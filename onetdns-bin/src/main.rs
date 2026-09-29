@@ -57,8 +57,10 @@ mod quic_memory;
 mod qworker;
 /** @brief IPv6 라우터 광고. */
 mod ra;
-/** @brief 외부 공유 캐시 클라이언트. */
 mod redis;
+/** @brief 외부 공유 캐시 클라이언트. */
+/** @brief 설정에서 해석 체인을 조립한다. */
+mod resolver_chain;
 /** @brief 업스트림 인증서 폐기 확인. */
 mod revoke;
 /** @brief 서명 키 교체. */
@@ -2367,461 +2369,43 @@ pub fn serve(
         let local_only_names = local_only_names.clone();
         let split_local_wire_cache = Arc::new(std::sync::OnceLock::new());
 
-        let mk_forward = {
-            let forward_slot = forward_slot.clone();
-            move |_cfg: &Config| Arc::new(forward_slot.clone()) as Arc<dyn native::Resolver>
-        };
-        let mk_recurse = {
-            let recursor_jobs = recursor_jobs.clone();
-            let block_ttl = block_ttl.clone();
-            let filter = filter.clone();
-            let lane_recursor = lane_recursor.clone();
-            let local_ttl = local_ttl.clone();
-            // ServiceCleanup은 드롭될 때 스레드를 전부 내린다. 복제해 넘기면 클로저가
-            // 사라질 때 서비스가 함께 죽는다. 추적 목록만 넘긴다.
-            let thread_tracker = service_cleanup.tracker();
-            let shutdown = shutdown.clone();
-            move |cfg: &Config| -> BoxResult<Arc<dyn native::Resolver>> {
-                let timeout = Duration::from_secs(cfg.query_timeout_secs);
-                let prefer = if cfg.prefer_ip6 {
-                    Some(true)
-                } else if cfg.prefer_ip4 {
-                    Some(false)
-                } else {
-                    None
-                };
-                let insecure: Vec<onetdns_proto::Name> = cfg
-                    .domain_insecure
-                    .iter()
-                    .map(|name| {
-                        onetdns_proto::Name::from_str(name).map_err(|_| {
-                            crate::anyhow!(format!(
-                                "DNSSEC 검증 예외 DNS 이름이 올바르지 않습니다: {name}"
-                            ))
-                        })
-                    })
-                    .collect::<BoxResult<_>>()?;
-                let mut recursor = new_recursor(recursor_roots(cfg), timeout)
-                    .with_recursion_limit(cfg.recursion_limit)
-                    .with_cname_limit(cfg.cname_limit)
-                    .with_dname_limit(cfg.dname_limit)
-                    .with_server_acl(
-                        cfg.recurse_deny_server.clone(),
-                        cfg.recurse_allow_server.clone(),
-                    )
-                    .with_ip_family(cfg.do_ip4, cfg.do_ip6, prefer)
-                    .with_qname_min_strict(cfg.qname_minimisation_strict)
-                    .with_harden_referral_path(cfg.harden_referral_path)
-                    .with_domain_insecure(insecure)
-                    .with_root_key_sentinel(cfg.root_key_sentinel)
-                    .with_nsec3_max_iterations(cfg.val_nsec3_max_iterations)
-                    .with_ns_cache_max(cfg.ns_cache_size)
-                    .with_recursive_cache_ttl_max(cfg.max_ttl as u32)
-                    .with_ns_side_query_limit(cfg.ns_recursion_limit as usize)
-                    .with_caps_for_id(cfg.use_caps_for_id)
-                    .with_lowercase_outgoing(cfg.lowercase_outgoing);
-                if cfg.dnssec {
-                    recursor = recursor
-                        .with_dnssec()
-                        .with_dnssec_strict(cfg.dnssec_strict)
-                        .with_dnssec_permissive(cfg.val_permissive_mode)
-                        .with_ignore_cd(cfg.ignore_cd_flag);
-
-                    if let Some(path) = cfg.dnssec_anchor_file.as_deref() {
-                        recursor =
-                            recursor.with_trust_anchors(load_configured_trust_anchors(path)?);
-                    }
-
-                    // 재귀 리졸버를 새로 만들 때마다 이전 보조 작업을 멈춘다. 멈추지 않으면 이전
-                    // 작업이 이전 앵커 핸들을 갱신하고 스레드도 계속 늘어난다.
-                    let jobs_stop = recursor_jobs.restart_all();
-                    if cfg.dnssec_rfc5011 {
-                        let thread = spawn_rfc5011(
-                            cfg,
-                            recursor.anchors_handle(),
-                            timeout,
-                            jobs_stop.clone(),
-                        )
-                        .with_context(|| "RFC 5011 신뢰 앵커 갱신 스레드를 시작하지 못했습니다")?;
-                        track_service_thread(&thread_tracker, thread);
-                    }
-                    if cfg.trust_anchor_signaling {
-                        let thread = spawn_ta_signaling(
-                            recursor.anchors_handle(),
-                            timeout,
-                            recursor_roots(cfg),
-                            cfg.recurse_deny_server.clone(),
-                            cfg.recurse_allow_server.clone(),
-                            cfg.max_ttl as u32,
-                            jobs_stop.clone(),
-                        )
-                        .with_context(|| "RFC 8145 신뢰 앵커 신호 스레드를 시작하지 못했습니다")?;
-                        track_service_thread(&thread_tracker, thread);
-                    }
-                }
-
-                if let Some(thread) =
-                    detect_dns53_interception(recursor_roots(cfg), timeout, shutdown.clone())
-                {
-                    track_service_thread(&thread_tracker, thread);
-                }
-
-                let recursor = Arc::new(recursor);
-                *lane_recursor.lock_recover() = Some(recursor.clone());
-                let mut base: Arc<dyn native::Resolver> =
-                    Arc::new(native::NativeBackend::Recurse {
-                        recursor,
-                        ns_rpz: Some(filter.clone()),
-                        block_ttl: block_ttl.clone(),
-                        local_ttl: local_ttl.clone(),
-                    });
-                if cfg.harden_below_nxdomain {
-                    base = Arc::new(layers::BelowNxdomainLayer::new(
-                        base,
-                        cfg.cache_size as usize,
-                        cfg.neg_min_ttl as u32,
-                        cfg.neg_max_ttl as u32,
-                    ));
-                }
-                if cfg.aggressive_nsec {
-                    base = Arc::new(layers::AggressiveNsecLayer::new(
-                        base,
-                        cfg.cache_size as usize,
-                        cfg.neg_min_ttl as u32,
-                        cfg.neg_max_ttl as u32,
-                    ));
-                }
-                Ok(base)
-            }
-        };
-
         let cache_ns_base = cache_namespace_base(&cfg);
 
-        // layer-order:begin
-        // 체인을 만드는 코드가 설정을 인자로 받는다. 그래야 설정이 바뀌었을 때 이
-        // 곳에서 새 체인을 만들어 교체할 수 있고, 스레드와 소켓을 내릴 이유가 없다.
-        let wrap_common_layers = Arc::new({
-            let block_ttl = block_ttl.clone();
-            let cache_slot = cache_slot.clone();
-            let dhcp_slot = dhcp_slot.clone();
-            let local_ttl = local_ttl.clone();
-            let recorder = recorder.clone();
-            let shutdown = shutdown.clone();
-            let split_local_wire_cache = split_local_wire_cache.clone();
-            let zone_store = zone_store.clone();
-            move |cfg: &Config,
-                  mut base: Arc<dyn native::Resolver>,
-                  expose_cache_handle: bool,
-                  report: bool,
-                  split_local_addresses: bool,
-                  cache_ns: &str|
-                  -> Result<Arc<dyn native::Resolver>, String> {
-                base = Arc::new(layers::LocalOnlyLayer::new(
-                    base,
-                    local_only_names.clone(),
-                    block_ttl.clone(),
-                ));
-
-                if !cfg.fallback_upstreams.is_empty() {
-                    let upstreams =
-                        upstream::servers_to_upstreams(&cfg.fallback_upstreams, &cfg.bootstrap);
-                    if !upstreams.is_empty() {
-                        ensure_upstreams_not_self(cfg, &upstreams, "fallback_upstreams")?;
-                        let fallback: Arc<dyn native::Resolver> =
-                            Arc::new(native::NativeBackend::Forward(
-                                onetdns_forward::Forwarder::with_upstreams(
-                                    upstreams,
-                                    Duration::from_secs(cfg.query_timeout_secs),
-                                )
-                                .with_strategy(forward_strategy(cfg.upstream_strategy))
-                                .with_parallel_limit(cfg.upstream_concurrency),
-                            ));
-                        base = Arc::new(layers::FallbackLayer::new(base, fallback));
-                    }
-                }
-
-                // 예비 업스트림까지 감싼 뒤에 얹는다. 어느 업스트림이 답했든 이 서버가 검증한 것만
-                // 위로 올라가고, 위쪽 캐시에는 검증된 응답만 담긴다.
-                if cfg.forward_validation_active() {
-                    let insecure_domains = cfg
-                        .domain_insecure
-                        .iter()
-                        .map(|name| {
-                            onetdns_proto::Name::from_str(name).map_err(|_| {
-                                format!("DNSSEC 검증 예외 DNS 이름이 올바르지 않습니다: {name}")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    base = Arc::new(dnssecfwd::ForwardValidateLayer::new(
-                        base,
-                        Arc::new(onetdns_core::ArcSwap::new(Arc::new(
-                            forward_trust_anchors(cfg).map_err(|error| error.to_string())?,
-                        ))),
-                        dnssecfwd::ForwardValidationPolicy {
-                            strict: cfg.dnssec_strict,
-                            permissive: cfg.val_permissive_mode,
-                            ignore_cd: cfg.ignore_cd_flag,
-                            insecure_domains,
-                            root_key_sentinel: cfg.root_key_sentinel,
-                        },
-                    ));
-                }
-
-                if let Some(addr) = cachedb_redis_addr(cfg)? {
-                    let redis = Arc::new(redis::RedisClient::new(addr));
-                    let namespace =
-                        format!("{:x}", Sha256::digest(cache_ns.as_bytes()))[..16].to_string();
-                    base = Arc::new(layers::CacheDbLayer::new(
-                        base,
-                        redis,
-                        cfg.cachedb_redis_expire_secs,
-                        cfg.min_ttl as u32,
-                        cfg.max_ttl as u32,
-                        namespace,
-                    ));
-                    if report {
-                        onetdns_core::info!(event = "cache.redis_enabled", %addr, "외부 Redis 응답 캐시를 사용합니다");
-                    }
-                }
-
-                let mut chain = base;
-                match cfg.ecs_mode {
-                    EcsMode::Send => {
-                        if let Some(ip) = cfg.ecs_custom_ip {
-                            chain = Arc::new(layers::EcsLayer::new(chain, ip));
-                        }
-                    }
-                    EcsMode::Strip => chain = Arc::new(layers::EcsLayer::strip(chain)),
-                    EcsMode::Off => {}
-                }
-
-                let prefetch_backend = cfg.prefetch.then(|| chain.clone());
-                let mut prefetch_cache: Option<cache::CacheHandle> = None;
-                {
-                    let positive_cache_enabled = cfg.cache_enabled && cfg.cache_size > 0;
-                    let shards = if positive_cache_enabled && cfg.sharded_cache {
-                        cfg.cache_shards
-                    } else {
-                        1
-                    };
-                    let cl = cache::CacheLayer::new(
-                        chain,
-                        cfg.cache_size.max(1) as usize,
-                        shards,
-                        cfg.min_ttl as u32,
-                        cfg.max_ttl as u32,
-                        cfg.neg_min_ttl as u32,
-                        cfg.neg_max_ttl as u32,
-                    )
-                    .with_positive_cache(positive_cache_enabled)
-                    .with_recorder(recorder.clone());
-                    if expose_cache_handle {
-                        *cache_slot.lock_recover() = Some(cl.handle());
-                    }
-                    if cfg.prefetch {
-                        prefetch_cache = Some(cl.handle());
-                    }
-                    chain = Arc::new(cl);
-                }
-
-                if cfg.serve_stale_secs > 0 {
-                    chain = Arc::new(
-                        layers::ServeStaleLayer::new(
-                            chain,
-                            Duration::from_secs(cfg.serve_stale_secs),
-                            cfg.cache_size as usize,
-                            cfg.min_ttl as u32,
-                            cfg.max_ttl as u32,
-                            cfg.serve_expired_reply_ttl,
-                            cfg.serve_expired_ttl_reset,
-                            (cfg.serve_expired_client_timeout_ms > 0).then(|| {
-                                Duration::from_millis(cfg.serve_expired_client_timeout_ms)
-                            }),
-                            cfg.serve_stale_refresh,
-                        )
-                        .with_shutdown(shutdown.clone()),
-                    );
-                }
-
-                if cfg.prefetch {
-                    let backend = prefetch_backend
-                        .expect("미리 가져오기가 켜져 있으면 핸들러가 준비되어야 합니다");
-                    let cache_handle =
-                        prefetch_cache.expect("prefetch_cache는 cfg.prefetch일 때 설정됨");
-
-                    let refresher: layers::PrefetchRefresher = Arc::new(move |req| {
-                        let resp = backend.resolve(req)?;
-                        if resp.header.rcode == onetdns_proto::ResponseCode::NoError.0
-                            && !resp.answers.is_empty()
-                        {
-                            cache_handle.store(req, &resp);
-                        }
-                        Some(resp)
-                    });
-                    chain = Arc::new(layers::PrefetchLayer::with_policy(
-                        chain,
-                        refresher,
-                        Duration::from_secs(cfg.prefetch_interval_secs.max(1)),
-                        cfg.cache_size as usize,
-                        cfg.prefetch_min_hits,
-                        cfg.prefetch_ttl_pct,
-                        shutdown.clone(),
-                    ));
-                }
-
-                if split_local_addresses && (!cfg.local_a.is_empty() || !cfg.local_aaaa.is_empty())
-                {
-                    let addresses = layers::LocalAddressTable::new(
-                        &cfg.local_a,
-                        &cfg.local_aaaa,
-                        local_ttl.clone(),
-                    )?;
-                    chain = Arc::new(layers::LocalAddressLayer::new(
-                        chain,
-                        Arc::new(addresses),
-                        Some(split_local_wire_cache.clone()),
-                    ));
-                }
-
-                if cfg.name_ratelimit_per_sec > 0 {
-                    chain = Arc::new(layers::NameRateLimitLayer::new(
-                        chain,
-                        cfg.name_ratelimit_per_sec,
-                        cfg.name_ratelimit_labels,
-                    ));
-                }
-
-                if !cfg.stub_zones.is_empty() {
-                    let mut stubs: Vec<(String, Arc<dyn native::Resolver>)> = Vec::new();
-                    for z in &cfg.stub_zones {
-                        let ups = upstream::servers_to_upstreams(&z.servers, &cfg.bootstrap);
-                        if ups.is_empty() {
-                            return Err(format!(
-                                "스텁 영역 '{}'에 사용할 수 있는 업스트림 DNS 서버가 없습니다",
-                                z.suffix
-                            ));
-                        }
-                        ensure_upstreams_not_self(cfg, &ups, &format!("스텁 영역 '{}'", z.suffix))?;
-                        let fwd = onetdns_forward::Forwarder::with_upstreams(
-                            ups,
-                            Duration::from_secs(cfg.query_timeout_secs),
-                        )
-                        .with_strategy(forward_strategy(cfg.upstream_strategy))
-                        .with_parallel_limit(cfg.upstream_concurrency);
-                        let guarded: Arc<dyn native::Resolver> =
-                            Arc::new(cache::CacheLayer::failure_guard(
-                                Arc::new(native::NativeBackend::Forward(fwd)),
-                                64,
-                            ));
-                        stubs.push((z.suffix.clone(), guarded));
-                    }
-                    if !stubs.is_empty() {
-                        chain = Arc::new(layers::StubLayer::new(chain, stubs)?);
-                    }
-                }
-
-                if let Some(pool) = dhcp_slot.lock_recover().as_ref() {
-                    if !cfg.dhcp_local_domain.is_empty() {
-                        chain = Arc::new(layers::DhcpDnsLayer::new(
-                            chain,
-                            pool.clone(),
-                            &cfg.dhcp_local_domain,
-                            local_ttl.clone(),
-                        ));
-                    }
-                }
-
-                if ipset_layer_active(cfg) {
-                    chain = Arc::new(layers::IpsetLayer::new(
-                        chain,
-                        cfg.ipset_name_v4.clone(),
-                        cfg.ipset_name_v6.clone(),
-                        &cfg.ipset_domains,
-                    )?);
-                }
-
-                if authority_sources_configured(cfg) {
-                    chain = Arc::new(
-                        layers::AuthorityLayer::new(chain, zone_store.clone())
-                            .with_recursion_offered(recursion_offered_by(cfg)),
-                    );
-                }
-
-                if cfg.acme_directory_url.is_some() {
-                    chain = Arc::new(layers::AcmeChallengeLayer::new(chain));
-                }
-
-                if !cfg.ddr_name.is_empty() {
-                    if let Some(ddr) = layers::DdrLayer::new(
-                        chain.clone(),
-                        &cfg.ddr_name,
-                        &ddr_endpoints_from(cfg),
-                    )? {
-                        if report {
-                            onetdns_core::info!(
-                                event = "ddr.enabled",
-                                name = %cfg.ddr_name,
-                                endpoints = ddr_endpoints_from(cfg).len(),
-                                "암호화 전송 승격 안내(DDR)를 켭니다"
-                            );
-                        }
-                        chain = Arc::new(ddr);
-                    }
-                }
-
-                if !cfg.dynamic_records.is_empty() {
-                    let dl = layers::DynamicRecordLayer::new(chain.clone(), &cfg.dynamic_records)?;
-                    if !dl.is_empty() {
-                        if report {
-                            onetdns_core::info!(
-                                event = "dynamic_records.enabled",
-                                count = cfg.dynamic_records.len(),
-                                "동적 DNS 레코드 처리를 사용합니다"
-                            );
-                        }
-                        chain = Arc::new(dl);
-                    }
-                }
-
-                Ok(chain)
-            }
-        });
-        // layer-order:end
-
-        // 기반도 설정을 인자로 받는다. 처리 방식이 바뀌어도 기반과 체인만 새로 만들어
-        // 교체하면 되므로 소켓과 스레드를 내릴 이유가 없다.
-        let build_base = move |cfg: &Config| -> BoxResult<Arc<dyn native::Resolver>> {
-            Ok(match cfg.backend {
-                BackendKind::Recurse => mk_recurse(cfg)?,
-                BackendKind::Forward => mk_forward(cfg),
-                BackendKind::Split => {
-                    let default = match cfg.split_default {
-                        SplitTarget::Forward => layers::Route::Forward,
-                        SplitTarget::Recurse => layers::Route::Recurse,
-                    };
-                    Arc::new(
-                        layers::SplitResolver::new(
-                            mk_forward(cfg),
-                            mk_recurse(cfg)?,
-                            default,
-                            &cfg.split_recurse,
-                            &cfg.split_forward,
-                        )
-                        .map_err(|error| crate::anyhow!(error))?,
-                    )
-                }
-            })
+        let base = resolver_chain::ResolverBase {
+            forward_slot: forward_slot.clone(),
+            recurse: resolver_chain::RecursiveBase {
+                recursor_jobs: recursor_jobs.clone(),
+                block_ttl: block_ttl.clone(),
+                filter: filter.clone(),
+                lane_recursor: lane_recursor.clone(),
+                local_ttl: local_ttl.clone(),
+                thread_tracker: service_cleanup.tracker(),
+                shutdown: shutdown.clone(),
+            },
         };
-        let default_base: Arc<dyn native::Resolver> = build_base(&cfg)?;
-        let chain = wrap_common_layers(
-            &cfg,
-            default_base,
-            true,
-            true,
-            matches!(cfg.backend, BackendKind::Split),
-            &cache_ns_base,
-        )
-        .map_err(|e| crate::anyhow!(e))?;
+        let chain_layers = resolver_chain::ChainLayers {
+            block_ttl: block_ttl.clone(),
+            cache_slot: cache_slot.clone(),
+            dhcp_slot: dhcp_slot.clone(),
+            local_ttl: local_ttl.clone(),
+            local_only_names: local_only_names.clone(),
+            recorder: recorder.clone(),
+            shutdown: shutdown.clone(),
+            split_local_wire_cache: split_local_wire_cache.clone(),
+            zone_store: zone_store.clone(),
+        };
+
+        let default_base: Arc<dyn native::Resolver> = base.build(&cfg)?;
+        let chain = chain_layers
+            .wrap_common_layers(
+                &cfg,
+                default_base,
+                true,
+                true,
+                matches!(cfg.backend, BackendKind::Split),
+                &cache_ns_base,
+            )
+            .map_err(|e| crate::anyhow!(e))?;
 
         let client_upstreams: Vec<native::ClientUpstream> =
             build_client_upstream_routes(&cfg, timeout)
@@ -2829,8 +2413,14 @@ pub fn serve(
                 .into_iter()
                 .map(|mut route| {
                     let ns = format!("{cache_ns_base}/route={}", route.namespace_key());
-                    route.resolver =
-                        wrap_common_layers(&cfg, route.resolver, false, false, false, &ns)?;
+                    route.resolver = chain_layers.wrap_common_layers(
+                        &cfg,
+                        route.resolver,
+                        false,
+                        false,
+                        false,
+                        &ns,
+                    )?;
                     Ok(route)
                 })
                 .collect::<Result<_, String>>()
@@ -2893,17 +2483,20 @@ pub fn serve(
         let chain_slot = Arc::new(native::ResolverSlot::new(chain));
         // 설정이 바뀌면 같은 위치에서 기반과 체인을 새로 만들어 슬롯에 넣는다.
         *chain_rebuild.lock_recover() = Some({
-            let build = wrap_common_layers.clone();
+            let layers = chain_layers.clone();
             let slot = chain_slot.clone();
-            let make_base = Mutex::new(build_base);
+            let make_base = Mutex::new(base);
             Arc::new(move |next: &Config| -> Result<(), String> {
-                let base = (make_base.lock_recover())(next).map_err(|error| error.to_string())?;
+                let base = make_base
+                    .lock_recover()
+                    .build(next)
+                    .map_err(|error| error.to_string())?;
                 let split = matches!(next.backend, BackendKind::Split);
                 // 이름은 지금 설정에서 낸다. 시작할 때 낸 것을 쓰면 처리 방식이나 DNSSEC을
                 // 바꿔도 공유 캐시가 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인
                 // 것처럼 나온다.
                 let cache_ns = cache_namespace_base(next);
-                let chain = build(next, base, true, true, split, &cache_ns)?;
+                let chain = layers.wrap_common_layers(next, base, true, true, split, &cache_ns)?;
                 slot.replace(chain);
                 Ok(())
             }) as ChainRebuild

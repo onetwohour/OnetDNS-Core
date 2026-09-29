@@ -114,6 +114,7 @@ fn public_sources() -> Vec<(&'static str, String)> {
         "onetdns-bin/src/main.rs",
         "onetdns-bin/src/control_api.rs",
         "onetdns-bin/src/hot_apply.rs",
+        "onetdns-bin/src/resolver_chain.rs",
         "crates/onetdns-config/src/settings.rs",
     ]
     .into_iter()

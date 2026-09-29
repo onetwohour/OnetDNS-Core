@@ -491,6 +491,7 @@ fn user_facing_errors_avoid_implementation_wording() {
         "onetdns-bin/src/main.rs",
         "onetdns-bin/src/control_api.rs",
         "onetdns-bin/src/hot_apply.rs",
+        "onetdns-bin/src/resolver_chain.rs",
         "onetdns-bin/src/upstream.rs",
         "crates/onetdns-control/src/api.rs",
         "crates/onetdns-config/src/settings.rs",

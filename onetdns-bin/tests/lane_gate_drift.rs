@@ -7,20 +7,20 @@
  */
 
 /** @brief 계층 순서를 검사할 소스. */
-const MAIN_RS: &str = include_str!("../src/main.rs");
+const CHAIN_RS: &str = include_str!("../src/resolver_chain.rs");
 /** @brief 재시작 없는 설정 교체를 검사할 소스. */
 const HOT_APPLY_RS: &str = include_str!("../src/hot_apply.rs");
 
 /** @brief 표시 사이의 소스 구간. */
 fn gate_body(begin: &str, end: &str) -> String {
-    let start = MAIN_RS
+    let start = CHAIN_RS
         .find(begin)
         .unwrap_or_else(|| panic!("{begin} 표시를 찾지 못했습니다"));
-    let stop = MAIN_RS
+    let stop = CHAIN_RS
         .find(end)
         .unwrap_or_else(|| panic!("{end} 표시를 찾지 못했습니다"));
     assert!(start < stop, "{begin}이 {end}보다 앞이어야 합니다");
-    MAIN_RS[start..stop].to_string()
+    CHAIN_RS[start..stop].to_string()
 }
 
 #[test]
