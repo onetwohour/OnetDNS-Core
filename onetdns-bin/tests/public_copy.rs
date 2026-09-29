@@ -106,12 +106,14 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
     out
 }
 
-/** @brief 검사 대상 소스 세 곳. */
+/** @brief 사용자에게 보이는 문구를 담은 검사 대상 소스. */
 fn public_sources() -> Vec<(&'static str, String)> {
     let repo = root();
     [
         "crates/onetdns-control/src/api.rs",
         "onetdns-bin/src/main.rs",
+        "onetdns-bin/src/control_api.rs",
+        "onetdns-bin/src/hot_apply.rs",
         "crates/onetdns-config/src/settings.rs",
     ]
     .into_iter()

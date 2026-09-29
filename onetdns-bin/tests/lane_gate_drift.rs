@@ -6,8 +6,10 @@
  * @warning 계층 목록은 계산해서 나온 값이 아니라 일부러 고정해 둔 것이다.
  */
 
-/** @brief 검사할 소스. */
+/** @brief 계층 순서를 검사할 소스. */
 const MAIN_RS: &str = include_str!("../src/main.rs");
+/** @brief 재시작 없는 설정 교체를 검사할 소스. */
+const HOT_APPLY_RS: &str = include_str!("../src/hot_apply.rs");
 
 /** @brief 표시 사이의 소스 구간. */
 fn gate_body(begin: &str, end: &str) -> String {
@@ -77,10 +79,10 @@ fn layer_stack_order_is_pinned() {
  * @warning 새 그룹 적용 코드는 반드시 이 검사 아래에 넣어야 한다.
  */
 fn hot_apply_checks_before_it_changes_anything() {
-    let guard = MAIN_RS
+    let guard = HOT_APPLY_RS
         .find(".any(|key| !is_hot_reload_config_change(&previous_cfg, next, key))")
         .expect("교체 가능 여부 검사를 찾지 못했습니다");
-    let first_apply = MAIN_RS
+    let first_apply = HOT_APPLY_RS
         .find("// hot-apply:begin")
         .expect("그룹 적용 구간 표시를 찾지 못했습니다");
     assert!(
@@ -100,10 +102,10 @@ fn hot_apply_checks_before_it_changes_anything() {
  * @warning 이 정규화를 빼면 그 사고가 그대로 돌아온다.
  */
 fn hot_apply_fills_startup_defaults_before_comparing() {
-    let apply = MAIN_RS
+    let apply = HOT_APPLY_RS
         .find("let changed = config_changed_keys(&previous_cfg, next)?;")
         .expect("교체 비교 지점을 찾지 못했습니다");
-    let normalize = MAIN_RS
+    let normalize = HOT_APPLY_RS
         .find("let next = &normalize_config_for_comparison(&previous_cfg, next);")
         .expect(
             "교체 경로가 시작 기본값을 채우지 않습니다. 파일에 없는 기본값이 \
@@ -125,14 +127,14 @@ fn hot_apply_fills_startup_defaults_before_comparing() {
  * @warning 이 호출을 지우면 두 증상이 조용히 돌아온다. 어느 쪽도 오류로 드러나지 않는다.
  */
 fn hot_apply_redecides_whether_to_collect() {
-    let end = MAIN_RS
+    let end = HOT_APPLY_RS
         .find("// hot-apply:end")
         .expect("그룹 적용 구간 끝 표시를 찾지 못했습니다");
-    let done = MAIN_RS[end..]
+    let done = HOT_APPLY_RS[end..]
         .find("event = \"config.runtime_hot_applied\"")
         .expect("교체 성공 지점을 찾지 못했습니다");
     assert!(
-        MAIN_RS[end..end + done].contains("set_collecting(telemetry_consumed(next))"),
+        HOT_APPLY_RS[end..end + done].contains("set_collecting(telemetry_consumed(next))"),
         "교체 성공 경로가 통계 수집 여부를 다시 정하지 않습니다. 시작할 때의 \
          판정이 그대로 남아 관리 주소를 열어도 대시보드가 비어 있게 됩니다."
     );

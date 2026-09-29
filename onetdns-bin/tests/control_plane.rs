@@ -12,8 +12,8 @@ mod common;
 
 use common::{read, root};
 
-/** @brief main.rs 가 갖춰야 할 안전장치. */
-const MAIN_REQUIRED: &[&str] = &[
+/** @brief onetdns-bin 의 관리 평면이 갖춰야 할 안전장치. */
+const BIN_REQUIRED: &[&str] = &[
     "metrics: Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>",
     "audit: Arc<Mutex<Option<onetdns_control::AuditLog>>>",
     "event = \"stats.channel_reused\"",
@@ -155,11 +155,11 @@ fn require(source: &str, required: &[&str], subject: &str) {
 #[test]
 fn every_control_plane_safeguard_is_present() {
     let repo = root();
-    require(
-        &read(&repo.join("onetdns-bin/src/main.rs")),
-        MAIN_REQUIRED,
-        "main.rs 관리 평면",
-    );
+    let bin: String = ["main.rs", "control_api.rs", "hot_apply.rs"]
+        .iter()
+        .map(|file| read(&repo.join("onetdns-bin/src").join(file)))
+        .collect();
+    require(&bin, BIN_REQUIRED, "onetdns-bin 관리 평면");
     require(
         &read(&repo.join("crates/onetdns-control/src/metrics.rs")),
         METRICS_REQUIRED,

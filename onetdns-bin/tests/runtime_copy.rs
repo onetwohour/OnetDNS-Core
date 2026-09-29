@@ -489,6 +489,8 @@ fn user_facing_errors_avoid_implementation_wording() {
     let mut found = Vec::new();
     for name in [
         "onetdns-bin/src/main.rs",
+        "onetdns-bin/src/control_api.rs",
+        "onetdns-bin/src/hot_apply.rs",
         "onetdns-bin/src/upstream.rs",
         "crates/onetdns-control/src/api.rs",
         "crates/onetdns-config/src/settings.rs",
