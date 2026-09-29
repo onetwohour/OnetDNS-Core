@@ -358,7 +358,7 @@ pub struct Rewrite {
     pub answer: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 상태를 살펴 답을 바꾸는 레코드. */
 pub struct DynamicRecord {
     /** @brief 이 기록의 이름. */
@@ -375,7 +375,7 @@ pub struct DynamicRecord {
     pub probe_port: u16,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 특정 접미사를 지정한 서버로 보내는 설정. */
 pub struct StubZone {
     /** @brief 이 접미사에 걸린다. */

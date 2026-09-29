@@ -919,6 +919,7 @@ const SVCB_KEY_DOHPATH: u16 = 7;
  * @brief 암호화 전송 하나를 DDR로 알리기 위한 재료.
  * @details 우선순위는 이 리졸버가 권하는 순서다. 값이 작을수록 먼저 시도된다.
  */
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DdrEndpoint {
     /** @brief 권하는 순서. */
     pub priority: u16,

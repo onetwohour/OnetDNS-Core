@@ -2369,7 +2369,7 @@ pub fn serve(
         let local_only_names = local_only_names.clone();
         let split_local_wire_cache = Arc::new(std::sync::OnceLock::new());
 
-        let cache_ns_base = cache_namespace_base(&cfg);
+        let plan = resolver_chain::ChainPlan::new(&cfg);
 
         let base = resolver_chain::ResolverBase {
             forward_slot: forward_slot.clone(),
@@ -2395,15 +2395,15 @@ pub fn serve(
             zone_store: zone_store.clone(),
         };
 
-        let default_base: Arc<dyn native::Resolver> = base.build(&cfg)?;
+        let default_base: Arc<dyn native::Resolver> = base.build(&plan)?;
         let chain = chain_layers
             .wrap_common_layers(
-                &cfg,
+                &plan,
                 default_base,
                 true,
                 true,
-                matches!(cfg.backend, BackendKind::Split),
-                &cache_ns_base,
+                plan.is_split(),
+                plan.cache_namespace(),
             )
             .map_err(|e| crate::anyhow!(e))?;
 
@@ -2412,9 +2412,9 @@ pub fn serve(
                 .map_err(|e| crate::anyhow!(e))?
                 .into_iter()
                 .map(|mut route| {
-                    let ns = format!("{cache_ns_base}/route={}", route.namespace_key());
+                    let ns = format!("{}/route={}", plan.cache_namespace(), route.namespace_key());
                     route.resolver = chain_layers.wrap_common_layers(
-                        &cfg,
+                        &plan,
                         route.resolver,
                         false,
                         false,
@@ -2486,20 +2486,29 @@ pub fn serve(
             let layers = chain_layers.clone();
             let slot = chain_slot.clone();
             let make_base = Mutex::new(base);
-            Arc::new(move |next: &Config| -> Result<(), String> {
-                let base = make_base
-                    .lock_recover()
-                    .build(next)
-                    .map_err(|error| error.to_string())?;
-                let split = matches!(next.backend, BackendKind::Split);
-                // 이름은 지금 설정에서 낸다. 시작할 때 낸 것을 쓰면 처리 방식이나 DNSSEC을
-                // 바꿔도 공유 캐시가 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인
-                // 것처럼 나온다.
-                let cache_ns = cache_namespace_base(next);
-                let chain = layers.wrap_common_layers(next, base, true, true, split, &cache_ns)?;
-                slot.replace(chain);
-                Ok(())
-            }) as ChainRebuild
+            Arc::new(
+                move |next: &resolver_chain::ChainPlan| -> Result<(), String> {
+                    let base = make_base
+                        .lock_recover()
+                        .build(next)
+                        .map_err(|error| error.to_string())?;
+                    /*
+                     * 공유 캐시 이름 공간도 새 계획에서 낸다. 시작할 때 낸 것을 쓰면 처리 방식이나
+                     * DNSSEC 을 바꿔도 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인
+                     * 것처럼 나온다.
+                     */
+                    let chain = layers.wrap_common_layers(
+                        next,
+                        base,
+                        true,
+                        true,
+                        next.is_split(),
+                        next.cache_namespace(),
+                    )?;
+                    slot.replace(chain);
+                    Ok(())
+                },
+            ) as ChainRebuild
         });
 
         let mut native_server = native::NativeServer::new(
@@ -2813,14 +2822,9 @@ fn resolve_probe(
     ))
 }
 
-/** @brief 업스트림이 이 서버의 리스너를 가리키지 않는지 확인한다. 가리키면 질의가 무한히 돌아온다. */
-fn ensure_upstreams_not_self(
-    cfg: &Config,
-    upstreams: &[onetdns_forward::Upstream],
-    label: &str,
-) -> Result<(), String> {
-    let listeners: Vec<SocketAddr> = cfg
-        .listen
+/** @brief 이 서버가 DNS 질의를 받는 모든 수신 주소. */
+fn dns_listeners(cfg: &Config) -> Vec<SocketAddr> {
+    cfg.listen
         .iter()
         .chain(cfg.listen_dot.iter())
         .chain(cfg.listen_doh.iter())
@@ -2828,8 +2832,16 @@ fn ensure_upstreams_not_self(
         .chain(cfg.listen_doh3.iter())
         .chain(cfg.listen_dnscrypt.iter())
         .copied()
-        .collect();
-    upstream::ensure_not_listener(upstreams, &listeners, label)
+        .collect()
+}
+
+/** @brief 업스트림이 이 서버의 리스너를 가리키지 않는지 확인한다. 가리키면 질의가 무한히 돌아온다. */
+fn ensure_upstreams_not_self(
+    cfg: &Config,
+    upstreams: &[onetdns_forward::Upstream],
+    label: &str,
+) -> Result<(), String> {
+    upstream::ensure_not_listener(upstreams, &dns_listeners(cfg), label)
 }
 
 /**
@@ -2841,8 +2853,8 @@ fn ensure_upstreams_not_self(
  */
 fn runtime_preflight(cfg: &Config) -> Result<(), String> {
     ensure_resolution_sources_not_self(cfg)?;
-    if cfg.dnssec_anchor_file.is_some() {
-        forward_trust_anchors(cfg).map_err(|error| error.to_string())?;
+    if let Some(path) = cfg.dnssec_anchor_file.as_deref() {
+        load_configured_trust_anchors(path).map_err(|error| error.to_string())?;
     }
     build_policy_engine(cfg)?;
     for (key, source) in zone_source_specs(cfg) {
@@ -2850,7 +2862,9 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
             return Err(format!("DNS 영역 원본 '{key}'의 주소가 올바르지 않습니다"));
         }
     }
-    cachedb_redis_addr(cfg)?;
+    if let Some(host) = &cfg.cachedb_redis_host {
+        cachedb_redis_addr(host, cfg.cachedb_redis_port, &cfg.bootstrap)?;
+    }
     edge_service_preflight(cfg)?;
     if let Some(url) = &cfg.zones_postgres {
         onetdns_authority::PostgresZoneSource::from_url(url, &cfg.zones_sql_table)
@@ -10537,20 +10551,22 @@ fn spawn_ta_signaling(
         })
 }
 
-/** @brief 설정한 신뢰 루트를 읽는다. 못 읽으면 시작하지 않는다. */
 /**
  * @brief 전달 검증기가 쓸 루트 신뢰 기준.
  * @details 설정 파일로 앵커를 준 사람은 그것을, 아니면 내장 앵커를 쓴다. 체인을 새로 구성할
  *          때마다 이 설정에서 다시 읽는다. 처음 구성할 때 읽은 값을 계속 가지고 있으면 앵커 파일을
  *          바꿔도 이전 키로 검증한다.
  */
-fn forward_trust_anchors(cfg: &Config) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
-    match cfg.dnssec_anchor_file.as_deref() {
+fn forward_trust_anchors(
+    anchor_file: Option<&std::path::Path>,
+) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
+    match anchor_file {
         Some(path) => load_configured_trust_anchors(path),
         None => Ok(onetdns_dnssec::root_trust_anchors()),
     }
 }
 
+/** @brief 설정한 신뢰 루트를 읽는다. 못 읽으면 시작하지 않는다. */
 fn load_configured_trust_anchors(path: &std::path::Path) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
     let text = read_text_limited(path, LOCAL_STATE_MAX_BYTES).with_context(|| {
         format!(
@@ -10582,20 +10598,16 @@ fn load_configured_trust_anchors(path: &std::path::Path) -> BoxResult<Vec<onetdn
 
 /** @brief 신뢰 루트가 바뀌는 것을 따라가는 스레드를 시작한다. */
 fn spawn_rfc5011(
-    cfg: &Config,
+    plan: &resolver_chain::RecursivePlan,
     anchors: Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
-    timeout: Duration,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     use onetdns_dnssec::anchor::{extract_dnskey_rrset, AnchorManager};
-    let anchor_file = cfg
-        .dnssec_anchor_file
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("onetdns-anchors.txt"));
-    let deny = cfg.recurse_deny_server.clone();
-    let allow = cfg.recurse_allow_server.clone();
-    let roots = recursor_roots(cfg);
-    let max_ttl = cfg.max_ttl as u32;
+    let anchor_file = plan.anchor_state_file();
+    let (deny, allow) = plan.server_acl();
+    let roots = plan.roots();
+    let max_ttl = plan.max_ttl();
+    let timeout = plan.timeout();
     std::thread::Builder::new()
         .name("rfc5011".into())
         .spawn(move || {
@@ -12127,18 +12139,15 @@ fn runtime_access_control(cfg: &Config) -> Arc<dyn AccessControl> {
  *
  * @details 체인을 만들 때마다 다시 찾는다. 한 번 찾아 두면 주소를 바꿔도 이전 서버를 계속
  *          바라본다.
- * @return 설정에 없으면 None. 이름을 주소로 바꾸지 못하면 실패.
+ * @return 이름을 주소로 바꾸지 못하면 실패.
  */
-fn cachedb_redis_addr(cfg: &Config) -> Result<Option<SocketAddr>, String> {
-    let Some(host) = &cfg.cachedb_redis_host else {
-        return Ok(None);
-    };
-    let ip = upstream::resolve_host_via_bootstrap(host, &cfg.bootstrap).ok_or_else(|| {
+fn cachedb_redis_addr(host: &str, port: u16, bootstrap: &[IpAddr]) -> Result<SocketAddr, String> {
+    let ip = upstream::resolve_host_via_bootstrap(host, bootstrap).ok_or_else(|| {
         format!(
             "cachedb_redis_host={host}의 주소를 찾지 못했습니다. 호스트 이름을 사용하려면 bootstrap를 지정해야 합니다"
         )
     })?;
-    Ok(Some(SocketAddr::new(ip, cfg.cachedb_redis_port)))
+    Ok(SocketAddr::new(ip, port))
 }
 
 /**
@@ -13254,21 +13263,20 @@ fn hot_reload_groups(previous: &Config, next: &Config, changed: &[String]) -> Ve
         .iter()
         .filter_map(|key| config_keys::hot_group(key))
         .collect::<Vec<_>>();
-    // 영역이 생기거나 사라지면 권한 계층이 체인에 얹히고 빠져야 한다. 저장소만 교체하면
-    // 영역을 만들어도 그 답을 낼 계층이 없어 SERVFAIL이 나간다.
-    if groups.contains(&ApplyGroup::Authority) || groups.contains(&ApplyGroup::EdgeServices) {
+    /*
+     * 체인은 계획만 읽으므로, 어느 키가 바뀌었든 계획이 달라지면 체인을 다시 만든다.
+     * 질의 제한 시간처럼 전달 그룹에 속한 키도 스텁 영역과 예비 업스트림의 전달기에 쓰인다.
+     */
+    if resolver_chain::ChainPlan::new(previous) != resolver_chain::ChainPlan::new(next) {
+        groups.push(ApplyGroup::Chain);
+    }
+    /* DHCP 임대 풀은 서비스를 다시 띄우면 새로 만들어지므로, DHCP DNS 계층도 새 풀을 봐야 한다. */
+    if groups.contains(&ApplyGroup::EdgeServices) {
         groups.push(ApplyGroup::Chain);
     }
     /* 로컬 도메인은 DHCP 옵션 15로도 나간다. */
     if changed.iter().any(|key| key == "dhcp_local_domain") {
         groups.push(ApplyGroup::EdgeServices);
-    }
-    // DDR 답은 암호화 수신 주소와 DoH 경로를 체인 생성 시점에 미리 고정한다. 리스너만
-    // 교체하면 실제로 닫힌 주소를 계속 광고하므로, DDR이 전후 어느 쪽에든 있으면 함께 만든다.
-    if groups.contains(&ApplyGroup::Listeners)
-        && (!previous.ddr_name.is_empty() || !next.ddr_name.is_empty())
-    {
-        groups.push(ApplyGroup::Chain);
     }
     // 클러스터 활성 상태나 공용 비밀이 바뀌면 DNS Cookie의 공유 루트도 같은 설정 세대에서
     // 다시 만들어야 한다. native 그룹은 ArcSwap 한 번으로 기존/새 정책 중 하나만 보인다.
@@ -13376,8 +13384,8 @@ fn is_hot_reload_config_change(current: &Config, proposed: &Config, key: &str) -
     }
 }
 
-/** @brief 새 설정으로 해석 체인을 다시 만들어 교체하는 함수. */
-type ChainRebuild = Arc<dyn Fn(&Config) -> Result<(), String> + Send + Sync>;
+/** @brief 새 계획으로 해석 체인을 다시 만들어 교체하는 함수. */
+type ChainRebuild = Arc<dyn Fn(&resolver_chain::ChainPlan) -> Result<(), String> + Send + Sync>;
 
 /** @brief 세대가 소유한 보조 작업을 새 설정으로 다시 시작하는 함수. */
 type SecondaryRestart = Arc<dyn Fn(&Config) -> Result<(), String> + Send + Sync>;
@@ -21254,6 +21262,71 @@ name = \"a\"
         assert_eq!(
             hot_reload_groups(&with_ddr, &next, &keys),
             vec![ApplyGroup::Chain, ApplyGroup::Listeners]
+        );
+    }
+
+    #[test]
+    /** @brief 전달 설정은 체인이 그 값을 쓰는 전달기가 있을 때만 체인을 다시 만드는지. */
+    fn forward_settings_rebuild_the_chain_only_when_the_chain_uses_them() {
+        let plain = Config::default();
+        let mut slower = plain.clone();
+        slower.query_timeout_secs = plain.query_timeout_secs + 3;
+        let timeout = vec!["query_timeout_secs".to_string()];
+        assert_eq!(
+            hot_reload_groups(&plain, &slower, &timeout),
+            vec![ApplyGroup::Forward]
+        );
+
+        let mut with_stub = plain.clone();
+        with_stub.stub_zones.push(onetdns_config::StubZone {
+            suffix: "corp.test".to_string(),
+            servers: vec!["192.0.2.53".to_string()],
+        });
+        let mut stub_slower = with_stub.clone();
+        stub_slower.query_timeout_secs = slower.query_timeout_secs;
+        assert_eq!(
+            hot_reload_groups(&with_stub, &stub_slower, &timeout),
+            vec![ApplyGroup::Chain, ApplyGroup::Forward]
+        );
+
+        let mut with_fallback = plain;
+        with_fallback.fallback_upstreams = vec!["192.0.2.54".to_string()];
+        let mut fallback_parallel = with_fallback.clone();
+        fallback_parallel.upstream_strategy = UpstreamStrategy::Parallel;
+        assert_eq!(
+            hot_reload_groups(
+                &with_fallback,
+                &fallback_parallel,
+                &["upstream_strategy".to_string()]
+            ),
+            vec![ApplyGroup::Chain, ApplyGroup::Forward]
+        );
+    }
+
+    #[test]
+    /** @brief 영역이 생기거나 사라질 때만 체인을 다시 만들고, 영역 편집은 저장소 교체로 끝나는지. */
+    fn zone_edits_rebuild_the_chain_only_when_the_authority_layer_appears() {
+        let zone = |origin: &str| onetdns_config::ZoneConfig {
+            origin: origin.to_string(),
+            ..Default::default()
+        };
+        let plain = Config::default();
+        let mut one = plain.clone();
+        one.zones.push(zone("a.test"));
+        let mut two = one.clone();
+        two.zones.push(zone("b.test"));
+        let keys = vec!["zones".to_string()];
+        assert_eq!(
+            hot_reload_groups(&plain, &one, &keys),
+            vec![ApplyGroup::Authority, ApplyGroup::Chain]
+        );
+        assert_eq!(
+            hot_reload_groups(&one, &two, &keys),
+            vec![ApplyGroup::Authority]
+        );
+        assert_eq!(
+            hot_reload_groups(&one, &plain, &keys),
+            vec![ApplyGroup::Authority, ApplyGroup::Chain]
         );
     }
 

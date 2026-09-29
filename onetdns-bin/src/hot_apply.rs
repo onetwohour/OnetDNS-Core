@@ -176,6 +176,15 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
         }
 
         let groups = hot_reload_groups(&previous_cfg, next, &changed);
+        /*
+         * 클라이언트별 경로 체인은 세대를 시작할 때 한 번 만들고 교체하지 않는다. 기본 체인만
+         * 다시 만들면 그 경로의 클라이언트는 이전 캐시 크기나 검증 설정으로 답을 받는다.
+         */
+        if groups.contains(&ApplyGroup::Chain)
+            && (has_client_upstream_routes(&previous_cfg) || has_client_upstream_routes(next))
+        {
+            return Ok((false, changed));
+        }
 
         // hot-apply:begin
         if groups.contains(&ApplyGroup::Tls) {
@@ -538,7 +547,8 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             let rebuild = chain_rebuild.lock_recover().clone();
             match rebuild {
                 Some(rebuild) => {
-                    let rebuilt = rebuild(next).and_then(|()| {
+                    let plan = resolver_chain::ChainPlan::new(next);
+                    let rebuilt = rebuild(&plan).and_then(|()| {
                         cache_slot
                             .lock_recover()
                             .clone()
