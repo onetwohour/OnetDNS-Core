@@ -5379,7 +5379,7 @@ pub fn serve(
                         })
                     })
                     .collect::<BoxResult<_>>()?;
-                let mut recursor = onetdns_recurse::Recursor::new(recursor_roots(cfg), timeout)
+                let mut recursor = new_recursor(recursor_roots(cfg), timeout)
                     .with_recursion_limit(cfg.recursion_limit)
                     .with_cname_limit(cfg.cname_limit)
                     .with_dname_limit(cfg.dname_limit)
@@ -5439,7 +5439,7 @@ pub fn serve(
                 }
 
                 if let Some(thread) =
-                    warn_if_dns53_hijacked(recursor_roots(cfg), timeout, shutdown.clone())
+                    detect_dns53_interception(recursor_roots(cfg), timeout, shutdown.clone())
                 {
                     track_service_thread(&thread_tracker, thread);
                 }
@@ -6472,6 +6472,29 @@ fn base_url(addr: SocketAddr) -> String {
     }
 }
 
+/**
+ * @brief 관리 API 응답이 성공일 때만 본문을 돌려준다.
+ *
+ * @details 요청이 거절되어도 HTTP 응답 자체는 도착하므로, 상태 코드를 보지 않으면 인증
+ *          실패나 리더가 아닌 노드의 거절을 성공으로 출력하게 된다. 서버가 보낸 error
+ *          문구가 있으면 그 문구를 오류로 쓴다.
+ */
+fn ctl_body(resp: http::Resp) -> BoxResult<String> {
+    let status = resp.status;
+    let body = resp.into_string()?;
+    if (200..300).contains(&status) {
+        return Ok(body);
+    }
+    let message = onetdns_core::json::parse(&body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| body.trim().to_owned());
+    if message.is_empty() {
+        crate::bail!("관리 API가 요청을 거절했습니다(HTTP {status})");
+    }
+    crate::bail!("관리 API가 요청을 거절했습니다(HTTP {status}): {message}")
+}
+
 /** @brief 토큰을 인증 헤더 값으로. */
 fn bearer(token: &str) -> String {
     format!("Bearer {token}")
@@ -6481,12 +6504,12 @@ fn bearer(token: &str) -> String {
 fn ctl_stats(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
-    let body = http::get(&format!("{base}/v1/stats"))
+    let resp = http::get(&format!("{base}/v1/stats"))
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?
-        .into_string()?;
+        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+    let body = ctl_body(resp)?;
 
     println!("{body}");
     Ok(())
@@ -6496,12 +6519,12 @@ fn ctl_stats(ctl: &CtlArgs) -> BoxResult<()> {
 fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
-    let body = http::get(&format!("{base}/v1/top"))
+    let resp = http::get(&format!("{base}/v1/top"))
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?
-        .into_string()?;
+        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+    let body = ctl_body(resp)?;
     let v = onetdns_core::json::parse(&body)
         .map_err(|e| crate::anyhow!("관리 API 응답을 해석하지 못했습니다: {e}"))?;
     let show = |label: &str, key: &str| {
@@ -6526,12 +6549,12 @@ fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
 fn ctl_reload(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
-    let body = http::post(&format!("{base}/v1/reload"))
+    let resp = http::post(&format!("{base}/v1/reload"))
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?
-        .into_string()?;
+        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+    let body = ctl_body(resp)?;
     println!("설정을 다시 불러왔습니다: {body}");
     Ok(())
 }
@@ -6541,14 +6564,14 @@ fn ctl_add(kind: &str, domain: &str, ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
     let json = format!("{{\"domain\":{}}}", onetdns_core::json::escape(domain));
-    let body = http::post(&format!("{base}/v1/{kind}"))
+    let resp = http::post(&format!("{base}/v1/{kind}"))
         .header("Authorization", &bearer(&token))
         .header("Content-Type", "application/json")
         .resolver(resolver)
         .body_string(&json)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?
-        .into_string()?;
+        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+    let body = ctl_body(resp)?;
     println!("{kind} 규칙에 {domain}을 추가했습니다: {body}");
     Ok(())
 }
@@ -7382,7 +7405,7 @@ fn blocklist_bootstrap(cfg: &Config) -> Vec<IpAddr> {
 fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
     let bootstrap = blocklist_bootstrap(cfg);
     let recursor = Arc::new(
-        onetdns_recurse::Recursor::new(recursor_roots(cfg), Duration::from_secs(8))
+        new_recursor(recursor_roots(cfg), Duration::from_secs(8))
             .with_recursive_cache_ttl_max(cfg.max_ttl as u32),
     );
     let success_ttl_cap_secs = cfg.max_ttl.min(HOST_RESOLVER_CACHE_TTL_MAX_SECS);
@@ -13733,8 +13756,35 @@ fn recursor_roots(cfg: &Config) -> Vec<SocketAddr> {
     }
 }
 
-/** @brief 일반 DNS가 중간에서 가로채이는지 확인하고 알린다. 가로채이면 재귀가 무의미하다. */
-fn warn_if_dns53_hijacked(
+/**
+ * @brief 권한 서버에 TCP로만 물을지의 판정. 프로세스에 하나만 둔다.
+ *
+ * @details UDP 53번 가로채기는 호스트 망의 성질이라 설정을 다시 읽어도 바뀌지 않는다.
+ *          재귀기마다 따로 두면 다시 읽을 때 새로 만든 재귀기가 판정을 잃는다.
+ */
+fn authority_tcp_switch() -> Arc<std::sync::atomic::AtomicBool> {
+    /** @brief 판정 값. */
+    static SWITCH: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    SWITCH
+        .get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
+/** @brief 가로채기 판정을 공유하는 재귀기를 만든다. */
+fn new_recursor(roots: Vec<SocketAddr>, timeout: Duration) -> onetdns_recurse::Recursor {
+    onetdns_recurse::Recursor::new(roots, timeout).with_authority_tcp(authority_tcp_switch())
+}
+
+/**
+ * @brief 일반 DNS가 중간에서 가로채이는지 확인한다.
+ *
+ * @details 루트 서버는 비재귀 질의에 위임만 돌려주므로, 주소 답이 오면 중간에서 다른 것이
+ *          대신 답한 것이다. UDP로 물은 루트가 하나도 답하지 않는 망도 있다. 두 경우 모두
+ *          같은 루트에 TCP로 다시 물어 위임이 오면 권한 서버 질의를 TCP로 돌린다. TCP까지
+ *          가로채이면 재귀를 쓸 수 없으므로 경고만 남긴다.
+ */
+fn detect_dns53_interception(
     roots: Vec<SocketAddr>,
     timeout: Duration,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -13749,7 +13799,7 @@ fn warn_if_dns53_hijacked(
     match std::thread::Builder::new()
         .name("dns53-hijack-probe".into())
         .spawn(move || {
-            use onetdns_proto::{DnsClass, Header, Message, Question, RData, RecordType};
+            use onetdns_proto::{DnsClass, Header, Message, Question, RecordType};
             let Ok(name) = onetdns_proto::Name::from_str("example.com") else {
                 return;
             };
@@ -13769,6 +13819,17 @@ fn warn_if_dns53_hijacked(
             let Ok(wire) = probe.try_encode() else {
                 return;
             };
+            let tcp_gives_referral = |root: SocketAddr| {
+                onetdns_forward::query_server_over(
+                    root,
+                    &probe,
+                    probe_timeout,
+                    onetdns_forward::AuthorityTransport::Tcp,
+                    false,
+                )
+                .is_ok_and(|tcp| !is_forged_root_answer(&tcp))
+            };
+            let mut silent_root = None;
             'roots: for root in roots.iter().take(3) {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
@@ -13796,7 +13857,10 @@ fn warn_if_dns53_hijacked(
                                 error.kind(),
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) && std::time::Instant::now() < deadline => {}
-                        Err(_) => continue 'roots,
+                        Err(_) => {
+                            silent_root.get_or_insert(*root);
+                            continue 'roots;
+                        }
                     }
                 };
                 if from != *root {
@@ -13806,13 +13870,31 @@ fn warn_if_dns53_hijacked(
                     continue;
                 };
 
-                if resp.answers.iter().any(|r| matches!(r.rdata, RData::A(_))) {
+                if !is_forged_root_answer(&resp) {
+                    return;
+                }
+                if tcp_gives_referral(*root) {
+                    authority_tcp_switch().store(true, Ordering::Relaxed);
+                    onetdns_core::warn!(event = "net.port53_udp_intercepted",
+                        root = %root,
+                        "외부 UDP 53번이 가로채져 있어 재귀 해석의 권한 서버 질의를 TCP로 보냅니다"
+                    );
+                } else {
                     onetdns_core::warn!(event = "net.port53_intercepted",
                         root = %root,
                         "외부 53번 포트가 가로채져 직접 재귀 해석을 사용할 수 없습니다. 암호화 업스트림 DNS 서버 사용을 권장합니다"
                     );
                 }
                 return;
+            }
+            if let Some(root) = silent_root {
+                if !shutdown.load(Ordering::Relaxed) && tcp_gives_referral(root) {
+                    authority_tcp_switch().store(true, Ordering::Relaxed);
+                    onetdns_core::warn!(event = "net.port53_udp_blocked",
+                        root = %root,
+                        "루트 서버가 UDP 53번으로 답하지 않아 재귀 해석의 권한 서버 질의를 TCP로 보냅니다"
+                    );
+                }
             }
         })
     {
@@ -13823,6 +13905,13 @@ fn warn_if_dns53_hijacked(
             None
         }
     }
+}
+
+/** @brief 루트 서버가 비재귀 질의에 줄 수 없는 주소 답이 들어 있는지. */
+fn is_forged_root_answer(resp: &onetdns_proto::Message) -> bool {
+    resp.answers
+        .iter()
+        .any(|r| matches!(r.rdata, onetdns_proto::RData::A(_)))
 }
 
 /**
@@ -13865,7 +13954,7 @@ fn spawn_ta_signaling(
         .spawn(move || loop {
             let current = anchors.load();
             if let Some(label) = ta_signal_label(&current) {
-                let r = onetdns_recurse::Recursor::new(roots.clone(), timeout)
+                let r = new_recursor(roots.clone(), timeout)
                     .with_server_acl(deny.clone(), allow.clone())
                     .with_recursive_cache_ttl_max(max_ttl)
                     .with_trust_anchors(current.to_vec());
@@ -13962,7 +14051,7 @@ fn spawn_rfc5011(
                 hold_down_secs: onetdns_dnssec::anchor::DEFAULT_HOLD_DOWN_SECS,
             });
 
-        let fetcher = onetdns_recurse::Recursor::new(roots, timeout)
+        let fetcher = new_recursor(roots, timeout)
             .with_server_acl(deny, allow)
             .with_recursive_cache_ttl_max(max_ttl)
             .with_dnssec();

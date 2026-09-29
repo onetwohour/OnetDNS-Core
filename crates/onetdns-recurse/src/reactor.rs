@@ -605,6 +605,12 @@ impl Reactor {
         if cd && !r.ignore_cd {
             return SubmitOutcome::Rejected;
         }
+        /*
+         * 이 레인은 UDP만 보내므로, TCP로만 물어야 하는 동안에는 동기 경로에 맡긴다.
+         */
+        if r.authority_over_tcp() {
+            return SubmitOutcome::Rejected;
+        }
         let key = (qname.canonical_key(), qtype);
         if self.cfg.singleflight {
             if let Some(&leader) = self.inflight.get(&key) {
@@ -1559,6 +1565,34 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[test]
+    /** @brief 권한 서버에 TCP로만 물어야 하는 동안에는 UDP만 쓰는 레인이 제출을 거절하는지. */
+    fn reactor_rejects_while_authority_tcp_switch_is_on() {
+        let root: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let recursor = Recursor::new(vec![root], Duration::from_millis(200))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()])
+            .with_authority_tcp(switch.clone());
+        let qname = Name::from_str("example.").unwrap();
+        let mut reactor = Reactor::new(ReactorConfig::default());
+        assert!(matches!(
+            reactor.submit(
+                &recursor,
+                qname.clone(),
+                RecordType::A,
+                1,
+                Instant::now(),
+                false
+            ),
+            SubmitOutcome::Rejected
+        ));
+        switch.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            reactor.submit(&recursor, qname, RecordType::A, 2, Instant::now(), false),
+            SubmitOutcome::Accepted
+        ));
     }
 
     #[test]

@@ -2136,12 +2136,26 @@ fn store_state(path: &Path, state: &StableView) -> Result<[u8; 32], String> {
 }
 
 /**
+ * @brief 상태 파일이 놓일 디렉터리.
+ *
+ * @details 디렉터리 없이 파일 이름만 적힌 상대 경로는 parent 가 None 이 아니라 빈 경로를
+ *          돌려준다. 빈 경로는 열 수 없어서 디렉터리 fsync 가 실패하고 노드가 시작하지
+ *          못하므로 현재 디렉터리로 바꾼다.
+ */
+fn state_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/**
  * @brief 임시 파일에 쓰고 fsync한 뒤 제자리로 옮긴다.
  * @warning 제자리에 바로 쓰면 중간에 죽었을 때 반쯤 쓰인 상태 파일이 남아 노드가 기동조차
  *          못 한다. 디렉터리도 함께 fsync해야 이름 바꾸기가 실제로 남는다.
  */
 fn write_state_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = state_parent(path);
     fs::create_dir_all(parent).map_err(|error| {
         format!("Raft 상태 파일을 저장할 디렉터리를 만들지 못했습니다: {error}")
     })?;
@@ -2173,6 +2187,11 @@ fn write_state_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("Raft 상태 파일에 데이터를 쓰지 못했습니다: {error}"))?;
         file.sync_all()
             .map_err(|error| format!("Raft 상태 파일을 디스크에 동기화하지 못했습니다: {error}"))?;
+        /*
+         * 연 채로 이름을 바꾸면 WSL 의 Windows 드라이브(9p)에서는 새 이름으로 권한을 바꿀 때
+         * 파일을 찾지 못한다. 이름을 바꾸기 전에 닫는다.
+         */
+        drop(file);
         replace_state_file(&tmp, path)
             .map_err(|error| format!("Raft 상태 파일을 원자적으로 교체하지 못했습니다: {error}"))?;
         restrict_state_file(path).map_err(|error| {
@@ -2330,6 +2349,20 @@ fn restrict_state_file(_path: &Path) -> std::io::Result<()> {
 /** @brief 갈라진 망에서의 합의, 기록 복구, 그리고 묶어 저장하기. */
 mod tests {
     use super::*;
+
+    #[test]
+    /** @brief 파일 이름만 적은 상태 경로도 현재 디렉터리에 저장되는지. */
+    fn state_parent_of_bare_file_name_is_current_dir() {
+        assert_eq!(
+            state_parent(Path::new("n1.toml.raft-1.state")),
+            Path::new(".")
+        );
+        assert_eq!(
+            state_parent(Path::new("dir/n1.toml.raft-1.state")),
+            Path::new("dir")
+        );
+        assert!(sync_state_parent(state_parent(Path::new("bare.state"))).is_ok());
+    }
 
     /** @brief 테스트용 노드 집합. */
     struct Cluster {

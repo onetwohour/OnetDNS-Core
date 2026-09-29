@@ -158,6 +158,14 @@ pub struct Recursor {
     /** @brief 0x20 인코딩. 질의 이름의 대소문자를 섞어 응답 위조 난도를 올린다. */
     caps_for_id: bool,
 
+    /**
+     * @brief 참이면 권한 서버에 TCP로만 묻는다.
+     * @details UDP 53번이 중간에서 가로채이는지는 인스턴스가 아니라 호스트 망의 성질이다.
+     *          설정을 다시 읽어 인스턴스를 새로 만들어도 판정이 이어지도록, 판정하는 쪽이
+     *          가진 값을 공유한다.
+     */
+    authority_tcp: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
     /** @brief 나가는 질의 이름을 소문자로 내린다. 캐시 적중률을 올리지만 0x20과는 함께 쓸 수 없다. */
     lowercase_outgoing: bool,
 
@@ -718,6 +726,7 @@ impl Recursor {
             strict: false,
             permissive: false,
             caps_for_id: true,
+            authority_tcp: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lowercase_outgoing: false,
             ignore_cd: true,
             deny_servers: Vec::new(),
@@ -738,6 +747,21 @@ impl Recursor {
             dnskey_cache: std::sync::Mutex::new(LruMap::new(DNSKEY_CACHE_MAX)),
             validated_keys: std::sync::Mutex::new(LruMap::new(VALIDATED_KEY_CACHE_MAX)),
         }
+    }
+
+    /** @brief 권한 서버에 TCP로만 물을지를 이 값으로 정한다. 값은 부른 쪽이 바꾼다. */
+    pub fn with_authority_tcp(
+        mut self,
+        switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.authority_tcp = switch;
+        self
+    }
+
+    /** @brief 지금 권한 서버에 TCP로만 묻고 있는지. */
+    pub fn authority_over_tcp(&self) -> bool {
+        self.authority_tcp
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /** @brief NSEC3 반복 상한을 바꾼다. 보안 하드 상한 150보다 높게는 설정되지 않는다. */
@@ -2645,11 +2669,18 @@ impl Recursor {
             }
             let attempt_timeout = per_server.min(remaining);
             let start = Instant::now();
-            let result = if self.caps_for_id {
-                onetdns_forward::query_server_case_merged(s, &sent, attempt_timeout)
+            let transport = if self.authority_over_tcp() {
+                onetdns_forward::AuthorityTransport::Tcp
             } else {
-                onetdns_forward::query_server(s, &sent, attempt_timeout)
+                onetdns_forward::AuthorityTransport::Udp
             };
+            let result = onetdns_forward::query_server_over(
+                s,
+                &sent,
+                attempt_timeout,
+                transport,
+                self.caps_for_id,
+            );
             match result {
                 Ok(r) => {
                     if self.caps_for_id && !questions_case_exact(&r.questions, &sent.questions) {
@@ -5117,9 +5148,7 @@ mod tests {
         port: u16,
         respond: impl Fn(&Message) -> Message + Send + Sync + 'static,
     ) -> SocketAddr {
-        use std::io::{Read, Write};
         let addr: SocketAddr = format!("{bind_ip}:{port}").parse().unwrap();
-        let respond = std::sync::Arc::new(respond);
 
         let udp = UdpSocket::bind(addr).unwrap();
         std::thread::spawn(move || {
@@ -5137,6 +5166,16 @@ mod tests {
             }
         });
 
+        spawn_tcp_server(addr, respond)
+    }
+
+    /** @brief 주어진 응답 규칙으로 답하는 테스트용 TCP DNS 서버를 시작한다. */
+    fn spawn_tcp_server(
+        addr: SocketAddr,
+        respond: impl Fn(&Message) -> Message + Send + Sync + 'static,
+    ) -> SocketAddr {
+        use std::io::{Read, Write};
+        let respond = std::sync::Arc::new(respond);
         let listener = std::net::TcpListener::bind(addr).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -6177,6 +6216,56 @@ mod tests {
                 |record| matches!(&record.rdata, RData::A(ip) if *ip == Ipv4Addr::new(10, 0, 0, 36))
             ),
             "최종 답을 얻지 못했습니다"
+        );
+    }
+
+    #[test]
+    /** @brief UDP가 가로채인 망에서 TCP 판정을 켜면 권한 서버의 진짜 답을 받는지. */
+    fn authority_tcp_switch_bypasses_intercepted_udp() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5412;
+        /** @brief 가로챈 쪽이 UDP로 돌려주는 주소. */
+        const FORGED: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 9);
+        /** @brief 권한 서버가 TCP로 돌려주는 주소. */
+        const REAL: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 44);
+
+        let answer = |req: &Message, ip: Ipv4Addr| {
+            let q = req.questions.first().unwrap().clone();
+            let mut m = base(req);
+            m.header.authoritative = true;
+            if q.qtype == RecordType::A {
+                m.answers.push(Record::new(q.name, 300, RData::A(ip)));
+            }
+            m
+        };
+        let addr = spawn_server("127.0.0.44", PORT, move |req| answer(req, FORGED));
+        spawn_tcp_server(addr, move |req| answer(req, REAL));
+
+        let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rec = Recursor::new(vec![addr], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_authority_tcp(switch.clone());
+        let resolve = |name: &str| {
+            let resp = rec
+                .resolve(&Name::from_str(name).unwrap(), RecordType::A)
+                .expect("답을 받아야 합니다");
+            resp.answers
+                .iter()
+                .find_map(|record| match record.rdata {
+                    RData::A(ip) => Some(ip),
+                    _ => None,
+                })
+                .expect("주소 답이 있어야 합니다")
+        };
+
+        assert_eq!(resolve("udp.intercept"), FORGED);
+        switch.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(rec.authority_over_tcp());
+        assert_eq!(
+            resolve("tcp.intercept"),
+            REAL,
+            "판정을 켰는데도 UDP로 물어 가로챈 답을 받았습니다"
         );
     }
 

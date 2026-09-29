@@ -1751,7 +1751,13 @@ pub fn query_server(
     request: &Message,
     timeout: Duration,
 ) -> Result<Message, ForwardError> {
-    query_server_with_case_policy(server, request, timeout, CasePolicy::Normalized)
+    query_server_with_case_policy(
+        server,
+        request,
+        timeout,
+        CasePolicy::Normalized,
+        AuthorityTransport::Udp,
+    )
 }
 
 /**
@@ -1764,7 +1770,13 @@ pub fn query_server_case_sensitive(
     request: &Message,
     timeout: Duration,
 ) -> Result<Message, ForwardError> {
-    query_server_with_case_policy(server, request, timeout, CasePolicy::Exact)
+    query_server_with_case_policy(
+        server,
+        request,
+        timeout,
+        CasePolicy::Exact,
+        AuthorityTransport::Udp,
+    )
 }
 
 /** @brief 대소문자를 합쳐 비교하는 질의. 0x20 인코딩을 쓰지 않을 때의 경로다. */
@@ -1773,7 +1785,47 @@ pub fn query_server_case_merged(
     request: &Message,
     timeout: Duration,
 ) -> Result<Message, ForwardError> {
-    query_server_with_case_policy(server, request, timeout, CasePolicy::MergedExact)
+    query_server_with_case_policy(
+        server,
+        request,
+        timeout,
+        CasePolicy::MergedExact,
+        AuthorityTransport::Udp,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/** @brief 권한 서버에 직접 질의할 때 쓰는 전송. */
+pub enum AuthorityTransport {
+    /** @brief UDP로 보내고, 잘린 응답이면 TCP로 다시 받는다. */
+    Udp,
+
+    /**
+     * @brief 처음부터 TCP로 보낸다.
+     * @details 중간 장비가 UDP 53번만 가로채 대신 답하는 망에서 쓴다. 그런 망에서는
+     *          UDP 응답이 권한 서버가 보낸 것이 아니다.
+     */
+    Tcp,
+}
+
+/**
+ * @brief 전송을 골라 권한 서버에 직접 질의한다.
+ * @param merge_case 참이면 대소문자를 합쳐 비교하고 부른 쪽 형태로 돌려준다. 거짓이면
+ *                   소문자로 맞춘다.
+ */
+pub fn query_server_over(
+    server: SocketAddr,
+    request: &Message,
+    timeout: Duration,
+    transport: AuthorityTransport,
+    merge_case: bool,
+) -> Result<Message, ForwardError> {
+    let policy = if merge_case {
+        CasePolicy::MergedExact
+    } else {
+        CasePolicy::Normalized
+    };
+    query_server_with_case_policy(server, request, timeout, policy, transport)
 }
 
 /** @brief 대소문자 정책을 인자로 받는 직접 질의의 공통 구현. */
@@ -1782,6 +1834,7 @@ fn query_server_with_case_policy(
     request: &Message,
     timeout: Duration,
     policy: CasePolicy,
+    transport: AuthorityTransport,
 ) -> Result<Message, ForwardError> {
     let normalize_key_case = policy != CasePolicy::Exact;
     let exact_wire_echo = policy != CasePolicy::Normalized;
@@ -1792,7 +1845,14 @@ fn query_server_with_case_policy(
     let key = AuthorityQueryKey::from_wire(server, &wire, normalize_key_case)
         .or_else(|| AuthorityQueryKey::from_request(server, request, normalize_key_case));
     let Some(key) = key else {
-        return query_server_uncollapsed(server, request, timeout, exact_wire_echo, wire);
+        return query_server_uncollapsed(
+            server,
+            request,
+            timeout,
+            exact_wire_echo,
+            wire,
+            transport,
+        );
     };
 
     let acquired = {
@@ -1802,11 +1862,19 @@ fn query_server_with_case_policy(
         acquire_authority_flight(&mut flights, &key)
     };
     let Some((flight, leader)) = acquired else {
-        return query_server_uncollapsed(server, request, timeout, exact_wire_echo, wire);
+        return query_server_uncollapsed(
+            server,
+            request,
+            timeout,
+            exact_wire_echo,
+            wire,
+            transport,
+        );
     };
 
     let mut result = if leader {
-        let result = query_server_uncollapsed(server, request, timeout, exact_wire_echo, wire);
+        let result =
+            query_server_uncollapsed(server, request, timeout, exact_wire_echo, wire, transport);
 
         authority_flights()
             .lock()
@@ -1864,17 +1932,21 @@ fn query_server_uncollapsed(
     timeout: Duration,
     require_exact_question_case: bool,
     mut wire: Vec<u8>,
+    transport: AuthorityTransport,
 ) -> Result<Message, ForwardError> {
     let wire_id = next_id();
     wire[0..2].copy_from_slice(&wire_id.to_be_bytes());
-    let mut response = udp_exchange(
-        server,
-        &wire,
-        wire_id,
-        request,
-        timeout,
-        require_exact_question_case,
-    )?;
+    let mut response = match transport {
+        AuthorityTransport::Udp => udp_exchange(
+            server,
+            &wire,
+            wire_id,
+            request,
+            timeout,
+            require_exact_question_case,
+        )?,
+        AuthorityTransport::Tcp => tcp_exchange(server, &wire, wire_id, request, timeout)?,
+    };
     response.header.id = request.header.id;
     Ok(response)
 }
