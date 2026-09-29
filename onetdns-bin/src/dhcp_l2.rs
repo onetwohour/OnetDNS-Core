@@ -43,12 +43,68 @@ pub fn send_initial_unicast(
 }
 
 /**
+ * @brief DHCP 요청을 받을 소켓을 연다.
+ *
+ * @details 0.0.0.0에 묶은 소켓은 모든 인터페이스의 방송을 받으므로, 그대로 두면 이 서버가
+ *          맡지 않은 망의 기기에까지 답한다. 그 망의 주소는 이 서버의 범위 밖이라 NAK로
+ *          끝나고, NAK를 받은 기기는 쓰던 주소를 버린다. Windows는 서버 주소에 묶은 소켓이
+ *          그 인터페이스로 들어온 방송을 받으므로 서버 주소에 묶는다. Linux는 서버 주소에
+ *          묶으면 방송을 받지 못하므로 0.0.0.0에 묶고, 받을 때 들어온 인터페이스를 함께 읽는다.
+ */
+pub fn bind_server_socket(server_ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    #[cfg(windows)]
+    let socket = onetdns_core::udp::bind((server_ip, port))?;
+    #[cfg(not(windows))]
+    let socket = onetdns_core::udp::bind((Ipv4Addr::UNSPECIFIED, port))?;
+    #[cfg(target_os = "linux")]
+    linux::report_arrival_interface(&socket)?;
+    #[cfg(not(windows))]
+    let _ = server_ip;
+    Ok(socket)
+}
+
+/**
+ * @brief 요청 하나와 그 요청이 들어온 인터페이스 번호를 받는다.
+ * @return 들어온 인터페이스를 알 수 없는 플랫폼이면 번호는 없다.
+ * @retval Err 한도 안에 오지 않았으면 종류가 WouldBlock 이나 TimedOut 인 오류.
+ */
+pub fn recv_request(
+    socket: &UdpSocket,
+    wait: onetdns_core::udp::RecvWait,
+    buf: &mut [u8],
+) -> io::Result<(usize, Option<u32>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = wait;
+        linux::recv_with_interface(socket, buf)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        wait.recv_from(socket, buf).map(|(n, _)| (n, None))
+    }
+}
+
+/** @brief 서버 주소가 붙은 인터페이스 번호. 알 수 없는 플랫폼이면 없다. */
+pub fn served_interface(server_ip: Ipv4Addr) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::interface_index(server_ip).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = server_ip;
+        None
+    }
+}
+
+/**
  * @brief 서버 주소가 붙은 인터페이스로 DHCP 방송을 보낸다.
  * @details 0.0.0.0에 묶인 소켓으로 255.255.255.255에 보내면 커널이 라우팅 표로 나갈 곳을
  *          고른다. 기본 경로가 없는 LAN 전용 장비에서는 전송이 실패하고, WAN과 LAN을 함께
  *          가진 장비에서는 OFFER가 클라이언트가 없는 기본 경로 쪽으로 나간다. Linux는 서버
- *          주소의 인터페이스를 찾아 그리로 내보낸다. 서버 주소가 로컬에 없거나, 그 인터페이스가
- *          방송을 실어 나르지 못하거나, 다른 운영체제면 커널의 선택에 맡긴다.
+ *          주소의 인터페이스를 찾아 그리로 내보낸다. Windows는 소켓을 서버 주소에 묶으므로
+ *          그 주소의 인터페이스로 나간다. 서버 주소가 로컬에 없거나, 그 인터페이스가 방송을
+ *          실어 나르지 못하거나, 다른 운영체제면 커널의 선택에 맡긴다.
  */
 pub fn send_broadcast(
     socket: &UdpSocket,
@@ -165,6 +221,71 @@ mod linux {
     /** @brief 설정한 서버 주소가 속한 인터페이스 번호. */
     pub(super) fn interface_index(server_ip: Ipv4Addr) -> io::Result<u32> {
         interface_name(&Addrs::load()?, server_ip).map(|(_, index)| index)
+    }
+
+    /** @brief 받는 데이터그램마다 들어온 인터페이스를 함께 알려 달라고 한다. */
+    pub(super) fn report_arrival_interface(socket: &UdpSocket) -> io::Result<()> {
+        let on: libc::c_int = 1;
+        // SAFETY: on은 호출 동안 살아 있는 int이고 길이를 정확히 넘긴다.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_PKTINFO,
+                (&raw const on).cast(),
+                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                    .expect("int 크기는 socklen_t 범위"),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /**
+     * @brief 데이터그램 하나와 들어온 인터페이스 번호를 받는다.
+     * @details 소켓 수신 한도에 걸리면 WouldBlock 이나 TimedOut 으로 끝난다.
+     */
+    pub(super) fn recv_with_interface(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, Option<u32>)> {
+        let info_len = u32::try_from(std::mem::size_of::<libc::in_pktinfo>())
+            .expect("in_pktinfo 크기는 u32 범위");
+        // SAFETY: CMSG_SPACE는 길이만 계산한다.
+        let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
+        let mut control = vec![0u8; space];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: 모든 0 비트가 msghdr의 유효한 초기 상태다.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = space as _;
+        // SAFETY: message가 가리키는 버퍼와 제어 자료는 호출 동안 모두 살아 있다.
+        let received = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut message, 0) };
+        let len = usize::try_from(received).map_err(|_| io::Error::last_os_error())?;
+        let mut interface = None;
+        // SAFETY: 커널이 채운 제어 자료를 CMSG 매크로로만 따라가며 msg_controllen 안에서 읽는다.
+        unsafe {
+            let mut header = libc::CMSG_FIRSTHDR(&raw const message);
+            while !header.is_null() {
+                if (*header).cmsg_level == libc::IPPROTO_IP
+                    && (*header).cmsg_type == libc::IP_PKTINFO
+                {
+                    let info = std::ptr::read_unaligned(
+                        libc::CMSG_DATA(header).cast::<libc::in_pktinfo>(),
+                    );
+                    interface = u32::try_from(info.ipi_ifindex).ok();
+                }
+                header = libc::CMSG_NXTHDR(&raw const message, header);
+            }
+        }
+        Ok((len, interface))
     }
 
     /**

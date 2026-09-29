@@ -717,6 +717,12 @@ impl LeasePool {
         self.address_use.get(&ip).copied().unwrap_or(0) > self.own_address_references(identity, ip)
     }
 
+    /** @brief 만료 상태를 치운 뒤 이 클라이언트의 임대 기록이 남아 있는지. */
+    fn has_record(&mut self, identity: &ClientIdentity) -> bool {
+        self.cleanup_expired(crate::unix_now());
+        self.leases.contains_key(identity)
+    }
+
     /** @brief 만료 상태를 치운 뒤 같은 식별자 이외의 주소 참조가 남는지. */
     fn address_used_by_other(&mut self, identity: &ClientIdentity, ip: u32) -> bool {
         self.cleanup_expired(crate::unix_now());
@@ -1732,6 +1738,22 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                     Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg))
                 }
             } else {
+                /*
+                 * 이 서버에 기록이 없는 클라이언트가 같은 망에서 이 서버의 범위 밖 주소를 요청하면
+                 * 같은 망의 다른 서버가 준 주소다. RFC 2131 은 기록이 없는 클라이언트에게 답하지
+                 * 말라고 정한다. NAK 를 보내면 그 기기가 쓰던 주소를 버린다. 이 서버 범위의 주소는
+                 * 이 서버가 맡으므로 NAK 로 거절하고, 망 밖의 주소는 잘못된 망이라는 뜻이므로 NAK 로
+                 * 알린다.
+                 */
+                let outside_pool = want_u < pool.start || want_u > pool.end;
+                if !selecting
+                    && outside_pool
+                    && in_served_subnet(target, cfg)
+                    && !pool.has_record(&identity)
+                {
+                    onetdns_core::debug!(event = "dhcp4.request_ignored", identity = %identity.to_text(), requested = %target, reason = "unknown_client", "기록이 없는 클라이언트의 같은 망 주소 요청이라 답하지 않습니다");
+                    return None;
+                }
                 let reason = if want_u < pool.start || want_u > pool.end {
                     "out_of_range"
                 } else {
@@ -1750,6 +1772,12 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
             None
         }
     }
+}
+
+/** @brief 이 서버가 맡은 서브넷의 주소인지. */
+fn in_served_subnet(ip: Ipv4Addr, cfg: &DhcpConfig) -> bool {
+    let mask = u32::from(cfg.subnet_mask);
+    u32::from(ip) & mask == u32::from(cfg.server_ip) & mask
 }
 
 /** @brief 응답 메시지를 만든다. 거절에는 설정 값을 담지 않는다. */
@@ -1852,6 +1880,21 @@ where
     }
 }
 
+/**
+ * @brief 이 서버가 맡은 망에서 온 요청인지.
+ * @details 중계된 요청은 중계기가 서버 주소로 직접 보내므로 들어온 인터페이스와 무관하다.
+ *          들어온 인터페이스나 서버 인터페이스를 알 수 없으면 받는다.
+ */
+fn from_served_link(giaddr: Ipv4Addr, arrival: Option<u32>, served: Option<u32>) -> bool {
+    if giaddr != Ipv4Addr::UNSPECIFIED {
+        return true;
+    }
+    match (arrival, served) {
+        (Some(arrival), Some(served)) => arrival == served,
+        _ => true,
+    }
+}
+
 /** @brief DHCP 서버를 시작한다. */
 pub fn spawn_dhcp(
     cfg: DhcpConfig,
@@ -1860,15 +1903,16 @@ pub fn spawn_dhcp(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     use onetdns_core::MutexExt;
-    let sock = onetdns_core::udp::bind((Ipv4Addr::UNSPECIFIED, port))?;
+    let sock = crate::dhcp_l2::bind_server_socket(cfg.server_ip, port)?;
     sock.set_broadcast(true)?;
     let wait = onetdns_core::udp::RecvWait::new(Duration::from_millis(500));
     wait.install(&sock)?;
     std::thread::Builder::new().name("dhcp".into()).spawn(move || {
         let mut buf = vec![0u8; DHCP4_RECV_CAPACITY];
+        let mut served = crate::dhcp_l2::served_interface(cfg.server_ip);
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            let n = match wait.recv_from(&sock, &mut buf) {
-                Ok((n, _)) => n,
+            let (n, arrival) = match crate::dhcp_l2::recv_request(&sock, wait, &mut buf) {
+                Ok(received) => received,
                 Err(error) => {
                     if !matches!(
                         error.kind(),
@@ -1883,6 +1927,13 @@ pub fn spawn_dhcp(
                 continue;
             };
             let Some(req) = parse_client_request(&buf[..n]) else { continue };
+            if !from_served_link(req.giaddr, arrival, served) {
+                /* 인터페이스 번호는 인터페이스를 다시 만들면 바뀌므로 버리기 전에 한 번 다시 찾는다. */
+                served = crate::dhcp_l2::served_interface(cfg.server_ip);
+                if !from_served_link(req.giaddr, arrival, served) {
+                    continue;
+                }
+            }
             let reply = handle(&req, &mut pool.lock_recover(), &cfg);
             if let Some(reply) = reply {
                 if reply.msg_type() == Some(ACK) {
@@ -2660,6 +2711,40 @@ mod tests {
         assert_eq!(nak.ciaddr, Ipv4Addr::UNSPECIFIED);
         assert_eq!(nak.siaddr, Ipv4Addr::UNSPECIFIED);
         assert_ne!(nak.flags & BROADCAST_FLAG, 0);
+    }
+
+    #[test]
+    /** @brief 같은 망의 다른 서버가 준 주소에는 답하지 않고, 망 밖의 주소와 기록이 있는 클라이언트에는 거절을 알리는지. */
+    fn unknown_client_on_same_subnet_outside_pool_gets_no_reply() {
+        let c = cfg();
+        let mut pool = LeasePool::new(&c);
+        let stranger = [3, 3, 3, 3, 3, 3];
+        assert!(
+            handle(&request(stranger, [192, 168, 1, 50], None), &mut pool, &c).is_none(),
+            "같은 망의 다른 서버가 준 주소에 NAK를 보내면 그 기기가 주소를 버립니다"
+        );
+        let wrong_network = handle(&request(stranger, [172, 30, 1, 6], None), &mut pool, &c)
+            .expect("망 밖의 주소는 잘못된 망이라고 알려야 합니다");
+        assert_eq!(wrong_network.msg_type(), Some(NAK));
+
+        let known = [4, 4, 4, 4, 4, 4];
+        let ack = handle(&request(known, [192, 168, 1, 100], None), &mut pool, &c).unwrap();
+        assert_eq!(ack.msg_type(), Some(ACK));
+        let moved = handle(&request(known, [192, 168, 1, 50], None), &mut pool, &c)
+            .expect("기록이 있는 클라이언트에게는 거절을 알려야 합니다");
+        assert_eq!(moved.msg_type(), Some(NAK));
+    }
+
+    #[test]
+    /** @brief 중계되지 않은 요청은 서버 인터페이스로 들어온 것만 받는지. */
+    fn requests_from_other_links_are_dropped() {
+        let direct = Ipv4Addr::UNSPECIFIED;
+        let relay = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(from_served_link(direct, Some(3), Some(3)));
+        assert!(!from_served_link(direct, Some(2), Some(3)));
+        assert!(from_served_link(relay, Some(2), Some(3)));
+        assert!(from_served_link(direct, None, Some(3)));
+        assert!(from_served_link(direct, Some(2), None));
     }
 
     #[test]
