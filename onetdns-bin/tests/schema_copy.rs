@@ -13,9 +13,6 @@ mod common;
 use common::{read, root};
 use std::collections::BTreeMap;
 
-/** @brief 지금 있어야 할 설정 항목 수. */
-const EXPECTED_FIELDS: usize = 251;
-
 /** @brief 설명이라기보다 곳만 채운 문장들. */
 const GENERIC_PHRASES: &[&str] = &[
     "관련 보안",
@@ -224,18 +221,6 @@ fn has_hangul(text: &str) -> bool {
 fn has_word(text: &str, words: &[&str]) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| words.contains(&word))
-}
-
-/** @brief 설정 항목 수가 바뀌면 실패한다. 의식적으로 고쳐야 하는 곳이다. */
-#[test]
-fn settings_field_count_is_pinned() {
-    let source = schema();
-    let keys = field_keys(&source);
-    assert_eq!(
-        keys.len(),
-        EXPECTED_FIELDS,
-        "설정 항목 수가 바뀌었습니다. 의도한 변경이면 EXPECTED_FIELDS 를 손으로 고치십시오"
-    );
 }
 
 /** @brief 항목과 문구가 1대1로 맞물리는지. */

@@ -1,11 +1,9 @@
 /*!
- * @brief 빠른 경로 조건과 계층 순서가 말없이 바뀌지 않게 붙든다.
+ * @brief 계층 순서와 hot-apply 의 단계 순서가 말없이 바뀌지 않게 붙든다.
  *
- * @details 소스에서 표시 사이 구간을 그대로 잘라 조건 목록과 계층 순서를 비교한다.
- *          조건 하나가 빠지거나 순서가 바뀌면 여기서 걸린다.
- * @warning 여기 적힌 수와 목록은 계산해서 나온 값이 아니라 일부러 고정해 둔 것이다. 새
- *          설정을 넣었다면 그 설정이 빠른 경로를 막아야 하는지 스스로 판단하고 손으로
- *          고쳐야 한다.
+ * @details 소스에서 표시 사이 구간을 그대로 잘라 계층 순서를 비교하고, hot-apply 경로에서
+ *          검사와 적용의 앞뒤 관계를 확인한다.
+ * @warning 계층 목록은 계산해서 나온 값이 아니라 일부러 고정해 둔 것이다.
  */
 
 /** @brief 검사할 소스. */
@@ -21,114 +19,6 @@ fn gate_body(begin: &str, end: &str) -> String {
         .unwrap_or_else(|| panic!("{end} 표시를 찾지 못했습니다"));
     assert!(start < stop, "{begin}이 {end}보다 앞이어야 합니다");
     MAIN_RS[start..stop].to_string()
-}
-
-/** @brief 조건 구간에서 조건 하나하나를 추출한다. */
-fn conjuncts(body: &str) -> Vec<String> {
-    let stripped: String = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with("//"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    stripped
-        .split("&&")
-        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
-        .map(|part| part.trim_end_matches(';').trim().to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-#[test]
-/** @brief 두 빠른 경로의 조건 목록이 그대로인지. 하나라도 빠지면 그 기능이 없는 것처럼 답이 나간다. */
-fn wire_and_reactor_gates_are_pinned() {
-    let authority = conjuncts(&gate_body(
-        "// authority-wire-gate:begin",
-        "// authority-wire-gate:end",
-    ));
-    let expected_authority = [
-        "let authority = authority_sources_configured(cfg)",
-        "cfg.acme_directory_url.is_none()",
-        "cfg.dynamic_records.is_empty()",
-    ];
-    assert_eq!(
-        authority, expected_authority,
-        "권한 wire 고속 경로 게이트가 바뀌었습니다. 바깥 계층이 권한 응답을 대체할 수 \
-         있다면 고속 경로를 꺼야 합니다. 의도한 변경이면 이 목록을 갱신하십시오."
-    );
-
-    let wire = conjuncts(&gate_body("// wire-gate:begin", "// wire-gate:end"));
-    let expected_wire = [
-        "let wire = cfg.cache_enabled",
-        "cfg.cache_size > 0",
-        "cfg.min_ttl == 0",
-        "!cfg.prefetch",
-        "matches!(cfg.ecs_mode, EcsMode::Off)",
-        "cfg.dns64_prefix.is_none()",
-        "!cfg.rrset_roundrobin",
-        "cfg.clients.iter().all(|c| c.upstreams.is_empty())",
-        "!facts.views_present",
-        "!facts.policy_present",
-        "!cfg.cookies.is_strict()",
-        "cfg.dnstap_file.is_none()",
-        "!authority_sources_configured(cfg)",
-        "cfg.secondary.is_empty()",
-        "cfg.catalog.is_empty()",
-        "cfg.acme_directory_url.is_none()",
-        "cfg.dynamic_records.is_empty()",
-        "(!facts.dhcp_pool || cfg.dhcp_local_domain.is_empty())",
-        "!ipset_layer_active(cfg)",
-        "cfg.name_ratelimit_per_sec == 0",
-        "!cfg.domain_needed",
-        "!cfg.bogus_priv",
-        "!cfg.empty_zones",
-        "!cfg.block_aaaa",
-        "cfg.edns_padding_block == 0",
-    ];
-    assert_eq!(
-        wire, expected_wire,
-        "wire 고속 경로 게이트가 바뀌었습니다. 조건을 **뺐다면** 그 기능이 응답을 \
-         요청 내용만으로 결정하는지 먼저 증명하십시오. 아니면 캐시가 다른 클라이언트의 \
-         답을 돌려줍니다. 의도한 변경이면 이 목록을 갱신하십시오."
-    );
-
-    let reactor = conjuncts(&gate_body("// reactor-gate:begin", "// reactor-gate:end"));
-    let expected_reactor = [
-        "let reactor = cfg!(unix)",
-        "wire",
-        "matches!(cfg.backend, BackendKind::Recurse)",
-        "cfg.serve_stale_secs == 0",
-        "cfg.stub_zones.is_empty()",
-        "cfg.name_ratelimit_per_sec == 0",
-        "cfg.cachedb_redis_host.is_none()",
-        "!cfg.aggressive_nsec",
-        "!cfg.harden_below_nxdomain",
-    ];
-    assert_eq!(
-        reactor, expected_reactor,
-        "리액터 레인 게이트가 바뀌었습니다. 레인은 동기 경로가 하는 일을 대신하므로, \
-         조건을 빼려면 레인이 그 계층의 의미를 똑같이 낸다는 것을 먼저 보여야 합니다."
-    );
-
-    assert!(
-        reactor.iter().any(|part| part == "wire"),
-        "리액터 레인은 wire 고속 경로 적격을 전제로만 켜져야 합니다"
-    );
-}
-
-#[test]
-/** @brief 설정을 새로 넣었을 때 빠른 경로 조건을 살펴보게 만든다. */
-fn adding_a_config_key_forces_a_lane_gate_decision() {
-    /** @brief 지금 설정 항목 수. 일부러 고정해 둔 값이다. */
-    const PINNED_CONFIG_KEYS: usize = 251;
-    let actual = onetdns_config::known_keys().len();
-    assert_eq!(
-        actual, PINNED_CONFIG_KEYS,
-        "설정 키 수가 {PINNED_CONFIG_KEYS} → {actual}로 바뀌었습니다. 새 키가 응답을 \
-         요청 내용만으로 결정하지 않게 만든다면 wire 고속 경로·리액터 레인 게이트에 \
-         반드시 조건을 더하십시오(docs/architecture/fast-paths.md의 wire 경로 규칙). 판단을 마친 뒤 이 수를 \
-         갱신하십시오."
-    );
 }
 
 #[test]
@@ -181,21 +71,21 @@ fn layer_stack_order_is_pinned() {
 /**
  * @brief 교체가 전부 아니면 전무인지.
  *
- * @details 이 그룹을 처리할 코드가 있는지 보는 검사보다 먼저 무엇을 바꾸면, 처리하지 못하는
- *          그룹이 섞여 있을 때 이미 바꿔 놓고 "재시작해야 한다"고 답하게 된다. 인증서를
- *          교체하고 DHCP를 재시작한 뒤에 그렇게 답한 적이 실제로 있었다.
+ * @details 바뀐 키가 모두 재시작 없이 교체할 수 있는지 보는 검사보다 먼저 무엇을 바꾸면,
+ *          재시작해야 하는 키가 섞여 있을 때 이미 바꿔 놓고 "재시작해야 한다"고 답하게 된다.
+ *          인증서를 교체하고 DHCP를 재시작한 뒤에 그렇게 답한 적이 실제로 있었다.
  * @warning 새 그룹 적용 코드는 반드시 이 검사 아래에 넣어야 한다.
  */
 fn hot_apply_checks_before_it_changes_anything() {
     let guard = MAIN_RS
-        .find("!HOT_APPLY_HANDLED_GROUPS.contains(group)")
+        .find(".any(|key| !is_hot_reload_config_change(&previous_cfg, next, key))")
         .expect("교체 가능 여부 검사를 찾지 못했습니다");
     let first_apply = MAIN_RS
         .find("// hot-apply:begin")
         .expect("그룹 적용 구간 표시를 찾지 못했습니다");
     assert!(
         guard < first_apply,
-        "그룹을 처리할 수 있는지 보기 전에 무언가를 바꾸고 있습니다. 적용 코드를 검사 \
+        "재시작 없이 교체할 수 있는지 보기 전에 무언가를 바꾸고 있습니다. 적용 코드를 검사 \
          아래로 옮기십시오. 그러지 않으면 반쯤 바꿔 놓고 재시작하게 됩니다."
     );
 }

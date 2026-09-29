@@ -5,6 +5,8 @@ mod error;
 mod acme;
 /** @brief 응답 캐시와 같은 질의 합치기. */
 mod cache;
+/** @brief 설정 키마다 교체 방법, 클러스터 공유 여부, 빠른 경로 영향을 정한 표. */
+mod config_keys;
 /** @brief 주소별 연결 수 제한. */
 mod connection_limit;
 /** @brief DHCPv4 서버. */
@@ -90,6 +92,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Mutex;
 
 use crate::error::{BoxResult, Context};
+use config_keys::ApplyGroup;
 use onetdns_core::ArcSwap;
 use onetdns_core::MutexExt;
 use std::net::UdpSocket;
@@ -2163,15 +2166,8 @@ pub fn serve(
 
                 let groups = hot_reload_groups(&previous_cfg, next, &changed);
 
-                if groups
-                    .iter()
-                    .any(|group| !HOT_APPLY_HANDLED_GROUPS.contains(group))
-                {
-                    return Ok((false, changed));
-                }
-
                 // hot-apply:begin
-                if groups.contains(&"tls") {
+                if groups.contains(&ApplyGroup::Tls) {
                     // 슬롯이 아직 없으면 이 인증서를 쓰는 수신 주소도 없다. 나중에 주소를
                     // 열 때 그때 설정으로 만들어지므로 지금 할 일이 없다.
                     if let Some(slots) = tls_slots.lock_recover().clone() {
@@ -2182,7 +2178,7 @@ pub fn serve(
                         );
                     }
                 }
-                if groups.contains(&"edge_services") {
+                if groups.contains(&ApplyGroup::EdgeServices) {
                     if let Err(error) =
                         reconcile_edge_services(next, &edge_services, &dhcp_slot, &dhcp6_slot)
                     {
@@ -2206,11 +2202,11 @@ pub fn serve(
                 }
                 if groups
                     .iter()
-                    .any(|group| matches!(*group, "chain" | "forward"))
+                    .any(|group| matches!(*group, ApplyGroup::Chain | ApplyGroup::Forward))
                 {
                     *blocklist_resolver_slot.lock_recover() = blocklist_host_resolver(next);
                 }
-                if groups.contains(&"listeners") {
+                if groups.contains(&ApplyGroup::Listeners) {
                     let Some(sync) = listener_sync.lock_recover().clone() else {
                         return Ok((false, changed));
                     };
@@ -2229,7 +2225,7 @@ pub fn serve(
                         "수신 주소를 설정에 맞췄습니다. 그대로인 주소는 끊기지 않았습니다"
                     );
                 }
-                if groups.contains(&"cluster") {
+                if groups.contains(&ApplyGroup::Cluster) {
                     let Some(restart) = raft_restart.lock_recover().clone() else {
                         return Ok((false, changed));
                     };
@@ -2244,7 +2240,7 @@ pub fn serve(
                         "클러스터를 DNS를 멈추지 않고 다시 띄웠습니다"
                     );
                 }
-                if groups.contains(&"control_tokens") {
+                if groups.contains(&ApplyGroup::ControlTokens) {
                     if next.control_listen != previous_cfg.control_listen {
                         let rebind = control_rebind
                             .lock_recover()
@@ -2267,13 +2263,13 @@ pub fn serve(
                         "제어 토큰을 DNS를 멈추지 않고 갱신했습니다"
                     );
                 }
-                if groups.contains(&"mac_vendor") {
+                if groups.contains(&ApplyGroup::MacVendor) {
                     vendor_db.store(Arc::new(mac::VendorDb::load(next.mac_vendor_db.as_deref())));
                 }
-                if groups.contains(&"dnssec_clock") {
+                if groups.contains(&ApplyGroup::DnssecClock) {
                     onetdns_dnssec::set_accept_expired(next.dnssec_accept_expired);
                 }
-                if groups.contains(&"subscriptions") {
+                if groups.contains(&ApplyGroup::Subscriptions) {
                     *sub_urls.lock_recover() = next.blocklist_urls.clone();
                     let mut titles = next.blocklist_titles.clone();
                     titles.resize(next.blocklist_urls.len(), String::new());
@@ -2292,7 +2288,7 @@ pub fn serve(
                     );
                 }
 
-                let prepared_filter = if groups.contains(&"filter") {
+                let prepared_filter = if groups.contains(&ApplyGroup::Filter) {
                     let subscriptions = sub_meta.lock_recover().clone();
                     let rpz_texts_snapshot = rpz_texts.lock_recover().clone();
                     Some(build_filter_engine_for_config(
@@ -2312,7 +2308,8 @@ pub fn serve(
                     None
                 };
                 let prepared_forward = if backend_uses_forward(next.backend)
-                    && (groups.contains(&"forward") || !backend_uses_forward(previous_cfg.backend))
+                    && (groups.contains(&ApplyGroup::Forward)
+                        || !backend_uses_forward(previous_cfg.backend))
                 {
                     let (resolver, stats) = build_forward_backend(next)?;
                     if let Some(previous) = forward_stats.lock_recover().as_ref() {
@@ -2325,13 +2322,13 @@ pub fn serve(
                 let native_state = if groups.iter().any(|group| {
                     matches!(
                         *group,
-                        "chain"
-                            | "forward"
-                            | "native"
-                            | "policy"
-                            | "views"
-                            | "block_ttl"
-                            | "local_ttl"
+                        ApplyGroup::Chain
+                            | ApplyGroup::Forward
+                            | ApplyGroup::Native
+                            | ApplyGroup::Policy
+                            | ApplyGroup::Views
+                            | ApplyGroup::BlockTtl
+                            | ApplyGroup::LocalTtl
                     )
                 }) {
                     let Some(state) = native_hot_state.lock_recover().clone() else {
@@ -2341,37 +2338,36 @@ pub fn serve(
                 } else {
                     None
                 };
-                let prepared_native = if groups.contains(&"native") {
+                let prepared_native = if groups.contains(&ApplyGroup::Native) {
                     let state = native_state.as_ref().expect("native 상태를 확인했습니다");
                     let current = state.features.load();
                     Some(reconfigure_native_features(&current, next, &changed)?)
                 } else {
                     None
                 };
-                let prepared_policy = if groups.contains(&"policy") {
+                let prepared_policy = if groups.contains(&ApplyGroup::Policy) {
                     Some(Arc::new(build_policy_engine(next)?))
                 } else {
                     None
                 };
-                let prepared_views = if groups.contains(&"views") {
+                let prepared_views = if groups.contains(&ApplyGroup::Views) {
                     Some(build_views(next)?)
                 } else {
                     None
                 };
-                let prepared_persist =
-                    groups
-                        .contains(&"persistence")
-                        .then(|| onetdns_control::PersistOpts {
-                            querylog_file: next
-                                .querylog_file
-                                .clone()
-                                .filter(|path| !path.as_os_str().is_empty()),
-                            stats_file: next
-                                .stats_file
-                                .clone()
-                                .filter(|path| !path.as_os_str().is_empty()),
-                            flush_secs: next.persist_flush_secs,
-                        });
+                let prepared_persist = groups.contains(&ApplyGroup::Persistence).then(|| {
+                    onetdns_control::PersistOpts {
+                        querylog_file: next
+                            .querylog_file
+                            .clone()
+                            .filter(|path| !path.as_os_str().is_empty()),
+                        stats_file: next
+                            .stats_file
+                            .clone()
+                            .filter(|path| !path.as_os_str().is_empty()),
+                        flush_secs: next.persist_flush_secs,
+                    }
+                });
 
                 if let Some(persist) = prepared_persist {
                     stats.reconfigure_persist(persist).map_err(|error| {
@@ -2437,14 +2433,14 @@ pub fn serve(
                         .views
                         .store(Arc::new(views));
                 }
-                if groups.contains(&"block_ttl") {
+                if groups.contains(&ApplyGroup::BlockTtl) {
                     native_state
                         .as_ref()
                         .expect("native 상태를 확인했습니다")
                         .block_ttl
                         .store(next.blocked_response_ttl, Ordering::Release);
                 }
-                if groups.contains(&"local_ttl") {
+                if groups.contains(&ApplyGroup::LocalTtl) {
                     native_state
                         .as_ref()
                         .expect("native 상태를 확인했습니다")
@@ -2454,7 +2450,12 @@ pub fn serve(
                 if groups.iter().any(|group| {
                     matches!(
                         *group,
-                        "chain" | "forward" | "native" | "policy" | "views" | "local_ttl"
+                        ApplyGroup::Chain
+                            | ApplyGroup::Forward
+                            | ApplyGroup::Native
+                            | ApplyGroup::Policy
+                            | ApplyGroup::Views
+                            | ApplyGroup::LocalTtl
                     )
                 }) {
                     native_state
@@ -2463,13 +2464,13 @@ pub fn serve(
                         .wire_epoch
                         .fetch_add(1, Ordering::AcqRel);
                 }
-                if groups.contains(&"acl") {
+                if groups.contains(&ApplyGroup::Acl) {
                     acl_state.replace(runtime_access_control(next));
                 }
-                if groups.contains(&"rate_limit") {
+                if groups.contains(&ApplyGroup::RateLimit) {
                     rate_state.replace(runtime_rate_limiters(next));
                 }
-                if groups.contains(&"query_log") {
+                if groups.contains(&ApplyGroup::QueryLog) {
                     recorder.reconfigure(
                         next.querylog,
                         next.anonymize_client_ip,
@@ -2479,19 +2480,19 @@ pub fn serve(
                         next.stats_retention_secs,
                     );
                 }
-                if groups.contains(&"safe_search") {
+                if groups.contains(&ApplyGroup::SafeSearch) {
                     safe_search.store(next.safe_search, Ordering::Release);
                 }
-                if groups.contains(&"log") {
+                if groups.contains(&ApplyGroup::Log) {
                     onetdns_core::log::set_level_str(next.log_level.as_deref().unwrap_or("info"));
                 }
-                if groups.contains(&"query_source") {
+                if groups.contains(&ApplyGroup::QuerySource) {
                     onetdns_forward::set_query_source(next.query_source, next.query_source_v6);
                 }
-                if groups.contains(&"revocation") {
+                if groups.contains(&ApplyGroup::Revocation) {
                     install_revocation_policy(next, &blocklist_resolver);
                 }
-                if groups.contains(&"authority") {
+                if groups.contains(&ApplyGroup::Authority) {
                     // 접근 설정을 먼저 바꾼다. 영역이 먼저 바뀌면 그 사이에 이전 저장 경로로
                     // 원격 업데이트가 들어가 엉뚱한 파일을 덮는다.
                     let settings = build_authority_settings(next)?;
@@ -2527,7 +2528,7 @@ pub fn serve(
 
                 let previous_runtime = runtime_cfg.load();
                 runtime_cfg.store(Arc::new(next.clone()));
-                if groups.contains(&"chain") {
+                if groups.contains(&ApplyGroup::Chain) {
                     let rebuild = chain_rebuild.lock_recover().clone();
                     match rebuild {
                         Some(rebuild) => {
@@ -2596,7 +2597,7 @@ pub fn serve(
                     }
                 }
 
-                if groups.contains(&"console_accounts") {
+                if groups.contains(&ApplyGroup::ConsoleAccounts) {
                     if let Some(auth) = console_auth.lock_recover().as_ref() {
                         auth.replace_users(build_user_creds(next)?);
                     }
@@ -3053,9 +3054,7 @@ pub fn serve(
                     let hot: Vec<String> = keys
                         .iter()
                         .map(|key| -> &str { key })
-                        .filter(|key| {
-                            is_hot_reload_config_key(key) && !conditional_keys.contains(key)
-                        })
+                        .filter(|key| config_keys::is_hot(key) && !conditional_keys.contains(key))
                         .map(onetdns_core::json::escape)
                         .collect();
                     let conditional: Vec<String> = conditional_keys
@@ -12754,62 +12753,6 @@ fn ensure_raft_runtime(
 }
 
 /**
- * @brief 클러스터가 공유하지 않고 노드마다 따로 두는 설정인지.
- * @details 세 종류다. 첫째는 비밀 값이다. 복제하면 모든 노드가 같은 비밀을 쓰게 되어 한
- *          노드가 유출되면 전부 유출된다. 둘째는 노드 고유 설정이다. 수신 주소, 클러스터
- *          노드 ID, 인증서, DHCP 같은 값은 노드마다 달라야 하며, 복제하면 ID가 겹치거나 없는
- *          주소에 바인딩하려다 서비스가 시작되지 않는다. 셋째는 로컬 파일 경로와 권한 영역
- *          저장소다. 같은 경로가 다른 노드에 있다는 보장이 없고, 권한 영역은 영역 전송으로
- *          따로 동기화한다.
- * @note 여기 포함되지 않는 설정은 모두 클러스터가 공유한다. 노드마다 값이 달라야 하는 키를
- *       새로 만들면 여기에 추가해야 한다. 빠뜨리면 한 노드의 값이 모든 노드에 덮어써진다.
- */
-fn cluster_local_config_key(key: &str) -> bool {
-    /** @brief 이름 그대로 맞춰 보는 노드별 설정. */
-    const EXACT: &[&str] = &[
-        "listen",
-        "workers",
-        "run_as_user",
-        "run_as_group",
-        "proxy_protocol_ports",
-        "query_source",
-        "query_source_v6",
-        "doh_path",
-        "ddr_name",
-        "dnscrypt_provider_name",
-        "users",
-        "tsig_keys",
-        "blocklists",
-        "allowlists",
-        "rpz_files",
-        "dnssec_anchor_file",
-        "wasm_policy",
-        "wasm_plugins",
-        "mac_vendor_db",
-        "querylog_file",
-        "stats_file",
-        "dnstap_file",
-        "dnstap_identity",
-        "secondary",
-        "catalog",
-        "catalog_serve",
-        "xfr_allow",
-        "xfr_tsig_required",
-        "notify",
-        "nsid",
-        "identity",
-        "log_level",
-    ];
-    /** @brief 이 접두사로 시작하는 설정은 모두 노드별이다. */
-    const PREFIXES: &[&str] = &[
-        "listen_", "control_", "cluster_", "tls_", "acme_", "dhcp", "ra_", "tftp_", "zones",
-        "zonemd_", "update_", "ipset_", "cachedb_",
-    ];
-    let key = key.to_ascii_lowercase();
-    EXACT.contains(&key.as_str()) || PREFIXES.iter().any(|prefix| key.starts_with(prefix))
-}
-
-/**
  * @brief 클러스터가 정할 수 있는 설정인지 확인한다.
  * @warning 노드별 설정은 거부한다. 퍼뜨리면 모든 노드가 같은 비밀을 쓰거나 서로 신원이
  *          겹친다.
@@ -12818,7 +12761,7 @@ fn validate_raft_patch_scope(value: &onetdns_core::json::Json) -> Result<(), Str
     let onetdns_core::json::Json::Obj(pairs) = value else {
         return Err("Raft로 전달하는 설정 변경 내용은 JSON 객체여야 합니다".to_string());
     };
-    if let Some((key, _)) = pairs.iter().find(|(key, _)| cluster_local_config_key(key)) {
+    if let Some((key, _)) = pairs.iter().find(|(key, _)| config_keys::node_local(key)) {
         return Err(format!(
             "{key}는 노드마다 따로 두는 설정이라 Raft로 복제할 수 없습니다. 각 노드에서 별도로 설정하십시오"
         ));
@@ -12847,13 +12790,13 @@ fn cluster_follower_must_reject(path: &str, body: &str) -> bool {
         | "/v1/config/rollback" => true,
         "/v1/config/set" => match onetdns_core::json::parse(body) {
             Ok(onetdns_core::json::Json::Obj(fields)) => {
-                fields.iter().any(|(key, _)| !cluster_local_config_key(key))
+                fields.iter().any(|(key, _)| !config_keys::node_local(key))
             }
             _ => false,
         },
         "/v1/config/apply" => match onetdns_config::toml::parse(body) {
             Ok(onetdns_config::toml::Value::Table(fields)) => {
-                fields.keys().any(|key| !cluster_local_config_key(key))
+                fields.keys().any(|key| !config_keys::node_local(key))
             }
             _ => false,
         },
@@ -12897,7 +12840,7 @@ fn cluster_config_changes(
 ) -> Result<Vec<(String, onetdns_core::json::Json)>, String> {
     let keys: Vec<String> = changed_config_keys(before, after)?
         .into_iter()
-        .filter(|key| !cluster_local_config_key(key))
+        .filter(|key| !config_keys::node_local(key))
         .collect();
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -15448,58 +15391,18 @@ fn ipset_layer_active(cfg: &Config) -> bool {
  * @brief 지금 설정으로 세 빠른 경로가 적격인지 판정한다.
  *
  * @details 시작할 때와 설정을 교체할 때 모두 이 함수 하나만 부른다. 두 곳에서 따로
- *          판정하면 교체한 뒤 레인이 이전 조건으로 남아 없는 기능처럼 답한다.
+ *          판정하면 교체한 뒤 레인이 이전 조건으로 남아 없는 기능처럼 답한다. 어느 키가
+ *          경로를 닫는지는 config_keys 의 표가 정하고, 여기서는 경로마다의 전제만 본다.
  * @param cfg    판정할 설정.
  * @param facts  설정만으로 알 수 없는 사실들.
  * @return 세 경로 각각의 적격 여부.
  */
 fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> LaneGates {
-    // wire-gate:begin
-    let wire = cfg.cache_enabled
-        && cfg.cache_size > 0
-        && cfg.min_ttl == 0
-        && !cfg.prefetch
-        && matches!(cfg.ecs_mode, EcsMode::Off)
-        && cfg.dns64_prefix.is_none()
-        && !cfg.rrset_roundrobin
-        && cfg.clients.iter().all(|c| c.upstreams.is_empty())
-        && !facts.views_present
-        && !facts.policy_present
-        && !cfg.cookies.is_strict()
-        && cfg.dnstap_file.is_none()
-        && !authority_sources_configured(cfg)
-        && cfg.secondary.is_empty()
-        && cfg.catalog.is_empty()
-        && cfg.acme_directory_url.is_none()
-        && cfg.dynamic_records.is_empty()
-        && (!facts.dhcp_pool || cfg.dhcp_local_domain.is_empty())
-        && !ipset_layer_active(cfg)
-        && cfg.name_ratelimit_per_sec == 0
-        && !cfg.domain_needed
-        && !cfg.bogus_priv
-        && !cfg.empty_zones
-        && !cfg.block_aaaa
-        && cfg.edns_padding_block == 0;
-    // wire-gate:end
-
-    // authority-wire-gate:begin
-    let authority = authority_sources_configured(cfg)
-        && cfg.acme_directory_url.is_none()
-        && cfg.dynamic_records.is_empty();
-    // authority-wire-gate:end
-
-    // reactor-gate:begin
-    let reactor = cfg!(unix)
-        && wire
-        && matches!(cfg.backend, BackendKind::Recurse)
-        && cfg.serve_stale_secs == 0
-        && cfg.stub_zones.is_empty()
-        && cfg.name_ratelimit_per_sec == 0
-        && cfg.cachedb_redis_host.is_none()
-        && !cfg.aggressive_nsec
-        && !cfg.harden_below_nxdomain;
-    // reactor-gate:end
-
+    use config_keys::{lane_unblocked, Lane};
+    let wire = lane_unblocked(Lane::Wire, cfg, facts);
+    let authority =
+        authority_sources_configured(cfg) && lane_unblocked(Lane::Authority, cfg, facts);
+    let reactor = cfg!(unix) && wire && lane_unblocked(Lane::Reactor, cfg, facts);
     LaneGates {
         wire,
         authority,
@@ -16721,546 +16624,35 @@ fn runtime_rate_limiters(cfg: &Config) -> Vec<Arc<dyn RateLimiter>> {
 }
 
 /**
- * @brief 서버를 재시작하지 않고 바꿀 수 있는 설정들.
- * @warning 여기 넣으려면 실제로 교체하는 코드가 있어야 한다. 없으면 바뀐 줄 알지만
- *          아무 일도 일어나지 않는다.
- */
-const HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "users",
-    "blocklists",
-    "allowlists",
-    "block_rules",
-    "allow_rules",
-    "blocked_services",
-    "safe_search",
-    "rewrites",
-    "local_zones",
-    "refused_domains",
-    "rpz_files",
-    "track_rule_hits",
-    "block_response",
-    "log_level",
-    "acl_allow",
-    "acl_deny",
-    "acl_allow_ids",
-    "acl_deny_ids",
-    "rate_limit_per_sec",
-    "rate_limit_burst",
-    "subnet_rrl_per_sec",
-    "subnet_rrl_burst",
-    "rate_limit_allow",
-    "querylog",
-    "anonymize_client_ip",
-    "querylog_ignored",
-    "querylog_size",
-    "querylog_retention_secs",
-    "stats_retention_secs",
-    "mode",
-    "blocked_response_ttl",
-    "block_aaaa",
-    "dns64_prefix",
-    "dns64_synthall",
-    "rebind_protection",
-    "rebind_allow",
-    "bogus_nxdomain",
-    "recurse_deny_answers",
-    "recurse_allow_answers",
-    "rrset_roundrobin",
-    "service_schedule",
-    "nsid",
-    "cookies",
-    "max_inflight",
-    "dnstap_file",
-    "dnstap_identity",
-    "edns_buffer_size",
-    "hide_identity",
-    "hide_version",
-    "identity",
-    "version",
-    "deny_any",
-    "minimal_responses",
-    "edns_padding_block",
-    "edns_tcp_keepalive_secs",
-    "harden_large_queries",
-    "domain_needed",
-    "bogus_priv",
-    "empty_zones",
-    "local_ttl",
-    "policy",
-    "wasm_policy",
-    "wasm_plugins",
-    "wasm_fail_mode",
-    "views",
-    "querylog_file",
-    "stats_file",
-    "persist_flush_secs",
-    "block_ipv4",
-    "block_ipv6",
-    "query_source",
-    "query_source_v6",
-    "tls_revocation",
-    "tls_revocation_softfail",
-    "mac_vendor_db",
-    "blocklist_urls",
-    "blocklist_titles",
-    "disabled_blocklist_urls",
-    "list_refresh_secs",
-    "rpz_urls",
-    "safe_browsing",
-    "parental_control",
-    "dnssec_accept_expired",
-];
-
-/** @brief 교체하는 코드가 실제로 있는 그룹들. */
-const HOT_APPLY_HANDLED_GROUPS: &[&str] = &[
-    "acl",
-    "acme",
-    "cluster",
-    "control_tokens",
-    "listeners",
-    "mac_vendor",
-    "authority",
-    "dnssec_clock",
-    "edge_services",
-    "block_ttl",
-    "chain",
-    "console_accounts",
-    "filter",
-    "forward",
-    "local_ttl",
-    "log",
-    "metadata",
-    "native",
-    "persistence",
-    "policy",
-    "query_log",
-    "query_source",
-    "rate_limit",
-    "revocation",
-    "safe_search",
-    "subscriptions",
-    "tls",
-    "views",
-];
-
-/**
- * @brief 해석 체인만 다시 만들면 되는 설정들.
- *
- * @details 소켓도 스레드도 건드리지 않는다. 새 체인을 만들어 슬롯에 교체하면 다음
- *          질의부터 새 설정으로 간다.
- */
-const CHAIN_REBUILD_CONFIG_KEYS: &[&str] = &[
-    "backend",
-    "split_default",
-    "split_recurse",
-    "split_forward",
-    "dnssec",
-    "dnssec_strict",
-    "recursion_limit",
-    "cname_limit",
-    "dname_limit",
-    "aggressive_nsec",
-    "harden_below_nxdomain",
-    "root_hints",
-    "prefer_ip4",
-    "prefer_ip6",
-    "cache_size",
-    "min_ttl",
-    "max_ttl",
-    "neg_min_ttl",
-    "neg_max_ttl",
-    "cache_shards",
-    "cache_enabled",
-    "sharded_cache",
-    "serve_stale_secs",
-    "serve_expired_reply_ttl",
-    "serve_expired_client_timeout_ms",
-    "serve_expired_ttl_reset",
-    "serve_stale_refresh",
-    "prefetch",
-    "prefetch_interval_secs",
-    "prefetch_min_hits",
-    "prefetch_ttl_pct",
-    "name_ratelimit_per_sec",
-    "name_ratelimit_labels",
-    "stub_zones",
-    "dhcp_local_domain",
-    "dynamic_records",
-    "ddr_name",
-    "ecs_custom_ip",
-    "acme_directory_url",
-    "val_permissive_mode",
-    "ignore_cd_flag",
-    "root_key_sentinel",
-    "trust_anchor_signaling",
-    "do_ip4",
-    "do_ip6",
-    "qname_minimisation_strict",
-    "harden_referral_path",
-    "use_caps_for_id",
-    "lowercase_outgoing",
-    "bootstrap",
-    "fallback_upstreams",
-    "ecs_mode",
-    "ipset_name_v4",
-    "ipset_name_v6",
-    "ipset_domains",
-    "cachedb_redis_host",
-    "cachedb_redis_port",
-    "cachedb_redis_expire_secs",
-    "ns_recursion_limit",
-    "ns_cache_size",
-    "val_nsec3_max_iterations",
-    "local_a",
-    "local_aaaa",
-    "domain_insecure",
-    "dnssec_rfc5011",
-    "dnssec_anchor_file",
-    "recurse_deny_server",
-    "recurse_allow_server",
-];
-
-/** @brief 무엇이 바뀌었느냐에 따라 갈리는 설정들. */
-/**
- * @brief 권한 영역을 다시 읽으면 되는 설정들.
- *
- * @details 영역 저장소를 새로 만들어 교체하고, 원본 감시 작업을 설정에 맞춰 시작하거나
- *          멈춘다. 소켓도 스레드 풀도 건드리지 않는다.
- */
-const AUTHORITY_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "zones",
-    "zones_dir",
-    "zones_db",
-    "zones_db_table",
-    "zones_postgres",
-    "zones_mysql",
-    "zones_lmdb",
-    "zones_sql_table",
-    "zones_etcd",
-    "zones_etcd_prefix",
-    "zones_etcd_ca",
-    "zones_etcd_user",
-    "zones_etcd_password",
-    "xfr_allow",
-    "xfr_tsig_required",
-    "tsig_keys",
-    "update_allow",
-    "update_policy",
-    "update_tsig_required",
-    "zonemd_check",
-    "zonemd_reject_absence",
-    "secondary",
-    "catalog",
-    "catalog_serve",
-    "dnssec_roll_interval_secs",
-    "notify",
-];
-
-/**
- * @brief 가장자리 서비스만 재시작하면 되는 설정들.
- *
- * @details DHCP·DHCPv6·라우터 광고·TFTP는 DNS와 다른 소켓을 쓴다. 그 서비스만 멈추고 새
- *          설정으로 재시작하므로 이름 해석은 한 건도 끊기지 않는다.
- */
-const EDGE_SERVICE_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "dhcp_enable",
-    "dhcp_server_ip",
-    "dhcp_range_start",
-    "dhcp_range_end",
-    "dhcp_subnet_mask",
-    "dhcp_router",
-    "dhcp_dns",
-    "dhcp_lease_secs",
-    "dhcp_tftp_server",
-    "dhcp_boot_file",
-    "dhcp_lease_file",
-    "dhcp_static_file",
-    "tftp_enable",
-    "tftp_root",
-    "tftp_listen",
-    "tftp_writable",
-    "tftp_write_allow",
-    "tftp_allow_overwrite",
-    "ra_enable",
-    "ra_prefix",
-    "ra_managed",
-    "ra_other",
-    "ra_router_lifetime",
-    "ra_interval",
-    "ra_mtu",
-    "ra_interface_index",
-    "dhcp6_enable",
-    "dhcp6_range_start",
-    "dhcp6_range_end",
-    "dhcp6_dns",
-    "dhcp6_interface_index",
-    "dhcp6_lease_file",
-];
-
-/**
- * @brief 인증서만 교체하면 되는 설정들.
- *
- * @details 수신 소켓은 그대로 두고 인증서 슬롯만 바꾼다. 이미 맺힌 연결은 이전 인증서로
- *          이어지고 다음 연결부터 새 인증서를 쓴다.
- * @warning 암호화 수신 주소가 하나도 없으면 슬롯 자체가 없다. 그때는 재시작해야 한다.
- */
-const TLS_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "tls_cert",
-    "tls_key",
-    "tls_self_signed_host",
-    "tls_client_ca",
-];
-
-/**
- * @brief 발급을 시킬 때 읽는 설정들.
- *
- * @details ACME 발급은 관리 API로 시킬 때만 돈다. 그 자리에서 실행 중 설정을 읽으므로
- *          바꿔 두면 다음 발급부터 새 값으로 간다. 교체할 것이 따로 없다.
- */
-const ACME_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "acme_contact_email",
-    "acme_domains",
-    "acme_challenge",
-    "acme_account_key_file",
-    "acme_cert_file",
-    "acme_key_file",
-];
-
-/**
- * @brief 자기 소켓만 다시 열면 되는 설정들.
- *
- * @details 클러스터와 컨트롤 플레인은 DNS와 다른 수신 주소를 쓴다. 그쪽만 멈추고 재시작하므로
- *          이름 해석은 이어진다.
- * @warning control_listen은 주소가 바뀌면 세대를 넘겨 물려받은 소켓을 못 쓴다. 그래서
- *          여기 없고, 주소가 그대로일 때만 토큰이 갈린다.
- */
-const CLUSTER_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "cluster_peers",
-    "cluster_raft",
-    "cluster_node_id",
-    "cluster_raft_listen",
-    "cluster_raft_peers",
-    "cluster_raft_secret",
-    "cluster_raft_node_key",
-];
-
-/** @brief 제어 토큰만 교체하면 되는 설정들. */
-const CONTROL_TOKEN_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "control_listen",
-    "control_token",
-    "control_admin_tokens",
-    "control_readonly_tokens",
-];
-
-/**
- * @brief 수신 주소만 열고 닫으면 되는 설정들.
- *
- * @details 설정이 그대로인 주소는 손대지 않는다. 새 주소를 모두 연 뒤에 빠진 주소를 닫으므로
- *          살아 있던 주소로 오던 질의는 한 건도 끊기지 않는다.
- * @warning 같은 주소의 워커 수, 프로토콜, DoH 경로를 바꾸면 이전 리스너를 먼저 닫고 연다. 그
- *          사이 잠깐 그 주소가 비고, 새로 열지 못하면 이전 설정으로 다시 연다.
- */
-const LISTENER_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "listen",
-    "workers",
-    "do_udp",
-    "do_tcp",
-    "proxy_protocol_ports",
-    "proxy_protocol_trusted",
-    "listen_dot",
-    "listen_doh",
-    "listen_doq",
-    "listen_doh3",
-    "doh_path",
-    "listen_dnscrypt",
-    "dnscrypt_provider_name",
-];
-
-/**
  * @brief 응답 캐시 아래에서 판정하는 로컬 전용 이름 설정들.
  * @details 판정 결과가 캐시에 담기므로, 이 값을 바꾸면 캐시를 비워야 바뀐 판정이 바로 나간다.
  */
 const LOCAL_ONLY_CONFIG_KEYS: &[&str] = &["domain_needed", "bogus_priv", "empty_zones"];
 
+/** @brief 무엇이 바뀌었느냐에 따라 재시작 여부가 갈리는 설정들. */
 const CONDITIONAL_HOT_RELOAD_CONFIG_KEYS: &[&str] = &["clients"];
-/** @brief 전달 경로만 교체하면 되는 설정들. */
-const FORWARD_HOT_RELOAD_CONFIG_KEYS: &[&str] = &[
-    "upstreams",
-    "upstream_urls",
-    "upstream_strategy",
-    "upstream_concurrency",
-    "query_timeout_secs",
-];
-
-/** @brief 전달 경로만 교체하면 되는 설정인지. */
-fn is_forward_hot_key(key: &str) -> bool {
-    FORWARD_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-}
-
-/** @brief 차단 엔진만 교체하면 되는 설정인지. */
-fn is_filter_hot_key(key: &str) -> bool {
-    matches!(
-        key,
-        "blocklists"
-            | "allowlists"
-            | "block_rules"
-            | "allow_rules"
-            | "blocked_services"
-            | "service_schedule"
-            | "rewrites"
-            | "local_zones"
-            | "refused_domains"
-            | "rpz_files"
-            | "track_rule_hits"
-            | "block_response"
-            | "block_ipv4"
-            | "block_ipv6"
-            | "clients"
-    )
-}
-
-/** @brief 이 설정이 속한 교체 그룹. */
-fn hot_reload_group(key: &str) -> Option<&'static str> {
-    if CHAIN_REBUILD_CONFIG_KEYS.contains(&key) {
-        Some("chain")
-    } else if key == "users" {
-        Some("console_accounts")
-    } else if is_filter_hot_key(key) {
-        Some("filter")
-    } else if is_forward_hot_key(key) {
-        Some("forward")
-    } else if matches!(
-        key,
-        "acl_allow" | "acl_deny" | "acl_allow_ids" | "acl_deny_ids"
-    ) {
-        Some("acl")
-    } else if matches!(
-        key,
-        "rate_limit_per_sec"
-            | "rate_limit_burst"
-            | "subnet_rrl_per_sec"
-            | "subnet_rrl_burst"
-            | "rate_limit_allow"
-    ) {
-        Some("rate_limit")
-    } else if matches!(
-        key,
-        "querylog"
-            | "anonymize_client_ip"
-            | "querylog_ignored"
-            | "querylog_size"
-            | "querylog_retention_secs"
-            | "stats_retention_secs"
-    ) {
-        Some("query_log")
-    } else if key == "safe_search" {
-        Some("safe_search")
-    } else if key == "log_level" {
-        Some("log")
-    } else if key == "blocked_response_ttl" {
-        Some("block_ttl")
-    } else if key == "local_ttl" {
-        Some("local_ttl")
-    } else if matches!(
-        key,
-        "block_aaaa"
-            | "dns64_prefix"
-            | "dns64_synthall"
-            | "rebind_protection"
-            | "rebind_allow"
-            | "bogus_nxdomain"
-            | "recurse_deny_answers"
-            | "recurse_allow_answers"
-            | "rrset_roundrobin"
-            | "nsid"
-            | "cookies"
-            | "max_inflight"
-            | "dnstap_file"
-            | "dnstap_identity"
-            | "edns_buffer_size"
-            | "hide_identity"
-            | "hide_version"
-            | "identity"
-            | "version"
-            | "deny_any"
-            | "minimal_responses"
-            | "edns_padding_block"
-            | "edns_tcp_keepalive_secs"
-            | "harden_large_queries"
-            | "domain_needed"
-            | "bogus_priv"
-            | "empty_zones"
-    ) {
-        Some("native")
-    } else if matches!(
-        key,
-        "policy" | "wasm_policy" | "wasm_plugins" | "wasm_fail_mode"
-    ) {
-        Some("policy")
-    } else if key == "views" {
-        Some("views")
-    } else if matches!(key, "querylog_file" | "stats_file" | "persist_flush_secs") {
-        Some("persistence")
-    } else if AUTHORITY_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("authority")
-    } else if matches!(
-        key,
-        "blocklist_urls"
-            | "blocklist_titles"
-            | "disabled_blocklist_urls"
-            | "list_refresh_secs"
-            | "rpz_urls"
-            | "safe_browsing"
-            | "parental_control"
-    ) {
-        Some("subscriptions")
-    } else if TLS_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("tls")
-    } else if ACME_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("acme")
-    } else if EDGE_SERVICE_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("edge_services")
-    } else if key == "dnssec_accept_expired" {
-        Some("dnssec_clock")
-    } else if key == "mac_vendor_db" {
-        Some("mac_vendor")
-    } else if LISTENER_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("listeners")
-    } else if CLUSTER_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("cluster")
-    } else if CONTROL_TOKEN_HOT_RELOAD_CONFIG_KEYS.contains(&key) {
-        Some("control_tokens")
-    } else if matches!(key, "query_source" | "query_source_v6") {
-        Some("query_source")
-    } else if matches!(key, "tls_revocation" | "tls_revocation_softfail") {
-        Some("revocation")
-    } else if key == "mode" {
-        Some("metadata")
-    } else {
-        None
-    }
-}
 
 /** @brief 직접 바뀐 설정과 그 설정이 다시 만들어야 하는 파생 그룹을 모은다. */
-fn hot_reload_groups(previous: &Config, next: &Config, changed: &[String]) -> Vec<&'static str> {
+fn hot_reload_groups(previous: &Config, next: &Config, changed: &[String]) -> Vec<ApplyGroup> {
     let mut groups = changed
         .iter()
-        .filter_map(|key| hot_reload_group(key))
+        .filter_map(|key| config_keys::hot_group(key))
         .collect::<Vec<_>>();
     // 영역이 생기거나 사라지면 권한 계층이 체인에 얹히고 빠져야 한다. 저장소만 교체하면
     // 영역을 만들어도 그 답을 낼 계층이 없어 SERVFAIL이 나간다.
-    if groups.contains(&"authority") || groups.contains(&"edge_services") {
-        groups.push("chain");
+    if groups.contains(&ApplyGroup::Authority) || groups.contains(&ApplyGroup::EdgeServices) {
+        groups.push(ApplyGroup::Chain);
     }
     /* 로컬 도메인은 DHCP 옵션 15로도 나간다. */
     if changed.iter().any(|key| key == "dhcp_local_domain") {
-        groups.push("edge_services");
+        groups.push(ApplyGroup::EdgeServices);
     }
     // DDR 답은 암호화 수신 주소와 DoH 경로를 체인 생성 시점에 미리 고정한다. 리스너만
     // 교체하면 실제로 닫힌 주소를 계속 광고하므로, DDR이 전후 어느 쪽에든 있으면 함께 만든다.
-    if groups.contains(&"listeners") && (!previous.ddr_name.is_empty() || !next.ddr_name.is_empty())
+    if groups.contains(&ApplyGroup::Listeners)
+        && (!previous.ddr_name.is_empty() || !next.ddr_name.is_empty())
     {
-        groups.push("chain");
+        groups.push(ApplyGroup::Chain);
     }
     // 클러스터 활성 상태나 공용 비밀이 바뀌면 DNS Cookie의 공유 루트도 같은 설정 세대에서
     // 다시 만들어야 한다. native 그룹은 ArcSwap 한 번으로 기존/새 정책 중 하나만 보인다.
@@ -17268,7 +16660,7 @@ fn hot_reload_groups(previous: &Config, next: &Config, changed: &[String]) -> Ve
         || ((previous.cluster_raft || next.cluster_raft)
             && changed.iter().any(|key| key == "cluster_raft_secret"))
     {
-        groups.push("native");
+        groups.push(ApplyGroup::Native);
     }
     groups.sort_unstable();
     groups.dedup();
@@ -17303,21 +16695,6 @@ fn install_revocation_policy(cfg: &Config, resolver: &http::HostResolver) {
 /** @brief 이 backend가 전달 리졸버를 쓰는지. */
 fn backend_uses_forward(backend: BackendKind) -> bool {
     matches!(backend, BackendKind::Forward | BackendKind::Split)
-}
-
-/** @brief 재시작하지 않고 바꿀 수 있는 설정인지. */
-fn is_hot_reload_config_key(key: &str) -> bool {
-    HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || AUTHORITY_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || EDGE_SERVICE_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || TLS_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || ACME_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || CLUSTER_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || LISTENER_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || CONTROL_TOKEN_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || CHAIN_REBUILD_CONFIG_KEYS.contains(&key)
-        || CONDITIONAL_HOT_RELOAD_CONFIG_KEYS.contains(&key)
-        || FORWARD_HOT_RELOAD_CONFIG_KEYS.contains(&key)
 }
 
 /** @brief 클라이언트 설정 변화가 재시작를 요구하는지. 경로가 바뀌면 체인을 다시 지어야 한다. */
@@ -17362,7 +16739,7 @@ fn has_client_upstream_routes(config: &Config) -> bool {
 
 /** @brief 이 변화를 재시작하지 않고 반영할 수 있는지. */
 fn is_hot_reload_config_change(current: &Config, proposed: &Config, key: &str) -> bool {
-    if !is_hot_reload_config_key(key) {
+    if !config_keys::is_hot(key) {
         return false;
     }
     let client_routes_active =
@@ -21124,7 +20501,7 @@ mod tests {
         });
         let changed = config_changed_keys(&applied, &desired).unwrap();
         assert_eq!(changed, vec!["policy".to_string()]);
-        assert_eq!(hot_reload_group("policy"), Some("policy"));
+        assert_eq!(config_keys::hot_group("policy"), Some(ApplyGroup::Policy));
     }
 
     #[test]
@@ -21135,10 +20512,13 @@ mod tests {
      */
     fn revocation_keys_reinstall_the_upstream_hook() {
         for key in ["tls_revocation", "tls_revocation_softfail"] {
-            assert!(is_hot_reload_config_key(key), "{key}");
-            assert_eq!(hot_reload_group(key), Some("revocation"), "{key}");
+            assert!(config_keys::is_hot(key), "{key}");
+            assert_eq!(
+                config_keys::hot_group(key),
+                Some(ApplyGroup::Revocation),
+                "{key}"
+            );
         }
-        assert!(HOT_APPLY_HANDLED_GROUPS.contains(&"revocation"));
     }
 
     #[test]
@@ -21199,7 +20579,11 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(hot_reload_group(key), Some("native"), "{key}");
+            assert_eq!(
+                config_keys::hot_group(key),
+                Some(ApplyGroup::Native),
+                "{key}"
+            );
             let features = reconfigure_native_features(
                 &native::NativeFeatures::default(),
                 &next,
@@ -21211,9 +20595,6 @@ mod tests {
                     && features.minimal_responses == next.minimal_responses,
                 "{key}"
             );
-        }
-        for key in CHAIN_REBUILD_CONFIG_KEYS {
-            assert_ne!(hot_reload_group(key), Some("native"), "{key}");
         }
     }
 
@@ -21314,7 +20695,7 @@ mod tests {
                 "{label}을 갈았는데 그 이름으로 불리지 않았습니다"
             );
             assert!(
-                is_hot_reload_config_key(label) || label == "tsig_keys",
+                config_keys::is_hot(label) || label == "tsig_keys",
                 "{label}은 무중단 그룹에 있어야 합니다"
             );
             mutate(&mut applied);
@@ -22466,7 +21847,7 @@ mod tests {
             "querylog_file",
             "nsid",
         ] {
-            assert!(cluster_local_config_key(key), "{key}");
+            assert!(config_keys::node_local(key), "{key}");
         }
         for key in [
             "mode",
@@ -22480,7 +21861,7 @@ mod tests {
             "block_response",
             "acl_allow",
         ] {
-            assert!(!cluster_local_config_key(key), "{key}");
+            assert!(!config_keys::node_local(key), "{key}");
         }
     }
 
@@ -22735,7 +22116,10 @@ mod tests {
     fn blocklist_resolver_inputs_rebuild_the_resolver_when_changed() {
         for key in ["bootstrap", "upstreams", "root_hints", "max_ttl"] {
             assert!(
-                matches!(hot_reload_group(key), Some("chain" | "forward")),
+                matches!(
+                    config_keys::hot_group(key),
+                    Some(ApplyGroup::Chain | ApplyGroup::Forward)
+                ),
                 "{key}"
             );
         }
@@ -24900,12 +24284,12 @@ name = \"a\"
     #[test]
     /** @brief 어떤 설정을 재시작하지 않고 바꿀 수 있는지 구분하는지. */
     fn hot_reload_key_classification() {
-        assert!(is_hot_reload_config_key("block_rules"));
-        assert!(is_hot_reload_config_key("clients"));
-        assert!(is_hot_reload_config_key("acl_allow"));
-        assert!(is_hot_reload_config_key("querylog"));
-        assert!(is_hot_reload_config_key("listen"));
-        assert!(is_hot_reload_config_key("upstream_urls"));
+        assert!(config_keys::is_hot("block_rules"));
+        assert!(config_keys::is_hot("clients"));
+        assert!(config_keys::is_hot("acl_allow"));
+        assert!(config_keys::is_hot("querylog"));
+        assert!(config_keys::is_hot("listen"));
+        assert!(config_keys::is_hot("upstream_urls"));
         for key in [
             "block_aaaa",
             "dns64_prefix",
@@ -24914,37 +24298,16 @@ name = \"a\"
             "querylog_file",
             "stats_file",
         ] {
-            assert!(
-                is_hot_reload_config_key(key),
-                "{key} must remain hot-reloadable"
-            );
+            assert!(config_keys::is_hot(key), "{key} must remain hot-reloadable");
         }
-        let mut keys = HOT_RELOAD_CONFIG_KEYS.to_vec();
-        keys.extend_from_slice(FORWARD_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CONDITIONAL_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CHAIN_REBUILD_CONFIG_KEYS);
-        keys.extend_from_slice(AUTHORITY_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(EDGE_SERVICE_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(TLS_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(ACME_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CLUSTER_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(LISTENER_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CONTROL_TOKEN_HOT_RELOAD_CONFIG_KEYS);
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(
-            keys.len(),
-            249,
-            "무중단 항목을 늘리거나 줄일 때 의식적으로 고칠 것"
-        );
         let mut cold_keys: Vec<_> = onetdns_config::known_keys()
             .iter()
             .copied()
-            .filter(|key| !is_hot_reload_config_key(key))
+            .filter(|key| !config_keys::is_hot(key))
             .collect();
         cold_keys.sort_unstable();
         assert_eq!(cold_keys, ["run_as_group", "run_as_user"]);
-        assert!(is_hot_reload_config_key("tls_cert"));
+        assert!(config_keys::is_hot("tls_cert"));
     }
 
     #[test]
@@ -25061,7 +24424,7 @@ name = \"a\"
         ];
         for (key, break_it) in breakers {
             assert!(
-                is_hot_reload_config_key(key),
+                config_keys::is_hot(key),
                 "{key}가 무중단 목록에서 빠졌습니다. 테스트를 함께 고치십시오"
             );
             let mut cfg = base.clone();
@@ -25082,7 +24445,7 @@ name = \"a\"
         ];
         for (key, name_it) in ipset_breakers {
             assert!(
-                is_hot_reload_config_key(key),
+                config_keys::is_hot(key),
                 "{key}가 무중단 목록에서 빠졌습니다. 테스트를 함께 고치십시오"
             );
             let mut cfg = base.clone();
@@ -25119,7 +24482,7 @@ name = \"a\"
             ("backend", |c: &mut Config| c.backend = BackendKind::Forward),
         ] {
             assert!(
-                is_hot_reload_config_key(key),
+                config_keys::is_hot(key),
                 "{key}가 무중단 목록에서 빠졌습니다. 테스트를 함께 고치십시오"
             );
             let mut cfg = base.clone();
@@ -25205,7 +24568,7 @@ name = \"a\"
         staged.cluster_raft_secret = "shared-cluster-secret-at-least-32-bytes".into();
         assert_eq!(
             hot_reload_groups(&previous, &staged, &["cluster_raft_secret".to_string()]),
-            vec!["cluster"],
+            vec![ApplyGroup::Cluster],
             "Raft를 켜기 전 비밀 준비는 독립 실행 Cookie를 무효화하지 않습니다"
         );
 
@@ -25214,7 +24577,7 @@ name = \"a\"
 
         assert_eq!(
             hot_reload_groups(&staged, &next, &["cluster_raft".to_string()]),
-            vec!["cluster", "native"]
+            vec![ApplyGroup::Cluster, ApplyGroup::Native]
         );
     }
 
@@ -25253,7 +24616,7 @@ name = \"a\"
         let keys = vec!["listen_doh".to_string()];
         assert_eq!(
             hot_reload_groups(&plain, &changed, &keys),
-            vec!["listeners"]
+            vec![ApplyGroup::Listeners]
         );
 
         let mut with_ddr = plain;
@@ -25262,7 +24625,7 @@ name = \"a\"
         next.ddr_name = with_ddr.ddr_name.clone();
         assert_eq!(
             hot_reload_groups(&with_ddr, &next, &keys),
-            vec!["chain", "listeners"]
+            vec![ApplyGroup::Chain, ApplyGroup::Listeners]
         );
     }
 
@@ -25296,44 +24659,6 @@ name = \"a\"
     }
 
     #[test]
-    /**
-     * @brief 무중단이라고 적어 둔 키가 전부 교체하는 코드에 닿는지.
-     *
-     * @details 목록에만 넣고 그룹을 붙이지 않으면, 바꿨다고 답해 놓고 아무 일도 일어나지
-     *          않는다. 그룹이 처리 목록에 없으면 조용히 재시작으로 떨어진다. 둘 다
-     *          목록을 손으로 고치다 생기는 실수라 여기서 막는다.
-     */
-    fn every_hot_key_reaches_apply_code() {
-        let mut keys = HOT_RELOAD_CONFIG_KEYS.to_vec();
-        keys.extend_from_slice(FORWARD_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CONDITIONAL_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CHAIN_REBUILD_CONFIG_KEYS);
-        keys.extend_from_slice(AUTHORITY_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(EDGE_SERVICE_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(TLS_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(ACME_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CLUSTER_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(CONTROL_TOKEN_HOT_RELOAD_CONFIG_KEYS);
-        keys.extend_from_slice(LISTENER_HOT_RELOAD_CONFIG_KEYS);
-        keys.sort_unstable();
-        keys.dedup();
-
-        let known = onetdns_config::known_keys();
-        for key in &keys {
-            assert!(
-                known.contains(key),
-                "{key}는 설정 항목이 아닙니다. 이름이 바뀌었거나 오타입니다"
-            );
-            let group = hot_reload_group(key)
-                .unwrap_or_else(|| panic!("{key}가 어느 교체 그룹에도 속하지 않습니다"));
-            assert!(
-                HOT_APPLY_HANDLED_GROUPS.contains(&group),
-                "{key}의 그룹 '{group}'을 처리하는 코드가 없습니다"
-            );
-        }
-    }
-
-    #[test]
     /** @brief 목록 출처가 바뀌어도 재시작하지 않는지. */
     fn subscription_source_changes_stay_hot() {
         for key in [
@@ -25345,8 +24670,8 @@ name = \"a\"
             "safe_browsing",
             "parental_control",
         ] {
-            assert!(is_hot_reload_config_key(key), "{key}는 무중단이어야 합니다");
-            assert_eq!(hot_reload_group(key), Some("subscriptions"));
+            assert!(config_keys::is_hot(key), "{key}는 무중단이어야 합니다");
+            assert_eq!(config_keys::hot_group(key), Some(ApplyGroup::Subscriptions));
         }
     }
 
@@ -25355,14 +24680,11 @@ name = \"a\"
     fn unrelated_hot_reload_groups_remain_independently_classified() {
         let mut groups = ["block_rules", "acl_allow"]
             .iter()
-            .filter_map(|key| hot_reload_group(key))
+            .filter_map(|key| config_keys::hot_group(key))
             .collect::<Vec<_>>();
         groups.sort_unstable();
         groups.dedup();
-        assert_eq!(groups, ["acl", "filter"]);
-        assert!(groups
-            .iter()
-            .all(|group| matches!(*group, "acl" | "filter")));
+        assert_eq!(groups, [ApplyGroup::Acl, ApplyGroup::Filter]);
     }
 
     #[test]
@@ -25549,22 +24871,5 @@ mac = [\"00:11:22:33:44:55\"]
         assert_eq!(changed, vec!["cache_size".to_string()]);
 
         assert!(Config::diff_toml(cur, "no_such_key = 1").is_err());
-    }
-
-    #[test]
-    /** @brief 교체할 수 있다고 적은 설정에 실제로 교체하는 코드가 있는지. 없으면 바뀐 줄 알지만 아무 일도 없다. */
-    fn every_hot_reload_key_maps_to_a_handled_apply_group() {
-        let keys = HOT_RELOAD_CONFIG_KEYS
-            .iter()
-            .chain(CONDITIONAL_HOT_RELOAD_CONFIG_KEYS)
-            .chain(FORWARD_HOT_RELOAD_CONFIG_KEYS);
-        for key in keys {
-            let group = hot_reload_group(key)
-                .unwrap_or_else(|| panic!("핫 리로드 키 {key}에 적용 그룹이 없습니다"));
-            assert!(
-                HOT_APPLY_HANDLED_GROUPS.contains(&group),
-                "그룹 {group}(키 {key})은 핫 적용 클로저가 처리하지 않습니다"
-            );
-        }
     }
 }
