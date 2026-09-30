@@ -362,6 +362,7 @@ fn build_catalog_zone(
 fn spawn_zones_dir_watcher(
     dir: std::path::PathBuf,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
+    journal: ZoneJournals,
     notify: NotifySender,
     zonemd: ZonemdPolicy,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -384,28 +385,9 @@ fn spawn_zones_dir_watcher(
             last = std::time::SystemTime::now();
             match src.load() {
                 Ok(new_store) => {
-                    let new_origins: Vec<String> =
-                        new_store.zones().iter().map(|z| z.origin().to_ascii_lower()).collect();
-
-                    for gone in prev_origins.iter().filter(|o| !new_origins.contains(o)) {
-                        if let Ok(n) = onetdns_proto::Name::from_str(gone) {
-                            remove_zone(&store, &n);
-                            onetdns_core::info!(event = "authority.zone_file_removed", origin = %gone, "Removed DNS zone because its zone file was deleted");
-                        }
-                    }
-
-                    let current = store.load();
-                    for z in new_store.zones().iter().filter(|z| zonemd_ok(z, zonemd)) {
-                        let changed = current
-                            .zones()
-                            .iter()
-                            .find(|old| old.origin().eq_ignore_case(z.origin()))
-                            .is_none_or(|old| old.soa().serial != z.soa().serial);
-                        swap_zone(&store, z.clone());
-                        if changed {
-                            notify.enqueue_zone(z);
-                        }
-                    }
+                    let new_origins = apply_source_reload(&store, &journal, &notify, zonemd, &prev_origins, &new_store, |gone| {
+                        onetdns_core::info!(event = "authority.zone_file_removed", origin = %gone, "Removed DNS zone because its zone file was deleted");
+                    });
                     onetdns_core::info!(event = "authority.zones_reloaded_dir", dir = %dir.display(), zones = new_origins.len(), "Replaced running DNS zones with the directory's current contents");
                     prev_origins = new_origins;
                 }
@@ -415,6 +397,53 @@ fn spawn_zones_dir_watcher(
             }
         }
         })
+}
+
+/**
+ * @brief 원본에서 다시 읽은 영역들을 저장소에 반영한다.
+ * @details 원본을 읽는 일은 잠금 밖에서 끝내고, 저장소와 비교해 교체하는 일만 영역 변경 잠금
+ *          아래에서 한다. 시리얼이 바뀐 영역의 IXFR 기록은 새 시리얼로 이어지지 않으므로 지운다.
+ * @param prev_origins 지난번에 이 원본에서 읽은 영역들. 이번에 없으면 저장소에서 뺀다.
+ * @param on_removed 뺀 영역마다 부른다.
+ * @return 이번에 이 원본에서 읽은 영역들.
+ */
+fn apply_source_reload(
+    store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
+    journal: &ZoneJournals,
+    notify: &NotifySender,
+    zonemd: ZonemdPolicy,
+    prev_origins: &[String],
+    new_store: &onetdns_authority::ZoneStore,
+    on_removed: impl Fn(&str),
+) -> Vec<String> {
+    let new_origins: Vec<String> = new_store
+        .zones()
+        .iter()
+        .map(|z| z.origin().to_ascii_lower())
+        .collect();
+    let mut journals = journal.lock_recover();
+    for gone in prev_origins.iter().filter(|o| !new_origins.contains(o)) {
+        if let Ok(n) = onetdns_proto::Name::from_str(gone) {
+            remove_zone(store, &mut journals, &n);
+            on_removed(gone);
+        }
+    }
+    let current = store.load();
+    for z in new_store.zones().iter().filter(|z| zonemd_ok(z, zonemd)) {
+        let changed = current
+            .zones()
+            .iter()
+            .find(|old| old.origin().eq_ignore_case(z.origin()))
+            .is_none_or(|old| old.soa().serial != z.soa().serial);
+        if changed {
+            journals.remove(&z.origin().canonical_key());
+        }
+        swap_zone(store, &mut journals, z.clone());
+        if changed {
+            notify.enqueue_zone(z);
+        }
+    }
+    new_origins
 }
 
 /**
@@ -514,6 +543,7 @@ pub(crate) fn reconcile_zone_watchers(
     cfg: &Config,
     watchers: &ZoneWatchers,
     store: &Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
+    journal: &ZoneJournals,
     notify: &NotifySender,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     tracker: &Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
@@ -554,6 +584,7 @@ pub(crate) fn reconcile_zone_watchers(
             spawn_zones_dir_watcher(
                 std::path::PathBuf::from(dir),
                 store.clone(),
+                journal.clone(),
                 notify.clone(),
                 ZonemdPolicy::of(cfg),
                 shutdown.clone(),
@@ -566,6 +597,7 @@ pub(crate) fn reconcile_zone_watchers(
             spawn_zone_source_watcher(
                 source,
                 store.clone(),
+                journal.clone(),
                 notify.clone(),
                 ZonemdPolicy::of(cfg),
                 shutdown.clone(),
@@ -635,6 +667,7 @@ fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> 
 fn spawn_zone_source_watcher(
     src: std::sync::Arc<dyn onetdns_authority::ZoneSource>,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
+    journal: ZoneJournals,
     notify: NotifySender,
     zonemd: ZonemdPolicy,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -667,26 +700,9 @@ fn spawn_zone_source_watcher(
                         onetdns_core::info!(event = "authority.source_recovered", source = %src.describe(), failures = consecutive_failures, "Store is readable again");
                         consecutive_failures = 0;
                     }
-                    let new_origins: Vec<String> =
-                        new_store.zones().iter().map(|z| z.origin().to_ascii_lower()).collect();
-                    for gone in prev_origins.iter().filter(|o| !new_origins.contains(o)) {
-                        if let Ok(n) = onetdns_proto::Name::from_str(gone) {
-                            remove_zone(&store, &n);
-                            onetdns_core::info!(event = "authority.zone_removed_source", origin = %gone, source = %src.describe(), "Removed DNS zone deleted at the source");
-                        }
-                    }
-                    let current = store.load();
-                    for z in new_store.zones().iter().filter(|z| zonemd_ok(z, zonemd)) {
-                        let changed = current
-                            .zones()
-                            .iter()
-                            .find(|old| old.origin().eq_ignore_case(z.origin()))
-                            .is_none_or(|old| old.soa().serial != z.soa().serial);
-                        swap_zone(&store, z.clone());
-                        if changed {
-                            notify.enqueue_zone(z);
-                        }
-                    }
+                    let new_origins = apply_source_reload(&store, &journal, &notify, zonemd, &prev_origins, &new_store, |gone| {
+                        onetdns_core::info!(event = "authority.zone_removed_source", origin = %gone, source = %src.describe(), "Removed DNS zone deleted at the source");
+                    });
                     onetdns_core::info!(event = "authority.zones_reloaded_source", source = %src.describe(), zones = new_origins.len(), "Replaced running DNS zones with the store's current contents");
                     prev_origins = new_origins;
                 }
@@ -706,9 +722,15 @@ pub(crate) fn serial_gt(a: u32, b: u32) -> bool {
     a != b && a.wrapping_sub(b) < 0x8000_0000
 }
 
-/** @brief 영역 하나를 교체한다. */
+/**
+ * @brief 영역 하나를 교체한다.
+ * @param _held 잠근 ZoneJournals. 잡고 있다는 증거로만 받는다. 영역을 바꾸는 모든 경로가 이
+ *              잠금 아래에서 읽고, 계산하고, 교체해야 한다. 잠금 밖에서 교체하면 동적 갱신이 읽은
+ *              뒤 끼워 넣기 전에 들어온 변경을 그 갱신이 덮어 버린다.
+ */
 pub(crate) fn swap_zone(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
+    _held: &mut ZoneJournalMap,
     zone: onetdns_authority::Zone,
 ) {
     store.update(|current| {
@@ -723,11 +745,16 @@ pub(crate) fn swap_zone(
     });
 }
 
-/** @brief 영역 하나를 뺀다. */
+/**
+ * @brief 영역 하나를 빼고 그 영역의 IXFR 기록도 지운다.
+ * @param journals 잠근 ZoneJournals. swap_zone 과 같은 잠금 규칙을 따른다.
+ */
 pub(crate) fn remove_zone(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
+    journals: &mut ZoneJournalMap,
     origin: &onetdns_proto::Name,
 ) {
+    journals.remove(&origin.canonical_key());
     store.update(|current| {
         let mut next = onetdns_authority::ZoneStore::new();
         for zone in current.zones() {
@@ -971,7 +998,7 @@ pub(crate) fn apply_zone_mutation_locked(
         false
     };
 
-    swap_zone(store, new_zone.clone());
+    swap_zone(store, journals, new_zone.clone());
     if let Some(old) = old_serial {
         journals
             .entry(origin_key)
@@ -1035,7 +1062,45 @@ pub(crate) fn zone_file_mtimes(
 }
 
 /** @brief 영역별 IXFR 기록. 영역 이름의 wire 표기로 찾는다. */
-pub(crate) type ZoneJournals = Arc<Mutex<std::collections::HashMap<Vec<u8>, native::ZoneJournal>>>;
+pub(crate) type ZoneJournalMap = std::collections::HashMap<Vec<u8>, native::ZoneJournal>;
+
+/**
+ * @brief 영역별 IXFR 기록과 영역 변경 잠금.
+ * @details 이 Mutex 가 영역 저장소를 바꾸는 유일한 잠금이다. 동적 갱신, 관리 API, 원본 감시,
+ *          secondary 전송, 설정으로 저장소 전체를 다시 만드는 경로가 모두 이것을 잡는다. 설정
+ *          잠금처럼 바깥 잠금을 잡은 채 이것을 잡을 수는 있다. 이것을 잡은 채로는 NOTIFY 대기열처럼
+ *          이 잠금을 다시 찾지 않는 잠금만 잡는다.
+ */
+pub(crate) type ZoneJournals = Arc<Mutex<ZoneJournalMap>>;
+
+/**
+ * @brief 설정으로 새로 만든 저장소로 통째로 바꾼다.
+ * @details 새 저장소는 원본에서 다시 읽은 것이라, 바뀐 영역의 이전 IXFR 기록은 새 시리얼로
+ *          이어지지 않는다. 시리얼이 달라졌거나 사라진 영역의 기록을 지운다.
+ * @param journals 잠근 ZoneJournals. 새 저장소를 만드는 동안에도 잡고 있어야 한다. 만드는 사이에
+ *                 들어온 동적 갱신은 원본을 다시 읽기 전에 저장까지 끝나 있어야 사라지지 않는다.
+ */
+pub(crate) fn replace_zone_store(
+    store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
+    journals: &mut ZoneJournalMap,
+    next: Arc<onetdns_authority::ZoneStore>,
+) {
+    journals.retain(|key, _| {
+        let current = store
+            .load()
+            .zones()
+            .iter()
+            .find(|zone| zone.origin().canonical_key() == *key)
+            .map(|zone| zone.soa().serial);
+        let replacement = next
+            .zones()
+            .iter()
+            .find(|zone| zone.origin().canonical_key() == *key)
+            .map(|zone| zone.soa().serial);
+        current.is_some() && current == replacement
+    });
+    store.store(next);
+}
 
 /**
  * @brief 한 세대 동안의 권한 영역 상태.
@@ -1099,10 +1164,12 @@ impl ZoneState {
         }
 
         let watchers = Arc::new(ZoneWatchers::default());
+        let journal: ZoneJournals = Arc::new(Mutex::new(std::collections::HashMap::new()));
         reconcile_zone_watchers(
             cfg,
             &watchers,
             &store,
+            &journal,
             &notify,
             shutdown,
             &service_cleanup.tracker(),
@@ -1112,7 +1179,7 @@ impl ZoneState {
         Ok(Self {
             store,
             signers,
-            journal: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            journal,
             notify,
             watchers,
         })
@@ -1513,5 +1580,85 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(store.load().zones()[0].soa().serial, 1);
         assert!(journal.lock_recover().is_empty());
+    }
+
+    /** @brief 이름과 시리얼만 다른 작은 영역. */
+    fn tiny_zone(origin: &str, serial: u32) -> onetdns_authority::Zone {
+        onetdns_authority::parse_zone(
+            &format!("$ORIGIN {origin}.\n@ IN SOA ns admin {serial} 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n"),
+            origin,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    /**
+     * @brief 원본 감시가 진행 중인 영역 변경이 끝날 때까지 기다리는지.
+     * @details 동적 갱신은 영역 변경 잠금을 잡고 읽고, 계산하고, 교체한다. 감시가 그 사이에 끼어들어
+     *          영역을 바꾸면 갱신이 오래된 영역으로 만든 결과로 그 변경을 덮는다.
+     */
+    fn source_reload_waits_for_an_in_flight_zone_mutation() {
+        let mut zones = onetdns_authority::ZoneStore::new();
+        zones.add(tiny_zone("race.test", 1));
+        let store = Arc::new(onetdns_core::ArcSwap::new(Arc::new(zones)));
+        let journal: ZoneJournals = Arc::default();
+
+        let mut held = journal.lock_recover();
+        let reloader = {
+            let store = store.clone();
+            let journal = journal.clone();
+            std::thread::spawn(move || {
+                let mut source = onetdns_authority::ZoneStore::new();
+                source.add(tiny_zone("race.test", 20));
+                apply_source_reload(
+                    &store,
+                    &journal,
+                    &NotifySender::disabled(),
+                    ZonemdPolicy::of(&Config::default()),
+                    &["race.test".to_string()],
+                    &source,
+                    |_| {},
+                );
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            store.load().zones()[0].soa().serial,
+            1,
+            "감시가 진행 중인 변경 사이에 영역을 바꿨다"
+        );
+        swap_zone(&store, &mut held, tiny_zone("race.test", 2));
+        drop(held);
+        reloader.join().unwrap();
+        assert_eq!(store.load().zones()[0].soa().serial, 20);
+    }
+
+    #[test]
+    /** @brief 저장소를 통째로 바꿀 때 시리얼이 그대로인 영역의 IXFR 기록만 남기는지. */
+    fn replacing_the_store_keeps_journals_only_for_unchanged_zones() {
+        let mut zones = onetdns_authority::ZoneStore::new();
+        for (origin, serial) in [("same.test", 1), ("bumped.test", 1), ("gone.test", 1)] {
+            zones.add(tiny_zone(origin, serial));
+        }
+        let store = onetdns_core::ArcSwap::new(Arc::new(zones));
+        let key = |origin: &str| {
+            onetdns_proto::Name::from_str(origin)
+                .unwrap()
+                .canonical_key()
+        };
+        let mut journals = ZoneJournalMap::new();
+        for origin in ["same.test", "bumped.test", "gone.test"] {
+            journals.insert(key(origin), native::ZoneJournal::default());
+        }
+
+        let mut next = onetdns_authority::ZoneStore::new();
+        next.add(tiny_zone("same.test", 1));
+        next.add(tiny_zone("bumped.test", 2));
+        replace_zone_store(&store, &mut journals, Arc::new(next));
+
+        assert!(journals.contains_key(&key("same.test")));
+        assert!(!journals.contains_key(&key("bumped.test")));
+        assert!(!journals.contains_key(&key("gone.test")));
+        assert_eq!(store.load().zones().len(), 2);
     }
 }

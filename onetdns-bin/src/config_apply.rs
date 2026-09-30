@@ -129,9 +129,14 @@ pub(crate) fn is_hot_reload_config_change(current: &Config, proposed: &Config, k
     }
 }
 
-/** @brief 새 계획으로 해석 체인을 다시 만들어 교체하는 함수. */
-pub(crate) type ChainRebuild =
-    Arc<dyn Fn(&resolver_chain::ChainPlan) -> Result<(), String> + Send + Sync>;
+/** @brief 기본 체인을 다시 만드는 핸들과 그 체인이 들어 있는 슬롯. */
+#[derive(Clone)]
+pub(crate) struct ChainRebuild {
+    /** @brief 기본 체인을 만들고 설치한다. */
+    pub(crate) chain: Arc<resolver_chain::DefaultChain>,
+    /** @brief 질의 처리기가 읽는 체인 슬롯. */
+    pub(crate) slot: crate::native::ResolverSlot,
+}
 
 /** @brief 세대가 소유한 보조 작업을 새 설정으로 다시 시작하는 함수. */
 pub(crate) type SecondaryRestart = Arc<dyn Fn(&Config) -> Result<(), String> + Send + Sync>;

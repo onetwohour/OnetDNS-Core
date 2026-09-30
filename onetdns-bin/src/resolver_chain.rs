@@ -366,16 +366,44 @@ impl ForwarderPlan {
     }
 }
 
+/**
+ * @brief 새 재귀 리졸버에 딸려 시작한 보조 작업의 종료 신호.
+ * @details 리졸버를 쓰기로 정하기 전에 버리면 작업을 멈춘다. 멈추지 않으면 아무도 쓰지 않는
+ *          앵커 핸들을 갱신하는 스레드가 세대가 끝날 때까지 남는다.
+ */
+pub(crate) struct PendingJobs(Option<Arc<std::sync::atomic::AtomicBool>>);
+
+impl PendingJobs {
+    /** @brief 이전 작업을 멈추고 이 작업을 등록한다. 신호가 없으면 이전 작업만 멈춘다. */
+    fn adopt(mut self, jobs: &EdgeServices) {
+        jobs.replace_all(self.0.take());
+    }
+}
+
+impl Drop for PendingJobs {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/** @brief 계획대로 만든 기반. 재귀를 쓰면 그 리졸버와 딸린 작업을 함께 가진다. */
+pub(crate) struct PreparedBase {
+    /** @brief 기반 리졸버. */
+    resolver: Arc<dyn native::Resolver>,
+    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    recursor: Option<Arc<onetdns_recurse::Recursor>>,
+    /** @brief 재귀 리졸버에 딸린 작업. */
+    jobs: PendingJobs,
+}
+
 /** @brief 재귀 기반을 만들 때 쓰는 이 세대의 핸들. */
 pub(crate) struct RecursiveBase {
-    /** @brief 재귀 리졸버에 딸린 보조 작업. 새로 만들 때 이전 작업을 멈춘다. */
-    pub(crate) recursor_jobs: Arc<EdgeServices>,
     /** @brief 차단 응답 TTL. */
     pub(crate) block_ttl: Arc<std::sync::atomic::AtomicU32>,
     /** @brief NS 이름에 적용하는 차단 엔진. */
     pub(crate) filter: Arc<SharedFilter>,
-    /** @brief reactor 레인이 쓰는 재귀 리졸버. 새로 만든 것으로 바꿔 넣는다. */
-    pub(crate) lane_recursor: Arc<Mutex<Option<Arc<onetdns_recurse::Recursor>>>>,
     /** @brief 로컬 응답 TTL. */
     pub(crate) local_ttl: Arc<std::sync::atomic::AtomicU32>,
     /**
@@ -389,13 +417,15 @@ pub(crate) struct RecursiveBase {
 }
 
 impl RecursiveBase {
-    /** @brief 계획대로 재귀 리졸버를 만들고 재귀 전용 계층을 얹는다. */
-    fn build(&self, plan: &RecursivePlan) -> BoxResult<Arc<dyn native::Resolver>> {
+    /**
+     * @brief 계획대로 재귀 리졸버를 만들고 재귀 전용 계층을 얹는다.
+     * @details 딸린 작업은 새 종료 신호로 시작하고 등록하지 않는다. 이전 작업은 이 기반을 설치할
+     *          때 멈추므로, 여기서 실패하거나 결과를 버려도 지금 쓰는 리졸버의 작업은 그대로 돈다.
+     */
+    fn build(&self, plan: &RecursivePlan) -> BoxResult<PreparedBase> {
         let Self {
-            recursor_jobs,
             block_ttl,
             filter,
-            lane_recursor,
             local_ttl,
             thread_tracker,
             shutdown,
@@ -420,6 +450,8 @@ impl RecursiveBase {
             })
             .collect::<BoxResult<_>>()?;
         let (deny, allow) = plan.server_acl();
+        let jobs_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let jobs = PendingJobs(Some(jobs_stop.clone()));
         let mut recursor = new_recursor(plan.roots(), timeout)
             .with_recursion_limit(plan.recursion_limit)
             .with_cname_limit(plan.cname_limit)
@@ -447,11 +479,6 @@ impl RecursiveBase {
                 recursor = recursor.with_trust_anchors(load_configured_trust_anchors(path)?);
             }
 
-            /*
-             * 재귀 리졸버를 새로 만들 때마다 이전 보조 작업을 멈춘다. 멈추지 않으면 이전
-             * 작업이 이전 앵커 핸들을 갱신하고 스레드도 계속 늘어난다.
-             */
-            let jobs_stop = recursor_jobs.restart_all();
             if plan.dnssec_rfc5011 {
                 let thread = spawn_rfc5011(plan, recursor.anchors_handle(), jobs_stop.clone())
                     .with_context(|| "Could not start the RFC 5011 trust anchor update thread")?;
@@ -478,9 +505,8 @@ impl RecursiveBase {
         }
 
         let recursor = Arc::new(recursor);
-        *lane_recursor.lock_recover() = Some(recursor.clone());
         let mut base: Arc<dyn native::Resolver> = Arc::new(native::NativeBackend::Recurse {
-            recursor,
+            recursor: recursor.clone(),
             ns_rpz: Some(filter.clone()),
             block_ttl: block_ttl.clone(),
             local_ttl: local_ttl.clone(),
@@ -501,7 +527,11 @@ impl RecursiveBase {
                 plan.neg_max_ttl as u32,
             ));
         }
-        Ok(base)
+        Ok(PreparedBase {
+            resolver: base,
+            recursor: Some(recursor),
+            jobs,
+        })
     }
 }
 
@@ -520,10 +550,14 @@ impl ResolverBase {
     }
 
     /** @brief 계획의 처리 방식에 맞는 기반을 만든다. */
-    pub(crate) fn build(&self, plan: &ChainPlan) -> BoxResult<Arc<dyn native::Resolver>> {
+    fn build(&self, plan: &ChainPlan) -> BoxResult<PreparedBase> {
         Ok(match &plan.base {
             BasePlan::Recurse(recurse) => self.recurse.build(recurse)?,
-            BasePlan::Forward => self.forward(),
+            BasePlan::Forward => PreparedBase {
+                resolver: self.forward(),
+                recursor: None,
+                jobs: PendingJobs(None),
+            },
             BasePlan::Split {
                 recurse,
                 default,
@@ -534,18 +568,108 @@ impl ResolverBase {
                     SplitTarget::Forward => layers::Route::Forward,
                     SplitTarget::Recurse => layers::Route::Recurse,
                 };
-                Arc::new(
-                    layers::SplitResolver::new(
-                        self.forward(),
-                        self.recurse.build(recurse)?,
-                        default,
-                        split_recurse,
-                        split_forward,
-                    )
-                    .map_err(|error| crate::anyhow!(error))?,
-                )
+                let recurse = self.recurse.build(recurse)?;
+                PreparedBase {
+                    resolver: Arc::new(
+                        layers::SplitResolver::new(
+                            self.forward(),
+                            recurse.resolver,
+                            default,
+                            split_recurse,
+                            split_forward,
+                        )
+                        .map_err(|error| crate::anyhow!(error))?,
+                    ),
+                    recursor: recurse.recursor,
+                    jobs: recurse.jobs,
+                }
             }
         })
+    }
+}
+
+/**
+ * @brief 기본 해석 체인을 만들고 이 세대에 설치한다.
+ *
+ * @details 만드는 단계는 실패할 수 있지만 이 세대의 상태를 바꾸지 않는다. 설치 단계는 실패하지
+ *          않는다. 설정 교체는 다른 준비가 모두 끝난 뒤에 설치하므로, 어느 단계에서 실패해도
+ *          지금 쓰는 체인과 그 캐시, 재귀 리졸버의 보조 작업이 그대로 남는다.
+ */
+pub(crate) struct DefaultChain {
+    /** @brief 기반 리졸버를 만드는 핸들. */
+    pub(crate) base: ResolverBase,
+    /** @brief 공통 계층을 쌓는 핸들. */
+    pub(crate) layers: ChainLayers,
+    /** @brief 기본 체인의 응답 캐시를 넣어 두는 슬롯. wire 빠른 경로가 읽는다. */
+    pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
+    /** @brief 재귀 리졸버에 딸린 보조 작업. */
+    pub(crate) recursor_jobs: Arc<EdgeServices>,
+}
+
+/** @brief 만들었지만 아직 설치하지 않은 기본 체인. 설치하지 않고 버리면 딸린 작업도 멈춘다. */
+pub(crate) struct PreparedChain {
+    /** @brief 공통 계층까지 쌓은 체인. */
+    resolver: Arc<dyn native::Resolver>,
+    /** @brief 이 체인의 응답 캐시. */
+    cache: cache::CacheHandle,
+    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    recursor: Option<Arc<onetdns_recurse::Recursor>>,
+    /** @brief 재귀 리졸버에 딸린 작업. */
+    jobs: PendingJobs,
+}
+
+/** @brief 설치한 기본 체인. */
+pub(crate) struct InstalledChain {
+    /** @brief 공통 계층까지 쌓은 체인. */
+    pub(crate) resolver: Arc<dyn native::Resolver>,
+    /** @brief 이 체인의 응답 캐시. */
+    pub(crate) cache: cache::CacheHandle,
+    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    pub(crate) recursor: Option<Arc<onetdns_recurse::Recursor>>,
+}
+
+impl DefaultChain {
+    /** @brief 계획대로 기본 체인을 만든다. 이 세대의 상태는 바꾸지 않는다. */
+    pub(crate) fn prepare(&self, plan: &ChainPlan) -> Result<PreparedChain, String> {
+        let PreparedBase {
+            resolver,
+            recursor,
+            jobs,
+        } = self.base.build(plan).map_err(|error| error.to_string())?;
+        /*
+         * 공유 캐시 이름 공간도 새 계획에서 낸다. 이전 것을 쓰면 처리 방식이나 DNSSEC 을
+         * 바꿔도 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인 것처럼 나온다.
+         */
+        let (resolver, cache) = self.layers.wrap_common_layers(
+            plan,
+            resolver,
+            true,
+            plan.is_split(),
+            plan.cache_namespace(),
+        )?;
+        Ok(PreparedChain {
+            resolver,
+            cache,
+            recursor,
+            jobs,
+        })
+    }
+
+    /** @brief 캐시와 재귀 리졸버를 올리고 이전 보조 작업을 멈춘다. 체인 슬롯은 호출한 쪽이 바꾼다. */
+    pub(crate) fn install(&self, prepared: PreparedChain) -> InstalledChain {
+        let PreparedChain {
+            resolver,
+            cache,
+            recursor,
+            jobs,
+        } = prepared;
+        *self.cache_slot.lock_recover() = Some(cache.clone());
+        jobs.adopt(&self.recursor_jobs);
+        InstalledChain {
+            resolver,
+            cache,
+            recursor,
+        }
     }
 }
 
@@ -554,8 +678,6 @@ impl ResolverBase {
 pub(crate) struct ChainLayers {
     /** @brief 차단 응답 TTL. */
     pub(crate) block_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief 기본 체인의 응답 캐시를 넣어 두는 슬롯. wire 빠른 경로가 읽는다. */
-    pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
     /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
     pub(crate) dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
     /** @brief 로컬 응답 TTL. */
@@ -574,24 +696,22 @@ pub(crate) struct ChainLayers {
 
 impl ChainLayers {
     /**
-     * @brief 기반 위에 공통 계층을 쌓는다.
-     * @param expose_cache_handle  만든 응답 캐시를 cache_slot 에 넣을지. 기본 체인만 넣는다.
+     * @brief 기반 위에 공통 계층을 쌓는다. 이 세대의 상태는 바꾸지 않는다.
      * @param report  켜진 기능을 기록에 남길지.
      * @param split_local_addresses  Split 로컬 주소 계층을 얹을지.
      * @param cache_ns  공유 캐시에서 이 체인이 쓰는 이름 공간.
+     * @return 쌓은 체인과 그 응답 캐시.
      */
     pub(crate) fn wrap_common_layers(
         &self,
         plan: &ChainPlan,
         mut base: Arc<dyn native::Resolver>,
-        expose_cache_handle: bool,
         report: bool,
         split_local_addresses: bool,
         cache_ns: &str,
-    ) -> Result<Arc<dyn native::Resolver>, String> {
+    ) -> Result<(Arc<dyn native::Resolver>, cache::CacheHandle), String> {
         let Self {
             block_ttl,
-            cache_slot,
             dhcp_slot,
             local_ttl,
             local_only_names,
@@ -676,7 +796,7 @@ impl ChainLayers {
         }
 
         let prefetch_backend = plan.prefetch.then(|| chain.clone());
-        let mut prefetch_cache: Option<cache::CacheHandle> = None;
+        let response_cache;
         {
             let positive_cache_enabled = plan.cache_enabled && plan.cache_size > 0;
             let shards = if positive_cache_enabled && plan.sharded_cache {
@@ -695,12 +815,7 @@ impl ChainLayers {
             )
             .with_positive_cache(positive_cache_enabled)
             .with_recorder(recorder.clone());
-            if expose_cache_handle {
-                *cache_slot.lock_recover() = Some(cl.handle());
-            }
-            if plan.prefetch {
-                prefetch_cache = Some(cl.handle());
-            }
+            response_cache = cl.handle();
             chain = Arc::new(cl);
         }
 
@@ -724,8 +839,7 @@ impl ChainLayers {
 
         if plan.prefetch {
             let backend = prefetch_backend.expect("The handler must be ready when prefetch is on");
-            let cache_handle =
-                prefetch_cache.expect("prefetch_cache is set when plan.prefetch is on");
+            let cache_handle = response_cache.clone();
 
             let refresher: layers::PrefetchRefresher = Arc::new(move |req| {
                 let resp = backend.resolve(req)?;
@@ -843,7 +957,98 @@ impl ChainLayers {
             }
         }
 
-        Ok(chain)
+        Ok((chain, response_cache))
         // layer-order:end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /** @brief 전달 기반으로 체인을 만드는 핸들. 재귀 기반은 루트로 탐지 질의를 보내므로 쓰지 않는다. */
+    fn default_chain() -> DefaultChain {
+        let block_ttl = Arc::new(AtomicU32::new(10));
+        let local_ttl = Arc::new(AtomicU32::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        DefaultChain {
+            base: ResolverBase {
+                forward_slot: native::ResolverSlot::new(Arc::new(native::UnbuiltForward)),
+                recurse: RecursiveBase {
+                    block_ttl: block_ttl.clone(),
+                    filter: Arc::new(SharedFilter::from_pointee(
+                        onetdns_filter::BlockEngine::empty(onetdns_core::BlockResponse::NxDomain),
+                    )),
+                    local_ttl: local_ttl.clone(),
+                    thread_tracker: Arc::default(),
+                    shutdown: shutdown.clone(),
+                },
+            },
+            layers: ChainLayers {
+                block_ttl,
+                dhcp_slot: Arc::default(),
+                local_ttl,
+                local_only_names: Arc::new(layers::LocalOnlyNames::new(true, true, true)),
+                recorder: None,
+                shutdown,
+                split_local_wire_cache: Arc::default(),
+                zone_store: Arc::new(ArcSwap::new(Arc::new(onetdns_authority::ZoneStore::new()))),
+            },
+            cache_slot: Arc::default(),
+            recursor_jobs: Arc::default(),
+        }
+    }
+
+    /** @brief 전달만 하는 설정. */
+    fn forward_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.backend = BackendKind::Forward;
+        cfg.listen = vec!["127.0.0.1:5399".parse().unwrap()];
+        cfg
+    }
+
+    #[test]
+    /**
+     * @brief 체인을 만들다 실패하거나 만든 것을 버려도 지금 쓰는 캐시와 보조 작업이 그대로인지.
+     * @details 설정 교체는 체인을 다른 준비와 함께 먼저 만들고, 모두 성공한 뒤에 설치한다. 만드는
+     *          단계가 캐시 슬롯을 바꾸거나 이전 작업을 멈추면, 교체가 실패했는데도 빠른 경로가 쓰지
+     *          않는 캐시를 읽고 신뢰 앵커 갱신이 멈춘다.
+     */
+    fn preparing_a_chain_leaves_the_running_one_alone() {
+        let chain = default_chain();
+        let cfg = forward_config();
+        let running = chain.install(chain.prepare(&ChainPlan::new(&cfg)).unwrap());
+        let old_jobs = chain.recursor_jobs.restart_all();
+
+        let mut broken = cfg.clone();
+        broken.fallback_upstreams = vec!["127.0.0.1:5399".to_string()];
+        assert!(chain.prepare(&ChainPlan::new(&broken)).is_err());
+        drop(chain.prepare(&ChainPlan::new(&cfg)).unwrap());
+
+        let slot = chain.cache_slot.lock_recover().clone().unwrap();
+        assert!(slot.ptr_eq(&running.cache));
+        assert!(!old_jobs.load(Ordering::Acquire));
+
+        let installed = chain.install(chain.prepare(&ChainPlan::new(&cfg)).unwrap());
+        let slot = chain.cache_slot.lock_recover().clone().unwrap();
+        assert!(slot.ptr_eq(&installed.cache));
+        assert!(!slot.ptr_eq(&running.cache));
+        assert!(old_jobs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    /** @brief 설치하지 않고 버린 체인의 보조 작업이 멈추고, 설치한 체인의 작업은 도는지. */
+    fn discarded_recursor_jobs_stop_and_adopted_ones_run() {
+        let discarded = Arc::new(AtomicBool::new(false));
+        drop(PendingJobs(Some(discarded.clone())));
+        assert!(discarded.load(Ordering::Acquire));
+
+        let jobs = EdgeServices::default();
+        let adopted = Arc::new(AtomicBool::new(false));
+        PendingJobs(Some(adopted.clone())).adopt(&jobs);
+        assert!(!adopted.load(Ordering::Acquire));
+        PendingJobs(None).adopt(&jobs);
+        assert!(adopted.load(Ordering::Acquire));
     }
 }

@@ -723,13 +723,24 @@ impl EdgeServices {
      */
     pub(crate) fn restart_all(&self) -> Arc<std::sync::atomic::AtomicBool> {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.replace_all(Some(stop.clone()));
+        stop
+    }
+
+    /**
+     * @brief 등록된 것을 모두 멈추고, 이미 시작해 둔 작업의 종료 신호를 대신 등록한다.
+     * @details 새 재귀 리졸버에 딸린 작업은 그 리졸버를 쓰기로 정하기 전에 시작해 둔다. 쓰기로
+     *          정한 순간에 이 함수로 이전 작업과 바꾼다. 없음을 넘기면 이전 작업만 멈춘다.
+     */
+    pub(crate) fn replace_all(&self, stop: Option<Arc<std::sync::atomic::AtomicBool>>) {
         let mut running = self.running.lock_recover();
         for (_, old) in running.iter() {
             old.store(true, std::sync::atomic::Ordering::Release);
         }
         running.clear();
-        running.push(("recursor-jobs".to_string(), stop.clone()));
-        stop
+        if let Some(stop) = stop {
+            running.push(("recursor-jobs".to_string(), stop));
+        }
     }
 }
 

@@ -25,4 +25,4 @@ pub use metrics::{
     channel, Action, EventDiag, Metrics, MetricsSnapshot, PersistOpts, QueryEvent, Recorder,
     RecorderOpts, RequestTimer, Stats, TopLists,
 };
-pub use password::{hash_password, verify_password};
+pub use password::{hash_password, verify_password, PasswordError};

@@ -1136,16 +1136,7 @@ impl NativeServer {
         let mut new_recs = new_zone.axfr_records();
         new_recs.pop();
         let new_serial = new_zone.soa().serial;
-        store_swap.update(|current| {
-            let mut next = onetdns_authority::ZoneStore::new();
-            for zone in current.zones() {
-                if !zone.origin().eq_ignore_case(&apex) {
-                    next.add(zone.clone());
-                }
-            }
-            next.add(new_zone);
-            next
-        });
+        crate::zones::swap_zone(store_swap, &mut journals, new_zone);
         journals
             .entry(apex.canonical_key())
             .or_default()

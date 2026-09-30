@@ -8,10 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use onetdns_config::Config;
+use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write;
 use crate::notify::NotifySender;
-use crate::zones::{catalog_members, remove_zone, serial_gt, swap_zone, zonemd_ok, ZonemdPolicy};
+use crate::zones::{
+    catalog_members, remove_zone, serial_gt, swap_zone, zonemd_ok, ZoneJournals, ZonemdPolicy,
+};
 use crate::{native, nonblocking_tcp, read_text_limited, tsig_for_secondary, unix_now};
 
 /** @brief 받아 둔 하위 영역을 읽는다. 못 받아도 시작할 수 있게 하려는 것이다. */
@@ -1748,6 +1751,7 @@ fn complete_secondary_refresh(
     xfr_origins: &mut std::collections::HashSet<String>,
     urgent: &mut std::collections::HashSet<String>,
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
+    journal: &ZoneJournals,
     notify: &NotifySender,
     cfg: &Config,
 ) {
@@ -1804,7 +1808,11 @@ fn complete_secondary_refresh(
                         onetdns_core::info!(event = "authority.secondary_ixfr_fallback_axfr", origin = %job.entry.origin, serial, "IXFR response was a full transfer; handled it as AXFR")
                     }
                 }
-                swap_zone(store, *zone);
+                {
+                    let mut journals = journal.lock_recover();
+                    journals.remove(&zone_origin.canonical_key());
+                    swap_zone(store, &mut journals, *zone);
+                }
                 notify.enqueue(&zone_origin, serial);
                 ok = true;
             }
@@ -1821,7 +1829,7 @@ fn complete_secondary_refresh(
                 xfr_origins.remove(gone);
                 ready.retain(|(ready_job, _)| ready_job.entry.origin != *gone);
                 if let Ok(origin) = onetdns_proto::Name::from_str(gone) {
-                    remove_zone(store, &origin);
+                    remove_zone(store, &mut journal.lock_recover(), &origin);
                 }
                 onetdns_core::info!(event = "authority.catalog_zone_removed", catalog = %job.entry.origin, member = %gone, "Removed a DNS zone that left the catalog");
             }
@@ -1864,7 +1872,7 @@ fn complete_secondary_refresh(
         }
     } else if job.had_zone && completed.saturating_sub(job.last_ok) > job.expire {
         if let Ok(origin) = onetdns_proto::Name::from_str(&job.entry.origin) {
-            remove_zone(store, &origin);
+            remove_zone(store, &mut journal.lock_recover(), &origin);
         }
         onetdns_core::warn!(event = "authority.secondary_expired", origin = %job.entry.origin, "Secondary zone expired; no longer answering for it");
     }
@@ -1887,6 +1895,7 @@ pub(crate) fn spawn_secondary_refresh(
     cfg: Config,
     tsig_keys: Vec<onetdns_dnssec::tsig::TsigKey>,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
+    journal: ZoneJournals,
     kick: Arc<native::NotifyKick>,
     notify: NotifySender,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -1895,6 +1904,7 @@ pub(crate) fn spawn_secondary_refresh(
         cfg,
         tsig_keys,
         store,
+        journal,
         kick,
         notify,
         shutdown,
@@ -1907,10 +1917,12 @@ pub(crate) fn spawn_secondary_refresh(
  * @details 시리얼을 먼저 묻고, 더 새것일 때만 받아 온다. 접속부터 종료 SOA까지 스레드 없이
  *          처리해 응답이 느리거나 중간에 멈춘 상대가 워커를 붙잡지 못하게 한다.
  */
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_secondary_refresh_with_timeout(
     cfg: Config,
     tsig_keys: Vec<onetdns_dnssec::tsig::TsigKey>,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
+    journal: ZoneJournals,
     kick: Arc<native::NotifyKick>,
     notify: NotifySender,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -2085,6 +2097,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                     &mut xfr_origins,
                     &mut urgent,
                     &store,
+                    &journal,
                     &notify,
                     &cfg,
                 );
@@ -2125,6 +2138,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                             &mut xfr_origins,
                             &mut urgent,
                             &store,
+                            &journal,
                             &notify,
                             &cfg,
                         );
@@ -2160,6 +2174,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                         &mut xfr_origins,
                         &mut urgent,
                         &store,
+                        &journal,
                         &notify,
                         &cfg,
                     );
@@ -2179,6 +2194,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                         &mut xfr_origins,
                         &mut urgent,
                         &store,
+                        &journal,
                         &notify,
                         &cfg,
                     );
@@ -2220,6 +2236,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                             &mut xfr_origins,
                             &mut urgent,
                             &store,
+                            &journal,
                             &notify,
                             &cfg,
                         );
@@ -2263,6 +2280,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                             &mut xfr_origins,
                             &mut urgent,
                             &store,
+                            &journal,
                             &notify,
                             &cfg,
                         );
@@ -2300,6 +2318,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                             &mut xfr_origins,
                             &mut urgent,
                             &store,
+                            &journal,
                             &notify,
                             &cfg,
                         );
@@ -3348,6 +3367,7 @@ mod tests {
             config,
             Vec::new(),
             store,
+            Arc::default(),
             kick.clone(),
             NotifySender::disabled(),
             shutdown.clone(),
@@ -3630,6 +3650,7 @@ mod tests {
             config,
             vec![key],
             store.clone(),
+            Arc::default(),
             kick.clone(),
             NotifySender::disabled(),
             shutdown.clone(),
@@ -3737,6 +3758,7 @@ mod tests {
             config,
             Vec::new(),
             store.clone(),
+            Arc::default(),
             kick.clone(),
             NotifySender::disabled(),
             shutdown.clone(),
@@ -3812,6 +3834,7 @@ mod tests {
             config,
             Vec::new(),
             store.clone(),
+            Arc::default(),
             Arc::new(native::NotifyKick::default()),
             NotifySender::disabled(),
             shutdown.clone(),

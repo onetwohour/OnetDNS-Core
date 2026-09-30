@@ -151,8 +151,8 @@ use cluster::{ensure_raft_runtime, spawn_resign_timer, stop_raft, RaftProcessCle
 use secondary::spawn_secondary_refresh;
 use zone_signing::{spawn_zsk_rollover, zone_is_split_key, zsk_path_for, ZoneKeyReload};
 use zones::{
-    build_zone_store, zone_file_mtimes, zone_source_specs, zones_with_edited_files, ZoneState,
-    ZONE_FILE_WATCH_SECS,
+    build_zone_store, replace_zone_store, zone_file_mtimes, zone_source_specs,
+    zones_with_edited_files, ZoneState, ZONE_FILE_WATCH_SECS,
 };
 
 use atomic_file::{atomic_write, atomic_write_secret};
@@ -274,25 +274,23 @@ fn gen_passwd(name: Option<String>) -> BoxResult<()> {
     }
 
     eprintln!("Type the password for dashboard account '{login}' and press Enter.");
-    eprintln!(
-        "(The characters you type are shown on screen. At least 12 characters is recommended.)"
-    );
+    eprintln!("(The characters you type are shown on screen. Use at least 12 characters.)");
 
-    /** @brief 읽어들일 암호 길이 상한. */
-    const MAX_PASSWORD_INPUT: u64 = 4097;
+    /**
+     * @brief 읽어들일 입력 길이 상한.
+     * @details 최대 1024자를 모두 4바이트 문자로 채운 4096바이트에 줄 끝 CRLF 와 한 바이트를 더한
+     *          값이다. 이만큼 읽고도 줄이 끝나지 않았으면 상한을 넘은 것이고, 길이 판정은
+     *          hash_password 가 한다.
+     */
+    const MAX_PASSWORD_INPUT: u64 = 4096 + 2 + 1;
     let mut line = String::new();
     std::io::stdin()
         .lock()
         .take(MAX_PASSWORD_INPUT)
         .read_line(&mut line)
         .with_context(|| "Could not read the password")?;
-    if line.len() as u64 >= MAX_PASSWORD_INPUT {
-        return Err(crate::anyhow!("The password is too long"));
-    }
     let pw = line.trim_end_matches(['\n', '\r']);
-    if pw.is_empty() {
-        return Err(crate::anyhow!("An empty password is not allowed"));
-    }
+    let hash = onetdns_control::hash_password(pw).map_err(|error| crate::anyhow!("{error}"))?;
 
     eprintln!();
     eprintln!(
@@ -302,7 +300,7 @@ fn gen_passwd(name: Option<String>) -> BoxResult<()> {
     eprintln!();
     println!("[[users]]");
     println!("name = \"{login}\"");
-    println!("password_hash = \"{}\"", onetdns_control::hash_password(pw));
+    println!("password_hash = \"{hash}\"");
     println!("role = \"admin\"");
     Ok(())
 }
@@ -1288,6 +1286,7 @@ pub fn serve(
         let runtime = runtime_cfg.clone();
         let signers = zones.signers.clone();
         let store_slot = zones.store.clone();
+        let journal = zones.journal.clone();
         let hot_state = native_hot_state.clone();
         let notify = zones.notify.clone();
         Arc::new(
@@ -1295,9 +1294,13 @@ pub fn serve(
                 let _write_guard = config_write_lock().lock_recover();
                 let cfg = runtime.load();
                 let settings = build_authority_settings(&cfg)?;
+                let native = hot_state.lock_recover().clone();
+                // 원본을 다시 읽는 동안에도 영역 변경 잠금을 잡는다. 읽은 뒤에 들어온 동적 갱신은
+                // 새 저장소에 없으므로, 교체하면 그 갱신이 사라진다.
+                let mut journals = journal.lock_recover();
                 let store = build_zone_store(&cfg, &settings.tsig_keys, &settings.zone_signers)?;
                 signers.store(Arc::new(settings.zone_signers.clone()));
-                if let Some(state) = hot_state.lock_recover().as_ref() {
+                if let Some(state) = native.as_ref() {
                     state.authority.store(Arc::new(settings));
                 }
                 for origin in rolled {
@@ -1305,7 +1308,7 @@ pub fn serve(
                         notify.enqueue(origin, zone.soa().serial);
                     }
                 }
-                store_slot.store(Arc::new(store));
+                replace_zone_store(&store_slot, &mut journals, Arc::new(store));
                 Ok(())
             },
         )
@@ -1398,11 +1401,6 @@ pub fn serve(
     )));
 
     let cache_slot: Arc<Mutex<Option<cache::CacheHandle>>> = Arc::new(Mutex::new(None));
-
-    // 재귀 리졸버는 기반을 만들 때 정해지고 리액터 레인이 나중에 읽는다. 기반 만들기가
-    // 다시 불릴 수 있으므로 공유 슬롯에 담는다.
-    let lane_recursor: Arc<Mutex<Option<Arc<onetdns_recurse::Recursor>>>> =
-        Arc::new(Mutex::new(None));
 
     let config_prev = shared.previous_config_text.clone();
     let applied_config_text = shared.applied_config_text.clone();
@@ -1503,7 +1501,6 @@ pub fn serve(
             blocklist_resolver_slot: blocklist_resolver_slot.clone(),
             blocklist_resolver: blocklist_resolver.clone(),
             cache_slot: cache_slot.clone(),
-            lane_recursor: lane_recursor.clone(),
         });
         raft_hot_apply = Some(hot_config_apply.clone());
 
@@ -1705,41 +1702,39 @@ pub fn serve(
 
         let plan = resolver_chain::ChainPlan::new(&cfg);
 
-        let base = resolver_chain::ResolverBase {
-            forward_slot: forward_slot.clone(),
-            recurse: resolver_chain::RecursiveBase {
-                recursor_jobs: recursor_jobs.clone(),
-                block_ttl: block_ttl.clone(),
-                filter: filters.filter.clone(),
-                lane_recursor: lane_recursor.clone(),
-                local_ttl: local_ttl.clone(),
-                thread_tracker: service_cleanup.tracker(),
-                shutdown: shutdown.clone(),
+        let default_chain = Arc::new(resolver_chain::DefaultChain {
+            base: resolver_chain::ResolverBase {
+                forward_slot: forward_slot.clone(),
+                recurse: resolver_chain::RecursiveBase {
+                    block_ttl: block_ttl.clone(),
+                    filter: filters.filter.clone(),
+                    local_ttl: local_ttl.clone(),
+                    thread_tracker: service_cleanup.tracker(),
+                    shutdown: shutdown.clone(),
+                },
             },
-        };
-        let chain_layers = resolver_chain::ChainLayers {
-            block_ttl: block_ttl.clone(),
+            layers: resolver_chain::ChainLayers {
+                block_ttl: block_ttl.clone(),
+                dhcp_slot: dhcp_slot.clone(),
+                local_ttl: local_ttl.clone(),
+                local_only_names: local_only_names.clone(),
+                recorder: recorder.clone(),
+                shutdown: shutdown.clone(),
+                split_local_wire_cache: split_local_wire_cache.clone(),
+                zone_store: zones.store.clone(),
+            },
             cache_slot: cache_slot.clone(),
-            dhcp_slot: dhcp_slot.clone(),
-            local_ttl: local_ttl.clone(),
-            local_only_names: local_only_names.clone(),
-            recorder: recorder.clone(),
-            shutdown: shutdown.clone(),
-            split_local_wire_cache: split_local_wire_cache.clone(),
-            zone_store: zones.store.clone(),
-        };
-
-        let default_base: Arc<dyn native::Resolver> = base.build(&plan)?;
-        let chain = chain_layers
-            .wrap_common_layers(
-                &plan,
-                default_base,
-                true,
-                true,
-                plan.is_split(),
-                plan.cache_namespace(),
-            )
-            .map_err(|e| crate::anyhow!(e))?;
+            recursor_jobs: recursor_jobs.clone(),
+        });
+        let resolver_chain::InstalledChain {
+            resolver: chain,
+            recursor: lane_recursor,
+            ..
+        } = default_chain.install(
+            default_chain
+                .prepare(&plan)
+                .map_err(|error| crate::anyhow!(error))?,
+        );
 
         let client_upstreams: Vec<native::ClientUpstream> =
             build_client_upstream_routes(&cfg, timeout)
@@ -1747,14 +1742,10 @@ pub fn serve(
                 .into_iter()
                 .map(|mut route| {
                     let ns = format!("{}/route={}", plan.cache_namespace(), route.namespace_key());
-                    route.resolver = chain_layers.wrap_common_layers(
-                        &plan,
-                        route.resolver,
-                        false,
-                        false,
-                        false,
-                        &ns,
-                    )?;
+                    route.resolver = default_chain
+                        .layers
+                        .wrap_common_layers(&plan, route.resolver, false, false, &ns)?
+                        .0;
                     Ok(route)
                 })
                 .collect::<Result<_, String>>()
@@ -1766,6 +1757,7 @@ pub fn serve(
             {
                 let jobs = secondary_jobs.clone();
                 let store = zones.store.clone();
+                let journal = zones.journal.clone();
                 let kick = notify_kick.clone();
                 let sender = zones.notify.clone();
                 let tracker = service_cleanup.tracker();
@@ -1779,6 +1771,7 @@ pub fn serve(
                         next.clone(),
                         keys,
                         store.clone(),
+                        journal.clone(),
                         kick.clone(),
                         sender.clone(),
                         stop,
@@ -1817,34 +1810,9 @@ pub fn serve(
         // 해석 체인을 교체 가능한 슬롯에 넣어 넘긴다. 설정이 바뀌면 체인만 새로 만들어
         // 교체하면 되므로 스레드와 소켓을 내렸다 올릴 이유가 없어진다.
         let chain_slot = Arc::new(native::ResolverSlot::new(chain));
-        // 설정이 바뀌면 같은 위치에서 기반과 체인을 새로 만들어 슬롯에 넣는다.
-        *restarts.chain.lock_recover() = Some({
-            let layers = chain_layers.clone();
-            let slot = chain_slot.clone();
-            let make_base = Mutex::new(base);
-            Arc::new(
-                move |next: &resolver_chain::ChainPlan| -> Result<(), String> {
-                    let base = make_base
-                        .lock_recover()
-                        .build(next)
-                        .map_err(|error| error.to_string())?;
-                    /*
-                     * 공유 캐시 이름 공간도 새 계획에서 낸다. 시작할 때 낸 것을 쓰면 처리 방식이나
-                     * DNSSEC 을 바꿔도 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인
-                     * 것처럼 나온다.
-                     */
-                    let chain = layers.wrap_common_layers(
-                        next,
-                        base,
-                        true,
-                        true,
-                        next.is_split(),
-                        next.cache_namespace(),
-                    )?;
-                    slot.replace(chain);
-                    Ok(())
-                },
-            ) as ChainRebuild
+        *restarts.chain.lock_recover() = Some(ChainRebuild {
+            chain: default_chain,
+            slot: (*chain_slot).clone(),
         });
 
         let mut native_server = native::NativeServer::new(
@@ -1880,8 +1848,7 @@ pub fn serve(
             }));
         }
         if let Some(ch) = cache_slot.lock_recover().clone() {
-            let recursor = lane_recursor.lock_recover().clone();
-            native_server = native_server.with_reactor_lane_runtime(recursor, ch, 32);
+            native_server = native_server.with_reactor_lane_runtime(lane_recursor, ch, 32);
         }
         let _ = native_server.lane_switch.set(
             lane_gates.wire,
@@ -3058,6 +3025,126 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /** @brief 관리 API 에 요청 하나를 보내고 응답 전체를 돌려준다. */
+    fn control_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let content_type = if path == "/v1/config/apply" {
+            "application/toml"
+        } else {
+            "application/json"
+        };
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n\
+             Authorization: Bearer hot-apply-test-token-0123456789\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    /**
+     * @brief 영역을 읽지 못해 교체가 실패하면 같이 바꾸려던 차단 규칙과 실행 중 설정이 그대로인지.
+     * @details 설정 파일은 이전 것으로 돌아간다. 차단 규칙만 먼저 바뀌어 있으면 파일에 없는 규칙으로
+     *          답하고, 다음 재시작 때 말없이 풀린다. 영역 파일의 내용은 사전 검사가 읽지 않으므로
+     *          이 설정은 교체 경로에 들어와서야 거절된다.
+     */
+    fn failed_hot_apply_leaves_the_running_configuration_alone() {
+        let dns = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "onetdns-hot-apply-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("OnetDNS.toml");
+        let text = format!(
+            "listen = [\"{dns}\"]\n\
+             do_tcp = false\n\
+             workers = 1\n\
+             backend = \"forward\"\n\
+             upstream_urls = [\"udp://192.0.2.1:53\"]\n\
+             control_listen = \"{control}\"\n\
+             control_token = \"hot-apply-test-token-0123456789\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::from_toml_str(&text).unwrap();
+
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let ready = ready.clone();
+            let stop = stop.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    Some(onetdns_core::SecretString::from(text)),
+                    Some(path),
+                    Default::default(),
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "server did not start");
+            assert!(!server.is_finished(), "server stopped before it was ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let zone = root.join("broken.zone");
+        std::fs::write(&zone, "this is not a zone file\n").unwrap();
+        let snippet = format!(
+            "block_rules = [\"||blocked.test^\"]\n\
+             [[zones]]\norigin = \"broken.test\"\nfile = \"{}\"\n",
+            zone.display().to_string().replace('\\', "/")
+        );
+        let applied = control_request(control, "POST", "/v1/config/apply", &snippet);
+        assert!(!applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(
+            applied.contains("Could not parse DNS zone file"),
+            "{applied}"
+        );
+
+        let explained = control_request(
+            control,
+            "POST",
+            "/v1/explain",
+            "{\"qname\":\"blocked.test\"}",
+        );
+        assert!(explained.starts_with("HTTP/1.1 200"), "{explained}");
+        assert!(!explained.contains("\"filter\":\"block"), "{explained}");
+        let effective = control_request(control, "GET", "/v1/config/effective", "");
+        assert!(!effective.contains("blocked.test"), "{effective}");
+        assert!(!effective.contains("broken.test"), "{effective}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     /** @brief 노드별 설정은 복제에서 빠지고, 서비스 동작을 정하는 설정은 복제되는지. */
     fn cluster_local_keys_cover_identity_secrets_and_paths_only() {
@@ -3322,6 +3409,7 @@ mod tests {
             config,
             Vec::new(),
             store.clone(),
+            Arc::default(),
             kick.clone(),
             NotifySender::disabled(),
             shutdown.clone(),

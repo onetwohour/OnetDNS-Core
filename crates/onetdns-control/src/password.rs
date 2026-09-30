@@ -93,8 +93,86 @@ fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
     }
 }
 
-/** @brief 새 비밀번호를 해시한다. salt와 반복 횟수를 결과 문자열에 함께 담는다. */
-pub fn hash_password(pw: &str) -> String {
+/** @brief 새 비밀번호에 요구하는 최소 글자 수. */
+const MIN_PASSWORD_CHARS: usize = 12;
+/**
+ * @brief 새 비밀번호에 허용하는 최대 글자 수.
+ * @invariant UTF-8 한 글자는 최대 4바이트이므로 이 글자 수는 MAX_PASSWORD_BYTES 를 넘지 않는다.
+ *            넘으면 저장은 되지만 검증이 항상 불일치로 답하는 비밀번호가 생긴다.
+ */
+const MAX_PASSWORD_CHARS: usize = 1024;
+const _: () = assert!(MAX_PASSWORD_CHARS * 4 <= MAX_PASSWORD_BYTES);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/** @brief 새 비밀번호를 해시하지 못한 이유. */
+pub enum PasswordError {
+    /** @brief 최소 글자 수보다 짧다. */
+    TooShort,
+    /** @brief 최대 글자 수보다 길다. */
+    TooLong,
+    /** @brief 계산 슬롯이 없어 지금은 해시하지 못한다. */
+    Busy,
+}
+
+impl std::fmt::Display for PasswordError {
+    /** @brief 사용자에게 보일 문구. */
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasswordError::TooShort => write!(
+                f,
+                "Password must be at least {MIN_PASSWORD_CHARS} characters"
+            ),
+            PasswordError::TooLong => {
+                write!(
+                    f,
+                    "Password must be at most {MAX_PASSWORD_CHARS} characters"
+                )
+            }
+            PasswordError::Busy => write!(f, "Too many password checks. Try again shortly"),
+        }
+    }
+}
+
+/**
+ * @brief 새 비밀번호를 해시한다. salt와 반복 횟수를 결과 문자열에 함께 담는다.
+ * @details 길이 규칙을 여기서 검사한다. 호출자마다 검사하게 두면 한 곳이 빠졌을 때 로그인할 수
+ *          없는 해시가 저장된다. 검증과 같은 동시 실행 상한을 쓴다. 첫 계정 생성은 인증 전에
+ *          닿는 경로이기 때문이다.
+ */
+pub fn hash_password(pw: &str) -> Result<String, PasswordError> {
+    hash_password_with_acquire(pw, KdfGuard::acquire)
+}
+
+/**
+ * @brief 슬롯 잡기 방식을 주입받아 해시한다.
+ * @param acquire 슬롯 잡기 방식. 테스트에서 포화 상황을 만들 때 교체한다.
+ */
+fn hash_password_with_acquire(
+    pw: &str,
+    acquire: impl FnOnce() -> Option<KdfGuard>,
+) -> Result<String, PasswordError> {
+    check_new_password(pw)?;
+    let _guard = acquire().ok_or(PasswordError::Busy)?;
+    Ok(derive_password_hash(pw))
+}
+
+/**
+ * @brief 새 비밀번호가 길이 규칙을 지키는지 본다.
+ * @details hash_password 도 같은 검사를 한다. 값비싼 검증을 하기 전에 먼저 거르려는 호출자가 쓴다.
+ */
+pub fn check_new_password(pw: &str) -> Result<(), PasswordError> {
+    let chars = pw.chars().count();
+    if chars < MIN_PASSWORD_CHARS {
+        return Err(PasswordError::TooShort);
+    }
+    if chars > MAX_PASSWORD_CHARS {
+        return Err(PasswordError::TooLong);
+    }
+    Ok(())
+}
+
+/** @brief 길이 규칙 없이 해시 문자열을 만든다. */
+fn derive_password_hash(pw: &str) -> String {
     let salt = onetdns_core::rng::random_array::<SALT_LEN>();
     let mut dk = [0u8; HLEN];
     pbkdf2(pw.as_bytes(), &salt, DEFAULT_ITERS, &mut dk);
@@ -249,10 +327,20 @@ mod tests {
         }
     }
 
+    /** @brief 포화로 실패하면 잠시 뒤 다시 시도해 해시를 얻는다. */
+    fn hash_password_eventually(pw: &str) -> Result<String, PasswordError> {
+        loop {
+            match hash_password(pw) {
+                Err(PasswordError::Busy) => std::thread::yield_now(),
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     /** @brief 해시한 비밀번호가 다시 검증되는지. */
     fn hash_verify_roundtrip() {
-        let h = hash_password("correct horse battery staple");
+        let h = hash_password_eventually("correct horse battery staple").unwrap();
         assert!(h.starts_with("pbkdf2-sha256$600000$"));
         assert!(verify_password_eventually(
             "correct horse battery staple",
@@ -264,11 +352,41 @@ mod tests {
     #[test]
     /** @brief 같은 비밀번호라도 salt가 달라 해시가 달라지는지. */
     fn distinct_salts_distinct_hashes() {
-        let a = hash_password("same");
-        let b = hash_password("same");
+        let a = derive_password_hash("same");
+        let b = derive_password_hash("same");
         assert_ne!(a, b, "임의 솔트로 해시가 달라야 함");
         assert!(verify_password_eventually("same", &a));
         assert!(verify_password_eventually("same", &b));
+    }
+
+    #[test]
+    /**
+     * @brief 길이 규칙을 글자 수로 적용하고, 허용한 비밀번호는 모두 로그인에 쓸 수 있는지.
+     * @details 저장만 되고 로그인할 수 없는 계정이 생기면 첫 계정 생성 뒤 복구할 길이 없다.
+     *          가장 긴 비밀번호를 4바이트 문자로 채워 바이트 수가 가장 큰 경우를 확인한다.
+     */
+    fn every_accepted_password_can_sign_in() {
+        assert_eq!(
+            hash_password_eventually("elevenchars"),
+            Err(PasswordError::TooShort)
+        );
+        assert!(hash_password_eventually("비밀번호는열두글자입니다").is_ok());
+        assert_eq!(
+            hash_password_eventually(&"x".repeat(MAX_PASSWORD_CHARS + 1)),
+            Err(PasswordError::TooLong)
+        );
+        let longest = "😀".repeat(MAX_PASSWORD_CHARS);
+        let hash = hash_password_eventually(&longest).unwrap();
+        assert!(verify_password_eventually(&longest, &hash));
+    }
+
+    #[test]
+    /** @brief 해시 생성도 검증과 같은 동시 실행 상한을 받는지. */
+    fn hashing_respects_the_kdf_limit() {
+        assert_eq!(
+            hash_password_with_acquire("correct horse battery staple", || None),
+            Err(PasswordError::Busy)
+        );
     }
 
     #[test]
@@ -309,14 +427,14 @@ mod tests {
         assert!(!verify_password("x", &huge));
         assert!(!verify_password(
             &"x".repeat(MAX_PASSWORD_BYTES + 1),
-            &hash_password("x")
+            &derive_password_hash("x")
         ));
     }
 
     #[test]
     /** @brief 포화와 불일치를 구분해 알리는지. */
     fn reports_kdf_saturation_separately_from_a_wrong_password() {
-        let hash = hash_password("correct");
+        let hash = derive_password_hash("correct");
         assert_eq!(
             verify_password_with_acquire("correct", &hash, || None),
             VerifyResult::Busy

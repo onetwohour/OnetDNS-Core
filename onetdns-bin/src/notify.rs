@@ -82,21 +82,9 @@ impl NotifySender {
         }
     }
 
-    /**
-     * @brief 알림을 보낼 곳 목록을 교체한다.
-     *
-     * @details 설정에 적힌 대상과 그 TSIG 키를 다시 풀어 넣는다. 키를 찾지 못하면 아무것도
-     *          바꾸지 않는다. 절반만 교체하면 서명 없이 알리게 된다.
-     * @return 대상의 TSIG 키가 설정에 없으면 실패.
-     */
-    pub(crate) fn replace_targets(
-        &self,
-        configured: &[onetdns_config::NotifyTarget],
-        tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
-    ) -> Result<(), String> {
-        let next = notify_runtime_targets(configured, tsig_keys)?;
-        self.targets.store(Arc::new(next));
-        Ok(())
+    /** @brief 알림을 보낼 곳 목록을 교체한다. */
+    pub(crate) fn replace_targets(&self, targets: NotifyTargets) {
+        self.targets.store(Arc::new(targets.0));
     }
 
     /** @brief 이 영역이 바뀌었다고 알릴 것을 맡긴다. 같은 영역의 알림은 하나로 합친다. */
@@ -440,6 +428,22 @@ pub(crate) fn start_notify_dispatcher(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let (sender, thread) = spawn_notify_worker(targets, NotifyRetryPolicy::default(), shutdown)?;
     Ok((sender, Some(thread)))
+}
+
+/** @brief 설정에서 푼 알림 대상 목록. 대상마다 TSIG 키를 찾아 둔 상태다. */
+pub(crate) struct NotifyTargets(Vec<NotifyRuntimeTarget>);
+
+impl NotifyTargets {
+    /**
+     * @brief 설정에 적힌 대상과 그 TSIG 키를 푼다.
+     * @return 대상의 TSIG 키가 설정에 없으면 실패. 그 대상만 빼고 교체하면 서명 없이 알리게 된다.
+     */
+    pub(crate) fn from_config(
+        configured: &[onetdns_config::NotifyTarget],
+        tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
+    ) -> Result<Self, String> {
+        notify_runtime_targets(configured, tsig_keys).map(Self)
+    }
 }
 
 /** @brief 설정에 적힌 알림 대상을 실행에 쓸 모양으로 푼다. */

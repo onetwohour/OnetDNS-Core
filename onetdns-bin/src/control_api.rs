@@ -2276,8 +2276,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         file_removed = true;
                     }
                 }
-                remove_zone(&zs, &name);
-                journals.remove(&name.canonical_key());
+                remove_zone(&zs, &mut journals, &name);
                 onetdns_core::info!(event = "authority.zone_deleted", origin = %key, file_removed, "Deleted DNS zone");
                 Ok(format!(
                     "{{\"deleted\":true,\"file_removed\":{file_removed}}}"

@@ -204,24 +204,45 @@ impl TlsSlots {
     }
 
     /**
-     * @brief 설정에 적힌 인증서를 읽어 네 슬롯을 한꺼번에 교체한다.
-     *
-     * @details 하나라도 읽지 못하면 아무 슬롯도 건드리지 않고 실패한다. 절반만 교체하면 전송마다
-     *          다른 인증서를 내밀게 된다.
-     * @return 인증서나 개인키가 올바르지 않으면 실패. 그때 이전 인증서가 그대로 쓰인다.
+     * @brief 설정에 적힌 인증서를 읽어 네 슬롯에 넣을 설정을 만든다. 슬롯은 건드리지 않는다.
+     * @return 인증서나 개인키가 올바르지 않으면 실패.
      */
-    pub(crate) fn reload(&self, cfg: &Config) -> Result<(), String> {
-        let mut live = self.live_files.lock_recover();
+    pub(crate) fn prepare(cfg: &Config) -> Result<PreparedTls, String> {
         let material = native_tls_material(cfg)?;
-        let fresh = live_tls_files(cfg, material.0.clone())?;
+        let files = live_tls_files(cfg, material.0.clone())?;
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
-        self.dot.store(dot);
-        self.doh.store(doh);
-        self.doq.store(doq);
-        self.doh3.store(doh3);
-        *live = fresh;
-        Ok(())
+        Ok(PreparedTls {
+            dot,
+            doh,
+            doq,
+            doh3,
+            files,
+        })
     }
+
+    /** @brief 준비한 설정으로 네 슬롯을 한꺼번에 교체한다. 절반만 바꾸면 전송마다 다른 인증서를 내민다. */
+    pub(crate) fn install(&self, prepared: PreparedTls) {
+        let mut live = self.live_files.lock_recover();
+        self.dot.store(prepared.dot);
+        self.doh.store(prepared.doh);
+        self.doq.store(prepared.doq);
+        self.doh3.store(prepared.doh3);
+        *live = prepared.files;
+    }
+}
+
+/** @brief 읽어 두었지만 아직 슬롯에 넣지 않은 TLS 설정. */
+pub(crate) struct PreparedTls {
+    /** @brief DoT 설정. */
+    dot: Arc<onetdns_tls::ServerConfig>,
+    /** @brief DoH 설정. */
+    doh: Arc<onetdns_tls::ServerConfig>,
+    /** @brief DoQ 설정. */
+    doq: Arc<onetdns_tls::ServerConfig>,
+    /** @brief DoH3 설정. */
+    doh3: Arc<onetdns_tls::ServerConfig>,
+    /** @brief 이 설정을 만든 인증서 파일 내용. */
+    files: LiveTlsFiles,
 }
 
 /** @brief 이미 읽어 둔 인증서로 전송 넷에 쓸 TLS 설정을 만든다. ALPN만 다르다. */

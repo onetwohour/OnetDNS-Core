@@ -775,14 +775,11 @@ fn pss_scheme_from_params(d: &mut Der) -> Result<u16, TlsError> {
             }
             2 => {
                 let value = Der::new(f.value).expect(der::INTEGER)?;
-                salt_len = der_uint(value);
-                if salt_len.is_none() {
-                    return Err(TlsError::BadCert);
-                }
+                salt_len = Some(der::uint_value(value)?);
             }
             3 => {
                 let value = Der::new(f.value).expect(der::INTEGER)?;
-                trailer = der_uint(value).ok_or(TlsError::BadCert)?;
+                trailer = der::uint_value(value)?;
             }
             _ => unreachable!(),
         }
@@ -880,13 +877,16 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
 
         let n1 = ex.next()?;
         let (critical, val) = if n1.tag == der::BOOLEAN {
-            let critical = n1.value.first().copied().unwrap_or(0) != 0;
+            let critical = der::boolean_value(n1.value)?;
             (critical, ex.expect(der::OCTET_STRING)?)
         } else if n1.tag == der::OCTET_STRING {
             (false, n1.value)
         } else {
             return Err(TlsError::BadCert);
         };
+        if !ex.is_empty() {
+            return Err(TlsError::BadCert);
+        }
         let known = oid == OID_SAN
             || oid == OID_BASIC_CONSTRAINTS
             || oid == OID_KEY_USAGE
@@ -898,14 +898,18 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
             return Err(TlsError::BadCert);
         }
         if oid == OID_SAN {
-            let names = Der::new(val).expect(der::SEQUENCE)?;
+            let names = only_value(val, der::SEQUENCE)?;
             let mut g = Der::new(names);
             while !g.is_empty() {
                 let name = g.next()?;
                 if name.tag == 0x82 {
-                    if let Ok(s) = std::str::from_utf8(name.value) {
-                        out.san_dns.push(s.to_string());
+                    // dNSName 은 IA5String 이다. ASCII 가 아닌 값을 이름으로 받아들이면 다른
+                    // 검증기가 거절하는 인증서를 이쪽만 통과시킬 수 있다.
+                    if !name.value.is_ascii() {
+                        return Err(TlsError::BadCert);
                     }
+                    let s = std::str::from_utf8(name.value).map_err(|_| TlsError::BadCert)?;
+                    out.san_dns.push(s.to_string());
                 } else if name.tag == 0x87 {
                     match name.value {
                         [a, b, c, d] => out.san_ip.push(IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d))),
@@ -919,44 +923,52 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
                 }
             }
         } else if oid == OID_BASIC_CONSTRAINTS {
-            let seq = Der::new(val).expect(der::SEQUENCE)?;
+            // cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL 순서이고
+            // 그 밖의 값은 없어야 한다. 순서나 중복, 모르는 값을 넘기면 다른 검증기와 다르게 읽는다.
+            let mut outer = Der::new(val);
+            let seq = outer.expect(der::SEQUENCE)?;
+            if !outer.is_empty() {
+                return Err(TlsError::BadCert);
+            }
             let mut b = Der::new(seq);
-            while !b.is_empty() {
-                let t = b.next()?;
-                if t.tag == der::BOOLEAN {
-                    if t.value.first().copied().unwrap_or(0) != 0 {
-                        out.is_ca = true;
-                    }
-                } else if t.tag == der::INTEGER {
-                    out.path_len = der_uint(t.value);
+            let mut field = if b.is_empty() { None } else { Some(b.next()?) };
+            if let Some(t) = field.filter(|t| t.tag == der::BOOLEAN) {
+                out.is_ca = der::boolean_value(t.value)?;
+                field = if b.is_empty() { None } else { Some(b.next()?) };
+            }
+            if let Some(t) = field {
+                if t.tag != der::INTEGER {
+                    return Err(TlsError::BadCert);
                 }
+                out.path_len = Some(der::uint_value(t.value)?);
+            }
+            if !b.is_empty() {
+                return Err(TlsError::BadCert);
             }
         } else if oid == OID_KEY_USAGE {
-            let bs = Der::new(val).expect(der::BIT_STRING)?;
+            let bs = only_value(val, der::BIT_STRING)?;
             out.key_usage = Some(decode_key_usage(bit_string_bytes(bs)?));
         } else if oid == OID_EKU {
-            let seq = Der::new(val).expect(der::SEQUENCE)?;
+            let seq = only_value(val, der::SEQUENCE)?;
             let mut k = Der::new(seq);
             let mut server_auth = false;
             let mut client_auth = false;
             while !k.is_empty() {
-                let p = k.next()?;
-                if p.tag == der::OID {
-                    if p.value == EKU_SERVER_AUTH || p.value == EKU_ANY {
-                        server_auth = true;
-                    }
-                    if p.value == EKU_CLIENT_AUTH || p.value == EKU_ANY {
-                        client_auth = true;
-                    }
-                    if p.value == EKU_OCSP_SIGNING {
-                        out.eku_ocsp_signing = true;
-                    }
+                let purpose = k.expect(der::OID)?;
+                if purpose == EKU_SERVER_AUTH || purpose == EKU_ANY {
+                    server_auth = true;
+                }
+                if purpose == EKU_CLIENT_AUTH || purpose == EKU_ANY {
+                    client_auth = true;
+                }
+                if purpose == EKU_OCSP_SIGNING {
+                    out.eku_ocsp_signing = true;
                 }
             }
             out.eku_server_auth = Some(server_auth);
             out.eku_client_auth = Some(client_auth);
         } else if oid == OID_NAME_CONSTRAINTS {
-            let seq = Der::new(val).expect(der::SEQUENCE)?;
+            let seq = only_value(val, der::SEQUENCE)?;
             let mut nc = Der::new(seq);
             let mut constraints = NameConstraints::default();
             while !nc.is_empty() {
@@ -979,7 +991,7 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
             }
             out.name_constraints = Some(constraints);
         } else if oid == OID_AIA {
-            let seq = Der::new(val).expect(der::SEQUENCE)?;
+            let seq = only_value(val, der::SEQUENCE)?;
             let mut a = Der::new(seq);
             while !a.is_empty() {
                 let Ok(adv) = a.expect(der::SEQUENCE) else {
@@ -1127,13 +1139,17 @@ fn decode_key_usage(bits: &[u8]) -> u16 {
     mask
 }
 
-/** @brief 작은 부호 없는 정수를 읽는다. */
-fn der_uint(v: &[u8]) -> Option<u32> {
-    let mut n: u32 = 0;
-    for &b in v {
-        n = n.checked_mul(256)?.checked_add(b as u32)?;
+/**
+ * @brief 확장 값이 기대한 태그의 TLV 하나로만 이루어졌는지 보고 그 내용을 준다.
+ * @details 뒤에 남는 바이트를 무시하면 다른 검증기가 거절하는 인증서를 이쪽만 받아들인다.
+ */
+fn only_value(val: &[u8], tag: u8) -> Result<&[u8], TlsError> {
+    let mut d = Der::new(val);
+    let value = d.expect(tag)?;
+    if !d.is_empty() {
+        return Err(TlsError::BadCert);
     }
-    Some(n)
+    Ok(value)
 }
 
 /** @brief 그 달의 날 수. 윤년을 반영한다. */
@@ -1317,6 +1333,145 @@ mod tests {
             0x30, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x04, 0x02, 0x30, 0x00,
         ];
         assert!(parse_extensions(&one).is_ok());
+    }
+
+    /** @brief 어디에도 속하지 않는 값으로 끼워 넣을 NULL 태그. */
+    const NULL_TAG: u8 = 0x05;
+
+    /** @brief 태그와 짧은 길이를 붙인 DER 조각. 테스트 입력은 모두 128바이트보다 짧다. */
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, u8::try_from(content.len()).unwrap()];
+        out.extend_from_slice(content);
+        out
+    }
+
+    /** @brief 확장 하나만 담은 Extensions. critical 은 BOOLEAN 내용 바이트다. */
+    fn one_extension(oid: &[u8], critical: Option<&[u8]>, value: &[u8]) -> Vec<u8> {
+        let mut ext = tlv(der::OID, oid);
+        if let Some(critical) = critical {
+            ext.extend(tlv(der::BOOLEAN, critical));
+        }
+        ext.extend(tlv(der::OCTET_STRING, value));
+        tlv(der::SEQUENCE, &tlv(der::SEQUENCE, &ext))
+    }
+
+    /** @brief 주어진 내용을 담은 BasicConstraints 확장. */
+    fn basic_constraints(fields: &[u8]) -> Vec<u8> {
+        one_extension(OID_BASIC_CONSTRAINTS, None, &tlv(der::SEQUENCE, fields))
+    }
+
+    #[test]
+    /**
+     * @brief 확장의 구조를 DER 그대로만 받아들이는지.
+     * @details 다른 검증기가 거절하는 인증서를 이쪽만 받아들이면 검증기마다 판정이 갈린다.
+     */
+    fn extension_structure_is_strict_der() {
+        let empty_seq = tlv(der::SEQUENCE, &[]);
+        let with_critical =
+            |critical: &[u8]| one_extension(OID_BASIC_CONSTRAINTS, Some(critical), &empty_seq);
+        assert!(parse_extensions(&with_critical(&[0xFF])).is_ok());
+        assert!(parse_extensions(&with_critical(&[0x00])).is_ok());
+        for critical in [&[][..], &[0x01], &[0xFF, 0xFF]] {
+            assert!(
+                parse_extensions(&with_critical(critical)).is_err(),
+                "BOOLEAN {critical:02x?}"
+            );
+        }
+
+        let mut trailing = tlv(der::OID, OID_BASIC_CONSTRAINTS);
+        trailing.extend(tlv(der::OCTET_STRING, &empty_seq));
+        trailing.extend(tlv(NULL_TAG, &[]));
+        let trailing = tlv(der::SEQUENCE, &tlv(der::SEQUENCE, &trailing));
+        assert!(parse_extensions(&trailing).is_err(), "extnValue 뒤의 값");
+
+        let mut value_tail = empty_seq.clone();
+        value_tail.extend(tlv(NULL_TAG, &[]));
+        assert!(
+            parse_extensions(&one_extension(OID_BASIC_CONSTRAINTS, None, &value_tail)).is_err(),
+            "extnValue 안에서 SEQUENCE 뒤의 값"
+        );
+    }
+
+    #[test]
+    /** @brief BasicConstraints 를 정해진 순서와 값으로만 읽는지. */
+    fn basic_constraints_follow_the_grammar() {
+        let ca = tlv(der::BOOLEAN, &[0xFF]);
+        let zero = tlv(der::INTEGER, &[0x00]);
+
+        let mut ca_zero = ca.clone();
+        ca_zero.extend(&zero);
+        let parsed = parse_extensions(&basic_constraints(&ca_zero)).unwrap();
+        assert!(parsed.is_ca);
+        assert_eq!(parsed.path_len, Some(0));
+
+        let parsed = parse_extensions(&basic_constraints(&ca)).unwrap();
+        assert!(parsed.is_ca);
+        assert_eq!(parsed.path_len, None);
+
+        let mut negative = ca.clone();
+        negative.extend(tlv(der::INTEGER, &[0xFF]));
+        assert!(
+            parse_extensions(&basic_constraints(&negative)).is_err(),
+            "pathLen -1"
+        );
+
+        let mut huge = ca.clone();
+        huge.extend(tlv(der::INTEGER, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+        assert!(
+            parse_extensions(&basic_constraints(&huge)).is_err(),
+            "pathLen 이 u32 를 넘음"
+        );
+
+        let mut reversed = zero.clone();
+        reversed.extend(&ca);
+        assert!(
+            parse_extensions(&basic_constraints(&reversed)).is_err(),
+            "순서가 뒤바뀜"
+        );
+
+        let mut twice = ca.clone();
+        twice.extend(&ca);
+        assert!(
+            parse_extensions(&basic_constraints(&twice)).is_err(),
+            "cA 가 두 번"
+        );
+
+        let mut extra = ca_zero.clone();
+        extra.extend(tlv(NULL_TAG, &[]));
+        assert!(
+            parse_extensions(&basic_constraints(&extra)).is_err(),
+            "모르는 값"
+        );
+    }
+
+    #[test]
+    /** @brief EKU 안의 OID 가 아닌 값과 ASCII 가 아닌 dNSName 을 거부하는지. */
+    fn eku_and_san_reject_foreign_values() {
+        let mut purposes = tlv(der::OID, EKU_SERVER_AUTH);
+        let eku = one_extension(OID_EKU, None, &tlv(der::SEQUENCE, &purposes));
+        assert_eq!(parse_extensions(&eku).unwrap().eku_server_auth, Some(true));
+        purposes.extend(tlv(NULL_TAG, &[]));
+        let eku = one_extension(OID_EKU, None, &tlv(der::SEQUENCE, &purposes));
+        assert!(parse_extensions(&eku).is_err());
+
+        let san = |name: &[u8]| one_extension(OID_SAN, None, &tlv(der::SEQUENCE, &tlv(0x82, name)));
+        assert_eq!(
+            parse_extensions(&san(b"example.com")).unwrap().san_dns,
+            ["example.com"]
+        );
+        assert!(parse_extensions(&san("예시.com".as_bytes())).is_err());
+    }
+
+    #[test]
+    /** @brief 음이 아닌 INTEGER 를 최소 인코딩으로만 읽는지. */
+    fn uint_value_rejects_negative_and_non_minimal() {
+        assert_eq!(der::uint_value(&[0x00]).unwrap(), 0);
+        assert_eq!(der::uint_value(&[0x7F]).unwrap(), 127);
+        assert_eq!(der::uint_value(&[0x00, 0x80]).unwrap(), 128);
+        assert!(der::uint_value(&[]).is_err());
+        assert!(der::uint_value(&[0x80]).is_err());
+        assert!(der::uint_value(&[0x00, 0x7F]).is_err());
+        assert!(der::uint_value(&[0x01, 0x00, 0x00, 0x00, 0x00]).is_err());
     }
 
     #[test]

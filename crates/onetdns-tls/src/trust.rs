@@ -101,7 +101,7 @@ impl TrustStore {
         Ok(store)
     }
 
-    /** @brief 루트 수. */
+    /** @brief 신뢰하는 인증서 수. 루트와 인증서 핀을 합친 값이다. */
     pub fn len(&self) -> usize {
         self.roots.len() + self.certificate_pins.len()
     }
@@ -124,7 +124,7 @@ impl TrustStore {
     pub fn system() -> TrustStore {
         let ders = load_system_root_ders();
         let store = TrustStore::from_ders(ders.iter().map(|d| d.as_slice()));
-        let accepted = store.len() + store.certificate_pins.len();
+        let accepted = store.len();
         if accepted == 0 {
             onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates");
         } else {

@@ -32,8 +32,14 @@ const MAX_CONTROL_CONNECTIONS: usize = 128;
 
 /** @brief 동시에 받을 스트리밍 연결 수. 오래 붙어 있으므로 따로 더 좁게 잡는다. */
 const MAX_CONTROL_STREAM_CONNECTIONS: usize = 64;
-/** @brief 제어 연결 스레드 스택 크기. 단순 HTTP 파서는 큰 스택이 필요 없다. */
-const CONTROL_CONNECTION_STACK_BYTES: usize = 256 * 1024;
+/**
+ * @brief 제어 연결 스레드 스택 크기.
+ * @details 요청을 받은 스레드가 설정 반영까지 그대로 실행한다. 반영에는 차단 엔진 컴파일과
+ *          영역 파일 파싱이 들어가고, 최적화하지 않은 빌드는 그 프레임이 훨씬 크다. 스택이
+ *          모자라면 설정 하나를 바꾸다 프로세스 전체가 죽는다. 스택은 쓰는 만큼만 커밋되므로
+ *          연결 수만큼 예약해도 실제 메모리는 늘지 않는다.
+ */
+const CONTROL_CONNECTION_STACK_BYTES: usize = 1024 * 1024;
 /** @brief 요청을 다 받기까지의 데드라인. */
 const CONTROL_READ_TIMEOUT_SECS: u64 = 15;
 /** @brief 응답을 다 보내기까지의 데드라인. */
@@ -334,7 +340,7 @@ mod stream_slot_tests {
             MAX_CONTROL_STREAM_CONNECTIONS * 2,
             "Streaming at capacity still leaves 64 regular and Raft connections"
         );
-        assert_eq!(CONTROL_CONNECTION_STACK_BYTES, 256 * 1024);
+        assert_eq!(CONTROL_CONNECTION_STACK_BYTES, 1024 * 1024);
 
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut held = Vec::new();
@@ -3010,15 +3016,16 @@ fn handle_setup(
             "Username cannot contain quotes or control characters",
         );
     }
-    if password.chars().count() < 12 {
-        return refuse(
-            stream,
-            "400 Bad Request",
-            "Password must be at least 12 characters",
-        );
-    }
-
-    let hash = crate::password::hash_password(&password);
+    let hash = match crate::password::hash_password(&password) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let status = match error {
+                crate::password::PasswordError::Busy => "503 Service Unavailable",
+                _ => "400 Bad Request",
+            };
+            return refuse(stream, status, &error.to_string());
+        }
+    };
     // 잠금은 설정 파일 기록 구간에만 건다. 뒤따르는 로그인 검증까지 안고 있으면 느린
     // 키 파생이 다른 모든 컨트롤 플레인 변경을 함께 멈춘다.
     {
@@ -4090,11 +4097,11 @@ fn route_dispatch(
             let current = body_str(body, "current_password");
             let next = body_str(body, "new_password");
 
-            if next.chars().count() < 12 {
+            if let Err(error) = crate::password::check_new_password(&next) {
                 return (
                     "400 Bad Request",
                     "application/json",
-                    "{\"error\":\"New password must be at least 12 characters\"}".to_string(),
+                    format!("{{\"error\":{}}}", json::escape(&error.to_string())),
                 );
             }
             match st.auth.verify_user(&name, &current) {
@@ -4114,7 +4121,20 @@ fn route_dispatch(
                     );
                 }
             }
-            let hash = crate::password::hash_password(&next);
+            let hash = match crate::password::hash_password(&next) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let status = match error {
+                        crate::password::PasswordError::Busy => "503 Service Unavailable",
+                        _ => "400 Bad Request",
+                    };
+                    return (
+                        status,
+                        "application/json",
+                        format!("{{\"error\":{}}}", json::escape(&error.to_string())),
+                    );
+                }
+            };
             match (st.controls.password_change)(&name, &hash) {
                 Ok(j) => {
                     if !st.auth.update_user_hash(&name, hash) {
@@ -5922,7 +5942,7 @@ mod tests {
     fn user_login_session_grants_role_and_logout_revokes() {
         let auth = Auth::new(vec!["adm".into()], vec![]).with_users(vec![UserCred {
             name: "alice".into(),
-            hash: crate::password::hash_password("s3cret").into(),
+            hash: hash_eventually("s3cret-passphrase").into(),
             role: Role::Admin,
         }]);
 
@@ -5931,11 +5951,12 @@ mod tests {
             LoginResult::Invalid
         ));
         assert!(matches!(
-            login_eventually(&auth, "bob", "s3cret"),
+            login_eventually(&auth, "bob", "s3cret-passphrase"),
             LoginResult::Invalid
         ));
 
-        let LoginResult::Success(token, role, name) = login_eventually(&auth, "alice", "s3cret")
+        let LoginResult::Success(token, role, name) =
+            login_eventually(&auth, "alice", "s3cret-passphrase")
         else {
             panic!("login ok");
         };
@@ -5955,7 +5976,7 @@ mod tests {
             secure_cookies: true,
         };
         let LoginResult::Success(session, _, _) =
-            login_eventually(st.auth.as_ref(), "alice", "s3cret")
+            login_eventually(st.auth.as_ref(), "alice", "s3cret-passphrase")
         else {
             panic!("login ok");
         };
@@ -7438,10 +7459,12 @@ mod tests {
     fn valid_session_cookie_is_preferred_over_stale_duplicate() {
         let auth = Auth::new(vec![], vec![]).with_users(vec![UserCred {
             name: "alice".to_string(),
-            hash: crate::password::hash_password("s3cret").into(),
+            hash: hash_eventually("s3cret-passphrase").into(),
             role: Role::Admin,
         }]);
-        let LoginResult::Success(active, _, _) = login_eventually(&auth, "alice", "s3cret") else {
+        let LoginResult::Success(active, _, _) =
+            login_eventually(&auth, "alice", "s3cret-passphrase")
+        else {
             panic!("login");
         };
         let candidates = vec!["stale".to_string(), active.clone()];
@@ -7455,6 +7478,16 @@ mod tests {
             match auth.login(name, password) {
                 LoginResult::Busy => std::thread::yield_now(),
                 result => return result,
+            }
+        }
+    }
+
+    /** @brief 포화로 실패하면 잠시 뒤 다시 시도해 해시를 얻는다. */
+    fn hash_eventually(password: &str) -> String {
+        loop {
+            match crate::password::hash_password(password) {
+                Err(crate::password::PasswordError::Busy) => std::thread::yield_now(),
+                result => return result.expect("A test password satisfies the length rule"),
             }
         }
     }

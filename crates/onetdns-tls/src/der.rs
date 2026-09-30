@@ -125,6 +125,41 @@ impl<'a> Der<'a> {
     }
 }
 
+/**
+ * @brief BOOLEAN 값의 내용을 읽는다.
+ * @details DER 은 참을 0xFF 한 바이트, 거짓을 0x00 한 바이트로만 적는다. 다른 길이나 값을 받으면
+ *          같은 인증서를 다른 검증기와 다르게 읽게 된다.
+ */
+pub fn boolean_value(value: &[u8]) -> Result<bool, TlsError> {
+    match value {
+        [0xFF] => Ok(true),
+        [0x00] => Ok(false),
+        _ => Err(TlsError::BadCert),
+    }
+}
+
+/**
+ * @brief 음이 아닌 INTEGER 값의 내용을 u32 로 읽는다.
+ * @details 빈 값, 음수(첫 비트가 1), 불필요한 앞자리 0x00 을 거부한다. 음수를 부호 없는 값으로
+ *          읽으면 -1 이 255 처럼 큰 제한으로 바뀐다. u32 를 넘는 값도 거부한다.
+ */
+pub fn uint_value(value: &[u8]) -> Result<u32, TlsError> {
+    match value {
+        [] => return Err(TlsError::BadCert),
+        [first, ..] if first & 0x80 != 0 => return Err(TlsError::BadCert),
+        [0x00, second, ..] if second & 0x80 == 0 => return Err(TlsError::BadCert),
+        _ => {}
+    }
+    let mut n: u32 = 0;
+    for &b in value {
+        n = n
+            .checked_mul(256)
+            .and_then(|n| n.checked_add(u32::from(b)))
+            .ok_or(TlsError::BadCert)?;
+    }
+    Ok(n)
+}
+
 /** @brief 비트열에서 실제 바이트를 꺼낸다. 남는 비트가 0이 아니면 거부한다. */
 pub fn bit_string_bytes(value: &[u8]) -> Result<&[u8], TlsError> {
     let (&unused, rest) = value.split_first().ok_or(TlsError::BadCert)?;
