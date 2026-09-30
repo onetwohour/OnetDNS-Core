@@ -557,25 +557,36 @@ pub struct ClientUpstream {
     pub ids: Vec<String>,
     /** @brief 이 경로가 쓸 해석 체인. */
     pub resolver: Arc<dyn Resolver>,
+    /** @brief 이 경로가 묻는 업스트림. 공유 캐시에서 이 경로의 답을 구분한다. */
+    upstreams: Vec<String>,
 }
 
 impl ClientUpstream {
-    /** @brief 대상 대역과 식별자, 그리고 그 업스트림으로 만든다. */
-    pub fn new(nets: Vec<IpNet>, ids: Vec<String>, resolver: Arc<dyn Resolver>) -> Self {
+    /** @brief 대상 대역과 식별자, 그리고 그 업스트림과 그 업스트림으로 만든 체인으로 만든다. */
+    pub fn new(
+        nets: Vec<IpNet>,
+        ids: Vec<String>,
+        upstreams: Vec<String>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Self {
         ClientUpstream {
             nets,
             ids,
             resolver,
+            upstreams,
         }
     }
 
-    /** @brief 이 경로의 캐시를 남과 구분하는 이름. */
+    /**
+     * @brief 공유 캐시에서 이 경로의 답을 구분하는 이름.
+     * @details 답을 정하는 것은 이 경로가 묻는 업스트림이다. 대상 클라이언트로 구분하면 같은
+     *          대역에 다른 업스트림을 둔 서버끼리 답이 섞인다.
+     */
     pub fn namespace_key(&self) -> String {
-        let mut nets: Vec<String> = self.nets.iter().map(|n| n.to_string()).collect();
-        nets.sort();
-        let mut ids = self.ids.clone();
-        ids.sort();
-        format!("{}|{}", nets.join(","), ids.join(","))
+        let mut upstreams = self.upstreams.clone();
+        upstreams.sort_unstable();
+        upstreams.dedup();
+        upstreams.join(",")
     }
 
     /** @brief 이 클라이언트가 이 경로에 드는지. */

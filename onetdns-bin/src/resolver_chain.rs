@@ -63,7 +63,11 @@ pub(crate) struct ChainPlan {
     acme_challenge: bool,
     ddr: Option<DdrPlan>,
     dynamic_records: Vec<onetdns_config::DynamicRecord>,
-    /** @brief 공유 캐시에서 기본 체인이 쓰는 이름 공간. 클라이언트 경로는 여기에 경로 이름을 붙인다. */
+    /**
+     * @brief 공유 캐시에서 기본 체인이 쓰는 이름 공간. 클라이언트 경로는 여기에 경로 이름을 붙인다.
+     * @details 외부 캐시를 쓰지 않으면 빈 문자열이다. 그래야 업스트림만 바꾼 설정이 체인을 다시
+     *          만들지 않는다.
+     */
     cache_namespace: String,
 }
 
@@ -189,6 +193,11 @@ impl ChainPlan {
                 split_forward: cfg.split_forward.clone(),
             },
         };
+        let cache_namespace = if cfg.cachedb_redis_host.is_some() {
+            cache_context(cfg, &base)
+        } else {
+            String::new()
+        };
         let forwarder = |servers: &[String]| ForwarderPlan {
             servers: servers.to_vec(),
             bootstrap: cfg.bootstrap.clone(),
@@ -258,7 +267,7 @@ impl ChainPlan {
                 endpoints: ddr_endpoints_from(cfg),
             }),
             dynamic_records: cfg.dynamic_records.clone(),
-            cache_namespace: cache_namespace_base(cfg),
+            cache_namespace,
         }
     }
 
@@ -271,6 +280,110 @@ impl ChainPlan {
     pub(crate) fn cache_namespace(&self) -> &str {
         &self.cache_namespace
     }
+}
+
+/**
+ * @brief 외부 공유 캐시의 이름 공간을 정하는 해석 맥락을 문자열로 만든다.
+ * @details CacheDbLayer 아래에서 답의 내용을 바꾸는 설정만 담는다. 기반 처리 방식과 재귀 설정,
+ *          전달 업스트림, Split 목록, 예비 업스트림, 업스트림 응답 검증, 로컬 전용 이름 판정,
+ *          담을 때 거는 수명 범위가 여기에 든다. 같은 Redis를 쓰는 서버는 이 값이 같을 때만
+ *          서로의 답을 쓴다. 목록은 정렬하고 중복을 없애므로 순서만 다른 설정은 같은 이름 공간을
+ *          쓴다. 제한 시간, 캐시 크기, 선호 주소 계열처럼 답의 내용을 바꾸지 않는 값은 넣지 않는다.
+ *          ECS 옵션과 DO, CD 비트는 요청 키에 이미 들어간다.
+ * @warning CacheDbLayer 아래에 계층이나 답을 바꾸는 설정을 더하면 여기에도 넣어야 한다. 빠지면
+ *          그 설정이 다른 서버가 담은 답을 이 서버가 그대로 쓴다.
+ */
+fn cache_context(cfg: &Config, base: &BasePlan) -> String {
+    let forward = || {
+        canonical_list(
+            cfg.upstreams
+                .iter()
+                .map(ToString::to_string)
+                .chain(cfg.upstream_urls.iter().cloned()),
+        )
+    };
+    let base = match base {
+        BasePlan::Forward => format!("forward{:?}", forward()),
+        BasePlan::Recurse(recurse) => format!("recurse{{{}}}", recursion_context(recurse)),
+        BasePlan::Split {
+            recurse,
+            default,
+            split_recurse,
+            split_forward,
+        } => format!(
+            "split{{forward={:?};recurse={{{}}};default={default:?};split_recurse={:?};split_forward={:?}}}",
+            forward(),
+            recursion_context(recurse),
+            canonical_names(split_recurse),
+            canonical_names(split_forward),
+        ),
+    };
+    let validation = cfg.forward_validation_active().then(|| {
+        format!(
+            "strict={};permissive={};ignore_cd={};insecure={:?};sentinel={};anchors={:?}",
+            cfg.dnssec_strict,
+            cfg.val_permissive_mode,
+            cfg.ignore_cd_flag,
+            canonical_names(&cfg.domain_insecure),
+            cfg.root_key_sentinel,
+            cfg.dnssec_anchor_file,
+        )
+    });
+    format!(
+        "base={base};fallback={:?};validation={validation:?};domain_needed={};bogus_priv={};empty_zones={};min_ttl={};max_ttl={}",
+        canonical_list(cfg.fallback_upstreams.iter()),
+        cfg.domain_needed,
+        cfg.bogus_priv,
+        cfg.empty_zones,
+        cfg.min_ttl,
+        cfg.max_ttl,
+    )
+}
+
+/** @brief 재귀 설정 가운데 답이나 검증 결과를 바꾸는 값. */
+fn recursion_context(plan: &RecursivePlan) -> String {
+    let mut roots = plan.roots.clone();
+    roots.sort_unstable();
+    roots.dedup();
+    format!(
+        "roots={roots:?};insecure={:?};recursion_limit={};cname_limit={};dname_limit={};\
+         deny={:?};allow={:?};qname_min_strict={};harden_referral={};sentinel={};\
+         nsec3_iterations={};dnssec={};strict={};permissive={};ignore_cd={};anchors={:?};\
+         aggressive_nsec={}",
+        canonical_names(&plan.domain_insecure),
+        plan.recursion_limit,
+        plan.cname_limit,
+        plan.dname_limit,
+        canonical_list(plan.recurse_deny_server.iter()),
+        canonical_list(plan.recurse_allow_server.iter()),
+        plan.qname_minimisation_strict,
+        plan.harden_referral_path,
+        plan.root_key_sentinel,
+        plan.val_nsec3_max_iterations,
+        plan.dnssec,
+        plan.dnssec_strict,
+        plan.val_permissive_mode,
+        plan.ignore_cd_flag,
+        plan.dnssec_anchor_file,
+        plan.aggressive_nsec,
+    )
+}
+
+/** @brief 정렬하고 중복을 없앤 목록. */
+fn canonical_list<T: ToString>(values: impl IntoIterator<Item = T>) -> Vec<String> {
+    let mut values: Vec<String> = values.into_iter().map(|value| value.to_string()).collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+/** @brief 대소문자와 끝 점만 다른 도메인 이름을 같게 만든 목록. */
+fn canonical_names(names: &[String]) -> Vec<String> {
+    canonical_list(
+        names
+            .iter()
+            .map(|name| name.trim_end_matches('.').to_ascii_lowercase()),
+    )
 }
 
 impl RecursivePlan {
@@ -1035,6 +1148,73 @@ mod tests {
         assert!(slot.ptr_eq(&installed.cache));
         assert!(!slot.ptr_eq(&running.cache));
         assert!(old_jobs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    /**
+     * @brief 공유 캐시 이름 공간이 답을 바꾸는 설정마다 갈리고, 답과 무관한 설정에는 그대로인지.
+     * @details 같은 Redis를 쓰는 서버끼리 이름 공간이 같으면 서로의 답을 그대로 쓴다.
+     */
+    fn external_cache_namespace_follows_the_resolution_context() {
+        let mut base = forward_config();
+        base.cachedb_redis_host = Some("127.0.0.1".to_string());
+        base.upstreams = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        let namespace = |cfg: &Config| ChainPlan::new(cfg).cache_namespace().to_string();
+        let original = namespace(&base);
+
+        let changes: Vec<(&str, fn(&mut Config))> = vec![
+            ("upstreams", |c| {
+                c.upstreams = vec!["198.51.100.1".parse().unwrap()]
+            }),
+            ("upstream_urls", |c| {
+                c.upstream_urls = vec!["https://dns.example/dns-query".into()]
+            }),
+            ("fallback_upstreams", |c| {
+                c.fallback_upstreams = vec!["192.0.2.54".into()]
+            }),
+            ("backend", |c| c.backend = BackendKind::Recurse),
+            ("split_forward", |c| {
+                c.backend = BackendKind::Split;
+                c.split_forward = vec!["corp.test".into()];
+            }),
+            ("dnssec", |c| c.dnssec = !c.dnssec),
+            ("bogus_priv", |c| c.bogus_priv = !c.bogus_priv),
+            ("min_ttl", |c| c.min_ttl += 1),
+            ("max_ttl", |c| c.max_ttl -= 1),
+        ];
+        for (key, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(namespace(&changed), original, "{key}");
+        }
+
+        let mut reordered = base.clone();
+        reordered.upstreams.reverse();
+        assert_eq!(namespace(&reordered), original, "upstream order");
+        let mut slower = base.clone();
+        slower.query_timeout_secs += 3;
+        assert_eq!(namespace(&slower), original, "query_timeout_secs");
+
+        let mut split = base.clone();
+        split.backend = BackendKind::Split;
+        split.split_forward = vec!["corp.test".into()];
+        let mut split_recursion = split.clone();
+        split_recursion.qname_minimisation_strict = !split.qname_minimisation_strict;
+        assert_ne!(namespace(&split), namespace(&split_recursion));
+        let mut split_case = split.clone();
+        split_case.split_forward = vec!["CORP.test.".into()];
+        assert_eq!(namespace(&split), namespace(&split_case));
+
+        let mut local = base;
+        local.cachedb_redis_host = None;
+        assert_eq!(namespace(&local), "");
+        let mut local_upstream = local.clone();
+        local_upstream.upstreams = vec!["198.51.100.1".parse().unwrap()];
+        assert_eq!(
+            ChainPlan::new(&local),
+            ChainPlan::new(&local_upstream),
+            "without Redis an upstream change leaves the chain alone"
+        );
     }
 
     #[test]

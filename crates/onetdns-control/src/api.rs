@@ -1510,10 +1510,34 @@ impl Auth {
         }
         drop(attempts);
         if let Some(proxy) = proxy {
-            let mut pace = self.proxy_login_pace.lock_recover();
-            let next = pace.entry(proxy.to_string()).or_insert(0);
-            *next = (*next).max(now) + PROXY_LOGIN_FAILURE_INTERVAL_MS;
+            Self::pace_proxy_failure(&mut self.proxy_login_pace.lock_recover(), proxy, now);
         }
+    }
+
+    /**
+     * @brief 프록시 하나의 다음 허용 시각을 한 간격 뒤로 민다.
+     * @details 다음 허용 시각이 이미 지난 항목은 없는 항목과 같게 동작하므로 지운다. 신뢰하는
+     *          프록시 대역이 127.0.0.0/8처럼 넓으면 같은 컴퓨터의 프로그램이 출발 주소를 바꿔
+     *          항목을 끝없이 만들 수 있어서 항목 수에도 상한을 두고, 넘치면 가장 먼저 풀리는
+     *          항목을 버린다.
+     */
+    fn pace_proxy_failure(
+        pace: &mut std::collections::HashMap<String, u64>,
+        proxy: &str,
+        now: u64,
+    ) {
+        pace.retain(|_, next| *next > now);
+        if !pace.contains_key(proxy) && pace.len() >= MAX_LOGIN_ATTEMPT_KEYS {
+            if let Some(soonest) = pace
+                .iter()
+                .min_by_key(|(_, next)| **next)
+                .map(|(key, _)| key.clone())
+            {
+                pace.remove(&soonest);
+            }
+        }
+        let next = pace.entry(proxy.to_string()).or_insert(0);
+        *next = (*next).max(now) + PROXY_LOGIN_FAILURE_INTERVAL_MS;
     }
 
     /** @brief 실패를 기록한다. 항목 수가 상한을 넘으면 오래된 것부터 버린다. */
@@ -2535,11 +2559,30 @@ fn http_field_value(value: &str) -> bool {
 }
 
 /**
+ * @brief 루프백 Host 헤더에서 읽은 출처. 호스트는 소문자 이름이나 IP 문자열로 정규화한다.
+ * @details 포트가 없는 Host는 HTTP 기본 포트 80을 뜻한다. Origin과 비교할 때 이 규칙으로
+ *          양쪽의 실제 포트를 맞춘다.
+ */
+#[derive(Debug, PartialEq, Eq)]
+struct LoopbackAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+impl LoopbackAuthority {
+    /** @brief 포트를 생략했을 때 HTTP가 쓰는 포트까지 채운 실제 포트. */
+    fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(80)
+    }
+}
+
+/**
  * @brief Host 헤더가 자기 자신을 가리키는지 확인한다.
+ * @details 포트가 있으면 이 제어 소켓의 포트와 같아야 한다.
  * @warning DNS 리바인딩 방어의 핵심이다. 확인하지 않으면 공격자 페이지가 이름을 이 서버의
  *          루프백으로 돌려 브라우저를 통해 관리 API를 부를 수 있다.
  */
-fn control_authority(value: &str, local_port: u16) -> Option<String> {
+fn control_authority(value: &str, local_port: u16) -> Option<LoopbackAuthority> {
     let value = value.trim();
     if value.is_empty()
         || value.bytes().any(|byte| byte.is_ascii_whitespace())
@@ -2547,35 +2590,64 @@ fn control_authority(value: &str, local_port: u16) -> Option<String> {
     {
         return None;
     }
+    let authority = parse_loopback_authority(value)?;
+    authority
+        .port
+        .is_none_or(|port| port == local_port)
+        .then_some(authority)
+}
 
-    if value.eq_ignore_ascii_case("localhost") {
-        return Some("localhost".into());
-    }
-    if let Some((name, port)) = value.rsplit_once(':') {
-        if name.eq_ignore_ascii_case("localhost") && port.parse::<u16>().ok() == Some(local_port) {
-            return Some("localhost".into());
-        }
-    }
-
+/** @brief host[:port] 형태를 읽고 호스트가 루프백일 때만 돌려준다. */
+fn parse_loopback_authority(value: &str) -> Option<LoopbackAuthority> {
     if let Ok(address) = value.parse::<SocketAddr>() {
-        return (address.ip().is_loopback() && address.port() == local_port)
-            .then(|| address.ip().to_string());
+        return address.ip().is_loopback().then(|| LoopbackAuthority {
+            host: address.ip().to_string(),
+            port: Some(address.port()),
+        });
     }
     if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
         let ip = inner.parse::<std::net::IpAddr>().ok()?;
-        return ip.is_loopback().then(|| ip.to_string());
+        return ip.is_loopback().then(|| LoopbackAuthority {
+            host: ip.to_string(),
+            port: None,
+        });
     }
-    let ip = value.parse::<std::net::IpAddr>().ok()?;
-    ip.is_loopback().then(|| ip.to_string())
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return ip.is_loopback().then(|| LoopbackAuthority {
+            host: ip.to_string(),
+            port: None,
+        });
+    }
+    let (name, port) = match value.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port.parse::<u16>().ok()?)),
+        None => (value, None),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        .then(|| LoopbackAuthority {
+            host: "localhost".into(),
+            port,
+        })
 }
 
-/** @brief Origin 헤더가 자기 자신인지 확인한다. 교차 출처 요청을 막는다. */
-fn control_origin_authority(value: &str, local_port: u16) -> Option<String> {
-    let authority_and_path = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"))?;
-    let authority = authority_and_path.split('/').next()?;
-    control_authority(authority, local_port)
+/**
+ * @brief Origin이 루프백 Host와 같은 출처인지 확인한다.
+ * @details 출처는 스킴, 호스트, 포트의 조합이다. 제어 소켓은 평문 HTTP만 받으므로 스킴은
+ *          http여야 하고, 호스트와 실제 포트가 모두 Host와 같아야 한다. 경로가 붙은 값은
+ *          Origin 형식이 아니므로 거절한다.
+ * @warning 호스트만 비교하면 같은 컴퓨터의 다른 포트에서 뜬 페이지가 관리 API와 웹소켓을
+ *          호출할 수 있다. 브라우저는 웹소켓에 동일 출처 정책을 적용하지 않으므로 이 검사가
+ *          교차 출처 웹소켓 가로채기를 막는 유일한 장치다.
+ */
+fn same_loopback_origin(origin: &str, host: &LoopbackAuthority) -> bool {
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '\\', '@', '#', '?']) {
+        return false;
+    }
+    parse_loopback_authority(authority).is_some_and(|origin| {
+        origin.host == host.host && origin.effective_port() == host.effective_port()
+    })
 }
 
 /** @brief Host와 Origin 검사에서 요청을 거절하는 이유. */
@@ -2604,10 +2676,8 @@ fn control_caller(
     origin: Option<&str>,
     forwarded_for: &str,
 ) -> Result<Caller, HostRejection> {
-    if let Some(identity) = control_authority(host, local_port) {
-        if origin.is_some_and(|value| {
-            control_origin_authority(value, local_port).as_deref() != Some(identity.as_str())
-        }) {
+    if let Some(authority) = control_authority(host, local_port) {
+        if origin.is_some_and(|value| !same_loopback_origin(value, &authority)) {
             return Err(HostRejection::CrossOrigin);
         }
         return Ok(Caller::direct(peer));
@@ -3743,54 +3813,7 @@ fn handle_dashboard_websocket(
     ws_write_text(&mut stream, &dashboard_top_json(st))?;
     ws_write_text(&mut stream, &dashboard_jobs_json(st))?;
 
-    let mut read_stream = stream.clone();
-    read_stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
-    let reader_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader_stop_t = reader_stop.clone();
-    let (command_tx, command_rx) = std::sync::mpsc::sync_channel::<DashboardCommand>(64);
-    let reader = std::thread::Builder::new()
-        .name("onetdns-dashboard-ws-read".to_string())
-        .stack_size(CONTROL_CONNECTION_STACK_BYTES)
-        .spawn(move || loop {
-            if reader_stop_t.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            match ws_read_frame(&mut read_stream) {
-                Ok((0x1, payload)) => {
-                    let Ok(text) = String::from_utf8(payload) else {
-                        continue;
-                    };
-                    let Some(value) = json::parse(&text).ok() else {
-                        continue;
-                    };
-                    if value.get("type").and_then(|value| value.as_str()) == Some("history") {
-                        let range = value
-                            .get("range")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(60)
-                            .clamp(60, 604_800);
-                        let _ = command_tx.try_send(DashboardCommand::History(range));
-                    }
-                }
-                Ok((0x8, _)) => {
-                    let _ = command_tx.send(DashboardCommand::Close);
-                    break;
-                }
-                Ok((0x9, payload)) => {
-                    let _ = command_tx.try_send(DashboardCommand::Pong(payload));
-                }
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => {
-                    let _ = command_tx.send(DashboardCommand::Close);
-                    break;
-                }
-            }
-        })?;
+    let reader = DashboardReader::spawn(&stream)?;
 
     let mut history_range = 60u64;
     let now = std::time::Instant::now();
@@ -3802,7 +3825,7 @@ fn handle_dashboard_websocket(
     let mut closed = false;
     let mut auth_expired = false;
     while !closed {
-        while let Ok(command) = command_rx.try_recv() {
+        while let Ok(command) = reader.commands().try_recv() {
             match command {
                 DashboardCommand::History(range) => {
                     history_range = range;
@@ -3853,10 +3876,100 @@ fn handle_dashboard_websocket(
     }
     let close_payload = if auth_expired { 1008u16 } else { 1000u16 }.to_be_bytes();
     let _ = ws_write_frame(&mut stream, 0x8, &close_payload);
-    reader_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    let _ = reader.join();
     Ok(())
+}
+
+/**
+ * @brief 대시보드 웹소켓에서 브라우저가 보낸 프레임을 읽는 스레드와 그 정리 책임.
+ * @details 읽기 스레드는 같은 소켓을 공유하므로 소켓이 열려 있는 한 끝나지 않는다. 그래서
+ *          값이 사라지는 모든 경로에서 멈춤 신호, 소켓 종료, 명령 수신 쪽 해제, join을 이
+ *          순서대로 수행한다. 쓰기 실패로 핸들러가 중간에 빠져나가도 스레드와 소켓이 남지 않는다.
+ * @invariant 수신 쪽을 join보다 먼저 놓는다. 가득 찬 채널에 Close를 보내려고 막힌 읽기
+ *            스레드가 있으면, 수신 쪽이 살아 있는 동안 join은 끝나지 않는다.
+ */
+struct DashboardReader {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    stream: SharedTcp,
+    commands: Option<std::sync::mpsc::Receiver<DashboardCommand>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DashboardReader {
+    /** @brief 읽기 스레드를 띄운다. 실패하면 스레드도 소켓 복제도 남지 않는다. */
+    fn spawn(stream: &SharedTcp) -> std::io::Result<Self> {
+        let mut read_stream = stream.clone();
+        read_stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let (command_tx, commands) = std::sync::mpsc::sync_channel::<DashboardCommand>(64);
+        let thread = std::thread::Builder::new()
+            .name("onetdns-dashboard-ws-read".to_string())
+            .stack_size(CONTROL_CONNECTION_STACK_BYTES)
+            .spawn(move || loop {
+                if stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                match ws_read_frame(&mut read_stream) {
+                    Ok((0x1, payload)) => {
+                        let Ok(text) = String::from_utf8(payload) else {
+                            continue;
+                        };
+                        let Some(value) = json::parse(&text).ok() else {
+                            continue;
+                        };
+                        if value.get("type").and_then(|value| value.as_str()) == Some("history") {
+                            let range = value
+                                .get("range")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(60)
+                                .clamp(60, 604_800);
+                            let _ = command_tx.try_send(DashboardCommand::History(range));
+                        }
+                    }
+                    Ok((0x8, _)) => {
+                        let _ = command_tx.send(DashboardCommand::Close);
+                        break;
+                    }
+                    Ok((0x9, payload)) => {
+                        let _ = command_tx.try_send(DashboardCommand::Pong(payload));
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => {
+                        let _ = command_tx.send(DashboardCommand::Close);
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            stream: stream.clone(),
+            commands: Some(commands),
+            thread: Some(thread),
+        })
+    }
+
+    /** @brief 읽기 스레드가 넘긴 명령을 받는 쪽. */
+    fn commands(&self) -> &std::sync::mpsc::Receiver<DashboardCommand> {
+        self.commands
+            .as_ref()
+            .expect("commands are released only in drop")
+    }
+}
+
+impl Drop for DashboardReader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        drop(self.commands.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /** @brief 대시보드에 보낼 지표 모음 JSON. */
@@ -7682,36 +7795,48 @@ mod tests {
     #[test]
     /** @brief 리바인딩과 교차 출처 요청을 막는지. 브라우저를 통한 관리 API 호출을 차단하는 방어다. */
     fn control_authority_rejects_dns_rebinding_and_cross_origin_requests() {
+        let host = |value: &str| control_authority(value, 8080).map(|a| (a.host, a.port));
+        assert_eq!(host("localhost"), Some(("localhost".into(), None)));
         assert_eq!(
-            control_authority("localhost", 8080).as_deref(),
-            Some("localhost")
+            host("LOCALHOST:8080"),
+            Some(("localhost".into(), Some(8080)))
         );
         assert_eq!(
-            control_authority("LOCALHOST:8080", 8080).as_deref(),
-            Some("localhost")
+            host("127.0.0.1:8080"),
+            Some(("127.0.0.1".into(), Some(8080)))
         );
-        assert_eq!(
-            control_authority("127.0.0.1:8080", 8080).as_deref(),
-            Some("127.0.0.1")
-        );
-        assert_eq!(
-            control_authority("[::1]:8080", 8080).as_deref(),
-            Some("::1")
-        );
+        assert_eq!(host("[::1]:8080"), Some(("::1".into(), Some(8080))));
         for rejected in [
             "evil.example",
             "evil.example:8080",
             "localhost:8081",
+            "localhost:",
             "0.0.0.0:8080",
             "127.0.0.1@evil.example",
         ] {
             assert!(control_authority(rejected, 8080).is_none(), "{rejected}");
         }
-        assert_eq!(
-            control_origin_authority("http://localhost:8080", 8080).as_deref(),
-            Some("localhost")
-        );
-        assert!(control_origin_authority("https://evil.example", 8080).is_none());
+
+        let same = |host: &str, origin: &str| {
+            same_loopback_origin(origin, &control_authority(host, 8553).unwrap())
+        };
+        assert!(same("localhost:8553", "http://localhost:8553"));
+        assert!(same("127.0.0.1:8553", "http://127.0.0.1:8553"));
+        assert!(same("[::1]:8553", "http://[::1]:8553"));
+        assert!(same("localhost", "http://localhost"));
+        assert!(same("localhost", "http://localhost:80"));
+        for (host, origin) in [
+            ("localhost:8553", "http://localhost"),
+            ("127.0.0.1:8553", "http://127.0.0.1"),
+            ("127.0.0.1:8553", "http://127.0.0.1:9000"),
+            ("127.0.0.1:8553", "https://127.0.0.1:8553"),
+            ("127.0.0.1:8553", "http://localhost:8553"),
+            ("127.0.0.1:8553", "http://127.0.0.1:8553/"),
+            ("localhost:8553", "https://evil.example"),
+            ("localhost:8553", "null"),
+        ] {
+            assert!(!same(host, origin), "{host} {origin}");
+        }
 
         let rebinding = raw_control_request(b"GET /v1/auth HTTP/1.1\r\nHost: evil.example\r\n\r\n");
         assert!(rebinding.starts_with("HTTP/1.1 421 Misdirected Request"));
@@ -8044,6 +8169,28 @@ mod tests {
     }
 
     #[test]
+    /** @brief 프록시별 속도 제한 표가 풀린 항목을 지우고 항목 수 상한을 지키는지. */
+    fn proxy_login_pacing_keeps_a_bounded_table() {
+        let mut pace: std::collections::HashMap<String, u64> = (0..MAX_LOGIN_ATTEMPT_KEYS)
+            .map(|i| (format!("127.0.{}.{}", i / 256, i % 256), 2_000 + i as u64))
+            .collect();
+        Auth::pace_proxy_failure(&mut pace, "127.1.0.1", 1_000);
+        assert_eq!(pace.len(), MAX_LOGIN_ATTEMPT_KEYS);
+        assert!(
+            !pace.contains_key("127.0.0.0"),
+            "the soonest entry is evicted"
+        );
+        assert!(pace.contains_key("127.0.0.1"));
+
+        Auth::pace_proxy_failure(&mut pace, "127.1.0.1", 1_000_000);
+        assert_eq!(pace.len(), 1, "expired entries are dropped");
+        assert_eq!(
+            pace["127.1.0.1"],
+            1_000_000 + PROXY_LOGIN_FAILURE_INTERVAL_MS
+        );
+    }
+
+    #[test]
     /**
      * @brief 프록시 뒤의 로그인 실패를 실제 클라이언트마다 세고, 프록시 전체는 막지 않고 늦추는지.
      * @details 프록시 주소로 막으면 공격자 하나가 모든 관리자를 막는다. 클라이언트 주소로만
@@ -8187,6 +8334,46 @@ mod tests {
         without_code.auth.clear_setup_code();
         let response = setup_request(&without_code, &body(TEST_SETUP_CODE));
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    #[test]
+    /**
+     * @brief 웹소켓 읽기 가드를 놓으면 읽기 스레드가 끝나고 소켓이 닫히는지.
+     * @details 명령 채널을 가득 채운 뒤 Close 프레임을 보내 읽기 스레드를 블로킹 send에
+     *          묶어 둔다. 가드가 수신 쪽을 join보다 먼저 놓지 않으면 drop이 끝나지 않는다.
+     */
+    fn dropping_the_dashboard_reader_joins_a_blocked_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let mut client =
+            TcpStream::connect(listener.local_addr().unwrap()).expect("connect test client");
+        let (server, _) = listener.accept().expect("accept test connection");
+        let reader = DashboardReader::spawn(&SharedTcp::new(server)).expect("spawn reader");
+
+        let mut frames = Vec::new();
+        for _ in 0..80 {
+            frames.extend_from_slice(&[0x89, 0x80, 1, 2, 3, 4]);
+        }
+        frames.extend_from_slice(&[0x88, 0x80, 1, 2, 3, 4]);
+        std::io::Write::write_all(&mut client, &frames).expect("write frames");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(reader);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropping the reader joins its thread");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(
+            std::io::Read::read_to_end(&mut client, &mut rest).expect("socket is shut down"),
+            0
+        );
     }
 
     #[test]

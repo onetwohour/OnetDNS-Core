@@ -527,14 +527,6 @@ fn ddr_endpoints_from(cfg: &Config) -> Vec<layers::DdrEndpoint> {
     out
 }
 
-/** @brief 외부 응답 캐시에서 서로 섞이면 안 되는 기본 해석·TTL 정책 이름. */
-fn cache_namespace_base(cfg: &Config) -> String {
-    format!(
-        "{:?}/dnssec={}/strict={}/min_ttl={}/max_ttl={}",
-        cfg.backend, cfg.dnssec, cfg.dnssec_strict, cfg.min_ttl, cfg.max_ttl
-    )
-}
-
 /** @brief 신호 핸들러가 보내는 종료 플래그. */
 static SHUTDOWN_FLAG: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
@@ -2243,7 +2235,12 @@ fn build_client_upstream_routes(
             .with_strategy(forward_strategy(cfg.upstream_strategy))
             .with_parallel_limit(cfg.upstream_concurrency);
         let backend: Arc<dyn native::Resolver> = Arc::new(native::NativeBackend::Forward(fwd));
-        routes.push(native::ClientUpstream::new(c.ids.clone(), ids, backend));
+        routes.push(native::ClientUpstream::new(
+            c.ids.clone(),
+            ids,
+            c.upstreams.clone(),
+            backend,
+        ));
     }
     Ok(routes)
 }
@@ -2844,19 +2841,6 @@ mod tests {
         // DNSCrypt는 SVCB로 알릴 ALPN이 없어 대상이 아니다.
         cfg.listen_dnscrypt = vec!["127.0.0.1:5443".parse().unwrap()];
         assert_eq!(ddr_endpoints_from(&cfg).len(), endpoints.len());
-    }
-
-    #[test]
-    /** @brief 외부 캐시가 서로 다른 TTL 정책의 응답을 같은 이름 공간에서 나누지 않는지. */
-    fn external_cache_namespace_separates_ttl_policies() {
-        let base = Config::default();
-        let mut changed = base.clone();
-        changed.min_ttl = base.min_ttl.saturating_add(1);
-        assert_ne!(cache_namespace_base(&base), cache_namespace_base(&changed));
-
-        changed = base.clone();
-        changed.max_ttl = base.max_ttl.saturating_sub(1);
-        assert_ne!(cache_namespace_base(&base), cache_namespace_base(&changed));
     }
 
     #[test]

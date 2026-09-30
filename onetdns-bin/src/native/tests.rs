@@ -3946,6 +3946,7 @@ fn per_client_upstream_match_prefers_specific_resolver() {
     .with_client_upstreams(vec![ClientUpstream::new(
         vec!["127.0.0.1/32".parse().unwrap()],
         vec![],
+        vec![specific.to_string()],
         Arc::new(NativeBackend::Forward(Forwarder::new(
             vec![specific],
             Duration::from_secs(2),

@@ -75,7 +75,7 @@ impl CacheDbLayer {
 
     /** @brief 이 요청의 외부 캐시 키. */
     fn key(&self, request: &Message) -> Option<Vec<u8>> {
-        let mut key = format!("onetdns:v2:{}:", self.namespace).into_bytes();
+        let mut key = format!("onetdns:v3:{}:", self.namespace).into_bytes();
         key.extend_from_slice(&semantic_request_key(request)?);
         Some(key)
     }
@@ -259,7 +259,7 @@ mod tests {
         let upper = layer.key(&query("Example.COM", RecordType::A)).unwrap();
         let lower = layer.key(&query("example.com", RecordType::A)).unwrap();
         assert_eq!(upper, lower, "0x20 대소문자는 동일 키로 정규화되어야 함");
-        assert!(upper.starts_with(b"onetdns:v2:ns:"));
+        assert!(upper.starts_with(b"onetdns:v3:ns:"));
         let aaaa = layer.key(&query("example.com", RecordType::AAAA)).unwrap();
         assert_ne!(lower, aaaa, "qtype가 다르면 키가 분리되어야 함");
     }
