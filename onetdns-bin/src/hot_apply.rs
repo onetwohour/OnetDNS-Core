@@ -97,6 +97,8 @@ pub(crate) struct HotApplyDeps {
     pub(crate) filters: FilterState,
     /** @brief 관리 화면 인증. 관리 수신 주소가 없으면 없다. */
     pub(crate) console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>>,
+    /** @brief 관리 화면 앞의 리버스 프록시 정책. */
+    pub(crate) control_proxy: Arc<ArcSwap<onetdns_control::ProxyPolicy>>,
     /** @brief 실행 중 설정. */
     pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
     /** @brief 접근 제어. */
@@ -657,6 +659,7 @@ impl HotApplyDeps {
                     ..
                 },
             console_auth,
+            control_proxy,
             runtime_cfg,
             acl_state,
             rate_state,
@@ -706,6 +709,7 @@ impl HotApplyDeps {
                 }
                 auth.replace_tokens(admin, next.control_readonly_tokens.clone());
             }
+            control_proxy.store(Arc::new(crate::control_proxy_policy(next)));
             onetdns_core::info!(
                 event = "control.tokens_reloaded",
                 "Updated the control token without stopping DNS"

@@ -14,7 +14,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-use onetdns_core::{IpNet, SecretString};
+use onetdns_core::{HttpsOrigin, IpNet, SecretString};
 
 use crate::mode::Mode;
 
@@ -826,6 +826,16 @@ pub struct Config {
     /** @brief 읽기 전용 API 토큰. */
     pub control_readonly_tokens: Vec<SecretString>,
 
+    /**
+     * @brief 관리 화면 앞에 둔 리버스 프록시의 주소 대역.
+     * @details 이 대역에서 온 요청만 control_public_origins의 Host로 들어올 수 있고, 그때만
+     *          X-Forwarded-For에서 실제 클라이언트 주소를 읽는다.
+     */
+    pub control_trusted_proxies: Vec<IpNet>,
+
+    /** @brief 리버스 프록시가 관리 화면을 내보이는 HTTPS 출처. */
+    pub control_public_origins: Vec<HttpsOrigin>,
+
     /** @brief 사용자 지정 차단 IPv4. */
     pub block_ipv4: Option<Ipv4Addr>,
 
@@ -1365,6 +1375,8 @@ impl Default for Config {
             control_token: SecretString::default(),
             control_admin_tokens: vec![],
             control_readonly_tokens: vec![],
+            control_trusted_proxies: vec![],
+            control_public_origins: vec![],
 
             block_ipv4: None,
             block_ipv6: None,
@@ -2621,6 +2633,7 @@ impl Config {
                 )));
             }
         }
+        validate_control_proxy(&self.control_trusted_proxies, &self.control_public_origins)?;
 
         if self.tftp_enable
             && self.tftp_writable
@@ -3299,6 +3312,11 @@ impl Config {
             "control_readonly_tokens",
             self.control_readonly_tokens.len().to_string(),
         );
+        kv(
+            "control_trusted_proxies",
+            sarr(&self.control_trusted_proxies),
+        );
+        kv("control_public_origins", sarr(&self.control_public_origins));
         kv("hide_identity", self.hide_identity.to_string());
         kv("hide_version", self.hide_version.to_string());
         kv("nsid", opt_s(&self.nsid));
@@ -3788,6 +3806,8 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "cluster_raft_peers",
         "control_admin_tokens",
         "control_readonly_tokens",
+        "control_public_origins",
+        "control_trusted_proxies",
         "dhcp6_dns",
         "dhcp_dns",
         "disabled_blocklist_urls",
@@ -3935,6 +3955,18 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "proxy_protocol_trusted",
         "CIDR (for example 127.0.0.1/32)",
     )?;
+    check_typed_array::<IpNet>(
+        root,
+        "control_trusted_proxies",
+        "CIDR (for example 127.0.0.1/32)",
+    )?;
+    for value in gstrvec(root, "control_public_origins") {
+        if HttpsOrigin::parse(&value).is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "control_public_origins: expected an HTTPS address with no path, like https://admin.example.com: {value}"
+            )));
+        }
+    }
     if let Some(value) = root.get("tftp_listen") {
         let valid = value
             .as_str()
@@ -5164,6 +5196,32 @@ fn check_named_ip_array<T: FromStr>(
 }
 
 /** @brief 파싱 가능한 값 배열을 검사한다. */
+/**
+ * @brief 관리 화면 리버스 프록시 설정을 검증한다.
+ * @details 두 키는 함께 쓴다. 한쪽만 있으면 아무 동작도 하지 않는다. 관리 서버는 루프백에서만
+ *          받으므로 프록시도 루프백에서 접속한다.
+ */
+fn validate_control_proxy(proxies: &[IpNet], origins: &[HttpsOrigin]) -> Result<(), ConfigError> {
+    if proxies.is_empty() != origins.is_empty() {
+        return Err(ConfigError::Invalid(
+            "Set control_trusted_proxies and control_public_origins together: the reverse proxy's address and the HTTPS address it serves the dashboard on".into(),
+        ));
+    }
+    for net in proxies {
+        let loopback = net.network().is_loopback()
+            && match net.network() {
+                IpAddr::V4(_) => net.prefix_len() >= 8,
+                IpAddr::V6(_) => net.prefix_len() == 128,
+            };
+        if !loopback {
+            return Err(ConfigError::Invalid(format!(
+                "control_trusted_proxies can hold only local addresses, because the management server listens only on a local address: {net}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_typed_array<T: FromStr>(root: &Value, key: &str, hint: &str) -> Result<(), ConfigError> {
     let Some(raw) = root.get(key) else {
         return Ok(());
@@ -5512,6 +5570,8 @@ const KNOWN_KEYS: &[&str] = &[
     "control_token",
     "control_admin_tokens",
     "control_readonly_tokens",
+    "control_trusted_proxies",
+    "control_public_origins",
     "block_ipv4",
     "block_ipv6",
     "blocked_response_ttl",
@@ -5865,6 +5925,11 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.control_readonly_tokens = gstrvec(root, "control_readonly_tokens")
         .into_iter()
         .map(SecretString::from)
+        .collect();
+    c.control_trusted_proxies = gparsevec(root, "control_trusted_proxies");
+    c.control_public_origins = gstrvec(root, "control_public_origins")
+        .iter()
+        .filter_map(|value| HttpsOrigin::parse(value))
         .collect();
     c.block_ipv4 = gopt_parse(root, "block_ipv4");
     c.block_ipv6 = gopt_parse(root, "block_ipv6");
@@ -6700,6 +6765,44 @@ answer = \"target.example\"
             format!("3@127.0.0.1:7003#{}", pubkey.to_uppercase()),
         ];
         assert!(dup_pubkey.validate().is_err(), "중복 peer 공개키는 거부");
+    }
+
+    #[test]
+    /**
+     * @brief 관리 화면 리버스 프록시 설정을 검증하는지.
+     * @details 두 키는 함께 있어야 하고, 프록시는 로컬 주소, 출처는 경로 없는 HTTPS여야 한다.
+     *          출처는 브라우저가 Origin에 싣는 형태로 정규화된다.
+     */
+    fn dashboard_reverse_proxy_settings_are_validated() {
+        let parsed = Config::from_toml_str(
+            "control_trusted_proxies = [\"127.0.0.1/32\"]\n\
+             control_public_origins = [\"HTTPS://Admin.Example.com:443\"]\n",
+        )
+        .expect("정상 설정이 거부됨");
+        assert_eq!(
+            parsed.control_public_origins[0].to_string(),
+            "https://admin.example.com"
+        );
+        assert!(parsed.validate().is_ok());
+
+        for (proxies, origins) in [
+            ("[\"127.0.0.1/32\"]", "[\"http://admin.example.com\"]"),
+            ("[\"127.0.0.1/32\"]", "[\"https://admin.example.com/ui\"]"),
+            ("[\"192.168.0.10/32\"]", "[\"https://admin.example.com\"]"),
+            ("[\"::/0\"]", "[\"https://admin.example.com\"]"),
+            ("[\"127.0.0.1/32\"]", "[]"),
+            ("[]", "[\"https://admin.example.com\"]"),
+        ] {
+            let text = format!(
+                "control_trusted_proxies = {proxies}\ncontrol_public_origins = {origins}\n"
+            );
+            assert!(
+                Config::from_toml_str(&text)
+                    .and_then(|cfg| cfg.validate())
+                    .is_err(),
+                "{text}"
+            );
+        }
     }
 
     #[test]

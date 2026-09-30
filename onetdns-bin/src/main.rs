@@ -1477,12 +1477,14 @@ pub fn serve(
         // 목록만 교체하려면 그 핸들이 필요하므로 슬롯을 먼저 잡아 둔다.
         let console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>> =
             Arc::new(Mutex::new(None));
+        let control_proxy = Arc::new(ArcSwap::from_pointee(control_proxy_policy(&cfg)));
 
         let hot_config_apply = hot_apply::build(hot_apply::HotApplyDeps {
             restarts: restarts.clone(),
             zones: zones.clone(),
             filters: filters.clone(),
             console_auth: console_auth.clone(),
+            control_proxy: control_proxy.clone(),
             runtime_cfg: runtime_cfg.clone(),
             acl_state: acl_state.clone(),
             rate_state: rate_state.clone(),
@@ -1549,8 +1551,7 @@ pub fn serve(
             },
             controls: Arc::new(controls),
             readiness: readiness.clone(),
-
-            secure_cookies: false,
+            proxy: control_proxy,
         };
         *console_auth.lock_recover() = Some(state.auth.clone());
         let state_for_control = state;
@@ -2529,6 +2530,14 @@ fn json_str_array(items: &[String]) -> String {
         .map(|s| onetdns_core::json::escape(s))
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+/** @brief 관리 화면 앞의 리버스 프록시 정책을 설정에서 만든다. */
+fn control_proxy_policy(cfg: &Config) -> onetdns_control::ProxyPolicy {
+    onetdns_control::ProxyPolicy {
+        trusted: cfg.control_trusted_proxies.clone(),
+        origins: cfg.control_public_origins.clone(),
+    }
 }
 
 /** @brief 대시보드 로그인 정보를 만든다. */

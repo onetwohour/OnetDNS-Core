@@ -15,13 +15,13 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use onetdns_core::json;
-use onetdns_core::{MutexExt, SecretString};
+use onetdns_core::{ArcSwap, HttpsOrigin, IpNet, MutexExt, SecretString};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -992,7 +992,7 @@ impl Role {
 
     /**
      * @brief 이 등급이 그 메서드를 쓸 수 있는지.
-     * @note 읽기 전용은 GET과 HEAD만 된다. 상태를 바꾸는 메서드는 전부 막힌다.
+     * @note 읽기 전용은 GET만 된다. 라우팅이 HEAD를 처리하지 않으므로 여기서도 열지 않는다.
      */
     fn allows(self, method: &str) -> bool {
         self == Role::Admin || method == "GET"
@@ -1061,6 +1061,15 @@ const MAX_LOGIN_FAILURES: u32 = 8;
 
 /** @brief 출발지별 실패 허용 횟수. 사용자 이름을 바꿔 가며 시도하는 것을 막는다. */
 const MAX_SOURCE_LOGIN_FAILURES: u32 = 40;
+
+/**
+ * @brief 리버스 프록시 하나를 거쳐 온 실패 전체의 허용 횟수.
+ * @details 프록시 뒤의 출발지는 X-Forwarded-For가 알려 준다. 프록시와 같은 컴퓨터의 다른
+ *          프로그램도 이 헤더를 꾸며 보낼 수 있으므로, 출발지를 바꿔 가며 무한히 시도하지
+ *          못하게 프록시 단위로도 센다. 출발지 한도의 열 배라, 출발지 하나가 막힌다고
+ *          프록시 뒤의 다른 관리자까지 막히지는 않는다.
+ */
+const MAX_PROXY_LOGIN_FAILURES: u32 = 10 * MAX_SOURCE_LOGIN_FAILURES;
 /** @brief 실패 기록을 담을 항목 수 상한. */
 const MAX_LOGIN_ATTEMPT_KEYS: usize = 4096;
 /** @brief 요청 첫 줄의 길이 상한. */
@@ -1376,8 +1385,16 @@ impl Auth {
         format!("user\u{1f}{source}\u{1f}{user}")
     }
 
-    /** @brief 지금 이 출발지와 사용자가 시도할 수 있는지. */
-    fn login_allowed(&self, source: &str, user: &str) -> bool {
+    /** @brief 리버스 프록시 하나를 거쳐 온 실패 전체의 키. */
+    fn login_proxy_bucket(proxy: &str) -> String {
+        format!("proxy\u{1f}{proxy}")
+    }
+
+    /**
+     * @brief 지금 이 출발지와 사용자가 시도할 수 있는지.
+     * @param proxy 리버스 프록시를 거쳐 왔으면 그 프록시의 주소.
+     */
+    fn login_allowed(&self, source: &str, proxy: Option<&str>, user: &str) -> bool {
         let now = now_ms();
         let mut attempts = self.login_attempts.lock_recover();
         attempts.retain(|_, attempt| {
@@ -1389,21 +1406,31 @@ impl Auth {
                 .get(&key)
                 .is_none_or(|attempt| attempt.blocked_until_ms <= now)
         };
-        allowed(Self::login_source_bucket(source)) && allowed(Self::login_user_bucket(source, user))
+        allowed(Self::login_source_bucket(source))
+            && allowed(Self::login_user_bucket(source, user))
+            && proxy.is_none_or(|proxy| allowed(Self::login_proxy_bucket(proxy)))
     }
 
-    /** @brief 시도 결과를 기록한다. 성공하면 실패 기록을 지운다. */
-    fn record_login_result(&self, source: &str, user: &str, success: bool) {
+    /**
+     * @brief 시도 결과를 기록한다. 성공하면 그 사용자의 실패 기록만 지운다.
+     * @note 출발지와 프록시 단위의 기록은 성공해도 지우지 않는다. 지우면 자기 계정으로 한 번
+     *       로그인할 때마다 다른 계정을 추측할 횟수가 다시 채워진다.
+     */
+    fn record_login_result(&self, source: &str, proxy: Option<&str>, user: &str, success: bool) {
         let mut attempts = self.login_attempts.lock_recover();
         if success {
             attempts.remove(&Self::login_user_bucket(source, user));
             return;
         }
         let now = now_ms();
-        for (key, limit) in [
+        let mut buckets = vec![
             (Self::login_user_bucket(source, user), MAX_LOGIN_FAILURES),
             (Self::login_source_bucket(source), MAX_SOURCE_LOGIN_FAILURES),
-        ] {
+        ];
+        if let Some(proxy) = proxy {
+            buckets.push((Self::login_proxy_bucket(proxy), MAX_PROXY_LOGIN_FAILURES));
+        }
+        for (key, limit) in buckets {
             Self::record_login_failure(&mut attempts, key, limit, now);
         }
     }
@@ -2002,8 +2029,118 @@ pub struct AppState {
     /** @brief 서버가 다 떴는지. 그 전에는 준비되지 않았다고 답한다. */
     pub readiness: Arc<std::sync::atomic::AtomicBool>,
 
-    /** @brief 쿠키에 안전 표시를 붙일지. TLS로 서빙할 때만 붙인다. */
-    pub secure_cookies: bool,
+    /** @brief 관리 화면 앞의 리버스 프록시 정책. 설정을 다시 읽으면 통째로 바뀐다. */
+    pub proxy: Arc<ArcSwap<ProxyPolicy>>,
+}
+
+#[derive(Default)]
+/**
+ * @brief 관리 화면을 리버스 프록시 뒤에서 내보일 때의 정책.
+ * @details trusted 대역에서 접속한 요청만 origins의 Host로 들어올 수 있고, 그런 요청에서만
+ *          X-Forwarded-For를 읽는다. 그 밖의 요청은 전처럼 루프백 Host만 받는다.
+ */
+pub struct ProxyPolicy {
+    /** @brief 리버스 프록시가 접속해 오는 주소 대역. */
+    pub trusted: Vec<IpNet>,
+    /** @brief 리버스 프록시가 관리 화면을 내보이는 HTTPS 출처. */
+    pub origins: Vec<HttpsOrigin>,
+}
+
+impl ProxyPolicy {
+    /** @brief 이 주소가 신뢰하는 리버스 프록시인지. */
+    fn trusts(&self, ip: IpAddr) -> bool {
+        self.trusted.iter().any(|net| net.contains(&ip))
+    }
+
+    /**
+     * @brief X-Forwarded-For에서 실제 클라이언트 주소를 고른다.
+     * @details 오른쪽부터 읽으며 신뢰하는 프록시 주소를 건너뛴 첫 주소다. 왼쪽 항목은
+     *          클라이언트가 마음대로 적어 보낼 수 있고, 프록시는 자기가 본 주소를 오른쪽 끝에
+     *          붙이기 때문이다. 주소가 아닌 값을 만나면 거기서 멈추고 모른다고 답한다.
+     */
+    fn forwarded_client(&self, forwarded_for: &str) -> Option<IpAddr> {
+        for entry in forwarded_for.rsplit(',') {
+            let ip = entry.trim().parse::<IpAddr>().ok()?;
+            if !self.trusts(ip) {
+                return Some(ip);
+            }
+        }
+        None
+    }
+}
+
+/** @brief 로그인 세션 쿠키 이름. 루프백으로 직접 접속할 때 쓴다. */
+const SESSION_COOKIE: &str = "onetdns_session";
+
+/**
+ * @brief HTTPS 리버스 프록시를 거쳐 접속할 때의 세션 쿠키 이름.
+ * @details __Host- 접두사가 붙은 쿠키는 브라우저가 Secure, Path=/, Domain 없음일 때만
+ *          받는다. 같은 도메인의 다른 하위 도메인이 이 쿠키를 덮어쓸 수 없게 된다.
+ */
+const SECURE_SESSION_COOKIE: &str = "__Host-onetdns_session";
+
+/** @brief 요청을 보낸 쪽. 감사 기록, 로그인 제한, 쿠키 형식이 이것을 따른다. */
+struct Caller {
+    /** @brief TCP 연결의 상대 주소. 프록시를 거쳤으면 프록시다. */
+    peer: Option<SocketAddr>,
+    /** @brief 신뢰하는 리버스 프록시를 거쳐 공개 출처로 들어왔을 때 그 내용. */
+    proxied: Option<Proxied>,
+}
+
+/** @brief 리버스 프록시를 거쳐 들어온 요청의 정보. */
+struct Proxied {
+    /** @brief X-Forwarded-For가 알려 준 실제 클라이언트 주소. 헤더가 없거나 깨졌으면 없다. */
+    client: Option<IpAddr>,
+}
+
+impl Caller {
+    /** @brief 프록시를 거치지 않은 요청. */
+    fn direct(peer: Option<SocketAddr>) -> Self {
+        Self {
+            peer,
+            proxied: None,
+        }
+    }
+
+    /** @brief 감사 기록과 로그에 남길 출발지. 프록시를 거쳤으면 실제 클라이언트와 프록시를 함께 적는다. */
+    fn label(&self) -> String {
+        let peer = self.peer.map(|value| value.to_string()).unwrap_or_default();
+        match &self.proxied {
+            Some(proxied) => match proxied.client {
+                Some(client) => format!("{client} via {peer}"),
+                None => format!("unknown via {peer}"),
+            },
+            None => peer,
+        }
+    }
+
+    /**
+     * @brief 로그인 실패를 셀 출발지.
+     * @details 프록시를 거쳤으면 실제 클라이언트 주소다. 프록시 주소로 세면 공격자 하나가
+     *          프록시 뒤의 모든 관리자를 함께 막는다. 클라이언트 주소를 모르면 프록시 주소로 센다.
+     */
+    fn login_source(&self) -> String {
+        self.proxied
+            .as_ref()
+            .and_then(|proxied| proxied.client)
+            .or(self.peer.map(|peer| peer.ip()))
+            .map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
+    }
+
+    /** @brief 프록시를 거쳤으면 그 프록시 주소. 프록시 단위 로그인 제한의 키다. */
+    fn login_proxy(&self) -> Option<String> {
+        self.proxied.as_ref()?;
+        Some(self.peer?.ip().to_string())
+    }
+
+    /** @brief 이 요청이 쓰는 세션 쿠키 이름. HTTPS 공개 출처로 들어왔으면 Secure 쿠키다. */
+    fn session_cookie(&self) -> &'static str {
+        if self.proxied.is_some() {
+            SECURE_SESSION_COOKIE
+        } else {
+            SESSION_COOKIE
+        }
+    }
 }
 
 /** @brief 완성된 요청을 기존 연결 처리 스레드로 승격한다. */
@@ -2353,6 +2490,61 @@ fn control_origin_authority(value: &str, local_port: u16) -> Option<String> {
     control_authority(authority, local_port)
 }
 
+/** @brief Host와 Origin 검사에서 요청을 거절하는 이유. */
+#[derive(Debug, PartialEq, Eq)]
+enum HostRejection {
+    /** @brief Host가 루프백도 아니고, 신뢰하는 프록시를 거친 공개 출처도 아니다. */
+    Misdirected,
+    /** @brief Origin이 Host와 다른 출처다. */
+    CrossOrigin,
+}
+
+/**
+ * @brief Host와 Origin으로 요청을 받을지 정하고, 받는다면 보낸 쪽을 알아낸다.
+ * @details 루프백 Host는 전처럼 받고 Origin도 같은 루프백 출처여야 한다. 그 밖의 Host는
+ *          신뢰하는 리버스 프록시에서 접속했고 공개 출처 목록의 Host일 때만 받으며, Origin이
+ *          있으면 그 출처와 정확히 같아야 한다. 이때만 X-Forwarded-For를 읽는다.
+ * @warning DNS 리바인딩 방어가 여기 있다. 공개 출처를 프록시가 아닌 연결에도 열면, 이름을
+ *          루프백으로 돌린 공격자 페이지는 막히지만 같은 컴퓨터의 다른 프로그램이 프록시인
+ *          척 X-Forwarded-For를 꾸며 로그인 제한을 피할 수 있다.
+ */
+fn control_caller(
+    policy: &ProxyPolicy,
+    peer: Option<SocketAddr>,
+    local_port: u16,
+    host: &str,
+    origin: Option<&str>,
+    forwarded_for: &str,
+) -> Result<Caller, HostRejection> {
+    if let Some(identity) = control_authority(host, local_port) {
+        if origin.is_some_and(|value| {
+            control_origin_authority(value, local_port).as_deref() != Some(identity.as_str())
+        }) {
+            return Err(HostRejection::CrossOrigin);
+        }
+        return Ok(Caller::direct(peer));
+    }
+    let from_proxy = peer.is_some_and(|peer| policy.trusts(peer.ip()));
+    let public = from_proxy
+        .then(|| {
+            policy
+                .origins
+                .iter()
+                .find(|public| public.matches_host(host))
+        })
+        .flatten()
+        .ok_or(HostRejection::Misdirected)?;
+    if origin.is_some_and(|value| !public.matches_origin(value)) {
+        return Err(HostRejection::CrossOrigin);
+    }
+    Ok(Caller {
+        peer,
+        proxied: Some(Proxied {
+            client: policy.forwarded_client(forwarded_for),
+        }),
+    })
+}
+
 #[cfg(test)]
 /** @brief 연결 하나를 처리한다. */
 fn handle_conn(stream: TcpStream, st: &AppState) -> std::io::Result<()> {
@@ -2480,6 +2672,7 @@ fn handle_conn_inner(
     let mut csrf_seen = false;
     let mut host: Option<String> = None;
     let mut origin: Option<String> = None;
+    let mut forwarded_for = String::new();
     let mut header_bytes = 0usize;
     let mut header_count = 0usize;
     let mut has_transfer_encoding = false;
@@ -2614,6 +2807,11 @@ fn handle_conn_inner(
                 );
             }
             origin = Some(val.to_string());
+        } else if name.eq_ignore_ascii_case("x-forwarded-for") {
+            if !forwarded_for.is_empty() {
+                forwarded_for.push(',');
+            }
+            forwarded_for.push_str(val);
         } else if name.eq_ignore_ascii_case("authorization") {
             if auth_seen {
                 return write_simple(
@@ -2669,35 +2867,44 @@ fn handle_conn_inner(
      * 읽기 전용 GET이라 리바인딩으로 얻을 것이 없으므로 Host 검사를 거치지 않는다.
      */
     if method == "GET" && path.starts_with("/.well-known/acme-challenge/") {
-        let (status, content_type, body) = route(&method, &path, "", "", "", peer, st);
+        let (status, content_type, body) =
+            route(&method, &path, "", "", "", &Caller::direct(peer), st);
         return write_simple(stream, status, content_type, "", &body);
     }
-    let Some(host_identity) = control_authority(&host, local_port) else {
-        record_control_error(
-            "host_not_loopback",
-            peer,
-            "Management API called with a non-loopback Host. This may be a DNS rebinding attempt",
-        );
-        return write_simple(
-            stream,
-            "421 Misdirected Request",
-            "text/plain",
-            "",
-            "Management API Host must be localhost or a loopback address",
-        );
+    let caller = match control_caller(
+        &st.proxy.load(),
+        peer,
+        local_port,
+        &host,
+        origin.as_deref(),
+        &forwarded_for,
+    ) {
+        Ok(caller) => caller,
+        Err(HostRejection::Misdirected) => {
+            record_control_error(
+                "host_not_loopback",
+                peer,
+                "Management API called with a Host that is neither loopback nor a configured public address. This may be a DNS rebinding attempt",
+            );
+            return write_simple(
+                stream,
+                "421 Misdirected Request",
+                "text/plain",
+                "",
+                "Management API Host must be localhost, a loopback address, or an address in control_public_origins reached through control_trusted_proxies",
+            );
+        }
+        Err(HostRejection::CrossOrigin) => {
+            record_control_error("cross_origin", peer, "Cross-origin management request");
+            return write_simple(
+                stream,
+                "403 Forbidden",
+                "text/plain",
+                "",
+                "Cross-origin management requests are not allowed",
+            );
+        }
     };
-    if origin.as_deref().is_some_and(|value| {
-        control_origin_authority(value, local_port).as_deref() != Some(host_identity.as_str())
-    }) {
-        record_control_error("cross_origin", peer, "Cross-origin management request");
-        return write_simple(
-            stream,
-            "403 Forbidden",
-            "text/plain",
-            "",
-            "Cross-origin management requests are not allowed",
-        );
-    }
     if has_transfer_encoding {
         return write_simple(
             stream,
@@ -2718,7 +2925,7 @@ fn handle_conn_inner(
             "Request body is too large",
         );
     }
-    let session_candidates = cookie_values(&cookie, "onetdns_session");
+    let session_candidates = cookie_values(&cookie, caller.session_cookie());
 
     let session = select_session_cookie(&session_candidates, &st.auth);
     let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
@@ -2770,16 +2977,16 @@ fn handle_conn_inner(
     };
 
     if method == "POST" && path == "/v1/setup" {
-        return handle_setup(stream, &body, peer, st);
+        return handle_setup(stream, &body, &caller, st);
     }
     if method == "POST" && path == "/v1/login" {
-        return handle_login(stream, &body, peer, st);
+        return handle_login(stream, &body, &caller, st);
     }
     if method == "POST" && path == "/v1/logout" {
-        return handle_logout(stream, &session_candidates, st);
+        return handle_logout(stream, &session_candidates, &caller, st);
     }
     if method == "GET" && path == "/v1/auth" {
-        return handle_auth(stream, &auth, &session, peer, st);
+        return handle_auth(stream, &auth, &session, &caller, st);
     }
 
     if method == "GET" && path == "/v1/dashboard/ws" {
@@ -2792,12 +2999,12 @@ fn handle_conn_inner(
             &ws_key,
             &ws_version,
             &ws_protocols,
-            peer,
+            &caller,
             st,
         );
     }
 
-    let (status, ctype, resp) = route(&method, &path, &auth, &session, &body, peer, st);
+    let (status, ctype, resp) = route(&method, &path, &auth, &session, &body, &caller, st);
     let ctype = with_charset(ctype);
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2939,14 +3146,19 @@ fn write_simple(
 }
 
 /**
- * @brief 세션 쿠키를 설정하는 헤더.
- * @note HTTPS일 때만 Secure를 붙인다. 평문 접속에 붙이면 브라우저가 쿠키를 아예 저장하지 않는다.
+ * @brief 세션 쿠키를 설정하는 헤더. max_age가 0이면 쿠키를 지운다.
+ * @note HTTPS 공개 출처로 들어왔을 때만 Secure를 붙인다. 루프백 평문 접속에 붙이면 브라우저에
+ *       따라 쿠키를 저장하지 않는다.
  */
-fn session_cookie_header(token: &str, secure_cookies: bool) -> String {
-    let secure = if secure_cookies { " Secure;" } else { "" };
+fn session_cookie_header(caller: &Caller, token: &str, max_age: u64) -> String {
+    let secure = if caller.proxied.is_some() {
+        " Secure;"
+    } else {
+        ""
+    };
     format!(
-        "Set-Cookie: onetdns_session={token};{secure} HttpOnly; SameSite=Strict; Path=/; Max-Age={}\r\n",
-        SESSION_ABSOLUTE_TTL_MS / 1000
+        "Set-Cookie: {}={token};{secure} HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}\r\n",
+        caller.session_cookie()
     )
 }
 
@@ -2963,10 +3175,10 @@ fn session_cookie_header(token: &str, secure_cookies: bool) -> String {
 fn handle_setup(
     stream: SharedTcp,
     body: &str,
-    peer: Option<SocketAddr>,
+    caller: &Caller,
     st: &AppState,
 ) -> std::io::Result<()> {
-    let peer_s = peer.map(|value| value.to_string()).unwrap_or_default();
+    let peer_s = caller.label();
     let refuse = |stream, status: &str, message: &str| {
         write_simple(
             stream,
@@ -2976,6 +3188,18 @@ fn handle_setup(
             &format!("{{\"ok\":false,\"error\":{}}}", json::escape(message)),
         )
     };
+
+    // 첫 계정은 설정 파일을 고칠 수 있는 사람만 만들어야 한다. 리버스 프록시를 거친 요청은
+    // 인터넷의 누구든 보낼 수 있다.
+    if caller.proxied.is_some() {
+        st.audit
+            .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
+        return refuse(
+            stream,
+            "403 Forbidden",
+            "Create the first account on the computer running OnetDNS, then sign in here",
+        );
+    }
 
     if st.auth.has_users() {
         st.audit
@@ -3065,7 +3289,7 @@ fn handle_setup(
 
     match st.auth.start_session_for(&name) {
         Some((token, role)) => {
-            let cookie = session_cookie_header(&token, st.secure_cookies);
+            let cookie = session_cookie_header(caller, &token, SESSION_ABSOLUTE_TTL_MS / 1000);
             let resp = format!(
                 "{{\"ok\":true,\"user\":{},\"role\":{}}}",
                 json::escape(&name),
@@ -3086,10 +3310,10 @@ fn handle_auth(
     stream: SharedTcp,
     auth: &str,
     session: &str,
-    peer: Option<SocketAddr>,
+    caller: &Caller,
     st: &AppState,
 ) -> std::io::Result<()> {
-    let peer_s = peer.map(|value| value.to_string()).unwrap_or_default();
+    let peer_s = caller.label();
     if let Some(role) = st.auth.role_for_session(session) {
         let user = st.auth.session_name(session).unwrap_or_default();
         st.audit.record_actor(
@@ -3147,10 +3371,10 @@ fn auth_status_body(st: &AppState, authenticated: bool, role: &str, user: &str) 
 fn handle_login(
     stream: SharedTcp,
     body: &str,
-    peer: Option<SocketAddr>,
+    caller: &Caller,
     st: &AppState,
 ) -> std::io::Result<()> {
-    let peer_s = peer.map(|p| p.to_string()).unwrap_or_default();
+    let peer_s = caller.label();
     let j = json::parse(body).ok();
     let field = |k: &str| {
         j.as_ref()
@@ -3161,11 +3385,13 @@ fn handle_login(
     };
     let user = field("user");
     let password = field("password");
-    let source_key = peer
-        .map(|address| address.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let source_key = caller.login_source();
+    let proxy_key = caller.login_proxy();
     let attempted_actor = audit_identity(&user, "anonymous");
-    if !st.auth.login_allowed(&source_key, &user) {
+    if !st
+        .auth
+        .login_allowed(&source_key, proxy_key.as_deref(), &user)
+    {
         st.audit
             .record_actor("none", &attempted_actor, "POST", "/v1/login", &peer_s, 429);
         return write_simple(
@@ -3178,7 +3404,8 @@ fn handle_login(
     }
     match st.auth.login(&user, &password) {
         LoginResult::Success(token, role, name) => {
-            st.auth.record_login_result(&source_key, &user, true);
+            st.auth
+                .record_login_result(&source_key, proxy_key.as_deref(), &user, true);
             st.audit.record_actor(
                 role.as_str(),
                 &audit_identity(&name, "authenticated-user"),
@@ -3187,7 +3414,7 @@ fn handle_login(
                 &peer_s,
                 200,
             );
-            let cookie = session_cookie_header(&token, st.secure_cookies);
+            let cookie = session_cookie_header(caller, &token, SESSION_ABSOLUTE_TTL_MS / 1000);
             let resp = format!(
                 "{{\"ok\":true,\"user\":{},\"role\":{}}}",
                 json::escape(&name),
@@ -3196,7 +3423,8 @@ fn handle_login(
             write_simple(stream, "200 OK", "application/json", &cookie, &resp)
         }
         LoginResult::Invalid => {
-            st.auth.record_login_result(&source_key, &user, false);
+            st.auth
+                .record_login_result(&source_key, proxy_key.as_deref(), &user, false);
             st.audit
                 .record_actor("none", &attempted_actor, "POST", "/v1/login", &peer_s, 401);
             write_simple(
@@ -3222,14 +3450,16 @@ fn handle_login(
 }
 
 /** @brief 세션을 버리고 쿠키를 지운다. */
-fn handle_logout(stream: SharedTcp, sessions: &[String], st: &AppState) -> std::io::Result<()> {
+fn handle_logout(
+    stream: SharedTcp,
+    sessions: &[String],
+    caller: &Caller,
+    st: &AppState,
+) -> std::io::Result<()> {
     for session in sessions {
         st.auth.logout(session);
     }
-    let secure = if st.secure_cookies { " Secure;" } else { "" };
-    let clear = format!(
-        "Set-Cookie: onetdns_session=;{secure} HttpOnly; SameSite=Strict; Path=/; Max-Age=0\r\n"
-    );
+    let clear = session_cookie_header(caller, "", 0);
     write_simple(
         stream,
         "200 OK",
@@ -3270,7 +3500,7 @@ fn handle_dashboard_websocket(
     key: &str,
     version: &str,
     protocols: &str,
-    peer: Option<SocketAddr>,
+    caller: &Caller,
     st: &AppState,
 ) -> std::io::Result<()> {
     let offered = protocols
@@ -3285,7 +3515,7 @@ fn handle_dashboard_websocket(
         .any(|value| value.eq_ignore_ascii_case("upgrade"));
     if !upgrade.eq_ignore_ascii_case("websocket")
         || !connection_upgrade
-        || key.is_empty()
+        || !websocket_key_valid(key)
         || version != "13"
         || !protocol_ok
     {
@@ -3316,7 +3546,7 @@ fn handle_dashboard_websocket(
         .find_map(|value| value.strip_prefix("resume."))
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
-    let peer_s = peer.map(|value| value.to_string()).unwrap_or_default();
+    let peer_s = caller.label();
     let Some(role) = st.auth.resolve(token, session) else {
         st.audit.record_actor(
             "none",
@@ -3344,7 +3574,7 @@ fn handle_dashboard_websocket(
             &peer_s,
             503,
         );
-        record_control_error("stream_limit", peer, "Too many live log connections");
+        record_control_error("stream_limit", caller.peer, "Too many live log connections");
         return write_simple(
             stream,
             "503 Service Unavailable",
@@ -3640,6 +3870,30 @@ fn ws_write_frame(stream: &mut SharedTcp, opcode: u8, payload: &[u8]) -> std::io
     stream.flush()
 }
 
+/**
+ * @brief Sec-WebSocket-Key가 RFC 6455의 형식인지. 16바이트를 표준 base64로 적은 값이어야 한다.
+ * @details 16바이트는 base64로 22글자에 == 가 붙은 24글자이고, 마지막 글자의 아래 4비트는
+ *          0이다. 이것을 확인하지 않으면 아무 문자열에나 핸드셰이크를 마쳐 준다.
+ */
+fn websocket_key_valid(key: &str) -> bool {
+    /** @brief 표준 base64 글자 하나의 6비트 값. */
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = key.as_bytes();
+    bytes.len() == 24
+        && bytes.ends_with(b"==")
+        && bytes[..22].iter().all(|&byte| sextet(byte).is_some())
+        && sextet(bytes[21]).is_some_and(|last| last & 0x0f == 0)
+}
+
 /** @brief 표준 base64 인코딩. 웹소켓 핸드셰이크 응답에 쓴다. */
 fn base64_standard(bytes: &[u8]) -> String {
     /** @brief base64 문자표. */
@@ -3721,10 +3975,10 @@ fn route(
     auth: &str,
     session: &str,
     body: &str,
-    peer: Option<SocketAddr>,
+    caller: &Caller,
     st: &AppState,
 ) -> (&'static str, &'static str, String) {
-    let peer_s = peer.map(|p| p.to_string()).unwrap_or_default();
+    let peer_s = caller.label();
 
     if method == "GET" {
         if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
@@ -5481,7 +5735,7 @@ mod tests {
             audit: AuditLog::new(100),
             controls: Arc::new(controls),
             readiness: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            secure_cookies: true,
+            proxy: Arc::new(ArcSwap::from_pointee(ProxyPolicy::default())),
         }
     }
 
@@ -5698,7 +5952,7 @@ mod tests {
             audit: AuditLog::new(100),
             controls: Arc::new(controls),
             readiness: Arc::new(AtomicBool::new(true)),
-            secure_cookies: false,
+            proxy: Arc::new(ArcSwap::from_pointee(ProxyPolicy::default())),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5740,13 +5994,13 @@ mod tests {
         } else {
             format!("Bearer {tok}")
         };
-        let (s, _ct, b) = route(m, p, &auth, "", body, None, st);
+        let (s, _ct, b) = route(m, p, &auth, "", body, &Caller::direct(None), st);
         (status_code(s), b)
     }
 
     /** @brief 세션 쿠키로 요청 하나를 보낸다. */
     fn call_session(st: &AppState, m: &str, p: &str, session: &str, body: &str) -> (u16, String) {
-        let (s, _ct, b) = route(m, p, "", session, body, None, st);
+        let (s, _ct, b) = route(m, p, "", session, body, &Caller::direct(None), st);
         (status_code(s), b)
     }
 
@@ -5973,7 +6227,7 @@ mod tests {
             audit: AuditLog::new(100),
             controls: Arc::new(Controls::noop()),
             readiness: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            secure_cookies: true,
+            proxy: Arc::new(ArcSwap::from_pointee(ProxyPolicy::default())),
         };
         let LoginResult::Success(session, _, _) =
             login_eventually(st.auth.as_ref(), "alice", "s3cret-passphrase")
@@ -6008,26 +6262,26 @@ mod tests {
         let auth = Auth::default();
         let source = "127.0.0.1";
         for _ in 0..MAX_LOGIN_FAILURES {
-            auth.record_login_result(source, "alice", false);
+            auth.record_login_result(source, None, "alice", false);
         }
         assert!(
-            !auth.login_allowed(source, "alice"),
+            !auth.login_allowed(source, None, "alice"),
             "실패가 누적된 사용자만 차단"
         );
         assert!(
-            auth.login_allowed(source, "bob"),
+            auth.login_allowed(source, None, "bob"),
             "다른 사용자의 로그인은 막지 않음"
         );
 
         for i in 0..MAX_SOURCE_LOGIN_FAILURES {
-            auth.record_login_result(source, &format!("ghost{i}"), false);
+            auth.record_login_result(source, None, &format!("ghost{i}"), false);
         }
         assert!(
-            !auth.login_allowed(source, "bob"),
+            !auth.login_allowed(source, None, "bob"),
             "사용자명 회전은 소스 집계로 차단"
         );
         assert!(
-            auth.login_allowed("192.0.2.9", "bob"),
+            auth.login_allowed("192.0.2.9", None, "bob"),
             "다른 소스는 영향 없음"
         );
     }
@@ -7473,6 +7727,244 @@ mod tests {
     }
 
     /** @brief 포화로 실패하면 잠시 뒤 다시 시도해 실제 판정을 얻는다. */
+    /** @brief 127.0.0.1을 프록시로 믿고 https://admin.example.com을 내보이는 정책. */
+    fn proxied_policy() -> ProxyPolicy {
+        ProxyPolicy {
+            trusted: vec!["127.0.0.1/32".parse().unwrap()],
+            origins: vec![HttpsOrigin::parse("https://admin.example.com").unwrap()],
+        }
+    }
+
+    /** @brief 요청 하나를 실제 연결로 보내고 응답 전체를 받는다. 연결은 127.0.0.1에서 온다. */
+    fn exchange(st: &AppState, request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = accept_before_deadline(&listener).expect("accept request");
+                handle_conn(stream, st).unwrap();
+            });
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(request.as_bytes()).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            std::io::Read::read_to_string(&mut client, &mut response).unwrap();
+            response
+        })
+    }
+
+    #[test]
+    /**
+     * @brief 공개 출처 Host는 신뢰하는 프록시에서 온 연결에만 열리는지.
+     * @details 프록시가 아닌 연결에 열면 같은 컴퓨터의 다른 프로그램이 X-Forwarded-For를 꾸며
+     *          로그인 제한을 피한다. Origin은 그 공개 출처와 정확히 같아야 한다.
+     */
+    fn a_public_origin_is_accepted_only_through_a_trusted_proxy() {
+        let policy = proxied_policy();
+        let proxy: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:40000".parse().unwrap();
+        let host = "admin.example.com";
+        let origin = Some("https://admin.example.com");
+
+        let caller = control_caller(&policy, Some(proxy), 8553, host, origin, "198.51.100.7")
+            .expect("프록시를 거친 공개 출처가 거절됨");
+        assert!(caller.proxied.is_some());
+        assert_eq!(caller.login_source(), "198.51.100.7");
+        assert_eq!(caller.login_proxy().as_deref(), Some("127.0.0.1"));
+        assert_eq!(caller.session_cookie(), SECURE_SESSION_COOKIE);
+
+        assert_eq!(
+            control_caller(&policy, Some(other), 8553, host, origin, "").err(),
+            Some(HostRejection::Misdirected),
+            "신뢰하지 않는 연결이 공개 출처로 들어옴"
+        );
+        assert_eq!(
+            control_caller(&ProxyPolicy::default(), Some(proxy), 8553, host, origin, "").err(),
+            Some(HostRejection::Misdirected),
+            "설정이 없는데 공개 출처가 열림"
+        );
+        assert_eq!(
+            control_caller(
+                &policy,
+                Some(proxy),
+                8553,
+                host,
+                Some("https://evil.example"),
+                ""
+            )
+            .err(),
+            Some(HostRejection::CrossOrigin)
+        );
+        assert_eq!(
+            control_caller(
+                &policy,
+                Some(proxy),
+                8553,
+                host,
+                Some("http://admin.example.com"),
+                ""
+            )
+            .err(),
+            Some(HostRejection::CrossOrigin),
+            "HTTPS가 아닌 출처를 받음"
+        );
+
+        let local = control_caller(
+            &policy,
+            Some(proxy),
+            8553,
+            "127.0.0.1:8553",
+            None,
+            "1.2.3.4",
+        )
+        .expect("루프백 Host가 거절됨");
+        assert!(
+            local.proxied.is_none(),
+            "루프백 Host 요청에서 X-Forwarded-For를 읽음"
+        );
+        assert_eq!(local.session_cookie(), SESSION_COOKIE);
+    }
+
+    #[test]
+    /**
+     * @brief X-Forwarded-For에서 프록시가 붙인 오른쪽 주소를 고르는지.
+     * @details 왼쪽 항목은 클라이언트가 마음대로 적어 보낼 수 있다.
+     */
+    fn the_forwarded_client_is_the_rightmost_untrusted_address() {
+        let policy = proxied_policy();
+        let client = |value: &str| policy.forwarded_client(value);
+        assert_eq!(
+            client("203.0.113.1, 198.51.100.7"),
+            Some("198.51.100.7".parse().unwrap())
+        );
+        assert_eq!(
+            client("198.51.100.7, 127.0.0.1"),
+            Some("198.51.100.7".parse().unwrap())
+        );
+        assert_eq!(client("127.0.0.1"), None);
+        assert_eq!(client(""), None);
+        assert_eq!(client("203.0.113.1, garbage"), None);
+    }
+
+    #[test]
+    /**
+     * @brief 프록시를 거친 로그인이 Secure가 붙은 __Host- 쿠키를 받고, 그 쿠키로 인증되는지.
+     * @details Secure가 빠지면 HTTPS로 받은 세션 쿠키가 평문 요청에도 실려 나간다.
+     */
+    fn a_proxied_sign_in_gets_a_secure_host_cookie() {
+        let mut st = test_state("adm", "ro");
+        st.auth = Arc::new(Auth::new(vec![], vec![]).with_users(vec![UserCred {
+            name: "alice".into(),
+            hash: hash_eventually("s3cret-passphrase").into(),
+            role: Role::Admin,
+        }]));
+        st.proxy = Arc::new(ArcSwap::from_pointee(proxied_policy()));
+        let body = "{\"user\":\"alice\",\"password\":\"s3cret-passphrase\"}";
+        let login = format!(
+            "POST /v1/login HTTP/1.1\r\nHost: admin.example.com\r\nOrigin: https://admin.example.com\r\n\
+             X-Forwarded-For: 198.51.100.7\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = loop {
+            let response = exchange(&st, &login);
+            if !response.starts_with("HTTP/1.1 503") {
+                break response;
+            }
+        };
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let cookie = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .expect("세션 쿠키가 없음");
+        assert!(
+            cookie.starts_with("__Host-onetdns_session=") && cookie.contains("Secure;"),
+            "{cookie}"
+        );
+        let token = cookie
+            .trim_start_matches("__Host-onetdns_session=")
+            .split(';')
+            .next()
+            .unwrap();
+
+        let auth_request = |cookie_name: &str| {
+            format!(
+                "GET /v1/auth HTTP/1.1\r\nHost: admin.example.com\r\nCookie: {cookie_name}={token}\r\n\r\n"
+            )
+        };
+        assert!(exchange(&st, &auth_request("__Host-onetdns_session"))
+            .contains("\"authenticated\":true"));
+        assert!(
+            exchange(&st, &auth_request("onetdns_session")).contains("\"authenticated\":false"),
+            "HTTPS 출처에서 Secure가 아닌 쿠키 이름을 받음"
+        );
+    }
+
+    #[test]
+    /** @brief 첫 계정 만들기는 프록시를 거친 요청에 열리지 않는지. 인터넷의 누구든 관리자가 된다. */
+    fn first_account_setup_is_closed_through_the_proxy() {
+        let mut st = state_without_accounts(Box::new(|_, _| Ok("{}".to_string())));
+        st.proxy = Arc::new(ArcSwap::from_pointee(proxied_policy()));
+        let body = "{\"user\":\"owner\",\"password\":\"correct-horse-battery\"}";
+        let response = exchange(
+            &st,
+            &format!(
+                "POST /v1/setup HTTP/1.1\r\nHost: admin.example.com\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(!st.auth.has_users());
+    }
+
+    #[test]
+    /**
+     * @brief 프록시 뒤의 로그인 실패를 실제 클라이언트마다 세고, 프록시 전체에도 상한을 두는지.
+     * @details 프록시 주소로만 세면 공격자 하나가 모든 관리자를 막는다. 클라이언트 주소로만
+     *          세면 X-Forwarded-For를 꾸며 무한히 시도할 수 있다.
+     */
+    fn proxied_sign_in_failures_are_counted_per_client_and_capped_per_proxy() {
+        let auth = Auth::default();
+        let proxy = Some("127.0.0.1");
+        for i in 0..MAX_SOURCE_LOGIN_FAILURES {
+            auth.record_login_result("198.51.100.7", proxy, &format!("ghost{i}"), false);
+        }
+        assert!(!auth.login_allowed("198.51.100.7", proxy, "alice"));
+        assert!(
+            auth.login_allowed("203.0.113.9", proxy, "alice"),
+            "다른 클라이언트까지 막힘"
+        );
+
+        for i in MAX_SOURCE_LOGIN_FAILURES..MAX_PROXY_LOGIN_FAILURES {
+            auth.record_login_result(&format!("client{i}"), proxy, "alice", false);
+        }
+        assert!(
+            !auth.login_allowed("203.0.113.9", proxy, "alice"),
+            "출발지를 바꿔 가며 프록시 상한을 넘김"
+        );
+        assert!(
+            auth.login_allowed("127.0.0.1", None, "alice"),
+            "프록시를 거치지 않은 로그인까지 막힘"
+        );
+    }
+
+    #[test]
+    /** @brief Sec-WebSocket-Key가 16바이트의 표준 base64가 아니면 거부하는지. */
+    fn websocket_keys_must_encode_sixteen_bytes() {
+        assert!(websocket_key_valid("dGhlIHNhbXBsZSBub25jZQ=="));
+        for key in [
+            "",
+            "x",
+            "dGhlIHNhbXBsZSBub25jZQ",
+            "dGhlIHNhbXBsZSBub25jZR==",
+            "dGhlIHNhbXBsZSBub25jZQ=x",
+            "dGhlIHNhbXBsZSBub25j-Q==",
+            "dGhlIHNhbXBsZSBub25jZSBh",
+        ] {
+            assert!(!websocket_key_valid(key), "{key}");
+        }
+    }
+
     fn login_eventually(auth: &Auth, name: &str, password: &str) -> LoginResult {
         loop {
             match auth.login(name, password) {

@@ -447,6 +447,18 @@ static KEYS: &[KeySpec] = &[
         Node,
         Lanes::OPEN,
     ),
+    key(
+        "control_trusted_proxies",
+        Hot(ControlTokens),
+        Node,
+        Lanes::OPEN,
+    ),
+    key(
+        "control_public_origins",
+        Hot(ControlTokens),
+        Node,
+        Lanes::OPEN,
+    ),
     key("block_ipv4", Hot(Filter), Shared, Lanes::OPEN),
     key("block_ipv6", Hot(Filter), Shared, Lanes::OPEN),
     key("blocked_response_ttl", Hot(BlockTtl), Shared, Lanes::OPEN),

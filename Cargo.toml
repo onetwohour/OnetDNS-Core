@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -39,24 +39,24 @@ single_match = "allow"                # match 1-arm 스타일
 len_without_is_empty = "allow"        # Hash::len은 digest 길이(컬렉션 크기 아님)
 
 [workspace.dependencies]
-onetdns-proto = { version = "0.1.0-alpha.4", path = "crates/onetdns-proto" }
-onetdns-runtime = { version = "0.1.0-alpha.4", path = "crates/onetdns-runtime" }
-onetdns-forward = { version = "0.1.0-alpha.4", path = "crates/onetdns-forward" }
-onetdns-recurse = { version = "0.1.0-alpha.4", path = "crates/onetdns-recurse" }
-onetdns-dnssec = { version = "0.1.0-alpha.4", path = "crates/onetdns-dnssec" }
-onetdns-tls = { version = "0.1.0-alpha.4", path = "crates/onetdns-tls" }
-onetdns-http2 = { version = "0.1.0-alpha.4", path = "crates/onetdns-http2" }
-onetdns-quic = { version = "0.1.0-alpha.4", path = "crates/onetdns-quic" }
-onetdns-core = { version = "0.1.0-alpha.4", path = "crates/onetdns-core" }
-onetdns-config = { version = "0.1.0-alpha.4", path = "crates/onetdns-config" }
-onetdns-security = { version = "0.1.0-alpha.4", path = "crates/onetdns-security" }
-onetdns-filter = { version = "0.1.0-alpha.4", path = "crates/onetdns-filter" }
-onetdns-transport = { version = "0.1.0-alpha.4", path = "crates/onetdns-transport" }
-onetdns-control = { version = "0.1.0-alpha.4", path = "crates/onetdns-control", default-features = false }
-onetdns-dnscrypt = { version = "0.1.0-alpha.4", path = "crates/onetdns-dnscrypt" }
-onetdns-policy = { version = "0.1.0-alpha.4", path = "crates/onetdns-policy" }
-onetdns-authority = { version = "0.1.0-alpha.4", path = "crates/onetdns-authority" }
-onetdns-cluster = { version = "0.1.0-alpha.4", path = "crates/onetdns-cluster" }
+onetdns-proto = { version = "0.1.0-alpha.5", path = "crates/onetdns-proto" }
+onetdns-runtime = { version = "0.1.0-alpha.5", path = "crates/onetdns-runtime" }
+onetdns-forward = { version = "0.1.0-alpha.5", path = "crates/onetdns-forward" }
+onetdns-recurse = { version = "0.1.0-alpha.5", path = "crates/onetdns-recurse" }
+onetdns-dnssec = { version = "0.1.0-alpha.5", path = "crates/onetdns-dnssec" }
+onetdns-tls = { version = "0.1.0-alpha.5", path = "crates/onetdns-tls" }
+onetdns-http2 = { version = "0.1.0-alpha.5", path = "crates/onetdns-http2" }
+onetdns-quic = { version = "0.1.0-alpha.5", path = "crates/onetdns-quic" }
+onetdns-core = { version = "0.1.0-alpha.5", path = "crates/onetdns-core" }
+onetdns-config = { version = "0.1.0-alpha.5", path = "crates/onetdns-config" }
+onetdns-security = { version = "0.1.0-alpha.5", path = "crates/onetdns-security" }
+onetdns-filter = { version = "0.1.0-alpha.5", path = "crates/onetdns-filter" }
+onetdns-transport = { version = "0.1.0-alpha.5", path = "crates/onetdns-transport" }
+onetdns-control = { version = "0.1.0-alpha.5", path = "crates/onetdns-control", default-features = false }
+onetdns-dnscrypt = { version = "0.1.0-alpha.5", path = "crates/onetdns-dnscrypt" }
+onetdns-policy = { version = "0.1.0-alpha.5", path = "crates/onetdns-policy" }
+onetdns-authority = { version = "0.1.0-alpha.5", path = "crates/onetdns-authority" }
+onetdns-cluster = { version = "0.1.0-alpha.5", path = "crates/onetdns-cluster" }
 
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }

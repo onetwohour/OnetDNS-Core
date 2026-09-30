@@ -18,7 +18,7 @@ mod persist;
 
 pub use api::{
     clear_acme_http01, serve, serve_listener, set_acme_http01, ApiResponse, AppState, AuditLog,
-    Auth, ClusterWrite, Controls, ListCounts, Role, SessionStore, UserCred,
+    Auth, ClusterWrite, Controls, ListCounts, ProxyPolicy, Role, SessionStore, UserCred,
 };
 pub use dnstap::{DnstapProtocol, DnstapWriter};
 pub use metrics::{

@@ -121,14 +121,9 @@ impl Session {
         }
         let ctx = make_ctx(&self.qname, self.qtype);
         self.plan = self.state.next_query(&ctx);
-        let ladder: Vec<SocketAddr> = r
-            .order_by_infra(&self.state.servers, &self.state.zone)
-            .into_iter()
-            .filter(|s| r.is_queryable(s.ip()))
-            .collect();
-        if ladder.is_empty() {
-            return Err(());
-        }
+        let ladder = r
+            .ask_order(&self.state.servers, &self.state.zone)
+            .map_err(|_| ())?;
         let per_server =
             (r.timeout / ladder.len().clamp(1, 4) as u32).max(Duration::from_millis(300));
         self.exchange = None;

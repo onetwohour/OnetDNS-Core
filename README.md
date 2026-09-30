@@ -193,19 +193,32 @@ Something else is already a DNS server on that machine. On Windows it is often I
 </details>
 
 <details>
-<summary>My upstreams are plain IP addresses, and some lookups are slow or fail.</summary>
+<summary>Some sites fail to load, or lookups are slow.</summary>
 <br>
 
-Some ISPs, routers, and security programs catch every lookup sent over UDP to port 53, whichever server it was meant for, and answer it with their own resolver. To check, run these two commands. The first asks over UDP and the second over TCP, and each prints the address of the resolver that answered. If the addresses differ, something on the way is answering in Google's place.
+Some ISPs, routers, and security programs quietly take over every ordinary DNS lookup, whichever server it was meant for, and answer it themselves. Filters that run on your own computer, such as AdGuard for Windows, can do this too, so it can happen even when your router is fine.
+
+To check, run these two commands. Each prints the address of whoever answered. If the two addresses differ, something between you and Google is answering in its place.
 
 ```sh
 nslookup -type=txt o-o.myaddr.l.google.com 8.8.8.8
 nslookup -vc -type=txt o-o.myaddr.l.google.com 8.8.8.8
 ```
 
-When this happens, the servers in `upstreams` never see your lookups, and some of these interceptors also cut answers larger than 512 bytes. OnetDNS asks again over TCP when an answer arrives cut, but that costs an extra round trip. With `backend = "recurse"`, OnetDNS notices the interception at startup, logs `net.port53_udp_intercepted`, and asks every DNS server over TCP.
+If you forward to plain IP upstreams, your lookups never reach the servers you picked, and some answers arrive slowly.
 
-To get answers from the servers you chose, use encrypted upstreams in `upstream_urls` instead of `upstreams`. The default upstreams already do this.
+If you use `backend = "recurse"`, OnetDNS notices the interception at startup, warns about it in its log, and works around it. The workaround does not reach every site: a few, often ones served through large CDNs, keep failing, and the dashboard shows them as failed queries. Once a site has failed, it fails right away for a while instead of making you wait each time.
+
+To fix it, best first:
+
+- Stop the interception. For a filter on your computer, exclude OnetDNS from its DNS filtering or turn that filtering off; OnetDNS already blocks ads. For a router, turn off its DNS redirect or "DNS proxy" option.
+- With `backend = "recurse"`, add a fallback server. OnetDNS uses it only for sites it cannot reach on its own:
+
+  ```toml
+  fallback_upstreams = ["https://1.1.1.1/dns-query#cloudflare-dns.com"]
+  ```
+
+- Or forward instead of recursing, using encrypted upstreams in `upstream_urls`. Nothing on the way can take those over. The default settings already do this.
 
 </details>
 
@@ -214,6 +227,21 @@ To get answers from the servers you chose, use encrypted upstreams in `upstream_
 <br>
 
 No. Your router still connects you to the internet. OnetDNS only takes over name lookups, and addresses too if you turn on its DHCP server.
+
+</details>
+
+<details>
+<summary>Can I open the dashboard from another computer?</summary>
+<br>
+
+The dashboard only answers on the machine running OnetDNS, because it has no HTTPS of its own. To reach it from elsewhere, either use an SSH tunnel, or put an HTTPS reverse proxy such as Caddy or nginx on the same machine and tell OnetDNS about it:
+
+```toml
+control_trusted_proxies = ["127.0.0.1/32"]
+control_public_origins = ["https://dns.example.com"]
+```
+
+The proxy has to forward to `127.0.0.1:8553`, keep the original `Host` header, and set `X-Forwarded-For`. Create your admin account on the machine itself first; the first-time setup page does not open through the proxy.
 
 </details>
 

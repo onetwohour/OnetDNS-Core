@@ -281,8 +281,47 @@ struct InfraStat {
     /** @brief 마지막 실패 시각. 잠깐 뒤로 미루는 데 쓴다. */
     last_fail: Option<Instant>,
 
+    /**
+     * @brief 성공 없이 이어진 전송 실패 횟수. 성공하면 기록째 지워진다.
+     * @note 서버가 내려간 동안 들어온 실패는 세지 않는다. 내려가기 직전에 함께 나간 질의들이
+     *       뒤늦게 실패하면서 묻지 않는 기간을 곧바로 최대로 올리지 않게 한다.
+     */
+    consecutive_failures: u8,
+
     /** @brief 마지막 프로토콜 오류 시각. 응답은 왔지만 쓸 수 없던 경우다. */
     last_protocol_error: Option<Instant>,
+}
+
+impl InfraStat {
+    /** @brief 최근에 실패해 순위를 뒤로 미룰지. */
+    fn cooling(&self, now: Instant) -> bool {
+        self.failed_within(INFRA_FAIL_COOLDOWN, now)
+    }
+
+    /**
+     * @brief 연달아 실패해 아예 묻지 않을지.
+     * @details SERVER_DOWN_AFTER_FAILURES번 연달아 실패하면 SERVER_DOWN_BASE 동안 묻지 않는다.
+     *          그 뒤 한 번 다시 물어 또 실패하면 기간을 두 배로 늘리고, SERVER_DOWN_MAX에서
+     *          멈춘다.
+     */
+    fn down(&self, now: Instant) -> bool {
+        let Some(extra) = self
+            .consecutive_failures
+            .checked_sub(SERVER_DOWN_AFTER_FAILURES)
+        else {
+            return false;
+        };
+        let period = SERVER_DOWN_BASE
+            .saturating_mul(1 << u32::from(extra).min(16))
+            .min(SERVER_DOWN_MAX);
+        self.failed_within(period, now)
+    }
+
+    /** @brief 마지막 전송 실패가 period 안에 있었는지. */
+    fn failed_within(&self, period: Duration, now: Instant) -> bool {
+        self.last_fail
+            .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < period)
+    }
 }
 
 /** @brief 재 본 적 없는 서버에 매길 왕복 시간. 새 서버가 무조건 뒤로 밀리지 않게 한다. */
@@ -312,6 +351,25 @@ const MIN_SERVER_PATIENCE: Duration = Duration::from_millis(100);
 
 /** @brief 실패한 서버를 뒤로 미룰 기간. 지나면 다시 정상 순위로 돌아온다. */
 const INFRA_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
+
+/**
+ * @brief 이만큼 연달아 전송에 실패한 서버는 잠시 묻지 않는다.
+ * @details 한 번의 실패는 패킷 하나를 잃은 것일 수 있어 순위만 뒤로 미룬다. 여러 번 이어지면
+ *          TCP를 받지 않는 서버처럼 지금 경로로는 닿지 않는 서버다. 그런 서버에 계속 물으면
+ *          질의마다 제한 시간을 통째로 쓰고, 그동안 bin의 예비 경로(fallback_upstreams)로도
+ *          넘어가지 못한다.
+ */
+const SERVER_DOWN_AFTER_FAILURES: u8 = 3;
+
+/** @brief 내려간 서버에 처음 묻지 않는 기간. bin이 실패 응답을 기억하는 최소 기간과 같다. */
+const SERVER_DOWN_BASE: Duration = Duration::from_secs(5);
+
+/**
+ * @brief 내려간 서버에 묻지 않는 기간의 상한.
+ * @note RFC 9520은 해석 실패를 기억하는 기간을 지수로 늘리되 5분을 넘기지 말라고 한다. 더
+ *       길면 되살아난 서버를 늦게 알아챈다.
+ */
+const SERVER_DOWN_MAX: Duration = Duration::from_secs(300);
 
 /** @brief 최근 실패한 서버에 더할 가상 지연. 순위를 크게 낮추되 완전히 배제하지는 않는다. */
 const INFRA_FAIL_PENALTY_MS: u64 = 100_000;
@@ -2959,14 +3017,7 @@ impl Recursor {
         let mut sent = q.clone();
         self.apply_outgoing_case(&mut sent);
 
-        let ordered: Vec<SocketAddr> = self
-            .order_by_infra(servers, zone)
-            .into_iter()
-            .filter(|server| self.server_eligible(server.ip()))
-            .collect();
-        if ordered.is_empty() {
-            return Err(RecurseError::NoReachableNs);
-        }
+        let ordered = self.ask_order(servers, zone)?;
 
         let per_exchange_deadline = Instant::now().checked_add(self.timeout).unwrap_or(deadline);
         let deadline = deadline.min(per_exchange_deadline);
@@ -3153,8 +3204,9 @@ impl Recursor {
 
     /**
      * @brief 응답성 통계로 서버 순서를 정한다.
-     * @details 선호 계열, 점수, 그리고 냉각 중인지로 정렬한다. 냉각 중인 서버도 목록
-     *          뒤에는 남긴다. 전부 냉각 중이면 아무 데도 못 묻게 되기 때문이다.
+     * @details 선호 계열, 점수, 그리고 최근에 실패했는지로 정렬한다. 최근에 실패한 서버도 목록
+     *          뒤에는 남긴다. 전부 최근에 실패했으면 아무 데도 못 묻게 되기 때문이다. 내려간 서버는
+     *          빼므로, 전부 내려갔으면 빈 목록이다.
      */
     fn order_by_infra(&self, servers: &[SocketAddr], zone: &Name) -> Vec<SocketAddr> {
         let infra = self.infra.lock_recover();
@@ -3164,7 +3216,12 @@ impl Recursor {
         let eligible: Vec<SocketAddr> = servers
             .iter()
             .copied()
-            .filter(|server| self.family_allowed(server.ip()))
+            .filter(|server| {
+                self.family_allowed(server.ip())
+                    && !infra
+                        .peek(&InfraKey::new(server.ip(), zone))
+                        .is_some_and(|state| state.down(now))
+            })
             .collect();
         let score = |server: &SocketAddr| {
             let key = InfraKey::new(server.ip(), zone);
@@ -3198,6 +3255,36 @@ impl Recursor {
         drop(infra);
         ready.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         ready.into_iter().map(|(_, _, server)| server).collect()
+    }
+
+    /**
+     * @brief 이 zone의 서버 가운데 실제로 물을 서버를 물을 순서대로 고른다.
+     * @retval NoReachableNs 정책이나 주소 계열 때문에 물을 수 있는 서버가 하나도 없다.
+     * @retval NoResponse 물을 수 있는 서버가 모두 연달아 실패해 내려가 있다. 전송 실패로
+     *         알려야 bin이 예비 경로(fallback_upstreams)로 넘긴다.
+     */
+    fn ask_order(
+        &self,
+        servers: &[SocketAddr],
+        zone: &Name,
+    ) -> Result<Vec<SocketAddr>, RecurseError> {
+        let eligible: Vec<SocketAddr> = servers
+            .iter()
+            .copied()
+            .filter(|server| self.server_eligible(server.ip()))
+            .collect();
+        if eligible.is_empty() {
+            return Err(RecurseError::NoReachableNs);
+        }
+        let ordered = self.order_by_infra(&eligible, zone);
+        if ordered.is_empty() {
+            rtrace!(
+                "Every nameserver of {} failed repeatedly; not asking until its backoff ends",
+                zone.to_ascii_lower()
+            );
+            return Err(RecurseError::NoResponse);
+        }
+        Ok(ordered)
     }
 
     /** @brief 이 주소가 재 본 적 있는 왕복 시간. 처음 보는 주소면 없다. */
@@ -3248,28 +3335,29 @@ impl Recursor {
         infra.put(key, state);
     }
 
-    /** @brief 전송 실패를 기록한다. 잠시 뒤로 밀린다. */
+    /** @brief 전송 실패를 기록한다. 순위가 뒤로 밀리고, 연달아 실패하면 한동안 묻지 않는다. */
     fn infra_fail(&self, ip: IpAddr, zone: &Name) {
         let key = InfraKey::new(ip, zone);
+        let now = Instant::now();
         let mut infra = self.infra.lock_recover();
         let mut state = infra.pop(&key).unwrap_or_default();
-        state.last_fail = Some(Instant::now());
+        if !state.down(now) {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        }
+        state.last_fail = Some(now);
         infra.put(key, state);
     }
 }
 
-/** @brief 이 서버가 아직 실패 냉각 중인지. */
+/** @brief 이 서버가 최근에 실패해 순위를 뒤로 미룰 대상인지. */
 fn infra_is_cooling(infra: &LruMap<InfraKey, InfraStat>, key: &InfraKey, now: Instant) -> bool {
-    infra
-        .peek(key)
-        .and_then(|state| state.last_fail)
-        .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < INFRA_FAIL_COOLDOWN)
+    infra.peek(key).is_some_and(|state| state.cooling(now))
 }
 
 /**
  * @brief 서버 점수. 낮을수록 먼저 시도한다.
  * @details 왕복 시간에 실패 벌점을 더한다. 벌점을 크게 잡아 실패한 서버가 뒤로 가지만,
- *          완전히 배제하지는 않아 냉각이 끝나면 자연히 돌아온다.
+ *          완전히 배제하지는 않아 INFRA_FAIL_COOLDOWN이 지나면 자연히 돌아온다.
  * @param state 이 서버와 zone 쌍의 실패 기록.
  * @param srtt_ms 이 주소의 평활 왕복 시간. 재 본 적 없으면 없다.
  */
@@ -3281,7 +3369,7 @@ fn infra_score(state: Option<&InfraStat>, srtt_ms: Option<u32>, now: Instant) ->
     let recent = |at: Option<Instant>| {
         at.is_some_and(|at| now.saturating_duration_since(at) < INFRA_FAIL_COOLDOWN)
     };
-    let transport_penalty = if recent(state.last_fail) {
+    let transport_penalty = if state.cooling(now) {
         INFRA_FAIL_PENALTY_MS
     } else {
         0
@@ -5335,7 +5423,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 성공하면 실패 냉각이 즉시 풀리는지. */
+    /** @brief 성공하면 실패 기록이 즉시 지워지는지. */
     fn infra_success_clears_fail_cooldown() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let ip: IpAddr = "8.8.4.4".parse().unwrap();
@@ -5356,7 +5444,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패한 서버가 냉각 동안 뒤로 밀렸다가 돌아오는지. */
+    /** @brief 실패한 서버가 INFRA_FAIL_COOLDOWN 동안 뒤로 밀렸다가 돌아오는지. */
     fn failed_servers_are_excluded_until_cooldown_expires() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let failed: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5376,7 +5464,106 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정책으로 거부한 것을 전송 실패로 세지 않는지. 그러면 멀쩡한 서버가 냉각된다. */
+    /**
+     * @brief 서버가 모두 연달아 실패한 zone은 묻지 않고 곧바로 전송 실패로 끝나는지.
+     * @details 한 번 실패한 서버는 패킷 하나를 잃었을 수 있으니 여전히 묻는다. 연달아 실패한
+     *          서버까지 물으면 질의마다 제한 시간을 통째로 쓰고, NoReachableNs로 끝나면 bin이
+     *          예비 경로로 넘기지 않는다.
+     */
+    fn a_zone_whose_servers_all_failed_repeatedly_fails_fast() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = blackhole.local_addr().unwrap();
+        let recursor = Recursor::new(vec![], Duration::from_secs(2))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
+        let zone = Name::from_str("down.test").unwrap();
+        let query = make_query(
+            &Name::from_str("a.down.test").unwrap(),
+            RecordType::A,
+            false,
+        );
+
+        for _ in 1..SERVER_DOWN_AFTER_FAILURES {
+            recursor.infra_fail(server.ip(), &zone);
+        }
+        assert_eq!(
+            recursor.order_by_infra(&[server], &zone),
+            vec![server],
+            "몇 번 실패했을 뿐인 서버는 여전히 물어야 합니다"
+        );
+
+        recursor.infra_fail(server.ip(), &zone);
+        let started = Instant::now();
+        assert!(matches!(
+            recursor.query_any(&[server], &query, &zone, recursor.query_deadline()),
+            Err(RecurseError::NoResponse)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "내려간 서버에 다시 물었습니다: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 내려간 서버에 묻지 않는 기간이 다시 실패할 때마다 두 배로 늘고 상한에서 멈추는지.
+     * @details 내려가 있는 동안 들어온 실패는 세지 않는다. 내려가기 직전에 함께 나간 질의들이
+     *          뒤늦게 실패하면서 기간을 곧바로 상한까지 올리면 안 된다.
+     */
+    fn a_down_server_backs_off_exponentially() {
+        let r = Recursor::new(vec![], Duration::from_millis(100));
+        let ip: IpAddr = "192.0.2.53".parse().unwrap();
+        let server = SocketAddr::new(ip, 53);
+        let zone = Name::from_str("example").unwrap();
+        let key = InfraKey::new(ip, &zone);
+        let failed_ago = |r: &Recursor, ago: Duration| {
+            r.infra.lock_recover().get_mut(&key).unwrap().last_fail =
+                Instant::now().checked_sub(ago);
+        };
+
+        for _ in 0..SERVER_DOWN_AFTER_FAILURES + 3 {
+            r.infra_fail(ip, &zone);
+        }
+        assert_eq!(
+            r.infra
+                .lock_recover()
+                .peek(&key)
+                .unwrap()
+                .consecutive_failures,
+            SERVER_DOWN_AFTER_FAILURES,
+            "내려가 있는 동안의 실패를 셌습니다"
+        );
+        assert!(r.order_by_infra(&[server], &zone).is_empty());
+
+        failed_ago(&r, SERVER_DOWN_BASE + Duration::from_secs(1));
+        assert_eq!(r.order_by_infra(&[server], &zone), vec![server]);
+
+        r.infra_fail(ip, &zone);
+        failed_ago(&r, SERVER_DOWN_BASE + Duration::from_secs(1));
+        assert!(
+            r.order_by_infra(&[server], &zone).is_empty(),
+            "다시 실패했는데 묻지 않는 기간이 늘지 않았습니다"
+        );
+        failed_ago(&r, SERVER_DOWN_BASE * 2 + Duration::from_secs(1));
+        assert_eq!(r.order_by_infra(&[server], &zone), vec![server]);
+
+        r.infra
+            .lock_recover()
+            .get_mut(&key)
+            .unwrap()
+            .consecutive_failures = u8::MAX;
+        failed_ago(&r, SERVER_DOWN_MAX - Duration::from_secs(1));
+        assert!(r.order_by_infra(&[server], &zone).is_empty());
+        failed_ago(&r, SERVER_DOWN_MAX + Duration::from_secs(1));
+        assert_eq!(
+            r.order_by_infra(&[server], &zone),
+            vec![server],
+            "묻지 않는 기간이 상한을 넘었습니다"
+        );
+    }
+
+    #[test]
+    /** @brief 정책으로 거부한 것을 전송 실패로 세지 않는지. 그러면 멀쩡한 서버가 뒤로 밀린다. */
     fn recursion_policy_rejection_is_not_reported_as_transport_failure() {
         let recursor = Recursor::new(vec![], Duration::from_millis(10));
         let blocked: SocketAddr = "127.0.0.1:53".parse().unwrap();

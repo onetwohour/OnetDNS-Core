@@ -261,21 +261,14 @@ impl Session {
     }
 
     /** @brief 다음 질의를 만들어 보낸다. 보낼 서버가 없으면 실패다. */
-    fn send_next(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
+    fn send_next(&mut self, r: &Recursor, now: Instant) -> Result<(), crate::RecurseError> {
         self.steps += 1;
         if self.steps > self.step_cap {
-            return Err(());
+            return Err(crate::RecurseError::NoReachableNs);
         }
         let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         self.plan = self.state.next_query(&ctx);
-        let ladder: Vec<SocketAddr> = r
-            .order_by_infra(&self.state.servers, &self.state.zone)
-            .into_iter()
-            .filter(|s| r.server_eligible(s.ip()))
-            .collect();
-        if ladder.is_empty() {
-            return Err(());
-        }
+        let ladder = r.ask_order(&self.state.servers, &self.state.zone)?;
         // 주소를 풀지 않은 이름 몫의 시간도 남긴다. 동기 경로의 query_any_reserving과 같은 규칙이다.
         let candidates = ladder.len() + self.state.unresolved_ns.len();
         self.per_server =
@@ -284,6 +277,7 @@ impl Session {
         self.next_idx = 0;
         self.attempts.clear();
         self.fire_next(r, now)
+            .map_err(|()| crate::RecurseError::NoReachableNs)
     }
 
     /**
@@ -454,7 +448,7 @@ impl Session {
             StepOutcome::Done(final_msg) => Some(SessionEnd::Done(final_msg)),
             StepOutcome::Continue => match self.send_next(r, now) {
                 Ok(()) => None,
-                Err(()) => Some(SessionEnd::Failed(crate::RecurseError::NoReachableNs)),
+                Err(error) => Some(SessionEnd::Failed(error)),
             },
             StepOutcome::NeedNsAddrs { missing, pending } => {
                 Some(SessionEnd::NeedAddrs { missing, pending })
@@ -482,7 +476,7 @@ impl Session {
             StepOutcome::Done(final_msg) => Some(SessionEnd::Done(final_msg)),
             StepOutcome::Continue => match self.send_next(r, now) {
                 Ok(()) => None,
-                Err(()) => Some(SessionEnd::Failed(crate::RecurseError::NoReachableNs)),
+                Err(error) => Some(SessionEnd::Failed(error)),
             },
             StepOutcome::NeedNsAddrs { .. } | StepOutcome::NeedDs { .. } => {
                 Some(SessionEnd::Failed(crate::RecurseError::NoReachableNs))

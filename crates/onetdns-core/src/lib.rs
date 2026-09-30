@@ -18,6 +18,8 @@ pub mod json;
 pub mod log;
 /** @brief 상한이 있는 캐시 자료 구조. */
 pub mod lrumap;
+/** @brief 관리 화면을 내보이는 HTTPS 출처. */
+pub mod origin;
 /** @brief 접근 제어·속도 제한·차단이 지켜야 할 약속. */
 pub mod policy;
 /** @brief 난수. */
@@ -37,6 +39,7 @@ pub mod udp;
 pub use client::{ClientInfo, Transport};
 pub use ipnet::IpNet;
 pub use lrumap::LruMap;
+pub use origin::HttpsOrigin;
 pub use policy::{
     AccessControl, AclDecision, BlockResponse, FilterEngine, FilterExplanation, FilterVerdict,
     MatchStage, RateDecision, RateLimiter, RewriteTarget,

@@ -3,14 +3,15 @@ name: Release
 # Pushing a tag that starts with v builds a binary for every target and publishes a
 # GitHub release. The tag must be v followed by the [workspace.package] version in
 # Cargo.toml. A version with a hyphen suffix, such as 0.1.0-alpha.1, is published as a
-# pre-release. This workflow does not rerun the tests, so only tag a commit on main
-# whose CI has passed.
+# pre-release. This workflow does not rerun the tests. Instead it refuses to release
+# unless the tagged commit is on main and the CI workflow passed for that exact commit.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +25,35 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require the tagged commit to be on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points to $GITHUB_SHA, which is not on main. Tag a commit on main."
+            exit 1
+          fi
+      - name: Require CI to have passed for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A tag pushed right after main may arrive while CI is still running, so wait for it.
+          for attempt in $(seq 1 90); do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=100")
+            if [ "$(echo "$runs" | jq '[.workflow_runs[] | select(.conclusion == "success")] | length')" -gt 0 ]; then
+              exit 0
+            fi
+            if [ "$(echo "$runs" | jq '[.workflow_runs[] | select(.status != "completed")] | length')" -eq 0 ]; then
+              echo "::error::No passing CI run on main for $GITHUB_SHA. Fix CI, then tag a commit whose CI passed."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "::error::CI for $GITHUB_SHA did not finish within 90 minutes."
+          exit 1
       - uses: dtolnay/rust-toolchain@1.88.0
       - name: Match tag and package version
         id: version
