@@ -240,6 +240,18 @@ impl NativeServer {
                         continue;
                     };
                     runtime.cache.lane_remember_failure(&cl.request);
+                    if let (onetdns_recurse::RecurseError::NoResponse, Some(recursor), Some(q)) = (
+                        &error,
+                        runtime.recursor.as_ref(),
+                        cl.request.questions.first(),
+                    ) {
+                        // 동기 경로와 같은 규칙으로, 답을 받지 못한 해석은 뒤에서 마저 돌린다.
+                        recursor.complete_in_background(
+                            q.name.clone(),
+                            q.qtype,
+                            cl.request.header.checking_disabled,
+                        );
+                    }
                     let failure = match cl.request.questions.first() {
                         Some(question) => recurse_failure(error, &question.name),
                         None => ResolveFailure::Permanent(None),

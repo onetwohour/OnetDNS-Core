@@ -2198,7 +2198,92 @@ fn udp_exchange_on(
     }
 }
 
-/** @brief 평문 TCP로 교환한다. 2바이트 길이 접두사 프레이밍을 쓴다. */
+/** @brief 보관 중인 유휴 평문 TCP 연결 하나. */
+struct IdleTcp {
+    /** @brief 이어진 연결. */
+    stream: TcpStream,
+    /** @brief 마지막으로 응답을 받은 시각. */
+    last_used: Instant,
+}
+
+/** @brief 유휴 평문 TCP 연결을 보관하는 풀. 키는 (바인드 주소, 서버 주소)다. */
+#[derive(Default)]
+struct TcpIdlePool {
+    /** @brief 서버별 유휴 연결. */
+    idle: HashMap<(SocketAddr, SocketAddr), Vec<IdleTcp>>,
+    /** @brief 모든 서버에 걸친 유휴 연결 수. */
+    total: usize,
+}
+
+/** @brief 서버 하나에 보관할 유휴 연결 수 상한. 같은 서버에 동시에 묻는 질의 수만큼 필요하다. */
+const TCP_IDLE_PER_SERVER: usize = 2;
+
+/**
+ * @brief 모든 서버에 걸쳐 보관할 유휴 연결 수 상한.
+ * @note 재귀는 서버를 수백 곳 거친다. 상한이 없으면 유휴 연결이 파일 디스크립터를 다 쓴다.
+ */
+const TCP_IDLE_TOTAL: usize = 256;
+
+/**
+ * @brief 프로세스가 공유하는 유휴 평문 TCP 연결 풀.
+ * @details 스레드마다 두면 재귀가 서버마다 따로 띄우는 교환 스레드가 서로의 연결을 쓰지 못한다.
+ */
+fn tcp_idle_pool() -> &'static Mutex<TcpIdlePool> {
+    /** @brief 처음 쓸 때 만드는 풀. */
+    static POOL: OnceLock<Mutex<TcpIdlePool>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(TcpIdlePool::default()))
+}
+
+/**
+ * @brief 이 서버로 이어 둔 유휴 연결을 꺼낸다. 너무 오래 쉰 연결은 버린다.
+ * @note 서버가 그사이 닫은 연결도 꺼내질 수 있다. 그런 연결은 질의를 보내면 곧바로 EOF가
+ *       읽혀 새 연결로 넘어가므로 따로 확인하지 않는다.
+ */
+fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
+    let mut pool = tcp_idle_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let TcpIdlePool { idle, total } = &mut *pool;
+    let conns = idle.get_mut(&(bind, upstream))?;
+    let mut found = None;
+    while let Some(conn) = conns.pop() {
+        *total -= 1;
+        if conn.last_used.elapsed() < tcp_idle_reuse_max() {
+            found = Some(conn.stream);
+            break;
+        }
+    }
+    if conns.is_empty() {
+        idle.remove(&(bind, upstream));
+    }
+    found
+}
+
+/** @brief 응답을 온전히 받은 연결을 풀에 돌려놓는다. 상한을 넘으면 닫는다. */
+fn return_idle_tcp(bind: SocketAddr, upstream: SocketAddr, stream: TcpStream) {
+    let mut pool = tcp_idle_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pool.total >= TCP_IDLE_TOTAL {
+        return;
+    }
+    let conns = pool.idle.entry((bind, upstream)).or_default();
+    if conns.len() >= TCP_IDLE_PER_SERVER {
+        return;
+    }
+    conns.push(IdleTcp {
+        stream,
+        last_used: Instant::now(),
+    });
+    pool.total += 1;
+}
+
+/**
+ * @brief 평문 TCP로 교환한다. 2바이트 길이 접두사 프레이밍을 쓴다.
+ * @details 이 서버로 이어 둔 연결이 있으면 먼저 그것으로 묻는다. 새 연결은 핸드셰이크 왕복이
+ *          한 번 더 들어, 멀리 있는 서버는 질의 하나에 수백 밀리초가 붙는다. 이어 둔 연결은
+ *          그사이 끊겼을 수 있으므로 첫 시도를 짧게 끊고, 실패하면 새 연결로 다시 묻는다.
+ */
 fn tcp_exchange(
     upstream: SocketAddr,
     wire: &[u8],
@@ -2207,22 +2292,62 @@ fn tcp_exchange(
     timeout: Duration,
 ) -> Result<Message, ForwardError> {
     let deadline = deadline_after(timeout);
-    let mut stream =
-        bound_tcp::connect(outgoing_bind(upstream), upstream, timeout).map_err(io_err)?;
-
     if wire.len() > 0xffff {
         return Err(ForwardError::BadResponse);
     }
     let mut framed = Vec::with_capacity(wire.len() + 2);
     framed.extend_from_slice(&(wire.len() as u16).to_be_bytes());
     framed.extend_from_slice(wire);
-    write_all_deadline(&mut stream, &framed, deadline)?;
+    let bind = outgoing_bind(upstream);
+
+    if let Some(mut stream) = take_idle_tcp(bind, upstream) {
+        match tcp_roundtrip(
+            &mut stream,
+            &framed,
+            wire_id,
+            request,
+            bounded_first_try(deadline),
+        ) {
+            Ok(resp) => {
+                return_idle_tcp(bind, upstream, stream);
+                return Ok(resp);
+            }
+            Err(error) => {
+                onetdns_core::debug!(event = "forward.conn_retry",
+                    transport = "tcp",
+                    addr = %upstream,
+                    reason = ?error,
+                    "Could not reuse the existing connection; retrying on a new one"
+                );
+            }
+        }
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ForwardError::Timeout);
+    }
+    let mut stream = bound_tcp::connect(bind, upstream, remaining).map_err(io_err)?;
+    let resp = tcp_roundtrip(&mut stream, &framed, wire_id, request, deadline)?;
+    return_idle_tcp(bind, upstream, stream);
+    Ok(resp)
+}
+
+/** @brief 이어진 연결로 길이 접두사가 붙은 질의 하나를 보내고 응답 하나를 읽는다. */
+fn tcp_roundtrip(
+    stream: &mut TcpStream,
+    framed: &[u8],
+    wire_id: u16,
+    request: &Message,
+    deadline: Instant,
+) -> Result<Message, ForwardError> {
+    write_all_deadline(stream, framed, deadline)?;
 
     let mut lenb = [0u8; 2];
-    read_exact_deadline(&mut stream, &mut lenb, deadline)?;
+    read_exact_deadline(stream, &mut lenb, deadline)?;
     let rlen = u16::from_be_bytes(lenb) as usize;
     let mut rbuf = vec![0u8; rlen];
-    read_exact_deadline(&mut stream, &mut rbuf, deadline)?;
+    read_exact_deadline(stream, &mut rbuf, deadline)?;
 
     let resp = Message::parse(&rbuf).map_err(|_| ForwardError::BadResponse)?;
     validate_response(request, &resp, Some(wire_id))?;
@@ -2978,6 +3103,81 @@ mod tests {
         )
         .is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /**
+     * @brief 연결마다 질의를 받아 빈 응답을 돌려주는 TCP 서버를 띄운다.
+     * @param close_after_answer 참이면 응답 하나를 보낸 뒤 연결을 닫는다.
+     * @return 서버 주소와, 지금까지 받아들인 연결 수.
+     */
+    fn spawn_tcp_answerer(close_after_answer: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || loop {
+                    let mut len = [0u8; 2];
+                    if stream.read_exact(&mut len).is_err() {
+                        return;
+                    }
+                    let mut wire = vec![0; u16::from_be_bytes(len) as usize];
+                    if stream.read_exact(&mut wire).is_err() {
+                        return;
+                    }
+                    let request = Message::parse(&wire).unwrap();
+                    let mut response = Message::default();
+                    response.header.id = request.header.id;
+                    response.header.response = true;
+                    response.questions = request.questions.clone();
+                    let wire = response.try_encode().unwrap();
+                    let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
+                    framed.extend_from_slice(&wire);
+                    if stream.write_all(&framed).is_err() || close_after_answer {
+                        return;
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /** @brief 이 서버에 TCP로 한 번 묻는다. */
+    fn ask_over_tcp(addr: SocketAddr, id: u16) -> Result<Message, ForwardError> {
+        let request = Message::query(id, Name::from_str("pool.example").unwrap(), RecordType::A);
+        let wire = request.try_encode().unwrap();
+        tcp_exchange(addr, &wire, id, &request, Duration::from_secs(2))
+    }
+
+    #[test]
+    /**
+     * @brief 같은 서버에 잇따라 물으면 이어 둔 연결을 다시 쓰는지.
+     * @details 새 연결은 핸드셰이크 왕복이 한 번 더 든다. UDP 53번이 막혀 권한 서버에 TCP로
+     *          묻는 망에서는 질의마다 이 왕복이 붙는다.
+     */
+    fn tcp_exchange_reuses_the_connection_to_the_same_server() {
+        let (addr, accepted) = spawn_tcp_answerer(false);
+        ask_over_tcp(addr, 0x7001).expect("첫 질의");
+        ask_over_tcp(addr, 0x7002).expect("둘째 질의");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /**
+     * @brief 서버가 닫은 연결로 묻다 실패하면 곧바로 새 연결로 다시 묻는지.
+     * @details 권한 서버는 유휴 연결을 몇 초 만에 닫기도 한다. 이어 둔 연결이 닫혔다고 질의가
+     *          실패하거나 제한 시간까지 기다리면 재사용이 오히려 해가 된다.
+     */
+    fn tcp_exchange_retries_on_a_new_connection_when_the_kept_one_was_closed() {
+        let (addr, accepted) = spawn_tcp_answerer(true);
+        ask_over_tcp(addr, 0x7003).expect("첫 질의");
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        ask_over_tcp(addr, 0x7004).expect("둘째 질의");
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[test]

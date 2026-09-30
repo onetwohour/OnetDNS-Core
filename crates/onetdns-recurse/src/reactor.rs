@@ -73,17 +73,11 @@ impl Default for ReactorConfig {
 }
 
 /** @brief 지금 답을 기다리는 왕복 하나. */
-struct Exchange {
+struct Attempt {
     /** @brief 보낸 질의. 응답 대조에 쓰므로 그대로 가지고 있어야 한다. */
     sent: Message,
-    /** @brief 지금 물어보고 있는 서버. */
+    /** @brief 물어본 서버. */
     target: SocketAddr,
-    /** @brief 순서대로 시도할 서버들. */
-    ladder: Vec<SocketAddr>,
-    /** @brief 지금 몇 번째를 시도 중인지. */
-    ladder_idx: usize,
-    /** @brief 서버 하나에 줄 시간. */
-    per_server: Duration,
     /** @brief 이 왕복의 데드라인. */
     deadline: Instant,
     /** @brief 보낸 시각. 왕복 시간 측정에 쓴다. */
@@ -100,8 +94,20 @@ struct Session {
     state: IterationState,
     /** @brief 다음에 보낼 질의의 모양. */
     plan: NextQuery,
-    /** @brief 답을 기다리는 왕복. 없으면 다음 질의를 보낼 차례다. */
-    exchange: Option<Exchange>,
+    /** @brief 이번 단계에서 순서대로 물을 서버들. */
+    ladder: Vec<SocketAddr>,
+    /** @brief 다음에 물을 서버의 순번. */
+    next_idx: usize,
+    /** @brief 서버 하나에 줄 시간. */
+    per_server: Duration,
+    /**
+     * @brief 답을 기다리는 왕복들.
+     * @details 앞 서버의 답을 기다리는 채로 다음 서버에도 물으므로 여럿일 수 있다. 먼저 온
+     *          쓸 만한 답을 쓰고 나머지는 버린다. 동기 경로의 query_any_reserving과 같은 규칙이다.
+     */
+    attempts: Vec<Attempt>,
+    /** @brief 이 시각까지 답이 없으면 다음 서버에도 묻는다. */
+    ask_next_at: Instant,
     /** @brief 이 해석 전용 소켓. 포트 무작위화가 여기서 나온다. */
     sock: UdpSocket,
 
@@ -113,6 +119,12 @@ struct Session {
     steps: usize,
     /** @brief 밟을 수 있는 단계 수 상한. 참조가 순환해도 멈춘다. */
     step_cap: usize,
+    /**
+     * @brief 위임마다 DS 증거를 모을지. 검증할 때만 참이다.
+     * @note 네임서버 주소를 푸는 자식 해석은 결과를 검증하지 않으므로 끈다. 켜 두면 답변 절로
+     *       드러난 경계에서 DS를 물으려고 부모까지 동기 경로로 넘어간다.
+     */
+    collect_ds: bool,
 }
 
 thread_local! {
@@ -180,13 +192,13 @@ enum Settled {
 }
 
 /** @brief 해석 내내 바뀌지 않는 질의 정보를 만든다. */
-fn make_ctx<'a>(r: &Recursor, qname: &'a Name, qtype: RecordType) -> IterationContext<'a> {
+fn make_ctx(qname: &Name, qtype: RecordType, collect_ds: bool) -> IterationContext<'_> {
     IterationContext {
         qname,
         qtype,
         total: qname.num_labels(),
         do_bit: true,
-        collect_ds: r.is_validating(),
+        collect_ds,
     }
 }
 
@@ -230,12 +242,17 @@ impl Session {
                 mname: Name::root(),
                 mtype: qtype,
             },
-            exchange: None,
+            ladder: Vec::new(),
+            next_idx: 0,
+            per_server: Duration::ZERO,
+            attempts: Vec::new(),
+            ask_next_at: now,
             sock,
             sock_v6: false,
             session_deadline: now + budget,
             steps: 0,
             step_cap,
+            collect_ds: r.is_validating(),
         };
         if s.send_next(r, now).is_err() {
             return None;
@@ -249,7 +266,7 @@ impl Session {
         if self.steps > self.step_cap {
             return Err(());
         }
-        let ctx = make_ctx(r, &self.qname, self.qtype);
+        let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         self.plan = self.state.next_query(&ctx);
         let ladder: Vec<SocketAddr> = r
             .order_by_infra(&self.state.servers, &self.state.zone)
@@ -259,49 +276,59 @@ impl Session {
         if ladder.is_empty() {
             return Err(());
         }
-        let per_server =
-            (r.timeout / ladder.len().clamp(1, 4) as u32).max(Duration::from_millis(300));
-        self.exchange = None;
-        self.fire_attempt(r, ladder, 0, per_server, now)
+        // 주소를 풀지 않은 이름 몫의 시간도 남긴다. 동기 경로의 query_any_reserving과 같은 규칙이다.
+        let candidates = ladder.len() + self.state.unresolved_ns.len();
+        self.per_server =
+            (r.timeout / candidates.clamp(1, 4) as u32).max(Duration::from_millis(300));
+        self.ladder = ladder;
+        self.next_idx = 0;
+        self.attempts.clear();
+        self.fire_next(r, now)
     }
 
     /**
-     * @brief 사다리의 현재 서버에 실제로 보낸다.
+     * @brief 사다리의 다음 서버에 실제로 보낸다.
+     * @details 보내지 못한 서버는 실패로 기록하고 그다음 서버로 넘어간다. 기다리는 왕복이
+     *          남아 있으면 보낼 서버가 더 없어도 실패가 아니다.
      * @note 0x20이 켜져 있으면 여기서 대소문자를 섞는다. 응답 대조에 쓰이므로 보낸 형태를
      *       그대로 기억해 둔다.
      */
-    fn fire_attempt(
-        &mut self,
-        r: &Recursor,
-        ladder: Vec<SocketAddr>,
-        mut idx: usize,
-        per_server: Duration,
-        now: Instant,
-    ) -> Result<(), ()> {
-        while let Some(&target) = ladder.get(idx) {
-            let ctx = make_ctx(r, &self.qname, self.qtype);
+    fn fire_next(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
+        while let Some(&target) = self.ladder.get(self.next_idx) {
+            if !self.attempts.is_empty() && self.sock_v6 != target.is_ipv6() {
+                // 소켓을 바꾸면 기다리던 왕복의 답을 받을 수 없다. 그 왕복이 끝나면 보낸다.
+                self.ask_next_at = self
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.deadline)
+                    .max()
+                    .unwrap_or(now);
+                return Ok(());
+            }
+            self.next_idx += 1;
+            let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
             let mut q = make_query(&self.plan.mname, self.plan.mtype, ctx.do_bit);
             q.header.id = u16::from_le_bytes(onetdns_core::rng::ephemeral_random_array::<2>());
             r.apply_outgoing_case(&mut q);
             let wire = q.try_encode().map_err(|_| ())?;
             if !self.use_socket_for(target) || self.sock.send_to(&wire, target).is_err() {
                 r.infra_fail(target.ip(), &self.state.zone);
-                idx += 1;
                 continue;
             }
-            let deadline = (now + per_server).min(self.session_deadline);
-            self.exchange = Some(Exchange {
+            self.attempts.push(Attempt {
                 sent: q,
                 target,
-                ladder,
-                ladder_idx: idx,
-                per_server,
-                deadline,
+                deadline: (now + self.per_server).min(self.session_deadline),
                 sent_at: now,
             });
+            self.ask_next_at = now + r.server_patience(target.ip()).min(self.per_server);
             return Ok(());
         }
-        Err(())
+        if self.attempts.is_empty() {
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     /** @brief 대상 계열에 맞는 소켓을 준비한다. 계열이 바뀌면 새로 연다. */
@@ -319,68 +346,110 @@ impl Session {
         }
     }
 
-    /** @brief 왕복이 시간을 넘겼다. 사다리의 다음 서버로 넘어간다. */
-    fn on_exchange_timeout(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
-        let Some(ex) = self.exchange.take() else {
-            return Err(());
-        };
-        r.infra_fail(ex.target.ip(), &self.state.zone);
-        self.fire_attempt(r, ex.ladder, ex.ladder_idx + 1, ex.per_server, now)
+    /**
+     * @brief 시간이 된 일을 처리한다.
+     * @details 데드라인을 넘긴 왕복은 실패로 기록해 버린다. 기다리는 왕복이 없거나 다음 서버에
+     *          물을 시각이 되었으면 다음 서버에 보낸다.
+     * @return 더 물을 서버도 기다리는 왕복도 없으면 Err.
+     */
+    fn on_timers(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
+        let zone = &self.state.zone;
+        self.attempts.retain(|attempt| {
+            let live = now < attempt.deadline;
+            if !live {
+                r.infra_fail(attempt.target.ip(), zone);
+            }
+            live
+        });
+        if self.attempts.is_empty()
+            || (now >= self.ask_next_at && self.attempts.len() < crate::MAX_EXCHANGES_PER_QUERY)
+        {
+            if self.next_idx >= self.ladder.len() && self.attempts.is_empty() {
+                return Err(());
+            }
+            if self.next_idx < self.ladder.len() {
+                return self.fire_next(r, now);
+            }
+        }
+        Ok(())
+    }
+
+    /** @brief 다음에 깨어나야 할 시각. 기다리는 왕복의 데드라인과 다음 서버에 물을 시각이다. */
+    fn next_wake(&self) -> Option<Instant> {
+        let deadline = self.attempts.iter().map(|attempt| attempt.deadline).min();
+        let ask_next = (self.next_idx < self.ladder.len()
+            && self.attempts.len() < crate::MAX_EXCHANGES_PER_QUERY)
+            .then_some(self.ask_next_at);
+        deadline.into_iter().chain(ask_next).min()
     }
 
     /**
-     * @brief 소켓에서 응답을 읽어 이 서버의 질의에 대한 것인지 확인한다.
+     * @brief 소켓에서 응답을 읽어 기다리는 왕복 가운데 하나에 대한 것인지 확인한다.
+     * @return 받아들인 응답과, 그 응답이 답한 왕복.
      * @warning 트랜잭션 ID와 질문, 0x20 대소문자까지 맞아야 받아들인다. 이 검사가 위조
      *          응답을 막는 실체다.
      */
-    fn try_recv(&mut self, r: &Recursor) -> Option<Message> {
-        let ex = self.exchange.as_ref()?;
-        RECV_BUFFER.with(|slot| {
+    fn try_recv(&mut self, r: &Recursor) -> Option<(Message, Attempt)> {
+        if self.attempts.is_empty() {
+            return None;
+        }
+        let matched = RECV_BUFFER.with(|slot| {
             let mut buf = slot.borrow_mut();
             loop {
                 match self.sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
-                        if from != ex.target {
-                            continue;
-                        }
                         let Some(resp) = Message::parse_udp_reply(&buf[..n]) else {
                             continue;
                         };
-                        if resp.header.id != ex.sent.header.id {
+                        let Some(idx) = self.attempts.iter().position(|attempt| {
+                            attempt.target == from && attempt.sent.header.id == resp.header.id
+                        }) else {
                             continue;
-                        }
-                        if r.caps_for_id
-                            && !questions_case_exact(&resp.questions, &ex.sent.questions)
+                        };
+                        let sent = &self.attempts[idx].sent;
+                        if r.caps_for_id && !questions_case_exact(&resp.questions, &sent.questions)
                         {
                             continue;
                         }
                         // 잘린 응답은 레코드가 비어 있어 아래 검사를 통과하지 못한다. 거기서
                         // 버리면 TCP 로 넘어가지 못하고 왕복 시간 초과까지 기다린다.
                         if resp.header.truncated {
-                            return Some(resp);
+                            return Some((resp, idx));
                         }
-                        if !response_usable_for_iteration(&resp, &ex.sent, &self.state.zone) {
+                        if !response_usable_for_iteration(&resp, sent, &self.state.zone) {
                             continue;
                         }
-                        return Some(resp);
+                        return Some((resp, idx));
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
                     Err(_) => return None,
                 }
             }
-        })
+        });
+        matched.map(|(resp, idx)| (resp, self.attempts.swap_remove(idx)))
     }
 
     /** @brief 받은 응답으로 한 단계 나아간다. 판정은 동기 경로의 advance를 그대로 쓴다. */
-    fn on_response(&mut self, r: &Recursor, resp: Message, now: Instant) -> Option<SessionEnd> {
-        if let Some(ex) = self.exchange.take() {
-            r.infra_success(ex.target.ip(), &self.state.zone, ex.sent_at.elapsed());
+    fn on_response(
+        &mut self,
+        r: &Recursor,
+        resp: Message,
+        answered: Attempt,
+        now: Instant,
+    ) -> Option<SessionEnd> {
+        r.infra_success(
+            answered.target.ip(),
+            &self.state.zone,
+            answered.sent_at.elapsed(),
+        );
+        for attempt in self.attempts.drain(..) {
+            r.record_rtt_at_least(attempt.target.ip(), attempt.sent_at.elapsed());
         }
 
         if resp.header.truncated {
             return Some(SessionEnd::NeedsSync);
         }
-        let ctx = make_ctx(r, &self.qname, self.qtype);
+        let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         match r.advance(&mut self.state, resp, &self.plan, &ctx) {
             StepOutcome::Done(final_msg) => Some(SessionEnd::Done(final_msg)),
             StepOutcome::Continue => match self.send_next(r, now) {
@@ -390,6 +459,8 @@ impl Session {
             StepOutcome::NeedNsAddrs { missing, pending } => {
                 Some(SessionEnd::NeedAddrs { missing, pending })
             }
+            // DS를 따로 묻는 질의는 이 레인에 없다. 드문 경계라 동기 경로에 맡긴다.
+            StepOutcome::NeedDs { .. } => Some(SessionEnd::NeedsSync),
             StepOutcome::Failed(error) => Some(SessionEnd::Failed(error)),
         }
     }
@@ -406,14 +477,14 @@ impl Session {
         pending.addrs.extend(addrs);
 
         pending.address_ttl = crate::min_optional_ttl(pending.address_ttl, addr_ttl);
-        let ctx = make_ctx(r, &self.qname, self.qtype);
+        let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         match r.finish_referral(&mut self.state, &ctx, pending) {
             StepOutcome::Done(final_msg) => Some(SessionEnd::Done(final_msg)),
             StepOutcome::Continue => match self.send_next(r, now) {
                 Ok(()) => None,
                 Err(()) => Some(SessionEnd::Failed(crate::RecurseError::NoReachableNs)),
             },
-            StepOutcome::NeedNsAddrs { .. } => {
+            StepOutcome::NeedNsAddrs { .. } | StepOutcome::NeedDs { .. } => {
                 Some(SessionEnd::Failed(crate::RecurseError::NoReachableNs))
             }
             StepOutcome::Failed(error) => Some(SessionEnd::Failed(error)),
@@ -702,8 +773,8 @@ impl Reactor {
             }
             let mut end: Option<SessionEnd> = None;
             if let Some(slot) = self.slots[slot_idx].as_mut() {
-                while let Some(resp) = slot.session.try_recv(r) {
-                    end = slot.session.on_response(r, resp, now);
+                while let Some((resp, answered)) = slot.session.try_recv(r) {
+                    end = slot.session.on_response(r, resp, answered, now);
                     if end.is_some() {
                         break;
                     }
@@ -723,15 +794,16 @@ impl Reactor {
                 if slot.parked.is_some() || slot.awaiting.is_some() {
                     continue;
                 }
-                let past = slot
-                    .session
-                    .exchange
-                    .as_ref()
-                    .is_some_and(|ex| now >= ex.deadline);
-                if (past && slot.session.on_exchange_timeout(r, now).is_err())
-                    || now >= slot.session.session_deadline
-                {
+                if now >= slot.session.session_deadline {
                     end = Some(SessionEnd::Failed(crate::RecurseError::NoResponse));
+                } else if slot.session.on_timers(r, now).is_err() {
+                    end = Some(if slot.session.state.unresolved_ns.is_empty() {
+                        SessionEnd::Failed(crate::RecurseError::NoResponse)
+                    } else {
+                        // 이 영역의 서버가 모두 답하지 않았고 주소를 풀지 않은 이름이 남아 있다.
+                        // 이 레인에는 그 이름을 이어서 푸는 경로가 없으므로 동기 경로에 맡긴다.
+                        SessionEnd::NeedsSync
+                    });
                 }
             }
             if let Some(e) = end {
@@ -746,7 +818,7 @@ impl Reactor {
             .iter()
             .flatten()
             .filter(|s| s.parked.is_none())
-            .filter_map(|s| s.session.exchange.as_ref().map(|ex| ex.deadline))
+            .filter_map(|s| s.session.next_wake())
             .min()
             .map(|d| d.saturating_duration_since(now))
     }
@@ -815,7 +887,11 @@ impl Reactor {
             .filter(|_| self.has_child_capacity());
         let started = depth_left
             .zip(self.child_budget(parent, now))
-            .and_then(|(_, budget)| Session::start(r, qname, RecordType::A, budget, now));
+            .and_then(|(_, budget)| Session::start(r, qname, RecordType::A, budget, now))
+            .map(|mut session| {
+                session.collect_ds = false;
+                session
+            });
         match started {
             Some(session) => {
                 self.insert(Slot {
@@ -1206,7 +1282,11 @@ impl Reactor {
         parked.addrs.extend(addrs);
         parked.addr_ttl = crate::min_optional_ttl(parked.addr_ttl, addr_ttl);
 
-        if parked.next_missing < parked.missing.len() && parked.children_spawned < 8 {
+        // 쓸 수 있는 주소가 생기면 남은 이름은 풀지 않고 내려간다. 그 주소들이 모두 답하지
+        // 않으면 동기 경로가 남은 이름을 이어서 푼다.
+        let have_usable = parked.addrs.iter().any(|addr| r.usable_server(addr.ip()));
+        if !have_usable && parked.next_missing < parked.missing.len() && parked.children_spawned < 8
+        {
             let next = parked.missing[parked.next_missing].clone();
             parked.next_missing += 1;
             parked.children_spawned += 1;
@@ -1215,13 +1295,14 @@ impl Reactor {
             self.spawn_child(r, parent, next, now, out);
             return;
         }
-        match pslot.session.resume_with_addrs(
-            r,
-            *parked.pending,
-            parked.addrs,
-            parked.addr_ttl,
-            now,
-        ) {
+        let mut pending = *parked.pending;
+        pending.unresolved = parked
+            .missing
+            .split_off(parked.next_missing.min(parked.missing.len()));
+        match pslot
+            .session
+            .resume_with_addrs(r, pending, parked.addrs, parked.addr_ttl, now)
+        {
             None => self.slots[parent] = Some(pslot),
             Some(e) => {
                 self.slots[parent] = Some(pslot);
@@ -1278,11 +1359,28 @@ mod tests {
 
     /** @brief AD 비트를 위조해 보내는 테스트용 서버. */
     fn spawn_mock_authority_forging_ad(forge_ad: bool) -> SocketAddr {
+        spawn_mock_answering(
+            forge_ad,
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+            Duration::ZERO,
+        )
+    }
+
+    /**
+     * @brief 모든 질의에 주어진 주소로 권한 있게 답하는 테스트용 서버.
+     * @param delay 답하기 전에 기다릴 시간.
+     */
+    fn spawn_mock_answering(
+        forge_ad: bool,
+        address: std::net::Ipv4Addr,
+        delay: Duration,
+    ) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let addr = sock.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                std::thread::sleep(delay);
                 let Ok(req) = Message::parse(&buf[..n]) else {
                     continue;
                 };
@@ -1305,11 +1403,8 @@ mod tests {
                     ..Default::default()
                 };
                 resp.header.rcode = ResponseCode::NoError.0;
-                resp.answers.push(Record::new(
-                    q.name.clone(),
-                    60,
-                    RData::A(std::net::Ipv4Addr::new(192, 0, 2, 7)),
-                ));
+                resp.answers
+                    .push(Record::new(q.name.clone(), 60, RData::A(address)));
                 let _ = sock.send_to(&resp.try_encode().unwrap(), from);
             }
         });
@@ -2328,6 +2423,106 @@ mod tests {
         assert!(
             !sync.header.authoritative,
             "재귀 답은 이 서버의 권한이 아니므로 AA=0"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 느린 서버의 답을 기다리는 동안 다음 서버에도 물어 먼저 온 답을 쓰는지.
+     * @details 동기 경로의 a_slow_server_is_raced_by_the_next_one과 같은 규칙을 레인에서
+     *          확인한다. 첫 서버를 끝까지 기다리면 그 서버의 지연만큼 늦는다.
+     */
+    fn reactor_races_a_slow_server_with_the_next_one() {
+        /** @brief 느린 서버가 답을 미루는 시간. 서버당 제한 시간보다 짧아야 한다. */
+        const SLOW_DELAY: Duration = Duration::from_millis(1500);
+        let slow_ip = std::net::Ipv4Addr::new(192, 0, 2, 8);
+        let fast_ip = std::net::Ipv4Addr::new(192, 0, 2, 9);
+        let slow = spawn_mock_answering(false, slow_ip, SLOW_DELAY);
+        let fast = spawn_mock_answering(false, fast_ip, Duration::ZERO);
+        let recursor = Recursor::new(vec![slow, fast], Duration::from_secs(4))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
+        let mut reactor = Reactor::new(ReactorConfig::default());
+        let started = Instant::now();
+        assert!(matches!(
+            reactor.submit(
+                &recursor,
+                Name::from_str("example.").unwrap(),
+                RecordType::A,
+                1,
+                started,
+                false
+            ),
+            SubmitOutcome::Accepted
+        ));
+
+        let msg = drive_one(&mut reactor, &recursor).expect("리액터 응답");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(msg.answers.first().map(|r| &r.rdata), Some(RData::A(ip)) if *ip == fast_ip),
+            "{msg:?}"
+        );
+        assert!(
+            elapsed >= crate::UNKNOWN_SERVER_PATIENCE && elapsed < SLOW_DELAY,
+            "둘째 서버에 물은 시점이 기대와 다릅니다: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 세션 하나가 동시에 기다리는 왕복이 MAX_EXCHANGES_PER_QUERY를 넘지 않는지.
+     * @details 동기 경로의 a_query_waits_on_at_most_two_exchanges_at_once와 같은 규칙을 레인에서
+     *          확인한다. 앞의 두 서버는 답하지 않으므로, 셋째 서버에는 앞의 왕복 하나가 시간을
+     *          넘긴 뒤에야 물어야 한다.
+     */
+    fn reactor_waits_on_at_most_two_exchanges_at_once() {
+        let silent = || {
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = sock.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                while sock.recv_from(&mut buf).is_ok() {}
+            });
+            addr
+        };
+        let first = silent();
+        let second = silent();
+        let third_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let third = third_sock.local_addr().unwrap();
+        let asked_third = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let record = asked_third.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while third_sock.recv_from(&mut buf).is_ok() {
+                record.lock().unwrap().get_or_insert_with(Instant::now);
+            }
+        });
+
+        let timeout = Duration::from_secs(4);
+        let recursor = Recursor::new(vec![first, second, third], timeout)
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
+        let mut reactor = Reactor::new(ReactorConfig::default());
+        let started = Instant::now();
+        assert!(matches!(
+            reactor.submit(
+                &recursor,
+                Name::from_str("example.").unwrap(),
+                RecordType::A,
+                1,
+                started,
+                false
+            ),
+            SubmitOutcome::Accepted
+        ));
+        assert!(drive_one(&mut reactor, &recursor).is_none());
+
+        let asked = asked_third
+            .lock()
+            .unwrap()
+            .map(|at| at.duration_since(started))
+            .expect("앞의 왕복이 끝나면 셋째 서버에도 물어야 합니다");
+        assert!(
+            asked >= timeout / 3,
+            "앞의 두 왕복이 답을 기다리는 동안 셋째 서버에도 물었습니다: {asked:?}"
         );
     }
 }

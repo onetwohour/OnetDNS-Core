@@ -220,7 +220,7 @@ impl Session {
             StepOutcome::NeedNsAddrs { missing, pending } => {
                 Some(SessionEnd::NeedAddrs { missing, pending })
             }
-            StepOutcome::Failed(_) => Some(SessionEnd::Failed),
+            StepOutcome::NeedDs { .. } | StepOutcome::Failed(_) => Some(SessionEnd::Failed),
         }
     }
 
@@ -240,7 +240,9 @@ impl Session {
                 Ok(()) => None,
                 Err(()) => Some(SessionEnd::Failed),
             },
-            StepOutcome::NeedNsAddrs { .. } => Some(SessionEnd::Failed),
+            StepOutcome::NeedNsAddrs { .. } | StepOutcome::NeedDs { .. } => {
+                Some(SessionEnd::Failed)
+            }
             StepOutcome::Failed(_) => Some(SessionEnd::Failed),
         }
     }

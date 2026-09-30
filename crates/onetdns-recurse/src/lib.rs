@@ -205,8 +205,19 @@ pub struct Recursor {
     /** @brief 캐시에 담을 TTL 상한. */
     recursive_cache_ttl_max: u32,
 
-    /** @brief 서버별 응답성 통계. 어느 서버를 먼저 물을지 정하는 근거다. */
+    /**
+     * @brief 서버와 zone 쌍마다의 실패 기록. 어느 서버를 먼저 물을지 정하는 근거다.
+     * @note 무응답과 lame 응답은 서버가 그 zone을 제대로 맡고 있는지의 문제라 zone마다 따로 본다.
+     */
     infra: std::sync::Mutex<LruMap<InfraKey, InfraStat>>,
+
+    /**
+     * @brief 주소마다의 평활 왕복 시간.
+     * @note 왕복 시간은 그 주소까지의 경로가 정하므로 zone과 무관하다. zone마다 따로 재면 한
+     *       zone에서 느리다고 잰 서버를 같은 서버가 맡은 부모 zone에서는 처음 보는 서버로 보고
+     *       가장 먼저 묻는다.
+     */
+    rtt: std::sync::Mutex<LruMap<IpAddr, u32>>,
 
     /** @brief 네임서버 이름에서 주소로 가는 캐시. 부수 질의를 크게 줄인다. */
     ns_addr_cache: std::sync::Mutex<LruMap<Vec<u8>, NsAddrEntry>>,
@@ -218,6 +229,31 @@ pub struct Recursor {
     dnskey_cache: std::sync::Mutex<LruMap<Vec<u8>, DnskeyEntry>>,
     /** @brief 검증까지 끝난 키 캐시. 체인 전체를 매번 다시 걷지 않게 한다. */
     validated_keys: std::sync::Mutex<LruMap<Vec<u8>, ValidatedKeyEntry>>,
+
+    /** @brief 뒤에서 마저 해석 중인 질의. 같은 질의를 두 번 돌리지 않는다. */
+    background: std::sync::Mutex<HashSet<(Vec<u8>, RecordType)>>,
+}
+
+/**
+ * @brief 뒤에서 동시에 마저 해석할 질의 수 상한.
+ * @note 끝내지 못한 질의가 이보다 많이 쌓이면 권한 서버 쪽 망이 막힌 것이라, 더 돌려도 채울
+ *       캐시 없이 스레드와 질의만 쓴다.
+ */
+const MAX_BACKGROUND_COMPLETIONS: usize = 16;
+
+/**
+ * @brief 뒤에서 마저 해석할 만한 결과인지.
+ * @details 아무 서버도 답하지 않았거나, 해석 예산의 데드라인을 넘겨 실패한 경우다. 데드라인을
+ *          넘긴 해석은 검증에 쓸 키를 받지 못해 SERVFAIL 응답으로 끝나기도 한다.
+ */
+fn unfinished(result: &Result<(Message, NsContext), RecurseError>, deadline: Instant) -> bool {
+    match result {
+        Err(RecurseError::NoResponse) => true,
+        Err(_) => Instant::now() >= deadline,
+        Ok((message, _)) => {
+            message.header.rcode == ResponseCode::ServFail.0 && Instant::now() >= deadline
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -240,11 +276,8 @@ impl InfraKey {
 }
 
 #[derive(Default)]
-/** @brief 서버 하나의 응답성 통계. */
+/** @brief 서버와 zone 쌍 하나의 실패 기록. */
 struct InfraStat {
-    /** @brief 평활 왕복 시간. 아직 재 본 적 없으면 없다. */
-    srtt_ms: Option<u32>,
-
     /** @brief 마지막 실패 시각. 잠깐 뒤로 미루는 데 쓴다. */
     last_fail: Option<Instant>,
 
@@ -254,6 +287,28 @@ struct InfraStat {
 
 /** @brief 재 본 적 없는 서버에 매길 왕복 시간. 새 서버가 무조건 뒤로 밀리지 않게 한다. */
 const DEFAULT_RTT_MS: u32 = 50;
+
+/**
+ * @brief 처음 보는 서버의 답을 기다렸다가 다음 서버에도 물을 때까지의 시간.
+ * @note 대부분의 권한 서버는 UDP로 이 안에 답한다. 더 짧으면 처음 보는 서버마다 질의가 두
+ *       배로 나가고, 더 길면 답하지 않는 서버 하나에 그만큼씩 시간을 쓴다.
+ */
+const UNKNOWN_SERVER_PATIENCE: Duration = Duration::from_millis(400);
+
+/**
+ * @brief 질의 하나가 동시에 답을 기다리는 교환 수 상한.
+ * @details 느린 서버 하나의 답을 기다리면서 다음 서버에 묻는 데는 둘이면 된다. 더 늘리면
+ *          워커 하나가 동시에 걸어 두는 질의가 늘어, 응답을 한꺼번에 몰아오게 하는
+ *          DNSBomb류 공격에 쓸 폭이 넓어진다.
+ */
+const MAX_EXCHANGES_PER_QUERY: usize = 2;
+
+/**
+ * @brief 잰 왕복 시간이 아무리 짧아도 다음 서버에 묻기 전에 기다리는 시간.
+ * @note 가까운 서버는 스케줄링 지연만으로 왕복 시간의 세 배를 넘길 수 있다. 그때마다 질의를
+ *       두 번 보내지 않게 한다.
+ */
+const MIN_SERVER_PATIENCE: Duration = Duration::from_millis(100);
 
 /** @brief 실패한 서버를 뒤로 미룰 기간. 지나면 다시 정상 순위로 돌아온다. */
 const INFRA_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
@@ -473,7 +528,11 @@ enum SecurityStatus {
     /** @brief 서명이 없는 구간이다. */
     Insecure,
 
-    /** @brief 서명이 있는데 맞지 않는다. 값은 클라이언트에 알릴 EDE 사유다. */
+    /**
+     * @brief 검증을 통과하지 못했다. 값은 클라이언트에 알릴 EDE 사유다.
+     * @details 서명이 맞지 않는 경우뿐 아니라, 검증에 쓸 키를 받지 못해 서명되지 않았다는
+     *          증명도 할 수 없는 경우도 여기에 든다. 둘 다 답을 내보낼 수 없지만 사유는 다르다.
+     */
     Bogus(u16),
 }
 
@@ -528,6 +587,13 @@ struct IterationState {
 
     /** @brief 루트부터 여기까지의 단계들. DNSSEC 체인을 만들 재료가 된다. */
     chain: Vec<ZoneStep>,
+
+    /**
+     * @brief 지금 영역의 네임서버 가운데 주소를 아직 풀지 않은 이름들.
+     * @details 주소는 쓸 수 있는 것이 하나 생기면 그만 푼다. 그 주소들이 모두 답하지 않을 때만
+     *          여기서 하나씩 더 푼다.
+     */
+    unresolved_ns: Vec<Name>,
 }
 
 /** @brief 다음에 보낼 질의의 모양. */
@@ -584,6 +650,14 @@ struct PendingReferral {
     addrs: Vec<SocketAddr>,
     /** @brief 그 주소들의 TTL. 캐시에 담을 때 쓴다. */
     address_ttl: Option<u32>,
+    /**
+     * @brief 부모에게 따로 물어 받은 DS와 그 부재 증명. 답변 절로 드러난 경계에만 있다.
+     * @details 참조라면 DS 증거가 권한 절에 함께 오지만, 권한 있는 답으로 드러난 경계에는 오지
+     *          않는다. 증거 없이 체인에 넣으면 서명된 영역이 증명 없이 Insecure로 내려간다.
+     */
+    ds_evidence: Option<Vec<Record>>,
+    /** @brief 주소를 풀지 않고 남긴 네임서버 이름들. 내려간 뒤 반복 상태로 옮긴다. */
+    unresolved: Vec<Name>,
 }
 
 /** @brief 한 단계를 밟은 결과. */
@@ -599,6 +673,14 @@ enum StepOutcome {
         /** @brief 주소를 모르는 이름들. */
         missing: Vec<Name>,
         /** @brief 주소를 얻은 뒤 이어 갈 참조 상태. */
+        pending: Box<PendingReferral>,
+    },
+
+    /** @brief 답변 절로 드러난 경계라 부모에게 DS를 먼저 물어야 한다. 검증할 때만 생긴다. */
+    NeedDs {
+        /** @brief glue가 없어 주소를 모르는 네임서버 이름들. */
+        missing: Vec<Name>,
+        /** @brief DS를 받은 뒤 이어 갈 참조 상태. */
         pending: Box<PendingReferral>,
     },
 
@@ -628,6 +710,7 @@ impl IterationState {
             depth,
             minimize: true,
             chain,
+            unresolved_ns: Vec::new(),
         }
     }
 
@@ -742,10 +825,12 @@ impl Recursor {
             nsec3_max_iterations: DEFAULT_NSEC3_MAX_ITERATIONS,
             recursive_cache_ttl_max: u32::MAX,
             infra: std::sync::Mutex::new(LruMap::new(MAX_INFRA)),
+            rtt: std::sync::Mutex::new(LruMap::new(MAX_INFRA)),
             ns_addr_cache: std::sync::Mutex::new(LruMap::new(NS_ADDR_CACHE_MAX)),
             deleg_cache: std::sync::Mutex::new(LruMap::new(DELEGATION_CACHE_MAX)),
             dnskey_cache: std::sync::Mutex::new(LruMap::new(DNSKEY_CACHE_MAX)),
             validated_keys: std::sync::Mutex::new(LruMap::new(VALIDATED_KEY_CACHE_MAX)),
+            background: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -775,6 +860,7 @@ impl Recursor {
         if max > 0 {
             let max = max.min(MAX_NS_CACHE_CONFIGURED);
             self.infra = std::sync::Mutex::new(LruMap::new(max));
+            self.rtt = std::sync::Mutex::new(LruMap::new(max));
             self.ns_addr_cache = std::sync::Mutex::new(LruMap::new(max));
             self.deleg_cache = std::sync::Mutex::new(LruMap::new(max));
             self.dnskey_cache = std::sync::Mutex::new(LruMap::new(max));
@@ -936,7 +1022,7 @@ impl Recursor {
             queries: MAX_TOTAL_QUERIES,
             deadline: self.query_deadline(),
         };
-        let (resp, _) = self.iterate(zone, RecordType::DNSKEY, &mut budget)?;
+        let (resp, _) = self.iterate(zone, RecordType::DNSKEY, &mut budget, self.validating())?;
         Ok(resp.answers)
     }
 
@@ -1049,8 +1135,27 @@ impl Recursor {
         self
     }
 
-    /** @brief CD 비트를 지정해 해석하고 거쳐 온 네임서버도 함께 돌려준다. */
+    /**
+     * @brief CD 비트를 지정해 해석하고 거쳐 온 네임서버도 함께 돌려준다.
+     * @details 끝내지 못한 해석은 뒤에서 마저 돌린다(complete_in_background). 클라이언트는
+     *          곧 다시 묻는데, 그때 남은 단계만 진행하면 되도록 이 재귀기의 캐시를 채워 둔다.
+     */
     pub fn resolve_with_ns_cd(
+        self: &std::sync::Arc<Self>,
+        qname: &Name,
+        qtype: RecordType,
+        cd: bool,
+    ) -> Result<(Message, NsContext), RecurseError> {
+        let deadline = self.query_deadline();
+        let result = self.resolve_once_cd(qname, qtype, cd);
+        if unfinished(&result, deadline) {
+            self.complete_in_background(qname.clone(), qtype, cd);
+        }
+        result
+    }
+
+    /** @brief CD 비트를 지정해 한 번 해석한다. 끝내지 못해도 뒤에서 이어 가지 않는다. */
+    fn resolve_once_cd(
         &self,
         qname: &Name,
         qtype: RecordType,
@@ -1058,6 +1163,42 @@ impl Recursor {
     ) -> Result<(Message, NsContext), RecurseError> {
         let honor = cd && !self.ignore_cd;
         with_honor_cd(honor, || self.resolve_collect(qname, qtype))
+    }
+
+    /**
+     * @brief 끝내지 못한 해석을 다른 스레드에서 한 번 더 돌린다. 결과는 버리고 캐시만 남는다.
+     * @details 같은 질의는 한 번만 돌리고, 동시에 돌리는 수는 MAX_BACKGROUND_COMPLETIONS를
+     *          넘지 않는다. 뒤에서 돌리는 해석이 실패해도 다시 뒤로 넘기지 않는다.
+     */
+    pub fn complete_in_background(
+        self: &std::sync::Arc<Self>,
+        qname: Name,
+        qtype: RecordType,
+        cd: bool,
+    ) {
+        let key = (qname.canonical_key(), qtype);
+        {
+            let mut running = self.background.lock_recover();
+            if running.len() >= MAX_BACKGROUND_COMPLETIONS || !running.insert(key.clone()) {
+                return;
+            }
+        }
+        let this = std::sync::Arc::clone(self);
+        let task_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("recurse-complete".into())
+            .spawn(move || {
+                rtrace!(
+                    "Finishing an unfinished recursion in the background: name={}, type={:?}",
+                    qname.to_ascii_lower(),
+                    qtype
+                );
+                let _ = this.resolve_once_cd(&qname, qtype, cd);
+                this.background.lock_recover().remove(&task_key);
+            });
+        if spawned.is_err() {
+            self.background.lock_recover().remove(&key);
+        }
     }
 
     /** @brief 해석하고 거쳐 온 네임서버도 함께 돌려준다. */
@@ -1108,7 +1249,7 @@ impl Recursor {
             qtype,
             self.validating()
         );
-        let (resp, chain) = self.iterate(qname, qtype, &mut budget)?;
+        let (resp, chain) = self.iterate(qname, qtype, &mut budget, self.validating())?;
 
         let ns = NsContext::from_chain(&chain);
 
@@ -1219,7 +1360,7 @@ impl Recursor {
             SecurityStatus::Insecure
         };
         let (mut tail, tail_status) =
-            self.resolve_inner(&target, qtype, cname_depth, dname_depth, &mut budget)?;
+            self.resolve_inner(&target, qtype, cname_depth, dname_depth, &mut budget, true)?;
         merged.append(&mut tail.answers);
         tail.answers = merged;
         tail.questions = resp.questions.clone();
@@ -1246,6 +1387,8 @@ impl Recursor {
      * @brief 별칭을 따라가며 재귀적으로 해석한다.
      * @details 체인 깊이를 인자로 물려받아 예산을 이어 쓴다. 깊이를 새로 세면 별칭이
      *          별칭을 부르는 체인에서 상한이 무의미해진다.
+     * @param validate 거짓이면 DS를 모으지도 검증하지도 않고 Insecure로 돌려준다. 결과를 판정에
+     *                 쓰지 않는 네임서버 주소 풀기만 끈다.
      */
     fn resolve_inner(
         &self,
@@ -1254,6 +1397,7 @@ impl Recursor {
         cname_depth: usize,
         dname_depth: usize,
         budget: &mut Budget,
+        validate: bool,
     ) -> Result<(Message, SecurityStatus), RecurseError> {
         if cname_depth > self.max_cnames {
             return Err(RecurseError::TooManyCnames);
@@ -1261,10 +1405,11 @@ impl Recursor {
         if dname_depth > self.max_dnames {
             return Err(RecurseError::TooManyDnames);
         }
-        let (mut resp, chain) = self.iterate(qname, qtype, budget)?;
+        let validate = validate && self.validating();
+        let (mut resp, chain) = self.iterate(qname, qtype, budget, validate)?;
 
         if let Some((dname_record, target, synthetic_cname)) = dname_rewrite(&resp, qname) {
-            let dname_status = if self.validating() {
+            let dname_status = if validate {
                 self.validate_answer_status(
                     &dname_record.name,
                     RecordType::DNAME,
@@ -1275,8 +1420,14 @@ impl Recursor {
             } else {
                 SecurityStatus::Insecure
             };
-            let (mut tail, tail_status) =
-                self.resolve_inner(&target, qtype, cname_depth, dname_depth + 1, budget)?;
+            let (mut tail, tail_status) = self.resolve_inner(
+                &target,
+                qtype,
+                cname_depth,
+                dname_depth + 1,
+                budget,
+                validate,
+            )?;
             let mut merged = alias_rrset_records(&resp, &dname_record.name, RecordType::DNAME);
             merged.push(synthetic_cname);
             merged.append(&mut tail.answers);
@@ -1286,7 +1437,7 @@ impl Recursor {
         }
 
         if has_direct_qtype_answer(&resp, qname, qtype) {
-            let status = if self.validating() {
+            let status = if validate {
                 self.validate_answer_status(qname, qtype, &resp, &chain, budget.deadline)
             } else {
                 SecurityStatus::Insecure
@@ -1295,7 +1446,7 @@ impl Recursor {
             return Ok((resp, status));
         }
         if resp.header.rcode == ResponseCode::NXDomain.0 {
-            let status = if self.validating() {
+            let status = if validate {
                 self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline)
             } else {
                 SecurityStatus::Insecure
@@ -1310,7 +1461,7 @@ impl Recursor {
             return Ok((resp, status));
         }
         if let Some(target) = cname_target(&resp, qname) {
-            let cname_status = if self.validating() {
+            let cname_status = if validate {
                 self.validate_answer_status(
                     qname,
                     RecordType::CNAME,
@@ -1321,8 +1472,14 @@ impl Recursor {
             } else {
                 SecurityStatus::Insecure
             };
-            let (mut tail, tail_status) =
-                self.resolve_inner(&target, qtype, cname_depth + 1, dname_depth, budget)?;
+            let (mut tail, tail_status) = self.resolve_inner(
+                &target,
+                qtype,
+                cname_depth + 1,
+                dname_depth,
+                budget,
+                validate,
+            )?;
             let mut merged = alias_rrset_records(&resp, qname, RecordType::CNAME);
             merged.append(&mut tail.answers);
             tail.answers = merged;
@@ -1330,7 +1487,7 @@ impl Recursor {
             return Ok((tail, cname_status.combine(tail_status)));
         }
 
-        let status = if self.validating() {
+        let status = if validate {
             self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline)
         } else {
             SecurityStatus::Insecure
@@ -1951,8 +2108,15 @@ impl Recursor {
             Ok(l) => l,
 
             Err(error) => {
-                onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "Could not build the chain of trust; treating as bogus");
-                return Err(SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS));
+                onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "Could not fetch the keys for the chain of trust; answering SERVFAIL");
+                // 체인을 만들지 못하는 것은 DNSKEY 를 받지 못했을 때뿐이다. 서명이 깨졌는지는
+                // 알 수 없으므로, 서명이 깨졌다고 알리면 운영자가 엉뚱한 영역을 살핀다.
+                return Err(SecurityStatus::Bogus(match error {
+                    RecurseError::NoResponse | RecurseError::NoReachableNs => {
+                        ede_code::NO_REACHABLE_AUTHORITY
+                    }
+                    _ => ede_code::DNSSEC_BOGUS,
+                }));
             }
         };
         if self.chain_has_excessive_nsec3(&links) {
@@ -2001,14 +2165,17 @@ impl Recursor {
      *          시도가 실패하면 그 경로를 지우고 루트부터 다시 한다.
      * @note 다시 시도할 때 부수 질의 예산을 되돌린다. 되돌리지 않으면 캐시가 오래된 것뿐인데
      *       예산 부족으로 SERVFAIL이 나간다.
+     * @param validate 거짓이면 DS를 모으지 않고, 캐시된 위임에서 시작할 때 검증된 키를 요구하지
+     *                 않는다.
      */
     fn iterate(
         &self,
         qname: &Name,
         qtype: RecordType,
         budget: &mut Budget,
+        validate: bool,
     ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
-        let validated_start_ok = |zone: &Name| self.validated_start_ok(zone);
+        let validated_start_ok = |zone: &Name| !validate || self.validated_start_ok(zone);
         {
             if let Some((zone, servers)) = self
                 .deepest_cached_delegation(qname)
@@ -2021,7 +2188,7 @@ impl Recursor {
                     qname.to_ascii_lower()
                 );
                 let saved = budget.ns_resolves;
-                match self.iterate_from(qname, qtype, budget, zone.clone(), servers) {
+                match self.iterate_from(qname, qtype, budget, zone.clone(), servers, validate) {
                     Ok(v) if validated_start_ok(v.1.last().map_or(&zone, |s| &s.zone)) => {
                         return Ok(v)
                     }
@@ -2041,7 +2208,14 @@ impl Recursor {
                 }
             }
         }
-        self.iterate_from(qname, qtype, budget, Name::root(), self.roots.clone())
+        self.iterate_from(
+            qname,
+            qtype,
+            budget,
+            Name::root(),
+            self.roots.clone(),
+            validate,
+        )
     }
 
     /**
@@ -2059,13 +2233,14 @@ impl Recursor {
         budget: &mut Budget,
         start_zone: Name,
         start_servers: Vec<SocketAddr>,
+        validate: bool,
     ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
         let ctx = IterationContext {
             qname,
             qtype,
             total: qname.num_labels(),
             do_bit: true,
-            collect_ds: self.validating(),
+            collect_ds: validate,
         };
         let mut state = IterationState::start(start_zone, start_servers);
         let mut referrals = 0usize;
@@ -2083,35 +2258,54 @@ impl Recursor {
             }
             budget.queries -= 1;
 
-            let resp = match self.query_any(
-                &state.servers,
-                &make_query(&plan.mname, plan.mtype, ctx.do_bit),
-                &state.zone,
-                budget.deadline,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    rtrace!(
-                        "Recursive query failed: name={}, type={:?}, final_step={}, error={:?}, nameservers={}, zone={}",
-                        plan.mname.to_ascii_lower(),
-                        plan.mtype,
-                        plan.is_final,
-                        e,
-                        state.servers.len(),
-                        state.zone.to_ascii_lower()
-                    );
-                    return Err(e);
+            let resp = loop {
+                let error = match self.query_any_reserving(
+                    &state.servers,
+                    &make_query(&plan.mname, plan.mtype, ctx.do_bit),
+                    &state.zone,
+                    budget.deadline,
+                    state.unresolved_ns.len(),
+                ) {
+                    Ok(r) => break r,
+                    Err(e) => e,
+                };
+                // 이 영역의 서버가 모두 답하지 않았다. 남겨 둔 네임서버 이름이 있으면 그 주소로
+                // 다시 묻는다.
+                if budget.queries > 0 && self.resolve_more_ns_addrs(&mut state, budget) {
+                    budget.queries -= 1;
+                    continue;
                 }
+                rtrace!(
+                    "Recursive query failed: name={}, type={:?}, final_step={}, error={:?}, nameservers={}, zone={}",
+                    plan.mname.to_ascii_lower(),
+                    plan.mtype,
+                    plan.is_final,
+                    error,
+                    state.servers.len(),
+                    state.zone.to_ascii_lower()
+                );
+                return Err(error);
             };
 
             let mut outcome = self.advance(&mut state, resp, &plan, &ctx);
 
+            if let StepOutcome::NeedDs { missing, pending } = outcome {
+                let mut pending = *pending;
+                pending.ds_evidence = Some(self.fetch_ds_evidence(
+                    &pending.zone,
+                    &state.zone,
+                    &state.servers,
+                    budget,
+                )?);
+                outcome = self.descend(&mut state, &ctx, pending, missing);
+            }
             if let StepOutcome::NeedNsAddrs { missing, pending } = outcome {
                 let mut pending = *pending;
                 match self.resolve_ns_addrs(&missing, budget) {
-                    Ok((extra, side_ttl)) => {
+                    Ok((extra, side_ttl, rest)) => {
                         pending.addrs.extend(extra);
                         pending.address_ttl = min_optional_ttl(pending.address_ttl, side_ttl);
+                        pending.unresolved = rest;
                         outcome = self.finish_referral(&mut state, &ctx, pending);
                     }
                     Err(e) => {
@@ -2136,7 +2330,7 @@ impl Recursor {
                     }
                 }
 
-                StepOutcome::NeedNsAddrs { .. } => unreachable!(),
+                StepOutcome::NeedNsAddrs { .. } | StepOutcome::NeedDs { .. } => unreachable!(),
             }
         }
         rtrace!("Delegation limit exceeded: name={}", qname.to_ascii_lower());
@@ -2212,6 +2406,30 @@ impl Recursor {
             return StepOutcome::Continue;
         }
 
+        if let Some(ns_names) = answer_zone_cut(&resp, plan, &state.zone) {
+            rtrace!(
+                "Found a zone cut in an authoritative NS answer: zone={}",
+                plan.mname.to_ascii_lower()
+            );
+            let (addrs, missing, address_ttl) = self.glue_addrs(&resp, &ns_names, &state.zone);
+            let pending = PendingReferral {
+                zone: plan.mname.clone(),
+                resp,
+                ns_names,
+                addrs,
+                address_ttl,
+                ds_evidence: None,
+                unresolved: Vec::new(),
+            };
+            if ctx.collect_ds {
+                return StepOutcome::NeedDs {
+                    missing,
+                    pending: Box::new(pending),
+                };
+            }
+            return self.descend(state, ctx, pending, missing);
+        }
+
         let (referral_zone, ns_names) = extract_referral(&resp, ctx.qname);
         rtrace!(
             "Checked delegation: zone={:?}, ns_names={}, closer_than_current={}, contains_qname={}",
@@ -2236,31 +2454,10 @@ impl Recursor {
                     ns_names,
                     addrs,
                     address_ttl,
+                    ds_evidence: None,
+                    unresolved: Vec::new(),
                 };
-                // 부모가 준 주소가 하나라도 있으면 그것으로 내려간다. 주소를 이미 쥐고도
-                // 남은 네임서버 이름을 먼저 풀러 가면, 그 하나하나가 다시 루트부터 걷는
-                // 해석이 되어 예산을 전부 소진한다. iana.org가 그랬다. 주소 2개를 손에
-                // 잡은 채 이름 3개를 풀다가 시간이 끝나 SERVFAIL이 나갔다.
-                if !missing_ns.is_empty() && pending.addrs.is_empty() {
-                    rtrace!(
-                        "Looking up addresses of nameservers without glue: need_address={}, have_address={}",
-                        missing_ns.len(),
-                        pending.addrs.len()
-                    );
-
-                    return StepOutcome::NeedNsAddrs {
-                        missing: missing_ns,
-                        pending: Box::new(pending),
-                    };
-                }
-                if !missing_ns.is_empty() {
-                    rtrace!(
-                        "Leaving {} glueless nameservers and descending with the {} addresses already known",
-                        missing_ns.len(),
-                        pending.addrs.len()
-                    );
-                }
-                self.finish_referral(state, ctx, pending)
+                self.descend(state, ctx, pending, missing_ns)
             }
             rejected_referral => {
                 if plan.is_final {
@@ -2295,6 +2492,70 @@ impl Recursor {
     }
 
     /**
+     * @brief 받아들인 경계로 내려간다. 주소를 모르는 네임서버만 있으면 주소부터 풀게 한다.
+     * @param missing glue가 없어 주소를 모르는 네임서버 이름들.
+     */
+    fn descend(
+        &self,
+        state: &mut IterationState,
+        ctx: &IterationContext<'_>,
+        mut pending: PendingReferral,
+        missing: Vec<Name>,
+    ) -> StepOutcome {
+        // 부모가 준 주소가 하나라도 있으면 그것으로 내려간다. 주소를 이미 쥐고도
+        // 남은 네임서버 이름을 먼저 풀러 가면, 그 하나하나가 다시 루트부터 걷는
+        // 해석이 되어 예산을 전부 소진한다. iana.org가 그랬다. 주소 2개를 손에
+        // 잡은 채 이름 3개를 풀다가 시간이 끝나 SERVFAIL이 나갔다.
+        if !missing.is_empty() && pending.addrs.is_empty() {
+            rtrace!(
+                "Looking up addresses of nameservers without glue: need_address={}, have_address={}",
+                missing.len(),
+                pending.addrs.len()
+            );
+
+            return StepOutcome::NeedNsAddrs {
+                missing,
+                pending: Box::new(pending),
+            };
+        }
+        if !missing.is_empty() {
+            rtrace!(
+                "Leaving {} glueless nameservers and descending with the {} addresses already known",
+                missing.len(),
+                pending.addrs.len()
+            );
+            pending.unresolved = missing;
+        }
+        self.finish_referral(state, ctx, pending)
+    }
+
+    /**
+     * @brief 답변 절로 드러난 경계의 DS와 그 부재 증명을 부모 영역의 서버에 묻는다.
+     * @details 자식 영역도 같은 서버가 맡지만 DS는 부모 영역의 데이터이므로 서버가 부모 쪽에서
+     *          답한다. 받은 증거는 참조의 권한 절처럼 체인 검증이 서명으로 확인한다.
+     * @return 답변 절과 권한 절의 레코드. 체인 단계의 DS 증거로 쓴다.
+     */
+    fn fetch_ds_evidence(
+        &self,
+        zone: &Name,
+        parent: &Name,
+        servers: &[SocketAddr],
+        budget: &mut Budget,
+    ) -> Result<Vec<Record>, RecurseError> {
+        if budget.queries == 0 {
+            return Err(RecurseError::TooManyQueries);
+        }
+        budget.queries -= 1;
+        let resp = self.query_any(
+            servers,
+            &make_query(zone, RecordType::DS, true),
+            parent,
+            budget.deadline,
+        )?;
+        Ok(resp.answers.into_iter().chain(resp.authorities).collect())
+    }
+
+    /**
      * @brief 주소가 모인 참조로 실제 이동한다.
      * @details 주소를 정렬해 중복을 없애고 개수를 자른다. 자르지 않으면 주소를 잔뜩 담은
      *          위임 하나가 캐시와 시도 횟수를 함께 부풀린다.
@@ -2312,6 +2573,8 @@ impl Recursor {
             ns_names,
             mut addrs,
             address_ttl,
+            ds_evidence,
+            unresolved,
         } = pending;
         addrs.sort_unstable();
         addrs.dedup();
@@ -2340,7 +2603,7 @@ impl Recursor {
             ds_nsec3_rrsigs,
             ds,
         ) = if ctx.collect_ds {
-            extract_ds(&resp, &nz)
+            extract_ds(ds_evidence.as_deref().unwrap_or(&resp.authorities), &nz)
         } else {
             (vec![], vec![], vec![], vec![], vec![], vec![], vec![])
         };
@@ -2358,6 +2621,7 @@ impl Recursor {
         });
         state.depth = nz.num_labels();
         state.zone = nz;
+        state.unresolved_ns = unresolved;
         StepOutcome::Continue
     }
 
@@ -2414,74 +2678,118 @@ impl Recursor {
     }
 
     /**
-     * @brief glue가 없는 네임서버의 주소를 따로 해석한다.
+     * @brief glue가 없는 네임서버의 주소를 앞에서부터 풀되, 쓸 수 있는 주소가 생기면 멈춘다.
      * @details 이 부수 해석도 같은 예산과 데드라인을 나눠 쓴다. 새로 잡으면 위임 체인 하나가
-     *          질의를 기하급수로 늘린다.
-     * @return 얻은 주소들과 그 최소 TTL.
+     *          질의를 기하급수로 늘린다. 이름을 전부 풀면 느린 서버 하나가 남은 시간을 모두
+     *          가져가, 주소를 쥐고도 정작 그 영역에는 묻지 못한다. 남은 이름은 돌려주고, 받은
+     *          주소들이 모두 답하지 않을 때만 더 푼다.
+     * @note 주소는 어디로 보낼지만 정한다. 답은 체인으로 따로 검증하므로 이 해석은 검증하지
+     *       않는다. 위조된 주소는 틀린 서버로 보낼 뿐이고, 그 서버의 답은 검증에서 걸러진다.
+     * @return 얻은 주소들, 그 최소 TTL, 풀지 않고 남긴 이름들.
      */
     fn resolve_ns_addrs(
         &self,
         ns_names: &[Name],
         budget: &mut Budget,
-    ) -> Result<(Vec<SocketAddr>, Option<u32>), RecurseError> {
+    ) -> Result<(Vec<SocketAddr>, Option<u32>, Vec<Name>), RecurseError> {
         let mut all: Vec<SocketAddr> = Vec::new();
         let mut all_ttl = None;
-        for ns in ns_names {
+        let mut rest = ns_names.iter();
+        let ask_aaaa = self.do_ip6 && ipv6_route_available();
+        for ns in rest.by_ref() {
             let key = ns.canonical_key();
 
             if let Some((addrs, ttl)) = self.ns_addr_cached_with_ttl(&key) {
                 all.extend(addrs.into_iter().map(|ip| SocketAddr::new(ip, self.port)));
                 all_ttl = min_optional_ttl(all_ttl, Some(ttl));
-                continue;
+            } else {
+                if budget.ns_resolves == 0 {
+                    break;
+                }
+                budget.ns_resolves -= 1;
+                let mut resolved: Vec<IpAddr> = Vec::new();
+                let mut min_ttl = u32::MAX;
+                let families = [(self.do_ip4, RecordType::A), (ask_aaaa, RecordType::AAAA)];
+                for (wanted, rtype) in families {
+                    if !wanted {
+                        continue;
+                    }
+                    let Ok((m, _)) = self.resolve_inner(ns, rtype, 0, 0, budget, false) else {
+                        continue;
+                    };
+                    for r in m.answers.iter().filter(|r| r.class == DnsClass::IN) {
+                        let ip = match &r.rdata {
+                            RData::A(ip) => IpAddr::V4(*ip),
+                            RData::Aaaa(ip) => IpAddr::V6(*ip),
+                            _ => continue,
+                        };
+                        resolved.push(ip);
+                        min_ttl = min_ttl.min(r.ttl);
+                    }
+                }
+                if !resolved.is_empty() {
+                    resolved.sort_unstable();
+                    resolved.dedup();
+                    resolved.truncate(MAX_CACHED_NS_ADDRS);
+                    self.ns_addr_store(key, resolved.clone(), min_ttl);
+                    all_ttl = min_optional_ttl(all_ttl, Some(min_ttl));
+                }
+                all.extend(
+                    resolved
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, self.port)),
+                );
             }
-            if budget.ns_resolves == 0 {
+            if all.iter().any(|s| self.usable_server(s.ip())) {
                 break;
             }
-
-            budget.ns_resolves -= 1;
-            let mut resolved: Vec<IpAddr> = Vec::new();
-            let mut min_ttl = u32::MAX;
-            if self.do_ip4 {
-                if let Ok((m, _secure)) = self.resolve_inner(ns, RecordType::A, 0, 0, budget) {
-                    for r in &m.answers {
-                        if r.class == DnsClass::IN {
-                            if let RData::A(ip) = &r.rdata {
-                                resolved.push(IpAddr::V4(*ip));
-                                min_ttl = min_ttl.min(r.ttl);
-                            }
-                        }
-                    }
-                }
-            }
-            if self.do_ip6 {
-                if let Ok((m, _secure)) = self.resolve_inner(ns, RecordType::AAAA, 0, 0, budget) {
-                    for r in &m.answers {
-                        if r.class == DnsClass::IN {
-                            if let RData::Aaaa(ip) = &r.rdata {
-                                resolved.push(IpAddr::V6(*ip));
-                                min_ttl = min_ttl.min(r.ttl);
-                            }
-                        }
-                    }
-                }
-            }
-            if !resolved.is_empty() {
-                resolved.sort_unstable();
-                resolved.dedup();
-                resolved.truncate(MAX_CACHED_NS_ADDRS);
-                self.ns_addr_store(key, resolved.clone(), min_ttl);
-                all_ttl = min_optional_ttl(all_ttl, Some(min_ttl));
-            }
-            all.extend(
-                resolved
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(ip, self.port)),
-            );
         }
-        all.retain(|s| self.family_allowed(s.ip()) && self.is_queryable(s.ip()));
+        all.retain(|s| self.server_eligible(s.ip()));
         all.sort_unstable();
         all.dedup();
-        Ok((all, all_ttl))
+        Ok((all, all_ttl, rest.cloned().collect()))
+    }
+
+    /**
+     * @brief 지금 이 호스트에서 실제로 보낼 수 있는 서버 주소인지.
+     * @details 허용 여부에 더해, IPv6 경로가 없는 호스트의 IPv6 주소는 쓸 수 없는 것으로 본다.
+     *          그런 주소만 쥐고 네임서버 풀기를 멈추면 보낼 곳이 없다.
+     */
+    fn usable_server(&self, ip: IpAddr) -> bool {
+        self.server_eligible(ip) && (ip.is_ipv4() || ipv6_route_available())
+    }
+
+    /**
+     * @brief 지금 영역의 서버가 모두 답하지 않을 때 남겨 둔 네임서버 이름의 주소를 더 푼다.
+     * @return 새 주소를 얻어 서버 목록을 바꿨으면 참.
+     */
+    fn resolve_more_ns_addrs(&self, state: &mut IterationState, budget: &mut Budget) -> bool {
+        while !state.unresolved_ns.is_empty() {
+            let names = std::mem::take(&mut state.unresolved_ns);
+            let Ok((addrs, _, rest)) = self.resolve_ns_addrs(&names, budget) else {
+                return false;
+            };
+            state.unresolved_ns = rest;
+            let fresh: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|addr| !state.servers.contains(addr))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            rtrace!(
+                "Nameservers of {} did not answer; resolved {} more addresses ({} names left)",
+                state.zone.to_ascii_lower(),
+                fresh.len(),
+                state.unresolved_ns.len()
+            );
+            if let Some(step) = state.chain.last_mut() {
+                step.servers.extend(fresh.iter().copied());
+            }
+            state.servers = fresh;
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -2625,60 +2933,114 @@ impl Recursor {
         zone: &Name,
         deadline: Instant,
     ) -> Result<Message, RecurseError> {
+        self.query_any_reserving(servers, q, zone, deadline, 0)
+    }
+
+    /**
+     * @brief query_any와 같되, 아직 주소를 풀지 않은 서버 몫의 시간을 남겨 둔다.
+     * @param reserve 이 목록이 모두 실패하면 이어서 풀어 물어볼 네임서버 이름 수.
+     * @details 서버마다 답을 기다릴 시간(server_patience)이 지나면 앞 서버의 답을 기다리는
+     *          채로 다음 서버에도 묻고, 먼저 온 쓸 만한 답을 쓴다. 앞 서버를 버리고 넘어가면
+     *          조금 느린 서버의 답을 받기 직전에 버리게 되고, 끝까지 기다리면 느린 서버 하나가
+     *          남은 시간을 다 쓴다.
+     * @note 네임서버 주소는 쓸 수 있는 것이 생기면 그만 풀므로 목록이 짧다. 그 몇 개로 시간을
+     *       나누면 죽은 서버 하나가 데드라인을 다 써서 남은 이름으로 넘어가지 못한다.
+     */
+    fn query_any_reserving(
+        &self,
+        servers: &[SocketAddr],
+        q: &Message,
+        zone: &Name,
+        deadline: Instant,
+        reserve: usize,
+    ) -> Result<Message, RecurseError> {
         let mut fallback: Option<Message> = None;
 
         let mut sent = q.clone();
         self.apply_outgoing_case(&mut sent);
 
-        if !servers
-            .iter()
-            .any(|server| self.server_eligible(server.ip()))
-        {
+        let ordered: Vec<SocketAddr> = self
+            .order_by_infra(servers, zone)
+            .into_iter()
+            .filter(|server| self.server_eligible(server.ip()))
+            .collect();
+        if ordered.is_empty() {
             return Err(RecurseError::NoReachableNs);
         }
 
-        let ordered = self.order_by_infra(servers, zone);
         let per_exchange_deadline = Instant::now().checked_add(self.timeout).unwrap_or(deadline);
         let deadline = deadline.min(per_exchange_deadline);
-        let divisor = ordered.len().clamp(1, 4) as u32;
+        let divisor = (ordered.len() + reserve).clamp(1, 4) as u32;
         let per_server = (self.timeout / divisor).max(Duration::from_millis(300));
-        for s in ordered {
-            if !self.server_eligible(s.ip()) {
-                continue;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                rtrace!(
-                    "Ran out of time before asking some of the {} servers: name={}",
-                    servers.len(),
-                    sent.questions
-                        .first()
-                        .map(|q| q.name.to_ascii_lower())
-                        .unwrap_or_default()
-                );
+        let request = std::sync::Arc::new(sent);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut started: Vec<Option<Instant>> = vec![None; ordered.len()];
+        let mut next = 0;
+        let mut in_flight = 0usize;
+        let mut ask_next_at = Instant::now();
+
+        // 교환마다 제한 시간을 데드라인 안에 잡으므로, 이 상한은 교환이 제 시간을 넘기는
+        // 이상한 경우에만 쓰인다.
+        let settled_by = deadline + per_server;
+        loop {
+            let now = Instant::now();
+            let asking = now < deadline;
+            if !asking && (in_flight == 0 || now >= settled_by) {
+                if next < ordered.len() {
+                    rtrace!(
+                        "Ran out of time before asking some of the {} servers: name={}",
+                        servers.len(),
+                        request
+                            .questions
+                            .first()
+                            .map(|q| q.name.to_ascii_lower())
+                            .unwrap_or_default()
+                    );
+                }
                 break;
             }
-            let attempt_timeout = per_server.min(remaining);
-            let start = Instant::now();
-            let transport = if self.authority_over_tcp() {
-                onetdns_forward::AuthorityTransport::Tcp
+            if asking
+                && next < ordered.len()
+                && (in_flight == 0 || (now >= ask_next_at && in_flight < MAX_EXCHANGES_PER_QUERY))
+            {
+                let server = ordered[next];
+                let attempt_timeout = per_server.min(deadline - now);
+                self.spawn_attempt(server, &request, attempt_timeout, next, &tx);
+                started[next] = Some(now);
+                next += 1;
+                in_flight += 1;
+                ask_next_at = now + self.server_patience(server.ip()).min(per_server);
+                continue;
+            }
+            if in_flight == 0 {
+                break;
+            }
+            // 데드라인이 지나면 새로 묻지 않고, 이미 보낸 교환이 끝나 결과를 보낼 때까지만
+            // 기다린다. 끝나기 전에 돌아가면 그 교환이 아직 진행 중으로 남아, 곧 같은 질의를 다시
+            // 보내는 쪽이 끝나 가는 교환에 합쳐져 함께 시간 초과로 끝난다.
+            let wake = if !asking {
+                settled_by
+            } else if next < ordered.len() && in_flight < MAX_EXCHANGES_PER_QUERY {
+                ask_next_at.min(deadline)
             } else {
-                onetdns_forward::AuthorityTransport::Udp
+                deadline
             };
-            let result = onetdns_forward::query_server_over(
-                s,
-                &sent,
-                attempt_timeout,
-                transport,
-                self.caps_for_id,
-            );
+            let Ok((idx, result)) = rx.recv_timeout(wake.saturating_duration_since(now)) else {
+                continue;
+            };
+            in_flight -= 1;
+            let s = ordered[idx];
+            let elapsed = started[idx]
+                .take()
+                .map_or(Duration::ZERO, |at| at.elapsed());
             match result {
                 Ok(r) => {
-                    if self.caps_for_id && !questions_case_exact(&r.questions, &sent.questions) {
+                    if self.caps_for_id && !questions_case_exact(&r.questions, &request.questions) {
                         rtrace!(
                             "{} did not echo the query name case; dropping: sent={}, got={}",
                             s,
-                            sent.questions
+                            request
+                                .questions
                                 .first()
                                 .map(|q| q.name.to_string())
                                 .unwrap_or_default(),
@@ -2688,32 +3050,105 @@ impl Recursor {
                                 .unwrap_or_default()
                         );
                         self.infra_fail(s.ip(), zone);
+                        ask_next_at = Instant::now();
                         continue;
                     }
-                    if response_usable_for_iteration(&r, &sent, zone) {
-                        self.infra_success(s.ip(), zone, start.elapsed());
+                    if response_usable_for_iteration(&r, &request, zone) {
+                        self.infra_success(s.ip(), zone, elapsed);
+                        self.record_unanswered(&ordered, &started);
                         return Ok(r);
                     }
 
                     self.infra_protocol_error(s.ip(), zone);
                     fallback = Some(r);
+                    ask_next_at = Instant::now();
                 }
                 Err(error) => {
                     rtrace!(
                         "Asked {} but got no answer: name={}, type={:?}, error={:?}",
                         s,
-                        sent.questions
+                        request
+                            .questions
                             .first()
                             .map(|q| q.name.to_ascii_lower())
                             .unwrap_or_default(),
-                        sent.questions.first().map(|q| q.qtype),
+                        request.questions.first().map(|q| q.qtype),
                         error
                     );
-                    self.infra_fail(s.ip(), zone)
+                    self.infra_fail(s.ip(), zone);
+                    ask_next_at = Instant::now();
                 }
             }
         }
+        self.record_unanswered(&ordered, &started);
         fallback.ok_or(RecurseError::NoResponse)
+    }
+
+    /**
+     * @brief 서버 하나에 묻는 교환을 따로 돌리고 결과를 채널로 보낸다.
+     * @details 부른 쪽은 이 교환을 기다리는 동안 다른 서버에도 물을 수 있어야 한다. 부른 쪽이
+     *          먼저 끝나 채널을 닫아도 교환은 자기 제한 시간 안에 끝나고 결과만 버려진다.
+     *          스레드를 만들지 못하면 이 자리에서 직접 묻는다.
+     * @note 전송은 교환마다 새로 고른다. UDP 53번 가로채기 판정은 해석 도중에도 켜지며, 켜진
+     *       뒤에 UDP로 보낸 질의는 답을 받지 못한다.
+     */
+    fn spawn_attempt(
+        &self,
+        server: SocketAddr,
+        request: &std::sync::Arc<Message>,
+        timeout: Duration,
+        idx: usize,
+        tx: &std::sync::mpsc::Sender<(usize, Result<Message, onetdns_forward::ForwardError>)>,
+    ) {
+        let merge_case = self.caps_for_id;
+        let transport = if self.authority_over_tcp() {
+            onetdns_forward::AuthorityTransport::Tcp
+        } else {
+            onetdns_forward::AuthorityTransport::Udp
+        };
+        let attempt = {
+            let request = request.clone();
+            let tx = tx.clone();
+            move || {
+                let result = onetdns_forward::query_server_over(
+                    server, &request, timeout, transport, merge_case,
+                );
+                let _ = tx.send((idx, result));
+            }
+        };
+        if std::thread::Builder::new()
+            .name("recurse-exchange".into())
+            .spawn(attempt)
+            .is_err()
+        {
+            let result =
+                onetdns_forward::query_server_over(server, request, timeout, transport, merge_case);
+            let _ = tx.send((idx, result));
+        }
+    }
+
+    /**
+     * @brief 답을 받기 전에 그만 기다린 서버들의 왕복 시간을 기다린 시간 이상으로 기록한다.
+     * @param started 서버마다 아직 답을 기다리던 교환의 시작 시각.
+     */
+    fn record_unanswered(&self, ordered: &[SocketAddr], started: &[Option<Instant>]) {
+        for (server, at) in ordered.iter().zip(started) {
+            if let Some(at) = at {
+                self.record_rtt_at_least(server.ip(), at.elapsed());
+            }
+        }
+    }
+
+    /**
+     * @brief 이 서버의 답을 기다렸다가 다음 서버에도 물을 때까지의 시간.
+     * @details 잰 왕복 시간이 있으면 그 세 배다. RFC 6298이 첫 측정 뒤에 잡는 재전송 시간과
+     *          같은 값으로, 평소의 흔들림으로는 넘지 않는다.
+     */
+    fn server_patience(&self, ip: IpAddr) -> Duration {
+        match self.srtt(ip) {
+            Some(ms) => Duration::from_millis(u64::from(ms) * 3).max(MIN_SERVER_PATIENCE),
+            None => UNKNOWN_SERVER_PATIENCE,
+        }
     }
 
     /**
@@ -2723,6 +3158,7 @@ impl Recursor {
      */
     fn order_by_infra(&self, servers: &[SocketAddr], zone: &Name) -> Vec<SocketAddr> {
         let infra = self.infra.lock_recover();
+        let rtt = self.rtt.lock_recover();
         let now = Instant::now();
 
         let eligible: Vec<SocketAddr> = servers
@@ -2730,20 +3166,21 @@ impl Recursor {
             .copied()
             .filter(|server| self.family_allowed(server.ip()))
             .collect();
+        let score = |server: &SocketAddr| {
+            let key = InfraKey::new(server.ip(), zone);
+            (
+                self.family_rank(server.ip()),
+                infra_score(infra.peek(&key), rtt.peek(&server.ip()).copied(), now),
+                *server,
+            )
+        };
         let mut ready: Vec<(u8, u64, SocketAddr)> = eligible
             .iter()
             .filter(|server| {
                 let key = InfraKey::new(server.ip(), zone);
                 !infra_is_cooling(&infra, &key, now)
             })
-            .map(|server| {
-                let key = InfraKey::new(server.ip(), zone);
-                (
-                    self.family_rank(server.ip()),
-                    infra_score(&infra, &key, now),
-                    *server,
-                )
-            })
+            .map(score)
             .collect();
 
         if ready.is_empty() {
@@ -2754,35 +3191,52 @@ impl Recursor {
                     .and_then(|state| state.last_fail)
                     .unwrap_or_else(Instant::now)
             }) {
-                let key = InfraKey::new(server.ip(), zone);
-                ready.push((
-                    self.family_rank(server.ip()),
-                    infra_score(&infra, &key, now),
-                    *server,
-                ));
+                ready.push(score(server));
             }
         }
+        drop(rtt);
         drop(infra);
         ready.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         ready.into_iter().map(|(_, _, server)| server).collect()
     }
 
+    /** @brief 이 주소가 재 본 적 있는 왕복 시간. 처음 보는 주소면 없다. */
+    fn srtt(&self, ip: IpAddr) -> Option<u32> {
+        self.rtt.lock_recover().peek(&ip).copied()
+    }
+
     /**
-     * @brief 성공을 기록하고 왕복 시간을 갱신한다.
+     * @brief 왕복 시간 측정 하나를 반영한다.
      * @note 지수 평활이라 새 측정이 8분의 1만 반영된다. 한 번 느렸다고 순위가 뒤집히지 않는다.
      */
-    fn infra_success(&self, ip: IpAddr, zone: &Name, rtt: Duration) {
-        let key = InfraKey::new(ip, zone);
-        let ms = rtt.as_millis().min(u32::MAX as u128) as u32;
-        let mut infra = self.infra.lock_recover();
-        let mut state = infra.pop(&key).unwrap_or_default();
-        state.srtt_ms = Some(match state.srtt_ms {
-            Some(old) => (old * 7 + ms) / 8,
+    fn record_rtt(&self, ip: IpAddr, sample: Duration) {
+        let ms = sample.as_millis().min(u128::from(u32::MAX)) as u32;
+        let mut rtt = self.rtt.lock_recover();
+        let smoothed = match rtt.peek(&ip) {
+            Some(&old) => ((u64::from(old) * 7 + u64::from(ms)) / 8) as u32,
             None => ms,
-        });
-        state.last_fail = None;
-        state.last_protocol_error = None;
-        infra.put(key, state);
+        };
+        rtt.put(ip, smoothed);
+    }
+
+    /**
+     * @brief 답을 기다리던 중에 다른 서버의 답을 받아 그만 기다린 서버를 기록한다.
+     * @details 이 서버의 왕복 시간은 적어도 기다린 시간만큼이다. 이것을 남기지 않으면 처음 보는
+     *          서버로 남아 다음 질의에서도 가장 먼저 물어진다.
+     */
+    fn record_rtt_at_least(&self, ip: IpAddr, waited: Duration) {
+        if self
+            .srtt(ip)
+            .is_none_or(|known| u128::from(known) < waited.as_millis())
+        {
+            self.record_rtt(ip, waited);
+        }
+    }
+
+    /** @brief 성공을 기록한다. 왕복 시간을 갱신하고 이 zone에서의 실패 기록을 지운다. */
+    fn infra_success(&self, ip: IpAddr, zone: &Name, rtt: Duration) {
+        self.record_rtt(ip, rtt);
+        self.infra.lock_recover().pop(&InfraKey::new(ip, zone));
     }
 
     /** @brief 프로토콜 오류를 기록한다. 응답은 왔으므로 전송 실패와는 다르게 센다. */
@@ -2816,31 +3270,28 @@ fn infra_is_cooling(infra: &LruMap<InfraKey, InfraStat>, key: &InfraKey, now: In
  * @brief 서버 점수. 낮을수록 먼저 시도한다.
  * @details 왕복 시간에 실패 벌점을 더한다. 벌점을 크게 잡아 실패한 서버가 뒤로 가지만,
  *          완전히 배제하지는 않아 냉각이 끝나면 자연히 돌아온다.
+ * @param state 이 서버와 zone 쌍의 실패 기록.
+ * @param srtt_ms 이 주소의 평활 왕복 시간. 재 본 적 없으면 없다.
  */
-fn infra_score(infra: &LruMap<InfraKey, InfraStat>, key: &InfraKey, now: Instant) -> u64 {
-    match infra.peek(key) {
-        Some(state) => {
-            let base = state.srtt_ms.unwrap_or(DEFAULT_RTT_MS) as u64;
-            let transport_penalty = match state.last_fail {
-                Some(failed_at)
-                    if now.saturating_duration_since(failed_at) < INFRA_FAIL_COOLDOWN =>
-                {
-                    INFRA_FAIL_PENALTY_MS
-                }
-                _ => 0,
-            };
-            let protocol_penalty = match state.last_protocol_error {
-                Some(failed_at)
-                    if now.saturating_duration_since(failed_at) < INFRA_FAIL_COOLDOWN =>
-                {
-                    INFRA_PROTOCOL_PENALTY_MS
-                }
-                _ => 0,
-            };
-            base + transport_penalty + protocol_penalty
-        }
-        None => DEFAULT_RTT_MS as u64,
-    }
+fn infra_score(state: Option<&InfraStat>, srtt_ms: Option<u32>, now: Instant) -> u64 {
+    let base = u64::from(srtt_ms.unwrap_or(DEFAULT_RTT_MS));
+    let Some(state) = state else {
+        return base;
+    };
+    let recent = |at: Option<Instant>| {
+        at.is_some_and(|at| now.saturating_duration_since(at) < INFRA_FAIL_COOLDOWN)
+    };
+    let transport_penalty = if recent(state.last_fail) {
+        INFRA_FAIL_PENALTY_MS
+    } else {
+        0
+    };
+    let protocol_penalty = if recent(state.last_protocol_error) {
+        INFRA_PROTOCOL_PENALTY_MS
+    } else {
+        0
+    };
+    base + transport_penalty + protocol_penalty
 }
 
 /**
@@ -2975,10 +3426,10 @@ fn test_thread_validation_bogus_total() -> u64 {
  *          깨진 것과 이 서버가 계산을 거부한 것은 대응이 다르다.
  */
 fn ede_text_for(code: u16) -> &'static str {
-    if code == ede_code::UNSUPPORTED_NSEC3_ITERATIONS {
-        "NSEC3 iterations above local limit"
-    } else {
-        "DNSSEC validation failed"
+    match code {
+        ede_code::UNSUPPORTED_NSEC3_ITERATIONS => "NSEC3 iterations above local limit",
+        ede_code::NO_REACHABLE_AUTHORITY => "Could not fetch the DNSSEC keys from the authority",
+        _ => "DNSSEC validation failed",
     }
 }
 
@@ -2988,7 +3439,11 @@ fn ede_text_for(code: u16) -> &'static str {
  *       쓸 수 있다.
  */
 fn bogus_servfail(template: &Message, ede: u16) -> Message {
-    record_validation_bogus();
+    // 키를 받지 못한 것은 권한 서버에 닿지 못한 것이지 검증이 실패한 것이 아니다. 검증 실패
+    // 지표에 섞으면 망 장애가 서명 문제로 보인다.
+    if ede != ede_code::NO_REACHABLE_AUTHORITY {
+        record_validation_bogus();
+    }
     let mut sf = Message::default();
     sf.header.id = template.header.id;
     sf.header.rcode = ResponseCode::ServFail.0;
@@ -3095,9 +3550,12 @@ fn questions_case_exact(resp: &[Question], sent: &[Question]) -> bool {
     })
 }
 
-/** @brief 참조 응답에서 DS와 그 부재 증명, 서명을 추출한다. 체인 단계에 기록된다. */
+/**
+ * @brief DS와 그 부재 증명, 서명을 추출한다. 체인 단계에 기록된다.
+ * @param records 참조 응답의 권한 절, 또는 부모에게 따로 물은 DS 응답의 레코드.
+ */
 fn extract_ds(
-    resp: &Message,
+    records: &[Record],
     child_zone: &Name,
 ) -> (
     Vec<Record>,
@@ -3117,7 +3575,7 @@ fn extract_ds(
     let mut ds_rrsig_ttl = None;
     let mut nsec_owners = HashSet::new();
     let mut nsec3_owners = HashSet::new();
-    for r in &resp.authorities {
+    for r in records {
         if r.class != DnsClass::IN {
             continue;
         }
@@ -3136,7 +3594,7 @@ fn extract_ds(
     }
 
     let mut sigs = Vec::new();
-    for record in &resp.authorities {
+    for record in records {
         if record.class != DnsClass::IN || record.rtype != RecordType::RRSIG {
             continue;
         }
@@ -3164,6 +3622,39 @@ fn extract_ds(
         }
     }
     (recs, sigs, nsec, nsec_sigs, nsec3, nsec3_sigs, ds)
+}
+
+/**
+ * @brief 이 호스트에 전역 IPv6 경로가 있는지.
+ * @details UDP 소켓의 connect는 경로만 고르고 패킷을 보내지 않으므로, 경로가 없으면 네트워크
+ *          도달 불가로 바로 실패한다. 경로가 없는 호스트에서 AAAA를 풀면 쓸 수 없는 주소를
+ *          얻으려고 시간만 쓴다. 망은 바뀔 수 있으므로 판정은 30초만 쓴다.
+ * @note 대상은 a.root-servers.net 의 IPv6 주소다. 전역 경로가 있는지만 보므로 응답은 필요 없다.
+ */
+fn ipv6_route_available() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /** @brief 판정을 다시 할 간격(초). */
+    const RECHECK_SECS: u64 = 30;
+    /** @brief 마지막 판정 시각(Unix 초)을 위 비트에, 결과를 맨 아래 비트에 담는다. 0이면 판정 전이다. */
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last >> 1) < RECHECK_SECS {
+        return last & 1 == 1;
+    }
+    let probe = SocketAddr::new(
+        IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0x503, 0xba3e, 0, 0, 0, 2, 0x30,
+        )),
+        53,
+    );
+    let available = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+        .and_then(|sock| sock.connect(probe))
+        .is_ok();
+    LAST.store((now << 1) | u64::from(available), Ordering::Relaxed);
+    available
 }
 
 /** @brief 현재 Unix 초. 서명 유효 기간 판정에 쓴다. */
@@ -3301,10 +3792,14 @@ fn min_optional_ttl(left: Option<u32>, right: Option<u32>) -> Option<u32> {
     }
 }
 
-/** @brief 참조의 NS 레코드 중 최소 TTL. 위임 캐시 기간이 된다. */
+/**
+ * @brief 경계의 NS 레코드 중 최소 TTL. 위임 캐시 기간이 된다.
+ * @note 참조면 권한 절에, 권한 있는 답으로 드러난 경계면 답변 절에 있다.
+ */
 fn min_ns_ttl(resp: &Message, zone: &Name) -> Option<u32> {
     resp.authorities
         .iter()
+        .chain(&resp.answers)
         .filter(|r| {
             r.class == DnsClass::IN && r.rtype == RecordType::NS && r.name.eq_ignore_case(zone)
         })
@@ -3353,6 +3848,39 @@ fn extract_referral(resp: &Message, qname: &Name) -> (Option<Name>, Vec<Name>) {
         })
         .collect();
     (Some(zone), ns)
+}
+
+/**
+ * @brief 최소화 질의에 온 권한 있는 NS 답이 현재 영역 아래의 경계를 드러내는지.
+ * @details 부모와 자식 영역을 같은 서버가 맡으면 서버는 자식 영역으로 답하므로, 경계의 NS가
+ *          참조의 권한 절이 아니라 답변 절에 온다. RFC 9156은 이 답도 경계로 다룬다. 따라가지
+ *          않으면 현재 영역을 부모로 잘못 알아, 자식 영역의 SOA가 붙은 부정 응답을 무관한
+ *          것으로 버린다.
+ * @note 물은 이름이 현재 영역보다 깊어야 한다. 현재 영역의 꼭대기 NS는 경계가 아니다.
+ * @return 경계면 그 영역의 네임서버 이름들.
+ */
+fn answer_zone_cut(resp: &Message, plan: &NextQuery, zone: &Name) -> Option<Vec<Name>> {
+    if plan.is_final
+        || plan.mtype != RecordType::NS
+        || resp.header.rcode != ResponseCode::NoError.0
+        || !resp.header.authoritative
+        || !is_closer(&plan.mname, zone)
+    {
+        return None;
+    }
+    let ns: Vec<Name> = resp
+        .answers
+        .iter()
+        .filter_map(|record| match &record.rdata {
+            RData::Ns(target)
+                if record.class == DnsClass::IN && record.name.eq_ignore_case(&plan.mname) =>
+            {
+                Some(target.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    (!ns.is_empty()).then_some(ns)
 }
 
 /** @brief 이 서버가 물은 이름과 타입에 대한 답이 실제로 있는지. */
@@ -4219,7 +4747,8 @@ mod tests {
         let mut response = Message::default();
         response.authorities = vec![ds_record, signature_record];
 
-        let (ds_records, ds_rrsigs, _, _, _, _, parsed_ds) = extract_ds(&response, &child);
+        let (ds_records, ds_rrsigs, _, _, _, _, parsed_ds) =
+            extract_ds(&response.authorities, &child);
         assert_eq!(ds_records[0].ttl, 7);
         assert_eq!(ds_rrsigs.len(), 1);
         assert_eq!(parsed_ds, vec![ds]);
@@ -4259,7 +4788,7 @@ mod tests {
         let mut response = Message::default();
         response.authorities = vec![nsec.clone(), nsec, signature];
 
-        let (_, _, nsecs, nsec_sigs, _, _, _) = extract_ds(&response, &child);
+        let (_, _, nsecs, nsec_sigs, _, _, _) = extract_ds(&response.authorities, &child);
         assert_eq!(nsecs.len(), 2, "입력 RR은 손실 없이 보존한다");
         assert_eq!(
             nsec_sigs.len(),
@@ -4337,13 +4866,21 @@ mod tests {
 
         rec.infra_fail(ip1, &a);
         rec.infra_fail(ip1, &b);
-        rec.infra_success(ip1, &a, Duration::from_millis(10));
+        rec.infra_protocol_error(ip1, &a);
         rec.infra_fail(ip1, &c);
         let infra = rec.infra.lock_recover();
         assert!(infra.peek(&InfraKey::new(ip1, &a)).is_some());
         assert!(infra.peek(&InfraKey::new(ip1, &b)).is_none());
         assert!(infra.peek(&InfraKey::new(ip1, &c)).is_some());
         assert_eq!(infra.len(), 2);
+        drop(infra);
+
+        let ip3 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+        rec.record_rtt(ip1, Duration::from_millis(10));
+        rec.record_rtt(ip2, Duration::from_millis(10));
+        rec.record_rtt(ip3, Duration::from_millis(10));
+        assert!(rec.srtt(ip1).is_none());
+        assert_eq!(rec.rtt.lock_recover().len(), 2);
 
         let key1 = name_key("key1.test");
         let key2 = name_key("key2.test");
@@ -4804,21 +5341,18 @@ mod tests {
         let ip: IpAddr = "8.8.4.4".parse().unwrap();
         let zone = Name::from_str("example").unwrap();
         let key = InfraKey::new(ip, &zone);
+        let score = |r: &Recursor| {
+            infra_score(
+                r.infra.lock_recover().peek(&key),
+                r.srtt(ip),
+                Instant::now(),
+            )
+        };
         r.infra_fail(ip, &zone);
-        {
-            let infra = r.infra.lock_recover();
-            assert!(
-                infra_score(&infra, &key, Instant::now()) >= INFRA_FAIL_PENALTY_MS,
-                "실패는 큰 점수"
-            );
-        }
+        assert!(score(&r) >= INFRA_FAIL_PENALTY_MS, "실패는 큰 점수");
 
         r.infra_success(ip, &zone, Duration::from_millis(10));
-        let infra = r.infra.lock_recover();
-        assert!(
-            infra_score(&infra, &key, Instant::now()) < 100,
-            "성공 후 작은 점수"
-        );
+        assert!(score(&r) < 100, "성공 후 작은 점수");
     }
 
     #[test]
@@ -4893,6 +5427,27 @@ mod tests {
             recursor.order_by_infra(&[server], &zone),
             vec![server],
             "SERVFAIL/REFUSED/lame response must remain a DNS response, not transport outage"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 한 zone에서 잰 왕복 시간을 다른 zone에서도 쓰는지.
+     * @details 부모와 자식 zone을 같은 서버가 맡는 일이 흔하다. 자식 zone에서 느리다고 잰
+     *          서버를 부모 zone에서 처음 보는 서버로 치면, 부모 zone의 DNSKEY를 물을 때 그
+     *          느린 서버에 가장 먼저 묻는다.
+     */
+    fn round_trip_time_is_shared_across_zones() {
+        let recursor = Recursor::new(vec![], Duration::from_millis(100));
+        let slow: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let fresh: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let child = Name::from_str("ris.example").unwrap();
+        let parent = Name::from_str("example").unwrap();
+
+        recursor.infra_success(slow.ip(), &child, Duration::from_millis(800));
+        assert_eq!(
+            recursor.order_by_infra(&[slow, fresh], &parent),
+            vec![fresh, slow]
         );
     }
 
@@ -6338,6 +6893,825 @@ mod tests {
 
     #[test]
     /**
+     * @brief 질의 하나가 동시에 기다리는 교환이 MAX_EXCHANGES_PER_QUERY를 넘지 않는지.
+     * @details 앞의 두 서버는 답하지 않는다. 상한이 없으면 셋째 서버에도 다음 서버에 물을
+     *          시각이 되자마자 묻고, 상한이 있으면 앞의 교환 하나가 시간을 넘긴 뒤에야 묻는다.
+     */
+    fn a_query_waits_on_at_most_two_exchanges_at_once() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5423;
+        let silent = |ip: &str| {
+            let sock = UdpSocket::bind(format!("{ip}:{PORT}")).unwrap();
+            let addr = sock.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while sock.recv_from(&mut buf).is_ok() {}
+            });
+            addr
+        };
+        let first = silent("127.0.0.90");
+        let second = silent("127.0.0.91");
+        let third_sock = UdpSocket::bind(format!("127.0.0.92:{PORT}")).unwrap();
+        let third = third_sock.local_addr().unwrap();
+        let asked_third = Arc::new(Mutex::new(None::<Instant>));
+        let record = asked_third.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while third_sock.recv_from(&mut buf).is_ok() {
+                record.lock().unwrap().get_or_insert_with(Instant::now);
+            }
+        });
+
+        let timeout = Duration::from_secs(4);
+        let rec = Recursor::new(vec![], timeout).with_test_loopback();
+        let zone = Name::from_str("cap.test").unwrap();
+        let query = make_query(
+            &Name::from_str("host.cap.test").unwrap(),
+            RecordType::A,
+            false,
+        );
+        let started = Instant::now();
+        assert!(rec
+            .query_any(&[first, second, third], &query, &zone, rec.query_deadline())
+            .is_err());
+
+        let per_server = timeout / 3;
+        let asked = asked_third
+            .lock()
+            .unwrap()
+            .map(|at| at.duration_since(started))
+            .expect("앞의 교환이 끝나면 셋째 서버에도 물어야 합니다");
+        assert!(
+            asked >= per_server,
+            "앞의 두 교환이 답을 기다리는 동안 셋째 서버에도 물었습니다: {asked:?}"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 답을 기다리는 사이 TCP 판정이 켜지면 다음 서버에는 TCP로 묻는지.
+     * @details 판정은 시작 직후의 점검이 끝날 때 켜지므로, 그 전에 시작한 해석의 도중에 바뀐다.
+     *          서버 목록을 시작할 때 전송을 한 번만 고르면 나머지 서버에도 가로채이는 UDP로
+     *          묻는다.
+     */
+    fn authority_tcp_switch_applies_to_servers_asked_after_it_turns_on() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5422;
+        /** @brief 가로챈 쪽이 UDP로 돌려주는 주소. */
+        const FORGED: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 88);
+        /** @brief 권한 서버가 TCP로 돌려주는 주소. */
+        const REAL: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 88);
+
+        let switch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let silent = UdpSocket::bind("127.0.0.88:5422").unwrap();
+        let first = silent.local_addr().unwrap();
+        let flip = switch.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while silent.recv_from(&mut buf).is_ok() {
+                flip.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let answer = |req: &Message, ip: Ipv4Addr| {
+            let mut m = base(req);
+            m.header.authoritative = true;
+            let q = req.questions.first().unwrap().clone();
+            m.answers.push(Record::new(q.name, 300, RData::A(ip)));
+            m
+        };
+        let second = spawn_server("127.0.0.89", PORT, move |req| answer(req, FORGED));
+        spawn_tcp_server(second, move |req| answer(req, REAL));
+
+        let rec = Recursor::new(vec![], Duration::from_secs(3))
+            .with_test_loopback()
+            .with_authority_tcp(switch);
+        let zone = Name::from_str("switch.test").unwrap();
+        let query = make_query(
+            &Name::from_str("host.switch.test").unwrap(),
+            RecordType::A,
+            false,
+        );
+        let resp = rec
+            .query_any(&[first, second], &query, &zone, rec.query_deadline())
+            .expect("둘째 서버의 답을 받아야 합니다");
+        assert!(
+            matches!(resp.answers.first().map(|r| &r.rdata), Some(RData::A(ip)) if *ip == REAL),
+            "판정이 켜진 뒤에도 UDP로 물어 가로챈 답을 받았습니다: {resp:?}"
+        );
+    }
+
+    /** @brief 부모와 자식 영역 테스트에서 최종 이름이 가리키는 주소. */
+    const COHOSTED_TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
+
+    /**
+     * @brief parent.test와 그 자식 l.parent.test를 한 서버가 맡는 구성을 시작한다.
+     * @details 루트는 parent.test로 위임한다. 영역 서버는 자식 영역의 NS를 권한 있는 답으로
+     *          주고, 빈 비단말 myaddr.l.parent.test를 NXDOMAIN으로 답한다. DS 질의에는 부모
+     *          영역의 DS를 답변 절에 담아 주고, 받은 횟수를 센다.
+     * @return 루트 서버 주소와 DS 질의 횟수.
+     */
+    fn spawn_cohosted_zones(
+        root_ip: Ipv4Addr,
+        zone_ip: Ipv4Addr,
+        port: u16,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        /** @brief 테스트 이름을 만든다. */
+        fn name(text: &str) -> Name {
+            Name::from_str(text).unwrap()
+        }
+        /** @brief 이 영역의 부정 응답에 붙일 SOA. */
+        fn soa(apex: &str) -> Record {
+            Record::new(
+                name(apex),
+                300,
+                RData::soa(onetdns_proto::Soa {
+                    mname: name("ns.parent.test"),
+                    rname: name("hostmaster.parent.test"),
+                    serial: 1,
+                    refresh: 3600,
+                    retry: 600,
+                    expire: 86_400,
+                    minimum: 300,
+                }),
+            )
+        }
+
+        spawn_server(&root_ip.to_string(), port, move |req| {
+            let mut m = base(req);
+            m.authorities.push(Record::new(
+                name("parent.test"),
+                3600,
+                RData::Ns(name("ns.parent.test")),
+            ));
+            m.additionals
+                .push(Record::new(name("ns.parent.test"), 3600, RData::A(zone_ip)));
+            m
+        });
+        let ds_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ds_queries.clone();
+        spawn_server(&zone_ip.to_string(), port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let asked = q.name.to_ascii_lower();
+            let mut m = base(req);
+            m.header.authoritative = true;
+            match (asked.as_str(), q.qtype) {
+                ("l.parent.test", RecordType::NS) => {
+                    m.answers.push(Record::new(
+                        name("l.parent.test"),
+                        3600,
+                        RData::Ns(name("ns.parent.test")),
+                    ));
+                    m.additionals.push(Record::new(
+                        name("ns.parent.test"),
+                        3600,
+                        RData::A(zone_ip),
+                    ));
+                }
+                ("l.parent.test", RecordType::DS) => {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let ds = onetdns_dnssec::Ds {
+                        key_tag: 4321,
+                        algorithm: 13,
+                        digest_type: 2,
+                        digest: vec![5; 32],
+                    };
+                    m.answers.push(Record::new(
+                        name("l.parent.test"),
+                        300,
+                        RData::Unknown(RecordType::DS.0, ds.rdata_bytes()),
+                    ));
+                }
+                ("myaddr.l.parent.test", _) => {
+                    m.header.rcode = ResponseCode::NXDomain.0;
+                    m.authorities.push(soa("l.parent.test"));
+                }
+                ("o-o.myaddr.l.parent.test", RecordType::A) => {
+                    m.answers
+                        .push(Record::new(q.name, 60, RData::A(COHOSTED_TARGET)));
+                }
+                (other, _) if other.ends_with("l.parent.test") => {
+                    m.authorities.push(soa("l.parent.test"));
+                }
+                _ => m.authorities.push(soa("parent.test")),
+            }
+            m
+        });
+        (SocketAddr::new(IpAddr::V4(root_ip), port), ds_queries)
+    }
+
+    #[test]
+    /**
+     * @brief 부모와 자식 영역을 같은 서버가 맡을 때 답변 절의 NS를 영역 경계로 따라가는지.
+     * @details 서버는 자식 영역으로 답하므로 최소화 질의에 대한 NS가 위임이 아니라 권한 있는
+     *          답으로 온다. 경계를 놓치면 현재 영역을 부모로 알아, 자식 영역의 SOA가 붙은
+     *          부정 응답을 무관한 것으로 버리고 SERVFAIL을 낸다. 경계를 따라가야 빈 비단말에
+     *          대한 NXDOMAIN을 받아들이고 전체 이름으로 다시 물을 수 있다.
+     */
+    fn an_authoritative_ns_answer_is_followed_as_a_zone_cut() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5413;
+        let (root, ds_queries) = spawn_cohosted_zones(
+            Ipv4Addr::new(127, 0, 0, 50),
+            Ipv4Addr::new(127, 0, 0, 51),
+            PORT,
+        );
+
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback();
+        let resp = rec
+            .resolve(
+                &Name::from_str("o-o.myaddr.l.parent.test").unwrap(),
+                RecordType::A,
+            )
+            .expect("같은 서버가 맡은 자식 영역으로 내려가 답을 받아야 합니다");
+        assert_eq!(resp.header.rcode, ResponseCode::NoError.0);
+        assert!(
+            resp.answers
+                .iter()
+                .any(|record| matches!(&record.rdata, RData::A(ip) if *ip == COHOSTED_TARGET)),
+            "최종 답을 얻지 못했습니다: {resp:?}"
+        );
+        assert_eq!(
+            ds_queries.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "검증하지 않으면 DS를 따로 묻지 않는다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 검증할 때 답변 절로 드러난 경계의 DS를 부모에게 물어 체인에 넣는지.
+     * @details 참조와 달리 이 경계에는 DS 증거가 함께 오지 않는다. 증거 없이 체인에 넣으면
+     *          서명된 자식 영역이 증명 없이 Insecure로 내려가 검증이 무력화된다.
+     */
+    fn an_answer_zone_cut_fetches_its_ds_when_validating() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5414;
+        let (root, ds_queries) = spawn_cohosted_zones(
+            Ipv4Addr::new(127, 0, 0, 52),
+            Ipv4Addr::new(127, 0, 0, 53),
+            PORT,
+        );
+
+        let anchor = onetdns_dnssec::Ds {
+            key_tag: 1,
+            algorithm: 13,
+            digest_type: 2,
+            digest: vec![1; 32],
+        };
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+        let mut budget = Budget {
+            ns_resolves: rec.max_ns_resolves,
+            queries: MAX_TOTAL_QUERIES,
+            deadline: rec.query_deadline(),
+        };
+        let qname = Name::from_str("o-o.myaddr.l.parent.test").unwrap();
+        let (resp, chain) = rec
+            .iterate_from(
+                &qname,
+                RecordType::A,
+                &mut budget,
+                Name::root(),
+                vec![root],
+                true,
+            )
+            .expect("검증을 켜도 경계를 따라 내려가야 합니다");
+        assert!(resp
+            .answers
+            .iter()
+            .any(|record| matches!(&record.rdata, RData::A(ip) if *ip == COHOSTED_TARGET)));
+        assert_eq!(ds_queries.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let child = chain
+            .iter()
+            .find(|step| step.zone.to_ascii_lower() == "l.parent.test")
+            .expect("자식 영역이 체인에 있어야 합니다");
+        assert_eq!(
+            child.ds.iter().map(|ds| ds.key_tag).collect::<Vec<_>>(),
+            vec![4321],
+            "부모에게 받은 DS가 체인에 기록돼야 합니다"
+        );
+    }
+
+    /**
+     * @brief 서명된 루트, parent.test, l.parent.test를 시작한다. 두 영역은 한 서버가 맡는다.
+     * @details 영역마다 키가 다르다. 자식 영역의 NS는 권한 있는 답으로 주고, 그 DS는 부모 키로
+     *          서명해 DS 질의에만 준다. child_ds_seed로 DS를 만들 키를 고른다. 자식 키와 다르면
+     *          위조된 DS가 된다.
+     * @return 루트 서버 주소와 루트 신뢰 앵커.
+     */
+    fn spawn_signed_cohosted_zones(
+        root_ip: Ipv4Addr,
+        zone_ip: Ipv4Addr,
+        port: u16,
+        child_ds_seed: u8,
+    ) -> (SocketAddr, onetdns_dnssec::Ds) {
+        /** @brief 테스트 이름을 만든다. */
+        fn name(text: &str) -> Name {
+            Name::from_str(text).unwrap()
+        }
+        /** @brief DS를 레코드로 감싼다. */
+        fn ds_rec(owner: &str, key: &onetdns_dnssec::Dnskey) -> Record {
+            let ds = onetdns_dnssec::Ds::from_dnskey(key, &name(owner), 2).unwrap();
+            Record::new(
+                name(owner),
+                3600,
+                RData::Unknown(RecordType::DS.0, ds.rdata_bytes()),
+            )
+        }
+
+        let (root_sk, root_key) = ecdsa_key(71);
+        let (parent_sk, parent_key) = ecdsa_key(72);
+        let (child_sk, child_key) = ecdsa_key(73);
+        let (_, ds_key) = ecdsa_key(child_ds_seed);
+        let anchor = onetdns_dnssec::Ds::from_dnskey(&root_key, &Name::root(), 2).unwrap();
+
+        let root_dnskey = vec![dnskey_rec(".", &root_key)];
+        let root_dnskey_sig = rrsig_rec(&root_sk, &root_key, ".", 48, &root_dnskey);
+        let parent_ds = vec![ds_rec("parent.test", &parent_key)];
+        let parent_ds_sig = rrsig_rec(&root_sk, &root_key, ".", RecordType::DS.0, &parent_ds);
+        spawn_server(&root_ip.to_string(), port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let mut m = base(req);
+            if q.qtype == RecordType::DNSKEY && q.name.is_root() {
+                m.header.authoritative = true;
+                m.answers.extend(root_dnskey.iter().cloned());
+                m.answers.push(root_dnskey_sig.clone());
+                return m;
+            }
+            m.authorities.push(Record::new(
+                name("parent.test"),
+                3600,
+                RData::Ns(name("ns.parent.test")),
+            ));
+            m.authorities.extend(parent_ds.iter().cloned());
+            m.authorities.push(parent_ds_sig.clone());
+            m.additionals
+                .push(Record::new(name("ns.parent.test"), 3600, RData::A(zone_ip)));
+            m
+        });
+
+        let parent_dnskey = vec![dnskey_rec("parent.test", &parent_key)];
+        let parent_dnskey_sig =
+            rrsig_rec(&parent_sk, &parent_key, "parent.test", 48, &parent_dnskey);
+        let child_dnskey = vec![dnskey_rec("l.parent.test", &child_key)];
+        let child_dnskey_sig = rrsig_rec(&child_sk, &child_key, "l.parent.test", 48, &child_dnskey);
+        let child_ns = vec![Record::new(
+            name("l.parent.test"),
+            3600,
+            RData::Ns(name("ns.parent.test")),
+        )];
+        let child_ns_sig = rrsig_rec(
+            &child_sk,
+            &child_key,
+            "l.parent.test",
+            RecordType::NS.0,
+            &child_ns,
+        );
+        let child_ds = vec![ds_rec("l.parent.test", &ds_key)];
+        let child_ds_sig = rrsig_rec(
+            &parent_sk,
+            &parent_key,
+            "parent.test",
+            RecordType::DS.0,
+            &child_ds,
+        );
+        let host = vec![Record::new(
+            name("host.l.parent.test"),
+            3600,
+            RData::A(COHOSTED_TARGET),
+        )];
+        let host_sig = rrsig_rec(&child_sk, &child_key, "l.parent.test", 1, &host);
+        spawn_server(&zone_ip.to_string(), port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let mut m = base(req);
+            m.header.authoritative = true;
+            let (records, signature): (&[Record], &Record) =
+                match (q.name.to_ascii_lower().as_str(), q.qtype) {
+                    ("parent.test", RecordType::DNSKEY) => (&parent_dnskey, &parent_dnskey_sig),
+                    ("l.parent.test", RecordType::DNSKEY) => (&child_dnskey, &child_dnskey_sig),
+                    ("l.parent.test", RecordType::NS) => {
+                        m.additionals.push(Record::new(
+                            name("ns.parent.test"),
+                            3600,
+                            RData::A(zone_ip),
+                        ));
+                        (&child_ns, &child_ns_sig)
+                    }
+                    ("l.parent.test", RecordType::DS) => (&child_ds, &child_ds_sig),
+                    ("host.l.parent.test", RecordType::A) => (&host, &host_sig),
+                    _ => return m,
+                };
+            m.answers.extend(records.iter().cloned());
+            m.answers.push(signature.clone());
+            m
+        });
+        (SocketAddr::new(IpAddr::V4(root_ip), port), anchor)
+    }
+
+    #[test]
+    /**
+     * @brief 답변 절로 드러난 서명된 자식 영역의 답이 부모에게 받은 DS로 끝까지 검증되는지.
+     * @details 루트, 부모, 자식 영역을 모두 실제 키로 서명한다. 자식 영역의 DS를 부모에게 따로
+     *          물어 체인에 넣어야 자식 키를 믿을 수 있고, 그래야 답에 AD가 붙는다. DS 없이
+     *          체인에 넣으면 자식 영역이 Insecure로 내려가 AD가 붙지 않는다.
+     */
+    fn a_signed_answer_zone_cut_validates_through_the_fetched_ds() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5415;
+        let (root, anchor) = spawn_signed_cohosted_zones(
+            Ipv4Addr::new(127, 0, 0, 54),
+            Ipv4Addr::new(127, 0, 0, 55),
+            PORT,
+            73,
+        );
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+        let resp = rec
+            .resolve(
+                &Name::from_str("host.l.parent.test").unwrap(),
+                RecordType::A,
+            )
+            .expect("서명된 자식 영역의 답을 받아야 합니다");
+        assert_eq!(resp.header.rcode, ResponseCode::NoError.0, "{resp:?}");
+        assert!(
+            resp.answers
+                .iter()
+                .any(|record| matches!(&record.rdata, RData::A(ip) if *ip == COHOSTED_TARGET)),
+            "최종 답을 얻지 못했습니다: {resp:?}"
+        );
+        assert!(
+            resp.header.authentic_data,
+            "부모에게 받은 DS로 자식 키를 확인해 Secure여야 합니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 답변 절로 드러난 경계에서 부모가 준 DS가 자식 키와 맞지 않으면 SERVFAIL인지.
+     * @details 부모의 서명은 유효하지만 DS가 다른 키를 가리킨다. 자식 영역의 DNSKEY를 믿을 수
+     *          없으므로 Bogus이고, Insecure로 내려가 답을 그대로 주면 안 된다.
+     */
+    fn a_signed_answer_zone_cut_with_a_mismatched_ds_is_bogus() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5416;
+        let (root, anchor) = spawn_signed_cohosted_zones(
+            Ipv4Addr::new(127, 0, 0, 56),
+            Ipv4Addr::new(127, 0, 0, 57),
+            PORT,
+            74,
+        );
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+        let resp = rec
+            .resolve(
+                &Name::from_str("host.l.parent.test").unwrap(),
+                RecordType::A,
+            )
+            .expect("검증 실패도 응답으로 돌아와야 합니다");
+        assert_eq!(resp.header.rcode, ResponseCode::ServFail.0, "{resp:?}");
+        assert!(!resp.header.authentic_data);
+    }
+
+    /** @brief glue 없는 위임 테스트에서 최종 이름이 가리키는 주소. */
+    const GLUELESS_TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 58);
+
+    /**
+     * @brief glue 없이 네임서버 두 개로 위임하는 구성을 시작한다.
+     * @details 루트는 target.test를 ns1.a.test와 ns2.b.test로 위임하되 주소를 주지 않고, 두
+     *          이름의 주소는 스스로 권한 있게 답한다. 한 주소는 답하지 않는 서버, 다른 주소는
+     *          답하는 서버다. 루트가 받은 질의는 이름과 타입으로 기록한다.
+     * @param dead_first 참이면 ns1.a.test가 답하지 않는 서버를 가리킨다.
+     * @return 루트 서버 주소와 루트가 받은 질의 기록.
+     */
+    fn spawn_glueless_delegation(
+        ips: [Ipv4Addr; 3],
+        port: u16,
+        dead_first: bool,
+    ) -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, RecordType)>>>,
+    ) {
+        let [root_ip, dead_ip, good_ip] = ips;
+        let (first, second) = if dead_first {
+            (dead_ip, good_ip)
+        } else {
+            (good_ip, dead_ip)
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        spawn_server(&root_ip.to_string(), port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let asked = q.name.to_ascii_lower();
+            log.lock().unwrap().push((asked.clone(), q.qtype));
+            let mut m = base(req);
+            if asked.ends_with("target.test") {
+                for ns in ["ns1.a.test", "ns2.b.test"] {
+                    m.authorities.push(Record::new(
+                        Name::from_str("target.test").unwrap(),
+                        3600,
+                        RData::Ns(Name::from_str(ns).unwrap()),
+                    ));
+                }
+                return m;
+            }
+            m.header.authoritative = true;
+            let address = match (asked.as_str(), q.qtype) {
+                ("ns1.a.test", RecordType::A) => Some(first),
+                ("ns2.b.test", RecordType::A) => Some(second),
+                _ => None,
+            };
+            if let Some(ip) = address {
+                m.answers.push(Record::new(q.name, 3600, RData::A(ip)));
+            }
+            m
+        });
+        let silent = UdpSocket::bind(SocketAddr::new(IpAddr::V4(dead_ip), port)).unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while silent.recv_from(&mut buf).is_ok() {}
+        });
+        spawn_server(&good_ip.to_string(), port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let mut m = base(req);
+            m.header.authoritative = true;
+            if q.name.to_ascii_lower() == "host.target.test" && q.qtype == RecordType::A {
+                m.answers
+                    .push(Record::new(q.name, 60, RData::A(GLUELESS_TARGET)));
+            }
+            m
+        });
+        (SocketAddr::new(IpAddr::V4(root_ip), port), seen)
+    }
+
+    /** @brief 응답에 이 테스트의 최종 주소가 있는지. */
+    fn has_glueless_target(resp: &Message) -> bool {
+        resp.answers
+            .iter()
+            .any(|record| matches!(&record.rdata, RData::A(ip) if *ip == GLUELESS_TARGET))
+    }
+
+    #[test]
+    /**
+     * @brief glue 없는 네임서버의 주소를 쓸 수 있는 것이 생기면 그만 푸는지.
+     * @details 이름을 전부 풀면 느린 서버 하나가 남은 시간을 모두 가져가, 주소를 쥐고도 정작 그
+     *          영역에는 묻지 못한다. 첫 이름이 답하는 서버를 가리키면 둘째 이름은 묻지 않아야 한다.
+     */
+    fn glueless_nameserver_lookup_stops_at_the_first_usable_address() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5417;
+        let (root, seen) = spawn_glueless_delegation(
+            [
+                Ipv4Addr::new(127, 0, 0, 58),
+                Ipv4Addr::new(127, 0, 0, 59),
+                Ipv4Addr::new(127, 0, 0, 61),
+            ],
+            PORT,
+            false,
+        );
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback();
+        let resp = rec
+            .resolve(&Name::from_str("host.target.test").unwrap(), RecordType::A)
+            .expect("첫 네임서버로 답을 받아야 합니다");
+        assert!(has_glueless_target(&resp), "{resp:?}");
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "ns2.b.test"),
+            "쓸 수 있는 주소가 있는데 다음 네임서버 이름까지 풀었습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 먼저 푼 네임서버가 답하지 않으면 남겨 둔 이름을 풀어 다시 묻는지.
+     * @details 서버당 시간은 남겨 둔 이름 몫까지 나눈다. 받은 주소 하나로 시간을 다 쓰면 둘째
+     *          이름으로 넘어갈 시간이 남지 않는다.
+     */
+    fn glueless_nameserver_lookup_resolves_the_next_name_when_the_first_is_dead() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5418;
+        let (root, seen) = spawn_glueless_delegation(
+            [
+                Ipv4Addr::new(127, 0, 0, 68),
+                Ipv4Addr::new(127, 0, 0, 69),
+                Ipv4Addr::new(127, 0, 0, 72),
+            ],
+            PORT,
+            true,
+        );
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback();
+        let resp = rec
+            .resolve(&Name::from_str("host.target.test").unwrap(), RecordType::A)
+            .expect("둘째 네임서버로 넘어가 답을 받아야 합니다");
+        assert!(has_glueless_target(&resp), "{resp:?}");
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, qtype)| name == "ns2.b.test" && *qtype == RecordType::A)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 네임서버 주소를 풀 때는 검증하지 않는지.
+     * @details 주소는 어디로 보낼지만 정하고 답은 체인으로 따로 검증한다. 이 해석을 검증하면
+     *          결과는 쓰지 않으면서 DNSKEY를 가져오느라 시간만 쓴다. 최종 답은 검증하지 않고
+     *          반복만 돌리므로, 루트가 DNSKEY 질의를 받았다면 주소 풀기가 보낸 것이다.
+     */
+    fn glueless_nameserver_lookup_does_not_validate() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5419;
+        let (root, seen) = spawn_glueless_delegation(
+            [
+                Ipv4Addr::new(127, 0, 0, 75),
+                Ipv4Addr::new(127, 0, 0, 76),
+                Ipv4Addr::new(127, 0, 0, 77),
+            ],
+            PORT,
+            false,
+        );
+        let anchor = onetdns_dnssec::Ds {
+            key_tag: 1,
+            algorithm: 13,
+            digest_type: 2,
+            digest: vec![1; 32],
+        };
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+        let mut budget = Budget {
+            ns_resolves: rec.max_ns_resolves,
+            queries: MAX_TOTAL_QUERIES,
+            deadline: rec.query_deadline(),
+        };
+        let qname = Name::from_str("host.target.test").unwrap();
+        let (resp, _) = rec
+            .iterate_from(
+                &qname,
+                RecordType::A,
+                &mut budget,
+                Name::root(),
+                vec![root],
+                true,
+            )
+            .expect("주소를 풀어 내려가야 합니다");
+        assert!(has_glueless_target(&resp), "{resp:?}");
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, qtype)| matches!(*qtype, RecordType::DNSKEY | RecordType::DS)),
+            "네임서버 주소를 푸는 해석이 검증하려고 키를 물었습니다: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 느린 서버의 답을 기다리는 동안 다음 서버에도 물어 먼저 온 답을 쓰는지.
+     * @details 첫 서버는 처음 보는 서버라 UNKNOWN_SERVER_PATIENCE만큼 기다린 뒤 둘째 서버에도
+     *          묻는다. 첫 서버를 끝까지 기다리면 그 서버의 지연만큼 늦고, 버리고 넘어가면 곧 올
+     *          답을 잃는다. 늦은 서버는 기다린 시간 이상으로 왕복 시간이 기록되어 다음에는
+     *          뒤로 간다.
+     */
+    fn a_slow_server_is_raced_by_the_next_one() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5420;
+        /** @brief 느린 서버가 답을 미루는 시간. 서버당 제한 시간보다 짧아야 한다. */
+        const SLOW_DELAY: Duration = Duration::from_millis(1500);
+        let answer = |ip: Ipv4Addr| {
+            move |req: &Message| {
+                let mut m = base(req);
+                m.header.authoritative = true;
+                let q = req.questions.first().unwrap().clone();
+                m.answers.push(Record::new(q.name, 60, RData::A(ip)));
+                m
+            }
+        };
+        let slow_ip = Ipv4Addr::new(127, 0, 0, 78);
+        let fast_ip = Ipv4Addr::new(127, 0, 0, 79);
+        let slow = spawn_server(&slow_ip.to_string(), PORT, {
+            let respond = answer(slow_ip);
+            move |req: &Message| {
+                std::thread::sleep(SLOW_DELAY);
+                respond(req)
+            }
+        });
+        let fast = spawn_server(&fast_ip.to_string(), PORT, answer(fast_ip));
+
+        let rec = Recursor::new(vec![], Duration::from_secs(4)).with_test_loopback();
+        let zone = Name::from_str("race.test").unwrap();
+        let query = make_query(
+            &Name::from_str("host.race.test").unwrap(),
+            RecordType::A,
+            false,
+        );
+        let started = Instant::now();
+        let resp = rec
+            .query_any(&[slow, fast], &query, &zone, rec.query_deadline())
+            .expect("둘째 서버의 답을 받아야 합니다");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(resp.answers.first().map(|r| &r.rdata), Some(RData::A(ip)) if *ip == fast_ip),
+            "{resp:?}"
+        );
+        assert!(
+            elapsed >= UNKNOWN_SERVER_PATIENCE && elapsed < SLOW_DELAY,
+            "둘째 서버에 물은 시점이 기대와 다릅니다: {elapsed:?}"
+        );
+        assert!(
+            rec.srtt(slow.ip())
+                .is_some_and(|ms| u128::from(ms) >= UNKNOWN_SERVER_PATIENCE.as_millis()),
+            "답을 기다리다 만 서버의 왕복 시간이 기록되지 않았습니다"
+        );
+        assert_eq!(rec.order_by_infra(&[slow, fast], &zone), vec![fast, slow]);
+    }
+
+    #[test]
+    /**
+     * @brief 아무 서버도 답하지 않아 실패한 해석을 뒤에서 마저 돌려 캐시를 채우는지.
+     * @details 루트는 첫 질의에만 답하지 않는다. 클라이언트에게는 실패가 나가지만, 뒤에서 다시
+     *          돌린 해석이 자식 zone의 위임을 캐시에 남겨 다음 질의는 루트부터 걷지 않는다.
+     */
+    fn an_unanswered_resolution_is_finished_in_the_background() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5421;
+        let root_ip = Ipv4Addr::new(127, 0, 0, 86);
+        let child_ip = Ipv4Addr::new(127, 0, 0, 87);
+        let root_sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(root_ip), PORT)).unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut first = true;
+            while let Ok((n, from)) = root_sock.recv_from(&mut buf) {
+                let Ok(req) = Message::parse(&buf[..n]) else {
+                    continue;
+                };
+                if std::mem::take(&mut first) {
+                    continue;
+                }
+                let asked = req.questions.first().unwrap().name.to_ascii_lower();
+                let resp = if asked.ends_with("bg.test") {
+                    referral(&req, "bg.test", "ns.bg.test", child_ip)
+                } else {
+                    let mut m = base(&req);
+                    m.header.authoritative = true;
+                    m
+                };
+                let _ = root_sock.send_to(&resp.try_encode().unwrap(), from);
+            }
+        });
+        spawn_server(&child_ip.to_string(), PORT, move |req| {
+            a_answer(req, Ipv4Addr::new(192, 0, 2, 86))
+        });
+
+        let rec = Arc::new(
+            Recursor::new(
+                vec![SocketAddr::new(IpAddr::V4(root_ip), PORT)],
+                Duration::from_millis(500),
+            )
+            .with_port(PORT)
+            .with_test_loopback(),
+        );
+        let qname = Name::from_str("host.bg.test").unwrap();
+        assert!(
+            rec.resolve_with_ns_cd(&qname, RecordType::A, false)
+                .is_err(),
+            "루트가 첫 질의에 답하지 않았으니 이 해석은 실패해야 합니다"
+        );
+
+        let zone = Name::from_str("bg.test").unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while rec.deleg_cached(&zone).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rec.deleg_cached(&zone).is_some(),
+            "뒤에서 마저 돌린 해석이 위임을 캐시에 남기지 않았습니다"
+        );
+    }
+
+    #[test]
+    /**
      * @brief 검증하지 않아도 DO=1로 묻는 질의자에게 서명을 줄 수 있는지.
      *
      * @details 업스트림에 DO를 설정하지 않으면 서명을 애초에 받아 오지 못한다. 그러면 이 서버의 뒤에
@@ -6701,11 +8075,13 @@ mod tests {
 
         let bad3 =
             onetdns_dnssec::Ds::from_dnskey(&k_test, &Name::from_str(".").unwrap(), 2).unwrap();
-        let rec_cd = Recursor::new(vec![root_server], Duration::from_secs(2))
-            .with_port(PORT)
-            .with_test_loopback()
-            .with_trust_anchors(vec![bad3])
-            .with_ignore_cd(false);
+        let rec_cd = Arc::new(
+            Recursor::new(vec![root_server], Duration::from_secs(2))
+                .with_port(PORT)
+                .with_test_loopback()
+                .with_trust_anchors(vec![bad3])
+                .with_ignore_cd(false),
+        );
         let n = Name::from_str("host.test").unwrap();
 
         let r_cd1 = rec_cd
@@ -6731,10 +8107,12 @@ mod tests {
 
         let bad4 =
             onetdns_dnssec::Ds::from_dnskey(&k_test, &Name::from_str(".").unwrap(), 2).unwrap();
-        let rec_ign = Recursor::new(vec![root_server], Duration::from_secs(2))
-            .with_port(PORT)
-            .with_test_loopback()
-            .with_trust_anchors(vec![bad4]);
+        let rec_ign = Arc::new(
+            Recursor::new(vec![root_server], Duration::from_secs(2))
+                .with_port(PORT)
+                .with_test_loopback()
+                .with_trust_anchors(vec![bad4]),
+        );
         let r_ign = rec_ign
             .resolve_with_ns_cd(&n, RecordType::A, true)
             .expect("ign 해석")
@@ -7525,6 +8903,53 @@ mod tests {
             excessive.header.rcode,
             ResponseCode::ServFail.0,
             "rcode는 그대로 SERVFAIL입니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 검증에 쓸 키를 받지 못한 SERVFAIL이 서명 문제가 아니라 권한 서버 문제로 알려지는지.
+     * @details 루트는 주소 질의에는 답하고 DNSKEY 질의에는 답하지 않는다. 서명되지 않았다는
+     *          증명도 없으므로 답은 여전히 SERVFAIL이지만, 사유는 EDE 22여야 하고 검증 실패
+     *          지표에 잡히면 안 된다. EDE 6으로 알리면 운영자가 멀쩡한 서명을 살핀다.
+     */
+    fn unfetchable_keys_are_reported_as_an_unreachable_authority() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5424;
+        let root = spawn_server("127.0.0.93", PORT, |req| {
+            if req.questions.first().unwrap().qtype == RecordType::DNSKEY {
+                // 답하지 않는 서버를 흉내 내려고, 이 서버가 버리는 ID를 가진 응답을 돌려준다.
+                let mut m = base(req);
+                m.header.id = req.header.id.wrapping_add(1);
+                return m;
+            }
+            a_answer(req, Ipv4Addr::new(192, 0, 2, 93))
+        });
+        let anchor = onetdns_dnssec::Ds {
+            key_tag: 1,
+            algorithm: 13,
+            digest_type: 2,
+            digest: vec![1; 32],
+        };
+        let rec = Recursor::new(vec![root], Duration::from_millis(800))
+            .with_port(PORT)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+
+        let before = test_thread_validation_bogus_total();
+        let resp = rec
+            .resolve(&Name::from_str("host.test").unwrap(), RecordType::A)
+            .expect("SERVFAIL 응답이어야 합니다");
+        assert_eq!(resp.header.rcode, ResponseCode::ServFail.0);
+        let (code, _) = Edns::from_record(resp.opt().expect("OPT"))
+            .expect("EDNS")
+            .ede()
+            .expect("EDE");
+        assert_eq!(code, ede_code::NO_REACHABLE_AUTHORITY);
+        assert_eq!(
+            test_thread_validation_bogus_total(),
+            before,
+            "키를 받지 못한 것을 검증 실패로 셌습니다"
         );
     }
 
