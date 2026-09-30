@@ -795,7 +795,7 @@ fn sign_message_fields(
     let mac = compute_mac(&wire, key, time_signed, fudge, error, other, request_mac);
     msg.additionals.push(tsig_record_fields(
         key.name.clone(),
-        Name::from_str(ALG_HMAC_SHA256).expect("TSIG 알고리즘 이름은 올바른 DNS 이름이어야 합니다"),
+        Name::from_str(ALG_HMAC_SHA256).expect("TSIG algorithm name must be a valid DNS name"),
         time_signed,
         fudge,
         &mac,
@@ -817,7 +817,7 @@ fn tsig_record(
 ) -> Record {
     tsig_record_fields(
         key.name.clone(),
-        Name::from_str(ALG_HMAC_SHA256).expect("TSIG 알고리즘 이름은 올바른 DNS 이름이어야 합니다"),
+        Name::from_str(ALG_HMAC_SHA256).expect("TSIG algorithm name must be a valid DNS name"),
         now,
         fudge,
         mac,
@@ -880,15 +880,11 @@ fn append_tsig_wire(
     other: &[u8],
 ) -> Result<(), ProtoError> {
     if writer.buf.len() < 12 {
-        return Err(ProtoError::Message(
-            "TSIG를 추가할 DNS 헤더가 없습니다".into(),
-        ));
+        return Err(ProtoError::Message("No DNS header to add TSIG to".into()));
     }
     let arcount = u16::from_be_bytes([writer.buf[10], writer.buf[11]]);
     let Some(next_arcount) = arcount.checked_add(1) else {
-        return Err(ProtoError::Message(
-            "TSIG를 추가할 section 공간이 없습니다".into(),
-        ));
+        return Err(ProtoError::Message("No section space to add TSIG".into()));
     };
     let owner_len = key
         .name
@@ -901,7 +897,7 @@ fn append_tsig_wire(
     let additional = owner_len.saturating_add(10).saturating_add(rdata_len);
     if writer.buf.len().saturating_add(additional) > MAX_DNS_WIRE_LEN {
         return Err(ProtoError::Message(
-            "TSIG를 추가하면 DNS wire 크기 한도를 넘습니다".into(),
+            "Adding TSIG would exceed the DNS message size limit".into(),
         ));
     }
 
@@ -921,7 +917,7 @@ fn append_tsig_wire(
     writer.push_u16(other.len() as u16);
     writer.push_bytes(other);
     if writer.is_failed() {
-        return Err(ProtoError::Message("TSIG wire 추가에 실패했습니다".into()));
+        return Err(ProtoError::Message("Could not append TSIG".into()));
     }
     Ok(())
 }
@@ -961,7 +957,7 @@ fn compute_mac(
     request_mac: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut h = Hmac::<Sha256>::new_from_slice(key.secret.as_slice())
-        .expect("HMAC 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+        .expect("HMAC key length must match the algorithm");
     if let Some(rm) = request_mac {
         h.update(&(rm.len() as u16).to_be_bytes());
         h.update(rm);
@@ -995,7 +991,7 @@ fn compute_mac_timers(
     prior_mac: &[u8],
 ) -> Vec<u8> {
     let mut h = Hmac::<Sha256>::new_from_slice(key.secret.as_slice())
-        .expect("HMAC 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+        .expect("HMAC key length must match the algorithm");
     h.update(&(prior_mac.len() as u16).to_be_bytes());
     h.update(prior_mac);
     h.update(digest_wire);

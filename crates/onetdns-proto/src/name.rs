@@ -220,9 +220,7 @@ impl Name {
                             .iter()
                             .fold(0u16, |acc, byte| acc * 10 + u16::from(byte - b'0'));
                         if value > 255 {
-                            return Err(ProtoError::Name(
-                                "십진 이스케이프가 255를 넘었습니다".into(),
-                            ));
+                            return Err(ProtoError::Name("Decimal escape exceeds 255".into()));
                         }
                         current.push(value as u8);
                         index += 4;
@@ -230,7 +228,7 @@ impl Name {
                         current.push(*byte);
                         index += 2;
                     } else {
-                        return Err(ProtoError::Name("이스케이프가 끝나지 않았습니다".into()));
+                        return Err(ProtoError::Name("Unterminated escape".into()));
                     }
                     ended_with_separator = false;
                 }
@@ -254,7 +252,7 @@ impl Name {
             return Ok(Self::root());
         }
         if labels.iter().any(Vec::is_empty) {
-            return Err(ProtoError::Name("루트 라벨이 두 번 이상 붙었습니다".into()));
+            return Err(ProtoError::Name("Root label appears more than once".into()));
         }
         Self::from_labels(labels)
     }
@@ -296,14 +294,14 @@ impl Name {
         let mut total = 1usize;
         for label in &labels {
             if label.is_empty() || label.len() > 63 {
-                return Err(ProtoError::Name("라벨 길이가 올바르지 않습니다".into()));
+                return Err(ProtoError::Name("Invalid label length".into()));
             }
             total = total
                 .checked_add(label.len() + 1)
-                .ok_or_else(|| ProtoError::Name("이름이 너무 김".into()))?;
+                .ok_or_else(|| ProtoError::Name("Name too long".into()))?;
         }
         if total > MAX_NAME_LEN {
-            return Err(ProtoError::Name("이름이 너무 김".into()));
+            return Err(ProtoError::Name("Name too long".into()));
         }
         let mut wire = Vec::with_capacity(total);
         for label in labels {
@@ -542,9 +540,9 @@ impl Name {
                     let lab = buf.get(start..label_end).ok_or(ProtoError::Eof)?;
                     total = total
                         .checked_add(len + 1)
-                        .ok_or_else(|| ProtoError::Name("이름이 너무 김".into()))?;
+                        .ok_or_else(|| ProtoError::Name("Name too long".into()))?;
                     if total > MAX_NAME_LEN {
-                        return Err(ProtoError::Name("이름이 너무 김".into()));
+                        return Err(ProtoError::Name("Name too long".into()));
                     }
                     wire[wire_len] = len as u8;
                     wire_len += 1;
@@ -564,15 +562,15 @@ impl Name {
                     jumped = true;
                     jumps += 1;
                     if jumps > MAX_JUMPS {
-                        return Err(ProtoError::Name("압축 포인터 루프".into()));
+                        return Err(ProtoError::Name("Compression pointer loop".into()));
                     }
                     let ptr = ((len & 0x3F) << 8) | b2;
                     if ptr >= pos {
-                        return Err(ProtoError::Name("잘못된 압축 포인터".into()));
+                        return Err(ProtoError::Name("Invalid compression pointer".into()));
                     }
                     pos = ptr;
                 }
-                _ => return Err(ProtoError::Name("예약된 라벨 길이 비트".into())),
+                _ => return Err(ProtoError::Name("Reserved label length bits".into())),
             }
         }
         r.pos = end;
@@ -607,14 +605,14 @@ impl Name {
             }
             if len & 0xc0 != 0 || len > 63 {
                 return Err(ProtoError::Name(
-                    "압축이 허용되지 않는 DNS 이름에 잘못된 라벨".into(),
+                    "Invalid label in a DNS name that cannot be compressed".into(),
                 ));
             }
             total = total
                 .checked_add(len + 1)
-                .ok_or_else(|| ProtoError::Name("이름이 너무 김".into()))?;
+                .ok_or_else(|| ProtoError::Name("Name too long".into()))?;
             if total > MAX_NAME_LEN {
-                return Err(ProtoError::Name("이름이 너무 김".into()));
+                return Err(ProtoError::Name("Name too long".into()));
             }
             wire[wire_len] = len as u8;
             wire_len += 1;
@@ -635,7 +633,7 @@ impl Name {
     pub fn encode(&self, w: &mut Writer) {
         let mut key_buf = [0u8; MAX_NAME_LEN];
         let Some(key) = self.canonical_key_into(&mut key_buf) else {
-            w.fail("DNS 이름의 정규화된 키가 255바이트를 넘었습니다");
+            w.fail("Canonical DNS name key exceeds 255 bytes");
             return;
         };
         let mut key_offset = 0;
@@ -1029,7 +1027,10 @@ mod tests {
         let mut reader = Reader::new(&wire);
         reader.pos = last;
         let error = Name::parse(&mut reader).expect_err("점프 21회는 예산을 넘는다");
-        assert!(error.to_string().contains("압축 포인터 루프"), "{error}");
+        assert!(
+            error.to_string().contains("Compression pointer loop"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1056,7 +1057,7 @@ mod tests {
         let mut reader = Reader::new(&wire);
         reader.pos = last;
         let error = Name::parse(&mut reader).expect_err("확장 후 255바이트를 넘는다");
-        assert!(error.to_string().contains("이름이 너무 김"), "{error}");
+        assert!(error.to_string().contains("Name too long"), "{error}");
     }
 
     #[test]

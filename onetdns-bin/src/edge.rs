@@ -17,10 +17,10 @@ const MAX_SYNCED_LEASES: usize = 16_384;
 /** @brief 공유 DHCP 임대 수명을 두 wire 형식의 32비트 값으로 손실 없이 바꾼다. */
 fn wire_dhcp_lease_secs(value: u64) -> Result<u32, String> {
     let value = u32::try_from(value).map_err(|_| {
-        "dhcp_lease_secs는 DHCP wire 범위인 4294967295초 이하여야 합니다".to_string()
+        "dhcp_lease_secs must not exceed 4294967295 seconds, the DHCP wire limit".to_string()
     })?;
     if value == 0 {
-        return Err("dhcp_lease_secs는 1초 이상이어야 합니다".to_string());
+        return Err("dhcp_lease_secs must be at least 1 second".to_string());
     }
     Ok(value)
 }
@@ -30,16 +30,14 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     use std::net::Ipv4Addr;
     let p = |o: &Option<String>, name: &str| -> Result<Ipv4Addr, String> {
         o.as_deref()
-            .ok_or_else(|| format!("{name} 값을 입력해야 합니다"))?
+            .ok_or_else(|| format!("{name} is required"))?
             .parse()
-            .map_err(|_| format!("{name} 값의 형식이 올바르지 않습니다"))
+            .map_err(|_| format!("{name} is malformed"))
     };
     let opt = |o: &Option<String>, name: &str, default: Ipv4Addr| -> Result<Ipv4Addr, String> {
         match o.as_deref() {
             None => Ok(default),
-            Some(s) => s
-                .parse()
-                .map_err(|_| format!("{name} 값의 형식이 올바르지 않습니다")),
+            Some(s) => s.parse().map_err(|_| format!("{name} is malformed")),
         }
     };
     let server_ip = p(&cfg.dhcp_server_ip, "dhcp_server_ip")?;
@@ -53,16 +51,13 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     let router = opt(&cfg.dhcp_router, "dhcp_router", server_ip)?;
 
     if u32::from(range_start) > u32::from(range_end) {
-        return Err("dhcp_range_start는 dhcp_range_end보다 작거나 같아야 합니다".to_string());
+        return Err("dhcp_range_start must be less than or equal to dhcp_range_end".to_string());
     }
     let mask = u32::from(subnet_mask);
 
     let inv = !mask;
     if mask == 0 || (inv & inv.wrapping_add(1)) != 0 {
-        return Err(
-            "dhcp_subnet_mask에는 연속된 비트로 이루어진 올바른 넷마스크를 입력해야 합니다"
-                .to_string(),
-        );
+        return Err("dhcp_subnet_mask must be a valid netmask with contiguous bits".to_string());
     }
     let net = u32::from(server_ip) & mask;
     let bcast = net | inv;
@@ -73,17 +68,17 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     ] {
         if !in_subnet(ip) {
             return Err(format!(
-                "{name} 주소가 DHCP 서버 서브넷({})에 속하지 않습니다",
+                "{name} is not in the DHCP server subnet ({})",
                 Ipv4Addr::from(net)
             ));
         }
         let v = u32::from(ip);
         if v == net || v == bcast {
-            return Err(format!("{name}가 네트워크/브로드캐스트 주소"));
+            return Err(format!("{name} is the network or broadcast address"));
         }
     }
     if !in_subnet(router) {
-        return Err("dhcp_router 주소가 DHCP 서버 서브넷에 속하지 않습니다".to_string());
+        return Err("dhcp_router is not in the DHCP server subnet".to_string());
     }
     let in_range = |ip: Ipv4Addr| {
         let value = u32::from(ip);
@@ -91,27 +86,25 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     };
     for (ip, name) in [(server_ip, "dhcp_server_ip"), (router, "dhcp_router")] {
         if in_range(ip) {
-            return Err(format!(
-                "{name} 주소는 DHCP 동적 할당 범위에 포함될 수 없습니다"
-            ));
+            return Err(format!("{name} cannot be inside the DHCP dynamic range"));
         }
     }
     let static_file = cfg.dhcp_static_file.as_ref().map(std::path::PathBuf::from);
     if let Some(path) = &static_file {
         dhcp::read_reservations(path)?;
     }
-    let dns: Vec<Ipv4Addr> =
-        if cfg.dhcp_dns.is_empty() {
-            vec![server_ip]
-        } else {
-            let mut out = Vec::with_capacity(cfg.dhcp_dns.len());
-            for s in &cfg.dhcp_dns {
-                out.push(s.parse().map_err(|_| {
-                    format!("dhcp_dns 항목에 올바른 IPv4 주소를 입력해야 합니다: {s}")
-                })?);
-            }
-            out
-        };
+    let dns: Vec<Ipv4Addr> = if cfg.dhcp_dns.is_empty() {
+        vec![server_ip]
+    } else {
+        let mut out = Vec::with_capacity(cfg.dhcp_dns.len());
+        for s in &cfg.dhcp_dns {
+            out.push(
+                s.parse()
+                    .map_err(|_| format!("dhcp_dns needs valid IPv4 addresses: {s}"))?,
+            );
+        }
+        out
+    };
     Ok(dhcp::DhcpConfig {
         server_ip,
         range_start,
@@ -134,7 +127,7 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
  * @return ra_prefix가 없거나 읽을 수 없으면 실패. 값의 범위는 설정 검사가 이미 거른다.
  */
 fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
-    let missing = || "ra_enable에는 fd00:1::/64 처럼 적은 ra_prefix가 필요합니다".to_string();
+    let missing = || "ra_enable needs ra_prefix, written like fd00:1::/64".to_string();
     let spec = cfg.ra_prefix.as_deref().ok_or_else(missing)?;
     let (addr_s, len_s) = spec.split_once('/').ok_or_else(missing)?;
     let prefix: std::net::Ipv6Addr = addr_s.trim().parse().map_err(|_| missing())?;
@@ -194,15 +187,15 @@ fn dhcp6_addresses(
     use std::net::Ipv6Addr;
     let p = |o: &Option<String>, name: &str| -> Result<Ipv6Addr, String> {
         o.as_deref()
-            .ok_or_else(|| format!("{name} 값을 입력해야 합니다"))?
+            .ok_or_else(|| format!("{name} is required"))?
             .parse()
-            .map_err(|_| format!("{name} 값의 형식이 올바르지 않습니다"))
+            .map_err(|_| format!("{name} is malformed"))
     };
     let range_start = p(&cfg.dhcp6_range_start, "dhcp6_range_start")?;
     let range_end = p(&cfg.dhcp6_range_end, "dhcp6_range_end")?;
     if u128::from(range_start) > u128::from(range_end) {
         return Err(
-            "`dhcp6_range_start`는 `dhcp6_range_end`보다 작거나 같은 주소여야 합니다".to_string(),
+            "`dhcp6_range_start` must be less than or equal to `dhcp6_range_end`".to_string(),
         );
     }
     let dns = cfg
@@ -210,7 +203,7 @@ fn dhcp6_addresses(
         .iter()
         .map(|s| {
             s.parse()
-                .map_err(|_| format!("dhcp6_dns 항목에는 IPv6 주소를 입력해야 합니다: {s}"))
+                .map_err(|_| format!("dhcp6_dns needs IPv6 addresses: {s}"))
         })
         .collect::<Result<Vec<Ipv6Addr>, String>>()?;
     Ok((range_start, range_end, dns))
@@ -231,7 +224,7 @@ pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
             Ok(())
         } else {
             Err(format!(
-                "{key}를 둘 디렉터리가 없습니다: {}",
+                "The directory for {key} does not exist: {}",
                 parent.display()
             ))
         }
@@ -252,13 +245,13 @@ pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
         let root = cfg
             .tftp_root
             .as_deref()
-            .ok_or("tftp_enable에는 tftp_root가 필요합니다")?;
+            .ok_or("tftp_enable needs tftp_root")?;
         if !std::path::Path::new(root).is_dir() {
-            return Err(format!("tftp_root 디렉터리가 없습니다: {root}"));
+            return Err(format!("tftp_root directory does not exist: {root}"));
         }
         if std::net::UdpSocket::bind((cfg.tftp_listen.ip(), 0)).is_err() {
             return Err(format!(
-                "tftp_listen 주소 {}는 이 기기에 없는 주소입니다",
+                "tftp_listen address {} is not an address of this machine",
                 cfg.tftp_listen.ip()
             ));
         }
@@ -278,13 +271,13 @@ pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
             && index != 0
             && unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null()
         {
-            return Err(format!("{key} {index}번 네트워크 인터페이스가 없습니다"));
+            return Err(format!("{key}: network interface {index} does not exist"));
         }
     }
     if cfg.dhcp_enable || cfg.dhcp6_enable {
         if let Some(path) = cfg.mac_vendor_db.as_deref() {
             if !std::path::Path::new(path).is_file() {
-                return Err(format!("mac_vendor_db 파일이 없습니다: {path}"));
+                return Err(format!("mac_vendor_db file does not exist: {path}"));
             }
         }
     }
@@ -308,12 +301,12 @@ fn load_or_create_server_duid6(lease_file: Option<&str>) -> Result<Vec<u8>, Stri
             {
                 return Ok(duid);
             }
-            onetdns_core::warn!(event = "dhcp6.duid_regenerated", path = %path.display(), "DHCPv6 DUID 파일이 손상되어 새 식별자를 만들었습니다");
+            onetdns_core::warn!(event = "dhcp6.duid_regenerated", path = %path.display(), "DHCPv6 DUID file was corrupted; created a new identifier");
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "DHCPv6 DUID 파일을 읽지 못했습니다({}): {error}",
+                "Could not read the DHCPv6 DUID file ({}): {error}",
                 path.display()
             ));
         }
@@ -322,7 +315,7 @@ fn load_or_create_server_duid6(lease_file: Option<&str>) -> Result<Vec<u8>, Stri
     let hex: String = duid.iter().map(|byte| format!("{byte:02x}")).collect();
     atomic_write(&path, hex.as_bytes()).map_err(|error| {
         format!(
-            "DHCPv6 DUID를 파일에 저장하지 못했습니다({}): {error}. 재시작 후 같은 서버 식별자를 유지할 수 없어 DHCPv6를 시작하지 않습니다",
+            "Could not save the DHCPv6 DUID to a file ({}): {error}. DHCPv6 is not started because the server identifier could not be kept across restarts",
             path.display()
         )
     })?;
@@ -466,30 +459,29 @@ pub(crate) fn apply_static_add(
     body: &str,
 ) -> Result<String, String> {
     use onetdns_core::MutexExt;
-    let j = onetdns_core::json::parse(body)
-        .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+    let j =
+        onetdns_core::json::parse(body).map_err(|e| format!("Invalid JSON request body: {e}"))?;
     let identity_s = j
         .get("identity")
         .and_then(|v| v.as_str())
-        .ok_or("identity 값을 입력해야 합니다")?;
+        .ok_or("identity is required")?;
     let ip_s = j
         .get("ip")
         .and_then(|v| v.as_str())
-        .ok_or("ip 값을 입력해야 합니다")?;
+        .ok_or("ip is required")?;
     let hostname = j.get("hostname").and_then(|v| v.as_str()).map(String::from);
     if hostname
         .as_deref()
         .is_some_and(|value| !dhcp::valid_hostname(value))
     {
         return Err(
-            "hostname 값은 1~255바이트이며 공백이나 제어문자를 포함할 수 없습니다".to_string(),
+            "hostname must be 1 to 255 bytes and cannot contain spaces or control characters"
+                .to_string(),
         );
     }
     let identity = dhcp::ClientIdentity::from_text(identity_s)
-        .ok_or("identity 값은 mac:<12자리 16진수> 또는 id:<4~510자리 16진수>여야 합니다")?;
-    let ip: std::net::Ipv4Addr = ip_s
-        .parse()
-        .map_err(|_| "ip 값의 형식이 올바르지 않습니다")?;
+        .ok_or("identity must be mac:<12 hex digits> or id:<4 to 510 hex digits>")?;
+    let ip: std::net::Ipv4Addr = ip_s.parse().map_err(|_| "ip is malformed")?;
     pool.lock_recover()
         .add_reservation(identity, u32::from(ip), hostname)?;
     Ok(format!(
@@ -505,7 +497,7 @@ pub(crate) fn apply_static_remove(
 ) -> Result<String, String> {
     use onetdns_core::MutexExt;
     let identity = dhcp::ClientIdentity::from_text(identity_s)
-        .ok_or("identity 값은 mac:<12자리 16진수> 또는 id:<4~510자리 16진수>여야 합니다")?;
+        .ok_or("identity must be mac:<12 hex digits> or id:<4 to 510 hex digits>")?;
     if pool.lock_recover().remove_reservation(&identity) {
         Ok(format!(
             "{{\"removed\":true,\"identity\":{}}}",
@@ -513,7 +505,7 @@ pub(crate) fn apply_static_remove(
         ))
     } else {
         Err(format!(
-            "해당 클라이언트 식별자의 고정 할당을 찾을 수 없습니다: {identity_s}"
+            "No static assignment for this client identifier: {identity_s}"
         ))
     }
 }
@@ -576,14 +568,14 @@ pub(crate) fn spawn_lease_sync(
                         event = "dhcp.lease_sync_sent",
                         peer = %peer,
                         leases = snapshot.len(),
-                        "DHCP 임대 스냅샷을 상대 노드에 보냈습니다"
+                        "Sent a DHCP lease snapshot to peer node"
                     ),
                     Err(error) => onetdns_core::warn!(
                         event = "dhcp.lease_sync_failed",
                         peer = %peer,
                         leases = snapshot.len(),
                         error = %error,
-                        "DHCP 임대를 상대 노드에 복제하지 못했습니다"
+                        "Could not replicate DHCP leases to peer node"
                     ),
                 }
             }
@@ -597,8 +589,8 @@ pub(crate) fn apply_lease_sync(
     body: &str,
 ) -> Result<String, String> {
     use onetdns_core::MutexExt;
-    let parsed = onetdns_core::json::parse(body)
-        .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+    let parsed =
+        onetdns_core::json::parse(body).map_err(|e| format!("Invalid JSON request body: {e}"))?;
     let items: Vec<&onetdns_core::json::Json> = match &parsed {
         onetdns_core::json::Json::Arr(items) => items.iter().collect(),
         single => vec![single],
@@ -608,7 +600,7 @@ pub(crate) fn apply_lease_sync(
     }
     if items.len() > MAX_SYNCED_LEASES {
         return Err(format!(
-            "한 번에 반영할 수 있는 임대는 최대 {MAX_SYNCED_LEASES}개입니다"
+            "At most {MAX_SYNCED_LEASES} leases can be applied at once"
         ));
     }
 
@@ -616,24 +608,24 @@ pub(crate) fn apply_lease_sync(
     let mut seen_identities = std::collections::HashSet::with_capacity(items.len());
     let mut seen_ips = std::collections::HashSet::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        let at = |what: &str| format!("임대 {}번 항목의 {what}", index + 1);
+        let at = |what: &str| format!("Lease item {}: {what}", index + 1);
         let identity_s = item
             .get("identity")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| at("identity 값을 입력해야 합니다"))?;
+            .ok_or_else(|| at("identity is required"))?;
         let mac_s = item
             .get("mac")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| at("mac 값을 입력해야 합니다"))?;
+            .ok_or_else(|| at("mac is required"))?;
         let ip_s = item
             .get("ip")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| at("ip 값을 입력해야 합니다"))?;
+            .ok_or_else(|| at("ip is required"))?;
         let expiry = item
             .get("expiry")
             .and_then(|v| v.as_str())
             .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| at("expiry 값에는 u64 범위의 10진 문자열을 입력해야 합니다"))?;
+            .ok_or_else(|| at("expiry must be a decimal string within the u64 range"))?;
         let hostname = item
             .get("hostname")
             .and_then(|v| v.as_str())
@@ -643,28 +635,26 @@ pub(crate) fn apply_lease_sync(
             .is_some_and(|value| !dhcp::valid_hostname(value))
         {
             return Err(at(
-                "hostname 값은 1~255바이트이며 공백이나 제어문자를 포함할 수 없습니다",
+                "hostname must be 1 to 255 bytes and cannot contain spaces or control characters",
             ));
         }
-        let mac = parse_mac_colon(mac_s).ok_or_else(|| at("mac 값의 형식이 올바르지 않습니다"))?;
+        let mac = parse_mac_colon(mac_s).ok_or_else(|| at("mac is malformed"))?;
         let identity = dhcp::ClientIdentity::from_text(identity_s).ok_or_else(|| {
-            at("identity 값은 mac:<12자리 16진수> 또는 id:<4~510자리 16진수>여야 합니다")
+            at("identity must be mac:<12 hex digits> or id:<4 to 510 hex digits>")
         })?;
         if identity
             .hardware()
             .is_some_and(|identity_mac| identity_mac != mac)
         {
-            return Err(at("MAC fallback identity와 mac 값이 일치하지 않습니다"));
+            return Err(at("The MAC fallback identity does not match mac"));
         }
-        let ip: std::net::Ipv4Addr = ip_s
-            .parse()
-            .map_err(|_| at("ip 값의 형식이 올바르지 않습니다"))?;
+        let ip: std::net::Ipv4Addr = ip_s.parse().map_err(|_| at("ip is malformed"))?;
         let ip = u32::from(ip);
         if !seen_identities.insert(identity.clone()) {
-            return Err(at("identity 값이 같은 배치에서 중복되었습니다"));
+            return Err(at("identity is repeated in the same batch"));
         }
         if !seen_ips.insert(ip) {
-            return Err(at("ip 값이 같은 배치에서 중복되었습니다"));
+            return Err(at("ip is repeated in the same batch"));
         }
         pending.push((identity, mac, ip, expiry, hostname));
     }
@@ -834,7 +824,7 @@ pub(crate) fn reconcile_edge_services(
             "tftp" => {
                 cfg.tftp_root
                     .as_deref()
-                    .ok_or("tftp_enable에는 tftp_root가 필요합니다")?;
+                    .ok_or("tftp_enable needs tftp_root")?;
             }
             "ra" => {
                 build_ra_config(cfg)?;
@@ -860,7 +850,7 @@ pub(crate) fn reconcile_edge_services(
         onetdns_core::info!(
             event = "edge.service_retired",
             service = %key.split(':').next().unwrap_or(&key),
-            "설정에서 빠졌거나 바뀐 가장자리 서비스를 멈췄습니다"
+            "Stopped edge services that were removed or changed in the configuration"
         );
     }
     if !wanted.iter().any(|key| key.starts_with("dhcp4:")) {
@@ -892,14 +882,14 @@ pub(crate) fn reconcile_edge_services(
                     }
                 };
                 dhcp::spawn_dhcp(dc, 67, pool, stop.clone()).map_err(|error| {
-                    format!("DHCP 수신 주소를 열지 못했습니다. UDP 67번 포트 권한을 확인하십시오: {error}")
+                    format!("Could not open the DHCP listening address; check permission for UDP port 67: {error}")
                 })?
             }
             "tftp" => {
                 let root = cfg
                     .tftp_root
                     .as_deref()
-                    .ok_or("tftp_enable에는 tftp_root가 필요합니다")?;
+                    .ok_or("tftp_enable needs tftp_root")?;
                 tftp::spawn_tftp(
                     root.into(),
                     cfg.tftp_listen,
@@ -908,13 +898,13 @@ pub(crate) fn reconcile_edge_services(
                     cfg.tftp_allow_overwrite,
                     stop.clone(),
                 )
-                .map_err(|error| format!("TFTP 수신 주소를 열지 못했습니다: {error}"))?
+                .map_err(|error| format!("Could not open the TFTP listening address: {error}"))?
             }
             "ra" => {
                 let ra_cfg = build_ra_config(cfg)?;
-                match ra::spawn_ra(ra_cfg, stop.clone())
-                    .map_err(|error| format!("IPv6 라우터 광고를 시작하지 못했습니다: {error}"))?
-                {
+                match ra::spawn_ra(ra_cfg, stop.clone()).map_err(|error| {
+                    format!("Could not start IPv6 router advertisements: {error}")
+                })? {
                     Some(thread) => thread,
                     None => continue,
                 }
@@ -930,7 +920,7 @@ pub(crate) fn reconcile_edge_services(
                     None => Arc::new(Mutex::new(dhcp6::Lease6Pool::new(&dc))),
                 };
                 let thread = dhcp6::spawn_dhcp6(dc, 547, pool.clone(), stop.clone()).map_err(|error| {
-                    format!("DHCPv6 UDP 547 수신 주소를 열거나 ff02::1:2 multicast에 가입하지 못했습니다. dhcp6_interface_index와 포트 권한을 확인하십시오: {error}")
+                    format!("Could not open UDP port 547 for DHCPv6 or join the ff02::1:2 multicast group; check dhcp6_interface_index and port permissions: {error}")
                 })?;
                 *dhcp6_slot.lock_recover() = Some(pool);
                 thread
@@ -941,7 +931,7 @@ pub(crate) fn reconcile_edge_services(
         onetdns_core::info!(
             event = "edge.service_started",
             service = %kind,
-            "가장자리 서비스를 시작했습니다"
+            "Started edge service"
         );
         running.push((key, stop));
     }

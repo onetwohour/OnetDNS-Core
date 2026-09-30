@@ -192,15 +192,16 @@ impl FilterState {
             }
             (all_loaded, had_cached)
         };
-        let (block, allow) = rebuild()
-            .map_err(|error| crate::anyhow!(format!("필터 정책을 적용하지 못했습니다: {error}")))?;
+        let (block, allow) = rebuild().map_err(|error| {
+            crate::anyhow!(format!("Could not apply the filter policy: {error}"))
+        })?;
         if had_cached_blocklists {
             onetdns_core::info!(
                 event = "filter.cache_applied",
                 block,
                 allow,
                 complete = subscriptions_settled,
-                "차단 목록을 걸었습니다"
+                "Applied blocklists"
             );
         } else {
             onetdns_core::info!(
@@ -208,7 +209,7 @@ impl FilterState {
                 block,
                 allow,
                 services = cfg.blocked_services.len(),
-                "차단 목록을 불러왔습니다"
+                "Loaded blocklists"
             );
         }
         {
@@ -222,7 +223,8 @@ impl FilterState {
                     if sleep_or_shutdown(SERVICE_SCHEDULE_TICK_SECS, &sd) {
                         break;
                     }
-                    let paused = service_blocking_paused(&runtime.load(), std::time::SystemTime::now());
+                    let paused =
+                        service_blocking_paused(&runtime.load(), std::time::SystemTime::now());
                     if paused == applied {
                         continue;
                     }
@@ -232,17 +234,17 @@ impl FilterState {
                             onetdns_core::info!(
                                 event = "filter.service_schedule_applied",
                                 paused,
-                                "서비스 차단 일정에 따라 서비스 차단 규칙을 다시 걸었습니다"
+                                "Reapplied service blocking rules on schedule"
                             );
                         }
                         Err(error) => onetdns_core::warn!(
                             event = "filter.service_schedule_failed",
                             %error,
-                            "서비스 차단 일정을 적용하지 못했습니다. 다음 확인 주기에 다시 시도합니다"
+                            "Could not apply the service blocking schedule; retrying next check"
                         ),
                     }
                 })
-                .with_context(|| "서비스 차단 일정 스레드를 시작하지 못했습니다")?;
+                .with_context(|| "Could not start the service blocking schedule thread")?;
             service_cleanup.track(thread);
         }
         let list_refresh_lock = Arc::new(Mutex::new(()));
@@ -271,7 +273,7 @@ impl FilterState {
                         *sm.lock_recover() = previous_meta;
                         let error = with_rollback_result(
                             error,
-                            "URL 차단 목록의 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                            "Could not restore the previous runtime state of URL blocklists",
                             rebuild().map(|_| ()),
                         );
                         Err(error)
@@ -308,13 +310,13 @@ impl FilterState {
                             waited = 0;
                             match refresh_lists() {
                                 Ok((block, _)) => {
-                                    onetdns_core::info!(event = "filter.subscription_applied", block, "다운로드한 차단 목록을 적용했습니다")
+                                    onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
                                 }
                                 Err(error) if error == LIST_REFRESH_BUSY => {
-                                    onetdns_core::info!(event = "filter.subscription_refresh_inflight", "차단 목록 갱신이 이미 진행 중입니다")
+                                    onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
                                 }
                                 Err(error) => {
-                                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "원격 차단 목록을 갱신하지 못했습니다")
+                                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "Could not update remote blocklists")
                                 }
                             }
                         }
@@ -324,7 +326,7 @@ impl FilterState {
                         waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
                     }
                 })
-                .with_context(|| "URL 차단 목록 갱신 스레드를 시작하지 못했습니다")?;
+                .with_context(|| "Could not start the URL blocklist refresh thread")?;
             service_cleanup.track(thread);
         }
 
@@ -373,16 +375,16 @@ impl FilterState {
                         *rpz_texts.lock_recover() = fetched;
                         let previous_urls = std::mem::replace(&mut fetched_urls, urls_now);
                         match rebuild3() {
-                            Ok((b, _)) => onetdns_core::info!(event = "filter.rpz_applied", block = b, "다운로드한 RPZ 규칙을 적용했습니다"),
+                            Ok((b, _)) => onetdns_core::info!(event = "filter.rpz_applied", block = b, "Applied downloaded RPZ rules"),
                             Err(e) => {
                                 *rpz_texts.lock_recover() = previous;
                                 fetched_urls = previous_urls;
                                 let error = with_rollback_result(
                                     e,
-                                    "RPZ 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                                    "Could not restore the previous RPZ runtime state",
                                     rebuild3().map(|_| ()),
                                 );
-                                onetdns_core::warn!(event = "filter.rpz_rebuild_failed", error = %error, "RPZ 규칙을 다시 구성하지 못해 이전 규칙을 유지합니다");
+                                onetdns_core::warn!(event = "filter.rpz_rebuild_failed", error = %error, "Could not rebuild RPZ rules; keeping the previous rules");
                             }
                         }
                         if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
@@ -391,7 +393,7 @@ impl FilterState {
                         waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
                     }
                 })
-                .with_context(|| "RPZ 갱신 스레드를 시작하지 못했습니다")?;
+                .with_context(|| "Could not start the RPZ refresh thread")?;
             service_cleanup.track(thread);
         }
         Ok(Self {

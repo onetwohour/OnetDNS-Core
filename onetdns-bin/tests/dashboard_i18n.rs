@@ -1,5 +1,5 @@
 /*!
- * @brief 대시보드가 보여 주는 한국어 문구에 영어와 일본어 번역이 있는지 검사한다.
+ * @brief 대시보드가 보여 주는 한국어 문구에 영어, 일본어, 중국어 번역이 있는지 검사한다.
  *
  * @details 대시보드는 두 경로로 화면을 그린다. 템플릿 텍스트는 localizeDom 이 실행
  *          중에 바꾸고, React 쪽 코드는 this.t 나 this.tr 로 직접 바꾼다. 둘 다 한국어
@@ -9,16 +9,17 @@
  *          요소에는 그 표시가 없어서, React 에 넘긴 한국어 문자열은 영어 화면에도
  *          그대로 나온다. 사전만 확인해서는 이 경우를 잡을 수 없다. 문자열이 사전에
  *          있는데 아무도 찾지 않은 것이기 때문이다.
- * @details 서버가 보내는 문자열도 함께 확인한다. errorText 는 서버 설명을 버리지 않고
- *          그대로 보여 주므로, 관리 API 가 한국어 본문을 보내면 영어 화면에 한국어가
- *          섞인다. 그 문자열은 Rust 쪽에 있어서 HTML 만으로는 찾을 수 없다.
+ * @details 서버가 보내는 문자열도 함께 확인한다. 관리 API 는 영어로 답하므로, 오류
+ *          본문은 한국어, 일본어, 중국어 사전에 영어 원문을 키로 올라 있어야 한다.
+ *          그렇지 않으면 errorText 가 대비 문구 뒤에 영어 원문을 붙여 보여 준다. 그
+ *          문자열은 Rust 쪽에 있어서 HTML 만으로는 찾을 수 없다.
  * @note 한 가지는 여기서 잡히지 않는다. 렌더 위치에서 변수에 붙은 t 를 빼는 경우다.
  *       소스 텍스트만으로는 그 변수에 무엇이 담기는지 알 수 없다.
  */
 
 mod common;
 
-use common::{collect, read, rel, root};
+use common::{collect, production_prefix, read, rel, root};
 use std::collections::{BTreeMap, BTreeSet};
 
 /** @brief t 가 접미 일치로 키를 찾을 때 쓰는 시작 조각. 실행 중 규칙과 같아야 한다. */
@@ -113,7 +114,8 @@ fn quoted_spans(text: &str) -> Vec<(usize, usize)> {
 }
 
 /**
- * @brief 사전 블록에 선언된 한국어 키.
+ * @brief 사전 블록에 선언된 키.
+ * @details 화면 문구는 한국어 원문이, 서버 문구는 영어 원문이 키다.
  * @details 키는 뒤에 콜론이 따라오는 문자열이다. 콜론이 없으면 그 따옴표는 키를 여는
  *          곳이 아니었다는 뜻이므로, 닫는 위치 뒤로 건너뛰지 않고 한 글자만
  *          나아가 다시 확인한다. 큰따옴표로 시작하는 키가 실제로 있어서, 건너뛰면
@@ -146,10 +148,7 @@ fn literal_keys(segment: &str) -> BTreeSet<String> {
             index += 1;
             continue;
         }
-        let key = &segment[start..cursor];
-        if has_korean(key) {
-            found.insert(unescape(key));
-        }
+        found.insert(unescape(&segment[start..cursor]));
         index = after + 1;
     }
     found
@@ -269,7 +268,7 @@ fn dictionary(text: &str, lang: &str) -> BTreeSet<String> {
     let marker = format!("{lang}: {{");
     if let Some(at) = block.find(&marker) {
         let rest = &block[at..];
-        let next = ["\n  en: {", "\n  ja: {"]
+        let next = ["\n  en: {", "\n  ja: {", "\n  ko: {", "\n  zh: {"]
             .iter()
             .filter_map(|head| rest.find(head))
             .filter(|offset| *offset > 0)
@@ -308,7 +307,10 @@ fn resolvable(key: &str, keys: &BTreeSet<String>) -> bool {
     })
 }
 
-/** @brief 관리 API 가 돌려줄 수 있는 한국어 오류 본문. */
+/**
+ * @brief 관리 API 가 돌려줄 수 있는 오류 본문.
+ * @note 테스트 모듈은 흉내 낸 응답이라 세지 않는다.
+ */
 fn server_error_strings() -> BTreeMap<String, String> {
     let repo = root();
     let mut sources = Vec::new();
@@ -322,9 +324,10 @@ fn server_error_strings() -> BTreeMap<String, String> {
         if where_.contains("/tests/") {
             continue;
         }
-        let body = read(&path);
-        for (value, at) in escaped_error_bodies(&body) {
-            if !has_korean(&value) {
+        let text = read(&path);
+        let body = production_prefix(&text);
+        for (value, at) in escaped_error_bodies(body) {
+            if !value.chars().any(char::is_alphabetic) {
                 continue;
             }
             let line = body[..at].matches('\n').count() + 1;
@@ -519,7 +522,7 @@ fn raw_render_data(script: &str, translating: &[(usize, usize)]) -> BTreeSet<(St
     out
 }
 
-/** @brief 화면 문구와 서버 오류 본문이 영어와 일본어로 모두 번역되는지 확인한다. */
+/** @brief 화면 문구와 서버 오류 본문이 화면의 모든 언어로 번역되는지 확인한다. */
 #[test]
 fn every_korean_string_the_dashboard_shows_has_a_translation() {
     let source = root().join("crates/onetdns-control/dashboard/index.html");
@@ -528,12 +531,17 @@ fn every_korean_string_the_dashboard_shows_has_a_translation() {
     let text = read(&source).replace("\r\n", "\n");
     let english = dictionary(&text, "en");
     let japanese = dictionary(&text, "ja");
+    let chinese = dictionary(&text, "zh");
+    let korean = dictionary(&text, "ko");
     assert!(
-        english.len() > 500 && japanese.len() > 500,
-        "사전을 거의 읽지 못했습니다. en {} / ja {}",
+        english.len() > 500 && japanese.len() > 500 && chinese.len() > 500,
+        "사전을 거의 읽지 못했습니다. en {} / ja {} / zh {}",
         english.len(),
-        japanese.len()
+        japanese.len(),
+        chinese.len()
     );
+    let screen_languages = [("en", &english), ("ja", &japanese), ("zh", &chinese)];
+    let server_languages = [("ko", &korean), ("ja", &japanese), ("zh", &chinese)];
 
     let open = text.find("<x-dc>").expect("템플릿 시작을 찾지 못했습니다");
     let close = text.find("</x-dc>").expect("템플릿 끝을 찾지 못했습니다");
@@ -578,7 +586,7 @@ fn every_korean_string_the_dashboard_shows_has_a_translation() {
         "관리 API 오류 본문을 하나도 읽지 못했습니다"
     );
     for (message, origin) in &server_errors {
-        for (lang, keys) in [("en", &english), ("ja", &japanese)] {
+        for (lang, keys) in server_languages {
             if !resolvable(message, keys) {
                 problems.push(format!(
                     "{lang} 번역 없음 (관리 API 오류 본문 {origin}): {message:?}"
@@ -587,7 +595,7 @@ fn every_korean_string_the_dashboard_shows_has_a_translation() {
         }
     }
     for (key, origin) in &wanted {
-        for (lang, keys) in [("en", &english), ("ja", &japanese)] {
+        for (lang, keys) in screen_languages {
             if !resolvable(key, keys) {
                 problems.push(format!("{lang} 번역 없음 ({origin}): {key:?}"));
             }

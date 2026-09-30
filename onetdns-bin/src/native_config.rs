@@ -38,7 +38,7 @@ pub(crate) fn build_views(cfg: &Config) -> Result<Vec<native::NativeView>, Strin
                 .enumerate()
                 .map(|(item, (name, ip))| {
                     let name = onetdns_proto::Name::from_str(name.trim()).map_err(|_| {
-                        format!("views[{index}].local_a[{item}]의 DNS 이름이 올바르지 않습니다")
+                        format!("views[{index}].local_a[{item}] has an invalid DNS name")
                     })?;
                     Ok((name.canonical_key(), *ip))
                 })
@@ -49,7 +49,7 @@ pub(crate) fn build_views(cfg: &Config) -> Result<Vec<native::NativeView>, Strin
                 .enumerate()
                 .map(|(item, (name, ip))| {
                     let name = onetdns_proto::Name::from_str(name.trim()).map_err(|_| {
-                        format!("views[{index}].local_aaaa[{item}]의 DNS 이름이 올바르지 않습니다")
+                        format!("views[{index}].local_aaaa[{item}] has an invalid DNS name")
                     })?;
                     Ok((name.canonical_key(), *ip))
                 })
@@ -75,7 +75,7 @@ fn build_update_policy(cfg: &Config) -> Result<Vec<native::UpdateRule>, String> 
                 "deny" => false,
                 other => {
                     return Err(format!(
-                        "update_policy[{index}].action에 허용되지 않은 값이 있습니다: '{other}'"
+                        "update_policy[{index}].action has a value that is not allowed: '{other}'"
                     ));
                 }
             };
@@ -86,7 +86,7 @@ fn build_update_policy(cfg: &Config) -> Result<Vec<native::UpdateRule>, String> 
                 .map(|(item, rtype)| {
                     onetdns_config::parse_update_rtype(rtype).ok_or_else(|| {
                         format!(
-                            "update_policy[{index}].types[{item}]에 허용되지 않은 DNS 레코드 형식이 있습니다: '{rtype}'"
+                            "update_policy[{index}].types[{item}] has a DNS record type that is not allowed: '{rtype}'"
                         )
                     })
                 })
@@ -97,7 +97,7 @@ fn build_update_policy(cfg: &Config) -> Result<Vec<native::UpdateRule>, String> 
                 &r.name,
                 types,
             )
-            .ok_or_else(|| format!("update_policy[{index}]의 identity 또는 name이 올바르지 않습니다"))
+            .ok_or_else(|| format!("update_policy[{index}] has an invalid identity or name"))
         })
         .collect()
 }
@@ -332,7 +332,7 @@ pub(crate) fn build_authority_settings(cfg: &Config) -> Result<native::Authority
         .filter(|zone| zone.dnssec_sign)
         .map(|zone| {
             let origin = onetdns_proto::Name::from_str(&zone.origin)
-                .map_err(|_| format!("DNS 영역 이름이 올바르지 않습니다: {}", zone.origin))?;
+                .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
             Ok((origin, load_zone_signer(zone)?))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -426,13 +426,13 @@ pub(crate) fn build_policy_engine(cfg: &Config) -> Result<onetdns_policy::Policy
                 Some(ip) => Action::Rewrite(ip),
                 None => {
                     return Err(format!(
-                        "policy[{index}].rewrite에는 올바른 IPv4 주소가 필요합니다"
+                        "policy[{index}].rewrite needs a valid IPv4 address"
                     ));
                 }
             },
             other => {
                 return Err(format!(
-                    "policy[{index}].action에 허용되지 않은 값이 있습니다: '{other}'"
+                    "policy[{index}].action has a value that is not allowed: '{other}'"
                 ));
             }
         };
@@ -441,9 +441,8 @@ pub(crate) fn build_policy_engine(cfg: &Config) -> Result<onetdns_policy::Policy
             .with_suffixes(&p.suffixes)
             .with_qtypes(&qtype_numbers(&p.qtypes));
         if !p.days.is_empty() || p.start.is_some() || p.end.is_some() {
-            let window = parse_time_window(&p.days, &p.start, &p.end).ok_or_else(|| {
-                format!("policy[{index}]의 요일 또는 시간 범위가 올바르지 않습니다")
-            })?;
+            let window = parse_time_window(&p.days, &p.start, &p.end)
+                .ok_or_else(|| format!("policy[{index}] has an invalid day or time range"))?;
             rule = rule.with_window(window);
         }
         rules.push(rule);
@@ -478,23 +477,29 @@ pub(crate) fn build_policy_engine(cfg: &Config) -> Result<onetdns_policy::Policy
                             .unwrap_or("wasm")
                             .to_string()
                     });
-                    onetdns_core::info!(event = "policy.wasm_loaded", path = %path.display(), fail_mode = ?fail_mode, "WASM 정책 플러그인을 불러왔습니다");
+                    onetdns_core::info!(event = "policy.wasm_loaded", path = %path.display(), fail_mode = ?fail_mode, "Loaded WASM policy plugin");
                     plugins.push(w.with_name(name).with_failure_mode(fail_mode));
                 }
                 Err(e) => {
-                    let error = format!("WASM 정책을 준비하지 못했습니다({}): {e}", path.display());
+                    let error = format!(
+                        "Could not prepare the WASM policy ({}): {e}",
+                        path.display()
+                    );
                     if fail_mode != onetdns_policy::FailureMode::Open {
                         return Err(error);
                     }
-                    onetdns_core::error!(event = "policy.wasm_skipped", error = %error, "WASM 정책을 적용하지 않았습니다")
+                    onetdns_core::error!(event = "policy.wasm_skipped", error = %error, "WASM policy was not applied")
                 }
             },
             Err(e) => {
-                let error = format!("WASM 정책 파일을 읽지 못했습니다({}): {e}", path.display());
+                let error = format!(
+                    "Could not read the WASM policy file ({}): {e}",
+                    path.display()
+                );
                 if fail_mode != onetdns_policy::FailureMode::Open {
                     return Err(error);
                 }
-                onetdns_core::error!(event = "policy.wasm_skipped", error = %error, "WASM 정책을 적용하지 않았습니다")
+                onetdns_core::error!(event = "policy.wasm_skipped", error = %error, "WASM policy was not applied")
             }
         }
     }
@@ -833,11 +838,11 @@ fn build_dnstap(cfg: &Config) -> Result<Option<Arc<onetdns_control::DnstapWriter
     let writer =
         onetdns_control::DnstapWriter::create(path, dnstap_identity(cfg)).map_err(|error| {
             format!(
-                "dnstap 출력 파일을 열지 못했습니다({}): {error}",
+                "Could not open the dnstap output file ({}): {error}",
                 path.display()
             )
         })?;
-    onetdns_core::info!(event = "dnstap.started", path = %path.display(), "질의 기록을 dnstap으로 내보냅니다");
+    onetdns_core::info!(event = "dnstap.started", path = %path.display(), "Exporting the query log over dnstap");
     Ok(Some(Arc::new(writer)))
 }
 
@@ -904,7 +909,7 @@ pub(crate) fn parse_qtype(s: Option<&str>) -> BoxResult<onetdns_proto::RecordTyp
         "PTR" => Rt::PTR,
         "SRV" => Rt::SRV,
         "CAA" => Rt::CAA,
-        other => crate::bail!("지원하지 않는 DNS 레코드 유형입니다: {other}"),
+        other => crate::bail!("Unsupported DNS record type: {other}"),
     })
 }
 

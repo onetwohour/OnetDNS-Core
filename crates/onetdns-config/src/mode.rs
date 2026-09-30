@@ -42,7 +42,7 @@ impl Mode {
             .iter()
             .map(|cidr| {
                 cidr.parse()
-                    .expect("기본 접근 제어 대역은 올바른 CIDR이어야 합니다")
+                    .expect("The default access control ranges must be valid CIDRs")
             })
             .collect()
     }

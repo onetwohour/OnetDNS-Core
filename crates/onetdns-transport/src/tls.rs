@@ -22,11 +22,11 @@ impl std::fmt::Display for TlsError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsError::Io(s) => write!(f, "인증서 IO 오류: {s}"),
-            TlsError::NoCert(s) => write!(f, "PEM 데이터에서 인증서를 찾지 못했습니다: {s}"),
-            TlsError::NoKey(s) => write!(f, "PEM 데이터에서 개인 키를 찾지 못했습니다: {s}"),
-            TlsError::SelfSigned(s) => write!(f, "자체 서명 만들지 못했습니다: {s}"),
-            TlsError::Mismatch(s) => write!(f, "인증서와 개인 키가 일치하지 않습니다: {s}"),
+            TlsError::Io(s) => write!(f, "Certificate I/O error: {s}"),
+            TlsError::NoCert(s) => write!(f, "No certificate found in PEM data: {s}"),
+            TlsError::NoKey(s) => write!(f, "No private key found in PEM data: {s}"),
+            TlsError::SelfSigned(s) => write!(f, "Could not create a self-signed certificate: {s}"),
+            TlsError::Mismatch(s) => write!(f, "Certificate and private key do not match: {s}"),
         }
     }
 }
@@ -338,10 +338,10 @@ pub fn generate_self_signed_pem(hostname: &str) -> Result<(String, String), TlsE
 pub fn parse_pem(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>), TlsError> {
     let certs = pem_blocks(cert_pem, "CERTIFICATE");
     if certs.is_empty() {
-        return Err(TlsError::NoCert("(인라인 PEM)".to_string()));
+        return Err(TlsError::NoCert("(inline PEM)".to_string()));
     }
     let key =
-        key_der_from_pem(key_pem).ok_or_else(|| TlsError::NoKey("(인라인 PEM)".to_string()))?;
+        key_der_from_pem(key_pem).ok_or_else(|| TlsError::NoKey("(inline PEM)".to_string()))?;
     Ok((certs, key))
 }
 
@@ -353,17 +353,14 @@ pub fn parse_pem(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>
 pub fn verify_key_matches_cert(cert_der: &[u8], key_pkcs8_der: &[u8]) -> Result<(), TlsError> {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::pkcs8::DecodePrivateKey;
-    let secret = p256::SecretKey::from_pkcs8_der(key_pkcs8_der).map_err(|e| {
-        TlsError::NoKey(format!(
-            "PKCS#8 형식의 P-256 개인 키를 해석하지 못했습니다: {e}"
-        ))
-    })?;
+    let secret = p256::SecretKey::from_pkcs8_der(key_pkcs8_der)
+        .map_err(|e| TlsError::NoKey(format!("Could not parse PKCS#8 P-256 private key: {e}")))?;
     let point = secret.public_key().to_encoded_point(false);
     let x = onetdns_tls::X509::parse(cert_der)
-        .map_err(|e| TlsError::NoCert(format!("X.509 해석하지 못했습니다: {e:?}")))?;
+        .map_err(|e| TlsError::NoCert(format!("Could not parse X.509: {e:?}")))?;
     if x.public_key != point.as_bytes() {
         return Err(TlsError::Mismatch(
-            "개인키가 인증서 공개키와 일치하지 않음".to_string(),
+            "Private key does not match the certificate public key".to_string(),
         ));
     }
     Ok(())
@@ -386,7 +383,7 @@ fn read_pem_limited(path: &Path, max: u64) -> Result<String, TlsError> {
         std::fs::metadata(path).map_err(|e| TlsError::Io(format!("{}: {e}", path.display())))?;
     if !meta.is_file() || meta.len() > max {
         return Err(TlsError::Io(format!(
-            "{}: PEM 파일 크기 또는 형식이 허용 범위를 벗어났습니다",
+            "{}: PEM file size or format is out of range",
             path.display()
         )));
     }
@@ -398,16 +395,12 @@ fn read_pem_limited(path: &Path, max: u64) -> Result<String, TlsError> {
         .map_err(|e| TlsError::Io(format!("{}: {e}", path.display())))?;
     if bytes.len() as u64 > max {
         return Err(TlsError::Io(format!(
-            "{}: PEM 파일 크기가 허용 한도를 넘었습니다",
+            "{}: PEM file is too large",
             path.display()
         )));
     }
-    String::from_utf8(bytes).map_err(|_| {
-        TlsError::Io(format!(
-            "{}: PEM UTF-8 형식이 올바르지 않습니다",
-            path.display()
-        ))
-    })
+    String::from_utf8(bytes)
+        .map_err(|_| TlsError::Io(format!("{}: PEM is not valid UTF-8", path.display())))
 }
 
 /** @brief 파일에서 인증서 체인과 개인키를 읽는다. */

@@ -182,7 +182,7 @@ fn apply_completions(
                 "doh3",
                 "memory_budget",
                 Some(entry.peer),
-                "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                "Total QUIC connection memory budget exceeded",
             );
             to_remove.push(d.conn_key);
             continue;
@@ -284,7 +284,7 @@ fn drive_timeouts(
                 "doh3",
                 "memory_budget",
                 Some(entry.peer),
-                "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                "Total QUIC connection memory budget exceeded",
             );
             closed.push(key.clone());
         } else if entry.conn.is_closed() {
@@ -477,7 +477,7 @@ fn run_loop(
                         "memory_budget",
                         Some(peer),
                         format!(
-                            "전체 QUIC 연결 메모리 예산이 가득 찼습니다: {} / {} bytes",
+                            "Total QUIC connection memory budget is full: {} / {} bytes",
                             control.memory_budget().used_bytes(),
                             control.memory_budget().limit_bytes()
                         ),
@@ -563,7 +563,7 @@ fn run_loop(
                                             peer = %entry.peer,
                                             path_identity = %r.client_id.as_deref().unwrap_or(""),
                                             auth_identity = %auth_identity.as_deref().unwrap_or(""),
-                                            "DoH3 URL에 지정된 클라이언트 ID와 mTLS 인증서의 클라이언트 ID가 일치하지 않습니다"
+                                            "Client ID in the DoH3 URL does not match the client ID in the mTLS certificate"
                                         );
                                         if let Err(error) = h3.send_status(r.stream_id, b"403") {
                                             transport_observe::record_error(
@@ -694,7 +694,7 @@ fn run_loop(
                         "doh3",
                         "memory_budget",
                         Some(entry.peer),
-                        "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                        "Total QUIC connection memory budget exceeded",
                     );
                     remove = true;
                 }

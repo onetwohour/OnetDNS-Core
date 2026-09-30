@@ -35,7 +35,7 @@ pub fn ensure_not_listener(
         })
     }) {
         return Err(format!(
-            "{label}={}가 초기 주소 조회 뒤 이 서버의 DNS 수신 주소를 가리켜 순환 질의를 만듭니다",
+            "{label}={} points to this server's own DNS listening address after the initial lookup, which would create a query loop",
             upstream.addr
         ));
     }
@@ -73,7 +73,7 @@ pub fn native_upstreams(plain: &[IpAddr], urls: &[String], bootstrap: &[IpAddr])
         match parse_native_upstream(u, bootstrap) {
             Some(up) => out.push(up),
             None => {
-                onetdns_core::warn!(event = "upstream.parse_failed", url = %u, "업스트림 DNS 서버의 주소를 찾지 못해 해당 서버를 제외했습니다")
+                onetdns_core::warn!(event = "upstream.parse_failed", url = %u, "Could not resolve an upstream DNS server's address; skipping that server")
             }
         }
     }
@@ -90,7 +90,7 @@ pub fn servers_to_upstreams(servers: &[String], bootstrap: &[IpAddr]) -> Vec<Ups
         } else if let Some(up) = parse_native_upstream(s, bootstrap) {
             out.push(up);
         } else {
-            onetdns_core::warn!(event = "upstream.fallback_parse_failed", server = %s, "스텁 또는 대체 업스트림 DNS 서버의 주소를 찾지 못해 해당 서버를 제외했습니다");
+            onetdns_core::warn!(event = "upstream.fallback_parse_failed", server = %s, "Could not resolve a stub or fallback upstream DNS server's address; skipping that server");
         }
     }
     out
@@ -199,9 +199,9 @@ fn resolve_host(host: &str, bootstrap: &[IpAddr]) -> Option<IpAddr> {
     let resolved = resolve_host_via_bootstrap(host, bootstrap);
     if resolved.is_none() && host.parse::<IpAddr>().is_err() {
         if bootstrap.is_empty() {
-            onetdns_core::warn!(event = "forward.bootstrap_required", %host, "호스트 이름으로 지정한 업스트림 DNS 서버에는 bootstrap 설정이 필요합니다");
+            onetdns_core::warn!(event = "forward.bootstrap_required", %host, "Upstream DNS servers given by hostname need a bootstrap setting");
         } else {
-            onetdns_core::warn!(event = "forward.bootstrap_lookup_failed", %host, servers = bootstrap.len(), "부트스트랩 서버로 업스트림 DNS 서버의 이름을 풀지 못했습니다");
+            onetdns_core::warn!(event = "forward.bootstrap_lookup_failed", %host, servers = bootstrap.len(), "Could not resolve the upstream DNS server name through the bootstrap servers");
         }
     }
     resolved

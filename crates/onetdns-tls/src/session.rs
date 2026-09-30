@@ -222,7 +222,7 @@ impl Ticketer {
     pub fn seal(&self, state: &ResumptionState) -> Option<Vec<u8>> {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         let cipher = aes_gcm::Aes256Gcm::new_from_slice(&self.key)
-            .expect("세션 암호화 키는 32바이트여야 합니다");
+            .expect("Session encryption key must be 32 bytes");
         let mut nonce = [0u8; 12];
         fill_random(&mut nonce);
         let mut plaintext = state.serialize()?;

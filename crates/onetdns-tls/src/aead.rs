@@ -168,20 +168,20 @@ pub(crate) fn aead_seal(
     match aead {
         Aead::Aes128Gcm => {
             let c = aes_gcm::Aes128Gcm::new_from_slice(key)
-                .expect("암호화 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+                .expect("Cipher key length must match the algorithm");
             c.encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg, aad })
                 .expect("seal")
         }
         Aead::Aes256Gcm => {
             let c = aes_gcm::Aes256Gcm::new_from_slice(key)
-                .expect("암호화 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+                .expect("Cipher key length must match the algorithm");
             c.encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg, aad })
                 .expect("seal")
         }
         Aead::ChaCha20Poly1305 => {
             use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload as CPayload};
             let c = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-                .expect("암호화 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+                .expect("Cipher key length must match the algorithm");
             c.encrypt(
                 chacha20poly1305::Nonce::from_slice(nonce),
                 CPayload { msg, aad },

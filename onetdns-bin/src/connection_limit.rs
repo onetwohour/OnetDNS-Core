@@ -237,7 +237,7 @@ impl PendingEncryptedConnection {
             let remaining = limit.saturating_sub(self.prefix.len());
             if remaining == 0 {
                 return Err(invalid_admission(
-                    "암호화 TCP prefix 상한 안에 frame이 끝나지 않습니다",
+                    "Frame did not end within the encrypted TCP prefix limit",
                 ));
             }
             let read_limit = remaining.min(scratch.len());
@@ -316,9 +316,7 @@ pub(crate) fn encrypted_prefix_state(
 /** @brief 여러 TLS handshake record에 걸친 첫 ClientHello 완결 여부를 센다. */
 fn tls_client_hello_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
     if prefix.len() > MAX_TLS_CLIENT_HELLO_PREFIX_BYTES {
-        return Err(invalid_admission(
-            "TLS ClientHello prefix가 64 KiB를 넘습니다",
-        ));
+        return Err(invalid_admission("TLS ClientHello prefix exceeds 64 KiB"));
     }
 
     let mut record_offset = 0usize;
@@ -333,14 +331,12 @@ fn tls_client_hello_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
         let header = &prefix[record_offset..record_offset + TLS_RECORD_HEADER_BYTES];
         if header[0] != 22 || header[1] != 3 {
             return Err(invalid_admission(
-                "첫 TLS 메시지는 handshake record여야 합니다",
+                "The first TLS message must be a handshake record",
             ));
         }
         let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if record_len == 0 || record_len > MAX_TLS_PLAINTEXT_RECORD_BYTES {
-            return Err(invalid_admission(
-                "TLS record 길이가 허용 범위를 벗어납니다",
-            ));
+            return Err(invalid_admission("TLS record length is out of range"));
         }
         let record_end = record_offset + TLS_RECORD_HEADER_BYTES + record_len;
         if record_end > prefix.len() {
@@ -358,7 +354,7 @@ fn tls_client_hello_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
         if handshake_total.is_none() && handshake_bytes >= handshake_header.len() {
             if handshake_header[0] != 1 {
                 return Err(invalid_admission(
-                    "첫 TLS handshake는 ClientHello여야 합니다",
+                    "The first TLS handshake message must be a ClientHello",
                 ));
             }
             let body_len = ((handshake_header[1] as usize) << 16)
@@ -366,9 +362,7 @@ fn tls_client_hello_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
                 | handshake_header[3] as usize;
             let total = handshake_header.len() + body_len;
             if total + TLS_RECORD_HEADER_BYTES > MAX_TLS_CLIENT_HELLO_PREFIX_BYTES {
-                return Err(invalid_admission(
-                    "TLS ClientHello 길이가 64 KiB를 넘습니다",
-                ));
+                return Err(invalid_admission("TLS ClientHello length exceeds 64 KiB"));
             }
             handshake_total = Some(total);
         }
@@ -389,7 +383,7 @@ fn dnscrypt_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
     let frame_len = u16::from_be_bytes([prefix[0], prefix[1]]) as usize;
     if frame_len == 0 || frame_len > MAX_DNSCRYPT_TCP_QUERY_BYTES {
         return Err(invalid_admission(
-            "DNSCrypt TCP frame 길이가 허용 범위를 벗어납니다",
+            "DNSCrypt TCP frame length is out of range",
         ));
     }
     if prefix.len() >= frame_len + 2 {
@@ -584,7 +578,7 @@ pub fn wake_tcp_listener(addr: SocketAddr) {
         addr => addr,
     };
     if let Err(e) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-        onetdns_core::debug!(event = "listener.wake_failed", addr = %addr, error = %e, "연결 수신 스레드를 깨우지 못했습니다. 대기 중인 accept가 풀리지 않으면 종료가 늦어집니다");
+        onetdns_core::debug!(event = "listener.wake_failed", addr = %addr, error = %e, "Could not wake the accept thread; shutdown is delayed until the pending accept returns");
     }
 }
 

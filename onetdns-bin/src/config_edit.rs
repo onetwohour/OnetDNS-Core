@@ -200,12 +200,12 @@ pub(crate) fn merge_config_snippet(current: &str, snippet: &str) -> Result<Strin
         } = entry
         {
             base = drop_config_tables(&base, key)
-                .map_err(|error| format!("현재 설정을 해석하지 못했습니다: {error}"))?;
+                .map_err(|error| format!("Could not parse the current configuration: {error}"))?;
         }
     }
     let current = base.as_str();
     let cur_entries = onetdns_config::toml::top_entries(current)
-        .map_err(|error| format!("현재 설정을 해석하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not parse the current configuration: {error}"))?;
     let fragment = |source: &str, start: usize, end: usize| {
         let mut piece = source[start..end].to_string();
         if !piece.ends_with('\n') {
@@ -331,7 +331,10 @@ pub(crate) fn remove_token_by_id(text: &str, id: &str) -> Result<(String, usize)
         .collect();
     let removed = before - (admin.len() + ro.len());
     if removed == 0 {
-        return Err("일치하는 토큰이 없거나 기본 관리 토큰은 삭제할 수 없습니다".to_string());
+        return Err(
+            "No matching token, or the token is the primary control token, which cannot be deleted"
+                .to_string(),
+        );
     }
     let out = rewrite_config_string_array(text, "control_admin_tokens", &admin)?;
     let out = rewrite_config_string_array(&out, "control_readonly_tokens", &ro)?;
@@ -386,11 +389,11 @@ pub(crate) fn materialize_mode_acl_patch(
     };
     let mode = value
         .as_str()
-        .ok_or_else(|| "mode는 문자열 personal 또는 public이어야 합니다".to_string())?;
+        .ok_or_else(|| "mode must be the string personal or public".to_string())?;
     let mode = match mode.to_ascii_lowercase().as_str() {
         "personal" => onetdns_config::Mode::Personal,
         "public" => onetdns_config::Mode::Public,
-        _ => return Err("mode는 personal 또는 public이어야 합니다".into()),
+        _ => return Err("Mode must be personal or public".into()),
     };
     pairs.push((
         "acl_allow".into(),
@@ -432,17 +435,17 @@ pub(crate) fn validate_config_patch_values(
         }
         if TOKEN_ARRAYS.contains(&key.as_str()) {
             return Err(format!(
-                "{key}는 일반 설정 편집기로 변경할 수 없습니다. 접근 토큰 전용 화면을 사용하십시오"
+                "{key} cannot be changed in the general settings editor; use the access token screen"
             ));
         }
         if REDACTED_URLS.contains(&key.as_str()) {
             let Some(text) = value.as_str() else {
-                return Err(format!("{key}에는 접속 문자열을 입력해야 합니다"));
+                return Err(format!("{key} needs a connection string"));
             };
             let lowered = text.to_ascii_lowercase();
             if text.contains("***") || lowered.contains("redacted") || lowered.contains("masked") {
                 return Err(format!(
-                    "{key}에 마스킹된 표시값을 저장할 수 없습니다. 새 접속 문자열을 직접 입력하십시오"
+                    "{key} cannot be saved with a masked value; enter the new connection string"
                 ));
             }
         }
@@ -454,7 +457,7 @@ pub(crate) fn validate_config_patch_values(
                         && !text.to_ascii_lowercase().contains("redacted") => {}
                 _ => {
                     return Err(format!(
-                        "{key}는 기존 값을 표시하지 않는 비밀 설정입니다. 변경할 새 값을 직접 입력하십시오"
+                        "{key} is a secret setting whose current value is never shown; enter the new value"
                     ))
                 }
             }
@@ -477,16 +480,16 @@ pub(crate) fn json_to_toml_literal(v: &onetdns_core::json::Json) -> Result<Strin
                     Json::Str(s) => toml_quote(s),
                     Json::Num(n) => toml_num(*n),
                     Json::Bool(b) => b.to_string(),
-                    _ => {
-                        return Err("배열에는 문자열, 숫자 또는 논리값만 사용할 수 있습니다".into())
-                    }
+                    _ => return Err("Arrays may contain only strings, numbers, or booleans".into()),
                 });
             }
             format!("[{}]", parts.join(", "))
         }
-        Json::Null => return Err("null 값은 사용할 수 없습니다".into()),
+        Json::Null => return Err("null is not allowed".into()),
         Json::Obj(_) => {
-            return Err("중첩 설정은 DNS 영역이나 클라이언트 전용 API를 사용해야 합니다".into())
+            return Err(
+                "Nested settings must be changed through the DNS zone or client APIs".into(),
+            )
         }
     })
 }
@@ -511,7 +514,11 @@ pub(crate) fn toml_value_to_json(
         Value::Int(number) if number.unsigned_abs() <= MAX_EXACT as u64 => {
             Json::Num(*number as f64)
         }
-        Value::Int(_) => return Err("Raft로 복제할 수 없을 만큼 큰 정수가 설정에 있습니다".into()),
+        Value::Int(_) => {
+            return Err(
+                "The configuration contains an integer too large to replicate through Raft".into(),
+            )
+        }
         Value::Float(number) => Json::Num(*number),
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Array(items) => Json::Arr(
@@ -543,13 +550,13 @@ pub(crate) fn json_to_raft_toml_literal(
 ) -> Result<String, String> {
     use onetdns_core::json::Json;
     if depth > MAX_RAFT_VALUE_DEPTH {
-        return Err("Raft 설정 값의 중첩이 너무 깊습니다".into());
+        return Err("Raft configuration value is nested too deeply".into());
     }
     Ok(match value {
-        Json::Null => return Err("Raft 설정 값 안에는 null을 둘 수 없습니다".into()),
+        Json::Null => return Err("Raft configuration values cannot contain null".into()),
         Json::Bool(flag) => flag.to_string(),
         Json::Num(number) if number.is_finite() => toml_num(*number),
-        Json::Num(_) => return Err("Raft 설정 값의 수가 유한하지 않습니다".into()),
+        Json::Num(_) => return Err("Raft configuration value is not a finite number".into()),
         Json::Str(text) => toml_quote(text),
         Json::Arr(items) => {
             let parts = items
@@ -597,14 +604,14 @@ pub(crate) fn upstream_values(cfg: &onetdns_config::Config, key: &str) -> Vec<St
 /** @brief 대시보드가 보낸 클라이언트 설정을 설정 텍스트로. */
 pub(crate) fn client_block_from_json(body: &str) -> Result<(String, String), String> {
     use onetdns_core::json;
-    let j = json::parse(body).map_err(|e| format!("JSON 요청 본문을 해석할 수 없습니다: {e}"))?;
+    let j = json::parse(body).map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
     let name = j
         .get("name")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let Some(name) = name else {
-        return Err("`name` 항목을 입력해야 합니다".to_string());
+        return Err("`name` is required".to_string());
     };
     let arr = |k: &str| -> Vec<String> {
         j.get(k)
@@ -709,10 +716,10 @@ pub(crate) fn update_client_disable(
         .clients
         .into_iter()
         .find(|c| c.name == name)
-        .ok_or_else(|| format!("클라이언트를 찾을 수 없습니다: {name}"))?;
+        .ok_or_else(|| format!("Client not found: {name}"))?;
     client.disable_filtering = disable;
-    let mut updated = remove_client_block(text, name)
-        .ok_or_else(|| format!("클라이언트를 찾을 수 없습니다: {name}"))?;
+    let mut updated =
+        remove_client_block(text, name).ok_or_else(|| format!("Client not found: {name}"))?;
     updated.push_str(&client_to_toml(&client));
     Ok(updated)
 }
@@ -729,7 +736,7 @@ pub(crate) fn append_user_block(text: &str, name: &str, hash: &str) -> Result<St
         .iter()
         .any(|block| block.is_array && block.root == "users")
     {
-        return Err("이미 사용자 계정이 있습니다".to_string());
+        return Err("A user account already exists".to_string());
     }
     let mut out = text.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
@@ -788,7 +795,7 @@ pub(crate) fn rewrite_user_password_hash(
         }
     }
     if !found {
-        return Err(format!("사용자를 찾을 수 없습니다: {name}"));
+        return Err(format!("User not found: {name}"));
     }
     Ok(splice_config_edits(text, edits))
 }

@@ -405,7 +405,7 @@ impl DeadlineTcp {
         if remaining.is_zero() {
             return Err(std::io::Error::new(
                 ErrorKind::TimedOut,
-                "응답 대기 시간이 지났습니다",
+                "Response timed out",
             ));
         }
         Ok(Self {
@@ -425,7 +425,7 @@ impl DeadlineTcp {
         if remaining.is_zero() {
             Err(std::io::Error::new(
                 ErrorKind::TimedOut,
-                "응답 대기 시간이 지났습니다",
+                "Response timed out",
             ))
         } else {
             Ok(remaining)
@@ -726,7 +726,7 @@ pub fn set_revocation_hook(f: Box<dyn Fn(&[Vec<u8>], &str) -> Result<(), String>
     policy.generation = policy
         .generation
         .checked_add(1)
-        .expect("폐기 정책 세대가 소진되었습니다");
+        .expect("Revocation policy generations exhausted");
     policy.hook = Some(Arc::from(f));
 }
 
@@ -738,7 +738,7 @@ pub fn clear_revocation_hook() {
     policy.generation = policy
         .generation
         .checked_add(1)
-        .expect("폐기 정책 세대가 소진되었습니다");
+        .expect("Revocation policy generations exhausted");
     policy.hook = None;
 }
 
@@ -754,7 +754,7 @@ pub(crate) fn check_revocation(peer_chain: &[Vec<u8>], host: &str) -> Result<(),
         .clone();
     if let Some(hook) = hook {
         hook(peer_chain, host)
-            .map_err(|e| ForwardError::Io(format!("인증서 폐기 검증에 실패했습니다: {e}")))?;
+            .map_err(|e| ForwardError::Io(format!("Certificate revocation check failed: {e}")))?;
     }
     Ok(())
 }
@@ -779,16 +779,13 @@ impl std::fmt::Display for ForwardError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ForwardError::NoUpstream => write!(f, "사용할 수 있는 업스트림 DNS 서버가 없습니다"),
-            ForwardError::Timeout => write!(f, "업스트림 DNS 서버의 응답 시간이 초과되었습니다"),
-            ForwardError::Io(s) => write!(
-                f,
-                "업스트림 DNS 서버와 통신하는 중 입출력 오류가 발생했습니다: {s}"
-            ),
+            ForwardError::NoUpstream => write!(f, "No upstream DNS server available"),
+            ForwardError::Timeout => write!(f, "Upstream DNS server timed out"),
+            ForwardError::Io(s) => write!(f, "I/O error talking to the upstream DNS server: {s}"),
             ForwardError::BadResponse => {
                 write!(
                     f,
-                    "업스트림 DNS 서버가 질의와 일치하지 않는 응답을 보냈습니다"
+                    "Upstream DNS server sent a response that does not match the query"
                 )
             }
         }
@@ -1514,7 +1511,7 @@ fn observe_non_final(upstream: &Upstream, class: RespClass, request: &Message, r
             qname = %qname,
             qtype = %qtype,
             count = count,
-            "업스트림 DNS 서버가 최종 응답이 아닌 메시지를 반환했습니다"
+            "Upstream DNS server returned a message that is not a final response"
         );
     }
 }
@@ -2162,7 +2159,7 @@ fn udp_exchange_on(
         let received = UDP_RECV_BUFFER.with(|slot| {
             let mut buf = slot.borrow_mut();
             sock.recv_from(&mut buf)
-                .map(|(n, from)| (from, Message::parse(&buf[..n])))
+                .map(|(n, from)| (from, Message::parse_udp_reply(&buf[..n])))
         });
         let (from, parsed) = match received {
             Ok(v) => v,
@@ -2179,9 +2176,8 @@ fn udp_exchange_on(
         if from != upstream {
             continue;
         }
-        let resp = match parsed {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Some(resp) = parsed else {
+            continue;
         };
         if validate_response(request, &resp, Some(wire_id)).is_err() {
             continue;
@@ -2248,7 +2244,7 @@ fn write_all_deadline(
         match stream.write(buf) {
             Ok(0) => {
                 return Err(ForwardError::Io(
-                    "TCP 연결에 데이터를 쓰지 못했습니다(0바이트 기록)".into(),
+                    "Could not write to the TCP connection (wrote 0 bytes)".into(),
                 ))
             }
             Ok(written) => buf = &buf[written..],
@@ -2275,11 +2271,7 @@ fn read_exact_deadline(
         }
         stream.set_read_timeout(Some(remaining)).map_err(io_err)?;
         match stream.read(buf) {
-            Ok(0) => {
-                return Err(ForwardError::Io(
-                    "TCP 연결이 예상보다 일찍 종료되었습니다".into(),
-                ))
-            }
+            Ok(0) => return Err(ForwardError::Io("TCP connection closed early".into())),
             Ok(read) => buf = &mut buf[read..],
             Err(error) => return Err(io_err(error)),
         }
@@ -2353,7 +2345,7 @@ pub(crate) fn note_upstream_connect_failure(
     };
     let count = COUNTS[slot].fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "forward.upstream_connect_failed", transport = transport, addr = %addr, server_name = server_name, count = count, %error, "암호화 업스트림 DNS 서버에 연결하지 못했습니다");
+        onetdns_core::warn!(event = "forward.upstream_connect_failed", transport = transport, addr = %addr, server_name = server_name, count = count, %error, "Could not connect to the encrypted upstream DNS server");
     }
 }
 
@@ -2439,7 +2431,7 @@ impl ParallelExecutor {
                 static FAILURES: AtomicUsize = AtomicUsize::new(0);
                 let count = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_power_of_two() {
-                    onetdns_core::warn!(event = "forward.parallel_worker_start_failed", index, count, %error, "업스트림 서버 병렬 질의 워커를 시작하지 못해 그만큼 순차로 처리합니다");
+                    onetdns_core::warn!(event = "forward.parallel_worker_start_failed", index, count, %error, "Could not start parallel upstream query workers; handling those queries sequentially");
                 }
                 false
             }
@@ -3708,9 +3700,11 @@ mod tests {
         );
     }
 
-    #[test]
-    /** @brief 잘린 응답에 TCP로 다시 묻는지. */
-    fn tcp_fallback_on_truncation() {
+    /**
+     * @brief 같은 포트에서 UDP 와 TCP 로 답하는 가짜 업스트림을 띄운다.
+     * @param udp_reply UDP 질의에 돌려줄 바이트를 만든다. TCP 는 항상 9.9.9.9 를 담은 온전한 답이다.
+     */
+    fn spawn_udp_tcp_upstream(udp_reply: fn(&Message) -> Vec<u8>) -> SocketAddr {
         let mut pair = None;
         let mut last_error = None;
         let mut taken = Vec::new();
@@ -3736,12 +3730,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             while let Ok((n, from)) = udp.recv_from(&mut buf) {
                 if let Ok(req) = Message::parse(&buf[..n]) {
-                    let mut tc = Message::default();
-                    tc.header.id = req.header.id;
-                    tc.header.response = true;
-                    tc.header.truncated = true;
-                    tc.questions = req.questions.clone();
-                    let _ = udp.send_to(&tc.try_encode().unwrap(), from);
+                    let _ = udp.send_to(&udp_reply(&req), from);
                 }
             }
         });
@@ -3768,14 +3757,55 @@ mod tests {
                 let _ = s.write_all(&out);
             }
         });
+        addr
+    }
 
+    /** @brief 가짜 업스트림에 물어 TCP 로 받은 온전한 답이 나오는지 확인하고 걸린 시간을 돌려준다. */
+    fn resolve_through_tcp_fallback(addr: SocketAddr) -> Duration {
         let fwd = Forwarder::new(vec![addr], Duration::from_secs(20));
+        let started = Instant::now();
         let resp = fwd.resolve(&query("trunc.example.com")).unwrap();
+        let elapsed = started.elapsed();
         assert_eq!(resp.answers.len(), 1, "TCP 폴백으로 전체 응답");
         match &resp.answers[0].rdata {
             RData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(9, 9, 9, 9)),
             _ => panic!("A 기대"),
         }
+        elapsed
+    }
+
+    #[test]
+    /** @brief 잘린 응답에 TCP로 다시 묻는지. */
+    fn tcp_fallback_on_truncation() {
+        let addr = spawn_udp_tcp_upstream(|req| {
+            let mut tc = Message::default();
+            tc.header.id = req.header.id;
+            tc.header.response = true;
+            tc.header.truncated = true;
+            tc.questions = req.questions.clone();
+            tc.try_encode().unwrap()
+        });
+        resolve_through_tcp_fallback(addr);
+    }
+
+    #[test]
+    /**
+     * @brief TC 없이 레코드 중간에서 끊긴 UDP 응답에 곧바로 TCP 로 다시 묻는지.
+     * @details UDP 53 을 가로채는 프록시가 512바이트에서 이렇게 자른다. 버리고 기다리면
+     *          질의 제한 시간을 다 쓰고 실패한다.
+     */
+    fn tcp_fallback_on_reply_cut_without_tc() {
+        let addr = spawn_udp_tcp_upstream(|req| {
+            let full = answer_for(req, Ipv4Addr::new(9, 9, 9, 9))
+                .try_encode()
+                .unwrap();
+            full[..full.len() - 3].to_vec()
+        });
+        let elapsed = resolve_through_tcp_fallback(addr);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "잘린 응답을 버리고 제한 시간까지 기다렸다: {elapsed:?}"
+        );
     }
 
     #[test]

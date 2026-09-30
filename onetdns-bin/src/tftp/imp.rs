@@ -72,9 +72,7 @@ impl RootHandle {
         let canonical = root.canonicalize()?;
         let metadata = canonical.symlink_metadata()?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(std::io::Error::other(
-                "TFTP root가 안전한 디렉터리가 아닙니다",
-            ));
+            return Err(std::io::Error::other("TFTP root is not a safe directory"));
         }
         use std::os::unix::fs::OpenOptionsExt;
         let mut options = OpenOptions::new();
@@ -83,7 +81,7 @@ impl RootHandle {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let dir = options.open(&canonical)?;
         if !dir.metadata()?.is_dir() {
-            return Err(std::io::Error::other("TFTP root가 디렉터리가 아닙니다"));
+            return Err(std::io::Error::other("TFTP root is not a directory"));
         }
         Ok(Self { dir })
     }
@@ -93,14 +91,14 @@ impl RootHandle {
      * @warning 이어진 곳을 따라가지 않는다. 따라가면 루트 바깥의 파일이 그대로 나간다.
      */
     fn open_read(&self, name: &str) -> std::io::Result<File> {
-        let name = safe_file_name(name)
-            .ok_or_else(|| std::io::Error::other("안전하지 않은 TFTP 파일명"))?;
+        let name =
+            safe_file_name(name).ok_or_else(|| std::io::Error::other("Unsafe TFTP file name"))?;
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
         let name = CString::new(std::ffi::OsStr::new(name).as_bytes())
-            .map_err(|_| std::io::Error::other("TFTP 파일명 NUL 포함"))?;
+            .map_err(|_| std::io::Error::other("TFTP file name contains NUL"))?;
         let fd = unsafe {
             libc::openat(
                 self.dir.as_raw_fd(),
@@ -113,7 +111,7 @@ impl RootHandle {
         }
         let file = unsafe { File::from_raw_fd(fd) };
         if !file.metadata()?.is_file() {
-            return Err(std::io::Error::other("TFTP 대상이 일반 파일이 아닙니다"));
+            return Err(std::io::Error::other("TFTP target is not a regular file"));
         }
         Ok(file)
     }
@@ -129,7 +127,7 @@ impl RootHandle {
         use std::os::unix::ffi::OsStrExt;
 
         let name = CString::new(std::ffi::OsStr::new(name).as_bytes())
-            .map_err(|_| std::io::Error::other("TFTP 파일명 NUL 포함"))?;
+            .map_err(|_| std::io::Error::other("TFTP file name contains NUL"))?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let rc = unsafe {
             libc::fstatat(
@@ -143,14 +141,14 @@ impl RootHandle {
             let stat = unsafe { stat.assume_init() };
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
                 return Err(std::io::Error::other(
-                    "기존 TFTP 대상이 일반 파일이 아니거나 symlink임",
+                    "Existing TFTP target is not a regular file or is a symlink",
                 ));
             }
 
             if !allow_overwrite {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    "기존 TFTP 파일 덮어쓰기가 허용되지 않았습니다. tftp_allow_overwrite 설정을 확인하십시오",
+                    "Overwriting an existing TFTP file is not allowed; check tftp_allow_overwrite",
                 ));
             }
             return Ok(());
@@ -187,8 +185,8 @@ struct TempUpload {
 impl TempUpload {
     /** @brief 임시 파일을 만든다. 같은 이름이 이미 있으면 실패한다. */
     fn create(root: Arc<RootHandle>, name: &str, allow_overwrite: bool) -> std::io::Result<Self> {
-        let name = safe_file_name(name)
-            .ok_or_else(|| std::io::Error::other("안전하지 않은 TFTP 파일명"))?;
+        let name =
+            safe_file_name(name).ok_or_else(|| std::io::Error::other("Unsafe TFTP file name"))?;
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let nonce = u64::from_le_bytes(onetdns_core::try_random_array::<8>()?);
         let temp_name = format!(
@@ -202,7 +200,7 @@ impl TempUpload {
 
         root.validate_final_name(name, allow_overwrite)?;
         let temp_c = CString::new(std::ffi::OsStr::new(&temp_name).as_bytes())
-            .map_err(|_| std::io::Error::other("임시 파일명 NUL 포함"))?;
+            .map_err(|_| std::io::Error::other("Temporary file name contains NUL"))?;
         let fd = unsafe {
             libc::openat(
                 root.dir.as_raw_fd(),
@@ -229,7 +227,7 @@ impl TempUpload {
     fn file_mut(&mut self) -> std::io::Result<&mut File> {
         self.file
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("업로드 파일 닫힘"))
+            .ok_or_else(|| std::io::Error::other("Upload file is closed"))
     }
 
     /**
@@ -249,9 +247,9 @@ impl TempUpload {
         self.root
             .validate_final_name(&self.final_name, self.allow_overwrite)?;
         let temp = CString::new(std::ffi::OsStr::new(&self.temp_name).as_bytes())
-            .map_err(|_| std::io::Error::other("임시 파일명 NUL 포함"))?;
+            .map_err(|_| std::io::Error::other("Temporary file name contains NUL"))?;
         let final_name = CString::new(std::ffi::OsStr::new(&self.final_name).as_bytes())
-            .map_err(|_| std::io::Error::other("최종 파일명 NUL 포함"))?;
+            .map_err(|_| std::io::Error::other("Final file name contains NUL"))?;
         atomic_install(
             self.root.dir.as_raw_fd(),
             temp.as_ptr(),
@@ -371,25 +369,25 @@ pub enum Op {
  */
 pub fn parse_request(buf: &[u8]) -> Result<(Op, String), &'static str> {
     if buf.len() < 4 {
-        return Err("짧은 패킷");
+        return Err("Packet is too short");
     }
     let op = match u16::from_be_bytes([buf[0], buf[1]]) {
         OP_RRQ => Op::Read,
         OP_WRQ => Op::Write,
-        _ => return Err("TFTP RRQ 또는 WRQ 요청이 아닙니다"),
+        _ => return Err("Not a TFTP RRQ or WRQ request"),
     };
     let mut fields = buf[2..].split(|byte| *byte == 0);
-    let name = fields.next().ok_or("파일 이름이 없습니다")?;
-    let mode = fields.next().ok_or("전송 모드가 없습니다")?;
+    let name = fields.next().ok_or("File name is missing")?;
+    let mode = fields.next().ok_or("Transfer mode is missing")?;
     if name.is_empty() || mode.is_empty() {
-        return Err("파일 이름 또는 전송 모드가 비어 있습니다");
+        return Err("File name or transfer mode is empty");
     }
     if !mode.eq_ignore_ascii_case(b"octet") {
-        return Err("지원하지 않는 TFTP mode");
+        return Err("Unsupported TFTP mode");
     }
     let rest: Vec<&[u8]> = fields.collect();
     if rest.last().is_some_and(|value| !value.is_empty()) {
-        return Err("요청 끝의 NUL 문자가 없습니다");
+        return Err("The request does not end with a NUL character");
     }
     let options = if rest.last().is_some_and(|value| value.is_empty()) {
         &rest[..rest.len().saturating_sub(1)]
@@ -401,9 +399,9 @@ pub fn parse_request(buf: &[u8]) -> Result<(Op, String), &'static str> {
             .chunks(2)
             .any(|pair| pair[0].is_empty() || pair[1].is_empty())
     {
-        return Err("TFTP option key/value 형식이 올바르지 않습니다");
+        return Err("Malformed TFTP option key or value");
     }
-    let name = std::str::from_utf8(name).map_err(|_| "파일명 UTF-8 형식이 올바르지 않습니다")?;
+    let name = std::str::from_utf8(name).map_err(|_| "File name is not valid UTF-8")?;
     Ok((op, name.to_string()))
 }
 
@@ -515,7 +513,7 @@ fn serve_write(
         let Some(n) = got else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "TFTP 쓰기 요청이 제한 시간 안에 끝나지 않았습니다",
+                "TFTP write request did not finish in time",
             ));
         };
         if n < 4 {
@@ -523,7 +521,7 @@ fn serve_write(
         }
         let op = u16::from_be_bytes([buf[0], buf[1]]);
         if op == OP_ERROR {
-            return Err(std::io::Error::other("클라이언트 ERROR"));
+            return Err(std::io::Error::other("Client sent ERROR"));
         }
         if op != OP_DATA {
             continue;
@@ -537,7 +535,7 @@ fn serve_write(
             let Some(next) = next else {
                 let _ = sock.send_to(&error_packet(3, "Disk full or allocation exceeded"), client);
                 return Err(std::io::Error::other(
-                    "TFTP 쓰기 요청의 파일 크기가 허용 한도를 넘었습니다",
+                    "TFTP write request exceeds the file size limit",
                 ));
             };
             upload.file_mut()?.write_all(payload)?;
@@ -550,12 +548,12 @@ fn serve_write(
                     client,
                 );
                 return Err(std::io::Error::other(
-                    "TFTP 쓰기 요청의 블록 번호가 한 바퀴 돌아가는 전송은 허용하지 않습니다",
+                    "TFTP write requests whose block number wraps around are not allowed",
                 ));
             }
             if payload.len() < BLOCK {
                 if let Err(error) = upload.commit() {
-                    let _ = sock.send_to(&error_packet(2, "접근 권한이 없습니다"), client);
+                    let _ = sock.send_to(&error_packet(2, "Access denied"), client);
                     return Err(error);
                 }
                 sock.send_to(&last_ack, client)?;
@@ -607,7 +605,7 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
         let n = match file.read(&mut buf) {
             Ok(n) => n,
             Err(error) => {
-                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "부팅 파일을 읽는 중에 실패해 전송을 중단했습니다");
+                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "Failed to read the boot file; aborted the transfer");
                 return;
             }
         };
@@ -618,7 +616,7 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
                 return;
             }
             if let Err(error) = sock.send_to(&pkt, client) {
-                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "부팅 파일 조각을 보내지 못해 전송을 중단했습니다");
+                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "Could not send a boot file block; aborted the transfer");
                 return;
             }
             let mut ack = [0u8; 64];
@@ -631,7 +629,7 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
             }
         }
         if !acked {
-            onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, "다섯 번 보내도 응답이 없어 전송을 중단했습니다. 이 기기는 네트워크 부팅을 마치지 못합니다");
+            onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, "No response after five retries; aborted the transfer, so this device cannot finish network boot");
             return;
         }
         if n < BLOCK {
@@ -679,7 +677,7 @@ pub fn spawn_tftp(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) {
-                        onetdns_core::warn!(event = "tftp.recv_failed", %error, "TFTP 요청을 받지 못했습니다");
+                        onetdns_core::warn!(event = "tftp.recv_failed", %error, "Failed to receive a TFTP request");
                     }
                     continue;
                 }
@@ -687,8 +685,8 @@ pub fn spawn_tftp(
             let request = match parse_request(&buf[..n]) {
                 Ok(request) => request,
                 Err(error) => {
-                    onetdns_core::debug!(event = "tftp.request_invalid", %client, %error, "해석하지 못한 TFTP 요청을 거절했습니다");
-                    let _ = sock.send_to(&error_packet(4, "지원하지 않는 TFTP 요청입니다"), client);
+                    onetdns_core::debug!(event = "tftp.request_invalid", %client, %error, "Rejected a malformed TFTP request");
+                    let _ = sock.send_to(&error_packet(4, "Unsupported TFTP request"), client);
                     continue;
                 }
             };
@@ -698,7 +696,7 @@ pub fn spawn_tftp(
                 })
                 .is_err()
             {
-                onetdns_core::warn!(event = "tftp.busy", %client, limit = MAX_TRANSFERS, "동시 전송 수가 한도에 닿아 TFTP 요청을 거절했습니다");
+                onetdns_core::warn!(event = "tftp.busy", %client, limit = MAX_TRANSFERS, "Rejected a TFTP request because the concurrent transfer limit was reached");
                 let _ = sock.send_to(&error_packet(0, "Server busy"), client);
                 continue;
             }
@@ -706,13 +704,13 @@ pub fn spawn_tftp(
             let xfer = match UdpSocket::bind(transfer_bind) {
                 Ok(s) => s,
                 Err(error) => {
-                    onetdns_core::warn!(event = "tftp.transfer_bind_failed", %client, %error, "전송용 소켓을 열지 못해 TFTP 요청을 처리하지 못했습니다");
+                    onetdns_core::warn!(event = "tftp.transfer_bind_failed", %client, %error, "Could not open a transfer socket; TFTP request not handled");
                     active.fetch_sub(1, Ordering::AcqRel);
                     continue;
                 }
             };
             if let Err(error) = xfer.set_read_timeout(Some(Duration::from_secs(2))) {
-                onetdns_core::warn!(event = "tftp.transfer_timeout_failed", %client, %error, "전송용 소켓에 제한 시간을 걸지 못해 응답이 없는 상대에 오래 붙잡힐 수 있습니다");
+                onetdns_core::warn!(event = "tftp.transfer_timeout_failed", %client, %error, "Could not set a timeout on the transfer socket; an unresponsive peer can hold it for a long time");
             }
             let root = root.clone();
             let active_worker = active.clone();
@@ -726,18 +724,18 @@ pub fn spawn_tftp(
                         (Op::Read, name) => match root.open_read(&name).and_then(|file| {
                             let meta = file.metadata()?;
                             if !meta.is_file() || meta.len() > MAX_READ {
-                                return Err(std::io::Error::other("파일 크기/형식 제한"));
+                                return Err(std::io::Error::other("File size or type limit"));
                             }
                             Ok(file)
                         }) {
                             Ok(mut file) => {
                                 let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-                                onetdns_core::debug!(event = "tftp.sent", %client, file = %name, bytes, "TFTP 파일을 전송했습니다");
+                                onetdns_core::debug!(event = "tftp.sent", %client, file = %name, bytes, "Sent TFTP file");
                                 serve_read(&xfer, client, &mut file, &transfer_shutdown);
                             }
                             Err(error) => {
-                                onetdns_core::warn!(event = "tftp.read_rejected", %client, file = %name, %error, "요청한 부팅 파일을 내주지 못했습니다. 이 기기는 네트워크 부팅에 실패합니다");
-                                let _ = xfer.send_to(&error_packet(1, "파일을 찾을 수 없습니다"), client);
+                                onetdns_core::warn!(event = "tftp.read_rejected", %client, file = %name, %error, "Could not serve the requested boot file; this device will fail to network boot");
+                                let _ = xfer.send_to(&error_packet(1, "File not found"), client);
                             }
                         },
                         (Op::Write, name) => {
@@ -746,7 +744,7 @@ pub fn spawn_tftp(
                                 || write_allow.iter().any(|n| n.contains(&client.ip()));
                             if !writable || !src_ok {
                                 let reason = if writable { "source_not_allowed" } else { "write_disabled" };
-                                onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, reason = reason, "허용하지 않은 TFTP 쓰기 요청을 거절했습니다");
+                                onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, reason = reason, "Rejected a TFTP write request that is not allowed");
                                 let _ = xfer.send_to(&error_packet(2, "Write not permitted"), client);
                             } else {
                                 match serve_write(
@@ -758,14 +756,14 @@ pub fn spawn_tftp(
                                     allow_overwrite,
                                 ) {
                                     Ok(bytes) => {
-                                        onetdns_core::debug!(event = "tftp.received", %client, file = %name, bytes, "TFTP 파일 수신을 마쳤습니다");
+                                        onetdns_core::debug!(event = "tftp.received", %client, file = %name, bytes, "Received TFTP file");
                                     }
                                     Err(error)
                                         if error.kind()
                                             == std::io::ErrorKind::ConnectionAborted => {}
                                     Err(error) => {
-                                        let _ = xfer.send_to(&error_packet(2, "접근 권한이 없습니다"), client);
-                                        onetdns_core::warn!(event = "tftp.receive_failed", %client, file = %name, %error, "TFTP 파일을 받지 못했습니다");
+                                        let _ = xfer.send_to(&error_packet(2, "Access denied"), client);
+                                        onetdns_core::warn!(event = "tftp.receive_failed", %client, file = %name, %error, "Failed to receive TFTP file");
                                     }
                                 }
                             }
@@ -775,7 +773,7 @@ pub fn spawn_tftp(
             match spawn {
                 Ok(thread) => transfers.push(thread),
                 Err(error) => {
-                    onetdns_core::warn!(event = "tftp.transfer_spawn_failed", %client, %error, "전송 스레드를 시작하지 못해 TFTP 요청을 처리하지 못했습니다");
+                    onetdns_core::warn!(event = "tftp.transfer_spawn_failed", %client, %error, "Could not start a transfer thread; TFTP request not handled");
                     active.fetch_sub(1, Ordering::AcqRel);
                 }
             }

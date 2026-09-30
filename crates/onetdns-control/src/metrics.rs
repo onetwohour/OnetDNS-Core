@@ -881,7 +881,7 @@ impl Drop for RecorderRuntime {
         {
             thread.thread().unpark();
             if thread.join().is_err() {
-                onetdns_core::error!(event = "metrics.sampler_panicked", "이력 표본 스레드가 예기치 않게 끝났습니다. 그동안의 시간별 이력이 비어 있습니다");
+                onetdns_core::error!(event = "metrics.sampler_panicked", "History sampling thread exited unexpectedly; hourly history has a gap for this period");
             }
         }
         if let Some(thread) = self
@@ -893,7 +893,7 @@ impl Drop for RecorderRuntime {
             if thread.join().is_err() {
                 onetdns_core::error!(
                     event = "metrics.collector_panicked",
-                    "통계 수집 스레드가 예기치 않게 끝났습니다. 그동안의 질의 기록이 비어 있습니다"
+                    "Statistics thread exited unexpectedly; query records have a gap for this period"
                 );
             }
         }
@@ -1092,7 +1092,7 @@ impl Recorder {
                     onetdns_core::warn!(
                         event = "stats.slot_full",
                         dropped,
-                        "통계 수집 슬롯이 가득 차 상위 도메인·클라이언트 목록의 일부 귀속을 잃었습니다. 누적 질의 수는 그대로입니다"
+                        "Statistics slots are full; some top domain and client counts were lost, but total query counts are intact"
                     );
                 }
                 return;
@@ -1133,12 +1133,12 @@ impl Recorder {
                     mpsc::TrySendError::Full(_) => onetdns_core::warn!(
                         event = "querylog.queue_full",
                         dropped,
-                        "질의 로그 대기열이 가득 차 일부 항목을 기록하지 못했습니다"
+                        "Query log queue is full; some entries were not recorded"
                     ),
                     mpsc::TrySendError::Disconnected(_) => onetdns_core::error!(
                         event = "querylog.collector_disconnected",
                         dropped,
-                        "질의 로그 기록 스레드가 종료되어 새 항목을 저장할 수 없습니다"
+                        "Query log writer thread has exited; new entries cannot be saved"
                     ),
                 }
             }
@@ -1557,7 +1557,7 @@ impl Stats {
                         event = "querylog.previous_path_final_flush_failed",
                         path = %path.display(),
                         %error,
-                        "기존 질의 기록 파일에 마지막 상태를 저장하지 못했지만 새 설정으로 전환합니다"
+                        "Could not save the final state to the old query log file; switching to the new configuration anyway"
                     );
                 }
             }
@@ -1579,7 +1579,7 @@ impl Stats {
                         event = "stats.previous_path_final_flush_failed",
                         path = %path.display(),
                         %error,
-                        "기존 통계 파일에 마지막 상태를 저장하지 못했지만 새 설정으로 전환합니다"
+                        "Could not save the final state to the old statistics file; switching to the new configuration anyway"
                     );
                 }
             }
@@ -1697,7 +1697,7 @@ fn process_event(
                         onetdns_core::warn!(
                             event = "querylog.subscriber_dropped",
                             dropped,
-                            "느린 실시간 로그 구독 연결을 종료했습니다"
+                            "Closed a slow live log subscriber"
                         );
                     }
                     false
@@ -1863,7 +1863,7 @@ fn persist_warning(
             let message = error.to_string();
             let now = Instant::now();
             if warnings.should_log(kind, path, &message, now) {
-                onetdns_core::warn!(event = "stats.persist_flush_failed", kind = kind.as_str(), path = %path.display(), error = %error, "통계 또는 질의 로그 파일을 저장하지 못했습니다");
+                onetdns_core::warn!(event = "stats.persist_flush_failed", kind = kind.as_str(), path = %path.display(), error = %error, "Could not save the statistics or query log file");
             }
         }
         None => warnings.clear(kind),
@@ -2031,7 +2031,7 @@ pub fn channel(
                             dropped_query_logs,
                             dropped_live_events,
                             persist_failures,
-                            "최근 1분간 DNS 처리 현황을 집계했습니다"
+                            "DNS activity over the last minute"
                         );
                     }
                     previous_total = snapshot.total;
@@ -2048,7 +2048,7 @@ pub fn channel(
             }) {
             Ok(thread) => Some(thread),
             Err(error) => {
-                onetdns_core::warn!(event = "metrics.sampler_start_failed", %error, "시계열 통계 스레드를 시작하지 못해 시계열 기록을 비활성화합니다");
+                onetdns_core::warn!(event = "metrics.sampler_start_failed", %error, "Could not start the time-series statistics thread; time-series recording is disabled");
                 None
             }
         }
@@ -2193,7 +2193,7 @@ pub fn channel(
         }) {
         Ok(thread) => Some(thread),
         Err(error) => {
-            onetdns_core::warn!(event = "metrics.collector_start_failed", %error, "통계 기록 스레드를 시작하지 못해 질의 로그 기록을 비활성화합니다");
+            onetdns_core::warn!(event = "metrics.collector_start_failed", %error, "Could not start the statistics writer thread; query logging is disabled");
             None
         }
     };

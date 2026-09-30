@@ -60,7 +60,7 @@ fn ecs_encode_failed(error: &impl std::fmt::Display) {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::error!(event = "ecs.edns_encode_failed", count = count, %error, "클라이언트 대역 정보를 붙인 EDNS 레코드를 만들지 못해 질의를 실패로 접었습니다");
+        onetdns_core::error!(event = "ecs.edns_encode_failed", count = count, %error, "Could not build the EDNS record carrying the client subnet; failing the query");
     }
 }
 

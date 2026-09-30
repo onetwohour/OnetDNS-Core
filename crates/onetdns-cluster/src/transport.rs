@@ -117,7 +117,7 @@ impl ReplayCache {
     fn accept(&mut self, sender: NodeId, nonce: [u8; RAFT_NONCE_LEN]) -> bool {
         let mut session = [0u8; 16];
         session.copy_from_slice(&nonce[..16]);
-        let sequence = u64::from_be_bytes(nonce[16..].try_into().expect("고정 nonce 길이"));
+        let sequence = u64::from_be_bytes(nonce[16..].try_into().expect("Fixed nonce length"));
 
         let Some(window) = self.peers.get_mut(&sender) else {
             self.peers.insert(
@@ -576,7 +576,7 @@ impl Dispatcher {
         for (&peer_id, address) in peers {
             let socket: SocketAddr = address
                 .parse()
-                .map_err(|_| format!("Raft peer 주소 오류: {peer_id}@{address}"))?;
+                .map_err(|_| format!("Invalid Raft peer address: {peer_id}@{address}"))?;
             let (tx, rx) = mpsc::sync_channel(PEER_QUEUE);
             let cipher = cipher.clone();
             let signing_key = signing_key.clone();
@@ -596,7 +596,7 @@ impl Dispatcher {
                         rx,
                     )
                 })
-                .map_err(|error| format!("Raft peer sender 만들지 못했습니다: {error}"))?;
+                .map_err(|error| format!("Could not create the Raft peer sender: {error}"))?;
             track_thread(threads, thread);
             senders.insert(peer_id, tx);
         }
@@ -616,7 +616,7 @@ impl Dispatcher {
                 onetdns_core::warn!(
                     event = "raft.unknown_peer",
                     peer = output.to,
-                    "설정에 없는 노드로 보내려 해 메시지를 버렸습니다"
+                    "Dropped a message addressed to a node not in the configuration"
                 );
                 continue;
             };
@@ -627,7 +627,7 @@ impl Dispatcher {
                     onetdns_core::error!(
                         event = "raft.sender_gone",
                         peer = output.to,
-                        "이 노드로 가는 송신 스레드가 끝나 더는 메시지를 보내지 못합니다"
+                        "Sender thread for this node has exited; no more messages can be sent to it"
                     );
                 }
             }
@@ -645,7 +645,7 @@ fn reject_raft_connection(ip: IpAddr, reason: &str) {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "raft.connection_rejected", peer_ip = %ip, reason = reason, count = count, "클러스터 포트로 들어온 연결을 받지 않았습니다");
+        onetdns_core::warn!(event = "raft.connection_rejected", peer_ip = %ip, reason = reason, count = count, "Did not accept a connection on the cluster port");
     }
 }
 
@@ -671,7 +671,7 @@ fn peer_sender(
         onetdns_core::error!(
             event = "raft.sealer_init_failed",
             peer = peer_id,
-            "클러스터 프레임 봉인을 준비하지 못해 이 노드와 통신하지 않습니다"
+            "Could not set up cluster frame sealing; not communicating with this node"
         );
         return;
     };
@@ -687,7 +687,7 @@ fn peer_sender(
             onetdns_core::warn!(
                 event = "raft.message_too_large",
                 peer = peer_id,
-                "클러스터 메시지가 상한을 넘어 보내지 못했습니다. 이 노드의 복제가 밀립니다"
+                "Cluster message exceeds the size limit and was not sent; replication to this node falls behind"
             );
             continue;
         };
@@ -696,7 +696,7 @@ fn peer_sender(
                 event = "raft.frame_seal_failed",
                 peer = peer_id,
                 bytes = encoded.len(),
-                "클러스터 메시지를 봉인하지 못해 보내지 못했습니다"
+                "Could not seal a cluster message; not sent"
             );
             continue;
         };
@@ -710,7 +710,7 @@ fn peer_sender(
                         .and_then(|()| conn.set_read_timeout(Some(Duration::from_secs(5))))
                         .and_then(|()| conn.set_nodelay(true))
                     {
-                        onetdns_core::warn!(event = "raft.socket_options_failed", peer = peer_id, %error, "클러스터 연결에 제한 시간을 걸지 못했습니다");
+                        onetdns_core::warn!(event = "raft.socket_options_failed", peer = peer_id, %error, "Could not set a timeout on the cluster connection");
                     }
                 }
             }
@@ -729,11 +729,11 @@ fn peer_sender(
         match (delivered, reachable) {
             (false, true) => {
                 reachable = false;
-                onetdns_core::warn!(event = "raft.peer_unreachable", peer = peer_id, address = %address, "클러스터 노드에 닿지 못합니다. 이 노드는 복제에서 뒤처집니다");
+                onetdns_core::warn!(event = "raft.peer_unreachable", peer = peer_id, address = %address, "Cannot reach cluster node; it falls behind in replication");
             }
             (true, false) => {
                 reachable = true;
-                onetdns_core::info!(event = "raft.peer_reachable", peer = peer_id, address = %address, "클러스터 노드와 다시 이어졌습니다");
+                onetdns_core::info!(event = "raft.peer_reachable", peer = peer_id, address = %address, "Reconnected to cluster node");
             }
             _ => {}
         }
@@ -949,7 +949,7 @@ impl std::fmt::Display for ProposalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(reason) | Self::Undetermined(reason) => f.write_str(reason),
-            Self::Discarded => f.write_str("제안이 리더 교체로 폐기되었습니다"),
+            Self::Discarded => f.write_str("The proposal was discarded because the leader changed"),
         }
     }
 }
@@ -971,13 +971,13 @@ impl RaftHandle {
         let undetermined = |reason: &str| Err(ProposalError::Undetermined(reason.to_string()));
         if data.is_empty() || data.len() > MAX_ENTRY_BYTES {
             return Err(ProposalError::Rejected(format!(
-                "Raft 항목 크기는 1..={MAX_ENTRY_BYTES}바이트여야 합니다"
+                "A Raft entry must be 1..={MAX_ENTRY_BYTES} bytes"
             )));
         }
         if self.shutdown.load(Ordering::Acquire)
             || !self.accepting_proposals.load(Ordering::Acquire)
         {
-            return rejected("종료된 Raft 노드에는 변경을 제안할 수 없습니다");
+            return rejected("Cannot propose a change to a stopped Raft node");
         }
         let deadline = Instant::now() + PROPOSAL_TIMEOUT;
         self.pending_proposals.fetch_add(1, Ordering::AcqRel);
@@ -988,7 +988,7 @@ impl RaftHandle {
         if self.shutdown.load(Ordering::Acquire)
             || !self.accepting_proposals.load(Ordering::Acquire)
         {
-            return rejected("종료된 Raft 노드에는 변경을 제안할 수 없습니다");
+            return rejected("Cannot propose a change to a stopped Raft node");
         }
 
         let (response, result) = mpsc::channel();
@@ -998,24 +998,24 @@ impl RaftHandle {
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                return rejected("Raft 제안 대기열이 가득 찼습니다. 잠시 후 다시 시도하십시오");
+                return rejected("The Raft proposal queue is full; try again shortly");
             }
             Err(TrySendError::Disconnected(_)) => {
-                return rejected("Raft 제안 핸들러가 종료되었습니다");
+                return rejected("The Raft proposal handler has stopped");
             }
         }
         /* 핸들러에 넘긴 뒤로는 로그에 들어갔는지 모른다. 그때부터의 실패는 확정할 수 없다. */
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return undetermined("Raft 변경 요청 처리 시간이 초과되었습니다");
+            return undetermined("The Raft change request timed out");
         };
         let (index, proposal_term) = match result.recv_timeout(remaining) {
             Ok(Ok(appended)) => appended,
             Ok(Err(reason)) => return Err(ProposalError::Rejected(reason)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                return undetermined("Raft 변경 요청 처리 시간이 초과되었습니다");
+                return undetermined("The Raft change request timed out");
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return undetermined("Raft 제안 핸들러가 응답 전에 종료되었습니다");
+                return undetermined("The Raft proposal handler stopped before replying");
             }
         };
 
@@ -1034,14 +1034,12 @@ impl RaftHandle {
                     return undetermined(error);
                 }
                 if !node.is_leader() {
-                    return undetermined("제안 커밋 전에 리더십을 잃었습니다");
+                    return undetermined("Lost leadership before the proposal was committed");
                 }
             }
             let now = Instant::now();
             if now >= deadline {
-                return undetermined(
-                    "Raft 변경 요청이 제한 시간 안에 합의되고 적용되지 않았습니다",
-                );
+                return undetermined("The Raft change request was not agreed and applied in time");
             }
             let timeout = deadline.saturating_duration_since(now);
             let observed = *generation;
@@ -1050,9 +1048,7 @@ impl RaftHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             generation = result.0;
             if result.1.timed_out() {
-                return undetermined(
-                    "Raft 변경 요청이 제한 시간 안에 합의되고 적용되지 않았습니다",
-                );
+                return undetermined("The Raft change request was not agreed and applied in time");
             }
         }
     }
@@ -1154,7 +1150,7 @@ impl RaftHandle {
                     pending,
                     applied,
                     last,
-                    "Raft 종료 전 기존 제안 적용을 기다리는 제한 시간을 넘었습니다"
+                    "Timed out waiting for pending proposals to apply before Raft shutdown"
                 );
                 break;
             }
@@ -1405,37 +1401,38 @@ impl RaftServer {
         let secret = Zeroizing::new(secret);
         let node_signing_seed = Zeroizing::new(node_signing_seed);
         if secret.len() < 32 {
-            return Err("raft secret은 최소 32바이트여야 합니다".into());
+            return Err("The Raft secret must be at least 32 bytes".into());
         }
         if tick_ms == 0 {
-            return Err("raft tick_ms는 0일 수 없습니다".into());
+            return Err("Raft tick_ms cannot be 0".into());
         }
         if let Some(error) = node.fatal_error() {
             return Err(error.to_string());
         }
-        let listen_addr: SocketAddr = listen
-            .parse()
-            .map_err(|_| format!("Raft listen 주소 오류(숫자 IP:port 필요): {listen}"))?;
+        let listen_addr: SocketAddr = listen.parse().map_err(|_| {
+            format!("Invalid Raft listen address (numeric IP:port required): {listen}")
+        })?;
 
         if peers.contains_key(&self_id) {
-            return Err("Raft peers에는 이 노드 자신의 ID를 포함할 수 없습니다".into());
+            return Err("Raft peers cannot include this node's own ID".into());
         }
         if peer_keys.contains_key(&self_id) {
-            return Err("Raft peer_keys에는 이 노드 자신의 ID를 포함할 수 없습니다".into());
+            return Err("Raft peer_keys cannot include this node's own ID".into());
         }
         if peers.len() != peer_keys.len()
             || peers.keys().any(|id| !peer_keys.contains_key(id))
             || peer_keys.keys().any(|id| !peers.contains_key(id))
         {
-            return Err("Raft peers와 peer_keys의 노드 ID 집합이 정확히 일치해야 합니다".into());
+            return Err("Raft peers and peer_keys must list exactly the same node IDs".into());
         }
 
         let signing_key = Arc::new(SigningKey::from_bytes(&node_signing_seed));
         drop(node_signing_seed);
         let mut verifying = HashMap::new();
         for (&id, pk) in &peer_keys {
-            let vk = VerifyingKey::from_bytes(pk)
-                .map_err(|_| format!("Raft peer {id} 공개키가 유효한 Ed25519 키가 아닙니다"))?;
+            let vk = VerifyingKey::from_bytes(pk).map_err(|_| {
+                format!("The public key of Raft peer {id} is not a valid Ed25519 key")
+            })?;
             verifying.insert(id, vk);
         }
 
@@ -1445,27 +1442,28 @@ impl RaftServer {
         for (&id, vk) in &verifying {
             if !unique_keys.insert(vk.to_bytes()) {
                 return Err(format!(
-                    "Raft 노드 {id}의 공개 키가 다른 노드와 같습니다. 노드마다 서로 다른 키를 사용하십시오"
+                    "The public key of Raft node {id} is the same as another node's; use a different key on every node"
                 ));
             }
         }
 
         let cluster_context = derive_cluster_context(&secret, self_id, &own_public, &verifying);
         let cipher = Arc::new(
-            raft_cipher(&secret).ok_or("Raft 공유 비밀에서 프레임 암호 키를 만들지 못했습니다")?,
+            raft_cipher(&secret)
+                .ok_or("Could not derive the frame encryption key from the Raft shared secret")?,
         );
         drop(secret);
 
         let mut node = node;
         let session_prefix = node
             .next_boot_session()
-            .map_err(|error| format!("Raft 세션 카운터 준비 실패: {error}"))?;
+            .map_err(|error| format!("Could not prepare the Raft session counter: {error}"))?;
         let node = Arc::new(Mutex::new(node));
         let peers = Arc::new(peers);
         for id in peers.keys() {
             if !verifying.contains_key(id) {
                 return Err(format!(
-                    "Raft peer {id}의 공개키가 없습니다. 노드별 인증에 필수"
+                    "Raft peer {id} has no public key; per-node authentication requires one"
                 ));
             }
         }
@@ -1509,11 +1507,12 @@ impl RaftServer {
             threads: threads.clone(),
         };
 
-        let listener = TcpListener::bind(listen_addr)
-            .map_err(|error| format!("Raft 수신 주소 {listen_addr}를 열지 못했습니다: {error}"))?;
+        let listener = TcpListener::bind(listen_addr).map_err(|error| {
+            format!("Could not open the Raft listening address {listen_addr}: {error}")
+        })?;
         listener
             .set_nonblocking(true)
-            .map_err(|error| format!("raft nonblocking 설정하지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not make the Raft socket non-blocking: {error}"))?;
 
         {
             let node = node.clone();
@@ -1690,7 +1689,7 @@ impl RaftServer {
                             if let Some(snapshot) = pending_snapshot {
                                 if let Err(error) = on_install_snapshot(&snapshot.data) {
                                     lock(&node).fail_stop(format!(
-                                        "Raft 스냅샷 {}을 상태머신에 설치하지 못했습니다: {error}",
+                                        "Could not install Raft snapshot {} into the state machine: {error}",
                                         snapshot.index
                                     ));
                                     signal_progress(&progress);
@@ -1716,7 +1715,7 @@ impl RaftServer {
                                     Ok(snapshot) => snapshot,
                                     Err(error) => {
                                         lock(&node).fail_stop(format!(
-                                            "Raft 상태머신 스냅샷을 만들지 못했습니다: {error}"
+                                            "Could not create a Raft state machine snapshot: {error}"
                                         ));
                                         signal_progress(&progress);
                                         break 'apply;
@@ -1743,14 +1742,14 @@ impl RaftServer {
                                 };
                                 if let Err(error) = apply_result {
                                     lock(&node).fail_stop(format!(
-                                        "Raft 로그 항목 {}을 실행하지 못했습니다: {error}",
+                                        "Could not apply Raft log entry {}: {error}",
                                         entry.index
                                     ));
                                     signal_progress(&progress);
                                     break 'apply;
                                 }
                             }
-                            let last = entries.last().expect("비어 있지 않은 적용 배치").index;
+                            let last = entries.last().expect("The apply batch is not empty").index;
                             let mark_result = { lock(&node).mark_applied_batch(first, last) };
                             if let Err(error) = mark_result {
                                 lock(&node).fail_stop(error);
@@ -1890,7 +1889,7 @@ fn handle_conn(
                     event = "raft.replay_rejected",
                     peer = from,
                     count,
-                    "Raft 재전송 방지 검사에서 프레임을 거부했습니다"
+                    "Rejected a frame in the Raft replay check"
                 );
             }
             return;
@@ -2548,7 +2547,7 @@ mod tests {
         assert_eq!(
             handle.propose(b"change".to_vec()),
             Err(ProposalError::Rejected(
-                "종료된 Raft 노드에는 변경을 제안할 수 없습니다".into()
+                "Cannot propose a change to a stopped Raft node".into()
             ))
         );
         assert!(started.elapsed() < Duration::from_millis(100));

@@ -563,7 +563,7 @@ pub mod testsign {
         /** @brief PKCS#1 v1.5 서명을 만든다. 테스트 전용이다. */
         pub fn sign_pkcs1(&self, hash: RsaHash, msg: &[u8]) -> Vec<u8> {
             let em = emsa_pkcs1(hash, msg, self.n.len())
-                .expect("RSA 공개키 모듈러스 길이가 최소 요구 크기보다 짧습니다");
+                .expect("RSA public key modulus is shorter than the minimum size");
             self.raw_sign(&em)
         }
 
@@ -573,13 +573,13 @@ pub mod testsign {
          */
         pub fn sign_pss(&self, hash: RsaHash, msg: &[u8], salt: &[u8]) -> Vec<u8> {
             let hlen = hash.digest_len();
-            assert_eq!(salt.len(), hlen, "PSS salt는 해시 길이와 같아야 함");
-            let modulus = Modulus::parse(&self.n, MIN_MODULUS_BITS).expect("잘못된 테스트 키");
+            assert_eq!(salt.len(), hlen, "PSS salt must match the hash length");
+            let modulus = Modulus::parse(&self.n, MIN_MODULUS_BITS).expect("Invalid test key");
             let em_bits = modulus.bits as usize - 1;
             let em_len = em_bits.div_ceil(8);
             assert!(
                 em_len >= 2 * hlen + 2,
-                "RSA 공개키 모듈러스 길이가 최소 요구 크기보다 짧습니다"
+                "RSA public key modulus is shorter than the minimum size"
             );
 
             let mhash = hash.digest(&[msg]);
@@ -603,10 +603,10 @@ pub mod testsign {
 
         /** @brief 인코딩 블록을 개인 지수로 올린다. 상수시간이 아니다. */
         fn raw_sign(&self, em: &[u8]) -> Vec<u8> {
-            let modulus = Modulus::parse(&self.n, MIN_MODULUS_BITS).expect("잘못된 테스트 키");
+            let modulus = Modulus::parse(&self.n, MIN_MODULUS_BITS).expect("Invalid test key");
             modulus
                 .pow(em, &self.d)
-                .expect("EM이 모듈러스 범위를 벗어남")
+                .expect("EM is outside the modulus range")
         }
     }
 

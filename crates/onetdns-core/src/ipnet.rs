@@ -78,7 +78,7 @@ pub struct ParseIpNetError(String);
 impl std::fmt::Display for ParseIpNetError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "잘못된 CIDR: {}", self.0)
+        write!(f, "Invalid CIDR: {}", self.0)
     }
 }
 

@@ -125,7 +125,7 @@ impl DomainTable {
                 self.overflowed = true;
                 onetdns_core::warn!(
                     event = "filter.rule_table_overflow",
-                    "차단 목록이 32비트 인덱스 한도를 넘어 이후 규칙을 넣지 않았습니다"
+                    "Blocklist exceeds the 32-bit index limit; later rules were not added"
                 );
             }
             return false;

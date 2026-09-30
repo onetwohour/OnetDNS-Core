@@ -40,7 +40,7 @@ pub fn record_error(
             peer = %peer,
             count = count,
             error = %detail,
-            "DNS 전송 중 오류가 발생했습니다"
+            "Error during DNS transport"
         );
     }
 }

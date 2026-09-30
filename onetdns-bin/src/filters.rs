@@ -32,11 +32,10 @@ pub(crate) fn mutate_user_rule(
 
     let rule = rule.trim();
     if rule.is_empty() {
-        return Err("`rule` 항목을 입력해야 합니다".to_string());
+        return Err("`rule` is required".to_string());
     }
     if add {
-        onetdns_filter::validate_rule(rule)
-            .map_err(|reason| format!("유효하지 않은 규칙: {reason}"))?;
+        onetdns_filter::validate_rule(rule).map_err(|reason| format!("Invalid rule: {reason}"))?;
     }
     let into_allow = tab_allow || rule.starts_with("@@");
 
@@ -94,14 +93,14 @@ pub(crate) fn mutate_user_rule(
                             .map_err(|rollback_error| rollback_error.to_string())?,
                     );
                     if current != updated_text {
-                        return Err("실행 상태를 갱신하는 동안 설정 파일이 다시 변경되어 자동으로 되돌리지 않았습니다".to_string());
+                        return Err("The configuration file changed again while the runtime state was being updated, so it was not reverted automatically".to_string());
                     }
                     atomic_write(&path, previous_text.as_bytes())
                         .map_err(|rollback_error| rollback_error.to_string())
                 })();
                 with_rollback_result(
                     error,
-                    "규칙 설정을 이전 값으로 되돌리지 못했습니다",
+                    "Could not restore the previous rule settings",
                     rollback,
                 )
             } else {
@@ -117,7 +116,7 @@ fn expand_services(services: &[String]) -> Result<Vec<String>, String> {
     let mut out = vec![];
     for svc in services {
         let rules = onetdns_filter::services::service_rules(svc)
-            .ok_or_else(|| format!("지원하지 않는 서비스 차단 항목입니다: {svc}"))?;
+            .ok_or_else(|| format!("Unsupported blocked service: {svc}"))?;
         out.extend(rules.iter().map(|rule| (*rule).to_string()));
     }
     Ok(out)
@@ -222,10 +221,7 @@ pub(crate) fn build_filter_engine_for_config(
     let cached =
         compiled_filter_cache.and_then(|path| load_compiled_filter_cache(path, fingerprint));
     let parts = if let Some(parts) = cached {
-        onetdns_core::debug!(
-            event = "filter.cache_loaded",
-            "미리 만들어 둔 차단 목록을 읽었습니다"
-        );
+        onetdns_core::debug!(event = "filter.cache_loaded", "Loaded prebuilt blocklist");
         parts
     } else {
         let disk_subscription_files: Vec<Option<PathBuf>> = subscriptions
@@ -255,7 +251,7 @@ pub(crate) fn build_filter_engine_for_config(
                 onetdns_core::warn!(
                     event = "filter.subscription_unavailable",
                     url = %meta.url,
-                    "구독 캐시 파일이 없어 이 차단 목록의 규칙을 적용하지 못합니다"
+                    "Subscription cache file is missing; this blocklist's rules are not applied"
                 );
             }
         }
@@ -478,7 +474,7 @@ fn load_compiled_filter_cache(
 
     let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() > onetdns_filter::MAX_CACHE_BYTES as u64 {
-        onetdns_core::warn!(event = "filter.cache_evicted_oversize", path = %path.display(), "크기 제한을 넘은 컴파일된 필터 캐시를 삭제했습니다");
+        onetdns_core::warn!(event = "filter.cache_evicted_oversize", path = %path.display(), "Deleted the compiled filter cache because it exceeded the size limit");
         return None;
     }
     let mut bytes = Vec::new();
@@ -493,7 +489,7 @@ fn load_compiled_filter_cache(
     match onetdns_filter::decode_engine_cache(&bytes, fingerprint) {
         Ok(parts) => Some(parts),
         Err(error) => {
-            onetdns_core::debug!(event = "filter.cache_unusable", path = %path.display(), %error, "컴파일된 필터 캐시를 사용할 수 없어 원본 규칙을 다시 처리합니다");
+            onetdns_core::debug!(event = "filter.cache_unusable", path = %path.display(), %error, "Compiled filter cache is unusable; reprocessing the source rules");
             None
         }
     }
@@ -507,14 +503,14 @@ fn save_compiled_filter_cache(
 ) {
     if let Some(parent) = path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
-            onetdns_core::warn!(event = "filter.cache_dir_failed", path = %path.display(), %error, "컴파일된 필터 캐시 디렉터리를 만들지 못했습니다");
+            onetdns_core::warn!(event = "filter.cache_dir_failed", path = %path.display(), %error, "Could not create the compiled filter cache directory");
             return;
         }
     }
     if let Err(error) = atomic_write_with(path, false, |file| {
         onetdns_filter::write_engine_cache(parts, fingerprint, file).map_err(std::io::Error::other)
     }) {
-        onetdns_core::warn!(event = "filter.cache_save_failed", path = %path.display(), %error, "컴파일된 필터 캐시를 저장하지 못했습니다");
+        onetdns_core::warn!(event = "filter.cache_save_failed", path = %path.display(), %error, "Could not save the compiled filter cache");
     }
 }
 
@@ -639,10 +635,12 @@ pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
         let resolved = if !bootstrap.is_empty() {
             onetdns_forward::resolve_via_bootstrap(host, &bootstrap, timeout)
                 .map(|(ip, ttl)| (vec![ip], ttl))
-                .ok_or_else(|| format!("호스트명 확인용 DNS 서버로 주소를 찾지 못했습니다: {host}"))
+                .ok_or_else(|| {
+                    format!("The bootstrap DNS servers could not resolve the address: {host}")
+                })
         } else {
             let name = onetdns_proto::Name::from_str(host)
-                .map_err(|_| format!("다운로드 주소의 호스트 이름이 올바르지 않습니다: {host}"));
+                .map_err(|_| format!("Invalid host name in the download URL: {host}"));
             name.and_then(|name| {
                 let mut addresses = Vec::new();
                 let mut ttl: Option<u32> = None;
@@ -666,7 +664,7 @@ pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
                 addresses.dedup();
                 if addresses.is_empty() {
                     Err(format!(
-                        "내장 재귀 리졸버로 호스트 이름을 찾지 못했습니다: {host}"
+                        "The built-in recursive resolver could not resolve the host name: {host}"
                     ))
                 } else {
                     Ok((addresses, ttl.unwrap_or(0)))
@@ -703,24 +701,24 @@ pub(crate) fn fetch_blocklist(
         .resolver(resolver.clone())
         .deny_private_targets()
         .call()
-        .map_err(|error| format!("차단 목록을 내려받지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not download the blocklist: {error}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
-            "차단 목록 서버가 오류 상태를 반환했습니다: {}",
+            "Blocklist server returned an error status: {}",
             resp.status
         ));
     }
     let body = resp
         .into_string()
-        .map_err(|error| format!("차단 목록 응답을 읽지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not read the blocklist response: {error}"))?;
     if body.trim().is_empty() || looks_like_error_document(&body) {
-        return Err("블록리스트 본문이 비어 있거나 HTML 오류 문서입니다".to_string());
+        return Err("Blocklist body is empty or an HTML error page".to_string());
     }
     let rules = count_list_rules(&body);
     if rules == 0 {
-        return Err("블록리스트에서 유효 규칙을 찾지 못했습니다".to_string());
+        return Err("Blocklist has no valid rules".to_string());
     }
-    onetdns_core::debug!(event = "filter.subscription_downloaded", %url, lines = rules, "차단 목록을 내려받았습니다");
+    onetdns_core::debug!(event = "filter.subscription_downloaded", %url, lines = rules, "Downloaded blocklist");
     let updated_unix = unix_now();
     save_blocklist_cache_text(url, updated_unix, &body, cache_dir)?;
 
@@ -759,7 +757,7 @@ fn save_blocklist_cache_text(
         return Ok(());
     };
     std::fs::create_dir_all(dir)
-        .map_err(|e| format!("차단 목록 캐시 디렉터리를 만들지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Could not create the blocklist cache directory: {e}"))?;
     let path = dir.join(blocklist_cache_key(url));
     let mut body = format!("# onetdns-url:{url}\n# onetdns-updated:{updated_unix}\n");
     body.reserve(text.len() + 1);
@@ -769,7 +767,7 @@ fn save_blocklist_cache_text(
     }
 
     atomic_write(&path, body.as_bytes())
-        .map_err(|e| format!("차단 목록 캐시를 저장하지 못했습니다({url}): {e}"))
+        .map_err(|e| format!("Could not save the blocklist cache ({url}): {e}"))
 }
 
 /** @brief 담아 둔 목록을 읽는다. 못 받아도 시작할 수 있게 하려는 것이다. */
@@ -827,10 +825,10 @@ pub(crate) fn fetch_blocklists_meta(
             Ok(item) => meta.push(item),
             Err(error) => {
                 if let Some(old) = previous_by_url.get(url.as_str()) {
-                    onetdns_core::warn!(event = "filter.subscription_refresh_failed_kept", %url, %error, retained_rules = old.rules, "차단 목록을 갱신하지 못해 이전 목록을 유지합니다");
+                    onetdns_core::warn!(event = "filter.subscription_refresh_failed_kept", %url, %error, retained_rules = old.rules, "Could not update blocklist; keeping the previous list");
                     meta.push((*old).clone());
                 } else {
-                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %url, %error, "차단 목록을 갱신하지 못했습니다");
+                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %url, %error, "Could not update blocklist");
                     meta.push(SubMeta {
                         url: url.clone(),
                         title: String::new(),
@@ -856,7 +854,7 @@ fn save_rpz_cache(url: &str, body: &str, dir: Option<&std::path::Path>) -> Resul
         return Ok(());
     };
     std::fs::create_dir_all(dir)
-        .map_err(|error| format!("RPZ 캐시 디렉터리를 만들지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not create the RPZ cache directory: {error}"))?;
     let mut cached = format!(
         "# onetdns-rpz-url:{url}\n# onetdns-updated:{}\n",
         unix_now()
@@ -866,7 +864,7 @@ fn save_rpz_cache(url: &str, body: &str, dir: Option<&std::path::Path>) -> Resul
         cached.push('\n');
     }
     atomic_write(&dir.join(rpz_cache_key(url)), cached.as_bytes())
-        .map_err(|error| format!("RPZ 캐시를 저장하지 못했습니다({url}): {error}"))
+        .map_err(|error| format!("Could not save the RPZ cache ({url}): {error}"))
 }
 
 /** @brief 담아 둔 영역 형식 목록을 읽는다. */
@@ -954,7 +952,7 @@ pub(crate) fn fetch_rpz_texts(
             .and_then(|resp| {
                 if !(200..300).contains(&resp.status) {
                     return Err(http::HttpError::Protocol(format!(
-                        "HTTP 상태 {}",
+                        "HTTP status {}",
                         resp.status
                     )));
                 }
@@ -966,27 +964,27 @@ pub(crate) fn fetch_rpz_texts(
                     && !looks_like_error_document(&body)
                     && likely_rpz_rule_count(&body) > 0 =>
             {
-                onetdns_core::debug!(event = "filter.rpz_downloaded", %url, bytes = body.len(), "RPZ 규칙을 내려받았습니다");
+                onetdns_core::debug!(event = "filter.rpz_downloaded", %url, bytes = body.len(), "Downloaded RPZ rules");
                 if let Err(error) = save_rpz_cache(url, &body, cache_dir) {
-                    onetdns_core::warn!(event = "filter.rpz_cache_save_failed", %url, %error, "RPZ 캐시 파일을 저장하지 못했습니다");
+                    onetdns_core::warn!(event = "filter.rpz_cache_save_failed", %url, %error, "Could not save the RPZ cache file");
                 }
                 out.push(body);
             }
             Ok(_) => {
                 if let Some(old) = previous.get(index) {
-                    onetdns_core::warn!(event = "filter.rpz_empty_kept", %url, "내려받은 RPZ 데이터에 사용할 수 있는 규칙이 없어 이전 규칙을 유지합니다");
+                    onetdns_core::warn!(event = "filter.rpz_empty_kept", %url, "Downloaded RPZ data has no usable rules; keeping the previous rules");
                     out.push(old.clone());
                 } else {
-                    onetdns_core::warn!(event = "filter.rpz_empty", %url, "내려받은 RPZ 데이터에 사용할 수 있는 규칙이 없습니다");
+                    onetdns_core::warn!(event = "filter.rpz_empty", %url, "Downloaded RPZ data has no usable rules");
                     out.push(String::new());
                 }
             }
             Err(error) => {
                 if let Some(old) = previous.get(index) {
-                    onetdns_core::warn!(event = "filter.rpz_refresh_failed_kept", %url, %error, "RPZ 규칙을 갱신하지 못해 이전 규칙을 유지합니다");
+                    onetdns_core::warn!(event = "filter.rpz_refresh_failed_kept", %url, %error, "Could not update RPZ rules; keeping the previous rules");
                     out.push(old.clone());
                 } else {
-                    onetdns_core::warn!(event = "filter.rpz_download_failed", %url, %error, "RPZ 규칙을 내려받지 못했습니다");
+                    onetdns_core::warn!(event = "filter.rpz_download_failed", %url, %error, "Could not download RPZ rules");
                     out.push(String::new());
                 }
             }
@@ -1008,7 +1006,7 @@ fn merge_config_filters(
     }
     for (index, rw) in rewrites.iter().enumerate() {
         let target = parse_rewrite_answer(&rw.answer).ok_or_else(|| {
-            format!("rewrites[{index}].answer에 올바른 IP 주소 또는 DNS 이름이 필요합니다")
+            format!("rewrites[{index}].answer needs a valid IP address or DNS name")
         })?;
         add_rewrite(parts, &rw.domain, target)
             .map_err(|error| format!("rewrites[{index}].domain: {error}"))?;
@@ -1018,7 +1016,7 @@ fn merge_config_filters(
     }
     for f in rpz_files {
         let text = read_text_limited(f, BLOCKLIST_MAX_RESPONSE)
-            .map_err(|error| format!("RPZ 파일을 읽지 못했습니다({}): {error}", f.display()))?;
+            .map_err(|error| format!("Could not read the RPZ file ({}): {error}", f.display()))?;
         onetdns_filter::parse_rpz_text(&text, parts);
     }
     Ok(())
@@ -1041,7 +1039,7 @@ fn add_rewrite(parts: &mut EngineParts, domain: &str, target: RewriteTarget) -> 
     let domain = domain.trim();
     let parsed = domain.strip_prefix("*.").unwrap_or(domain);
     if parsed.is_empty() || parsed.contains('*') || onetdns_proto::Name::from_str(parsed).is_err() {
-        return Err("올바른 정확 일치 이름 또는 `*.하위영역`이 아닙니다".to_string());
+        return Err("Not a valid exact name or `*.subdomain` pattern".to_string());
     }
     if domain.starts_with("*.") {
         parts.rewrites.add_suffix(domain, target);
@@ -1064,7 +1062,7 @@ fn local_answer_target(answer: &onetdns_config::LocalAnswer) -> Result<RewriteTa
         ),
         onetdns_config::LocalAnswer::Alias(name) => RewriteTarget::Cname(
             onetdns_proto::Name::from_str(name)
-                .map_err(|_| format!("CNAME 대상 '{name}'이 올바른 DNS 이름이 아닙니다"))?,
+                .map_err(|_| format!("CNAME target '{name}' is not a valid DNS name"))?,
         ),
     })
 }
@@ -1077,7 +1075,7 @@ fn local_answer_target(answer: &onetdns_config::LocalAnswer) -> Result<RewriteTa
  */
 fn apply_local_zone(parts: &mut EngineParts, lz: &LocalZone) -> Result<(), String> {
     if onetdns_proto::Name::from_str(lz.name.trim()).is_err() {
-        return Err("name에 올바른 DNS 영역 이름이 필요합니다".to_string());
+        return Err("name needs a valid DNS zone name".to_string());
     }
     let action = match lz.kind {
         LocalZoneKind::Deny => LocalZoneAction::Deny,
@@ -1090,7 +1088,9 @@ fn apply_local_zone(parts: &mut EngineParts, lz: &LocalZone) -> Result<(), Strin
         LocalZoneKind::Redirect => {
             let answers = lz.answers()?;
             let [(_, answer)] = answers.as_slice() else {
-                return Err("redirect 영역에는 영역 이름 하나의 답만 있어야 합니다".to_string());
+                return Err(
+                    "A redirect zone must have answers only for the zone name itself".to_string(),
+                );
             };
             LocalZoneAction::Rewrite(local_answer_target(answer)?)
         }
@@ -1147,7 +1147,7 @@ pub(crate) fn preset_list_urls(cfg: &Config) -> Vec<String> {
 }
 
 /** @brief 이미 갱신 중이라는 문구. */
-pub(crate) const LIST_REFRESH_BUSY: &str = "블록리스트 갱신 작업이 이미 실행 중";
+pub(crate) const LIST_REFRESH_BUSY: &str = "A blocklist update is already running";
 
 /** @brief 목록 갱신을 한 번에 하나만 돌게 한다. */
 pub(crate) fn try_list_refresh_lock(
@@ -1196,7 +1196,7 @@ pub(crate) fn persist_subscription_state(
     disabled: &[String],
 ) -> Result<(), String> {
     let Some(p) = path else {
-        return Err("설정 파일 경로가 없습니다".to_string());
+        return Err("There is no configuration file path".to_string());
     };
     let text =
         onetdns_core::SecretString::from(Config::read_text(p).map_err(|error| error.to_string())?);

@@ -150,7 +150,7 @@ fn windows_system_directory() -> Option<PathBuf> {
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let Some(exe) = resolve_tool(cmd) else {
         return Err(format!(
-            "신뢰할 수 있는 시스템 경로에서 `{cmd}` 실행 파일을 찾지 못했습니다"
+            "Could not find the `{cmd}` executable in a trusted system path"
         ));
     };
     let mut command = Command::new(exe);
@@ -165,7 +165,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
     let out = command
         .output()
-        .map_err(|e| format!("{cmd} 실행하지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Could not run {cmd}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let so = String::from_utf8_lossy(&out.stdout);
@@ -174,7 +174,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
         } else {
             err.trim()
         };
-        return Err(format!("{cmd} 실패: {msg}"));
+        return Err(format!("{cmd} failed: {msg}"));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -243,15 +243,15 @@ fn backup_blob(adapter: &str, data: &[u8]) -> Vec<u8> {
  */
 fn read_backup(path: &Path, adapter: &str) -> Result<String, String> {
     let text = read_text_limited(path)
-        .map_err(|error| format!("복원할 DNS 백업 파일을 읽지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not read the DNS backup file to restore: {error}"))?;
     let Some(rest) = text.strip_prefix("ONETDNS-DNS-BACKUP\n") else {
-        return Err("DNS 백업 파일 형식이 올바르지 않습니다".to_string());
+        return Err("DNS backup file is malformed".to_string());
     };
     let Some((stored_adapter, data)) = rest.split_once('\n') else {
-        return Err("DNS 백업 파일에 어댑터 식별자가 없습니다".to_string());
+        return Err("DNS backup file has no adapter identifier".to_string());
     };
     if stored_adapter != backup_adapter_id(adapter) {
-        return Err("DNS 백업 파일이 요청한 네트워크 어댑터의 백업이 아닙니다".to_string());
+        return Err("DNS backup file is not for the requested network adapter".to_string());
     }
     Ok(data.to_string())
 }
@@ -261,10 +261,10 @@ fn read_backup(path: &Path, adapter: &str) -> Result<String, String> {
 fn write_backup_atomic(path: &Path, adapter: &str, data: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)
-            .map_err(|e| format!("백업 디렉터리 만들지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not create the backup directory: {e}"))?;
     }
     crate::atomic_file::atomic_write(path, &backup_blob(adapter, data))
-        .map_err(|e| format!("DNS 백업 기록 실패: {e}"))
+        .map_err(|e| format!("Could not write the DNS backup: {e}"))
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -285,10 +285,9 @@ fn valid_ip(s: &str) -> bool {
 #[cfg(windows)]
 /** @brief 어댑터와 각각의 DNS 설정 목록. */
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
-    let nonce = u64::from_le_bytes(
-        onetdns_core::try_random_array::<8>()
-            .map_err(|error| format!("어댑터 임시 파일용 난수를 얻지 못했습니다: {error}"))?,
-    );
+    let nonce = u64::from_le_bytes(onetdns_core::try_random_array::<8>().map_err(|error| {
+        format!("Could not get random bytes for the adapter temporary file: {error}")
+    })?);
     let tmp = std::env::temp_dir().join(format!(
         "onetdns-adapters-{}-{nonce:016x}.json",
         std::process::id()
@@ -301,7 +300,8 @@ pub fn list_adapters() -> Result<Vec<Adapter>, String> {
         "powershell",
         &["-NoProfile", "-NonInteractive", "-Command", &script],
     )?;
-    let out = read_text_limited(&tmp).map_err(|e| format!("어댑터 임시 파일 읽지 못했습니다: {e}"));
+    let out = read_text_limited(&tmp)
+        .map_err(|e| format!("Could not read the adapter temporary file: {e}"));
     let _ = std::fs::remove_file(&tmp);
     parse_windows_adapters(&out?)
 }
@@ -324,7 +324,7 @@ fn fix_mojibake(s: &str) -> String {
 fn parse_windows_adapters(json: &str) -> Result<Vec<Adapter>, String> {
     use onetdns_core::json::Json;
     let parsed = onetdns_core::json::parse(json.trim_start_matches('\u{feff}').trim())
-        .map_err(|e| format!("어댑터 JSON 해석하지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Could not parse the adapter JSON: {e}"))?;
     let items: Vec<&Json> = match &parsed {
         Json::Arr(a) => a.iter().collect(),
         other => vec![other],
@@ -370,10 +370,10 @@ fn windows_current_dns(adapter: &str) -> Vec<String> {
 fn validate_windows_adapter(adapter: &str) -> Result<(), String> {
     if adapter.is_empty() || adapter.chars().count() > 256 || adapter.chars().any(char::is_control)
     {
-        return Err("네트워크 어댑터 이름이 올바르지 않습니다".to_string());
+        return Err("Invalid network adapter name".to_string());
     }
     if !list_adapters()?.iter().any(|item| item.name == adapter) {
-        return Err(format!("존재하지 않는 네트워크 어댑터입니다: {adapter}"));
+        return Err(format!("Network adapter does not exist: {adapter}"));
     }
     Ok(())
 }
@@ -382,7 +382,7 @@ fn validate_windows_adapter(adapter: &str) -> Result<(), String> {
 /** @brief 이 어댑터의 DNS를 지정한 목록으로 바꾼다. */
 fn windows_apply_dns(adapter: &str, servers: &[String]) -> Result<(), String> {
     if servers.is_empty() || servers.iter().any(|server| !valid_ip(server)) {
-        return Err("DNS 서버 주소를 하나 이상 올바른 IP 주소로 입력해야 합니다".to_string());
+        return Err("Enter at least one DNS server address as a valid IP address".to_string());
     }
     run(
         "netsh",
@@ -422,7 +422,7 @@ fn windows_apply_dns(adapter: &str, servers: &[String]) -> Result<(), String> {
 pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(), String> {
     validate_windows_adapter(adapter)?;
     if servers.is_empty() || servers.iter().any(|server| !valid_ip(server)) {
-        return Err("DNS 서버 주소를 하나 이상 올바른 IP 주소로 입력해야 합니다".to_string());
+        return Err("Enter at least one DNS server address as a valid IP address".to_string());
     }
 
     let original: Vec<String> = windows_current_dns(adapter)
@@ -470,7 +470,7 @@ pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
         windows_apply_dns(adapter, &servers)?;
     }
     if let Err(e) = std::fs::remove_file(&path) {
-        onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %path.display(), error = %e, "복원한 DNS 백업 파일을 지우지 못했습니다. 다음 복원이 이 낡은 값을 다시 씁니다");
+        onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %path.display(), error = %e, "Could not delete the restored DNS backup file; the next restore will write this stale value again");
     }
     Ok(())
 }
@@ -585,7 +585,7 @@ pub fn list_adapters() -> Result<Vec<Adapter>, String> {
  */
 pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(), String> {
     if servers.iter().any(|s| !valid_ip(s)) {
-        return Err("DNS 서버 주소 형식이 올바르지 않습니다".to_string());
+        return Err("Invalid DNS server address".to_string());
     }
 
     if adapter != "system" && have("resolvectl") {
@@ -596,7 +596,7 @@ pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(
         args.extend(refs);
         if let Err(e) = run("resolvectl", &args) {
             if let Err(cleanup) = std::fs::remove_file(&marker) {
-                onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %marker.display(), error = %cleanup, "적용에 실패한 표식 파일을 지우지 못했습니다. 다음 복원이 바꾸지도 않은 설정을 되돌리려 합니다");
+                onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %marker.display(), error = %cleanup, "Could not delete the failed-apply marker file; the next restore will try to revert settings that were never changed");
             }
             return Err(e);
         }
@@ -605,7 +605,7 @@ pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(
 
     let path = "/etc/resolv.conf";
     let cur = read_text_limited(Path::new(path)).map_err(|error| {
-        format!("현재 /etc/resolv.conf 내용을 읽지 못해 DNS 설정을 변경하지 않습니다: {error}")
+        format!("Could not read the current /etc/resolv.conf, so the DNS settings were not changed: {error}")
     })?;
 
     ensure_backup(&backup_file(backup_dir, "system"), "system", cur.as_bytes())?;
@@ -613,7 +613,7 @@ pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(
         .iter()
         .map(|s| format!("nameserver {s}\n"))
         .collect();
-    std::fs::write(path, body).map_err(|e| format!("/etc/resolv.conf 쓰지 못했습니다: {e}"))
+    std::fs::write(path, body).map_err(|e| format!("Could not write /etc/resolv.conf: {e}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -623,16 +623,16 @@ pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
     if adapter != "system" && read_backup(&marker, adapter).ok().as_deref() == Some("resolvectl") {
         run("resolvectl", &["revert", adapter])?;
         if let Err(e) = std::fs::remove_file(&marker) {
-            onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %marker.display(), error = %e, "복원한 표식 파일을 지우지 못했습니다. 다음 복원이 이 낡은 값을 다시 씁니다");
+            onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %marker.display(), error = %e, "Could not delete the restored marker file; the next restore will write this stale value again");
         }
         return Ok(());
     }
     let sys = backup_file(backup_dir, "system");
     let saved = read_backup(&sys, "system")?;
     std::fs::write("/etc/resolv.conf", saved)
-        .map_err(|e| format!("/etc/resolv.conf 복원하지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Could not restore /etc/resolv.conf: {e}"))?;
     if let Err(e) = std::fs::remove_file(&sys) {
-        onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %sys.display(), error = %e, "복원한 DNS 백업 파일을 지우지 못했습니다. 다음 복원이 이 낡은 값을 다시 씁니다");
+        onetdns_core::warn!(event = "osnet.backup_cleanup_failed", path = %sys.display(), error = %e, "Could not delete the restored DNS backup file; the next restore will write this stale value again");
     }
     Ok(())
 }
@@ -666,7 +666,7 @@ pub fn firewall_allow(udp: bool, tcp: bool, port: u16) -> Result<(), String> {
         }
         return Ok(());
     }
-    Err("지원하는 방화벽 도구인 ufw 또는 iptables를 찾지 못했습니다".to_string())
+    Err("Could not find a supported firewall tool (ufw or iptables)".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -695,25 +695,25 @@ pub fn firewall_remove(port: u16) -> Result<(), String> {
 #[cfg(not(any(windows, target_os = "linux")))]
 /** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
-    Err("이 플랫폼에서는 네트워크 어댑터 조회를 지원하지 않습니다".to_string())
+    Err("Listing network adapters is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 /** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn set_dns(_adapter: &str, _servers: &[String], _backup_dir: &Path) -> Result<(), String> {
-    Err("이 플랫폼에서는 시스템 DNS 설정 변경을 지원하지 않습니다".to_string())
+    Err("Changing the system DNS settings is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 /** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn restore_dns(_adapter: &str, _backup_dir: &Path) -> Result<(), String> {
-    Err("이 플랫폼에서는 시스템 DNS 복원을 지원하지 않음".to_string())
+    Err("Restoring the system DNS settings is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 /** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn firewall_allow(_udp: bool, _tcp: bool, _port: u16) -> Result<(), String> {
-    Err("이 플랫폼에서는 방화벽 설정을 지원하지 않음".to_string())
+    Err("Firewall settings are not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]

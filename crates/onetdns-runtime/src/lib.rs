@@ -585,7 +585,7 @@ impl Server {
     fn stop(&mut self) {
         let panicked = stop_workers(&self.shutdown, &mut self.handles, self.udp_addr);
         if panicked > 0 {
-            onetdns_core::error!(event = "server.worker_panicked", workers = panicked, "질의 처리 스레드가 요청 경계 밖에서 끝났습니다. 그동안 그만큼 적은 스레드로 처리했습니다");
+            onetdns_core::error!(event = "server.worker_panicked", workers = panicked, "A query worker thread exited outside a request boundary; running with that many fewer threads meanwhile");
         }
     }
 
@@ -658,7 +658,7 @@ fn wake_udp_workers(handles: &[JoinHandle<()>], addr: SocketAddr) {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let Ok(sender) = onetdns_core::udp::bind(local) else {
-        onetdns_core::error!(event = "server.udp_wake_failed", %addr, "UDP 워커를 깨울 소켓을 열지 못했습니다. 워커가 다음 질의를 받을 때까지 종료가 늦어집니다");
+        onetdns_core::error!(event = "server.udp_wake_failed", %addr, "Could not open the socket used to wake UDP workers; shutdown waits until each worker receives its next query");
         return;
     };
     loop {

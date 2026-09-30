@@ -12,7 +12,7 @@
  *          암호 연산을 하게 되므로, 조용히 약한 값을 쓰느니 멈추는 쪽을 택한다.
  */
 pub fn fill_random(buf: &mut [u8]) {
-    try_fill_random(buf).expect("운영체제 보안 난수원을 사용할 수 없습니다");
+    try_fill_random(buf).expect("The OS secure random source is unavailable");
 }
 
 /** @brief 실패를 오류로 돌려주는 fill_random. 시작 시 난수원 가용성 확인에 쓴다. */
@@ -29,7 +29,7 @@ pub fn try_fill_random(buf: &mut [u8]) -> std::io::Result<()> {
 
 /** @brief 고정 길이 난수 배열. 실패 시 패닉한다. */
 pub fn random_array<const N: usize>() -> [u8; N] {
-    try_random_array().expect("운영체제 보안 난수원을 사용할 수 없습니다")
+    try_random_array().expect("The OS secure random source is unavailable")
 }
 
 /** @brief 실패를 오류로 돌려주는 random_array. */
@@ -150,7 +150,7 @@ fn try_fill_windows(buf: &mut [u8]) -> std::io::Result<()> {
         };
         if rc != 0 {
             return Err(std::io::Error::other(format!(
-                "BCryptGenRandom 실패(NTSTATUS {rc:#x})"
+                "BCryptGenRandom failed (NTSTATUS {rc:#x})"
             )));
         }
     }
@@ -174,7 +174,7 @@ fn try_fill_urandom(buf: &mut [u8]) -> std::io::Result<()> {
     }
     let mut file = URANDOM
         .get()
-        .ok_or_else(|| std::io::Error::other("운영체제 난수 장치를 초기화하지 못했습니다"))?;
+        .ok_or_else(|| std::io::Error::other("Could not initialize the OS random device"))?;
     file.read_exact(buf)
 }
 

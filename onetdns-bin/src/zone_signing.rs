@@ -55,13 +55,13 @@ pub(crate) fn spawn_zsk_rollover(
                     Ok(text) => match rollover::RollState::parse(&text) {
                         Some(state) => Some(state),
                         None => {
-                            onetdns_core::warn!(event = "dnssec.zsk_state_corrupt", zone = %origin.to_ascii_lower(), path = %sp.display(), "ZSK 교체 상태 파일의 형식이 깨져 있어 첫 단계부터 다시 시작합니다");
+                            onetdns_core::warn!(event = "dnssec.zsk_state_corrupt", zone = %origin.to_ascii_lower(), path = %sp.display(), "ZSK rollover state file is malformed; starting over from the first step");
                             None
                         }
                     },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => {
-                        onetdns_core::warn!(event = "dnssec.zsk_state_read_failed", zone = %origin.to_ascii_lower(), path = %sp.display(), error = %e, "ZSK 교체 상태 파일을 읽지 못해 첫 단계부터 다시 시작합니다");
+                        onetdns_core::warn!(event = "dnssec.zsk_state_read_failed", zone = %origin.to_ascii_lower(), path = %sp.display(), error = %e, "Could not read the ZSK rollover state file; starting over from the first step");
                         None
                     }
                 };
@@ -70,7 +70,7 @@ pub(crate) fn spawn_zsk_rollover(
                     None => {
                         let state = rollover::RollState::stable(now);
                         if let Err(e) = atomic_write_secret(&sp, state.serialize().as_bytes()) {
-                            onetdns_core::error!(event = "dnssec.zsk_init_save_failed", zone = %origin.to_ascii_lower(), error = %e, "ZSK 교체 초기 상태를 저장하지 못해 키 교체를 시작하지 않습니다");
+                            onetdns_core::error!(event = "dnssec.zsk_init_save_failed", zone = %origin.to_ascii_lower(), error = %e, "Could not save the initial ZSK rollover state; not starting the rollover");
                             continue;
                         }
                         state
@@ -82,23 +82,23 @@ pub(crate) fn spawn_zsk_rollover(
                 let key_backup = match RollKeyBackup::capture(zsk) {
                     Ok(backup) => backup,
                     Err(e) => {
-                        onetdns_core::error!(event = "dnssec.zsk_backup_failed", zone = %origin.to_ascii_lower(), error = %e, "ZSK 파일을 백업하지 못해 키 교체를 보류합니다");
+                        onetdns_core::error!(event = "dnssec.zsk_backup_failed", zone = %origin.to_ascii_lower(), error = %e, "Could not back up the ZSK file; postponing the rollover");
                         continue;
                     }
                 };
                 if !apply_roll_transition(origin, zsk, state.phase, next_state.phase) {
 
                     if let Err(rollback_err) = key_backup.restore(zsk) {
-                        onetdns_core::error!(event = "dnssec.zsk_restore_failed", zone = %origin.to_ascii_lower(), error = %rollback_err, "ZSK 교체 실패 후 키 파일을 이전 상태로 되돌리지 못했습니다");
+                        onetdns_core::error!(event = "dnssec.zsk_restore_failed", zone = %origin.to_ascii_lower(), error = %rollback_err, "Could not restore the key files after a failed ZSK rollover");
                     }
                     continue;
                 }
 
                 if let Err(e) = atomic_write_secret(&sp, next_state.serialize().as_bytes()) {
                     if let Err(rollback_err) = key_backup.restore(zsk) {
-                        onetdns_core::error!(event = "dnssec.zsk_save_and_restore_failed", zone = %origin.to_ascii_lower(), error = %e, rollback_error = %rollback_err, "ZSK 상태 저장과 키 복구가 모두 실패했습니다");
+                        onetdns_core::error!(event = "dnssec.zsk_save_and_restore_failed", zone = %origin.to_ascii_lower(), error = %e, rollback_error = %rollback_err, "Saving ZSK state and restoring the keys both failed");
                     } else {
-                        onetdns_core::error!(event = "dnssec.zsk_rolled_back", zone = %origin.to_ascii_lower(), error = %e, "ZSK 교체 상태를 저장하지 못해 키 변경을 되돌렸습니다");
+                        onetdns_core::error!(event = "dnssec.zsk_rolled_back", zone = %origin.to_ascii_lower(), error = %e, "Could not save ZSK rollover state; reverted the key change");
                     }
                     continue;
                 }
@@ -106,8 +106,8 @@ pub(crate) fn spawn_zsk_rollover(
             }
             if !rolled.is_empty() {
                 match reload_keys(&rolled) {
-                    Ok(()) => onetdns_core::info!(event = "dnssec.zsk_step_applied", zones = rolled.len(), "ZSK 교체 단계를 갱신하고 서명 키와 DNS 영역만 다시 불러왔습니다"),
-                    Err(error) => onetdns_core::error!(event = "dnssec.zsk_reload_failed", %error, "ZSK 교체 단계는 저장했지만 새 키로 DNS 영역을 다시 만들지 못했습니다. 다음 확인 주기에 다시 시도합니다"),
+                    Ok(()) => onetdns_core::info!(event = "dnssec.zsk_step_applied", zones = rolled.len(), "Advanced the ZSK rollover step and reloaded only the signing keys and DNS zones"),
+                    Err(error) => onetdns_core::error!(event = "dnssec.zsk_reload_failed", %error, "Saved the ZSK rollover step but could not rebuild the DNS zones with the new key; retrying next check"),
                 }
             }
         })
@@ -182,51 +182,51 @@ fn apply_roll_transition(
             {
                 Some(pem) => match atomic_write_secret(&next, pem.as_bytes()) {
                     Ok(()) => {
-                        onetdns_core::info!(event = "dnssec.zsk_next_published", zone = %origin.to_ascii_lower(), "다음 ZSK를 미리 게시했습니다");
+                        onetdns_core::info!(event = "dnssec.zsk_next_published", zone = %origin.to_ascii_lower(), "Pre-published the next ZSK");
                         true
                     }
                     Err(e) => {
-                        onetdns_core::error!(event = "dnssec.zsk_next_save_failed", zone = %origin.to_ascii_lower(), error = %e, "다음 ZSK를 저장하지 못해 키 교체를 보류합니다");
+                        onetdns_core::error!(event = "dnssec.zsk_next_save_failed", zone = %origin.to_ascii_lower(), error = %e, "Could not save the next ZSK; postponing the rollover");
                         false
                     }
                 },
                 None => {
-                    onetdns_core::error!(event = "dnssec.zsk_next_encode_failed", zone = %origin.to_ascii_lower(), "새로 만든 ZSK를 PKCS#8로 옮기지 못해 키 교체를 보류합니다");
+                    onetdns_core::error!(event = "dnssec.zsk_next_encode_failed", zone = %origin.to_ascii_lower(), "Could not convert the new ZSK to PKCS#8; postponing the rollover");
                     false
                 }
             }
         }
         (Phase::Publish, Phase::Activate) => {
             if !next.exists() {
-                onetdns_core::warn!(event = "dnssec.zsk_promote_no_next", zone = %origin.to_ascii_lower(), ".next 키가 없어 ZSK 승격을 보류합니다");
+                onetdns_core::warn!(event = "dnssec.zsk_promote_no_next", zone = %origin.to_ascii_lower(), "No .next key; postponing ZSK promotion");
                 return false;
             }
             if let Err(e) = replace_file(zsk, &prev) {
-                onetdns_core::error!(event = "dnssec.zsk_prev_move_failed", error = %e, "현재 ZSK를 .prev 파일로 옮기지 못했습니다");
+                onetdns_core::error!(event = "dnssec.zsk_prev_move_failed", error = %e, "Could not move the current ZSK to the .prev file");
                 return false;
             }
             if let Err(e) = replace_file(&next, zsk) {
-                onetdns_core::error!(event = "dnssec.zsk_promote_failed", error = %e, ".next 키를 활성 ZSK로 바꾸지 못해 이전 키를 유지합니다");
+                onetdns_core::error!(event = "dnssec.zsk_promote_failed", error = %e, "Could not promote the .next key to the active ZSK; keeping the previous key");
                 if let Err(rollback_err) = replace_file(&prev, zsk) {
-                    onetdns_core::error!(event = "dnssec.zsk_revert_failed", error = %rollback_err, "현재 ZSK를 즉시 이전 상태로 되돌리지 못했습니다");
+                    onetdns_core::error!(event = "dnssec.zsk_revert_failed", error = %rollback_err, "Could not immediately restore the current ZSK");
                 }
                 return false;
             }
-            onetdns_core::info!(event = "dnssec.zsk_activated", zone = %origin.to_ascii_lower(), "새 ZSK를 활성화했습니다");
+            onetdns_core::info!(event = "dnssec.zsk_activated", zone = %origin.to_ascii_lower(), "Activated the new ZSK");
             true
         }
         (Phase::Activate, Phase::Stable) => {
             if let Err(e) = std::fs::remove_file(&prev) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    onetdns_core::error!(event = "dnssec.zsk_retire_failed", error = %e, "이전 ZSK를 폐기하지 못해 안정 상태 전환을 보류합니다");
+                    onetdns_core::error!(event = "dnssec.zsk_retire_failed", error = %e, "Could not retire the previous ZSK; postponing the move to steady state");
                     return false;
                 }
             }
-            onetdns_core::info!(event = "dnssec.zsk_retired", zone = %origin.to_ascii_lower(), "이전 ZSK를 폐기해 안정 상태로 전환했습니다");
+            onetdns_core::info!(event = "dnssec.zsk_retired", zone = %origin.to_ascii_lower(), "Retired the previous ZSK; rollover reached steady state");
             true
         }
         _ => {
-            onetdns_core::error!(event = "dnssec.zsk_phase_unexpected", zone = %origin.to_ascii_lower(), from = ?from, to = ?to, "ZSK 교체 단계가 순서를 벗어나 이번 전환을 건너뜁니다");
+            onetdns_core::error!(event = "dnssec.zsk_phase_unexpected", zone = %origin.to_ascii_lower(), from = ?from, to = ?to, "ZSK rollover step is out of order; skipping this transition");
             false
         }
     }
@@ -288,7 +288,7 @@ fn load_or_create_key_pem(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "{label} DNSSEC 키 '{}'를 읽지 못했습니다: {error}",
+                "Could not read {label} DNSSEC key '{}': {error}",
                 path.display()
             ));
         }
@@ -300,14 +300,14 @@ fn load_or_create_key_pem(
     );
     let pem = s
         .to_pkcs8_pem()
-        .ok_or_else(|| format!("{label} DNSSEC 키를 PKCS#8 형식으로 만들지 못했습니다"))?;
+        .ok_or_else(|| format!("Could not convert the {label} DNSSEC key to PKCS#8"))?;
     if let Err(e) = atomic_write_secret(path, pem.as_bytes()) {
         return Err(format!(
-            "{label} DNSSEC 키 '{}'를 저장하지 못했습니다: {e}",
+            "Could not save {label} DNSSEC key '{}': {e}",
             path.display()
         ));
     }
-    onetdns_core::info!(event = "dnssec.key_created", key_role = label, path = %path.display(), key_algorithm = algorithm.number(), "DNSSEC 서명 키를 생성해 저장했습니다");
+    onetdns_core::info!(event = "dnssec.key_created", key_role = label, path = %path.display(), key_algorithm = algorithm.number(), "Generated and saved DNSSEC signing keys");
     Ok(pem)
 }
 
@@ -315,7 +315,7 @@ fn load_or_create_key_pem(
 pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSigningCtx, String> {
     use onetdns_dnssec::sign::{DenialMode, Nsec3Params, ZoneSigner};
     let origin = onetdns_proto::Name::from_str(&zc.origin)
-        .map_err(|_| format!("DNS 영역 이름이 올바르지 않습니다: {}", zc.origin))?;
+        .map_err(|_| format!("Invalid DNS zone name: {}", zc.origin))?;
     let base = zc.file.clone().unwrap_or_default();
     let zsk_path = zc
         .dnssec_key
@@ -326,7 +326,7 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
     } else {
         onetdns_dnssec::sign::SignAlgorithm::from_str(&zc.dnssec_algorithm).ok_or_else(|| {
             format!(
-                "DNS 영역 '{}'의 `dnssec_algorithm` 값을 알 수 없습니다: {}",
+                "DNS zone '{}' has an unknown `dnssec_algorithm`: {}",
                 zc.origin, zc.dnssec_algorithm
             )
         })?
@@ -341,20 +341,15 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
     let signer = if split {
         let ksk_pem = load_or_create_key_pem(&ksk_path, "KSK", algorithm)?;
         ZoneSigner::from_pkcs8_pems(zsk_pem.as_str(), Some(ksk_pem.as_str()), origin.clone())
-            .ok_or_else(|| {
-                format!(
-                    "DNS 영역 '{}'의 ZSK 또는 KSK 형식이 잘못되었습니다",
-                    zc.origin
-                )
-            })?
+            .ok_or_else(|| format!("DNS zone '{}' has a malformed ZSK or KSK", zc.origin))?
     } else {
         ZoneSigner::from_pkcs8_pem(zsk_pem.as_str(), origin.clone())
-            .ok_or_else(|| format!("DNS 영역 '{}'의 ZSK 형식이 잘못되었습니다", zc.origin))?
+            .ok_or_else(|| format!("DNS zone '{}' has a malformed ZSK", zc.origin))?
     };
 
     if signer.algorithm() != algorithm {
         return Err(format!(
-            "DNS 영역 '{}'의 저장된 키는 알고리즘 {}인데 `dnssec_algorithm`은 {}입니다. 키 파일을 옮기거나 설정을 맞추십시오",
+            "The stored key for DNS zone '{}' uses algorithm {}, but `dnssec_algorithm` is {}. Move the key files or change the setting to match",
             zc.origin,
             signer.algorithm().number(),
             algorithm.number()
@@ -369,12 +364,12 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
             if !seen_tags.contains(&tag) {
                 seen_tags.push(tag);
                 published.push(dk);
-                onetdns_core::info!(event = "dnssec.additional_zsk_published", zone = %zc.origin, key_tag = tag, key_source = label, "추가 ZSK를 DNSKEY 응답에 게시했습니다");
+                onetdns_core::info!(event = "dnssec.additional_zsk_published", zone = %zc.origin, key_tag = tag, key_source = label, "Published an additional ZSK in DNSKEY responses");
             }
             Ok(())
         } else {
             Err(format!(
-                "DNS 영역 '{}'의 추가 ZSK 형식이 잘못되었습니다: {label}",
+                "DNS zone '{}' has a malformed additional ZSK: {label}",
                 zc.origin
             ))
         }
@@ -383,12 +378,12 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
         let pem = Zeroizing::new(read_text_limited(next_path, LOCAL_KEY_MAX_BYTES).map_err(
             |error| {
                 format!(
-                    "차기 ZSK '{}'를 읽지 못했습니다: {error}",
+                    "Could not read the next ZSK '{}': {error}",
                     next_path.display()
                 )
             },
         )?);
-        add(pem.as_str(), "차기 ZSK 사전발행(dnssec_key_next)")?;
+        add(pem.as_str(), "pre-published next ZSK (dnssec_key_next)")?;
     }
     for slot in [
         rollover::next_path(&zsk_path),
@@ -397,12 +392,12 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
         match read_text_limited(&slot, LOCAL_KEY_MAX_BYTES) {
             Ok(pem) => {
                 let pem = Zeroizing::new(pem);
-                add(pem.as_str(), "롤오버 슬롯 키 게시(DNSKEY)")?;
+                add(pem.as_str(), "rollover slot key published in DNSKEY")?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
-                    "롤오버 ZSK '{}'를 읽지 못했습니다: {error}",
+                    "Could not read the rollover ZSK '{}': {error}",
                     slot.display()
                 ));
             }
@@ -440,7 +435,7 @@ pub(crate) fn sign_authority_zone(
     if let Some(ds) = ctx.signer.ds() {
         let digest: String = ds.digest.iter().map(|b| format!("{b:02X}")).collect();
         let kind = if ctx.signer.is_split() {
-            "KSK/ZSK 분리"
+            "separate KSK/ZSK"
         } else {
             "CSK"
         };
@@ -449,7 +444,7 @@ pub(crate) fn sign_authority_zone(
             zone = %origin.to_ascii_lower(),
             ds = %format!("{} IN DS {} 13 2 {}", origin.to_ascii_lower(), ds.key_tag, digest),
             mode = kind,
-            "DNSSEC 서명을 마쳤습니다. 표시된 DS 레코드를 부모 영역에 등록해야 합니다"
+            "DNSSEC signing finished; register the DS record shown here with the parent zone"
         );
     }
     Some(out)

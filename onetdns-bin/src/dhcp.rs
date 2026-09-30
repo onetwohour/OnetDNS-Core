@@ -55,7 +55,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
                 event = "dhcp4.restore_open_failed",
                 path = %path.display(),
                 %error,
-                "저장된 DHCP 정보를 열지 못해 빈 상태로 시작합니다"
+                "Could not open saved DHCP state; starting empty"
             );
             return None;
         }
@@ -66,7 +66,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
             event = "dhcp4.restore_read_failed",
             path = %path.display(),
             %error,
-            "저장된 DHCP 정보를 읽지 못해 빈 상태로 시작합니다"
+            "Could not read saved DHCP state; starting empty"
         );
         return None;
     }
@@ -76,7 +76,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
             path = %path.display(),
             bytes = bytes.len(),
             limit = MAX_PERSIST_FILE,
-            "저장된 DHCP 파일이 허용 크기를 넘어 복원하지 않습니다"
+            "Saved DHCP file exceeds the size limit; not restoring it"
         );
         return None;
     }
@@ -87,7 +87,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
                 event = "dhcp4.restore_invalid_utf8",
                 path = %path.display(),
                 %error,
-                "저장된 DHCP 파일의 문자 인코딩이 올바르지 않아 복원하지 않습니다"
+                "Saved DHCP file is not valid text; not restoring it"
             );
             None
         }
@@ -320,7 +320,10 @@ impl DhcpMessage {
         b.extend_from_slice(&MAGIC);
         if let Some(client_identifier) = &self.client_identifier {
             b.push(OPT_CLIENT_ID);
-            b.push(u8::try_from(client_identifier.len()).expect("파서가 DHCP 옵션 길이를 검증함"));
+            b.push(
+                u8::try_from(client_identifier.len())
+                    .expect("The parser has already validated DHCP option lengths"),
+            );
             b.extend_from_slice(client_identifier);
         }
         for (code, val) in &self.options {
@@ -568,7 +571,7 @@ impl LeasePool {
         let reservations = match cfg.static_file.as_deref().map(read_reservations) {
             Some(Ok(reservations)) => reservations,
             Some(Err(error)) => {
-                onetdns_core::warn!(event = "dhcp4.reservations_restore_invalid", error = %error, "DHCP 고정 할당 파일을 읽지 못했습니다. 운영자 파일을 덮어쓰지 않도록 고정 할당을 저장하지 않고 시작합니다");
+                onetdns_core::warn!(event = "dhcp4.reservations_restore_invalid", error = %error, "Could not read the DHCP static lease file; starting without saving static leases so the operator's file is not overwritten");
                 static_persist = None;
                 HashMap::new()
             }
@@ -643,7 +646,7 @@ impl LeasePool {
                     kind = kind,
                     entries,
                     limit = MAX_STATE_ENTRIES,
-                    "DHCPv4 상태 상한 아래에 다시 빈자리가 생겼습니다"
+                    "DHCPv4 state is back under its limit"
                 );
             }
             true
@@ -654,7 +657,7 @@ impl LeasePool {
                     kind = kind,
                     entries,
                     limit = MAX_STATE_ENTRIES,
-                    "DHCPv4 상태 상한에 닿아 새 항목을 받지 않습니다"
+                    "DHCPv4 state reached its limit; not accepting new entries"
                 );
             }
             false
@@ -855,16 +858,22 @@ impl LeasePool {
         let net = self.server_ip & self.subnet_mask;
         let bcast = net | !self.subnet_mask;
         if (ip & self.subnet_mask) != net {
-            return Err(format!("{} 는 서버 서브넷 밖", Ipv4Addr::from(ip)));
+            return Err(format!(
+                "{} is outside the server subnet",
+                Ipv4Addr::from(ip)
+            ));
         }
         if ip == net || ip == bcast {
             return Err(format!(
-                "{} 는 네트워크/브로드캐스트 주소",
+                "{} is the network or broadcast address",
                 Ipv4Addr::from(ip)
             ));
         }
         if ip == self.server_ip || ip == self.router {
-            return Err(format!("{} 는 서버/게이트웨이 주소", Ipv4Addr::from(ip)));
+            return Err(format!(
+                "{} is the server or gateway address",
+                Ipv4Addr::from(ip)
+            ));
         }
         Ok(())
     }
@@ -886,7 +895,7 @@ impl LeasePool {
             .collect();
         for identity in invalid_reservations {
             self.reservations.remove(&identity);
-            onetdns_core::warn!(event = "dhcp4.static_entry_invalid", identity = %identity.to_text(), "유효하지 않은 DHCP 고정 할당 항목을 제외했습니다");
+            onetdns_core::warn!(event = "dhcp4.static_entry_invalid", identity = %identity.to_text(), "Skipped an invalid DHCP static lease entry");
         }
         let reservation_owners: std::collections::HashMap<u32, ClientIdentity> = self
             .reservations
@@ -921,7 +930,7 @@ impl LeasePool {
                 && !reserved_by_other
                 && lease_ips.insert(lease.ip);
             if !valid {
-                onetdns_core::warn!(event = "dhcp4.stale_lease_dropped", identity = %identity.to_text(), ip = %Ipv4Addr::from(lease.ip), "현재 DHCP 주소 범위에 맞지 않는 저장된 임대 정보를 삭제했습니다");
+                onetdns_core::warn!(event = "dhcp4.stale_lease_dropped", identity = %identity.to_text(), ip = %Ipv4Addr::from(lease.ip), "Removed saved leases outside the current DHCP address range");
             }
             valid
         });
@@ -1036,11 +1045,11 @@ impl LeasePool {
         match (picked, self.exhausted) {
             (None, false) => {
                 self.exhausted = true;
-                onetdns_core::warn!(event = "dhcp4.pool_exhausted", range_start = %Ipv4Addr::from(self.start), range_end = %Ipv4Addr::from(self.end), indexed_addresses = self.address_use.len(), "DHCP 주소 범위가 모두 차서 새 기기에 주소를 주지 못합니다");
+                onetdns_core::warn!(event = "dhcp4.pool_exhausted", range_start = %Ipv4Addr::from(self.start), range_end = %Ipv4Addr::from(self.end), indexed_addresses = self.address_use.len(), "DHCP address range is full; new devices cannot get an address");
             }
             (Some(_), true) => {
                 self.exhausted = false;
-                onetdns_core::info!(event = "dhcp4.pool_available", range_start = %Ipv4Addr::from(self.start), range_end = %Ipv4Addr::from(self.end), "DHCP 주소 범위에 다시 빈자리가 생겼습니다");
+                onetdns_core::info!(event = "dhcp4.pool_available", range_start = %Ipv4Addr::from(self.start), range_end = %Ipv4Addr::from(self.end), "DHCP address range has free addresses again");
             }
             _ => {}
         }
@@ -1075,13 +1084,14 @@ impl LeasePool {
             .is_some_and(|value| !valid_hostname(value))
         {
             return Err(
-                "hostname 값은 1~255바이트이며 공백이나 제어문자를 포함할 수 없습니다".to_string(),
+                "hostname must be 1 to 255 bytes and cannot contain spaces or control characters"
+                    .to_string(),
             );
         }
         self.validate_reservation_ip(ip)?;
         if self.is_reserved_by_other(ip, &identity) {
             return Err(format!(
-                "IP {} 는 이미 다른 클라이언트 식별자에 예약됨",
+                "IP {} is already reserved for another client identifier",
                 Ipv4Addr::from(ip)
             ));
         }
@@ -1093,7 +1103,7 @@ impl LeasePool {
             )
         {
             return Err(format!(
-                "DHCPv4 고정 할당은 최대 {MAX_STATE_ENTRIES}개입니다"
+                "At most {MAX_STATE_ENTRIES} DHCPv4 static assignments are allowed"
             ));
         }
         let now = crate::unix_now();
@@ -1219,14 +1229,14 @@ impl LeasePool {
         match self.reservations.get(identity) {
             Some((reserved, _)) if *reserved != ip => {
                 return Err(format!(
-                    "클라이언트 {} 는 IP {} 에 고정되어 있습니다",
+                    "Client {} is assigned to IP {}",
                     identity.to_text(),
                     Ipv4Addr::from(*reserved)
                 ));
             }
             None if ip < self.start || ip > self.end => {
                 return Err(format!(
-                    "IP {} 는 DHCP 동적 범위 밖입니다",
+                    "IP {} is outside the DHCP dynamic range",
                     Ipv4Addr::from(ip)
                 ));
             }
@@ -1235,7 +1245,7 @@ impl LeasePool {
 
         if self.address_used_by_other_inner(identity, ip) {
             return Err(format!(
-                "IP {} 는 이미 다른 DHCP 상태가 사용 중입니다",
+                "IP {} is already used by another DHCP entry",
                 Ipv4Addr::from(ip)
             ));
         }
@@ -1253,7 +1263,7 @@ impl LeasePool {
         for (identity, ip, expiry) in entries {
             if expiry <= now {
                 return Err(format!(
-                    "클라이언트 {} 의 임대 만료 시각이 이미 지났습니다",
+                    "The lease for client {} has already expired",
                     identity.to_text()
                 ));
             }
@@ -1269,7 +1279,7 @@ impl LeasePool {
             } else if !self.offers.contains_key(&identity) {
                 if projected >= MAX_STATE_ENTRIES {
                     return Err(format!(
-                        "DHCPv4 동적 상태는 최대 {MAX_STATE_ENTRIES}개입니다"
+                        "At most {MAX_STATE_ENTRIES} DHCPv4 dynamic entries are allowed"
                     ));
                 }
                 projected += 1;
@@ -1396,7 +1406,7 @@ impl LeasePool {
             text.push('\n');
         }
         if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
-            onetdns_core::warn!(event = "dhcp4.lease_save_failed", path = ?path, error = %e, "DHCP 임대 정보를 파일에 저장하지 못했습니다");
+            onetdns_core::warn!(event = "dhcp4.lease_save_failed", path = ?path, error = %e, "Could not save DHCP leases to file");
         }
     }
 
@@ -1415,7 +1425,7 @@ impl LeasePool {
             text.push('\n');
         }
         if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
-            onetdns_core::warn!(event = "dhcp4.static_save_failed", path = ?path, error = %e, "DHCP 고정 할당 정보를 저장하지 못했습니다");
+            onetdns_core::warn!(event = "dhcp4.static_save_failed", path = ?path, error = %e, "Could not save DHCP static leases");
         }
     }
 }
@@ -1436,27 +1446,27 @@ pub fn read_reservations(
             file.take(MAX_PERSIST_FILE + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| {
-                    format!("DHCP 고정 할당 파일을 읽지 못했습니다({shown}): {error}")
+                    format!("Could not read the DHCP static assignment file ({shown}): {error}")
                 })?;
             bytes
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(error) => {
             return Err(format!(
-                "DHCP 고정 할당 파일을 열지 못했습니다({shown}): {error}"
+                "Could not open the DHCP static assignment file ({shown}): {error}"
             ));
         }
     };
     if bytes.len() as u64 > MAX_PERSIST_FILE {
         return Err(format!(
-            "DHCP 고정 할당 파일이 허용 크기 {MAX_PERSIST_FILE}바이트를 넘습니다({shown})"
+            "DHCP static assignment file exceeds the {MAX_PERSIST_FILE}-byte limit ({shown})"
         ));
     }
     let text = String::from_utf8(bytes)
-        .map_err(|_| format!("DHCP 고정 할당 파일이 UTF-8 텍스트가 아닙니다({shown})"))?;
+        .map_err(|_| format!("DHCP static assignment file is not UTF-8 text ({shown})"))?;
     let body = text.strip_prefix(RESERVATION_HEADER).ok_or_else(|| {
         format!(
-            "DHCP 고정 할당 파일({shown})의 첫 줄은 {}이어야 합니다",
+            "The first line of the DHCP static assignment file ({shown}) must be {}",
             RESERVATION_HEADER.trim_end()
         )
     })?;
@@ -1465,11 +1475,11 @@ pub fn read_reservations(
         let line_no = index + 2;
         if out.len() >= MAX_STATE_ENTRIES {
             return Err(format!(
-                "DHCP 고정 할당 파일({shown})의 항목이 상한 {MAX_STATE_ENTRIES}개를 넘습니다"
+                "DHCP static assignment file ({shown}) has more than {MAX_STATE_ENTRIES} entries"
             ));
         }
         let bad =
-            || format!("DHCP 고정 할당 파일({shown}) {line_no}번째 줄의 형식이 올바르지 않습니다");
+            || format!("Line {line_no} of the DHCP static assignment file ({shown}) is malformed");
         let mut toks = line.split_whitespace();
         let (Some(identity_s), Some(ip_s)) = (toks.next(), toks.next()) else {
             return Err(bad());
@@ -1490,7 +1500,7 @@ pub fn read_reservations(
         }
         if out.insert(identity, (u32::from(ip), hostname)).is_some() {
             return Err(format!(
-                "DHCP 고정 할당 파일({shown}) {line_no}번째 줄의 클라이언트가 앞에서 이미 나왔습니다"
+                "Line {line_no} of the DHCP static assignment file ({shown}) repeats a client listed earlier"
             ));
         }
     }
@@ -1552,7 +1562,7 @@ fn load_leases(path: &std::path::Path) -> HashMap<ClientIdentity, Lease> {
         return out;
     };
     let Some(text) = text.strip_prefix(LEASE_HEADER) else {
-        onetdns_core::warn!(event = "dhcp4.leases_restore_invalid", path = %path.display(), "DHCP 임대 파일이 현재 형식과 일치하지 않아 빈 상태로 시작합니다");
+        onetdns_core::warn!(event = "dhcp4.leases_restore_invalid", path = %path.display(), "DHCP lease file does not match the current format; starting empty");
         return out;
     };
     let now = crate::unix_now();
@@ -1615,7 +1625,7 @@ fn load_leases(path: &std::path::Path) -> HashMap<ClientIdentity, Lease> {
             event = "dhcp4.leases_restore_invalid",
             path = %path.display(),
             malformed,
-            "DHCP 임대 파일이 손상되어 빈 상태로 시작합니다"
+            "DHCP lease file is corrupted; starting empty"
         );
         return HashMap::new();
     }
@@ -1713,12 +1723,12 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
         ClientAction::Request { target, selecting } => {
             let want_u = u32::from(target);
             if selecting && !pool.consume_offer(&identity, req.xid, want_u) {
-                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = "no_matching_offer", "이 서버가 제안한 적 없는 주소를 확정해 달라는 요청이라 거절했습니다");
+                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = "no_matching_offer", "Declined a request to confirm an address this server never offered");
                 return Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg));
             }
             if let Some(rip) = pool.reservation_ip(&identity) {
                 if rip != want_u {
-                    onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reserved = %Ipv4Addr::from(rip), reason = "reserved_address_mismatch", "고정 할당과 다른 주소를 요청해 거절했습니다");
+                    onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reserved = %Ipv4Addr::from(rip), reason = "reserved_address_mismatch", "Declined a request for an address other than the static lease");
                     return Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg));
                 }
                 if !pool.address_used_by_other(&identity, rip)
@@ -1726,7 +1736,7 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                 {
                     return Some(build_reply(req, ACK, Ipv4Addr::from(rip), cfg));
                 }
-                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %Ipv4Addr::from(rip), reason = "reserved_address_unavailable", "고정 할당 주소를 안전하게 확정할 수 없어 거절했습니다");
+                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %Ipv4Addr::from(rip), reason = "reserved_address_unavailable", "Declined because the static lease address cannot be confirmed safely");
                 return Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg));
             }
             let used_by_other = pool.address_used_by_other(&identity, want_u);
@@ -1734,7 +1744,7 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                 if pool.commit(&identity, req.chaddr, want_u, req.hostname()) {
                     Some(build_reply(req, ACK, target, cfg))
                 } else {
-                    onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = "lease_state_limit", "임대 기록 상한 때문에 새 주소를 확정하지 않습니다");
+                    onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = "lease_state_limit", "Not confirming a new address because the lease table is full");
                     Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg))
                 }
             } else {
@@ -1751,7 +1761,7 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                     && in_served_subnet(target, cfg)
                     && !pool.has_record(&identity)
                 {
-                    onetdns_core::debug!(event = "dhcp4.request_ignored", identity = %identity.to_text(), requested = %target, reason = "unknown_client", "기록이 없는 클라이언트의 같은 망 주소 요청이라 답하지 않습니다");
+                    onetdns_core::debug!(event = "dhcp4.request_ignored", identity = %identity.to_text(), requested = %target, reason = "unknown_client", "Not answering a same-network address request from an unknown client");
                     return None;
                 }
                 let reason = if want_u < pool.start || want_u > pool.end {
@@ -1759,7 +1769,7 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                 } else {
                     "used_by_other"
                 };
-                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = reason, "요청한 주소를 줄 수 없어 거절했습니다");
+                onetdns_core::debug!(event = "dhcp4.request_rejected", identity = %identity.to_text(), requested = %target, reason = reason, "Declined because the requested address cannot be given");
                 Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg))
             }
         }
@@ -1918,7 +1928,7 @@ pub fn spawn_dhcp(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) {
-                        onetdns_core::warn!(event = "dhcp4.recv_failed", %error, "DHCP 요청을 받지 못했습니다");
+                        onetdns_core::warn!(event = "dhcp4.recv_failed", %error, "Failed to receive a DHCP request");
                     }
                     continue;
                 }
@@ -1937,7 +1947,7 @@ pub fn spawn_dhcp(
             let reply = handle(&req, &mut pool.lock_recover(), &cfg);
             if let Some(reply) = reply {
                 if reply.msg_type() == Some(ACK) {
-                    onetdns_core::debug!(event = "dhcp4.lease_issued", ip = %reply.yiaddr, active = pool.lock_recover().active(), "DHCP 임대 주소를 발급했습니다");
+                    onetdns_core::debug!(event = "dhcp4.lease_issued", ip = %reply.yiaddr, active = pool.lock_recover().active(), "Issued a DHCP lease");
                 }
                 let wire = reply.encode();
                 let target = reply_target(&req, &reply);
@@ -1959,7 +1969,7 @@ pub fn spawn_dhcp(
                                 &wire,
                             )
                             .map_err(|error| {
-                                onetdns_core::warn!(event = "dhcp4.initial_unicast_fallback", ip = %ip, mac = %mac_hex(&mac), %error, "초기 클라이언트에 L2 유니캐스트를 보낼 수 없어 방송으로 다시 보냅니다");
+                                onetdns_core::warn!(event = "dhcp4.initial_unicast_fallback", ip = %ip, mac = %mac_hex(&mac), %error, "Cannot send L2 unicast to a client without an address; resending as broadcast");
                                 error
                             })
                         },
@@ -1967,7 +1977,7 @@ pub fn spawn_dhcp(
                     ),
                 };
                 if let Err(error) = sent {
-                    onetdns_core::warn!(event = "dhcp4.send_failed", target = ?target, mac = %mac_hex(&req.chaddr), %error, "DHCP 응답을 보내지 못해 이 기기는 주소를 받지 못합니다");
+                    onetdns_core::warn!(event = "dhcp4.send_failed", target = ?target, mac = %mac_hex(&req.chaddr), %error, "Failed to send a DHCP reply; the device will not get an address");
                 }
             }
         }

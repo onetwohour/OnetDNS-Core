@@ -228,7 +228,7 @@ pub(crate) fn reactor_worker<H: Handler>(
 ) {
     use std::os::fd::AsRawFd;
     if let Err(error) = sock.set_nonblocking(true) {
-        onetdns_core::error!(event = "dns.reactor_nonblocking_failed", %error, "수신 소켓을 비차단으로 바꾸지 못했습니다. 리액터가 한 질의에서 멈춰 설 수 있습니다");
+        onetdns_core::error!(event = "dns.reactor_nonblocking_failed", %error, "Could not make the receive socket non-blocking; the reactor may stall on a single query");
     }
     let listener_fd = sock.as_raw_fd();
     let mut recv = [0u8; MAX_UDP_REQUEST + 1];
@@ -402,7 +402,7 @@ fn record_send_error(src: std::net::SocketAddr, bytes: usize, error: &std::io::E
             bytes,
             %error,
             count,
-            "UDP DNS 응답을 보내지 못했습니다"
+            "Could not send UDP DNS response"
         );
     }
 }
@@ -429,7 +429,7 @@ fn record_recv_error(error: &std::io::Error) {
     static RECV_ERRORS: AtomicU64 = AtomicU64::new(0);
     let count = RECV_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "dns.udp_recv_failed", %error, count, "UDP 질의를 받지 못했습니다");
+        onetdns_core::warn!(event = "dns.udp_recv_failed", %error, count, "Failed to receive UDP query");
     }
 }
 
@@ -630,10 +630,7 @@ pub fn encode_within(request: &Message, response: &Message, writer: &mut Writer,
     if !encode_response(&response, writer) {
         let fallback = crate::encoding_failure_response(request);
         let encoded = encode_response(&fallback, writer);
-        debug_assert!(
-            encoded,
-            "고정된 최소 SERVFAIL은 항상 인코딩 가능해야 합니다"
-        );
+        debug_assert!(encoded, "The fixed minimal SERVFAIL must always encode");
     }
     debug_assert!(writer.buf.len() <= limit);
 }

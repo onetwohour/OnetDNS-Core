@@ -129,7 +129,7 @@ impl ZoneSource for MysqlZoneSource {
             store.add(z);
         }
         if missing_origin > 0 {
-            onetdns_core::warn!(event = "authority.mysql_origin_missing", table = %self.table, rows = missing_origin, "origin이 비어 있는 행을 루트 영역으로 읽었습니다. 의도한 것이 아니면 테이블을 확인하십시오");
+            onetdns_core::warn!(event = "authority.mysql_origin_missing", table = %self.table, rows = missing_origin, "Read a row with an empty origin as the root zone; check the table if this is unintended");
         }
         Ok(store)
     }
@@ -161,7 +161,7 @@ fn sanitize_table(t: &str) -> Result<String, String> {
     {
         Ok(t.to_string())
     } else {
-        Err(format!("부적절한 테이블 이름: {t}"))
+        Err(format!("Invalid table name: {t}"))
     }
 }
 
@@ -197,11 +197,11 @@ impl MyConn {
             .map_err(|e| e.to_string())?;
         let len = (head[0] as usize) | ((head[1] as usize) << 8) | ((head[2] as usize) << 16);
         if len > MAX_MYSQL_PACKET {
-            return Err("MySQL 패킷 크기가 허용 한도를 넘었습니다".into());
+            return Err("MySQL packet exceeds the size limit".into());
         }
         if head[3] != self.seq {
             return Err(format!(
-                "MySQL 패킷 순번이 일치하지 않습니다: expected {}, got {}",
+                "MySQL packet sequence mismatch: expected {}, got {}",
                 self.seq, head[3]
             ));
         }
@@ -216,7 +216,7 @@ impl MyConn {
     /** @brief 3바이트 길이와 순번을 앞에 붙여 패킷을 보낸다. */
     fn write_packet(&mut self, body: &[u8]) -> Result<(), String> {
         if body.len() > MAX_MYSQL_PACKET {
-            return Err("MySQL 송신 패킷 크기가 허용 한도를 넘었습니다".into());
+            return Err("Outgoing MySQL packet exceeds the size limit".into());
         }
         let mut pkt = Vec::with_capacity(body.len() + 4);
         pkt.push((body.len() & 0xff) as u8);
@@ -257,8 +257,8 @@ impl MyConn {
                         i += 1;
                     }
                     let new_plugin = String::from_utf8_lossy(&pkt[pstart..i]).to_string();
-                    let next = i.checked_add(1).ok_or("인증 전환 길이 계산 범위를 넘었습니다")?;
-                    let new_scramble = trim_nul(pkt.get(next..).ok_or("인증 전환 패킷 너무 짧습니다")?);
+                    let next = i.checked_add(1).ok_or("Auth switch length calculation overflowed")?;
+                    let new_scramble = trim_nul(pkt.get(next..).ok_or("Auth switch packet is too short")?);
                     let auth = compute_auth(&new_plugin, password.as_bytes(), &new_scramble);
                     self.write_packet(&auth)?;
                 }
@@ -268,16 +268,16 @@ impl MyConn {
                         Some(0x03) => {}
                         Some(0x04) => {
                             return Err(
-                                "현재 연결 방식에서는 MySQL의 caching_sha2_password 전체 인증을 지원하지 않습니다. TLS를 사용하거나 계정을 mysql_native_password 방식으로 구성하십시오".into(),
+                                "Full caching_sha2_password authentication is not supported over this connection; use TLS or configure the account with mysql_native_password".into(),
                             )
                         }
                         _ => {}
                     }
                 }
-                _ => return Err("예상치 못한 핸드셰이크 응답".into()),
+                _ => return Err("Unexpected handshake response".into()),
             }
         }
-        Err("MySQL 인증 왕복 횟수가 허용 한도를 넘었습니다".into())
+        Err("Too many MySQL authentication round trips".into())
     }
 
     /**
@@ -302,10 +302,10 @@ impl MyConn {
             return Ok(Vec::new());
         }
 
-        let (ncols, _) = lenenc_int(&first, 0).ok_or("컬럼 개수 해석하지 못했습니다")?;
-        let ncols = usize::try_from(ncols).map_err(|_| "컬럼 개수 허용 범위를 넘었습니다")?;
+        let (ncols, _) = lenenc_int(&first, 0).ok_or("Could not parse the column count")?;
+        let ncols = usize::try_from(ncols).map_err(|_| "Column count is out of range")?;
         if ncols == 0 || ncols > MAX_MYSQL_COLUMNS {
-            return Err("MySQL 컬럼 개수가 허용 한도를 넘었습니다".into());
+            return Err("MySQL column count exceeds the limit".into());
         }
 
         for _ in 0..ncols {
@@ -332,14 +332,14 @@ impl MyConn {
             let origin = cols.first().cloned().flatten().unwrap_or_default();
             let zone = cols.get(1).cloned().flatten().unwrap_or_default();
             if rows.len() >= MAX_MYSQL_ROWS {
-                return Err("MySQL 결과 행 수 허용 한도를 넘었습니다".into());
+                return Err("MySQL result exceeds the row limit".into());
             }
             result_bytes = result_bytes
                 .checked_add(origin.len())
                 .and_then(|n| n.checked_add(zone.len()))
-                .ok_or("MySQL 결과 크기 계산 범위를 넘었습니다")?;
+                .ok_or("MySQL result size calculation overflowed")?;
             if result_bytes > MAX_MYSQL_RESULT_BYTES {
-                return Err("MySQL 결과 크기가 허용 한도를 넘었습니다".into());
+                return Err("MySQL result exceeds the size limit".into());
             }
             rows.push((origin, zone));
             cur = self.read_packet()?;
@@ -356,37 +356,37 @@ impl MyConn {
  */
 fn parse_handshake(p: &[u8]) -> Result<(Vec<u8>, String), String> {
     if p.first() != Some(&0x0a) {
-        return Err("MySQL 프로토콜 v10 핸드셰이크가 아닙니다".into());
+        return Err("Not a MySQL protocol v10 handshake".into());
     }
     let mut i = 1usize;
     let server_end = p
         .get(i..)
         .and_then(|tail| tail.iter().position(|&b| b == 0))
         .map(|n| i + n)
-        .ok_or("서버 버전 문자열의 끝 표시가 없습니다")?;
+        .ok_or("The server version string is not terminated")?;
     i = server_end
         .checked_add(1)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
     i = i
         .checked_add(4)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
 
     let part1_end = i
         .checked_add(8)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
     let mut scramble = p
         .get(i..part1_end)
-        .ok_or("핸드셰이크 너무 짧습니다")?
+        .ok_or("Handshake is too short")?
         .to_vec();
     i = part1_end
         .checked_add(1)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
 
     let cap_low_end = i
         .checked_add(2)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
     if cap_low_end > p.len() {
-        return Err("핸드셰이크 capability 너무 짧습니다".into());
+        return Err("Handshake capability field is too short".into());
     }
     i = cap_low_end;
     if i == p.len() {
@@ -395,16 +395,16 @@ fn parse_handshake(p: &[u8]) -> Result<(Vec<u8>, String), String> {
 
     let fixed_end = i
         .checked_add(6)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
     let fixed = p
         .get(i..fixed_end)
-        .ok_or("핸드셰이크 확장부 너무 짧습니다")?;
+        .ok_or("Handshake extension is too short")?;
     let adl = fixed[5] as usize;
     i = fixed_end
         .checked_add(10)
-        .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Handshake length calculation overflowed")?;
     if i > p.len() {
-        return Err("핸드셰이크 예약 필드 너무 짧습니다".into());
+        return Err("Handshake reserved field is too short".into());
     }
 
     let available = p.len().saturating_sub(i);
@@ -413,7 +413,7 @@ fn parse_handshake(p: &[u8]) -> Result<(Vec<u8>, String), String> {
     if part2_len > 0 {
         let end = i
             .checked_add(part2_len)
-            .ok_or("핸드셰이크 길이 계산 범위를 넘었습니다")?;
+            .ok_or("Handshake length calculation overflowed")?;
         scramble.extend_from_slice(&trim_nul(&p[i..end]));
         i = end;
     }
@@ -519,14 +519,14 @@ fn build_handshake_response(user: &str, auth: &[u8], database: &str, plugin: &st
 /** @brief 오류 패킷에서 사람이 읽을 메시지를 추출한다. SQL 상태가 붙어 있으면 건너뛴다. */
 fn err_packet(p: &[u8]) -> String {
     if p.len() < 3 {
-        return "MySQL 서버가 오류를 반환했습니다".into();
+        return "MySQL server returned an error".into();
     }
     let mut i = 3;
     if p.get(3) == Some(&b'#') {
         i = 9;
     }
     format!(
-        "MySQL 오류: {}",
+        "MySQL error: {}",
         String::from_utf8_lossy(&p[i.min(p.len())..])
     )
 }
@@ -577,13 +577,13 @@ fn parse_text_row(b: &[u8], ncols: usize) -> Result<Vec<Option<String>>, String>
             pos += 1;
             continue;
         }
-        let (len, np) = lenenc_int(b, pos).ok_or("lenenc 해석하지 못했습니다")?;
+        let (len, np) = lenenc_int(b, pos).ok_or("Could not parse a length-encoded integer")?;
         pos = np;
-        let len = usize::try_from(len).map_err(|_| "행 값 길이 허용 범위를 넘었습니다")?;
+        let len = usize::try_from(len).map_err(|_| "Row value length is out of range")?;
         let end = pos
             .checked_add(len)
-            .ok_or("행 값 길이 계산 범위를 넘었습니다")?;
-        let s = b.get(pos..end).ok_or("행 값 허용 범위를 넘었습니다")?;
+            .ok_or("Row value length calculation overflowed")?;
+        let s = b.get(pos..end).ok_or("Row value is out of range")?;
         out.push(Some(String::from_utf8_lossy(s).to_string()));
         pos = end;
     }

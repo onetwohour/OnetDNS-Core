@@ -265,7 +265,7 @@ fn receive_notify_acks(
             Ok(received) => received,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(error) => {
-                onetdns_core::warn!(event = "authority.notify_receive_failed", %error, "DNS NOTIFY ACK를 받지 못했습니다");
+                onetdns_core::warn!(event = "authority.notify_receive_failed", %error, "No ACK received for DNS NOTIFY");
                 break;
             }
         };
@@ -276,7 +276,7 @@ fn receive_notify_acks(
         if let Some(job_key) = matched {
             if let Some(done) = active.remove(&job_key) {
                 let target = targets[job_key.target].address;
-                onetdns_core::info!(event = "authority.notify_acknowledged", zone = %done.origin.to_ascii_lower(), serial = done.serial, %target, transmissions = done.transmissions, "DNS NOTIFY ACK를 확인했습니다");
+                onetdns_core::info!(event = "authority.notify_acknowledged", zone = %done.origin.to_ascii_lower(), serial = done.serial, %target, transmissions = done.transmissions, "DNS NOTIFY acknowledged");
             }
         }
     }
@@ -310,7 +310,7 @@ fn spawn_notify_worker(
             Some(socket)
         }
         Err(error) => {
-            onetdns_core::warn!(event = "authority.notify_ipv6_unavailable", %error, "IPv6 NOTIFY 소켓을 열지 못했습니다. IPv6 대상에는 알리지 못합니다");
+            onetdns_core::warn!(event = "authority.notify_ipv6_unavailable", %error, "Could not open the IPv6 NOTIFY socket; IPv6 targets will not be notified");
             None
         }
     };
@@ -351,7 +351,7 @@ fn spawn_notify_worker(
                         Ok(outstanding) => {
                             active.insert(job_key, outstanding);
                         }
-                        Err(error) => onetdns_core::error!(event = "authority.notify_encode_failed", serial = job.serial, %error, "DNS NOTIFY를 인코딩하지 못했습니다"),
+                        Err(error) => onetdns_core::error!(event = "authority.notify_encode_failed", serial = job.serial, %error, "Could not encode DNS NOTIFY"),
                     }
                 }
 
@@ -380,7 +380,7 @@ fn spawn_notify_worker(
                             outstanding.transmissions += 1;
                             outstanding.next_send =
                                 now + retry_delay(policy, outstanding.transmissions);
-                            onetdns_core::info!(event = "authority.notify_sent", zone = %outstanding.origin.to_ascii_lower(), serial = outstanding.serial, target = %target.address, transmission = outstanding.transmissions, "DNS NOTIFY를 전송했습니다");
+                            onetdns_core::info!(event = "authority.notify_sent", zone = %outstanding.origin.to_ascii_lower(), serial = outstanding.serial, target = %target.address, transmission = outstanding.transmissions, "Sent DNS NOTIFY");
                         }
                         Ok(_) => {
                             outstanding.next_send = now + Duration::from_millis(10);
@@ -392,13 +392,13 @@ fn spawn_notify_worker(
                             outstanding.transmissions += 1;
                             outstanding.next_send =
                                 now + retry_delay(policy, outstanding.transmissions);
-                            onetdns_core::warn!(event = "authority.notify_send_failed", zone = %outstanding.origin.to_ascii_lower(), target = %target.address, transmission = outstanding.transmissions, %error, "DNS NOTIFY 전송에 실패했습니다");
+                            onetdns_core::warn!(event = "authority.notify_send_failed", zone = %outstanding.origin.to_ascii_lower(), target = %target.address, transmission = outstanding.transmissions, %error, "Failed to send DNS NOTIFY");
                         }
                     }
                 }
                 for job_key in timed_out {
                     if let Some(expired) = active.remove(&job_key) {
-                        onetdns_core::warn!(event = "authority.notify_timeout", zone = %expired.origin.to_ascii_lower(), serial = expired.serial, target = %targets[job_key.target].address, transmissions = expired.transmissions, "DNS NOTIFY가 ACK 없이 만료됐습니다");
+                        onetdns_core::warn!(event = "authority.notify_timeout", zone = %expired.origin.to_ascii_lower(), serial = expired.serial, target = %targets[job_key.target].address, transmissions = expired.transmissions, "DNS NOTIFY expired without an ACK");
                     }
                 }
                 if let Some(socket) = &socket4 {
@@ -456,7 +456,7 @@ fn notify_runtime_targets(
                         .cloned()
                         .ok_or_else(|| {
                             format!(
-                                "NOTIFY 대상 '{}'의 TSIG 키 '{}'를 찾을 수 없습니다",
+                                "Could not find TSIG key '{}' for NOTIFY target '{}'",
                                 target.address, name
                             )
                         })?,

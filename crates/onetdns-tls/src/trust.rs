@@ -126,13 +126,13 @@ impl TrustStore {
         let store = TrustStore::from_ders(ders.iter().map(|d| d.as_slice()));
         let accepted = store.len() + store.certificate_pins.len();
         if accepted == 0 {
-            onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "시스템 루트 인증서를 하나도 읽지 못했습니다. 암호화 업스트림 DNS 서버의 인증서를 검증할 수 없습니다");
+            onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates");
         } else {
             onetdns_core::debug!(
                 event = "tls.system_roots_loaded",
                 roots = accepted,
                 skipped = ders.len().saturating_sub(accepted),
-                "시스템 루트 인증서를 읽었습니다"
+                "Loaded system root certificates"
             );
         }
         store

@@ -207,8 +207,9 @@ fn main() -> BoxResult<()> {
     };
 
     let mut rng_probe = [0u8; 32];
-    onetdns_core::try_fill_random(&mut rng_probe)
-        .map_err(|error| crate::anyhow!("운영체제 보안 난수원을 사용할 수 없습니다: {error}"))?;
+    onetdns_core::try_fill_random(&mut rng_probe).map_err(|error| {
+        crate::anyhow!("The operating system secure random source is unavailable: {error}")
+    })?;
 
     #[cfg(windows)]
     if let Command::Service {
@@ -246,7 +247,7 @@ fn main() -> BoxResult<()> {
         Command::Check { config } => check_config(config),
         Command::Top { ctl } => ctl_top(&ctl),
         Command::Services => {
-            println!("차단 가능한 서비스:");
+            println!("Services that can be blocked:");
             for (id, name) in onetdns_filter::services::list() {
                 println!("  {id:12} {name}");
             }
@@ -269,11 +270,13 @@ fn gen_passwd(name: Option<String>) -> BoxResult<()> {
 
     let login = name.unwrap_or_else(|| "admin".to_string());
     if login.trim().is_empty() || login.len() > 64 {
-        return Err(crate::anyhow!("로그인 이름은 1~64자여야 합니다"));
+        return Err(crate::anyhow!("The login name must be 1 to 64 characters"));
     }
 
-    eprintln!("웹 콘솔 계정 '{login}'의 비밀번호를 입력하고 Enter를 누르십시오.");
-    eprintln!("(입력한 글자가 화면에 그대로 보입니다. 12자 이상을 권합니다.)");
+    eprintln!("Type the password for dashboard account '{login}' and press Enter.");
+    eprintln!(
+        "(The characters you type are shown on screen. At least 12 characters is recommended.)"
+    );
 
     /** @brief 읽어들일 암호 길이 상한. */
     const MAX_PASSWORD_INPUT: u64 = 4097;
@@ -282,20 +285,20 @@ fn gen_passwd(name: Option<String>) -> BoxResult<()> {
         .lock()
         .take(MAX_PASSWORD_INPUT)
         .read_line(&mut line)
-        .with_context(|| "비밀번호를 읽지 못했습니다")?;
+        .with_context(|| "Could not read the password")?;
     if line.len() as u64 >= MAX_PASSWORD_INPUT {
-        return Err(crate::anyhow!("비밀번호가 너무 깁니다"));
+        return Err(crate::anyhow!("The password is too long"));
     }
     let pw = line.trim_end_matches(['\n', '\r']);
     if pw.is_empty() {
-        return Err(crate::anyhow!("빈 비밀번호는 허용되지 않습니다"));
+        return Err(crate::anyhow!("An empty password is not allowed"));
     }
 
     eprintln!();
     eprintln!(
-        "아래 세 줄을 설정 파일({CONFIG_FILE_NAME}) 맨 끝에 붙여 넣고 서버를 다시 시작하십시오."
+        "Paste the three lines below at the end of the configuration file ({CONFIG_FILE_NAME}) and restart the server."
     );
-    eprintln!("웹 콘솔을 열 수 있으면 이 명령 없이 첫 화면에서 바로 계정을 만들 수 있습니다.");
+    eprintln!("If you can open the dashboard, you can create the account on its first screen without this command.");
     eprintln!();
     println!("[[users]]");
     println!("name = \"{login}\"");
@@ -314,152 +317,151 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
     runtime_preflight(&cfg).map_err(|error| crate::anyhow!(error))?;
 
     let mode_label = match cfg.mode {
-        Mode::Personal => "개인·내부망용",
-        Mode::Public => "공개 서비스용",
+        Mode::Personal => "personal (private network)",
+        Mode::Public => "public service",
     };
     let backend_label = match cfg.backend {
-        BackendKind::Forward => "업스트림 DNS 서버에 전달",
-        BackendKind::Recurse => "직접 재귀 조회",
-        BackendKind::Split => "도메인별 분리 처리",
+        BackendKind::Forward => "forward to upstream DNS servers",
+        BackendKind::Recurse => "resolve recursively",
+        BackendKind::Split => "split by domain",
     };
     let cookie_label = match cfg.cookies {
-        CookieMode::Off => "사용 안 함",
-        CookieMode::Lenient => "지원하는 클라이언트에만 적용",
-        CookieMode::Strict => "모든 클라이언트에 요구",
+        CookieMode::Off => "off",
+        CookieMode::Lenient => "only for clients that support it",
+        CookieMode::Strict => "required for every client",
     };
 
-    println!("설정 파일을 확인했습니다.");
-    println!("  운영 대상: {mode_label}");
-    println!("  질의 처리 방식: {backend_label}");
-    println!("  일반 DNS 수신 주소: {:?}", cfg.listen);
+    println!("The configuration file is valid.");
+    println!("  Mode: {mode_label}");
+    println!("  Query resolution: {backend_label}");
+    println!("  Plain DNS listening addresses: {:?}", cfg.listen);
     if cfg.tls_enabled() {
         println!(
-            "  암호화 DNS 수신 주소: DoT {}개, DoH {}개, DoQ {}개, DoH3 {}개",
+            "  Encrypted DNS listening addresses: DoT {}, DoH {}, DoQ {}, DoH3 {}",
             cfg.listen_dot.len(),
             cfg.listen_doh.len(),
             cfg.listen_doq.len(),
             cfg.listen_doh3.len()
         );
         println!(
-            "  클라이언트 인증서 확인: {}",
-            if cfg.tls_authenticated() {
-                "사용"
-            } else {
-                "사용 안 함"
-            }
+            "  Client certificate verification: {}",
+            if cfg.tls_authenticated() { "on" } else { "off" }
         );
     }
     if !cfg.listen_dnscrypt.is_empty() {
-        println!("  DNSCrypt 수신 주소: {:?}", cfg.listen_dnscrypt);
+        println!("  DNSCrypt listening addresses: {:?}", cfg.listen_dnscrypt);
     }
     println!(
-        "  접근 제어: 허용 대역 {}개, 차단 대역 {}개",
+        "  Access control: {} allowed ranges, {} denied ranges",
         cfg.acl_allow.len(),
         cfg.acl_deny.len()
     );
     /* 한도 설정의 0은 끔을 뜻한다. 0건으로 적으면 모든 요청을 막는 것처럼 읽힌다. */
     if cfg.rate_limit_per_sec == 0 {
-        println!("  클라이언트별 속도 제한: 사용 안 함");
+        println!("  Per-client rate limit: off");
     } else {
         println!(
-            "  클라이언트별 속도 제한: 초당 {}건, 순간 허용 {}건",
+            "  Per-client rate limit: {} per second, burst {}",
             cfg.rate_limit_per_sec, cfg.rate_limit_burst
         );
     }
     if cfg.subnet_rrl_per_sec == 0 {
-        println!("  대역별 응답 제한: 사용 안 함");
+        println!("  Per-subnet response limit: off");
     } else {
-        println!("  대역별 응답 제한: 초당 {}건", cfg.subnet_rrl_per_sec);
+        println!(
+            "  Per-subnet response limit: {} per second",
+            cfg.subnet_rrl_per_sec
+        );
     }
-    println!("  DNS 쿠키: {cookie_label}");
+    println!("  DNS cookies: {cookie_label}");
     let inflight = if cfg.max_inflight == 0 {
-        "제한 없음".to_string()
+        "unlimited".to_string()
     } else {
-        format!("{}건", cfg.max_inflight)
+        format!("{}", cfg.max_inflight)
     };
     println!(
-        "  처리 자원: 캐시 {}건, 동시 질의 {inflight}, 질의 제한 시간 {}초",
+        "  Resources: cache {} entries, concurrent queries {inflight}, query timeout {} s",
         cfg.cache_size, cfg.query_timeout_secs
     );
     if let Some(c) = cfg.control_listen {
-        println!("  관리 화면 수신 주소: {c}");
+        println!("  Dashboard listening address: {c}");
     }
 
     let mut ext: Vec<String> = Vec::new();
     if cfg.block_response == BlockResponseKind::Custom {
-        ext.push("사용자 지정 주소로 차단 응답".into());
+        ext.push("custom address for blocked responses".into());
     }
     if cfg.block_aaaa {
-        ext.push("AAAA 응답이 비활성화되어 있습니다".into());
+        ext.push("AAAA responses disabled".into());
     }
     if !cfg.upstream_urls.is_empty() {
         // 섞여 있으면 "암호화 N개"만 보여 주는 것이 사실을 가린다. 실제로 나가는 질의는
         // 대부분 평문 쪽이다.
         if cfg.mixes_plain_and_encrypted_upstreams() {
             ext.push(format!(
-                "업스트림 DNS 서버 {}개(암호화) + {}개(평문)",
+                "{} encrypted + {} plain upstream DNS servers",
                 cfg.upstream_urls.len(),
                 cfg.upstreams.len()
             ));
         } else {
             ext.push(format!(
-                "암호화 업스트림 DNS 서버 {}개",
+                "{} encrypted upstream DNS servers",
                 cfg.upstream_urls.len()
             ));
         }
     }
     if !cfg.fallback_upstreams.is_empty() {
-        ext.push("예비 업스트림 DNS 서버".into());
+        ext.push("fallback upstream DNS servers".into());
     }
     if cfg.ecs_mode != EcsMode::Off {
         ext.push(match cfg.ecs_mode {
             EcsMode::Off => unreachable!(),
-            EcsMode::Strip => "클라이언트 서브넷 정보 제거".into(),
-            EcsMode::Send => "클라이언트 서브넷 정보 전달".into(),
+            EcsMode::Strip => "remove client subnet".into(),
+            EcsMode::Send => "send client subnet".into(),
         });
     }
     if !cfg.stub_zones.is_empty() {
         ext.push(format!(
-            "별도 DNS 서버로 보낼 영역 {}개",
+            "{} stub zones sent to separate DNS servers",
             cfg.stub_zones.len()
         ));
     }
     if !cfg.local_zones.is_empty() {
-        ext.push(format!("로컬 영역 {}개", cfg.local_zones.len()));
+        ext.push(format!("{} local zones", cfg.local_zones.len()));
     }
     if !cfg.rewrites.is_empty() {
-        ext.push(format!("질의 재작성 규칙 {}개", cfg.rewrites.len()));
+        ext.push(format!("{} rewrite rules", cfg.rewrites.len()));
     }
     if !cfg.rpz_files.is_empty() || !cfg.rpz_urls.is_empty() {
         ext.push(format!(
-            "응답 정책 영역: 파일 {}개, 원격 목록 {}개",
+            "response policy zones: {} files, {} remote lists",
             cfg.rpz_files.len(),
             cfg.rpz_urls.len()
         ));
     }
     if cfg.dnssec_validation_active() {
-        ext.push("DNSSEC 검증".into());
+        ext.push("DNSSEC validation".into());
     }
     if cfg.safe_browsing {
-        ext.push("위험 사이트 차단".into());
+        ext.push("dangerous-site blocking".into());
     }
     if cfg.parental_control {
-        ext.push("보호자 통제".into());
+        ext.push("parental control".into());
     }
     if !cfg.service_schedule.is_empty() {
-        ext.push("시간대별 서비스 차단 멈춤".into());
+        ext.push("scheduled pauses of service blocking".into());
     }
     if cfg.anonymize_client_ip {
-        ext.push("로그 익명화".into());
+        ext.push("query log anonymization".into());
     }
     if cfg.clients.iter().any(|c| !c.mac.is_empty()) {
-        ext.push("MAC 식별".into());
+        ext.push("MAC-based client identification".into());
     }
     if !ext.is_empty() {
-        println!("  추가 기능: {}", ext.join(", "));
+        println!("  Additional features: {}", ext.join(", "));
     }
     for warning in cfg.open_resolver_warnings().iter().chain(&cfg.advisories()) {
-        println!("  주의: {warning}");
+        println!("  Warning: {warning}");
     }
     Ok(())
 }
@@ -483,7 +485,7 @@ fn run_service(action: ServiceAction) -> BoxResult<()> {
     #[cfg(not(windows))]
     {
         let _ = action;
-        crate::bail!("service 명령은 Windows 전용입니다")
+        crate::bail!("The service command is available only on Windows")
     }
 }
 
@@ -596,7 +598,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
                 }
                 if let Some(first_error) = recovery_error.take() {
                     return Err(crate::anyhow!(format!(
-                        "새 설정을 적용하지 못했고 마지막 정상 설정으로도 서비스를 복구하지 못했습니다: 새 설정 오류={first_error}; 복구 설정 오류={error}"
+                        "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
                     )));
                 }
                 return Err(error.into());
@@ -627,7 +629,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
                 recovery_error = None;
                 onetdns_core::info!(
                     event = "config.reload_restarted",
-                    "설정을 다시 불러온 뒤 DNS 서비스를 재시작했습니다"
+                    "Restarted the DNS service after reloading the configuration"
                 );
             }
             Err(error) => {
@@ -640,7 +642,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
                 }
                 if let Some(first_error) = recovery_error.take() {
                     return Err(crate::anyhow!(format!(
-                        "새 설정을 적용하지 못했고 마지막 정상 설정으로도 서비스를 복구하지 못했습니다: 새 설정 오류={first_error}; 복구 설정 오류={error}"
+                        "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
                     )));
                 }
                 return Err(error);
@@ -665,14 +667,14 @@ fn restore_last_applied_config(
     }
     atomic_write(path, text.as_bytes()).with_context(|| {
         format!(
-            "새 설정으로 서비스를 시작하지 못한 뒤 마지막 정상 설정을 복구하지 못했습니다: {}",
+            "Could not start the service with the new configuration, and then could not restore the last working configuration: {}",
             path.display()
         )
     })?;
     onetdns_core::warn!(
         event = "config.start_failed_rollback",
         path = %path.display(),
-        "새 설정으로 서비스를 시작하지 못해 마지막 정상 설정을 복구합니다"
+        "Could not start with the new configuration; restoring the last working configuration"
     );
     Ok(true)
 }
@@ -685,7 +687,7 @@ fn apply_web_defaults(cfg: &mut Config, no_web: bool, config_path: Option<&std::
     if no_web {
         onetdns_core::info!(
             event = "serve.dashboard_disabled",
-            "대시보드 없이 DNS만 켭니다"
+            "Starting DNS without the dashboard"
         );
         return;
     }
@@ -700,22 +702,24 @@ fn apply_web_defaults(cfg: &mut Config, no_web: bool, config_path: Option<&std::
                 Ok(()) => persisted = true,
                 Err(error) => onetdns_core::error!(event = "control.token_save_failed",
                     path = %path.display(), %error,
-                    "관리 토큰을 설정 파일에 저장하지 못했습니다. 이번 실행에만 유효한 임시 토큰을 사용합니다"
+                    "Could not save the management token to the configuration file; using a temporary token for this run only"
                 ),
             }
         }
     }
     // 토큰을 설정에 적어 둔 사람은 그 값을 이미 안다. 그때는 주소만 알려 준다.
     println!();
-    println!("  대시보드: http://{addr}/");
+    println!("  Dashboard: http://{addr}/");
     if auto_token {
-        println!("  토큰: {}", cfg.control_token.as_str());
+        println!("  Token: {}", cfg.control_token.as_str());
         if persisted {
-            println!("  토큰은 설정 파일에 적어 뒀습니다. 다음에도 이 값으로 들어가면 됩니다.");
+            println!(
+                "  The token is saved in the configuration file, so it stays the same next time."
+            );
         } else {
-            println!("  이 토큰은 이번에만 씁니다. 고정하려면 설정 파일에 control_token 을 적으면 됩니다.");
+            println!("  This token is for this run only. To keep it, set control_token in the configuration file.");
         }
-        println!("  --no-web 을 주면 대시보드 없이 DNS만 돕니다.");
+        println!("  Pass --no-web to run DNS without the dashboard.");
     }
     println!();
 }
@@ -748,7 +752,7 @@ fn ensure_auto_config() -> Option<PathBuf> {
     let path = auto_config_path()?;
     if let Some(parent) = path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
-            onetdns_core::error!(event = "config.autocreate_dir_failed", path = %parent.display(), %error, "자동 설정 디렉터리를 만들지 못했습니다");
+            onetdns_core::error!(event = "config.autocreate_dir_failed", path = %parent.display(), %error, "Could not create the configuration directory");
             return None;
         }
         #[cfg(unix)]
@@ -757,22 +761,22 @@ fn ensure_auto_config() -> Option<PathBuf> {
             if let Err(error) =
                 std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             {
-                onetdns_core::error!(event = "config.autocreate_dir_acl_failed", path = %parent.display(), %error, "자동 설정 디렉터리의 접근 권한을 설정하지 못했습니다");
+                onetdns_core::error!(event = "config.autocreate_dir_acl_failed", path = %parent.display(), %error, "Could not set permissions on the configuration directory");
                 return None;
             }
         }
     }
     if !path.exists() {
         let body = format!(
-            "# OnetDNS가 자동으로 만든 설정 파일입니다. 웹 관리 화면이나 텍스트 편집기로 변경할 수 있습니다.\n# 각 항목의 설명은 문서와 웹 관리 화면의 전체 설정에서 확인할 수 있습니다.\ncontrol_token = \"{}\"\n",
+            "# Configuration file created automatically by OnetDNS. Edit it in the dashboard or a text editor.\n# Each setting is described in the documentation and on the dashboard's full settings page.\ncontrol_token = \"{}\"\n",
             gen_token()
         );
 
         if let Err(error) = atomic_write_secret(&path, body.as_bytes()) {
-            onetdns_core::error!(event = "config.autocreate_file_failed", path = %path.display(), %error, "자동 설정 파일을 만들지 못했습니다");
+            onetdns_core::error!(event = "config.autocreate_file_failed", path = %path.display(), %error, "Could not create the configuration file");
             return None;
         }
-        onetdns_core::info!(event = "config.autocreated", path = %path.display(), "기본 설정 파일을 만들었습니다");
+        onetdns_core::info!(event = "config.autocreated", path = %path.display(), "Created a default configuration file");
     } else {
         #[cfg(unix)]
         {
@@ -780,14 +784,14 @@ fn ensure_auto_config() -> Option<PathBuf> {
             if let Err(error) =
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             {
-                onetdns_core::error!(event = "config.autocreate_chmod_failed", path = %path.display(), %error, "자동 설정 파일의 접근 권한을 바로잡지 못했습니다");
+                onetdns_core::error!(event = "config.autocreate_chmod_failed", path = %path.display(), %error, "Could not fix permissions on the configuration file");
                 return None;
             }
         }
     }
     #[cfg(windows)]
     if let Err(error) = atomic_file::harden_windows_secret_acl(&path) {
-        onetdns_core::error!(event = "config.autocreate_acl_failed", path = %path.display(), %error, "자동 설정 파일의 Windows 접근 제어 목록을 바로잡지 못했습니다");
+        onetdns_core::error!(event = "config.autocreate_acl_failed", path = %path.display(), %error, "Could not fix the Windows access control list on the configuration file");
         return None;
     }
     Some(path)
@@ -989,7 +993,7 @@ pub fn serve(
     let lease_sync_jobs = Arc::new(EdgeServices::default());
     // ZSK 교체 작업. 영역 목록이나 주기가 바뀌면 멈추고 재시작한다.
     let zsk_rollover_jobs = Arc::new(EdgeServices::default());
-    onetdns_core::info!(event = "serve.starting", mode = ?cfg.mode, backend = ?cfg.backend, "DNS 서버를 켭니다");
+    onetdns_core::info!(event = "serve.starting", mode = ?cfg.mode, backend = ?cfg.backend, "Starting DNS server");
 
     let reload = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1032,7 +1036,7 @@ pub fn serve(
                     break;
                 }
             })
-            .with_context(|| "업스트림 DNS 서버 통계 저장 스레드를 시작하지 못했습니다")?;
+            .with_context(|| "Could not start the upstream DNS server statistics writer thread")?;
         service_cleanup.track(thread);
     }
 
@@ -1064,7 +1068,7 @@ pub fn serve(
         onetdns_core::info!(
             event = "dhcp.vendor_db_ready",
             oui_entries = vendor_db.load().len(),
-            "DHCP 임대 정보에 사용할 MAC 주소 제조사 데이터베이스를 준비했습니다"
+            "Prepared the MAC vendor database for DHCP leases"
         );
     }
 
@@ -1102,7 +1106,9 @@ pub fn serve(
                 lease_sync_jobs_for_retire.retire_all();
                 zsk_rollover_jobs_for_retire.retire_all();
             })
-            .with_context(|| "가장자리 서비스 종료 전파 작업을 시작하지 못했습니다")?;
+            .with_context(|| {
+                "Could not start the task that propagates shutdown to edge services"
+            })?;
         service_cleanup.track(thread);
     }
 
@@ -1128,16 +1134,14 @@ pub fn serve(
                     resolver.clone(),
                     stop,
                 )
-                .map_err(|error| {
-                    format!("DHCP 임대 정보 동기화 스레드를 시작하지 못했습니다: {error}")
-                })?;
+                .map_err(|error| format!("Could not start the DHCP lease sync thread: {error}"))?;
                 if let Some(thread) = thread {
                     track_service_thread(&tracker, thread);
                 }
                 onetdns_core::info!(
                     event = "dhcp.lease_sync_started",
                     peers = next.cluster_peers.len(),
-                    "DHCP 임대 정보 동기화를 시작합니다(30초 주기)"
+                    "Starting DHCP lease sync (every 30 seconds)"
                 );
                 Ok(())
             }) as SecondaryRestart
@@ -1156,18 +1160,18 @@ pub fn serve(
         Some(o)
     });
     if dns64_prefix_bytes.is_some() {
-        onetdns_core::info!(event = "dns64.enabled", prefix = ?cfg.dns64_prefix, "IPv6만 있는 망을 위해 A를 AAAA로 합성합니다");
+        onetdns_core::info!(event = "dns64.enabled", prefix = ?cfg.dns64_prefix, "Synthesizing AAAA from A for IPv6-only networks");
     }
     if cfg.rebind_protection {
         onetdns_core::info!(
             event = "rebind.protection_enabled",
-            "리바인딩 공격을 막습니다. 바깥에서 온 답에 사설 주소가 있으면 걸러냅니다"
+            "DNS rebinding protection is on; private addresses in outside answers are filtered"
         );
     }
     if cfg.safe_search {
         onetdns_core::info!(
             event = "safesearch.forced",
-            "검색 서비스의 안전 검색을 강제로 적용합니다"
+            "Enforcing SafeSearch on search engines"
         );
     }
 
@@ -1181,7 +1185,7 @@ pub fn serve(
         rate_layers = rate_state.layer_count(),
         cookies = ?cfg.cookies,
         mtls = cfg.tls_authenticated(),
-        "접근 제한과 속도 제한을 걸었습니다"
+        "Applied access control and rate limits"
     );
 
     for warning in cfg.open_resolver_warnings() {
@@ -1189,7 +1193,7 @@ pub fn serve(
             event = "security.open_resolver_warning",
             security = "open-resolver",
             detail = %warning,
-            "외부에 공개된 재귀 DNS 서버 설정을 확인하십시오"
+            "Check the configuration of this publicly reachable recursive resolver"
         );
     }
     // 조건이 맞지 않아 동작하지 않을 항목들. 설정을 막지 않고 알리기만 한다.
@@ -1197,7 +1201,7 @@ pub fn serve(
         onetdns_core::warn!(
             event = "config.advisory",
             detail = %advisory,
-            "설정은 저장했지만 이 항목은 지금 조건에서 동작하지 않습니다"
+            "Setting saved, but it has no effect under the current conditions"
         );
     }
 
@@ -1231,7 +1235,7 @@ pub fn serve(
                                 onetdns_core::info!(
                                     event = "tls.certificate_reloaded",
                                     changed = %swapped.join(","),
-                                    "수신 주소를 닫지 않고 TLS 인증서를 교체했습니다"
+                                    "Replaced the TLS certificate without closing listening addresses"
                                 );
                             }
                         }
@@ -1242,7 +1246,7 @@ pub fn serve(
                                 onetdns_core::warn!(
                                     event = "tls.certificate_reload_failed",
                                     %error,
-                                    "갱신된 TLS 인증서를 읽지 못했습니다. 이전 인증서를 그대로 씁니다"
+                                    "Could not read the renewed TLS certificate; keeping the previous one"
                                 );
                                 last_error = Some(error);
                             }
@@ -1250,7 +1254,7 @@ pub fn serve(
                     }
                 }
             })
-            .with_context(|| "TLS 인증서 감시 작업을 시작하지 못했습니다")?;
+            .with_context(|| "Could not start the TLS certificate watch task")?;
         service_cleanup.track(thread);
     }
 
@@ -1259,11 +1263,11 @@ pub fn serve(
         .iter()
         .map(|zone| {
             let origin = onetdns_proto::Name::from_str(&zone.origin)
-                .map_err(|_| format!("DNS 영역 이름이 올바르지 않습니다: {}", zone.origin))?;
+                .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
             let file = zone
                 .file
                 .clone()
-                .ok_or_else(|| format!("DNS 영역 '{}'에 file 설정이 없습니다", zone.origin))?;
+                .ok_or_else(|| format!("DNS zone '{}' has no file setting", zone.origin))?;
             Ok((origin, file))
         })
         .collect::<Result<Vec<_>, String>>()
@@ -1276,7 +1280,7 @@ pub fn serve(
         zones.notify.clone(),
         shutdown.clone(),
     )
-    .with_context(|| "DNSSEC 재서명 스레드를 시작하지 못했습니다")?
+    .with_context(|| "Could not start the DNSSEC re-signing thread")?
     {
         service_cleanup.track(thread);
     }
@@ -1336,7 +1340,7 @@ pub fn serve(
                             onetdns_core::info!(
                                 event = "authority.zones_reloaded_file",
                                 zones = origins.len(),
-                                "바뀐 영역 파일을 다시 읽어 실행 중인 영역을 교체했습니다"
+                                "Reloaded changed zone files and replaced the running zones"
                             );
                         }
                         // mtime 을 남겨 두면 다음 주기에 다시 시도한다. 편집 도중의 반쪽 파일은
@@ -1344,12 +1348,12 @@ pub fn serve(
                         Err(error) => onetdns_core::warn!(
                             event = "authority.zone_file_reload_failed",
                             %error,
-                            "바뀐 영역 파일을 읽지 못해 이전 영역을 그대로 답합니다"
+                            "Could not read the changed zone file; still answering from the previous zone"
                         ),
                     }
                 }
             })
-            .with_context(|| "DNS 영역 파일 감시 작업을 시작하지 못했습니다")?;
+            .with_context(|| "Could not start the DNS zone file watch task")?;
         service_cleanup.track(thread);
     }
 
@@ -1368,9 +1372,7 @@ pub fn serve(
                     .map(|zone| {
                         onetdns_proto::Name::from_str(&zone.origin)
                             .map(|origin| (origin, zsk_path_for(zone)))
-                            .map_err(|_| {
-                                format!("DNS 영역 이름이 올바르지 않습니다: {}", zone.origin)
-                            })
+                            .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let thread = spawn_zsk_rollover(
@@ -1380,7 +1382,7 @@ pub fn serve(
                     stop,
                 )
                 .map_err(|error| {
-                    format!("DNSSEC ZSK 교체 스레드를 시작하지 못했습니다: {error}")
+                    format!("Could not start the DNSSEC ZSK rollover thread: {error}")
                 })?;
                 if let Some(thread) = thread {
                     track_service_thread(&tracker, thread);
@@ -1422,7 +1424,7 @@ pub fn serve(
             if let Some((recorder, stats)) = slot.as_ref() {
                 onetdns_core::info!(
                     event = "stats.channel_reused",
-                    "기존 통계와 질의 기록을 유지한 채 새 설정을 적용합니다"
+                    "Applying the new configuration while keeping existing statistics and query log"
                 );
                 recorder.reconfigure(
                     cfg.querylog,
@@ -1433,14 +1435,14 @@ pub fn serve(
                     cfg.stats_retention_secs,
                 );
                 stats.reconfigure_persist(persist_opts.clone()).with_context(|| {
-                    "새 통계 또는 질의 기록 저장 설정을 사용할 수 없어 DNS 서비스를 시작하지 못했습니다"
+                    "Could not start the DNS service because the new statistics or query log storage settings cannot be used"
                 })?;
                 onetdns_core::info!(
                     event = "stats.persistence_reconfigured",
                     querylog_file = ?persist_opts.querylog_file,
                     stats_file = ?persist_opts.stats_file,
                     flush_secs = persist_opts.flush_secs,
-                    "통계와 질의 로그의 저장 설정을 갱신했습니다"
+                    "Updated storage settings for statistics and the query log"
                 );
                 (recorder.clone(), stats.clone())
             } else {
@@ -1457,13 +1459,13 @@ pub fn serve(
                     persist_opts.clone(),
                 );
                 pair.1.flush_persisted().with_context(|| {
-                    "통계 또는 질의 기록 파일을 사용할 수 없어 관리 기능을 시작하지 못했습니다"
+                    "Could not start management because the statistics or query log file cannot be used"
                 })?;
                 onetdns_core::debug!(
                     event = "stats.channel_created",
                     querylog_capacity = cfg.querylog_size.max(1),
                     history_retention_secs = cfg.stats_retention_secs,
-                    "통계를 모으기 시작했습니다"
+                    "Started collecting statistics"
                 );
                 *slot = Some((pair.0.clone(), pair.1.clone()));
                 pair
@@ -1575,7 +1577,7 @@ pub fn serve(
                     if had {
                         onetdns_core::info!(
                             event = "control.stopped",
-                            "control_listen을 지워 관리 화면과 API를 닫았습니다"
+                            "control_listen was removed; closed the dashboard and API"
                         );
                     }
                     return Ok(());
@@ -1590,23 +1592,23 @@ pub fn serve(
                     return Ok(());
                 }
                 if !addr.ip().is_loopback() {
-                    onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "관리 API가 루프백이 아닌 주소에서 수신합니다. 방화벽과 접근 제어를 확인하세요");
+                    onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "Management API is listening on a non-loopback address; check your firewall and access control");
                 }
                 let listener = match reuse_control_listener(&shared_slot, addr) {
                     Some(listener) => listener,
                     None => TcpListener::bind(addr).map_err(|error| {
-                        format!("웹 관리 수신 주소를 열지 못했습니다: {addr}: {error}")
+                        format!("Could not open the dashboard listening address: {addr}: {error}")
                     })?,
                 };
                 *shared_slot.lock_recover() = match listener.try_clone() {
                     Ok(clone) => Some(clone),
                     Err(error) => {
-                        onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "관리 수신 소켓을 세대 간에 물려주지 못했습니다. 설정을 다시 읽을 때 이 포트를 다시 열어야 합니다");
+                        onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "Could not hand the management socket over to the next configuration; the port must be reopened on reload");
                         None
                     }
                 };
                 let bound = listener.local_addr().map_err(|error| {
-                    format!("웹 관리 수신 주소를 확인하지 못했습니다: {addr}: {error}")
+                    format!("Could not read the dashboard listening address: {addr}: {error}")
                 })?;
                 // 새 리스너를 시작한 뒤에 이전 것을 멈춘다. 지금 처리 중인 응답은 이전 리스너가
                 // 끝까지 보낸다.
@@ -1619,10 +1621,10 @@ pub fn serve(
                         if let Err(error) =
                             onetdns_control::serve_listener(listener, state, listener_stop)
                         {
-                            onetdns_core::error!(event = "control.stopped", %error, "웹 관리 서비스를 중지했습니다");
+                            onetdns_core::error!(event = "control.stopped", %error, "Stopped the dashboard service");
                         }
                     })
-                    .map_err(|error| format!("웹 관리 스레드를 시작하지 못했습니다: {error}"))?;
+                    .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
                 // 이 세대의 정리 목록에 넣지 않는다. 재시작하는 동안 살아 있어야 하므로
                 // 여기서 기다리면 세대 정리가 끝나지 않는다. 멈추는 일은 다음 세대나
                 // 종료 전파가 맡는다.
@@ -1633,7 +1635,7 @@ pub fn serve(
                 }
                 running.clear();
                 running.push((key, stop));
-                onetdns_core::info!(event = "control.started", addr = %bound, "관리 화면과 API를 열었습니다");
+                onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API");
                 Ok(())
             }) as SecondaryRestart
         }, &cfg)
@@ -1677,11 +1679,11 @@ pub fn serve(
         let thread = cache
             .clone()
             .spawn_refresh(Duration::from_secs(30), shutdown.clone())
-            .with_context(|| "MAC 이웃 정보 갱신 스레드를 시작하지 못했습니다")?;
+            .with_context(|| "Could not start the MAC neighbor refresh thread")?;
         service_cleanup.track(thread);
         onetdns_core::info!(
             event = "mac.neighbor_scan_started",
-            "이웃 테이블을 사용한 MAC 주소 식별을 시작합니다(30초 주기)"
+            "Started identifying devices by MAC address from the neighbor table (every 30 seconds)"
         );
         Some(cache)
     } else {
@@ -1782,7 +1784,7 @@ pub fn serve(
                         stop,
                     )
                     .map_err(|error| {
-                        format!("보조 영역 갱신 작업을 시작하지 못했습니다: {error}")
+                        format!("Could not start the secondary zone refresh task: {error}")
                     })?;
                     track_service_thread(&tracker, thread);
                     Ok(())
@@ -1891,7 +1893,7 @@ pub fn serve(
             wire = lane_gates.wire,
             authority = lane_gates.authority,
             reactor = lane_gates.reactor,
-            "빠른 경로 적격 여부를 정했습니다"
+            "Decided fast-path eligibility"
         );
         Arc::new(native_server)
     };
@@ -1931,7 +1933,7 @@ pub fn serve(
     )
     .map_err(std::io::Error::other)?;
 
-    onetdns_core::info!(event = "server.ready", "이제 질의를 받습니다");
+    onetdns_core::info!(event = "server.ready", "Now answering queries");
 
     #[cfg(target_os = "linux")]
     if let Some(user) = cfg.run_as_user.as_deref() {
@@ -1944,14 +1946,14 @@ pub fn serve(
                 onetdns_core::info!(
                     event = "privdrop.applied",
                     user,
-                    "프로세스의 사용자·그룹 권한을 낮추고 추가 권한 획득을 차단했습니다"
+                    "Dropped user and group privileges and blocked further privilege gain"
                 );
             }
             drop_result = Some(r);
         });
         if let Some(Err(e)) = drop_result {
             return Err(crate::anyhow!(format!(
-                "프로세스 권한을 낮추지 못해 서비스를 중지합니다: {e}"
+                "Stopping the service because process privileges could not be dropped: {e}"
             )));
         }
     }
@@ -1963,7 +1965,7 @@ pub fn serve(
     } else {
         onetdns_core::info!(
             event = "config.changed_during_start",
-            "서비스 준비 중 설정이 다시 바뀌어 현재 구성을 복구 기준으로 채택하지 않습니다"
+            "Configuration changed again during startup; not using this configuration as the recovery baseline"
         );
     }
     readiness.store(true, Ordering::Release);
@@ -1979,7 +1981,7 @@ pub fn serve(
             onetdns_core::info!(
                 event = "server.shutdown_requested",
                 reason = "external_signal",
-                "외부 종료 신호를 받았습니다"
+                "Received an external shutdown signal"
             );
             break false;
         }
@@ -1987,7 +1989,7 @@ pub fn serve(
             onetdns_core::info!(
                 event = "server.restart_requested",
                 reason = "config_change",
-                "설정 변경을 적용하기 위해 DNS 서비스를 다시 시작합니다"
+                "Restarting the DNS service to apply configuration changes"
             );
             break true;
         }
@@ -2013,7 +2015,7 @@ pub fn serve(
     onetdns_core::info!(
         event = "server.configuration_stopped",
         reload = reloaded,
-        "지금 구성을 내립니다"
+        "Shutting down the current configuration"
     );
     Ok(reloaded)
 }
@@ -2031,7 +2033,7 @@ fn query(name: String, qtype: Option<String>) -> BoxResult<()> {
     let cfg = Config::default();
     let ups = upstream::native_upstreams(&cfg.upstreams, &cfg.upstream_urls, &cfg.bootstrap);
     if ups.is_empty() {
-        crate::bail!("`upstreams`에 사용할 업스트림 DNS 서버가 지정되지 않았습니다");
+        crate::bail!("No upstream DNS servers are set in `upstreams`");
     }
     let fwd = onetdns_forward::Forwarder::with_upstreams(
         ups,
@@ -2041,19 +2043,19 @@ fn query(name: String, qtype: Option<String>) -> BoxResult<()> {
     .with_parallel_limit(cfg.upstream_concurrency);
     let qtype = parse_qtype(qtype.as_deref())?;
     let qname = onetdns_proto::Name::from_str(&name)
-        .map_err(|_| crate::anyhow!("도메인 이름의 형식이 올바르지 않습니다: {name}"))?;
+        .map_err(|_| crate::anyhow!("Invalid domain name: {name}"))?;
     let req = onetdns_proto::Message::query(0x4242, qname, qtype);
     let resp = fwd
         .resolve(&req)
-        .map_err(|e| crate::anyhow!("DNS 질의를 처리하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Could not resolve the DNS query: {e}"))?;
 
     println!(
-        "응답 코드: {} ({})",
+        "Response code: {} ({})",
         native::rcode_str(onetdns_proto::ResponseCode(resp.header.rcode)),
         resp.header.rcode
     );
     if resp.answers.is_empty() {
-        println!("응답 레코드가 없습니다");
+        println!("No answer records");
     }
     for r in &resp.answers {
         println!("{}\t{}\t{:?}\t{:?}", r.name, r.ttl, r.rtype, r.rdata);
@@ -2078,15 +2080,15 @@ fn resolve_probe(
 ) -> Result<String, String> {
     let esc = onetdns_core::json::escape;
     let j = onetdns_core::json::parse(body)
-        .map_err(|error| format!("JSON 요청 본문이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| format!("Invalid JSON request body: {error}"))?;
     let qname = j
         .get("qname")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .ok_or("`qname` 항목에 물어볼 도메인을 입력해야 합니다")?;
+        .ok_or("`qname` must contain the domain to look up")?;
     let name = onetdns_proto::Name::from_str(qname)
-        .map_err(|_| format!("도메인 이름의 형식이 올바르지 않습니다: {qname}"))?;
+        .map_err(|_| format!("Invalid domain name: {qname}"))?;
     let qtype_text = j
         .get("qtype")
         .and_then(|v| v.as_str())
@@ -2095,7 +2097,7 @@ fn resolve_probe(
     let qtype = onetdns_proto::RecordType(
         *qtype_numbers(&[qtype_text.clone()])
             .first()
-            .ok_or("질의 종류를 알아보지 못했습니다")?,
+            .ok_or("Unknown query type")?,
     );
 
     // 0.0.0.0이나 ::는 "모든 주소"라 목적지가 될 수 없다. 같은 포트의 루프백으로 바꾼다.
@@ -2110,7 +2112,7 @@ fn resolve_probe(
             }
             _ => *addr,
         })
-        .ok_or("일반 DNS 수신 주소가 없어 물어볼 곳이 없습니다")?;
+        .ok_or("There is no plain DNS listening address to query")?;
 
     let request = onetdns_proto::Message::query(
         u16::from_be_bytes(onetdns_core::ephemeral_random_array::<2>()),
@@ -2119,7 +2121,7 @@ fn resolve_probe(
     );
     let started = std::time::Instant::now();
     let response = onetdns_forward::query_server(target, &request, timeout)
-        .map_err(|error| format!("이 서버에 물어보지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not query this server: {error}"))?;
     let elapsed_ms = started.elapsed().as_millis();
 
     let record_json = |record: &onetdns_proto::Record| {
@@ -2193,7 +2195,7 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
     build_policy_engine(cfg)?;
     for (key, source) in zone_source_specs(cfg) {
         if source.is_none() {
-            return Err(format!("DNS 영역 원본 '{key}'의 주소가 올바르지 않습니다"));
+            return Err(format!("DNS zone source '{key}' has an invalid address"));
         }
     }
     if let Some(host) = &cfg.cachedb_redis_host {
@@ -2202,13 +2204,13 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
     edge_service_preflight(cfg)?;
     if let Some(url) = &cfg.zones_postgres {
         onetdns_authority::PostgresZoneSource::from_url(url, &cfg.zones_sql_table)
-            .ok_or("zones_postgres 주소를 해석하지 못했습니다")?
+            .ok_or("Could not parse the zones_postgres connection string")?
             .check()
             .map_err(|error| format!("zones_postgres: {error}"))?;
     }
     if let Some(url) = &cfg.zones_mysql {
         onetdns_authority::MysqlZoneSource::from_url(url, &cfg.zones_sql_table)
-            .ok_or("zones_mysql 주소를 해석하지 못했습니다")?
+            .ok_or("Could not parse the zones_mysql connection string")?
             .check()
             .map_err(|error| format!("zones_mysql: {error}"))?;
     }
@@ -2222,7 +2224,7 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
     );
     for service in services {
         if onetdns_filter::services::service_rules(service).is_none() {
-            return Err(format!("알 수 없는 차단 서비스: {service}"));
+            return Err(format!("Unknown blocked service: {service}"));
         }
     }
     Ok(())
@@ -2257,14 +2259,14 @@ fn build_client_upstream_routes(
         let ups = upstream::servers_to_upstreams(&c.upstreams, &cfg.bootstrap);
         if ups.is_empty() {
             return Err(format!(
-                "클라이언트 '{}'에 사용할 수 있는 전용 업스트림 DNS 서버가 없습니다",
+                "Client '{}' has no usable dedicated upstream DNS servers",
                 c.name
             ));
         }
         ensure_upstreams_not_self(
             cfg,
             &ups,
-            &format!("클라이언트 '{}' 전용 업스트림 DNS 서버", c.name),
+            &format!("dedicated upstream DNS servers for client '{}'", c.name),
         )?;
         let mut ids = c.client_ids.clone();
         ids.extend(c.mac.iter().map(|m| mac::normalize_mac(m)));
@@ -2291,17 +2293,19 @@ fn build_forward_backend(
                 .iter()
                 .any(|u| upstream::url_uses_hostname(u));
             let hint = if has_hostname && cfg.bootstrap.is_empty() {
-                " (호스트 이름으로 업스트림 DNS 서버를 지정하려면 bootstrap가 필요합니다. 또는 IP 주소와 TLS 서버 이름을 함께 지정하십시오. 예: h3://1.1.1.1/dns-query#cloudflare-dns.com)"
+                " (upstream DNS servers given by host name need bootstrap, or give an IP address together with the TLS server name, for example h3://1.1.1.1/dns-query#cloudflare-dns.com)"
             } else if has_hostname {
-                " (업스트림 DNS 서버의 호스트 이름을 찾지 못했습니다. `bootstrap`가 연결 가능한지 확인하거나 IP 주소와 TLS 서버 이름을 함께 지정하십시오. 예: h3://1.1.1.1/dns-query#cloudflare-dns.com)"
+                " (could not resolve the upstream DNS server host name; check that `bootstrap` is reachable, or give an IP address together with the TLS server name, for example h3://1.1.1.1/dns-query#cloudflare-dns.com)"
             } else {
-                " (업스트림 DNS 서버 주소 형식을 확인하십시오)"
+                " (check the upstream DNS server address format)"
             };
             return Err(format!(
-                "설정한 업스트림 DNS 서버 {configured}개를 모두 해석하지 못했습니다{hint}"
+                "None of the {configured} configured upstream DNS servers could be resolved{hint}"
             ));
         }
-        return Err("업스트림 DNS 서버 전달 또는 도메인별 처리 방식을 사용하려면 업스트림 DNS 서버를 하나 이상 지정해야 합니다".to_string());
+        return Err(
+            "Forwarding and split resolution need at least one upstream DNS server".to_string(),
+        );
     }
     ensure_upstreams_not_self(cfg, &upstreams, "upstreams")?;
     let forwarder = onetdns_forward::Forwarder::with_upstreams(
@@ -2332,9 +2336,9 @@ fn parse_control_backup(
     use onetdns_core::json::Json;
 
     let root = onetdns_core::json::parse(body)
-        .map_err(|error| format!("백업 JSON을 해석하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not parse the backup JSON: {error}"))?;
     let Json::Obj(fields) = &root else {
-        return Err("백업 JSON의 최상위 값은 객체여야 합니다".to_string());
+        return Err("The top-level value of the backup JSON must be an object".to_string());
     };
     if fields.len() != 6
         || fields.iter().any(|(key, _)| {
@@ -2344,20 +2348,22 @@ fn parse_control_backup(
             )
         })
     {
-        return Err("백업 JSON의 항목 구성이 현재 형식과 일치하지 않습니다".to_string());
+        return Err("The backup JSON fields do not match the current format".to_string());
     }
     if root.get("version").and_then(Json::as_u64) != Some(1) {
-        return Err("백업 JSON의 version은 현재 형식 1이어야 합니다".to_string());
+        return Err("The backup JSON version must be 1, the current format".to_string());
     }
     let strings = |key: &str| -> Result<Vec<String>, String> {
         root.get(key)
             .and_then(Json::as_array)
-            .ok_or_else(|| format!("백업 JSON의 {key} 항목은 문자열 배열이어야 합니다"))?
+            .ok_or_else(|| {
+                format!("The {key} field of the backup JSON must be an array of strings")
+            })?
             .iter()
             .map(|item| {
-                item.as_str()
-                    .map(String::from)
-                    .ok_or_else(|| format!("백업 JSON의 {key} 항목은 문자열 배열이어야 합니다"))
+                item.as_str().map(String::from).ok_or_else(|| {
+                    format!("The {key} field of the backup JSON must be an array of strings")
+                })
             })
             .collect()
     };
@@ -2368,7 +2374,7 @@ fn parse_control_backup(
     let safe_search = root
         .get("safe_search")
         .and_then(Json::as_bool)
-        .ok_or_else(|| "백업 JSON의 safe_search 항목은 불리언이어야 합니다".to_string())?;
+        .ok_or_else(|| "The safe_search field of the backup JSON must be a boolean".to_string())?;
     Ok((block, allow, services, refused_domains, safe_search))
 }
 
@@ -2391,7 +2397,7 @@ fn read_bytes_limited(path: &std::path::Path, max_bytes: u64) -> std::io::Result
     if bytes.len() as u64 > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "파일 크기가 허용 한도를 넘었습니다",
+            "File exceeds the size limit",
         ));
     }
     Ok(bytes)
@@ -2567,18 +2573,18 @@ fn build_user_creds(cfg: &Config) -> Result<Vec<onetdns_control::UserCred>, Stri
         .map(|(index, user)| {
             if user.name.is_empty() || user.password_hash.is_empty() {
                 return Err(format!(
-                    "users[{index}]에 비어 있지 않은 name과 password_hash가 필요합니다"
+                    "users[{index}] needs a non-empty name and password_hash"
                 ));
             }
             if !names.insert(user.name.clone()) {
-                return Err(format!("users[{index}]의 name이 중복되었습니다"));
+                return Err(format!("users[{index}] has a duplicate name"));
             }
             let role = match user.role.as_str() {
                 "admin" => onetdns_control::Role::Admin,
                 "readonly" => onetdns_control::Role::ReadOnly,
                 other => {
                     return Err(format!(
-                        "users[{index}].role에 허용되지 않은 값이 있습니다: '{other}'"
+                        "users[{index}].role has a value that is not allowed: '{other}'"
                     ));
                 }
             };
@@ -2600,9 +2606,7 @@ fn build_user_creds(cfg: &Config) -> Result<Vec<onetdns_control::UserCred>, Stri
  */
 fn cachedb_redis_addr(host: &str, port: u16, bootstrap: &[IpAddr]) -> Result<SocketAddr, String> {
     let ip = upstream::resolve_host_via_bootstrap(host, bootstrap).ok_or_else(|| {
-        format!(
-            "cachedb_redis_host={host}의 주소를 찾지 못했습니다. 호스트 이름을 사용하려면 bootstrap를 지정해야 합니다"
-        )
+        format!("Could not resolve cachedb_redis_host={host}; host names need bootstrap")
     })?;
     Ok(SocketAddr::new(ip, port))
 }
@@ -2628,7 +2632,7 @@ fn install_revocation_policy(cfg: &Config, resolver: &http::HostResolver) {
     onetdns_core::info!(event = "tls.revocation_check_enabled",
         mode = ?mode,
         softfail = cfg.tls_revocation_softfail,
-        "업스트림 TLS 서버 인증서의 폐기 상태를 확인합니다(OCSP/CRL)"
+        "Checking revocation of upstream TLS server certificates (OCSP/CRL)"
     );
 }
 
@@ -2665,12 +2669,7 @@ fn build_tsig_keys(cfg: &Config) -> Result<Vec<onetdns_dnssec::tsig::TsigKey>, S
     let mut keys = Vec::new();
     for k in &cfg.tsig_keys {
         let key = onetdns_dnssec::tsig::TsigKey::from_base64(&k.name, k.secret.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "TSIG 키 '{}'의 이름 또는 Base64 비밀값 형식이 잘못되었습니다",
-                    k.name
-                )
-            })?;
+            .ok_or_else(|| format!("TSIG key '{}' has an invalid name or Base64 secret", k.name))?;
         keys.push(key);
     }
     Ok(keys)

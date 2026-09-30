@@ -171,7 +171,7 @@ impl Message {
     pub fn parse(buf: &[u8]) -> Result<Message, ProtoError> {
         if buf.len() > MAX_DNS_WIRE_LEN {
             return Err(ProtoError::Message(
-                "DNS 메시지가 최대 wire 크기인 65,535바이트를 넘었습니다".into(),
+                "DNS message exceeds the 65,535-byte wire limit".into(),
             ));
         }
         let mut r = Reader::new(buf);
@@ -194,7 +194,7 @@ impl Message {
             || an.saturating_add(ns).saturating_add(ar).saturating_mul(11) > remaining
         {
             return Err(ProtoError::Message(
-                "불가능하거나 과도한 DNS section count".into(),
+                "Impossible or excessive DNS section count".into(),
             ));
         }
 
@@ -230,13 +230,13 @@ impl Message {
             .any(|record| record.rtype == RecordType::OPT)
         {
             return Err(ProtoError::Message(
-                "OPT 레코드는 Additional 섹션에만 올 수 있습니다".into(),
+                "OPT record is only allowed in the Additional section".into(),
             ));
         }
         let additionals = read_n(&mut r, ar, 0)?;
         if r.remaining() != 0 {
             return Err(ProtoError::Message(
-                "DNS 메시지 뒤에 해석되지 않은 바이트가 남음".into(),
+                "Unparsed bytes after the DNS message".into(),
             ));
         }
 
@@ -246,7 +246,7 @@ impl Message {
         if let Some(opt) = opts.next() {
             if opts.next().is_some() {
                 return Err(ProtoError::Message(
-                    "DNS 메시지에는 OPT 레코드를 하나만 넣을 수 있습니다".into(),
+                    "A DNS message can have only one OPT record".into(),
                 ));
             }
             let extended_rcode = Edns::validate_record(opt)?;
@@ -259,6 +259,59 @@ impl Message {
             answers,
             authorities,
             additionals,
+        })
+    }
+
+    /**
+     * @brief UDP 로 받은 응답을 해석한다. 바이트가 모자라 끝난 응답은 잘린 응답으로 읽는다.
+     *
+     * @details UDP 53 을 가로채 대신 답하는 ISP 프록시 가운데는 512바이트를 넘는 응답을 TC 비트
+     *          없이 512바이트에서 잘라 보내는 것이 있다. 그런 응답은 레코드 중간에서 끊겨 parse 가
+     *          거부하고, 버린 채 기다려도 온전한 응답은 오지 않으므로 질의가 데드라인까지 묶인다.
+     *          헤더가 응답이고 질문 구간까지 온전하면 TC 가 켜진 빈 응답으로 돌려주어, 호출자가
+     *          원래의 TC 처리대로 TCP 로 다시 묻게 한다. 바이트가 모자란 것이 아닌 형식 위반은
+     *          잘림으로 보지 않고 버린다.
+     * @warning 잘린 응답에는 질문 뒤의 레코드를 하나도 담지 않는다. 잘린 나머지를 답으로 쓰면
+     *          안 된다. 호출자는 이 결과에도 보통 응답과 같은 ID 와 질문 검사를 해야 한다.
+     * @return 해석할 수 없으면 없다.
+     */
+    pub fn parse_udp_reply(buf: &[u8]) -> Option<Message> {
+        match Message::parse(buf) {
+            Ok(message) => Some(message),
+            Err(ProtoError::Eof) => Message::cut_reply(buf),
+            Err(_) => None,
+        }
+    }
+
+    /** @brief 잘린 응답의 헤더와 질문만으로 TC 가 켜진 빈 응답을 만든다. */
+    fn cut_reply(buf: &[u8]) -> Option<Message> {
+        let mut r = Reader::new(buf);
+        let id = r.u16().ok()?;
+        let flags = r.u16().ok()?;
+        let qd = r.u16().ok()? as usize;
+        for _ in 0..3 {
+            r.u16().ok()?;
+        }
+        let mut header = Header::from_flags(id, flags);
+        if !header.response || qd == 0 || qd.saturating_mul(5) > r.remaining() {
+            return None;
+        }
+        let mut questions = Vec::with_capacity(qd);
+        for _ in 0..qd {
+            let name = Name::parse(&mut r).ok()?;
+            let qtype = RecordType(r.u16().ok()?);
+            let qclass = DnsClass(r.u16().ok()?);
+            questions.push(Question {
+                name,
+                qtype,
+                qclass,
+            });
+        }
+        header.truncated = true;
+        Some(Message {
+            header,
+            questions,
+            ..Message::default()
         })
     }
 
@@ -280,7 +333,7 @@ impl Message {
     pub fn try_encode_into(&self, w: &mut Writer) -> Result<(), ProtoError> {
         if !w.buf.is_empty() || !w.names.is_empty() || w.is_failed() {
             return Err(ProtoError::Message(
-                "DNS 메시지를 직접 인코딩하려면 비어 있는 출력 버퍼가 필요합니다".into(),
+                "Encoding a DNS message in place needs an empty output buffer".into(),
             ));
         }
         self.encode_checked_into(w)
@@ -298,22 +351,20 @@ impl Message {
     fn encode_checked_into(&self, w: &mut Writer) -> Result<(), ProtoError> {
         if self.header.opcode > 0x0f {
             return Err(ProtoError::Message(
-                "DNS opcode가 4비트 범위를 넘었습니다".into(),
+                "DNS opcode does not fit in 4 bits".into(),
             ));
         }
         if self.header.rcode > 0x0fff {
             return Err(ProtoError::Message(
-                "DNS 응답 코드가 12비트 범위를 넘었습니다".into(),
+                "DNS rcode does not fit in 12 bits".into(),
             ));
         }
         let qd = u16::try_from(self.questions.len())
-            .map_err(|_| ProtoError::Message("DNS 질문 수가 65,535개를 넘었습니다".into()))?;
-        let an = u16::try_from(self.answers.len()).map_err(|_| {
-            ProtoError::Message("DNS 응답 레코드 수가 65,535개를 넘었습니다".into())
-        })?;
-        let ns = u16::try_from(self.authorities.len()).map_err(|_| {
-            ProtoError::Message("DNS 권한 레코드 수가 65,535개를 넘었습니다".into())
-        })?;
+            .map_err(|_| ProtoError::Message("More than 65,535 DNS questions".into()))?;
+        let an = u16::try_from(self.answers.len())
+            .map_err(|_| ProtoError::Message("More than 65,535 DNS answer records".into()))?;
+        let ns = u16::try_from(self.authorities.len())
+            .map_err(|_| ProtoError::Message("More than 65,535 DNS authority records".into()))?;
         let opt_count = self
             .additionals
             .iter()
@@ -321,7 +372,7 @@ impl Message {
             .count();
         if opt_count > 1 {
             return Err(ProtoError::Message(
-                "DNS 메시지에는 OPT 레코드를 하나만 넣을 수 있습니다".into(),
+                "A DNS message can have only one OPT record".into(),
             ));
         }
         if self
@@ -331,7 +382,7 @@ impl Message {
             .any(|record| record.rtype == RecordType::OPT)
         {
             return Err(ProtoError::Message(
-                "OPT 레코드는 Additional 섹션에만 올 수 있습니다".into(),
+                "OPT record is only allowed in the Additional section".into(),
             ));
         }
         for record in self
@@ -342,7 +393,7 @@ impl Message {
         {
             if record.rtype != record.rdata.record_type() {
                 return Err(ProtoError::Message(format!(
-                    "DNS 레코드 TYPE {}와 RDATA TYPE {}가 일치하지 않습니다",
+                    "DNS record TYPE {} does not match RDATA TYPE {}",
                     record.rtype.0,
                     record.rdata.record_type().0
                 )));
@@ -355,7 +406,7 @@ impl Message {
             .find(|record| record.rtype == RecordType::OPT)
         {
             if !opt.name.is_root() {
-                return Err(ProtoError::Message("OPT owner는 root여야 함".into()));
+                return Err(ProtoError::Message("OPT owner must be root".into()));
             }
             Edns::try_from_record(opt)?;
         }
@@ -364,10 +415,9 @@ impl Message {
             .additionals
             .len()
             .checked_add(usize::from(needs_synthetic_opt))
-            .ok_or_else(|| ProtoError::Message("additional count 계산 범위를 넘었습니다".into()))?;
-        let ar = u16::try_from(ar_len).map_err(|_| {
-            ProtoError::Message("DNS 부가 레코드 수가 65,535개를 넘었습니다".into())
-        })?;
+            .ok_or_else(|| ProtoError::Message("Additional count overflowed".into()))?;
+        let ar = u16::try_from(ar_len)
+            .map_err(|_| ProtoError::Message("More than 65,535 DNS additional records".into()))?;
 
         w.push_u16(self.header.id);
         w.push_u16(self.header.flags());
@@ -627,14 +677,14 @@ impl Edns {
      */
     fn record_parts(rec: &Record) -> Result<(u32, &[u8]), ProtoError> {
         if rec.rtype != RecordType::OPT {
-            return Err(ProtoError::Message("OPT가 아닌 레코드".into()));
+            return Err(ProtoError::Message("Not an OPT record".into()));
         }
         if !rec.name.is_root() {
-            return Err(ProtoError::Message("OPT owner는 root여야 함".into()));
+            return Err(ProtoError::Message("OPT owner must be root".into()));
         }
         match &rec.rdata {
             crate::rdata::RData::Unknown(_, raw) => Ok((rec.ttl, raw)),
-            _ => Err(ProtoError::Message("잘못된 OPT RDATA".into())),
+            _ => Err(ProtoError::Message("Invalid OPT RDATA".into())),
         }
     }
 
@@ -650,17 +700,17 @@ impl Edns {
         while i < raw.len() {
             if raw.len() - i < 4 {
                 return Err(ProtoError::Message(
-                    "EDNS 옵션 헤더가 중간에서 끊겼습니다".into(),
+                    "EDNS option header is truncated".into(),
                 ));
             }
             let code = u16::from_be_bytes([raw[i], raw[i + 1]]);
             let len = u16::from_be_bytes([raw[i + 2], raw[i + 3]]) as usize;
             i += 4;
-            let end = i.checked_add(len).ok_or_else(|| {
-                ProtoError::Message("EDNS option 길이 계산 범위를 넘었습니다".into())
-            })?;
+            let end = i
+                .checked_add(len)
+                .ok_or_else(|| ProtoError::Message("EDNS option length overflowed".into()))?;
             if end > raw.len() {
-                return Err(ProtoError::Message("잘린 EDNS option data".into()));
+                return Err(ProtoError::Message("EDNS option data is truncated".into()));
             }
             visit(code, &raw[i..end]);
             i = end;
@@ -762,20 +812,16 @@ impl Edns {
         let mut raw = Vec::new();
         for (code, data) in &self.options {
             let len = u16::try_from(data.len()).map_err(|_| {
-                ProtoError::Message(format!(
-                    "EDNS 옵션 {code}의 크기가 65,535바이트를 넘었습니다"
-                ))
+                ProtoError::Message(format!("EDNS option {code} exceeds 65,535 bytes"))
             })?;
             let next = raw
                 .len()
                 .checked_add(4)
                 .and_then(|value| value.checked_add(data.len()))
-                .ok_or_else(|| {
-                    ProtoError::Message("EDNS option 길이 계산 범위를 넘었습니다".into())
-                })?;
+                .ok_or_else(|| ProtoError::Message("EDNS option length overflowed".into()))?;
             if next > u16::MAX as usize {
                 return Err(ProtoError::Message(
-                    "EDNS 옵션 전체 크기가 65,535바이트를 넘었습니다".into(),
+                    "EDNS options exceed 65,535 bytes in total".into(),
                 ));
             }
             raw.extend_from_slice(&code.to_be_bytes());
@@ -825,6 +871,63 @@ mod robustness_tests {
 }
 
 #[cfg(test)]
+/** @brief UDP 응답이 도중에 끊겼을 때만 잘린 응답으로 읽는지. */
+mod udp_reply_tests {
+    use super::*;
+    use crate::rdata::RData;
+    use std::net::Ipv4Addr;
+
+    /** @brief A 레코드 여러 개를 담은 응답의 와이어. */
+    fn reply_wire() -> Vec<u8> {
+        let name = Name::from_str("cut.example").unwrap();
+        let mut m = Message::query(7, name.clone(), RecordType::A);
+        m.header.response = true;
+        for i in 0..4 {
+            m.answers.push(Record::new(
+                name.clone(),
+                60,
+                RData::A(Ipv4Addr::new(192, 0, 2, i)),
+            ));
+        }
+        m.try_encode().unwrap()
+    }
+
+    #[test]
+    /** @brief 온전한 응답은 그대로 해석하는지. */
+    fn whole_reply_is_parsed_as_is() {
+        let m = Message::parse_udp_reply(&reply_wire()).unwrap();
+        assert!(!m.header.truncated);
+        assert_eq!(m.answers.len(), 4);
+    }
+
+    #[test]
+    /** @brief 레코드 중간에서 끊긴 응답을 레코드 없는 TC 응답으로 읽는지. */
+    fn reply_cut_mid_record_reads_as_truncated() {
+        let wire = reply_wire();
+        let m = Message::parse_udp_reply(&wire[..wire.len() - 3]).unwrap();
+        assert!(m.header.truncated);
+        assert_eq!(m.header.id, 7);
+        assert_eq!(m.questions.len(), 1);
+        assert!(m.answers.is_empty() && m.authorities.is_empty() && m.additionals.is_empty());
+    }
+
+    #[test]
+    /** @brief 질문이 끊겼거나 질의이거나 형식 위반이면 잘림으로 보지 않는지. */
+    fn only_a_cut_reply_with_a_whole_question_counts() {
+        let wire = reply_wire();
+        assert!(Message::parse_udp_reply(&wire[..14]).is_none());
+
+        let mut query = wire.clone();
+        query[2] &= 0x7f;
+        assert!(Message::parse_udp_reply(&query[..wire.len() - 3]).is_none());
+
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(Message::parse_udp_reply(&trailing).is_none());
+    }
+}
+
+#[cfg(test)]
 /** @brief 확장 옵션을 붙이고 읽는 동작. */
 mod edns_option_tests {
     use super::*;
@@ -843,7 +946,11 @@ mod edns_option_tests {
         let mut m = resp_with_opt();
         m.pad_to(128).unwrap();
         let size = m.try_encode().unwrap().len();
-        assert_eq!(size % 128, 0, "패딩 후 와이어 크기는 block 배수");
+        assert_eq!(
+            size % 128,
+            0,
+            "Padded wire size is a multiple of the block size"
+        );
 
         let edns = Edns::from_record(m.opt().unwrap()).unwrap();
         assert!(edns.has_option(EDNS_PADDING));
@@ -862,7 +969,7 @@ mod edns_option_tests {
         assert_eq!(
             m.try_encode().unwrap().len(),
             before,
-            "OPT 없으면 패딩 안 함"
+            "No padding without OPT"
         );
     }
 
@@ -920,19 +1027,19 @@ mod hardening_tests {
             RecordType::A,
         );
         query.header.recursion_desired = true;
-        let mut wire = query.try_encode().expect("질의를 만들지 못했습니다");
+        let mut wire = query.try_encode().expect("Could not build the query");
         let flags = u16::from_be_bytes([wire[2], wire[3]]) | 0x0040;
         wire[2..4].copy_from_slice(&flags.to_be_bytes());
 
-        let parsed = Message::parse(&wire).expect("Z 비트를 설정한 질의를 버렸습니다");
+        let parsed = Message::parse(&wire).expect("Dropped a query with the Z bit set");
         assert_eq!(parsed.questions.len(), 1);
         assert!(parsed.header.recursion_desired);
 
-        let again = parsed.try_encode().expect("다시 만들지 못했습니다");
+        let again = parsed.try_encode().expect("Could not rebuild");
         assert_eq!(
             u16::from_be_bytes([again[2], again[3]]) & 0x0040,
             0,
-            "예약 비트를 되울렸습니다"
+            "Echoed reserved bits"
         );
     }
 
@@ -953,8 +1060,8 @@ mod hardening_tests {
             ttl: 0,
             rdata: crate::RData::Unknown(RecordType::A.0, Vec::new()),
         });
-        let parsed =
-            Message::parse(&update.try_encode().unwrap()).expect("ANY prerequisite의 빈 RDATA");
+        let parsed = Message::parse(&update.try_encode().unwrap())
+            .expect("Empty RDATA in an ANY prerequisite");
         assert!(matches!(
             &parsed.answers[0].rdata,
             crate::RData::Unknown(1, bytes) if bytes.is_empty()
@@ -1058,7 +1165,7 @@ mod hardening_tests {
         assert!(writer.buf.len() <= 512);
         assert!(
             writer.buf.capacity() < 4096,
-            "남은 RRset을 끝까지 확장하지 않음"
+            "Remaining RRsets were not fully expanded"
         );
     }
 

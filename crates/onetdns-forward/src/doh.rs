@@ -69,7 +69,7 @@ pub(crate) fn exchange(
             }
             let (res, session) = {
                 let mut p = pool.borrow_mut();
-                let conn = p.get_mut(&key).expect("방금 삽입됨");
+                let conn = p.get_mut(&key).expect("Just inserted");
                 let result = roundtrip(conn, server_name, path, wire, request, deadline);
                 let session = conn.client.stream_mut().take_sessions().pop();
                 (result, session)
@@ -87,7 +87,7 @@ pub(crate) fn exchange(
                             addr = %addr,
                             path = path,
                             reason = ?e,
-                            "기존 연결을 재사용하지 못해 새 연결로 다시 시도합니다"
+                            "Could not reuse the existing connection; retrying on a new one"
                         );
                     }
                     if attempt == 1 {
@@ -121,14 +121,14 @@ fn connect(
     };
     let tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
         crate::note_upstream_connect_failure("doh", addr, server_name, &e);
-        ForwardError::Io(format!("DoH 핸드셰이크: {e}"))
+        ForwardError::Io(format!("DoH handshake: {e}"))
     })?;
     if !tls.is_resumed() {
         crate::check_revocation(tls.peer_chain(), server_name)?;
     }
     let stream = TlsStream::new(tls, tcp);
     let client =
-        H2Client::connect(stream).map_err(|_| ForwardError::Io("DoH HTTP/2 프리페이스".into()))?;
+        H2Client::connect(stream).map_err(|_| ForwardError::Io("DoH HTTP/2 preface".into()))?;
     Ok(DohConn { client, rtt_hint })
 }
 
@@ -175,10 +175,10 @@ fn roundtrip(
 fn h2_io(e: onetdns_http2::H2Error) -> ForwardError {
     use onetdns_http2::H2Error;
     match e {
-        H2Error::Closed => ForwardError::Io("DoH 서버가 연결을 종료했습니다".into()),
-        H2Error::BadStatus => ForwardError::Io("DoH 비 200 상태".into()),
+        H2Error::Closed => ForwardError::Io("DoH server closed the connection".into()),
+        H2Error::BadStatus => ForwardError::Io("DoH non-200 status".into()),
         H2Error::Protocol => ForwardError::BadResponse,
-        H2Error::Io => ForwardError::Io("DoH HTTP/2 연결에서 입출력 오류가 발생했습니다".into()),
+        H2Error::Io => ForwardError::Io("I/O error on the DoH HTTP/2 connection".into()),
     }
 }
 

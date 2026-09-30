@@ -125,9 +125,7 @@ pub fn encode_engine_cache(
     let mut output = payload.bytes;
     let payload_len = output.len() - HEADER_BYTES;
     if payload_len > MAX_CACHE_BYTES.saturating_sub(HEADER_BYTES) {
-        return Err(CacheError::new(
-            "컴파일된 필터 캐시가 허용 크기를 넘었습니다",
-        ));
+        return Err(CacheError::new("Compiled filter cache is too large"));
     }
     let payload_digest: [u8; 32] = Sha256::digest(&output[HEADER_BYTES..]).into();
     output[..8].copy_from_slice(MAGIC);
@@ -264,11 +262,11 @@ impl<'a, W: Write> PayloadStream<'a, W> {
     fn len(&mut self, value: usize, max: usize) -> Result<(), CacheError> {
         if value > max {
             return Err(CacheError::new(
-                "컴파일된 필터 캐시의 항목 수가 허용 한도를 넘었습니다",
+                "Compiled filter cache has too many entries",
             ));
         }
         let value = u32::try_from(value)
-            .map_err(|_| CacheError::new("컴파일된 필터 캐시 항목 수가 허용 범위를 넘음"))?;
+            .map_err(|_| CacheError::new("Compiled filter cache has too many entries"))?;
         self.write(&value.to_le_bytes());
         Ok(())
     }
@@ -276,7 +274,7 @@ impl<'a, W: Write> PayloadStream<'a, W> {
     /** @brief 남은 것을 비우고 총 길이와 해시를 돌려준다. */
     fn finish(mut self) -> Result<(usize, [u8; 32]), CacheWriteError> {
         if self.overflowed {
-            return Err(CacheError::new("컴파일된 필터 캐시가 허용 크기를 넘었습니다").into());
+            return Err(CacheError::new("Compiled filter cache is too large").into());
         }
         self.flush();
         if let Some(error) = self.error {
@@ -297,42 +295,42 @@ pub fn decode_engine_cache(
 ) -> Result<EngineParts, CacheError> {
     if encoded.len() < HEADER_BYTES || encoded.len() > MAX_CACHE_BYTES {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시 파일 크기가 올바르지 않습니다",
+            "Compiled filter cache file size is invalid",
         ));
     }
     if encoded.get(..8) != Some(MAGIC.as_slice()) {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시 파일 식별값이 일치하지 않음",
+            "Compiled filter cache file magic does not match",
         ));
     }
     if encoded[8..12] != layout_tag() {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시의 저장 배치가 지금 쓰는 배치와 다릅니다",
+            "Compiled filter cache layout differs from the current layout",
         ));
     }
     if encoded[12..44] != expected_fingerprint {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시 입력 지문이 일치하지 않습니다",
+            "Compiled filter cache input fingerprint does not match",
         ));
     }
     let payload_len = u64::from_le_bytes(
         encoded[44..52]
             .try_into()
-            .map_err(|_| CacheError::new("컴파일된 필터 캐시 헤더가 올바르지 않습니다"))?,
+            .map_err(|_| CacheError::new("Invalid compiled filter cache header"))?,
     );
     let payload_len = usize::try_from(payload_len).map_err(|_| {
-        CacheError::new("컴파일된 필터 캐시에 기록된 데이터 크기를 처리할 수 없습니다")
+        CacheError::new("Compiled filter cache declares a data size that cannot be handled")
     })?;
     if HEADER_BYTES.checked_add(payload_len) != Some(encoded.len()) {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시에 기록된 데이터 길이가 실제 파일 크기와 일치하지 않습니다",
+            "Compiled filter cache data length does not match the file size",
         ));
     }
     let payload = &encoded[HEADER_BYTES..];
     let actual_digest: [u8; 32] = Sha256::digest(payload).into();
     if encoded[52..84] != actual_digest {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시의 무결성 검사에 실패했습니다",
+            "Compiled filter cache integrity check failed",
         ));
     }
 
@@ -340,7 +338,7 @@ pub fn decode_engine_cache(
     let parts = decode_parts(&mut decoder)?;
     if !decoder.input.is_empty() {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시 끝에 예상하지 못한 데이터가 남아 있습니다",
+            "Unexpected trailing data in compiled filter cache",
         ));
     }
     Ok(parts)
@@ -397,12 +395,12 @@ impl<'a> Encoder<'a> {
     fn len(&mut self, value: usize, max: usize) -> Result<(), CacheError> {
         if value > max {
             return Err(CacheError::new(
-                "컴파일된 필터 캐시의 항목 수가 허용 한도를 넘었습니다",
+                "Compiled filter cache has too many entries",
             ));
         }
         self.u32(
             u32::try_from(value)
-                .map_err(|_| CacheError::new("컴파일된 필터 캐시 항목 수가 허용 범위를 넘음"))?,
+                .map_err(|_| CacheError::new("Compiled filter cache has too many entries"))?,
         );
         Ok(())
     }
@@ -437,7 +435,7 @@ impl<'a> Decoder<'a> {
         let (head, tail) = self
             .input
             .split_at_checked(count)
-            .ok_or_else(|| CacheError::new("컴파일된 필터 캐시 잘림"))?;
+            .ok_or_else(|| CacheError::new("Compiled filter cache is truncated"))?;
         self.input = tail;
         Ok(head)
     }
@@ -450,21 +448,21 @@ impl<'a> Decoder<'a> {
     /** @brief 16비트 값. */
     fn u16(&mut self) -> Result<u16, CacheError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(
-            |_| CacheError::new("컴파일된 필터 캐시에서 16비트 정수를 읽지 못했습니다"),
+            |_| CacheError::new("Could not read a 16-bit integer from the compiled filter cache"),
         )?))
     }
 
     /** @brief 32비트 값. */
     fn u32(&mut self) -> Result<u32, CacheError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(
-            |_| CacheError::new("컴파일된 필터 캐시에서 32비트 정수를 읽지 못했습니다"),
+            |_| CacheError::new("Could not read a 32-bit integer from the compiled filter cache"),
         )?))
     }
 
     /** @brief 64비트 값. */
     fn u64(&mut self) -> Result<u64, CacheError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(
-            |_| CacheError::new("컴파일된 필터 캐시에서 64비트 정수를 읽지 못했습니다"),
+            |_| CacheError::new("Could not read a 64-bit integer from the compiled filter cache"),
         )?))
     }
 
@@ -473,7 +471,7 @@ impl<'a> Decoder<'a> {
         let value = self.u32()? as usize;
         if value > max {
             return Err(CacheError::new(
-                "컴파일된 필터 캐시의 항목 수가 허용 한도를 넘었습니다",
+                "Compiled filter cache has too many entries",
             ));
         }
         Ok(value)
@@ -489,7 +487,7 @@ impl<'a> Decoder<'a> {
     fn string(&mut self) -> Result<String, CacheError> {
         let bytes = self.blob(MAX_STRING_BYTES)?;
         let value = std::str::from_utf8(bytes)
-            .map_err(|_| CacheError::new("컴파일된 필터 캐시 문자열 형식이 올바르지 않습니다"))?;
+            .map_err(|_| CacheError::new("Invalid string in compiled filter cache"))?;
         Ok(value.to_owned())
     }
 
@@ -498,9 +496,7 @@ impl<'a> Decoder<'a> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
-            _ => Err(CacheError::new(
-                "컴파일된 필터 캐시 논리값 형식이 올바르지 않습니다",
-            )),
+            _ => Err(CacheError::new("Invalid boolean in compiled filter cache")),
         }
     }
 }
@@ -692,9 +688,9 @@ fn decode_vec<T>(
 ) -> Result<Vec<T>, CacheError> {
     let count = r.len(MAX_ITEMS)?;
     let mut values = Vec::new();
-    values.try_reserve_exact(count).map_err(|_| {
-        CacheError::new("컴파일된 필터 캐시 항목을 저장할 메모리를 확보하지 못했습니다")
-    })?;
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| CacheError::new("Out of memory loading compiled filter cache entries"))?;
     for _ in 0..count {
         values.push(decode(r)?);
     }
@@ -768,7 +764,7 @@ fn decode_rewrite_map(r: &mut Decoder<'_>) -> Result<HashMap<Box<str>, RewriteTa
     let map: HashMap<_, _> = entries.into_iter().collect();
     if map.len() != count {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시에 같은 주소 변경 항목이 두 번 들어 있습니다",
+            "Compiled filter cache has a duplicate rewrite entry",
         ));
     }
     Ok(map)
@@ -819,7 +815,7 @@ fn decode_local_zones(r: &mut Decoder<'_>) -> Result<LocalZoneSet, CacheError> {
                 for (name, target) in names {
                     data.insert(&name, target).map_err(|_| {
                         CacheError::new(
-                            "컴파일된 필터 캐시의 static 영역에 영역 밖 이름이나 겹친 이름이 있습니다",
+                            "Compiled filter cache static zone has an out-of-zone or overlapping name",
                         )
                     })?;
                 }
@@ -827,7 +823,7 @@ fn decode_local_zones(r: &mut Decoder<'_>) -> Result<LocalZoneSet, CacheError> {
             }
             _ => {
                 return Err(CacheError::new(
-                    "컴파일된 필터 캐시의 로컬 영역 구분값이 올바르지 않습니다",
+                    "Invalid local zone type in compiled filter cache",
                 ))
             }
         };
@@ -835,9 +831,8 @@ fn decode_local_zones(r: &mut Decoder<'_>) -> Result<LocalZoneSet, CacheError> {
     })?;
     let mut set = LocalZoneSet::default();
     for (zone, action) in entries {
-        set.insert(&zone, action).map_err(|_| {
-            CacheError::new("컴파일된 필터 캐시에 같은 로컬 영역이 두 번 들어 있습니다")
-        })?;
+        set.insert(&zone, action)
+            .map_err(|_| CacheError::new("Compiled filter cache has a duplicate local zone"))?;
     }
     Ok(set)
 }
@@ -877,16 +872,17 @@ fn decode_client_rule(r: &mut Decoder<'_>) -> Result<ClientRule, CacheError> {
         match tag {
             0 => Ok(ClientCond::Net {
                 negated,
-                net: r.string()?.parse().map_err(|_| {
-                    CacheError::new("컴파일된 필터 캐시 클라이언트 CIDR 형식이 올바르지 않습니다")
-                })?,
+                net: r
+                    .string()?
+                    .parse()
+                    .map_err(|_| CacheError::new("Invalid client CIDR in compiled filter cache"))?,
             }),
             1 => Ok(ClientCond::Id {
                 negated,
                 id: r.string()?,
             }),
             _ => Err(CacheError::new(
-                "컴파일된 필터 캐시의 클라이언트 조건 구분값이 올바르지 않습니다",
+                "Invalid client condition type in compiled filter cache",
             )),
         }
     })?;
@@ -914,7 +910,7 @@ fn decode_rpz_ip(r: &mut Decoder<'_>) -> Result<RpzIpRule, CacheError> {
     let net = r
         .string()?
         .parse()
-        .map_err(|_| CacheError::new("컴파일된 필터 캐시 RPZ CIDR 형식이 올바르지 않습니다"))?;
+        .map_err(|_| CacheError::new("Invalid RPZ CIDR in compiled filter cache"))?;
     let display = r.string()?.into_boxed_str();
     let verdict = decode_verdict(r)?;
     Ok(RpzIpRule {
@@ -955,7 +951,7 @@ fn decode_report(r: &mut Decoder<'_>) -> Result<FilterLoadReport, CacheError> {
     let unsupported_modifier: BTreeMap<_, _> = entries.into_iter().collect();
     if unsupported_modifier.len() != count {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시에 같은 보고 항목이 두 번 들어 있습니다",
+            "Compiled filter cache has a duplicate report entry",
         ));
     }
     Ok(FilterLoadReport {
@@ -991,7 +987,7 @@ fn decode_verdict(r: &mut Decoder<'_>) -> Result<FilterVerdict, CacheError> {
         1 => Ok(FilterVerdict::Block(decode_block_response(r)?)),
         2 => Ok(FilterVerdict::Rewrite(decode_rewrite_target(r)?)),
         _ => Err(CacheError::new(
-            "컴파일된 필터 캐시의 판정 구분값이 올바르지 않습니다",
+            "Invalid verdict type in compiled filter cache",
         )),
     }
 }
@@ -1028,7 +1024,7 @@ fn decode_block_response(r: &mut Decoder<'_>) -> Result<BlockResponse, CacheErro
             let v4 = if r.boolean()? {
                 Some(std::net::Ipv4Addr::from(
                     <[u8; 4]>::try_from(r.take(4)?).map_err(|_| {
-                        CacheError::new("컴파일된 필터 캐시의 IPv4 주소가 올바르지 않습니다")
+                        CacheError::new("Invalid IPv4 address in compiled filter cache")
                     })?,
                 ))
             } else {
@@ -1037,7 +1033,7 @@ fn decode_block_response(r: &mut Decoder<'_>) -> Result<BlockResponse, CacheErro
             let v6 = if r.boolean()? {
                 Some(std::net::Ipv6Addr::from(
                     <[u8; 16]>::try_from(r.take(16)?).map_err(|_| {
-                        CacheError::new("컴파일된 필터 캐시의 IPv6 주소가 올바르지 않습니다")
+                        CacheError::new("Invalid IPv6 address in compiled filter cache")
                     })?,
                 ))
             } else {
@@ -1046,7 +1042,7 @@ fn decode_block_response(r: &mut Decoder<'_>) -> Result<BlockResponse, CacheErro
             Ok(BlockResponse::Custom { v4, v6 })
         }
         _ => Err(CacheError::new(
-            "컴파일된 필터 캐시의 차단 응답 구분값이 올바르지 않습니다",
+            "Invalid block response type in compiled filter cache",
         )),
     }
 }
@@ -1071,7 +1067,7 @@ fn decode_rewrite_target(r: &mut Decoder<'_>) -> Result<RewriteTarget, CacheErro
         0 => Ok(RewriteTarget::Records(decode_vec(r, decode_rdata)?)),
         1 => Ok(RewriteTarget::Cname(decode_name(r)?)),
         _ => Err(CacheError::new(
-            "컴파일된 필터 캐시의 주소 변경 구분값이 올바르지 않습니다",
+            "Invalid rewrite type in compiled filter cache",
         )),
     }
 }
@@ -1082,7 +1078,7 @@ fn encode_name(w: &mut Encoder<'_>, name: &Name) -> Result<(), CacheError> {
     name.encode(&mut wire);
     if wire.is_failed() {
         return Err(CacheError::new(
-            "필터 캐시의 DNS 이름을 저장 형식으로 만들지 못했습니다",
+            "Could not encode a DNS name for the filter cache",
         ));
     }
     w.blob(&wire.buf, 255)
@@ -1093,10 +1089,10 @@ fn decode_name(r: &mut Decoder<'_>) -> Result<Name, CacheError> {
     let bytes = r.blob(255)?;
     let mut wire = DnsReader::new(bytes);
     let name = Name::parse(&mut wire)
-        .map_err(|_| CacheError::new("컴파일된 필터 캐시의 DNS 이름이 올바르지 않습니다"))?;
+        .map_err(|_| CacheError::new("Invalid DNS name in compiled filter cache"))?;
     if wire.remaining() != 0 {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시 DNS name 길이가 올바르지 않습니다",
+            "Invalid DNS name length in compiled filter cache",
         ));
     }
     Ok(name)
@@ -1108,7 +1104,7 @@ fn encode_rdata(w: &mut Encoder<'_>, rdata: &RData) -> Result<(), CacheError> {
     rdata.encode(&mut wire);
     if wire.is_failed() {
         return Err(CacheError::new(
-            "필터 캐시의 레코드 데이터를 저장 형식으로 만들지 못했습니다",
+            "Could not encode record data for the filter cache",
         ));
     }
     w.u16(rdata.record_type().0);
@@ -1121,10 +1117,10 @@ fn decode_rdata(r: &mut Decoder<'_>) -> Result<RData, CacheError> {
     let bytes = r.blob(u16::MAX as usize)?;
     let mut wire = DnsReader::new(bytes);
     let rdata = RData::parse(rtype, &mut wire, bytes.len())
-        .map_err(|_| CacheError::new("컴파일된 필터 캐시의 레코드 데이터가 올바르지 않습니다"))?;
+        .map_err(|_| CacheError::new("Invalid record data in compiled filter cache"))?;
     if wire.remaining() != 0 || rdata.record_type() != rtype {
         return Err(CacheError::new(
-            "컴파일된 필터 캐시의 레코드 데이터 길이 또는 형식이 올바르지 않습니다",
+            "Invalid record data length or format in compiled filter cache",
         ));
     }
     Ok(rdata)
@@ -1157,7 +1153,7 @@ fn decode_option<T>(
         0 => Ok(None),
         1 => decode(r).map(Some),
         _ => Err(CacheError::new(
-            "컴파일된 필터 캐시의 선택값 구분자가 올바르지 않습니다",
+            "Invalid option tag in compiled filter cache",
         )),
     }
 }

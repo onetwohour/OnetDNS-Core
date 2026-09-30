@@ -65,14 +65,14 @@ impl std::fmt::Display for RecurseError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            RecurseError::NoRoots => "루트 서버 정보가 없습니다",
-            RecurseError::NoResponse => "질의한 서버에서 응답하지 않았습니다",
-            RecurseError::TooManyReferrals => "도메인 위임을 너무 많이 따라갔습니다",
-            RecurseError::TooManyQueries => "한 질의가 보내야 하는 업스트림 질의가 너무 많습니다",
-            RecurseError::TooManyCnames => "CNAME 연결을 너무 많이 따라갔습니다",
-            RecurseError::TooManyDnames => "DNAME 연결을 너무 많이 따라갔습니다",
-            RecurseError::NoReachableNs => "도달할 수 있는 네임서버가 없습니다",
-            RecurseError::Bogus => "DNSSEC 검증 결과가 올바르지 않습니다",
+            RecurseError::NoRoots => "No root server hints",
+            RecurseError::NoResponse => "The queried server did not respond",
+            RecurseError::TooManyReferrals => "Followed too many delegations",
+            RecurseError::TooManyQueries => "Query needs too many upstream queries",
+            RecurseError::TooManyCnames => "Followed too many CNAMEs",
+            RecurseError::TooManyDnames => "Followed too many DNAMEs",
+            RecurseError::NoReachableNs => "No reachable name server",
+            RecurseError::Bogus => "DNSSEC validation failed",
         };
         write!(f, "{s}")
     }
@@ -1103,7 +1103,7 @@ impl Recursor {
             deadline: self.query_deadline(),
         };
         rtrace!(
-            "재귀 해석을 시작합니다: 이름={}, 유형={:?}, DNSSEC 검증={}",
+            "Starting recursion: name={}, type={:?}, dnssec={}",
             qname.to_ascii_lower(),
             qtype,
             self.validating()
@@ -1130,7 +1130,7 @@ impl Recursor {
 
         let alias = alias_hop(&resp, qname, qtype);
         rtrace!(
-            "재귀 해석을 마쳤습니다: 응답 코드={}, 답변 수={}, 별칭 응답={}, 별칭 대상={:?}, 위임 단계={}",
+            "Finished recursion: rcode={}, answers={}, cname_response={}, cname_target={:?}, delegation_steps={}",
             resp.header.rcode,
             resp.answers.len(),
             alias.is_some(),
@@ -1149,7 +1149,7 @@ impl Recursor {
                     let status =
                         self.validate_answer_status(qname, qtype, &out, &chain, budget.deadline);
                     rtrace!(
-                        "DNSSEC 응답 검증 결과입니다: 이름={}, 상태={:?}",
+                        "DNSSEC response validation: name={}, status={:?}",
                         qname.to_ascii_lower(),
                         status
                     );
@@ -1158,7 +1158,7 @@ impl Recursor {
 
                         SecurityStatus::Bogus(code) if !self.permissive && !honor_cd_active() => {
                             rtrace!(
-                                "DNSSEC 검증에 실패해 SERVFAIL 응답을 반환합니다: 이름={}",
+                                "DNSSEC validation failed; returning SERVFAIL: name={}",
                                 qname.to_ascii_lower()
                             );
                             out = bogus_servfail(&out, code)
@@ -1170,7 +1170,7 @@ impl Recursor {
                     let status =
                         self.validate_denial_status(qname, qtype, &out, &chain, budget.deadline);
                     rtrace!(
-                        "DNSSEC 부재 증명 검증 결과입니다: 이름={}, 상태={:?}",
+                        "DNSSEC denial proof validation: name={}, status={:?}",
                         qname.to_ascii_lower(),
                         status
                     );
@@ -1179,7 +1179,7 @@ impl Recursor {
 
                         SecurityStatus::Bogus(code) if !self.permissive && !honor_cd_active() => {
                             rtrace!(
-                                "DNSSEC 부재 증명에 실패해 SERVFAIL 응답을 반환합니다: 이름={}",
+                                "DNSSEC denial proof failed; returning SERVFAIL: name={}",
                                 qname.to_ascii_lower()
                             );
                             out = bogus_servfail(&out, code)
@@ -1207,7 +1207,7 @@ impl Recursor {
             owner: alias_owner,
             atype: alias_type,
             records: mut merged,
-        } = alias.expect("alias.is_none() 분기에서 반환됨");
+        } = alias.expect("Returned in the alias.is_none() branch");
         let (cname_depth, dname_depth) = if alias_type == RecordType::DNAME {
             (0, 1)
         } else {
@@ -1758,7 +1758,7 @@ impl Recursor {
                 let remaining = entry
                     .lifetime
                     .remaining_secs(now)
-                    .expect("live TTL에는 남은 시간이 있어야 함");
+                    .expect("A live TTL must have time remaining");
                 let mut records = entry.records.clone();
                 for record in &mut records {
                     record.ttl = record.ttl.min(remaining);
@@ -1951,12 +1951,12 @@ impl Recursor {
             Ok(l) => l,
 
             Err(error) => {
-                onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "신뢰 체인을 구성하지 못해 검증 실패로 봅니다");
+                onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "Could not build the chain of trust; treating as bogus");
                 return Err(SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS));
             }
         };
         if self.chain_has_excessive_nsec3(&links) {
-            onetdns_core::debug!(event = "dnssec.chain_nsec3_excessive", zone = %leaf.zone.to_ascii_lower(), "NSEC3 반복 횟수가 예산을 넘어 검증 실패로 봅니다");
+            onetdns_core::debug!(event = "dnssec.chain_nsec3_excessive", zone = %leaf.zone.to_ascii_lower(), "NSEC3 iterations exceed the budget; treating as bogus");
             // RFC 9276: 이 서버가 계산을 거부한 것이지 서명이 깨진 것이 아니다. 사유를
             // 갈라 알려야 운영자가 영역 매개변수를 고쳐야 한다는 것을 안다.
             return Err(SecurityStatus::Bogus(
@@ -2015,7 +2015,7 @@ impl Recursor {
                 .filter(|(zone, _)| validated_start_ok(zone))
             {
                 rtrace!(
-                    "{}에 대해 캐시된 위임 {}에서 시작합니다(서버 {}개)",
+                    "Starting {} from cached delegation {} ({} servers)",
                     zone.to_ascii_lower(),
                     servers.len(),
                     qname.to_ascii_lower()
@@ -2026,12 +2026,12 @@ impl Recursor {
                         return Ok(v)
                     }
                     Ok(_) => {
-                        rtrace!("부분 체인 leaf의 검증된 키 캐시가 없어 root부터 다시 걷습니다");
+                        rtrace!("No cached validated key for the partial chain leaf; walking again from the root");
                         budget.ns_resolves = saved;
                     }
                     Err(e) => {
                         rtrace!(
-                            "캐시된 위임 {}에서 시작한 질의가 실패해({:?}) 해당 경로를 지우고 루트부터 다시 시도합니다",
+                            "Query from cached delegation {} failed ({:?}); dropping that path and retrying from the root",
                             zone.to_ascii_lower(),
                             e
                         );
@@ -2076,7 +2076,7 @@ impl Recursor {
 
             if budget.queries == 0 {
                 rtrace!(
-                    "총 발신 질의 예산을 모두 썼습니다: 이름={}",
+                    "Used up the total outgoing query budget: name={}",
                     qname.to_ascii_lower()
                 );
                 return Err(RecurseError::TooManyQueries);
@@ -2092,7 +2092,7 @@ impl Recursor {
                 Ok(r) => r,
                 Err(e) => {
                     rtrace!(
-                        "재귀 질의에 실패했습니다: 이름={}, 유형={:?}, 최종 단계={}, 오류={:?}, 네임서버 수={}, 현재 영역={}",
+                        "Recursive query failed: name={}, type={:?}, final_step={}, error={:?}, nameservers={}, zone={}",
                         plan.mname.to_ascii_lower(),
                         plan.mtype,
                         plan.is_final,
@@ -2116,7 +2116,7 @@ impl Recursor {
                     }
                     Err(e) => {
                         rtrace!(
-                            "  {} 영역의 네임서버 주소 조회 실패: {:?}",
+                            "  nameserver address lookup failed for zone {}: {:?}",
                             e,
                             pending.zone.to_ascii_lower()
                         );
@@ -2139,10 +2139,7 @@ impl Recursor {
                 StepOutcome::NeedNsAddrs { .. } => unreachable!(),
             }
         }
-        rtrace!(
-            "위임 추적 횟수가 허용 범위를 넘었습니다: 이름={}",
-            qname.to_ascii_lower()
-        );
+        rtrace!("Delegation limit exceeded: name={}", qname.to_ascii_lower());
         Err(RecurseError::TooManyReferrals)
     }
 
@@ -2168,7 +2165,7 @@ impl Recursor {
         ctx: &IterationContext<'_>,
     ) -> StepOutcome {
         rtrace!(
-            "재귀 질의 응답을 받았습니다: 이름={}, 유형={:?}, 최종 단계={}, 응답 코드={}, 답변 수={}, 권한 레코드 수={}, 부가 레코드 수={}, 네임서버 수={}, 현재 영역={}",
+            "Got recursive response: name={}, type={:?}, final_step={}, rcode={}, answers={}, authority={}, additional={}, nameservers={}, zone={}",
             plan.mname.to_ascii_lower(),
             plan.mtype,
             plan.is_final,
@@ -2183,10 +2180,7 @@ impl Recursor {
         if plan.is_final {
             strip_out_of_bailiwick_dnames(&mut resp, &state.zone);
             if is_relevant_positive(&resp, ctx.qname, ctx.qtype) {
-                rtrace!(
-                    "최종 응답을 받았습니다: 이름={}",
-                    ctx.qname.to_ascii_lower()
-                );
+                rtrace!("Got final response: name={}", ctx.qname.to_ascii_lower());
                 return StepOutcome::Done(resp);
             }
         }
@@ -2198,7 +2192,7 @@ impl Recursor {
         if resp.header.rcode == ResponseCode::NXDomain.0 {
             if !is_authoritative_negative(&resp, &plan.mname, &state.zone) {
                 rtrace!(
-                    "현재 영역과 관련이 없거나 권한이 없는 NXDOMAIN 응답을 거부했습니다: 영역={}",
+                    "Rejected an NXDOMAIN that is unrelated to the current zone or not authoritative: zone={}",
                     state.zone.to_ascii_lower()
                 );
                 return StepOutcome::Failed(RecurseError::NoReachableNs);
@@ -2211,7 +2205,7 @@ impl Recursor {
                 return StepOutcome::Done(resp);
             }
             rtrace!(
-                "QNAME 최소화 과정에서 NXDOMAIN 응답을 받아 전체 이름으로 다시 질의합니다: 이름={}",
+                "Got NXDOMAIN during QNAME minimization; querying the full name: name={}",
                 plan.mname.to_ascii_lower()
             );
             state.minimize = false;
@@ -2220,7 +2214,7 @@ impl Recursor {
 
         let (referral_zone, ns_names) = extract_referral(&resp, ctx.qname);
         rtrace!(
-            "위임 응답을 확인했습니다: 위임 영역={:?}, 네임서버 이름 수={}, 현재 영역보다 가까움={}, 질의 이름 포함={}",
+            "Checked delegation: zone={:?}, ns_names={}, closer_than_current={}, contains_qname={}",
             referral_zone.as_ref().map(|z| z.to_ascii_lower()),
             ns_names.len(),
             referral_zone
@@ -2249,7 +2243,7 @@ impl Recursor {
                 // 잡은 채 이름 3개를 풀다가 시간이 끝나 SERVFAIL이 나갔다.
                 if !missing_ns.is_empty() && pending.addrs.is_empty() {
                     rtrace!(
-                        "글루 레코드가 없는 네임서버의 주소를 별도로 조회합니다: 주소가 필요한 네임서버 수={}, 현재 주소 수={}",
+                        "Looking up addresses of nameservers without glue: need_address={}, have_address={}",
                         missing_ns.len(),
                         pending.addrs.len()
                     );
@@ -2261,7 +2255,7 @@ impl Recursor {
                 }
                 if !missing_ns.is_empty() {
                     rtrace!(
-                        "글루가 없는 네임서버 {}개는 두고 이미 받은 주소 {}개로 내려갑니다",
+                        "Leaving {} glueless nameservers and descending with the {} addresses already known",
                         missing_ns.len(),
                         pending.addrs.len()
                     );
@@ -2272,14 +2266,14 @@ impl Recursor {
                 if plan.is_final {
                     if is_terminal_response(&resp, ctx.qname, &state.zone) {
                         rtrace!(
-                            "답변 레코드가 없는 최종 응답을 받았습니다: 이름={}",
+                            "Got a final response with no answers: name={}",
                             ctx.qname.to_ascii_lower()
                         );
                         return StepOutcome::Done(resp);
                     }
 
                     rtrace!(
-                        "최종 응답을 사용할 수 없어 네임서버 도달 실패로 처리합니다: 이름={}",
+                        "Final response is unusable; treating as unreachable nameservers: name={}",
                         ctx.qname.to_ascii_lower()
                     );
                     return StepOutcome::Failed(RecurseError::NoReachableNs);
@@ -2287,11 +2281,11 @@ impl Recursor {
                 if self.harden_referral_path
                     && (rejected_referral.is_some() || !resp.header.authoritative)
                 {
-                    rtrace!("안전한 위임 경로를 찾지 못해 네임서버 도달 실패로 처리합니다");
+                    rtrace!("Found no safe delegation path; treating as unreachable nameservers");
                     return StepOutcome::Failed(RecurseError::NoReachableNs);
                 }
                 rtrace!(
-                    "사용할 수 있는 위임이 없어 QNAME 최소화 깊이를 줄입니다: 깊이={}",
+                    "No usable delegation; reducing QNAME minimization depth: depth={}",
                     plan.target
                 );
                 state.depth = plan.target;
@@ -2323,14 +2317,11 @@ impl Recursor {
         addrs.dedup();
         addrs.truncate(MAX_CACHED_NS_ADDRS);
         if addrs.is_empty() {
-            rtrace!(
-                "  {}에 도달 가능한 네임서버가 없습니다",
-                nz.to_ascii_lower()
-            );
+            rtrace!("  no reachable nameserver for {}", nz.to_ascii_lower());
             return StepOutcome::Failed(RecurseError::NoReachableNs);
         }
         rtrace!(
-            "  {} 위임으로 이동(네임서버 주소 {}개)",
+            "  following delegation {} ({} nameserver addresses)",
             nz.to_ascii_lower(),
             addrs.len()
         );
@@ -2508,7 +2499,7 @@ impl Recursor {
                 let remaining = entry
                     .lifetime
                     .remaining_secs(now)
-                    .expect("live TTL에는 남은 시간이 있어야 함");
+                    .expect("A live TTL must have time remaining");
                 Some((entry.addrs.clone(), remaining))
             }
             Some(_) => {
@@ -2658,7 +2649,7 @@ impl Recursor {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 rtrace!(
-                    "남은 시간을 다 써 {}개 서버 중 일부에 물어보지도 못했습니다: 이름={}",
+                    "Ran out of time before asking some of the {} servers: name={}",
                     servers.len(),
                     sent.questions
                         .first()
@@ -2685,10 +2676,16 @@ impl Recursor {
                 Ok(r) => {
                     if self.caps_for_id && !questions_case_exact(&r.questions, &sent.questions) {
                         rtrace!(
-                            "{}가 질의 이름의 대소문자를 그대로 되비추지 않아 버립니다: 보낸 것={}, 받은 것={}",
+                            "{} did not echo the query name case; dropping: sent={}, got={}",
                             s,
-                            sent.questions.first().map(|q| q.name.to_string()).unwrap_or_default(),
-                            r.questions.first().map(|q| q.name.to_string()).unwrap_or_default()
+                            sent.questions
+                                .first()
+                                .map(|q| q.name.to_string())
+                                .unwrap_or_default(),
+                            r.questions
+                                .first()
+                                .map(|q| q.name.to_string())
+                                .unwrap_or_default()
                         );
                         self.infra_fail(s.ip(), zone);
                         continue;
@@ -2703,7 +2700,7 @@ impl Recursor {
                 }
                 Err(error) => {
                     rtrace!(
-                        "{}에 물었으나 답을 얻지 못했습니다: 이름={}, 유형={:?}, 오류={:?}",
+                        "Asked {} but got no answer: name={}, type={:?}, error={:?}",
                         s,
                         sent.questions
                             .first()
@@ -3413,6 +3410,24 @@ fn is_authoritative_negative(resp: &Message, qname: &Name, zone: &Name) -> bool 
     resp.header.authoritative && has_relevant_soa(resp, qname, zone)
 }
 
+/**
+ * @brief 권한 서버가 답도 SOA도 위임도 없이 비워 보낸 NOERROR인지.
+ * @details RFC 2308은 이 모양도 NODATA의 한 형태로 열거한다. 지역 부하 분산용 권한 서버가
+ *          A에만 별칭을 주고 다른 유형에는 이렇게 답하는 일이 흔해서, 받지 않으면 영역의 모든
+ *          서버가 실패로 보여 SERVFAIL이 된다. SOA가 없으니 부정 캐시 기한이 없고, 담지 않는 일은
+ *          캐시 계층이 맡는다. 서명된 영역이면 부재 증명 검증이 SOA를 요구하므로 bogus가 된다.
+ */
+fn is_bare_authoritative_nodata(resp: &Message, qname: &Name, zone: &Name) -> bool {
+    resp.header.rcode == ResponseCode::NoError.0
+        && resp.header.authoritative
+        && is_within(qname, zone)
+        && resp.answers.is_empty()
+        && !resp
+            .authorities
+            .iter()
+            .any(|record| matches!(record.rtype, RecordType::NS | RecordType::SOA))
+}
+
 /** @brief 이 응답 코드면 다른 서버에 다시 물어볼 만한지. */
 fn retryable_rcode(rcode: u16) -> bool {
     matches!(
@@ -3440,6 +3455,7 @@ fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -
         code if code == ResponseCode::NoError.0 => {
             is_relevant_positive(resp, &question.name, question.qtype)
                 || is_authoritative_negative(resp, &question.name, zone)
+                || is_bare_authoritative_nodata(resp, &question.name, zone)
                 || extract_referral(resp, &question.name)
                     .0
                     .is_some_and(|child| is_closer(&child, zone))
@@ -3455,7 +3471,9 @@ fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -
 
 /** @brief 답변은 없지만 이것으로 끝나는 응답인지. NODATA가 여기 해당한다. */
 fn is_terminal_response(resp: &Message, qname: &Name, zone: &Name) -> bool {
-    resp.header.rcode == ResponseCode::NoError.0 && is_authoritative_negative(resp, qname, zone)
+    resp.header.rcode == ResponseCode::NoError.0
+        && (is_authoritative_negative(resp, qname, zone)
+            || is_bare_authoritative_nodata(resp, qname, zone))
 }
 
 /**
@@ -4425,6 +4443,55 @@ mod tests {
             2,
             "ANY 응답의 A·AAAA RRset이 유지되어야 한다"
         );
+    }
+
+    #[test]
+    /**
+     * @brief 권한 서버가 SOA 없이 비워 보낸 NOERROR를 NODATA로 받는지.
+     * @details 받지 않으면 다음 서버로 넘어가고, 모든 서버가 같은 답을 주는 영역은 SERVFAIL이
+     *          된다. 권한 비트가 없거나, 위임이 있거나, 영역 밖 이름이거나, 답이 섞여 있으면
+     *          NODATA가 아니다.
+     */
+    fn bare_authoritative_nodata_is_terminal_and_usable() {
+        let qname = Name::from_str("host.gslb.test").unwrap();
+        let zone = Name::from_str("gslb.test").unwrap();
+        let query = Message::query(1, qname.clone(), RecordType::AAAA);
+        let mut resp = query.clone();
+        resp.header.response = true;
+        resp.header.authoritative = true;
+
+        assert!(response_usable_for_iteration(&resp, &query, &zone));
+        assert!(is_terminal_response(&resp, &qname, &zone));
+
+        let mut not_authoritative = resp.clone();
+        not_authoritative.header.authoritative = false;
+        assert!(!response_usable_for_iteration(
+            &not_authoritative,
+            &query,
+            &zone
+        ));
+        assert!(!is_terminal_response(&not_authoritative, &qname, &zone));
+
+        let mut delegation = resp.clone();
+        delegation.authorities.push(Record::new(
+            qname.clone(),
+            300,
+            RData::Ns(Name::from_str("ns.host.gslb.test").unwrap()),
+        ));
+        assert!(!is_bare_authoritative_nodata(&delegation, &qname, &zone));
+        assert!(!is_terminal_response(&delegation, &qname, &zone));
+
+        let other_zone = Name::from_str("other.test").unwrap();
+        assert!(!is_bare_authoritative_nodata(&resp, &qname, &other_zone));
+        assert!(!is_terminal_response(&resp, &qname, &other_zone));
+
+        let mut unrelated_answer = resp.clone();
+        unrelated_answer.answers.push(Record::new(
+            Name::from_str("elsewhere.gslb.test").unwrap(),
+            300,
+            RData::A(Ipv4Addr::new(192, 0, 2, 1)),
+        ));
+        assert!(!is_terminal_response(&unrelated_answer, &qname, &zone));
     }
 
     #[test]

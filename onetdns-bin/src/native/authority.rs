@@ -442,7 +442,7 @@ impl NativeServer {
                         request_tsig,
                     )
                 }
-                .expect("60KiB AXFR wire template에는 TSIG를 추가할 공간이 있습니다");
+                .expect("A 60 KiB AXFR wire template leaves room for TSIG");
                 previous_mac = Some(mac);
             }
             if !emit(&out.buf) {
@@ -480,7 +480,7 @@ impl NativeServer {
             .iter()
             .any(|net| net.contains(&ctx.src.ip()))
         {
-            onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "not_in_xfr_allow", "영역 전송을 허용하지 않은 주소라 거절했습니다");
+            onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "not_in_xfr_allow", "Refused zone transfer from an address that is not allowed");
             self.rec(client, Action::Refused, Some(qname), Some(axfr));
             return emit(error_resp(request, ResponseCode::Refused)).then_some(());
         }
@@ -488,7 +488,7 @@ impl NativeServer {
         let tsig_ctx = match self.check_tsig(request, ctx.raw, authority.xfr_tsig_required, false) {
             Ok(t) => t,
             Err(response) => {
-                onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "tsig", "TSIG 확인에 실패해 영역 전송을 거절했습니다");
+                onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "tsig", "Refused zone transfer because TSIG verification failed");
                 self.rec(client, Action::Refused, Some(qname), Some(axfr));
                 return emit(response).then_some(());
             }
@@ -498,7 +498,7 @@ impl NativeServer {
             .iter()
             .find(|z| z.origin().eq_ignore_case(qname));
         let Some(zone) = zone else {
-            onetdns_core::warn!(event = "xfr.unknown_zone", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), "이 서버가 맡지 않은 영역의 전송 요청이라 거절했습니다");
+            onetdns_core::warn!(event = "xfr.unknown_zone", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), "Refused transfer of a zone this server is not authoritative for");
             return emit(xfr_single_response(
                 request,
                 ResponseCode(9),
@@ -563,7 +563,7 @@ impl NativeServer {
         }
 
         if is_ixfr {
-            let client_serial = client_serial.expect("앞에서 IXFR 일련번호를 확인했습니다");
+            let client_serial = client_serial.expect("The IXFR serial was checked above");
             let cur_serial = zone.soa().serial;
             if client_serial == cur_serial {
                 let soa = zone.axfr_records_iter().next()?;
@@ -652,7 +652,7 @@ impl NativeServer {
                             .peek(&replay_key)
                             .is_some_and(|expires| *expires >= now)
                         {
-                            onetdns_core::warn!(event = "authority.tsig_replay_blocked", key = %key.name.to_ascii_lower(), "재사용된 TSIG 요청을 차단했습니다");
+                            onetdns_core::warn!(event = "authority.tsig_replay_blocked", key = %key.name.to_ascii_lower(), "Blocked a replayed TSIG request");
                             return Err(signed_tsig_error_response(
                                 request,
                                 &key,
@@ -704,7 +704,7 @@ impl NativeServer {
                     ))
                 }
                 Err(onetdns_dnssec::tsig::TsigError::BadTime) => {
-                    unreachable!("상세 TSIG 검증은 BADTIME 문맥을 보존합니다")
+                    unreachable!("Detailed TSIG verification keeps the BADTIME context")
                 }
             }
         } else if required {
@@ -783,7 +783,7 @@ impl NativeServer {
                     }
                 }
                 self.notify_kick.push(origin.to_ascii_lower());
-                onetdns_core::info!(event = "authority.notify_received", zone = %origin.to_ascii_lower(), src = %ctx.src, "DNS NOTIFY를 받아 보조 영역 갱신을 예약했습니다");
+                onetdns_core::info!(event = "authority.notify_received", zone = %origin.to_ascii_lower(), src = %ctx.src, "Received DNS NOTIFY; scheduled a secondary zone refresh");
                 if let Some((key, verified)) = tsig_ctx.as_ref() {
                     if onetdns_dnssec::tsig::sign_response_message(
                         &mut m,
@@ -802,7 +802,7 @@ impl NativeServer {
                 }
             }
             None => {
-                onetdns_core::warn!(event = "authority.notify_unknown_master", zone = %q.name.to_ascii_lower(), src = %ctx.src, "알 수 없는 주 서버의 DNS NOTIFY를 무시했습니다");
+                onetdns_core::warn!(event = "authority.notify_unknown_master", zone = %q.name.to_ascii_lower(), src = %ctx.src, "Ignored DNS NOTIFY from an unknown primary");
                 return None;
             }
         }
@@ -860,7 +860,7 @@ impl NativeServer {
             m.additionals.clear();
             if let Some((key, request_tsig)) = &tsig_ctx {
                 onetdns_dnssec::tsig::sign_response_message(&mut m, key, now_unix(), request_tsig)
-                    .expect("최소 UPDATE 응답은 TSIG 서명 전에 항상 인코딩 가능");
+                    .expect("A minimal UPDATE response can always be encoded before TSIG signing");
             }
             Some(m)
         };
@@ -1114,7 +1114,7 @@ impl NativeServer {
         let new_zone = match onetdns_authority::Zone::from_records(recs) {
             Ok(z) => z,
             Err(error) => {
-                onetdns_core::error!(event = "authority.ddns_zone_invalid", zone = %apex.to_ascii_lower(), %error, "동적 DNS 갱신을 적용하면 영역이 어긋나 변경을 버렸습니다");
+                onetdns_core::error!(event = "authority.ddns_zone_invalid", zone = %apex.to_ascii_lower(), %error, "Discarded a dynamic DNS update that would leave the zone inconsistent");
                 return reply(ResponseCode::ServFail.0);
             }
         };
@@ -1128,7 +1128,7 @@ impl NativeServer {
                 crate::atomic_file::atomic_write(path, new_zone.to_master_file().as_bytes())
             {
                 onetdns_core::error!(event = "authority.ddns_save_failed", zone = %apex.to_ascii_lower(), path = %path.display(), %error,
-                    "동적 DNS 갱신을 저장하지 못해 변경을 되돌렸습니다");
+                    "Could not save a dynamic DNS update; reverted the change");
                 return reply(ResponseCode::ServFail.0);
             }
         }
@@ -1154,7 +1154,7 @@ impl NativeServer {
         if let Some(notify) = &self.update_notify {
             notify(&apex, new_serial);
         }
-        onetdns_core::info!(event = "authority.ddns_applied", zone = %apex.to_ascii_lower(), src = %ctx.src, "동적 DNS 갱신을 적용하고 일련번호를 올렸습니다");
+        onetdns_core::info!(event = "authority.ddns_applied", zone = %apex.to_ascii_lower(), src = %ctx.src, "Applied a dynamic DNS update and bumped the serial");
 
         self.rec(client, Action::Resolved, Some(&zq.name), Some(ApRt::SOA));
         reply(ResponseCode::NoError.0)
@@ -1386,7 +1386,7 @@ fn signed_badtime_response(
         response.questions.clear();
         response.additionals.clear();
         onetdns_dnssec::tsig::sign_badtime_response(&mut response, key, request_tsig, server_now)
-            .expect("최소 BADTIME 응답은 TSIG 서명 전에 항상 인코딩 가능");
+            .expect("A minimal BADTIME response can always be encoded before TSIG signing");
     }
     response
 }
@@ -1406,7 +1406,7 @@ fn signed_tsig_error_response(
         response.questions.clear();
         response.additionals.clear();
         onetdns_dnssec::tsig::sign_response_message(&mut response, key, now_unix(), request_tsig)
-            .expect("최소 TSIG 오류 응답은 서명 전에 항상 인코딩 가능");
+            .expect("A minimal TSIG error response can always be encoded before signing");
     }
     response
 }
@@ -1430,7 +1430,7 @@ fn xfr_single_response(
     response.answers.extend(answer);
     if let Some((key, request_tsig)) = tsig_ctx {
         onetdns_dnssec::tsig::sign_response_message(&mut response, key, now_unix(), request_tsig)
-            .expect("크기가 제한된 단일 XFR 응답은 TSIG 서명 전에 인코딩 가능");
+            .expect("A size-limited single XFR response can be encoded before TSIG signing");
     }
     response
 }
@@ -1508,7 +1508,7 @@ fn xfr_envelope(
                 request_tsig,
             )
         }
-        .expect("16KiB로 제한한 XFR 엔벨로프는 TSIG 서명 전에 인코딩 가능");
+        .expect("An XFR message capped at 16 KiB always encodes before TSIG signing");
         *prev_mac = Some(mac);
     }
     message

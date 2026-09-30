@@ -26,9 +26,9 @@ impl StubLayer {
         let mut parsed = Vec::with_capacity(stubs.len());
         for (suffix, backend) in stubs {
             let key = configured_name_key(&suffix)
-                .ok_or_else(|| format!("스텁 영역 이름이 올바르지 않습니다: {suffix}"))?;
+                .ok_or_else(|| format!("Invalid stub zone name: {suffix}"))?;
             if parsed.iter().any(|(existing, _)| existing == &key) {
-                return Err(format!("스텁 영역 이름이 중복되었습니다: {suffix}"));
+                return Err(format!("Duplicate stub zone name: {suffix}"));
             }
             parsed.push((key, backend));
         }

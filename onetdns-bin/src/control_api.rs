@@ -181,7 +181,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let runtime = runtime_cfg.clone();
             Box::new(move |svc: &str, enable: bool| {
                 if enable && onetdns_filter::services::service_rules(svc).is_none() {
-                    return Err(format!("알 수 없는 차단 서비스: {svc}"));
+                    return Err(format!("Unknown blocked service: {svc}"));
                 }
                 let previous = ss.lock_recover().clone();
                 let mut next = previous.clone();
@@ -210,7 +210,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         let error = if let Some(path) = cp.as_deref() {
                             with_rollback_result(
                                 error,
-                                "차단 서비스 설정을 이전 값으로 되돌리지 못했습니다",
+                                "Could not restore the previous blocked-service settings",
                                 persist_config_string_array(path, "blocked_services", &previous)
                                     .map_err(|rollback_error| rollback_error.to_string()),
                             )
@@ -353,7 +353,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         {
                             with_rollback_result(
                                 error,
-                                "필터 다운로드 설정을 이전 값으로 되돌리지 못했습니다",
+                                "Could not restore the previous filter download settings",
                                 atomic_write(path, text.as_bytes())
                                     .map_err(|rollback_error| rollback_error.to_string()),
                             )
@@ -373,7 +373,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let current = match path.as_deref() {
                     Some(p) => {
                         onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| {
-                            format!("현재 설정 파일을 읽지 못했습니다({}): {e}", p.display())
+                            format!(
+                                "Could not read the current configuration file ({}): {e}",
+                                p.display()
+                            )
                         })?)
                     }
                     None => startup.clone(),
@@ -393,7 +396,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let current = match path.as_deref() {
                     Some(p) => {
                         onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| {
-                            format!("현재 설정 파일을 읽지 못했습니다({}): {e}", p.display())
+                            format!(
+                                "Could not read the current configuration file ({}): {e}",
+                                p.display()
+                            )
                         })?)
                     }
                     None => startup.clone(),
@@ -403,7 +409,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     onetdns_config::Config::diff_toml(&current, &proposed)
                         .map_err(|e| e.to_string())?;
                 let proposed_cfg = onetdns_config::Config::from_toml_str(&proposed)
-                    .map_err(|e| format!("변경할 설정을 해석하지 못했습니다: {e}"))?;
+                    .map_err(|e| format!("Could not parse the settings to change: {e}"))?;
 
                 let active_cfg = runtime_cfg.load();
                 let effective = config_changed_keys(&active_cfg, &proposed_cfg)?;
@@ -456,7 +462,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     mode = result.mode.as_str(),
                     changed = result.changed.len(),
                     keys = ?result.changed,
-                    "설정 변경분을 적용했습니다"
+                    "Applied configuration changes"
                 );
                 Ok(format!("{{\"applied\":true,{}}}", result.json_fields()))
             })
@@ -470,12 +476,12 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let mut pairs = match &j {
                     onetdns_core::json::Json::Obj(p) => p.clone(),
                     _ => {
                         return Err(
-                            "요청 본문에는 키와 값으로 이루어진 최상위 객체가 필요합니다"
+                            "The request body must be a top-level object of keys and values"
                                 .to_string(),
                         )
                     }
@@ -483,7 +489,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 materialize_mode_acl_patch(&mut pairs)?;
                 validate_config_patch_values(&pairs)?;
                 if pairs.is_empty() {
-                    return Err("변경할 설정 항목이 없습니다".to_string());
+                    return Err("No settings to change".to_string());
                 }
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
@@ -510,7 +516,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     count = pairs.len(),
                     mode = result.mode.as_str(),
                     keys = ?changed_keys,
-                    "설정 항목을 적용했습니다"
+                    "Applied configuration setting"
                 );
                 Ok(format!(
                     "{{\"applied\":true,{},\"keys\":[{}]}}",
@@ -556,7 +562,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     .map(|key| onetdns_core::json::escape(key))
                     .collect();
                 format!(
-                "{{\"count\":{},\"keys\":[{}],\"hot_reload_keys\":[{}],\"conditional_hot_reload_keys\":[{}],\"fields\":{},\"note\":\"업스트림 DNS 서버 주소는 실행 중에 바꿀 수 있습니다. 응답 제한 시간, 선택 방식, 동시 요청 수는 클라이언트별 전용 업스트림 DNS 서버가 없고 해당 핸들러를 다시 만들 필요가 없을 때만 즉시 적용됩니다.\"}}",
+                "{{\"count\":{},\"keys\":[{}],\"hot_reload_keys\":[{}],\"conditional_hot_reload_keys\":[{}],\"fields\":{},\"note\":\"Upstream DNS server addresses can be changed while running. Response timeout, selection method, and concurrency apply immediately only when no client has dedicated upstream DNS servers and the handlers do not need to be rebuilt.\"}}",
                 keys.len(),
                 list.join(","),
                 hot.join(","),
@@ -571,11 +577,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             Box::new(move |body: &str| {
                 let bootstrap = runtime.load().bootstrap.clone();
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let addr_s = j
                     .get("addr")
                     .and_then(|v| v.as_str())
-                    .ok_or("`addr` 항목을 입력해야 합니다".to_string())?
+                    .ok_or("`addr` is required".to_string())?
                     .trim()
                     .to_string();
                 let mut candidates = if addr_s.contains("://") {
@@ -583,22 +589,21 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 } else {
                     let ip: std::net::IpAddr = addr_s
                         .parse()
-                        .map_err(|_| format!("IP 주소 형식이 올바르지 않습니다: {addr_s}"))?;
+                        .map_err(|_| format!("Invalid IP address: {addr_s}"))?;
                     vec![onetdns_forward::Upstream::udp(std::net::SocketAddr::new(
                         ip, 53,
                     ))]
                 };
                 let Some(up) = candidates.pop() else {
-                    return Err(format!(
-                        "업스트림 DNS 서버 주소 형식이 올바르지 않습니다: {addr_s}"
-                    ));
+                    return Err(format!("Invalid upstream DNS server address: {addr_s}"));
                 };
                 let fwd =
                     onetdns_forward::Forwarder::with_upstreams(vec![up], Duration::from_secs(3));
                 let probe = onetdns_proto::Message::query(
                     0x4f54,
-                    onetdns_proto::Name::from_str("example.com")
-                        .map_err(|_| "내장 점검용 도메인 이름을 해석하지 못했습니다".to_string())?,
+                    onetdns_proto::Name::from_str("example.com").map_err(|_| {
+                        "Could not parse the built-in probe domain name".to_string()
+                    })?,
                     onetdns_proto::RecordType::A,
                 );
                 let start = std::time::Instant::now();
@@ -606,7 +611,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     Ok(ans) if !matches!(ans.header.rcode, 0 | 3) => Ok(format!(
                         "{{\"ok\":false,\"error\":{},\"rcode\":{},\"addr\":{}}}",
                         onetdns_core::json::escape(&format!(
-                            "업스트림 DNS 서버가 {} 로 답했습니다",
+                            "Upstream DNS server answered {}",
                             native::rcode_str(onetdns_proto::ResponseCode(ans.header.rcode))
                         )),
                         ans.header.rcode,
@@ -635,7 +640,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 onetdns_core::info!(
                     event = "cache.flushed",
                     flushed = n,
-                    "응답 캐시를 비웠습니다"
+                    "Cleared the response cache"
                 );
                 format!("{{\"flushed\":{n}}}")
             })
@@ -668,16 +673,16 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let domain = j
                     .get("domain")
                     .and_then(|v| v.as_str())
-                    .ok_or("`domain` 항목을 입력해야 합니다".to_string())?
+                    .ok_or("`domain` is required".to_string())?
                     .to_string();
                 let answer = j
                     .get("answer")
                     .and_then(|v| v.as_str())
-                    .ok_or("`answer` 항목을 입력해야 합니다".to_string())?
+                    .ok_or("`answer` is required".to_string())?
                     .to_string();
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
@@ -707,11 +712,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let domain = j
                     .get("domain")
                     .and_then(|v| v.as_str())
-                    .ok_or("`domain` 항목을 입력해야 합니다".to_string())?
+                    .ok_or("`domain` is required".to_string())?
                     .to_string();
                 let mut removed = 0usize;
                 let result =
@@ -726,7 +731,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                             .collect();
                         removed = before - rw.len();
                         if removed == 0 {
-                            return Err(format!("일치하는 주소 변경 규칙이 없습니다: {domain}"));
+                            return Err(format!("No matching rewrite rule: {domain}"));
                         }
                         rewrite_config_kv(text, "rewrites", &rewrites_to_toml(&rw))
                     })?;
@@ -812,16 +817,16 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             Box::new(move || {
                 let current = runtime.load();
                 let (Some(cp), Some(kp)) = (&current.tls_cert, &current.tls_key) else {
-                    return Err("tls_cert/tls_key 미설정".to_string());
+                    return Err("tls_cert and tls_key are not set".to_string());
                 };
                 let (certs, keyder) = onetdns_transport::load_pem(cp, kp)
-                    .map_err(|e| format!("PEM 데이터를 불러오지 못했습니다: {e}"))?;
+                    .map_err(|e| format!("Could not load the PEM data: {e}"))?;
                 let chain_len = certs.len();
                 let material = inspect_tls_material(&certs, &keyder)?;
                 let leaf = material
                     .parsed
                     .first()
-                    .ok_or("빈 인증서 체인".to_string())?;
+                    .ok_or("Certificate chain is empty".to_string())?;
                 let now = unix_now() as i64;
                 let self_signed = material.self_signed;
                 let all_times_valid = material.all_times_valid;
@@ -872,11 +877,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let resolver = blocklist_resolver.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|e| format!("JSON 요청 본문을 해석할 수 없습니다: {e}"))?;
+                    .map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
                 let pem = j
                     .get("certificate_chain")
                     .and_then(|v| v.as_str())
-                    .ok_or("`certificate_chain` 항목을 입력해야 합니다")?;
+                    .ok_or("`certificate_chain` is required")?;
                 revoke::check_pem_chain_json(
                     pem,
                     unix_now() as i64,
@@ -933,10 +938,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let readonly = j.get("role").and_then(|v| v.as_str()) != Some("admin");
-                let bytes = onetdns_core::rng::try_random_array::<24>()
-                    .map_err(|error| format!("보안 토큰을 만들 난수를 얻지 못했습니다: {error}"))?;
+                let bytes = onetdns_core::rng::try_random_array::<24>().map_err(|error| {
+                    format!("Could not get random bytes for the security token: {error}")
+                })?;
                 let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 let key = if readonly {
                     "control_readonly_tokens"
@@ -959,7 +965,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 onetdns_core::info!(
                     event = "control.temp_token_issued",
                     role = key,
-                    "임시 관리 토큰을 발급했습니다"
+                    "Issued a temporary management token"
                 );
                 Ok(format!(
                     "{{\"created\":true,\"role\":{},\"token\":{},\"id\":{},{}}}",
@@ -979,11 +985,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let id = j
                     .get("id")
                     .and_then(|v| v.as_str())
-                    .ok_or("`id` 항목을 입력해야 합니다".to_string())?
+                    .ok_or("`id` is required".to_string())?
                     .to_string();
                 let mut removed = 0usize;
                 let result =
@@ -1008,7 +1014,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             Box::new(move || {
                 let snapshot = prev.lock_recover().clone();
                 let Some(text) = snapshot else {
-                    return Err("되돌릴 이전 설정이 없습니다".to_string());
+                    return Err("There is no previous configuration to restore".to_string());
                 };
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |_| {
@@ -1018,7 +1024,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     event = "config.rollback_applied",
                     mode = result.mode.as_str(),
                     keys = ?result.changed,
-                    "이전 설정으로 되돌렸습니다"
+                    "Restored the previous configuration"
                 );
                 Ok(format!("{{\"rolled_back\":true,{}}}", result.json_fields()))
             })
@@ -1075,7 +1081,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     "{{\"committed\":true,\"applied\":true,\"index\":{idx}}}"
                 ))
             }
-            None => Err("Raft 고가용성 기능이 설정되어 있지 않습니다".to_string()),
+            None => Err("Raft is not configured".to_string()),
         }),
 
         cluster_write: Box::new(cluster_routed_write),
@@ -1120,13 +1126,13 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
 
         firewall_set: Box::new(|body: &str| {
             let j = onetdns_core::json::parse(body)
-                .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+                .map_err(|e| format!("Invalid JSON request body: {e}"))?;
             let port = j
                 .get("port")
                 .and_then(|v| v.as_u64())
                 .and_then(|port| u16::try_from(port).ok())
                 .filter(|port| *port != 0)
-                .ok_or("`port` 항목에 1부터 65535 사이의 값을 입력해야 합니다")?;
+                .ok_or("`port` must be between 1 and 65535")?;
             let udp = j.get("udp").and_then(|v| v.as_bool()).unwrap_or(true);
             let tcp = j.get("tcp").and_then(|v| v.as_bool()).unwrap_or(true);
             let action = j.get("action").and_then(|v| v.as_str()).unwrap_or("allow");
@@ -1138,7 +1144,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         port = port,
                         udp = udp,
                         tcp = tcp,
-                        "관리 화면 요청으로 이 기계의 방화벽에서 포트를 열었습니다"
+                        "Opened a port in this machine's firewall at the dashboard's request"
                     );
                 }
                 "remove" => {
@@ -1146,10 +1152,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     onetdns_core::info!(
                         event = "osnet.firewall_closed",
                         port = port,
-                        "관리 화면 요청으로 이 기계의 방화벽 규칙을 지웠습니다"
+                        "Removed a firewall rule on this machine at the dashboard's request"
                     );
                 }
-                other => return Err(format!("알 수 없는 방화벽 동작입니다: {other}")),
+                other => return Err(format!("Unknown firewall action: {other}")),
             }
             Ok(format!(
                 "{{\"ok\":true,\"port\":{port},\"action\":{},\"platform\":{}}}",
@@ -1162,23 +1168,23 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let backup = osnet_backup_dir.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+                    .map_err(|e| format!("Invalid JSON request body: {e}"))?;
                 let adapter = j
                     .get("adapter")
                     .and_then(|v| v.as_str())
-                    .ok_or("`adapter` 항목을 입력해야 합니다")?;
+                    .ok_or("`adapter` is required")?;
                 let servers: Vec<String> = match j.get("servers") {
                     Some(onetdns_core::json::Json::Arr(a)) => a
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
                         .collect(),
-                    _ => return Err("`servers` 배열을 입력해야 합니다".to_string()),
+                    _ => return Err("`servers` array is required".to_string()),
                 };
                 if servers.is_empty() {
-                    return Err("servers 목록에 한 개 이상의 서버를 입력해야 합니다".to_string());
+                    return Err("servers must list at least one server".to_string());
                 }
                 osnet::set_dns(adapter, &servers, &backup)?;
-                onetdns_core::info!(event = "osnet.client_dns_set", adapter = %adapter, servers = %servers.join(","), "관리 화면 요청으로 이 기계의 DNS 서버 설정을 바꿨습니다. 원래 값은 백업해 뒀습니다");
+                onetdns_core::info!(event = "osnet.client_dns_set", adapter = %adapter, servers = %servers.join(","), "Changed this machine's DNS server setting at the dashboard's request; the original value is backed up");
                 Ok(format!(
                     "{{\"ok\":true,\"adapter\":{}}}",
                     onetdns_core::json::escape(adapter)
@@ -1204,27 +1210,23 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let path = config_path.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+                    .map_err(|e| format!("Invalid JSON request body: {e}"))?;
                 let action = j
                     .get("action")
                     .and_then(|v| v.as_str())
-                    .ok_or("`action` 항목에 install 또는 uninstall을 입력해야 합니다")?;
+                    .ok_or("`action` must be install or uninstall")?;
                 // 서비스로 뜰 때도 지금 쓰는 설정 파일을 그대로 읽어야 한다. 넘기지 않으면
                 // 부팅 뒤에 기본 설정으로 떠서 지금 화면에 보이는 것과 다르게 돈다.
                 let outcome = match action {
                     "install" => service::install(path.clone()),
                     "uninstall" => service::uninstall(),
-                    other => {
-                        return Err(format!(
-                            "`action`은 install 또는 uninstall이어야 합니다: {other}"
-                        ))
-                    }
+                    other => return Err(format!("`action` must be install or uninstall: {other}")),
                 }
                 .map_err(|error| error.to_string())?;
                 onetdns_core::info!(
                     event = "service.boot_registration_changed",
                     action = %action,
-                    "관리 화면 요청으로 부팅 서비스 등록을 바꿨습니다"
+                    "Changed the boot-time service registration at the dashboard's request"
                 );
                 Ok(format!(
                     "{{\"ok\":true,\"message\":{}}}",
@@ -1239,19 +1241,21 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         }),
 
         #[cfg(not(windows))]
-        boot_service_set: Box::new(|_| Err("부팅 서비스 등록은 Windows에서만 됩니다".to_string())),
+        boot_service_set: Box::new(|_| {
+            Err("Boot-time service registration is available only on Windows".to_string())
+        }),
 
         dns_client_restore: {
             let backup = osnet_backup_dir.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|e| format!("JSON 요청 본문이 올바르지 않습니다: {e}"))?;
+                    .map_err(|e| format!("Invalid JSON request body: {e}"))?;
                 let adapter = j
                     .get("adapter")
                     .and_then(|v| v.as_str())
-                    .ok_or("`adapter` 항목을 입력해야 합니다")?;
+                    .ok_or("`adapter` is required")?;
                 osnet::restore_dns(adapter, &backup)?;
-                onetdns_core::info!(event = "osnet.client_dns_restored", adapter = %adapter, "관리 화면 요청으로 이 기계의 DNS 서버 설정을 백업해 둔 값으로 되돌렸습니다");
+                onetdns_core::info!(event = "osnet.client_dns_restored", adapter = %adapter, "Restored this machine's DNS server setting from the backup at the dashboard's request");
                 Ok(format!(
                     "{{\"ok\":true,\"adapter\":{}}}",
                     onetdns_core::json::escape(adapter)
@@ -1264,7 +1268,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let failures = transport_observe::snapshot();
             if !failures.is_empty() {
                 s.push_str(
-                    "# TYPE onetdns_transport_errors_total counter\n# HELP onetdns_transport_errors_total 전송 단계별 처리 실패 누적 횟수\n",
+                    "# TYPE onetdns_transport_errors_total counter\n# HELP onetdns_transport_errors_total Total handling failures by transport stage\n",
                 );
                 for (transport, stage, count) in failures {
                     s.push_str(&format!(
@@ -1277,7 +1281,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 + onetdns_recurse::validation_bogus_total();
             if bogus > 0 {
                 s.push_str(
-                    "# TYPE onetdns_dnssec_bogus_total counter\n# HELP onetdns_dnssec_bogus_total DNSSEC 검증 실패로 차단한 응답 수\n",
+                    "# TYPE onetdns_dnssec_bogus_total counter\n# HELP onetdns_dnssec_bogus_total Responses blocked because DNSSEC validation failed\n",
                 );
                 s.push_str(&format!("onetdns_dnssec_bogus_total {bogus}\n"));
             }
@@ -1285,11 +1289,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let (batches, datagrams) = onetdns_runtime::recv_batch_counters();
             if batches > 0 {
                 s.push_str(
-                    "# TYPE onetdns_udp_recv_batches_total counter\n# HELP onetdns_udp_recv_batches_total UDP 배치 수신 호출 횟수\n",
+                    "# TYPE onetdns_udp_recv_batches_total counter\n# HELP onetdns_udp_recv_batches_total UDP batch receive calls\n",
                 );
                 s.push_str(&format!("onetdns_udp_recv_batches_total {batches}\n"));
                 s.push_str(
-                    "# TYPE onetdns_udp_recv_datagrams_total counter\n# HELP onetdns_udp_recv_datagrams_total 그 호출들이 가져온 데이터그램 수\n",
+                    "# TYPE onetdns_udp_recv_datagrams_total counter\n# HELP onetdns_udp_recv_datagrams_total Datagrams returned by those calls\n",
                 );
                 s.push_str(&format!("onetdns_udp_recv_datagrams_total {datagrams}\n"));
             }
@@ -1408,7 +1412,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let runtime = runtime_cfg.clone();
             Box::new(move |body: &str| {
                 let request = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let url = request
                     .get("url")
                     .and_then(|value| value.as_str())
@@ -1422,13 +1426,13 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     .trim()
                     .to_string();
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err("목록 주소는 http:// 또는 https://로 시작해야 합니다".to_string());
+                    return Err("List URL must start with http:// or https://".to_string());
                 }
 
                 let _guard = try_list_refresh_lock(&operation_lock)?;
                 let previous_urls = urls.lock_recover().clone();
                 if previous_urls.iter().any(|item| item == &url) {
-                    return Err("이미 등록된 필터 목록입니다".to_string());
+                    return Err("This filter list is already registered".to_string());
                 }
                 let previous_titles = titles.lock_recover().clone();
                 let previous_disabled = disabled.lock_recover().clone();
@@ -1466,7 +1470,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     *sm.lock_recover() = previous_meta;
                     let error = with_rollback_result(
                         error,
-                        "구독 설정을 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous subscription settings",
                         persist_subscription_state(
                             config_path.as_deref(),
                             &previous_urls,
@@ -1476,7 +1480,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     );
                     let error = with_rollback_result(
                         error,
-                        "구독 필터의 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous runtime state of subscription filters",
                         rebuild().map(|_| ()),
                     );
                     return Err(error);
@@ -1510,7 +1514,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let position = previous_urls
                     .iter()
                     .position(|item| item == target)
-                    .ok_or_else(|| format!("구독 항목을 찾을 수 없습니다: {target}"))?;
+                    .ok_or_else(|| format!("Subscription not found: {target}"))?;
                 let previous_titles = titles.lock_recover().clone();
                 let previous_disabled = disabled.lock_recover().clone();
                 let previous_meta = sm.lock_recover().clone();
@@ -1544,7 +1548,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     *sm.lock_recover() = previous_meta;
                     let error = with_rollback_result(
                         error,
-                        "구독 설정을 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous subscription settings",
                         persist_subscription_state(
                             config_path.as_deref(),
                             &previous_urls,
@@ -1554,7 +1558,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     );
                     let error = with_rollback_result(
                         error,
-                        "구독 필터의 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous runtime state of subscription filters",
                         rebuild().map(|_| ()),
                     );
                     return Err(error);
@@ -1583,7 +1587,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let runtime = runtime_cfg.clone();
             Box::new(move |body: &str| {
                 let request = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let url = request
                     .get("url")
                     .and_then(|value| value.as_str())
@@ -1592,12 +1596,12 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let enabled = request
                     .get("enabled")
                     .and_then(|value| value.as_bool())
-                    .ok_or_else(|| "`enabled` 항목을 입력해야 합니다".to_string())?;
+                    .ok_or_else(|| "`enabled` is required".to_string())?;
 
                 let _guard = try_list_refresh_lock(&operation_lock)?;
                 let current_urls = urls.lock_recover().clone();
                 if !current_urls.iter().any(|item| item == url) {
-                    return Err(format!("구독 항목을 찾을 수 없습니다: {url}"));
+                    return Err(format!("Subscription not found: {url}"));
                 }
                 let current_titles = titles.lock_recover().clone();
                 let previous_disabled = disabled.lock_recover().clone();
@@ -1627,7 +1631,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     *sm.lock_recover() = previous_meta;
                     let error = with_rollback_result(
                         error,
-                        "구독 사용 상태를 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous subscription enabled state",
                         persist_subscription_state(
                             config_path.as_deref(),
                             &current_urls,
@@ -1637,7 +1641,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     );
                     let error = with_rollback_result(
                         error,
-                        "구독 필터의 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous runtime state of subscription filters",
                         rebuild().map(|_| ()),
                     );
                     return Err(error);
@@ -1663,7 +1667,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let operation_lock = list_refresh_lock.clone();
             Box::new(move |body: &str| {
                 let request = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let target = request
                     .get("url")
                     .and_then(|value| value.as_str())
@@ -1673,10 +1677,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let current_urls = urls.lock_recover().clone();
                 let builtin = presets.lock_recover().iter().any(|item| item == target);
                 if !builtin && !current_urls.iter().any(|item| item == target) {
-                    return Err(format!("구독 항목을 찾을 수 없습니다: {target}"));
+                    return Err(format!("Subscription not found: {target}"));
                 }
                 if !builtin && disabled.lock_recover().iter().any(|item| item == target) {
-                    return Err("사용하지 않도록 설정한 구독은 갱신할 수 없습니다".to_string());
+                    return Err("A disabled subscription cannot be refreshed".to_string());
                 }
                 let fresh = fetch_blocklist(target, &resolver, None)?;
                 let previous_meta = sm.lock_recover().clone();
@@ -1690,7 +1694,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     *sm.lock_recover() = previous_meta;
                     let error = with_rollback_result(
                         error,
-                        "구독 필터의 실행 상태를 이전 값으로 되돌리지 못했습니다",
+                        "Could not restore the previous runtime state of subscription filters",
                         rebuild().map(|_| ()),
                     );
                     return Err(error);
@@ -1719,11 +1723,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let runtime = runtime_cfg.clone();
             Box::new(move |body: &str, add: bool| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let kind = j.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 let rule = j.get("rule").and_then(|v| v.as_str()).unwrap_or("").trim();
                 if rule.is_empty() {
-                    return Err("`rule` 항목을 입력해야 합니다".to_string());
+                    return Err("`rule` is required".to_string());
                 }
                 match kind {
                     "block" | "allow" => {
@@ -1754,7 +1758,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                             let error = if let Some(path) = cp.as_deref() {
                                 with_rollback_result(
                                     error,
-                                    "거절 도메인 설정을 이전 값으로 되돌리지 못했습니다",
+                                    "Could not restore the previous refused-domain settings",
                                     persist_config_string_array(path, "refused_domains", &previous)
                                         .map_err(|rollback_error| rollback_error.to_string()),
                                 )
@@ -1768,12 +1772,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                             config.refused_domains = applied;
                         });
                     }
-                    _ => {
-                        return Err(
-                            "kind에는 block, allow 또는 refused_domain을 지정해야 합니다"
-                                .to_string(),
-                        )
-                    }
+                    _ => return Err("kind must be block, allow, or refused_domain".to_string()),
                 }
                 Ok("{\"updated\":true}".to_string())
             })
@@ -1846,10 +1845,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         },
         job_get: {
             let j = jobs.clone();
-            Box::new(move |id: u64| {
-                j.get_json(id)
-                    .ok_or_else(|| format!("작업을 찾을 수 없습니다: {id}"))
-            })
+            Box::new(move |id: u64| j.get_json(id).ok_or_else(|| format!("Job not found: {id}")))
         },
 
         job_refresh: {
@@ -1858,8 +1854,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let service_threads = service_threads.clone();
             Box::new(move || {
                 let Some(id) = jobs.create("refresh-lists") else {
-                    return "{\"error\":\"진행 중인 작업이 가득 찼습니다\",\"busy\":true}"
-                        .to_string();
+                    return "{\"error\":\"Too many jobs are running\",\"busy\":true}".to_string();
                 };
                 let task_jobs = jobs.clone();
                 let refresh_lists = refresh_lists.clone();
@@ -1876,7 +1871,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         format!("{{\"id\":{id},\"status\":\"running\"}}")
                     }
                     Err(error) => {
-                        let message = format!("작업 스레드를 시작하지 못했습니다: {error}");
+                        let message = format!("Could not start the job thread: {error}");
                         jobs.finish(id, false, message.clone());
                         format!(
                             "{{\"id\":{id},\"status\":\"failed\",\"error\":{}}}",
@@ -1902,7 +1897,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let v4 = dhcp_slot.clone();
             Box::new(move |body: &str| match v4.lock_recover().clone() {
                 Some(pool) => apply_lease_sync(&pool, body),
-                None => Err("DHCPv4 기능이 설정되어 있지 않습니다".to_string()),
+                None => Err("DHCPv4 is not configured".to_string()),
             })
         },
 
@@ -1915,7 +1910,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let v4 = dhcp_slot.clone();
             Box::new(move |body: &str| match v4.lock_recover().clone() {
                 Some(pool) => apply_static_add(&pool, body),
-                None => Err("DHCPv4 기능이 설정되어 있지 않습니다".to_string()),
+                None => Err("DHCPv4 is not configured".to_string()),
             })
         },
 
@@ -1923,7 +1918,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let v4 = dhcp_slot.clone();
             Box::new(move |identity: &str| match v4.lock_recover().clone() {
                 Some(pool) => apply_static_remove(&pool, identity),
-                None => Err("DHCPv4 기능이 설정되어 있지 않습니다".to_string()),
+                None => Err("DHCPv4 is not configured".to_string()),
             })
         },
 
@@ -1940,7 +1935,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         let cfg = onetdns_config::Config::from_toml_str(text)
                             .map_err(|e| e.to_string())?;
                         if cfg.clients.iter().any(|c| c.name == name) {
-                            return Err(format!("이미 등록된 클라이언트입니다: {name}"));
+                            return Err(format!("Client already exists: {name}"));
                         }
                         let mut t = text.to_string();
                         if !t.ends_with('\n') {
@@ -1966,12 +1961,12 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             Box::new(move |name: &str| {
                 let name = name.trim().to_string();
                 if name.is_empty() {
-                    return Err("`name` 항목을 입력해야 합니다".to_string());
+                    return Err("`name` is required".to_string());
                 }
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
                         remove_client_block(text, &name)
-                            .ok_or_else(|| format!("클라이언트를 찾을 수 없습니다: {name}"))
+                            .ok_or_else(|| format!("Client not found: {name}"))
                     })?;
                 Ok(format!(
                     "{{\"removed\":true,\"name\":{},{} }}",
@@ -1989,7 +1984,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
                 let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "JSON 요청 본문을 해석할 수 없습니다".to_string())?;
+                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
                 let name = j
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -1999,9 +1994,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let disable = j
                     .get("disable_filtering")
                     .and_then(|v| v.as_bool())
-                    .ok_or("`disable_filtering` 항목을 입력해야 합니다".to_string())?;
+                    .ok_or("`disable_filtering` is required".to_string())?;
                 if name.is_empty() {
-                    return Err("`name` 항목을 입력해야 합니다".to_string());
+                    return Err("`name` is required".to_string());
                 }
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
@@ -2061,7 +2056,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             Box::new(move |entry: &str| {
                 let entry = entry.trim().to_string();
                 if entry.is_empty() {
-                    return Err("추가할 업스트림 DNS 서버 주소가 비어 있습니다".to_string());
+                    return Err("Upstream DNS server address to add is empty".to_string());
                 }
                 let key = upstream_key(&entry);
                 let result =
@@ -2070,19 +2065,21 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                             .map_err(|e| e.to_string())?;
                         let mut vals = upstream_values(&cfg, key);
                         if vals.iter().any(|value| value == &entry) {
-                            return Err(format!("이미 등록된 업스트림 DNS 서버입니다: {entry}"));
+                            return Err(format!("Upstream DNS server already registered: {entry}"));
                         }
                         vals.push(entry.clone());
-                        // 암호화 업스트림을 처음 적으면 적히지 않은 기본 평문 업스트림이 물러난다.
-                        // 여기서 쓰던 목록을 텍스트로 남기지 않으면 목록에서 조용히 사라진다.
-                        let text = if key == "upstream_urls"
-                            && cfg.upstream_urls.is_empty()
-                            && !cfg.upstreams.is_empty()
-                        {
-                            let plain = upstream_values(&cfg, "upstreams");
-                            rewrite_config_string_array(text, "upstreams", &plain)?
+                        // 한쪽 목록만 파일에 적히면 적히지 않은 다른 쪽 기본값이 물러난다. 지금 쓰던
+                        // 다른 쪽 목록을 텍스트로 남기지 않으면 화면 목록에서 조용히 사라진다.
+                        let other = if key == "upstream_urls" {
+                            "upstreams"
                         } else {
+                            "upstream_urls"
+                        };
+                        let others = upstream_values(&cfg, other);
+                        let text = if others.is_empty() {
                             text.to_string()
+                        } else {
+                            rewrite_config_string_array(text, other, &others)?
                         };
                         rewrite_config_string_array(&text, key, &vals)
                     })?;
@@ -2091,7 +2088,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     address = %entry,
                     config_key = key,
                     apply_mode = result.mode.as_str(),
-                    "업스트림 DNS 서버를 추가했습니다"
+                    "Added an upstream DNS server"
                 );
                 Ok(format!(
                     "{{\"added\":{},\"id\":{},\"key\":{},{} }}",
@@ -2120,7 +2117,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         let before = vals.len();
                         vals.retain(|value| value != &entry);
                         if vals.len() == before {
-                            return Err(format!("업스트림 DNS 서버를 찾을 수 없습니다: {entry}"));
+                            return Err(format!("Upstream DNS server not found: {entry}"));
                         }
                         rewrite_config_string_array(text, key, &vals)
                     })?;
@@ -2129,7 +2126,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     address = %entry,
                     config_key = key,
                     apply_mode = result.mode.as_str(),
-                    "업스트림 DNS 서버를 삭제했습니다"
+                    "Removed an upstream DNS server"
                 );
                 Ok(format!(
                     "{{\"removed\":{},\"id\":{},\"key\":{},{} }}",
@@ -2193,13 +2190,13 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let zs = zone_store.clone();
             Box::new(move |origin: &str| {
                 let name = onetdns_proto::Name::from_str(origin)
-                    .map_err(|_| format!("DNS 영역 이름 형식이 올바르지 않습니다: {origin}"))?;
+                    .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let store = zs.load();
                 let zone = store
                     .zones()
                     .iter()
                     .find(|z| z.origin().eq_ignore_case(&name))
-                    .ok_or_else(|| format!("DNS 영역을 찾을 수 없습니다: {origin}"))?;
+                    .ok_or_else(|| format!("DNS zone not found: {origin}"))?;
                 let records: Vec<String> = zone_records_without_closing_soa(zone)
                     .iter()
                     .map(zone_record_json)
@@ -2222,10 +2219,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let notify = notify_sender.clone();
             Box::new(move |origin: &str, text: &str| {
                 let current_cfg = runtime.load();
-                let target = zone_api_target(&current_cfg, &zs.load(), origin, "수정")?;
+                let target = zone_api_target(&current_cfg, &zs.load(), origin, "modify")?;
                 let key = target.key.clone();
                 let zone = onetdns_authority::parse_zone(text, origin)
-                    .map_err(|e| format!("DNS 영역 데이터 형식이 올바르지 않습니다: {e}"))?;
+                    .map_err(|e| format!("Invalid DNS zone data: {e}"))?;
 
                 let path = target.path.clone();
                 let applied = apply_zone_mutation(
@@ -2235,9 +2232,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     &journal,
                     path.as_deref(),
                     &notify,
-                    "DNS 영역 변경",
+                    "zone save",
                 )?;
-                onetdns_core::info!(event = "authority.zone_saved", origin = %key, serial = applied.serial, persisted = applied.persisted, "DNS 영역을 저장했습니다");
+                onetdns_core::info!(event = "authority.zone_saved", origin = %key, serial = applied.serial, persisted = applied.persisted, "Saved DNS zone");
                 Ok(format!(
                     "{{\"origin\":\"{}\",\"serial\":{},\"records\":{},\"persisted\":{},\"signed\":{},\"served\":{}}}",
                     applied.origin,
@@ -2256,10 +2253,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let journal = ixfr_journal.clone();
             Box::new(move |origin: &str| {
                 let current_cfg = runtime.load();
-                let target = zone_api_target(&current_cfg, &zs.load(), origin, "삭제")?;
+                let target = zone_api_target(&current_cfg, &zs.load(), origin, "delete")?;
                 let key = target.key.clone();
                 let name = onetdns_proto::Name::from_str(origin)
-                    .map_err(|_| format!("DNS 영역 이름 형식이 올바르지 않습니다: {origin}"))?;
+                    .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let mut journals = journal.lock().unwrap_or_else(|e| e.into_inner());
                 let exists = zs
                     .load()
@@ -2267,21 +2264,21 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     .iter()
                     .any(|z| z.origin().eq_ignore_case(&name));
                 if !exists {
-                    return Err(format!("DNS 영역을 찾을 수 없습니다: {origin}"));
+                    return Err(format!("DNS zone not found: {origin}"));
                 }
                 let path = target.path.clone();
                 let mut file_removed = false;
                 if let Some(p) = path {
                     if p.exists() {
                         std::fs::remove_file(&p).map_err(|e| {
-                            format!("DNS 영역 파일을 삭제하지 못했습니다({}): {e}", p.display())
+                            format!("Could not delete the DNS zone file ({}): {e}", p.display())
                         })?;
                         file_removed = true;
                     }
                 }
                 remove_zone(&zs, &name);
                 journals.remove(&name.canonical_key());
-                onetdns_core::info!(event = "authority.zone_deleted", origin = %key, file_removed, "DNS 영역을 삭제했습니다");
+                onetdns_core::info!(event = "authority.zone_deleted", origin = %key, file_removed, "Deleted DNS zone");
                 Ok(format!(
                     "{{\"deleted\":true,\"file_removed\":{file_removed}}}"
                 ))
@@ -2296,12 +2293,12 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let notify = notify_sender.clone();
             Box::new(move |origin: &str, body: &str| {
                 let current_cfg = runtime.load();
-                let target = zone_api_target(&current_cfg, &zs.load(), origin, "수정")?;
+                let target = zone_api_target(&current_cfg, &zs.load(), origin, "modify")?;
                 let name = onetdns_proto::Name::from_str(origin)
-                    .map_err(|_| format!("DNS 영역 이름 형식이 올바르지 않습니다: {origin}"))?;
+                    .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let line = body.trim();
                 if line.is_empty() {
-                    return Err("DNS 레코드 본문이 비어 있습니다".to_string());
+                    return Err("DNS record text is empty".to_string());
                 }
                 let mut journals = journal.lock().unwrap_or_else(|e| e.into_inner());
                 let current = {
@@ -2310,11 +2307,11 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         .zones()
                         .iter()
                         .find(|z| z.origin().eq_ignore_case(&name))
-                        .ok_or_else(|| format!("DNS 영역을 찾을 수 없습니다: {origin}"))?;
+                        .ok_or_else(|| format!("DNS zone not found: {origin}"))?;
                     zone.to_master_file()
                 };
                 let zone = onetdns_authority::parse_zone(&format!("{current}\n{line}\n"), origin)
-                    .map_err(|e| format!("DNS 레코드 형식이 올바르지 않습니다: {e}"))?;
+                    .map_err(|e| format!("Invalid DNS record: {e}"))?;
                 let path = target.path.clone();
                 let applied = apply_zone_mutation_locked(
                     &zs,
@@ -2323,9 +2320,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     &mut journals,
                     path.as_deref(),
                     &notify,
-                    "DNS 레코드를 추가했습니다",
+                    "record add",
                 )?;
-                onetdns_core::info!(event = "authority.record_added", origin = %applied.origin, serial = applied.serial, "DNS 레코드를 추가했습니다");
+                onetdns_core::info!(event = "authority.record_added", origin = %applied.origin, serial = applied.serial, "Added DNS record");
                 Ok(format!(
                     "{{\"origin\":\"{}\",\"serial\":{},\"records\":{},\"persisted\":{},\"signed\":{}}}",
                     applied.origin, applied.serial, applied.records, applied.persisted, applied.signed
@@ -2341,18 +2338,18 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let notify = notify_sender.clone();
             Box::new(move |origin: &str, body: &str| {
                 let current_cfg = runtime.load();
-                let target = zone_api_target(&current_cfg, &zs.load(), origin, "수정")?;
+                let target = zone_api_target(&current_cfg, &zs.load(), origin, "modify")?;
                 let name = onetdns_proto::Name::from_str(origin)
-                    .map_err(|_| format!("DNS 영역 이름 형식이 올바르지 않습니다: {origin}"))?;
+                    .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let j = onetdns_core::json::parse(body).unwrap_or(onetdns_core::json::Json::Null);
                 let rname_s = j
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .ok_or("`name` 항목을 입력해야 합니다".to_string())?;
+                    .ok_or("`name` is required".to_string())?;
                 let rtype_s = j
                     .get("type")
                     .and_then(|v| v.as_str())
-                    .ok_or("`type` 항목을 입력해야 합니다".to_string())?;
+                    .ok_or("`type` is required".to_string())?;
 
                 let rvalue = j
                     .get("value")
@@ -2361,13 +2358,13 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     .filter(|value| !value.is_empty());
                 let rtype_num = *qtype_numbers(&[rtype_s.to_string()])
                     .first()
-                    .ok_or_else(|| format!("지원하지 않는 DNS 레코드 형식입니다: {rtype_s}"))?;
+                    .ok_or_else(|| format!("Unsupported DNS record type: {rtype_s}"))?;
                 if rtype_num == 6 {
-                    return Err("SOA 레코드는 삭제할 수 없습니다".to_string());
+                    return Err("The SOA record cannot be deleted".to_string());
                 }
                 let rtype = onetdns_proto::RecordType(rtype_num);
                 let rname = resolve_zone_name(rname_s, origin)
-                    .ok_or_else(|| format!("DNS 이름 형식이 올바르지 않습니다: {rname_s}"))?;
+                    .ok_or_else(|| format!("Invalid DNS name: {rname_s}"))?;
                 let mut journals = journal.lock().unwrap_or_else(|e| e.into_inner());
                 let mut recs = {
                     let store = zs.load();
@@ -2375,7 +2372,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         .zones()
                         .iter()
                         .find(|z| z.origin().eq_ignore_case(&name))
-                        .ok_or_else(|| format!("DNS 영역을 찾을 수 없습니다: {origin}"))?;
+                        .ok_or_else(|| format!("DNS zone not found: {origin}"))?;
                     zone.axfr_records()
                 };
                 recs.pop();
@@ -2390,12 +2387,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 });
                 let removed = before - recs.len();
                 if removed == 0 {
-                    return Err(format!(
-                        "일치하는 DNS 레코드를 찾을 수 없습니다: {rname_s} {rtype_s}"
-                    ));
+                    return Err(format!("No matching DNS record: {rname_s} {rtype_s}"));
                 }
                 let zone = onetdns_authority::Zone::from_records(recs)
-                    .map_err(|e| format!("DNS 영역을 다시 구성하지 못했습니다: {e}"))?;
+                    .map_err(|e| format!("Could not rebuild the DNS zone: {e}"))?;
                 let path = target.path.clone();
                 let applied = apply_zone_mutation_locked(
                     &zs,
@@ -2404,9 +2399,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     &mut journals,
                     path.as_deref(),
                     &notify,
-                    "DNS 레코드를 삭제했습니다",
+                    "record delete",
                 )?;
-                onetdns_core::info!(event = "authority.record_deleted", origin = %applied.origin, removed, serial = applied.serial, "DNS 레코드를 삭제했습니다");
+                onetdns_core::info!(event = "authority.record_deleted", origin = %applied.origin, removed, serial = applied.serial, "Deleted DNS record");
                 Ok(format!(
                     "{{\"deleted\":{removed},\"origin\":{},\"serial\":{},\"persisted\":{}}}",
                     onetdns_core::json::escape(&applied.origin.to_string()),
@@ -2420,7 +2415,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let signers = zone_signers.clone();
             Box::new(move |origin: &str| {
                 let name = onetdns_proto::Name::from_str(origin)
-                    .map_err(|_| format!("DNS 영역 이름 형식이 올바르지 않습니다: {origin}"))?;
+                    .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let signers = signers.load();
                 let Some((_, ctx)) = signers.iter().find(|(o, _)| o.eq_ignore_case(&name)) else {
                     return Ok(format!(
@@ -2490,7 +2485,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let prev = config_prev.clone();
             Box::new(move || {
                 let path = path.as_deref().ok_or_else(|| {
-                    "설정 파일 경로가 없어 디스크 설정을 적용할 수 없습니다".to_string()
+                    "There is no configuration file path, so the on-disk configuration cannot be applied".to_string()
                 })?;
                 let text = onetdns_core::SecretString::from(
                     Config::read_text(path).map_err(|error| error.to_string())?,
@@ -2513,7 +2508,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                             onetdns_core::info!(
                                 event = "tls.certificate_reloaded",
                                 changed = %swapped.join(","),
-                                "수신 주소를 닫지 않고 TLS 인증서를 교체했습니다"
+                                "Replaced the TLS certificate without closing listening addresses"
                             );
                             let names: Vec<String> = swapped
                                 .iter()
@@ -2540,7 +2535,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                         event = "config.disk_hot_applied",
                         path = %path.display(),
                         changed = effective_changed.len(),
-                        "파일에 저장된 설정을 실행 중인 서비스에 적용했습니다"
+                        "Applied the saved configuration file to the running service"
                     );
                     return Ok(format!(
                         "{{\"accepted\":true,\"mode\":\"hot_reload\",\"restart_required\":false,\"changed\":[{}]}}",
@@ -2553,7 +2548,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     event = "config.disk_restart_requested",
                     path = %path.display(),
                     changed = effective_changed.len(),
-                    "파일에 저장된 설정을 적용하기 위해 DNS 서비스를 다시 시작합니다"
+                    "Restarting the DNS service to apply the saved configuration file"
                 );
                 Ok(format!(
                     "{{\"accepted\":true,\"mode\":\"service_restart\",\"restart_required\":true,\"changed\":[{}]}}",

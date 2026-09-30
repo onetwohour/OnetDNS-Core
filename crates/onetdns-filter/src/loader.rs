@@ -22,7 +22,7 @@ const MAX_LOCAL_LIST_LINE: u64 = 1024 * 1024;
 fn list_too_large() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "필터 목록이 128MiB 크기 제한을 넘었습니다",
+        "Filter list exceeds the 128 MiB size limit",
     )
 }
 
@@ -33,7 +33,7 @@ fn read_list_line(reader: &mut impl BufRead, line: &mut String) -> std::io::Resu
     if read as u64 > MAX_LOCAL_LIST_LINE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "필터 규칙 한 줄이 1MiB 크기 제한을 넘었습니다",
+            "Filter rule line exceeds the 1 MiB size limit",
         ));
     }
     Ok(read)
@@ -227,10 +227,7 @@ fn parse_mods<'a>(mods: &[&'a str], acc: &mut Accum, line: &str) -> Option<RuleM
                 }
             }
         } else {
-            onetdns_core::trace!(
-                modifier = m,
-                "지원하지 않는 규칙 조건이 있어 해당 규칙을 제외했습니다"
-            );
+            onetdns_core::trace!(modifier = m, "Excluded a rule with an unsupported modifier");
             let key = m.split('=').next().unwrap_or(m).trim_start_matches('~');
             acc.parts.report.rules_skipped += 1;
             if is_network_modifier(key) {
@@ -250,7 +247,7 @@ fn parse_mods<'a>(mods: &[&'a str], acc: &mut Accum, line: &str) -> Option<RuleM
         onetdns_core::debug!(
             event = "filter.dnstype_rule_invalid",
             rule = line,
-            "dnstype 조건에 유효한 DNS 레코드 형식이 없어 해당 규칙을 제외했습니다"
+            "Excluded a rule whose dnstype modifier has no valid record type"
         );
         acc.parts.report.rules_skipped += 1;
         acc.parts.report.invalid_pattern += 1;
@@ -370,7 +367,7 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
             return;
         };
         if let Err(error) = Regex::new(pat) {
-            onetdns_core::debug!(event = "filter.regex_rule_invalid", pat, %error, "정규식 규칙을 준비하지 못해 해당 규칙을 제외했습니다");
+            onetdns_core::debug!(event = "filter.regex_rule_invalid", pat, %error, "Could not compile a regex rule; excluded it");
             acc.parts.report.rules_skipped += 1;
             acc.parts.report.invalid_regex += 1;
             return;
@@ -757,13 +754,13 @@ fn apply_badfilter(acc: &mut Accum) {
 pub fn validate_rule(line: &str) -> Result<(), String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-        return Err("빈 규칙 또는 주석입니다".to_string());
+        return Err("Empty rule or comment".to_string());
     }
 
     let body = trimmed.strip_prefix("@@").unwrap_or(trimmed);
     if body.starts_with('/') {
         let Some((pat, _)) = split_regex_rule(body) else {
-            return Err("정규식 규칙에 닫는 슬래시가 없습니다".to_string());
+            return Err("Regex rule is missing its closing slash".to_string());
         };
         if let Err(error) = Regex::new(pat) {
             return Err(error.to_string());
@@ -777,15 +774,15 @@ pub fn validate_rule(line: &str) -> Result<(), String> {
         return Ok(());
     }
     if let Some(name) = report.unsupported_modifier.keys().next() {
-        return Err(format!("지원하지 않는 수식어: ${name}"));
+        return Err(format!("Unsupported modifier: ${name}"));
     }
     if report.not_applicable > 0 {
-        return Err("DNS 필터링에는 적용되지 않는 수식어입니다".to_string());
+        return Err("Modifier does not apply to DNS filtering".to_string());
     }
     if report.invalid_regex > 0 {
-        return Err("잘못된 정규식 규칙입니다".to_string());
+        return Err("Invalid regex rule".to_string());
     }
-    Err("유효한 도메인 또는 규칙 패턴이 아닙니다".to_string())
+    Err("Not a valid domain or rule pattern".to_string())
 }
 
 /**
@@ -1047,7 +1044,7 @@ pub fn load_parts_with_subscriptions(
             std::io::Error::new(
                 error.kind(),
                 format!(
-                    "차단 목록 '{}'을 읽거나 검증하지 못했습니다: {error}",
+                    "Could not read or validate blocklist '{}': {error}",
                     path.as_ref().display()
                 ),
             )
@@ -1058,7 +1055,7 @@ pub fn load_parts_with_subscriptions(
                 std::io::Error::new(
                     error.kind(),
                     format!(
-                        "차단 목록 '{}'을 읽지 못했습니다: {error}",
+                        "Could not read blocklist '{}': {error}",
                         path.as_ref().display()
                     ),
                 )
@@ -1070,7 +1067,7 @@ pub fn load_parts_with_subscriptions(
             std::io::Error::new(
                 error.kind(),
                 format!(
-                    "허용 목록 '{}'을 읽거나 검증하지 못했습니다: {error}",
+                    "Could not read or validate allowlist '{}': {error}",
                     path.as_ref().display()
                 ),
             )
@@ -1081,7 +1078,7 @@ pub fn load_parts_with_subscriptions(
                 std::io::Error::new(
                     error.kind(),
                     format!(
-                        "허용 목록 '{}'을 읽지 못했습니다: {error}",
+                        "Could not read allowlist '{}': {error}",
                         path.as_ref().display()
                     ),
                 )
@@ -1096,7 +1093,7 @@ pub fn load_parts_with_subscriptions(
                     std::io::Error::new(
                         error.kind(),
                         format!(
-                            "구독 차단 목록 캐시 '{}'을 읽거나 검증하지 못했습니다: {error}",
+                            "Could not read or validate subscription blocklist cache '{}': {error}",
                             path.display()
                         ),
                     )
@@ -1106,7 +1103,7 @@ pub fn load_parts_with_subscriptions(
                         std::io::Error::new(
                             error.kind(),
                             format!(
-                                "구독 차단 목록 캐시 '{}'을 읽지 못했습니다: {error}",
+                                "Could not read subscription blocklist cache '{}': {error}",
                                 path.display()
                             ),
                         )

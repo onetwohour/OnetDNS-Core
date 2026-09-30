@@ -84,7 +84,7 @@ pub fn catch_request<T>(f: impl FnOnce() -> T) -> Result<T, RequestPanicked> {
                 crate::error!(
                     event = "request.panic_isolated",
                     count,
-                    "질의 처리 중 예기치 않은 오류를 격리하고 처리 스레드를 계속 실행합니다"
+                    "Contained an unexpected error while handling a query; the worker thread keeps running"
                 );
             }
             Err(RequestPanicked)

@@ -341,7 +341,7 @@ impl Drop for WireEntry {
         fence(Ordering::Acquire);
         let storage_len = self.header().storage_len as usize;
         let layout = wire_allocation_layout(storage_len)
-            .expect("생성 시 검증한 wire 캐시 할당 layout이어야 합니다");
+            .expect("The wire cache allocation layout was validated when it was created");
 
         unsafe {
             std::ptr::drop_in_place(self.0.as_ptr());
@@ -406,7 +406,7 @@ impl WireEntry {
         assert_eq!(
             self.header().refs.load(Ordering::Acquire),
             1,
-            "공유된 wire 캐시 할당은 변경할 수 없습니다"
+            "A shared wire cache allocation cannot be modified"
         );
         let len = self.header().storage_len as usize;
 
@@ -446,7 +446,7 @@ impl WireEntry {
     /** @brief 질의 기록에 남길 답변 요약. */
     pub(crate) fn answers_summary(&self) -> &str {
         std::str::from_utf8(&self.storage()[self.ttl_metadata_end()..])
-            .expect("String에서 복사한 wire 캐시 답변 요약은 UTF-8이어야 합니다")
+            .expect("A wire cache answer summary copied from a String is UTF-8")
     }
 
     /** @brief 저장한 뒤 흐른 초. */
@@ -761,8 +761,8 @@ fn walk_response(wire: &[u8]) -> Option<(Vec<(u32, u32)>, u32)> {
 pub(crate) fn random_shard_hash_keys() -> [u64; 2] {
     let seed = onetdns_core::random_array::<16>();
     [
-        u64::from_le_bytes(seed[..8].try_into().expect("고정 시드 길이")),
-        u64::from_le_bytes(seed[8..].try_into().expect("고정 시드 길이")),
+        u64::from_le_bytes(seed[..8].try_into().expect("Fixed seed length")),
+        u64::from_le_bytes(seed[8..].try_into().expect("Fixed seed length")),
     ]
 }
 

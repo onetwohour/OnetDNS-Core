@@ -37,7 +37,7 @@ pub fn send_initial_unicast(
         );
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "이 운영체제에는 DHCPv4 L2 유니캐스트 송신기가 없습니다",
+            "This operating system has no DHCPv4 L2 unicast sender",
         ))
     }
 }
@@ -145,7 +145,7 @@ fn checksum(parts: &[&[u8]]) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !u16::try_from(sum).expect("carry fold 뒤 체크섬은 16비트")
+    !u16::try_from(sum).expect("The checksum fits in 16 bits after the carry fold")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -165,10 +165,10 @@ fn build_frame(
         .checked_add(payload.len())
         .and_then(|length| u16::try_from(length).ok())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "DHCP UDP 응답이 너무 큽니다")
+            io::Error::new(io::ErrorKind::InvalidInput, "DHCP UDP reply is too large")
         })?;
     let ip_len = u16::try_from(IPV4_LEN + usize::from(udp_len))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DHCP IPv4 응답이 너무 큽니다"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DHCP IPv4 reply is too large"))?;
     let mut frame = vec![0u8; ETHERNET_LEN + usize::from(ip_len)];
 
     frame[..6].copy_from_slice(&target_mac);
@@ -234,7 +234,7 @@ mod linux {
                 libc::IP_PKTINFO,
                 (&raw const on).cast(),
                 libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-                    .expect("int 크기는 socklen_t 범위"),
+                    .expect("The size of int fits in socklen_t"),
             )
         };
         if result != 0 {
@@ -252,7 +252,7 @@ mod linux {
         buf: &mut [u8],
     ) -> io::Result<(usize, Option<u32>)> {
         let info_len = u32::try_from(std::mem::size_of::<libc::in_pktinfo>())
-            .expect("in_pktinfo 크기는 u32 범위");
+            .expect("The size of in_pktinfo fits in u32");
         // SAFETY: CMSG_SPACE는 길이만 계산한다.
         let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
         let mut control = vec![0u8; space];
@@ -307,7 +307,7 @@ mod linux {
         destination.sin_addr.s_addr = u32::from_ne_bytes(Ipv4Addr::BROADCAST.octets());
         let info = libc::in_pktinfo {
             ipi_ifindex: i32::try_from(index).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "인터페이스 번호가 너무 큽니다")
+                io::Error::new(io::ErrorKind::InvalidInput, "Interface index is too large")
             })?,
             ipi_spec_dst: libc::in_addr {
                 s_addr: u32::from_ne_bytes(server_ip.octets()),
@@ -315,7 +315,7 @@ mod linux {
             ipi_addr: libc::in_addr { s_addr: 0 },
         };
         let info_len = u32::try_from(std::mem::size_of::<libc::in_pktinfo>())
-            .expect("in_pktinfo 크기는 u32 범위");
+            .expect("The size of in_pktinfo fits in u32");
         // SAFETY: CMSG_SPACE는 길이만 계산한다.
         let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
         let mut control = vec![0u8; space];
@@ -327,7 +327,7 @@ mod linux {
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_name = (&raw mut destination).cast();
         message.msg_namelen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>())
-            .expect("sockaddr_in 크기는 socklen_t 범위");
+            .expect("The size of sockaddr_in fits in socklen_t");
         message.msg_iov = &raw mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
@@ -348,7 +348,7 @@ mod linux {
         if usize::try_from(sent).ok() != Some(payload.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "DHCP 방송이 일부만 전송됐습니다",
+                "DHCP broadcast was only partly sent",
             ));
         }
         Ok(())
@@ -408,7 +408,7 @@ mod linux {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
-                    format!("DHCP 서버 주소 {server_ip}가 로컬 인터페이스에 없습니다"),
+                    format!("DHCP server address {server_ip} is not on any local interface"),
                 )
             })?;
         // SAFETY: name은 NUL 종료 문자열이며 libc는 읽기만 한다.
@@ -444,7 +444,7 @@ mod linux {
         Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             format!(
-                "DHCP 인터페이스 {}의 Ethernet MAC을 찾지 못했습니다",
+                "Could not find the Ethernet MAC of DHCP interface {}",
                 name.to_string_lossy()
             ),
         ))
@@ -485,7 +485,7 @@ mod linux {
         address.sll_family = libc::AF_PACKET as u16;
         address.sll_protocol = ETH_P_IP.to_be();
         address.sll_ifindex = i32::try_from(interface_index).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "인터페이스 번호가 너무 큽니다")
+            io::Error::new(io::ErrorKind::InvalidInput, "Interface index is too large")
         })?;
         address.sll_halen = 6;
         address.sll_addr[..6].copy_from_slice(&target_mac);
@@ -498,7 +498,7 @@ mod linux {
                 0,
                 (&raw const address).cast::<libc::sockaddr>(),
                 libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_ll>())
-                    .expect("sockaddr_ll 크기는 socklen_t 범위"),
+                    .expect("The size of sockaddr_ll fits in socklen_t"),
             )
         };
         if sent < 0 {
@@ -507,7 +507,7 @@ mod linux {
         if usize::try_from(sent).ok() != Some(frame.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "DHCP Ethernet 프레임이 일부만 전송됐습니다",
+                "DHCP Ethernet frame was only partly sent",
             ));
         }
         Ok(())
@@ -620,7 +620,7 @@ mod windows {
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Windows IP Helper 테이블 크기가 올바르지 않습니다",
+                        "Windows IP Helper table size is invalid",
                     )
                 })?;
             let words = bytes.div_ceil(std::mem::size_of::<usize>());
@@ -646,7 +646,7 @@ mod windows {
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Windows IP Helper 테이블 항목 수가 너무 큽니다",
+                        "Windows IP Helper table has too many entries",
                     )
                 })?;
             if required > usize::try_from(actual).unwrap_or(0)
@@ -654,7 +654,7 @@ mod windows {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Windows IP Helper 테이블이 중간에서 잘렸습니다",
+                    "Windows IP Helper table is truncated",
                 ));
             }
             let rows = (table as *const u8).wrapping_add(row_offset).cast::<Row>();
@@ -667,7 +667,7 @@ mod windows {
         }
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "Windows IP Helper 테이블이 읽는 동안 계속 커졌습니다",
+            "Windows IP Helper table kept growing while being read",
         ))
     }
 
@@ -694,7 +694,7 @@ mod windows {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                format!("DHCP 서버 주소 {server_ip}가 로컬 인터페이스에 없습니다"),
+                format!("DHCP server address {server_ip} is not on any local interface"),
             )
         })
     }
@@ -714,7 +714,7 @@ mod windows {
                         ip = %Ipv4Addr::from(self.temporary.address.to_ne_bytes()),
                         interface = self.temporary.index,
                         %error,
-                        "초기 DHCP 유니캐스트 뒤 Windows ARP 항목의 현재 소유자를 확인하지 못해 건드리지 않습니다"
+                        "Could not check who owns the Windows ARP entry after an initial DHCP unicast; leaving it alone"
                     );
                     return;
                 }
@@ -743,7 +743,7 @@ mod windows {
                     ip = %Ipv4Addr::from(self.temporary.address.to_ne_bytes()),
                     interface = self.temporary.index,
                     error = %error(result),
-                    "초기 DHCP 유니캐스트 뒤 Windows ARP 항목을 원래 상태로 돌리지 못했습니다"
+                    "Could not restore the Windows ARP entry after an initial DHCP unicast"
                 );
             }
         }
@@ -764,7 +764,8 @@ mod windows {
                     IPPROTO_IP,
                     IP_UNICAST_IF,
                     (&raw const previous).cast(),
-                    i32::try_from(std::mem::size_of::<u32>()).expect("DWORD 크기는 i32 범위"),
+                    i32::try_from(std::mem::size_of::<u32>())
+                        .expect("The size of DWORD fits in i32"),
                 )
             } == SOCKET_ERROR
             {
@@ -772,7 +773,7 @@ mod windows {
                     event = "dhcp4.interface_restore_failed",
                     interface = self.previous,
                     error = %socket_error(),
-                    "초기 DHCP 유니캐스트 뒤 Windows 송신 인터페이스를 원래 값으로 돌리지 못했습니다"
+                    "Could not restore the Windows outgoing interface after an initial DHCP unicast"
                 );
             }
         }
@@ -780,7 +781,8 @@ mod windows {
 
     fn current_interface(socket: RawSocket) -> io::Result<u32> {
         let mut previous = 0u32;
-        let mut length = i32::try_from(std::mem::size_of::<u32>()).expect("DWORD 크기는 i32 범위");
+        let mut length =
+            i32::try_from(std::mem::size_of::<u32>()).expect("The size of DWORD fits in i32");
         // SAFETY: previous와 length는 4바이트 socket option의 유효한 출력 버퍼다.
         if unsafe {
             getsockopt(
@@ -794,11 +796,12 @@ mod windows {
         {
             return Err(socket_error());
         }
-        if length != i32::try_from(std::mem::size_of::<u32>()).expect("DWORD 크기는 i32 범위")
+        if length
+            != i32::try_from(std::mem::size_of::<u32>()).expect("The size of DWORD fits in i32")
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Windows IP_UNICAST_IF 값의 크기가 올바르지 않습니다",
+                "Windows IP_UNICAST_IF value has an invalid size",
             ));
         }
         Ok(previous)
@@ -808,7 +811,7 @@ mod windows {
         if index == 0 || index > 0x00ff_ffff {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Windows IPv4 인터페이스 번호가 24비트 범위를 벗어났습니다",
+                "Windows IPv4 interface index does not fit in 24 bits",
             ));
         }
         let socket = socket.as_raw_socket();
@@ -821,7 +824,7 @@ mod windows {
                 IPPROTO_IP,
                 IP_UNICAST_IF,
                 (&raw const network_index).cast(),
-                i32::try_from(std::mem::size_of::<u32>()).expect("DWORD 크기는 i32 범위"),
+                i32::try_from(std::mem::size_of::<u32>()).expect("The size of DWORD fits in i32"),
             )
         } == SOCKET_ERROR
         {
@@ -873,7 +876,7 @@ mod windows {
         if sent != payload.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "DHCP UDP 응답이 일부만 전송됐습니다",
+                "DHCP UDP reply was only partly sent",
             ));
         }
         Ok(())

@@ -52,9 +52,9 @@ pub fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], out_len: u
     info.push(context.len() as u8);
     info.extend_from_slice(context);
 
-    let hk = hkdf::Hkdf::<Sha256>::from_prk(secret).expect("PRK 길이");
+    let hk = hkdf::Hkdf::<Sha256>::from_prk(secret).expect("PRK length");
     let mut out = vec![0u8; out_len];
-    hk.expand(&info, &mut out).expect("HKDF expand 길이");
+    hk.expand(&info, &mut out).expect("HKDF expand length");
     out
 }
 

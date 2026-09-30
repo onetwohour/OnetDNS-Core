@@ -272,7 +272,7 @@ pub(crate) fn new_client_connection(
         random_cid(),
         TransportParams::server_defaults(),
     )
-    .map_err(|_| ForwardError::Io("QUIC 클라이언트를 만들지 못했습니다".into()))?;
+    .map_err(|_| ForwardError::Io("Could not create QUIC client".into()))?;
     Ok((QuicSocket { sock, wait }, conn))
 }
 
@@ -314,7 +314,7 @@ pub(crate) fn recv_once<D: QuicDriven>(
     match sock.wait.recv(&sock.sock, buf) {
         Ok(n) => {
             d.recv_datagram(&buf[..n]).map_err(|error| {
-                ForwardError::Io(format!("QUIC 데이터그램을 처리하지 못했습니다: {error}"))
+                ForwardError::Io(format!("Could not process QUIC datagram: {error}"))
             })?;
             Ok(true)
         }
@@ -341,10 +341,8 @@ pub(crate) fn pump_handshake<D: QuicDriven>(
         if d.is_closed() {
             let detail = d
                 .close_detail()
-                .unwrap_or_else(|| "까닭을 남기지 않고 닫혔습니다".into());
-            return Err(ForwardError::Io(format!(
-                "QUIC 보안 연결을 설정하지 못했습니다: {detail}"
-            )));
+                .unwrap_or_else(|| "Closed without a reason".into());
+            return Err(ForwardError::Io(format!("QUIC handshake failed: {detail}")));
         }
         if d.is_handshake_complete() && d.can_send_app() {
             d.set_now(created.elapsed().as_millis() as u64);

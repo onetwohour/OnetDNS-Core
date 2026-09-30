@@ -184,7 +184,7 @@ impl<'a> P<'a> {
      */
     fn value(&mut self, depth: usize) -> Result<Json, String> {
         if depth > MAX_JSON_DEPTH {
-            return Err("JSON 중첩 깊이가 허용 한도를 넘었습니다".into());
+            return Err("JSON nesting is too deep".into());
         }
         self.ws();
         match self.s.get(self.i) {
@@ -195,11 +195,14 @@ impl<'a> P<'a> {
             Some(b'f') => self.lit("false", Json::Bool(false)),
             Some(b'n') => self.lit("null", Json::Null),
             Some(c) if *c == b'-' || c.is_ascii_digit() => self.number(),
-            None => Err("값을 읽기 전에 입력이 끝났습니다".into()),
-            Some(c) if c.is_ascii_graphic() => {
-                Err(format!("값이 올 곳에 '{}'가 있습니다", *c as char))
-            }
-            Some(c) => Err(format!("값이 올 곳에 0x{c:02x} 바이트가 있습니다")),
+            None => Err("Input ended before a value".into()),
+            Some(c) if c.is_ascii_graphic() => Err(format!(
+                "Unexpected '{}' where a value was expected",
+                *c as char
+            )),
+            Some(c) => Err(format!(
+                "Unexpected byte 0x{c:02x} where a value was expected"
+            )),
         }
     }
     /** @brief true/false/null 키워드를 정확히 대조해 읽는다. */
@@ -212,7 +215,7 @@ impl<'a> P<'a> {
             self.i += kw.len();
             Ok(v)
         } else {
-            Err(format!("'{kw}' 값이 필요합니다"))
+            Err(format!("Expected '{kw}'"))
         }
     }
     /**
@@ -230,7 +233,7 @@ impl<'a> P<'a> {
             match c {
                 b'"' => return Ok(out),
                 b'\\' => {
-                    let e = *self.s.get(self.i).ok_or("escape 끝")?;
+                    let e = *self.s.get(self.i).ok_or("Input ended inside an escape")?;
                     self.i += 1;
                     match e {
                         b'"' => out.push('"'),
@@ -246,57 +249,53 @@ impl<'a> P<'a> {
                             let cp = if (0xd800..=0xdbff).contains(&first) {
                                 if self.s.get(self.i..self.i.saturating_add(2)) != Some(b"\\u") {
                                     return Err(
-                                        "high surrogate 뒤에 low surrogate가 없습니다".into()
+                                        "High surrogate is not followed by a low surrogate".into(),
                                     );
                                 }
                                 self.i += 2;
                                 let second = self.hex4()?;
                                 if !(0xdc00..=0xdfff).contains(&second) {
-                                    return Err("잘못된 low surrogate".into());
+                                    return Err("Invalid low surrogate".into());
                                 }
                                 0x1_0000
                                     + (((first as u32 - 0xd800) << 10) | (second as u32 - 0xdc00))
                             } else if (0xdc00..=0xdfff).contains(&first) {
-                                return Err("단독 low surrogate".into());
+                                return Err("Lone low surrogate".into());
                             } else {
                                 first as u32
                             };
-                            out.push(char::from_u32(cp).ok_or("잘못된 Unicode escape")?);
+                            out.push(char::from_u32(cp).ok_or("Invalid Unicode escape")?);
                         }
-                        _ => return Err("지원하지 않는 JSON escape".into()),
+                        _ => return Err("Unsupported JSON escape".into()),
                     }
                 }
-                0x00..=0x1f => return Err("JSON 문자열에 제어 문자 존재".into()),
+                0x00..=0x1f => return Err("JSON string contains a control character".into()),
                 c if c.is_ascii() => out.push(c as char),
                 _ => {
                     self.i -= 1;
                     let tail = std::str::from_utf8(&self.s[self.i..])
-                        .map_err(|_| "JSON 문자열 UTF-8 형식이 올바르지 않습니다")?;
+                        .map_err(|_| "JSON string is not valid UTF-8")?;
                     let ch = tail
                         .chars()
                         .next()
-                        .ok_or("JSON 문자열 UTF-8 형식이 올바르지 않습니다")?;
+                        .ok_or("JSON string is not valid UTF-8")?;
                     self.i += ch.len_utf8();
                     out.push(ch);
                 }
             }
         }
-        Err("문자열을 닫는 따옴표가 없습니다".into())
+        Err("String is missing its closing quote".into())
     }
     /** @brief \u 뒤의 4자리 16진수를 읽는다. 정확히 4자리가 아니면 오류다. */
     fn hex4(&mut self) -> Result<u16, String> {
-        let end = self
-            .i
-            .checked_add(4)
-            .ok_or("Unicode escape 계산 범위를 넘었습니다")?;
+        let end = self.i.checked_add(4).ok_or("Unicode escape overflowed")?;
         let raw = self
             .s
             .get(self.i..end)
-            .ok_or("Unicode escape가 4자리보다 너무 짧습니다")?;
-        let hex = std::str::from_utf8(raw)
-            .map_err(|_| "Unicode escape UTF-8 형식이 올바르지 않습니다")?;
+            .ok_or("Unicode escape is shorter than 4 digits")?;
+        let hex = std::str::from_utf8(raw).map_err(|_| "Unicode escape is not valid UTF-8")?;
         let value =
-            u16::from_str_radix(hex, 16).map_err(|_| "Unicode escape가 16진수가 아닙니다")?;
+            u16::from_str_radix(hex, 16).map_err(|_| "Unicode escape is not hexadecimal")?;
         self.i = end;
         Ok(value)
     }
@@ -318,7 +317,7 @@ impl<'a> P<'a> {
                     self.i += 1;
                 }
             }
-            _ => return Err("JSON 숫자의 정수 부분이 올바르지 않습니다".into()),
+            _ => return Err("Invalid integer part in JSON number".into()),
         }
         if self.s.get(self.i) == Some(&b'.') {
             self.i += 1;
@@ -327,7 +326,7 @@ impl<'a> P<'a> {
                 self.i += 1;
             }
             if self.i == fraction_start {
-                return Err("JSON 숫자의 소수 부분이 올바르지 않습니다".into());
+                return Err("Invalid fraction part in JSON number".into());
             }
         }
         if matches!(self.s.get(self.i), Some(b'e' | b'E')) {
@@ -340,14 +339,14 @@ impl<'a> P<'a> {
                 self.i += 1;
             }
             if self.i == exponent_start {
-                return Err("JSON 숫자의 지수 부분이 올바르지 않습니다".into());
+                return Err("Invalid exponent part in JSON number".into());
             }
         }
         let number = std::str::from_utf8(&self.s[start..self.i])
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|number| number.is_finite())
-            .ok_or_else(|| "JSON 숫자가 표현 가능한 범위를 벗어났습니다".to_string())?;
+            .ok_or_else(|| "JSON number is out of range".to_string())?;
         Ok(Json::Num(number))
     }
     /** @brief 배열을 읽는다. 항목 수 상한을 넘으면 중단한다. */
@@ -361,7 +360,7 @@ impl<'a> P<'a> {
                 return Ok(Json::Arr(out));
             }
             if out.len() >= MAX_JSON_ITEMS {
-                return Err("JSON 배열의 항목 수가 허용 한도를 넘었습니다".into());
+                return Err("JSON array has too many items".into());
             }
             out.push(self.value(depth)?);
             self.ws();
@@ -371,7 +370,7 @@ impl<'a> P<'a> {
                     self.i += 1;
                     return Ok(Json::Arr(out));
                 }
-                _ => return Err("JSON 배열의 쉼표 또는 닫는 대괄호가 올바르지 않습니다".into()),
+                _ => return Err("Expected ',' or ']' in JSON array".into()),
             }
         }
     }
@@ -391,21 +390,21 @@ impl<'a> P<'a> {
                 return Ok(Json::Obj(out));
             }
             if out.len() >= MAX_JSON_ITEMS {
-                return Err("JSON 객체의 항목 수가 허용 한도를 넘었습니다".into());
+                return Err("JSON object has too many entries".into());
             }
             self.ws();
             if self.s.get(self.i) != Some(&b'"') {
-                return Err("객체 키는 문자열".into());
+                return Err("Object keys must be strings".into());
             }
             let key = self.string()?;
             self.ws();
             if self.s.get(self.i) != Some(&b':') {
-                return Err("객체 항목에서 ':'이 빠져 있습니다".into());
+                return Err("Object entry is missing ':'".into());
             }
             self.i += 1;
             let val = self.value(depth)?;
             if !seen.insert(key.clone()) {
-                return Err("JSON 객체에 중복 키 존재".into());
+                return Err("JSON object has a duplicate key".into());
             }
             out.push((key, val));
             self.ws();
@@ -415,7 +414,7 @@ impl<'a> P<'a> {
                     self.i += 1;
                     return Ok(Json::Obj(out));
                 }
-                _ => return Err("JSON 객체의 쉼표 또는 닫는 중괄호가 올바르지 않습니다".into()),
+                _ => return Err("Expected ',' or '}' in JSON object".into()),
             }
         }
     }
@@ -434,7 +433,7 @@ pub fn parse(s: &str) -> Result<Json, String> {
  */
 pub fn parse_with_limit(s: &str, max_bytes: usize) -> Result<Json, String> {
     if s.len() > max_bytes {
-        return Err("JSON 입력 크기가 허용 한도를 넘었습니다".into());
+        return Err("JSON input is too large".into());
     }
     let mut p = P {
         s: s.as_bytes(),
@@ -443,7 +442,7 @@ pub fn parse_with_limit(s: &str, max_bytes: usize) -> Result<Json, String> {
     let value = p.value(0)?;
     p.ws();
     if p.i != p.s.len() {
-        return Err("JSON 뒤에 불필요한 데이터".into());
+        return Err("Trailing data after JSON".into());
     }
     Ok(value)
 }

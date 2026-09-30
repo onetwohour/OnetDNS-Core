@@ -227,9 +227,10 @@ pub(crate) fn ensure_raft_runtime(
     reload: Arc<std::sync::atomic::AtomicBool>,
     hot_apply: Option<HotConfigApply>,
 ) -> Result<(), String> {
-    let listen = cfg.cluster_raft_listen.clone().ok_or(
-        "Raft 고가용성이 켜져 있지만 수신 주소(`cluster_raft_listen`)가 설정되어 있지 않습니다",
-    )?;
+    let listen = cfg
+        .cluster_raft_listen
+        .clone()
+        .ok_or("Raft is enabled but no listen address (cluster_raft_listen) is set")?;
     let mut peers: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut peer_keys: std::collections::HashMap<u64, [u8; 32]> = std::collections::HashMap::new();
     let mut ids = vec![cfg.cluster_node_id];
@@ -245,7 +246,7 @@ pub(crate) fn ensure_raft_runtime(
         }
     }
     let node_seed = hex32(cfg.cluster_raft_node_key.trim()).ok_or(
-        "cluster_raft_node_key에는 32바이트 Ed25519 시드를 64자리 16진수로 입력해야 합니다",
+        "cluster_raft_node_key must be a 32-byte Ed25519 seed written as 64 hexadecimal digits",
     )?;
     let state_path = path
         .as_ref()
@@ -285,7 +286,7 @@ pub(crate) fn ensure_raft_runtime(
                 event = "raft.consensus_reused",
                 node = cfg.cluster_node_id,
                 changed_during_start,
-                "DNS 서비스 구성을 교체하면서 기존 Raft 합의 런타임을 유지합니다"
+                "Keeping the running Raft consensus runtime across the DNS service restart"
             );
             return Ok(());
         }
@@ -315,7 +316,7 @@ pub(crate) fn ensure_raft_runtime(
     )
     .map_err(|error| {
         format!(
-            "디스크에서 Raft 상태를 복구하지 못했습니다({}): {error}",
+            "Could not recover Raft state from disk ({}): {error}",
             state_path.display()
         )
     })?;
@@ -372,7 +373,7 @@ pub(crate) fn ensure_raft_runtime(
         create_snapshot,
         install_snapshot,
     )
-    .map_err(|error| format!("Raft 고가용성 기능을 시작하지 못했습니다: {error}"))?;
+    .map_err(|error| format!("Could not start Raft: {error}"))?;
     *raft_slot().lock_recover() = Some(RaftRuntime {
         identity,
         apply: apply_context,
@@ -383,7 +384,7 @@ pub(crate) fn ensure_raft_runtime(
         listen = %listen,
         peers = cfg.cluster_raft_peers.len(),
         changed_during_start,
-        "Raft 클러스터 합의를 시작합니다(리더 선출 및 로그 복제)"
+        "Starting Raft cluster consensus (leader election and log replication)"
     );
     Ok(())
 }
@@ -395,11 +396,11 @@ pub(crate) fn ensure_raft_runtime(
  */
 pub(crate) fn validate_raft_patch_scope(value: &onetdns_core::json::Json) -> Result<(), String> {
     let onetdns_core::json::Json::Obj(pairs) = value else {
-        return Err("Raft로 전달하는 설정 변경 내용은 JSON 객체여야 합니다".to_string());
+        return Err("A configuration change sent through Raft must be a JSON object".to_string());
     };
     if let Some((key, _)) = pairs.iter().find(|(key, _)| config_keys::node_local(key)) {
         return Err(format!(
-            "{key}는 노드마다 따로 두는 설정이라 Raft로 복제할 수 없습니다. 각 노드에서 별도로 설정하십시오"
+            "{key} is a per-node setting and cannot be replicated through Raft; set it on each node"
         ));
     }
     Ok(())
@@ -460,9 +461,9 @@ fn cluster_write_error(status: &'static str, message: String) -> onetdns_control
 fn cluster_not_leader_message(leader: Option<u64>) -> String {
     match leader {
         Some(id) => format!(
-            "이 노드는 Raft 리더가 아니므로 클러스터 전체에 적용되는 설정을 바꿀 수 없습니다. 리더인 {id}번 노드의 관리 화면에서 변경하십시오"
+            "This node is not the Raft leader, so cluster-wide settings cannot be changed here; make the change on the dashboard of node {id}, the current leader"
         ),
-        None => "Raft 리더를 선출하는 중이라 클러스터 전체에 적용되는 설정을 바꿀 수 없습니다. 잠시 후 다시 시도하십시오".to_string(),
+        None => "A Raft leader election is in progress, so cluster-wide settings cannot be changed; try again shortly".to_string(),
     }
 }
 
@@ -530,9 +531,9 @@ pub(crate) fn cluster_routed_write(
     let read = |when: &str| {
         Config::read_text(&config_path)
             .map(onetdns_core::SecretString::from)
-            .map_err(|error| format!("{when} 설정 파일을 읽지 못했습니다: {error}"))
+            .map_err(|error| format!("Could not read the configuration file {when}: {error}"))
     };
-    let before = match read("요청을 처리하기 전에") {
+    let before = match read("before handling the request") {
         Ok(text) => text,
         Err(error) => return cluster_write_error("503 Service Unavailable", error),
     };
@@ -541,8 +542,8 @@ pub(crate) fn cluster_routed_write(
     if !response.0.starts_with('2') {
         return response;
     }
-    let changes =
-        read("요청을 처리한 뒤").and_then(|after| cluster_config_changes(&before, &after));
+    let changes = read("after handling the request")
+        .and_then(|after| cluster_config_changes(&before, &after));
     let (status, message) = match changes {
         Ok(changes) if changes.is_empty() => return response,
         Ok(_) if !leader => ("409 Conflict", cluster_not_leader_message(handle.leader())),
@@ -560,29 +561,31 @@ pub(crate) fn cluster_routed_write(
                 Ok(_) => return response,
                 Err(onetdns_cluster::transport::ProposalError::Undetermined(error)) => (
                     "503 Service Unavailable",
-                    format!("Raft 클러스터가 이 변경을 합의했는지 아직 확인하지 못해 이 노드에서는 되돌렸습니다({error}). 과반의 노드가 연결되어 합의되면 그때 모든 노드에 적용되고, 합의되지 않으면 적용되지 않습니다. 잠시 뒤 설정을 다시 확인하십시오"),
+                    format!("Could not yet confirm that the Raft cluster agreed on this change, so it was reverted on this node ({error}). If a majority of nodes connect and agree, it will be applied to every node; otherwise it will not be applied. Check the configuration again shortly"),
                 ),
                 Err(error) => (
                     "503 Service Unavailable",
-                    format!("변경 내용이 Raft 클러스터에 합의되지 않아 이 노드의 변경도 되돌렸습니다: {error}"),
+                    format!("The Raft cluster did not agree on the change, so it was reverted on this node too: {error}"),
                 ),
             }
         }
         Err(error) => (
             "503 Service Unavailable",
-            format!("변경 내용을 Raft 클러스터에 올릴 수 없어 되돌렸습니다: {error}"),
+            format!("Could not submit the change to the Raft cluster, so it was reverted: {error}"),
         ),
     };
     let message = match context.restore_text(&before, previous_slot) {
         Ok(()) => message,
-        Err(error) => format!("{message}. 이 노드의 설정 파일을 되돌리지도 못했습니다: {error}"),
+        Err(error) => {
+            format!("{message}. Reverting this node's configuration file also failed: {error}")
+        }
     };
     onetdns_core::warn!(
         event = "raft.write_rejected",
         method = %method,
         path = %path,
         reason = %message,
-        "Raft 에 커밋되지 않은 관리 요청을 되돌렸습니다"
+        "Rolled back a management request that Raft did not commit"
     );
     cluster_write_error(status, message)
 }
@@ -613,20 +616,20 @@ impl RaftConfigSnapshot {
     /** @brief 스냅숏을 바이트로 인코딩한다. */
     fn encode(&self) -> Result<Vec<u8>, String> {
         if self.values.is_empty() || self.values.len() > MAX_RAFT_SNAPSHOT_KEYS {
-            return Err("Raft 설정 스냅샷 항목 수가 허용 범위를 벗어났습니다".into());
+            return Err("Raft configuration snapshot has too many or too few entries".into());
         }
         let mut out = Vec::new();
         out.extend_from_slice(RAFT_CONFIG_SNAPSHOT_MAGIC);
         out.extend_from_slice(&(self.values.len() as u32).to_be_bytes());
         for (key, value) in &self.values {
             if key.is_empty() || key.len() > 128 || key.len() > u16::MAX as usize {
-                return Err("Raft 설정 스냅샷 키가 올바르지 않습니다".into());
+                return Err("Raft configuration snapshot has an invalid key".into());
             }
             out.extend_from_slice(&(key.len() as u16).to_be_bytes());
             out.extend_from_slice(key.as_bytes());
             encode_raft_snapshot_value(value, &mut out, 0)?;
             if out.len() > onetdns_cluster::raft::MAX_SNAPSHOT_BYTES {
-                return Err("Raft 설정 스냅샷이 허용 크기를 넘었습니다".into());
+                return Err("Raft configuration snapshot exceeds the size limit".into());
             }
         }
         Ok(out)
@@ -638,29 +641,29 @@ impl RaftConfigSnapshot {
             || bytes.get(..RAFT_CONFIG_SNAPSHOT_MAGIC.len())
                 != Some(RAFT_CONFIG_SNAPSHOT_MAGIC.as_slice())
         {
-            return Err("Raft 설정 스냅샷 헤더가 올바르지 않습니다".into());
+            return Err("Raft configuration snapshot has an invalid header".into());
         }
         let mut pos = RAFT_CONFIG_SNAPSHOT_MAGIC.len();
         let count = raft_snapshot_take_u32(bytes, &mut pos)? as usize;
         if count == 0 || count > MAX_RAFT_SNAPSHOT_KEYS {
-            return Err("Raft 설정 스냅샷 항목 수가 허용 범위를 벗어났습니다".into());
+            return Err("Raft configuration snapshot has too many or too few entries".into());
         }
         let mut values = std::collections::BTreeMap::new();
         for _ in 0..count {
             let key_len = raft_snapshot_take_u16(bytes, &mut pos)? as usize;
             if key_len == 0 || key_len > 128 {
-                return Err("Raft 설정 스냅샷 키 길이가 올바르지 않습니다".into());
+                return Err("Raft configuration snapshot has an invalid key length".into());
             }
             let key = std::str::from_utf8(raft_snapshot_take(bytes, &mut pos, key_len)?)
-                .map_err(|_| "Raft 설정 스냅샷 키가 UTF-8이 아닙니다")?
+                .map_err(|_| "Raft configuration snapshot key is not UTF-8")?
                 .to_string();
             let value = decode_raft_snapshot_value(bytes, &mut pos, 0)?;
             if values.insert(key, value).is_some() {
-                return Err("Raft 설정 스냅샷에 중복 키가 있습니다".into());
+                return Err("Raft configuration snapshot has a duplicate key".into());
             }
         }
         if pos != bytes.len() {
-            return Err("Raft 설정 스냅샷 끝에 불필요한 데이터가 있습니다".into());
+            return Err("Raft configuration snapshot has trailing data".into());
         }
         let patch = onetdns_core::json::Json::Obj(
             values
@@ -698,7 +701,7 @@ fn encode_raft_snapshot_value(
 ) -> Result<(), String> {
     use onetdns_core::json::Json;
     if depth > MAX_RAFT_VALUE_DEPTH {
-        return Err("Raft 설정 스냅샷 값의 중첩이 너무 깊습니다".into());
+        return Err("Raft configuration snapshot value is nested too deeply".into());
     }
     match value {
         Json::Null if depth == 0 => out.push(0),
@@ -710,15 +713,15 @@ fn encode_raft_snapshot_value(
         }
         Json::Str(text) => {
             out.push(4);
-            let len =
-                u32::try_from(text.len()).map_err(|_| "Raft 설정 스냅샷 문자열이 너무 큽니다")?;
+            let len = u32::try_from(text.len())
+                .map_err(|_| "Raft configuration snapshot string is too large")?;
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(text.as_bytes());
         }
         Json::Arr(items) => {
             out.push(5);
-            let count =
-                u32::try_from(items.len()).map_err(|_| "Raft 설정 스냅샷 배열이 너무 큽니다")?;
+            let count = u32::try_from(items.len())
+                .map_err(|_| "Raft configuration snapshot array is too large")?;
             out.extend_from_slice(&count.to_be_bytes());
             for item in items {
                 encode_raft_snapshot_value(item, out, depth + 1)?;
@@ -726,18 +729,18 @@ fn encode_raft_snapshot_value(
         }
         Json::Obj(fields) => {
             out.push(6);
-            let count =
-                u32::try_from(fields.len()).map_err(|_| "Raft 설정 스냅샷 테이블이 너무 큽니다")?;
+            let count = u32::try_from(fields.len())
+                .map_err(|_| "Raft configuration snapshot table is too large")?;
             out.extend_from_slice(&count.to_be_bytes());
             for (key, value) in fields {
                 let len = u16::try_from(key.len())
-                    .map_err(|_| "Raft 설정 스냅샷 테이블의 키가 너무 깁니다")?;
+                    .map_err(|_| "Raft configuration snapshot table key is too long")?;
                 out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(key.as_bytes());
                 encode_raft_snapshot_value(value, out, depth + 1)?;
             }
         }
-        _ => return Err("Raft 설정 스냅샷 값 형식이 지원되지 않습니다".into()),
+        _ => return Err("Raft configuration snapshot has an unsupported value type".into()),
     }
     Ok(())
 }
@@ -752,11 +755,11 @@ fn decode_raft_snapshot_value(
     /** @brief 배열이나 테이블 하나가 가질 수 있는 항목 수 상한. */
     const MAX_ITEMS: usize = 100_000;
     if depth > MAX_RAFT_VALUE_DEPTH {
-        return Err("Raft 설정 스냅샷 값의 중첩이 너무 깊습니다".into());
+        return Err("Raft configuration snapshot value is nested too deeply".into());
     }
     let tag = *raft_snapshot_take(bytes, pos, 1)?
         .first()
-        .ok_or("Raft 설정 스냅샷 값 태그가 없습니다")?;
+        .ok_or("Raft configuration snapshot value has no tag")?;
     match tag {
         0 if depth == 0 => Ok(Json::Null),
         1 => Ok(Json::Bool(false)),
@@ -765,24 +768,24 @@ fn decode_raft_snapshot_value(
             let bits = u64::from_be_bytes(
                 raft_snapshot_take(bytes, pos, 8)?
                     .try_into()
-                    .map_err(|_| "Raft 설정 스냅샷의 숫자 데이터를 8바이트로 읽을 수 없습니다")?,
+                    .map_err(|_| "Raft configuration snapshot number is not 8 bytes long")?,
             );
             let number = f64::from_bits(bits);
             number
                 .is_finite()
                 .then_some(Json::Num(number))
-                .ok_or_else(|| "Raft 설정 스냅샷 숫자가 유한하지 않습니다".into())
+                .ok_or_else(|| "Raft configuration snapshot number is not finite".into())
         }
         4 => {
             let len = raft_snapshot_take_u32(bytes, pos)? as usize;
             let text = std::str::from_utf8(raft_snapshot_take(bytes, pos, len)?)
-                .map_err(|_| "Raft 설정 스냅샷 문자열이 UTF-8이 아닙니다")?;
+                .map_err(|_| "Raft configuration snapshot string is not UTF-8")?;
             Ok(Json::Str(text.to_string()))
         }
         5 => {
             let count = raft_snapshot_take_u32(bytes, pos)? as usize;
             if count > MAX_ITEMS {
-                return Err("Raft 설정 스냅샷 배열 항목이 너무 많습니다".into());
+                return Err("Raft configuration snapshot array has too many items".into());
             }
             let mut items = Vec::with_capacity(count.min(1_024));
             for _ in 0..count {
@@ -793,23 +796,23 @@ fn decode_raft_snapshot_value(
         6 => {
             let count = raft_snapshot_take_u32(bytes, pos)? as usize;
             if count > MAX_ITEMS {
-                return Err("Raft 설정 스냅샷 테이블 항목이 너무 많습니다".into());
+                return Err("Raft configuration snapshot table has too many entries".into());
             }
             let mut fields: Vec<(String, Json)> = Vec::with_capacity(count.min(1_024));
             for _ in 0..count {
                 let len = raft_snapshot_take_u16(bytes, pos)? as usize;
                 let key = std::str::from_utf8(raft_snapshot_take(bytes, pos, len)?)
-                    .map_err(|_| "Raft 설정 스냅샷 테이블의 키가 UTF-8이 아닙니다")?
+                    .map_err(|_| "Raft configuration snapshot table key is not UTF-8")?
                     .to_string();
                 if fields.iter().any(|(existing, _)| *existing == key) {
-                    return Err("Raft 설정 스냅샷 테이블에 중복 키가 있습니다".into());
+                    return Err("Raft configuration snapshot table has a duplicate key".into());
                 }
                 let value = decode_raft_snapshot_value(bytes, pos, depth + 1)?;
                 fields.push((key, value));
             }
             Ok(Json::Obj(fields))
         }
-        _ => Err("Raft 설정 스냅샷 값 태그가 올바르지 않습니다".into()),
+        _ => Err("Raft configuration snapshot value has an invalid tag".into()),
     }
 }
 
@@ -821,10 +824,10 @@ fn raft_snapshot_take<'a>(
 ) -> Result<&'a [u8], String> {
     let end = pos
         .checked_add(len)
-        .ok_or("Raft 설정 스냅샷 위치가 범위를 넘었습니다")?;
+        .ok_or("Raft configuration snapshot offset is out of range")?;
     let value = bytes
         .get(*pos..end)
-        .ok_or("Raft 설정 스냅샷 데이터가 중간에서 잘렸습니다")?;
+        .ok_or("Raft configuration snapshot is truncated")?;
     *pos = end;
     Ok(value)
 }
@@ -834,7 +837,7 @@ fn raft_snapshot_take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, String> 
     Ok(u16::from_be_bytes(
         raft_snapshot_take(bytes, pos, 2)?
             .try_into()
-            .map_err(|_| "Raft 설정 스냅샷의 16비트 정수 데이터를 읽을 수 없습니다")?,
+            .map_err(|_| "Could not read a 16-bit integer from the Raft configuration snapshot")?,
     ))
 }
 
@@ -843,26 +846,26 @@ fn raft_snapshot_take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> 
     Ok(u32::from_be_bytes(
         raft_snapshot_take(bytes, pos, 4)?
             .try_into()
-            .map_err(|_| "Raft 설정 스냅샷의 32비트 정수 데이터를 읽을 수 없습니다")?,
+            .map_err(|_| "Could not read a 32-bit integer from the Raft configuration snapshot")?,
     ))
 }
 
 /** @brief 클러스터에 올릴 제안을 읽는다. 형식이 다르면 거부한다. */
 pub(crate) fn parse_cluster_proposal(body: &str) -> Result<onetdns_core::json::Json, String> {
     let json = onetdns_core::json::parse(body)
-        .map_err(|error| format!("JSON 요청 본문을 해석할 수 없습니다: {error}"))?;
+        .map_err(|error| format!("Could not parse the JSON request body: {error}"))?;
     let onetdns_core::json::Json::Obj(fields) = json else {
-        return Err("Raft 설정 변경 요청은 patch 객체 하나만 포함해야 합니다".into());
+        return Err("A Raft configuration change must contain exactly one patch object".into());
     };
     if fields.len() != 1 || fields[0].0 != "patch" {
-        return Err("Raft 설정 변경 요청은 patch 객체 하나만 포함해야 합니다".into());
+        return Err("A Raft configuration change must contain exactly one patch object".into());
     }
     let patch = fields[0].1.clone();
     let onetdns_core::json::Json::Obj(entries) = &patch else {
-        return Err("Raft 설정 변경 요청의 patch는 객체여야 합니다".into());
+        return Err("The patch in a Raft configuration change must be an object".into());
     };
     if entries.is_empty() || entries.len() > 128 {
-        return Err("Raft 설정 변경 항목 수가 허용 범위를 벗어났습니다".into());
+        return Err("A Raft configuration change has too many or too few entries".into());
     }
     Ok(patch)
 }
@@ -872,24 +875,24 @@ fn decode_raft_command_patch(
     data: &[u8],
 ) -> Result<Vec<(String, onetdns_core::json::Json)>, String> {
     let text = std::str::from_utf8(data)
-        .map_err(|error| format!("Raft 명령이 올바른 UTF-8 문자열이 아닙니다: {error}"))?;
+        .map_err(|error| format!("Raft command is not valid UTF-8: {error}"))?;
     let json = onetdns_core::json::parse(text)
-        .map_err(|error| format!("Raft 명령 JSON 요청 본문이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| format!("Raft command JSON is invalid: {error}"))?;
     let onetdns_core::json::Json::Obj(fields) = &json else {
-        return Err("Raft 명령은 patch 객체 하나만 포함해야 합니다".into());
+        return Err("A Raft command must contain exactly one patch object".into());
     };
     if fields.len() != 1 || fields[0].0 != "patch" {
-        return Err("Raft 명령은 patch 객체 하나만 포함해야 합니다".into());
+        return Err("A Raft command must contain exactly one patch object".into());
     }
     let patch_value = json
         .get("patch")
-        .ok_or_else(|| "Raft 설정 변경 요청에 patch 객체가 없습니다".to_string())?;
+        .ok_or_else(|| "The Raft configuration change has no patch object".to_string())?;
     validate_raft_patch_scope(patch_value)?;
     let onetdns_core::json::Json::Obj(patch) = patch_value else {
-        return Err("Raft 설정 변경 요청에 patch 객체가 없습니다".into());
+        return Err("The Raft configuration change has no patch object".into());
     };
     if patch.is_empty() || patch.len() > 128 {
-        return Err("Raft 설정 변경 항목 수가 허용 범위를 벗어났습니다".into());
+        return Err("A Raft configuration change has too many or too few entries".into());
     }
     let mut patch = patch.clone();
     materialize_mode_acl_patch(&mut patch)?;
@@ -902,14 +905,14 @@ fn apply_raft_patch(
     patch: &[(String, onetdns_core::json::Json)],
 ) -> Result<(), String> {
     if patch.is_empty() || patch.len() > MAX_RAFT_SNAPSHOT_KEYS {
-        return Err("Raft 설정 상태 항목 수가 허용 범위를 벗어났습니다".into());
+        return Err("Raft configuration state has too many or too few entries".into());
     }
     validate_raft_patch_scope(&onetdns_core::json::Json::Obj(patch.to_vec()))?;
     let edit = |text: &str| {
         let mut output = text.to_string();
         for (key, value) in patch {
             if key.is_empty() || key.len() > 128 {
-                return Err("Raft 설정 항목 이름의 길이가 허용 범위를 벗어났습니다".into());
+                return Err("Raft configuration key length is out of range".into());
             }
             output = match value {
                 /* null 은 항목을 지우라는 합의다. 빈 값으로 적으면 기본값으로 돌아가지 않는다. */
@@ -940,7 +943,7 @@ fn apply_raft_patch(
         event = "raft.config_applied",
         keys = patch.len(),
         mode = mode.as_str(),
-        "Raft로 복제된 설정을 적용했습니다"
+        "Applied configuration replicated through Raft"
     );
     Ok(())
 }
@@ -1023,7 +1026,7 @@ pub(crate) fn peer_cluster_status_json(
                     event = "cluster.peer_probe_spawn_failed",
                     peer = %url,
                     error = %error,
-                    "상대 노드 상태 조사 스레드를 만들지 못했습니다"
+                    "Could not start the peer health probe thread"
                 );
             }
             (url, spawned.ok())
@@ -1097,9 +1100,9 @@ pub(crate) fn spawn_resign_timer(
                     &notify,
                     "dnssec resign",
                 ) {
-                    onetdns_core::error!(event = "dnssec.resign_failed", zone = %origin.to_ascii_lower(), %error, "DNSSEC 재서명에 실패해 기존 서명을 유지합니다");
+                    onetdns_core::error!(event = "dnssec.resign_failed", zone = %origin.to_ascii_lower(), %error, "DNSSEC re-signing failed; keeping the existing signatures");
                 } else {
-                    onetdns_core::info!(event = "dnssec.resigned", zone = %origin.to_ascii_lower(), "RRSIG를 다시 서명하고 영역 일련번호를 갱신했습니다");
+                    onetdns_core::info!(event = "dnssec.resigned", zone = %origin.to_ascii_lower(), "Re-signed RRSIGs and bumped the zone serial");
                 }
             }
         })

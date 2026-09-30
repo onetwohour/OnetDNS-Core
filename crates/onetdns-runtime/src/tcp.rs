@@ -288,7 +288,7 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
                             onetdns_core::error!(
                                 event = "tcp.accept_queue_poisoned",
                                 worker = idx,
-                                "연결 대기열 잠금이 오염돼 회복하고 계속 처리합니다"
+                                "Connection queue lock was poisoned; recovered and continuing"
                             );
                             poisoned.into_inner()
                         });
@@ -314,14 +314,14 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
             }) {
             Ok(worker) => workers.push(worker),
             Err(error) => {
-                onetdns_core::error!(event = "tcp.worker_spawn_failed", %error, worker = idx, "DNS/TCP 연결 처리 스레드를 시작하지 못했습니다");
+                onetdns_core::error!(event = "tcp.worker_spawn_failed", %error, worker = idx, "Could not start the DNS/TCP connection thread");
                 break;
             }
         }
     }
     if workers.is_empty() {
         return Err(io::Error::other(
-            "DNS/TCP 연결 처리 스레드를 시작하지 못했습니다",
+            "Could not start the DNS/TCP connection thread",
         ));
     }
     Ok((tx, workers))
@@ -437,7 +437,7 @@ fn handle_conn<H: Handler>(
             note_tcp_drop(
                 "untrusted_proxy",
                 peer,
-                "trusted_proxies에 없는 주소에서 온 연결입니다",
+                "Connection from an address not in trusted_proxies",
             );
             return;
         }
@@ -447,17 +447,13 @@ fn handle_conn<H: Handler>(
                 note_tcp_drop(
                     "client_connection_limit",
                     peer,
-                    "PROXY 헤더가 알린 클라이언트가 이미 연결 한도에 찼습니다",
+                    "Client named in the PROXY header is already at its connection limit",
                 );
                 return;
             }
             Some(None) => {}
             None => {
-                note_tcp_drop(
-                    "proxy_header",
-                    peer,
-                    "PROXY 헤더가 없거나 형식이 어긋납니다",
-                );
+                note_tcp_drop("proxy_header", peer, "PROXY header is missing or malformed");
                 return;
             }
         }
@@ -585,7 +581,7 @@ fn note_tcp_drop(reason: &'static str, peer: SocketAddr, detail: &str) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "tcp.connection_dropped", reason = reason, peer = %peer, count = count, detail = detail, "연결을 받자마자 끊었습니다");
+        onetdns_core::warn!(event = "tcp.connection_dropped", reason = reason, peer = %peer, count = count, detail = detail, "Connection dropped right after accept");
     }
 }
 
@@ -688,9 +684,7 @@ mod malformed_tests {
     fn send_frame(stream: &mut TcpStream, payload: &[u8]) {
         let mut framed = (payload.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(payload);
-        stream
-            .write_all(&framed)
-            .expect("프레임을 보내지 못했습니다");
+        stream.write_all(&framed).expect("Could not send the frame");
     }
 
     /** @brief 한 프레임 받는다. 연결이 닫혔으면 없다. */
@@ -713,37 +707,37 @@ mod malformed_tests {
      *          클라이언트가 깨진 것 하나에 연결을 전부 잃고 다시 붙어야 한다.
      */
     fn a_malformed_message_does_not_end_the_tcp_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("수신 주소를 잡지 못했습니다");
-        let address = listener.local_addr().expect("주소를 읽지 못했습니다");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Could not bind the listen address");
+        let address = listener.local_addr().expect("Could not read the address");
 
         let client = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("붙지 못했습니다");
+            let mut stream = TcpStream::connect(address).expect("Could not connect");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("데드라인을 걸지 못했습니다");
+                .expect("Could not set the deadline");
 
             // 질문 하나를 적고 둘이라고 말하는 헤더다.
             let mut broken = vec![0u8; 12];
             broken[0..2].copy_from_slice(&0x4321u16.to_be_bytes());
             broken[4..6].copy_from_slice(&2u16.to_be_bytes());
             broken.extend_from_slice(&[2, b'n', b's', 0, 0, 1, 0, 1]);
-            assert!(Message::parse(&broken).is_err(), "대조군이 무효입니다");
+            assert!(Message::parse(&broken).is_err(), "Control case is invalid");
             send_frame(&mut stream, &broken);
             let first = recv_frame(&mut stream);
 
             let good = Message::query(0x1234, Name::from_str("ok.test").unwrap(), RecordType::A)
                 .try_encode()
-                .expect("질의를 만들지 못했습니다");
+                .expect("Could not build the query");
             send_frame(&mut stream, &good);
             let second = recv_frame(&mut stream);
             (first, second)
         });
 
-        let (stream, peer) = listener.accept().expect("받지 못했습니다");
+        let (stream, peer) = listener.accept().expect("Did not receive");
         let limiter = ConnectionLimiter::new(4, 4);
         let guard = limiter
             .try_acquire(peer.ip())
-            .expect("슬롯을 잡지 못했습니다");
+            .expect("Could not take a slot");
         let shutdown = AtomicBool::new(false);
         handle_conn(
             (stream, peer, guard),
@@ -754,11 +748,11 @@ mod malformed_tests {
             &[],
         );
 
-        let (first, second) = client.join().expect("클라이언트가 죽었습니다");
-        let first = first.expect("읽지 못한 메시지에 답하지 않았습니다");
+        let (first, second) = client.join().expect("Client died");
+        let first = first.expect("Did not answer an unreadable message");
         assert_eq!(first.header.rcode, 1);
         assert_eq!(first.header.id, 0x4321);
-        let second = second.expect("읽지 못한 메시지 하나에 연결을 끊었습니다");
+        let second = second.expect("Closed the connection on a single unreadable message");
         assert_eq!(second.header.rcode, 0);
         assert_eq!(second.header.id, 0x1234);
     }

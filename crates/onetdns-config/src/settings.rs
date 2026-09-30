@@ -26,6 +26,17 @@ const MAX_UPSTREAMS_PER_RESOLVER: usize = 256;
 const MAX_DYNAMIC_RECORD_VALUES: usize = 64;
 /** @brief 검증기가 받아들일 수 있는 NSEC3 반복 횟수 보안 하드 상한. */
 const MAX_VALIDATOR_NSEC3_ITERATIONS: u16 = 150;
+/**
+ * @brief 업스트림을 적지 않았을 때 쓰는 DNS-over-HTTP/3 서버.
+ * @details 평문 UDP 53번은 ISP 나 공유기가 가로채 자기 리졸버로 대신 답하는 망이 있어, 적은
+ *          업스트림이 아닌 서버의 답을 받게 된다. 443번 포트의 암호화 전송은 가로챌 수 없고 인증서로
+ *          상대를 확인한다. 주소를 IP 로 적고 인증서 이름을
+ *          함께 주므로 업스트림 이름을 풀기 위한 bootstrap 이 필요 없다.
+ */
+const DEFAULT_UPSTREAM_URLS: [&str; 2] = [
+    "h3://1.1.1.1/dns-query#cloudflare-dns.com",
+    "h3://1.0.0.1/dns-query#cloudflare-dns.com",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /** @brief 해석 방식. 전달, 재귀, 또는 이름별로 나누는 분할이다. */
@@ -267,7 +278,7 @@ impl LocalZone {
             String::new()
         } else {
             normalized_dns_name(&self.name)
-                .ok_or_else(|| "name이 올바른 DNS 이름이 아닙니다".to_string())?
+                .ok_or_else(|| "name is not a valid DNS name".to_string())?
         };
         let mut grouped: Vec<(String, Vec<IpAddr>, Option<String>)> = Vec::new();
         for (item, raw) in self.records.iter().enumerate() {
@@ -277,11 +288,11 @@ impl LocalZone {
                     (fields.next(), fields.next(), fields.next())
                 else {
                     return Err(format!(
-                        "records[{item}]는 static에서 '이름 값' 형식이어야 합니다. 예: \"www.corp.example 192.0.2.10\""
+                        "records[{item}] must be 'name value' for static zones, for example \"www.corp.example 192.0.2.10\""
                     ));
                 };
                 let owner = normalized_dns_name(owner).ok_or_else(|| {
-                    format!("records[{item}]의 이름 '{owner}'이 올바른 DNS 이름이 아닙니다")
+                    format!("records[{item}] name '{owner}' is not a valid DNS name")
                 })?;
                 let inside = zone.is_empty()
                     || owner == zone
@@ -290,14 +301,14 @@ impl LocalZone {
                         .is_some_and(|head| head.ends_with('.'));
                 if !inside {
                     return Err(format!(
-                        "records[{item}]의 이름 '{owner}'이 영역 '{zone}' 밖에 있습니다"
+                        "records[{item}] name '{owner}' is outside zone '{zone}'"
                     ));
                 }
                 (owner, value)
             } else {
                 let (Some(value), None) = (fields.next(), fields.next()) else {
                     return Err(format!(
-                        "records[{item}]에는 redirect에서 IP 주소나 DNS 이름 하나만 적습니다. 이름마다 다른 답을 두려면 kind를 static으로 쓰십시오"
+                        "For redirect, records[{item}] holds a single IP address or DNS name; to give each name a different answer, use kind static"
                     ));
                 };
                 (zone.clone(), value)
@@ -314,26 +325,24 @@ impl LocalZone {
                 entry.1.push(ip);
             } else {
                 let target = normalized_dns_name(value).ok_or_else(|| {
-                    format!(
-                        "records[{item}]에 올바른 IP 주소 또는 DNS 이름이 필요합니다: '{value}'"
-                    )
+                    format!("records[{item}] needs a valid IP address or DNS name: '{value}'")
                 })?;
                 if entry.2.replace(target).is_some() {
                     return Err(format!(
-                        "records에서 '{}'에는 CNAME 대상을 하나만 지정할 수 있습니다",
+                        "In records, '{}' can have only one CNAME target",
                         entry.0
                     ));
                 }
             }
             if !entry.1.is_empty() && entry.2.is_some() {
                 return Err(format!(
-                    "records에서 '{}'에 IP 주소와 CNAME 대상을 함께 쓸 수 없습니다",
+                    "In records, '{}' cannot have both IP addresses and a CNAME target",
                     entry.0
                 ));
             }
         }
         if grouped.is_empty() {
-            return Err("records에 한 개 이상의 응답 값을 입력해야 합니다".to_string());
+            return Err("records needs at least one answer value".to_string());
         }
         Ok(grouped
             .into_iter()
@@ -1257,10 +1266,7 @@ impl Default for Config {
 
             listen: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)],
 
-            upstreams: vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            ],
+            upstreams: vec![],
             blocklists: vec![],
             allowlists: vec![],
             blocklist_urls: vec![],
@@ -1378,7 +1384,10 @@ impl Default for Config {
             safe_browsing: false,
             parental_control: false,
             service_schedule: vec![],
-            upstream_urls: vec![],
+            upstream_urls: DEFAULT_UPSTREAM_URLS
+                .iter()
+                .map(|url| (*url).to_string())
+                .collect(),
             bootstrap: vec![],
             root_hints: vec![],
             fallback_upstreams: vec![],
@@ -1449,7 +1458,7 @@ impl Default for Config {
             tftp_root: None,
             tftp_listen: "127.0.0.1:69"
                 .parse()
-                .expect("기본 TFTP 수신 주소가 올바라야 합니다"),
+                .expect("The default TFTP listening address must be valid"),
             tftp_writable: false,
             tftp_write_allow: vec![],
             tftp_allow_overwrite: false,
@@ -1550,7 +1559,7 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         if s.len() as u64 > MAX_CONFIG_BYTES {
             return Err(ConfigError::Invalid(
-                "설정 파일이 허용 크기를 넘었습니다".into(),
+                "The configuration file exceeds the size limit".into(),
             ));
         }
         let value = crate::toml::parse(s).map_err(ConfigError::Parse)?;
@@ -1614,7 +1623,7 @@ impl Config {
             .len();
         if len > MAX_CONFIG_BYTES {
             return Err(ConfigError::Invalid(
-                "설정 파일이 허용 크기를 넘었습니다".into(),
+                "The configuration file exceeds the size limit".into(),
             ));
         }
         let mut bytes = Vec::with_capacity(len as usize);
@@ -1623,11 +1632,11 @@ impl Config {
             .map_err(|e| ConfigError::Io(format!("{}: {e}", path.display())))?;
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err(ConfigError::Invalid(
-                "설정 파일이 허용 크기를 넘었습니다".into(),
+                "The configuration file exceeds the size limit".into(),
             ));
         }
         String::from_utf8(bytes)
-            .map_err(|_| ConfigError::Parse("설정 파일이 올바른 UTF-8 형식이 아닙니다".into()))
+            .map_err(|_| ConfigError::Parse("The configuration file is not valid UTF-8".into()))
     }
 
     /**
@@ -1659,13 +1668,13 @@ impl Config {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
             {
                 return invalid(format!(
-                    "{key}에는 영문자, 숫자, 밑줄, 점으로 된 테이블 이름을 입력해야 합니다: {table:?}"
+                    "{key} needs a table name made of letters, digits, underscores, and dots: {table:?}"
                 ));
             }
         }
         if self.zones_etcd_prefix.is_empty() {
             return invalid(
-                "zones_etcd_prefix를 비울 수 없습니다. 비우면 etcd의 모든 키를 영역으로 읽습니다"
+                "zones_etcd_prefix cannot be empty; an empty prefix would read every etcd key as a zone"
                     .into(),
             );
         }
@@ -1674,42 +1683,35 @@ impl Config {
             .as_ref()
             .is_some_and(|path| path.as_os_str().is_empty())
         {
-            return invalid("zones_lmdb에 빈 경로를 넣을 수 없습니다".into());
+            return invalid("zones_lmdb cannot be an empty path".into());
         }
         if self.zones_etcd_user.is_some() != self.zones_etcd_password.is_some() {
-            return invalid(
-                "zones_etcd_user와 zones_etcd_password는 둘 다 설정하거나 둘 다 생략해야 합니다"
-                    .into(),
-            );
+            return invalid("Set both zones_etcd_user and zones_etcd_password, or neither".into());
         }
         if let Some(name) = &self.catalog_serve {
             if !valid_dns_name(name) {
-                return invalid(format!(
-                    "catalog_serve에는 올바른 DNS 이름을 입력해야 합니다: {name:?}"
-                ));
+                return invalid(format!("catalog_serve needs a valid DNS name: {name:?}"));
             }
         }
         let mut key_names = std::collections::HashSet::new();
         for key in &self.tsig_keys {
             let name = key.name.trim().trim_end_matches('.').to_ascii_lowercase();
             if !key_names.insert(name.clone()) {
-                return invalid(format!(
-                    "같은 TSIG 키 이름이 두 번 설정되어 있습니다: {name}"
-                ));
+                return invalid(format!("The same TSIG key name is set twice: {name}"));
             }
         }
         for (index, rule) in self.update_policy.iter().enumerate() {
             let identity = rule.identity.trim_end_matches('.').to_ascii_lowercase();
             if identity != "*" && !key_names.contains(&identity) {
                 return invalid(format!(
-                    "update_policy[{index}]의 identity '{}'를 [[tsig_keys]]에서 찾을 수 없습니다",
+                    "update_policy[{index}] identity '{}' is not in [[tsig_keys]]",
                     rule.identity
                 ));
             }
         }
         if self.zonemd_reject_absence && !self.zonemd_check {
             return invalid(
-                "zonemd_reject_absence는 zonemd_check를 켠 상태에서만 켤 수 있습니다. zonemd_check를 먼저 켜십시오"
+                "zonemd_reject_absence can be turned on only while zonemd_check is on; turn on zonemd_check first"
                     .into(),
             );
         }
@@ -1725,24 +1727,24 @@ impl Config {
         let invalid = |message: String| Err(ConfigError::Invalid(message));
         if self.edns_tcp_keepalive_secs > 6_553 {
             return invalid(
-                "edns_tcp_keepalive_secs는 6553초 이하여야 합니다. EDNS TCP keepalive 옵션은 100ms 단위 16비트 값입니다"
+                "edns_tcp_keepalive_secs must be at most 6553 seconds; the EDNS TCP keepalive option is a 16-bit value in units of 100 ms"
                     .into(),
             );
         }
         if self.ecs_mode == EcsMode::Send && self.ecs_custom_ip.is_none() {
             return invalid(
-                "ecs_mode가 send이면 업스트림에 보낼 대역을 ecs_custom_ip에 입력해야 합니다".into(),
+                "When ecs_mode is send, set the subnet to send upstream in ecs_custom_ip".into(),
             );
         }
         if !valid_doh_path(&self.doh_path) {
             return invalid(format!(
-                "doh_path는 /로 시작하고 공백, ?, #이 없는 경로여야 합니다: {:?}",
+                "doh_path must start with / and contain no spaces, ?, or #: {:?}",
                 self.doh_path
             ));
         }
         if !valid_dns_name(&self.dnscrypt_provider_name) {
             return invalid(format!(
-                "dnscrypt_provider_name에는 2.dnscrypt-cert.example.com 처럼 올바른 DNS 이름을 입력해야 합니다: {:?}",
+                "dnscrypt_provider_name needs a valid DNS name such as 2.dnscrypt-cert.example.com: {:?}",
                 self.dnscrypt_provider_name
             ));
         }
@@ -1760,14 +1762,12 @@ impl Config {
         ] {
             if path.as_deref().is_some_and(|p| p.trim().is_empty()) {
                 return invalid(format!(
-                    "{key}에 빈 경로를 넣을 수 없습니다. 쓰지 않으려면 항목을 지우십시오"
+                    "{key} cannot be an empty path; remove the setting if you do not use it"
                 ));
             }
         }
         if self.acme_cert_file.is_some() != self.acme_key_file.is_some() {
-            return invalid(
-                "acme_cert_file과 acme_key_file은 둘 다 설정하거나 둘 다 생략해야 합니다".into(),
-            );
+            return invalid("Set both acme_cert_file and acme_key_file, or neither".into());
         }
         Ok(())
     }
@@ -1781,21 +1781,19 @@ impl Config {
         let invalid = |message: String| Err(ConfigError::Invalid(message));
         if !self.dhcp_local_domain.is_empty() && !valid_dns_name(&self.dhcp_local_domain) {
             return invalid(format!(
-                "dhcp_local_domain에는 올바른 DNS 이름을 입력해야 합니다: {}",
+                "dhcp_local_domain needs a valid DNS name: {}",
                 self.dhcp_local_domain
             ));
         }
         if let Some(server) = &self.dhcp_tftp_server {
             if server.parse::<std::net::Ipv4Addr>().is_err() {
-                return invalid(format!(
-                    "dhcp_tftp_server에는 IPv4 주소를 입력해야 합니다: {server}"
-                ));
+                return invalid(format!("dhcp_tftp_server needs an IPv4 address: {server}"));
             }
         }
         if let Some(file) = &self.dhcp_boot_file {
             if file.is_empty() || file.len() > 255 || file.bytes().any(|b| b == 0) {
                 return invalid(
-                    "dhcp_boot_file은 DHCP 옵션 하나에 담을 수 있는 1~255바이트 이름이어야 합니다"
+                    "dhcp_boot_file must be a 1 to 255 byte name that fits in one DHCP option"
                         .into(),
                 );
             }
@@ -1803,7 +1801,7 @@ impl Config {
         for server in &self.dhcp6_dns {
             if server.parse::<std::net::Ipv6Addr>().is_err() {
                 return invalid(format!(
-                    "dhcp6_dns 항목에는 IPv6 주소를 입력해야 합니다: {server}"
+                    "dhcp6_dns entries must be IPv6 addresses: {server}"
                 ));
             }
         }
@@ -1815,7 +1813,7 @@ impl Config {
             });
             let Some((address, length)) = parsed else {
                 return invalid(format!(
-                    "ra_prefix에는 fd00:1::/64 처럼 IPv6 주소와 접두사 길이를 함께 입력해야 합니다: {prefix}"
+                    "ra_prefix needs an IPv6 address and prefix length, such as fd00:1::/64: {prefix}"
                 ));
             };
             let host_bits = u128::from(address)
@@ -1823,24 +1821,24 @@ impl Config {
                 .unwrap_or(0);
             if address.is_unspecified() || host_bits != 0 {
                 return invalid(format!(
-                    "ra_prefix는 접두사 길이 뒤의 비트가 모두 0인 네트워크 주소여야 합니다: {prefix}"
+                    "ra_prefix must be a network address with every bit after the prefix length set to 0: {prefix}"
                 ));
             }
         }
         if !(4..=1_800).contains(&self.ra_interval) {
             return invalid(
-                "ra_interval은 RFC 4861이 정한 라우터 광고 주기 4~1800초 안이어야 합니다".into(),
+                "ra_interval must be within the RFC 4861 router advertisement range of 4 to 1800 seconds".into(),
             );
         }
         let lifetime = u64::from(self.ra_router_lifetime);
         if lifetime != 0 && !(self.ra_interval..=9_000).contains(&lifetime) {
             return invalid(
-                "ra_router_lifetime은 0이거나 ra_interval 이상 9000초 이하여야 합니다. 광고 주기보다 짧으면 다음 광고 전에 기본 경로가 사라집니다"
+                "ra_router_lifetime must be 0, or at least ra_interval and at most 9000 seconds; if it is shorter than the advertisement interval, the default route disappears before the next advertisement"
                     .into(),
             );
         }
         if self.ra_mtu != 0 && self.ra_mtu < 1_280 {
-            return invalid("ra_mtu는 0이거나 IPv6 최소 MTU인 1280 이상이어야 합니다".into());
+            return invalid("ra_mtu must be 0 or at least 1280, the IPv6 minimum MTU".into());
         }
         Ok(())
     }
@@ -1891,7 +1889,7 @@ impl Config {
             && self.upstream_urls.is_empty()
         {
             return Err(ConfigError::Invalid(
-                "업스트림 DNS 서버로 질의를 전달하도록 설정했지만 서버 주소가 없습니다. `upstreams` 또는 `upstream_urls`에 한 개 이상 입력하십시오".into(),
+                "Queries are set to be forwarded to upstream DNS servers, but no server address is set; add at least one to `upstreams` or `upstream_urls`".into(),
             ));
         }
         if !matches!(self.backend, BackendKind::Split)
@@ -1900,62 +1898,63 @@ impl Config {
                 || !self.split_recurse.is_empty()
                 || !self.split_forward.is_empty())
         {
-            soft.push("`local_a`, `local_aaaa`, `split_recurse`, `split_forward`는 split 백엔드에서만 동작합니다. `backend = \"split\"`으로 바꾸거나 해당 항목을 지우십시오".into(),);
+            soft.push("`local_a`, `local_aaaa`, `split_recurse`, and `split_forward` work only with the split backend; set `backend = \"split\"` or remove those settings".into(),);
         }
         match (self.run_as_user.as_deref(), self.run_as_group.as_deref()) {
             (None, Some(_)) => {
-                soft.push(
-                    "`run_as_group`을 사용하려면 `run_as_user`도 함께 지정해야 합니다".into(),
-                );
+                soft.push("`run_as_group` also needs `run_as_user`".into());
             }
             (Some(user), group) => {
                 let user = user.trim();
                 if user.is_empty() {
                     return Err(ConfigError::Invalid(
-                        "`run_as_user`에 실행 권한을 넘겨받을 사용자 이름을 입력하십시오".into(),
+                        "Set `run_as_user` to the user that should run the server".into(),
                     ));
                 }
                 if user.eq_ignore_ascii_case("root") || user.parse::<u32>() == Ok(0) {
                     return Err(ConfigError::Invalid(
-                        "`run_as_user`에는 root가 아닌 사용자를 지정하십시오".into(),
+                        "Set `run_as_user` to a user other than root".into(),
                     ));
                 }
                 if let Some(group) = group {
                     let group = group.trim();
                     if group.is_empty() {
                         return Err(ConfigError::Invalid(
-                            "`run_as_group`에 실행 권한을 넘겨받을 그룹 이름을 입력하십시오".into(),
+                            "Set `run_as_group` to the group that should run the server".into(),
                         ));
                     }
                     if group.eq_ignore_ascii_case("root") || group.parse::<u32>() == Ok(0) {
                         return Err(ConfigError::Invalid(
-                            "`run_as_group`에는 root 그룹이 아닌 그룹을 지정하십시오".into(),
+                            "Set `run_as_group` to a group other than root".into(),
                         ));
                     }
                 }
                 if !cfg!(target_os = "linux") {
-                    soft.push("`run_as_user`와 `run_as_group`은 Linux에서만 동작합니다. 이 운영체제에서는 권한을 낮추지 않고 지금 계정 그대로 실행합니다".into());
+                    soft.push("`run_as_user` and `run_as_group` work only on Linux; on this operating system the server keeps running as the current account".into());
                 }
             }
             (None, None) => {}
         }
         if !self.recurse_allow_answers.is_empty() && self.recurse_deny_answers.is_empty() {
-            soft.push("`recurse_allow_answers`는 `recurse_deny_answers`의 예외입니다. 거부 목록이 비어 있어 아무 효과가 없습니다".into());
+            soft.push("`recurse_allow_answers` lists exceptions to `recurse_deny_answers`; the deny list is empty, so it has no effect".into());
         }
         let ipset_named = self.ipset_name_v4.is_some() || self.ipset_name_v6.is_some();
         if ipset_named == self.ipset_domains.is_empty() {
-            soft.push("ipset은 `ipset_name_v4`나 `ipset_name_v6`와 `ipset_domains`를 함께 지정해야 동작합니다".into());
+            soft.push(
+                "ipset needs `ipset_name_v4` or `ipset_name_v6` together with `ipset_domains`"
+                    .into(),
+            );
         } else if ipset_named && !cfg!(target_os = "linux") {
-            soft.push("ipset은 Linux에서만 동작합니다. 이 운영체제에서는 답한 주소를 주소 집합에 넣지 않습니다".into());
+            soft.push("ipset works only on Linux; on this operating system answer addresses are not added to address sets".into());
         }
         if self.min_ttl > self.max_ttl {
             return Err(ConfigError::Invalid(
-                "최소 TTL은 최대 TTL보다 클 수 없습니다".into(),
+                "The minimum TTL cannot be greater than the maximum TTL".into(),
             ));
         }
         if self.val_nsec3_max_iterations > MAX_VALIDATOR_NSEC3_ITERATIONS {
             return Err(ConfigError::Invalid(format!(
-                "`val_nsec3_max_iterations`는 CPU 소진 방지를 위해 {MAX_VALIDATOR_NSEC3_ITERATIONS} 이하여야 합니다"
+                "`val_nsec3_max_iterations` must be at most {MAX_VALIDATOR_NSEC3_ITERATIONS} to prevent CPU exhaustion"
             )));
         }
         if [
@@ -1968,12 +1967,12 @@ impl Config {
         .any(|ttl| ttl > u64::from(u32::MAX))
         {
             return Err(ConfigError::Invalid(
-                "DNS TTL 값은 u32 형식으로 표현할 수 있는 범위를 넘을 수 없습니다".into(),
+                "DNS TTL values cannot exceed the u32 range".into(),
             ));
         }
         if !(1..=u64::from(u32::MAX)).contains(&self.dhcp_lease_secs) {
             return Err(ConfigError::Invalid(
-                "`dhcp_lease_secs`는 DHCP wire에 그대로 담을 수 있는 1..=4294967295초 범위여야 합니다"
+                "`dhcp_lease_secs` must be within 1..=4294967295 seconds, the range the DHCP wire format can carry"
                     .into(),
             ));
         }
@@ -1982,45 +1981,45 @@ impl Config {
         self.check_authority_values()?;
         if !(1..=3_600).contains(&self.query_timeout_secs) {
             return Err(ConfigError::Invalid(
-                "`query_timeout_secs`는 1초 이상 3,600초 이하로 설정하십시오".into(),
+                "Set `query_timeout_secs` between 1 and 3,600 seconds".into(),
             ));
         }
         if self.serve_stale_secs > 31_536_000 {
             return Err(ConfigError::Invalid(
-                "`serve_stale_secs`는 31,536,000초(1년) 이하로 설정하십시오".into(),
+                "Set `serve_stale_secs` to at most 31,536,000 seconds (1 year)".into(),
             ));
         }
         if self.serve_expired_client_timeout_ms > 3_600_000 {
             return Err(ConfigError::Invalid(
-                "`serve_expired_client_timeout_ms`는 3,600,000밀리초(1시간) 이하로 설정하십시오"
+                "Set `serve_expired_client_timeout_ms` to at most 3,600,000 milliseconds (1 hour)"
                     .into(),
             ));
         }
         if self.prefetch && !(1..=3_600).contains(&self.prefetch_interval_secs) {
             return Err(ConfigError::Invalid(
-                "미리 가져오기를 사용할 때 `prefetch_interval_secs`는 1초 이상 3,600초 이하로 설정하십시오".into(),
+                "With prefetch on, set `prefetch_interval_secs` between 1 and 3,600 seconds".into(),
             ));
         }
         let response_cache_available =
             self.cache_enabled && self.max_ttl > 0 && self.cache_size > 0;
         if self.prefetch && !response_cache_available {
-            soft.push("`prefetch`를 사용하려면 TTL이 0보다 큰 응답 캐시를 활성화하십시오".into());
+            soft.push("`prefetch` needs an enabled response cache with a TTL above 0".into());
         }
         if self.serve_stale_secs > 0 && !response_cache_available {
             soft.push(
-                "`serve_stale_secs`를 사용하려면 TTL이 0보다 큰 응답 캐시를 활성화하십시오".into(),
+                "`serve_stale_secs` needs an enabled response cache with a TTL above 0".into(),
             );
         }
         if !(10..=99).contains(&self.prefetch_ttl_pct) {
             return Err(ConfigError::Invalid(
-                "`prefetch_ttl_pct`는 10 이상 99 이하로 설정하십시오".into(),
+                "Set `prefetch_ttl_pct` between 10 and 99".into(),
             ));
         }
         if (self.aggressive_nsec || self.harden_below_nxdomain)
             && !(self.dnssec && self.backend != BackendKind::Forward)
         {
             soft.push(
-                "`aggressive_nsec`와 `harden_below_nxdomain`은 로컬 DNSSEC 검증을 사용하는 직접 재귀 또는 분할 처리 방식에서만 동작합니다. 지금 설정에서는 효과가 없습니다"
+                "`aggressive_nsec` and `harden_below_nxdomain` work only with recursive or split resolution using local DNSSEC validation; they have no effect with the current settings"
                     .into(),
             );
         }
@@ -2030,21 +2029,21 @@ impl Config {
             && self.val_nsec3_max_iterations != 150
         {
             soft.push(
-                "`val_nsec3_max_iterations`는 직접 재귀 또는 분할 처리 방식에서만 동작합니다. 전달 방식의 검증은 반복 150회 상한을 씁니다"
+                "`val_nsec3_max_iterations` works only with recursive or split resolution; validation in forwarding mode uses a limit of 150 iterations"
                     .into(),
             );
         }
 
         if self.mixes_plain_and_encrypted_upstreams() {
             soft.push(
-                "암호화 업스트림 DNS 서버와 평문 업스트림 DNS 서버를 함께 지정했습니다. 업스트림을 고르는 기준이 왕복 시간이라 평문 쪽이 거의 언제나 이기므로, 실제로는 대부분의 질의가 암호화되지 않은 채 나갑니다. 암호화만 쓰려면 `upstreams`를 비우십시오"
+                "Both encrypted and plain upstream DNS servers are set. Upstreams are chosen by round-trip time, so the plain ones almost always win and most queries actually leave unencrypted. To use encryption only, empty `upstreams`"
                     .into(),
             );
         }
 
         if self.dnssec_anchor_file.is_some() && !self.dnssec_validation_active() {
             soft.push(
-                "`dnssec_anchor_file`은 `dnssec`를 켜야 동작합니다. 지금 설정에서는 효과가 없습니다"
+                "`dnssec_anchor_file` needs `dnssec` turned on; it has no effect with the current settings"
                     .into(),
             );
         }
@@ -2052,29 +2051,32 @@ impl Config {
         let reject_upstream_count = |label: &str, count: usize| -> Result<(), ConfigError> {
             if count > MAX_UPSTREAMS_PER_RESOLVER {
                 return Err(ConfigError::Invalid(format!(
-                    "{label}에 설정할 수 있는 업스트림 DNS 서버는 최대 {MAX_UPSTREAMS_PER_RESOLVER}개입니다. 현재 {count}개가 설정되어 있습니다"
+                    "{label} can have at most {MAX_UPSTREAMS_PER_RESOLVER} upstream DNS servers; {count} are set"
                 )));
             }
             Ok(())
         };
         reject_upstream_count(
-            "기본 질의 전달 경로",
+            "default forwarding path",
             self.upstreams
                 .len()
                 .saturating_add(self.upstream_urls.len()),
         )?;
         reject_upstream_count(
-            "기본 경로 실패 시 사용할 예비 전달 경로",
+            "fallback forwarding path used when the default path fails",
             self.fallback_upstreams.len(),
         )?;
-        reject_upstream_count("암호화 DNS 서버 주소 확인 경로", self.bootstrap.len())?;
-        reject_upstream_count("루트 DNS 서버 목록", self.root_hints.len())?;
+        reject_upstream_count(
+            "address lookup path for encrypted DNS servers",
+            self.bootstrap.len(),
+        )?;
+        reject_upstream_count("root DNS server list", self.root_hints.len())?;
         for zone in &self.stub_zones {
-            reject_upstream_count(&format!("스텁 영역 '{}'", zone.suffix), zone.servers.len())?;
+            reject_upstream_count(&format!("stub zone '{}'", zone.suffix), zone.servers.len())?;
         }
         for client in &self.clients {
             reject_upstream_count(
-                &format!("클라이언트 '{}'의 전용 전달 경로", client.name),
+                &format!("dedicated forwarding path of client '{}'", client.name),
                 client.upstreams.len(),
             )?;
         }
@@ -2084,7 +2086,7 @@ impl Config {
             .find(|record| record.values.len() > MAX_DYNAMIC_RECORD_VALUES)
         {
             return Err(ConfigError::Invalid(format!(
-                "동적 레코드 '{}'에는 값을 최대 {MAX_DYNAMIC_RECORD_VALUES}개까지 지정할 수 있습니다. 현재 {}개가 설정되어 있습니다",
+                "Dynamic record '{}' can have at most {MAX_DYNAMIC_RECORD_VALUES} values; {} are set",
                 record.name,
                 record.values.len()
             )));
@@ -2100,7 +2102,7 @@ impl Config {
         }
         if self.neg_min_ttl > self.neg_max_ttl {
             return Err(ConfigError::Invalid(
-                "최소 부정 응답 TTL은 최대 부정 응답 TTL보다 클 수 없습니다".into(),
+                "The minimum negative-response TTL cannot be greater than the maximum negative-response TTL".into(),
             ));
         }
 
@@ -2108,12 +2110,12 @@ impl Config {
             && self.block_ipv4.is_none()
             && self.block_ipv6.is_none()
         {
-            soft.push("차단 응답 방식을 사용자 지정으로 선택한 경우 `block_ipv4` 또는 `block_ipv6` 중 하나 이상을 설정하십시오. 그 전까지 차단한 이름에는 NXDOMAIN으로 답합니다".into(),);
+            soft.push("With the custom block response, set `block_ipv4` or `block_ipv6`; until then blocked names are answered with NXDOMAIN".into(),);
         }
 
         if let Some(z) = self.stub_zones.iter().find(|z| z.servers.is_empty()) {
             return Err(ConfigError::Invalid(format!(
-                "스텁 영역 '{}'의 `servers` 목록에 DNS 서버를 한 개 이상 입력하십시오",
+                "Add at least one DNS server to the `servers` list of stub zone '{}'",
                 z.suffix
             )));
         }
@@ -2125,7 +2127,7 @@ impl Config {
                 && c.mac.is_empty()
         }) {
             return Err(ConfigError::Invalid(format!(
-                "클라이언트 '{}'에 전용 업스트림 DNS 서버가 설정되어 있지만 적용 대상을 찾을 조건이 없습니다. `ids`, `client_ids`, `mac` 중 하나 이상을 입력하십시오",
+                "Client '{}' has dedicated upstream DNS servers but nothing to match it by; set at least one of `ids`, `client_ids`, or `mac`",
                 c.name
             )));
         }
@@ -2136,19 +2138,19 @@ impl Config {
             && self.listen_doh3.is_empty()
             && self.listen_dnscrypt.is_empty()
         {
-            soft.push("수신 주소가 하나도 없어 질의를 받지 않습니다".into());
+            soft.push("There are no listening addresses, so no queries are received".into());
         }
 
         if !self.ddr_name.is_empty() {
             // 알릴 것이 없는데 알리면 클라이언트가 닿지 못하는 곳으로 올라가려 한다.
             if !self.tls_enabled() {
                 return Err(ConfigError::Invalid(
-                    "ddr_name이 설정되었지만 알릴 암호화 수신 주소가 없습니다. listen_dot, listen_doh, listen_doq, listen_doh3 중 하나 이상을 여십시오".into(),
+                    "ddr_name is set but there is no encrypted listening address to announce; open at least one of listen_dot, listen_doh, listen_doq, or listen_doh3".into(),
                 ));
             }
             if !valid_dns_name(&self.ddr_name) {
                 return Err(ConfigError::Invalid(format!(
-                    "ddr_name '{}'이 올바른 DNS 이름이 아닙니다",
+                    "ddr_name '{}' is not a valid DNS name",
                     self.ddr_name
                 )));
             }
@@ -2158,7 +2160,7 @@ impl Config {
             let trimmed = name.trim();
             if trimmed != "." && !valid_dns_name(trimmed) {
                 return Err(ConfigError::Invalid(format!(
-                    "domain_insecure의 '{name}'이 올바른 DNS 이름이 아닙니다"
+                    "'{name}' in domain_insecure is not a valid DNS name"
                 )));
             }
         }
@@ -2166,7 +2168,7 @@ impl Config {
             let trimmed = name.trim();
             if !valid_dns_name(trimmed.strip_prefix("*.").unwrap_or(trimmed)) {
                 return Err(ConfigError::Invalid(format!(
-                    "rebind_allow의 '{name}'이 올바른 DNS 이름이 아닙니다"
+                    "'{name}' in rebind_allow is not a valid DNS name"
                 )));
             }
         }
@@ -2177,13 +2179,13 @@ impl Config {
         ] {
             if value.as_ref().is_some_and(|text| text.len() > 255) {
                 return Err(ConfigError::Invalid(format!(
-                    "{key}는 255바이트를 넘을 수 없습니다. 서버 이름과 버전은 TXT 문자열 하나에 담겨 나갑니다"
+                    "{key} cannot exceed 255 bytes; the server name and version are sent in a single TXT string"
                 )));
             }
         }
         if !(1..=127).contains(&self.name_ratelimit_labels) {
             return Err(ConfigError::Invalid(
-                "name_ratelimit_labels는 1에서 127 사이여야 합니다".into(),
+                "name_ratelimit_labels must be between 1 and 127".into(),
             ));
         }
         for (key, urls) in [
@@ -2192,18 +2194,18 @@ impl Config {
         ] {
             if let Some(url) = urls.iter().find(|url| !valid_http_url(url)) {
                 return Err(ConfigError::Invalid(format!(
-                    "{key}의 '{url}'은 http:// 또는 https:// 주소여야 합니다"
+                    "'{url}' in {key} must be an http:// or https:// URL"
                 )));
             }
         }
         if !self.do_ip4 && !self.do_ip6 {
             return Err(ConfigError::Invalid(
-                "do_ip4와 do_ip6를 모두 끄면 재귀 질의를 보낼 수 있는 주소가 없습니다".into(),
+                "With both do_ip4 and do_ip6 off, there is no address to send recursive queries from".into(),
             ));
         }
         if self.prefer_ip4 && self.prefer_ip6 {
             return Err(ConfigError::Invalid(
-                "prefer_ip4와 prefer_ip6는 함께 켤 수 없습니다".into(),
+                "prefer_ip4 and prefer_ip6 cannot both be on".into(),
             ));
         }
         let mut split_names = std::collections::HashSet::new();
@@ -2214,14 +2216,14 @@ impl Config {
             for name in names {
                 let Some(normalized) = normalized_dns_name(name) else {
                     return Err(ConfigError::Invalid(format!(
-                        "{key}의 '{name}'이 올바른 DNS 이름이 아닙니다"
+                        "'{name}' in {key} is not a valid DNS name"
                     )));
                 };
                 if key == "split_recurse" {
                     split_names.insert(normalized);
                 } else if split_names.contains(&normalized) {
                     return Err(ConfigError::Invalid(format!(
-                        "'{name}'을 split_recurse와 split_forward에 함께 지정할 수 없습니다"
+                        "'{name}' cannot be in both split_recurse and split_forward"
                     )));
                 }
             }
@@ -2255,13 +2257,13 @@ impl Config {
             };
             let Some(normalized) = normalized else {
                 return Err(ConfigError::Invalid(format!(
-                    "local_zones[{index}].name '{}'이 올바른 DNS 이름이 아닙니다",
+                    "local_zones[{index}].name '{}' is not a valid DNS name",
                     zone.name
                 )));
             };
             if !zone_names.insert(normalized) {
                 return Err(ConfigError::Invalid(format!(
-                    "local_zones에 '{}' 영역이 두 번 적혀 있습니다. 한 영역에는 처리 방식을 하나만 정할 수 있습니다",
+                    "Zone '{}' appears twice in local_zones; a zone can have only one kind",
                     zone.name
                 )));
             }
@@ -2269,7 +2271,7 @@ impl Config {
                 && !matches!(zone.kind, LocalZoneKind::Static | LocalZoneKind::Redirect)
             {
                 return Err(ConfigError::Invalid(format!(
-                    "local_zones[{index}].records는 kind가 static이나 redirect일 때만 씁니다"
+                    "local_zones[{index}].records is used only when kind is static or redirect"
                 )));
             }
             zone.answers()
@@ -2280,26 +2282,26 @@ impl Config {
             for name in names {
                 let Some(normalized) = normalized_dns_name(name) else {
                     return Err(ConfigError::Invalid(format!(
-                        "{key}의 '{name}'이 올바른 DNS 이름이 아닙니다"
+                        "'{name}' in {key} is not a valid DNS name"
                     )));
                 };
                 if !seen.insert(normalized) {
                     return Err(ConfigError::Invalid(format!(
-                        "{key}에 '{name}'이 두 번 적혀 있습니다"
+                        "'{name}' appears twice in {key}"
                     )));
                 }
             }
         }
         if self.cachedb_redis_port == 0 {
             return Err(ConfigError::Invalid(
-                "cachedb_redis_port는 1에서 65535 사이여야 합니다".into(),
+                "cachedb_redis_port must be between 1 and 65535".into(),
             ));
         }
         for (index, rewrite) in self.rewrites.iter().enumerate() {
             let answer = rewrite.answer.trim();
             if answer.parse::<IpAddr>().is_err() && !valid_dns_name(answer) {
                 return Err(ConfigError::Invalid(format!(
-                    "rewrites[{index}].answer에는 IP 주소나 DNS 이름을 입력하십시오: '{answer}'"
+                    "rewrites[{index}].answer needs an IP address or DNS name: '{answer}'"
                 )));
             }
         }
@@ -2317,34 +2319,37 @@ impl Config {
         let reject_loop = |label: &str, target: SocketAddr| -> Result<(), ConfigError> {
             if listener_conflicts(&listeners, target) {
                 return Err(ConfigError::Invalid(format!(
-                    "{label}={target}가 이 서버의 DNS 수신 주소를 다시 가리켜 순환 질의를 만듭니다"
+                    "{label}={target} points back to this server's own DNS listening address, which would create a query loop"
                 )));
             }
             Ok(())
         };
         for ip in &self.upstreams {
-            reject_loop("기본 업스트림 DNS 서버", SocketAddr::new(*ip, 53))?;
+            reject_loop("default upstream DNS server", SocketAddr::new(*ip, 53))?;
         }
         for ip in &self.bootstrap {
-            reject_loop("암호화 DNS 주소 확인 서버", SocketAddr::new(*ip, 53))?;
+            reject_loop(
+                "address lookup server for encrypted DNS",
+                SocketAddr::new(*ip, 53),
+            )?;
         }
         for ip in &self.root_hints {
-            reject_loop("루트 DNS 서버", SocketAddr::new(*ip, 53))?;
+            reject_loop("root DNS server", SocketAddr::new(*ip, 53))?;
         }
         for raw in &self.fallback_upstreams {
             if let Some(target) = numeric_upstream_endpoint(raw) {
-                reject_loop("예비 업스트림 DNS 서버", target)?;
+                reject_loop("fallback upstream DNS server", target)?;
             }
         }
         for raw in &self.upstream_urls {
             if let Some(target) = numeric_upstream_endpoint(raw) {
-                reject_loop("암호화 업스트림 DNS 서버", target)?;
+                reject_loop("encrypted upstream DNS server", target)?;
             }
         }
         for zone in &self.stub_zones {
             for raw in &zone.servers {
                 if let Some(target) = numeric_upstream_endpoint(raw) {
-                    reject_loop(&format!("스텁 영역 '{}'", zone.suffix), target)?;
+                    reject_loop(&format!("stub zone '{}'", zone.suffix), target)?;
                 }
             }
         }
@@ -2352,7 +2357,7 @@ impl Config {
             for raw in &client.upstreams {
                 if let Some(target) = numeric_upstream_endpoint(raw) {
                     reject_loop(
-                        &format!("클라이언트 '{}'의 전용 업스트림 DNS 서버", client.name),
+                        &format!("dedicated upstream DNS server of client '{}'", client.name),
                         target,
                     )?;
                 }
@@ -2367,13 +2372,13 @@ impl Config {
         for target in &self.notify {
             if target.address.port() == 0 {
                 return Err(ConfigError::Invalid(
-                    "notify 대상 포트에는 0을 사용할 수 없습니다".into(),
+                    "A notify target port cannot be 0".into(),
                 ));
             }
-            reject_loop("NOTIFY 대상", target.address)?;
+            reject_loop("NOTIFY target", target.address)?;
             if !notify_addresses.insert(target.address) {
                 return Err(ConfigError::Invalid(format!(
-                    "같은 NOTIFY 대상이 두 번 설정되어 있습니다: {}",
+                    "The same NOTIFY target is set twice: {}",
                     target.address
                 )));
             }
@@ -2381,7 +2386,7 @@ impl Config {
                 let key = key.trim().trim_end_matches('.').to_ascii_lowercase();
                 if !configured_tsig_keys.contains(&key) {
                     return Err(ConfigError::Invalid(format!(
-                        "NOTIFY 대상 '{}'에서 지정한 TSIG 키 '{key}'를 `[[tsig_keys]]`에서 찾을 수 없습니다",
+                        "TSIG key '{key}' given for NOTIFY target '{}' is not in `[[tsig_keys]]`",
                         target.address
                     )));
                 }
@@ -2400,20 +2405,20 @@ impl Config {
         for zone in &self.zones {
             if zone.origin.trim().is_empty() {
                 return Err(ConfigError::Invalid(
-                    "`zones` 항목에 DNS 영역 이름(`origin`)을 입력하십시오".into(),
+                    "Enter the DNS zone name (`origin`) in the `zones` entry".into(),
                 ));
             }
             if !zone.dnssec_algorithm.is_empty()
                 && !matches!(zone.dnssec_algorithm.as_str(), "ecdsap256" | "ed25519")
             {
                 return Err(ConfigError::Invalid(format!(
-                    "DNS 영역 '{}'의 `dnssec_algorithm`은 `ecdsap256` 또는 `ed25519`여야 합니다. 입력값: {}",
+                    "`dnssec_algorithm` for DNS zone '{}' must be `ecdsap256` or `ed25519`; got: {}",
                     zone.origin, zone.dnssec_algorithm
                 )));
             }
             if zone.dnssec_nsec3_iterations != 0 {
                 soft.push(format!(
-                    "DNS 영역 '{}'의 `dnssec_nsec3_iterations`는 RFC 9276에 따라 0으로 설정하십시오",
+                    "Set `dnssec_nsec3_iterations` for DNS zone '{}' to 0 per RFC 9276",
                     zone.origin
                 ));
             }
@@ -2421,14 +2426,14 @@ impl Config {
             if let Some(path) = &zone.file {
                 if let Some(previous) = zone_files.insert(path.clone(), origin.clone()) {
                     return Err(ConfigError::Invalid(format!(
-                        "{previous} 영역과 {origin} 영역이 같은 파일을 사용하고 있습니다: {}",
+                        "Zones {previous} and {origin} use the same file: {}",
                         path.display()
                     )));
                 }
             }
             if zone_origins.insert(origin.clone(), "zones").is_some() {
                 return Err(ConfigError::Invalid(format!(
-                    "같은 권한 DNS 영역이 두 번 설정되어 있습니다: {origin}"
+                    "The same authoritative DNS zone is set twice: {origin}"
                 )));
             }
         }
@@ -2436,37 +2441,37 @@ impl Config {
             for zone in zones {
                 if zone.origin.trim().is_empty() {
                     return Err(ConfigError::Invalid(format!(
-                        "{kind} 영역 항목에 영역 이름(`origin`)을 입력하십시오"
+                        "Enter the zone name (`origin`) in the {kind} zone entry"
                     )));
                 }
                 let origin = normalize_origin(&zone.origin);
                 if kind == "catalog" && zone.file.is_some() {
                     return Err(ConfigError::Invalid(
-                        "카탈로그 영역에는 보조 영역 파일 캐시를 사용할 수 없습니다".into(),
+                        "Catalog zones cannot use the secondary zone file cache".into(),
                     ));
                 }
                 if let Some(path) = &zone.file {
                     if let Some(previous) = zone_files.insert(path.clone(), origin.clone()) {
                         return Err(ConfigError::Invalid(format!(
-                            "{previous} 영역과 {origin} 영역이 같은 파일을 사용하고 있습니다: {}",
+                            "Zones {previous} and {origin} use the same file: {}",
                             path.display()
                         )));
                     }
                 }
                 if let Some(previous) = zone_origins.insert(origin.clone(), kind) {
                     return Err(ConfigError::Invalid(format!(
-                        "{origin} 영역이 {previous}와 {kind}에 중복으로 설정되어 있습니다"
+                        "Zone {origin} is set both in {previous} and in {kind}"
                     )));
                 }
                 let primary = zone.primary.ok_or_else(|| {
                     ConfigError::Invalid(format!(
-                        "{kind} 영역 '{origin}'에 주 DNS 서버(`primary`)를 설정하십시오"
+                        "Set the primary DNS server (`primary`) for {kind} zone '{origin}'"
                     ))
                 })?;
                 let port = zone.primary_port.unwrap_or(53);
                 if port == 0 {
                     return Err(ConfigError::Invalid(format!(
-                        "{kind} 영역 '{origin}'의 주 DNS 서버 포트(`primary_port`)에는 0을 사용할 수 없습니다"
+                        "The primary DNS server port (`primary_port`) of {kind} zone '{origin}' cannot be 0"
                     )));
                 }
                 reject_loop(
@@ -2477,7 +2482,7 @@ impl Config {
                     let key = key.trim().trim_end_matches('.').to_ascii_lowercase();
                     if !configured_tsig_keys.contains(&key) {
                         return Err(ConfigError::Invalid(format!(
-                            "{kind} 영역 '{origin}'에서 지정한 TSIG 키 '{key}'를 `[[tsig_keys]]`에서 찾을 수 없습니다"
+                            "TSIG key '{key}' given for {kind} zone '{origin}' is not in `[[tsig_keys]]`"
                         )));
                     }
                 }
@@ -2506,7 +2511,7 @@ impl Config {
         for (addr, label) in tcp_addrs.iter().chain(udp_addrs.iter()) {
             if addr.port() == 0 {
                 return Err(ConfigError::Invalid(format!(
-                    "{label} 수신 주소에는 0번 포트를 사용할 수 없습니다: {addr}"
+                    "{label} listening addresses cannot use port 0: {addr}"
                 )));
             }
         }
@@ -2517,61 +2522,61 @@ impl Config {
         }
 
         if !self.proxy_protocol_ports.is_empty() && self.proxy_protocol_trusted.is_empty() {
-            soft.push("PROXY protocol을 사용할 포트를 지정한 경우 `proxy_protocol_trusted`에 신뢰할 프록시 주소 범위도 설정하십시오".into(),);
+            soft.push("With PROXY protocol ports set, also set the trusted proxy address ranges in `proxy_protocol_trusted`".into(),);
         }
         if self.workers > 256 {
-            return Err(ConfigError::Invalid(
-                "`workers`는 256 이하로 설정하십시오".into(),
-            ));
+            return Err(ConfigError::Invalid("Set `workers` to at most 256".into()));
         }
         if self.max_inflight > 1_000_000 {
             return Err(ConfigError::Invalid(
-                "`max_inflight`는 1,000,000 이하로 설정하십시오".into(),
+                "Set `max_inflight` to at most 1,000,000".into(),
             ));
         }
         if self.cache_size > 10_000_000 {
             return Err(ConfigError::Invalid(
-                "`cache_size`는 10,000,000 이하로 설정하십시오".into(),
+                "Set `cache_size` to at most 10,000,000".into(),
             ));
         }
 
         if self.ns_cache_size > 1_000_000 {
             return Err(ConfigError::Invalid(
-                "`ns_cache_size`는 1,000,000 이하로 설정하십시오".into(),
+                "Set `ns_cache_size` to at most 1,000,000".into(),
             ));
         }
         if self.use_caps_for_id && self.lowercase_outgoing {
             return Err(ConfigError::Invalid(
-                "`use_caps_for_id`와 `lowercase_outgoing`은 함께 켤 수 없습니다. 소문자로 보내려면 `use_caps_for_id`를 끄십시오".into(),
+                "`use_caps_for_id` and `lowercase_outgoing` cannot both be on; turn off `use_caps_for_id` to send lowercase names".into(),
             ));
         }
         if self.cache_shards > 4096 {
             return Err(ConfigError::Invalid(
-                "`cache_shards`는 4,096 이하로 설정하십시오".into(),
+                "Set `cache_shards` to at most 4,096".into(),
             ));
         }
         if self.upstream_concurrency > MAX_UPSTREAMS_PER_RESOLVER {
             return Err(ConfigError::Invalid(format!(
-                "`upstream_concurrency`는 {MAX_UPSTREAMS_PER_RESOLVER} 이하로 설정하십시오"
+                "Set `upstream_concurrency` to at most {MAX_UPSTREAMS_PER_RESOLVER}"
             )));
         }
 
         if self.rate_limit_burst != 0 && self.rate_limit_burst < self.rate_limit_per_sec {
             return Err(ConfigError::Invalid(
-                "순간 허용 질의 수는 초당 허용 질의 수보다 작을 수 없습니다".into(),
+                "The burst allowance cannot be smaller than the per-second rate".into(),
             ));
         }
 
         if self.tls_enabled() && !self.has_cert_source() {
-            soft.push("DoT 또는 DoH 수신 주소를 사용하려면 tls_cert와 tls_key를 지정하거나 tls_self_signed_host로 자체 서명 인증서를 만들어야 합니다".into(),);
+            soft.push("DoT or DoH listening addresses need tls_cert and tls_key, or a self-signed certificate from tls_self_signed_host".into(),);
         }
         if self.tls_cert.is_some() != self.tls_key.is_some() {
-            soft.push("tls_cert와 tls_key는 함께 설정해야 합니다".into());
+            soft.push("tls_cert and tls_key must be set together".into());
         }
 
         if self.tls_client_ca.is_some() && !self.tls_enabled() {
-            soft.push("tls_client_ca(mTLS)를 사용하려면 DoT, DoH, DoQ 또는 DoH3 수신 주소가 하나 이상 있어야 합니다"
-                    .into(),);
+            soft.push(
+                "tls_client_ca (mTLS) needs at least one DoT, DoH, DoQ, or DoH3 listening address"
+                    .into(),
+            );
         }
 
         let mut admin_tokens = std::collections::HashSet::new();
@@ -2595,7 +2600,9 @@ impl Config {
         ] {
             for token in tokens.iter().filter(|token| !token.is_empty()) {
                 if token.chars().count() < 24 {
-                    soft.push(format!("관리 토큰(`{field}`)은 24자 이상으로 설정하십시오"));
+                    soft.push(format!(
+                        "Set the control token (`{field}`) to at least 24 characters"
+                    ));
                 }
                 if readonly {
                     readonly_tokens.insert(token.as_str());
@@ -2605,12 +2612,12 @@ impl Config {
             }
         }
         if admin_tokens.intersection(&readonly_tokens).next().is_some() {
-            soft.push("같은 토큰을 관리자와 읽기 전용 권한에 함께 지정할 수 없습니다".into());
+            soft.push("The same token cannot have both administrator and read-only access".into());
         }
         if let Some(addr) = self.control_listen {
             if !addr.ip().is_loopback() {
                 return Err(ConfigError::Invalid(format!(
-                    "내장 관리 서버는 TLS를 제공하지 않으므로 로컬 주소에만 연결할 수 있습니다: {addr}"
+                    "The built-in management server has no TLS, so it can listen only on a local address: {addr}"
                 )));
             }
         }
@@ -2620,7 +2627,7 @@ impl Config {
             && !self.tftp_listen.ip().is_loopback()
             && self.tftp_write_allow.is_empty()
         {
-            soft.push("외부 주소에서 TFTP 쓰기를 허용하려면 tftp_write_allow에 허용할 소스 CIDR을 설정해야 합니다".into(),);
+            soft.push("To allow TFTP writes from outside addresses, set the allowed source CIDRs in tftp_write_allow".into(),);
         }
 
         if let Some(raw) = &self.dns64_prefix {
@@ -2634,7 +2641,7 @@ impl Config {
         if self.cluster_raft {
             if self.cluster_node_id == 0 {
                 return Err(ConfigError::Invalid(
-                    "Raft 고가용성을 사용할 때 `cluster_node_id`에는 0이 아닌 노드 번호를 지정하십시오".into(),
+                    "With Raft, set `cluster_node_id` to a nonzero node number".into(),
                 ));
             }
             if self
@@ -2644,18 +2651,19 @@ impl Config {
                 .is_none()
             {
                 return Err(ConfigError::Invalid(
-                    "`cluster_raft_listen`에는 운영체제 DNS 조회가 필요 없는 숫자 IP 주소와 포트를 입력하십시오"
+                    "Set `cluster_raft_listen` to a numeric IP address and port that need no operating system DNS lookup"
                         .into(),
                 ));
             }
             if self.cluster_raft_secret.len() < 32 {
                 return Err(ConfigError::Invalid(
-                    "Raft 고가용성을 사용할 때 `cluster_raft_secret`은 32바이트 이상으로 설정하십시오".into(),
+                    "With Raft, set `cluster_raft_secret` to at least 32 bytes".into(),
                 ));
             }
             if !is_hex_len(&self.cluster_raft_node_key, 64) {
                 return Err(ConfigError::Invalid(
-                    "cluster_raft를 사용하려면 cluster_raft_node_key에 64자리 16진수 Ed25519 시드를 설정해야 합니다".into(),
+                    "cluster_raft needs a 64-digit hex Ed25519 seed in cluster_raft_node_key"
+                        .into(),
                 ));
             }
             let mut peer_ids = std::collections::HashSet::new();
@@ -2663,17 +2671,17 @@ impl Config {
             for peer in &self.cluster_raft_peers {
                 let Some((id, rest)) = peer.split_once('@') else {
                     return Err(ConfigError::Invalid(format!(
-                        "`cluster_raft_peers` 항목은 `노드번호@IP주소:포트#공개키` 형식으로 입력하십시오: '{peer}'"
+                        "Write each `cluster_raft_peers` entry as `node-number@IP-address:port#public-key`: '{peer}'"
                     )));
                 };
                 let Some((addr, pubkey)) = rest.split_once('#') else {
                     return Err(ConfigError::Invalid(format!(
-                        "cluster_raft_peers의 각 항목에는 노드 인증에 사용할 64자리 16진수 공개키가 필요합니다: '{peer}'"
+                        "Each cluster_raft_peers entry needs a 64-digit hex public key for node authentication: '{peer}'"
                     )));
                 };
                 let Ok(id) = id.trim().parse::<u64>() else {
                     return Err(ConfigError::Invalid(format!(
-                        "cluster_raft_peers의 노드 ID가 올바르지 않습니다: '{peer}'"
+                        "Invalid node ID in cluster_raft_peers: '{peer}'"
                     )));
                 };
                 if id == 0
@@ -2681,23 +2689,23 @@ impl Config {
                     || addr.trim().parse::<SocketAddr>().is_err()
                 {
                     return Err(ConfigError::Invalid(format!(
-                        "`cluster_raft_peers` 항목에는 운영체제 DNS 조회가 필요 없는 `노드번호@숫자IP:포트#공개키` 형식을 사용하십시오: '{peer}'"
+                        "Write `cluster_raft_peers` entries as `node-number@numeric-IP:port#public-key`, which needs no operating system DNS lookup: '{peer}'"
                     )));
                 }
                 if !is_hex_len(pubkey.trim(), 64) {
                     return Err(ConfigError::Invalid(format!(
-                        "`cluster_raft_peers`의 공개키는 64자리 16진수 Ed25519 공개키여야 합니다: '{peer}'"
+                        "The public key in `cluster_raft_peers` must be a 64-digit hex Ed25519 public key: '{peer}'"
                     )));
                 }
                 if !peer_ids.insert(id) {
                     return Err(ConfigError::Invalid(format!(
-                        "cluster_raft_peers에 같은 노드 ID가 두 번 있습니다: {id}"
+                        "The same node ID appears twice in cluster_raft_peers: {id}"
                     )));
                 }
 
                 if !peer_pubkeys.insert(pubkey.trim().to_ascii_lowercase()) {
                     return Err(ConfigError::Invalid(format!(
-                        "cluster_raft_peers에서 여러 노드가 같은 공개 키를 사용하고 있습니다: '{peer}'"
+                        "Several nodes in cluster_raft_peers use the same public key: '{peer}'"
                     )));
                 }
             }
@@ -2706,18 +2714,18 @@ impl Config {
         for u in &self.users {
             if u.name.is_empty() {
                 return Err(ConfigError::Invalid(
-                    "[[users]] 항목에 name을 입력해야 합니다".into(),
+                    "A [[users]] entry needs a name".into(),
                 ));
             }
             if u.password_hash.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "사용자 '{}'에 password_hash를 설정해야 합니다",
+                    "User '{}' needs a password_hash",
                     u.name
                 )));
             }
             if !matches!(u.role.as_str(), "admin" | "readonly") {
                 return Err(ConfigError::Invalid(format!(
-                    "사용자 '{}'의 role은 admin 또는 readonly여야 합니다. 입력값: '{}'",
+                    "The role of user '{}' must be admin or readonly; got: '{}'",
                     u.name, u.role
                 )));
             }
@@ -2727,7 +2735,7 @@ impl Config {
             names.sort_unstable();
             if names.windows(2).any(|w| w[0] == w[1]) {
                 return Err(ConfigError::Invalid(
-                    "[[users]]에 같은 사용자 이름이 두 번 있습니다".into(),
+                    "The same user name appears twice in [[users]]".into(),
                 ));
             }
         }
@@ -2735,32 +2743,32 @@ impl Config {
         if let Some(ep) = &self.zones_etcd {
             if !ep.starts_with("http://") && !ep.starts_with("https://") {
                 return Err(ConfigError::Invalid(
-                    "zones_etcd는 http:// 또는 https:// 엔드포인트여야 합니다".into(),
+                    "zones_etcd must be an http:// or https:// endpoint".into(),
                 ));
             }
             if ep.starts_with("https://") && self.zones_etcd_ca.is_none() {
                 return Err(ConfigError::Invalid(
-                    "https zones_etcd를 쓰려면 zones_etcd_ca에 CA PEM 파일을 지정해야 합니다. etcd 연결은 시스템 신뢰 저장소를 쓰지 않습니다".into(),
+                    "An https zones_etcd needs a CA PEM file in zones_etcd_ca; etcd connections do not use the system trust store".into(),
                 ));
             }
         }
 
         if self.xfr_tsig_required && self.tsig_keys.is_empty() {
             soft.push(
-                "xfr_tsig_required가 켜져 있지만 [[tsig_keys]]가 없어 모든 영역 전송 요청을 거부합니다. 전송을 허용하려면 [[tsig_keys]]를 한 개 이상 설정하십시오"
+                "xfr_tsig_required is on but there are no [[tsig_keys]], so every zone transfer request is refused; set at least one [[tsig_keys]] entry to allow transfers"
                     .into(),
             );
         }
         if self.update_tsig_required && self.tsig_keys.is_empty() {
             soft.push(
-                "update_tsig_required가 켜져 있지만 [[tsig_keys]]가 없어 모든 동적 갱신 요청을 거부합니다. 갱신을 허용하려면 [[tsig_keys]]를 한 개 이상 설정하십시오"
+                "update_tsig_required is on but there are no [[tsig_keys]], so every dynamic update request is refused; set at least one [[tsig_keys]] entry to allow updates"
                     .into(),
             );
         }
         for k in &self.tsig_keys {
             if k.name.trim().is_empty() || !valid_base64_secret(&k.secret, 16) {
                 return Err(ConfigError::Invalid(
-                    "[[tsig_keys]] 항목에는 name과 16바이트 이상의 올바른 Base64 secret이 필요합니다"
+                    "A [[tsig_keys]] entry needs a name and a valid Base64 secret of at least 16 bytes"
                         .into(),
                 ));
             }
@@ -2803,12 +2811,12 @@ impl Config {
         if self.mode == Mode::Public && self.reachable_from_other_hosts() {
             if self.rate_limit_per_sec == 0 || self.rate_limit_burst == 0 {
                 out.push(
-                    "공개 모드에서 클라이언트별 질의 속도를 제한하지 않았습니다. 이 서버가 DNS 증폭·반사 공격에 악용될 수 있으므로 rate_limit_per_sec와 rate_limit_burst를 설정하십시오.".into(),
+                    "Public mode has no per-client query rate limit. This server could be abused for DNS amplification and reflection attacks; set rate_limit_per_sec and rate_limit_burst.".into(),
                 );
             }
             if self.acl_default_allow() {
                 out.push(
-                    "공개 모드가 모든 원본 주소의 요청을 허용하고 있습니다. 실제로 서비스할 주소 범위만 acl_allow에 지정하십시오.".into(),
+                    "Public mode accepts requests from every source address. Set acl_allow to only the address ranges you actually serve.".into(),
                 );
             }
         }
@@ -3433,7 +3441,9 @@ fn first_bind_conflict(addrs: &[(SocketAddr, &str)]) -> Option<String> {
                 || (a_ip.is_unspecified() || b_ip.is_unspecified())
                     && (same_family || dual_stack_wildcard);
             if overlap {
-                return Some(format!("DNS 수신 주소 충돌: {la}={a} 와 {lb}={b}"));
+                return Some(format!(
+                    "DNS listening address conflict: {la}={a} and {lb}={b}"
+                ));
             }
         }
     }
@@ -3514,9 +3524,9 @@ impl std::fmt::Display for ConfigError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::Parse(s) => write!(f, "설정 내용을 해석하지 못했습니다: {s}"),
-            ConfigError::Invalid(s) => write!(f, "설정값이 올바르지 않습니다: {s}"),
-            ConfigError::Io(s) => write!(f, "설정 파일을 읽지 못했습니다: {s}"),
+            ConfigError::Parse(s) => write!(f, "Could not parse the configuration: {s}"),
+            ConfigError::Invalid(s) => write!(f, "Invalid configuration value: {s}"),
+            ConfigError::Io(s) => write!(f, "Could not read the configuration file: {s}"),
         }
     }
 }
@@ -3760,7 +3770,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "zones_postgres",
         "zones_sql_table",
     ] {
-        check_kind(root, key, "문자열", Value::as_str)?;
+        check_kind(root, key, "string", Value::as_str)?;
     }
     for key in [
         "acl_allow_ids",
@@ -3844,12 +3854,12 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     validate_nested_config(root)?;
     check_named_ip_array::<Ipv4Addr>(root, "local_a", "IPv4")?;
     check_named_ip_array::<Ipv6Addr>(root, "local_aaaa", "IPv6")?;
-    check_optional_parse::<SocketAddr>(root, "control_listen", "주소:포트")?;
-    check_optional_parse::<Ipv4Addr>(root, "block_ipv4", "IPv4 주소")?;
-    check_optional_parse::<Ipv6Addr>(root, "block_ipv6", "IPv6 주소")?;
-    check_optional_parse::<IpAddr>(root, "ecs_custom_ip", "IP 주소")?;
-    check_optional_parse::<Ipv4Addr>(root, "query_source", "IPv4 주소")?;
-    check_optional_parse::<Ipv6Addr>(root, "query_source_v6", "IPv6 주소")?;
+    check_optional_parse::<SocketAddr>(root, "control_listen", "address:port")?;
+    check_optional_parse::<Ipv4Addr>(root, "block_ipv4", "IPv4 address")?;
+    check_optional_parse::<Ipv6Addr>(root, "block_ipv6", "IPv6 address")?;
+    check_optional_parse::<IpAddr>(root, "ecs_custom_ip", "IP address")?;
+    check_optional_parse::<Ipv4Addr>(root, "query_source", "IPv4 address")?;
+    check_optional_parse::<Ipv6Addr>(root, "query_source_v6", "IPv6 address")?;
 
     for key in [
         "recursion_limit",
@@ -3920,7 +3930,11 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         check_int_range::<usize>(root, key)?;
     }
     check_int_array_range::<u16>(root, "proxy_protocol_ports")?;
-    check_typed_array::<IpNet>(root, "proxy_protocol_trusted", "CIDR(예: 127.0.0.1/32)")?;
+    check_typed_array::<IpNet>(
+        root,
+        "proxy_protocol_trusted",
+        "CIDR (for example 127.0.0.1/32)",
+    )?;
     if let Some(value) = root.get("tftp_listen") {
         let valid = value
             .as_str()
@@ -3928,7 +3942,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
             .is_some();
         if !valid {
             return Err(ConfigError::Invalid(
-                "tftp_listen: 주소:포트 형식이어야 합니다".into(),
+                "tftp_listen: expected address:port".into(),
             ));
         }
     }
@@ -3938,20 +3952,28 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_nested_int_range::<u16>(root, "secondary", "primary_port")?;
     check_nested_int_range::<u16>(root, "catalog", "primary_port")?;
 
-    check_typed_array::<IpNet>(root, "acl_allow", "CIDR(예: 192.168.0.0/24)")?;
-    check_typed_array::<IpNet>(root, "acl_deny", "CIDR(예: 192.168.0.0/24)")?;
-    check_typed_array::<IpNet>(root, "tftp_write_allow", "CIDR(예: 192.168.0.0/24)")?;
-    check_typed_array::<IpNet>(root, "rate_limit_allow", "CIDR(예: 192.168.0.0/24)")?;
-    check_typed_array::<IpNet>(root, "bogus_nxdomain", "CIDR(예: 10.10.10.10/32)")?;
+    check_typed_array::<IpNet>(root, "acl_allow", "CIDR (for example 192.168.0.0/24)")?;
+    check_typed_array::<IpNet>(root, "acl_deny", "CIDR (for example 192.168.0.0/24)")?;
+    check_typed_array::<IpNet>(
+        root,
+        "tftp_write_allow",
+        "CIDR (for example 192.168.0.0/24)",
+    )?;
+    check_typed_array::<IpNet>(
+        root,
+        "rate_limit_allow",
+        "CIDR (for example 192.168.0.0/24)",
+    )?;
+    check_typed_array::<IpNet>(root, "bogus_nxdomain", "CIDR (for example 10.10.10.10/32)")?;
     check_typed_array::<IpNet>(root, "recurse_deny_server", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_server", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_deny_answers", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_answers", "CIDR")?;
     check_typed_array::<IpNet>(root, "xfr_allow", "CIDR")?;
     check_typed_array::<IpNet>(root, "update_allow", "CIDR")?;
-    check_typed_array::<IpAddr>(root, "upstreams", "IP 주소(예: 1.1.1.1)")?;
-    check_typed_array::<IpAddr>(root, "bootstrap", "IP 주소")?;
-    check_typed_array::<IpAddr>(root, "root_hints", "IP 주소")?;
+    check_typed_array::<IpAddr>(root, "upstreams", "IP address (for example 1.1.1.1)")?;
+    check_typed_array::<IpAddr>(root, "bootstrap", "IP address")?;
+    check_typed_array::<IpAddr>(root, "root_hints", "IP address")?;
     for k in [
         "listen",
         "listen_dot",
@@ -3960,7 +3982,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "listen_doh3",
         "listen_dnscrypt",
     ] {
-        check_typed_array::<SocketAddr>(root, k, "주소:포트(예: 0.0.0.0:53)")?;
+        check_typed_array::<SocketAddr>(root, k, "address:port (for example 0.0.0.0:53)")?;
     }
 
     for (i, v) in garr(root, "fallback_upstreams").iter().enumerate() {
@@ -3969,7 +3991,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "fallback_upstreams",
                 i,
                 v,
-                "IP 또는 지원되는 scheme://host[:port] 형식",
+                "an IP or a supported scheme://host[:port]",
             ));
         };
         if !valid_upstream_spec(raw, true) {
@@ -3977,7 +3999,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "fallback_upstreams",
                 i,
                 v,
-                "IP 또는 udp|tcp|tls|https|quic|h3://host[:port] 형식",
+                "an IP or udp|tcp|tls|https|quic|h3://host[:port]",
             ));
         }
     }
@@ -3988,7 +4010,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "upstream_urls",
                 i,
                 v,
-                "지원되는 scheme://host[:port] 형식",
+                "a supported scheme://host[:port]",
             ));
         };
         if !valid_upstream_spec(raw, false) {
@@ -3996,7 +4018,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "upstream_urls",
                 i,
                 v,
-                "udp|tcp|tls|https|quic|h3://host[:port] 형식",
+                "udp|tcp|tls|https|quic|h3://host[:port]",
             ));
         }
     }
@@ -4087,7 +4109,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             "clients",
             index,
             "ids",
-            "CIDR(예: 192.168.0.0/24)",
+            "CIDR (for example 192.168.0.0/24)",
             false,
         )?;
         for field in [
@@ -4105,7 +4127,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 };
                 if !valid_upstream_spec(raw, true) {
                     return Err(ConfigError::Invalid(format!(
-                        "clients[{index}].upstreams[{item}]: IP 또는 udp|tcp|tls|https|quic|h3://host[:port] 형식이어야 합니다"
+                        "clients[{index}].upstreams[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port]"
                     )));
                 }
             }
@@ -4116,14 +4138,14 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         let action = required_nested_str(table, "policy", index, "action")?;
         if !matches!(action, "block" | "allow" | "refuse" | "rewrite") {
             return Err(ConfigError::Invalid(format!(
-                "`policy[{index}].action`에는 `block`, `allow`, `refuse`, `rewrite` 중 하나를 입력하십시오"
+                "Set `policy[{index}].action` to one of `block`, `allow`, `refuse`, or `rewrite`"
             )));
         }
         if action == "rewrite" {
             let raw = required_nested_str(table, "policy", index, "rewrite")?;
             if raw.parse::<Ipv4Addr>().is_err() {
                 return Err(ConfigError::Invalid(format!(
-                    "`policy[{index}].rewrite`에 올바른 IPv4 주소를 입력하십시오"
+                    "Set `policy[{index}].rewrite` to a valid IPv4 address"
                 )));
             }
         }
@@ -4133,12 +4155,12 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             for (item, value) in values.iter().enumerate() {
                 let Some(raw) = value.as_str() else {
                     return Err(ConfigError::Invalid(format!(
-                        "`policy[{index}].qtypes[{item}]`에는 DNS 레코드 형식을 문자열로 입력하십시오"
+                        "`policy[{index}].qtypes[{item}]` must be a DNS record type written as a string"
                     )));
                 };
                 if !valid_qtype(raw) {
                     return Err(ConfigError::Invalid(format!(
-                        "`policy[{index}].qtypes[{item}]`에 알 수 없는 DNS 레코드 형식이 지정되었습니다: '{raw}'"
+                        "`policy[{index}].qtypes[{item}]` has an unknown DNS record type: '{raw}'"
                     )));
                 }
             }
@@ -4147,12 +4169,12 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             for (item, value) in values.iter().enumerate() {
                 let Some(raw) = value.as_str() else {
                     return Err(ConfigError::Invalid(format!(
-                        "`policy[{index}].days[{item}]`에는 요일을 문자열로 입력하십시오"
+                        "`policy[{index}].days[{item}]` must be a day of the week written as a string"
                     )));
                 };
                 if !valid_day(raw) {
                     return Err(ConfigError::Invalid(format!(
-                        "`policy[{index}].days[{item}]`에 알 수 없는 요일이 지정되었습니다: '{raw}'"
+                        "`policy[{index}].days[{item}]` has an unknown day of the week: '{raw}'"
                     )));
                 }
             }
@@ -4172,7 +4194,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                     .map(|(item, value)| {
                         value.as_str().ok_or_else(|| {
                             ConfigError::Invalid(format!(
-                                "`update_policy[{index}].types[{item}]`에는 DNS 레코드 형식을 문자열로 입력하십시오"
+                                "`update_policy[{index}].types[{item}]` must be a DNS record type written as a string"
                             ))
                         })
                     })
@@ -4189,7 +4211,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         let role = required_nested_str(table, "users", index, "role")?;
         if !matches!(role, "admin" | "readonly") {
             return Err(ConfigError::Invalid(format!(
-                "users[{index}].role에는 `admin` 또는 `readonly`를 정확히 입력하십시오"
+                "Set users[{index}].role to exactly `admin` or `readonly`"
             )));
         }
     }
@@ -4198,7 +4220,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         required_nested_str(table, "views", index, "name")?;
         let Some(_) = nested_array(table, "views", index, "clients", true)? else {
             return Err(ConfigError::Invalid(format!(
-                "views[{index}].clients에 한 개 이상의 적용 대상을 입력해야 합니다"
+                "views[{index}].clients needs at least one target"
             )));
         };
         check_nested_string_array(table, "views", index, "clients", true)?;
@@ -4223,14 +4245,14 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             "deny" | "refuse" | "static" | "redirect" | "always_null" | "transparent"
         ) {
             return Err(ConfigError::Invalid(format!(
-                "local_zones[{index}].kind에 알 수 없는 값이 있습니다: '{kind}'"
+                "local_zones[{index}].kind has an unknown value: '{kind}'"
             )));
         }
         let records_required = matches!(kind, "static" | "redirect");
         check_nested_string_array(table, "local_zones", index, "records", records_required)?;
         if records_required && table.get("records").is_none() {
             return Err(ConfigError::Invalid(format!(
-                "local_zones[{index}].records에 한 개 이상의 응답 값을 입력해야 합니다"
+                "local_zones[{index}].records needs at least one answer value"
             )));
         }
     }
@@ -4239,18 +4261,18 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         required_nested_str(table, "stub_zones", index, "suffix")?;
         let Some(servers) = nested_array(table, "stub_zones", index, "servers", true)? else {
             return Err(ConfigError::Invalid(format!(
-                "stub_zones[{index}].servers에 한 개 이상의 업스트림 DNS 서버를 입력해야 합니다"
+                "stub_zones[{index}].servers needs at least one upstream DNS server"
             )));
         };
         for (item, value) in servers.iter().enumerate() {
             let raw = value.as_str().ok_or_else(|| {
                 ConfigError::Invalid(format!(
-                    "stub_zones[{index}].servers[{item}]: 문자열이어야 합니다"
+                    "stub_zones[{index}].servers[{item}]: must be a string"
                 ))
             })?;
             if !valid_upstream_spec(raw, true) {
                 return Err(ConfigError::Invalid(format!(
-                    "stub_zones[{index}].servers[{item}]: IP 또는 udp|tcp|tls|https|quic|h3://host[:port] 형식이어야 합니다"
+                    "stub_zones[{index}].servers[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port]"
                 )));
             }
         }
@@ -4265,7 +4287,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         let address = required_nested_str(table, "notify", index, "address")?;
         if address.parse::<SocketAddr>().is_err() {
             return Err(ConfigError::Invalid(format!(
-                "notify[{index}].address에는 주소:포트 형식을 입력해야 합니다"
+                "notify[{index}].address must be address:port"
             )));
         }
         check_nested_str(table, "notify", index, "tsig_key")?;
@@ -4293,7 +4315,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             let primary = required_nested_str(table, array, index, "primary")?;
             if primary.parse::<IpAddr>().is_err() {
                 return Err(ConfigError::Invalid(format!(
-                    "{array}[{index}].primary에는 숫자 IP 주소를 입력해야 합니다"
+                    "{array}[{index}].primary must be a numeric IP address"
                 )));
             }
             for field in ["file", "tsig_key"] {
@@ -4305,18 +4327,18 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
     for (index, table) in garr(root, "service_schedule").iter().enumerate() {
         let Some(days) = nested_array(table, "service_schedule", index, "days", true)? else {
             return Err(ConfigError::Invalid(format!(
-                "service_schedule[{index}].days에 한 개 이상의 요일을 입력해야 합니다"
+                "service_schedule[{index}].days needs at least one day"
             )));
         };
         for (item, value) in days.iter().enumerate() {
             let Some(raw) = value.as_str() else {
                 return Err(ConfigError::Invalid(format!(
-                    "service_schedule[{index}].days[{item}]: 문자열이어야 합니다"
+                    "service_schedule[{index}].days[{item}]: must be a string"
                 )));
             };
             if !valid_day(raw) && raw != "all" {
                 return Err(ConfigError::Invalid(format!(
-                    "service_schedule[{index}].days[{item}]: 알 수 없는 요일 '{raw}'"
+                    "service_schedule[{index}].days[{item}]: unknown day '{raw}'"
                 )));
             }
         }
@@ -4324,17 +4346,17 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         let end = required_nested_str(table, "service_schedule", index, "end")?;
         let start_min = parse_hhmm_checked(start).ok_or_else(|| {
             ConfigError::Invalid(format!(
-                "service_schedule[{index}].start: HH:MM(00:00..23:59) 형식이어야 합니다"
+                "service_schedule[{index}].start: expected HH:MM (00:00..23:59)"
             ))
         })?;
         let end_min = parse_hhmm_checked(end).ok_or_else(|| {
             ConfigError::Invalid(format!(
-                "service_schedule[{index}].end: HH:MM(00:00..23:59) 형식이어야 합니다"
+                "service_schedule[{index}].end: expected HH:MM (00:00..23:59)"
             ))
         })?;
         if start_min == end_min {
             return Err(ConfigError::Invalid(format!(
-                "service_schedule[{index}]의 start와 end는 서로 달라야 합니다"
+                "service_schedule[{index}] start and end must differ"
             )));
         }
     }
@@ -4346,7 +4368,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
         let qtype = table.get("qtype").and_then(Value::as_str).unwrap_or("A");
         if !matches!(qtype, "A" | "AAAA") {
             return Err(ConfigError::Invalid(format!(
-                "dynamic_records[{index}].qtype: A 또는 AAAA만 허용"
+                "dynamic_records[{index}].qtype: only A or AAAA is allowed"
             )));
         }
         let mode = table
@@ -4355,18 +4377,18 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             .unwrap_or("random");
         if !matches!(mode, "random" | "weighted" | "round_robin" | "failover") {
             return Err(ConfigError::Invalid(format!(
-                "dynamic_records[{index}].mode: 알 수 없는 값 '{mode}'"
+                "dynamic_records[{index}].mode: unknown value '{mode}'"
             )));
         }
         let Some(values) = nested_array(table, "dynamic_records", index, "values", true)? else {
             return Err(ConfigError::Invalid(format!(
-                "dynamic_records[{index}].values에 한 개 이상의 값을 입력해야 합니다"
+                "dynamic_records[{index}].values needs at least one value"
             )));
         };
         for (item, value) in values.iter().enumerate() {
             let raw = value.as_str().ok_or_else(|| {
                 ConfigError::Invalid(format!(
-                    "dynamic_records[{index}].values[{item}]: 문자열이어야 합니다"
+                    "dynamic_records[{index}].values[{item}]: must be a string"
                 ))
             })?;
             let (ip_raw, weight_raw) = raw
@@ -4374,18 +4396,18 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 .map_or((raw, None), |(ip, weight)| (ip, Some(weight)));
             let ip: IpAddr = ip_raw.trim().parse().map_err(|_| {
                 ConfigError::Invalid(format!(
-                    "dynamic_records[{index}].values[{item}]에 올바른 IP 주소를 입력해야 합니다"
+                    "dynamic_records[{index}].values[{item}] needs a valid IP address"
                 ))
             })?;
             if (qtype == "A" && !ip.is_ipv4()) || (qtype == "AAAA" && !ip.is_ipv6()) {
                 return Err(ConfigError::Invalid(format!(
-                    "dynamic_records[{index}].values[{item}]: qtype과 IP family가 다름"
+                    "dynamic_records[{index}].values[{item}]: IP family does not match qtype"
                 )));
             }
             if let Some(weight) = weight_raw {
                 if mode != "weighted" || weight.trim().parse::<u32>().is_err() {
                     return Err(ConfigError::Invalid(format!(
-                        "dynamic_records[{index}].values[{item}].weight 값의 형식이 올바르지 않습니다"
+                        "dynamic_records[{index}].values[{item}].weight is malformed"
                     )));
                 }
             }
@@ -4404,11 +4426,11 @@ fn check_nested_fields(
 ) -> Result<(), ConfigError> {
     let fields = table
         .as_table()
-        .ok_or_else(|| ConfigError::Invalid(format!("{array}[{index}]: 테이블이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{array}[{index}]: must be a table")))?;
     for field in fields.keys() {
         if !allowed.contains(&field.as_str()) {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}]: 알 수 없는 키 '{field}'"
+                "{array}[{index}]: unknown key '{field}'"
             )));
         }
     }
@@ -4425,7 +4447,7 @@ fn validate_update_policy_values<'a>(
 ) -> Result<(), ConfigError> {
     if !matches!(action, "grant" | "deny") {
         return Err(ConfigError::Invalid(format!(
-            "`update_policy[{index}].action`에는 `grant` 또는 `deny`를 정확히 입력하십시오"
+            "Set `update_policy[{index}].action` to exactly `grant` or `deny`"
         )));
     }
     if identity.is_empty()
@@ -4433,7 +4455,7 @@ fn validate_update_policy_values<'a>(
         || (identity != "*" && identity.contains('*'))
     {
         return Err(ConfigError::Invalid(format!(
-            "`update_policy[{index}].identity`에는 정확한 TSIG 이름 또는 `*`를 입력하십시오"
+            "Set `update_policy[{index}].identity` to an exact TSIG name or `*`"
         )));
     }
     let name_valid = if name == "*" {
@@ -4445,13 +4467,13 @@ fn validate_update_policy_values<'a>(
     };
     if name.is_empty() || name != name.trim() || !name_valid {
         return Err(ConfigError::Invalid(format!(
-            "`update_policy[{index}].name`에는 정확한 DNS 이름, `*.하위영역`, 또는 `*`를 입력하십시오"
+            "Set `update_policy[{index}].name` to an exact DNS name, `*.subdomain`, or `*`"
         )));
     }
     for (item, rtype) in types.into_iter().enumerate() {
         if parse_update_rtype(rtype).is_none() {
             return Err(ConfigError::Invalid(format!(
-                "`update_policy[{index}].types[{item}]`에 허용되지 않은 DNS 레코드 형식이 지정되었습니다: '{rtype}'"
+                "`update_policy[{index}].types[{item}]` has a DNS record type that is not allowed: '{rtype}'"
             )));
         }
     }
@@ -4470,9 +4492,7 @@ fn required_nested_str<'a>(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "{array}[{index}].{field}에 비어 있지 않은 문자열을 입력해야 합니다"
-            ))
+            ConfigError::Invalid(format!("{array}[{index}].{field} needs a non-empty string"))
         })
 }
 
@@ -4486,7 +4506,7 @@ fn check_nested_str(
     if let Some(value) = table.get(field) {
         if value.as_str().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}].{field}: 문자열이어야 합니다"
+                "{array}[{index}].{field}: must be a string"
             )));
         }
     }
@@ -4503,7 +4523,7 @@ fn check_nested_bool(
     if let Some(value) = table.get(field) {
         if value.as_bool().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}].{field}: true 또는 false여야 합니다"
+                "{array}[{index}].{field}: must be true or false"
             )));
         }
     }
@@ -4524,7 +4544,7 @@ fn check_nested_named_ip_array<T: FromStr>(
     for (item, value) in values.iter().enumerate() {
         let pair = value.as_array().ok_or_else(|| {
             ConfigError::Invalid(format!(
-                "{array}[{index}].{field}[{item}]: [name, address] 배열이어야 합니다"
+                "{array}[{index}].{field}[{item}]: must be a [name, address] array"
             ))
         })?;
         let valid = pair.len() == 2
@@ -4534,7 +4554,7 @@ fn check_nested_named_ip_array<T: FromStr>(
                 .is_some_and(|address| address.parse::<T>().is_ok());
         if !valid {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}].{field}[{item}]: [DNS 이름, {address_kind} 주소] 형식이어야 합니다"
+                "{array}[{index}].{field}[{item}]: expected [DNS name, {address_kind} address]"
             )));
         }
     }
@@ -4553,11 +4573,11 @@ fn nested_array<'a>(
         return Ok(None);
     };
     let values = raw.as_array().ok_or_else(|| {
-        ConfigError::Invalid(format!("{array}[{index}].{field}: 배열이어야 합니다"))
+        ConfigError::Invalid(format!("{array}[{index}].{field}: must be an array"))
     })?;
     if reject_empty && values.is_empty() {
         return Err(ConfigError::Invalid(format!(
-            "{array}[{index}].{field}: 빈 배열은 전체 대상을 뜻하는 것으로 오해될 수 있습니다. 이 필드를 지우거나 값을 하나 이상 지정하십시오"
+            "{array}[{index}].{field}: an empty array could be mistaken for matching everything; remove the field or give at least one value"
         )));
     }
     Ok(Some(values))
@@ -4577,7 +4597,7 @@ fn check_nested_string_array(
     for (item, value) in values.iter().enumerate() {
         if value.as_str().is_none_or(|raw| raw.trim().is_empty()) {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}].{field}[{item}]: 비어 있지 않은 문자열이어야 합니다"
+                "{array}[{index}].{field}[{item}]: must be a non-empty string"
             )));
         }
     }
@@ -4600,7 +4620,7 @@ fn check_nested_typed_array<T: FromStr>(
         let valid = value.as_str().is_some_and(|raw| raw.parse::<T>().is_ok());
         if !valid {
             return Err(ConfigError::Invalid(format!(
-                "{array}[{index}].{field}[{item}]: {hint} 형식이어야 합니다"
+                "{array}[{index}].{field}[{item}]: expected {hint}"
             )));
         }
     }
@@ -4651,13 +4671,13 @@ pub fn validate_acme_request(
 ) -> Result<(), String> {
     if !matches!(challenge, "http01" | "dns01") {
         return Err(format!(
-            "acme_challenge는 http01 또는 dns01이어야 합니다: {challenge:?}"
+            "acme_challenge must be http01 or dns01: {challenge:?}"
         ));
     }
     if let Some(url) = directory_url {
         if !valid_acme_directory_url(url) {
             return Err(format!(
-                "acme_directory_url은 https:// 주소여야 합니다. http://는 localhost와 루프백 주소에만 허용합니다: {url:?}"
+                "acme_directory_url must be an https:// URL; http:// is allowed only for localhost and loopback addresses: {url:?}"
             ));
         }
     }
@@ -4668,12 +4688,12 @@ pub fn validate_acme_request(
         };
         if !valid_dns_name(name) || name.contains('_') {
             return Err(format!(
-                "acme_domains에는 인증서에 넣을 호스트 이름을 입력해야 합니다: {domain:?}"
+                "acme_domains needs host names to put in the certificate: {domain:?}"
             ));
         }
         if wildcard && challenge != "dns01" {
             return Err(format!(
-                "와일드카드 이름은 dns01로만 발급할 수 있습니다: {domain}"
+                "Wildcard names can be issued only with dns01: {domain}"
             ));
         }
     }
@@ -4688,7 +4708,7 @@ pub fn validate_acme_request(
         });
         if !valid {
             return Err(format!(
-                "acme_contact_email에는 ops@example.com 같은 전자우편 주소를 입력해야 합니다: {email:?}"
+                "acme_contact_email needs an email address such as ops@example.com: {email:?}"
             ));
         }
     }
@@ -4839,20 +4859,20 @@ fn validate_optional_time_pair(
         (None, None) => Ok(()),
         (Some(start), Some(end)) => {
             let start = start.as_str().and_then(parse_hhmm_checked).ok_or_else(|| {
-                ConfigError::Invalid(format!("{array}[{index}].start는 HH:MM 형식이어야 합니다"))
+                ConfigError::Invalid(format!("{array}[{index}].start must be HH:MM"))
             })?;
             let end = end.as_str().and_then(parse_hhmm_checked).ok_or_else(|| {
-                ConfigError::Invalid(format!("{array}[{index}].end는 HH:MM 형식이어야 합니다"))
+                ConfigError::Invalid(format!("{array}[{index}].end must be HH:MM"))
             })?;
             if start == end {
                 return Err(ConfigError::Invalid(format!(
-                    "{array}[{index}]의 start와 end는 서로 달라야 합니다"
+                    "{array}[{index}] start and end must differ"
                 )));
             }
             Ok(())
         }
         _ => Err(ConfigError::Invalid(format!(
-            "{array}[{index}]: start와 end를 함께 설정해야 합니다"
+            "{array}[{index}]: start and end must be set together"
         ))),
     }
 }
@@ -4866,9 +4886,7 @@ fn check_kind<'a, T>(
 ) -> Result<(), ConfigError> {
     if let Some(value) = root.get(key) {
         if extract(value).is_none() {
-            return Err(ConfigError::Invalid(format!(
-                "{key}: {expected} 타입이어야 합니다"
-            )));
+            return Err(ConfigError::Invalid(format!("{key}: must be a {expected}")));
         }
     }
     Ok(())
@@ -4884,7 +4902,7 @@ fn check_wasm_plugins(root: &Value) -> Result<(), ConfigError> {
     };
     let Some(values) = value.as_array() else {
         return Err(ConfigError::Invalid(
-            "wasm_plugins: 배열 타입이어야 합니다".into(),
+            "wasm_plugins: must be an array".into(),
         ));
     };
     for (idx, entry) in values.iter().enumerate() {
@@ -4892,7 +4910,7 @@ fn check_wasm_plugins(root: &Value) -> Result<(), ConfigError> {
             Value::String(path) => {
                 if path.is_empty() {
                     return Err(ConfigError::Invalid(format!(
-                        "wasm_plugins[{idx}]: 빈 경로"
+                        "wasm_plugins[{idx}]: empty path"
                     )));
                 }
             }
@@ -4900,7 +4918,7 @@ fn check_wasm_plugins(root: &Value) -> Result<(), ConfigError> {
                 for key in table.keys() {
                     if !matches!(key.as_str(), "path" | "name" | "fail_mode") {
                         return Err(ConfigError::Invalid(format!(
-                            "wasm_plugins[{idx}]: 알 수 없는 키 '{key}'"
+                            "wasm_plugins[{idx}]: unknown key '{key}'"
                         )));
                     }
                 }
@@ -4910,13 +4928,13 @@ fn check_wasm_plugins(root: &Value) -> Result<(), ConfigError> {
                     .is_some_and(|s| !s.is_empty());
                 if !path_ok {
                     return Err(ConfigError::Invalid(format!(
-                        "wasm_plugins[{idx}].path에는 비어 있지 않은 파일 경로를 입력해야 합니다"
+                        "wasm_plugins[{idx}].path needs a non-empty file path"
                     )));
                 }
                 if let Some(name) = table.get("name") {
                     if name.as_str().is_none() {
                         return Err(ConfigError::Invalid(format!(
-                            "wasm_plugins[{idx}]: name은 문자열이어야 합니다"
+                            "wasm_plugins[{idx}]: name must be a string"
                         )));
                     }
                 }
@@ -4926,14 +4944,14 @@ fn check_wasm_plugins(root: &Value) -> Result<(), ConfigError> {
                         .is_some_and(|s| WASM_FAIL_MODE_VALUES.contains(&s));
                     if !valid {
                         return Err(ConfigError::Invalid(format!(
-                            "wasm_plugins[{idx}].fail_mode에는 다음 값 중 하나를 사용해야 합니다: {WASM_FAIL_MODE_VALUES:?}"
+                            "wasm_plugins[{idx}].fail_mode must be one of: {WASM_FAIL_MODE_VALUES:?}"
                         )));
                     }
                 }
             }
             _ => {
                 return Err(ConfigError::Invalid(format!(
-                    "wasm_plugins[{idx}]에는 파일 경로 문자열 또는 {{ path, name, fail_mode }} 형식의 테이블을 사용해야 합니다"
+                    "wasm_plugins[{idx}] must be a file path string or a table of the form {{ path, name, fail_mode }}"
                 )));
             }
         }
@@ -4947,14 +4965,12 @@ fn check_string_array(root: &Value, key: &str) -> Result<(), ConfigError> {
         return Ok(());
     };
     let Some(values) = value.as_array() else {
-        return Err(ConfigError::Invalid(format!(
-            "{key}: 배열 타입이어야 합니다"
-        )));
+        return Err(ConfigError::Invalid(format!("{key}: must be an array")));
     };
     for (idx, value) in values.iter().enumerate() {
         if value.as_str().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{key}[{idx}]: 문자열이어야 합니다"
+                "{key}[{idx}]: must be a string"
             )));
         }
     }
@@ -4967,13 +4983,11 @@ fn check_enum(root: &Value, key: &str, allowed: &[&str]) -> Result<(), ConfigErr
         return Ok(());
     };
     let Some(value) = value.as_str() else {
-        return Err(ConfigError::Invalid(format!(
-            "{key}: 문자열 타입이어야 합니다"
-        )));
+        return Err(ConfigError::Invalid(format!("{key}: must be a string")));
     };
     if !allowed.contains(&value) {
         return Err(ConfigError::Invalid(format!(
-            "{key}: 알 수 없는 값 '{value}': 허용값: {}",
+            "{key}: unknown value '{value}'; allowed values: {}",
             allowed.join("|")
         )));
     }
@@ -4993,8 +5007,9 @@ where
     };
     let i = value
         .as_int()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 정수 타입이어야 합니다")))?;
-    T::try_from(i).map_err(|_| ConfigError::Invalid(format!("{key}: 정수 범위를 벗어남(={i})")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be an integer")))?;
+    T::try_from(i)
+        .map_err(|_| ConfigError::Invalid(format!("{key}: integer out of range (={i})")))?;
     Ok(())
 }
 
@@ -5008,13 +5023,14 @@ where
     };
     let values = raw
         .as_array()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 배열 타입이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be an array")))?;
     for (idx, value) in values.iter().enumerate() {
-        let i = value.as_int().ok_or_else(|| {
-            ConfigError::Invalid(format!("{key}[{idx}]에 정수를 입력해야 합니다"))
+        let i = value
+            .as_int()
+            .ok_or_else(|| ConfigError::Invalid(format!("{key}[{idx}] must be an integer")))?;
+        T::try_from(i).map_err(|_| {
+            ConfigError::Invalid(format!("{key}[{idx}]: integer out of range (={i})"))
         })?;
-        T::try_from(i)
-            .map_err(|_| ConfigError::Invalid(format!("{key}[{idx}]: 정수 범위를 벗어남(={i})")))?;
     }
     Ok(())
 }
@@ -5029,22 +5045,20 @@ where
     };
     let values = raw
         .as_array()
-        .ok_or_else(|| ConfigError::Invalid(format!("{array_key}: 배열 타입이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{array_key}: must be an array")))?;
     for (idx, value) in values.iter().enumerate() {
         if value.as_table().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{array_key}[{idx}]: 테이블이어야 합니다"
+                "{array_key}[{idx}]: must be a table"
             )));
         }
         if let Some(raw_field) = value.get(field) {
             let i = raw_field.as_int().ok_or_else(|| {
-                ConfigError::Invalid(format!(
-                    "{array_key}[{idx}].{field}: 정수 타입이어야 합니다"
-                ))
+                ConfigError::Invalid(format!("{array_key}[{idx}].{field}: must be an integer"))
             })?;
             T::try_from(i).map_err(|_| {
                 ConfigError::Invalid(format!(
-                    "{array_key}[{idx}].{field}: 정수 범위를 벗어남(={i})"
+                    "{array_key}[{idx}].{field}: integer out of range (={i})"
                 ))
             })?;
         }
@@ -5056,7 +5070,7 @@ where
 fn reject_negative_ints(v: &Value, path: &str) -> Result<(), ConfigError> {
     match v {
         Value::Int(i) if *i < 0 => Err(ConfigError::Invalid(format!(
-            "{}에는 0 이상의 정수를 입력해야 합니다. 입력값: {i}",
+            "{} must be a non-negative integer; got: {i}",
             if path.is_empty() { "<root>" } else { path }
         ))),
         Value::Array(a) => {
@@ -5087,11 +5101,11 @@ fn check_table_array(root: &Value, key: &str) -> Result<(), ConfigError> {
     };
     let values = raw
         .as_array()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 배열-테이블이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be an array of tables")))?;
     for (index, value) in values.iter().enumerate() {
         if value.as_table().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{key}[{index}]: 테이블이어야 합니다"
+                "{key}[{index}]: must be a table"
             )));
         }
     }
@@ -5109,11 +5123,11 @@ fn check_optional_parse<T: FromStr>(
     };
     let value = raw
         .as_str()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 문자열 타입이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be a string")))?;
     value
         .parse::<T>()
         .map(|_| ())
-        .map_err(|_| ConfigError::Invalid(format!("{key}: {hint} 형식이어야 합니다")))
+        .map_err(|_| ConfigError::Invalid(format!("{key}: expected {hint}")))
 }
 
 /** @brief 이름-주소 배열을 검사한다. */
@@ -5127,22 +5141,22 @@ fn check_named_ip_array<T: FromStr>(
     };
     let values = raw
         .as_array()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 배열 타입이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be an array")))?;
     for (index, value) in values.iter().enumerate() {
         let pair = value.as_array().ok_or_else(|| {
-            ConfigError::Invalid(format!("{key}[{index}]: [name, address] 배열이어야 합니다"))
+            ConfigError::Invalid(format!("{key}[{index}]: must be a [name, address] array"))
         })?;
         if pair.len() != 2 || pair[0].as_str().is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{key}[{index}]: [name, address] 형식이어야 합니다"
+                "{key}[{index}]: expected [name, address]"
             )));
         }
-        let address = pair[1].as_str().ok_or_else(|| {
-            ConfigError::Invalid(format!("{key}[{index}][1]: 문자열이어야 합니다"))
-        })?;
+        let address = pair[1]
+            .as_str()
+            .ok_or_else(|| ConfigError::Invalid(format!("{key}[{index}][1]: must be a string")))?;
         if address.parse::<T>().is_err() {
             return Err(ConfigError::Invalid(format!(
-                "{key}[{index}][1]: {hint} 형식이어야 합니다"
+                "{key}[{index}][1]: expected {hint}"
             )));
         }
     }
@@ -5156,7 +5170,7 @@ fn check_typed_array<T: FromStr>(root: &Value, key: &str, hint: &str) -> Result<
     };
     let values = raw
         .as_array()
-        .ok_or_else(|| ConfigError::Invalid(format!("{key}: 배열 타입이어야 합니다")))?;
+        .ok_or_else(|| ConfigError::Invalid(format!("{key}: must be an array")))?;
     for (i, v) in values.iter().enumerate() {
         let ok = v.as_str().map(|s| s.parse::<T>().is_ok()).unwrap_or(false);
         if !ok {
@@ -5171,9 +5185,9 @@ fn invalid_elem(key: &str, idx: usize, v: &Value, hint: &str) -> ConfigError {
     let shown = v
         .as_str()
         .map(String::from)
-        .unwrap_or_else(|| "<비문자열>".to_string());
+        .unwrap_or_else(|| "<not a string>".to_string());
     ConfigError::Invalid(format!(
-        "{key}[{idx}] 값이 올바르지 않습니다: \"{shown}\". {hint}"
+        "Invalid value for {key}[{idx}]: \"{shown}\". {hint}"
     ))
 }
 
@@ -5190,7 +5204,7 @@ fn validate_cluster_peer_url(raw: &str) -> Result<(), ConfigError> {
         .or_else(|| peer.strip_prefix("http://"))
     else {
         return Err(ConfigError::Invalid(format!(
-            "`cluster_peers` 항목은 `https://호스트[:포트]` 형식이어야 합니다: '{raw}'"
+            "`cluster_peers` entries must be `https://host[:port]`: '{raw}'"
         )));
     };
     let authority = host_port.split(['/', '?', '#']).next().unwrap_or("");
@@ -5200,7 +5214,7 @@ fn validate_cluster_peer_url(raw: &str) -> Result<(), ConfigError> {
     };
     if host.is_empty() {
         return Err(ConfigError::Invalid(format!(
-            "`cluster_peers` 항목에 호스트가 없습니다: '{raw}'"
+            "A `cluster_peers` entry has no host: '{raw}'"
         )));
     }
     if peer.starts_with("http://") {
@@ -5211,7 +5225,7 @@ fn validate_cluster_peer_url(raw: &str) -> Result<(), ConfigError> {
                 .unwrap_or(false);
         if !loopback {
             return Err(ConfigError::Invalid(format!(
-                "`cluster_peers`에는 컨트롤 플레인 토큰이 전송되므로 루프백이 아닌 상대에는 `https://`를 사용하십시오: '{raw}'"
+                "`cluster_peers` receive the control plane token, so use `https://` for peers that are not on loopback: '{raw}'"
             )));
         }
     }
@@ -5221,23 +5235,17 @@ fn validate_cluster_peer_url(raw: &str) -> Result<(), ConfigError> {
 /** @brief DNS64 접두사가 규격이 허용한 길이인지. */
 fn validate_dns64_prefix(raw: &str) -> Result<(), ConfigError> {
     let (address, prefix) = raw.split_once('/').ok_or_else(|| {
-        ConfigError::Invalid(
-            "dns64_prefix는 IPv6/prefix 형식이어야 합니다(예: 64:ff9b::/96)".into(),
-        )
+        ConfigError::Invalid("dns64_prefix must be IPv6/prefix (for example 64:ff9b::/96)".into())
     })?;
     address.parse::<Ipv6Addr>().map_err(|_| {
-        ConfigError::Invalid(format!(
-            "dns64_prefix의 IPv6 주소가 올바르지 않습니다: '{address}'"
-        ))
+        ConfigError::Invalid(format!("Invalid IPv6 address in dns64_prefix: '{address}'"))
     })?;
-    let prefix: u8 = prefix.parse().map_err(|_| {
-        ConfigError::Invalid(format!(
-            "dns64_prefix의 길이가 올바르지 않습니다: '{prefix}'"
-        ))
-    })?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ConfigError::Invalid(format!("Invalid dns64_prefix length: '{prefix}'")))?;
     if prefix != 96 {
         return Err(ConfigError::Invalid(format!(
-            "현재 DNS64 합성기는 RFC 6052 /96만 지원함(입력 /{prefix})"
+            "The DNS64 synthesizer supports only the RFC 6052 /96 prefix (got /{prefix})"
         )));
     }
     Ok(())
@@ -5662,11 +5670,15 @@ pub fn known_keys() -> &'static [&'static str] {
 pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     strict_check(root)?;
     let table = root.as_table().ok_or_else(|| {
-        ConfigError::Parse("설정 문서의 최상위 값은 TOML 테이블이어야 합니다".into())
+        ConfigError::Parse(
+            "The top-level value of the configuration document must be a TOML table".into(),
+        )
     })?;
     for k in table.keys() {
         if !KNOWN_KEYS.contains(&k.as_str()) {
-            return Err(ConfigError::Invalid(format!("알 수 없는 설정 키: {k}")));
+            return Err(ConfigError::Invalid(format!(
+                "Unknown configuration key: {k}"
+            )));
         }
     }
     let d = Config::default();
@@ -5681,13 +5693,18 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     if root.get("listen").is_some() {
         c.listen = gparsevec(root, "listen");
     }
+    // 업스트림 기본값은 upstream_urls 의 암호화 서버다. 평문 upstreams 만 적은 사람에게
+    // 기본 암호화 서버를 남기면, 적은 적 없는 서버로 질의가 나가고 평문과 섞였다는 경고까지
+    // 받는다. 적지 않은 것은 고른 것이 아니므로 한쪽을 적으면 다른 쪽 기본값을 물린다.
+    let urls_written = root.get("upstream_urls").is_some();
+    if urls_written {
+        c.upstream_urls = gstrvec(root, "upstream_urls");
+    }
     if root.get("upstreams").is_some() {
         c.upstreams = gparsevec(root, "upstreams");
-    } else if !gstrvec(root, "upstream_urls").is_empty() {
-        // 암호화 업스트림만 적은 사람에게 기본 평문 업스트림을 남기면 안 된다. 고르는 기준이
-        // 지연이라 평문이 언제나 이기고, 결국 거의 모든 질의가 평문으로 나간다.
-        // 적지 않은 것은 고른 것이 아니므로 기본값을 물린다.
-        c.upstreams.clear();
+        if !urls_written {
+            c.upstream_urls.clear();
+        }
     }
     c.blocklists = gpathvec(root, "blocklists");
     c.allowlists = gpathvec(root, "allowlists");
@@ -5903,7 +5920,6 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
             end: gstr(t, "end").unwrap_or_default(),
         })
         .collect();
-    c.upstream_urls = gstrvec(root, "upstream_urls");
     c.bootstrap = gparsevec(root, "bootstrap");
     c.root_hints = gparsevec(root, "root_hints");
     c.fallback_upstreams = gstrvec(root, "fallback_upstreams");
@@ -6003,7 +6019,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
         Some(i) if (512..=4096).contains(&i) => i as u16,
         Some(i) => {
             return Err(ConfigError::Invalid(format!(
-                "edns_buffer_size는 512..=4096 범위여야 합니다(입력값: {i})"
+                "edns_buffer_size must be within 512..=4096 (got {i})"
             )));
         }
         None => d.edns_buffer_size,
@@ -6207,7 +6223,7 @@ mod tests {
         let error = Config::from_toml_str("udp_worker_overlap = 2\n")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("알 수 없는 설정 키: udp_worker_overlap"));
+        assert!(error.contains("Unknown configuration key: udp_worker_overlap"));
         assert!(!known_keys().contains(&"udp_worker_overlap"));
     }
 
@@ -7034,7 +7050,7 @@ answer = \"target.example\"
         assert!(
             cfg.open_resolver_warnings()
                 .iter()
-                .any(|line| line.contains("증폭")),
+                .any(|line| line.contains("amplification")),
             "막지는 않되 위험은 반드시 알려야 합니다"
         );
     }
@@ -7327,32 +7343,54 @@ rate_limit_burst = 0
 
     #[test]
     /**
-     * @brief 암호화 업스트림만 적으면 기본 평문 업스트림이 남지 않는지.
+     * @brief 업스트림을 적지 않으면 암호화 기본값만 쓰고, 한쪽을 적으면 다른 쪽 기본값이
+     *        물러나는지.
      *
-     * @details 업스트림을 고르는 기준이 왕복 시간이라 평문이 언제나 이긴다. 기본값이 남아
-     *          있으면 upstream_urls만 적은 사람의 질의가 사실상 전부 평문으로 나간다.
+     * @details 업스트림을 고르는 기준이 왕복 시간이라 평문이 언제나 이긴다. 기본값이 섞여
+     *          남으면 한쪽만 적은 사람의 질의가 적은 적 없는 서버로 나간다.
      */
-    fn naming_only_encrypted_upstreams_drops_the_plain_defaults() {
-        assert_eq!(
-            Config::default().upstreams.len(),
-            2,
-            "이 테스트는 기본 평문 업스트림이 있다는 전제 위에 있습니다"
+    fn naming_one_upstream_list_drops_the_other_default() {
+        let defaults = Config::from_toml_str("").unwrap();
+        assert!(
+            defaults.upstreams.is_empty(),
+            "기본값에 평문 업스트림이 있습니다"
         );
+        assert_eq!(
+            defaults.upstream_urls,
+            DEFAULT_UPSTREAM_URLS.map(str::to_string).to_vec(),
+            "기본값은 Cloudflare DNS-over-HTTP/3 입니다"
+        );
+        assert!(DEFAULT_UPSTREAM_URLS
+            .iter()
+            .all(|url| url.starts_with("h3://1.") && url.ends_with("#cloudflare-dns.com")));
+
+        let plain_only = Config::from_toml_str("upstreams = [\"9.9.9.9\"]\n").unwrap();
+        assert!(
+            plain_only.upstream_urls.is_empty(),
+            "평문만 적었는데 기본 암호화 업스트림이 남았습니다: {:?}",
+            plain_only.upstream_urls
+        );
+        assert!(!plain_only.mixes_plain_and_encrypted_upstreams());
 
         let encrypted_only =
             Config::from_toml_str("upstream_urls = [\"tls://1.1.1.1:853#cloudflare-dns.com\"]\n")
                 .unwrap();
         assert!(
             encrypted_only.upstreams.is_empty(),
-            "암호화만 적었는데 평문 업스트림이 남았습니다: {:?}",
+            "암호화만 적었는데 평문 업스트림이 생겼습니다: {:?}",
             encrypted_only.upstreams
+        );
+        assert_eq!(
+            encrypted_only.upstream_urls.len(),
+            1,
+            "적은 것만 남아야 합니다"
         );
         assert!(!encrypted_only.mixes_plain_and_encrypted_upstreams());
         assert!(
             !encrypted_only
                 .advisories()
                 .iter()
-                .any(|line| line.contains("평문 업스트림")),
+                .any(|line| line.contains("plain upstream")),
             "섞이지 않았는데 섞였다고 알렸습니다"
         );
 
@@ -7367,12 +7405,9 @@ rate_limit_burst = 0
             mixed
                 .advisories()
                 .iter()
-                .any(|line| line.contains("평문 업스트림")),
+                .any(|line| line.contains("plain upstream")),
             "섞였다는 것을 알리지 않았습니다"
         );
-
-        // 아무것도 적지 않으면 기본값 그대로다.
-        assert_eq!(Config::from_toml_str("").unwrap().upstreams.len(), 2);
     }
 
     #[test]
@@ -7609,7 +7644,7 @@ types = ["A", "AAAA", "CAA", "257"]
             let text = format!("{array} = [{{ oops = true }}]\n");
             let error = Config::from_toml_str(&text).unwrap_err().to_string();
             assert!(
-                error.contains("알 수 없는 키 'oops'"),
+                error.contains("unknown key 'oops'"),
                 "{array}가 내부 오타를 명시적으로 거부해야 함: {error}"
             );
         }
@@ -7718,7 +7753,7 @@ types = ["A", "AAAA", "CAA", "257"]
     fn validator_nsec3_iterations_cannot_exceed_the_hard_limit() {
         assert!(Config::from_toml_str("val_nsec3_max_iterations = 150\n").is_ok());
         let error = Config::from_toml_str("val_nsec3_max_iterations = 151\n").unwrap_err();
-        assert!(format!("{error}").contains("150 이하"));
+        assert!(format!("{error}").contains("at most 150"));
     }
 
     #[test]

@@ -1,9 +1,12 @@
 /*!
- * @brief 운영 기록과 사용자에게 닿는 오류 문구가 읽을 만한 한국어로 남아 있는지 검사한다.
+ * @brief 운영 기록과 사용자에게 닿는 오류 문구가 읽을 만한 영어 문장으로 남아 있는지
+ *        검사한다.
  *
  * @details 장애가 났을 때 기록을 읽는 사람은 이 코드를 쓴 사람이 아니다. 구현 용어를
  *          그대로 적거나 값만 찍어 두면 무엇이 잘못됐는지 알 수 없다. 기록이 아예
  *          사라지는 것도 같은 문제라, 호출 수와 이벤트 코드 수에 바닥을 둔다.
+ * @details 서버가 내보내는 문구는 영어 하나로 쓰고, 언어별 표기는 대시보드와 설정
+ *          스키마의 번역 사전이 맡는다. 스키마 번역 사전은 그래서 한글 검사에서 뺀다.
  * @note 검사 범위는 실제로 동작하는 소스뿐이다. 테스트 디렉터리와 파일 안의 테스트 모듈은
  *       사용자에게 보이지 않으므로 세지 않는다.
  * @warning 두 최소 기준은 계산해서 얻은 값이 아니라 의도적으로 고정한 값이다. 기록을
@@ -25,79 +28,47 @@ const MIN_EXPLICIT_EVENTS: usize = 350;
 const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
 /**
- * @brief 기록 문구에 남으면 안 되는 구현 용어.
- *
- * @note 업스트림은 여기 넣지 않는다. 설정 키가 upstream_urls 이고 대시보드도 같은 말을
- *       쓰므로, 상류나 상위 서버로 옮기면 읽는 사람이 자기가 적은 항목과 이어 붙이지
- *       못한다. 이 목록은 옮길 말이 있는 용어만 담는다.
- */
-const BANNED_IN_LOGS: &[&str] = &[
-    "세대 교체",
-    "재로드",
-    "롤백",
-    "리빌드",
-    "폴백",
-    "프리페치",
-    "스테일",
-    "핫리로드",
-    "리스너",
-    "zone CRUD",
-    "record add",
-    "record delete",
-    "dry explain",
-    "native 스택",
-    "vendor DB",
-    "compiled filter",
-    "background refresh",
-    "영속 lease",
-];
-
-/**
  * @brief 사용자에게 닿는 오류 문구에 남으면 안 되는 구현 용어.
  *
- * @note 업스트림을 빼 두는 이유는 BANNED_IN_LOGS 와 같다.
+ * @note 업스트림은 여기 넣지 않는다. 설정 키가 upstream_urls 이고 대시보드도 같은 말을
+ *       쓰므로, 다른 말로 바꾸면 읽는 사람이 자기가 적은 항목과 이어 붙이지 못한다.
+ *       이 목록은 운영자가 쓰는 말로 바꿔 적을 수 있는 용어만 담는다.
  */
 const BANNED_IN_PUBLIC: &[&str] = &[
-    "config 파일",
-    "client 없음",
     "zone backend",
-    "구독 backend",
-    "필터 backend",
-    "세대 교체",
-    "재로드",
-    "롤백",
-    "리빌드",
-    "폴백",
-    "프리페치",
-    "스테일",
-    "핫리로드",
-    "리스너",
+    "subscription backend",
+    "filter backend",
+    "generation swap",
+    "hot-reload",
+    "hotreload",
     "zone CRUD",
     "dry explain",
-    "native 스택",
+    "native stack",
     "vendor DB",
-    "compiled filter",
 ];
 
 /** @brief 무엇이 잘못됐는지 알려 주지 않는 짧은 진단 문구. */
 const TERSE_DIAGNOSTICS: &[&str] = &[
-    "파싱 실패",
-    "디코드 실패",
-    "미지원",
-    "오버플로 오류",
-    "오버플로 포인터 없음",
-    "형식 오류",
-    "길이 오류",
-    "범위 오류",
-    "크기 오류",
-    "너무 짧음",
+    "parse failed",
+    "decode failed",
+    "overflow error",
+    "format error",
+    "length error",
+    "range error",
+    "size error",
     "deadline elapsed",
     "length checked",
-    "SASLContinue 기대",
-    "envelope 일치",
+    "SASLContinue expected",
+    "envelope",
     "fallback origin/serial",
     "delta serial",
 ];
+
+/**
+ * @brief 한글을 담아도 되는 소스. 설정 스키마의 언어별 표기 사전이다.
+ * @details 이 파일의 한국어는 서버 문구가 아니라 대시보드가 고르는 번역 자료다.
+ */
+const LOCALIZATION_SOURCES: &[&str] = &["crates/onetdns-config/src/schema.rs"];
 
 /** @brief 값만 담긴 문구. 무엇에 대한 값인지 알 수 없다. */
 const DYNAMIC_ONLY: &[&str] = &["{label}", "{warning}", "{error}"];
@@ -266,12 +237,24 @@ fn macro_calls(where_: &str, source: &str) -> Vec<LogCall> {
 }
 
 /**
- * @brief Rust 소스에서 문자열 리터럴만 추출한다.
- * @details 주석 안의 글자, 문자 리터럴, 줄바꿈이 들어간 긴 문구는 사용자 문구가
- *          아니므로 걸러 낸다.
+ * @brief Rust 소스에서 한 줄짜리 문자열 리터럴만 추출한다.
+ * @details 줄바꿈이 들어간 긴 문구는 도움말이나 문서 본문이라 짧은 오류 문구 검사에서
+ *          뺀다.
  * @return 줄 번호와 값의 쌍.
  */
 fn string_literals(source: &str) -> Vec<(usize, String)> {
+    every_literal(source)
+        .into_iter()
+        .filter(|(_, value)| !value.contains("\\n") && value.chars().count() <= 600)
+        .collect()
+}
+
+/**
+ * @brief Rust 소스의 문자열 리터럴을 길이와 관계없이 전부 추출한다.
+ * @details 주석 안의 글자와 문자 리터럴은 문자열이 아니므로 걸러 낸다.
+ * @return 줄 번호와 값의 쌍.
+ */
+fn every_literal(source: &str) -> Vec<(usize, String)> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
     let mut index = 0usize;
@@ -319,9 +302,7 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
                 };
                 let end = quote + 1 + offset;
                 let value = &source[quote + 1..end];
-                if !value.contains("\\n") && value.chars().count() <= 600 {
-                    out.push((source[..index].matches('\n').count() + 1, value.to_string()));
-                }
+                out.push((source[..index].matches('\n').count() + 1, value.to_string()));
                 index = end + terminator.len();
                 continue;
             }
@@ -363,9 +344,7 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
                 return out;
             }
             let value = &source[start + 1..end];
-            if !value.contains("\\n") && value.chars().count() <= 600 {
-                out.push((source[..index].matches('\n').count() + 1, value.to_string()));
-            }
+            out.push((source[..index].matches('\n').count() + 1, value.to_string()));
             index = end + 1;
             continue;
         }
@@ -428,34 +407,22 @@ fn every_log_call_says_something() {
     );
 }
 
-/** @brief 기록 문구가 구현 용어이거나 한국어가 아니면 실패한다. */
+/**
+ * @brief 기록 문구에 한글이 섞이면 실패한다.
+ * @details 기록은 운영자가 검색하고 이슈에 붙여 넣는 텍스트라 영어 하나로 맞춘다.
+ *          대시보드 화면 문구는 이 검사와 무관하다.
+ */
 #[test]
-fn log_messages_stay_readable_korean() {
-    let calls = all_log_calls();
-    let awkward: Vec<String> = calls
+fn log_messages_are_english() {
+    let korean: Vec<String> = all_log_calls()
         .iter()
-        .filter_map(|call| {
-            let hits = contains_any(&call.message, BANNED_IN_LOGS);
-            (!hits.is_empty())
-                .then(|| format!("{}:{} {:?} {hits:?}", call.where_, call.line, call.message))
-        })
-        .collect();
-    assert!(
-        awkward.is_empty(),
-        "기록 문구에 구현 용어가 남아 있습니다:\n  - {}",
-        awkward.join("\n  - ")
-    );
-
-    let untranslated: Vec<String> = calls
-        .iter()
-        .filter(|call| matches!(call.level, "info" | "warn" | "error"))
-        .filter(|call| !has_korean(&call.message))
+        .filter(|call| has_korean(&call.message))
         .map(|call| format!("{}:{} {:?}", call.where_, call.line, call.message))
         .collect();
     assert!(
-        untranslated.is_empty(),
-        "한국어가 아닌 운영 기록이 남아 있습니다:\n  - {}",
-        untranslated.join("\n  - ")
+        korean.is_empty(),
+        "한국어로 남은 운영 기록이 있습니다:\n  - {}",
+        korean.join("\n  - ")
     );
 }
 
@@ -500,9 +467,6 @@ fn user_facing_errors_avoid_implementation_wording() {
         let name = rel(&path);
         let text = read(&path);
         for (line, value) in string_literals(production_prefix(&text)) {
-            if !has_korean(&value) {
-                continue;
-            }
             let hits = contains_any(&value, BANNED_IN_PUBLIC);
             if !hits.is_empty() {
                 found.push(format!("{name}:{line} {value:?} {hits:?}"));
@@ -512,6 +476,34 @@ fn user_facing_errors_avoid_implementation_wording() {
     assert!(
         found.is_empty(),
         "사용자가 보는 오류에 구현 용어가 남아 있습니다:\n  - {}",
+        found.join("\n  - ")
+    );
+}
+
+/**
+ * @brief 서버 문자열에 한글이 남으면 실패한다.
+ * @details 오류, 도움말, 관리 API 본문, 명령 출력은 모두 영어로 쓴다. 화면 언어에
+ *          맞춘 표기는 대시보드와 스키마 번역 사전이 맡는다.
+ */
+#[test]
+fn runtime_strings_are_english() {
+    let mut found = Vec::new();
+    for path in production_sources() {
+        let name = rel(&path);
+        if LOCALIZATION_SOURCES.contains(&name.as_str()) {
+            continue;
+        }
+        let text = read(&path);
+        for (line, value) in every_literal(production_prefix(&text)) {
+            if has_korean(&value) {
+                let shown: String = value.chars().take(80).collect();
+                found.push(format!("{name}:{line} {shown:?}"));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "한국어로 남은 서버 문자열이 있습니다:\n  - {}",
         found.join("\n  - ")
     );
 }

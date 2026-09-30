@@ -315,7 +315,7 @@ fn serve_conn(
     if len == 0 || len > onetdns_dnscrypt::server::MAX_TCP_QUERY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "DNSCrypt TCP 질의 길이가 상한을 벗어났습니다",
+            "DNSCrypt TCP query length is out of range",
         ));
     }
     let mut packet = vec![0u8; len];
@@ -331,7 +331,7 @@ fn serve_conn(
     let Ok(prefix) = u16::try_from(payload.len()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "DNSCrypt TCP 응답이 길이 접두사에 담기지 않습니다",
+            "DNSCrypt TCP response does not fit in the length prefix",
         ));
     };
     write_all_until(&mut stream, &prefix.to_be_bytes(), shutdown, stop, deadline)?;

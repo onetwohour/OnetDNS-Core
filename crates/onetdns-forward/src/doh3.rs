@@ -75,7 +75,7 @@ pub(crate) fn exchange(
             }
             let res = {
                 let mut p = pool.borrow_mut();
-                let conn = p.get_mut(&key).expect("방금 삽입됨");
+                let conn = p.get_mut(&key).expect("Just inserted");
                 let r = roundtrip(conn, server_name, path, wire, request, deadline);
                 if r.is_ok() {
                     harvest_sessions(conn.h3.conn_mut(), addr, server_name, b"h3", trust);
@@ -92,7 +92,7 @@ pub(crate) fn exchange(
                             addr = %addr,
                             path = path,
                             reason = ?e,
-                            "기존 연결을 재사용하지 못해 새 연결로 다시 시도합니다"
+                            "Could not reuse the existing connection; retrying on a new one"
                         );
                     }
                     if attempt == 1 {
@@ -154,7 +154,7 @@ fn roundtrip(
     c.h3.set_now(c.created.elapsed().as_millis() as u64);
     c.h3.on_timeout(c.created.elapsed().as_millis() as u64);
     if c.h3.is_closed() {
-        return Err(ForwardError::Io("DoH3 연결 유휴 종료".into()));
+        return Err(ForwardError::Io("DoH3 connection closed after idle".into()));
     }
 
     check_peer_revocation(c.h3.conn_mut(), &c.server_name, &mut c.revocation_checked)?;
@@ -162,7 +162,7 @@ fn roundtrip(
     c.h3.set_now(c.created.elapsed().as_millis() as u64);
     let sid =
         c.h3.send_request(authority, path, &q)
-            .map_err(|error| ForwardError::Io(format!("DoH3 요청 송신: {error}")))?;
+            .map_err(|error| ForwardError::Io(format!("DoH3 request send: {error}")))?;
     flush_out(&c.sock, &mut c.h3)?;
 
     let silence_limit = Duration::from_millis(silence_limit_ms(c.h3.conn_mut().base_pto_ms()));
@@ -170,7 +170,7 @@ fn roundtrip(
     let mut buf = [0u8; onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize];
     while Instant::now() < deadline {
         if c.h3.is_closed() {
-            return Err(ForwardError::Io("DoH3 연결 종료".into()));
+            return Err(ForwardError::Io("DoH3 connection closed".into()));
         }
         c.h3.set_now(c.created.elapsed().as_millis() as u64);
         if recv_once(&c.sock, &mut c.h3, &mut buf)? {
@@ -179,7 +179,7 @@ fn roundtrip(
             c.h3.on_timeout(c.created.elapsed().as_millis() as u64);
             if last_rx.elapsed() >= silence_limit {
                 return Err(ForwardError::Io(
-                    "DoH3 전송 계층 무응답: 경로 사망 판정".into(),
+                    "DoH3 transport unresponsive; path considered dead".into(),
                 ));
             }
         }
@@ -189,7 +189,7 @@ fn roundtrip(
         for (rid, status, body) in c.h3.take_responses() {
             if rid == sid {
                 if status != 200 {
-                    return Err(ForwardError::Io(format!("DoH3 비 200 상태: {status}")));
+                    return Err(ForwardError::Io(format!("DoH3 non-200 status: {status}")));
                 }
                 let resp = Message::parse(&body).map_err(|_| ForwardError::BadResponse)?;
                 validate_response(request, &resp, Some(0))?;

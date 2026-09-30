@@ -147,8 +147,9 @@ pub(crate) fn harden_windows_secret_acl(path: &std::path::Path) -> std::io::Resu
     if converted == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let descriptor = NonNull::new(descriptor)
-        .ok_or_else(|| std::io::Error::other("Windows 보안 설명자를 변환하지 못했습니다"))?;
+    let descriptor = NonNull::new(descriptor).ok_or_else(|| {
+        std::io::Error::other("Could not convert the Windows security descriptor")
+    })?;
     let applied = unsafe {
         SetFileSecurityW(
             path_w.as_ptr(),
@@ -223,7 +224,7 @@ fn retry_windows_replace(mut replace: impl FnMut() -> std::io::Result<()>) -> st
             Err(error) => return Err(error),
         }
     }
-    unreachable!("Windows 파일 교체 재시도 반복은 반드시 반환합니다")
+    unreachable!("The Windows file replace retry loop always returns")
 }
 
 #[derive(Clone)]
@@ -285,7 +286,7 @@ pub(crate) fn rollback_cert_key(
         (Ok(()), Err(cert_err)) => Err(cert_err),
         (Err(key_err), Err(cert_err)) => Err(std::io::Error::new(
             key_err.kind(),
-            format!("개인키와 인증서 파일을 모두 이전 상태로 되돌리지 못했습니다: 개인키={key_err}; 인증서={cert_err}"),
+            format!("Could not restore both the private key and the certificate file: key={key_err}; certificate={cert_err}"),
         )),
     }
 }
@@ -300,7 +301,7 @@ pub(crate) fn commit_cert_key(
     if cert_path == key_path {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "인증서와 개인키는 서로 다른 파일 경로에 저장해야 합니다",
+            "The certificate and private key must be saved to different file paths",
         ));
     }
     let backup = CertKeyBackup {
@@ -311,7 +312,7 @@ pub(crate) fn commit_cert_key(
         if let Err(rollback_err) = rollback_cert_key(cert_path, key_path, &backup) {
             return Err(std::io::Error::new(
                 e.kind(),
-                format!("인증서 파일을 저장하지 못했고 이전 파일 복구에도 실패했습니다: 저장 오류={e}; 복구 오류={rollback_err}"),
+                format!("Could not save the certificate file, and restoring the previous file also failed: save error={e}; restore error={rollback_err}"),
             ));
         }
         return Err(e);
@@ -320,7 +321,7 @@ pub(crate) fn commit_cert_key(
         if let Err(rollback_err) = rollback_cert_key(cert_path, key_path, &backup) {
             return Err(std::io::Error::new(
                 e.kind(),
-                format!("개인키 파일을 저장하지 못했고 이전 파일 복구에도 실패했습니다: 저장 오류={e}; 복구 오류={rollback_err}"),
+                format!("Could not save the private key file, and restoring the previous file also failed: save error={e}; restore error={rollback_err}"),
             ));
         }
         return Err(e);
@@ -336,7 +337,7 @@ pub(crate) fn with_rollback_result(
 ) -> String {
     match result {
         Ok(()) => primary,
-        Err(rollback_error) => format!("{primary}; 이전 설정으로 되돌리는 과정에서도 오류가 발생했습니다: {operation}: {rollback_error}"),
+        Err(rollback_error) => format!("{primary}; reverting to the previous configuration also failed: {operation}: {rollback_error}"),
     }
 }
 

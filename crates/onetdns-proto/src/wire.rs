@@ -173,14 +173,11 @@ impl Writer {
             return false;
         }
         let Some(total) = self.buf.len().checked_add(additional) else {
-            self.fail("DNS 메시지 길이 산술 계산 범위를 넘었습니다");
+            self.fail("DNS message length arithmetic overflowed");
             return false;
         };
         if total > self.limit {
-            self.fail(format!(
-                "DNS 메시지가 허용 크기인 {}바이트를 넘었습니다",
-                self.limit
-            ));
+            self.fail(format!("DNS message exceeds the {}-byte limit", self.limit));
             return false;
         }
         true
@@ -254,20 +251,20 @@ impl Writer {
             return;
         }
         let Some(start) = at.checked_add(2) else {
-            self.fail("DNS 길이 placeholder 계산 범위를 넘었습니다");
+            self.fail("DNS length placeholder overflowed");
             return;
         };
         let Some(slice) = self.buf.get(at..start) else {
-            self.fail("DNS 길이 placeholder 범위가 올바르지 않습니다");
+            self.fail("Invalid DNS length placeholder range");
             return;
         };
         let _ = slice;
         let Some(len) = self.buf.len().checked_sub(start) else {
-            self.fail("DNS RDATA 길이 범위가 올바르지 않습니다");
+            self.fail("Invalid DNS RDATA length range");
             return;
         };
         let Ok(len) = u16::try_from(len) else {
-            self.fail("DNS 레코드 데이터가 65,535바이트를 넘었습니다");
+            self.fail("DNS record data exceeds 65,535 bytes");
             return;
         };
         self.buf[at..start].copy_from_slice(&len.to_be_bytes());

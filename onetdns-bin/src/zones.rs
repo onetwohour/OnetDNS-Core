@@ -61,20 +61,20 @@ pub(crate) fn zonemd_ok(zone: &onetdns_authority::Zone, policy: ZonemdPolicy) ->
     let origin = zone.origin().to_ascii_lower();
     match onetdns_dnssec::verify_zonemd(&records, zone.origin(), serial) {
         onetdns_dnssec::ZonemdResult::Verified => {
-            onetdns_core::info!(event = "authority.zonemd_verified", origin = %origin, "ZONEMD 검증을 통과했습니다");
+            onetdns_core::info!(event = "authority.zonemd_verified", origin = %origin, "ZONEMD verification passed");
             true
         }
         onetdns_dnssec::ZonemdResult::Absent => {
             if policy.reject_absence {
-                onetdns_core::error!(event = "authority.zonemd_missing_rejected", origin = %origin, "ZONEMD 레코드가 없어 설정에 따라 DNS 영역을 거부했습니다");
+                onetdns_core::error!(event = "authority.zonemd_missing_rejected", origin = %origin, "DNS zone rejected because it has no ZONEMD record, as configured");
                 false
             } else {
-                onetdns_core::warn!(event = "authority.zonemd_missing_allowed", origin = %origin, "ZONEMD 레코드가 없지만 설정에 따라 DNS 영역을 허용했습니다");
+                onetdns_core::warn!(event = "authority.zonemd_missing_allowed", origin = %origin, "DNS zone has no ZONEMD record but was accepted, as configured");
                 true
             }
         }
         other => {
-            onetdns_core::error!(event = "authority.zonemd_failed", origin = %origin, result = ?other, "ZONEMD 검증에 실패해 DNS 영역을 제공하지 않습니다");
+            onetdns_core::error!(event = "authority.zonemd_failed", origin = %origin, result = ?other, "ZONEMD verification failed; not serving the DNS zone");
             false
         }
     }
@@ -91,17 +91,14 @@ pub(crate) fn build_zone_store(
         let path = z
             .file
             .as_ref()
-            .ok_or_else(|| format!("DNS 영역 '{}'에 file 설정이 없습니다", z.origin))?;
+            .ok_or_else(|| format!("DNS zone '{}' has no file setting", z.origin))?;
         let text = onetdns_authority::source::read_zone_text(path).map_err(|error| {
-            format!(
-                "DNS 영역 파일 '{}'을 읽지 못했습니다: {error}",
-                path.display()
-            )
+            format!("Could not read DNS zone file '{}': {error}", path.display())
         })?;
         let origin = if z.origin.is_empty() { "." } else { &z.origin };
         let zone = onetdns_authority::parse_zone(&text, origin).map_err(|error| {
             format!(
-                "DNS 영역 파일 '{}'을 해석하지 못했습니다: {error}",
+                "Could not parse DNS zone file '{}': {error}",
                 path.display()
             )
         })?;
@@ -111,20 +108,23 @@ pub(crate) fn build_zone_store(
                 .find(|(signer_origin, _)| signer_origin.eq_ignore_case(zone.origin()))
                 .map(|(_, signer)| signer)
                 .ok_or_else(|| {
-                    format!("DNS 영역 '{}'의 서명 키를 준비하지 못했습니다", z.origin)
+                    format!(
+                        "Could not prepare the signing keys for DNS zone '{}'",
+                        z.origin
+                    )
                 })?;
             sign_authority_zone(zone, signer)
-                .ok_or_else(|| format!("DNS 영역 '{}'을 서명하지 못했습니다", z.origin))?
+                .ok_or_else(|| format!("Could not sign DNS zone '{}'", z.origin))?
         } else {
             zone
         };
         if !zonemd_ok(&zone, ZonemdPolicy::of(cfg)) {
             return Err(format!(
-                "DNS 영역 '{}'의 ZONEMD 검증에 실패했습니다",
+                "ZONEMD verification failed for DNS zone '{}'",
                 z.origin
             ));
         }
-        onetdns_core::info!(event = "authority.zones_loaded_config", origin = %zone.origin().to_ascii_lower(), "설정 파일에서 권한 DNS 영역을 불러왔습니다");
+        onetdns_core::info!(event = "authority.zones_loaded_config", origin = %zone.origin().to_ascii_lower(), "Loaded authoritative DNS zone from the configuration file");
         store.add(zone);
     }
 
@@ -134,13 +134,13 @@ pub(crate) fn build_zone_store(
             Ok(dir_store) => {
                 for z in dir_store.zones() {
                     if zonemd_ok(z, ZonemdPolicy::of(cfg)) {
-                        onetdns_core::info!(event = "authority.zones_loaded_dir", origin = %z.origin().to_ascii_lower(), dir = %dir.display(), "디렉터리에서 권한 DNS 영역을 불러왔습니다");
+                        onetdns_core::info!(event = "authority.zones_loaded_dir", origin = %z.origin().to_ascii_lower(), dir = %dir.display(), "Loaded authoritative DNS zones from directory");
                         store.add(z.clone());
                     }
                 }
             }
             Err(e) => {
-                onetdns_core::error!(event = "authority.zone_dir_read_failed", dir = %dir.display(), error = %e, "DNS 영역 디렉터리를 읽지 못했습니다")
+                onetdns_core::error!(event = "authority.zone_dir_read_failed", dir = %dir.display(), error = %e, "Could not read the DNS zone directory")
             }
         }
     }
@@ -152,13 +152,13 @@ pub(crate) fn build_zone_store(
             Ok(db_store) => {
                 for z in db_store.zones() {
                     if zonemd_ok(z, ZonemdPolicy::of(cfg)) {
-                        onetdns_core::info!(event = "authority.zones_loaded_sqlite", origin = %z.origin().to_ascii_lower(), db = %db.display(), "SQLite에서 권한 DNS 영역을 불러왔습니다");
+                        onetdns_core::info!(event = "authority.zones_loaded_sqlite", origin = %z.origin().to_ascii_lower(), db = %db.display(), "Loaded authoritative DNS zones from SQLite");
                         store.add(z.clone());
                     }
                 }
             }
             Err(e) => {
-                onetdns_core::error!(event = "authority.sqlite_read_failed", db = %db.display(), error = %e, "SQLite에서 DNS 영역을 읽지 못했습니다")
+                onetdns_core::error!(event = "authority.sqlite_read_failed", db = %db.display(), error = %e, "Could not read DNS zones from SQLite")
             }
         }
     }
@@ -172,12 +172,12 @@ pub(crate) fn build_zone_store(
                         .iter()
                         .filter(|z| zonemd_ok(z, ZonemdPolicy::of(cfg)))
                     {
-                        onetdns_core::info!(event = "authority.zones_loaded_etcd", origin = %z.origin().to_ascii_lower(), endpoint = %ep, "etcd에서 권한 DNS 영역을 불러왔습니다");
+                        onetdns_core::info!(event = "authority.zones_loaded_etcd", origin = %z.origin().to_ascii_lower(), endpoint = %ep, "Loaded authoritative DNS zones from etcd");
                         store.add(z.clone());
                     }
                 }
                 Err(e) => {
-                    onetdns_core::error!(event = "authority.etcd_read_failed", endpoint = %ep, error = %e, "etcd에서 DNS 영역을 읽지 못했습니다. 다음 확인 주기에 다시 시도합니다")
+                    onetdns_core::error!(event = "authority.etcd_read_failed", endpoint = %ep, error = %e, "Could not read DNS zones from etcd; retrying next check")
                 }
             }
         }
@@ -215,39 +215,39 @@ pub(crate) fn build_zone_store(
                     .iter()
                     .filter(|z| zonemd_ok(z, ZonemdPolicy::of(cfg)))
                 {
-                    onetdns_core::info!(event = "authority.zones_loaded_db", origin = %z.origin().to_ascii_lower(), backend = %label, "데이터베이스에서 권한 DNS 영역을 불러왔습니다");
+                    onetdns_core::info!(event = "authority.zones_loaded_db", origin = %z.origin().to_ascii_lower(), backend = %label, "Loaded authoritative DNS zones from the database");
                     store.add(z.clone());
                 }
             }
             Err(e) => {
-                onetdns_core::error!(event = "authority.db_read_failed", backend = %label, error = %e, "데이터베이스의 DNS 영역을 읽지 못했습니다. 다음 확인 주기에 다시 시도합니다")
+                onetdns_core::error!(event = "authority.db_read_failed", backend = %label, error = %e, "Could not read DNS zones from the database; retrying next check")
             }
         }
     }
 
     for s in &cfg.secondary {
         let Some(primary) = s.primary else {
-            onetdns_core::warn!(event = "authority.secondary_no_primary", origin = %s.origin, "보조 영역에 주 서버가 없어 해당 영역을 제외했습니다");
+            onetdns_core::warn!(event = "authority.secondary_no_primary", origin = %s.origin, "Skipped a secondary zone that has no primary server");
             continue;
         };
         let origin = match onetdns_proto::Name::from_str(&s.origin) {
             Ok(n) => n,
             Err(_) => {
-                onetdns_core::error!(event = "authority.secondary_name_invalid", origin = %s.origin, "보조 DNS 영역 이름의 형식이 잘못되었습니다");
+                onetdns_core::error!(event = "authority.secondary_name_invalid", origin = %s.origin, "Invalid secondary DNS zone name");
                 continue;
             }
         };
         let key = tsig_for_secondary(tsig_keys, &s.tsig_key);
         if s.tsig_key.is_some() && key.is_none() {
-            onetdns_core::error!(event = "authority.secondary_tsig_missing", origin = %s.origin, "보조 영역에서 지정한 TSIG 키를 찾지 못해 해당 영역을 제외했습니다");
+            onetdns_core::error!(event = "authority.secondary_tsig_missing", origin = %s.origin, "Skipped a secondary zone whose TSIG key was not found");
             continue;
         }
         if let Some(zone) = load_secondary_cache(s, cfg, &origin) {
-            onetdns_core::info!(event = "authority.secondary_cache_path_missing", origin = %s.origin, file = %s.file.as_ref().expect("보조 DNS 영역 캐시 경로가 설정되어 있어야 합니다").display(), "저장된 보조 DNS 영역을 복구하고 별도 갱신 작업을 예약했습니다");
+            onetdns_core::info!(event = "authority.secondary_cache_path_missing", origin = %s.origin, file = %s.file.as_ref().expect("The secondary DNS zone cache path must be set").display(), "Restored saved secondary DNS zone and scheduled its refresh");
             store.add(zone);
             continue;
         }
-        onetdns_core::info!(event = "authority.secondary_initial_transfer_scheduled", origin = %s.origin, %primary, "보조 DNS 영역의 최초 전송을 비차단 갱신 작업에 예약했습니다");
+        onetdns_core::info!(event = "authority.secondary_initial_transfer_scheduled", origin = %s.origin, %primary, "Scheduled the first transfer of secondary DNS zone in the background");
     }
 
     if let Some(cat) = &cfg.catalog_serve {
@@ -262,16 +262,16 @@ pub(crate) fn build_zone_store(
                     .collect();
                 match build_catalog_zone(&cat_origin, &members, catalog_serial(unix_now())) {
                     Ok(z) => {
-                        onetdns_core::info!(event = "authority.catalog_published", catalog = %cat, members = members.len(), "카탈로그 DNS 영역을 게시했습니다");
+                        onetdns_core::info!(event = "authority.catalog_published", catalog = %cat, members = members.len(), "Published catalog DNS zone");
                         store.add(z);
                     }
                     Err(e) => {
-                        onetdns_core::error!(event = "authority.catalog_build_failed", catalog = %cat, error = %e, "카탈로그 DNS 영역을 만들지 못했습니다")
+                        onetdns_core::error!(event = "authority.catalog_build_failed", catalog = %cat, error = %e, "Could not build the catalog DNS zone")
                     }
                 }
             }
             Err(_) => {
-                onetdns_core::error!(event = "authority.catalog_name_invalid", catalog = %cat, "제공할 카탈로그 영역 이름의 형식이 잘못되었습니다")
+                onetdns_core::error!(event = "authority.catalog_name_invalid", catalog = %cat, "Invalid catalog zone name")
             }
         }
     }
@@ -344,15 +344,15 @@ fn build_catalog_zone(
             RData::Ns(Name::from_str("invalid.").map_err(|_| "NS")?),
         ),
         Record::new(
-            Name::from_str(&format!("version.{apex}")).map_err(|_| "version 이름")?,
+            Name::from_str(&format!("version.{apex}")).map_err(|_| "version name")?,
             0,
             RData::Txt(vec![b"2".to_vec()]),
         ),
     ];
     for m in members {
         let id = catalog_member_id(m);
-        let owner = Name::from_str(&format!("{id}.zones.{apex}")).map_err(|_| "멤버 이름")?;
-        let member = Name::from_str(m).map_err(|_| "멤버 origin")?;
+        let owner = Name::from_str(&format!("{id}.zones.{apex}")).map_err(|_| "member name")?;
+        let member = Name::from_str(m).map_err(|_| "member origin")?;
         recs.push(Record::new(owner, 0, RData::Ptr(member)));
     }
     onetdns_authority::Zone::from_records(recs)
@@ -390,7 +390,7 @@ fn spawn_zones_dir_watcher(
                     for gone in prev_origins.iter().filter(|o| !new_origins.contains(o)) {
                         if let Ok(n) = onetdns_proto::Name::from_str(gone) {
                             remove_zone(&store, &n);
-                            onetdns_core::info!(event = "authority.zone_file_removed", origin = %gone, "영역 파일이 삭제되어 DNS 영역을 제거했습니다");
+                            onetdns_core::info!(event = "authority.zone_file_removed", origin = %gone, "Removed DNS zone because its zone file was deleted");
                         }
                     }
 
@@ -406,11 +406,11 @@ fn spawn_zones_dir_watcher(
                             notify.enqueue_zone(z);
                         }
                     }
-                    onetdns_core::info!(event = "authority.zones_reloaded_dir", dir = %dir.display(), zones = new_origins.len(), "실행 중인 DNS 영역 구성을 디렉터리의 최신 내용으로 교체했습니다");
+                    onetdns_core::info!(event = "authority.zones_reloaded_dir", dir = %dir.display(), zones = new_origins.len(), "Replaced running DNS zones with the directory's current contents");
                     prev_origins = new_origins;
                 }
                 Err(e) => {
-                    onetdns_core::warn!(event = "authority.zone_dir_reload_failed", dir = %dir.display(), error = %e, "DNS 영역 디렉터리를 다시 읽지 못해 기존 영역을 유지합니다")
+                    onetdns_core::warn!(event = "authority.zone_dir_reload_failed", dir = %dir.display(), error = %e, "Could not reread the DNS zone directory; keeping the existing zones")
                 }
             }
         }
@@ -538,7 +538,7 @@ pub(crate) fn reconcile_zone_watchers(
             onetdns_core::info!(
                 event = "authority.source_watch_retired",
                 source = %key,
-                "설정에서 빠진 DNS 영역 원본의 감시를 멈췄습니다"
+                "Stopped watching DNS zone sources removed from the configuration"
             );
         }
         keep
@@ -561,7 +561,7 @@ pub(crate) fn reconcile_zone_watchers(
             )
         } else {
             let Some(source) = source else {
-                return Err(format!("DNS 영역 원본 '{key}'의 주소가 올바르지 않습니다"));
+                return Err(format!("DNS zone source '{key}' has an invalid address"));
             };
             spawn_zone_source_watcher(
                 source,
@@ -572,12 +572,12 @@ pub(crate) fn reconcile_zone_watchers(
                 retire.clone(),
             )
         }
-        .map_err(|error| format!("DNS 영역 감시 작업을 시작하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not start the DNS zone watch task: {error}"))?;
         track_service_thread(tracker, thread);
         onetdns_core::info!(
             event = "authority.source_watch_started",
             source = %key,
-            "DNS 영역 원본 감시를 시작했습니다"
+            "Started watching DNS zone sources"
         );
         running.push((tagged, retire));
     }
@@ -591,7 +591,7 @@ fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> 
     let (host, port) = match src.endpoint_host_port() {
         Ok(parts) => parts,
         Err(error) => {
-            onetdns_core::error!(event = "authority.etcd_addr_invalid", endpoint = %ep, %error, "etcd 서버 주소의 형식이 잘못되었습니다");
+            onetdns_core::error!(event = "authority.etcd_addr_invalid", endpoint = %ep, %error, "Invalid etcd server address");
             return None;
         }
     };
@@ -601,7 +601,7 @@ fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> 
         match upstream::resolve_host_via_bootstrap(&host, &cfg.bootstrap) {
             Some(ip) => ip,
             None => {
-                onetdns_core::error!(event = "authority.etcd_bootstrap_missing", endpoint = %ep, %host, "etcd 서버 이름을 찾지 못했습니다. bootstrap 설정이 필요합니다");
+                onetdns_core::error!(event = "authority.etcd_bootstrap_missing", endpoint = %ep, %host, "Could not resolve the etcd server name; a bootstrap setting is needed");
                 return None;
             }
         }
@@ -613,14 +613,14 @@ fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> 
                 let store = match onetdns_tls::TrustStore::try_from_pem(&pem) {
                     Ok(store) => store,
                     Err(error) => {
-                        onetdns_core::error!(event = "authority.etcd_ca_invalid", ca = %ca.display(), %error, "etcd TLS CA 파일에 손상됐거나 지원하지 않는 형식의 인증서가 있습니다");
+                        onetdns_core::error!(event = "authority.etcd_ca_invalid", ca = %ca.display(), %error, "etcd TLS CA file contains a corrupted or unsupported certificate");
                         return None;
                     }
                 };
                 src = src.with_tls(store);
             }
             Err(e) => {
-                onetdns_core::error!(event = "authority.etcd_ca_read_failed", ca = %ca.display(), error = %e, "etcd TLS CA 파일을 읽지 못했습니다");
+                onetdns_core::error!(event = "authority.etcd_ca_read_failed", ca = %ca.display(), error = %e, "Could not read the etcd TLS CA file");
                 return None;
             }
         }
@@ -648,7 +648,7 @@ fn spawn_zone_source_watcher(
         let mut prev_origins: Vec<String> = match src.load() {
             Ok(s) => s.zones().iter().map(|z| z.origin().to_ascii_lower()).collect(),
             Err(error) => {
-                onetdns_core::error!(event = "authority.source_initial_load_failed", source = %src.describe(), %error, "저장소에서 DNS 영역을 처음 읽지 못했습니다. 이 저장소의 영역은 아직 응답하지 않습니다");
+                onetdns_core::error!(event = "authority.source_initial_load_failed", source = %src.describe(), %error, "Could not load DNS zones from the store; zones from this store are not answered yet");
                 Vec::new()
             }
         };
@@ -664,7 +664,7 @@ fn spawn_zone_source_watcher(
             match src.load() {
                 Ok(new_store) => {
                     if consecutive_failures > 0 {
-                        onetdns_core::info!(event = "authority.source_recovered", source = %src.describe(), failures = consecutive_failures, "저장소를 다시 읽을 수 있게 되었습니다");
+                        onetdns_core::info!(event = "authority.source_recovered", source = %src.describe(), failures = consecutive_failures, "Store is readable again");
                         consecutive_failures = 0;
                     }
                     let new_origins: Vec<String> =
@@ -672,7 +672,7 @@ fn spawn_zone_source_watcher(
                     for gone in prev_origins.iter().filter(|o| !new_origins.contains(o)) {
                         if let Ok(n) = onetdns_proto::Name::from_str(gone) {
                             remove_zone(&store, &n);
-                            onetdns_core::info!(event = "authority.zone_removed_source", origin = %gone, source = %src.describe(), "원본에서 삭제된 DNS 영역을 제거했습니다");
+                            onetdns_core::info!(event = "authority.zone_removed_source", origin = %gone, source = %src.describe(), "Removed DNS zone deleted at the source");
                         }
                     }
                     let current = store.load();
@@ -687,13 +687,13 @@ fn spawn_zone_source_watcher(
                             notify.enqueue_zone(z);
                         }
                     }
-                    onetdns_core::info!(event = "authority.zones_reloaded_source", source = %src.describe(), zones = new_origins.len(), "실행 중인 DNS 영역 구성을 저장소의 최신 내용으로 교체했습니다");
+                    onetdns_core::info!(event = "authority.zones_reloaded_source", source = %src.describe(), zones = new_origins.len(), "Replaced running DNS zones with the store's current contents");
                     prev_origins = new_origins;
                 }
                 Err(e) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures == 1 || consecutive_failures % 60 == 0 {
-                        onetdns_core::warn!(event = "authority.source_reload_failed", source = %src.describe(), error = %e, failures = consecutive_failures, "DNS 영역 저장소를 다시 읽지 못해 기존 영역을 유지합니다");
+                        onetdns_core::warn!(event = "authority.source_reload_failed", source = %src.describe(), error = %e, failures = consecutive_failures, "Could not reread the DNS zone store; keeping the existing zones");
                     }
                 }
             }
@@ -807,7 +807,7 @@ fn bump_soa_serial_if_needed(recs: &mut [onetdns_proto::Record], old_serial: Opt
 fn safe_zone_key(origin: &str) -> Result<String, String> {
     let key = origin.trim_end_matches('.').to_ascii_lowercase();
     if key.is_empty() {
-        return Err("영역의 origin 값이 비어 있습니다".to_string());
+        return Err("The zone origin is empty".to_string());
     }
     let valid = key.split('.').all(|label| {
         !label.is_empty()
@@ -818,7 +818,7 @@ fn safe_zone_key(origin: &str) -> Result<String, String> {
     });
     if !valid {
         return Err(format!(
-            "DNS 영역 이름 형식이 올바르지 않습니다(경로/허용되지 않는 문자): {origin}"
+            "Invalid DNS zone name (path or disallowed characters): {origin}"
         ));
     }
     Ok(key)
@@ -855,7 +855,7 @@ pub(crate) fn zone_api_target(
     };
     if cfg.secondary.iter().any(|zone| same(&zone.origin)) {
         return Err(format!(
-            "보조 DNS 영역은 이 API에서 {verb}할 수 없습니다: {key}"
+            "This API cannot {verb} a secondary DNS zone: {key}"
         ));
     }
     let file = cfg
@@ -879,7 +879,7 @@ pub(crate) fn zone_api_target(
         .is_some_and(|name| store.zone_exact(&name).is_some());
     if exists && external && !file_backed {
         return Err(format!(
-            "{key} 영역은 외부 저장소(DB, etcd, LMDB, 카탈로그)에서 옵니다. 이 API에서 {verb}하면 다음 읽기에서 되돌아가므로 그 저장소에서 바꾸십시오"
+            "Zone {key} comes from an external store (database, etcd, LMDB, or catalog). A {verb} through this API would be undone on the next read, so change it in that store"
         ));
     }
     Ok(ZoneApiTarget {
@@ -958,14 +958,14 @@ pub(crate) fn apply_zone_mutation_locked(
         signed = true;
     }
     let new_zone = onetdns_authority::Zone::from_records(recs)
-        .map_err(|e| format!("영역 DNS 영역을 다시 구성하지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Could not rebuild the DNS zone: {e}"))?;
     let new_recs = zone_records_without_closing_soa(&new_zone);
     let serial = new_zone.soa().serial;
     let records = new_zone.axfr_records().len().saturating_sub(2);
 
     let persisted = if let Some(path) = persist_path {
         crate::atomic_file::atomic_write(path, new_zone.to_master_file().as_bytes())
-            .map_err(|e| format!("파일에 저장하지 못했습니다({}): {e}", path.display()))?;
+            .map_err(|e| format!("Could not save to the file ({}): {e}", path.display()))?;
         true
     } else {
         false
@@ -979,7 +979,7 @@ pub(crate) fn apply_zone_mutation_locked(
             .record(old, serial, &old_recs, &new_recs);
     }
     notify.enqueue_zone(&new_zone);
-    onetdns_core::info!(event = "authority.zone_hooks_applied", origin = %origin, serial, source = %source, signed, persisted, "DNS 영역 변경 처리 절차를 적용했습니다");
+    onetdns_core::info!(event = "authority.zone_hooks_applied", origin = %origin, serial, source = %source, signed, persisted, "Applied DNS zone change");
     Ok(ZoneApplyResult {
         origin,
         serial,
@@ -1073,9 +1073,8 @@ impl ZoneState {
                 .iter()
                 .filter(|z| z.dnssec_sign)
                 .map(|zone| {
-                    let origin = onetdns_proto::Name::from_str(&zone.origin).map_err(|_| {
-                        format!("DNS 영역 이름이 올바르지 않습니다: {}", zone.origin)
-                    })?;
+                    let origin = onetdns_proto::Name::from_str(&zone.origin)
+                        .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
                     Ok((origin, load_zone_signer(zone)?))
                 })
                 .collect::<Result<Vec<_>, String>>()
@@ -1088,7 +1087,7 @@ impl ZoneState {
 
         let (notify, notify_thread) =
             start_notify_dispatcher(&cfg.notify, tsig_keys, shutdown.clone())
-                .with_context(|| "DNS NOTIFY 발신 작업을 시작하지 못했습니다")?;
+                .with_context(|| "Could not start the DNS NOTIFY sender task")?;
         if let Some(thread) = notify_thread {
             service_cleanup.track(thread);
         }

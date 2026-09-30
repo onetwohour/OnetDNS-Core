@@ -638,7 +638,7 @@ fn note_dnssec_bogus(qname: &onetdns_proto::Name) {
             event = "dnssec.validation_bogus",
             qname = %qname,
             count = count,
-            "DNSSEC 검증에 실패한 응답을 차단했습니다"
+            "Blocked a response that failed DNSSEC validation"
         );
     }
 }

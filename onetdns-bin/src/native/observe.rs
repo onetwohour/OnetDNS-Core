@@ -94,7 +94,7 @@ impl NativeServer {
         };
         if resp.header.rcode == ResponseCode::ServFail.0 {
             let detail = format!(
-                "DNS 처리 경로에서 서버 오류 응답을 반환했습니다. 처리 방식={}",
+                "The DNS handling path returned a server error response. backend={}",
                 self.resolver_mode(client)
             );
             self.rec_failure(
@@ -312,9 +312,9 @@ fn note_rejection(action: Action, client: &ClientInfo) {
         return;
     }
     if denied {
-        onetdns_core::warn!(event = "dns.client_rejected", reason = "acl", client = %client.source_ip, count = count, "접근을 허용하지 않은 주소의 질의를 막았습니다");
+        onetdns_core::warn!(event = "dns.client_rejected", reason = "acl", client = %client.source_ip, count = count, "Blocked a query from an address that is not allowed");
     } else {
-        onetdns_core::warn!(event = "dns.client_rejected", reason = "rate_limit", client = %client.source_ip, count = count, "속도 제한에 걸린 질의를 막았습니다");
+        onetdns_core::warn!(event = "dns.client_rejected", reason = "rate_limit", client = %client.source_ip, count = count, "Blocked a rate-limited query");
     }
 }
 
@@ -331,5 +331,5 @@ fn resolution_failed(reason: &'static str, stage: &'static str, name: Option<&Ap
         return;
     }
     let qname = name.map(|n| n.to_ascii_lower()).unwrap_or_default();
-    onetdns_core::warn!(event = "dns.resolution_failed", reason = reason, stage = stage, qname = %qname, count = count, "질의를 풀지 못해 SERVFAIL로 답했습니다");
+    onetdns_core::warn!(event = "dns.resolution_failed", reason = reason, stage = stage, qname = %qname, count = count, "Could not resolve the query; answered SERVFAIL");
 }

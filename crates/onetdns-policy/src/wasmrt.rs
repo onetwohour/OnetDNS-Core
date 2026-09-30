@@ -89,14 +89,14 @@ impl Value {
     fn as_i32(self) -> Result<i32, String> {
         match self {
             Value::I32(v) => Ok(v),
-            _ => Err("WASM 값의 형식이 올바르지 않습니다. 32비트 정수가 필요합니다".into()),
+            _ => Err("Invalid WASM value type; expected a 32-bit integer".into()),
         }
     }
     /** @brief i64로 꺼낸다. 다른 형식이면 오류다. */
     fn as_i64(self) -> Result<i64, String> {
         match self {
             Value::I64(v) => Ok(v),
-            _ => Err("WASM 값의 형식이 올바르지 않습니다. 64비트 정수가 필요합니다".into()),
+            _ => Err("Invalid WASM value type; expected a 64-bit integer".into()),
         }
     }
 }
@@ -121,7 +121,7 @@ fn val_type(b: u8) -> Result<ValType, String> {
         0x7e => Ok(ValType::I64),
         0x7d => Ok(ValType::F32),
         0x7c => Ok(ValType::F64),
-        other => Err(format!("알 수 없는 valtype 0x{other:02x}")),
+        other => Err(format!("Unknown valtype 0x{other:02x}")),
     }
 }
 
@@ -246,7 +246,7 @@ impl<'a> Reader<'a> {
         let end = self
             .pos
             .checked_add(n)
-            .ok_or("WASM 바이트 범위 계산이 넘쳤습니다")?;
+            .ok_or("WASM byte range overflowed")?;
         let s = self.b.get(self.pos..end).ok_or("EOF")?;
         self.pos = end;
         Ok(s)
@@ -266,7 +266,7 @@ impl<'a> Reader<'a> {
             }
             shift += 7;
             if shift >= 35 {
-                return Err("LEB128 u32 값이 허용 범위를 넘었습니다".into());
+                return Err("LEB128 u32 value is out of range".into());
             }
         }
     }
@@ -289,7 +289,7 @@ impl<'a> Reader<'a> {
                 return Ok(r);
             }
             if shift >= 70 {
-                return Err("LEB128 i64 값이 허용 범위를 넘었습니다".into());
+                return Err("LEB128 i64 value is out of range".into());
             }
         }
     }
@@ -309,7 +309,7 @@ impl<'a> Reader<'a> {
     fn name(&mut self) -> Result<String, String> {
         let n = self.u32()? as usize;
         let s = self.bytes(n)?;
-        String::from_utf8(s.to_vec()).map_err(|_| "비UTF-8 이름".into())
+        String::from_utf8(s.to_vec()).map_err(|_| "Non-UTF-8 name".into())
     }
 }
 
@@ -404,14 +404,14 @@ impl Module {
      */
     pub fn parse(bytes: &[u8]) -> Result<Module, String> {
         if bytes.len() > MAX_MODULE_BYTES {
-            return Err("WASM 모듈 크기가 허용 한도를 넘었습니다".into());
+            return Err("WASM module is too large".into());
         }
         let mut r = Reader::new(bytes);
         if r.bytes(4)? != b"\0asm" {
-            return Err("WASM 파일 식별자가 일치하지 않습니다".into());
+            return Err("WASM magic does not match".into());
         }
         if r.bytes(4)? != [1, 0, 0, 0] {
-            return Err("WASM 버전 != 1".into());
+            return Err("WASM version != 1".into());
         }
         let mut m = Module {
             types: Vec::new(),
@@ -431,17 +431,16 @@ impl Module {
         let mut last_standard_section = 0u8;
         while !r.done() {
             let id = r.byte()?;
-            let size =
-                usize::try_from(r.u32()?).map_err(|_| "section 크기 계산 범위를 넘었습니다")?;
+            let size = usize::try_from(r.u32()?).map_err(|_| "Section size overflowed")?;
             let payload = r.bytes(size)?;
             if id == 0 {
                 continue;
             }
             if !(1..=11).contains(&id) {
-                return Err(format!("지원하지 않는 WASM section ID {id}"));
+                return Err(format!("Unsupported WASM section ID {id}"));
             }
             if id <= last_standard_section {
-                return Err("WASM 표준 section이 중복되었거나 순서가 올바르지 않습니다".into());
+                return Err("WASM standard section is duplicated or out of order".into());
             }
             last_standard_section = id;
             let mut s = Reader::new(payload);
@@ -451,7 +450,7 @@ impl Module {
                 3 => {
                     let n = s.u32()?;
                     if n > MAX_FUNCTIONS {
-                        return Err("함수 개수가 허용 한도를 넘었습니다".into());
+                        return Err("Too many functions".into());
                     }
                     for _ in 0..n {
                         m.func_types.push(s.u32()?);
@@ -466,26 +465,24 @@ impl Module {
                 10 => {
                     let n = s.u32()?;
                     if n > MAX_FUNCTIONS {
-                        return Err("WASM 코드 본문 수가 허용 한도를 넘었습니다".into());
+                        return Err("Too many WASM code bodies".into());
                     }
                     for _ in 0..n {
-                        let csize = usize::try_from(s.u32()?)
-                            .map_err(|_| "code 크기 계산 범위를 넘었습니다")?;
+                        let csize =
+                            usize::try_from(s.u32()?).map_err(|_| "Code size overflowed")?;
                         code_bodies.push(s.bytes(csize)?);
                     }
                 }
                 11 => m.parse_data(&mut s)?,
-                _ => unreachable!("위에서 표준 section 범위를 확인했습니다"),
+                _ => unreachable!("Standard section range was checked above"),
             }
             if !s.done() {
-                return Err(format!(
-                    "WASM section {id}에 해석되지 않은 바이트가 남았습니다"
-                ));
+                return Err(format!("WASM section {id} has unparsed trailing bytes"));
             }
         }
 
         if code_bodies.len() != m.func_types.len() {
-            return Err("code/function 섹션 개수가 일치하지 않습니다".into());
+            return Err("code and function section counts do not match".into());
         }
         let mut decoded_instructions = 0usize;
         for (i, body) in code_bodies.iter().enumerate() {
@@ -493,17 +490,17 @@ impl Module {
             let ft = m
                 .types
                 .get(type_idx as usize)
-                .ok_or("WASM 함수가 존재하지 않는 타입을 참조합니다")?;
+                .ok_or("WASM function references a type that does not exist")?;
             let nparams = ft.params.len();
             let instruction_budget = MAX_DECODED_INSTRUCTIONS
                 .checked_sub(decoded_instructions)
-                .ok_or("WASM 디코딩 명령 수가 허용 한도를 넘었습니다")?;
+                .ok_or("Too many decoded WASM instructions")?;
             let (locals, instrs) = decode_function(body, nparams, instruction_budget)?;
             decoded_instructions = decoded_instructions
                 .checked_add(instrs.len())
-                .ok_or("WASM 명령 개수 계산 범위를 넘었습니다")?;
+                .ok_or("WASM instruction count overflowed")?;
             if decoded_instructions > MAX_DECODED_INSTRUCTIONS {
-                return Err("WASM 디코딩 명령 수가 허용 한도를 넘었습니다".into());
+                return Err("Too many decoded WASM instructions".into());
             }
             m.funcs.push(Func {
                 type_idx,
@@ -525,7 +522,7 @@ impl Module {
                 ExportKind::Global => (*idx as usize) < self.globals.len(),
             };
             if !valid {
-                return Err("WASM export가 존재하지 않는 정의를 참조합니다".into());
+                return Err("WASM export references a definition that does not exist".into());
             }
         }
 
@@ -533,19 +530,21 @@ impl Module {
             let func = self
                 .funcs
                 .get(start as usize)
-                .ok_or("WASM start 함수 인덱스가 허용 범위를 벗어났습니다")?;
+                .ok_or("WASM start function index is out of range")?;
             let ty = self
                 .types
                 .get(func.type_idx as usize)
-                .ok_or("WASM start 함수 타입 인덱스가 허용 범위를 벗어났습니다")?;
+                .ok_or("WASM start function type index is out of range")?;
             if !ty.params.is_empty() || !ty.results.is_empty() {
-                return Err("WASM start 함수는 매개변수와 반환값이 없어야 합니다".into());
+                return Err(
+                    "WASM start function must take no parameters and return nothing".into(),
+                );
             }
         }
 
         for function in self.table.iter().flatten() {
             if (*function as usize) >= self.funcs.len() {
-                return Err("WASM table이 존재하지 않는 함수를 참조합니다".into());
+                return Err("WASM table references a function that does not exist".into());
             }
         }
 
@@ -553,48 +552,46 @@ impl Module {
             let params = self
                 .types
                 .get(func.type_idx as usize)
-                .ok_or("WASM 함수 타입 인덱스가 허용 범위를 벗어났습니다")?
+                .ok_or("WASM function type index is out of range")?
                 .params
                 .len();
             let local_count = params
                 .checked_add(func.locals.len())
-                .ok_or("WASM local 인덱스 범위 계산이 넘쳤습니다")?;
+                .ok_or("WASM local index range overflowed")?;
             for instr in &func.body {
                 match instr {
                     Instr::Call(idx) if (*idx as usize) >= self.funcs.len() => {
-                        return Err("WASM call 함수 인덱스가 허용 범위를 벗어났습니다".into());
+                        return Err("WASM call function index is out of range".into());
                     }
                     Instr::CallIndirect(type_idx) => {
                         if !self.table_defined {
-                            return Err("WASM call_indirect에 필요한 table이 없습니다".into());
+                            return Err("WASM call_indirect needs a table".into());
                         }
                         if (*type_idx as usize) >= self.types.len() {
-                            return Err(
-                                "WASM call_indirect 타입 인덱스가 허용 범위를 벗어났습니다".into(),
-                            );
+                            return Err("WASM call_indirect type index is out of range".into());
                         }
                     }
                     Instr::LocalGet(idx) | Instr::LocalSet(idx) | Instr::LocalTee(idx)
                         if (*idx as usize) >= local_count =>
                     {
-                        return Err("WASM local 인덱스가 허용 범위를 벗어났습니다".into());
+                        return Err("WASM local index is out of range".into());
                     }
                     Instr::GlobalGet(idx) if (*idx as usize) >= self.globals.len() => {
-                        return Err("WASM global 인덱스가 허용 범위를 벗어났습니다".into());
+                        return Err("WASM global index is out of range".into());
                     }
                     Instr::GlobalSet(idx) => match self.globals.get(*idx as usize) {
                         Some((_, true, _)) => {}
                         Some((_, false, _)) => {
-                            return Err("WASM 불변 global을 변경할 수 없습니다".into());
+                            return Err("Cannot modify an immutable WASM global".into());
                         }
                         None => {
-                            return Err("WASM global 인덱스가 허용 범위를 벗어났습니다".into());
+                            return Err("WASM global index is out of range".into());
                         }
                     },
                     Instr::Load { .. } | Instr::Store { .. } | Instr::MemSize | Instr::MemGrow
                         if !self.memory_defined =>
                     {
-                        return Err("WASM 메모리 명령에 필요한 memory가 없습니다".into());
+                        return Err("WASM memory instruction needs a memory".into());
                     }
                     _ => {}
                 }
@@ -607,15 +604,15 @@ impl Module {
     fn parse_types(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_TYPES {
-            return Err("type 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many types".into());
         }
         for _ in 0..n {
             if s.byte()? != 0x60 {
-                return Err("functype 형식이 올바르지 않습니다".into());
+                return Err("Invalid functype".into());
             }
             let np = s.u32()?;
             if np > MAX_PARAMS {
-                return Err("함수 parameter 개수가 허용 한도를 넘었습니다".into());
+                return Err("Too many function parameters".into());
             }
             let mut params = Vec::with_capacity(np as usize);
             for _ in 0..np {
@@ -623,7 +620,7 @@ impl Module {
             }
             let nr = s.u32()?;
             if nr > MAX_RESULTS {
-                return Err("함수 result는 최대 하나만 지원합니다".into());
+                return Err("Functions support at most one result".into());
             }
             let mut results = Vec::with_capacity(nr as usize);
             for _ in 0..nr {
@@ -641,7 +638,7 @@ impl Module {
     fn parse_imports(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n != 0 {
-            return Err("WASM import는 지원하지 않습니다".into());
+            return Err("WASM imports are not supported".into());
         }
         Ok(())
     }
@@ -650,15 +647,15 @@ impl Module {
     fn parse_tables(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > 1 {
-            return Err("table은 하나만 지원".into());
+            return Err("Only one table is supported".into());
         }
         for _ in 0..n {
             if s.byte()? != 0x70 {
-                return Err("WASM table 요소 형식은 funcref여야 합니다".into());
+                return Err("WASM table element type must be funcref".into());
             }
             let (min, max) = read_limits(s)?;
             if min > MAX_TABLE_ELEMS || max.is_some_and(|value| value > MAX_TABLE_ELEMS) {
-                return Err("WASM table 크기가 허용 한도를 넘었습니다".into());
+                return Err("WASM table is too large".into());
             }
             self.table = vec![None; min as usize];
             self.table_defined = true;
@@ -670,12 +667,12 @@ impl Module {
     fn parse_memory(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > 1 {
-            return Err("memory는 하나만 지원합니다".into());
+            return Err("Only one memory is supported".into());
         }
         if n > 0 {
             let (min, max) = read_limits(s)?;
             if max.is_some_and(|value| value < min) {
-                return Err("WASM 최대 메모리가 최소 메모리보다 작습니다".into());
+                return Err("WASM maximum memory is smaller than the minimum".into());
             }
             self.mem_min = min;
             self.mem_max = max;
@@ -688,14 +685,14 @@ impl Module {
     fn parse_globals(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_GLOBALS {
-            return Err("global 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many globals".into());
         }
         for _ in 0..n {
             let vt = val_type(s.byte()?)?;
             let mutable = match s.byte()? {
                 0 => false,
                 1 => true,
-                _ => return Err("WASM global mutability 값이 올바르지 않습니다".into()),
+                _ => return Err("Invalid WASM global mutability".into()),
             };
             let v = eval_const_expr(s, vt)?;
             self.globals.push((vt, mutable, v));
@@ -707,7 +704,7 @@ impl Module {
     fn parse_exports(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_EXPORTS {
-            return Err("export 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many exports".into());
         }
         for _ in 0..n {
             let name = s.name()?;
@@ -718,10 +715,10 @@ impl Module {
                 0x01 => ExportKind::Table,
                 0x02 => ExportKind::Memory,
                 0x03 => ExportKind::Global,
-                _ => return Err("알 수 없는 export 종류".into()),
+                _ => return Err("Unknown export kind".into()),
             };
             if self.exports.insert(name, (k, idx)).is_some() {
-                return Err("WASM export 이름이 중복되었습니다".into());
+                return Err("Duplicate WASM export name".into());
             }
         }
         Ok(())
@@ -731,28 +728,25 @@ impl Module {
     fn parse_elements(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_TABLE_ELEMS {
-            return Err("element segment 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many element segments".into());
         }
         if n != 0 && !self.table_defined {
-            return Err("WASM element 세그먼트에 필요한 table이 없습니다".into());
+            return Err("WASM element segment needs a table".into());
         }
         for _ in 0..n {
             let flags = s.u32()?;
             if flags != 0 {
-                return Err("지원하지 않는 element 세그먼트 형식".into());
+                return Err("Unsupported element segment form".into());
             }
             let offset = eval_const_expr(s, ValType::I32)?.as_i32()?;
             if offset < 0 {
-                return Err("WASM 요소 구간의 시작 위치가 음수입니다".into());
+                return Err("WASM element segment offset is negative".into());
             }
             let off = offset as usize;
-            let cnt =
-                usize::try_from(s.u32()?).map_err(|_| "element 개수 계산 범위를 넘었습니다")?;
-            let end = off
-                .checked_add(cnt)
-                .ok_or("element 범위 계산 범위를 넘었습니다")?;
+            let cnt = usize::try_from(s.u32()?).map_err(|_| "Element count overflowed")?;
+            let end = off.checked_add(cnt).ok_or("Element range overflowed")?;
             if end > self.table.len() {
-                return Err("element 세그먼트 table 허용 범위를 넘었습니다".into());
+                return Err("Element segment exceeds the table".into());
             }
             for slot in &mut self.table[off..end] {
                 *slot = Some(s.u32()?);
@@ -768,10 +762,10 @@ impl Module {
     fn parse_data(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_DATA_SEGMENTS {
-            return Err("data 세그먼트 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many data segments".into());
         }
         if n != 0 && !self.memory_defined {
-            return Err("WASM data 세그먼트에 필요한 memory가 없습니다".into());
+            return Err("WASM data segment needs a memory".into());
         }
         let mut total = self
             .data
@@ -781,18 +775,16 @@ impl Module {
         for _ in 0..n {
             let flags = s.u32()?;
             if flags != 0 {
-                return Err("지원하지 않는 data 세그먼트 형식".into());
+                return Err("Unsupported data segment form".into());
             }
             let offset = eval_const_expr(s, ValType::I32)?.as_i32()?;
             if offset < 0 {
-                return Err("WASM 데이터 구간의 시작 위치가 음수입니다".into());
+                return Err("WASM data segment offset is negative".into());
             }
-            let len = usize::try_from(s.u32()?).map_err(|_| "data 길이 계산 범위를 넘었습니다")?;
-            total = total
-                .checked_add(len)
-                .ok_or("data 총크기 계산 범위를 넘었습니다")?;
+            let len = usize::try_from(s.u32()?).map_err(|_| "Data length overflowed")?;
+            total = total.checked_add(len).ok_or("Total data size overflowed")?;
             if total > MAX_DATA_BYTES {
-                return Err("data 세그먼트 전체 크기가 허용 한도를 넘었습니다".into());
+                return Err("Data segments are too large in total".into());
             }
             let bytes = s.bytes(len)?.to_vec();
             self.data.push((offset as u32, bytes));
@@ -805,12 +797,12 @@ impl Module {
 fn read_limits(s: &mut Reader) -> Result<(u32, Option<u32>), String> {
     let flag = s.byte()?;
     if flag > 1 {
-        return Err("잘못된 WASM limits flag".into());
+        return Err("Invalid WASM limits flag".into());
     }
     let min = s.u32()?;
     let max = if flag == 1 { Some(s.u32()?) } else { None };
     if max.is_some_and(|value| value < min) {
-        return Err("WASM 최대 한도가 최소 한도보다 작습니다".into());
+        return Err("WASM maximum limit is smaller than the minimum".into());
     }
     Ok((min, max))
 }
@@ -829,15 +821,15 @@ fn eval_const_expr(s: &mut Reader, expected: ValType) -> Result<Value, String> {
         0x44 => Value::F64(s.f64()?),
         0x23 => {
             let _g = s.u32()?;
-            return Err("텍스트로벌 참조 const expr 지원하지 않습니다".into());
+            return Err("Global-reference const expr is not supported".into());
         }
-        other => return Err(format!("const expr opcode 0x{other:02x} 지원하지 않습니다")),
+        other => return Err(format!("Const expr opcode 0x{other:02x} is not supported")),
     };
     if s.byte()? != 0x0b {
-        return Err("상수 식의 끝 표시가 빠져 있습니다".into());
+        return Err("Const expr is missing its end".into());
     }
     if v.value_type() != expected {
-        return Err("WASM 상수 식 결과 형식이 선언과 일치하지 않습니다".into());
+        return Err("WASM const expr result type does not match its declaration".into());
     }
     Ok(v)
 }
@@ -852,7 +844,7 @@ fn blocktype_arity(s: &mut Reader) -> Result<u32, String> {
     match b {
         0x40 => Ok(0),
         0x7c..=0x7f => Ok(1),
-        _ => Err("멀티값/타입인덱스 블록타입 지원하지 않습니다".into()),
+        _ => Err("Multi-value and type-index block types are not supported".into()),
     }
 }
 
@@ -871,21 +863,20 @@ fn decode_function(
     let mut s = Reader::new(body);
     let nlocal_decl = s.u32()?;
     if nlocal_decl as usize > MAX_LOCALS_PER_FUNCTION {
-        return Err("WASM local declaration 개수가 허용 한도를 넘었습니다".into());
+        return Err("Too many WASM local declarations".into());
     }
     let mut locals = Vec::new();
     for _ in 0..nlocal_decl {
-        let count =
-            usize::try_from(s.u32()?).map_err(|_| "WASM local 개수 계산 범위를 넘었습니다")?;
+        let count = usize::try_from(s.u32()?).map_err(|_| "WASM local count overflowed")?;
         let vt = val_type(s.byte()?)?;
         let total = locals
             .len()
             .checked_add(count)
-            .ok_or("WASM local 개수 계산 범위를 넘었습니다")?;
+            .ok_or("WASM local count overflowed")?;
         if total > MAX_LOCALS_PER_FUNCTION
             || total.saturating_add(nparams) > MAX_LOCALS_PER_FUNCTION
         {
-            return Err("함수 local 개수가 허용 한도를 넘었습니다".into());
+            return Err("Too many function locals".into());
         }
         locals.resize(total, vt);
     }
@@ -918,9 +909,9 @@ fn decode_function(
                 });
             }
             0x05 => {
-                let (if_idx, kind) = ctrl.last_mut().ok_or("if 없이 else가 나타났습니다")?;
+                let (if_idx, kind) = ctrl.last_mut().ok_or("else without if")?;
                 if *kind != 2 {
-                    return Err("WASM else 명령에 대응하는 if 블록이 없습니다".into());
+                    return Err("WASM else has no matching if block".into());
                 }
                 *kind = 3;
                 let if_idx = *if_idx;
@@ -978,7 +969,7 @@ fn decode_function(
                 /** @brief 분기 테이블에 담을 수 있는 대상 수. 없으면 짧은 플러그인으로 메모리를 잡게 만든다. */
                 const MAX_BR_TABLE_TARGETS: usize = 65_536;
                 if cnt > MAX_BR_TABLE_TARGETS {
-                    return Err("WASM br_table의 분기 대상이 허용 한도를 넘었습니다".into());
+                    return Err("WASM br_table has too many targets".into());
                 }
                 let mut targets = Vec::with_capacity(cnt);
                 for _ in 0..cnt {
@@ -992,7 +983,7 @@ fn decode_function(
             0x11 => {
                 let t = s.u32()?;
                 if s.byte()? != 0 {
-                    return Err("WASM call_indirect table 인덱스는 0이어야 합니다".into());
+                    return Err("WASM call_indirect table index must be 0".into());
                 }
                 instrs.push(Instr::CallIndirect(t));
             }
@@ -1001,7 +992,7 @@ fn decode_function(
             0x1c => {
                 let n = s.u32()?;
                 if n != 1 {
-                    return Err("WASM typed select는 결과 형식 하나가 필요합니다".into());
+                    return Err("WASM typed select needs exactly one result type".into());
                 }
                 let _ = val_type(s.byte()?)?;
                 instrs.push(Instr::Select);
@@ -1023,13 +1014,13 @@ fn decode_function(
             }
             0x3f => {
                 if s.byte()? != 0 {
-                    return Err("WASM memory.size memory 인덱스는 0이어야 합니다".into());
+                    return Err("WASM memory.size memory index must be 0".into());
                 }
                 instrs.push(Instr::MemSize);
             }
             0x40 => {
                 if s.byte()? != 0 {
-                    return Err("WASM memory.grow memory 인덱스는 0이어야 합니다".into());
+                    return Err("WASM memory.grow memory index must be 0".into());
                 }
                 instrs.push(Instr::MemGrow);
             }
@@ -1041,23 +1032,23 @@ fn decode_function(
                 instrs.push(Instr::Num(op));
             }
             0x45..=0xc4 => {
-                return Err(format!("지원하지 않는 숫자 연산 코드 0x{op:02x}"));
+                return Err(format!("Unsupported numeric opcode 0x{op:02x}"));
             }
 
-            other => return Err(format!("지원하지 않는 연산 코드 0x{other:02x}")),
+            other => return Err(format!("Unsupported opcode 0x{other:02x}")),
         }
         if instrs.len() > instruction_budget {
-            return Err("WASM 디코딩 명령 수가 허용 한도를 넘었습니다".into());
+            return Err("Too many decoded WASM instructions".into());
         }
     }
     if instrs.len() > instruction_budget {
-        return Err("WASM 디코딩 명령 수가 허용 한도를 넘었습니다".into());
+        return Err("Too many decoded WASM instructions".into());
     }
     if !function_ended {
-        return Err("WASM 함수 본문에 최종 end가 없습니다".into());
+        return Err("WASM function body has no final end".into());
     }
     if !s.done() {
-        return Err("WASM 함수의 최종 end 뒤에 데이터가 남았습니다".into());
+        return Err("WASM function has data after the final end".into());
     }
     Ok((locals, instrs))
 }
@@ -1153,9 +1144,9 @@ impl<'m> Instance<'m> {
         let mem_bytes = usize::try_from(module.mem_min)
             .ok()
             .and_then(|pages| pages.checked_mul(PAGE))
-            .ok_or("초기 메모리 크기 계산 범위를 넘었습니다")?;
+            .ok_or("Initial memory size overflowed")?;
         if mem_bytes > mem_max_bytes {
-            return Err("WASM 초기 메모리가 허용 한도를 넘었습니다".into());
+            return Err("WASM initial memory is too large".into());
         }
         let InstanceState {
             mut memory,
@@ -1169,7 +1160,7 @@ impl<'m> Instance<'m> {
                 .checked_add(bytes.len())
                 .is_none_or(|end| end > memory.len())
             {
-                return Err("data 세그먼트 메모리 허용 범위를 넘었습니다".into());
+                return Err("Data segment exceeds memory".into());
             }
             memory[off..off + bytes.len()].copy_from_slice(bytes);
         }
@@ -1203,11 +1194,9 @@ impl<'m> Instance<'m> {
      *          확인한다. 검사를 빠뜨리면 게스트가 호스트 메모리를 건드릴 수 있다.
      */
     pub fn write_mem(&mut self, addr: usize, data: &[u8]) -> Result<(), String> {
-        let end = addr
-            .checked_add(data.len())
-            .ok_or("주소 계산 범위를 넘었습니다")?;
+        let end = addr.checked_add(data.len()).ok_or("Address overflowed")?;
         if end > self.memory.len() {
-            return Err("메모리 쓰기 허용 범위를 넘었습니다".into());
+            return Err("Memory write out of bounds".into());
         }
         self.memory[addr..end].copy_from_slice(data);
         Ok(())
@@ -1217,10 +1206,10 @@ impl<'m> Instance<'m> {
     pub fn read_mem(&self, addr: usize, len: usize) -> Result<&[u8], String> {
         let end = addr
             .checked_add(len)
-            .ok_or("메모리 읽기 주소 계산 범위를 넘었습니다")?;
+            .ok_or("Memory read address overflowed")?;
         self.memory
             .get(addr..end)
-            .ok_or("메모리 읽기 허용 범위를 넘었습니다".into())
+            .ok_or("Memory read out of bounds".into())
     }
 
     /** @brief 내보낸 함수의 인덱스. 함수가 아니면 None. */
@@ -1240,7 +1229,7 @@ impl<'m> Instance<'m> {
     pub fn call_export(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, String> {
         let idx = self
             .export_func(name)
-            .ok_or(format!("내보낸 함수 '{name}'을 찾을 수 없습니다"))?;
+            .ok_or(format!("Exported function '{name}' not found"))?;
         self.invoke(idx, args)
     }
 
@@ -1252,7 +1241,7 @@ impl<'m> Instance<'m> {
         self.module
             .funcs
             .get(idx as usize)
-            .ok_or("WASM 함수 번호가 허용 범위를 벗어났습니다".into())
+            .ok_or("WASM function index is out of range".into())
     }
 
     /** @brief 함수 인덱스의 서명을 찾는다. */
@@ -1261,7 +1250,7 @@ impl<'m> Instance<'m> {
         self.module
             .types
             .get(f.type_idx as usize)
-            .ok_or("WASM 타입 번호가 허용 범위를 벗어났습니다".into())
+            .ok_or("WASM type index is out of range".into())
     }
 
     /**
@@ -1271,19 +1260,19 @@ impl<'m> Instance<'m> {
      */
     fn invoke(&mut self, idx: u32, args: Vec<Value>) -> Result<Vec<Value>, String> {
         if self.call_depth >= MAX_CALL_DEPTH {
-            return Err("WASM 호출 깊이가 허용 한도를 넘었습니다".into());
+            return Err("WASM call depth limit exceeded".into());
         }
         let result_type = {
             let ft = self.ftype(idx)?;
             if args.len() != ft.params.len() {
-                return Err("인자 개수가 일치하지 않습니다".into());
+                return Err("Argument count does not match".into());
             }
             if args
                 .iter()
                 .zip(&ft.params)
                 .any(|(value, expected)| value.value_type() != *expected)
             {
-                return Err("WASM 함수 인자 형식이 선언과 일치하지 않습니다".into());
+                return Err("WASM function argument types do not match its declaration".into());
             }
             ft.results.first().copied()
         };
@@ -1328,9 +1317,9 @@ impl<'m> Instance<'m> {
         loop {
             if stack.len() > MAX_VALUE_STACK || labels.len() > MAX_LABEL_STACK {
                 return Err(if stack.len() > MAX_VALUE_STACK {
-                    "WASM 값 스택이 허용 한도를 넘었습니다"
+                    "WASM value stack limit exceeded"
                 } else {
-                    "WASM 제어 스택이 허용 한도를 넘었습니다"
+                    "WASM control stack limit exceeded"
                 }
                 .into());
             }
@@ -1338,7 +1327,7 @@ impl<'m> Instance<'m> {
                 break;
             }
             if self.fuel == 0 {
-                return Err("fuel 소진".into());
+                return Err("Out of fuel".into());
             }
             self.fuel -= 1;
             let instr = &body[pc];
@@ -1364,7 +1353,7 @@ impl<'m> Instance<'m> {
                     });
                 }
                 Instr::If { arity, else_, end } => {
-                    let cond = stack.pop().ok_or("스택 부족")?.as_i32()?;
+                    let cond = stack.pop().ok_or("Stack underflow")?.as_i32()?;
                     labels.push(Label {
                         arity: *arity,
                         end_arity: *arity,
@@ -1384,13 +1373,15 @@ impl<'m> Instance<'m> {
                 Instr::End => {
                     let label = labels
                         .pop()
-                        .ok_or("WASM end에 대응하는 제어 라벨이 없습니다")?;
+                        .ok_or("WASM end has no matching control label")?;
                     let expected = label
                         .height
                         .checked_add(label.end_arity as usize)
-                        .ok_or("WASM 제어 스택 높이 계산이 넘쳤습니다")?;
+                        .ok_or("WASM control stack height overflowed")?;
                     if stack.len() != expected {
-                        return Err("WASM 블록 결과 스택 높이가 선언과 일치하지 않습니다".into());
+                        return Err(
+                            "WASM block result stack height does not match its declaration".into(),
+                        );
                     }
                     if labels.is_empty() {
                         break;
@@ -1401,23 +1392,25 @@ impl<'m> Instance<'m> {
                     continue;
                 }
                 Instr::BrIf(d) => {
-                    let cond = stack.pop().ok_or("스택 부족")?.as_i32()?;
+                    let cond = stack.pop().ok_or("Stack underflow")?.as_i32()?;
                     if cond != 0 {
                         pc = self.do_branch(*d, &mut stack, &mut labels)?;
                         continue;
                     }
                 }
                 Instr::BrTable(targets, default) => {
-                    let i = stack.pop().ok_or("스택 부족")?.as_i32()? as usize;
+                    let i = stack.pop().ok_or("Stack underflow")?.as_i32()? as usize;
                     let d = *targets.get(i).unwrap_or(default);
                     pc = self.do_branch(d, &mut stack, &mut labels)?;
                     continue;
                 }
                 Instr::Return => {
                     if let Some(expected) = result_type {
-                        let value = stack.pop().ok_or("스택 부족")?;
+                        let value = stack.pop().ok_or("Stack underflow")?;
                         if value.value_type() != expected {
-                            return Err("WASM 함수 반환 형식이 선언과 일치하지 않습니다".into());
+                            return Err(
+                                "WASM function return types do not match its declaration".into()
+                            );
                         }
                         return Ok(vec![value]);
                     }
@@ -1427,104 +1420,104 @@ impl<'m> Instance<'m> {
                     let param_count = self.ftype(*callee)?.params.len();
                     let mut args = Vec::with_capacity(param_count);
                     for _ in 0..param_count {
-                        args.push(stack.pop().ok_or("스택 부족")?);
+                        args.push(stack.pop().ok_or("Stack underflow")?);
                     }
                     args.reverse();
                     let res = self.invoke(*callee, args)?;
                     stack.extend(res);
                 }
                 Instr::CallIndirect(type_idx) => {
-                    let ti = stack.pop().ok_or("스택 부족")?.as_i32()? as usize;
+                    let ti = stack.pop().ok_or("Stack underflow")?.as_i32()? as usize;
                     let callee = self
                         .module
                         .table
                         .get(ti)
                         .copied()
                         .flatten()
-                        .ok_or("table 인덱스 무효")?;
+                        .ok_or("Invalid table index")?;
                     let param_count = {
                         let cft = self.ftype(callee)?;
                         let expected = self
                             .module
                             .types
                             .get(*type_idx as usize)
-                            .ok_or("call_indirect 타입 인덱스 무효")?;
+                            .ok_or("Invalid call_indirect type index")?;
                         if cft.params != expected.params || cft.results != expected.results {
-                            return Err("call_indirect 타입이 일치하지 않습니다".into());
+                            return Err("call_indirect type does not match".into());
                         }
                         cft.params.len()
                     };
                     let mut args = Vec::with_capacity(param_count);
                     for _ in 0..param_count {
-                        args.push(stack.pop().ok_or("스택 부족")?);
+                        args.push(stack.pop().ok_or("Stack underflow")?);
                     }
                     args.reverse();
                     let res = self.invoke(callee, args)?;
                     stack.extend(res);
                 }
                 Instr::Drop => {
-                    stack.pop().ok_or("스택 부족")?;
+                    stack.pop().ok_or("Stack underflow")?;
                 }
                 Instr::Select => {
-                    let c = stack.pop().ok_or("스택 부족")?.as_i32()?;
-                    let b = stack.pop().ok_or("스택 부족")?;
-                    let a = stack.pop().ok_or("스택 부족")?;
+                    let c = stack.pop().ok_or("Stack underflow")?.as_i32()?;
+                    let b = stack.pop().ok_or("Stack underflow")?;
+                    let a = stack.pop().ok_or("Stack underflow")?;
                     if a.value_type() != b.value_type() {
-                        return Err("WASM select 피연산자 형식이 일치하지 않습니다".into());
+                        return Err("WASM select operand types do not match".into());
                     }
                     stack.push(if c != 0 { a } else { b });
                 }
                 Instr::LocalGet(i) => {
-                    stack.push(*frame.locals.get(*i as usize).ok_or("local 인덱스")?);
+                    stack.push(*frame.locals.get(*i as usize).ok_or("local index")?);
                 }
                 Instr::LocalSet(i) => {
-                    let v = stack.pop().ok_or("스택 부족")?;
-                    let slot = frame.locals.get_mut(*i as usize).ok_or("local 인덱스")?;
+                    let v = stack.pop().ok_or("Stack underflow")?;
+                    let slot = frame.locals.get_mut(*i as usize).ok_or("local index")?;
                     if slot.value_type() != v.value_type() {
-                        return Err("WASM local.set 값 형식이 일치하지 않습니다".into());
+                        return Err("WASM local.set value type does not match".into());
                     }
                     *slot = v;
                 }
                 Instr::LocalTee(i) => {
-                    let v = *stack.last().ok_or("스택 부족")?;
-                    let slot = frame.locals.get_mut(*i as usize).ok_or("local 인덱스")?;
+                    let v = *stack.last().ok_or("Stack underflow")?;
+                    let slot = frame.locals.get_mut(*i as usize).ok_or("local index")?;
                     if slot.value_type() != v.value_type() {
-                        return Err("WASM local.tee 값 형식이 일치하지 않습니다".into());
+                        return Err("WASM local.tee value type does not match".into());
                     }
                     *slot = v;
                 }
                 Instr::GlobalGet(i) => {
-                    stack.push(*self.globals.get(*i as usize).ok_or("global 인덱스")?);
+                    stack.push(*self.globals.get(*i as usize).ok_or("global index")?);
                 }
                 Instr::GlobalSet(i) => {
-                    let v = stack.pop().ok_or("스택 부족")?;
-                    let slot = self.globals.get_mut(*i as usize).ok_or("global 인덱스")?;
+                    let v = stack.pop().ok_or("Stack underflow")?;
+                    let slot = self.globals.get_mut(*i as usize).ok_or("global index")?;
                     if slot.value_type() != v.value_type() {
-                        return Err("WASM global.set 값 형식이 일치하지 않습니다".into());
+                        return Err("WASM global.set value type does not match".into());
                     }
                     *slot = v;
                 }
                 Instr::Load { op, offset } => {
-                    let addr = stack.pop().ok_or("스택 부족")?.as_i32()? as usize;
+                    let addr = stack.pop().ok_or("Stack underflow")?.as_i32()? as usize;
                     let effective = addr
                         .checked_add(*offset as usize)
-                        .ok_or("WASM load 유효 주소 계산이 넘쳤습니다")?;
+                        .ok_or("WASM load effective address overflowed")?;
                     let v = self.exec_load(*op, effective)?;
                     stack.push(v);
                 }
                 Instr::Store { op, offset } => {
-                    let v = stack.pop().ok_or("스택 부족")?;
-                    let addr = stack.pop().ok_or("스택 부족")?.as_i32()? as usize;
+                    let v = stack.pop().ok_or("Stack underflow")?;
+                    let addr = stack.pop().ok_or("Stack underflow")?.as_i32()? as usize;
                     let effective = addr
                         .checked_add(*offset as usize)
-                        .ok_or("WASM store 유효 주소 계산이 넘쳤습니다")?;
+                        .ok_or("WASM store effective address overflowed")?;
                     self.exec_store(*op, effective, v)?;
                 }
                 Instr::MemSize => {
                     stack.push(Value::I32((self.memory.len() / PAGE) as i32));
                 }
                 Instr::MemGrow => {
-                    let signed_delta = stack.pop().ok_or("스택 부족")?.as_i32()?;
+                    let signed_delta = stack.pop().ok_or("Stack underflow")?.as_i32()?;
                     let old = self.memory.len() / PAGE;
                     let next_pages = usize::try_from(signed_delta)
                         .ok()
@@ -1537,7 +1530,8 @@ impl<'m> Instance<'m> {
                     {
                         stack.push(Value::I32(-1));
                     } else {
-                        self.memory.resize(newbytes.expect("검증된 메모리 크기"), 0);
+                        self.memory
+                            .resize(newbytes.expect("Validated memory size"), 0);
                         stack.push(Value::I32(old as i32));
                     }
                 }
@@ -1552,12 +1546,12 @@ impl<'m> Instance<'m> {
 
         let arity = usize::from(result_type.is_some());
         if stack.len() != arity {
-            return Err("WASM 함수 반환 스택 높이가 선언과 일치하지 않습니다".into());
+            return Err("WASM function return stack height does not match its declaration".into());
         }
         let out = stack.split_off(stack.len() - arity);
         if let (Some(value), Some(expected)) = (out.first(), result_type) {
             if value.value_type() != expected {
-                return Err("WASM 함수 반환 형식이 선언과 일치하지 않습니다".into());
+                return Err("WASM function return types do not match its declaration".into());
             }
         }
         Ok(out)
@@ -1579,7 +1573,7 @@ impl<'m> Instance<'m> {
         let n = labels.len();
         let idx = n
             .checked_sub(1 + depth as usize)
-            .ok_or("WASM 분기 깊이가 현재 블록 깊이를 넘었습니다")?;
+            .ok_or("WASM branch depth exceeds the current block depth")?;
         let label = &labels[idx];
         let arity = label.arity as usize;
         let height = label.height;
@@ -1588,9 +1582,9 @@ impl<'m> Instance<'m> {
 
         let required = height
             .checked_add(arity)
-            .ok_or("WASM 분기 스택 높이 계산이 넘쳤습니다")?;
+            .ok_or("WASM branch stack height overflowed")?;
         if stack.len() < required {
-            return Err("branch 스택 부족".into());
+            return Err("Stack underflow on branch".into());
         }
         let kept = stack.split_off(stack.len() - arity);
         stack.truncate(height);
@@ -1611,10 +1605,10 @@ impl<'m> Instance<'m> {
      */
     fn exec_load(&self, op: u8, addr: usize) -> Result<Value, String> {
         let rd = |n: usize| -> Result<&[u8], String> {
-            let end = addr.checked_add(n).ok_or("주소 계산 범위를 넘었습니다")?;
+            let end = addr.checked_add(n).ok_or("Address overflowed")?;
             self.memory
                 .get(addr..end)
-                .ok_or("load 허용 범위를 넘었습니다".into())
+                .ok_or("Load out of bounds".into())
         };
         Ok(match op {
             0x28 => {
@@ -1665,18 +1659,16 @@ impl<'m> Instance<'m> {
                 let b = rd(4)?;
                 Value::I64(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
             }
-            _ => return Err(format!("지원하지 않는 메모리 읽기 연산 0x{op:02x}")),
+            _ => return Err(format!("Unsupported memory load opcode 0x{op:02x}")),
         })
     }
 
     /** @brief 메모리 저장 명령을 실행한다. 범위 검사는 로드와 같다. */
     fn exec_store(&mut self, op: u8, addr: usize, v: Value) -> Result<(), String> {
         let wr = |mem: &mut Vec<u8>, bytes: &[u8]| -> Result<(), String> {
-            let end = addr
-                .checked_add(bytes.len())
-                .ok_or("주소 계산 범위를 넘었습니다")?;
+            let end = addr.checked_add(bytes.len()).ok_or("Address overflowed")?;
             if end > mem.len() {
-                return Err("store 허용 범위를 넘었습니다".into());
+                return Err("Store out of bounds".into());
             }
             mem[addr..end].copy_from_slice(bytes);
             Ok(())
@@ -1687,14 +1679,14 @@ impl<'m> Instance<'m> {
             0x38 => {
                 let f = match v {
                     Value::F32(x) => x,
-                    _ => return Err("f32 값이 필요합니다".into()),
+                    _ => return Err("Expected an f32 value".into()),
                 };
                 wr(&mut self.memory, &f.to_le_bytes())?
             }
             0x39 => {
                 let f = match v {
                     Value::F64(x) => x,
-                    _ => return Err("f64 값이 필요합니다".into()),
+                    _ => return Err("Expected an f64 value".into()),
                 };
                 wr(&mut self.memory, &f.to_le_bytes())?
             }
@@ -1703,7 +1695,7 @@ impl<'m> Instance<'m> {
             0x3c => wr(&mut self.memory, &[(v.as_i64()? as u8)])?,
             0x3d => wr(&mut self.memory, &(v.as_i64()? as u16).to_le_bytes())?,
             0x3e => wr(&mut self.memory, &(v.as_i64()? as u32).to_le_bytes())?,
-            _ => return Err(format!("지원하지 않는 메모리 쓰기 연산 0x{op:02x}")),
+            _ => return Err(format!("Unsupported memory store opcode 0x{op:02x}")),
         }
         Ok(())
     }
@@ -1711,11 +1703,15 @@ impl<'m> Instance<'m> {
 
 /** @brief 스택에서 i32를 꺼낸다. 비었거나 형식이 다르면 트랩이다. */
 fn pop_i32(s: &mut Vec<Value>) -> Result<i32, String> {
-    s.pop().ok_or("스택 부족".into()).and_then(Value::as_i32)
+    s.pop()
+        .ok_or("Stack underflow".into())
+        .and_then(Value::as_i32)
 }
 /** @brief 스택에서 i64를 꺼낸다. */
 fn pop_i64(s: &mut Vec<Value>) -> Result<i64, String> {
-    s.pop().ok_or("스택 부족".into()).and_then(Value::as_i64)
+    s.pop()
+        .ok_or("Stack underflow".into())
+        .and_then(Value::as_i64)
 }
 
 /**
@@ -1799,10 +1795,10 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i32(s)?;
             let a = pop_i32(s)?;
             if b == 0 {
-                return Err("i32.div_s에서 0으로 나눌 수 없습니다".into());
+                return Err("i32.div_s division by zero".into());
             }
             if a == i32::MIN && b == -1 {
-                return Err("i32.div_s 결과가 표현 범위를 넘었습니다".into());
+                return Err("i32.div_s overflow".into());
             }
             s.push(Value::I32(a / b));
         }
@@ -1810,7 +1806,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i32(s)?;
             let a = pop_i32(s)?;
             if b == 0 {
-                return Err("i32.div_u에서 0으로 나눌 수 없습니다".into());
+                return Err("i32.div_u division by zero".into());
             }
             s.push(Value::I32(((a as u32) / (b as u32)) as i32));
         }
@@ -1818,7 +1814,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i32(s)?;
             let a = pop_i32(s)?;
             if b == 0 {
-                return Err("i32.rem_s에서 0으로 나머지를 계산할 수 없습니다".into());
+                return Err("i32.rem_s division by zero".into());
             }
             s.push(Value::I32(a.wrapping_rem(b)));
         }
@@ -1826,7 +1822,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i32(s)?;
             let a = pop_i32(s)?;
             if b == 0 {
-                return Err("i32.rem_u에서 0으로 나머지를 계산할 수 없습니다".into());
+                return Err("i32.rem_u division by zero".into());
             }
             s.push(Value::I32(((a as u32) % (b as u32)) as i32));
         }
@@ -1858,10 +1854,10 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i64(s)?;
             let a = pop_i64(s)?;
             if b == 0 {
-                return Err("i64.div_s에서 0으로 나눌 수 없습니다".into());
+                return Err("i64.div_s division by zero".into());
             }
             if a == i64::MIN && b == -1 {
-                return Err("i64.div_s 결과가 표현 범위를 넘었습니다".into());
+                return Err("i64.div_s overflow".into());
             }
             s.push(Value::I64(a / b));
         }
@@ -1869,7 +1865,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i64(s)?;
             let a = pop_i64(s)?;
             if b == 0 {
-                return Err("i64.div_u에서 0으로 나눌 수 없습니다".into());
+                return Err("i64.div_u division by zero".into());
             }
             s.push(Value::I64(((a as u64) / (b as u64)) as i64));
         }
@@ -1877,7 +1873,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i64(s)?;
             let a = pop_i64(s)?;
             if b == 0 {
-                return Err("i64.rem_s에서 0으로 나머지를 계산할 수 없습니다".into());
+                return Err("i64.rem_s division by zero".into());
             }
             s.push(Value::I64(a.wrapping_rem(b)));
         }
@@ -1885,7 +1881,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let b = pop_i64(s)?;
             let a = pop_i64(s)?;
             if b == 0 {
-                return Err("i64.rem_u에서 0으로 나머지를 계산할 수 없습니다".into());
+                return Err("i64.rem_u division by zero".into());
             }
             s.push(Value::I64(((a as u64) % (b as u64)) as i64));
         }
@@ -1925,7 +1921,7 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
             let a = pop_i64(s)?;
             s.push(Value::I64((a as i32) as i64));
         }
-        other => return Err(format!("지원하지 않는 숫자 연산 코드 0x{other:02x}")),
+        other => return Err(format!("Unsupported numeric opcode 0x{other:02x}")),
     }
     Ok(())
 }

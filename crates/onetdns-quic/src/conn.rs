@@ -131,9 +131,9 @@ impl std::fmt::Display for QuicDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::LongPacketProtection => {
-                "QUIC long-header 패킷의 헤더 보호 또는 인증을 검증하지 못했습니다"
+                "Could not verify header protection or authentication of a QUIC long-header packet"
             }
-            Self::TransportParameters => "상대 QUIC transport parameters가 유효하지 않습니다",
+            Self::TransportParameters => "Peer QUIC transport parameters are invalid",
         })
     }
 }
@@ -142,11 +142,11 @@ impl std::fmt::Display for QuicError {
     /** @brief 사람이 읽을 설명. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
-            QuicError::Tls => "TLS 연결 협상 중 오류가 발생했습니다",
-            QuicError::Frame => "QUIC 프레임을 전송 형식으로 만들지 못했습니다",
-            QuicError::FlowControl => "흐름 제어 위반",
-            QuicError::StreamLimit => "열 수 있는 QUIC 스트림 수를 초과했습니다",
-            QuicError::Closed => "연결 또는 스트림 종료",
+            QuicError::Tls => "TLS handshake error",
+            QuicError::Frame => "Could not encode a QUIC frame",
+            QuicError::FlowControl => "Flow control violation",
+            QuicError::StreamLimit => "QUIC stream limit exceeded",
+            QuicError::Closed => "Connection or stream closed",
         };
         f.write_str(reason)
     }
@@ -3352,22 +3352,22 @@ impl Connection {
         }
         if let Some(close) = &self.peer_close {
             return Some(format!(
-                "상대가 연결을 끊었습니다: code=0x{:x} frame={:?} reason={}",
+                "Peer closed the connection: code=0x{:x} frame={:?} reason={}",
                 close.error_code,
                 close.frame_type,
                 String::from_utf8_lossy(&close.reason)
             ));
         }
         if self.reset_received {
-            return Some("상대가 stateless reset을 보냈습니다".to_string());
+            return Some("Peer sent a stateless reset".to_string());
         }
         if self.idle_timed_out {
-            return Some("정해진 시간 안에 아무것도 오지 않아 연결이 끊겼습니다".to_string());
+            return Some("Connection timed out with no traffic".to_string());
         }
         if let Some(diagnostic) = self.diagnostic {
             return Some(diagnostic.to_string());
         }
-        Some("까닭을 남기지 않고 닫혔습니다".to_string())
+        Some("Closed without a reason".to_string())
     }
 
     /** @brief 합의된 응용 프로토콜. */

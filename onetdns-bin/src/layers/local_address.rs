@@ -44,14 +44,14 @@ impl LocalAddressTable {
         );
         for (name, ip) in local_a {
             let key = configured_name_key(name)
-                .ok_or_else(|| format!("로컬 A 레코드 이름이 올바르지 않습니다: {name}"))?;
+                .ok_or_else(|| format!("Invalid local A record name: {name}"))?;
             if addresses.entry(key).or_default().a.replace(*ip).is_some() {
-                return Err(format!("로컬 A 레코드 이름이 중복되었습니다: {name}"));
+                return Err(format!("Duplicate local A record name: {name}"));
             }
         }
         for (name, ip) in local_aaaa {
             let key = configured_name_key(name)
-                .ok_or_else(|| format!("로컬 AAAA 레코드 이름이 올바르지 않습니다: {name}"))?;
+                .ok_or_else(|| format!("Invalid local AAAA record name: {name}"))?;
             if addresses
                 .entry(key)
                 .or_default()
@@ -59,7 +59,7 @@ impl LocalAddressTable {
                 .replace(*ip)
                 .is_some()
             {
-                return Err(format!("로컬 AAAA 레코드 이름이 중복되었습니다: {name}"));
+                return Err(format!("Duplicate local AAAA record name: {name}"));
             }
         }
         Ok(Self {

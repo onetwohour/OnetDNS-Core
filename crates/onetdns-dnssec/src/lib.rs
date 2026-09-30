@@ -48,11 +48,11 @@ impl std::fmt::Display for DnssecError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DnssecError::Unsupported(a) => write!(f, "지원하지 않는 알고리즘/다이제스트: {a}"),
-            DnssecError::BadKey => write!(f, "공개키 형식이 올바르지 않습니다"),
-            DnssecError::BadSignature => write!(f, "서명 검증에 실패했습니다"),
-            DnssecError::BadDigest => write!(f, "DS 다이제스트가 일치하지 않습니다"),
-            DnssecError::Invalid => write!(f, "검증 입력 비정상"),
+            DnssecError::Unsupported(a) => write!(f, "Unsupported algorithm or digest: {a}"),
+            DnssecError::BadKey => write!(f, "Malformed public key"),
+            DnssecError::BadSignature => write!(f, "Signature verification failed"),
+            DnssecError::BadDigest => write!(f, "DS digest does not match"),
+            DnssecError::Invalid => write!(f, "Invalid verification input"),
         }
     }
 }

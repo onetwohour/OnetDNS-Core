@@ -82,7 +82,7 @@ const API_REQUIRED: &[&str] = &[
     "json::escape(&e.detail)",
     "pub struct SessionCheckpoint",
     "pub fn checkpoint(&self) -> SessionCheckpoint",
-    "DNS 서비스 설정을 적용하는 중입니다. 준비가 끝난 뒤 다시 시도하십시오",
+    "DNS service settings are being applied. Try again when they are ready",
     "mutations_are_rejected_until_service_is_ready",
     "fn control_security_headers()",
     "Content-Security-Policy:",

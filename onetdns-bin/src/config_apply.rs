@@ -286,13 +286,16 @@ pub(crate) fn apply_config_edit_smart_locked(
     use onetdns_core::MutexExt;
     use std::sync::atomic::Ordering;
     let Some(p) = path else {
-        return Err("설정 파일 경로가 없습니다. 현재 설정은 메모리에만 있습니다".to_string());
+        return Err(
+            "There is no configuration file path; the current configuration exists only in memory"
+                .to_string(),
+        );
     };
     let current =
         onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| e.to_string())?);
     let new_text = onetdns_core::SecretString::from(edit(&current)?);
     let new_cfg = onetdns_config::Config::from_toml_str(&new_text)
-        .map_err(|e| format!("변경한 설정이 유효하지 않습니다: {e}"))?;
+        .map_err(|e| format!("The changed configuration is invalid: {e}"))?;
     let changed = changed_config_keys(&current, &new_text)?;
     if changed.is_empty() {
         return Ok(ConfigApplyResult {
@@ -301,7 +304,8 @@ pub(crate) fn apply_config_edit_smart_locked(
         });
     }
     /* 검증 API와 같은 기준으로 거른다. 통과시키면 저장한 뒤 재시작할 때 서버가 뜨지 않는다. */
-    runtime_preflight(&new_cfg).map_err(|e| format!("변경한 설정이 유효하지 않습니다: {e}"))?;
+    runtime_preflight(&new_cfg)
+        .map_err(|e| format!("The changed configuration is invalid: {e}"))?;
 
     atomic_write(p, new_text.as_bytes()).map_err(|e| e.to_string())?;
     let (mode, effective_changed) = match hot_apply(&new_cfg, &changed) {
@@ -312,7 +316,7 @@ pub(crate) fn apply_config_edit_smart_locked(
         }
         Err(error) => {
             let restore = atomic_write(p, current.as_bytes())
-                .map_err(|e| format!("{error}; 설정 파일도 이전 상태로 복구하지 못했습니다: {e}"));
+                .map_err(|e| format!("{error}; restoring the configuration file also failed: {e}"));
             return match restore {
                 Ok(()) => Err(error),
                 Err(combined) => Err(combined),
@@ -351,13 +355,16 @@ pub(crate) fn apply_config_edit_locked(
     use onetdns_core::MutexExt;
     use std::sync::atomic::Ordering;
     let Some(p) = path else {
-        return Err("설정 파일 경로가 없습니다. 현재 설정은 메모리에만 있습니다".to_string());
+        return Err(
+            "There is no configuration file path; the current configuration exists only in memory"
+                .to_string(),
+        );
     };
     let current =
         onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| e.to_string())?);
     let new_text = onetdns_core::SecretString::from(edit(&current)?);
     onetdns_config::Config::from_toml_str(&new_text)
-        .map_err(|e| format!("변경한 설정이 유효하지 않습니다: {e}"))?;
+        .map_err(|e| format!("The changed configuration is invalid: {e}"))?;
     atomic_write(p, new_text.as_bytes()).map_err(|e| e.to_string())?;
     *prev.lock_recover() = Some(current);
     reload.store(true, Ordering::Relaxed);
@@ -454,11 +461,11 @@ pub(crate) fn config_changed_keys(
 ) -> Result<Vec<String>, String> {
     use onetdns_core::json::Json;
     let applied = onetdns_core::json::parse(&runtime.effective_json())
-        .map_err(|error| format!("현재 실행 설정을 비교할 수 없습니다: {error}"))?;
+        .map_err(|error| format!("Could not compare the running configuration: {error}"))?;
     let wanted = onetdns_core::json::parse(&desired.effective_json())
-        .map_err(|error| format!("파일에 저장된 설정을 비교할 수 없습니다: {error}"))?;
+        .map_err(|error| format!("Could not compare the saved configuration file: {error}"))?;
     let (Json::Obj(applied), Json::Obj(wanted)) = (applied, wanted) else {
-        return Err("설정 비교 데이터가 JSON 객체가 아닙니다".to_string());
+        return Err("Configuration comparison data is not a JSON object".to_string());
     };
     /** @brief 이 항목의 값. */
     fn lookup<'a>(pairs: &'a [(String, Json)], key: &str) -> Option<&'a Json> {

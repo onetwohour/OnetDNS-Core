@@ -72,7 +72,7 @@ impl Drop for KdfGuard {
 fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
     let iters = iters.max(1);
     let blocks = out.len().div_ceil(HLEN);
-    let template = HmacSha256::new_from_slice(password).expect("HMAC는 임의 키 길이 허용");
+    let template = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
     for block in 1..=blocks {
         let mut mac = template.clone();
         mac.update(salt);

@@ -243,10 +243,10 @@ mod linux {
         no_web: bool,
         restarts: u64,
     ) -> BoxResult<ManagedChild> {
-        let (readiness, ready_address, ready_token) =
-            readiness_channel().with_context(|| "supervisor readiness 채널 만들지 못했습니다")?;
+        let (readiness, ready_address, ready_token) = readiness_channel()
+            .with_context(|| "Could not create the supervisor readiness channel")?;
         let executable = std::env::current_exe()
-            .with_context(|| "현재 실행 파일의 경로를 확인하지 못했습니다")?;
+            .with_context(|| "Could not find the path of the current executable")?;
         let mut command = Command::new(executable);
         command.arg("run");
         if let Some(path) = config_path {
@@ -262,7 +262,7 @@ mod linux {
         crate::osnet::harden_child_env(&mut command);
         let process = command
             .spawn()
-            .with_context(|| "supervisor DNS 자식 프로세스 만들지 못했습니다")?;
+            .with_context(|| "Could not create the supervised DNS child process")?;
         Ok(ManagedChild {
             process,
             readiness: Some(readiness),
@@ -277,7 +277,7 @@ mod linux {
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                onetdns_core::warn!(event = "supervisor.shutdown_signal_failed", pid = child.id(), %error, "감독 프로세스가 DNS 서비스에 종료 신호를 전달하지 못했습니다");
+                onetdns_core::warn!(event = "supervisor.shutdown_signal_failed", pid = child.id(), %error, "Supervisor could not forward the shutdown signal to the DNS service");
             }
         }
     }
@@ -291,16 +291,16 @@ mod linux {
                 Ok(Some(_)) => return,
                 Ok(None) => std::thread::sleep(POLL_INTERVAL),
                 Err(error) => {
-                    onetdns_core::warn!(event = "supervisor.child_wait_failed", pid = child.id(), %error, "종료 중인 자식 프로세스의 상태를 확인하지 못해 곧바로 강제 종료합니다");
+                    onetdns_core::warn!(event = "supervisor.child_wait_failed", pid = child.id(), %error, "Could not check the state of the exiting child process; killing it now");
                     break;
                 }
             }
         }
         if let Err(error) = child.kill() {
-            onetdns_core::warn!(event = "supervisor.child_kill_failed", pid = child.id(), %error, "자식 프로세스를 강제 종료하지 못했습니다. 포트를 잡은 프로세스가 남을 수 있습니다");
+            onetdns_core::warn!(event = "supervisor.child_kill_failed", pid = child.id(), %error, "Could not kill the child process; a process holding the ports may be left behind");
         }
         if let Err(error) = child.wait() {
-            onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.id(), %error, "종료한 자식 프로세스를 거두지 못했습니다");
+            onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.id(), %error, "Could not reap the exited child process");
         }
     }
 
@@ -344,9 +344,9 @@ mod linux {
             .map(|user| (user, config.run_as_group.clone()));
         drop(config);
         disable_core_dumps()
-            .with_context(|| "감시 프로세스에서 코어 덤프 생성을 차단하지 못했습니다")?;
+            .with_context(|| "Could not disable core dumps in the supervisor process")?;
         disable_process_dumping()
-            .with_context(|| "감시 프로세스를 덤프할 수 없도록 설정하지 못했습니다")?;
+            .with_context(|| "Could not make the supervisor process non-dumpable")?;
 
         let stop: Arc<AtomicBool> = crate::install_shutdown_handler();
         let mut policy = RestartPolicy::default();
@@ -362,7 +362,7 @@ mod linux {
                 event = "supervisor.child_started",
                 pid = child.process.id(),
                 restarts,
-                "DNS 서비스 프로세스를 시작했습니다"
+                "Started the DNS service process"
             );
 
             let status = loop {
@@ -371,24 +371,24 @@ mod linux {
                     return Ok(());
                 }
                 if child.poll_ready()? && !parent_privileges_dropped {
-                    let (user, group) = run_as.as_ref().expect("run_as 존재");
+                    let (user, group) = run_as.as_ref().expect("run_as is set");
                     if let Err(error) = crate::privdrop::drop_privileges(user, group.as_deref()) {
                         terminate_child(&mut child.process);
                         return Err(crate::anyhow!(format!(
-                            "감시 프로세스의 권한을 낮추지 못해 서비스를 중단합니다: {error}"
+                            "Stopping the service because the supervisor could not drop privileges: {error}"
                         )));
                     }
                     if let Err(error) = crate::privdrop::executable_still_runnable() {
                         terminate_child(&mut child.process);
                         return Err(crate::anyhow!(format!(
-                            "권한을 낮춘 뒤에는 자식을 다시 띄울 수 없어 서비스를 중단합니다: {error}"
+                            "Stopping the service because the child cannot be restarted after dropping privileges: {error}"
                         )));
                     }
                     parent_privileges_dropped = true;
                     onetdns_core::info!(
                         event = "supervisor.privdrop_applied",
                         user,
-                        "감독 프로세스의 실행 권한을 낮췄습니다"
+                        "Dropped the supervisor's privileges"
                     );
                 }
                 match child.process.try_wait()? {
@@ -405,7 +405,7 @@ mod linux {
             match policy.child_exited(ready, runtime) {
                 RestartDecision::GiveUp => {
                     return Err(crate::anyhow!(format!(
-                        "DNS 자식이 readiness 전에 {MAX_STARTUP_FAILURES}회 연속 종료됨 ({})",
+                        "The DNS child exited {MAX_STARTUP_FAILURES} times in a row before becoming ready ({})",
                         status_text(status)
                     )));
                 }
@@ -417,7 +417,7 @@ mod linux {
                         runtime_ms = runtime.as_millis(),
                         delay_ms = delay.as_millis(),
                         restarts,
-                        "DNS 서비스 프로세스가 비정상 종료되어 다시 시작합니다"
+                        "DNS service process exited abnormally; restarting it"
                     );
                     if !sleep_until(delay, &stop) {
                         return Ok(());
@@ -437,25 +437,27 @@ mod linux {
             return Ok(None);
         }
         disable_process_dumping()
-            .with_context(|| "DNS 자식 프로세스를 덤프할 수 없도록 설정하지 못했습니다")?;
+            .with_context(|| "Could not make the DNS child process non-dumpable")?;
         let address = address
-            .ok_or_else(|| crate::anyhow!("감독 프로세스 준비 확인 주소가 빠져 있습니다"))?
+            .ok_or_else(|| crate::anyhow!("The supervisor readiness address is missing"))?
             .parse::<SocketAddr>()
-            .map_err(|error| crate::anyhow!(format!("supervisor readiness 주소 오류: {error}")))?;
+            .map_err(|error| {
+                crate::anyhow!(format!("Invalid supervisor readiness address: {error}"))
+            })?;
         if !address.ip().is_loopback() {
             return Err(crate::anyhow!(
-                "supervisor readiness 주소가 loopback이 아닙니다"
+                "The supervisor readiness address is not a loopback address"
             ));
         }
         let token = decode_token(
             token
                 .as_deref()
-                .ok_or_else(|| crate::anyhow!("감독 프로세스 준비 확인 토큰이 빠져 있습니다"))?,
+                .ok_or_else(|| crate::anyhow!("The supervisor readiness token is missing"))?,
         )
-        .ok_or_else(|| crate::anyhow!("supervisor readiness 토큰 형식이 올바르지 않습니다"))?;
+        .ok_or_else(|| crate::anyhow!("The supervisor readiness token is malformed"))?;
         Ok(Some(Box::new(move || {
             if let Err(error) = signal_readiness(address, token) {
-                onetdns_core::error!(event = "supervisor.ready_signal_failed", %error, "서비스 준비 신호를 보내지 못해 시작을 중단합니다");
+                onetdns_core::error!(event = "supervisor.ready_signal_failed", %error, "Could not send the service ready signal; aborting startup");
                 std::process::exit(1);
             }
         })))

@@ -177,7 +177,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 slots.reload(next)?;
                 onetdns_core::info!(
                     event = "tls.certificate_reloaded",
-                    "수신 주소를 닫지 않고 TLS 인증서를 교체했습니다"
+                    "Replaced the TLS certificate without closing listening addresses"
                 );
             }
         }
@@ -190,14 +190,14 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                     reconcile_edge_services(&previous_cfg, &edge_services, &dhcp_slot, &dhcp6_slot)
                 {
                     return Err(format!(
-                        "{error}; 이전 설정의 DHCP 계열 서비스도 재시작하지 못했습니다: {restore}"
+                        "{error}; restarting the DHCP services of the previous configuration also failed: {restore}"
                     ));
                 }
                 return Err(error);
             }
             onetdns_core::info!(
                 event = "edge.reloaded",
-                "DHCP 계열 서비스를 DNS를 멈추지 않고 다시 띄웠습니다"
+                "Restarted DHCP services without stopping DNS"
             );
         }
         if groups
@@ -214,7 +214,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 /* 이전 리스너를 먼저 닫았을 수 있으므로 이전 설정으로 다시 연다. */
                 if let Err(restore) = sync(&previous_cfg) {
                     return Err(format!(
-                        "{error}; 이전 설정의 수신 주소도 다시 열지 못했습니다: {restore}"
+                        "{error}; reopening the listening addresses of the previous configuration also failed: {restore}"
                     ));
                 }
                 return Err(error);
@@ -222,7 +222,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             onetdns_core::info!(
                 event = "listener.reloaded",
                 plain = next.listen.len(),
-                "수신 주소를 설정에 맞췄습니다. 그대로인 주소는 끊기지 않았습니다"
+                "Matched listening addresses to the configuration; unchanged addresses stayed up"
             );
         }
         if groups.contains(&ApplyGroup::Cluster) {
@@ -237,7 +237,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 event = "cluster.reloaded",
                 raft = next.cluster_raft,
                 peers = next.cluster_raft_peers.len(),
-                "클러스터를 DNS를 멈추지 않고 다시 띄웠습니다"
+                "Restarted clustering without stopping DNS"
             );
         }
         if groups.contains(&ApplyGroup::ControlTokens) {
@@ -245,7 +245,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 let rebind = control_rebind
                     .lock_recover()
                     .clone()
-                    .ok_or("웹 관리 화면의 연결 수신을 아직 준비하지 못했습니다")?;
+                    .ok_or("The dashboard listener is not ready yet")?;
                 rebind(next)?;
             }
             if let Some(auth) = console_auth.lock_recover().as_ref() {
@@ -260,7 +260,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             }
             onetdns_core::info!(
                 event = "control.tokens_reloaded",
-                "제어 토큰을 DNS를 멈추지 않고 갱신했습니다"
+                "Updated the control token without stopping DNS"
             );
         }
         if groups.contains(&ApplyGroup::MacVendor) {
@@ -284,7 +284,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 event = "filter.subscriptions_reloaded",
                 lists = next.blocklist_urls.len(),
                 rpz = next.rpz_urls.len(),
-                "DNS 처리를 멈추지 않고 차단 목록 구독을 바꿨습니다"
+                "Changed blocklist subscriptions without interrupting DNS"
             );
         }
 
@@ -339,7 +339,9 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             None
         };
         let prepared_native = if groups.contains(&ApplyGroup::Native) {
-            let state = native_state.as_ref().expect("native 상태를 확인했습니다");
+            let state = native_state
+                .as_ref()
+                .expect("Native state was checked above");
             let current = state.features.load();
             Some(reconfigure_native_features(&current, next, &changed)?)
         } else {
@@ -372,7 +374,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
 
         if let Some(persist) = prepared_persist {
             stats.reconfigure_persist(persist).map_err(|error| {
-                format!("통계 또는 질의 기록 저장 설정을 적용하지 못했습니다: {error}")
+                format!("Could not apply the statistics or query log storage settings: {error}")
             })?;
         }
 
@@ -389,7 +391,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 event = "filter.rebuilt",
                 block = counts.0,
                 allow = counts.1,
-                "필터 규칙을 새 설정으로 교체했습니다"
+                "Replaced filter rules with the new configuration"
             );
         }
         if let Some((resolver, stats)) = prepared_forward {
@@ -397,7 +399,9 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             *forward_stats.lock_recover() = Some(stats);
         }
         if let Some(features) = prepared_native {
-            let state = native_state.as_ref().expect("native 상태를 확인했습니다");
+            let state = native_state
+                .as_ref()
+                .expect("Native state was checked above");
             state
                 .local_only_names
                 .set(next.domain_needed, next.bogus_priv, next.empty_zones);
@@ -414,35 +418,35 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 onetdns_core::info!(
                     event = "cache.flushed_for_local_only",
                     flushed,
-                    "로컬 전용 이름 처리가 바뀌어 응답 캐시를 비웠습니다"
+                    "Cleared the response cache because local-only name handling changed"
                 );
             }
         }
         if let Some(policy) = prepared_policy {
             native_state
                 .as_ref()
-                .expect("native 상태를 확인했습니다")
+                .expect("Native state was checked above")
                 .policy
                 .store(policy);
         }
         if let Some(views) = prepared_views {
             native_state
                 .as_ref()
-                .expect("native 상태를 확인했습니다")
+                .expect("Native state was checked above")
                 .views
                 .store(Arc::new(views));
         }
         if groups.contains(&ApplyGroup::BlockTtl) {
             native_state
                 .as_ref()
-                .expect("native 상태를 확인했습니다")
+                .expect("Native state was checked above")
                 .block_ttl
                 .store(next.blocked_response_ttl, Ordering::Release);
         }
         if groups.contains(&ApplyGroup::LocalTtl) {
             native_state
                 .as_ref()
-                .expect("native 상태를 확인했습니다")
+                .expect("Native state was checked above")
                 .local_ttl
                 .store(next.local_ttl, Ordering::Release);
         }
@@ -459,7 +463,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
         }) {
             native_state
                 .as_ref()
-                .expect("native 상태를 확인했습니다")
+                .expect("Native state was checked above")
                 .wire_epoch
                 .fetch_add(1, Ordering::AcqRel);
         }
@@ -520,7 +524,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             onetdns_core::info!(
                 event = "authority.reloaded",
                 zones = next.zones.len(),
-                "DNS 처리를 멈추지 않고 DNS 영역 구성을 교체했습니다"
+                "Replaced the DNS zone configuration without interrupting DNS"
             );
         }
 
@@ -532,10 +536,9 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                 Some(rebuild) => {
                     let plan = resolver_chain::ChainPlan::new(next);
                     let rebuilt = rebuild(&plan).and_then(|()| {
-                        cache_slot
-                            .lock_recover()
-                            .clone()
-                            .ok_or_else(|| "새 해석 체인의 응답 캐시 핸들이 없습니다".to_string())
+                        cache_slot.lock_recover().clone().ok_or_else(|| {
+                            "The new resolver chain has no response cache handle".to_string()
+                        })
                     });
                     let cache = match rebuilt {
                         Ok(cache) => cache,
@@ -550,7 +553,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                             .flatten();
                     native_state
                         .as_ref()
-                        .expect("chain 변경은 native 상태를 준비합니다")
+                        .expect("A chain change prepares the native state")
                         .handler
                         .replace_lane_runtime(
                             wirecache::WireEntryFactory::new(
@@ -563,7 +566,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                         );
                     onetdns_core::info!(
                         event = "chain.rebuilt",
-                        "해석 체인을 새로 만들어 교체했습니다. DNS 처리는 멈추지 않았습니다"
+                        "Rebuilt and swapped the resolver chain; DNS kept answering"
                     );
                 }
                 // 체인을 만들 준비가 아직 안 됐으면 재시작하는 쪽이 안전하다.
@@ -592,7 +595,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
                     wire = gates.wire,
                     authority = gates.authority,
                     reactor = gates.reactor,
-                    "바뀐 설정에 맞춰 빠른 경로를 다시 열고 닫았습니다"
+                    "Reopened and closed fast paths for the changed configuration"
                 );
             }
         }
@@ -604,7 +607,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             onetdns_core::info!(
                 event = "console.accounts_reloaded",
                 accounts = next.users.len(),
-                "웹 콘솔 계정 목록을 DNS 처리를 멈추지 않고 갱신했습니다"
+                "Updated dashboard accounts without interrupting DNS"
             );
         }
 
@@ -616,7 +619,7 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
             event = "config.runtime_hot_applied",
             changed = changed.len(),
             keys = ?changed,
-            "실행 중인 설정을 갱신했습니다"
+            "Updated the running configuration"
         );
         Ok((true, changed))
     })

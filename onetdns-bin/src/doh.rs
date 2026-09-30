@@ -460,7 +460,7 @@ fn serve_conn(
                     peer = %src,
                     path_identity = path_client_id.unwrap_or(""),
                     auth_identity = tls_auth_identity.as_deref().unwrap_or(""),
-                    "DoH URL에 지정된 클라이언트 ID와 mTLS 인증서의 클라이언트 ID가 일치하지 않습니다"
+                    "Client ID in the DoH URL does not match the client ID in the mTLS certificate"
                 );
                 return Err("403");
             }

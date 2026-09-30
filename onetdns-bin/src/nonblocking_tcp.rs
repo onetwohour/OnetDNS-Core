@@ -251,7 +251,7 @@ pub(crate) fn connect(address: SocketAddr) -> io::Result<TcpStream> {
 }
 
 #[cfg(not(any(unix, windows)))]
-compile_error!("비차단 TCP 연결에는 Unix 또는 Windows 소켓 API가 필요합니다");
+compile_error!("Non-blocking TCP connections need the Unix or Windows socket API");
 
 #[cfg(test)]
 /** @brief 접속이 스레드를 붙잡지 않고, 소켓이 자식에게 새지 않는지. */

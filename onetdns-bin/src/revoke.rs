@@ -86,10 +86,10 @@ impl RevocationChecker {
         let leaf = chain
             .first()
             .and_then(|d| X509::parse(d).ok())
-            .ok_or("leaf 인증서 해석하지 못했습니다")?;
+            .ok_or("Could not parse the leaf certificate")?;
         let issuer = match chain.get(1).and_then(|d| X509::parse(d).ok()) {
             Some(i) => i,
-            None => return self.soft("발급자 인증서 없습니다(폐기 확인 불가)"),
+            None => return self.soft("No issuer certificate, so revocation cannot be checked"),
         };
 
         let status = match self.mode {
@@ -106,10 +106,10 @@ impl RevocationChecker {
         };
 
         match status {
-            Some(RevocationStatus::Revoked) => Err("폐기된 인증서입니다".to_string()),
+            Some(RevocationStatus::Revoked) => Err("The certificate has been revoked".to_string()),
             Some(RevocationStatus::Good) => Ok(RevocationStatus::Good),
             Some(RevocationStatus::Unknown) | None => {
-                self.soft("인증서 폐기 여부를 확인하지 못했습니다")
+                self.soft("Could not check whether the certificate has been revoked")
             }
         }
     }
@@ -123,12 +123,12 @@ impl RevocationChecker {
         if self.soft_fail {
             let count = SOFT_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
             if count.is_power_of_two() {
-                onetdns_core::warn!(event = "tls.revocation_soft_pass", reason = %why, count = count, "폐기 여부를 확인하지 못한 업스트림 인증서를 설정에 따라 통과시켰습니다. 확인 서버를 막는 것만으로 폐기된 인증서가 통과할 수 있습니다");
+                onetdns_core::warn!(event = "tls.revocation_soft_pass", reason = %why, count = count, "Accepted an upstream certificate whose revocation could not be checked, as configured; blocking the checking server alone is enough to let a revoked certificate through");
             }
             Ok(RevocationStatus::Unknown)
         } else {
             Err(format!(
-                "인증서 폐기 여부를 확인하지 못해 연결을 거부했습니다: {why}"
+                "Rejected the connection because certificate revocation could not be checked: {why}"
             ))
         }
     }
@@ -150,18 +150,18 @@ impl RevocationChecker {
         let resp = match request.call() {
             Ok(resp) => resp,
             Err(e) => {
-                onetdns_core::debug!(event = "tls.ocsp_fetch_failed", url = %url, error = %e, "OCSP 응답기에 닿지 못했습니다");
+                onetdns_core::debug!(event = "tls.ocsp_fetch_failed", url = %url, error = %e, "Could not reach the OCSP responder");
                 return None;
             }
         };
         if resp.status != 200 {
-            onetdns_core::debug!(event = "tls.ocsp_status_unexpected", url = %url, status = resp.status, "OCSP 응답기가 200이 아닌 상태를 돌려줬습니다");
+            onetdns_core::debug!(event = "tls.ocsp_status_unexpected", url = %url, status = resp.status, "OCSP responder returned a non-200 status");
             return None;
         }
         match check_ocsp_response(&resp.body, issuer, &leaf.serial, now) {
             Ok(status) => Some(status),
             Err(e) => {
-                onetdns_core::debug!(event = "tls.ocsp_response_invalid", url = %url, error = %e, "OCSP 응답을 검증하지 못했습니다");
+                onetdns_core::debug!(event = "tls.ocsp_response_invalid", url = %url, error = %e, "Could not verify the OCSP response");
                 None
             }
         }
@@ -180,18 +180,18 @@ impl RevocationChecker {
         let resp = match request.call() {
             Ok(resp) => resp,
             Err(e) => {
-                onetdns_core::debug!(event = "tls.crl_fetch_failed", url = %url, error = %e, "폐기 목록을 받아 오지 못했습니다");
+                onetdns_core::debug!(event = "tls.crl_fetch_failed", url = %url, error = %e, "Could not fetch the revocation list");
                 return None;
             }
         };
         if resp.status != 200 {
-            onetdns_core::debug!(event = "tls.crl_status_unexpected", url = %url, status = resp.status, "폐기 목록 서버가 200이 아닌 상태를 돌려줬습니다");
+            onetdns_core::debug!(event = "tls.crl_status_unexpected", url = %url, status = resp.status, "Revocation list server returned a non-200 status");
             return None;
         }
         let crl = match Crl::parse(&resp.body, issuer) {
             Ok(crl) => crl,
             Err(e) => {
-                onetdns_core::debug!(event = "tls.crl_invalid", url = %url, error = %e, "폐기 목록을 검증하지 못했습니다");
+                onetdns_core::debug!(event = "tls.crl_invalid", url = %url, error = %e, "Could not verify the revocation list");
                 return None;
             }
         };
@@ -260,11 +260,14 @@ pub fn check_pem_chain_json(
     let ders = pem_chain_to_ders(pem);
     if ders.len() < 2 {
         return Err(
-            "서버 인증서와 발급자 인증서를 포함한 PEM 인증서가 두 개 이상 필요합니다".to_string(),
+            "At least two PEM certificates are needed: the server certificate and its issuer"
+                .to_string(),
         );
     }
-    let leaf = X509::parse(&ders[0]).map_err(|_| "leaf 해석하지 못했습니다".to_string())?;
-    let issuer = X509::parse(&ders[1]).map_err(|_| "issuer 해석하지 못했습니다".to_string())?;
+    let leaf =
+        X509::parse(&ders[0]).map_err(|_| "Could not parse the leaf certificate".to_string())?;
+    let issuer =
+        X509::parse(&ders[1]).map_err(|_| "Could not parse the issuer certificate".to_string())?;
 
     let ocsp_checker =
         RevocationChecker::new(RevocationMode::Ocsp, true, timeout).with_resolver(resolver.clone());

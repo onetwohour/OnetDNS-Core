@@ -170,18 +170,21 @@ impl IaMap {
 
         let new_iaid = value.iaid;
         let (primary_iaid, old_head) = {
-            let primary = self.primary.get_mut(duid).expect("첫 IA가 있어야 합니다");
+            let primary = self
+                .primary
+                .get_mut(duid)
+                .expect("The first IA must be present");
             let old_head = primary.link;
             primary.link = new_iaid;
             (primary.iaid, old_head)
         };
         if old_head != primary_iaid {
             let mut old_storage = [0; SECONDARY_IA_KEY_LEN];
-            let old_key =
-                secondary_ia_key(duid, old_head, &mut old_storage).expect("검증된 DUID여야 합니다");
+            let old_key = secondary_ia_key(duid, old_head, &mut old_storage)
+                .expect("The DUID must already be validated");
             self.additional
                 .get_mut(old_key)
-                .expect("추가 IA 연결이 온전해야 합니다")
+                .expect("Additional IA links must be intact")
                 .previous = new_iaid;
             value.link = old_head;
         } else {
@@ -208,7 +211,7 @@ impl IaMap {
                 let promoted = self
                     .additional
                     .remove(head_key)
-                    .expect("추가 IA 머리가 있어야 합니다")
+                    .expect("The additional IA head must be present")
                     .value;
                 if promoted.link != promoted.iaid {
                     let mut next_storage = [0; SECONDARY_IA_KEY_LEN];
@@ -216,7 +219,7 @@ impl IaMap {
                     let next = self
                         .additional
                         .get_mut(next_key)
-                        .expect("다음 추가 IA가 있어야 합니다");
+                        .expect("The next additional IA must be present");
                     next.previous = next.value.iaid;
                 }
                 self.primary.insert(duid.to_vec(), promoted);
@@ -229,7 +232,10 @@ impl IaMap {
         let removed = self.additional.remove(key)?;
         let next = removed.value.link;
         if removed.previous == iaid {
-            let primary = self.primary.get_mut(duid).expect("첫 IA가 있어야 합니다");
+            let primary = self
+                .primary
+                .get_mut(duid)
+                .expect("The first IA must be present");
             primary.link = if next == iaid { primary.iaid } else { next };
         } else {
             let mut previous_storage = [0; SECONDARY_IA_KEY_LEN];
@@ -237,7 +243,7 @@ impl IaMap {
             let previous = self
                 .additional
                 .get_mut(previous_key)
-                .expect("이전 추가 IA가 있어야 합니다");
+                .expect("The previous additional IA must be present");
             previous.value.link = if next == iaid {
                 previous.value.iaid
             } else {
@@ -250,7 +256,7 @@ impl IaMap {
             let next_value = self
                 .additional
                 .get_mut(next_key)
-                .expect("다음 추가 IA가 있어야 합니다");
+                .expect("The next additional IA must be present");
             next_value.previous = if removed.previous == iaid {
                 next_value.value.iaid
             } else {
@@ -317,18 +323,18 @@ impl IaMap {
             }
             let mut head_storage = [0; SECONDARY_IA_KEY_LEN];
             let head_key = secondary_ia_key(duid, primary.link, &mut head_storage)
-                .expect("검증된 DUID여야 합니다");
+                .expect("The DUID must already be validated");
             let promoted = additional
                 .remove(head_key)
-                .expect("추가 IA 머리가 있어야 합니다")
+                .expect("The additional IA head must be present")
                 .value;
             if promoted.link != promoted.iaid {
                 let mut next_storage = [0; SECONDARY_IA_KEY_LEN];
                 let next_key = secondary_ia_key(duid, promoted.link, &mut next_storage)
-                    .expect("검증된 DUID여야 합니다");
+                    .expect("The DUID must already be validated");
                 let next = additional
                     .get_mut(next_key)
-                    .expect("다음 추가 IA가 있어야 합니다");
+                    .expect("The next additional IA must be present");
                 next.previous = next.value.iaid;
             }
             *primary = promoted;
@@ -344,25 +350,27 @@ impl IaMap {
                 let (expiry, ip, next) = {
                     let mut storage = [0; SECONDARY_IA_KEY_LEN];
                     let key = secondary_ia_key(duid, current, &mut storage)
-                        .expect("검증된 DUID여야 합니다");
-                    let entry = additional.get(key).expect("추가 IA 연결이 온전해야 합니다");
+                        .expect("The DUID must already be validated");
+                    let entry = additional
+                        .get(key)
+                        .expect("Additional IA links must be intact");
                     (entry.value.expiry, entry.value.ip, entry.value.link)
                 };
                 let has_next = next != current;
                 if expiry <= now {
                     let mut storage = [0; SECONDARY_IA_KEY_LEN];
                     let key = secondary_ia_key(duid, current, &mut storage)
-                        .expect("검증된 DUID여야 합니다");
+                        .expect("The DUID must already be validated");
                     additional.remove(key);
                     used.remove(&ip);
                     if let Some(previous_iaid) = previous {
                         let mut previous_storage = [0; SECONDARY_IA_KEY_LEN];
                         let previous_key =
                             secondary_ia_key(duid, previous_iaid, &mut previous_storage)
-                                .expect("검증된 DUID여야 합니다");
+                                .expect("The DUID must already be validated");
                         let previous_value = additional
                             .get_mut(previous_key)
-                            .expect("이전 추가 IA가 있어야 합니다");
+                            .expect("The previous additional IA must be present");
                         previous_value.value.link = if has_next { next } else { previous_iaid };
                     } else {
                         primary.link = if has_next { next } else { primary.iaid };
@@ -372,10 +380,10 @@ impl IaMap {
                     }
                     let mut next_storage = [0; SECONDARY_IA_KEY_LEN];
                     let next_key = secondary_ia_key(duid, next, &mut next_storage)
-                        .expect("검증된 DUID여야 합니다");
+                        .expect("The DUID must already be validated");
                     let next_value = additional
                         .get_mut(next_key)
-                        .expect("다음 추가 IA가 있어야 합니다");
+                        .expect("The next additional IA must be present");
                     next_value.previous = previous.unwrap_or(next);
                     current = next;
                 } else {
@@ -401,24 +409,24 @@ impl IaMap {
             if valid {
                 return true;
             }
-            onetdns_core::warn!(event = "dhcp6.stale_lease_dropped", duid = %hex_bytes(duid), iaid = %hex_bytes(&primary.iaid), ip = %Ipv6Addr::from(primary.ip), "현재 DHCPv6 주소 범위에 맞지 않는 저장된 임대 정보를 삭제했습니다");
+            onetdns_core::warn!(event = "dhcp6.stale_lease_dropped", duid = %hex_bytes(duid), iaid = %hex_bytes(&primary.iaid), ip = %Ipv6Addr::from(primary.ip), "Removed saved leases outside the current DHCPv6 address range");
             if primary.link == primary.iaid {
                 return false;
             }
             let mut head_storage = [0; SECONDARY_IA_KEY_LEN];
             let head_key = secondary_ia_key(duid, primary.link, &mut head_storage)
-                .expect("검증된 DUID여야 합니다");
+                .expect("The DUID must already be validated");
             let promoted = additional
                 .remove(head_key)
-                .expect("추가 IA 머리가 있어야 합니다")
+                .expect("The additional IA head must be present")
                 .value;
             if promoted.link != promoted.iaid {
                 let mut next_storage = [0; SECONDARY_IA_KEY_LEN];
                 let next_key = secondary_ia_key(duid, promoted.link, &mut next_storage)
-                    .expect("검증된 DUID여야 합니다");
+                    .expect("The DUID must already be validated");
                 let next = additional
                     .get_mut(next_key)
-                    .expect("다음 추가 IA가 있어야 합니다");
+                    .expect("The next additional IA must be present");
                 next.previous = next.value.iaid;
             }
             *primary = promoted;
@@ -434,8 +442,10 @@ impl IaMap {
                 let (value, next) = {
                     let mut storage = [0; SECONDARY_IA_KEY_LEN];
                     let key = secondary_ia_key(duid, current, &mut storage)
-                        .expect("검증된 DUID여야 합니다");
-                    let entry = *additional.get(key).expect("추가 IA 연결이 온전해야 합니다");
+                        .expect("The DUID must already be validated");
+                    let entry = *additional
+                        .get(key)
+                        .expect("Additional IA links must be intact");
                     (entry.value, entry.value.link)
                 };
                 let has_next = next != current;
@@ -444,19 +454,19 @@ impl IaMap {
                     && value.ip <= end
                     && used.insert(value.ip);
                 if !valid {
-                    onetdns_core::warn!(event = "dhcp6.stale_lease_dropped", duid = %hex_bytes(duid), iaid = %hex_bytes(&value.iaid), ip = %Ipv6Addr::from(value.ip), "현재 DHCPv6 주소 범위에 맞지 않는 저장된 임대 정보를 삭제했습니다");
+                    onetdns_core::warn!(event = "dhcp6.stale_lease_dropped", duid = %hex_bytes(duid), iaid = %hex_bytes(&value.iaid), ip = %Ipv6Addr::from(value.ip), "Removed saved leases outside the current DHCPv6 address range");
                     let mut storage = [0; SECONDARY_IA_KEY_LEN];
                     let key = secondary_ia_key(duid, current, &mut storage)
-                        .expect("검증된 DUID여야 합니다");
+                        .expect("The DUID must already be validated");
                     additional.remove(key);
                     if let Some(previous_iaid) = previous {
                         let mut previous_storage = [0; SECONDARY_IA_KEY_LEN];
                         let previous_key =
                             secondary_ia_key(duid, previous_iaid, &mut previous_storage)
-                                .expect("검증된 DUID여야 합니다");
+                                .expect("The DUID must already be validated");
                         let previous_value = additional
                             .get_mut(previous_key)
-                            .expect("이전 추가 IA가 있어야 합니다");
+                            .expect("The previous additional IA must be present");
                         previous_value.value.link = if has_next { next } else { previous_iaid };
                     } else {
                         primary.link = if has_next { next } else { primary.iaid };
@@ -466,10 +476,10 @@ impl IaMap {
                     }
                     let mut next_storage = [0; SECONDARY_IA_KEY_LEN];
                     let next_key = secondary_ia_key(duid, next, &mut next_storage)
-                        .expect("검증된 DUID여야 합니다");
+                        .expect("The DUID must already be validated");
                     let next_value = additional
                         .get_mut(next_key)
-                        .expect("다음 추가 IA가 있어야 합니다");
+                        .expect("The next additional IA must be present");
                     next_value.previous = previous.unwrap_or(next);
                     current = next;
                 } else {
@@ -509,7 +519,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
                 event = "dhcp6.restore_open_failed",
                 path = %path.display(),
                 %error,
-                "저장된 DHCP 정보를 열지 못해 빈 상태로 시작합니다"
+                "Could not open saved DHCP state; starting empty"
             );
             return None;
         }
@@ -520,7 +530,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
             event = "dhcp6.restore_read_failed",
             path = %path.display(),
             %error,
-            "저장된 DHCP 정보를 읽지 못해 빈 상태로 시작합니다"
+            "Could not read saved DHCP state; starting empty"
         );
         return None;
     }
@@ -530,7 +540,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
             path = %path.display(),
             bytes = bytes.len(),
             limit = MAX_PERSIST_FILE,
-            "저장된 DHCP 파일이 허용 크기를 넘어 복원하지 않습니다"
+            "Saved DHCP file exceeds the size limit; not restoring it"
         );
         return None;
     }
@@ -541,7 +551,7 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
                 event = "dhcp6.restore_invalid_utf8",
                 path = %path.display(),
                 %error,
-                "저장된 DHCP 파일의 문자 인코딩이 올바르지 않아 복원하지 않습니다"
+                "Saved DHCP file is not valid text; not restoring it"
             );
             None
         }
@@ -717,7 +727,7 @@ impl ParsedIaNa<'_> {
             let end = 4 + len;
             if code == OPT_IA_ADDR {
                 return Some(u128::from_be_bytes(
-                    options[4..20].try_into().expect("검증된 IAADDR"),
+                    options[4..20].try_into().expect("IAADDR was validated"),
                 ));
             }
             options = &options[end..];
@@ -733,7 +743,7 @@ impl ParsedIaNa<'_> {
             let len = u16::from_be_bytes([options[2], options[3]]) as usize;
             let end = 4 + len;
             if code == OPT_IA_ADDR
-                && u128::from_be_bytes(options[4..20].try_into().expect("검증된 IAADDR"))
+                && u128::from_be_bytes(options[4..20].try_into().expect("IAADDR was validated"))
                     == expected
             {
                 return true;
@@ -781,8 +791,7 @@ fn ia_addr_option(addr: Ipv6Addr, pref: u32, valid: u32) -> Vec<u8> {
     d.extend_from_slice(&valid.to_be_bytes());
     let mut o = Vec::with_capacity(28);
     o.extend_from_slice(&OPT_IA_ADDR.to_be_bytes());
-    let len =
-        u16::try_from(d.len()).expect("IAADDR 옵션 길이는 16비트 정수 범위 안에 있어야 합니다");
+    let len = u16::try_from(d.len()).expect("IAADDR option length must fit in a 16-bit integer");
     o.extend_from_slice(&len.to_be_bytes());
     o.extend_from_slice(&d);
     o
@@ -1014,11 +1023,11 @@ impl Lease6Pool {
         match (picked, self.exhausted) {
             (None, false) => {
                 self.exhausted = true;
-                onetdns_core::warn!(event = "dhcp6.pool_exhausted", range_start = %Ipv6Addr::from(self.start), range_end = %Ipv6Addr::from(self.end), entries = self.dynamic_entries(), "DHCPv6 주소 범위가 모두 차서 새 기기에 주소를 주지 못합니다");
+                onetdns_core::warn!(event = "dhcp6.pool_exhausted", range_start = %Ipv6Addr::from(self.start), range_end = %Ipv6Addr::from(self.end), entries = self.dynamic_entries(), "DHCPv6 address range is full; new devices cannot get an address");
             }
             (Some(_), true) => {
                 self.exhausted = false;
-                onetdns_core::info!(event = "dhcp6.pool_available", range_start = %Ipv6Addr::from(self.start), range_end = %Ipv6Addr::from(self.end), "DHCPv6 주소 범위에 다시 빈자리가 생겼습니다");
+                onetdns_core::info!(event = "dhcp6.pool_available", range_start = %Ipv6Addr::from(self.start), range_end = %Ipv6Addr::from(self.end), "DHCPv6 address range has free addresses again");
             }
             _ => {}
         }
@@ -1298,7 +1307,7 @@ impl Lease6Pool {
             ));
         }
         if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
-            onetdns_core::warn!(event = "dhcp6.lease_save_failed", path = ?path, error = %e, "DHCPv6 임대 정보를 파일에 저장하지 못했습니다");
+            onetdns_core::warn!(event = "dhcp6.lease_save_failed", path = ?path, error = %e, "Could not save DHCPv6 leases to file");
         }
     }
 }
@@ -1330,7 +1339,7 @@ fn load_leases6(path: &std::path::Path) -> IaMap {
         return out;
     };
     let Some(text) = text.strip_prefix(LEASE_HEADER) else {
-        onetdns_core::warn!(event = "dhcp6.leases_restore_invalid", path = %path.display(), "DHCPv6 임대 파일이 현재 형식과 일치하지 않아 빈 상태로 시작합니다");
+        onetdns_core::warn!(event = "dhcp6.leases_restore_invalid", path = %path.display(), "DHCPv6 lease file does not match the current format; starting empty");
         return out;
     };
     let now = crate::unix_now();
@@ -1380,7 +1389,7 @@ fn load_leases6(path: &std::path::Path) -> IaMap {
             event = "dhcp6.leases_restore_invalid",
             path = %path.display(),
             malformed,
-            "DHCPv6 임대 파일이 손상되어 빈 상태로 시작합니다"
+            "DHCPv6 lease file is corrupted; starting empty"
         );
         return IaMap::default();
     }
@@ -1638,7 +1647,7 @@ pub fn spawn_dhcp6(
         event = "dhcp6.multicast_joined",
         group = %DHCP6_CLIENT_MULTICAST,
         interface = cfg.interface_index,
-        "DHCPv6 클라이언트 multicast 그룹에 가입했습니다"
+        "Joined the DHCPv6 client multicast group"
     );
     let wait = onetdns_core::udp::RecvWait::new(Duration::from_millis(500));
     wait.install(&sock)?;
@@ -1654,7 +1663,7 @@ pub fn spawn_dhcp6(
                             error.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) {
-                            onetdns_core::warn!(event = "dhcp6.recv_failed", %error, "DHCPv6 요청을 받지 못했습니다");
+                            onetdns_core::warn!(event = "dhcp6.recv_failed", %error, "Failed to receive a DHCPv6 request");
                         }
                         continue;
                     }
@@ -1677,12 +1686,12 @@ pub fn spawn_dhcp6(
                         onetdns_core::info!(
                             event = "dhcp6.lease_issued",
                             active = pool.lock_recover().active(),
-                            "DHCPv6 임대 주소를 발급했습니다"
+                            "Issued a DHCPv6 lease"
                         );
                     }
                     let destination = direct_client_destination(peer);
                     if let Err(error) = sock.send_to(&reply.encode(), destination) {
-                        onetdns_core::warn!(event = "dhcp6.send_failed", peer = %destination, %error, "DHCPv6 응답을 보내지 못해 이 기기는 주소를 받지 못합니다");
+                        onetdns_core::warn!(event = "dhcp6.send_failed", peer = %destination, %error, "Failed to send a DHCPv6 reply; the device will not get an address");
                     }
                 }
             }

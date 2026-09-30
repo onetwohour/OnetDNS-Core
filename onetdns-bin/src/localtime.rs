@@ -81,7 +81,7 @@ pub fn local_weekday_minute(now: SystemTime) -> (u8, u16) {
         /** @brief UTC로 전환했음을 한 번만 알린다. 질의마다 호출되는 경로라 되풀이하면 안 된다. */
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
-            onetdns_core::warn!(event = "policy.localtime_fallback", "지역 시각으로 바꾸지 못해 UTC를 씁니다. 시간대를 쓰는 정책 규칙이 의도한 시각과 어긋납니다");
+            onetdns_core::warn!(event = "policy.localtime_fallback", "Could not convert to local time; using UTC, so time-of-day policy rules may fire at the wrong time");
         });
         utc_parts(seconds)
     })

@@ -112,13 +112,13 @@ fn loopback_socket_addr(host: &str, port: u16, backend: &str) -> Result<SocketAd
     } else {
         host.parse::<IpAddr>().map_err(|_| {
             format!(
-                "{backend} 권한 DNS 저장소에 암호화되지 않은 방식으로 연결할 때는 호스트 이름을 사용할 수 없습니다. `localhost` 또는 루프백 IP 주소를 사용하십시오"
+                "Host names cannot be used for an unencrypted connection to the {backend} authoritative DNS store; use `localhost` or a loopback IP address"
             )
         })?
     };
     if !ip.is_loopback() {
         return Err(format!(
-            "{backend} 권한 DNS 저장소에는 암호화되지 않은 방식으로 로컬에서만 연결할 수 있습니다. 원격 데이터베이스를 사용하려면 TLS 프록시를 구성하십시오"
+            "The {backend} authoritative DNS store can be reached unencrypted only on the local machine; configure a TLS proxy to use a remote database"
         ));
     }
     Ok(SocketAddr::new(ip, port))
@@ -299,11 +299,11 @@ impl OwnerIndex {
             .checked_mul(5)
             .and_then(|value| value.checked_add(3))
             .map(|value| value / 4)
-            .ok_or_else(|| "영역 owner 인덱스 크기가 넘쳤습니다".to_string())?;
+            .ok_or_else(|| "Zone owner index size overflowed".to_string())?;
         let slot_count = minimum_slots
             .max(2)
             .checked_next_power_of_two()
-            .ok_or_else(|| "영역 owner 인덱스 크기가 넘쳤습니다".to_string())?;
+            .ok_or_else(|| "Zone owner index size overflowed".to_string())?;
         Ok(Self {
             slots: vec![
                 OwnerSlot {
@@ -339,9 +339,9 @@ impl OwnerIndex {
      */
     fn insert(&mut self, key: &[u8], range: RecordRange) -> Result<(), String> {
         let key_len = u8::try_from(key.len())
-            .map_err(|_| "영역 owner wire key가 255바이트를 넘었습니다".to_string())?;
+            .map_err(|_| "Zone owner wire key exceeds 255 bytes".to_string())?;
         let metadata_start = u32::try_from(self.metadata.len())
-            .map_err(|_| "영역 owner key 아레나 offset이 32비트를 넘었습니다".to_string())?;
+            .map_err(|_| "Zone owner key arena offset exceeds 32 bits".to_string())?;
         self.metadata.push(key_len);
         self.metadata.extend_from_slice(&range.len.to_le_bytes());
         self.metadata.extend_from_slice(key);
@@ -494,7 +494,7 @@ impl StoredRecord {
             }),
             RData::Aaaa(address) => {
                 let address_index = u32::try_from(aaaa_arena.len())
-                    .map_err(|_| "AAAA 주소 아레나 offset이 32비트를 넘었습니다".to_string())?;
+                    .map_err(|_| "AAAA address arena offset exceeds 32 bits".to_string())?;
                 aaaa_arena.push(*address);
                 Ok(Self {
                     tagged: (STORED_TAG_AAAA << STORED_TAG_SHIFT) | ttl,
@@ -503,7 +503,7 @@ impl StoredRecord {
             }
             _ => {
                 let index = u32::try_from(other_arena.len())
-                    .map_err(|_| "레코드 아레나 offset이 32비트를 넘었습니다".to_string())?;
+                    .map_err(|_| "Record arena offset exceeds 32 bits".to_string())?;
                 let rtype = u32::from(record.rtype.0);
                 other_arena.push(record);
                 Ok(Self {
@@ -696,21 +696,21 @@ fn build_owner_index(records: &[Record]) -> Result<OwnerIndex, String> {
         let end = owner_group_end(records, start);
         if end - start > MAX_OWNER_RECORDS {
             return Err(format!(
-                "한 이름에 등록된 레코드 수가 허용 한도({MAX_OWNER_RECORDS})를 넘었습니다"
+                "One name has more records than allowed ({MAX_OWNER_RECORDS})"
             ));
         }
         let mut key = [0u8; 255];
         let key = records[start]
             .name
             .canonical_key_into(&mut key)
-            .ok_or_else(|| "DNS owner 이름이 최대 wire 길이를 넘었습니다".to_string())?;
+            .ok_or_else(|| "DNS owner name exceeds the maximum wire length".to_string())?;
         metadata_len = metadata_len
             .checked_add(
                 key.len()
                     .checked_add(3)
-                    .ok_or_else(|| "영역 owner key 아레나 크기가 넘쳤습니다".to_string())?,
+                    .ok_or_else(|| "Zone owner key arena size overflowed".to_string())?,
             )
-            .ok_or_else(|| "영역 owner key 아레나 크기가 넘쳤습니다".to_string())?;
+            .ok_or_else(|| "Zone owner key arena size overflowed".to_string())?;
         owner_count += 1;
         start = end;
     }
@@ -723,14 +723,14 @@ fn build_owner_index(records: &[Record]) -> Result<OwnerIndex, String> {
         let key = records[start]
             .name
             .canonical_key_into(&mut key)
-            .ok_or_else(|| "DNS owner 이름이 최대 wire 길이를 넘었습니다".to_string())?;
+            .ok_or_else(|| "DNS owner name exceeds the maximum wire length".to_string())?;
         index.insert(
             key,
             RecordRange {
                 start: u32::try_from(start)
-                    .map_err(|_| "영역 레코드 아레나 offset이 32비트를 넘었습니다".to_string())?,
+                    .map_err(|_| "Zone record arena offset exceeds 32 bits".to_string())?,
                 len: u16::try_from(end - start)
-                    .map_err(|_| "owner 레코드 수가 16비트를 넘었습니다".to_string())?,
+                    .map_err(|_| "Owner record count exceeds 16 bits".to_string())?,
             },
         )?;
         start = end;
@@ -794,7 +794,7 @@ impl Zone {
                         || !is_subdomain_or_eq(&record.name, &origin)
                 })
         }) {
-            return Err("zone 밖 owner 또는 소유자 인덱스가 일치하지 않습니다".to_string());
+            return Err("Owner outside the zone, or the owner index does not match".to_string());
         }
         let mut canonical_records = HashMap::with_capacity(records.len());
         for owner_records in records.into_values() {
@@ -818,12 +818,12 @@ impl Zone {
             .try_fold(0usize, |total, owner| total.checked_add(owner.len()))
         else {
             return Err(format!(
-                "영역 레코드 수가 허용 한도({MAX_ZONE_RECORDS})를 넘었습니다"
+                "The zone has more records than allowed ({MAX_ZONE_RECORDS})"
             ));
         };
         if total_records > MAX_ZONE_RECORDS {
             return Err(format!(
-                "영역 레코드 수가 허용 한도({MAX_ZONE_RECORDS})를 넘었습니다"
+                "The zone has more records than allowed ({MAX_ZONE_RECORDS})"
             ));
         }
         let mut records = Vec::with_capacity(total_records);
@@ -851,14 +851,14 @@ impl Zone {
     ) -> Result<Self, String> {
         if full_records.len() > MAX_ZONE_RECORDS {
             return Err(format!(
-                "영역 레코드 수가 허용 한도({MAX_ZONE_RECORDS})를 넘었습니다"
+                "The zone has more records than allowed ({MAX_ZONE_RECORDS})"
             ));
         }
         if full_records
             .iter()
             .any(|record| !is_subdomain_or_eq(&record.name, &origin))
         {
-            return Err("zone 밖 owner 또는 소유자 인덱스가 일치하지 않습니다".to_string());
+            return Err("Owner outside the zone, or the owner index does not match".to_string());
         }
         full_records.sort_unstable_by(|left, right| {
             dnssec_name_cmp(&left.name, &right.name).then_with(|| left.rtype.0.cmp(&right.rtype.0))
@@ -872,7 +872,7 @@ impl Zone {
                 event = "zone.duplicate_records_dropped",
                 zone = %origin.to_ascii_lower(),
                 count = duplicates,
-                "완전히 같은 레코드를 하나만 남겼습니다"
+                "Kept only one of several identical records"
             );
         }
         let soa_ttl = if soa_ttl > onetdns_proto::MAX_TTL {
@@ -884,11 +884,11 @@ impl Zone {
         let mut origin_storage = [0u8; 255];
         let origin_key = origin
             .canonical_key_into(&mut origin_storage)
-            .ok_or_else(|| "DNS zone origin이 최대 wire 길이를 넘었습니다".to_string())?;
+            .ok_or_else(|| "DNS zone origin exceeds the maximum wire length".to_string())?;
         if !full_records_for_key(&full_records, &records, origin_key)
             .is_some_and(|apex| apex.iter().any(|record| record.rtype == RecordType::NS))
         {
-            return Err("zone apex NS가 없습니다".to_string());
+            return Err("The zone apex has no NS record".to_string());
         }
         validate_zone_records(&origin, &full_records, &records)?;
         let mut name_flags = HashMap::new();
@@ -897,7 +897,7 @@ impl Zone {
             for labels in origin.num_labels()..=owner.num_labels() {
                 let mut storage = [0u8; 255];
                 let Some(key) = owner.suffix(labels).canonical_key_into(&mut storage) else {
-                    return Err("DNS owner 이름이 최대 wire 길이를 넘었습니다".to_string());
+                    return Err("DNS owner name exceeds the maximum wire length".to_string());
                 };
                 if !records.contains_key(key) {
                     *name_flags.entry(key.to_vec()).or_default() |= NAME_EXISTS;
@@ -914,7 +914,7 @@ impl Zone {
         for (owner, owner_records) in full_record_groups(&full_records, &records) {
             if owner.starts_with(&[1, b'*']) {
                 let parent = parent_canonical_key(owner)
-                    .ok_or_else(|| "wildcard owner에 부모 이름이 없습니다".to_string())?;
+                    .ok_or_else(|| "A wildcard owner has no parent name".to_string())?;
                 *name_flags.entry(parent.to_vec()).or_default() |= NAME_HAS_WILDCARD;
             }
             if owner_records
@@ -994,7 +994,7 @@ impl Zone {
     pub fn from_records(mut records: Vec<Record>) -> Result<Zone, String> {
         if records.len() > MAX_ZONE_RECORDS {
             return Err(format!(
-                "영역 레코드 수가 허용 한도({MAX_ZONE_RECORDS})를 넘었습니다"
+                "The zone has more records than allowed ({MAX_ZONE_RECORDS})"
             ));
         }
         let soa_records: Vec<&Record> = records
@@ -1003,9 +1003,9 @@ impl Zone {
             .collect();
         let soa_rec = *soa_records
             .first()
-            .ok_or_else(|| "AXFR 응답에 SOA 레코드가 없습니다".to_string())?;
+            .ok_or_else(|| "AXFR response has no SOA record".to_string())?;
         let RData::Soa(soa) = &soa_rec.rdata else {
-            return Err("SOA RDATA 형식이 올바르지 않습니다".to_string());
+            return Err("Malformed SOA RDATA".to_string());
         };
         let origin = soa_rec.name.clone();
 
@@ -1014,19 +1014,19 @@ impl Zone {
                 .iter()
                 .any(|record| !record.name.eq_ignore_case(&origin) || record.rdata != soa_rec.rdata)
         {
-            return Err("AXFR에 서로 다른 SOA 또는 과도한 SOA가 존재함".to_string());
+            return Err("AXFR contains differing or too many SOA records".to_string());
         }
         if records
             .iter()
             .any(|record| !is_subdomain_or_eq(&record.name, &origin))
         {
-            return Err("AXFR에 zone 밖 owner가 존재함".to_string());
+            return Err("AXFR contains an owner outside the zone".to_string());
         }
         if !records
             .iter()
             .any(|record| record.name.eq_ignore_case(&origin) && record.rtype == RecordType::NS)
         {
-            return Err("zone apex NS가 없습니다".to_string());
+            return Err("The zone apex has no NS record".to_string());
         }
 
         let soa_ttl = soa_rec.ttl;
@@ -1206,7 +1206,7 @@ impl Zone {
     pub fn to_master_file(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("$ORIGIN {}.\n", self.origin.to_ascii_lower()));
-        out.push_str(";; OnetDNS가 동적 DNS 갱신 내용을 저장한 파일입니다. 수동으로 편집할 때는 형식을 유지하십시오.\n");
+        out.push_str(";; File in which OnetDNS saves dynamic DNS updates. Keep the format when editing it by hand.\n");
         let soa = self.soa_record();
         out.push_str(&record_to_master_line(&soa));
         let mut names: Vec<&[u8]> = self.records.keys().collect();
@@ -2484,7 +2484,9 @@ fn validate_zone_records(
             .iter()
             .any(|record| record.class != DnsClass::IN)
         {
-            return Err("IN 이외 class의 권한 레코드는 지원하지 않음".to_string());
+            return Err(
+                "Authoritative records in classes other than IN are not supported".to_string(),
+            );
         }
 
         let cnames: Vec<&Record> = owner_records
@@ -2497,7 +2499,7 @@ fn validate_zone_records(
                 .any(|record| record.rdata != first.rdata || record.ttl != first.ttl)
             {
                 return Err(format!(
-                    "서로 다른 CNAME target: {}",
+                    "Conflicting CNAME targets: {}",
                     first.name.to_ascii_lower()
                 ));
             }
@@ -2508,7 +2510,7 @@ fn validate_zone_records(
                 )
             }) {
                 return Err(format!(
-                    "CNAME과 다른 데이터가 공존함: {}",
+                    "CNAME coexists with other data: {}",
                     first.name.to_ascii_lower()
                 ));
             }
@@ -2520,7 +2522,10 @@ fn validate_zone_records(
             .collect();
         if let Some(first) = dnames.first() {
             if dnames.len() != 1 {
-                return Err(format!("복수 DNAME: {}", first.name.to_ascii_lower()));
+                return Err(format!(
+                    "Multiple DNAME records: {}",
+                    first.name.to_ascii_lower()
+                ));
             }
             if !first.name.eq_ignore_case(origin)
                 && owner_records
@@ -2528,7 +2533,7 @@ fn validate_zone_records(
                     .any(|record| record.rtype == RecordType::NS)
             {
                 return Err(format!(
-                    "비-apex DNAME과 NS가 공존함: {}",
+                    "Non-apex DNAME coexists with NS: {}",
                     first.name.to_ascii_lower()
                 ));
             }
@@ -2541,20 +2546,20 @@ fn validate_zone_records(
             let metadata = parse_nsec3_metadata(record)?;
             if metadata.hash_algorithm != 1 {
                 return Err(format!(
-                    "지원하지 않는 NSEC3 hash algorithm {}: {}",
+                    "Unsupported NSEC3 hash algorithm {}: {}",
                     metadata.hash_algorithm,
                     record.name.to_ascii_lower()
                 ));
             }
             if metadata.flags & !1 != 0 {
                 return Err(format!(
-                    "유효하지 않은 NSEC3 flags: {}",
+                    "Invalid NSEC3 flags: {}",
                     record.name.to_ascii_lower()
                 ));
             }
             if metadata.iterations != 0 {
                 return Err(format!(
-                    "NSEC3 iterations는 RFC 9276에 따라 0이어야 함: {}",
+                    "NSEC3 iterations must be 0 per RFC 9276: {}",
                     record.name.to_ascii_lower()
                 ));
             }
@@ -2570,7 +2575,7 @@ fn validate_zone_records(
                     .is_some_and(is_sha1_nsec3_owner)
             {
                 return Err(format!(
-                    "유효하지 않은 NSEC3 owner name: {}",
+                    "Invalid NSEC3 owner name: {}",
                     record.name.to_ascii_lower()
                 ));
             }
@@ -2585,7 +2590,7 @@ fn validate_zone_records(
                 .is_some_and(|expected| expected != &parameters)
             {
                 return Err(
-                    "한 zone의 NSEC3 hash algorithm/iterations/salt가 서로 다름".to_string()
+                    "NSEC3 hash algorithm, iterations, or salt differ within one zone".to_string(),
                 );
             }
             nsec3_parameters.get_or_insert(parameters);
@@ -2606,7 +2611,7 @@ fn validate_zone_records(
             let ancestor = owner.suffix(labels);
             if dname_owners.contains(&ancestor.canonical_key()) {
                 return Err(format!(
-                    "DNAME 아래 데이터가 존재함: {}",
+                    "Data exists below a DNAME: {}",
                     owner.to_ascii_lower()
                 ));
             }
@@ -2634,7 +2639,7 @@ fn validate_zone_records(
                         .and_then(|owner_records| owner_records.first())
                         .map(|record| record.name.to_ascii_lower())
                         .unwrap_or_else(|| "<binary-name>".to_string());
-                    return Err(format!("CNAME 순환: {owner}"));
+                    return Err(format!("CNAME loop: {owner}"));
                 }
                 Some(2) => break,
                 _ => {}
@@ -2681,13 +2686,13 @@ struct Nsec3Metadata<'a> {
 fn parse_nsec3_metadata(record: &Record) -> Result<Nsec3Metadata<'_>, String> {
     let RData::Unknown(50, raw) = &record.rdata else {
         return Err(format!(
-            "NSEC3 record의 RDATA 형식이 잘못됨: {}",
+            "Malformed NSEC3 RDATA: {}",
             record.name.to_ascii_lower()
         ));
     };
     if raw.len() < 6 {
         return Err(format!(
-            "잘린 NSEC3 RDATA: {}",
+            "Truncated NSEC3 RDATA: {}",
             record.name.to_ascii_lower()
         ));
     }
@@ -2696,21 +2701,26 @@ fn parse_nsec3_metadata(record: &Record) -> Result<Nsec3Metadata<'_>, String> {
     let hash_len_offset = 5usize
         .checked_add(salt_len)
         .filter(|offset| *offset < raw.len())
-        .ok_or_else(|| format!("잘린 NSEC3 salt: {}", record.name.to_ascii_lower()))?;
+        .ok_or_else(|| format!("Truncated NSEC3 salt: {}", record.name.to_ascii_lower()))?;
     let hash_len = usize::from(raw[hash_len_offset]);
     if hash_len != 20 {
         return Err(format!(
-            "NSEC3 SHA-1 next hash 길이는 20이어야 함: {}",
+            "NSEC3 SHA-1 next hash length must be 20: {}",
             record.name.to_ascii_lower()
         ));
     }
     let bitmap_offset = hash_len_offset
         .checked_add(1 + hash_len)
         .filter(|offset| *offset <= raw.len())
-        .ok_or_else(|| format!("잘린 NSEC3 next hash: {}", record.name.to_ascii_lower()))?;
+        .ok_or_else(|| {
+            format!(
+                "Truncated NSEC3 next hash: {}",
+                record.name.to_ascii_lower()
+            )
+        })?;
     if !valid_type_bitmaps(&raw[bitmap_offset..]) {
         return Err(format!(
-            "유효하지 않은 NSEC3 type bitmap: {}",
+            "Invalid NSEC3 type bitmap: {}",
             record.name.to_ascii_lower()
         ));
     }
@@ -2793,7 +2803,7 @@ fn prepend_wildcard(parent: &Name) -> Name {
     let mut labels = Vec::with_capacity(parent.labels().len() + 1);
     labels.push(b"*".to_vec());
     labels.extend(parent.labels().map(<[u8]>::to_vec));
-    Name::from_labels(labels).expect("와일드카드 이름 유효")
+    Name::from_labels(labels).expect("The wildcard name is valid")
 }
 
 /**
@@ -4109,7 +4119,7 @@ leaf.empty 60 IN A 192.0.2.2
             Ok(_) => panic!("CNAME 순환이 허용됨"),
             Err(error) => error,
         };
-        assert!(error.contains("CNAME 순환"), "{error}");
+        assert!(error.contains("CNAME loop"), "{error}");
     }
 
     /** @brief apex의 SOA와 NS가 제대로 답해지는지. */
@@ -4274,7 +4284,7 @@ leaf.empty 60 IN A 192.0.2.2
             Ok(_) => panic!("혼합 NSEC3 파라미터가 허용됨"),
             Err(error) => error,
         };
-        assert!(error.contains("서로 다름"));
+        assert!(error.contains("differ within one zone"));
 
         let mut records = zone().axfr_records();
         records.push(nsec3_record(

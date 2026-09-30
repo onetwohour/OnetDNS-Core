@@ -276,7 +276,7 @@ mod linux {
             let sock = unsafe { UdpSocket::from_raw_fd(fd) };
 
             if sock.local_addr().ok().map(|la| la.port()) != Some(addr.port()) {
-                return Err(io::Error::other("reuseport 포트가 일치하지 않습니다"));
+                return Err(io::Error::other("reuseport port does not match"));
             }
             out.push(sock);
         }
@@ -298,7 +298,7 @@ mod linux {
             }
             let l = unsafe { TcpListener::from_raw_fd(fd) };
             if l.local_addr().ok().map(|la| la.port()) != Some(addr.port()) {
-                return Err(io::Error::other("reuseport 포트가 일치하지 않습니다"));
+                return Err(io::Error::other("reuseport port does not match"));
             }
             l.set_nonblocking(true)?;
             out.push(l);

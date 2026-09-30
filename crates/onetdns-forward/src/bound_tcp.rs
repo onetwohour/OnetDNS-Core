@@ -19,7 +19,7 @@ pub(crate) fn connect(
     if timeout.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "연결 대기 시간이 0입니다",
+            "Connect timeout is zero",
         ));
     }
     let stream = sys::bound_socket(bind, addr)?;
@@ -179,7 +179,7 @@ mod sys {
                 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "업스트림 연결 시간이 지났습니다",
+                        "Upstream connection timed out",
                     ))
                 }
                 n if n > 0 => return Ok(()),
@@ -327,7 +327,7 @@ mod sys {
         match unsafe { WSAPoll(&mut pfd, 1, super::timeout_millis(timeout)) } {
             0 => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "업스트림 연결 시간이 지났습니다",
+                "Upstream connection timed out",
             )),
             n if n > 0 => Ok(()),
             _ => Err(last_error()),

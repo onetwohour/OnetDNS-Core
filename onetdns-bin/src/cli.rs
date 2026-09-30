@@ -79,31 +79,33 @@ pub(crate) struct CtlArgs {
 
 /** @brief 사용법 안내. */
 const HELP: &str = "\
-OnetDNS: 광고 차단 DNS 리졸버
+OnetDNS: ad-blocking DNS resolver
 
-사용법:
+Usage:
   OnetDNS [--config PATH] [--no-web] [--no-supervisor]
-                                      # 기본: DNS 서버 + 웹 대시보드(127.0.0.1:8553) 자동 시작
-  OnetDNS --cli <명령> [...]           # 관리 명령(아래)을 CLI로 실행
-  OnetDNS run [--config PATH] [--no-web]   # 위 기본 동작과 동일(명시적)
+                                      # Default: start the DNS server and web dashboard (127.0.0.1:8553)
+  OnetDNS --cli <command> [...]       # Run a management command (below)
+  OnetDNS run [--config PATH] [--no-web]   # Same as the default, stated explicitly
 
-관리 명령(--cli 필수):
+Management commands (require --cli):
   OnetDNS --cli query NAME [--type TYPE]
   OnetDNS --cli cert --host HOST [--cert-out PATH] [--key-out PATH]
   OnetDNS --cli stats|reload|top [--config PATH] [--url URL] [--token TOKEN]
-  OnetDNS --cli block DOMAIN [ctl옵션]
-  OnetDNS --cli allow DOMAIN [ctl옵션]
+  OnetDNS --cli block DOMAIN [ctl options]
+  OnetDNS --cli allow DOMAIN [ctl options]
   OnetDNS --cli check [--config PATH]
   OnetDNS --cli services
-  OnetDNS --cli passwd [--name 이름]  # 웹 콘솔 [[users]] 항목 생성(비밀번호는 물어봄)
+  OnetDNS --cli passwd [--name NAME]  # Create a web console [[users]] entry (prompts for the password)
   OnetDNS service install|uninstall|run [--config PATH]
 
-비고:
-  query      돌고 있는 서버가 아니라 기본 설정의 업스트림에 직접 묻는다.
-             접근 제한, 필터, 캐시를 거치지 않으므로 서버의 판정과 다를 수 있다.
-  --no-web   기본 웹 대시보드 자동 활성화를 끄고 DNS 서버만 시작(헤드리스).
-             config에 control_listen이 있으면 그 설정이 항상 우선한다.
-  --no-supervisor  Linux 프로세스 자가 복구를 끄고 서버를 직접 실행(외부 supervisor용).
+Notes:
+  query      Asks the configured upstream directly, not the running server.
+             It skips access control, filters, and the cache, so the answer can
+             differ from what the server would return.
+  --no-web   Start only the DNS server, without the default web dashboard (headless).
+             A control_listen setting in the config always takes precedence.
+  --no-supervisor  Run the server directly without Linux process self-recovery
+                   (for an external supervisor).
 ";
 
 /** @brief 뒤에 값을 하나 받는 플래그들. */
@@ -167,7 +169,7 @@ fn reject_unknown_flags(sub: &str, rest: &[String]) -> Result<(), String> {
         }
         let flag = format!("--{name}");
         if !allowed.contains(&flag.as_str()) {
-            return Err(format!("{sub}: 알 수 없는 옵션 {flag} (OnetDNS help 참고)"));
+            return Err(format!("{sub}: unknown option {flag} (see OnetDNS help)"));
         }
     }
     Ok(())
@@ -232,7 +234,7 @@ fn parse_argv(argv: &[String]) -> Result<Command, String> {
         let sub = argv
             .get(1)
             .cloned()
-            .ok_or("--cli: 서브커맨드가 필요합니다 (OnetDNS --cli help)")?;
+            .ok_or("--cli: a subcommand is required (see OnetDNS --cli help)")?;
         return parse_subcommand(&sub, &argv[2..]);
     }
 
@@ -260,7 +262,7 @@ fn parse_argv(argv: &[String]) -> Result<Command, String> {
         });
     }
 
-    Err(format!("알 수 없는 명령: {first} (OnetDNS help 참고)"))
+    Err(format!("Unknown command: {first} (see OnetDNS help)"))
 }
 
 /**
@@ -285,11 +287,11 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
             no_supervisor: rest.iter().any(|a| a == "--no-supervisor"),
         }),
         "query" => Ok(Command::Query {
-            name: positional(rest).ok_or("query 명령에는 조회할 도메인이 필요합니다")?,
+            name: positional(rest).ok_or("query needs a domain to look up")?,
             qtype: opt_val(rest, "--type"),
         }),
         "cert" => Ok(Command::Cert {
-            host: opt_val(rest, "--host").ok_or("cert 명령에는 --host 옵션이 필요합니다")?,
+            host: opt_val(rest, "--host").ok_or("cert needs the --host option")?,
             cert_out: opt_path(rest, "--cert-out").unwrap_or_else(|| "cert.pem".into()),
             key_out: opt_path(rest, "--key-out").unwrap_or_else(|| "key.pem".into()),
         }),
@@ -303,11 +305,11 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
             ctl: ctl_args(rest),
         }),
         "block" => Ok(Command::Block {
-            domain: positional(rest).ok_or("block 명령에는 차단할 도메인이 필요합니다")?,
+            domain: positional(rest).ok_or("block needs a domain to block")?,
             ctl: ctl_args(rest),
         }),
         "allow" => Ok(Command::Allow {
-            domain: positional(rest).ok_or("allow 명령에는 허용할 도메인이 필요합니다")?,
+            domain: positional(rest).ok_or("allow needs a domain to allow")?,
             ctl: ctl_args(rest),
         }),
         "check" => Ok(Command::Check {
@@ -317,7 +319,7 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
         "passwd" => {
             if positional(rest).is_some() {
                 return Err(
-                    "passwd: 평문 비밀번호 인수는 허용되지 않습니다; 물어볼 때 입력하거나 표준 입력으로 넣으십시오"
+                    "passwd: a plaintext password argument is not allowed; type it at the prompt or pipe it through standard input"
                         .into(),
                 );
             }
@@ -336,15 +338,11 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
                     #[cfg(windows)]
                     config: opt_path(rest, "--config"),
                 },
-                _ => {
-                    return Err(
-                        "service 명령에는 install, uninstall, run 중 하나를 지정해야 합니다".into(),
-                    )
-                }
+                _ => return Err("service needs one of install, uninstall, or run".into()),
             };
             Ok(Command::Service { action })
         }
-        other => Err(format!("알 수 없는 명령: {other} (OnetDNS help 참고)")),
+        other => Err(format!("Unknown command: {other} (see OnetDNS help)")),
     }
 }
 

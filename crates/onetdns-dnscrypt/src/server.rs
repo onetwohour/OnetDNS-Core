@@ -82,7 +82,7 @@ where
         let dns_query = match decrypt_query(&key, &client_nonce, &packet[HEADER_LEN..]) {
             Some(query) => query,
             None => {
-                onetdns_core::trace!(%src, "DNSCrypt 요청을 복호화하지 못했습니다");
+                onetdns_core::trace!(%src, "Could not decrypt DNSCrypt request");
                 return None;
             }
         };
@@ -97,7 +97,7 @@ where
         }
         let dns_response = handler(dns_query, src, budget)?;
         if dns_response.len() > budget {
-            onetdns_core::debug!(event = "dnscrypt.response_over_budget", client = %src, len = dns_response.len(), budget = budget, "예산을 넘는 응답이라 보내지 않았습니다");
+            onetdns_core::debug!(event = "dnscrypt.response_over_budget", client = %src, len = dns_response.len(), budget = budget, "Response exceeds the size budget; not sent");
             return None;
         }
         let (nonce, ct) = encrypt_response(&key, &client_nonce, &dns_response);
@@ -124,7 +124,7 @@ fn record_send_error(src: SocketAddr, error: &std::io::Error) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "dnscrypt.send_failed", client = %src, count = count, %error, "DNSCrypt 응답을 보내지 못했습니다");
+        onetdns_core::warn!(event = "dnscrypt.send_failed", client = %src, count = count, %error, "Could not send DNSCrypt response");
     }
 }
 
@@ -155,7 +155,7 @@ where
 {
     let wait = onetdns_core::udp::RecvWait::new(std::time::Duration::from_millis(500));
     if let Err(error) = wait.install(&socket) {
-        onetdns_core::error!(event = "dnscrypt.read_timeout_failed", %error, "수신에 제한 시간을 걸지 못했습니다. 설정을 다시 읽을 때 이 스레드가 끝나지 않아 포트가 묶입니다");
+        onetdns_core::error!(event = "dnscrypt.read_timeout_failed", %error, "Could not set a receive timeout; this thread will not exit on reload and will keep the port bound");
     }
     let mut buf = vec![0u8; 4096];
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -168,7 +168,7 @@ where
                 continue;
             }
             Err(e) => {
-                onetdns_core::debug!(event = "dnscrypt.recv_failed", error = %e, "DNSCrypt 패킷을 받지 못했습니다");
+                onetdns_core::debug!(event = "dnscrypt.recv_failed", error = %e, "Failed to receive DNSCrypt packet");
                 continue;
             }
         };

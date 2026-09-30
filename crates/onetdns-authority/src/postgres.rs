@@ -132,7 +132,7 @@ impl ZoneSource for PostgresZoneSource {
             store.add(z);
         }
         if missing_origin > 0 {
-            onetdns_core::warn!(event = "authority.postgres_origin_missing", table = %self.table, rows = missing_origin, "origin이 비어 있는 행을 루트 영역으로 읽었습니다. 의도한 것이 아니면 테이블을 확인하십시오");
+            onetdns_core::warn!(event = "authority.postgres_origin_missing", table = %self.table, rows = missing_origin, "Read a row with an empty origin as the root zone; check the table if this is unintended");
         }
         Ok(store)
     }
@@ -156,7 +156,7 @@ fn sanitize_table(t: &str) -> Result<String, String> {
     {
         Ok(t.to_string())
     } else {
-        Err(format!("부적절한 테이블 이름: {t}"))
+        Err(format!("Invalid table name: {t}"))
     }
 }
 
@@ -187,9 +187,9 @@ impl PgConn {
         let wire_len = body
             .len()
             .checked_add(4)
-            .ok_or("Postgres 송신 길이 계산 범위를 넘었습니다")?;
+            .ok_or("Postgres outgoing length calculation overflowed")?;
         if wire_len > MAX_PG_MESSAGE || wire_len > u32::MAX as usize {
-            return Err("Postgres 송신 메시지 크기가 허용 한도를 넘었습니다".into());
+            return Err("Outgoing Postgres message exceeds the size limit".into());
         }
         let mut msg = Vec::with_capacity(body.len() + 5);
         if tag != 0 {
@@ -212,7 +212,7 @@ impl PgConn {
         let tag = head[0];
         let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
         if !(4..=MAX_PG_MESSAGE).contains(&len) {
-            return Err("잘못된 메시지 길이".into());
+            return Err("Invalid message length".into());
         }
         let mut body = vec![0u8; len - 4];
         self.stream
@@ -249,9 +249,9 @@ impl PgConn {
             match tag {
                 b'R' => {
                     if body.len() > MAX_PG_AUTH_PAYLOAD {
-                        return Err("Authentication 메시지 크기가 허용 한도를 넘었습니다".into());
+                        return Err("Authentication message exceeds the size limit".into());
                     }
-                    let code = body.get(..4).ok_or("Authentication 메시지 너무 짧습니다")?;
+                    let code = body.get(..4).ok_or("Authentication message is too short")?;
                     let sub = u32::from_be_bytes([code[0], code[1], code[2], code[3]]);
                     match sub {
                         0 => {}
@@ -261,17 +261,22 @@ impl PgConn {
                             self.send(b'p', &m)?;
                         }
                         10 => self.scram(user, password, &body[4..])?,
-                        5 => return Err("PostgreSQL MD5 인증은 지원하지 않습니다. SCRAM-SHA-256 인증을 사용하십시오".into()),
-                        other => return Err(format!("지원하지 않는 인증 방식 {other}")),
+                        5 => {
+                            return Err(
+                                "PostgreSQL MD5 authentication is not supported; use SCRAM-SHA-256"
+                                    .into(),
+                            )
+                        }
+                        other => return Err(format!("Unsupported authentication method {other}")),
                     }
                 }
-                b'E' => return Err(format!("Postgres 오류: {}", error_text(&body))),
+                b'E' => return Err(format!("Postgres error: {}", error_text(&body))),
                 b'S' | b'K' | b'N' => {}
                 b'Z' => return Ok(()),
                 _ => {}
             }
         }
-        Err("Postgres 시작 메시지 횟수가 허용 한도를 넘었습니다".into())
+        Err("Too many Postgres startup messages".into())
     }
 
     /**
@@ -286,7 +291,7 @@ impl PgConn {
     fn scram(&mut self, user: &str, password: &str, mechs: &[u8]) -> Result<(), String> {
         let mech_list = String::from_utf8_lossy(mechs);
         if !mech_list.contains("SCRAM-SHA-256") {
-            return Err(format!("지원하지 않는 SASL 방식: {mech_list}"));
+            return Err(format!("Unsupported SASL mechanism: {mech_list}"));
         }
         let mut nonce = [0u8; 18];
         onetdns_tls::sys::fill_random(&mut nonce);
@@ -303,33 +308,33 @@ impl PgConn {
 
         let (tag, body) = self.recv()?;
         if tag == b'E' {
-            return Err(format!("Postgres 오류: {}", error_text(&body)));
+            return Err(format!("Postgres error: {}", error_text(&body)));
         }
         if tag != b'R' {
-            return Err("SASLContinue 메시지가 필요합니다".into());
+            return Err("A SASLContinue message is required".into());
         }
-        let code = body.get(..4).ok_or("SASLContinue 메시지 너무 짧습니다")?;
+        let code = body.get(..4).ok_or("SASLContinue message is too short")?;
         let sub = u32::from_be_bytes([code[0], code[1], code[2], code[3]]);
         if sub != 11 {
-            return Err("SASLContinue(11) 메시지가 필요합니다".into());
+            return Err("A SASLContinue (11) message is required".into());
         }
         if body.len() > MAX_PG_AUTH_PAYLOAD {
-            return Err("SASLContinue 메시지 크기가 허용 한도를 넘었습니다".into());
+            return Err("SASLContinue message exceeds the size limit".into());
         }
         let server_first = String::from_utf8_lossy(&body[4..]).to_string();
         if server_first.len() > 8192 {
-            return Err("SCRAM 서버 파라미터 크기가 허용 한도를 넘었습니다".into());
+            return Err("SCRAM server parameters exceed the size limit".into());
         }
         let (r, s, i) = parse_server_first(&server_first)?;
         if s.len() > 2048 || r.len() > 4096 {
-            return Err("SCRAM 서버 파라미터 크기가 허용 한도를 넘었습니다".into());
+            return Err("SCRAM server parameters exceed the size limit".into());
         }
         if !r.starts_with(&client_nonce) {
-            return Err("서버 nonce가 클라 nonce를 포함하지 않음".into());
+            return Err("The server nonce does not contain the client nonce".into());
         }
-        let salt = b64_decode(&s).ok_or("비밀번호 salt의 Base64 값이 올바르지 않습니다")?;
+        let salt = b64_decode(&s).ok_or("Invalid Base64 password salt")?;
         if salt.is_empty() || salt.len() > 1024 {
-            return Err("SCRAM 서버 파라미터 크기가 허용 한도를 넘었습니다".into());
+            return Err("SCRAM server parameters exceed the size limit".into());
         }
 
         let salted = pbkdf2_sha256(password.as_bytes(), &salt, i);
@@ -348,39 +353,39 @@ impl PgConn {
 
         let (tag, body) = self.recv()?;
         if tag == b'E' {
-            return Err(format!("Postgres 오류: {}", error_text(&body)));
+            return Err(format!("Postgres error: {}", error_text(&body)));
         }
         if tag != b'R' {
-            return Err("SASLFinal 메시지가 필요합니다".into());
+            return Err("A SASLFinal message is required".into());
         }
-        let code = body.get(..4).ok_or("SASLFinal 메시지 너무 짧습니다")?;
+        let code = body.get(..4).ok_or("SASLFinal message is too short")?;
         let sub = u32::from_be_bytes([code[0], code[1], code[2], code[3]]);
         if sub != 12 {
-            return Err("SASLFinal(12) 메시지가 필요합니다".into());
+            return Err("A SASLFinal (12) message is required".into());
         }
         if body.len() > MAX_PG_AUTH_PAYLOAD {
-            return Err("SASLFinal 메시지 크기가 허용 한도를 넘었습니다".into());
+            return Err("SASLFinal message exceeds the size limit".into());
         }
-        let server_final = std::str::from_utf8(&body[4..])
-            .map_err(|_| "SASLFinal UTF-8 형식이 올바르지 않습니다")?;
+        let server_final =
+            std::str::from_utf8(&body[4..]).map_err(|_| "SASLFinal is not valid UTF-8")?;
         let mut verifier: Option<&str> = None;
         for attr in server_final.split(',') {
             let (key, value) = attr
                 .split_once('=')
-                .ok_or("SASLFinal 속성 형식이 올바르지 않습니다")?;
+                .ok_or("Malformed SASLFinal attribute")?;
             match key {
                 "v" if verifier.is_none() && !value.is_empty() => verifier = Some(value),
-                "e" => return Err(format!("SCRAM 서버 오류: {value}")),
-                "v" => return Err("SASLFinal verifier 중복/빈 값".into()),
-                _ => return Err(format!("SASLFinal 알 수 없는 속성: {key}")),
+                "e" => return Err(format!("SCRAM server error: {value}")),
+                "v" => return Err("SASLFinal verifier is duplicated or empty".into()),
+                _ => return Err(format!("Unknown SASLFinal attribute: {key}")),
             }
         }
-        let verifier = verifier.ok_or("SASLFinal 응답에 서버 서명값이 빠져 있습니다")?;
+        let verifier = verifier.ok_or("SASLFinal response has no server signature")?;
         let server_key = hmac_sha256(&salted, b"Server Key");
         let server_sig = hmac_sha256(&server_key, auth_message.as_bytes());
         if b64_decode(verifier).as_deref() != Some(&server_sig[..]) {
             return Err(
-                "PostgreSQL 서버가 보낸 인증 서명이 일치하지 않습니다. 연결을 중단합니다".into(),
+                "The authentication signature sent by the PostgreSQL server does not match; closing the connection".into(),
             );
         }
         Ok(())
@@ -406,24 +411,24 @@ impl PgConn {
                     let origin = cols.first().cloned().flatten().unwrap_or_default();
                     let zone = cols.get(1).cloned().flatten().unwrap_or_default();
                     if rows.len() >= MAX_ZONE_ROWS {
-                        return Err("Postgres 결과 행 수 허용 한도를 넘었습니다".into());
+                        return Err("Postgres result exceeds the row limit".into());
                     }
                     result_bytes = result_bytes
                         .checked_add(origin.len())
                         .and_then(|n| n.checked_add(zone.len()))
-                        .ok_or("Postgres 결과 크기 계산 범위를 넘었습니다")?;
+                        .ok_or("Postgres result size calculation overflowed")?;
                     if result_bytes > MAX_ZONE_RESULT_BYTES {
-                        return Err("Postgres 결과 크기가 허용 한도를 넘었습니다".into());
+                        return Err("Postgres result exceeds the size limit".into());
                     }
                     rows.push((origin, zone));
                 }
                 b'C' => {}
-                b'E' => return Err(format!("쿼리 오류: {}", error_text(&body))),
+                b'E' => return Err(format!("Query error: {}", error_text(&body))),
                 b'Z' => return Ok(rows),
                 _ => {}
             }
         }
-        Err("Postgres 쿼리 메시지 횟수가 허용 한도를 넘었습니다".into())
+        Err("Too many Postgres query messages".into())
     }
 }
 
@@ -434,30 +439,30 @@ impl PgConn {
  */
 fn parse_data_row(body: &[u8]) -> Result<Vec<Option<String>>, String> {
     if body.len() < 2 {
-        return Err("DataRow 너무 짧습니다".into());
+        return Err("DataRow is too short".into());
     }
     let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
     let mut pos: usize = 2;
     let mut out = Vec::with_capacity(ncols);
     for _ in 0..ncols {
         let Some(header_end) = pos.checked_add(4) else {
-            return Err("DataRow 길이 계산 범위를 넘었습니다".into());
+            return Err("DataRow length calculation overflowed".into());
         };
         if header_end > body.len() {
-            return Err("DataRow 길이가 올바르지 않습니다".into());
+            return Err("Invalid DataRow length".into());
         }
         let len = i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
         pos += 4;
         if len < 0 {
             out.push(None);
         } else {
-            let len = usize::try_from(len).map_err(|_| "DataRow 값 길이가 올바르지 않습니다")?;
+            let len = usize::try_from(len).map_err(|_| "Invalid DataRow value length")?;
             let end = pos
                 .checked_add(len)
-                .ok_or("DataRow 값 길이 계산 범위를 넘었습니다")?;
+                .ok_or("DataRow value length calculation overflowed")?;
             let bytes = body
                 .get(pos..end)
-                .ok_or("PostgreSQL 행 데이터가 메시지 경계를 벗어났습니다")?;
+                .ok_or("PostgreSQL row data crosses the message boundary")?;
             out.push(Some(String::from_utf8_lossy(bytes).to_string()));
             pos = end;
         }
@@ -481,7 +486,7 @@ fn error_text(body: &[u8]) -> String {
             return val;
         }
     }
-    "서버가 원인을 알 수 없는 오류를 반환했습니다".to_string()
+    "The server returned an error without a reason".to_string()
 }
 
 /**
@@ -503,13 +508,13 @@ fn parse_server_first(s: &str) -> Result<(String, String, u32), String> {
         }
     }
     Ok((
-        r.ok_or("PostgreSQL SCRAM 인증의 첫 서버 응답에 nonce 값(r)이 없습니다")?,
-        salt.ok_or("PostgreSQL SCRAM 인증의 첫 서버 응답에 salt 값(s)이 없습니다")?,
+        r.ok_or("The first PostgreSQL SCRAM server response has no nonce (r)")?,
+        salt.ok_or("The first PostgreSQL SCRAM server response has no salt (s)")?,
         {
-            let iterations =
-                iter.ok_or("PostgreSQL SCRAM 인증의 첫 서버 응답에 반복 횟수(i)가 없습니다")?;
+            let iterations = iter
+                .ok_or("The first PostgreSQL SCRAM server response has no iteration count (i)")?;
             if !(MIN_SCRAM_ITERATIONS..=MAX_SCRAM_ITERATIONS).contains(&iterations) {
-                return Err("SCRAM 반복 횟수 허용 범위를 넘었습니다".into());
+                return Err("SCRAM iteration count is out of range".into());
             }
             iterations
         },
@@ -535,7 +540,7 @@ fn sha256(d: &[u8]) -> [u8; 32] {
 /** @brief HMAC-SHA-256. */
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut m = <HmacSha256 as Mac>::new_from_slice(key)
-        .expect("HMAC 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+        .expect("The HMAC key length matches the algorithm requirement");
     m.update(msg);
     m.finalize().into_bytes().into()
 }

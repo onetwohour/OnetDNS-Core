@@ -78,9 +78,10 @@ impl DdrLayer {
             return Ok(None);
         }
         let owner = Name::from_str("_dns.resolver.arpa")
-            .map_err(|error| format!("DDR 이름을 만들지 못했습니다: {error}"))?;
-        let target = Name::from_str(name)
-            .map_err(|error| format!("ddr_name '{name}'을 이름으로 만들지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not build the DDR name: {error}"))?;
+        let target = Name::from_str(name).map_err(|error| {
+            format!("Could not turn ddr_name '{name}' into a DNS name: {error}")
+        })?;
         let mut records = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
             // 매개변수는 키 오름차순이어야 한다. 인코더가 그것을 검사한다.
@@ -89,7 +90,7 @@ impl DdrLayer {
             for id in endpoint.alpn {
                 let bytes = id.as_bytes();
                 if bytes.is_empty() || bytes.len() > u8::MAX as usize {
-                    return Err(format!("DDR ALPN 표식 '{id}'의 길이가 올바르지 않습니다"));
+                    return Err(format!("DDR ALPN identifier '{id}' has an invalid length"));
                 }
                 alpn.push(bytes.len() as u8);
                 alpn.extend_from_slice(bytes);
@@ -115,7 +116,7 @@ impl DdrLayer {
         // 부정 응답의 SOA 소유자는 영역 꼭대기다. resolver.arpa는 특수 용도 이름이라
         // 이 서버가 로컬에서 맡는다.
         let apex = Name::from_str("resolver.arpa")
-            .map_err(|error| format!("resolver.arpa 이름을 만들지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not build the resolver.arpa name: {error}"))?;
         let negative_soa = Record::new(
             apex.clone(),
             DDR_TTL,

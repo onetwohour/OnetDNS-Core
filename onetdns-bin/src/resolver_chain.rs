@@ -414,7 +414,7 @@ impl RecursiveBase {
             .map(|name| {
                 onetdns_proto::Name::from_str(name).map_err(|_| {
                     crate::anyhow!(format!(
-                        "DNSSEC 검증 예외 DNS 이름이 올바르지 않습니다: {name}"
+                        "Invalid DNS name in the DNSSEC validation exceptions: {name}"
                     ))
                 })
             })
@@ -454,7 +454,7 @@ impl RecursiveBase {
             let jobs_stop = recursor_jobs.restart_all();
             if plan.dnssec_rfc5011 {
                 let thread = spawn_rfc5011(plan, recursor.anchors_handle(), jobs_stop.clone())
-                    .with_context(|| "RFC 5011 신뢰 앵커 갱신 스레드를 시작하지 못했습니다")?;
+                    .with_context(|| "Could not start the RFC 5011 trust anchor update thread")?;
                 track_service_thread(thread_tracker, thread);
             }
             if plan.trust_anchor_signaling {
@@ -468,7 +468,7 @@ impl RecursiveBase {
                     plan.max_ttl(),
                     jobs_stop.clone(),
                 )
-                .with_context(|| "RFC 8145 신뢰 앵커 신호 스레드를 시작하지 못했습니다")?;
+                .with_context(|| "Could not start the RFC 8145 trust anchor signaling thread")?;
                 track_service_thread(thread_tracker, thread);
             }
         }
@@ -627,7 +627,7 @@ impl ChainLayers {
                 .iter()
                 .map(|name| {
                     onetdns_proto::Name::from_str(name).map_err(|_| {
-                        format!("DNSSEC 검증 예외 DNS 이름이 올바르지 않습니다: {name}")
+                        format!("Invalid DNS name in the DNSSEC validation exceptions: {name}")
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -660,7 +660,7 @@ impl ChainLayers {
                 namespace,
             ));
             if report {
-                onetdns_core::info!(event = "cache.redis_enabled", %addr, "외부 Redis 응답 캐시를 사용합니다");
+                onetdns_core::info!(event = "cache.redis_enabled", %addr, "Using external Redis response cache");
             }
         }
 
@@ -723,9 +723,9 @@ impl ChainLayers {
         }
 
         if plan.prefetch {
-            let backend =
-                prefetch_backend.expect("미리 가져오기가 켜져 있으면 핸들러가 준비되어야 합니다");
-            let cache_handle = prefetch_cache.expect("prefetch_cache는 plan.prefetch일 때 설정됨");
+            let backend = prefetch_backend.expect("The handler must be ready when prefetch is on");
+            let cache_handle =
+                prefetch_cache.expect("prefetch_cache is set when plan.prefetch is on");
 
             let refresher: layers::PrefetchRefresher = Arc::new(move |req| {
                 let resp = backend.resolve(req)?;
@@ -768,10 +768,10 @@ impl ChainLayers {
         if !plan.stub_zones.is_empty() {
             let mut stubs: Vec<(String, Arc<dyn native::Resolver>)> = Vec::new();
             for (suffix, zone) in &plan.stub_zones {
-                let ups = zone.upstreams(&format!("스텁 영역 '{suffix}'"))?;
+                let ups = zone.upstreams(&format!("stub zone '{suffix}'"))?;
                 if ups.is_empty() {
                     return Err(format!(
-                        "스텁 영역 '{suffix}'에 사용할 수 있는 업스트림 DNS 서버가 없습니다"
+                        "Stub zone '{suffix}' has no usable upstream DNS servers"
                     ));
                 }
                 let guarded: Arc<dyn native::Resolver> =
@@ -822,7 +822,7 @@ impl ChainLayers {
                         event = "ddr.enabled",
                         name = %ddr.name,
                         endpoints = ddr.endpoints.len(),
-                        "암호화 전송 승격 안내(DDR)를 켭니다"
+                        "Advertising encrypted DNS upgrade (DDR)"
                     );
                 }
                 chain = Arc::new(layer);
@@ -836,7 +836,7 @@ impl ChainLayers {
                     onetdns_core::info!(
                         event = "dynamic_records.enabled",
                         count = plan.dynamic_records.len(),
-                        "동적 DNS 레코드 처리를 사용합니다"
+                        "Dynamic DNS records are enabled"
                     );
                 }
                 chain = Arc::new(dl);

@@ -50,7 +50,7 @@ fn resolve_uid(user: &str) -> Result<libc::uid_t, String> {
     if let Ok(n) = user.parse::<u32>() {
         return Ok(n);
     }
-    let cname = CString::new(user).map_err(|_| "run_as_user에 NUL 포함".to_string())?;
+    let cname = CString::new(user).map_err(|_| "run_as_user contains NUL".to_string())?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -64,7 +64,7 @@ fn resolve_uid(user: &str) -> Result<libc::uid_t, String> {
         )
     };
     if rc != 0 || result.is_null() {
-        return Err(format!("run_as_user '{user}'를 확인할 수 없습니다"));
+        return Err(format!("Could not look up run_as_user '{user}'"));
     }
     Ok(pwd.pw_uid)
 }
@@ -74,7 +74,7 @@ fn resolve_gid(group: &str) -> Result<libc::gid_t, String> {
     if let Ok(n) = group.parse::<u32>() {
         return Ok(n);
     }
-    let cname = CString::new(group).map_err(|_| "run_as_group에 NUL 포함".to_string())?;
+    let cname = CString::new(group).map_err(|_| "run_as_group contains NUL".to_string())?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::group = std::ptr::null_mut();
@@ -88,7 +88,7 @@ fn resolve_gid(group: &str) -> Result<libc::gid_t, String> {
         )
     };
     if rc != 0 || result.is_null() {
-        return Err(format!("run_as_group '{group}'를 확인할 수 없습니다"));
+        return Err(format!("Could not look up run_as_group '{group}'"));
     }
     Ok(grp.gr_gid)
 }
@@ -134,7 +134,7 @@ fn set_caps(caps: &[u32]) -> Result<(), String> {
     }
     let rc = unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) };
     if rc != 0 {
-        return Err(format!("capset 실패: {}", last_err()));
+        return Err(format!("capset failed: {}", last_err()));
     }
     Ok(())
 }
@@ -150,7 +150,7 @@ fn set_caps(caps: &[u32]) -> Result<(), String> {
 pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
     let uid = resolve_uid(user)?;
     if uid == 0 {
-        return Err("run_as_user가 UID 0(root)을 가리킴: 권한 강등 대상이 아닙니다".into());
+        return Err("run_as_user refers to UID 0 (root), which is not a lower privilege".into());
     }
     let gid = match group {
         Some(g) => resolve_gid(g)?,
@@ -159,7 +159,7 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
                 n
             } else {
                 let cname = CString::new(user)
-                    .map_err(|_| "실행 사용자 이름에 NUL 문자가 포함되어 있습니다".to_string())?;
+                    .map_err(|_| "The user name to run as contains a NUL character".to_string())?;
                 let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
                 let mut buf = vec![0 as libc::c_char; 4096];
                 let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -173,16 +173,14 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
                     )
                 };
                 if rc != 0 || result.is_null() {
-                    return Err(format!(
-                        "실행 사용자 '{user}'의 기본 그룹을 확인하지 못했습니다"
-                    ));
+                    return Err(format!("Could not find the primary group of user '{user}'"));
                 }
                 pwd.pw_gid
             }
         }
     };
     if gid == 0 {
-        return Err("run_as_group이 GID 0(root)을 가리킴: 권한 강등 대상이 아닙니다".into());
+        return Err("run_as_group refers to GID 0 (root), which is not a lower privilege".into());
     }
 
     let current_uid = unsafe { libc::geteuid() };
@@ -190,7 +188,7 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
     if current_uid != 0 {
         if current_uid != uid || current_gid != gid {
             return Err(format!(
-                "현재 UID/GID({current_uid}/{current_gid})에서 대상 UID/GID({uid}/{gid})로 강등할 권한이 없습니다"
+                "No permission to switch from UID/GID {current_uid}/{current_gid} to UID/GID {uid}/{gid}"
             ));
         }
 
@@ -207,42 +205,44 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
             };
             if rc != 0 {
                 return Err(format!(
-                    "PR_CAP_AMBIENT_RAISE({capability}) 실패: {}",
+                    "PR_CAP_AMBIENT_RAISE({capability}) failed: {}",
                     last_err()
                 ));
             }
         }
         if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            return Err(format!("PR_SET_NO_NEW_PRIVS 실패: {}", last_err()));
+            return Err(format!("PR_SET_NO_NEW_PRIVS failed: {}", last_err()));
         }
         if unsafe { libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-            return Err(format!("PR_SET_DUMPABLE 실패: {}", last_err()));
+            return Err(format!("PR_SET_DUMPABLE failed: {}", last_err()));
         }
         return Ok(());
     }
 
     if unsafe { libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
-        return Err(format!("PR_SET_KEEPCAPS 실패: {}", last_err()));
+        return Err(format!("PR_SET_KEEPCAPS failed: {}", last_err()));
     }
 
     if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-        return Err(format!("setgroups 실패: {}", last_err()));
+        return Err(format!("setgroups failed: {}", last_err()));
     }
     if unsafe { libc::setgid(gid) } != 0 {
-        return Err(format!("setgid({gid}) 실패: {}", last_err()));
+        return Err(format!("setgid({gid}) failed: {}", last_err()));
     }
     if unsafe { libc::setuid(uid) } != 0 {
-        return Err(format!("setuid({uid}) 실패: {}", last_err()));
+        return Err(format!("setuid({uid}) failed: {}", last_err()));
     }
 
     if uid != 0 && unsafe { libc::setuid(0) } == 0 {
-        return Err("권한 강등 후에도 root로 복귀 가능: 안전하지 않음".into());
+        return Err(
+            "The process can still regain root after dropping privileges, which is unsafe".into(),
+        );
     }
 
     set_caps(RETAINED_CAPS)?;
 
     if unsafe { libc::prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) } != 0 {
-        return Err(format!("PR_SET_KEEPCAPS 해제 실패: {}", last_err()));
+        return Err(format!("Could not clear PR_SET_KEEPCAPS: {}", last_err()));
     }
 
     for &c in RETAINED_CAPS {
@@ -256,16 +256,16 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
             )
         };
         if rc != 0 {
-            return Err(format!("PR_CAP_AMBIENT_RAISE({c}) 실패: {}", last_err()));
+            return Err(format!("PR_CAP_AMBIENT_RAISE({c}) failed: {}", last_err()));
         }
     }
 
     if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(format!("PR_SET_NO_NEW_PRIVS 실패: {}", last_err()));
+        return Err(format!("PR_SET_NO_NEW_PRIVS failed: {}", last_err()));
     }
 
     if unsafe { libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        return Err(format!("PR_SET_DUMPABLE 실패: {}", last_err()));
+        return Err(format!("PR_SET_DUMPABLE failed: {}", last_err()));
     }
     Ok(())
 }
@@ -284,14 +284,14 @@ pub fn executable_still_runnable() -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = std::env::current_exe()
-        .map_err(|error| format!("현재 실행 파일의 경로를 확인하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not find the path of the current executable: {error}"))?;
     let raw = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "실행 파일 경로에 NUL 문자가 들어 있습니다".to_string())?;
+        .map_err(|_| "The executable path contains a NUL character".to_string())?;
     if unsafe { libc::access(raw.as_ptr(), libc::X_OK) } == 0 {
         return Ok(());
     }
     Err(format!(
-        "권한을 낮춘 사용자가 실행 파일에 접근하지 못합니다: {} ({})",
+        "The unprivileged user cannot access the executable: {} ({})",
         path.display(),
         last_err()
     ))

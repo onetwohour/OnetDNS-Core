@@ -74,7 +74,7 @@ pub(crate) fn exchange(
             }
             let res = {
                 let mut p = pool.borrow_mut();
-                let conn = p.get_mut(&key).expect("방금 삽입됨");
+                let conn = p.get_mut(&key).expect("Just inserted");
                 let r = roundtrip(conn, wire, request, deadline);
                 if r.is_ok() {
                     harvest_sessions(&mut conn.conn, addr, server_name, b"doq", trust);
@@ -90,7 +90,7 @@ pub(crate) fn exchange(
                             transport = "doq",
                             addr = %addr,
                             reason = ?e,
-                            "기존 연결을 재사용하지 못해 새 연결로 다시 시도합니다"
+                            "Could not reuse the existing connection; retrying on a new one"
                         );
                     }
                     if attempt == 1 {
@@ -154,9 +154,7 @@ fn roundtrip(
     c.conn.set_now(c.created.elapsed().as_millis() as u64);
     c.conn.on_timeout(c.created.elapsed().as_millis() as u64);
     if c.conn.is_closed() {
-        return Err(ForwardError::Io(
-            "사용하지 않던 DoQ 연결이 종료되었습니다".into(),
-        ));
+        return Err(ForwardError::Io("Idle DoQ connection closed".into()));
     }
 
     check_peer_revocation(&c.conn, &c.server_name, &mut c.revocation_checked)?;
@@ -165,7 +163,7 @@ fn roundtrip(
     c.conn.set_now(c.created.elapsed().as_millis() as u64);
     c.conn
         .send_dns_message(sid, &q)
-        .map_err(|error| ForwardError::Io(format!("DoQ 요청을 보내지 못했습니다: {error}")))?;
+        .map_err(|error| ForwardError::Io(format!("Could not send DoQ request: {error}")))?;
     c.next_bidi += 1;
     flush_out(&c.sock, &mut c.conn)?;
 
@@ -174,7 +172,7 @@ fn roundtrip(
     let mut buf = [0u8; onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize];
     while Instant::now() < deadline {
         if c.conn.is_closed() {
-            return Err(ForwardError::Io("DoQ 서버가 연결을 종료했습니다".into()));
+            return Err(ForwardError::Io("DoQ server closed the connection".into()));
         }
         c.conn.set_now(c.created.elapsed().as_millis() as u64);
         if recv_once(&c.sock, &mut c.conn, &mut buf)? {
@@ -183,8 +181,7 @@ fn roundtrip(
             c.conn.on_timeout(c.created.elapsed().as_millis() as u64);
             if last_rx.elapsed() >= silence_limit {
                 return Err(ForwardError::Io(
-                    "DoQ 연결에서 응답을 받지 못해 해당 서버를 사용할 수 없는 상태로 처리했습니다"
-                        .into(),
+                    "No response on the DoQ connection; server marked unavailable".into(),
                 ));
             }
         }
@@ -197,7 +194,7 @@ fn roundtrip(
             .any(|(stream_id, _)| *stream_id == sid)
         {
             return Err(ForwardError::Io(
-                "DoQ 서버가 요청 스트림을 강제로 종료했습니다".into(),
+                "DoQ server reset the request stream".into(),
             ));
         }
         for (rid, dns) in c.conn.take_stream_requests() {

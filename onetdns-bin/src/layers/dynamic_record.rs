@@ -134,13 +134,13 @@ impl DynRec {
                                 event = "upstream.health_recovered",
                                 address = %ip,
                                 port,
-                                "업스트림 DNS 서버가 다시 응답합니다"
+                                "Upstream DNS server is answering again"
                             ),
                             (None | Some(true), false) => onetdns_core::warn!(
                                 event = "upstream.health_failed",
                                 address = %ip,
                                 port,
-                                "업스트림 DNS 서버의 연결 확인에 실패했습니다"
+                                "Upstream DNS server health check failed"
                             ),
                             _ => {}
                         }
@@ -151,7 +151,7 @@ impl DynRec {
                             event = "upstream.health_probe_queue_full",
                             address = %ip,
                             port,
-                            "업스트림 DNS 서버 상태 확인 대기열이 가득 차 이번 확인을 건너뜁니다"
+                            "Upstream health check queue is full; skipping this check"
                         );
                     }
                 }
@@ -241,7 +241,7 @@ fn health_probe_executor() -> &'static mpsc::SyncSender<HealthProbeJob> {
                     }
                 })
             {
-                onetdns_core::warn!(event = "upstream.health_worker_start_failed", %error, index, "업스트림 DNS 서버 상태 확인 스레드를 시작하지 못해 해당 기능을 일부 비활성화합니다");
+                onetdns_core::warn!(event = "upstream.health_worker_start_failed", %error, index, "Could not start the upstream health check thread; part of this feature is disabled");
                 break;
             }
         }
@@ -275,7 +275,7 @@ impl DynamicRecordLayer {
                 "AAAA" => RecordType::AAAA,
                 other => {
                     return Err(format!(
-                        "dynamic_records[{index}].qtype에 허용되지 않은 값이 있습니다: '{other}'"
+                        "dynamic_records[{index}].qtype has a value that is not allowed: '{other}'"
                     ));
                 }
             };
@@ -286,7 +286,7 @@ impl DynamicRecordLayer {
                 "failover" => DynMode::Failover,
                 other => {
                     return Err(format!(
-                        "dynamic_records[{index}].mode에 허용되지 않은 값이 있습니다: '{other}'"
+                        "dynamic_records[{index}].mode has a value that is not allowed: '{other}'"
                     ));
                 }
             };
@@ -296,33 +296,30 @@ impl DynamicRecordLayer {
                     Some((a, w)) => (
                         a.trim(),
                         w.trim().parse::<u32>().map_err(|_| {
-                            format!(
-                                "dynamic_records[{index}].values[{item}]의 weight가 올바르지 않습니다"
-                            )
+                            format!("dynamic_records[{index}].values[{item}] has an invalid weight")
                         })?,
                     ),
                     None => (v.trim(), 1),
                 };
                 let ip = ip_s.parse::<IpAddr>().map_err(|_| {
-                    format!("dynamic_records[{index}].values[{item}]의 IP 주소가 올바르지 않습니다")
+                    format!("dynamic_records[{index}].values[{item}] has an invalid IP address")
                 })?;
                 let family_ok = (qtype == RecordType::A && ip.is_ipv4())
                     || (qtype == RecordType::AAAA && ip.is_ipv6());
                 if !family_ok {
                     return Err(format!(
-                        "dynamic_records[{index}].values[{item}]의 IP 주소 계열이 qtype과 다릅니다"
+                        "dynamic_records[{index}].values[{item}] has an IP address family that does not match qtype"
                     ));
                 }
                 values.push((ip, weight));
             }
             if values.is_empty() {
                 return Err(format!(
-                    "dynamic_records[{index}].values에 한 개 이상의 IP 주소가 필요합니다"
+                    "dynamic_records[{index}].values needs at least one IP address"
                 ));
             }
-            let name_key = configured_name_key(&r.name).ok_or_else(|| {
-                format!("dynamic_records[{index}].name의 DNS 이름이 올바르지 않습니다")
-            })?;
+            let name_key = configured_name_key(&r.name)
+                .ok_or_else(|| format!("dynamic_records[{index}].name is not a valid DNS name"))?;
             let record = DynRec {
                 qtype,
                 mode,
@@ -339,7 +336,7 @@ impl DynamicRecordLayer {
                 .any(|existing| existing.qtype == qtype)
             {
                 return Err(format!(
-                    "dynamic_records[{index}]가 같은 name과 qtype을 중복 정의합니다"
+                    "dynamic_records[{index}] defines the same name and qtype twice"
                 ));
             }
             records_for_name.push(record);

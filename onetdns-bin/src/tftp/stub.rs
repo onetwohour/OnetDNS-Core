@@ -28,6 +28,6 @@ pub fn spawn_tftp(
     );
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "이 운영체제에서는 안전한 TFTP 파일 접근 방식을 지원하지 않아 TFTP 서버를 시작할 수 없습니다",
+        "The TFTP server cannot start because this operating system does not support safe TFTP file access",
     ))
 }

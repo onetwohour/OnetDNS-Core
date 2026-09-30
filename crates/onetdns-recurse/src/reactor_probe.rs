@@ -251,7 +251,7 @@ fn build_recursor() -> (Recursor, SocketAddr) {
     let root: SocketAddr = std::env::var("RP_ROOT")
         .unwrap_or_else(|_| "127.0.1.1:53".into())
         .parse()
-        .expect("RP_ROOT 형식");
+        .expect("RP_ROOT format");
     let r = Recursor::new(vec![root], Duration::from_millis(1500))
         .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
     (r, root)
@@ -260,13 +260,13 @@ fn build_recursor() -> (Recursor, SocketAddr) {
 /** @brief 질의 목록을 파일에서 읽는다. 지정하지 않으면 프로브를 건너뛴다. */
 fn load_queries() -> Option<Vec<Name>> {
     let path = std::env::var("RP_QUERIES").ok()?;
-    let text = std::fs::read_to_string(&path).expect("질의 파일");
+    let text = std::fs::read_to_string(&path).expect("Query file");
     let mut names: Vec<Name> = text
         .lines()
         .filter_map(|l| l.split_whitespace().next())
         .filter_map(|n| Name::from_str(n).ok())
         .collect();
-    assert!(!names.is_empty(), "질의 파일이 비었습니다");
+    assert!(!names.is_empty(), "Query file is empty");
     names.reverse();
     Some(names)
 }
@@ -292,7 +292,7 @@ fn remove_at(sessions: &mut Vec<Session>, fds: &mut Vec<libc::pollfd>, i: usize)
 /** @brief 판정 없이 세션만 돌렸을 때의 처리량 상한을 측정한다. */
 fn reactor_ceiling_probe() {
     let Some(mut names) = load_queries() else {
-        eprintln!("RP_QUERIES 미설정: 프로브 생략");
+        eprintln!("RP_QUERIES not set; skipping probe");
         return;
     };
     let inflight_max = env_usize("RP_INFLIGHT", 32);
@@ -374,7 +374,7 @@ fn reactor_ceiling_probe() {
         "reactor-ceiling: total={total} done={done} failed={failed} bailed={bailed} timeouts={timeouts} elapsed={:.2}s qps={qps:.0} inflight={inflight_max}",
         elapsed.as_secs_f64()
     );
-    assert!(done > 0, "완료 0: 권한 계층 미기동?");
+    assert!(done > 0, "0 completed; is the authoritative tier running?");
 }
 
 /** @brief 프로브 서버가 받은 클라이언트 요청 하나. */
@@ -744,7 +744,7 @@ fn bind_reuseport(addr: SocketAddr) -> std::net::UdpSocket {
         );
         assert_eq!(rc, 0, "SO_REUSEPORT");
         let SocketAddr::V4(v4) = addr else {
-            panic!("V4 주소만");
+            panic!("IPv4 addresses only");
         };
         /* BSD 계열은 sin_len 필드가 더 있어 구조체 리터럴로는 그 플랫폼에서만 깨진다. */
         let mut sin: libc::sockaddr_in = std::mem::zeroed();
@@ -802,7 +802,7 @@ fn run_reactor_worker(
     inflight_max: usize,
     duration: Duration,
 ) -> SrvStats {
-    listener.set_nonblocking(true).expect("논블로킹");
+    listener.set_nonblocking(true).expect("Nonblocking");
     let listener_fd = listener.as_raw_fd();
     let mut srv = Srv::new(recursor, &listener);
     let started = Instant::now();
@@ -948,7 +948,7 @@ fn reactor_server_probe() {
     let listen: SocketAddr = std::env::var("RP_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:5301".into())
         .parse()
-        .expect("RP_LISTEN 형식");
+        .expect("RP_LISTEN format");
     let inflight_max = env_usize("RP_INFLIGHT", 32);
     let duration = Duration::from_secs(env_usize("RP_DURATION_SECS", 30) as u64);
     let workers = env_usize("RP_WORKERS", 1).max(1);

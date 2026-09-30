@@ -67,15 +67,15 @@ pub fn hkdf_expand(hash: Hash, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     match hash {
         Hash::Sha256 => {
             hkdf::Hkdf::<sha2::Sha256>::from_prk(prk)
-                .expect("PRK 길이")
+                .expect("PRK length")
                 .expand(info, &mut okm)
-                .expect("OKM 길이");
+                .expect("OKM length");
         }
         Hash::Sha384 => {
             hkdf::Hkdf::<sha2::Sha384>::from_prk(prk)
-                .expect("PRK 길이")
+                .expect("PRK length")
                 .expand(info, &mut okm)
-                .expect("OKM 길이");
+                .expect("OKM length");
         }
     }
     okm

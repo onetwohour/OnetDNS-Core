@@ -218,7 +218,7 @@ fn apply_completions(
                 "doq",
                 "memory_budget",
                 Some(entry.peer),
-                "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                "Total QUIC connection memory budget exceeded",
             );
             to_remove.push(d.conn_key);
             continue;
@@ -320,7 +320,7 @@ fn drive_timeouts(
                 "doq",
                 "memory_budget",
                 Some(entry.peer),
-                "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                "Total QUIC connection memory budget exceeded",
             );
             closed.push(key.clone());
         } else if entry.conn.is_closed() {
@@ -499,7 +499,7 @@ fn run_loop(
                         "memory_budget",
                         Some(peer),
                         format!(
-                            "전체 QUIC 연결 메모리 예산이 가득 찼습니다: {} / {} bytes",
+                            "Total QUIC connection memory budget is full: {} / {} bytes",
                             control.memory_budget().used_bytes(),
                             control.memory_budget().limit_bytes()
                         ),
@@ -663,7 +663,7 @@ fn run_loop(
                         "doq",
                         "memory_budget",
                         Some(entry.peer),
-                        "전체 QUIC 연결 메모리 예산을 초과했습니다",
+                        "Total QUIC connection memory budget exceeded",
                     );
                     remove = true;
                 }

@@ -41,7 +41,7 @@ impl IpsetLayer {
             .iter()
             .map(|domain| {
                 Name::from_str(domain.trim())
-                    .map_err(|_| format!("ipset 추적 DNS 이름이 올바르지 않습니다: {domain}"))
+                    .map_err(|_| format!("Invalid DNS name to track in ipset: {domain}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(IpsetLayer {
@@ -89,7 +89,7 @@ impl IpsetLayer {
 /** @brief 커널 주소 집합에 넣는다. */
 fn ipset_add(set: &str, ip: IpAddr) -> bool {
     let Some(exe) = crate::osnet::resolve_tool("ipset") else {
-        onetdns_core::warn!(event = "ipset.binary_missing", set, %ip, "신뢰할 수 있는 경로에서 ipset 실행 파일을 찾지 못했습니다");
+        onetdns_core::warn!(event = "ipset.binary_missing", set, %ip, "Could not find the ipset executable in a trusted path");
         return false;
     };
     let mut command = std::process::Command::new(exe);
@@ -103,12 +103,12 @@ fn ipset_add(set: &str, ip: IpAddr) -> bool {
                 %ip,
                 status = ?output.status.code(),
                 stderr = %String::from_utf8_lossy(&output.stderr),
-                "ipset에 주소를 반영하지 못했습니다"
+                "Could not apply addresses to ipset"
             );
             false
         }
         Err(error) => {
-            onetdns_core::warn!(event = "ipset.command_failed", set, %ip, %error, "ipset 명령 실행에 실패했습니다");
+            onetdns_core::warn!(event = "ipset.command_failed", set, %ip, %error, "ipset command failed");
             false
         }
     }

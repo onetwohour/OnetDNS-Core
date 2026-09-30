@@ -111,8 +111,16 @@ impl SignKey {
             SignKey::EcdsaP256(key) => {
                 let point = key.verifying_key().to_encoded_point(false);
                 let mut pk = Vec::with_capacity(64);
-                pk.extend_from_slice(point.x().expect("P-256 공개 키의 x 좌표가 있어야 합니다"));
-                pk.extend_from_slice(point.y().expect("P-256 공개 키의 y 좌표가 있어야 합니다"));
+                pk.extend_from_slice(
+                    point
+                        .x()
+                        .expect("P-256 public key must have an x coordinate"),
+                );
+                pk.extend_from_slice(
+                    point
+                        .y()
+                        .expect("P-256 public key must have a y coordinate"),
+                );
                 pk
             }
             SignKey::Ed25519(key) => key.verifying_key().to_bytes().to_vec(),
@@ -959,7 +967,7 @@ fn build_nsec3_chain(
         });
     }
     if skipped > 0 {
-        onetdns_core::error!(event = "dnssec.nsec3_owner_invalid", zone = %apex.to_ascii_lower(), skipped = skipped, nodes = n, "NSEC3 소유자 이름을 만들지 못해 체인에 구멍이 생겼습니다. 이 영역의 부재 증명이 검증에 실패합니다");
+        onetdns_core::error!(event = "dnssec.nsec3_owner_invalid", zone = %apex.to_ascii_lower(), skipped = skipped, nodes = n, "Could not build an NSEC3 owner name, leaving a gap in the chain; denial proofs for this zone will fail validation");
     }
     out
 }

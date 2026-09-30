@@ -161,7 +161,7 @@ impl Resolver for CacheDbLayer {
                     m.header.recursion_desired = req.header.recursion_desired;
                     m.header.checking_disabled = req.header.checking_disabled;
                     m.questions = req.questions.clone();
-                    onetdns_forward::note_response_source("외부 캐시");
+                    onetdns_forward::note_response_source("external cache");
                     return ResolveOutcome::Response(m);
                 }
             }

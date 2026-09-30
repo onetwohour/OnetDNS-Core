@@ -48,9 +48,9 @@ impl std::fmt::Display for ProtoError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProtoError::Eof => write!(f, "메시지가 끝난 뒤의 데이터를 읽으려 했습니다"),
-            ProtoError::Name(s) => write!(f, "이름 파싱 오류: {s}"),
-            ProtoError::Message(s) => write!(f, "DNS 메시지 오류: {s}"),
+            ProtoError::Eof => write!(f, "Read past the end of the message"),
+            ProtoError::Name(s) => write!(f, "Name parse error: {s}"),
+            ProtoError::Message(s) => write!(f, "DNS message error: {s}"),
         }
     }
 }
@@ -79,7 +79,7 @@ mod xval {
         let bytes = msg.try_encode().unwrap();
 
         let h = hickory_proto::op::Message::from_vec(&bytes)
-            .expect("비교 대상 DNS 구현이 메시지를 해석해야 합니다");
+            .expect("Reference DNS implementation must parse the message");
         assert_eq!(h.metadata.id, 0x1234);
         assert_eq!(h.queries.len(), 1);
         assert_eq!(h.queries[0].name().to_ascii(), "www.example.com.");
@@ -114,7 +114,7 @@ mod xval {
         ));
         let bytes = m.to_vec().unwrap();
 
-        let ours = Message::parse(&bytes).expect("현재 DNS 구현이 메시지를 해석해야 합니다");
+        let ours = Message::parse(&bytes).expect("This DNS implementation must parse the message");
         assert_eq!(ours.header.id, 0xABCD);
         assert!(ours.header.response);
         assert_eq!(ours.questions.len(), 1);
@@ -123,12 +123,12 @@ mod xval {
 
         match &ours.answers[0].rdata {
             RData::Cname(n) => assert_eq!(n.to_ascii_lower(), "b.example.com"),
-            other => panic!("CNAME 레코드를 예상했지만 실제 값은 {other:?}입니다"),
+            other => panic!("Expected a CNAME record, got {other:?}"),
         }
 
         match &ours.answers[1].rdata {
             RData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(1, 2, 3, 4)),
-            other => panic!("A 레코드를 예상했지만 실제 값은 {other:?}입니다"),
+            other => panic!("Expected an A record, got {other:?}"),
         }
     }
 
@@ -174,7 +174,7 @@ mod xval {
                 assert_eq!(*preference, 10);
                 assert_eq!(exchange.to_ascii_lower(), "mx1.test.org");
             }
-            _ => panic!("MX 레코드가 필요합니다"),
+            _ => panic!("Expected an MX record"),
         }
 
         let h = hickory_proto::op::Message::from_vec(&bytes).unwrap();
@@ -215,7 +215,7 @@ mod xval {
                 assert_eq!(&**tag, b"issue");
                 assert_eq!(&**value, b"letsencrypt.org");
             }
-            other => panic!("CAA 레코드를 예상했지만 실제 값은 {other:?}입니다"),
+            other => panic!("Expected a CAA record, got {other:?}"),
         }
 
         let h = hickory_proto::op::Message::from_vec(&bytes).unwrap();
@@ -235,8 +235,8 @@ mod xval {
         msg.additionals.push(edns.try_to_record().unwrap());
         let bytes = msg.try_encode().unwrap();
         let back = Message::parse(&bytes).unwrap();
-        let opt = back.opt().expect("OPT 있음");
-        let (code, text) = Edns::from_record(opt).unwrap().ede().expect("EDE 옵션");
+        let opt = back.opt().expect("Has OPT");
+        let (code, text) = Edns::from_record(opt).unwrap().ede().expect("EDE option");
         assert_eq!(code, 15);
         assert_eq!(text, "blocked by filter");
 
@@ -257,7 +257,7 @@ mod xval {
         msg.additionals.push(edns.try_to_record().unwrap());
         let bytes = msg.try_encode().unwrap();
         let back = Message::parse(&bytes).unwrap();
-        let opt = back.opt().expect("OPT 있음");
+        let opt = back.opt().expect("Has OPT");
         let e = Edns::from_record(opt).unwrap();
         assert_eq!(e.udp_payload, 1232);
         assert!(e.dnssec_ok);

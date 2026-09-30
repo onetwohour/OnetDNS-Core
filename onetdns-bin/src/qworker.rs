@@ -106,7 +106,7 @@ pub fn udp_completion_notifier(bound: SocketAddr) -> io::Result<(DoneNotify, Soc
         if let Err(e) = socket.send_to(COMPLETION_WAKE, target) {
             let count = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if count.is_power_of_two() {
-                onetdns_core::warn!(event = "worker.wake_failed", target = %target, count = count, error = %e, "완료 알림을 보내지 못해 처리된 응답이 다음 패킷이 올 때까지 나가지 못합니다");
+                onetdns_core::warn!(event = "worker.wake_failed", target = %target, count = count, error = %e, "Could not send the completion notice; the finished response waits until the next packet arrives");
             }
         }
     });
@@ -326,7 +326,7 @@ pub fn servfail_wire(req: &Message) -> Vec<u8> {
     m.header.rcode = ResponseCode::ServFail.0;
     m.questions = req.questions.clone();
     m.try_encode()
-        .expect("파싱된 요청에서 만든 최소 SERVFAIL은 인코딩 가능")
+        .expect("A minimal SERVFAIL built from a parsed request can always be encoded")
 }
 
 /**

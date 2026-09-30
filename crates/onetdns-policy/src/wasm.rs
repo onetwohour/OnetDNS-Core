@@ -71,7 +71,7 @@ impl FailureMode {
             "open" => FailureMode::Open,
             other => {
                 return Err(PolicyError::Wasm(format!(
-                    "알 수 없는 WASM failure mode: {other}"
+                    "Unknown WASM failure mode: {other}"
                 )))
             }
         };
@@ -144,7 +144,7 @@ impl WasmPolicy {
         let module = Module::parse(bytes).map_err(PolicyError::Wasm)?;
         if !module.has_memory_export("memory") {
             return Err(PolicyError::Wasm(
-                "memory 내보내기 항목이 없거나 올바르지 않습니다".into(),
+                "memory export is missing or invalid".into(),
             ));
         }
         let require_signature =
@@ -156,7 +156,7 @@ impl WasmPolicy {
                         Ok(())
                     }
                     _ => Err(PolicyError::Wasm(format!(
-                        "WASM {name} 함수 형식이 현재 ABI와 일치하지 않습니다"
+                        "WASM function {name} does not match the current ABI"
                     ))),
                 }
             };
@@ -234,7 +234,7 @@ impl WasmPolicy {
                 let count = self.metrics.error_total.fetch_add(1, Ordering::Relaxed) + 1;
                 let action = self.fail_mode.action();
                 if count.is_power_of_two() {
-                    onetdns_core::warn!(event = "policy.wasm_eval_failed", plugin = %self.name, count = count, fallback = ?action, %error, "정책 플러그인이 질의를 평가하지 못해 실패 모드로 처리했습니다");
+                    onetdns_core::warn!(event = "policy.wasm_eval_failed", plugin = %self.name, count = count, fallback = ?action, %error, "Policy plugin could not evaluate the query; applied the failure mode");
                 }
                 action
             }
@@ -289,7 +289,7 @@ impl WasmPolicy {
                 let count = self.metrics.error_total.fetch_add(1, Ordering::Relaxed) + 1;
                 let verdict = self.fail_mode.response_verdict();
                 if count.is_power_of_two() {
-                    onetdns_core::warn!(event = "policy.wasm_response_eval_failed", plugin = %self.name, count = count, fallback = ?verdict, %error, "정책 플러그인이 응답을 평가하지 못해 실패 모드로 처리했습니다");
+                    onetdns_core::warn!(event = "policy.wasm_response_eval_failed", plugin = %self.name, count = count, fallback = ?verdict, %error, "Policy plugin could not evaluate the response; applied the failure mode");
                 }
                 verdict
             }
@@ -379,7 +379,7 @@ impl WasmPolicy {
             .first()
         {
             Some(Value::I32(v)) => *v,
-            _ => return Err("alloc i32 결과가 필요합니다".into()),
+            _ => return Err("alloc must return i32".into()),
         };
         inst.write_mem(ptr as usize, &ctx)?;
         let code = match inst
@@ -390,13 +390,13 @@ impl WasmPolicy {
             .first()
         {
             Some(Value::I32(v)) => *v,
-            _ => return Err("on_response i32 결과가 필요합니다".into()),
+            _ => return Err("on_response must return i32".into()),
         };
         match code {
             0 => Ok(ResponseVerdict::Pass),
             2 => Ok(ResponseVerdict::Block),
             3 => Ok(ResponseVerdict::Refuse),
-            other => Err(format!("알 수 없는 응답 verdict 코드: {other}")),
+            other => Err(format!("Unknown response verdict code: {other}")),
         }
     }
 
@@ -459,7 +459,7 @@ impl WasmPolicy {
         let call_i32 = |inst: &mut Instance, name: &str, args: Vec<Value>| -> Result<i32, String> {
             match inst.call_export(name, args)?.first() {
                 Some(Value::I32(v)) => Ok(*v),
-                _ => Err(format!("{name} i32 결과가 필요합니다")),
+                _ => Err(format!("{name} must return i32")),
             }
         };
 

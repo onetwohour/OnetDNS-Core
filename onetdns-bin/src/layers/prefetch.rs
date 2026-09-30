@@ -123,7 +123,7 @@ impl PrefetchLayer {
             }) {
             Ok(handle) => Some(handle),
             Err(error) => {
-                onetdns_core::warn!(event = "cache.prefetch_worker_start_failed", %error, "만료 전 사전 갱신 스레드를 시작하지 못해 해당 기능을 비활성화합니다");
+                onetdns_core::warn!(event = "cache.prefetch_worker_start_failed", %error, "Could not start the prefetch thread; prefetch is disabled");
                 None
             }
         };

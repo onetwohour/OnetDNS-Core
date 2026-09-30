@@ -80,7 +80,7 @@ fn stale_refresh_executor() -> &'static mpsc::SyncSender<StaleRefreshJob> {
                     }
                 })
             {
-                onetdns_core::warn!(event = "cache.stale_refresh_worker_start_failed", %error, index, "만료 응답 갱신 스레드를 시작하지 못해 해당 기능을 일부 비활성화합니다");
+                onetdns_core::warn!(event = "cache.stale_refresh_worker_start_failed", %error, index, "Could not start the stale-answer refresh thread; part of serve-stale is disabled");
                 break;
             }
         }
@@ -103,7 +103,7 @@ fn stale_refresh_not_submitted() {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "cache.stale_refresh_dropped", count = count, "갱신 대기열이 꽉 차 만료 응답을 새로 받아 오지 못했습니다. 유예 기간 동안 낡은 답이 그대로 나갑니다");
+        onetdns_core::warn!(event = "cache.stale_refresh_dropped", count = count, "Refresh queue is full, so a stale answer was not refreshed; the old answer is served until the grace period ends");
     }
 }
 
@@ -352,10 +352,9 @@ impl ServeStaleLayer {
             .retain(|(code, _)| *code != onetdns_proto::EDE_OPTION);
         edns.push_ede(ede_code::STALE_ANSWER, "stale answer");
         response.additionals.retain(|r| r.rtype != RecordType::OPT);
-        response.additionals.push(
-            edns.try_to_record()
-                .expect("기존 EDNS 옵션을 줄이고 고정 EDE를 추가한 레코드는 인코딩 가능"),
-        );
+        response.additionals.push(edns.try_to_record().expect(
+            "A record that trims existing EDNS options and adds a fixed EDE can always be encoded",
+        ));
         response
     }
 

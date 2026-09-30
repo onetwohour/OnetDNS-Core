@@ -46,7 +46,7 @@ impl Handler for NativeServer {
         let features = self.features.load();
         if let Err(error) = postprocess(&features, &mut resp, request, ctx) {
             onetdns_core::error!(event = "dns.response_postprocess_failed", %error,
-                "응답의 EDNS 후처리에 실패해 SERVFAIL로 교체합니다");
+                "EDNS post-processing of the response failed; replacing it with SERVFAIL");
             resp = error_resp(request, ResponseCode::ServFail);
         }
         if let Some((key, request_tsig)) = query_tsig {
@@ -66,7 +66,7 @@ impl Handler for NativeServer {
                     now_unix(),
                     &request_tsig,
                 )
-                .expect("최소 SERVFAIL은 TSIG 서명 전에 항상 인코딩 가능");
+                .expect("A minimal SERVFAIL can always be encoded before TSIG signing");
             }
         }
         if features.events().is_some() {
@@ -314,7 +314,7 @@ impl Handler for NativeServer {
 
             if let Some(recorder) = f.events() {
                 recorder.record_cache(true);
-                onetdns_forward::note_response_source("캐시");
+                onetdns_forward::note_response_source("cache");
                 let timer = onetdns_control::RequestTimer::start();
                 let qname = &request.questions[0].name;
                 self.rec_final_answer(&f, &client, qname, qtype, &resp);
@@ -348,7 +348,7 @@ impl Handler for NativeServer {
                 runtime
                     .recursor
                     .as_ref()
-                    .expect("재귀 리졸버가 있는 세대만 위에서 통과했습니다"),
+                    .expect("Only generations with a recursive resolver passed the check above"),
                 qname,
                 qtype,
                 token,
@@ -398,7 +398,7 @@ impl Handler for NativeServer {
                 st.runtime
                     .recursor
                     .as_ref()
-                    .expect("진행 중인 레인 세대에는 재귀 리졸버가 있습니다"),
+                    .expect("The in-flight lane generation has a recursive resolver"),
                 fds,
                 base,
                 map,
@@ -428,7 +428,7 @@ impl Handler for NativeServer {
                 st.runtime
                     .recursor
                     .as_ref()
-                    .expect("진행 중인 레인 세대에는 재귀 리졸버가 있습니다"),
+                    .expect("The in-flight lane generation has a recursive resolver"),
                 now,
                 &mut comps,
             );
@@ -470,7 +470,7 @@ impl Handler for NativeServer {
             event = "dns.unparsable_query",
             client = %ctx.src.ip(),
             bytes = packet.len(),
-            "질의를 읽지 못해 FORMERR로 답했습니다"
+            "Could not parse the query; answered FORMERR"
         );
         Some(response)
     }
@@ -644,7 +644,7 @@ impl NativeServer {
                     Some(ApRt(scanned.qtype)),
                     ResponseCode::NoError,
                     entry.answers_summary(),
-                    "캐시",
+                    "cache",
                     "",
                     log,
                     stat,

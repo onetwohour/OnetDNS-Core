@@ -46,14 +46,14 @@ impl SplitResolver {
             .iter()
             .map(|suffix| {
                 configured_name_key(suffix)
-                    .ok_or_else(|| format!("재귀 분할 DNS 이름이 올바르지 않습니다: {suffix}"))
+                    .ok_or_else(|| format!("Invalid DNS name for recursive split: {suffix}"))
             })
             .collect::<Result<HashSet<_>, _>>()?;
         let forward_suffixes = forward_suffixes
             .iter()
             .map(|suffix| {
                 configured_name_key(suffix)
-                    .ok_or_else(|| format!("전달 분할 DNS 이름이 올바르지 않습니다: {suffix}"))
+                    .ok_or_else(|| format!("Invalid DNS name for forwarding split: {suffix}"))
             })
             .collect::<Result<HashSet<_>, _>>()?;
         if recurse_suffixes
@@ -62,7 +62,8 @@ impl SplitResolver {
             .is_some()
         {
             return Err(
-                "같은 DNS 이름을 재귀와 전달 분할 경로에 동시에 지정할 수 없습니다".to_string(),
+                "The same DNS name cannot be listed for both recursive and forwarding split"
+                    .to_string(),
             );
         }
         Ok(SplitResolver {

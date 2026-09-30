@@ -343,7 +343,7 @@ fn collect_sources(sorted: &SortedDomains) -> SourceTable {
         }
     }
     if dense_sources.is_empty() {
-        let (value, len) = uniform_source.expect("비어 있지 않은 map에는 source가 있습니다");
+        let (value, len) = uniform_source.expect("A non-empty map has a source");
         SourceTable::Uniform {
             value,
             len: len as u32,
@@ -656,7 +656,7 @@ impl CompactDomainMap {
         assert_eq!(
             root_terms,
             sources.len() as u32,
-            "검증한 압축 필터의 항목 수가 패킹 중 바뀌었습니다"
+            "Validated compact filter item count changed while packing"
         );
         let collapsed = Self::collapse_chains(&states, &edge_labels, &edge_targets, &edge_outputs);
         drop(states);
@@ -723,7 +723,7 @@ impl CompactDomainMap {
             return if self.sources.is_empty() {
                 Ok(())
             } else {
-                Err("빈 오토마톤에 출처 항목이 남아 있습니다")
+                Err("Empty automaton still has source entries")
             };
         }
 
@@ -738,18 +738,16 @@ impl CompactDomainMap {
             let _ = pushed;
             let state = self
                 .state(state_index)
-                .ok_or("오토마톤 순회 상태가 범위를 벗어났습니다")?;
+                .ok_or("Automaton traversal state is out of range")?;
             if !terminal_emitted {
                 stack[frame_index].3 = true;
                 if state.terminal() {
                     let index = rank as usize;
-                    let source = self
-                        .source(index)
-                        .ok_or("오토마톤 순위의 출처가 없습니다")?;
+                    let source = self.source(index).ok_or("Automaton rank has no source")?;
                     forward.clear();
                     forward.extend(reversed.iter().rev().copied());
                     let key = std::str::from_utf8(&forward)
-                        .map_err(|_| "오토마톤이 복원한 도메인이 UTF-8이 아닙니다")?;
+                        .map_err(|_| "Domain rebuilt from the automaton is not UTF-8")?;
                     visitor(index, key, source);
                 }
                 continue;
@@ -758,29 +756,28 @@ impl CompactDomainMap {
             if next_edge < state.edge_count() {
                 let edge = (state.first_edge as usize)
                     .checked_add(next_edge)
-                    .ok_or("오토마톤 순회 엣지 위치를 계산할 수 없습니다")?;
+                    .ok_or("Could not compute automaton edge position")?;
                 stack[frame_index].1 += 1;
                 let label = *self
                     .edge_labels
                     .get(edge)
-                    .ok_or("오토마톤 순회 엣지 이름이 없습니다")?;
+                    .ok_or("Automaton edge has no label")?;
                 let target = *self
                     .edge_targets
                     .get(edge)
-                    .ok_or("오토마톤 순회 엣지 대상이 없습니다")?
-                    as usize;
+                    .ok_or("Automaton edge has no target")? as usize;
                 let child_rank = rank
                     .checked_add(
                         *self
                             .edge_outputs
                             .get(edge)
-                            .ok_or("오토마톤 순회 엣지 출력이 없습니다")?,
+                            .ok_or("Automaton edge has no output")?,
                     )
-                    .ok_or("오토마톤 순회 순위가 넘쳤습니다")?;
+                    .ok_or("Automaton traversal rank overflowed")?;
                 reversed.push(label);
                 let tail = self
                     .edge_tail(edge)
-                    .ok_or("오토마톤 순회 엣지의 이어지는 글자를 읽지 못했습니다")?;
+                    .ok_or("Could not read automaton edge tail bytes")?;
                 reversed.extend_from_slice(tail);
                 stack.push((target, 0, child_rank, false, 1 + tail.len()));
                 continue;
@@ -799,13 +796,13 @@ impl CompactDomainMap {
     pub(crate) fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), &'static str> {
         let encoded_len = self
             .encoded_len()
-            .ok_or("compact map 크기 계산 범위를 넘었습니다")?;
+            .ok_or("Compact map size computation overflowed")?;
         if encoded_len > MAX_ENCODED_MAP_BYTES {
-            return Err("압축 필터 맵의 저장 크기가 허용 한도를 넘었습니다");
+            return Err("Compact filter map is too large");
         }
         output
             .try_reserve(encoded_len)
-            .map_err(|_| "압축 필터 맵을 저장할 메모리를 확보하지 못했습니다")?;
+            .map_err(|_| "Out of memory storing the compact filter map")?;
         self.encode_chunks(&mut |bytes| output.extend_from_slice(bytes))
     }
 
@@ -813,9 +810,9 @@ impl CompactDomainMap {
     pub(crate) fn encode_chunks(&self, output: &mut impl FnMut(&[u8])) -> Result<(), &'static str> {
         let encoded_len = self
             .encoded_len()
-            .ok_or("compact map 크기 계산 범위를 넘었습니다")?;
+            .ok_or("Compact map size computation overflowed")?;
         if encoded_len > MAX_ENCODED_MAP_BYTES {
-            return Err("압축 필터 맵의 저장 크기가 허용 한도를 넘었습니다");
+            return Err("Compact filter map is too large");
         }
         for value in [
             self.state_count(),
@@ -823,8 +820,8 @@ impl CompactDomainMap {
             self.sources.len(),
             self.tail_bytes.len(),
         ] {
-            let value = u32::try_from(value)
-                .map_err(|_| "압축 필터 맵의 길이가 32비트 정수 범위를 넘었습니다")?;
+            let value =
+                u32::try_from(value).map_err(|_| "Compact filter map length exceeds 32 bits")?;
             output(&value.to_le_bytes());
         }
         output(&[self.sources.wire_kind()]);
@@ -861,11 +858,11 @@ impl CompactDomainMap {
             return if source_kind == SOURCE_EMPTY {
                 Ok(Self::default())
             } else {
-                Err("빈 compact map의 source 형식이 올바르지 않습니다")
+                Err("Invalid source format for an empty compact map")
             };
         }
         if states_len == 0 || entries_len == 0 {
-            return Err("압축 도메인 맵의 상태 정보가 불완전합니다");
+            return Err("Compact domain map state is incomplete");
         }
         let source_bytes = source_wire_len(source_kind, entries_len)?;
         let body_len = states_len
@@ -876,23 +873,23 @@ impl CompactDomainMap {
             .and_then(|bytes| bytes.checked_add(edges_len.checked_mul(12)?))
             .and_then(|bytes| bytes.checked_add(tail_len))
             .and_then(|bytes| bytes.checked_add(source_bytes))
-            .ok_or("압축 도메인 맵의 저장 크기를 계산할 수 없습니다")?;
+            .ok_or("Could not compute compact domain map size")?;
         let encoded_len = MAP_HEADER_BYTES
             .checked_add(body_len)
-            .ok_or("압축 도메인 맵의 저장 크기를 계산할 수 없습니다")?;
+            .ok_or("Could not compute compact domain map size")?;
         if encoded_len > MAX_ENCODED_MAP_BYTES || body_len > input.len() {
-            return Err("compact map 직렬화 길이가 올바르지 않습니다");
+            return Err("Invalid compact map serialized length");
         }
 
         let state_edges = read_u32_vec(
             input,
             states_len + 1,
-            "압축 필터 상태를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter states",
         )?
         .into_boxed_slice();
         let mut state_terminal = reserved_vec(
             states_len.div_ceil(64),
-            "압축 필터 종료 상태 표시를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter final-state bits",
         )?;
         for _ in 0..states_len.div_ceil(64) {
             state_terminal.push(read_u64(input)?);
@@ -901,33 +898,33 @@ impl CompactDomainMap {
         let edge_labels = copy_bytes(
             input,
             edges_len,
-            "압축 필터 엣지 이름을 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter edge labels",
         )?;
         let edge_targets = read_u32_vec(
             input,
             edges_len,
-            "압축 필터 엣지 대상을 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter edge targets",
         )?;
         let edge_outputs = read_u32_vec(
             input,
             edges_len,
-            "압축 필터 엣지 결과를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter edge outputs",
         )?;
         let edge_tails = read_u32_vec(
             input,
             edges_len,
-            "압축 필터 엣지의 이어지는 글자 자리를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter edge tail offsets",
         )?;
         let tail_bytes = copy_bytes(
             input,
             tail_len,
-            "압축 필터의 이어지는 글자를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter tail bytes",
         )?;
         let sources = decode_source_table(
             input,
             entries_len,
             source_kind,
-            "압축 필터 원본 정보를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter sources",
         )?;
         let map = Self {
             state_edges,
@@ -1018,7 +1015,7 @@ impl CompactDomainMap {
         if self.edge_labels.len() != self.edge_targets.len()
             || self.edge_labels.len() != self.edge_outputs.len()
         {
-            return Err("compact map 배열 길이 불변식 위반");
+            return Err("Compact map array length invariant violated");
         }
 
         // 엣지 수는 이웃한 두 시작 자리의 차이로 얻는다. 그래서 이 배열이 단조가 아니면
@@ -1026,13 +1023,13 @@ impl CompactDomainMap {
         if self.state_edges.first() != Some(&0)
             || self.state_edges.last().map(|last| *last as usize) != Some(self.edge_labels.len())
         {
-            return Err("압축 필터 상태의 엣지 시작 자리가 처음과 끝에서 어긋났습니다");
+            return Err("Compact filter edge start offsets do not match at the ends");
         }
         if self.state_edges.windows(2).any(|pair| pair[0] > pair[1]) {
-            return Err("압축 필터 상태의 엣지 시작 자리가 커지는 순서가 아닙니다");
+            return Err("Compact filter edge start offsets are not increasing");
         }
         if self.state_terminal.len() != self.state_count().div_ceil(64) {
-            return Err("압축 필터 종료 상태 표시의 길이가 상태 수와 맞지 않습니다");
+            return Err("Compact filter final-state bit length does not match the state count");
         }
         // 남는 비트를 0 으로 못 박지 않으면 같은 집합이 서로 다른 바이트로 인코딩된다.
         let spare = self.state_terminal.len() * 64 - self.state_count();
@@ -1042,15 +1039,15 @@ impl CompactDomainMap {
                 .last()
                 .is_some_and(|word| word >> (64 - spare) != 0)
         {
-            return Err("압축 필터 종료 상태 표시에 쓰이지 않는 비트가 남아 있습니다");
+            return Err("Compact filter final-state bits have unused bits set");
         }
 
         if self.edge_tails.len() != self.edge_labels.len() {
-            return Err("압축 필터 엣지의 이어지는 글자 배열 길이가 맞지 않습니다");
+            return Err("Compact filter edge tail array length does not match");
         }
         // 0번 자리는 "이어지는 글자 없음" 표시이므로 글자로 읽히면 안 된다.
         if self.tail_bytes.len() == 1 && self.edge_tails.iter().any(|at| *at != 0) {
-            return Err("압축 필터에 이어지는 글자가 없는데 가리키는 엣지가 있습니다");
+            return Err("Compact filter edge points to tail bytes that do not exist");
         }
         for at in self.edge_tails.iter() {
             let at = *at as usize;
@@ -1058,10 +1055,10 @@ impl CompactDomainMap {
                 continue;
             }
             let Some(length) = self.tail_bytes.get(at).map(|value| *value as usize) else {
-                return Err("압축 필터 엣지가 없는 글자 묶음을 가리킵니다");
+                return Err("Compact filter edge points to a missing tail");
             };
             if length == 0 || at + 1 + length > self.tail_bytes.len() {
-                return Err("압축 필터 글자 묶음의 길이가 올바르지 않습니다");
+                return Err("Invalid compact filter tail length");
             }
         }
 
@@ -1071,35 +1068,35 @@ impl CompactDomainMap {
             let count = state.edge_count();
             let end = first
                 .checked_add(count)
-                .ok_or("압축 필터 상태의 엣지 범위를 계산하는 중 값이 허용 범위를 넘었습니다")?;
+                .ok_or("Compact filter edge range overflowed")?;
             if first != edge_cursor || end > self.edge_labels.len() || count > 256 {
-                return Err("압축 필터 상태의 엣지 범위가 올바르지 않습니다");
+                return Err("Invalid compact filter edge range");
             }
             let labels = &self.edge_labels[first..end];
             if labels.windows(2).any(|pair| pair[0] >= pair[1]) {
-                return Err("압축 필터 상태의 엣지 이름이 정렬되어 있지 않습니다");
+                return Err("Compact filter edge labels are not sorted");
             }
             if self.edge_targets[first..end]
                 .iter()
                 .any(|target| *target as usize >= self.state_count())
             {
-                return Err("압축 필터 상태의 엣지 대상 위치가 올바르지 않습니다");
+                return Err("Invalid compact filter edge target");
             }
             edge_cursor = end;
         }
         if edge_cursor != self.edge_labels.len() {
-            return Err("압축 필터 상태에 참조되지 않는 엣지 데이터가 남아 있습니다");
+            return Err("Compact filter has unreferenced edge data");
         }
 
         const VISITING: u32 = NONE - 1;
         let mut calculated = filled_vec(
             self.state_count(),
             NONE,
-            "압축 필터 그래프의 개수를 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing compact filter graph counts",
         )?;
         let mut stack = reserved_vec(
             self.state_count().min(256),
-            "압축 필터 그래프의 탐색 스택을 저장할 메모리를 확보하지 못했습니다",
+            "Out of memory storing the compact filter traversal stack",
         )?;
         calculated[0] = VISITING;
         stack.push((0usize, 0usize));
@@ -1115,12 +1112,12 @@ impl CompactDomainMap {
                         calculated[target] = VISITING;
                         if stack.len() == stack.capacity() {
                             stack.try_reserve(1).map_err(|_| {
-                                "압축 필터 그래프의 탐색 스택을 저장할 메모리를 확보하지 못했습니다"
+                                "Out of memory storing the compact filter traversal stack"
                             })?;
                         }
                         stack.push((target, 0));
                     }
-                    VISITING => return Err("compact automaton 순환 감지"),
+                    VISITING => return Err("Compact automaton has a cycle"),
                     _ => {}
                 }
                 continue;
@@ -1129,17 +1126,17 @@ impl CompactDomainMap {
             for target in &self.edge_targets[first..first + count] {
                 terms = terms
                     .checked_add(u64::from(calculated[*target as usize]))
-                    .ok_or("compact subtree term 계산 범위를 넘었습니다")?;
+                    .ok_or("Compact subtree term count overflowed")?;
             }
             let terms = u32::try_from(terms)
-                .map_err(|_| "압축 필터 하위 트리의 끝 항목 수가 허용 한도를 넘었습니다")?;
+                .map_err(|_| "Compact filter subtree has too many terminal entries")?;
             calculated[*state_index] = terms;
             stack.pop();
         }
         if calculated.iter().any(|count| *count >= VISITING)
             || calculated[0] as usize != self.sources.len()
         {
-            return Err("압축 오토마톤의 도달 가능 상태 수와 종료 상태 수가 일치하지 않습니다");
+            return Err("Compact automaton reachable and final state counts do not match");
         }
 
         for state in self.iter_states() {
@@ -1148,11 +1145,11 @@ impl CompactDomainMap {
             let mut expected = u32::from(state.terminal());
             for edge in first..end {
                 if self.edge_outputs[edge] != expected {
-                    return Err("압축 엣지의 출력 순위가 일치하지 않습니다");
+                    return Err("Compact edge output rank does not match");
                 }
                 expected = expected
                     .checked_add(calculated[self.edge_targets[edge] as usize])
-                    .ok_or("compact edge output 계산 범위를 넘었습니다")?;
+                    .ok_or("Compact edge output computation overflowed")?;
             }
         }
         let mut expected_index = 0usize;
@@ -1166,7 +1163,7 @@ impl CompactDomainMap {
             expected_index += 1;
         })?;
         if !ranks_match || expected_index != self.len() {
-            return Err("압축 도메인과 오토마톤의 순위가 일치하지 않습니다");
+            return Err("Compact domain and automaton ranks do not match");
         }
         Ok(())
     }
@@ -1237,7 +1234,7 @@ fn read_u8(input: &mut &[u8]) -> Result<u8, &'static str> {
 
 /** @brief 정해진 길이만큼 가져온다. */
 fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], &'static str> {
-    let bytes = input.get(..len).ok_or("compact map 데이터 절단")?;
+    let bytes = input.get(..len).ok_or("Compact map data is truncated")?;
     *input = &input[len..];
     Ok(bytes)
 }
@@ -1292,7 +1289,7 @@ fn decode_source_table(
         SOURCE_U8 => {
             let values = copy_bytes(input, len, error)?;
             if values.windows(2).all(|pair| pair[0] == pair[1]) {
-                return Err("source 배열이 최소 폭 uniform 형식이 아닙니다");
+                return Err("Source array is not in minimal-width uniform form");
             }
             Ok(SourceTable::U8(values.into_boxed_slice()))
         }
@@ -1310,7 +1307,7 @@ fn decode_source_table(
                 values.push(value);
             }
             if uniform || !needs_u16 {
-                return Err("source 배열이 최소 폭 u16 형식이 아닙니다");
+                return Err("Source array is not in minimal-width u16 form");
             }
             Ok(SourceTable::U16(values.into_boxed_slice()))
         }
@@ -1322,11 +1319,11 @@ fn decode_source_table(
                 .iter()
                 .any(|value| *value != u32::MAX && *value >= u16::MAX as u32);
             if uniform || !needs_u32 {
-                return Err("source 배열이 최소 폭 u32 형식이 아닙니다");
+                return Err("Source array is not in minimal-width u32 form");
             }
             Ok(SourceTable::Dense(values.into_boxed_slice()))
         }
-        _ => Err("compact map source 형식 태그가 올바르지 않습니다"),
+        _ => Err("Invalid compact map source format tag"),
     }
 }
 
@@ -1336,7 +1333,7 @@ fn source_wire_len(kind: u8, len: usize) -> Result<usize, &'static str> {
         return if kind == SOURCE_EMPTY {
             Ok(0)
         } else {
-            Err("빈 source 배열의 형식 태그가 올바르지 않습니다")
+            Err("Invalid format tag for an empty source array")
         };
     }
     match kind {
@@ -1344,11 +1341,11 @@ fn source_wire_len(kind: u8, len: usize) -> Result<usize, &'static str> {
         SOURCE_U8 => Ok(len),
         SOURCE_U16 => len
             .checked_mul(size_of::<u16>())
-            .ok_or("압축 필터 u16 source 길이를 계산할 수 없습니다"),
+            .ok_or("Could not compute compact filter u16 source length"),
         SOURCE_U32 => len
             .checked_mul(size_of::<u32>())
-            .ok_or("압축 필터 u32 source 길이를 계산할 수 없습니다"),
-        _ => Err("compact map source 형식 태그가 올바르지 않습니다"),
+            .ok_or("Could not compute compact filter u32 source length"),
+        _ => Err("Invalid compact map source format tag"),
     }
 }
 
@@ -1627,14 +1624,14 @@ impl DawgBuilder {
     fn state(&self, id: u32) -> &BuildState {
         self.states[id as usize]
             .as_ref()
-            .expect("압축 필터의 활성 상태가 존재해야 합니다")
+            .expect("Active compact filter state must exist")
     }
 
     /** @brief 상태를 바꿀 수 있게 빌린다. */
     fn state_mut(&mut self, id: u32) -> &mut BuildState {
         self.states[id as usize]
             .as_mut()
-            .expect("압축 필터의 활성 상태가 존재해야 합니다")
+            .expect("Active compact filter state must exist")
     }
 
     /** @brief 두 상태가 같은 언어를 나타내는지. 엣지와 종단 여부를 모두 본다. */

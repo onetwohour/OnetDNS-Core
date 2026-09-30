@@ -287,7 +287,7 @@ fn read_char_string(r: &mut Reader) -> Result<Vec<u8>, ProtoError> {
 /** @brief character-string을 쓴다. 255옥텟을 넘으면 자르지 않고 인코딩을 실패시킨다. */
 fn write_char_string(w: &mut Writer, s: &[u8]) {
     let Ok(n) = u8::try_from(s.len()) else {
-        w.fail("DNS 문자 문자열이 255바이트를 넘었습니다");
+        w.fail("DNS character string exceeds 255 bytes");
         return;
     };
     w.push_u8(n);
@@ -320,12 +320,12 @@ fn is_unsupported_name_bearing(rtype: RecordType) -> bool {
 fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<(), ProtoError> {
     if params.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(ProtoError::Message(
-            "SVCB parameter key가 엄격한 오름차순이 아닙니다".into(),
+            "SVCB parameter keys are not strictly increasing".into(),
         ));
     }
     if params.last().is_some_and(|(key, _)| *key == u16::MAX) {
         return Err(ProtoError::Message(
-            "SVCB 매개변수 키 65535는 사용할 수 없습니다".into(),
+            "SVCB parameter key 65535 is reserved".into(),
         ));
     }
 
@@ -339,7 +339,7 @@ fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<()
             0 => {
                 if value.is_empty() || value.len() % 2 != 0 {
                     return Err(ProtoError::Message(
-                        "SVCB mandatory 값은 비어 있지 않은 u16 key 목록이어야 함".into(),
+                        "SVCB mandatory value must be a non-empty list of u16 keys".into(),
                     ));
                 }
                 let mut previous = None;
@@ -350,7 +350,7 @@ fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<()
                         || !has(listed)
                     {
                         return Err(ProtoError::Message(
-                            "SVCB mandatory key 목록이 자기일관적이지 않음".into(),
+                            "SVCB mandatory key list is not self-consistent".into(),
                         ));
                     }
                     previous = Some(listed);
@@ -363,35 +363,30 @@ fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<()
                     position += 1;
                     if len == 0 || position.saturating_add(len) > value.len() {
                         return Err(ProtoError::Message(
-                            "SVCB alpn 값의 길이 표기가 올바르지 않습니다".into(),
+                            "Invalid length prefix in SVCB alpn value".into(),
                         ));
                     }
                     position += len;
                 }
                 if position == 0 {
-                    return Err(ProtoError::Message("SVCB alpn 값이 비어 있습니다".into()));
+                    return Err(ProtoError::Message("SVCB alpn value is empty".into()));
                 }
             }
             2 if !value.is_empty() || !has(1) => {
                 return Err(ProtoError::Message(
-                    "SVCB no-default-alpn 값은 비어 있어야 하며 alpn 항목이 함께 있어야 합니다"
-                        .into(),
+                    "SVCB no-default-alpn must be empty and requires alpn".into(),
                 ));
             }
             3 if value.len() != 2 => {
                 return Err(ProtoError::Message(
-                    "SVCB port 값은 정확히 2바이트여야 함".into(),
+                    "SVCB port value must be exactly 2 bytes".into(),
                 ));
             }
             4 if value.is_empty() || value.len() % 4 != 0 => {
-                return Err(ProtoError::Message(
-                    "SVCB ipv4hint 값의 길이가 올바르지 않습니다".into(),
-                ));
+                return Err(ProtoError::Message("Invalid SVCB ipv4hint length".into()));
             }
             6 if value.is_empty() || value.len() % 16 != 0 => {
-                return Err(ProtoError::Message(
-                    "SVCB ipv6hint 값의 길이가 올바르지 않습니다".into(),
-                ));
+                return Err(ProtoError::Message("Invalid SVCB ipv6hint length".into()));
             }
             _ => {}
         }
@@ -582,7 +577,7 @@ impl RData {
             }
             other if is_unsupported_name_bearing(other) => {
                 return Err(ProtoError::Message(format!(
-                    "압축 이름을 포함할 수 있는 지원하지 않는 RDATA 유형 {}",
+                    "Unsupported RDATA type {} that may contain compressed names",
                     other.0
                 )))
             }
@@ -614,7 +609,7 @@ impl RData {
             RData::Txt(chunks) => {
                 for c in chunks {
                     let Ok(len) = u8::try_from(c.len()) else {
-                        w.fail("TXT 문자열 조각이 255바이트를 넘었습니다");
+                        w.fail("TXT string exceeds 255 bytes");
                         return;
                     };
                     w.push_u8(len);
@@ -644,7 +639,7 @@ impl RData {
             RData::Caa { flags, tag, value } => {
                 w.push_u8(*flags);
                 let Ok(tag_len) = u8::try_from(tag.len()) else {
-                    w.fail("CAA 태그가 255바이트를 넘었습니다");
+                    w.fail("CAA tag exceeds 255 bytes");
                     return;
                 };
                 w.push_u8(tag_len);
@@ -707,7 +702,7 @@ impl RData {
                 for (key, val) in params {
                     w.push_u16(*key);
                     let Ok(len) = u16::try_from(val.len()) else {
-                        w.fail("SVCB 매개변수가 65,535바이트를 넘었습니다");
+                        w.fail("SVCB parameter exceeds 65,535 bytes");
                         return;
                     };
                     w.push_u16(len);
@@ -808,7 +803,7 @@ impl Record {
         r.limit = previous_limit;
         let rdata = parsed?;
         if r.pos != end {
-            return Err(ProtoError::Name("RDATA 길이가 일치하지 않습니다".into()));
+            return Err(ProtoError::Name("RDATA length does not match".into()));
         }
         Ok(Record {
             name,
@@ -943,7 +938,7 @@ mod typed_rdata_tests {
         assert_eq!(
             std::mem::size_of::<RData>(),
             48,
-            "RData가 커졌습니다. 새 변형을 인라인으로 넣었는지 확인하고 드문 대형 변형은 Box로 감싸십시오"
+            "RData grew. Check that a new variant was added inline, and Box rare large variants"
         );
         assert_eq!(std::mem::size_of::<Record>(), 72);
         assert_eq!(std::mem::size_of::<(u16, Box<[u8]>)>(), 24);
@@ -1019,10 +1014,10 @@ mod typed_rdata_tests {
             let wire = [0, high, low, 0, 1, 0, 0, 0, 0, 0, 2, 0xc0, 0x00];
             let mut reader = Reader::new(&wire);
             let Err(error) = Record::parse(&mut reader) else {
-                panic!("type {rtype}는 거절되어야 합니다. 압축 이름이 든 RDATA를 원시                         바이트로 다시 쓰면 응답이 손상됩니다");
+                panic!("type {rtype} must be rejected. Rewriting RDATA that contains compressed names as raw bytes corrupts the response");
             };
             assert!(
-                error.to_string().contains("지원하지 않는 RDATA 유형"),
+                error.to_string().contains("Unsupported RDATA type"),
                 "type {rtype}: {error}"
             );
         }
@@ -1129,12 +1124,12 @@ mod typed_rdata_tests {
             apex.encode(&mut writer);
             let start = writer.buf.len();
             rdata.encode(&mut writer);
-            assert!(writer.error().is_none(), "{label} 인코딩 실패");
+            assert!(writer.error().is_none(), "Encoding {label} failed");
             let body = &writer.buf[start..];
             assert_eq!(
                 name_is_compressed(body, name_at),
                 compressible,
-                "{label} 의 압축 여부가 규격과 다릅니다: {body:02x?}"
+                "{label} compression does not match the spec: {body:02x?}"
             );
         }
     }
@@ -1155,7 +1150,7 @@ mod typed_rdata_tests {
         let mut writer = Writer::new();
         record.encode(&mut writer);
         assert!(writer.error().is_none());
-        assert_eq!(writer.buf[25], 3, "TargetName 첫 label은 포인터가 아닙니다");
+        assert_eq!(writer.buf[25], 3, "First TargetName label is not a pointer");
         assert_eq!(&writer.buf[25..], b"\x03svc\x07example\x00");
     }
 
@@ -1217,11 +1212,11 @@ mod ttl_normalization_tests {
         ];
         normalize_ttls(&mut records);
         assert_eq!(records[0].ttl, 0);
-        assert_eq!(records[1].ttl, 300, "상한 아래는 그대로 둔다");
+        assert_eq!(records[1].ttl, 300, "Values below the cap are unchanged");
 
         let mut edge = vec![a("z.example.com", MAX_TTL, 3)];
         normalize_ttls(&mut edge);
-        assert_eq!(edge[0].ttl, MAX_TTL, "상한 자신은 정상 값이다");
+        assert_eq!(edge[0].ttl, MAX_TTL, "The cap itself is a valid value");
     }
 
     #[test]
@@ -1235,7 +1230,7 @@ mod ttl_normalization_tests {
         normalize_ttls(&mut records);
         assert_eq!(records[0].ttl, 100);
         assert_eq!(records[1].ttl, 100);
-        assert_eq!(records[2].ttl, 700, "다른 이름은 묶이지 않는다");
+        assert_eq!(records[2].ttl, 700, "Other names are not grouped");
     }
 
     #[test]
@@ -1291,8 +1286,14 @@ mod ttl_normalization_tests {
         };
         let mut records = vec![sig(1, 900), sig(28, 100), sig(1, 500)];
         normalize_ttls(&mut records);
-        assert_eq!(records[0].ttl, 500, "A를 덮는 서명끼리만 묶인다");
-        assert_eq!(records[1].ttl, 100, "AAAA를 덮는 서명은 그대로");
+        assert_eq!(
+            records[0].ttl, 500,
+            "Only signatures covering A are grouped"
+        );
+        assert_eq!(
+            records[1].ttl, 100,
+            "Signatures covering AAAA are unchanged"
+        );
         assert_eq!(records[2].ttl, 500);
     }
 }

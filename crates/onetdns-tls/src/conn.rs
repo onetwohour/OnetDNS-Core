@@ -785,7 +785,7 @@ impl<S: Read + Write> Write for TlsStream<S> {
         }
         self.conn
             .write_app(&mut self.inner, data)
-            .map_err(|_| std::io::Error::other("TLS 데이터를 쓰지 못했습니다"))?;
+            .map_err(|_| std::io::Error::other("Could not write TLS data"))?;
         Ok(data.len())
     }
     /** @brief 밑에 깔린 소켓을 비운다. */
@@ -1538,7 +1538,7 @@ fn build_client_hello(
     extensions.push(Extension::psk_key_exchange_modes(&[PSK_DHE_KE]));
 
     if let Some(session) = session {
-        let (hash, _) = suite_params(session.suite).expect("검증된 TLS 1.3 세션 suite");
+        let (hash, _) = suite_params(session.suite).expect("Validated TLS 1.3 session suite");
         extensions.push(Extension::pre_shared_key_client(
             &session.ticket,
             session.obfuscated_age(crate::session::now_ms()),

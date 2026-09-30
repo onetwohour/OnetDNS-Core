@@ -95,7 +95,7 @@ impl QuicMemoryBudget {
                 used.checked_sub(bytes)
             })
             .is_ok();
-        debug_assert!(released, "QUIC 메모리 charge가 음수가 되면 안 됩니다");
+        debug_assert!(released, "QUIC memory charge must never go negative");
     }
 
     /** @brief 지금 빌려준 바이트. 진단과 테스트에 쓴다. */

@@ -35,7 +35,7 @@ fn load_or_create_dnscrypt_provider(
     valid_secs: u32,
 ) -> Result<onetdns_dnscrypt::Provider, String> {
     let path = dnscrypt_provider_key_path(config_path).ok_or_else(|| {
-        "DNSCrypt 제공자 키를 저장할 설정 파일 경로가 없습니다. 다시 시작할 때 공개 키가 바뀌는 것을 막기 위해 DNSCrypt를 시작하지 않습니다".to_string()
+        "There is no configuration file path to store the DNSCrypt provider key, so DNSCrypt is not started; this keeps the public key from changing on restart".to_string()
     })?;
     match read_text_limited(&path, 4096) {
         Ok(text) => {
@@ -51,14 +51,14 @@ fn load_or_create_dnscrypt_provider(
                 ));
             }
             return Err(format!(
-                "DNSCrypt provider 키 파일이 손상되었습니다({}); 기존 공개키 신뢰를 보존하기 위해 자동 교체하지 않습니다",
+                "DNSCrypt provider key file is corrupted ({}); it is not replaced automatically so that clients that trust the current public key keep working",
                 path.display()
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "DNSCrypt 공급자 키 파일을 읽지 못했습니다({}): {error}",
+                "Could not read the DNSCrypt provider key file ({}): {error}",
                 path.display()
             ));
         }
@@ -74,7 +74,7 @@ fn load_or_create_dnscrypt_provider(
     }
     atomic_write_secret(&path, hex.as_bytes()).map_err(|error| {
         format!(
-            "DNSCrypt 공급자 키를 파일에 저장하지 못했습니다({}): {error}. 재시작 후 같은 공개 키를 유지할 수 없어 DNSCrypt를 시작하지 않습니다",
+            "Could not save the DNSCrypt provider key to a file ({}): {error}. DNSCrypt is not started because the public key could not be kept across restarts",
             path.display()
         )
     })?;
@@ -120,7 +120,7 @@ fn live_tls_files(cfg: &Config, certs: Vec<Vec<u8>>) -> Result<LiveTlsFiles, Str
         Some(path) => Some(
             read_bytes_limited(path, LOCAL_CA_MAX_BYTES).map_err(|error| {
                 format!(
-                    "mTLS CA 파일을 읽지 못했습니다({}): {error}",
+                    "Could not read the mTLS CA file ({}): {error}",
                     path.display()
                 )
             })?,
@@ -311,21 +311,21 @@ fn plain_listener_key(cfg: &Config, addr: &SocketAddr, workers: usize, acceptors
  * @return 운영자에게 보일 문장.
  */
 fn listener_open_error(role: &str, addr: SocketAddr, error: &std::io::Error) -> String {
-    let mut text = format!("{role} 수신 주소를 열지 못했습니다: {addr}: {error}");
+    let mut text = format!("Could not open the {role} listening address: {addr}: {error}");
     if error.kind() != std::io::ErrorKind::AddrInUse {
         return text;
     }
     let port = addr.port();
-    text.push_str(&format!(". {port}번을 다른 프로세스가 잡고 있습니다."));
+    text.push_str(&format!(". Another process is using port {port}."));
     if cfg!(windows) {
         text.push_str(&format!(
-            " 확인: netstat -ano | findstr :{port}, tasklist /svc /FI \"PID eq <번호>\"."
+            " Check with: netstat -ano | findstr :{port}, tasklist /svc /FI \"PID eq <PID>\"."
         ));
     } else {
-        text.push_str(&format!(" 확인: ss -lnup sport = :{port}."));
+        text.push_str(&format!(" Check with: ss -lnup sport = :{port}."));
     }
     if addr.ip().is_unspecified() {
-        text.push_str(" 와일드카드는 구체 주소가 모두 비어 있어도 막힙니다.");
+        text.push_str(" A wildcard address is blocked even when every specific address is free.");
     }
     text
 }
@@ -416,8 +416,8 @@ pub(crate) fn reconcile_listeners(
                 ..Default::default()
             },
         )
-        .map_err(|error| listener_open_error("일반 DNS", *addr, &error))?;
-        onetdns_core::info!(event = "do53.started", %addr, udp_workers, tcp_acceptors, udp = cfg.do_udp, tcp = cfg.do_tcp, backend = ?cfg.backend, "일반 DNS를 받습니다");
+        .map_err(|error| listener_open_error("Plain DNS", *addr, &error))?;
+        onetdns_core::info!(event = "do53.started", %addr, udp_workers, tcp_acceptors, udp = cfg.do_udp, tcp = cfg.do_tcp, backend = ?cfg.backend, "Listening for plain DNS");
         if let Some(bound) = server.udp_addr() {
             registry
                 .lock_recover()
@@ -459,7 +459,7 @@ fn reconcile_encrypted(
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
 ) -> Result<(), String> {
     /** @brief 인증서 슬롯이 없으면 암호화 수신 주소를 열 수 없다. */
-    const NEED_TLS: &str = "암호화 DNS를 사용하려면 질의를 업스트림 서버로 전달하거나 직접 재귀 조회하도록 설정하고, ECDSA P-256 인증서와 개인 키를 지정해야 합니다";
+    const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
 
     /* DoH 경로는 리스너가 열 때 고정한다. 같은 주소는 이전 리스너를 먼저 내려야 다시 열 수 있다. */
     macro_rules! sync_one {
@@ -492,7 +492,7 @@ fn reconcile_encrypted(
                     event = "listener.started",
                     transport = $kind,
                     bound = %listener.addr(),
-                    "암호화 DNS 수신 주소를 열었습니다"
+                    "Opened encrypted DNS listener"
                 );
                 registry
                     .lock_recover()
@@ -652,7 +652,7 @@ pub(crate) fn reconcile_dnscrypt(
     onetdns_core::info!(event = "dnscrypt.provider_key_loaded",
         provider = %cfg.dnscrypt_provider_name,
         provider_pubkey = %pubkey,
-        "DNSCrypt 공급자 키를 불러왔습니다. 클라이언트는 이 공개 키를 신뢰해야 합니다"
+        "Loaded DNSCrypt provider key; clients must trust this public key"
     );
 
     let mut fresh = Vec::new();
@@ -696,11 +696,11 @@ pub(crate) fn reconcile_dnscrypt(
                     provider.reissue_cert(DNSCRYPT_CERT_VALID_SECS);
                     onetdns_core::info!(
                         event = "dnscrypt.cert_rotated",
-                        "DNSCrypt 리졸버 인증서를 만료 전에 갱신했습니다"
+                        "Renewed the DNSCrypt resolver certificate before it expired"
                     );
                 })
                 .map_err(|error| {
-                    format!("DNSCrypt 인증서 갱신 작업을 시작하지 못했습니다: {error}")
+                    format!("Could not start the DNSCrypt certificate renewal task: {error}")
                 })?;
             track_service_thread(tracker, thread);
         }
@@ -723,12 +723,12 @@ pub(crate) fn reconcile_dnscrypt(
             .name(format!("dnscrypt-{bound}"))
             .spawn(move || {
                 if let Err(error) = dnscrypt::serve(handler, socket, provider, listener_stop) {
-                    onetdns_core::error!(event = "dnscrypt.stopped", %error, "DNSCrypt 수신을 중지했습니다");
+                    onetdns_core::error!(event = "dnscrypt.stopped", %error, "Stopped DNSCrypt listener");
                 }
             })
-            .map_err(|error| format!("DNSCrypt 수신 스레드를 시작하지 못했습니다: {bound}: {error}"))?;
+            .map_err(|error| format!("Could not start the DNSCrypt listener thread: {bound}: {error}"))?;
         track_service_thread(tracker, thread);
-        onetdns_core::info!(event = "dnscrypt.started", %addr, "DNSCrypt로 질의를 받습니다 (UDP·TCP)");
+        onetdns_core::info!(event = "dnscrypt.started", %addr, "Accepting DNSCrypt queries (UDP and TCP)");
         fresh.push((key.clone(), stop, tcp));
     }
     live.retain(|(key, stop, _)| {
@@ -767,7 +767,7 @@ mod tests {
             "찾는 명령에 포트가 들어가야 합니다: {wildcard}"
         );
         assert!(
-            wildcard.contains("와일드카드"),
+            wildcard.contains("wildcard"),
             "와일드카드에는 우회 방법을 알려야 합니다: {wildcard}"
         );
 
@@ -777,7 +777,7 @@ mod tests {
             "찾는 명령에 포트가 들어가야 합니다: {specific}"
         );
         assert!(
-            !specific.contains("와일드카드"),
+            !specific.contains("wildcard"),
             "이미 구체 주소인데 우회하라고 하면 안 됩니다: {specific}"
         );
 

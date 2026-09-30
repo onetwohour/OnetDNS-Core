@@ -120,7 +120,10 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
      */
     pub fn new(cap: usize) -> Self {
         let cap = cap.max(1);
-        assert!(cap < NIL as usize, "LRU 용량은 u32::MAX보다 작아야 합니다");
+        assert!(
+            cap < NIL as usize,
+            "LRU capacity must be less than u32::MAX"
+        );
         let reserve = cap.min(INITIAL_RESERVE);
         Self {
             cap,
@@ -226,14 +229,14 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
     fn node(&self, idx: NodeIndex) -> &Node<K, V> {
         self.nodes[idx as usize]
             .as_ref()
-            .expect("LRU 목록의 활성 노드가 존재해야 합니다")
+            .expect("Active LRU list node must exist")
     }
 
     /** @brief 노드의 이전 링크를 교체한다. */
     fn set_prev(&mut self, idx: NodeIndex, prev: NodeIndex) {
         self.nodes[idx as usize]
             .as_mut()
-            .expect("LRU 목록의 활성 노드가 존재해야 합니다")
+            .expect("Active LRU list node must exist")
             .prev = prev;
     }
 
@@ -241,7 +244,7 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
     fn set_next(&mut self, idx: NodeIndex, next: NodeIndex) {
         self.nodes[idx as usize]
             .as_mut()
-            .expect("LRU 목록의 활성 노드가 존재해야 합니다")
+            .expect("Active LRU list node must exist")
             .next = next;
     }
 
@@ -321,7 +324,7 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
         if let Some(idx) = self.find_index_with_hash(hash, &key) {
             self.nodes[idx as usize]
                 .as_mut()
-                .expect("LRU 목록의 활성 노드가 존재해야 합니다")
+                .expect("Active LRU list node must exist")
                 .val = val;
             self.move_front(idx);
             return;
@@ -349,7 +352,7 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
             i
         } else {
             let index = NodeIndex::try_from(self.nodes.len())
-                .expect("LRU 노드 인덱스는 생성 시 검증한 u32 범위여야 합니다");
+                .expect("LRU node index must fit the u32 range checked at construction");
             self.nodes.push(Some(node));
             index
         };
@@ -388,10 +391,7 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
      */
     fn remove_index(&mut self, index: NodeIndex, hash: Digest) -> Node<K, V> {
         let hash_next = self.node(index).hash_next;
-        let head = *self
-            .map
-            .get(&hash)
-            .expect("LRU 해시 체인의 머리가 존재해야 합니다");
+        let head = *self.map.get(&hash).expect("LRU hash chain head must exist");
         if head == index {
             if hash_next == NIL {
                 self.map.remove(&hash);
@@ -402,11 +402,11 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
             let mut previous = head;
             loop {
                 let next = self.node(previous).hash_next;
-                assert!(next != NIL, "LRU 해시 충돌 체인이 끊어졌습니다");
+                assert!(next != NIL, "LRU hash collision chain is broken");
                 if next == index {
                     self.nodes[previous as usize]
                         .as_mut()
-                        .expect("LRU 해시 체인의 활성 노드가 존재해야 합니다")
+                        .expect("Active LRU hash chain node must exist")
                         .hash_next = hash_next;
                     break;
                 }
@@ -418,7 +418,7 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
         self.free.push(index);
         self.nodes[index as usize]
             .take()
-            .expect("제거할 LRU 노드가 존재해야 합니다")
+            .expect("LRU node to remove must exist")
     }
 
     /** @brief 가장 오래된 항목을 버린다. */
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "LRU 용량은 u32::MAX보다 작아야 합니다")]
+    #[should_panic(expected = "LRU capacity must be less than u32::MAX")]
     /** @brief 인덱스할 수 없는 크기를 거부하는지. */
     fn rejects_capacity_that_cannot_be_indexed() {
         let _ = LruMap::<u8, u8>::new(u32::MAX as usize);

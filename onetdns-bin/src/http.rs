@@ -101,12 +101,12 @@ impl std::fmt::Display for HttpError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HttpError::Url(s) => write!(f, "잘못된 URL: {s}"),
-            HttpError::Connect(s) => write!(f, "연결하지 못했습니다: {s}"),
-            HttpError::Tls(s) => write!(f, "TLS 오류: {s}"),
-            HttpError::Io(s) => write!(f, "IO 오류: {s}"),
-            HttpError::Protocol(s) => write!(f, "HTTP 프로토콜 오류: {s}"),
-            HttpError::TooManyRedirects => write!(f, "HTTP 주소 이동을 너무 많이 따라갔습니다"),
+            HttpError::Url(s) => write!(f, "Invalid URL: {s}"),
+            HttpError::Connect(s) => write!(f, "Could not connect: {s}"),
+            HttpError::Tls(s) => write!(f, "TLS error: {s}"),
+            HttpError::Io(s) => write!(f, "I/O error: {s}"),
+            HttpError::Protocol(s) => write!(f, "HTTP protocol error: {s}"),
+            HttpError::TooManyRedirects => write!(f, "Followed too many HTTP redirects"),
         }
     }
 }
@@ -144,14 +144,16 @@ fn parse_url(s: &str) -> Result<Url, HttpError> {
         || s.chars()
             .any(|ch| ch.is_ascii_whitespace() || ch.is_control())
     {
-        return Err(HttpError::Url("공백·제어 문자가 포함된 URL".to_string()));
+        return Err(HttpError::Url(
+            "URL contains spaces or control characters".to_string(),
+        ));
     }
     let (scheme, rest) = if let Some(r) = s.strip_prefix("http://") {
         (Scheme::Http, r)
     } else if let Some(r) = s.strip_prefix("https://") {
         (Scheme::Https, r)
     } else {
-        return Err(HttpError::Url(format!("스킴 없습니다: {s}")));
+        return Err(HttpError::Url(format!("URL has no scheme: {s}")));
     };
 
     let split = rest
@@ -163,7 +165,7 @@ fn parse_url(s: &str) -> Result<Url, HttpError> {
         None => (rest, ""),
     };
     if authority.is_empty() || authority.contains('@') {
-        return Err(HttpError::Url(format!("잘못된 authority: {s}")));
+        return Err(HttpError::Url(format!("Invalid authority: {s}")));
     }
     let path_without_fragment = suffix.split('#').next().unwrap_or("");
     let path = if path_without_fragment.is_empty() {
@@ -180,38 +182,38 @@ fn parse_url(s: &str) -> Result<Url, HttpError> {
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let close = bracketed
             .find(']')
-            .ok_or_else(|| HttpError::Url(format!("IPv6 대괄호 오류: {authority}")))?;
+            .ok_or_else(|| HttpError::Url(format!("Malformed IPv6 brackets: {authority}")))?;
         let host = &bracketed[..close];
         let tail = &bracketed[close + 1..];
         let port = if tail.is_empty() {
             default_port
         } else {
             tail.strip_prefix(':')
-                .ok_or_else(|| HttpError::Url(format!("잘못된 IPv6 authority: {authority}")))?
+                .ok_or_else(|| HttpError::Url(format!("Invalid IPv6 authority: {authority}")))?
                 .parse::<u16>()
-                .map_err(|_| HttpError::Url(format!("잘못된 포트: {authority}")))?
+                .map_err(|_| HttpError::Url(format!("Invalid port: {authority}")))?
         };
         (host.to_string(), port)
     } else if authority.matches(':').count() == 1 {
         let (host, port) = authority
             .rsplit_once(':')
-            .ok_or_else(|| HttpError::Url(format!("잘못된 authority: {authority}")))?;
+            .ok_or_else(|| HttpError::Url(format!("Invalid authority: {authority}")))?;
         if host.is_empty() {
-            return Err(HttpError::Url(format!("호스트 없습니다: {authority}")));
+            return Err(HttpError::Url(format!("URL has no host: {authority}")));
         }
         let port = port
             .parse::<u16>()
-            .map_err(|_| HttpError::Url(format!("잘못된 포트: {authority}")))?;
+            .map_err(|_| HttpError::Url(format!("Invalid port: {authority}")))?;
         (host.to_string(), port)
     } else if authority.contains(':') {
         return Err(HttpError::Url(format!(
-            "IPv6 주소는 대괄호 필요: {authority}"
+            "IPv6 addresses need brackets: {authority}"
         )));
     } else {
         (authority.to_string(), default_port)
     };
     if host.is_empty() || !host.is_ascii() || port == 0 {
-        return Err(HttpError::Url(format!("잘못된 호스트/포트: {authority}")));
+        return Err(HttpError::Url(format!("Invalid host or port: {authority}")));
     }
     Ok(Url {
         scheme,
@@ -330,7 +332,8 @@ impl Req {
                         && matches!(next_url.scheme, Scheme::Http)
                     {
                         return Err(HttpError::Protocol(
-                            "HTTPS 요청을 암호화되지 않은 HTTP 주소로 보내는 리디렉션은 허용하지 않습니다".to_string(),
+                            "A redirect from HTTPS to an unencrypted HTTP URL is not allowed"
+                                .to_string(),
                         ));
                     }
                     if !same_origin(&current_url, &next_url) {
@@ -377,7 +380,8 @@ impl Resp {
 
     /** @brief 본문을 문자열로. */
     pub fn into_string(self) -> Result<String, HttpError> {
-        String::from_utf8(self.body).map_err(|e| HttpError::Protocol(format!("비UTF-8 본문: {e}")))
+        String::from_utf8(self.body)
+            .map_err(|e| HttpError::Protocol(format!("Body is not UTF-8: {e}")))
     }
 }
 
@@ -414,7 +418,9 @@ fn connect(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| HttpError::Connect(format!("{host}: 요청 시간 허용 한도를 넘었습니다")))?;
+        .ok_or_else(|| {
+            HttpError::Connect(format!("{host}: the request took longer than allowed"))
+        })?;
     let lookup_host = host.trim_start_matches('[').trim_end_matches(']');
     let addrs: Vec<SocketAddr> = if let Ok(ip) = lookup_host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
@@ -428,15 +434,15 @@ fn connect(
             .collect()
     } else {
         return Err(HttpError::Connect(format!(
-            "{host}: 호스트 이름으로 요청하려면 별도의 DNS 조회 서버를 지정해야 합니다. 운영체제 DNS를 다시 호출하는 순환을 막기 위한 제한입니다"
+            "{host}: requesting by host name needs a separate DNS server for lookups; this prevents a loop that calls the operating system DNS again"
         )));
     };
     if addrs.is_empty() {
-        return Err(HttpError::Connect(format!("{host} 해석 불가")));
+        return Err(HttpError::Connect(format!("Could not resolve {host}")));
     }
     if deny_private_targets && addrs.iter().any(|addr| blocked_target(addr.ip())) {
         return Err(HttpError::Connect(format!(
-            "내부망·루프백·특수 목적 주소 거부: {host}"
+            "Refusing a private, loopback, or special-purpose address: {host}"
         )));
     }
     let mut last = None;
@@ -457,7 +463,7 @@ fn connect(
                     .set_read_timeout(Some(remaining))
                     .and_then(|()| s.set_write_timeout(Some(remaining)))
                 {
-                    onetdns_core::warn!(event = "http.deadline_not_applied", host = %host, addr = %addr, %error, "연결에 제한 시간을 걸지 못했습니다. 응답이 없는 상대에 오래 붙잡힐 수 있습니다");
+                    onetdns_core::warn!(event = "http.deadline_not_applied", host = %host, addr = %addr, %error, "Could not set a timeout on the connection; an unresponsive peer can hold it for a long time");
                 }
                 return Ok(DeadlineTcp {
                     stream: s,
@@ -469,7 +475,7 @@ fn connect(
     }
     Err(HttpError::Connect(
         last.map(|e| e.to_string())
-            .unwrap_or_else(|| format!("{host} 연결 불가")),
+            .unwrap_or_else(|| format!("Could not connect to {host}")),
     ))
 }
 
@@ -573,7 +579,7 @@ fn validate_http_head(head: &[u8]) -> Result<(), HttpError> {
         };
         if !paired {
             return Err(HttpError::Protocol(
-                "HTTP 응답 헤더 줄은 CRLF로 끝나야 합니다".into(),
+                "HTTP response header lines must end with CRLF".into(),
             ));
         }
     }
@@ -588,17 +594,17 @@ fn parse_header_line(line: &[u8]) -> Result<(&str, &str), HttpError> {
         .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
     {
         return Err(HttpError::Protocol(
-            "여러 줄로 접힌 HTTP 헤더는 허용하지 않습니다".into(),
+            "Folded multi-line HTTP headers are not allowed".into(),
         ));
     }
     let index = line
         .iter()
         .position(|&byte| byte == b':')
-        .ok_or_else(|| HttpError::Protocol("HTTP 헤더 형식이 올바르지 않습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("Malformed HTTP header".into()))?;
     let name = std::str::from_utf8(&line[..index])
-        .map_err(|_| HttpError::Protocol("헤더 이름 인코딩".into()))?;
+        .map_err(|_| HttpError::Protocol("Header name encoding".into()))?;
     if !valid_header_name(name) {
-        return Err(HttpError::Protocol("잘못된 HTTP 헤더 이름".into()));
+        return Err(HttpError::Protocol("Invalid HTTP header name".into()));
     }
     let value = &line[index + 1..];
     if value
@@ -606,11 +612,11 @@ fn parse_header_line(line: &[u8]) -> Result<(&str, &str), HttpError> {
         .any(|&byte| byte != b'\t' && (byte < b' ' || byte == 0x7f))
     {
         return Err(HttpError::Protocol(
-            "HTTP 헤더 값에 허용되지 않는 문자가 있습니다".into(),
+            "HTTP header value contains a character that is not allowed".into(),
         ));
     }
     let value = std::str::from_utf8(value)
-        .map_err(|_| HttpError::Protocol("헤더 값 인코딩".into()))?
+        .map_err(|_| HttpError::Protocol("Header value encoding".into()))?
         .trim_matches([' ', '\t']);
     Ok((name, value))
 }
@@ -640,7 +646,9 @@ fn build_request(req: &Req, url: &Url) -> Result<Vec<u8>, HttpError> {
                 "host" | "content-length" | "transfer-encoding" | "connection"
             )
         {
-            return Err(HttpError::Protocol(format!("허용되지 않는 요청 헤더: {k}")));
+            return Err(HttpError::Protocol(format!(
+                "Request header not allowed: {k}"
+            )));
         }
         s.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -716,12 +724,15 @@ fn send_tls(
             {
                 break
             }
-            Err(TlsError::Io) => {
-                return Err(HttpError::Tls(
-                    "TLS close_notify 없이 연결이 종료되어 응답 완전성을 확인할 수 없습니다".into(),
-                ))
+            Err(TlsError::Io) => return Err(HttpError::Tls(
+                "The connection closed without TLS close_notify, so the response may be incomplete"
+                    .into(),
+            )),
+            Err(e) => {
+                return Err(HttpError::Tls(format!(
+                    "Could not receive the TLS response: {e}"
+                )))
             }
-            Err(e) => return Err(HttpError::Tls(format!("TLS 응답 수신 실패: {e}"))),
         };
         if chunk.is_empty() {
             break;
@@ -739,7 +750,7 @@ fn send_tls(
 fn ensure_response_limit(raw: &[u8], max_response: u64) -> Result<(), HttpError> {
     if raw.len() as u64 > max_response {
         Err(HttpError::Protocol(format!(
-            "응답 크기가 허용 한도를 넘었습니다: 상한 {} MiB",
+            "Response exceeds the size limit of {} MiB",
             max_response / 1024 / 1024
         )))
     } else {
@@ -762,29 +773,29 @@ fn final_response_start(raw: &[u8]) -> Result<Option<usize>, HttpError> {
         let Some(relative_sep) = find(&raw[start..], b"\r\n\r\n") else {
             if raw.len().saturating_sub(start) > MAX_HEADER_BYTES {
                 return Err(HttpError::Protocol(
-                    "응답 헤더 크기가 허용 한도를 넘었습니다".into(),
+                    "Response headers exceed the size limit".into(),
                 ));
             }
             return Ok(None);
         };
         if relative_sep > MAX_HEADER_BYTES {
             return Err(HttpError::Protocol(
-                "응답 헤더 크기가 허용 한도를 넘었습니다".into(),
+                "Response headers exceed the size limit".into(),
             ));
         }
         let sep = start
             .checked_add(relative_sep)
-            .ok_or_else(|| HttpError::Protocol("응답 위치 계산 범위를 넘었습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Response offset calculation overflowed".into()))?;
         let head = &raw[start..sep];
         validate_http_head(head)?;
         let status_line = head
             .split(|&byte| byte == b'\n')
             .next()
-            .ok_or_else(|| HttpError::Protocol("HTTP 상태 줄이 없습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("HTTP status line is missing".into()))?;
         let status = parse_status(trim_cr(status_line))?;
         if status == 101 {
             return Err(HttpError::Protocol(
-                "HTTP 프로토콜 전환 응답은 지원하지 않음".into(),
+                "HTTP protocol switch responses are not supported".into(),
             ));
         }
         if (100..200).contains(&status) {
@@ -793,7 +804,7 @@ fn final_response_start(raw: &[u8]) -> Result<Option<usize>, HttpError> {
                 header_count = header_count.saturating_add(1);
                 if header_count > MAX_HEADER_COUNT || line.len() > MAX_HEADER_LINE {
                     return Err(HttpError::Protocol(
-                        "정보 응답 헤더 개수/줄 길이가 허용 한도를 넘었습니다".into(),
+                        "Informational response has too many headers or too long a line".into(),
                     ));
                 }
                 let (name, _) = parse_header_line(line)?;
@@ -801,19 +812,19 @@ fn final_response_start(raw: &[u8]) -> Result<Option<usize>, HttpError> {
                     || name.eq_ignore_ascii_case("transfer-encoding")
                 {
                     return Err(HttpError::Protocol(
-                        "정보 응답에는 본문 프레이밍 헤더를 사용할 수 없습니다".into(),
+                        "Informational responses cannot use body framing headers".into(),
                     ));
                 }
             }
-            start = sep
-                .checked_add(4)
-                .ok_or_else(|| HttpError::Protocol("응답 위치 계산 범위를 넘었습니다".into()))?;
+            start = sep.checked_add(4).ok_or_else(|| {
+                HttpError::Protocol("Response offset calculation overflowed".into())
+            })?;
             continue;
         }
         return Ok(Some(start));
     }
     Err(HttpError::Protocol(
-        "HTTP 1xx 응답 연쇄 허용 한도를 넘었습니다".into(),
+        "Too many chained HTTP 1xx responses".into(),
     ))
 }
 
@@ -858,7 +869,7 @@ impl ResponseCompletion {
                 .is_some_and(|actual| actual >= length)),
             Some(ResponseFraming::Chunked { body_start }) => {
                 let body = raw.get(body_start..).ok_or_else(|| {
-                    HttpError::Protocol("HTTP 본문 위치가 응답 범위를 넘었습니다".into())
+                    HttpError::Protocol("HTTP body offset is outside the response".into())
                 })?;
                 Ok(chunked_wire_len_from(body, &mut self.chunk_position)?.is_some())
             }
@@ -879,14 +890,14 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
     let Some(sep) = find(final_raw, b"\r\n\r\n") else {
         if final_raw.len() > MAX_HEADER_BYTES {
             return Err(HttpError::Protocol(
-                "응답 헤더 크기가 허용 한도를 넘었습니다".into(),
+                "Response headers exceed the size limit".into(),
             ));
         }
         return Ok(None);
     };
     if sep > MAX_HEADER_BYTES {
         return Err(HttpError::Protocol(
-            "응답 헤더 크기가 허용 한도를 넘었습니다".into(),
+            "Response headers exceed the size limit".into(),
         ));
     }
 
@@ -894,7 +905,7 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
     let mut lines = head.split(|&byte| byte == b'\n');
     let status_line = lines
         .next()
-        .ok_or_else(|| HttpError::Protocol("HTTP 상태 줄이 없습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("HTTP status line is missing".into()))?;
     let status = parse_status(trim_cr(status_line))?;
     let mut content_length = None::<usize>;
     let mut chunked = false;
@@ -905,31 +916,29 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
         header_count = header_count.saturating_add(1);
         if header_count > MAX_HEADER_COUNT || line.len() > MAX_HEADER_LINE {
             return Err(HttpError::Protocol(
-                "응답 헤더 개수/줄 길이가 허용 한도를 넘었습니다".into(),
+                "Response has too many headers or too long a line".into(),
             ));
         }
         let (name, value) = parse_header_line(line)?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encoding_count = transfer_encoding_count.saturating_add(1);
             if transfer_encoding_count > 1 || !value.eq_ignore_ascii_case("chunked") {
-                return Err(HttpError::Protocol(
-                    "지원하지 않는 Transfer-Encoding".into(),
-                ));
+                return Err(HttpError::Protocol("Unsupported Transfer-Encoding".into()));
             }
             chunked = true;
         } else if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
-                return Err(HttpError::Protocol("중복 Content-Length".into()));
+                return Err(HttpError::Protocol("Duplicate Content-Length".into()));
             }
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(HttpError::Protocol("잘못된 Content-Length".into()));
+                return Err(HttpError::Protocol("Invalid Content-Length".into()));
             }
             let parsed = value
                 .parse::<usize>()
-                .map_err(|_| HttpError::Protocol("잘못된 Content-Length".into()))?;
+                .map_err(|_| HttpError::Protocol("Invalid Content-Length".into()))?;
             if parsed as u64 > max_response {
                 return Err(HttpError::Protocol(format!(
-                    "응답 크기가 허용 한도를 넘었습니다: Content-Length={parsed}, 상한={} MiB",
+                    "Response exceeds the size limit: Content-Length={parsed}, limit={} MiB",
                     max_response / 1024 / 1024
                 )));
             }
@@ -938,12 +947,12 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
     }
     if chunked && content_length.is_some() {
         return Err(HttpError::Protocol(
-            "Transfer-Encoding과 Content-Length를 함께 사용한 응답은 허용하지 않습니다".into(),
+            "Responses that use both Transfer-Encoding and Content-Length are not allowed".into(),
         ));
     }
     if status == 204 && (chunked || content_length.is_some()) {
         return Err(HttpError::Protocol(
-            "204 응답에는 본문 프레이밍 헤더를 사용할 수 없습니다".into(),
+            "A 204 response cannot use body framing headers".into(),
         ));
     }
     if matches!(status, 204 | 304) {
@@ -952,7 +961,7 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
     let body_start = start
         .checked_add(sep)
         .and_then(|value| value.checked_add(4))
-        .ok_or_else(|| HttpError::Protocol("HTTP 본문 위치 계산 범위를 넘었습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("HTTP body offset calculation overflowed".into()))?;
     if chunked {
         return Ok(Some(ResponseFraming::Chunked { body_start }));
     }
@@ -979,7 +988,7 @@ fn chunked_wire_len_from(
     let mut pos = *completed_position;
     if pos > data.len() {
         return Err(HttpError::Protocol(
-            "청크 진행 위치가 본문 범위를 넘었습니다".into(),
+            "Chunk position is outside the body".into(),
         ));
     }
     loop {
@@ -988,11 +997,11 @@ fn chunked_wire_len_from(
         };
         let eol = pos
             .checked_add(relative_eol)
-            .ok_or_else(|| HttpError::Protocol("청크 위치 계산 범위를 넘었습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Chunk offset calculation overflowed".into()))?;
         let size = parse_chunk_size(&data[pos..eol])?;
         pos = eol
             .checked_add(2)
-            .ok_or_else(|| HttpError::Protocol("청크 위치 계산 범위를 넘었습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Chunk offset calculation overflowed".into()))?;
 
         if size == 0 {
             if data.len() < pos.saturating_add(2) {
@@ -1009,19 +1018,21 @@ fn chunked_wire_len_from(
                 .checked_add(trailer_end)
                 .and_then(|value| value.checked_add(4))
                 .map(Some)
-                .ok_or_else(|| HttpError::Protocol("청크 트레일러 계산 범위를 넘었습니다".into()));
+                .ok_or_else(|| {
+                    HttpError::Protocol("Chunk trailer offset calculation overflowed".into())
+                });
         }
 
         let chunk_end = pos
             .checked_add(size)
             .and_then(|value| value.checked_add(2))
-            .ok_or_else(|| HttpError::Protocol("청크 크기 계산 범위를 넘었습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Chunk size calculation overflowed".into()))?;
         if data.len() < chunk_end {
             return Ok(None);
         }
         if data.get(chunk_end - 2..chunk_end) != Some(&b"\r\n"[..]) {
             return Err(HttpError::Protocol(
-                "청크 데이터 끝의 CRLF가 없습니다".into(),
+                "Chunk data is missing its trailing CRLF".into(),
             ));
         }
         pos = chunk_end;
@@ -1032,13 +1043,13 @@ fn chunked_wire_len_from(
 /** @brief 받은 바이트를 응답으로. */
 fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
     let start = final_response_start(raw)?
-        .ok_or_else(|| HttpError::Protocol("최종 HTTP 응답이 없습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("No final HTTP response".into()))?;
     let raw = &raw[start..];
     let sep = find(raw, b"\r\n\r\n")
-        .ok_or_else(|| HttpError::Protocol("HTTP 헤더의 끝을 찾을 수 없습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("Could not find the end of the HTTP headers".into()))?;
     if sep > MAX_HEADER_BYTES {
         return Err(HttpError::Protocol(
-            "응답 헤더 크기가 허용 한도를 넘었습니다".into(),
+            "Response headers exceed the size limit".into(),
         ));
     }
     let head = &raw[..sep];
@@ -1047,7 +1058,7 @@ fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
     let mut lines = head.split(|&b| b == b'\n');
     let status_line = lines
         .next()
-        .ok_or_else(|| HttpError::Protocol("HTTP 상태 줄이 없습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("HTTP status line is missing".into()))?;
     let status = parse_status(trim_cr(status_line))?;
 
     let mut headers = Vec::new();
@@ -1060,49 +1071,47 @@ fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
         header_count = header_count.saturating_add(1);
         if header_count > MAX_HEADER_COUNT || line.len() > MAX_HEADER_LINE {
             return Err(HttpError::Protocol(
-                "응답 헤더 개수/줄 길이가 허용 한도를 넘었습니다".into(),
+                "Response has too many headers or too long a line".into(),
             ));
         }
         let (k, v) = parse_header_line(line)?;
         if k.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encoding_count = transfer_encoding_count.saturating_add(1);
             if transfer_encoding_count > 1 || !v.trim().eq_ignore_ascii_case("chunked") {
-                return Err(HttpError::Protocol(
-                    "지원하지 않는 Transfer-Encoding".into(),
-                ));
+                return Err(HttpError::Protocol("Unsupported Transfer-Encoding".into()));
             }
             has_transfer_encoding = true;
             chunked = true;
         }
         if k.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
-                return Err(HttpError::Protocol("중복 Content-Length".into()));
+                return Err(HttpError::Protocol("Duplicate Content-Length".into()));
             }
             if v.is_empty() || !v.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(HttpError::Protocol("잘못된 Content-Length".into()));
+                return Err(HttpError::Protocol("Invalid Content-Length".into()));
             }
             let parsed = v
                 .parse::<usize>()
-                .map_err(|_| HttpError::Protocol("잘못된 Content-Length".into()))?;
+                .map_err(|_| HttpError::Protocol("Invalid Content-Length".into()))?;
             content_length = Some(parsed);
         }
         headers.push((k.to_string(), v.to_string()));
     }
     if has_transfer_encoding && content_length.is_some() {
         return Err(HttpError::Protocol(
-            "Transfer-Encoding과 Content-Length를 함께 사용한 응답은 허용하지 않습니다".into(),
+            "Responses that use both Transfer-Encoding and Content-Length are not allowed".into(),
         ));
     }
     if status == 204 && (chunked || content_length.is_some()) {
         return Err(HttpError::Protocol(
-            "204 응답에는 본문 프레이밍 헤더를 사용할 수 없습니다".into(),
+            "A 204 response cannot use body framing headers".into(),
         ));
     }
 
     let body = if matches!(status, 204 | 304) {
         if !body_raw.is_empty() {
             return Err(HttpError::Protocol(
-                "본문이 없어야 하는 HTTP 응답에 데이터가 포함됐습니다".into(),
+                "An HTTP response that must have no body contains data".into(),
             ));
         }
         Vec::new()
@@ -1111,7 +1120,7 @@ fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
     } else if let Some(expected) = content_length {
         if body_raw.len() != expected {
             return Err(HttpError::Protocol(format!(
-                "Content-Length 값이 일치하지 않습니다: 예상 {expected}, 실제 {}",
+                "Content-Length mismatch: expected {expected}, got {}",
                 body_raw.len()
             )));
         }
@@ -1128,18 +1137,19 @@ fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
 
 /** @brief 상태 줄에서 상태 번호를. */
 fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
-    let s = std::str::from_utf8(line).map_err(|_| HttpError::Protocol("상태줄 인코딩".into()))?;
+    let s = std::str::from_utf8(line)
+        .map_err(|_| HttpError::Protocol("Status line encoding".into()))?;
     if s.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
         return Err(HttpError::Protocol(
-            "HTTP 상태 줄에 허용되지 않는 문자가 있습니다".into(),
+            "HTTP status line contains a character that is not allowed".into(),
         ));
     }
     let (version, rest) = s
         .split_once(' ')
-        .ok_or_else(|| HttpError::Protocol("HTTP 버전 또는 상태코드가 없습니다".into()))?;
+        .ok_or_else(|| HttpError::Protocol("HTTP version or status code is missing".into()))?;
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
         return Err(HttpError::Protocol(format!(
-            "지원하지 않는 HTTP 버전: {version}"
+            "Unsupported HTTP version: {version}"
         )));
     }
     let code = rest.split_once(' ').map_or(rest, |(code, _)| code);
@@ -1147,7 +1157,7 @@ fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
         .then(|| code.parse::<u16>().ok())
         .flatten()
         .filter(|code| (100..=599).contains(code))
-        .ok_or_else(|| HttpError::Protocol(format!("상태코드 해석하지 못했습니다: {s}")))?;
+        .ok_or_else(|| HttpError::Protocol(format!("Could not parse the status code: {s}")))?;
     Ok(code)
 }
 
@@ -1156,7 +1166,7 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::new();
     loop {
         let eol = find(data, b"\r\n")
-            .ok_or_else(|| HttpError::Protocol("청크 크기 줄이 없습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Chunk size line is missing".into()))?;
         let size = parse_chunk_size(&data[..eol])?;
         data = &data[eol + 2..];
         if size == 0 {
@@ -1164,23 +1174,25 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
                 return Ok(out);
             }
             let end = find(data, b"\r\n\r\n").ok_or_else(|| {
-                HttpError::Protocol("청크 트레일러의 끝을 찾을 수 없습니다".into())
+                HttpError::Protocol("Could not find the end of the chunk trailer".into())
             })?;
             if end + 4 != data.len() {
-                return Err(HttpError::Protocol("청크 본문 뒤 잉여 데이터".into()));
+                return Err(HttpError::Protocol(
+                    "Extra data after the chunked body".into(),
+                ));
             }
             validate_chunk_trailers(&data[..end])?;
             return Ok(out);
         }
         let chunk_end = size
             .checked_add(2)
-            .ok_or_else(|| HttpError::Protocol("청크 크기 계산 범위를 넘었습니다".into()))?;
+            .ok_or_else(|| HttpError::Protocol("Chunk size calculation overflowed".into()))?;
         if data.len() < chunk_end {
-            return Err(HttpError::Protocol("청크 데이터 부족".into()));
+            return Err(HttpError::Protocol("Chunk data is truncated".into()));
         }
         if &data[size..chunk_end] != b"\r\n" {
             return Err(HttpError::Protocol(
-                "청크 데이터 끝의 CRLF가 없습니다".into(),
+                "Chunk data is missing its trailing CRLF".into(),
             ));
         }
         out.extend_from_slice(&data[..size]);
@@ -1191,9 +1203,7 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
 /** @brief 조각 크기 줄을 읽는다. */
 fn parse_chunk_size(line: &[u8]) -> Result<usize, HttpError> {
     if line.len() > MAX_HEADER_LINE {
-        return Err(HttpError::Protocol(
-            "청크 크기 줄이 허용 길이를 넘었습니다".into(),
-        ));
+        return Err(HttpError::Protocol("Chunk size line is too long".into()));
     }
     let hex_end = line
         .iter()
@@ -1201,34 +1211,32 @@ fn parse_chunk_size(line: &[u8]) -> Result<usize, HttpError> {
         .unwrap_or(line.len());
     let hex = &line[..hex_end];
     if hex.is_empty() || !hex.iter().all(u8::is_ascii_hexdigit) {
-        return Err(HttpError::Protocol(
-            "청크 크기 값이 올바르지 않습니다".into(),
-        ));
+        return Err(HttpError::Protocol("Invalid chunk size".into()));
     }
     let extension = &line[hex_end..];
     if extension.iter().any(|&byte| byte < b'!' || byte == 0x7f) {
         return Err(HttpError::Protocol(
-            "청크 확장에 허용되지 않는 문자가 있습니다".into(),
+            "Chunk extension contains a character that is not allowed".into(),
         ));
     }
     let hex =
-        std::str::from_utf8(hex).map_err(|_| HttpError::Protocol("청크 크기 인코딩".into()))?;
+        std::str::from_utf8(hex).map_err(|_| HttpError::Protocol("Chunk size encoding".into()))?;
     usize::from_str_radix(hex, 16)
-        .map_err(|_| HttpError::Protocol(format!("청크 크기 파싱: {hex}")))
+        .map_err(|_| HttpError::Protocol(format!("Could not parse the chunk size: {hex}")))
 }
 
 /** @brief 본문 뒤에 붙은 헤더가 형식에 맞는지. 여기도 검사해야 경계가 어긋나지 않는다. */
 fn validate_chunk_trailers(trailers: &[u8]) -> Result<(), HttpError> {
     if trailers.len() > MAX_HEADER_BYTES {
         return Err(HttpError::Protocol(
-            "청크 트레일러 크기가 허용 한도를 넘었습니다".into(),
+            "Chunk trailer exceeds the size limit".into(),
         ));
     }
     validate_http_head(trailers)?;
     for (index, line) in trailers.split(|&byte| byte == b'\n').enumerate() {
         if index >= MAX_HEADER_COUNT || line.len() > MAX_HEADER_LINE {
             return Err(HttpError::Protocol(
-                "청크 트레일러 개수와 줄 길이가 허용 한도를 넘었습니다".into(),
+                "Chunk trailer has too many fields or too long a line".into(),
             ));
         }
         let (name, _) = parse_header_line(line)?;
@@ -1236,7 +1244,7 @@ fn validate_chunk_trailers(trailers: &[u8]) -> Result<(), HttpError> {
             || name.eq_ignore_ascii_case("transfer-encoding")
         {
             return Err(HttpError::Protocol(
-                "청크 트레일러에 프레이밍 필드를 사용할 수 없습니다".into(),
+                "Chunk trailers cannot contain framing fields".into(),
             ));
         }
     }
@@ -1247,7 +1255,7 @@ fn validate_chunk_trailers(trailers: &[u8]) -> Result<(), HttpError> {
 fn resolve_redirect(current: &str, location: &str) -> Result<String, HttpError> {
     let location = location.trim();
     if location.is_empty() {
-        return Err(HttpError::Protocol("Location 헤더가 비어 있습니다".into()));
+        return Err(HttpError::Protocol("Location header is empty".into()));
     }
     if location.starts_with("http://") || location.starts_with("https://") {
         return Ok(location.to_string());
@@ -1434,7 +1442,7 @@ mod tests {
             Err(error) => error.to_string(),
             Ok(_) => panic!("resolver 없는 hostname 요청은 실패해야 함"),
         };
-        assert!(error.contains("별도의 DNS 조회 서버"), "{error}");
+        assert!(error.contains("separate DNS server"), "{error}");
     }
 
     #[test]
@@ -1468,7 +1476,7 @@ mod tests {
             Err(error) => error.to_string(),
             Ok(_) => panic!("private localhost target must be rejected"),
         };
-        assert!(error.contains("내부망·루프백"), "{error}");
+        assert!(error.contains("private, loopback"), "{error}");
     }
 
     #[test]

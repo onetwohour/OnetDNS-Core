@@ -70,7 +70,7 @@ impl LaneFallback {
                 }
             })
         {
-            onetdns_core::error!(event = "reactor.fallback_worker_start_failed", %error, "리액터의 대체 처리 스레드를 시작하지 못했습니다. 레인이 풀지 못한 질의는 수신 루프에서 바로 처리됩니다");
+            onetdns_core::error!(event = "reactor.fallback_worker_start_failed", %error, "Could not start the reactor fallback thread; queries a lane cannot resolve are handled directly on the receive loop");
             return Self {
                 jobs,
                 done: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -185,7 +185,7 @@ impl NativeServer {
         let qname = cl.request.questions.first().map(|q| &q.name);
         let (reason, class, ede) = failure_diagnosis(failure);
         let detail = format!(
-            "DNS 질의를 처리했지만 응답을 만들지 못했습니다. 처리 방식={}, 질의 클래스={class}",
+            "The DNS query was handled but no response was produced. backend={}, query class={class}",
             self.resolver_mode(&cl.client)
         );
         let timer = onetdns_control::RequestTimer::start_at(cl.submitted);
@@ -298,7 +298,7 @@ impl NativeServer {
             reactor_response_edns(&f, &mut resp, req);
             if let Err(error) = postprocess(&f, &mut resp, req, &ctx) {
                 onetdns_core::error!(event = "dns.response_postprocess_failed", %error,
-                    "응답의 EDNS 후처리에 실패해 SERVFAIL로 교체합니다");
+                    "EDNS post-processing of the response failed; replacing it with SERVFAIL");
                 resp = error_resp(req, ResponseCode::ServFail);
             }
             runtime.cache.store(req, &resp);
@@ -388,7 +388,7 @@ fn reactor_fallback_unavailable() {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "reactor.fallback_unavailable", count = count, "리액터의 대체 처리 경로가 닫혀 질의를 수신 루프에서 바로 풀었습니다. 그동안 다른 질의가 밀립니다");
+        onetdns_core::warn!(event = "reactor.fallback_unavailable", count = count, "Reactor fallback path is closed; resolved a query directly on the receive loop, delaying other queries meanwhile");
     }
 }
 

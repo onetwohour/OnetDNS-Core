@@ -1,10 +1,11 @@
 /*!
- * @brief 사람이 보는 문구가 자연스러운 한국어로 남아 있는지, 번역 대비가 있는지 검사한다.
+ * @brief 사람이 보는 문구가 읽을 만한 문장으로 남아 있는지, 화면에 번역 대비가 있는지
+ *        검사한다.
  *
  * @details 관리 API 와 CLI 의 오류 문구는 개발자가 아니라 운영자가 읽는다. 구현 용어를
- *          그대로 노출하거나 영어 단어만 던지면 무엇을 고쳐야 할지 알 수 없다. 화면
- *          언어가 한국어가 아닐 때 번역되지 않은 한국어 오류가 그대로 나가는 것도 같은
- *          문제다.
+ *          그대로 노출하거나 단어 하나만 던지면 무엇을 고쳐야 할지 알 수 없다. 서버는
+ *          영어로 답하므로, 화면이 모르는 서버 문구를 영어 아닌 화면에 그대로 내보내는
+ *          것도 같은 문제다.
  * @note 테스트 모듈 안의 문자열은 사용자에게 보이지 않으므로 검사에서 제외한다.
  */
 
@@ -12,7 +13,7 @@ mod common;
 
 use common::{production_files, production_prefix, read, rel, root};
 
-/** @brief 이 문장 그대로는 내보내지 않는다. 너무 짧거나 번역되지 않았다. */
+/** @brief 이 문장 그대로는 내보내지 않는다. 무엇이 잘못됐는지 알 수 없을 만큼 짧다. */
 const FORBIDDEN_EXACT: &[&str] = &[
     "invalid content-length",
     "invalid last-event-id",
@@ -21,15 +22,15 @@ const FORBIDDEN_EXACT: &[&str] = &[
     "too many login attempts",
     "invalid credentials",
     "unauthorized",
+    "Unauthorized",
     "not found",
+    "Not found",
     "forbidden: read-only token",
-    "query: 도메인 인자 필요",
-    "cert: --host 필요",
-    "DHCPv4 비활성",
-    "Raft HA 비활성",
-    "HTTP 또는 HTTPS URL 필요",
-    "config에 control_listen 없음",
-    "빈 패치",
+    "query: domain required",
+    "cert: --host required",
+    "DHCPv4 disabled",
+    "Raft HA disabled",
+    "empty patch",
 ];
 
 /** @brief 구현 내부 용어가 그대로 드러난 조각. */
@@ -37,29 +38,35 @@ const FORBIDDEN_FRAGMENTS: &[&str] = &[
     "  mode={:?}  backend={:?}",
     "  listen={:?}",
     "length checked",
-    "XFR 응답 envelope",
-    "SOA 응답 envelope",
+    "XFR response envelope",
+    "SOA response envelope",
     "fallback origin/serial",
     "delta serial",
 ];
 
 /** @brief 설정 확인 명령이 사람이 읽을 수 있게 내놓아야 할 항목. */
 const REQUIRED_CLI_COPY: &[&str] = &[
-    "설정 파일을 확인했습니다.",
-    "운영 대상: {mode_label}",
-    "질의 처리 방식: {backend_label}",
-    "일반 DNS 수신 주소:",
-    "클라이언트별 속도 제한:",
-    "대역별 응답 제한:",
+    "The configuration file is valid.",
+    "Mode: {mode_label}",
+    "Query resolution: {backend_label}",
+    "Plain DNS listening addresses:",
+    "Per-client rate limit:",
+    "Per-subnet response limit:",
 ];
 
-/** @brief 화면이 서버 오류를 언어별로 되받아 주는 장치. */
+/**
+ * @brief 화면이 서버 오류를 언어별로 되받아 주는 장치.
+ * @details 영어 화면은 서버 문구를 그대로 쓰고, 다른 화면은 사전에 있으면 번역하고
+ *          없으면 번역된 대비 문구 뒤에 원문을 붙인다.
+ */
 const REQUIRED_DASHBOARD: &[&str] = &[
-    "if(this.state.lang==='ko'||translated!==raw||!/[가-힣]/.test(raw))return translated;",
+    "if(this.state.lang==='en'||translated!==raw)return translated;",
     "'요청을 처리하지 못했습니다':'The request could not be completed'",
     "'요청을 처리하지 못했습니다':'リクエストを処理できませんでした'",
+    "\"요청을 처리하지 못했습니다\":\"无法处理请求\"",
     "'서버에서 요청을 처리하지 못했습니다':'The server could not complete the request'",
     "'서버에서 요청을 처리하지 못했습니다':'サーバーでリクエストを処理できませんでした'",
+    "\"서버에서 요청을 처리하지 못했습니다\":\"服务器无法处理请求\"",
 ];
 
 /** @brief 소스에 든 문자열 리터럴을 줄 번호와 함께 모은다. */
@@ -184,7 +191,7 @@ fn the_configuration_summary_stays_human_readable() {
     );
 }
 
-/** @brief 한국어가 아닌 화면이 번역되지 않은 서버 오류를 그대로 보여 주면 실패한다. */
+/** @brief 영어가 아닌 화면이 번역되지 않은 서버 오류를 그대로 보여 주면 실패한다. */
 #[test]
 fn the_dashboard_localizes_unmatched_server_errors() {
     let dashboard = read(&root().join("crates/onetdns-control/dashboard/index.html"));

@@ -15,9 +15,9 @@ use crate::http;
 fn resolve_ctl(ctl: &CtlArgs) -> BoxResult<(String, String)> {
     if let Some(p) = &ctl.config {
         let cfg = Config::load_or_default(Some(p))?;
-        let addr = cfg
-            .control_listen
-            .ok_or_else(|| crate::anyhow!("설정 파일에 control_listen 항목이 없습니다"))?;
+        let addr = cfg.control_listen.ok_or_else(|| {
+            crate::anyhow!("The configuration file has no control_listen setting")
+        })?;
         Ok((base_url(addr), cfg.control_token.as_str().to_owned()))
     } else {
         let url = ctl
@@ -61,9 +61,9 @@ fn ctl_body(resp: http::Resp) -> BoxResult<String> {
         .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
         .unwrap_or_else(|| body.trim().to_owned());
     if message.is_empty() {
-        crate::bail!("관리 API가 요청을 거절했습니다(HTTP {status})");
+        crate::bail!("The management API rejected the request (HTTP {status})");
     }
-    crate::bail!("관리 API가 요청을 거절했습니다(HTTP {status}): {message}")
+    crate::bail!("The management API rejected the request (HTTP {status}): {message}")
 }
 
 /** @brief 토큰을 인증 헤더 값으로. */
@@ -79,7 +79,7 @@ pub(crate) fn ctl_stats(ctl: &CtlArgs) -> BoxResult<()> {
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Management API request failed: {e}"))?;
     let body = ctl_body(resp)?;
 
     println!("{body}");
@@ -94,10 +94,10 @@ pub(crate) fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Management API request failed: {e}"))?;
     let body = ctl_body(resp)?;
     let v = onetdns_core::json::parse(&body)
-        .map_err(|e| crate::anyhow!("관리 API 응답을 해석하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Could not parse the management API response: {e}"))?;
     let show = |label: &str, key: &str| {
         println!("[{label}]");
         if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
@@ -110,9 +110,9 @@ pub(crate) fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
             }
         }
     };
-    show("업스트림 도메인", "domains");
-    show("업스트림 차단", "blocked");
-    show("업스트림 클라이언트", "clients");
+    show("Top domains", "domains");
+    show("Top blocked domains", "blocked");
+    show("Top clients", "clients");
     Ok(())
 }
 
@@ -124,9 +124,9 @@ pub(crate) fn ctl_reload(ctl: &CtlArgs) -> BoxResult<()> {
         .header("Authorization", &bearer(&token))
         .resolver(resolver)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Management API request failed: {e}"))?;
     let body = ctl_body(resp)?;
-    println!("설정을 다시 불러왔습니다: {body}");
+    println!("Configuration reloaded: {body}");
     Ok(())
 }
 
@@ -141,9 +141,9 @@ pub(crate) fn ctl_add(kind: &str, domain: &str, ctl: &CtlArgs) -> BoxResult<()> 
         .resolver(resolver)
         .body_string(&json)
         .call()
-        .map_err(|e| crate::anyhow!("관리 API 요청을 처리하지 못했습니다: {e}"))?;
+        .map_err(|e| crate::anyhow!("Management API request failed: {e}"))?;
     let body = ctl_body(resp)?;
-    println!("{kind} 규칙에 {domain}을 추가했습니다: {body}");
+    println!("Added {domain} to the {kind} rules: {body}");
     Ok(())
 }
 

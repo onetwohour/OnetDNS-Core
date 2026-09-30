@@ -15,7 +15,7 @@ pub struct Error(pub String);
 impl std::fmt::Display for Error {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "정규식 오류: {}", self.0)
+        write!(f, "Regex error: {}", self.0)
     }
 }
 
@@ -182,7 +182,9 @@ impl<'a> Parser<'a> {
             branches.push(self.parse_concat()?);
         }
         if branches.len() == 1 {
-            branches.pop().ok_or_else(|| Error("빈 대안식".to_string()))
+            branches
+                .pop()
+                .ok_or_else(|| Error("Empty alternative".to_string()))
         } else {
             Ok(Ast::Alt(branches))
         }
@@ -201,7 +203,9 @@ impl<'a> Parser<'a> {
         }
         match parts.len() {
             0 => Ok(Ast::Empty),
-            1 => parts.pop().ok_or_else(|| Error("빈 연결식".to_string())),
+            1 => parts
+                .pop()
+                .ok_or_else(|| Error("Empty concatenation".to_string())),
             _ => Ok(Ast::Concat(parts)),
         }
     }
@@ -269,11 +273,11 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         if min > MAX_REPEAT || max.map(|m| m > MAX_REPEAT).unwrap_or(false) {
-            return Err(Error("정규식 반복 횟수가 허용 한도를 넘었습니다".into()));
+            return Err(Error("Regex repetition count is too large".into()));
         }
         if let Some(m) = max {
             if m < min {
-                return Err(Error("반복 범위 역전".into()));
+                return Err(Error("Repetition range is reversed".into()));
             }
         }
         Ok(Some((min, max)))
@@ -323,7 +327,9 @@ impl<'a> Parser<'a> {
                 })
             }
             Some(b'\\') => self.parse_escape(),
-            Some(b'*') | Some(b'+') | Some(b'?') => Err(Error("수량자 앞에 항이 없습니다".into())),
+            Some(b'*') | Some(b'+') | Some(b'?') => {
+                Err(Error("Quantifier has nothing to repeat".into()))
+            }
             Some(c) => {
                 self.bump();
                 Ok(Ast::Literal(self.fold(c)))
@@ -335,7 +341,7 @@ impl<'a> Parser<'a> {
     fn parse_group(&mut self) -> Result<Ast, Error> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
-            return Err(Error("정규식 중첩이 너무 깊음".into()));
+            return Err(Error("Regex nesting is too deep".into()));
         }
         let r = self.parse_group_inner();
         self.depth -= 1;
@@ -355,18 +361,18 @@ impl<'a> Parser<'a> {
                     Some(saved) => {
                         let inner = self.parse_alt()?;
                         if !self.eat(b')') {
-                            return Err(Error("닫는 괄호가 없습니다".into()));
+                            return Err(Error("Missing closing parenthesis".into()));
                         }
                         self.restore(saved);
                         return Ok(inner);
                     }
                 },
-                _ => return Err(Error("지원하지 않는 (?...) 그룹".into())),
+                _ => return Err(Error("Unsupported (?...) group".into())),
             }
         }
         let inner = self.parse_alt()?;
         if !self.eat(b')') {
-            return Err(Error("닫는 괄호가 없습니다".into()));
+            return Err(Error("Missing closing parenthesis".into()));
         }
         Ok(inner)
     }
@@ -404,7 +410,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return Ok(None);
                 }
-                _ => return Err(Error("지원하지 않는 그룹 플래그".into())),
+                _ => return Err(Error("Unsupported group flag".into())),
             }
         }
     }
@@ -418,7 +424,7 @@ impl<'a> Parser<'a> {
         let mut first = true;
         loop {
             match self.peek() {
-                None => return Err(Error("닫히지 않은 문자 클래스".into())),
+                None => return Err(Error("Unclosed character class".into())),
                 Some(b']') if !first => {
                     self.bump();
                     break;
@@ -437,7 +443,7 @@ impl<'a> Parser<'a> {
                 let hi = self.class_atom(&mut ranges)?;
                 match hi {
                     Some(hi) if hi >= lo => self.push_class_range(&mut ranges, lo, hi),
-                    Some(_) => return Err(Error("문자 클래스 범위 역전".into())),
+                    Some(_) => return Err(Error("Character class range is reversed".into())),
                     None => {
                         self.push_class_range(&mut ranges, lo, lo);
                     }
@@ -447,7 +453,7 @@ impl<'a> Parser<'a> {
             }
         }
         if ranges.is_empty() {
-            return Err(Error("빈 문자 클래스".into()));
+            return Err(Error("Empty character class".into()));
         }
         Ok(Ast::Class { negated, ranges })
     }
@@ -472,11 +478,9 @@ impl<'a> Parser<'a> {
     /** @brief 문자 집합 안의 항목 하나를 읽는다. */
     fn class_atom(&mut self, ranges: &mut Vec<(u8, u8)>) -> Result<Option<u8>, Error> {
         match self.bump() {
-            None => Err(Error("닫히지 않은 문자 클래스".into())),
+            None => Err(Error("Unclosed character class".into())),
             Some(b'\\') => {
-                let e = self
-                    .bump()
-                    .ok_or_else(|| Error("잘못된 이스케이프".into()))?;
+                let e = self.bump().ok_or_else(|| Error("Invalid escape".into()))?;
                 match e {
                     b'd' => {
                         ranges.push((b'0', b'9'));
@@ -521,7 +525,7 @@ impl<'a> Parser<'a> {
         self.bump();
         let e = self
             .bump()
-            .ok_or_else(|| Error("패턴 끝의 백슬래시".into()))?;
+            .ok_or_else(|| Error("Trailing backslash in pattern".into()))?;
         Ok(match e {
             b'd' => class_from(&[(b'0', b'9')], false),
             b'D' => class_from(&[(b'0', b'9')], true),
@@ -629,7 +633,7 @@ impl Compiler {
     /** @brief 명령 하나를 낸다. 상한을 넘으면 실패다. */
     fn emit(&mut self, i: Inst) -> Result<usize, Error> {
         if self.insts.len() >= MAX_INSTS {
-            return Err(Error("정규식이 너무 큼".into()));
+            return Err(Error("Regex is too large".into()));
         }
         self.insts.push(i);
         Ok(self.insts.len() - 1)
@@ -946,7 +950,7 @@ fn parse_pattern(pattern: &str) -> Result<Ast, Error> {
     let mut parser = Parser::new(pattern.as_bytes());
     let ast = parser.parse_alt()?;
     if parser.pos != parser.s.len() {
-        return Err(Error("예상치 못한 문자".into()));
+        return Err(Error("Unexpected character".into()));
     }
     Ok(ast)
 }
@@ -1025,7 +1029,7 @@ impl RegexSet {
             1 => Some(compile_ast(
                 &asts
                     .pop()
-                    .ok_or_else(|| Error("빈 정규식 집합".to_string()))?,
+                    .ok_or_else(|| Error("Empty regex set".to_string()))?,
             )?),
             _ => Some(compile_ast(&Ast::Alt(asts))?),
         };

@@ -48,7 +48,9 @@ impl DeadlineTcp {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| HttpError::Other(format!("{addr}: 연결 시간 허용 한도를 넘었습니다")))?;
+            .ok_or_else(|| {
+                HttpError::Other(format!("{addr}: the connection took longer than allowed"))
+            })?;
         let stream = TcpStream::connect_timeout(&addr, remaining)
             .map_err(|error| HttpError::Other(format!("{addr}: {error}")))?;
         Ok(Self { stream, deadline })
@@ -192,11 +194,11 @@ impl EtcdZoneSource {
         );
         let resp = self.request("/v3/auth/authenticate", &body, None)?;
         let j = onetdns_core::json::parse(&resp)
-            .map_err(|e| format!("etcd 인증 응답의 JSON을 해석하지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not parse the etcd authentication response JSON: {e}"))?;
         let token: onetdns_core::SecretString = j
             .get("token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "etcd 인증 응답에 토큰이 없습니다".to_string())?
+            .ok_or_else(|| "The etcd authentication response has no token".to_string())?
             .to_string()
             .into();
         *self.token.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
@@ -262,7 +264,8 @@ impl EtcdZoneSource {
      */
     fn range(&self, keys_only: bool) -> Result<(Vec<(String, String, u64)>, usize, u64), String> {
         let body = self.request("/v3/kv/range", &self.range_body(keys_only), None)?;
-        let j = onetdns_core::json::parse(&body).map_err(|e| format!("etcd 응답 JSON: {e}"))?;
+        let j = onetdns_core::json::parse(&body)
+            .map_err(|e| format!("Invalid etcd response JSON: {e}"))?;
         let mut kvs = Vec::new();
         let mut max_mod = 0u64;
         if let Some(arr) = j.get("kvs").and_then(|v| v.as_array()) {
@@ -274,14 +277,14 @@ impl EtcdZoneSource {
                         .and_then(|b| String::from_utf8(b).ok())
                 };
                 let key = decode("key").unwrap_or_else(|| {
-                    onetdns_core::warn!(event = "authority.etcd_key_undecodable", prefix = %self.prefix, "etcd 항목의 키를 읽지 못해 이 영역을 건너뜁니다");
+                    onetdns_core::warn!(event = "authority.etcd_key_undecodable", prefix = %self.prefix, "Could not read the key of an etcd entry; skipping this zone");
                     String::new()
                 });
                 let value = if keys_only {
                     String::new()
                 } else {
                     decode("value").unwrap_or_else(|| {
-                        onetdns_core::warn!(event = "authority.etcd_value_undecodable", key = %key, "etcd 항목의 값을 읽지 못해 이 영역을 건너뜁니다");
+                        onetdns_core::warn!(event = "authority.etcd_value_undecodable", key = %key, "Could not read the value of an etcd entry; skipping this zone");
                         String::new()
                     })
                 };
@@ -303,7 +306,7 @@ impl ZoneSource for EtcdZoneSource {
      */
     fn load(&self) -> Result<ZoneStore, String> {
         if self.is_https() && self.tls.is_none() {
-            return Err("https etcd는 tls_ca(신뢰 스토어)가 필요합니다".to_string());
+            return Err("https etcd endpoints need tls_ca (a trust store)".to_string());
         }
         let (kvs, count, max_mod) = self.range(false)?;
         let mut store = ZoneStore::new();
@@ -313,7 +316,7 @@ impl ZoneSource for EtcdZoneSource {
                 continue;
             }
             let z = parse_zone(&value, origin)
-                .map_err(|e| format!("etcd 키 {key}의 DNS 영역을 해석하지 못했습니다: {e}"))?;
+                .map_err(|e| format!("Could not parse the DNS zone at etcd key {key}: {e}"))?;
             store.add(z);
         }
         *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = (count, max_mod);
@@ -332,7 +335,7 @@ impl ZoneSource for EtcdZoneSource {
                     .unreachable
                     .swap(false, std::sync::atomic::Ordering::Relaxed)
                 {
-                    onetdns_core::info!(event = "authority.etcd_reachable", endpoint = %self.endpoint, "etcd에 다시 닿아 영역 변경 감시를 재개했습니다");
+                    onetdns_core::info!(event = "authority.etcd_reachable", endpoint = %self.endpoint, "etcd is reachable again; resumed watching zone changes");
                 }
                 range
             }
@@ -341,7 +344,7 @@ impl ZoneSource for EtcdZoneSource {
                     .unreachable
                     .swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
-                    onetdns_core::warn!(event = "authority.etcd_unreachable", endpoint = %self.endpoint, %error, "etcd에 닿지 못해 영역 변경을 감시하지 못합니다. 이미 읽어 둔 영역으로 계속 응답합니다");
+                    onetdns_core::warn!(event = "authority.etcd_unreachable", endpoint = %self.endpoint, %error, "Cannot reach etcd, so zone changes are not being watched; still answering from the zones already loaded");
                 }
                 return false;
             }
@@ -398,7 +401,7 @@ impl std::fmt::Display for HttpError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HttpError::Unauthorized => write!(f, "etcd HTTP 401(인증에 실패했습니다)"),
+            HttpError::Unauthorized => write!(f, "etcd HTTP 401 (authentication failed)"),
             HttpError::Other(s) => write!(f, "{s}"),
         }
     }
@@ -430,7 +433,7 @@ fn http_post(
         None => SocketAddr::new(
             parts.host.parse::<IpAddr>().map_err(|_| {
                 HttpError::Other(format!(
-                    "etcd 서버를 호스트 이름으로 지정한 경우 초기 DNS 조회로 확인한 연결 주소가 필요합니다: hostname={}",
+                    "An etcd server given by host name needs a connection address resolved by the initial DNS lookup: hostname={}",
                     parts.host
                 ))
             })?,
@@ -449,8 +452,9 @@ fn http_post(
     let mut stream = DeadlineTcp::connect(addr, deadline)?;
 
     let resp = if parts.https {
-        let roots = tls
-            .ok_or_else(|| HttpError::Other("HTTPS 연결에 사용할 신뢰 저장소가 없습니다".into()))?;
+        let roots = tls.ok_or_else(|| {
+            HttpError::Other("There is no trust store for the HTTPS connection".into())
+        })?;
         let cfg = ClientConfig {
             server_name: parts.host,
             verify_name: true,
@@ -459,9 +463,9 @@ fn http_post(
             ..Default::default()
         };
         let mut conn = client_handshake(&mut stream, &cfg)
-            .map_err(|e| HttpError::Other(format!("etcd TLS 핸드셰이크: {e}")))?;
+            .map_err(|e| HttpError::Other(format!("etcd TLS handshake failed: {e}")))?;
         conn.write_app(&mut stream, req.as_bytes())
-            .map_err(|e| HttpError::Other(format!("etcd TLS 쓰기: {e}")))?;
+            .map_err(|e| HttpError::Other(format!("etcd TLS write failed: {e}")))?;
         read_tls_response(&mut conn, &mut stream)?
     } else {
         stream
@@ -497,21 +501,18 @@ fn endpoint_parts(endpoint: &str) -> Result<EndpointParts, HttpError> {
         .or_else(|| endpoint.strip_prefix("http://").map(|rest| (false, rest)))
         .ok_or_else(|| {
             HttpError::Other(format!(
-                "etcd 연결 주소는 `http://` 또는 `https://`로 시작해야 합니다: {endpoint}"
+                "The etcd endpoint must start with `http://` or `https://`: {endpoint}"
             ))
         })?;
     let authority = authority.trim_end_matches('/');
     if authority.is_empty() || authority.contains('/') || authority.chars().any(char::is_control) {
         return Err(HttpError::Other(format!(
-            "etcd 연결 주소의 형식이 올바르지 않습니다: {endpoint}"
+            "Invalid etcd endpoint: {endpoint}"
         )));
     }
     let default_port = if https { 443 } else { 80 };
-    let (host, port) = crate::split_host_port(authority, default_port).ok_or_else(|| {
-        HttpError::Other(format!(
-            "etcd 연결 주소의 형식이 올바르지 않습니다: {endpoint}"
-        ))
-    })?;
+    let (host, port) = crate::split_host_port(authority, default_port)
+        .ok_or_else(|| HttpError::Other(format!("Invalid etcd endpoint: {endpoint}")))?;
     Ok(EndpointParts {
         https,
         host,
@@ -537,7 +538,7 @@ fn read_plain_response(stream: &mut DeadlineTcp) -> Result<Vec<u8>, HttpError> {
         }
         if out.len().saturating_add(read) > MAX_HTTP_RESPONSE {
             return Err(HttpError::Other(
-                "etcd HTTP 응답 크기가 허용 한도를 넘었습니다".into(),
+                "etcd HTTP response exceeds the size limit".into(),
             ));
         }
         out.extend_from_slice(&chunk[..read]);
@@ -560,7 +561,7 @@ fn read_tls_response(
             Ok(d) => {
                 if out.len().saturating_add(d.len()) > MAX_HTTP_RESPONSE {
                     return Err(HttpError::Other(
-                        "etcd TLS 응답 크기가 허용 한도를 넘었습니다".into(),
+                        "etcd TLS response exceeds the size limit".into(),
                     ));
                 }
                 out.extend_from_slice(&d);
@@ -570,7 +571,7 @@ fn read_tls_response(
             }
             Err(error) => {
                 return Err(HttpError::Other(format!(
-                    "etcd TLS 응답 수신 실패: {error}"
+                    "Could not receive the etcd TLS response: {error}"
                 )))
             }
         }
@@ -587,14 +588,14 @@ fn response_content_length_complete(response: &[u8]) -> Result<bool, HttpError> 
     let Some(split) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         if response.len() > MAX_HTTP_HEADER {
             return Err(HttpError::Other(
-                "etcd HTTP 헤더 크기가 허용 한도를 넘었습니다".into(),
+                "etcd HTTP headers exceed the size limit".into(),
             ));
         }
         return Ok(false);
     };
     if split > MAX_HTTP_HEADER {
         return Err(HttpError::Other(
-            "etcd HTTP 헤더 크기가 허용 한도를 넘었습니다".into(),
+            "etcd HTTP headers exceed the size limit".into(),
         ));
     }
     let head = parse_http_head(&response[..split])?;
@@ -632,22 +633,20 @@ fn valid_http_header_name(name: &str) -> bool {
  */
 fn parse_http_field(line: &str) -> Result<(&str, &str), HttpError> {
     if line.len() > MAX_HTTP_HEADER_LINE {
-        return Err(HttpError::Other(
-            "etcd HTTP 헤더 줄이 허용 길이를 넘었습니다".into(),
-        ));
+        return Err(HttpError::Other("etcd HTTP header line is too long".into()));
     }
     let (name, value) = line
         .split_once(':')
-        .ok_or_else(|| HttpError::Other("HTTP 헤더 형식이 올바르지 않습니다".into()))?;
+        .ok_or_else(|| HttpError::Other("Malformed HTTP header".into()))?;
     if !valid_http_header_name(name) {
-        return Err(HttpError::Other("잘못된 HTTP 헤더 이름".into()));
+        return Err(HttpError::Other("Invalid HTTP header name".into()));
     }
     if value
         .bytes()
         .any(|byte| byte != b'\t' && (byte < b' ' || byte == 0x7f))
     {
         return Err(HttpError::Other(
-            "HTTP 헤더 값에 허용되지 않는 문자가 있습니다".into(),
+            "HTTP header value contains a character that is not allowed".into(),
         ));
     }
     Ok((name, value.trim_matches([' ', '\t'])))
@@ -657,23 +656,23 @@ fn parse_http_field(line: &str) -> Result<(&str, &str), HttpError> {
 fn parse_http_status(line: &str) -> Result<u16, HttpError> {
     if line.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
         return Err(HttpError::Other(
-            "HTTP 상태 줄에 허용되지 않는 문자가 있습니다".into(),
+            "HTTP status line contains a character that is not allowed".into(),
         ));
     }
     let (version, rest) = line
         .split_once(' ')
-        .ok_or_else(|| HttpError::Other("HTTP 상태 줄 형식이 올바르지 않습니다".into()))?;
+        .ok_or_else(|| HttpError::Other("Malformed HTTP status line".into()))?;
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
-        return Err(HttpError::Other("지원하지 않는 HTTP 버전".into()));
+        return Err(HttpError::Other("Unsupported HTTP version".into()));
     }
     let code = rest.split_once(' ').map_or(rest, |(code, _)| code);
     if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(HttpError::Other("HTTP 상태코드가 올바르지 않습니다".into()));
+        return Err(HttpError::Other("Invalid HTTP status code".into()));
     }
     code.parse::<u16>()
         .ok()
         .filter(|code| (100..=599).contains(code))
-        .ok_or_else(|| HttpError::Other("HTTP 상태코드가 올바르지 않습니다".into()))
+        .ok_or_else(|| HttpError::Other("Invalid HTTP status code".into()))
 }
 
 /**
@@ -686,12 +685,12 @@ fn parse_http_status(line: &str) -> Result<u16, HttpError> {
  */
 fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
     let head = std::str::from_utf8(head)
-        .map_err(|_| HttpError::Other("HTTP 헤더 UTF-8 형식이 올바르지 않습니다".into()))?;
+        .map_err(|_| HttpError::Other("HTTP header is not valid UTF-8".into()))?;
     let mut lines = head.split("\r\n");
     let status = parse_http_status(
         lines
             .next()
-            .ok_or_else(|| HttpError::Other("HTTP 상태 줄이 없습니다".into()))?,
+            .ok_or_else(|| HttpError::Other("HTTP status line is missing".into()))?,
     )?;
     let mut content_length = None;
     let mut chunked = false;
@@ -700,30 +699,30 @@ fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
         header_count = header_count.saturating_add(1);
         if header_count > MAX_HTTP_HEADERS {
             return Err(HttpError::Other(
-                "etcd HTTP 헤더 개수가 허용 한도를 넘었습니다".into(),
+                "etcd HTTP response has too many headers".into(),
             ));
         }
         let (name, value) = parse_http_field(line)?;
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
-                return Err(HttpError::Other("중복 Content-Length".into()));
+                return Err(HttpError::Other("Duplicate Content-Length".into()));
             }
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(HttpError::Other("잘못된 Content-Length".into()));
+                return Err(HttpError::Other("Invalid Content-Length".into()));
             }
             let length = value
                 .parse::<usize>()
-                .map_err(|_| HttpError::Other("잘못된 Content-Length".into()))?;
+                .map_err(|_| HttpError::Other("Invalid Content-Length".into()))?;
             if length > MAX_HTTP_BODY {
                 return Err(HttpError::Other(
-                    "etcd HTTP 본문 크기가 허용 한도를 넘었습니다".into(),
+                    "etcd HTTP body exceeds the size limit".into(),
                 ));
             }
             content_length = Some(length);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if chunked || !value.eq_ignore_ascii_case("chunked") {
                 return Err(HttpError::Other(
-                    "지원하지 않거나 중복된 Transfer-Encoding".into(),
+                    "Unsupported or duplicate Transfer-Encoding".into(),
                 ));
             }
             chunked = true;
@@ -731,7 +730,7 @@ fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
     }
     if chunked && content_length.is_some() {
         return Err(HttpError::Other(
-            "Transfer-Encoding과 Content-Length를 함께 사용할 수 없습니다".into(),
+            "Transfer-Encoding and Content-Length cannot be used together".into(),
         ));
     }
     Ok(ParsedHttpHead {
@@ -750,16 +749,16 @@ fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
 fn parse_http_response(resp: &[u8]) -> Result<String, HttpError> {
     if resp.len() > MAX_HTTP_RESPONSE {
         return Err(HttpError::Other(
-            "etcd HTTP 응답 크기가 허용 한도를 넘었습니다".into(),
+            "etcd HTTP response exceeds the size limit".into(),
         ));
     }
     let split = resp
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| HttpError::Other("HTTP 응답 형식이 올바르지 않습니다".into()))?;
+        .ok_or_else(|| HttpError::Other("Malformed HTTP response".into()))?;
     if split > MAX_HTTP_HEADER {
         return Err(HttpError::Other(
-            "etcd HTTP 헤더 크기가 허용 한도를 넘었습니다".into(),
+            "etcd HTTP headers exceed the size limit".into(),
         ));
     }
     let head = parse_http_head(&resp[..split])?;
@@ -769,7 +768,7 @@ fn parse_http_response(resp: &[u8]) -> Result<String, HttpError> {
     }
     if head.status != 200 {
         return Err(HttpError::Other(format!(
-            "etcd가 HTTP {} 오류를 반환했습니다: {}",
+            "etcd returned HTTP error {}: {}",
             head.status,
             String::from_utf8_lossy(&body[..body.len().min(200)])
         )));
@@ -780,20 +779,19 @@ fn parse_http_response(resp: &[u8]) -> Result<String, HttpError> {
         if let Some(expected) = head.content_length {
             if body.len() != expected {
                 return Err(HttpError::Other(format!(
-                    "etcd HTTP 본문 길이가 일치하지 않습니다: expected={expected} actual={}",
+                    "etcd HTTP body length mismatch: expected={expected} actual={}",
                     body.len()
                 )));
             }
         }
         if body.len() > MAX_HTTP_BODY {
             return Err(HttpError::Other(
-                "etcd HTTP 본문 크기가 허용 한도를 넘었습니다".into(),
+                "etcd HTTP body exceeds the size limit".into(),
             ));
         }
         body.to_vec()
     };
-    String::from_utf8(decoded)
-        .map_err(|_| HttpError::Other("etcd JSON UTF-8 형식이 올바르지 않습니다".into()))
+    String::from_utf8(decoded).map_err(|_| HttpError::Other("etcd JSON is not valid UTF-8".into()))
 }
 
 /**
@@ -810,23 +808,21 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, HttpError> {
             .windows(2)
             .position(|window| window == b"\r\n")
             .map(|relative| pos + relative)
-            .ok_or_else(|| {
-                HttpError::Other("청크 크기를 나타내는 줄이 중간에서 끊겼습니다".into())
-            })?;
+            .ok_or_else(|| HttpError::Other("Chunk size line is truncated".into()))?;
         let size_text = std::str::from_utf8(&body[pos..line_end]).map_err(|_| {
-            HttpError::Other("청크 크기 줄의 문자 인코딩이 올바르지 않습니다".into())
+            HttpError::Other("Chunk size line has an invalid character encoding".into())
         })?;
         if size_text.bytes().any(|byte| byte < b'!' || byte == 0x7f) {
             return Err(HttpError::Other(
-                "청크 크기 줄에 허용되지 않는 문자가 있습니다".into(),
+                "Chunk size line contains a character that is not allowed".into(),
             ));
         }
         let size_token = size_text.split(';').next().unwrap_or("");
         if size_token.is_empty() || !size_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(HttpError::Other("청크 크기 값이 올바르지 않습니다".into()));
+            return Err(HttpError::Other("Invalid chunk size".into()));
         }
         let size = usize::from_str_radix(size_token, 16)
-            .map_err(|_| HttpError::Other("청크 크기 값이 올바르지 않습니다".into()))?;
+            .map_err(|_| HttpError::Other("Invalid chunk size".into()))?;
         pos = line_end + 2;
         if size == 0 {
             let trailers = &body[pos..];
@@ -836,24 +832,22 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, HttpError> {
             let trailer_end = trailers
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
-                .ok_or_else(|| HttpError::Other("청크 트레일러가 중간에서 끊겼습니다".into()))?;
+                .ok_or_else(|| HttpError::Other("Chunk trailer is truncated".into()))?;
             if trailer_end + 4 != trailers.len() {
-                return Err(HttpError::Other("청크 본문 뒤 잉여 데이터".into()));
+                return Err(HttpError::Other("Extra data after the chunked body".into()));
             }
             let trailers = std::str::from_utf8(&trailers[..trailer_end])
-                .map_err(|_| HttpError::Other("청크 트레일러 인코딩이 올바르지 않습니다".into()))?;
+                .map_err(|_| HttpError::Other("Chunk trailer has an invalid encoding".into()))?;
             for (index, line) in trailers.split("\r\n").enumerate() {
                 if index >= MAX_HTTP_HEADERS {
-                    return Err(HttpError::Other(
-                        "청크 트레일러 개수가 허용 한도를 넘었습니다".into(),
-                    ));
+                    return Err(HttpError::Other("Chunk trailer has too many fields".into()));
                 }
                 let (name, _) = parse_http_field(line)?;
                 if name.eq_ignore_ascii_case("content-length")
                     || name.eq_ignore_ascii_case("transfer-encoding")
                 {
                     return Err(HttpError::Other(
-                        "청크 트레일러에 프레이밍 필드를 사용할 수 없습니다".into(),
+                        "Chunk trailers cannot contain framing fields".into(),
                     ));
                 }
             }
@@ -862,15 +856,17 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, HttpError> {
         let end = pos
             .checked_add(size)
             .filter(|end| *end <= body.len())
-            .ok_or_else(|| HttpError::Other("청크 전송 본문이 중간에서 끊겼습니다".into()))?;
+            .ok_or_else(|| HttpError::Other("Chunked body is truncated".into()))?;
         if out.len().saturating_add(size) > MAX_HTTP_BODY {
             return Err(HttpError::Other(
-                "etcd 응답 본문이 허용 크기를 넘었습니다".into(),
+                "etcd response body exceeds the size limit".into(),
             ));
         }
         out.extend_from_slice(&body[pos..end]);
         if body.get(end..end + 2) != Some(b"\r\n") {
-            return Err(HttpError::Other("청크 끝의 CRLF가 빠져 있습니다".into()));
+            return Err(HttpError::Other(
+                "Chunk is missing its trailing CRLF".into(),
+            ));
         }
         pos = end + 2;
     }
@@ -1014,7 +1010,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("초기 DNS 조회로 확인한 연결 주소"),
+            error.contains("resolved by the initial DNS lookup"),
             "{error}"
         );
     }

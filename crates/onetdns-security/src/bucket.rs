@@ -97,7 +97,9 @@ impl<K: Hash + Eq + Clone> TokenBucket<K> {
                 },
             );
         }
-        let b = map.get_mut(key).expect("방금 삽입했거나 기존 bucket");
+        let b = map
+            .get_mut(key)
+            .expect("Just inserted or an existing bucket");
         let elapsed = now.duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * self.rate).min(self.burst);
         b.last = now;

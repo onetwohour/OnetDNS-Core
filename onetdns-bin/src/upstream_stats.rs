@@ -51,7 +51,7 @@ pub(crate) fn save_upstream_stats(
                     event = "upstream.stats_save_recovered",
                     path = %path.display(),
                     failed_attempts = failures,
-                    "업스트림 DNS 서버 통계 파일 저장이 정상으로 돌아왔습니다"
+                    "Saving upstream DNS server statistics works again"
                 );
             }
         }
@@ -64,7 +64,7 @@ pub(crate) fn save_upstream_stats(
                     path = %path.display(),
                     consecutive_failures = failures,
                     %error,
-                    "업스트림 DNS 서버 통계를 파일에 저장하지 못했습니다"
+                    "Could not save upstream DNS server statistics to file"
                 );
             }
         }
@@ -83,7 +83,7 @@ pub(crate) fn load_upstream_stats(
                 event = "upstream.stats_load_failed",
                 path = %path.display(),
                 %error,
-                "업스트림 DNS 서버 통계 파일을 읽지 못해 이번 실행에서는 새로 집계합니다"
+                "Could not read the upstream DNS server statistics file; starting fresh for this run"
             );
             return vec![];
         }
@@ -95,7 +95,7 @@ pub(crate) fn load_upstream_stats(
                 event = "upstream.stats_parse_failed",
                 path = %path.display(),
                 %error,
-                "업스트림 DNS 서버 통계 파일이 손상되어 이번 실행에서는 새로 집계합니다"
+                "Upstream DNS server statistics file is corrupted; starting fresh for this run"
             );
             return vec![];
         }
@@ -104,7 +104,7 @@ pub(crate) fn load_upstream_stats(
         onetdns_core::warn!(
             event = "upstream.stats_format_invalid",
             path = %path.display(),
-            "업스트림 DNS 서버 통계 파일의 최상위 값이 객체가 아니어서 새로 집계합니다"
+            "Upstream DNS server statistics file does not hold a JSON object; starting fresh"
         );
         return vec![];
     };
@@ -155,7 +155,7 @@ pub(crate) fn load_upstream_stats(
         onetdns_core::warn!(
             event = "upstream.stats_format_invalid",
             path = %path.display(),
-            "업스트림 DNS 서버 통계 파일이 현재 형식과 일치하지 않아 새로 집계합니다"
+            "Upstream DNS server statistics file does not match the current format; starting fresh"
         );
         return vec![];
     };

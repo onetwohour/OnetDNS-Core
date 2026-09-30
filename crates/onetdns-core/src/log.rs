@@ -112,8 +112,6 @@ pub fn enabled(level: Level) -> bool {
  */
 pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body: &str) {
     let timestamp = utc_timestamp();
-    let current = std::thread::current();
-    let thread = current.name().unwrap_or("unnamed");
     let body = body.trim_end();
     let fallback_event = fallback_event_code(target, level);
     let matched_event = event_code(body);
@@ -127,6 +125,8 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
 
     let mut out = std::io::stderr().lock();
     if json {
+        let current = std::thread::current();
+        let thread = current.name().unwrap_or("unnamed");
         let _ = writeln!(
             out,
             "{{\"ts\":\"{}\",\"level\":\"{}\",\"event\":\"{}\",\"target\":\"{}\",\"pid\":{},\"thread\":\"{}\",\"source\":\"{}:{}\",\"message\":\"{}\"}}",
@@ -144,7 +144,7 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
         let _ = writeln!(
             out,
             "{}",
-            human_line(&timestamp, level, event, message, fields, file, line, thread)
+            human_line(&timestamp, level, event, message, fields)
         );
     }
 }
@@ -188,21 +188,11 @@ fn strip_event<'a>(fields: &'a str, code: Option<&str>) -> std::borrow::Cow<'a, 
  *
  * @details 순서는 「언제·얼마나 심각한지·무슨 일인지·무슨 뜻인지·자세한 값」이다. 문구를
  *          필드 뒤에 두면 화면 오른쪽 끝에서 잘려 정작 읽어야 할 것이 안 보인다.
- * @note target과 pid는 넣지 않는다. 한 프로세스의 콘솔에서는 매 줄에 같은 값이 붙어
+ * @note target, pid, 소스 위치, 스레드 이름은 넣지 않는다. 운영자가 읽는 줄에는 쓸모가 없고
  *       읽는 것을 방해하기만 한다. 수집기가 볼 JSON 쪽에는 그대로 있다.
  * @return 줄바꿈 없는 한 줄. 호출자가 한 번의 writeln으로 내보내야 스레드끼리 섞이지 않는다.
  */
-#[allow(clippy::too_many_arguments)]
-fn human_line(
-    timestamp: &str,
-    level: Level,
-    event: &str,
-    message: &str,
-    fields: &str,
-    file: &str,
-    line: u32,
-    thread: &str,
-) -> String {
+fn human_line(timestamp: &str, level: Level, event: &str, message: &str, fields: &str) -> String {
     use std::fmt::Write as _;
     let mut out =
         String::with_capacity(timestamp.len() + event.len() + message.len() + fields.len() + 32);
@@ -212,10 +202,6 @@ fn human_line(
     }
     if !fields.is_empty() {
         let _ = write!(out, "  {fields}");
-    }
-    // 고쳐야 할 줄에만 어디서 났는지 붙인다. 정상 시작 로그에는 필요 없다.
-    if level <= Level::Warn {
-        let _ = write!(out, "  ({file}:{line} {thread})");
     }
     out
 }
@@ -397,12 +383,12 @@ mod tests {
     /** @brief 사람이 읽는 줄에 event가 두 번 나오지 않고 문구가 앞에 오는지. */
     fn human_line_shows_the_message_before_the_fields_and_never_repeats_the_event() {
         let body = format!(
-            "event=do53.started addr=127.0.0.1:53 udp=true{MESSAGE_SEPARATOR}일반 DNS를 받습니다"
+            "event=do53.started addr=127.0.0.1:53 udp=true{MESSAGE_SEPARATOR}Listening for plain DNS"
         );
         let (fields, message) = split_body(&body);
         let code = event_code(&body);
         let fields = strip_event(fields, code);
-        assert_eq!(message, "일반 DNS를 받습니다");
+        assert_eq!(message, "Listening for plain DNS");
         assert_eq!(fields.as_ref(), "addr=127.0.0.1:53 udp=true");
 
         let line = human_line(
@@ -411,20 +397,13 @@ mod tests {
             code.unwrap(),
             message,
             fields.as_ref(),
-            "src/main.rs",
-            10,
-            "main",
         );
         assert_eq!(
             line,
-            "2026-08-02T00:00:00.000Z INFO  do53.started  일반 DNS를 받습니다  addr=127.0.0.1:53 udp=true"
+            "2026-08-02T00:00:00.000Z INFO  do53.started  Listening for plain DNS  addr=127.0.0.1:53 udp=true"
         );
         assert_eq!(line.matches("do53.started").count(), 1, "event는 한 번만");
         assert!(!line.contains("event="), "event= 필드는 앞자리로 올라간다");
-        assert!(
-            !line.contains("src/main.rs"),
-            "정상 시작 줄에는 소스 위치를 붙이지 않는다"
-        );
     }
 
     #[test]
@@ -442,19 +421,19 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고쳐야 할 줄에는 어디서 났는지 붙는지. */
-    fn warnings_carry_the_source_location() {
+    /** @brief 경고 줄도 문구와 값에서 끝나고 소스 위치나 스레드 이름을 붙이지 않는지. */
+    fn warnings_end_with_the_fields() {
         let line = human_line(
             "2026-08-02T00:00:00.000Z",
             Level::Warn,
             "cert.reload_failed",
             "인증서를 다시 읽지 못했습니다",
             "path=/x",
-            "src/tls.rs",
-            42,
-            "worker-3",
         );
-        assert!(line.ends_with("  (src/tls.rs:42 worker-3)"), "{line}");
+        assert_eq!(
+            line,
+            "2026-08-02T00:00:00.000Z WARN  cert.reload_failed  인증서를 다시 읽지 못했습니다  path=/x"
+        );
     }
 
     #[test]

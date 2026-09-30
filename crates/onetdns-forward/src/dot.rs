@@ -70,7 +70,7 @@ pub(crate) fn exchange(
                 transport = "dot",
                 addr = %addr,
                 idle_ms = idle.unwrap_or_default().as_millis() as u64,
-                "연결 풀에서 오래 사용하지 않은 연결을 닫았습니다"
+                "Closed an idle pooled connection"
             );
         }
 
@@ -88,7 +88,7 @@ pub(crate) fn exchange(
             };
             let (res, session) = {
                 let mut p = pool.borrow_mut();
-                let conn = p.get_mut(&key).expect("방금 삽입됨");
+                let conn = p.get_mut(&key).expect("Just inserted");
                 let r = roundtrip(conn, wire, wire_id, request, rt_deadline);
                 if r.is_ok() {
                     conn.last_used = Instant::now();
@@ -107,7 +107,7 @@ pub(crate) fn exchange(
                             transport = "dot",
                             addr = %addr,
                             reason = ?e,
-                            "기존 연결을 재사용하지 못해 새 연결로 다시 시도합니다"
+                            "Could not reuse the existing connection; retrying on a new one"
                         );
                     }
                     if attempt == 1 {
@@ -143,7 +143,7 @@ fn connect(
     };
     let tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
         crate::note_upstream_connect_failure("dot", addr, server_name, &e);
-        ForwardError::Io(format!("DoT 보안 연결을 설정하지 못했습니다: {e}"))
+        ForwardError::Io(format!("DoT handshake failed: {e}"))
     })?;
     if !tls.is_resumed() {
         crate::check_revocation(tls.peer_chain(), server_name)?;
@@ -187,7 +187,7 @@ fn read_n(conn: &mut DotConn, n: usize, deadline: Instant) -> Result<Vec<u8>, Fo
         conn.tcp.set_deadline(deadline);
         let chunk = conn.tls.read_app(&mut conn.tcp).map_err(tls_io)?;
         if chunk.is_empty() {
-            return Err(ForwardError::Io("DoT 서버가 연결을 종료했습니다".into()));
+            return Err(ForwardError::Io("DoT server closed the connection".into()));
         }
         conn.buf.extend_from_slice(&chunk);
     }
@@ -202,7 +202,7 @@ fn read_n(conn: &mut DotConn, n: usize, deadline: Instant) -> Result<Vec<u8>, Fo
  *       상대가 그것을 신탁으로 삼을 수 있다.
  */
 fn tls_io(_e: onetdns_tls::TlsError) -> ForwardError {
-    ForwardError::Io("DoT TLS 연결에서 입출력 오류가 발생했습니다".into())
+    ForwardError::Io("I/O error on the DoT TLS connection".into())
 }
 
 #[cfg(test)]

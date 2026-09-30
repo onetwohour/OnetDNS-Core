@@ -146,12 +146,12 @@ pub(crate) fn detect_dns53_interception(
                     authority_tcp_switch().store(true, Ordering::Relaxed);
                     onetdns_core::warn!(event = "net.port53_udp_intercepted",
                         root = %root,
-                        "외부 UDP 53번이 가로채져 있어 재귀 해석의 권한 서버 질의를 TCP로 보냅니다"
+                        "Outgoing UDP port 53 is intercepted; sending recursive queries to authoritative servers over TCP"
                     );
                 } else {
                     onetdns_core::warn!(event = "net.port53_intercepted",
                         root = %root,
-                        "외부 53번 포트가 가로채져 직접 재귀 해석을 사용할 수 없습니다. 암호화 업스트림 DNS 서버 사용을 권장합니다"
+                        "Outgoing port 53 is intercepted, so direct recursion is unavailable; use an encrypted upstream DNS server instead"
                     );
                 }
                 return;
@@ -161,7 +161,7 @@ pub(crate) fn detect_dns53_interception(
                     authority_tcp_switch().store(true, Ordering::Relaxed);
                     onetdns_core::warn!(event = "net.port53_udp_blocked",
                         root = %root,
-                        "루트 서버가 UDP 53번으로 답하지 않아 재귀 해석의 권한 서버 질의를 TCP로 보냅니다"
+                        "Root servers do not answer on UDP port 53; sending recursive queries to authoritative servers over TCP"
                     );
                 }
             }
@@ -170,7 +170,7 @@ pub(crate) fn detect_dns53_interception(
         Ok(thread) => Some(thread),
         Err(error) => {
             PROBED.store(false, Ordering::Relaxed);
-            onetdns_core::warn!(event = "net.intercept_probe_thread_failed", %error, "53번 포트 가로채기 진단 스레드를 시작하지 못했습니다");
+            onetdns_core::warn!(event = "net.intercept_probe_thread_failed", %error, "Could not start the port 53 interception check thread");
             None
         }
     }
@@ -230,14 +230,14 @@ pub(crate) fn spawn_ta_signaling(
                 match onetdns_proto::Name::from_str(&label) {
                     Ok(name) => match r.resolve(&name, onetdns_proto::RecordType(10)) {
                         Ok(_) => {
-                            onetdns_core::info!(event = "dnssec.ta_signal_sent", signal = %label, "RFC 8145 신뢰 앵커 신호를 전송했습니다");
+                            onetdns_core::info!(event = "dnssec.ta_signal_sent", signal = %label, "Sent RFC 8145 trust anchor signal");
                         }
                         Err(error) => {
-                            onetdns_core::warn!(event = "dnssec.ta_signal_failed", signal = %label, error = ?error, "RFC 8145 신뢰 앵커 신호를 보내지 못했습니다");
+                            onetdns_core::warn!(event = "dnssec.ta_signal_failed", signal = %label, error = ?error, "Could not send RFC 8145 trust anchor signal");
                         }
                     },
                     Err(error) => {
-                        onetdns_core::warn!(event = "dnssec.ta_signal_name_invalid", signal = %label, error = ?error, "신뢰 앵커 신호 이름을 만들지 못했습니다");
+                        onetdns_core::warn!(event = "dnssec.ta_signal_name_invalid", signal = %label, error = ?error, "Could not build the trust anchor signal name");
                     }
                 }
             }
@@ -268,26 +268,26 @@ pub(crate) fn load_configured_trust_anchors(
 ) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
     let text = read_text_limited(path, LOCAL_STATE_MAX_BYTES).with_context(|| {
         format!(
-            "DNSSEC 신뢰 앵커 상태 파일 '{}'을 읽지 못했습니다",
+            "Could not read the DNSSEC trust anchor state file '{}'",
             path.display()
         )
     })?;
     let manager = onetdns_dnssec::anchor::AnchorManager::deserialize(&text).ok_or_else(|| {
         crate::anyhow!(
-            "DNSSEC 신뢰 앵커 상태 파일 '{}'의 형식이 올바르지 않습니다",
+            "DNSSEC trust anchor state file '{}' is malformed",
             path.display()
         )
     })?;
     if !manager.zone.is_root() {
         return Err(crate::anyhow!(
-            "DNSSEC 신뢰 앵커 상태 파일 '{}'은 현재 루트 영역 앵커만 지원합니다",
+            "DNSSEC trust anchor state file '{}' supports only the root zone anchor",
             path.display()
         ));
     }
     let anchors = manager.active_ds();
     if anchors.is_empty() {
         return Err(crate::anyhow!(
-            "DNSSEC 신뢰 앵커 상태 파일 '{}'에 활성 키가 없습니다",
+            "DNSSEC trust anchor state file '{}' has no active key",
             path.display()
         ));
     }
@@ -347,19 +347,19 @@ pub(crate) fn spawn_rfc5011(
                             .collect();
                         if !bootstrap.is_empty() {
                             mgr = AnchorManager::bootstrap(root.clone(), bootstrap, unix_now());
-                            onetdns_core::info!(event = "dnssec.rfc5011_initialized", keys = mgr.active_ds().len(), "RFC 5011 루트 KSK 초기화를 마쳤습니다");
+                            onetdns_core::info!(event = "dnssec.rfc5011_initialized", keys = mgr.active_ds().len(), "Finished RFC 5011 root KSK initialization");
                         }
                     } else {
                         let changed = mgr.update(&keys, &sigs, unix_now());
                         if changed {
-                            onetdns_core::info!(event = "dnssec.rfc5011_state_changed", active = mgr.active_ds().len(), "RFC 5011 신뢰 앵커 상태가 바뀌었습니다");
+                            onetdns_core::info!(event = "dnssec.rfc5011_state_changed", active = mgr.active_ds().len(), "RFC 5011 trust anchor state changed");
                         }
                     }
 
                     if let Err(e) = crate::atomic_write(&anchor_file, mgr.serialize().as_bytes()) {
 
                         mgr = previous_mgr;
-                        onetdns_core::warn!(event = "dnssec.rfc5011_save_failed", error = %e, "RFC 5011 신뢰 앵커 상태를 저장하지 못해 메모리의 변경도 되돌렸습니다");
+                        onetdns_core::warn!(event = "dnssec.rfc5011_save_failed", error = %e, "Could not save RFC 5011 trust anchor state; reverted the in-memory change too");
                     } else {
                         let active = mgr.active_ds();
                         if !active.is_empty() {
@@ -367,7 +367,7 @@ pub(crate) fn spawn_rfc5011(
                         }
                     }
                 }
-                Err(e) => onetdns_core::warn!(event = "dnssec.rfc5011_query_failed", error = %e, "RFC 5011 루트 DNSKEY를 조회하지 못했습니다. 다음 주기에 다시 시도합니다"),
+                Err(e) => onetdns_core::warn!(event = "dnssec.rfc5011_query_failed", error = %e, "Could not fetch the root DNSKEY for RFC 5011; retrying next cycle"),
             }
 
             if sleep_or_shutdown(12 * 3600, &shutdown) {

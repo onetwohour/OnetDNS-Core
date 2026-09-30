@@ -169,12 +169,12 @@ impl<'a> Parser<'a> {
                 let name = self.parse_bare_key()?;
                 self.skip_inline_ws();
                 if self.bump() != Some(b']') {
-                    return Err(format!("'{name}' 헤더를 닫는 ']' 문자가 빠져 있습니다"));
+                    return Err(format!("The '{name}' header is missing its closing ']'"));
                 }
                 if array {
                     if self.bump() != Some(b']') {
                         return Err(format!(
-                            "'{name}' 배열 테이블을 닫는 ']]' 문자가 빠져 있습니다"
+                            "The '{name}' array of tables is missing its closing ']]'"
                         ));
                     }
 
@@ -184,13 +184,13 @@ impl<'a> Parser<'a> {
                     if let Value::Array(a) = arr {
                         a.push(Value::Table(BTreeMap::new()));
                     } else {
-                        return Err(format!("'{name}'가 배열-테이블이 아닙니다"));
+                        return Err(format!("'{name}' is not an array of tables"));
                     }
                     cur_path = vec![name];
                     cur_is_array = true;
                 } else {
                     if root.contains_key(&name) {
-                        return Err(format!("중복 테이블 헤더: '[{name}]'"));
+                        return Err(format!("Duplicate table header: '[{name}]'"));
                     }
                     root.insert(name.clone(), Value::Table(BTreeMap::new()));
                     cur_path = vec![name];
@@ -201,7 +201,7 @@ impl<'a> Parser<'a> {
                 let key = self.parse_bare_key()?;
                 self.skip_inline_ws();
                 if self.bump() != Some(b'=') {
-                    return Err(format!("'{key}' 다음에 '=' 문자가 빠져 있습니다"));
+                    return Err(format!("'{key}' is missing its '='"));
                 }
                 self.skip_inline_ws();
                 let val = self.parse_value()?;
@@ -222,7 +222,7 @@ impl<'a> Parser<'a> {
             }
             None => Ok(()),
             Some(other) => Err(format!(
-                "값 또는 헤더 뒤에 허용되지 않는 문자 '{}' (위치 {})",
+                "Unexpected character '{}' after a value or header (position {})",
                 other as char, self.i
             )),
         }
@@ -242,7 +242,7 @@ impl<'a> Parser<'a> {
     ) -> PResult<()> {
         if path.is_empty() {
             if root.contains_key(&key) {
-                return Err(format!("중복 키: '{key}'"));
+                return Err(format!("Duplicate key: '{key}'"));
             }
             root.insert(key, val);
             return Ok(());
@@ -250,23 +250,23 @@ impl<'a> Parser<'a> {
         let head = &path[0];
         let target = root
             .get_mut(head)
-            .ok_or_else(|| format!("내부 오류: '{head}' 테이블을 찾을 수 없습니다"))?;
+            .ok_or_else(|| format!("Internal error: table '{head}' not found"))?;
         let table = if is_array {
             match target {
                 Value::Array(a) => match a.last_mut() {
                     Some(Value::Table(t)) => t,
-                    _ => return Err(format!("'{head}' 배열의 항목이 테이블이 아닙니다")),
+                    _ => return Err(format!("An item of array '{head}' is not a table")),
                 },
-                _ => return Err(format!("'{head}' 값이 배열이 아닙니다")),
+                _ => return Err(format!("'{head}' is not an array")),
             }
         } else {
             match target {
                 Value::Table(t) => t,
-                _ => return Err(format!("'{head}' 값이 테이블이 아닙니다")),
+                _ => return Err(format!("'{head}' is not a table")),
             }
         };
         if table.contains_key(&key) {
-            return Err(format!("중복 키: '{}.{key}'", path.join(".")));
+            return Err(format!("Duplicate key: '{}.{key}'", path.join(".")));
         }
         table.insert(key, val);
         Ok(())
@@ -288,7 +288,7 @@ impl<'a> Parser<'a> {
             }
         }
         if self.i == start {
-            return Err(format!("키를 찾을 수 없습니다(위치 {})", self.i));
+            return Err(format!("Could not find a key (position {})", self.i));
         }
         Ok(String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
     }
@@ -302,18 +302,18 @@ impl<'a> Parser<'a> {
             Some(b'{') => self.parse_inline_table(),
             Some(c) if c == b't' || c == b'f' => self.parse_bool(),
             Some(c) if c == b'-' || c == b'+' || c.is_ascii_digit() => self.parse_number(),
-            other => Err(format!("값을 파싱할 수 없습니다: {other:?}")),
+            other => Err(format!("Could not parse the value: {other:?}")),
         }
     }
 
     /** @brief 문자열을 읽는다. 이스케이프를 푼다. */
     fn parse_string(&mut self) -> PResult<String> {
-        let quote = self.bump().ok_or("문자열을 여는 따옴표가 없습니다")?;
+        let quote = self.bump().ok_or("The string has no opening quote")?;
         let mut out: Vec<u8> = Vec::new();
         while let Some(c) = self.bump() {
             if c == quote {
                 return String::from_utf8(out)
-                    .map_err(|_| "문자열이 올바른 UTF-8이 아닙니다".to_string());
+                    .map_err(|_| "The string is not valid UTF-8".to_string());
             }
             if c == b'\\' && quote == b'"' {
                 match self.bump() {
@@ -327,19 +327,19 @@ impl<'a> Parser<'a> {
                     Some(b'u') => self.push_unicode_escape(4, &mut out)?,
                     Some(b'U') => self.push_unicode_escape(8, &mut out)?,
                     Some(other) => {
-                        return Err(format!("지원하지 않는 문자열 escape: \\{}", other as char));
+                        return Err(format!("Unsupported string escape: \\{}", other as char));
                     }
-                    None => return Err("문자열 escape가 잘림".into()),
+                    None => return Err("String escape is truncated".into()),
                 }
             } else {
                 if c < 0x20 && c != b'\t' {
-                    return Err("문자열에 제어 문자를 직접 넣을 수 없습니다".into());
+                    return Err("Strings cannot contain raw control characters".into());
                 }
 
                 out.push(c);
             }
         }
-        Err("문자열을 닫는 따옴표가 없습니다".into())
+        Err("String is missing its closing quote".into())
     }
 
     /** @brief 유니코드 이스케이프를 UTF-8로 푼다. */
@@ -348,13 +348,13 @@ impl<'a> Parser<'a> {
             .i
             .checked_add(digits)
             .filter(|end| *end <= self.s.len())
-            .ok_or_else(|| "Unicode escape가 잘림".to_string())?;
+            .ok_or_else(|| "Unicode escape is truncated".to_string())?;
         let raw = std::str::from_utf8(&self.s[self.i..end])
-            .map_err(|_| "Unicode escape가 ASCII가 아닙니다".to_string())?;
+            .map_err(|_| "Unicode escape is not ASCII".to_string())?;
         let value =
-            u32::from_str_radix(raw, 16).map_err(|_| format!("잘못된 Unicode escape: {raw}"))?;
+            u32::from_str_radix(raw, 16).map_err(|_| format!("Invalid Unicode escape: {raw}"))?;
         let ch = char::from_u32(value)
-            .ok_or_else(|| format!("허용되지 않는 Unicode scalar: U+{value:04X}"))?;
+            .ok_or_else(|| format!("Unicode scalar not allowed: U+{value:04X}"))?;
         let mut encoded = [0u8; 4];
         out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
         self.i = end;
@@ -370,7 +370,7 @@ impl<'a> Parser<'a> {
             self.i += 5;
             Ok(Value::Bool(false))
         } else {
-            Err("bool 해석하지 못했습니다".into())
+            Err("Could not parse bool".into())
         }
     }
 
@@ -398,18 +398,20 @@ impl<'a> Parser<'a> {
         if is_float {
             raw.parse::<f64>()
                 .map(Value::Float)
-                .map_err(|e| format!("실수 해석하지 못했습니다 '{raw}': {e}"))
+                .map_err(|e| format!("Could not parse float '{raw}': {e}"))
         } else {
             raw.parse::<i64>()
                 .map(Value::Int)
-                .map_err(|e| format!("정수 해석하지 못했습니다 '{raw}': {e}"))
+                .map_err(|e| format!("Could not parse integer '{raw}': {e}"))
         }
     }
 
     /** @brief 배열을 읽는다. 깊이를 세며 들어간다. */
     fn parse_array(&mut self) -> PResult<Value> {
         if self.depth >= MAX_NESTING {
-            return Err(format!("배열/테이블 중첩은 {MAX_NESTING}단계 이하여야 함"));
+            return Err(format!(
+                "Arrays and tables can nest at most {MAX_NESTING} levels"
+            ));
         }
         self.depth += 1;
         let result = self.parse_array_inner();
@@ -428,7 +430,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return Ok(Value::Array(out));
                 }
-                None => return Err("배열을 닫는 ']'가 없습니다".into()),
+                None => return Err("Array is missing its closing ']'".into()),
                 _ => {
                     out.push(self.parse_value()?);
                     self.skip_ws();
@@ -437,10 +439,10 @@ impl<'a> Parser<'a> {
                             self.bump();
                         }
                         Some(b']') => {}
-                        None => return Err("배열을 닫는 ']'가 없습니다".into()),
+                        None => return Err("Array is missing its closing ']'".into()),
                         Some(other) => {
                             return Err(format!(
-                                "배열 값 뒤에 ',' 또는 ']' 필요, '{}' 발견",
+                                "Expected ',' or ']' after array value, found '{}'",
                                 other as char
                             ));
                         }
@@ -453,7 +455,9 @@ impl<'a> Parser<'a> {
     /** @brief 인라인 테이블를 읽는다. */
     fn parse_inline_table(&mut self) -> PResult<Value> {
         if self.depth >= MAX_NESTING {
-            return Err(format!("배열/테이블 중첩은 {MAX_NESTING}단계 이하여야 함"));
+            return Err(format!(
+                "Arrays and tables can nest at most {MAX_NESTING} levels"
+            ));
         }
         self.depth += 1;
         let result = self.parse_inline_table_inner();
@@ -472,17 +476,17 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return Ok(Value::Table(t));
                 }
-                None => return Err("인라인 테이블을 닫는 '}'가 없습니다".into()),
+                None => return Err("Inline table is missing its closing '}'".into()),
                 _ => {
                     let key = self.parse_bare_key()?;
                     self.skip_inline_ws();
                     if self.bump() != Some(b'=') {
-                        return Err(format!("인라인 테이블의 '{key}' 항목 뒤에 '='가 없습니다"));
+                        return Err(format!("Inline table entry '{key}' is missing '='"));
                     }
                     self.skip_inline_ws();
                     let val = self.parse_value()?;
                     if t.contains_key(&key) {
-                        return Err(format!("인라인 테이블에 '{key}' 항목이 두 번 있습니다"));
+                        return Err(format!("Inline table has duplicate entry '{key}'"));
                     }
                     t.insert(key, val);
                     self.skip_inline_ws();
@@ -491,10 +495,10 @@ impl<'a> Parser<'a> {
                             self.bump();
                         }
                         Some(b'}') => {}
-                        None => return Err("인라인 테이블을 닫는 '}'가 없습니다".into()),
+                        None => return Err("Inline table is missing its closing '}'".into()),
                         Some(other) => {
                             return Err(format!(
-                                "인라인 테이블 값 뒤에 ',' 또는 '}}' 필요, '{}' 발견",
+                                "Expected ',' or '}}' after inline table value, found '{}'",
                                 other as char
                             ));
                         }
@@ -589,16 +593,14 @@ impl<'a> Parser<'a> {
                 let name = self.parse_bare_key()?;
                 self.skip_inline_ws();
                 if self.bump() != Some(b']') {
-                    return Err(format!("'{name}' 헤더를 닫는 ']' 문자가 빠져 있습니다"));
+                    return Err(format!("Header '{name}' is missing its closing ']'"));
                 }
                 if is_array {
                     if self.bump() != Some(b']') {
-                        return Err(format!(
-                            "'{name}' 배열 테이블을 닫는 ']]' 문자가 빠져 있습니다"
-                        ));
+                        return Err(format!("Array table '{name}' is missing its closing ']]'"));
                     }
                 } else if !table_names.insert(name.clone()) {
-                    return Err(format!("중복 테이블 헤더: '[{name}]'"));
+                    return Err(format!("Duplicate table header: '[{name}]'"));
                 }
                 self.finish_line()?;
                 entries.push(TopEntry::Header {
@@ -613,7 +615,7 @@ impl<'a> Parser<'a> {
                 let key = self.parse_bare_key()?;
                 self.skip_inline_ws();
                 if self.bump() != Some(b'=') {
-                    return Err(format!("'{key}' 다음에 '=' 문자가 빠져 있습니다"));
+                    return Err(format!("Missing '=' after '{key}'"));
                 }
                 self.skip_inline_ws();
                 let value = self.parse_value()?;
@@ -623,7 +625,7 @@ impl<'a> Parser<'a> {
                     Some(_) => !block_keys.insert(key.clone()),
                 };
                 if duplicate {
-                    return Err(format!("중복 키: '{key}'"));
+                    return Err(format!("Duplicate key: '{key}'"));
                 }
                 entries.push(TopEntry::Assign {
                     key,

@@ -1,5 +1,5 @@
 /*!
- * @brief 설정 항목마다 ko/en/ja 문구가 실제로 그 항목을 설명하는지 검사한다.
+ * @brief 설정 항목마다 ko/en/ja/zh 문구가 실제로 그 항목을 설명하는지 검사한다.
  *
  * @details 변수 이름을 그대로 옮긴 딱지나, 여러 항목에 같은 문장을 복사한 설명은
  *          화면을 채우기만 할 뿐 아무것도 알려 주지 않는다. 번역칸을 한국어로 채운
@@ -163,11 +163,11 @@ fn field_keys(source: &str) -> Vec<String> {
     out
 }
 
-/** @brief 한 항목의 여섯 가지 문구. */
+/** @brief 한 항목의 언어별 딱지와 설명. 순서는 ko, en, ja, zh 이다. */
 struct Copy {
     key: String,
-    label: [String; 3],
-    description: [String; 3],
+    label: [String; 4],
+    description: [String; 4],
 }
 
 /** @brief FieldCopy 선언을 모두 읽는다. */
@@ -185,9 +185,11 @@ fn copies(source: &str) -> Vec<Copy> {
             "label_ko:",
             "label_en:",
             "label_ja:",
+            "label_zh:",
             "description_ko:",
             "description_en:",
             "description_ja:",
+            "description_zh:",
         ] {
             match string_after(source, cursor, marker) {
                 Some((value, next)) => {
@@ -203,8 +205,18 @@ fn copies(source: &str) -> Vec<Copy> {
         if ok {
             out.push(Copy {
                 key,
-                label: [values[0].clone(), values[1].clone(), values[2].clone()],
-                description: [values[3].clone(), values[4].clone(), values[5].clone()],
+                label: [
+                    values[0].clone(),
+                    values[1].clone(),
+                    values[2].clone(),
+                    values[3].clone(),
+                ],
+                description: [
+                    values[4].clone(),
+                    values[5].clone(),
+                    values[6].clone(),
+                    values[7].clone(),
+                ],
             });
         }
         from = cursor.max(start + 11);
@@ -266,7 +278,7 @@ fn every_copy_is_specific_enough() {
     let source = schema();
     let mut bad = Vec::new();
     for entry in copies(&source) {
-        for (index, language) in [(0, "ko"), (1, "en"), (2, "ja")] {
+        for (index, language) in [(0, "ko"), (1, "en"), (2, "ja"), (3, "zh")] {
             let label = entry.label[index].trim();
             let description = entry.description[index].trim();
             if label.chars().count() < 2 {
@@ -294,6 +306,9 @@ fn every_copy_is_specific_enough() {
         if has_hangul(&entry.label[2]) || has_hangul(&entry.description[2]) {
             bad.push(format!("{} ja: 한국어가 남아 있습니다", entry.key));
         }
+        if has_hangul(&entry.label[3]) || has_hangul(&entry.description[3]) {
+            bad.push(format!("{} zh: 한국어가 남아 있습니다", entry.key));
+        }
         if has_word(&entry.label[1], GENERATED_EN) || entry.label[1].contains("Control Control") {
             bad.push(format!(
                 "{} en: 변수 이름에서 만든 딱지입니다 ({})",
@@ -320,7 +335,7 @@ fn no_description_is_pasted_across_many_fields() {
     let source = schema();
     let entries = copies(&source);
     let mut repeated = Vec::new();
-    for (index, language) in [(0, "ko"), (1, "en"), (2, "ja")] {
+    for (index, language) in [(0, "ko"), (1, "en"), (2, "ja"), (3, "zh")] {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for entry in &entries {
             *counts.entry(entry.description[index].as_str()).or_default() += 1;
@@ -358,8 +373,8 @@ fn every_enum_value_has_a_label() {
             values.push(value);
             cursor = next;
         }
-        if values.len() >= 5 && values[1] == "enum" {
-            for value in values[4].split('|').filter(|v| !v.is_empty()) {
+        if values.len() >= 4 && values[1] == "enum" {
+            for value in values[3].split('|').filter(|v| !v.is_empty()) {
                 assert!(
                     !value.contains('('),
                     "선택지의 원값에 설명이 섞여 있습니다: {value}"

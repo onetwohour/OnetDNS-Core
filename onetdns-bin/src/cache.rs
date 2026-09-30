@@ -332,7 +332,7 @@ impl ClientFlight {
         Some(
             result
                 .as_ref()
-                .expect("앞에서 클라이언트 요청 완료를 확인했습니다")
+                .expect("Client request completion was checked above")
                 .clone(),
         )
     }
@@ -1514,7 +1514,7 @@ impl Resolver for CacheLayer {
             {
                 if let Some(recorder) = &self.recorder {
                     recorder.record_cache(true);
-                    onetdns_forward::note_response_source("캐시");
+                    onetdns_forward::note_response_source("cache");
                 }
                 return ResolveOutcome::Response(cached_message(
                     req,
@@ -1529,7 +1529,7 @@ impl Resolver for CacheLayer {
         if let Some(rcode) = self.failure_hit(request_key.as_slice()) {
             if let Some(recorder) = &self.recorder {
                 recorder.record_cache(true);
-                onetdns_forward::note_response_source("캐시");
+                onetdns_forward::note_response_source("cache");
             }
             return ResolveOutcome::Response(cached_message(
                 req,
@@ -1598,7 +1598,7 @@ impl Resolver for CacheLayer {
                 {
                     if let Some(recorder) = &self.recorder {
                         recorder.record_cache(true);
-                        onetdns_forward::note_response_source("캐시");
+                        onetdns_forward::note_response_source("cache");
                     }
                     return Ok(cached_message(
                         req,
@@ -1613,7 +1613,7 @@ impl Resolver for CacheLayer {
             if let Some(rcode) = self.failure_hit(flight_key.as_slice()) {
                 if let Some(recorder) = &self.recorder {
                     recorder.record_cache(true);
-                    onetdns_forward::note_response_source("캐시");
+                    onetdns_forward::note_response_source("cache");
                 }
                 return Ok(cached_message(req, rcode, vec![], vec![], vec![], false));
             }

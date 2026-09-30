@@ -153,7 +153,7 @@ impl Action {
             1 => Ok(Action::Allow),
             2 => Ok(Action::Block),
             3 => Ok(Action::Refuse),
-            other => Err(format!("알 수 없는 정책 반환 코드: {other}")),
+            other => Err(format!("Unknown policy return code: {other}")),
         }
     }
 }
@@ -169,7 +169,7 @@ impl std::fmt::Display for PolicyError {
     /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PolicyError::Wasm(s) => write!(f, "WASM 정책 오류: {s}"),
+            PolicyError::Wasm(s) => write!(f, "WASM policy error: {s}"),
         }
     }
 }

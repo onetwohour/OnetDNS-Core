@@ -58,15 +58,15 @@ impl Aead {
         match self {
             Aead::Aes128Gcm => Aes128Gcm::new(key.into())
                 .encrypt(aes_gcm::Nonce::from_slice(&nonce), pl)
-                .expect("AES-128-GCM 암호화에 필요한 키와 nonce 길이가 올바라야 합니다"),
+                .expect("AES-128-GCM key and nonce must have the correct length"),
             Aead::Aes256Gcm => Aes256Gcm::new(key.into())
                 .encrypt(aes_gcm::Nonce::from_slice(&nonce), pl)
-                .expect("AES-256-GCM 암호화에 필요한 키와 nonce 길이가 올바라야 합니다"),
+                .expect("AES-256-GCM key and nonce must have the correct length"),
             Aead::ChaCha20Poly1305 => {
                 let c = ChaCha20Poly1305::new_from_slice(key)
-                    .expect("ChaCha20-Poly1305 키 길이는 32바이트여야 합니다");
+                    .expect("ChaCha20-Poly1305 key must be 32 bytes");
                 c.encrypt(chacha20poly1305::Nonce::from_slice(&nonce), pl)
-                    .expect("ChaCha20-Poly1305 암호화에 필요한 키와 nonce 길이가 올바라야 합니다")
+                    .expect("ChaCha20-Poly1305 key and nonce must have the correct length")
             }
         }
     }
@@ -94,7 +94,7 @@ impl Aead {
                 .ok(),
             Aead::ChaCha20Poly1305 => {
                 let c = ChaCha20Poly1305::new_from_slice(key)
-                    .expect("ChaCha20-Poly1305 키 길이는 32바이트여야 합니다");
+                    .expect("ChaCha20-Poly1305 key must be 32 bytes");
                 c.decrypt(chacha20poly1305::Nonce::from_slice(&nonce), pl)
                     .ok()
             }

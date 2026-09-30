@@ -159,7 +159,7 @@ pub(crate) fn load_querylog(
                 event = "querylog.restore_open_failed",
                 path = %path.display(),
                 %error,
-                "기존 질의 기록 파일을 열지 못해 빈 기록으로 시작합니다"
+                "Could not open the existing query log file; starting with an empty log"
             );
             return out;
         }
@@ -181,7 +181,7 @@ pub(crate) fn load_querylog(
                     event = "querylog.restore_read_failed",
                     path = %path.display(),
                     %error,
-                    "질의 기록 파일을 읽는 중 오류가 발생해 빈 기록으로 시작합니다"
+                    "Error reading the query log file; starting with an empty log"
                 );
                 return VecDeque::new();
             }
@@ -213,7 +213,7 @@ pub(crate) fn load_querylog(
             path = %path.display(),
             oversized,
             malformed,
-            "질의 기록 파일이 손상되어 빈 기록으로 시작합니다"
+            "Query log file is corrupted; starting with an empty log"
         );
         return VecDeque::new();
     }
@@ -442,7 +442,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 event = "stats.restore_open_failed",
                 path = %path.display(),
                 %error,
-                "기존 통계 파일을 열지 못해 누적 통계를 새로 시작합니다"
+                "Could not open the existing statistics file; starting statistics fresh"
             );
             return;
         }
@@ -455,7 +455,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
             event = "stats.restore_read_failed",
             path = %path.display(),
             %error,
-            "기존 통계 파일을 읽지 못해 누적 통계를 새로 시작합니다"
+            "Could not read the existing statistics file; starting statistics fresh"
         );
         return;
     }
@@ -465,7 +465,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
             path = %path.display(),
             bytes = bytes.len(),
             limit = MAX_STATS_FILE,
-            "기존 통계 파일이 허용 크기를 넘어 복원하지 않습니다"
+            "Existing statistics file exceeds the size limit; not restoring it"
         );
         return;
     }
@@ -476,7 +476,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 event = "stats.restore_invalid_utf8",
                 path = %path.display(),
                 %error,
-                "기존 통계 파일의 문자 인코딩이 올바르지 않아 복원하지 않습니다"
+                "Existing statistics file is not valid text; not restoring it"
             );
             return;
         }
@@ -488,7 +488,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 event = "stats.restore_invalid_json",
                 path = %path.display(),
                 %error,
-                "기존 통계 파일의 JSON 형식이 올바르지 않아 복원하지 않습니다"
+                "Existing statistics file is not valid JSON; not restoring it"
             );
             return;
         }
@@ -500,7 +500,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 event = "stats.restore_invalid_value",
                 path = %path.display(),
                 reason,
-                "기존 통계 파일에 올바르지 않은 값이 있어 전체 복원을 건너뜁니다"
+                "Existing statistics file has invalid values; skipping the whole restore"
             );
             return;
         }
@@ -569,7 +569,7 @@ fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
         path = %path.display(),
         kind,
         dropped,
-        "저장된 상위 목록이 상한을 넘어 횟수가 적은 항목을 잘라 냈습니다"
+        "Saved top list exceeds its limit; dropped the entries with the lowest counts"
     );
 }
 
@@ -624,23 +624,23 @@ fn parse_stats_snapshot(
     transport_count: usize,
 ) -> Result<PersistedStatsSnapshot, String> {
     let Json::Obj(root_fields) = root else {
-        return Err("최상위 값은 객체여야 합니다".to_string());
+        return Err("Top-level value must be an object".to_string());
     };
     if root_fields.len() != 3
         || root_fields
             .iter()
             .any(|(key, _)| !matches!(key.as_str(), "version" | "metrics" | "top"))
     {
-        return Err("최상위 항목 구성이 현재 형식과 일치하지 않습니다".to_string());
+        return Err("Top-level entries do not match the current format".to_string());
     }
     if root.get("version").and_then(Json::as_u64) != Some(1) {
-        return Err("`version`은 현재 형식 1이어야 합니다".to_string());
+        return Err("version must be the current format 1".to_string());
     }
     let metrics = root
         .get("metrics")
-        .ok_or_else(|| "`metrics` 항목이 없습니다".to_string())?;
+        .ok_or_else(|| "Missing metrics entry".to_string())?;
     let Json::Obj(metric_fields) = metrics else {
-        return Err("`metrics` 항목은 객체여야 합니다".to_string());
+        return Err("metrics must be an object".to_string());
     };
     if metric_fields.len() != 17
         || metric_fields.iter().any(|(key, _)| {
@@ -666,7 +666,7 @@ fn parse_stats_snapshot(
             )
         })
     {
-        return Err("metrics 항목 구성이 현재 형식과 일치하지 않습니다".to_string());
+        return Err("metrics entries do not match the current format".to_string());
     }
     let counter =
         |key: &str| json_u64(metrics, key).map_err(|reason| format!("metrics.{key}: {reason}"));
@@ -674,10 +674,10 @@ fn parse_stats_snapshot(
     let array = metrics
         .get("by_transport")
         .and_then(Json::as_array)
-        .ok_or_else(|| "metrics.by_transport: 배열이 없거나 올바르지 않습니다".to_string())?;
+        .ok_or_else(|| "metrics.by_transport: array is missing or invalid".to_string())?;
     if array.len() != transport_count {
         return Err(format!(
-            "metrics.by_transport: 항목 수가 현재 형식의 {transport_count}개여야 합니다"
+            "metrics.by_transport: must have {transport_count} entries in the current format"
         ));
     }
     let by_transport = array
@@ -690,16 +690,16 @@ fn parse_stats_snapshot(
 
     let top = root
         .get("top")
-        .ok_or_else(|| "`top` 항목이 없습니다".to_string())?;
+        .ok_or_else(|| "Missing top entry".to_string())?;
     let Json::Obj(top_fields) = top else {
-        return Err("`top` 항목은 객체여야 합니다".to_string());
+        return Err("top must be an object".to_string());
     };
     if top_fields.len() != 3
         || top_fields
             .iter()
             .any(|(key, _)| !matches!(key.as_str(), "domains" | "blocked" | "clients"))
     {
-        return Err("top 항목 구성이 현재 형식과 일치하지 않습니다".to_string());
+        return Err("top entries do not match the current format".to_string());
     }
     Ok(PersistedStatsSnapshot {
         total: counter("total")?,
@@ -738,11 +738,7 @@ fn parse_stats_snapshot(
 
 /** @brief JSON 객체에서 부호 없는 정수 필드를 읽는다. */
 fn json_u64(object: &Json, key: &str) -> Result<u64, String> {
-    exact_u64(
-        object
-            .get(key)
-            .ok_or_else(|| "항목이 없습니다".to_string())?,
-    )
+    exact_u64(object.get(key).ok_or_else(|| "Missing entry".to_string())?)
 }
 
 /**
@@ -753,13 +749,13 @@ fn json_u64(object: &Json, key: &str) -> Result<u64, String> {
 fn exact_u64(value: &Json) -> Result<u64, String> {
     if let Some(text) = value.as_str() {
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("0 이상의 정수를 10진수로 적어야 합니다".to_string());
+            return Err("Must be a non-negative decimal integer".to_string());
         }
         return text
             .parse::<u64>()
-            .map_err(|_| "0 이상의 64비트 정수 범위여야 합니다".to_string());
+            .map_err(|_| "Must fit in a non-negative 64-bit integer".to_string());
     }
-    Err("0 이상의 64비트 정수를 10진수 문자열로 적어야 합니다".to_string())
+    Err("Must be a non-negative 64-bit integer written as a decimal string".to_string())
 }
 
 /** @brief 이름-횟수 쌍 객체를 읽는다. */
@@ -768,39 +764,37 @@ where
     K: Eq + std::hash::Hash,
     F: Fn(&str) -> Option<K>,
 {
-    let value = top
-        .get(key)
-        .ok_or_else(|| format!("top.{key}: 항목이 없습니다"))?;
+    let value = top.get(key).ok_or_else(|| format!("top.{key}: missing"))?;
     let array = value
         .as_array()
-        .ok_or_else(|| format!("top.{key}: 배열이어야 합니다"))?;
+        .ok_or_else(|| format!("top.{key}: must be an array"))?;
     if array.len() > 10_000 {
-        return Err(format!("top.{key}: 항목 수가 10,000개를 넘습니다"));
+        return Err(format!("top.{key}: more than 10,000 entries"));
     }
     let mut out = HashMap::with_capacity(array.len());
     for (index, entry) in array.iter().enumerate() {
         let pair = entry
             .as_array()
-            .ok_or_else(|| format!("top.{key}[{index}]: [이름, 횟수] 배열이어야 합니다"))?;
+            .ok_or_else(|| format!("top.{key}[{index}]: must be a [name, count] array"))?;
         if pair.len() != 2 {
             return Err(format!(
-                "top.{key}[{index}]: 항목은 이름과 횟수 두 값이어야 합니다"
+                "top.{key}[{index}]: entry must have exactly two values, name and count"
             ));
         }
         let name = pair[0]
             .as_str()
-            .ok_or_else(|| format!("top.{key}[{index}][0]: 이름은 문자열이어야 합니다"))?;
+            .ok_or_else(|| format!("top.{key}[{index}][0]: name must be a string"))?;
         if name.is_empty() || name.len() > 4_096 {
             return Err(format!(
-                "top.{key}[{index}][0]: 이름 길이가 허용 범위를 벗어났습니다"
+                "top.{key}[{index}][0]: name length is out of range"
             ));
         }
         let count =
             exact_u64(&pair[1]).map_err(|reason| format!("top.{key}[{index}][1]: {reason}"))?;
-        let parsed = to_key(name)
-            .ok_or_else(|| format!("top.{key}[{index}][0]: `{name}` 형식이 올바르지 않습니다"))?;
+        let parsed =
+            to_key(name).ok_or_else(|| format!("top.{key}[{index}][0]: invalid {name}"))?;
         if out.insert(parsed, count).is_some() {
-            return Err(format!("top.{key}: `{name}` 항목이 중복되었습니다"));
+            return Err(format!("top.{key}: duplicate entry {name}"));
         }
     }
     Ok(out)

@@ -254,7 +254,7 @@ impl ForwardValidateLayer {
                 onetdns_core::debug!(
                     event = "dnssec.forward_no_dnskey",
                     zone = %apex.to_ascii_lower(),
-                    "이 영역의 DNSKEY와 그 서명을 얻지 못해 체인을 구성하지 못했습니다"
+                    "Could not get this zone's DNSKEY and its signatures; cannot build the chain"
                 );
                 return None;
             };
@@ -272,7 +272,7 @@ impl ForwardValidateLayer {
                         event = "dnssec.forward_chain_bogus",
                         zone = %apex.to_ascii_lower(),
                         error = ?error,
-                        "영역 키가 위에서 확정된 DS와 맞지 않습니다"
+                        "Zone key does not match the DS established above"
                     );
                     return None;
                 }
@@ -286,7 +286,7 @@ impl ForwardValidateLayer {
                     onetdns_core::debug!(
                         event = "dnssec.forward_no_ds",
                         zone = %child.to_ascii_lower(),
-                        "DS 응답을 얻지 못해 체인을 구성하지 못했습니다"
+                        "Could not get a DS response; cannot build the chain"
                     );
                     return None;
                 };
@@ -303,7 +303,7 @@ impl ForwardValidateLayer {
                         onetdns_core::debug!(
                             event = "dnssec.forward_ds_bogus",
                             zone = %child.to_ascii_lower(),
-                            "위임의 DS 서명이 부모 키로 확인되지 않습니다"
+                            "Delegation's DS signature does not verify with the parent key"
                         );
                         return None;
                     }
@@ -334,7 +334,7 @@ impl ForwardValidateLayer {
                         onetdns_core::debug!(
                             event = "dnssec.forward_ds_unproven",
                             zone = %child.to_ascii_lower(),
-                            "DS가 없다는 서명된 증명이 없습니다"
+                            "No signed proof that the DS is absent"
                         );
                         return None;
                     }
@@ -406,7 +406,7 @@ impl ForwardValidateLayer {
             rcode = response.header.rcode,
             answers = response.answers.len(),
             authorities = response.authorities.len(),
-            "위임에 DS가 없습니다. 부재 증명으로 판정합니다"
+            "Delegation has no DS; treating it as proven absent"
         );
         let nsec = records_of_type(&response.authorities, RecordType::NSEC);
         let nsec3 = records_of_type(&response.authorities, RecordType::NSEC3);
@@ -446,7 +446,7 @@ impl ForwardValidateLayer {
                 onetdns_core::debug!(
                     event = "dnssec.forward_denial_unsigned",
                     qname = %question.name.to_ascii_lower(),
-                    "서명된 영역인데 부정 응답에 서명이 하나도 없습니다"
+                    "Negative answer from a signed zone carries no signatures"
                 );
                 return None;
             }
@@ -471,7 +471,7 @@ impl ForwardValidateLayer {
                     event = "dnssec.forward_signer_not_apex",
                     signer = %signer.to_ascii_lower(),
                     apex = %apex.to_ascii_lower(),
-                    "서명자로 적힌 이름이 영역 apex가 아닙니다"
+                    "Signer name is not the zone apex"
                 );
                 return None;
             }
@@ -488,7 +488,7 @@ impl ForwardValidateLayer {
             onetdns_core::debug!(
                 event = "dnssec.forward_answer_unsigned",
                 qname = %question.name.to_ascii_lower(),
-                "서명된 영역인데 답을 덮는 서명이 없습니다"
+                "Answer from a signed zone has no covering signature"
             );
             return None;
         }
@@ -502,7 +502,7 @@ impl ForwardValidateLayer {
                     signatures = rrsigs.len(),
                     keys = keys.len(),
                     error = ?error,
-                    "답을 덮는 서명이 확인되지 않았습니다"
+                    "Covering signature on the answer did not verify"
                 );
                 None
             }
@@ -581,7 +581,7 @@ impl Resolver for ForwardValidateLayer {
                 onetdns_core::warn!(
                     event = "dnssec.forward_bogus_permissive",
                     qname = %insecure.to_ascii_lower(),
-                    "서명을 확인하지 못했지만 허용 모드라 AD 없이 답합니다"
+                    "Could not verify signatures; answering without AD because permissive mode is on"
                 );
                 response.header.authentic_data = false;
                 crate::native::strip_dnssec_unless_requested(request, &mut response);
@@ -596,7 +596,7 @@ impl Resolver for ForwardValidateLayer {
                 onetdns_core::warn!(
                     event = "dnssec.forward_bogus",
                     qname = %question,
-                    "전달받은 응답의 서명을 확인하지 못해 답하지 않습니다"
+                    "Could not verify signatures on the forwarded answer; not answering"
                 );
                 ResolveOutcome::Failure(ResolveFailure::Permanent(Some(
                     onetdns_proto::ede_code::DNSSEC_BOGUS,

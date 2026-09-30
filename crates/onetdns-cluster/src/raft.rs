@@ -523,22 +523,22 @@ impl RaftNode {
     pub fn compact(&mut self, data: Vec<u8>) -> Result<(), String> {
         if data.is_empty() || data.len() > MAX_SNAPSHOT_BYTES {
             return Err(format!(
-                "Raft 스냅샷 크기는 1..={MAX_SNAPSHOT_BYTES}바이트여야 합니다"
+                "Raft snapshot size must be 1..={MAX_SNAPSHOT_BYTES} bytes"
             ));
         }
         let previous = self.snapshot.as_ref().map_or(0, |snapshot| snapshot.index);
         let included_index = self.last_applied;
         if included_index <= previous || included_index > self.commit_index {
-            return Err("Raft 스냅샷 위치가 적용 완료 범위를 벗어났습니다".into());
+            return Err("Raft snapshot index is outside the applied range".into());
         }
         let included_term = self.term_at(included_index);
         if included_term == 0 {
-            return Err("Raft 스냅샷 위치의 term을 찾을 수 없습니다".into());
+            return Err("Could not find the term at the Raft snapshot index".into());
         }
         let remove = usize::try_from(included_index - previous)
-            .map_err(|_| "Raft 스냅샷 로그 범위를 계산할 수 없습니다")?;
+            .map_err(|_| "Could not compute the Raft snapshot log range")?;
         if remove > self.log.len() {
-            return Err("Raft 스냅샷 로그 범위가 보유 로그를 벗어났습니다".into());
+            return Err("Raft snapshot log range is outside the retained log".into());
         }
         self.log.drain(..remove);
         self.snapshot = Some(Snapshot {
@@ -553,7 +553,7 @@ impl RaftNode {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "Raft 스냅샷을 디스크에 저장하지 못했습니다".into()));
+                .unwrap_or_else(|| "Could not save the Raft snapshot to disk".into()));
         }
         Ok(())
     }
@@ -584,7 +584,7 @@ impl RaftNode {
             node = self.id,
             term = self.current_term,
             error = %error,
-            "Raft 노드를 복구 불가 오류로 중지합니다"
+            "Stopping the Raft node on an unrecoverable error"
         );
         self.fatal = Some(error);
         self.role = Role::Follower;
@@ -663,7 +663,7 @@ impl RaftNode {
             return true;
         };
         if let Err(error) = self.persist_at(&path) {
-            self.fail_stop(format!("Raft 상태를 디스크에 저장하지 못했습니다: {error}"));
+            self.fail_stop(format!("Could not save Raft state to disk: {error}"));
             return false;
         }
         true
@@ -719,42 +719,39 @@ impl RaftNode {
             if self.wal_len < WAL_HEADER_LEN as u64 {
                 let digest = self
                     .base_digest
-                    .ok_or("Raft 로그 파일을 만들려면 기준 상태의 지문이 필요합니다")?;
+                    .ok_or("Creating the Raft log file needs the fingerprint of the base state")?;
                 reset_wal(&wal, &digest)?;
                 self.wal_len = WAL_HEADER_LEN as u64;
             }
 
             let on_disk = fs::metadata(&wal)
-                .map_err(|error| format!("Raft WAL metadata 실패: {error}"))?
+                .map_err(|error| format!("Could not read Raft WAL metadata: {error}"))?
                 .len();
             if on_disk > self.wal_len {
                 let repair = OpenOptions::new()
                     .write(true)
                     .open(&wal)
-                    .map_err(|error| format!("Raft WAL 열기 실패: {error}"))?;
-                repair
-                    .set_len(self.wal_len)
-                    .map_err(|error| format!("Raft WAL 끝부분 절단 실패: {error}"))?;
-                repair
-                    .sync_all()
-                    .map_err(|error| format!("Raft WAL 절단 fsync 실패: {error}"))?;
+                    .map_err(|error| format!("Could not open the Raft WAL: {error}"))?;
+                repair.set_len(self.wal_len).map_err(|error| {
+                    format!("Could not truncate the end of the Raft WAL: {error}")
+                })?;
+                repair.sync_all().map_err(|error| {
+                    format!("Could not fsync the Raft WAL after truncation: {error}")
+                })?;
             }
             let file = OpenOptions::new()
                 .append(true)
                 .open(&wal)
-                .map_err(|error| format!("Raft WAL append 열기 실패: {error}"))?;
+                .map_err(|error| format!("Could not open the Raft WAL for appending: {error}"))?;
             self.wal_file = Some(file);
         }
-        let file = self
-            .wal_file
-            .as_mut()
-            .ok_or("Raft WAL 파일 핸들이 없습니다")?;
+        let file = self.wal_file.as_mut().ok_or("No Raft WAL file handle")?;
         let write = file
             .write_all(frame)
-            .map_err(|error| format!("Raft WAL 쓰지 못했습니다: {error}"))
+            .map_err(|error| format!("Could not write the Raft WAL: {error}"))
             .and_then(|()| {
                 file.sync_all()
-                    .map_err(|error| format!("Raft WAL fsync 실패: {error}"))
+                    .map_err(|error| format!("Could not fsync the Raft WAL: {error}"))
             });
         if let Err(error) = write {
             self.wal_file = None;
@@ -777,13 +774,13 @@ impl RaftNode {
             .boot_counter
             .max(now)
             .checked_add(1)
-            .ok_or("Raft 세션 카운터 계산 범위를 넘었습니다")?;
+            .ok_or("Raft session counter overflowed")?;
         self.boot_counter = next;
         if !self.persist() {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "Raft 세션 카운터를 디스크에 저장하지 못했습니다".into()));
+                .unwrap_or_else(|| "Could not save the Raft session counter to disk".into()));
         }
         Ok(next)
     }
@@ -825,7 +822,7 @@ impl RaftNode {
      */
     fn start_election(&mut self) -> Vec<Output> {
         let Some(next_term) = self.current_term.checked_add(1) else {
-            self.fail_stop("Raft term 계산 범위를 넘었습니다");
+            self.fail_stop("Raft term overflowed");
             return Vec::new();
         };
         self.current_term = next_term;
@@ -834,7 +831,7 @@ impl RaftNode {
             event = "raft.election_started",
             node = self.id,
             term = self.current_term,
-            "Raft 리더 선출을 시작합니다"
+            "Starting Raft leader election"
         );
         self.voted_for = Some(self.id);
         self.leader_id = None;
@@ -871,16 +868,16 @@ impl RaftNode {
             event = "raft.leader_elected",
             node = self.id,
             term = self.current_term,
-            "Raft 리더로 선출되었습니다"
+            "Elected Raft leader"
         );
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = self.cfg.heartbeat.max(1);
         if self.log.len() >= MAX_LOG_ENTRIES {
-            self.fail_stop("Raft 로그 상한 때문에 리더 no-op 항목을 기록할 수 없습니다");
+            self.fail_stop("The Raft log limit prevents writing the leader no-op entry");
             return;
         }
         let Some(noop_index) = self.last_index().checked_add(1) else {
-            self.fail_stop("Raft 리더 no-op index 계산 범위를 넘었습니다");
+            self.fail_stop("Raft leader no-op index overflowed");
             return;
         };
 
@@ -965,7 +962,7 @@ impl RaftNode {
         let snapshot = self
             .snapshot
             .as_ref()
-            .expect("스냅샷 index 이전 복제에는 스냅샷이 존재합니다");
+            .expect("A snapshot exists for replication before the snapshot index");
         let requested = self.snapshot_offsets.get(&peer).copied().unwrap_or(0);
         let offset = usize::try_from(requested)
             .ok()
@@ -1017,20 +1014,18 @@ impl RaftNode {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "현재 노드는 리더가 아닙니다".to_string()));
+                .unwrap_or_else(|| "This node is not the leader".to_string()));
         }
         if entries.is_empty() || entries.len() > MAX_APPEND_ENTRIES {
             return Err(format!(
-                "Raft 제안 배치는 1..={MAX_APPEND_ENTRIES}개 항목이어야 합니다"
+                "A Raft proposal batch must have 1..={MAX_APPEND_ENTRIES} entries"
             ));
         }
         if entries
             .iter()
             .any(|data| data.is_empty() || data.len() > MAX_ENTRY_BYTES)
         {
-            return Err(format!(
-                "Raft 항목 크기는 1..={MAX_ENTRY_BYTES}바이트여야 합니다"
-            ));
+            return Err(format!("A Raft entry must be 1..={MAX_ENTRY_BYTES} bytes"));
         }
         let encoded_bytes = entries.iter().fold(0usize, |total, data| {
             total
@@ -1041,21 +1036,23 @@ impl RaftNode {
         });
         if encoded_bytes > MAX_APPEND_BYTES {
             return Err(format!(
-                "Raft 제안 배치의 인코딩 크기는 {MAX_APPEND_BYTES}바이트 이하여야 합니다"
+                "The encoded size of a Raft proposal batch must be at most {MAX_APPEND_BYTES} bytes"
             ));
         }
         if self.log.len().saturating_add(entries.len()) > MAX_LOG_ENTRIES {
-            return Err("Raft 로그 상한 도달: 스냅샷 또는 운영자 압축이 필요합니다".into());
+            return Err(
+                "Raft log limit reached; a snapshot or operator compaction is needed".into(),
+            );
         }
         let first_index = self
             .last_index()
             .checked_add(1)
-            .ok_or_else(|| "Raft log index 계산 범위를 넘었습니다".to_string())?;
+            .ok_or_else(|| "Raft log index overflowed".to_string())?;
         let last_offset = u64::try_from(entries.len() - 1)
-            .map_err(|_| "Raft 제안 배치 크기 계산 범위를 넘었습니다".to_string())?;
+            .map_err(|_| "Raft proposal batch size overflowed".to_string())?;
         first_index
             .checked_add(last_offset)
-            .ok_or_else(|| "Raft log index 계산 범위를 넘었습니다".to_string())?;
+            .ok_or_else(|| "Raft log index overflowed".to_string())?;
 
         let mut indexes = Vec::with_capacity(entries.len());
         for (offset, data) in entries.into_iter().enumerate() {
@@ -1072,7 +1069,7 @@ impl RaftNode {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "Raft 상태를 디스크에 저장하지 못했습니다".into()));
+                .unwrap_or_else(|| "Could not save Raft state to disk".into()));
         }
         Ok(indexes)
     }
@@ -1109,7 +1106,7 @@ impl RaftNode {
                     event = "raft.stepped_down",
                     node = self.id,
                     term = msg_term,
-                    "더 높은 term을 관측해 Raft 리더에서 물러납니다"
+                    "Saw a higher term; stepping down as Raft leader"
                 );
             }
             self.current_term = msg_term;
@@ -1273,7 +1270,7 @@ impl RaftNode {
                 node = self.id,
                 leader = leader,
                 term = self.current_term,
-                "Raft 리더를 확인했습니다"
+                "Confirmed Raft leader"
             );
         }
         if self
@@ -1330,7 +1327,7 @@ impl RaftNode {
             }
         }
         if self.log.len() > MAX_LOG_ENTRIES {
-            self.fail_stop("Raft 로그 항목 수가 허용 한도를 넘었습니다");
+            self.fail_stop("Too many Raft log entries");
             return Vec::new();
         }
         if leader_commit > self.commit_index {
@@ -1445,7 +1442,7 @@ impl RaftNode {
         let incoming = self
             .incoming_snapshot
             .as_mut()
-            .expect("동일한 스냅샷 수신 상태를 만들었습니다");
+            .expect("The same snapshot receive state was created");
         let expected = incoming.data.len() as u64;
         if offset < expected {
             let Ok(start) = usize::try_from(offset) else {
@@ -1526,13 +1523,13 @@ impl RaftNode {
                     && self.leader_id == Some(incoming.leader)
             })
             .cloned()
-            .ok_or_else(|| "완료된 Raft 스냅샷 수신 상태가 없습니다".to_string())?;
+            .ok_or_else(|| "No completed Raft snapshot receive state".to_string())?;
 
         let retain_suffix = self.term_at(incoming.index) == incoming.term;
         let old_base = self.snapshot.as_ref().map_or(0, |snapshot| snapshot.index);
         if retain_suffix {
             let remove = usize::try_from(incoming.index.saturating_sub(old_base))
-                .map_err(|_| "Raft 스냅샷 suffix 범위를 계산할 수 없습니다")?;
+                .map_err(|_| "Could not compute the Raft snapshot suffix range")?;
             if remove <= self.log.len() {
                 self.log.drain(..remove);
             } else {
@@ -1554,7 +1551,7 @@ impl RaftNode {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "Raft 스냅샷 설치 상태를 저장하지 못했습니다".into()));
+                .unwrap_or_else(|| "Could not save the Raft snapshot install state".into()));
         }
         self.incoming_snapshot = None;
         Ok(self.snapshot_response(incoming.leader, incoming.index, 0, true))
@@ -1661,14 +1658,14 @@ impl RaftNode {
     pub fn mark_applied_batch(&mut self, first: u64, last: u64) -> Result<(), String> {
         if first != self.last_applied.saturating_add(1) || last < first || last > self.commit_index
         {
-            return Err("Raft applied index 순서 위반".into());
+            return Err("Raft applied index went backwards".into());
         }
         self.last_applied = last;
         if !self.persist() {
             return Err(self
                 .fatal
                 .clone()
-                .unwrap_or_else(|| "Raft 상태를 디스크에 저장하지 못했습니다".into()));
+                .unwrap_or_else(|| "Could not save Raft state to disk".into()));
         }
         Ok(())
     }
@@ -1691,7 +1688,7 @@ fn encode_state(state: &StableView) -> Result<Vec<u8>, String> {
         .snapshot
         .map_or_else(|| [].as_slice(), |snapshot| snapshot.data.as_slice());
     let Some(last_index) = snapshot_index.checked_add(state.log.len() as u64) else {
-        return Err("Raft 영구 상태의 로그 위치가 범위를 넘었습니다".into());
+        return Err("Raft persistent state log index is out of range".into());
     };
     if state.log.len() > MAX_LOG_ENTRIES
         || state.commit_index > last_index
@@ -1700,10 +1697,10 @@ fn encode_state(state: &StableView) -> Result<Vec<u8>, String> {
         || (snapshot_index == 0) != snapshot_data.is_empty()
         || (snapshot_index == 0) != (snapshot_term == 0)
     {
-        return Err("Raft 영구 상태의 값 범위가 올바르지 않습니다".into());
+        return Err("Raft persistent state has an invalid value range".into());
     }
     if state.last_applied > state.commit_index {
-        return Err("Raft에서 마지막으로 적용한 로그 위치가 확정된 로그 위치보다 큽니다".into());
+        return Err("The last applied Raft log index is greater than the committed index".into());
     }
     let mut out = Vec::new();
     out.extend_from_slice(STATE_MAGIC);
@@ -1729,14 +1726,14 @@ fn encode_state(state: &StableView) -> Result<Vec<u8>, String> {
     for (position, entry) in state.log.iter().enumerate() {
         let expected = snapshot_index + position as u64 + 1;
         if entry.index != expected || entry.data.len() > MAX_ENTRY_BYTES {
-            return Err("Raft log index 또는 항목 크기가 올바르지 않습니다".into());
+            return Err("Invalid Raft log index or entry size".into());
         }
         out.extend_from_slice(&entry.term.to_be_bytes());
         out.extend_from_slice(&entry.index.to_be_bytes());
         out.extend_from_slice(&(entry.data.len() as u32).to_be_bytes());
         out.extend_from_slice(&entry.data);
         if out.len() > MAX_STATE_BYTES.saturating_sub(32) {
-            return Err("Raft 상태 파일이 허용 크기를 넘었습니다".into());
+            return Err("Raft state file exceeds the size limit".into());
         }
     }
     let digest = Sha256::digest(&out);
@@ -1753,26 +1750,28 @@ fn decode_state(bytes: &[u8]) -> Result<StableState, String> {
     if bytes.len() < STATE_MAGIC.len() + 8 + 9 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 32
         || bytes.len() > MAX_STATE_BYTES
     {
-        return Err("Raft 상태 파일의 크기가 올바르지 않습니다".into());
+        return Err("Invalid Raft state file size".into());
     }
     let (body, stored_digest) = bytes.split_at(bytes.len() - 32);
     let actual = Sha256::digest(body);
     if actual.as_slice() != stored_digest {
-        return Err("Raft 상태 파일의 검사합이 일치하지 않습니다".into());
+        return Err("Raft state file checksum mismatch".into());
     }
     let mut pos = 0usize;
     if body.get(..STATE_MAGIC.len()) != Some(STATE_MAGIC.as_slice()) {
-        return Err("Raft 상태 파일의 식별자 또는 버전이 현재 형식과 일치하지 않습니다".into());
+        return Err(
+            "Raft state file identifier or version does not match the current format".into(),
+        );
     }
     pos += STATE_MAGIC.len();
     let current_term = take_u64(body, &mut pos)?;
-    let vote_flag = *body.get(pos).ok_or("Raft 투표 상태 값이 빠져 있습니다")?;
+    let vote_flag = *body.get(pos).ok_or("Raft vote state is missing")?;
     pos += 1;
     let vote_id = take_u64(body, &mut pos)?;
     let voted_for = match vote_flag {
         0 => None,
         1 => Some(vote_id),
-        _ => return Err("Raft 투표 상태 값이 올바르지 않습니다".into()),
+        _ => return Err("Invalid Raft vote state".into()),
     };
     let commit_index = take_u64(body, &mut pos)?;
     let last_applied = take_u64(body, &mut pos)?;
@@ -1784,19 +1783,19 @@ fn decode_state(bytes: &[u8]) -> Result<StableState, String> {
         || (snapshot_index == 0) != (snapshot_len == 0)
         || (snapshot_index == 0) != (snapshot_term == 0)
     {
-        return Err("Raft 스냅샷 형식이 올바르지 않습니다".into());
+        return Err("Malformed Raft snapshot".into());
     }
     let snapshot_end = pos
         .checked_add(snapshot_len)
-        .ok_or("Raft 스냅샷 길이를 계산할 수 없습니다")?;
+        .ok_or("Could not compute the Raft snapshot length")?;
     let snapshot_data = body
         .get(pos..snapshot_end)
-        .ok_or("Raft 스냅샷 데이터가 중간에서 잘렸습니다")?
+        .ok_or("Raft snapshot data is truncated")?
         .to_vec();
     pos = snapshot_end;
     let count = take_u32(body, &mut pos)? as usize;
     if count > MAX_LOG_ENTRIES {
-        return Err("Raft 로그 항목이 허용 크기를 넘었습니다".into());
+        return Err("Raft log entry exceeds the size limit".into());
     }
     let mut log = Vec::with_capacity(count.min(4096));
     for position in 0..count {
@@ -1804,29 +1803,27 @@ fn decode_state(bytes: &[u8]) -> Result<StableState, String> {
         let index = take_u64(body, &mut pos)?;
         let len = take_u32(body, &mut pos)? as usize;
         if index != snapshot_index + position as u64 + 1 || len > MAX_ENTRY_BYTES {
-            return Err("Raft log 형식이 올바르지 않습니다".into());
+            return Err("Malformed Raft log".into());
         }
         let end = pos
             .checked_add(len)
-            .ok_or("Raft 로그 항목의 길이를 계산할 수 없습니다")?;
+            .ok_or("Could not compute the Raft log entry length")?;
         let data = body
             .get(pos..end)
-            .ok_or("Raft 로그 데이터가 중간에서 잘렸습니다")?
+            .ok_or("Raft log data is truncated")?
             .to_vec();
         pos = end;
         log.push(LogEntry { term, index, data });
     }
     let last_index = snapshot_index
         .checked_add(count as u64)
-        .ok_or("Raft 로그 마지막 위치가 범위를 넘었습니다")?;
+        .ok_or("Last Raft log index is out of range")?;
     if pos != body.len()
         || commit_index > last_index
         || last_applied > commit_index
         || last_applied < snapshot_index
     {
-        return Err(
-            "Raft 상태 파일에 불필요한 데이터가 있거나 값이 허용 범위를 벗어났습니다".into(),
-        );
+        return Err("Raft state file has trailing data or an out-of-range value".into());
     }
     Ok(StableState {
         current_term,
@@ -1847,13 +1844,11 @@ fn decode_state(bytes: &[u8]) -> Result<StableState, String> {
 fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
     let end = pos
         .checked_add(8)
-        .ok_or("Raft 상태 파일에서 64비트 값을 읽을 위치를 계산할 수 없습니다")?;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or("Raft 상태 데이터가 중간에서 잘렸습니다")?;
+        .ok_or("Could not compute where to read a 64-bit value in the Raft state file")?;
+    let slice = bytes.get(*pos..end).ok_or("Raft state data is truncated")?;
     *pos = end;
     Ok(u64::from_be_bytes(slice.try_into().map_err(|_| {
-        "Raft 상태 파일의 64비트 값 형식이 올바르지 않습니다"
+        "Malformed 64-bit value in the Raft state file"
     })?))
 }
 
@@ -1861,13 +1856,11 @@ fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
 fn take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
     let end = pos
         .checked_add(4)
-        .ok_or("Raft 상태 파일에서 32비트 값을 읽을 위치를 계산할 수 없습니다")?;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or("Raft 상태 데이터가 중간에서 잘렸습니다")?;
+        .ok_or("Could not compute where to read a 32-bit value in the Raft state file")?;
+    let slice = bytes.get(*pos..end).ok_or("Raft state data is truncated")?;
     *pos = end;
     Ok(u32::from_be_bytes(slice.try_into().map_err(|_| {
-        "Raft 상태 파일의 32비트 값 형식이 올바르지 않습니다"
+        "Malformed 32-bit value in the Raft state file"
     })?))
 }
 
@@ -1886,7 +1879,7 @@ fn wal_path(path: &Path) -> PathBuf {
  */
 fn encode_wal_frame(state: &StableView, truncate_to: usize) -> Result<Vec<u8>, String> {
     if truncate_to > state.log.len() || state.log.len() > MAX_LOG_ENTRIES {
-        return Err("Raft WAL 프레임 범위가 올바르지 않습니다".into());
+        return Err("Invalid Raft WAL frame range".into());
     }
     let mut body = Vec::new();
     body.extend_from_slice(&state.current_term.to_be_bytes());
@@ -1910,7 +1903,7 @@ fn encode_wal_frame(state: &StableView, truncate_to: usize) -> Result<Vec<u8>, S
     for (position, entry) in entries.iter().enumerate() {
         let expected = snapshot_index + truncate_to as u64 + position as u64 + 1;
         if entry.index != expected || entry.data.len() > MAX_ENTRY_BYTES {
-            return Err("Raft WAL 항목 index/크기가 올바르지 않습니다".into());
+            return Err("Invalid Raft WAL entry index or size".into());
         }
         body.extend_from_slice(&entry.term.to_be_bytes());
         body.extend_from_slice(&entry.index.to_be_bytes());
@@ -1928,15 +1921,13 @@ fn encode_wal_frame(state: &StableView, truncate_to: usize) -> Result<Vec<u8>, S
 fn apply_wal_frame(state: &mut StableState, body: &[u8]) -> Result<(), String> {
     let mut pos = 0usize;
     let current_term = take_u64(body, &mut pos)?;
-    let vote_flag = *body
-        .get(pos)
-        .ok_or("Raft WAL 투표 상태 값이 빠져 있습니다")?;
+    let vote_flag = *body.get(pos).ok_or("Raft WAL vote state is missing")?;
     pos += 1;
     let vote_id = take_u64(body, &mut pos)?;
     let voted_for = match vote_flag {
         0 => None,
         1 => Some(vote_id),
-        _ => return Err("Raft 로그 파일의 투표 상태 값이 올바르지 않습니다".into()),
+        _ => return Err("Invalid vote state in the Raft log file".into()),
     };
     let commit_index = take_u64(body, &mut pos)?;
     let last_applied = take_u64(body, &mut pos)?;
@@ -1950,29 +1941,29 @@ fn apply_wal_frame(state: &mut StableState, body: &[u8]) -> Result<(), String> {
         || last_applied > commit_index
         || boot_counter < state.boot_counter
     {
-        return Err("Raft WAL 단조성 위반".into());
+        return Err("Raft WAL is not monotonic".into());
     }
 
     if current_term == state.current_term {
         if let Some(prev) = state.voted_for {
             if voted_for != Some(prev) {
-                return Err("Raft WAL 동일 term 투표 변경".into());
+                return Err("Raft WAL changed the vote within the same term".into());
             }
         }
     }
     let snapshot_index = state.snapshot.as_ref().map_or(0, |snapshot| snapshot.index);
     let truncate_index = snapshot_index.saturating_add(truncate_to as u64);
     if truncate_to > state.log.len() || truncate_index < state.commit_index {
-        return Err("Raft WAL truncate 범위가 올바르지 않습니다".into());
+        return Err("Invalid Raft WAL truncate range".into());
     }
     let final_len = truncate_to
         .checked_add(count)
-        .ok_or("Raft WAL 로그 길이 계산 범위를 넘었습니다")?;
+        .ok_or("Raft WAL log length overflowed")?;
     let final_index = snapshot_index
         .checked_add(final_len as u64)
-        .ok_or("Raft WAL 마지막 로그 위치가 범위를 넘었습니다")?;
+        .ok_or("Last Raft WAL log index is out of range")?;
     if final_len > MAX_LOG_ENTRIES || commit_index > final_index || last_applied < snapshot_index {
-        return Err("Raft WAL 로그 범위가 올바르지 않습니다".into());
+        return Err("Invalid Raft WAL log range".into());
     }
     state.log.truncate(truncate_to);
     for position in 0..count {
@@ -1982,20 +1973,18 @@ fn apply_wal_frame(state: &mut StableState, body: &[u8]) -> Result<(), String> {
         if index != snapshot_index + truncate_to as u64 + position as u64 + 1
             || len > MAX_ENTRY_BYTES
         {
-            return Err("Raft WAL 항목 형식이 올바르지 않습니다".into());
+            return Err("Malformed Raft WAL entry".into());
         }
-        let end = pos
-            .checked_add(len)
-            .ok_or("Raft WAL 길이 계산 범위를 넘었습니다")?;
+        let end = pos.checked_add(len).ok_or("Raft WAL length overflowed")?;
         let data = body
             .get(pos..end)
-            .ok_or("Raft WAL 데이터가 중간에서 잘렸습니다")?
+            .ok_or("Raft WAL data is truncated")?
             .to_vec();
         pos = end;
         state.log.push(LogEntry { term, index, data });
     }
     if pos != body.len() {
-        return Err("Raft 로그 파일 끝에 불필요한 데이터가 남아 있습니다".into());
+        return Err("Trailing data remains at the end of the Raft log file".into());
     }
     state.current_term = current_term;
     state.voted_for = voted_for;
@@ -2018,22 +2007,22 @@ fn load_wal(path: &Path, base_digest: &[u8; 32], state: &mut StableState) -> Res
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("{} 열기 실패: {error}", path.display())),
+        Err(error) => return Err(format!("Could not open {}: {error}", path.display())),
     };
     let len = file
         .metadata()
-        .map_err(|error| format!("Raft WAL metadata 실패: {error}"))?
+        .map_err(|error| format!("Could not read Raft WAL metadata: {error}"))?
         .len();
     if len > MAX_WAL_BYTES as u64 {
-        return Err("Raft WAL 파일이 너무 큽니다".into());
+        return Err("Raft WAL file is too large".into());
     }
     let mut bytes = Vec::with_capacity(len as usize);
     file.take(MAX_WAL_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("Raft WAL 읽지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not read the Raft WAL: {error}"))?;
 
     if bytes.len() < WAL_HEADER_LEN || &bytes[..WAL_MAGIC.len()] != WAL_MAGIC {
-        return Err("Raft WAL 헤더 손상".into());
+        return Err("Raft WAL header is corrupted".into());
     }
     if &bytes[WAL_MAGIC.len()..WAL_HEADER_LEN] != base_digest {
         return Ok(0);
@@ -2043,22 +2032,22 @@ fn load_wal(path: &Path, base_digest: &[u8; 32], state: &mut StableState) -> Res
     while pos < bytes.len() {
         let length_end = pos
             .checked_add(4)
-            .ok_or("Raft WAL 프레임 길이 위치 계산 범위를 넘었습니다")?;
+            .ok_or("Raft WAL frame length offset overflowed")?;
         let Some(len_bytes) = bytes.get(pos..length_end) else {
             break;
         };
         let body_len =
-            u32::from_be_bytes(len_bytes.try_into().map_err(|_| "Raft WAL 길이")?) as usize;
+            u32::from_be_bytes(len_bytes.try_into().map_err(|_| "Raft WAL length")?) as usize;
         if !(MIN_WAL_FRAME_BODY..=MAX_WAL_BYTES).contains(&body_len) {
-            return Err("Raft WAL 프레임 길이가 올바르지 않습니다".into());
+            return Err("Invalid Raft WAL frame length".into());
         }
         let body_start = length_end;
         let digest_start = body_start
             .checked_add(body_len)
-            .ok_or("Raft WAL 프레임 끝 계산 범위를 넘었습니다")?;
+            .ok_or("Raft WAL frame end overflowed")?;
         let frame_end = digest_start
             .checked_add(32)
-            .ok_or("Raft WAL 검사합 끝 계산 범위를 넘었습니다")?;
+            .ok_or("Raft WAL checksum end overflowed")?;
         let Some(body) = bytes.get(body_start..digest_start) else {
             break;
         };
@@ -2067,7 +2056,7 @@ fn load_wal(path: &Path, base_digest: &[u8; 32], state: &mut StableState) -> Res
         };
         if Sha256::digest(body).as_slice() != digest {
             if frame_end < bytes.len() {
-                return Err("Raft WAL 중간 프레임의 검사합이 일치하지 않습니다".into());
+                return Err("Checksum mismatch in a middle Raft WAL frame".into());
             }
             break;
         }
@@ -2089,23 +2078,23 @@ fn load_state(path: &Path) -> Result<LoadedState, String> {
                 wal_len: 0,
             })
         }
-        Err(error) => return Err(format!("{} 열기 실패: {error}", path.display())),
+        Err(error) => return Err(format!("Could not open {}: {error}", path.display())),
     };
     let len = file
         .metadata()
-        .map_err(|error| format!("Raft 상태 파일 정보를 읽지 못했습니다: {error}"))?
+        .map_err(|error| format!("Could not read Raft state file metadata: {error}"))?
         .len();
     if len > MAX_STATE_BYTES as u64 {
-        return Err("Raft 상태 파일이 허용 크기를 넘었습니다".into());
+        return Err("Raft state file exceeds the size limit".into());
     }
     let mut bytes = Vec::with_capacity(len as usize);
     file.take(MAX_STATE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("Raft 상태 파일을 읽지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not read the Raft state file: {error}"))?;
     let mut state = decode_state(&bytes)?;
     let base_digest: [u8; 32] = bytes[bytes.len() - 32..]
         .try_into()
-        .map_err(|_| "Raft 상태 파일의 해시 길이가 올바르지 않습니다")?;
+        .map_err(|_| "Invalid hash length in the Raft state file")?;
     let wal_len = load_wal(&wal_path(path), &base_digest, &mut state)?;
     Ok(LoadedState {
         state,
@@ -2130,7 +2119,7 @@ fn store_state(path: &Path, state: &StableView) -> Result<[u8; 32], String> {
     let bytes = encode_state(state)?;
     let digest: [u8; 32] = bytes[bytes.len() - 32..]
         .try_into()
-        .map_err(|_| "Raft 상태 파일의 해시 길이가 올바르지 않습니다")?;
+        .map_err(|_| "Invalid hash length in the Raft state file")?;
     write_state_file_atomic(path, &bytes)?;
     Ok(digest)
 }
@@ -2157,12 +2146,12 @@ fn state_parent(path: &Path) -> &Path {
 fn write_state_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = state_parent(path);
     fs::create_dir_all(parent).map_err(|error| {
-        format!("Raft 상태 파일을 저장할 디렉터리를 만들지 못했습니다: {error}")
+        format!("Could not create the directory for the Raft state file: {error}")
     })?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "Raft 상태 파일 이름이 올바르지 않습니다".to_string())?;
+        .ok_or_else(|| "Invalid Raft state file name".to_string())?;
     let nonce = u64::from_le_bytes(onetdns_core::random_array::<8>());
     let tmp = parent.join(format!(
         ".{file_name}.tmp-{}-{nonce:016x}",
@@ -2178,28 +2167,28 @@ fn write_state_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         }
         let mut file = options
             .open(&tmp)
-            .map_err(|error| format!("Raft 상태를 저장할 임시 파일을 열지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not open a temporary file for Raft state: {error}"))?;
 
         restrict_state_file(&tmp).map_err(|error| {
-            format!("Raft 임시 상태 파일의 접근 권한을 제한하지 못했습니다: {error}")
+            format!("Could not restrict permissions on the temporary Raft state file: {error}")
         })?;
         file.write_all(bytes)
-            .map_err(|error| format!("Raft 상태 파일에 데이터를 쓰지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not write the Raft state file: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("Raft 상태 파일을 디스크에 동기화하지 못했습니다: {error}"))?;
+            .map_err(|error| format!("Could not sync the Raft state file to disk: {error}"))?;
         /*
          * 연 채로 이름을 바꾸면 WSL 의 Windows 드라이브(9p)에서는 새 이름으로 권한을 바꿀 때
          * 파일을 찾지 못한다. 이름을 바꾸기 전에 닫는다.
          */
         drop(file);
-        replace_state_file(&tmp, path)
-            .map_err(|error| format!("Raft 상태 파일을 원자적으로 교체하지 못했습니다: {error}"))?;
+        replace_state_file(&tmp, path).map_err(|error| {
+            format!("Could not atomically replace the Raft state file: {error}")
+        })?;
         restrict_state_file(path).map_err(|error| {
-            format!("Raft 상태 파일의 접근 권한을 제한하지 못했습니다: {error}")
+            format!("Could not restrict permissions on the Raft state file: {error}")
         })?;
-        sync_state_parent(parent).map_err(|error| {
-            format!("Raft 상태 디렉터리를 디스크에 동기화하지 못했습니다: {error}")
-        })?;
+        sync_state_parent(parent)
+            .map_err(|error| format!("Could not sync the Raft state directory to disk: {error}"))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -3231,7 +3220,7 @@ mod tests {
             Ok(_) => panic!("중간 WAL 손상을 잘린 끝부분처럼 무시하면 안 된다"),
             Err(error) => error,
         };
-        assert!(error.contains("중간 프레임의 검사합"), "{error}");
+        assert!(error.contains("middle Raft WAL frame"), "{error}");
         let _ = fs::remove_dir_all(dir);
     }
 

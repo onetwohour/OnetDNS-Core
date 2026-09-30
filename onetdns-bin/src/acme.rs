@@ -165,7 +165,7 @@ impl AccountKey {
         use p256::pkcs8::EncodePrivateKey;
         let der = p256::SecretKey::from(self.signing.clone())
             .to_pkcs8_der()
-            .expect("P-256 개인 키를 PKCS#8 형식으로 변환하지 못했습니다");
+            .expect("Could not convert the P-256 private key to PKCS#8");
         der_to_pem(der.as_bytes(), "PRIVATE KEY")
     }
 
@@ -175,13 +175,13 @@ impl AccountKey {
         let point = vk.to_encoded_point(false);
         let x: [u8; 32] = point
             .x()
-            .expect("P-256 공개 키의 x 좌표가 있어야 합니다")
+            .expect("P-256 public key is missing its x coordinate")
             .as_slice()
             .try_into()
             .unwrap();
         let y: [u8; 32] = point
             .y()
-            .expect("P-256 공개 키의 y 좌표가 있어야 합니다")
+            .expect("P-256 public key is missing its y coordinate")
             .as_slice()
             .try_into()
             .unwrap();
@@ -443,15 +443,15 @@ impl AcmeClient {
             .timeout(timeout)
             .resolver(resolver.clone())
             .call()
-            .map_err(|e| format!("디렉터리를 요청하지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not fetch the ACME directory: {e}"))?;
         let body = String::from_utf8_lossy(&resp.body);
-        let j = json::parse(&body).map_err(|e| format!("디렉터리 JSON: {e}"))?;
+        let j = json::parse(&body).map_err(|e| format!("ACME directory is not valid JSON: {e}"))?;
         let get = |k: &str| j.get(k).and_then(|v| v.as_str()).map(String::from);
         let dir = Directory {
-            new_nonce: get("newNonce").ok_or("ACME 디렉터리에 newNonce 주소가 없습니다")?,
+            new_nonce: get("newNonce").ok_or("ACME directory has no newNonce URL")?,
             new_account: get("newAccount")
-                .ok_or("ACME 디렉터리 응답에 계정 등록 주소가 없습니다")?,
-            new_order: get("newOrder").ok_or("ACME 디렉터리 응답에 인증서 주문 주소가 없습니다")?,
+                .ok_or("ACME directory has no account registration URL")?,
+            new_order: get("newOrder").ok_or("ACME directory has no certificate order URL")?,
         };
         Ok(AcmeClient {
             key,
@@ -475,9 +475,9 @@ impl AcmeClient {
             .timeout(self.timeout)
             .resolver(self.resolver.clone())
             .call()
-            .map_err(|e| format!("nonce를 요청하지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not fetch a nonce: {e}"))?;
         resp.header("replay-nonce")
-            .ok_or("Replay-Nonce 헤더가 없습니다".to_string())
+            .ok_or("Response has no Replay-Nonce header".to_string())
     }
 
     /** @brief 서명한 요청을 보낸다. 응답에 실려 온 nonce를 챙겨 둔다. */
@@ -495,7 +495,7 @@ impl AcmeClient {
             .resolver(self.resolver.clone())
             .body_bytes(body.into_bytes())
             .call()
-            .map_err(|e| format!("ACME 서버에 요청을 보내지 못했습니다({url}): {e}"))?;
+            .map_err(|e| format!("Could not send the request to the ACME server ({url}): {e}"))?;
         if let Some(n) = resp.header("replay-nonce") {
             self.nonce = Some(n);
         }
@@ -515,14 +515,14 @@ impl AcmeClient {
         let resp = self.post(&url, &payload, true)?;
         if resp.status != 200 && resp.status != 201 {
             return Err(format!(
-                "ACME 계정을 등록하지 못했습니다(HTTP {}): {}",
+                "Could not register the ACME account (HTTP {}): {}",
                 resp.status,
                 String::from_utf8_lossy(&resp.body)
             ));
         }
         let loc = resp
             .header("location")
-            .ok_or("계정 응답에 Location 헤더가 없습니다")?;
+            .ok_or("Account response has no Location header")?;
         self.account_url = Some(loc.clone());
         Ok(loc)
     }
@@ -538,7 +538,9 @@ impl AcmeClient {
         provision: &Provision,
     ) -> Result<String, String> {
         if self.account_url.is_none() {
-            return Err("ACME 계정이 등록되지 않았습니다. 먼저 계정을 등록하십시오".to_string());
+            return Err(
+                "The ACME account is not registered yet; register the account first".to_string(),
+            );
         }
         let order = self.new_order(domains)?;
         for authz_url in &order.authorizations {
@@ -561,21 +563,21 @@ impl AcmeClient {
         let resp = self.post(&url, &payload, false)?;
         if resp.status != 201 && resp.status != 200 {
             return Err(format!(
-                "ACME 인증서 주문을 만들지 못했습니다(HTTP {}): {}",
+                "Could not create the ACME certificate order (HTTP {}): {}",
                 resp.status,
                 String::from_utf8_lossy(&resp.body)
             ));
         }
         let loc = resp
             .header("location")
-            .ok_or("주문 응답에 Location 헤더가 없습니다")?;
+            .ok_or("Order response has no Location header")?;
         let body = String::from_utf8_lossy(&resp.body);
         let j = json::parse(&body)
-            .map_err(|e| format!("ACME 주문 응답의 JSON을 해석하지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not parse the ACME order response JSON: {e}"))?;
         let finalize = j
             .get("finalize")
             .and_then(|v| v.as_str())
-            .ok_or("주문 응답에 인증서 확정 주소가 없습니다")?
+            .ok_or("Order response has no finalize URL")?
             .to_string();
         let authorizations = str_array(&j, "authorizations");
         Ok(Order {
@@ -594,7 +596,7 @@ impl AcmeClient {
         let resp = self.post(authz_url, "", false)?;
         let body = String::from_utf8_lossy(&resp.body);
         let j = json::parse(&body)
-            .map_err(|e| format!("ACME 인증 응답의 JSON을 해석하지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Could not parse the ACME authorization response JSON: {e}"))?;
         let domain = j
             .get("identifier")
             .and_then(|i| i.get("value"))
@@ -619,7 +621,9 @@ impl AcmeClient {
                     c.get("token").and_then(|v| v.as_str())?.to_string(),
                 ))
             })
-            .ok_or(format!("{want_type} 방식의 도메인 검증 항목이 없습니다"))?;
+            .ok_or(format!(
+                "No {want_type} challenge in the domain authorization"
+            ))?;
 
         match provision {
             Provision::Dns01(f) => {
@@ -647,14 +651,14 @@ impl AcmeClient {
             let resp = self.post(authz_url, "", false)?;
             let body = String::from_utf8_lossy(&resp.body);
             let j = json::parse(&body)
-                .map_err(|e| format!("ACME 인증 상태 응답의 JSON을 해석하지 못했습니다: {e}"))?;
+                .map_err(|e| format!("Could not parse the ACME authorization status JSON: {e}"))?;
             match j.get("status").and_then(|v| v.as_str()) {
                 Some("valid") => return Ok(()),
-                Some("invalid") => return Err(format!("ACME 도메인 인증에 실패했습니다: {body}")),
+                Some("invalid") => return Err(format!("ACME domain authorization failed: {body}")),
                 _ => std::thread::sleep(Duration::from_secs(2)),
             }
         }
-        Err("ACME 도메인 소유권 확인이 제한 시간 안에 끝나지 않았습니다".to_string())
+        Err("ACME domain validation did not finish in time".to_string())
     }
 
     /** @brief 서명 요청을 올린다. */
@@ -663,7 +667,7 @@ impl AcmeClient {
         let resp = self.post(finalize_url, &payload, false)?;
         if resp.status >= 400 {
             return Err(format!(
-                "ACME 인증서 발급 요청을 마무리하지 못했습니다(HTTP {}): {}",
+                "Could not finalize the ACME certificate order (HTTP {}): {}",
                 resp.status,
                 String::from_utf8_lossy(&resp.body)
             ));
@@ -677,20 +681,20 @@ impl AcmeClient {
             let resp = self.post(order_url, "", false)?;
             let body = String::from_utf8_lossy(&resp.body);
             let j = json::parse(&body)
-                .map_err(|e| format!("ACME 주문 상태 응답의 JSON을 해석하지 못했습니다: {e}"))?;
+                .map_err(|e| format!("Could not parse the ACME order status JSON: {e}"))?;
             match j.get("status").and_then(|v| v.as_str()) {
                 Some("valid") => {
                     return j
                         .get("certificate")
                         .and_then(|v| v.as_str())
                         .map(String::from)
-                        .ok_or("인증서 다운로드 주소가 없습니다".to_string());
+                        .ok_or("Order has no certificate download URL".to_string());
                 }
-                Some("invalid") => return Err(format!("ACME 인증서 주문에 실패했습니다: {body}")),
+                Some("invalid") => return Err(format!("ACME certificate order failed: {body}")),
                 _ => std::thread::sleep(Duration::from_secs(2)),
             }
         }
-        Err("ACME 인증서 주문 확정이 제한 시간 안에 끝나지 않았습니다".to_string())
+        Err("ACME order finalization did not finish in time".to_string())
     }
 
     /** @brief 발급된 인증서를 받는다. */
@@ -698,12 +702,12 @@ impl AcmeClient {
         let resp = self.post(cert_url, "", false)?;
         if resp.status != 200 {
             return Err(format!(
-                "ACME 인증서를 내려받지 못했습니다(HTTP {})",
+                "Could not download the ACME certificate (HTTP {})",
                 resp.status
             ));
         }
         String::from_utf8(resp.body)
-            .map_err(|_| "받은 인증서 본문이 UTF-8 텍스트가 아닙니다".to_string())
+            .map_err(|_| "Downloaded certificate is not UTF-8 text".to_string())
     }
 }
 
@@ -756,7 +760,7 @@ pub fn run_issue(
 ) -> Result<IssueResult, String> {
     let account_key = match &p.account_key_pem {
         Some(pem) => {
-            AccountKey::from_pkcs8_pem(pem.as_str()).ok_or("계정 키 PEM 해석하지 못했습니다")?
+            AccountKey::from_pkcs8_pem(pem.as_str()).ok_or("Could not parse the account key PEM")?
         }
         None => AccountKey::generate(),
     };
@@ -774,7 +778,7 @@ pub fn run_issue(
         });
     }
     if p.domains.is_empty() {
-        return Err("인증서를 발급할 도메인이 없습니다. acme_domains를 설정하십시오".to_string());
+        return Err("No domains to issue a certificate for; set acme_domains".to_string());
     }
 
     let cert_key = AccountKey::generate();
@@ -785,7 +789,7 @@ pub fn run_issue(
     let provision = match p.challenge.as_str() {
         "dns01" => Provision::Dns01(&dns01),
         "http01" => Provision::Http01(&http01),
-        other => return Err(format!("지원하지 않는 ACME 확인 방식입니다: {other}")),
+        other => return Err(format!("Unsupported ACME challenge type: {other}")),
     };
 
     let cert_pem = client.issue(&p.domains, &cert_key, &provision)?;

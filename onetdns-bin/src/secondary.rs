@@ -163,20 +163,24 @@ impl AxfrSequence {
         let answer_count = message.answers.len();
         for (index, record) in message.answers.iter().enumerate() {
             if self.record_count >= MAX_AXFR_RECORDS {
-                return Err("AXFR 응답의 레코드 수가 허용 범위를 넘었습니다".to_string());
+                return Err("AXFR response has too many records".to_string());
             }
             if self.record_count == 0
                 && (record.rtype != RecordType::SOA || !record.name.eq_ignore_case(&self.origin))
             {
-                return Err("AXFR 응답의 첫 레코드는 영역 최상위 SOA여야 합니다".to_string());
+                return Err(
+                    "The first record of an AXFR response must be the zone apex SOA".to_string(),
+                );
             }
             if record.rtype == RecordType::SOA && record.name.eq_ignore_case(&self.origin) {
                 if let Some(opening) = &self.opening_soa {
                     if !xfr_rr_equal(record, opening) {
-                        return Err("AXFR 종료 SOA가 시작 SOA와 일치하지 않습니다".to_string());
+                        return Err(
+                            "The closing AXFR SOA does not match the opening SOA".to_string()
+                        );
                     }
                     if index + 1 != answer_count {
-                        return Err("AXFR 종료 SOA 뒤에 추가 레코드 존재".to_string());
+                        return Err("Records follow the closing AXFR SOA".to_string());
                     }
                     self.record_count += 1;
                     return Ok(true);
@@ -197,12 +201,12 @@ fn encode_xfr_request(
     let request_mac = tsig
         .map(|key| onetdns_dnssec::tsig::sign_message(&mut query, key, unix_now(), None))
         .transpose()
-        .map_err(|error| format!("XFR 질의를 서명하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not sign the XFR query: {error}"))?;
     let wire = query
         .try_encode()
-        .map_err(|error| format!("XFR 질의를 인코딩하지 못했습니다: {error}"))?;
+        .map_err(|error| format!("Could not encode the XFR query: {error}"))?;
     let length = u16::try_from(wire.len())
-        .map_err(|_| "XFR 질의가 DNS/TCP frame 크기를 넘었습니다".to_string())?;
+        .map_err(|_| "XFR query exceeds the DNS/TCP frame size".to_string())?;
     let mut framed_wire = Vec::with_capacity(wire.len() + 2);
     framed_wire.extend_from_slice(&length.to_be_bytes());
     framed_wire.extend_from_slice(&wire);
@@ -280,7 +284,7 @@ fn xfr_exchange_prepared(
             return Ok(());
         }
     }
-    Err("영역 전송 응답에 종료 SOA가 없습니다".to_string())
+    Err("Zone transfer response has no closing SOA".to_string())
 }
 
 /** @brief XFR frame 하나의 크기·TSIG·엔벨로프를 검증하고 내용 소비자에게 넘긴다. */
@@ -295,13 +299,13 @@ fn accept_xfr_message(
     accept: &mut impl FnMut(&onetdns_proto::Message) -> Result<bool, String>,
 ) -> Result<bool, String> {
     if message_index >= MAX_AXFR_MESSAGES {
-        return Err("영역 전송 응답에 종료 SOA가 없습니다".to_string());
+        return Err("Zone transfer response has no closing SOA".to_string());
     }
     *transferred_bytes = transferred_bytes
         .checked_add(2 + buffer.len())
-        .ok_or_else(|| "AXFR 전송 크기 계산 범위를 넘었습니다".to_string())?;
+        .ok_or_else(|| "AXFR transfer size calculation overflowed".to_string())?;
     if *transferred_bytes > MAX_AXFR_WIRE_BYTES {
-        return Err("AXFR 응답의 전체 크기가 허용 범위를 넘었습니다".to_string());
+        return Err("AXFR response exceeds the total size limit".to_string());
     }
 
     let stripped_wire;
@@ -324,7 +328,7 @@ fn accept_xfr_message(
             }
             Err(error) => {
                 return Err(format!(
-                    "영역 전송 응답의 TSIG 검증에 실패했습니다: {error:?}"
+                    "TSIG verification of the zone transfer response failed: {error:?}"
                 ));
             }
         }
@@ -332,7 +336,7 @@ fn accept_xfr_message(
         buffer
     };
     let message = onetdns_proto::Message::parse(effective)
-        .map_err(|_| "영역 전송 응답을 해석하지 못했습니다".to_string())?;
+        .map_err(|_| "Could not parse the zone transfer response".to_string())?;
     let question_ok = if message_index == 0 {
         message.questions.len() == 1
             && message.questions[0]
@@ -354,14 +358,16 @@ fn accept_xfr_message(
         || !question_ok
         || !message.authorities.is_empty()
     {
-        return Err("영역 전송 응답의 헤더와 질의 정보가 요청과 일치하지 않습니다".to_string());
+        return Err(
+            "Zone transfer response header or question does not match the request".to_string(),
+        );
     }
     accept(&message)
 }
 
 /** @brief 이 응답 코드의 실패 사유. */
 fn xfr_rcode_error(rcode: u16) -> String {
-    format!("영역 전송 응답 코드: {rcode}")
+    format!("Zone transfer response code: {rcode}")
 }
 
 /**
@@ -444,23 +450,30 @@ impl IxfrSequence {
         let answer_count = message.answers.len();
         for (index, record) in message.answers.iter().enumerate() {
             if self.record_count >= MAX_AXFR_RECORDS {
-                return Err("IXFR 응답의 레코드 수가 허용 범위를 넘었습니다".to_string());
+                return Err("IXFR response has too many records".to_string());
             }
             let last_in_message = index + 1 == answer_count;
             let is_apex_soa = record.rtype == RecordType::SOA
                 && record.class == DnsClass::IN
                 && record.name.eq_ignore_case(&self.origin);
             if record.rtype == RecordType::SOA && !is_apex_soa {
-                return Err("IXFR에 apex 밖 SOA가 포함됨".to_string());
+                return Err("IXFR contains an SOA outside the apex".to_string());
             }
             if self.record_count == 0 {
                 if !is_apex_soa {
-                    return Err("IXFR 응답의 첫 레코드는 영역 최상위 SOA여야 합니다".to_string());
+                    return Err(
+                        "The first record of an IXFR response must be the zone apex SOA"
+                            .to_string(),
+                    );
                 }
-                let serial = record_soa_serial(record)
-                    .ok_or_else(|| "IXFR 응답의 첫 SOA 데이터를 해석하지 못했습니다".to_string())?;
+                let serial = record_soa_serial(record).ok_or_else(|| {
+                    "Could not parse the first SOA of the IXFR response".to_string()
+                })?;
                 if serial != self.client_serial && !serial_gt(serial, self.client_serial) {
-                    return Err("IXFR 응답의 영역 일련번호가 요청한 클라이언트의 일련번호보다 오래되었습니다".to_string());
+                    return Err(
+                        "The IXFR response serial is older than the requesting client's serial"
+                            .to_string(),
+                    );
                 }
                 self.server_serial = Some(serial);
                 self.opening_soa = Some(record.clone());
@@ -472,7 +485,7 @@ impl IxfrSequence {
                 IxfrWireMode::Undecided => {
                     if is_apex_soa {
                         let serial = record_soa_serial(record).ok_or_else(|| {
-                            "IXFR 응답의 SOA 데이터를 해석하지 못했습니다".to_string()
+                            "Could not parse an SOA in the IXFR response".to_string()
                         })?;
                         if serial == self.client_serial
                             && self
@@ -491,7 +504,7 @@ impl IxfrSequence {
                 IxfrWireMode::Delete => {
                     if is_apex_soa {
                         let serial = record_soa_serial(record).ok_or_else(|| {
-                            "IXFR 응답의 새 SOA 데이터를 해석하지 못했습니다".to_string()
+                            "Could not parse the new SOA in the IXFR response".to_string()
                         })?;
                         self.mode = IxfrWireMode::Add(serial);
                     }
@@ -499,19 +512,19 @@ impl IxfrSequence {
                 IxfrWireMode::Add(latest) => {
                     if is_apex_soa {
                         let serial = record_soa_serial(record).ok_or_else(|| {
-                            "IXFR 변경 구간의 SOA 데이터를 해석하지 못했습니다".to_string()
+                            "Could not parse the SOA of an IXFR change section".to_string()
                         })?;
                         if Some(latest) == self.server_serial {
                             let opening = self
                                 .opening_soa
                                 .as_ref()
-                                .expect("첫 IXFR 레코드를 앞에서 저장했습니다");
+                                .expect("The first IXFR record was stored above");
                             if Some(serial) != self.server_serial
                                 || !xfr_rr_equal(record, opening)
                                 || !last_in_message
                             {
                                 return Err(
-                                    "IXFR 응답의 마지막 SOA가 시작 SOA와 일치하지 않습니다"
+                                    "The last SOA of the IXFR response does not match the opening SOA"
                                         .to_string(),
                                 );
                             }
@@ -519,8 +532,10 @@ impl IxfrSequence {
                             return Ok(true);
                         }
                         if serial != latest {
-                            return Err("IXFR 변경분의 일련번호가 앞선 변경분과 이어지지 않습니다"
-                                .to_string());
+                            return Err(
+                                "The serial of an IXFR change does not follow the previous change"
+                                    .to_string(),
+                            );
                         }
                         self.mode = IxfrWireMode::Delete;
                     }
@@ -531,10 +546,10 @@ impl IxfrSequence {
                 let opening = self
                     .opening_soa
                     .as_ref()
-                    .expect("첫 IXFR 레코드를 앞에서 저장했습니다");
+                    .expect("The first IXFR record was stored above");
                 if xfr_rr_equal(record, opening) {
                     if !last_in_message {
-                        return Err("IXFR에서 전체 영역 전송으로 전환한 응답의 마지막 SOA 뒤에 레코드가 남아 있습니다".to_string());
+                        return Err("Records remain after the last SOA of an IXFR response that fell back to a full transfer".to_string());
                     }
                     self.record_count += 1;
                     return Ok(true);
@@ -585,7 +600,7 @@ fn build_ixfr_query(current: &onetdns_authority::Zone) -> Result<onetdns_proto::
     let client_soa = current
         .axfr_records_iter()
         .next()
-        .ok_or_else(|| "IXFR 요청에 클라이언트 SOA 레코드가 없습니다".to_string())?;
+        .ok_or_else(|| "The IXFR request has no client SOA record".to_string())?;
     query.authorities.push(client_soa);
     Ok(query)
 }
@@ -614,11 +629,11 @@ fn collect_ixfr(
     }
     if matches!(sequence.mode, IxfrWireMode::Full) {
         let zone = onetdns_authority::Zone::from_records(records)
-            .map_err(|error| format!("IXFR 응답을 전체 영역 전송으로 처리하는 과정에서 영역 데이터가 올바르지 않았습니다: {error}"))?;
+            .map_err(|error| format!("Zone data was invalid while handling the IXFR response as a full transfer: {error}"))?;
         if !zone.origin().eq_ignore_case(origin)
             || zone.soa().serial != sequence.server_serial.unwrap_or(0)
         {
-            return Err("IXFR에서 전체 영역 전송으로 전환한 응답의 영역 이름 또는 일련번호가 요청과 일치하지 않습니다".to_string());
+            return Err("The zone name or serial of an IXFR response that fell back to a full transfer does not match the request".to_string());
         }
         return Ok(IxfrFetchResult::Full(zone));
     }
@@ -639,14 +654,16 @@ fn apply_ixfr_records(
     let current_soa = transfer
         .first()
         .and_then(record_soa_serial)
-        .ok_or_else(|| "IXFR 응답에 현재 SOA가 없습니다".to_string())?;
+        .ok_or_else(|| "IXFR response has no current SOA".to_string())?;
     if transfer.len() < 4
         || !xfr_rr_equal(
             &transfer[0],
-            transfer.last().expect("앞에서 응답 길이를 확인했습니다"),
+            transfer
+                .last()
+                .expect("The response length was checked above"),
         )
     {
-        return Err("IXFR 응답의 시작 SOA와 마지막 SOA가 일치하지 않습니다".to_string());
+        return Err("The opening and closing SOA of the IXFR response do not match".to_string());
     }
     let mut records = current.axfr_records();
     records.pop();
@@ -654,10 +671,10 @@ fn apply_ixfr_records(
     let mut index = 1usize;
     while index + 1 < transfer.len() {
         let old_serial = record_soa_serial(&transfer[index])
-            .ok_or_else(|| "IXFR 변경 구간에 이전 SOA가 없습니다".to_string())?;
+            .ok_or_else(|| "An IXFR change section has no old SOA".to_string())?;
         if old_serial != working_serial {
             return Err(
-                "IXFR 변경 내역이 클라이언트의 현재 일련번호에서 이어지지 않습니다".to_string(),
+                "IXFR changes do not continue from the client's current serial".to_string(),
             );
         }
         index += 1;
@@ -667,31 +684,31 @@ fn apply_ixfr_records(
                 .iter()
                 .position(|record| xfr_rr_equal(record, deleted))
             else {
-                return Err("IXFR가 존재하지 않는 RR 삭제를 요구함".to_string());
+                return Err("IXFR asks to delete an RR that does not exist".to_string());
             };
             records.remove(position);
             index += 1;
         }
         if index + 1 >= transfer.len() {
-            return Err("IXFR 변경 구간에 새 SOA가 없습니다".to_string());
+            return Err("An IXFR change section has no new SOA".to_string());
         }
         let new_soa = transfer[index].clone();
         let new_serial = record_soa_serial(&new_soa)
-            .ok_or_else(|| "IXFR 변경 구간의 새 SOA가 올바르지 않습니다".to_string())?;
+            .ok_or_else(|| "The new SOA of an IXFR change section is invalid".to_string())?;
         if !serial_gt(new_serial, working_serial) {
-            return Err("IXFR 변경 구간의 일련번호가 증가하지 않았습니다".to_string());
+            return Err("The serial of an IXFR change section did not increase".to_string());
         }
         let soa_position = records
             .iter()
             .position(|record| record.rtype == RecordType::SOA)
-            .ok_or_else(|| "클라이언트 DNS 영역에 SOA 레코드가 없습니다".to_string())?;
+            .ok_or_else(|| "The client DNS zone has no SOA record".to_string())?;
         records[soa_position] = new_soa;
         working_serial = new_serial;
         index += 1;
         while index + 1 < transfer.len() && transfer[index].rtype != RecordType::SOA {
             let added = transfer[index].clone();
             if matches!(added.rdata, RData::Soa(_)) {
-                return Err("IXFR 추가 구간의 SOA 위치가 올바르지 않습니다".to_string());
+                return Err("The SOA of an IXFR addition section is misplaced".to_string());
             }
             if let Some(existing) = records
                 .iter_mut()
@@ -705,25 +722,24 @@ fn apply_ixfr_records(
         }
         if working_serial == current_soa {
             if index + 1 != transfer.len() {
-                return Err(
-                    "IXFR 응답에서 현재 일련번호 뒤에 불필요한 변경 내역이 이어집니다".to_string(),
-                );
+                return Err("IXFR response has extra changes after the current serial".to_string());
             }
             break;
         }
     }
     if working_serial != current_soa {
         return Err(
-            "IXFR 적용을 마친 뒤 영역 일련번호가 응답의 최종 일련번호와 일치하지 않습니다"
+            "After applying IXFR, the zone serial does not match the final serial of the response"
                 .to_string(),
         );
     }
     let zone = onetdns_authority::Zone::from_records(records).map_err(|error| {
-        format!("IXFR 변경을 적용한 뒤 영역 데이터 검증에 실패했습니다: {error}")
+        format!("Zone data validation failed after applying IXFR changes: {error}")
     })?;
     if !zone.origin().eq_ignore_case(current.origin()) || zone.soa().serial != current_soa {
         return Err(
-            "IXFR 적용을 마친 뒤 영역 이름 또는 일련번호가 예상값과 일치하지 않습니다".to_string(),
+            "After applying IXFR, the zone name or serial does not match the expected values"
+                .to_string(),
         );
     }
     Ok(zone)
@@ -1017,7 +1033,7 @@ impl PendingSecondaryXfrAdmission {
             match &mut self.state {
                 SecondaryXfrAdmissionState::Connecting => {
                     if let Some(error) = self.stream.take_error().map_err(|e| e.to_string())? {
-                        return Err(format!("XFR TCP 연결에 실패했습니다: {error}"));
+                        return Err(format!("XFR TCP connection failed: {error}"));
                     }
                     match self.stream.peer_addr() {
                         Ok(_) => {
@@ -1037,14 +1053,18 @@ impl PendingSecondaryXfrAdmission {
                         }
                         Err(error) => {
                             return Err(format!(
-                                "XFR TCP 연결 상태를 확인하지 못했습니다: {error}"
+                                "Could not check the XFR TCP connection state: {error}"
                             ));
                         }
                     }
                 }
                 SecondaryXfrAdmissionState::Writing { offset } => {
                     match self.stream.write(&self.framed_wire[*offset..]) {
-                        Ok(0) => return Err("XFR 질의를 보내는 중 연결이 닫혔습니다".to_string()),
+                        Ok(0) => {
+                            return Err(
+                                "The connection closed while sending the XFR query".to_string()
+                            )
+                        }
                         Ok(written) => {
                             *offset += written;
                             self.idle_deadline =
@@ -1060,35 +1080,34 @@ impl PendingSecondaryXfrAdmission {
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             return Ok(false);
                         }
-                        Err(error) => return Err(format!("XFR 질의를 보내지 못했습니다: {error}")),
+                        Err(error) => return Err(format!("Could not send the XFR query: {error}")),
                     }
                 }
                 SecondaryXfrAdmissionState::ReadingLength { bytes, offset } => {
                     if *offset == bytes.len() {
                         let length = u16::from_be_bytes(*bytes) as usize;
                         if length == 0 {
-                            return Err("XFR 응답 frame 길이가 0입니다".to_string());
+                            return Err("XFR response frame length is zero".to_string());
                         }
                         if self.messages.len() >= MAX_AXFR_MESSAGES {
-                            return Err("영역 전송 응답에 종료 SOA가 없습니다".to_string());
+                            return Err("Zone transfer response has no closing SOA".to_string());
                         }
-                        let wire_bytes = self
-                            .wire_bytes
-                            .checked_add(2 + length)
-                            .ok_or_else(|| "AXFR 전송 크기 계산 범위를 넘었습니다".to_string())?;
+                        let wire_bytes =
+                            self.wire_bytes.checked_add(2 + length).ok_or_else(|| {
+                                "AXFR transfer size calculation overflowed".to_string()
+                            })?;
                         if wire_bytes > MAX_AXFR_WIRE_BYTES {
-                            return Err(
-                                "AXFR 응답의 전체 크기가 허용 범위를 넘었습니다".to_string()
-                            );
+                            return Err("AXFR response exceeds the total size limit".to_string());
                         }
                         let charge = length
                             .checked_add(SECONDARY_XFR_FRAME_OVERHEAD_BYTES)
                             .ok_or_else(|| {
-                                "XFR 응답 버퍼 크기 계산 범위를 넘었습니다".to_string()
+                                "XFR response buffer size calculation overflowed".to_string()
                             })?;
                         if !self.reservation.try_grow(charge) {
                             return Err(
-                                "동시 XFR 응답 버퍼가 전체 메모리 상한에 도달했습니다".to_string()
+                                "Concurrent XFR response buffers reached the total memory limit"
+                                    .to_string(),
                             );
                         }
                         self.wire_bytes = wire_bytes;
@@ -1100,7 +1119,9 @@ impl PendingSecondaryXfrAdmission {
                     }
                     match self.stream.read(&mut bytes[*offset..]) {
                         Ok(0) => {
-                            return Err("XFR 종료 SOA 없이 연결이 닫혔습니다".to_string());
+                            return Err(
+                                "The connection closed before the closing XFR SOA".to_string()
+                            );
                         }
                         Ok(read) => {
                             *offset += read;
@@ -1117,15 +1138,16 @@ impl PendingSecondaryXfrAdmission {
                             return Ok(false);
                         }
                         Err(error) => {
-                            return Err(format!("XFR 응답 길이를 읽지 못했습니다: {error}"));
+                            return Err(format!("Could not read the XFR response length: {error}"));
                         }
                     }
                 }
                 SecondaryXfrAdmissionState::ReadingMessage { bytes, offset } => {
                     if *offset == bytes.len() {
                         let wire = std::mem::take(bytes);
-                        let message = onetdns_proto::Message::parse(&wire)
-                            .map_err(|_| "영역 전송 응답을 해석하지 못했습니다".to_string())?;
+                        let message = onetdns_proto::Message::parse(&wire).map_err(|_| {
+                            "Could not parse the zone transfer response".to_string()
+                        })?;
                         let complete = if message.header.rcode != 0 {
                             true
                         } else {
@@ -1149,7 +1171,9 @@ impl PendingSecondaryXfrAdmission {
                     }
                     match self.stream.read(&mut bytes[*offset..]) {
                         Ok(0) => {
-                            return Err("XFR 종료 SOA 없이 연결이 닫혔습니다".to_string());
+                            return Err(
+                                "The connection closed before the closing XFR SOA".to_string()
+                            );
                         }
                         Ok(read) => {
                             *offset += read;
@@ -1166,7 +1190,7 @@ impl PendingSecondaryXfrAdmission {
                             return Ok(false);
                         }
                         Err(error) => {
-                            return Err(format!("XFR 응답 본문을 읽지 못했습니다: {error}"));
+                            return Err(format!("Could not read the XFR response body: {error}"));
                         }
                     }
                 }
@@ -1234,7 +1258,7 @@ impl SecondaryXfrAdmission {
         if self.pending.len() >= SECONDARY_XFR_ADMISSION_MAX_IN_FLIGHT {
             return Err(Box::new((
                 job,
-                "XFR admission 연결 상한에 도달했습니다".to_string(),
+                "XFR admission connection limit reached".to_string(),
             )));
         }
         let origin = match onetdns_proto::Name::from_str(&job.entry.origin) {
@@ -1242,7 +1266,7 @@ impl SecondaryXfrAdmission {
             Err(_) => {
                 return Err(Box::new((
                     job,
-                    "보조 DNS 영역 이름의 형식이 잘못되었습니다".to_string(),
+                    "Invalid secondary DNS zone name".to_string(),
                 )));
             }
         };
@@ -1250,7 +1274,7 @@ impl SecondaryXfrAdmission {
         if job.entry.tsig_key.is_some() && key.is_none() {
             return Err(Box::new((
                 job,
-                "보조 영역에 사용할 TSIG 키를 찾지 못했습니다".to_string(),
+                "Could not find the TSIG key for the secondary zone".to_string(),
             )));
         }
 
@@ -1279,7 +1303,7 @@ impl SecondaryXfrAdmission {
             Err(error) => {
                 return Err(Box::new((
                     job,
-                    format!("XFR TCP 연결을 시작하지 못했습니다: {error}"),
+                    format!("Could not start the XFR TCP connection: {error}"),
                 )));
             }
         };
@@ -1320,9 +1344,9 @@ impl SecondaryXfrAdmission {
         while index > 0 {
             index -= 1;
             let result = if self.pending[index].progress_deadline.expired(now) {
-                Err("XFR 전송 전체 시간이 초과됐습니다".to_string())
+                Err("XFR transfer exceeded its total time limit".to_string())
             } else if now >= self.pending[index].idle_deadline {
-                Err("XFR 응답 대기 시간이 초과됐습니다".to_string())
+                Err("Timed out waiting for the XFR response".to_string())
             } else {
                 self.pending[index].advance()
             };
@@ -1452,7 +1476,7 @@ impl SecondarySoaProber {
         if self.contains(&job.entry.origin) {
             return Err(Box::new((
                 job,
-                "같은 영역의 SOA 질의가 이미 진행 중입니다".to_string(),
+                "An SOA query for the same zone is already in progress".to_string(),
             )));
         }
         let origin = match onetdns_proto::Name::from_str(&job.entry.origin) {
@@ -1460,7 +1484,7 @@ impl SecondarySoaProber {
             Err(_) => {
                 return Err(Box::new((
                     job,
-                    "보조 DNS 영역 이름의 형식이 잘못되었습니다".to_string(),
+                    "Invalid secondary DNS zone name".to_string(),
                 )));
             }
         };
@@ -1469,7 +1493,7 @@ impl SecondarySoaProber {
         if job.entry.tsig_key.is_some() && tsig_key.is_none() {
             return Err(Box::new((
                 job,
-                "보조 영역에 사용할 TSIG 키를 찾지 못했습니다".to_string(),
+                "Could not find the TSIG key for the secondary zone".to_string(),
             )));
         }
         let source = std::net::SocketAddr::new(job.entry.primary, job.entry.port);
@@ -1483,7 +1507,7 @@ impl SecondarySoaProber {
         }) else {
             return Err(Box::new((
                 job,
-                "같은 primary에 보낼 SOA 질의 ID 공간이 가득 찼습니다".to_string(),
+                "No free SOA query IDs left for this primary".to_string(),
             )));
         };
 
@@ -1496,7 +1520,7 @@ impl SecondarySoaProber {
                     Err(error) => {
                         return Err(Box::new((
                             job,
-                            format!("SOA 질의를 서명하지 못했습니다: {error}"),
+                            format!("Could not sign the SOA query: {error}"),
                         )));
                     }
                 }
@@ -1508,7 +1532,7 @@ impl SecondarySoaProber {
             Err(error) => {
                 return Err(Box::new((
                     job,
-                    format!("SOA 질의를 인코딩하지 못했습니다: {error}"),
+                    format!("Could not encode the SOA query: {error}"),
                 )));
             }
         };
@@ -1518,23 +1542,20 @@ impl SecondarySoaProber {
             self.ipv6.as_ref()
         };
         let Some(socket) = socket else {
-            return Err(Box::new((
-                job,
-                "SOA 질의용 UDP 소켓이 없습니다".to_string(),
-            )));
+            return Err(Box::new((job, "No UDP socket for SOA queries".to_string())));
         };
         match socket.send_to(&wire, source) {
             Ok(written) if written == wire.len() => {}
             Ok(_) => {
                 return Err(Box::new((
                     job,
-                    "SOA UDP 질의가 일부만 전송됐습니다".to_string(),
+                    "SOA UDP query was only partly sent".to_string(),
                 )));
             }
             Err(error) => {
                 return Err(Box::new((
                     job,
-                    format!("SOA 질의를 전송하지 못했습니다: {error}"),
+                    format!("Could not send the SOA query: {error}"),
                 )));
             }
         }
@@ -1566,7 +1587,7 @@ impl SecondarySoaProber {
                 Ok(received) => received,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    onetdns_core::warn!(event = "authority.secondary_soa_receive_failed", %error, "보조 DNS SOA 응답 소켓에서 읽지 못했습니다");
+                    onetdns_core::warn!(event = "authority.secondary_soa_receive_failed", %error, "Failed to read from the secondary SOA response socket");
                     break;
                 }
             };
@@ -1642,7 +1663,7 @@ impl SecondarySoaProber {
                 self.pending_origins.remove(&probe.job.entry.origin);
                 completed.push(SecondarySoaProbeResult {
                     job: probe.job,
-                    result: Err("SOA 질의 시간이 초과됐습니다".to_string()),
+                    result: Err("SOA query timed out".to_string()),
                 });
             }
         }
@@ -1660,10 +1681,10 @@ fn run_prepared_secondary_transfer(
     _reservation: XfrBufferReservation,
 ) -> Result<SecondaryXferOutcome, String> {
     let origin = onetdns_proto::Name::from_str(&entry.origin)
-        .map_err(|_| "보조 DNS 영역 이름의 형식이 잘못되었습니다".to_string())?;
+        .map_err(|_| "Invalid secondary DNS zone name".to_string())?;
     let key = tsig_for_secondary(tsig_keys, &entry.tsig_key);
     if entry.tsig_key.is_some() && key.is_none() {
-        return Err("보조 영역에 사용할 TSIG 키를 찾지 못했습니다".to_string());
+        return Err("Could not find the TSIG key for the secondary zone".to_string());
     }
     if entry.is_catalog {
         let records = axfr_fetch_prepared(&origin, key, prepared)?;
@@ -1693,7 +1714,7 @@ fn run_prepared_secondary_transfer(
 
     let records = axfr_fetch_prepared(&origin, key, prepared)?;
     let zone = onetdns_authority::Zone::from_records(records)
-        .map_err(|error| format!("AXFR 영역 데이터가 올바르지 않습니다: {error}"))?;
+        .map_err(|error| format!("Invalid AXFR zone data: {error}"))?;
     Ok(SecondaryXferOutcome::Zone(
         Box::new(zone),
         SecondaryXferKind::Axfr,
@@ -1738,7 +1759,7 @@ fn complete_secondary_refresh(
     if let Ok(SecondaryXferOutcome::NeedsFullTransfer { remote_serial }) = &result {
         let remote_serial = *remote_serial;
         if !job.force_axfr {
-            onetdns_core::info!(event = "authority.secondary_ixfr_notimp", origin = %job.entry.origin, primary = %job.entry.primary, "primary가 IXFR를 지원하지 않아 AXFR로 다시 받습니다");
+            onetdns_core::info!(event = "authority.secondary_ixfr_notimp", origin = %job.entry.origin, primary = %job.entry.primary, "Primary does not support IXFR; falling back to AXFR");
             let mut job = job;
             job.force_axfr = true;
             xfr_origins.insert(job.entry.origin.clone());
@@ -1756,7 +1777,7 @@ fn complete_secondary_refresh(
     match result {
         Ok(SecondaryXferOutcome::UpToDate) => ok = true,
         Ok(SecondaryXferOutcome::Zone(zone, _)) if !zonemd_ok(&zone, ZonemdPolicy::of(cfg)) => {
-            onetdns_core::warn!(event = "authority.secondary_zonemd_rejected", origin = %job.entry.origin, serial = zone.soa().serial, "받아 온 보조 DNS 영역이 ZONEMD 검증을 통과하지 못해 적용하지 않습니다. 다음 갱신 주기에 다시 받습니다");
+            onetdns_core::warn!(event = "authority.secondary_zonemd_rejected", origin = %job.entry.origin, serial = zone.soa().serial, "Transferred secondary zone failed ZONEMD verification and was not applied; retrying next refresh");
         }
         Ok(SecondaryXferOutcome::Zone(zone, kind)) => {
             refresh = zone.soa().refresh as u64;
@@ -1766,7 +1787,7 @@ fn complete_secondary_refresh(
                 match atomic_write(path, zone.to_master_file().as_bytes()) {
                     Ok(()) => true,
                     Err(error) => {
-                        onetdns_core::warn!(event = "authority.secondary_cache_save_failed", origin = %job.entry.origin, path = %path.display(), %error, "보조 DNS 영역 캐시를 저장하지 못해 새 구성을 적용하지 않습니다");
+                        onetdns_core::warn!(event = "authority.secondary_cache_save_failed", origin = %job.entry.origin, path = %path.display(), %error, "Could not save the secondary zone cache; not applying the new data");
                         false
                     }
                 }
@@ -1774,13 +1795,13 @@ fn complete_secondary_refresh(
             if persisted {
                 match kind {
                     SecondaryXferKind::Axfr => {
-                        onetdns_core::info!(event = "authority.secondary_axfr_done", origin = %job.entry.origin, serial, primary = %job.entry.primary, "보조 DNS 영역의 전체 전송을 적용했습니다")
+                        onetdns_core::info!(event = "authority.secondary_axfr_done", origin = %job.entry.origin, serial, primary = %job.entry.primary, "Applied full transfer of secondary zone")
                     }
                     SecondaryXferKind::Ixfr => {
-                        onetdns_core::info!(event = "authority.secondary_ixfr_applied", origin = %job.entry.origin, serial, "보조 DNS 영역의 증분 갱신을 적용했습니다")
+                        onetdns_core::info!(event = "authority.secondary_ixfr_applied", origin = %job.entry.origin, serial, "Applied incremental update of secondary zone")
                     }
                     SecondaryXferKind::IxfrFull => {
-                        onetdns_core::info!(event = "authority.secondary_ixfr_fallback_axfr", origin = %job.entry.origin, serial, "IXFR 응답이 완전 전송 형식이어서 AXFR로 처리했습니다")
+                        onetdns_core::info!(event = "authority.secondary_ixfr_fallback_axfr", origin = %job.entry.origin, serial, "IXFR response was a full transfer; handled it as AXFR")
                     }
                 }
                 swap_zone(store, *zone);
@@ -1802,7 +1823,7 @@ fn complete_secondary_refresh(
                 if let Ok(origin) = onetdns_proto::Name::from_str(gone) {
                     remove_zone(store, &origin);
                 }
-                onetdns_core::info!(event = "authority.catalog_zone_removed", catalog = %job.entry.origin, member = %gone, "카탈로그에서 빠진 DNS 영역을 제거했습니다");
+                onetdns_core::info!(event = "authority.catalog_zone_removed", catalog = %job.entry.origin, member = %gone, "Removed a DNS zone that left the catalog");
             }
             for added in members.iter().filter(|member| !old.contains(member)) {
                 if entries.iter().any(|entry| entry.origin == *added) {
@@ -1817,13 +1838,13 @@ fn complete_secondary_refresh(
                     is_catalog: false,
                 });
                 sched.insert(added.clone(), (completed, completed));
-                onetdns_core::info!(event = "authority.catalog_zone_added", catalog = %job.entry.origin, member = %added, "카탈로그에서 새 DNS 영역을 찾았습니다");
+                onetdns_core::info!(event = "authority.catalog_zone_added", catalog = %job.entry.origin, member = %added, "Found a new DNS zone in the catalog");
             }
             cat_state.insert(job.entry.origin.clone(), (serial, members));
             ok = true;
         }
         Ok(SecondaryXferOutcome::NeedsFullTransfer { .. }) => {
-            onetdns_core::warn!(event = "authority.secondary_axfr_refused", origin = %job.entry.origin, primary = %job.entry.primary, "AXFR 재시도까지 NOTIMP로 거절되어 다음 갱신 주기에 다시 시도합니다");
+            onetdns_core::warn!(event = "authority.secondary_axfr_refused", origin = %job.entry.origin, primary = %job.entry.primary, "AXFR retry was also refused with NOTIMP; retrying next refresh");
         }
         Err(error) => {
             let event = if job.entry.is_catalog {
@@ -1831,21 +1852,21 @@ fn complete_secondary_refresh(
             } else {
                 "authority.secondary_transfer_failed"
             };
-            onetdns_core::warn!(event = event, origin = %job.entry.origin, %error, "보조 DNS 영역 전송에 실패했습니다. 다음 갱신 주기에 다시 시도합니다");
+            onetdns_core::warn!(event = event, origin = %job.entry.origin, %error, "Secondary zone transfer failed; retrying next refresh");
         }
     }
 
     if ok {
         if let Some(path) = &job.entry.file {
             if let Err(error) = mark_secondary_refresh(path, completed) {
-                onetdns_core::warn!(event = "authority.secondary_state_save_failed", origin = %job.entry.origin, path = %path.display(), %error, "보조 DNS 영역의 갱신 상태를 저장하지 못했습니다");
+                onetdns_core::warn!(event = "authority.secondary_state_save_failed", origin = %job.entry.origin, path = %path.display(), %error, "Could not save secondary zone refresh state");
             }
         }
     } else if job.had_zone && completed.saturating_sub(job.last_ok) > job.expire {
         if let Ok(origin) = onetdns_proto::Name::from_str(&job.entry.origin) {
             remove_zone(store, &origin);
         }
-        onetdns_core::warn!(event = "authority.secondary_expired", origin = %job.entry.origin, "보조 DNS 영역이 만료되어 응답 제공을 중지합니다");
+        onetdns_core::warn!(event = "authority.secondary_expired", origin = %job.entry.origin, "Secondary zone expired; no longer answering for it");
     }
     let next_check = if urgent.contains(&job.entry.origin) {
         completed
@@ -1932,7 +1953,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
             sched.insert(e.origin.clone(), (now0, last_ok));
         }
         let max_in_flight = secondary_refresh_parallelism(entries.len());
-        onetdns_core::info!(event = "authority.secondary_refresh_started", zones = entries.len(), parser_max_in_flight = max_in_flight, admission_max_in_flight = SECONDARY_XFR_ADMISSION_MAX_IN_FLIGHT, "보조 DNS 영역 갱신 작업을 bounded 병렬 모드로 시작했습니다");
+        onetdns_core::info!(event = "authority.secondary_refresh_started", zones = entries.len(), parser_max_in_flight = max_in_flight, admission_max_in_flight = SECONDARY_XFR_ADMISSION_MAX_IN_FLIGHT, "Started secondary zone refresh with bounded parallelism");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1987,7 +2008,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                 let result = finished
                     .handle
                     .join()
-                    .map_err(|_| "보조 영역 전송 작업이 패닉으로 중단됐습니다".to_string())
+                    .map_err(|_| "The secondary zone transfer task panicked".to_string())
                     .and_then(|result| result);
                 completed.push((finished.job, result));
             }
@@ -2096,7 +2117,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                     Err(_) => {
                         complete_secondary_refresh(
                             job,
-                            Err("보조 DNS 영역 이름의 형식이 잘못되었습니다".to_string()),
+                            Err("Invalid secondary DNS zone name".to_string()),
                             &mut entries,
                             &mut sched,
                             &mut cat_state,
@@ -2191,7 +2212,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                     Err(_) => {
                         complete_secondary_refresh(
                             job,
-                            Err("보조 DNS 영역 이름의 형식이 잘못되었습니다".to_string()),
+                            Err("Invalid secondary DNS zone name".to_string()),
                             &mut entries,
                             &mut sched,
                             &mut cat_state,
@@ -2271,7 +2292,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                         let origin = job.entry.origin.clone();
                         complete_secondary_refresh(
                             job,
-                            Err(format!("보조 DNS 영역 전송 작업을 시작하지 못했습니다: {error}")),
+                            Err(format!("Could not start the secondary DNS zone transfer task: {error}")),
                             &mut entries,
                             &mut sched,
                             &mut cat_state,
@@ -2282,7 +2303,7 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
                             &notify,
                             &cfg,
                         );
-                        onetdns_core::warn!(event = "authority.secondary_worker_spawn_failed", origin = %origin, %error, "보조 DNS 영역 전송 작업을 시작하지 못했습니다");
+                        onetdns_core::warn!(event = "authority.secondary_worker_spawn_failed", origin = %origin, %error, "Could not start the secondary zone transfer task");
                         break;
                     }
                 }
@@ -2328,7 +2349,7 @@ fn soa_serial_from_response(
         || !response.header.authoritative
         || response.header.truncated
     {
-        return Err("SOA 응답의 헤더와 질의 정보가 요청과 일치하지 않습니다".to_string());
+        return Err("SOA response header or question does not match the request".to_string());
     }
     let mut serials = response.answers.iter().filter_map(|record| {
         if record.name.eq_ignore_case(origin)
@@ -2345,9 +2366,9 @@ fn soa_serial_from_response(
     });
     let serial = serials
         .next()
-        .ok_or_else(|| "SOA 응답에 영역 최상위 SOA가 없습니다".to_string())?;
+        .ok_or_else(|| "SOA response has no zone apex SOA".to_string())?;
     if serials.next().is_some() {
-        return Err("SOA 응답에 apex SOA가 중복됨".to_string());
+        return Err("SOA response has a duplicate apex SOA".to_string());
     }
     Ok(serial)
 }
@@ -2640,7 +2661,10 @@ mod tests {
         let (address, server) = axfr_test_server(false, false);
         let origin = onetdns_proto::Name::from_str("example.test").unwrap();
         let error = axfr_fetch(address, &origin, Duration::from_secs(1)).unwrap_err();
-        assert!(error.contains("종료 SOA"));
+        assert!(
+            error.contains("closing") && error.contains("SOA"),
+            "{error}"
+        );
         server.join().unwrap();
     }
 

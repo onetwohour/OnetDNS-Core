@@ -68,14 +68,14 @@ impl NeighborCache {
                     Ok(m) => {
                         if !healthy {
                             healthy = true;
-                            onetdns_core::info!(event = "mac.neighbors_recovered", entries = m.len(), "이웃 테이블을 다시 읽어 기기 이름 표시를 재개했습니다");
+                            onetdns_core::info!(event = "mac.neighbors_recovered", entries = m.len(), "Reading the neighbor table again; device names are back");
                         }
                         self.map.store(Arc::new(m));
                     }
                     Err(e) => {
                         if healthy {
                             healthy = false;
-                            onetdns_core::warn!(event = "mac.neighbors_read_failed", error = %e, "이웃 테이블을 읽지 못했습니다. 질의 처리에는 영향이 없고 대시보드에 기기 이름만 비어 보입니다");
+                            onetdns_core::warn!(event = "mac.neighbors_read_failed", error = %e, "Could not read the neighbor table; queries are unaffected but the dashboard shows no device names");
                         }
                     }
                 }
@@ -179,10 +179,10 @@ impl VendorDb {
                         }
                     }
                 }
-                onetdns_core::info!(event = "mac.vendor_db_loaded", path = %p, entries = n, "MAC 주소 제조사 데이터베이스를 불러왔습니다");
+                onetdns_core::info!(event = "mac.vendor_db_loaded", path = %p, entries = n, "Loaded the MAC vendor database");
             }
             Err(e) => {
-                onetdns_core::warn!(event = "mac.vendor_db_fallback", path = %p, error = %e, "MAC 주소 제조사 데이터베이스를 읽지 못해 내장 목록을 사용합니다")
+                onetdns_core::warn!(event = "mac.vendor_db_fallback", path = %p, error = %e, "Could not read the MAC vendor database; using the built-in list")
             }
         }
         db
@@ -249,7 +249,7 @@ fn read_arp_a() -> std::io::Result<HashMap<IpAddr, String>> {
     let Some(exe) = crate::osnet::resolve_tool("arp") else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "arp 명령을 찾지 못했습니다",
+            "Could not find the arp command",
         ));
     };
     let mut command = std::process::Command::new(exe);

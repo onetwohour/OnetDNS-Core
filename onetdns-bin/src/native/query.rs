@@ -615,7 +615,7 @@ impl NativeServer {
             ResolveOutcome::Failure(failure) => {
                 let (reason, class, ede) = failure_diagnosis(&failure);
                 let detail = format!(
-                    "DNS 질의를 처리했지만 응답을 만들지 못했습니다. 처리 방식={}, 질의 클래스={class}",
+                    "The DNS query was handled but no response was produced. backend={}, query class={class}",
                     self.resolver_mode(&scope.client)
                 );
                 self.rec_failure(
@@ -737,13 +737,13 @@ impl NativeServer {
                 event = "dns.unproven_nodata",
                 qname = %qname.to_ascii_lower(),
                 qtype = qtype.0,
-                "부정 응답 SOA 없이 비어 온 NOERROR를 그대로 전달합니다. 캐시에는 담지 않습니다"
+                "Passing through an empty NOERROR without a negative SOA; not caching it"
             );
         }
 
         if resp.header.rcode == ResponseCode::ServFail.0 {
             let detail = format!(
-                "DNS 처리 경로에서 서버 오류 응답을 반환했습니다. 처리 방식={}",
+                "The DNS handling path returned a server error response. backend={}",
                 self.resolver_mode(&scope.client)
             );
             self.rec_failure(
@@ -912,7 +912,7 @@ impl NativeServer {
                 event = "dns.unproven_nodata_after_postprocess",
                 qname = %qname.to_ascii_lower(),
                 qtype = qtype.0,
-                "후처리 뒤에도 근거 없이 비어 있어 그대로 전달합니다"
+                "Answer is still empty without proof after post-processing; passing it through"
             );
         }
 
@@ -1116,7 +1116,7 @@ fn strip_client_hop_edns(request: &mut Message) {
         });
         *record = edns
             .try_to_record()
-            .expect("EDNS 옵션을 제거한 레코드는 원본보다 커질 수 없음");
+            .expect("A record with EDNS options removed cannot be larger than the original");
     }
 }
 

@@ -78,7 +78,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let mut w = self.out.lock_recover();
         if let Err(e) = write_control_stop(&mut *w).and_then(|()| w.flush()) {
-            onetdns_core::warn!(event = "dnstap.stop_frame_failed", error = %e, "dnstap 종료 프레임을 쓰지 못했습니다. 수집기가 이 스트림을 비정상 종료로 봅니다");
+            onetdns_core::warn!(event = "dnstap.stop_frame_failed", error = %e, "Could not write the dnstap stop frame; the collector will see this stream as ending abnormally");
         }
     }
 }
@@ -167,7 +167,7 @@ impl DnstapWriter {
                 onetdns_core::warn!(
                     event = "dnstap.write_failed",
                     error = %e,
-                    "dnstap 프레임을 쓰지 못했습니다"
+                    "Could not write dnstap frame"
                 );
             }
         }

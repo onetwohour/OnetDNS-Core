@@ -51,7 +51,7 @@ impl LmdbZoneSource {
 impl ZoneSource for LmdbZoneSource {
     /** @brief 모든 키-값 쌍을 읽어 각각 zone으로 파싱한다. 빈 키는 루트를 뜻한다. */
     fn load(&self) -> Result<ZoneStore, String> {
-        let data = read_file_limited(&self.path, MAX_DATABASE_FILE, "데이터베이스")?;
+        let data = read_file_limited(&self.path, MAX_DATABASE_FILE, "database")?;
         let pairs = read_all(&data)?;
         let mut store = ZoneStore::new();
         let mut missing_origin = 0usize;
@@ -65,11 +65,11 @@ impl ZoneSource for LmdbZoneSource {
                 origin.as_str()
             };
             let z = parse_zone(&text, o)
-                .map_err(|e| format!("LMDB의 {origin} 영역을 해석하지 못했습니다: {e}"))?;
+                .map_err(|e| format!("Could not parse zone {origin} in LMDB: {e}"))?;
             store.add(z);
         }
         if missing_origin > 0 {
-            onetdns_core::warn!(event = "authority.lmdb_origin_missing", path = %self.path.display(), entries = missing_origin, "키가 비어 있는 항목을 루트 영역으로 읽었습니다. 의도한 것이 아니면 데이터베이스를 확인하십시오");
+            onetdns_core::warn!(event = "authority.lmdb_origin_missing", path = %self.path.display(), entries = missing_origin, "Read an entry with an empty key as the root zone; check the database if this is unintended");
         }
         Ok(store)
     }
@@ -116,7 +116,7 @@ fn u64le(d: &[u8], o: usize) -> Option<u64> {
  */
 fn detect_psize(data: &[u8]) -> Result<usize, String> {
     if u32le(data, 16) != Some(META_MAGIC) {
-        return Err("LMDB 메타데이터 파일의 첫 페이지 식별자가 올바르지 않습니다".into());
+        return Err("The first page identifier of the LMDB metadata file is invalid".into());
     }
     for &ps in &[4096usize, 8192, 16384, 32768, 512, 1024, 2048, 65536] {
         if data.len() >= ps + 32
@@ -162,7 +162,7 @@ fn parse_meta(page: &[u8]) -> Option<(u64, Db)> {
  */
 fn read_all(data: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
     let psize = detect_psize(data)?;
-    let meta0 = parse_meta(&data[0..]).ok_or("page0 메타 해석하지 못했습니다")?;
+    let meta0 = parse_meta(&data[0..]).ok_or("Could not parse the page 0 metadata")?;
     let meta1 = data
         .get(psize..)
         .and_then(parse_meta)
@@ -204,39 +204,38 @@ fn walk(
     depth: u32,
 ) -> Result<(), String> {
     if depth > 40 || !visited.insert(pgno) {
-        return Err("LMDB B+tree 루프/과도 깊이".into());
+        return Err("LMDB B+tree loop or excessive depth".into());
     }
-    let page = page_at(data, psize, pgno).ok_or("페이지 허용 범위를 넘었습니다")?;
-    let flags = u16le(page, 10).ok_or("LMDB 페이지 헤더를 읽지 못했습니다")?;
+    let page = page_at(data, psize, pgno).ok_or("Page is out of range")?;
+    let flags = u16le(page, 10).ok_or("Could not read the LMDB page header")?;
     let lower = u16le(page, 12).ok_or("lower")? as usize;
     if lower < 16 {
-        return Err("LMDB 페이지의 lower 값이 16보다 작습니다".into());
+        return Err("LMDB page lower bound is less than 16".into());
     }
     let nnodes = (lower - 16) / 2;
     for i in 0..nnodes {
         let ptr = u16le(page, 16 + i * 2).ok_or("ptr")? as usize;
-        let lo = u16le(page, ptr).ok_or("LMDB 노드의 시작 위치가 올바르지 않습니다")? as u64;
-        let hi = u16le(page, ptr + 2).ok_or("LMDB 노드의 끝 위치가 올바르지 않습니다")? as u64;
-        let nflags = u16le(page, ptr + 4).ok_or("LMDB 노드 플래그가 올바르지 않습니다")?;
-        let ksize = u16le(page, ptr + 6).ok_or("LMDB 노드 키 길이가 올바르지 않습니다")? as usize;
+        let lo = u16le(page, ptr).ok_or("LMDB node start offset is invalid")? as u64;
+        let hi = u16le(page, ptr + 2).ok_or("LMDB node end offset is invalid")? as u64;
+        let nflags = u16le(page, ptr + 4).ok_or("Invalid LMDB node flags")?;
+        let ksize = u16le(page, ptr + 6).ok_or("Invalid LMDB node key length")? as usize;
         let key_start = ptr + 8;
         let key = page
             .get(key_start..key_start + ksize)
-            .ok_or("LMDB 키가 페이지 경계를 벗어났습니다")?
+            .ok_or("LMDB key crosses the page boundary")?
             .to_vec();
 
         if flags & P_LEAF != 0 {
             let dsize = (lo | (hi << 16)) as usize;
             let data_start = key_start + ksize;
             if nflags & F_BIGDATA != 0 {
-                let opg = u64le(page, data_start)
-                    .ok_or("LMDB 추가 데이터 페이지 번호가 올바르지 않습니다")?;
+                let opg = u64le(page, data_start).ok_or("Invalid LMDB overflow page number")?;
                 let val = read_overflow(data, psize, opg, dsize)?;
                 out.push((key, val));
             } else {
                 let val = page
                     .get(data_start..data_start + dsize)
-                    .ok_or("LMDB 값이 페이지 경계를 벗어났습니다")?
+                    .ok_or("LMDB value crosses the page boundary")?
                     .to_vec();
                 out.push((key, val));
             }
@@ -244,7 +243,7 @@ fn walk(
             let child = lo | (hi << 16) | ((nflags as u64) << 32);
             walk(data, psize, child, out, visited, depth + 1)?;
         } else {
-            return Err("leaf/branch 아닌 페이지".into());
+            return Err("Page is neither a leaf nor a branch".into());
         }
     }
     Ok(())
@@ -256,16 +255,16 @@ fn walk(
  *       번호로 파일의 다른 곳을 값으로 읽어 낼 수 있다.
  */
 fn read_overflow(data: &[u8], psize: usize, pgno: u64, dsize: usize) -> Result<Vec<u8>, String> {
-    let page = page_at(data, psize, pgno).ok_or("추가 데이터 페이지 번호가 범위를 벗어났습니다")?;
-    let flags = u16le(page, 10).ok_or("추가 데이터 페이지 헤더가 올바르지 않습니다")?;
+    let page = page_at(data, psize, pgno).ok_or("Overflow page number is out of range")?;
+    let flags = u16le(page, 10).ok_or("Invalid overflow page header")?;
     if flags & P_OVERFLOW == 0 {
-        return Err("추가 데이터 페이지 표시가 없습니다".into());
+        return Err("Overflow page flag is missing".into());
     }
 
     let start = (pgno as usize) * psize + 16;
     data.get(start..start + dsize)
         .map(|s| s.to_vec())
-        .ok_or("추가 데이터의 크기가 허용 범위를 넘었습니다".into())
+        .ok_or("Overflow data exceeds the size limit".into())
 }
 
 /** @brief 최소 LMDB 이미지를 손으로 만들어 형식 해석을 고정한다. */

@@ -64,7 +64,7 @@ impl ZoneSource for SqliteZoneSource {
      *       본 파일만 읽으면 이미 커밋된 변경을 못 본 채로 서빙하게 된다.
      */
     fn load(&self) -> Result<ZoneStore, String> {
-        let data = read_file_limited(&self.path, MAX_DATABASE_FILE, "데이터베이스")?;
+        let data = read_file_limited(&self.path, MAX_DATABASE_FILE, "database")?;
 
         let wal_path = self.wal_path();
         let wal = match std::fs::metadata(&wal_path) {
@@ -96,12 +96,12 @@ impl ZoneSource for SqliteZoneSource {
         let mt = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
         let Some(main) = mt(&self.path) else {
             if !self.unreadable.swap(true, Ordering::Relaxed) {
-                onetdns_core::warn!(event = "authority.sqlite_unreadable", path = %self.path.display(), "SQLite 파일의 수정 시각을 읽지 못해 바뀐 것으로 보고 다시 읽습니다");
+                onetdns_core::warn!(event = "authority.sqlite_unreadable", path = %self.path.display(), "Could not read the SQLite file's modification time; treating it as changed and rereading");
             }
             return true;
         };
         if self.unreadable.swap(false, Ordering::Relaxed) {
-            onetdns_core::info!(event = "authority.sqlite_readable", path = %self.path.display(), "SQLite 파일을 다시 읽을 수 있게 되었습니다");
+            onetdns_core::info!(event = "authority.sqlite_readable", path = %self.path.display(), "SQLite file is readable again");
         }
         let newest = mt(&self.wal_path()).map_or(main, |wal| main.max(wal));
         newest > last
@@ -193,21 +193,21 @@ fn read_table_wal(
                 .to_string();
         }
     }
-    let rootpage = rootpage.ok_or_else(|| format!("테이블 없습니다: {table}"))?;
+    let rootpage = rootpage.ok_or_else(|| format!("Table not found: {table}"))?;
     let rootpage = u32::try_from(rootpage)
         .ok()
         .filter(|page| *page > 0)
-        .ok_or_else(|| format!("{table} root page가 유효하지 않음: {rootpage}"))?;
+        .ok_or_else(|| format!("Invalid root page for {table}: {rootpage}"))?;
 
     let cols = parse_columns(&create_sql);
     let oi = cols
         .iter()
         .position(|c| c.eq_ignore_ascii_case("origin"))
-        .ok_or_else(|| format!("{table}에 origin 컬럼 없습니다(스키마: {create_sql})"))?;
+        .ok_or_else(|| format!("{table} has no origin column (schema: {create_sql})"))?;
     let zi = cols
         .iter()
         .position(|c| c.eq_ignore_ascii_case("zone"))
-        .ok_or_else(|| format!("{table}에 zone 컬럼 없습니다(스키마: {create_sql})"))?;
+        .ok_or_else(|| format!("{table} has no zone column (schema: {create_sql})"))?;
 
     let mut rows = Vec::new();
     db.walk_table(rootpage, &mut rows)?;
@@ -273,25 +273,23 @@ impl<'a> Db<'a> {
      */
     fn open(data: &'a [u8], wal: Option<&[u8]>) -> Result<Db<'a>, String> {
         if data.len() < 100 || &data[..16] != b"SQLite format 3\0" {
-            return Err("SQLite 데이터베이스 파일의 헤더가 올바르지 않습니다".to_string());
+            return Err("Invalid SQLite database header".to_string());
         }
         let raw = u16::from_be_bytes([data[16], data[17]]);
         let page_size = if raw == 1 { 65536 } else { raw as usize };
         if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
-            return Err(format!(
-                "SQLite 페이지 크기가 허용 범위를 벗어났습니다: {raw}"
-            ));
+            return Err(format!("SQLite page size is out of range: {raw}"));
         }
         let reserved = data[20] as usize;
         if reserved >= page_size || data.len() < page_size {
             return Err(format!(
-                "SQLite 페이지에서 사용할 수 있는 공간이 올바르지 않습니다: page_size={page_size}, reserved={reserved}"
+                "Invalid usable space in SQLite pages: page_size={page_size}, reserved={reserved}"
             ));
         }
 
         let enc = u32::from_be_bytes([data[56], data[57], data[58], data[59]]);
         if enc != 1 && enc != 0 {
-            return Err(format!("이 SQLite 데이터베이스의 텍스트 인코딩은 지원하지 않습니다. UTF-8 데이터베이스를 사용하십시오: {enc}"));
+            return Err(format!("This SQLite database's text encoding is not supported; use a UTF-8 database: {enc}"));
         }
 
         let wal_map = match wal {
@@ -312,25 +310,25 @@ impl<'a> Db<'a> {
      */
     fn page(&self, n: u32) -> Result<&[u8], String> {
         if n == 0 {
-            return Err("SQLite 페이지 번호 0은 사용할 수 없습니다".to_string());
+            return Err("SQLite page number 0 is not allowed".to_string());
         }
         if let Some(p) = self.wal.get(&n) {
             if p.len() != self.page_size {
-                return Err(format!("WAL 페이지 {n} 크기가 일치하지 않습니다"));
+                return Err(format!("WAL page {n} size mismatch"));
             }
             return Ok(p.as_slice());
         }
         let index = usize::try_from(n - 1)
-            .map_err(|_| format!("SQLite 페이지 {n}의 번호를 내부 인덱스로 바꾸지 못했습니다"))?;
+            .map_err(|_| format!("Could not convert SQLite page {n} to an internal index"))?;
         let start = index
             .checked_mul(self.page_size)
-            .ok_or_else(|| format!("페이지 {n} 오프셋 계산 범위를 넘었습니다"))?;
+            .ok_or_else(|| format!("Page {n} offset calculation overflowed"))?;
         let end = start
             .checked_add(self.page_size)
-            .ok_or_else(|| format!("페이지 {n} 끝 오프셋 계산 범위를 넘었습니다"))?;
+            .ok_or_else(|| format!("Page {n} end offset calculation overflowed"))?;
         self.data
             .get(start..end)
-            .ok_or_else(|| format!("SQLite 파일에 {n}번 페이지가 없습니다"))
+            .ok_or_else(|| format!("The SQLite file has no page {n}"))
     }
 
     /** @brief 루트 페이지부터 테이블 B-tree를 훑어 행을 모은다. */
@@ -355,12 +353,12 @@ impl<'a> Db<'a> {
     ) -> Result<(), String> {
         if depth > MAX_BTREE_DEPTH {
             return Err(format!(
-                "SQLite B-tree의 중첩 깊이가 허용 한도({MAX_BTREE_DEPTH})를 넘었습니다"
+                "SQLite B-tree nesting exceeds the limit ({MAX_BTREE_DEPTH})"
             ));
         }
         if !visited.insert(page_no) {
             return Err(format!(
-                "SQLite B-tree에서 같은 페이지가 반복 참조됩니다: {page_no}"
+                "SQLite B-tree refers to the same page more than once: {page_no}"
             ));
         }
         let result = (|| {
@@ -369,7 +367,7 @@ impl<'a> Db<'a> {
             let hdr = if page_no == 1 { 100 } else { 0 };
             let base_header = page
                 .get(hdr..hdr + 8)
-                .ok_or_else(|| format!("SQLite {page_no}번 페이지에 B-tree 헤더가 없습니다"))?;
+                .ok_or_else(|| format!("SQLite page {page_no} has no B-tree header"))?;
             let ptype = base_header[0];
             let ncells = u16::from_be_bytes([base_header[3], base_header[4]]) as usize;
             let header_len = match ptype {
@@ -377,41 +375,45 @@ impl<'a> Db<'a> {
                 0x05 => 12,
                 t => {
                     return Err(format!(
-                        "SQLite {page_no}번 페이지가 테이블 B-tree 형식이 아닙니다: type={t:#x}"
+                        "SQLite page {page_no} is not a table B-tree page: type={t:#x}"
                     ))
                 }
             };
             let cells_at = hdr.checked_add(header_len).ok_or_else(|| {
-                format!("SQLite {page_no}번 페이지의 셀 위치표 시작점을 계산할 수 없습니다")
+                format!("Could not compute the start of the cell pointer array on SQLite page {page_no}")
             })?;
             let ptr_bytes = ncells.checked_mul(2).ok_or_else(|| {
-                format!("SQLite {page_no}번 페이지의 셀 위치표 크기를 계산할 수 없습니다")
+                format!(
+                    "Could not compute the size of the cell pointer array on SQLite page {page_no}"
+                )
             })?;
             let ptr_end = cells_at.checked_add(ptr_bytes).ok_or_else(|| {
-                format!("SQLite {page_no}번 페이지의 셀 위치표 끝을 계산할 수 없습니다")
+                format!(
+                    "Could not compute the end of the cell pointer array on SQLite page {page_no}"
+                )
             })?;
             if ptr_end > usable {
                 return Err(format!(
-                    "SQLite {page_no}번 페이지의 셀 위치표가 페이지 범위를 벗어났습니다: cells={ncells}, usable_bytes={usable}"
+                    "The cell pointer array on SQLite page {page_no} is outside the page: cells={ncells}, usable_bytes={usable}"
                 ));
             }
 
             for i in 0..ncells {
                 let at = cells_at + i * 2;
-                let pointer = page.get(at..at + 2).ok_or_else(|| {
-                    format!("SQLite {page_no}번 페이지에서 {i}번 셀의 위치 정보가 없습니다")
-                })?;
+                let pointer = page
+                    .get(at..at + 2)
+                    .ok_or_else(|| format!("SQLite page {page_no} has no pointer for cell {i}"))?;
                 let off = u16::from_be_bytes([pointer[0], pointer[1]]) as usize;
                 if off < ptr_end || off >= usable {
                     return Err(format!(
-                        "SQLite {page_no}번 페이지의 {i}번 셀 위치가 올바르지 않습니다: offset={off}, valid_range={ptr_end}..{usable}"
+                        "Invalid offset of cell {i} on SQLite page {page_no}: offset={off}, valid_range={ptr_end}..{usable}"
                     ));
                 }
                 match ptype {
                     0x0D => {
                         if out.len() >= MAX_TABLE_ROWS {
                             return Err(format!(
-                                "SQLite 테이블의 행 수가 허용 한도({MAX_TABLE_ROWS})를 넘었습니다"
+                                "SQLite table has more rows than allowed ({MAX_TABLE_ROWS})"
                             ));
                         }
                         let payload = self.leaf_cell_payload(page, off)?;
@@ -419,12 +421,11 @@ impl<'a> Db<'a> {
                     }
                     0x05 => {
                         let child_bytes = page.get(off..off + 4).ok_or_else(|| {
-                            format!("SQLite {page_no}번 내부 페이지에 하위 페이지 주소가 없습니다")
+                            format!("SQLite interior page {page_no} has no child page pointer")
                         })?;
-                        let child =
-                            u32::from_be_bytes(child_bytes.try_into().map_err(|_| {
-                                format!("SQLite {page_no}번 페이지의 하위 페이지 주소 형식이 올바르지 않습니다")
-                            })?);
+                        let child = u32::from_be_bytes(child_bytes.try_into().map_err(|_| {
+                            format!("Malformed child page pointer on SQLite page {page_no}")
+                        })?);
                         self.walk_table_inner(child, out, visited, depth + 1)?;
                     }
                     _ => unreachable!(),
@@ -433,13 +434,11 @@ impl<'a> Db<'a> {
 
             if ptype == 0x05 {
                 let right_bytes = page.get(hdr + 8..hdr + 12).ok_or_else(|| {
-                    format!("SQLite {page_no}번 내부 페이지에 마지막 하위 페이지 주소가 없습니다")
+                    format!("SQLite interior page {page_no} has no rightmost child pointer")
                 })?;
-                let right = u32::from_be_bytes(
-                    right_bytes
-                        .try_into()
-                        .map_err(|_| format!("SQLite {page_no}번 페이지의 마지막 하위 페이지 주소 형식이 올바르지 않습니다"))?,
-                );
+                let right = u32::from_be_bytes(right_bytes.try_into().map_err(|_| {
+                    format!("Malformed rightmost child pointer on SQLite page {page_no}")
+                })?);
                 self.walk_table_inner(right, out, visited, depth + 1)?;
             }
             Ok(())
@@ -460,28 +459,25 @@ impl<'a> Db<'a> {
      */
     fn leaf_cell_payload(&self, page: &[u8], off: usize) -> Result<Vec<u8>, String> {
         let mut pos = off;
-        let payload_len = usize::try_from(read_varint(page, &mut pos)?).map_err(|_| {
-            "SQLite 셀 데이터 길이가 이 시스템에서 처리할 수 있는 범위를 넘었습니다".to_string()
-        })?;
+        let payload_len = usize::try_from(read_varint(page, &mut pos)?)
+            .map_err(|_| "SQLite cell payload length is too large for this system".to_string())?;
         let _rowid = read_varint(page, &mut pos)?;
 
         let u = self.usable.min(page.len());
         if u < 480 || off >= u {
-            return Err(
-                "SQLite 셀의 시작 위치가 페이지에서 사용할 수 있는 범위를 벗어났습니다".to_string(),
-            );
+            return Err("SQLite cell starts outside the usable area of the page".to_string());
         }
         let x = u
             .checked_sub(35)
-            .ok_or("SQLite 페이지에서 데이터를 저장할 수 있는 공간이 너무 작습니다")?;
+            .ok_or("SQLite usable page area is too small for data")?;
         if payload_len <= x {
             let end = pos
                 .checked_add(payload_len)
-                .ok_or_else(|| "셀 페이로드 끝 오프셋 계산 범위를 넘었습니다".to_string())?;
+                .ok_or_else(|| "Cell payload end offset calculation overflowed".to_string())?;
             return page
                 .get(pos..end)
                 .map(|s| s.to_vec())
-                .ok_or_else(|| "SQLite 셀 데이터가 페이지 범위를 벗어났습니다".to_string());
+                .ok_or_else(|| "SQLite cell data is outside the page".to_string());
         }
 
         let m = u
@@ -489,68 +485,66 @@ impl<'a> Db<'a> {
             .and_then(|value| value.checked_mul(32))
             .map(|value| value / 255)
             .and_then(|value| value.checked_sub(23))
-            .ok_or("SQLite 셀에 직접 저장할 데이터 크기를 계산할 수 없습니다")?;
+            .ok_or("Could not compute the local payload size of a SQLite cell")?;
         let remainder = u
             .checked_sub(4)
-            .ok_or("SQLite 페이지 크기가 너무 작아 오버플로 데이터를 계산할 수 없습니다")?;
+            .ok_or("SQLite page size is too small to compute overflow data")?;
         let k = if payload_len >= m {
             m.checked_add((payload_len - m) % remainder)
-                .ok_or("SQLite 셀에 직접 저장할 데이터 길이를 계산할 수 없습니다")?
+                .ok_or("Could not compute the local payload length of a SQLite cell")?
         } else {
             payload_len
         };
         let inline = if k <= x { k } else { m };
         let inline_end = pos
             .checked_add(inline)
-            .ok_or_else(|| "셀 인라인 끝 오프셋 계산 범위를 넘었습니다".to_string())?;
+            .ok_or_else(|| "Cell inline end offset calculation overflowed".to_string())?;
         let mut out = page
             .get(pos..inline_end)
             .map(|s| s.to_vec())
-            .ok_or_else(|| {
-                "SQLite 셀에 직접 저장된 데이터가 페이지 범위를 벗어났습니다".to_string()
-            })?;
+            .ok_or_else(|| "SQLite local cell data is outside the page".to_string())?;
         let op = pos
             .checked_add(inline)
-            .ok_or("SQLite 오버플로 페이지 주소의 위치를 계산할 수 없습니다")?;
+            .ok_or("Could not compute the location of the SQLite overflow page pointer")?;
         let next_bytes = page
             .get(
                 op..op
                     .checked_add(4)
-                    .ok_or("SQLite 오버플로 페이지 주소의 끝 위치를 계산할 수 없습니다")?,
+                    .ok_or("Could not compute the end of the SQLite overflow page pointer")?,
             )
-            .ok_or("SQLite 오버플로 페이지를 가리키는 주소가 없습니다")?;
+            .ok_or("The SQLite overflow page pointer is missing")?;
         let mut next = u32::from_be_bytes(
             next_bytes
                 .try_into()
-                .map_err(|_| "SQLite 오버플로 페이지 주소 형식이 올바르지 않습니다")?,
+                .map_err(|_| "Malformed SQLite overflow page pointer")?,
         );
         let mut overflow_seen = std::collections::HashSet::new();
         while next != 0 && out.len() < payload_len {
             if overflow_seen.len() >= MAX_OVERFLOW_PAGES || !overflow_seen.insert(next) {
-                return Err(
-                    "SQLite 오버플로 페이지가 반복 참조되거나 허용 개수를 넘었습니다".to_string(),
-                );
+                return Err("SQLite overflow pages repeat or exceed the allowed count".to_string());
             }
             let opage = self.page(next)?;
             let header = opage
                 .get(..4)
-                .ok_or("SQLite 오버플로 페이지에 다음 페이지 주소가 없습니다")?;
-            next = u32::from_be_bytes(header.try_into().map_err(|_| {
-                "SQLite 오버플로 페이지의 다음 페이지 주소 형식이 올바르지 않습니다"
-            })?);
+                .ok_or("SQLite overflow page has no next page pointer")?;
+            next = u32::from_be_bytes(
+                header
+                    .try_into()
+                    .map_err(|_| "Malformed next page pointer on a SQLite overflow page")?,
+            );
             let want = (payload_len - out.len()).min(u - 4);
             let chunk = opage
                 .get(
                     4..4usize
                         .checked_add(want)
-                        .ok_or("SQLite 오버플로 데이터의 끝 위치를 계산할 수 없습니다")?,
+                        .ok_or("Could not compute the end of SQLite overflow data")?,
                 )
-                .ok_or("SQLite 오버플로 데이터가 페이지 범위를 벗어났습니다")?;
+                .ok_or("SQLite overflow data is outside the page")?;
             out.extend_from_slice(chunk);
         }
         if out.len() != payload_len {
             return Err(
-                "SQLite 오버플로 페이지의 데이터가 기록된 전체 길이보다 짧습니다".to_string(),
+                "SQLite overflow pages hold less data than the recorded length".to_string(),
             );
         }
         Ok(out)
@@ -663,12 +657,11 @@ fn wal_checksum(mut s0: u32, mut s1: u32, data: &[u8], big_endian: bool) -> (u32
  */
 fn parse_record(payload: &[u8]) -> Result<Vec<Value>, String> {
     let mut pos = 0usize;
-    let hdr_len = usize::try_from(read_varint(payload, &mut pos)?).map_err(|_| {
-        "SQLite 레코드 헤더 길이가 이 시스템에서 처리할 수 있는 범위를 넘었습니다".to_string()
-    })?;
+    let hdr_len = usize::try_from(read_varint(payload, &mut pos)?)
+        .map_err(|_| "SQLite record header length is too large for this system".to_string())?;
     if hdr_len < pos || hdr_len > payload.len() {
         return Err(format!(
-            "SQLite 레코드 헤더 범위가 올바르지 않습니다: header_bytes={hdr_len}, parsed_bytes={pos}, record_bytes={}",
+            "Invalid SQLite record header range: header_bytes={hdr_len}, parsed_bytes={pos}, record_bytes={}",
             payload.len()
         ));
     }
@@ -676,7 +669,7 @@ fn parse_record(payload: &[u8]) -> Result<Vec<Value>, String> {
     while pos < hdr_len {
         serials.push(read_varint(payload, &mut pos)?);
         if pos > hdr_len {
-            return Err("SQLite 레코드의 값 형식 정보가 헤더 범위를 벗어났습니다".to_string());
+            return Err("SQLite record serial types extend past the header".to_string());
         }
     }
     let mut body = hdr_len;
@@ -685,7 +678,7 @@ fn parse_record(payload: &[u8]) -> Result<Vec<Value>, String> {
         let (v, n) = decode_value(payload, body, st)?;
         out.push(v);
         body = body.checked_add(n).ok_or_else(|| {
-            "SQLite 레코드 본문에서 다음 값을 읽을 위치를 계산할 수 없습니다".to_string()
+            "Could not compute where to read the next value in the SQLite record body".to_string()
         })?;
     }
     Ok(out)
@@ -703,12 +696,12 @@ fn decode_value(buf: &[u8], at: usize, serial: u64) -> Result<(Value, usize), St
     let slice = |len: usize, label: &str| -> Result<&[u8], String> {
         let end = at
             .checked_add(len)
-            .ok_or_else(|| format!("{label} 데이터의 끝 위치를 계산할 수 없습니다"))?;
+            .ok_or_else(|| format!("Could not compute the end of the {label} data"))?;
         buf.get(at..end)
-            .ok_or_else(|| format!("{label} 데이터가 레코드 범위를 벗어났습니다"))
+            .ok_or_else(|| format!("{label} data extends past the record"))
     };
     let int_be = |n: usize| -> Result<i64, String> {
-        let s = slice(n, "레코드 정수 본문")?;
+        let s = slice(n, "record integer body")?;
         let mut v: i64 = if s.first().is_some_and(|byte| byte & 0x80 != 0) {
             -1
         } else {
@@ -728,36 +721,32 @@ fn decode_value(buf: &[u8], at: usize, serial: u64) -> Result<(Value, usize), St
         5 => (Value::Int(int_be(6)?), 6),
         6 => (Value::Int(int_be(8)?), 8),
         7 => {
-            let s = slice(8, "실수")?;
+            let s = slice(8, "real")?;
             let bytes: [u8; 8] = s
                 .try_into()
-                .map_err(|_| "실수 바이트 길이가 일치하지 않습니다".to_string())?;
+                .map_err(|_| "Real value byte length mismatch".to_string())?;
             (Value::Real(f64::from_be_bytes(bytes)), 8)
         }
         8 => (Value::Int(0), 0),
         9 => (Value::Int(1), 0),
         n if n >= 13 && n % 2 == 1 => {
-            let len = usize::try_from((n - 13) / 2).map_err(|_| {
-                "SQLite 텍스트 길이가 이 시스템에서 처리할 수 있는 범위를 넘었습니다".to_string()
-            })?;
-            let s = slice(len, "텍스트")?;
+            let len = usize::try_from((n - 13) / 2)
+                .map_err(|_| "SQLite text length is too large for this system".to_string())?;
+            let s = slice(len, "text")?;
             (
                 Value::Text(
-                    String::from_utf8(s.to_vec())
-                        .map_err(|_| "SQLite 텍스트가 올바른 UTF-8 형식이 아닙니다")?,
+                    String::from_utf8(s.to_vec()).map_err(|_| "SQLite text is not valid UTF-8")?,
                 ),
                 len,
             )
         }
         n if n >= 12 => {
-            let len = usize::try_from((n - 12) / 2).map_err(|_| {
-                "SQLite 바이너리 데이터 길이가 이 시스템에서 처리할 수 있는 범위를 넘었습니다"
-                    .to_string()
-            })?;
-            let s = slice(len, "블롭")?;
+            let len = usize::try_from((n - 12) / 2)
+                .map_err(|_| "SQLite blob length is too large for this system".to_string())?;
+            let s = slice(len, "blob")?;
             (Value::Blob(s.to_vec()), len)
         }
-        n => return Err(format!("지원하지 않는 SQLite 값 형식 번호입니다: {n}")),
+        n => return Err(format!("Unsupported SQLite serial type: {n}")),
     })
 }
 
@@ -769,9 +758,7 @@ fn decode_value(buf: &[u8], at: usize, serial: u64) -> Result<(Value, usize), St
 fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, String> {
     let mut v: u64 = 0;
     for i in 0..9 {
-        let b = *buf
-            .get(*pos)
-            .ok_or("SQLite 가변 길이 정수 데이터가 중간에서 끝났습니다")?;
+        let b = *buf.get(*pos).ok_or("SQLite varint data ended early")?;
         *pos += 1;
         if i == 8 {
             v = (v << 8) | b as u64;
@@ -1128,10 +1115,7 @@ mod tests {
         page[100] = 0x0D;
         page[103..105].copy_from_slice(&u16::MAX.to_be_bytes());
         let error = read_table(&page, "zones").unwrap_err();
-        assert!(
-            error.contains("셀 위치표가 페이지 범위를 벗어났습니다"),
-            "{error}"
-        );
+        assert!(error.contains("is outside the page"), "{error}");
     }
 
     /** @brief 셀 포인터가 헤더 안을 가리키면 거부하는지. */
@@ -1144,7 +1128,7 @@ mod tests {
         page[105..107].copy_from_slice(&200u16.to_be_bytes());
         page[108..110].copy_from_slice(&100u16.to_be_bytes());
         let error = read_table(&page, "zones").unwrap_err();
-        assert!(error.contains("0번 셀 위치가 올바르지 않습니다"), "{error}");
+        assert!(error.contains("Invalid offset of cell 0"), "{error}");
     }
 
     /** @brief 페이지가 자기 자신을 자식으로 두는 트리에서 무한 재귀에 빠지지 않는지. */
@@ -1162,7 +1146,7 @@ mod tests {
         let p2 = interior_page(&[], 2);
         let data = build_db(vec![p1, p2]);
         let error = read_table(&data, "zones").unwrap_err();
-        assert!(error.contains("같은 페이지가 반복 참조됩니다"), "{error}");
+        assert!(error.contains("same page more than once"), "{error}");
     }
 
     /** @brief 값 길이가 위치 계산을 넘치게 만들어도 패닉하지 않는지. */
@@ -1188,7 +1172,7 @@ mod tests {
         let p2 = leaf_page(&[], &mut ovf, &mut o, false);
         let data = build_db(vec![p1, p2]);
         let err = read_table(&data, "zones").unwrap_err();
-        assert!(err.contains("테이블 없습니다"), "{err}");
+        assert!(err.contains("Table not found"), "{err}");
     }
 
     /** @brief 따옴표·대괄호로 감싼 열 이름과 제약 조건 항목을 제대로 갈라내는지. */

@@ -315,12 +315,15 @@ mod stream_slot_tests {
             held.push(g);
             assert!(
                 held.len() <= MAX_CONTROL_STREAM_CONNECTIONS,
-                "동시 처리 상한을 넘겨 자원을 얻을 수 없습니다"
+                "Concurrency limit reached; cannot acquire a slot"
             );
         }
         assert!(!held.is_empty());
         held.pop();
-        assert!(acquire_stream_slot().is_some(), "슬롯 반환 후 재획득 가능");
+        assert!(
+            acquire_stream_slot().is_some(),
+            "A slot can be acquired again after release"
+        );
     }
 
     #[test]
@@ -329,7 +332,7 @@ mod stream_slot_tests {
         assert_eq!(
             MAX_CONTROL_CONNECTIONS,
             MAX_CONTROL_STREAM_CONNECTIONS * 2,
-            "스트리밍이 가득 차도 일반·Raft 연결 64개를 남깁니다"
+            "Streaming at capacity still leaves 64 regular and Raft connections"
         );
         assert_eq!(CONTROL_CONNECTION_STACK_BYTES, 256 * 1024);
 
@@ -342,7 +345,7 @@ mod stream_slot_tests {
         assert_eq!(
             active.load(std::sync::atomic::Ordering::Acquire),
             MAX_CONTROL_CONNECTIONS,
-            "거절된 획득이 활성 연결 수를 늘리지 않습니다"
+            "A rejected acquire does not increase the active connection count"
         );
         held.pop();
         assert!(acquire_connection_slot(&active).is_some());
@@ -514,7 +517,7 @@ fn record_control_error(
             peer = %peer,
             count = count,
             error = %detail,
-            "웹 관리 연결에서 오류가 발생했습니다"
+            "Error on a dashboard connection"
         );
     }
 }
@@ -842,39 +845,39 @@ impl Controls {
             config_diff: Box::new(|_| {
                 Ok("{\"added\":[],\"removed\":[],\"changed\":[]}".to_string())
             }),
-            config_apply: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            config_set: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
+            config_apply: Box::new(|_| Err("No config file path".to_string())),
+            config_set: Box::new(|_| Err("No config file path".to_string())),
             config_schema: Box::new(|| "{\"keys\":[]}".to_string()),
-            upstream_test: Box::new(|_| Err("요청한 기능을 사용할 수 없습니다".to_string())),
+            upstream_test: Box::new(|_| Err("The requested feature is not available".to_string())),
             cache_flush: Box::new(|| "{\"flushed\":0}".to_string()),
             rewrites_list: Box::new(|| "{\"rewrites\":[]}".to_string()),
-            rewrite_add: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            rewrite_delete: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
+            rewrite_add: Box::new(|_| Err("No config file path".to_string())),
+            rewrite_delete: Box::new(|_| Err("No config file path".to_string())),
             services_catalog: Box::new(|| "{\"services\":[]}".to_string()),
             access_list: Box::new(|| {
                 "{\"allowed\":[],\"blocked\":[],\"refused_domains\":[]}".to_string()
             }),
             tls_status: Box::new(|| "{\"configured\":false}".to_string()),
-            tls_validate: Box::new(|| Err("TLS 인증서가 설정되어 있지 않습니다".to_string())),
-            tls_configure: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            tls_revocation_check: Box::new(|_| Err("인증서 체인을 찾을 수 없습니다".to_string())),
-            acme_issue: Box::new(|_| {
-                Err("ACME 인증서 발급 기능이 설정되어 있지 않습니다".to_string())
-            }),
+            tls_validate: Box::new(|| Err("No TLS certificate is configured".to_string())),
+            tls_configure: Box::new(|_| Err("No config file path".to_string())),
+            tls_revocation_check: Box::new(|_| Err("Certificate chain not found".to_string())),
+            acme_issue: Box::new(
+                |_| Err("ACME certificate issuance is not configured".to_string()),
+            ),
             tokens_list: Box::new(|| "{\"tokens\":[]}".to_string()),
-            token_add: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            token_delete: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            config_rollback: Box::new(|| Err("되돌릴 이전 설정이 없습니다".to_string())),
+            token_add: Box::new(|_| Err("No config file path".to_string())),
+            token_delete: Box::new(|_| Err("No config file path".to_string())),
+            config_rollback: Box::new(|| Err("No previous config to roll back to".to_string())),
             policy_simulate: Box::new(|_| "{\"action\":\"continue\"}".to_string()),
             zones_list: Box::new(|| "[]".to_string()),
-            zone_get: Box::new(|_| Err("권한 DNS 기능을 사용할 수 없습니다".to_string())),
-            zone_put: Box::new(|_, _| Err("권한 DNS 기능을 사용할 수 없습니다".to_string())),
-            zone_delete: Box::new(|_| Err("권한 DNS 기능을 사용할 수 없습니다".to_string())),
-            zone_record_add: Box::new(|_, _| Err("권한 DNS 기능을 사용할 수 없습니다".to_string())),
+            zone_get: Box::new(|_| Err("Authoritative DNS is not available".to_string())),
+            zone_put: Box::new(|_, _| Err("Authoritative DNS is not available".to_string())),
+            zone_delete: Box::new(|_| Err("Authoritative DNS is not available".to_string())),
+            zone_record_add: Box::new(|_, _| Err("Authoritative DNS is not available".to_string())),
             zone_record_delete: Box::new(|_, _| {
-                Err("권한 DNS 기능을 사용할 수 없습니다".to_string())
+                Err("Authoritative DNS is not available".to_string())
             }),
-            zone_dnssec: Box::new(|_| Err("권한 DNS 기능을 사용할 수 없습니다".to_string())),
+            zone_dnssec: Box::new(|_| Err("Authoritative DNS is not available".to_string())),
             config_desired: Box::new(|| "{}".to_string()),
             config_effective: Box::new(|| "{}".to_string()),
             config_status: Box::new(|| "{\"in_sync\":true,\"changed_keys\":[]}".to_string()),
@@ -889,65 +892,65 @@ impl Controls {
                 "{\"urls\":[],\"count\":0,\"block_domains\":0}".to_string()
             }),
             subscription_add: Box::new(|_| {
-                Err("차단 목록 구독 기능을 사용할 수 없습니다".to_string())
+                Err("Blocklist subscriptions are not available".to_string())
             }),
             subscription_remove: Box::new(|_| {
-                Err("차단 목록 구독 기능을 사용할 수 없습니다".to_string())
+                Err("Blocklist subscriptions are not available".to_string())
             }),
             subscription_update: Box::new(|_| {
-                Err("차단 목록 구독 기능을 사용할 수 없습니다".to_string())
+                Err("Blocklist subscriptions are not available".to_string())
             }),
             subscription_refresh: Box::new(|_| {
-                Err("차단 목록 구독 기능을 사용할 수 없습니다".to_string())
+                Err("Blocklist subscriptions are not available".to_string())
             }),
             filter_rules_list: Box::new(|| {
                 "{\"block\":[],\"allow\":[],\"refused_domains\":[]}".to_string()
             }),
-            filter_rule_mutate: Box::new(|_, _| Err("필터 기능을 사용할 수 없습니다".to_string())),
+            filter_rule_mutate: Box::new(|_, _| Err("Filtering is not available".to_string())),
             clients_list: Box::new(|| "[]".to_string()),
             upstreams_list: Box::new(|| "[]".to_string()),
             jobs_list: Box::new(|| "[]".to_string()),
-            job_get: Box::new(|_| Err("작업을 찾을 수 없습니다".to_string())),
+            job_get: Box::new(|_| Err("Job not found".to_string())),
             job_refresh: Box::new(|| "{\"id\":0,\"status\":\"running\"}".to_string()),
             dhcp_leases: Box::new(|| "{\"v4\":[],\"v6\":[]}".to_string()),
-            dhcp_lease_put: Box::new(|_| Err("DHCP 기능이 설정되어 있지 않습니다".to_string())),
+            dhcp_lease_put: Box::new(|_| Err("DHCP is not configured".to_string())),
             dhcp_static_list: Box::new(|| "{\"available\":false,\"reservations\":[]}".to_string()),
-            dhcp_static_add: Box::new(|_| Err("DHCP 기능이 설정되어 있지 않습니다".to_string())),
-            dhcp_static_remove: Box::new(|_| Err("DHCP 기능이 설정되어 있지 않습니다".to_string())),
-            client_add: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            client_remove: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            client_update: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            password_change: Box::new(|_, _| Err("설정 파일 경로가 없습니다".to_string())),
-            user_create: Box::new(|_, _| Err("설정 파일 경로가 없습니다".to_string())),
-            upstream_add: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
-            upstream_remove: Box::new(|_| Err("설정 파일 경로가 없습니다".to_string())),
+            dhcp_static_add: Box::new(|_| Err("DHCP is not configured".to_string())),
+            dhcp_static_remove: Box::new(|_| Err("DHCP is not configured".to_string())),
+            client_add: Box::new(|_| Err("No config file path".to_string())),
+            client_remove: Box::new(|_| Err("No config file path".to_string())),
+            client_update: Box::new(|_| Err("No config file path".to_string())),
+            password_change: Box::new(|_, _| Err("No config file path".to_string())),
+            user_create: Box::new(|_, _| Err("No config file path".to_string())),
+            upstream_add: Box::new(|_| Err("No config file path".to_string())),
+            upstream_remove: Box::new(|_| Err("No config file path".to_string())),
             explain: Box::new(|_| "{\"decision\":\"continue\"}".to_string()),
             cluster_status: Box::new(|| {
                 "{\"self\":{\"id\":null,\"role\":\"standalone\",\"backend\":\"unknown\",\"listeners\":0,\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true},\"peers\":[]}".to_string()
             }),
             cluster_propose: Box::new(|_| {
-                Err("Raft 고가용성 기능이 설정되어 있지 않습니다".to_string())
+                Err("Raft high availability is not configured".to_string())
             }),
             cluster_write: Box::new(|_, _, _, dispatch| dispatch()),
             listeners_status: Box::new(|| "[]".to_string()),
             net_adapters: Box::new(|| {
-                Err("현재 운영 체제에서는 네트워크 어댑터 조회를 지원하지 않습니다".to_string())
+                Err("Listing network adapters is not supported on this OS".to_string())
             }),
             firewall_set: Box::new(|_| {
-                Err("현재 운영 체제에서는 방화벽 설정 변경을 지원하지 않습니다".to_string())
+                Err("Changing firewall settings is not supported on this OS".to_string())
             }),
             dns_client_set: Box::new(|_| {
-                Err("현재 운영 체제에서는 시스템 DNS 서버 변경을 지원하지 않습니다".to_string())
+                Err("Changing the system DNS server is not supported on this OS".to_string())
             }),
             dns_client_restore: Box::new(|_| {
-                Err("현재 운영 체제에서는 시스템 DNS 설정 복원을 지원하지 않습니다".to_string())
+                Err("Restoring system DNS settings is not supported on this OS".to_string())
             }),
-            resolve_probe: Box::new(|_| Err("DNS 수신 주소가 없습니다".to_string())),
+            resolve_probe: Box::new(|_| Err("No DNS listen address".to_string())),
             boot_service_status: Box::new(|| {
                 "{\"supported\":false,\"installed\":false,\"running\":false}".to_string()
             }),
             boot_service_set: Box::new(|_| {
-                Err("현재 운영 체제에서는 부팅 서비스 등록을 지원하지 않습니다".to_string())
+                Err("Installing a boot service is not supported on this OS".to_string())
             }),
             metrics_extra: Box::new(String::new),
         }
@@ -1554,7 +1557,7 @@ fn credential_digest(prefix: &str, parts: &[&str]) -> [u8; 32] {
     /** @brief 이 프로세스의 서명 키. */
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();
     let key = KEY.get_or_init(onetdns_core::random_array::<32>);
-    let mut hasher = HmacSha256::new_from_slice(key).expect("HMAC-SHA-256 키 길이는 유효합니다");
+    let mut hasher = HmacSha256::new_from_slice(key).expect("HMAC-SHA-256 key length is valid");
     hasher.update(prefix.as_bytes());
     for part in parts {
         hasher.update(&[0]);
@@ -1785,7 +1788,7 @@ impl AuditLog {
                         Some(detail) => onetdns_core::warn!(
                             event = "control.request_failed",
                             actor, role, method, path, peer, status, count, detail = %detail,
-                            "관리 API 요청 처리에 실패했습니다"
+                            "Management API request failed"
                         ),
                         None => onetdns_core::warn!(
                             event = "control.request_failed",
@@ -1796,7 +1799,7 @@ impl AuditLog {
                             peer,
                             status,
                             count,
-                            "관리 API 요청 처리에 실패했습니다"
+                            "Management API request failed"
                         ),
                     }
                 }
@@ -1805,7 +1808,7 @@ impl AuditLog {
                     Some(detail) => onetdns_core::info!(
                         event = "control.mutation",
                         actor, role, method, path, peer, status, detail = %detail,
-                        "관리 API의 변경 요청을 처리했습니다"
+                        "Handled a management API change request"
                     ),
                     None => onetdns_core::info!(
                         event = "control.mutation",
@@ -1815,7 +1818,7 @@ impl AuditLog {
                         path,
                         peer,
                         status,
-                        "관리 API의 변경 요청을 처리했습니다"
+                        "Handled a management API change request"
                     ),
                 }
             }
@@ -2046,7 +2049,7 @@ fn spawn_control_connection(
                         | std::io::ErrorKind::UnexpectedEof
                         | std::io::ErrorKind::NotConnected
                 ) {
-                    onetdns_core::debug!(event = "control.connection_closed", transport = "control", peer = %peer, error = %error, "웹 관리 연결을 닫았습니다");
+                    onetdns_core::debug!(event = "control.connection_closed", transport = "control", peer = %peer, error = %error, "Closed dashboard connection");
                 } else {
                     record_control_error("connection", Some(peer), error);
                 }
@@ -2077,7 +2080,7 @@ fn promote_control_connections(
                     "408 Request Timeout",
                     "text/plain",
                     "",
-                    "관리 요청을 제한 시간 안에 받지 못했습니다",
+                    "Management request was not received in time",
                 );
             }
             continue;
@@ -2117,7 +2120,7 @@ fn promote_control_connections(
                         "503 Service Unavailable",
                         "text/plain",
                         "Retry-After: 1\r\n",
-                        "관리 요청 원문 메모리 상한에 도달했습니다",
+                        "Management request buffer limit reached",
                     );
                 }
             }
@@ -2190,14 +2193,14 @@ pub fn serve_listener(
                         record_control_error(
                             "connection_limit",
                             Some(peer),
-                            "동시에 처리할 수 있는 관리 연결 수를 초과했습니다",
+                            "Too many concurrent management connections",
                         );
                         let _ = write_simple(
                             s,
                             "503 Service Unavailable",
                             "text/plain",
                             "Retry-After: 1\r\n",
-                            "관리 요청이 많습니다. 잠시 후 다시 시도하세요",
+                            "Too many management requests. Try again shortly",
                         );
                         continue;
                     };
@@ -2400,7 +2403,7 @@ fn handle_conn_inner(
             request_deadline,
             shutdown,
             prefix,
-            admission_bytes.expect("admission 보호자는 서버 연결에 항상 존재합니다"),
+            admission_bytes.expect("Server connections always carry an admission guard"),
         ),
         None => DeadlineTcp::new(request_stream, request_deadline),
     };
@@ -2416,7 +2419,7 @@ fn handle_conn_inner(
             "414 URI Too Long",
             "text/plain",
             "",
-            "요청 주소가 허용된 길이를 초과했습니다",
+            "Request target is too long",
         );
     }
     let Some(line) = http_line(&line) else {
@@ -2425,7 +2428,7 @@ fn handle_conn_inner(
             "400 Bad Request",
             "text/plain",
             "",
-            "HTTP 요청 줄은 CRLF로 끝나야 합니다",
+            "HTTP request line must end with CRLF",
         );
     };
     let mut it = line.split(' ');
@@ -2448,7 +2451,7 @@ fn handle_conn_inner(
             "400 Bad Request",
             "text/plain",
             "",
-            "HTTP 요청의 첫 줄 형식이 올바르지 않습니다",
+            "Malformed HTTP request line",
         );
     }
     // 질의 문자열은 경로가 아니다. 이것을 떼지 않으면 /?x=1도 /healthz?src=lb도
@@ -2482,7 +2485,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "HTTP 헤더가 완전히 전송되지 않았습니다",
+                "HTTP headers were not fully received",
             );
         }
         header_bytes = header_bytes.saturating_add(h.len());
@@ -2496,7 +2499,7 @@ fn handle_conn_inner(
                 "431 Request Header Fields Too Large",
                 "text/plain",
                 "",
-                "HTTP 헤더의 크기나 개수가 허용 범위를 초과했습니다",
+                "HTTP headers exceed the size or count limit",
             );
         }
         let Some(t) = http_line(&h) else {
@@ -2505,7 +2508,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "HTTP 헤더 줄은 CRLF로 끝나야 합니다",
+                "HTTP header line must end with CRLF",
             );
         };
         if t.is_empty() {
@@ -2517,7 +2520,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "여러 줄로 접힌 HTTP 헤더는 사용할 수 없습니다",
+                "Folded HTTP headers are not allowed",
             );
         }
         let Some((name, val)) = t.split_once(':') else {
@@ -2526,7 +2529,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "HTTP 헤더 형식이 올바르지 않습니다",
+                "Malformed HTTP header",
             );
         };
         if !http_token(name) || !http_field_value(val) {
@@ -2535,7 +2538,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "HTTP 헤더 이름이나 값에 허용되지 않는 문자가 있습니다",
+                "HTTP header name or value contains a disallowed character",
             );
         }
         let val = val.trim_matches([' ', '\t']);
@@ -2546,7 +2549,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Content-Length 헤더를 두 번 이상 보낼 수 없습니다",
+                    "Content-Length header sent more than once",
                 );
             }
             if val.is_empty() || !val.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -2555,7 +2558,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Content-Length 헤더 값이 올바르지 않습니다",
+                    "Invalid Content-Length header",
                 );
             }
             content_length = Some(match val.parse::<usize>() {
@@ -2566,7 +2569,7 @@ fn handle_conn_inner(
                         "400 Bad Request",
                         "text/plain",
                         "",
-                        "Content-Length 헤더 값이 올바르지 않습니다",
+                        "Invalid Content-Length header",
                     )
                 }
             });
@@ -2577,7 +2580,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Content-Type 헤더를 두 번 이상 보낼 수 없습니다",
+                    "Content-Type header sent more than once",
                 );
             }
             content_type = Some(val.to_ascii_lowercase());
@@ -2590,7 +2593,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Host 헤더를 두 번 이상 보낼 수 없습니다",
+                    "Host header sent more than once",
                 );
             }
             host = Some(val.to_string());
@@ -2601,7 +2604,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Origin 헤더를 두 번 이상 보낼 수 없습니다",
+                    "Origin header sent more than once",
                 );
             }
             origin = Some(val.to_string());
@@ -2612,7 +2615,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "Authorization 헤더를 두 번 이상 보낼 수 없습니다",
+                    "Authorization header sent more than once",
                 );
             }
             auth_seen = true;
@@ -2626,7 +2629,7 @@ fn handle_conn_inner(
                     "400 Bad Request",
                     "text/plain",
                     "",
-                    "요청 위조 방지 헤더를 두 번 이상 보낼 수 없습니다",
+                    "CSRF header sent more than once",
                 );
             }
             csrf_seen = true;
@@ -2652,7 +2655,7 @@ fn handle_conn_inner(
             "400 Bad Request",
             "text/plain",
             "",
-            "Host 헤더가 없습니다",
+            "Missing Host header",
         );
     };
     /*
@@ -2667,26 +2670,26 @@ fn handle_conn_inner(
         record_control_error(
             "host_not_loopback",
             peer,
-            "관리 API를 루프백이 아닌 Host로 불렀습니다. DNS 리바인딩 시도일 수 있습니다",
+            "Management API called with a non-loopback Host. This may be a DNS rebinding attempt",
         );
         return write_simple(
             stream,
             "421 Misdirected Request",
             "text/plain",
             "",
-            "관리 API의 Host는 localhost 또는 루프백 주소여야 합니다",
+            "Management API Host must be localhost or a loopback address",
         );
     };
     if origin.as_deref().is_some_and(|value| {
         control_origin_authority(value, local_port).as_deref() != Some(host_identity.as_str())
     }) {
-        record_control_error("cross_origin", peer, "다른 출처에서 보낸 관리 요청입니다");
+        record_control_error("cross_origin", peer, "Cross-origin management request");
         return write_simple(
             stream,
             "403 Forbidden",
             "text/plain",
             "",
-            "다른 출처에서 보낸 관리 요청은 허용하지 않습니다",
+            "Cross-origin management requests are not allowed",
         );
     }
     if has_transfer_encoding {
@@ -2695,7 +2698,7 @@ fn handle_conn_inner(
             "400 Bad Request",
             "text/plain",
             "",
-            "Transfer-Encoding 요청은 지원하지 않습니다",
+            "Transfer-Encoding requests are not supported",
         );
     }
     let content_length = content_length.unwrap_or(0);
@@ -2706,7 +2709,7 @@ fn handle_conn_inner(
             "413 Payload Too Large",
             "text/plain",
             "",
-            "요청 본문이 허용된 크기를 초과했습니다",
+            "Request body is too large",
         );
     }
     let session_candidates = cookie_values(&cookie, "onetdns_session");
@@ -2718,14 +2721,14 @@ fn handle_conn_inner(
         record_control_error(
             "csrf_check",
             peer,
-            "세션 쿠키로 보낸 변경 요청에 위조 방지 표식이 없습니다",
+            "Cookie-authenticated write request has no CSRF token",
         );
         return write_simple(
             stream,
             "403 Forbidden",
             "text/plain",
             "",
-            "요청 위조 방지 검사를 통과하지 못했습니다",
+            "CSRF check failed",
         );
     }
 
@@ -2733,14 +2736,14 @@ fn handle_conn_inner(
         record_control_error(
             "content_type",
             peer,
-            "Content-Type이 없거나 지원하지 않는 형식입니다",
+            "Content-Type is missing or unsupported",
         );
         return write_simple(
             stream,
             "415 Unsupported Media Type",
             "text/plain",
             "",
-            "Content-Type 헤더가 없거나 지원하지 않는 형식입니다",
+            "Content-Type header is missing or unsupported",
         );
     }
     let mut body = vec![0u8; content_length];
@@ -2755,7 +2758,7 @@ fn handle_conn_inner(
                 "400 Bad Request",
                 "text/plain",
                 "",
-                "요청 본문은 올바른 UTF-8 문자열이어야 합니다",
+                "Request body must be valid UTF-8",
             )
         }
     };
@@ -2974,7 +2977,7 @@ fn handle_setup(
         return refuse(
             stream,
             "409 Conflict",
-            "이미 계정이 있습니다. 로그인하거나 계정 화면에서 비밀번호를 바꾸십시오",
+            "An account already exists. Sign in, or change the password from the account page",
         );
     }
 
@@ -2991,7 +2994,11 @@ fn handle_setup(
     let password = field("password");
 
     if name.is_empty() || name.chars().count() > 64 {
-        return refuse(stream, "400 Bad Request", "아이디는 1~64자여야 합니다");
+        return refuse(
+            stream,
+            "400 Bad Request",
+            "Username must be 1 to 64 characters",
+        );
     }
     if name
         .chars()
@@ -3000,14 +3007,14 @@ fn handle_setup(
         return refuse(
             stream,
             "400 Bad Request",
-            "아이디에 따옴표나 제어 문자를 쓸 수 없습니다",
+            "Username cannot contain quotes or control characters",
         );
     }
     if password.chars().count() < 12 {
         return refuse(
             stream,
             "400 Bad Request",
-            "비밀번호는 12자 이상이어야 합니다",
+            "Password must be at least 12 characters",
         );
     }
 
@@ -3020,7 +3027,7 @@ fn handle_setup(
             return refuse(
                 stream,
                 "409 Conflict",
-                "이미 계정이 있습니다. 로그인하거나 계정 화면에서 비밀번호를 바꾸십시오",
+                "An account already exists. Sign in, or change the password from the account page",
             );
         }
         if let Err(error) = (st.controls.user_create)(&name, &hash) {
@@ -3046,7 +3053,7 @@ fn handle_setup(
         event = "console.first_admin_created",
         user = %name,
         peer = %peer_s,
-        "웹 콘솔의 첫 관리자 계정을 만들었습니다. 이 경로는 이제 닫힙니다"
+        "Created the first dashboard admin account; this setup path is now closed"
     );
 
     match st.auth.start_session_for(&name) {
@@ -3062,7 +3069,7 @@ fn handle_setup(
         None => refuse(
             stream,
             "500 Internal Server Error",
-            "계정은 만들었지만 로그인에 실패했습니다. 방금 만든 계정으로 다시 로그인하십시오",
+            "The account was created but sign-in failed. Sign in again with the new account",
         ),
     }
 }
@@ -3159,7 +3166,7 @@ fn handle_login(
             "429 Too Many Requests",
             "application/json",
             "Retry-After: 900\r\n",
-            "{\"ok\":false,\"error\":\"로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요\"}",
+            "{\"ok\":false,\"error\":\"Too many sign-in attempts. Try again shortly\"}",
         );
     }
     match st.auth.login(&user, &password) {
@@ -3190,7 +3197,7 @@ fn handle_login(
                 "401 Unauthorized",
                 "application/json",
                 "",
-                "{\"ok\":false,\"error\":\"사용자 이름 또는 비밀번호가 올바르지 않습니다\"}",
+                "{\"ok\":false,\"error\":\"Incorrect username or password\"}",
             )
         }
         LoginResult::Busy => {
@@ -3201,7 +3208,7 @@ fn handle_login(
                 "503 Service Unavailable",
                 "application/json",
                 "Retry-After: 1\r\n",
-                "{\"ok\":false,\"error\":\"비밀번호 확인 요청이 많습니다. 잠시 후 다시 시도하세요\"}",
+                "{\"ok\":false,\"error\":\"Too many password checks. Try again shortly\"}",
             )
         }
     }
@@ -3280,7 +3287,7 @@ fn handle_dashboard_websocket(
             "400 Bad Request",
             "text/plain",
             "Sec-WebSocket-Version: 13\r\n",
-            "WebSocket 연결 협상에 실패했습니다",
+            "WebSocket handshake failed",
         );
     }
 
@@ -3290,7 +3297,7 @@ fn handle_dashboard_websocket(
             "400 Bad Request",
             "text/plain",
             "",
-            "WebSocket 하위 프로토콜에 인증 정보를 넣을 수 없습니다",
+            "WebSocket subprotocol cannot carry credentials",
         );
     }
     let token = auth
@@ -3317,7 +3324,7 @@ fn handle_dashboard_websocket(
             "401 Unauthorized",
             "text/plain",
             "",
-            "인증이 필요합니다",
+            "Authentication required",
         );
     };
     let actor = audit_actor(&st.auth, token, session);
@@ -3330,17 +3337,13 @@ fn handle_dashboard_websocket(
             &peer_s,
             503,
         );
-        record_control_error(
-            "stream_limit",
-            peer,
-            "동시에 열 수 있는 실시간 로그 연결 수를 초과했습니다",
-        );
+        record_control_error("stream_limit", peer, "Too many live log connections");
         return write_simple(
             stream,
             "503 Service Unavailable",
             "text/plain",
             "Retry-After: 1\r\n",
-            "실시간 로그 연결이 많습니다. 잠시 후 다시 시도하세요",
+            "Too many live log connections. Try again shortly",
         );
     };
 
@@ -3537,16 +3540,16 @@ fn ws_read_frame(stream: &mut SharedTcp) -> std::io::Result<(u8, Vec<u8>)> {
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
     if !fin {
-        return Err(invalid("분할된 WebSocket 메시지는 지원하지 않습니다"));
+        return Err(invalid("Fragmented WebSocket messages are not supported"));
     }
     if rsv != 0 {
-        return Err(invalid("WebSocket 프레임의 RSV 비트가 올바르지 않습니다"));
+        return Err(invalid("Invalid WebSocket RSV bits"));
     }
     if !matches!(opcode, 0x1 | 0x8 | 0x9 | 0xA) {
-        return Err(invalid("지원하지 않는 WebSocket 메시지 유형입니다"));
+        return Err(invalid("Unsupported WebSocket message type"));
     }
     if !masked {
-        return Err(invalid("마스킹되지 않은 WebSocket 프레임을 거부했습니다"));
+        return Err(invalid("Rejected unmasked WebSocket frame"));
     }
 
     let length_code = header[1] & 0x7f;
@@ -3556,29 +3559,25 @@ fn ws_read_frame(stream: &mut SharedTcp) -> std::io::Result<(u8, Vec<u8>)> {
         stream.read_exact(&mut extended)?;
         length = u16::from_be_bytes(extended) as u64;
         if length < 126 {
-            return Err(invalid(
-                "WebSocket 프레임 길이가 최소 형식으로 인코딩되지 않았습니다",
-            ));
+            return Err(invalid("WebSocket frame length is not minimally encoded"));
         }
     } else if length_code == 127 {
         let mut extended = [0u8; 8];
         stream.read_exact(&mut extended)?;
         if extended[0] & 0x80 != 0 {
-            return Err(invalid("WebSocket 메시지 길이 값이 올바르지 않습니다"));
+            return Err(invalid("Invalid WebSocket message length"));
         }
         length = u64::from_be_bytes(extended);
         if length <= u16::MAX as u64 {
-            return Err(invalid(
-                "WebSocket 프레임 길이가 최소 형식으로 인코딩되지 않았습니다",
-            ));
+            return Err(invalid("WebSocket frame length is not minimally encoded"));
         }
     }
     let control = matches!(opcode, 0x8..=0xA);
     if control && length > 125 {
-        return Err(invalid("WebSocket 제어 프레임이 허용 크기를 넘었습니다"));
+        return Err(invalid("WebSocket control frame is too large"));
     }
     if length > MAX_WEBSOCKET_PAYLOAD as u64 {
-        return Err(invalid("WebSocket 프레임이 허용 크기를 넘었습니다"));
+        return Err(invalid("WebSocket frame is too large"));
     }
 
     let mut mask = [0u8; 4];
@@ -3590,25 +3589,21 @@ fn ws_read_frame(stream: &mut SharedTcp) -> std::io::Result<(u8, Vec<u8>)> {
     }
     if opcode == 0x8 {
         if payload.len() == 1 {
-            return Err(invalid("WebSocket 종료 메시지의 본문이 올바르지 않습니다"));
+            return Err(invalid("Invalid WebSocket close body"));
         }
         if payload.len() >= 2 {
             let code = u16::from_be_bytes([payload[0], payload[1]]);
             let valid_code = matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999);
             if !valid_code {
-                return Err(invalid("WebSocket 종료 상태 코드가 올바르지 않습니다"));
+                return Err(invalid("Invalid WebSocket close code"));
             }
             if std::str::from_utf8(&payload[2..]).is_err() {
-                return Err(invalid(
-                    "WebSocket 종료 사유가 올바른 UTF-8 문자열이 아닙니다",
-                ));
+                return Err(invalid("WebSocket close reason is not valid UTF-8"));
             }
         }
     }
     if opcode == 0x1 && std::str::from_utf8(&payload).is_err() {
-        return Err(invalid(
-            "WebSocket 텍스트 메시지가 올바른 UTF-8 문자열이 아닙니다",
-        ));
+        return Err(invalid("WebSocket text message is not valid UTF-8"));
     }
     Ok((opcode, payload))
 }
@@ -3731,7 +3726,7 @@ fn route(
                 None => (
                     "404 Not Found",
                     "text/plain",
-                    "요청한 경로를 찾을 수 없습니다".to_string(),
+                    "Requested path not found".to_string(),
                 ),
             };
         }
@@ -3749,8 +3744,7 @@ fn route(
             let page = (
                 "200 OK",
                 "text/plain",
-                "OnetDNS 관리 API가 실행 중입니다. 웹 대시보드는 비활성화되어 있습니다."
-                    .to_string(),
+                "OnetDNS management API is running. The web dashboard is disabled.".to_string(),
             );
             return page;
         }
@@ -3766,7 +3760,7 @@ fn route(
             return (
                 "404 Not Found",
                 "text/plain",
-                "요청한 경로를 찾을 수 없습니다".to_string(),
+                "Requested path not found".to_string(),
             );
         }
 
@@ -3781,7 +3775,7 @@ fn route(
             return (
                 "404 Not Found",
                 "text/plain",
-                "요청한 경로를 찾을 수 없습니다".to_string(),
+                "Requested path not found".to_string(),
             );
         }
         ("GET", "/react-dom.js") => {
@@ -3795,7 +3789,7 @@ fn route(
             return (
                 "404 Not Found",
                 "text/plain",
-                "요청한 경로를 찾을 수 없습니다".to_string(),
+                "Requested path not found".to_string(),
             );
         }
         // 아이콘을 링크로만 주면 브라우저와 북마크·점검 도구가 여전히 이 주소를 부르고,
@@ -3807,7 +3801,7 @@ fn route(
             return (
                 "404 Not Found",
                 "text/plain",
-                "요청한 경로를 찾을 수 없습니다".to_string(),
+                "Requested path not found".to_string(),
             );
         }
 
@@ -3858,7 +3852,7 @@ fn route(
             return (
                 "401 Unauthorized",
                 "text/plain",
-                "인증이 필요합니다".to_string(),
+                "Authentication required".to_string(),
             );
         }
     };
@@ -3877,7 +3871,7 @@ fn route(
         return (
             "403 Forbidden",
             "text/plain",
-            "읽기 전용 권한으로는 이 작업을 수행할 수 없습니다".to_string(),
+            "Read-only access cannot perform this action".to_string(),
         );
     }
 
@@ -3889,7 +3883,7 @@ fn route(
         return (
             "503 Service Unavailable",
             "text/plain",
-            "DNS 서비스 설정을 적용하는 중입니다. 준비가 끝난 뒤 다시 시도하십시오".to_string(),
+            "DNS service settings are being applied. Try again when they are ready".to_string(),
         );
     }
 
@@ -3946,7 +3940,7 @@ fn route_dispatch(
                 _ => (
                     "405 Method Not Allowed",
                     "text/plain",
-                    "이 요청 방식은 해당 경로에서 사용할 수 없습니다".to_string(),
+                    "Method not allowed on this path".to_string(),
                 ),
             };
             return out;
@@ -3972,7 +3966,7 @@ fn route_dispatch(
                 _ => (
                     "405 Method Not Allowed",
                     "text/plain",
-                    "이 요청 방식은 해당 경로에서 사용할 수 없습니다".to_string(),
+                    "Method not allowed on this path".to_string(),
                 ),
             };
             return out;
@@ -4006,7 +4000,7 @@ fn route_dispatch(
             _ => (
                 "405 Method Not Allowed",
                 "text/plain",
-                "이 요청 방식은 해당 경로에서 사용할 수 없습니다".to_string(),
+                "Method not allowed on this path".to_string(),
             ),
         };
         return out;
@@ -4021,7 +4015,7 @@ fn route_dispatch(
                 _ => (
                     "400 Bad Request",
                     "application/json",
-                    "{\"error\":\"지원하지 않는 통계 조회 범위입니다\"}".to_string(),
+                    "{\"error\":\"Unsupported stats range\"}".to_string(),
                 ),
             };
             return out;
@@ -4045,7 +4039,7 @@ fn route_dispatch(
                 Err(_) => (
                     "400 Bad Request",
                     "application/json",
-                    "{\"error\":\"작업 ID 형식이 올바르지 않습니다\"}".to_string(),
+                    "{\"error\":\"Invalid job ID\"}".to_string(),
                 ),
             };
             return out;
@@ -4089,7 +4083,7 @@ fn route_dispatch(
                 return (
                     "400 Bad Request",
                     "application/json",
-                    "{\"error\":\"비밀번호를 변경하려면 사용자 계정으로 로그인해야 합니다\"}"
+                    "{\"error\":\"Sign in with a user account to change the password\"}"
                         .to_string(),
                 );
             };
@@ -4100,7 +4094,7 @@ fn route_dispatch(
                 return (
                     "400 Bad Request",
                     "application/json",
-                    "{\"error\":\"새 비밀번호는 12자 이상이어야 합니다\"}".to_string(),
+                    "{\"error\":\"New password must be at least 12 characters\"}".to_string(),
                 );
             }
             match st.auth.verify_user(&name, &current) {
@@ -4109,15 +4103,14 @@ fn route_dispatch(
                     return (
                         "403 Forbidden",
                         "application/json",
-                        "{\"error\":\"현재 비밀번호가 올바르지 않습니다\"}".to_string(),
+                        "{\"error\":\"Current password is incorrect\"}".to_string(),
                     );
                 }
                 crate::password::VerifyResult::Busy => {
                     return (
                         "503 Service Unavailable",
                         "application/json",
-                        "{\"error\":\"비밀번호 확인 요청이 많습니다. 잠시 후 다시 시도하세요\"}"
-                            .to_string(),
+                        "{\"error\":\"Too many password checks. Try again shortly\"}".to_string(),
                     );
                 }
             }
@@ -4128,7 +4121,7 @@ fn route_dispatch(
                         return (
                             "409 Conflict",
                             "application/json",
-                            "{\"error\":\"비밀번호를 변경하는 동안 사용자 계정이 삭제되었습니다\"}"
+                            "{\"error\":\"The user account was deleted while changing the password\"}"
                                 .to_string(),
                         );
                     }
@@ -4400,7 +4393,7 @@ fn route_dispatch(
         _ => (
             "404 Not Found",
             "text/plain",
-            "요청한 경로를 찾을 수 없습니다".to_string(),
+            "Requested path not found".to_string(),
         ),
     }
 }
@@ -4456,13 +4449,13 @@ fn result_resp(r: Result<String, String>) -> (&'static str, &'static str, String
 
 /** @brief 요청 본문에서 업스트림 주소를 추출해 검증한다. */
 fn upstream_field(body: &str) -> Result<String, String> {
-    let json = json::parse(body)
-        .map_err(|error| format!("JSON 요청 본문을 해석할 수 없습니다: {error}"))?;
+    let json =
+        json::parse(body).map_err(|error| format!("Could not parse JSON request body: {error}"))?;
     let json::Json::Obj(fields) = json else {
-        return Err("업스트림 DNS 서버 요청은 addr 문자열 하나만 포함한 객체여야 합니다".into());
+        return Err("Upstream DNS request must be an object with a single addr string".into());
     };
     if fields.len() != 1 || fields[0].0 != "addr" {
-        return Err("업스트림 DNS 서버 요청은 addr 문자열 하나만 포함해야 합니다".into());
+        return Err("Upstream DNS request must contain only an addr string".into());
     }
     fields[0]
         .1
@@ -4470,7 +4463,7 @@ fn upstream_field(body: &str) -> Result<String, String> {
         .map(str::trim)
         .filter(|addr| !addr.is_empty())
         .map(String::from)
-        .ok_or_else(|| "addr 항목에는 비어 있지 않은 문자열을 입력해야 합니다".into())
+        .ok_or_else(|| "addr must be a non-empty string".into())
 }
 
 /** @brief 본문 JSON에서 문자열 필드를 읽는다. */
@@ -4572,101 +4565,101 @@ fn metrics_text(st: &AppState) -> String {
             "# TYPE {name} counter\n# HELP {name} {help}\n{name} {val}\n"
         ));
     };
-    line(&mut s, "onetdns_queries_total", "총 질의 수", m.total);
+    line(&mut s, "onetdns_queries_total", "Total queries", m.total);
     line(
         &mut s,
         "onetdns_resolved_total",
-        "해석/리라이트 응답",
+        "Resolved or rewritten responses",
         m.resolved,
     );
     line(
         &mut s,
         "onetdns_blocked_total",
-        "차단한 DNS 응답",
+        "Blocked DNS responses",
         m.blocked,
     );
     line(
         &mut s,
         "onetdns_rewritten_total",
-        "다른 답으로 바꾼 응답",
+        "Rewritten responses",
         m.rewritten,
     );
     line(
         &mut s,
         "onetdns_denied_total",
-        "접근 제어 규칙에 따라 요청을 거부했습니다",
+        "Requests refused by access control rules",
         m.denied,
     );
     line(
         &mut s,
         "onetdns_refused_total",
-        "거절(REFUSED)로 답한 요청",
+        "Requests answered with REFUSED",
         m.refused,
     );
     line(
         &mut s,
         "onetdns_throttled_total",
-        "속도 제한으로 거부한 요청",
+        "Requests rejected by rate limiting",
         m.throttled,
     );
     line(
         &mut s,
         "onetdns_servfail_total",
-        "서버 오류(SERVFAIL) 응답",
+        "Server failure (SERVFAIL) responses",
         m.servfail,
     );
     line(
         &mut s,
         "onetdns_cache_hits_total",
-        "응답 캐시 적중",
+        "Response cache hits",
         m.cache_hits,
     );
     line(
         &mut s,
         "onetdns_cache_lookups_total",
-        "응답 캐시 조회",
+        "Response cache lookups",
         m.cache_lookups,
     );
     line(
         &mut s,
         "onetdns_query_latency_microseconds_total",
-        "처리 시간 누적. 카운터와 나눠 평균을 낸다",
+        "Total processing time. Divide by the count for the average",
         m.latency_sum_us,
     );
     line(
         &mut s,
         "onetdns_query_latency_measured_total",
-        "처리 시간을 측정한 질의 수",
+        "Queries with measured processing time",
         m.latency_count,
     );
     line(
         &mut s,
         "onetdns_dropped_log_events_total",
-        "처리 대기열이 가득 차 기록하지 못한 질의 이벤트",
+        "Query events dropped because the processing queue was full",
         m.dropped_log_events,
     );
     line(
         &mut s,
         "onetdns_dropped_stat_events_total",
-        "수집 슬롯이 가득 차 상위 목록 귀속을 잃은 이벤트. 누적 질의 수에는 영향이 없다",
+        "Events that lost top-list attribution because collection slots were full. Total query counts are unaffected",
         m.dropped_stat_events,
     );
     line(
         &mut s,
         "onetdns_dropped_stream_events_total",
-        "구독 연결이 느려 보내지 못한 실시간 이벤트",
+        "Live events not sent because a subscriber was slow",
         m.dropped_stream_events,
     );
     line(
         &mut s,
         "onetdns_persist_failures_total",
-        "통계 또는 질의 로그를 저장하지 못한 횟수",
+        "Failures saving stats or the query log",
         m.persist_failures,
     );
     line(
         &mut s,
         "onetdns_request_panics_total",
-        "요청 처리 오류를 격리하고 복구한 횟수",
+        "Request handling faults isolated and recovered",
         onetdns_core::isolation::request_panic_count(),
     );
     let supervisor_restarts = std::env::var("ONETDNS_SUPERVISOR_RESTARTS")
@@ -4676,7 +4669,7 @@ fn metrics_text(st: &AppState) -> String {
     line(
         &mut s,
         "onetdns_supervisor_restarts_total",
-        "감시 프로세스가 다시 시작한 DNS 작업 프로세스",
+        "DNS worker processes restarted by the supervisor",
         supervisor_restarts,
     );
     s.push_str("# TYPE onetdns_queries_by_transport counter\n");
@@ -4695,9 +4688,9 @@ fn openapi_json() -> String {
     const SPEC: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "OnetDNS 관리 API",
+    "title": "OnetDNS Management API",
     "version": "1",
-    "description": "OnetDNS 관리 API입니다. Bearer 토큰 또는 쿠키 세션으로 인증합니다. 관리자 권한은 설정을 변경할 수 있고, 읽기 전용 권한은 조회와 진단만 수행할 수 있습니다. 설정 변경과 인증·권한 오류는 /v1/audit에 기록됩니다."
+    "description": "OnetDNS management API. Authenticate with a Bearer token or a cookie session. The admin role can change settings; the read-only role can only view and run diagnostics. Setting changes and authentication or authorization failures are recorded in /v1/audit."
   },
   "components": {
     "securitySchemes": {
@@ -4706,94 +4699,94 @@ fn openapi_json() -> String {
   },
   "security": [ { "bearer": [] } ],
   "paths": {
-    "/healthz": { "get": { "summary": "프로세스 동작 확인", "security": [], "responses": { "200": { "description": "ok" } } } },
-    "/openapi.json": { "get": { "summary": "이 OpenAPI 스펙", "security": [], "responses": { "200": { "description": "OpenAPI 3.1 문서" } } } },
-    "/v1/auth": { "get": { "summary": "현재 인증 상태와 역할", "description": "제어 토큰은 API 전용이라 세션 쿠키로 바뀌지 않습니다. 웹 콘솔 세션은 /v1/login으로만 발급됩니다.", "security": [], "responses": { "200": { "description": "{login_enabled,authenticated,role,user}" } } } },
-    "/v1/setup": { "post": { "summary": "첫 관리자 계정 만들기", "description": "계정이 하나도 없을 때만 열립니다. 하나라도 생기면 409를 돌려줍니다.", "security": [], "responses": { "200": { "description": "세션 쿠키와 {ok,user,role}" }, "400": { "description": "아이디나 비밀번호가 규칙에 맞지 않습니다" }, "409": { "description": "이미 계정이 있습니다" } } } },
-    "/v1/login": { "post": { "summary": "사용자명·비밀번호 로그인", "security": [], "responses": { "200": { "description": "세션 쿠키와 {authenticated,role,user}" }, "401": { "description": "자격 증명이 일치하지 않습니다" } } } },
-    "/v1/logout": { "post": { "summary": "현재 로그인 세션 종료", "responses": { "200": { "description": "{logged_out:true}" } } } },
-    "/v1/stats": { "get": { "summary": "통계와 최근 DNS 질의", "responses": { "200": { "description": "누적 통계와 최근 질의 기록" }, "401": { "description": "미인증" } } } },
-    "/v1/metrics": { "get": { "summary": "대시보드 통계", "responses": { "200": { "description": "{metrics:{...}}" } } } },
-    "/v1/queries": { "get": { "summary": "최근 DNS 질의 목록", "responses": { "200": { "description": "{recent:[...]}" } } } },
-    "/v1/stats/history/{range}": { "get": { "summary": "초당 전체 질의와 차단 질의 시계열", "parameters": [ { "name": "range", "in": "path", "required": true, "schema": { "type": "integer", "enum": [60,300,3600,86400,604800] } } ], "responses": { "200": { "description": "선택한 시간 범위의 시계열 집계점" }, "400": { "description": "요청한 기능 범위를 지원하지 않습니다" } } } },
-    "/v1/top": { "get": { "summary": "질의가 많은 도메인, 차단 항목, 클라이언트", "responses": { "200": { "description": "질의 수 기준 상위 항목" } } } },
-    "/v1/audit": { "get": { "summary": "관리 작업과 접근 거부 기록", "responses": { "200": { "description": "최근 관리 작업과 접근 거부 내역" } } } },
-    "/v1/backup": { "get": { "summary": "사용자 필터 데이터 백업: 차단·허용 규칙, 차단 서비스, 거절 도메인, 세이프서치", "responses": { "200": { "description": "{version,block,allow,services,refused_domains,safe_search}" } } } },
-    "/v1/dashboard/ws": { "get": { "summary": "대시보드 WebSocket", "description": "질의 이벤트, 통계, 상위 항목, 작업 상태를 한 연결로 전송합니다. 서브프로토콜 onetdns.v1을 사용하며 resume.<event_id>로 재연결 지점을 전달할 수 있습니다.", "responses": { "101": { "description": "WebSocket 연결" } } } },
-    "/metrics": { "get": { "summary": "Prometheus 노출", "responses": { "200": { "description": "text/plain 0.0.4" } } } },
-    "/v1/reload": { "post": { "summary": "현재 설정에 따라 차단 목록 다시 읽기", "responses": { "200": { "description": "{block,allow}" }, "403": { "description": "이 작업에는 관리자 권한이 필요합니다" } } } },
-    "/v1/block": { "post": { "summary": "차단 도메인 추가", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "domain": { "type": "string" } }, "required": ["domain"] } } } }, "responses": { "200": { "description": "{block,allow}" } } } },
-    "/v1/allow": { "post": { "summary": "허용 도메인 추가", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "domain": { "type": "string" } }, "required": ["domain"] } } } }, "responses": { "200": { "description": "{block,allow}" } } } },
-    "/v1/restore": { "post": { "summary": "사용자 필터 데이터 백업 복원(전체 교체)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{block,allow}" }, "400": { "description": "입력 형식이 올바르지 않습니다" } } } },
-    "/v1/safesearch": { "post": { "summary": "안전 검색 설정 변경", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "enable": { "type": "boolean" } }, "required": ["enable"] } } } }, "responses": { "200": { "description": "{safe_search}" }, "400": { "description": "설정 파일을 저장하지 못했습니다" } } } },
-    "/v1/password": { "post": { "summary": "로그인 사용자의 비밀번호 변경 후 해당 사용자의 모든 세션 폐기", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "current_password": { "type": "string" }, "new_password": { "type": "string", "minLength": 12 } }, "required": ["current_password","new_password"] } } } }, "responses": { "200": { "description": "{changed,reloading}" }, "403": { "description": "현재 비밀번호가 일치하지 않습니다" } } } },
-    "/v1/querylog/clear": { "post": { "summary": "최근 질의 로그 비우기", "responses": { "200": { "description": "{cleared}" } } } },
-    "/v1/config/validate": { "post": { "summary": "입력한 TOML 조각을 현재 설정에 합쳤을 때 유효한지 확인합니다. 실제 설정은 바뀌지 않습니다", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{valid:true}" }, "400": { "description": "{valid:false,error}" } } } },
-    "/v1/config/diff": { "post": { "summary": "입력한 TOML 조각을 현재 설정 파일과 비교해 바뀌는 항목과 적용 방식을 확인합니다", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{added[],removed[],changed[],hot_reload[],service_restart[],restart_required}" }, "400": { "description": "변경할 설정이 올바르지 않은 경우 오류 내용을 반환합니다" } } } },
-    "/v1/config/apply": { "post": { "summary": "설정 조각 적용(관리자 전용): 입력한 최상위 항목만 바꾸고 나머지는 유지합니다. 필터, 접근 제어, 요청 속도 제한, 질의 기록, 업스트림 DNS 서버 주소는 서비스를 중단하지 않고 반영합니다", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed}" }, "400": { "description": "입력값이 올바르지 않거나 설정 파일을 사용할 수 없는 경우 오류 내용을 반환합니다" } } } },
-    "/v1/config/rollback": { "post": { "summary": "직전 설정 적용 전 상태로 되돌리기(관리자 전용)", "responses": { "200": { "description": "{rolled_back,restart_required}" }, "409": { "description": "되돌릴 이전 설정이 없으면 오류 내용을 반환합니다" } } } },
-    "/v1/policies/simulate": { "post": { "summary": "DNS 질의에 적용될 정책과 필터 결과 미리 보기", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{policy,filter,filter_stage,filter_matched,filter_list,decision}" } } } },
-    "/v1/explain": { "post": { "summary": "DNS 질의 판정 미리 보기: 실제 질의를 보내거나 캐시를 바꾸지 않고 정책, 필터, 응답 코드, 처리 방식을 설명합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "client_id": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{decision,rcode,policy,filter,filter_stage,filter_matched,filter_list,matched,client_safe_search,backend,dnssec,resolution}" } } } },
-    "/readyz": { "get": { "summary": "DNS 서비스 준비 상태 확인", "security": [], "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } } } },
-    "/v1/cluster/nodes": { "get": { "summary": "클러스터 노드 상태를 반환합니다. 합의 기능을 사용하면 역할·임기·대표 노드·반영 위치를 포함합니다", "responses": { "200": { "description": "{self:{id,role,backend,listeners,leader,term,commit_index,last_applied,last_index,snapshot_index,retained_log_entries,fatal,healthy},peers:[{id,url,healthy,role,rtt_ms}],identity:{node_id,public_key,peer_entry}}. identity.public_key는 설정한 Raft 서명 키에서 구한 공개 키이고, peer_entry는 다른 노드의 cluster_raft_peers에 그대로 추가할 항목입니다. 서명 키가 없으면 둘 다 null입니다" } } } },
-    "/v1/cluster/propose": { "post": { "summary": "Raft 리더에 설정 변경 제안(관리자 전용): {patch:{key:value}} 내용을 모든 노드에 복제해 적용합니다. null 값은 그 항목을 지웁니다. 노드별 설정은 거부합니다. Raft를 켜면 설정을 바꾸는 다른 관리 요청도 리더에서만 받고 같은 방식으로 복제하며, 팔로워는 409로 거절합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "patch": { "type": "object" } }, "required": ["patch"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{committed,applied,index}" }, "400": { "description": "{error}" } } } },
-    "/v1/listeners": { "get": { "summary": "현재 사용 중인 DNS 수신 주소와 전송 방식별 상태", "responses": { "200": { "description": "{listeners:[...]}" } } } },
-    "/v1/system/network-adapters": { "get": { "summary": "호스트 네트워크 어댑터 조회", "responses": { "200": { "description": "어댑터 JSON" }, "400": { "description": "요청한 정보를 조회하지 못했습니다" } } } },
-    "/v1/system/firewall": { "post": { "summary": "DNS 수신 주소에 필요한 방화벽 규칙 적용(관리자 전용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "적용 결과" }, "400": { "description": "변경 사항을 적용하지 못했습니다" } } } },
-    "/v1/resolve": { "post": { "summary": "이 서버에 이름 하나를 실제로 물어본다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{rcode,elapsed_ms,server,answers[]}" }, "400": { "description": "물어보지 못했습니다" } } } },
-    "/v1/system/service": { "get": { "summary": "부팅 서비스 등록 상태", "responses": { "200": { "description": "{supported,installed,running}" } } }, "post": { "summary": "부팅 서비스 등록 또는 제거(관리자 전용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["install", "uninstall"] } }, "required": ["action"] } } } }, "responses": { "200": { "description": "적용 결과" }, "400": { "description": "적용하지 못했습니다" } } } },
-    "/v1/system/dns-client": { "post": { "summary": "운영체제의 DNS 클라이언트 설정 변경(관리자 전용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "적용 결과" }, "400": { "description": "변경 사항을 적용하지 못했습니다" } } } },
-    "/v1/system/dns-client/restore": { "post": { "summary": "운영체제의 DNS 클라이언트 설정 복원(관리자 전용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "복원 결과" }, "400": { "description": "복원하지 못했습니다" } } } },
-    "/v1/zones": { "get": { "summary": "권한 영역 목록", "responses": { "200": { "description": "[{origin,serial,records}]" } } } },
+    "/healthz": { "get": { "summary": "Process liveness check", "security": [], "responses": { "200": { "description": "ok" } } } },
+    "/openapi.json": { "get": { "summary": "This OpenAPI spec", "security": [], "responses": { "200": { "description": "OpenAPI 3.1 document" } } } },
+    "/v1/auth": { "get": { "summary": "Current authentication state and role", "description": "The control token is for the API only and is never turned into a session cookie. Web console sessions are issued only by /v1/login.", "security": [], "responses": { "200": { "description": "{login_enabled,authenticated,role,user}" } } } },
+    "/v1/setup": { "post": { "summary": "Create the first admin account", "description": "Available only while no account exists. Returns 409 once any account exists.", "security": [], "responses": { "200": { "description": "Session cookie and {ok,user,role}" }, "400": { "description": "Username or password does not meet the rules" }, "409": { "description": "An account already exists" } } } },
+    "/v1/login": { "post": { "summary": "Sign in with username and password", "security": [], "responses": { "200": { "description": "Session cookie and {authenticated,role,user}" }, "401": { "description": "Credentials do not match" } } } },
+    "/v1/logout": { "post": { "summary": "End the current sign-in session", "responses": { "200": { "description": "{logged_out:true}" } } } },
+    "/v1/stats": { "get": { "summary": "Stats and recent DNS queries", "responses": { "200": { "description": "Cumulative stats and recent queries" }, "401": { "description": "Not authenticated" } } } },
+    "/v1/metrics": { "get": { "summary": "Dashboard stats", "responses": { "200": { "description": "{metrics:{...}}" } } } },
+    "/v1/queries": { "get": { "summary": "Recent DNS queries", "responses": { "200": { "description": "{recent:[...]}" } } } },
+    "/v1/stats/history/{range}": { "get": { "summary": "Per-second time series of total and blocked queries", "parameters": [ { "name": "range", "in": "path", "required": true, "schema": { "type": "integer", "enum": [60,300,3600,86400,604800] } } ], "responses": { "200": { "description": "Time series points for the selected range" }, "400": { "description": "Unsupported range" } } } },
+    "/v1/top": { "get": { "summary": "Most queried domains, blocked entries, and clients", "responses": { "200": { "description": "Top entries by query count" } } } },
+    "/v1/audit": { "get": { "summary": "Management actions and access denials", "responses": { "200": { "description": "Recent management actions and access denials" } } } },
+    "/v1/backup": { "get": { "summary": "Back up user filter data: block and allow rules, blocked services, refused domains, safe search", "responses": { "200": { "description": "{version,block,allow,services,refused_domains,safe_search}" } } } },
+    "/v1/dashboard/ws": { "get": { "summary": "Dashboard WebSocket", "description": "Sends query events, stats, top entries, and job status over one connection. Uses the onetdns.v1 subprotocol; pass resume.<event_id> to resume after reconnecting.", "responses": { "101": { "description": "WebSocket connection" } } } },
+    "/metrics": { "get": { "summary": "Prometheus exposition", "responses": { "200": { "description": "text/plain 0.0.4" } } } },
+    "/v1/reload": { "post": { "summary": "Reload blocklists from the current settings", "responses": { "200": { "description": "{block,allow}" }, "403": { "description": "This action requires the admin role" } } } },
+    "/v1/block": { "post": { "summary": "Add a blocked domain", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "domain": { "type": "string" } }, "required": ["domain"] } } } }, "responses": { "200": { "description": "{block,allow}" } } } },
+    "/v1/allow": { "post": { "summary": "Add an allowed domain", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "domain": { "type": "string" } }, "required": ["domain"] } } } }, "responses": { "200": { "description": "{block,allow}" } } } },
+    "/v1/restore": { "post": { "summary": "Restore a user filter data backup (replaces everything)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{block,allow}" }, "400": { "description": "Invalid input" } } } },
+    "/v1/safesearch": { "post": { "summary": "Change the safe search setting", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "enable": { "type": "boolean" } }, "required": ["enable"] } } } }, "responses": { "200": { "description": "{safe_search}" }, "400": { "description": "Could not save the config file" } } } },
+    "/v1/password": { "post": { "summary": "Change the signed-in user's password and revoke all of that user's sessions", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "current_password": { "type": "string" }, "new_password": { "type": "string", "minLength": 12 } }, "required": ["current_password","new_password"] } } } }, "responses": { "200": { "description": "{changed,reloading}" }, "403": { "description": "Current password does not match" } } } },
+    "/v1/querylog/clear": { "post": { "summary": "Clear the recent query log", "responses": { "200": { "description": "{cleared}" } } } },
+    "/v1/config/validate": { "post": { "summary": "Check whether a TOML fragment is valid when merged into the current config. The actual config is not changed", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{valid:true}" }, "400": { "description": "{valid:false,error}" } } } },
+    "/v1/config/diff": { "post": { "summary": "Compare a TOML fragment with the current config file and show which entries change and how they are applied", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{added[],removed[],changed[],hot_reload[],service_restart[],restart_required}" }, "400": { "description": "Returns the error when the proposed config is invalid" } } } },
+    "/v1/config/apply": { "post": { "summary": "Apply a config fragment (admin only): changes only the given top-level entries and keeps the rest. Filters, access control, rate limits, the query log, and upstream DNS server addresses apply without interrupting service", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed}" }, "400": { "description": "Returns the error when the input is invalid or the config file cannot be used" } } } },
+    "/v1/config/rollback": { "post": { "summary": "Roll back to the state before the last config apply (admin only)", "responses": { "200": { "description": "{rolled_back,restart_required}" }, "409": { "description": "Returns an error when there is no previous config" } } } },
+    "/v1/policies/simulate": { "post": { "summary": "Preview the policy and filter result for a DNS query", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{policy,filter,filter_stage,filter_matched,filter_list,decision}" } } } },
+    "/v1/explain": { "post": { "summary": "Preview the decision for a DNS query: explains the policy, filter, response code, and handling without sending a real query or changing the cache", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "client_id": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{decision,rcode,policy,filter,filter_stage,filter_matched,filter_list,matched,client_safe_search,backend,dnssec,resolution}" } } } },
+    "/readyz": { "get": { "summary": "DNS service readiness check", "security": [], "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } } } },
+    "/v1/cluster/nodes": { "get": { "summary": "Cluster node status. With consensus enabled, includes role, term, leader, and apply position", "responses": { "200": { "description": "{self:{id,role,backend,listeners,leader,term,commit_index,last_applied,last_index,snapshot_index,retained_log_entries,fatal,healthy},peers:[{id,url,healthy,role,rtt_ms}],identity:{node_id,public_key,peer_entry}}. identity.public_key is derived from the configured Raft signing key, and peer_entry is the entry to add as-is to cluster_raft_peers on other nodes. Both are null without a signing key" } } } },
+    "/v1/cluster/propose": { "post": { "summary": "Propose a config change to the Raft leader (admin only): replicates {patch:{key:value}} to every node and applies it. A null value removes the entry. Node-local settings are rejected. With Raft enabled, other config-changing management requests are also accepted only on the leader and replicated the same way; followers reject them with 409", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "patch": { "type": "object" } }, "required": ["patch"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{committed,applied,index}" }, "400": { "description": "{error}" } } } },
+    "/v1/listeners": { "get": { "summary": "Active DNS listen addresses and per-transport status", "responses": { "200": { "description": "{listeners:[...]}" } } } },
+    "/v1/system/network-adapters": { "get": { "summary": "List host network adapters", "responses": { "200": { "description": "Adapter JSON" }, "400": { "description": "Could not retrieve the information" } } } },
+    "/v1/system/firewall": { "post": { "summary": "Apply the firewall rules the DNS listen addresses need (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply the change" } } } },
+    "/v1/resolve": { "post": { "summary": "Send one real query to this server", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{rcode,elapsed_ms,server,answers[]}" }, "400": { "description": "Could not send the query" } } } },
+    "/v1/system/service": { "get": { "summary": "Boot service registration status", "responses": { "200": { "description": "{supported,installed,running}" } } }, "post": { "summary": "Install or remove the boot service (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["install", "uninstall"] } }, "required": ["action"] } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply" } } } },
+    "/v1/system/dns-client": { "post": { "summary": "Change the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply the change" } } } },
+    "/v1/system/dns-client/restore": { "post": { "summary": "Restore the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Restore result" }, "400": { "description": "Could not restore" } } } },
+    "/v1/zones": { "get": { "summary": "Authoritative zones", "responses": { "200": { "description": "[{origin,serial,records}]" } } } },
     "/v1/zones/{origin}": {
-      "get": { "summary": "권한 영역과 구조화 레코드 조회", "responses": { "200": { "description": "{origin,serial,record_count,records:[{name,type,ttl,value}]}" }, "404": { "description": "{error}" } } },
-      "put": { "summary": "권한 DNS 영역 생성 또는 교체(관리자 전용, 본문은 RFC 1035 영역 파일 형식)", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{origin,serial,records,persisted}" }, "400": { "description": "{error}: DNS 영역 데이터 형식이 올바르지 않습니다" }, "403": { "description": "이 작업에는 관리자 권한이 필요합니다" } } },
-      "delete": { "summary": "권한 DNS 영역 삭제(관리자 전용)", "responses": { "200": { "description": "{deleted}" }, "404": { "description": "{error}" } } }
+      "get": { "summary": "Authoritative zone with structured records", "responses": { "200": { "description": "{origin,serial,record_count,records:[{name,type,ttl,value}]}" }, "404": { "description": "{error}" } } },
+      "put": { "summary": "Create or replace an authoritative DNS zone (admin only; body is an RFC 1035 zone file)", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{origin,serial,records,persisted}" }, "400": { "description": "{error}: invalid DNS zone data" }, "403": { "description": "This action requires the admin role" } } },
+      "delete": { "summary": "Delete an authoritative DNS zone (admin only)", "responses": { "200": { "description": "{deleted}" }, "404": { "description": "{error}" } } }
     },
-    "/v1/zones/{origin}/dnssec": { "get": { "summary": "영역 DNSSEC 상태(서명 여부·DNSKEY·부모 제출용 DS)", "responses": { "200": { "description": "{signed,dnskeys:[{key_tag,flags,algorithm,role}],ds:{key_tag,algorithm,digest_type,digest}}" } } } },
+    "/v1/zones/{origin}/dnssec": { "get": { "summary": "Zone DNSSEC status (signed, DNSKEYs, DS for the parent)", "responses": { "200": { "description": "{signed,dnskeys:[{key_tag,flags,algorithm,role}],ds:{key_tag,algorithm,digest_type,digest}}" } } } },
     "/v1/zones/{origin}/records": {
-      "post": { "summary": "DNS 레코드 추가(관리자 전용): 저장, DNSSEC 재서명, NOTIFY 전송까지 수행합니다", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{origin,serial,records,persisted,signed}" }, "400": { "description": "{error}: DNS 레코드 형식이 올바르지 않습니다" } } },
-      "delete": { "summary": "DNS 레코드 삭제(관리자 전용): value를 지정하면 값까지 일치하는 레코드만 삭제합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string" }, "value": { "type": "string" } }, "required": ["name","type"] } } } }, "responses": { "200": { "description": "{deleted,origin,serial,persisted}" }, "404": { "description": "{error}: 조건에 맞는 항목을 찾지 못했습니다" } } }
+      "post": { "summary": "Add a DNS record (admin only): saves, re-signs with DNSSEC, and sends NOTIFY", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{origin,serial,records,persisted,signed}" }, "400": { "description": "{error}: invalid DNS record" } } },
+      "delete": { "summary": "Delete DNS records (admin only): with value, deletes only records whose value also matches", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string" }, "value": { "type": "string" } }, "required": ["name","type"] } } } }, "responses": { "200": { "description": "{deleted,origin,serial,persisted}" }, "404": { "description": "{error}: no matching entry" } } }
     },
-    "/v1/config/effective": { "get": { "summary": "현재 서버가 실제로 사용 중인 설정입니다. 기본값을 합친 결과이며 민감한 값은 가립니다. 설정 파일을 직접 바꾼 내용은 적용하기 전까지 포함되지 않습니다", "responses": { "200": { "description": "현재 실행 중인 설정(JSON)" } } } },
-    "/v1/config": { "get": { "summary": "설정 파일에 저장된 값입니다. 아직 서버에 적용되지 않은 변경도 포함합니다. 파일을 읽거나 해석할 수 없으면 오류 정보를 반환합니다", "responses": { "200": { "description": "설정 파일에 저장된 값 또는 파일 오류(JSON)" } } } },
-    "/v1/config/status": { "get": { "summary": "설정 파일과 현재 적용 중인 설정이 일치하는지 확인하고 아직 적용하지 않은 항목을 보여 줍니다", "responses": { "200": { "description": "{in_sync,changed_keys,error?}" } } } },
-    "/v1/config/reload": { "post": { "summary": "설정 파일의 변경 내용을 검증해 현재 서버에 적용(관리자 전용)", "responses": { "200": { "description": "{accepted,mode,restart_required,changed}" }, "400": { "description": "{error}: 설정 파일이 없거나 내용이 올바르지 않습니다" } } } },
-    "/v1/config/set": { "post": { "summary": "설정 항목 변경(관리자 전용): 입력한 값을 TOML 파일에 합치고 검증한 뒤 저장합니다. 즉시 반영 가능한 항목은 연결을 유지하고 적용하며, 그 밖의 항목은 DNS 서비스를 다시 시작합니다. 중첩 항목은 전용 API를 사용합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed,keys}" }, "400": { "description": "{error}: 알 수 없는 키/무효 값" } } } },
-    "/v1/config/schema": { "get": { "summary": "/v1/config/set으로 변경할 수 있는 설정 항목과 형식, 설명을 반환합니다", "responses": { "200": { "description": "{keys:[...],count}" } } } },
-    "/v1/upstreams/test": { "post": { "summary": "업스트림 DNS 서버 연결 테스트(관리자 전용): 테스트 질의를 보내 도달 여부, 지연 시간, 응답 코드를 확인합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{ok,latency_ms,rcode,addr}" }, "400": { "description": "{error}" } } } },
-    "/v1/cache/flush": { "post": { "summary": "응답 캐시 전체 비우기(관리자 전용). 삭제한 항목 수를 반환합니다", "responses": { "200": { "description": "{flushed}" } } } },
-    "/v1/tokens": { "get": { "summary": "관리 API 토큰 목록. 토큰 값은 가리고 역할과 고정 식별자만 반환합니다", "responses": { "200": { "description": "{tokens:[{id,role,masked}]}" } } }, "post": { "summary": "관리 API 토큰 발급(관리자 전용). 새 토큰 전체 값은 이 응답에서 한 번만 반환합니다", "responses": { "200": { "description": "{created,role,token,id}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "관리 API 토큰 폐기(관리자 전용). 설정 파일의 기본 관리 토큰은 삭제할 수 없습니다", "responses": { "200": { "description": "{removed}" }, "404": { "description": "{error}" } } } },
-    "/v1/rewrites": { "get": { "summary": "DNS 응답 주소 변경 규칙 목록", "responses": { "200": { "description": "{rewrites:[{domain,answer}]}" } } }, "post": { "summary": "DNS 응답 주소 변경 규칙 추가 또는 교체(관리자 전용)", "responses": { "200": { "description": "{added,domain}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "DNS 응답 주소 변경 규칙 삭제(관리자 전용)", "responses": { "200": { "description": "{removed,domain}" }, "404": { "description": "{error}" } } } },
+    "/v1/config/effective": { "get": { "summary": "The config the server is actually running: defaults merged in, sensitive values masked. Direct edits to the config file are not included until applied", "responses": { "200": { "description": "Running config (JSON)" } } } },
+    "/v1/config": { "get": { "summary": "Values saved in the config file, including changes not yet applied to the server. Returns error details when the file cannot be read or parsed", "responses": { "200": { "description": "Saved config values or a file error (JSON)" } } } },
+    "/v1/config/status": { "get": { "summary": "Check whether the config file matches the running config and show entries not yet applied", "responses": { "200": { "description": "{in_sync,changed_keys,error?}" } } } },
+    "/v1/config/reload": { "post": { "summary": "Validate config file changes and apply them to the running server (admin only)", "responses": { "200": { "description": "{accepted,mode,restart_required,changed}" }, "400": { "description": "{error}: config file is missing or invalid" } } } },
+    "/v1/config/set": { "post": { "summary": "Change settings (admin only): merges the values into the TOML file, validates, and saves. Hot-reloadable entries apply without dropping connections; others restart the DNS service. Nested entries use their dedicated APIs", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed,keys}" }, "400": { "description": "{error}: unknown key or invalid value" } } } },
+    "/v1/config/schema": { "get": { "summary": "Settings that /v1/config/set can change, with their types and descriptions", "responses": { "200": { "description": "{keys:[...],count}" } } } },
+    "/v1/upstreams/test": { "post": { "summary": "Test an upstream DNS server (admin only): sends a test query and reports reachability, latency, and response code", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{ok,latency_ms,rcode,addr}" }, "400": { "description": "{error}" } } } },
+    "/v1/cache/flush": { "post": { "summary": "Flush the whole response cache (admin only). Returns the number of entries removed", "responses": { "200": { "description": "{flushed}" } } } },
+    "/v1/tokens": { "get": { "summary": "Management API tokens. Token values are masked; only the role and a stable ID are returned", "responses": { "200": { "description": "{tokens:[{id,role,masked}]}" } } }, "post": { "summary": "Issue a management API token (admin only). The full token value is returned only once, in this response", "responses": { "200": { "description": "{created,role,token,id}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "Revoke a management API token (admin only). The primary control token from the config file cannot be deleted", "responses": { "200": { "description": "{removed}" }, "404": { "description": "{error}" } } } },
+    "/v1/rewrites": { "get": { "summary": "DNS rewrite rules", "responses": { "200": { "description": "{rewrites:[{domain,answer}]}" } } }, "post": { "summary": "Add or replace a DNS rewrite rule (admin only)", "responses": { "200": { "description": "{added,domain}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "Delete a DNS rewrite rule (admin only)", "responses": { "200": { "description": "{removed,domain}" }, "404": { "description": "{error}" } } } },
     "/v1/services": {
-      "get": { "summary": "서비스별 차단 항목과 현재 차단 여부를 반환합니다", "responses": { "200": { "description": "{count,services:[{id,name,blocked}]}" } } },
-      "post": { "summary": "서비스 차단 설정 변경", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "service": { "type": "string" }, "enable": { "type": "boolean" } }, "required": ["service","enable"] } } } }, "responses": { "200": { "description": "{block,allow}" } } }
+      "get": { "summary": "Blockable services and whether each is blocked", "responses": { "200": { "description": "{count,services:[{id,name,blocked}]}" } } },
+      "post": { "summary": "Change service blocking", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "service": { "type": "string" }, "enable": { "type": "boolean" } }, "required": ["service","enable"] } } } }, "responses": { "200": { "description": "{block,allow}" } } }
     },
-    "/v1/access": { "get": { "summary": "허용·차단할 네트워크 범위와 REFUSED로 답할 도메인 목록을 반환합니다. 변경은 설정 API를 사용합니다", "responses": { "200": { "description": "{allowed,blocked,refused_domains}" } } } },
-    "/v1/tls": { "get": { "summary": "TLS 인증서와 개인 키 경로, 암호화 DNS 수신 주소 상태", "responses": { "200": { "description": "{configured,cert,key,doh_listeners,dot_listeners}" } } } },
-    "/v1/tls/validate": { "post": { "summary": "설정된 인증서, 개인 키, 인증서 체인, 유효기간 검증(관리자 전용). 신뢰 경로와 호스트 이름은 확인하지 않습니다", "responses": { "200": { "description": "{material_valid,valid:false,trusted:false,hostname_checked:false,chain_len}" }, "400": { "description": "{error}" } } } },
-    "/v1/tls/configure": { "post": { "summary": "TLS 인증서와 개인 키 교체(관리자 전용): PEM 본문이나 파일 경로를 받아 형식과 키 일치 여부를 검증한 뒤 저장하고, 암호화 DNS 수신 서비스를 다시 시작합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" }, "private_key": { "type": "string" }, "cert_path": { "type": "string" }, "key_path": { "type": "string" } }, "additionalProperties": false } } } }, "responses": { "200": { "description": "{configured,chain_len,reloading,cert,key}" }, "400": { "description": "{error}" } } } },
-    "/v1/tls/revocation-check": { "post": { "summary": "인증서 체인의 OCSP·CRL 폐기 상태 확인(관리자 전용). 인증서에 기록된 조회 주소에서 정보를 가져와 서명을 검증합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" } }, "required": ["certificate_chain"] } } } }, "responses": { "200": { "description": "{ocsp,crl,ocsp_urls,crl_urls,revoked}" }, "400": { "description": "{error}" } } } },
-    "/v1/acme/issue": { "post": { "summary": "ACME 인증서 발급 또는 계정 등록(관리자 전용). HTTP-01과 DNS-01 검증에 자동 응답하고, 성공한 인증서와 개인 키를 설정된 파일에 저장합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "directory": { "type": "string" }, "domains": { "type": "array" }, "contact": { "type": "string" }, "challenge": { "type": "string" }, "account_only": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "{account,issued,cert_file,key_file}" }, "400": { "description": "{error}" } } } },
-    "/v1/plugins": { "get": { "summary": "WASM 플러그인 메트릭", "responses": { "200": { "description": "[{name,eval,error,block,latency_us}]" } } } },
-    "/v1/filter/report": { "get": { "summary": "필터 규칙을 읽은 결과와 적용하지 못한 규칙의 사유를 반환합니다", "responses": { "200": { "description": "{rules_total,rules_applied,rules_skipped,skip_reasons}" } } } },
-    "/v1/filter/top-rules": { "get": { "summary": "per-rule 히트 상위 N(track_rule_hits 활성 시)", "responses": { "200": { "description": "{enabled,top:[{rule,hits}]}" } } } },
-    "/v1/filter/sources": { "get": { "summary": "차단/허용 리스트(출처)별 규칙 수와 누적 히트", "responses": { "200": { "description": "{hits_enabled,sources:[{source,rules,hits}]}" } } } },
+    "/v1/access": { "get": { "summary": "Allowed and blocked networks, and domains answered with REFUSED. Use the config API to change them", "responses": { "200": { "description": "{allowed,blocked,refused_domains}" } } } },
+    "/v1/tls": { "get": { "summary": "TLS certificate and private key paths, and encrypted DNS listener status", "responses": { "200": { "description": "{configured,cert,key,doh_listeners,dot_listeners}" } } } },
+    "/v1/tls/validate": { "post": { "summary": "Validate the configured certificate, private key, chain, and validity period (admin only). Trust path and hostname are not checked", "responses": { "200": { "description": "{material_valid,valid:false,trusted:false,hostname_checked:false,chain_len}" }, "400": { "description": "{error}" } } } },
+    "/v1/tls/configure": { "post": { "summary": "Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" }, "private_key": { "type": "string" }, "cert_path": { "type": "string" }, "key_path": { "type": "string" } }, "additionalProperties": false } } } }, "responses": { "200": { "description": "{configured,chain_len,reloading,cert,key}" }, "400": { "description": "{error}" } } } },
+    "/v1/tls/revocation-check": { "post": { "summary": "Check OCSP and CRL revocation status of a certificate chain (admin only). Fetches from the URLs in the certificate and verifies signatures", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" } }, "required": ["certificate_chain"] } } } }, "responses": { "200": { "description": "{ocsp,crl,ocsp_urls,crl_urls,revoked}" }, "400": { "description": "{error}" } } } },
+    "/v1/acme/issue": { "post": { "summary": "Issue an ACME certificate or register an account (admin only). Answers HTTP-01 and DNS-01 challenges automatically and saves the issued certificate and private key to the configured files", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "directory": { "type": "string" }, "domains": { "type": "array" }, "contact": { "type": "string" }, "challenge": { "type": "string" }, "account_only": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "{account,issued,cert_file,key_file}" }, "400": { "description": "{error}" } } } },
+    "/v1/plugins": { "get": { "summary": "WASM plugin metrics", "responses": { "200": { "description": "[{name,eval,error,block,latency_us}]" } } } },
+    "/v1/filter/report": { "get": { "summary": "Filter rule load results and why rules were skipped", "responses": { "200": { "description": "{rules_total,rules_applied,rules_skipped,skip_reasons}" } } } },
+    "/v1/filter/top-rules": { "get": { "summary": "Top N rules by hits (when track_rule_hits is enabled)", "responses": { "200": { "description": "{enabled,top:[{rule,hits}]}" } } } },
+    "/v1/filter/sources": { "get": { "summary": "Rule count and cumulative hits per block or allow list", "responses": { "200": { "description": "{hits_enabled,sources:[{source,rules,hits}]}" } } } },
     "/v1/filter/subscriptions": {
-      "get": { "summary": "구독 목록과 제목·활성 상태·규칙 수. 위험 사이트 차단과 자녀 보호가 켜 둔 내장 목록도 preset 값을 달고 함께 나옵니다. 내장 목록은 그 설정으로만 켜고 끄며 여기서 삭제하거나 끌 수 없습니다", "responses": { "200": { "description": "{lists:[{url,title,enabled,rules,updated_unix,preset?}],count,block_domains}. preset은 safe_browsing 또는 parental_control" } } },
-      "post": { "summary": "차단 목록 구독 추가(관리자 전용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "title": { "type": "string" }, "enabled": { "type": "boolean" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{added,subscriptions,block}" }, "400": { "description": "{error}" } } },
-      "patch": { "summary": "차단 목록 구독 이름 또는 사용 여부 변경(관리자 전용)", "responses": { "200": { "description": "{updated}" }, "400": { "description": "{error}" } } },
-      "delete": { "summary": "차단 목록 구독 삭제(관리자 전용)", "responses": { "200": { "description": "{removed,subscriptions,block}" }, "404": { "description": "{error}" } } }
+      "get": { "summary": "Subscriptions with title, enabled state, and rule count. Built-in lists enabled by safe browsing and parental control are included with a preset value; they are turned on and off only by those settings and cannot be deleted or disabled here", "responses": { "200": { "description": "{lists:[{url,title,enabled,rules,updated_unix,preset?}],count,block_domains}. preset is safe_browsing or parental_control" } } },
+      "post": { "summary": "Add a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "title": { "type": "string" }, "enabled": { "type": "boolean" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{added,subscriptions,block}" }, "400": { "description": "{error}" } } },
+      "patch": { "summary": "Rename or enable/disable a blocklist subscription (admin only)", "responses": { "200": { "description": "{updated}" }, "400": { "description": "{error}" } } },
+      "delete": { "summary": "Delete a blocklist subscription (admin only)", "responses": { "200": { "description": "{removed,subscriptions,block}" }, "404": { "description": "{error}" } } }
     },
-    "/v1/filter/subscriptions/refresh": { "post": { "summary": "지정한 차단 목록 구독 갱신(관리자 전용)", "responses": { "200": { "description": "{refreshed:true}" }, "400": { "description": "{error}" } } } },
-    "/v1/filter/rules": { "get": { "summary": "사용자 차단·허용 규칙과 REFUSED로 답할 도메인 조회", "responses": { "200": { "description": "{block,allow,refused_domains}" } } }, "post": { "summary": "필터 규칙 추가(관리자 전용)", "responses": { "200": { "description": "{updated:true}" } } }, "delete": { "summary": "필터 규칙 삭제(관리자 전용)", "responses": { "200": { "description": "{updated:true}" } } } },
-    "/v1/clients": { "get": { "summary": "클라이언트별 정책 목록", "responses": { "200": { "description": "[{name,nets,client_ids,tags,block_rules,disable_filtering}]" } } }, "post": { "summary": "클라이언트 정책 추가(관리자 전용): 일반 차단·허용 정책은 연결을 유지한 채 반영하고, 전용 업스트림 DNS 서버나 새 MAC 식별 규칙을 추가하면 DNS 서비스를 다시 시작합니다", "responses": { "200": { "description": "{added,reloading}" }, "400": { "description": "{error}" } } }, "patch": { "summary": "클라이언트의 필터 사용 여부 변경(관리자 전용)", "responses": { "200": { "description": "{updated,disable_filtering,reloading}" } } }, "delete": { "summary": "클라이언트 정책 삭제(관리자 전용)", "responses": { "200": { "description": "{removed,reloading}" }, "400": { "description": "{error}" } } } },
-    "/v1/upstreams": { "get": { "summary": "업스트림 DNS 서버 목록", "responses": { "200": { "description": "[{id,addr,queries?,ok?,fail?,ewma_ms?}]" } } }, "post": { "summary": "업스트림 DNS 서버 추가(관리자 전용, 연결을 유지한 채 적용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{added,mode,restart_required}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "업스트림 DNS 서버 삭제(관리자 전용, 연결을 유지한 채 적용)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{removed,mode,restart_required}" }, "400": { "description": "{error}" } } } },
-    "/v1/jobs": { "get": { "summary": "비동기 작업 목록", "responses": { "200": { "description": "[{id,kind,status,created,finished,result}]" } } } },
-    "/v1/jobs/refresh": { "post": { "summary": "차단 목록 갱신 작업 시작(관리자 전용)", "responses": { "200": { "description": "{id,status}" } } } },
-    "/v1/jobs/{id}": { "get": { "summary": "작업 1건 상태 조회(폴링)", "responses": { "200": { "description": "{id,kind,status,...}" }, "404": { "description": "{error}" } } } },
-    "/v1/dhcp/leases": { "get": { "summary": "현재 유효한 DHCP 임대 목록. IPv4 항목에는 바인딩 identity, 마지막 MAC, 확인 가능한 제조사와 호스트 이름을 포함합니다", "responses": { "200": { "description": "{v4:[{ip,identity,mac,vendor,hostname,expires,remaining}],v6:[{ip,duid,expires,remaining}]}" } } }, "post": { "summary": "고가용성 구성에서 상대 노드가 보낸 DHCP 임대 반영(관리자 전용). identity와 마지막 MAC을 포함한 객체 하나 또는 스냅샷 배열을 받으며, 한 항목이라도 형식이 틀리면 전체를 거부합니다", "requestBody": { "content": { "application/json": { "schema": { "oneOf": [{ "type": "object" }, { "type": "array", "items": { "type": "object" } }], "example": [{ "identity": "id:0102", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.100", "expiry": "1900000000", "hostname": "host1" }] } } } }, "responses": { "200": { "description": "{synced}" }, "400": { "description": "{error}" } } } },
-    "/v1/dhcp/static": { "get": { "summary": "DHCP 고정 할당 목록(mac:<hex> 또는 id:<hex> 식별자별 고정 IP)", "responses": { "200": { "description": "{available,reservations:[{identity,ip,hostname}]}. DHCPv4 주소 풀이 실행 중이 아니면 available은 false이고 추가와 삭제를 받지 않습니다" } } }, "post": { "summary": "DHCP 고정 할당 추가 또는 변경(관리자 전용). 즉시 주소 풀에 반영하고 파일에 저장합니다", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "identity": { "type": "string" }, "ip": { "type": "string" }, "hostname": { "type": "string" } }, "required": ["identity", "ip"] } } } }, "responses": { "200": { "description": "{added,identity,ip}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "DHCP 고정 할당 삭제(관리자 전용)", "responses": { "200": { "description": "{removed,identity}" }, "404": { "description": "{error}" } } } }
+    "/v1/filter/subscriptions/refresh": { "post": { "summary": "Refresh the given blocklist subscription (admin only)", "responses": { "200": { "description": "{refreshed:true}" }, "400": { "description": "{error}" } } } },
+    "/v1/filter/rules": { "get": { "summary": "User block and allow rules, and domains answered with REFUSED", "responses": { "200": { "description": "{block,allow,refused_domains}" } } }, "post": { "summary": "Add a filter rule (admin only)", "responses": { "200": { "description": "{updated:true}" } } }, "delete": { "summary": "Delete a filter rule (admin only)", "responses": { "200": { "description": "{updated:true}" } } } },
+    "/v1/clients": { "get": { "summary": "Per-client policies", "responses": { "200": { "description": "[{name,nets,client_ids,tags,block_rules,disable_filtering}]" } } }, "post": { "summary": "Add a client policy (admin only): ordinary block and allow policies apply without dropping connections; a dedicated upstream DNS server or a new MAC match restarts the DNS service", "responses": { "200": { "description": "{added,reloading}" }, "400": { "description": "{error}" } } }, "patch": { "summary": "Turn filtering on or off for a client (admin only)", "responses": { "200": { "description": "{updated,disable_filtering,reloading}" } } }, "delete": { "summary": "Delete a client policy (admin only)", "responses": { "200": { "description": "{removed,reloading}" }, "400": { "description": "{error}" } } } },
+    "/v1/upstreams": { "get": { "summary": "Upstream DNS servers", "responses": { "200": { "description": "[{id,addr,queries?,ok?,fail?,ewma_ms?}]" } } }, "post": { "summary": "Add an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{added,mode,restart_required}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "Delete an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{removed,mode,restart_required}" }, "400": { "description": "{error}" } } } },
+    "/v1/jobs": { "get": { "summary": "Background jobs", "responses": { "200": { "description": "[{id,kind,status,created,finished,result}]" } } } },
+    "/v1/jobs/refresh": { "post": { "summary": "Start a blocklist refresh job (admin only)", "responses": { "200": { "description": "{id,status}" } } } },
+    "/v1/jobs/{id}": { "get": { "summary": "Status of one job (polling)", "responses": { "200": { "description": "{id,kind,status,...}" }, "404": { "description": "{error}" } } } },
+    "/v1/dhcp/leases": { "get": { "summary": "Active DHCP leases. IPv4 entries include the binding identity, last MAC, and the vendor and hostname when known", "responses": { "200": { "description": "{v4:[{ip,identity,mac,vendor,hostname,expires,remaining}],v6:[{ip,duid,expires,remaining}]}" } } }, "post": { "summary": "Apply DHCP leases sent by the peer node in a high-availability setup (admin only). Accepts one object or a snapshot array with identity and last MAC; rejects the whole request if any entry is malformed", "requestBody": { "content": { "application/json": { "schema": { "oneOf": [{ "type": "object" }, { "type": "array", "items": { "type": "object" } }], "example": [{ "identity": "id:0102", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.100", "expiry": "1900000000", "hostname": "host1" }] } } } }, "responses": { "200": { "description": "{synced}" }, "400": { "description": "{error}" } } } },
+    "/v1/dhcp/static": { "get": { "summary": "DHCP static assignments (fixed IP per mac:<hex> or id:<hex> identity)", "responses": { "200": { "description": "{available,reservations:[{identity,ip,hostname}]}. available is false when no DHCPv4 pool is running; adds and deletes are then rejected" } } }, "post": { "summary": "Add or change a DHCP static assignment (admin only). Applies to the pool immediately and saves to file", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "identity": { "type": "string" }, "ip": { "type": "string" }, "hostname": { "type": "string" } }, "required": ["identity", "ip"] } } } }, "responses": { "200": { "description": "{added,identity,ip}" }, "400": { "description": "{error}" } } }, "delete": { "summary": "Delete a DHCP static assignment (admin only)", "responses": { "200": { "description": "{removed,identity}" }, "404": { "description": "{error}" } } } }
   }
 }"##;
     SPEC.to_string()
@@ -5428,7 +5421,7 @@ mod tests {
                 if body.contains("\"qname\"") {
                     "{\"decision\":\"block\",\"rcode\":\"NXDOMAIN\",\"filter_stage\":\"block\",\"backend\":\"forward\",\"dnssec\":false}".to_string()
                 } else {
-                    "{\"error\":\"qname 항목을 입력해야 합니다\"}".to_string()
+                    "{\"error\":\"qname is required\"}".to_string()
                 }
             }),
             cluster_status: Box::new(|| {
@@ -5751,7 +5744,7 @@ mod tests {
             r#"{"domain":"example.com"}"#,
         );
         assert_eq!(status, 503);
-        assert!(body.contains("설정을 적용하는 중"));
+        assert!(body.contains("settings are being applied"));
         assert_eq!(call(&st, "GET", "/v1/stats", "adm", "").0, 200);
     }
 

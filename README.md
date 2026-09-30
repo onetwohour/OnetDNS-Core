@@ -33,7 +33,7 @@ Phones, laptops, TVs, consoles, and every app on them. OnetDNS reads the blockli
 
 ### A dashboard
 
-See what each device is looking up, what got blocked, and whether your upstream servers are healthy. Filter lists and most settings can be changed there and take effect right away. It comes in English, Korean, and Japanese.
+See what each device is looking up, what got blocked, and whether your upstream servers are healthy. Filter lists and most settings can be changed there and take effect right away. It comes in English, Korean, Japanese, and Simplified Chinese.
 
 ### Different rules for different devices
 
@@ -79,7 +79,7 @@ AdGuard Home and Pi-hole have years of releases and large communities behind the
 
 **1. Download.** Grab the file for your system from the [releases page](https://github.com/onetwohour/OnetDNS-Core/releases) and extract it. There are builds for Linux (x86_64, i686, aarch64, armv7), Windows (x86_64, i686), and macOS (Apple Silicon, Intel). The Linux builds run on any distribution, and the Windows builds need no extra runtime.
 
-**2. Write a config.** Out of the box OnetDNS answers only the machine it runs on and has no blocklists. Create `OnetDNS.toml` with this machine's LAN address and a list to start with:
+**2. Write a config.** Out of the box OnetDNS answers only the machine it runs on, forwards lookups to Cloudflare over encrypted DNS (DNS over HTTP/3), and has no blocklists. Create `OnetDNS.toml` with this machine's LAN address and a list to start with:
 
 ```toml
 listen = ["192.168.1.10:53"]
@@ -189,6 +189,23 @@ OnetDNS --cli allow example.com
 <br>
 
 Something else is already a DNS server on that machine. On Windows it is often Internet Connection Sharing or the DNS Server role; on Linux, `systemd-resolved` or `dnsmasq`. `netstat -ano` (Windows) or `ss -lunp` (Linux) shows which program holds it.
+
+</details>
+
+<details>
+<summary>My upstreams are plain IP addresses, and some lookups are slow or fail.</summary>
+<br>
+
+Some ISPs, routers, and security programs catch every lookup sent over UDP to port 53, whichever server it was meant for, and answer it with their own resolver. To check, run these two commands. The first asks over UDP and the second over TCP, and each prints the address of the resolver that answered. If the addresses differ, something on the way is answering in Google's place.
+
+```sh
+nslookup -type=txt o-o.myaddr.l.google.com 8.8.8.8
+nslookup -vc -type=txt o-o.myaddr.l.google.com 8.8.8.8
+```
+
+When this happens, the servers in `upstreams` never see your lookups, and some of these interceptors also cut answers larger than 512 bytes. OnetDNS asks again over TCP when an answer arrives cut, but that costs an extra round trip. With `backend = "recurse"`, OnetDNS notices the interception at startup, logs `net.port53_udp_intercepted`, and asks every DNS server over TCP.
+
+To get answers from the servers you chose, use encrypted upstreams in `upstream_urls` instead of `upstreams`. The default upstreams already do this.
 
 </details>
 

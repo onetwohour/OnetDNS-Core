@@ -32,19 +32,19 @@ pub(crate) fn simulate_policy(
         .map(String::from);
     let qname = gets("qname", "");
     if qname.is_empty() {
-        return "{\"error\":\"qname 항목을 입력해야 합니다\"}".to_string();
+        return "{\"error\":\"qname is required\"}".to_string();
     }
     let Some(qtype) = requested_qtype(&gets("qtype", "A")) else {
-        return "{\"error\":\"qtype 값의 형식이 올바르지 않습니다\"}".to_string();
+        return "{\"error\":\"qtype is malformed\"}".to_string();
     };
 
     let name = match onetdns_proto::Name::from_str(&qname) {
         Ok(n) => n,
-        Err(_) => return "{\"error\":\"qname 값의 형식이 올바르지 않습니다\"}".to_string(),
+        Err(_) => return "{\"error\":\"qname is malformed\"}".to_string(),
     };
 
     let Some(policy_qname) = native::normalized_text_name(&name) else {
-        return "{\"error\":\"UTF-8로 표현할 수 없는 이름은 정책 평가에서 제외됩니다\"}"
+        return "{\"error\":\"Names that cannot be written in UTF-8 are excluded from policy evaluation\"}"
             .to_string();
     };
 
@@ -145,14 +145,14 @@ pub(crate) fn explain_query(
         .map(String::from);
     let qname = gets("qname", "");
     if qname.is_empty() {
-        return "{\"error\":\"qname 항목을 입력해야 합니다\"}".to_string();
+        return "{\"error\":\"qname is required\"}".to_string();
     }
     let Some(qtype) = requested_qtype(&gets("qtype", "A")) else {
-        return "{\"error\":\"qtype 값의 형식이 올바르지 않습니다\"}".to_string();
+        return "{\"error\":\"qtype is malformed\"}".to_string();
     };
     let name = match onetdns_proto::Name::from_str(&qname) {
         Ok(n) => n,
-        Err(_) => return "{\"error\":\"qname 값의 형식이 올바르지 않습니다\"}".to_string(),
+        Err(_) => return "{\"error\":\"qname is malformed\"}".to_string(),
     };
     let ci = ClientInfo {
         source_ip: client,
@@ -162,7 +162,7 @@ pub(crate) fn explain_query(
     };
 
     let Some(policy_qname) = native::normalized_text_name(&name) else {
-        return "{\"error\":\"UTF-8로 표현할 수 없는 이름은 정책 평가에서 제외됩니다\"}"
+        return "{\"error\":\"Names that cannot be written in UTF-8 are excluded from policy evaluation\"}"
             .to_string();
     };
     let now = std::time::SystemTime::now();
@@ -282,7 +282,7 @@ pub(crate) fn explain_query(
         esc(backend),
         esc(route),
         esc(&resolution),
-        esc("미리 보기 결과이며 캐시 조회, 업스트림 DNS 서버 질의, DNSSEC 검증은 수행하지 않았습니다"),
+        esc("This is a preview; the cache, upstream DNS servers, and DNSSEC validation were not consulted"),
         qn = esc(&qname),
         qt = esc(&qtype_text(qtype)),
         matched_arr = stages.join(","),

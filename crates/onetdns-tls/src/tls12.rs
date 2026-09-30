@@ -146,13 +146,13 @@ fn hmac(hash: Hash, key: &[u8], data: &[u8]) -> Vec<u8> {
     match hash {
         Hash::Sha256 => {
             let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
-                .expect("HMAC 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+                .expect("HMAC key length must match the algorithm");
             m.update(data);
             m.finalize().into_bytes().to_vec()
         }
         Hash::Sha384 => {
             let mut m = hmac::Hmac::<sha2::Sha384>::new_from_slice(key)
-                .expect("HMAC 키 길이는 알고리즘 요구사항과 일치해야 합니다");
+                .expect("HMAC key length must match the algorithm");
             m.update(data);
             m.finalize().into_bytes().to_vec()
         }

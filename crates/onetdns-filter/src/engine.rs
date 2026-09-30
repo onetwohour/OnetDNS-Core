@@ -203,7 +203,7 @@ impl DomainSet {
         output: &mut impl FnMut(&[u8]),
     ) -> Result<(), &'static str> {
         if !self.exact.is_empty() || !self.suffixes.is_empty() {
-            return Err("도메인 집합의 압축 준비가 끝나지 않아 캐시에 저장할 수 없습니다");
+            return Err("Domain set is not compacted yet and cannot be cached");
         }
         self.exact_compact.encode_chunks(output)?;
         self.suffix_compact.encode_chunks(output)
@@ -216,7 +216,7 @@ impl DomainSet {
         let entry_count = exact_compact
             .len()
             .checked_add(suffix_compact.len())
-            .ok_or("DomainSet entry 수 계산 범위를 넘었습니다")?;
+            .ok_or("DomainSet entry count overflowed")?;
         Ok(Self {
             exact_compact,
             suffix_compact,
@@ -622,10 +622,10 @@ impl StaticZone {
                 .strip_suffix(zone)
                 .is_some_and(|head| head.ends_with('.'));
         if !inside {
-            return Err(format!("'{name}'이 영역 '{zone}' 밖에 있습니다"));
+            return Err(format!("'{name}' is outside zone '{zone}'"));
         }
         if self.names.contains_key(name.as_str()) {
-            return Err(format!("'{name}'의 답이 두 번 있습니다"));
+            return Err(format!("'{name}' has two answers"));
         }
         let mut rest = name.as_str();
         while rest != zone {
@@ -687,7 +687,7 @@ impl LocalZoneSet {
     pub fn insert(&mut self, zone: &str, action: LocalZoneAction) -> Result<(), String> {
         let key = normalize_str(zone).into_boxed_str();
         if self.zones.contains_key(&key) {
-            return Err(format!("같은 로컬 영역이 두 번 있습니다: {key}"));
+            return Err(format!("Duplicate local zone: {key}"));
         }
         self.zones.insert(
             key,
@@ -1266,7 +1266,7 @@ fn compile_isolated(pattern: &str) -> Option<Regex> {
     match Regex::new(pattern) {
         Ok(re) => Some(re),
         Err(error) => {
-            onetdns_core::warn!(event = "filter.regex_rule_skipped", pattern, error = %error, "문제가 있는 정규식 규칙 하나를 제외했습니다");
+            onetdns_core::warn!(event = "filter.regex_rule_skipped", pattern, error = %error, "Excluded one problematic regex rule");
             None
         }
     }
@@ -1288,7 +1288,7 @@ fn build_regexes(patterns: &[String]) -> RegexMatcher {
         match RegexSet::new(chunk.iter().map(|(p, _)| p.as_str())) {
             Ok(set) => matcher.chunks.push((set, chunk)),
             Err(error) => {
-                onetdns_core::warn!(event = "filter.regex_bundle_split", error = %error, "통합 정규식의 크기 한도를 넘어 해당 규칙 번들을 개별적으로 검사합니다");
+                onetdns_core::warn!(event = "filter.regex_bundle_split", error = %error, "Combined regex exceeds its size limit; checking this rule bundle rule by rule");
                 matcher.individual.extend(chunk);
             }
         }

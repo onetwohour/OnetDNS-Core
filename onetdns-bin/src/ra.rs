@@ -289,7 +289,7 @@ pub fn spawn_ra(
         bytes = pkt.len(),
         ifindex = cfg.interface_index,
         interval = cfg.interval,
-        "IPv6 라우터 광고 패킷을 만들었습니다"
+        "Built the IPv6 router advertisement packet"
     );
     #[cfg(target_os = "linux")]
     {
@@ -303,7 +303,7 @@ pub fn spawn_ra(
         let _ = (cfg, shutdown);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "RA(Router Advertisement)는 raw ICMPv6 소켓이 필요한 Linux 전용 기능입니다",
+            "Router advertisements need a raw ICMPv6 socket and are available only on Linux",
         ))
     }
 }
@@ -551,7 +551,7 @@ mod linux {
         let fd = unsafe { socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) };
         if fd < 0 {
             onetdns_core::error!(event = "ra.socket_failed",
-                "원시 ICMPv6 소켓을 열지 못해 라우터 광고를 사용하지 않습니다. CAP_NET_RAW 권한이 필요합니다"
+                "Could not open a raw ICMPv6 socket; router advertisements are disabled (requires CAP_NET_RAW)"
             );
             return;
         }
@@ -631,7 +631,7 @@ mod linux {
         }
         if !ancillary_ready {
             onetdns_core::warn!(event = "ra.ifindex_check_failed",
-                "IPv6 라우터 광고의 수신 인터페이스 검증을 설정하지 못했습니다. 요청 응답 광고는 보내지 않고 주기 광고만 보냅니다"
+                "Could not set up receive-interface checks for IPv6 router advertisements; sending periodic advertisements only, not solicited ones"
             );
         }
 
@@ -652,7 +652,7 @@ mod linux {
                 let error = std::io::Error::last_os_error();
                 let count = SEND_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_power_of_two() {
-                    onetdns_core::warn!(event = "ra.send_failed", interface = cfg.interface_index, count = count, %error, "IPv6 라우터 광고를 보내지 못했습니다. 이 링크의 기기들이 이 서버를 DNS로 알지 못합니다");
+                    onetdns_core::warn!(event = "ra.send_failed", interface = cfg.interface_index, count = count, %error, "Failed to send IPv6 router advertisement; devices on this link will not learn this server as their DNS");
                 }
             }
         };

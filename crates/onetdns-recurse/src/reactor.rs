@@ -147,7 +147,7 @@ fn record_bind_failure(error: &std::io::Error) {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
-        onetdns_core::warn!(event = "recurse.outgoing_bind_failed", count = count, %error, "재귀 질의를 보낼 소켓을 열지 못했습니다");
+        onetdns_core::warn!(event = "recurse.outgoing_bind_failed", count = count, %error, "Could not open a socket for recursive queries");
     }
 }
 
@@ -343,7 +343,7 @@ impl Session {
                         if from != ex.target {
                             continue;
                         }
-                        let Ok(resp) = Message::parse(&buf[..n]) else {
+                        let Some(resp) = Message::parse_udp_reply(&buf[..n]) else {
                             continue;
                         };
                         if resp.header.id != ex.sent.header.id {
@@ -353,6 +353,11 @@ impl Session {
                             && !questions_case_exact(&resp.questions, &ex.sent.questions)
                         {
                             continue;
+                        }
+                        // 잘린 응답은 레코드가 비어 있어 아래 검사를 통과하지 못한다. 거기서
+                        // 버리면 TCP 로 넘어가지 못하고 왕복 시간 초과까지 기다린다.
+                        if resp.header.truncated {
+                            return Some(resp);
                         }
                         if !response_usable_for_iteration(&resp, &ex.sent, &self.state.zone) {
                             continue;
@@ -1527,8 +1532,41 @@ mod tests {
         );
     }
 
-    /** @brief 잘림 비트를 설정해 답하는 테스트용 서버. */
-    fn spawn_mock_authority_truncating() -> SocketAddr {
+    /**
+     * @brief 받은 질의에 A 레코드 하나를 담은 권한 응답을 만든다.
+     * @param truncated 잘림 비트를 켤지.
+     * @param with_answer 답 레코드를 담을지.
+     */
+    fn authority_reply(req: &Message, truncated: bool, with_answer: bool) -> Vec<u8> {
+        let q = req.questions[0].clone();
+        let mut resp = Message {
+            header: Header {
+                id: req.header.id,
+                response: true,
+                authoritative: true,
+                truncated,
+                ..Default::default()
+            },
+            questions: vec![Question {
+                name: q.name.clone(),
+                qtype: q.qtype,
+                qclass: DnsClass::IN,
+            }],
+            ..Default::default()
+        };
+        resp.header.rcode = ResponseCode::NoError.0;
+        if with_answer {
+            resp.answers.push(Record::new(
+                q.name.clone(),
+                60,
+                RData::A(std::net::Ipv4Addr::new(192, 0, 2, 7)),
+            ));
+        }
+        resp.try_encode().unwrap()
+    }
+
+    /** @brief UDP 질의에 reply 가 만든 바이트로 답하는 테스트용 권한 서버. */
+    fn spawn_mock_authority_replying(reply: fn(&Message) -> Vec<u8>) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let addr = sock.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1537,31 +1575,10 @@ mod tests {
                 let Ok(req) = Message::parse(&buf[..n]) else {
                     continue;
                 };
-                let Some(q) = req.questions.first().cloned() else {
+                if req.questions.is_empty() {
                     continue;
-                };
-                let mut resp = Message {
-                    header: Header {
-                        id: req.header.id,
-                        response: true,
-                        authoritative: true,
-                        truncated: true,
-                        ..Default::default()
-                    },
-                    questions: vec![Question {
-                        name: q.name.clone(),
-                        qtype: q.qtype,
-                        qclass: DnsClass::IN,
-                    }],
-                    ..Default::default()
-                };
-                resp.header.rcode = ResponseCode::NoError.0;
-                resp.answers.push(Record::new(
-                    q.name.clone(),
-                    60,
-                    RData::A(std::net::Ipv4Addr::new(192, 0, 2, 7)),
-                ));
-                let _ = sock.send_to(&resp.try_encode().unwrap(), from);
+                }
+                let _ = sock.send_to(&reply(&req), from);
             }
         });
         addr
@@ -1598,7 +1615,34 @@ mod tests {
     #[test]
     /** @brief 잘린 응답은 TCP가 필요하므로 동기 경로로 넘기는지. */
     fn reactor_hands_truncated_response_to_sync_path() {
-        let root = spawn_mock_authority_truncating();
+        assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
+            authority_reply(req, true, true)
+        }));
+    }
+
+    #[test]
+    /**
+     * @brief 레코드 없이 잘림 비트만 켠 응답도 동기 경로로 넘기는지.
+     * @details 이 응답은 반복 해석에 쓸 수 있는 응답인지 보는 검사를 통과하지 못한다. 그 검사보다
+     *          잘림을 먼저 보지 않으면 왕복 시간 초과까지 기다렸다가 실패한다.
+     */
+    fn reactor_hands_empty_truncated_response_to_sync_path() {
+        assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
+            authority_reply(req, true, false)
+        }));
+    }
+
+    #[test]
+    /** @brief 잘림 비트 없이 레코드 중간에서 끊긴 응답도 동기 경로로 넘기는지. */
+    fn reactor_hands_reply_cut_without_tc_to_sync_path() {
+        assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
+            let full = authority_reply(req, false, true);
+            full[..full.len() - 3].to_vec()
+        }));
+    }
+
+    /** @brief root 한 곳에 물은 해석이 재시도 통지로 끝나는지 확인한다. */
+    fn assert_handed_to_sync_path(root: SocketAddr) {
         let recursor = Recursor::new(vec![root], Duration::from_millis(500))
             .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
         let qname = Name::from_str("example.").unwrap();

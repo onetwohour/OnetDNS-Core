@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static regression checks for the embedded OnetDNS dashboard.
 
-The checks cover JavaScript syntax, duplicate declarations, complete ko/en/ja
+The checks cover JavaScript syntax, duplicate declarations, complete ko/en/ja/zh
 coverage for static and dynamic user-facing copy, terminology regressions, and
 critical state-synchronization hooks. Only Python's standard library and Node.js
 are required.
@@ -487,19 +487,32 @@ def main() -> None:
             "update the map and this pin together"
         )
 
+    # Screen copy is keyed by its Korean source text. The server answers in English, so
+    # the server messages the dashboard knows are keyed by their English text and need
+    # every language except English.
     en = dictionaries.get("en", {})
     ja = dictionaries.get("ja", {})
-    if set(en) != set(ja):
-        fail(
-            f"translation key mismatch: en-only={sorted(set(en)-set(ja))[:10]}, "
-            f"ja-only={sorted(set(ja)-set(en))[:10]}"
-        )
-    empty = [key for key in en if not str(en[key]).strip() or not str(ja[key]).strip()]
+    zh = dictionaries.get("zh", {})
+    ko = dictionaries.get("ko", {})
+    expected = set(en) | set(ko)
+    for language, dictionary in (("ja", ja), ("zh", zh)):
+        if set(dictionary) != expected:
+            fail(
+                f"translation key mismatch in {language}: "
+                f"missing={sorted(expected - set(dictionary))[:10]}, "
+                f"extra={sorted(set(dictionary) - expected)[:10]}"
+            )
+    empty = [
+        (language, key)
+        for language, dictionary in (("en", en), ("ja", ja), ("zh", zh), ("ko", ko))
+        for key, value in dictionary.items()
+        if not str(value).strip()
+    ]
     if empty:
         fail(f"empty translations: {empty[:10]}")
     untranslated_values = [
         (language, key, value)
-        for language, dictionary in (("en", en), ("ja", ja))
+        for language, dictionary in (("en", en), ("ja", ja), ("zh", zh))
         for key, value in dictionary.items()
         if KOREAN.search(str(value))
     ]

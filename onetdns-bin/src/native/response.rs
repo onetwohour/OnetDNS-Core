@@ -37,7 +37,7 @@ impl NativeServer {
                 Some(qtype),
                 "REWRITE_TARGET_RESOLUTION_FAILED",
                 "rewrite",
-                "rewrite 대상의 후속 해석이 유효한 응답을 만들지 못했습니다",
+                "Resolving the rewrite target did not produce a valid response",
             );
         } else if rcode == ResponseCode::Refused {
             self.rec_rc(client, Action::Refused, Some(name), Some(qtype), rcode);
@@ -215,7 +215,7 @@ pub(crate) fn finalize(mut msg: Message, edns: Option<Edns>) -> Message {
     if let Some(e) = edns {
         msg.additionals.push(
             e.try_to_record()
-                .expect("내부에서 제한한 응답 EDNS는 인코딩 가능"),
+                .expect("Response EDNS limited internally can always be encoded"),
         );
     }
     msg
@@ -454,7 +454,7 @@ pub(crate) fn answers_summary(answers: &[ApRecord]) -> String {
         })
         .collect();
     if answers.len() > MAX {
-        parts.push(format!("외 {}개", answers.len() - MAX));
+        parts.push(format!("+{} more", answers.len() - MAX));
     }
     parts.join(" · ")
 }

@@ -24,7 +24,7 @@ pub(crate) fn read_file_limited(path: &Path, max: u64, kind: &str) -> Result<Vec
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() || meta.len() > max {
         return Err(format!(
-            "{}: {kind} 파일 크기 또는 형식이 허용 범위를 벗어났습니다",
+            "{}: {kind} file size or format is out of range",
             path.display()
         ));
     }
@@ -35,7 +35,7 @@ pub(crate) fn read_file_limited(path: &Path, max: u64, kind: &str) -> Result<Vec
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() as u64 > max {
         return Err(format!(
-            "{}: {kind} 파일 크기가 허용 한도를 넘었습니다",
+            "{}: {kind} file exceeds the size limit",
             path.display()
         ));
     }
@@ -45,8 +45,7 @@ pub(crate) fn read_file_limited(path: &Path, max: u64, kind: &str) -> Result<Vec
 /** @brief zone 파일을 텍스트로 읽는다. UTF-8이 아니면 거부한다. */
 pub fn read_zone_text(path: &Path) -> Result<String, String> {
     let bytes = read_file_limited(path, MAX_ZONE_FILE, "zone")?;
-    String::from_utf8(bytes)
-        .map_err(|_| format!("{}: UTF-8 형식이 올바르지 않습니다", path.display()))
+    String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", path.display()))
 }
 
 use crate::{parse_zone, Zone, ZoneStore};
@@ -149,7 +148,7 @@ impl DirZoneSource {
             }
             if out.len() >= limit {
                 return Err(format!(
-                    "{}: 영역 파일 수가 허용 한도 {limit}개를 넘었습니다",
+                    "{}: more than {limit} zone files",
                     self.dir.display()
                 ));
             }

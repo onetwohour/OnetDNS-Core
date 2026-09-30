@@ -21,7 +21,7 @@ use onetdns_config::Config;
 /** @brief 등록할 서비스 이름. */
 const SERVICE_NAME: &str = "OnetDNS";
 /** @brief 목록에 보일 이름. */
-const SERVICE_DISPLAY: &str = "OnetDNS 광고 차단 DNS";
+const SERVICE_DISPLAY: &str = "OnetDNS ad-blocking DNS";
 
 /** @brief 서비스로 뜰 때 쓸 설정 경로. 진입점이 인수를 받지 못해 여기 둔다. */
 static CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -256,7 +256,7 @@ fn wide_nul(value: &OsStr) -> io::Result<Vec<u16>> {
     if wide.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Windows 서비스 문자열에 NUL 문자를 사용할 수 없습니다",
+            "Windows service strings cannot contain NUL characters",
         ));
     }
     wide.push(0);
@@ -274,7 +274,7 @@ fn escape_argument(value: &OsStr) -> io::Result<Vec<u16>> {
     if units.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Windows 서비스 실행 인수에 NUL 문자를 사용할 수 없습니다",
+            "Windows service arguments cannot contain NUL characters",
         ));
     }
     let quote = u16::from(b'"');
@@ -363,10 +363,10 @@ pub fn status() -> BoxResult<(bool, bool)> {
 fn describe(error: io::Error) -> io::Error {
     let message = match error.raw_os_error() {
         Some(win32::ERROR_ACCESS_DENIED) => {
-            "서비스를 등록하거나 제거하려면 관리자 권한이 필요합니다. 관리자 권한 콘솔에서 실행하십시오"
+            "Installing or removing the service needs administrator rights; run it from an elevated console"
         }
-        Some(win32::ERROR_SERVICE_EXISTS) => "같은 이름의 서비스가 이미 등록돼 있습니다",
-        Some(win32::ERROR_SERVICE_DOES_NOT_EXIST) => "등록된 서비스가 없습니다",
+        Some(win32::ERROR_SERVICE_EXISTS) => "A service with the same name is already installed",
+        Some(win32::ERROR_SERVICE_DOES_NOT_EXIST) => "The service is not installed",
         _ => return error,
     };
     io::Error::new(error.kind(), message)
@@ -414,7 +414,7 @@ pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
     .map_err(describe)?;
 
     Ok(format!(
-        "서비스 '{SERVICE_NAME}'를 등록했습니다. 다음 부팅부터 자동으로 뜹니다"
+        "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot"
     ))
 }
 
@@ -442,7 +442,7 @@ pub fn uninstall() -> BoxResult<String> {
         });
     }
     bool_result(unsafe { win32::DeleteService(service.0) })?;
-    Ok(format!("서비스 '{SERVICE_NAME}'를 제거했습니다"))
+    Ok(format!("Removed service '{SERVICE_NAME}'"))
 }
 
 /** @brief 관리자와 이어 서비스로 돈다. */
@@ -466,7 +466,7 @@ pub fn run_dispatcher(config: Option<PathBuf>) -> BoxResult<()> {
 /** @brief 관리자가 부르는 진입점. */
 extern "system" fn ffi_service_main(_argument_count: u32, _arguments: *mut *mut u16) {
     if let Err(error) = service_run() {
-        eprintln!("서비스 오류: {error}");
+        eprintln!("Service error: {error}");
     }
 }
 
@@ -508,9 +508,9 @@ fn service_run() -> BoxResult<()> {
 
     let config = CONFIG_PATH.get().cloned().flatten();
     if let Err(error) = Config::load_or_default(config.as_deref()) {
-        onetdns_core::error!(event = "service.config_load_failed", %error, "설정을 읽지 못해 서비스를 시작하지 않습니다");
+        onetdns_core::error!(event = "service.config_load_failed", %error, "Could not read the configuration; not starting the service");
         if let Err(report_error) = status_handle.report(win32::SERVICE_STOPPED, 0, Some(1), 0, 0) {
-            onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", error = %report_error, "서비스 관리자에 상태를 알리지 못했습니다");
+            onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", error = %report_error, "Could not report status to the service manager");
         }
         return Err(error.into());
     }
@@ -522,14 +522,14 @@ fn service_run() -> BoxResult<()> {
             Ok(config) => config,
             Err(error) => match crate::restore_last_applied_config(config.as_deref(), &shared) {
                 Ok(true) if recovery_error.is_none() => {
-                    onetdns_core::error!(event = "service.config_rolled_back", %error, "새 설정을 읽지 못해 마지막으로 정상 적용됐던 설정으로 되돌려 시작합니다");
+                    onetdns_core::error!(event = "service.config_rolled_back", %error, "Could not read the new configuration; starting with the last configuration that worked");
                     recovery_error = Some(error.to_string());
                     continue;
                 }
                 Ok(_) => {
                     if let Some(first_error) = recovery_error.take() {
                         break Err(crate::anyhow!(format!(
-                            "새 설정을 적용하지 못했고 마지막 정상 설정으로도 서비스를 복구하지 못했습니다: 새 설정 오류={first_error}; 복구 설정 오류={error}"
+                            "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
                         )));
                     }
                     break Err(error.into());
@@ -540,7 +540,7 @@ fn service_run() -> BoxResult<()> {
         let cfg_text = config.as_deref().and_then(|path| match Config::read_text(path) {
             Ok(text) => Some(onetdns_core::SecretString::from(text)),
             Err(error) => {
-                onetdns_core::warn!(event = "service.config_text_unavailable", path = %path.display(), %error, "설정 원문을 읽지 못해 관리 화면에서 설정 편집이 비어 보입니다");
+                onetdns_core::warn!(event = "service.config_text_unavailable", path = %path.display(), %error, "Could not read the configuration file text; the dashboard's configuration editor will be empty");
                 None
             }
         });
@@ -553,7 +553,7 @@ fn service_run() -> BoxResult<()> {
                 0,
                 0,
             ) {
-                onetdns_core::warn!(event = "service.status_report_failed", state = "running", %error, "서비스 관리자에 실행 중임을 알리지 못했습니다. 관리자가 시작 실패로 보고 서비스를 내릴 수 있습니다");
+                onetdns_core::warn!(event = "service.status_report_failed", state = "running", %error, "Could not tell the service manager that the service is running; it may treat startup as failed and stop the service");
             }
         });
         let session_checkpoint = shared.sessions.checkpoint();
@@ -568,7 +568,7 @@ fn service_run() -> BoxResult<()> {
             Ok(true) => {
                 recovery_error = None;
                 if let Err(error) = start_pending(1) {
-                    onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "서비스 관리자에 상태를 알리지 못했습니다");
+                    onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "Could not report status to the service manager");
                 }
                 continue;
             }
@@ -577,17 +577,17 @@ fn service_run() -> BoxResult<()> {
                 shared.sessions.restore(session_checkpoint);
                 match crate::restore_last_applied_config(config.as_deref(), &shared) {
                     Ok(true) if recovery_error.is_none() => {
-                        onetdns_core::error!(event = "service.config_rolled_back", %error, "새 설정으로 서비스를 시작하지 못해 마지막으로 정상 적용됐던 설정으로 되돌립니다");
+                        onetdns_core::error!(event = "service.config_rolled_back", %error, "Could not start with the new configuration; reverting to the last configuration that worked");
                         recovery_error = Some(error.to_string());
                         if let Err(report_error) = start_pending(2) {
-                            onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", error = %report_error, "서비스 관리자에 상태를 알리지 못했습니다");
+                            onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", error = %report_error, "Could not report status to the service manager");
                         }
                         continue;
                     }
                     Ok(_) => {
                         if let Some(first_error) = recovery_error.take() {
                             break Err(crate::anyhow!(format!(
-                                "새 설정을 적용하지 못했고 마지막 정상 설정으로도 서비스를 복구하지 못했습니다: 새 설정 오류={first_error}; 복구 설정 오류={error}"
+                                "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
                             )));
                         }
                         break Err(error);

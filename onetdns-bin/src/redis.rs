@@ -142,14 +142,14 @@ impl RedisClient {
                     }
                 }
             }
-            let stream = state.conn.as_mut().expect("방금 삽입됨");
+            let stream = state.conn.as_mut().expect("The entry was just inserted");
             stream.set_deadline(deadline);
             match roundtrip(stream, args) {
                 Ok(value) => {
                     state.retry_after = None;
                     if !state.healthy {
                         state.healthy = true;
-                        onetdns_core::info!(event = "cachedb.recovered", addr = %self.addr, "공유 캐시가 다시 응답해 캐시를 함께 쓰기 시작했습니다");
+                        onetdns_core::info!(event = "cachedb.recovered", addr = %self.addr, "Shared cache is answering again; resumed using it");
                     }
                     return Ok(value);
                 }
@@ -178,7 +178,7 @@ impl RedisClient {
             return;
         }
         state.healthy = false;
-        onetdns_core::warn!(event = "cachedb.unavailable", addr = %self.addr, error = %error, cooldown_secs = FAILURE_COOLDOWN.as_secs(), "공유 캐시에 닿지 못해 잠시 건너뜁니다. 질의는 계속 처리되지만 캐시를 함께 쓰지 못합니다");
+        onetdns_core::warn!(event = "cachedb.unavailable", addr = %self.addr, error = %error, cooldown_secs = FAILURE_COOLDOWN.as_secs(), "Cannot reach the shared cache; skipping it for now. Queries are still answered but the cache is not shared");
     }
 
     /**
@@ -195,7 +195,7 @@ impl RedisClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         if count.is_power_of_two() {
-            onetdns_core::warn!(event = "cachedb.command_rejected", addr = %self.addr, command = command, count = count, reply = %message, "공유 캐시 서버가 명령을 거부했습니다. 캐시를 함께 쓰지 못하는 상태입니다");
+            onetdns_core::warn!(event = "cachedb.command_rejected", addr = %self.addr, command = command, count = count, reply = %message, "Shared cache server rejected a command; the cache is not being shared");
         }
     }
 

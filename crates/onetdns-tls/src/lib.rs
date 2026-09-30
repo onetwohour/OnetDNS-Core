@@ -111,21 +111,21 @@ impl std::fmt::Display for TlsError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsError::Decode => write!(f, "TLS 메시지를 해석하지 못했습니다"),
-            TlsError::RecordOverflow => write!(f, "TLS 레코드 길이가 허용 한도를 넘었습니다"),
-            TlsError::Decrypt => write!(f, "TLS 레코드의 암호를 풀지 못했습니다"),
-            TlsError::BadCert => write!(f, "인증서 또는 공개 키가 올바르지 않습니다"),
-            TlsError::BadSignature => write!(f, "서명 검증에 실패했습니다"),
-            TlsError::UnsupportedSig(s) => write!(f, "지원하지 않는 서명 스킴: {s}"),
-            TlsError::Io => write!(f, "TLS 연결에서 입출력 오류가 발생했습니다"),
-            TlsError::Protocol => write!(f, "TLS 프로토콜 위반"),
-            TlsError::CloseNotify => write!(f, "TLS close_notify 수신"),
-            TlsError::Eof => write!(f, "상대가 TLS 종료 알림 없이 연결을 닫았습니다"),
+            TlsError::Decode => write!(f, "Could not parse TLS message"),
+            TlsError::RecordOverflow => write!(f, "TLS record length exceeds the limit"),
+            TlsError::Decrypt => write!(f, "Could not decrypt TLS record"),
+            TlsError::BadCert => write!(f, "Invalid certificate or public key"),
+            TlsError::BadSignature => write!(f, "Signature verification failed"),
+            TlsError::UnsupportedSig(s) => write!(f, "Unsupported signature scheme: {s}"),
+            TlsError::Io => write!(f, "I/O error on the TLS connection"),
+            TlsError::Protocol => write!(f, "TLS protocol violation"),
+            TlsError::CloseNotify => write!(f, "Received TLS close_notify"),
+            TlsError::Eof => write!(f, "Peer closed the connection without a TLS close_notify"),
             TlsError::PeerAlert { level, description } => write!(
                 f,
-                "상대 서버가 TLS 경고를 보냈습니다. 수준={level}, 설명={description}"
+                "Peer sent a TLS alert: level={level}, description={description}"
             ),
-            TlsError::SeqExhausted => write!(f, "TLS 레코드 시퀀스 소진"),
+            TlsError::SeqExhausted => write!(f, "TLS record sequence exhausted"),
         }
     }
 }

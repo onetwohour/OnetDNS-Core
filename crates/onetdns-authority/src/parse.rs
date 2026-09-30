@@ -30,7 +30,7 @@ use crate::{Zone, MAX_ZONE_RECORDS};
  */
 pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut origin = Name::from_str(default_origin).map_err(|_| "잘못된 origin".to_string())?;
+    let mut origin = Name::from_str(default_origin).map_err(|_| "Invalid origin".to_string())?;
     let mut default_ttl: u32 = 3600;
     let mut last_owner: Option<Name> = Some(origin.clone());
     let mut soa: Option<(Name, u32, Soa)> = None;
@@ -53,13 +53,13 @@ pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
 
         if toks[0].eq_ignore_ascii_case("$ORIGIN") {
             origin = parse_name(
-                toks.get(1).ok_or("$ORIGIN 지시문에 값이 없습니다")?,
+                toks.get(1).ok_or("$ORIGIN directive has no value")?,
                 &origin,
             )?;
             return Ok(());
         }
         if toks[0].eq_ignore_ascii_case("$TTL") {
-            default_ttl = parse_ttl(toks.get(1).ok_or("$TTL 지시문에 값이 없습니다")?)?;
+            default_ttl = parse_ttl(toks.get(1).ok_or("$TTL directive has no value")?)?;
             return Ok(());
         }
 
@@ -67,7 +67,7 @@ pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
         let owner = if started_ws {
             last_owner
                 .clone()
-                .ok_or("owner 없습니다(첫 줄이 공백 시작)")?
+                .ok_or("Missing owner (the first line starts with whitespace)")?
         } else {
             let o = parse_name(&toks[0], &origin)?;
             i = 1;
@@ -79,7 +79,7 @@ pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
         loop {
             let t = toks
                 .get(i)
-                .ok_or("레코드 유형이 빠져 있어 레코드가 완전하지 않습니다")?;
+                .ok_or("The record is incomplete because its type is missing")?;
             if t.eq_ignore_ascii_case("IN") {
                 i += 1;
                 continue;
@@ -98,20 +98,20 @@ pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
         if let RData::Soa(s) = &rdata {
             soa_count += 1;
             if soa_count > 1 {
-                return Err("영역에는 apex SOA가 정확히 하나만 있어야 함".to_string());
+                return Err("A zone must have exactly one apex SOA".to_string());
             }
             soa = Some((owner.clone(), ttl, s.as_ref().clone()));
         }
         if records.len() >= MAX_ZONE_RECORDS {
             return Err(format!(
-                "영역 레코드 수가 허용 한도({MAX_ZONE_RECORDS})를 넘었습니다"
+                "The zone has more records than allowed ({MAX_ZONE_RECORDS})"
             ));
         }
         records.push(Record::new(owner.clone(), ttl, rdata));
         Ok(())
     })?;
 
-    let (soa_owner, soa_ttl, soa_rec) = soa.ok_or("영역에 SOA가 없습니다".to_string())?;
+    let (soa_owner, soa_ttl, soa_rec) = soa.ok_or("The zone has no SOA".to_string())?;
     Zone::from_flat_records(soa_owner, soa_rec, soa_ttl, records)
 }
 
@@ -131,7 +131,7 @@ const ZONEMD_MIN_DIGEST: usize = 12;
 fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, String> {
     let need = |n: usize| -> Result<(), String> {
         if toks.len() < n {
-            Err(format!("{rtype} rdata 부족"))
+            Err(format!("{rtype} RDATA is incomplete"))
         } else {
             Ok(())
         }
@@ -142,7 +142,7 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
             RData::A(
                 toks[0]
                     .parse::<Ipv4Addr>()
-                    .map_err(|_| "A 레코드의 IPv4 주소가 올바르지 않습니다")?,
+                    .map_err(|_| "Invalid IPv4 address in A record")?,
             )
         }
         "AAAA" => {
@@ -150,7 +150,7 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
             RData::Aaaa(
                 toks[0]
                     .parse::<Ipv6Addr>()
-                    .map_err(|_| "AAAA 레코드의 IPv6 주소가 올바르지 않습니다")?,
+                    .map_err(|_| "Invalid IPv6 address in AAAA record")?,
             )
         }
         "NS" => {
@@ -172,18 +172,14 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "MX" => {
             need(2)?;
             RData::Mx {
-                preference: toks[0]
-                    .parse()
-                    .map_err(|_| "MX 레코드의 우선순위가 올바르지 않습니다")?,
+                preference: toks[0].parse().map_err(|_| "Invalid MX preference")?,
                 exchange: parse_name(&toks[1], origin)?,
             }
         }
         "TXT" => RData::Txt(toks.iter().map(|t| unescape_char_string(t)).collect()),
         "CAA" => {
             need(3)?;
-            let flags: u8 = toks[0]
-                .parse()
-                .map_err(|_| "CAA 레코드의 플래그가 올바르지 않습니다")?;
+            let flags: u8 = toks[0].parse().map_err(|_| "Invalid CAA flags")?;
             let tag = unescape_char_string(&toks[1]);
 
             let value = unescape_char_string(&toks[2..].join(" "));
@@ -196,15 +192,9 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "SRV" => {
             need(4)?;
             RData::Srv {
-                priority: toks[0]
-                    .parse()
-                    .map_err(|_| "SRV 레코드의 우선순위가 올바르지 않습니다")?,
-                weight: toks[1]
-                    .parse()
-                    .map_err(|_| "SRV 레코드의 가중치가 올바르지 않습니다")?,
-                port: toks[2]
-                    .parse()
-                    .map_err(|_| "SRV 레코드의 포트가 올바르지 않습니다")?,
+                priority: toks[0].parse().map_err(|_| "Invalid SRV priority")?,
+                weight: toks[1].parse().map_err(|_| "Invalid SRV weight")?,
+                port: toks[2].parse().map_err(|_| "Invalid SRV port")?,
                 target: parse_name(&toks[3], origin)?,
             }
         }
@@ -213,9 +203,7 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
             RData::soa(Soa {
                 mname: parse_name(&toks[0], origin)?,
                 rname: parse_name(&toks[1], origin)?,
-                serial: toks[2]
-                    .parse()
-                    .map_err(|_| "SOA 레코드의 일련번호가 올바르지 않습니다")?,
+                serial: toks[2].parse().map_err(|_| "Invalid SOA serial")?,
                 refresh: parse_ttl(&toks[3])?,
                 retry: parse_ttl(&toks[4])?,
                 expire: parse_ttl(&toks[5])?,
@@ -225,30 +213,21 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "TLSA" => {
             need(4)?;
             RData::Tlsa {
-                usage: toks[0]
-                    .parse()
-                    .map_err(|_| "TLSA 레코드의 용도 값이 올바르지 않습니다")?,
-                selector: toks[1]
-                    .parse()
-                    .map_err(|_| "TLSA 레코드의 선택자 값이 올바르지 않습니다")?,
-                matching: toks[2]
-                    .parse()
-                    .map_err(|_| "TLSA 레코드의 일치 방식 값이 올바르지 않습니다")?,
-                data: hex_decode(&toks[3..].join(""))
-                    .ok_or("TLSA 레코드의 16진수 데이터가 올바르지 않습니다")?,
+                usage: toks[0].parse().map_err(|_| "Invalid TLSA usage")?,
+                selector: toks[1].parse().map_err(|_| "Invalid TLSA selector")?,
+                matching: toks[2].parse().map_err(|_| "Invalid TLSA matching type")?,
+                data: hex_decode(&toks[3..].join("")).ok_or("Invalid TLSA hex data")?,
             }
         }
         "SSHFP" => {
             need(3)?;
             RData::Sshfp {
-                algorithm: toks[0]
-                    .parse()
-                    .map_err(|_| "SSHFP 레코드의 알고리즘 값이 올바르지 않습니다")?,
+                algorithm: toks[0].parse().map_err(|_| "Invalid SSHFP algorithm")?,
                 fp_type: toks[1]
                     .parse()
-                    .map_err(|_| "SSHFP 레코드의 지문 형식이 올바르지 않습니다")?,
+                    .map_err(|_| "Invalid SSHFP fingerprint type")?,
                 fingerprint: hex_decode(&toks[2..].join(""))
-                    .ok_or("SSHFP 레코드의 16진수 지문이 올바르지 않습니다")?,
+                    .ok_or("Invalid SSHFP hex fingerprint")?,
             }
         }
 
@@ -256,15 +235,15 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
             need(4)?;
             let flags: u16 = toks[0]
                 .parse()
-                .map_err(|_| format!("{rtype} 레코드의 플래그가 올바르지 않습니다"))?;
+                .map_err(|_| format!("Invalid {rtype} flags"))?;
             let protocol: u8 = toks[1]
                 .parse()
-                .map_err(|_| format!("{rtype} 레코드의 프로토콜 값이 올바르지 않습니다"))?;
+                .map_err(|_| format!("Invalid {rtype} protocol"))?;
             let algorithm: u8 = toks[2]
                 .parse()
-                .map_err(|_| format!("{rtype} 레코드의 알고리즘 값이 올바르지 않습니다"))?;
+                .map_err(|_| format!("Invalid {rtype} algorithm"))?;
             let key = base64_decode(&toks[3..].join(""))
-                .ok_or_else(|| format!("{rtype} 레코드의 공개키가 올바른 base64가 아닙니다"))?;
+                .ok_or_else(|| format!("{rtype} public key is not valid base64"))?;
             let mut wire = Vec::with_capacity(4 + key.len());
             wire.extend_from_slice(&flags.to_be_bytes());
             wire.push(protocol);
@@ -282,21 +261,15 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "RRSIG" => {
             need(9)?;
             let covered = rrsig_covered_type(&toks[0])?;
-            let algorithm: u8 = toks[1]
-                .parse()
-                .map_err(|_| "RRSIG 레코드의 알고리즘 값이 올바르지 않습니다")?;
-            let labels: u8 = toks[2]
-                .parse()
-                .map_err(|_| "RRSIG 레코드의 라벨 수가 올바르지 않습니다")?;
+            let algorithm: u8 = toks[1].parse().map_err(|_| "Invalid RRSIG algorithm")?;
+            let labels: u8 = toks[2].parse().map_err(|_| "Invalid RRSIG label count")?;
             let original_ttl = parse_ttl(&toks[3])?;
             let expiration = parse_dnssec_time(&toks[4])?;
             let inception = parse_dnssec_time(&toks[5])?;
-            let key_tag: u16 = toks[6]
-                .parse()
-                .map_err(|_| "RRSIG 레코드의 키 태그가 올바르지 않습니다")?;
+            let key_tag: u16 = toks[6].parse().map_err(|_| "Invalid RRSIG key tag")?;
             let signer = parse_name(&toks[7], origin)?;
-            let signature = base64_decode(&toks[8..].join(""))
-                .ok_or("RRSIG 레코드의 서명이 올바른 base64가 아닙니다")?;
+            let signature =
+                base64_decode(&toks[8..].join("")).ok_or("RRSIG signature is not valid base64")?;
             let mut wire = Vec::with_capacity(18 + signature.len());
             wire.extend_from_slice(&covered.to_be_bytes());
             wire.push(algorithm);
@@ -325,10 +298,10 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "NSEC3" => {
             need(6)?;
             let mut wire = nsec3_head(&toks[0], &toks[1], &toks[2], &toks[3], "NSEC3")?;
-            let next = base32hex_decode(&toks[4])
-                .ok_or("NSEC3 레코드의 다음 해시가 올바른 base32hex가 아닙니다")?;
-            let len = u8::try_from(next.len())
-                .map_err(|_| "NSEC3 레코드의 다음 해시가 너무 깁니다".to_string())?;
+            let next =
+                base32hex_decode(&toks[4]).ok_or("NSEC3 next hash is not valid base32hex")?;
+            let len =
+                u8::try_from(next.len()).map_err(|_| "NSEC3 next hash is too long".to_string())?;
             wire.push(len);
             wire.extend_from_slice(&next);
             wire.extend_from_slice(&type_bitmap(&toks[5..])?);
@@ -336,17 +309,10 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         }
         "DS" | "CDS" => {
             need(4)?;
-            let key_tag: u16 = toks[0]
-                .parse()
-                .map_err(|_| "DS 레코드의 키 태그가 올바르지 않습니다")?;
-            let algorithm: u8 = toks[1]
-                .parse()
-                .map_err(|_| "DS 레코드의 알고리즘 값이 올바르지 않습니다")?;
-            let digest_type: u8 = toks[2]
-                .parse()
-                .map_err(|_| "DS 레코드의 다이제스트 유형이 올바르지 않습니다")?;
-            let digest = hex_decode(&toks[3..].join(""))
-                .ok_or("DS 레코드의 16진수 다이제스트가 올바르지 않습니다")?;
+            let key_tag: u16 = toks[0].parse().map_err(|_| "Invalid DS key tag")?;
+            let algorithm: u8 = toks[1].parse().map_err(|_| "Invalid DS algorithm")?;
+            let digest_type: u8 = toks[2].parse().map_err(|_| "Invalid DS digest type")?;
+            let digest = hex_decode(&toks[3..].join("")).ok_or("Invalid DS hex digest")?;
             let mut wire = Vec::with_capacity(4 + digest.len());
             wire.extend_from_slice(&key_tag.to_be_bytes());
             wire.push(algorithm);
@@ -363,20 +329,15 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         }
         "ZONEMD" => {
             need(4)?;
-            let serial: u32 = toks[0]
-                .parse()
-                .map_err(|_| "ZONEMD 레코드의 serial이 올바르지 않습니다")?;
-            let scheme: u8 = toks[1]
-                .parse()
-                .map_err(|_| "ZONEMD 레코드의 방식 값이 올바르지 않습니다")?;
+            let serial: u32 = toks[0].parse().map_err(|_| "Invalid ZONEMD serial")?;
+            let scheme: u8 = toks[1].parse().map_err(|_| "Invalid ZONEMD scheme")?;
             let hash_alg: u8 = toks[2]
                 .parse()
-                .map_err(|_| "ZONEMD 레코드의 해시 알고리즘 값이 올바르지 않습니다")?;
-            let digest = hex_decode(&toks[3..].join(""))
-                .ok_or("ZONEMD 레코드의 16진수 다이제스트가 올바르지 않습니다")?;
+                .map_err(|_| "Invalid ZONEMD hash algorithm")?;
+            let digest = hex_decode(&toks[3..].join("")).ok_or("Invalid ZONEMD hex digest")?;
             if digest.len() < ZONEMD_MIN_DIGEST {
                 return Err(format!(
-                    "ZONEMD 레코드의 다이제스트는 {ZONEMD_MIN_DIGEST}바이트 이상이어야 합니다"
+                    "ZONEMD digest must be at least {ZONEMD_MIN_DIGEST} bytes"
                 ));
             }
             let mut wire = Vec::with_capacity(6 + digest.len());
@@ -389,12 +350,8 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "NAPTR" => {
             need(6)?;
             RData::Naptr(Box::new(onetdns_proto::Naptr {
-                order: toks[0]
-                    .parse()
-                    .map_err(|_| "NAPTR 레코드의 순서 값이 올바르지 않습니다")?,
-                preference: toks[1]
-                    .parse()
-                    .map_err(|_| "NAPTR 레코드의 우선순위가 올바르지 않습니다")?,
+                order: toks[0].parse().map_err(|_| "Invalid NAPTR order")?,
+                preference: toks[1].parse().map_err(|_| "Invalid NAPTR preference")?,
                 flags: unescape_char_string(&toks[2]),
                 services: unescape_char_string(&toks[3]),
                 regexp: unescape_char_string(&toks[4]),
@@ -404,20 +361,14 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
         "URI" => {
             need(3)?;
             RData::Uri {
-                priority: toks[0]
-                    .parse()
-                    .map_err(|_| "URI 레코드의 우선순위가 올바르지 않습니다")?,
-                weight: toks[1]
-                    .parse()
-                    .map_err(|_| "URI 레코드의 가중치가 올바르지 않습니다")?,
+                priority: toks[0].parse().map_err(|_| "Invalid URI priority")?,
+                weight: toks[1].parse().map_err(|_| "Invalid URI weight")?,
                 target: unescape_char_string(&toks[2..].join(" ")),
             }
         }
         "SVCB" | "HTTPS" => {
             need(2)?;
-            let priority: u16 = toks[0]
-                .parse()
-                .map_err(|_| "SVCB 레코드의 우선순위가 올바르지 않습니다")?;
+            let priority: u16 = toks[0].parse().map_err(|_| "Invalid SVCB priority")?;
             let target = parse_name(&toks[1], origin)?;
             let mut params = Vec::new();
             for t in &toks[2..] {
@@ -452,30 +403,29 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
                     need(2)?;
                     let len: usize = toks[1]
                         .parse()
-                        .map_err(|_| "\\# 길이가 올바르지 않습니다".to_string())?;
+                        .map_err(|_| "Invalid \\# length".to_string())?;
                     let hex: String = toks[2..].concat();
-                    let bytes = hex_decode(&hex)
-                        .ok_or("RFC 3597 형식의 16진수 데이터가 올바르지 않습니다")?;
+                    let bytes = hex_decode(&hex).ok_or("Invalid RFC 3597 hex data")?;
                     if bytes.len() != len {
                         return Err(format!(
-                            "\\# 길이가 일치하지 않습니다: 선언 {len} 실제 {}",
+                            "\\# length mismatch: declared {len}, actual {}",
                             bytes.len()
                         ));
                     }
                     RData::Unknown(num, bytes)
                 } else {
                     return Err(format!(
-                        "TYPE{num} 레코드는 RFC 3597의 \\# 형식으로 입력해야 합니다"
+                        "TYPE{num} records must use the RFC 3597 \\# format"
                     ));
                 }
             } else {
-                return Err(format!("지원하지 않는 레코드 유형: {other}"));
+                return Err(format!("Unsupported record type: {other}"));
             }
         }
     };
     let _ = RecordType::A;
     rd.validate()
-        .map_err(|error| format!("{rtype} rdata 오류: {error}"))?;
+        .map_err(|error| format!("Invalid {rtype} RDATA: {error}"))?;
     Ok(rd)
 }
 
@@ -509,14 +459,14 @@ fn parse_name(tok: &str, origin: &Name) -> Result<Name, String> {
         return Ok(origin.clone());
     }
     if tok.ends_with('.') && !tok.ends_with(r"\.") {
-        return Name::from_str(tok).map_err(|_| format!("잘못된 이름: {tok}"));
+        return Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"));
     }
     // origin은 라벨로 이어 붙인다. 표시 문자열로 합치면 이스케이프가 필요한 바이트가
     // 그대로 섞여 들어가 다시 읽을 때 라벨 경계가 달라진다.
-    let relative = Name::from_str(tok).map_err(|_| format!("잘못된 이름: {tok}"))?;
+    let relative = Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"))?;
     let mut labels: Vec<Vec<u8>> = relative.labels().map(<[u8]>::to_vec).collect();
     labels.extend(origin.labels().map(<[u8]>::to_vec));
-    Name::from_labels(labels).map_err(|_| format!("잘못된 이름: {tok}"))
+    Name::from_labels(labels).map_err(|_| format!("Invalid name: {tok}"))
 }
 
 /**
@@ -544,14 +494,14 @@ fn parse_ttl(s: &str) -> Result<u32, String> {
                 'h' => 3600,
                 'd' => 86_400,
                 'w' => 604_800,
-                _ => return Err(format!("TTL 오류: {s}")),
+                _ => return Err(format!("Invalid TTL: {s}")),
             };
             total = total.saturating_add(num.saturating_mul(mult));
             num = 0;
         }
     }
     if !saw {
-        return Err(format!("TTL 오류: {s}"));
+        return Err(format!("Invalid TTL: {s}"));
     }
     total = total.saturating_add(num);
     Ok(total.min(u32::MAX as u64) as u32)
@@ -691,7 +641,7 @@ fn tokenize(s: &str) -> Vec<String> {
  * @details 이름을 아는 종류는 약칭으로, 그 밖은 TYPEnnn으로 적힌다.
  */
 fn rrsig_covered_type(tok: &str) -> Result<u16, String> {
-    type_number(tok).ok_or_else(|| format!("RRSIG가 덮는 종류를 알 수 없습니다: {tok}"))
+    type_number(tok).ok_or_else(|| format!("Unknown type covered by RRSIG: {tok}"))
 }
 
 /**
@@ -721,7 +671,7 @@ fn type_number(tok: &str) -> Option<u16> {
 fn type_bitmap(toks: &[String]) -> Result<Vec<u8>, String> {
     let mut windows: std::collections::BTreeMap<u8, [u8; 32]> = std::collections::BTreeMap::new();
     for tok in toks {
-        let number = type_number(tok).ok_or_else(|| format!("알 수 없는 종류입니다: {tok}"))?;
+        let number = type_number(tok).ok_or_else(|| format!("Unknown type: {tok}"))?;
         let window = (number >> 8) as u8;
         let bit = (number & 0xff) as usize;
         let bytes = windows.entry(window).or_insert([0u8; 32]);
@@ -753,20 +703,19 @@ fn nsec3_head(
 ) -> Result<Vec<u8>, String> {
     let hash: u8 = hash
         .parse()
-        .map_err(|_| format!("{rtype} 레코드의 해시 알고리즘이 올바르지 않습니다"))?;
+        .map_err(|_| format!("Invalid {rtype} hash algorithm"))?;
     let flags: u8 = flags
         .parse()
-        .map_err(|_| format!("{rtype} 레코드의 플래그가 올바르지 않습니다"))?;
+        .map_err(|_| format!("Invalid {rtype} flags"))?;
     let iterations: u16 = iterations
         .parse()
-        .map_err(|_| format!("{rtype} 레코드의 반복 횟수가 올바르지 않습니다"))?;
+        .map_err(|_| format!("Invalid {rtype} iteration count"))?;
     let salt = if salt == "-" {
         Vec::new()
     } else {
-        hex_decode(salt).ok_or_else(|| format!("{rtype} 레코드의 소금이 16진수가 아닙니다"))?
+        hex_decode(salt).ok_or_else(|| format!("{rtype} salt is not hex"))?
     };
-    let salt_len =
-        u8::try_from(salt.len()).map_err(|_| format!("{rtype} 레코드의 소금이 너무 깁니다"))?;
+    let salt_len = u8::try_from(salt.len()).map_err(|_| format!("{rtype} salt is too long"))?;
     let mut wire = Vec::with_capacity(5 + salt.len());
     wire.push(hash);
     wire.push(flags);
@@ -808,7 +757,7 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     if tok.len() != 14 || !tok.bytes().all(|b| b.is_ascii_digit()) {
         return tok
             .parse::<u32>()
-            .map_err(|_| format!("RRSIG 레코드의 시각이 올바르지 않습니다: {tok}"));
+            .map_err(|_| format!("Invalid RRSIG time: {tok}"));
     }
     let field = |range: std::ops::Range<usize>| -> u64 { tok[range].parse().unwrap_or(0) };
     let (year, month, day) = (field(0..4), field(4..6), field(6..8));
@@ -819,7 +768,7 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
         || minute > 59
         || second > 60
     {
-        return Err(format!("RRSIG 레코드의 시각이 올바르지 않습니다: {tok}"));
+        return Err(format!("Invalid RRSIG time: {tok}"));
     }
     // 1970-01-01부터의 일수. 3월을 한 해의 시작으로 옮겨 윤년 보정을 한 줄로 만든다.
     let shifted_year = if month <= 2 { year - 1 } else { year };
@@ -830,7 +779,7 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = (era * 146_097 + day_of_era) as i64 - 719_468;
     let seconds = days * 86_400 + (hour * 3600 + minute * 60 + second) as i64;
-    u32::try_from(seconds).map_err(|_| format!("RRSIG 레코드의 시각이 범위를 벗어납니다: {tok}"))
+    u32::try_from(seconds).map_err(|_| format!("RRSIG time is out of range: {tok}"))
 }
 
 /**
@@ -898,7 +847,7 @@ fn svcb_key_of(name: &str) -> Result<u16, String> {
     }
     name.strip_prefix("key")
         .and_then(|digits| digits.parse::<u16>().ok())
-        .ok_or_else(|| format!("SVCB 레코드의 매개변수 키가 올바르지 않습니다: {name}"))
+        .ok_or_else(|| format!("Invalid SVCB parameter key: {name}"))
 }
 
 /**
@@ -916,7 +865,7 @@ fn split_escaped_list(value: &[u8]) -> Vec<Vec<u8>> {
             b'\\' if i + 1 < value.len() => {
                 items
                     .last_mut()
-                    .expect("항목은 늘 하나 이상")
+                    .expect("There is always at least one item")
                     .push(value[i + 1]);
                 i += 2;
             }
@@ -925,7 +874,10 @@ fn split_escaped_list(value: &[u8]) -> Vec<Vec<u8>> {
                 i += 1;
             }
             byte => {
-                items.last_mut().expect("항목은 늘 하나 이상").push(byte);
+                items
+                    .last_mut()
+                    .expect("There is always at least one item")
+                    .push(byte);
                 i += 1;
             }
         }
@@ -946,7 +898,7 @@ fn split_escaped_list(value: &[u8]) -> Vec<Vec<u8>> {
 fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String> {
     let key = svcb_key_of(name)?;
     let raw = value.map(unescape_char_string).unwrap_or_default();
-    let missing = |what: &str| format!("SVCB 레코드의 {what} 값이 없습니다");
+    let missing = |what: &str| format!("SVCB {what} has no value");
 
     let wire = match key {
         0 => {
@@ -956,7 +908,7 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
             let mut keys = Vec::new();
             for item in split_escaped_list(&raw) {
                 let item = String::from_utf8(item)
-                    .map_err(|_| "SVCB 레코드 mandatory 값이 올바르지 않습니다".to_string())?;
+                    .map_err(|_| "Invalid SVCB mandatory value".to_string())?;
                 keys.push(svcb_key_of(&item)?);
             }
             keys.sort_unstable();
@@ -970,7 +922,7 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
             let mut out = Vec::new();
             for id in split_escaped_list(&raw) {
                 if id.is_empty() || id.len() > 255 {
-                    return Err("SVCB 레코드 alpn 항목의 길이가 올바르지 않습니다".to_string());
+                    return Err("Invalid SVCB alpn entry length".to_string());
                 }
                 out.push(id.len() as u8);
                 out.extend_from_slice(&id);
@@ -979,15 +931,13 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
         }
         2 => {
             if !raw.is_empty() {
-                return Err("SVCB 레코드 no-default-alpn은 값을 갖지 않습니다".to_string());
+                return Err("SVCB no-default-alpn takes no value".to_string());
             }
             Vec::new()
         }
         3 => {
             let text = String::from_utf8(raw).map_err(|_| missing("port"))?;
-            let port: u16 = text
-                .parse()
-                .map_err(|_| "SVCB 레코드 port 값이 올바르지 않습니다".to_string())?;
+            let port: u16 = text.parse().map_err(|_| "Invalid SVCB port".to_string())?;
             port.to_be_bytes().to_vec()
         }
         4 | 6 => {
@@ -996,17 +946,17 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
             }
             let mut out = Vec::new();
             for item in split_escaped_list(&raw) {
-                let text = String::from_utf8(item)
-                    .map_err(|_| "SVCB 레코드 주소 힌트가 올바르지 않습니다".to_string())?;
+                let text =
+                    String::from_utf8(item).map_err(|_| "Invalid SVCB address hint".to_string())?;
                 if key == 4 {
-                    let ip: std::net::Ipv4Addr = text.parse().map_err(|_| {
-                        format!("SVCB 레코드 ipv4hint 주소가 올바르지 않습니다: {text}")
-                    })?;
+                    let ip: std::net::Ipv4Addr = text
+                        .parse()
+                        .map_err(|_| format!("Invalid SVCB ipv4hint address: {text}"))?;
                     out.extend_from_slice(&ip.octets());
                 } else {
-                    let ip: std::net::Ipv6Addr = text.parse().map_err(|_| {
-                        format!("SVCB 레코드 ipv6hint 주소가 올바르지 않습니다: {text}")
-                    })?;
+                    let ip: std::net::Ipv6Addr = text
+                        .parse()
+                        .map_err(|_| format!("Invalid SVCB ipv6hint address: {text}"))?;
                     out.extend_from_slice(&ip.octets());
                 }
             }
@@ -1014,7 +964,7 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
         }
         5 => {
             let text = String::from_utf8(raw).map_err(|_| missing("ech"))?;
-            base64_decode(&text).ok_or("SVCB 레코드 ech 값이 올바른 base64가 아닙니다")?
+            base64_decode(&text).ok_or("SVCB ech value is not valid base64")?
         }
         _ => raw,
     };
