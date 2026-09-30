@@ -48,6 +48,45 @@ pub fn read_zone_text(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", path.display()))
 }
 
+/**
+ * @brief zone 파일 내용의 지문.
+ * @details 메모리의 zone이 어느 파일 내용에서 왔는지 나타낸다. 이 서버가 파일을 고쳐 쓰기
+ *          전에 지금 파일의 지문과 비교해, 밖에서 고친 내용을 덮어쓰지 않는다. 수정 시각은
+ *          해상도가 거칠고 편집기가 보존하기도 하므로 내용으로 비교한다.
+ */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceDigest([u8; 32]);
+
+impl SourceDigest {
+    /** @brief 파일 내용의 지문. */
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::Digest;
+        Self(sha2::Sha256::digest(bytes).into())
+    }
+
+    /**
+     * @brief 지금 파일의 지문.
+     * @return 파일이 없으면 없음. 있는데 읽지 못하면 실패.
+     */
+    pub fn of_file(path: &Path) -> Result<Option<Self>, String> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+            Ok(_) => {
+                read_file_limited(path, MAX_ZONE_FILE, "zone").map(|bytes| Some(Self::of(&bytes)))
+            }
+        }
+    }
+}
+
+/** @brief zone 파일을 읽어 파싱하고 그 내용의 지문을 붙인다. */
+pub fn load_zone_file(path: &Path, default_origin: &str) -> Result<Zone, String> {
+    let text = read_zone_text(path)?;
+    parse_zone(&text, default_origin)
+        .map(|zone| zone.with_source_digest(SourceDigest::of(text.as_bytes())))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 use crate::{parse_zone, Zone, ZoneStore};
 
 /** @brief zone 공급자. 모든 백엔드가 이 세 가지만 제공하면 된다. */
@@ -94,16 +133,12 @@ impl ZoneSource for FileZoneSource {
     fn load(&self) -> Result<ZoneStore, String> {
         let mut store = ZoneStore::new();
         for (origin, path) in &self.zones {
-            let text = read_zone_text(path)?;
             let o = if origin.is_empty() {
                 "."
             } else {
                 origin.as_str()
             };
-            match parse_zone(&text, o) {
-                Ok(z) => store.add(z),
-                Err(e) => return Err(format!("{}: {e}", path.display())),
-            }
+            store.add(load_zone_file(path, o)?);
         }
         Ok(store)
     }
@@ -182,13 +217,8 @@ impl ZoneSource for DirZoneSource {
     fn load(&self) -> Result<ZoneStore, String> {
         let mut store = ZoneStore::new();
         for path in self.zone_files()? {
-            let text = read_zone_text(&path)?;
-
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(".");
-            match parse_zone(&text, stem) {
-                Ok(z) => store.add(z),
-                Err(e) => return Err(format!("{}: {e}", path.display())),
-            }
+            store.add(load_zone_file(&path, stem)?);
         }
         Ok(store)
     }

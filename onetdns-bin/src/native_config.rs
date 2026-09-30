@@ -365,20 +365,24 @@ pub(crate) fn build_authority_settings(cfg: &Config) -> Result<native::Authority
         update_allow: cfg.update_allow.clone(),
         update_policy: build_update_policy(cfg)?,
         update_tsig_required: cfg.update_tsig_required,
-        zone_files: cfg
+        update_targets: cfg
             .zones
             .iter()
-            .filter_map(|zone| {
-                let file = zone.file.clone()?;
-                let origin = onetdns_proto::Name::from_str(&zone.origin).ok()?;
-                Some((origin, file))
+            .map(|zone| {
+                let file = zone
+                    .file
+                    .clone()
+                    .ok_or_else(|| format!("DNS zone '{}' has no file setting", zone.origin))?;
+                let origin = if zone.origin.is_empty() {
+                    "."
+                } else {
+                    zone.origin.as_str()
+                };
+                let origin = onetdns_proto::Name::from_str(origin)
+                    .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
+                Ok(native::UpdateTarget { origin, file })
             })
-            .collect(),
-        update_zones: cfg
-            .zones
-            .iter()
-            .filter_map(|zone| onetdns_proto::Name::from_str(&zone.origin).ok())
-            .collect(),
+            .collect::<Result<_, String>>()?,
         notify_secondaries,
         notify_catalog_primaries,
         zone_signers,

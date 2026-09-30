@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use onetdns_authority::source::SourceDigest;
 use onetdns_config::Config;
 use onetdns_core::MutexExt;
 
@@ -125,7 +126,8 @@ pub(crate) fn build_zone_store(
             ));
         }
         onetdns_core::info!(event = "authority.zones_loaded_config", origin = %zone.origin().to_ascii_lower(), "Loaded authoritative DNS zone from the configuration file");
-        store.add(zone);
+        // 서명은 영역을 새로 만들므로 지문은 서명한 뒤에 붙인다.
+        store.add(zone.with_source_digest(SourceDigest::of(text.as_bytes())));
     }
 
     if let Some(dir) = &cfg.zones_dir {
@@ -928,6 +930,44 @@ pub(crate) fn resolve_zone_name(s: &str, origin: &str) -> Option<onetdns_proto::
     }
 }
 
+/**
+ * @brief 파일이 이 서버가 마지막으로 본 내용 그대로인지 확인한다.
+ * @details base 는 지금 메모리에 있는 영역이다. 그 영역이 파일에서 왔으면 지금 파일의 지문이
+ *          그 지문과 같아야 하고, 파일에서 오지 않았으면 파일이 없어야 한다. 다르면 밖에서
+ *          파일을 고친 것이다. 그대로 쓰거나 지우면 그 편집이 사라지고, 감시 작업이 나중에
+ *          읽는 것도 이미 덮인 파일이다.
+ * @warning 확인한 뒤 쓰기 전에 끼어드는 외부 쓰기까지 막지는 못한다.
+ */
+pub(crate) fn ensure_zone_file_unchanged(
+    path: &std::path::Path,
+    base: Option<&onetdns_authority::Zone>,
+) -> Result<(), String> {
+    if SourceDigest::of_file(path)? == base.and_then(onetdns_authority::Zone::source_digest) {
+        return Ok(());
+    }
+    Err(format!(
+        "DNS zone file '{}' was changed outside this server after it was last loaded, so the change was not saved. The file is reloaded shortly; retry after that",
+        path.display()
+    ))
+}
+
+/**
+ * @brief 고친 영역을 파일에 쓴다. 파일이 이 서버가 마지막으로 본 내용 그대로일 때만 쓴다.
+ * @param base 지금 메모리에 있는 영역. 새로 만드는 영역이면 없다.
+ * @return 쓴 내용의 지문을 붙인 영역.
+ */
+pub(crate) fn persist_zone(
+    path: &std::path::Path,
+    base: Option<&onetdns_authority::Zone>,
+    zone: onetdns_authority::Zone,
+) -> Result<onetdns_authority::Zone, String> {
+    ensure_zone_file_unchanged(path, base)?;
+    let text = zone.to_master_file();
+    crate::atomic_file::atomic_write(path, text.as_bytes())
+        .map_err(|e| format!("Could not save to the file ({}): {e}", path.display()))?;
+    Ok(zone.with_source_digest(SourceDigest::of(text.as_bytes())))
+}
+
 /** @brief 영역을 고친다. */
 pub(crate) fn apply_zone_mutation(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
@@ -990,12 +1030,9 @@ pub(crate) fn apply_zone_mutation_locked(
     let serial = new_zone.soa().serial;
     let records = new_zone.axfr_records().len().saturating_sub(2);
 
-    let persisted = if let Some(path) = persist_path {
-        crate::atomic_file::atomic_write(path, new_zone.to_master_file().as_bytes())
-            .map_err(|e| format!("Could not save to the file ({}): {e}", path.display()))?;
-        true
-    } else {
-        false
+    let (new_zone, persisted) = match persist_path {
+        Some(path) => (persist_zone(path, old_zone.as_ref(), new_zone)?, true),
+        None => (new_zone, false),
     };
 
     swap_zone(store, journals, new_zone.clone());
@@ -1580,6 +1617,70 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(store.load().zones()[0].soa().serial, 1);
         assert!(journal.lock_recover().is_empty());
+    }
+
+    #[test]
+    /**
+     * @brief 관리 API 와 재서명도 밖에서 고친 영역 파일을 덮어쓰지 않는지.
+     * @details 메모리에 없는 영역을 새로 만들 때도, 같은 이름의 파일이 이미 있으면 쓰지 않는다.
+     *          감시 작업이 아직 읽지 않은 파일일 수 있다.
+     */
+    fn zone_mutation_refuses_to_overwrite_an_externally_edited_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-zone-digest-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edit.test.zone");
+        std::fs::write(
+            &path,
+            "$ORIGIN edit.test.\n@ IN SOA ns admin 1 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n",
+        )
+        .unwrap();
+        let mut zones = onetdns_authority::ZoneStore::new();
+        zones.add(onetdns_authority::source::load_zone_file(&path, "edit.test").unwrap());
+        let store = onetdns_core::ArcSwap::new(Arc::new(zones));
+        let journal: ZoneJournals = Arc::default();
+        let mutate = |serial| {
+            apply_zone_mutation(
+                &store,
+                tiny_zone("edit.test", serial),
+                &[],
+                &journal,
+                Some(&path),
+                &NotifySender::disabled(),
+                "test",
+            )
+        };
+
+        assert_eq!(mutate(2).unwrap().serial, 2);
+        assert_eq!(mutate(3).unwrap().serial, 3);
+
+        let edited = "$ORIGIN edit.test.\n@ IN SOA ns admin 9 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.9\n";
+        std::fs::write(&path, edited).unwrap();
+        assert!(mutate(4).is_err_and(|error| error.contains("changed outside this server")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(store.load().zones()[0].soa().serial, 3);
+
+        let unseen = dir.join("new.test.zone");
+        std::fs::write(&unseen, "not yet loaded\n").unwrap();
+        let created = apply_zone_mutation(
+            &store,
+            tiny_zone("new.test", 1),
+            &[],
+            &journal,
+            Some(&unseen),
+            &NotifySender::disabled(),
+            "test",
+        );
+        assert!(created.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&unseen).unwrap(),
+            "not yet loaded\n"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /** @brief 이름과 시리얼만 다른 작은 영역. */

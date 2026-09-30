@@ -214,6 +214,8 @@ pub struct Zone {
 
     /** @brief 전송용 와이어 템플릿. 처음 요청될 때 한 번만 만든다. */
     axfr_wire: Arc<OnceLock<Result<Box<[Box<[u8]>]>, ProtoError>>>,
+    /** @brief 이 내용을 읽어 오거나 써 넣은 파일의 지문. 파일에서 오지 않았으면 없다. */
+    source: Option<source::SourceDigest>,
 }
 
 /** @brief 아레나 안 레코드 하나의 위치. 소유자 키와 그 안에서의 곳이다. */
@@ -980,7 +982,23 @@ impl Zone {
             simple_nxdomain,
             denial_index,
             axfr_wire: Arc::new(OnceLock::new()),
+            source: None,
         })
+    }
+
+    /** @brief 이 내용이 어느 파일 내용에서 왔는지. 파일에서 오지 않았으면 없다. */
+    pub fn source_digest(&self) -> Option<source::SourceDigest> {
+        self.source
+    }
+
+    /**
+     * @brief 이 내용을 읽어 오거나 써 넣은 파일의 지문을 붙인다.
+     * @details 파일을 고쳐 쓰는 쪽은 쓰기 전에 지금 파일의 지문이 이 값과 같은지 확인한다.
+     *          다르면 이 서버가 모르는 사이에 파일이 바뀐 것이다.
+     */
+    pub fn with_source_digest(mut self, digest: source::SourceDigest) -> Self {
+        self.source = Some(digest);
+        self
     }
 
     /**

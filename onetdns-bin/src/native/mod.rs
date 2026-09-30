@@ -992,13 +992,26 @@ pub struct NativeServer {
     pub lane_switch: Arc<LaneSwitch>,
 }
 
+#[derive(Clone)]
+/**
+ * @brief 원격 업데이트를 받는 영역 하나.
+ * @details 영역과 저장할 파일을 한 값으로 묶는다. 업데이트는 받는데 저장할 곳이 없는 영역은
+ *          다시 읽을 때 변경이 사라지므로, 그런 상태를 만들 수 없게 한다. 파일이 아닌 원본에서
+ *          온 영역은 그 원본에 쓰는 방법이 따로 있어야 하므로 여기 들어오지 않는다.
+ */
+pub struct UpdateTarget {
+    /** @brief 영역 이름. */
+    pub origin: ApName,
+    /** @brief 고친 내용을 저장할 파일. */
+    pub file: std::path::PathBuf,
+}
+
 #[derive(Clone, Default)]
 /**
  * @brief 권한 영역을 다루는 설정 세트.
  *
  * @details 영역 목록이 바뀌면 전송 허용 대역·서명 키·고칠 수 있는 영역·저장 경로가
  *          함께 바뀐다. 하나씩 교체하면 그 사이에 서로 어긋난 상태로 요청을 받는다.
- * @invariant zone_files와 update_zones는 같은 영역 목록에서 나온다.
  */
 pub struct AuthoritySettings {
     /** @brief 영역 전송을 허용할 대역. */
@@ -1013,10 +1026,8 @@ pub struct AuthoritySettings {
     pub update_policy: Vec<UpdateRule>,
     /** @brief 원격 업데이트에 서명을 요구할지. */
     pub update_tsig_required: bool,
-    /** @brief 영역별 파일 경로. 고친 뒤 저장할 곳이다. */
-    pub zone_files: Vec<(ApName, std::path::PathBuf)>,
-    /** @brief 원격으로 고칠 수 있는 영역들. */
-    pub update_zones: Vec<ApName>,
+    /** @brief 원격으로 고칠 수 있는 영역들과 고친 내용을 저장할 파일. */
+    pub update_targets: Vec<UpdateTarget>,
     /** @brief NOTIFY를 받아들일 보조 영역과 그 주 서버, 기대하는 TSIG 키. */
     pub notify_secondaries: Vec<(ApName, IpAddr, Option<ApName>)>,
     /**
@@ -1348,14 +1359,12 @@ impl NativeServer {
         self,
         allow: Vec<IpNet>,
         tsig_required: bool,
-        zone_files: Vec<(ApName, std::path::PathBuf)>,
-        update_zones: Vec<ApName>,
+        targets: Vec<UpdateTarget>,
     ) -> Self {
         self.edit_authority(|a| {
             a.update_allow = allow;
             a.update_tsig_required = tsig_required;
-            a.zone_files = zone_files;
-            a.update_zones = update_zones;
+            a.update_targets = targets;
         });
         self
     }

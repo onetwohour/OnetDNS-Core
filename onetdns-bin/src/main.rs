@@ -3146,6 +3146,132 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 효과 단계의 뒤쪽 효과가 실패하면 앞에서 이미 일으킨 효과까지 되돌리는지.
+     * @details 수신 주소를 하나 더 여는 효과는 성공하고, 그 뒤에 관리 주소를 이미 쓰이는 포트로
+     *          옮기는 효과가 실패한다. 새로 연 주소가 남아 있으면 설정 파일에 없는 주소로 답한다.
+     *          원래 수신 주소는 이전 차단 규칙으로 계속 답해야 한다.
+     */
+    fn failed_hot_apply_effect_undoes_the_effects_that_already_ran() {
+        let dns = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let added = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "onetdns-hot-apply-effects-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("OnetDNS.toml");
+        let text = format!(
+            "listen = [\"{dns}\"]\n\
+             do_tcp = false\n\
+             workers = 1\n\
+             backend = \"forward\"\n\
+             upstream_urls = [\"udp://192.0.2.1:53\"]\n\
+             block_rules = [\"||old.test^\"]\n\
+             control_listen = \"{control}\"\n\
+             control_token = \"hot-apply-test-token-0123456789\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::from_toml_str(&text).unwrap();
+
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let ready = ready.clone();
+            let stop = stop.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    Some(onetdns_core::SecretString::from(text)),
+                    Some(path),
+                    Default::default(),
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "server did not start");
+            assert!(!server.is_finished(), "server stopped before it was ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let snippet = format!(
+            "listen = [\"{dns}\", \"{added}\"]\n\
+             block_rules = [\"||old.test^\", \"||new.test^\"]\n\
+             control_listen = \"{occupied_addr}\"\n"
+        );
+        let applied = control_request(control, "POST", "/v1/config/apply", &snippet);
+        assert!(!applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(
+            applied.contains("Could not open the dashboard listening address"),
+            "{applied}"
+        );
+        assert!(!applied.contains("also failed"), "{applied}");
+
+        // 되돌리기가 소켓을 닫았으면 이 주소를 다시 열 수 있다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match UdpSocket::bind(added) {
+                Ok(_) => break,
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the listener opened by the failed apply is still bound: {error}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut query = vec![0x4f, 0x4e, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["old", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        client.send_to(&query, dns).unwrap();
+        let mut reply = [0u8; 512];
+        let (len, _) = client.recv_from(&mut reply).unwrap();
+        assert!(len >= 12 && reply[..2] == [0x4f, 0x4e] && reply[2] & 0x80 != 0);
+
+        let explained = control_request(control, "POST", "/v1/explain", "{\"qname\":\"old.test\"}");
+        assert!(explained.contains("\"filter\":\"block"), "{explained}");
+        let explained = control_request(control, "POST", "/v1/explain", "{\"qname\":\"new.test\"}");
+        assert!(explained.starts_with("HTTP/1.1 200"), "{explained}");
+        assert!(!explained.contains("\"filter\":\"block"), "{explained}");
+        let effective = control_request(control, "GET", "/v1/config/effective", "");
+        assert!(!effective.contains("new.test"), "{effective}");
+        assert!(!effective.contains(&added.to_string()), "{effective}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        drop(occupied);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     /** @brief 노드별 설정은 복제에서 빠지고, 서비스 동작을 정하는 설정은 복제되는지. */
     fn cluster_local_keys_cover_identity_secrets_and_paths_only() {
         for key in [

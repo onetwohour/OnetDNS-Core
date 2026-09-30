@@ -38,8 +38,9 @@ use crate::query_explain::{backend_label, explain_query, simulate_policy};
 use crate::tls_material::{acme_issue_run, inspect_tls_material, tls_configure};
 use crate::zones::ZoneState;
 use crate::zones::{
-    apply_zone_mutation, apply_zone_mutation_locked, remove_zone, resolve_zone_name,
-    zone_api_target, zone_record_json, zone_record_value, zone_records_without_closing_soa,
+    apply_zone_mutation, apply_zone_mutation_locked, ensure_zone_file_unchanged, remove_zone,
+    resolve_zone_name, zone_api_target, zone_record_json, zone_record_value,
+    zone_records_without_closing_soa,
 };
 use std::sync::atomic::Ordering;
 
@@ -2258,17 +2259,18 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let name = onetdns_proto::Name::from_str(origin)
                     .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
                 let mut journals = journal.lock().unwrap_or_else(|e| e.into_inner());
-                let exists = zs
-                    .load()
+                let store = zs.load();
+                let Some(zone) = store
                     .zones()
                     .iter()
-                    .any(|z| z.origin().eq_ignore_case(&name));
-                if !exists {
+                    .find(|z| z.origin().eq_ignore_case(&name))
+                else {
                     return Err(format!("DNS zone not found: {origin}"));
-                }
+                };
                 let path = target.path.clone();
                 let mut file_removed = false;
                 if let Some(p) = path {
+                    ensure_zone_file_unchanged(&p, Some(zone))?;
                     if p.exists() {
                         std::fs::remove_file(&p).map_err(|e| {
                             format!("Could not delete the DNS zone file ({}): {e}", p.display())

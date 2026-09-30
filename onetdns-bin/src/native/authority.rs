@@ -875,13 +875,13 @@ impl NativeServer {
         if zq.qclass != DnsClass::IN {
             return reply(9);
         }
-        if !authority
-            .update_zones
+        let Some(target) = authority
+            .update_targets
             .iter()
-            .any(|origin| origin.eq_ignore_case(&zq.name))
-        {
+            .find(|target| target.origin.eq_ignore_case(&zq.name))
+        else {
             return reply(9);
-        }
+        };
 
         let mut journals = self.journal.lock_recover();
         let store = store_swap.load();
@@ -1119,19 +1119,15 @@ impl NativeServer {
             }
         };
 
-        if let Some((_, path)) = authority
-            .zone_files
-            .iter()
-            .find(|(o, _)| o.eq_ignore_case(&apex))
-        {
-            if let Err(error) =
-                crate::atomic_file::atomic_write(path, new_zone.to_master_file().as_bytes())
-            {
+        let path = &target.file;
+        let new_zone = match crate::zones::persist_zone(path, Some(zone), new_zone) {
+            Ok(saved) => saved,
+            Err(error) => {
                 onetdns_core::error!(event = "authority.ddns_save_failed", zone = %apex.to_ascii_lower(), path = %path.display(), %error,
                     "Could not save a dynamic DNS update; reverted the change");
                 return reply(ResponseCode::ServFail.0);
             }
-        }
+        };
 
         let mut new_recs = new_zone.axfr_records();
         new_recs.pop();

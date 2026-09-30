@@ -2667,19 +2667,10 @@ fn axfr_large_zone_streams_multiple_envelopes() {
 #[test]
 /** @brief 원격 업데이트가 반영되고 시리얼이 오르는지. */
 fn ddns_update_applies_and_bumps_serial() {
-    let zone_text = "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n";
-    let zone = onetdns_authority::parse_zone(zone_text, "example.com").unwrap();
-    let mut zs = onetdns_authority::ZoneStore::new();
-    zs.add(zone);
-    let store = Arc::new(ArcSwap::new(Arc::new(zs)));
-    let srv = server("")
-        .with_xfr(store.clone(), vec!["127.0.0.0/8".parse().unwrap()])
-        .with_ddns(
-            vec!["127.0.0.0/8".parse().unwrap()],
-            false,
-            vec![],
-            vec![ApName::from_str("example.com").unwrap()],
-        );
+    let (store, srv, _file) = ddns_server(
+        "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n",
+        "example.com",
+    );
     let tcp = RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
         transport: RtTransport::Do53Tcp,
@@ -2743,19 +2734,10 @@ fn ddns_update_applies_and_bumps_serial() {
 #[test]
 /** @brief 선행 조건과 기록 모양을 확인하는지. 어긋난 것이 통과하면 영역이 깨진다. */
 fn ddns_enforces_prerequisite_sets_and_update_record_shape() {
-    let zone_text = "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 10 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nmulti IN A 10.0.0.2\nmulti IN A 10.0.0.3\n";
-    let zone = onetdns_authority::parse_zone(zone_text, "example.com").unwrap();
-    let mut zs = onetdns_authority::ZoneStore::new();
-    zs.add(zone);
-    let store = Arc::new(ArcSwap::new(Arc::new(zs)));
-    let srv = server("")
-        .with_xfr(store.clone(), vec!["127.0.0.0/8".parse().unwrap()])
-        .with_ddns(
-            vec!["127.0.0.0/8".parse().unwrap()],
-            false,
-            vec![],
-            vec![ApName::from_str("example.com").unwrap()],
-        );
+    let (store, srv, file) = ddns_server(
+        "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 10 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nmulti IN A 10.0.0.2\nmulti IN A 10.0.0.3\n",
+        "example.com",
+    );
     let tcp = RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
         transport: RtTransport::Do53Tcp,
@@ -2825,8 +2807,10 @@ fn ddns_enforces_prerequisite_sets_and_update_record_shape() {
         .with_ddns(
             vec!["127.0.0.0/8".parse().unwrap()],
             false,
-            vec![],
-            vec![ApName::from_str("primary-only.test").unwrap()],
+            vec![UpdateTarget {
+                origin: ApName::from_str("primary-only.test").unwrap(),
+                file: file.dir.join("primary-only.test.zone"),
+            }],
         );
     update.answers.clear();
     update.authorities.clear();
@@ -2837,22 +2821,154 @@ fn ddns_enforces_prerequisite_sets_and_update_record_shape() {
     );
 }
 
-/** @brief DDNS 갱신 판정에 쓸 영역과 서버를 새로 만든다. */
-#[allow(clippy::type_complexity)]
-fn ddns_fixture() -> (Arc<ArcSwap<onetdns_authority::ZoneStore>>, NativeServer) {
-    let zone_text = "$ORIGIN skip.test.\n$TTL 300\n@ IN SOA ns admin 10 300 60 86400 60\n@ IN NS ns\nns IN A 10.0.0.1\nmulti IN A 10.0.0.2\nsub IN NS ns.sub\nns.sub IN A 10.0.0.5\n";
+#[test]
+/**
+ * @brief 밖에서 고친 영역 파일을 동적 갱신이 덮어쓰지 않는지.
+ * @details 감시 작업이 파일 변경을 알아채기 전에 갱신이 들어오면, 메모리의 이전 영역에 갱신을
+ *          더해 파일에 쓰게 된다. 그러면 밖에서 고친 내용이 사라지고, 감시 작업이 나중에 읽는
+ *          것도 이미 덮인 파일이다.
+ */
+fn ddns_refuses_to_overwrite_an_externally_edited_zone_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "onetdns-ddns-digest-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("example.com.zone");
+    std::fs::write(
+        &path,
+        "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n",
+    )
+    .unwrap();
     let mut zs = onetdns_authority::ZoneStore::new();
-    zs.add(onetdns_authority::parse_zone(zone_text, "skip.test").unwrap());
+    zs.add(onetdns_authority::source::load_zone_file(&path, "example.com").unwrap());
+    let store = Arc::new(ArcSwap::new(Arc::new(zs)));
+    let origin = ApName::from_str("example.com").unwrap();
+    let srv = server("")
+        .with_xfr(store.clone(), vec!["127.0.0.0/8".parse().unwrap()])
+        .with_ddns(
+            vec!["127.0.0.0/8".parse().unwrap()],
+            false,
+            vec![UpdateTarget {
+                origin: origin.clone(),
+                file: path.clone(),
+            }],
+        );
+    let tcp = RequestCtx {
+        src: "127.0.0.1:5555".parse().unwrap(),
+        transport: RtTransport::Do53Tcp,
+        raw: None,
+        client_id: None,
+        authenticated: false,
+        auth_identity: None,
+    };
+    let add = |name: &str, last: u8| {
+        let mut up = Message::default();
+        up.header.opcode = 5;
+        up.questions.push(onetdns_proto::Question {
+            name: origin.clone(),
+            qtype: ApRt::SOA,
+            qclass: DnsClass::IN,
+        });
+        up.authorities.push(ApRecord::new(
+            ApName::from_str(name).unwrap(),
+            120,
+            ApRData::A(Ipv4Addr::new(10, 0, 0, last)),
+        ));
+        up
+    };
+
+    let first = srv.handle(&add("www.example.com", 9), &tcp).unwrap();
+    assert_eq!(first.header.rcode, ResponseCode::NoError.0);
+    let second = srv.handle(&add("api.example.com", 10), &tcp).unwrap();
+    assert_eq!(
+        second.header.rcode,
+        ResponseCode::NoError.0,
+        "the server's own write must not count as an outside edit"
+    );
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("api.example.com"));
+
+    let edited = "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 20 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nhand IN A 10.0.0.20\n";
+    std::fs::write(&path, edited).unwrap();
+    let refused = srv.handle(&add("late.example.com", 11), &tcp).unwrap();
+    assert_eq!(refused.header.rcode, ResponseCode::ServFail.0);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    assert_eq!(store.load().zones()[0].soa().serial, 3);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/** @brief 원격 업데이트를 받는 영역의 파일. 값이 사라질 때 파일도 지운다. */
+struct UpdateZoneFile {
+    /** @brief 파일을 담은 임시 디렉터리. */
+    dir: std::path::PathBuf,
+    /** @brief 업데이트 대상. */
+    target: UpdateTarget,
+}
+
+impl UpdateZoneFile {
+    /** @brief 영역 원문을 임시 파일에 쓰고, 그 파일에서 읽은 영역을 함께 돌려준다. */
+    fn new(text: &str, origin: &str) -> (Self, onetdns_authority::Zone) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-ddns-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{origin}.zone"));
+        std::fs::write(&file, text).unwrap();
+        let zone = onetdns_authority::source::load_zone_file(&file, origin).unwrap();
+        let target = UpdateTarget {
+            origin: ApName::from_str(origin).unwrap(),
+            file,
+        };
+        (Self { dir, target }, zone)
+    }
+}
+
+impl Drop for UpdateZoneFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/** @brief 이 영역 하나로 업데이트를 받는 저장소와 서버. */
+fn ddns_server(
+    text: &str,
+    origin: &str,
+) -> (
+    Arc<ArcSwap<onetdns_authority::ZoneStore>>,
+    NativeServer,
+    UpdateZoneFile,
+) {
+    let (file, zone) = UpdateZoneFile::new(text, origin);
+    let mut zs = onetdns_authority::ZoneStore::new();
+    zs.add(zone);
     let store = Arc::new(ArcSwap::new(Arc::new(zs)));
     let srv = server("")
         .with_xfr(store.clone(), vec!["127.0.0.0/8".parse().unwrap()])
         .with_ddns(
             vec!["127.0.0.0/8".parse().unwrap()],
             false,
-            vec![],
-            vec![ApName::from_str("skip.test").unwrap()],
+            vec![file.target.clone()],
         );
-    (store, srv)
+    (store, srv, file)
+}
+
+/** @brief DDNS 갱신 판정에 쓸 영역과 서버를 새로 만든다. */
+fn ddns_fixture() -> (
+    Arc<ArcSwap<onetdns_authority::ZoneStore>>,
+    NativeServer,
+    UpdateZoneFile,
+) {
+    ddns_server(
+        "$ORIGIN skip.test.\n$TTL 300\n@ IN SOA ns admin 10 300 60 86400 60\n@ IN NS ns\nns IN A 10.0.0.1\nmulti IN A 10.0.0.2\nsub IN NS ns.sub\nns.sub IN A 10.0.0.5\n",
+        "skip.test",
+    )
 }
 
 /** @brief 갱신부에 기록들을 담은 UPDATE 한 통. */
@@ -2903,7 +3019,7 @@ fn ddns_skips_only_the_conflicting_record() {
         auth_identity: None,
     };
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     let resp = srv
         .handle(
             &ddns_update(vec![
@@ -2938,7 +3054,7 @@ fn ddns_skips_only_the_conflicting_record() {
         "같은 메시지의 멀쩡한 갱신은 그대로 적용합니다"
     );
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     let cname = ApRecord::new(
         ApName::from_str("c1.skip.test").unwrap(),
         60,
@@ -2989,7 +3105,7 @@ fn ddns_skips_only_the_conflicting_record() {
         "CNAME 은 하나만 둘 수 있어 새 값이 이전 값을 대체합니다"
     );
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     let drop_ns = |owner: &str, target: &str| ApRecord {
         name: ApName::from_str(owner).unwrap(),
         rtype: ApRt::NS,
@@ -3033,7 +3149,7 @@ fn ddns_skips_only_the_conflicting_record() {
         "위임의 마지막 NS 는 지워야 위임을 걷을 수 있습니다"
     );
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     let wks = |bitmap: u8| ApRecord {
         name: ApName::from_str("wks.skip.test").unwrap(),
         rtype: ApRt(11),
@@ -3080,7 +3196,7 @@ fn ddns_reports_a_foreign_zone_class_as_notauth() {
         authenticated: false,
         auth_identity: None,
     };
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
 
     let mut foreign = ddns_update(vec![ApRecord::new(
         ApName::from_str("x.skip.test").unwrap(),
@@ -3157,7 +3273,7 @@ fn ddns_keeps_an_explicit_soa_serial() {
         )
     };
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     assert_eq!(
         srv.handle(&ddns_update(vec![soa_add(500)]), &tcp)
             .unwrap()
@@ -3171,7 +3287,7 @@ fn ddns_keeps_an_explicit_soa_serial() {
         "갱신이 지정한 일련번호 위에 서버가 또 올리지 않습니다"
     );
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     assert_eq!(
         srv.handle(
             &ddns_update(vec![
@@ -3195,7 +3311,7 @@ fn ddns_keeps_an_explicit_soa_serial() {
         "다른 변경이 함께 와도 지정한 일련번호를 씁니다"
     );
 
-    let (store, srv) = ddns_fixture();
+    let (store, srv, _file) = ddns_fixture();
     assert_eq!(
         srv.handle(&ddns_update(vec![soa_add(1)]), &tcp)
             .unwrap()
@@ -3634,7 +3750,7 @@ fn notify_uses_the_secondary_specific_tsig_identity() {
 /** @brief 고친 뒤 바뀐 부분만 보내는지. */
 fn ixfr_returns_incremental_after_ddns() {
     let zone_text = "$ORIGIN ix.test.\n$TTL 300\n@ IN SOA ns1 admin 10 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nold IN A 10.0.0.5\nkeep1 IN A 10.0.0.11\nkeep2 IN A 10.0.0.12\nkeep3 IN A 10.0.0.13\nkeep4 IN A 10.0.0.14\nkeep5 IN A 10.0.0.15\nkeep6 IN A 10.0.0.16\nkeep7 IN A 10.0.0.17\nkeep8 IN A 10.0.0.18\n";
-    let zone = onetdns_authority::parse_zone(zone_text, "ix.test").unwrap();
+    let (file, zone) = UpdateZoneFile::new(zone_text, "ix.test");
     let mut zs = onetdns_authority::ZoneStore::new();
     zs.add(zone);
     let store = Arc::new(ArcSwap::new(Arc::new(zs)));
@@ -3645,8 +3761,7 @@ fn ixfr_returns_incremental_after_ddns() {
         .with_ddns(
             vec!["127.0.0.0/8".parse().unwrap()],
             false,
-            vec![],
-            vec![ApName::from_str("ix.test").unwrap()],
+            vec![file.target.clone()],
         )
         .with_update_notify(Arc::new(move |origin, serial| {
             notified_sink

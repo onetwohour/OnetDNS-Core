@@ -20,7 +20,7 @@ use crate::config_edit::{
 };
 use crate::notify::NotifySender;
 use crate::zone_signing::SharedZoneSigners;
-use crate::zones::apply_zone_mutation;
+use crate::zones::apply_zone_mutation_locked;
 use crate::{config_keys, http, native, sleep_or_shutdown, ConfigTextSlot};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1077,13 +1077,15 @@ pub(crate) fn spawn_resign_timer(
             }
             let signers = zone_signers.load();
             for (origin, ctx) in signers.iter() {
-                let zone = {
-                    let cur = store.load();
-                    cur.zones()
-                        .iter()
-                        .find(|z| z.origin().eq_ignore_case(origin))
-                        .cloned()
-                };
+                // 영역을 잠금 아래에서 읽는다. 잠그기 전에 읽으면 그사이에 들어온 동적 갱신이
+                // 다시 서명한 이전 내용에 덮여 사라진다.
+                let mut journals = journal.lock_recover();
+                let zone = store
+                    .load()
+                    .zones()
+                    .iter()
+                    .find(|z| z.origin().eq_ignore_case(origin))
+                    .cloned();
                 let Some(zone) = zone else {
                     continue;
                 };
@@ -1091,15 +1093,17 @@ pub(crate) fn spawn_resign_timer(
                     .iter()
                     .find(|(candidate, _)| candidate.eq_ignore_case(origin))
                     .map(|(_, path)| path.as_path());
-                if let Err(error) = apply_zone_mutation(
+                let resigned = apply_zone_mutation_locked(
                     &store,
                     zone,
                     std::slice::from_ref(&(origin.clone(), ctx.clone())),
-                    &journal,
+                    &mut journals,
                     path,
                     &notify,
                     "dnssec resign",
-                ) {
+                );
+                drop(journals);
+                if let Err(error) = resigned {
                     onetdns_core::error!(event = "dnssec.resign_failed", zone = %origin.to_ascii_lower(), %error, "DNSSEC re-signing failed; keeping the existing signatures");
                 } else {
                     onetdns_core::info!(event = "dnssec.resigned", zone = %origin.to_ascii_lower(), "Re-signed RRSIGs and bumped the zone serial");
