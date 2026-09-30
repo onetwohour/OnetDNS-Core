@@ -11,7 +11,7 @@
  * @invariant 표의 키 집합은 onetdns_config::known_keys 와 정확히 같다. 테스트가 강제한다.
  */
 
-use crate::LaneFacts;
+use crate::native_config::LaneFacts;
 use onetdns_config::{BackendKind, Config, EcsMode};
 
 /**
@@ -675,19 +675,19 @@ static KEYS: &[KeySpec] = &[
         "ipset_name_v4",
         Hot(Chain),
         Node,
-        wire(|c, _| crate::ipset_layer_active(c)),
+        wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
     key(
         "ipset_name_v6",
         Hot(Chain),
         Node,
-        wire(|c, _| crate::ipset_layer_active(c)),
+        wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
     key(
         "ipset_domains",
         Hot(Chain),
         Node,
-        wire(|c, _| crate::ipset_layer_active(c)),
+        wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
     key(
         "cachedb_redis_host",

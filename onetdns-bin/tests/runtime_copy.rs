@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{collect, production_prefix, read, rel, root};
+use common::{collect, is_test_module_file, production_files, production_prefix, read, rel, root};
 use std::path::PathBuf;
 
 /** @brief 기록 호출이 이 아래로 떨어지면 기록 자체가 무너진 것으로 본다. */
@@ -135,6 +135,7 @@ fn production_sources() -> Vec<PathBuf> {
     for entry in entries.flatten() {
         collect(&entry.path().join("src"), "rs", &mut out);
     }
+    out.retain(|path| !is_test_module_file(path));
     out.sort();
     assert!(
         out.len() > 50,
@@ -487,17 +488,17 @@ fn the_structured_logger_keeps_its_fixed_fields() {
 fn user_facing_errors_avoid_implementation_wording() {
     let repo = root();
     let mut found = Vec::new();
+    let mut paths = production_files(&["onetdns-bin/src"]);
     for name in [
-        "onetdns-bin/src/main.rs",
-        "onetdns-bin/src/control_api.rs",
-        "onetdns-bin/src/hot_apply.rs",
-        "onetdns-bin/src/resolver_chain.rs",
-        "onetdns-bin/src/upstream.rs",
         "crates/onetdns-control/src/api.rs",
         "crates/onetdns-config/src/settings.rs",
         "crates/onetdns-filter/src/cache.rs",
     ] {
-        let text = read(&repo.join(name));
+        paths.push(repo.join(name));
+    }
+    for path in paths {
+        let name = rel(&path);
+        let text = read(&path);
         for (line, value) in string_literals(production_prefix(&text)) {
             if !has_korean(&value) {
                 continue;

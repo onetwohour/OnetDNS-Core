@@ -263,7 +263,7 @@ fn write_backup_atomic(path: &Path, adapter: &str, data: &[u8]) -> Result<(), St
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("백업 디렉터리 만들지 못했습니다: {e}"))?;
     }
-    crate::atomic_write(path, &backup_blob(adapter, data))
+    crate::atomic_file::atomic_write(path, &backup_blob(adapter, data))
         .map_err(|e| format!("DNS 백업 기록 실패: {e}"))
 }
 
@@ -747,7 +747,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = backup_file(&dir, "Ethernet-2");
-        crate::atomic_write(&path, &backup_blob("Ethernet-2", b"1.1.1.1")).unwrap();
+        crate::atomic_file::atomic_write(&path, &backup_blob("Ethernet-2", b"1.1.1.1")).unwrap();
 
         assert_eq!(read_backup(&path, "Ethernet-2").unwrap(), "1.1.1.1");
         assert!(read_backup(&path, "Ethernet_2").is_err());

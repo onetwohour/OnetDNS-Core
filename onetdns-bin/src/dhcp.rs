@@ -1395,7 +1395,7 @@ impl LeasePool {
             }
             text.push('\n');
         }
-        if let Err(e) = crate::atomic_write(path, text.as_bytes()) {
+        if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
             onetdns_core::warn!(event = "dhcp4.lease_save_failed", path = ?path, error = %e, "DHCP 임대 정보를 파일에 저장하지 못했습니다");
         }
     }
@@ -1414,7 +1414,7 @@ impl LeasePool {
             }
             text.push('\n');
         }
-        if let Err(e) = crate::atomic_write(path, text.as_bytes()) {
+        if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
             onetdns_core::warn!(event = "dhcp4.static_save_failed", path = ?path, error = %e, "DHCP 고정 할당 정보를 저장하지 못했습니다");
         }
     }

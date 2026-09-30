@@ -6,10 +6,49 @@
  */
 
 use super::*;
+use crate::atomic_file::{atomic_write, with_rollback_result};
+use crate::cluster::{
+    cluster_routed_write, parse_cluster_proposal, peer_cluster_status_json, raft_handle,
+    standalone_cluster_status_json, validate_raft_patch_scope, with_raft_identity,
+};
+use crate::config_apply::{
+    apply_config_edit_smart, config_changed_keys, config_status_json, config_write_lock,
+    desired_config_json, has_client_upstream_routes, is_hot_reload_config_change,
+    update_runtime_config, HotConfigApply, CONDITIONAL_HOT_RELOAD_CONFIG_KEYS,
+};
+use crate::config_edit::{
+    append_user_block, client_block_from_json, json_to_toml_literal, materialize_mode_acl_patch,
+    merge_config_snippet, persist_config_string_array, remove_client_block, remove_config_key,
+    remove_token_by_id, rewrite_config_kv, rewrite_config_string_array, rewrite_user_password_hash,
+    rewrites_to_toml, token_id, token_mask, update_client_disable, upstream_key, upstream_values,
+    validate_config_patch_values,
+};
+use crate::ctl::counts;
+use crate::edge::{
+    apply_lease_sync, apply_static_add, apply_static_remove, leases_json, static_reservations_json,
+};
+use crate::filter_runtime::FilterState;
+use crate::filters::{
+    active_subscription_urls, fetch_blocklist, fetch_blocklists_meta, mutate_user_rule,
+    persist_subscription_state, preset_list_kind, try_list_refresh_lock, SubMeta,
+};
+use crate::listeners::TlsSlots;
+use crate::native_config::{qtype_numbers, stable_resource_id};
+use crate::query_explain::{backend_label, explain_query, simulate_policy};
+use crate::tls_material::{acme_issue_run, inspect_tls_material, tls_configure};
+use crate::zones::ZoneState;
+use crate::zones::{
+    apply_zone_mutation, apply_zone_mutation_locked, remove_zone, resolve_zone_name,
+    zone_api_target, zone_record_json, zone_record_value, zone_records_without_closing_soa,
+};
 use std::sync::atomic::Ordering;
 
 /** @brief 관리 API 가 읽고 바꾸는 이 세대의 핸들. */
 pub(crate) struct ControlDeps {
+    /** @brief 권한 영역 상태. */
+    pub(crate) zones: ZoneState,
+    /** @brief 차단 엔진과 그 재료. */
+    pub(crate) filters: FilterState,
     /** @brief 실행 중 설정. */
     pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
     /** @brief 설정 파일 경로. 없으면 파일 없이 돈다. */
@@ -24,45 +63,10 @@ pub(crate) struct ControlDeps {
     pub(crate) applied_config_text: ConfigTextSlot,
     /** @brief 재시작 없이 설정을 교체한다. */
     pub(crate) hot_config_apply: HotConfigApply,
-    /** @brief 차단 엔진을 다시 만든다. */
-    pub(crate) rebuild: FilterRebuild,
-    /** @brief 구독 목록을 다시 받는다. */
-    pub(crate) refresh_url_lists:
-        Arc<dyn Fn() -> Result<(usize, usize), String> + Send + Sync + 'static>,
-    /** @brief 지금 쓰는 차단 엔진. */
-    pub(crate) filter: Arc<SharedFilter>,
-    /** @brief 관리 API 로 더한 차단과 허용 규칙. */
-    pub(crate) overlay: Arc<Mutex<(Vec<String>, Vec<String>)>>,
-    /** @brief 차단한 서비스 목록. */
-    pub(crate) service_set: Arc<Mutex<Vec<String>>>,
-    /** @brief 거부할 도메인 목록. */
-    pub(crate) refused_domains_state: Arc<Mutex<Vec<String>>>,
-    /** @brief 안전 검색을 켰는지. */
-    pub(crate) safe_search_flag: Arc<std::sync::atomic::AtomicBool>,
     /** @brief 정책 엔진. */
     pub(crate) policy_engine: Arc<native::GatedSwap<onetdns_policy::PolicyEngine>>,
     /** @brief 목록을 받을 때 쓰는 이름 해석기. */
     pub(crate) blocklist_resolver: http::HostResolver,
-    /** @brief 구독 주소. */
-    pub(crate) sub_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief 구독별로 받은 결과. */
-    pub(crate) sub_meta: Arc<Mutex<Vec<SubMeta>>>,
-    /** @brief 꺼 둔 구독 주소. */
-    pub(crate) sub_disabled: Arc<Mutex<Vec<String>>>,
-    /** @brief 구독 제목. */
-    pub(crate) sub_titles: Arc<Mutex<Vec<String>>>,
-    /** @brief 미리 정해 둔 목록 주소. */
-    pub(crate) preset_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief 목록 받기를 한 번에 하나만 하게 하는 잠금. */
-    pub(crate) list_refresh_lock: Arc<Mutex<()>>,
-    /** @brief 권한 영역 저장소. */
-    pub(crate) zone_store: Arc<ArcSwap<onetdns_authority::ZoneStore>>,
-    /** @brief 영역 서명 키. */
-    pub(crate) zone_signers: SharedZoneSigners,
-    /** @brief 영역별 IXFR 기록. */
-    pub(crate) ixfr_journal: Arc<Mutex<std::collections::HashMap<Vec<u8>, native::ZoneJournal>>>,
-    /** @brief 영역이 바뀌었을 때 NOTIFY 를 보낸다. */
-    pub(crate) notify_sender: NotifySender,
     /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
     pub(crate) dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
     /** @brief DHCPv6 임대 풀. 서비스가 꺼져 있으면 없다. */
@@ -86,6 +90,31 @@ pub(crate) struct ControlDeps {
 /** @brief 관리 API 콜백을 만든다. */
 pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
     let ControlDeps {
+        zones:
+            ZoneState {
+                store: zone_store,
+                signers: zone_signers,
+                journal: ixfr_journal,
+                notify: notify_sender,
+                ..
+            },
+        filters:
+            FilterState {
+                rebuild,
+                refresh_url_lists,
+                filter,
+                overlay,
+                service_set,
+                refused_domains: refused_domains_state,
+                safe_search: safe_search_flag,
+                sub_urls,
+                sub_meta,
+                sub_disabled,
+                sub_titles,
+                preset_urls,
+                list_refresh_lock,
+                ..
+            },
         runtime_cfg,
         config_path,
         cfg_text,
@@ -93,25 +122,8 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         config_prev,
         applied_config_text,
         hot_config_apply,
-        rebuild,
-        refresh_url_lists,
-        filter,
-        overlay,
-        service_set,
-        refused_domains_state,
-        safe_search_flag,
         policy_engine,
         blocklist_resolver,
-        sub_urls,
-        sub_meta,
-        sub_disabled,
-        sub_titles,
-        preset_urls,
-        list_refresh_lock,
-        zone_store,
-        zone_signers,
-        ixfr_journal,
-        notify_sender,
         dhcp_slot,
         dhcp6_slot,
         vendor_db,

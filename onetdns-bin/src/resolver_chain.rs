@@ -7,6 +7,12 @@
  */
 
 use super::*;
+use crate::edge::EdgeServices;
+use crate::native_config::{ipset_layer_active, recursion_offered_by};
+use crate::recursion::{
+    detect_dns53_interception, forward_trust_anchors, load_configured_trust_anchors, new_recursor,
+    recursor_roots, spawn_rfc5011, spawn_ta_signaling,
+};
 
 /**
  * @brief 해석 체인을 조립하는 데 필요한 설정 값.

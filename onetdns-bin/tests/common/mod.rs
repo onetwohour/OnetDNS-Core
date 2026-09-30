@@ -46,6 +46,36 @@ pub fn rust_sources(bases: &[&str]) -> Vec<PathBuf> {
     out
 }
 
+/**
+ * @brief 부모 모듈이 #[cfg(test)] 아래에서 선언한 파일인지.
+ * @details native/tests.rs 처럼 테스트만 담은 파일은 mod tests 로 감싸지 않으므로
+ *          production_prefix 로는 걸러지지 않는다. 선언한 쪽을 보고 판단한다.
+ */
+pub fn is_test_module_file(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let declaration = format!("mod {stem};");
+    [dir.join("mod.rs"), dir.with_extension("rs")]
+        .iter()
+        .filter_map(|parent| std::fs::read_to_string(parent).ok())
+        .any(|text| {
+            text.match_indices(&declaration)
+                .any(|(at, _)| text[..at].trim_end().ends_with("#[cfg(test)]"))
+        })
+}
+
+/** @brief 주어진 디렉터리들 아래에서 테스트 전용 파일을 뺀 Rust 소스 경로. */
+pub fn production_files(bases: &[&str]) -> Vec<PathBuf> {
+    rust_sources(bases)
+        .into_iter()
+        .filter(|path| !is_test_module_file(path))
+        .collect()
+}
+
 /** @brief 파일 하나를 읽는다. 읽지 못하면 그 자리에서 멈춘다. */
 pub fn read(path: &Path) -> String {
     std::fs::read_to_string(path)
@@ -87,13 +117,20 @@ pub fn block_after<'a>(source: &'a str, head: &str) -> Option<&'a str> {
 
 /**
  * @brief 테스트 모듈 앞까지만 남긴다.
- * @details 테스트 안의 문자열은 사용자에게 보이지 않으므로 검사 대상이 아니다.
+ * @details 테스트 안의 문자열은 사용자에게 보이지 않으므로 검사 대상이 아니다. 속성과
+ *          mod tests 사이에 문서 주석이 있어도 테스트 모듈로 본다.
  */
 pub fn production_prefix(source: &str) -> &str {
     let mut from = 0usize;
     while let Some(at) = source[from..].find("#[cfg(test)]") {
         let start = from + at;
-        let after = source[start + "#[cfg(test)]".len()..].trim_start();
+        let mut after = source[start + "#[cfg(test)]".len()..].trim_start();
+        while let Some(rest) = after.strip_prefix("/*") {
+            after = rest
+                .split_once("*/")
+                .map_or("", |(_, tail)| tail)
+                .trim_start();
+        }
         if after.starts_with("mod tests") {
             return &source[..start];
         }

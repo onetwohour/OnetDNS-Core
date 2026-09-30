@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{production_prefix, read, root};
+use common::{production_files, production_prefix, read, rel, root};
 
 /** @brief 이 문장 그대로는 내보내지 않는다. 너무 짧거나 번역되지 않았다. */
 const FORBIDDEN_EXACT: &[&str] = &[
@@ -106,23 +106,32 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
     out
 }
 
-/** @brief 사용자에게 보이는 문구를 담은 검사 대상 소스. */
-fn public_sources() -> Vec<(&'static str, String)> {
+/**
+ * @brief 사용자에게 보이는 문구를 담은 검사 대상 소스.
+ * @details 바이너리 소스는 파일을 고르지 않고 전부 읽는다. 코드가 다른 파일로 옮겨 가도
+ *          검사 범위에서 빠지지 않게 하려는 것이다.
+ */
+fn public_sources() -> Vec<(String, String)> {
     let repo = root();
-    [
-        "crates/onetdns-control/src/api.rs",
-        "onetdns-bin/src/main.rs",
-        "onetdns-bin/src/control_api.rs",
-        "onetdns-bin/src/hot_apply.rs",
-        "onetdns-bin/src/resolver_chain.rs",
-        "crates/onetdns-config/src/settings.rs",
-    ]
-    .into_iter()
-    .map(|path| {
-        let text = read(&repo.join(path));
-        (path, production_prefix(&text).to_string())
-    })
-    .collect()
+    let mut paths = production_files(&["onetdns-bin/src"]);
+    paths.push(repo.join("crates/onetdns-control/src/api.rs"));
+    paths.push(repo.join("crates/onetdns-config/src/settings.rs"));
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = read(&path);
+            (rel(&path), production_prefix(&text).to_string())
+        })
+        .collect()
+}
+
+/** @brief 바이너리의 운영 코드 전체를 이어 붙인 것. */
+fn binary_production_source() -> String {
+    production_files(&["onetdns-bin/src"])
+        .iter()
+        .map(|path| production_prefix(&read(path)).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /** @brief 짧거나 번역되지 않은 문구가 그대로 남아 있으면 실패한다. */
@@ -164,8 +173,7 @@ fn no_implementation_wording_reaches_the_user() {
 /** @brief 설정 확인 명령의 사람이 읽는 요약이 빠지면 실패한다. */
 #[test]
 fn the_configuration_summary_stays_human_readable() {
-    let main_rs = read(&root().join("onetdns-bin/src/main.rs"));
-    let source = production_prefix(&main_rs);
+    let source = binary_production_source();
     let missing: Vec<&&str> = REQUIRED_CLI_COPY
         .iter()
         .filter(|text| !source.contains(**text))

@@ -1,9 +1,10 @@
 name: Release
 
-# v 로 시작하는 태그를 올리면 대상마다 실행 파일을 빌드해 GitHub 릴리스에 올린다.
-# 태그 이름은 v 뒤에 Cargo.toml 의 [workspace.package] version 을 그대로 붙여야 하고,
-# 버전에 0.1.0-alpha.1 처럼 하이픈 꼬리가 있으면 시험판(pre-release)으로 올린다.
-# 이 워크플로는 테스트를 다시 돌리지 않으므로 main 의 CI 가 통과한 커밋에 태그를 붙인다.
+# Pushing a tag that starts with v builds a binary for every target and publishes a
+# GitHub release. The tag must be v followed by the [workspace.package] version in
+# Cargo.toml. A version with a hyphen suffix, such as 0.1.0-alpha.1, is published as a
+# pre-release. This workflow does not rerun the tests, so only tag a commit on main
+# whose CI has passed.
 on:
   push:
     tags: ["v*"]
@@ -31,7 +32,7 @@ jobs:
           version=$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "onetdns") | .version')
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::태그와 패키지 버전이 맞지 않습니다(태그 $GITHUB_REF_NAME, 버전 $version). 태그 이름은 v 뒤에 버전을 그대로 붙여야 합니다."
+            echo "::error::Tag $GITHUB_REF_NAME does not match package version $version. Name the tag v$version."
             exit 1
           fi
           case "${version%%+*}" in
@@ -92,10 +93,10 @@ jobs:
           set -euo pipefail
           RUSTFLAGS="-D warnings"
           case "$RUNNER_OS" in
-            # C 교차 컴파일러 없이 정적으로 링크하려고, 대상 표준 라이브러리에 들어 있는
-            # musl CRT 와 rust-lld 를 쓴다.
+            # Link statically with the musl CRT and rust-lld that ship with the target's
+            # standard library, so no C cross-compiler is needed.
             Linux) RUSTFLAGS="$RUSTFLAGS -C linker=rust-lld -C link-self-contained=yes" ;;
-            # C 런타임을 실행 파일에 넣어 VC++ 재배포 패키지가 없는 PC 에서도 실행되게 한다.
+            # Bundle the C runtime so the binary runs without the Visual C++ Redistributable.
             Windows) RUSTFLAGS="$RUSTFLAGS -C target-feature=+crt-static" ;;
           esac
           export RUSTFLAGS
@@ -110,21 +111,21 @@ jobs:
             Linux)
               headers=$(readelf -lW "$bin")
               if grep INTERP <<<"$headers"; then
-                echo "::error::동적 로더가 필요한 실행 파일입니다. 정적 링크가 풀렸습니다."
+                echo "::error::The binary requires a dynamic loader; static linking was lost."
                 exit 1
               fi
               ;;
             Windows)
               bin="$bin.exe"
               if grep -aqiE 'vcruntime[0-9]+\.dll|api-ms-win-crt-' "$bin"; then
-                echo "::error::C 런타임 DLL 이 필요한 실행 파일입니다. 정적 C 런타임이 빠졌습니다."
+                echo "::error::The binary requires C runtime DLLs; the static C runtime was dropped."
                 exit 1
               fi
               ;;
           esac
           reported=$($EMULATOR "$bin" --version)
           if [ "$reported" != "OnetDNS $VERSION" ]; then
-            echo "::error::--version 출력이 예상과 다릅니다(출력 '$reported', 예상 'OnetDNS $VERSION')."
+            echo "::error::Unexpected --version output: got '$reported', expected 'OnetDNS $VERSION'."
             exit 1
           fi
           echo "$reported"
@@ -141,8 +142,8 @@ jobs:
           else
             install -m 755 "target/$TARGET/release/OnetDNS" "pkg/$name/"
             install -m 644 LICENSE README.md "pkg/$name/"
-            # 러너 계정의 uid 가 소유자로 기록되면, root 로 풀었을 때 같은 uid 를 가진
-            # 계정이 실행 파일을 바꿀 수 있다. 소유자를 root 로 적는다.
+            # Record root as the owner. If the runner's uid were recorded, extracting as root
+            # would let whichever local account has that uid replace the binary.
             if [ "$RUNNER_OS" = macOS ]; then
               owner=(--uid 0 --gid 0)
             else
@@ -185,20 +186,45 @@ jobs:
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/notes.md"
-          : > "$notes"
-          if [ "$PRERELEASE" = true ]; then
-            printf '%s\n\n' "시험판입니다. 설정 파일 형식과 관리 API 는 예고 없이 바뀔 수 있습니다." >> "$notes"
-          fi
-          cat >> "$notes" <<'EOF'
-          Linux 용은 musl 로 정적 링크해 배포판을 가리지 않고, Windows 용은 C 런타임을 넣어 두어 VC++ 재배포 패키지 없이 실행됩니다.
+          {
+            cat <<'EOF'
+          OnetDNS is an ad-blocking DNS resolver that ships as a single self-contained binary. It answers over plain DNS, DNS-over-TLS, DNS-over-HTTPS (HTTP/2 and HTTP/3), DNS-over-QUIC and DNSCrypt, resolves by forwarding, full recursion or a split of the two, validates and signs DNSSEC, and can also serve authoritative zones and DHCP. A web dashboard is built in.
 
-          받은 파일은 함께 올린 `SHA256SUMS` 로 확인하십시오.
+          EOF
+            if [ "$PRERELEASE" = true ]; then
+              cat <<'EOF'
+          > [!WARNING]
+          > This is a pre-release. The configuration format and management API may change without notice.
+
+          EOF
+            fi
+            cat <<'EOF'
+          ## Downloads
+
+          | Platform | Archive |
+          |---|---|
+          | Linux x86-64 | `OnetDNS-@VERSION@-x86_64-unknown-linux-musl.tar.gz` |
+          | Linux x86 (32-bit) | `OnetDNS-@VERSION@-i686-unknown-linux-musl.tar.gz` |
+          | Linux ARM64 | `OnetDNS-@VERSION@-aarch64-unknown-linux-musl.tar.gz` |
+          | Linux ARMv7 | `OnetDNS-@VERSION@-armv7-unknown-linux-musleabihf.tar.gz` |
+          | Windows x64 | `OnetDNS-@VERSION@-x86_64-pc-windows-msvc.zip` |
+          | Windows x86 (32-bit) | `OnetDNS-@VERSION@-i686-pc-windows-msvc.zip` |
+          | macOS Apple silicon | `OnetDNS-@VERSION@-aarch64-apple-darwin.tar.gz` |
+          | macOS Intel | `OnetDNS-@VERSION@-x86_64-apple-darwin.tar.gz` |
+
+          Linux builds are statically linked against musl and run on any distribution. Windows builds bundle the C runtime and need no Visual C++ Redistributable.
+
+          ## Verify your download
+
+          Every archive is listed in `SHA256SUMS`:
 
           ```sh
           sha256sum -c SHA256SUMS --ignore-missing
           ```
+
           EOF
-          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "OnetDNS $VERSION" --notes-file "$notes")
+          } | sed "s/@VERSION@/$VERSION/g" > "$notes"
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "OnetDNS $VERSION" --notes-file "$notes" --generate-notes)
           if [ "$PRERELEASE" = true ]; then
             args+=(--prerelease)
           fi

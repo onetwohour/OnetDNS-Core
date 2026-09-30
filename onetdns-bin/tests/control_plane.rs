@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{read, root};
+use common::{production_files, read, root};
 
 /** @brief onetdns-bin 의 관리 평면이 갖춰야 할 안전장치. */
 const BIN_REQUIRED: &[&str] = &[
@@ -151,15 +151,27 @@ fn require(source: &str, required: &[&str], subject: &str) {
     );
 }
 
+/**
+ * @brief 바이너리 소스 전체를 이어 붙인 것.
+ * @details 파일을 고르지 않는다. 코드가 다른 파일로 옮겨 가도 검사가 대상을 놓치지 않게
+ *          하려는 것이다.
+ */
+fn bin_source() -> String {
+    production_files(&["onetdns-bin/src"])
+        .iter()
+        .map(|path| read(path))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
 /** @brief 관리 평면의 각 부분이 안전장치를 갖추고 있는지 확인한다. */
 #[test]
 fn every_control_plane_safeguard_is_present() {
     let repo = root();
-    let bin: String = ["main.rs", "control_api.rs", "hot_apply.rs"]
-        .iter()
-        .map(|file| read(&repo.join("onetdns-bin/src").join(file)))
-        .collect();
-    require(&bin, BIN_REQUIRED, "onetdns-bin 관리 평면");
+    require(&bin_source(), BIN_REQUIRED, "onetdns-bin 관리 평면");
     require(
         &read(&repo.join("crates/onetdns-control/src/metrics.rs")),
         METRICS_REQUIRED,
@@ -190,15 +202,15 @@ fn every_control_plane_safeguard_is_present() {
 /** @brief 형식이 잘못된 TOML 을 적용 중인 설정으로 조용히 대체하면 실패한다. */
 #[test]
 fn an_invalid_desired_file_is_reported_rather_than_replaced() {
-    let main_rs = read(&root().join("onetdns-bin/src/main.rs"));
-    let start = main_rs
+    let source = bin_source();
+    let start = source
         .find("fn desired_config_json(")
         .expect("desired_config_json 을 찾지 못했습니다");
-    let end = main_rs[start..]
+    let end = source[start..]
         .find("fn config_status_json(")
         .map(|offset| start + offset)
         .expect("config_status_json 을 찾지 못했습니다");
-    let body = &main_rs[start..end];
+    let body = &source[start..end];
     assert!(
         body.contains(r#"\"_valid\":false"#) && body.contains("Config::from_toml_str"),
         "형식이 잘못된 TOML 이 아직도 적용 중인 설정으로 조용히 대체됩니다"
@@ -279,13 +291,13 @@ fn enum_raw_values_carry_no_display_annotation() {
 /** @brief 업스트림 변경 응답이 이름 붙은 인자와 위치 인자를 섞으면 실패한다. */
 #[test]
 fn the_upstream_mutation_response_does_not_mix_argument_styles() {
-    let main_rs = read(&root().join("onetdns-bin/src/main.rs"));
+    let source = bin_source();
     for malformed in [
         r#"{{\"added\":{},\"id\":{},\"key\":\"{key}\",{} }}"#,
         r#"{{\"removed\":{},\"id\":{},\"key\":\"{key}\",{} }}"#,
     ] {
         assert!(
-            !main_rs.contains(malformed),
+            !source.contains(malformed),
             "업스트림 변경 응답이 이름 붙은 인자와 위치 인자를 섞습니다"
         );
     }

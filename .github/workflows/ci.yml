@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # 외부 공인 서버(Cloudflare·AdGuard) 상호운용을 하루 한 번 회귀 검사.
+    # Daily interop regression check against public resolvers (Cloudflare, AdGuard).
     - cron: "17 6 * * *"
 
 env:
@@ -29,7 +29,8 @@ jobs:
             python3 "$script"
           done
 
-  # 스타일/정적분석 게이트(플랫폼 무관 — ubuntu 1회). fmt·clippy 모두 실패 시 CI 차단.
+  # Style and static-analysis gate. Platform independent, so it runs once on Ubuntu.
+  # A failure in either fmt or clippy blocks CI.
   lint:
     name: fmt · clippy (gated)
     runs-on: ubuntu-latest
@@ -43,11 +44,12 @@ jobs:
       - name: rustfmt (deny diffs)
         run: cargo fmt --all --check
 
-      # 게이트: clippy 경고 0(주관적 린트는 [workspace.lints.clippy]에서 allow, 실버그 그룹은 deny).
+      # Zero clippy warnings. Subjective lints are allowed in [workspace.lints.clippy];
+      # the groups that catch real bugs stay denied.
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # 빌드·테스트 게이트(OS 매트릭스). 컴파일 경고 0 + 전 워크스페이스 테스트 통과.
+  # Build and test gate on every OS: no compiler warnings, whole workspace test suite green.
   test:
     name: build · test
     strategy:
@@ -60,9 +62,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
 
-      # 리눅스는 127.0.0.0/8 전체를 루프백에 붙여 두지만 macOS 는 127.0.0.1 하나만
-      # 설정한다. 위임 계층을 흉내 내려고 서버마다 다른 루프백 주소를 묶는 시험이 있어,
-      # 주소를 하나씩 쫓는 대신 리눅스와 같은 상태를 만들어 준다.
+      # Linux routes all of 127.0.0.0/8 to loopback; macOS configures only 127.0.0.1.
+      # Some tests bind a separate loopback address per server to emulate a delegation
+      # hierarchy, so give macOS the same range instead of chasing single addresses.
       - name: Add loopback aliases (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -82,7 +84,7 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-  # 경량 edge 빌드(보고서 #11): 대시보드 제외 — ubuntu만.
+  # Lightweight edge build without the dashboard. Ubuntu only.
   minimal-build:
     name: minimal build (no dashboard)
     runs-on: ubuntu-latest
@@ -93,7 +95,7 @@ jobs:
       - name: Build minimal
         run: cargo build -p onetdns --no-default-features --profile release-min
 
-  # 저사양 32비트 배포에서 포인터 폭과 Linux 소켓 ABI를 함께 회귀 검사한다.
+  # Pointer-width and Linux socket ABI regressions for low-end 32-bit deployments.
   pointer-width-32:
     name: i686 build · test (${{ matrix.target }})
     strategy:
@@ -121,9 +123,9 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-  # 릴리스가 빌드하는 musl 대상은 다른 작업이 컴파일하지 않는 cfg 분기를 탄다. 32비트
-  # musl 과 c_char 가 부호 없는 ARM 이 그렇다. 태그를 붙인 뒤에야 깨진 것을 알게 되지
-  # 않도록 여기서 미리 컴파일한다.
+  # The musl targets built for releases take cfg branches no other job compiles, such as
+  # 32-bit musl and ARM where c_char is unsigned. Compile them here so a break shows up
+  # before a release tag is pushed, not after.
   release-targets:
     name: release target check (musl)
     runs-on: ubuntu-latest
@@ -143,7 +145,8 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-  # 공급망 게이트: RustSec 취약점·철회 크레이트, 라이선스, 출처를 deny.toml 정책으로 검사.
+  # Supply-chain gate: RustSec advisories, yanked crates, licenses and sources, checked
+  # against the deny.toml policy.
   supply-chain:
     name: cargo-audit · cargo-deny
     runs-on: ubuntu-latest
@@ -169,14 +172,16 @@ jobs:
         run: cargo test -p onetdns --test parser_panic_safety -- --nocapture
         env:
           ONETDNS_SWEEP_ITERS: "1000000"
-      # 컴파일된 필터 캐시는 디스크에서 오는 입력이고, 봉투 SHA-256 때문에 훼손 뒤
-      # 다시 봉인해야 본문 파서가 노출된다. 그래서 크레이트 안의 스위프로 따로 돈다.
+      # The compiled filter cache is read from disk. Its envelope carries a SHA-256, so the
+      # body parser is only reached when a mutated file is resealed; that sweep lives in the
+      # filter crate and runs separately.
       - name: Sweep resealed compiled-filter-cache mutations
         run: cargo test -p onetdns-filter --release cache_decoder_never_panics -- --nocapture
         env:
           ONETDNS_SWEEP_ITERS: "1000000"
 
-  # 표준 클라(dig/kdig) + dnsperf interop. 외부 의존 없이 로컬 권한 존을 서빙해 질의한다.
+  # Interop with standard clients (dig, kdig) and dnsperf. Serves a local authoritative
+  # zone, so nothing outside the runner is involved.
   interop:
     name: protocol interop (dig · kdig · dnsperf)
     runs-on: ubuntu-latest
@@ -260,31 +265,32 @@ jobs:
       - name: Supervisor — privilege drop and privileged-port recovery
         run: |
           set -eu
-          # 권한을 낮춘 감독자는 낮춘 사용자로 자기 실행 파일을 다시 실행하고 존 파일도
-          # 다시 읽는다. 러너의 /home/runner 는 0750 이라 nobody 가 지나갈 수 없으므로,
-          # 실제 배포와 같이 누구나 지나갈 수 있는 자리에 두고 확인한다.
+          # After dropping privileges the supervisor re-executes its own binary and re-reads
+          # the zone file as the unprivileged user. /home/runner is 0750 and nobody cannot
+          # traverse it, so stage the files in a world-traversable directory, as a real
+          # deployment would.
           WORK=/tmp/onetdns-privdrop
           rm -rf "$WORK"
           mkdir -m 755 "$WORK"
           install -m 755 target/release/OnetDNS "$WORK/OnetDNS"
           install -m 644 interop.zone privdrop.toml "$WORK/"
-          # 이 단계는 성공해도 실패해도 화면에 아무것도 내지 않아서, 실패했을 때
-          # 감독자가 죽었는지 포트를 못 잡았는지조차 구분할 수 없었다. 서버가 남긴
-          # privdrop.log 는 실패 원인이 그대로 적히는 유일한 자리라 반드시 출력한다.
+          # On failure, dump process state and privdrop.log. Without it there is no way to
+          # tell whether the supervisor died or failed to bind the port, and the log is the
+          # only place the server writes the cause.
           diagnose() {
-            echo "::group::권한 강등 진단"
-            echo "--- 감독자 PID 파일: $(cat "$WORK/priv-supervisor.pid" 2>/dev/null || echo 없음)"
-            ps -eo pid,ppid,user,args | grep -F OnetDNS | grep -v grep || echo "--- OnetDNS 프로세스 없음"
+            echo "::group::Privilege drop diagnostics"
+            echo "--- supervisor PID file: $(cat "$WORK/priv-supervisor.pid" 2>/dev/null || echo missing)"
+            ps -eo pid,ppid,user,args | grep -F OnetDNS | grep -v grep || echo "--- no OnetDNS process"
             for pid in ${PARENT:-} ${OLD_CHILD:-} ${NEW_CHILD:-}; do
               echo "--- /proc/$pid/status"
               awk '/^(Uid|Gid|NoNewPrivs|CapEff|CapBnd|CapAmb):/{print}' "/proc/$pid/status" 2>&1 || true
             done
-            echo "--- 작업 디렉터리"
+            echo "--- work directory"
             ls -la "$WORK"
-            echo "--- 535 포트 수신자"
+            echo "--- listeners on port 535"
             sudo -n ss -lunp "sport = :535" 2>&1 || true
             echo "--- privdrop.log"
-            cat "$WORK/privdrop.log" 2>&1 || echo 없음
+            cat "$WORK/privdrop.log" 2>&1 || echo missing
             echo "::endgroup::"
           }
           cleanup() {
@@ -316,7 +322,7 @@ jobs:
           dig @127.0.0.1 -p 535 www.interop.test A +short | grep -qx "192.0.2.10"
           OLD_CHILD=$(pgrep -P "$PARENT" | head -n 1 || true)
           test -n "$OLD_CHILD"
-          echo "감독자 $PARENT, 자식 $OLD_CHILD 가 65534 로 535 를 서빙합니다"
+          echo "supervisor $PARENT and child $OLD_CHILD serve port 535 as uid 65534"
           python3 - "$PARENT" "$OLD_CHILD" <<'PY'
           import re, sys
           required = sum(1 << bit for bit in (10, 11, 12, 13))
@@ -345,7 +351,7 @@ jobs:
           done
           test -n "$NEW_CHILD"
           dig @127.0.0.1 -p 535 www.interop.test A +short | grep -qx "192.0.2.10"
-          echo "자식을 강제 종료한 뒤 $NEW_CHILD 가 535 를 다시 잡았습니다"
+          echo "child aborted; $NEW_CHILD is serving port 535 again"
           test "$(awk '/^Uid:/{print $2}' "/proc/$NEW_CHILD/status")" = "65534"
           test "$(awk '/^NoNewPrivs:/{print $2}' "/proc/$NEW_CHILD/status")" = "1"
           CAP_EFF=$(awk '/^CapEff:/{print $2}' "/proc/$NEW_CHILD/status")
@@ -376,8 +382,8 @@ jobs:
           grep -q "ns1.interop.test" kdig.out
           grep -qi "flags:.*aa" kdig.out
 
-      # 암호화 전송은 표준 클라이언트로 확인해야 회귀를 잡는다. 이전에는 Do53만
-      # 검사해 DoT·DoH가 깨져도 CI가 통과했다.
+      # Encrypted transports are checked with standard clients too; testing Do53 alone
+      # would let a broken DoT or DoH listener pass CI.
       - name: kdig — DoT (RFC 7858)
         run: |
           set -e
@@ -415,10 +421,11 @@ jobs:
           done
           exit 1
 
-  # 자체구현 QUIC/HTTP3/TLS 스택이 실제 공인 서버(Cloudflare·AdGuard)와 상호운용하는지
-  # 확인한다. 외부 네트워크에 의존하므로 push/PR에서는 돌리지 않고(외부 장애가 빌드를
-  # 깨지 않게) 예약·수동 실행에서만, 실패를 비차단으로 둔다. DoQ 흐름제어 클램프 같은
-  # 상호운용 회귀를 잡는 것이 목적이며, kdig가 못 치는 조합(공인 인증서·h3 등)을 덮는다.
+  # Checks that the in-house QUIC, HTTP/3 and TLS stacks interoperate with real public
+  # resolvers (Cloudflare, AdGuard). It needs the external network, so it runs only on
+  # schedule or manual dispatch and never blocks: an outside outage must not break the
+  # build. It catches interop regressions such as the DoQ flow-control clamp and covers
+  # what kdig cannot, like publicly trusted certificates and HTTP/3.
   live-interop:
     name: live interop (Cloudflare · AdGuard)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

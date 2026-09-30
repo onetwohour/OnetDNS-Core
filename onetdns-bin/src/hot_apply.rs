@@ -7,34 +7,39 @@
  */
 
 use super::*;
+use crate::config_apply::RestartHooks;
+use crate::config_apply::{
+    backend_uses_forward, config_changed_keys, has_client_upstream_routes, hot_reload_groups,
+    is_hot_reload_config_change, normalize_config_for_comparison, runtime_config_update_lock,
+    HotConfigApply, LOCAL_ONLY_CONFIG_KEYS,
+};
+use crate::edge::{reconcile_edge_services, EdgeServices};
+use crate::filter_runtime::FilterState;
+use crate::filters::{
+    blocklist_host_resolver, build_filter_engine_for_config, preset_list_urls,
+    release_subscription_lines, FilterBuildInputs,
+};
+use crate::listeners::TlsSlots;
+use crate::native_config::{
+    build_authority_settings, build_policy_engine, build_views, evaluate_lane_gates,
+    reconfigure_native_features, runtime_access_control, runtime_rate_limiters, telemetry_consumed,
+    DynamicAccessControl, DynamicRateLimiter, LaneFacts, NativeHotState,
+};
+use crate::zones::{build_zone_store, reconcile_zone_watchers, ZoneState};
 use std::sync::atomic::Ordering;
 
 /** @brief 교체 경로가 바꾸는 이 세대의 핸들. */
 pub(crate) struct HotApplyDeps {
-    /** @brief 해석 체인을 다시 만든다. 체인을 만들기 전에는 없다. */
-    pub(crate) chain_rebuild: Arc<Mutex<Option<ChainRebuild>>>,
+    /** @brief 설정이 바뀌면 다시 시작할 작업들. */
+    pub(crate) restarts: RestartHooks,
+    /** @brief 권한 영역 상태. */
+    pub(crate) zones: ZoneState,
+    /** @brief 차단 엔진과 그 재료. */
+    pub(crate) filters: FilterState,
     /** @brief 관리 화면 인증. 관리 수신 주소가 없으면 없다. */
     pub(crate) console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>>,
     /** @brief 실행 중 설정. */
     pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
-    /** @brief 지금 쓰는 차단 엔진. */
-    pub(crate) filter: Arc<SharedFilter>,
-    /** @brief 관리 API 로 더한 차단과 허용 규칙. */
-    pub(crate) overlay: Arc<Mutex<(Vec<String>, Vec<String>)>>,
-    /** @brief 차단한 서비스 목록. */
-    pub(crate) service_set: Arc<Mutex<Vec<String>>>,
-    /** @brief 거부할 도메인 목록. */
-    pub(crate) refused_domains: Arc<Mutex<Vec<String>>>,
-    /** @brief 안전 검색을 켰는지. */
-    pub(crate) safe_search: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 구독별로 받은 결과. */
-    pub(crate) sub_meta: Arc<Mutex<Vec<SubMeta>>>,
-    /** @brief 받아 둔 RPZ 본문. */
-    pub(crate) rpz_texts: Arc<Mutex<Vec<String>>>,
-    /** @brief 컴파일한 차단 엔진을 저장하는 파일. */
-    pub(crate) compiled_filter_cache: Option<PathBuf>,
-    /** @brief 받은 목록을 저장하는 디렉터리. */
-    pub(crate) subscription_cache_dir: Option<PathBuf>,
     /** @brief 접근 제어. */
     pub(crate) acl_state: Arc<DynamicAccessControl>,
     /** @brief 속도 제한. */
@@ -49,30 +54,10 @@ pub(crate) struct HotApplyDeps {
     pub(crate) native_hot_state: Arc<Mutex<Option<NativeHotState>>>,
     /** @brief 통계. */
     pub(crate) stats: onetdns_control::Stats,
-    /** @brief 권한 영역 저장소. */
-    pub(crate) zone_store: Arc<ArcSwap<onetdns_authority::ZoneStore>>,
-    /** @brief 영역 원본 감시 작업. */
-    pub(crate) zone_watchers: Arc<ZoneWatchers>,
-    /** @brief 영역이 바뀌었을 때 NOTIFY 를 보낸다. */
-    pub(crate) zone_notify: NotifySender,
     /** @brief 이 세대의 종료 플래그. */
     pub(crate) zone_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /** @brief 이 세대가 끝날 때 기다릴 스레드. */
     pub(crate) zone_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
-    /** @brief 구독 주소. */
-    pub(crate) sub_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief 구독 제목. */
-    pub(crate) sub_titles: Arc<Mutex<Vec<String>>>,
-    /** @brief 꺼 둔 구독 주소. */
-    pub(crate) sub_disabled: Arc<Mutex<Vec<String>>>,
-    /** @brief 미리 정해 둔 목록 주소. */
-    pub(crate) preset_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief RPZ 구독 주소. */
-    pub(crate) rpz_url_state: Arc<Mutex<Vec<String>>>,
-    /** @brief 목록을 다시 받는 주기. */
-    pub(crate) list_refresh_secs: Arc<std::sync::atomic::AtomicU64>,
-    /** @brief 목록 받기 작업의 세대. 주기를 바꾸면 이전 작업이 멈춘다. */
-    pub(crate) list_generation: Arc<std::sync::atomic::AtomicU64>,
     /** @brief DHCP 계열 서비스. */
     pub(crate) edge_services: Arc<EdgeServices>,
     /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
@@ -81,22 +66,8 @@ pub(crate) struct HotApplyDeps {
     pub(crate) dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<dhcp6::Lease6Pool>>>>>,
     /** @brief TLS 인증서 슬롯. 암호화 수신 주소가 없으면 없다. */
     pub(crate) tls_slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
-    /** @brief 세컨더리 영역 갱신 작업을 다시 시작한다. */
-    pub(crate) secondary_restart: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief ZSK 교체 작업을 다시 시작한다. */
-    pub(crate) zsk_rollover_restart: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief 영역 서명 키. */
-    pub(crate) zone_signers: SharedZoneSigners,
     /** @brief MAC 제조사 데이터베이스. */
     pub(crate) vendor_db: Arc<ArcSwap<mac::VendorDb>>,
-    /** @brief 임대 동기화 작업을 다시 시작한다. */
-    pub(crate) lease_sync_restart: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief Raft 런타임을 다시 시작한다. */
-    pub(crate) raft_restart: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief 수신 주소를 설정에 맞춘다. */
-    pub(crate) listener_sync: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief 관리 수신 주소를 다시 연다. */
-    pub(crate) control_rebind: Arc<Mutex<Option<SecondaryRestart>>>,
     /** @brief 목록을 받을 때 쓰는 이름 해석기의 교체 슬롯. */
     pub(crate) blocklist_resolver_slot: Arc<Mutex<http::HostResolver>>,
     /** @brief 목록을 받을 때 쓰는 이름 해석기. */
@@ -110,18 +81,47 @@ pub(crate) struct HotApplyDeps {
 /** @brief 교체 함수를 만든다. */
 pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
     let HotApplyDeps {
-        chain_rebuild,
+        restarts:
+            RestartHooks {
+                chain: chain_rebuild,
+                secondary: secondary_restart,
+                zsk_rollover: zsk_rollover_restart,
+                lease_sync: lease_sync_restart,
+                raft: raft_restart,
+                listeners: listener_sync,
+                control: control_rebind,
+                ..
+            },
+        zones:
+            ZoneState {
+                store: zone_store,
+                watchers: zone_watchers,
+                notify: zone_notify,
+                signers: zone_signers,
+                ..
+            },
+        filters:
+            FilterState {
+                filter,
+                overlay,
+                service_set,
+                refused_domains,
+                safe_search,
+                sub_meta,
+                rpz_texts,
+                compiled_filter_cache,
+                subscription_cache_dir,
+                sub_urls,
+                sub_titles,
+                sub_disabled,
+                preset_urls,
+                rpz_urls: rpz_url_state,
+                list_refresh_secs,
+                list_generation,
+                ..
+            },
         console_auth,
         runtime_cfg,
-        filter,
-        overlay,
-        service_set,
-        refused_domains,
-        safe_search,
-        sub_meta,
-        rpz_texts,
-        compiled_filter_cache,
-        subscription_cache_dir,
         acl_state,
         rate_state,
         recorder,
@@ -129,30 +129,13 @@ pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
         forward_stats,
         native_hot_state,
         stats,
-        zone_store,
-        zone_watchers,
-        zone_notify,
         zone_shutdown,
         zone_threads,
-        sub_urls,
-        sub_titles,
-        sub_disabled,
-        preset_urls,
-        rpz_url_state,
-        list_refresh_secs,
-        list_generation,
         edge_services,
         dhcp_slot,
         dhcp6_slot,
         tls_slots,
-        secondary_restart,
-        zsk_rollover_restart,
-        zone_signers,
         vendor_db,
-        lease_sync_restart,
-        raft_restart,
-        listener_sync,
-        control_rebind,
         blocklist_resolver_slot,
         blocklist_resolver,
         cache_slot,

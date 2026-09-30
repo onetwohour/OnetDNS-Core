@@ -1297,7 +1297,7 @@ impl Lease6Pool {
                 value.expiry
             ));
         }
-        if let Err(e) = crate::atomic_write(path, text.as_bytes()) {
+        if let Err(e) = crate::atomic_file::atomic_write(path, text.as_bytes()) {
             onetdns_core::warn!(event = "dhcp6.lease_save_failed", path = ?path, error = %e, "DHCPv6 임대 정보를 파일에 저장하지 못했습니다");
         }
     }
