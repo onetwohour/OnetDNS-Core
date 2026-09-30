@@ -3204,57 +3204,36 @@ impl Recursor {
 
     /**
      * @brief 응답성 통계로 서버 순서를 정한다.
-     * @details 선호 계열, 점수, 그리고 최근에 실패했는지로 정렬한다. 최근에 실패한 서버도 목록
-     *          뒤에는 남긴다. 전부 최근에 실패했으면 아무 데도 못 묻게 되기 때문이다. 내려간 서버는
-     *          빼므로, 전부 내려갔으면 빈 목록이다.
+     * @details 선호 계열과 점수로 정렬한다. 최근에 실패한 서버는 점수에 벌점이 붙어 뒤로 가지만
+     *          목록에는 남는다. 앞 서버가 이번 질의에서 답하지 않으면 같은 질의 안에서 그 서버에도
+     *          물어야 하기 때문이다. 연달아 실패해 내려간 서버만 빼므로, 전부 내려갔으면 빈
+     *          목록이다.
      */
     fn order_by_infra(&self, servers: &[SocketAddr], zone: &Name) -> Vec<SocketAddr> {
         let infra = self.infra.lock_recover();
         let rtt = self.rtt.lock_recover();
         let now = Instant::now();
 
-        let eligible: Vec<SocketAddr> = servers
+        let mut ranked: Vec<(u8, u64, SocketAddr)> = servers
             .iter()
             .copied()
-            .filter(|server| {
-                self.family_allowed(server.ip())
-                    && !infra
-                        .peek(&InfraKey::new(server.ip(), zone))
-                        .is_some_and(|state| state.down(now))
+            .filter(|server| self.family_allowed(server.ip()))
+            .filter_map(|server| {
+                let state = infra.peek(&InfraKey::new(server.ip(), zone));
+                if state.is_some_and(|state| state.down(now)) {
+                    return None;
+                }
+                Some((
+                    self.family_rank(server.ip()),
+                    infra_score(state, rtt.peek(&server.ip()).copied(), now),
+                    server,
+                ))
             })
             .collect();
-        let score = |server: &SocketAddr| {
-            let key = InfraKey::new(server.ip(), zone);
-            (
-                self.family_rank(server.ip()),
-                infra_score(infra.peek(&key), rtt.peek(&server.ip()).copied(), now),
-                *server,
-            )
-        };
-        let mut ready: Vec<(u8, u64, SocketAddr)> = eligible
-            .iter()
-            .filter(|server| {
-                let key = InfraKey::new(server.ip(), zone);
-                !infra_is_cooling(&infra, &key, now)
-            })
-            .map(score)
-            .collect();
-
-        if ready.is_empty() {
-            if let Some(server) = eligible.iter().min_by_key(|server| {
-                let key = InfraKey::new(server.ip(), zone);
-                infra
-                    .peek(&key)
-                    .and_then(|state| state.last_fail)
-                    .unwrap_or_else(Instant::now)
-            }) {
-                ready.push(score(server));
-            }
-        }
         drop(rtt);
         drop(infra);
-        ready.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        ready.into_iter().map(|(_, _, server)| server).collect()
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        ranked.into_iter().map(|(_, _, server)| server).collect()
     }
 
     /**
@@ -3347,11 +3326,6 @@ impl Recursor {
         state.last_fail = Some(now);
         infra.put(key, state);
     }
-}
-
-/** @brief 이 서버가 최근에 실패해 순위를 뒤로 미룰 대상인지. */
-fn infra_is_cooling(infra: &LruMap<InfraKey, InfraStat>, key: &InfraKey, now: Instant) -> bool {
-    infra.peek(key).is_some_and(|state| state.cooling(now))
 }
 
 /**
@@ -5321,7 +5295,7 @@ mod tests {
 
         assert_eq!(
             r.order_by_infra(&[dead, slow, fast], &zone),
-            vec![fast, slow]
+            vec![fast, slow, dead]
         );
     }
 
@@ -5444,15 +5418,22 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패한 서버가 INFRA_FAIL_COOLDOWN 동안 뒤로 밀렸다가 돌아오는지. */
-    fn failed_servers_are_excluded_until_cooldown_expires() {
+    /**
+     * @brief 실패한 서버가 INFRA_FAIL_COOLDOWN 동안 뒤로 밀렸다가 돌아오는지.
+     * @details 뒤로 밀려도 목록에서 빠지지 않는다. 앞 서버가 답하지 않으면 같은 질의 안에서
+     *          물어야 하기 때문이다.
+     */
+    fn failed_servers_are_asked_last_until_cooldown_expires() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let failed: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let healthy: SocketAddr = "1.1.1.1:53".parse().unwrap();
         let zone = Name::from_str("example").unwrap();
         let key = InfraKey::new(failed.ip(), &zone);
         r.infra_fail(failed.ip(), &zone);
-        assert_eq!(r.order_by_infra(&[failed, healthy], &zone), vec![healthy]);
+        assert_eq!(
+            r.order_by_infra(&[failed, healthy], &zone),
+            vec![healthy, failed]
+        );
 
         {
             let mut infra = r.infra.lock_recover();
@@ -5461,6 +5442,54 @@ mod tests {
         }
         let ordered = r.order_by_infra(&[failed, healthy], &zone);
         assert!(ordered.contains(&failed) && ordered.contains(&healthy));
+    }
+
+    #[test]
+    /**
+     * @brief 먼저 물은 서버가 답하지 않으면 최근에 한 번 실패한 서버에도 같은 질의 안에서 묻는지.
+     * @details 한 번 실패한 서버를 목록에서 빼면, 남은 서버 하나가 답하지 않을 때 되살아난 서버를
+     *          두고도 질의가 실패한다.
+     */
+    fn a_recently_failed_server_is_still_asked_when_the_preferred_one_is_silent() {
+        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
+        const PORT: u16 = 5425;
+        let recovered = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 94)), PORT);
+        let silent_sock = UdpSocket::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 95)),
+            PORT,
+        ))
+        .unwrap();
+        let silent = silent_sock.local_addr().unwrap();
+        spawn_server("127.0.0.94", PORT, |req| {
+            a_answer(req, Ipv4Addr::new(192, 0, 2, 94))
+        });
+
+        let recursor = Recursor::new(vec![], Duration::from_secs(2))
+            .with_port(PORT)
+            .with_test_loopback();
+        let zone = Name::from_str("recover.test").unwrap();
+        recursor.infra_success(silent.ip(), &zone, Duration::from_millis(5));
+        recursor.infra_fail(recovered.ip(), &zone);
+        assert_eq!(
+            recursor.order_by_infra(&[recovered, silent], &zone),
+            vec![silent, recovered]
+        );
+
+        let query = make_query(
+            &Name::from_str("a.recover.test").unwrap(),
+            RecordType::A,
+            false,
+        );
+        let answer = recursor
+            .query_any(
+                &[recovered, silent],
+                &query,
+                &zone,
+                recursor.query_deadline(),
+            )
+            .expect("답하지 않는 서버 다음에 되살아난 서버에 묻지 않았습니다");
+        assert_eq!(answer.answers.len(), 1);
+        drop(silent_sock);
     }
 
     #[test]
@@ -5651,7 +5680,7 @@ mod tests {
 
         assert_eq!(
             recursor.order_by_infra(&[server, healthy], &failed_zone),
-            vec![healthy]
+            vec![healthy, server]
         );
 
         let other = recursor.order_by_infra(&[server, healthy], &other_zone);

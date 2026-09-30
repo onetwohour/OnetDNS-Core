@@ -258,7 +258,11 @@ struct ClientFlight {
     /** @brief 기다리는 쪽을 깨우는 곳. */
     ready: Condvar,
 
-    /** @brief 지금 기다리는 수. 0이면 깨우지 않는다. */
+    /**
+     * @brief 지금 condvar에서 기다리는 수. 0이면 깨우지 않는다.
+     * @invariant wait 안에서만 늘고 줄어든다. 결과 잠금을 쥔 채로 늘리므로, 결과를 채운 쪽이
+     *            0을 읽었다면 그 뒤에 기다리기 시작한 쪽은 잠들기 전에 결과를 본다.
+     */
     waiters: std::sync::atomic::AtomicUsize,
 
     /** @brief 밖으로 내보낸 스레드. 자기 자신을 기다리지 않으려고 본다. */
@@ -312,8 +316,19 @@ impl ClientFlight {
 
     /** @brief 결과를 기다린다. 데드라인을 넘기면 없다. */
     fn wait(&self, timeout: Duration) -> Option<Result<Message, ResolveFailure>> {
+        /** @brief 어떤 경로로 돌아가든 대기자 수를 되돌린다. */
+        struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         let deadline = Instant::now() + timeout;
         let mut result = self.result.lock_recover();
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _waiting = Waiting(&self.waiters);
         while result.is_none() {
             let now = Instant::now();
             if now >= deadline {
@@ -1548,9 +1563,6 @@ impl Resolver for CacheLayer {
                 if existing.leader_thread == std::thread::current().id() {
                     None
                 } else {
-                    existing
-                        .waiters
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Some((existing.clone(), false))
                 }
             } else if flights.len() >= MAX_CLIENT_FLIGHTS {
@@ -2707,8 +2719,6 @@ mod tests {
         let flight = Arc::new(ClientFlight::new());
         let follower_flight = flight.clone();
 
-        flight.waiters.fetch_add(1, Ordering::SeqCst);
-
         let follower = std::thread::spawn(move || {
             follower_flight
                 .wait(Duration::from_secs(5))
@@ -2723,6 +2733,11 @@ mod tests {
         answer.header.id = 0x3131;
         flight.complete(Ok(answer));
         assert_eq!(follower.join().expect("팔로워 스레드"), 0x3131);
+        assert_eq!(
+            flight.waiters.load(Ordering::SeqCst),
+            0,
+            "깨어나 돌아간 대기자가 수에 남음"
+        );
 
         let quiet = ClientFlight::new();
         let mut late = Message::default();

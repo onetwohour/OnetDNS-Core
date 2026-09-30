@@ -1063,13 +1063,17 @@ const MAX_LOGIN_FAILURES: u32 = 8;
 const MAX_SOURCE_LOGIN_FAILURES: u32 = 40;
 
 /**
- * @brief 리버스 프록시 하나를 거쳐 온 실패 전체의 허용 횟수.
+ * @brief 리버스 프록시 하나를 거친 로그인 실패를 쉬지 않고 받는 횟수.
  * @details 프록시 뒤의 출발지는 X-Forwarded-For가 알려 준다. 프록시와 같은 컴퓨터의 다른
- *          프로그램도 이 헤더를 꾸며 보낼 수 있으므로, 출발지를 바꿔 가며 무한히 시도하지
- *          못하게 프록시 단위로도 센다. 출발지 한도의 열 배라, 출발지 하나가 막힌다고
- *          프록시 뒤의 다른 관리자까지 막히지는 않는다.
+ *          프로그램도 이 헤더를 꾸며 보낼 수 있으므로 프록시 단위로도 제한한다. 다만 오래
+ *          막으면 공격자 하나가 프록시 뒤의 모든 관리자를 막으므로, 막지 않고 속도만 늦춘다.
+ *          출발지 하나의 한도보다 커서, 출발지 하나가 한도를 다 써도 다른 관리자는 늦춰지지
+ *          않는다.
  */
-const MAX_PROXY_LOGIN_FAILURES: u32 = 10 * MAX_SOURCE_LOGIN_FAILURES;
+const PROXY_LOGIN_FAILURE_BURST: u64 = 2 * MAX_SOURCE_LOGIN_FAILURES as u64;
+
+/** @brief 몰아서 받는 횟수를 다 쓴 뒤 프록시를 거친 로그인 실패를 하나 더 받기까지의 간격. */
+const PROXY_LOGIN_FAILURE_INTERVAL_MS: u64 = 1000;
 /** @brief 실패 기록을 담을 항목 수 상한. */
 const MAX_LOGIN_ATTEMPT_KEYS: usize = 4096;
 /** @brief 요청 첫 줄의 길이 상한. */
@@ -1134,6 +1138,23 @@ pub struct Auth {
     sessions: SessionStore,
     /** @brief 주소별 로그인 실패 기록. */
     login_attempts: Mutex<std::collections::HashMap<String, LoginAttempt>>,
+
+    /**
+     * @brief 리버스 프록시별 로그인 실패 속도 기록. 값은 다음 실패를 쉬지 않고 받을 수 있게
+     *        되는 시각(밀리초)이다.
+     */
+    proxy_login_pace: Mutex<std::collections::HashMap<String, u64>>,
+
+    /** @brief 첫 관리자 계정을 만들 때 요구하는 일회용 설정 코드. 계정을 만들면 지운다. */
+    setup_code: Mutex<Option<SetupCode>>,
+}
+
+/** @brief 일회용 설정 코드. */
+struct SetupCode {
+    /** @brief 코드의 키드 지문. 원문은 보관하지 않는다. */
+    digest: [u8; 32],
+    /** @brief 코드를 적어 둔 파일 경로. 설정 화면에 보여 준다. */
+    file: String,
 }
 
 impl Auth {
@@ -1247,6 +1268,42 @@ impl Auth {
         !self.users.lock_recover().is_empty()
     }
 
+    /**
+     * @brief 첫 관리자 계정을 만들 때 요구할 일회용 설정 코드를 정한다.
+     * @details 루프백에 접속할 수 있다고 해서 설정 파일을 고칠 권한이 있는 것은 아니다. 여러
+     *          사람이 쓰는 컴퓨터에서는 다른 사용자의 프로그램도 루프백에 접속한다. 그래서 설정
+     *          파일 옆의 파일을 읽을 수 있는 사람만 아는 코드를 요구한다.
+     * @param file 코드를 적어 둔 파일 경로.
+     */
+    pub fn set_setup_code(&self, code: &str, file: String) {
+        *self.setup_code.lock_recover() = Some(SetupCode {
+            digest: credential_digest("setup", &[code]),
+            file,
+        });
+    }
+
+    /** @brief 설정 코드를 지운다. 계정을 만들었거나 코드를 둘 곳이 없을 때 부른다. */
+    pub fn clear_setup_code(&self) {
+        *self.setup_code.lock_recover() = None;
+    }
+
+    /** @brief 설정 코드가 맞는지. 비교는 상수 시간이다. 코드가 없으면 언제나 틀리다. */
+    fn setup_code_matches(&self, offered: &str) -> bool {
+        let digest = credential_digest("setup", &[offered]);
+        self.setup_code
+            .lock_recover()
+            .as_ref()
+            .is_some_and(|code| ct_eq(&digest, &code.digest))
+    }
+
+    /** @brief 설정 코드를 적어 둔 파일 경로. 코드가 없으면 없다. */
+    fn setup_code_file(&self) -> Option<String> {
+        self.setup_code
+            .lock_recover()
+            .as_ref()
+            .map(|code| code.file.clone())
+    }
+
     /** @brief 이 토큰의 등급. 비교는 상수 시간이다. */
     fn role_for(&self, token: &str) -> Option<Role> {
         if token.is_empty() {
@@ -1272,10 +1329,18 @@ impl Auth {
         None
     }
 
-    /** @brief 토큰이나 세션에서 등급을 정한다. */
+    /**
+     * @brief 토큰이나 세션에서 등급을 정한다.
+     * @details 베어러 토큰을 보냈으면 그 토큰으로만 판정하고, 틀리면 세션이 맞아도 인증되지
+     *          않는다. 세션으로 넘어가면 CSRF 검사는 베어러 요청으로 보고 건너뛰는데 실제
+     *          권한은 쿠키에서 나온다.
+     */
     fn resolve(&self, bearer: &str, session: &str) -> Option<Role> {
-        self.role_for(bearer)
-            .or_else(|| self.role_for_session(session))
+        if bearer.is_empty() {
+            self.role_for_session(session)
+        } else {
+            self.role_for(bearer)
+        }
     }
 
     /** @brief 세션 토큰의 등급. 만료됐으면 없다. */
@@ -1385,30 +1450,44 @@ impl Auth {
         format!("user\u{1f}{source}\u{1f}{user}")
     }
 
-    /** @brief 리버스 프록시 하나를 거쳐 온 실패 전체의 키. */
-    fn login_proxy_bucket(proxy: &str) -> String {
-        format!("proxy\u{1f}{proxy}")
-    }
-
     /**
-     * @brief 지금 이 출발지와 사용자가 시도할 수 있는지.
+     * @brief 지금 이 출발지와 사용자가 시도할 수 없으면, 다시 시도할 수 있을 때까지의 초.
      * @param proxy 리버스 프록시를 거쳐 왔으면 그 프록시의 주소.
      */
-    fn login_allowed(&self, source: &str, proxy: Option<&str>, user: &str) -> bool {
+    fn login_retry_after(&self, source: &str, proxy: Option<&str>, user: &str) -> Option<u64> {
         let now = now_ms();
         let mut attempts = self.login_attempts.lock_recover();
         attempts.retain(|_, attempt| {
             attempt.blocked_until_ms > now
                 || now.saturating_sub(attempt.window_start_ms) <= LOGIN_WINDOW_MS
         });
-        let allowed = |key: String| {
-            attempts
-                .get(&key)
-                .is_none_or(|attempt| attempt.blocked_until_ms <= now)
-        };
-        allowed(Self::login_source_bucket(source))
-            && allowed(Self::login_user_bucket(source, user))
-            && proxy.is_none_or(|proxy| allowed(Self::login_proxy_bucket(proxy)))
+        let blocked_until = [
+            Self::login_source_bucket(source),
+            Self::login_user_bucket(source, user),
+        ]
+        .iter()
+        .filter_map(|key| attempts.get(key))
+        .map(|attempt| attempt.blocked_until_ms)
+        .max()
+        .unwrap_or(0);
+        drop(attempts);
+        let paced_until = proxy.map_or(0, |proxy| {
+            let next = self
+                .proxy_login_pace
+                .lock_recover()
+                .get(proxy)
+                .copied()
+                .unwrap_or(0);
+            next.saturating_sub((PROXY_LOGIN_FAILURE_BURST - 1) * PROXY_LOGIN_FAILURE_INTERVAL_MS)
+        });
+        let until = blocked_until.max(paced_until);
+        (until > now).then(|| (until - now).div_ceil(1000))
+    }
+
+    #[cfg(test)]
+    /** @brief 지금 이 출발지와 사용자가 시도할 수 있는지. */
+    fn login_allowed(&self, source: &str, proxy: Option<&str>, user: &str) -> bool {
+        self.login_retry_after(source, proxy, user).is_none()
     }
 
     /**
@@ -1423,15 +1502,17 @@ impl Auth {
             return;
         }
         let now = now_ms();
-        let mut buckets = vec![
+        for (key, limit) in [
             (Self::login_user_bucket(source, user), MAX_LOGIN_FAILURES),
             (Self::login_source_bucket(source), MAX_SOURCE_LOGIN_FAILURES),
-        ];
-        if let Some(proxy) = proxy {
-            buckets.push((Self::login_proxy_bucket(proxy), MAX_PROXY_LOGIN_FAILURES));
-        }
-        for (key, limit) in buckets {
+        ] {
             Self::record_login_failure(&mut attempts, key, limit, now);
+        }
+        drop(attempts);
+        if let Some(proxy) = proxy {
+            let mut pace = self.proxy_login_pace.lock_recover();
+            let next = pace.entry(proxy.to_string()).or_insert(0);
+            *next = (*next).max(now) + PROXY_LOGIN_FAILURE_INTERVAL_MS;
         }
     }
 
@@ -1633,15 +1714,17 @@ fn bearer_actor(token: &str) -> String {
 
 /** @brief 이 요청을 누가 보냈는지 감사 로그용으로 정리한다. */
 fn audit_actor(auth: &Auth, bearer: &str, session: &str) -> String {
-    if !session.is_empty() {
-        if let Some(name) = auth.session_name(session) {
-            return audit_identity(&name, "authenticated-user");
-        }
+    if !bearer.is_empty() {
+        return if auth.role_for(bearer).is_some() {
+            bearer_actor(bearer)
+        } else {
+            "anonymous".to_string()
+        };
     }
-    if !bearer.is_empty() && auth.role_for(bearer).is_some() {
-        return bearer_actor(bearer);
+    match auth.session_name(session) {
+        Some(name) if !session.is_empty() => audit_identity(&name, "authenticated-user"),
+        _ => "anonymous".to_string(),
     }
-    "anonymous".to_string()
 }
 
 /**
@@ -2118,13 +2201,18 @@ impl Caller {
      * @brief 로그인 실패를 셀 출발지.
      * @details 프록시를 거쳤으면 실제 클라이언트 주소다. 프록시 주소로 세면 공격자 하나가
      *          프록시 뒤의 모든 관리자를 함께 막는다. 클라이언트 주소를 모르면 프록시 주소로 센다.
+     *          직접 들어온 요청은 모두 이 컴퓨터 안에서 온 것이라 하나로 센다. 주소로 나누면
+     *          Linux에서는 127.0.0.0/8의 아무 주소에서나 접속할 수 있어 출발지를 바꿔 가며
+     *          제한을 피한다.
      */
     fn login_source(&self) -> String {
-        self.proxied
-            .as_ref()
-            .and_then(|proxied| proxied.client)
-            .or(self.peer.map(|peer| peer.ip()))
-            .map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
+        match &self.proxied {
+            Some(proxied) => proxied
+                .client
+                .or(self.peer.map(|peer| peer.ip()))
+                .map_or_else(|| "unknown".to_string(), |ip| ip.to_string()),
+            None => "local".to_string(),
+        }
     }
 
     /** @brief 프록시를 거쳤으면 그 프록시 주소. 프록시 단위 로그인 제한의 키다. */
@@ -3223,6 +3311,17 @@ fn handle_setup(
     let name = field("user").trim().to_string();
     let password = field("password");
 
+    // 비밀번호 해시는 비싸므로 코드부터 본다.
+    if !st.auth.setup_code_matches(&field("code")) {
+        st.audit
+            .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
+        let message = match st.auth.setup_code_file() {
+            Some(file) => format!("The setup code does not match. Copy it from {file}"),
+            None => "OnetDNS has no setup code to check. Restart OnetDNS; it writes a new code next to its configuration file".to_string(),
+        };
+        return refuse(stream, "403 Forbidden", &message);
+    }
+
     if name.is_empty() || name.chars().count() > 64 {
         return refuse(
             stream,
@@ -3270,6 +3369,7 @@ fn handle_setup(
         // 더 넣을 것이 없으므로 실패로 보지 않는다. 계정이 정말 생겼는지는 바로 아래에서
         // 세션을 열어 보며 확인한다.
         st.auth.add_first_user(name.clone(), hash);
+        st.auth.clear_setup_code();
     }
 
     st.audit.record_actor(
@@ -3314,7 +3414,15 @@ fn handle_auth(
     st: &AppState,
 ) -> std::io::Result<()> {
     let peer_s = caller.label();
-    if let Some(role) = st.auth.role_for_session(session) {
+    let bearer = auth
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    if let Some(role) = bearer
+        .is_empty()
+        .then(|| st.auth.role_for_session(session))
+        .flatten()
+    {
         let user = st.auth.session_name(session).unwrap_or_default();
         st.audit.record_actor(
             role.as_str(),
@@ -3324,27 +3432,23 @@ fn handle_auth(
             &peer_s,
             200,
         );
-        let body = auth_status_body(st, true, role.as_str(), &user);
+        let body = auth_status_body(st, caller, true, role.as_str(), &user);
         return write_simple(stream, "200 OK", "application/json", "", &body);
     }
 
     // 제어 토큰은 API 전용이다. 유효한 토큰에게 역할은 알려 주되 세션 쿠키는 발급하지
     // 않는다. 쿠키로 바꿔 주면 사람이 외워 넣을 수 없는 값이 브라우저 자격증명이 되고
     // 토큰 하나가 새면 콘솔 전체가 함께 열린다.
-    let bearer = auth
-        .strip_prefix("Bearer ")
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
     if let Some(role) = st.auth.role_for(bearer) {
         let actor = bearer_actor(bearer);
         st.audit
             .record_actor(role.as_str(), &actor, "GET", "/v1/auth", &peer_s, 200);
-        let body = auth_status_body(st, true, role.as_str(), &actor);
+        let body = auth_status_body(st, caller, true, role.as_str(), &actor);
         return write_simple(stream, "200 OK", "application/json", "", &body);
     }
 
     /* 로그인하지 않은 상태 확인은 남기지 않는다. 인증 없이 누구나 보낼 수 있어서, 남기면 크기가 정해진 감사 기록에서 진짜 기록을 밀어낼 수 있다. */
-    let body = auth_status_body(st, false, "none", "");
+    let body = auth_status_body(st, caller, false, "none", "");
     write_simple(stream, "200 OK", "application/json", "", &body)
 }
 
@@ -3353,13 +3457,27 @@ fn handle_auth(
  * @details 실제 접속이 지나는 handle_auth와 route()의 직접 호출 경로가 같은 본문을 쓰게
  *          하여 두 구현이 서로 어긋나지 않게 한다.
  */
-fn auth_status_body(st: &AppState, authenticated: bool, role: &str, user: &str) -> String {
+fn auth_status_body(
+    st: &AppState,
+    caller: &Caller,
+    authenticated: bool,
+    role: &str,
+    user: &str,
+) -> String {
+    // 경로에는 계정 이름 같은 것이 들어 있다. 첫 계정은 이 컴퓨터에서만 만들 수 있으므로
+    // 프록시를 거친 요청에는 알려 주지 않는다.
+    let setup_code_file = if st.auth.has_users() || caller.proxied.is_some() {
+        None
+    } else {
+        st.auth.setup_code_file()
+    };
     format!(
-        "{{\"login_enabled\":{},\"authenticated\":{},\"role\":{},\"user\":{}}}",
+        "{{\"login_enabled\":{},\"authenticated\":{},\"role\":{},\"user\":{},\"setup_code_file\":{}}}",
         st.auth.has_users(),
         authenticated,
         json::escape(role),
-        json::escape(user)
+        json::escape(user),
+        setup_code_file.map_or_else(|| "null".to_string(), |file| json::escape(&file))
     )
 }
 
@@ -3388,9 +3506,9 @@ fn handle_login(
     let source_key = caller.login_source();
     let proxy_key = caller.login_proxy();
     let attempted_actor = audit_identity(&user, "anonymous");
-    if !st
+    if let Some(retry_after) = st
         .auth
-        .login_allowed(&source_key, proxy_key.as_deref(), &user)
+        .login_retry_after(&source_key, proxy_key.as_deref(), &user)
     {
         st.audit
             .record_actor("none", &attempted_actor, "POST", "/v1/login", &peer_s, 429);
@@ -3398,7 +3516,7 @@ fn handle_login(
             stream,
             "429 Too Many Requests",
             "application/json",
-            "Retry-After: 900\r\n",
+            &format!("Retry-After: {retry_after}\r\n"),
             "{\"ok\":false,\"error\":\"Too many sign-in attempts. Try again shortly\"}",
         );
     }
@@ -4089,9 +4207,9 @@ fn route(
                         .auth
                         .session_name(session)
                         .unwrap_or_else(|| bearer_actor(token));
-                    auth_status_body(st, true, r.as_str(), &user)
+                    auth_status_body(st, caller, true, r.as_str(), &user)
                 }
-                None => auth_status_body(st, false, "none", ""),
+                None => auth_status_body(st, caller, false, "none", ""),
             };
             return ("200 OK", "application/json", body);
         }
@@ -5740,15 +5858,22 @@ mod tests {
     }
 
     /** @brief 날 바이트를 그대로 보내고 응답을 받는다. 파서 자체를 테스트할 때 쓴다. */
-    /** @brief 계정이 하나도 없는 컨트롤 플레인 상태. 첫 실행 화면을 재현한다. */
+    /** @brief 테스트용 일회용 설정 코드. */
+    const TEST_SETUP_CODE: &str = "test-setup-code";
+    /** @brief 테스트용 설정 코드 파일 경로. */
+    const TEST_SETUP_FILE: &str = "/etc/onetdns/setup-code.txt";
+
+    /** @brief 계정이 하나도 없고 설정 코드가 발급된 컨트롤 플레인 상태. 첫 실행 화면을 재현한다. */
     fn state_without_accounts(
         user_create: Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
     ) -> AppState {
         let base = test_state("adm", "ro");
         let mut controls = Controls::noop();
         controls.user_create = user_create;
+        let auth = Auth::new(vec![], vec![]);
+        auth.set_setup_code(TEST_SETUP_CODE, TEST_SETUP_FILE.to_string());
         AppState {
-            auth: Arc::new(Auth::new(vec![], vec![])),
+            auth: Arc::new(auth),
             controls: Arc::new(controls),
             ..base
         }
@@ -5853,7 +5978,8 @@ mod tests {
             "테스트는 계정이 없는 상태에서 시작한다"
         );
 
-        let body = "{\"user\":\"owner\",\"password\":\"correct-horse-battery\"}";
+        let body =
+            "{\"user\":\"owner\",\"password\":\"correct-horse-battery\",\"code\":\"test-setup-code\"}";
         let first = setup_request(&st, body);
         assert!(
             first.starts_with("HTTP/1.1 200 OK"),
@@ -5892,9 +6018,9 @@ mod tests {
         let st =
             state_without_accounts(Box::new(|_, _| panic!("거부된 요청이 설정 파일에 닿았다")));
         for body in [
-            "{\"user\":\"\",\"password\":\"correct-horse-battery\"}",
-            "{\"user\":\"owner\",\"password\":\"short\"}",
-            "{\"user\":\"ow\\\"ner\",\"password\":\"correct-horse-battery\"}",
+            "{\"user\":\"\",\"password\":\"correct-horse-battery\",\"code\":\"test-setup-code\"}",
+            "{\"user\":\"owner\",\"password\":\"short\",\"code\":\"test-setup-code\"}",
+            "{\"user\":\"ow\\\"ner\",\"password\":\"correct-horse-battery\",\"code\":\"test-setup-code\"}",
         ] {
             let response = setup_request(&st, body);
             assert!(
@@ -7919,11 +8045,11 @@ mod tests {
 
     #[test]
     /**
-     * @brief 프록시 뒤의 로그인 실패를 실제 클라이언트마다 세고, 프록시 전체에도 상한을 두는지.
-     * @details 프록시 주소로만 세면 공격자 하나가 모든 관리자를 막는다. 클라이언트 주소로만
+     * @brief 프록시 뒤의 로그인 실패를 실제 클라이언트마다 세고, 프록시 전체는 막지 않고 늦추는지.
+     * @details 프록시 주소로 막으면 공격자 하나가 모든 관리자를 막는다. 클라이언트 주소로만
      *          세면 X-Forwarded-For를 꾸며 무한히 시도할 수 있다.
      */
-    fn proxied_sign_in_failures_are_counted_per_client_and_capped_per_proxy() {
+    fn proxied_sign_in_failures_are_counted_per_client_and_paced_per_proxy() {
         let auth = Auth::default();
         let proxy = Some("127.0.0.1");
         for i in 0..MAX_SOURCE_LOGIN_FAILURES {
@@ -7932,20 +8058,135 @@ mod tests {
         assert!(!auth.login_allowed("198.51.100.7", proxy, "alice"));
         assert!(
             auth.login_allowed("203.0.113.9", proxy, "alice"),
-            "다른 클라이언트까지 막힘"
+            "클라이언트 하나가 한도를 다 쓰자 다른 클라이언트까지 늦춰짐"
         );
 
-        for i in MAX_SOURCE_LOGIN_FAILURES..MAX_PROXY_LOGIN_FAILURES {
+        for i in u64::from(MAX_SOURCE_LOGIN_FAILURES)..PROXY_LOGIN_FAILURE_BURST {
             auth.record_login_result(&format!("client{i}"), proxy, "alice", false);
         }
-        assert!(
-            !auth.login_allowed("203.0.113.9", proxy, "alice"),
-            "출발지를 바꿔 가며 프록시 상한을 넘김"
+        assert_eq!(
+            auth.login_retry_after("203.0.113.9", proxy, "alice"),
+            Some(1),
+            "출발지를 바꿔 가며 프록시 한도를 넘겼는데 늦추지 않거나, 1초보다 오래 막음"
         );
         assert!(
-            auth.login_allowed("127.0.0.1", None, "alice"),
-            "프록시를 거치지 않은 로그인까지 막힘"
+            auth.login_allowed("local", None, "alice"),
+            "프록시를 거치지 않은 로그인까지 늦춰짐"
         );
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            auth.login_allowed("203.0.113.9", proxy, "alice"),
+            "간격이 지나도 프록시를 거친 로그인을 받지 않음"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 루프백으로 직접 들어온 요청의 로그인 실패를 주소와 상관없이 하나로 세는지.
+     * @details Linux에서는 127.0.0.0/8의 아무 주소에서나 접속할 수 있다. 주소로 나누면 주소를
+     *          바꿔 가며 제한을 피한다.
+     */
+    fn direct_sign_in_failures_share_one_local_bucket() {
+        let first = Caller::direct(Some("127.0.0.2:40000".parse().unwrap()));
+        let second = Caller::direct(Some("127.0.0.3:40001".parse().unwrap()));
+        assert_eq!(first.login_source(), second.login_source());
+        assert_eq!(first.login_proxy(), None);
+    }
+
+    #[test]
+    /**
+     * @brief 틀린 베어러 토큰을 보낸 요청이 세션 쿠키로 넘어가 인증되지 않는지.
+     * @details CSRF 검사는 베어러가 있으면 건너뛴다. 틀린 베어러 뒤에서 세션으로 넘어가면
+     *          CSRF 헤더 없는 쿠키 요청이 세션 권한으로 실행된다.
+     */
+    fn a_wrong_bearer_is_not_replaced_by_the_session_cookie() {
+        let mut st = test_state("adm", "ro");
+        st.auth = Arc::new(Auth::new(vec![], vec![]).with_users(vec![UserCred {
+            name: "alice".into(),
+            hash: hash_eventually("s3cret-passphrase").into(),
+            role: Role::Admin,
+        }]));
+        let LoginResult::Success(session, _, _) =
+            login_eventually(st.auth.as_ref(), "alice", "s3cret-passphrase")
+        else {
+            panic!("login ok");
+        };
+        assert_eq!(
+            st.auth.resolve("garbage", &session),
+            None,
+            "틀린 베어러 뒤에서 세션으로 인증됨"
+        );
+        assert_eq!(st.auth.resolve("", &session), Some(Role::Admin));
+        let (with_wrong_bearer, _, _) = route(
+            "POST",
+            "/v1/cache/flush",
+            "Bearer garbage",
+            &session,
+            "",
+            &Caller::direct(None),
+            &st,
+        );
+        assert_eq!(status_code(with_wrong_bearer), 401);
+
+        let request = format!(
+            "POST /v1/cache/flush HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer garbage\r\n\
+             Cookie: onetdns_session={session}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let response = exchange(&st, &request);
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[test]
+    /**
+     * @brief 첫 계정 만들기가 일회용 설정 코드를 요구하고, 만든 뒤에는 코드를 지우는지.
+     * @details 루프백에 접속할 수 있다는 것만으로는 설정 파일을 고칠 권한이 있다고 볼 수 없다.
+     *          같은 컴퓨터의 다른 사용자가 먼저 관리자가 될 수 있다.
+     */
+    fn first_account_setup_requires_the_one_time_code() {
+        let created = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen = created.clone();
+        let st = state_without_accounts(Box::new(move |_, _| {
+            *seen.lock_recover() += 1;
+            Ok("{}".to_string())
+        }));
+        let body = |code: &str| {
+            format!(
+                "{{\"user\":\"owner\",\"password\":\"correct-horse-battery\",\"code\":\"{code}\"}}"
+            )
+        };
+        for wrong in ["", "wrong-code"] {
+            let response = setup_request(&st, &body(wrong));
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        }
+        assert_eq!(*created.lock_recover(), 0, "틀린 코드로 계정을 만듦");
+
+        let status = exchange(&st, "GET /v1/auth HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(
+            status.contains(&format!(
+                "\"setup_code_file\":{}",
+                json::escape(TEST_SETUP_FILE)
+            )),
+            "설정 화면에 코드 파일 경로를 알려 주지 않음: {status}"
+        );
+
+        // 다른 테스트가 비밀번호를 해시하는 중이면 503이 온다. 코드는 그때 쓰이지 않는다.
+        let response = loop {
+            let response = setup_request(&st, &body(TEST_SETUP_CODE));
+            if !response.starts_with("HTTP/1.1 503") {
+                break response;
+            }
+        };
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(*created.lock_recover(), 1);
+        assert!(
+            st.auth.setup_code_file().is_none(),
+            "계정을 만든 뒤에도 설정 코드가 남음"
+        );
+
+        let without_code = state_without_accounts(Box::new(|_, _| panic!("코드 없이 계정을 만듦")));
+        without_code.auth.clear_setup_code();
+        let response = setup_request(&without_code, &body(TEST_SETUP_CODE));
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     }
 
     #[test]

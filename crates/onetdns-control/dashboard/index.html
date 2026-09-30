@@ -1141,7 +1141,10 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
         <label for="setup-password" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">비밀번호</label>
         <input id="setup-password" type="password" autocomplete="new-password" data-k="setupPassword" value="{{ forms.setupPassword }}" onInput="{{ onForm }}" onKeyDown="{{ setupKeyDown }}" placeholder="12자 이상" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px;margin-bottom:14px">
         <label for="setup-confirm" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">비밀번호 확인</label>
-        <input id="setup-confirm" type="password" autocomplete="new-password" data-k="setupConfirm" value="{{ forms.setupConfirm }}" onInput="{{ onForm }}" onKeyDown="{{ setupKeyDown }}" placeholder="비밀번호 다시 입력" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px;margin-bottom:18px">
+        <input id="setup-confirm" type="password" autocomplete="new-password" data-k="setupConfirm" value="{{ forms.setupConfirm }}" onInput="{{ onForm }}" onKeyDown="{{ setupKeyDown }}" placeholder="비밀번호 다시 입력" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px;margin-bottom:14px">
+        <label for="setup-code" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">설정 코드</label>
+        <input id="setup-code" autocomplete="off" spellcheck="false" data-k="setupCode" value="{{ forms.setupCode }}" onInput="{{ onForm }}" onKeyDown="{{ setupKeyDown }}" placeholder="파일에 적힌 코드" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px;font-family:var(--font-mono,monospace);margin-bottom:6px">
+        <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:18px;word-break:break-all">{{ setupCodeHint }}</div>
         <button onClick="{{ createAccount }}" disabled="{{ authPending }}" style="width:100%;padding:12px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:14px;font-weight:600;cursor:pointer;opacity:{{ authButtonOpacity }}">{{ setupButtonLabel }}</button>
         </sc-if>
         <sc-if value="{{ loginEnabled }}">
@@ -1368,6 +1371,11 @@ Object.assign(I18N.en, {
   "계정을 만들었습니다. 방금 만든 계정으로 로그인하세요": "Account created. Sign in with the account you just made",
   "비밀번호 확인": "Confirm password",
   "비밀번호 다시 입력": "Re-enter the password",
+  "설정 코드": "Setup code",
+  "파일에 적힌 코드": "Code from the file",
+  "설정 코드를 입력하세요": "Enter the setup code",
+  "OnetDNS가 이 파일에 적어 둔 코드를 붙여 넣으세요:": "Paste the code OnetDNS wrote to this file:",
+  "OnetDNS를 다시 시작하면 설정 파일 옆의 setup-code.txt에 코드를 적습니다.": "Restart OnetDNS and it writes a code to setup-code.txt next to its configuration file.",
   "이 서버의 DHCP가 꺼져 있습니다.": "DHCP is off on this server.",
   "아직 추가한 차단 규칙이 없습니다.": "No block rules yet.",
   "아직 추가한 허용 규칙이 없습니다.": "No allow rules yet.",
@@ -1601,6 +1609,11 @@ Object.assign(I18N.ja, {
   "계정을 만들었습니다. 방금 만든 계정으로 로그인하세요": "アカウントを作成しました。作成したアカウントでサインインしてください",
   "비밀번호 확인": "パスワードの確認",
   "비밀번호 다시 입력": "パスワードを再入力",
+  "설정 코드": "セットアップコード",
+  "파일에 적힌 코드": "ファイルに書かれたコード",
+  "설정 코드를 입력하세요": "セットアップコードを入力してください",
+  "OnetDNS가 이 파일에 적어 둔 코드를 붙여 넣으세요:": "OnetDNS がこのファイルに書き込んだコードを貼り付けてください:",
+  "OnetDNS를 다시 시작하면 설정 파일 옆의 setup-code.txt에 코드를 적습니다.": "OnetDNS を再起動すると、設定ファイルと同じフォルダーの setup-code.txt にコードが書き込まれます。",
   "이 서버의 DHCP가 꺼져 있습니다.": "このサーバーの DHCP はオフです。",
   "아직 추가한 차단 규칙이 없습니다.": "ブロックルールはまだありません。",
   "아직 추가한 허용 규칙이 없습니다.": "許可ルールはまだありません。",
@@ -3517,6 +3530,11 @@ Object.assign(I18N.zh, {
   "계정을 만들었습니다. 방금 만든 계정으로 로그인하세요":"已创建账户。请使用刚创建的账户登录",
   "비밀번호 확인":"确认密码",
   "비밀번호 다시 입력":"再次输入密码",
+  "설정 코드":"设置代码",
+  "파일에 적힌 코드":"文件中的代码",
+  "설정 코드를 입력하세요":"请输入设置代码",
+  "OnetDNS가 이 파일에 적어 둔 코드를 붙여 넣으세요:":"请粘贴 OnetDNS 写入此文件的代码：",
+  "OnetDNS를 다시 시작하면 설정 파일 옆의 setup-code.txt에 코드를 적습니다.":"重新启动 OnetDNS 后，它会把代码写入配置文件旁的 setup-code.txt。",
   "이 서버의 DHCP가 꺼져 있습니다.":"此服务器的 DHCP 已关闭。",
   "아직 추가한 차단 규칙이 없습니다.":"尚未添加拦截规则。",
   "아직 추가한 허용 규칙이 없습니다.":"尚未添加允许规则。",
@@ -4532,7 +4550,7 @@ class Component extends DCLogic {
              clName:'', clId:'', exQname:'', exQtype:'A', exClient:'',
              upAddr:'', zoneName:'', zoneOrigin:'', zoneText:'', recName:'', recType:'A', recVal:'', config:'', acmeMethod:'DNS-01',
              acmeDomain:'', certPem:'', keyPem:'', certFileName:'fullchain.pem 선택…', keyFileName:'privkey.pem 선택…',
-             resIdentity:'', resIp:'', resHost:'', rootAddr:'', cpKey:'', cpVal:'', cfgSearch:'', setupUser:'admin',setupPassword:'',setupConfirm:'', loginUser:'',loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',tokRole:'readonly',
+             resIdentity:'', resIp:'', resHost:'', rootAddr:'', cpKey:'', cpVal:'', cfgSearch:'', setupUser:'admin',setupPassword:'',setupConfirm:'',setupCode:'', loginUser:'',loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',tokRole:'readonly',
              rewriteDomain:'',rewriteAnswer:'',restoreFileName:'백업 파일 선택…',dnssecZone:'' },
 
     blocklists: [],
@@ -4757,7 +4775,7 @@ class Component extends DCLogic {
     const role=String(a.role||'none');
     const logged=!!a.authenticated;
     const user=String(a.user||'');
-    this.setState({authPending:false,loginEnabled:a.login_enabled!==false,loggedIn:logged,authRole:role,restOnline:true,account:{user,display:user,tokenReveal:false},connectionState:'degraded'},()=>{ if(logged) this.bootLoad(); });
+    this.setState({authPending:false,loginEnabled:a.login_enabled!==false,setupCodeFile:a.setup_code_file||'',loggedIn:logged,authRole:role,restOnline:true,account:{user,display:user,tokenReveal:false},connectionState:'degraded'},()=>{ if(logged) this.bootLoad(); });
     return logged;
   }
   bootLoad(){
@@ -5562,18 +5580,19 @@ class Component extends DCLogic {
   createAccount=async()=>{
     if(this.state.authPending)return;
     const f=this.state.forms;
-    const user=(f.setupUser||'').trim(),password=f.setupPassword||'',confirm=f.setupConfirm||'';
+    const user=(f.setupUser||'').trim(),password=f.setupPassword||'',confirm=f.setupConfirm||'',code=(f.setupCode||'').trim();
     if(!user)return this.toastMsg('아이디를 입력하세요',true);
     if([...password].length<12)return this.toastMsg('비밀번호는 12자 이상이어야 합니다',true);
     if(password!==confirm)return this.toastMsg('두 비밀번호가 서로 다릅니다',true);
+    if(!code)return this.toastMsg('설정 코드를 입력하세요',true);
     this.setState({authPending:true});
-    const r=await this.request('/v1/setup',{method:'POST',headers:this.apiHdr({'Content-Type':'application/json'}),body:JSON.stringify({user,password})});
+    const r=await this.request('/v1/setup',{method:'POST',headers:this.apiHdr({'Content-Type':'application/json'}),body:JSON.stringify({user,password,code})});
     if(!r.ok){
       this.setState({authPending:false});
       return this.toastMsg('계정을 만들지 못했습니다: '+this.errorText(r),true);
     }
     this._booted=false;
-    this.setState(s=>({authPending:false,forms:{...s.forms,setupPassword:'',setupConfirm:''}}));
+    this.setState(s=>({authPending:false,forms:{...s.forms,setupPassword:'',setupConfirm:'',setupCode:''}}));
     const logged=await this.checkAuth();
     if(logged)this.toastMsg('관리자 계정을 만들고 로그인했습니다');
     else this.toastMsg('계정을 만들었습니다. 방금 만든 계정으로 로그인하세요',true);
@@ -6357,7 +6376,8 @@ class Component extends DCLogic {
     return {
       shell,brand:(this.props.brand||'OnetDNS'),
       configOutOfSync,configStatusTitle:this.t(configCheckFailed?'설정 동기화 상태 확인 실패':'미적용 설정 파일 변경'),configStatusText,configStatusKeys,configApplyLabel:this.t('설정 파일 변경 적용'),configApplyDisabled:configCheckFailed||Object.keys(s.mutationPending||{}).length>0||s.authRole!=='admin',configApplyOpacity:(configCheckFailed||Object.keys(s.mutationPending||{}).length>0||s.authRole!=='admin')?'0.55':'1',applyDiskConfig:this.applyDiskConfig,
-      loginEnabled:s.loginEnabled,noAccounts:!s.loginEnabled,authPending:s.authPending,authButtonOpacity:s.authPending?'0.55':'1',loginButtonLabel:this.t(s.authPending?'확인 중…':'로그인'),
+      loginEnabled:s.loginEnabled,noAccounts:!s.loginEnabled,
+      setupCodeHint:s.setupCodeFile?this.t('OnetDNS가 이 파일에 적어 둔 코드를 붙여 넣으세요:')+' '+s.setupCodeFile:this.t('OnetDNS를 다시 시작하면 설정 파일 옆의 setup-code.txt에 코드를 적습니다.'),authPending:s.authPending,authButtonOpacity:s.authPending?'0.55':'1',loginButtonLabel:this.t(s.authPending?'확인 중…':'로그인'),
       // 제어 토큰은 API 전용이다. 사람이 외워 넣을 값이 아니므로 웹 콘솔은 계정으로만 받는다.
       createAccount:this.createAccount, setupKeyDown:this.setupKeyDown,
       setupButtonLabel:this.t(s.authPending?'만드는 중…':'관리자 계정 만들기'),

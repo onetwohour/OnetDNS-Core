@@ -98,7 +98,7 @@ OnetDNS --config OnetDNS.toml
 
 On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it works without admin rights; to start it with Windows, run `OnetDNS service install --config OnetDNS.toml`.
 
-**4. Open the dashboard** at <http://127.0.0.1:8553> on the same machine and create your admin account.
+**4. Open the dashboard** at <http://127.0.0.1:8553> on the same machine and create your admin account. It asks for a setup code: OnetDNS writes one to `setup-code.txt` next to its configuration file, and the page shows the exact path. The code works once.
 
 **5. Point your devices at it.** In your router's settings, set the DNS server to this machine's address. Every device picks it up the next time it reconnects. To try it on one device first, change the DNS setting on that device only.
 

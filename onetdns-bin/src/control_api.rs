@@ -2041,6 +2041,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
                         append_user_block(text, name, hash)
                     })?;
+                if let Some(code_file) = crate::setup_code_path(path.as_deref()) {
+                    crate::remove_setup_code_file(&code_file);
+                }
                 Ok(format!(
                     "{{\"created\":true,\"mode\":\"{}\",\"restart_required\":{}}}",
                     result.mode.as_str(),

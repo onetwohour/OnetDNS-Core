@@ -1554,6 +1554,7 @@ pub fn serve(
             proxy: control_proxy,
         };
         *console_auth.lock_recover() = Some(state.auth.clone());
+        issue_setup_code(&state.auth, config_path.as_deref());
         let state_for_control = state;
 
         install_restart(&restarts.control, {
@@ -2530,6 +2531,84 @@ fn json_str_array(items: &[String]) -> String {
         .map(|s| onetdns_core::json::escape(s))
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+/** @brief 첫 관리자 계정용 일회용 설정 코드를 적는 파일 이름. 설정 파일과 같은 폴더에 둔다. */
+const SETUP_CODE_FILE_NAME: &str = "setup-code.txt";
+
+/**
+ * @brief 설정 코드 파일 경로. 설정 파일이 없으면 없다.
+ * @details 실행 파일 옆이 아니라 설정 파일 옆에 둔다. 실행 파일이 있는 폴더는 다른 사용자도
+ *          읽거나 쓸 수 있는 경우가 많고, 설정 파일 폴더는 이미 제어 토큰 같은 비밀을 담는
+ *          곳이라 서비스 계정만 읽도록 되어 있다. 같은 실행 파일로 설정을 달리해 띄운 인스턴스도
+ *          서로의 코드를 덮어쓰지 않는다.
+ */
+fn setup_code_path(config_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let dir = config_path?.parent()?;
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    };
+    Some(dir.join(SETUP_CODE_FILE_NAME))
+}
+
+/**
+ * @brief 계정이 없으면 첫 관리자 계정용 일회용 설정 코드를 발급해 파일에 적는다.
+ * @details 계정이 이미 있으면 남아 있는 코드 파일을 지운다. 로그에는 코드가 아니라 파일 경로만
+ *          남긴다. 로그는 설정 폴더보다 넓게 읽히는 경우가 많다.
+ */
+fn issue_setup_code(auth: &onetdns_control::Auth, config_path: Option<&std::path::Path>) {
+    let path = setup_code_path(config_path);
+    if auth.has_users() {
+        auth.clear_setup_code();
+        if let Some(path) = path {
+            remove_setup_code_file(&path);
+        }
+        return;
+    }
+    let Some(path) = path else {
+        auth.clear_setup_code();
+        onetdns_core::warn!(
+            event = "console.setup_code_unavailable",
+            "No configuration file, so there is nowhere to write a setup code. Add a [[users]] entry to create the first dashboard account"
+        );
+        return;
+    };
+    let code: String = gen_token().chars().take(32).collect();
+    match atomic_write_secret(&path, format!("{code}\n").as_bytes()) {
+        Ok(()) => {
+            auth.set_setup_code(&code, path.display().to_string());
+            onetdns_core::warn!(
+                event = "console.setup_code_issued",
+                path = %path.display(),
+                "No dashboard account exists yet. Open the dashboard and enter the setup code from this file to create the first administrator"
+            );
+        }
+        Err(error) => {
+            auth.clear_setup_code();
+            onetdns_core::error!(
+                event = "console.setup_code_write_failed",
+                path = %path.display(),
+                %error,
+                "Could not write the setup code, so the dashboard cannot create the first account"
+            );
+        }
+    }
+}
+
+/** @brief 쓴 설정 코드 파일을 지운다. 없으면 할 일이 없다. */
+fn remove_setup_code_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => onetdns_core::warn!(
+            event = "console.setup_code_remove_failed",
+            path = %path.display(),
+            %error,
+            "Could not delete the used setup code file. It no longer works; delete it by hand"
+        ),
+    }
 }
 
 /** @brief 관리 화면 앞의 리버스 프록시 정책을 설정에서 만든다. */
