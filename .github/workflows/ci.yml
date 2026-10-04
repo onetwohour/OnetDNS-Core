@@ -438,3 +438,29 @@ jobs:
         run: |
           cargo test -p onetdns-forward --release -- --ignored --nocapture \
             doh_live_cloudflare doh3_live_cloudflare doq_live_adguard
+
+  # Single stable status check for branch protection. Keep the external live-interop
+  # job out of this gate because it is intentionally non-blocking and only runs on
+  # schedule or manual dispatch.
+  merge-gate:
+    name: merge gate
+    if: always()
+    needs:
+      - repository-verifiers
+      - lint
+      - test
+      - minimal-build
+      - pointer-width-32
+      - release-targets
+      - supply-chain
+      - parser-panic-sweep
+      - interop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all merge checks
+        shell: bash
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          echo "$NEEDS" | jq .
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' >/dev/null
