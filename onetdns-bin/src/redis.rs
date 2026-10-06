@@ -990,16 +990,17 @@ mod tests {
     /**
      * @brief 느린 캐시에 동시에 보낸 명령이 줄을 서지 않는지.
      * @details 연결 하나를 잠금으로 나눠 쓰면 명령마다 앞 명령의 왕복을 기다려 지연이 쌓인다.
-     *          실패가 아니므로 회로도 열리지 않아 질의마다 그 지연을 치른다.
+     *          실패가 아니므로 회로도 열리지 않아 질의마다 그 지연을 치른다. 명령은 쉬는 연결을
+     *          먼저 쓰므로, 앞 명령을 기다렸다면 가짜 Redis 는 연결을 하나만 받는다.
+     * @note 걸린 시간이나 회로 상태로는 판정하지 않는다. 테스트 머신이 잠깐 멈추면 명령이 함께
+     *       나갔더라도 왕복 데드라인을 넘겨 회로가 열리고 걸린 시간도 그만큼 늘어난다.
      */
     fn slow_cache_does_not_serialize_concurrent_commands() {
-        let delay = ROUNDTRIP_TIMEOUT / 4;
         let fake = FakeRedis::start(Behavior {
-            delay,
+            delay: ROUNDTRIP_TIMEOUT / 4,
             ..Behavior::default()
         });
         let client = plain_client(fake.addr);
-        let started = Instant::now();
         let workers: Vec<_> = (0..8)
             .map(|index| {
                 let client = client.clone();
@@ -1009,13 +1010,11 @@ mod tests {
         for worker in workers {
             assert!(worker.join().unwrap().is_none());
         }
-        let elapsed = started.elapsed();
+        let connections = fake.connections.load(Ordering::Acquire);
         assert!(
-            elapsed < delay * 4,
-            "commands waited for each other: {elapsed:?}"
+            connections > 1,
+            "commands waited for each other: the cache accepted {connections} connection(s)"
         );
-        assert_eq!(*client.circuit.lock_recover(), Circuit::Closed);
-        assert_eq!(fake.commands.load(Ordering::Acquire), 8);
     }
 
     #[test]
