@@ -262,19 +262,19 @@ impl QpackCtx {
             let mut data = Vec::new();
             varint::write(&mut data, UNI_CONTROL);
             encode_frame(&mut data, FRAME_SETTINGS, &our_settings());
-            conn.send_stream(self.ctrl_sid.ok_or(QuicError::StreamLimit)?, &data, false)?;
+            send_critical(conn, self.ctrl_sid.ok_or(QuicError::StreamLimit)?, &data)?;
             self.ctrl_sent = true;
         }
         if !self.enc_sent {
             let mut data = Vec::new();
             varint::write(&mut data, UNI_QPACK_ENCODER);
-            conn.send_stream(self.enc_sid.ok_or(QuicError::StreamLimit)?, &data, false)?;
+            send_critical(conn, self.enc_sid.ok_or(QuicError::StreamLimit)?, &data)?;
             self.enc_sent = true;
         }
         if !self.dec_sent {
             let mut data = Vec::new();
             varint::write(&mut data, UNI_QPACK_DECODER);
-            conn.send_stream(self.dec_sid.ok_or(QuicError::StreamLimit)?, &data, false)?;
+            send_critical(conn, self.dec_sid.ok_or(QuicError::StreamLimit)?, &data)?;
             self.dec_sent = true;
         }
         Ok(())
@@ -395,7 +395,7 @@ impl QpackCtx {
         let (section, enc_bytes) = self.enc.encode_field_section(headers);
         if !enc_bytes.is_empty() {
             if let Some(sid) = self.enc_sid {
-                if let Err(error) = conn.send_stream(sid, &enc_bytes, false) {
+                if let Err(error) = send_critical(conn, sid, &enc_bytes) {
                     self.enc.restore_encoder_stream(enc_bytes);
                     return Err(error);
                 }
@@ -412,7 +412,7 @@ impl QpackCtx {
         let out = self.dec.take_decoder_stream();
         if !out.is_empty() {
             if let Some(sid) = self.dec_sid {
-                if let Err(error) = conn.send_stream(sid, &out, false) {
+                if let Err(error) = send_critical(conn, sid, &out) {
                     self.dec.restore_decoder_stream(out);
                     return Err(error);
                 }
@@ -422,6 +422,19 @@ impl QpackCtx {
             }
         }
         Ok(())
+    }
+}
+
+/**
+ * @brief 제어 스트림이나 QPACK 스트림으로 보낸다.
+ * @details 이 스트림들이 닫히면 HTTP/3 연결은 이어 갈 수 없다. 상대가 STOP_SENDING 으로
+ *          닫은 것을 스트림 오류로 돌려주면 부른 쪽이 연결을 살려 두고, 그 뒤로 헤더 테이블
+ *          갱신이 상대에게 닿지 않는다. 그래서 연결 오류로 바꾼다.
+ */
+fn send_critical(conn: &mut Connection, id: u64, data: &[u8]) -> Result<(), QuicError> {
+    match conn.send_stream(id, data, false) {
+        Err(QuicError::StreamClosed) => Err(QuicError::Frame),
+        other => other,
     }
 }
 
@@ -778,7 +791,7 @@ impl H3Connection {
 
     /** @brief 모은 데이터에서 요청을 추출해 본다. 덜 왔으면 다시 넣어 둔다. */
     fn try_extract(&mut self, id: u64, buf: Vec<u8>) -> Result<(), QuicError> {
-        match extract_dns_request(&mut self.qp.dec, id, &buf) {
+        let status = match extract_dns_request(&mut self.qp.dec, id, &buf) {
             Extracted::Done(mut q) => {
                 if self.ready.len() >= MAX_H3_STREAMS
                     || !fits_connection_buffer(self.buffered_bytes(), q.wire.len())
@@ -787,20 +800,28 @@ impl H3Connection {
                 }
                 q.stream_id = id;
                 self.ready.push(q);
+                return Ok(());
             }
             Extracted::Blocked => {
                 if self.blocked.len() < QPACK_BLOCKED as usize
                     && fits_connection_buffer(self.buffered_bytes(), buf.len())
                 {
                     self.blocked.push((id, buf));
-                } else {
-                    return Err(QuicError::Frame);
+                    return Ok(());
                 }
+                return Err(QuicError::Frame);
             }
-            Extracted::Bad => self.send_status(id, b"400")?,
-            Extracted::Refused(status) => self.send_status(id, status)?,
+            Extracted::Bad => b"400".as_slice(),
+            Extracted::Refused(status) => status,
+        };
+        /*
+         * 상대가 이 스트림의 답을 이미 거절했으면 보낼 곳이 없을 뿐이다. 그 오류를 올리면
+         * recv_datagram 이 실패하고, 부른 쪽은 연결 전체를 버린다.
+         */
+        match self.send_status(id, status) {
+            Ok(()) | Err(QuicError::StreamClosed) => Ok(()),
+            Err(error) => Err(error),
         }
-        Ok(())
     }
 
     /** @brief 데이터그램 하나를 받아 상태를 진행시킨다. */
@@ -1883,6 +1904,111 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].0, 0);
         assert_eq!(responses[0].1, 400);
+    }
+
+    /** @brief RFC 9114 의 H3_REQUEST_CANCELLED. 클라이언트가 요청을 거둘 때 쓴다. */
+    const H3_REQUEST_CANCELLED: u64 = 0x010c;
+
+    #[test]
+    /**
+     * @brief 상대가 요청 스트림 하나를 멈추면 그 스트림만 실패하는지.
+     * @details 워커가 늦게 낸 답을 멈춘 스트림에 실으면 스트림 오류여야 한다. 연결 오류로
+     *          올리면 서버가 같은 연결에 실린 다른 질의까지 버린다.
+     */
+    fn stopped_request_stream_fails_alone() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+
+        let cancelled = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 cancelled")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 1);
+        client
+            .conn_mut()
+            .send_stop_sending_for_test(cancelled, H3_REQUEST_CANCELLED);
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            server.send_response(cancelled, b"\x00\x00 late", 60),
+            Err(QuicError::StreamClosed)
+        );
+        assert!(!server.is_closed());
+
+        let next = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 next")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            server.take_requests(),
+            vec![(next, b"\x00\x00 next".to_vec())]
+        );
+        server.send_response(next, b"\x00\x00 answer", 60).unwrap();
+        pump_h3(&mut client, &mut server);
+        assert!(client
+            .take_responses()
+            .contains(&(next, 200, b"\x00\x00 answer".to_vec())));
+    }
+
+    #[test]
+    /**
+     * @brief 받자마자 내는 상태 답이 멈춘 스트림을 만나도 연결이 남는지.
+     * @details 잘못된 요청에는 그 자리에서 400 을 보낸다. 상대가 그 스트림을 이미 멈췄으면
+     *          보낼 곳이 없을 뿐이다. recv_datagram 이 실패하면 부른 쪽이 연결을 버린다.
+     */
+    fn immediate_status_to_a_stopped_stream_keeps_the_connection() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+
+        let mut invalid = Vec::new();
+        encode_frame(&mut invalid, FRAME_DATA, b"not a request");
+        client
+            .conn_mut()
+            .send_stream(0, &invalid[..1], false)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        client
+            .conn_mut()
+            .send_stop_sending_for_test(0, H3_REQUEST_CANCELLED);
+        pump_h3(&mut client, &mut server);
+        client
+            .conn_mut()
+            .send_stream(0, &invalid[1..], true)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+
+        assert!(!server.is_closed());
+        assert!(server.take_requests().is_empty());
+    }
+
+    #[test]
+    /**
+     * @brief 상대가 이쪽 QPACK 인코더 스트림을 멈추면 연결 오류가 되는지.
+     * @details 필수 스트림이 닫히면 HTTP/3 연결은 이어 갈 수 없다. 스트림 오류로 돌려주면
+     *          부른 쪽이 연결을 살려 두고, 그 뒤 헤더 테이블 갱신이 상대에게 닿지 않는다.
+     */
+    fn stopped_critical_stream_is_a_connection_error() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+        let id = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 query")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 1);
+
+        let encoder = server.qp.enc_sid.expect("서버 인코더 스트림");
+        client.conn_mut().send_stop_sending_for_test(encoder, 0);
+        /*
+         * 서버가 돌려줄 RESET_STREAM 은 클라이언트에게도 필수 스트림 종료라서 연결 오류다.
+         * 서버의 판정만 보려고 클라이언트가 보낸 것만 전달한다.
+         */
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        /* 새 max-age 값은 동적 테이블에 넣어야 하므로 인코더 스트림으로 보낼 것이 생긴다. */
+        assert_eq!(
+            server.send_response(id, b"\x00\x00 answer", 4242),
+            Err(QuicError::Frame)
+        );
     }
 
     #[test]

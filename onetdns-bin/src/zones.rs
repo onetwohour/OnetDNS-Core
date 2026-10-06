@@ -12,16 +12,17 @@ use onetdns_authority::source::SourceDigest;
 use onetdns_config::Config;
 use onetdns_core::MutexExt;
 
+use crate::config_apply::config_write_lock;
 use crate::error::{BoxResult, Context};
-use crate::native_config::private_resource_id;
+use crate::native_config::{build_authority_settings, private_resource_id, NativeHotState};
 use crate::notify::{start_notify_dispatcher, NotifySender};
 use crate::secondary::load_secondary_cache;
 use crate::zone_signing::{
-    load_zone_signer, sign_authority_zone, SharedZoneSigners, ZoneSigningCtx,
+    load_zone_signer, sign_authority_zone, SharedZoneSigners, ZoneKeyReload, ZoneSigningCtx,
 };
 use crate::{
-    native, read_bytes_limited, sleep_or_retire, track_service_thread, tsig_for_secondary,
-    unix_now, upstream, ServiceCleanup, LOCAL_CA_MAX_BYTES,
+    native, read_bytes_limited, sleep_or_retire, sleep_or_shutdown, track_service_thread,
+    tsig_for_secondary, unix_now, upstream, ServiceCleanup, LOCAL_CA_MAX_BYTES,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1054,7 +1055,75 @@ pub(crate) fn apply_zone_mutation_locked(
 }
 
 /** @brief 설정에 직접 적은 영역 파일을 다시 확인하는 주기(초). 디렉터리 감시와 같다. */
-pub(crate) const ZONE_FILE_WATCH_SECS: u64 = 10;
+const ZONE_FILE_WATCH_SECS: u64 = 10;
+
+/**
+ * @brief 설정에 직접 적은 영역 파일을 주기마다 확인하는 스레드를 띄운다.
+ * @details 이 파일들도 zones_dir 의 파일과 똑같이 편집된다. 보지 않으면 직렬 번호를 올려도 이
+ *          서버가 옛 영역을 계속 답하고, 세컨더리는 변경을 영영 받지 못한다.
+ * @param reload 편집된 영역들을 설정 전체로 다시 만드는 함수.
+ */
+pub(crate) fn spawn_zone_file_watch(
+    runtime_cfg: Arc<onetdns_core::ArcSwap<Config>>,
+    reload: ZoneKeyReload,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("zones-file-watch".into())
+        .spawn(move || {
+            let mut seen: std::collections::HashMap<PathBuf, std::time::SystemTime> =
+                zone_file_mtimes(&runtime_cfg.load());
+            loop {
+                if sleep_or_shutdown(ZONE_FILE_WATCH_SECS, &shutdown) {
+                    break;
+                }
+                let cfg = runtime_cfg.load();
+                let now = zone_file_mtimes(&cfg);
+                let origins = zones_with_edited_files(&cfg, &seen, &now);
+                if origins.is_empty() {
+                    seen = now;
+                    continue;
+                }
+                match reload(&origins) {
+                    Ok(()) => {
+                        seen = now;
+                        onetdns_core::info!(
+                            event = "authority.zones_reloaded_file",
+                            zones = origins.len(),
+                            "Reloaded changed zone files and replaced the running zones"
+                        );
+                    }
+                    /*
+                     * mtime 을 남겨 두면 다음 주기에 다시 시도한다. 편집 도중의 반쪽 파일은
+                     * 그렇게 저절로 회복된다.
+                     */
+                    Err(error) => onetdns_core::warn!(
+                        event = "authority.zone_file_reload_failed",
+                        %error,
+                        "Could not read the changed zone file; still answering from the previous zone"
+                    ),
+                }
+            }
+        })
+}
+
+/** @brief 설정에 적은 영역과 그 파일. 파일이 없는 영역이 있으면 실패한다. */
+pub(crate) fn configured_zone_files(
+    cfg: &Config,
+) -> Result<Vec<(onetdns_proto::Name, PathBuf)>, String> {
+    cfg.zones
+        .iter()
+        .map(|zone| {
+            let origin = onetdns_proto::Name::from_str(&zone.origin)
+                .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
+            let file = zone
+                .file
+                .clone()
+                .ok_or_else(|| format!("DNS zone '{}' has no file setting", zone.origin))?;
+            Ok((origin, file))
+        })
+        .collect()
+}
 
 /**
  * @brief 파일이 편집된 영역들의 이름.
@@ -1064,7 +1133,7 @@ pub(crate) const ZONE_FILE_WATCH_SECS: u64 = 10;
  * @param previous 지난 주기에 본 수정 시각.
  * @param current 이번 주기에 본 수정 시각.
  */
-pub(crate) fn zones_with_edited_files(
+fn zones_with_edited_files(
     cfg: &Config,
     previous: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
     current: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
@@ -1083,9 +1152,7 @@ pub(crate) fn zones_with_edited_files(
 }
 
 /** @brief 설정에 직접 적은 영역 파일들의 지금 수정 시각. 읽지 못하는 파일은 빠진다. */
-pub(crate) fn zone_file_mtimes(
-    cfg: &Config,
-) -> std::collections::HashMap<PathBuf, std::time::SystemTime> {
+fn zone_file_mtimes(cfg: &Config) -> std::collections::HashMap<PathBuf, std::time::SystemTime> {
     cfg.zones
         .iter()
         .filter_map(|zone| zone.file.clone())
@@ -1220,6 +1287,51 @@ impl ZoneState {
             notify,
             watchers,
         })
+    }
+
+    /**
+     * @brief 설정 전체로 서명 키와 저장소를 다시 만들어 교체하는 함수를 만든다.
+     * @details 원본 하나만 바꿔 끼우지 않는 이유는 서명과 TSIG, ZONEMD 정책이 설정으로 만드는
+     *          경로에만 있기 때문이다. 넘겨받은 영역은 새 시리얼로 NOTIFY 대기열에 넣는다.
+     * @param native_hot_state 질의 처리기의 권한 영역 설정도 함께 바꾼다. 처리기를 만들기 전이면
+     *                         저장소만 바꾼다.
+     */
+    pub(crate) fn reload_from_config(
+        &self,
+        runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
+        native_hot_state: &Arc<Mutex<Option<NativeHotState>>>,
+    ) -> ZoneKeyReload {
+        let runtime = runtime_cfg.clone();
+        let signers = self.signers.clone();
+        let store_slot = self.store.clone();
+        let journal = self.journal.clone();
+        let hot_state = native_hot_state.clone();
+        let notify = self.notify.clone();
+        Arc::new(
+            move |rolled: &[onetdns_proto::Name]| -> Result<(), String> {
+                let _write_guard = config_write_lock().lock_recover();
+                let cfg = runtime.load();
+                let settings = build_authority_settings(&cfg)?;
+                let native = hot_state.lock_recover().clone();
+                /*
+                 * 원본을 다시 읽는 동안에도 영역 변경 잠금을 잡는다. 읽은 뒤에 들어온 동적 갱신은
+                 * 새 저장소에 없으므로, 교체하면 그 갱신이 사라진다.
+                 */
+                let mut journals = journal.lock_recover();
+                let store = build_zone_store(&cfg, &settings.tsig_keys, &settings.zone_signers)?;
+                signers.store(Arc::new(settings.zone_signers.clone()));
+                if let Some(state) = native.as_ref() {
+                    state.authority.store(Arc::new(settings));
+                }
+                for origin in rolled {
+                    if let Some(zone) = store.zone_exact(origin) {
+                        notify.enqueue(origin, zone.soa().serial);
+                    }
+                }
+                replace_zone_store(&store_slot, &mut journals, Arc::new(store));
+                Ok(())
+            },
+        )
     }
 }
 
@@ -1363,13 +1475,13 @@ mod tests {
             .collect();
         assert_ne!(old_keys, new_keys, "자격증명 변경은 감시자를 교체한다");
         assert_eq!(
-            config_changed_keys(&applied, &desired).unwrap(),
+            config_changed_keys(&applied, &desired),
             vec!["zones_mysql".to_string(), "zones_postgres".to_string()]
         );
 
         applied.zones_postgres = desired.zones_postgres.clone();
         applied.zones_mysql = desired.zones_mysql.clone();
-        assert!(config_changed_keys(&applied, &desired).unwrap().is_empty());
+        assert!(config_changed_keys(&applied, &desired).is_empty());
     }
 
     #[test]

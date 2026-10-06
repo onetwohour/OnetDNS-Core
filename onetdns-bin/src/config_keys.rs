@@ -2,8 +2,12 @@
  * @brief 설정 키마다 실행 중 서버가 그 값을 다루는 방식을 정한 표.
  *
  * @details 키 하나에 세 가지를 정한다. 값을 바꿨을 때 무엇을 교체하는지, 클러스터가 그
- *          값을 공유하는지, 그리고 어느 빠른 경로를 닫는지다. 행을 만드는 함수가 셋을 모두
+ *          값을 공유하는지, 그리고 어느 빠른 경로를 닫는지다. 행을 만드는 매크로가 셋을 모두
  *          인자로 받으므로 키를 추가하면서 하나라도 정하지 않으면 컴파일되지 않는다.
+ *
+ *          매크로는 키 이름을 Config 필드로 받아 그 필드를 비교하는 함수도 만든다. 설정에서
+ *          무엇이 바뀌었는지는 키마다 이 함수로 판정한다. 필드와 이름이 다른 키는 컴파일되지
+ *          않으므로, 바뀌었는데 이름을 댈 수 없는 변경은 생기지 않는다.
  *
  *          이 판단이 여러 목록에 흩어져 있으면 새 키를 어느 목록에 빠뜨려도 아무것도
  *          실패하지 않는다. 빠른 경로 조건에서 빠지면 캐시가 그 기능을 거치지 않은 답을
@@ -13,6 +17,7 @@
 
 use crate::native_config::LaneFacts;
 use onetdns_config::{BackendKind, Config, EcsMode};
+use onetdns_core::IpNet;
 
 /**
  * @brief 값이 바뀌었을 때 세대를 새로 만들지 않고 교체하는 부분.
@@ -96,16 +101,103 @@ pub(crate) enum ApplyGroup {
     Views,
 }
 
+impl ApplyGroup {
+    /**
+     * @brief 이 그룹을 교체할 때 함께 다시 만들어야 하는 그룹.
+     * @details 가장자리 서비스를 다시 띄우면 DHCP 임대 풀이 새로 만들어지는데, 해석 체인의 DHCP
+     *          DNS 계층이 체인을 만들 때 그 풀을 붙잡는다.
+     */
+    pub(crate) fn also_rebuilds(self) -> Option<ApplyGroup> {
+        match self {
+            ApplyGroup::EdgeServices => Some(ApplyGroup::Chain),
+            _ => None,
+        }
+    }
+}
+
+/** @brief 이전 설정과 새 설정을 받아, 세대를 새로 만들지 않고 반영할 수 있는지 정한다. */
+pub(crate) type Swappable = fn(&Config, &Config) -> bool;
+
 /** @brief 값이 바뀌었을 때 실행 중 서버가 반영하는 방법. */
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) enum Reload {
     /** @brief 이 그룹만 교체한다. */
     Hot(ApplyGroup),
+    /**
+     * @brief 조건이 참이면 이 그룹만 교체하고, 거짓이면 세대를 새로 만든다.
+     * @details 조건은 이 키가 아닌 다른 키만 읽는다. 그래서 지금 설정에서 이 키 하나만 바꿀 때의
+     *          판정은 지금 설정만 보고 미리 낼 수 있다.
+     */
+    HotWhile(ApplyGroup, Swappable),
+    /**
+     * @brief 조건이 참이면 이 그룹만 교체하고, 거짓이면 세대를 새로 만든다.
+     * @details 조건이 이 키의 새 값을 읽으므로, 무엇으로 바꾸는지 보기 전에는 판정할 수 없다.
+     */
+    HotIf(ApplyGroup, Swappable),
     /**
      * @brief 세대를 새로 만든다.
      * @details 권한을 낮추는 동작은 한 프로세스 안에서 되돌릴 수 없다.
      */
     NewGeneration,
+}
+
+impl Reload {
+    /** @brief 교체할 그룹. 세대를 새로 만들어야 하면 없다. */
+    fn group(self) -> Option<ApplyGroup> {
+        match self {
+            Reload::Hot(group) | Reload::HotWhile(group, _) | Reload::HotIf(group, _) => {
+                Some(group)
+            }
+            Reload::NewGeneration => None,
+        }
+    }
+}
+
+/** @brief 클라이언트별 업스트림 경로가 있는지. */
+pub(crate) fn has_client_routes(cfg: &Config) -> bool {
+    cfg.clients
+        .iter()
+        .any(|client| !client.upstreams.is_empty())
+}
+
+/**
+ * @brief 클라이언트 경로와 MAC 식별이 교체할 수 있는 범위에서만 바뀌었는지.
+ * @details 클라이언트 경로마다 전달기와 체인을 세대를 시작할 때 만들고 교체하지 않으므로, 경로의
+ *          식별 기준이나 업스트림이 바뀌면 세대를 새로 만든다. MAC 으로 식별하는 클라이언트가
+ *          처음 생길 때도 그렇다. MAC 조회는 그런 클라이언트가 있을 때만 세대를 시작하면서 켠다.
+ */
+fn clients_swappable(previous: &Config, next: &Config) -> bool {
+    /** @brief 경로마다 식별 기준과 업스트림. */
+    fn routes(cfg: &Config) -> Vec<(&[IpNet], &[String], &[String], &[String])> {
+        cfg.clients
+            .iter()
+            .filter(|client| !client.upstreams.is_empty())
+            .map(|client| {
+                (
+                    &client.ids[..],
+                    &client.client_ids[..],
+                    &client.mac[..],
+                    &client.upstreams[..],
+                )
+            })
+            .collect()
+    }
+    let uses_mac = |cfg: &Config| cfg.clients.iter().any(|client| !client.mac.is_empty());
+    routes(previous) == routes(next) && (uses_mac(previous) || !uses_mac(next))
+}
+
+/**
+ * @brief 처리 방식이 그대로이고 클라이언트 경로가 없는지.
+ * @details 클라이언트 경로의 전달기는 세대를 시작할 때 질의 제한 시간과 업스트림 전략을 복사하고
+ *          교체하지 않는다.
+ */
+fn same_backend_without_routes(previous: &Config, next: &Config) -> bool {
+    previous.backend == next.backend && !has_client_routes(previous) && !has_client_routes(next)
+}
+
+/** @brief 처리 방식이 forward 로 그대로이고 클라이언트 경로가 없는지. */
+fn forward_without_routes(previous: &Config, next: &Config) -> bool {
+    previous.backend == BackendKind::Forward && same_backend_without_routes(previous, next)
 }
 
 /** @brief Raft 클러스터에서 이 값을 복제하는지. */
@@ -174,6 +266,37 @@ const fn reactor(blocks: Blocks) -> Lanes {
     }
 }
 
+/** @brief wire 경로와 권한 경로를 함께 닫는다. */
+const fn wire_and_authority(blocks: Blocks) -> Lanes {
+    Lanes {
+        wire: Some(blocks),
+        reactor: None,
+        authority: Some(blocks),
+    }
+}
+
+/**
+ * @brief reactor 레인과 권한 경로를 닫는다.
+ * @details 해석한 답의 주소를 거르는 기능이다. 두 경로는 거르지 않은 답을 그대로 내보낸다.
+ *          wire 경로는 일반 경로가 거른 응답만 담고 이 값이 바뀌면 세대가 올라 이전 항목이
+ *          나가지 않으므로 열어 둔다.
+ */
+const fn reactor_and_authority(blocks: Blocks) -> Lanes {
+    Lanes {
+        wire: None,
+        reactor: Some(blocks),
+        authority: Some(blocks),
+    }
+}
+
+/** @brief 권한 경로만 닫는다. */
+const fn authority(blocks: Blocks) -> Lanes {
+    Lanes {
+        authority: Some(blocks),
+        ..Lanes::OPEN
+    }
+}
+
 /** @brief 설정 키 하나에 대한 결정. */
 pub(crate) struct KeySpec {
     /** @brief 설정 키 이름. */
@@ -184,16 +307,24 @@ pub(crate) struct KeySpec {
     pub(crate) scope: Scope,
     /** @brief 빠른 경로를 닫는 조건. */
     pub(crate) lanes: Lanes,
+    /** @brief 두 설정에서 이 키의 값이 다른지. */
+    changed: fn(&Config, &Config) -> bool,
 }
 
-/** @brief 행 하나를 만든다. */
-const fn key(key: &'static str, reload: Reload, scope: Scope, lanes: Lanes) -> KeySpec {
-    KeySpec {
-        key,
-        reload,
-        scope,
-        lanes,
-    }
+/**
+ * @brief 행 하나를 만든다.
+ * @details 키 이름을 Config 필드로 받아, 그 필드를 비교하는 함수를 함께 만든다.
+ */
+macro_rules! key {
+    ($field:ident, $reload:expr, $scope:expr, $lanes:expr $(,)?) => {
+        KeySpec {
+            key: stringify!($field),
+            reload: $reload,
+            scope: $scope,
+            lanes: $lanes,
+            changed: |previous: &Config, next: &Config| previous.$field != next.$field,
+        }
+    };
 }
 
 /** @brief 키에 대한 결정. 알 수 없는 키면 없다. */
@@ -203,15 +334,54 @@ pub(crate) fn spec(name: &str) -> Option<&'static KeySpec> {
 
 /** @brief 이 키를 바꿨을 때 교체하는 그룹. 세대를 새로 만들어야 하거나 알 수 없는 키면 없다. */
 pub(crate) fn hot_group(name: &str) -> Option<ApplyGroup> {
-    match spec(name)?.reload {
-        Reload::Hot(group) => Some(group),
-        Reload::NewGeneration => None,
-    }
+    spec(name)?.reload.group()
 }
 
 /** @brief 세대를 새로 만들지 않고 바꿀 수 있는 키인지. */
 pub(crate) fn is_hot(name: &str) -> bool {
     hot_group(name).is_some()
+}
+
+/** @brief 세대를 새로 만들지 않고 바꿀 수 있는 키들. 표 순서를 따른다. */
+pub(crate) fn hot_keys() -> impl Iterator<Item = &'static str> {
+    KEYS.iter()
+        .filter(|spec| spec.reload.group().is_some())
+        .map(|spec| spec.key)
+}
+
+/** @brief 두 설정에서 값이 다른 키들. 표 순서를 따른다. */
+pub(crate) fn changed_keys<'a>(
+    previous: &'a Config,
+    next: &'a Config,
+) -> impl Iterator<Item = &'static str> + 'a {
+    KEYS.iter()
+        .filter(move |spec| (spec.changed)(previous, next))
+        .map(|spec| spec.key)
+}
+
+/**
+ * @brief 이 키의 변화를 세대를 새로 만들지 않고 반영할 수 있는지. 알 수 없는 키면 거짓이다.
+ * @details 함께 바뀐 다른 키가 체인을 다시 만드는지는 보지 않는다.
+ */
+pub(crate) fn swappable(name: &str, previous: &Config, next: &Config) -> bool {
+    spec(name).is_some_and(|spec| match spec.reload {
+        Reload::Hot(_) => true,
+        Reload::HotWhile(_, swappable) | Reload::HotIf(_, swappable) => swappable(previous, next),
+        Reload::NewGeneration => false,
+    })
+}
+
+/**
+ * @brief 지금 설정에서 이 키 하나만 바꿔도 키의 조건 때문에 세대를 새로 만들 수 있는지.
+ * @details HotWhile 의 조건은 이 키를 읽지 않으므로, 지금 설정을 이전 설정과 새 설정 양쪽에 넣은
+ *          판정이 이 키 하나만 바꿀 때의 판정과 같다. HotIf 의 조건은 새 값을 읽으므로 늘 참이다.
+ */
+pub(crate) fn may_need_new_generation(name: &str, now: &Config) -> bool {
+    spec(name).is_some_and(|spec| match spec.reload {
+        Reload::Hot(_) => false,
+        Reload::HotWhile(_, swappable) => !swappable(now, now),
+        Reload::HotIf(..) | Reload::NewGeneration => true,
+    })
 }
 
 /**
@@ -254,381 +424,398 @@ pub(crate) fn lane_unblocked(lane: Lane, cfg: &Config, facts: &LaneFacts) -> boo
 }
 
 use ApplyGroup::*;
-use Reload::{Hot, NewGeneration};
+use Reload::{Hot, HotIf, HotWhile, NewGeneration};
 use Scope::{Node, Shared};
 
 /** @brief 모든 설정 키. 순서는 onetdns_config::known_keys 를 따른다. */
 static KEYS: &[KeySpec] = &[
-    key("mode", Hot(Metadata), Shared, Lanes::OPEN),
-    key(
-        "backend",
+    key!(mode, Hot(Metadata), Shared, Lanes::OPEN),
+    key!(
+        backend,
         Hot(Chain),
         Shared,
         reactor(|c, _| !matches!(c.backend, BackendKind::Recurse)),
     ),
-    key("listen", Hot(Listeners), Node, Lanes::OPEN),
-    key("upstreams", Hot(Forward), Shared, Lanes::OPEN),
-    key("blocklists", Hot(Filter), Node, Lanes::OPEN),
-    key("allowlists", Hot(Filter), Node, Lanes::OPEN),
-    key("blocklist_urls", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key("blocklist_titles", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key(
-        "disabled_blocklist_urls",
+    key!(listen, Hot(Listeners), Node, Lanes::OPEN),
+    key!(upstreams, Hot(Forward), Shared, Lanes::OPEN),
+    key!(blocklists, Hot(Filter), Node, Lanes::OPEN),
+    key!(allowlists, Hot(Filter), Node, Lanes::OPEN),
+    key!(blocklist_urls, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(blocklist_titles, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(
+        disabled_blocklist_urls,
         Hot(Subscriptions),
         Shared,
         Lanes::OPEN,
     ),
-    key("block_rules", Hot(Filter), Shared, Lanes::OPEN),
-    key("allow_rules", Hot(Filter), Shared, Lanes::OPEN),
-    key("list_refresh_secs", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key("blocked_services", Hot(Filter), Shared, Lanes::OPEN),
-    key("safe_search", Hot(SafeSearch), Shared, Lanes::OPEN),
-    key(
-        "clients",
-        Hot(Filter),
+    key!(block_rules, Hot(Filter), Shared, Lanes::OPEN),
+    key!(allow_rules, Hot(Filter), Shared, Lanes::OPEN),
+    key!(list_refresh_secs, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(blocked_services, Hot(Filter), Shared, Lanes::OPEN),
+    key!(safe_search, Hot(SafeSearch), Shared, Lanes::OPEN),
+    key!(
+        clients,
+        HotIf(Filter, clients_swappable),
         Shared,
-        wire(|c, _| c.clients.iter().any(|client| !client.upstreams.is_empty())),
+        wire(|c, _| has_client_routes(c)),
     ),
-    key("users", Hot(ConsoleAccounts), Node, Lanes::OPEN),
-    key("views", Hot(Views), Shared, wire(|_, f| f.views_present)),
-    key("policy", Hot(Policy), Shared, wire(|_, f| f.policy_present)),
-    key(
-        "wasm_policy",
+    key!(users, Hot(ConsoleAccounts), Node, Lanes::OPEN),
+    key!(
+        views,
+        Hot(Views),
+        Shared,
+        wire_and_authority(|_, f| f.views_present),
+    ),
+    key!(
+        policy,
+        Hot(Policy),
+        Shared,
+        wire_and_authority(|_, f| f.policy_present),
+    ),
+    key!(
+        wasm_policy,
         Hot(Policy),
         Node,
-        wire(|_, f| f.policy_present),
+        wire_and_authority(|_, f| f.policy_present),
     ),
-    key(
-        "wasm_plugins",
+    key!(
+        wasm_plugins,
         Hot(Policy),
         Node,
-        wire(|_, f| f.policy_present),
+        wire_and_authority(|_, f| f.policy_present),
     ),
-    key("wasm_fail_mode", Hot(Policy), Shared, Lanes::OPEN),
-    key("block_response", Hot(Filter), Shared, Lanes::OPEN),
-    key(
-        "cache_size",
+    key!(wasm_fail_mode, Hot(Policy), Shared, Lanes::OPEN),
+    key!(block_response, Hot(Filter), Shared, Lanes::OPEN),
+    key!(
+        cache_size,
         Hot(Chain),
         Shared,
         wire(|c, _| c.cache_size == 0),
     ),
-    key("min_ttl", Hot(Chain), Shared, wire(|c, _| c.min_ttl != 0)),
-    key("max_ttl", Hot(Chain), Shared, Lanes::OPEN),
-    key("query_timeout_secs", Hot(Forward), Shared, Lanes::OPEN),
-    key("max_inflight", Hot(Native), Shared, Lanes::OPEN),
-    key("workers", Hot(Listeners), Node, Lanes::OPEN),
-    key("do_udp", Hot(Listeners), Shared, Lanes::OPEN),
-    key("do_tcp", Hot(Listeners), Shared, Lanes::OPEN),
-    key(
-        "serve_stale_secs",
+    key!(min_ttl, Hot(Chain), Shared, wire(|c, _| c.min_ttl != 0)),
+    key!(max_ttl, Hot(Chain), Shared, Lanes::OPEN),
+    key!(
+        query_timeout_secs,
+        HotWhile(Forward, forward_without_routes),
+        Shared,
+        Lanes::OPEN,
+    ),
+    key!(max_inflight, Hot(Native), Shared, Lanes::OPEN),
+    key!(workers, Hot(Listeners), Node, Lanes::OPEN),
+    key!(do_udp, Hot(Listeners), Shared, Lanes::OPEN),
+    key!(do_tcp, Hot(Listeners), Shared, Lanes::OPEN),
+    key!(
+        serve_stale_secs,
         Hot(Chain),
         Shared,
         reactor(|c, _| c.serve_stale_secs != 0),
     ),
-    key("serve_expired_reply_ttl", Hot(Chain), Shared, Lanes::OPEN),
-    key("serve_expired_ttl_reset", Hot(Chain), Shared, Lanes::OPEN),
-    key(
-        "serve_expired_client_timeout_ms",
+    key!(serve_expired_reply_ttl, Hot(Chain), Shared, Lanes::OPEN),
+    key!(serve_expired_ttl_reset, Hot(Chain), Shared, Lanes::OPEN),
+    key!(
+        serve_expired_client_timeout_ms,
         Hot(Chain),
         Shared,
         Lanes::OPEN,
     ),
-    key("serve_stale_refresh", Hot(Chain), Shared, Lanes::OPEN),
-    key("proxy_protocol_ports", Hot(Listeners), Node, Lanes::OPEN),
-    key(
-        "proxy_protocol_trusted",
-        Hot(Listeners),
-        Shared,
-        Lanes::OPEN,
-    ),
-    key(
-        "dns64_prefix",
+    key!(serve_stale_refresh, Hot(Chain), Shared, Lanes::OPEN),
+    key!(proxy_protocol_ports, Hot(Listeners), Node, Lanes::OPEN),
+    key!(proxy_protocol_trusted, Hot(Listeners), Shared, Lanes::OPEN,),
+    key!(
+        dns64_prefix,
         Hot(Native),
         Shared,
-        wire(|c, _| c.dns64_prefix.is_some()),
+        wire_and_authority(|c, _| c.dns64_prefix.is_some()),
     ),
-    key("rebind_protection", Hot(Native), Shared, Lanes::OPEN),
-    key("prefetch", Hot(Chain), Shared, wire(|c, _| c.prefetch)),
-    key("prefetch_min_hits", Hot(Chain), Shared, Lanes::OPEN),
-    key("prefetch_ttl_pct", Hot(Chain), Shared, Lanes::OPEN),
-    key("dnssec", Hot(Chain), Shared, Lanes::OPEN),
-    key("dnssec_strict", Hot(Chain), Shared, Lanes::OPEN),
-    key("val_permissive_mode", Hot(Chain), Shared, Lanes::OPEN),
-    key(
-        "dnssec_accept_expired",
-        Hot(DnssecClock),
+    key!(
+        rebind_protection,
+        Hot(Native),
         Shared,
-        Lanes::OPEN,
+        reactor_and_authority(|c, _| c.rebind_protection),
     ),
-    key("ignore_cd_flag", Hot(Chain), Shared, Lanes::OPEN),
-    key("dnssec_rfc5011", Hot(Chain), Shared, Lanes::OPEN),
-    key("dnssec_anchor_file", Hot(Chain), Node, Lanes::OPEN),
-    key(
-        "dnssec_roll_interval_secs",
+    key!(prefetch, Hot(Chain), Shared, wire(|c, _| c.prefetch)),
+    key!(prefetch_min_hits, Hot(Chain), Shared, Lanes::OPEN),
+    key!(prefetch_ttl_pct, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dnssec, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dnssec_strict, Hot(Chain), Shared, Lanes::OPEN),
+    key!(val_permissive_mode, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dnssec_accept_expired, Hot(DnssecClock), Shared, Lanes::OPEN,),
+    key!(ignore_cd_flag, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dnssec_rfc5011, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dnssec_anchor_file, Hot(Chain), Node, Lanes::OPEN),
+    key!(
+        dnssec_roll_interval_secs,
         Hot(Authority),
         Shared,
         Lanes::OPEN,
     ),
-    key("root_key_sentinel", Hot(Chain), Shared, Lanes::OPEN),
-    key("trust_anchor_signaling", Hot(Chain), Shared, Lanes::OPEN),
-    key("recursion_limit", Hot(Chain), Shared, Lanes::OPEN),
-    key("cname_limit", Hot(Chain), Shared, Lanes::OPEN),
-    key("dname_limit", Hot(Chain), Shared, Lanes::OPEN),
-    key("do_ip4", Hot(Chain), Shared, Lanes::OPEN),
-    key("do_ip6", Hot(Chain), Shared, Lanes::OPEN),
-    key("prefer_ip4", Hot(Chain), Shared, Lanes::OPEN),
-    key("prefer_ip6", Hot(Chain), Shared, Lanes::OPEN),
-    key("qname_minimisation_strict", Hot(Chain), Shared, Lanes::OPEN),
-    key("harden_referral_path", Hot(Chain), Shared, Lanes::OPEN),
-    key("use_caps_for_id", Hot(Chain), Shared, Lanes::OPEN),
-    key("lowercase_outgoing", Hot(Chain), Shared, Lanes::OPEN),
-    key("harden_large_queries", Hot(Native), Shared, Lanes::OPEN),
-    key("domain_insecure", Hot(Chain), Shared, Lanes::OPEN),
-    key("split_default", Hot(Chain), Shared, Lanes::OPEN),
-    key("split_recurse", Hot(Chain), Shared, Lanes::OPEN),
-    key("split_forward", Hot(Chain), Shared, Lanes::OPEN),
-    key("local_a", Hot(Chain), Shared, Lanes::OPEN),
-    key("local_aaaa", Hot(Chain), Shared, Lanes::OPEN),
-    key("acl_allow", Hot(Acl), Shared, Lanes::OPEN),
-    key("acl_deny", Hot(Acl), Shared, Lanes::OPEN),
-    key("rate_limit_per_sec", Hot(RateLimit), Shared, Lanes::OPEN),
-    key("rate_limit_burst", Hot(RateLimit), Shared, Lanes::OPEN),
-    key("run_as_user", NewGeneration, Node, Lanes::OPEN),
-    key("run_as_group", NewGeneration, Node, Lanes::OPEN),
-    key(
-        "cookies",
+    key!(root_key_sentinel, Hot(Chain), Shared, Lanes::OPEN),
+    key!(trust_anchor_signaling, Hot(Chain), Shared, Lanes::OPEN),
+    key!(recursion_limit, Hot(Chain), Shared, Lanes::OPEN),
+    key!(cname_limit, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dname_limit, Hot(Chain), Shared, Lanes::OPEN),
+    key!(do_ip4, Hot(Chain), Shared, Lanes::OPEN),
+    key!(do_ip6, Hot(Chain), Shared, Lanes::OPEN),
+    key!(prefer_ip4, Hot(Chain), Shared, Lanes::OPEN),
+    key!(prefer_ip6, Hot(Chain), Shared, Lanes::OPEN),
+    key!(qname_minimisation_strict, Hot(Chain), Shared, Lanes::OPEN),
+    key!(harden_referral_path, Hot(Chain), Shared, Lanes::OPEN),
+    key!(use_caps_for_id, Hot(Chain), Shared, Lanes::OPEN),
+    key!(lowercase_outgoing, Hot(Chain), Shared, Lanes::OPEN),
+    key!(harden_large_queries, Hot(Native), Shared, Lanes::OPEN),
+    key!(domain_insecure, Hot(Chain), Shared, Lanes::OPEN),
+    key!(split_default, Hot(Chain), Shared, Lanes::OPEN),
+    key!(split_recurse, Hot(Chain), Shared, Lanes::OPEN),
+    key!(split_forward, Hot(Chain), Shared, Lanes::OPEN),
+    key!(local_a, Hot(Chain), Shared, Lanes::OPEN),
+    key!(local_aaaa, Hot(Chain), Shared, Lanes::OPEN),
+    key!(acl_allow, Hot(Acl), Shared, Lanes::OPEN),
+    key!(acl_deny, Hot(Acl), Shared, Lanes::OPEN),
+    key!(rate_limit_per_sec, Hot(RateLimit), Shared, Lanes::OPEN),
+    key!(rate_limit_burst, Hot(RateLimit), Shared, Lanes::OPEN),
+    key!(run_as_user, NewGeneration, Node, Lanes::OPEN),
+    key!(run_as_group, NewGeneration, Node, Lanes::OPEN),
+    key!(
+        cookies,
         Hot(Native),
         Shared,
-        wire(|c, _| c.cookies.is_strict()),
+        wire_and_authority(|c, _| c.cookies.is_strict()),
     ),
-    key("subnet_rrl_per_sec", Hot(RateLimit), Shared, Lanes::OPEN),
-    key("subnet_rrl_burst", Hot(RateLimit), Shared, Lanes::OPEN),
-    key("listen_dot", Hot(Listeners), Node, Lanes::OPEN),
-    key("listen_doh", Hot(Listeners), Node, Lanes::OPEN),
-    key("listen_doq", Hot(Listeners), Node, Lanes::OPEN),
-    key("listen_doh3", Hot(Listeners), Node, Lanes::OPEN),
-    key("listen_dnscrypt", Hot(Listeners), Node, Lanes::OPEN),
-    key("dnscrypt_provider_name", Hot(Listeners), Node, Lanes::OPEN),
-    key("doh_path", Hot(Listeners), Node, Lanes::OPEN),
-    key("ddr_name", Hot(Chain), Node, Lanes::OPEN),
-    key("tls_cert", Hot(Tls), Node, Lanes::OPEN),
-    key("tls_key", Hot(Tls), Node, Lanes::OPEN),
-    key("tls_self_signed_host", Hot(Tls), Node, Lanes::OPEN),
-    key("tls_client_ca", Hot(Tls), Node, Lanes::OPEN),
-    key("tls_revocation", Hot(Revocation), Node, Lanes::OPEN),
-    key(
-        "tls_revocation_softfail",
-        Hot(Revocation),
-        Node,
-        Lanes::OPEN,
-    ),
-    key(
-        "acme_directory_url",
+    key!(subnet_rrl_per_sec, Hot(RateLimit), Shared, Lanes::OPEN),
+    key!(subnet_rrl_burst, Hot(RateLimit), Shared, Lanes::OPEN),
+    key!(listen_dot, Hot(Listeners), Node, Lanes::OPEN),
+    key!(listen_doh, Hot(Listeners), Node, Lanes::OPEN),
+    key!(listen_doq, Hot(Listeners), Node, Lanes::OPEN),
+    key!(listen_doh3, Hot(Listeners), Node, Lanes::OPEN),
+    key!(listen_dnscrypt, Hot(Listeners), Node, Lanes::OPEN),
+    key!(dnscrypt_provider_name, Hot(Listeners), Node, Lanes::OPEN),
+    key!(doh_path, Hot(Listeners), Node, Lanes::OPEN),
+    key!(ddr_name, Hot(Chain), Node, Lanes::OPEN),
+    key!(tls_cert, Hot(Tls), Node, Lanes::OPEN),
+    key!(tls_key, Hot(Tls), Node, Lanes::OPEN),
+    key!(tls_self_signed_host, Hot(Tls), Node, Lanes::OPEN),
+    key!(tls_client_ca, Hot(Tls), Node, Lanes::OPEN),
+    key!(tls_revocation, Hot(Revocation), Node, Lanes::OPEN),
+    key!(tls_revocation_softfail, Hot(Revocation), Node, Lanes::OPEN,),
+    key!(
+        acme_directory_url,
         Hot(Chain),
         Node,
-        Lanes {
-            wire: Some(|c, _| c.acme_directory_url.is_some()),
-            reactor: None,
-            authority: Some(|c, _| c.acme_directory_url.is_some()),
-        },
+        wire_and_authority(|c, _| c.acme_directory_url.is_some()),
     ),
-    key("acme_contact_email", Hot(Acme), Node, Lanes::OPEN),
-    key("acme_domains", Hot(Acme), Node, Lanes::OPEN),
-    key("acme_challenge", Hot(Acme), Node, Lanes::OPEN),
-    key("acme_account_key_file", Hot(Acme), Node, Lanes::OPEN),
-    key("acme_cert_file", Hot(Acme), Node, Lanes::OPEN),
-    key("acme_key_file", Hot(Acme), Node, Lanes::OPEN),
-    key("control_listen", Hot(ControlTokens), Node, Lanes::OPEN),
-    key("control_token", Hot(ControlTokens), Node, Lanes::OPEN),
-    key(
-        "control_admin_tokens",
+    key!(acme_contact_email, Hot(Acme), Node, Lanes::OPEN),
+    key!(acme_domains, Hot(Acme), Node, Lanes::OPEN),
+    key!(acme_challenge, Hot(Acme), Node, Lanes::OPEN),
+    key!(acme_account_key_file, Hot(Acme), Node, Lanes::OPEN),
+    key!(acme_cert_file, Hot(Acme), Node, Lanes::OPEN),
+    key!(acme_key_file, Hot(Acme), Node, Lanes::OPEN),
+    key!(control_listen, Hot(ControlTokens), Node, Lanes::OPEN),
+    key!(control_token, Hot(ControlTokens), Node, Lanes::OPEN),
+    key!(control_admin_tokens, Hot(ControlTokens), Node, Lanes::OPEN,),
+    key!(
+        control_readonly_tokens,
         Hot(ControlTokens),
         Node,
         Lanes::OPEN,
     ),
-    key(
-        "control_readonly_tokens",
+    key!(
+        control_trusted_proxies,
         Hot(ControlTokens),
         Node,
         Lanes::OPEN,
     ),
-    key(
-        "control_trusted_proxies",
+    key!(
+        control_public_origins,
         Hot(ControlTokens),
         Node,
         Lanes::OPEN,
     ),
-    key(
-        "control_public_origins",
-        Hot(ControlTokens),
-        Node,
-        Lanes::OPEN,
-    ),
-    key("block_ipv4", Hot(Filter), Shared, Lanes::OPEN),
-    key("block_ipv6", Hot(Filter), Shared, Lanes::OPEN),
-    key("blocked_response_ttl", Hot(BlockTtl), Shared, Lanes::OPEN),
-    key("block_aaaa", Hot(Native), Shared, wire(|c, _| c.block_aaaa)),
-    key("bogus_nxdomain", Hot(Native), Shared, Lanes::OPEN),
-    key(
-        "domain_needed",
+    key!(block_ipv4, Hot(Filter), Shared, Lanes::OPEN),
+    key!(block_ipv6, Hot(Filter), Shared, Lanes::OPEN),
+    key!(blocked_response_ttl, Hot(BlockTtl), Shared, Lanes::OPEN),
+    key!(
+        block_aaaa,
         Hot(Native),
         Shared,
-        wire(|c, _| c.domain_needed),
+        wire_and_authority(|c, _| c.block_aaaa),
     ),
-    key("bogus_priv", Hot(Native), Shared, wire(|c, _| c.bogus_priv)),
-    key(
-        "empty_zones",
+    key!(
+        bogus_nxdomain,
         Hot(Native),
         Shared,
-        wire(|c, _| c.empty_zones),
+        reactor_and_authority(|c, _| !c.bogus_nxdomain.is_empty()),
     ),
-    key("local_ttl", Hot(LocalTtl), Shared, Lanes::OPEN),
-    key("rewrites", Hot(Filter), Shared, Lanes::OPEN),
-    key(
-        "dynamic_records",
+    key!(
+        domain_needed,
+        Hot(Native),
+        Shared,
+        wire_and_authority(|c, _| c.domain_needed),
+    ),
+    key!(
+        bogus_priv,
+        Hot(Native),
+        Shared,
+        wire_and_authority(|c, _| c.bogus_priv),
+    ),
+    key!(
+        empty_zones,
+        Hot(Native),
+        Shared,
+        wire_and_authority(|c, _| c.empty_zones),
+    ),
+    key!(local_ttl, Hot(LocalTtl), Shared, Lanes::OPEN),
+    key!(rewrites, Hot(Filter), Shared, Lanes::OPEN),
+    key!(
+        dynamic_records,
         Hot(Chain),
         Shared,
-        Lanes {
-            wire: Some(|c, _| !c.dynamic_records.is_empty()),
-            reactor: None,
-            authority: Some(|c, _| !c.dynamic_records.is_empty()),
-        },
+        wire_and_authority(|c, _| !c.dynamic_records.is_empty()),
     ),
-    key("local_zones", Hot(Filter), Shared, Lanes::OPEN),
-    key("refused_domains", Hot(Filter), Shared, Lanes::OPEN),
-    key("rpz_files", Hot(Filter), Node, Lanes::OPEN),
-    key("rpz_urls", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key("safe_browsing", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key("parental_control", Hot(Subscriptions), Shared, Lanes::OPEN),
-    key("service_schedule", Hot(Filter), Shared, Lanes::OPEN),
-    key("upstream_urls", Hot(Forward), Shared, Lanes::OPEN),
-    key("bootstrap", Hot(Chain), Shared, Lanes::OPEN),
-    key("root_hints", Hot(Chain), Shared, Lanes::OPEN),
-    key("fallback_upstreams", Hot(Chain), Shared, Lanes::OPEN),
-    key("upstream_strategy", Hot(Forward), Shared, Lanes::OPEN),
-    key("upstream_concurrency", Hot(Forward), Shared, Lanes::OPEN),
-    key("query_source", Hot(QuerySource), Node, Lanes::OPEN),
-    key("query_source_v6", Hot(QuerySource), Node, Lanes::OPEN),
-    key(
-        "stub_zones",
+    key!(local_zones, Hot(Filter), Shared, Lanes::OPEN),
+    key!(refused_domains, Hot(Filter), Shared, Lanes::OPEN),
+    key!(rpz_files, Hot(Filter), Node, Lanes::OPEN),
+    key!(rpz_urls, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(safe_browsing, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(parental_control, Hot(Subscriptions), Shared, Lanes::OPEN),
+    key!(service_schedule, Hot(Filter), Shared, Lanes::OPEN),
+    key!(upstream_urls, Hot(Forward), Shared, Lanes::OPEN),
+    key!(bootstrap, Hot(Chain), Shared, Lanes::OPEN),
+    key!(root_hints, Hot(Chain), Shared, Lanes::OPEN),
+    key!(fallback_upstreams, Hot(Chain), Shared, Lanes::OPEN),
+    key!(
+        upstream_strategy,
+        HotWhile(Forward, same_backend_without_routes),
+        Shared,
+        Lanes::OPEN,
+    ),
+    key!(
+        upstream_concurrency,
+        HotWhile(Forward, same_backend_without_routes),
+        Shared,
+        Lanes::OPEN,
+    ),
+    key!(query_source, Hot(QuerySource), Node, Lanes::OPEN),
+    key!(query_source_v6, Hot(QuerySource), Node, Lanes::OPEN),
+    key!(
+        stub_zones,
         Hot(Chain),
         Shared,
         reactor(|c, _| !c.stub_zones.is_empty()),
     ),
-    key(
-        "zones",
+    key!(
+        zones,
         Hot(Authority),
         Node,
         wire(|c, _| !c.zones.is_empty()),
     ),
-    key(
-        "zones_dir",
+    key!(
+        zones_dir,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_dir.is_some()),
     ),
-    key(
-        "zones_db",
+    key!(
+        zones_db,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_db.is_some()),
     ),
-    key("zones_db_table", Hot(Authority), Node, Lanes::OPEN),
-    key(
-        "zones_postgres",
+    key!(zones_db_table, Hot(Authority), Node, Lanes::OPEN),
+    key!(
+        zones_postgres,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_postgres.is_some()),
     ),
-    key(
-        "zones_mysql",
+    key!(
+        zones_mysql,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_mysql.is_some()),
     ),
-    key(
-        "zones_lmdb",
+    key!(
+        zones_lmdb,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_lmdb.is_some()),
     ),
-    key("zones_sql_table", Hot(Authority), Node, Lanes::OPEN),
-    key(
-        "zones_etcd",
+    key!(zones_sql_table, Hot(Authority), Node, Lanes::OPEN),
+    key!(
+        zones_etcd,
         Hot(Authority),
         Node,
         wire(|c, _| c.zones_etcd.is_some()),
     ),
-    key("zones_etcd_prefix", Hot(Authority), Node, Lanes::OPEN),
-    key("zones_etcd_ca", Hot(Authority), Node, Lanes::OPEN),
-    key("zones_etcd_user", Hot(Authority), Node, Lanes::OPEN),
-    key("zones_etcd_password", Hot(Authority), Node, Lanes::OPEN),
-    key(
-        "secondary",
+    key!(zones_etcd_prefix, Hot(Authority), Node, Lanes::OPEN),
+    key!(zones_etcd_ca, Hot(Authority), Node, Lanes::OPEN),
+    key!(zones_etcd_user, Hot(Authority), Node, Lanes::OPEN),
+    key!(zones_etcd_password, Hot(Authority), Node, Lanes::OPEN),
+    key!(
+        secondary,
         Hot(Authority),
         Node,
         wire(|c, _| !c.secondary.is_empty()),
     ),
-    key(
-        "catalog",
+    key!(
+        catalog,
         Hot(Authority),
         Node,
         wire(|c, _| !c.catalog.is_empty()),
     ),
-    key("catalog_serve", Hot(Authority), Node, Lanes::OPEN),
-    key("xfr_allow", Hot(Authority), Node, Lanes::OPEN),
-    key("notify", Hot(Authority), Node, Lanes::OPEN),
-    key("tsig_keys", Hot(Authority), Node, Lanes::OPEN),
-    key("xfr_tsig_required", Hot(Authority), Node, Lanes::OPEN),
-    key("zonemd_check", Hot(Authority), Node, Lanes::OPEN),
-    key("zonemd_reject_absence", Hot(Authority), Node, Lanes::OPEN),
-    key("update_allow", Hot(Authority), Node, Lanes::OPEN),
-    key("update_policy", Hot(Authority), Node, Lanes::OPEN),
-    key("update_tsig_required", Hot(Authority), Node, Lanes::OPEN),
-    key(
-        "ecs_mode",
+    key!(catalog_serve, Hot(Authority), Node, Lanes::OPEN),
+    key!(xfr_allow, Hot(Authority), Node, Lanes::OPEN),
+    key!(notify, Hot(Authority), Node, Lanes::OPEN),
+    key!(tsig_keys, Hot(Authority), Node, Lanes::OPEN),
+    key!(xfr_tsig_required, Hot(Authority), Node, Lanes::OPEN),
+    key!(zonemd_check, Hot(Authority), Node, Lanes::OPEN),
+    key!(zonemd_reject_absence, Hot(Authority), Node, Lanes::OPEN),
+    key!(update_allow, Hot(Authority), Node, Lanes::OPEN),
+    key!(update_policy, Hot(Authority), Node, Lanes::OPEN),
+    key!(update_tsig_required, Hot(Authority), Node, Lanes::OPEN),
+    key!(
+        ecs_mode,
         Hot(Chain),
         Shared,
         wire(|c, _| !matches!(c.ecs_mode, EcsMode::Off)),
     ),
-    key("ecs_custom_ip", Hot(Chain), Shared, Lanes::OPEN),
-    key("neg_min_ttl", Hot(Chain), Shared, Lanes::OPEN),
-    key("neg_max_ttl", Hot(Chain), Shared, Lanes::OPEN),
-    key("edns_buffer_size", Hot(Native), Shared, Lanes::OPEN),
-    key("deny_any", Hot(Native), Shared, Lanes::OPEN),
-    key("minimal_responses", Hot(Native), Shared, Lanes::OPEN),
-    key(
-        "edns_padding_block",
+    key!(ecs_custom_ip, Hot(Chain), Shared, Lanes::OPEN),
+    key!(neg_min_ttl, Hot(Chain), Shared, Lanes::OPEN),
+    key!(neg_max_ttl, Hot(Chain), Shared, Lanes::OPEN),
+    key!(edns_buffer_size, Hot(Native), Shared, Lanes::OPEN),
+    key!(deny_any, Hot(Native), Shared, Lanes::OPEN),
+    key!(minimal_responses, Hot(Native), Shared, Lanes::OPEN),
+    key!(
+        edns_padding_block,
         Hot(Native),
         Shared,
-        wire(|c, _| c.edns_padding_block != 0),
+        wire_and_authority(|c, _| c.edns_padding_block != 0),
     ),
-    key("edns_tcp_keepalive_secs", Hot(Native), Shared, Lanes::OPEN),
-    key(
-        "cache_enabled",
+    key!(edns_tcp_keepalive_secs, Hot(Native), Shared, Lanes::OPEN),
+    key!(
+        cache_enabled,
         Hot(Chain),
         Shared,
         wire(|c, _| !c.cache_enabled),
     ),
-    key("sharded_cache", Hot(Chain), Shared, Lanes::OPEN),
-    key("cache_shards", Hot(Chain), Shared, Lanes::OPEN),
-    key("prefetch_interval_secs", Hot(Chain), Shared, Lanes::OPEN),
-    key("dns64_synthall", Hot(Native), Shared, Lanes::OPEN),
-    key(
-        "rrset_roundrobin",
+    key!(sharded_cache, Hot(Chain), Shared, Lanes::OPEN),
+    key!(cache_shards, Hot(Chain), Shared, Lanes::OPEN),
+    key!(prefetch_interval_secs, Hot(Chain), Shared, Lanes::OPEN),
+    key!(dns64_synthall, Hot(Native), Shared, Lanes::OPEN),
+    key!(
+        rrset_roundrobin,
         Hot(Native),
         Shared,
-        wire(|c, _| c.rrset_roundrobin),
+        wire_and_authority(|c, _| c.rrset_roundrobin),
     ),
-    key("track_rule_hits", Hot(Filter), Shared, Lanes::OPEN),
-    key(
-        "aggressive_nsec",
+    key!(track_rule_hits, Hot(Filter), Shared, Lanes::OPEN),
+    key!(
+        aggressive_nsec,
         Hot(Chain),
         Shared,
         reactor(|c, _| c.aggressive_nsec),
     ),
-    key(
-        "name_ratelimit_per_sec",
+    key!(
+        name_ratelimit_per_sec,
         Hot(Chain),
         Shared,
         Lanes {
@@ -637,134 +824,129 @@ static KEYS: &[KeySpec] = &[
             authority: None,
         },
     ),
-    key("name_ratelimit_labels", Hot(Chain), Shared, Lanes::OPEN),
-    key(
-        "harden_below_nxdomain",
+    key!(name_ratelimit_labels, Hot(Chain), Shared, Lanes::OPEN),
+    key!(
+        harden_below_nxdomain,
         Hot(Chain),
         Shared,
         reactor(|c, _| c.harden_below_nxdomain),
     ),
-    key("dhcp_enable", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_server_ip", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_range_start", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_range_end", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_subnet_mask", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_router", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_dns", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_lease_secs", Hot(EdgeServices), Node, Lanes::OPEN),
-    key(
-        "dhcp_local_domain",
-        Hot(Chain),
+    key!(dhcp_enable, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_server_ip, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_range_start, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_range_end, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_subnet_mask, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_router, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_dns, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_lease_secs, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(
+        dhcp_local_domain,
+        Hot(EdgeServices),
         Node,
         wire(|c, f| f.dhcp_pool && !c.dhcp_local_domain.is_empty()),
     ),
-    key("dhcp_tftp_server", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_boot_file", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_enable", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_root", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_listen", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_writable", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_write_allow", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("tftp_allow_overwrite", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_enable", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_prefix", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_managed", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_other", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_router_lifetime", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_interval", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_mtu", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("ra_interface_index", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp6_enable", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp6_range_start", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp6_range_end", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp6_dns", Hot(EdgeServices), Node, Lanes::OPEN),
-    key(
-        "dhcp6_interface_index",
-        Hot(EdgeServices),
-        Node,
-        Lanes::OPEN,
-    ),
-    key("dhcp_lease_file", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp_static_file", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("dhcp6_lease_file", Hot(EdgeServices), Node, Lanes::OPEN),
-    key("mac_vendor_db", Hot(MacVendor), Node, Lanes::OPEN),
-    key(
-        "ipset_name_v4",
+    key!(dhcp_tftp_server, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_boot_file, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_enable, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_root, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_listen, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_writable, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_write_allow, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_allow_overwrite, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_enable, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_prefix, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_managed, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_other, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_router_lifetime, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_interval, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_mtu, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_interface_index, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_enable, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_range_start, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_range_end, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_dns, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_interface_index, Hot(EdgeServices), Node, Lanes::OPEN,),
+    key!(dhcp_lease_file, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp_static_file, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(dhcp6_lease_file, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(mac_vendor_db, Hot(MacVendor), Node, Lanes::OPEN),
+    key!(
+        ipset_name_v4,
         Hot(Chain),
         Node,
         wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
-    key(
-        "ipset_name_v6",
+    key!(
+        ipset_name_v6,
         Hot(Chain),
         Node,
         wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
-    key(
-        "ipset_domains",
+    key!(
+        ipset_domains,
         Hot(Chain),
         Node,
         wire(|c, _| crate::native_config::ipset_layer_active(c)),
     ),
-    key(
-        "cachedb_redis_host",
+    key!(
+        cachedb_redis_host,
         Hot(Chain),
         Node,
         reactor(|c, _| c.cachedb_redis_host.is_some()),
     ),
-    key("cachedb_redis_port", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_expire_secs", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_secret", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_username", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_password", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_tls", Hot(Chain), Node, Lanes::OPEN),
-    key("cachedb_redis_tls_ca", Hot(Chain), Node, Lanes::OPEN),
-    key("cluster_peers", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_raft", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_node_id", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_raft_listen", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_raft_peers", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_raft_secret", Hot(Cluster), Node, Lanes::OPEN),
-    key("cluster_raft_node_key", Hot(Cluster), Node, Lanes::OPEN),
-    key("rebind_allow", Hot(Native), Shared, Lanes::OPEN),
-    key("recurse_deny_server", Hot(Chain), Shared, Lanes::OPEN),
-    key("recurse_allow_server", Hot(Chain), Shared, Lanes::OPEN),
-    key("ns_recursion_limit", Hot(Chain), Shared, Lanes::OPEN),
-    key("ns_cache_size", Hot(Chain), Shared, Lanes::OPEN),
-    key("recurse_deny_answers", Hot(Native), Shared, Lanes::OPEN),
-    key("recurse_allow_answers", Hot(Native), Shared, Lanes::OPEN),
-    key("val_nsec3_max_iterations", Hot(Chain), Shared, Lanes::OPEN),
-    key("rate_limit_allow", Hot(RateLimit), Shared, Lanes::OPEN),
-    key("acl_allow_ids", Hot(Acl), Shared, Lanes::OPEN),
-    key("acl_deny_ids", Hot(Acl), Shared, Lanes::OPEN),
-    key("hide_identity", Hot(Native), Shared, Lanes::OPEN),
-    key("hide_version", Hot(Native), Shared, Lanes::OPEN),
-    key("nsid", Hot(Native), Node, Lanes::OPEN),
-    key("identity", Hot(Native), Node, Lanes::OPEN),
-    key("version", Hot(Native), Shared, Lanes::OPEN),
-    key("log_level", Hot(Log), Node, Lanes::OPEN),
-    key("querylog", Hot(QueryLog), Shared, Lanes::OPEN),
-    key("querylog_size", Hot(QueryLog), Shared, Lanes::OPEN),
-    key(
-        "querylog_retention_secs",
-        Hot(QueryLog),
+    key!(cachedb_redis_port, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_expire_secs, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_secret, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_username, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_password, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_tls, Hot(Chain), Node, Lanes::OPEN),
+    key!(cachedb_redis_tls_ca, Hot(Chain), Node, Lanes::OPEN),
+    key!(cluster_peers, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_raft, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_node_id, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_raft_listen, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_raft_peers, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_raft_secret, Hot(Cluster), Node, Lanes::OPEN),
+    key!(cluster_raft_node_key, Hot(Cluster), Node, Lanes::OPEN),
+    key!(rebind_allow, Hot(Native), Shared, Lanes::OPEN),
+    key!(recurse_deny_server, Hot(Chain), Shared, Lanes::OPEN),
+    key!(recurse_allow_server, Hot(Chain), Shared, Lanes::OPEN),
+    key!(ns_recursion_limit, Hot(Chain), Shared, Lanes::OPEN),
+    key!(ns_cache_size, Hot(Chain), Shared, Lanes::OPEN),
+    key!(
+        recurse_deny_answers,
+        Hot(Native),
         Shared,
-        Lanes::OPEN,
+        reactor_and_authority(|c, _| !c.recurse_deny_answers.is_empty()),
     ),
-    key("anonymize_client_ip", Hot(QueryLog), Shared, Lanes::OPEN),
-    key("querylog_ignored", Hot(QueryLog), Shared, Lanes::OPEN),
-    key("stats_retention_secs", Hot(QueryLog), Shared, Lanes::OPEN),
-    key("querylog_file", Hot(Persistence), Node, Lanes::OPEN),
-    key("stats_file", Hot(Persistence), Node, Lanes::OPEN),
-    key("persist_flush_secs", Hot(Persistence), Shared, Lanes::OPEN),
-    key(
-        "dnstap_file",
+    key!(recurse_allow_answers, Hot(Native), Shared, Lanes::OPEN),
+    key!(val_nsec3_max_iterations, Hot(Chain), Shared, Lanes::OPEN),
+    key!(rate_limit_allow, Hot(RateLimit), Shared, Lanes::OPEN),
+    key!(acl_allow_ids, Hot(Acl), Shared, Lanes::OPEN),
+    key!(acl_deny_ids, Hot(Acl), Shared, Lanes::OPEN),
+    key!(hide_identity, Hot(Native), Shared, Lanes::OPEN),
+    key!(hide_version, Hot(Native), Shared, Lanes::OPEN),
+    key!(nsid, Hot(Native), Node, authority(|c, _| c.nsid.is_some()),),
+    key!(identity, Hot(Native), Node, Lanes::OPEN),
+    key!(version, Hot(Native), Shared, Lanes::OPEN),
+    key!(log_level, Hot(Log), Node, Lanes::OPEN),
+    key!(querylog, Hot(QueryLog), Shared, Lanes::OPEN),
+    key!(querylog_size, Hot(QueryLog), Shared, Lanes::OPEN),
+    key!(querylog_retention_secs, Hot(QueryLog), Shared, Lanes::OPEN,),
+    key!(anonymize_client_ip, Hot(QueryLog), Shared, Lanes::OPEN),
+    key!(querylog_ignored, Hot(QueryLog), Shared, Lanes::OPEN),
+    key!(stats_retention_secs, Hot(QueryLog), Shared, Lanes::OPEN),
+    key!(querylog_file, Hot(Persistence), Node, Lanes::OPEN),
+    key!(stats_file, Hot(Persistence), Node, Lanes::OPEN),
+    key!(persist_flush_secs, Hot(Persistence), Shared, Lanes::OPEN),
+    key!(
+        dnstap_file,
         Hot(Native),
         Node,
-        wire(|c, _| c.dnstap_file.is_some()),
+        wire_and_authority(|c, _| c.dnstap_file.is_some()),
     ),
-    key("dnstap_identity", Hot(Native), Node, Lanes::OPEN),
-    key("release_check", Hot(ReleaseCheck), Node, Lanes::OPEN),
+    key!(dnstap_identity, Hot(Native), Node, Lanes::OPEN),
+    key!(release_check, Hot(ReleaseCheck), Node, Lanes::OPEN),
 ];
 
 #[cfg(test)]
@@ -772,16 +954,21 @@ mod tests {
     use super::*;
 
     #[test]
-    /** @brief 표가 설정 키를 빠짐없이 한 번씩 담는지. */
+    /**
+     * @brief 표가 설정 키를 빠짐없이 한 번씩, 설정 키 목록의 순서대로 담는지.
+     * @details 관리 API 가 내는 키 목록은 표 순서를 따른다.
+     */
     fn table_covers_every_known_key_once() {
-        let mut table: Vec<&str> = KEYS.iter().map(|spec| spec.key).collect();
-        let mut known = onetdns_config::known_keys().to_vec();
-        table.sort_unstable();
-        known.sort_unstable();
+        let table: Vec<&str> = KEYS.iter().map(|spec| spec.key).collect();
         let mut unique = table.clone();
+        unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), table.len(), "같은 키가 표에 두 번 있습니다");
-        assert_eq!(table, known, "표와 설정 키 목록이 다릅니다");
+        assert_eq!(
+            table,
+            onetdns_config::known_keys(),
+            "표와 설정 키 목록이 다릅니다"
+        );
     }
 
     /** @brief 그 경로를 닫을 수 있는 키들. 표 순서를 따른다. */
@@ -844,16 +1031,39 @@ mod tests {
             [
                 "backend",
                 "serve_stale_secs",
+                "rebind_protection",
+                "bogus_nxdomain",
                 "stub_zones",
                 "aggressive_nsec",
                 "name_ratelimit_per_sec",
                 "harden_below_nxdomain",
                 "cachedb_redis_host",
+                "recurse_deny_answers",
             ]
         );
         assert_eq!(
             blockers(Lane::Authority),
-            ["acme_directory_url", "dynamic_records"]
+            [
+                "views",
+                "policy",
+                "wasm_policy",
+                "wasm_plugins",
+                "dns64_prefix",
+                "rebind_protection",
+                "cookies",
+                "acme_directory_url",
+                "block_aaaa",
+                "bogus_nxdomain",
+                "domain_needed",
+                "bogus_priv",
+                "empty_zones",
+                "dynamic_records",
+                "edns_padding_block",
+                "rrset_roundrobin",
+                "recurse_deny_answers",
+                "nsid",
+                "dnstap_file",
+            ]
         );
     }
 
@@ -862,7 +1072,7 @@ mod tests {
     fn only_privilege_drop_needs_a_new_generation() {
         let cold: Vec<&str> = KEYS
             .iter()
-            .filter(|spec| spec.reload == Reload::NewGeneration)
+            .filter(|spec| matches!(spec.reload, Reload::NewGeneration))
             .map(|spec| spec.key)
             .collect();
         assert_eq!(cold, ["run_as_user", "run_as_group"]);

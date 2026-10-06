@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 use crate::error::BoxResult;
 use crate::zone_signing::load_zone_signer;
 use crate::{
-    authority_sources_configured, build_tsig_keys, config_keys, layers, mac, native,
-    read_bytes_limited, tsig_for_secondary, PRODUCT_NAME, WASM_MODULE_MAX_BYTES,
+    authority_sources_configured, build_tsig_keys, config_keys, layers, native, read_bytes_limited,
+    tsig_for_secondary, PRODUCT_NAME, WASM_MODULE_MAX_BYTES,
 };
 
 /** @brief 클라이언트별로 다르게 답할 뷰들을 만든다. */
@@ -177,16 +177,6 @@ pub(crate) struct LaneFacts {
     pub(crate) policy_present: bool,
 }
 
-/** @brief 세 빠른 경로 각각을 지금 써도 되는지. */
-pub(crate) struct LaneGates {
-    /** @brief 캐시 적중 UDP 빠른 경로. */
-    pub(crate) wire: bool,
-    /** @brief 권한 영역 단순 질의 빠른 경로. */
-    pub(crate) authority: bool,
-    /** @brief 재귀 콜드미스 리액터 레인. */
-    pub(crate) reactor: bool,
-}
-
 /**
  * @brief 답한 주소를 커널 주소 집합에 넣는 계층이 이 설정에서 붙는지.
  * @details 집합 이름과 대상 도메인이 함께 있어야 하고, 커널 집합은 Linux에만 있다. 붙지 않는
@@ -208,13 +198,13 @@ pub(crate) fn ipset_layer_active(cfg: &Config) -> bool {
  * @param facts  설정만으로 알 수 없는 사실들.
  * @return 세 경로 각각의 적격 여부.
  */
-pub(crate) fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> LaneGates {
+pub(crate) fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> native::LaneGates {
     use config_keys::{lane_unblocked, Lane};
     let wire = lane_unblocked(Lane::Wire, cfg, facts);
     let authority =
         authority_sources_configured(cfg) && lane_unblocked(Lane::Authority, cfg, facts);
     let reactor = cfg!(unix) && wire && lane_unblocked(Lane::Reactor, cfg, facts);
-    LaneGates {
+    native::LaneGates {
         wire,
         authority,
         reactor,
@@ -224,9 +214,7 @@ pub(crate) fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> LaneGates 
 #[derive(Clone)]
 /** @brief 설정을 다시 읽을 때 교체할 것들. */
 pub(crate) struct NativeHotState {
-    /** @brief 빠른 경로의 체인 세대까지 함께 교체할 핸들러. */
-    pub(crate) handler: Arc<native::NativeServer>,
-    /** @brief 기능 세트. */
+    /** @brief 기능 세트. 빠른 경로 조건과 체인 세대도 여기에 함께 담긴다. */
     pub(crate) features: Arc<native::NativeFeatureSwap>,
     /** @brief 정책 엔진. */
     pub(crate) policy: Arc<native::GatedSwap<onetdns_policy::PolicyEngine>>,
@@ -238,10 +226,6 @@ pub(crate) struct NativeHotState {
     pub(crate) local_ttl: Arc<std::sync::atomic::AtomicU32>,
     /** @brief 밖에 물어보면 안 되는 이름의 범주. */
     pub(crate) local_only_names: Arc<layers::LocalOnlyNames>,
-    /** @brief 설정 세대. 이전 세대가 만든 항목이 들어오지 못하게 한다. */
-    pub(crate) wire_epoch: Arc<std::sync::atomic::AtomicUsize>,
-    /** @brief 빠른 경로 켜짐 여부. */
-    pub(crate) lane_switch: Arc<native::LaneSwitch>,
     /** @brief 권한 영역 설정 세트. */
     pub(crate) authority: Arc<onetdns_core::ArcSwap<native::AuthoritySettings>>,
 }
@@ -654,44 +638,74 @@ pub(crate) fn telemetry_consumed(cfg: &Config) -> bool {
     cfg.control_listen.is_some() || has_file(&cfg.stats_file) || has_file(&cfg.querylog_file)
 }
 
-/** @brief 설정에서 DNS Cookie 정책과 서버 비밀을 만든다. */
-fn build_cookie_policy(cfg: &Config) -> native::CookiePolicy {
+/** @brief 쿠키 서버 비밀을 끌어낼 클러스터 비밀. 없으면 노드마다 무작위 비밀을 쓴다. */
+fn cookie_root(cfg: &Config) -> Option<&str> {
+    (cfg.cluster_raft && cfg.cluster_raft_secret.len() >= 32)
+        .then_some(cfg.cluster_raft_secret.as_str())
+}
+
+/**
+ * @brief 설정에서 DNS Cookie 정책을 만든다.
+ * @param previous 지금 쓰는 설정과 쿠키 정책. 서버 비밀을 정하는 입력이 그대로면 그 비밀을
+ *                 이어 쓴다. 새 비밀을 만들면 클라이언트가 가진 서버 쿠키가 모두 맞지 않게 된다.
+ */
+fn build_cookie_policy(
+    cfg: &Config,
+    previous: Option<(&Config, &native::CookiePolicy)>,
+) -> native::CookiePolicy {
     if !cfg.cookies.is_enabled() {
         return native::CookiePolicy::default();
     }
-
-    let keeper = if cfg.cluster_raft && cfg.cluster_raft_secret.len() >= 32 {
-        // Raft 인증과 쿠키가 같은 원시 키를 직접 공유하지 않도록 문맥을 붙여 별도 루트를
-        // 만든다. 같은 클러스터 비밀을 가진 노드는 같은 루트와 epoch 키를 얻게 된다.
-        let mut digest = Sha256::new();
-        digest.update(b"OnetDNS DNS Cookie cluster master v1\0");
-        digest.update(cfg.cluster_raft_secret.as_bytes());
-        let digest = Zeroizing::new(<[u8; 32]>::from(digest.finalize()));
-        let mut master = Zeroizing::new([0u8; 16]);
-        master.copy_from_slice(&digest[..16]);
-        CookieKeeper::from_master_secret(&master)
-    } else {
-        CookieKeeper::random()
-    };
-
+    let kept = previous
+        .filter(|(running, _)| cookie_root(running) == cookie_root(cfg))
+        .and_then(|(_, policy)| policy.keeper.clone());
+    let keeper = kept.unwrap_or_else(|| {
+        Arc::new(match cookie_root(cfg) {
+            Some(secret) => {
+                /*
+                 * Raft 인증과 쿠키가 같은 원시 키를 직접 공유하지 않도록 문맥을 붙여 별도 루트를
+                 * 만든다. 같은 클러스터 비밀을 가진 노드는 같은 루트와 epoch 키를 얻게 된다.
+                 */
+                let mut digest = Sha256::new();
+                digest.update(b"OnetDNS DNS Cookie cluster master v1\0");
+                digest.update(secret.as_bytes());
+                let digest = Zeroizing::new(<[u8; 32]>::from(digest.finalize()));
+                let mut master = Zeroizing::new([0u8; 16]);
+                master.copy_from_slice(&digest[..16]);
+                CookieKeeper::from_master_secret(&master)
+            }
+            None => CookieKeeper::random(),
+        })
+    });
     native::CookiePolicy {
-        keeper: Some(Arc::new(keeper)),
+        keeper: Some(keeper),
         strict: cfg.cookies.is_strict(),
     }
 }
 
-/** @brief 설정대로 기능 세트를 만든다. */
+/** @brief DNS64 접두사의 16바이트 표현. 뒤 4바이트는 합성할 때 IPv4 주소로 채우므로 0이다. */
+fn dns64_prefix(cfg: &Config) -> Option<[u8; 16]> {
+    let address = cfg.dns64_prefix.as_ref()?.split('/').next()?;
+    let mut octets = address.parse::<std::net::Ipv6Addr>().ok()?.octets();
+    octets[12..16].fill(0);
+    Some(octets)
+}
+
+/**
+ * @brief 설정으로 기능 세트를 만든다. 시작할 때와 설정을 교체할 때 이 함수 하나를 쓴다.
+ * @details 어느 키가 바뀌었는지 보지 않고 설정 전체에서 만든다. 바뀐 키의 그룹으로 고칠 필드를
+ *          고르면, 다른 그룹에 속하면서 응답 기능 값도 정하는 키를 빠뜨린다.
+ * @param previous 지금 쓰는 설정과 기능 세트. 시작할 때는 없다. 쿠키 비밀과 dnstap 스트림을
+ *                 이어 쓸지 정하는 데만 쓴다.
+ * @note 빠른 경로 상태는 비워 둔다. 체인 세대와 경로 조건은 부른 쪽이 정해 넣는다.
+ */
 pub(crate) fn build_native_features(
     cfg: &Config,
-    dns64_prefix: Option<[u8; 16]>,
-    safe_search: Arc<std::sync::atomic::AtomicBool>,
-    recorder: Option<onetdns_control::Recorder>,
-    mac_cache: Option<Arc<mac::NeighborCache>>,
+    previous: Option<(&Config, &native::NativeFeatures)>,
 ) -> Result<native::NativeFeatures, String> {
-    let cookies = build_cookie_policy(cfg);
     Ok(native::NativeFeatures {
         block_aaaa: cfg.block_aaaa,
-        dns64_prefix,
+        dns64_prefix: dns64_prefix(cfg),
         dns64_synthall: cfg.dns64_synthall,
         rebind_protection: cfg.rebind_protection,
         rebind_allow: cfg
@@ -708,15 +722,16 @@ pub(crate) fn build_native_features(
         recurse_deny_answers: cfg.recurse_deny_answers.clone(),
         recurse_allow_answers: cfg.recurse_allow_answers.clone(),
         rrset_roundrobin: cfg.rrset_roundrobin,
-        rotor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        safe_search,
         nsid: cfg.nsid.as_ref().map(|s| s.clone().into_bytes()),
-        cookies,
-        recorder,
-        mac_cache,
+        cookies: build_cookie_policy(
+            cfg,
+            previous.map(|(running, features)| (running, &features.cookies)),
+        ),
         inflight_max: cfg.max_inflight,
-        inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        dnstap: build_dnstap(cfg)?,
+        dnstap: build_dnstap(
+            cfg,
+            previous.and_then(|(_, features)| features.dnstap.as_ref()),
+        )?,
         edns_buffer: cfg.edns_buffer_size,
         hide_identity: cfg.hide_identity,
         hide_version: cfg.hide_version,
@@ -738,91 +753,11 @@ pub(crate) fn build_native_features(
             .then(|| (cfg.edns_tcp_keepalive_secs.saturating_mul(10)).min(65535) as u16),
         ecs_in_use: cfg.ecs_mode == EcsMode::Send && cfg.ecs_custom_ip.is_some(),
         harden_large_queries: cfg.harden_large_queries,
-        domain_needed: cfg.domain_needed,
-        bogus_priv: cfg.bogus_priv,
-        empty_zones: cfg.empty_zones,
         ddr_enabled: !cfg.ddr_name.is_empty(),
         lane_runtime: None,
+        lanes: native::LaneGates::default(),
+        wire_epoch: 0,
     })
-}
-
-/** @brief 기능 세트를 교체한다. */
-pub(crate) fn reconfigure_native_features(
-    current: &native::NativeFeatures,
-    cfg: &Config,
-    changed: &[String],
-) -> Result<native::NativeFeatures, String> {
-    let mut next = current.clone();
-    next.block_aaaa = cfg.block_aaaa;
-    next.dns64_prefix = cfg.dns64_prefix.as_ref().and_then(|prefix| {
-        let ip_part = prefix.split('/').next()?;
-        let mut octets = ip_part.parse::<std::net::Ipv6Addr>().ok()?.octets();
-        octets[12..16].fill(0);
-        Some(octets)
-    });
-    next.dns64_synthall = cfg.dns64_synthall;
-    next.rebind_protection = cfg.rebind_protection;
-    next.rebind_allow = cfg
-        .rebind_allow
-        .iter()
-        .filter_map(|name| {
-            onetdns_proto::Name::from_str(
-                name.trim().trim_start_matches("*.").trim_end_matches('.'),
-            )
-            .ok()
-        })
-        .collect();
-    next.bogus_nxdomain = cfg.bogus_nxdomain.clone();
-    next.recurse_deny_answers = cfg.recurse_deny_answers.clone();
-    next.recurse_allow_answers = cfg.recurse_allow_answers.clone();
-    next.rrset_roundrobin = cfg.rrset_roundrobin;
-
-    next.nsid = cfg.nsid.as_ref().map(|value| value.clone().into_bytes());
-    if changed.iter().any(|key| {
-        matches!(
-            key.as_str(),
-            "cookies" | "cluster_raft" | "cluster_raft_secret"
-        )
-    }) {
-        next.cookies = build_cookie_policy(cfg);
-    }
-    next.inflight_max = cfg.max_inflight;
-    if changed
-        .iter()
-        .any(|key| matches!(key.as_str(), "dnstap_file" | "dnstap_identity"))
-    {
-        next.dnstap = match (current.dnstap.as_ref(), cfg.dnstap_file.as_ref()) {
-            (Some(open), Some(path)) if open.path() == path.as_path() => {
-                Some(Arc::new(open.with_identity(dnstap_identity(cfg))))
-            }
-            _ => build_dnstap(cfg)?,
-        };
-    }
-    next.edns_buffer = cfg.edns_buffer_size;
-    next.hide_identity = cfg.hide_identity;
-    next.hide_version = cfg.hide_version;
-    next.server_identity = cfg
-        .identity
-        .clone()
-        .or_else(|| cfg.nsid.clone())
-        .unwrap_or_else(|| PRODUCT_NAME.to_string())
-        .into_bytes();
-    next.server_version = cfg
-        .version
-        .clone()
-        .unwrap_or_else(|| PRODUCT_NAME.to_string())
-        .into_bytes();
-    next.allow_any = !cfg.deny_any;
-    next.minimal_responses = cfg.minimal_responses;
-    next.padding_block = cfg.edns_padding_block;
-    next.tcp_keepalive_100ms = (cfg.edns_tcp_keepalive_secs > 0)
-        .then(|| (cfg.edns_tcp_keepalive_secs.saturating_mul(10)).min(65535) as u16);
-    next.ecs_in_use = cfg.ecs_mode == EcsMode::Send && cfg.ecs_custom_ip.is_some();
-    next.harden_large_queries = cfg.harden_large_queries;
-    next.domain_needed = cfg.domain_needed;
-    next.bogus_priv = cfg.bogus_priv;
-    next.empty_zones = cfg.empty_zones;
-    Ok(next)
 }
 
 /** @brief dnstap 기록에 적을 서버 이름. 따로 정하지 않으면 제품 이름이다. */
@@ -834,11 +769,21 @@ fn dnstap_identity(cfg: &Config) -> &str {
     }
 }
 
-/** @brief 질의 기록 파일을 연다. 열지 못하면 조용히 끄지 않고 실패로 알린다. */
-fn build_dnstap(cfg: &Config) -> Result<Option<Arc<onetdns_control::DnstapWriter>>, String> {
+/**
+ * @brief 질의 기록 파일을 연다. 열지 못하면 조용히 끄지 않고 실패로 알린다.
+ * @param open 지금 쓰는 기록기. 같은 파일이면 그 스트림을 이어 쓰고 서버 이름만 바꾼다. 같은
+ *             파일에 스트림을 하나 더 열면 두 스트림의 프레임이 한 파일에 섞인다.
+ */
+fn build_dnstap(
+    cfg: &Config,
+    open: Option<&Arc<onetdns_control::DnstapWriter>>,
+) -> Result<Option<Arc<onetdns_control::DnstapWriter>>, String> {
     let Some(path) = cfg.dnstap_file.as_ref() else {
         return Ok(None);
     };
+    if let Some(open) = open.filter(|open| open.path() == path.as_path()) {
+        return Ok(Some(Arc::new(open.with_identity(dnstap_identity(cfg)))));
+    }
     let writer =
         onetdns_control::DnstapWriter::create(path, dnstap_identity(cfg)).map_err(|error| {
             format!(
@@ -928,7 +873,6 @@ mod tests {
     use onetdns_core::RateLimiter;
     use onetdns_security::IpAcl;
 
-    use crate::config_keys::ApplyGroup;
     use crate::{config_keys, native};
 
     #[test]
@@ -1172,49 +1116,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의마다 읽는 기능 값이 체인 재구성으로 가로채이지 않는지.
-     * @details 분류는 체인 목록을 먼저 본다. 체인 목록에도 있으면 기능 세트가 갱신되지 않아
-     *          무중단 변경이 저장만 되고 적용되지 않는다.
-     */
-    fn native_feature_keys_reach_the_native_group() {
-        let previous = Config::default();
-        for (key, next) in [
-            (
-                "deny_any",
-                Config {
-                    deny_any: !previous.deny_any,
-                    ..Config::default()
-                },
-            ),
-            (
-                "minimal_responses",
-                Config {
-                    minimal_responses: !previous.minimal_responses,
-                    ..Config::default()
-                },
-            ),
-        ] {
-            assert_eq!(
-                config_keys::hot_group(key),
-                Some(ApplyGroup::Native),
-                "{key}"
-            );
-            let features = reconfigure_native_features(
-                &native::NativeFeatures::default(),
-                &next,
-                &[key.to_string()],
-            )
-            .unwrap();
-            assert!(
-                features.allow_any != next.deny_any
-                    && features.minimal_responses == next.minimal_responses,
-                "{key}"
-            );
-        }
-    }
-
-    #[test]
     /** @brief 플러그인마다 정한 실패 처분이 전체 설정을 이기는지. */
     fn per_plugin_fail_mode_overrides_global() {
         let missing = std::env::temp_dir().join(format!(
@@ -1427,6 +1328,15 @@ mod tests {
                 })
             }),
             ("backend", |c: &mut Config| c.backend = BackendKind::Forward),
+            ("rebind_protection", |c: &mut Config| {
+                c.rebind_protection = true
+            }),
+            ("bogus_nxdomain", |c: &mut Config| {
+                c.bogus_nxdomain = vec!["192.0.2.1/32".parse().unwrap()]
+            }),
+            ("recurse_deny_answers", |c: &mut Config| {
+                c.recurse_deny_answers = vec!["192.0.2.1/32".parse().unwrap()]
+            }),
         ] {
             assert!(
                 config_keys::is_hot(key),
@@ -1445,14 +1355,7 @@ mod tests {
     #[test]
     /** @brief 기본 설정이 실제 질의 기능 세트에도 lenient 쿠키를 만드는지. */
     fn default_native_features_enable_lenient_cookies() {
-        let features = build_native_features(
-            &Config::default(),
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            None,
-            None,
-        )
-        .unwrap();
+        let features = build_native_features(&Config::default(), None).unwrap();
 
         assert!(
             features.cookies.keeper.is_some(),
@@ -1464,10 +1367,30 @@ mod tests {
         );
     }
 
+    /** @brief 이 기능 세트가 정해진 클라이언트 쿠키와 주소, 시각에 내는 서버 쿠키. */
+    fn server_cookie(features: &native::NativeFeatures) -> Vec<u8> {
+        features
+            .cookies
+            .keeper
+            .as_ref()
+            .expect("쿠키 비밀이 없습니다")
+            .server_cookie_at(
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                "192.0.2.53".parse().unwrap(),
+                1_800_000_000,
+            )
+            .to_vec()
+    }
+
     #[test]
-    /** @brief 같은 Raft 비밀의 노드는 쿠키를 공유하고 비밀 hot-reload는 즉시 갈리는지. */
+    /**
+     * @brief 같은 Raft 비밀의 노드는 쿠키를 공유하고, 비밀을 바꾸면 쿠키도 바로 바뀌는지.
+     * @details Raft 를 켜기 전에 노드가 쓰던 무작위 비밀도 켜는 순간 공용 루트로 바뀌어야 한다.
+     *          남아 있으면 노드마다 다른 서버 쿠키를 내서, 다른 노드로 간 클라이언트의 쿠키가
+     *          맞지 않는다.
+     */
     fn raft_nodes_share_cookie_keys_and_secret_reload_rotates_them() {
-        let mut first_cfg = Config {
+        let first_cfg = Config {
             cluster_raft: true,
             cluster_node_id: 1,
             cluster_raft_secret: "shared-cluster-secret-at-least-32-bytes".into(),
@@ -1475,35 +1398,99 @@ mod tests {
         };
         let mut second_cfg = first_cfg.clone();
         second_cfg.cluster_node_id = 2;
-        let build = |cfg: &Config| {
-            build_native_features(
-                cfg,
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                None,
-                None,
-            )
-            .unwrap()
-        };
-        let cookie = |features: &native::NativeFeatures| {
-            features.cookies.keeper.as_ref().unwrap().server_cookie_at(
-                &[1, 2, 3, 4, 5, 6, 7, 8],
-                "192.0.2.53".parse().unwrap(),
-                1_800_000_000,
-            )
-        };
+        let build = |cfg: &Config| build_native_features(cfg, None).unwrap();
 
         let first = build(&first_cfg);
         let second = build(&second_cfg);
-        assert_eq!(cookie(&first), cookie(&second), "노드 ID와 무관한 공유 키");
+        assert_eq!(
+            server_cookie(&first),
+            server_cookie(&second),
+            "노드 ID가 달라도 같은 클러스터 비밀이면 서버 쿠키가 같아야 합니다"
+        );
 
-        first_cfg.cluster_raft_secret = "replacement-cluster-secret-at-least-32".into();
-        let changed = vec!["cluster_raft_secret".to_string()];
-        let reloaded = reconfigure_native_features(&first, &first_cfg, &changed).unwrap();
+        let mut rotated_cfg = first_cfg.clone();
+        rotated_cfg.cluster_raft_secret = "replacement-cluster-secret-at-least-32".into();
+        let rotated = build_native_features(&rotated_cfg, Some((&first_cfg, &first))).unwrap();
         assert_ne!(
-            cookie(&first),
-            cookie(&reloaded),
-            "공용 비밀 변경은 새 Cookie 루트를 원자적으로 교체합니다"
+            server_cookie(&first),
+            server_cookie(&rotated),
+            "클러스터 비밀을 바꿨는데 이전 쿠키 루트가 남았습니다"
+        );
+        assert_eq!(
+            server_cookie(&rotated),
+            server_cookie(&build(&rotated_cfg)),
+            "비밀을 바꾼 노드와 새 비밀로 시작한 노드의 서버 쿠키가 달라야 할 이유가 없습니다"
+        );
+
+        let standalone_cfg = Config {
+            cluster_raft: false,
+            ..first_cfg.clone()
+        };
+        let standalone = build(&standalone_cfg);
+        let joined =
+            build_native_features(&first_cfg, Some((&standalone_cfg, &standalone))).unwrap();
+        assert_eq!(
+            server_cookie(&joined),
+            server_cookie(&first),
+            "Raft를 켰는데 노드의 무작위 쿠키 비밀이 남았습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 쿠키 비밀을 정하는 입력이 그대로면 설정을 교체해도 같은 비밀을 쓰는지.
+     * @details 비밀을 새로 만들면 클라이언트가 받아 둔 서버 쿠키가 모두 맞지 않게 된다. 엄격
+     *          모드에서는 그 클라이언트들이 거부된다. 모드만 바꾸거나, Raft 를 끈 채 비밀만 적어
+     *          둔 경우도 입력이 그대로인 경우다.
+     */
+    fn cookie_secret_survives_reloads_that_keep_its_root() {
+        let running_cfg = Config::default();
+        let running = build_native_features(&running_cfg, None).unwrap();
+        let keeper = |features: &native::NativeFeatures| {
+            features
+                .cookies
+                .keeper
+                .clone()
+                .expect("쿠키 비밀이 없습니다")
+        };
+
+        let unrelated = Config {
+            minimal_responses: !running_cfg.minimal_responses,
+            ..running_cfg.clone()
+        };
+        let strict = Config {
+            cookies: CookieMode::Strict,
+            ..running_cfg.clone()
+        };
+        let staged_secret = Config {
+            cluster_raft: false,
+            cluster_raft_secret: "staged-cluster-secret-at-least-32-bytes".into(),
+            ..running_cfg.clone()
+        };
+        for (case, next) in [
+            ("다른 키만 바꾼 경우", &unrelated),
+            ("엄격 모드로 바꾼 경우", &strict),
+            ("Raft를 끈 채 비밀만 적은 경우", &staged_secret),
+        ] {
+            let reloaded = build_native_features(next, Some((&running_cfg, &running))).unwrap();
+            assert!(
+                Arc::ptr_eq(&keeper(&running), &keeper(&reloaded)),
+                "{case}에 쿠키 비밀을 새로 만들었습니다"
+            );
+            assert_eq!(reloaded.cookies.strict, next.cookies.is_strict(), "{case}");
+        }
+
+        let disabled = Config {
+            cookies: CookieMode::Off,
+            ..running_cfg.clone()
+        };
+        assert!(
+            build_native_features(&disabled, Some((&running_cfg, &running)))
+                .unwrap()
+                .cookies
+                .keeper
+                .is_none(),
+            "쿠키를 껐는데 비밀이 남았습니다"
         );
     }
 
@@ -1546,20 +1533,72 @@ mod tests {
             origin: "example.test".to_string(),
             ..Default::default()
         });
-        assert!(evaluate_lane_gates(&base, &facts).authority);
+        assert_eq!(base.cookies, CookieMode::Lenient);
+        assert!(
+            evaluate_lane_gates(&base, &facts).authority,
+            "lenient 쿠키는 COOKIE 옵션이 붙은 질의만 일반 경로로 보내므로 경로를 닫지 않아야 합니다"
+        );
 
-        let mut with_acme = base.clone();
-        with_acme.acme_directory_url = Some("https://acme.test/dir".to_string());
-        assert!(!evaluate_lane_gates(&with_acme, &facts).authority);
+        let breakers: Vec<(&str, fn(&mut Config))> = vec![
+            ("acme_directory_url", |c| {
+                c.acme_directory_url = Some("https://acme.test/dir".to_string())
+            }),
+            ("dynamic_records", |c| {
+                c.dynamic_records.push(onetdns_config::DynamicRecord {
+                    name: "www.example.test".to_string(),
+                    ..Default::default()
+                })
+            }),
+            ("dns64_prefix", |c| {
+                c.dns64_prefix = Some("64:ff9b::/96".to_string())
+            }),
+            ("rebind_protection", |c| c.rebind_protection = true),
+            ("cookies", |c| c.cookies = CookieMode::Strict),
+            ("block_aaaa", |c| c.block_aaaa = true),
+            ("bogus_nxdomain", |c| {
+                c.bogus_nxdomain = vec!["192.0.2.1/32".parse().unwrap()]
+            }),
+            ("domain_needed", |c| c.domain_needed = true),
+            ("bogus_priv", |c| c.bogus_priv = true),
+            ("empty_zones", |c| c.empty_zones = true),
+            ("edns_padding_block", |c| c.edns_padding_block = 128),
+            ("rrset_roundrobin", |c| c.rrset_roundrobin = true),
+            ("recurse_deny_answers", |c| {
+                c.recurse_deny_answers = vec!["192.0.2.1/32".parse().unwrap()]
+            }),
+            ("nsid", |c| c.nsid = Some("ns1".to_string())),
+            ("dnstap_file", |c| {
+                c.dnstap_file = Some(PathBuf::from("dnstap.log"))
+            }),
+        ];
+        for (key, break_it) in breakers {
+            assert!(
+                config_keys::is_hot(key),
+                "{key}가 무중단 목록에서 빠졌습니다. 테스트를 함께 고치십시오"
+            );
+            let mut cfg = base.clone();
+            break_it(&mut cfg);
+            assert!(
+                !evaluate_lane_gates(&cfg, &facts).authority,
+                "{key}를 무중단으로 켜면 권한 빠른 경로가 닫혀야 합니다"
+            );
+        }
 
-        let mut with_dynamic = base;
-        with_dynamic
-            .dynamic_records
-            .push(onetdns_config::DynamicRecord {
-                name: "www.example.test".to_string(),
-                ..Default::default()
-            });
-        assert!(!evaluate_lane_gates(&with_dynamic, &facts).authority);
+        for live in [
+            LaneFacts {
+                views_present: true,
+                ..facts
+            },
+            LaneFacts {
+                policy_present: true,
+                ..facts
+            },
+        ] {
+            assert!(
+                !evaluate_lane_gates(&base, &live).authority,
+                "뷰나 정책이 있으면 권한 빠른 경로가 닫혀야 합니다"
+            );
+        }
     }
 
     #[test]
@@ -1567,6 +1606,46 @@ mod tests {
     fn configured_dnstap_open_failure_is_not_silently_disabled() {
         let mut config = Config::default();
         config.dnstap_file = Some(std::env::temp_dir());
-        assert!(build_dnstap(&config).is_err());
+        assert!(build_dnstap(&config, None).is_err());
+    }
+
+    #[test]
+    /**
+     * @brief 같은 dnstap 파일로 설정을 교체하면 스트림을 새로 열지 않는지.
+     * @details 새로 열면 시작 프레임이 하나 더 붙고, 이전 기록기가 마저 쓰는 프레임과 새
+     *          기록기의 프레임이 한 파일에 섞여 읽는 쪽이 스트림을 해석하지 못한다.
+     */
+    fn dnstap_reload_on_the_same_file_keeps_one_stream() {
+        let path = std::env::temp_dir().join(format!(
+            "onetdns-dnstap-reload-{}-{}.fstrm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let running_cfg = Config {
+            dnstap_file: Some(path.clone()),
+            ..Config::default()
+        };
+        let next_cfg = Config {
+            dnstap_identity: "renamed".to_string(),
+            ..running_cfg.clone()
+        };
+        let running = build_native_features(&running_cfg, None).unwrap();
+        let reloaded = build_native_features(&next_cfg, Some((&running_cfg, &running))).unwrap();
+        assert!(
+            reloaded.dnstap.is_some(),
+            "교체한 설정에서 dnstap이 꺼졌습니다"
+        );
+
+        let content = std::fs::read(&path).unwrap();
+        drop((running, reloaded));
+        let _ = std::fs::remove_file(&path);
+        let starts = content
+            .windows(b"protobuf:dnstap.Dnstap".len())
+            .filter(|window| *window == b"protobuf:dnstap.Dnstap")
+            .count();
+        assert_eq!(starts, 1, "같은 파일에 dnstap 스트림을 하나 더 열었습니다");
     }
 }

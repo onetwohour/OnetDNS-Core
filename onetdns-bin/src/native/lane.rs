@@ -117,6 +117,14 @@ pub(crate) struct LaneClient {
 
     /** @brief 레인에 맡긴 시각. */
     pub(crate) submitted: std::time::Instant,
+    /** @brief 맡기기 전에 잡은 캐시 세대. 이 질의의 답과 실패는 이 세대로만 담긴다. */
+    pub(crate) epoch: crate::cache::CacheEpoch,
+    /**
+     * @brief 맡길 때 읽은 기능 세트.
+     * @details 끝낸 답을 다듬고 wire 항목으로 담는 판단도 이 세트로 한다. 그사이 교체된 세트로
+     *          하면 이전 조건으로 고른 답에 새 세대의 태그가 붙어, 그 조건이 바뀐 뒤에도 나간다.
+     */
+    pub(crate) features: Arc<NativeFeatures>,
 }
 
 #[cfg(unix)]
@@ -181,7 +189,7 @@ impl NativeServer {
         failure: &ResolveFailure,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
-        let f = self.features.load();
+        let f = &cl.features;
         let qname = cl.request.questions.first().map(|q| &q.name);
         let (reason, class, ede) = failure_diagnosis(failure);
         let detail = format!(
@@ -197,15 +205,15 @@ impl NativeServer {
             "resolver",
             &detail,
         );
-        self.rec_latency(&f, &cl.client, qname, timer.elapsed_us());
+        self.rec_latency(&cl.client, qname, timer.elapsed_us());
         let mut resp = error_resp(&cl.request, ResponseCode::ServFail);
         if let Some(code) = ede {
             let edns = with_ede(None, &cl.request, f.edns_buffer, code, ede_text(code));
             resp = finalize(resp, edns);
         }
         let ctx = RequestCtx::new(cl.src, onetdns_runtime::Transport::Do53Udp);
-        reactor_response_edns(&f, &mut resp, &cl.request);
-        let _ = postprocess(&f, &mut resp, &cl.request, &ctx);
+        reactor_response_edns(f, &mut resp, &cl.request);
+        let _ = postprocess(f, &mut resp, &cl.request, &ctx);
         let mut w = onetdns_proto::Writer::with_limit(1232);
         onetdns_runtime::encode_limited(&cl.request, &resp, &mut w);
         if !w.buf.is_empty() {
@@ -225,11 +233,8 @@ impl NativeServer {
         if comps.is_empty() {
             return;
         }
-        let f = self.features.load();
         let runtime = st.runtime.clone();
         let filter = self.filter.load();
-        let filter_tag = (Arc::as_ptr(&filter) as usize).rotate_left(17)
-            ^ self.wire_epoch.load(Ordering::Acquire);
         let mut w = onetdns_proto::Writer::with_limit(1232);
         for comp in comps {
             let (token, lane_answer) = match comp {
@@ -239,7 +244,7 @@ impl NativeServer {
                     let Some(cl) = st.clients.remove(&token) else {
                         continue;
                     };
-                    runtime.cache.lane_remember_failure(&cl.request);
+                    runtime.cache.lane_remember_failure(cl.epoch, &cl.request);
                     if let (onetdns_recurse::RecurseError::NoResponse, Some(recursor), Some(q)) = (
                         &error,
                         runtime.recursor.as_ref(),
@@ -264,6 +269,7 @@ impl NativeServer {
                 continue;
             };
             let req = &cl.request;
+            let f = &cl.features;
 
             let timer = onetdns_control::RequestTimer::start_at(cl.submitted);
             let mut resp = match lane_answer {
@@ -307,13 +313,13 @@ impl NativeServer {
             resp.header.checking_disabled = req.header.checking_disabled;
             resp.questions = req.questions.clone();
             let ctx = RequestCtx::new(cl.src, onetdns_runtime::Transport::Do53Udp);
-            reactor_response_edns(&f, &mut resp, req);
-            if let Err(error) = postprocess(&f, &mut resp, req, &ctx) {
+            reactor_response_edns(f, &mut resp, req);
+            if let Err(error) = postprocess(f, &mut resp, req, &ctx) {
                 onetdns_core::error!(event = "dns.response_postprocess_failed", %error,
                     "EDNS post-processing of the response failed; replacing it with SERVFAIL");
                 resp = error_resp(req, ResponseCode::ServFail);
             }
-            runtime.cache.store(req, &resp);
+            runtime.cache.store(cl.epoch, req, &resp);
 
             let uncloaked = (!filter.is_trivially_allow())
                 .then(|| Self::cname_uncloak(&filter, &resp.answers, &cl.client))
@@ -337,19 +343,13 @@ impl NativeServer {
                 );
             } else {
                 self.rec_final_answer(
-                    &f,
                     &cl.client,
                     &req.questions[0].name,
                     req.questions[0].qtype,
                     &resp,
                 );
             }
-            self.rec_latency(
-                &f,
-                &cl.client,
-                Some(&req.questions[0].name),
-                timer.elapsed_us(),
-            );
+            self.rec_latency(&cl.client, Some(&req.questions[0].name), timer.elapsed_us());
             w.clear();
             onetdns_runtime::encode_limited(req, &resp, &mut w);
             if w.buf.is_empty() {
@@ -357,7 +357,7 @@ impl NativeServer {
             }
 
             if let (Some(fast_path), Some(scanned)) = (
-                (!blocked && self.lane_switch.wire())
+                (!blocked && f.lanes.wire)
                     .then_some(runtime.as_ref())
                     .filter(|runtime| runtime.factory.is_some()),
                 crate::wirecache::scan_query(&cl.raw),
@@ -374,11 +374,11 @@ impl NativeServer {
                             FilterVerdict::Allow
                         ));
                 if storable {
-                    self.store_wire_response(
-                        fast_path,
+                    fast_path.store_wire_response(
+                        cl.epoch,
                         scanned.key(),
                         &w.buf,
-                        filter_tag,
+                        f.wire_tag(&filter),
                         String::new(),
                         std::time::Instant::now(),
                     );

@@ -394,8 +394,9 @@ mod tests {
         let refresher: PrefetchRefresher = {
             let backend = backend.clone();
             Arc::new(move |req: &Message| {
+                let epoch = handle.epoch();
                 let resp = backend.resolve(req)?;
-                handle.store(req, &resp);
+                handle.store(epoch, req, &resp);
                 Some(resp)
             })
         };

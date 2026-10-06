@@ -123,3 +123,104 @@ impl Resolver for LocalOnlyLayer {
         self.inner.resolve_outcome(req)
     }
 }
+
+#[cfg(test)]
+/** @brief 범주를 바꾸며 캐시를 비울 때 이미 나간 질의가 그 결과를 되돌리지 않는지. */
+mod tests {
+    use super::*;
+    use crate::layers::test_support::query;
+    use onetdns_proto::{RData, Record, ResponseCode};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
+
+    /** @brief 첫 질의를 붙잡아 두었다가 놓아 주면 업스트림의 PTR 답을 내는 리졸버. */
+    struct HeldUpstream {
+        /** @brief 첫 질의가 들어왔음을 알릴 곳. 한 번 알리면 비운다. */
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        /** @brief 붙잡은 질의를 놓아 줄 신호. */
+        release: Mutex<mpsc::Receiver<()>>,
+        /** @brief 불린 횟수. */
+        calls: AtomicUsize,
+    }
+
+    impl Resolver for HeldUpstream {
+        /** @brief 첫 질의는 신호가 올 때까지 붙잡고, 모든 질의에 같은 PTR 답을 낸다. */
+        fn resolve(&self, req: &Message) -> Option<Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let entered = self.entered.lock().unwrap().take();
+            if let Some(entered) = entered {
+                entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            let q = req.questions.first()?;
+            let mut response =
+                crate::layers::answer_message(req.header.id, q.name.clone(), q.qtype, vec![]);
+            response.answers.push(Record::new(
+                q.name.clone(),
+                300,
+                RData::Ptr(Name::from_str("printer.lan").unwrap()),
+            ));
+            Some(response)
+        }
+    }
+
+    #[test]
+    /**
+     * @brief bogus_priv를 켜며 캐시를 비운 뒤, 그 전에 나간 질의의 업스트림 답이 캐시에 다시
+     *        들어가지 않는지.
+     * @details 들어가면 사설 대역 역방향 질의가 그 답의 수명 동안 업스트림 답을 받는다. 범주를
+     *          켜면서 캐시를 비운 뜻이 사라진다.
+     */
+    fn a_local_only_flush_is_not_undone_by_an_in_flight_answer() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let upstream = Arc::new(HeldUpstream {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let names = Arc::new(LocalOnlyNames::new(false, false, false));
+        let cache = crate::cache::CacheLayer::new(
+            Arc::new(LocalOnlyLayer::new(
+                upstream.clone(),
+                names.clone(),
+                Arc::new(AtomicU32::new(10)),
+            )),
+            64,
+            1,
+            0,
+            86_400,
+            0,
+            86_400,
+        );
+        let handle = cache.handle();
+        let chain: Arc<dyn Resolver> = Arc::new(cache);
+        let request = query("1.0.168.192.in-addr.arpa", RecordType::PTR);
+        let in_flight = {
+            let chain = chain.clone();
+            let request = request.clone();
+            std::thread::spawn(move || chain.resolve(&request))
+        };
+
+        entered_rx.recv().unwrap();
+        names.set(false, true, false);
+        handle.clear();
+        release_tx.send(()).unwrap();
+        in_flight
+            .join()
+            .unwrap()
+            .expect("붙잡혔던 질의도 답은 받아야 합니다");
+
+        let after = chain.resolve(&request).expect("답");
+        assert_eq!(
+            after.header.rcode,
+            ResponseCode::NXDomain.0,
+            "비운 뒤에 도착한 이전 설정의 답이 캐시에 남았습니다"
+        );
+        assert_eq!(
+            upstream.calls.load(Ordering::SeqCst),
+            1,
+            "켜진 범주의 이름이 업스트림으로 나갔습니다"
+        );
+    }
+}

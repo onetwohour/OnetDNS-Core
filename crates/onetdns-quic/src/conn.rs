@@ -93,7 +93,10 @@ enum PacketKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 연결을 이어 갈 수 없게 만드는 오류. */
+/**
+ * @brief QUIC 연결의 오류.
+ * @details StreamClosed 만 스트림 하나에 그치는 오류라서 연결은 계속 쓸 수 있다.
+ */
 pub enum QuicError {
     /** @brief TLS 쪽에서 실패했다. */
     Tls,
@@ -105,6 +108,11 @@ pub enum QuicError {
     StreamLimit,
     /** @brief 연결이 이미 닫혔다. */
     Closed,
+    /**
+     * @brief 이 스트림으로는 더 보낼 수 없다.
+     * @details 상대가 STOP_SENDING 으로 답을 거절했거나 이쪽이 이미 끝을 보낸 스트림이다.
+     */
+    StreamClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +154,8 @@ impl std::fmt::Display for QuicError {
             QuicError::Frame => "Could not encode a QUIC frame",
             QuicError::FlowControl => "Flow control violation",
             QuicError::StreamLimit => "QUIC stream limit exceeded",
-            QuicError::Closed => "Connection or stream closed",
+            QuicError::Closed => "Connection closed",
+            QuicError::StreamClosed => "Stream no longer accepts data",
         };
         f.write_str(reason)
     }
@@ -2910,6 +2919,16 @@ impl Connection {
         }
     }
 
+    #[cfg(test)]
+    /**
+     * @brief 상대에게 STOP_SENDING 을 보낸다.
+     * @note 이 구현은 스트림을 스스로 취소하지 않는다. 상대가 취소하는 상황을 시험에서 만들 때만 쓴다.
+     */
+    pub(crate) fn send_stop_sending_for_test(&mut self, id: u64, error_code: u64) {
+        self.queue_app_frame(Frame::StopSending { id, error_code });
+        self.flush();
+    }
+
     /** @brief 보내려고 쌓아 둔 바이트. 연결 상한 판정에 쓴다. */
     fn buffered_stream_send_bytes(&self) -> usize {
         /** @brief 이 프레임이 차지하는 바이트. */
@@ -3231,7 +3250,7 @@ impl Connection {
             || stream_range_contains(&self.closed_send_ranges, id)
             || stream_range_contains(&self.sealed_send_ranges, id)
         {
-            return Err(QuicError::Closed);
+            return Err(QuicError::StreamClosed);
         }
         let copies = if !self.handshake_complete && self.early_send_keys.is_some() {
             2
@@ -5091,7 +5110,7 @@ mod tests {
         conn.peer_stream_max.insert(0, 1024);
         assert_eq!(
             conn.send_stream(0, b"late response", true),
-            Err(QuicError::Closed)
+            Err(QuicError::StreamClosed)
         );
         assert!(!conn
             .out_frames_app

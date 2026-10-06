@@ -280,60 +280,6 @@ pub(crate) fn shared_filter(filter: ArcSwap<BlockEngine>) -> Arc<SharedFilter> {
 }
 
 #[test]
-/** @brief 권한 영역 빠른 경로를 막는 기능이 켜지면 판정도 함께 바뀌는지. */
-fn native_feature_swap_tracks_authority_wire_gates() {
-    let features = NativeFeatures::default();
-    let safe_search = features.safe_search.clone();
-    let swap = NativeFeatureSwap::from_pointee(features);
-    assert!(!swap.authority_wire_blocked());
-    assert!(!swap.harden_large_queries());
-    assert!(!swap.safe_search_enabled());
-
-    let mut next = (*swap.load()).clone();
-    next.block_aaaa = true;
-    swap.store(Arc::new(next));
-    assert!(swap.authority_wire_blocked());
-
-    let mut next = (*swap.load()).clone();
-    next.block_aaaa = false;
-    next.harden_large_queries = true;
-    swap.store(Arc::new(next));
-    assert!(!swap.authority_wire_blocked());
-    assert!(swap.harden_large_queries());
-
-    let mut next = (*swap.load()).clone();
-    next.cookies = CookiePolicy {
-        keeper: Some(Arc::new(CookieKeeper::from_secret(&[1; 16]))),
-        strict: false,
-    };
-    swap.store(Arc::new(next));
-    assert!(
-        !swap.authority_wire_blocked(),
-        "lenient는 COOKIE 옵션이 붙은 질의만 구조적 경로로 보내야 합니다"
-    );
-
-    let mut next = (*swap.load()).clone();
-    next.cookies.strict = true;
-    swap.store(Arc::new(next));
-    assert!(
-        swap.authority_wire_blocked(),
-        "strict는 쿠키 없는 질의도 BADCOOKIE로 보내야 합니다"
-    );
-
-    safe_search.store(true, Ordering::Release);
-    assert!(swap.safe_search_enabled());
-
-    let mut replacement = (*swap.load()).clone();
-    replacement.harden_large_queries = false;
-    replacement.safe_search = Arc::new(AtomicBool::new(false));
-    swap.store(Arc::new(replacement));
-    assert!(
-        swap.authority_wire_blocked(),
-        "추적되지 않는 safe-search 포인터 교체는 fail-closed"
-    );
-}
-
-#[test]
 #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
 /** @brief 같은 질의에서 기능 snapshot을 두 번 잡는 비용과 한 번 재사용하는 비용. */
 fn bench_native_feature_snapshot_reuse() {
@@ -348,7 +294,7 @@ fn bench_native_feature_snapshot_reuse() {
         for _ in 0..iters {
             let features = black_box(swap.load());
             sink ^= black_box(features.edns_buffer as usize);
-            sink ^= black_box(features.events().is_some() as usize);
+            sink ^= black_box(features.ddr_enabled as usize);
         }
         black_box(sink);
         started.elapsed().as_nanos() as f64 / iters as f64
@@ -358,10 +304,10 @@ fn bench_native_feature_snapshot_reuse() {
         let mut sink = 0usize;
         let started = Instant::now();
         for _ in 0..iters {
-            let identify = black_box(swap.load());
-            sink ^= black_box(identify.edns_buffer as usize);
-            let record = black_box(swap.load());
-            sink ^= black_box(record.events().is_some() as usize);
+            let first = black_box(swap.load());
+            sink ^= black_box(first.edns_buffer as usize);
+            let second = black_box(swap.load());
+            sink ^= black_box(second.ddr_enabled as usize);
         }
         black_box(sink);
         started.elapsed().as_nanos() as f64 / iters as f64
@@ -611,11 +557,12 @@ fn wire_lane_hits_patch_id_and_respect_filter_generation() {
     );
     assert_eq!(Message::parse(&out4.buf).unwrap().header.id, 0x0404);
 
-    update_features(&server, |features| features.block_aaaa = true);
+    update_features(&server, |features| features.lanes.wire = false);
     let mut out5 = onetdns_proto::Writer::with_limit(1232);
     assert_eq!(
         server.handle_udp_wire(&third_wire, &ctx(), &mut out5, std::time::Instant::now()),
-        WireDisposition::Fallback
+        WireDisposition::Fallback,
+        "경로 조건이 닫히면 담아 둔 답이 있어도 내보내지 않습니다"
     );
 }
 
@@ -884,7 +831,7 @@ fn split_local_fixed_wire_rejects_late_old_ttl_generation() {
     );
 
     ttl.store(0, Ordering::Release);
-    server.wire_epoch.fetch_add(1, Ordering::AcqRel);
+    update_features(&server, |features| features.wire_epoch += 1);
     assert!(handle.install_local_wire_for_test(&request, old_wire.clone()));
     assert_eq!(
         server.handle_udp_wire(
@@ -917,7 +864,7 @@ fn split_local_fixed_wire_rejects_late_old_ttl_generation() {
     assert!(crate::wirecache::WireEntry::ptr_eq(&zero_wire, &zero_hit));
 
     ttl.store(u32::MAX, Ordering::Release);
-    server.wire_epoch.fetch_add(1, Ordering::AcqRel);
+    update_features(&server, |features| features.wire_epoch += 1);
     assert_eq!(
         server.handle_udp_wire(
             &packet,
@@ -1200,6 +1147,20 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
         ),
         onetdns_runtime::WireDisposition::Fallback,
         "이 서버의 상한보다 작게 알린 질의는 절단 사다리가 필요합니다"
+    );
+    assert!(output.buf.is_empty());
+
+    update_features(&server, |features| features.lanes.authority = false);
+    output.clear();
+    assert_eq!(
+        server.handle_udp_wire(&wildcard_packet, &ctx(), &mut output, Instant::now()),
+        onetdns_runtime::WireDisposition::Fallback,
+        "권한 경로 조건이 닫히면 단순 질의도 구조적 경로가 맡아야 합니다"
+    );
+    assert_eq!(
+        server.handle_tcp_wire(&wildcard_packet, &tcp_context, &mut output, Instant::now()),
+        onetdns_runtime::WireDisposition::Fallback,
+        "권한 경로 조건이 닫히면 TCP 질의도 구조적 경로가 맡아야 합니다"
     );
     assert!(output.buf.is_empty());
 }
@@ -1595,8 +1556,7 @@ fn wire_fast_path_uses_the_response_cache_as_its_only_index() {
     );
 
     let filter = server.filter.load();
-    let filter_tag =
-        (Arc::as_ptr(&filter) as usize).rotate_left(17) ^ server.wire_epoch.load(Ordering::Acquire);
+    let filter_tag = server.features.load().wire_tag(&filter);
     let (wire_entry, _) = response_cache
         .wire_get(scanned.key(), filter_tag, std::time::Instant::now())
         .expect("응답 LRU의 wire 항목");
@@ -1648,12 +1608,14 @@ fn lane_runtime_replacement_is_generation_atomic() {
         .expect("시작 세대");
     assert!(old_snapshot.cache.ptr_eq(&old_cache));
 
-    server.replace_lane_runtime(
-        crate::wirecache::WireEntryFactory::new(0, 300),
-        new_cache.clone(),
-        None,
-        true,
-    );
+    update_features(&server, |features| {
+        features.adopt_chain(
+            crate::wirecache::WireEntryFactory::new(0, 300),
+            new_cache.clone(),
+            None,
+        );
+        features.ddr_enabled = true;
+    });
     let new_snapshot = server
         .features
         .load()
@@ -1701,13 +1663,14 @@ fn lane_runtime_replacement_applies_the_new_ttl_policy() {
     let new_layer = crate::cache::CacheLayer::new(Arc::new(FixedAnswer), 16, 1, 0, 31, 0, 31);
     let new_cache = new_layer.handle();
     slot.replace(Arc::new(new_layer));
-    server.wire_epoch.fetch_add(1, Ordering::AcqRel);
-    server.replace_lane_runtime(
-        crate::wirecache::WireEntryFactory::new(0, 31),
-        new_cache,
-        None,
-        false,
-    );
+    update_features(&server, |features| {
+        features.wire_epoch += 1;
+        features.adopt_chain(
+            crate::wirecache::WireEntryFactory::new(0, 31),
+            new_cache,
+            None,
+        );
+    });
 
     output.clear();
     assert_eq!(
@@ -2631,9 +2594,7 @@ fn axfr_large_zone_streams_multiple_envelopes() {
             onetdns_control::RecorderOpts::default(),
             onetdns_control::PersistOpts::default(),
         );
-        let mut features = (*srv.features.load()).clone();
-        features.recorder = Some(recorder);
-        srv.features.store(Arc::new(features));
+        srv.recorder = Some(recorder);
         cached_wires.clear();
         assert_eq!(
             srv.handle_preencoded_stream(&axfr, &tcp, &mut cached_writer, &mut |wire| {
@@ -3333,8 +3294,8 @@ fn ddns_keeps_an_explicit_soa_serial() {
  * @details 이 경로가 기록하지 못하던 시절의 조건(기록기가 있으면 막는다)이 그대로
  *          남아 있으면, 컨트롤 플레인을 만들어 두는 모든 배치에서 경로가 전부 죽는다. 반대로
  *          조건만 지우고 기록을 안 붙이면 대시보드에서 권한 응답이 조용히 사라진다.
- *          Personal 모드처럼 ACL이 클라이언트를 요구해도 식별과 기록은 같은 기능 세대
- *          snapshot 하나를 써야 한다. 셋 다 조용한 사고라 여기서 붙든다.
+ *          Personal 모드처럼 ACL이 클라이언트를 요구해도 기능 세트는 질의마다 한 번만 읽어야
+ *          한다. 셋 다 조용한 사고라 여기서 붙든다.
  */
 fn authority_wire_answers_are_recorded_like_the_structured_path() {
     let zone_text = "$ORIGIN rec.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n";
@@ -3357,8 +3318,6 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
         },
         onetdns_control::PersistOpts::default(),
     );
-    let mut features = NativeFeatures::default();
-    features.recorder = Some(recorder);
     let server = NativeServer::new(
         shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
             BlockResponse::NxDomain,
@@ -3372,7 +3331,7 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
         authority,
         60,
     )
-    .with_features(features)
+    .with_recorder(Some(recorder))
     .with_authority_wire_path(Some(store), true);
 
     let mut output = onetdns_proto::Writer::with_limit(1232);
@@ -3400,7 +3359,7 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
         assert_eq!(
             server.features.take_test_loads(),
             1,
-            "ACL 식별과 기록이 질의 세대 snapshot 하나를 공유해야 합니다"
+            "무할당 경로가 질의 하나에 기능 세트를 한 번만 읽어야 합니다"
         );
     }
 
@@ -4024,10 +3983,8 @@ fn filter_block_records_the_subscription_list() {
             Duration::from_secs(2),
         ))),
         60,
-    );
-    let mut features = (*server.features.load()).clone();
-    features.recorder = Some(recorder);
-    let server = server.with_features(features);
+    )
+    .with_recorder(Some(recorder));
 
     for (name, list) in [
         ("listed.test", "https://lists.example/ads.txt"),
@@ -4094,7 +4051,7 @@ fn rewrite_uses_local_ttl_instead_of_block_ttl() {
 fn safe_search_cname_uses_local_ttl() {
     let s = server("");
     s.local_ttl.store(41, Ordering::Release);
-    s.features.load().safe_search.store(true, Ordering::Release);
+    s.safe_search.store(true, Ordering::Release);
 
     let response = s.handle(&q("google.com"), &ctx()).unwrap();
     let cname = response
@@ -4354,8 +4311,12 @@ fn response_address_blocks_use_blocked_response_ttl() {
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인이 처리하지 않는 검사는 보통 경로로 넘기는지. 안 넘기면 그 검사가 없는 것처럼 답이 나간다. */
-fn reactor_lane_defers_answer_address_filters_and_ns_rpz_to_sync_path() {
+/**
+ * @brief 레인 조건이 닫혔거나 레인이 처리하지 않는 차단 규칙이 있으면 보통 경로로 넘기는지.
+ * @details 안 넘기면 그 기능이 없는 것처럼 답이 나간다. 어느 설정이 조건을 닫는지는 설정 키
+ *          표의 테스트가 본다.
+ */
+fn reactor_lane_defers_closed_gate_and_ns_rpz_to_sync_path() {
     use onetdns_runtime::ReactorDisposition;
 
     let lane_server = |engine: onetdns_filter::BlockEngine| {
@@ -4391,21 +4352,9 @@ fn reactor_lane_defers_answer_address_filters_and_ns_rpz_to_sync_path() {
         "필터가 없으면 레인에 제출된다"
     );
 
-    let rebind = lane_server(plain());
-    update_features(&rebind, |features| features.rebind_protection = true);
-    assert_eq!(submit(&rebind), ReactorDisposition::Fallback);
-
-    let bogus = lane_server(plain());
-    update_features(&bogus, |features| {
-        features.bogus_nxdomain = vec!["7.7.7.7/32".parse().unwrap()]
-    });
-    assert_eq!(submit(&bogus), ReactorDisposition::Fallback);
-
-    let denied = lane_server(plain());
-    update_features(&denied, |features| {
-        features.recurse_deny_answers = vec!["7.7.7.7/32".parse().unwrap()]
-    });
-    assert_eq!(submit(&denied), ReactorDisposition::Fallback);
+    let closed = lane_server(plain());
+    update_features(&closed, |features| features.lanes.reactor = false);
+    assert_eq!(submit(&closed), ReactorDisposition::Fallback);
 
     let mut parts = onetdns_filter::EngineParts::default();
     parts.rpz_nsdname.push(
@@ -4510,13 +4459,6 @@ fn lenient_cookie_keeps_plain_reactor_and_defers_cookie_requests() {
         submit(&q("plain-reactor.example")),
         ReactorDisposition::Submitted,
         "쿠키 없는 질의는 lenient 때문에 콜드 경로를 잃지 않습니다"
-    );
-
-    update_features(&server, |features| features.cookies.strict = true);
-    assert_eq!(
-        submit(&q("strict-reactor.example")),
-        ReactorDisposition::Fallback,
-        "strict는 무쿠키 질의를 BADCOOKIE 경로로 넘깁니다"
     );
 }
 
@@ -4711,10 +4653,7 @@ fn parity_server_recording(
         onetdns_control::PersistOpts::default(),
     );
     let server = parity_server_with(authority, with_lane, Some(recorder.clone()));
-    let features = server.features.load();
-    let mut features = (*features).clone();
-    features.recorder = Some(recorder);
-    (server.with_features(features), stats)
+    (server.with_recorder(Some(recorder)), stats)
 }
 
 #[cfg(unix)]
@@ -5279,6 +5218,150 @@ fn reactor_lane_fallback_failure_keeps_its_reason() {
         ede,
         Some(onetdns_proto::ede_code::NO_REACHABLE_AUTHORITY),
         "동기 체인이 알린 사유가 나가야 한다. 23이면 실패를 전송 실패로 뭉갠 것"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+/**
+ * @brief 레인에 맡긴 뒤 캐시를 비우면 그 답을 담지 않는지.
+ * @details 레인은 맡길 때의 설정으로 답을 만들고 끝난 뒤에 따로 담는다. 그 사이에 비운
+ *          캐시에 담으면 비우기 전 설정의 답이 다시 들어간다.
+ */
+fn reactor_lane_answer_does_not_land_in_a_cache_cleared_after_submit() {
+    use onetdns_runtime::ReactorDisposition;
+
+    let authority = spawn_mixed_truncating_authority();
+    let (backend, cache) = lane_backend_and_cache();
+    let recursor = Arc::new(
+        onetdns_recurse::Recursor::new(vec![authority], std::time::Duration::from_millis(500))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]),
+    );
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_reactor_lane(recursor, cache.clone(), 32);
+
+    let resolve = |name: &str, clear_after_submit: bool| {
+        let request = Message::query(0x31, ApName::from_str(name).unwrap(), ApRt::A);
+        let packet = request.try_encode().unwrap();
+        let mut w = onetdns_proto::Writer::with_limit(1232);
+        assert_eq!(
+            server.reactor_submit(&packet, &ctx(), &mut w, std::time::Instant::now()),
+            ReactorDisposition::Submitted,
+            "{name}: 레인이 받아야 확인할 수 있습니다"
+        );
+        if clear_after_submit {
+            cache.clear();
+        }
+        assert_eq!(
+            pump_lane_until_answered(&server).len(),
+            1,
+            "{name}: 레인이 답해야 합니다"
+        );
+        request
+    };
+
+    let kept = resolve("okkept.", false);
+    assert!(
+        cache.lane_response(&kept).is_some(),
+        "비우지 않았으면 레인의 답이 담겨야 합니다"
+    );
+    let dropped = resolve("okdropped.", true);
+    assert!(
+        cache.lane_response(&dropped).is_none(),
+        "맡긴 뒤에 비운 캐시에 레인의 답이 담겼습니다"
+    );
+}
+
+#[cfg(unix)]
+/** @brief 레인이 답을 하나라도 낼 때까지 돌리고 낸 답을 돌려준다. 5초 안에 못 내면 빈 목록이다. */
+fn pump_lane_until_answered(server: &NativeServer) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while out.is_empty() && std::time::Instant::now() < deadline {
+        let mut fds = Vec::new();
+        let mut map = Vec::new();
+        server.reactor_collect(&mut fds, &mut map);
+        if fds.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        } else {
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+            server.reactor_pump(&fds, 0, &map, std::time::Instant::now(), &mut out);
+        }
+        server.reactor_tick(std::time::Instant::now(), &mut out);
+    }
+    out
+}
+
+#[cfg(unix)]
+#[test]
+/**
+ * @brief 레인에 맡긴 뒤 설정 세대가 바뀌면 그 답이 새 세대의 wire 항목으로 나가지 않는지.
+ * @details 레인은 맡길 때의 기능 세트로 답을 고른다. 끝날 때의 세트로 태그를 달면 이전
+ *          조건으로 고른 답이 새 설정에서도 캐시 적중으로 나간다.
+ */
+fn reactor_lane_answer_carries_the_generation_it_was_submitted_under() {
+    use onetdns_runtime::{ReactorDisposition, WireDisposition};
+
+    let authority = spawn_mixed_truncating_authority();
+    let (backend, cache) = lane_backend_and_cache();
+    let recursor = Arc::new(
+        onetdns_recurse::Recursor::new(vec![authority], std::time::Duration::from_millis(500))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]),
+    );
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_wire_fast_path(Some((
+        crate::wirecache::WireEntryFactory::new(0, 86_400),
+        cache.clone(),
+    )))
+    .with_reactor_lane(recursor, cache, 32);
+
+    let resolve = |name: &str, reload_after_submit: bool| {
+        let packet = Message::query(0x32, ApName::from_str(name).unwrap(), ApRt::A)
+            .try_encode()
+            .unwrap();
+        let mut w = onetdns_proto::Writer::with_limit(1232);
+        assert_eq!(
+            server.reactor_submit(&packet, &ctx(), &mut w, Instant::now()),
+            ReactorDisposition::Submitted,
+            "{name}: 레인이 받아야 확인할 수 있습니다"
+        );
+        if reload_after_submit {
+            update_features(&server, |features| features.wire_epoch += 1);
+        }
+        assert_eq!(
+            pump_lane_until_answered(&server).len(),
+            1,
+            "{name}: 레인이 답해야 합니다"
+        );
+        let mut hit = onetdns_proto::Writer::with_limit(1232);
+        server.handle_udp_wire_hit(&packet, &ctx(), &mut hit, Instant::now())
+    };
+
+    assert_eq!(
+        resolve("okfresh.", false),
+        WireDisposition::Respond,
+        "같은 세대 안에서 끝난 레인의 답은 wire 항목으로 나가야 합니다"
+    );
+    assert_eq!(
+        resolve("okstale.", true),
+        WireDisposition::Fallback,
+        "맡긴 뒤 세대가 바뀌었는데 레인의 답이 새 세대의 wire 항목으로 나갔습니다"
     );
 }
 

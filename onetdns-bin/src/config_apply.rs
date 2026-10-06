@@ -7,8 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use onetdns_config::{BackendKind, Config};
 use onetdns_core::ArcSwap;
-use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 
 use crate::atomic_file::atomic_write;
 use crate::config_keys::ApplyGroup;
@@ -20,16 +18,13 @@ use crate::{config_keys, resolver_chain, runtime_preflight, ConfigTextSlot};
  */
 pub(crate) const LOCAL_ONLY_CONFIG_KEYS: &[&str] = &["domain_needed", "bogus_priv", "empty_zones"];
 
-/** @brief 무엇이 바뀌었느냐에 따라 재시작 여부가 갈리는 설정들. */
-const CONDITIONAL_HOT_RELOAD_CONFIG_KEYS: &[&str] = &["clients"];
-
 /** @brief 직접 바뀐 설정과 그 설정이 다시 만들어야 하는 파생 그룹을 모은다. */
 pub(crate) fn hot_reload_groups(
     previous: &Config,
     next: &Config,
     changed: &[String],
 ) -> Vec<ApplyGroup> {
-    let mut groups = key_groups(previous, next, changed);
+    let mut groups = key_groups(changed);
     /*
      * 체인은 계획만 읽으므로, 어느 키가 바뀌었든 계획이 달라지면 체인을 다시 만든다.
      * 질의 제한 시간처럼 전달 그룹에 속한 키도 스텁 영역과 예비 업스트림의 전달기에 쓰인다.
@@ -42,30 +37,14 @@ pub(crate) fn hot_reload_groups(
     groups
 }
 
-/** @brief 바뀐 키가 키 표와 파생 규칙으로 끌어오는 그룹. 체인 계획은 비교하지 않는다. */
-fn key_groups(previous: &Config, next: &Config, changed: &[String]) -> Vec<ApplyGroup> {
+/** @brief 바뀐 키가 키 표와 그룹 사이의 의존으로 끌어오는 그룹. 체인 계획은 비교하지 않는다. */
+fn key_groups(changed: &[String]) -> Vec<ApplyGroup> {
     let mut groups = changed
         .iter()
         .filter_map(|key| config_keys::hot_group(key))
+        .flat_map(|group| [Some(group), group.also_rebuilds()])
+        .flatten()
         .collect::<Vec<_>>();
-    /* DHCP 임대 풀은 서비스를 다시 띄우면 새로 만들어지므로, DHCP DNS 계층도 새 풀을 봐야 한다. */
-    if groups.contains(&ApplyGroup::EdgeServices) {
-        groups.push(ApplyGroup::Chain);
-    }
-    /* 로컬 도메인은 DHCP 옵션 15로도 나간다. */
-    if changed.iter().any(|key| key == "dhcp_local_domain") {
-        groups.push(ApplyGroup::EdgeServices);
-    }
-    /*
-     * 클러스터 활성 상태나 공용 비밀이 바뀌면 DNS Cookie의 공유 루트도 같은 설정 세대에서
-     * 다시 만들어야 한다. native 그룹은 ArcSwap 한 번으로 기존/새 정책 중 하나만 보인다.
-     */
-    if changed.iter().any(|key| key == "cluster_raft")
-        || ((previous.cluster_raft || next.cluster_raft)
-            && changed.iter().any(|key| key == "cluster_raft_secret"))
-    {
-        groups.push(ApplyGroup::Native);
-    }
     groups.sort_unstable();
     groups.dedup();
     groups
@@ -76,80 +55,12 @@ pub(crate) fn backend_uses_forward(backend: BackendKind) -> bool {
     matches!(backend, BackendKind::Forward | BackendKind::Split)
 }
 
-/** @brief 클라이언트 설정 변화가 재시작를 요구하는지. 경로가 바뀌면 체인을 다시 지어야 한다. */
-fn clients_require_service_restart(current: &Config, proposed: &Config) -> bool {
-    let current_routes: Vec<_> = current
-        .clients
-        .iter()
-        .filter(|client| !client.upstreams.is_empty())
-        .collect();
-    let proposed_routes: Vec<_> = proposed
-        .clients
-        .iter()
-        .filter(|client| !client.upstreams.is_empty())
-        .collect();
-
-    let routes_changed = current_routes.len() != proposed_routes.len()
-        || current_routes
-            .iter()
-            .zip(proposed_routes.iter())
-            .any(|(old, new)| {
-                old.ids != new.ids
-                    || old.client_ids != new.client_ids
-                    || old.mac != new.mac
-                    || old.upstreams != new.upstreams
-            });
-    if routes_changed {
-        return true;
-    }
-
-    let had_mac = current.clients.iter().any(|client| !client.mac.is_empty());
-    let needs_mac = proposed.clients.iter().any(|client| !client.mac.is_empty());
-    !had_mac && needs_mac
-}
-
-/** @brief 클라이언트별 업스트림 경로가 있는지. */
-fn has_client_upstream_routes(config: &Config) -> bool {
-    config
-        .clients
-        .iter()
-        .any(|client| !client.upstreams.is_empty())
-}
-
 /**
- * @brief 이 키 하나의 변화를 재시작하지 않고 반영할 수 있는지.
- * @details 함께 바뀐 다른 키는 보지 않는다. 체인을 다시 만드는 변경과 클라이언트 경로가 함께
- *          있는지는 service_restart_keys 가 본다.
- */
-fn is_hot_reload_config_change(current: &Config, proposed: &Config, key: &str) -> bool {
-    if !config_keys::is_hot(key) {
-        return false;
-    }
-    let client_routes_active =
-        has_client_upstream_routes(current) || has_client_upstream_routes(proposed);
-    match key {
-        "clients" => !clients_require_service_restart(current, proposed),
-
-        "query_timeout_secs" => {
-            current.backend == proposed.backend
-                && current.backend == BackendKind::Forward
-                && !client_routes_active
-        }
-
-        "upstream_strategy" | "upstream_concurrency" => {
-            current.backend == proposed.backend && !client_routes_active
-        }
-        _ => true,
-    }
-}
-
-/**
- * @brief 이 설정에서 이 키를 바꾸면 해석 체인을 다시 만드는지.
+ * @brief 이 키를 바꾸면 해석 체인을 다시 만드는지.
  * @param plan_inputs 계획이 값을 읽는 다른 그룹의 키들. ChainPlan::other_group_inputs 가 낸다.
  */
-fn rebuilds_chain(cfg: &Config, key: &str, plan_inputs: &[&str]) -> bool {
-    plan_inputs.contains(&key)
-        || key_groups(cfg, cfg, &[key.to_string()]).contains(&ApplyGroup::Chain)
+fn rebuilds_chain(key: &str, plan_inputs: &[&str]) -> bool {
+    plan_inputs.contains(&key) || key_groups(&[key.to_string()]).contains(&ApplyGroup::Chain)
 }
 
 /**
@@ -170,16 +81,17 @@ pub(crate) fn service_restart_keys(
 ) -> Vec<String> {
     let mut restart: Vec<String> = changed
         .iter()
-        .filter(|key| !is_hot_reload_config_change(current, proposed, key))
+        .filter(|key| !config_keys::swappable(key, current, proposed))
         .cloned()
         .collect();
-    let routes = has_client_upstream_routes(current) || has_client_upstream_routes(proposed);
+    let routes =
+        config_keys::has_client_routes(current) || config_keys::has_client_routes(proposed);
     if routes && hot_reload_groups(current, proposed, changed).contains(&ApplyGroup::Chain) {
         let mut inputs = resolver_chain::ChainPlan::new(current).other_group_inputs();
         inputs.extend(resolver_chain::ChainPlan::new(proposed).other_group_inputs());
         let rebuilding: Vec<String> = changed
             .iter()
-            .filter(|key| rebuilds_chain(current, key, &inputs))
+            .filter(|key| rebuilds_chain(key, &inputs))
             .cloned()
             .collect();
         restart.extend(if rebuilding.is_empty() {
@@ -197,19 +109,15 @@ pub(crate) fn service_restart_keys(
  * @brief 표에서는 교체할 수 있는 키지만 지금 설정에서는 바꾸면 재시작할 수 있는 키들.
  * @details 관리 화면이 적용하기 전에 재시작을 알리는 데 쓴다. service_restart_keys 와 같은
  *          규칙에서 내므로, 지금 설정에서 키 하나만 바꿀 때 그 판정이 재시작할 수 있는 키는
- *          모두 여기에 든다. clients 처럼 무엇이 바뀌었느냐에 따라 갈리는 키는 늘 든다.
+ *          모두 여기에 든다. clients 처럼 무엇으로 바꾸느냐에 따라 갈리는 키는 늘 든다.
  */
 pub(crate) fn conditional_hot_reload_keys(now: &Config) -> Vec<&'static str> {
-    let routes = has_client_upstream_routes(now);
+    let routes = config_keys::has_client_routes(now);
     let inputs = resolver_chain::ChainPlan::new(now).other_group_inputs();
-    onetdns_config::known_keys()
-        .iter()
-        .copied()
-        .filter(|key| config_keys::is_hot(key))
+    config_keys::hot_keys()
         .filter(|key| {
-            CONDITIONAL_HOT_RELOAD_CONFIG_KEYS.contains(key)
-                || !is_hot_reload_config_change(now, now, key)
-                || (routes && rebuilds_chain(now, key, &inputs))
+            config_keys::may_need_new_generation(key, now)
+                || (routes && rebuilds_chain(key, &inputs))
         })
         .collect()
 }
@@ -480,58 +388,6 @@ pub(crate) fn update_runtime_config(
     runtime.store(Arc::new(config));
 }
 
-/** @brief 설정의 지문. */
-fn config_fingerprint(config: &Config) -> [u8; 32] {
-    /** @brief 프로세스 밖에서 비밀값 후보를 지문과 대조하지 못하게 하는 키. */
-    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    let debug = Zeroizing::new(format!("{config:?}"));
-    let mut digest = Sha256::new();
-    digest.update(KEY.get_or_init(onetdns_core::random_array::<32>));
-    digest.update((debug.len() as u64).to_le_bytes());
-    digest.update(debug.as_bytes());
-
-    // SecretString의 Debug는 반드시 가려져야 한다. 그렇다고 값 변화까지 숨기면 핫 리로드가
-    // 비밀번호·토큰 교체를 놓치므로, 외부로 내보내지 않는 키드 지문에만 원문을 넣는다.
-    let mut secret = |label: &str, value: &str| {
-        digest.update((label.len() as u64).to_le_bytes());
-        digest.update(label.as_bytes());
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
-    };
-    secret("control_token", config.control_token.as_str());
-    for value in &config.control_admin_tokens {
-        secret("control_admin_token", value.as_str());
-    }
-    for value in &config.control_readonly_tokens {
-        secret("control_readonly_token", value.as_str());
-    }
-    for user in &config.users {
-        secret("user_password_hash", user.password_hash.as_str());
-    }
-    if let Some(value) = &config.zones_etcd_password {
-        secret("zones_etcd_password", value.as_str());
-    }
-    if let Some(value) = &config.zones_postgres {
-        secret("zones_postgres", value.as_str());
-    }
-    if let Some(value) = &config.zones_mysql {
-        secret("zones_mysql", value.as_str());
-    }
-    secret("cachedb_redis_secret", config.cachedb_redis_secret.as_str());
-    if let Some(value) = &config.cachedb_redis_password {
-        secret("cachedb_redis_password", value.as_str());
-    }
-    for key in &config.tsig_keys {
-        secret("tsig_secret", key.secret.as_str());
-    }
-    secret("cluster_raft_secret", config.cluster_raft_secret.as_str());
-    secret(
-        "cluster_raft_node_key",
-        config.cluster_raft_node_key.as_str(),
-    );
-    digest.finalize().into()
-}
-
 /** @brief 비교 전에 기본값으로 채워진 것을 맞춘다. 안 맞추면 바뀌지 않은 것이 바뀐 것으로 보인다. */
 pub(crate) fn normalize_config_for_comparison(runtime: &Config, desired: &Config) -> Config {
     let mut normalized = desired.clone();
@@ -542,132 +398,13 @@ pub(crate) fn normalize_config_for_comparison(runtime: &Config, desired: &Config
     normalized
 }
 
-/**
- * @brief 두 설정에서 달라진 항목들.
- * @details 요약에 값이 드러나지 않는 항목은 지문을 비교해 찾는다. 요약에 드러난 항목이 같은
- *          요청에서 함께 바뀌었어도 이 탐색은 한다. 건너뛰면 토큰 교체나 일정 삭제가 적용
- *          목록에서 빠져 이전 값이 계속 쓰인다.
- * @note 요약에 드러난 항목이 바뀌었으면, 이름 붙일 수 없는 나머지 차이는 가려낼 수 없다.
- */
-pub(crate) fn config_changed_keys(
-    runtime: &Config,
-    desired: &Config,
-) -> Result<Vec<String>, String> {
-    use onetdns_core::json::Json;
-    let applied = onetdns_core::json::parse(&runtime.effective_json())
-        .map_err(|error| format!("Could not compare the running configuration: {error}"))?;
-    let wanted = onetdns_core::json::parse(&desired.effective_json())
-        .map_err(|error| format!("Could not compare the saved configuration file: {error}"))?;
-    let (Json::Obj(applied), Json::Obj(wanted)) = (applied, wanted) else {
-        return Err("Configuration comparison data is not a JSON object".to_string());
-    };
-    /** @brief 이 항목의 값. */
-    fn lookup<'a>(pairs: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
-        pairs
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value)
-    }
-    let mut changed = Vec::new();
-    for (key, value) in &wanted {
-        if lookup(&applied, key) != Some(value) {
-            changed.push(key.clone());
-        }
-    }
-    for (key, _) in &applied {
-        if lookup(&wanted, key).is_none() {
-            changed.push(key.clone());
-        }
-    }
-
-    let summary_changed = !changed.is_empty();
-    if config_fingerprint(runtime) != config_fingerprint(desired) {
-        // 요약에 개수만 담기거나 아예 빠지는 항목들이 있다. 개수가 같은 채로 값만 달라지면
-        // 위 비교로는 드러나지 않는다. 그렇다고 뭉뚱그리면 무중단 대상인 줄 모르고 다시
-        // 시작한다. 항목 하나씩 실행 중 값으로 되돌려 보고, 지문이 그대로면 그 항목이 범인이다.
-        /** @brief 이 항목만 실행 중 값으로 되돌린다. */
-        type Restore = fn(&mut Config, &Config);
-        let opaque: &[(&str, Restore)] = &[
-            ("users", |probe, live| probe.users = live.users.clone()),
-            ("clients", |probe, live| {
-                probe.clients = live.clients.clone()
-            }),
-            ("views", |probe, live| probe.views = live.views.clone()),
-            ("policy", |probe, live| probe.policy = live.policy.clone()),
-            ("rewrites", |probe, live| {
-                probe.rewrites = live.rewrites.clone()
-            }),
-            ("local_zones", |probe, live| {
-                probe.local_zones = live.local_zones.clone()
-            }),
-            ("local_a", |probe, live| {
-                probe.local_a = live.local_a.clone()
-            }),
-            ("local_aaaa", |probe, live| {
-                probe.local_aaaa = live.local_aaaa.clone()
-            }),
-            ("stub_zones", |probe, live| {
-                probe.stub_zones = live.stub_zones.clone()
-            }),
-            ("dynamic_records", |probe, live| {
-                probe.dynamic_records = live.dynamic_records.clone()
-            }),
-            ("update_policy", |probe, live| {
-                probe.update_policy = live.update_policy.clone()
-            }),
-            ("service_schedule", |probe, live| {
-                probe.service_schedule = live.service_schedule.clone()
-            }),
-            ("tsig_keys", |probe, live| {
-                probe.tsig_keys = live.tsig_keys.clone()
-            }),
-            ("control_token", |probe, live| {
-                probe.control_token = live.control_token.clone()
-            }),
-            ("control_admin_tokens", |probe, live| {
-                probe.control_admin_tokens = live.control_admin_tokens.clone()
-            }),
-            ("control_readonly_tokens", |probe, live| {
-                probe.control_readonly_tokens = live.control_readonly_tokens.clone()
-            }),
-            ("zones_etcd_password", |probe, live| {
-                probe.zones_etcd_password = live.zones_etcd_password.clone()
-            }),
-            ("zones_postgres", |probe, live| {
-                probe.zones_postgres = live.zones_postgres.clone()
-            }),
-            ("zones_mysql", |probe, live| {
-                probe.zones_mysql = live.zones_mysql.clone()
-            }),
-            ("cachedb_redis_secret", |probe, live| {
-                probe.cachedb_redis_secret = live.cachedb_redis_secret.clone()
-            }),
-            ("cachedb_redis_password", |probe, live| {
-                probe.cachedb_redis_password = live.cachedb_redis_password.clone()
-            }),
-            ("cluster_raft_secret", |probe, live| {
-                probe.cluster_raft_secret = live.cluster_raft_secret.clone()
-            }),
-            ("cluster_raft_node_key", |probe, live| {
-                probe.cluster_raft_node_key = live.cluster_raft_node_key.clone()
-            }),
-        ];
-        let mut probe = desired.clone();
-        for (name, restore) in opaque {
-            let before = config_fingerprint(&probe);
-            restore(&mut probe, runtime);
-            if config_fingerprint(&probe) != before {
-                changed.push((*name).to_string());
-            }
-        }
-        // 하나씩 되돌려도 실행 중 설정과 같아지지 않으면 이름을 붙일 수 없다.
-        if !summary_changed && config_fingerprint(&probe) != config_fingerprint(runtime) {
-            changed.push("structured_or_secret_config".to_string());
-        }
-    }
-    changed.sort();
-    changed.dedup();
-    Ok(changed)
+/** @brief 두 설정에서 값이 다른 키들. 이름순이다. */
+pub(crate) fn config_changed_keys(runtime: &Config, desired: &Config) -> Vec<String> {
+    let mut changed: Vec<String> = config_keys::changed_keys(runtime, desired)
+        .map(str::to_string)
+        .collect();
+    changed.sort_unstable();
+    changed
 }
 
 /** @brief 파일에 적힌 설정을 JSON으로. */
@@ -701,11 +438,11 @@ pub(crate) fn desired_config_json(path: Option<&std::path::Path>, runtime: &Conf
 fn config_changed_keys_for_status(
     runtime: &Config,
     desired: &Config,
-) -> Result<(Vec<String>, Vec<String>), String> {
+) -> (Vec<String>, Vec<String>) {
     let desired = normalize_config_for_comparison(runtime, desired);
-    let changed = config_changed_keys(runtime, &desired)?;
+    let changed = config_changed_keys(runtime, &desired);
     let restart = service_restart_keys(runtime, &desired, &changed);
-    Ok((changed, restart))
+    (changed, restart)
 }
 
 /** @brief 설정 파일을 읽어 config_changed_keys_for_status 로 판정한다. */
@@ -717,7 +454,7 @@ fn disk_change(
         Config::read_text(path).map_err(|error| error.to_string())?,
     );
     let desired = Config::from_toml_str(&text).map_err(|error| error.to_string())?;
-    config_changed_keys_for_status(runtime, &desired)
+    Ok(config_changed_keys_for_status(runtime, &desired))
 }
 
 /**
@@ -815,12 +552,12 @@ mod tests {
         proposed.safe_search = !active.safe_search;
         proposed.run_as_user = Some("onetdns".to_string());
 
-        let changed = config_changed_keys(&active, &proposed).unwrap();
+        let changed = config_changed_keys(&active, &proposed);
         assert!(changed.contains(&"safe_search".to_string()));
         assert!(changed.contains(&"run_as_user".to_string()));
         assert!(changed
             .iter()
-            .any(|key| !is_hot_reload_config_change(&active, &proposed, key)));
+            .any(|key| !config_keys::swappable(key, &active, &proposed)));
     }
 
     #[test]
@@ -834,7 +571,7 @@ mod tests {
             "backend = \"forward\"\nupstreams = [\"8.8.8.8\"]\ncache_size = 2000\n",
         )
         .unwrap();
-        let changed = config_changed_keys(&applied, &desired).unwrap();
+        let changed = config_changed_keys(&applied, &desired);
         assert!(changed.contains(&"upstreams".to_string()));
         assert!(changed.contains(&"cache_size".to_string()));
         assert_eq!(changed.iter().filter(|key| *key == "upstreams").count(), 1);
@@ -854,7 +591,7 @@ mod tests {
         }];
         let mut desired = applied.clone();
         desired.users[0].password_hash = "hash-b".into();
-        let changed = config_changed_keys(&applied, &desired).unwrap();
+        let changed = config_changed_keys(&applied, &desired);
         assert_eq!(changed, vec!["users".to_string()]);
     }
 
@@ -872,7 +609,7 @@ mod tests {
         let mut desired = applied.clone();
         desired.control_token = "control-token-b".into();
         desired.cache_size = applied.cache_size + 1;
-        let changed = config_changed_keys(&applied, &desired).unwrap();
+        let changed = config_changed_keys(&applied, &desired);
         assert!(
             changed.contains(&"control_token".to_string()),
             "{changed:?}"
@@ -894,7 +631,7 @@ mod tests {
             suffixes: vec!["example.com".into()],
             ..Default::default()
         });
-        let changed = config_changed_keys(&applied, &desired).unwrap();
+        let changed = config_changed_keys(&applied, &desired);
         assert_eq!(changed, vec!["policy".to_string()]);
         assert_eq!(config_keys::hot_group("policy"), Some(ApplyGroup::Policy));
     }
@@ -944,21 +681,21 @@ mod tests {
         desired.control_token = "control-token-b".into();
 
         assert_eq!(
-            config_changed_keys(&applied, &desired).unwrap(),
+            config_changed_keys(&applied, &desired),
             vec!["control_token".to_string()]
         );
 
         applied.control_token = desired.control_token.clone();
-        assert!(config_changed_keys(&applied, &desired).unwrap().is_empty());
+        assert!(config_changed_keys(&applied, &desired).is_empty());
     }
 
     #[test]
     /**
      * @brief 값만 바뀐 비밀 목록이 제 이름으로 불리는지.
      *
-     * @details 이 항목들은 요약에 개수나 이름만 실려, 값을 갈아도 개수가 같으면 비교에
-     *          드러나지 않는다. 되돌려보기 목록에 없으면 포괄 이름이 붙는데 그 이름은 어느
-     *          무중단 그룹에도 없어, 무중단으로 갈 수 있는 키 교체가 재시작이 된다.
+     * @details 유효 설정 요약은 이 목록들을 개수나 이름으로만 싣는다. 요약을 비교해서는 개수가
+     *          같은 교체가 드러나지 않고, 바뀐 키를 대지 못하면 그 변경을 반영할 그룹도 정하지
+     *          못한다.
      */
     fn rotating_a_secret_list_names_the_key_it_changed() {
         let mut applied = Config {
@@ -990,7 +727,7 @@ mod tests {
             let mut desired = applied.clone();
             mutate(&mut desired);
             assert_eq!(
-                config_changed_keys(&applied, &desired).unwrap(),
+                config_changed_keys(&applied, &desired),
                 vec![label.to_string()],
                 "{label}을 갈았는데 그 이름으로 불리지 않았습니다"
             );
@@ -1000,10 +737,71 @@ mod tests {
             );
             mutate(&mut applied);
             assert!(
-                config_changed_keys(&applied, &desired).unwrap().is_empty(),
+                config_changed_keys(&applied, &desired).is_empty(),
                 "{label}을 맞춘 뒤에는 달라진 것이 없어야 합니다"
             );
         }
+    }
+
+    #[test]
+    /**
+     * @brief 바뀐 키 목록에 설정 키만 드는지.
+     * @details 유효 설정 요약은 mtls_enforced, cachedb_redis_password_set 처럼 설정 키가 아닌
+     *          파생 항목도 싣는다. 그런 이름은 키 표에 없으므로, 바뀐 키에 섞이면 교체할 수 있는
+     *          변경이 재시작이 된다.
+     */
+    fn only_configuration_keys_are_reported_as_changed() {
+        let applied = Config::default();
+        for (key, mutate) in [
+            (
+                "tls_client_ca",
+                (|c: &mut Config| c.tls_client_ca = Some("ca.pem".into())) as fn(&mut Config),
+            ),
+            ("cachedb_redis_password", |c: &mut Config| {
+                c.cachedb_redis_password = Some("redis-pass".into())
+            }),
+            ("zones_etcd_password", |c: &mut Config| {
+                c.zones_etcd_password = Some("etcd-pass".into())
+            }),
+        ] {
+            let mut desired = applied.clone();
+            mutate(&mut desired);
+            let changed = config_changed_keys(&applied, &desired);
+            assert_eq!(changed, [key], "{key} 하나만 바꿨습니다");
+            assert!(
+                service_restart_keys(&applied, &desired, &changed).is_empty(),
+                "{key} 는 재시작 없이 바뀌어야 합니다"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 요약에 영역 이름만 실리는 목록의 세부 값이 바뀌어도 그 키로 불리는지.
+     * @details 세컨더리 영역은 요약에 이름만 실린다. 주 서버 주소만 바꾼 변경이 다른 키와 함께
+     *          들어올 때 이 키가 빠지면 권한 그룹을 교체하지 않아서, 세컨더리 갱신 작업이 이전 주
+     *          서버에서 계속 받아 온다.
+     */
+    fn a_secondary_primary_change_is_reported_by_its_key() {
+        let applied = Config {
+            secondary: vec![onetdns_config::SecondaryZone {
+                origin: "b.test".to_string(),
+                primary: Some("192.0.2.1".parse().unwrap()),
+                ..Default::default()
+            }],
+            ..Config::default()
+        };
+        let mut desired = applied.clone();
+        desired.secondary[0].primary = Some("192.0.2.2".parse().unwrap());
+        let changed = config_changed_keys(&applied, &desired);
+        assert_eq!(changed, ["secondary"]);
+        assert!(service_restart_keys(&applied, &desired, &changed).is_empty());
+
+        desired.cache_size = applied.cache_size + 1;
+        assert_eq!(
+            config_changed_keys(&applied, &desired),
+            ["cache_size", "secondary"]
+        );
     }
 
     #[test]
@@ -1030,7 +828,7 @@ mod tests {
         let mut runtime = desired.clone();
         runtime.control_listen = Some(SocketAddr::from(([127, 0, 0, 1], 8553)));
 
-        let (changed, _) = config_changed_keys_for_status(&runtime, &desired).unwrap();
+        let (changed, _) = config_changed_keys_for_status(&runtime, &desired);
         assert!(
             changed.is_empty(),
             "runtime-only dashboard default: {changed:?}"
@@ -1044,7 +842,7 @@ mod tests {
         let mut runtime = desired.clone();
         runtime.control_listen = Some(SocketAddr::from(([127, 0, 0, 1], 8553)));
 
-        let changed = config_changed_keys(&runtime, &desired).unwrap();
+        let changed = config_changed_keys(&runtime, &desired);
         assert!(
             changed.contains(&"control_listen".to_string()),
             "{changed:?}"
@@ -1061,7 +859,7 @@ mod tests {
         let mut runtime = desired.clone();
         runtime.control_listen = Some(SocketAddr::from(([127, 0, 0, 1], 8553)));
 
-        let (changed, _) = config_changed_keys_for_status(&runtime, &desired).unwrap();
+        let (changed, _) = config_changed_keys_for_status(&runtime, &desired);
         assert!(
             changed.contains(&"control_listen".to_string()),
             "{changed:?}"
@@ -1107,27 +905,6 @@ mod tests {
         assert!(status.contains("error"), "{status}");
 
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    /** @brief Raft 쿠키 루트 입력이 바뀌면 cluster와 native 그룹을 함께 준비하는지. */
-    fn raft_cookie_root_changes_rebuild_native_features() {
-        let previous = Config::default();
-        let mut staged = previous.clone();
-        staged.cluster_raft_secret = "shared-cluster-secret-at-least-32-bytes".into();
-        assert_eq!(
-            hot_reload_groups(&previous, &staged, &["cluster_raft_secret".to_string()]),
-            vec![ApplyGroup::Cluster],
-            "Raft를 켜기 전 비밀 준비는 독립 실행 Cookie를 무효화하지 않습니다"
-        );
-
-        let mut next = staged.clone();
-        next.cluster_raft = true;
-
-        assert_eq!(
-            hot_reload_groups(&staged, &next, &["cluster_raft".to_string()]),
-            vec![ApplyGroup::Cluster, ApplyGroup::Native]
-        );
     }
 
     #[test]
@@ -1218,17 +995,31 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 로컬 도메인을 바꾸면 DHCP 서비스와 체인을 함께 다시 만드는지.
+     * @details 이 값은 DHCP 옵션 15로 나가고 DHCP DNS 계층의 로컬 이름에도 쓰인다. 한쪽만 다시
+     *          만들면 임대에 알린 도메인과 DNS 가 답하는 이름이 어긋난다.
+     */
+    fn local_domain_change_rebuilds_dhcp_and_the_chain() {
+        let plain = Config::default();
+        let mut next = plain.clone();
+        next.dhcp_local_domain = "home.arpa".to_string();
+        let changed = config_changed_keys(&plain, &next);
+        assert_eq!(changed, ["dhcp_local_domain"]);
+        assert_eq!(
+            hot_reload_groups(&plain, &next, &changed),
+            vec![ApplyGroup::Chain, ApplyGroup::EdgeServices]
+        );
+    }
+
+    #[test]
     /** @brief 업스트림을 바꾸는 것은 재시작하지 않아도 되는지. */
     fn forward_upstream_change_is_hot_reload() {
         let current =
             Config::from_toml_str("backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n").unwrap();
         let proposed =
             Config::from_toml_str("backend = \"forward\"\nupstreams = [\"8.8.8.8\"]\n").unwrap();
-        assert!(is_hot_reload_config_change(
-            &current,
-            &proposed,
-            "upstreams"
-        ));
+        assert!(config_keys::swappable("upstreams", &current, &proposed));
     }
 
     #[test]
@@ -1251,12 +1042,8 @@ mod tests {
     ",
         )
         .unwrap();
-        assert!(is_hot_reload_config_change(&current, &proposed, "backend"));
-        assert!(is_hot_reload_config_change(
-            &current,
-            &proposed,
-            "upstreams"
-        ));
+        assert!(config_keys::swappable("backend", &current, &proposed));
+        assert!(config_keys::swappable("upstreams", &current, &proposed));
         assert!(!backend_uses_forward(current.backend));
         assert!(backend_uses_forward(proposed.backend));
     }
@@ -1270,15 +1057,15 @@ mod tests {
             "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\nupstream_concurrency = 4\nquery_timeout_secs = 2\n",
         )
         .unwrap();
-        assert!(is_hot_reload_config_change(
+        assert!(config_keys::swappable(
+            "upstream_concurrency",
             &current,
-            &proposed,
-            "upstream_concurrency"
+            &proposed
         ));
-        assert!(is_hot_reload_config_change(
+        assert!(config_keys::swappable(
+            "query_timeout_secs",
             &current,
-            &proposed,
-            "query_timeout_secs"
+            &proposed
         ));
     }
 
@@ -1298,13 +1085,9 @@ mod tests {
             "upstream_concurrency",
             "query_timeout_secs",
         ] {
-            assert!(!is_hot_reload_config_change(&current, &proposed, key));
+            assert!(!config_keys::swappable(key, &current, &proposed));
         }
-        assert!(is_hot_reload_config_change(
-            &current,
-            &proposed,
-            "upstreams"
-        ));
+        assert!(config_keys::swappable("upstreams", &current, &proposed));
     }
 
     #[test]
@@ -1316,10 +1099,10 @@ mod tests {
             "backend = \"split\"\nupstreams = [\"1.1.1.1\"]\nquery_timeout_secs = 2\n",
         )
         .unwrap();
-        assert!(!is_hot_reload_config_change(
+        assert!(!config_keys::swappable(
+            "query_timeout_secs",
             &current,
-            &proposed,
-            "query_timeout_secs"
+            &proposed
         ));
     }
 
@@ -1342,11 +1125,7 @@ mod tests {
     ",
         )
         .unwrap();
-        assert!(is_hot_reload_config_change(
-            &current,
-            &policy_only,
-            "clients"
-        ));
+        assert!(config_keys::swappable("clients", &current, &policy_only));
 
         let routed = Config::from_toml_str(
             "[[clients]]
@@ -1356,7 +1135,7 @@ mod tests {
     ",
         )
         .unwrap();
-        assert!(!is_hot_reload_config_change(&current, &routed, "clients"));
+        assert!(!config_keys::swappable("clients", &current, &routed));
     }
 
     #[test]
@@ -1370,7 +1149,7 @@ mod tests {
     ",
         )
         .unwrap();
-        assert!(!is_hot_reload_config_change(&current, &proposed, "clients"));
+        assert!(!config_keys::swappable("clients", &current, &proposed));
     }
 
     /** @brief 업스트림을 따로 쓰는 클라이언트 경로 하나. */
@@ -1405,7 +1184,7 @@ mod tests {
             let tables = if routed { CLIENT_ROUTE } else { "" };
             let current = Config::from_toml_str(&format!("{top}{tables}")).unwrap();
             let proposed = Config::from_toml_str(&with_key(top, key, value, tables)).unwrap();
-            let changed = config_changed_keys(&current, &proposed).unwrap();
+            let changed = config_changed_keys(&current, &proposed);
             assert_eq!(changed, vec![key.to_string()]);
             service_restart_keys(&current, &proposed, &changed)
         };

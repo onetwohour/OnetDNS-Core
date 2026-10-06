@@ -1190,7 +1190,7 @@ mod tests {
         let cache_layer = crate::cache::CacheLayer::new(Arc::new(Noop), 1024, 8, 0, 3600, 0, 3600);
         let cache = cache_layer.handle();
         let response_message = Message::parse(&response).unwrap();
-        cache.store(&request, &response_message);
+        cache.store(cache.epoch(), &request, &response_message);
         let candidate = cache.wire_candidate(scanned.key(), now).unwrap();
         let entry = WireEntryFactory::new(0, 3600)
             .prepare(
@@ -1201,7 +1201,7 @@ mod tests {
                 candidate.lifetime_secs(),
             )
             .unwrap();
-        assert!(cache.promote_wire(scanned.key(), &candidate, entry));
+        assert!(cache.promote_wire(cache.epoch(), scanned.key(), &candidate, entry));
 
         use std::hint::black_box;
         let mut out = Writer::with_limit(1232);

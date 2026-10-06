@@ -14,9 +14,9 @@ use crate::atomic_file::atomic_write_secret;
 use crate::edge::parse_hex_bytes;
 use crate::tls_material::{native_tls_config, native_tls_material};
 use crate::{
-    connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts, quic_memory,
-    read_bytes_limited, read_text_limited, sleep_or_shutdown, track_service_thread,
-    LOCAL_CA_MAX_BYTES,
+    connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
+    quic_listener, quic_memory, read_bytes_limited, read_text_limited, sleep_or_shutdown,
+    track_service_thread, LOCAL_CA_MAX_BYTES,
 };
 
 /** @brief DNSCrypt 제공자 키를 둘 경로. */
@@ -279,15 +279,15 @@ pub(crate) fn tls_configs_from(
 #[derive(Default)]
 pub(crate) struct ListenerSet {
     /** @brief 일반 DNS. */
-    pub(crate) plain: Mutex<Vec<(String, onetdns_runtime::Server)>>,
+    plain: Mutex<Vec<(String, onetdns_runtime::Server)>>,
     /** @brief DoT. */
-    pub(crate) dot: Mutex<Vec<(String, dot::DotListener)>>,
+    dot: Mutex<Vec<(String, dot::DotListener)>>,
     /** @brief DoH. */
-    pub(crate) doh: Mutex<Vec<(String, doh::DohListener)>>,
+    doh: Mutex<Vec<(String, doh::DohListener)>>,
     /** @brief DoQ. */
-    pub(crate) doq: Mutex<Vec<(String, doq::DoqListener)>>,
+    doq: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     /** @brief DoH3. */
-    pub(crate) doh3: Mutex<Vec<(String, doh3::Doh3Listener)>>,
+    doh3: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     /** @brief 모든 주소의 DoQ·DoH3 연결이 함께 쓰는 전역 메모리 예산. */
     quic_memory: Arc<quic_memory::QuicMemoryBudget>,
     /** @brief 모든 주소의 DoH·DoT·DNSCrypt TCP 연결이 함께 쓰는 admission. */
@@ -296,13 +296,30 @@ pub(crate) struct ListenerSet {
      * @brief DNSCrypt. UDP 리스너가 스레드라 종료 신호를 가지고 있고, 같은 주소의 TCP
      *        리스너는 사라질 때 스스로 합류하므로 함께 가지고 있는다.
      */
-    pub(crate) dnscrypt: Mutex<
+    dnscrypt: Mutex<
         Vec<(
             String,
             Arc<std::sync::atomic::AtomicBool>,
             dnscrypt::DnscryptTcpListener,
         )>,
     >,
+}
+
+impl ListenerSet {
+    /** @brief 모든 수신 주소를 닫는다. 세대를 끝낼 때 부른다. */
+    pub(crate) fn close_all(&self) {
+        for (_, server) in self.plain.lock_recover().drain(..) {
+            server.shutdown();
+        }
+        self.dot.lock_recover().clear();
+        self.doh.lock_recover().clear();
+        self.doq.lock_recover().clear();
+        self.doh3.lock_recover().clear();
+        for (_, stop, tcp) in self.dnscrypt.lock_recover().drain(..) {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            drop(tcp);
+        }
+    }
 }
 
 /** @brief 일반 DNS 리스너 하나를 여는 설정을 이름으로 만든다. */
@@ -595,6 +612,57 @@ const DNSCRYPT_CERT_VALID_SECS: u32 = 24 * 60 * 60;
  *          동안 파일을 읽는 횟수만 늘어난다.
  */
 pub(crate) const TLS_CERT_WATCH_SECS: u64 = 300;
+
+/**
+ * @brief 인증서 파일을 주기마다 다시 읽는 스레드를 띄운다.
+ * @details 인증서 갱신은 설정을 건드리지 않고 같은 경로의 내용만 바꾼다. 갱신 도구가 이 서버에
+ *          아무것도 알리지 않아도 다음 연결부터 새 인증서를 쓰게 하려는 것이다.
+ */
+pub(crate) fn spawn_tls_cert_watch(
+    runtime_cfg: Arc<onetdns_core::ArcSwap<Config>>,
+    slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("tls-cert-watch".into())
+        .spawn(move || {
+            let mut last_error: Option<String> = None;
+            loop {
+                if sleep_or_shutdown(TLS_CERT_WATCH_SECS, &shutdown) {
+                    break;
+                }
+                let Some(current) = slots.lock_recover().clone() else {
+                    continue;
+                };
+                match current.refresh_certificate_files(&runtime_cfg.load()) {
+                    Ok(swapped) => {
+                        last_error = None;
+                        if !swapped.is_empty() {
+                            onetdns_core::info!(
+                                event = "tls.certificate_reloaded",
+                                changed = %swapped.join(","),
+                                "Replaced the TLS certificate without closing listening addresses"
+                            );
+                        }
+                    }
+                    /*
+                     * 갱신 도구가 파일을 쓰는 중이면 한두 번은 읽기에 실패한다. 같은 실패를 반복해
+                     * 적으면 기록이 그것으로 덮인다.
+                     */
+                    Err(error) => {
+                        if last_error.as_deref() != Some(error.as_str()) {
+                            onetdns_core::warn!(
+                                event = "tls.certificate_reload_failed",
+                                %error,
+                                "Could not read the renewed TLS certificate; keeping the previous one"
+                            );
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+        })
+}
 
 /**
  * @brief DNSCrypt 수신 주소를 설정에 맞춘다.

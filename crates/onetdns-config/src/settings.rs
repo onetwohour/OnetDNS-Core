@@ -73,7 +73,7 @@ pub struct WasmPluginConfig {
     pub fail_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 클라이언트 그룹 하나의 설정. */
 pub struct ClientConfig {
     /** @brief 이 클라이언트 그룹의 이름. */
@@ -116,7 +116,7 @@ pub struct ClientConfig {
     pub ignore_stats: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 클라이언트에 따라 다른 답을 주는 뷰 설정. */
 pub struct ViewConfig {
     /** @brief 이 뷰의 이름. */
@@ -234,7 +234,7 @@ pub enum LocalZoneKind {
     Transparent,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 밖으로 새면 안 되는 이름들의 처분. */
 pub struct LocalZone {
     /** @brief 이 규칙이 걸릴 이름. */
@@ -357,7 +357,7 @@ impl LocalZone {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 이름 재작성 규칙 하나. */
 pub struct Rewrite {
     /** @brief 바꿀 이름. */
@@ -394,7 +394,7 @@ pub struct StubZone {
     pub servers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 이 서버가 권한을 갖는 zone 하나. */
 pub struct ZoneConfig {
     /** @brief 이 영역의 꼭대기 이름. */
@@ -431,7 +431,7 @@ pub struct ZoneConfig {
     pub dnssec_nsec3_iterations: u16,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 다른 서버에서 전송받아 서빙하는 zone. */
 pub struct SecondaryZone {
     /** @brief 이 영역의 꼭대기 이름. */
@@ -450,7 +450,7 @@ pub struct SecondaryZone {
     pub tsig_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /** @brief zone이 바뀌면 알릴 대상. */
 pub struct NotifyTarget {
     /** @brief 알림을 보낼 주소. */
@@ -460,7 +460,7 @@ pub struct NotifyTarget {
     pub tsig_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 전송 인증에 쓸 TSIG 키. */
 pub struct TsigKeyConfig {
     /** @brief 키 이름. 요청에 이 이름이 담긴다. */
@@ -470,7 +470,7 @@ pub struct TsigKeyConfig {
     pub secret: SecretString,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 규칙이 적용되는 시간 구간. */
 pub struct ScheduleWindow {
     /** @brief 적용할 요일. */
@@ -482,7 +482,7 @@ pub struct ScheduleWindow {
     pub end: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /** @brief 질의 정책 규칙 하나. */
 pub struct PolicyRule {
     /** @brief 맞았을 때 할 일. */
@@ -506,7 +506,7 @@ pub struct PolicyRule {
     pub end: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /** @brief 동적 갱신 허용 규칙 하나. */
 pub struct UpdatePolicyRule {
     /** @brief 허용할지 거절할지. */

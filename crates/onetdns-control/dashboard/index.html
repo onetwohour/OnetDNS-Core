@@ -2649,8 +2649,7 @@ Object.assign(I18N.en, {
   'DNS 서비스를 다시 시작하지 않고 바로 적용됩니다.':'The changes can be applied without restarting the DNS service.',
   '수신 주소나 질의 처리 방식이 바뀌므로 DNS 서비스를 다시 시작합니다.':'The DNS service will restart because its listen addresses or resolution behavior will change.',
   '변경 내용을 비교하지 못했습니다':'Could not compare the changes',
-  '적용 실패':'Could not apply the configuration',
-  '민감 정보 또는 복합 설정':'Sensitive or structured settings'
+  '적용 실패':'Could not apply the configuration'
 });
 Object.assign(I18N.ja, {
   '편집한 파일 내용':'編集したファイルの内容',
@@ -2659,8 +2658,7 @@ Object.assign(I18N.ja, {
   'DNS 서비스를 다시 시작하지 않고 바로 적용됩니다.':'DNS サービスを再起動せずに適用できます。',
   '수신 주소나 질의 처리 방식이 바뀌므로 DNS 서비스를 다시 시작합니다.':'待受アドレスまたは名前解決方式が変わるため、DNS サービスを再起動します。',
   '변경 내용을 비교하지 못했습니다':'変更内容を比較できませんでした',
-  '적용 실패':'設定を適用できませんでした',
-  '민감 정보 또는 복합 설정':'機密情報または複合設定'
+  '적용 실패':'設定を適用できませんでした'
 });
 
 
@@ -4060,7 +4058,6 @@ Object.assign(I18N.zh, {
   "수신 주소나 질의 처리 방식이 바뀌므로 DNS 서비스를 다시 시작합니다.":"监听地址或查询处理方式将发生变化，因此会重启 DNS 服务。",
   "변경 내용을 비교하지 못했습니다":"无法比较更改内容",
   "적용 실패":"应用失败",
-  "민감 정보 또는 복합 설정":"敏感信息或复合设置",
   "변경 비교":"比较更改",
   "일련번호":"序列号",
   "RRset 순서 순환":"轮换 RRset 顺序",
@@ -6276,7 +6273,7 @@ class Component extends DCLogic {
 
 
 
-  configLabels(keys){return (keys||[]).map(key=>{if(key==='structured_or_secret_config')return this.t('민감 정보 또는 복합 설정');const fd=(this.state.schema||[]).find(item=>item.key===key);return (fd&&this.fieldText(fd,'label'))||key;});}
+  configLabels(keys){return (keys||[]).map(key=>{const fd=(this.state.schema||[]).find(item=>item.key===key);return (fd&&this.fieldText(fd,'label'))||key;});}
   /**
    * 서비스를 다시 시작하는지는 서버가 이번 변경을 보고 낸 판정으로만 묻는다. 항목 분류는 지금 설정에서
    * 항목 하나만 바꾼다고 보고 정한 것이라, 클라이언트 경로를 더하면서 캐시 설정을 바꾸는 것처럼 함께

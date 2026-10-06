@@ -2,14 +2,17 @@
  * @brief 권한 영역 서명 키를 읽거나 만들고 ZSK를 교체한다.
  */
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use onetdns_config::Config;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::{atomic_write_secret, replace_file, FileBackup};
+use crate::config_apply::SecondaryRestart;
+use crate::edge::EdgeServices;
 use crate::{
-    read_text_limited, rollover, sleep_or_shutdown, unix_now, LOCAL_KEY_MAX_BYTES,
-    LOCAL_STATE_MAX_BYTES,
+    read_text_limited, rollover, sleep_or_shutdown, track_service_thread, unix_now,
+    LOCAL_KEY_MAX_BYTES, LOCAL_STATE_MAX_BYTES,
 };
 
 /** @brief 이 영역의 서명 키 경로. */
@@ -112,6 +115,42 @@ pub(crate) fn spawn_zsk_rollover(
             }
         })
         .map(Some)
+}
+
+/**
+ * @brief ZSK 교체 작업을 새 설정으로 다시 시작하는 함수.
+ * @details 키를 둘로 나눠 쓰는 서명 영역만 교체한다. 영역 목록이나 주기가 바뀌면 이전 작업을
+ *          멈추고 새로 띄운다.
+ */
+pub(crate) fn rollover_restart(
+    jobs: Arc<EdgeServices>,
+    reload_keys: ZoneKeyReload,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> SecondaryRestart {
+    Arc::new(move |next: &Config| -> Result<(), String> {
+        let stop = jobs.restart_all();
+        let zones = next
+            .zones
+            .iter()
+            .filter(|zone| zone.dnssec_sign && zone_is_split_key(zone))
+            .map(|zone| {
+                onetdns_proto::Name::from_str(&zone.origin)
+                    .map(|origin| (origin, zsk_path_for(zone)))
+                    .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let thread = spawn_zsk_rollover(
+            zones,
+            next.dnssec_roll_interval_secs,
+            reload_keys.clone(),
+            stop,
+        )
+        .map_err(|error| format!("Could not start the DNSSEC ZSK rollover thread: {error}"))?;
+        if let Some(thread) = thread {
+            track_service_thread(&threads, thread);
+        }
+        Ok(())
+    })
 }
 
 /** @brief 서명 영역과 그 키. 키 교체와 설정 변경이 이 핸들 하나를 교체한다. */

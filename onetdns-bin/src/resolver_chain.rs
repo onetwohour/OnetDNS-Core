@@ -322,7 +322,7 @@ impl ChainPlan {
     }
 
     /**
-     * @brief 이 계획이 값을 읽는 키 가운데 설정 키 표에서 Chain 그룹이 아닌 키들.
+     * @brief 이 계획이 값을 읽는 키 가운데 설정 키 표의 그룹으로는 체인을 다시 만들지 않는 키들.
      * @details 이 키들은 바뀌면 자기 그룹을 교체하고, 계획에 그 값을 읽는 구성 요소가 있으면
      *          체인도 다시 만든다. 영역 원본은 하나라도 있는지가 권한 계층을 얹을지 정하므로
      *          늘 든다. new 가 다른 그룹의 키를 새로 읽으면 여기에도 넣어야 한다. 빠뜨리면
@@ -1244,11 +1244,12 @@ impl ChainLayers {
             let cache_handle = response_cache.clone();
 
             let refresher: layers::PrefetchRefresher = Arc::new(move |req| {
+                let epoch = cache_handle.epoch();
                 let resp = backend.resolve(req)?;
                 if resp.header.rcode == onetdns_proto::ResponseCode::NoError.0
                     && !resp.answers.is_empty()
                 {
-                    cache_handle.store(req, &resp);
+                    cache_handle.store(epoch, req, &resp);
                 }
                 Some(resp)
             });

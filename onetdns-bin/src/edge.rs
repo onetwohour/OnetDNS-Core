@@ -9,7 +9,11 @@ use onetdns_config::Config;
 use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write;
-use crate::{dhcp, dhcp6, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, unix_now};
+use crate::config_apply::SecondaryRestart;
+use crate::{
+    dhcp, dhcp6, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, track_service_thread,
+    unix_now,
+};
 
 /** @brief 한 번에 받아들일 임대 수 상한. */
 const MAX_SYNCED_LEASES: usize = 16_384;
@@ -581,6 +585,45 @@ pub(crate) fn spawn_lease_sync(
             }
         })
         .map(Some)
+}
+
+/**
+ * @brief 임대 동기화 작업을 새 설정으로 다시 시작하는 함수.
+ * @details DHCPv4 임대 풀이 있고 클러스터 동료와 관리 토큰이 모두 있을 때만 띄운다. 설정이 바뀌면
+ *          이전 작업을 멈추고 새로 띄운다.
+ */
+pub(crate) fn lease_sync_restart(
+    jobs: Arc<EdgeServices>,
+    dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
+    resolver: http::HostResolver,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> SecondaryRestart {
+    Arc::new(move |next: &Config| -> Result<(), String> {
+        let stop = jobs.restart_all();
+        let Some(pool) = dhcp_slot.lock_recover().clone() else {
+            return Ok(());
+        };
+        if next.cluster_peers.is_empty() || next.control_token.is_empty() {
+            return Ok(());
+        }
+        let thread = spawn_lease_sync(
+            pool,
+            next.cluster_peers.clone(),
+            next.control_token.clone(),
+            resolver.clone(),
+            stop,
+        )
+        .map_err(|error| format!("Could not start the DHCP lease sync thread: {error}"))?;
+        if let Some(thread) = thread {
+            track_service_thread(&threads, thread);
+        }
+        onetdns_core::info!(
+            event = "dhcp.lease_sync_started",
+            peers = next.cluster_peers.len(),
+            "Starting DHCP lease sync (every 30 seconds)"
+        );
+        Ok(())
+    })
 }
 
 /** @brief 받은 임대를 기록에 넣는다. 하나라도 형식이 어긋나면 전체를 거부한다. */

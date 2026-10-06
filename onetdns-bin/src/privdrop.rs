@@ -140,6 +140,29 @@ fn set_caps(caps: &[u32]) -> Result<(), String> {
 }
 
 /**
+ * @brief 프로세스에서 한 번만 내려간다.
+ * @details 세대를 다시 시작해도 프로세스는 그대로라 두 번째 세대부터는 내려간 권한으로 돈다.
+ * @return 이번에 내려가려 했으면 그 결과. 이미 한 번 시도했으면 없음.
+ */
+pub fn drop_privileges_once(user: &str, group: Option<&str>) -> Option<Result<(), String>> {
+    /** @brief 권한 내려놓기를 한 번만 하게 한다. */
+    static DROP_ONCE: std::sync::Once = std::sync::Once::new();
+    let mut outcome = None;
+    DROP_ONCE.call_once(|| {
+        let result = drop_privileges(user, group);
+        if result.is_ok() {
+            onetdns_core::info!(
+                event = "privdrop.applied",
+                user,
+                "Dropped user and group privileges and blocked further privilege gain"
+            );
+        }
+        outcome = Some(result);
+    });
+    outcome
+}
+
+/**
  * @brief 지정한 사용자와 그룹으로 내려간다.
  *
  * @details 보조 그룹, 그룹, 사용자 순이다. 사용자를 먼저 바꾸면 그룹을 바꿀 권한이 없어져

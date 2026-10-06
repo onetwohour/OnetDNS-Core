@@ -3,6 +3,7 @@
  */
 
 use std::sync::atomic::Ordering;
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -23,7 +24,7 @@ use crate::native::query::read_cookie;
 use crate::native::response::{
     answers_summary, edns_error_resp, error_resp, finalize, now_unix, postprocess, with_ede,
 };
-use crate::native::{LaneRuntime, NativeServer, MAX_LARGE_QUERY_BYTES};
+use crate::native::{NativeServer, MAX_LARGE_QUERY_BYTES};
 
 impl Handler for NativeServer {
     /** @brief 질의 하나를 처리한다. */
@@ -69,10 +70,9 @@ impl Handler for NativeServer {
                 .expect("A minimal SERVFAIL can always be encoded before TSIG signing");
             }
         }
-        if features.events().is_some() {
+        if self.events().is_some() {
             let client = self.identify(ctx);
             self.rec_latency(
-                &features,
                 &client,
                 request.questions.first().map(|q| &q.name),
                 timer.elapsed_us(),
@@ -140,7 +140,7 @@ impl Handler for NativeServer {
     /** @brief 레인이 붙어 있는지. */
     fn reactor_active(&self) -> bool {
         self.reactor_lane.is_some()
-            && (self.lane_switch.reactor()
+            && (self.features.load().lanes.reactor
                 || LANE.with(|slot| {
                     slot.borrow()
                         .as_ref()
@@ -186,7 +186,7 @@ impl Handler for NativeServer {
     #[cfg(unix)]
     /**
      * @brief 이 질의를 레인에 맡긴다.
-     * @warning 응답을 달라지게 하는 기능이 켜져 있으면 맡기지 않는다. 레인은 그 처리를
+     * @warning 레인 조건이 닫혀 있으면 맡기지 않는다. 레인은 응답을 바꾸는 기능의 처리를
      *          하지 않으므로 맡기면 그 기능이 없는 것처럼 답이 나간다.
      */
     fn reactor_submit(
@@ -201,10 +201,10 @@ impl Handler for NativeServer {
         let Some(lane) = &self.reactor_lane else {
             return R::Fallback;
         };
-        if !self.lane_switch.reactor() {
+        let f = self.features.load();
+        if !f.lanes.reactor {
             return R::Fallback;
         }
-        let f = self.features.load();
         let Some(runtime) = f
             .lane_runtime
             .as_ref()
@@ -213,22 +213,15 @@ impl Handler for NativeServer {
         else {
             return R::Fallback;
         };
-        if f.dns64_prefix.is_some()
-            || f.rrset_roundrobin
-            || f.cookies.strict
-            || f.dnstap.is_some()
-            || f.domain_needed
-            || f.bogus_priv
-            || f.empty_zones
-            || f.block_aaaa
-            || f.padding_block > 0
-            || self.views.present()
-            || self.policy.present()
-            || f.safe_search.load(Ordering::Relaxed)
-            || f.rebind_protection
-            || !f.bogus_nxdomain.is_empty()
-            || !f.recurse_deny_answers.is_empty()
-        {
+        let epoch = runtime.cache.epoch();
+        /*
+         * 레인이 끝낸 답은 조건을 다시 보지 않고 이 캐시 세대로 담긴다. 세대를 잡기 전에 기능
+         * 세트가 바뀌었다면 이전 조건으로 고른 답이 비운 뒤의 세대를 달게 되므로 맡기지 않는다.
+         */
+        if !Arc::ptr_eq(&f, &self.features.load()) {
+            return R::Fallback;
+        }
+        if self.safe_search.load(Ordering::Relaxed) {
             return R::Fallback;
         }
         if f.harden_large_queries && packet.len() > MAX_LARGE_QUERY_BYTES {
@@ -265,7 +258,7 @@ impl Handler for NativeServer {
         if qtype == ApRt(251) || qtype == ApRt(252) {
             return R::Fallback;
         }
-        let client = self.identify_with(ctx, &f);
+        let client = self.identify(ctx);
         if self.acl.check(&client) == AclDecision::Deny {
             return R::Fallback;
         }
@@ -312,13 +305,13 @@ impl Handler for NativeServer {
                 }
             }
 
-            if let Some(recorder) = f.events() {
+            if let Some(recorder) = self.events() {
                 recorder.record_cache(true);
                 onetdns_forward::note_response_source("cache");
                 let timer = onetdns_control::RequestTimer::start();
                 let qname = &request.questions[0].name;
-                self.rec_final_answer(&f, &client, qname, qtype, &resp);
-                self.rec_latency(&f, &client, Some(qname), timer.elapsed_us());
+                self.rec_final_answer(&client, qname, qtype, &resp);
+                self.rec_latency(&client, Some(qname), timer.elapsed_us());
             }
             return R::Respond;
         }
@@ -357,7 +350,7 @@ impl Handler for NativeServer {
             ) {
                 SubmitOutcome::Accepted | SubmitOutcome::Merged => {
                     st.next = st.next.wrapping_add(1);
-                    if let Some(recorder) = f.events() {
+                    if let Some(recorder) = self.events() {
                         recorder.record_cache(false);
                     }
                     st.clients.insert(
@@ -368,6 +361,8 @@ impl Handler for NativeServer {
                             request,
                             client,
                             submitted: now,
+                            epoch,
+                            features: f,
                         },
                     );
                     R::Submitted
@@ -496,8 +491,7 @@ impl NativeServer {
      *          누구에게나 열린 증폭기가 된다.
      */
     pub fn client_allowed(&self, ctx: &RequestCtx) -> bool {
-        let features = self.features.load();
-        let client = self.identify_with(ctx, &features);
+        let client = self.identify(ctx);
         if self.acl.check(&client) == AclDecision::Deny {
             return false;
         }
@@ -505,39 +499,6 @@ impl NativeServer {
             .rate_limiters
             .iter()
             .any(|limiter| limiter.check(&client) == RateDecision::Throttle)
-    }
-
-    /** @brief 내보낸 응답을 빠른 경로가 다시 쓸 수 있게 담아 둔다. 담을 수 없는 응답이면 담지 않는다. */
-    pub(crate) fn store_wire_response(
-        &self,
-        runtime: &LaneRuntime,
-        key: &[u8],
-        response_wire: &[u8],
-        filter_tag: usize,
-        answers_summary: String,
-        now: std::time::Instant,
-    ) {
-        let Some(factory) = runtime.factory.as_ref() else {
-            return;
-        };
-        let Some(candidate) = runtime.cache.wire_candidate(key, now) else {
-            return;
-        };
-        let entry = if candidate.has_fixed_local_ttl() {
-            factory.prepare_fixed(response_wire, filter_tag, answers_summary, now)
-        } else {
-            factory.prepare(
-                response_wire,
-                filter_tag,
-                answers_summary,
-                now,
-                candidate.lifetime_secs(),
-            )
-        };
-        let Some(entry) = entry else {
-            return;
-        };
-        runtime.cache.promote_wire(key, &candidate, entry);
     }
 
     /**
@@ -554,10 +515,10 @@ impl NativeServer {
         hit_only: bool,
     ) -> onetdns_runtime::WireDisposition {
         use onetdns_runtime::WireDisposition as Wire;
-        if !self.lane_switch.wire() {
+        let f = self.features.load();
+        if !f.lanes.wire {
             return Wire::Fallback;
         }
-        let f = self.features.load();
         let Some(runtime) = f
             .lane_runtime
             .as_ref()
@@ -566,22 +527,7 @@ impl NativeServer {
             return Wire::Fallback;
         };
 
-        if f.dns64_prefix.is_some()
-            || f.rrset_roundrobin
-            || f.cookies.strict
-            || f.dnstap.is_some()
-            || f.domain_needed
-            || f.bogus_priv
-            || f.empty_zones
-            || f.block_aaaa
-            || f.padding_block > 0
-            || self.views.present()
-            || self.policy.present()
-        {
-            return Wire::Fallback;
-        }
-
-        if f.safe_search.load(Ordering::Relaxed) {
+        if self.safe_search.load(Ordering::Relaxed) {
             return Wire::Fallback;
         }
         if f.harden_large_queries && packet.len() > MAX_LARGE_QUERY_BYTES {
@@ -592,16 +538,15 @@ impl NativeServer {
         };
 
         let filter = self.filter.load();
-        let filter_tag = (Arc::as_ptr(&filter) as usize).rotate_left(17)
-            ^ self.wire_epoch.load(Ordering::Acquire);
+        let filter_tag = f.wire_tag(&filter);
 
         let trivial = filter.is_trivially_allow();
 
         if let Some((entry, elapsed_secs)) = runtime.cache.wire_get(scanned.key(), filter_tag, now)
         {
-            let events = f.events();
+            let events = self.events();
             let timer = events.is_some().then(onetdns_control::RequestTimer::start);
-            let client = self.identify_with(ctx, &f);
+            let client = self.identify(ctx);
             if self.acl.check(&client) == AclDecision::Deny {
                 return Wire::Fallback;
             }
@@ -661,7 +606,7 @@ impl NativeServer {
             return Wire::Fallback;
         }
 
-        let client = self.identify_with(ctx, &f);
+        let client = self.identify(ctx);
 
         let storable = trivial || {
             if filter.has_client_specific_rules() {
@@ -684,6 +629,7 @@ impl NativeServer {
         let Ok(request) = Message::parse(packet) else {
             return Wire::Fallback;
         };
+        let epoch = runtime.cache.epoch();
         let Some(response) = self.handle(&request, ctx) else {
             return Wire::Drop;
         };
@@ -692,12 +638,12 @@ impl NativeServer {
             return Wire::Fallback;
         }
 
-        let summary = if f.events().is_some() {
+        let summary = if self.events().is_some() {
             answers_summary(&response.answers)
         } else {
             String::new()
         };
-        self.store_wire_response(runtime, scanned.key(), &out.buf, filter_tag, summary, now);
+        runtime.store_wire_response(epoch, scanned.key(), &out.buf, filter_tag, summary, now);
         Wire::Respond
     }
 

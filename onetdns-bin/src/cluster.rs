@@ -391,6 +391,42 @@ pub(crate) fn ensure_raft_runtime(
 }
 
 /**
+ * @brief 클러스터 노드를 설정대로 다시 시작하는 함수. 두 번째 인자는 합의된 설정과 맞춰 볼 원문이다.
+ * @details 세대를 시작할 때는 그 세대를 연 설정 원문을 넘기고, 핫 적용으로 다시 시작할 때는 넘길
+ *          원문이 없다.
+ */
+pub(crate) type RaftRestart =
+    Arc<dyn Fn(&Config, Option<&str>) -> Result<(), String> + Send + Sync>;
+
+/** @brief 이 세대의 설정 원문 슬롯과 교체 함수로 클러스터 노드를 다시 시작하는 함수를 만든다. */
+pub(crate) fn raft_restart(
+    path: Option<PathBuf>,
+    prev: ConfigTextSlot,
+    applied: ConfigTextSlot,
+    reload: Arc<std::sync::atomic::AtomicBool>,
+    hot_apply: Option<HotConfigApply>,
+) -> RaftRestart {
+    Arc::new(
+        move |next: &Config, expected_text: Option<&str>| -> Result<(), String> {
+            /* 언제나 먼저 멈춘다. 켜져 있는 채로 재시작하면 수신 주소가 겹친다. */
+            stop_raft();
+            if !next.cluster_raft || next.cluster_node_id == 0 {
+                return Ok(());
+            }
+            ensure_raft_runtime(
+                next,
+                expected_text,
+                path.clone(),
+                prev.clone(),
+                applied.clone(),
+                reload.clone(),
+                hot_apply.clone(),
+            )
+        },
+    )
+}
+
+/**
  * @brief 클러스터가 정할 수 있는 설정인지 확인한다.
  * @warning 노드별 설정은 거부한다. 퍼뜨리면 모든 노드가 같은 비밀을 쓰거나 서로 신원이
  *          겹친다.

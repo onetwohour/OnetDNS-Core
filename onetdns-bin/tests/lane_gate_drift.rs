@@ -103,7 +103,7 @@ fn hot_apply_checks_before_it_changes_anything() {
  */
 fn hot_apply_fills_startup_defaults_before_comparing() {
     let apply = HOT_APPLY_RS
-        .find("let changed = config_changed_keys(&previous_cfg, next)?;")
+        .find("let changed = config_changed_keys(&previous_cfg, next);")
         .expect("교체 비교 지점을 찾지 못했습니다");
     let normalize = HOT_APPLY_RS
         .find("let next = &normalize_config_for_comparison(&previous_cfg, next);")
@@ -137,5 +137,57 @@ fn hot_apply_redecides_whether_to_collect() {
         HOT_APPLY_RS[end..end + done].contains("set_collecting(telemetry_consumed(next))"),
         "교체 성공 경로가 통계 수집 여부를 다시 정하지 않습니다. 시작할 때의 \
          판정이 그대로 남아 관리 주소를 열어도 대시보드가 비어 있게 됩니다."
+    );
+}
+
+#[test]
+/**
+ * @brief 빠른 경로가 읽는 기능 세트를 응답을 바꾸는 상태를 모두 바꾼 뒤에 한 번만 게시하는지.
+ *
+ * @details 기능 세트에는 경로 조건, 체인 세대, wire 세대가 함께 담긴다. 이 세트가 체인보다
+ *          먼저 보이면 새 세대의 태그를 단 요청이 이전 체인으로 답을 만들어 새 캐시에 담고,
+ *          새로 추가한 stub 영역의 이름을 레인이 순수 재귀로 풀어 그 TTL 동안 내보낸다.
+ *          캐시를 게시보다 먼저 비우면 그 사이 이전 조건으로 맡은 답이 비운 뒤의 세대로 담긴다.
+ * @warning 응답을 바꾸는 상태를 새로 두면 게시보다 앞에서 바꾸고 아래 목록에도 넣는다.
+ */
+fn hot_apply_publishes_the_fast_path_snapshot_last() {
+    let start = HOT_APPLY_RS
+        .find("fn commit(")
+        .expect("commit 함수를 찾지 못했습니다");
+    let end = start
+        + HOT_APPLY_RS[start..]
+            .find("#[cfg(test)]")
+            .expect("commit 함수의 끝을 찾지 못했습니다");
+    let commit = &HOT_APPLY_RS[start..end];
+    assert_eq!(
+        commit.matches("features.store(").count(),
+        1,
+        "commit이 기능 세트를 여러 번 게시합니다. 빠른 경로가 중간 상태를 보게 됩니다."
+    );
+    let publish = commit.find("features.store(").unwrap();
+    for write in [
+        "chain.slot.replace(",
+        "forward_slot.replace(",
+        "state.local_ttl.store(",
+        "state.policy.store(",
+        "state.views.store(",
+        ".local_only_names",
+    ] {
+        let at = commit
+            .find(write)
+            .unwrap_or_else(|| panic!("{write} 지점을 찾지 못했습니다"));
+        assert!(
+            at < publish,
+            "{write} 지점이 기능 세트 게시보다 뒤에 있습니다. 새 세대의 태그를 단 요청이 \
+             이전 상태로 답을 만들어 담습니다."
+        );
+    }
+    let flush = commit
+        .find(".clear()")
+        .expect("캐시를 비우는 지점을 찾지 못했습니다");
+    assert!(
+        publish < flush,
+        "기능 세트를 게시하기 전에 캐시를 비웁니다. 이전 조건으로 맡은 답이 비운 뒤의 \
+         세대로 담깁니다."
     );
 }

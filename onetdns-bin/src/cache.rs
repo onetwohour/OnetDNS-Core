@@ -12,6 +12,7 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -619,10 +620,27 @@ impl Entry {
     }
 }
 
-/** @brief 조각으로 나눈 응답 캐시. */
+/**
+ * @brief 해석을 시작하기 전에 잡아 둔 캐시 세대.
+ * @details 담는 함수는 모두 이것을 받는다. 캐시를 비운 뒤에 돌아온 답은 세대가 달라 담기지
+ *          않는다. 이 모듈 밖에서는 epoch로만 얻는다.
+ */
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CacheEpoch(u64);
+
+/** @brief 조각으로 나눈 응답 캐시와 최근 실패 기억. */
 pub struct NativeCache {
     /** @brief 조각들. 조각마다 잠금이 따로다. */
     shards: Vec<Mutex<LruMap<CacheKey, Entry>>>,
+    /** @brief 최근 실패 기억. */
+    failures: Mutex<LruMap<FailureKey, FailureEntry>>,
+    /**
+     * @brief 비울 때마다 오르는 세대.
+     * @invariant clear는 무엇이든 비우기 전에 이 값을 올리고, 담는 쪽은 담을 곳의 잠금을 잡은
+     *            채 이 값을 다시 본다. 그래서 비우기 전에 시작한 해석의 답은 비운 뒤에 남지
+     *            않는다.
+     */
+    epoch: AtomicU64,
     /** @brief 조각 번호를 뽑는 데 쓰는 가리개. */
     mask: usize,
     /** @brief 조각을 나누는 비밀값. 프로세스마다 다르다. */
@@ -662,6 +680,8 @@ impl NativeCache {
             .collect();
         Self {
             shards,
+            failures: Mutex::new(LruMap::new(capacity.clamp(64, 4096))),
+            epoch: AtomicU64::new(0),
             mask: nshards - 1,
             hash_keys: crate::wirecache::random_shard_hash_keys(),
             min_ttl,
@@ -779,8 +799,23 @@ impl NativeCache {
         }
     }
 
+    /**
+     * @brief 지금 세대.
+     * @warning 답을 정하는 상태를 읽기 전에 잡아야 한다. 상태를 먼저 읽고 세대를 나중에 잡으면
+     *          비우기 전 상태로 만든 답이 비운 뒤의 세대를 달고 담긴다.
+     */
+    pub(crate) fn epoch(&self) -> CacheEpoch {
+        CacheEpoch(self.epoch.load(Ordering::Acquire))
+    }
+
+    /** @brief 잡아 둔 세대가 아직 지금 세대인지. 담을 곳의 잠금을 잡은 채 불러야 clear와 엇갈리지 않는다. */
+    fn is_current(&self, epoch: CacheEpoch) -> bool {
+        self.epoch.load(Ordering::Acquire) == epoch.0
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    /** @brief 응답을 담는다. */
+    /** @brief 지금 세대로 응답을 담는다. 테스트용 진입점. */
     pub fn put(
         &self,
         request: &Message,
@@ -795,6 +830,7 @@ impl NativeCache {
             return;
         };
         self.put_by_key(
+            self.epoch(),
             &key,
             request,
             rcode,
@@ -814,9 +850,11 @@ impl NativeCache {
      *          엉뚱한 답이 캐시에 눌러앉는다.
      * @note 수명은 응답의 가장 짧은 것과 설정 상하한, 그리고 서명 만료 중 가장 짧은 것으로
      *       정한다.
+     * @param epoch 이 응답을 만든 해석이 시작되기 전에 잡은 세대.
      */
     fn put_by_key(
         &self,
+        epoch: CacheEpoch,
         key: &CacheKey,
         request: &Message,
         rcode: u16,
@@ -918,9 +956,56 @@ impl NativeCache {
             lifetime_secs: ttl,
         };
         let idx = self.idx(key.as_slice());
-        self.shards[idx]
-            .lock_recover()
-            .put(key.clone(), Entry::Structured(Arc::new(entry)));
+        let mut shard = self.shards[idx].lock_recover();
+        if self.is_current(epoch) {
+            shard.put(key.clone(), Entry::Structured(Arc::new(entry)));
+        }
+    }
+
+    /** @brief 이 질의가 최근에 실패했는지. 기한이 지났으면 없는 것으로 본다. */
+    fn failure_hit(&self, key: &[u8]) -> Option<u16> {
+        let mut failures = self.failures.lock_recover();
+        match failures.get(key).copied() {
+            Some(entry) if Instant::now() < entry.expiry => Some(ResponseCode::ServFail.0),
+            Some(_) => None,
+            None => None,
+        }
+    }
+
+    /**
+     * @brief 실패를 기억한다.
+     * @note 거듭 실패하면 기억 기간을 배로 늘린다. 죽은 업스트림에 같은 간격으로 계속 나가면
+     *       그것이 더 느리다.
+     * @param epoch 실패한 해석이 시작되기 전에 잡은 세대.
+     */
+    fn remember_failure(&self, epoch: CacheEpoch, key: FailureKey) {
+        let now = Instant::now();
+        let mut failures = self.failures.lock_recover();
+        if !self.is_current(epoch) {
+            return;
+        }
+        let attempts = failures
+            .get(&key)
+            .map(|entry| entry.attempts.saturating_add(1))
+            .unwrap_or(1)
+            .min(8);
+        let multiplier = 1u32 << u32::from(attempts.saturating_sub(1));
+        let ttl = FAILURE_CACHE_BASE_TTL
+            .checked_mul(multiplier)
+            .unwrap_or(FAILURE_CACHE_MAX_TTL)
+            .min(FAILURE_CACHE_MAX_TTL);
+        failures.put(
+            key,
+            FailureEntry {
+                expiry: now + ttl,
+                attempts,
+            },
+        );
+    }
+
+    /** @brief 성공했으니 실패 기억을 지운다. */
+    fn forget_failure(&self, key: &[u8]) {
+        self.failures.lock_recover().pop(key);
     }
 
     #[allow(dead_code)]
@@ -929,14 +1014,22 @@ impl NativeCache {
         self.shards.iter().map(|s| s.lock_recover().len()).sum()
     }
 
-    /** @brief 전부 비운다. 비운 개수를 돌려준다. */
+    /**
+     * @brief 담긴 답과 실패 기억을 전부 비운다. 비운 개수를 돌려준다.
+     * @warning 답을 달라지게 하는 상태는 이것을 부르기 전에 바꿔 둬야 한다. 순서가 바뀌면 새
+     *          세대를 잡은 해석이 이전 상태를 읽고, 그 답이 비운 캐시에 담긴다.
+     */
     pub fn clear(&self) -> usize {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut n = 0;
         for s in &self.shards {
             let mut g = s.lock_recover();
             n += g.len();
             g.clear();
         }
+        let mut failures = self.failures.lock_recover();
+        n += failures.len();
+        failures.clear();
         n
     }
 
@@ -1139,8 +1232,6 @@ pub struct CacheLayer {
     positive_enabled: bool,
     /** @brief 지표 기록기. */
     recorder: Option<onetdns_control::Recorder>,
-    /** @brief 최근 실패 기억. */
-    failures: Arc<Mutex<LruMap<FailureKey, FailureEntry>>>,
     /** @brief 지금 나가 있는 같은 질의들. */
     flights: Mutex<HashMap<FlightKey, Arc<ClientFlight>>>,
 }
@@ -1164,24 +1255,8 @@ impl CacheLayer {
             )),
             positive_enabled: true,
             recorder: None,
-            failures: Arc::new(Mutex::new(LruMap::new(capacity.clamp(64, 4096)))),
             flights: Mutex::new(HashMap::new()),
         }
-    }
-
-    /** @brief 이 질의가 최근에 실패했는지. */
-    fn failure_hit(&self, key: &[u8]) -> Option<u16> {
-        failure_hit_in(&self.failures, key)
-    }
-
-    /** @brief 실패를 기억한다. */
-    fn remember_failure(&self, key: FailureKey) {
-        remember_failure_in(&self.failures, key);
-    }
-
-    /** @brief 성공했으니 실패 기억을 지운다. */
-    fn clear_failure(&self, key: &[u8]) {
-        self.failures.lock_recover().pop(key);
     }
 
     /** @brief 지표 기록기를 붙인다. */
@@ -1209,46 +1284,8 @@ impl CacheLayer {
     pub fn handle(&self) -> CacheHandle {
         CacheHandle {
             cache: self.cache.clone(),
-            failures: self.failures.clone(),
         }
     }
-}
-
-/** @brief 실패 기억을 조회한다. 기한이 지났으면 없는 것으로 본다. */
-fn failure_hit_in(failures: &Mutex<LruMap<FailureKey, FailureEntry>>, key: &[u8]) -> Option<u16> {
-    let mut failures = failures.lock_recover();
-    match failures.get(key).copied() {
-        Some(entry) if Instant::now() < entry.expiry => Some(ResponseCode::ServFail.0),
-        Some(_) => None,
-        None => None,
-    }
-}
-
-/**
- * @brief 실패를 기억한다.
- * @note 거듭 실패하면 기억 기간을 배로 늘린다. 죽은 업스트림에 같은 간격으로 계속 나가면
- *       그것이 더 느리다.
- */
-fn remember_failure_in(failures: &Mutex<LruMap<FailureKey, FailureEntry>>, key: FailureKey) {
-    let now = Instant::now();
-    let mut failures = failures.lock_recover();
-    let attempts = failures
-        .get(&key)
-        .map(|entry| entry.attempts.saturating_add(1))
-        .unwrap_or(1)
-        .min(8);
-    let multiplier = 1u32 << u32::from(attempts.saturating_sub(1));
-    let ttl = FAILURE_CACHE_BASE_TTL
-        .checked_mul(multiplier)
-        .unwrap_or(FAILURE_CACHE_MAX_TTL)
-        .min(FAILURE_CACHE_MAX_TTL);
-    failures.put(
-        key,
-        FailureEntry {
-            expiry: now + ttl,
-            attempts,
-        },
-    );
 }
 
 #[derive(Clone)]
@@ -1256,8 +1293,6 @@ fn remember_failure_in(failures: &Mutex<LruMap<FailureKey, FailureEntry>>, key: 
 pub struct CacheHandle {
     /** @brief 담아 두는 곳. */
     cache: Arc<NativeCache>,
-    /** @brief 최근 실패 기억. */
-    failures: Arc<Mutex<LruMap<FailureKey, FailureEntry>>>,
 }
 
 /** @brief 바이트 형태로 승격할 후보. */
@@ -1291,11 +1326,12 @@ impl CacheHandle {
 
     /** @brief 담긴 것과 실패 기억을 모두 비운다. */
     pub fn clear(&self) -> usize {
-        let positive = self.cache.clear();
-        let mut failures = self.failures.lock_recover();
-        let negative = failures.len();
-        failures.clear();
-        positive.saturating_add(negative)
+        self.cache.clear()
+    }
+
+    /** @brief 지금 세대. 해석을 시작하기 전에 잡아 두고 담을 때 넘긴다. */
+    pub(crate) fn epoch(&self) -> CacheEpoch {
+        self.cache.epoch()
     }
 
     /**
@@ -1361,15 +1397,21 @@ impl CacheHandle {
      * @brief 후보를 바이트 항목으로 바꿔 넣는다.
      * @warning 후보를 볼 때와 같은 것이 아직 그곳에 있을 때만 바꾼다. 확인하지 않으면
      *          그 사이 들어온 더 새로운 답을 이전 답으로 덮는다.
+     * @param epoch 바이트를 만든 해석이 시작되기 전에 잡은 세대. 후보는 비운 뒤에 새로 들어온
+     *              것일 수 있으므로 후보가 같다는 것만으로는 바이트가 새 세대의 답이라고 할 수 없다.
      */
     pub(crate) fn promote_wire(
         &self,
+        epoch: CacheEpoch,
         key: &[u8],
         candidate: &WirePromotionCandidate,
         wire: crate::wirecache::WireEntry,
     ) -> bool {
         let idx = self.cache.idx(key);
         let mut shard = self.cache.shards[idx].lock_recover();
+        if !self.cache.is_current(epoch) {
+            return false;
+        }
         let Some(current) = shard.get_mut(key) else {
             return false;
         };
@@ -1449,7 +1491,7 @@ impl CacheHandle {
     /** @brief 다른 레인이 실패 기억만 조회할 때 쓰는 진입점. */
     pub(crate) fn lane_failure(&self, request: &Message) -> Option<Message> {
         let key = NormalizedRequestKey::from_request(request)?;
-        let rcode = failure_hit_in(&self.failures, key.as_slice())?;
+        let rcode = self.cache.failure_hit(key.as_slice())?;
         Some(cached_message(
             request,
             rcode,
@@ -1462,23 +1504,27 @@ impl CacheHandle {
 
     #[cfg_attr(not(unix), allow(dead_code))]
     /** @brief 다른 레인이 실패를 기억시킬 때 쓰는 진입점. */
-    pub(crate) fn lane_remember_failure(&self, request: &Message) {
+    pub(crate) fn lane_remember_failure(&self, epoch: CacheEpoch, request: &Message) {
         if let Some(key) = NormalizedRequestKey::from_request(request) {
-            remember_failure_in(&self.failures, key.into_owned());
+            self.cache.remember_failure(epoch, key.into_owned());
         }
     }
 
-    /** @brief 응답을 담는다. */
-    pub fn store(&self, request: &Message, response: &Message) {
-        let neg_min = neg_soa_minimum(request, response);
-        self.cache.put(
+    /** @brief 응답을 담는다. epoch는 이 응답을 만든 해석이 시작되기 전에 잡은 세대다. */
+    pub fn store(&self, epoch: CacheEpoch, request: &Message, response: &Message) {
+        let Some(key) = NativeCache::key(request) else {
+            return;
+        };
+        self.cache.put_by_key(
+            epoch,
+            &key,
             request,
             response.header.rcode,
             &response.answers,
             &response.authorities,
             &response.additionals,
             response.header.authentic_data,
-            neg_min,
+            neg_soa_minimum(request, response),
         );
     }
 }
@@ -1541,7 +1587,7 @@ impl Resolver for CacheLayer {
                 ));
             }
         }
-        if let Some(rcode) = self.failure_hit(request_key.as_slice()) {
+        if let Some(rcode) = self.cache.failure_hit(request_key.as_slice()) {
             if let Some(recorder) = &self.recorder {
                 recorder.record_cache(true);
                 onetdns_forward::note_response_source("cache");
@@ -1622,7 +1668,7 @@ impl Resolver for CacheLayer {
                     ));
                 }
             }
-            if let Some(rcode) = self.failure_hit(flight_key.as_slice()) {
+            if let Some(rcode) = self.cache.failure_hit(flight_key.as_slice()) {
                 if let Some(recorder) = &self.recorder {
                     recorder.record_cache(true);
                     onetdns_forward::note_response_source("cache");
@@ -1634,14 +1680,15 @@ impl Resolver for CacheLayer {
                 recorder.record_cache(false);
             }
 
+            let epoch = self.cache.epoch();
             let response = match self.inner.resolve_outcome(req) {
                 ResolveOutcome::Response(response) => response,
                 ResolveOutcome::Failure(failure) => {
-                    self.remember_failure(flight_key.clone());
+                    self.cache.remember_failure(epoch, flight_key.clone());
                     return Err(failure);
                 }
             };
-            self.clear_failure(flight_key.as_slice());
+            self.cache.forget_failure(flight_key.as_slice());
             let neg_min = neg_soa_minimum(req, &response);
             let negative = response.header.rcode == ResponseCode::NXDomain.0
                 || (response.header.rcode == ResponseCode::NoError.0
@@ -1651,6 +1698,7 @@ impl Resolver for CacheLayer {
             if self.positive_enabled {
                 self.cache.clamp_outgoing_ttls(&mut response, negative);
                 self.cache.put_by_key(
+                    epoch,
                     &flight_key,
                     req,
                     response.header.rcode,
@@ -2000,7 +2048,6 @@ mod tests {
         let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
         let handle = CacheHandle {
             cache: native.clone(),
-            failures: Arc::new(Mutex::new(LruMap::new(64))),
         };
         let request = Message::query(
             1,
@@ -2057,7 +2104,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!handle.promote_wire(scanned.key(), &candidate, wire));
+        assert!(!handle.promote_wire(handle.epoch(), scanned.key(), &candidate, wire));
         let (_, answers, _, _, _) = native.get(&request).unwrap();
         assert_eq!(answers[0].rdata, new.rdata);
     }
@@ -2068,7 +2115,6 @@ mod tests {
         let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
         let handle = CacheHandle {
             cache: native.clone(),
-            failures: Arc::new(Mutex::new(LruMap::new(64))),
         };
         let request = Message::query(
             1,
@@ -2106,7 +2152,7 @@ mod tests {
                 candidate.lifetime_secs(),
             )
             .unwrap();
-        assert!(handle.promote_wire(scanned.key(), &candidate, wire));
+        assert!(handle.promote_wire(handle.epoch(), scanned.key(), &candidate, wire));
 
         assert!(handle.wire_get(scanned.key(), 7, now).is_some());
         assert!(handle.wire_get(scanned.key(), 8, now).is_none());
@@ -2829,21 +2875,167 @@ mod tests {
             RecordType::A,
         );
         let key = FlightKey::from_request(&request).unwrap();
+        let cache = &layer.cache;
 
-        layer.remember_failure(key.clone());
+        cache.remember_failure(cache.epoch(), key.clone());
         {
-            let mut failures = layer.failures.lock_recover();
+            let mut failures = cache.failures.lock_recover();
             let entry = failures.get_mut(&key).unwrap();
             assert_eq!(entry.attempts, 1);
             entry.expiry = Instant::now() - Duration::from_secs(1);
         }
-        assert_eq!(layer.failure_hit(key.as_slice()), None);
+        assert_eq!(cache.failure_hit(key.as_slice()), None);
 
-        layer.remember_failure(key.clone());
-        let mut failures = layer.failures.lock_recover();
+        cache.remember_failure(cache.epoch(), key.clone());
+        let mut failures = cache.failures.lock_recover();
         let entry = failures.get_mut(&key).unwrap();
         assert_eq!(entry.attempts, 2);
         assert!(entry.expiry > Instant::now() + FAILURE_CACHE_BASE_TTL);
+    }
+
+    /** @brief 첫 질의를 붙잡아 두었다가 놓아 주면 실패로 끝내는 업스트림. */
+    struct HeldFailure {
+        /** @brief 첫 질의가 들어왔음을 알릴 곳. 한 번 알리면 비운다. */
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        /** @brief 붙잡은 질의를 놓아 줄 신호. */
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        /** @brief 불린 횟수. */
+        calls: AtomicUsize,
+    }
+
+    impl Resolver for HeldFailure {
+        /** @brief 첫 질의는 신호가 올 때까지 붙잡고, 모든 질의를 실패로 끝낸다. */
+        fn resolve(&self, _request: &Message) -> Option<Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let entered = self.entered.lock_recover().take();
+            if let Some(entered) = entered {
+                entered.send(()).unwrap();
+                self.release.lock_recover().recv().unwrap();
+            }
+            None
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 해석하는 동안 캐시를 비웠다면 그 실패를 기억하지 않는지.
+     * @details 기억하면 비운 뒤에도 기억 기간 동안 그 이름에 SERVFAIL이 나간다. 로컬 전용 범주를
+     *          켜며 비운 경우라면 업스트림 없이 답해야 할 이름이 실패로 남는다.
+     */
+    fn a_failure_in_flight_across_a_clear_is_not_remembered() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let upstream = Arc::new(HeldFailure {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let layer = Arc::new(CacheLayer::new(upstream.clone(), 64, 1, 0, 86_400, 0, 60));
+        let handle = layer.handle();
+        let request = Message::query(
+            3,
+            Name::from_str("held.failure.test").unwrap(),
+            RecordType::A,
+        );
+        let in_flight = {
+            let layer = layer.clone();
+            let request = request.clone();
+            std::thread::spawn(move || layer.resolve(&request))
+        };
+
+        entered_rx.recv().unwrap();
+        handle.clear();
+        release_tx.send(()).unwrap();
+        assert!(in_flight.join().unwrap().is_none());
+
+        assert!(layer.resolve(&request).is_none());
+        assert_eq!(
+            upstream.calls.load(Ordering::SeqCst),
+            2,
+            "비운 뒤에 도착한 실패가 기억돼 다시 묻지 않았습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 비우기 전에 잡은 세대로는 아무것도 담기지 않는지.
+     * @details 프리패치와 레인은 해석을 마친 뒤에 따로 담고, 바이트 승격은 응답을 내보낸 뒤에
+     *          한다. 그동안 캐시를 비웠다면 그 답은 비우기 전 설정으로 만든 것이다. 승격 후보는
+     *          비운 뒤에 새로 담긴 답일 수 있으므로 후보가 그대로라는 것만으로는 막지 못한다.
+     */
+    fn writes_that_started_before_a_clear_do_not_land_after_it() {
+        let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
+        let handle = CacheHandle {
+            cache: native.clone(),
+        };
+        let request = Message::query(
+            1,
+            Name::from_str("epoch.example.test").unwrap(),
+            RecordType::A,
+        );
+        let mut stale = request.clone();
+        stale.header.response = true;
+        stale.header.recursion_available = true;
+        stale.answers.push(Record::new(
+            request.questions[0].name.clone(),
+            300,
+            RData::A(Ipv4Addr::new(192, 0, 2, 1)),
+        ));
+
+        let before = handle.epoch();
+        handle.clear();
+
+        handle.store(before, &request, &stale);
+        assert!(
+            native.get(&request).is_none(),
+            "비우기 전에 시작한 답이 담겼습니다"
+        );
+        handle.lane_remember_failure(before, &request);
+        assert!(
+            handle.lane_failure(&request).is_none(),
+            "비우기 전에 시작한 실패가 기억됐습니다"
+        );
+
+        let fresh = Record::new(
+            request.questions[0].name.clone(),
+            300,
+            RData::A(Ipv4Addr::new(192, 0, 2, 2)),
+        );
+        handle.store(
+            handle.epoch(),
+            &request,
+            &Message {
+                answers: vec![fresh.clone()],
+                ..stale.clone()
+            },
+        );
+        let request_wire = request.try_encode().unwrap();
+        let scanned = crate::wirecache::scan_query(&request_wire).unwrap();
+        let now = Instant::now();
+        let candidate = handle
+            .wire_candidate(scanned.key(), now)
+            .expect("비운 뒤에 담긴 답");
+        let wire = crate::wirecache::WireEntryFactory::new(0, 86_400)
+            .prepare(
+                &stale.try_encode().unwrap(),
+                0,
+                String::new(),
+                now,
+                candidate.lifetime_secs(),
+            )
+            .unwrap();
+        assert!(
+            !handle.promote_wire(before, scanned.key(), &candidate, wire),
+            "비우기 전에 만든 바이트가 비운 뒤의 답을 덮었습니다"
+        );
+        let (_, answers, _, _, _) = native.get(&request).unwrap();
+        assert_eq!(answers[0].rdata, fresh.rdata);
+
+        handle.lane_remember_failure(handle.epoch(), &request);
+        assert!(
+            handle.lane_failure(&request).is_some(),
+            "지금 세대로 시작한 실패는 기억돼야 합니다"
+        );
     }
 
     #[test]

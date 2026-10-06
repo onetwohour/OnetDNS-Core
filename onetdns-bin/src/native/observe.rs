@@ -8,7 +8,7 @@ use onetdns_proto::{Message, Name as ApName, RecordType as ApRt, ResponseCode};
 
 use crate::native::query::RuleMatch;
 use crate::native::response::{answers_summary, rcode_str};
-use crate::native::{NativeFeatures, NativeServer};
+use crate::native::NativeServer;
 
 /** @brief 필터 판정을 설명하는 규칙과 목록. 기록할 때까지 들고 있는 값이다. */
 pub(crate) struct FilterRuleLabel {
@@ -57,8 +57,7 @@ impl NativeServer {
         detail: &str,
     ) {
         resolution_failed(reason, stage, name);
-        let features = self.features.load();
-        if let Some(r) = features.events() {
+        if let Some(r) = self.events() {
             let (log, stat) = self.filter.load().client_log_stat(client);
             r.record_detailed(
                 client.transport,
@@ -82,14 +81,13 @@ impl NativeServer {
     /** @brief 최종 답을 기록에 남긴다. */
     pub(crate) fn rec_final_answer(
         &self,
-        f: &NativeFeatures,
         client: &ClientInfo,
         qname: &ApName,
         qtype: ApRt,
         resp: &Message,
     ) {
         let source = onetdns_forward::take_response_source().unwrap_or_default();
-        let Some(recorder) = f.events() else {
+        let Some(recorder) = self.events() else {
             return;
         };
         if resp.header.rcode == ResponseCode::ServFail.0 {
@@ -122,7 +120,6 @@ impl NativeServer {
         } else {
             String::new()
         };
-        // 여기서 확인한 레코더를 그대로 넘겨 같은 질의 세대의 snapshot을 다시 잡지 않는다.
         let (log, stat) = self.filter.load().client_log_stat(client);
         self.rec_rc_diag_with(
             recorder,
@@ -141,14 +138,8 @@ impl NativeServer {
     }
 
     /** @brief 처리에 걸린 시간을 남긴다. */
-    pub(crate) fn rec_latency(
-        &self,
-        f: &NativeFeatures,
-        client: &ClientInfo,
-        qname: Option<&ApName>,
-        elapsed_us: u64,
-    ) {
-        if let Some(r) = f.events() {
+    pub(crate) fn rec_latency(&self, client: &ClientInfo, qname: Option<&ApName>, elapsed_us: u64) {
+        if let Some(r) = self.events() {
             let (_, stat) = self.filter.load().client_log_stat(client);
             r.record_latency_for(elapsed_us, stat, qname);
         }
@@ -163,8 +154,7 @@ impl NativeServer {
         qtype: Option<ApRt>,
     ) {
         note_rejection(action, client);
-        let features = self.features.load();
-        if let Some(r) = features.events() {
+        if let Some(r) = self.events() {
             let (log, stat) = self.filter.load().client_log_stat(client);
             r.record(
                 client.transport,
@@ -204,8 +194,7 @@ impl NativeServer {
         rule: impl Into<RuleMatch<'r>>,
     ) {
         note_rejection(action, client);
-        let features = self.features.load();
-        if let Some(recorder) = features.events() {
+        if let Some(recorder) = self.events() {
             let (log, stat) = self.filter.load().client_log_stat(client);
             self.rec_rc_diag_with(
                 recorder, client, action, name, qtype, rcode, answers, upstream, rule, log, stat,
@@ -221,8 +210,7 @@ impl NativeServer {
      */
     pub(crate) fn rec_overloaded(&self, client: &ClientInfo, name: &ApName, qtype: ApRt) {
         note_rejection(Action::Throttled, client);
-        let features = self.features.load();
-        if let Some(recorder) = features.events() {
+        if let Some(recorder) = self.events() {
             let (log, stat) = self.filter.load().client_log_stat(client);
             self.rec_rc_diag_with(
                 recorder,

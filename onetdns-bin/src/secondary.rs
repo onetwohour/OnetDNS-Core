@@ -4,18 +4,24 @@
  *          시점을 정한다.
  */
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use onetdns_config::Config;
 use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write;
+use crate::config_apply::SecondaryRestart;
+use crate::edge::EdgeServices;
 use crate::notify::NotifySender;
 use crate::zones::{
-    catalog_members, remove_zone, serial_gt, swap_zone, zonemd_ok, ZoneJournals, ZonemdPolicy,
+    catalog_members, remove_zone, serial_gt, swap_zone, zonemd_ok, ZoneJournals, ZoneState,
+    ZonemdPolicy,
 };
-use crate::{native, nonblocking_tcp, read_text_limited, tsig_for_secondary, unix_now};
+use crate::{
+    build_tsig_keys, native, nonblocking_tcp, read_text_limited, track_service_thread,
+    tsig_for_secondary, unix_now,
+};
 
 /** @brief 받아 둔 하위 영역을 읽는다. 못 받아도 시작할 수 있게 하려는 것이다. */
 pub(crate) fn load_secondary_cache(
@@ -1910,6 +1916,41 @@ pub(crate) fn spawn_secondary_refresh(
         shutdown,
         Duration::from_secs(10),
     )
+}
+
+/**
+ * @brief 세컨더리 영역 갱신 작업을 새 설정으로 다시 시작하는 함수.
+ * @details 설정이 바뀔 때마다 이전 작업을 멈추고 새 설정으로 띄운다. 세컨더리와 카탈로그가 모두
+ *          비어 있으면 멈추기만 한다.
+ */
+pub(crate) fn refresh_restart(
+    jobs: Arc<EdgeServices>,
+    zones: &ZoneState,
+    kick: Arc<native::NotifyKick>,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> SecondaryRestart {
+    let store = zones.store.clone();
+    let journal = zones.journal.clone();
+    let sender = zones.notify.clone();
+    Arc::new(move |next: &Config| -> Result<(), String> {
+        let stop = jobs.restart_all();
+        if next.secondary.is_empty() && next.catalog.is_empty() {
+            return Ok(());
+        }
+        let keys = build_tsig_keys(next)?;
+        let thread = spawn_secondary_refresh(
+            next.clone(),
+            keys,
+            store.clone(),
+            journal.clone(),
+            kick.clone(),
+            sender.clone(),
+            stop,
+        )
+        .map_err(|error| format!("Could not start the secondary zone refresh task: {error}"))?;
+        track_service_thread(&threads, thread);
+        Ok(())
+    })
 }
 
 /**

@@ -101,11 +101,6 @@ impl NativeServer {
 
     /** @brief 이 요청을 보낸 클라이언트를 알아본다. */
     pub(crate) fn identify(&self, ctx: &RequestCtx) -> ClientInfo {
-        self.identify_with(ctx, &self.features.load())
-    }
-
-    /** @brief 켜진 기능에 맞춰 클라이언트를 알아본다. */
-    pub(crate) fn identify_with(&self, ctx: &RequestCtx, f: &NativeFeatures) -> ClientInfo {
         let transport = core_transport(ctx.transport);
         let mut client = ClientInfo {
             source_ip: canonical_source_ip(ctx.src.ip()),
@@ -120,7 +115,7 @@ impl NativeServer {
             authenticated: ctx.authenticated,
         };
         if client.client_id.is_none() {
-            if let Some(mc) = &f.mac_cache {
+            if let Some(mc) = &self.mac_cache {
                 client.client_id = mc.lookup(client.source_ip);
             }
         }
@@ -153,11 +148,11 @@ impl NativeServer {
         let mut scope = self.admit(request, ctx, f, block_ttl)?;
         let filter = self.apply_request_policy(&mut scope, ctx, f, policy)?;
         let _permit = self.acquire_inflight(&mut scope, f)?;
-        let resolved = self.resolve_query(&mut scope, f, &filter)?;
+        let resolved = self.resolve_query(&mut scope, &filter)?;
         let resolved = self.complete_answer(&mut scope, f, resolved)?;
         let mut response = self.apply_response_policy(&mut scope, f, policy, &filter, resolved)?;
 
-        self.rec_final_answer(f, &scope.client, &scope.qname, scope.qtype, &response);
+        self.rec_final_answer(&scope.client, &scope.qname, scope.qtype, &response);
         normalize_recursive_response(&mut response, request);
         ControlFlow::Continue(Some(finalize(response, scope.resp_edns.take())))
     }
@@ -547,19 +542,19 @@ impl NativeServer {
         &self,
         scope: &mut QueryScope<'_>,
         f: &NativeFeatures,
-    ) -> Stage<Option<InflightGuard>> {
+    ) -> Stage<Option<InflightGuard<'_>>> {
         if f.inflight_max == 0 {
             return ControlFlow::Continue(None);
         }
-        let n = f.inflight.fetch_add(1, Ordering::Relaxed);
+        let n = self.inflight.fetch_add(1, Ordering::Relaxed);
         if n >= f.inflight_max {
-            f.inflight.fetch_sub(1, Ordering::Relaxed);
+            self.inflight.fetch_sub(1, Ordering::Relaxed);
             self.rec_overloaded(&scope.client, &scope.qname, scope.qtype);
             return ControlFlow::Break(
                 scope.reply(error_resp(scope.request, ResponseCode::ServFail), None),
             );
         }
-        ControlFlow::Continue(Some(InflightGuard(f.inflight.clone())))
+        ControlFlow::Continue(Some(InflightGuard(&self.inflight)))
     }
 
     /**
@@ -569,7 +564,6 @@ impl NativeServer {
     fn resolve_query<'r>(
         &self,
         scope: &mut QueryScope<'r>,
-        f: &NativeFeatures,
         filter: &BlockEngine,
     ) -> Stage<Resolved<'r>> {
         let request = scope.request;
@@ -578,7 +572,7 @@ impl NativeServer {
 
         let ss = filter
             .client_safe_search(&scope.client)
-            .unwrap_or_else(|| f.safe_search.load(Ordering::Relaxed));
+            .unwrap_or_else(|| self.safe_search.load(Ordering::Relaxed));
         let mut resolve_name = qname.clone();
         let mut safe_cname: Option<ApRecord> = None;
         if ss {
@@ -842,7 +836,7 @@ impl NativeServer {
         }
 
         if f.rrset_roundrobin && resp.answers.len() > 1 {
-            let n = f.rotor.fetch_add(1, Ordering::Relaxed) % resp.answers.len();
+            let n = self.rotor.fetch_add(1, Ordering::Relaxed) % resp.answers.len();
             resp.answers.rotate_left(n);
         }
 
@@ -1301,17 +1295,6 @@ mod tests {
         assert_eq!(&returned[..8], &client_cookie);
 
         update_features(&server, |features| features.cookies.strict = true);
-        output.clear();
-        assert_eq!(
-            server.handle_udp_wire(
-                &plain.try_encode().unwrap(),
-                &ctx(),
-                &mut output,
-                Instant::now()
-            ),
-            WireDisposition::Fallback,
-            "strict에서는 무쿠키 질의도 BADCOOKIE 처리가 필요합니다"
-        );
         let strict = server
             .handle(&plain, &ctx())
             .expect("strict BADCOOKIE 응답");

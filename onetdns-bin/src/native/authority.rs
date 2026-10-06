@@ -3,6 +3,7 @@
  */
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use onetdns_control::Action;
@@ -15,10 +16,7 @@ use onetdns_runtime::{RequestCtx, Transport as RtTransport};
 
 use crate::native::query::{advertised_udp_payload, base_edns};
 use crate::native::response::{base_response, edns_error_resp, error_resp, finalize, now_unix};
-use crate::native::{
-    NativeFeatures, NativeServer, DDR_OWNER_WIRE, EMPTY_OPT_WIRE_LEN, MAX_LARGE_QUERY_BYTES,
-    SERVER_UDP_MAX,
-};
+use crate::native::{NativeServer, DDR_OWNER_WIRE, EMPTY_OPT_WIRE_LEN, SERVER_UDP_MAX};
 
 /** @brief 검증에 쓴 키와 그 결과. 응답에도 같은 키로 서명해야 한다. */
 type TsigContext = (
@@ -382,7 +380,7 @@ impl NativeServer {
         if features.dnstap.is_some() {
             return None;
         }
-        let client = self.identify_with(ctx, &features);
+        let client = self.identify(ctx);
         if self.acl.check(&client) == AclDecision::Deny
             || !authority
                 .xfr_allow
@@ -1163,43 +1161,25 @@ impl NativeServer {
         let Some(path) = &self.authority_wire_path else {
             return Wire::Fallback;
         };
-        if !self.lane_switch.authority() {
-            return Wire::Fallback;
-        }
-
-        if self.features.authority_wire_blocked()
-            || self.views.present()
-            || self.policy.present()
-            || self.features.safe_search_enabled()
-            || (self.features.harden_large_queries() && packet.len() > MAX_LARGE_QUERY_BYTES)
-        {
-            return Wire::Fallback;
-        }
         let Some(scanned) = crate::wirecache::scan_query(packet) else {
             return Wire::Fallback;
-        };
-        let ddr_features = if scanned.canonical_qname() == DDR_OWNER_WIRE {
-            let features = self.features.load();
-            if features.ddr_enabled {
-                return Wire::Fallback;
-            }
-            Some(features)
-        } else {
-            None
         };
         if !matches!(scanned.qtype, 1 | 28) {
             return Wire::Fallback;
         }
-        // 질의 뒤에 아무것도 없거나, 옵션 없는 OPT 하나만 붙은 것만 맡는다. 옵션이 있거나
-        // DO가 켜져 있으면 응답에 담을 것이 생기고, 알린 크기가 이 서버의 상한보다 작으면 절단
-        // 사다리가 필요하므로 전부 구조적 경로로 보낸다.
+        /*
+         * 질의 뒤에 아무것도 없거나, 옵션 없는 OPT 하나만 붙은 것만 맡는다. 옵션이 있거나 DO가
+         * 켜져 있으면 응답에 담을 것이 생기고, 알린 크기가 이 서버의 상한보다 작으면 절단
+         * 사다리가 필요하므로 전부 구조적 경로로 보낸다. 이렇게 맡는 질의는 큰 질의 상한보다
+         * 늘 작으므로 그 검사는 하지 않는다.
+         */
         let bare_len = 12 + scanned.qname.len() + 4;
-        let edns = match &scanned.edns {
+        let has_opt = match &scanned.edns {
             None => {
                 if packet.len() != bare_len {
                     return Wire::Fallback;
                 }
-                None
+                false
             }
             Some(edns) => {
                 if edns.dnssec_ok
@@ -1209,19 +1189,27 @@ impl NativeServer {
                 {
                     return Wire::Fallback;
                 }
-                Some(advertised_udp_payload(self.features.edns_buffer()))
+                true
             }
         };
         if self.filter.wire_blocked() {
             return Wire::Fallback;
         }
-        // DDR 이름이면 위에서 이미 잡은 같은 세대를 재사용한다. 보통 이름은 모든 조기
-        // fallback을 지난 뒤에만 snapshot을 잡아, 맡지 않을 질의에 새 lock 비용을 붙이지 않는다.
-        let features = ddr_features.unwrap_or_else(|| self.features.load());
+        /*
+         * 기능 세트는 요청 내용으로 거를 수 있는 질의를 모두 거른 뒤에 한 번만 읽는다. 맡지
+         * 않을 질의에 잠금 비용을 붙이지 않고, 경로 조건과 DDR 판정, EDNS 크기가 같은 세트를 본다.
+         */
+        let features = self.features.load();
+        if !features.lanes.authority
+            || self.safe_search.load(Ordering::Acquire)
+            || (features.ddr_enabled && scanned.canonical_qname() == DDR_OWNER_WIRE)
+        {
+            return Wire::Fallback;
+        }
+        let edns = has_opt.then(|| advertised_udp_payload(features.edns_buffer));
         let acl_trivially_allows = self.acl.is_trivially_allow();
         let rate_limiters_active = self.rate_limiters.iter().any(|limiter| limiter.is_active());
-        let client = (!acl_trivially_allows || rate_limiters_active)
-            .then(|| self.identify_with(ctx, &features));
+        let client = (!acl_trivially_allows || rate_limiters_active).then(|| self.identify(ctx));
         if !acl_trivially_allows
             && self
                 .acl
@@ -1275,7 +1263,7 @@ impl NativeServer {
                 return Wire::Fallback;
             }
         }
-        self.record_authority_wire(&features, ctx, &scanned, client, out);
+        self.record_authority_wire(ctx, &scanned, client, out);
         Wire::Respond
     }
 
@@ -1286,18 +1274,16 @@ impl NativeServer {
      *          컨트롤 플레인을 수신 주소 없이도 만들어 두게 된 뒤로는 그 조건이 언제나 참이라 경로가
      *          전부 죽는다. 응답 코드는 방금 쓴 와이어의 헤더에서 그대로 읽어 구조적
      *          경로와 같은 값을 남긴다.
-     * @param features 접근 제어·DDR 판정과 함께 잡은 질의 세대 snapshot.
      * @param client 접근 제어나 제한기 때문에 이미 만들어 둔 것이 있으면 다시 만들지 않는다.
      */
     fn record_authority_wire(
         &self,
-        features: &NativeFeatures,
         ctx: &RequestCtx,
         scanned: &crate::wirecache::ScannedQuery<'_>,
         client: Option<ClientInfo>,
         out: &onetdns_proto::Writer,
     ) {
-        let Some(recorder) = features.events() else {
+        let Some(recorder) = self.events() else {
             return;
         };
         let Some(flags) = out.buf.get(3) else {
@@ -1306,7 +1292,7 @@ impl NativeServer {
         let rcode = ResponseCode(u16::from(flags & 0x0f));
         let client = match client {
             Some(client) => client,
-            None => self.identify_with(ctx, features),
+            None => self.identify(ctx),
         };
         let qname = ApName::from_uncompressed_wire(scanned.qname);
         let (log, stat) = self.filter.load().client_log_stat(&client);

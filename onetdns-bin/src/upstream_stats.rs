@@ -2,8 +2,13 @@
  * @brief 업스트림 통계를 파일에 저장하고 다시 시작할 때 읽는다.
  */
 
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+use onetdns_core::MutexExt;
+
 use crate::atomic_file::atomic_write;
-use crate::read_text_limited;
+use crate::{read_text_limited, sleep_or_shutdown};
 
 /** @brief 업스트림 성적을 담아 둘 파일 이름. */
 const UPSTREAM_STATS_FILE: &str = "upstream-stats.json";
@@ -160,6 +165,32 @@ pub(crate) fn load_upstream_stats(
         return vec![];
     };
     reports
+}
+
+/**
+ * @brief 업스트림 성적을 주기마다 파일에 쓰는 스레드를 띄운다.
+ * @details 전달 경로가 없어도 띄운다. 핫 적용이 나중에 전달 리졸버를 만들면 그 통계가 이 슬롯에
+ *          들어온다. 종료 신호를 받으면 한 번 더 쓰고 끝난다.
+ */
+pub(crate) fn spawn_flush(
+    path: std::path::PathBuf,
+    stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
+    flush_secs: u64,
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let flush_secs = flush_secs.max(1);
+    std::thread::Builder::new()
+        .name("upstream-stats-flush".into())
+        .spawn(move || loop {
+            let stop = sleep_or_shutdown(flush_secs, &shutdown);
+            let snapshot = stats.lock_recover().as_ref().map(|h| h.snapshot());
+            if let Some(reports) = snapshot {
+                save_upstream_stats(&path, &reports);
+            }
+            if stop {
+                break;
+            }
+        })
 }
 
 #[cfg(test)]

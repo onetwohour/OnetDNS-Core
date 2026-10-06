@@ -27,8 +27,8 @@ use crate::filters::{
 };
 use crate::listeners::{PreparedTls, TlsSlots};
 use crate::native_config::{
-    build_authority_settings, build_policy_engine, build_views, evaluate_lane_gates,
-    reconfigure_native_features, runtime_access_control, runtime_rate_limiters, telemetry_consumed,
+    build_authority_settings, build_native_features, build_policy_engine, build_views,
+    evaluate_lane_gates, runtime_access_control, runtime_rate_limiters, telemetry_consumed,
     DynamicAccessControl, DynamicRateLimiter, LaneFacts, NativeHotState,
 };
 use crate::notify::NotifyTargets;
@@ -72,7 +72,7 @@ impl<'a> Undo<'a> {
 }
 
 /** @brief 통계와 질의 기록을 저장할 설정. 경로가 비어 있으면 저장하지 않는다. */
-fn persist_opts(cfg: &Config) -> onetdns_control::PersistOpts {
+pub(crate) fn persist_opts(cfg: &Config) -> onetdns_control::PersistOpts {
     onetdns_control::PersistOpts {
         querylog_file: cfg
             .querylog_file
@@ -160,7 +160,7 @@ struct Prepared {
     filter: Option<onetdns_filter::BlockEngine>,
     /** @brief 새 전달 리졸버와 그 통계. */
     forward: Option<(Arc<dyn native::Resolver>, onetdns_forward::ForwardStats)>,
-    /** @brief 새 기능 세트. */
+    /** @brief 새 설정으로 만든 기능 세트. 질의 처리기가 아직 없으면 없다. */
     native: Option<native::NativeFeatures>,
     /** @brief 새 정책 엔진. */
     policy: Option<Arc<onetdns_policy::PolicyEngine>>,
@@ -190,12 +190,16 @@ struct Effects {
     chain: Option<PreparedChain>,
 }
 
-/** @brief 이 그룹들 중 하나라도 바뀌면 질의 처리기 상태가 있어야 한다. */
+/**
+ * @brief 이 그룹들 중 하나라도 바뀌면 질의 처리기 상태가 있어야 한다.
+ * @details 클러스터 그룹은 DNS Cookie 서버 비밀이 클러스터 비밀에서 나오기 때문에 든다.
+ */
 fn needs_native_state(groups: &[ApplyGroup]) -> bool {
     groups.iter().any(|group| {
         matches!(
             *group,
             ApplyGroup::Chain
+                | ApplyGroup::Cluster
                 | ApplyGroup::Forward
                 | ApplyGroup::Native
                 | ApplyGroup::Policy
@@ -222,7 +226,7 @@ impl HotApplyDeps {
         // 처리하고 웹 화면을 닫아 버린다.
         let next = &normalize_config_for_comparison(&previous_cfg, next);
 
-        let changed = config_changed_keys(&previous_cfg, next)?;
+        let changed = config_changed_keys(&previous_cfg, next);
         if !service_restart_keys(&previous_cfg, next, &changed).is_empty() {
             return Ok((false, changed));
         }
@@ -230,7 +234,7 @@ impl HotApplyDeps {
         let groups = hot_reload_groups(&previous_cfg, next, &changed);
 
         // hot-apply:begin
-        let Some(prepared) = self.prepare(&previous_cfg, next, &groups, &changed)? else {
+        let Some(prepared) = self.prepare(&previous_cfg, next, &groups)? else {
             return Ok((false, changed));
         };
         let mut prepared = prepared;
@@ -259,7 +263,6 @@ impl HotApplyDeps {
         previous: &Config,
         next: &Config,
         groups: &[ApplyGroup],
-        changed: &[String],
     ) -> Result<Option<Box<Prepared>>, String> {
         let HotApplyDeps {
             restarts:
@@ -291,14 +294,10 @@ impl HotApplyDeps {
             ..
         } = self;
 
-        let native_state = if needs_native_state(groups) {
-            let Some(state) = native_hot_state.lock_recover().clone() else {
-                return Ok(None);
-            };
-            Some(state)
-        } else {
-            None
-        };
+        let native_state = native_hot_state.lock_recover().clone();
+        if native_state.is_none() && needs_native_state(groups) {
+            return Ok(None);
+        }
         // 교체할 작업이 아직 서지 않았으면 재시작하는 쪽이 안전하다.
         let listeners = if groups.contains(&ApplyGroup::Listeners) {
             let Some(sync) = listener_sync.lock_recover().clone() else {
@@ -385,10 +384,11 @@ impl HotApplyDeps {
             None
         };
         let native = match &native_state {
-            Some(state) if groups.contains(&ApplyGroup::Native) => Some(
-                reconfigure_native_features(&state.features.load(), next, changed)?,
-            ),
-            _ => None,
+            Some(state) => Some(build_native_features(
+                next,
+                Some((previous, &state.features.load())),
+            )?),
+            None => None,
         };
         let policy = if groups.contains(&ApplyGroup::Policy) {
             Some(Arc::new(build_policy_engine(next)?))
@@ -747,33 +747,6 @@ impl HotApplyDeps {
             *forward_stats.lock_recover() = Some(stats);
         }
         if let Some(state) = &native_state {
-            if let Some(features) = native {
-                state
-                    .local_only_names
-                    .set(next.domain_needed, next.bogus_priv, next.empty_zones);
-                state.features.store(Arc::new(features));
-                if changed
-                    .iter()
-                    .any(|key| LOCAL_ONLY_CONFIG_KEYS.contains(&key.as_str()))
-                {
-                    let flushed = cache_slot
-                        .lock_recover()
-                        .as_ref()
-                        .map(|cache| cache.clear())
-                        .unwrap_or(0);
-                    onetdns_core::info!(
-                        event = "cache.flushed_for_local_only",
-                        flushed,
-                        "Cleared the response cache because local-only name handling changed"
-                    );
-                }
-            }
-            if let Some(policy) = policy {
-                state.policy.store(policy);
-            }
-            if let Some(views) = views {
-                state.views.store(Arc::new(views));
-            }
             if groups.contains(&ApplyGroup::BlockTtl) {
                 state
                     .block_ttl
@@ -781,19 +754,6 @@ impl HotApplyDeps {
             }
             if groups.contains(&ApplyGroup::LocalTtl) {
                 state.local_ttl.store(next.local_ttl, Ordering::Release);
-            }
-            if groups.iter().any(|group| {
-                matches!(
-                    *group,
-                    ApplyGroup::Chain
-                        | ApplyGroup::Forward
-                        | ApplyGroup::Native
-                        | ApplyGroup::Policy
-                        | ApplyGroup::Views
-                        | ApplyGroup::LocalTtl
-                )
-            }) {
-                state.wire_epoch.fetch_add(1, Ordering::AcqRel);
             }
         }
         if groups.contains(&ApplyGroup::Acl) {
@@ -834,26 +794,53 @@ impl HotApplyDeps {
         }
 
         runtime_cfg.store(Arc::new(next.clone()));
-        if let (Some(chain), Some(prepared), Some(state)) = (chain, effects.chain, &native_state) {
-            let installed = chain.chain.install(prepared);
-            chain.slot.replace(installed.resolver);
-            state.handler.replace_lane_runtime(
-                wirecache::WireEntryFactory::new(next.min_ttl as u32, next.max_ttl as u32),
-                installed.cache,
-                installed.recursor,
-                !next.ddr_name.is_empty(),
-            );
-            onetdns_core::info!(
-                event = "chain.rebuilt",
-                "Rebuilt and swapped the resolver chain; DNS kept answering"
-            );
-        }
+        let chain_generation = match (chain, effects.chain) {
+            (Some(chain), Some(prepared)) => {
+                let installed = chain.chain.install(prepared);
+                chain.slot.replace(installed.resolver);
+                onetdns_core::info!(
+                    event = "chain.rebuilt",
+                    "Rebuilt and swapped the resolver chain; DNS kept answering"
+                );
+                Some((installed.cache, installed.recursor))
+            }
+            _ => None,
+        };
 
-        // 빠른 경로는 지어질 때의 설정을 전제로 답한다. 설정이 바뀌었으면 무엇이
-        // 바뀌었든 조건을 다시 보고 스위치를 맞춘다. 이것을 빼면 캐시를 껐는데도
-        // 이전 답이 계속 나가고, 켠 기능이 없는 것처럼 답한다.
-        if let Some(state) = native_hot_state.lock_recover().as_ref() {
-            let gates = evaluate_lane_gates(
+        /*
+         * 빠른 경로가 읽는 값은 응답을 바꾸는 상태를 모두 바꾼 뒤 마지막에 한 번 게시한다.
+         * 체인 세대만 먼저 보이면 새 캐시에 이전 조건으로 만든 답이 담기고, wire 세대가 먼저
+         * 오르면 그 뒤에 이전 상태로 만든 항목이 새 태그를 단다. 어느 키가 바뀌었든 조건은
+         * 다시 판정한다. 경로를 닫는 키가 여러 그룹에 흩어져 있기 때문이다.
+         */
+        let native_state = native_state.or_else(|| native_hot_state.lock_recover().clone());
+        if let Some(state) = native_state {
+            let local_only_changed = native.is_some()
+                && changed
+                    .iter()
+                    .any(|key| LOCAL_ONLY_CONFIG_KEYS.contains(&key.as_str()));
+            if native.is_some() {
+                state
+                    .local_only_names
+                    .set(next.domain_needed, next.bogus_priv, next.empty_zones);
+            }
+            if let Some(policy) = policy {
+                state.policy.store(policy);
+            }
+            if let Some(views) = views {
+                state.views.store(Arc::new(views));
+            }
+            let current = state.features.load();
+            let mut features = native.unwrap_or_else(|| (*current).clone());
+            match chain_generation {
+                Some((cache, recursor)) => features.adopt_chain(
+                    wirecache::WireEntryFactory::new(next.min_ttl as u32, next.max_ttl as u32),
+                    cache,
+                    recursor,
+                ),
+                None => features.lane_runtime = current.lane_runtime.clone(),
+            }
+            features.lanes = evaluate_lane_gates(
                 next,
                 &LaneFacts {
                     dhcp_pool: dhcp_slot.lock_recover().is_some(),
@@ -861,16 +848,47 @@ impl HotApplyDeps {
                     policy_present: state.policy.present(),
                 },
             );
-            if state
-                .lane_switch
-                .set(gates.wire, gates.authority, gates.reactor)
-            {
+            let responses_changed = groups.iter().any(|group| {
+                matches!(
+                    *group,
+                    ApplyGroup::Chain
+                        | ApplyGroup::Forward
+                        | ApplyGroup::Native
+                        | ApplyGroup::Policy
+                        | ApplyGroup::Views
+                        | ApplyGroup::LocalTtl
+                )
+            });
+            features.wire_epoch = if responses_changed {
+                current.wire_epoch.wrapping_add(1)
+            } else {
+                current.wire_epoch
+            };
+            let lanes = features.lanes;
+            state.features.store(Arc::new(features));
+            if lanes != current.lanes {
                 onetdns_core::debug!(
                     event = "do53.lane_switch",
-                    wire = gates.wire,
-                    authority = gates.authority,
-                    reactor = gates.reactor,
+                    wire = lanes.wire,
+                    authority = lanes.authority,
+                    reactor = lanes.reactor,
                     "Reopened and closed fast paths for the changed configuration"
+                );
+            }
+            /*
+             * 비우기는 게시한 뒤에 한다. 먼저 비우면 그 사이 이전 조건으로 맡은 레인의 답이 비운
+             * 뒤의 캐시 세대로 담긴다.
+             */
+            if local_only_changed {
+                let flushed = cache_slot
+                    .lock_recover()
+                    .as_ref()
+                    .map(|cache| cache.clear())
+                    .unwrap_or(0);
+                onetdns_core::info!(
+                    event = "cache.flushed_for_local_only",
+                    flushed,
+                    "Cleared the response cache because local-only name handling changed"
                 );
             }
         }

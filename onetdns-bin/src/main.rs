@@ -77,6 +77,8 @@ mod osnet;
 mod privdrop;
 /** @brief 질의 판정 미리 보기와 설명. */
 mod query_explain;
+/** @brief DoQ·DoH3 가 함께 쓰는 연결 테이블과 수신 반복. */
+mod quic_listener;
 /** @brief DoQ·DoH3 전역 연결 메모리 예산. */
 mod quic_memory;
 /** @brief 질의 처리 워커 풀. */
@@ -148,26 +150,22 @@ use onetdns_config::{
 use onetdns_core::{AccessControl, RateLimiter};
 use onetdns_filter::SharedFilter;
 
-use cluster::{ensure_raft_runtime, spawn_resign_timer, stop_raft, RaftProcessCleanup};
-use secondary::spawn_secondary_refresh;
-use zone_signing::{spawn_zsk_rollover, zone_is_split_key, zsk_path_for, ZoneKeyReload};
-use zones::{
-    build_zone_store, replace_zone_store, zone_file_mtimes, zone_source_specs,
-    zones_with_edited_files, ZoneState, ZONE_FILE_WATCH_SECS,
-};
+use cluster::{raft_restart, spawn_resign_timer, RaftProcessCleanup};
+use secondary::refresh_restart;
+use zone_signing::rollover_restart;
+use zones::{configured_zone_files, spawn_zone_file_watch, zone_source_specs, ZoneState};
 
 use atomic_file::{atomic_write, atomic_write_secret};
 use cli::{parse_args, Command, ServiceAction};
 use config_apply::{
-    backend_uses_forward, config_write_lock, install_restart, ChainRebuild, HotConfigApply,
-    RestartHooks, SecondaryRestart,
+    backend_uses_forward, install_restart, ChainRebuild, RestartHooks, SecondaryRestart,
 };
 use config_edit::{rewrite_config_kv, toml_quote};
 use ctl::{ctl_add, ctl_reload, ctl_stats, ctl_top};
-use edge::{edge_service_preflight, reconcile_edge_services, spawn_lease_sync, EdgeServices};
+use edge::{edge_service_preflight, lease_sync_restart, reconcile_edge_services, EdgeServices};
 use filters::blocklist_host_resolver;
 use listeners::{
-    reconcile_dnscrypt, reconcile_listeners, ListenerSet, TlsSlots, TLS_CERT_WATCH_SECS,
+    reconcile_dnscrypt, reconcile_listeners, spawn_tls_cert_watch, ListenerSet, TlsSlots,
 };
 use native_config::{
     build_authority_settings, build_native_features, build_policy_engine, build_views,
@@ -177,7 +175,7 @@ use native_config::{
 };
 use recursion::load_configured_trust_anchors;
 use tls_material::{gen_cert, load_client_ca};
-use upstream_stats::{load_upstream_stats, save_upstream_stats, upstream_stats_path};
+use upstream_stats::{load_upstream_stats, upstream_stats_path};
 
 /**
  * @brief 사람과 상대 서버에게 내보이는 프로그램 이름. 실행 파일 이름도 이것이다.
@@ -902,6 +900,77 @@ fn track_service_thread(
         .push(thread);
 }
 
+/**
+ * @brief 설정이 바뀌면 멈추고 새 설정으로 다시 띄우는 작업들. 묶음마다 종료 신호를 따로 가진다.
+ * @invariant 세대가 끝나면 spawn_retire 의 스레드가 모든 묶음에 신호를 보낸다. 묶음을 더하면서
+ *            그 스레드에 넣지 않으면 그 작업이 다음 세대까지 남는다.
+ */
+#[derive(Clone)]
+struct GenerationJobs {
+    /** @brief DHCP, DHCPv6, 라우터 광고, TFTP. */
+    edge: Arc<EdgeServices>,
+    /** @brief 재귀 리졸버에 딸린 보조 작업들. 재귀 리졸버를 다시 만들 때 이전 것을 멈춘다. */
+    recursor: Arc<EdgeServices>,
+    /**
+     * @brief 웹 관리 리스너. 주소가 바뀌면 새로 시작하고 이전 것을 멈춘다.
+     * @details 세대를 넘어 이어지므로 재시작하는 동안에도 이전 스레드가 계속 연결을 받는다.
+     */
+    control: Arc<EdgeServices>,
+    /** @brief 세컨더리 영역 갱신 작업. */
+    secondary: Arc<EdgeServices>,
+    /** @brief DHCP 임대 동기화. */
+    lease_sync: Arc<EdgeServices>,
+    /** @brief ZSK 교체 작업. 영역 목록이나 주기가 바뀌면 멈추고 재시작한다. */
+    zsk_rollover: Arc<EdgeServices>,
+}
+
+impl GenerationJobs {
+    /** @brief 관리 리스너 작업만 앞 세대 것을 이어받고 나머지는 새로 만든다. */
+    fn new(control: Arc<EdgeServices>) -> Self {
+        Self {
+            edge: Arc::default(),
+            recursor: Arc::default(),
+            control,
+            secondary: Arc::default(),
+            lease_sync: Arc::default(),
+            zsk_rollover: Arc::default(),
+        }
+    }
+
+    /**
+     * @brief 세대가 끝나면 등록된 서비스 신호를 모두 보내는 스레드를 띄운다.
+     * @details 이것이 없으면 그 스레드들이 남아 포트를 잡은 채로 다음 세대가 뜬다.
+     */
+    fn spawn_retire(
+        &self,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        reload: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        use std::sync::atomic::Ordering;
+        let jobs = self.clone();
+        std::thread::Builder::new()
+            .name("edge-retire".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                jobs.edge.retire_all();
+                jobs.recursor.retire_all();
+                /*
+                 * 재시작하는 중이면 관리 수신 스레드는 그대로 둔다. 여기서 멈추면 새 세대가 자기
+                 * 것을 시작할 때까지 웹 화면에 닿을 길이 없다. 이전 스레드는 새 세대의 관리
+                 * 리스너 재시작 함수가 자기 것을 시작한 뒤에 멈춘다.
+                 */
+                if !reload.load(Ordering::Relaxed) {
+                    jobs.control.retire_all();
+                }
+                jobs.secondary.retire_all();
+                jobs.lease_sync.retire_all();
+                jobs.zsk_rollover.retire_all();
+            })
+    }
+}
+
 #[derive(Clone, Default)]
 /** @brief 세대가 바뀌어도 살아남는 것들. 제어 리스너와 로그인 상태가 그렇다. */
 pub struct ServeShared {
@@ -959,6 +1028,192 @@ fn reuse_control_listener(
 /** @brief 세대마다 하나씩 늘어나는 관리 리스너 이름표. 세대가 다르면 새로 시작한다. */
 static CONTROL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+impl ServeShared {
+    /**
+     * @brief 지표 기록기와 저장소를 이 세대 설정으로 연다.
+     * @details 앞 세대가 연 것이 있으면 설정만 바꿔 이어 쓴다. 통계와 질의 기록이 다시 읽기를
+     *          넘어 이어지는 것은 이 때문이다.
+     */
+    fn open_metrics(
+        &self,
+        cfg: &Config,
+    ) -> BoxResult<(onetdns_control::Recorder, onetdns_control::Stats)> {
+        let persist_opts = hot_apply::persist_opts(cfg);
+        let mut slot = self.metrics.lock_recover();
+        if let Some((recorder, stats)) = slot.as_ref() {
+            onetdns_core::info!(
+                event = "stats.channel_reused",
+                "Applying the new configuration while keeping existing statistics and query log"
+            );
+            recorder.reconfigure(
+                cfg.querylog,
+                cfg.anonymize_client_ip,
+                cfg.querylog_ignored.clone(),
+                cfg.querylog_size.max(1),
+                cfg.querylog_retention_secs,
+                cfg.stats_retention_secs,
+            );
+            stats.reconfigure_persist(persist_opts.clone()).with_context(|| {
+                "Could not start the DNS service because the new statistics or query log storage settings cannot be used"
+            })?;
+            onetdns_core::info!(
+                event = "stats.persistence_reconfigured",
+                querylog_file = ?persist_opts.querylog_file,
+                stats_file = ?persist_opts.stats_file,
+                flush_secs = persist_opts.flush_secs,
+                "Updated storage settings for statistics and the query log"
+            );
+            return Ok((recorder.clone(), stats.clone()));
+        }
+        let pair = onetdns_control::channel(
+            1024,
+            cfg.querylog_size.max(1),
+            cfg.querylog_retention_secs,
+            onetdns_control::RecorderOpts {
+                querylog: cfg.querylog,
+                anonymize: cfg.anonymize_client_ip,
+                ignored: cfg.querylog_ignored.clone(),
+                stats_retention_secs: cfg.stats_retention_secs,
+            },
+            persist_opts,
+        );
+        pair.1.flush_persisted().with_context(|| {
+            "Could not start management because the statistics or query log file cannot be used"
+        })?;
+        onetdns_core::debug!(
+            event = "stats.channel_created",
+            querylog_capacity = cfg.querylog_size.max(1),
+            history_retention_secs = cfg.stats_retention_secs,
+            "Started collecting statistics"
+        );
+        *slot = Some((pair.0.clone(), pair.1.clone()));
+        Ok(pair)
+    }
+
+    /**
+     * @brief 이 세대의 관리 API 상태를 만든다.
+     * @details 토큰과 계정은 이 세대 설정으로 만들고, 로그인 상태와 감사 기록은 앞 세대 것을
+     *          이어 쓴다.
+     */
+    fn control_state(
+        &self,
+        cfg: &Config,
+        stats: onetdns_control::Stats,
+        controls: onetdns_control::Controls,
+        readiness: Arc<std::sync::atomic::AtomicBool>,
+        proxy: Arc<ArcSwap<onetdns_control::ProxyPolicy>>,
+    ) -> BoxResult<onetdns_control::AppState> {
+        let mut admin = cfg.control_admin_tokens.clone();
+        if !cfg.control_token.is_empty() {
+            admin.push(cfg.control_token.clone());
+        }
+        let auth = onetdns_control::Auth::new(admin, cfg.control_readonly_tokens.clone())
+            .with_users(build_user_creds(cfg).map_err(|error| crate::anyhow!(error))?)
+            .with_sessions(self.sessions.clone());
+        let audit = self
+            .audit
+            .lock_recover()
+            .get_or_insert_with(|| onetdns_control::AuditLog::new(1000))
+            .clone();
+        Ok(onetdns_control::AppState {
+            stats,
+            auth: Arc::new(auth),
+            audit,
+            controls: Arc::new(controls),
+            readiness,
+            proxy,
+        })
+    }
+
+    /**
+     * @brief 관리 리스너를 설정에 맞추는 함수를 만든다.
+     * @details 만들 때 이 세대의 이름표를 하나 받는다. 주소가 같아도 세대가 다르면 새로 시작해야
+     *          한다. 이전 스레드는 앞 세대의 데이터 플레인을 가지고 있기 때문이다.
+     */
+    fn control_restart(&self, state: onetdns_control::AppState) -> SecondaryRestart {
+        let jobs = self.control_jobs.clone();
+        let shared_slot = self.control_listener.clone();
+        let generation = CONTROL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Arc::new(move |next: &Config| -> Result<(), String> {
+            let Some(addr) = next.control_listen else {
+                /* 주소를 지웠으면 리스너를 세우기만 한다. 재시작할 이유가 없다. */
+                let mut running = jobs.running.lock_recover();
+                let had = !running.is_empty();
+                for (_, old) in running.iter() {
+                    old.store(true, std::sync::atomic::Ordering::Release);
+                }
+                running.clear();
+                *shared_slot.lock_recover() = None;
+                if had {
+                    onetdns_core::info!(
+                        event = "control.stopped",
+                        "control_listen was removed; closed the dashboard and API"
+                    );
+                }
+                return Ok(());
+            };
+            let key = format!("{addr}#{generation}");
+            if jobs
+                .running
+                .lock_recover()
+                .iter()
+                .any(|(have, _)| have == &key)
+            {
+                return Ok(());
+            }
+            if !addr.ip().is_loopback() {
+                onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "Management API is listening on a non-loopback address; check your firewall and access control");
+            }
+            let listener = match reuse_control_listener(&shared_slot, addr) {
+                Some(listener) => listener,
+                None => TcpListener::bind(addr).map_err(|error| {
+                    format!("Could not open the dashboard listening address: {addr}: {error}")
+                })?,
+            };
+            *shared_slot.lock_recover() = match listener.try_clone() {
+                Ok(clone) => Some(clone),
+                Err(error) => {
+                    onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "Could not hand the management socket over to the next configuration; the port must be reopened on reload");
+                    None
+                }
+            };
+            let bound = listener.local_addr().map_err(|error| {
+                format!("Could not read the dashboard listening address: {addr}: {error}")
+            })?;
+            /*
+             * 새 리스너를 시작한 뒤에 이전 것을 멈춘다. 지금 처리 중인 응답은 이전 리스너가
+             * 끝까지 보낸다.
+             */
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = state.clone();
+            let listener_stop = stop.clone();
+            let thread = std::thread::Builder::new()
+                .name("onetdns-control".into())
+                .spawn(move || {
+                    if let Err(error) =
+                        onetdns_control::serve_listener(listener, state, listener_stop)
+                    {
+                        onetdns_core::error!(event = "control.stopped", %error, "Stopped the dashboard service");
+                    }
+                })
+                .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
+            /*
+             * 이 세대의 정리 목록에 넣지 않는다. 재시작하는 동안 살아 있어야 하므로 여기서
+             * 기다리면 세대 정리가 끝나지 않는다. 멈추는 일은 다음 세대나 종료 전파가 맡는다.
+             */
+            drop(thread);
+            let mut running = jobs.running.lock_recover();
+            for (_, old) in running.iter() {
+                old.store(true, std::sync::atomic::Ordering::Release);
+            }
+            running.clear();
+            running.push((key, stop));
+            onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API");
+            Ok(())
+        })
+    }
+}
+
 /** @brief 재귀일 때 코어당 UDP 워커 수. */
 const RECURSIVE_UDP_WORKERS_PER_CPU: usize = 5;
 
@@ -1010,18 +1265,12 @@ pub fn serve(
     onetdns_forward::set_query_source(cfg.query_source, cfg.query_source_v6);
 
     let restarts = RestartHooks::default();
+    /*
+     * 인증서는 교체 가능한 슬롯에 넣는다. 인증서를 갈아도 수신 소켓은 그대로 두고 다음 연결부터
+     * 새 인증서를 쓴다.
+     */
     let tls_slot_handle: Arc<Mutex<Option<Arc<TlsSlots>>>> = Arc::new(Mutex::new(None));
-    // 재귀 리졸버에 딸린 보조 작업들. 재귀 리졸버를 다시 만들 때 이전 것을 멈춘다.
-    let recursor_jobs = Arc::new(EdgeServices::default());
-    // 웹 관리 리스너. 주소가 바뀌면 새로 시작하고 이전 것을 멈춘다. 세대를 넘어 이어지므로
-    // 재시작하는 동안에도 이전 스레드가 계속 연결을 받는다.
-    let control_jobs = shared.control_jobs.clone();
-    // 보조 영역 갱신 작업. 설정이 바뀌면 이전 것을 멈추고 새 설정으로 재시작한다.
-    let secondary_jobs = Arc::new(EdgeServices::default());
-    // 임대 정보 동기화와 Raft. 설정이 바뀌면 멈추고 새 설정으로 재시작한다.
-    let lease_sync_jobs = Arc::new(EdgeServices::default());
-    // ZSK 교체 작업. 영역 목록이나 주기가 바뀌면 멈추고 재시작한다.
-    let zsk_rollover_jobs = Arc::new(EdgeServices::default());
+    let jobs = GenerationJobs::new(shared.control_jobs.clone());
     onetdns_core::info!(event = "serve.starting", mode = ?cfg.mode, backend = ?cfg.backend, "Starting DNS server");
 
     let reload = Arc::new(AtomicBool::new(false));
@@ -1050,28 +1299,22 @@ pub fn serve(
     };
 
     if let Some(stats_path) = upstream_stats_path(config_path.as_deref()) {
-        let handle = forward_stats.clone();
-        let sd = shutdown.clone();
-        let flush = cfg.persist_flush_secs.max(1);
-        let thread = std::thread::Builder::new()
-            .name("upstream-stats-flush".into())
-            .spawn(move || loop {
-                let stop = sleep_or_shutdown(flush, &sd);
-                let snapshot = handle.lock_recover().as_ref().map(|h| h.snapshot());
-                if let Some(reports) = snapshot {
-                    save_upstream_stats(&stats_path, &reports);
-                }
-                if stop {
-                    break;
-                }
-            })
-            .with_context(|| "Could not start the upstream DNS server statistics writer thread")?;
-        service_cleanup.track(thread);
+        service_cleanup.track(
+            upstream_stats::spawn_flush(
+                stats_path,
+                forward_stats.clone(),
+                cfg.persist_flush_secs,
+                shutdown.clone(),
+            )
+            .with_context(|| "Could not start the upstream DNS server statistics writer thread")?,
+        );
     }
 
-    // 이름을 푸는 데 쓰는 업스트림 서버와 루트 힌트는 무중단으로 바뀐다. 시작할 때 만든 것을
-    // 그대로 계속 가지고 있으면 주소를 바꿔도 목록은 계속 이전 서버에서 받아 온다. 겉은 그대로 두고
-    // 속만 교체한다.
+    /*
+     * 이름을 푸는 데 쓰는 업스트림 서버와 루트 힌트는 무중단으로 바뀐다. 시작할 때 만든 것을
+     * 그대로 계속 가지고 있으면 주소를 바꿔도 목록은 계속 이전 서버에서 받아 온다. 겉은 그대로 두고
+     * 속만 교체한다.
+     */
     let blocklist_resolver_slot: Arc<Mutex<http::HostResolver>> =
         Arc::new(Mutex::new(blocklist_host_resolver(&cfg)));
     let blocklist_resolver: http::HostResolver = {
@@ -1101,206 +1344,50 @@ pub fn serve(
         );
     }
 
-    let edge_services = Arc::new(EdgeServices::default());
     let dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>> = Arc::new(Mutex::new(None));
     let dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<dhcp6::Lease6Pool>>>>> = Arc::new(Mutex::new(None));
-    reconcile_edge_services(&cfg, &edge_services, &dhcp_slot, &dhcp6_slot)
+    reconcile_edge_services(&cfg, &jobs.edge, &dhcp_slot, &dhcp6_slot)
         .map_err(std::io::Error::other)?;
-    {
-        // 세대가 끝나면 등록된 서비스 신호를 모두 보낸다. 이것이 없으면 그 스레드들이 남아
-        // 포트를 잡은 채로 다음 세대가 뜬다.
-        let services = edge_services.clone();
-        let recursor_jobs_for_retire = recursor_jobs.clone();
-        let control_jobs_for_retire = control_jobs.clone();
-        let secondary_jobs_for_retire = secondary_jobs.clone();
-        let lease_sync_jobs_for_retire = lease_sync_jobs.clone();
-        let zsk_rollover_jobs_for_retire = zsk_rollover_jobs.clone();
-        let sd = shutdown.clone();
-        let rl = reload.clone();
-        let thread = std::thread::Builder::new()
-            .name("edge-retire".into())
-            .spawn(move || {
-                while !sd.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                services.retire_all();
-                recursor_jobs_for_retire.retire_all();
-                // 재시작하는 중이면 관리 수신 스레드는 그대로 둔다. 여기서 멈추면 새
-                // 세대가 자기 것을 시작할 때까지 웹 화면에 닿을 길이 없다. 이전 스레드는
-                // 새 세대의 control_rebind가 자기 것을 시작한 뒤에 멈춘다.
-                if !rl.load(Ordering::Relaxed) {
-                    control_jobs_for_retire.retire_all();
-                }
-                secondary_jobs_for_retire.retire_all();
-                lease_sync_jobs_for_retire.retire_all();
-                zsk_rollover_jobs_for_retire.retire_all();
-            })
+    service_cleanup.track(
+        jobs.spawn_retire(shutdown.clone(), reload.clone())
             .with_context(|| {
                 "Could not start the task that propagates shutdown to edge services"
-            })?;
-        service_cleanup.track(thread);
-    }
+            })?,
+    );
 
     install_restart(
         &restarts.lease_sync,
-        {
-            let jobs = lease_sync_jobs.clone();
-            let slot = dhcp_slot.clone();
-            let resolver = blocklist_resolver.clone();
-            let tracker = service_cleanup.tracker();
-            Arc::new(move |next: &Config| -> Result<(), String> {
-                let stop = jobs.restart_all();
-                let Some(pool) = slot.lock_recover().clone() else {
-                    return Ok(());
-                };
-                if next.cluster_peers.is_empty() || next.control_token.is_empty() {
-                    return Ok(());
-                }
-                let thread = spawn_lease_sync(
-                    pool,
-                    next.cluster_peers.clone(),
-                    next.control_token.clone(),
-                    resolver.clone(),
-                    stop,
-                )
-                .map_err(|error| format!("Could not start the DHCP lease sync thread: {error}"))?;
-                if let Some(thread) = thread {
-                    track_service_thread(&tracker, thread);
-                }
-                onetdns_core::info!(
-                    event = "dhcp.lease_sync_started",
-                    peers = next.cluster_peers.len(),
-                    "Starting DHCP lease sync (every 30 seconds)"
-                );
-                Ok(())
-            }) as SecondaryRestart
-        },
+        lease_sync_restart(
+            jobs.lease_sync.clone(),
+            dhcp_slot.clone(),
+            blocklist_resolver.clone(),
+            service_cleanup.tracker(),
+        ),
         &cfg,
     )
     .map_err(std::io::Error::other)?;
 
     install_revocation_policy(&cfg, &blocklist_resolver);
 
-    let dns64_prefix_bytes: Option<[u8; 16]> = cfg.dns64_prefix.as_ref().and_then(|s| {
-        let ip_part = s.split('/').next()?;
-        let v6: std::net::Ipv6Addr = ip_part.parse().ok()?;
-        let mut o = v6.octets();
-        o[12..16].fill(0);
-        Some(o)
-    });
-    if dns64_prefix_bytes.is_some() {
-        onetdns_core::info!(event = "dns64.enabled", prefix = ?cfg.dns64_prefix, "Synthesizing AAAA from A for IPv6-only networks");
-    }
-    if cfg.rebind_protection {
-        onetdns_core::info!(
-            event = "rebind.protection_enabled",
-            "DNS rebinding protection is on; private addresses in outside answers are filtered"
-        );
-    }
-    if cfg.safe_search {
-        onetdns_core::info!(
-            event = "safesearch.forced",
-            "Enforcing SafeSearch on search engines"
-        );
-    }
-
     let acl_state = Arc::new(DynamicAccessControl::new(runtime_access_control(&cfg)));
     let acl: Arc<dyn AccessControl> = acl_state.clone();
     let rate_state = Arc::new(DynamicRateLimiter::new(runtime_rate_limiters(&cfg)));
     let rate_limiters: Vec<Arc<dyn RateLimiter>> = vec![rate_state.clone()];
-    onetdns_core::info!(event = "serve.protections_summary",
-        acl_allow = cfg.acl_allow.len(),
-        acl_deny = cfg.acl_deny.len(),
-        rate_layers = rate_state.layer_count(),
-        cookies = ?cfg.cookies,
-        mtls = cfg.tls_authenticated(),
-        "Applied access control and rate limits"
-    );
-
-    for warning in cfg.open_resolver_warnings() {
-        onetdns_core::warn!(
-            event = "security.open_resolver_warning",
-            security = "open-resolver",
-            detail = %warning,
-            "Check the configuration of this publicly reachable recursive resolver"
-        );
-    }
-    // 조건이 맞지 않아 동작하지 않을 항목들. 설정을 막지 않고 알리기만 한다.
-    for advisory in cfg.advisories() {
-        onetdns_core::warn!(
-            event = "config.advisory",
-            detail = %advisory,
-            "Setting saved, but it has no effect under the current conditions"
-        );
-    }
+    log_generation_settings(&cfg, &rate_state);
 
     let tsig_keys = build_tsig_keys(&cfg).map_err(|error| crate::anyhow!(error))?;
 
     let native_hot_state: Arc<Mutex<Option<NativeHotState>>> = Arc::new(Mutex::new(None));
     let zones = ZoneState::start(&cfg, &tsig_keys, &shutdown, &service_cleanup)?;
-
-    // 인증서 갱신은 설정을 건드리지 않고 같은 경로의 내용만 바꾼다. 영역 파일과 같은
-    // 이유로 파일 쪽을 주기적으로 본다. 갱신 도구가 이 서버에 아무것도 알리지 않아도
-    // 다음 연결부터 새 인증서를 쓴다.
-    {
-        let watch_cfg = runtime_cfg.clone();
-        let watch_slots = tls_slot_handle.clone();
-        let watch_stop = shutdown.clone();
-        let thread = std::thread::Builder::new()
-            .name("tls-cert-watch".into())
-            .spawn(move || {
-                let mut last_error: Option<String> = None;
-                loop {
-                    if sleep_or_shutdown(TLS_CERT_WATCH_SECS, &watch_stop) {
-                        break;
-                    }
-                    let Some(slots) = watch_slots.lock_recover().clone() else {
-                        continue;
-                    };
-                    match slots.refresh_certificate_files(&watch_cfg.load()) {
-                        Ok(swapped) => {
-                            last_error = None;
-                            if !swapped.is_empty() {
-                                onetdns_core::info!(
-                                    event = "tls.certificate_reloaded",
-                                    changed = %swapped.join(","),
-                                    "Replaced the TLS certificate without closing listening addresses"
-                                );
-                            }
-                        }
-                        // 갱신 도구가 파일을 쓰는 중이면 한두 번은 읽기에 실패한다. 같은
-                        // 실패를 반복해 적으면 기록이 그것으로 덮인다.
-                        Err(error) => {
-                            if last_error.as_deref() != Some(error.as_str()) {
-                                onetdns_core::warn!(
-                                    event = "tls.certificate_reload_failed",
-                                    %error,
-                                    "Could not read the renewed TLS certificate; keeping the previous one"
-                                );
-                                last_error = Some(error);
-                            }
-                        }
-                    }
-                }
-            })
-            .with_context(|| "Could not start the TLS certificate watch task")?;
-        service_cleanup.track(thread);
-    }
-
-    let resign_zone_files = cfg
-        .zones
-        .iter()
-        .map(|zone| {
-            let origin = onetdns_proto::Name::from_str(&zone.origin)
-                .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))?;
-            let file = zone
-                .file
-                .clone()
-                .ok_or_else(|| format!("DNS zone '{}' has no file setting", zone.origin))?;
-            Ok((origin, file))
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|error| crate::anyhow!(error))?;
+    service_cleanup.track(
+        spawn_tls_cert_watch(
+            runtime_cfg.clone(),
+            tls_slot_handle.clone(),
+            shutdown.clone(),
+        )
+        .with_context(|| "Could not start the TLS certificate watch task")?,
+    );
+    let resign_zone_files = configured_zone_files(&cfg).map_err(|error| crate::anyhow!(error))?;
     if let Some(thread) = spawn_resign_timer(
         zones.signers.clone(),
         zones.store.clone(),
@@ -1313,120 +1400,37 @@ pub fn serve(
     {
         service_cleanup.track(thread);
     }
-    let reload_zone_keys: ZoneKeyReload = {
-        let runtime = runtime_cfg.clone();
-        let signers = zones.signers.clone();
-        let store_slot = zones.store.clone();
-        let journal = zones.journal.clone();
-        let hot_state = native_hot_state.clone();
-        let notify = zones.notify.clone();
-        Arc::new(
-            move |rolled: &[onetdns_proto::Name]| -> Result<(), String> {
-                let _write_guard = config_write_lock().lock_recover();
-                let cfg = runtime.load();
-                let settings = build_authority_settings(&cfg)?;
-                let native = hot_state.lock_recover().clone();
-                // 원본을 다시 읽는 동안에도 영역 변경 잠금을 잡는다. 읽은 뒤에 들어온 동적 갱신은
-                // 새 저장소에 없으므로, 교체하면 그 갱신이 사라진다.
-                let mut journals = journal.lock_recover();
-                let store = build_zone_store(&cfg, &settings.tsig_keys, &settings.zone_signers)?;
-                signers.store(Arc::new(settings.zone_signers.clone()));
-                if let Some(state) = native.as_ref() {
-                    state.authority.store(Arc::new(settings));
-                }
-                for origin in rolled {
-                    if let Some(zone) = store.zone_exact(origin) {
-                        notify.enqueue(origin, zone.soa().serial);
-                    }
-                }
-                replace_zone_store(&store_slot, &mut journals, Arc::new(store));
-                Ok(())
-            },
+    let reload_zone_keys = zones.reload_from_config(&runtime_cfg, &native_hot_state);
+    service_cleanup.track(
+        spawn_zone_file_watch(
+            runtime_cfg.clone(),
+            reload_zone_keys.clone(),
+            shutdown.clone(),
         )
-    };
-    // 설정에 직접 적은 영역 파일도 zones_dir 의 파일과 똑같이 편집된다. 여기서 보지 않으면
-    // 직렬 번호를 올려도 이 서버가 옛 영역을 계속 답하고, 세컨더리는 변경을 영영 못 받는다.
-    // 원본 하나만 바꿔 끼우지 않고 설정 전체로 다시 만드는 이유는, 서명과 TSIG, ZONEMD
-    // 정책이 그 경로에만 있기 때문이다.
-    {
-        let watch_cfg = runtime_cfg.clone();
-        let watch_reload = reload_zone_keys.clone();
-        let watch_stop = shutdown.clone();
-        let thread = std::thread::Builder::new()
-            .name("zones-file-watch".into())
-            .spawn(move || {
-                let mut seen: std::collections::HashMap<PathBuf, std::time::SystemTime> =
-                    zone_file_mtimes(&watch_cfg.load());
-                loop {
-                    if sleep_or_shutdown(ZONE_FILE_WATCH_SECS, &watch_stop) {
-                        break;
-                    }
-                    let cfg = watch_cfg.load();
-                    let now = zone_file_mtimes(&cfg);
-                    let origins = zones_with_edited_files(&cfg, &seen, &now);
-                    if origins.is_empty() {
-                        seen = now;
-                        continue;
-                    }
-                    match watch_reload(&origins) {
-                        Ok(()) => {
-                            seen = now;
-                            onetdns_core::info!(
-                                event = "authority.zones_reloaded_file",
-                                zones = origins.len(),
-                                "Reloaded changed zone files and replaced the running zones"
-                            );
-                        }
-                        // mtime 을 남겨 두면 다음 주기에 다시 시도한다. 편집 도중의 반쪽 파일은
-                        // 그렇게 저절로 회복된다.
-                        Err(error) => onetdns_core::warn!(
-                            event = "authority.zone_file_reload_failed",
-                            %error,
-                            "Could not read the changed zone file; still answering from the previous zone"
-                        ),
-                    }
-                }
-            })
-            .with_context(|| "Could not start the DNS zone file watch task")?;
-        service_cleanup.track(thread);
-    }
-
+        .with_context(|| "Could not start the DNS zone file watch task")?,
+    );
     install_restart(
         &restarts.zsk_rollover,
-        {
-            let jobs = zsk_rollover_jobs.clone();
-            let reload_zone_keys = reload_zone_keys.clone();
-            let tracker = service_cleanup.tracker();
-            Arc::new(move |next: &Config| -> Result<(), String> {
-                let stop = jobs.restart_all();
-                let zones = next
-                    .zones
-                    .iter()
-                    .filter(|zone| zone.dnssec_sign && zone_is_split_key(zone))
-                    .map(|zone| {
-                        onetdns_proto::Name::from_str(&zone.origin)
-                            .map(|origin| (origin, zsk_path_for(zone)))
-                            .map_err(|_| format!("Invalid DNS zone name: {}", zone.origin))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let thread = spawn_zsk_rollover(
-                    zones,
-                    next.dnssec_roll_interval_secs,
-                    reload_zone_keys.clone(),
-                    stop,
-                )
-                .map_err(|error| {
-                    format!("Could not start the DNSSEC ZSK rollover thread: {error}")
-                })?;
-                if let Some(thread) = thread {
-                    track_service_thread(&tracker, thread);
-                }
-                Ok(())
-            }) as SecondaryRestart
-        },
+        rollover_restart(
+            jobs.zsk_rollover.clone(),
+            reload_zone_keys,
+            service_cleanup.tracker(),
+        ),
         &cfg,
     )
     .map_err(std::io::Error::other)?;
+    let notify_kick = Arc::new(native::NotifyKick::default());
+    install_restart(
+        &restarts.secondary,
+        refresh_restart(
+            jobs.secondary.clone(),
+            &zones,
+            notify_kick.clone(),
+            service_cleanup.tracker(),
+        ),
+        &cfg,
+    )
+    .map_err(|error| crate::anyhow!(error))?;
     let policy_engine = Arc::new(native::GatedSwap::new(Arc::new(
         build_policy_engine(&cfg).map_err(std::io::Error::other)?,
     )));
@@ -1435,274 +1439,87 @@ pub fn serve(
 
     let config_prev = shared.previous_config_text.clone();
     let applied_config_text = shared.applied_config_text.clone();
-    let raft_hot_apply: Option<HotConfigApply>;
 
-    // 컨트롤 플레인은 수신 주소가 없어도 만들어 둔다. 주소를 나중에 넣어도 그때 리스너만 열면
-    // 되도록 하기 위해서다. 주소가 없으면 리스너를 시작하지 않을 뿐이다.
-    let recorder = {
-        let persist_opts = onetdns_control::PersistOpts {
-            querylog_file: cfg
-                .querylog_file
-                .clone()
-                .filter(|p| !p.as_os_str().is_empty()),
-            stats_file: cfg.stats_file.clone().filter(|p| !p.as_os_str().is_empty()),
-            flush_secs: cfg.persist_flush_secs,
-        };
-        let (recorder, stats) = {
-            let mut slot = shared.metrics.lock_recover();
-            if let Some((recorder, stats)) = slot.as_ref() {
-                onetdns_core::info!(
-                    event = "stats.channel_reused",
-                    "Applying the new configuration while keeping existing statistics and query log"
-                );
-                recorder.reconfigure(
-                    cfg.querylog,
-                    cfg.anonymize_client_ip,
-                    cfg.querylog_ignored.clone(),
-                    cfg.querylog_size.max(1),
-                    cfg.querylog_retention_secs,
-                    cfg.stats_retention_secs,
-                );
-                stats.reconfigure_persist(persist_opts.clone()).with_context(|| {
-                    "Could not start the DNS service because the new statistics or query log storage settings cannot be used"
-                })?;
-                onetdns_core::info!(
-                    event = "stats.persistence_reconfigured",
-                    querylog_file = ?persist_opts.querylog_file,
-                    stats_file = ?persist_opts.stats_file,
-                    flush_secs = persist_opts.flush_secs,
-                    "Updated storage settings for statistics and the query log"
-                );
-                (recorder.clone(), stats.clone())
-            } else {
-                let pair = onetdns_control::channel(
-                    1024,
-                    cfg.querylog_size.max(1),
-                    cfg.querylog_retention_secs,
-                    onetdns_control::RecorderOpts {
-                        querylog: cfg.querylog,
-                        anonymize: cfg.anonymize_client_ip,
-                        ignored: cfg.querylog_ignored.clone(),
-                        stats_retention_secs: cfg.stats_retention_secs,
-                    },
-                    persist_opts.clone(),
-                );
-                pair.1.flush_persisted().with_context(|| {
-                    "Could not start management because the statistics or query log file cannot be used"
-                })?;
-                onetdns_core::debug!(
-                    event = "stats.channel_created",
-                    querylog_capacity = cfg.querylog_size.max(1),
-                    history_retention_secs = cfg.stats_retention_secs,
-                    "Started collecting statistics"
-                );
-                *slot = Some((pair.0.clone(), pair.1.clone()));
-                pair
-            }
-        };
-        recorder.set_collecting(telemetry_consumed(&cfg));
+    let (recorder, stats) = shared.open_metrics(&cfg)?;
+    recorder.set_collecting(telemetry_consumed(&cfg));
 
-        let jobs = shared.jobs.clone();
+    /*
+     * 컨트롤 플레인 인증은 이 뒤에서 만들어진다. 계정만 바뀌었을 때 DNS를 건드리지 않고
+     * 목록만 교체하려면 그 핸들이 필요하므로 슬롯을 먼저 잡아 둔다.
+     */
+    let console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>> = Arc::new(Mutex::new(None));
+    let control_proxy = Arc::new(ArcSwap::from_pointee(control_proxy_policy(&cfg)));
 
-        // 컨트롤 플레인 인증은 이 뒤에서 만들어진다. 계정만 바뀌었을 때 DNS를 건드리지 않고
-        // 목록만 교체하려면 그 핸들이 필요하므로 슬롯을 먼저 잡아 둔다.
-        let console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>> =
-            Arc::new(Mutex::new(None));
-        let control_proxy = Arc::new(ArcSwap::from_pointee(control_proxy_policy(&cfg)));
-
-        let hot_config_apply = hot_apply::build(hot_apply::HotApplyDeps {
-            restarts: restarts.clone(),
-            zones: zones.clone(),
-            filters: filters.clone(),
-            console_auth: console_auth.clone(),
-            control_proxy: control_proxy.clone(),
-            runtime_cfg: runtime_cfg.clone(),
-            acl_state: acl_state.clone(),
-            rate_state: rate_state.clone(),
-            recorder: recorder.clone(),
-            forward_slot: forward_slot.clone(),
-            forward_stats: forward_stats.clone(),
-            native_hot_state: native_hot_state.clone(),
-            stats: stats.clone(),
-            zone_shutdown: shutdown.clone(),
-            zone_threads: service_cleanup.tracker(),
-            edge_services: edge_services.clone(),
-            dhcp_slot: dhcp_slot.clone(),
-            dhcp6_slot: dhcp6_slot.clone(),
-            tls_slots: tls_slot_handle.clone(),
-            vendor_db: vendor_db.clone(),
-            blocklist_resolver_slot: blocklist_resolver_slot.clone(),
-            blocklist_resolver: blocklist_resolver.clone(),
-            cache_slot: cache_slot.clone(),
-        });
-        raft_hot_apply = Some(hot_config_apply.clone());
-
-        let controls = control_api::build(control_api::ControlDeps {
-            zones: zones.clone(),
-            filters: filters.clone(),
-            runtime_cfg: runtime_cfg.clone(),
-            config_path: config_path.clone(),
-            cfg_text: cfg_text.clone(),
-            reload: reload.clone(),
-            config_prev: config_prev.clone(),
-            applied_config_text: applied_config_text.clone(),
-            hot_config_apply: hot_config_apply.clone(),
-            policy_engine: policy_engine.clone(),
-            blocklist_resolver: blocklist_resolver.clone(),
-            dhcp_slot: dhcp_slot.clone(),
-            dhcp6_slot: dhcp6_slot.clone(),
-            vendor_db: vendor_db.clone(),
-            cache_slot: cache_slot.clone(),
-            forward_stats: forward_stats.clone(),
-            listener_reg: listener_reg.clone(),
-            tls_slot_handle: tls_slot_handle.clone(),
-            jobs: jobs.clone(),
-            service_threads: service_cleanup.tracker(),
-        });
-        let state = onetdns_control::AppState {
-            stats,
-            auth: Arc::new(
-                onetdns_control::Auth::new(
-                    {
-                        let mut admin = cfg.control_admin_tokens.clone();
-                        if !cfg.control_token.is_empty() {
-                            admin.push(cfg.control_token.clone());
-                        }
-                        admin
-                    },
-                    cfg.control_readonly_tokens.clone(),
-                )
-                .with_users(build_user_creds(&cfg).map_err(|error| crate::anyhow!(error))?)
-                .with_sessions(shared.sessions.clone()),
-            ),
-            audit: {
-                let mut slot = shared.audit.lock_recover();
-                slot.get_or_insert_with(|| onetdns_control::AuditLog::new(1000))
-                    .clone()
-            },
-            controls: Arc::new(controls),
-            readiness: readiness.clone(),
-            proxy: control_proxy,
-        };
-        *console_auth.lock_recover() = Some(state.auth.clone());
-        issue_setup_code(&state.auth, config_path.as_deref());
-        let state_for_control = state;
-
-        install_restart(&restarts.control, {
-            let jobs = control_jobs.clone();
-            let shared_slot = shared.control_listener.clone();
-            // 이 세대를 나타내는 이름. 주소가 같아도 세대가 다르면 새로 시작해야 한다 --
-            // 이전 스레드는 앞 세대의 데이터 플레인을 가지고 있기 때문이다.
-            let generation = CONTROL_GENERATION.fetch_add(1, Ordering::Relaxed);
-            Arc::new(move |next: &Config| -> Result<(), String> {
-                let Some(addr) = next.control_listen else {
-                    // 주소를 지웠으면 리스너를 세우기만 한다. 재시작할 이유가 없다.
-                    let mut running = jobs.running.lock_recover();
-                    let had = !running.is_empty();
-                    for (_, old) in running.iter() {
-                        old.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    running.clear();
-                    *shared_slot.lock_recover() = None;
-                    if had {
-                        onetdns_core::info!(
-                            event = "control.stopped",
-                            "control_listen was removed; closed the dashboard and API"
-                        );
-                    }
-                    return Ok(());
-                };
-                let key = format!("{addr}#{generation}");
-                if jobs
-                    .running
-                    .lock_recover()
-                    .iter()
-                    .any(|(have, _)| have == &key)
-                {
-                    return Ok(());
-                }
-                if !addr.ip().is_loopback() {
-                    onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "Management API is listening on a non-loopback address; check your firewall and access control");
-                }
-                let listener = match reuse_control_listener(&shared_slot, addr) {
-                    Some(listener) => listener,
-                    None => TcpListener::bind(addr).map_err(|error| {
-                        format!("Could not open the dashboard listening address: {addr}: {error}")
-                    })?,
-                };
-                *shared_slot.lock_recover() = match listener.try_clone() {
-                    Ok(clone) => Some(clone),
-                    Err(error) => {
-                        onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "Could not hand the management socket over to the next configuration; the port must be reopened on reload");
-                        None
-                    }
-                };
-                let bound = listener.local_addr().map_err(|error| {
-                    format!("Could not read the dashboard listening address: {addr}: {error}")
-                })?;
-                // 새 리스너를 시작한 뒤에 이전 것을 멈춘다. 지금 처리 중인 응답은 이전 리스너가
-                // 끝까지 보낸다.
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let state = state_for_control.clone();
-                let listener_stop = stop.clone();
-                let thread = std::thread::Builder::new()
-                    .name("onetdns-control".into())
-                    .spawn(move || {
-                        if let Err(error) =
-                            onetdns_control::serve_listener(listener, state, listener_stop)
-                        {
-                            onetdns_core::error!(event = "control.stopped", %error, "Stopped the dashboard service");
-                        }
-                    })
-                    .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
-                // 이 세대의 정리 목록에 넣지 않는다. 재시작하는 동안 살아 있어야 하므로
-                // 여기서 기다리면 세대 정리가 끝나지 않는다. 멈추는 일은 다음 세대나
-                // 종료 전파가 맡는다.
-                drop(thread);
-                let mut running = jobs.running.lock_recover();
-                for (_, old) in running.iter() {
-                    old.store(true, std::sync::atomic::Ordering::Release);
-                }
-                running.clear();
-                running.push((key, stop));
-                onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API");
-                Ok(())
-            }) as SecondaryRestart
-        }, &cfg)
-        .map_err(std::io::Error::other)?;
-        Some(recorder)
-    };
-
-    let start_raft = {
-        let path = config_path.clone();
-        let prev = config_prev.clone();
-        let applied = applied_config_text.clone();
-        let reload = reload.clone();
-        let hot = raft_hot_apply.clone();
-        Arc::new(
-            move |next: &Config, expected_text: Option<&str>| -> Result<(), String> {
-                // 언제나 먼저 멈춘다. 켜져 있는 채로 재시작하면 수신 주소가 겹친다.
-                stop_raft();
-                if !next.cluster_raft || next.cluster_node_id == 0 {
-                    return Ok(());
-                }
-                ensure_raft_runtime(
-                    next,
-                    expected_text,
-                    path.clone(),
-                    prev.clone(),
-                    applied.clone(),
-                    reload.clone(),
-                    hot.clone(),
-                )
-            },
-        )
-    };
-    *restarts.raft.lock_recover() = Some({
-        let start_raft = start_raft.clone();
-        Arc::new(move |next: &Config| start_raft(next, None)) as SecondaryRestart
+    let hot_config_apply = hot_apply::build(hot_apply::HotApplyDeps {
+        restarts: restarts.clone(),
+        zones: zones.clone(),
+        filters: filters.clone(),
+        console_auth: console_auth.clone(),
+        control_proxy: control_proxy.clone(),
+        runtime_cfg: runtime_cfg.clone(),
+        acl_state: acl_state.clone(),
+        rate_state: rate_state.clone(),
+        recorder: recorder.clone(),
+        forward_slot: forward_slot.clone(),
+        forward_stats: forward_stats.clone(),
+        native_hot_state: native_hot_state.clone(),
+        stats: stats.clone(),
+        zone_shutdown: shutdown.clone(),
+        zone_threads: service_cleanup.tracker(),
+        edge_services: jobs.edge.clone(),
+        dhcp_slot: dhcp_slot.clone(),
+        dhcp6_slot: dhcp6_slot.clone(),
+        tls_slots: tls_slot_handle.clone(),
+        vendor_db: vendor_db.clone(),
+        blocklist_resolver_slot: blocklist_resolver_slot.clone(),
+        blocklist_resolver: blocklist_resolver.clone(),
+        cache_slot: cache_slot.clone(),
     });
-    start_raft(&cfg, cfg_text.as_deref()).map_err(std::io::Error::other)?;
+
+    /*
+     * 컨트롤 플레인은 수신 주소가 없어도 만들어 둔다. 주소를 나중에 넣어도 그때 리스너만 열면
+     * 되도록 하기 위해서다. 주소가 없으면 리스너를 시작하지 않을 뿐이다.
+     */
+    let controls = control_api::build(control_api::ControlDeps {
+        zones: zones.clone(),
+        filters: filters.clone(),
+        runtime_cfg: runtime_cfg.clone(),
+        config_path: config_path.clone(),
+        cfg_text: cfg_text.clone(),
+        reload: reload.clone(),
+        config_prev: config_prev.clone(),
+        applied_config_text: applied_config_text.clone(),
+        hot_config_apply: hot_config_apply.clone(),
+        policy_engine: policy_engine.clone(),
+        blocklist_resolver: blocklist_resolver.clone(),
+        dhcp_slot: dhcp_slot.clone(),
+        dhcp6_slot: dhcp6_slot.clone(),
+        vendor_db: vendor_db.clone(),
+        cache_slot: cache_slot.clone(),
+        forward_stats: forward_stats.clone(),
+        listener_reg: listener_reg.clone(),
+        tls_slot_handle: tls_slot_handle.clone(),
+        jobs: shared.jobs.clone(),
+        service_threads: service_cleanup.tracker(),
+    });
+    let state = shared.control_state(&cfg, stats, controls, readiness.clone(), control_proxy)?;
+    *console_auth.lock_recover() = Some(state.auth.clone());
+    issue_setup_code(&state.auth, config_path.as_deref());
+    install_restart(&restarts.control, shared.control_restart(state), &cfg)
+        .map_err(std::io::Error::other)?;
+
+    let restart_raft = raft_restart(
+        config_path.clone(),
+        config_prev,
+        applied_config_text,
+        reload.clone(),
+        Some(hot_config_apply),
+    );
+    *restarts.raft.lock_recover() = Some({
+        let restart_raft = restart_raft.clone();
+        Arc::new(move |next: &Config| restart_raft(next, None)) as SecondaryRestart
+    });
+    restart_raft(&cfg, cfg_text.as_deref()).map_err(std::io::Error::other)?;
 
     let mac_cache = if cfg.clients.iter().any(|c| !c.mac.is_empty()) {
         let cache = mac::NeighborCache::new();
@@ -1720,210 +1537,25 @@ pub fn serve(
         None
     };
 
-    let local_only_names = Arc::new(layers::LocalOnlyNames::new(
-        cfg.domain_needed,
-        cfg.bogus_priv,
-        cfg.empty_zones,
-    ));
-
-    let native_handler: Arc<native::NativeServer> = {
-        let timeout = Duration::from_secs(cfg.query_timeout_secs);
-        let block_ttl = Arc::new(std::sync::atomic::AtomicU32::new(cfg.blocked_response_ttl));
-        let local_ttl = Arc::new(std::sync::atomic::AtomicU32::new(cfg.local_ttl));
-        let local_only_names = local_only_names.clone();
-        let split_local_wire_cache = Arc::new(std::sync::OnceLock::new());
-
-        let plan = resolver_chain::ChainPlan::new(&cfg);
-
-        let default_chain = Arc::new(resolver_chain::DefaultChain {
-            base: resolver_chain::ResolverBase {
-                forward_slot: forward_slot.clone(),
-                recurse: resolver_chain::RecursiveBase {
-                    block_ttl: block_ttl.clone(),
-                    filter: filters.filter.clone(),
-                    local_ttl: local_ttl.clone(),
-                    thread_tracker: service_cleanup.tracker(),
-                    shutdown: shutdown.clone(),
-                },
-            },
-            layers: resolver_chain::ChainLayers {
-                block_ttl: block_ttl.clone(),
-                dhcp_slot: dhcp_slot.clone(),
-                local_ttl: local_ttl.clone(),
-                local_only_names: local_only_names.clone(),
-                recorder: recorder.clone(),
-                shutdown: shutdown.clone(),
-                split_local_wire_cache: split_local_wire_cache.clone(),
-                zone_store: zones.store.clone(),
-            },
-            cache_slot: cache_slot.clone(),
-            recursor_jobs: recursor_jobs.clone(),
-        });
-        let resolver_chain::InstalledChain {
-            resolver: chain,
-            recursor: lane_recursor,
-            anchors: recursor_anchors,
-            shared_cache,
-            ..
-        } = default_chain.install(
-            default_chain
-                .prepare(&plan)
-                .map_err(|error| crate::anyhow!(error))?,
-        );
-
-        let client_upstreams: Vec<native::ClientUpstream> =
-            build_client_upstream_routes(&cfg, timeout)
-                .map_err(|e| crate::anyhow!(e))?
-                .into_iter()
-                .map(|mut route| {
-                    let kind = resolver_chain::ChainBase::Route {
-                        upstreams: route.namespace_key(),
-                        anchors: recursor_anchors.clone(),
-                    };
-                    route.resolver = default_chain
-                        .layers
-                        .wrap_common_layers(
-                            &plan,
-                            route.resolver,
-                            false,
-                            false,
-                            kind,
-                            shared_cache.as_ref(),
-                        )?
-                        .0;
-                    Ok(route)
-                })
-                .collect::<Result<_, String>>()
-                .map_err(|e| crate::anyhow!(e))?;
-
-        let notify_kick = Arc::new(native::NotifyKick::default());
-        install_restart(
-            &restarts.secondary,
-            {
-                let jobs = secondary_jobs.clone();
-                let store = zones.store.clone();
-                let journal = zones.journal.clone();
-                let kick = notify_kick.clone();
-                let sender = zones.notify.clone();
-                let tracker = service_cleanup.tracker();
-                Arc::new(move |next: &Config| -> Result<(), String> {
-                    let stop = jobs.restart_all();
-                    if next.secondary.is_empty() && next.catalog.is_empty() {
-                        return Ok(());
-                    }
-                    let keys = build_tsig_keys(next)?;
-                    let thread = spawn_secondary_refresh(
-                        next.clone(),
-                        keys,
-                        store.clone(),
-                        journal.clone(),
-                        kick.clone(),
-                        sender.clone(),
-                        stop,
-                    )
-                    .map_err(|error| {
-                        format!("Could not start the secondary zone refresh task: {error}")
-                    })?;
-                    track_service_thread(&tracker, thread);
-                    Ok(())
-                }) as SecondaryRestart
-            },
-            &cfg,
-        )
-        .map_err(|error| crate::anyhow!(error))?;
-        let views = build_views(&cfg).map_err(|error| crate::anyhow!(error))?;
-
-        // 빠른 경로 구조는 조건과 무관하게 만들어 둔다. 조건 판정은 스위치가 맡으므로
-        // 설정이 바뀌면 스위치만 올리고 내리면 되고, 소켓과 스레드는 그대로 둔다.
-        let authority_wire_path = Some(zones.store.clone());
-
-        let wire_fast_path = cache_slot.lock_recover().clone().map(|response_cache| {
-            let _ = split_local_wire_cache.set(response_cache.clone());
-            (
-                wirecache::WireEntryFactory::new(cfg.min_ttl as u32, cfg.max_ttl as u32),
-                response_cache,
-            )
-        });
-
-        let lane_facts = LaneFacts {
-            dhcp_pool: dhcp_slot.lock_recover().is_some(),
-            views_present: !views.is_empty(),
-            policy_present: policy_engine.present(),
-        };
-        let lane_gates = evaluate_lane_gates(&cfg, &lane_facts);
-
-        // 해석 체인을 교체 가능한 슬롯에 넣어 넘긴다. 설정이 바뀌면 체인만 새로 만들어
-        // 교체하면 되므로 스레드와 소켓을 내렸다 올릴 이유가 없어진다.
-        let chain_slot = Arc::new(native::ResolverSlot::new(chain));
-        *restarts.chain.lock_recover() = Some(ChainRebuild {
-            chain: default_chain,
-            slot: (*chain_slot).clone(),
-        });
-
-        let mut native_server = native::NativeServer::new(
-            filters.filter.clone(),
-            acl.clone(),
-            rate_limiters.clone(),
-            chain_slot.clone(),
-            cfg.blocked_response_ttl,
-        )
-        .with_ttl_sources(block_ttl, local_ttl)
-        .with_client_upstreams(client_upstreams)
-        .with_features(build_native_features(
-            &cfg,
-            dns64_prefix_bytes,
-            filters.safe_search.clone(),
-            recorder.clone(),
-            mac_cache.clone(),
-        )?)
-        .with_policy(policy_engine.clone())
-        .with_xfr(zones.store.clone(), Vec::new())
-        .with_notify_kick(notify_kick)
-        .with_journal(zones.journal.clone())
-        .with_views(views)
-        .with_authority_wire_path(authority_wire_path, recursion_offered_by(&cfg))
-        .with_wire_fast_path(wire_fast_path);
-        native_server.replace_authority(
-            build_authority_settings(&cfg).map_err(|error| crate::anyhow!(error))?,
-        );
-        {
-            let notify = zones.notify.clone();
-            native_server = native_server.with_update_notify(Arc::new(move |origin, serial| {
-                notify.enqueue(origin, serial)
-            }));
-        }
-        if let Some(ch) = cache_slot.lock_recover().clone() {
-            native_server = native_server.with_reactor_lane_runtime(lane_recursor, ch, 32);
-        }
-        let _ = native_server.lane_switch.set(
-            lane_gates.wire,
-            lane_gates.authority,
-            lane_gates.reactor,
-        );
-        onetdns_core::debug!(
-            event = "do53.lane_switch",
-            wire = lane_gates.wire,
-            authority = lane_gates.authority,
-            reactor = lane_gates.reactor,
-            "Decided fast-path eligibility"
-        );
-        Arc::new(native_server)
-    };
-    *native_hot_state.lock_recover() = Some(NativeHotState {
-        handler: native_handler.clone(),
-        features: native_handler.features.clone(),
-        policy: native_handler.policy.clone(),
-        views: native_handler.views.clone(),
-        block_ttl: native_handler.block_ttl.clone(),
-        local_ttl: native_handler.local_ttl.clone(),
-        local_only_names: local_only_names.clone(),
-        wire_epoch: native_handler.wire_epoch.clone(),
-        lane_switch: native_handler.lane_switch.clone(),
-        authority: native_handler.authority.clone(),
-    });
-
-    // 인증서는 교체 가능한 슬롯에 넣는다. 인증서를 갈아도 수신 소켓은 그대로 두고 다음
-    // 연결부터 새 인증서를 쓴다.
+    let (native_handler, native_state) = build_native_server(NativeDeps {
+        cfg: &cfg,
+        chain_restart: &restarts.chain,
+        forward_slot,
+        filters: &filters,
+        zones: &zones,
+        dhcp_slot,
+        cache_slot,
+        recursor_jobs: jobs.recursor.clone(),
+        recorder: Some(recorder),
+        acl,
+        rate_limiters,
+        mac_cache,
+        policy_engine,
+        notify_kick,
+        shutdown: shutdown.clone(),
+        threads: service_cleanup.tracker(),
+    })?;
+    *native_hot_state.lock_recover() = Some(native_state);
 
     let listeners = Arc::new(ListenerSet::default());
     install_restart(
@@ -1949,21 +1581,7 @@ pub fn serve(
 
     #[cfg(target_os = "linux")]
     if let Some(user) = cfg.run_as_user.as_deref() {
-        /** @brief 권한 내려놓기를 한 번만 하게 한다. */
-        static DROP_ONCE: std::sync::Once = std::sync::Once::new();
-        let mut drop_result: Option<Result<(), String>> = None;
-        DROP_ONCE.call_once(|| {
-            let r = privdrop::drop_privileges(user, cfg.run_as_group.as_deref());
-            if r.is_ok() {
-                onetdns_core::info!(
-                    event = "privdrop.applied",
-                    user,
-                    "Dropped user and group privileges and blocked further privilege gain"
-                );
-            }
-            drop_result = Some(r);
-        });
-        if let Some(Err(e)) = drop_result {
+        if let Some(Err(e)) = privdrop::drop_privileges_once(user, cfg.run_as_group.as_deref()) {
             return Err(crate::anyhow!(format!(
                 "Stopping the service because process privileges could not be dropped: {e}"
             )));
@@ -1992,42 +1610,11 @@ pub fn serve(
         blocklist_resolver.clone(),
     );
 
-    let reloaded = loop {
-        if external_stop
-            .as_ref()
-            .is_some_and(|s| s.load(Ordering::Relaxed))
-        {
-            onetdns_core::info!(
-                event = "server.shutdown_requested",
-                reason = "external_signal",
-                "Received an external shutdown signal"
-            );
-            break false;
-        }
-        if reload.load(Ordering::Relaxed) {
-            onetdns_core::info!(
-                event = "server.restart_requested",
-                reason = "config_change",
-                "Restarting the DNS service to apply configuration changes"
-            );
-            break true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    let reloaded = wait_for_stop_or_reload(&reload, external_stop.as_deref());
 
     readiness.store(false, Ordering::Release);
     shutdown.store(true, Ordering::Relaxed);
-    for (_, server) in listeners.plain.lock_recover().drain(..) {
-        server.shutdown();
-    }
-    listeners.dot.lock_recover().clear();
-    listeners.doh.lock_recover().clear();
-    listeners.doq.lock_recover().clear();
-    listeners.doh3.lock_recover().clear();
-    for (_, stop, tcp) in listeners.dnscrypt.lock_recover().drain(..) {
-        stop.store(true, Ordering::Release);
-        drop(tcp);
-    }
+    listeners.close_all();
 
     service_cleanup.shutdown_and_join();
     std::thread::sleep(Duration::from_millis(500));
@@ -2037,6 +1624,301 @@ pub fn serve(
         "Shutting down the current configuration"
     );
     Ok(reloaded)
+}
+
+/**
+ * @brief 종료 신호나 다시 읽기 요청이 올 때까지 기다린다.
+ * @return 다시 읽어야 하면 참, 끝내야 하면 거짓.
+ */
+fn wait_for_stop_or_reload(
+    reload: &std::sync::atomic::AtomicBool,
+    external_stop: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    loop {
+        if external_stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            onetdns_core::info!(
+                event = "server.shutdown_requested",
+                reason = "external_signal",
+                "Received an external shutdown signal"
+            );
+            return false;
+        }
+        if reload.load(Ordering::Relaxed) {
+            onetdns_core::info!(
+                event = "server.restart_requested",
+                reason = "config_change",
+                "Restarting the DNS service to apply configuration changes"
+            );
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/** @brief 이 세대의 보호 설정을 요약하고, 위험하거나 효과가 없는 설정을 경고로 남긴다. */
+fn log_generation_settings(cfg: &Config, rate_state: &DynamicRateLimiter) {
+    if cfg.dns64_prefix.is_some() {
+        onetdns_core::info!(event = "dns64.enabled", prefix = ?cfg.dns64_prefix, "Synthesizing AAAA from A for IPv6-only networks");
+    }
+    if cfg.rebind_protection {
+        onetdns_core::info!(
+            event = "rebind.protection_enabled",
+            "DNS rebinding protection is on; private addresses in outside answers are filtered"
+        );
+    }
+    if cfg.safe_search {
+        onetdns_core::info!(
+            event = "safesearch.forced",
+            "Enforcing SafeSearch on search engines"
+        );
+    }
+    onetdns_core::info!(event = "serve.protections_summary",
+        acl_allow = cfg.acl_allow.len(),
+        acl_deny = cfg.acl_deny.len(),
+        rate_layers = rate_state.layer_count(),
+        cookies = ?cfg.cookies,
+        mtls = cfg.tls_authenticated(),
+        "Applied access control and rate limits"
+    );
+
+    for warning in cfg.open_resolver_warnings() {
+        onetdns_core::warn!(
+            event = "security.open_resolver_warning",
+            security = "open-resolver",
+            detail = %warning,
+            "Check the configuration of this publicly reachable recursive resolver"
+        );
+    }
+    /* 조건이 맞지 않아 동작하지 않을 항목들. 설정을 막지 않고 알리기만 한다. */
+    for advisory in cfg.advisories() {
+        onetdns_core::warn!(
+            event = "config.advisory",
+            detail = %advisory,
+            "Setting saved, but it has no effect under the current conditions"
+        );
+    }
+}
+
+/** @brief 질의 처리기를 조립하는 데 드는 이 세대의 핸들. */
+struct NativeDeps<'a> {
+    /** @brief 이 세대의 설정. */
+    cfg: &'a Config,
+    /** @brief 기본 체인을 다시 만드는 핸들을 넣을 슬롯. */
+    chain_restart: &'a Mutex<Option<ChainRebuild>>,
+    /** @brief 전달 리졸버 슬롯. */
+    forward_slot: native::ResolverSlot,
+    /** @brief 차단 엔진과 그 재료. */
+    filters: &'a filter_runtime::FilterState,
+    /** @brief 권한 영역 상태. */
+    zones: &'a ZoneState,
+    /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
+    dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
+    /** @brief 응답 캐시. 기본 체인을 설치하면 채워진다. */
+    cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
+    /** @brief 재귀 리졸버에 딸린 보조 작업. */
+    recursor_jobs: Arc<EdgeServices>,
+    /** @brief 질의 기록. */
+    recorder: Option<onetdns_control::Recorder>,
+    /** @brief 접근 제어. */
+    acl: Arc<dyn AccessControl>,
+    /** @brief 속도 제한. */
+    rate_limiters: Vec<Arc<dyn RateLimiter>>,
+    /** @brief MAC 주소로 기기를 찾는 이웃 표. MAC 으로 고른 클라이언트가 없으면 없다. */
+    mac_cache: Option<Arc<mac::NeighborCache>>,
+    /** @brief 정책 엔진. */
+    policy_engine: Arc<native::GatedSwap<onetdns_policy::PolicyEngine>>,
+    /** @brief 들어온 NOTIFY 로 세컨더리 갱신을 깨운다. */
+    notify_kick: Arc<native::NotifyKick>,
+    /** @brief 이 세대의 종료 플래그. */
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /** @brief 이 세대가 끝날 때 기다릴 스레드. */
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+/**
+ * @brief 이 세대의 질의 처리기를 조립한다.
+ * @details 기본 체인을 설치하고, 클라이언트별 업스트림 경로를 같은 공통 계층으로 감싼 뒤 빠른
+ *          경로와 기능 세트를 붙인다.
+ * @return 질의 처리기와, 핫 적용이 그 처리기와 함께 교체할 상태.
+ */
+fn build_native_server(
+    deps: NativeDeps<'_>,
+) -> BoxResult<(Arc<native::NativeServer>, NativeHotState)> {
+    let NativeDeps {
+        cfg,
+        chain_restart,
+        forward_slot,
+        filters,
+        zones,
+        dhcp_slot,
+        cache_slot,
+        recursor_jobs,
+        recorder,
+        acl,
+        rate_limiters,
+        mac_cache,
+        policy_engine,
+        notify_kick,
+        shutdown,
+        threads,
+    } = deps;
+    let local_only_names = Arc::new(layers::LocalOnlyNames::new(
+        cfg.domain_needed,
+        cfg.bogus_priv,
+        cfg.empty_zones,
+    ));
+    let timeout = Duration::from_secs(cfg.query_timeout_secs);
+    let block_ttl = Arc::new(std::sync::atomic::AtomicU32::new(cfg.blocked_response_ttl));
+    let local_ttl = Arc::new(std::sync::atomic::AtomicU32::new(cfg.local_ttl));
+    let split_local_wire_cache = Arc::new(std::sync::OnceLock::new());
+
+    let plan = resolver_chain::ChainPlan::new(cfg);
+
+    let default_chain = Arc::new(resolver_chain::DefaultChain {
+        base: resolver_chain::ResolverBase {
+            forward_slot,
+            recurse: resolver_chain::RecursiveBase {
+                block_ttl: block_ttl.clone(),
+                filter: filters.filter.clone(),
+                local_ttl: local_ttl.clone(),
+                thread_tracker: threads,
+                shutdown: shutdown.clone(),
+            },
+        },
+        layers: resolver_chain::ChainLayers {
+            block_ttl: block_ttl.clone(),
+            dhcp_slot: dhcp_slot.clone(),
+            local_ttl: local_ttl.clone(),
+            local_only_names: local_only_names.clone(),
+            recorder: recorder.clone(),
+            shutdown,
+            split_local_wire_cache: split_local_wire_cache.clone(),
+            zone_store: zones.store.clone(),
+        },
+        cache_slot: cache_slot.clone(),
+        recursor_jobs,
+    });
+    let resolver_chain::InstalledChain {
+        resolver: chain,
+        recursor: lane_recursor,
+        anchors: recursor_anchors,
+        shared_cache,
+        ..
+    } = default_chain.install(
+        default_chain
+            .prepare(&plan)
+            .map_err(|error| crate::anyhow!(error))?,
+    );
+
+    let client_upstreams: Vec<native::ClientUpstream> = build_client_upstream_routes(cfg, timeout)
+        .map_err(|e| crate::anyhow!(e))?
+        .into_iter()
+        .map(|mut route| {
+            let kind = resolver_chain::ChainBase::Route {
+                upstreams: route.namespace_key(),
+                anchors: recursor_anchors.clone(),
+            };
+            route.resolver = default_chain
+                .layers
+                .wrap_common_layers(
+                    &plan,
+                    route.resolver,
+                    false,
+                    false,
+                    kind,
+                    shared_cache.as_ref(),
+                )?
+                .0;
+            Ok(route)
+        })
+        .collect::<Result<_, String>>()
+        .map_err(|e| crate::anyhow!(e))?;
+
+    let views = build_views(cfg).map_err(|error| crate::anyhow!(error))?;
+
+    /*
+     * 빠른 경로 구조는 조건과 무관하게 만들어 둔다. 조건은 기능 세트에 담기므로 설정이
+     * 바뀌면 그 세트만 교체하면 되고, 소켓과 스레드는 그대로 둔다.
+     */
+    let authority_wire_path = Some(zones.store.clone());
+
+    let wire_fast_path = cache_slot.lock_recover().clone().map(|response_cache| {
+        let _ = split_local_wire_cache.set(response_cache.clone());
+        (
+            wirecache::WireEntryFactory::new(cfg.min_ttl as u32, cfg.max_ttl as u32),
+            response_cache,
+        )
+    });
+
+    let lane_facts = LaneFacts {
+        dhcp_pool: dhcp_slot.lock_recover().is_some(),
+        views_present: !views.is_empty(),
+        policy_present: policy_engine.present(),
+    };
+    let lane_gates = evaluate_lane_gates(cfg, &lane_facts);
+    onetdns_core::debug!(
+        event = "do53.lane_switch",
+        wire = lane_gates.wire,
+        authority = lane_gates.authority,
+        reactor = lane_gates.reactor,
+        "Decided fast-path eligibility"
+    );
+    let mut features = build_native_features(cfg, None)?;
+    features.lanes = lane_gates;
+
+    /*
+     * 해석 체인을 교체 가능한 슬롯에 넣어 넘긴다. 설정이 바뀌면 체인만 새로 만들어
+     * 교체하면 되므로 스레드와 소켓을 내렸다 올릴 이유가 없어진다.
+     */
+    let chain_slot = Arc::new(native::ResolverSlot::new(chain));
+    *chain_restart.lock_recover() = Some(ChainRebuild {
+        chain: default_chain,
+        slot: (*chain_slot).clone(),
+    });
+
+    let mut native_server = native::NativeServer::new(
+        filters.filter.clone(),
+        acl,
+        rate_limiters,
+        chain_slot.clone(),
+        cfg.blocked_response_ttl,
+    )
+    .with_ttl_sources(block_ttl, local_ttl)
+    .with_client_upstreams(client_upstreams)
+    .with_features(features)
+    .with_recorder(recorder)
+    .with_mac_cache(mac_cache)
+    .with_safe_search(filters.safe_search.clone())
+    .with_policy(policy_engine)
+    .with_xfr(zones.store.clone(), Vec::new())
+    .with_notify_kick(notify_kick)
+    .with_journal(zones.journal.clone())
+    .with_views(views)
+    .with_authority_wire_path(authority_wire_path, recursion_offered_by(cfg))
+    .with_wire_fast_path(wire_fast_path);
+    native_server
+        .replace_authority(build_authority_settings(cfg).map_err(|error| crate::anyhow!(error))?);
+    {
+        let notify = zones.notify.clone();
+        native_server = native_server.with_update_notify(Arc::new(move |origin, serial| {
+            notify.enqueue(origin, serial)
+        }));
+    }
+    if let Some(ch) = cache_slot.lock_recover().clone() {
+        native_server = native_server.with_reactor_lane_runtime(lane_recursor, ch, 32);
+    }
+    let native_server = Arc::new(native_server);
+    let hot_state = NativeHotState {
+        features: native_server.features.clone(),
+        policy: native_server.policy.clone(),
+        views: native_server.views.clone(),
+        block_ttl: native_server.block_ttl.clone(),
+        local_ttl: native_server.local_ttl.clone(),
+        local_only_names,
+        authority: native_server.authority.clone(),
+    };
+    Ok((native_server, hot_state))
 }
 
 /**
@@ -3411,6 +3293,117 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap().unwrap();
         drop(occupied);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    /**
+     * @brief 해석 체인 그룹의 키를 무중단으로 바꿔도 질의마다 읽는 기능 값이 새 설정을 따르는지.
+     * @details ecs_mode 와 ecs_custom_ip 는 체인을 다시 만드는 키지만, 클라이언트가 보낸 ECS
+     *          옵션을 응답에 되돌려 줄지도 정한다. 기능 세트가 이전 설정에 머물면 ECS 를 켠 뒤에도
+     *          RFC 7871 이 요구하는 에코가 나가지 않는다.
+     */
+    fn hot_applied_chain_keys_reach_the_response_features() {
+        let dns = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "onetdns-hot-apply-features-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("OnetDNS.toml");
+        let text = format!(
+            "listen = [\"{dns}\"]\n\
+             do_tcp = false\n\
+             workers = 1\n\
+             backend = \"forward\"\n\
+             upstream_urls = [\"udp://192.0.2.1:53\"]\n\
+             block_rules = [\"||blocked.test^\"]\n\
+             control_listen = \"{control}\"\n\
+             control_token = \"hot-apply-test-token-0123456789\"\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::from_toml_str(&text).unwrap();
+
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let ready = ready.clone();
+            let stop = stop.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    Some(onetdns_core::SecretString::from(text)),
+                    Some(path),
+                    Default::default(),
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "server did not start");
+            assert!(!server.is_finished(), "server stopped before it was ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        /* 주소 계열 1(IPv4), 원본 접두사 24, 범위 접두사 0, 주소 192.0.2 */
+        let subnet = vec![0, 1, 24, 0, 192, 0, 2];
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let echoed = |id: u16| {
+            let mut query = onetdns_proto::Message::query(
+                id,
+                onetdns_proto::Name::from_str("blocked.test").unwrap(),
+                onetdns_proto::RecordType::A,
+            );
+            let mut edns = onetdns_proto::Edns::default();
+            edns.set_client_subnet(subnet.clone());
+            query.additionals.push(edns.try_to_record().unwrap());
+            client.send_to(&query.try_encode().unwrap(), dns).unwrap();
+            let mut reply = [0u8; 512];
+            let (len, _) = client.recv_from(&mut reply).unwrap();
+            let response = onetdns_proto::Message::parse(&reply[..len]).unwrap();
+            assert_eq!(response.header.id, id);
+            response
+                .opt()
+                .and_then(onetdns_proto::Edns::from_record)
+                .and_then(|edns| edns.client_subnet().map(<[u8]>::to_vec))
+        };
+        assert_eq!(
+            echoed(1),
+            None,
+            "ECS 를 쓰지 않는 동안에는 되돌려 줄 옵션이 없습니다"
+        );
+
+        let applied = control_request(
+            control,
+            "POST",
+            "/v1/config/apply",
+            "ecs_mode = \"send\"\necs_custom_ip = \"203.0.113.1\"\n",
+        );
+        assert!(applied.contains("\"mode\":\"hot_reload\""), "{applied}");
+        assert_eq!(
+            echoed(2),
+            Some(subnet.clone()),
+            "ECS 를 켠 뒤에는 클라이언트가 보낸 옵션을 SCOPE 0 으로 되돌려 줘야 합니다"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

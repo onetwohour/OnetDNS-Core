@@ -12,7 +12,7 @@
  */
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -121,8 +121,45 @@ impl Schedule {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/**
+ * @brief 세 빠른 경로 각각을 지금 써도 되는지.
+ * @details 설정과 설정 밖의 사실로 evaluate_lane_gates 가 정한다.
+ */
+pub(crate) struct LaneGates {
+    /** @brief 캐시 적중 UDP 빠른 경로. */
+    pub(crate) wire: bool,
+    /** @brief 권한 영역 단순 질의 빠른 경로. */
+    pub(crate) authority: bool,
+    /** @brief 재귀 콜드미스 리액터 레인. */
+    pub(crate) reactor: bool,
+}
+
+impl Default for LaneGates {
+    /**
+     * @brief 세 경로를 모두 연다.
+     * @details 설정으로 정하기 전의 핸들러가 쓰는 값이다. 실행 중 서버는 시작할 때와 설정을
+     *          교체할 때 evaluate_lane_gates 의 결과를 넣는다.
+     */
+    fn default() -> Self {
+        LaneGates {
+            wire: true,
+            authority: true,
+            reactor: true,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-/** @brief 켜고 끌 수 있는 기능들. 설정을 다시 읽으면 한꺼번에 교체한다. */
+/**
+ * @brief 설정 하나로 정해지는 응답 기능들. 설정을 다시 읽으면 한꺼번에 교체한다.
+ * @details 세대를 넘겨 이어 쓰는 상태는 여기 두지 않고 NativeServer 가 가진다. 처리 중 질의
+ *          수, 지표 기록기, 안전 검색 스위치가 그렇다. 여기 두면 설정을 바꿀 때마다 옮겨 담아야
+ *          하고, 빠뜨리면 그 상태가 처음으로 돌아간다.
+ * @invariant 빠른 경로는 경로 조건, 체인 세대, wire 세대를 이 값 하나에서 읽는다. 체인
+ *            세대만 먼저 바뀐 상태가 보이면 새 체인의 캐시에 이전 조건으로 만든 답이 담겨
+ *            그 수명 동안 나간다.
+ */
 pub struct NativeFeatures {
     /** @brief IPv6 주소 답을 막는다. */
     pub block_aaaa: bool,
@@ -142,23 +179,13 @@ pub struct NativeFeatures {
     pub recurse_allow_answers: Vec<IpNet>,
     /** @brief 같은 이름의 답 순서를 돌려 가며 낸다. */
     pub rrset_roundrobin: bool,
-    /** @brief 돌려 가며 낼 때의 지금 위치. */
-    pub rotor: Arc<AtomicUsize>,
-    /** @brief 안전 검색이 켜져 있는지. 시간대에 따라 바뀐다. */
-    pub safe_search: Arc<AtomicBool>,
     /** @brief 응답에 담을 서버 식별값. */
     pub nsid: Option<Vec<u8>>,
     /** @brief 쿠키 정책. */
     pub cookies: CookiePolicy,
-    /** @brief 지표 기록기. */
-    pub recorder: Option<Recorder>,
-    /** @brief 클라이언트 하드웨어 주소 조회. */
-    pub mac_cache: Option<Arc<crate::mac::NeighborCache>>,
 
     /** @brief 동시에 처리할 질의 수 상한. */
     pub inflight_max: usize,
-    /** @brief 지금 처리 중인 질의 수. */
-    pub inflight: Arc<AtomicUsize>,
 
     /** @brief 질의 기록 파일. */
     pub dnstap: Option<Arc<onetdns_control::DnstapWriter>>,
@@ -189,73 +216,54 @@ pub struct NativeFeatures {
     /** @brief 지나치게 큰 질의를 버린다. */
     pub harden_large_queries: bool,
 
-    /** @brief 점 없는 이름을 밖에 묻지 않는다. */
-    pub domain_needed: bool,
-
-    /** @brief 내부망 주소의 역조회를 밖에 묻지 않는다. */
-    pub bogus_priv: bool,
-
-    /** @brief 밖에 새 나가면 안 되는 이름을 막는다. */
-    pub empty_zones: bool,
-
     /** @brief DDR 특수 이름을 일반 해석 체인으로 보내야 하는지. */
     pub ddr_enabled: bool,
 
     /** @brief 지금 체인 세대의 캐시·재귀 리졸버. */
     pub(crate) lane_runtime: Option<Arc<LaneRuntime>>,
+    /** @brief 세 빠른 경로 각각을 지금 써도 되는지. */
+    pub(crate) lanes: LaneGates,
+    /**
+     * @brief wire 항목에 붙일 설정 세대.
+     * @details 응답을 바꾸는 설정이 바뀌면 올린다. 이전 세대에 만든 항목은 태그가 달라 다시
+     *          나가지 않는다.
+     */
+    pub(crate) wire_epoch: usize,
 }
 
 impl NativeFeatures {
     /**
-     * @brief 질의마다 기록을 남길 곳.
-     *
-     * @details 기록기가 있어도 볼 곳이 없으면 없는 것으로 답한다. 그 자리에서 만드는 이름과
-     *          시계 읽기가 질의마다 드는 비용이라, 만들어서 버릴 것이면 만들지 않아야 한다.
-     * @return 볼 곳이 있을 때만 기록기.
+     * @brief wire 항목의 태그. 차단 엔진과 설정 세대가 모두 같을 때만 같은 값이 나온다.
+     * @param filter 응답을 거른 차단 엔진.
      */
-    pub fn events(&self) -> Option<&Recorder> {
-        self.recorder.as_ref().filter(|r| r.collecting())
+    pub(crate) fn wire_tag(&self, filter: &Arc<onetdns_filter::BlockEngine>) -> usize {
+        (Arc::as_ptr(filter) as usize).rotate_left(17) ^ self.wire_epoch
     }
 
     /**
-     * @brief 권한 영역 빠른 경로를 막는 기능이 켜져 있는지.
-     * @warning 응답을 달라지게 하거나 기록을 남겨야 하는 기능이 하나라도 켜지면 참이다.
-     *          lenient 쿠키는 COOKIE 옵션이 붙은 질의만 스캐너가 물리므로 전역 차단하지
-     *          않는다. strict는 쿠키 없는 질의도 BADCOOKIE여야 하므로 전역 차단한다.
+     * @brief 빠른 경로를 새 체인 세대의 캐시와 재귀 리졸버로 옮긴다.
+     * @param factory  wire 항목의 수명 정책.
+     * @param cache    새 체인의 응답 캐시.
+     * @param recursor 새 체인의 재귀 리졸버. 전달만 하는 체인이면 없다.
      */
-    fn blocks_authority_wire(&self) -> bool {
-        self.dns64_prefix.is_some()
-            || self.rrset_roundrobin
-            || self.cookies.strict
-            || self.dnstap.is_some()
-            || self.domain_needed
-            || self.bogus_priv
-            || self.empty_zones
-            || self.block_aaaa
-            || self.padding_block > 0
-            || self.nsid.is_some()
-            || self.rebind_protection
-            || !self.bogus_nxdomain.is_empty()
-            || !self.recurse_deny_answers.is_empty()
+    pub(crate) fn adopt_chain(
+        &mut self,
+        factory: crate::wirecache::WireEntryFactory,
+        cache: crate::cache::CacheHandle,
+        recursor: Option<Arc<Recursor>>,
+    ) {
+        self.lane_runtime = Some(Arc::new(LaneRuntime {
+            factory: Some(factory),
+            cache,
+            recursor,
+        }));
     }
 }
 
-/**
- * @brief 기능 세트 전체를 교체하는 슬롯.
- * @details 자주 보는 판정은 원자 값으로 따로 둔다. 질의마다 세트 전체를 복제해 확인하면
- *          그것이 비용이다.
- */
+/** @brief 기능 세트 전체를 교체하는 슬롯. */
 pub struct NativeFeatureSwap {
     /** @brief 지금 기능 세트. */
     swap: ArcSwap<NativeFeatures>,
-    /** @brief 권한 영역 빠른 경로가 막혀 있는지. 복제 없이 답하려고 따로 둔다. */
-    authority_wire_blocked: AtomicBool,
-    /** @brief 큰 질의를 거절하는지. 복제 없이 답하려고 따로 둔다. */
-    harden_large_queries: AtomicBool,
-    /** @brief 안전 검색 여부. 시간대에 따라 밖에서 바뀐다. */
-    safe_search: Arc<AtomicBool>,
-    /** @brief 응답 OPT에 알릴 UDP 크기. 복제 없이 답하려고 따로 둔다. */
-    edns_buffer: AtomicU16,
     /** @brief 테스트에서 질의당 snapshot 수를 고정한다. 출하 코드에는 없다. */
     #[cfg(test)]
     test_loads: AtomicUsize,
@@ -264,16 +272,8 @@ pub struct NativeFeatureSwap {
 impl NativeFeatureSwap {
     /** @brief 값 하나로 만든다. */
     fn from_pointee(value: NativeFeatures) -> Self {
-        let authority_wire_blocked = value.blocks_authority_wire();
-        let harden_large_queries = value.harden_large_queries;
-        let safe_search = value.safe_search.clone();
-        let edns_buffer = value.edns_buffer;
         Self {
             swap: ArcSwap::from_pointee(value),
-            authority_wire_blocked: AtomicBool::new(authority_wire_blocked),
-            harden_large_queries: AtomicBool::new(harden_large_queries),
-            safe_search,
-            edns_buffer: AtomicU16::new(edns_buffer),
             #[cfg(test)]
             test_loads: AtomicUsize::new(0),
         }
@@ -292,51 +292,15 @@ impl NativeFeatureSwap {
         self.test_loads.swap(0, Ordering::Relaxed)
     }
 
-    /** @brief 기능 세트를 교체하고 요약 판정도 함께 맞춘다. */
+    /** @brief 기능 세트를 교체한다. */
     pub fn store(&self, value: Arc<NativeFeatures>) {
-        let authority_wire_blocked =
-            value.blocks_authority_wire() || !Arc::ptr_eq(&value.safe_search, &self.safe_search);
-        let harden_large_queries = value.harden_large_queries;
-        self.edns_buffer.store(value.edns_buffer, Ordering::Release);
-        if authority_wire_blocked {
-            self.authority_wire_blocked.store(true, Ordering::Release);
-        }
-        if harden_large_queries {
-            self.harden_large_queries.store(true, Ordering::Release);
-        }
         self.swap.store(value);
-        if !authority_wire_blocked {
-            self.authority_wire_blocked.store(false, Ordering::Release);
-        }
-        if !harden_large_queries {
-            self.harden_large_queries.store(false, Ordering::Release);
-        }
-    }
-
-    /** @brief 권한 영역 빠른 경로가 막혀 있는지. */
-    fn authority_wire_blocked(&self) -> bool {
-        self.authority_wire_blocked.load(Ordering::Acquire)
-    }
-
-    /** @brief 큰 질의를 거절하는지. */
-    fn harden_large_queries(&self) -> bool {
-        self.harden_large_queries.load(Ordering::Acquire)
-    }
-
-    /** @brief 안전 검색이 켜져 있는지. */
-    fn safe_search_enabled(&self) -> bool {
-        self.safe_search.load(Ordering::Acquire)
-    }
-
-    /** @brief 응답 OPT에 알릴 UDP 크기. */
-    fn edns_buffer(&self) -> u16 {
-        self.edns_buffer.load(Ordering::Acquire)
     }
 }
 
 /** @brief 처리 중인 질의 수를 세고 끝나면 되돌린다. */
-struct InflightGuard(Arc<AtomicUsize>);
-impl Drop for InflightGuard {
+struct InflightGuard<'a>(&'a AtomicUsize);
+impl Drop for InflightGuard<'_> {
     /** @brief 처리 중 수를 하나 줄인다. */
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
@@ -945,6 +909,44 @@ pub(crate) struct LaneRuntime {
     recursor: Option<Arc<Recursor>>,
 }
 
+impl LaneRuntime {
+    /**
+     * @brief 내보낸 응답을 빠른 경로가 다시 쓸 수 있게 담아 둔다. 담을 수 없는 응답이면 담지 않는다.
+     * @param epoch 이 응답을 만든 해석이 시작되기 전에 잡은 캐시 세대.
+     */
+    pub(crate) fn store_wire_response(
+        &self,
+        epoch: crate::cache::CacheEpoch,
+        key: &[u8],
+        response_wire: &[u8],
+        filter_tag: usize,
+        answers_summary: String,
+        now: std::time::Instant,
+    ) {
+        let Some(factory) = self.factory.as_ref() else {
+            return;
+        };
+        let Some(candidate) = self.cache.wire_candidate(key, now) else {
+            return;
+        };
+        let entry = if candidate.has_fixed_local_ttl() {
+            factory.prepare_fixed(response_wire, filter_tag, answers_summary, now)
+        } else {
+            factory.prepare(
+                response_wire,
+                filter_tag,
+                answers_summary,
+                now,
+                candidate.lifetime_secs(),
+            )
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        self.cache.promote_wire(epoch, key, &candidate, entry);
+    }
+}
+
 /** @brief 질의 하나를 처음부터 끝까지 다루는 것. */
 pub struct NativeServer {
     /** @brief 차단 엔진. 한꺼번에 교체한다. */
@@ -966,8 +968,18 @@ pub struct NativeServer {
     pub block_ttl: Arc<AtomicU32>,
     /** @brief 고정해 둔 주소에 담을 수명. */
     pub local_ttl: Arc<AtomicU32>,
-    /** @brief 켜고 끌 수 있는 기능들. */
+    /** @brief 설정 하나로 정해지는 응답 기능들. */
     pub features: Arc<NativeFeatureSwap>,
+    /** @brief 지표와 질의 기록을 보낼 곳. */
+    recorder: Option<Recorder>,
+    /** @brief 클라이언트 하드웨어 주소 조회. */
+    mac_cache: Option<Arc<crate::mac::NeighborCache>>,
+    /** @brief 안전 검색이 켜져 있는지. 시간대 작업과 설정 교체가 함께 바꾼다. */
+    safe_search: Arc<AtomicBool>,
+    /** @brief 지금 처리 중인 질의 수. */
+    inflight: AtomicUsize,
+    /** @brief 같은 이름의 답을 돌려 가며 낼 때의 지금 위치. */
+    rotor: AtomicUsize,
 
     /** @brief 정책 엔진. */
     pub policy: Arc<GatedSwap<onetdns_policy::PolicyEngine>>,
@@ -995,12 +1007,6 @@ pub struct NativeServer {
 
     /** @brief 권한 영역 단순 질의의 빠른 경로. 없으면 쓰지 않는다. */
     authority_wire_path: Option<AuthorityWirePath>,
-
-    /** @brief 설정 세대. 이전 세대가 만든 항목이 들어오지 못하게 한다. */
-    pub wire_epoch: Arc<AtomicUsize>,
-
-    /** @brief 빠른 경로를 지금 써도 되는지. 설정이 바뀌면 여기만 내린다. */
-    pub lane_switch: Arc<LaneSwitch>,
 }
 
 #[derive(Clone)]
@@ -1051,62 +1057,6 @@ pub struct AuthoritySettings {
     pub zone_signers: Vec<(ApName, crate::zone_signing::ZoneSigningCtx)>,
 }
 
-/**
- * @brief 세 빠른 경로의 켜짐 여부를 담는 슬롯.
- *
- * @details 빠른 경로는 전부 순수한 최적화다. 설정이 바뀌어 조건이 깨지면 여기를 내려
- *          일반 경로로 보내면 되고, 조건이 다시 서면 올린다. 소켓과 스레드는 건드리지
- *          않는다.
- * @invariant 내린 상태에서는 조회도 저장도 하지 않는다. 반쪽만 막으면 이전 답이 남는다.
- */
-pub struct LaneSwitch {
-    /** @brief 캐시 적중 UDP 빠른 경로. */
-    wire: AtomicBool,
-    /** @brief 권한 영역 단순 질의 빠른 경로. */
-    authority: AtomicBool,
-    /** @brief 재귀 콜드미스 리액터 레인. */
-    reactor: AtomicBool,
-}
-
-impl Default for LaneSwitch {
-    fn default() -> Self {
-        LaneSwitch {
-            wire: AtomicBool::new(true),
-            authority: AtomicBool::new(true),
-            reactor: AtomicBool::new(true),
-        }
-    }
-}
-
-impl LaneSwitch {
-    /**
-     * @brief 세 경로의 켜짐 여부를 한꺼번에 정한다.
-     * @return 하나라도 달라졌으면 참. 달라진 것을 알려야 조용히 느려지지 않는다.
-     */
-    pub fn set(&self, wire: bool, authority: bool, reactor: bool) -> bool {
-        let was_wire = self.wire.swap(wire, Ordering::AcqRel);
-        let was_authority = self.authority.swap(authority, Ordering::AcqRel);
-        let was_reactor = self.reactor.swap(reactor, Ordering::AcqRel);
-        was_wire != wire || was_authority != authority || was_reactor != reactor
-    }
-
-    /** @brief 캐시 적중 빠른 경로를 지금 써도 되는지. */
-    pub fn wire(&self) -> bool {
-        self.wire.load(Ordering::Acquire)
-    }
-
-    /** @brief 권한 영역 빠른 경로를 지금 써도 되는지. */
-    pub fn authority(&self) -> bool {
-        self.authority.load(Ordering::Acquire)
-    }
-
-    #[cfg(unix)]
-    /** @brief 리액터 레인을 지금 써도 되는지. */
-    pub fn reactor(&self) -> bool {
-        self.reactor.load(Ordering::Acquire)
-    }
-}
-
 #[derive(Clone, Default)]
 /** @brief 특정 클라이언트에만 다르게 답할 이름들. */
 pub struct NativeView {
@@ -1153,6 +1103,11 @@ impl NativeServer {
             block_ttl: Arc::new(AtomicU32::new(block_ttl)),
             local_ttl: Arc::new(AtomicU32::new(300)),
             features: Arc::new(NativeFeatureSwap::from_pointee(NativeFeatures::default())),
+            recorder: None,
+            mac_cache: None,
+            safe_search: Arc::new(AtomicBool::new(false)),
+            inflight: AtomicUsize::new(0),
+            rotor: AtomicUsize::new(0),
             policy: Arc::new(GatedSwap::from_pointee(
                 onetdns_policy::PolicyEngine::default(),
             )),
@@ -1164,8 +1119,6 @@ impl NativeServer {
             journal: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             views: Arc::new(GatedSwap::from_pointee(Vec::new())),
             authority_wire_path: None,
-            wire_epoch: Arc::new(AtomicUsize::new(0)),
-            lane_switch: Arc::new(LaneSwitch::default()),
         }
     }
 
@@ -1245,24 +1198,6 @@ impl NativeServer {
         self
     }
 
-    /** @brief 체인을 교체한 뒤 빠른 경로도 같은 캐시·재귀 리졸버 세대로 옮긴다. */
-    pub fn replace_lane_runtime(
-        &self,
-        factory: crate::wirecache::WireEntryFactory,
-        cache: crate::cache::CacheHandle,
-        recursor: Option<Arc<Recursor>>,
-        ddr_enabled: bool,
-    ) {
-        let mut features = (*self.features.load()).clone();
-        features.ddr_enabled = ddr_enabled;
-        features.lane_runtime = Some(Arc::new(LaneRuntime {
-            factory: Some(factory),
-            cache,
-            recursor,
-        }));
-        self.features.store(Arc::new(features));
-    }
-
     /** @brief 권한 영역 단순 질의의 빠른 경로를 붙인다. */
     pub fn with_authority_wire_path(
         mut self,
@@ -1313,6 +1248,35 @@ impl NativeServer {
     pub fn with_features(mut self, features: NativeFeatures) -> Self {
         self.features = Arc::new(NativeFeatureSwap::from_pointee(features));
         self
+    }
+
+    /** @brief 지표와 질의 기록을 보낼 곳을 붙인다. */
+    pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /** @brief 클라이언트 하드웨어 주소 조회를 붙인다. */
+    pub fn with_mac_cache(mut self, mac_cache: Option<Arc<crate::mac::NeighborCache>>) -> Self {
+        self.mac_cache = mac_cache;
+        self
+    }
+
+    /** @brief 시간대 작업과 설정 교체가 함께 바꾸는 안전 검색 스위치를 붙인다. */
+    pub fn with_safe_search(mut self, safe_search: Arc<AtomicBool>) -> Self {
+        self.safe_search = safe_search;
+        self
+    }
+
+    /**
+     * @brief 질의마다 기록을 남길 곳.
+     *
+     * @details 기록기가 있어도 볼 곳이 없으면 없는 것으로 답한다. 그 자리에서 만드는 이름과
+     *          시계 읽기가 질의마다 드는 비용이라, 만들어서 버릴 것이면 만들지 않아야 한다.
+     * @return 볼 곳이 있을 때만 기록기.
+     */
+    pub fn events(&self) -> Option<&Recorder> {
+        self.recorder.as_ref().filter(|r| r.collecting())
     }
 
     /** @brief 클라이언트별 업스트림 경로를 붙인다. */
