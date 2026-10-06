@@ -1,5 +1,5 @@
 /*!
- * @brief 프레임 입출력과 패딩 제거 도우미.
+ * @brief 프레임 입출력과 패딩 제거 함수.
  */
 
 use std::io::{Read, Write};

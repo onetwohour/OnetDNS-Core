@@ -1111,7 +1111,7 @@ mod tests {
         ));
         let entry = StaleEntry {
             response,
-            inserted: Instant::now() - Duration::from_secs(62),
+            inserted: Instant::now(),
             fresh_until: Instant::now(),
             stale_until: Instant::now() + Duration::from_secs(60),
             original_ttl: Duration::from_secs(100),
@@ -1162,8 +1162,8 @@ mod tests {
         ));
         let entry = StaleEntry {
             response,
-            inserted: Instant::now() - Duration::from_secs(200),
-            fresh_until: Instant::now() - Duration::from_secs(100),
+            inserted: Instant::now(),
+            fresh_until: Instant::now(),
             stale_until: Instant::now() + Duration::from_secs(60),
             original_ttl: Duration::from_secs(100),
         };

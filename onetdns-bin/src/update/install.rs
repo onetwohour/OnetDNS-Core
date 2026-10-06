@@ -751,8 +751,8 @@ mod tests {
         /** @brief 아직 실행 중인지. 끝났으면 맞바꾸기가 실행 중인 파일을 다룬 것이 아니다. */
         fn assert_alive(&mut self) {
             assert!(
-                self.0.try_wait().expect("도우미 상태").is_none(),
-                "설치 경로에서 띄운 도우미가 이미 끝났습니다"
+                self.0.try_wait().expect("자식 프로세스 상태").is_none(),
+                "설치 경로에서 실행한 자식 프로세스가 이미 끝났습니다"
             );
         }
     }
@@ -764,7 +764,7 @@ mod tests {
         }
     }
 
-    /** @brief 이 테스트 바이너리를 설치 경로에 복사해 오래 기다리는 테스트 하나만 돌린다. */
+    /** @brief 이 테스트 바이너리를 설치 경로에 복사하고 기다리기만 하는 테스트 하나를 자식 프로세스로 실행한다. */
     fn run_copy_of_this_binary(install: &Install) -> Running {
         std::fs::copy(
             std::env::current_exe().expect("테스트 바이너리"),
@@ -775,9 +775,9 @@ mod tests {
             .args([
                 "--ignored",
                 "--exact",
-                "update::install::tests::sleeps_while_a_test_swaps_its_executable",
+                "update::install::tests::waits_while_a_test_swaps_its_executable",
             ])
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -787,10 +787,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "다른 테스트가 실행 중인 실행 파일로 띄워 쓰는 도우미다"]
-    /** @brief 맞바꾸기 테스트가 띄우는 실행 중인 프로세스 역할. */
-    fn sleeps_while_a_test_swaps_its_executable() {
-        std::thread::sleep(Duration::from_secs(30));
+    #[ignore = "맞바꾸기 테스트가 자식 프로세스로 실행한다"]
+    /**
+     * @brief 맞바꾸기 테스트가 설치 경로에서 실행하는 자식 프로세스.
+     * @details 부모 테스트가 표준 입력 파이프를 닫을 때까지 끝나지 않는다. 정해 둔 시간만 자면, 큰
+     *          테스트 바이너리를 여러 번 해시하느라 부모 테스트가 그보다 오래 걸리는 환경에서 먼저
+     *          끝나 버린다. 부모 테스트가 비정상으로 끝나도 운영체제가 파이프를 닫으므로 남지 않는다.
+     */
+    fn waits_while_a_test_swaps_its_executable() {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
     }
 
     #[test]

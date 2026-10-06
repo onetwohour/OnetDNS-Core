@@ -16,7 +16,7 @@ pub mod hpack;
 pub mod huffman;
 /** @brief DoH 수신 쪽. */
 pub mod server;
-/** @brief 테스트가 쓰는 소켓 도우미. */
+/** @brief 테스트용 소켓 헬퍼. */
 #[cfg(test)]
 mod testutil;
 /** @brief 바이트를 읽고 쓰는 기본 도구. */
