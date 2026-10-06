@@ -106,6 +106,8 @@ mod tftp;
 mod tls_material;
 /** @brief 전송별 지표 관측. */
 mod transport_observe;
+/** @brief 새 릴리스 확인, 실행 파일 교체, 시험 실행과 되돌림. */
+mod update;
 /** @brief 업스트림 주소 해석. */
 mod upstream;
 /** @brief 업스트림 통계의 저장과 복원. */
@@ -196,6 +198,7 @@ fn main() -> BoxResult<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    update::install::init();
     init_tracing();
     let cmd = match parse_args() {
         Ok(c) => c,
@@ -230,7 +233,7 @@ fn main() -> BoxResult<()> {
             }
             #[cfg(not(target_os = "linux"))]
             let _ = no_supervisor;
-            run(config, no_web)
+            serve_directly(config, no_web)
         }
         Command::Query { name, qtype } => query(name, qtype),
         Command::Cert {
@@ -244,6 +247,9 @@ fn main() -> BoxResult<()> {
         Command::Allow { domain, ctl } => ctl_add("allow", &domain, &ctl),
         Command::Service { action } => run_service(action),
         Command::Check { config } => check_config(config),
+        Command::Update { action, config } => {
+            update::task::run_cli(action, config.as_deref()).map_err(|error| crate::anyhow!(error))
+        }
         Command::Top { ctl } => ctl_top(&ctl),
         Command::Services => {
             println!("Services that can be blocked:");
@@ -559,6 +565,32 @@ fn install_shutdown_handler() -> Arc<std::sync::atomic::AtomicBool> {
 }
 
 /**
+ * @brief 감독자 없이 이 프로세스에서 서버를 돌린다.
+ * @details 감독받는 자식이 아니면 업데이트 기록을 처리하고, 시험 중인 새 버전이 준비 전에
+ *          오류로 끝나면 되돌린다. 적용을 마치고 멈췄으면 맞바꾼 실행 파일을 띄운다.
+ */
+fn serve_directly(config: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
+    if !update::install::supervised_child() {
+        match update::trial::on_start(&mut || {}) {
+            update::trial::Startup::Normal => {}
+            update::trial::Startup::Trial(trial) => update::trial::watch(trial),
+            update::trial::Startup::Reverted => update::launch::start_reverted(),
+        }
+    }
+    let result = run(config, no_web);
+    if let Err(error) = &result {
+        if update::trial::revert_after_error(error) {
+            update::launch::start_reverted();
+        }
+    }
+    #[cfg(unix)]
+    if result.is_ok() && update::launch::restart_requested() {
+        return Err(crate::anyhow!(update::launch::start_installed()));
+    }
+    result
+}
+
+/**
  * @brief 서버를 시작하고 설정을 다시 읽을 때마다 새 세대로 교체한다.
  * @details 한 세대가 끝나면 그 세대가 잡은 스레드와 리스너를 모두 정리한 뒤 다음 세대를
  *          시작한다. 그래야 포트가 확실히 풀린다.
@@ -570,6 +602,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
         config_path = ensure_auto_config();
     }
     let stop = install_shutdown_handler();
+    update::launch::register(stop.clone());
 
     let shared = ServeShared::default();
     let ready_callback = Arc::new(Mutex::new(supervisor::take_ready_callback()?));
@@ -601,6 +634,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
         let session_checkpoint = shared.sessions.checkpoint();
         let ready_slot = ready_callback.clone();
         let attempt_ready: Box<dyn FnOnce() + Send> = Box::new(move || {
+            update::trial::commit_active();
             if let Some(callback) = ready_slot.lock_recover().take() {
                 callback();
             }
@@ -883,6 +917,12 @@ pub struct ServeShared {
      *          뒤에 멈춘다.
      */
     control_jobs: Arc<EdgeServices>,
+    /**
+     * @brief 오래 걸리는 작업들의 진행 상황. 세대가 바뀌어도 이어진다.
+     * @details 업데이트 작업은 세대와 상관없이 끝까지 돈다. 세대마다 새로 만들면 그 결과가 버려진 목록에
+     *          남고, 작업 번호가 다시 1부터 매겨져 관리 화면이 다른 작업의 결과를 읽는다.
+     */
+    jobs: Arc<JobRegistry>,
 
     /** @brief 지표 기록기와 저장소. */
     metrics: Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>,
@@ -1462,7 +1502,7 @@ pub fn serve(
         };
         recorder.set_collecting(telemetry_consumed(&cfg));
 
-        let jobs = Arc::new(JobRegistry::new(64));
+        let jobs = shared.jobs.clone();
 
         // 컨트롤 플레인 인증은 이 뒤에서 만들어진다. 계정만 바뀌었을 때 DNS를 건드리지 않고
         // 목록만 교체하려면 그 핸들이 필요하므로 슬롯을 먼저 잡아 둔다.
@@ -1944,6 +1984,13 @@ pub fn serve(
     if let Some(cb) = on_ready {
         cb();
     }
+    update::task::schedule(
+        {
+            let runtime = runtime_cfg.clone();
+            move || runtime.load().release_check
+        },
+        blocklist_resolver.clone(),
+    );
 
     let reloaded = loop {
         if external_stop
@@ -2415,6 +2462,16 @@ struct Job {
     finished: Option<u64>,
     /** @brief 끝난 뒤의 결과 문구. */
     result: String,
+}
+
+/** @brief 담아 두는 작업 수. 넘치면 끝난 작업 중 가장 오래된 것부터 지운다. */
+const JOB_HISTORY: usize = 64;
+
+impl Default for JobRegistry {
+    /** @brief 기본 개수만큼 담아 두도록 만든다. */
+    fn default() -> Self {
+        JobRegistry::new(JOB_HISTORY)
+    }
 }
 
 impl JobRegistry {

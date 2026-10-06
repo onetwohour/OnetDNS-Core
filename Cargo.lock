@@ -756,6 +756,7 @@ dependencies = [
 name = "onetdns"
 version = "0.1.0-alpha.5"
 dependencies = [
+ "ed25519-dalek",
  "hmac",
  "libc",
  "onetdns-authority",

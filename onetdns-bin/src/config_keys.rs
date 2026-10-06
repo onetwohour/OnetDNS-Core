@@ -76,6 +76,11 @@ pub(crate) enum ApplyGroup {
     QuerySource,
     /** @brief 속도 제한기를 교체한다. */
     RateLimit,
+    /**
+     * @brief 교체할 것이 없다.
+     * @details 주기 확인이 확인할 때마다 실행 중 설정을 읽는다.
+     */
+    ReleaseCheck,
     /** @brief 업스트림 TLS 인증서 폐기 확인 정책을 다시 설치한다. */
     Revocation,
     /** @brief 안전 검색 설정을 바꾼다. */
@@ -759,6 +764,7 @@ static KEYS: &[KeySpec] = &[
         wire(|c, _| c.dnstap_file.is_some()),
     ),
     key("dnstap_identity", Hot(Native), Node, Lanes::OPEN),
+    key("release_check", Hot(ReleaseCheck), Node, Lanes::OPEN),
 ];
 
 #[cfg(test)]

@@ -362,6 +362,7 @@ pub(crate) fn ensure_raft_runtime(
         });
     let handle = onetdns_cluster::transport::RaftServer::spawn(
         cfg.cluster_node_id,
+        crate::update::VERSION,
         listen.clone(),
         peers,
         node,
@@ -989,8 +990,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 /** @brief 클러스터 없이 실행 중인 상태를 JSON으로. */
 pub(crate) fn standalone_cluster_status_json(backend: &str, listeners: usize) -> String {
     format!(
-        "{{\"self\":{{\"id\":null,\"role\":\"standalone\",\"backend\":{},\"listeners\":{listeners},\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true}},\"peers\":[]}}",
-        onetdns_core::json::escape(backend)
+        "{{\"self\":{{\"id\":null,\"role\":\"standalone\",\"backend\":{},\"listeners\":{listeners},\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true,\"version\":{}}},\"peers\":[]}}",
+        onetdns_core::json::escape(backend),
+        onetdns_core::json::escape(crate::update::VERSION)
     )
 }
 
@@ -1044,14 +1046,15 @@ pub(crate) fn peer_cluster_status_json(
                 _ => "null".to_string(),
             };
             format!(
-                "{{\"id\":null,\"url\":{},\"healthy\":{healthy},\"role\":\"member\",\"rtt_ms\":{rtt}}}",
+                "{{\"id\":null,\"url\":{},\"healthy\":{healthy},\"role\":\"member\",\"rtt_ms\":{rtt},\"version\":null}}",
                 onetdns_core::json::escape(url)
             )
         })
         .collect();
     format!(
-        "{{\"self\":{{\"id\":null,\"role\":\"member\",\"backend\":{},\"listeners\":{listeners},\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true}},\"peers\":[{}]}}",
+        "{{\"self\":{{\"id\":null,\"role\":\"member\",\"backend\":{},\"listeners\":{listeners},\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true,\"version\":{}}},\"peers\":[{}]}}",
         onetdns_core::json::escape(backend),
+        onetdns_core::json::escape(crate::update::VERSION),
         items.join(",")
     )
 }

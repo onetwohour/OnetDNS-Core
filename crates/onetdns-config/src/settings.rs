@@ -1275,6 +1275,12 @@ pub struct Config {
 
     /** @brief dnstap 서버 식별자. */
     pub dnstap_identity: String,
+
+    /**
+     * @brief 새 릴리스를 주기적으로 확인하는지.
+     * @details 끄면 주기 확인만 멈춘다. 관리자가 직접 확인하고 적용하는 것은 막지 않는다.
+     */
+    pub release_check: bool,
 }
 
 impl Default for Config {
@@ -1547,6 +1553,7 @@ impl Default for Config {
             persist_flush_secs: 30,
             dnstap_file: None,
             dnstap_identity: String::new(),
+            release_check: true,
         }
     }
 }
@@ -3373,6 +3380,7 @@ impl Config {
         kv("persist_flush_secs", self.persist_flush_secs.to_string());
         kv("dnstap_file", opt_p(&self.dnstap_file));
         kv("dnstap_identity", js(&self.dnstap_identity));
+        kv("release_check", self.release_check.to_string());
 
         format!("{{{}}}", o.join(","))
     }
@@ -3720,6 +3728,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "ra_managed",
         "ra_other",
         "rebind_protection",
+        "release_check",
         "root_key_sentinel",
         "rrset_roundrobin",
         "safe_browsing",
@@ -5762,6 +5771,7 @@ const KNOWN_KEYS: &[&str] = &[
     "persist_flush_secs",
     "dnstap_file",
     "dnstap_identity",
+    "release_check",
 ];
 
 /** @brief 알려진 키 목록. 스키마 테스트가 이것과 대조한다. */
@@ -6253,6 +6263,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.persist_flush_secs = gu64(root, "persist_flush_secs", d.persist_flush_secs);
     c.dnstap_file = gstr(root, "dnstap_file").map(PathBuf::from);
     c.dnstap_identity = gstr(root, "dnstap_identity").unwrap_or(d.dnstap_identity);
+    c.release_check = gbool(root, "release_check", d.release_check);
 
     Ok(c)
 }

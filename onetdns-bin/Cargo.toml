@@ -32,6 +32,7 @@ onetdns-policy.workspace = true
 onetdns-authority.workspace = true
 onetdns-cluster.workspace = true
 onetdns-dnssec.workspace = true
+ed25519-dalek.workspace = true
 hmac.workspace = true
 p256.workspace = true
 sha2.workspace = true

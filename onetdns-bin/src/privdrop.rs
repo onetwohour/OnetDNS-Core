@@ -271,28 +271,22 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
 }
 
 /**
- * @brief 권한을 낮춘 뒤에도 자기 실행 파일을 다시 실행할 수 있는지 확인한다.
+ * @brief 권한을 낮춘 뒤에도 이 실행 파일을 다시 실행할 수 있는지 확인한다.
  *
- * @details 감독 프로세스는 자식이 죽으면 같은 실행 파일을 다시 실행해 살린다. 권한을
- *          낮추고 나면 그 경로에 닿지 못하는 자리가 있다. 실행 파일이 0750 인 홈
- *          디렉터리 아래 있으면 낮춘 사용자는 디렉터리를 지나갈 수 없다.
- * @return 실행할 수 있으면 Ok, 아니면 사유.
+ * @details 감독 프로세스는 자식이 죽으면 자기 실행 파일을 다시 실행해 살린다. 파일이
+ *          root 만 실행할 수 있는 권한이거나 noexec 로 마운트된 곳에 있으면 낮춘 사용자는
+ *          실행하지 못한다.
+ * @return 실행할 수 있으면 Ok, 아니면 운영체제가 알려 준 사유.
  * @warning 여기서 확인하지 않으면 첫 자식이 죽는 순간에야 드러난다. 그때는 다시 띄울
  *          수단이 없어 서비스가 돌아오지 못한다.
  */
-pub fn executable_still_runnable() -> Result<(), String> {
+pub fn executable_still_runnable(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
 
-    let path = std::env::current_exe()
-        .map_err(|error| format!("Could not find the path of the current executable: {error}"))?;
     let raw = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "The executable path contains a NUL character".to_string())?;
     if unsafe { libc::access(raw.as_ptr(), libc::X_OK) } == 0 {
         return Ok(());
     }
-    Err(format!(
-        "The unprivileged user cannot access the executable: {} ({})",
-        path.display(),
-        last_err()
-    ))
+    Err(last_err())
 }

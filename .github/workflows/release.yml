@@ -5,6 +5,11 @@ name: Release
 # Cargo.toml. A version with a hyphen suffix, such as 0.1.0-alpha.1, is published as a
 # pre-release. This workflow does not rerun the tests. Instead it refuses to release
 # unless the tagged commit is on main and the CI workflow passed for that exact commit.
+#
+# Running installations update themselves from the bare executables, which the signed
+# OnetDNS-release.toml lists with their sizes and hashes. The publish job signs it in the
+# release environment and creates no release unless a key in onetdns-bin/release-keys.txt
+# verifies the signature.
 on:
   push:
     tags: ["v*"]
@@ -65,7 +70,13 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match package version $version. Name the tag v$version."
             exit 1
           fi
-          case "${version%%+*}" in
+          case "$version" in
+            # Self-update skips tags it cannot order, and semver leaves build metadata out of
+            # the ordering, so such a release would never be offered.
+            *+*)
+              echo "::error::Version $version carries build metadata (+...), so installations would not update to it. Remove it."
+              exit 1
+              ;;
             *-*) prerelease=true ;;
             *) prerelease=false ;;
           esac
@@ -130,6 +141,9 @@ jobs:
             Windows) RUSTFLAGS="$RUSTFLAGS -C target-feature=+crt-static" ;;
           esac
           export RUSTFLAGS
+          # The binary looks up its own executable in the release manifest by this key, and a
+          # binary built without it never updates itself.
+          export ONETDNS_RELEASE_TARGET="$TARGET"
           cargo build -p onetdns --release --locked --target "$TARGET"
 
       - name: Check linkage and version
@@ -166,9 +180,11 @@ jobs:
           set -euo pipefail
           name="OnetDNS-$VERSION-$TARGET"
           mkdir -p "pkg/$name" dist
+          # Each archive gets its bare executable alongside, the file self-update downloads.
           if [ "$RUNNER_OS" = Windows ]; then
             cp "target/$TARGET/release/OnetDNS.exe" LICENSE README.md "pkg/$name/"
             (cd pkg && 7z a -tzip "../dist/$name.zip" "$name")
+            cp "target/$TARGET/release/OnetDNS.exe" "dist/$name.exe"
           else
             install -m 755 "target/$TARGET/release/OnetDNS" "pkg/$name/"
             install -m 644 LICENSE README.md "pkg/$name/"
@@ -180,6 +196,7 @@ jobs:
               owner=(--owner=0 --group=0 --numeric-owner)
             fi
             tar "${owner[@]}" -C pkg -czf "dist/$name.tar.gz" "$name"
+            install -m 755 "target/$TARGET/release/OnetDNS" "dist/$name"
           fi
           ls -l dist
 
@@ -193,9 +210,18 @@ jobs:
     name: publish release
     needs: [version, build]
     runs-on: ubuntu-latest
+    # The manifest signing key is a secret of this environment. The environment requires the
+    # owner's approval, so pushing a tag alone cannot produce a signed release.
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          sparse-checkout: onetdns-bin/release-keys.txt
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -207,6 +233,95 @@ jobs:
           set -euo pipefail
           sha256sum OnetDNS-* > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Write the release manifest
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          # Update contract number. A test in onetdns-bin/src/update/mod.rs keeps it equal to
+          # CONTRACT there.
+          UPDATE_CONTRACT: 1
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          manifest=OnetDNS-release.toml
+          prefix="OnetDNS-$VERSION-"
+          printf 'format = %s\nproduct = "OnetDNS"\nversion = "%s"\n' "$UPDATE_CONTRACT" "$VERSION" > "$manifest"
+          archives=("$prefix"*.tar.gz "$prefix"*.zip)
+          executables=0
+          for file in "$prefix"*; do
+            case "$file" in
+              *.tar.gz | *.zip) continue ;;
+            esac
+            target=${file#"$prefix"}
+            target=${target%.exe}
+            # Installations derive the file name from their target and reject a manifest
+            # that names any file differently.
+            case "$target" in
+              *-windows-*) expected="$prefix$target.exe" ;;
+              *) expected="$prefix$target" ;;
+            esac
+            if [ "$file" != "$expected" ]; then
+              echo "::error::$file must be named $expected."
+              exit 1
+            fi
+            printf '\n[[asset]]\ntarget = "%s"\nfile = "%s"\nsize = %s\nsha256 = "%s"\n' \
+              "$target" "$file" "$(stat -c %s "$file")" "$(sha256sum "$file" | cut -d ' ' -f 1)" >> "$manifest"
+            executables=$((executables + 1))
+          done
+          if [ "$executables" -eq 0 ] || [ "$executables" -ne "${#archives[@]}" ]; then
+            echo "::error::Found $executables executables for ${#archives[@]} archives. Every target must publish both."
+            exit 1
+          fi
+          cat "$manifest"
+
+      - name: Sign the release manifest
+        working-directory: dist
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::The release environment has no RELEASE_SIGNING_KEY secret."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          openssl pkeyutl -sign -rawin -inkey "$key" -in OnetDNS-release.toml -out OnetDNS-release.toml.sig
+
+      - name: Verify the signature with the trusted keys
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Installations trust only these keys, so a release no listed key verifies could
+          # never be installed by them.
+          der="$RUNNER_TEMP/release-key.der"
+          listed=0
+          while read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            case "$line" in
+              '' | '#'*) continue ;;
+            esac
+            if ! [[ "$line" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::onetdns-bin/release-keys.txt has a line that is not 64 lowercase hexadecimal characters."
+              exit 1
+            fi
+            listed=$((listed + 1))
+            # DER SubjectPublicKeyInfo of a raw Ed25519 public key is this fixed prefix and the key.
+            printf '%b' "$(printf '302a300506032b6570032100%s' "$line" | sed 's/../\\x&/g')" > "$der"
+            if openssl pkeyutl -verify -pubin -keyform DER -inkey "$der" -rawin \
+              -in OnetDNS-release.toml -sigfile OnetDNS-release.toml.sig > /dev/null; then
+              echo "The manifest signature verifies with release key $line."
+              exit 0
+            fi
+          done < ../source/onetdns-bin/release-keys.txt
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::onetdns-bin/release-keys.txt lists no release key, so installations could not verify this release."
+          else
+            echo "::error::None of the $listed keys in onetdns-bin/release-keys.txt verifies the manifest signature, so installations would reject this release."
+          fi
+          exit 1
 
       - name: Create release
         env:
@@ -244,9 +359,11 @@ jobs:
 
           Linux builds are statically linked against musl and run on any distribution. Windows builds bundle the C runtime and need no Visual C++ Redistributable.
 
+          Each target also has its bare executable, named like its archive without the extension (with `.exe` on Windows). OnetDNS installations update themselves from these files after checking them against the signed `OnetDNS-release.toml`.
+
           ## Verify your download
 
-          Every archive is listed in `SHA256SUMS`:
+          Every archive and executable is listed in `SHA256SUMS`:
 
           ```sh
           sha256sum -c SHA256SUMS --ignore-missing

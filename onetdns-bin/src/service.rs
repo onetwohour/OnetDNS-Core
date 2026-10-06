@@ -27,6 +27,16 @@ const SERVICE_DISPLAY: &str = "OnetDNS ad-blocking DNS";
 static CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /** @brief 정지 요청을 서비스 반복에 전하는 플래그. */
 static STOP_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/** @brief 상태 보고 핸들. 시험 기한을 재는 스레드도 정지를 보고하므로 여기 둔다. */
+static STATUS: OnceLock<StatusHandle> = OnceLock::new();
+
+/**
+ * @brief 서비스가 실패했을 때 다시 시작하기까지 기다리는 밀리초. 실패할 때마다 다음 값으로 넘어간다.
+ * @details 업데이트를 마치고 업데이트 종료 코드로 멈춘 서비스도 첫 값만큼 기다렸다가 다시 뜬다.
+ */
+const RECOVERY_DELAYS_MS: [u32; 3] = [1_000, 5_000, 30_000];
+/** @brief 이만큼(초) 실패가 없으면 실패 횟수를 0 으로 되돌린다. 하루다. */
+const RECOVERY_RESET_SECONDS: u32 = 86_400;
 
 #[allow(non_snake_case)]
 /** @brief 서비스 제어 관리자 프로토콜. */
@@ -50,6 +60,18 @@ mod win32 {
     pub const SERVICE_QUERY_STATUS: u32 = 0x0004;
     /** @brief 정지시킬 권한. */
     pub const SERVICE_STOP: u32 = 0x0020;
+    /** @brief 설정을 물을 권한. */
+    pub const SERVICE_QUERY_CONFIG: u32 = 0x0001;
+    /** @brief 시작시킬 권한. 복구 동작에 다시 시작을 걸려면 이 권한으로 연 핸들이어야 한다. */
+    pub const SERVICE_START: u32 = 0x0010;
+    /** @brief 실패했을 때의 복구 동작 설정. */
+    pub const SERVICE_CONFIG_FAILURE_ACTIONS: u32 = 2;
+    /** @brief 충돌이 아닌 실패에도 복구 동작을 적용할지 정하는 설정. */
+    pub const SERVICE_CONFIG_FAILURE_ACTIONS_FLAG: u32 = 4;
+    /** @brief 복구 동작 가운데 서비스를 다시 시작하는 것. */
+    pub const SC_ACTION_RESTART: u32 = 1;
+    /** @brief 버퍼가 작다. 필요한 크기를 함께 알려 준다. */
+    pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 
     /** @brief 프로세스 하나를 전부 쓰는 서비스. */
     pub const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0010;
@@ -98,6 +120,38 @@ mod win32 {
         pub dwCheckPoint: u32,
         /** @brief 다음 보고까지 걸릴 예상 시간. */
         pub dwWaitHint: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    /** @brief 복구 동작 하나. */
+    pub struct ScAction {
+        /** @brief 동작 종류. */
+        pub Type: u32,
+        /** @brief 동작하기 전에 기다릴 밀리초. */
+        pub Delay: u32,
+    }
+
+    #[repr(C)]
+    /** @brief 복구 동작 목록. 실패할 때마다 다음 동작으로 넘어간다. */
+    pub struct ServiceFailureActionsW {
+        /** @brief 이만큼(초) 실패가 없으면 실패 횟수를 0 으로 되돌린다. */
+        pub dwResetPeriod: u32,
+        /** @brief 재부팅할 때 보낼 메시지. 널이면 바꾸지 않는다. */
+        pub lpRebootMsg: *mut u16,
+        /** @brief 실행할 명령. 널이면 바꾸지 않는다. */
+        pub lpCommand: *mut u16,
+        /** @brief 동작 수. */
+        pub cActions: u32,
+        /** @brief 동작 배열. */
+        pub lpsaActions: *mut ScAction,
+    }
+
+    #[repr(C)]
+    /** @brief 충돌이 아닌 실패에도 복구 동작을 적용할지. */
+    pub struct ServiceFailureActionsFlag {
+        /** @brief 0 이 아니면 적용한다. */
+        pub fFailureActionsOnNonCrashFailures: i32,
     }
 
     /** @brief 서비스 진입점. */
@@ -150,6 +204,16 @@ mod win32 {
         pub fn ControlService(service: ScHandle, control: u32, status: *mut ServiceStatus) -> i32;
         /** @brief 서비스를 지운다. */
         pub fn DeleteService(service: ScHandle) -> i32;
+        /** @brief 서비스의 추가 설정을 바꾼다. */
+        pub fn ChangeServiceConfig2W(service: ScHandle, info_level: u32, info: *mut c_void) -> i32;
+        /** @brief 서비스의 추가 설정을 읽는다. */
+        pub fn QueryServiceConfig2W(
+            service: ScHandle,
+            info_level: u32,
+            buffer: *mut u8,
+            buffer_size: u32,
+            bytes_needed: *mut u32,
+        ) -> i32;
         /** @brief 핸들을 닫는다. */
         pub fn CloseServiceHandle(handle: ScHandle) -> i32;
         /** @brief 관리자와 이어 서비스 진입점을 넘긴다. */
@@ -394,12 +458,12 @@ pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
     let name = wide_nul(OsStr::new(SERVICE_NAME))?;
     let display = wide_nul(OsStr::new(SERVICE_DISPLAY))?;
     let command = service_command(executable.as_os_str(), &arguments)?;
-    let _service = ScHandle::new(unsafe {
+    let service = ScHandle::new(unsafe {
         win32::CreateServiceW(
             manager.0,
             name.as_ptr(),
             display.as_ptr(),
-            win32::SERVICE_CHANGE_CONFIG,
+            win32::SERVICE_CHANGE_CONFIG | win32::SERVICE_START,
             win32::SERVICE_WIN32_OWN_PROCESS,
             win32::SERVICE_AUTO_START,
             win32::SERVICE_ERROR_NORMAL,
@@ -413,9 +477,142 @@ pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
     })
     .map_err(describe)?;
 
+    if let Err(error) = set_recovery(&service) {
+        return Ok(format!(
+            "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot. Could not set it to restart after a failure ({error}), so restart the service by hand after an update"
+        ));
+    }
     Ok(format!(
-        "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot"
+        "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot and restarts after a failure"
     ))
+}
+
+/**
+ * @brief 서비스가 실패하면 다시 시작하도록 복구 동작을 건다.
+ * @details 업데이트를 마친 서비스는 업데이트 종료 코드를 보고하고 멈춘다. 서비스 관리자는 이것을
+ *          충돌이 아닌 실패로 보므로, 그런 실패에도 복구 동작을 적용하는 플래그를 함께 건다. 같은
+ *          동작이 서비스가 죽었을 때 다시 띄우는 역할도 한다.
+ */
+fn set_recovery(service: &ScHandle) -> io::Result<()> {
+    let mut actions = RECOVERY_DELAYS_MS.map(|delay| win32::ScAction {
+        Type: win32::SC_ACTION_RESTART,
+        Delay: delay,
+    });
+    let mut failure = win32::ServiceFailureActionsW {
+        dwResetPeriod: RECOVERY_RESET_SECONDS,
+        lpRebootMsg: ptr::null_mut(),
+        lpCommand: ptr::null_mut(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    bool_result(unsafe {
+        win32::ChangeServiceConfig2W(
+            service.0,
+            win32::SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&mut failure as *mut win32::ServiceFailureActionsW).cast(),
+        )
+    })?;
+    let mut flag = win32::ServiceFailureActionsFlag {
+        fFailureActionsOnNonCrashFailures: 1,
+    };
+    bool_result(unsafe {
+        win32::ChangeServiceConfig2W(
+            service.0,
+            win32::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            (&mut flag as *mut win32::ServiceFailureActionsFlag).cast(),
+        )
+    })
+}
+
+/**
+ * @brief 이 서비스에 다시 시작하는 복구 동작이 걸려 있는지.
+ * @details 업데이트를 마친 서비스가 스스로 멈춰도 다시 뜨는지를 이것으로 판단한다. 다시 시작하는
+ *          동작이 없거나 충돌이 아닌 실패에 복구 동작을 적용하지 않으면 멈춘 채로 남는다.
+ */
+pub(crate) fn restarts_on_failure() -> bool {
+    match recovery_restarts(SERVICE_NAME) {
+        Ok(restarts) => restarts,
+        Err(error) => {
+            onetdns_core::warn!(event = "service.recovery_query_failed", %error, "Could not read the service recovery settings; an update waits for the service to be restarted by hand");
+            false
+        }
+    }
+}
+
+/** @brief 이 이름의 서비스가 실패하면 다시 시작하는지. */
+fn recovery_restarts(name: &str) -> io::Result<bool> {
+    let manager = ScHandle::new(unsafe {
+        win32::OpenSCManagerW(ptr::null(), ptr::null(), win32::SC_MANAGER_CONNECT)
+    })?;
+    let name = wide_nul(OsStr::new(name))?;
+    let service = ScHandle::new(unsafe {
+        win32::OpenServiceW(manager.0, name.as_ptr(), win32::SERVICE_QUERY_CONFIG)
+    })?;
+    let failure = query_config(&service, win32::SERVICE_CONFIG_FAILURE_ACTIONS)?;
+    let restarts = failure.len() * 8 >= std::mem::size_of::<win32::ServiceFailureActionsW>() && {
+        let failure = unsafe { &*failure.as_ptr().cast::<win32::ServiceFailureActionsW>() };
+        !failure.lpsaActions.is_null()
+            && unsafe { std::slice::from_raw_parts(failure.lpsaActions, failure.cActions as usize) }
+                .iter()
+                .any(|action| action.Type == win32::SC_ACTION_RESTART)
+    };
+    let flag = query_config(&service, win32::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG)?;
+    let on_non_crash = flag.len() * 8 >= std::mem::size_of::<win32::ServiceFailureActionsFlag>()
+        && unsafe { &*flag.as_ptr().cast::<win32::ServiceFailureActionsFlag>() }
+            .fFailureActionsOnNonCrashFailures
+            != 0;
+    Ok(restarts && on_non_crash)
+}
+
+/**
+ * @brief 서비스의 추가 설정 하나를 읽는다.
+ * @details 8바이트 단위로 잡아 안에 든 포인터와 구조체를 정렬된 채로 읽게 한다.
+ * @safety 돌려받은 구조체의 포인터는 이 버퍼 안을 가리키므로 버퍼보다 오래 쓰면 안 된다.
+ */
+fn query_config(service: &ScHandle, level: u32) -> io::Result<Vec<u64>> {
+    let mut needed = 0u32;
+    if unsafe { win32::QueryServiceConfig2W(service.0, level, ptr::null_mut(), 0, &mut needed) }
+        == 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(win32::ERROR_INSUFFICIENT_BUFFER) {
+            return Err(error);
+        }
+    }
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    let size = u32::try_from(buffer.len() * 8)
+        .map_err(|_| io::Error::other("The service setting is too large to read"))?;
+    bool_result(unsafe {
+        win32::QueryServiceConfig2W(
+            service.0,
+            level,
+            buffer.as_mut_ptr().cast(),
+            size,
+            &mut needed,
+        )
+    })?;
+    Ok(buffer)
+}
+
+/**
+ * @brief 업데이트 종료 코드로 서비스 정지를 보고하고 프로세스를 끝낸다.
+ * @details 시험에 실패해 되돌린 직후에 부른다. 준비에 이르지 못한 서버는 정상 종료를 기다리지
+ *          않는다. 복구 동작이 걸려 있으면 서비스 관리자가 되돌린 실행 파일로 다시 띄운다.
+ */
+pub(crate) fn exit_for_update() -> ! {
+    let code = crate::update::launch::UPDATE_EXIT_CODE;
+    if !restarts_on_failure() {
+        onetdns_core::error!(
+            event = "service.restart_needed",
+            "Reverted the update; start the OnetDNS service again to run the previous version"
+        );
+    }
+    if let Some(handle) = STATUS.get() {
+        if let Err(error) = handle.report(win32::SERVICE_STOPPED, 0, Some(code as u32), 0, 0) {
+            onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", %error, "Could not report status to the service manager");
+        }
+    }
+    std::process::exit(code)
 }
 
 /** @brief 서비스를 멈추고 지운다. */
@@ -490,9 +687,26 @@ extern "system" fn service_control_handler(
 }
 
 /**
+ * @brief 서비스가 끝날 때 보고할 서비스 고유 종료 코드. 정상 종료면 없다.
+ * @details 시험 중인 새 버전이 준비 전에 오류로 끝났으면 되돌리고 업데이트 종료 코드를 보고해,
+ *          복구 동작이 되돌린 버전을 띄우게 한다. 적용을 마치고 멈춘 것이면 같은 코드로 맞바꾼
+ *          버전을 띄우게 한다.
+ */
+fn exit_code(result: &BoxResult<()>) -> Option<u32> {
+    let update = crate::update::launch::UPDATE_EXIT_CODE as u32;
+    match result {
+        Err(error) if crate::update::trial::revert_after_error(error) => Some(update),
+        Err(_) => Some(1),
+        Ok(()) if crate::update::launch::restart_requested() => Some(update),
+        Ok(()) => None,
+    }
+}
+
+/**
  * @brief 서비스 본체.
  * @details 시작 중에는 진행 중임을 계속 보고하고, 다 뜨면 돌고 있음을 알린다. 정지
- *          요청이 오면 플래그를 설정해 서버 반복을 끝낸다.
+ *          요청이 오면 플래그를 설정해 서버 반복을 끝낸다. 설정을 읽기 전에 업데이트 기록을
+ *          처리하며, 다른 프로세스의 적용을 기다리는 동안에도 시작 중임을 보고한다.
  */
 fn service_run() -> BoxResult<()> {
     let stop = STOP_FLAG
@@ -500,19 +714,37 @@ fn service_run() -> BoxResult<()> {
         .clone();
     stop.store(false, Ordering::Relaxed);
     let status_handle = StatusHandle::register()?;
+    let _ = STATUS.set(status_handle);
+    crate::update::launch::register_service(stop.clone());
 
     let start_pending = |checkpoint: u32| {
         status_handle.report(win32::SERVICE_START_PENDING, 0, None, checkpoint, 15_000)
     };
     start_pending(1)?;
 
+    let mut checkpoint = 1;
+    let startup = crate::update::trial::on_start(&mut || {
+        checkpoint += 1;
+        if let Err(error) = start_pending(checkpoint) {
+            onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "Could not report status to the service manager");
+        }
+    });
+    match startup {
+        crate::update::trial::Startup::Normal => {}
+        crate::update::trial::Startup::Trial(trial) => crate::update::trial::watch(trial),
+        crate::update::trial::Startup::Reverted => crate::update::launch::start_reverted(),
+    }
+
     let config = CONFIG_PATH.get().cloned().flatten();
     if let Err(error) = Config::load_or_default(config.as_deref()) {
         onetdns_core::error!(event = "service.config_load_failed", %error, "Could not read the configuration; not starting the service");
-        if let Err(report_error) = status_handle.report(win32::SERVICE_STOPPED, 0, Some(1), 0, 0) {
+        let result: BoxResult<()> = Err(error.into());
+        if let Err(report_error) =
+            status_handle.report(win32::SERVICE_STOPPED, 0, exit_code(&result), 0, 0)
+        {
             onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", error = %report_error, "Could not report status to the service manager");
         }
-        return Err(error.into());
+        return result;
     }
 
     let shared = crate::ServeShared::default();
@@ -546,6 +778,7 @@ fn service_run() -> BoxResult<()> {
         });
         let ready_handle = status_handle;
         let on_ready: Box<dyn FnOnce() + Send> = Box::new(move || {
+            crate::update::trial::commit_active();
             if let Err(error) = ready_handle.report(
                 win32::SERVICE_RUNNING,
                 win32::SERVICE_ACCEPT_STOP,
@@ -598,13 +831,7 @@ fn service_run() -> BoxResult<()> {
         }
     };
 
-    status_handle.report(
-        win32::SERVICE_STOPPED,
-        0,
-        result.as_ref().err().map(|_| 1),
-        0,
-        0,
-    )?;
+    status_handle.report(win32::SERVICE_STOPPED, 0, exit_code(&result), 0, 0)?;
     result
 }
 
@@ -660,11 +887,38 @@ mod tests {
     #[test]
     /** @brief 구조체 크기와 필드 위치가 규격과 같은지. 어긋나면 엉뚱한 메모리를 읽는다. */
     fn win32_service_abi_layout_matches_winsvc_h() {
+        let word = std::mem::size_of::<usize>();
         assert_eq!(std::mem::size_of::<win32::ServiceStatus>(), 7 * 4);
         assert_eq!(std::mem::align_of::<win32::ServiceStatus>(), 4);
+        assert_eq!(std::mem::size_of::<win32::ServiceTableEntryW>(), 2 * word);
+        assert_eq!(std::mem::size_of::<win32::ScAction>(), 2 * 4);
         assert_eq!(
-            std::mem::size_of::<win32::ServiceTableEntryW>(),
-            2 * std::mem::size_of::<usize>()
+            std::mem::size_of::<win32::ServiceFailureActionsW>(),
+            5 * word
+        );
+        assert_eq!(
+            std::mem::offset_of!(win32::ServiceFailureActionsW, cActions),
+            3 * word
+        );
+        assert_eq!(
+            std::mem::offset_of!(win32::ServiceFailureActionsW, lpsaActions),
+            4 * word
+        );
+        assert_eq!(std::mem::size_of::<win32::ServiceFailureActionsFlag>(), 4);
+    }
+
+    #[test]
+    /**
+     * @brief 복구 설정을 실제로 읽어 내는지.
+     * @details 서비스를 등록하지 않고 확인하려고, 어느 Windows 에나 있는 이벤트 로그 서비스의 설정을
+     *          읽기만 한다. 크기를 먼저 묻고 다시 읽는 과정과 구조체 해석이 여기서 돈다.
+     */
+    fn recovery_settings_of_an_installed_service_can_be_read() {
+        recovery_restarts("EventLog").expect("이벤트 로그 서비스의 복구 설정");
+        let missing = recovery_restarts("OnetDNS-no-such-service").unwrap_err();
+        assert_eq!(
+            missing.raw_os_error(),
+            Some(win32::ERROR_SERVICE_DOES_NOT_EXIST)
         );
     }
 }

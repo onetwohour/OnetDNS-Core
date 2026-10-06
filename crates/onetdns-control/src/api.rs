@@ -376,12 +376,15 @@ fn is_state_changing_request(method: &str, path: &str) -> bool {
 }
 
 /**
- * @brief 이 요청에 변경 잠금이 필요한지.
+ * @brief 이 요청에 변경 잠금이 필요한지. 잠그지 않는 요청은 클러스터 합의도 거치지 않는다.
  * @details 클러스터 제안은 예외다. 그것은 합의 계층이 자체 순서를 정하므로, 여기서 또
- *          잠그면 제안 처리가 서로를 막는다.
+ *          잠그면 제안 처리가 서로를 막는다. 자체 업데이트 요청도 예외다. 설정을 바꾸지 않고
+ *          이 노드에서 작업만 시작하며, 업데이트 작업끼리는 업데이트 쪽이 하나씩 돌린다.
  */
 fn requires_control_mutation_lock(method: &str, path: &str) -> bool {
-    is_state_changing_request(method, path) && path != "/v1/cluster/propose"
+    is_state_changing_request(method, path)
+        && path != "/v1/cluster/propose"
+        && !path.starts_with("/v1/system/update/")
 }
 
 /** @brief 되풀이되는 요청 실패를 제한된 수의 지문으로 세는 곳. */
@@ -799,6 +802,28 @@ pub struct Controls {
     /** @brief 부팅 서비스를 등록하거나 제거한다. */
     pub boot_service_set: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
+    /** @brief 자체 업데이트 상태. */
+    pub update_status: Box<dyn Fn() -> String + Send + Sync>,
+
+    /**
+     * @brief 새 릴리스를 확인하는 작업을 시작한다.
+     * @return 시작한 작업. 실패는 지금 상태로는 시작할 수 없다는 뜻이다.
+     */
+    pub update_check: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
+
+    /**
+     * @brief 마지막 확인에서 찾은 버전을 설치하는 작업을 시작한다.
+     * @param version 운영자가 확인한 버전. 마지막 확인 결과와 다르면 시작하지 않는다.
+     * @return 시작한 작업. 실패는 지금 상태로는 시작할 수 없다는 뜻이다.
+     */
+    pub update_apply: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+
+    /**
+     * @brief 확정된 업데이트를 되돌리는 작업을 시작한다.
+     * @return 시작한 작업. 실패는 지금 상태로는 시작할 수 없다는 뜻이다.
+     */
+    pub update_rollback: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
+
     /** @brief 데이터 경로가 따로 내보내는 지표. */
     pub metrics_extra: Box<dyn Fn() -> String + Send + Sync>,
 }
@@ -903,7 +928,7 @@ impl Controls {
             upstream_remove: Box::new(|_| Err("No config file path".to_string())),
             explain: Box::new(|_| "{\"decision\":\"continue\"}".to_string()),
             cluster_status: Box::new(|| {
-                "{\"self\":{\"id\":null,\"role\":\"standalone\",\"backend\":\"unknown\",\"listeners\":0,\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true},\"peers\":[]}".to_string()
+                "{\"self\":{\"id\":null,\"role\":\"standalone\",\"backend\":\"unknown\",\"listeners\":0,\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true,\"version\":null},\"peers\":[]}".to_string()
             }),
             cluster_propose: Box::new(|_| {
                 Err("Raft high availability is not configured".to_string())
@@ -929,6 +954,12 @@ impl Controls {
             boot_service_set: Box::new(|_| {
                 Err("Installing a boot service is not supported on this OS".to_string())
             }),
+            update_status: Box::new(|| {
+                "{\"participating\":false,\"reason\":\"Updates are not available\"}".to_string()
+            }),
+            update_check: Box::new(|| Err("Updates are not available".to_string())),
+            update_apply: Box::new(|_| Err("Updates are not available".to_string())),
+            update_rollback: Box::new(|| Err("Updates are not available".to_string())),
             metrics_extra: Box::new(String::new),
         }
     }
@@ -4729,14 +4760,7 @@ fn route_dispatch(
             result_resp((st.controls.tls_revocation_check)(body))
         }
         ("POST", "/v1/acme/issue") => result_resp((st.controls.acme_issue)(body)),
-        ("POST", "/v1/config/rollback") => match (st.controls.config_rollback)() {
-            Ok(j) => ("200 OK", "application/json", j),
-            Err(e) => (
-                "409 Conflict",
-                "application/json",
-                format!("{{\"error\":\"{}\"}}", jesc(&e)),
-            ),
-        },
+        ("POST", "/v1/config/rollback") => conflict_resp((st.controls.config_rollback)()),
         ("POST", "/v1/policies/simulate") => (
             "200 OK",
             "application/json",
@@ -4767,6 +4791,15 @@ fn route_dispatch(
         ("POST", "/v1/system/dns-client/restore") => {
             result_resp((st.controls.dns_client_restore)(body))
         }
+        ("GET", "/v1/system/update") => {
+            ("200 OK", "application/json", (st.controls.update_status)())
+        }
+        ("POST", "/v1/system/update/check") => conflict_resp((st.controls.update_check)()),
+        ("POST", "/v1/system/update/apply") => match update_version(body) {
+            Ok(version) => conflict_resp((st.controls.update_apply)(&version)),
+            Err(error) => result_resp(Err(error)),
+        },
+        ("POST", "/v1/system/update/rollback") => conflict_resp((st.controls.update_rollback)()),
         ("GET", "/v1/zones") => ("200 OK", "application/json", (st.controls.zones_list)()),
         ("GET", "/v1/config") => ("200 OK", "application/json", (st.controls.config_desired)()),
         ("GET", "/v1/config/effective") => (
@@ -4925,6 +4958,35 @@ fn result_resp(r: Result<String, String>) -> (&'static str, &'static str, String
             format!("{{\"error\":\"{}\"}}", jesc(&e)),
         ),
     }
+}
+
+/** @brief 요청은 맞지만 지금 상태로는 할 수 없는 동작의 결과를 응답으로 만든다. 실패는 409 다. */
+fn conflict_resp(r: Result<String, String>) -> ApiResponse {
+    match r {
+        Ok(j) => ("200 OK", "application/json", j),
+        Err(e) => (
+            "409 Conflict",
+            "application/json",
+            format!("{{\"error\":\"{}\"}}", jesc(&e)),
+        ),
+    }
+}
+
+/** @brief 업데이트 적용 요청에서 운영자가 확인한 버전을 읽는다. */
+fn update_version(body: &str) -> Result<String, String> {
+    json::parse(body)
+        .ok()
+        .and_then(|json| {
+            json.get("version")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .map(String::from)
+        })
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            "The request body must be an object with the version shown by the last check"
+                .to_string()
+        })
 }
 
 /** @brief 요청 본문에서 업스트림 주소를 추출해 검증한다. */
@@ -5208,7 +5270,7 @@ fn openapi_json() -> String {
     "/v1/policies/simulate": { "post": { "summary": "Preview the policy and filter result for a DNS query", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{policy,filter,filter_stage,filter_matched,filter_list,decision}" } } } },
     "/v1/explain": { "post": { "summary": "Preview the decision for a DNS query: explains the policy, filter, response code, and handling without sending a real query or changing the cache", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "client_id": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{decision,rcode,policy,filter,filter_stage,filter_matched,filter_list,matched,client_safe_search,backend,dnssec,resolution}" } } } },
     "/readyz": { "get": { "summary": "DNS service readiness check", "security": [], "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } } } },
-    "/v1/cluster/nodes": { "get": { "summary": "Cluster node status. With consensus enabled, includes role, term, leader, and apply position", "responses": { "200": { "description": "{self:{id,role,backend,listeners,leader,term,commit_index,last_applied,last_index,snapshot_index,retained_log_entries,fatal,healthy},peers:[{id,url,healthy,role,rtt_ms}],identity:{node_id,public_key,peer_entry}}. identity.public_key is derived from the configured Raft signing key, and peer_entry is the entry to add as-is to cluster_raft_peers on other nodes. Both are null without a signing key" } } } },
+    "/v1/cluster/nodes": { "get": { "summary": "Cluster node status. With consensus enabled, includes role, term, leader, and apply position", "responses": { "200": { "description": "{self:{id,role,backend,listeners,leader,term,commit_index,last_applied,last_index,snapshot_index,retained_log_entries,fatal,healthy,version},peers:[{id,url,healthy,role,rtt_ms,version}],identity:{node_id,public_key,peer_entry}}. identity.public_key is derived from the configured Raft signing key, and peer_entry is the entry to add as-is to cluster_raft_peers on other nodes. Both are null without a signing key. self.version is this node's OnetDNS version. peers[].version is the version in the last authenticated cluster message from that node, null until one arrives. Nodes ignore cluster messages from nodes that run a different version" } } } },
     "/v1/cluster/propose": { "post": { "summary": "Propose a config change to the Raft leader (admin only): replicates {patch:{key:value}} to every node and applies it. A null value removes the entry. Node-local settings are rejected. With Raft enabled, other config-changing management requests are also accepted only on the leader and replicated the same way; followers reject them with 409", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "patch": { "type": "object" } }, "required": ["patch"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{committed,applied,index}" }, "400": { "description": "{error}" } } } },
     "/v1/listeners": { "get": { "summary": "Active DNS listen addresses and per-transport status", "responses": { "200": { "description": "{listeners:[...]}" } } } },
     "/v1/system/network-adapters": { "get": { "summary": "List host network adapters", "responses": { "200": { "description": "Adapter JSON" }, "400": { "description": "Could not retrieve the information" } } } },
@@ -5217,6 +5279,10 @@ fn openapi_json() -> String {
     "/v1/system/service": { "get": { "summary": "Boot service registration status", "responses": { "200": { "description": "{supported,installed,running}" } } }, "post": { "summary": "Install or remove the boot service (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["install", "uninstall"] } }, "required": ["action"] } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply" } } } },
     "/v1/system/dns-client": { "post": { "summary": "Change the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply the change" } } } },
     "/v1/system/dns-client/restore": { "post": { "summary": "Restore the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Restore result" }, "400": { "description": "Could not restore" } } } },
+    "/v1/system/update": { "get": { "summary": "Self-update status of this node: its version, whether this build updates itself and why not, how a new version is started, the last release check, the update record, and the version a rollback would reinstall", "responses": { "200": { "description": "{version,target,participating,reason,launch,release_check,task,checked_at,result,new_version,release_url,detail,record,rollback}" } } } },
+    "/v1/system/update/check": { "post": { "summary": "Start a job that checks GitHub for a newer release (admin only)", "responses": { "200": { "description": "{id,status}" }, "409": { "description": "{error}" } } } },
+    "/v1/system/update/apply": { "post": { "summary": "Start a job that installs the release found by the last check and starts it (admin only). version must be the version the last check found", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "version": { "type": "string" } }, "required": ["version"] } } } }, "responses": { "200": { "description": "{id,status}" }, "400": { "description": "{error}" }, "409": { "description": "{error}" } } } },
+    "/v1/system/update/rollback": { "post": { "summary": "Start a job that reinstalls the version replaced by the last committed update and starts it (admin only)", "responses": { "200": { "description": "{id,status}" }, "409": { "description": "{error}" } } } },
     "/v1/zones": { "get": { "summary": "Authoritative zones", "responses": { "200": { "description": "[{origin,serial,records}]" } } } },
     "/v1/zones/{origin}": {
       "get": { "summary": "Authoritative zone with structured records", "responses": { "200": { "description": "{origin,serial,record_count,records:[{name,type,ttl,value}]}" }, "404": { "description": "{error}" } } },
@@ -5911,7 +5977,7 @@ mod tests {
                 }
             }),
             cluster_status: Box::new(|| {
-                "{\"self\":{\"id\":null,\"role\":\"standalone\",\"backend\":\"unknown\",\"listeners\":0,\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true},\"peers\":[]}".to_string()
+                "{\"self\":{\"id\":null,\"role\":\"standalone\",\"backend\":\"unknown\",\"listeners\":0,\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true,\"version\":null},\"peers\":[]}".to_string()
             }),
             cluster_propose: Box::new(|body| {
                 if body.contains('{') {
@@ -5933,6 +5999,21 @@ mod tests {
             }),
             boot_service_set: Box::new(|_| {
                 Err("부팅 서비스 등록은 Windows에서만 됩니다".to_string())
+            }),
+            update_status: Box::new(|| {
+                "{\"participating\":true,\"result\":\"available\",\"new_version\":\"9.9.9\"}"
+                    .to_string()
+            }),
+            update_check: Box::new(|| Ok("{\"id\":1,\"status\":\"running\"}".to_string())),
+            update_apply: Box::new(|version| {
+                if version == "9.9.9" {
+                    Ok("{\"id\":2,\"status\":\"running\"}".to_string())
+                } else {
+                    Err(format!("The last check found version 9.9.9, not {version}"))
+                }
+            }),
+            update_rollback: Box::new(|| {
+                Err("There is no committed update to roll back".to_string())
             }),
             metrics_extra: Box::new(|| {
                 "onetdns_transport_errors_total{transport=\"doh\",stage=\"accept\"} 3\n".to_string()
@@ -6986,6 +7067,108 @@ mod tests {
             body.contains("Windows"),
             "어디서 되는지 알려야 합니다: {body}"
         );
+    }
+
+    #[test]
+    /**
+     * @brief 업데이트 경로의 권한과 응답 코드.
+     * @details 상태는 읽기 전용도 보고 작업은 관리자만 시작한다. 적용 요청에 버전이 없으면 400,
+     *          마지막 확인 결과와 다르면 409 다. 지금 상태로 할 수 없는 작업도 409 다.
+     */
+    fn update_routes_check_roles_and_the_confirmed_version() {
+        let st = test_state("adm", "ro");
+        assert_eq!(call(&st, "GET", "/v1/system/update", "ro", "").0, 200);
+        assert_eq!(call(&st, "GET", "/v1/system/update", "", "").0, 401);
+        for path in [
+            "/v1/system/update/check",
+            "/v1/system/update/apply",
+            "/v1/system/update/rollback",
+        ] {
+            let body = "{\"version\":\"9.9.9\"}";
+            assert_eq!(call(&st, "POST", path, "ro", body).0, 403, "{path}");
+            assert_eq!(call(&st, "POST", path, "", body).0, 401, "{path}");
+        }
+
+        assert_eq!(
+            call(&st, "POST", "/v1/system/update/check", "adm", "").0,
+            200
+        );
+        assert_eq!(
+            call(
+                &st,
+                "POST",
+                "/v1/system/update/apply",
+                "adm",
+                "{\"version\":\"9.9.9\"}"
+            )
+            .0,
+            200
+        );
+        for body in ["", "{}", "{\"version\":\"\"}", "{\"version\":9}"] {
+            assert_eq!(
+                call(&st, "POST", "/v1/system/update/apply", "adm", body).0,
+                400,
+                "{body}"
+            );
+        }
+        let (code, body) = call(
+            &st,
+            "POST",
+            "/v1/system/update/apply",
+            "adm",
+            "{\"version\":\"9.9.8\"}",
+        );
+        assert_eq!(code, 409);
+        assert!(body.contains("9.9.9"), "{body}");
+        assert_eq!(
+            call(&st, "POST", "/v1/system/update/rollback", "adm", "").0,
+            409
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 업데이트 요청이 변경 잠금과 클러스터 합의를 거치지 않는지.
+     * @details 설정을 바꾸지 않는 노드 로컬 작업이다. 합의를 거치면 팔로워에서 거절되거나, 설정
+     *          파일을 읽지 못하는 동안 실패한다.
+     */
+    fn update_routes_do_not_go_through_cluster_write() {
+        let base = test_state("adm", "ro");
+        let mut controls = Controls::noop();
+        controls.cluster_write = Box::new(|_, _, _, _| {
+            (
+                "503 Service Unavailable",
+                "application/json",
+                "{\"error\":\"cluster\"}".to_string(),
+            )
+        });
+        controls.update_check = Box::new(|| Ok("{\"id\":1,\"status\":\"running\"}".to_string()));
+        controls.update_apply = Box::new(|_| Ok("{\"id\":2,\"status\":\"running\"}".to_string()));
+        controls.update_rollback = Box::new(|| Ok("{\"id\":3,\"status\":\"running\"}".to_string()));
+        let st = AppState {
+            controls: Arc::new(controls),
+            ..base
+        };
+
+        assert_eq!(
+            call(
+                &st,
+                "POST",
+                "/v1/block",
+                "adm",
+                "{\"domain\":\"example.com\"}"
+            )
+            .0,
+            503,
+            "설정을 바꾸는 요청은 합의를 거칩니다"
+        );
+        for (path, body) in [
+            ("/v1/system/update/check", ""),
+            ("/v1/system/update/apply", "{\"version\":\"9.9.9\"}"),
+            ("/v1/system/update/rollback", ""),
+        ] {
+            assert_eq!(call(&st, "POST", path, "adm", body).0, 200, "{path}");
+        }
     }
 
     #[test]

@@ -79,14 +79,25 @@ impl RestartPolicy {
 mod linux {
     use super::{RestartDecision, RestartPolicy, MAX_STARTUP_FAILURES};
     use crate::error::{BoxResult, Context};
+    use crate::update::launch::UPDATE_EXIT_CODE;
+    use crate::update::trial::{Startup, Trial};
     use onetdns_config::Config;
     use std::net::{SocketAddr, UdpSocket};
-    use std::path::PathBuf;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /**
+     * @brief 자식을 띄울 실행 파일. 부모가 지금 실행 중인 이미지를 가리킨다.
+     * @details 설치 경로로 띄우면 실행 중인 파일을 rename 으로 갈아 끼운 뒤에는 그 경로가
+     *          새 파일을 가리키거나 끝에 (deleted) 가 붙는다. 그러면 재시작한 자식이 부모와
+     *          다른 판으로 뜨거나 아예 뜨지 못한다. 이 경로는 디렉터리를 거치지 않고 이미지로
+     *          바로 가므로, 권한을 낮춘 뒤 확인할 것도 파일 자체의 실행 권한뿐이다.
+     */
+    const SELF_IMAGE: &str = "/proc/self/exe";
     /** @brief 자식이 준비를 알릴 주소를 넘기는 환경 변수. */
     const READY_ADDR_ENV: &str = "ONETDNS_SUPERVISOR_READY_ADDR";
     /** @brief 준비 통지에 쓸 토큰. 남이 이 서버의 자식인 척 알리지 못하게 한다. */
@@ -205,6 +216,29 @@ mod linux {
         Ok(())
     }
 
+    /**
+     * @brief 프로세스 이름을 argv[0] 의 파일 이름으로 되돌린다.
+     * @details 커널은 실행한 경로의 마지막 부분을 프로세스 이름으로 삼으므로 SELF_IMAGE 로
+     *          뜬 자식의 이름은 exe 가 된다. 그대로 두면 top, pgrep, killall 과 OOM 기록에서
+     *          이 서버를 찾지 못한다.
+     * @warning 스레드는 만들어질 때 이름을 물려받으므로 다른 스레드를 띄우기 전에 부른다.
+     */
+    fn restore_process_name() -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let Some(argv0) = std::env::args_os().next() else {
+            return Ok(());
+        };
+        let Some(name) = Path::new(&argv0).file_name() else {
+            return Ok(());
+        };
+        let name = std::ffi::CString::new(name.as_bytes())?;
+        if unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /** @brief 이 서버가 시작한 자식 하나. */
     struct ManagedChild {
         /** @brief 시작한 자식. */
@@ -237,17 +271,21 @@ mod linux {
         }
     }
 
-    /** @brief 자식을 시작한다. 준비 통지 주소와 토큰을 물려준다. */
+    /**
+     * @brief 자식을 시작한다. 준비 통지 주소와 토큰, 설치 경로를 물려준다.
+     * @param program 자식의 argv[0]. ps 와 서비스 관리자가 보여 주는 이름이고, 자식은 여기서
+     *        프로세스 이름을 되찾는다.
+     */
     fn spawn_child(
-        config_path: Option<&std::path::Path>,
+        program: &Path,
+        config_path: Option<&Path>,
         no_web: bool,
         restarts: u64,
     ) -> BoxResult<ManagedChild> {
         let (readiness, ready_address, ready_token) = readiness_channel()
             .with_context(|| "Could not create the supervisor readiness channel")?;
-        let executable = std::env::current_exe()
-            .with_context(|| "Could not find the path of the current executable")?;
-        let mut command = Command::new(executable);
+        let mut command = Command::new(SELF_IMAGE);
+        command.arg0(program);
         command.arg("run");
         if let Some(path) = config_path {
             command.arg("--config").arg(path);
@@ -259,6 +297,12 @@ mod linux {
         command.env(READY_ADDR_ENV, ready_address.to_string());
         command.env(READY_TOKEN_ENV, encode_token(&ready_token));
         command.env(RESTARTS_ENV, restarts.to_string());
+        command.env(
+            crate::update::install::INSTALL_PATH_ENV,
+            crate::update::install::current()
+                .map(|install| install.path().as_os_str().to_os_string())
+                .unwrap_or_default(),
+        );
         crate::osnet::harden_child_env(&mut command);
         let process = command
             .spawn()
@@ -318,6 +362,21 @@ mod linux {
         !stop.load(Ordering::Acquire)
     }
 
+    /**
+     * @brief 이 부모를 설치 경로의 실행 파일로 바꾼다. 인수는 그대로 넘긴다.
+     * @return 돌아오면 exec 가 실패한 것이고 그 이유다.
+     */
+    fn exec_install_path() -> String {
+        match crate::update::install::current() {
+            Ok(install) => format!(
+                "Could not start {}: {}",
+                install.path().display(),
+                crate::update::launch::exec_installed(install)
+            ),
+            Err(reason) => reason,
+        }
+    }
+
     /** @brief 종료 상태를 사람이 읽을 문자열로. */
     fn status_text(status: ExitStatus) -> String {
         use std::os::unix::process::ExitStatusExt;
@@ -331,12 +390,22 @@ mod linux {
     /**
      * @brief 감독 반복을 돌린다.
      * @details 자식을 시작하고, 준비를 기다리고, 죽으면 정책에 따라 재시작한다. 준비된
-     *          뒤에는 부모도 권한을 내려놓는다.
+     *          뒤에는 부모도 권한을 내려놓는다. 업데이트 기록은 부모가 처리한다. 새 버전을
+     *          시험하는 동안 자식이 준비 전에 끝나거나 기한을 넘기면 재시작하지 않고 되돌린 뒤
+     *          되돌린 실행 파일을 exec 하고, 자식이 업데이트 종료 코드로 끝나면 맞바꾼 실행
+     *          파일을 exec 한다.
      */
     pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
+        let mut trial = match crate::update::trial::on_start(&mut || {}) {
+            Startup::Normal => None,
+            Startup::Trial(trial) => Some(trial),
+            Startup::Reverted => return Err(crate::anyhow!(exec_install_path())),
+        };
         if config_path.is_none() && !no_web {
             config_path = crate::ensure_auto_config();
         }
+        let program = std::env::current_exe()
+            .with_context(|| "Could not find the path of the current executable")?;
         let config = Config::load_or_default(config_path.as_deref())?;
         let run_as = config
             .run_as_user
@@ -357,7 +426,7 @@ mod linux {
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let mut child = spawn_child(config_path.as_deref(), no_web, restarts)?;
+            let mut child = spawn_child(&program, config_path.as_deref(), no_web, restarts)?;
             onetdns_core::info!(
                 event = "supervisor.child_started",
                 pid = child.process.id(),
@@ -370,26 +439,41 @@ mod linux {
                     terminate_child(&mut child.process);
                     return Ok(());
                 }
-                if child.poll_ready()? && !parent_privileges_dropped {
-                    let (user, group) = run_as.as_ref().expect("run_as is set");
-                    if let Err(error) = crate::privdrop::drop_privileges(user, group.as_deref()) {
-                        terminate_child(&mut child.process);
-                        return Err(crate::anyhow!(format!(
-                            "Stopping the service because the supervisor could not drop privileges: {error}"
-                        )));
+                if child.poll_ready()? {
+                    if let Some(trial) = trial.take() {
+                        trial.commit();
                     }
-                    if let Err(error) = crate::privdrop::executable_still_runnable() {
-                        terminate_child(&mut child.process);
-                        return Err(crate::anyhow!(format!(
-                            "Stopping the service because the child cannot be restarted after dropping privileges: {error}"
-                        )));
+                    if !parent_privileges_dropped {
+                        let (user, group) = run_as.as_ref().expect("run_as is set");
+                        if let Err(error) = crate::privdrop::drop_privileges(user, group.as_deref())
+                        {
+                            terminate_child(&mut child.process);
+                            return Err(crate::anyhow!(format!(
+                                "Stopping the service because the supervisor could not drop privileges: {error}"
+                            )));
+                        }
+                        if let Err(error) =
+                            crate::privdrop::executable_still_runnable(Path::new(SELF_IMAGE))
+                        {
+                            terminate_child(&mut child.process);
+                            return Err(crate::anyhow!(format!(
+                                "Stopping the service because {user} cannot run {} to restart the DNS service process: {error}",
+                                program.display()
+                            )));
+                        }
+                        parent_privileges_dropped = true;
+                        onetdns_core::info!(
+                            event = "supervisor.privdrop_applied",
+                            user,
+                            "Dropped the supervisor's privileges"
+                        );
                     }
-                    parent_privileges_dropped = true;
-                    onetdns_core::info!(
-                        event = "supervisor.privdrop_applied",
-                        user,
-                        "Dropped the supervisor's privileges"
-                    );
+                }
+                if trial.as_ref().is_some_and(Trial::expired)
+                    && trial.take().is_some_and(Trial::revert_expired)
+                {
+                    terminate_child(&mut child.process);
+                    return Err(crate::anyhow!(exec_install_path()));
                 }
                 match child.process.try_wait()? {
                     Some(status) => break status,
@@ -399,6 +483,28 @@ mod linux {
 
             if stop.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if let Some(trial) = trial.take() {
+                let reason = format!(
+                    "The new version exited before it became ready ({})",
+                    status_text(status)
+                );
+                if trial.revert(&reason) {
+                    return Err(crate::anyhow!(exec_install_path()));
+                }
+            } else if status.code() == Some(UPDATE_EXIT_CODE) {
+                onetdns_core::info!(
+                    event = "supervisor.update_exec",
+                    "The DNS service process installed an update; starting the new version"
+                );
+                let error = exec_install_path();
+                onetdns_core::error!(event = "supervisor.update_exec_failed", %error, "Could not start the new version; putting the previous executable back");
+                if let Err(error) = crate::update::apply::undo_unstarted(&format!(
+                    "Could not start the new version: {error}"
+                )) {
+                    onetdns_core::error!(event = "supervisor.update_undo_failed", %error, "Could not put the previous executable back; supervising the running version");
+                }
+                continue;
             }
             let runtime = child.started.elapsed();
             let ready = child.ready;
@@ -427,7 +533,11 @@ mod linux {
         }
     }
 
-    /** @brief 준비를 알릴 방법을 가져간다. 감독 없이 돌면 없다. */
+    /**
+     * @brief 준비를 알릴 방법을 가져간다. 감독 없이 돌면 없다.
+     * @details 감독받는 자식이면 덤프를 막고 프로세스 이름을 되찾는 일도 여기서 한다. 다른
+     *          스레드가 뜨기 전에 불러야 한다.
+     */
     pub fn take_ready_callback() -> BoxResult<Option<Box<dyn FnOnce() + Send>>> {
         let address = std::env::var(READY_ADDR_ENV).ok();
         let token = std::env::var(READY_TOKEN_ENV).ok();
@@ -438,6 +548,9 @@ mod linux {
         }
         disable_process_dumping()
             .with_context(|| "Could not make the DNS child process non-dumpable")?;
+        if let Err(error) = restore_process_name() {
+            onetdns_core::warn!(event = "supervisor.process_name_failed", %error, "Could not restore the process name of the DNS service process; it is listed as exe");
+        }
         let address = address
             .ok_or_else(|| crate::anyhow!("The supervisor readiness address is missing"))?
             .parse::<SocketAddr>()

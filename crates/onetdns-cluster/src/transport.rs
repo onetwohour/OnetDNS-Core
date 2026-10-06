@@ -73,8 +73,18 @@ const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(5);
 /** @brief 프레임 하나를 다 읽을 때까지 기다릴 시간. */
 const RAFT_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/** @brief 프레임 형식 버전. */
-const RAFT_FRAME_VERSION: u8 = 1;
+/**
+ * @brief 프레임 형식 버전.
+ * @warning 머리의 배치나 봉한 본문의 배치를 바꾸면 올린다. 번호가 다른 프레임은 인증하기 전에
+ *          버리므로, 번호가 다른 노드끼리는 서로의 제품 버전도 알 수 없다.
+ */
+const RAFT_FRAME_VERSION: u8 = 2;
+
+/**
+ * @brief 봉한 본문 앞에 싣는 제품 버전의 최대 길이.
+ * @details 길이를 1바이트로 적으므로 255를 넘을 수 없다. 버전 문자열은 이보다 훨씬 짧다.
+ */
+const MAX_PRODUCT_VERSION_LEN: usize = 64;
 
 /**
  * @brief 재생 방어 구간의 폭(비트).
@@ -506,6 +516,7 @@ impl Dispatcher {
     /** @brief 노드마다 송신 스레드를 시작하고 분배기를 만든다. */
     fn new(
         self_id: NodeId,
+        version: &'static str,
         peers: &HashMap<NodeId, String>,
         cipher: Arc<XChaCha20Poly1305>,
         signing_key: Arc<SigningKey>,
@@ -528,6 +539,7 @@ impl Dispatcher {
                 .spawn(move || {
                     peer_sender(
                         self_id,
+                        version,
                         peer_id,
                         socket,
                         cipher,
@@ -599,6 +611,7 @@ fn reject_raft_connection(ip: IpAddr, reason: &str) {
  */
 fn peer_sender(
     self_id: NodeId,
+    version: &'static str,
     peer_id: NodeId,
     address: SocketAddr,
     cipher: Arc<XChaCha20Poly1305>,
@@ -608,8 +621,13 @@ fn peer_sender(
     shutdown: &AtomicBool,
     receiver: Receiver<Msg>,
 ) {
-    let Some(sealer) = FrameSealer::new(cipher, signing_key, cluster_context, session_prefix)
-    else {
+    let Some(sealer) = FrameSealer::new(
+        cipher,
+        signing_key,
+        cluster_context,
+        session_prefix,
+        version,
+    ) else {
         onetdns_core::error!(
             event = "raft.sealer_init_failed",
             peer = peer_id,
@@ -683,16 +701,19 @@ fn peer_sender(
 }
 
 /**
- * @brief 노드마다 인증을 통과한 프레임을 마지막으로 받은 시각.
+ * @brief 노드마다 인증을 통과한 프레임에서 알게 된 것: 마지막으로 받은 시각과 그 노드의 제품 버전.
  * @details 클러스터 프레임은 한 방향으로만 흐르고 응답도 별도 프레임으로 오므로, 요청과
  *          응답을 짝지어 왕복 시간을 측정할 수 없다. 대신 서명과 암호를 모두 통과한 프레임을
- *          받았다는 사실은 그 노드가 살아 있고 같은 클러스터 키를 쓴다는 증거가 된다.
+ *          받았다는 사실은 그 노드가 살아 있고 같은 클러스터 키를 쓴다는 증거가 된다. 버전이 달라
+ *          버린 프레임도 인증은 통과했으므로 함께 적는다.
  */
 struct PeerContact {
     /** @brief 시각을 측정할 기준점. */
     origin: Instant,
     /** @brief 노드별 마지막 수신 시각. 기준점부터 지난 밀리초에 1을 더한 값이고, 0은 받은 적 없음이다. */
     last: HashMap<NodeId, AtomicU64>,
+    /** @brief 노드별로 마지막에 받은 프레임의 제품 버전. 받은 적이 없으면 없다. */
+    versions: HashMap<NodeId, Mutex<Option<String>>>,
 }
 
 impl PeerContact {
@@ -701,7 +722,29 @@ impl PeerContact {
         Self {
             origin: Instant::now(),
             last: peers.keys().map(|id| (*id, AtomicU64::new(0))).collect(),
+            versions: peers.keys().map(|id| (*id, Mutex::new(None))).collect(),
         }
+    }
+
+    /**
+     * @brief 이 노드가 보낸 프레임의 제품 버전을 적는다.
+     * @return 적어 둔 버전과 달라졌으면 참이다. 처음 받은 것도 달라진 것으로 본다.
+     */
+    fn note_version(&self, from: NodeId, version: &str) -> bool {
+        let Some(slot) = self.versions.get(&from) else {
+            return false;
+        };
+        let mut seen = lock(slot);
+        if seen.as_deref() == Some(version) {
+            return false;
+        }
+        *seen = Some(version.to_string());
+        true
+    }
+
+    /** @brief 이 노드에게서 마지막으로 받은 제품 버전. */
+    fn version(&self, peer: NodeId) -> Option<String> {
+        lock(self.versions.get(&peer)?).clone()
     }
 
     /** @brief 이 노드에게서 방금 프레임을 받았다고 적는다. */
@@ -742,6 +785,8 @@ pub struct RaftHandle {
     contact_window: Duration,
     /** @brief 이 노드 번호. */
     self_id: NodeId,
+    /** @brief 이 노드의 제품 버전. */
+    version: &'static str,
     /** @brief 끝나라는 표시. */
     shutdown: Arc<AtomicBool>,
     /** @brief 적용 진도와 그것을 기다리는 곳. */
@@ -1030,15 +1075,18 @@ impl RaftHandle {
                     "member"
                 };
                 format!(
-                    "{{\"id\":{id},\"url\":{},\"healthy\":{},\"role\":\"{peer_role}\",\"rtt_ms\":null}}",
+                    "{{\"id\":{id},\"url\":{},\"healthy\":{},\"role\":\"{peer_role}\",\"rtt_ms\":null,\"version\":{}}}",
                     onetdns_core::json::escape(url),
-                    peer_healthy.map_or("null", |value| if value { "true" } else { "false" })
+                    peer_healthy.map_or("null", |value| if value { "true" } else { "false" }),
+                    self.contact
+                        .version(id)
+                        .map_or_else(|| "null".to_string(), |version| onetdns_core::json::escape(&version))
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"self\":{{\"id\":{},\"role\":\"{}\",\"backend\":{},\"listeners\":{listeners},\"leader\":{},\"term\":{},\"commit_index\":{},\"last_applied\":{},\"last_index\":{},\"snapshot_index\":{},\"retained_log_entries\":{},\"fatal\":{},\"healthy\":{healthy}}},\"peers\":[{peers}]}}",
+            "{{\"self\":{{\"id\":{},\"role\":\"{}\",\"backend\":{},\"listeners\":{listeners},\"leader\":{},\"term\":{},\"commit_index\":{},\"last_applied\":{},\"last_index\":{},\"snapshot_index\":{},\"retained_log_entries\":{},\"fatal\":{},\"healthy\":{healthy},\"version\":{}}},\"peers\":[{peers}]}}",
             self.self_id,
             role,
             onetdns_core::json::escape(backend),
@@ -1050,6 +1098,7 @@ impl RaftHandle {
             node.snapshot_index(),
             node.retained_log_len(),
             fatal,
+            onetdns_core::json::escape(self.version),
         )
     }
 
@@ -1178,6 +1227,8 @@ struct FrameSealer {
     signing_key: Arc<SigningKey>,
     /** @brief 이 클러스터를 가리키는 값. 다른 클러스터로 옮겨 붙이지 못하게 묶는다. */
     cluster_context: [u8; 32],
+    /** @brief 보내는 노드의 제품 버전. 봉한 본문 앞에 싣는다. */
+    version: &'static str,
 }
 
 impl FrameSealer {
@@ -1187,6 +1238,7 @@ impl FrameSealer {
         signing_key: Arc<SigningKey>,
         cluster_context: [u8; 32],
         session_prefix: u64,
+        version: &'static str,
     ) -> Option<Self> {
         let session_id = new_session_id(session_prefix)?;
         Some(Self {
@@ -1195,6 +1247,7 @@ impl FrameSealer {
             sequence: AtomicU64::new(0),
             signing_key,
             cluster_context,
+            version,
         })
     }
 
@@ -1202,11 +1255,18 @@ impl FrameSealer {
      * @brief 메시지를 인증·암호화된 프레임으로 봉인한다.
      *
      * @details 발신자 ID를 AAD에 넣는다. 그래서 프레임을 다른 발신자 이름으로 옮겨 붙일
-     *          수 없다. 서명은 그 위에 노드 신원을 한 겹 더 묶는다.
+     *          수 없다. 서명은 그 위에 노드 신원을 한 겹 더 묶는다. 제품 버전은 봉한 본문 앞에
+     *          길이 1바이트와 함께 싣는다. 받는 쪽은 복호화한 뒤에만 버전을 보므로 머리에 둘 까닭이
+     *          없고, 머리에 두면 클러스터 연결을 엿보는 쪽에 빌드 버전이 드러난다.
      * @note 논스는 세션 식별자 + 증가하는 일련번호다. 무작위가 아니라 결정적이므로,
      *       같은 세션 안에서 논스가 겹칠 수 없다.
      */
     fn frame(&self, from: NodeId, to: NodeId, message: &[u8]) -> Option<Vec<u8>> {
+        let version_len = u8::try_from(self.version.len()).ok()?;
+        let mut plaintext = Vec::with_capacity(1 + self.version.len() + message.len());
+        plaintext.push(version_len);
+        plaintext.extend_from_slice(self.version.as_bytes());
+        plaintext.extend_from_slice(message);
         let sequence = self
             .sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| s.checked_add(1))
@@ -1225,7 +1285,7 @@ impl FrameSealer {
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: message,
+                    msg: &plaintext,
                     aad: &aad,
                 },
             )
@@ -1280,6 +1340,29 @@ fn frame_aad(cluster_context: &[u8; 32], header: &[u8]) -> Vec<u8> {
 }
 
 /**
+ * @brief 제품 버전으로 쓸 수 있는지. 공백과 제어 문자가 없는 ASCII 1..=64바이트여야 한다.
+ * @details 받은 버전은 로그와 상태 응답에 그대로 실린다. 보내는 쪽도 같은 규칙으로 확인해, 받는
+ *          쪽이 거절할 버전으로는 시작하지 않는다.
+ */
+fn product_version_valid(version: &[u8]) -> bool {
+    (1..=MAX_PRODUCT_VERSION_LEN).contains(&version.len())
+        && version.iter().all(u8::is_ascii_graphic)
+}
+
+/**
+ * @brief 복호화한 본문에서 보낸 노드의 제품 버전과 메시지를 나눈다.
+ * @return 길이가 맞지 않거나 버전으로 쓸 수 없는 바이트가 있으면 없다.
+ */
+fn split_versioned(plaintext: &[u8]) -> Option<(&str, &[u8])> {
+    let (&length, rest) = plaintext.split_first()?;
+    let (version, message) = rest.split_at_checked(usize::from(length))?;
+    if !product_version_valid(version) {
+        return None;
+    }
+    Some((std::str::from_utf8(version).ok()?, message))
+}
+
+/**
  * @brief 클러스터 구성에서 문맥 해시를 유도한다.
  * @details 구성이 다르면 문맥도 다르다. 실수로 두 클러스터가 같은 비밀을 써도 프레임이
  *          서로 통하지 않는다.
@@ -1322,6 +1405,9 @@ impl RaftServer {
     /**
      * @brief Raft 런타임을 시작한다. 리스너, 틱 스레드, 적용 스레드, 노드별 송신 스레드.
      *
+     * @param version  이 노드의 제품 버전. 같은 버전의 노드끼리만 메시지를 주고받는다. 복제하는
+     *                 설정의 키와 의미, 로그 항목과 스냅숏 형식, RPC 메시지가 모두 버전에 따라
+     *                 달라질 수 있기 때문이다.
      * @param on_apply 커밋된 항목을 상태 기계에 반영하는 콜백. 설정 복제의 착지점이다.
      * @warning 클러스터 비밀은 32바이트 이상이어야 한다. 짧으면 시작을 거부한다. 약한
      *          비밀은 인증이 없는 것과 다름없다.
@@ -1329,6 +1415,7 @@ impl RaftServer {
      */
     pub fn spawn(
         self_id: NodeId,
+        version: &'static str,
         listen: String,
         peers: HashMap<NodeId, String>,
         node: RaftNode,
@@ -1347,6 +1434,11 @@ impl RaftServer {
         }
         if tick_ms == 0 {
             return Err("Raft tick_ms cannot be 0".into());
+        }
+        if !product_version_valid(version.as_bytes()) {
+            return Err(format!(
+                "The product version must be 1..={MAX_PRODUCT_VERSION_LEN} visible ASCII characters"
+            ));
         }
         if let Some(error) = node.fatal_error() {
             return Err(error.to_string());
@@ -1423,6 +1515,7 @@ impl RaftServer {
         };
         let dispatcher = Dispatcher::new(
             self_id,
+            version,
             &peers,
             cipher.clone(),
             signing_key.clone(),
@@ -1441,6 +1534,7 @@ impl RaftServer {
             contact: contact.clone(),
             contact_window,
             self_id,
+            version,
             shutdown: shutdown.clone(),
             progress: progress.clone(),
             accepting_proposals,
@@ -1563,6 +1657,7 @@ impl RaftServer {
                                     };
                                     handle_conn(
                                         self_id,
+                                        version,
                                         stream,
                                         &node,
                                         &peers,
@@ -1727,12 +1822,15 @@ impl RaftServer {
  * @brief 들어온 클러스터 연결 하나를 처리한다.
  *
  * @details 프레임을 열고, 서명으로 발신자를 확인하고, 재생 구간을 통과시킨 뒤에야 상태
- *          기계에 넘긴다. 세 검사 중 하나라도 실패하면 연결을 끊는다.
+ *          기계에 넘긴다. 세 검사 중 하나라도 실패하면 연결을 끊는다. 그다음 보낸 노드의 제품
+ *          버전이 이 노드와 다르면 그 프레임만 버리고 연결은 유지한다. 끊으면 보내는 쪽이
+ *          메시지마다 다시 연결한다.
  * @warning 인증된 발신자 ID를 상태 기계에 넘긴다. 메시지 본문의 리더·후보 필드를
  *          그대로 믿으면 아무 노드나 리더를 사칭할 수 있다.
  */
 fn handle_conn(
     self_id: NodeId,
+    version: &'static str,
     stream: TcpStream,
     node: &Arc<Mutex<RaftNode>>,
     peers: &HashMap<NodeId, String>,
@@ -1836,7 +1934,32 @@ fn handle_conn(
             }
             return;
         }
-        let Some(message) = decode_msg(&plaintext) else {
+        let Some((peer_version, encoded)) = split_versioned(&plaintext) else {
+            return;
+        };
+        if contact.note_version(from, peer_version) {
+            if peer_version == version {
+                onetdns_core::info!(
+                    event = "raft.peer_version",
+                    peer = from,
+                    version = peer_version,
+                    "A cluster node runs the same OnetDNS version"
+                );
+            } else {
+                onetdns_core::warn!(
+                    event = "raft.peer_version_mismatch",
+                    peer = from,
+                    version = peer_version,
+                    own_version = version,
+                    "A cluster node runs a different OnetDNS version; its cluster messages are ignored until both run the same version"
+                );
+            }
+        }
+        if peer_version != version {
+            contact.record(from);
+            continue;
+        }
+        let Some(message) = decode_msg(encoded) else {
             return;
         };
         match &message {
@@ -1858,6 +1981,17 @@ fn handle_conn(
 /** @brief 프레임 봉하기와 사칭 거부, 그리고 재시작 뒤 상태 복구. */
 mod tests {
     use super::*;
+
+    /** @brief 테스트 노드들의 제품 버전. */
+    const TEST_VERSION: &str = "1.0.0";
+
+    /** @brief 상태 JSON 에서 한 피어의 항목만 잘라 낸다. */
+    fn peer_entry(status: &str, id: NodeId) -> String {
+        let marker = format!("{{\"id\":{id},");
+        let start = status.rfind(&marker).expect("노드 항목");
+        let end = status[start..].find('}').expect("항목 끝") + start;
+        status[start..=end].to_string()
+    }
 
     /** @brief Raft 진행 신호를 기다리며 상태 조건을 확인한다. */
     fn wait_for_progress(
@@ -1913,6 +2047,7 @@ mod tests {
         let applied_in_callback = applied.clone();
         let handle = RaftServer::spawn(
             1,
+            TEST_VERSION,
             "127.0.0.1:0".into(),
             HashMap::new(),
             RaftNode::new(
@@ -1962,6 +2097,7 @@ mod tests {
         let applied_in_callback = applied.clone();
         let handle = RaftServer::spawn(
             1,
+            TEST_VERSION,
             "127.0.0.1:0".into(),
             HashMap::new(),
             RaftNode::new(
@@ -2020,6 +2156,7 @@ mod tests {
         let snapshot_state = applied.clone();
         let handle = RaftServer::spawn(
             1,
+            TEST_VERSION,
             "127.0.0.1:0".into(),
             HashMap::new(),
             RaftNode::new(
@@ -2163,6 +2300,7 @@ mod tests {
             let install_state = states[index].clone();
             RaftServer::spawn(
                 self_id,
+                TEST_VERSION,
                 addresses[index].to_string(),
                 peers,
                 RaftNode::new(
@@ -2206,12 +2344,6 @@ mod tests {
             panic!("2/3 정족수 리더 선출 실패");
         };
         let follower = 1 - leader;
-        let peer_entry = |status: &str, id: NodeId| -> String {
-            let marker = format!("{{\"id\":{id},");
-            let start = status.rfind(&marker).expect("노드 항목");
-            let end = status[start..].find('}').expect("항목 끝") + start;
-            status[start..=end].to_string()
-        };
         let observed_deadline = Instant::now() + Duration::from_secs(2);
         let (leader_view, follower_view) = loop {
             let leader_view = handles[leader].status_json("Native", 1);
@@ -2321,6 +2453,7 @@ mod tests {
             handles.push(
                 RaftServer::spawn(
                     self_id,
+                    TEST_VERSION,
                     addresses[index].to_string(),
                     peers,
                     RaftNode::new(
@@ -2413,6 +2546,7 @@ mod tests {
     fn proposal_after_shutdown_is_rejected_immediately() {
         let handle = RaftServer::spawn(
             1,
+            TEST_VERSION,
             "127.0.0.1:0".into(),
             HashMap::new(),
             RaftNode::new(
@@ -2523,7 +2657,8 @@ mod tests {
     fn frame_sealer_shares_cipher_and_signing_key() {
         let cipher = Arc::new(raft_cipher(&[7u8; 32]).unwrap());
         let signing = Arc::new(SigningKey::from_bytes(&[5u8; 32]));
-        let sealer = FrameSealer::new(cipher.clone(), signing.clone(), [3u8; 32], 77).unwrap();
+        let sealer =
+            FrameSealer::new(cipher.clone(), signing.clone(), [3u8; 32], 77, TEST_VERSION).unwrap();
 
         assert!(Arc::ptr_eq(&cipher, &sealer.cipher));
         assert!(Arc::ptr_eq(&signing, &sealer.signing_key));
@@ -2540,6 +2675,7 @@ mod tests {
             Arc::new(signing),
             [3u8; 32],
             77,
+            TEST_VERSION,
         )
         .unwrap();
         let message = encode_msg(&Msg::RequestVoteResp {
@@ -2550,6 +2686,12 @@ mod tests {
         assert!(!framed
             .windows(message.len())
             .any(|window| window == message));
+        assert!(
+            !framed
+                .windows(TEST_VERSION.len())
+                .any(|window| window == TEST_VERSION.as_bytes()),
+            "제품 버전은 봉한 본문 안에만 있어야 합니다"
+        );
 
         let length = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
         assert_eq!(length, framed.len() - 4);
@@ -2581,7 +2723,223 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(plain, message);
+        assert_eq!(usize::from(plain[0]), TEST_VERSION.len());
+        assert_eq!(
+            split_versioned(&plain),
+            Some((TEST_VERSION, message.as_slice()))
+        );
+    }
+
+    #[test]
+    /** @brief 본문 앞의 제품 버전을 길이와 글자로 확인하는지. */
+    fn versioned_plaintext_rejects_malformed_versions() {
+        assert_eq!(
+            split_versioned(b"\x051.0.0rest"),
+            Some(("1.0.0", &b"rest"[..]))
+        );
+        assert_eq!(split_versioned(b"\x051.0.0"), Some(("1.0.0", &b""[..])));
+        assert_eq!(split_versioned(&[]), None);
+        assert_eq!(split_versioned(&[0, 1, 2]), None, "빈 버전");
+        assert_eq!(split_versioned(b"\x051.0."), None, "잘린 버전");
+        assert_eq!(split_versioned(b"\x031 0rest"), None, "공백");
+        assert_eq!(split_versioned(b"\x031\n0rest"), None, "제어 문자");
+        assert_eq!(
+            split_versioned(&[2, 0xc3, 0xa9, 1]),
+            None,
+            "ASCII 밖의 글자"
+        );
+        let mut longest = vec![64u8];
+        longest.extend([b'1'; 64]);
+        assert!(split_versioned(&longest).is_some());
+        let mut long = vec![65u8];
+        long.extend([b'1'; 65]);
+        assert_eq!(split_versioned(&long), None, "64바이트를 넘는 버전");
+    }
+
+    #[test]
+    /** @brief 다른 노드가 거절할 버전으로는 시작하지 않는지. */
+    fn spawn_rejects_versions_peers_would_refuse() {
+        let long: &'static str = "1".repeat(65).leak();
+        for version in ["", "1.0 0", "1.0\n0", "1.0.0é", long] {
+            let started = RaftServer::spawn(
+                1,
+                version,
+                "127.0.0.1:0".into(),
+                HashMap::new(),
+                RaftNode::new(
+                    1,
+                    vec![1],
+                    crate::raft::Config {
+                        election_base: 2,
+                        heartbeat: 1,
+                    },
+                ),
+                10,
+                vec![7; 32],
+                [9; 32],
+                HashMap::new(),
+                Box::new(|_| Ok(())),
+                Box::new(|| Ok(Vec::new())),
+                Box::new(|_| Ok(())),
+            );
+            if let Ok(handle) = started {
+                handle.shutdown();
+                panic!("{version:?} 로는 시작하지 않아야 합니다");
+            }
+        }
+    }
+
+    #[test]
+    /** @brief 노드 버전을 바뀔 때만 새로 적는지. 버전 로그를 바뀔 때만 남기는 근거다. */
+    fn peer_version_is_noted_only_when_it_changes() {
+        let peers = HashMap::from([(2, "127.0.0.1:1".to_string())]);
+        let contact = PeerContact::new(&peers);
+        assert_eq!(contact.version(2), None);
+        assert!(contact.note_version(2, "1.0.0"), "처음 받은 버전");
+        assert!(!contact.note_version(2, "1.0.0"));
+        assert!(contact.note_version(2, "1.1.0"));
+        assert_eq!(contact.version(2).as_deref(), Some("1.1.0"));
+        assert!(
+            !contact.note_version(9, "1.0.0"),
+            "설정에 없는 노드는 적지 않는다"
+        );
+        assert_eq!(contact.version(9), None);
+    }
+
+    #[test]
+    /**
+     * @brief 버전이 같은 노드끼리만 클러스터를 이루는지.
+     * @details 1, 2번은 버전이 같아 리더를 뽑고 변경을 커밋한다. 3번은 버전이 달라 인증은
+     *          통과하지만 메시지가 버려지므로 리더를 모르고 아무것도 적용하지 않는다. 서로의
+     *          버전은 상태에 남는다.
+     */
+    fn nodes_with_a_different_version_are_kept_out_of_the_cluster() {
+        let mut reserved = Vec::new();
+        let mut addresses = Vec::new();
+        for _ in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            reserved.push(listener);
+        }
+        drop(reserved);
+
+        let ids: Vec<NodeId> = vec![1, 2, 3];
+        let versions = [TEST_VERSION, TEST_VERSION, "2.0.0"];
+        let seeds = [[51u8; 32], [52u8; 32], [53u8; 32]];
+        let public = seeds.map(|seed| SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+        let states: Vec<_> = (0..3)
+            .map(|_| Arc::new(Mutex::new(Vec::<u8>::new())))
+            .collect();
+        let handles: Vec<RaftHandle> = (0..3)
+            .map(|index| {
+                let peers = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(peer, _)| *peer != index)
+                    .map(|(peer, id)| (*id, addresses[peer].to_string()))
+                    .collect();
+                let peer_keys = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(peer, _)| *peer != index)
+                    .map(|(peer, id)| (*id, public[peer]))
+                    .collect();
+                let apply_state = states[index].clone();
+                RaftServer::spawn(
+                    ids[index],
+                    versions[index],
+                    addresses[index].to_string(),
+                    peers,
+                    RaftNode::new(
+                        ids[index],
+                        ids.clone(),
+                        crate::raft::Config {
+                            election_base: 10,
+                            heartbeat: 1,
+                        },
+                    ),
+                    10,
+                    vec![7; 32],
+                    seeds[index],
+                    peer_keys,
+                    Box::new(move |data| {
+                        lock(&apply_state).extend_from_slice(data);
+                        Ok(())
+                    }),
+                    Box::new(|| Ok(Vec::new())),
+                    Box::new(|_| Ok(())),
+                )
+                .unwrap()
+            })
+            .collect();
+        let stop_all = || {
+            for handle in &handles {
+                handle.shutdown();
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let leader = loop {
+            if let Some(leader) = handles[..2].iter().position(RaftHandle::is_leader) {
+                let follower = 1 - leader;
+                let settled = handles[follower].leader() == Some(ids[leader])
+                    && peer_entry(&handles[leader].status_json("Native", 1), 3)
+                        .contains("\"version\":\"2.0.0\"")
+                    && peer_entry(&handles[follower].status_json("Native", 1), 3)
+                        .contains("\"version\":\"2.0.0\"")
+                    && peer_entry(&handles[2].status_json("Native", 1), ids[leader])
+                        .contains("\"version\":\"1.0.0\"");
+                if settled {
+                    break Some(leader);
+                }
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let Some(leader) = leader else {
+            let views: Vec<_> = handles
+                .iter()
+                .map(|handle| handle.status_json("Native", 1))
+                .collect();
+            stop_all();
+            panic!("같은 버전의 두 노드가 리더를 뽑고 서로의 버전을 알아야 합니다: {views:?}");
+        };
+        let follower = 1 - leader;
+
+        let proposal = handles[leader].propose(b"change".to_vec());
+        let applied = wait_for_progress(&handles[follower], Duration::from_secs(2), || {
+            lock(&states[follower]).as_slice() == b"change"
+        });
+        let leader_view = handles[leader].status_json("Native", 1);
+        let outsider_view = handles[2].status_json("Native", 1);
+        let outsider_leader = handles[2].leader();
+        let outsider_applied = lock(&handles[2].node).last_applied();
+        let outsider_state = lock(&states[2]).clone();
+        stop_all();
+
+        assert_eq!(proposal, Ok(2));
+        assert!(applied, "같은 버전의 팔로워에 적용되어야 합니다");
+        assert_eq!(outsider_leader, None, "버전이 다른 노드는 리더를 모릅니다");
+        assert_eq!(outsider_applied, 0);
+        assert!(outsider_state.is_empty());
+        assert!(
+            leader_view.contains("\"version\":\"1.0.0\"},\"peers\""),
+            "{leader_view}"
+        );
+        assert!(
+            peer_entry(&leader_view, ids[follower]).contains("\"version\":\"1.0.0\""),
+            "{leader_view}"
+        );
+        assert!(
+            peer_entry(&leader_view, 3).contains("\"version\":\"2.0.0\""),
+            "{leader_view}"
+        );
+        assert!(
+            outsider_view.contains("\"version\":\"2.0.0\"},\"peers\""),
+            "{outsider_view}"
+        );
     }
 
     #[test]
@@ -2596,6 +2954,7 @@ mod tests {
             Arc::new(attacker),
             [3u8; 32],
             77,
+            TEST_VERSION,
         )
         .unwrap();
         let framed = sealer
@@ -2638,6 +2997,7 @@ mod tests {
             Arc::new(SigningKey::from_bytes(&[5u8; 32])),
             [3u8; 32],
             77,
+            TEST_VERSION,
         )
         .unwrap();
         sealer.sequence.store(u64::MAX, Ordering::Relaxed);
@@ -2745,6 +3105,7 @@ mod tests {
             Arc::new(signing),
             [3u8; 32],
             77,
+            TEST_VERSION,
         )
         .unwrap();
         let mut framed = sealer.frame(9, 10, b"message").unwrap();

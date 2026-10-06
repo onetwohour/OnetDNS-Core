@@ -339,6 +339,7 @@ static FIELDS: &[Field] = &[
     f("persist_flush_secs", "int", "control", "seconds"),
     f("dnstap_file", "string", "control", ""),
     f("dnstap_identity", "string", "control", ""),
+    f("release_check", "bool", "control", ""),
 ];
 
 /** @brief 그룹 이름의 언어별 표기. 순서는 ko, en, ja, zh 이다. */
@@ -3247,6 +3248,17 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_en: "Name of this server recorded in dnstap output.",
         description_ja: "dnstap の記録に残すこのサーバーの名前です。",
         description_zh: "记录在 dnstap 输出中的本服务器名称。",
+    },
+    FieldCopy {
+        key: "release_check",
+        label_ko: "새 릴리스 확인",
+        label_en: "Check for new releases",
+        label_ja: "新しいリリースの確認",
+        label_zh: "检查新版本",
+        description_ko: "하루에 한 번 GitHub 에서 새 릴리스를 확인해 대시보드에 알립니다. 꺼도 직접 확인하고 설치할 수 있습니다.",
+        description_en: "Checks GitHub for a new release once a day and shows it on the dashboard. You can still check and install manually when this is off.",
+        description_ja: "1 日に 1 回 GitHub で新しいリリースを確認し、ダッシュボードに表示します。オフでも手動で確認・インストールできます。",
+        description_zh: "每天在 GitHub 上检查一次新版本并在管理界面中提示。关闭后仍可手动检查和安装。",
     },
 ];
 

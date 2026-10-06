@@ -46,6 +46,26 @@ pub(crate) enum Command {
     Services,
     /** @brief 대시보드 로그인에 쓸 암호 해시를 만든다. */
     Passwd { name: Option<String> },
+    /** @brief 새 릴리스를 확인하고, 시키면 설치 경로의 실행 파일을 맞바꾼다. */
+    Update {
+        /** @brief 할 일. */
+        action: UpdateAction,
+        /** @brief 서버가 쓰는 설정 파일. 이름 해석과 새 버전의 설정 검사에 쓴다. */
+        config: Option<PathBuf>,
+    },
+}
+
+/** @brief update 명령이 할 일. */
+pub(crate) enum UpdateAction {
+    /** @brief 새 릴리스를 확인만 한다. */
+    Check,
+    /** @brief 새 릴리스를 설치한다. */
+    Apply {
+        /** @brief 설치할 버전. 주면 확인한 새 버전이 이것일 때만 설치한다. */
+        version: Option<String>,
+    },
+    /** @brief 확정된 업데이트를 되돌려 바꾸기 전 버전을 다시 설치한다. */
+    Rollback,
 }
 
 /** @brief 서비스 관련 동작. */
@@ -96,6 +116,7 @@ Management commands (require --cli):
   OnetDNS --cli check [--config PATH]
   OnetDNS --cli services
   OnetDNS --cli passwd [--name NAME]  # Create a web console [[users]] entry (prompts for the password)
+  OnetDNS --cli update [apply [VERSION] | rollback] [--config PATH]
   OnetDNS service install|uninstall|run [--config PATH]
 
 Notes:
@@ -106,6 +127,11 @@ Notes:
              A control_listen setting in the config always takes precedence.
   --no-supervisor  Run the server directly without Linux process self-recovery
                    (for an external supervisor).
+  update     Checks GitHub for a newer release signed by the OnetDNS release key.
+             apply installs it and rollback reinstalls the version the last
+             update replaced. Restart OnetDNS afterwards to start the installed
+             version. Pass the --config the server uses so the new version
+             checks that configuration before it is installed.
 ";
 
 /** @brief 뒤에 값을 하나 받는 플래그들. */
@@ -146,6 +172,7 @@ const COMMAND_FLAGS: &[(&str, &[&str])] = &[
     ("services", &[]),
     ("passwd", &["--name"]),
     ("service", &["--config"]),
+    ("update", &["--config"]),
 ];
 
 /**
@@ -195,8 +222,9 @@ fn opt_path(args: &[String], flag: &str) -> Option<PathBuf> {
     opt_val(args, flag).map(PathBuf::from)
 }
 
-/** @brief 플래그가 아닌 첫 인수. */
-fn positional(args: &[String]) -> Option<String> {
+/** @brief 플래그와 그 값을 뺀 인수들. 순서는 그대로다. */
+fn positionals(args: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -207,10 +235,16 @@ fn positional(args: &[String]) -> Option<String> {
         } else if a.starts_with('-') {
             i += 1;
         } else {
-            return Some(a.clone());
+            found.push(a.clone());
+            i += 1;
         }
     }
-    None
+    found
+}
+
+/** @brief 플래그가 아닌 첫 인수. */
+fn positional(args: &[String]) -> Option<String> {
+    positionals(args).into_iter().next()
 }
 
 /** @brief 컨트롤 플레인 인수를 모은다. */
@@ -228,8 +262,16 @@ pub(crate) fn parse_args() -> Result<Command, String> {
     parse_argv(&argv)
 }
 
+/**
+ * @brief --version 이 출력하는 한 줄.
+ * @note 업데이트 사전 점검이 새 실행 파일의 출력을 이 모양과 맞댄다. 바꾸면 업데이트 계약이 바뀐다.
+ */
+pub(crate) fn version_line(version: &str) -> String {
+    format!("{PRODUCT_NAME} {version}")
+}
+
 /** @brief 인수 목록을 명령으로. */
-fn parse_argv(argv: &[String]) -> Result<Command, String> {
+pub(crate) fn parse_argv(argv: &[String]) -> Result<Command, String> {
     if argv.first().map(String::as_str) == Some("--cli") {
         let sub = argv
             .get(1)
@@ -278,7 +320,7 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
             std::process::exit(0);
         }
         "-V" | "--version" | "version" => {
-            println!("{PRODUCT_NAME} {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_line(crate::update::VERSION));
             std::process::exit(0);
         }
         "run" => Ok(Command::Run {
@@ -342,6 +384,22 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
             };
             Ok(Command::Service { action })
         }
+        "update" => {
+            let words = positionals(rest);
+            let action = match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                [] => UpdateAction::Check,
+                ["apply"] => UpdateAction::Apply { version: None },
+                ["apply", version] => UpdateAction::Apply {
+                    version: Some(version.to_string()),
+                },
+                ["rollback"] => UpdateAction::Rollback,
+                _ => return Err("update takes nothing, apply [VERSION], or rollback".into()),
+            };
+            Ok(Command::Update {
+                action,
+                config: opt_path(rest, "--config"),
+            })
+        }
         other => Err(format!("Unknown command: {other} (see OnetDNS help)")),
     }
 }
@@ -356,7 +414,7 @@ mod tests {
     fn management_commands_require_cli_prefix() {
         for command in [
             "query", "cert", "stats", "reload", "top", "block", "allow", "check", "services",
-            "passwd",
+            "passwd", "update",
         ] {
             assert!(parse_argv(&[command.to_string()]).is_err(), "{command}");
         }
@@ -409,6 +467,59 @@ mod tests {
                 accepted.contains(&flag.as_str()),
                 "도움말은 {flag} 를 안내하는데 어느 명령도 받지 않습니다"
             );
+        }
+    }
+
+    #[test]
+    /** @brief update 의 세 가지 형태를 읽고, 그 밖의 인수는 받지 않는지. */
+    fn update_forms_parse() {
+        /** @brief --cli update 뒤에 이 인수들을 붙여 읽는다. */
+        fn parse(args: &[&str]) -> Result<Command, String> {
+            let mut argv = vec!["--cli".to_string(), "update".to_string()];
+            argv.extend(args.iter().map(|arg| (*arg).to_string()));
+            parse_argv(&argv)
+        }
+
+        assert!(matches!(
+            parse(&[]),
+            Ok(Command::Update {
+                action: UpdateAction::Check,
+                config: None
+            })
+        ));
+        let Ok(Command::Update {
+            action: UpdateAction::Apply { version },
+            config,
+        }) = parse(&["apply", "0.2.0-beta.1", "--config", "/etc/onetdns.toml"])
+        else {
+            panic!("버전을 준 apply");
+        };
+        assert_eq!(version.as_deref(), Some("0.2.0-beta.1"));
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("/etc/onetdns.toml"))
+        );
+        assert!(matches!(
+            parse(&["--config=/etc/onetdns.toml", "apply"]),
+            Ok(Command::Update {
+                action: UpdateAction::Apply { version: None },
+                config: Some(_)
+            })
+        ));
+        assert!(matches!(
+            parse(&["rollback"]),
+            Ok(Command::Update {
+                action: UpdateAction::Rollback,
+                ..
+            })
+        ));
+        for wrong in [
+            &["install"][..],
+            &["apply", "1.0.0", "2.0.0"],
+            &["rollback", "1.0.0"],
+            &["apply", "--version", "1.0.0"],
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong:?}");
         }
     }
 

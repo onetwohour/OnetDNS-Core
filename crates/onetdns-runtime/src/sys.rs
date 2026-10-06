@@ -177,6 +177,14 @@ mod linux {
     const SOCK_STREAM: c_int = 1;
     /** @brief 데이터그램 소켓. */
     const SOCK_DGRAM: c_int = 2;
+    /**
+     * @brief exec 할 때 닫히는 소켓으로 만든다.
+     * @details 닫히지 않으면 자식 프로세스와, 업데이트가 exec 로 띄운 새 실행 파일이 수신 소켓을
+     *          물려받는다. 새 실행 파일이 같은 주소에 다시 묶어도 아무도 읽지 않는 이전 소켓이
+     *          SO_REUSEPORT 묶음에 남아 커널이 그쪽으로 나눈 질의가 사라진다. 만들 때 함께 걸어야
+     *          다른 스레드가 그 사이에 띄운 자식에게도 새지 않는다.
+     */
+    const SOCK_CLOEXEC: c_int = 0o2_000_000;
     /** @brief 소켓 공통 옵션 계층. */
     const SOL_SOCKET: c_int = 1;
     /** @brief 방금 닫은 주소에 다시 묶는다. */
@@ -243,7 +251,7 @@ mod linux {
     fn make_reuse_fd(addr: &SocketAddr, ty: c_int) -> io::Result<c_int> {
         let (sa, domain) = sockaddr(addr);
         unsafe {
-            let fd = socket(domain, ty, 0);
+            let fd = socket(domain, ty | SOCK_CLOEXEC, 0);
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -444,6 +452,41 @@ mod tests {
                 ports[idx % ports.len()],
                 "워커 {idx}가 라운드로빈 순서를 벗어났습니다"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    /**
+     * @brief 수신 소켓이 exec 할 때 닫히는지.
+     * @details 닫히지 않으면 exec 로 띄운 새 실행 파일이 이전 소켓을 물려받는다. 새 실행 파일이 같은
+     *          주소에 SO_REUSEPORT 로 다시 묶어도 아무도 읽지 않는 이전 소켓이 묶음에 남아, 커널이
+     *          그쪽으로 나눈 질의가 사라진다. 서버가 띄우는 다른 자식 프로세스도 소켓을 물려받는다.
+     */
+    fn listening_sockets_close_on_exec() {
+        use std::os::unix::io::AsRawFd;
+
+        /** @brief open 플래그 가운데 exec 할 때 닫는다는 표시. */
+        const O_CLOEXEC: u32 = 0o2_000_000;
+        let flags = |fd: i32| {
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).expect("fdinfo");
+            let value = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .expect("flags 줄");
+            u32::from_str_radix(value.trim(), 8).expect("8진수 플래그")
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0")
+            .and_then(|socket| socket.local_addr())
+            .expect("빈 UDP 포트");
+        for socket in linux::reuseport_udp(udp, 2).expect("UDP 수신 소켓") {
+            assert_ne!(flags(socket.as_raw_fd()) & O_CLOEXEC, 0, "UDP 수신 소켓");
+        }
+        let tcp = TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("빈 TCP 포트");
+        for listener in linux::reuseport_tcp(tcp, 2).expect("TCP 수신 소켓") {
+            assert_ne!(flags(listener.as_raw_fd()) & O_CLOEXEC, 0, "TCP 수신 소켓");
         }
     }
 

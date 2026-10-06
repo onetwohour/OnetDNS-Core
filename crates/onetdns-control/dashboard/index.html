@@ -143,6 +143,8 @@
         </div>
       </sc-if>
 
+      <sc-if value="{{ updateBanner }}"><div role="status" style="max-width:1100px;margin:0 auto 16px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:11px 14px;border:1px solid var(--accent-bd);border-left:4px solid var(--accent);border-radius:4px;background:var(--accent-bg);font-size:12px;color:var(--fg2)"><span style="flex:1;min-width:200px;line-height:1.5">{{ updateBanner }}</span><sc-if value="{{ updateBannerAction }}"><span data-readonly-safe=""><button onClick="{{ goUpdate }}" style="padding:7px 12px;border:1px solid var(--accent-bd);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">업데이트 보기</button></span></sc-if></div></sc-if>
+
       <sc-if value="{{ isDashboard }}" hint-placeholder-val="{{ true }}">
       <div style="max-width:1100px;margin:0 auto">
         <div style="min-width:0;display:flex;flex-direction:column;gap:34px">
@@ -762,8 +764,9 @@
               <span style="width:9px;height:9px;border-radius:50%;background:{{ p.dot }}"></span>
               <span style="font-family:var(--font-mono);font-size:13px;color:var(--fg);flex:1">{{ p.url }}</span>
               <span style="font-size:11px;font-weight:600;color:var(--muted)">{{ p.role }}</span>
+              <span style="font-family:var(--font-mono);font-size:12px;color:var(--fg2)">{{ p.versionLabel }}</span>
               <span style="font-family:var(--font-mono);font-size:12px;color:var(--fg2);width:54px;text-align:right">{{ p.rttLabel }}</span>
-              <span style="font-size:12px;font-weight:700;color:{{ p.labelColor }};width:64px;text-align:right">{{ p.label }}</span>
+              <span style="font-size:12px;font-weight:700;color:{{ p.labelColor }};min-width:64px;text-align:right">{{ p.label }}</span>
             </div>
           </sc-for>
                 <sc-if value="{{ !hasPeers }}"><div style="padding:22px 18px;text-align:center;color:var(--muted);font-size:12px">연결된 피어 노드가 없습니다.</div></sc-if>
@@ -802,6 +805,25 @@
             </div>
           </sc-for>
         </div>
+
+        <section style="min-width:0">
+          <div style="display:flex;align-items:flex-end;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border);flex-wrap:wrap">
+            <div style="flex:1;min-width:220px"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">소프트웨어 업데이트</div><div style="font-size:11px;color:var(--muted);margin-top:3px">서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.</div></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <sc-if value="{{ upd.canCheck }}"><button onClick="{{ upd.onCheck }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">업데이트 확인</button></sc-if>
+              <sc-if value="{{ upd.canApply }}"><button onClick="{{ upd.onApply }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.applyLabel }}</button></sc-if>
+              <sc-if value="{{ upd.canRollback }}"><button onClick="{{ upd.onRollback }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.rollbackLabel }}</button></sc-if>
+            </div>
+          </div>
+          <sc-if value="{{ upd.notice }}"><div role="status" style="margin-top:12px;padding:10px 13px;border-left:3px solid {{ upd.noticeColor }};background:{{ upd.noticeBg }};font-size:11.5px;line-height:1.55;color:var(--fg2);overflow-wrap:anywhere">{{ upd.notice }}</div></sc-if>
+          <div style="display:grid;grid-template-columns:{{ g4 }};gap:14px;padding-top:14px">
+            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">현재 버전</div><div style="font-family:var(--font-mono);font-size:13px;color:var(--fg);margin-top:5px;overflow-wrap:anywhere">{{ upd.version }}</div></div>
+            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">마지막 확인</div><div style="font-size:11.5px;color:{{ upd.checkColor }};margin-top:5px;line-height:1.5;overflow-wrap:anywhere">{{ upd.checkLabel }}</div><div style="font-size:10.5px;color:var(--faint);margin-top:3px">{{ upd.checkedAt }}</div></div>
+            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">다시 시작 방식</div><div style="font-size:11.5px;color:var(--fg2);margin-top:5px;line-height:1.5">{{ upd.launchLabel }}</div></div>
+            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">주기 확인</div><div style="font-size:11.5px;color:var(--fg2);margin-top:5px;line-height:1.5">{{ upd.scheduleLabel }}</div></div>
+          </div>
+          <sc-if value="{{ upd.releaseUrl }}"><div style="padding-top:10px;font-size:11.5px"><a href="{{ upd.releaseUrl }}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:600">릴리스 노트</a></div></sc-if>
+        </section>
 
         <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
           <section style="min-width:0">
@@ -1113,7 +1135,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
   <sc-if value="{{ toast }}"><div role="{{ toastRole }}" aria-live="{{ toastLive }}" aria-atomic="true" style="{{ toastStyle }}"><span style="display:flex">{{ toastIcon }}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ toast }}</span><sc-if value="{{ toastAction }}"><button onClick="{{ runToastAction }}" style="flex:0 0 auto;padding:5px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">{{ toastActionLabel }}</button></sc-if></div></sc-if>
   <sc-if value="{{ confirmOpen }}"><div style="position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(20,18,12,.45);padding:20px"><div id="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-message" style="width:100%;max-width:420px;border:1px solid var(--border);border-radius:5px;background:var(--surface);box-shadow:0 18px 48px rgba(20,18,12,.28);overflow:hidden">
     <div id="confirm-message" style="padding:20px 22px 6px;font-size:13.5px;font-weight:600;color:var(--fg);line-height:1.55">{{ confirmMessage }}</div>
-    <sc-if value="{{ confirmDetail }}"><div style="padding:0 22px 4px;font-size:12px;color:var(--muted);line-height:1.6;word-break:break-all">{{ confirmDetail }}</div></sc-if>
+    <sc-if value="{{ confirmDetail }}"><div style="padding:0 22px 4px;font-size:12px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere;white-space:pre-line">{{ confirmDetail }}</div></sc-if>
     <div style="display:flex;justify-content:flex-end;gap:8px;padding:16px 22px 18px">
       <button onClick="{{ onConfirmCancel }}" style="padding:9px 15px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">취소</button>
       <button onClick="{{ onConfirmOk }}" data-confirm-ok="" style="padding:9px 17px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:700;cursor:pointer">확인</button>
@@ -4398,6 +4420,198 @@ Object.assign(I18N.zh, {
   "No root server hints":"没有根服务器信息"
 });
 
+Object.assign(I18N.en, {
+  "업데이트 보기":"View update",
+  "소프트웨어 업데이트":"Software updates",
+  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"Checks for signed official releases and installs them on this node.",
+  "업데이트 확인":"Check for updates",
+  "현재 버전":"Current version",
+  "마지막 확인":"Last check",
+  "다시 시작 방식":"Restart method",
+  "주기 확인":"Scheduled check",
+  "릴리스 노트":"Release notes",
+  "새 버전을 확인하고 있습니다":"Checking for a new version",
+  "새 버전을 내려받아 설치하고 있습니다":"Downloading and installing the new version",
+  "이전 버전을 다시 설치하고 있습니다":"Reinstalling the previous version",
+  "OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다":"Waiting for OnetDNS to restart. This page reloads once it is back",
+  "{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다":"Version {version} is installed. Restart OnetDNS to run it",
+  "{to} 버전으로 업데이트하지 못해 {from} 버전으로 되돌렸습니다":"The update to version {to} did not succeed, so version {from} was put back",
+  "아직 확인하지 않았습니다":"Not checked yet",
+  "최신 버전입니다":"Up to date",
+  "{version} 버전을 설치할 수 있습니다":"Version {version} is available",
+  "{version} 버전은 직접 설치해야 합니다":"Version {version} must be installed manually",
+  "확인하지 못했습니다":"Check failed",
+  "감시 프로세스가 새 버전을 띄웁니다":"The supervisor process starts the new version",
+  "프로세스가 새 버전으로 바뀝니다":"The process replaces itself with the new version",
+  "Windows 서비스가 새 버전으로 다시 시작합니다":"The Windows service restarts with the new version",
+  "설치한 뒤 직접 다시 시작해야 합니다":"Restart OnetDNS yourself after installing",
+  "하루에 한 번 확인합니다":"Checks once a day",
+  "꺼져 있습니다. 직접 확인할 수 있습니다":"Off. You can still check manually",
+  "{version} 버전 설치":"Install {version}",
+  "{version} 버전으로 되돌리기":"Roll back to {version}",
+  "OnetDNS {version} 버전을 설치할까요?":"Install OnetDNS {version}?",
+  "{version} 버전으로 되돌릴까요?":"Roll back to version {version}?",
+  "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"After the installation, restart OnetDNS yourself to run the installed version.",
+  "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"OnetDNS restarts when the installation finishes. DNS answers pause briefly during the restart, and you need to sign in to this page again.",
+  "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"If the installed version does not become ready in time, the current version is put back automatically.",
+  "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"Only this node changes. Replication stops between cluster nodes running different versions, so bring the other nodes to the same version.",
+  "업데이트를 확인하지 못했습니다":"Could not check for updates",
+  "업데이트를 설치하지 못했습니다":"Could not install the update",
+  "이전 버전으로 되돌리지 못했습니다":"Could not roll back to the previous version",
+  "업데이트 설치":"Install update",
+  "이전 버전으로 되돌리기":"Roll back to the previous version",
+  "OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요":"OnetDNS restarted for an update. Sign in again",
+  "버전 {value}":"Version {value}",
+  "버전이 다릅니다":"Different version"
+});
+Object.assign(I18N.ja, {
+  "업데이트 보기":"更新を表示",
+  "소프트웨어 업데이트":"ソフトウェア更新",
+  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"署名済みの公式リリースを確認し、このノードにインストールします。",
+  "업데이트 확인":"更新を確認",
+  "현재 버전":"現在のバージョン",
+  "마지막 확인":"最終確認",
+  "다시 시작 방식":"再起動の方法",
+  "주기 확인":"定期確認",
+  "릴리스 노트":"リリースノート",
+  "새 버전을 확인하고 있습니다":"新しいバージョンを確認しています",
+  "새 버전을 내려받아 설치하고 있습니다":"新しいバージョンをダウンロードしてインストールしています",
+  "이전 버전을 다시 설치하고 있습니다":"以前のバージョンを再インストールしています",
+  "OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다":"OnetDNS の再起動を待っています。再起動するとこの画面を再読み込みします",
+  "{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다":"バージョン {version} をインストールしました。OnetDNS を再起動するとこのバージョンで動作します",
+  "{to} 버전으로 업데이트하지 못해 {from} 버전으로 되돌렸습니다":"バージョン {to} への更新に失敗したため、バージョン {from} に戻しました",
+  "아직 확인하지 않았습니다":"まだ確認していません",
+  "최신 버전입니다":"最新バージョンです",
+  "{version} 버전을 설치할 수 있습니다":"バージョン {version} をインストールできます",
+  "{version} 버전은 직접 설치해야 합니다":"バージョン {version} は手動でインストールする必要があります",
+  "확인하지 못했습니다":"確認できませんでした",
+  "감시 프로세스가 새 버전을 띄웁니다":"監視プロセスが新しいバージョンを起動します",
+  "프로세스가 새 버전으로 바뀝니다":"プロセスが新しいバージョンに置き換わります",
+  "Windows 서비스가 새 버전으로 다시 시작합니다":"Windows サービスが新しいバージョンで再起動します",
+  "설치한 뒤 직접 다시 시작해야 합니다":"インストール後に手動で再起動する必要があります",
+  "하루에 한 번 확인합니다":"1 日 1 回確認します",
+  "꺼져 있습니다. 직접 확인할 수 있습니다":"オフです。手動で確認できます",
+  "{version} 버전 설치":"{version} をインストール",
+  "{version} 버전으로 되돌리기":"{version} に戻す",
+  "OnetDNS {version} 버전을 설치할까요?":"OnetDNS {version} をインストールしますか？",
+  "{version} 버전으로 되돌릴까요?":"バージョン {version} に戻しますか？",
+  "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"インストール後、OnetDNS を手動で再起動すると、インストールしたバージョンで動作します。",
+  "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"インストールが終わると OnetDNS が再起動します。再起動中は DNS の応答が一時的に止まり、この画面には再度サインインが必要です。",
+  "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"インストールしたバージョンが所定の時間内に準備できない場合は、現在のバージョンに自動で戻します。",
+  "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"変更されるのはこのノードだけです。バージョンが異なるクラスターノード間では複製が止まるため、他のノードも同じバージョンにそろえてください。",
+  "업데이트를 확인하지 못했습니다":"更新を確認できませんでした",
+  "업데이트를 설치하지 못했습니다":"更新をインストールできませんでした",
+  "이전 버전으로 되돌리지 못했습니다":"以前のバージョンに戻せませんでした",
+  "업데이트 설치":"更新のインストール",
+  "이전 버전으로 되돌리기":"以前のバージョンに戻す",
+  "OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요":"更新のため OnetDNS が再起動しました。もう一度サインインしてください",
+  "버전 {value}":"バージョン {value}",
+  "버전이 다릅니다":"バージョンが異なります"
+});
+Object.assign(I18N.zh, {
+  "업데이트 보기":"查看更新",
+  "소프트웨어 업데이트":"软件更新",
+  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"检查已签名的官方版本并安装到此节点。",
+  "업데이트 확인":"检查更新",
+  "현재 버전":"当前版本",
+  "마지막 확인":"上次检查",
+  "다시 시작 방식":"重启方式",
+  "주기 확인":"定期检查",
+  "릴리스 노트":"发行说明",
+  "새 버전을 확인하고 있습니다":"正在检查新版本",
+  "새 버전을 내려받아 설치하고 있습니다":"正在下载并安装新版本",
+  "이전 버전을 다시 설치하고 있습니다":"正在重新安装先前版本",
+  "OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다":"正在等待 OnetDNS 重启。重启后将重新加载此页面",
+  "{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다":"已安装版本 {version}。重启 OnetDNS 后将运行此版本",
+  "{to} 버전으로 업데이트하지 못해 {from} 버전으로 되돌렸습니다":"未能更新到版本 {to}，已恢复为版本 {from}",
+  "아직 확인하지 않았습니다":"尚未检查",
+  "최신 버전입니다":"已是最新版本",
+  "{version} 버전을 설치할 수 있습니다":"可以安装版本 {version}",
+  "{version} 버전은 직접 설치해야 합니다":"版本 {version} 需要手动安装",
+  "확인하지 못했습니다":"检查失败",
+  "감시 프로세스가 새 버전을 띄웁니다":"由监控进程启动新版本",
+  "프로세스가 새 버전으로 바뀝니다":"进程将替换为新版本",
+  "Windows 서비스가 새 버전으로 다시 시작합니다":"Windows 服务将以新版本重启",
+  "설치한 뒤 직접 다시 시작해야 합니다":"安装后需要手动重启",
+  "하루에 한 번 확인합니다":"每天检查一次",
+  "꺼져 있습니다. 직접 확인할 수 있습니다":"已关闭。仍可手动检查",
+  "{version} 버전 설치":"安装 {version}",
+  "{version} 버전으로 되돌리기":"回退到 {version}",
+  "OnetDNS {version} 버전을 설치할까요?":"要安装 OnetDNS {version} 吗？",
+  "{version} 버전으로 되돌릴까요?":"要回退到版本 {version} 吗？",
+  "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"安装完成后，需要手动重启 OnetDNS 才能运行已安装的版本。",
+  "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"安装完成后 OnetDNS 将重启。重启期间 DNS 响应会短暂中断，并且需要重新登录此页面。",
+  "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"如果已安装的版本未能在规定时间内就绪，将自动恢复为当前版本。",
+  "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"只会更改此节点。版本不同的集群节点之间会停止复制，请将其他节点也更新到相同版本。",
+  "업데이트를 확인하지 못했습니다":"无法检查更新",
+  "업데이트를 설치하지 못했습니다":"无法安装更新",
+  "이전 버전으로 되돌리지 못했습니다":"无法回退到先前版本",
+  "업데이트 설치":"安装更新",
+  "이전 버전으로 되돌리기":"回退到先前版本",
+  "OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요":"OnetDNS 因更新已重启。请重新登录",
+  "버전 {value}":"版本 {value}",
+  "버전이 다릅니다":"版本不同"
+});
+
+// 업데이트 상태와 실패 사유. 버전이나 경로가 들어가는 문장은 원문 그대로 보인다.
+Object.assign(I18N.ko, {
+  "Updates are not available":"업데이트를 사용할 수 없습니다",
+  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"OnetDNS 릴리스 과정에서 빌드한 실행 파일이 아니어서 스스로 업데이트하지 않습니다",
+  "This executable has no release signing key, so it cannot verify releases":"릴리스 서명 키가 들어 있지 않은 실행 파일이어서 릴리스를 검증할 수 없습니다",
+  "The request body must be an object with the version shown by the last check":"요청 본문은 마지막 확인에서 찾은 버전을 담은 객체여야 합니다",
+  "There is no confirmed update to go back from":"되돌릴 수 있는 확정된 업데이트가 없습니다",
+  "Another update is being applied or tried out":"다른 업데이트를 적용하거나 시험하는 중입니다",
+  "The running executable was replaced or removed after it started; restart OnetDNS to update it":"실행 중인 실행 파일이 시작된 뒤에 바뀌었거나 지워졌습니다. 업데이트하려면 OnetDNS를 다시 시작하세요",
+  "The supervisor could not find the path of the executable":"감시 프로세스가 실행 파일의 경로를 찾지 못했습니다",
+  "The new version did not become ready before the trial deadline":"새 버전이 시험 기한 안에 준비되지 않았습니다",
+  "The new version stopped before it became ready":"새 버전이 준비되기 전에 멈췄습니다",
+  "The new version stopped with an error before it became ready: ":"새 버전이 준비되기 전에 오류로 멈췄습니다: ",
+  "The new version exited before it became ready ":"새 버전이 준비되기 전에 종료되었습니다 ",
+  "GitHub did not find the OnetDNS release list":"GitHub에서 OnetDNS 릴리스 목록을 찾지 못했습니다",
+  "The GitHub release list is not UTF-8 text":"GitHub 릴리스 목록이 UTF-8 텍스트가 아닙니다",
+  "The GitHub release list is not a JSON array":"GitHub 릴리스 목록이 JSON 배열이 아닙니다",
+  "Could not read the GitHub release list: ":"GitHub 릴리스 목록을 읽지 못했습니다: ",
+  "The release manifest is not signed by a trusted release key":"릴리스 매니페스트가 신뢰하는 릴리스 키로 서명되어 있지 않습니다"
+});
+Object.assign(I18N.ja, {
+  "Updates are not available":"更新は利用できません",
+  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"OnetDNS のリリース手順でビルドされた実行ファイルではないため、自動更新しません",
+  "This executable has no release signing key, so it cannot verify releases":"リリース署名鍵を含まない実行ファイルのため、リリースを検証できません",
+  "The request body must be an object with the version shown by the last check":"リクエスト本文は、最後の確認で見つかったバージョンを含むオブジェクトである必要があります",
+  "There is no confirmed update to go back from":"戻せる確定済みの更新がありません",
+  "Another update is being applied or tried out":"別の更新を適用中または試行中です",
+  "The running executable was replaced or removed after it started; restart OnetDNS to update it":"実行中の実行ファイルが起動後に置き換えられたか削除されました。更新するには OnetDNS を再起動してください",
+  "The supervisor could not find the path of the executable":"監視プロセスが実行ファイルのパスを見つけられませんでした",
+  "The new version did not become ready before the trial deadline":"新しいバージョンが試行期限内に準備できませんでした",
+  "The new version stopped before it became ready":"新しいバージョンが準備完了前に停止しました",
+  "The new version stopped with an error before it became ready: ":"新しいバージョンが準備完了前にエラーで停止しました: ",
+  "The new version exited before it became ready ":"新しいバージョンが準備完了前に終了しました ",
+  "GitHub did not find the OnetDNS release list":"GitHub で OnetDNS のリリース一覧が見つかりませんでした",
+  "The GitHub release list is not UTF-8 text":"GitHub のリリース一覧が UTF-8 テキストではありません",
+  "The GitHub release list is not a JSON array":"GitHub のリリース一覧が JSON 配列ではありません",
+  "Could not read the GitHub release list: ":"GitHub のリリース一覧を読み込めませんでした: ",
+  "The release manifest is not signed by a trusted release key":"リリースマニフェストが信頼済みのリリース鍵で署名されていません"
+});
+Object.assign(I18N.zh, {
+  "Updates are not available":"无法使用更新功能",
+  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"此可执行文件不是由 OnetDNS 发布流程构建的，因此不会自行更新",
+  "This executable has no release signing key, so it cannot verify releases":"此可执行文件不含发布签名密钥，无法验证发布版本",
+  "The request body must be an object with the version shown by the last check":"请求正文必须是包含上次检查所发现版本的对象",
+  "There is no confirmed update to go back from":"没有可回退的已确认更新",
+  "Another update is being applied or tried out":"另一个更新正在应用或试运行",
+  "The running executable was replaced or removed after it started; restart OnetDNS to update it":"正在运行的可执行文件在启动后被替换或删除。请重启 OnetDNS 后再更新",
+  "The supervisor could not find the path of the executable":"监控进程找不到可执行文件的路径",
+  "The new version did not become ready before the trial deadline":"新版本未能在试运行期限内就绪",
+  "The new version stopped before it became ready":"新版本在就绪前停止",
+  "The new version stopped with an error before it became ready: ":"新版本在就绪前因错误停止: ",
+  "The new version exited before it became ready ":"新版本在就绪前退出 ",
+  "GitHub did not find the OnetDNS release list":"GitHub 上找不到 OnetDNS 发布列表",
+  "The GitHub release list is not UTF-8 text":"GitHub 发布列表不是 UTF-8 文本",
+  "The GitHub release list is not a JSON array":"GitHub 发布列表不是 JSON 数组",
+  "Could not read the GitHub release list: ":"无法读取 GitHub 发布列表: ",
+  "The release manifest is not signed by a trusted release key":"发布清单未使用受信任的发布密钥签名"
+});
+
 // 전용 편집 화면이 따로 있는 설정과 그 화면. '전체 설정' 목록에서는 빼되 검색에는
 // 남겨 어디서 바꾸는지 알려 준다. 값은 화면 id이거나 설정 화면 안의 '빠른 설정'이다.
 const DEDICATED_HOME = {
@@ -4570,6 +4784,7 @@ class Component extends DCLogic {
     leases: { v4:[], v6:[] },
     tokens: [],
     jobs: [],
+    update: null, updateBusy: null,
     operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,availability:{},loadedAt:0,loaded:false},
     cluster: { self:{role:'standalone',listeners:0}, peers:[] },
     security: { rateLimit:0, anonymize:false, querylog:false, aclAllow:'', aclDeny:'' },
@@ -4591,6 +4806,7 @@ class Component extends DCLogic {
     this.timer=setInterval(()=>this.tick(),1000);
     this._configPoll=setInterval(()=>this.loadConfigStatus(),5000);
     this._auditPoll=setInterval(()=>{if(this.state.loggedIn)this.loadAudit();},10000);
+    this._updatePoll=setInterval(()=>{if(this.state.loggedIn&&!this._updateWatch)this.loadUpdate();},60000);
     this._fallbackPoll=setInterval(()=>{
       if(!this.state.loggedIn||this.state.streamOnline)return;
       // REST가 다시 답하는데 실시간 연결만 죽어 있으면 늘어난 재연결 간격을 되돌리고 곧장 붙는다.
@@ -4628,12 +4844,14 @@ class Component extends DCLogic {
     document.addEventListener('keydown',this._onSubmitEnter,true);
     document.addEventListener('keydown',this._onGlobalKeyDown,true);
     const initialView=this.viewFromLocation();if(initialView!==this.state.view)this.setState({view:initialView});
+    try{if(sessionStorage.getItem('onetdns_notice')==='update-restart'){sessionStorage.removeItem('onetdns_notice');this.setState({loginNotice:'OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요'});}}catch(e){}
     this.checkAuth();
   }
   componentWillUnmount(){
     clearInterval(this.timer);
     clearInterval(this._configPoll);
     clearInterval(this._auditPoll);
+    clearInterval(this._updatePoll);
     clearInterval(this._fallbackPoll);
     clearTimeout(this._socketRetry);
     clearTimeout(this._resyncT);
@@ -4689,7 +4907,7 @@ class Component extends DCLogic {
     return {loggedIn:false,authRole:'none',authPending:false,restOnline:false,streamOnline:false,connectionState:connectionState||'offline',connectionAt:0,loginNotice:notice||'',
       accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
-      log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],
+      log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],
       operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,loaded:false},
       blocklists:[],blockRules:[],allowRules:[],services:[],leases:{v4:[],v6:[]},pausedEvents:[],pausedDropped:0,schema:[],schemaHot:[],schemaConditional:[],cfgRaw:{},cfgApplied:{},configStatus:{in_sync:true,source:'runtime',changed_keys:[],error:null},
       forms:{...f,loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',config:'',certPem:'',keyPem:'',cpKey:'',cpVal:'',rewriteDomain:'',rewriteAnswer:'',dnssecZone:'',
@@ -4701,7 +4919,7 @@ class Component extends DCLogic {
     clearTimeout(this._socketRetry);clearTimeout(this._resyncT);clearTimeout(this._bootSubsT);clearTimeout(this._cfgFlush);clearTimeout(this._reverify);
     this._socketClosed=true;
     if(this._ws){this._ws.onclose=null;try{this._ws.close();}catch(e){}this._ws=null;}
-    this._mutationRequests={};this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;
+    this._mutationRequests={};this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;this._updateWatch=null;
     try{localStorage.removeItem('onetdns_token');}catch(e){}
     if(typeof document!=='undefined')document.querySelectorAll('input[type="file"]').forEach(input=>{try{input.value='';}catch(e){}});
     const state=reason==='auth-expired'?'auth-expired':'offline';
@@ -4711,7 +4929,10 @@ class Component extends DCLogic {
       :reason==='password-changed'?'비밀번호를 변경했습니다. 새 비밀번호로 로그인하세요':'';
     this.setState(this.sessionResetPatch(state,notice));
   }
-  authExpired(){this.clearSession('auth-expired');}
+  // 업데이트로 다시 시작하면 메모리에 있던 세션이 사라진다. 그때의 401은 만료가 아니라
+  // 다시 시작했다는 뜻이므로, 새 버전의 화면을 받도록 페이지를 다시 읽는다.
+  authExpired(){if(this._updateWatch&&this._updateWatch.kind!=='check')return this.reloadAfterRestart();this.clearSession('auth-expired');}
+  reloadAfterRestart(){this._updateWatch=null;try{sessionStorage.setItem('onetdns_notice','update-restart');}catch(e){}window.location.reload();}
   async request(path,opts){
     const generation=this._sessionGeneration;
     const controller=new AbortController();
@@ -5031,7 +5252,7 @@ class Component extends DCLogic {
     return true;
   }
   async loadCollections(){
-    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
+    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit(),this.loadUpdate()];
     await Promise.allSettled(tasks);
     if(this.state.view==='operations')await this.loadOperations();
   }
@@ -5052,7 +5273,7 @@ class Component extends DCLogic {
     this.setState({leases:{v4:(Array.isArray(r.body.v4)?r.body.v4:[]).map(l=>({ip:l.ip,identity:l.identity||'',mac:l.mac||'',vendor:l.vendor||'',hostname:l.hostname||'',remaining:rem(l)})),v6:(Array.isArray(r.body.v6)?r.body.v6:[]).map(l=>({ip:l.ip,duid:l.duid||'',iaid:l.iaid||'',remaining:rem(l)}))}});return true;
   }
   async loadReservations(){const r=await this.apiGet('/v1/dhcp/static');if(!(r.ok&&r.body&&Array.isArray(r.body.reservations)))return false;this.setState({reservationsAvailable:r.body.available===true,reservations:r.body.reservations.map(x=>({identity:x.identity||'',ip:x.ip||'',hostname:x.hostname||''}))});return true;}
-  async loadCluster(){const r=await this.apiGet('/v1/cluster/nodes');if(!(r.ok&&r.body))return false;this.setState({cluster:{identity:r.body.identity||null,self:r.body.self||{role:'standalone',listeners:0},peers:(r.body.peers||[]).map(x=>({url:x.url,healthy:x.healthy,role:x.role,rtt:x.rtt_ms}))}});return true;}
+  async loadCluster(){const r=await this.apiGet('/v1/cluster/nodes');if(!(r.ok&&r.body))return false;this.setState({cluster:{identity:r.body.identity||null,self:r.body.self||{role:'standalone',listeners:0},peers:(r.body.peers||[]).map(x=>({url:x.url,healthy:x.healthy,role:x.role,rtt:x.rtt_ms,version:x.version}))}});return true;}
   async loadSchema(){const r=await this.apiGet('/v1/config/schema');if(!(r.ok&&r.body&&Array.isArray(r.body.fields)))return false;this.setState({schema:r.body.fields,schemaHot:Array.isArray(r.body.hot_reload_keys)?r.body.hot_reload_keys:[],schemaConditional:Array.isArray(r.body.conditional_hot_reload_keys)?r.body.conditional_hot_reload_keys:[]});return true;}
   async loadServices(){const r=await this.apiGet('/v1/services');if(!(r.ok&&r.body&&Array.isArray(r.body.services)))return false;this.setState({services:r.body.services.map(x=>({id:x.id,name:x.name,group:x.group||'other',ruleCount:Number(x.rule_count)||0,blocked:!!x.blocked}))});return true;}
   async loadTls(){const r=await this.apiGet('/v1/tls');if(!(r.ok&&r.body))return false;const configured=!!r.body.configured;this.setState({cert:{configured,domain:configured?'검증 대기':'미설정',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—',valid:null}});return true;}
@@ -5062,6 +5283,7 @@ class Component extends DCLogic {
   }
   async loadOperations(){
     if(this._operationsLoading)return false;this._operationsLoading=true;
+    if(!this._updateWatch)this.loadUpdate();
     try{
       const names=['rewrites','plugins','filterReport','topRules','sources','jobs','access'];
       const responses=await Promise.all([
@@ -5088,6 +5310,100 @@ class Component extends DCLogic {
       });
       return {ok:responses.some(r=>r.ok),complete:responses.every(r=>r.ok),availability};
     }finally{this._operationsLoading=false;}
+  }
+  async loadUpdate(){const r=await this.apiGet('/v1/system/update');if(!(r.ok&&r.body&&typeof r.body==='object'))return null;this.setState({update:r.body});return r.body;}
+  goUpdate=()=>this.go('operations')();
+  updateFailure(kind){return {check:this.t('업데이트를 확인하지 못했습니다'),apply:this.t('업데이트를 설치하지 못했습니다'),rollback:this.t('이전 버전으로 되돌리지 못했습니다')}[kind];}
+  updateConfirmDetail(u){
+    const lines=[this.t(u.launch==='manual'?'설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.':'설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.'),
+      this.t('설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.')];
+    const self=(this.state.cluster&&this.state.cluster.self)||{};
+    if(self.role&&self.role!=='standalone')lines.push(this.t('이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.'));
+    return lines.join('\n');
+  }
+  updateTask=(kind)=>async()=>{
+    if(this._updateWatch)return;
+    const u=this.state.update||{};
+    const version=String(u.new_version||''),previous=String(u.rollback||'');
+    if(kind==='apply'&&!await this.askConfirm(this.tr('OnetDNS {version} 버전을 설치할까요?',{version}),this.updateConfirmDetail(u)))return;
+    if(kind==='rollback'&&!await this.askConfirm(this.tr('{version} 버전으로 되돌릴까요?',{version:previous}),this.updateConfirmDetail(u)))return;
+    const r=await this.apiSend('/v1/system/update/'+kind,'POST',kind==='apply'?{version}:undefined);
+    if(!r.ok){this.loadUpdate();return this.toastMsg(this.updateFailure(kind)+': '+this.errorText(r),true);}
+    const id=r.body&&r.body.id;
+    if(id==null)return this.loadUpdate();
+    const watch={kind};
+    this._updateWatch=watch;
+    this.setState({updateBusy:kind});
+    await this.followUpdate(watch,id);
+  };
+  // 설치와 되돌리기가 끝나면 서버가 다시 시작해 작업 결과를 못 받은 채 연결이 끊길 수 있다.
+  // 끊김은 다시 시작하는 중으로 보고, 다시 붙었을 때의 401에서 페이지를 다시 읽는다(authExpired).
+  async followUpdate(watch,id){
+    const finish=()=>{if(this._updateWatch===watch){this._updateWatch=null;this.setState({updateBusy:null});}};
+    const restarting=()=>{if(this.state.updateBusy!=='restart')this.setState({updateBusy:'restart'});};
+    for(;;){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      if(this._updateWatch!==watch)return;
+      const r=await this.apiGet('/v1/jobs/'+encodeURIComponent(String(id)));
+      if(this._updateWatch!==watch||r.stale)return;
+      const job=r.ok&&r.body&&typeof r.body==='object'?r.body:null;
+      if(job&&job.status==='running')continue;
+      if(!job&&(r.status===0||r.status===408||r.status>=500)){if(watch.kind!=='check')restarting();continue;}
+      if(!job||job.status!=='done'){finish();this.loadUpdate();return this.toastMsg(this.updateFailure(watch.kind)+': '+(job?this.t(String(job.result||'')):this.errorText(r)),true);}
+      const after=await this.loadUpdate();
+      if(this._updateWatch!==watch)return;
+      if(watch.kind==='check'){finish();return after?this.toastUpdateCheck(after):this.toastMsg(String(job.result||''));}
+      if(!after)continue;
+      if(after.launch==='manual'){finish();const record=after.record&&typeof after.record==='object'?after.record:{};return this.toastMsg(this.tr('{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다',{version:String(record.to||'')}));}
+      restarting();
+    }
+  }
+  toastUpdateCheck(u){
+    const version=String(u.new_version||'');
+    if(u.result==='available')return this.toastMsg(this.tr('{version} 버전을 설치할 수 있습니다',{version}));
+    if(u.result==='manual')return this.toastMsg(this.tr('{version} 버전은 직접 설치해야 합니다',{version}),true);
+    if(u.result==='failed')return this.toastMsg(this.t('업데이트를 확인하지 못했습니다')+': '+this.t(String(u.detail||'')),true);
+    this.toastMsg(this.t('최신 버전입니다'));
+  }
+  updateModel(){
+    const s=this.state,u=s.update&&typeof s.update==='object'?s.update:null;
+    const empty={canCheck:false,canApply:false,canRollback:false,busy:true,notice:'',noticeColor:'var(--accent)',noticeBg:'var(--accent-bg)',version:'—',checkLabel:'—',checkColor:'var(--fg2)',checkedAt:'',launchLabel:'—',scheduleLabel:'—',releaseUrl:'',applyLabel:'',rollbackLabel:''};
+    if(!u)return {upd:empty,banner:'',bannerAction:false};
+    const record=u.record&&typeof u.record==='object'?u.record:null;
+    const task=s.updateBusy||(typeof u.task==='string'?u.task:'');
+    const busyText={check:this.t('새 버전을 확인하고 있습니다'),apply:this.t('새 버전을 내려받아 설치하고 있습니다'),rollback:this.t('이전 버전을 다시 설치하고 있습니다'),restart:this.t('OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다')}[task]||'';
+    const participating=u.participating===true;
+    const result=typeof u.result==='string'?u.result:'';
+    const newVersion=typeof u.new_version==='string'?u.new_version:'';
+    const detail=typeof u.detail==='string'&&u.detail?': '+this.t(u.detail):'';
+    const pending=!!record&&record.state==='pending';
+    const pendingText=pending?this.tr('{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다',{version:String(record.to||'')}):'';
+    const tones={accent:['var(--accent)','var(--accent-bg)'],warn:['var(--warn)','var(--warn-bg)'],block:['var(--block)','var(--block-bg)'],muted:['var(--border)','var(--surface2)']};
+    let notice=busyText,tone='accent';
+    if(!notice&&!participating){notice=this.t(String(u.reason||''));tone='muted';}
+    else if(!notice&&pending){notice=pendingText;tone='warn';}
+    else if(!notice&&record&&record.state==='reverted'){notice=this.tr('{to} 버전으로 업데이트하지 못해 {from} 버전으로 되돌렸습니다',{to:String(record.to||''),from:String(record.from||'')})+(record.reason?': '+this.t(String(record.reason)):'');tone='block';}
+    const checkLabel=!result?this.t('아직 확인하지 않았습니다')
+      :result==='up_to_date'?this.t('최신 버전입니다')
+      :result==='available'?this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion})
+      :result==='manual'?this.tr('{version} 버전은 직접 설치해야 합니다',{version:newVersion})+detail
+      :this.t('확인하지 못했습니다')+detail;
+    const launchLabel={supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),service:this.t('Windows 서비스가 새 버전으로 다시 시작합니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
+    const rollbackTo=typeof u.rollback==='string'?u.rollback:'';
+    const canApply=participating&&result==='available'&&!!newVersion&&!pending;
+    const releaseUrl=(result==='available'||result==='manual')&&typeof u.release_url==='string'&&/^https:\/\//.test(u.release_url)?u.release_url:'';
+    const upd={canCheck:participating,canApply,canRollback:!!rollbackTo&&!pending,busy:!!task,
+      notice,noticeColor:tones[tone][0],noticeBg:tones[tone][1],
+      version:String(u.version||'—'),checkLabel,checkColor:result==='available'?'var(--accent)':(result==='manual'||result==='failed')?'var(--warn)':'var(--fg2)',
+      checkedAt:u.checked_at?this.relTime(u.checked_at):'',launchLabel,
+      scheduleLabel:!participating?'—':u.release_check===false?this.t('꺼져 있습니다. 직접 확인할 수 있습니다'):this.t('하루에 한 번 확인합니다'),
+      releaseUrl,applyLabel:this.tr('{version} 버전 설치',{version:newVersion}),rollbackLabel:this.tr('{version} 버전으로 되돌리기',{version:rollbackTo}),
+      onCheck:this.updateTask('check'),onApply:this.updateTask('apply'),onRollback:this.updateTask('rollback')};
+    let banner='',bannerAction=false;
+    if(task==='apply'||task==='rollback'||task==='restart')banner=busyText;
+    else if(pending)banner=pendingText;
+    else if(canApply){banner=this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion});bannerAction=s.view!=='operations';}
+    return {upd,banner,bannerAction};
   }
   refreshOperations=async()=>{const result=await this.loadOperations();if(!result||!result.ok)return this.toastMsg(this.t('운영 상태를 불러오지 못했습니다'),true);this.toastMsg(this.t(result.complete?'운영 상태를 새로고침했습니다':'일부 운영 정보를 불러오지 못했습니다'),!result.complete);};
   flushCache=async()=>{if(!await this.confirmDestructive('응답 캐시를 모두 비우시겠습니까?'))return;const r=await this.apiSend('/v1/cache/flush','POST',{});if(r.ok)this.toastMsg(this.tr('캐시 항목 {count}개를 비웠습니다',{count:Number(r.body&&r.body.flushed||0).toLocaleString(this.locale())}));else this.toastMsg(this.t('캐시 비우기 실패')+': '+this.errorText(r),true);};
@@ -6586,22 +6902,28 @@ class Component extends DCLogic {
 
 
     const cself=s.cluster.self;
-    const clusterSelfDetail=[cself.term!=null?this.tr('현재 임기 {value}',{value:cself.term}):null,cself.leader?this.tr('리더 {value}',{value:cself.leader}):null,cself.listeners!=null?this.tr('서비스 주소 {count}개',{count:this.fmt(cself.listeners)}):null].filter(Boolean).join(' · ')||this.t('클러스터 정보가 없습니다');
+    const clusterSelfDetail=[typeof cself.version==='string'?this.tr('버전 {value}',{value:cself.version}):null,cself.term!=null?this.tr('현재 임기 {value}',{value:cself.term}):null,cself.leader?this.tr('리더 {value}',{value:cself.leader}):null,cself.listeners!=null?this.tr('서비스 주소 {count}개',{count:this.fmt(cself.listeners)}):null].filter(Boolean).join(' · ')||this.t('클러스터 정보가 없습니다');
     const clusterHealthy=cself.healthy===true;
     const clusterCanPropose=s.authRole==='admin'&&cself.role==='leader';
     const roleNames={leader:this.t('리더'),follower:this.t('팔로워'),candidate:this.t('후보'),standalone:this.t('단독 실행'),unknown:this.t('알 수 없음')};
-    const peers=s.cluster.peers.map(p=>({...p,role:roleNames[p.role]||p.role,
-      dot:p.healthy===true?'var(--ok)':p.healthy===false?'var(--block)':'var(--muted)',
-      label:this.t(p.healthy===true?'정상':p.healthy===false?'응답 없음':'상태 불명'),
-      labelColor:p.healthy===true?'var(--ok)':p.healthy===false?'var(--block)':'var(--muted)',
-      rttLabel:p.rtt!=null?(p.rtt+'ms'):'—'}));
+    // 버전이 다른 노드는 응답하더라도 서로의 클러스터 메시지를 버리므로, 응답 여부보다 먼저 알린다.
+    const peers=s.cluster.peers.map(p=>{
+      const otherVersion=typeof p.version==='string'&&typeof cself.version==='string'&&p.version!==cself.version;
+      return {...p,role:roleNames[p.role]||p.role,
+        dot:otherVersion?'var(--warn)':p.healthy===true?'var(--ok)':p.healthy===false?'var(--block)':'var(--muted)',
+        label:this.t(otherVersion?'버전이 다릅니다':p.healthy===true?'정상':p.healthy===false?'응답 없음':'상태 불명'),
+        labelColor:otherVersion?'var(--warn)':p.healthy===true?'var(--ok)':p.healthy===false?'var(--block)':'var(--muted)',
+        versionLabel:typeof p.version==='string'?p.version:'—',
+        rttLabel:p.rtt!=null?(p.rtt+'ms'):'—'};
+    });
 
 
     const roleColor={admin:'var(--violet)',readonly:'var(--muted)'};
     const tokens=s.tokens.map(t=>({...t, onRemove:this.removeToken(t.id),removeLabel:this.tr('{name} 삭제',{name:t.name||this.t('접근 토큰')}),
       rc:roleColor[t.role], roleLabel:this.t(t.role==='admin'?'관리자':'읽기 전용')}));
     const jobStatus={done:[this.t('완료'),'var(--ok)','var(--ok-bg)'],running:[this.t('진행 중'),'var(--accent)','var(--accent-bg)'],failed:[this.t('실패'),'var(--block)','var(--block-bg)']};
-    const jobKinds={'refresh-lists':this.t('필터 목록 갱신')};
+    const jobKinds={'refresh-lists':this.t('필터 목록 갱신'),'update-check':this.t('업데이트 확인'),'update-apply':this.t('업데이트 설치'),'update-rollback':this.t('이전 버전으로 되돌리기')};
+    const updateView=this.updateModel();
     const jobs=s.jobs.map(j=>{const st=jobStatus[j.status]||[j.status||this.t('알 수 없음'),'var(--muted)','var(--surface2)'];return {...j,kindLabel:jobKinds[j.kind]||j.kind,createdLabel:this.relTime(j.created),stLabel:st[0],stColor:st[1],stBg:st[2]};});
     const diff=s.diff;
     const sec=s.security;
@@ -6754,6 +7076,7 @@ class Component extends DCLogic {
 
       listeners, lnAddButtons, onListenerHost, onListenerPort, saveListenerEdit:this.saveListenerEdit, cancelListenerEdit:this.cancelListenerEdit,
       sysAdapters, bootSvc, sysPlatform:String(s.sysPlatform||''), refreshAdapters:()=>{this.loadAdapters();this.loadBootService();}, fwAllowPort:this.fwAllowPort, fwRemovePort:this.fwRemovePort,
+      upd:updateView.upd,updateBanner:updateView.banner,updateBannerAction:updateView.bannerAction,goUpdate:this.goUpdate,
       operationsLoaded:!!ops.loaded,operationSummary,operationSourceStatus,operationUpdatedLabel,opPartial,operationFailedLabel,operationStatusColor:opPartial?'var(--warn)':'var(--ok)',refreshOperations:this.refreshOperations,flushCache:this.flushCache,downloadBackup:this.downloadBackup,onRestoreFile:this.onRestoreFile,restoreBackup:this.restoreBackup,restoreReady:!!this._restoreBackup,restoreFileName:localizedForms.restoreFileName,
       rewriteRows,hasRewrites:rewriteRows.length>0,addRewrite:this.addRewrite,reportTotal:reportTotalN.toLocaleString(this.locale()),reportApplied:reportAppliedN.toLocaleString(this.locale()),reportSkipped:reportSkippedN.toLocaleString(this.locale()),filterCoverageLabel,filterCoverageStyle,filterReasonRows,hasFilterReasons:filterReasonRows.length>0,
       topRuleRows,hasTopRules:topRuleRows.length>0,topRulesOff:!!ops.loaded&&topData.enabled!==true,topRulesEmpty:topData.enabled===true&&topRuleRows.length===0,sourceRows,hasSources:sourceRows.length>0,sourceHitsOff:!!ops.loaded&&!sourceHitsEnabled,sourceTotalsText,pluginRows,hasPlugins:pluginRows.length>0,pluginEvalTotal:pluginEvalTotal.toLocaleString(this.locale()),pluginErrorTotal:pluginErrorTotal.toLocaleString(this.locale()),pluginBlockTotal:pluginBlockTotal.toLocaleString(this.locale()),

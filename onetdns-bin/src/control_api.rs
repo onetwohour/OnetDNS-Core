@@ -186,6 +186,43 @@ fn change_report(active: &Config, current: &str, proposed: &str) -> Result<Strin
     ))
 }
 
+/**
+ * @brief 업데이트 작업을 작업 목록에 올리고 따로 띄운 스레드에서 돌린다.
+ * @details 이 스레드는 세대가 끝날 때 기다리는 목록에 넣지 않는다. 세대를 바꾸는 동안에는 DNS 가
+ *          멈춰 있는데, 실행 파일을 받느라 몇 분 걸릴 수 있는 작업을 그동안 기다리지 않으려는
+ *          것이다. 업데이트 작업 표는 스레드가 쥐고 있다가 작업 목록에 결과를 적기 전에 놓는다.
+ *          관리 화면은 작업이 끝난 것을 보자마자 다음 작업을 요청할 수 있어야 한다.
+ * @return 시작한 작업. 작업을 올리지 못하면 표를 바로 놓고 실패한다.
+ */
+fn start_update_job(
+    jobs: &Arc<JobRegistry>,
+    running: crate::update::task::Running,
+    work: impl FnOnce(&crate::update::task::Running) -> Result<String, String> + Send + 'static,
+) -> Result<String, String> {
+    let kind = format!("update-{}", running.task().name());
+    let id = jobs
+        .create(&kind)
+        .ok_or_else(|| "Too many jobs are running".to_string())?;
+    let task_jobs = jobs.clone();
+    std::thread::Builder::new()
+        .name(kind)
+        .spawn(move || {
+            let outcome = work(&running);
+            drop(running);
+            let (ok, result) = match outcome {
+                Ok(message) => (true, message),
+                Err(error) => (false, error),
+            };
+            task_jobs.finish(id, ok, result);
+        })
+        .map_err(|error| {
+            let message = format!("Could not start the update job: {error}");
+            jobs.finish(id, false, message.clone());
+            message
+        })?;
+    Ok(format!("{{\"id\":{id},\"status\":\"running\"}}"))
+}
+
 /** @brief 관리 API 콜백을 만든다. */
 pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
     let ControlDeps {
@@ -1274,6 +1311,60 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     "{{\"ok\":true,\"adapter\":{}}}",
                     onetdns_core::json::escape(adapter)
                 ))
+            })
+        },
+
+        update_status: {
+            let runtime = runtime_cfg.clone();
+            Box::new(move || crate::update::task::status_json(runtime.load().release_check))
+        },
+
+        update_check: {
+            let jobs = jobs.clone();
+            let resolver = blocklist_resolver.clone();
+            Box::new(move || {
+                crate::update::task::participation()?;
+                let running = crate::update::task::begin(crate::update::task::Task::Check)?;
+                let resolver = resolver.clone();
+                start_update_job(&jobs, running, move |running| {
+                    crate::update::task::check(running, &resolver)
+                        .map(|finding| crate::update::task::describe(&finding))
+                })
+            })
+        },
+
+        update_apply: {
+            let jobs = jobs.clone();
+            let resolver = blocklist_resolver.clone();
+            let config = config_path.clone();
+            Box::new(move |version: &str| {
+                let running = crate::update::task::begin(crate::update::task::Task::Apply)?;
+                let release = crate::update::task::confirmed(version)?;
+                let resolver = resolver.clone();
+                let config = config.clone();
+                start_update_job(&jobs, running, move |running| {
+                    crate::update::task::install_release(
+                        running,
+                        &release,
+                        &resolver,
+                        config.as_deref(),
+                    )
+                    .map(|swapped| crate::update::task::activate(&swapped))
+                })
+            })
+        },
+
+        update_rollback: {
+            let jobs = jobs.clone();
+            let config = config_path.clone();
+            Box::new(move || {
+                crate::update::apply::rollback_ready()?;
+                let running = crate::update::task::begin(crate::update::task::Task::Rollback)?;
+                let config = config.clone();
+                start_update_job(&jobs, running, move |running| {
+                    crate::update::task::rollback(running, config.as_deref())
+                        .map(|swapped| crate::update::task::activate(&swapped))
+                })
             })
         },
 
