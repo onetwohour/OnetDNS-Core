@@ -72,6 +72,12 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 zeroize = "1"
 libc = "0.2"
 
+# 클러스터는 프레임마다 Ed25519 서명을 검증한다. 이 크레이트를 최적화하지 않으면 debug 빌드의
+# 검증 한 번이 테스트의 하트비트 간격과 맞먹어, 노드 여럿을 띄우는 테스트가 CPU 를 다 쓰고
+# 선거를 되풀이한다.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

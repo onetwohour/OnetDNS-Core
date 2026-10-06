@@ -1408,6 +1408,9 @@ impl RaftServer {
      * @param version  이 노드의 제품 버전. 같은 버전의 노드끼리만 메시지를 주고받는다. 복제하는
      *                 설정의 키와 의미, 로그 항목과 스냅숏 형식, RPC 메시지가 모두 버전에 따라
      *                 달라질 수 있기 때문이다.
+     * @param listener 다른 노드의 연결을 받을 리스너. 주소가 아니라 bind 한 리스너를 받는다. 포트
+     *                 0 으로 정한 주소를 다른 노드에 알려 준 뒤 다시 bind 하면, 그사이에 다른
+     *                 소켓이 그 포트를 가져갈 수 있다.
      * @param on_apply 커밋된 항목을 상태 기계에 반영하는 콜백. 설정 복제의 착지점이다.
      * @warning 클러스터 비밀은 32바이트 이상이어야 한다. 짧으면 시작을 거부한다. 약한
      *          비밀은 인증이 없는 것과 다름없다.
@@ -1416,7 +1419,7 @@ impl RaftServer {
     pub fn spawn(
         self_id: NodeId,
         version: &'static str,
-        listen: String,
+        listener: TcpListener,
         peers: HashMap<NodeId, String>,
         node: RaftNode,
         tick_ms: u64,
@@ -1443,9 +1446,6 @@ impl RaftServer {
         if let Some(error) = node.fatal_error() {
             return Err(error.to_string());
         }
-        let listen_addr: SocketAddr = listen.parse().map_err(|_| {
-            format!("Invalid Raft listen address (numeric IP:port required): {listen}")
-        })?;
 
         if peers.contains_key(&self_id) {
             return Err("Raft peers cannot include this node's own ID".into());
@@ -1543,9 +1543,6 @@ impl RaftServer {
             threads: threads.clone(),
         };
 
-        let listener = TcpListener::bind(listen_addr).map_err(|error| {
-            format!("Could not open the Raft listening address {listen_addr}: {error}")
-        })?;
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("Could not make the Raft socket non-blocking: {error}"))?;
@@ -2048,7 +2045,7 @@ mod tests {
         let handle = RaftServer::spawn(
             1,
             TEST_VERSION,
-            "127.0.0.1:0".into(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
             HashMap::new(),
             RaftNode::new(
                 1,
@@ -2098,7 +2095,7 @@ mod tests {
         let handle = RaftServer::spawn(
             1,
             TEST_VERSION,
-            "127.0.0.1:0".into(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
             HashMap::new(),
             RaftNode::new(
                 1,
@@ -2157,7 +2154,7 @@ mod tests {
         let handle = RaftServer::spawn(
             1,
             TEST_VERSION,
-            "127.0.0.1:0".into(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
             HashMap::new(),
             RaftNode::new(
                 1,
@@ -2266,14 +2263,16 @@ mod tests {
                 join_threads(&handle.threads);
             }
         };
-        let mut reserved = Vec::new();
-        let mut addresses = Vec::new();
-        for _ in 0..3 {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            addresses.push(listener.local_addr().unwrap());
-            reserved.push(listener);
-        }
-        drop(reserved);
+        /*
+         * 늦게 뜨는 3번 노드의 리스너도 처음부터 잡아 둔다. 다른 노드에 알린 주소를 그사이 다른
+         * 소켓이 가져가지 못하게 하려는 것이다. 3번 노드가 뜨기 전에 이 리스너로 들어온 연결의
+         * 프레임은 쌓여 있다가 3번 노드가 뜬 뒤에 읽힌다.
+         */
+        let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
+        let addresses = listeners
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap());
+        let [first, second, third] = listeners;
 
         let ids = vec![1, 2, 3];
         let seeds = [[41u8; 32], [42u8; 32], [43u8; 32]];
@@ -2281,7 +2280,7 @@ mod tests {
         let states: Vec<_> = (0..3)
             .map(|_| Arc::new(Mutex::new(Vec::<u8>::new())))
             .collect();
-        let spawn_node = |index: usize| {
+        let spawn_node = |index: usize, listener: TcpListener| {
             let self_id = ids[index];
             let peers = ids
                 .iter()
@@ -2301,7 +2300,7 @@ mod tests {
             RaftServer::spawn(
                 self_id,
                 TEST_VERSION,
-                addresses[index].to_string(),
+                listener,
                 peers,
                 RaftNode::new(
                     self_id,
@@ -2328,7 +2327,7 @@ mod tests {
             .unwrap()
         };
 
-        let mut handles = vec![spawn_node(0), spawn_node(1)];
+        let mut handles = vec![spawn_node(0, first), spawn_node(1, second)];
         let election_deadline = Instant::now() + Duration::from_secs(5);
         let leader = loop {
             if let Some(index) = handles.iter().position(RaftHandle::is_leader) {
@@ -2403,7 +2402,7 @@ mod tests {
             panic!("리더 로그 스냅샷 생성 실패");
         }
 
-        handles.push(spawn_node(2));
+        handles.push(spawn_node(2, third));
         let caught_up = wait_for_progress(&handles[2], Duration::from_secs(5), || {
             lock(&states[2]).as_slice() == expected.as_slice()
                 && lock(&handles[2].node).last_applied()
@@ -2421,21 +2420,17 @@ mod tests {
     #[test]
     /** @brief 적용이 느려도 심장 박동이 끊기지 않는지. 끊기면 멀쩡한데도 리더를 다시 정한다. */
     fn slow_state_machine_application_does_not_starve_heartbeats() {
-        let mut reserved = Vec::new();
-        let mut addresses = Vec::new();
-        for _ in 0..3 {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            addresses.push(listener.local_addr().unwrap());
-            reserved.push(listener);
-        }
-        drop(reserved);
+        let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
+        let addresses = listeners
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap());
 
         let seeds = [[11u8; 32], [22u8; 32], [33u8; 32]];
         let public = seeds.map(|seed| SigningKey::from_bytes(&seed).verifying_key().to_bytes());
         let ids = vec![1, 2, 3];
         let apply_started = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
-        for index in 0..3 {
+        for (index, listener) in listeners.into_iter().enumerate() {
             let self_id = ids[index];
             let peers = ids
                 .iter()
@@ -2454,7 +2449,7 @@ mod tests {
                 RaftServer::spawn(
                     self_id,
                     TEST_VERSION,
-                    addresses[index].to_string(),
+                    listener,
                     peers,
                     RaftNode::new(
                         self_id,
@@ -2547,7 +2542,7 @@ mod tests {
         let handle = RaftServer::spawn(
             1,
             TEST_VERSION,
-            "127.0.0.1:0".into(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
             HashMap::new(),
             RaftNode::new(
                 1,
@@ -2764,7 +2759,7 @@ mod tests {
             let started = RaftServer::spawn(
                 1,
                 version,
-                "127.0.0.1:0".into(),
+                TcpListener::bind("127.0.0.1:0").unwrap(),
                 HashMap::new(),
                 RaftNode::new(
                     1,
@@ -2814,14 +2809,10 @@ mod tests {
      *          버전은 상태에 남는다.
      */
     fn nodes_with_a_different_version_are_kept_out_of_the_cluster() {
-        let mut reserved = Vec::new();
-        let mut addresses = Vec::new();
-        for _ in 0..3 {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            addresses.push(listener.local_addr().unwrap());
-            reserved.push(listener);
-        }
-        drop(reserved);
+        let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
+        let addresses = listeners
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap());
 
         let ids: Vec<NodeId> = vec![1, 2, 3];
         let versions = [TEST_VERSION, TEST_VERSION, "2.0.0"];
@@ -2830,8 +2821,10 @@ mod tests {
         let states: Vec<_> = (0..3)
             .map(|_| Arc::new(Mutex::new(Vec::<u8>::new())))
             .collect();
-        let handles: Vec<RaftHandle> = (0..3)
-            .map(|index| {
+        let handles: Vec<RaftHandle> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(index, listener)| {
                 let peers = ids
                     .iter()
                     .enumerate()
@@ -2848,7 +2841,7 @@ mod tests {
                 RaftServer::spawn(
                     ids[index],
                     versions[index],
-                    addresses[index].to_string(),
+                    listener,
                     peers,
                     RaftNode::new(
                         ids[index],

@@ -354,10 +354,19 @@ pub(crate) fn ensure_raft_runtime(
                 .unwrap_or_else(|error| error.into_inner()) = next;
             Ok(())
         });
+    let listener = listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| format!("Invalid Raft listen address (numeric IP:port required): {listen}"))
+        .and_then(|address| {
+            std::net::TcpListener::bind(address).map_err(|error| {
+                format!("Could not open the Raft listening address {address}: {error}")
+            })
+        })
+        .map_err(|error| format!("Could not start Raft: {error}"))?;
     let handle = onetdns_cluster::transport::RaftServer::spawn(
         cfg.cluster_node_id,
         crate::update::VERSION,
-        listen.clone(),
+        listener,
         peers,
         node,
         50,
