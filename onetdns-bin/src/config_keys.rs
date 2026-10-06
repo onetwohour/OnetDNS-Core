@@ -136,7 +136,9 @@ pub(crate) enum Reload {
     HotIf(ApplyGroup, Swappable),
     /**
      * @brief 세대를 새로 만든다.
-     * @details 권한을 낮추는 동작은 한 프로세스 안에서 되돌릴 수 없다.
+     * @details 권한을 낮추는 동작은 한 프로세스 안에서 되돌릴 수 없고, 스레드를 띄우기 전에만
+     *          할 수 있다. 그래서 새 세대는 값이 프로세스의 지금 사용자와 같은지만 확인하고,
+     *          다르면 실패해 마지막 설정으로 돌아간다.
      */
     NewGeneration,
 }

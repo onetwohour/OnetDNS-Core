@@ -731,7 +731,7 @@ fn service_run() -> BoxResult<()> {
     });
     match startup {
         crate::update::trial::Startup::Normal => {}
-        crate::update::trial::Startup::Trial(trial) => crate::update::trial::watch(trial),
+        crate::update::trial::Startup::Trial(trial) => crate::update::trial::hold(trial),
         crate::update::trial::Startup::Reverted => crate::update::launch::start_reverted(),
     }
 

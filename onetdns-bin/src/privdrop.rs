@@ -1,14 +1,19 @@
 /*!
  * @brief 권한 내려놓기.
  *
- * @details 낮은 포트에 묶으려면 처음에 높은 권한이 필요하다. 다 묶은 뒤에는 그 권한을
- *          내려놓아야, 나중에 뚫려도 피해가 그만큼 작다.
+ * @details 프로세스가 다른 스레드를 띄우기 전에 지정한 사용자와 그룹으로 내려간다. 낮은 포트
+ *          묶기와 네트워크 조작에 필요한 능력만 남기고 나머지는 버린다. 남긴 능력이 있어서
+ *          내려간 뒤에도 낮은 포트에 묶을 수 있다.
+ * @warning 능력과 no_new_privs 는 스레드마다 따로 있다. setgid 와 setuid 는 C 라이브러리가
+ *          모든 스레드에 적용하지만, 능력 유지 요청과 능력 설정, no_new_privs 는 부른 스레드에만
+ *          걸린다. 그래서 내려가기 전에 뜬 스레드는 능력을 모두 잃고 잠금도 걸리지 않는다.
+ *          내려간 뒤에 뜬 스레드만 부른 스레드의 상태를 물려받는다.
  * @warning 순서가 중요하다. 보조 그룹, 그룹, 사용자 순으로 내려놓는다. 사용자를 먼저
  *          바꾸면 그룹을 바꿀 권한이 없어져 그룹만 그대로 남는다.
- * @note 필요한 능력만 남긴다. 낮은 포트 묶기와 네트워크 조작이 그것이고, 나머지는 버린다.
  */
 
 use std::ffi::CString;
+use std::sync::OnceLock;
 
 /** @brief 낮은 포트에 묶을 수 있는 능력. */
 const CAP_NET_BIND_SERVICE: u32 = 10;
@@ -40,9 +45,30 @@ const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
 /** @brief 능력 구조 버전. */
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
+/**
+ * @brief 이 프로세스가 내려간 UID 와 GID.
+ * @details 내려간 뒤에 뜬 스레드는 모두 같은 상태를 물려받으므로, 그 뒤의 세대는 같은 사용자와
+ *          그룹인지만 확인한다. 커널은 다른 스레드가 내려간 뒤에 떴는지 알려 주지 않는다.
+ */
+static DROPPED_TO: OnceLock<(libc::uid_t, libc::gid_t)> = OnceLock::new();
+
 /** @brief 마지막 시스템 오류를 읽을 수 있는 문자열로. */
 fn last_err() -> String {
     std::io::Error::last_os_error().to_string()
+}
+
+/**
+ * @brief 이 프로세스에서 돌고 있는 스레드 수.
+ * @details 읽지 못하면 오류다. 스레드가 하나뿐인지 모르는 채로 내려가면 안 된다.
+ */
+fn running_threads() -> Result<usize, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("Could not read /proc/self/status to count threads: {error}"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|count| count.trim().parse().ok())
+        .ok_or_else(|| "/proc/self/status does not report the number of threads".to_string())
 }
 
 /** @brief 사용자 이름을 번호로. */
@@ -142,11 +168,10 @@ fn set_caps(caps: &[u32]) -> Result<(), String> {
 /**
  * @brief 지정한 사용자와 그룹으로 내려간다.
  *
- * @details 보조 그룹, 그룹, 사용자 순이다. 사용자를 먼저 바꾸면 그룹을 바꿀 권한이 없어져
- *          그룹만 높은 채로 남는다. 이미 그 사용자와 그룹으로 돌고 있으면 남길 능력과 잠금만
- *          다시 건다. 다른 일반 사용자로 돌고 있으면 바꿀 권한이 없어 실패한다.
- * @warning 내려간 뒤 실제로 되돌아갈 수 없는지 확인한다. 확인하지 않으면 내려놓은 줄
- *          알았는데 그대로인 경우를 알아채지 못한다.
+ * @details 처음 부를 때 내려간다. 그 뒤로는 같은 사용자와 그룹인지만 확인하고, 다르면 실패한다.
+ * @warning 처음 부를 때 다른 스레드가 돌고 있으면 내려가지 않고 실패한다. 내려가면 그 스레드들이
+ *          능력을 잃고 잠금 없이 남는다. 그래서 실행 중에 run_as_user 를 새로 넣거나 바꾸려면
+ *          서비스를 다시 시작해야 한다.
  */
 pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
     let uid = resolve_uid(user)?;
@@ -184,6 +209,34 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
         return Err("run_as_group refers to GID 0 (root), which is not a lower privilege".into());
     }
 
+    if let Some(&(dropped_uid, dropped_gid)) = DROPPED_TO.get() {
+        if (dropped_uid, dropped_gid) == (uid, gid) {
+            return Ok(());
+        }
+        return Err(format!(
+            "This process already runs as UID/GID {dropped_uid}/{dropped_gid}; restart the service to run as UID/GID {uid}/{gid}"
+        ));
+    }
+    let threads = running_threads()?;
+    if threads != 1 {
+        return Err(format!(
+            "Cannot drop privileges while {threads} threads are running, because each thread keeps its own capabilities; restart the service so that it drops them before starting other threads"
+        ));
+    }
+    switch_identity(uid, gid)?;
+    let _ = DROPPED_TO.set((uid, gid));
+    Ok(())
+}
+
+/**
+ * @brief 스레드가 하나뿐인 프로세스를 지정한 사용자와 그룹으로 내리고 잠근다.
+ *
+ * @details 이미 그 사용자와 그룹으로 돌고 있으면 남길 능력과 잠금만 건다. 다른 일반 사용자로
+ *          돌고 있으면 바꿀 권한이 없어 실패한다.
+ * @warning 내려간 뒤 실제로 되돌아갈 수 없는지 확인한다. 확인하지 않으면 내려놓은 줄
+ *          알았는데 그대로인 경우를 알아채지 못한다.
+ */
+fn switch_identity(uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
     let current_uid = unsafe { libc::geteuid() };
     let current_gid = unsafe { libc::getegid() };
     if current_uid != 0 {
@@ -290,4 +343,39 @@ pub fn executable_still_runnable(path: &std::path::Path) -> Result<(), String> {
         return Ok(());
     }
     Err(last_err())
+}
+
+#[cfg(test)]
+/** @brief 내려가기 전에 확인하는 조건. */
+mod tests {
+    use super::*;
+
+    #[test]
+    /**
+     * @brief 다른 스레드가 돌고 있으면 내려가지 않고 실패하는지.
+     * @details 확인이 내려가기 전에 실패하므로 테스트 프로세스의 권한은 그대로다. root 로 돌리면
+     *          0 이 아닌 사용자와 그룹을 고른다. 0 은 스레드를 세기 전에 거절된다.
+     */
+    fn refuses_to_drop_while_other_threads_run() {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            let _ = stopped.recv();
+        });
+        let uid = match unsafe { libc::getuid() } {
+            0 => 65534,
+            uid => uid,
+        };
+        let gid = match unsafe { libc::getgid() } {
+            0 => 65534,
+            gid => gid,
+        };
+        let result = drop_privileges(&uid.to_string(), Some(&gid.to_string()));
+        stop.send(()).expect("스레드에 멈추라고 알림");
+        other.join().expect("스레드 종료");
+        let error = result.expect_err("다른 스레드가 도는데 권한을 내려놓았다");
+        assert!(
+            error.contains("threads are running"),
+            "스레드와 무관한 이유로 실패했다: {error}"
+        );
+    }
 }

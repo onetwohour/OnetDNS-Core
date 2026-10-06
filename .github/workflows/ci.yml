@@ -323,22 +323,37 @@ jobs:
           OLD_CHILD=$(pgrep -P "$PARENT" | head -n 1 || true)
           test -n "$OLD_CHILD"
           echo "supervisor $PARENT and child $OLD_CHILD serve port 535 as uid 65534"
-          python3 - "$PARENT" "$OLD_CHILD" <<'PY'
-          import re, sys
+          # Capabilities and no_new_privs belong to each thread, and /proc/<pid>/status shows
+          # only the main thread. A thread started before the drop loses every capability and
+          # never gets the lock, so check every thread of every process.
+          cat > "$WORK/check-privileges.py" <<'PY'
+          import glob, re, sys
           required = sum(1 << bit for bit in (10, 11, 12, 13))
           for pid in sys.argv[1:]:
-              fields = {}
-              with open(f'/proc/{pid}/status', encoding='ascii') as status:
-                  for line in status:
-                      if ':' in line:
-                          key, value = line.split(':', 1)
-                          fields[key] = value.strip()
-              assert fields['NoNewPrivs'] == '1'
-              assert int(fields['CapEff'], 16) & required == required
+              threads = 0
+              for path in glob.glob(f'/proc/{pid}/task/*/status'):
+                  fields = {}
+                  try:
+                      with open(path, encoding='ascii', errors='replace') as status:
+                          for line in status:
+                              if ':' in line:
+                                  key, value = line.split(':', 1)
+                                  fields[key] = value.strip()
+                  except FileNotFoundError:
+                      continue
+                  threads += 1
+                  where = f"{path} ({fields.get('Name')})"
+                  assert fields['Uid'].split() == ['65534'] * 4, where
+                  assert fields['Gid'].split() == ['65534'] * 4, where
+                  assert fields['NoNewPrivs'] == '1', where
+                  assert int(fields['CapEff'], 16) & required == required, where
+              assert threads > 0, f'no threads found for {pid}'
               with open(f'/proc/{pid}/limits', encoding='ascii') as limits:
                   match = re.search(r'^Max core file size\s+(\S+)\s+(\S+)', limits.read(), re.MULTILINE)
-              assert match and match.groups() == ('0', '0')
+              assert match and match.groups() == ('0', '0'), pid
+              print(f'{pid}: all {threads} threads run as 65534 with the retained capabilities and no_new_privs')
           PY
+          python3 "$WORK/check-privileges.py" "$PARENT" "$OLD_CHILD"
           sudo -n kill -ABRT "$OLD_CHILD"
           NEW_CHILD=""
           for i in $(seq 1 100); do
@@ -352,11 +367,7 @@ jobs:
           test -n "$NEW_CHILD"
           dig @127.0.0.1 -p 535 www.interop.test A +short | grep -qx "192.0.2.10"
           echo "child aborted; $NEW_CHILD is serving port 535 again"
-          test "$(awk '/^Uid:/{print $2}' "/proc/$NEW_CHILD/status")" = "65534"
-          test "$(awk '/^NoNewPrivs:/{print $2}' "/proc/$NEW_CHILD/status")" = "1"
-          CAP_EFF=$(awk '/^CapEff:/{print $2}' "/proc/$NEW_CHILD/status")
-          python3 -c 'import sys; required=sum(1 << bit for bit in (10,11,12,13)); assert int(sys.argv[1],16) & required == required' "$CAP_EFF"
-          awk '$1 == "Max" && $2 == "core" && $3 == "file" && $4 == "size" { found=1; bad=($5 != 0 || $6 != 0) } END { exit (!found || bad) }' "/proc/$NEW_CHILD/limits"
+          python3 "$WORK/check-privileges.py" "$NEW_CHILD"
           sudo -n kill -TERM "$PARENT"
           wait "$LAUNCHER"
           trap - EXIT

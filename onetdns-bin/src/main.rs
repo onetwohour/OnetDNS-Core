@@ -571,7 +571,7 @@ fn serve_directly(config: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     if !update::install::supervised_child() {
         match update::trial::on_start(&mut || {}) {
             update::trial::Startup::Normal => {}
-            update::trial::Startup::Trial(trial) => update::trial::watch(trial),
+            update::trial::Startup::Trial(trial) => update::trial::hold(trial),
             update::trial::Startup::Reverted => update::launch::start_reverted(),
         }
     }
@@ -1246,6 +1246,8 @@ fn plain_dns_worker_counts(
  * @brief 한 세대를 시작하고 종료나 다시 읽기를 기다린다.
  * @details 리스너를 모두 묶고, 필터·영역·정책을 올리고, 컨트롤 플레인을 시작한 뒤 대기한다.
  * @return 다시 읽어야 하면 참, 끝내야 하면 거짓.
+ * @warning Linux 에서 run_as_user 가 있으면 처음 부를 때 프로세스에 다른 스레드가 없어야 한다.
+ *          있으면 권한을 내려놓지 못해 실패한다.
  */
 pub fn serve(
     cfg: Config,
@@ -1263,6 +1265,27 @@ pub fn serve(
     }
     onetdns_dnssec::set_accept_expired(cfg.dnssec_accept_expired);
     onetdns_forward::set_query_source(cfg.query_source, cfg.query_source_v6);
+
+    #[cfg(target_os = "linux")]
+    if let Some(user) = cfg.run_as_user.as_deref() {
+        /*
+         * 스레드를 하나라도 띄우기 전에 부른다. 첫 세대는 여기서 실제로 내려가고, 그 뒤에 뜨는
+         * 스레드는 남긴 능력과 잠금을 물려받는다. 세대마다 부르는 것은 run_as_user 를 바꾼 세대가
+         * 이전 사용자로 오류 없이 돌지 않게 하려는 것이다.
+         */
+        if let Err(e) = privdrop::drop_privileges(user, cfg.run_as_group.as_deref()) {
+            return Err(crate::anyhow!(format!(
+                "Could not start this configuration because process privileges could not be dropped: {e}"
+            )));
+        }
+        onetdns_core::info!(
+            event = "privdrop.applied",
+            user,
+            "Running with user and group privileges dropped and further privilege gain blocked"
+        );
+    }
+    /* 기한을 재는 스레드도 권한을 내려놓은 뒤에 띄운다. 기한이 지나면 그 스레드가 exec 한다. */
+    update::trial::start_deadline_timer();
 
     let restarts = RestartHooks::default();
     /*
@@ -1578,24 +1601,6 @@ pub fn serve(
     .map_err(std::io::Error::other)?;
 
     onetdns_core::info!(event = "server.ready", "Now answering queries");
-
-    #[cfg(target_os = "linux")]
-    if let Some(user) = cfg.run_as_user.as_deref() {
-        /*
-         * 세대마다 확인한다. 한 번만 하면 첫 시도가 실패한 뒤 다시 띄운 세대는 내려가지 않은
-         * 채로, run_as_user 를 바꾼 세대는 이전 사용자로 오류 없이 돈다.
-         */
-        if let Err(e) = privdrop::drop_privileges(user, cfg.run_as_group.as_deref()) {
-            return Err(crate::anyhow!(format!(
-                "Stopping the service because process privileges could not be dropped: {e}"
-            )));
-        }
-        onetdns_core::info!(
-            event = "privdrop.applied",
-            user,
-            "Running with user and group privileges dropped and further privilege gain blocked"
-        );
-    }
 
     if !reload.load(Ordering::Acquire) {
         if let Some(text) = cfg_text.as_ref() {

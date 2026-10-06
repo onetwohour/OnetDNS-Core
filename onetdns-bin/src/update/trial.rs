@@ -319,11 +319,28 @@ fn take_active() -> Option<Trial> {
 }
 
 /**
- * @brief 시험을 이 프로세스에 걸고 기한을 재는 스레드를 띄운다.
- * @details 기한이 지나면 되돌리고 되돌린 실행 파일을 곧바로 띄운다.
+ * @brief 시험을 이 프로세스에 건다.
+ * @details 기한은 시험을 시작한 시각부터 잰다. 기한을 재는 스레드는 start_deadline_timer 가 띄운다.
  */
-pub(crate) fn watch(trial: Trial) {
+pub(crate) fn hold(trial: Trial) {
     *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some(trial);
+}
+
+/**
+ * @brief 걸어 둔 시험이 있으면 기한을 재는 스레드를 띄운다.
+ * @details 기한이 지나면 되돌리고 되돌린 실행 파일을 그 스레드에서 곧바로 띄운다.
+ * @warning 세대가 권한을 내려놓은 뒤에 불러야 한다. exec 한 프로그램은 부른 스레드의 사용자와
+ *          능력을 물려받는데, 내려놓기 전에 뜬 스레드는 능력을 잃어 되돌린 버전이 낮은 포트에
+ *          묶지 못한다.
+ */
+pub(crate) fn start_deadline_timer() {
+    if ACTIVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none()
+    {
+        return;
+    }
     let spawned = std::thread::Builder::new()
         .name("update-trial".to_string())
         .spawn(|| {
@@ -564,7 +581,7 @@ mod tests {
         let Startup::Trial(trial) = start(install) else {
             panic!("시험을 시작해야 합니다");
         };
-        watch(trial);
+        hold(trial);
         assert!(revert_after_error(&"bind failed"));
         assert!(!revert_after_error(&"bind failed"), "이미 되돌린 시험");
         commit_active();
