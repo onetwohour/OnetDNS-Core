@@ -11,8 +11,7 @@ use onetdns_core::MutexExt;
 use sha2::{Digest, Sha256};
 
 use crate::config_apply::{
-    apply_config_edit_locked, apply_config_edit_smart_locked, changed_config_keys,
-    config_write_lock, ConfigApplyMode, HotConfigApply,
+    apply_config_edit_smart_locked, changed_config_keys, config_write_lock, HotConfigApply,
 };
 use crate::config_edit::{
     json_to_raft_toml_literal, materialize_mode_acl_patch, remove_config_key, rewrite_config_kv,
@@ -45,8 +44,8 @@ struct RaftRuntimeIdentity {
 struct RaftGenerationApply {
     /** @brief 설정을 다시 읽게 하는 플래그. */
     reload: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 재시작하지 않고 교체하는 방법. 없으면 재시작한다. */
-    hot_apply: Option<HotConfigApply>,
+    /** @brief 재시작하지 않고 교체하는 방법. */
+    hot_apply: HotConfigApply,
 }
 
 /** @brief Raft 로그 항목을 적용하는 곳. 세대가 바뀌면 교체한다. */
@@ -125,20 +124,15 @@ impl RaftApplyContext {
     ) -> Result<(), String> {
         let _write_guard = config_write_lock().lock_recover();
         let generation = self.generation.lock_recover().clone();
-        let edit = |_: &str| Ok(text.to_string());
-        let result = if let Some(hot_apply) = generation.hot_apply.as_ref() {
-            apply_config_edit_smart_locked(
-                &self.path,
-                &self.prev,
-                &self.applied,
-                &generation.reload,
-                hot_apply,
-                edit,
-            )
-            .map(|_| ())
-        } else {
-            apply_config_edit_locked(&self.path, &self.prev, &generation.reload, edit)
-        };
+        let result = apply_config_edit_smart_locked(
+            &self.path,
+            &self.prev,
+            &self.applied,
+            &generation.reload,
+            &generation.hot_apply,
+            |_: &str| Ok(text.to_string()),
+        )
+        .map(|_| ());
         *self.prev.lock_recover() = previous_slot;
         result
     }
@@ -225,7 +219,7 @@ pub(crate) fn ensure_raft_runtime(
     prev: ConfigTextSlot,
     applied: ConfigTextSlot,
     reload: Arc<std::sync::atomic::AtomicBool>,
-    hot_apply: Option<HotConfigApply>,
+    hot_apply: HotConfigApply,
 ) -> Result<(), String> {
     let listen = cfg
         .cluster_raft_listen
@@ -404,7 +398,7 @@ pub(crate) fn raft_restart(
     prev: ConfigTextSlot,
     applied: ConfigTextSlot,
     reload: Arc<std::sync::atomic::AtomicBool>,
-    hot_apply: Option<HotConfigApply>,
+    hot_apply: HotConfigApply,
 ) -> RaftRestart {
     Arc::new(
         move |next: &Config, expected_text: Option<&str>| -> Result<(), String> {
@@ -962,20 +956,15 @@ fn apply_raft_patch(
 
     let _write_guard = config_write_lock().lock_recover();
     let generation = context.generation.lock_recover().clone();
-    let mode = if let Some(hot_apply) = generation.hot_apply.as_ref() {
-        apply_config_edit_smart_locked(
-            &context.path,
-            &context.prev,
-            &context.applied,
-            &generation.reload,
-            hot_apply,
-            edit,
-        )?
-        .mode
-    } else {
-        apply_config_edit_locked(&context.path, &context.prev, &generation.reload, edit)?;
-        ConfigApplyMode::ServiceRestart
-    };
+    let mode = apply_config_edit_smart_locked(
+        &context.path,
+        &context.prev,
+        &context.applied,
+        &generation.reload,
+        &generation.hot_apply,
+        edit,
+    )?
+    .mode;
     onetdns_core::info!(
         event = "raft.config_applied",
         keys = patch.len(),
@@ -1446,7 +1435,7 @@ mod tests {
             applied.clone(),
             RaftGenerationApply {
                 reload: reload.clone(),
-                hot_apply: Some(hot_apply),
+                hot_apply,
             },
         );
         context
@@ -1489,7 +1478,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             RaftGenerationApply {
                 reload: old_reload,
-                hot_apply: Some(restart_apply.clone()),
+                hot_apply: restart_apply.clone(),
             },
         ));
         let applier = {
@@ -1502,7 +1491,7 @@ mod tests {
                 Some(INITIAL),
                 RaftGenerationApply {
                     reload: new_reload.clone(),
-                    hot_apply: Some(restart_apply),
+                    hot_apply: restart_apply,
                 },
             )
             .unwrap();

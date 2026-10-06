@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 권한 빠른 경로도 무중단 설정에 따라 닫히는지. */
+    /** @brief 권한 빠른 경로가 그 답을 바꾸는 무중단 설정에만 닫히는지. */
     fn hot_settings_that_break_the_authority_lane_close_it() {
         let facts = LaneFacts {
             dhcp_pool: false,
@@ -1539,10 +1539,31 @@ mod tests {
             "lenient 쿠키는 COOKIE 옵션이 붙은 질의만 일반 경로로 보내므로 경로를 닫지 않아야 합니다"
         );
 
-        let breakers: Vec<(&str, fn(&mut Config))> = vec![
+        /*
+         * 권한 빠른 경로는 옵션 없는 A, AAAA 질의를 권한 계층과 같은 영역 자료로 답한다. 로컬
+         * 전용 이름은 권한 계층보다 안쪽에서 판정하고, NSID 와 패딩은 그 옵션을 단 질의에만,
+         * ACME 도전은 TXT 질의에만 답을 바꾸므로 이 경로의 답을 바꾸지 못한다.
+         */
+        let keepers: Vec<(&str, fn(&mut Config))> = vec![
             ("acme_directory_url", |c| {
                 c.acme_directory_url = Some("https://acme.test/dir".to_string())
             }),
+            ("domain_needed", |c| c.domain_needed = true),
+            ("bogus_priv", |c| c.bogus_priv = true),
+            ("empty_zones", |c| c.empty_zones = true),
+            ("edns_padding_block", |c| c.edns_padding_block = 128),
+            ("nsid", |c| c.nsid = Some("ns1".to_string())),
+        ];
+        for (key, set) in keepers {
+            let mut cfg = base.clone();
+            set(&mut cfg);
+            assert!(
+                evaluate_lane_gates(&cfg, &facts).authority,
+                "{key}는 권한 빠른 경로의 답을 바꾸지 않으므로 경로를 닫지 않아야 합니다"
+            );
+        }
+
+        let breakers: Vec<(&str, fn(&mut Config))> = vec![
             ("dynamic_records", |c| {
                 c.dynamic_records.push(onetdns_config::DynamicRecord {
                     name: "www.example.test".to_string(),
@@ -1558,15 +1579,10 @@ mod tests {
             ("bogus_nxdomain", |c| {
                 c.bogus_nxdomain = vec!["192.0.2.1/32".parse().unwrap()]
             }),
-            ("domain_needed", |c| c.domain_needed = true),
-            ("bogus_priv", |c| c.bogus_priv = true),
-            ("empty_zones", |c| c.empty_zones = true),
-            ("edns_padding_block", |c| c.edns_padding_block = 128),
             ("rrset_roundrobin", |c| c.rrset_roundrobin = true),
             ("recurse_deny_answers", |c| {
                 c.recurse_deny_answers = vec!["192.0.2.1/32".parse().unwrap()]
             }),
-            ("nsid", |c| c.nsid = Some("ns1".to_string())),
             ("dnstap_file", |c| {
                 c.dnstap_file = Some(PathBuf::from("dnstap.log"))
             }),

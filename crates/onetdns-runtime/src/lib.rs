@@ -232,7 +232,14 @@ pub trait Handler: Send + Sync + 'static {
         None
     }
 
-    /** @brief 리액터 경로를 쓸지. false면 워커가 동기 루프만 돈다. */
+    /**
+     * @brief 이 스레드가 리액터 루프를 돌아야 하는지.
+     * @details 리액터를 쓰는 서버의 UDP 워커는 루프를 돌 때마다 이 값을 다시 묻고, 값이 바뀌면
+     *          리액터 루프와 동기 루프를 오간다. 거짓이 되면 워커가 리액터 루프를 떠나 남은
+     *          교환을 더 진행하지 않으므로, 이 스레드에 맡긴 교환이 남아 있는 동안에는 참이어야
+     *          한다.
+     * @note 동기 루프는 수신할 때마다 부르므로 가벼워야 한다.
+     */
     #[cfg(unix)]
     fn reactor_active(&self) -> bool {
         false
@@ -503,23 +510,13 @@ impl Server {
                 let h = handler.clone();
                 let sd = shutdown.clone();
                 let pin = cfg.pin_cores;
+                let reactor = cfg.udp_reactor;
                 let builder = std::thread::Builder::new().name(format!("onetdns-udp-{i}"));
-                #[cfg(unix)]
-                let use_reactor = cfg.udp_reactor && handler.reactor_active();
-                #[cfg(not(unix))]
-                let use_reactor = false;
                 handles.push(builder.spawn(move || {
                     if pin {
                         sys::pin_to_core(i);
                     }
-                    #[cfg(unix)]
-                    if use_reactor {
-                        udp::reactor_worker(sock, h, sd);
-                        return;
-                    }
-                    #[cfg(not(unix))]
-                    let _ = use_reactor;
-                    udp::worker(sock, h, sd, batch_size);
+                    udp::worker(sock, h, sd, batch_size, reactor);
                 })?);
             }
         }
@@ -914,6 +911,130 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
+        server.shutdown();
+    }
+
+    /** @brief 리액터 사용 여부를 실행 중에 바꿀 수 있는 테스트용 핸들러. */
+    #[cfg(unix)]
+    struct SwitchingReactor {
+        /** @brief 리액터를 쓰라고 답할지. */
+        active: AtomicBool,
+        /** @brief 리액터 사용 여부를 물은 횟수. */
+        asked: AtomicUsize,
+        /** @brief 리액터에 넘어온 질의 수. */
+        submitted: AtomicUsize,
+        /** @brief 동기 경로로 답한 질의 수. */
+        handled: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl Handler for SwitchingReactor {
+        /** @brief 답 없는 응답을 돌려준다. */
+        fn handle(&self, request: &Message, _ctx: &RequestCtx) -> Option<Message> {
+            self.handled.fetch_add(1, Ordering::SeqCst);
+            let mut resp = Message::default();
+            resp.header.id = request.header.id;
+            resp.header.response = true;
+            resp.questions = request.questions.clone();
+            Some(resp)
+        }
+
+        /** @brief 정해 둔 값을 돌려주고 물은 횟수를 센다. */
+        fn reactor_active(&self) -> bool {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.active.load(Ordering::SeqCst)
+        }
+
+        /** @brief 늘 더 받는다. */
+        fn reactor_has_capacity(&self) -> bool {
+            true
+        }
+
+        /** @brief 질의에 응답 비트만 세워 돌려준다. */
+        fn reactor_submit(
+            &self,
+            packet: &[u8],
+            _ctx: &RequestCtx<'_>,
+            out: &mut Writer,
+            _now: Instant,
+        ) -> ReactorDisposition {
+            self.submitted.fetch_add(1, Ordering::SeqCst);
+            out.clear();
+            out.push_bytes(packet);
+            out.buf[2] |= 0x80;
+            ReactorDisposition::Respond
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /**
+     * @brief UDP 워커가 실행 중에 바뀐 리액터 사용 여부를 따라가는지.
+     * @details 리액터 사용 여부는 설정을 교체할 때 바뀐다. 스레드를 띄울 때 한 번만 보면 나중에
+     *          켠 리액터로는 질의가 가지 않는다. 동기 루프로 돌아갈 때 소켓을 블로킹으로 되돌리지
+     *          않으면 수신이 기다리지 않고 헛돈다.
+     */
+    fn udp_worker_follows_the_reactor_switch_at_runtime() {
+        let handler = Arc::new(SwitchingReactor {
+            active: AtomicBool::new(false),
+            asked: AtomicUsize::new(0),
+            submitted: AtomicUsize::new(0),
+            handled: AtomicUsize::new(0),
+        });
+        let mut cfg = test_cfg();
+        cfg.tcp = false;
+        cfg.udp_reactor = true;
+        let server = Server::bind(local(0), handler.clone(), cfg).unwrap();
+        let addr = server.udp_addr().unwrap();
+        let client = UdpSocket::bind(local(0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        /* 루프를 바꾼 워커는 다음 질의부터 받으므로 조건이 설 때까지 질의를 계속 보낸다. */
+        let query_until = |failure: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut id = 0u16;
+            while !done() {
+                assert!(Instant::now() < deadline, "{failure}");
+                id = id.wrapping_add(1);
+                client
+                    .send_to(&query_bytes(id, "switch.example"), addr)
+                    .unwrap();
+                let _ = client.recv_from(&mut [0u8; 512]);
+            }
+        };
+
+        query_until(
+            "리액터를 끈 채로 띄운 워커가 동기 경로로 답하지 않았습니다",
+            &|| handler.handled.load(Ordering::SeqCst) > 0,
+        );
+        assert_eq!(
+            handler.submitted.load(Ordering::SeqCst),
+            0,
+            "리액터가 꺼져 있는데 질의를 리액터에 넘겼습니다"
+        );
+
+        handler.active.store(true, Ordering::SeqCst);
+        query_until(
+            "리액터를 켠 뒤에도 질의가 리액터로 가지 않았습니다",
+            &|| handler.submitted.load(Ordering::SeqCst) > 0,
+        );
+
+        handler.active.store(false, Ordering::SeqCst);
+        let handled = handler.handled.load(Ordering::SeqCst);
+        query_until(
+            "리액터를 끈 뒤에도 동기 경로로 돌아오지 않았습니다",
+            &|| handler.handled.load(Ordering::SeqCst) > handled,
+        );
+
+        /* 수신 대기 한도가 100밀리초라 쉬는 동안에는 몇 번만 묻는다. 헛돌면 수만 번을 묻는다. */
+        let asked = handler.asked.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        let idle = handler.asked.load(Ordering::SeqCst) - asked;
+        assert!(
+            idle < 50,
+            "쉬는 동안 리액터 사용 여부를 {idle}번 물었습니다. 수신이 기다리지 않고 헛돕니다"
+        );
         server.shutdown();
     }
 

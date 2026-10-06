@@ -1220,6 +1220,134 @@ fn ddr_only_preempts_its_owner_in_the_authority_wire_lane() {
 }
 
 #[test]
+/**
+ * @brief 권한 빠른 경로를 닫지 않는 설정을 켜도 그 경로의 답이 구조적 경로와 같은지.
+ * @details 로컬 전용 이름을 모두 막는 계층을 권한 계층 안쪽에 두고 NSID 와 패딩을 켠다.
+ *          옵션 없는 질의는 빠른 경로가 구조적 경로와 같은 바이트로 답하고, NSID 를 묻거나
+ *          TXT 를 묻는 질의는 구조적 경로가 맡는다.
+ */
+fn authority_lane_answers_ignore_settings_that_leave_it_open() {
+    use onetdns_runtime::WireDisposition;
+
+    let mut zones = onetdns_authority::ZoneStore::new();
+    for (origin, text) in [
+        (
+            "lan",
+            "$ORIGIN lan.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\n@ IN A 192.0.2.10\nns IN A 192.0.2.53\n",
+        ),
+        (
+            "home.arpa",
+            "$ORIGIN home.arpa.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nnas IN A 192.0.2.11\n",
+        ),
+    ] {
+        zones.add(onetdns_authority::parse_zone(text, origin).unwrap());
+    }
+    let store = Arc::new(ArcSwap::new(Arc::new(zones)));
+    let local_only = Arc::new(crate::layers::LocalOnlyLayer::new(
+        Arc::new(FixedAnswer),
+        Arc::new(crate::layers::LocalOnlyNames::new(true, true, true)),
+        Arc::new(std::sync::atomic::AtomicU32::new(60)),
+    ));
+    let authority = Arc::new(crate::layers::AuthorityLayer::new(
+        local_only,
+        store.clone(),
+    ));
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        authority,
+        60,
+    )
+    .with_features(NativeFeatures {
+        nsid: Some(b"ns1".to_vec()),
+        padding_block: 128,
+        ..NativeFeatures::default()
+    })
+    .with_authority_wire_path(Some(store), true);
+
+    let outside = Message::query(1, ApName::from_str("wpad").unwrap(), RecordType::A);
+    assert_eq!(
+        server.handle(&outside, &ctx()).unwrap().header.rcode,
+        ResponseCode::NXDomain.0,
+        "영역 밖의 점 없는 이름은 로컬 전용 계층이 막아야 합니다"
+    );
+
+    let mut output = onetdns_proto::Writer::with_limit(1232);
+    for (id, name) in [(2, "lan"), (3, "nas.home.arpa")] {
+        let mut request = Message::query(id, ApName::from_str(name).unwrap(), RecordType::A);
+        request
+            .additionals
+            .push(Edns::default().try_to_record().unwrap());
+        output.clear();
+        assert_eq!(
+            server.handle_udp_wire(
+                &request.try_encode().unwrap(),
+                &ctx(),
+                &mut output,
+                Instant::now()
+            ),
+            WireDisposition::Respond,
+            "{name}: 옵션 없는 권한 질의는 빠른 경로가 맡아야 합니다"
+        );
+        let structured = server.handle(&request, &ctx()).unwrap();
+        let mut structured_wire = onetdns_proto::Writer::with_limit(1232);
+        onetdns_runtime::encode_limited(&request, &structured, &mut structured_wire);
+        assert_eq!(
+            output.buf, structured_wire.buf,
+            "{name}: 빠른 경로의 답이 구조적 경로와 다릅니다"
+        );
+        assert_eq!(structured.header.rcode, ResponseCode::NoError.0);
+        assert_eq!(
+            structured.answers.len(),
+            1,
+            "{name}: 영역의 주소가 답이어야 합니다"
+        );
+    }
+
+    let mut asks_nsid = Message::query(4, ApName::from_str("lan").unwrap(), RecordType::A);
+    let mut edns = Edns::default();
+    edns.options.push((OPT_NSID, Vec::new()));
+    asks_nsid.additionals.push(edns.try_to_record().unwrap());
+    output.clear();
+    assert_eq!(
+        server.handle_udp_wire(
+            &asks_nsid.try_encode().unwrap(),
+            &ctx(),
+            &mut output,
+            Instant::now()
+        ),
+        WireDisposition::Fallback,
+        "NSID 를 묻는 질의는 구조적 경로가 맡아야 합니다"
+    );
+    let answered = server.handle(&asks_nsid, &ctx()).unwrap();
+    let echoed = Edns::from_record(answered.opt().expect("응답에 OPT가 없습니다")).unwrap();
+    assert!(echoed
+        .options
+        .iter()
+        .any(|(code, value)| *code == OPT_NSID && value == b"ns1"));
+
+    let challenge = Message::query(
+        5,
+        ApName::from_str("_acme-challenge.lan").unwrap(),
+        RecordType::TXT,
+    );
+    output.clear();
+    assert_eq!(
+        server.handle_udp_wire(
+            &challenge.try_encode().unwrap(),
+            &ctx(),
+            &mut output,
+            Instant::now()
+        ),
+        WireDisposition::Fallback,
+        "TXT 질의는 구조적 경로가 맡아야 합니다"
+    );
+}
+
+#[test]
 /** @brief 밖을 가리키는 별칭을 오류로 바꾸지 않는지. */
 fn authoritative_external_alias_is_not_replaced_with_servfail() {
     let zone_text = "$ORIGIN alias.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nalias IN CNAME outside.example.\nold IN DNAME target.example.\n";

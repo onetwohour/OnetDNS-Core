@@ -1091,19 +1091,63 @@ mod tests {
     }
 
     #[test]
-    /** @brief 가름 데드라인 설정은 체인을 다시 지어야 하는지. */
-    fn split_timeout_still_requires_resolver_restart() {
-        let current =
-            Config::from_toml_str("backend = \"split\"\nupstreams = [\"1.1.1.1\"]\n").unwrap();
-        let proposed = Config::from_toml_str(
-            "backend = \"split\"\nupstreams = [\"1.1.1.1\"]\nquery_timeout_secs = 2\n",
-        )
-        .unwrap();
-        assert!(!config_keys::swappable(
+    /**
+     * @brief 재귀 리졸버의 질의 제한 시간은 체인을 다시 만들어 재시작 없이 반영하는지.
+     * @details 체인을 다시 만들 때 계획으로 재귀 리졸버를 새로 만들고, 계획에 질의 제한 시간이
+     *          들어 있다.
+     */
+    fn recursive_timeout_is_applied_by_rebuilding_the_chain() {
+        let changed = ["query_timeout_secs".to_string()];
+        for base in [
+            "backend = \"recurse\"\n",
+            "backend = \"split\"\nupstreams = [\"1.1.1.1\"]\n",
+        ] {
+            let current = Config::from_toml_str(base).unwrap();
+            let proposed =
+                Config::from_toml_str(&format!("{base}query_timeout_secs = 2\n")).unwrap();
+            assert!(
+                service_restart_keys(&current, &proposed, &changed).is_empty(),
+                "{base:?}: 질의 제한 시간만 바꿨는데 재시작합니다"
+            );
+            assert!(
+                hot_reload_groups(&current, &proposed, &changed).contains(&ApplyGroup::Chain),
+                "{base:?}: 체인을 다시 만들지 않으면 재귀 리졸버가 이전 제한 시간을 씁니다"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 처리 방식과 전달 세부 설정을 함께 바꿔도 재시작하지 않는지.
+     * @details 전달기는 새 설정이 전달을 쓰고 이전 설정이 쓰지 않았으면 새로 만들고, 체인은
+     *          처리 방식이 바뀌면 다시 만든다.
+     */
+    fn backend_switch_keeps_forward_tuning_hot() {
+        let forward = "upstreams = [\"1.1.1.1\"]\nupstream_strategy = \"parallel\"\nupstream_concurrency = 4\nquery_timeout_secs = 2\n";
+        let changed: Vec<String> = [
+            "backend",
+            "upstream_strategy",
+            "upstream_concurrency",
             "query_timeout_secs",
-            &current,
-            &proposed
-        ));
+        ]
+        .map(String::from)
+        .to_vec();
+        for (from, to) in [
+            ("recurse", "forward"),
+            ("forward", "split"),
+            ("split", "recurse"),
+        ] {
+            let current = Config::from_toml_str(&format!(
+                "backend = \"{from}\"\nupstreams = [\"1.1.1.1\"]\n"
+            ))
+            .unwrap();
+            let proposed =
+                Config::from_toml_str(&format!("backend = \"{to}\"\n{forward}")).unwrap();
+            assert!(
+                service_restart_keys(&current, &proposed, &changed).is_empty(),
+                "{from} 에서 {to} 로 바꾸며 전달 세부 설정을 바꿨는데 재시작합니다"
+            );
+        }
     }
 
     #[test]
@@ -1213,7 +1257,7 @@ mod tests {
         assert_eq!(conditional_hot_reload_keys(&plain), ["clients"]);
 
         let recurse = Config::from_toml_str("backend = \"recurse\"\n").unwrap();
-        assert!(conditional_hot_reload_keys(&recurse).contains(&"query_timeout_secs"));
+        assert_eq!(conditional_hot_reload_keys(&recurse), ["clients"]);
 
         let routed = Config::from_toml_str(&format!("{forward}{CLIENT_ROUTE}")).unwrap();
         let announced = conditional_hot_reload_keys(&routed);

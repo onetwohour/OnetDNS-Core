@@ -652,7 +652,7 @@ pub struct Controls {
     /** @brief 이 영역에서 기록을 지운다. */
     pub zone_record_delete: Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
 
-    /** @brief 이 영역의 서명 설정을 바꾼다. */
+    /** @brief 이 영역의 서명 여부와 서명 키, 부모 영역에 올릴 DS. */
     pub zone_dnssec: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
     /** @brief 파일에 적힌 설정. */

@@ -87,35 +87,69 @@ pub(crate) fn worker_batch_size(workers: usize) -> usize {
     batch_size_for(workers, cpus)
 }
 
-/** @brief UDP 워커 진입점. 플랫폼에 맞는 루프로 갈라진다. */
+/**
+ * @brief UDP 워커 진입점.
+ * @details 리액터를 쓰는 서버면 핸들러가 리액터 사용 여부를 바꿀 때마다 리액터 루프와 동기
+ *          루프를 오간다. 그 여부는 설정을 교체할 때 바뀌므로, 스레드를 띄울 때 한 번만 보면
+ *          나중에 켠 리액터로는 질의가 가지 않는다.
+ * @param reactor 리액터를 쓰는 서버인지. 유닉스가 아니면 무시한다.
+ */
 pub fn worker<H: Handler>(
     sock: UdpSocket,
     handler: Arc<H>,
     shutdown: Arc<AtomicBool>,
     batch_size: usize,
+    reactor: bool,
+) {
+    #[cfg(unix)]
+    if reactor {
+        while !shutdown.load(Ordering::Relaxed) {
+            if handler.reactor_active() {
+                reactor_worker(&sock, handler.as_ref(), &shutdown);
+            } else {
+                blocking_worker(&sock, handler.as_ref(), &shutdown, batch_size, || {
+                    handler.reactor_active()
+                });
+            }
+        }
+        return;
+    }
+    #[cfg(not(unix))]
+    let _ = reactor;
+    blocking_worker(&sock, handler.as_ref(), &shutdown, batch_size, || false);
+}
+
+/** @brief 플랫폼에 맞는 동기 루프로 갈라진다. leave 가 참을 돌려주면 돌아온다. */
+fn blocking_worker<H: Handler>(
+    sock: &UdpSocket,
+    handler: &H,
+    shutdown: &AtomicBool,
+    batch_size: usize,
+    leave: impl Fn() -> bool,
 ) {
     #[cfg(target_os = "linux")]
-    batch::worker(sock, handler, shutdown, batch_size);
+    batch::worker(sock, handler, shutdown, batch_size, leave);
     #[cfg(not(target_os = "linux"))]
-    single_worker(sock, handler, shutdown, batch_size);
+    single_worker(sock, handler, shutdown, batch_size, leave);
 }
 
 /**
  * @brief 데이터그램을 하나씩 처리하는 워커 루프.
- * @details 수신이 끝날 때마다 종료 표시를 본다. 유닉스는 수신 대기 한도로 주기적으로
- *          깨어나고, 윈도우는 종료할 때 서버가 보내는 데이터그램으로 깨어난다.
+ * @details 수신이 끝날 때마다 종료 표시와 leave 를 본다. 유닉스는 수신 대기 한도로
+ *          주기적으로 깨어나고, 윈도우는 종료할 때 서버가 보내는 데이터그램으로 깨어난다.
  */
 #[cfg(not(target_os = "linux"))]
 fn single_worker<H: Handler>(
-    sock: UdpSocket,
-    handler: Arc<H>,
-    shutdown: Arc<AtomicBool>,
+    sock: &UdpSocket,
+    handler: &H,
+    shutdown: &AtomicBool,
     _batch_size: usize,
+    leave: impl Fn() -> bool,
 ) {
     let mut recv = [0u8; MAX_UDP_REQUEST + 1];
     let mut writer = Writer::with_limit(SERVER_UDP_MAX);
 
-    while !shutdown.load(Ordering::Relaxed) {
+    while !shutdown.load(Ordering::Relaxed) && !leave() {
         let (n, src) = match sock.recv_from(&mut recv) {
             Ok(v) => v,
 
@@ -130,13 +164,7 @@ fn single_worker<H: Handler>(
             continue;
         }
 
-        if !process_datagram(
-            handler.as_ref(),
-            &recv[..n],
-            src,
-            Instant::now(),
-            &mut writer,
-        ) {
+        if !process_datagram(handler, &recv[..n], src, Instant::now(), &mut writer) {
             continue;
         }
 
@@ -216,16 +244,13 @@ const REACTOR_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_mill
  *
  * @details 한 루프에서 리스너와 진행 중인 업스트림 교환들을 함께 폴링한다. 새 질의는 캐시
  *          히트면 즉시 응답하고, 아니면 리액터에 제출해 응답 없이 다음으로 넘어간다.
- *          블로킹 워커와 달리 업스트림을 기다리는 동안 스레드가 멈추지 않는다.
+ *          블로킹 워커와 달리 업스트림을 기다리는 동안 스레드가 멈추지 않는다. 핸들러가
+ *          리액터를 끄면 소켓을 블로킹으로 되돌리고 돌아온다.
  * @note 한 번에 받아들이는 질의를 64개로 끊는다. 무한정 받으면 이미 제출된 교환의
  *       폴링이 계속 밀려 응답이 늦어진다. 리액터에 슬롯이 없어도 즉시 멈춘다.
  */
 #[cfg(unix)]
-pub(crate) fn reactor_worker<H: Handler>(
-    sock: UdpSocket,
-    handler: Arc<H>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBool) {
     use std::os::fd::AsRawFd;
     if let Err(error) = sock.set_nonblocking(true) {
         onetdns_core::error!(event = "dns.reactor_nonblocking_failed", %error, "Could not make the receive socket non-blocking; the reactor may stall on a single query");
@@ -236,8 +261,22 @@ pub(crate) fn reactor_worker<H: Handler>(
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut map: Vec<usize> = Vec::new();
     let mut outq: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
+    let mut may_leave = true;
 
     while !shutdown.load(Ordering::Relaxed) {
+        if may_leave && !handler.reactor_active() {
+            /*
+             * 동기 루프는 수신 대기 한도까지 기다리는 블로킹 소켓을 전제한다. 논블로킹인 채로
+             * 넘어가면 수신이 기다리지 않고 헛돌므로, 되돌리지 못하면 이 루프에 남는다.
+             */
+            match sock.set_nonblocking(false) {
+                Ok(()) => return,
+                Err(error) => {
+                    onetdns_core::error!(event = "dns.reactor_blocking_failed", %error, "Could not make the receive socket blocking again; staying on the reactor loop");
+                    may_leave = false;
+                }
+            }
+        }
         fds.clear();
         map.clear();
         fds.push(libc::pollfd {
@@ -286,7 +325,7 @@ pub(crate) fn reactor_worker<H: Handler>(
                 match handler.handle_udp_wire_hit(packet, &ctx, &mut writer, now) {
                     crate::WireDisposition::Respond => {
                         if !writer.buf.is_empty() {
-                            send_or_record(&sock, &writer.buf, src);
+                            send_or_record(sock, &writer.buf, src);
                         }
                         continue;
                     }
@@ -297,13 +336,13 @@ pub(crate) fn reactor_worker<H: Handler>(
                 match handler.reactor_submit(packet, &ctx, &mut writer, now) {
                     crate::ReactorDisposition::Respond => {
                         if !writer.buf.is_empty() {
-                            send_or_record(&sock, &writer.buf, src);
+                            send_or_record(sock, &writer.buf, src);
                         }
                     }
                     crate::ReactorDisposition::Drop | crate::ReactorDisposition::Submitted => {}
                     crate::ReactorDisposition::Fallback => {
-                        if process_datagram(handler.as_ref(), packet, src, now, &mut writer) {
-                            send_or_record(&sock, &writer.buf, src);
+                        if process_datagram(handler, packet, src, now, &mut writer) {
+                            send_or_record(sock, &writer.buf, src);
                         }
                     }
                 }
@@ -315,7 +354,7 @@ pub(crate) fn reactor_worker<H: Handler>(
         }
         handler.reactor_tick(now, &mut outq);
         for (dst, wire) in outq.drain(..) {
-            send_or_record(&sock, &wire, dst);
+            send_or_record(sock, &wire, dst);
         }
     }
 
@@ -343,7 +382,7 @@ pub(crate) fn reactor_worker<H: Handler>(
         handler.reactor_tick(Instant::now(), &mut outq);
         let produced = !outq.is_empty();
         for (dst, wire) in outq.drain(..) {
-            send_or_record(&sock, &wire, dst);
+            send_or_record(sock, &wire, dst);
         }
         if fds.is_empty() && !produced {
             idle_passes += 1;
@@ -447,23 +486,24 @@ mod batch {
     use std::net::UdpSocket;
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     /** @brief 슬롯 하나의 수신 버퍼 크기. */
     const RECV_BUF: usize = MAX_UDP_REQUEST;
 
     /**
      * @brief 배치 수신·처리·전송 루프.
+     * @details 배치를 다 보낼 때마다 종료 표시와 leave 를 본다.
      * @note MSG_WAITFORONE으로 대기한다. 하나만 와도 깨어나므로 한산할 때 지연이 늘지
      *       않으면서, 몰릴 때는 배치가 자연히 커진다.
      * @safety 헤더가 가리키는 버퍼와 주소 저장소는 루프 전체에 살아 있고, 커널에 넘기는
      *         슬롯 수는 배열 길이를 넘지 않는다.
      */
     pub(super) fn worker<H: Handler>(
-        sock: UdpSocket,
-        handler: Arc<H>,
-        shutdown: Arc<AtomicBool>,
+        sock: &UdpSocket,
+        handler: &H,
+        shutdown: &AtomicBool,
         batch_size: usize,
+        leave: impl Fn() -> bool,
     ) {
         debug_assert!(matches!(batch_size, SHARED_UDP_BATCH | FULL_UDP_BATCH));
         let fd = sock.as_raw_fd();
@@ -500,7 +540,7 @@ mod batch {
         let mut send_hdrs: Vec<libc::mmsghdr> = (0..batch_size)
             .map(|_| unsafe { std::mem::zeroed() })
             .collect();
-        while !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) && !leave() {
             for hdr in &mut recv_hdrs {
                 hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
                 hdr.msg_hdr.msg_flags = 0;
@@ -531,13 +571,7 @@ mod batch {
                     continue;
                 };
                 let writer = &mut writers[out];
-                if !process_datagram(
-                    handler.as_ref(),
-                    &recv_bufs[slot][..len],
-                    src,
-                    batch_now,
-                    writer,
-                ) {
+                if !process_datagram(handler, &recv_bufs[slot][..len], src, batch_now, writer) {
                     continue;
                 }
                 send_iovs[out].iov_base = writer.buf.as_mut_ptr().cast();

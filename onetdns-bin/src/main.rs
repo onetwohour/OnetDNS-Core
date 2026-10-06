@@ -1513,7 +1513,7 @@ pub fn serve(
         config_prev,
         applied_config_text,
         reload.clone(),
-        Some(hot_config_apply),
+        hot_config_apply,
     );
     *restarts.raft.lock_recover() = Some({
         let restart_raft = restart_raft.clone();
@@ -1581,11 +1581,20 @@ pub fn serve(
 
     #[cfg(target_os = "linux")]
     if let Some(user) = cfg.run_as_user.as_deref() {
-        if let Some(Err(e)) = privdrop::drop_privileges_once(user, cfg.run_as_group.as_deref()) {
+        /*
+         * 세대마다 확인한다. 한 번만 하면 첫 시도가 실패한 뒤 다시 띄운 세대는 내려가지 않은
+         * 채로, run_as_user 를 바꾼 세대는 이전 사용자로 오류 없이 돈다.
+         */
+        if let Err(e) = privdrop::drop_privileges(user, cfg.run_as_group.as_deref()) {
             return Err(crate::anyhow!(format!(
                 "Stopping the service because process privileges could not be dropped: {e}"
             )));
         }
+        onetdns_core::info!(
+            event = "privdrop.applied",
+            user,
+            "Running with user and group privileges dropped and further privilege gain blocked"
+        );
     }
 
     if !reload.load(Ordering::Acquire) {
@@ -3048,6 +3057,47 @@ mod tests {
         assert!(!ready.load(std::sync::atomic::Ordering::SeqCst));
         drop(occupied);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    /**
+     * @brief 권한을 내려놓지 못하면 다음 세대도 준비 전에 실패하는지.
+     * @details 실행 루프는 실패한 세대를 마지막 설정으로 다시 띄우므로 한 프로세스에서 세대가
+     *          여럿 뜬다. 없는 사용자를 지정해 실제 권한은 바꾸지 않는다.
+     */
+    fn every_generation_fails_when_privileges_cannot_be_dropped() {
+        for generation in 1..=2 {
+            let mut cfg = Config::default();
+            cfg.listen = vec![UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()];
+            cfg.do_tcp = false;
+            cfg.workers = 1;
+            cfg.run_as_user = Some("onetdns-missing-test-user".into());
+
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ready_stop = stop.clone();
+            let result = serve(
+                cfg,
+                None,
+                None,
+                Default::default(),
+                Some(stop),
+                Some(Box::new(move || {
+                    ready_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                })),
+            );
+            let error = match result {
+                Ok(_) => panic!("{generation}번째 세대가 권한을 내려놓지 않은 채 준비를 마쳤다"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("privileges could not be dropped"),
+                "{generation}번째 세대가 권한과 무관한 이유로 실패했다: {error}"
+            );
+        }
     }
 
     /** @brief 관리 API 에 요청 하나를 보내고 응답 전체를 돌려준다. */

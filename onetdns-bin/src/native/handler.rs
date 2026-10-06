@@ -137,7 +137,11 @@ impl Handler for NativeServer {
         self.wire_dispatch(packet, ctx, out, now, true)
     }
     #[cfg(unix)]
-    /** @brief 레인이 붙어 있는지. */
+    /**
+     * @brief 이 스레드가 리액터 루프를 돌아야 하는지.
+     * @details 레인 조건이 닫혀도 이 스레드에 맡긴 교환이 남아 있으면 참이다. 워커가 루프를
+     *          떠나면 그 교환을 더 진행하지 않아 기다리는 클라이언트가 답을 받지 못한다.
+     */
     fn reactor_active(&self) -> bool {
         self.reactor_lane.is_some()
             && (self.features.load().lanes.reactor

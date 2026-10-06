@@ -187,17 +187,13 @@ fn clients_swappable(previous: &Config, next: &Config) -> bool {
 }
 
 /**
- * @brief 처리 방식이 그대로이고 클라이언트 경로가 없는지.
+ * @brief 클라이언트 경로가 없는지.
  * @details 클라이언트 경로의 전달기는 세대를 시작할 때 질의 제한 시간과 업스트림 전략을 복사하고
- *          교체하지 않는다.
+ *          교체하지 않는다. 기본 전달기와 재귀 리졸버, 스텁과 예비 업스트림의 전달기는 교체할 때
+ *          새 값으로 다시 만든다.
  */
-fn same_backend_without_routes(previous: &Config, next: &Config) -> bool {
-    previous.backend == next.backend && !has_client_routes(previous) && !has_client_routes(next)
-}
-
-/** @brief 처리 방식이 forward 로 그대로이고 클라이언트 경로가 없는지. */
-fn forward_without_routes(previous: &Config, next: &Config) -> bool {
-    previous.backend == BackendKind::Forward && same_backend_without_routes(previous, next)
+fn without_client_routes(previous: &Config, next: &Config) -> bool {
+    !has_client_routes(previous) && !has_client_routes(next)
 }
 
 /** @brief Raft 클러스터에서 이 값을 복제하는지. */
@@ -286,14 +282,6 @@ const fn reactor_and_authority(blocks: Blocks) -> Lanes {
         wire: None,
         reactor: Some(blocks),
         authority: Some(blocks),
-    }
-}
-
-/** @brief 권한 경로만 닫는다. */
-const fn authority(blocks: Blocks) -> Lanes {
-    Lanes {
-        authority: Some(blocks),
-        ..Lanes::OPEN
     }
 }
 
@@ -496,7 +484,7 @@ static KEYS: &[KeySpec] = &[
     key!(max_ttl, Hot(Chain), Shared, Lanes::OPEN),
     key!(
         query_timeout_secs,
-        HotWhile(Forward, forward_without_routes),
+        HotWhile(Forward, without_client_routes),
         Shared,
         Lanes::OPEN,
     ),
@@ -601,7 +589,7 @@ static KEYS: &[KeySpec] = &[
         acme_directory_url,
         Hot(Chain),
         Node,
-        wire_and_authority(|c, _| c.acme_directory_url.is_some()),
+        wire(|c, _| c.acme_directory_url.is_some()),
     ),
     key!(acme_contact_email, Hot(Acme), Node, Lanes::OPEN),
     key!(acme_domains, Hot(Acme), Node, Lanes::OPEN),
@@ -649,20 +637,10 @@ static KEYS: &[KeySpec] = &[
         domain_needed,
         Hot(Native),
         Shared,
-        wire_and_authority(|c, _| c.domain_needed),
+        wire(|c, _| c.domain_needed),
     ),
-    key!(
-        bogus_priv,
-        Hot(Native),
-        Shared,
-        wire_and_authority(|c, _| c.bogus_priv),
-    ),
-    key!(
-        empty_zones,
-        Hot(Native),
-        Shared,
-        wire_and_authority(|c, _| c.empty_zones),
-    ),
+    key!(bogus_priv, Hot(Native), Shared, wire(|c, _| c.bogus_priv)),
+    key!(empty_zones, Hot(Native), Shared, wire(|c, _| c.empty_zones)),
     key!(local_ttl, Hot(LocalTtl), Shared, Lanes::OPEN),
     key!(rewrites, Hot(Filter), Shared, Lanes::OPEN),
     key!(
@@ -684,13 +662,13 @@ static KEYS: &[KeySpec] = &[
     key!(fallback_upstreams, Hot(Chain), Shared, Lanes::OPEN),
     key!(
         upstream_strategy,
-        HotWhile(Forward, same_backend_without_routes),
+        HotWhile(Forward, without_client_routes),
         Shared,
         Lanes::OPEN,
     ),
     key!(
         upstream_concurrency,
-        HotWhile(Forward, same_backend_without_routes),
+        HotWhile(Forward, without_client_routes),
         Shared,
         Lanes::OPEN,
     ),
@@ -788,7 +766,7 @@ static KEYS: &[KeySpec] = &[
         edns_padding_block,
         Hot(Native),
         Shared,
-        wire_and_authority(|c, _| c.edns_padding_block != 0),
+        wire(|c, _| c.edns_padding_block != 0),
     ),
     key!(edns_tcp_keepalive_secs, Hot(Native), Shared, Lanes::OPEN),
     key!(
@@ -926,7 +904,7 @@ static KEYS: &[KeySpec] = &[
     key!(acl_deny_ids, Hot(Acl), Shared, Lanes::OPEN),
     key!(hide_identity, Hot(Native), Shared, Lanes::OPEN),
     key!(hide_version, Hot(Native), Shared, Lanes::OPEN),
-    key!(nsid, Hot(Native), Node, authority(|c, _| c.nsid.is_some()),),
+    key!(nsid, Hot(Native), Node, Lanes::OPEN),
     key!(identity, Hot(Native), Node, Lanes::OPEN),
     key!(version, Hot(Native), Shared, Lanes::OPEN),
     key!(log_level, Hot(Log), Node, Lanes::OPEN),
@@ -1051,17 +1029,11 @@ mod tests {
                 "dns64_prefix",
                 "rebind_protection",
                 "cookies",
-                "acme_directory_url",
                 "block_aaaa",
                 "bogus_nxdomain",
-                "domain_needed",
-                "bogus_priv",
-                "empty_zones",
                 "dynamic_records",
-                "edns_padding_block",
                 "rrset_roundrobin",
                 "recurse_deny_answers",
-                "nsid",
                 "dnstap_file",
             ]
         );
