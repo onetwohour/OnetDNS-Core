@@ -1130,6 +1130,8 @@ mod tests {
     fn raft_config_patch_rejects_secret_material() {
         for key in [
             "cluster_raft_secret",
+            "cachedb_redis_secret",
+            "cachedb_redis_password",
             "control_token",
             "control_admin_tokens",
             "control_readonly_tokens",

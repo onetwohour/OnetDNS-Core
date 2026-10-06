@@ -960,10 +960,15 @@ impl ClientHandshake {
                 RSA_PKCS1_SHA256,
             ]),
             Extension::key_share_client(&key_shares),
-            Extension::server_name(&cfg.server_name),
-            Extension::new(EXT_QUIC_TRANSPORT_PARAMETERS, local_transport_params),
-            Extension::psk_key_exchange_modes(&[PSK_DHE_KE]),
         ];
+        if let Some(host) = cfg.sni() {
+            extensions.push(Extension::server_name(host));
+        }
+        extensions.push(Extension::new(
+            EXT_QUIC_TRANSPORT_PARAMETERS,
+            local_transport_params,
+        ));
+        extensions.push(Extension::psk_key_exchange_modes(&[PSK_DHE_KE]));
         if !cfg.alpn.is_empty() {
             let protos: Vec<&[u8]> = cfg.alpn.iter().map(|v| v.as_slice()).collect();
             extensions.push(Extension::alpn(&protos));
@@ -1258,7 +1263,7 @@ impl ClientHandshake {
                 let exts = parse_ee_extensions(&msg.body)?;
                 if !exts.iter().all(|extension| match extension.ext_type {
                     EXT_ALPN | EXT_EARLY_DATA | EXT_QUIC_TRANSPORT_PARAMETERS => true,
-                    EXT_SERVER_NAME => extension.data.is_empty(),
+                    EXT_SERVER_NAME => extension.data.is_empty() && self.cfg.sni().is_some(),
                     EXT_SUPPORTED_GROUPS => extension.as_supported_groups().is_some(),
                     _ => false,
                 }) {
@@ -1613,6 +1618,60 @@ mod tests {
             client.provide(Level::Handshake, &certificate_message),
             Err(TlsError::Protocol)
         );
+    }
+
+    #[test]
+    /**
+     * @brief SNI 를 보낸 경우에만 서버의 server_name 응답을 받아들이는지.
+     * @details 주소로 붙을 때는 SNI 를 보내지 않는다. RFC 8446 은 보내지 않은 확장에 대한 응답을
+     *          받으면 핸드셰이크를 끊게 한다.
+     */
+    fn server_name_reply_requires_an_offered_name() {
+        for (server_name, offered) in [("localhost", true), ("127.0.0.1", false)] {
+            let mut server = ServerHandshake::new(
+                Arc::new(make_server_cfg(vec![b"doq".to_vec()])),
+                b"stp".to_vec(),
+            );
+            let client_cfg = ClientConfig {
+                server_name: server_name.to_string(),
+                alpn: vec![b"doq".to_vec()],
+                ..insecure_test_client()
+            };
+            let mut client = ClientHandshake::new(client_cfg, b"ctp".to_vec()).unwrap();
+            let initial = client.take_crypto();
+            let mut reader = HandshakeReader::new();
+            reader.feed(&initial[0].1);
+            let hello = ClientHello::parse(&reader.next_message().unwrap().unwrap().body).unwrap();
+            assert_eq!(
+                hello.ext(EXT_SERVER_NAME).is_some(),
+                offered,
+                "{server_name}"
+            );
+            for (level, data) in initial {
+                server.provide(level, &data).unwrap();
+            }
+            let flight = server.take_crypto();
+            client.provide(flight[0].0, &flight[0].1).unwrap();
+
+            let mut reader = HandshakeReader::new();
+            reader.feed(&flight[1].1);
+            let ee = reader.next_message().unwrap().unwrap();
+            assert_eq!(ee.msg_type, HandshakeType::EncryptedExtensions);
+            let mut extensions = parse_ee_extensions(&ee.body).unwrap();
+            extensions.push(Extension::new(EXT_SERVER_NAME, Vec::new()));
+            let mut body = Writer::new();
+            body.vec16(|w| {
+                extensions
+                    .iter()
+                    .for_each(|extension| extension.encode_into(w))
+            });
+            let reply = HandshakeMsg::new(HandshakeType::EncryptedExtensions, body.buf).encode();
+            assert_eq!(
+                client.provide(Level::Handshake, &reply).is_ok(),
+                offered,
+                "{server_name}"
+            );
+        }
     }
 
     /** @brief 테스트용 다시 시도 요청을 만든다. */

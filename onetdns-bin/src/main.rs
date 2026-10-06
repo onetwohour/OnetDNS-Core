@@ -131,7 +131,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Mutex;
 
@@ -1723,6 +1722,8 @@ pub fn serve(
         let resolver_chain::InstalledChain {
             resolver: chain,
             recursor: lane_recursor,
+            anchors: recursor_anchors,
+            shared_cache,
             ..
         } = default_chain.install(
             default_chain
@@ -1735,10 +1736,20 @@ pub fn serve(
                 .map_err(|e| crate::anyhow!(e))?
                 .into_iter()
                 .map(|mut route| {
-                    let ns = format!("{}/route={}", plan.cache_namespace(), route.namespace_key());
+                    let kind = resolver_chain::ChainBase::Route {
+                        upstreams: route.namespace_key(),
+                        anchors: recursor_anchors.clone(),
+                    };
                     route.resolver = default_chain
                         .layers
-                        .wrap_common_layers(&plan, route.resolver, false, false, &ns)?
+                        .wrap_common_layers(
+                            &plan,
+                            route.resolver,
+                            false,
+                            false,
+                            kind,
+                            shared_cache.as_ref(),
+                        )?
                         .0;
                     Ok(route)
                 })
@@ -2161,6 +2172,9 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
     }
     if let Some(host) = &cfg.cachedb_redis_host {
         cachedb_redis_addr(host, cfg.cachedb_redis_port, &cfg.bootstrap)?;
+        if let Some(ca) = cfg.cachedb_redis_tls_ca.as_deref() {
+            tls_material::cachedb_redis_roots(Some(ca))?;
+        }
     }
     edge_service_preflight(cfg)?;
     if let Some(url) = &cfg.zones_postgres {
@@ -3100,7 +3114,7 @@ mod tests {
     /** @brief 관리 API 에 요청 하나를 보내고 응답 전체를 돌려준다. */
     fn control_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
         use std::io::{Read, Write};
-        let content_type = if path == "/v1/config/apply" {
+        let content_type = if matches!(path, "/v1/config/apply" | "/v1/config/diff") {
             "application/toml"
         } else {
             "application/json"
@@ -3344,6 +3358,156 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 클라이언트 경로가 있을 때 관리 화면과 변경 미리보기가 체인 설정의 재시작을 알리는지.
+     * @details 경로의 체인은 세대를 시작할 때만 만들어지므로 체인 설정을 바꾸면 서비스를 다시
+     *          시작한다. 관리 화면은 원문 편집기에서는 /v1/config/diff 의 판정으로, 설정 항목
+     *          화면에서는 /v1/config/set/diff 의 판정으로, 저장된 파일을 반영할 때는
+     *          /v1/config/status 의 판정으로 묻고, 항목 표시는 스키마와 상태의 분류를 따른다.
+     *          어느 하나라도 무중단이라고 답하면 묻지 않고 적용하므로, 모두 실제 적용 결과와 같아야
+     *          한다.
+     */
+    fn client_routes_make_chain_changes_announce_a_restart() {
+        let dns = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "onetdns-route-restart-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("OnetDNS.toml");
+        let text = format!(
+            "listen = [\"{dns}\"]\n\
+             do_tcp = false\n\
+             workers = 1\n\
+             backend = \"forward\"\n\
+             upstream_urls = [\"udp://192.0.2.1:53\"]\n\
+             control_listen = \"{control}\"\n\
+             control_token = \"hot-apply-test-token-0123456789\"\n\
+             [[clients]]\nname = \"office\"\nids = [\"192.0.2.0/24\"]\n\
+             upstreams = [\"192.0.2.9\"]\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::from_toml_str(&text).unwrap();
+
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let ready = ready.clone();
+            let stop = stop.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    Some(onetdns_core::SecretString::from(text)),
+                    Some(path),
+                    Default::default(),
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "server did not start");
+            assert!(!server.is_finished(), "server stopped before it was ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let keys = |response: &str, name: &str| -> Vec<String> {
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            onetdns_core::json::parse(body)
+                .unwrap()
+                .get(name)
+                .and_then(|value| value.as_array())
+                .unwrap_or_else(|| panic!("{name} is missing: {body}"))
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect()
+        };
+        let schema = control_request(control, "GET", "/v1/config/schema", "");
+        let hot = keys(&schema, "hot_reload_keys");
+        let conditional = keys(&schema, "conditional_hot_reload_keys");
+        assert!(!hot.contains(&"min_ttl".to_string()), "{hot:?}");
+        assert!(
+            conditional.contains(&"min_ttl".to_string()),
+            "{conditional:?}"
+        );
+        assert!(hot.contains(&"block_rules".to_string()), "{hot:?}");
+
+        let preview = control_request(control, "POST", "/v1/config/diff", "min_ttl = 120\n");
+        assert_eq!(keys(&preview, "service_restart"), ["min_ttl"]);
+        assert!(preview.contains("\"restart_required\":true"), "{preview}");
+        let preview = control_request(
+            control,
+            "POST",
+            "/v1/config/diff",
+            "block_rules = [\"||blocked.test^\"]\n",
+        );
+        assert_eq!(keys(&preview, "hot_reload"), ["block_rules"]);
+        assert!(preview.contains("\"restart_required\":false"), "{preview}");
+
+        let preview = control_request(control, "POST", "/v1/config/set/diff", "{\"min_ttl\":120}");
+        assert_eq!(keys(&preview, "service_restart"), ["min_ttl"]);
+        assert!(preview.contains("\"restart_required\":true"), "{preview}");
+        let preview = control_request(
+            control,
+            "POST",
+            "/v1/config/set/diff",
+            "{\"block_rules\":[\"||blocked.test^\"]}",
+        );
+        assert_eq!(keys(&preview, "hot_reload"), ["block_rules"]);
+        assert!(preview.contains("\"restart_required\":false"), "{preview}");
+        let preview = control_request(control, "POST", "/v1/config/set/diff", "{\"min_ttl\":null}");
+        assert!(preview.contains("\"restart_required\":false"), "{preview}");
+        let rejected = control_request(control, "POST", "/v1/config/set/diff", "{\"no_such\":1}");
+        assert!(rejected.starts_with("HTTP/1.1 400"), "{rejected}");
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("min_ttl = 120\n{saved}")).unwrap();
+        let status = control_request(control, "GET", "/v1/config/status", "");
+        assert_eq!(keys(&status, "changed_keys"), ["min_ttl"]);
+        assert_eq!(keys(&status, "service_restart"), ["min_ttl"]);
+        assert!(status.contains("\"restart_required\":true"), "{status}");
+        assert_eq!(keys(&status, "conditional_hot_reload_keys"), conditional);
+        let preview = control_request(control, "POST", "/v1/config/set/diff", "{\"min_ttl\":120}");
+        assert!(keys(&preview, "effective_changed").is_empty(), "{preview}");
+        assert!(preview.contains("\"restart_required\":false"), "{preview}");
+        let applied = control_request(control, "POST", "/v1/config/set", "{\"min_ttl\":120}");
+        assert!(applied.contains("\"mode\":\"no_change\""), "{applied}");
+        let preview = control_request(
+            control,
+            "POST",
+            "/v1/config/set/diff",
+            "{\"block_rules\":[\"||blocked.test^\"]}",
+        );
+        assert_eq!(keys(&preview, "hot_reload"), ["block_rules"]);
+        assert_eq!(keys(&preview, "service_restart"), ["min_ttl"]);
+        assert!(preview.contains("\"restart_required\":true"), "{preview}");
+        std::fs::write(&path, saved).unwrap();
+
+        let applied = control_request(control, "POST", "/v1/config/apply", "min_ttl = 120\n");
+        assert!(
+            applied.contains("\"mode\":\"service_restart\""),
+            "{applied}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     /** @brief 노드별 설정은 복제에서 빠지고, 서비스 동작을 정하는 설정은 복제되는지. */
     fn cluster_local_keys_cover_identity_secrets_and_paths_only() {
         for key in [
@@ -3354,6 +3518,8 @@ mod tests {
             "users",
             "tsig_keys",
             "cluster_raft_secret",
+            "cachedb_redis_secret",
+            "cachedb_redis_password",
             "cluster_node_id",
             "tls_cert",
             "acme_domains",

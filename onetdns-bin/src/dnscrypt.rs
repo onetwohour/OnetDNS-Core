@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use onetdns_core::tcp::DeadlineTcp;
 use onetdns_dnscrypt::Provider;
 use onetdns_proto::{Message, Writer};
 use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
@@ -28,8 +29,6 @@ use crate::transport_observe;
 
 /** @brief 연결 하나의 입출력 데드라인. */
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/** @brief 종료 신호를 확인하는 주기. */
-const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
 /** @brief 질의를 처리해 DNS 응답 와이어를 돌려주는 콜백. */
 fn make_handler(
@@ -248,12 +247,10 @@ pub fn serve_tcp(
                                 let _guards = (guard, activity);
                                 let result = onetdns_core::isolation::catch_request(|| {
                                     serve_conn(
-                                        stream,
+                                        connection_io(stream, connection_shutdown, connection_stop),
                                         peer,
                                         &provider,
                                         &handler,
-                                        &connection_shutdown,
-                                        &connection_stop,
                                     )
                                 });
                                 if let Ok(Err(error)) = result {
@@ -298,19 +295,30 @@ pub fn serve_tcp(
     })
 }
 
+/**
+ * @brief 연결 하나를 입출력 데드라인과 종료 신호 아래에 둔다.
+ * @param shutdown 서버 전체가 끝나고 있다는 표시.
+ * @param stop 이 리스너가 끝나고 있다는 표시.
+ */
+fn connection_io(
+    stream: PrefixedTcp,
+    shutdown: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> DeadlineTcp<PrefixedTcp> {
+    DeadlineTcp::new(stream, std::time::Instant::now() + IO_TIMEOUT)
+        .stop_on(shutdown)
+        .stop_on(stop)
+}
+
 /** @brief 연결 하나에서 거래 하나를 처리한다. */
 fn serve_conn(
-    mut stream: PrefixedTcp,
+    mut stream: DeadlineTcp<PrefixedTcp>,
     peer: SocketAddr,
     provider: &Provider,
     handler: &Arc<NativeServer>,
-    shutdown: &AtomicBool,
-    stop: &AtomicBool,
 ) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + IO_TIMEOUT;
-
     let mut len_bytes = [0u8; 2];
-    read_exact_until(&mut stream, &mut len_bytes, shutdown, stop, deadline)?;
+    stream.read_exact(&mut len_bytes)?;
     let len = usize::from(u16::from_be_bytes(len_bytes));
     if len == 0 || len > onetdns_dnscrypt::server::MAX_TCP_QUERY {
         return Err(io::Error::new(
@@ -319,7 +327,7 @@ fn serve_conn(
         ));
     }
     let mut packet = vec![0u8; len];
-    read_exact_until(&mut stream, &mut packet, shutdown, stop, deadline)?;
+    stream.read_exact(&mut packet)?;
 
     let gate = make_gate(handler.clone());
     let respond_to = make_handler(handler.clone());
@@ -334,73 +342,9 @@ fn serve_conn(
             "DNSCrypt TCP response does not fit in the length prefix",
         ));
     };
-    write_all_until(&mut stream, &prefix.to_be_bytes(), shutdown, stop, deadline)?;
-    write_all_until(&mut stream, &payload, shutdown, stop, deadline)?;
+    stream.write_all(&prefix.to_be_bytes())?;
+    stream.write_all(&payload)?;
     stream.flush()
-}
-
-/** @brief 절대 데드라인과 종료 신호를 지키며 버퍼를 모두 읽는다. */
-fn read_exact_until(
-    stream: &mut PrefixedTcp,
-    mut buffer: &mut [u8],
-    shutdown: &AtomicBool,
-    stop: &AtomicBool,
-    deadline: std::time::Instant,
-) -> io::Result<()> {
-    while !buffer.is_empty() {
-        if shutdown.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or(io::ErrorKind::TimedOut)?;
-        stream.set_read_timeout(Some(remaining.min(SHUTDOWN_POLL)))?;
-        match stream.read(buffer) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(read) => buffer = &mut buffer[read..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) && std::time::Instant::now() < deadline => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-/** @brief 절대 데드라인과 종료 신호를 지키며 버퍼를 모두 쓴다. */
-fn write_all_until(
-    stream: &mut PrefixedTcp,
-    mut buffer: &[u8],
-    shutdown: &AtomicBool,
-    stop: &AtomicBool,
-    deadline: std::time::Instant,
-) -> io::Result<()> {
-    while !buffer.is_empty() {
-        if shutdown.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or(io::ErrorKind::TimedOut)?;
-        stream.set_write_timeout(Some(remaining.min(SHUTDOWN_POLL)))?;
-        match stream.write(buffer) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(written) => buffer = &buffer[written..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) && std::time::Instant::now() < deadline => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -413,20 +357,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let mut server = PrefixedTcp::new(server, Vec::new());
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
+        let mut server = connection_io(
+            PrefixedTcp::new(server, Vec::new()),
+            Arc::new(AtomicBool::new(false)),
+            stop.clone(),
+        );
         let worker = std::thread::spawn(move || {
             let mut length = [0u8; 2];
-            read_exact_until(
-                &mut server,
-                &mut length,
-                &AtomicBool::new(false),
-                &worker_stop,
-                std::time::Instant::now() + IO_TIMEOUT,
-            )
-            .unwrap_err()
-            .kind()
+            server.read_exact(&mut length).unwrap_err().kind()
         });
 
         std::thread::sleep(Duration::from_millis(20));

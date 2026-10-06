@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use onetdns_core::tcp::DeadlineTcp;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -164,65 +165,6 @@ impl ReplayCache {
         }
         window.seen_bitmap |= bit;
         true
-    }
-}
-
-/**
- * @brief 절대 데드라인과 종료 신호를 함께 보는 읽기 어댑터.
- * @details 소켓 타임아웃만으로는 조금씩 보내는 상대를 막지 못한다. 부분 읽기마다 데드라인을
- *          다시 확인해 총 시간을 유계로 만든다.
- */
-struct DeadlineReader {
-    /** @brief 이어진 연결. */
-    stream: TcpStream,
-    /** @brief 프레임 하나의 데드라인. */
-    deadline: Instant,
-    /** @brief 서버 전체가 끝나고 있다는 표시. */
-    shutdown: Arc<AtomicBool>,
-}
-
-impl DeadlineReader {
-    /** @brief 어댑터를 만든다. 데드라인은 프레임마다 다시 잡는다. */
-    fn new(stream: TcpStream, shutdown: Arc<AtomicBool>) -> Self {
-        Self {
-            stream,
-            deadline: Instant::now(),
-            shutdown,
-        }
-    }
-
-    /** @brief 데드라인을 다시 잡는다. 새 프레임을 읽기 시작할 때 부른다. */
-    fn set_deadline(&mut self, deadline: Instant) {
-        self.deadline = deadline;
-    }
-
-    /** @brief 데드라인까지 남은 시간. 지났으면 타임아웃 오류다. */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
-    }
-}
-
-impl Read for DeadlineReader {
-    /** @brief 남은 시간을 걸고 읽는다. */
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                return Err(std::io::ErrorKind::ConnectionAborted.into());
-            }
-            let timeout = self.remaining()?.min(Duration::from_millis(250));
-            self.stream.set_read_timeout(Some(timeout))?;
-            match self.stream.read(buf) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) && Instant::now() < self.deadline => {}
-                result => return result,
-            }
-        }
     }
 }
 
@@ -1806,7 +1748,7 @@ fn handle_conn(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
-    let mut stream = DeadlineReader::new(stream, shutdown.clone());
+    let mut stream = DeadlineTcp::new(stream, Instant::now()).stop_on(shutdown.clone());
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -1962,57 +1904,6 @@ mod tests {
         drop(last);
         assert_eq!(count.load(Ordering::Acquire), 0);
         assert_eq!(*lock(&progress.0), 1, "마지막 제안이 apply를 깨웁니다");
-    }
-
-    #[test]
-    /** @brief 한 바이트씩 흘려 보내는 상대가 데드라인을 늘리지 못하는지. */
-    fn frame_deadline_rejects_slow_drip_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for byte in 0..10 {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let started = Instant::now();
-        let stream = TcpStream::connect(addr).unwrap();
-        let mut reader = DeadlineReader::new(stream, Arc::new(AtomicBool::new(false)));
-        reader.set_deadline(started + Duration::from_millis(120));
-        let mut frame = [0u8; 10];
-        let error = reader.read_exact(&mut frame).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        server.join().unwrap();
-    }
-
-    #[test]
-    /** @brief 종료 신호에 곧바로 멈추는지. */
-    fn frame_reader_stops_promptly_on_shutdown() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-        });
-
-        let stream = TcpStream::connect(addr).unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut reader = DeadlineReader::new(stream, shutdown.clone());
-        reader.set_deadline(Instant::now() + Duration::from_secs(5));
-        shutdown.store(true, Ordering::Relaxed);
-        let started = Instant::now();
-        let error = reader.read_exact(&mut [0u8; 1]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
-        assert!(started.elapsed() < Duration::from_millis(100));
-        server.join().unwrap();
     }
 
     #[test]

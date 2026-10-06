@@ -33,6 +33,8 @@ pub mod swap;
 #[cfg(unix)]
 /** @brief 스레드마다 작은 캐시를 두는 할당기. */
 pub mod talloc;
+/** @brief 절대 데드라인과 종료 신호를 지키며 읽고 쓰는 TCP 연결. */
+pub mod tcp;
 /** @brief ICMP 오류가 수신을 깨뜨리지 않는 UDP 소켓과 데이터그램을 잃지 않는 수신 대기. */
 pub mod udp;
 

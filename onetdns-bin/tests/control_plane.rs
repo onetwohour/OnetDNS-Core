@@ -122,7 +122,7 @@ const DASHBOARD_REQUIRED: &[&str] = &[
     "detail:this.auditDetailText(e.detail)",
     "actor:String(e.actor||'system')",
     "actionLabel:this.t(",
-    "confirmConfigImpact(keys)",
+    "confirmServiceRestart(keys)",
     "effective_changed",
     "sessionResetPatch(connectionState,notice)",
     "abortRequests()",

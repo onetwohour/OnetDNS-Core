@@ -300,6 +300,195 @@ def check_chart_axis_labels_are_evenly_spaced(source: str) -> None:
             )
 
 
+def check_cleared_fields_remove_their_key(source: str) -> None:
+    """Clearing a settings field must remove the key, not store an empty string.
+
+    A setting without a default (the schema marks it nullable) has no meaningful
+    empty value: an empty Redis host or certificate path makes the server reject the
+    whole configuration, and an empty string in an integer field is not an integer.
+    The editor therefore sends null, which the API turns into removing the key. A
+    string setting that has a default keeps the empty string, because there the
+    empty value can mean "off" (an empty DHCP local domain turns the option off).
+    This runs the shipped handlers and checks what they stage.
+    """
+    handlers = {}
+    for name in ("schemaSetStr", "schemaSetNum"):
+        match = re.search(r"\n  " + name + r"=(\(.*?\};)\n", source)
+        if not match:
+            fail(name + " not found; the cleared-field check cannot run")
+        handlers[name] = match.group(1).rstrip(";")
+
+    harness = (
+        "const staged = [];" + chr(10)
+        + "const self = { stageConfig(obj) { staged.push(obj); } };" + chr(10)
+        + "const h = (function () { return {" + chr(10)
+        + "  schemaSetStr: " + handlers["schemaSetStr"] + "," + chr(10)
+        + "  schemaSetNum: " + handlers["schemaSetNum"] + "," + chr(10)
+        + "}; }).call(self);" + chr(10)
+        + "const input = (value) => ({ target: { value } });" + chr(10)
+        + "h.schemaSetStr({ key: 'host', nullable: true })(input(''));" + chr(10)
+        + "h.schemaSetStr({ key: 'host', nullable: true })(input('redis.lan'));" + chr(10)
+        + "h.schemaSetStr({ key: 'domain', nullable: false })(input(''));" + chr(10)
+        + "h.schemaSetNum('port')(input(''));" + chr(10)
+        + "h.schemaSetNum('port')(input('6380'));" + chr(10)
+        + "process.stdout.write(JSON.stringify(staged));" + chr(10)
+    )
+    with tempfile.TemporaryDirectory(prefix="onetdns-cleared-") as td:
+        script = Path(td) / "cleared.js"
+        script.write_text(harness, encoding="utf-8")
+        got = json.loads(
+            subprocess.check_output(["node", str(script)], text=True, encoding="utf-8")
+        )
+
+    want = [
+        {"host": None},
+        {"host": "redis.lan"},
+        {"domain": ""},
+        {"port": None},
+        {"port": "6380"},
+    ]
+    if got != want:
+        fail(
+            "clearing a settings field stages the wrong value: got "
+            + json.dumps(got)
+            + ", want "
+            + json.dumps(want)
+            + ". A cleared nullable string or integer must stage null so the key is"
+            " removed; an empty string there makes the server reject the whole"
+            " configuration."
+        )
+
+
+def check_restart_verdict_is_confirmed(source: str) -> None:
+    """Every way of applying settings must confirm whenever the server says it restarts.
+
+    The per-setting classification from /v1/config/schema assumes one setting
+    changes under the configuration the page loaded with. The server judges the
+    actual change: with clients that have their own upstream servers, a change that
+    rebuilds the resolver chain restarts the service, and those routes may have been
+    added after the page loaded. So the raw editor asks /v1/config/diff, a settings
+    form asks /v1/config/set/diff with the body it is about to send, and applying
+    the saved file reads /v1/config/status right before it reloads. This runs the
+    shipped handlers against a server verdict that says the change restarts while
+    the classification calls the changed setting hot, and checks that the user is
+    asked before anything is applied, and is not asked when the verdict is hot.
+    It also runs both readers of /v1/config/status, the five-second poll and the
+    full reload, and checks that the classification the status carries
+    re-partitions the settings, so the restart badges follow the current
+    configuration.
+    """
+    patterns = {
+        "applyConfig": r"\n  applyConfig=(async\(\)=>\{.*?\};)\n",
+        "applyDiskConfig": r"\n  applyDiskConfig=(async\(\)=>\{.*?\n  \};)\n",
+        "cset": r"\n  (async cset\(obj,options\)\{.*?\n  \})\n",
+        "confirmServiceRestart": r"\n  (confirmServiceRestart\(keys\)\{.*?\})\n",
+        "restartClassFrom": r"\n  (restartClassFrom\(s,status\)\{.*?\})\n",
+        "loadConfigState": r"\n  (async loadConfigState\(\)\{.*?\n  \})\n",
+        "loadConfigStatus": r"\n  (async loadConfigStatus\(\)\{.*?\n  \})\n",
+    }
+    found = {}
+    for name, pattern in patterns.items():
+        match = re.search(pattern, source, re.S)
+        if not match:
+            fail(name + " not found; the restart-confirmation check cannot run")
+        found[name] = match.group(1)
+
+    harness = (
+        "function host(server, state) {" + chr(10)
+        + "  const record = { asked: 0, calls: [] };" + chr(10)
+        + "  const self = {" + chr(10)
+        + "    state: { forms: { config: 'min_ttl = 120' }, schemaHot: ['min_ttl'], schemaConditional: [], configDraft: {}, configDraftDirty: {}, cfg: {}, security: {}, ...state }," + chr(10)
+        + "    t(text) { return text; }," + chr(10)
+        + "    configLabels(keys) { return keys; }," + chr(10)
+        + "    askConfirm() { record.asked += 1; return Promise.resolve(false); }," + chr(10)
+        + "    apiGet(path) { record.calls.push(path); return Promise.resolve(server[path] || { ok: true, body: {} }); }," + chr(10)
+        + "    apiSend(path) { record.calls.push(path); return Promise.resolve(server[path] || { ok: true, body: { mode: 'hot_reload' } }); }," + chr(10)
+        + "    setState(update) { Object.assign(this.state, typeof update === 'function' ? update(this.state) : update); }," + chr(10)
+        + "    expectRestart() {}, toastMsg() {}, errorText() { return ''; }," + chr(10)
+        + "    applyRoots() {}, loadListenerStatus() {}, loadAdapters() {}, loadBootService() {}," + chr(10)
+        + "    loadConfigState() { return Promise.resolve(); }," + chr(10)
+        + "    " + found["confirmServiceRestart"] + "," + chr(10)
+        + "    " + found["cset"] + "," + chr(10)
+        + "    " + found["restartClassFrom"] + "," + chr(10)
+        + "  };" + chr(10)
+        + "  return { self, record };" + chr(10)
+        + "}" + chr(10)
+        + "const verdict = (restarts) => ({ ok: true, body: { restart_required: restarts, service_restart: restarts ? ['min_ttl'] : [] } });" + chr(10)
+        + "async function raw(restarts) {" + chr(10)
+        + "  const { self, record } = host({ '/v1/config/diff': verdict(restarts) });" + chr(10)
+        + "  await (function () { return " + found["applyConfig"].rstrip(";") + "; }).call(self)();" + chr(10)
+        + "  return { asked: record.asked, applied: record.calls.includes('/v1/config/apply') };" + chr(10)
+        + "}" + chr(10)
+        + "async function form(preview) {" + chr(10)
+        + "  const { self, record } = host({ '/v1/config/set/diff': preview });" + chr(10)
+        + "  await self.cset({ min_ttl: 120 });" + chr(10)
+        + "  return { asked: record.asked, applied: record.calls.includes('/v1/config/set') };" + chr(10)
+        + "}" + chr(10)
+        + "async function disk(restarts) {" + chr(10)
+        + "  const { self, record } = host({ '/v1/config/status': verdict(restarts) });" + chr(10)
+        + "  await (function () { return " + found["applyDiskConfig"].rstrip(";") + "; }).call(self)();" + chr(10)
+        + "  return { asked: record.asked, applied: record.calls.includes('/v1/config/reload') };" + chr(10)
+        + "}" + chr(10)
+        + "const loaded = { schemaHot: ['min_ttl', 'block_rules'], schemaConditional: ['clients'] };" + chr(10)
+        + "const status = { ok: true, body: { in_sync: true, changed_keys: [], conditional_hot_reload_keys: ['clients', 'min_ttl'] } };" + chr(10)
+        + "const badges = (state) => ({ schemaConditional: state.schemaConditional, schemaHot: state.schemaHot });" + chr(10)
+        + "async function polled() {" + chr(10)
+        + "  const { self } = host({ '/v1/config/status': status }, { ...loaded, loggedIn: true, configStatus: status.body });" + chr(10)
+        + "  await ({ " + found["loadConfigStatus"] + " }).loadConfigStatus.call(self);" + chr(10)
+        + "  return badges(self.state);" + chr(10)
+        + "}" + chr(10)
+        + "async function reloaded() {" + chr(10)
+        + "  const { self } = host({ '/v1/config/status': status }, loaded);" + chr(10)
+        + "  await ({ " + found["loadConfigState"] + " }).loadConfigState.call(self);" + chr(10)
+        + "  return badges(self.state);" + chr(10)
+        + "}" + chr(10)
+        + "(async () => {" + chr(10)
+        + "  const { self } = host({}, loaded);" + chr(10)
+        + "  const got = {" + chr(10)
+        + "    raw: [await raw(true), await raw(false)]," + chr(10)
+        + "    form: [await form(verdict(true)), await form(verdict(false)), await form({ ok: false, body: { error: 'unknown key' } })]," + chr(10)
+        + "    disk: [await disk(true), await disk(false)]," + chr(10)
+        + "    classified: self.restartClassFrom(loaded, status.body)," + chr(10)
+        + "    unclassified: self.restartClassFrom(loaded, { in_sync: true })," + chr(10)
+        + "    polled: await polled()," + chr(10)
+        + "    reloaded: await reloaded()," + chr(10)
+        + "  };" + chr(10)
+        + "  process.stdout.write(JSON.stringify(got));" + chr(10)
+        + "  process.exit(0);" + chr(10)
+        + "})();" + chr(10)
+    )
+    with tempfile.TemporaryDirectory(prefix="onetdns-restart-") as td:
+        script = Path(td) / "restart.js"
+        script.write_text(harness, encoding="utf-8")
+        got = json.loads(
+            subprocess.check_output(["node", str(script)], text=True, encoding="utf-8")
+        )
+
+    asked_and_stopped = {"asked": 1, "applied": False}
+    applied_quietly = {"asked": 0, "applied": True}
+    partitioned = {"schemaConditional": ["clients", "min_ttl"], "schemaHot": ["block_rules"]}
+    want = {
+        "raw": [asked_and_stopped, applied_quietly],
+        "form": [asked_and_stopped, applied_quietly, {"asked": 0, "applied": False}],
+        "disk": [asked_and_stopped, applied_quietly],
+        "classified": partitioned,
+        "unclassified": {},
+        "polled": partitioned,
+        "reloaded": partitioned,
+    }
+    if got != want:
+        fail(
+            "applying settings does not follow the server's restart verdict: got "
+            + json.dumps(got)
+            + ", want "
+            + json.dumps(want)
+            + ". When the server says the change restarts the service, the user must"
+            " be asked before anything is applied, even if the classification calls"
+            " every changed setting hot; a preview that fails must not apply; and the"
+            " classification in the config status must re-partition the settings."
+        )
+
+
 def check_toast_is_never_painted_behind_an_overlay(source: str) -> None:
     """The toast must outrank every full-screen overlay.
 
@@ -641,7 +830,11 @@ def main() -> None:
     # 대화상자가 뜨는 것과 동시에 지우는 동작이 실행된다 -- 실제로 그렇게 나갔었다.
     if "window.confirm" in source or "window.alert" in source:
         fail("browser native dialogs are back; use the in-app confirm instead")
-    for asker in ("confirmDestructive", "confirmConfigImpact", "askConfirm"):
+    for asker in (
+        "confirmDestructive",
+        "confirmServiceRestart",
+        "askConfirm",
+    ):
         pattern = "(?<!await )this\\." + asker + "\\("
         for hit in re.finditer(pattern, source):
             head = source[max(0, hit.start() - 40) : hit.start()].rstrip()
@@ -660,6 +853,8 @@ def main() -> None:
     check_chart_curve_stays_in_band(source)
     check_chart_axis_labels_are_evenly_spaced(source)
     check_live_chart_buckets_are_time_anchored(source)
+    check_cleared_fields_remove_their_key(source)
+    check_restart_verdict_is_confirmed(source)
     check_toast_is_never_painted_behind_an_overlay(source)
     check_hidden_row_controls_keep_their_slot(source)
     check_template_names_are_exposed(source)

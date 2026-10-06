@@ -15,9 +15,8 @@
 
 use super::*;
 use crate::config_apply::{
-    backend_uses_forward, config_changed_keys, has_client_upstream_routes, hot_reload_groups,
-    is_hot_reload_config_change, normalize_config_for_comparison, runtime_config_update_lock,
-    HotConfigApply, LOCAL_ONLY_CONFIG_KEYS,
+    backend_uses_forward, config_changed_keys, hot_reload_groups, normalize_config_for_comparison,
+    runtime_config_update_lock, service_restart_keys, HotConfigApply, LOCAL_ONLY_CONFIG_KEYS,
 };
 use crate::config_apply::{ChainRebuild, RestartHooks, SecondaryRestart};
 use crate::edge::{reconcile_edge_services, EdgeServices};
@@ -224,23 +223,11 @@ impl HotApplyDeps {
         let next = &normalize_config_for_comparison(&previous_cfg, next);
 
         let changed = config_changed_keys(&previous_cfg, next)?;
-        if changed
-            .iter()
-            .any(|key| !is_hot_reload_config_change(&previous_cfg, next, key))
-        {
+        if !service_restart_keys(&previous_cfg, next, &changed).is_empty() {
             return Ok((false, changed));
         }
 
         let groups = hot_reload_groups(&previous_cfg, next, &changed);
-        /*
-         * 클라이언트별 경로 체인은 세대를 시작할 때 한 번 만들고 교체하지 않는다. 기본 체인만
-         * 다시 만들면 그 경로의 클라이언트는 이전 캐시 크기나 검증 설정으로 답을 받는다.
-         */
-        if groups.contains(&ApplyGroup::Chain)
-            && (has_client_upstream_routes(&previous_cfg) || has_client_upstream_routes(next))
-        {
-            return Ok((false, changed));
-        }
 
         // hot-apply:begin
         let Some(prepared) = self.prepare(&previous_cfg, next, &groups, &changed)? else {

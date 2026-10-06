@@ -283,6 +283,11 @@ static FIELDS: &[Field] = &[
     f("cachedb_redis_host", "string", "network", ""),
     f("cachedb_redis_port", "int", "network", ""),
     f("cachedb_redis_expire_secs", "int", "network", "seconds"),
+    f("cachedb_redis_secret", "string", "network", ""),
+    f("cachedb_redis_username", "string", "network", ""),
+    f("cachedb_redis_password", "string", "network", ""),
+    f("cachedb_redis_tls", "bool", "network", ""),
+    f("cachedb_redis_tls_ca", "string", "network", ""),
     f("cluster_peers", "array", "cluster", ""),
     f("cluster_raft", "bool", "cluster", ""),
     f("cluster_node_id", "int", "cluster", ""),
@@ -2848,6 +2853,61 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_zh: "Redis 中保存的 DNS 响应的最长有效期。",
     },
     FieldCopy {
+        key: "cachedb_redis_secret",
+        label_ko: "외부 Redis 캐시 공용 인증 키",
+        label_en: "Shared Redis cache authentication key",
+        label_ja: "外部 Redis キャッシュ共通の認証鍵",
+        label_zh: "外部 Redis 缓存共享认证密钥",
+        description_ko: "Redis에 담는 응답마다 붙이는 인증 값을 만드는 공용 비밀 키입니다. 32바이트 이상이어야 하며, 같은 Redis를 쓰는 서버에는 모두 같은 값을 넣습니다. Redis에는 보내지 않으므로 Redis에 접근할 수 있는 사람도 응답을 위조할 수 없습니다.",
+        description_en: "Shared secret used to authenticate every response stored in Redis. It must be at least 32 bytes, and every server using the same Redis needs the same value. It is never sent to Redis, so anyone with access to Redis still cannot forge responses.",
+        description_ja: "Redis に保存する応答ごとに付ける認証値を作る共通の秘密鍵です。32 バイト以上が必要で、同じ Redis を使うサーバーにはすべて同じ値を設定します。Redis には送らないため、Redis にアクセスできる者でも応答を偽造できません。",
+        description_zh: "为 Redis 中保存的每个响应生成认证值的共享密钥。至少需要 32 字节，使用同一 Redis 的所有服务器必须设置相同的值。该密钥不会发送给 Redis，因此即使有人能访问 Redis 也无法伪造响应。",
+    },
+    FieldCopy {
+        key: "cachedb_redis_username",
+        label_ko: "외부 Redis 캐시 사용자 이름",
+        label_en: "External Redis cache user name",
+        label_ja: "外部 Redis キャッシュのユーザー名",
+        label_zh: "外部 Redis 缓存用户名",
+        description_ko: "Redis ACL 사용자 이름입니다. 비워 두고 비밀번호만 넣으면 기본 사용자로 인증합니다.",
+        description_en: "Redis ACL user name. Leave it empty and set only the password to authenticate as the default user.",
+        description_ja: "Redis ACL のユーザー名です。空のままパスワードだけを設定すると、デフォルトユーザーとして認証します。",
+        description_zh: "Redis ACL 用户名。留空并只设置密码时，以默认用户身份认证。",
+    },
+    FieldCopy {
+        key: "cachedb_redis_password",
+        label_ko: "외부 Redis 캐시 비밀번호",
+        label_en: "External Redis cache password",
+        label_ja: "外部 Redis キャッシュのパスワード",
+        label_zh: "外部 Redis 缓存密码",
+        description_ko: "Redis에 접속한 뒤 AUTH 명령으로 보내는 비밀번호입니다. TLS를 켜지 않으면 평문으로 전달됩니다.",
+        description_en: "Password sent with the AUTH command after connecting to Redis. Without TLS it travels in plain text.",
+        description_ja: "Redis に接続した後、AUTH コマンドで送るパスワードです。TLS を有効にしないと平文で送られます。",
+        description_zh: "连接 Redis 后通过 AUTH 命令发送的密码。未启用 TLS 时以明文传输。",
+    },
+    FieldCopy {
+        key: "cachedb_redis_tls",
+        label_ko: "외부 Redis 캐시 TLS",
+        label_en: "External Redis cache TLS",
+        label_ja: "外部 Redis キャッシュの TLS",
+        label_zh: "外部 Redis 缓存 TLS",
+        description_ko: "켜면 Redis에 TLS로 접속하고, 서버 인증서가 Redis 서버 주소에 적은 이름으로 발급됐는지 확인합니다.",
+        description_en: "Connects to Redis over TLS and checks that the server certificate was issued for the name in the Redis server address.",
+        description_ja: "有効にすると Redis に TLS で接続し、サーバー証明書が Redis サーバーのアドレスに記載した名前で発行されたかを確認します。",
+        description_zh: "启用后通过 TLS 连接 Redis，并检查服务器证书是否为 Redis 服务器地址中填写的名称签发。",
+    },
+    FieldCopy {
+        key: "cachedb_redis_tls_ca",
+        label_ko: "외부 Redis 캐시 TLS CA 파일",
+        label_en: "External Redis cache TLS CA file",
+        label_ja: "外部 Redis キャッシュの TLS CA ファイル",
+        label_zh: "外部 Redis 缓存 TLS CA 文件",
+        description_ko: "Redis TLS 인증서를 검증할 CA 파일입니다. 비워 두면 시스템 신뢰 저장소를 씁니다. 사설 CA로 발급한 인증서에는 이 파일이 필요합니다.",
+        description_en: "CA file used to verify the Redis TLS certificate. When empty, the system trust store is used. Certificates issued by a private CA need this file.",
+        description_ja: "Redis TLS 証明書を検証する CA ファイルです。空のときはシステムの信頼ストアを使います。プライベート CA が発行した証明書にはこのファイルが必要です。",
+        description_zh: "用于验证 Redis TLS 证书的 CA 文件。留空时使用系统信任库。由私有 CA 签发的证书需要此文件。",
+    },
+    FieldCopy {
         key: "cluster_peers",
         label_ko: "상대 클러스터 노드",
         label_en: "Peer cluster nodes",
@@ -3368,6 +3428,8 @@ fn field_sensitive(key: &str) -> bool {
             | "zones_postgres"
             | "zones_mysql"
             | "zones_etcd_password"
+            | "cachedb_redis_secret"
+            | "cachedb_redis_password"
             | "cluster_raft_secret"
             | "cluster_raft_node_key"
             | "tsig_keys"
@@ -3385,6 +3447,8 @@ fn field_write_only(key: &str) -> bool {
             | "zones_postgres"
             | "zones_mysql"
             | "zones_etcd_password"
+            | "cachedb_redis_secret"
+            | "cachedb_redis_password"
             | "cluster_raft_secret"
             | "cluster_raft_node_key"
     )
@@ -3393,6 +3457,17 @@ fn field_write_only(key: &str) -> bool {
 /** @brief 대시보드에서 고칠 수 있는 항목인지. */
 fn field_editable(key: &str, kind: &str) -> bool {
     kind != "table" && !matches!(key, "control_admin_tokens" | "control_readonly_tokens")
+}
+
+/**
+ * @brief 기본 설정에서 값이 없는 항목인지.
+ * @details 이런 항목은 지정하지 않은 상태가 값이 없는 상태이므로, 대시보드는 입력란을 비우면
+ *          빈 문자열을 저장하지 않고 항목을 지운다. 빈 호스트나 빈 경로를 저장하면 설정 전체가
+ *          거부된다. 기본값이 있는 문자열 항목은 빈 문자열도 값이므로 이 표시가 붙지 않는다.
+ * @param defaults 기본 설정을 JSON으로 읽은 값. 값이 없는 항목은 null로 나온다.
+ */
+fn field_nullable(defaults: &onetdns_core::json::Json, key: &str) -> bool {
+    matches!(defaults.get(key), Some(onetdns_core::json::Json::Null))
 }
 
 /** @brief 값의 단위. 화면에 함께 보여 준다. */
@@ -3425,6 +3500,8 @@ fn i18n_object(values: [&str; 4]) -> String {
 /** @brief 전체 메타데이터를 JSON으로. 대시보드가 이것을 받아 화면을 만든다. */
 pub fn schema_json() -> String {
     use onetdns_core::json;
+    let defaults = json::parse(&crate::Config::default().effective_json())
+        .expect("the default configuration serializes to valid JSON");
     let mut out = String::from("[");
     for (i, fd) in FIELDS.iter().enumerate() {
         if i > 0 {
@@ -3456,7 +3533,7 @@ pub fn schema_json() -> String {
             .map(|(lang, column)| format!("\"{lang}\":{{{}}}", column.join(",")))
             .collect();
         out.push_str(&format!(
-            "{{\"key\":{},\"kind\":{},\"group\":{},\"label\":{},\"meta\":{},\"unit\":{},\"sensitive\":{},\"write_only\":{},\"editable\":{},\"enum_values\":[{}],\"enum_labels_i18n\":{{{}}},\"group_i18n\":{},\"label_i18n\":{},\"description_i18n\":{}}}",
+            "{{\"key\":{},\"kind\":{},\"group\":{},\"label\":{},\"meta\":{},\"unit\":{},\"sensitive\":{},\"write_only\":{},\"editable\":{},\"nullable\":{},\"enum_values\":[{}],\"enum_labels_i18n\":{{{}}},\"group_i18n\":{},\"label_i18n\":{},\"description_i18n\":{}}}",
             json::escape(fd.key),
             json::escape(fd.kind),
             json::escape(fd.group),
@@ -3466,6 +3543,7 @@ pub fn schema_json() -> String {
             field_sensitive(fd.key),
             field_write_only(fd.key),
             field_editable(fd.key, fd.kind),
+            field_nullable(&defaults, fd.key),
             enum_values.join(","),
             enum_i18n.join(","),
             i18n_object(group_i18n(fd.group)),
@@ -3501,6 +3579,45 @@ mod tests {
         for k in known_keys() {
             let n = fields().iter().filter(|fd| fd.key == *k).count();
             assert_eq!(n, 1, "키 '{k}' 스키마 항목 {n}개(정확히 1이어야)");
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 기본값이 없는 항목에만 nullable 표시가 붙는지.
+     * @details 대시보드는 이 표시를 보고 비운 입력란을 항목 삭제로 보낸다. 표시가 빠지면 빈 호스트가
+     *          저장되어 설정 전체가 거부되고, 기본값이 있는 항목에 붙으면 빈 문자열로 끄는 설정을
+     *          화면에서 끌 수 없다.
+     */
+    fn nullable_marks_only_settings_without_a_default() {
+        use onetdns_core::json::{parse, Json};
+        let schema = parse(&schema_json()).unwrap();
+        let nullable = |key: &str| {
+            schema
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field.get("key").and_then(Json::as_str) == Some(key))
+                .and_then(|field| field.get("nullable"))
+                .and_then(Json::as_bool)
+        };
+        for key in [
+            "cachedb_redis_host",
+            "cachedb_redis_username",
+            "cachedb_redis_tls_ca",
+            "tls_cert",
+            "dhcp_router",
+        ] {
+            assert_eq!(nullable(key), Some(true), "{key}");
+        }
+        for key in [
+            "dhcp_local_domain",
+            "doh_path",
+            "ddr_name",
+            "cachedb_redis_port",
+            "dnssec",
+        ] {
+            assert_eq!(nullable(key), Some(false), "{key}");
         }
     }
 

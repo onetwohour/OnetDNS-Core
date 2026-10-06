@@ -1166,6 +1166,16 @@ pub struct Config {
     pub cachedb_redis_port: u16,
     /** @brief 외부 Redis 캐시 만료 시간. */
     pub cachedb_redis_expire_secs: u64,
+    /** @brief 외부 Redis 캐시에 담는 값을 인증하는 공용 비밀 키. */
+    pub cachedb_redis_secret: SecretString,
+    /** @brief 외부 Redis 캐시 사용자 이름. */
+    pub cachedb_redis_username: Option<String>,
+    /** @brief 외부 Redis 캐시 비밀번호. */
+    pub cachedb_redis_password: Option<SecretString>,
+    /** @brief 외부 Redis 캐시에 TLS로 접속할지. */
+    pub cachedb_redis_tls: bool,
+    /** @brief 외부 Redis 캐시의 TLS 인증서를 검증할 CA 파일. 없으면 시스템 신뢰 저장소를 쓴다. */
+    pub cachedb_redis_tls_ca: Option<PathBuf>,
 
     /** @brief 상대 클러스터 노드. */
     pub cluster_peers: Vec<String>,
@@ -1497,6 +1507,11 @@ impl Default for Config {
             cachedb_redis_host: None,
             cachedb_redis_port: 6379,
             cachedb_redis_expire_secs: 0,
+            cachedb_redis_secret: String::new().into(),
+            cachedb_redis_username: None,
+            cachedb_redis_password: None,
+            cachedb_redis_tls: false,
+            cachedb_redis_tls_ca: None,
             cluster_peers: vec![],
             cluster_raft: false,
             cluster_node_id: 0,
@@ -1878,17 +1893,6 @@ impl Config {
      */
     pub fn dnssec_validation_active(&self) -> bool {
         self.dnssec
-    }
-
-    /**
-     * @brief 전달 경로에 검증 계층을 얹어야 하는지.
-     *
-     * @details 재귀 경로는 재귀 리졸버 자신이 검증하므로 이 계층이 필요 없다. 분할 방식은 전달로
-     *          가는 이름이 있으므로 얹는다.
-     * @return 얹어야 하면 참.
-     */
-    pub fn forward_validation_active(&self) -> bool {
-        self.dnssec && self.backend != BackendKind::Recurse
     }
 
     /**
@@ -2307,6 +2311,21 @@ impl Config {
         if self.cachedb_redis_port == 0 {
             return Err(ConfigError::Invalid(
                 "cachedb_redis_port must be between 1 and 65535".into(),
+            ));
+        }
+        if self.cachedb_redis_host.is_some() && self.cachedb_redis_secret.len() < 32 {
+            return Err(ConfigError::Invalid(
+                "With a shared Redis cache, set `cachedb_redis_secret` to at least 32 bytes".into(),
+            ));
+        }
+        if self.cachedb_redis_username.is_some() && self.cachedb_redis_password.is_none() {
+            return Err(ConfigError::Invalid(
+                "Set `cachedb_redis_password` together with `cachedb_redis_username`".into(),
+            ));
+        }
+        if self.cachedb_redis_tls_ca.is_some() && !self.cachedb_redis_tls {
+            return Err(ConfigError::Invalid(
+                "Set `cachedb_redis_tls = true` to use `cachedb_redis_tls_ca`".into(),
             ));
         }
         for (index, rewrite) in self.rewrites.iter().enumerate() {
@@ -3139,6 +3158,20 @@ impl Config {
             "cachedb_redis_expire_secs",
             self.cachedb_redis_expire_secs.to_string(),
         );
+        kv(
+            "cachedb_redis_secret_set",
+            (!self.cachedb_redis_secret.is_empty()).to_string(),
+        );
+        kv(
+            "cachedb_redis_username",
+            opt_s(&self.cachedb_redis_username),
+        );
+        kv(
+            "cachedb_redis_password_set",
+            self.cachedb_redis_password.is_some().to_string(),
+        );
+        kv("cachedb_redis_tls", self.cachedb_redis_tls.to_string());
+        kv("cachedb_redis_tls_ca", opt_p(&self.cachedb_redis_tls_ca));
         kv("cluster_peers", sarr(&self.cluster_peers));
         kv("cluster_raft", self.cluster_raft.to_string());
         kv("cluster_node_id", self.cluster_node_id.to_string());
@@ -3653,6 +3686,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "block_aaaa",
         "bogus_priv",
         "cache_enabled",
+        "cachedb_redis_tls",
         "cluster_raft",
         "deny_any",
         "dhcp6_enable",
@@ -3720,6 +3754,10 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "block_ipv4",
         "block_ipv6",
         "cachedb_redis_host",
+        "cachedb_redis_password",
+        "cachedb_redis_secret",
+        "cachedb_redis_tls_ca",
+        "cachedb_redis_username",
         "catalog_serve",
         "cluster_raft_listen",
         "cluster_raft_secret",
@@ -5684,6 +5722,11 @@ const KNOWN_KEYS: &[&str] = &[
     "cachedb_redis_host",
     "cachedb_redis_port",
     "cachedb_redis_expire_secs",
+    "cachedb_redis_secret",
+    "cachedb_redis_username",
+    "cachedb_redis_password",
+    "cachedb_redis_tls",
+    "cachedb_redis_tls_ca",
     "cluster_peers",
     "cluster_raft",
     "cluster_node_id",
@@ -6160,6 +6203,13 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
         "cachedb_redis_expire_secs",
         d.cachedb_redis_expire_secs,
     );
+    c.cachedb_redis_secret = gstr(root, "cachedb_redis_secret")
+        .unwrap_or_default()
+        .into();
+    c.cachedb_redis_username = gstr(root, "cachedb_redis_username");
+    c.cachedb_redis_password = gstr(root, "cachedb_redis_password").map(SecretString::from);
+    c.cachedb_redis_tls = gbool(root, "cachedb_redis_tls", d.cachedb_redis_tls);
+    c.cachedb_redis_tls_ca = gstr(root, "cachedb_redis_tls_ca").map(PathBuf::from);
     c.cluster_raft = gbool(root, "cluster_raft", d.cluster_raft);
     c.cluster_node_id = gi64(root, "cluster_node_id")
         .map(|i| i.max(0) as u64)
@@ -6769,6 +6819,57 @@ answer = \"target.example\"
 
     #[test]
     /**
+     * @brief 공유 캐시 설정이 함께 있어야 할 값을 요구하고, 비밀 키와 비밀번호를 가리는지.
+     * @details 비밀 키가 없으면 Redis에 쓸 수 있는 누구나 이 서버가 내보낼 답을 만들어 넣을 수 있다.
+     */
+    fn shared_cache_requires_secret_and_masks_credentials() {
+        let base = Config {
+            cachedb_redis_host: Some("127.0.0.1".into()),
+            cachedb_redis_secret: "s".repeat(32).into(),
+            ..Config::default()
+        };
+        assert!(base.validate().is_ok());
+
+        let mut short_secret = base.clone();
+        short_secret.cachedb_redis_secret = "s".repeat(31).into();
+        assert!(short_secret.validate().is_err());
+
+        let mut without_cache = short_secret.clone();
+        without_cache.cachedb_redis_host = None;
+        assert!(without_cache.validate().is_ok(), "공유 캐시를 쓸 때만 요구");
+
+        let mut username_only = base.clone();
+        username_only.cachedb_redis_username = Some("dns".into());
+        assert!(username_only.validate().is_err());
+
+        let mut ca_without_tls = base.clone();
+        ca_without_tls.cachedb_redis_tls_ca = Some("redis-ca.pem".into());
+        assert!(ca_without_tls.validate().is_err());
+
+        let toml = concat!(
+            "cachedb_redis_host = \"127.0.0.1\"\n",
+            "cachedb_redis_secret = \"shared-cache-secret-0123456789abcdef\"\n",
+            "cachedb_redis_username = \"dns\"\n",
+            "cachedb_redis_password = \"redis-password-secret\"\n",
+            "cachedb_redis_tls = true\n",
+            "cachedb_redis_tls_ca = \"redis-ca.pem\"\n",
+        );
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.cachedb_redis_username.as_deref(), Some("dns"));
+        assert!(cfg.cachedb_redis_tls);
+        assert_eq!(
+            cfg.cachedb_redis_tls_ca.as_deref(),
+            Some(std::path::Path::new("redis-ca.pem"))
+        );
+        let json = cfg.effective_json();
+        assert!(!json.contains("shared-cache-secret"), "비밀 키 마스킹");
+        assert!(!json.contains("redis-password-secret"), "비밀번호 마스킹");
+        assert!(json.contains("\"cachedb_redis_secret_set\":true"));
+        assert!(json.contains("\"cachedb_redis_password_set\":true"));
+    }
+
+    #[test]
+    /**
      * @brief 관리 화면 리버스 프록시 설정을 검증하는지.
      * @details 두 키는 함께 있어야 하고, 프록시는 로컬 주소, 출처는 경로 없는 HTTPS여야 한다.
      *          출처는 브라우저가 Origin에 싣는 형태로 정규화된다.
@@ -7371,9 +7472,8 @@ rate_limit_burst = 0
     #[test]
     /**
      * @brief 켰다고 말하는 곳과 실제로 검증하는 곳이 어긋나지 않는지.
-     * @details 한때 전달 방식에는 검증기가 없는데 켰다고 알렸다. 운영자는 검증되지 않는
-     *          답을 검증됐다고 믿었다. 지금은 전달 경로도 이 서버가 검증하므로 세 방식 모두
-     *          켜졌다고 말하고, 검증 계층은 재귀가 아닌 방식에만 얹는다.
+     * @details 전달 경로도 이 서버가 검증하므로 세 방식 모두 켜졌다고 말한다. 어느 체인에 검증
+     *          계층을 얹는지는 resolver_chain 의 테스트가 확인한다.
      */
     fn dnssec_is_not_claimed_active_where_nothing_validates() {
         let forwarding = Config {
@@ -7387,36 +7487,11 @@ rate_limit_burst = 0
             "전달 경로도 이 서버가 검증합니다"
         );
         assert!(
-            forwarding.forward_validation_active(),
-            "전달 방식에는 검증 계층이 얹혀야 합니다"
-        );
-        assert!(
             !forwarding
                 .advisories()
                 .iter()
                 .any(|line| line.contains("전달 처리 방식에서는 서명을 검증하지 않습니다")),
             "검증하는데 검증하지 않는다고 알렸습니다"
-        );
-
-        let recursing = Config {
-            dnssec: true,
-            backend: BackendKind::Recurse,
-            ..Config::default()
-        };
-        assert!(
-            !recursing.forward_validation_active(),
-            "재귀 리졸버가 스스로 검증하므로 계층을 겹쳐 얹지 않습니다"
-        );
-
-        let disabled = Config {
-            dnssec: false,
-            backend: BackendKind::Forward,
-            upstreams: vec!["1.1.1.1".parse().unwrap()],
-            ..Config::default()
-        };
-        assert!(
-            !disabled.forward_validation_active(),
-            "끄면 계층을 얹지 않습니다"
         );
 
         for backend in [BackendKind::Recurse, BackendKind::Split] {

@@ -11,10 +11,11 @@
  */
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use onetdns_core::tcp::DeadlineTcp;
 use onetdns_tls::{client_handshake, ClientConfig, TlsError, TrustStore};
 
 /** @brief 받아들일 응답 크기 상한. */
@@ -35,50 +36,6 @@ const MAX_HEADER_LINE: usize = 8 * 1024;
  */
 pub type HostResolver =
     Arc<dyn Fn(&str, Duration) -> Result<Vec<IpAddr>, String> + Send + Sync + 'static>;
-
-/** @brief 요청 하나 전체에 데드라인이 걸린 TCP. */
-struct DeadlineTcp {
-    /** @brief 이어진 연결. */
-    stream: TcpStream,
-    /** @brief 요청 하나 전체의 데드라인. */
-    deadline: Instant,
-}
-
-impl DeadlineTcp {
-    /**
-     * @brief 데드라인까지 남은 시간.
-     * @note 데드라인은 요청 전체에 대한 것이다. 읽을 때마다 다시 잡으면 한 바이트씩 흘려
-     *       보내는 상대가 연결을 영원히 붙든다.
-     */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
-    }
-}
-
-impl Read for DeadlineTcp {
-    /** @brief 남은 시간을 걸고 읽는다. */
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for DeadlineTcp {
-    /** @brief 남은 시간을 걸고 쓴다. */
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    /** @brief 비운다. */
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.flush()
-    }
-}
 
 #[derive(Debug)]
 /** @brief 요청이 실패한 까닭. */
@@ -447,29 +404,11 @@ fn connect(
     }
     let mut last = None;
     for addr in addrs {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        if remaining.is_zero() {
+        if onetdns_core::tcp::time_left(deadline).is_err() {
             break;
         }
-        match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(s) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                if let Err(error) = s
-                    .set_read_timeout(Some(remaining))
-                    .and_then(|()| s.set_write_timeout(Some(remaining)))
-                {
-                    onetdns_core::warn!(event = "http.deadline_not_applied", host = %host, addr = %addr, %error, "Could not set a timeout on the connection; an unresponsive peer can hold it for a long time");
-                }
-                return Ok(DeadlineTcp {
-                    stream: s,
-                    deadline,
-                });
-            }
+        match DeadlineTcp::connect(addr, deadline) {
+            Ok(tcp) => return Ok(tcp),
             Err(e) => last = Some(e),
         }
     }

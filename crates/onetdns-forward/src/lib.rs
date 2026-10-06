@@ -386,73 +386,22 @@ pub fn outgoing_bind(upstream: SocketAddr) -> SocketAddr {
     pick_bind(upstream, v4, v6)
 }
 
-/** @brief 절대 데드라인을 유지하는 TCP. */
-pub(crate) struct DeadlineTcp {
-    /** @brief 이어진 연결. */
-    stream: TcpStream,
-    /** @brief 요청 하나 전체의 데드라인. */
+pub(crate) use onetdns_core::tcp::DeadlineTcp;
+
+/**
+ * @brief 업스트림으로 나갈 주소에 묶어 데드라인 안에 TCP 연결을 맺는다.
+ * @note 이 크레이트의 TCP 연결은 이것으로 맺는다. DeadlineTcp::connect 는 나갈 주소를 고르지
+ *       않아 query_source 설정을 지키지 못한다.
+ */
+pub(crate) fn connect_upstream(
+    addr: SocketAddr,
     deadline: Instant,
-}
-
-impl DeadlineTcp {
-    /**
-     * @brief 데드라인 시각까지 안에 TCP 연결을 맺는다.
-     * @details 소켓 타임아웃이 아니라 절대 데드라인을 유지한다. 읽기·쓰기마다 남은 시간을
-     *          다시 계산하므로, 조금씩 데이터를 보내는 상대가 총 예산을 넘기지 못한다.
-     */
-    fn connect(addr: SocketAddr, deadline: Instant) -> std::io::Result<Self> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "Response timed out",
-            ));
-        }
-        Ok(Self {
-            stream: bound_tcp::connect(outgoing_bind(addr), addr, remaining)?,
-            deadline,
-        })
-    }
-
-    /** @brief 데드라인을 다시 잡는다. 살아 있음이 확인된 뒤 예산을 늘릴 때 쓴다. */
-    fn set_deadline(&mut self, deadline: Instant) {
-        self.deadline = deadline;
-    }
-
-    /** @brief 데드라인까지 남은 시간. 이미 지났으면 타임아웃 오류다. */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "Response timed out",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-}
-
-impl Read for DeadlineTcp {
-    /** @brief 남은 시간을 걸고 읽는다. */
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for DeadlineTcp {
-    /** @brief 남은 시간을 걸고 쓴다. */
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    /** @brief 남은 시간을 걸고 비운다. */
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.flush()
-    }
+) -> std::io::Result<DeadlineTcp> {
+    let left = onetdns_core::tcp::time_left(deadline)?;
+    Ok(DeadlineTcp::new(
+        bound_tcp::connect(outgoing_bind(addr), addr, left)?,
+        deadline,
+    ))
 }
 
 /** @brief 업스트림 여러 개를 어떻게 고를지. */
@@ -3223,33 +3172,6 @@ mod tests {
             Duration::from_millis(120),
         );
         assert!(matches!(result, Err(ForwardError::Timeout)));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        server.join().unwrap();
-    }
-
-    #[test]
-    /** @brief 읽을 때마다 데드라인이 되살아나지 않는지. */
-    fn deadline_tcp_slow_drip_cannot_reset_socket_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for byte in 0..10 {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let started = Instant::now();
-        let mut stream = DeadlineTcp::connect(addr, started + Duration::from_millis(120)).unwrap();
-        let mut bytes = [0u8; 10];
-        let error = stream.read_exact(&mut bytes).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            ErrorKind::WouldBlock | ErrorKind::TimedOut
-        ));
         assert!(started.elapsed() < Duration::from_millis(500));
         server.join().unwrap();
     }

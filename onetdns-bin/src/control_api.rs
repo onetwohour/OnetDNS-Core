@@ -12,9 +12,9 @@ use crate::cluster::{
     standalone_cluster_status_json, validate_raft_patch_scope, with_raft_identity,
 };
 use crate::config_apply::{
-    apply_config_edit_smart, config_changed_keys, config_status_json, config_write_lock,
-    desired_config_json, has_client_upstream_routes, is_hot_reload_config_change,
-    update_runtime_config, HotConfigApply, CONDITIONAL_HOT_RELOAD_CONFIG_KEYS,
+    apply_config_edit_smart, conditional_hot_reload_keys, config_changed_keys, config_status_json,
+    config_write_lock, desired_config_json, normalize_config_for_comparison, service_restart_keys,
+    update_runtime_config, HotConfigApply,
 };
 use crate::config_edit::{
     append_user_block, client_block_from_json, json_to_toml_literal, materialize_mode_acl_patch,
@@ -86,6 +86,104 @@ pub(crate) struct ControlDeps {
     pub(crate) jobs: Arc<JobRegistry>,
     /** @brief 이 세대가 끝날 때 기다릴 스레드. */
     pub(crate) service_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+/** @brief 지금 설정 파일의 원문. 파일 없이 돌면 시작할 때 읽은 원문이다. */
+fn current_config_text(
+    path: Option<&std::path::Path>,
+    startup: &onetdns_core::SecretString,
+) -> Result<onetdns_core::SecretString, String> {
+    match path {
+        Some(p) => Config::read_text(p)
+            .map(onetdns_core::SecretString::from)
+            .map_err(|e| {
+                format!(
+                    "Could not read the current configuration file ({}): {e}",
+                    p.display()
+                )
+            }),
+        None => Ok(startup.clone()),
+    }
+}
+
+/**
+ * @brief /v1/config/set 본문을 바꿀 항목 목록으로 읽는다.
+ * @details 적용과 미리보기가 이 함수 하나로 읽어야 미리보기가 적용과 같은 항목을 판정한다.
+ */
+fn config_patch(body: &str) -> Result<Vec<(String, onetdns_core::json::Json)>, String> {
+    let onetdns_core::json::Json::Obj(mut pairs) = onetdns_core::json::parse(body)
+        .map_err(|_| "Could not parse the JSON request body".to_string())?
+    else {
+        return Err("The request body must be a top-level object of keys and values".to_string());
+    };
+    materialize_mode_acl_patch(&mut pairs)?;
+    validate_config_patch_values(&pairs)?;
+    if pairs.is_empty() {
+        return Err("No settings to change".to_string());
+    }
+    Ok(pairs)
+}
+
+/**
+ * @brief 설정 원문에 항목들을 적는다.
+ * @details null 은 항목을 지우라는 뜻이다. 값을 비우는 것과 달리 기본값으로 돌아가고, 선택 항목은
+ *          꺼진다.
+ */
+fn apply_config_patch(
+    text: &str,
+    pairs: &[(String, onetdns_core::json::Json)],
+) -> Result<String, String> {
+    let mut out = text.to_string();
+    for (key, value) in pairs {
+        out = match value {
+            onetdns_core::json::Json::Null => remove_config_key(&out, key)?,
+            value => rewrite_config_kv(&out, key, &json_to_toml_literal(value)?)?,
+        };
+    }
+    Ok(out)
+}
+
+/**
+ * @brief 설정 원문을 current 에서 proposed 로 바꾸면 무엇이 바뀌고 어떻게 반영되는지 JSON으로.
+ * @details 반영하는 경로와 같은 입력으로 같은 판정을 내야 미리보기가 반영 결과와 맞는다. 반영
+ *          경로는 파일 원문이 그대로면 아무것도 반영하지 않고, 원문이 바뀌면 실행 중 설정과
+ *          비교용으로 맞춘 새 설정 전체를 비교해 service_restart_keys 로 판정한다. 그래서 파일에만
+ *          적혀 있고 아직 반영하지 않은 항목은 원문이 함께 바뀔 때만 이번 변경에 들어간다.
+ */
+fn change_report(active: &Config, current: &str, proposed: &str) -> Result<String, String> {
+    let (added, removed, changed) =
+        onetdns_config::Config::diff_toml(current, proposed).map_err(|e| e.to_string())?;
+    let proposed_cfg = onetdns_config::Config::from_toml_str(proposed)
+        .map_err(|e| format!("Could not parse the settings to change: {e}"))?;
+    let (effective, restart) = if added.is_empty() && removed.is_empty() && changed.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let proposed_cfg = normalize_config_for_comparison(active, &proposed_cfg);
+        let effective = config_changed_keys(active, &proposed_cfg)?;
+        let restart = service_restart_keys(active, &proposed_cfg, &effective);
+        (effective, restart)
+    };
+    let hot: Vec<String> = effective
+        .iter()
+        .filter(|key| !restart.contains(key))
+        .cloned()
+        .collect();
+    let arr = |v: &[String]| {
+        v.iter()
+            .map(|k| onetdns_core::json::escape(k))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Ok(format!(
+        "{{\"added\":[{}],\"removed\":[{}],\"changed\":[{}],\"effective_changed\":[{}],\"hot_reload\":[{}],\"service_restart\":[{}],\"restart_required\":{}}}",
+        arr(&added),
+        arr(&removed),
+        arr(&changed),
+        arr(&effective),
+        arr(&hot),
+        arr(&restart),
+        !restart.is_empty()
+    ))
 }
 
 /** @brief 관리 API 콜백을 만든다. */
@@ -371,17 +469,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let path = config_path.clone();
             let startup = cfg_text.clone().unwrap_or_default();
             Box::new(move |toml| {
-                let current = match path.as_deref() {
-                    Some(p) => {
-                        onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| {
-                            format!(
-                                "Could not read the current configuration file ({}): {e}",
-                                p.display()
-                            )
-                        })?)
-                    }
-                    None => startup.clone(),
-                };
+                let current = current_config_text(path.as_deref(), &startup)?;
                 let merged = merge_config_snippet(&current, toml)?;
                 let cfg =
                     onetdns_config::Config::from_toml_str(&merged).map_err(|e| e.to_string())?;
@@ -394,56 +482,21 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let startup = cfg_text.clone().unwrap_or_default();
             let runtime_cfg = runtime_cfg.clone();
             Box::new(move |proposed: &str| {
-                let current = match path.as_deref() {
-                    Some(p) => {
-                        onetdns_core::SecretString::from(Config::read_text(p).map_err(|e| {
-                            format!(
-                                "Could not read the current configuration file ({}): {e}",
-                                p.display()
-                            )
-                        })?)
-                    }
-                    None => startup.clone(),
-                };
+                let current = current_config_text(path.as_deref(), &startup)?;
                 let proposed = merge_config_snippet(&current, proposed)?;
-                let (added, removed, changed) =
-                    onetdns_config::Config::diff_toml(&current, &proposed)
-                        .map_err(|e| e.to_string())?;
-                let proposed_cfg = onetdns_config::Config::from_toml_str(&proposed)
-                    .map_err(|e| format!("Could not parse the settings to change: {e}"))?;
+                change_report(&runtime_cfg.load(), &current, &proposed)
+            })
+        },
 
-                let active_cfg = runtime_cfg.load();
-                let effective = config_changed_keys(&active_cfg, &proposed_cfg)?;
-                let hot: Vec<String> = effective
-                    .iter()
-                    .filter(|key| {
-                        is_hot_reload_config_change(&active_cfg, &proposed_cfg, key.as_str())
-                    })
-                    .cloned()
-                    .collect();
-                let restart: Vec<String> = effective
-                    .iter()
-                    .filter(|key| {
-                        !is_hot_reload_config_change(&active_cfg, &proposed_cfg, key.as_str())
-                    })
-                    .cloned()
-                    .collect();
-                let arr = |v: &[String]| {
-                    v.iter()
-                        .map(|k| onetdns_core::json::escape(k))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
-                Ok(format!(
-                    "{{\"added\":[{}],\"removed\":[{}],\"changed\":[{}],\"effective_changed\":[{}],\"hot_reload\":[{}],\"service_restart\":[{}],\"restart_required\":{}}}",
-                    arr(&added),
-                    arr(&removed),
-                    arr(&changed),
-                    arr(&effective),
-                    arr(&hot),
-                    arr(&restart),
-                    !restart.is_empty()
-                ))
+        config_set_diff: {
+            let path = config_path.clone();
+            let startup = cfg_text.clone().unwrap_or_default();
+            let runtime_cfg = runtime_cfg.clone();
+            Box::new(move |body: &str| {
+                let pairs = config_patch(body)?;
+                let current = current_config_text(path.as_deref(), &startup)?;
+                let proposed = apply_config_patch(&current, &pairs)?;
+                change_report(&runtime_cfg.load(), &current, &proposed)
             })
         },
 
@@ -476,36 +529,10 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
             let hot_apply = hot_config_apply.clone();
             let applied = applied_config_text.clone();
             Box::new(move |body: &str| {
-                let j = onetdns_core::json::parse(body)
-                    .map_err(|_| "Could not parse the JSON request body".to_string())?;
-                let mut pairs = match &j {
-                    onetdns_core::json::Json::Obj(p) => p.clone(),
-                    _ => {
-                        return Err(
-                            "The request body must be a top-level object of keys and values"
-                                .to_string(),
-                        )
-                    }
-                };
-                materialize_mode_acl_patch(&mut pairs)?;
-                validate_config_patch_values(&pairs)?;
-                if pairs.is_empty() {
-                    return Err("No settings to change".to_string());
-                }
+                let pairs = config_patch(body)?;
                 let result =
                     apply_config_edit_smart(&path, &prev, &applied, &reload, &hot_apply, |text| {
-                        let mut out = text.to_string();
-                        for (k, v) in &pairs {
-                            // null은 "이 항목을 지운다"는 뜻이다. 값을 비우는 것과 달리
-                            // 기본값으로 돌아가고 선택 항목은 꺼진다.
-                            if matches!(v, onetdns_core::json::Json::Null) {
-                                out = remove_config_key(&out, k)?;
-                                continue;
-                            }
-                            let lit = json_to_toml_literal(v)?;
-                            out = rewrite_config_kv(&out, k, &lit)?;
-                        }
-                        Ok(out)
+                        apply_config_patch(text, &pairs)
                     })?;
                 let keys: Vec<String> = pairs
                     .iter()
@@ -533,28 +560,14 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                 let keys = onetdns_config::known_keys();
                 let list: Vec<String> =
                     keys.iter().map(|k| onetdns_core::json::escape(k)).collect();
-                // 교체 판정과 같은 곳에서 낸다. 목록을 따로 들면 화면이 실제로는
-                // 무중단인 항목에 "다시 시작"이라고 적는다. 조건부 항목은 지금 설정에서
-                // 실제로 재시작하는 것만 조건부로 남긴다.
-                let now = runtime_cfg.load();
-                let routes = has_client_upstream_routes(&now);
-                let conditional_keys: Vec<&str> = CONDITIONAL_HOT_RELOAD_CONFIG_KEYS
-                    .iter()
-                    .copied()
-                    .chain([
-                        "query_timeout_secs",
-                        "upstream_strategy",
-                        "upstream_concurrency",
-                    ])
-                    .filter(|key| match *key {
-                        "query_timeout_secs" => routes || now.backend != BackendKind::Forward,
-                        "upstream_strategy" | "upstream_concurrency" => routes,
-                        _ => true,
-                    })
-                    .collect();
+                /*
+                 * 재시작 여부는 적용할 때와 같은 규칙에서 낸다. 따로 정하면 화면이 실제로
+                 * 재시작하는 항목을 무중단이라고 적는다.
+                 */
+                let conditional_keys = conditional_hot_reload_keys(&runtime_cfg.load());
                 let hot: Vec<String> = keys
                     .iter()
-                    .map(|key| -> &str { key })
+                    .copied()
                     .filter(|key| config_keys::is_hot(key) && !conditional_keys.contains(key))
                     .map(onetdns_core::json::escape)
                     .collect();
@@ -563,7 +576,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
                     .map(|key| onetdns_core::json::escape(key))
                     .collect();
                 format!(
-                "{{\"count\":{},\"keys\":[{}],\"hot_reload_keys\":[{}],\"conditional_hot_reload_keys\":[{}],\"fields\":{},\"note\":\"Upstream DNS server addresses can be changed while running. Response timeout, selection method, and concurrency apply immediately only when no client has dedicated upstream DNS servers and the handlers do not need to be rebuilt.\"}}",
+                "{{\"count\":{},\"keys\":[{}],\"hot_reload_keys\":[{}],\"conditional_hot_reload_keys\":[{}],\"fields\":{},\"note\":\"Settings in hot_reload_keys apply without restarting the DNS service. Settings in conditional_hot_reload_keys can restart it under the current configuration; for example, while a client has dedicated upstream DNS servers, a change that rebuilds the resolver chain restarts the service. /v1/config/diff and /v1/config/set/diff report what a specific change does.\"}}",
                 keys.len(),
                 list.join(","),
                 hot.join(","),

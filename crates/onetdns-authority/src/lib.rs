@@ -18,10 +18,8 @@ use std::cmp::Ordering;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use onetdns_proto::{DnsClass, Message, Name, ProtoError, RData, Record, RecordType, Soa, Writer};
 
@@ -124,61 +122,7 @@ fn loopback_socket_addr(host: &str, port: u16, backend: &str) -> Result<SocketAd
     Ok(SocketAddr::new(ip, port))
 }
 
-/**
- * @brief 절대 데드라인이 걸린 TCP.
- * @details 읽기마다 남은 시간을 다시 계산해 타임아웃으로 건다. 매 읽기에 고정 시간을
- *          주면 한 바이트씩 흘려 보내는 상대가 데드라인을 무한정 늘릴 수 있다.
- */
-pub(crate) struct DeadlineTcp {
-    /** @brief 실제 소켓. */
-    stream: TcpStream,
-    /** @brief 이 시각까지만 기다린다. */
-    deadline: Instant,
-}
-
-impl DeadlineTcp {
-    /** @brief 남은 시간만큼만 기다려 접속한다. */
-    pub(crate) fn connect(addr: SocketAddr, deadline: Instant) -> std::io::Result<Self> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or(std::io::ErrorKind::TimedOut)?;
-        Ok(Self {
-            stream: TcpStream::connect_timeout(&addr, remaining)?,
-            deadline,
-        })
-    }
-
-    /** @brief 데드라인까지 남은 시간. 이미 지났으면 타임아웃 오류다. */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
-    }
-}
-
-impl Read for DeadlineTcp {
-    /** @brief 남은 시간을 타임아웃으로 걸고 읽는다. */
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for DeadlineTcp {
-    /** @brief 남은 시간을 타임아웃으로 걸고 쓴다. */
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    /** @brief 남은 시간을 타임아웃으로 걸고 비운다. */
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.flush()
-    }
-}
+pub(crate) use onetdns_core::tcp::DeadlineTcp;
 
 /**
  * @brief zone 하나. 로드 후에는 바뀌지 않는다.
@@ -2841,7 +2785,8 @@ fn synthesize_owner(mut resp: Response, qname: &Name, wildcard_source: &Name) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
 
     #[test]
     /**
@@ -3258,33 +3203,6 @@ mod tests {
         assert_eq!(labels[0], b"*");
         assert_eq!(labels[1], [0xff]);
         assert_eq!(labels[2], b"test");
-    }
-
-    /** @brief 한 바이트씩 흘려 보내는 상대가 데드라인을 늘리지 못하는지. */
-    #[test]
-    fn sql_deadline_tcp_rejects_slow_drip_packet() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for byte in 0..10 {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let started = Instant::now();
-        let mut stream = DeadlineTcp::connect(addr, started + Duration::from_millis(120)).unwrap();
-        let mut packet = [0u8; 10];
-        let error = stream.read_exact(&mut packet).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        server.join().unwrap();
     }
 
     /** @brief 테스트용 영역 글. */

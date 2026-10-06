@@ -21,7 +21,7 @@ use crate::{config_keys, resolver_chain, runtime_preflight, ConfigTextSlot};
 pub(crate) const LOCAL_ONLY_CONFIG_KEYS: &[&str] = &["domain_needed", "bogus_priv", "empty_zones"];
 
 /** @brief 무엇이 바뀌었느냐에 따라 재시작 여부가 갈리는 설정들. */
-pub(crate) const CONDITIONAL_HOT_RELOAD_CONFIG_KEYS: &[&str] = &["clients"];
+const CONDITIONAL_HOT_RELOAD_CONFIG_KEYS: &[&str] = &["clients"];
 
 /** @brief 직접 바뀐 설정과 그 설정이 다시 만들어야 하는 파생 그룹을 모은다. */
 pub(crate) fn hot_reload_groups(
@@ -29,17 +29,25 @@ pub(crate) fn hot_reload_groups(
     next: &Config,
     changed: &[String],
 ) -> Vec<ApplyGroup> {
-    let mut groups = changed
-        .iter()
-        .filter_map(|key| config_keys::hot_group(key))
-        .collect::<Vec<_>>();
+    let mut groups = key_groups(previous, next, changed);
     /*
      * 체인은 계획만 읽으므로, 어느 키가 바뀌었든 계획이 달라지면 체인을 다시 만든다.
      * 질의 제한 시간처럼 전달 그룹에 속한 키도 스텁 영역과 예비 업스트림의 전달기에 쓰인다.
      */
     if resolver_chain::ChainPlan::new(previous) != resolver_chain::ChainPlan::new(next) {
         groups.push(ApplyGroup::Chain);
+        groups.sort_unstable();
+        groups.dedup();
     }
+    groups
+}
+
+/** @brief 바뀐 키가 키 표와 파생 규칙으로 끌어오는 그룹. 체인 계획은 비교하지 않는다. */
+fn key_groups(previous: &Config, next: &Config, changed: &[String]) -> Vec<ApplyGroup> {
+    let mut groups = changed
+        .iter()
+        .filter_map(|key| config_keys::hot_group(key))
+        .collect::<Vec<_>>();
     /* DHCP 임대 풀은 서비스를 다시 띄우면 새로 만들어지므로, DHCP DNS 계층도 새 풀을 봐야 한다. */
     if groups.contains(&ApplyGroup::EdgeServices) {
         groups.push(ApplyGroup::Chain);
@@ -48,8 +56,10 @@ pub(crate) fn hot_reload_groups(
     if changed.iter().any(|key| key == "dhcp_local_domain") {
         groups.push(ApplyGroup::EdgeServices);
     }
-    // 클러스터 활성 상태나 공용 비밀이 바뀌면 DNS Cookie의 공유 루트도 같은 설정 세대에서
-    // 다시 만들어야 한다. native 그룹은 ArcSwap 한 번으로 기존/새 정책 중 하나만 보인다.
+    /*
+     * 클러스터 활성 상태나 공용 비밀이 바뀌면 DNS Cookie의 공유 루트도 같은 설정 세대에서
+     * 다시 만들어야 한다. native 그룹은 ArcSwap 한 번으로 기존/새 정책 중 하나만 보인다.
+     */
     if changed.iter().any(|key| key == "cluster_raft")
         || ((previous.cluster_raft || next.cluster_raft)
             && changed.iter().any(|key| key == "cluster_raft_secret"))
@@ -99,15 +109,19 @@ fn clients_require_service_restart(current: &Config, proposed: &Config) -> bool 
 }
 
 /** @brief 클라이언트별 업스트림 경로가 있는지. */
-pub(crate) fn has_client_upstream_routes(config: &Config) -> bool {
+fn has_client_upstream_routes(config: &Config) -> bool {
     config
         .clients
         .iter()
         .any(|client| !client.upstreams.is_empty())
 }
 
-/** @brief 이 변화를 재시작하지 않고 반영할 수 있는지. */
-pub(crate) fn is_hot_reload_config_change(current: &Config, proposed: &Config, key: &str) -> bool {
+/**
+ * @brief 이 키 하나의 변화를 재시작하지 않고 반영할 수 있는지.
+ * @details 함께 바뀐 다른 키는 보지 않는다. 체인을 다시 만드는 변경과 클라이언트 경로가 함께
+ *          있는지는 service_restart_keys 가 본다.
+ */
+fn is_hot_reload_config_change(current: &Config, proposed: &Config, key: &str) -> bool {
     if !config_keys::is_hot(key) {
         return false;
     }
@@ -127,6 +141,77 @@ pub(crate) fn is_hot_reload_config_change(current: &Config, proposed: &Config, k
         }
         _ => true,
     }
+}
+
+/**
+ * @brief 이 설정에서 이 키를 바꾸면 해석 체인을 다시 만드는지.
+ * @param plan_inputs 계획이 값을 읽는 다른 그룹의 키들. ChainPlan::other_group_inputs 가 낸다.
+ */
+fn rebuilds_chain(cfg: &Config, key: &str, plan_inputs: &[&str]) -> bool {
+    plan_inputs.contains(&key)
+        || key_groups(cfg, cfg, &[key.to_string()]).contains(&ApplyGroup::Chain)
+}
+
+/**
+ * @brief 바뀐 키 가운데 서비스를 다시 시작해야 반영되는 키들. 비어 있으면 모두 교체한다.
+ * @details 교체 적용과 변경 미리보기가 이 판정 하나를 쓴다. 미리보기가 따로 판정하면 실제로는
+ *          재시작하는 변경을 무중단이라고 알린다.
+ *
+ *          클라이언트별 업스트림 경로가 있으면 체인을 다시 만드는 변경은 재시작한다. 경로마다
+ *          공통 계층을 감싼 체인은 세대를 시작할 때 한 번만 만들고 교체하지 않으므로, 기본
+ *          체인만 다시 만들면 그 경로의 클라이언트는 이전 캐시 크기나 검증 설정으로 답을 받는다.
+ *          체인을 다시 만들게 한 키를 가려내지 못해도 재시작은 해야 하므로, 그때는 바뀐 키를
+ *          모두 든다.
+ */
+pub(crate) fn service_restart_keys(
+    current: &Config,
+    proposed: &Config,
+    changed: &[String],
+) -> Vec<String> {
+    let mut restart: Vec<String> = changed
+        .iter()
+        .filter(|key| !is_hot_reload_config_change(current, proposed, key))
+        .cloned()
+        .collect();
+    let routes = has_client_upstream_routes(current) || has_client_upstream_routes(proposed);
+    if routes && hot_reload_groups(current, proposed, changed).contains(&ApplyGroup::Chain) {
+        let mut inputs = resolver_chain::ChainPlan::new(current).other_group_inputs();
+        inputs.extend(resolver_chain::ChainPlan::new(proposed).other_group_inputs());
+        let rebuilding: Vec<String> = changed
+            .iter()
+            .filter(|key| rebuilds_chain(current, key, &inputs))
+            .cloned()
+            .collect();
+        restart.extend(if rebuilding.is_empty() {
+            changed.to_vec()
+        } else {
+            rebuilding
+        });
+        restart.sort();
+        restart.dedup();
+    }
+    restart
+}
+
+/**
+ * @brief 표에서는 교체할 수 있는 키지만 지금 설정에서는 바꾸면 재시작할 수 있는 키들.
+ * @details 관리 화면이 적용하기 전에 재시작을 알리는 데 쓴다. service_restart_keys 와 같은
+ *          규칙에서 내므로, 지금 설정에서 키 하나만 바꿀 때 그 판정이 재시작할 수 있는 키는
+ *          모두 여기에 든다. clients 처럼 무엇이 바뀌었느냐에 따라 갈리는 키는 늘 든다.
+ */
+pub(crate) fn conditional_hot_reload_keys(now: &Config) -> Vec<&'static str> {
+    let routes = has_client_upstream_routes(now);
+    let inputs = resolver_chain::ChainPlan::new(now).other_group_inputs();
+    onetdns_config::known_keys()
+        .iter()
+        .copied()
+        .filter(|key| config_keys::is_hot(key))
+        .filter(|key| {
+            CONDITIONAL_HOT_RELOAD_CONFIG_KEYS.contains(key)
+                || !is_hot_reload_config_change(now, now, key)
+                || (routes && rebuilds_chain(now, key, &inputs))
+        })
+        .collect()
 }
 
 /** @brief 기본 체인을 다시 만드는 핸들과 그 체인이 들어 있는 슬롯. */
@@ -432,6 +517,10 @@ fn config_fingerprint(config: &Config) -> [u8; 32] {
     if let Some(value) = &config.zones_mysql {
         secret("zones_mysql", value.as_str());
     }
+    secret("cachedb_redis_secret", config.cachedb_redis_secret.as_str());
+    if let Some(value) = &config.cachedb_redis_password {
+        secret("cachedb_redis_password", value.as_str());
+    }
     for key in &config.tsig_keys {
         secret("tsig_secret", key.secret.as_str());
     }
@@ -550,6 +639,12 @@ pub(crate) fn config_changed_keys(
             ("zones_mysql", |probe, live| {
                 probe.zones_mysql = live.zones_mysql.clone()
             }),
+            ("cachedb_redis_secret", |probe, live| {
+                probe.cachedb_redis_secret = live.cachedb_redis_secret.clone()
+            }),
+            ("cachedb_redis_password", |probe, live| {
+                probe.cachedb_redis_password = live.cachedb_redis_password.clone()
+            }),
             ("cluster_raft_secret", |probe, live| {
                 probe.cluster_raft_secret = live.cluster_raft_secret.clone()
             }),
@@ -575,15 +670,6 @@ pub(crate) fn config_changed_keys(
     Ok(changed)
 }
 
-/** @brief 상태 표시에 쓸 달라진 항목들. */
-fn config_changed_keys_for_status(
-    runtime: &Config,
-    desired: &Config,
-) -> Result<Vec<String>, String> {
-    let normalized = normalize_config_for_comparison(runtime, desired);
-    config_changed_keys(runtime, &normalized)
-}
-
 /** @brief 파일에 적힌 설정을 JSON으로. */
 pub(crate) fn desired_config_json(path: Option<&std::path::Path>, runtime: &Config) -> String {
     let Some(path) = path else {
@@ -607,44 +693,63 @@ pub(crate) fn desired_config_json(path: Option<&std::path::Path>, runtime: &Conf
     }
 }
 
-/** @brief 파일과 지금 적용 중인 설정이 어긋나는지 JSON으로. */
+/**
+ * @brief 파일에 적힌 설정을 반영하면 바뀌는 항목과 그 가운데 서비스를 다시 시작하는 항목.
+ * @details 파일을 반영하는 경로와 같이 비교용으로 맞추고 service_restart_keys 로 판정한다. 그래야
+ *          관리 화면이 반영하기 전에 묻는 내용이 실제 반영 결과와 맞는다.
+ */
+fn config_changed_keys_for_status(
+    runtime: &Config,
+    desired: &Config,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let desired = normalize_config_for_comparison(runtime, desired);
+    let changed = config_changed_keys(runtime, &desired)?;
+    let restart = service_restart_keys(runtime, &desired, &changed);
+    Ok((changed, restart))
+}
+
+/** @brief 설정 파일을 읽어 config_changed_keys_for_status 로 판정한다. */
+fn disk_change(
+    path: &std::path::Path,
+    runtime: &Config,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let text = onetdns_core::SecretString::from(
+        Config::read_text(path).map_err(|error| error.to_string())?,
+    );
+    let desired = Config::from_toml_str(&text).map_err(|error| error.to_string())?;
+    config_changed_keys_for_status(runtime, &desired)
+}
+
+/**
+ * @brief 파일과 지금 적용 중인 설정이 어긋나는지, 그리고 지금 설정에서 바꾸면 재시작할 수 있는 항목을
+ *        JSON으로.
+ * @details 관리 화면은 이 응답을 주기적으로 읽는다. 항목 분류는 클라이언트 경로처럼 지금 설정에 따라
+ *          달라지므로, 화면을 연 뒤에 설정이 바뀌어도 항목 표시가 따라가도록 여기에 함께 싣는다.
+ */
 pub(crate) fn config_status_json(path: Option<&std::path::Path>, runtime: &Config) -> String {
-    let Some(path) = path else {
-        return "{\"in_sync\":true,\"source\":\"runtime\",\"changed_keys\":[]}".to_string();
+    use onetdns_core::json::escape;
+    let list = |keys: &[String]| keys.iter().map(|key| escape(key)).collect::<Vec<_>>();
+    let conditional: Vec<String> = conditional_hot_reload_keys(runtime)
+        .into_iter()
+        .map(escape)
+        .collect();
+    let (source, pending) = match path {
+        None => ("runtime", Ok((Vec::new(), Vec::new()))),
+        Some(path) => ("disk", disk_change(path, runtime)),
     };
-    let text = match Config::read_text(path) {
-        Ok(text) => onetdns_core::SecretString::from(text),
-        Err(error) => {
-            return format!(
-                "{{\"in_sync\":false,\"source\":\"disk\",\"error\":{},\"changed_keys\":[]}}",
-                onetdns_core::json::escape(&error.to_string())
-            );
-        }
-    };
-    let desired = match Config::from_toml_str(&text) {
-        Ok(config) => config,
-        Err(error) => {
-            return format!(
-                "{{\"in_sync\":false,\"source\":\"disk\",\"error\":{},\"changed_keys\":[]}}",
-                onetdns_core::json::escape(&error.to_string())
-            );
-        }
-    };
-    match config_changed_keys_for_status(runtime, &desired) {
-        Ok(changed) => {
-            let keys: Vec<String> = changed
-                .iter()
-                .map(|key| onetdns_core::json::escape(key))
-                .collect();
-            format!(
-                "{{\"in_sync\":{},\"source\":\"disk\",\"changed_keys\":[{}]}}",
-                changed.is_empty(),
-                keys.join(",")
-            )
-        }
+    match pending {
+        Ok((changed, restart)) => format!(
+            "{{\"in_sync\":{},\"source\":\"{source}\",\"changed_keys\":[{}],\"service_restart\":[{}],\"restart_required\":{},\"conditional_hot_reload_keys\":[{}]}}",
+            changed.is_empty(),
+            list(&changed).join(","),
+            list(&restart).join(","),
+            !restart.is_empty(),
+            conditional.join(",")
+        ),
         Err(error) => format!(
-            "{{\"in_sync\":false,\"source\":\"disk\",\"error\":{},\"changed_keys\":[]}}",
-            onetdns_core::json::escape(&error)
+            "{{\"in_sync\":false,\"source\":\"{source}\",\"error\":{},\"changed_keys\":[],\"service_restart\":[],\"restart_required\":false,\"conditional_hot_reload_keys\":[{}]}}",
+            escape(&error),
+            conditional.join(",")
         ),
     }
 }
@@ -925,7 +1030,7 @@ mod tests {
         let mut runtime = desired.clone();
         runtime.control_listen = Some(SocketAddr::from(([127, 0, 0, 1], 8553)));
 
-        let changed = config_changed_keys_for_status(&runtime, &desired).unwrap();
+        let (changed, _) = config_changed_keys_for_status(&runtime, &desired).unwrap();
         assert!(
             changed.is_empty(),
             "runtime-only dashboard default: {changed:?}"
@@ -956,7 +1061,7 @@ mod tests {
         let mut runtime = desired.clone();
         runtime.control_listen = Some(SocketAddr::from(([127, 0, 0, 1], 8553)));
 
-        let changed = config_changed_keys_for_status(&runtime, &desired).unwrap();
+        let (changed, _) = config_changed_keys_for_status(&runtime, &desired).unwrap();
         assert!(
             changed.contains(&"control_listen".to_string()),
             "{changed:?}"
@@ -987,6 +1092,14 @@ mod tests {
         let status = config_status_json(Some(&path), &runtime);
         assert!(status.contains("\"in_sync\":false"), "{status}");
         assert!(status.contains("cache_size"), "{status}");
+        assert!(
+            status.contains("\"service_restart\":[],\"restart_required\":false"),
+            "클라이언트 경로가 없으면 체인 설정은 무중단입니다: {status}"
+        );
+        assert!(
+            status.contains("\"conditional_hot_reload_keys\":[\"clients\"]"),
+            "{status}"
+        );
 
         std::fs::write(&path, "cache_size = [broken").unwrap();
         let status = config_status_json(Some(&path), &runtime);
@@ -1258,6 +1371,180 @@ mod tests {
         )
         .unwrap();
         assert!(!is_hot_reload_config_change(&current, &proposed, "clients"));
+    }
+
+    /** @brief 업스트림을 따로 쓰는 클라이언트 경로 하나. */
+    const CLIENT_ROUTE: &str =
+        "[[clients]]\nname = \"office\"\nids = [\"192.0.2.0/24\"]\nupstreams = [\"9.9.9.9\"]\n";
+
+    /**
+     * @brief 최상위 키 줄에서 key 를 value 로 바꾼 설정 본문.
+     * @param top    최상위 키 줄들.
+     * @param tables 최상위 키 뒤에 오는 표 배열들.
+     */
+    fn with_key(top: &str, key: &str, value: &str, tables: &str) -> String {
+        let prefix = format!("{key} =");
+        let mut text: String = top
+            .lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        text.push_str(&format!("{key} = {value}\n{tables}"));
+        text
+    }
+
+    #[test]
+    /**
+     * @brief 클라이언트 경로가 있으면 체인을 다시 만드는 변경을 재시작으로 판정하는지.
+     * @details 경로의 체인은 세대를 시작할 때만 만들어지므로, 기본 체인만 교체하면 경로의
+     *          클라이언트가 이전 설정으로 답을 받는다. 변경 미리보기도 이 판정을 쓰므로, 여기서
+     *          빠지면 관리 화면이 재시작하는 변경을 무중단이라고 알린다.
+     */
+    fn chain_changes_restart_while_client_routes_exist() {
+        let verdict = |top: &str, key: &str, value: &str, routed: bool| {
+            let tables = if routed { CLIENT_ROUTE } else { "" };
+            let current = Config::from_toml_str(&format!("{top}{tables}")).unwrap();
+            let proposed = Config::from_toml_str(&with_key(top, key, value, tables)).unwrap();
+            let changed = config_changed_keys(&current, &proposed).unwrap();
+            assert_eq!(changed, vec![key.to_string()]);
+            service_restart_keys(&current, &proposed, &changed)
+        };
+        let forward = "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n";
+        let shared = "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\ncachedb_redis_host = \"127.0.0.1\"\ncachedb_redis_secret = \"0123456789abcdef0123456789abcdef\"\n";
+
+        assert_eq!(verdict(forward, "min_ttl", "120", true), ["min_ttl"]);
+        assert!(verdict(forward, "min_ttl", "120", false).is_empty());
+        assert_eq!(
+            verdict(forward, "dhcp_lease_secs", "7200", true),
+            ["dhcp_lease_secs"]
+        );
+        assert_eq!(
+            verdict(shared, "upstreams", "[\"8.8.8.8\"]", true),
+            ["upstreams"]
+        );
+        assert!(verdict(forward, "upstreams", "[\"8.8.8.8\"]", true).is_empty());
+        assert!(verdict(forward, "safe_search", "true", true).is_empty());
+    }
+
+    #[test]
+    /** @brief 관리 화면에 알리는 조건부 키가 지금 설정을 따르는지. */
+    fn conditional_keys_follow_the_current_configuration() {
+        let forward = "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n";
+        let plain = Config::from_toml_str(forward).unwrap();
+        assert_eq!(conditional_hot_reload_keys(&plain), ["clients"]);
+
+        let recurse = Config::from_toml_str("backend = \"recurse\"\n").unwrap();
+        assert!(conditional_hot_reload_keys(&recurse).contains(&"query_timeout_secs"));
+
+        let routed = Config::from_toml_str(&format!("{forward}{CLIENT_ROUTE}")).unwrap();
+        let announced = conditional_hot_reload_keys(&routed);
+        for key in [
+            "clients",
+            "min_ttl",
+            "cache_size",
+            "dnssec",
+            "dhcp_lease_secs",
+            "zones",
+            "query_timeout_secs",
+            "upstream_strategy",
+        ] {
+            assert!(announced.contains(&key), "{key} must be announced");
+        }
+        for key in ["safe_search", "block_rules", "upstreams", "listen"] {
+            assert!(!announced.contains(&key), "{key} must stay hot");
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 클라이언트 경로가 있을 때 체인 계획을 바꾸는 키를 모두 조건부로 알리는지.
+     * @details 키마다 형에 맞는 값을 넣어 보고, 계획이 달라지는데 무중단으로 알리는 키가 있으면
+     *          실패한다. 계획이 다른 그룹의 키를 새로 읽으면서 ChainPlan::other_group_inputs 에
+     *          넣지 않으면 여기서 드러난다. 기반 설정은 그 함수가 보는 구성 요소를 하나씩만
+     *          켠다. 여럿을 함께 켜면 한 구성 요소의 목록이 다른 구성 요소의 빠진 키를 가린다.
+     */
+    fn every_key_that_changes_the_chain_plan_is_announced() {
+        let candidates = |kind: &str, meta: &str| -> Vec<String> {
+            let quoted = |values: &[&str]| values.iter().map(|v| format!("\"{v}\"")).collect();
+            match kind {
+                "bool" => vec!["true".into(), "false".into()],
+                "enum" => quoted(&meta.split('|').collect::<Vec<_>>()),
+                "int" => ["0", "1", "2", "3", "7", "60", "300", "4096"]
+                    .map(String::from)
+                    .to_vec(),
+                "string" => quoted(&[
+                    "",
+                    "x.example",
+                    "192.0.2.7",
+                    "127.0.0.1:5353",
+                    "/x",
+                    "https://x.example/dns-query",
+                ]),
+                "array" => [
+                    "[]",
+                    "[\"192.0.2.7\"]",
+                    "[\"192.0.2.7:5353\"]",
+                    "[\"127.0.0.1:5353\"]",
+                    "[\"192.0.2.0/24\"]",
+                    "[\"x.example\"]",
+                    "[\"https://x.example/dns-query\"]",
+                ]
+                .map(String::from)
+                .to_vec(),
+                _ => Vec::new(),
+            }
+        };
+        let forward = "backend = \"forward\"\nupstreams = [\"192.0.2.1\"]\n";
+        let bases = [
+            (forward.to_string(), ""),
+            (
+                format!("{forward}fallback_upstreams = [\"192.0.2.2\"]\n"),
+                "",
+            ),
+            (
+                forward.to_string(),
+                "[[stub_zones]]\nsuffix = \"corp.test\"\nservers = [\"192.0.2.53\"]\n",
+            ),
+            (
+                format!("{forward}cachedb_redis_host = \"127.0.0.1\"\ncachedb_redis_secret = \"0123456789abcdef0123456789abcdef\"\n"),
+                "",
+            ),
+            (
+                format!("{forward}ddr_name = \"dns.example\"\nlisten_dot = [\"127.0.0.1:8853\"]\nlisten_doh = [\"127.0.0.1:8443\"]\n"),
+                "",
+            ),
+            (forward.to_string(), "[[zones]]\norigin = \"a.test\"\n"),
+            ("backend = \"recurse\"\ndnssec = true\n".to_string(), ""),
+            (
+                "backend = \"split\"\nupstreams = [\"192.0.2.1\"]\n".to_string(),
+                "",
+            ),
+        ];
+        let mut probed = 0;
+        for (top, tables) in bases {
+            let tables = format!("{tables}{CLIENT_ROUTE}");
+            let now = Config::from_toml_str(&format!("{top}{tables}")).unwrap();
+            let plan = resolver_chain::ChainPlan::new(&now);
+            let announced = conditional_hot_reload_keys(&now);
+            for field in onetdns_config::schema::fields() {
+                if !config_keys::is_hot(field.key) || announced.contains(&field.key) {
+                    continue;
+                }
+                for value in candidates(field.kind, field.meta) {
+                    let text = with_key(&top, field.key, &value, &tables);
+                    let Ok(probe) = Config::from_toml_str(&text) else {
+                        continue;
+                    };
+                    probed += 1;
+                    assert!(
+                        resolver_chain::ChainPlan::new(&probe) == plan,
+                        "{} = {value} changes the chain plan, but the dashboard is told it applies without a restart",
+                        field.key
+                    );
+                }
+            }
+        }
+        assert!(probed > 500, "only {probed} probes parsed");
     }
 
     #[test]

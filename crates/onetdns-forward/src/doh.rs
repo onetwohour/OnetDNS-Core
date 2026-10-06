@@ -109,7 +109,7 @@ fn connect(
     session: Option<TlsSession>,
 ) -> Result<DohConn, ForwardError> {
     let started = Instant::now();
-    let mut tcp = DeadlineTcp::connect(addr, deadline).map_err(crate::io_err)?;
+    let mut tcp = crate::connect_upstream(addr, deadline).map_err(crate::io_err)?;
     let rtt_hint = started.elapsed();
     let cfg = ClientConfig {
         server_name: server_name.to_string(),

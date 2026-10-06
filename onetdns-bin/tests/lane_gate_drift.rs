@@ -80,7 +80,7 @@ fn layer_stack_order_is_pinned() {
  */
 fn hot_apply_checks_before_it_changes_anything() {
     let guard = HOT_APPLY_RS
-        .find(".any(|key| !is_hot_reload_config_change(&previous_cfg, next, key))")
+        .find("if !service_restart_keys(&previous_cfg, next, &changed).is_empty() {")
         .expect("교체 가능 여부 검사를 찾지 못했습니다");
     let first_apply = HOT_APPLY_RS
         .find("// hot-apply:begin")

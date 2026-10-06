@@ -7,7 +7,7 @@
  *       평문 경로에 적힌 값은 누구나 지어낼 수 있다.
  */
 
-use std::io::{self, Read, Write};
+use std::io;
 #[cfg(test)]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onetdns_core::tcp::DeadlineTcp;
 use onetdns_proto::Message;
 use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 use onetdns_tls::{server_handshake, ServerConfig, TlsStream};
@@ -40,117 +41,6 @@ pub struct DohListener {
 
 /** @brief 연결 하나의 입출력 데드라인. */
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
-/** @brief 종료 신호를 확인하는 주기. */
-const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
-
-/** @brief 데드라인과 종료 신호가 걸린 TCP. */
-struct DeadlineTcp {
-    /** @brief 이어진 연결. */
-    stream: PrefixedTcp,
-    /** @brief 요청 하나 전체의 데드라인. */
-    deadline: Instant,
-    /** @brief 서버 전체가 끝나고 있다는 표시. */
-    shutdown: Arc<AtomicBool>,
-    /** @brief 이 리스너가 끝나고 있다는 표시. */
-    stop: Arc<AtomicBool>,
-}
-
-impl DeadlineTcp {
-    /** @brief 소켓과 종료 신호로 만든다. */
-    #[cfg(test)]
-    fn new(stream: TcpStream, shutdown: Arc<AtomicBool>, stop: Arc<AtomicBool>) -> Self {
-        Self::from_prefixed(PrefixedTcp::new(stream, Vec::new()), shutdown, stop)
-    }
-
-    /** @brief admission prefix가 붙은 소켓과 종료 신호로 만든다. */
-    fn from_prefixed(
-        stream: PrefixedTcp,
-        shutdown: Arc<AtomicBool>,
-        stop: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            stream,
-            deadline: Instant::now() + DOH_IO_TIMEOUT,
-            shutdown,
-            stop,
-        }
-    }
-
-    /** @brief 데드라인을 다시 잡는다. 요청 하나가 끝날 때마다 부른다. */
-    fn reset_deadline(&mut self) {
-        self.deadline = Instant::now() + DOH_IO_TIMEOUT;
-    }
-
-    /** @brief 데드라인까지 남은 시간. */
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    }
-
-    /** @brief 종료 신호가 섰는지. */
-    fn stopped(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed)
-    }
-}
-
-impl Read for DeadlineTcp {
-    /**
-     * @brief 남은 시간을 걸고 읽는다.
-     * @note 종료 신호를 주기적으로 확인한다. 확인하지 않으면 재시작이 데드라인까지 지연된다.
-     */
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.stopped() {
-                // read_exact은 Interrupted를 무한 재시도한다. 종료는 최종 오류다.
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            self.stream
-                .set_read_timeout(Some(self.remaining()?.min(SHUTDOWN_POLL)))?;
-            match self.stream.read(buffer) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) && !self.stopped()
-                        && Instant::now() < self.deadline => {}
-                result => return result,
-            }
-        }
-    }
-}
-
-impl Write for DeadlineTcp {
-    /** @brief 남은 시간을 걸고 쓴다. */
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        loop {
-            if self.stopped() {
-                // write_all은 Interrupted를 무한 재시도한다. 종료는 최종 오류다.
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            self.stream
-                .set_write_timeout(Some(self.remaining()?.min(SHUTDOWN_POLL)))?;
-            match self.stream.write(buffer) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) && !self.stopped()
-                        && Instant::now() < self.deadline => {}
-                result => return result,
-            }
-        }
-    }
-
-    /** @brief 비운다. */
-    fn flush(&mut self) -> io::Result<()> {
-        if self.stopped() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        self.stream.flush()
-    }
-}
 
 impl DohListener {
     /** @brief 이 리스너가 묶인 주소. */
@@ -414,7 +304,9 @@ fn serve_conn(
     stop: Arc<AtomicBool>,
 ) -> Result<(), &'static str> {
     let src = tcp.peer_addr().map_err(|_| "peer_addr")?;
-    let mut tcp = DeadlineTcp::from_prefixed(tcp, shutdown, stop);
+    let mut tcp = DeadlineTcp::new(tcp, Instant::now() + DOH_IO_TIMEOUT)
+        .stop_on(shutdown)
+        .stop_on(stop);
     let conn = server_handshake(&mut tcp, tls).map_err(|_| "tls_handshake")?;
 
     let alpn = conn.alpn().map(|a| a.to_vec());
@@ -484,13 +376,17 @@ fn serve_conn(
     match alpn.as_deref() {
         Some(b"h2") => {
             onetdns_http2::serve_doh_with_deadline_reset(&mut stream, path, dns, |stream| {
-                stream.inner_mut().reset_deadline()
+                stream
+                    .inner_mut()
+                    .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
             })
             .map_err(|_| "http2_connection")
         }
 
         _ => onetdns_http2::serve_doh_h1_with_deadline_reset(&mut stream, path, dns, |stream| {
-            stream.inner_mut().reset_deadline()
+            stream
+                .inner_mut()
+                .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
         })
         .map_err(|_| "http1_connection"),
     }
@@ -558,40 +454,7 @@ mod tests {
         );
     }
     use std::io::{Read, Write};
-    use std::net::{TcpListener, UdpSocket};
-
-    #[test]
-    /** @brief 한 바이트씩 흘려 보내는 상대가 연결을 붙잡지 못하는지. */
-    fn doh_deadline_rejects_slow_drip_tls_bytes() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for byte in 0..10 {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let started = Instant::now();
-        let stream = TcpStream::connect(address).unwrap();
-        let mut stream = DeadlineTcp::new(
-            stream,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        stream.deadline = started + Duration::from_millis(120);
-        let mut bytes = [0u8; 10];
-        let error = stream.read_exact(&mut bytes).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-        ));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        server.join().unwrap();
-    }
+    use std::net::UdpSocket;
 
     #[test]
     /** @brief 핸드셰이크 중인 연결도 종료 때 정리되는지. */
@@ -611,26 +474,6 @@ mod tests {
         let started = Instant::now();
         drop(listener);
         assert!(started.elapsed() < Duration::from_secs(1));
-        drop(client);
-    }
-
-    #[test]
-    /** @brief 종료 오류가 read_exact/write_all의 무한 재시도 대상으로 보이지 않는지. */
-    fn doh_shutdown_io_is_terminal() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        let stop = Arc::new(AtomicBool::new(true));
-        let mut stream = DeadlineTcp::new(server, Arc::new(AtomicBool::new(false)), stop);
-
-        let read_error = stream.read(&mut [0]).unwrap_err();
-        assert_eq!(read_error.kind(), io::ErrorKind::ConnectionAborted);
-        let write_error = stream.write(&[0]).unwrap_err();
-        assert_eq!(write_error.kind(), io::ErrorKind::ConnectionAborted);
-        assert_eq!(
-            stream.flush().unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted
-        );
         drop(client);
     }
 

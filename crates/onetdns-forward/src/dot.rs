@@ -132,7 +132,7 @@ fn connect(
     trust: &TrustStore,
     session: Option<TlsSession>,
 ) -> Result<DotConn, ForwardError> {
-    let mut tcp = DeadlineTcp::connect(addr, deadline).map_err(crate::io_err)?;
+    let mut tcp = crate::connect_upstream(addr, deadline).map_err(crate::io_err)?;
     let cfg = ClientConfig {
         server_name: server_name.to_string(),
         verify_name: true,

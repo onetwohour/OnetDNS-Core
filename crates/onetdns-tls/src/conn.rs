@@ -351,6 +351,21 @@ impl Default for ClientConfig {
     }
 }
 
+impl ClientConfig {
+    /**
+     * @brief SNI 로 보낼 호스트 이름. 주소로 붙으면 없다.
+     * @details RFC 6066 은 SNI 에 IPv4, IPv6 주소를 넣지 못하게 하고, 이름은 끝 점 없이 쓰게 한다.
+     *          주소로 붙을 때는 확장을 보내지 않고 인증서는 IP SAN 으로 확인한다. 보내지 않았는데
+     *          서버가 server_name 확장으로 답하면 받아들이지 않는다.
+     */
+    pub(crate) fn sni(&self) -> Option<&str> {
+        match crate::x509::peer_host(&self.server_name) {
+            crate::x509::PeerHost::Name(name) if !name.is_empty() => Some(name),
+            _ => None,
+        }
+    }
+}
+
 /** @brief 진단 로그에 쓸 짧은 16진 표기. */
 fn short_hex(bytes: &[u8]) -> String {
     /** @brief 16진 문자표. */
@@ -1522,8 +1537,10 @@ fn build_client_hello(
             RSA_PKCS1_SHA256,
         ]),
         Extension::key_share_client(&key_shares),
-        Extension::server_name(&cfg.server_name),
     ];
+    if let Some(host) = cfg.sni() {
+        extensions.push(Extension::server_name(host));
+    }
     if let Some(c) = cookie {
         extensions.push(Extension::cookie(c));
     }
@@ -1700,7 +1717,7 @@ pub fn client_handshake<S: Read + Write>(
         .iter()
         .all(|extension| match extension.ext_type {
             EXT_ALPN => true,
-            EXT_SERVER_NAME => extension.data.is_empty(),
+            EXT_SERVER_NAME => extension.data.is_empty() && cfg.sni().is_some(),
             EXT_SUPPORTED_GROUPS => extension.as_supported_groups().is_some(),
             _ => false,
         })
@@ -3488,6 +3505,50 @@ mod tests {
         let mut conn = client_handshake(&mut c, &cfg).unwrap();
         conn.write_app(&mut c, b"hello").unwrap();
         assert_eq!(conn.read_app(&mut c).unwrap(), b"hello");
+        server.join().unwrap();
+    }
+
+    #[test]
+    /**
+     * @brief 주소로 붙을 때는 SNI 를 보내지 않고, 이름은 끝 점 없이 보내는지.
+     * @details RFC 6066 은 SNI 에 주소를 넣지 못하게 한다. 이를 엄격하게 지키는 서버는 주소가 든
+     *          SNI 를 받으면 핸드셰이크를 끊는다.
+     */
+    fn client_hello_names_only_host_names() {
+        let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
+        let sni = |server_name: &str| {
+            build_client_hello(&insecure_test_client(server_name), &kx, true, None, None)
+                .ext(EXT_SERVER_NAME)
+                .and_then(Extension::as_server_name)
+        };
+        assert_eq!(sni("192.0.2.1"), None);
+        assert_eq!(sni("2001:db8::1"), None);
+        assert_eq!(sni("[2001:db8::1]"), None);
+        assert_eq!(sni("dns.example"), Some("dns.example".to_string()));
+        assert_eq!(sni("dns.example."), Some("dns.example".to_string()));
+    }
+
+    #[test]
+    /** @brief 주소로 붙어 SNI 없이 시작한 핸드셰이크가 끝나는지. */
+    fn handshake_by_address_completes_without_sni() {
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let server_cfg = ServerConfig::from_pkcs8(
+            ck.cert.der().as_ref().to_vec(),
+            &ck.key_pair.serialize_der(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut conn = server_handshake(&mut s, &server_cfg).unwrap();
+            let req = conn.read_app(&mut s).unwrap();
+            conn.write_app(&mut s, &req).unwrap();
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let mut conn = client_handshake(&mut c, &insecure_test_client("127.0.0.1")).unwrap();
+        conn.write_app(&mut c, b"by address").unwrap();
+        assert_eq!(conn.read_app(&mut c).unwrap(), b"by address");
         server.join().unwrap();
     }
 

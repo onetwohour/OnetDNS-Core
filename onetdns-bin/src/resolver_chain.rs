@@ -31,7 +31,12 @@ use crate::recursion::{
 pub(crate) struct ChainPlan {
     base: BasePlan,
     fallback: Option<ForwarderPlan>,
-    forward_validation: Option<ValidationPlan>,
+    /**
+     * @brief 업스트림이 전달한 답을 검증할 때의 방침.
+     * @details dnssec 을 켜면 처리 방식과 상관없이 담는다. 클라이언트 경로는 재귀 방식에서도
+     *          업스트림에 전달하기 때문이다. 어느 체인에 검증 계층을 얹을지는 ChainBase 가 정한다.
+     */
+    validation: Option<ValidationPlan>,
     cachedb: Option<CacheDbPlan>,
     ecs_mode: EcsMode,
     ecs_custom_ip: Option<IpAddr>,
@@ -63,12 +68,6 @@ pub(crate) struct ChainPlan {
     acme_challenge: bool,
     ddr: Option<DdrPlan>,
     dynamic_records: Vec<onetdns_config::DynamicRecord>,
-    /**
-     * @brief 공유 캐시에서 기본 체인이 쓰는 이름 공간. 클라이언트 경로는 여기에 경로 이름을 붙인다.
-     * @details 외부 캐시를 쓰지 않으면 빈 문자열이다. 그래야 업스트림만 바꾼 설정이 체인을 다시
-     *          만들지 않는다.
-     */
-    cache_namespace: String,
 }
 
 /** @brief 처리 방식별 기반 리졸버. 재귀 설정은 재귀를 쓸 때만 담긴다. */
@@ -137,7 +136,7 @@ struct ForwarderPlan {
     upstream_concurrency: usize,
 }
 
-/** @brief 비재귀 처리 방식에서 업스트림 응답을 직접 검증할 때의 설정. */
+/** @brief 업스트림이 전달한 답을 이 서버가 직접 검증할 때의 설정. */
 #[derive(Clone, Debug, PartialEq)]
 struct ValidationPlan {
     dnssec_strict: bool,
@@ -148,13 +147,51 @@ struct ValidationPlan {
     dnssec_anchor_file: Option<std::path::PathBuf>,
 }
 
-/** @brief 외부 Redis 공유 캐시의 설정. 호스트 이름은 조립할 때 bootstrap 으로 푼다. */
+/**
+ * @brief 외부 Redis 공유 캐시의 설정. 호스트 이름은 조립할 때 bootstrap 으로 푼다.
+ * @details 기본 전달 업스트림과 로컬 전용 이름 판정은 체인을 조립하는 데 쓰지 않는다. 그래도
+ *          CacheDbLayer 아래의 답을 바꾸므로 공유 캐시를 쓸 때만 여기에 담아 해석 맥락에 넣는다.
+ *          공유 캐시를 쓰지 않으면 이 값들만 바꾼 설정은 체인을 다시 만들지 않는다.
+ */
 #[derive(Clone, Debug, PartialEq)]
 struct CacheDbPlan {
     host: String,
     port: u16,
     bootstrap: Vec<IpAddr>,
     expire_secs: u64,
+    secret: onetdns_core::SecretString,
+    username: Option<String>,
+    password: Option<onetdns_core::SecretString>,
+    tls: bool,
+    tls_ca: Option<std::path::PathBuf>,
+    /**
+     * @brief 기본 전달 기반이 질의하는 업스트림.
+     * @details 정렬하고 중복을 없앤 목록을 담으므로, 순서만 바꾼 설정으로는 체인을 다시 만들지 않는다.
+     */
+    upstreams: Vec<String>,
+    domain_needed: bool,
+    bogus_priv: bool,
+    empty_zones: bool,
+}
+
+impl CacheDbPlan {
+    /** @brief Redis 에 붙는 방법. 호스트 이름은 bootstrap 으로 풀고, TLS 를 쓰면 신뢰 저장소를 읽는다. */
+    fn redis_options(&self) -> Result<redis::RedisOptions, String> {
+        let addr = cachedb_redis_addr(&self.host, self.port, &self.bootstrap)?;
+        let tls = if self.tls {
+            Some(redis::RedisTls {
+                server_name: self.host.clone(),
+                roots: tls_material::cachedb_redis_roots(self.tls_ca.as_deref())?,
+            })
+        } else {
+            None
+        };
+        let auth = self.password.as_ref().map(|password| redis::RedisAuth {
+            username: self.username.clone(),
+            password: password.clone(),
+        });
+        Ok(redis::RedisOptions { addr, tls, auth })
+    }
 }
 
 /** @brief 답한 주소를 커널 주소 집합에 넣는 계층의 설정. */
@@ -193,11 +230,6 @@ impl ChainPlan {
                 split_forward: cfg.split_forward.clone(),
             },
         };
-        let cache_namespace = if cfg.cachedb_redis_host.is_some() {
-            cache_context(cfg, &base)
-        } else {
-            String::new()
-        };
         let forwarder = |servers: &[String]| ForwarderPlan {
             servers: servers.to_vec(),
             bootstrap: cfg.bootstrap.clone(),
@@ -210,7 +242,7 @@ impl ChainPlan {
             base,
             fallback: (!cfg.fallback_upstreams.is_empty())
                 .then(|| forwarder(&cfg.fallback_upstreams)),
-            forward_validation: cfg.forward_validation_active().then(|| ValidationPlan {
+            validation: cfg.dnssec_validation_active().then(|| ValidationPlan {
                 dnssec_strict: cfg.dnssec_strict,
                 val_permissive_mode: cfg.val_permissive_mode,
                 ignore_cd_flag: cfg.ignore_cd_flag,
@@ -223,6 +255,20 @@ impl ChainPlan {
                 port: cfg.cachedb_redis_port,
                 bootstrap: cfg.bootstrap.clone(),
                 expire_secs: cfg.cachedb_redis_expire_secs,
+                secret: cfg.cachedb_redis_secret.clone(),
+                username: cfg.cachedb_redis_username.clone(),
+                password: cfg.cachedb_redis_password.clone(),
+                tls: cfg.cachedb_redis_tls,
+                tls_ca: cfg.cachedb_redis_tls_ca.clone(),
+                upstreams: canonical_list(
+                    cfg.upstreams
+                        .iter()
+                        .map(ToString::to_string)
+                        .chain(cfg.upstream_urls.iter().cloned()),
+                ),
+                domain_needed: cfg.domain_needed,
+                bogus_priv: cfg.bogus_priv,
+                empty_zones: cfg.empty_zones,
             }),
             ecs_mode: cfg.ecs_mode,
             ecs_custom_ip: cfg.ecs_custom_ip,
@@ -267,7 +313,6 @@ impl ChainPlan {
                 endpoints: ddr_endpoints_from(cfg),
             }),
             dynamic_records: cfg.dynamic_records.clone(),
-            cache_namespace,
         }
     }
 
@@ -276,96 +321,291 @@ impl ChainPlan {
         matches!(self.base, BasePlan::Split { .. })
     }
 
-    /** @brief 공유 캐시에서 기본 체인이 쓰는 이름 공간. */
-    pub(crate) fn cache_namespace(&self) -> &str {
-        &self.cache_namespace
+    /**
+     * @brief 이 계획이 값을 읽는 키 가운데 설정 키 표에서 Chain 그룹이 아닌 키들.
+     * @details 이 키들은 바뀌면 자기 그룹을 교체하고, 계획에 그 값을 읽는 구성 요소가 있으면
+     *          체인도 다시 만든다. 영역 원본은 하나라도 있는지가 권한 계층을 얹을지 정하므로
+     *          늘 든다. new 가 다른 그룹의 키를 새로 읽으면 여기에도 넣어야 한다. 빠뜨리면
+     *          관리 화면이 그 키를 바꿔도 재시작하지 않는다고 알리는데, 클라이언트 경로가 있으면
+     *          실제로는 재시작한다.
+     */
+    pub(crate) fn other_group_inputs(&self) -> Vec<&'static str> {
+        let mut keys = vec![
+            "zones",
+            "zones_dir",
+            "zones_db",
+            "zones_postgres",
+            "zones_mysql",
+            "zones_lmdb",
+            "zones_etcd",
+            "secondary",
+            "catalog",
+        ];
+        if !matches!(self.base, BasePlan::Forward) {
+            keys.push("query_timeout_secs");
+        }
+        if self.fallback.is_some() || !self.stub_zones.is_empty() {
+            keys.extend([
+                "listen",
+                "listen_dot",
+                "listen_doh",
+                "listen_doq",
+                "listen_doh3",
+                "listen_dnscrypt",
+                "query_timeout_secs",
+                "upstream_strategy",
+                "upstream_concurrency",
+            ]);
+        }
+        if self.cachedb.is_some() {
+            keys.extend([
+                "upstreams",
+                "upstream_urls",
+                "domain_needed",
+                "bogus_priv",
+                "empty_zones",
+            ]);
+        }
+        if self.ddr.is_some() {
+            keys.extend([
+                "listen_doh",
+                "listen_doh3",
+                "listen_dot",
+                "listen_doq",
+                "doh_path",
+            ]);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 }
 
 /**
- * @brief 외부 공유 캐시의 이름 공간을 정하는 해석 맥락을 문자열로 만든다.
- * @details CacheDbLayer 아래에서 답의 내용을 바꾸는 설정만 담는다. 기반 처리 방식과 재귀 설정,
- *          전달 업스트림, Split 목록, 예비 업스트림, 업스트림 응답 검증, 로컬 전용 이름 판정,
- *          담을 때 거는 수명 범위가 여기에 든다. 같은 Redis를 쓰는 서버는 이 값이 같을 때만
- *          서로의 답을 쓴다. 목록은 정렬하고 중복을 없애므로 순서만 다른 설정은 같은 이름 공간을
- *          쓴다. 제한 시간, 캐시 크기, 선호 주소 계열처럼 답의 내용을 바꾸지 않는 값은 넣지 않는다.
- *          ECS 옵션과 DO, CD 비트는 요청 키에 이미 들어간다.
- * @warning CacheDbLayer 아래에 계층이나 답을 바꾸는 설정을 더하면 여기에도 넣어야 한다. 빠지면
+ * @brief 공통 계층 아래에 까는 기반이 무엇인지.
+ * @details 공유 캐시는 이 값으로 이 체인의 해석 맥락과 신뢰 앵커를 정한다.
+ */
+pub(crate) enum ChainBase {
+    /** @brief 계획의 처리 방식대로 만든 기반. 재귀가 DNSSEC 을 검증하면 그 신뢰 앵커를 든다. */
+    Planned(Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>),
+    /** @brief 이 업스트림으로만 전달하는 클라이언트 경로. */
+    Route {
+        /** @brief 정규화한 업스트림 목록. */
+        upstreams: String,
+        /**
+         * @brief 같은 세대의 재귀 리졸버가 검증에 쓰는 신뢰 앵커. 재귀가 검증하지 않으면 없다.
+         * @details 경로의 답도 이 앵커로 검증하므로, RFC 5011 갱신이 기본 체인과 경로에 함께
+         *          적용된다.
+         */
+        anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
+    },
+}
+
+impl ChainBase {
+    /** @brief 같은 세대의 재귀 리졸버가 검증에 쓰는 신뢰 앵커. */
+    fn recursor_anchors(&self) -> Option<&Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>> {
+        match self {
+            ChainBase::Planned(anchors) | ChainBase::Route { anchors, .. } => anchors.as_ref(),
+        }
+    }
+
+    /**
+     * @brief 이 기반이 업스트림에서 받은 답을 그대로 올려 보내는지.
+     * @details 그렇다면 dnssec 을 켰을 때 그 위에 검증 계층을 얹는다. 재귀 기반은 위임을 따라
+     *          내려가면서 스스로 검증하므로 얹지 않는다. 클라이언트 경로는 처리 방식과 상관없이
+     *          업스트림에 전달한다.
+     */
+    fn forwards(&self, plan: &ChainPlan) -> bool {
+        match self {
+            ChainBase::Planned(_) => !matches!(plan.base, BasePlan::Recurse(_)),
+            ChainBase::Route { .. } => true,
+        }
+    }
+}
+
+/**
+ * @brief 공유 캐시에서 이 체인의 답을 가르는 해석 맥락.
+ * @details CacheDbLayer 아래에서 답의 내용을 바꾸는 설정만 담는다. 계획과 그 안의 설정 묶음을
+ *          모두 필드 단위로 풀어 쓰므로, 필드를 더하면 여기서 담을지 정하기 전에는 컴파일되지
+ *          않는다. 목록은 정렬하고 중복을 없애므로 순서만 다른 설정은 같은 맥락을 쓴다. 신뢰
+ *          앵커는 실행 중에 바뀌므로 여기에 넣지 않고 CacheDbLayer 가 요청마다 지금 쓰는 앵커를
+ *          더한다. ECS 옵션과 DO, CD 비트는 요청 키에 이미 들어간다.
+ * @warning 같은 Redis를 쓰는 서버는 이 값이 같을 때만 서로의 답을 쓴다. 답을 바꾸는 값을 빼면
  *          그 설정이 다른 서버가 담은 답을 이 서버가 그대로 쓴다.
  */
-fn cache_context(cfg: &Config, base: &BasePlan) -> String {
-    let forward = || {
-        canonical_list(
-            cfg.upstreams
-                .iter()
-                .map(ToString::to_string)
-                .chain(cfg.upstream_urls.iter().cloned()),
-        )
-    };
-    let base = match base {
-        BasePlan::Forward => format!("forward{:?}", forward()),
-        BasePlan::Recurse(recurse) => format!("recurse{{{}}}", recursion_context(recurse)),
-        BasePlan::Split {
-            recurse,
-            default,
-            split_recurse,
-            split_forward,
-        } => format!(
-            "split{{forward={:?};recurse={{{}}};default={default:?};split_recurse={:?};split_forward={:?}}}",
+fn shared_cache_context(plan: &ChainPlan, cachedb: &CacheDbPlan, base: &ChainBase) -> String {
+    let ChainPlan {
+        base: planned,
+        fallback,
+        validation,
+        min_ttl,
+        max_ttl,
+        cachedb: _,
+        ecs_mode: _,
+        ecs_custom_ip: _,
+        cache_enabled: _,
+        cache_size: _,
+        sharded_cache: _,
+        cache_shards: _,
+        neg_min_ttl: _,
+        neg_max_ttl: _,
+        serve_stale_secs: _,
+        serve_expired_reply_ttl: _,
+        serve_expired_ttl_reset: _,
+        serve_expired_client_timeout_ms: _,
+        serve_stale_refresh: _,
+        prefetch: _,
+        prefetch_interval_secs: _,
+        prefetch_min_hits: _,
+        prefetch_ttl_pct: _,
+        local_a: _,
+        local_aaaa: _,
+        name_ratelimit_per_sec: _,
+        name_ratelimit_labels: _,
+        stub_zones: _,
+        dhcp_local_domain: _,
+        ipset: _,
+        authority: _,
+        acme_challenge: _,
+        ddr: _,
+        dynamic_records: _,
+    } = plan;
+    let CacheDbPlan {
+        bootstrap,
+        upstreams: default_upstreams,
+        domain_needed,
+        bogus_priv,
+        empty_zones,
+        host: _,
+        port: _,
+        expire_secs: _,
+        secret: _,
+        username: _,
+        password: _,
+        tls: _,
+        tls_ca: _,
+    } = cachedb;
+    let bootstrap = canonical_list(bootstrap.iter());
+    let forward = || format!("forward{{upstreams={default_upstreams:?};bootstrap={bootstrap:?}}}");
+    let validation = validation.as_ref().filter(|_| base.forwards(plan));
+    let base = match (base, planned) {
+        (ChainBase::Route { upstreams, .. }, _) => {
+            format!("route{{upstreams={upstreams:?};bootstrap={bootstrap:?}}}")
+        }
+        (ChainBase::Planned(_), BasePlan::Forward) => forward(),
+        (ChainBase::Planned(_), BasePlan::Recurse(recurse)) => {
+            format!("recurse{{{}}}", recursion_context(recurse))
+        }
+        (
+            ChainBase::Planned(_),
+            BasePlan::Split {
+                recurse,
+                default,
+                split_recurse,
+                split_forward,
+            },
+        ) => format!(
+            "split{{{};recurse={{{}}};default={default:?};split_recurse={:?};split_forward={:?}}}",
             forward(),
             recursion_context(recurse),
             canonical_names(split_recurse),
             canonical_names(split_forward),
         ),
     };
-    let validation = cfg.forward_validation_active().then(|| {
-        format!(
-            "strict={};permissive={};ignore_cd={};insecure={:?};sentinel={};anchors={:?}",
-            cfg.dnssec_strict,
-            cfg.val_permissive_mode,
-            cfg.ignore_cd_flag,
-            canonical_names(&cfg.domain_insecure),
-            cfg.root_key_sentinel,
-            cfg.dnssec_anchor_file,
-        )
-    });
     format!(
-        "base={base};fallback={:?};validation={validation:?};domain_needed={};bogus_priv={};empty_zones={};min_ttl={};max_ttl={}",
-        canonical_list(cfg.fallback_upstreams.iter()),
-        cfg.domain_needed,
-        cfg.bogus_priv,
-        cfg.empty_zones,
-        cfg.min_ttl,
-        cfg.max_ttl,
+        "base={base};fallback={:?};validation={:?};domain_needed={domain_needed};\
+         bogus_priv={bogus_priv};empty_zones={empty_zones};min_ttl={min_ttl};max_ttl={max_ttl}",
+        fallback.as_ref().map(forwarder_context),
+        validation.map(validation_context),
     )
 }
 
-/** @brief 재귀 설정 가운데 답이나 검증 결과를 바꾸는 값. */
+/**
+ * @brief 재귀 설정 가운데 답이나 검증 결과를 바꾸는 값.
+ * @details 제한 시간, 캐시 크기, 주소 계열처럼 닿을 수 있는 서버만 바꾸는 값은 넣지 않는다. 그런
+ *          값은 실패하는 질의를 늘리거나 줄일 뿐이고 실패한 답은 공유 캐시에 담지 않는다.
+ */
 fn recursion_context(plan: &RecursivePlan) -> String {
-    let mut roots = plan.roots.clone();
-    roots.sort_unstable();
-    roots.dedup();
+    let RecursivePlan {
+        roots,
+        domain_insecure,
+        recursion_limit,
+        cname_limit,
+        dname_limit,
+        recurse_deny_server,
+        recurse_allow_server,
+        qname_minimisation_strict,
+        harden_referral_path,
+        root_key_sentinel,
+        val_nsec3_max_iterations,
+        dnssec,
+        dnssec_strict,
+        val_permissive_mode,
+        ignore_cd_flag,
+        harden_below_nxdomain,
+        aggressive_nsec,
+        query_timeout_secs: _,
+        prefer_ip4: _,
+        prefer_ip6: _,
+        do_ip4: _,
+        do_ip6: _,
+        ns_recursion_limit: _,
+        ns_cache_size: _,
+        use_caps_for_id: _,
+        lowercase_outgoing: _,
+        dnssec_anchor_file: _,
+        dnssec_rfc5011: _,
+        trust_anchor_signaling: _,
+        cache_size: _,
+        max_ttl: _,
+        neg_min_ttl: _,
+        neg_max_ttl: _,
+    } = plan;
     format!(
-        "roots={roots:?};insecure={:?};recursion_limit={};cname_limit={};dname_limit={};\
-         deny={:?};allow={:?};qname_min_strict={};harden_referral={};sentinel={};\
-         nsec3_iterations={};dnssec={};strict={};permissive={};ignore_cd={};anchors={:?};\
-         aggressive_nsec={}",
-        canonical_names(&plan.domain_insecure),
-        plan.recursion_limit,
-        plan.cname_limit,
-        plan.dname_limit,
-        canonical_list(plan.recurse_deny_server.iter()),
-        canonical_list(plan.recurse_allow_server.iter()),
-        plan.qname_minimisation_strict,
-        plan.harden_referral_path,
-        plan.root_key_sentinel,
-        plan.val_nsec3_max_iterations,
-        plan.dnssec,
-        plan.dnssec_strict,
-        plan.val_permissive_mode,
-        plan.ignore_cd_flag,
-        plan.dnssec_anchor_file,
-        plan.aggressive_nsec,
+        "roots={:?};insecure={:?};recursion_limit={recursion_limit};cname_limit={cname_limit};\
+         dname_limit={dname_limit};deny={:?};allow={:?};qname_min_strict={qname_minimisation_strict};\
+         harden_referral={harden_referral_path};sentinel={root_key_sentinel};\
+         nsec3_iterations={val_nsec3_max_iterations};dnssec={dnssec};strict={dnssec_strict};\
+         permissive={val_permissive_mode};ignore_cd={ignore_cd_flag};\
+         below_nxdomain={harden_below_nxdomain};aggressive_nsec={aggressive_nsec}",
+        canonical_list(roots.iter()),
+        canonical_names(domain_insecure),
+        canonical_list(recurse_deny_server.iter()),
+        canonical_list(recurse_allow_server.iter()),
+    )
+}
+
+/** @brief 전달기 설정 가운데 답을 바꾸는 값. 어느 업스트림에 묻는지다. */
+fn forwarder_context(plan: &ForwarderPlan) -> String {
+    let ForwarderPlan {
+        servers,
+        bootstrap,
+        listeners: _,
+        query_timeout_secs: _,
+        upstream_strategy: _,
+        upstream_concurrency: _,
+    } = plan;
+    format!(
+        "servers={:?};bootstrap={:?}",
+        canonical_list(servers.iter()),
+        canonical_list(bootstrap.iter())
+    )
+}
+
+/** @brief 업스트림 응답 검증 설정 가운데 검증 결과를 바꾸는 값. 신뢰 앵커는 CacheDbLayer 가 더한다. */
+fn validation_context(plan: &ValidationPlan) -> String {
+    let ValidationPlan {
+        dnssec_strict,
+        val_permissive_mode,
+        ignore_cd_flag,
+        domain_insecure,
+        root_key_sentinel,
+        dnssec_anchor_file: _,
+    } = plan;
+    format!(
+        "strict={dnssec_strict};permissive={val_permissive_mode};ignore_cd={ignore_cd_flag};\
+         insecure={:?};sentinel={root_key_sentinel}",
+        canonical_names(domain_insecure)
     )
 }
 
@@ -509,6 +749,8 @@ pub(crate) struct PreparedBase {
     recursor: Option<Arc<onetdns_recurse::Recursor>>,
     /** @brief 재귀 리졸버에 딸린 작업. */
     jobs: PendingJobs,
+    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 검증하지 않으면 없다. */
+    anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
 }
 
 /** @brief 재귀 기반을 만들 때 쓰는 이 세대의 핸들. */
@@ -617,6 +859,7 @@ impl RecursiveBase {
             track_service_thread(thread_tracker, thread);
         }
 
+        let anchors = plan.dnssec.then(|| recursor.anchors_handle());
         let recursor = Arc::new(recursor);
         let mut base: Arc<dyn native::Resolver> = Arc::new(native::NativeBackend::Recurse {
             recursor: recursor.clone(),
@@ -644,6 +887,7 @@ impl RecursiveBase {
             resolver: base,
             recursor: Some(recursor),
             jobs,
+            anchors,
         })
     }
 }
@@ -670,6 +914,7 @@ impl ResolverBase {
                 resolver: self.forward(),
                 recursor: None,
                 jobs: PendingJobs(None),
+                anchors: None,
             },
             BasePlan::Split {
                 recurse,
@@ -695,6 +940,7 @@ impl ResolverBase {
                     ),
                     recursor: recurse.recursor,
                     jobs: recurse.jobs,
+                    anchors: recurse.anchors,
                 }
             }
         })
@@ -727,6 +973,10 @@ pub(crate) struct PreparedChain {
     cache: cache::CacheHandle,
     /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
     recursor: Option<Arc<onetdns_recurse::Recursor>>,
+    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 검증하지 않으면 없다. */
+    anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
+    /** @brief 이 체인이 쓰는 공유 캐시 클라이언트. 공유 캐시를 쓰지 않으면 없다. */
+    shared_cache: Option<Arc<redis::RedisClient>>,
     /** @brief 재귀 리졸버에 딸린 작업. */
     jobs: PendingJobs,
 }
@@ -739,6 +989,14 @@ pub(crate) struct InstalledChain {
     pub(crate) cache: cache::CacheHandle,
     /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
     pub(crate) recursor: Option<Arc<onetdns_recurse::Recursor>>,
+    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 클라이언트 경로의 검증도 이 앵커를 쓴다. */
+    pub(crate) anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
+    /**
+     * @brief 이 체인이 쓰는 공유 캐시 클라이언트. 공유 캐시를 쓰지 않으면 없다.
+     * @details 클라이언트 경로도 이 클라이언트를 함께 쓴다. 경로마다 따로 만들면 연결 풀도 따로
+     *          생겨, 공유 캐시에 여는 연결 수의 상한이 경로 수만큼 곱해진다.
+     */
+    pub(crate) shared_cache: Option<Arc<redis::RedisClient>>,
 }
 
 impl DefaultChain {
@@ -748,22 +1006,26 @@ impl DefaultChain {
             resolver,
             recursor,
             jobs,
+            anchors,
         } = self.base.build(plan).map_err(|error| error.to_string())?;
-        /*
-         * 공유 캐시 이름 공간도 새 계획에서 낸다. 이전 것을 쓰면 처리 방식이나 DNSSEC 을
-         * 바꿔도 같은 슬롯을 가리켜, 이전 의미로 담긴 답이 새 설정의 답인 것처럼 나온다.
-         */
+        let shared_cache = match &plan.cachedb {
+            Some(cachedb) => Some(Arc::new(redis::RedisClient::new(cachedb.redis_options()?))),
+            None => None,
+        };
         let (resolver, cache) = self.layers.wrap_common_layers(
             plan,
             resolver,
             true,
             plan.is_split(),
-            plan.cache_namespace(),
+            ChainBase::Planned(anchors.clone()),
+            shared_cache.as_ref(),
         )?;
         Ok(PreparedChain {
             resolver,
             cache,
             recursor,
+            anchors,
+            shared_cache,
             jobs,
         })
     }
@@ -774,6 +1036,8 @@ impl DefaultChain {
             resolver,
             cache,
             recursor,
+            anchors,
+            shared_cache,
             jobs,
         } = prepared;
         *self.cache_slot.lock_recover() = Some(cache.clone());
@@ -782,6 +1046,8 @@ impl DefaultChain {
             resolver,
             cache,
             recursor,
+            anchors,
+            shared_cache,
         }
     }
 }
@@ -812,7 +1078,9 @@ impl ChainLayers {
      * @brief 기반 위에 공통 계층을 쌓는다. 이 세대의 상태는 바꾸지 않는다.
      * @param report  켜진 기능을 기록에 남길지.
      * @param split_local_addresses  Split 로컬 주소 계층을 얹을지.
-     * @param cache_ns  공유 캐시에서 이 체인이 쓰는 이름 공간.
+     * @param kind  base 가 어떤 기반인지. 공유 캐시가 해석 맥락과 신뢰 앵커를 정할 때 쓴다.
+     * @param shared_cache  이 세대의 체인이 함께 쓰는 공유 캐시 클라이언트. 계획에 공유 캐시가
+     *                      있으면 있어야 한다.
      * @return 쌓은 체인과 그 응답 캐시.
      */
     pub(crate) fn wrap_common_layers(
@@ -821,7 +1089,8 @@ impl ChainLayers {
         mut base: Arc<dyn native::Resolver>,
         report: bool,
         split_local_addresses: bool,
-        cache_ns: &str,
+        kind: ChainBase,
+        shared_cache: Option<&Arc<redis::RedisClient>>,
     ) -> Result<(Arc<dyn native::Resolver>, cache::CacheHandle), String> {
         let Self {
             block_ttl,
@@ -833,6 +1102,10 @@ impl ChainLayers {
             split_local_wire_cache,
             zone_store,
         } = self;
+        let mut anchors: Vec<_> = match &kind {
+            ChainBase::Planned(recursor) => recursor.iter().cloned().collect(),
+            ChainBase::Route { .. } => Vec::new(),
+        };
         // layer-order:begin
         base = Arc::new(layers::LocalOnlyLayer::new(
             base,
@@ -852,9 +1125,10 @@ impl ChainLayers {
 
         /*
          * 예비 업스트림까지 감싼 뒤에 얹는다. 어느 업스트림이 답했든 이 서버가 검증한 것만
-         * 위로 올라가고, 위쪽 캐시에는 검증된 응답만 담긴다.
+         * 위로 올라가고, 위쪽 캐시에는 검증된 응답만 담긴다. 같은 세대의 재귀 리졸버가 있으면
+         * 그 앵커를 함께 써서, RFC 5011 갱신이 전달한 답의 검증에도 바로 적용되게 한다.
          */
-        if let Some(validation) = &plan.forward_validation {
+        if let Some(validation) = plan.validation.as_ref().filter(|_| kind.forwards(plan)) {
             let insecure_domains = validation
                 .domain_insecure
                 .iter()
@@ -864,12 +1138,22 @@ impl ChainLayers {
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            base = Arc::new(dnssecfwd::ForwardValidateLayer::new(
-                base,
-                Arc::new(onetdns_core::ArcSwap::new(Arc::new(
+            let validation_anchors = match kind.recursor_anchors() {
+                Some(recursor) => recursor.clone(),
+                None => Arc::new(onetdns_core::ArcSwap::new(Arc::new(
                     forward_trust_anchors(validation.dnssec_anchor_file.as_deref())
                         .map_err(|error| error.to_string())?,
                 ))),
+            };
+            if !anchors
+                .iter()
+                .any(|known| Arc::ptr_eq(known, &validation_anchors))
+            {
+                anchors.push(validation_anchors.clone());
+            }
+            base = Arc::new(dnssecfwd::ForwardValidateLayer::new(
+                base,
+                validation_anchors,
                 dnssecfwd::ForwardValidationPolicy {
                     strict: validation.dnssec_strict,
                     permissive: validation.val_permissive_mode,
@@ -881,16 +1165,21 @@ impl ChainLayers {
         }
 
         if let Some(cachedb) = &plan.cachedb {
-            let addr = cachedb_redis_addr(&cachedb.host, cachedb.port, &cachedb.bootstrap)?;
-            let redis = Arc::new(redis::RedisClient::new(addr));
-            let namespace = format!("{:x}", Sha256::digest(cache_ns.as_bytes()))[..16].to_string();
+            let redis = shared_cache
+                .cloned()
+                .ok_or("The shared cache client was not prepared for this chain")?;
+            let addr = redis.addr();
             base = Arc::new(layers::CacheDbLayer::new(
                 base,
                 redis,
+                layers::CacheDbScope {
+                    secret: cachedb.secret.clone(),
+                    context: shared_cache_context(plan, cachedb, &kind),
+                    anchors,
+                },
                 cachedb.expire_secs,
                 plan.min_ttl as u32,
                 plan.max_ttl as u32,
-                namespace,
             ));
             if report {
                 onetdns_core::info!(event = "cache.redis_enabled", %addr, "Using external Redis response cache");
@@ -1150,17 +1439,27 @@ mod tests {
         assert!(old_jobs.load(Ordering::Acquire));
     }
 
+    /** @brief 이 설정으로 만든 기본 체인의 공유 캐시 해석 맥락. */
+    fn shared_context(cfg: &Config, kind: &ChainBase) -> String {
+        let plan = ChainPlan::new(cfg);
+        let cachedb = plan
+            .cachedb
+            .clone()
+            .expect("the shared cache is configured");
+        shared_cache_context(&plan, &cachedb, kind)
+    }
+
     #[test]
     /**
-     * @brief 공유 캐시 이름 공간이 답을 바꾸는 설정마다 갈리고, 답과 무관한 설정에는 그대로인지.
-     * @details 같은 Redis를 쓰는 서버끼리 이름 공간이 같으면 서로의 답을 그대로 쓴다.
+     * @brief 공유 캐시 해석 맥락이 답을 바꾸는 설정마다 갈리고, 답과 무관한 설정에는 그대로인지.
+     * @details 같은 Redis를 쓰는 서버끼리 맥락이 같으면 서로의 답을 그대로 쓴다.
      */
-    fn external_cache_namespace_follows_the_resolution_context() {
+    fn external_cache_context_follows_the_resolution_context() {
         let mut base = forward_config();
         base.cachedb_redis_host = Some("127.0.0.1".to_string());
         base.upstreams = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
-        let namespace = |cfg: &Config| ChainPlan::new(cfg).cache_namespace().to_string();
-        let original = namespace(&base);
+        let context = |cfg: &Config| shared_context(cfg, &ChainBase::Planned(None));
+        let original = context(&base);
 
         let changes: Vec<(&str, fn(&mut Config))> = vec![
             ("upstreams", |c| {
@@ -1168,6 +1467,9 @@ mod tests {
             }),
             ("upstream_urls", |c| {
                 c.upstream_urls = vec!["https://dns.example/dns-query".into()]
+            }),
+            ("bootstrap", |c| {
+                c.bootstrap = vec!["192.0.2.53".parse().unwrap()]
             }),
             ("fallback_upstreams", |c| {
                 c.fallback_upstreams = vec!["192.0.2.54".into()]
@@ -1178,43 +1480,227 @@ mod tests {
                 c.split_forward = vec!["corp.test".into()];
             }),
             ("dnssec", |c| c.dnssec = !c.dnssec),
+            ("dnssec_strict", |c| {
+                c.dnssec = true;
+                c.dnssec_strict = !c.dnssec_strict;
+            }),
+            ("domain_needed", |c| c.domain_needed = !c.domain_needed),
             ("bogus_priv", |c| c.bogus_priv = !c.bogus_priv),
+            ("empty_zones", |c| c.empty_zones = !c.empty_zones),
             ("min_ttl", |c| c.min_ttl += 1),
             ("max_ttl", |c| c.max_ttl -= 1),
         ];
         for (key, change) in changes {
             let mut changed = base.clone();
             change(&mut changed);
-            assert_ne!(namespace(&changed), original, "{key}");
+            assert_ne!(context(&changed), original, "{key}");
         }
 
+        let unchanged: Vec<(&str, fn(&mut Config))> = vec![
+            ("upstream order", |c| c.upstreams.reverse()),
+            ("query_timeout_secs", |c| c.query_timeout_secs += 3),
+            ("cache_size", |c| c.cache_size += 1),
+            ("cachedb_redis_expire_secs", |c| {
+                c.cachedb_redis_expire_secs += 1
+            }),
+            ("cachedb_redis_port", |c| c.cachedb_redis_port += 1),
+        ];
+        for (key, change) in unchanged {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_eq!(context(&changed), original, "{key}");
+        }
         let mut reordered = base.clone();
         reordered.upstreams.reverse();
-        assert_eq!(namespace(&reordered), original, "upstream order");
-        let mut slower = base.clone();
-        slower.query_timeout_secs += 3;
-        assert_eq!(namespace(&slower), original, "query_timeout_secs");
+        assert_eq!(
+            ChainPlan::new(&base),
+            ChainPlan::new(&reordered),
+            "upstream order alone leaves the chain alone"
+        );
+
+        let mut recurse = base.clone();
+        recurse.backend = BackendKind::Recurse;
+        let recursion_changes: Vec<(&str, fn(&mut Config))> = vec![
+            ("harden_below_nxdomain", |c| {
+                c.harden_below_nxdomain = !c.harden_below_nxdomain
+            }),
+            ("aggressive_nsec", |c| {
+                c.aggressive_nsec = !c.aggressive_nsec
+            }),
+            ("qname_minimisation_strict", |c| {
+                c.qname_minimisation_strict = !c.qname_minimisation_strict
+            }),
+        ];
+        for (key, change) in recursion_changes {
+            let mut changed = recurse.clone();
+            change(&mut changed);
+            assert_ne!(context(&changed), context(&recurse), "{key}");
+        }
 
         let mut split = base.clone();
         split.backend = BackendKind::Split;
         split.split_forward = vec!["corp.test".into()];
-        let mut split_recursion = split.clone();
-        split_recursion.qname_minimisation_strict = !split.qname_minimisation_strict;
-        assert_ne!(namespace(&split), namespace(&split_recursion));
         let mut split_case = split.clone();
         split_case.split_forward = vec!["CORP.test.".into()];
-        assert_eq!(namespace(&split), namespace(&split_case));
+        assert_eq!(context(&split), context(&split_case));
+
+        let route = |upstreams: &str| ChainBase::Route {
+            upstreams: upstreams.to_string(),
+            anchors: None,
+        };
+        let route_a = shared_context(&base, &route("192.0.2.9"));
+        assert_ne!(route_a, original, "client route");
+        assert_ne!(
+            route_a,
+            shared_context(&base, &route("192.0.2.10")),
+            "route upstreams"
+        );
+        let mut validating = recurse.clone();
+        validating.dnssec = true;
+        let mut stricter = validating.clone();
+        stricter.dnssec_strict = !stricter.dnssec_strict;
+        assert_ne!(
+            shared_context(&validating, &route("192.0.2.9")),
+            shared_context(&stricter, &route("192.0.2.9")),
+            "the recursive backend validates client route answers too"
+        );
 
         let mut local = base;
         local.cachedb_redis_host = None;
-        assert_eq!(namespace(&local), "");
-        let mut local_upstream = local.clone();
-        local_upstream.upstreams = vec!["198.51.100.1".parse().unwrap()];
+        assert!(ChainPlan::new(&local).cachedb.is_none());
+        let local_changes: [fn(&mut Config); 2] = [
+            |c| c.upstreams = vec!["198.51.100.1".parse().unwrap()],
+            |c| c.bogus_priv = !c.bogus_priv,
+        ];
+        for change in local_changes {
+            let mut changed = local.clone();
+            change(&mut changed);
+            assert_eq!(
+                ChainPlan::new(&local),
+                ChainPlan::new(&changed),
+                "without Redis these settings leave the chain alone"
+            );
+        }
+    }
+
+    /** @brief 받은 질의의 CD 비트를 적어 두고 SERVFAIL 로 답하는 업스트림. */
+    struct CdRecorder(Mutex<Vec<bool>>);
+
+    impl native::Resolver for CdRecorder {
+        fn resolve(&self, request: &onetdns_proto::Message) -> Option<onetdns_proto::Message> {
+            self.0.lock_recover().push(request.header.checking_disabled);
+            let mut response = request.clone();
+            response.header.response = true;
+            response.header.rcode = onetdns_proto::ResponseCode::ServFail.0;
+            Some(response)
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 업스트림에 전달하는 체인에만 검증 계층이 얹히는지.
+     * @details 검증 계층은 업스트림에 CD 비트를 켜서 묻는다. 클라이언트 경로는 재귀 방식에서도
+     *          업스트림에 전달하므로, 이 계층이 빠지면 dnssec 을 켰는데도 검증하지 않은 답이
+     *          클라이언트에 나간다. 재귀 기반은 스스로 검증하므로 겹쳐 얹지 않는다.
+     */
+    fn validation_wraps_every_forwarding_base() {
+        let route = || ChainBase::Route {
+            upstreams: "192.0.2.9".to_string(),
+            anchors: None,
+        };
+        let cases = [
+            (BackendKind::Forward, true, ChainBase::Planned(None), true),
+            (BackendKind::Split, true, ChainBase::Planned(None), true),
+            (BackendKind::Recurse, true, ChainBase::Planned(None), false),
+            (BackendKind::Recurse, true, route(), true),
+            (BackendKind::Forward, true, route(), true),
+            (BackendKind::Recurse, false, route(), false),
+        ];
+        let chain = default_chain();
+        for (backend, dnssec, kind, validates) in cases {
+            let mut cfg = forward_config();
+            cfg.backend = backend;
+            cfg.dnssec = dnssec;
+            let label = format!(
+                "{backend:?} dnssec={dnssec} route={}",
+                matches!(kind, ChainBase::Route { .. })
+            );
+            let upstream = Arc::new(CdRecorder(Mutex::default()));
+            let (resolver, _) = chain
+                .layers
+                .wrap_common_layers(
+                    &ChainPlan::new(&cfg),
+                    upstream.clone(),
+                    false,
+                    false,
+                    kind,
+                    None,
+                )
+                .unwrap();
+            let query = onetdns_proto::Message::query(
+                7,
+                onetdns_proto::Name::from_str("example.com.").unwrap(),
+                onetdns_proto::RecordType::A,
+            );
+            resolver.resolve(&query);
+            assert_eq!(
+                upstream.0.lock_recover().first().copied(),
+                Some(validates),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 클라이언트 경로가 기본 체인의 공유 캐시 클라이언트와 그 연결 풀을 함께 쓰는지.
+     * @details 체인마다 클라이언트를 따로 만들면 연결 풀도 따로 생겨, 같은 세대가 공유 캐시에
+     *          여는 연결 수의 상한이 경로 수만큼 곱해진다. 두 체인이 차례로 물으면 뒤의 체인은
+     *          앞의 체인이 돌려놓은 연결을 다시 쓴다.
+     */
+    fn routes_share_the_default_chain_shared_cache_client() {
+        let fake = crate::redis::fake::FakeRedis::start(Default::default());
+        let mut cfg = forward_config();
+        cfg.cachedb_redis_host = Some("127.0.0.1".to_string());
+        cfg.cachedb_redis_port = fake.addr.port();
+        cfg.cachedb_redis_secret = "0123456789abcdef0123456789abcdef".into();
+        let plan = ChainPlan::new(&cfg);
+        let chain = default_chain();
+        let installed = chain.install(chain.prepare(&plan).unwrap());
+        let shared = installed
+            .shared_cache
+            .clone()
+            .expect("the plan uses the shared cache");
+        let (route, _) = chain
+            .layers
+            .wrap_common_layers(
+                &plan,
+                Arc::new(CdRecorder(Mutex::default())),
+                false,
+                false,
+                ChainBase::Route {
+                    upstreams: "192.0.2.9".to_string(),
+                    anchors: None,
+                },
+                Some(&shared),
+            )
+            .unwrap();
+        let query = |name: &str| {
+            onetdns_proto::Message::query(
+                7,
+                onetdns_proto::Name::from_str(name).unwrap(),
+                onetdns_proto::RecordType::A,
+            )
+        };
+        installed.resolver.resolve(&query("default.example."));
+        route.resolve(&query("route.example."));
+        shared.wait_for_writes();
         assert_eq!(
-            ChainPlan::new(&local),
-            ChainPlan::new(&local_upstream),
-            "without Redis an upstream change leaves the chain alone"
+            fake.commands.load(Ordering::Acquire),
+            2,
+            "one lookup per chain"
         );
+        assert_eq!(fake.connections.load(Ordering::Acquire), 1);
     }
 
     #[test]

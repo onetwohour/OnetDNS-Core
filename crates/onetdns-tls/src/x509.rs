@@ -490,14 +490,11 @@ impl X509 {
      *          믿으면 이름 제약이 걸리지 않는 경로가 생긴다.
      */
     pub fn matches_hostname(&self, host: &str) -> bool {
-        let trimmed = host
-            .trim()
-            .trim_matches(|c| c == '[' || c == ']')
-            .trim_end_matches('.');
-        if let Ok(ip) = trimmed.parse::<IpAddr>() {
-            return self.san_ip.contains(&ip);
-        }
-        let host = trimmed.to_ascii_lowercase();
+        let name = match peer_host(host) {
+            PeerHost::Ip(ip) => return self.san_ip.contains(&ip),
+            PeerHost::Name(name) => name,
+        };
+        let host = name.to_ascii_lowercase();
         self.san_dns.iter().any(|n| {
             let n = n.trim_end_matches('.').to_ascii_lowercase();
             if let Some(suffix) = n.strip_prefix("*.") {
@@ -629,6 +626,31 @@ pub(crate) fn rsa_public_key_components(key: &[u8]) -> Result<(&[u8], &[u8]), Tl
         return Err(TlsError::BadCert);
     }
     Ok((modulus, exponent))
+}
+
+/** @brief 접속할 호스트가 주소인지 이름인지. */
+pub(crate) enum PeerHost<'a> {
+    /** @brief IPv4 나 IPv6 주소. */
+    Ip(IpAddr),
+    /** @brief 호스트 이름. 끝 점은 걷어 냈다. */
+    Name(&'a str),
+}
+
+/**
+ * @brief 접속할 호스트를 주소와 이름으로 가른다.
+ * @details 앞뒤 공백과 IPv6 대괄호, 끝 점을 걷어 낸 뒤 주소로 읽히면 주소다. 인증서 이름 확인과
+ *          SNI 가 이 판정 하나를 같이 써야, 주소로 붙을 때 SNI 를 빼고 IP SAN 으로 확인하는 두
+ *          동작이 어긋나지 않는다.
+ */
+pub(crate) fn peer_host(host: &str) -> PeerHost<'_> {
+    let trimmed = host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.');
+    match trimmed.parse::<IpAddr>() {
+        Ok(ip) => PeerHost::Ip(ip),
+        Err(_) => PeerHost::Name(trimmed),
+    }
 }
 
 /** @brief 이름 구조에서 읽을 만한 표기를 만든다. */

@@ -104,19 +104,21 @@ impl PrefixedTcp {
         }
     }
 
+    /** @brief 상대 주소를 실제 연결에서 읽는다. */
+    pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
+
+impl onetdns_core::tcp::SocketTimeouts for PrefixedTcp {
     /** @brief 읽기 제한시간을 실제 연결에 설정한다. */
-    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)
     }
 
     /** @brief 쓰기 제한시간을 실제 연결에 설정한다. */
-    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_write_timeout(timeout)
-    }
-
-    /** @brief 상대 주소를 실제 연결에서 읽는다. */
-    pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.stream.peer_addr()
     }
 }
 

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use onetdns_core::json;
+use onetdns_core::tcp::DeadlineTcp;
 use onetdns_core::{ArcSwap, HttpsOrigin, IpNet, MutexExt, SecretString};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -110,11 +111,11 @@ impl Write for SharedTcp {
 }
 
 /**
- * @brief 절대 데드라인과 종료 신호가 걸린 TCP.
- * @details 읽기마다 남은 시간을 다시 계산한다. 매 읽기에 고정 시간을 주면 한 바이트씩
- *          흘려 보내는 상대가 연결을 무한정 붙잡는다.
+ * @brief admission 이 먼저 읽어 둔 요청 바이트를 앞에 붙인 연결.
+ * @details 앞 바이트를 다 돌려준 뒤에는 소켓을 그대로 읽는다. 데드라인과 종료 신호는 이 연결을
+ *          감싼 DeadlineTcp 가 지킨다.
  */
-struct DeadlineTcp {
+struct AdmittedTcp {
     /** @brief 실제 소켓. */
     stream: SharedTcp,
     /** @brief admission이 먼저 읽어 둔 요청 바이트. */
@@ -123,84 +124,47 @@ struct DeadlineTcp {
     prefix_offset: usize,
     /** @brief prefix가 사라질 때 전역 admission 원문 예산을 돌려준다. */
     _admission_bytes: Option<AdmissionBytesGuard>,
-    /** @brief 이 시각까지만 기다린다. */
-    deadline: Instant,
-    /** @brief 종료 신호. 서면 읽기를 즉시 끊는다. */
-    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-impl DeadlineTcp {
-    /** @brief 데드라인만 걸어 만든다. */
-    fn new(stream: SharedTcp, deadline: Instant) -> Self {
-        Self {
-            stream,
-            prefix: Vec::new(),
-            prefix_offset: 0,
-            _admission_bytes: None,
-            deadline,
-            shutdown: None,
-        }
-    }
-
-    /** @brief 데드라인과 종료 신호를 함께 걸어 만든다. */
-    fn with_shutdown(
+impl AdmittedTcp {
+    /** @brief 소켓 앞에 admission이 읽어 둔 바이트를 붙인다. */
+    fn new(
         stream: SharedTcp,
-        deadline: Instant,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
         prefix: Vec<u8>,
-        admission_bytes: AdmissionBytesGuard,
+        admission_bytes: Option<AdmissionBytesGuard>,
     ) -> Self {
         Self {
             stream,
             prefix,
             prefix_offset: 0,
-            _admission_bytes: Some(admission_bytes),
-            deadline,
-            shutdown: Some(shutdown),
+            _admission_bytes: admission_bytes,
         }
-    }
-
-    /** @brief 데드라인까지 남은 시간. 지났으면 타임아웃 오류다. */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
     }
 }
 
-impl Read for DeadlineTcp {
-    /**
-     * @brief 남은 시간을 타임아웃으로 걸고 읽는다.
-     * @note 종료 신호를 주기적으로 확인한다. 확인하지 않으면 재시작이 데드라인까지 지연된다.
-     */
+impl Read for AdmittedTcp {
+    /** @brief prefix를 먼저, 소켓을 나중에 읽는다. */
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if self
-                .shutdown
-                .as_ref()
-                .is_some_and(|shutdown| shutdown.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                return Err(std::io::ErrorKind::ConnectionAborted.into());
-            }
-            if self.prefix_offset < self.prefix.len() {
-                let available = &self.prefix[self.prefix_offset..];
-                let copied = available.len().min(buf.len());
-                buf[..copied].copy_from_slice(&available[..copied]);
-                self.prefix_offset += copied;
-                return Ok(copied);
-            }
-            let timeout = self.remaining()?.min(Duration::from_millis(250));
-            self.stream.set_read_timeout(Some(timeout))?;
-            match self.stream.read(buf) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) && Instant::now() < self.deadline => {}
-                result => return result,
-            }
+        if self.prefix_offset < self.prefix.len() {
+            let available = &self.prefix[self.prefix_offset..];
+            let copied = available.len().min(buf.len());
+            buf[..copied].copy_from_slice(&available[..copied]);
+            self.prefix_offset += copied;
+            return Ok(copied);
         }
+        self.stream.read(buf)
+    }
+}
+
+impl onetdns_core::tcp::SocketTimeouts for AdmittedTcp {
+    /** @brief 소켓에 건다. */
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /** @brief 소켓에 건다. */
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.0.set_write_timeout(timeout)
     }
 }
 
@@ -399,6 +363,7 @@ fn is_state_changing_request(method: &str, path: &str) -> bool {
             path,
             "/v1/config/validate"
                 | "/v1/config/diff"
+                | "/v1/config/set/diff"
                 | "/v1/explain"
                 | "/v1/resolve"
                 | "/v1/policies/simulate"
@@ -608,6 +573,9 @@ pub struct Controls {
 
     /** @brief 설정 항목 몇 개만 고친다. */
     pub config_set: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+
+    /** @brief config_set 에 보낼 항목들이 무엇을 바꾸고 어떻게 반영되는지. 적용하지는 않는다. */
+    pub config_set_diff: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
     /** @brief 대시보드가 화면을 그릴 설정 명세. */
     pub config_schema: Box<dyn Fn() -> String + Send + Sync>,
@@ -853,6 +821,9 @@ impl Controls {
             }),
             config_apply: Box::new(|_| Err("No config file path".to_string())),
             config_set: Box::new(|_| Err("No config file path".to_string())),
+            config_set_diff: Box::new(|_| {
+                Ok("{\"added\":[],\"removed\":[],\"changed\":[]}".to_string())
+            }),
             config_schema: Box::new(|| "{\"keys\":[]}".to_string()),
             upstream_test: Box::new(|_| Err("The requested feature is not available".to_string())),
             cache_flush: Box::new(|| "{\"flushed\":0}".to_string()),
@@ -2752,17 +2723,13 @@ fn handle_conn_inner(
 ) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok();
     let local_port = stream.local_addr()?.port();
-    let request_stream = stream.clone();
-    let deadline_stream = match shutdown {
-        Some(shutdown) => DeadlineTcp::with_shutdown(
-            request_stream,
-            request_deadline,
-            shutdown,
-            prefix,
-            admission_bytes.expect("Server connections always carry an admission guard"),
-        ),
-        None => DeadlineTcp::new(request_stream, request_deadline),
-    };
+    let mut deadline_stream = DeadlineTcp::new(
+        AdmittedTcp::new(stream.clone(), prefix, admission_bytes),
+        request_deadline,
+    );
+    if let Some(shutdown) = shutdown {
+        deadline_stream = deadline_stream.stop_on(shutdown);
+    }
     let mut reader = BufReader::new(deadline_stream);
 
     let mut line = String::new();
@@ -4688,6 +4655,14 @@ fn route_dispatch(
                 format!("{{\"error\":\"{}\"}}", jesc(&e)),
             ),
         },
+        ("POST", "/v1/config/set/diff") => match (st.controls.config_set_diff)(body) {
+            Ok(j) => ("200 OK", "application/json", j),
+            Err(e) => (
+                "400 Bad Request",
+                "application/json",
+                format!("{{\"error\":\"{}\"}}", jesc(&e)),
+            ),
+        },
         ("GET", "/v1/config/schema") => {
             ("200 OK", "application/json", (st.controls.config_schema)())
         }
@@ -5227,7 +5202,7 @@ fn openapi_json() -> String {
     "/v1/password": { "post": { "summary": "Change the signed-in user's password and revoke all of that user's sessions", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "current_password": { "type": "string" }, "new_password": { "type": "string", "minLength": 12 } }, "required": ["current_password","new_password"] } } } }, "responses": { "200": { "description": "{changed,reloading}" }, "403": { "description": "Current password does not match" } } } },
     "/v1/querylog/clear": { "post": { "summary": "Clear the recent query log", "responses": { "200": { "description": "{cleared}" } } } },
     "/v1/config/validate": { "post": { "summary": "Check whether a TOML fragment is valid when merged into the current config. The actual config is not changed", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{valid:true}" }, "400": { "description": "{valid:false,error}" } } } },
-    "/v1/config/diff": { "post": { "summary": "Compare a TOML fragment with the current config file and show which entries change and how they are applied", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{added[],removed[],changed[],hot_reload[],service_restart[],restart_required}" }, "400": { "description": "Returns the error when the proposed config is invalid" } } } },
+    "/v1/config/diff": { "post": { "summary": "Compare a TOML fragment with the current config file and show which entries change and how they are applied", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{added[],removed[],changed[],effective_changed[],hot_reload[],service_restart[],restart_required}" }, "400": { "description": "Returns the error when the proposed config is invalid" } } } },
     "/v1/config/apply": { "post": { "summary": "Apply a config fragment (admin only): changes only the given top-level entries and keeps the rest. Filters, access control, rate limits, the query log, and upstream DNS server addresses apply without interrupting service", "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed}" }, "400": { "description": "Returns the error when the input is invalid or the config file cannot be used" } } } },
     "/v1/config/rollback": { "post": { "summary": "Roll back to the state before the last config apply (admin only)", "responses": { "200": { "description": "{rolled_back,restart_required}" }, "409": { "description": "Returns an error when there is no previous config" } } } },
     "/v1/policies/simulate": { "post": { "summary": "Preview the policy and filter result for a DNS query", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "client": { "type": "string" }, "qname": { "type": "string" }, "qtype": { "type": "string" } }, "required": ["qname"] } } } }, "responses": { "200": { "description": "{policy,filter,filter_stage,filter_matched,filter_list,decision}" } } } },
@@ -5255,9 +5230,10 @@ fn openapi_json() -> String {
     },
     "/v1/config/effective": { "get": { "summary": "The config the server is actually running: defaults merged in, sensitive values masked. Direct edits to the config file are not included until applied", "responses": { "200": { "description": "Running config (JSON)" } } } },
     "/v1/config": { "get": { "summary": "Values saved in the config file, including changes not yet applied to the server. Returns error details when the file cannot be read or parsed", "responses": { "200": { "description": "Saved config values or a file error (JSON)" } } } },
-    "/v1/config/status": { "get": { "summary": "Check whether the config file matches the running config and show entries not yet applied", "responses": { "200": { "description": "{in_sync,changed_keys,error?}" } } } },
+    "/v1/config/status": { "get": { "summary": "Check whether the config file matches the running config and show entries not yet applied. service_restart lists the entries whose change restarts the DNS service when the file is applied; conditional_hot_reload_keys lists the settings that can restart it under the current configuration", "responses": { "200": { "description": "{in_sync,source,changed_keys[],service_restart[],restart_required,conditional_hot_reload_keys[],error?}" } } } },
     "/v1/config/reload": { "post": { "summary": "Validate config file changes and apply them to the running server (admin only)", "responses": { "200": { "description": "{accepted,mode,restart_required,changed}" }, "400": { "description": "{error}: config file is missing or invalid" } } } },
     "/v1/config/set": { "post": { "summary": "Change settings (admin only): merges the values into the TOML file, validates, and saves. Hot-reloadable entries apply without dropping connections; others restart the DNS service. Nested entries use their dedicated APIs", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{applied,mode,restart_required,reloading,changed,keys}" }, "400": { "description": "{error}: unknown key or invalid value" } } } },
+    "/v1/config/set/diff": { "post": { "summary": "Show which entries a /v1/config/set request with this body would change and how they would be applied, without changing anything (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{added[],removed[],changed[],effective_changed[],hot_reload[],service_restart[],restart_required}" }, "400": { "description": "{error}: unknown key or invalid value" } } } },
     "/v1/config/schema": { "get": { "summary": "Settings that /v1/config/set can change, with their types and descriptions", "responses": { "200": { "description": "{keys:[...],count}" } } } },
     "/v1/upstreams/test": { "post": { "summary": "Test an upstream DNS server (admin only): sends a test query and reports reachability, latency, and response code", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "{ok,latency_ms,rcode,addr}" }, "400": { "description": "{error}" } } } },
     "/v1/cache/flush": { "post": { "summary": "Flush the whole response cache (admin only). Returns the number of entries removed", "responses": { "200": { "description": "{flushed}" } } } },
@@ -5337,7 +5313,7 @@ mod tests {
         let started = Instant::now();
         let stream = TcpStream::connect(addr).unwrap();
         let mut reader = BufReader::new(DeadlineTcp::new(
-            SharedTcp::new(stream),
+            AdmittedTcp::new(SharedTcp::new(stream), Vec::new(), None),
             started + Duration::from_millis(120),
         ));
         let mut line = String::new();
@@ -5420,13 +5396,15 @@ mod tests {
             &mut pending.admission_bytes,
             AdmissionBytesGuard::new(admission_total.clone()),
         );
-        let mut reader = DeadlineTcp::with_shutdown(
-            pending.stream.clone(),
+        let mut reader = DeadlineTcp::new(
+            AdmittedTcp::new(
+                pending.stream.clone(),
+                std::mem::take(&mut pending.received),
+                Some(admission_bytes),
+            ),
             pending.deadline,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            std::mem::take(&mut pending.received),
-            admission_bytes,
-        );
+        )
+        .stop_on(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let mut received = vec![0u8; request.len()];
         reader.read_exact(&mut received).unwrap();
         assert_eq!(received, request, "기존 파서가 원래 요청을 그대로 봅니다");
@@ -5694,6 +5672,9 @@ mod tests {
                 } else {
                     Ok("{\"applied\":true,\"reloading\":true}".to_string())
                 }
+            }),
+            config_set_diff: Box::new(|_| {
+                Ok("{\"added\":[],\"removed\":[],\"changed\":[]}".to_string())
             }),
             config_schema: Box::new(|| "{\"keys\":[\"prefetch\",\"cache_size\"]}".to_string()),
             upstream_test: Box::new(|b| {
@@ -6747,6 +6728,7 @@ mod tests {
         for path in [
             "/v1/config/validate",
             "/v1/config/diff",
+            "/v1/config/set/diff",
             "/v1/explain",
             "/v1/policies/simulate",
             "/v1/tls/validate",

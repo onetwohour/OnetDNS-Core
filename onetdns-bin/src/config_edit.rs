@@ -424,6 +424,8 @@ pub(crate) fn validate_config_patch_values(
         "cluster_raft_secret",
         "cluster_raft_node_key",
         "zones_etcd_password",
+        "cachedb_redis_secret",
+        "cachedb_redis_password",
     ];
     /** @brief 암호가 섞여 있어 가려서 보여 주는 주소들. */
     const REDACTED_URLS: &[&str] = &["zones_postgres", "zones_mysql"];

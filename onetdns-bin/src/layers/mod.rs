@@ -33,7 +33,7 @@ pub use acme_challenge::AcmeChallengeLayer;
 pub use aggressive_nsec::AggressiveNsecLayer;
 pub use authority::AuthorityLayer;
 pub use below_nxdomain::BelowNxdomainLayer;
-pub use cache_db::CacheDbLayer;
+pub use cache_db::{CacheDbLayer, CacheDbScope};
 pub use ddr::{DdrEndpoint, DdrLayer};
 pub use dhcp_dns::DhcpDnsLayer;
 pub use dynamic_record::DynamicRecordLayer;

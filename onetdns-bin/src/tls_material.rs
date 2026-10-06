@@ -79,6 +79,26 @@ pub(crate) fn load_client_ca(path: &std::path::Path) -> Result<onetdns_tls::Trus
     })
 }
 
+/** @brief 공유 캐시의 TLS 인증서를 검증할 신뢰 저장소. CA 파일이 없으면 시스템 신뢰 저장소를 쓴다. */
+pub(crate) fn cachedb_redis_roots(
+    ca: Option<&std::path::Path>,
+) -> Result<onetdns_tls::TrustStore, String> {
+    let Some(path) = ca else {
+        return Ok(onetdns_tls::TrustStore::system());
+    };
+    let pem = read_bytes_limited(path, LOCAL_CA_MAX_BYTES).map_err(|error| {
+        format!(
+            "Could not read the shared cache TLS CA file ({}): {error}",
+            path.display()
+        )
+    })?;
+    onetdns_tls::TrustStore::try_from_pem(&pem).map_err(|error| {
+        format!(
+            "The shared cache TLS CA file contains a corrupted or unsupported certificate: {error}"
+        )
+    })
+}
+
 /** @brief 자체 서명 인증서를 만든다. */
 pub(crate) fn gen_cert(host: String, cert_out: PathBuf, key_out: PathBuf) -> BoxResult<()> {
     let (cert_pem, key_pem) = onetdns_transport::generate_self_signed_pem(&host)?;

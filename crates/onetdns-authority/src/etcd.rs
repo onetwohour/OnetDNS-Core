@@ -9,14 +9,14 @@
  */
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use onetdns_tls::{client_handshake, ClientConfig, TlsConnection, TrustStore};
 
 use crate::source::ZoneSource;
-use crate::{parse_zone, ZoneStore};
+use crate::{parse_zone, DeadlineTcp, ZoneStore};
 /** @brief 응답 헤더 전체 크기 상한. */
 const MAX_HTTP_HEADER: usize = 64 * 1024;
 /** @brief 응답 본문 크기 상한. */
@@ -29,63 +29,6 @@ const MAX_HTTP_HEADERS: usize = 200;
 const MAX_HTTP_HEADER_LINE: usize = 8 * 1024;
 /** @brief 요청 하나에 걸리는 전체 데드라인. */
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/**
- * @brief 절대 데드라인이 걸린 TCP.
- * @details 읽기마다 남은 시간을 다시 계산해 타임아웃으로 건다. 매 읽기에 고정 시간을
- *          주면 한 바이트씩 흘려 보내는 상대가 데드라인을 무한정 늘릴 수 있다.
- */
-struct DeadlineTcp {
-    /** @brief 실제 소켓. */
-    stream: TcpStream,
-    /** @brief 이 시각까지만 기다린다. */
-    deadline: Instant,
-}
-
-impl DeadlineTcp {
-    /** @brief 남은 시간만큼만 기다려 접속한다. */
-    fn connect(addr: SocketAddr, deadline: Instant) -> Result<Self, HttpError> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| {
-                HttpError::Other(format!("{addr}: the connection took longer than allowed"))
-            })?;
-        let stream = TcpStream::connect_timeout(&addr, remaining)
-            .map_err(|error| HttpError::Other(format!("{addr}: {error}")))?;
-        Ok(Self { stream, deadline })
-    }
-
-    /** @brief 데드라인까지 남은 시간. 이미 지났으면 타임아웃 오류다. */
-    fn remaining(&self) -> std::io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
-    }
-}
-
-impl Read for DeadlineTcp {
-    /** @brief 남은 시간을 타임아웃으로 걸고 읽는다. */
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for DeadlineTcp {
-    /** @brief 남은 시간을 타임아웃으로 걸고 쓴다. */
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    /** @brief 남은 시간을 타임아웃으로 걸고 비운다. */
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.flush()
-    }
-}
 
 /** @brief etcd를 zone 공급자로 쓴다. 키가 origin, 값이 zone 텍스트다. */
 pub struct EtcdZoneSource {
@@ -449,7 +392,8 @@ fn http_post(
         body.len()
     );
     let deadline = Instant::now() + HTTP_TIMEOUT;
-    let mut stream = DeadlineTcp::connect(addr, deadline)?;
+    let mut stream = DeadlineTcp::connect(addr, deadline)
+        .map_err(|error| HttpError::Other(format!("{addr}: {error}")))?;
 
     let resp = if parts.https {
         let roots = tls.ok_or_else(|| {
@@ -938,33 +882,6 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-
-    /** @brief 한 바이트씩 흘려 보내는 상대가 데드라인을 늘리지 못하는지. */
-    #[test]
-    fn deadline_tcp_rejects_slow_drip_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for byte in 0..10 {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let started = Instant::now();
-        let mut stream = DeadlineTcp::connect(addr, started + Duration::from_millis(120)).unwrap();
-        let mut response = [0u8; 10];
-        let error = stream.read_exact(&mut response).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        server.join().unwrap();
-    }
 
     /** @brief 본문이 다 찼으면 연결이 닫히기를 기다리지 않는지. */
     #[test]
