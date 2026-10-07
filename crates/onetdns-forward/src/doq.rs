@@ -232,12 +232,8 @@ mod tests {
         (addr, trust)
     }
 
-    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
-    fn doq_server_ex(
-        ip: Ipv4Addr,
-        one_shot: bool,
-        name: &str,
-    ) -> (SocketAddr, Arc<TrustStore>, Arc<AtomicUsize>) {
+    /** @brief 자체 서명 인증서를 쓰는 DoQ 서버 설정과 그 인증서만 믿는 신뢰 저장소. */
+    fn doq_server_config(name: &str) -> (Arc<ServerConfig>, Arc<TrustStore>) {
         let ck = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
         let cert_der = ck.cert.der().to_vec();
         let key_der = ck.key_pair.serialize_der();
@@ -252,6 +248,16 @@ mod tests {
 
             resumption: Some(onetdns_tls::conn::ServerResumption::secure_default()),
         });
+        (scfg, trust)
+    }
+
+    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
+    fn doq_server_ex(
+        ip: Ipv4Addr,
+        one_shot: bool,
+        name: &str,
+    ) -> (SocketAddr, Arc<TrustStore>, Arc<AtomicUsize>) {
+        let (scfg, trust) = doq_server_config(name);
 
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -430,6 +436,64 @@ mod tests {
         )
         .with_trust(Arc::new(TrustStore::empty()));
         assert!(fwd.resolve(&q(1, "x.test")).is_err());
+    }
+
+    #[test]
+    /**
+     * @brief 업스트림 인증서를 거부한 클라이언트가 그 까닭을 서버에 알리는지.
+     * @details 알리지 않고 연결을 버리면 서버는 핸드셰이크 중인 연결을 자기 유휴 데드라인까지
+     *          붙들고 있다.
+     */
+    fn doq_rejected_certificate_is_reported_to_the_server() {
+        let (scfg, _trust) = doq_server_config("dns.test");
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let (closes, reported) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut conns: HashMap<SocketAddr, Connection> = HashMap::new();
+            let mut buf = [0u8; onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                let conn = conns.entry(peer).or_insert_with(|| {
+                    Connection::new_server(
+                        scfg.clone(),
+                        random_cid(),
+                        TransportParams::server_defaults(),
+                    )
+                });
+                let received = conn.recv_datagram(&buf[..n]);
+                if let Some(close) = conn.peer_close() {
+                    let _ = closes.send(close.clone());
+                    return;
+                }
+                if received.is_err() {
+                    conns.remove(&peer);
+                    continue;
+                }
+                while let Some(dg) = conn.next_datagram() {
+                    let _ = sock.send_to(&dg, peer);
+                }
+            }
+        });
+
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doq(addr, "dns.test")],
+            Duration::from_secs(3),
+        )
+        .with_trust(Arc::new(TrustStore::empty()));
+        assert!(fwd.resolve(&q(1, "x.test")).is_err());
+        let close = reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 거부 사유를 서버에 보내지 않았습니다");
+        assert_eq!(
+            close.error_code,
+            0x100 + 42,
+            "bad_certificate 경고를 담은 CRYPTO_ERROR 여야 합니다"
+        );
     }
 
     #[test]

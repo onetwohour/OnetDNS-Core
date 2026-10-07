@@ -513,12 +513,13 @@ impl<S: QuicService> ConnTable<S> {
             };
             entry.conn.set_now(now_ms);
             let sent = S::send_answer(&mut entry.conn, d.stream_id, wire, d.max_age);
-            if !connection_survives(S::NAME, entry.peer, sent) {
-                lost.push(d.conn_key);
-                continue;
-            }
+            let survives = connection_survives(S::NAME, entry.peer, sent);
+            /*
+             * 답을 싣다가 연결 오류가 나면 연결은 그 종료 프레임을 쌓아 두고 닫혔다. 버리는
+             * 경우에도 먼저 내보낸다.
+             */
             entry.flush(socket, S::NAME, "send_datagram");
-            if !entry.refresh_memory(S::NAME) || entry.conn.is_closed() {
+            if !survives || !entry.refresh_memory(S::NAME) || entry.conn.is_closed() {
                 lost.push(d.conn_key);
             }
         }
@@ -684,6 +685,11 @@ impl<S: QuicService> Listener<S> {
                     Some(entry.peer),
                     error,
                 );
+                /*
+                 * 연결은 오류를 알리는 종료 프레임을 쌓아 두고 닫혔다. 버리기 전에 내보내야
+                 * 상대가 자기 유휴 데드라인까지 기다리지 않는다.
+                 */
+                entry.flush(&self.socket, S::NAME, "send_datagram");
                 false
             }
             Ok(()) => {

@@ -8,7 +8,7 @@
  */
 
 use crate::der::{self, bit_string_bytes, Der, Tlv};
-use crate::x509::{extensions, parse_time, scheme_from_sig_algid, X509};
+use crate::x509::{extensions, parse_time, scheme_from_sig_algid, Extension, X509};
 use crate::TlsError;
 
 use sha1::{Digest, Sha1};
@@ -72,6 +72,16 @@ fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 /** @brief SEQUENCE DER 값을 만든다. */
 fn seq(content: &[u8]) -> Vec<u8> {
     tlv(der::SEQUENCE, content)
+}
+
+/** @brief 명시 태그 안에 든 Extensions 를 확장 목록으로 읽는다. 뒤에 남는 바이트는 거부한다. */
+fn explicit_extensions(explicit: &[u8]) -> Result<Vec<Extension<'_>>, TlsError> {
+    let mut outer = Der::new(explicit);
+    let list = outer.expect(der::SEQUENCE)?;
+    if !outer.is_empty() {
+        return Err(TlsError::BadCert);
+    }
+    extensions(list)
 }
 
 /** @brief 이 인증서에 대한 OCSP 질의를 만든다. 발급자 이름과 키의 해시가 식별자가 된다. */
@@ -225,7 +235,11 @@ fn parse_basic_ocsp(
     Ok(status)
 }
 
-/** @brief 응답 본문을 읽는다. */
+/**
+ * @brief 응답 본문을 읽는다.
+ * @details 응답 확장은 하나도 해석하지 않으므로 필수로 표시된 확장이 있으면 응답을 쓰지
+ *          않는다. 필수 표시는 그 확장을 모르는 쪽이 응답을 믿지 말라는 뜻이다.
+ */
 fn parse_response_data(
     tbs: &[u8],
     issuer: &X509,
@@ -248,8 +262,13 @@ fn parse_response_data(
     let responses = d.expect(der::SEQUENCE)?;
 
     if !d.is_empty() {
-        let extensions = d.next()?;
-        if extensions.tag != der::context(1) || !d.is_empty() {
+        let response_extensions = d.next()?;
+        if response_extensions.tag != der::context(1)
+            || !d.is_empty()
+            || explicit_extensions(response_extensions.value)?
+                .iter()
+                .any(|ext| ext.critical)
+        {
             return Err(TlsError::BadCert);
         }
     }
@@ -301,7 +320,11 @@ fn responder_id_matches(id: &ResponderId, certificate: &X509) -> bool {
     }
 }
 
-/** @brief 인증서 하나에 대한 상태를 읽는다. 시각 구간도 여기서 본다. */
+/**
+ * @brief 인증서 하나에 대한 상태를 읽는다. 시각 구간도 여기서 본다.
+ * @details 그 인증서를 가리키는 단건 응답에 필수 확장이 있으면 응답을 쓰지 않는다. 단건
+ *          확장도 하나도 해석하지 않기 때문이다.
+ */
 fn parse_single_response(
     single: &[u8],
     issuer: &X509,
@@ -371,6 +394,12 @@ fn parse_single_response(
                 return Err(TlsError::BadCert);
             }
         } else if field.tag == der::context(1) && !seen_extensions {
+            if explicit_extensions(field.value)?
+                .iter()
+                .any(|ext| ext.critical)
+            {
+                return Err(TlsError::BadCert);
+            }
             seen_extensions = true;
         } else {
             return Err(TlsError::BadCert);
@@ -608,13 +637,8 @@ impl Crl {
      *          인증서를 정상으로 본다.
      */
     fn read_extensions(explicit: &[u8]) -> Result<CrlScope, TlsError> {
-        let mut outer = Der::new(explicit);
-        let list = outer.expect(der::SEQUENCE)?;
-        if !outer.is_empty() {
-            return Err(TlsError::BadCert);
-        }
         let mut scope = CrlScope::default();
-        for ext in extensions(list)? {
+        for ext in explicit_extensions(explicit)? {
             if ext.oid == OID_DELTA_CRL_INDICATOR {
                 return Err(TlsError::BadCert);
             } else if ext.oid == OID_ISSUING_DISTRIBUTION_POINT {
@@ -785,11 +809,13 @@ mod tests {
             now - 600,
             Some(now + 3600),
             ca.subject_raw.clone(),
+            &[],
+            &[],
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    /** @brief 필드를 지정해 테스트용 OCSP 응답을 만든다. */
+    /** @brief 필드와 단건 확장, 응답 확장을 지정해 테스트용 OCSP 응답을 만든다. */
     fn build_basic_ocsp_custom(
         signing: &SigningKey,
         _ca: &X509,
@@ -802,6 +828,8 @@ mod tests {
         this_update_at: i64,
         next_update_at: Option<i64>,
         responder_name: Vec<u8>,
+        single_extensions: &[Vec<u8>],
+        response_extensions: &[Vec<u8>],
     ) -> Vec<u8> {
         let alg = seq(&{
             let mut a = tlv(der::OID, OID_SHA1);
@@ -827,6 +855,9 @@ mod tests {
         if let Some(next_update_at) = next_update_at {
             single.extend(tlv(der::context(0), &gen_time(next_update_at)));
         }
+        if !single_extensions.is_empty() {
+            single.extend(tlv(der::context(1), &seq(&single_extensions.concat())));
+        }
         let single = seq(&single);
         let responses = seq(&single);
 
@@ -834,6 +865,9 @@ mod tests {
         let mut rd = responder_id;
         rd.extend(gen_time(produced_at));
         rd.extend(responses);
+        if !response_extensions.is_empty() {
+            rd.extend(tlv(der::context(1), &seq(&response_extensions.concat())));
+        }
         let tbs = seq(&rd);
 
         let sig = sign_tbs(signing, &tbs);
@@ -916,6 +950,8 @@ mod tests {
             now - 60,
             Some(now + 3600),
             ca.subject_raw.clone(),
+            &[],
+            &[],
         );
         assert_eq!(
             check_ocsp_response(&wrap_ocsp(&response), &ca, &leaf.serial, now).unwrap(),
@@ -940,6 +976,8 @@ mod tests {
             now - OCSP_MAX_AGE_WITHOUT_NEXT_UPDATE_SECS - 1,
             None,
             ca.subject_raw.clone(),
+            &[],
+            &[],
         );
         assert_eq!(
             check_ocsp_response(&wrap_ocsp(&response), &ca, &leaf.serial, now).unwrap(),
@@ -965,8 +1003,76 @@ mod tests {
             now - 60,
             Some(now + 3600),
             other_ca.subject_raw,
+            &[],
+            &[],
         );
         assert!(check_ocsp_response(&wrap_ocsp(&response), &ca, &leaf.serial, now).is_err());
+    }
+
+    #[test]
+    /**
+     * @brief 응답 확장이나 그 인증서의 단건 확장에 필수 확장이 붙은 OCSP 응답을 쓰지 않는지.
+     *        필수가 아닌 확장은 넘긴다.
+     */
+    fn ocsp_critical_extensions_are_rejected() {
+        let (ca, leaf, sk, _) = gen_ca_and_leaf();
+        let now = 1_700_000_000i64;
+        let respond = |single: &[Vec<u8>], response: &[Vec<u8>]| {
+            let basic = build_basic_ocsp_custom(
+                &sk,
+                &ca,
+                &leaf,
+                0,
+                now,
+                sha1(&ca.subject_raw),
+                sha1(&ca.public_key),
+                leaf.serial.clone(),
+                now - 600,
+                Some(now + 3600),
+                ca.subject_raw.clone(),
+                single,
+                response,
+            );
+            check_ocsp_response(&wrap_ocsp(&basic), &ca, &leaf.serial, now)
+        };
+        let nonce_oid: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+        let nonce = ext(nonce_oid, false, &tlv(der::OCTET_STRING, &[7; 16]));
+        let critical = ext(&[0x2a, 0x03, 0x04], true, &[0x05, 0x00]);
+
+        assert_eq!(
+            respond(std::slice::from_ref(&nonce), std::slice::from_ref(&nonce)),
+            Ok(RevocationStatus::Good),
+            "필수가 아닌 확장은 넘겨야 한다"
+        );
+        for (case, single, response) in [
+            ("응답 확장", vec![], vec![critical.clone()]),
+            ("단건 확장", vec![critical.clone()], vec![]),
+            (
+                "두 번 나온 확장",
+                vec![],
+                vec![nonce.clone(), nonce.clone()],
+            ),
+        ] {
+            assert_eq!(
+                respond(&single, &response),
+                Err(TlsError::BadCert),
+                "{case}: 거부해야 한다"
+            );
+        }
+    }
+
+    #[test]
+    /** @brief 명시 태그 안의 Extensions 뒤로 바이트가 남으면 확장 목록을 읽지 않는지. */
+    fn explicit_extensions_reject_trailing_bytes() {
+        let list = seq(&ext(&[0x2a, 0x03, 0x04], false, &[0x05, 0x00]));
+        assert_eq!(explicit_extensions(&list).map(|list| list.len()), Ok(1));
+        let mut trailing = list;
+        trailing.push(0);
+        assert_eq!(
+            explicit_extensions(&trailing).map(|list| list.len()),
+            Err(TlsError::BadCert),
+            "SEQUENCE 뒤에 남은 바이트는 거부해야 한다"
+        );
     }
 
     /** @brief 기본 응답을 바깥 껍데기로 감싼다. */

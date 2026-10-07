@@ -160,9 +160,18 @@ fn roundtrip(
     check_peer_revocation(c.h3.conn_mut(), &c.server_name, &mut c.revocation_checked)?;
 
     c.h3.set_now(c.created.elapsed().as_millis() as u64);
-    let sid =
-        c.h3.send_request(authority, path, &q)
-            .map_err(|error| ForwardError::Io(format!("DoH3 request send: {error}")))?;
+    let sid = match c.h3.send_request(authority, path, &q) {
+        Ok(sid) => sid,
+        Err(error) => {
+            /*
+             * 필수 스트림이 닫혀 HTTP/3 계층이 연결을 닫았으면 그 종료 프레임이 쌓여 있다.
+             * 부른 쪽이 이 연결을 버리므로 먼저 내보낸다. 보내지 못해도 돌려줄 것은 원래
+             * 오류다.
+             */
+            let _ = flush_out(&c.sock, &mut c.h3);
+            return Err(ForwardError::Io(format!("DoH3 request send: {error}")));
+        }
+    };
     flush_out(&c.sock, &mut c.h3)?;
 
     let silence_limit = Duration::from_millis(silence_limit_ms(c.h3.conn_mut().base_pto_ms()));

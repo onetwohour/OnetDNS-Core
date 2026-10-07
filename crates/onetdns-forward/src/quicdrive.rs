@@ -304,7 +304,12 @@ pub(crate) fn flush_out<D: QuicDriven>(sock: &QuicSocket, d: &mut D) -> Result<(
     Ok(())
 }
 
-/** @brief 데이터그램 하나를 받아 상태에 넣고, 그 결과로 나갈 것을 내보낸다. */
+/**
+ * @brief 데이터그램 하나를 받아 상태에 넣는다.
+ * @details 넣다가 연결 오류가 나면 상태 기계는 그 오류를 알리는 종료 프레임을 쌓아 두고
+ *          닫힌다. 부른 쪽은 이 오류를 받으면 연결을 버리므로 여기서 그 프레임을 내보낸다.
+ * @return 데이터그램을 받았으면 true, 수신 한도까지 아무것도 오지 않았으면 false.
+ */
 pub(crate) fn recv_once<D: QuicDriven>(
     sock: &QuicSocket,
     d: &mut D,
@@ -313,9 +318,15 @@ pub(crate) fn recv_once<D: QuicDriven>(
     use std::io::ErrorKind;
     match sock.wait.recv(&sock.sock, buf) {
         Ok(n) => {
-            d.recv_datagram(&buf[..n]).map_err(|error| {
-                ForwardError::Io(format!("Could not process QUIC datagram: {error}"))
-            })?;
+            if let Err(error) = d.recv_datagram(&buf[..n]) {
+                /*
+                 * 종료 프레임을 보내지 못해도 돌려줄 것은 원래 오류다.
+                 */
+                let _ = flush_out(sock, d);
+                return Err(ForwardError::Io(format!(
+                    "Could not process QUIC datagram: {error}"
+                )));
+            }
             Ok(true)
         }
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(false),

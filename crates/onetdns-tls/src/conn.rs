@@ -26,7 +26,7 @@ use crate::msg::{ClientHello, Extension, ServerHello};
 use crate::record::{ContentType, TlsRecord, MAX_CIPHERTEXT, MAX_FRAGMENT};
 use crate::sys::{fill_random, random_32};
 use crate::tls12::{self, Tls12RecordCrypto};
-use crate::wire::Writer;
+use crate::wire::{Reader, Writer};
 use crate::x509::X509;
 use crate::TlsError;
 
@@ -36,10 +36,13 @@ const MAX_CONSECUTIVE_EMPTY_APPLICATION_RECORDS: usize = 32;
 /** @brief 한 연결에서 보낼 수 있는 TLS 1.3 키 세대 수. */
 const MAX_TLS13_KEY_UPDATES: u64 = (1u64 << 48) - 1;
 
+/** @brief 치명 경고의 수준 값. */
+const ALERT_LEVEL_FATAL: u8 = 2;
+
 /** @brief 경고 레코드를 오류로 옮긴다. 정상 종료 통지는 오류와 구분한다. */
 fn alert_error(payload: &[u8]) -> TlsError {
     if payload.len() < 2 || payload.len() % 2 != 0 {
-        return TlsError::Protocol;
+        return TlsError::Decode;
     }
     for alert in payload.chunks_exact(2) {
         let level = alert[0];
@@ -49,6 +52,19 @@ fn alert_error(payload: &[u8]) -> TlsError {
         }
     }
     TlsError::CloseNotify
+}
+
+/**
+ * @brief 1.3 에서 보호된 경고 레코드를 오류로 옮긴다.
+ * @details 1.3 은 한 레코드에 경고를 정확히 하나 담게 한다. 내용이 빈 레코드는 경고가 아니므로
+ *          받을 수 없는 레코드로 보고, 길이가 다르면 경고를 읽어 내지 못한 것으로 본다.
+ */
+fn tls13_alert_error(payload: &[u8]) -> TlsError {
+    match payload.len() {
+        0 => TlsError::UnexpectedMessage,
+        2 => alert_error(payload),
+        _ => TlsError::Decode,
+    }
 }
 
 /** @brief 지금 쓰는 레코드 보호. 판마다 방식이 다르다. */
@@ -68,10 +84,24 @@ impl RecordLayer {
         }
     }
 
-    /** @brief 레코드를 복호화한다. */
+    /**
+     * @brief 치명 경고를 이 키로 보호해 보낸다.
+     * @note 보내지 못해도 결과는 같다. 이미 실패한 연결이고 호출자는 원래 실패 사유를 돌려준다.
+     */
+    fn send_fatal_alert<S: Write>(&mut self, s: &mut S, description: u8) {
+        if let Ok(record) = self.encrypt(ContentType::Alert, &[ALERT_LEVEL_FATAL, description]) {
+            let _ = write_record(s, &record);
+        }
+    }
+
+    /**
+     * @brief 레코드를 복호화한다.
+     * @retval TlsError::Decrypt 레코드 버전이 다르다. 버전은 AEAD 의 추가 인증 자료에 들어가므로
+     *         바뀐 레코드는 인증에 실패한 것과 같다.
+     */
     fn decrypt(&mut self, rec: &TlsRecord) -> Result<(ContentType, Vec<u8>), TlsError> {
         if rec.version != crate::record::LEGACY_VERSION {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::Decrypt);
         }
 
         let (content_type, plaintext, limit) = match self {
@@ -85,6 +115,81 @@ impl RecordLayer {
             return Err(TlsError::RecordOverflow);
         }
         Ok((content_type, plaintext))
+    }
+}
+
+/**
+ * @brief 핸드셰이크 동안 이쪽이 보내는 방향의 보호 상태.
+ * @details 핸드셰이크 메시지와 치명 경고가 모두 이 상태를 거쳐 나간다. RFC 8446 은 경고를 그
+ *          시점의 송신 보호로 보내게 하는데, 송신 키와 일련번호를 쥔 것이 이것 하나이므로
+ *          실패한 자리에서 보내는 경고도 이미 쓴 nonce 를 다시 쓰지 않는다.
+ */
+enum HandshakeWrite {
+    /** @brief 아직 아무것도 보내지 않았다. 이때 실패하면 경고도 보내지 않는다. */
+    Silent,
+    /** @brief 평문 레코드로 보낸다. */
+    Plain,
+    /** @brief 이 키로 보호해 보낸다. */
+    Protected(RecordLayer),
+}
+
+impl HandshakeWrite {
+    /** @brief 핸드셰이크를 끝까지 진행한다. 실패하면 그 시점의 송신 보호로 사유를 알린다. */
+    fn run<S: Write>(
+        mut self,
+        s: &mut S,
+        handshake: impl FnOnce(&mut S, &mut HandshakeWrite) -> Result<TlsConnection, TlsError>,
+    ) -> Result<TlsConnection, TlsError> {
+        let result = handshake(s, &mut self);
+        if let Err(error) = &result {
+            self.send_alert(s, error);
+        }
+        result
+    }
+
+    /** @brief 핸드셰이크 메시지를 지금 보호로 보낸다. 레코드 상한에 맞춰 나눈다. */
+    fn send<S: Write>(&mut self, s: &mut S, encoded: &[u8]) -> Result<(), TlsError> {
+        match self {
+            HandshakeWrite::Protected(layer) => {
+                for chunk in encoded.chunks(MAX_FRAGMENT) {
+                    let record = layer.encrypt(ContentType::Handshake, chunk)?;
+                    write_record(s, &record)?;
+                }
+                Ok(())
+            }
+            HandshakeWrite::Silent | HandshakeWrite::Plain => {
+                *self = HandshakeWrite::Plain;
+                write_plain_handshake(s, encoded)
+            }
+        }
+    }
+
+    /** @brief 이후 보내는 것을 이 키로 보호한다. */
+    fn protect(&mut self, layer: RecordLayer) {
+        *self = HandshakeWrite::Protected(layer);
+    }
+
+    /** @brief 핸드셰이크를 마친 연결이 이어 쓸 송신 보호를 넘긴다. */
+    fn take_layer(&mut self) -> Result<RecordLayer, TlsError> {
+        match std::mem::replace(self, HandshakeWrite::Silent) {
+            HandshakeWrite::Protected(layer) => Ok(layer),
+            _ => Err(TlsError::Internal),
+        }
+    }
+
+    /** @brief 핸드셰이크를 끝낸 실패를 상대에게 치명 경고로 알린다. */
+    fn send_alert<S: Write>(&mut self, s: &mut S, error: &TlsError) {
+        let Some(description) = error.alert() else {
+            return;
+        };
+        match self {
+            HandshakeWrite::Silent => {}
+            HandshakeWrite::Plain => {
+                let alert = vec![ALERT_LEVEL_FATAL, description];
+                let _ = write_record(s, &TlsRecord::new(ContentType::Alert, alert));
+            }
+            HandshakeWrite::Protected(layer) => layer.send_fatal_alert(s, description),
+        }
     }
 }
 
@@ -417,6 +522,13 @@ pub struct TlsConnection {
 
     /** @brief 핸드셰이크 뒤 받아 외부가 아직 가져가지 않은 세션. */
     new_sessions: Vec<crate::session::TlsSession>,
+
+    /**
+     * @brief 치명 경고를 보냈거나 받아서 끝난 연결의 실패 사유.
+     * @details RFC 8446 은 치명 경고를 주고받은 연결에서 더는 아무것도 보내거나 받지 못하게
+     *          한다. 그래서 이 값이 있으면 읽기, 쓰기, 종료 통지를 모두 이 사유로 거절한다.
+     */
+    failed: Option<TlsError>,
 }
 
 /** @brief TLS 1.3 응용 키를 다음 세대로 바꾸는 데 필요한 최소 상태. */
@@ -506,7 +618,7 @@ impl TlsConnection {
 
     /** @brief 받는 TLS 1.3 응용 키를 다음 세대로 원자 교체한다. */
     fn update_read_key(&mut self) -> Result<(), TlsError> {
-        let traffic = self.traffic.as_mut().ok_or(TlsError::Protocol)?;
+        let traffic = self.traffic.as_mut().ok_or(TlsError::Internal)?;
         let secret = traffic_update(traffic.hash, &traffic.read_secret);
         let (key, iv) = traffic_keys(traffic.hash, &secret, traffic.key_len);
         use zeroize::Zeroize;
@@ -518,7 +630,7 @@ impl TlsConnection {
 
     /** @brief 보내는 TLS 1.3 응용 키를 다음 세대로 원자 교체한다. */
     fn update_write_key(&mut self) -> Result<(), TlsError> {
-        let traffic = self.traffic.as_mut().ok_or(TlsError::Protocol)?;
+        let traffic = self.traffic.as_mut().ok_or(TlsError::Internal)?;
         if traffic.write_updates >= MAX_TLS13_KEY_UPDATES {
             return Err(TlsError::SeqExhausted);
         }
@@ -555,7 +667,7 @@ impl TlsConnection {
         .encode();
         let record = match &mut self.write {
             RecordLayer::Tls13(crypto) => crypto.encrypt(ContentType::Handshake, &encoded)?,
-            RecordLayer::Tls12(_) => return Err(TlsError::Protocol),
+            RecordLayer::Tls12(_) => return Err(TlsError::Internal),
         };
         write_record(s, &record)?;
         self.update_write_key()
@@ -580,6 +692,9 @@ impl TlsConnection {
     pub fn write_app<S: Write>(&mut self, s: &mut S, data: &[u8]) -> Result<(), TlsError> {
         /** @brief 한 번에 보낼 응용 자료 크기. 조각 상한을 넘지 않게 잡는다. */
         const APP_CHUNK: usize = MAX_FRAGMENT;
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if data.is_empty() {
             self.ensure_write_key_capacity(s)?;
             let rec = self.write.encrypt(ContentType::ApplicationData, data)?;
@@ -601,48 +716,72 @@ impl TlsConnection {
     pub fn send_close_notify<S: Write>(&mut self, s: &mut S) -> Result<(), TlsError> {
         /** @brief warning 수준 close_notify. */
         const CLOSE_NOTIFY: [u8; 2] = [1, 0];
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         let rec = self.write.encrypt(ContentType::Alert, &CLOSE_NOTIFY)?;
         write_record(s, &rec)
     }
 
-    /** @brief 응용 데이터를 받는다. 핸드셰이크 뒤 메시지도 여기서 처리한다. */
+    /**
+     * @brief 응용 데이터를 받는다. 핸드셰이크 뒤 메시지도 여기서 처리한다.
+     * @details 받은 레코드 때문에 실패하면 그 사유를 치명 경고로 알리고 연결을 실패 상태로
+     *          둔다. 상대가 보낸 치명 경고를 받았을 때도 실패 상태로 두지만 경고로 답하지 않는다.
+     */
     pub fn read_app<S: Read + Write>(&mut self, s: &mut S) -> Result<Vec<u8>, TlsError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let result = self.read_application_data(s);
+        if let Err(error) = &result {
+            if let Some(description) = error.alert() {
+                self.write.send_fatal_alert(s, description);
+                self.failed = Some(error.clone());
+            } else if matches!(error, TlsError::PeerAlert { .. }) {
+                self.failed = Some(error.clone());
+            }
+        }
+        result
+    }
+
+    /** @brief 응용 데이터가 든 레코드가 올 때까지 읽는다. */
+    fn read_application_data<S: Read + Write>(&mut self, s: &mut S) -> Result<Vec<u8>, TlsError> {
         let mut ignored_records = 0usize;
         let mut post_handshake_messages = 0usize;
         let mut answered_key_update = false;
         loop {
             let rec = read_record(s)?;
             if rec.content_type == ContentType::ChangeCipherSpec {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::UnexpectedMessage);
             }
             let (ct, pt) = self.read.decrypt(&rec)?;
             match ct {
                 ContentType::ApplicationData if pt.is_empty() => {
                     ignored_records += 1;
                     if ignored_records > MAX_CONSECUTIVE_EMPTY_APPLICATION_RECORDS {
-                        return Err(TlsError::Protocol);
+                        return Err(TlsError::UnexpectedMessage);
                     }
                 }
                 ContentType::ApplicationData => {
                     if self.post_handshake.has_pending() {
-                        return Err(TlsError::Protocol);
+                        return Err(TlsError::UnexpectedMessage);
                     }
                     return Ok(pt);
                 }
-                ContentType::Handshake if pt.is_empty() => return Err(TlsError::Protocol),
+                ContentType::Handshake if pt.is_empty() => return Err(TlsError::UnexpectedMessage),
                 ContentType::Handshake => {
                     ignored_records += 1;
                     if ignored_records > MAX_CONSECUTIVE_EMPTY_APPLICATION_RECORDS
                         || self.version != TLS13
                     {
-                        return Err(TlsError::Protocol);
+                        return Err(TlsError::UnexpectedMessage);
                     }
                     let had_pending = self.post_handshake.has_pending();
                     self.post_handshake.feed(&pt);
                     while let Some(msg) = self.post_handshake.next_message()? {
                         post_handshake_messages += 1;
                         if post_handshake_messages > MAX_CONSECUTIVE_EMPTY_APPLICATION_RECORDS {
-                            return Err(TlsError::Protocol);
+                            return Err(TlsError::UnexpectedMessage);
                         }
                         match msg.msg_type {
                             HandshakeType::NewSessionTicket if self.is_client => {
@@ -673,12 +812,16 @@ impl TlsConnection {
                                     });
                                 }
                             }
-                            HandshakeType::KeyUpdate
-                                if !had_pending
-                                    && pt.len() == 5
-                                    && msg.body.len() == 1
-                                    && msg.body[0] <= 1 =>
-                            {
+                            HandshakeType::KeyUpdate => {
+                                if msg.body.len() != 1 {
+                                    return Err(TlsError::Decode);
+                                }
+                                if msg.body[0] > 1 {
+                                    return Err(TlsError::IllegalParameter);
+                                }
+                                if had_pending || pt.len() != 5 {
+                                    return Err(TlsError::UnexpectedMessage);
+                                }
                                 self.update_read_key()?;
                                 if msg.body[0] == 1
                                     && !answered_key_update
@@ -688,15 +831,13 @@ impl TlsConnection {
                                     answered_key_update = true;
                                 }
                             }
-                            _ => return Err(TlsError::Protocol),
+                            _ => return Err(TlsError::UnexpectedMessage),
                         }
                     }
                 }
-                ContentType::Alert if self.version == TLS13 && pt.len() != 2 => {
-                    return Err(TlsError::Protocol);
-                }
+                ContentType::Alert if self.version == TLS13 => return Err(tls13_alert_error(&pt)),
                 ContentType::Alert => return Err(alert_error(&pt)),
-                _ => return Err(TlsError::Protocol),
+                _ => return Err(TlsError::UnexpectedMessage),
             }
         }
     }
@@ -841,10 +982,14 @@ fn read_record<S: Read>(s: &mut S) -> Result<TlsRecord, TlsError> {
     })
 }
 
-/** @brief 레코드 하나를 쓴다. */
+/**
+ * @brief 레코드 하나를 쓴다.
+ * @retval TlsError::Internal 레코드가 상한을 넘는다. 이쪽이 만든 레코드이므로 상대에게
+ *         record_overflow 를 알릴 일이 아니다.
+ */
 fn write_record<S: Write>(s: &mut S, rec: &TlsRecord) -> Result<(), TlsError> {
     if rec.fragment.len() > MAX_CIPHERTEXT {
-        return Err(TlsError::RecordOverflow);
+        return Err(TlsError::Internal);
     }
     s.write_all(&rec.encode()).map_err(|_| TlsError::Io)
 }
@@ -867,10 +1012,10 @@ fn read_plaintext_handshake<S: Read>(s: &mut S) -> Result<HandshakeMsg, TlsError
         let rec = read_record(s)?;
         match rec.content_type {
             ContentType::ChangeCipherSpec if valid_ccs_record(&rec) => continue,
-            ContentType::ChangeCipherSpec => return Err(TlsError::Protocol),
+            ContentType::ChangeCipherSpec => return Err(TlsError::UnexpectedMessage),
             ContentType::Handshake => reader.feed(&rec.fragment),
             ContentType::Alert => return Err(alert_error(&rec.fragment)),
-            _ => return Err(TlsError::Protocol),
+            _ => return Err(TlsError::UnexpectedMessage),
         }
     }
 }
@@ -889,42 +1034,32 @@ impl EncReader {
         }
     }
 
-    /** @brief 다음 핸드셰이크 메시지를 읽는다. */
+    /**
+     * @brief 다음 핸드셰이크 메시지를 읽는다.
+     * @details 평문 경고도 받는다. 상대가 이쪽 ServerHello 를 처리하다 실패하면 핸드셰이크 키를
+     *          만들기 전이므로 경고를 평문으로 보낸다.
+     */
     fn next<S: Read>(&mut self, s: &mut S, c: &mut RecordCrypto) -> Result<HandshakeMsg, TlsError> {
         loop {
             if let Some(m) = self.hr.next_message()? {
                 return Ok(m);
             }
             let rec = read_record(s)?;
-            if rec.content_type == ContentType::ChangeCipherSpec {
-                if valid_ccs_record(&rec) {
-                    continue;
-                }
-                return Err(TlsError::Protocol);
+            match rec.content_type {
+                ContentType::ChangeCipherSpec if valid_ccs_record(&rec) => continue,
+                ContentType::ChangeCipherSpec => return Err(TlsError::UnexpectedMessage),
+                ContentType::Alert => return Err(alert_error(&rec.fragment)),
+                _ => {}
             }
             let (ct, pt) = c.decrypt(&rec)?;
             match ct {
-                ContentType::Handshake if pt.is_empty() => return Err(TlsError::Protocol),
+                ContentType::Handshake if pt.is_empty() => return Err(TlsError::UnexpectedMessage),
                 ContentType::Handshake => self.hr.feed(&pt),
-                ContentType::Alert if pt.len() == 2 => return Err(alert_error(&pt)),
-                _ => return Err(TlsError::Protocol),
+                ContentType::Alert => return Err(tls13_alert_error(&pt)),
+                _ => return Err(TlsError::UnexpectedMessage),
             }
         }
     }
-}
-
-/** @brief 핸드셰이크 메시지를 암호화해 보낸다. */
-fn send_hs_enc<S: Write>(
-    s: &mut S,
-    c: &mut RecordCrypto,
-    msg: &HandshakeMsg,
-) -> Result<(), TlsError> {
-    let encoded = msg.encode();
-    for chunk in encoded.chunks(MAX_FRAGMENT) {
-        let rec = c.encrypt(ContentType::Handshake, chunk)?;
-        write_record(s, &rec)?;
-    }
-    Ok(())
 }
 
 /** @brief 논스 기준값을 고정 길이 배열로. */
@@ -968,10 +1103,10 @@ fn encode_client_hello(
     let Some(session) = session else {
         return Ok(wire);
     };
-    let (hash, _) = suite_params(session.suite).ok_or(TlsError::Protocol)?;
+    let (hash, _) = suite_params(session.suite).ok_or(TlsError::Internal)?;
     let binders_len = 2 + 1 + hash.len();
     if wire.len() <= binders_len {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::Internal);
     }
     let mut binder_transcript = Transcript::new(hash);
     binder_transcript.update(binder_prefix);
@@ -1053,12 +1188,6 @@ fn accept_client_psk(
     Ok(Some(state))
 }
 
-/** @brief 서버 인사말에서 X25519 공개값을 꺼낸다. */
-fn x25519_server_share(sh: &ServerHello) -> Option<Vec<u8>> {
-    let (g, key) = sh.ext(EXT_KEY_SHARE)?.as_key_share_server()?;
-    (g == X25519).then_some(key)
-}
-
 /** @brief 클라이언트 인사말에서 X25519 공개값을 꺼낸다. */
 fn x25519_client_share(ch: &ClientHello) -> Option<Vec<u8>> {
     let entries = ch.ext(EXT_KEY_SHARE)?.as_key_share_client()?;
@@ -1092,21 +1221,44 @@ impl PlainHsReader {
             match rec.content_type {
                 ContentType::Handshake => self.hr.feed(&rec.fragment),
                 ContentType::ChangeCipherSpec if valid_ccs_record(&rec) => {}
-                ContentType::ChangeCipherSpec => return Err(TlsError::Protocol),
+                ContentType::ChangeCipherSpec => return Err(TlsError::UnexpectedMessage),
                 ContentType::Alert => return Err(alert_error(&rec.fragment)),
-                _ => return Err(TlsError::Protocol),
+                _ => return Err(TlsError::UnexpectedMessage),
             }
         }
     }
 }
 
-/** @brief 호환용 더미 레코드를 받는다. 1.3에서는 뜻이 없지만 오기는 한다. */
+/** @brief 1.2 에서 상대의 ChangeCipherSpec 을 받는다. 그 자리에 온 경고는 상대의 실패다. */
 fn expect_ccs<S: Read>(s: &mut S) -> Result<(), TlsError> {
     let rec = read_record(s)?;
-    if !valid_ccs_record(&rec) {
-        return Err(TlsError::Protocol);
+    if valid_ccs_record(&rec) {
+        return Ok(());
     }
-    Ok(())
+    if rec.content_type == ContentType::Alert {
+        return Err(alert_error(&rec.fragment));
+    }
+    Err(TlsError::UnexpectedMessage)
+}
+
+/**
+ * @brief 1.2 에서 상대의 ChangeCipherSpec 다음에 오는 Finished 를 읽는다.
+ * @details 상대는 이미 새 키로 넘어갔으므로 이 자리의 레코드는 모두 보호돼 있다. 경고도 풀어서
+ *          읽는다.
+ */
+fn read_tls12_finished<S: Read>(
+    s: &mut S,
+    read_c: &mut Tls12RecordCrypto,
+) -> Result<HandshakeMsg, TlsError> {
+    let record = read_record(s)?;
+    if record.version != crate::record::LEGACY_VERSION {
+        return Err(TlsError::Decrypt);
+    }
+    match record.content_type {
+        ContentType::Handshake => parse_exact_handshake(&read_c.decrypt(&record)?),
+        ContentType::Alert => Err(alert_error(&read_c.decrypt(&record)?)),
+        _ => Err(TlsError::UnexpectedMessage),
+    }
 }
 
 /** @brief 더미 레코드가 규격 형태인지. 아무 바이트나 받으면 그것이 경로가 된다. */
@@ -1116,11 +1268,16 @@ fn valid_ccs_record(record: &TlsRecord) -> bool {
         && record.fragment == [1]
 }
 
-/** @brief 바이트열이 정확히 핸드셰이크 메시지 하나인지. 뒤에 바이트가 남으면 거부한다. */
+/**
+ * @brief 바이트열이 정확히 핸드셰이크 메시지 하나인지. 뒤에 바이트가 남으면 거부한다.
+ * @retval TlsError::Decode 메시지가 덜 왔다.
+ * @retval TlsError::UnexpectedMessage 메시지 뒤에 바이트가 남았다. 키가 바뀌는 자리에서는
+ *         메시지가 레코드 경계에서 끝나야 한다.
+ */
 fn parse_exact_handshake(bytes: &[u8]) -> Result<HandshakeMsg, TlsError> {
-    let (message, used) = HandshakeMsg::parse(bytes)?.ok_or(TlsError::Protocol)?;
+    let (message, used) = HandshakeMsg::parse(bytes)?.ok_or(TlsError::Decode)?;
     if used != bytes.len() {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     Ok(message)
 }
@@ -1137,20 +1294,36 @@ fn scheme_is_ecdsa(scheme: u16) -> bool {
 
 /**
  * @brief 1.2 클라이언트 인사말이 이쪽이 답할 수 있는 형태인지.
+ * @details 점 형식 목록을 보냈는데 압축하지 않은 형식이 없으면 거절한다. RFC 8422 는 그런
+ *          목록을 받은 서버가 핸드셰이크를 끝내도록 요구한다. 확장 마스터 비밀이나 첫 연결의
+ *          재협상 정보가 없으면 이쪽이 받아들일 수 있는 매개변수가 없는 것이다.
  * @warning 이쪽 인증서로 쓸 수 있는 서명 방식을 제안했는지 확인한다.
  */
 fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(), TlsError> {
-    if ch.legacy_version != TLS12
-        || ch.compression_methods != [0]
-        || !ch
-            .ext(tls12::EXT_EXTENDED_MASTER_SECRET)
-            .is_some_and(|extension| extension.data.is_empty())
+    if ch.legacy_version != TLS12 {
+        return Err(TlsError::ProtocolVersion);
+    }
+    if ch.compression_methods != [0] {
+        return Err(TlsError::IllegalParameter);
+    }
+    if !ch
+        .ext(tls12::EXT_EXTENDED_MASTER_SECRET)
+        .is_some_and(|extension| extension.data.is_empty())
         || ch
             .ext(tls12::EXT_RENEGOTIATION_INFO)
             .is_none_or(|extension| extension.data != [0])
-        || !ch.offers_signature_scheme(sign_scheme)
     {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::HandshakeFailure);
+    }
+    if ch
+        .ext(tls12::EXT_EC_POINT_FORMATS)
+        .and_then(Extension::as_ec_point_formats)
+        .is_some_and(|formats| !formats.contains(&tls12::EC_POINT_FORMAT_UNCOMPRESSED))
+    {
+        return Err(TlsError::IllegalParameter);
+    }
+    if !ch.offers_signature_scheme(sign_scheme) {
+        return Err(TlsError::HandshakeFailure);
     }
     Ok(())
 }
@@ -1158,67 +1331,89 @@ fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(),
 /**
  * @brief 1.2 서버 인사말이 이쪽 제안 안에 있는지.
  * @details 서버 이름을 보냈으면 서버는 빈 server_name 확장으로 그 이름을 썼다고 알릴 수 있다.
- *          RFC 6066 이 허용하는 응답이고, 많은 부하 분산기가 이렇게 답한다.
- * @warning 이쪽이 제안하지 않은 스위트나 확장을 받아들이면 다운그레이드이 성립한다.
+ *          RFC 6066 이 허용하는 응답이고, 많은 부하 분산기가 이렇게 답한다. 점 형식 목록은
+ *          압축하지 않은 형식이 들어 있으면 받아들인다. 이쪽이 제안했지만 1.2 서버 인사말에
+ *          올 수 없는 확장은 IllegalParameter 다.
+ * @warning 이쪽이 제안하지 않은 스위트나 확장을 받아들이면 다운그레이드가 성립한다.
+ * @return 서버가 고른 응용 프로토콜.
  */
 fn validate_tls12_server_hello(
     cfg: &ClientConfig,
     ch: &ClientHello,
     sh: &ServerHello,
 ) -> Result<Option<Vec<u8>>, TlsError> {
-    if sh.legacy_version != TLS12
-        || sh.ext(EXT_SUPPORTED_VERSIONS).is_some()
-        || !ch.cipher_suites.contains(&sh.cipher_suite)
+    if sh.legacy_version != TLS12 {
+        return Err(TlsError::ProtocolVersion);
+    }
+    if !ch.cipher_suites.contains(&sh.cipher_suite)
         || !tls12::client_suites().contains(&sh.cipher_suite)
-        || !sh
-            .ext(tls12::EXT_EXTENDED_MASTER_SECRET)
-            .is_some_and(|extension| extension.data.is_empty())
-        || sh
-            .ext(tls12::EXT_RENEGOTIATION_INFO)
-            .is_none_or(|extension| extension.data != [0])
-        || !sh
-            .extensions
-            .iter()
-            .all(|extension| match extension.ext_type {
-                tls12::EXT_EXTENDED_MASTER_SECRET
-                | tls12::EXT_RENEGOTIATION_INFO
-                | tls12::EXT_EC_POINT_FORMATS
-                | EXT_ALPN => true,
-                EXT_SERVER_NAME => extension.data.is_empty() && ch.ext(EXT_SERVER_NAME).is_some(),
-                _ => false,
-            })
-        || sh
-            .ext(tls12::EXT_EC_POINT_FORMATS)
-            .is_some_and(|extension| extension.data != [1, 0])
     {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::IllegalParameter);
     }
-    match sh.ext(EXT_ALPN) {
-        Some(extension) => {
-            let protocols = extension.as_alpn().ok_or(TlsError::Protocol)?;
-            if protocols.len() != 1 || !cfg.alpn.contains(&protocols[0]) {
-                return Err(TlsError::Protocol);
-            }
-            Ok(Some(protocols[0].clone()))
+    for extension in &sh.extensions {
+        if ch.ext(extension.ext_type).is_none() {
+            return Err(TlsError::UnsupportedExtension);
         }
-        None => Ok(None),
+        match extension.ext_type {
+            tls12::EXT_EXTENDED_MASTER_SECRET | EXT_SERVER_NAME => {
+                if !extension.data.is_empty() {
+                    return Err(TlsError::Decode);
+                }
+            }
+            tls12::EXT_RENEGOTIATION_INFO => {
+                let mut reader = Reader::new(&extension.data);
+                let renegotiated_connection = reader.vec8()?;
+                if !reader.is_empty() {
+                    return Err(TlsError::Decode);
+                }
+                if !renegotiated_connection.is_empty() {
+                    return Err(TlsError::HandshakeFailure);
+                }
+            }
+            tls12::EXT_EC_POINT_FORMATS => {
+                let formats = extension.as_ec_point_formats().ok_or(TlsError::Decode)?;
+                if !formats.contains(&tls12::EC_POINT_FORMAT_UNCOMPRESSED) {
+                    return Err(TlsError::IllegalParameter);
+                }
+            }
+            EXT_ALPN => {}
+            _ => return Err(TlsError::IllegalParameter),
+        }
     }
+    if sh.ext(tls12::EXT_EXTENDED_MASTER_SECRET).is_none()
+        || sh.ext(tls12::EXT_RENEGOTIATION_INFO).is_none()
+    {
+        return Err(TlsError::HandshakeFailure);
+    }
+    sh.ext(EXT_ALPN)
+        .map(|extension| extension.selected_alpn(&cfg.alpn))
+        .transpose()
 }
 
 /**
  * @brief 서버로서 핸드셰이크를 마친다. 버전에 따라 갈린다.
- * @details 다시 시도 요청은 재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도
- *          인사말은 지원 곡선과 서명 방식을 바꾸거나 재개 제안을 새로 넣을 수 없으므로,
- *          X25519 를 지원하지 않거나 재개 제안 없이 이쪽 서명 방식을 빠뜨린 인사말은 첫
- *          인사말에서 거절한다.
+ * @details 실패하면 그 사유를 그 시점의 송신 보호로 치명 경고를 보내 알린다. 다시 시도 요청은
+ *          재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도 인사말은 지원 곡선과
+ *          서명 방식을 바꾸거나 재개 제안을 새로 넣을 수 없으므로, X25519 를 지원하지 않거나
+ *          재개 제안 없이 이쪽 서명 방식을 빠뜨린 인사말은 첫 인사말에서 거절한다.
+ * @retval TlsError::Internal 설정이 와이어에 담기지 않는다. 상대에게는 아무것도 보내지 않는다.
  */
 pub fn server_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
 ) -> Result<TlsConnection, TlsError> {
     if !server_config_wire_is_valid(cfg) {
-        return Err(TlsError::RecordOverflow);
+        return Err(TlsError::Internal);
     }
+    HandshakeWrite::Plain.run(s, |s, w| run_server_handshake(s, cfg, w))
+}
+
+/** @brief 서버 핸드셰이크 본체. 보내는 것은 모두 w 를 거친다. */
+fn run_server_handshake<S: Read + Write>(
+    s: &mut S,
+    cfg: &ServerConfig,
+    w: &mut HandshakeWrite,
+) -> Result<TlsConnection, TlsError> {
     let mut ch_msg = read_plaintext_handshake(s)?;
     let mut ch = ClientHello::from_handshake(&ch_msg)?;
 
@@ -1227,22 +1422,26 @@ pub fn server_handshake<S: Read + Write>(
         .and_then(|e| e.as_supported_versions_client())
         .map(|vs| vs.contains(&TLS13))
         .unwrap_or(false);
-    if offers_13 && !ch.is_valid_tls13() {
-        return Err(TlsError::Protocol);
-    }
-    if offers_13 && ch.ext(EXT_COOKIE).is_some() {
-        return Err(TlsError::Protocol);
+    if offers_13 {
+        ch.validate_tls13()?;
+        if ch.ext(EXT_COOKIE).is_some() {
+            return Err(TlsError::IllegalParameter);
+        }
     }
     if !(offers_13 && choose_suite(&ch.cipher_suites).is_some()) {
         if cfg.client_ca.is_some() {
-            return Err(TlsError::Protocol);
+            return Err(if offers_13 {
+                TlsError::HandshakeFailure
+            } else {
+                TlsError::ProtocolVersion
+            });
         }
-        return server_handshake_tls12(s, cfg, ch_msg, ch);
+        return server_handshake_tls12(s, cfg, ch_msg, ch, w);
     }
 
-    let suite = choose_suite(&ch.cipher_suites).ok_or(TlsError::Protocol)?;
-    let (hash, key_len) = suite_params(suite).ok_or(TlsError::Protocol)?;
-    let aead = aead_for_suite(suite).ok_or(TlsError::Protocol)?;
+    let suite = choose_suite(&ch.cipher_suites).ok_or(TlsError::Internal)?;
+    let (hash, key_len) = suite_params(suite).ok_or(TlsError::Internal)?;
+    let aead = aead_for_suite(suite).ok_or(TlsError::Internal)?;
 
     let mut transcript = Transcript::new(hash);
     let mut psk_binder_prefix = Vec::new();
@@ -1255,10 +1454,10 @@ pub fn server_handshake<S: Read + Write>(
             .map(|gs| gs.contains(&X25519))
             .unwrap_or(false);
         if !supports_x25519 {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::HandshakeFailure);
         }
         if ch.ext(EXT_PRE_SHARED_KEY).is_none() && !ch.offers_signature_scheme(cfg.sign_scheme) {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::HandshakeFailure);
         }
 
         transcript.update(&ch_msg.encode());
@@ -1276,33 +1475,37 @@ pub fn server_handshake<S: Read + Write>(
             ],
         };
         let hrr_msg = hrr.to_handshake();
-        write_plain_handshake(s, &hrr_msg.encode())?;
+        w.send(s, &hrr_msg.encode())?;
         transcript.update(&hrr_msg.encode());
 
         ch_msg = read_plaintext_handshake(s)?;
         ch = ClientHello::from_handshake(&ch_msg)?;
-        if !ch.is_valid_tls13() || !ch.is_valid_retry_of(&first_ch) {
-            return Err(TlsError::Protocol);
+        ch.validate_tls13()?;
+        if !ch.is_valid_retry_of(&first_ch) {
+            return Err(TlsError::IllegalParameter);
         }
         let echoed = ch
-            .ext(crate::msg::consts::EXT_COOKIE)
-            .and_then(|e| e.as_cookie());
-        if echoed.as_deref() != Some(cookie.as_slice()) {
-            return Err(TlsError::Protocol);
+            .ext(EXT_COOKIE)
+            .ok_or(TlsError::MissingExtension)?
+            .as_cookie()
+            .ok_or(TlsError::Decode)?;
+        if echoed != cookie {
+            return Err(TlsError::IllegalParameter);
         }
         let retry_shares = ch
             .ext(EXT_KEY_SHARE)
-            .and_then(Extension::as_key_share_client)
-            .ok_or(TlsError::Protocol)?;
+            .ok_or(TlsError::MissingExtension)?
+            .as_key_share_client()
+            .ok_or(TlsError::Decode)?;
         if retry_shares.len() != 1 || retry_shares[0].0 != X25519 || retry_shares[0].1.len() != 32 {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
         psk_binder_prefix.extend_from_slice(transcript.as_bytes());
         transcript.update(&ch_msg.encode());
     } else {
         transcript.update(&ch_msg.encode());
     }
-    let client_pub = x25519_client_share(&ch).ok_or(TlsError::Protocol)?;
+    let client_pub = x25519_client_share(&ch).ok_or(TlsError::Internal)?;
 
     let client_alpn = ch
         .ext(EXT_ALPN)
@@ -1317,7 +1520,7 @@ pub fn server_handshake<S: Read + Write>(
         .filter(|state| state.suite == suite);
     let resumed = psk.is_some();
     if !resumed && !ch.offers_signature_scheme(cfg.sign_scheme) {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::HandshakeFailure);
     }
     let client_allows_resumption = ch
         .ext(EXT_PSK_KEY_EXCHANGE_MODES)
@@ -1326,8 +1529,11 @@ pub fn server_handshake<S: Read + Write>(
 
     let mut seed = Zeroizing::new([0u8; 32]);
     fill_random(&mut *seed);
-    let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Protocol)?;
-    let shared = Zeroizing::new(kx.shared_secret(&client_pub).ok_or(TlsError::Protocol)?);
+    let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
+    let shared = Zeroizing::new(
+        kx.shared_secret(&client_pub)
+            .ok_or(TlsError::IllegalParameter)?,
+    );
 
     let mut sh_extensions = vec![
         Extension::supported_versions_server(TLS13),
@@ -1344,7 +1550,7 @@ pub fn server_handshake<S: Read + Write>(
         extensions: sh_extensions,
     };
     let sh_msg = sh.to_handshake();
-    write_plain_handshake(s, &sh_msg.encode())?;
+    w.send(s, &sh_msg.encode())?;
     transcript.update(&sh_msg.encode());
 
     let mut ks = match &psk {
@@ -1357,14 +1563,14 @@ pub fn server_handshake<S: Read + Write>(
     let shs = Zeroizing::new(ks.server_handshake_traffic_secret(&th));
     let (ck, civ) = traffic_keys(hash, &chs, key_len);
     let (sk, siv) = traffic_keys(hash, &shs, key_len);
-    let mut write_c = RecordCrypto::new(aead, sk, iv12(siv));
+    w.protect(RecordLayer::Tls13(RecordCrypto::new(aead, sk, iv12(siv))));
     let mut read_c = RecordCrypto::new(aead, ck, iv12(civ));
 
     let ee = HandshakeMsg::new(
         HandshakeType::EncryptedExtensions,
         encrypted_extensions(negotiated_alpn.as_deref()),
     );
-    send_hs_enc(s, &mut write_c, &ee)?;
+    w.send(s, &ee.encode())?;
     transcript.update(&ee.encode());
 
     let want_client_cert = cfg.client_ca.is_some() && !resumed;
@@ -1373,7 +1579,7 @@ pub fn server_handshake<S: Read + Write>(
             HandshakeType::CertificateRequest,
             crate::cert::CertificateRequestMsg::standard().encode(),
         );
-        send_hs_enc(s, &mut write_c, &cr)?;
+        w.send(s, &cr.encode())?;
         transcript.update(&cr.encode());
     }
 
@@ -1390,7 +1596,7 @@ pub fn server_handshake<S: Read + Write>(
                 .collect(),
         };
         let cert_msg = HandshakeMsg::new(HandshakeType::Certificate, cert.encode());
-        send_hs_enc(s, &mut write_c, &cert_msg)?;
+        w.send(s, &cert_msg.encode())?;
         transcript.update(&cert_msg.encode());
 
         let cv_content = certificate_verify_content(&transcript.hash(), true);
@@ -1399,20 +1605,26 @@ pub fn server_handshake<S: Read + Write>(
             signature: (cfg.sign)(&cv_content),
         };
         let cv_msg = HandshakeMsg::new(HandshakeType::CertificateVerify, cv.encode());
-        send_hs_enc(s, &mut write_c, &cv_msg)?;
+        w.send(s, &cv_msg.encode())?;
         transcript.update(&cv_msg.encode());
     }
 
     let sfk = Zeroizing::new(finished_key(hash, &shs));
     let sfin = finished_verify_data(hash, &sfk, &transcript.hash());
     let fin_msg = HandshakeMsg::new(HandshakeType::Finished, sfin);
-    send_hs_enc(s, &mut write_c, &fin_msg)?;
+    w.send(s, &fin_msg.encode())?;
     transcript.update(&fin_msg.encode());
 
+    /*
+     * 이쪽 Finished 를 보낸 뒤로 서버의 송신 키는 응용 키다. 클라이언트의 인증서나 Finished 를
+     * 거절하는 경고도 이 키로 보내야 클라이언트가 풀 수 있다.
+     */
     ks.enter_master();
     let th_after = transcript.hash();
     let cap = ks.client_application_traffic_secret(&th_after);
     let sap = ks.server_application_traffic_secret(&th_after);
+    let (sak, saiv) = traffic_keys(hash, &sap, key_len);
+    w.protect(RecordLayer::Tls13(RecordCrypto::new(aead, sak, iv12(saiv))));
 
     let mut er = EncReader::new();
     let mut th_for_client_fin = th_after.clone();
@@ -1420,21 +1632,21 @@ pub fn server_handshake<S: Read + Write>(
     if want_client_cert {
         let cert_m = er.next(s, &mut read_c)?;
         if cert_m.msg_type != HandshakeType::Certificate {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
         let ccert = CertificateMsg::parse(&cert_m.body)?;
 
         if ccert.entries.is_empty() {
-            return Err(TlsError::BadCert);
+            return Err(TlsError::CertificateRequired);
         }
         let chain: Vec<X509> = ccert
             .entries
             .iter()
             .map(|e| X509::parse(&e.cert_data))
             .collect::<Result<_, _>>()?;
-        let store = cfg.client_ca.as_ref().ok_or(TlsError::Protocol)?;
+        let store = cfg.client_ca.as_ref().ok_or(TlsError::Internal)?;
         crate::trust::verify_client_chain(&chain, store, now_epoch())?;
-        let client_certificate = chain.first().ok_or(TlsError::BadCert)?;
+        let client_certificate = chain.first().ok_or(TlsError::Internal)?;
         client_auth_identity = Some(format!(
             "mtls:{}",
             short_hex(&client_certificate.public_key)
@@ -1444,7 +1656,7 @@ pub fn server_handshake<S: Read + Write>(
         let th_before_cv = transcript.hash();
         let cv_m = er.next(s, &mut read_c)?;
         if cv_m.msg_type != HandshakeType::CertificateVerify {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
         let cv = CertificateVerify::parse(&cv_m.body)?;
         let cv_content = certificate_verify_content(&th_before_cv, false);
@@ -1454,16 +1666,10 @@ pub fn server_handshake<S: Read + Write>(
     }
     let cfin = er.next(s, &mut read_c)?;
     let cfk = Zeroizing::new(finished_key(hash, &chs));
-    let expected = finished_verify_data(hash, &cfk, &th_for_client_fin);
-    if cfin.msg_type != HandshakeType::Finished || !crate::keyschedule::ct_eq(&cfin.body, &expected)
-    {
-        return Err(TlsError::BadSignature);
-    }
+    cfin.verify_finished(&finished_verify_data(hash, &cfk, &th_for_client_fin))?;
     transcript.update(&cfin.encode());
 
     let (cak, caiv) = traffic_keys(hash, &cap, key_len);
-    let (sak, saiv) = traffic_keys(hash, &sap, key_len);
-    let mut application_write = RecordCrypto::new(aead, sak, iv12(saiv));
     if let Some(resumption) = &cfg.resumption {
         if cfg.client_ca.is_none() && client_allows_resumption && resumption.lifetime_secs > 0 {
             let master = Zeroizing::new(ks.resumption_master_secret(&transcript.hash()));
@@ -1483,10 +1689,7 @@ pub fn server_handshake<S: Read + Write>(
                 lifetime_secs: resumption.lifetime_secs,
                 max_early_data: 0,
             };
-            let ticket = resumption
-                .ticketer
-                .seal(&state)
-                .ok_or(TlsError::RecordOverflow)?;
+            let ticket = resumption.ticketer.seal(&state).ok_or(TlsError::Internal)?;
             let message = HandshakeMsg::new(
                 HandshakeType::NewSessionTicket,
                 crate::msg::NewSessionTicket {
@@ -1498,12 +1701,12 @@ pub fn server_handshake<S: Read + Write>(
                 }
                 .encode(),
             );
-            send_hs_enc(s, &mut application_write, &message)?;
+            w.send(s, &message.encode())?;
         }
     }
     Ok(TlsConnection {
         read: RecordLayer::Tls13(RecordCrypto::new(aead, cak, iv12(caiv))),
-        write: RecordLayer::Tls13(application_write),
+        write: w.take_layer()?,
         version: TLS13,
         alpn: negotiated_alpn,
         client_authenticated: client_auth_identity.is_some(),
@@ -1522,6 +1725,7 @@ pub fn server_handshake<S: Read + Write>(
         resumed,
         resumption: None,
         new_sessions: Vec::new(),
+        failed: None,
     })
 }
 
@@ -1597,22 +1801,37 @@ fn build_client_hello(
     }
 }
 
-/** @brief 클라이언트로서 핸드셰이크를 마친다. */
+/**
+ * @brief 클라이언트로서 핸드셰이크를 마친다.
+ * @details 실패하면 그 사유를 그 시점의 송신 보호로 치명 경고를 보내 알린다. 서버 인사말을
+ *          받은 뒤로는 클라이언트 핸드셰이크 키로 보호한다. 이쪽은 조기 데이터를 보내지 않으므로
+ *          서버는 그 키로 읽고 있다.
+ * @retval TlsError::Internal 설정이 와이어에 담기지 않는다. 상대에게는 아무것도 보내지 않는다.
+ */
 pub fn client_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ClientConfig,
 ) -> Result<TlsConnection, TlsError> {
     if !client_config_wire_is_valid(cfg) {
-        return Err(TlsError::RecordOverflow);
+        return Err(TlsError::Internal);
     }
+    HandshakeWrite::Silent.run(s, |s, w| run_client_handshake(s, cfg, w))
+}
+
+/** @brief 클라이언트 핸드셰이크 본체. 보내는 것은 모두 w 를 거친다. */
+fn run_client_handshake<S: Read + Write>(
+    s: &mut S,
+    cfg: &ClientConfig,
+    w: &mut HandshakeWrite,
+) -> Result<TlsConnection, TlsError> {
     let mut seed = Zeroizing::new([0u8; 32]);
     fill_random(&mut *seed);
-    let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Protocol)?;
+    let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
 
     let mut offered_session = fresh_client_session(cfg);
     let ch = build_client_hello(cfg, &kx, cfg.send_key_share, None, offered_session);
     let mut ch_bytes = encode_client_hello(&ch, offered_session, &[])?;
-    write_plain_handshake(s, &ch_bytes)?;
+    w.send(s, &ch_bytes)?;
 
     let mut server_hs = PlainHsReader::new();
     let mut sh_msg = server_hs.next(s)?;
@@ -1628,28 +1847,23 @@ pub fn client_handshake<S: Read + Write>(
         /** @brief 더 낮은 판으로 끌어내렸음을 나타내는 표시. */
         const DOWNGRADE_11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
         if sh.random[24..32] == DOWNGRADE_12 || sh.random[24..32] == DOWNGRADE_11 {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
-        return client_handshake_tls12(s, cfg, ch, ch_bytes, sh, sh_msg, server_hs);
+        return client_handshake_tls12(s, cfg, ch, ch_bytes, sh, sh_msg, server_hs, w);
     }
 
     let mut hrr_transcript: Option<Transcript> = None;
     let mut hrr_suite = None;
+    let mut retry_hello: Option<ClientHello> = None;
     if sh.random == crate::msg::HRR_RANDOM {
-        if !sh.is_valid_tls13(&ch.session_id, true) || x25519_client_share(&ch).is_some() {
-            return Err(TlsError::Protocol);
-        }
-        let selected = sh.ext(EXT_KEY_SHARE).and_then(|e| e.as_key_share_hrr());
-        if selected != Some(X25519) {
-            return Err(TlsError::Protocol);
-        }
+        sh.validate_retry_request(&ch)?;
         let cookie = match sh.ext(EXT_COOKIE) {
-            Some(extension) => Some(extension.as_cookie().ok_or(TlsError::Protocol)?),
+            Some(extension) => Some(extension.as_cookie().ok_or(TlsError::Decode)?),
             None => None,
         };
-        let (hash, _) = suite_params(sh.cipher_suite).ok_or(TlsError::Protocol)?;
+        let (hash, _) = suite_params(sh.cipher_suite).ok_or(TlsError::IllegalParameter)?;
         if !ch.cipher_suites.contains(&sh.cipher_suite) {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
         hrr_suite = Some(sh.cipher_suite);
 
@@ -1666,34 +1880,44 @@ pub fn client_handshake<S: Read + Write>(
         ch2.session_id.clone_from(&ch.session_id);
         ch2.cipher_suites.clone_from(&ch.cipher_suites);
         ch_bytes = encode_client_hello(&ch2, offered_session, t.as_bytes())?;
-        write_plain_handshake(s, &ch_bytes)?;
+        w.send(s, &ch_bytes)?;
         t.update(&ch_bytes);
         hrr_transcript = Some(t);
+        retry_hello = Some(ch2);
 
         sh_msg = read_plaintext_handshake(s)?;
         sh = ServerHello::from_handshake(&sh_msg)?;
         if sh.random == crate::msg::HRR_RANDOM {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
     }
-    if !sh.is_valid_tls13(&ch.session_id, false) {
-        return Err(TlsError::Protocol);
-    }
+    let hello = retry_hello.as_ref().unwrap_or(&ch);
+    sh.validate_tls13(hello, false)?;
     let suite = sh.cipher_suite;
     if hrr_suite.is_some_and(|selected| selected != suite) {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::IllegalParameter);
     }
-    let (hash, key_len) = suite_params(suite).ok_or(TlsError::Protocol)?;
-    let aead = aead_for_suite(suite).ok_or(TlsError::Protocol)?;
-    let server_pub = x25519_server_share(&sh).ok_or(TlsError::Protocol)?;
-    let shared = Zeroizing::new(kx.shared_secret(&server_pub).ok_or(TlsError::Protocol)?);
-    let psk_accepted = match sh
-        .ext(EXT_PRE_SHARED_KEY)
-        .and_then(Extension::as_pre_shared_key_server)
-    {
-        Some(0) if offered_session.is_some_and(|session| session.suite == suite) => true,
-        Some(_) => return Err(TlsError::Protocol),
+    let (hash, key_len) = suite_params(suite).ok_or(TlsError::IllegalParameter)?;
+    let aead = aead_for_suite(suite).ok_or(TlsError::Internal)?;
+    let server_pub = sh.x25519_key_share()?;
+    let shared = Zeroizing::new(
+        kx.shared_secret(&server_pub)
+            .ok_or(TlsError::IllegalParameter)?,
+    );
+    let psk_accepted = match sh.ext(EXT_PRE_SHARED_KEY) {
         None => false,
+        Some(extension) => {
+            let selected = extension
+                .as_pre_shared_key_server()
+                .ok_or(TlsError::Decode)?;
+            let Some(session) = offered_session else {
+                return Err(TlsError::UnsupportedExtension);
+            };
+            if selected != 0 || session.suite != suite {
+                return Err(TlsError::IllegalParameter);
+            }
+            true
+        }
     };
 
     let mut transcript = match hrr_transcript {
@@ -1717,51 +1941,42 @@ pub fn client_handshake<S: Read + Write>(
     let (ck, civ) = traffic_keys(hash, &chs, key_len);
     let (sk, siv) = traffic_keys(hash, &shs, key_len);
     let mut read_c = RecordCrypto::new(aead, sk, iv12(siv));
-    let mut write_c = RecordCrypto::new(aead, ck, iv12(civ));
+    w.protect(RecordLayer::Tls13(RecordCrypto::new(aead, ck, iv12(civ))));
 
     let mut er = EncReader::new();
     let ee = er.next(s, &mut read_c)?;
     if ee.msg_type != HandshakeType::EncryptedExtensions {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
 
-    let ee_extensions = Extension::parse_vector(&ee.body)?;
-    if !ee_extensions
-        .iter()
-        .all(|extension| match extension.ext_type {
-            EXT_ALPN => true,
-            EXT_SERVER_NAME => extension.data.is_empty() && cfg.sni().is_some(),
-            EXT_SUPPORTED_GROUPS => extension.as_supported_groups().is_some(),
-            _ => false,
-        })
-    {
-        return Err(TlsError::Protocol);
-    }
-    let negotiated_alpn = match Extension::find(&ee_extensions, EXT_ALPN) {
-        Some(extension) => {
-            let protocols = extension.as_alpn().ok_or(TlsError::Protocol)?;
-            if protocols.len() != 1 || !cfg.alpn.contains(&protocols[0]) {
-                return Err(TlsError::Protocol);
+    let mut negotiated_alpn = None;
+    for extension in Extension::parse_vector(&ee.body)? {
+        match extension.ext_type {
+            EXT_ALPN => negotiated_alpn = Some(extension.selected_alpn(&cfg.alpn)?),
+            EXT_SERVER_NAME => {
+                if hello.ext(EXT_SERVER_NAME).is_none() {
+                    return Err(TlsError::UnsupportedExtension);
+                }
+                if !extension.data.is_empty() {
+                    return Err(TlsError::Decode);
+                }
             }
-            Some(protocols[0].clone())
+            EXT_SUPPORTED_GROUPS => {
+                extension.as_supported_groups().ok_or(TlsError::Decode)?;
+            }
+            other if hello.ext(other).is_some() => return Err(TlsError::IllegalParameter),
+            _ => return Err(TlsError::UnsupportedExtension),
         }
-        None => None,
-    };
+    }
     if psk_accepted && offered_session.is_none_or(|session| session.alpn != negotiated_alpn) {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::IllegalParameter);
     }
     transcript.update(&ee.encode());
 
     if psk_accepted {
         let fin_m = er.next(s, &mut read_c)?;
-        if fin_m.msg_type != HandshakeType::Finished {
-            return Err(TlsError::Protocol);
-        }
         let sfk = Zeroizing::new(finished_key(hash, &shs));
-        let expected = finished_verify_data(hash, &sfk, &transcript.hash());
-        if !crate::keyschedule::ct_eq(&fin_m.body, &expected) {
-            return Err(TlsError::BadSignature);
-        }
+        fin_m.verify_finished(&finished_verify_data(hash, &sfk, &transcript.hash()))?;
         transcript.update(&fin_m.encode());
         let application_transcript = transcript.hash();
 
@@ -1770,7 +1985,7 @@ pub fn client_handshake<S: Read + Write>(
             HandshakeType::Finished,
             finished_verify_data(hash, &cfk, &application_transcript),
         );
-        send_hs_enc(s, &mut write_c, &cfin_msg)?;
+        w.send(s, &cfin_msg.encode())?;
         transcript.update(&cfin_msg.encode());
 
         ks.enter_master();
@@ -1805,6 +2020,7 @@ pub fn client_handshake<S: Read + Write>(
                 master,
             }),
             new_sessions: Vec::new(),
+            failed: None,
         });
     }
 
@@ -1818,10 +2034,10 @@ pub fn client_handshake<S: Read + Write>(
     }
     let cert_m = next_m;
     if cert_m.msg_type != HandshakeType::Certificate {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     let cert = CertificateMsg::parse(&cert_m.body)?;
-    let leaf = cert.leaf().ok_or(TlsError::BadCert)?;
+    let leaf = cert.leaf().ok_or(TlsError::Decode)?;
     let x = X509::parse(leaf)?;
     let verified_chain = match &cfg.roots {
         Some(store) => {
@@ -1848,7 +2064,7 @@ pub fn client_handshake<S: Read + Write>(
     let th_before_cv = transcript.hash();
     let cv_m = er.next(s, &mut read_c)?;
     if cv_m.msg_type != HandshakeType::CertificateVerify {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     let cv = CertificateVerify::parse(&cv_m.body)?;
     let cv_content = certificate_verify_content(&th_before_cv, true);
@@ -1857,14 +2073,8 @@ pub fn client_handshake<S: Read + Write>(
 
     let th_before_fin = transcript.hash();
     let fin_m = er.next(s, &mut read_c)?;
-    if fin_m.msg_type != HandshakeType::Finished {
-        return Err(TlsError::Protocol);
-    }
     let sfk = Zeroizing::new(finished_key(hash, &shs));
-    let expected_sfin = finished_verify_data(hash, &sfk, &th_before_fin);
-    if !crate::keyschedule::ct_eq(&fin_m.body, &expected_sfin) {
-        return Err(TlsError::BadSignature);
-    }
+    fin_m.verify_finished(&finished_verify_data(hash, &sfk, &th_before_fin))?;
     transcript.update(&fin_m.encode());
     let th_after = transcript.hash();
 
@@ -1889,17 +2099,17 @@ pub fn client_handshake<S: Read + Write>(
             entries,
         };
         let cert_hs = HandshakeMsg::new(HandshakeType::Certificate, cmsg.encode());
-        send_hs_enc(s, &mut write_c, &cert_hs)?;
+        w.send(s, &cert_hs.encode())?;
         transcript.update(&cert_hs.encode());
         if has_cert {
-            let cc = cfg.client_cert.as_ref().ok_or(TlsError::Protocol)?;
+            let cc = cfg.client_cert.as_ref().ok_or(TlsError::Internal)?;
             let content = certificate_verify_content(&transcript.hash(), false);
             let cv = CertificateVerify {
                 algorithm: cc.sign_scheme,
                 signature: (cc.sign)(&content),
             };
             let cv_hs = HandshakeMsg::new(HandshakeType::CertificateVerify, cv.encode());
-            send_hs_enc(s, &mut write_c, &cv_hs)?;
+            w.send(s, &cv_hs.encode())?;
             transcript.update(&cv_hs.encode());
         }
         th_for_fin = transcript.hash();
@@ -1907,7 +2117,7 @@ pub fn client_handshake<S: Read + Write>(
     let cfk = Zeroizing::new(finished_key(hash, &chs));
     let cfin = finished_verify_data(hash, &cfk, &th_for_fin);
     let cfin_msg = HandshakeMsg::new(HandshakeType::Finished, cfin);
-    send_hs_enc(s, &mut write_c, &cfin_msg)?;
+    w.send(s, &cfin_msg.encode())?;
     transcript.update(&cfin_msg.encode());
 
     ks.enter_master();
@@ -1942,21 +2152,27 @@ pub fn client_handshake<S: Read + Write>(
             master: resumption_master,
         }),
         new_sessions: Vec::new(),
+        failed: None,
     })
 }
 
-/** @brief 1.2 서버 핸드셰이크. */
+/**
+ * @brief 1.2 서버 핸드셰이크.
+ * @details 이쪽 ChangeCipherSpec 을 보내기 전까지는 경고도 평문으로 나간다. 1.2 는 그 레코드를
+ *          보낼 때 송신 키를 바꾼다.
+ */
 fn server_handshake_tls12<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
     ch_msg: HandshakeMsg,
     ch: ClientHello,
+    w: &mut HandshakeWrite,
 ) -> Result<TlsConnection, TlsError> {
     validate_tls12_client_hello(&ch, cfg.sign_scheme)?;
     let server_ecdsa = scheme_is_ecdsa(cfg.sign_scheme);
-    let suite =
-        tls12::choose_server_suite(&ch.cipher_suites, server_ecdsa).ok_or(TlsError::Protocol)?;
-    let info = tls12::suite_info(suite).ok_or(TlsError::Protocol)?;
+    let suite = tls12::choose_server_suite(&ch.cipher_suites, server_ecdsa)
+        .ok_or(TlsError::HandshakeFailure)?;
+    let info = tls12::suite_info(suite).ok_or(TlsError::Internal)?;
 
     let client_groups = ch
         .ext(EXT_SUPPORTED_GROUPS)
@@ -1965,7 +2181,7 @@ fn server_handshake_tls12<S: Read + Write>(
     let group = tls12::supported_groups()
         .into_iter()
         .find(|g| client_groups.contains(g))
-        .ok_or(TlsError::Protocol)?;
+        .ok_or(TlsError::HandshakeFailure)?;
 
     let use_ems = ch.ext(tls12::EXT_EXTENDED_MASTER_SECRET).is_some();
     let client_random = ch.random;
@@ -1988,7 +2204,9 @@ fn server_handshake_tls12<S: Read + Write>(
         sh_exts.push(tls12::ext_extended_master_secret());
     }
     sh_exts.push(tls12::ext_renegotiation_info());
-    sh_exts.push(tls12::ext_ec_point_formats());
+    if ch.ext(tls12::EXT_EC_POINT_FORMATS).is_some() {
+        sh_exts.push(tls12::ext_ec_point_formats());
+    }
     if let Some(a) = &negotiated_alpn {
         sh_exts.push(Extension::alpn(&[a]));
     }
@@ -2000,19 +2218,19 @@ fn server_handshake_tls12<S: Read + Write>(
         extensions: sh_exts,
     };
     let sh_msg = sh.to_handshake();
-    write_plain_handshake(s, &sh_msg.encode())?;
+    w.send(s, &sh_msg.encode())?;
     transcript.extend_from_slice(&sh_msg.encode());
 
     let cert_msg = HandshakeMsg::new(
         HandshakeType::Certificate,
         tls12::certificate(&cfg.cert_chain),
     );
-    write_plain_handshake(s, &cert_msg.encode())?;
+    w.send(s, &cert_msg.encode())?;
     transcript.extend_from_slice(&cert_msg.encode());
 
     let mut seed = Zeroizing::new([0u8; 32]);
     fill_random(&mut *seed);
-    let kx = KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Protocol)?;
+    let kx = KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Internal)?;
     let params = tls12::ecdh_params(group, &kx.public_bytes());
     let signed = tls12::ske_signed_content(&client_random, &server_random, &params);
     let signature = (cfg.sign)(&signed);
@@ -2020,21 +2238,24 @@ fn server_handshake_tls12<S: Read + Write>(
         HandshakeType::ServerKeyExchange,
         tls12::server_key_exchange(&params, cfg.sign_scheme, &signature),
     );
-    write_plain_handshake(s, &ske_msg.encode())?;
+    w.send(s, &ske_msg.encode())?;
     transcript.extend_from_slice(&ske_msg.encode());
 
     let shd_msg = HandshakeMsg::new(HandshakeType::ServerHelloDone, Vec::new());
-    write_plain_handshake(s, &shd_msg.encode())?;
+    w.send(s, &shd_msg.encode())?;
     transcript.extend_from_slice(&shd_msg.encode());
 
     let mut phr = PlainHsReader::new();
     let cke = phr.next(s)?;
     if cke.msg_type != HandshakeType::ClientKeyExchange {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     let client_pub = tls12::parse_client_key_exchange(&cke.body)?;
     transcript.extend_from_slice(&cke.encode());
-    let shared = Zeroizing::new(kx.shared_secret(&client_pub).ok_or(TlsError::Protocol)?);
+    let shared = Zeroizing::new(
+        kx.shared_secret(&client_pub)
+            .ok_or(TlsError::IllegalParameter)?,
+    );
 
     let master = Zeroizing::new(if use_ems {
         tls12::extended_master_secret(info.hash, &shared, &info.hash.digest(&transcript))
@@ -2049,35 +2270,29 @@ fn server_handshake_tls12<S: Read + Write>(
         info.key_len,
     );
     let mut read_c = Tls12RecordCrypto::new(info.aead, km.client_key, km.client_iv);
-    let mut write_c = Tls12RecordCrypto::new(info.aead, km.server_key, km.server_iv);
+    let write_c = Tls12RecordCrypto::new(info.aead, km.server_key, km.server_iv);
 
     expect_ccs(s)?;
-    let cfin_rec = read_record(s)?;
-    if cfin_rec.content_type != ContentType::Handshake
-        || cfin_rec.version != crate::record::LEGACY_VERSION
-    {
-        return Err(TlsError::Protocol);
-    }
-    let cfin_plain = read_c.decrypt(&cfin_rec)?;
-    let cfin = parse_exact_handshake(&cfin_plain)?;
-    let expected = tls12::finished_verify_data(info.hash, &master, "client finished", &transcript);
-    if cfin.msg_type != HandshakeType::Finished || !crate::keyschedule::ct_eq(&cfin.body, &expected)
-    {
-        return Err(TlsError::BadSignature);
-    }
+    let cfin = read_tls12_finished(s, &mut read_c)?;
+    cfin.verify_finished(&tls12::finished_verify_data(
+        info.hash,
+        &master,
+        "client finished",
+        &transcript,
+    ))?;
     transcript.extend_from_slice(&cfin.encode());
 
     write_record(s, &ccs_record())?;
+    w.protect(RecordLayer::Tls12(write_c));
     let sfin = tls12::finished_verify_data(info.hash, &master, "server finished", &transcript);
-    let sfin_msg = HandshakeMsg::new(HandshakeType::Finished, sfin);
-    write_record(
+    w.send(
         s,
-        &write_c.encrypt(ContentType::Handshake, &sfin_msg.encode())?,
+        &HandshakeMsg::new(HandshakeType::Finished, sfin).encode(),
     )?;
 
     Ok(TlsConnection {
         read: RecordLayer::Tls12(read_c),
-        write: RecordLayer::Tls12(write_c),
+        write: w.take_layer()?,
         version: TLS12,
         alpn: negotiated_alpn,
         client_authenticated: false,
@@ -2089,10 +2304,16 @@ fn server_handshake_tls12<S: Read + Write>(
         resumed: false,
         resumption: None,
         new_sessions: Vec::new(),
+        failed: None,
     })
 }
 
-/** @brief 1.2 클라이언트 핸드셰이크. */
+#[allow(clippy::too_many_arguments)]
+/**
+ * @brief 1.2 클라이언트 핸드셰이크.
+ * @details 이쪽 ChangeCipherSpec 을 보내기 전까지는 경고도 평문으로 나간다. 1.2 는 그 레코드를
+ *          보낼 때 송신 키를 바꾼다.
+ */
 fn client_handshake_tls12<S: Read + Write>(
     s: &mut S,
     cfg: &ClientConfig,
@@ -2101,11 +2322,12 @@ fn client_handshake_tls12<S: Read + Write>(
     sh: ServerHello,
     sh_msg: HandshakeMsg,
     mut phr: PlainHsReader,
+    w: &mut HandshakeWrite,
 ) -> Result<TlsConnection, TlsError> {
     let client_random = ch.random;
     let negotiated_alpn = validate_tls12_server_hello(cfg, &ch, &sh)?;
     let suite = sh.cipher_suite;
-    let info = tls12::suite_info(suite).ok_or(TlsError::Protocol)?;
+    let info = tls12::suite_info(suite).ok_or(TlsError::Internal)?;
     let server_random = sh.random;
 
     let mut transcript = ch_bytes;
@@ -2113,14 +2335,14 @@ fn client_handshake_tls12<S: Read + Write>(
 
     let cert_message = phr.next(s)?;
     if cert_message.msg_type != HandshakeType::Certificate {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     let cert_chain = tls12::parse_certificate(&cert_message.body)?;
     transcript.extend_from_slice(&cert_message.encode());
 
     let ske_message = phr.next(s)?;
     if ske_message.msg_type != HandshakeType::ServerKeyExchange {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::UnexpectedMessage);
     }
     let (group, server_pub, params_bytes, sig_scheme, signature) =
         tls12::parse_server_key_exchange(&ske_message.body)?;
@@ -2128,32 +2350,30 @@ fn client_handshake_tls12<S: Read + Write>(
 
     let next = phr.next(s)?;
     if next.msg_type == HandshakeType::CertificateRequest {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::HandshakeFailure);
     }
-    if next.msg_type != HandshakeType::ServerHelloDone || !next.body.is_empty() {
-        return Err(TlsError::Protocol);
+    if next.msg_type != HandshakeType::ServerHelloDone {
+        return Err(TlsError::UnexpectedMessage);
+    }
+    if !next.body.is_empty() {
+        return Err(TlsError::Decode);
     }
     transcript.extend_from_slice(&next.encode());
-    if !tls12::group_supported(group) {
-        return Err(TlsError::Protocol);
-    }
-    if !ch
-        .ext(EXT_SUPPORTED_GROUPS)
-        .and_then(Extension::as_supported_groups)
-        .is_some_and(|groups| groups.contains(&group))
+    if !tls12::group_supported(group)
+        || !ch
+            .ext(EXT_SUPPORTED_GROUPS)
+            .and_then(Extension::as_supported_groups)
+            .is_some_and(|groups| groups.contains(&group))
         || info.ecdsa != scheme_is_ecdsa(sig_scheme)
+        || !ch
+            .ext(EXT_SIGNATURE_ALGORITHMS)
+            .and_then(Extension::as_signature_algorithms)
+            .is_some_and(|algorithms| algorithms.contains(&sig_scheme))
     {
-        return Err(TlsError::Protocol);
-    }
-    if !ch
-        .ext(EXT_SIGNATURE_ALGORITHMS)
-        .and_then(Extension::as_signature_algorithms)
-        .is_some_and(|algorithms| algorithms.contains(&sig_scheme))
-    {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::IllegalParameter);
     }
 
-    let leaf = cert_chain.first().ok_or(TlsError::BadCert)?;
+    let leaf = cert_chain.first().ok_or(TlsError::Decode)?;
     let x = X509::parse(leaf)?;
     let verified_chain = match &cfg.roots {
         Some(store) => {
@@ -2179,14 +2399,17 @@ fn client_handshake_tls12<S: Read + Write>(
 
     let mut seed = Zeroizing::new([0u8; 32]);
     fill_random(&mut *seed);
-    let kx = KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Protocol)?;
-    let shared = Zeroizing::new(kx.shared_secret(&server_pub).ok_or(TlsError::Protocol)?);
+    let kx = KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Internal)?;
+    let shared = Zeroizing::new(
+        kx.shared_secret(&server_pub)
+            .ok_or(TlsError::IllegalParameter)?,
+    );
 
     let cke_msg = HandshakeMsg::new(
         HandshakeType::ClientKeyExchange,
         tls12::client_key_exchange(&kx.public_bytes()),
     );
-    write_plain_handshake(s, &cke_msg.encode())?;
+    w.send(s, &cke_msg.encode())?;
     transcript.extend_from_slice(&cke_msg.encode());
 
     let master = Zeroizing::new(tls12::extended_master_secret(
@@ -2201,36 +2424,28 @@ fn client_handshake_tls12<S: Read + Write>(
         &server_random,
         info.key_len,
     );
-    let mut write_c = Tls12RecordCrypto::new(info.aead, km.client_key, km.client_iv);
+    let write_c = Tls12RecordCrypto::new(info.aead, km.client_key, km.client_iv);
     let mut read_c = Tls12RecordCrypto::new(info.aead, km.server_key, km.server_iv);
 
     write_record(s, &ccs_record())?;
+    w.protect(RecordLayer::Tls12(write_c));
     let cfin = tls12::finished_verify_data(info.hash, &master, "client finished", &transcript);
     let cfin_msg = HandshakeMsg::new(HandshakeType::Finished, cfin);
-    write_record(
-        s,
-        &write_c.encrypt(ContentType::Handshake, &cfin_msg.encode())?,
-    )?;
+    w.send(s, &cfin_msg.encode())?;
     transcript.extend_from_slice(&cfin_msg.encode());
 
     expect_ccs(s)?;
-    let sfin_rec = read_record(s)?;
-    if sfin_rec.content_type != ContentType::Handshake
-        || sfin_rec.version != crate::record::LEGACY_VERSION
-    {
-        return Err(TlsError::Protocol);
-    }
-    let sfin_plain = read_c.decrypt(&sfin_rec)?;
-    let sfin = parse_exact_handshake(&sfin_plain)?;
-    let expected = tls12::finished_verify_data(info.hash, &master, "server finished", &transcript);
-    if sfin.msg_type != HandshakeType::Finished || !crate::keyschedule::ct_eq(&sfin.body, &expected)
-    {
-        return Err(TlsError::BadSignature);
-    }
+    let sfin = read_tls12_finished(s, &mut read_c)?;
+    sfin.verify_finished(&tls12::finished_verify_data(
+        info.hash,
+        &master,
+        "server finished",
+        &transcript,
+    ))?;
 
     Ok(TlsConnection {
         read: RecordLayer::Tls12(read_c),
-        write: RecordLayer::Tls12(write_c),
+        write: w.take_layer()?,
         version: TLS12,
         alpn: negotiated_alpn,
         client_authenticated: false,
@@ -2242,6 +2457,7 @@ fn client_handshake_tls12<S: Read + Write>(
         resumed: false,
         resumption: None,
         new_sessions: Vec::new(),
+        failed: None,
     })
 }
 
@@ -2321,6 +2537,7 @@ mod tests {
             resumed: false,
             resumption: None,
             new_sessions: Vec::new(),
+            failed: None,
         }
     }
 
@@ -2377,7 +2594,7 @@ mod tests {
                 description: 40,
             }
         );
-        assert_eq!(alert_error(&[2]), TlsError::Protocol);
+        assert_eq!(alert_error(&[2]), TlsError::Decode);
     }
 
     #[test]
@@ -2415,7 +2632,7 @@ mod tests {
         let denied = vec![(ContentType::ApplicationData, &[][..]); 33];
         assert_eq!(
             test_tls13_connection().read_app(&mut encrypted_records(&denied)),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
     }
 
@@ -2424,19 +2641,23 @@ mod tests {
     fn invalid_protected_content_types_fail_closed() {
         assert_eq!(
             test_tls13_connection().read_app(&mut encrypted_records(&[(ContentType(0xff), b"x")])),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
         assert_eq!(
             test_tls13_connection()
                 .read_app(&mut encrypted_records(&[(ContentType::Handshake, b"")])),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
         assert_eq!(
             test_tls13_connection().read_app(&mut encrypted_records(&[(
                 ContentType::Alert,
                 &[1, 0, 1, 0]
             )])),
-            Err(TlsError::Protocol)
+            Err(TlsError::Decode)
+        );
+        assert_eq!(
+            test_tls13_connection().read_app(&mut encrypted_records(&[(ContentType::Alert, &[])])),
+            Err(TlsError::UnexpectedMessage)
         );
     }
 
@@ -2466,7 +2687,15 @@ mod tests {
                 ContentType::Handshake,
                 &key_update
             )])),
-            Err(TlsError::Protocol)
+            Err(TlsError::IllegalParameter)
+        );
+        let long_key_update = HandshakeMsg::new(HandshakeType::KeyUpdate, vec![0, 0]).encode();
+        assert_eq!(
+            test_tls13_connection().read_app(&mut encrypted_records(&[(
+                ContentType::Handshake,
+                &long_key_update
+            )])),
+            Err(TlsError::Decode)
         );
 
         assert_eq!(
@@ -2477,7 +2706,7 @@ mod tests {
                 ),
                 (ContentType::ApplicationData, b"dns"),
             ])),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
 
         let valid_key_update = HandshakeMsg::new(HandshakeType::KeyUpdate, vec![0]).encode();
@@ -2486,7 +2715,7 @@ mod tests {
                 (ContentType::Handshake, &valid_key_update[..2]),
                 (ContentType::Handshake, &valid_key_update[2..]),
             ])),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
         let mut coalesced = valid_key_update.clone();
         coalesced.extend_from_slice(&valid_key_update);
@@ -2495,17 +2724,33 @@ mod tests {
                 ContentType::Handshake,
                 &coalesced
             )])),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
     }
 
     #[test]
     /** @brief 핸드셰이크 중 예상 밖의 보호 레코드를 조용히 버리지 않는지. */
     fn encrypted_handshake_reader_rejects_unexpected_records() {
-        for (content_type, plaintext) in [
-            (ContentType::ApplicationData, &b"x"[..]),
-            (ContentType::Handshake, &b""[..]),
-            (ContentType::Alert, &[1, 0, 1, 0][..]),
+        for (content_type, plaintext, expected) in [
+            (
+                ContentType::ApplicationData,
+                &b"x"[..],
+                TlsError::UnexpectedMessage,
+            ),
+            (
+                ContentType::Handshake,
+                &b""[..],
+                TlsError::UnexpectedMessage,
+            ),
+            (ContentType::Alert, &[1, 0, 1, 0][..], TlsError::Decode),
+            (
+                ContentType::Alert,
+                &[2, 42][..],
+                TlsError::PeerAlert {
+                    level: 2,
+                    description: 42,
+                },
+            ),
         ] {
             let mut reader = EncReader::new();
             let secret = vec![0x42; Hash::Sha256.len()];
@@ -2516,9 +2761,125 @@ mod tests {
                     &mut encrypted_records(&[(content_type, plaintext)]),
                     &mut crypto
                 ),
-                Err(TlsError::Protocol)
+                Err(expected)
             );
         }
+    }
+
+    /** @brief encrypted_records 와 테스트 연결이 쓰는 키로 레코드를 푸는 상대 쪽 보호. */
+    fn test_peer_crypto() -> RecordCrypto {
+        let secret = vec![0x42; Hash::Sha256.len()];
+        let (key, iv) = traffic_keys(Hash::Sha256, &secret, 16);
+        RecordCrypto::new(Aead::Aes128Gcm, key, iv12(iv))
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크 실패를 그 시점의 송신 보호로 알리는지.
+     * @details 아무것도 보내기 전이면 상대는 이 연결을 모르므로 알리지 않는다. 입출력 실패와
+     *          상대가 보낸 경고에는 답하지 않는다.
+     */
+    fn handshake_failure_alert_follows_the_write_protection() {
+        let fail = |error: TlsError| {
+            move |_: &mut Vec<u8>, _: &mut HandshakeWrite| -> Result<TlsConnection, TlsError> {
+                Err(error)
+            }
+        };
+
+        let mut silent = Vec::new();
+        assert_eq!(
+            HandshakeWrite::Silent
+                .run(&mut silent, fail(TlsError::Decode))
+                .err(),
+            Some(TlsError::Decode)
+        );
+        assert!(silent.is_empty(), "아무것도 보내기 전에 경고를 보냈습니다");
+
+        let mut plain = Vec::new();
+        assert!(HandshakeWrite::Plain
+            .run(&mut plain, fail(TlsError::Decode))
+            .is_err());
+        assert_eq!(plain, [21, 3, 3, 0, 2, 2, 50]);
+
+        for error in [
+            TlsError::Io,
+            TlsError::Eof,
+            TlsError::PeerAlert {
+                level: 2,
+                description: 40,
+            },
+        ] {
+            let mut quiet = Vec::new();
+            assert!(HandshakeWrite::Plain
+                .run(&mut quiet, fail(error.clone()))
+                .is_err());
+            assert!(quiet.is_empty(), "{error:?} 에 경고로 답했습니다");
+        }
+
+        let protected = HandshakeWrite::Protected(RecordLayer::Tls13(test_peer_crypto()));
+        let mut sealed = Vec::new();
+        assert!(protected.run(&mut sealed, fail(TlsError::BadCert)).is_err());
+        let record = read_record(&mut sealed.as_slice()).unwrap();
+        assert_eq!(
+            record.content_type,
+            ContentType::ApplicationData,
+            "키를 바꾼 뒤의 경고를 평문으로 보냈습니다"
+        );
+        assert_eq!(
+            test_peer_crypto().decrypt(&record),
+            Ok((ContentType::Alert, vec![2, 42]))
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 받은 레코드 때문에 실패한 연결이 치명 경고를 보낸 뒤 아무것도 주고받지 않는지.
+     * @details RFC 8446 은 치명 경고를 주고받은 연결에서 더는 아무것도 보내거나 받지 못하게
+     *          한다. 상대가 보낸 치명 경고에는 답하지 않고, 끊긴 연결은 실패 상태로 두지 않는다.
+     */
+    fn fatal_alert_ends_the_connection() {
+        let mut conn = test_tls13_connection();
+        let mut wire = encrypted_records(&[(ContentType(0xff), b"x")]);
+        let received = wire.get_ref().len();
+        assert_eq!(conn.read_app(&mut wire), Err(TlsError::UnexpectedMessage));
+        let alert = read_record(&mut &wire.get_ref()[received..]).unwrap();
+        assert_eq!(
+            test_peer_crypto().decrypt(&alert),
+            Ok((ContentType::Alert, vec![2, 10]))
+        );
+        assert_eq!(
+            conn.write_app(&mut NoIo, b"dns"),
+            Err(TlsError::UnexpectedMessage)
+        );
+        assert_eq!(
+            conn.send_close_notify(&mut NoIo),
+            Err(TlsError::UnexpectedMessage)
+        );
+        assert_eq!(conn.read_app(&mut NoIo), Err(TlsError::UnexpectedMessage));
+
+        let mut conn = test_tls13_connection();
+        let mut wire = encrypted_records(&[(ContentType::Alert, &[2, 40])]);
+        let received = wire.get_ref().len();
+        let peer_alert = TlsError::PeerAlert {
+            level: 2,
+            description: 40,
+        };
+        assert_eq!(conn.read_app(&mut wire), Err(peer_alert.clone()));
+        assert_eq!(
+            wire.get_ref().len(),
+            received,
+            "받은 치명 경고에 경고로 답했습니다"
+        );
+        assert_eq!(conn.write_app(&mut NoIo, b"dns"), Err(peer_alert));
+
+        let mut conn = test_tls13_connection();
+        assert_eq!(
+            conn.read_app(&mut std::io::Cursor::new(Vec::new())),
+            Err(TlsError::Eof)
+        );
+        let mut after = Vec::new();
+        assert_eq!(conn.send_close_notify(&mut after), Ok(()));
+        assert!(!after.is_empty(), "끊긴 연결을 실패 상태로 두었습니다");
     }
 
     #[test]
@@ -2620,13 +2981,13 @@ mod tests {
             .retain(|extension| extension.ext_type != tls12::EXT_EXTENDED_MASTER_SECRET);
         assert_eq!(
             validate_tls12_server_hello(&cfg, &ch, &sh),
-            Err(TlsError::Protocol)
+            Err(TlsError::HandshakeFailure)
         );
         sh.extensions.push(tls12::ext_extended_master_secret());
         sh.extensions.push(Extension::new(0x1234, Vec::new()));
         assert_eq!(
             validate_tls12_server_hello(&cfg, &ch, &sh),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnsupportedExtension)
         );
         sh.extensions.pop();
         ch.extensions.push(Extension::server_name("dns.example"));
@@ -2640,7 +3001,7 @@ mod tests {
             .retain(|extension| extension.ext_type != EXT_SERVER_NAME);
         assert_eq!(
             validate_tls12_server_hello(&cfg, &ch, &sh),
-            Err(TlsError::Protocol),
+            Err(TlsError::UnsupportedExtension),
             "보내지 않은 서버 이름에 대한 응답은 거부한다"
         );
         sh.extensions.pop();
@@ -2650,13 +3011,121 @@ mod tests {
             .unwrap() = Extension::alpn(&[b"h2"]);
         assert_eq!(
             validate_tls12_server_hello(&cfg, &ch, &sh),
-            Err(TlsError::Protocol)
+            Err(TlsError::IllegalParameter)
         );
 
         ch.compression_methods = vec![1];
         assert_eq!(
             validate_tls12_client_hello(&ch, ECDSA_SECP256R1_SHA256),
-            Err(TlsError::Protocol)
+            Err(TlsError::IllegalParameter)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 1.2 서버 인사말의 확장마다 거절 사유가 경고 종류와 맞는지.
+     * @details 점 형식 목록은 압축하지 않은 형식이 들어 있으면 순서와 개수에 상관없이 받아들인다.
+     *          형식이 맞는 목록을 거절할 경고는 규격에 없다.
+     */
+    fn tls12_server_hello_rejections_name_the_matching_alert() {
+        let (cfg, ch, sh) = valid_tls12_hellos();
+        let with = |ext_type: u16, data: Vec<u8>| {
+            let mut changed = sh.clone();
+            changed
+                .extensions
+                .retain(|extension| extension.ext_type != ext_type);
+            changed.extensions.push(Extension::new(ext_type, data));
+            validate_tls12_server_hello(&cfg, &ch, &changed)
+        };
+        assert!(
+            with(tls12::EXT_EC_POINT_FORMATS, vec![3, 2, 0, 1]).is_ok(),
+            "압축하지 않은 형식이 든 목록은 받아들여야 한다"
+        );
+        assert_eq!(
+            with(tls12::EXT_EC_POINT_FORMATS, vec![2, 1, 2]),
+            Err(TlsError::IllegalParameter)
+        );
+        assert_eq!(
+            with(tls12::EXT_EC_POINT_FORMATS, vec![2, 0]),
+            Err(TlsError::Decode)
+        );
+        assert_eq!(
+            with(tls12::EXT_RENEGOTIATION_INFO, vec![1, 7]),
+            Err(TlsError::HandshakeFailure)
+        );
+        assert_eq!(
+            with(tls12::EXT_RENEGOTIATION_INFO, vec![2, 7]),
+            Err(TlsError::Decode)
+        );
+        assert_eq!(
+            with(tls12::EXT_EXTENDED_MASTER_SECRET, vec![0]),
+            Err(TlsError::Decode)
+        );
+        assert_eq!(
+            with(EXT_SIGNATURE_ALGORITHMS, Vec::new()),
+            Err(TlsError::IllegalParameter),
+            "제안했어도 서버 인사말에 올 수 없는 확장은 IllegalParameter 여야 한다"
+        );
+
+        let mut old_version = sh.clone();
+        old_version.legacy_version = 0x0301;
+        assert_eq!(
+            validate_tls12_server_hello(&cfg, &ch, &old_version),
+            Err(TlsError::ProtocolVersion)
+        );
+        let mut unoffered_suite = sh;
+        unoffered_suite.cipher_suite = TLS_AES_128_GCM_SHA256;
+        assert_eq!(
+            validate_tls12_server_hello(&cfg, &ch, &unoffered_suite),
+            Err(TlsError::IllegalParameter)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 1.2 서버가 클라이언트가 보낸 경우에만 점 형식 확장으로 답하고, 압축하지 않은
+     *        형식이 빠진 목록에는 답하지 않는지.
+     */
+    fn tls12_server_answers_point_formats_only_when_offered() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cfg = ServerConfig::from_pkcs8(
+            ck.cert.der().as_ref().to_vec(),
+            &ck.key_pair.serialize_der(),
+        )
+        .unwrap();
+        let (_, mut hello, _) = valid_tls12_hellos();
+        hello
+            .extensions
+            .push(Extension::supported_groups(&[X25519]));
+        let answer = |hello: &ClientHello| first_server_hello(&cfg, hello.to_handshake().encode());
+
+        let reply = answer(&hello).expect("정상 1.2 인사말에는 답해야 한다");
+        assert_eq!(
+            reply.ext(tls12::EXT_EC_POINT_FORMATS),
+            Some(&tls12::ext_ec_point_formats()),
+            "보낸 점 형식 확장에는 압축하지 않은 형식으로 답해야 한다"
+        );
+
+        let mut omitted = hello.clone();
+        omitted
+            .extensions
+            .retain(|extension| extension.ext_type != tls12::EXT_EC_POINT_FORMATS);
+        let reply = answer(&omitted).expect("점 형식 확장이 없어도 답해야 한다");
+        assert_eq!(
+            reply.ext(tls12::EXT_EC_POINT_FORMATS),
+            None,
+            "보내지 않은 확장으로 답하면 안 된다"
+        );
+
+        let mut compressed_only = hello;
+        *compressed_only
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == tls12::EXT_EC_POINT_FORMATS)
+            .unwrap() = Extension::new(tls12::EXT_EC_POINT_FORMATS, vec![1, 1]);
+        assert!(
+            answer(&compressed_only).is_none(),
+            "압축하지 않은 형식이 빠진 목록에는 답하지 않아야 한다"
         );
     }
 
@@ -2665,16 +3134,31 @@ mod tests {
     fn tls12_rejects_noncanonical_ccs_finished_and_server_flight_order() {
         let valid_finished = HandshakeMsg::new(HandshakeType::Finished, vec![1; 12]).encode();
         assert!(parse_exact_handshake(&valid_finished).is_ok());
+        assert_eq!(
+            parse_exact_handshake(&valid_finished[..valid_finished.len() - 1]),
+            Err(TlsError::Decode)
+        );
         let mut trailing = valid_finished;
         trailing.push(0);
-        assert_eq!(parse_exact_handshake(&trailing), Err(TlsError::Protocol));
+        assert_eq!(
+            parse_exact_handshake(&trailing),
+            Err(TlsError::UnexpectedMessage)
+        );
 
         let valid_ccs = TlsRecord::new(ContentType::ChangeCipherSpec, vec![1]).encode();
         assert!(expect_ccs(&mut std::io::Cursor::new(valid_ccs)).is_ok());
         let invalid_ccs = TlsRecord::new(ContentType::ChangeCipherSpec, vec![1, 0]).encode();
         assert_eq!(
             expect_ccs(&mut std::io::Cursor::new(invalid_ccs)),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
+        );
+        let alert_instead = TlsRecord::new(ContentType::Alert, vec![2, 40]).encode();
+        assert_eq!(
+            expect_ccs(&mut std::io::Cursor::new(alert_instead)),
+            Err(TlsError::PeerAlert {
+                level: 2,
+                description: 40,
+            })
         );
 
         let (cfg, ch, sh) = valid_tls12_hellos();
@@ -2698,9 +3182,10 @@ mod tests {
                 sh,
                 sh_msg,
                 PlainHsReader::new(),
+                &mut HandshakeWrite::Plain,
             )
             .map(|_| ()),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage)
         );
     }
 
@@ -2723,6 +3208,7 @@ mod tests {
             resumed: false,
             resumption: None,
             new_sessions: Vec::new(),
+            failed: None,
         };
         let plaintext = vec![0x5a; MAX_FRAGMENT * 2 + 17];
         let mut wire = Vec::new();
@@ -2772,9 +3258,13 @@ mod tests {
         let iv = [0x44; 12];
         let message = HandshakeMsg::new(HandshakeType::Certificate, vec![0x5a; MAX_FRAGMENT + 17]);
         let expected = message.encode();
-        let mut sender = RecordCrypto::new(Aead::Aes128Gcm, key.clone(), iv);
+        let mut sender = HandshakeWrite::Protected(RecordLayer::Tls13(RecordCrypto::new(
+            Aead::Aes128Gcm,
+            key.clone(),
+            iv,
+        )));
         let mut wire = Vec::new();
-        send_hs_enc(&mut wire, &mut sender, &message).unwrap();
+        sender.send(&mut wire, &expected).unwrap();
 
         let mut receiver = RecordCrypto::new(Aead::Aes128Gcm, key, iv);
         let mut decoded = Vec::new();
@@ -3216,7 +3706,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름이 다르면 거부하는지. */
+    /**
+     * @brief 이름이 다르면 거부하고 그 사유를 핸드셰이크 키로 보호해 알리는지.
+     * @details ServerHello 를 처리한 클라이언트는 핸드셰이크 키를 가졌으므로 경고도 그 키로
+     *          보호한다. 서버는 그 키로 풀어 bad_certificate 를 읽어야 한다.
+     */
     fn wrong_hostname_rejected() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -3238,11 +3732,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let _ = server_handshake(&mut s, &server_cfg);
-            }
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            server_handshake(&mut s, &server_cfg).err()
         });
-        let mut c = TcpStream::connect(addr).unwrap();
+        let mut c = Recorded {
+            inner: TcpStream::connect(addr).unwrap(),
+            written: Vec::new(),
+        };
         let client_cfg = ClientConfig {
             server_name: "evil.example".to_string(),
             verify_name: true,
@@ -3254,12 +3752,27 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(matches!(
-            client_handshake(&mut c, &client_cfg),
-            Err(TlsError::BadCert)
-        ));
+        assert_eq!(
+            client_handshake(&mut c, &client_cfg).err(),
+            Some(TlsError::BadCert)
+        );
+        assert_eq!(
+            last_written_record(&c.written).content_type,
+            ContentType::ApplicationData,
+            "ServerHello 를 처리한 뒤의 경고를 평문으로 보냈습니다"
+        );
+        /*
+         * 읽지 않은 서버 응답이 남은 채로 소켓을 닫으면 RST 가 나가 서버가 경고를 읽기 전에
+         * 연결이 끊길 수 있다. 서버가 끝난 뒤에 닫는다.
+         */
+        assert_eq!(
+            server.join().unwrap(),
+            Some(TlsError::PeerAlert {
+                level: 2,
+                description: 42,
+            })
+        );
         drop(c);
-        let _ = server.join();
     }
 
     #[test]
@@ -3471,6 +3984,41 @@ mod tests {
         }
     }
 
+    /** @brief 이쪽이 쓴 바이트를 남겨 두는 테스트용 스트림. */
+    struct Recorded<S> {
+        /** @brief 실제로 주고받는 스트림. */
+        inner: S,
+        /** @brief 지금까지 쓴 바이트. */
+        written: Vec<u8>,
+    }
+
+    impl<S: Read> Read for Recorded<S> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl<S: Write> Write for Recorded<S> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /** @brief 남겨 둔 바이트에서 마지막 레코드를 꺼낸다. */
+    fn last_written_record(mut wire: &[u8]) -> TlsRecord {
+        let mut last = None;
+        while !wire.is_empty() {
+            last = Some(read_record(&mut wire).unwrap());
+        }
+        last.expect("쓴 레코드가 없습니다")
+    }
+
     /** @brief 클라이언트 인증을 켠 테스트용 서버 설정. */
     fn mtls_server_cfg(client_ca: Option<crate::trust::TrustStore>) -> ServerConfig {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -3521,14 +4069,31 @@ mod tests {
 
             assert!(matches!(
                 server_handshake(&mut s, &server_cfg),
-                Err(TlsError::BadCert)
+                Err(TlsError::CertificateRequired)
             ));
+            let _ = s.read_to_end(&mut Vec::new());
         });
 
         let mut c = TcpStream::connect(addr).unwrap();
+        /*
+         * 서버가 경고를 보내지 않으면 클라이언트는 응답을, 서버는 연결 종료를 서로 기다린다.
+         * 멈추지 않고 실패하도록 읽기 한도를 둔다.
+         */
+        c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         let client_cfg = insecure_test_client("localhost");
 
-        let _ = client_handshake(&mut c, &client_cfg);
+        let mut conn = client_handshake(&mut c, &client_cfg)
+            .expect("클라이언트는 서버 Finished 까지 확인하고 핸드셰이크를 마친다");
+        assert_eq!(
+            conn.read_app(&mut c),
+            Err(TlsError::PeerAlert {
+                level: 2,
+                description: 116,
+            }),
+            "서버가 응용 키로 보낸 certificate_required 를 읽어야 한다"
+        );
+        drop(c);
         server.join().unwrap();
     }
 
@@ -3795,6 +4360,90 @@ mod tests {
 
     #[test]
     /**
+     * @brief 받아들일 수 없는 인사말을 받은 서버가 그 사유를 평문 경고 하나로 알리는지.
+     * @details ServerHello 를 보내기 전이라 양쪽 모두 핸드셰이크 키가 없다.
+     */
+    fn rejected_client_hello_is_answered_with_a_plaintext_alert() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cfg = ServerConfig::from_pkcs8(
+            ck.cert.der().as_ref().to_vec(),
+            &ck.key_pair.serialize_der(),
+        )
+        .unwrap();
+        let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
+        let hello = build_client_hello(&insecure_test_client("localhost"), &kx, true, None, None);
+
+        let mut broken = hello.clone();
+        broken
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_KEY_SHARE)
+            .unwrap()
+            .data
+            .push(0);
+        let mut other_schemes = hello;
+        withdraw_signature_scheme(&mut other_schemes, cfg.sign_scheme);
+
+        for (hello, expected) in [
+            (broken, TlsError::Decode),
+            (other_schemes, TlsError::HandshakeFailure),
+        ] {
+            let mut stream = Scripted {
+                input: std::io::Cursor::new(
+                    TlsRecord::new(ContentType::Handshake, hello.to_handshake().encode()).encode(),
+                ),
+                output: Vec::new(),
+            };
+            assert_eq!(
+                server_handshake(&mut stream, &cfg).err(),
+                Some(expected.clone())
+            );
+            let description = expected.alert().unwrap();
+            assert_eq!(stream.output, [21, 3, 3, 0, 2, 2, description]);
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 입출력 실패와 상대가 보낸 경고에는 경고로 답하지 않는지.
+     * @details 끊긴 연결에는 보낼 곳이 없고, 치명 경고를 받은 연결에서는 더 보내지 않는다.
+     */
+    fn handshake_does_not_answer_eof_io_or_peer_alerts() {
+        let cfg = insecure_test_client("localhost");
+        for (input, expected) in [
+            (Vec::new(), TlsError::Eof),
+            (vec![22, 3, 3, 0, 10, 2], TlsError::Io),
+            (
+                vec![21, 3, 3, 0, 2, 2, 40],
+                TlsError::PeerAlert {
+                    level: 2,
+                    description: 40,
+                },
+            ),
+        ] {
+            let mut stream = Scripted {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+            };
+            assert_eq!(
+                client_handshake(&mut stream, &cfg).err(),
+                Some(expected.clone())
+            );
+            let mut written = stream.output.as_slice();
+            assert!(!written.is_empty(), "ClientHello 를 보내지 않았습니다");
+            while !written.is_empty() {
+                let record = read_record(&mut written).unwrap();
+                assert_eq!(
+                    record.content_type,
+                    ContentType::Handshake,
+                    "{expected:?} 에 경고로 답했습니다"
+                );
+            }
+        }
+    }
+
+    #[test]
+    /**
      * @brief 티켓으로 재개하면 인증서로 서명하지 않으므로, 이쪽 서명 방식을 제안하지 않은
      *        인사말에도 재개로 답하는지. 키 공유가 비어 있어도 재개로 마칠 수 있으므로 다시
      *        시도를 요청해야 한다.
@@ -3921,12 +4570,14 @@ mod tests {
             compression_methods: vec![0],
             extensions: exts,
         };
-        let ch_bytes = ch.to_handshake().encode();
-        write_plain_handshake(s, &ch_bytes)?;
-        let mut phr = PlainHsReader::new();
-        let sh_msg = phr.next(s)?;
-        let sh = ServerHello::from_handshake(&sh_msg)?;
-        client_handshake_tls12(s, cfg, ch, ch_bytes, sh, sh_msg, phr)
+        HandshakeWrite::Silent.run(s, |s, w| {
+            let ch_bytes = ch.to_handshake().encode();
+            w.send(s, &ch_bytes)?;
+            let mut phr = PlainHsReader::new();
+            let sh_msg = phr.next(s)?;
+            let sh = ServerHello::from_handshake(&sh_msg)?;
+            client_handshake_tls12(s, cfg, ch, ch_bytes, sh, sh_msg, phr, w)
+        })
     }
 
     #[test]
@@ -4011,7 +4662,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 1.2에서도 이름이 다르면 거부하는지. */
+    /**
+     * @brief 1.2에서도 이름이 다르면 거부하고 그 사유를 평문 경고로 알리는지.
+     * @details 1.2 클라이언트는 ChangeCipherSpec 을 보내기 전까지 평문으로 보낸다. 보호해서
+     *          보내면 서버는 그 레코드를 풀 키가 없다.
+     */
     fn tls12_wrong_hostname_rejected() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(
@@ -4022,23 +4677,40 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let _ = server_handshake(&mut s, &server_cfg);
-            }
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            server_handshake(&mut s, &server_cfg).err()
         });
-        let mut c = TcpStream::connect(addr).unwrap();
+        let mut c = Recorded {
+            inner: TcpStream::connect(addr).unwrap(),
+            written: Vec::new(),
+        };
         let cfg = ClientConfig {
             server_name: "evil.example".into(),
             verify_name: true,
             ..Default::default()
         };
 
-        assert!(matches!(
-            client_handshake_force_tls12(&mut c, &cfg),
-            Err(TlsError::BadCert)
-        ));
+        assert_eq!(
+            client_handshake_force_tls12(&mut c, &cfg).err(),
+            Some(TlsError::BadCert)
+        );
+        let alert = last_written_record(&c.written);
+        assert_eq!(alert.content_type, ContentType::Alert);
+        assert_eq!(alert.fragment, [2, 42]);
+        /*
+         * 읽지 않은 서버 응답이 남은 채로 소켓을 닫으면 RST 가 나가 서버가 경고를 읽기 전에
+         * 연결이 끊길 수 있다. 서버가 끝난 뒤에 닫는다.
+         */
+        assert_eq!(
+            server.join().unwrap(),
+            Some(TlsError::PeerAlert {
+                level: 2,
+                description: 42,
+            })
+        );
         drop(c);
-        let _ = server.join();
     }
 
     #[test]

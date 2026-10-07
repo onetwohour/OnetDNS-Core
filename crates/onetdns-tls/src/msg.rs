@@ -7,7 +7,7 @@
  */
 
 use crate::handshake::{HandshakeMsg, HandshakeType};
-use crate::tls12::{EXT_EXTENDED_MASTER_SECRET, EXT_RENEGOTIATION_INFO};
+use crate::tls12::{EXT_EC_POINT_FORMATS, EXT_EXTENDED_MASTER_SECRET, EXT_RENEGOTIATION_INFO};
 use crate::wire::{Reader, Writer};
 use crate::TlsError;
 
@@ -394,11 +394,35 @@ impl Extension {
         Some(out)
     }
 
+    /**
+     * @brief 서버가 고른 응용 프로토콜을 읽는다.
+     * @param offered 이쪽이 제안한 프로토콜 목록.
+     * @return 제안한 목록에 든 프로토콜 하나. 제안하지 않았는데 왔으면 UnsupportedExtension,
+     *         형식이 깨졌으면 Decode, 하나가 아니거나 제안한 목록에 없으면 IllegalParameter.
+     */
+    pub(crate) fn selected_alpn(&self, offered: &[Vec<u8>]) -> Result<Vec<u8>, TlsError> {
+        if offered.is_empty() {
+            return Err(TlsError::UnsupportedExtension);
+        }
+        let mut protocols = self.as_alpn().ok_or(TlsError::Decode)?;
+        if protocols.len() != 1 || !offered.contains(&protocols[0]) {
+            return Err(TlsError::IllegalParameter);
+        }
+        Ok(protocols.remove(0))
+    }
+
     /** @brief 재개 방식 목록을 읽는다. */
     pub fn as_psk_modes(&self) -> Option<Vec<u8>> {
         let mut r = Reader::new(&self.data);
         let modes = r.vec8().ok()?.to_vec();
         (!modes.is_empty() && r.is_empty()).then_some(modes)
+    }
+
+    /** @brief 점 형식 목록을 읽는다. */
+    pub fn as_ec_point_formats(&self) -> Option<Vec<u8>> {
+        let mut r = Reader::new(&self.data);
+        let formats = r.vec8().ok()?.to_vec();
+        (!formats.is_empty() && r.is_empty()).then_some(formats)
     }
 
     /** @brief 지원 곡선 목록을 읽는다. */
@@ -497,6 +521,7 @@ impl Extension {
                 let mut r = Reader::new(&self.data);
                 r.vec8().is_ok() && r.is_empty()
             }
+            EXT_EC_POINT_FORMATS => self.as_ec_point_formats().is_some(),
             _ => return None,
         };
         Some(ok)
@@ -601,32 +626,43 @@ impl ClientHello {
     }
 
     /**
-     * @brief 1.3 인사말로서 형태가 맞는지.
+     * @brief 1.3 인사말로서 형태가 맞는지 확인한다.
      * @details RFC 8446 이 1.3 인사말에 요구하는 확장도 본다. 재개 제안이 있으면 재개 방식
      *          확장이, 없으면 서명 방식과 지원 곡선이 있어야 한다. 지원 곡선과 키 공유는 함께
      *          오거나 함께 빠져야 한다.
      * @warning 재개 확장은 반드시 마지막이어야 한다. 바인더가 그 앞까지의 바이트에
      *          걸리므로, 뒤에 뭔가 오면 그 부분이 인증되지 않는다.
      */
-    pub(crate) fn is_valid_tls13(&self) -> bool {
+    pub(crate) fn validate_tls13(&self) -> Result<(), TlsError> {
+        let offers_tls13 = self
+            .ext(EXT_SUPPORTED_VERSIONS)
+            .and_then(Extension::as_supported_versions_client)
+            .is_some_and(|versions| versions.contains(&TLS13));
+        if self.legacy_version != TLS12 || !offers_tls13 {
+            return Err(TlsError::ProtocolVersion);
+        }
+        if self.compression_methods != [0] {
+            return Err(TlsError::IllegalParameter);
+        }
+        if self
+            .extensions
+            .iter()
+            .position(|extension| extension.ext_type == EXT_PRE_SHARED_KEY)
+            .is_some_and(|position| position + 1 != self.extensions.len())
+        {
+            return Err(TlsError::IllegalParameter);
+        }
         let has = |ext_type| self.ext(ext_type).is_some();
-        self.legacy_version == TLS12
-            && self.compression_methods == [0]
-            && self
-                .ext(EXT_SUPPORTED_VERSIONS)
-                .and_then(Extension::as_supported_versions_client)
-                .is_some_and(|versions| versions.contains(&TLS13))
-            && self
-                .extensions
-                .iter()
-                .position(|extension| extension.ext_type == EXT_PRE_SHARED_KEY)
-                .is_none_or(|position| position + 1 == self.extensions.len())
-            && has(EXT_SUPPORTED_GROUPS) == has(EXT_KEY_SHARE)
+        let complete = has(EXT_SUPPORTED_GROUPS) == has(EXT_KEY_SHARE)
             && if has(EXT_PRE_SHARED_KEY) {
                 has(EXT_PSK_KEY_EXCHANGE_MODES)
             } else {
                 has(EXT_SUPPORTED_GROUPS) && has(EXT_SIGNATURE_ALGORITHMS)
-            }
+            };
+        if !complete {
+            return Err(TlsError::MissingExtension);
+        }
+        Ok(())
     }
 
     /** @brief 서명 방식 확장에 그 방식이 있는지. 인증서로 인증하는 서버는 이 안에서 골라야 한다. */
@@ -768,7 +804,7 @@ impl ClientHello {
     /** @brief 핸드셰이크 메시지에서 인사말을 꺼낸다. 종류가 다르면 오류다. */
     pub fn from_handshake(msg: &HandshakeMsg) -> Result<ClientHello, TlsError> {
         if msg.msg_type != HandshakeType::ClientHello {
-            return Err(TlsError::Decode);
+            return Err(TlsError::UnexpectedMessage);
         }
         ClientHello::parse(&msg.body)
     }
@@ -801,24 +837,98 @@ pub struct ServerHello {
 
 impl ServerHello {
     /**
-     * @brief 1.3 인사말로서 형태가 맞는지.
+     * @brief 1.3 서버 인사말이나 다시 시도 요청으로서 형태가 맞는지 확인한다.
+     * @param hello 이 메시지가 답하는 클라이언트 인사말.
+     * @param hrr 다시 시도 요청인지.
      * @note 세션 번호를 클라이언트가 보낸 것과 대조한다. 다르면 중간자가 바꾼 것이다.
+     * @details 이 메시지에 올 수 없는 확장은, 이쪽이 제안한 종류면 자리를 어긴 것이므로
+     *          IllegalParameter 이고 제안하지 않은 종류면 UnsupportedExtension 이다.
      */
-    pub(crate) fn is_valid_tls13(&self, expected_session_id: &[u8], hrr: bool) -> bool {
-        if self.legacy_version != TLS12
-            || self.session_id_echo != expected_session_id
-            || self
-                .ext(EXT_SUPPORTED_VERSIONS)
-                .and_then(Extension::as_supported_versions_server)
-                != Some(TLS13)
-        {
-            return false;
+    pub(crate) fn validate_tls13(&self, hello: &ClientHello, hrr: bool) -> Result<(), TlsError> {
+        if self.legacy_version != TLS12 {
+            return Err(TlsError::ProtocolVersion);
         }
-        self.extensions.iter().all(|extension| {
-            matches!(extension.ext_type, EXT_SUPPORTED_VERSIONS | EXT_KEY_SHARE)
+        if self.session_id_echo != hello.session_id {
+            return Err(TlsError::IllegalParameter);
+        }
+        let version = self
+            .ext(EXT_SUPPORTED_VERSIONS)
+            .ok_or(TlsError::MissingExtension)?
+            .as_supported_versions_server()
+            .ok_or(TlsError::Decode)?;
+        if version != TLS13 {
+            return Err(TlsError::IllegalParameter);
+        }
+        for extension in &self.extensions {
+            let allowed = matches!(extension.ext_type, EXT_SUPPORTED_VERSIONS | EXT_KEY_SHARE)
                 || (hrr && extension.ext_type == EXT_COOKIE)
-                || (!hrr && extension.ext_type == EXT_PRE_SHARED_KEY)
-        })
+                || (!hrr && extension.ext_type == EXT_PRE_SHARED_KEY);
+            if allowed {
+                continue;
+            }
+            return Err(if hello.ext(extension.ext_type).is_some() {
+                TlsError::IllegalParameter
+            } else {
+                TlsError::UnsupportedExtension
+            });
+        }
+        Ok(())
+    }
+
+    /**
+     * @brief 다시 시도 요청이 이쪽이 따를 수 있는 요청인지 확인한다.
+     * @param hello 이 요청이 답하는 첫 클라이언트 인사말.
+     * @details RFC 8446 은 고른 곡선이 첫 인사말의 지원 곡선에 있으면서 키 조각은 보내지 않은
+     *          것이어야 하고, 요청이 인사말에서 무언가를 바꾸게 해야 한다고 정한다. 이쪽은 X25519
+     *          키 조각을 다시 보내는 것으로만 답할 수 있으므로, 규격에는 맞아도 다른 곡선을
+     *          고르거나 쿠키만 담은 요청은 받아들일 매개변수가 없는 것으로 본다.
+     * @retval TlsError::IllegalParameter 규격을 어긴 요청이다.
+     * @retval TlsError::HandshakeFailure 규격에는 맞지만 이쪽이 따를 수 없다.
+     */
+    pub(crate) fn validate_retry_request(&self, hello: &ClientHello) -> Result<(), TlsError> {
+        self.validate_tls13(hello, true)?;
+        let selected = match self.ext(EXT_KEY_SHARE) {
+            Some(extension) => Some(extension.as_key_share_hrr().ok_or(TlsError::Decode)?),
+            None => None,
+        };
+        let offered_groups = hello
+            .ext(EXT_SUPPORTED_GROUPS)
+            .and_then(Extension::as_supported_groups)
+            .unwrap_or_default();
+        let shared_groups: Vec<u16> = hello
+            .ext(EXT_KEY_SHARE)
+            .and_then(Extension::as_key_share_client)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(group, _)| group)
+            .collect();
+        match selected {
+            Some(group) if !offered_groups.contains(&group) || shared_groups.contains(&group) => {
+                Err(TlsError::IllegalParameter)
+            }
+            Some(X25519) => Ok(()),
+            Some(_) => Err(TlsError::HandshakeFailure),
+            None if self.ext(EXT_COOKIE).is_some() => Err(TlsError::HandshakeFailure),
+            None => Err(TlsError::IllegalParameter),
+        }
+    }
+
+    /**
+     * @brief 서버 인사말에서 X25519 공개값을 꺼낸다.
+     * @retval TlsError::MissingExtension 키 공유가 없다. 이 스택은 키 공유 없이 재개하는 방식을
+     *         제안하지 않으므로 서버는 반드시 보내야 한다.
+     * @retval TlsError::IllegalParameter 이쪽이 키 조각을 보내지 않은 곡선을 골랐다.
+     */
+    pub(crate) fn x25519_key_share(&self) -> Result<Vec<u8>, TlsError> {
+        let (group, key) = self
+            .ext(EXT_KEY_SHARE)
+            .ok_or(TlsError::MissingExtension)?
+            .as_key_share_server()
+            .ok_or(TlsError::Decode)?;
+        if group != X25519 {
+            return Err(TlsError::IllegalParameter);
+        }
+        Ok(key)
     }
 
     /** @brief 서버가 보낸 첫 메시지를 읽는다. */
@@ -833,7 +943,7 @@ impl ServerHello {
         let cipher_suite = r.u16()?;
         let legacy_compression = r.u8()?;
         if legacy_compression != 0 {
-            return Err(TlsError::Decode);
+            return Err(TlsError::IllegalParameter);
         }
         let extensions = Extension::parse_list(r.vec16()?)?;
 
@@ -865,10 +975,10 @@ impl ServerHello {
         w.buf
     }
 
-    /** @brief 핸드셰이크 메시지에서 꺼낸다. */
+    /** @brief 핸드셰이크 메시지에서 꺼낸다. 종류가 다르면 오류다. */
     pub fn from_handshake(msg: &HandshakeMsg) -> Result<ServerHello, TlsError> {
         if msg.msg_type != HandshakeType::ServerHello {
-            return Err(TlsError::Decode);
+            return Err(TlsError::UnexpectedMessage);
         }
         ServerHello::parse(&msg.body)
     }
@@ -985,10 +1095,17 @@ mod tests {
     }
 
     #[test]
-    /** @brief 종류가 다른 메시지를 거부하는지. */
+    /** @brief 종류가 다른 메시지를 순서를 어긴 메시지로 거부하는지. */
     fn wrong_handshake_type_rejected() {
         let hs = HandshakeMsg::new(HandshakeType::Finished, vec![0; 10]);
-        assert!(ClientHello::from_handshake(&hs).is_err());
+        assert_eq!(
+            ClientHello::from_handshake(&hs),
+            Err(TlsError::UnexpectedMessage)
+        );
+        assert_eq!(
+            ServerHello::from_handshake(&hs),
+            Err(TlsError::UnexpectedMessage)
+        );
     }
 
     #[test]
@@ -1023,14 +1140,162 @@ mod tests {
                 Extension::key_share_server(X25519, &[1; 32]),
             ],
         };
-        assert!(sh.is_valid_tls13(&[], false));
+        let hello = hello_with(vec![Extension::alpn(&[b"h2"])]);
+        assert_eq!(sh.validate_tls13(&hello, false), Ok(()));
         sh.extensions.push(Extension::alpn(&[b"h2"]));
-        assert!(!sh.is_valid_tls13(&[], false));
+        assert_eq!(
+            sh.validate_tls13(&hello, false),
+            Err(TlsError::IllegalParameter)
+        );
 
         let mut body = sh.encode();
         let compression_offset = 2 + 32 + 1 + sh.session_id_echo.len() + 2;
         body[compression_offset] = 1;
-        assert!(ServerHello::parse(&body).is_err());
+        assert_eq!(ServerHello::parse(&body), Err(TlsError::IllegalParameter));
+    }
+
+    #[test]
+    /**
+     * @brief 1.3 서버 인사말과 다시 시도 요청을 거부할 때 RFC 8446 이 정한 경고에 맞는 사유를
+     *        내는지.
+     */
+    fn tls13_server_hello_rejections_name_their_alert() {
+        let hello = hello_with(vec![
+            Extension::supported_versions_client(&[TLS13]),
+            Extension::alpn(&[b"dot"]),
+        ]);
+        let base = ServerHello {
+            legacy_version: TLS12,
+            random: [0; 32],
+            session_id_echo: Vec::new(),
+            cipher_suite: TLS_AES_128_GCM_SHA256,
+            extensions: vec![
+                Extension::supported_versions_server(TLS13),
+                Extension::key_share_server(X25519, &[1; 32]),
+            ],
+        };
+        assert_eq!(base.validate_tls13(&hello, false), Ok(()));
+        assert_eq!(base.validate_tls13(&hello, true), Ok(()));
+
+        let with = |change: &dyn Fn(&mut ServerHello)| {
+            let mut sh = base.clone();
+            change(&mut sh);
+            sh
+        };
+        let replace_versions = |data: Vec<u8>| {
+            move |sh: &mut ServerHello| {
+                sh.extensions[0] = Extension::new(EXT_SUPPORTED_VERSIONS, data.clone())
+            }
+        };
+        let cases: [(&str, ServerHello, bool, TlsError); 9] = [
+            (
+                "legacy_version 이 0x0303 이 아님",
+                with(&|sh| sh.legacy_version = 0x0301),
+                false,
+                TlsError::ProtocolVersion,
+            ),
+            (
+                "세션 번호를 되비추지 않음",
+                with(&|sh| sh.session_id_echo = vec![1; 32]),
+                false,
+                TlsError::IllegalParameter,
+            ),
+            (
+                "지원 버전 확장 없음",
+                with(&|sh| {
+                    sh.extensions.remove(0);
+                }),
+                false,
+                TlsError::MissingExtension,
+            ),
+            (
+                "지원 버전 확장 형식이 깨짐",
+                with(&replace_versions(vec![0x03])),
+                false,
+                TlsError::Decode,
+            ),
+            (
+                "1.3 이 아닌 버전을 고름",
+                with(&replace_versions(vec![0x03, 0x03])),
+                false,
+                TlsError::IllegalParameter,
+            ),
+            (
+                "제안한 확장을 올 수 없는 자리에 보냄",
+                with(&|sh| sh.extensions.push(Extension::alpn(&[b"dot"]))),
+                false,
+                TlsError::IllegalParameter,
+            ),
+            (
+                "제안하지 않은 확장을 보냄",
+                with(&|sh| sh.extensions.push(Extension::new(0x1234, Vec::new()))),
+                false,
+                TlsError::UnsupportedExtension,
+            ),
+            (
+                "서버 인사말에 쿠키",
+                with(&|sh| sh.extensions.push(Extension::cookie(b"cookie"))),
+                false,
+                TlsError::UnsupportedExtension,
+            ),
+            (
+                "다시 시도 요청에 재개 응답",
+                with(&|sh| sh.extensions.push(Extension::pre_shared_key_server(0))),
+                true,
+                TlsError::UnsupportedExtension,
+            ),
+        ];
+        for (case, sh, hrr, expected) in cases {
+            assert_eq!(sh.validate_tls13(&hello, hrr), Err(expected), "{case}");
+        }
+
+        let cookie = with(&|sh| sh.extensions.push(Extension::cookie(b"cookie")));
+        assert_eq!(
+            cookie.validate_tls13(&hello, true),
+            Ok(()),
+            "다시 시도 요청의 쿠키는 제안하지 않았어도 받아야 한다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 서버가 고른 응용 프로토콜을 제안한 목록과 대조하고, 어긋난 까닭에 맞는 사유를
+     *        내는지.
+     */
+    fn selected_alpn_names_the_reason_for_rejection() {
+        let offered = vec![b"dot".to_vec(), b"h2".to_vec()];
+        assert_eq!(
+            Extension::alpn(&[b"h2"]).selected_alpn(&offered),
+            Ok(b"h2".to_vec())
+        );
+        for (case, extension, ours, expected) in [
+            (
+                "제안하지 않은 확장",
+                Extension::alpn(&[b"h2"]),
+                Vec::new(),
+                TlsError::UnsupportedExtension,
+            ),
+            (
+                "형식이 깨진 목록",
+                Extension::new(EXT_ALPN, vec![0, 1, 0]),
+                offered.clone(),
+                TlsError::Decode,
+            ),
+            (
+                "프로토콜 둘",
+                Extension::alpn(&[b"dot", b"h2"]),
+                offered.clone(),
+                TlsError::IllegalParameter,
+            ),
+            (
+                "제안하지 않은 프로토콜",
+                Extension::alpn(&[b"h3"]),
+                offered.clone(),
+                TlsError::IllegalParameter,
+            ),
+        ] {
+            assert_eq!(extension.selected_alpn(&ours), Err(expected), "{case}");
+        }
     }
 
     #[test]
@@ -1049,9 +1314,9 @@ mod tests {
                 Extension::server_name("dns.example"),
             ],
         };
-        assert!(!ch.is_valid_tls13());
+        assert_eq!(ch.validate_tls13(), Err(TlsError::IllegalParameter));
         ch.extensions.swap(2, 3);
-        assert!(ch.is_valid_tls13());
+        assert_eq!(ch.validate_tls13(), Ok(()));
     }
 
     #[test]
@@ -1102,7 +1367,7 @@ mod tests {
             .extensions
             .insert(psk_at, Extension::cookie(b"retry-cookie"));
         *retry.extensions.last_mut().unwrap() = Extension::pre_shared_key_client(b"ticket", 2, 32);
-        assert!(retry.is_valid_tls13());
+        assert_eq!(retry.validate_tls13(), Ok(()));
         assert!(retry.is_valid_retry_of(&first));
 
         let mut changed_name = retry.clone();
@@ -1156,6 +1421,7 @@ mod tests {
             Extension::psk_key_exchange_modes(&[PSK_DHE_KE]),
             Extension::key_share_client(&[(X25519, vec![1; 32])]),
             Extension::new(EXT_RENEGOTIATION_INFO, vec![0]),
+            Extension::new(EXT_EC_POINT_FORMATS, vec![1, 0]),
             Extension::pre_shared_key_client(b"ticket", 0, 32),
         ];
         for extension in interpreted {
@@ -1193,6 +1459,7 @@ mod tests {
             Extension::new(EXT_PSK_KEY_EXCHANGE_MODES, vec![0]),
             Extension::key_share_client(&[(X25519, Vec::new())]),
             Extension::pre_shared_key_client(b"ticket", 0, 31),
+            Extension::new(EXT_EC_POINT_FORMATS, vec![0]),
         ];
         for extension in wrong_length {
             assert_eq!(
@@ -1319,7 +1586,38 @@ mod tests {
                 false,
             ),
         ] {
-            assert_eq!(hello_with(extensions).is_valid_tls13(), valid, "{case}");
+            let expected = if valid {
+                Ok(())
+            } else {
+                Err(TlsError::MissingExtension)
+            };
+            assert_eq!(hello_with(extensions).validate_tls13(), expected, "{case}");
+        }
+
+        let complete = || hello_with(vec![versions(), groups(), schemes(), shares()]);
+        let mut old_version = complete();
+        old_version.legacy_version = 0x0301;
+        let without_versions = hello_with(vec![groups(), schemes(), shares()]);
+        let mut compressed = complete();
+        compressed.compression_methods = vec![1, 0];
+        for (case, hello, expected) in [
+            (
+                "legacy_version 이 0x0303 이 아님",
+                old_version,
+                TlsError::ProtocolVersion,
+            ),
+            (
+                "지원 버전에 1.3 이 없음",
+                without_versions,
+                TlsError::ProtocolVersion,
+            ),
+            (
+                "압축 방식이 null 하나가 아님",
+                compressed,
+                TlsError::IllegalParameter,
+            ),
+        ] {
+            assert_eq!(hello.validate_tls13(), Err(expected), "{case}");
         }
     }
 

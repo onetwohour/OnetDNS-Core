@@ -202,12 +202,22 @@ pub fn serve_dot(
                                 if !connection_shutdown.load(Ordering::Relaxed)
                                     && !connection_stop.load(Ordering::Relaxed)
                                 {
-                                    transport_observe::record_error(
-                                        "dot",
-                                        "connection",
-                                        Some(peer),
-                                        error,
-                                    );
+                                    match error {
+                                        ConnError::Tls(error) => transport_observe::record_error(
+                                            "dot",
+                                            "connection",
+                                            Some(peer),
+                                            error,
+                                        ),
+                                        ConnError::Dns(stage, detail) => {
+                                            transport_observe::record_error(
+                                                "dot",
+                                                stage,
+                                                Some(peer),
+                                                detail,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }) {
@@ -243,6 +253,24 @@ pub fn serve_dot(
     })
 }
 
+/**
+ * @brief DoT 연결을 끝낸 사유.
+ * @details TLS 계층이 실패했으면 보낼 경고는 그 계층이 이미 보냈다. DNS 교환이 어긋난 경우는
+ *          TLS 로서는 정상이므로 close_notify 를 보내고 닫는다.
+ */
+enum ConnError {
+    /** @brief TLS 계층의 실패. */
+    Tls(TlsError),
+    /** @brief DNS 교환이 어긋났다. 오류 집계에 쓸 단계 이름과 기록할 사유를 담는다. */
+    Dns(&'static str, &'static str),
+}
+
+impl From<TlsError> for ConnError {
+    fn from(error: TlsError) -> Self {
+        ConnError::Tls(error)
+    }
+}
+
 /** @brief 연결 하나에서 질의를 받아 처리한다. */
 fn serve_conn(
     stream: PrefixedTcp,
@@ -250,13 +278,34 @@ fn serve_conn(
     handler: &NativeServer,
     shutdown: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-) -> Result<(), TlsError> {
+) -> Result<(), ConnError> {
     let src = stream.peer_addr().map_err(|_| TlsError::Io)?;
 
     let mut stream = DeadlineTcp::new(stream, Instant::now() + DOT_IO_TIMEOUT)
         .stop_on(shutdown)
         .stop_on(stop);
     let mut conn = server_handshake(&mut stream, tls)?;
+    let served = serve_queries(&mut conn, &mut stream, handler, src);
+    if let Err(ConnError::Dns(..)) = served {
+        /*
+         * TLS 로서는 정상인 연결을 이쪽에서 닫는다. RFC 8446 은 오류 경고 없이 쓰기를 닫는 쪽에
+         * close_notify 를 요구한다. 없으면 클라이언트는 응답이 중간에 잘린 것과 구분하지 못한다.
+         */
+        let _ = conn.send_close_notify(&mut stream);
+    }
+    served
+}
+
+/**
+ * @brief 핸드셰이크를 마친 연결에서 질의를 받아 답한다.
+ * @return 상대가 연결을 닫았으면 Ok. ConnError::Dns 를 돌려줄 때 TLS 연결은 아직 정상이다.
+ */
+fn serve_queries(
+    conn: &mut TlsConnection,
+    stream: &mut DeadlineTcp<PrefixedTcp>,
+    handler: &NativeServer,
+    src: SocketAddr,
+) -> Result<(), ConnError> {
     let tls_authenticated = conn.client_authenticated();
     let tls_auth_identity = conn.client_auth_identity().map(|s| s.to_string());
 
@@ -265,29 +314,36 @@ fn serve_conn(
     let mut framed = Vec::with_capacity(2050);
     loop {
         stream.set_deadline(Instant::now() + DOT_IO_TIMEOUT);
-        let len_bytes = match read_n(&mut conn, &mut stream, &mut buf, 2) {
+        let len_bytes = match read_n(conn, stream, &mut buf, 2) {
             Ok(bytes) => bytes,
             Err(TlsError::CloseNotify) if buf.is_empty() => {
-                let _ = conn.send_close_notify(&mut stream);
+                let _ = conn.send_close_notify(stream);
                 return Ok(());
             }
-            // 길이 프리픽스로 경계가 정해진 DNS 메시지 사이에서 닫혔으면 잃은 질의가 없다.
-            // 답을 받고 종료 알림 없이 소켓을 닫는 클라이언트가 흔해서 오류로 세지 않는다.
+            /*
+             * 길이 프리픽스로 경계가 정해진 DNS 메시지 사이에서 닫혔으면 잃은 질의가 없다.
+             * 답을 받고 종료 알림 없이 소켓을 닫는 클라이언트가 흔해서 오류로 세지 않는다.
+             */
             Err(TlsError::Eof) if buf.is_empty() => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
         if len < 12 {
-            return Err(TlsError::Protocol);
+            return Err(ConnError::Dns(
+                "dns_short_message",
+                "DNS message shorter than its header",
+            ));
         }
-        let msg_bytes = read_n(&mut conn, &mut stream, &mut buf, len)?;
+        let msg_bytes = read_n(conn, stream, &mut buf, len)?;
         let request = match Message::parse(&msg_bytes) {
             Ok(m) => m,
             Err(error) => {
                 transport_observe::record_error("dot", "dns_parse", Some(src), error);
-                // 읽지 못해도 답을 주고 연결은 이어 간다. Do53 TCP 와 같은 길이 프리픽스
-                // 프레이밍이라 메시지 경계는 이미 정해져 있고, 하나가 깨졌다고 끊으면
-                // 질의를 이어 보내던 클라이언트가 연결과 TLS 핸드셰이크를 함께 잃는다.
+                /*
+                 * 읽지 못해도 답을 주고 연결은 이어 간다. Do53 TCP 와 같은 길이 프리픽스
+                 * 프레이밍이라 메시지 경계는 이미 정해져 있고, 하나가 깨졌다고 끊으면
+                 * 질의를 이어 보내던 클라이언트가 연결과 TLS 핸드셰이크를 함께 잃는다.
+                 */
                 let ctx = RequestCtx {
                     src,
                     transport: RtTransport::DoT,
@@ -304,7 +360,7 @@ fn serve_conn(
                                 framed.clear();
                                 framed.extend_from_slice(&n.to_be_bytes());
                                 framed.extend_from_slice(&writer.buf);
-                                conn.write_app(&mut stream, &framed)?;
+                                conn.write_app(stream, &framed)?;
                             }
                         }
                     }
@@ -313,7 +369,10 @@ fn serve_conn(
             }
         };
         if request.header.response {
-            return Err(TlsError::Protocol);
+            return Err(ConnError::Dns(
+                "dns_response_as_query",
+                "unsolicited DNS response",
+            ));
         }
         let ctx = RequestCtx {
             src,
@@ -326,15 +385,17 @@ fn serve_conn(
 
         let mut write_error = None;
         let completed = handler.handle_stream(&request, &ctx, &mut |resp| {
-            let result = (|| -> Result<(), TlsError> {
+            let result = (|| -> Result<(), ConnError> {
                 writer.clear();
                 resp.try_encode_into(&mut writer)
-                    .map_err(|_| TlsError::Protocol)?;
-                let n = u16::try_from(writer.buf.len()).map_err(|_| TlsError::Protocol)?;
+                    .map_err(|_| ConnError::Dns("dns_encode", "response could not be encoded"))?;
+                let n = u16::try_from(writer.buf.len()).map_err(|_| {
+                    ConnError::Dns("dns_encode", "response exceeds the 65535-byte frame")
+                })?;
                 framed.clear();
                 framed.extend_from_slice(&n.to_be_bytes());
                 framed.extend_from_slice(&writer.buf);
-                conn.write_app(&mut stream, &framed)?;
+                conn.write_app(stream, &framed)?;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -347,7 +408,10 @@ fn serve_conn(
             return Err(error);
         }
         if !completed {
-            return Err(TlsError::Protocol);
+            return Err(ConnError::Dns(
+                "dns_unanswered",
+                "query dropped without a response",
+            ));
         }
     }
 }
@@ -604,6 +668,57 @@ mod tests {
             transport_observe::count("dot", "connection"),
             before,
             "메시지 사이에서 끊긴 연결을 오류로 셌습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief DNS 교환이 어긋나 연결을 닫을 때 close_notify 를 먼저 보내는지.
+     * @details TLS 로서는 정상인 연결이다. close_notify 없이 닫으면 클라이언트는 응답이 중간에
+     *          잘린 것과 구분하지 못한다. 오류는 TLS 실패가 아니라 DNS 단계로 센다.
+     */
+    fn dot_dns_framing_error_closes_with_close_notify() {
+        let listener = serve_dot(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
+            native_handler(),
+            Arc::new(ConnectionLimiter::default()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let before = transport_observe::count("dot", "dns_short_message");
+
+        let mut stream = TcpStream::connect(listener.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: false,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![],
+            ..Default::default()
+        };
+        let mut conn = client_handshake(&mut stream, &cfg).expect("클라 핸드셰이크");
+        conn.write_app(&mut stream, &[0, 5]).unwrap();
+        assert_eq!(
+            conn.read_app(&mut stream),
+            Err(TlsError::CloseNotify),
+            "close_notify 없이 연결을 닫았습니다"
+        );
+
+        for _ in 0..100 {
+            if transport_observe::count("dot", "dns_short_message") > before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            transport_observe::count("dot", "dns_short_message") > before,
+            "헤더보다 짧은 메시지를 DNS 단계 오류로 세지 않았습니다"
         );
     }
 

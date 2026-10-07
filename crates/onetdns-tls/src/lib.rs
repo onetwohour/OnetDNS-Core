@@ -64,31 +64,60 @@ pub use wire::{Reader, Writer};
 pub use x509::X509;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief TLS 처리 실패 사유. */
+/**
+ * @brief TLS 처리 실패 사유.
+ * @details 사유마다 상대에게 알릴 치명 경고가 하나로 정해져 있고 alert 가 그 대응을 맡는다.
+ *          거부하는 자리가 경고를 따로 고르지 않으므로, 같은 거부가 경로에 따라 다른 경고로
+ *          나가지 않는다.
+ */
 pub enum TlsError {
-    /** @brief 바이트를 읽어 내지 못했다. */
+    /** @brief 바이트를 읽어 내지 못했다. decode_error 로 알린다. */
     Decode,
 
-    /** @brief 레코드가 규격 크기를 넘겼다. */
+    /** @brief 레코드가 규격 크기를 넘겼다. record_overflow 로 알린다. */
     RecordOverflow,
 
-    /** @brief 암호를 풀지 못했다. */
+    /** @brief 레코드의 암호를 풀지 못했다. bad_record_mac 으로 알린다. */
     Decrypt,
 
-    /** @brief 인증서가 어긋났다. */
+    /** @brief 인증서나 인증 경로가 어긋났다. bad_certificate 로 알린다. */
     BadCert,
 
-    /** @brief 서명이 맞지 않는다. */
+    /** @brief 서명, Finished, PSK 결합자가 맞지 않는다. decrypt_error 로 알린다. */
     BadSignature,
 
-    /** @brief 다루지 않는 서명 방식이다. */
+    /** @brief 다루지 않는 서명 방식이다. illegal_parameter 로 알린다. */
     UnsupportedSig(u16),
 
     /** @brief 주고받는 중 오류가 났다. */
     Io,
 
-    /** @brief 프로토콜을 어긴 순서나 값이다. */
-    Protocol,
+    /** @brief 지금 받을 수 없는 메시지나 레코드가 왔다. unexpected_message 로 알린다. */
+    UnexpectedMessage,
+
+    /** @brief 형식은 맞지만 값이 규격이나 협상 결과와 맞지 않는다. illegal_parameter 로 알린다. */
+    IllegalParameter,
+
+    /** @brief 양쪽이 함께 받아들일 수 있는 매개변수가 없다. handshake_failure 로 알린다. */
+    HandshakeFailure,
+
+    /** @brief 상대가 고른 프로토콜 버전을 지원하지 않는다. protocol_version 으로 알린다. */
+    ProtocolVersion,
+
+    /** @brief 반드시 있어야 할 확장이 없다. missing_extension 으로 알린다. */
+    MissingExtension,
+
+    /** @brief 이쪽이 제안하지 않은 확장이 응답에 왔다. unsupported_extension 으로 알린다. */
+    UnsupportedExtension,
+
+    /** @brief 인증서의 공개 키 형식을 다루지 않는다. unsupported_certificate 로 알린다. */
+    UnsupportedCertificate,
+
+    /** @brief 요구한 클라이언트 인증서가 오지 않았다. certificate_required 로 알린다. */
+    CertificateRequired,
+
+    /** @brief 상대와 무관하게 이쪽 내부에서 실패했다. internal_error 로 알린다. */
+    Internal,
 
     /** @brief 상대가 곱게 끝냈다. */
     CloseNotify,
@@ -107,6 +136,38 @@ pub enum TlsError {
     SeqExhausted,
 }
 
+impl TlsError {
+    /**
+     * @brief 이 실패를 상대에게 알릴 치명 경고의 설명 코드.
+     * @return 상대에게 알리지 않는 실패면 없다. 입출력 실패와 상대의 종료가 그렇고, 상대가
+     *         보낸 경고에는 경고로 답하지 않는다. 일련번호 소진은 경고를 보낼 nonce 도 남지
+     *         않았다.
+     */
+    pub fn alert(&self) -> Option<u8> {
+        match self {
+            TlsError::UnexpectedMessage => Some(10),
+            TlsError::Decrypt => Some(20),
+            TlsError::RecordOverflow => Some(22),
+            TlsError::HandshakeFailure => Some(40),
+            TlsError::BadCert => Some(42),
+            TlsError::UnsupportedCertificate => Some(43),
+            TlsError::IllegalParameter | TlsError::UnsupportedSig(_) => Some(47),
+            TlsError::Decode => Some(50),
+            TlsError::BadSignature => Some(51),
+            TlsError::ProtocolVersion => Some(70),
+            TlsError::Internal => Some(80),
+            TlsError::MissingExtension => Some(109),
+            TlsError::UnsupportedExtension => Some(110),
+            TlsError::CertificateRequired => Some(116),
+            TlsError::Io
+            | TlsError::CloseNotify
+            | TlsError::Eof
+            | TlsError::PeerAlert { .. }
+            | TlsError::SeqExhausted => None,
+        }
+    }
+}
+
 impl std::fmt::Display for TlsError {
     /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,7 +179,17 @@ impl std::fmt::Display for TlsError {
             TlsError::BadSignature => write!(f, "Signature verification failed"),
             TlsError::UnsupportedSig(s) => write!(f, "Unsupported signature scheme: {s}"),
             TlsError::Io => write!(f, "I/O error on the TLS connection"),
-            TlsError::Protocol => write!(f, "TLS protocol violation"),
+            TlsError::UnexpectedMessage => write!(f, "Unexpected TLS message"),
+            TlsError::IllegalParameter => write!(f, "Illegal TLS parameter"),
+            TlsError::HandshakeFailure => write!(f, "No acceptable TLS parameters"),
+            TlsError::ProtocolVersion => write!(f, "Unsupported TLS version"),
+            TlsError::MissingExtension => write!(f, "Required TLS extension is missing"),
+            TlsError::UnsupportedExtension => write!(f, "Unsolicited TLS extension"),
+            TlsError::UnsupportedCertificate => write!(f, "Unsupported certificate key type"),
+            TlsError::CertificateRequired => {
+                write!(f, "Peer did not send a required certificate")
+            }
+            TlsError::Internal => write!(f, "Internal TLS error"),
             TlsError::CloseNotify => write!(f, "Received TLS close_notify"),
             TlsError::Eof => write!(f, "Peer closed the connection without a TLS close_notify"),
             TlsError::PeerAlert { level, description } => write!(

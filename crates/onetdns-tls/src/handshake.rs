@@ -79,7 +79,11 @@ impl HandshakeMsg {
         v
     }
 
-    /** @brief 바이트열에서 메시지 하나를 읽는다. 덜 왔으면 None이다. */
+    /**
+     * @brief 바이트열에서 메시지 하나를 읽는다. 덜 왔으면 None이다.
+     * @retval TlsError::IllegalParameter 길이 필드가 이쪽 상한을 넘는다. 레코드 크기와는
+     *         무관한 값이므로 record_overflow 가 아니다.
+     */
     pub fn parse(buf: &[u8]) -> Result<Option<(HandshakeMsg, usize)>, TlsError> {
         if buf.len() < 4 {
             return Ok(None);
@@ -87,7 +91,7 @@ impl HandshakeMsg {
         let msg_type = HandshakeType(buf[0]);
         let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize;
         if len > MAX_HANDSHAKE_MESSAGE {
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::IllegalParameter);
         }
         if buf.len() < 4 + len {
             return Ok(None);
@@ -99,6 +103,26 @@ impl HandshakeMsg {
             },
             4 + len,
         )))
+    }
+
+    /**
+     * @brief 상대의 Finished 가 기대한 검증 값과 같은지 확인한다.
+     * @param expected 이쪽이 같은 기록으로 계산한 검증 값.
+     * @retval TlsError::UnexpectedMessage Finished 가 올 자리에 다른 메시지가 왔다.
+     * @retval TlsError::Decode 길이가 검증 값 길이와 다르다.
+     * @retval TlsError::BadSignature 검증 값이 다르다. 비교는 상수 시간이다.
+     */
+    pub(crate) fn verify_finished(&self, expected: &[u8]) -> Result<(), TlsError> {
+        if self.msg_type != HandshakeType::Finished {
+            return Err(TlsError::UnexpectedMessage);
+        }
+        if self.body.len() != expected.len() {
+            return Err(TlsError::Decode);
+        }
+        if !crate::keyschedule::ct_eq(&self.body, expected) {
+            return Err(TlsError::BadSignature);
+        }
+        Ok(())
     }
 }
 
@@ -137,7 +161,7 @@ impl HandshakeReader {
     pub fn next_message(&mut self) -> Result<Option<HandshakeMsg>, TlsError> {
         if self.buf.len() > MAX_HANDSHAKE_MESSAGE + 4 {
             self.buf.clear();
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::IllegalParameter);
         }
         match HandshakeMsg::parse(&self.buf)? {
             Some((msg, consumed)) => {

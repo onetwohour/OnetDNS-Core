@@ -106,12 +106,6 @@ fn x25519_client_share(ch: &ClientHello) -> Option<Vec<u8>> {
         .map(|(_, k)| k)
 }
 
-/** @brief 서버 인사말에서 X25519 공개값을 꺼낸다. */
-fn x25519_server_share(sh: &ServerHello) -> Option<Vec<u8>> {
-    let (g, key) = sh.ext(EXT_KEY_SHARE)?.as_key_share_server()?;
-    (g == X25519).then_some(key)
-}
-
 /** @brief 암호화된 확장 메시지를 만든다. 전송 매개변수가 여기 담긴다. */
 fn encrypted_extensions_quic_full(
     alpn: Option<&[u8]>,
@@ -312,7 +306,7 @@ impl ServerHandshake {
     /** @brief 받은 핸드셰이크 데이터를 넣어 상태를 진행시킨다. */
     pub fn provide(&mut self, _level: Level, data: &[u8]) -> Result<(), TlsError> {
         if !server_config_wire_is_valid(&self.cfg) || self.local_tp.len() > u16::MAX as usize {
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::Internal);
         }
         self.hr.feed(data);
         loop {
@@ -325,7 +319,7 @@ impl ServerHandshake {
                 SState::ExpectClientCertificate => self.on_client_certificate(&msg)?,
                 SState::ExpectClientCertVerify => self.on_client_cert_verify(&msg)?,
                 SState::ExpectClientFinished => self.on_client_finished(&msg)?,
-                SState::Done => return Err(TlsError::Protocol),
+                SState::Done => return Err(TlsError::UnexpectedMessage),
             }
         }
     }
@@ -415,8 +409,9 @@ impl ServerHandshake {
      */
     fn on_client_hello(&mut self, ch_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let ch = ClientHello::from_handshake(ch_msg)?;
-        if !ch.is_valid_tls13() || ch.ext(EXT_QUIC_TRANSPORT_PARAMETERS).is_none() {
-            return Err(TlsError::Protocol);
+        ch.validate_tls13()?;
+        if ch.ext(EXT_QUIC_TRANSPORT_PARAMETERS).is_none() {
+            return Err(TlsError::MissingExtension);
         }
         let server_name = ch.ext(EXT_SERVER_NAME).and_then(Extension::as_server_name);
         if self
@@ -424,15 +419,15 @@ impl ServerHandshake {
             .as_ref()
             .is_some_and(|expected| Some(expected) != server_name.as_ref())
         {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
         self.server_name = server_name;
         if let Some(first) = self.hrr_client_hello.take() {
             if !ch.is_valid_retry_of(&first) {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::IllegalParameter);
             }
         } else if ch.ext(EXT_COOKIE).is_some() {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
         self.peer_tp = ch
             .ext(EXT_QUIC_TRANSPORT_PARAMETERS)
@@ -440,7 +435,7 @@ impl ServerHandshake {
 
         if x25519_client_share(&ch).is_none() {
             if self.hrr_prefix.is_some() {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::IllegalParameter);
             }
             let supports = ch
                 .ext(EXT_SUPPORTED_GROUPS)
@@ -448,15 +443,15 @@ impl ServerHandshake {
                 .map(|gs| gs.contains(&X25519))
                 .unwrap_or(false);
             if !supports {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::HandshakeFailure);
             }
             if ch.ext(EXT_PRE_SHARED_KEY).is_none()
                 && !ch.offers_signature_scheme(self.cfg.sign_scheme)
             {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::HandshakeFailure);
             }
-            let suite = choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::Protocol)?;
-            let (hash, _) = suite_params(suite).ok_or(TlsError::Protocol)?;
+            let suite = choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::HandshakeFailure)?;
+            let (hash, _) = suite_params(suite).ok_or(TlsError::Internal)?;
             let cookie = random_32().to_vec();
             let mut t = Transcript::new(hash);
             t.update(&ch_msg.encode());
@@ -484,23 +479,26 @@ impl ServerHandshake {
 
         if let Some(expected) = &self.hrr_cookie {
             let echoed = ch
-                .ext(crate::msg::consts::EXT_COOKIE)
-                .and_then(|e| e.as_cookie());
-            if echoed.as_deref() != Some(expected.as_slice()) {
-                return Err(TlsError::Protocol);
+                .ext(EXT_COOKIE)
+                .ok_or(TlsError::MissingExtension)?
+                .as_cookie()
+                .ok_or(TlsError::Decode)?;
+            if echoed != *expected {
+                return Err(TlsError::IllegalParameter);
             }
             let retry_shares = ch
                 .ext(EXT_KEY_SHARE)
-                .and_then(Extension::as_key_share_client)
-                .ok_or(TlsError::Protocol)?;
+                .ok_or(TlsError::MissingExtension)?
+                .as_key_share_client()
+                .ok_or(TlsError::Decode)?;
             if retry_shares.len() != 1
                 || retry_shares[0].0 != X25519
                 || retry_shares[0].1.len() != 32
             {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::IllegalParameter);
             }
         }
-        let client_pub = x25519_client_share(&ch).ok_or(TlsError::Protocol)?;
+        let client_pub = x25519_client_share(&ch).ok_or(TlsError::Internal)?;
 
         let client_alpn = ch
             .ext(EXT_ALPN)
@@ -528,16 +526,16 @@ impl ServerHandshake {
             });
         let resumed = psk.is_some();
         if !resumed && !ch.offers_signature_scheme(self.cfg.sign_scheme) {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::HandshakeFailure);
         }
         let suite = match &psk {
             Some((state, _)) => state.suite,
             None => self
                 .hrr_suite
                 .or_else(|| choose_suite_quic(&ch.cipher_suites))
-                .ok_or(TlsError::Protocol)?,
+                .ok_or(TlsError::HandshakeFailure)?,
         };
-        let (hash, _key_len) = suite_params(suite).ok_or(TlsError::Protocol)?;
+        let (hash, _key_len) = suite_params(suite).ok_or(TlsError::Internal)?;
 
         let mut transcript = Transcript::new(hash);
         if let Some(prefix) = self.hrr_prefix.take() {
@@ -559,8 +557,11 @@ impl ServerHandshake {
 
         let mut seed = Zeroizing::new([0u8; 32]);
         fill_random(&mut *seed);
-        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Protocol)?;
-        let shared = Zeroizing::new(kx.shared_secret(&client_pub).ok_or(TlsError::Protocol)?);
+        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
+        let shared = Zeroizing::new(
+            kx.shared_secret(&client_pub)
+                .ok_or(TlsError::IllegalParameter)?,
+        );
         let mut sh_extensions = vec![
             Extension::supported_versions_server(TLS13),
             Extension::key_share_server(X25519, &kx.public_bytes()),
@@ -679,22 +680,22 @@ impl ServerHandshake {
     /** @brief 클라이언트 인증서를 받아 체인을 검증한다. */
     fn on_client_certificate(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         if msg.msg_type != HandshakeType::Certificate {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
         let ccert = CertificateMsg::parse(&msg.body)?;
 
         if ccert.entries.is_empty() {
-            return Err(TlsError::BadCert);
+            return Err(TlsError::CertificateRequired);
         }
         let chain: Vec<X509> = ccert
             .entries
             .iter()
             .map(|e| X509::parse(&e.cert_data))
             .collect::<Result<_, _>>()?;
-        let store = self.cfg.client_ca.as_ref().ok_or(TlsError::Protocol)?;
+        let store = self.cfg.client_ca.as_ref().ok_or(TlsError::Internal)?;
         crate::trust::verify_client_chain(&chain, store, now_epoch())?;
-        self.client_cert = Some(chain.first().ok_or(TlsError::BadCert)?.clone());
-        let transcript = self.transcript.as_mut().ok_or(TlsError::Protocol)?;
+        self.client_cert = Some(chain.first().ok_or(TlsError::Internal)?.clone());
+        let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         transcript.update(&msg.encode());
         self.state = SState::ExpectClientCertVerify;
         Ok(())
@@ -703,12 +704,12 @@ impl ServerHandshake {
     /** @brief 클라이언트가 개인키를 갖고 있음을 확인한다. */
     fn on_client_cert_verify(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         if msg.msg_type != HandshakeType::CertificateVerify {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
-        let transcript = self.transcript.as_mut().ok_or(TlsError::Protocol)?;
+        let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         let th_before_cv = transcript.hash();
         let cv = CertificateVerify::parse(&msg.body)?;
-        let certificate = self.client_cert.as_ref().ok_or(TlsError::Protocol)?;
+        let certificate = self.client_cert.as_ref().ok_or(TlsError::Internal)?;
         let cv_content = certificate_verify_content(&th_before_cv, false);
         certificate.verify_tls_signature(cv.algorithm, &cv_content, &cv.signature)?;
         transcript.update(&msg.encode());
@@ -721,14 +722,9 @@ impl ServerHandshake {
      * @warning 이것이 핸드셰이크 위조를 막는 마지막 검사다. 상수 시간으로 비교한다.
      */
     fn on_client_finished(&mut self, fin_msg: &HandshakeMsg) -> Result<(), TlsError> {
-        let transcript = self.transcript.as_mut().ok_or(TlsError::Protocol)?;
+        let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         let cfk = Zeroizing::new(finished_key(self.hash, &self.client_hs_secret));
-        let expected = finished_verify_data(self.hash, &cfk, &transcript.hash());
-        if fin_msg.msg_type != HandshakeType::Finished
-            || !crate::keyschedule::ct_eq(&fin_msg.body, &expected)
-        {
-            return Err(TlsError::BadSignature);
-        }
+        fin_msg.verify_finished(&finished_verify_data(self.hash, &cfk, &transcript.hash()))?;
         transcript.update(&fin_msg.encode());
         self.state = SState::Done;
 
@@ -737,8 +733,8 @@ impl ServerHandshake {
                 && self.client_allows_resumption
                 && res.lifetime_secs > 0
             {
-                let th_fin = self.transcript.as_ref().ok_or(TlsError::Protocol)?.hash();
-                let ks = self.ks.as_ref().ok_or(TlsError::Protocol)?;
+                let th_fin = self.transcript.as_ref().ok_or(TlsError::Internal)?.hash();
+                let ks = self.ks.as_ref().ok_or(TlsError::Internal)?;
                 let res_master = Zeroizing::new(ks.resumption_master_secret(&th_fin));
                 let mut nonce = [0u8; 8];
                 fill_random(&mut nonce);
@@ -756,7 +752,7 @@ impl ServerHandshake {
                     lifetime_secs: res.lifetime_secs,
                     max_early_data: res.max_early_data,
                 };
-                let ticket = res.ticketer.seal(&state).ok_or(TlsError::RecordOverflow)?;
+                let ticket = res.ticketer.seal(&state).ok_or(TlsError::Internal)?;
                 let mut extensions = Vec::new();
                 if res.max_early_data > 0 {
                     extensions.push(Extension::early_data_nst(res.max_early_data));
@@ -873,8 +869,13 @@ pub struct ClientHandshake {
     cfg: ClientConfig,
     /** @brief 키를 주고받는 곳. */
     kx: KeyExchange,
-    /** @brief 이쪽이 보낸 첫 메시지 바이트. */
+    /**
+     * @brief 서버 인사말 앞까지의 핸드셰이크 기록.
+     * @details 다시 시도 요청을 받은 뒤에는 첫 인사말의 해시, 그 요청, 두 번째 인사말을 담는다.
+     */
     ch_wire: Vec<u8>,
+    /** @brief 이쪽이 마지막으로 보낸 인사말. 서버의 응답을 이것과 대조한다. */
+    hello: ClientHello,
     /** @brief 받은 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
     /** @brief 지금 어느 단계인지. */
@@ -949,11 +950,11 @@ impl ClientHandshake {
     /** @brief 설정과 전송 매개변수로 만든다. */
     pub fn new(cfg: ClientConfig, local_transport_params: Vec<u8>) -> Result<Self, TlsError> {
         if !client_config_wire_is_valid(&cfg) || local_transport_params.len() > u16::MAX as usize {
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::Internal);
         }
         let mut seed = Zeroizing::new([0u8; 32]);
         fill_random(&mut *seed);
-        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Protocol)?;
+        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
         let session = cfg
             .session
             .clone()
@@ -995,7 +996,7 @@ impl ClientHandshake {
                 extensions.push(Extension::early_data());
                 early_offered = true;
             }
-            let (h, _) = suite_params(s.suite).ok_or(TlsError::Protocol)?;
+            let (h, _) = suite_params(s.suite).ok_or(TlsError::Internal)?;
             extensions.push(Extension::pre_shared_key_client(
                 &s.ticket,
                 s.obfuscated_age(crate::session::now_ms()),
@@ -1026,10 +1027,10 @@ impl ClientHandshake {
 
         let mut early_secret_out = None;
         if let Some(s) = &session {
-            let (h, _) = suite_params(s.suite).ok_or(TlsError::Protocol)?;
+            let (h, _) = suite_params(s.suite).ok_or(TlsError::Internal)?;
             let binders_len = 2 + 1 + h.len();
             if ch_wire.len() <= binders_len {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::Internal);
             }
             let truncated_hash = h.digest(&ch_wire[..ch_wire.len() - binders_len]);
             let ks_early = KeySchedule::new_with_psk(h, &s.psk);
@@ -1051,6 +1052,7 @@ impl ClientHandshake {
             kx,
             out_initial: ch_wire.clone(),
             ch_wire,
+            hello: ch,
             hr: HandshakeReader::new(),
             state: CState::ExpectServerHello,
             flight_state: CFlightState::EncryptedExtensions,
@@ -1102,28 +1104,17 @@ impl ClientHandshake {
      */
     fn on_hello_retry(&mut self, hrr: &HandshakeMsg, sh: &ServerHello) -> Result<(), TlsError> {
         if self.hrr_done {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::UnexpectedMessage);
         }
-        if !sh.is_valid_tls13(&[], true) {
-            return Err(TlsError::Protocol);
-        }
-        if sh.ext(EXT_KEY_SHARE).and_then(|e| e.as_key_share_hrr()) != Some(X25519) {
-            return Err(TlsError::Protocol);
-        }
-        let first_ch = HandshakeMsg::parse(&self.ch_wire)?
-            .and_then(|(message, used)| (used == self.ch_wire.len()).then_some(message))
-            .ok_or(TlsError::Protocol)
-            .and_then(|message| ClientHello::from_handshake(&message))?;
-        if x25519_client_share(&first_ch).is_some() {
-            return Err(TlsError::Protocol);
-        }
+        sh.validate_retry_request(&self.hello)?;
         let cookie = match sh.ext(EXT_COOKIE) {
-            Some(extension) => Some(extension.as_cookie().ok_or(TlsError::Protocol)?),
+            Some(extension) => Some(extension.as_cookie().ok_or(TlsError::Decode)?),
             None => None,
         };
-        let (hash, _) = suite_params(sh.cipher_suite).ok_or(TlsError::Protocol)?;
+        let (hash, _) = suite_params(sh.cipher_suite).ok_or(TlsError::IllegalParameter)?;
+        let first_ch = &self.hello;
         if !first_ch.cipher_suites.contains(&sh.cipher_suite) {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
 
         let mut t = Transcript::new(hash);
@@ -1171,7 +1162,7 @@ impl ClientHandshake {
         if let Some(session) = &self.psk_session {
             let binders_len = 2 + 1 + hash.len();
             if ch2_wire.len() <= binders_len {
-                return Err(TlsError::Protocol);
+                return Err(TlsError::Internal);
             }
             let mut binder_transcript = Transcript::new(hash);
             binder_transcript.update(t.as_bytes());
@@ -1185,6 +1176,7 @@ impl ClientHandshake {
 
         self.ch_wire = t.as_bytes().to_vec();
         self.out_initial.extend_from_slice(&ch2_wire);
+        self.hello = ch2;
 
         self.early_offered = false;
         self.early_secret_out = None;
@@ -1200,33 +1192,34 @@ impl ClientHandshake {
         if sh.random == crate::msg::HRR_RANDOM {
             return self.on_hello_retry(sh_msg, &sh);
         }
-        if !sh.is_valid_tls13(&[], false) {
-            return Err(TlsError::Protocol);
-        }
+        sh.validate_tls13(&self.hello, false)?;
         let suite = sh.cipher_suite;
         if self.hrr_done && self.suite != suite {
-            return Err(TlsError::Protocol);
+            return Err(TlsError::IllegalParameter);
         }
-        let (hash, _key_len) = suite_params(suite).ok_or(TlsError::Protocol)?;
-        let server_pub = x25519_server_share(&sh).ok_or(TlsError::Protocol)?;
+        let (hash, _key_len) = suite_params(suite).ok_or(TlsError::IllegalParameter)?;
+        let server_pub = sh.x25519_key_share()?;
         let shared = Zeroizing::new(
             self.kx
                 .shared_secret(&server_pub)
-                .ok_or(TlsError::Protocol)?,
+                .ok_or(TlsError::IllegalParameter)?,
         );
 
-        let psk_accepted = match sh
-            .ext(EXT_PRE_SHARED_KEY)
-            .and_then(|e| e.as_pre_shared_key_server())
-        {
-            Some(0) if self.psk_session.is_some() => {
-                if self.psk_session.as_ref().map(|s| s.suite) != Some(suite) {
-                    return Err(TlsError::Protocol);
+        let psk_accepted = match sh.ext(EXT_PRE_SHARED_KEY) {
+            None => false,
+            Some(extension) => {
+                let selected = extension
+                    .as_pre_shared_key_server()
+                    .ok_or(TlsError::Decode)?;
+                let session = self
+                    .psk_session
+                    .as_ref()
+                    .ok_or(TlsError::UnsupportedExtension)?;
+                if selected != 0 || session.suite != suite {
+                    return Err(TlsError::IllegalParameter);
                 }
                 true
             }
-            Some(_) => return Err(TlsError::Protocol),
-            None => false,
         };
 
         let mut transcript = Transcript::new(hash);
@@ -1234,7 +1227,7 @@ impl ClientHandshake {
         transcript.update(&sh_msg.encode());
 
         let mut ks = if psk_accepted {
-            let psk = &self.psk_session.as_ref().ok_or(TlsError::Protocol)?.psk;
+            let psk = &self.psk_session.as_ref().ok_or(TlsError::Internal)?.psk;
             KeySchedule::new_with_psk(hash, psk)
         } else {
             KeySchedule::new(hash)
@@ -1268,44 +1261,44 @@ impl ClientHandshake {
 
     /** @brief 서버 차례의 메시지를 순서대로 처리한다. */
     fn on_flight_msg(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
-        let transcript = self.transcript.as_mut().ok_or(TlsError::Protocol)?;
+        let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         match msg.msg_type {
             HandshakeType::EncryptedExtensions => {
                 if self.flight_state != CFlightState::EncryptedExtensions {
-                    return Err(TlsError::Protocol);
+                    return Err(TlsError::UnexpectedMessage);
                 }
-                let exts = parse_ee_extensions(&msg.body)?;
-                if !exts.iter().all(|extension| match extension.ext_type {
-                    EXT_ALPN | EXT_EARLY_DATA | EXT_QUIC_TRANSPORT_PARAMETERS => true,
-                    EXT_SERVER_NAME => extension.data.is_empty() && self.cfg.sni().is_some(),
-                    EXT_SUPPORTED_GROUPS => extension.as_supported_groups().is_some(),
-                    _ => false,
-                }) {
-                    return Err(TlsError::Protocol);
-                }
-                self.peer_tp = Some(
-                    Extension::find(&exts, EXT_QUIC_TRANSPORT_PARAMETERS)
-                        .ok_or(TlsError::Protocol)?
-                        .data
-                        .clone(),
-                );
-                self.alpn = match Extension::find(&exts, EXT_ALPN) {
-                    Some(extension) => {
-                        let protocols = extension.as_alpn().ok_or(TlsError::Protocol)?;
-                        if protocols.len() != 1 || !self.cfg.alpn.contains(&protocols[0]) {
-                            return Err(TlsError::Protocol);
+                let mut peer_tp = None;
+                for extension in parse_ee_extensions(&msg.body)? {
+                    match extension.ext_type {
+                        EXT_QUIC_TRANSPORT_PARAMETERS => peer_tp = Some(extension.data),
+                        EXT_ALPN => self.alpn = Some(extension.selected_alpn(&self.cfg.alpn)?),
+                        EXT_EARLY_DATA => {
+                            if !self.early_offered {
+                                return Err(TlsError::UnsupportedExtension);
+                            }
+                            if !extension.data.is_empty() {
+                                return Err(TlsError::Decode);
+                            }
+                            self.early_accepted = true;
                         }
-                        Some(protocols[0].clone())
+                        EXT_SERVER_NAME => {
+                            if self.hello.ext(EXT_SERVER_NAME).is_none() {
+                                return Err(TlsError::UnsupportedExtension);
+                            }
+                            if !extension.data.is_empty() {
+                                return Err(TlsError::Decode);
+                            }
+                        }
+                        EXT_SUPPORTED_GROUPS => {
+                            extension.as_supported_groups().ok_or(TlsError::Decode)?;
+                        }
+                        other if self.hello.ext(other).is_some() => {
+                            return Err(TlsError::IllegalParameter)
+                        }
+                        _ => return Err(TlsError::UnsupportedExtension),
                     }
-                    None => None,
-                };
-                let early_data = Extension::find(&exts, EXT_EARLY_DATA);
-                if early_data.is_some_and(|extension| !extension.data.is_empty())
-                    || (early_data.is_some() && !self.early_offered)
-                {
-                    return Err(TlsError::Protocol);
                 }
-                self.early_accepted = self.early_offered && early_data.is_some();
+                self.peer_tp = Some(peer_tp.ok_or(TlsError::MissingExtension)?);
                 self.flight_state = if self.psk_accepted {
                     CFlightState::Finished
                 } else {
@@ -1316,7 +1309,7 @@ impl ClientHandshake {
             }
             HandshakeType::CertificateRequest => {
                 if self.flight_state != CFlightState::CertificateOrRequest {
-                    return Err(TlsError::Protocol);
+                    return Err(TlsError::UnexpectedMessage);
                 }
                 crate::cert::CertificateRequestMsg::parse(&msg.body)?;
                 self.cert_requested = true;
@@ -1329,10 +1322,10 @@ impl ClientHandshake {
                     self.flight_state,
                     CFlightState::CertificateOrRequest | CFlightState::Certificate
                 ) {
-                    return Err(TlsError::Protocol);
+                    return Err(TlsError::UnexpectedMessage);
                 }
                 let cert = CertificateMsg::parse(&msg.body)?;
-                let leaf = cert.leaf().ok_or(TlsError::BadCert)?;
+                let leaf = cert.leaf().ok_or(TlsError::Decode)?;
                 let x = X509::parse(leaf)?;
 
                 self.verified_chain = match &self.cfg.roots {
@@ -1366,11 +1359,11 @@ impl ClientHandshake {
             }
             HandshakeType::CertificateVerify => {
                 if self.flight_state != CFlightState::CertificateVerify {
-                    return Err(TlsError::Protocol);
+                    return Err(TlsError::UnexpectedMessage);
                 }
                 let th_before_cv = transcript.hash();
                 let cv = CertificateVerify::parse(&msg.body)?;
-                let certificate = self.leaf_cert.as_ref().ok_or(TlsError::Protocol)?;
+                let certificate = self.leaf_cert.as_ref().ok_or(TlsError::Internal)?;
                 let cv_content = certificate_verify_content(&th_before_cv, true);
                 certificate.verify_tls_signature(cv.algorithm, &cv_content, &cv.signature)?;
                 self.seen_cert_verify = true;
@@ -1382,14 +1375,10 @@ impl ClientHandshake {
                 if self.flight_state != CFlightState::Finished
                     || (!self.psk_accepted && !self.seen_cert_verify)
                 {
-                    return Err(TlsError::Protocol);
+                    return Err(TlsError::UnexpectedMessage);
                 }
-                let th_before_fin = transcript.hash();
                 let sfk = Zeroizing::new(finished_key(self.hash, &self.server_hs_secret));
-                let expected = finished_verify_data(self.hash, &sfk, &th_before_fin);
-                if !crate::keyschedule::ct_eq(&msg.body, &expected) {
-                    return Err(TlsError::BadSignature);
-                }
+                msg.verify_finished(&finished_verify_data(self.hash, &sfk, &transcript.hash()))?;
                 transcript.update(&msg.encode());
                 let th_after = transcript.hash();
 
@@ -1417,7 +1406,7 @@ impl ClientHandshake {
                     self.out_handshake.extend_from_slice(&cert_hs.encode());
                     transcript.update(&cert_hs.encode());
                     if has_cert {
-                        let cc = self.cfg.client_cert.as_ref().ok_or(TlsError::Protocol)?;
+                        let cc = self.cfg.client_cert.as_ref().ok_or(TlsError::Internal)?;
                         let content = certificate_verify_content(&transcript.hash(), false);
                         let cv = CertificateVerify {
                             algorithm: cc.sign_scheme,
@@ -1437,7 +1426,7 @@ impl ClientHandshake {
                 transcript.update(&fin_msg.encode());
                 let th_client_fin = transcript.hash();
 
-                let ks = self.ks.as_mut().ok_or(TlsError::Protocol)?;
+                let ks = self.ks.as_mut().ok_or(TlsError::Internal)?;
                 ks.enter_master();
                 let cap = ks.client_application_traffic_secret(&th_after);
                 let sap = ks.server_application_traffic_secret(&th_after);
@@ -1457,7 +1446,7 @@ impl ClientHandshake {
                 self.state = CState::Done;
                 Ok(())
             }
-            _ => Err(TlsError::Protocol),
+            _ => Err(TlsError::UnexpectedMessage),
         }
     }
 
@@ -1487,7 +1476,7 @@ impl ClientHandshake {
                 });
                 Ok(())
             }
-            _ => Err(TlsError::Protocol),
+            _ => Err(TlsError::UnexpectedMessage),
         }
     }
 
@@ -1634,7 +1623,8 @@ mod tests {
         let certificate_message = certificate_message.unwrap().encode();
         assert_eq!(
             client.provide(Level::Handshake, &certificate_message),
-            Err(TlsError::Protocol)
+            Err(TlsError::UnexpectedMessage),
+            "암호화된 확장보다 먼저 온 인증서는 unexpected_message 다"
         );
     }
 
@@ -1685,11 +1675,92 @@ mod tests {
             });
             let reply = HandshakeMsg::new(HandshakeType::EncryptedExtensions, body.buf).encode();
             assert_eq!(
-                client.provide(Level::Handshake, &reply).is_ok(),
-                offered,
+                client.provide(Level::Handshake, &reply),
+                if offered {
+                    Ok(())
+                } else {
+                    Err(TlsError::UnsupportedExtension)
+                },
                 "{server_name}"
             );
         }
+    }
+
+    #[test]
+    /**
+     * @brief 암호화된 확장의 결함마다 RFC 8446 과 RFC 9001 이 정한 alert 로 거부하는지.
+     * @details 이쪽이 제안한 확장이 올 수 없는 자리에 오면 illegal_parameter, 제안하지 않은
+     *          확장이면 unsupported_extension, 전송 매개변수가 빠지면 missing_extension 이다.
+     */
+    fn encrypted_extensions_rejections_name_the_matching_alert() {
+        let cfg = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
+        let reply = |edit: &dyn Fn(&mut Vec<Extension>)| {
+            let mut server = ServerHandshake::new(Arc::clone(&cfg), b"stp".to_vec());
+            let client_cfg = ClientConfig {
+                server_name: "localhost".to_string(),
+                alpn: vec![b"doq".to_vec()],
+                ..insecure_test_client()
+            };
+            let mut client = ClientHandshake::new(client_cfg, b"ctp".to_vec()).unwrap();
+            for (level, data) in client.take_crypto() {
+                server.provide(level, &data).unwrap();
+            }
+            let flight = server.take_crypto();
+            client.provide(flight[0].0, &flight[0].1).unwrap();
+            let mut reader = HandshakeReader::new();
+            reader.feed(&flight[1].1);
+            let ee = reader.next_message().unwrap().unwrap();
+            let mut extensions = parse_ee_extensions(&ee.body).unwrap();
+            edit(&mut extensions);
+            let mut body = Writer::new();
+            body.vec16(|w| {
+                extensions
+                    .iter()
+                    .for_each(|extension| extension.encode_into(w))
+            });
+            let ee = HandshakeMsg::new(HandshakeType::EncryptedExtensions, body.buf);
+            client.provide(Level::Handshake, &ee.encode())
+        };
+
+        assert_eq!(reply(&|_| {}), Ok(()), "고치지 않은 확장은 받아들여야 한다");
+        assert_eq!(
+            reply(&|extensions| {
+                extensions.retain(|extension| extension.ext_type != EXT_QUIC_TRANSPORT_PARAMETERS)
+            }),
+            Err(TlsError::MissingExtension),
+            "전송 매개변수가 빠지면 missing_extension 이다"
+        );
+        assert_eq!(
+            reply(&|extensions| extensions.push(Extension::early_data())),
+            Err(TlsError::UnsupportedExtension),
+            "제안하지 않은 조기 데이터 수락은 unsupported_extension 이다"
+        );
+        assert_eq!(
+            reply(&|extensions| extensions.push(Extension::key_share_server(X25519, &[7; 32]))),
+            Err(TlsError::IllegalParameter),
+            "인사말에 보낸 키 공유가 암호화된 확장에 오면 illegal_parameter 다"
+        );
+        assert_eq!(
+            reply(&|extensions| extensions.push(Extension::new(0x1234, Vec::new()))),
+            Err(TlsError::UnsupportedExtension),
+            "제안하지 않은 확장은 unsupported_extension 이다"
+        );
+        assert_eq!(
+            reply(&|extensions| extensions.push(Extension::new(EXT_SUPPORTED_GROUPS, vec![0, 1]))),
+            Err(TlsError::Decode),
+            "형식이 깨진 지원 곡선은 decode_error 다"
+        );
+        assert_eq!(
+            reply(&|extensions| {
+                for extension in extensions.iter_mut() {
+                    if extension.ext_type == EXT_ALPN {
+                        *extension = Extension::alpn(&[b"h3".as_slice()]);
+                    }
+                }
+            }),
+            Err(TlsError::IllegalParameter),
+            "제안하지 않은 프로토콜을 고르면 illegal_parameter 다"
+        );
     }
 
     #[test]
@@ -1801,7 +1872,10 @@ mod tests {
     }
 
     #[test]
-    /** @brief 두 번째 다시 시도와 스위트 변경을 거부하는지. */
+    /**
+     * @brief 이미 보낸 키 조각을 다시 요구하는 요청, 두 번째 다시 시도 요청, 스위트 변경을
+     *        각각 RFC 8446 이 정한 alert 로 거부하는지.
+     */
     fn quic_client_rejects_redundant_hrr_and_suite_change() {
         let normal_cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -1810,19 +1884,30 @@ mod tests {
         let mut normal = ClientHandshake::new(normal_cfg, b"tp".to_vec()).unwrap();
         assert_eq!(
             normal.provide(Level::Initial, &test_hrr(TLS_AES_128_GCM_SHA256).encode()),
-            Err(TlsError::Protocol)
+            Err(TlsError::IllegalParameter),
+            "이미 키 조각을 보낸 곡선을 고른 요청은 illegal_parameter 다"
         );
 
-        let retry_cfg = ClientConfig {
-            server_name: "localhost".to_string(),
-            send_key_share: false,
-            ..insecure_test_client()
+        let retried = || {
+            let retry_cfg = ClientConfig {
+                server_name: "localhost".to_string(),
+                send_key_share: false,
+                ..insecure_test_client()
+            };
+            let mut retry = ClientHandshake::new(retry_cfg, b"tp".to_vec()).unwrap();
+            retry
+                .provide(Level::Initial, &test_hrr(TLS_AES_128_GCM_SHA256).encode())
+                .unwrap();
+            let _ = retry.take_crypto();
+            retry
         };
-        let mut retry = ClientHandshake::new(retry_cfg, b"tp".to_vec()).unwrap();
-        retry
-            .provide(Level::Initial, &test_hrr(TLS_AES_128_GCM_SHA256).encode())
-            .unwrap();
-        let _ = retry.take_crypto();
+        assert_eq!(
+            retried().provide(Level::Initial, &test_hrr(TLS_AES_128_GCM_SHA256).encode()),
+            Err(TlsError::UnexpectedMessage),
+            "두 번째 다시 시도 요청은 unexpected_message 다"
+        );
+
+        let mut retry = retried();
         let changed = ServerHello {
             legacy_version: TLS12,
             random: [9; 32],
@@ -1836,7 +1921,8 @@ mod tests {
         .to_handshake();
         assert_eq!(
             retry.provide(Level::Initial, &changed.encode()),
-            Err(TlsError::Protocol)
+            Err(TlsError::IllegalParameter),
+            "다시 시도 요청과 다른 스위트를 고른 서버 인사말은 illegal_parameter 다"
         );
     }
     use p256::pkcs8::DecodePrivateKey;
@@ -2219,7 +2305,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(err, Some(TlsError::BadCert));
+        assert_eq!(err, Some(TlsError::CertificateRequired));
         assert!(!server.is_complete());
     }
 

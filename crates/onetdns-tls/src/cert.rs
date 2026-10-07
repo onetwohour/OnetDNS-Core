@@ -48,7 +48,11 @@ pub struct CertificateMsg {
 }
 
 impl CertificateMsg {
-    /** @brief 인증서 메시지를 읽는다. */
+    /**
+     * @brief 인증서 메시지를 읽는다.
+     * @retval TlsError::Decode 형식이 깨졌거나 빈 인증서가 있다.
+     * @retval TlsError::BadCert 인증서가 이쪽이 검증할 개수 상한보다 많다.
+     */
     pub fn parse(body: &[u8]) -> Result<CertificateMsg, TlsError> {
         let mut r = Reader::new(body);
         let request_context = r.vec8()?.to_vec();
@@ -60,8 +64,11 @@ impl CertificateMsg {
         let mut entries = Vec::new();
         while !lr.is_empty() {
             let cert_data = lr.vec24()?.to_vec();
-            if cert_data.is_empty() || entries.len() >= MAX_CERTIFICATE_ENTRIES {
-                return Err(TlsError::RecordOverflow);
+            if cert_data.is_empty() {
+                return Err(TlsError::Decode);
+            }
+            if entries.len() >= MAX_CERTIFICATE_ENTRIES {
+                return Err(TlsError::BadCert);
             }
             let extensions = lr.vec16()?.to_vec();
             entries.push(CertEntry {

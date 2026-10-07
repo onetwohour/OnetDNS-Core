@@ -319,10 +319,12 @@ impl X509 {
             return Err(TlsError::BadCert);
         }
         let sig_algid = c.expect(der::SEQUENCE)?;
-        // 검증할 수 없는 서명 방식이어도 인증서 자체는 읽는다. 신뢰 루트는 서명을
-        // 확인하는 대상이 아니라 확인의 출발점이라, SHA-1으로 자기 서명한 이전 루트를
-        // 여기서 버리면 그 루트로 이어지는 체인을 전부 못 믿게 된다. 이 값이 0이면
-        // 그 서명으로는 아무것도 검증되지 않으므로 체인 안의 어느 곳에도 쓰이지 못한다.
+        /*
+         * 검증할 수 없는 서명 방식이어도 인증서 자체는 읽는다. 신뢰 루트는 서명을
+         * 확인하는 대상이 아니라 확인의 출발점이라, SHA-1으로 자기 서명한 이전 루트를
+         * 여기서 버리면 그 루트로 이어지는 체인을 전부 못 믿게 된다. 이 값이 0이면
+         * 그 서명으로는 아무것도 검증되지 않으므로 체인 안의 어느 곳에도 쓰이지 못한다.
+         */
         let sig_scheme = scheme_from_sig_algid(sig_algid)?;
         let signature = bit_string_bytes(c.expect(der::BIT_STRING)?)?.to_vec();
 
@@ -436,7 +438,13 @@ impl X509 {
         verify_signature(scheme, &self.public_key, content, signature)
     }
 
-    /** @brief TLS 서명 방식으로 검증한다. 키 종류와 방식이 맞아야 한다. */
+    /**
+     * @brief 상대가 핸드셰이크에서 한 서명을 이 인증서의 공개키로 검증한다.
+     * @retval TlsError::UnsupportedCertificate RSASSA-PSS 공개키다. 그 키에 맞는 서명 방식을
+     *         다루지 않는다.
+     * @retval TlsError::IllegalParameter 상대가 고른 서명 방식이 공개키 종류와 맞지 않는다.
+     *         인증서가 아니라 상대의 선택이 틀린 것이므로 bad_certificate 가 아니다.
+     */
     pub fn verify_tls_signature(
         &self,
         scheme: u16,
@@ -444,9 +452,12 @@ impl X509 {
         signature: &[u8],
     ) -> Result<(), TlsError> {
         if matches!(self.public_key_algorithm, PublicKeyAlgorithm::RsaPss { .. }) {
-            return Err(TlsError::UnsupportedSig(scheme));
+            return Err(TlsError::UnsupportedCertificate);
         }
-        self.verify_signature(scheme, content, signature)
+        if !self.public_key_algorithm.allows_signature_scheme(scheme) {
+            return Err(TlsError::IllegalParameter);
+        }
+        verify_signature(scheme, &self.public_key, content, signature)
     }
 
     /** @brief 다른 인증서를 서명할 수 있는지. CA 판정이다. */
@@ -620,8 +631,10 @@ pub(crate) fn rsa_public_key_components(key: &[u8]) -> Result<(&[u8], &[u8]), Tl
     let exponent_value = exponent
         .iter()
         .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
-    // 지수 3은 Go Daddy Class 2 같은 이전 루트가 아직 쓴다. 그 서명을 실제로 검증하는
-    // onetdns_core::rsa 가 EM을 전부 다시 만들어 비교하므로 작은 지수로 위조할 경로가 없다.
+    /*
+     * 지수 3은 Go Daddy Class 2 같은 이전 루트가 아직 쓴다. 그 서명을 실제로 검증하는
+     * onetdns_core::rsa 가 EM을 전부 다시 만들어 비교하므로 작은 지수로 위조할 경로가 없다.
+     */
     if !(3..=(1u64 << 33) - 1).contains(&exponent_value) || exponent_value & 1 == 0 {
         return Err(TlsError::BadCert);
     }
@@ -732,8 +745,10 @@ pub fn scheme_from_sig_algid(algid: &[u8]) -> Result<u16, TlsError> {
             consts::RSA_PKCS1_SHA512
         }
         x if x == OID_RSA_PSS => pss_scheme_from_params(&mut d)?,
-        // 검증하지 않을 방식이라 매개변수의 뜻은 보지 않는다. 다만 DER로서 온전한지는
-        // 따져, 뒤에 해석되지 않은 바이트가 남은 인증서는 그대로 거부한다.
+        /*
+         * 검증하지 않을 방식이라 매개변수의 뜻은 보지 않는다. 다만 DER로서 온전한지는
+         * 따져, 뒤에 해석되지 않은 바이트가 남은 인증서는 그대로 거부한다.
+         */
         _ => {
             while !d.is_empty() {
                 d.next()?;
@@ -885,15 +900,15 @@ struct ParsedExt {
 pub(crate) struct Extension<'a> {
     /** @brief 확장 종류. */
     pub oid: &'a [u8],
-    /** @brief 이 확장을 해석하지 못하면 담긴 인증서나 목록 전체를 쓰지 말아야 하는지. */
+    /** @brief 이 확장을 해석하지 못하면 담긴 인증서, 폐기 목록, OCSP 응답을 쓰지 말아야 하는지. */
     pub critical: bool,
     /** @brief OCTET STRING 안에 든 확장 값. */
     pub value: &'a [u8],
 }
 
 /**
- * @brief Extensions SEQUENCE 의 내용을 확장 목록으로 읽는다. 인증서와 폐기 목록이 이 형식을
- *        같이 쓴다.
+ * @brief Extensions SEQUENCE 의 내용을 확장 목록으로 읽는다. 인증서, 폐기 목록, OCSP 응답이
+ *        이 형식을 같이 쓴다.
  * @warning 같은 확장이 두 번 오면 거부한다. 어느 쪽을 따르느냐가 구현마다 달라 그 차이가 곧
  *          우회 경로가 된다.
  */
@@ -954,8 +969,10 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
             while !g.is_empty() {
                 let name = g.next()?;
                 if name.tag == 0x82 {
-                    // dNSName 은 IA5String 이다. ASCII 가 아닌 값을 이름으로 받아들이면 다른
-                    // 검증기가 거절하는 인증서를 이쪽만 통과시킬 수 있다.
+                    /*
+                     * dNSName 은 IA5String 이다. ASCII 가 아닌 값을 이름으로 받아들이면 다른
+                     * 검증기가 거절하는 인증서를 이쪽만 통과시킬 수 있다.
+                     */
                     if !name.value.is_ascii() {
                         return Err(TlsError::BadCert);
                     }
@@ -974,8 +991,11 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
                 }
             }
         } else if oid == OID_BASIC_CONSTRAINTS {
-            // cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL 순서이고
-            // 그 밖의 값은 없어야 한다. 순서나 중복, 모르는 값을 넘기면 다른 검증기와 다르게 읽는다.
+            /*
+             * cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL 순서이고
+             * 그 밖의 값은 없어야 한다. 순서나 중복, 모르는 값을 넘기면 다른 검증기와 다르게
+             * 읽는다.
+             */
             let mut outer = Der::new(val);
             let seq = outer.expect(der::SEQUENCE)?;
             if !outer.is_empty() {
@@ -1369,6 +1389,45 @@ mod tests {
             scheme: consts::RSA_PSS_RSAE_SHA256,
         }
         .allows_signature_scheme(consts::RSA_PKCS1_SHA256));
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크 서명 검증 실패를 원인에 맞는 경고로 나누는지.
+     * @details 상대가 키와 맞지 않는 방식을 고른 것은 인증서 탓이 아니고, 서명이 틀린 것은
+     *          decrypt_error 다. 섞으면 상대에게 엉뚱한 경고가 나간다.
+     */
+    fn tls_signature_failures_name_their_cause() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        use p256::pkcs8::DecodePrivateKey;
+
+        let ck = rcgen::generate_simple_self_signed(vec!["dns.example".to_string()]).unwrap();
+        let mut cert = X509::parse(ck.cert.der().as_ref()).unwrap();
+        let key = SigningKey::from(
+            p256::SecretKey::from_pkcs8_der(&ck.key_pair.serialize_der()).unwrap(),
+        );
+        let signature: Signature = key.sign(b"content");
+        let signature = signature.to_der().as_bytes().to_vec();
+
+        assert_eq!(
+            cert.verify_tls_signature(consts::ECDSA_SECP256R1_SHA256, b"content", &signature),
+            Ok(())
+        );
+        assert_eq!(
+            cert.verify_tls_signature(consts::ECDSA_SECP256R1_SHA256, b"tampered", &signature),
+            Err(TlsError::BadSignature)
+        );
+        assert_eq!(
+            cert.verify_tls_signature(consts::RSA_PSS_RSAE_SHA256, b"content", &signature),
+            Err(TlsError::IllegalParameter)
+        );
+        cert.public_key_algorithm = PublicKeyAlgorithm::RsaPss {
+            scheme: consts::RSA_PSS_RSAE_SHA256,
+        };
+        assert_eq!(
+            cert.verify_tls_signature(consts::RSA_PSS_RSAE_SHA256, b"content", &signature),
+            Err(TlsError::UnsupportedCertificate)
+        );
     }
 
     #[test]

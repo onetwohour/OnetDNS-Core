@@ -58,6 +58,11 @@ const UNI_QPACK_ENCODER: u64 = 0x02;
 /** @brief QPACK 확인 스트림 종류 번호. */
 const UNI_QPACK_DECODER: u64 = 0x03;
 
+/** @brief RFC 9114 의 오류 코드. 더 구체적인 코드를 고르지 않은 HTTP/3 규격 위반에 쓴다. */
+const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x0101;
+/** @brief 제어 스트림이나 QPACK 스트림이 닫혔다. RFC 9114 와 RFC 9204 가 연결 오류로 정했다. */
+const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
+
 /** @brief 연결 전체 버퍼 상한 안에 들어가는지. */
 fn fits_connection_buffer(buffered: usize, incoming: usize) -> bool {
     buffered
@@ -429,11 +434,14 @@ impl QpackCtx {
  * @brief 제어 스트림이나 QPACK 스트림으로 보낸다.
  * @details 이 스트림들이 닫히면 HTTP/3 연결은 이어 갈 수 없다. 상대가 STOP_SENDING 으로
  *          닫은 것을 스트림 오류로 돌려주면 부른 쪽이 연결을 살려 두고, 그 뒤로 헤더 테이블
- *          갱신이 상대에게 닿지 않는다. 그래서 연결 오류로 바꾼다.
+ *          갱신이 상대에게 닿지 않는다. 그래서 연결 오류로 바꾸고 그 코드로 연결을 닫는다.
  */
 fn send_critical(conn: &mut Connection, id: u64, data: &[u8]) -> Result<(), QuicError> {
     match conn.send_stream(id, data, false) {
-        Err(QuicError::StreamClosed) => Err(QuicError::Frame),
+        Err(QuicError::StreamClosed) => {
+            conn.close(H3_CLOSED_CRITICAL_STREAM, "HTTP/3 critical stream closed");
+            Err(QuicError::Frame)
+        }
         other => other,
     }
 }
@@ -824,9 +832,23 @@ impl H3Connection {
         }
     }
 
-    /** @brief 데이터그램 하나를 받아 상태를 진행시킨다. */
+    /**
+     * @brief 데이터그램 하나를 받아 상태를 진행시킨다.
+     * @details HTTP/3 계층에서 연결 오류가 나면 상대에게 알리고 연결을 닫은 뒤 그 오류를
+     *          돌려준다. QUIC 계층의 오류는 그 계층이 이미 알렸다.
+     */
     pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         self.conn.recv_datagram(dg)?;
+        let processed = self.process_streams();
+        if processed.is_err() {
+            self.conn
+                .close(H3_GENERAL_PROTOCOL_ERROR, "HTTP/3 protocol error");
+        }
+        processed
+    }
+
+    /** @brief QUIC 계층이 내놓은 스트림 데이터를 요청으로 모으고 끊긴 스트림을 정리한다. */
+    fn process_streams(&mut self) -> Result<(), QuicError> {
         match self.maybe_send_control() {
             Ok(()) | Err(QuicError::FlowControl | QuicError::StreamLimit) => {}
             Err(error) => return Err(error),
@@ -1125,9 +1147,23 @@ impl H3Client {
         Ok(())
     }
 
-    /** @brief 받은 데이터그램을 넣는다. */
+    /**
+     * @brief 받은 데이터그램을 넣는다.
+     * @details HTTP/3 계층에서 연결 오류가 나면 상대에게 알리고 연결을 닫은 뒤 그 오류를
+     *          돌려준다. QUIC 계층의 오류는 그 계층이 이미 알렸다.
+     */
     pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         self.conn.recv_datagram(dg)?;
+        let processed = self.process_streams();
+        if processed.is_err() {
+            self.conn
+                .close(H3_GENERAL_PROTOCOL_ERROR, "HTTP/3 protocol error");
+        }
+        processed
+    }
+
+    /** @brief QUIC 계층이 내놓은 스트림 데이터를 응답으로 모으고 끊긴 스트림을 정리한다. */
+    fn process_streams(&mut self) -> Result<(), QuicError> {
         match self.maybe_send_setup() {
             Ok(()) | Err(QuicError::FlowControl | QuicError::StreamLimit) => {}
             Err(error) => return Err(error),
@@ -2009,6 +2045,95 @@ mod tests {
             server.send_response(id, b"\x00\x00 answer", 4242),
             Err(QuicError::Frame)
         );
+        assert!(
+            server.is_closed(),
+            "필수 스트림이 닫혔는데 연결을 닫지 않았습니다"
+        );
+        while let Some(dg) = server.next_datagram() {
+            client.conn_mut().recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(
+            client.conn_mut().peer_close().map(|close| close.error_code),
+            Some(H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief HTTP/3 계층의 연결 오류를 상대에게 RFC 9114 코드로 알리는지.
+     * @details 제어 스트림은 연결마다 하나뿐이라 두 번째가 오면 연결 오류다. 알리지 않고 버리면
+     *          상대는 자기 유휴 데드라인까지 기다린다.
+     */
+    fn http3_connection_error_reaches_the_peer() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+
+        send_second_control_stream(client.conn_mut());
+        let mut rejected = false;
+        while let Some(dg) = client.next_datagram() {
+            if server.recv_datagram(&dg).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "두 번째 제어 스트림을 받아들였습니다");
+        assert!(server.is_closed());
+
+        while let Some(dg) = server.next_datagram() {
+            client.conn_mut().recv_datagram(&dg).unwrap();
+        }
+        let close = client
+            .conn_mut()
+            .peer_close()
+            .cloned()
+            .expect("종료 사유가 오지 않았습니다");
+        assert_eq!(close.error_code, H3_GENERAL_PROTOCOL_ERROR);
+        assert_eq!(close.frame_type, None, "응용 계층 종료여야 합니다");
+    }
+
+    #[test]
+    /**
+     * @brief 클라이언트도 HTTP/3 계층의 연결 오류를 서버에 RFC 9114 코드로 알리는지.
+     * @details 업스트림이 규격을 어기면 클라이언트는 그 연결을 버린다. 알리지 않으면 업스트림은
+     *          자기 유휴 데드라인까지 그 연결을 붙들고 있다.
+     */
+    fn http3_client_connection_error_reaches_the_server() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+
+        send_second_control_stream(server.conn_mut());
+        let mut rejected = false;
+        while let Some(dg) = server.next_datagram() {
+            if client.recv_datagram(&dg).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "두 번째 제어 스트림을 받아들였습니다");
+        assert!(client.is_closed());
+
+        while let Some(dg) = client.next_datagram() {
+            server.conn_mut().recv_datagram(&dg).unwrap();
+        }
+        let close = server
+            .conn_mut()
+            .peer_close()
+            .cloned()
+            .expect("종료 사유가 오지 않았습니다");
+        assert_eq!(close.error_code, H3_GENERAL_PROTOCOL_ERROR);
+        assert_eq!(close.frame_type, None, "응용 계층 종료여야 합니다");
+    }
+
+    /**
+     * @brief 제어 스트림을 이미 연 연결에서 제어 스트림을 하나 더 열어 설정을 보낸다.
+     * @details 제어 스트림은 연결마다 하나뿐이라 받는 쪽에는 HTTP/3 연결 오류다.
+     */
+    fn send_second_control_stream(conn: &mut Connection) {
+        let id = conn.open_uni_stream().unwrap();
+        let mut data = Vec::new();
+        varint::write(&mut data, UNI_CONTROL);
+        encode_frame(&mut data, FRAME_SETTINGS, &our_settings());
+        conn.send_stream(id, &data, false).unwrap();
     }
 
     #[test]

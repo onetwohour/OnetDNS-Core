@@ -356,6 +356,72 @@ mod tests {
 
     #[test]
     /**
+     * @brief 리스너가 핸드셰이크를 거부하면 그 까닭이 클라이언트에 닿는지.
+     * @details 리스너는 오류를 낸 연결을 그 자리에서 표에서 지운다. 쌓인 종료 프레임을 먼저
+     *          보내지 않으면 클라이언트는 자기 유휴 데드라인까지 기다린다.
+     */
+    fn rejected_handshake_reaches_the_client() {
+        let mut tls = (*self_signed_doq()).clone();
+        tls.client_ca = Some(onetdns_tls::TrustStore::from_ders([
+            tls.cert_chain[0].as_slice()
+        ]));
+        let listener = serve_doq(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(Arc::new(tls))),
+            native_handler(),
+            Arc::new(AtomicBool::new(false)),
+            memory_budget(),
+        )
+        .unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let wait = RecvWait::new(Duration::from_millis(50));
+        wait.install(&sock).unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: false,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![b"doq".to_vec()],
+            ..Default::default()
+        };
+        let mut client = Connection::new_client(
+            cfg,
+            random_cid(),
+            random_cid(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+
+        let mut b = [0u8; 2048];
+        let clock = Instant::now();
+        let deadline = clock + Duration::from_secs(15);
+        while !client.is_closed() && Instant::now() < deadline {
+            let now_ms = clock.elapsed().as_millis() as u64;
+            client.set_now(now_ms);
+            client.on_timeout(now_ms);
+            while let Some(dg) = client.next_datagram() {
+                sock.send_to(&dg, listener.addr()).unwrap();
+            }
+            if let Ok((n, _)) = wait.recv_from(&sock, &mut b) {
+                client.recv_datagram(&b[..n]).unwrap();
+            }
+        }
+        let close = client
+            .peer_close()
+            .cloned()
+            .expect("리스너가 종료 사유를 보내지 않았습니다");
+        assert_eq!(
+            close.error_code,
+            0x100 + 116,
+            "certificate_required 경고를 담은 CRYPTO_ERROR 여야 합니다"
+        );
+    }
+
+    #[test]
+    /**
      * @brief RFC 9250이 열거한 두 프로토콜 오류를 가려내는지.
      * @details 0이 아닌 ID와 edns-tcp-keepalive다. 둘 다 연결을 끊어야 하므로 답이 없다.
      */

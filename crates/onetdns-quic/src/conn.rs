@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use onetdns_tls::engine::{ClientHandshake, Level, SecretPair, ServerHandshake};
-use onetdns_tls::{ClientConfig, ServerConfig};
+use onetdns_tls::{ClientConfig, ServerConfig, TlsError};
 
 use crate::frame::{self, Frame};
 use crate::packet::{self, ptype};
@@ -79,6 +79,25 @@ const MAX_FLOW_CONTROL: u64 = 1 << 60;
  */
 const PROBE_PACKETS: u8 = 2;
 
+/** @brief RFC 9000 의 전송 오류 코드. 상대와 무관한 이쪽 내부 실패. */
+const INTERNAL_ERROR: u64 = 0x1;
+/** @brief 상대가 흐름 제어 한도를 넘겼다. */
+const FLOW_CONTROL_ERROR: u64 = 0x3;
+/** @brief 상대가 허락된 수보다 많은 스트림을 열었다. */
+const STREAM_LIMIT_ERROR: u64 = 0x4;
+/** @brief 상대의 전송 매개변수가 규격이나 실제로 오간 값과 어긋난다. */
+const TRANSPORT_PARAMETER_ERROR: u64 = 0x8;
+/** @brief 더 구체적인 코드가 없는 규격 위반. */
+const PROTOCOL_VIOLATION: u64 = 0xa;
+/**
+ * @brief 응용 계층 종료를 Initial 이나 Handshake 패킷에 실을 때 대신 쓰는 코드.
+ * @details 그 패킷들은 상대를 인증하기 전에도 오간다. 응용 계층의 코드와 사유를 그대로 실으면
+ *          응용 상태가 드러나므로, RFC 9000 이 이 코드로 바꾸고 사유를 비우게 한다.
+ */
+const APPLICATION_ERROR: u64 = 0xc;
+/** @brief TLS 경고를 알리는 코드의 시작. 경고 코드를 더한 값으로 알린다(RFC 9001). */
+const CRYPTO_ERROR: u64 = 0x100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /** @brief 패킷 종류. 확인 처리 방식이 갈린다. */
 enum PacketKind {
@@ -98,8 +117,8 @@ enum PacketKind {
  * @details StreamClosed 만 스트림 하나에 그치는 오류라서 연결은 계속 쓸 수 있다.
  */
 pub enum QuicError {
-    /** @brief TLS 쪽에서 실패했다. */
-    Tls,
+    /** @brief TLS 핸드셰이크가 실패했다. 상대에게 알릴 TLS 경고는 이 오류가 정한다. */
+    Tls(TlsError),
     /** @brief 프레임이 프로토콜에 맞지 않는다. */
     Frame,
     /** @brief 상대가 허락한 양을 넘겼다. */
@@ -146,12 +165,35 @@ impl std::fmt::Display for QuicDiagnostic {
     }
 }
 
+impl QuicError {
+    /**
+     * @brief 이 오류로 연결을 닫을 때 상대에게 알릴 전송 오류 코드.
+     * @details TLS 오류는 RFC 9001 이 정한 대로 TLS 경고 코드에 CRYPTO_ERROR 를 더해 알린다.
+     *          경고가 정해지지 않은 TLS 오류와, 받는 경로에서 나오지 않는 Closed 와
+     *          StreamClosed 는 이쪽 내부 실패로 알린다.
+     */
+    fn transport_code(&self) -> u64 {
+        match self {
+            QuicError::Tls(error) => error
+                .alert()
+                .map_or(INTERNAL_ERROR, |alert| CRYPTO_ERROR + u64::from(alert)),
+            QuicError::Frame => PROTOCOL_VIOLATION,
+            QuicError::FlowControl => FLOW_CONTROL_ERROR,
+            QuicError::StreamLimit => STREAM_LIMIT_ERROR,
+            QuicError::Closed | QuicError::StreamClosed => INTERNAL_ERROR,
+        }
+    }
+}
+
 impl std::fmt::Display for QuicError {
-    /** @brief 사람이 읽을 설명. */
+    /**
+     * @brief 사람이 읽을 설명.
+     * @note 연결 오류로 닫을 때 이 문구가 CONNECTION_CLOSE 의 사유로 상대에게 간다.
+     */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
-            QuicError::Tls => "TLS handshake error",
-            QuicError::Frame => "Could not encode a QUIC frame",
+            QuicError::Tls(error) => return write!(f, "TLS handshake failed: {error}"),
+            QuicError::Frame => "QUIC protocol violation",
             QuicError::FlowControl => "Flow control violation",
             QuicError::StreamLimit => "QUIC stream limit exceeded",
             QuicError::Closed => "Connection closed",
@@ -489,6 +531,13 @@ struct SpaceState {
     /** @brief 다시 보내야 할 프레임들. */
     rtx: Vec<Frame>,
 
+    /**
+     * @brief 이 공간의 다음 패킷에 실을 종료 프레임. 한 번 싣고 비운다.
+     * @details 혼잡 윈도우와 무관하게 나가고 재전송하지 않는다. 막혀서 못 나가면 상대는 자기 유휴
+     *          데드라인까지 기다린다.
+     */
+    close: Option<Frame>,
+
     /** @brief 상대가 확인한 가장 큰 패킷 번호. 손실 판정의 기준이다. */
     largest_acked: Option<u64>,
     /**
@@ -633,11 +682,6 @@ pub struct Connection {
 
     /** @brief 핸드셰이크 뒤 단계에서 보낼 프레임들. */
     out_frames_app: Vec<Frame>,
-    /**
-     * @brief 이쪽이 알릴 종료 프레임. 한 번만 보내고 비운다.
-     * @details 혼잡 윈도우와 무관하게 나가야 한다. 못 보내면 상대는 자기 유휴 데드라인까지 기다린다.
-     */
-    close_frame: Option<Frame>,
     /** @brief 받는 중인 스트림들. */
     streams: HashMap<u64, StreamRecv>,
     /** @brief 이미 끝난 스트림 번호 구간들. 같은 번호를 다시 열지 못하게 한다. */
@@ -826,7 +870,6 @@ impl Connection {
             client_auth_identity: None,
             out_datagrams: VecDeque::new(),
             out_frames_app: Vec::new(),
-            close_frame: None,
             streams: HashMap::new(),
             closed_recv_ranges: Default::default(),
             reset_streams: Vec::new(),
@@ -903,7 +946,7 @@ impl Connection {
             .session
             .as_ref()
             .and_then(|s| TransportParams::decode(&s.server_transport_params));
-        let engine = ClientHandshake::new(cfg, local_tp.encode()).map_err(|_| QuicError::Tls)?;
+        let engine = ClientHandshake::new(cfg, local_tp.encode()).map_err(QuicError::Tls)?;
         let local_base_tp = local_tp.clone();
         let local_max_data = local_base_tp.initial_max_data;
         let local_max_streams_bidi = local_base_tp.initial_max_streams_bidi;
@@ -931,7 +974,6 @@ impl Connection {
             client_auth_identity: None,
             out_datagrams: VecDeque::new(),
             out_frames_app: Vec::new(),
-            close_frame: None,
             streams: HashMap::new(),
             closed_recv_ranges: Default::default(),
             reset_streams: Vec::new(),
@@ -1262,8 +1304,10 @@ impl Connection {
                         };
                         if !cid_valid {
                             self.note_diagnostic(QuicDiagnostic::TransportParameters);
-                            self.closed = true;
-                            self.discard_send_output();
+                            self.close_on_error(
+                                TRANSPORT_PARAMETER_ERROR,
+                                QuicDiagnostic::TransportParameters,
+                            );
                             return;
                         }
                         self.peer_max_data = tp.initial_max_data;
@@ -1274,8 +1318,10 @@ impl Connection {
                     }
                     None => {
                         self.note_diagnostic(QuicDiagnostic::TransportParameters);
-                        self.closed = true;
-                        self.discard_send_output();
+                        self.close_on_error(
+                            TRANSPORT_PARAMETER_ERROR,
+                            QuicDiagnostic::TransportParameters,
+                        );
                         return;
                     }
                 }
@@ -1331,22 +1377,19 @@ impl Connection {
         }
     }
 
-    /** @brief 받은 핸드셰이크 데이터를 TLS에 넣는다. */
+    /**
+     * @brief 받은 핸드셰이크 데이터를 TLS에 넣는다.
+     * @retval QuicError::Tls TLS 가 거부했다. 서버는 핸드셰이크가 끝나면 상태 기계를 버리므로,
+     *         그 뒤에 온 핸드셰이크 데이터는 받을 수 없는 메시지로 본다.
+     */
     fn tls_provide(&mut self, level: Level, data: &[u8]) -> Result<(), QuicError> {
-        match self.role {
-            Role::Server => self
-                .tls_server
-                .as_mut()
-                .ok_or(QuicError::Tls)?
-                .provide(level, data)
-                .map_err(|_| QuicError::Tls)?,
-            Role::Client => self
-                .tls_client
-                .as_mut()
-                .ok_or(QuicError::Tls)?
-                .provide(level, data)
-                .map_err(|_| QuicError::Tls)?,
-        }
+        let provided = match self.role {
+            Role::Server => self.tls_server.as_mut().map(|e| e.provide(level, data)),
+            Role::Client => self.tls_client.as_mut().map(|e| e.provide(level, data)),
+        };
+        provided
+            .unwrap_or(Err(TlsError::UnexpectedMessage))
+            .map_err(QuicError::Tls)?;
         self.pump_tls();
         Ok(())
     }
@@ -1374,12 +1417,26 @@ impl Connection {
 
     /**
      * @brief 데이터그램 하나를 받아 상태를 진행시킨다.
+     * @details 연결 오류를 돌려줄 때는 그 오류를 알리는 종료 프레임을 이미 내보낼 큐에 넣고
+     *          연결을 닫았다. RFC 9000 이 연결 오류를 CONNECTION_CLOSE 로 알리게 하므로, 부른
+     *          쪽은 쌓인 데이터그램을 마저 보낸 뒤 연결을 버린다.
+     */
+    pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
+        let received = self.recv_packets(dg);
+        if let Err(error) = &received {
+            self.close_on_error(error.transport_code(), error);
+        }
+        received
+    }
+
+    /**
+     * @brief 데이터그램에 붙어 온 패킷들을 처리한다.
      * @details 데이터그램에는 패킷이 여러 개 붙어 올 수 있다. 소비한 길이를 따라가며
      *          끝까지 처리한다.
      * @warning 아직 인증되지 않은 바이트다. 길이와 식별자를 모두 검사하고, 풀리지 않는
      *          패킷은 조용히 버린다. 오류를 내면 그것이 곧 탐색 신호가 된다.
      */
-    pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
+    fn recv_packets(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         if self.closed {
             return Ok(());
         }
@@ -2090,6 +2147,9 @@ impl Connection {
             }
             self.spaces[space].ack_pending = false;
         }
+        if let Some(close) = self.spaces[space].close.take() {
+            frame::encode(&mut payload, &close);
+        }
 
         let window_open = self.can_send_new();
         if window_open || *probe > 0 {
@@ -2160,9 +2220,7 @@ impl Connection {
             self.spaces[APP].ack_pending = false;
         }
 
-        // 종료 알림은 혼잡 윈도우를 보지 않는다. 알리지 못하면 상대가 데드라인까지 기다리게 되고,
-        // 재전송 목록에도 넣지 않는다. 이 프레임은 ack를 끌어내지 않는다.
-        if let Some(close) = self.close_frame.take() {
+        if let Some(close) = self.spaces[APP].close.take() {
             frame::encode(&mut payload, &close);
         }
 
@@ -2549,11 +2607,6 @@ impl Connection {
                 &self.out_frames_app,
                 self.out_frames_app.capacity(),
             ))
-            .saturating_add(
-                self.close_frame
-                    .as_ref()
-                    .map_or(0, frame_retained_payload_bytes),
-            )
             .saturating_add(hash_map_retained_bytes(&self.streams))
             .saturating_add(
                 self.reset_streams
@@ -2653,7 +2706,8 @@ impl Connection {
                 .saturating_add(frames_retained_payload_bytes(
                     &space.rtx,
                     space.rtx.capacity(),
-                ));
+                ))
+                .saturating_add(space.close.as_ref().map_or(0, frame_retained_payload_bytes));
             for packet in &space.sent {
                 total = total.saturating_add(frames_retained_payload_bytes(
                     &packet.frames,
@@ -2760,7 +2814,7 @@ impl Connection {
         Some(pkt)
     }
 
-    /** @brief 만들다 만 출력을 버린다. */
+    /** @brief 만들다 만 출력을 버린다. 아직 보내지 않은 핸드셰이크 데이터도 함께 버린다. */
     fn discard_send_output(&mut self) {
         self.out_datagrams.clear();
         self.out_frames_app.clear();
@@ -2772,6 +2826,7 @@ impl Connection {
         for space in &mut self.spaces {
             space.rtx.clear();
             space.sent.clear();
+            space.out_crypto.clear();
         }
         self.bytes_in_flight = 0;
     }
@@ -3334,21 +3389,67 @@ impl Connection {
      *          그 계층이 정한다. DoQ 는 RFC 9250 의 값을 쓴다.
      * @param error_code 응용 계층이 정한 사유 코드.
      * @param reason 사람이 읽을 짧은 설명. 빈 문자열도 된다.
-     * @note 1-RTT 키가 서기 전에는 알릴 방법이 없으므로 조용히 닫기만 한다.
+     * @note 이 코드와 사유는 1-RTT 패킷에만 싣는다. 핸드셰이크가 확정되기 전이라 Initial 과
+     *       Handshake 패킷에도 함께 보낼 때는 그쪽에 APPLICATION_ERROR 와 빈 사유를 싣는다.
      */
     pub fn close(&mut self, error_code: u64, reason: &str) {
+        let application = Frame::ConnectionClose {
+            error_code,
+            frame_type: None,
+            reason: reason.as_bytes().to_vec(),
+        };
+        let concealed = Frame::ConnectionClose {
+            error_code: APPLICATION_ERROR,
+            frame_type: Some(0),
+            reason: Vec::new(),
+        };
+        self.send_close(application, concealed);
+    }
+
+    /**
+     * @brief 연결 오류를 상대에게 알리고 연결을 닫는다.
+     * @details 닫는 연결로는 더 보낼 것이 없으므로 쌓아 둔 출력을 먼저 버린다. 오류를 일으킨
+     *          프레임 종류는 추적하지 않으므로 규격이 모를 때 쓰라는 0 을 싣는다.
+     */
+    fn close_on_error(&mut self, error_code: u64, reason: impl std::fmt::Display) {
         if self.closed {
             return;
         }
-        if self.spaces[APP].send_keys.is_some() {
-            self.close_frame = Some(Frame::ConnectionClose {
-                error_code,
-                frame_type: None,
-                reason: reason.as_bytes().to_vec(),
-            });
-            // flush 는 closed 를 보고 바로 반환하므로 닫기 표시보다 먼저 부른다.
-            self.flush();
+        self.discard_send_output();
+        let close = Frame::ConnectionClose {
+            error_code,
+            frame_type: Some(0),
+            reason: reason.to_string().into_bytes(),
+        };
+        self.send_close(close.clone(), close);
+    }
+
+    /**
+     * @brief 종료 프레임을 보낼 수 있는 공간마다 싣고 연결을 닫는다.
+     * @details 핸드셰이크가 확정되기 전에는 상대가 어느 키까지 가졌는지 알 수 없어서 보낼 키가
+     *          있는 공간마다 하나씩 싣는다. 확정된 뒤에는 RFC 9000 이 1-RTT 에만 싣게 한다.
+     * @param in_app 1-RTT 패킷에 실을 종료 프레임.
+     * @param in_handshake Initial 과 Handshake 패킷에 실을 종료 프레임.
+     */
+    fn send_close(&mut self, in_app: Frame, in_handshake: Frame) {
+        if self.closed {
+            return;
         }
+        let spaces: &[usize] = if self.handshake_confirmed {
+            &[APP]
+        } else {
+            &[INITIAL, HANDSHAKE, APP]
+        };
+        for &space in spaces {
+            if self.spaces[space].send_keys.is_some() {
+                let close = if space == APP { &in_app } else { &in_handshake };
+                self.spaces[space].close = Some(close.clone());
+            }
+        }
+        /*
+         * flush 는 closed 를 보고 바로 반환하므로 닫기 표시보다 먼저 부른다.
+         */
+        self.flush();
         self.closed = true;
     }
 
@@ -4328,7 +4429,13 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트가 재설정 토큰을 보내면 거부하는지. 규격상 서버만 보낸다. */
+    /**
+     * @brief 클라이언트가 재설정 토큰을 보내면 거부하고 그 사유를 알리는지. 규격상 서버만
+     *        보낸다.
+     * @details 닫기로 한 서버가 자기 핸드셰이크 응답까지 보내면 거부한 상대에게 인증서 체인을
+     *          넘기고, 주소를 검증하기 전에 보낼 수 있는 양도 헛되이 쓴다. 종료는 클라이언트가
+     *          가진 Initial 키로 풀려야 한다.
+     */
     fn client_cannot_send_stateless_reset_token_parameter() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -4345,9 +4452,298 @@ mod tests {
         )
         .unwrap();
 
-        pump(&mut client, &mut server);
-
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
         assert!(server.is_closed());
+        let closing: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        let frames: Vec<Frame> = closing
+            .iter()
+            .flat_map(|dg| sent_frames(&server, dg))
+            .collect();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, Frame::ConnectionClose { .. })),
+            "거부한 서버가 종료 프레임을 보내지 않았습니다"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, Frame::Crypto { .. })),
+            "거부한 서버가 자기 핸드셰이크 응답까지 보냈습니다"
+        );
+
+        for dg in &closing {
+            client.recv_datagram(dg).unwrap();
+        }
+        assert_eq!(
+            client.peer_close(),
+            Some(&PeerClose {
+                error_code: TRANSPORT_PARAMETER_ERROR,
+                frame_type: Some(0),
+                reason: b"Peer QUIC transport parameters are invalid".to_vec(),
+            })
+        );
+    }
+
+    /** @brief 데이터그램에 붙은 패킷의 종류를 앞에서부터 나열한다. 채움 바이트에서 멈춘다. */
+    fn packet_kinds(dg: &[u8]) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        let mut rest = dg;
+        while let Some(&first) = rest.first() {
+            if first & 0x40 == 0 {
+                break;
+            }
+            if first & 0x80 == 0 {
+                kinds.push("1-RTT");
+                break;
+            }
+            kinds.push(match (first & 0x30) >> 4 {
+                ptype::INITIAL => "Initial",
+                ptype::HANDSHAKE => "Handshake",
+                _ => "other",
+            });
+            let Some(len) = packet::long_packet_len(rest) else {
+                break;
+            };
+            rest = &rest[len..];
+        }
+        kinds
+    }
+
+    /**
+     * @brief 보낸 쪽의 송신 키로 데이터그램의 패킷을 풀어 실린 프레임을 앞에서부터 꺼낸다.
+     * @details 받는 쪽은 CONNECTION_CLOSE 를 처리하면 같은 패킷의 나머지 프레임을 읽지 않는다.
+     *          종료와 함께 무엇이 나갔는지는 보낸 쪽 키로 직접 풀어야 보인다.
+     */
+    fn sent_frames(sender: &Connection, dg: &[u8]) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut rest = dg;
+        while let Some(&first) = rest.first() {
+            if first & 0x40 == 0 {
+                break;
+            }
+            let payload = if first & 0x80 == 0 {
+                let (aead, keys) = sender.spaces[APP]
+                    .send_keys
+                    .clone()
+                    .expect("1-RTT 송신 키가 없습니다");
+                let (pkt, _) = packet::unprotect_short(
+                    aead,
+                    &keys,
+                    None,
+                    sender.send_key_phase,
+                    rest,
+                    sender.remote_cid.len(),
+                    0,
+                )
+                .expect("1-RTT 패킷을 풀지 못했습니다");
+                rest = &[];
+                pkt.payload
+            } else {
+                let space = if (first & 0x30) >> 4 == ptype::INITIAL {
+                    INITIAL
+                } else {
+                    HANDSHAKE
+                };
+                let len = packet::long_packet_len(rest).expect("긴 헤더 길이를 읽지 못했습니다");
+                let (aead, keys) = sender.spaces[space]
+                    .send_keys
+                    .clone()
+                    .expect("긴 헤더 송신 키가 없습니다");
+                let pkt = packet::unprotect_long(aead, &keys, &rest[..len], 0)
+                    .expect("긴 헤더 패킷을 풀지 못했습니다");
+                rest = &rest[len..];
+                pkt.payload
+            };
+            frames.extend(frame::parse(&payload).expect("프레임을 읽지 못했습니다"));
+        }
+        frames
+    }
+
+    #[test]
+    /**
+     * @brief TLS 가 핸드셰이크를 거부하면 상대가 그 경고를 CRYPTO_ERROR 로 받는지.
+     * @details 알리지 않고 버리면 상대는 자기 유휴 데드라인까지 기다린다. RFC 9001 은 TLS
+     *          경고 코드에 0x100 을 더한 값을 CONNECTION_CLOSE 로 알리게 한다.
+     */
+    fn tls_rejection_reaches_the_peer_as_a_crypto_error() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            ClientConfig {
+                server_name: "other.example".to_string(),
+                ..client_cfg(vec![b"doq".to_vec()])
+            },
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        let mut rejected = None;
+        while let Some(dg) = server.next_datagram() {
+            if let Err(error) = client.recv_datagram(&dg) {
+                rejected = Some(error);
+                break;
+            }
+        }
+        assert_eq!(rejected, Some(QuicError::Tls(TlsError::BadCert)));
+        assert!(client.is_closed());
+
+        let mut delivered = false;
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+            delivered = true;
+        }
+        assert!(delivered, "TLS 가 거부한 뒤 아무것도 내보내지 않았습니다");
+        assert_eq!(
+            server.peer_close(),
+            Some(&PeerClose {
+                error_code: CRYPTO_ERROR + 42,
+                frame_type: Some(0),
+                reason: b"TLS handshake failed: Invalid certificate or public key".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크가 확정되기 전의 연결 오류를 보낼 키가 있는 공간마다 알리는지.
+     * @details 서버는 클라이언트가 어느 키까지 가졌는지 모른다. 클라이언트는 Handshake 패킷을
+     *          보낸 뒤 Initial 키를 버리므로, Initial 에만 실으면 클라이언트는 종료를 받지
+     *          못한다. 닫는 연결에 쌓여 있던 다른 출력은 나가지 않아야 한다.
+     */
+    fn closing_before_confirmation_uses_every_space_with_keys() {
+        let ca = rcgen::generate_simple_self_signed(vec!["client.example".to_string()]).unwrap();
+        let mut cfg = (*server_cfg(vec![b"doq".to_vec()])).clone();
+        cfg.client_ca = Some(onetdns_tls::TrustStore::from_ders([ca.cert.der().as_ref()]));
+        let mut server = Connection::new_server(
+            Arc::new(cfg),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        while let Some(dg) = server.next_datagram() {
+            client.recv_datagram(&dg).unwrap();
+        }
+        assert!(
+            client.spaces[INITIAL].discarded,
+            "클라이언트가 Initial 키를 버리지 않아 이 테스트가 재려던 것을 측정하지 못했습니다"
+        );
+
+        let mut rejected = None;
+        while let Some(dg) = client.next_datagram() {
+            if let Err(error) = server.recv_datagram(&dg) {
+                rejected = Some(error);
+                break;
+            }
+        }
+        assert_eq!(
+            rejected,
+            Some(QuicError::Tls(TlsError::CertificateRequired))
+        );
+        /*
+         * 서버가 Initial 키를 아직 가졌는지는 클라이언트 응답이 데이터그램 몇 개로 나뉘었는지에
+         * 달렸다. 기대값은 서버가 실제로 가진 키에서 뽑는다.
+         */
+        let expected: Vec<&str> = [
+            (INITIAL, "Initial"),
+            (HANDSHAKE, "Handshake"),
+            (APP, "1-RTT"),
+        ]
+        .into_iter()
+        .filter(|(space, _)| server.spaces[*space].send_keys.is_some())
+        .map(|(_, kind)| kind)
+        .collect();
+        assert!(
+            expected.contains(&"Handshake") && expected.contains(&"1-RTT"),
+            "서버가 Handshake 와 1-RTT 키를 갖추지 않아 이 테스트가 재려던 것을 측정하지 못했습니다"
+        );
+        let closing: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        let kinds: Vec<&str> = closing.iter().flat_map(|dg| packet_kinds(dg)).collect();
+        assert_eq!(kinds, expected);
+        let stray: Vec<Frame> = closing
+            .iter()
+            .flat_map(|dg| sent_frames(&server, dg))
+            .filter(|frame| {
+                !matches!(
+                    frame,
+                    Frame::Ack { .. } | Frame::ConnectionClose { .. } | Frame::Padding(_)
+                )
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "닫는 연결이 종료와 확인 말고 다른 프레임도 보냈습니다: {stray:?}"
+        );
+
+        for dg in &closing {
+            client.recv_datagram(dg).unwrap();
+        }
+        assert_eq!(
+            client.peer_close().map(|close| close.error_code),
+            Some(CRYPTO_ERROR + 116)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크 전에 응용 계층이 닫으면 Initial 패킷에 응용 계층의 코드와 사유를 싣지
+     *        않는지.
+     * @details Initial 패킷은 상대를 인증하기 전에 오간다. RFC 9000 은 응용 계층 종료를 이
+     *          패킷에 실을 때 APPLICATION_ERROR 로 바꾸고 사유를 비우게 한다. 1-RTT 키가 없다고
+     *          알리지 않으면 상대는 자기 유휴 데드라인까지 기다린다.
+     */
+    fn closing_before_the_handshake_conceals_the_application_reason() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+
+        client.close(0x2, "application detail");
+        assert!(client.is_closed());
+        let mut delivered = false;
+        while let Some(dg) = client.next_datagram() {
+            assert_eq!(packet_kinds(&dg), ["Initial"]);
+            server.recv_datagram(&dg).unwrap();
+            delivered = true;
+        }
+        assert!(delivered, "1-RTT 키가 없다고 종료를 알리지 않았습니다");
+        assert_eq!(
+            server.peer_close(),
+            Some(&PeerClose {
+                error_code: APPLICATION_ERROR,
+                frame_type: Some(0),
+                reason: Vec::new(),
+            })
+        );
     }
 
     #[test]

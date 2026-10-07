@@ -354,7 +354,9 @@ fn verify_chain_for(
         if child.issuer_raw != issuer.subject_raw {
             return Err(TlsError::BadCert);
         }
-        child.verify_signed_by(issuer)?;
+        child
+            .verify_signed_by(issuer)
+            .map_err(|_| TlsError::BadCert)?;
 
         if let Some(p) = issuer.path_len {
             let below = chain[1..i + 1]

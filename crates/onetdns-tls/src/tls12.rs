@@ -34,6 +34,8 @@ pub mod suites {
 
 /** @brief 점 형식 확장. 압축하지 않은 형식만 쓴다. */
 pub const EXT_EC_POINT_FORMATS: u16 = 11;
+/** @brief 압축하지 않은 점 형식. 이쪽이 읽고 쓰는 유일한 형식이다. */
+pub const EC_POINT_FORMAT_UNCOMPRESSED: u8 = 0;
 /** @brief 확장 마스터 비밀. 핸드셰이크 기록을 키 유도에 묶어 세션 혼동 공격을 막는다. */
 pub const EXT_EXTENDED_MASTER_SECRET: u16 = 23;
 /** @brief 재협상 정보. 이쪽은 재협상하지 않으므로 빈 값을 보낸다. */
@@ -309,6 +311,8 @@ impl Tls12RecordCrypto {
     /**
      * @brief 레코드를 암호화한다.
      * @warning 순서 번호가 넘칠 지경이면 실패한다. 되감기면 논스가 되풀이돼 보호가 무너진다.
+     * @retval TlsError::Internal 평문이 레코드 상한을 넘는다. 나눠 보내지 않은 호출자의
+     *         잘못이므로 상대에게 record_overflow 를 알리면 안 된다.
      */
     pub fn encrypt(
         &mut self,
@@ -316,7 +320,7 @@ impl Tls12RecordCrypto {
         plaintext: &[u8],
     ) -> Result<TlsRecord, TlsError> {
         if plaintext.len() > crate::record::MAX_FRAGMENT {
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::Internal);
         }
         if self.seq >= self.aead.encryption_limit() {
             return Err(TlsError::SeqExhausted);
@@ -376,7 +380,7 @@ pub fn parse_server_key_exchange(
     let mut r = Reader::new(body);
     let curve_type = r.u8()?;
     if curve_type != 3 {
-        return Err(TlsError::Protocol);
+        return Err(TlsError::IllegalParameter);
     }
     let group = r.u16()?;
     let public = r.vec8()?.to_vec();
@@ -419,7 +423,11 @@ pub fn certificate(chain: &[Vec<u8>]) -> Vec<u8> {
     w.buf
 }
 
-/** @brief 인증서 메시지를 읽는다. */
+/**
+ * @brief 인증서 메시지를 읽는다.
+ * @retval TlsError::Decode 형식이 깨졌거나 빈 인증서가 있다.
+ * @retval TlsError::BadCert 인증서가 이쪽이 검증할 개수 상한보다 많다.
+ */
 pub fn parse_certificate(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
     let mut r = Reader::new(body);
     let list = r.vec24()?;
@@ -430,8 +438,11 @@ pub fn parse_certificate(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
     let mut out = Vec::new();
     while !lr.is_empty() {
         let certificate = lr.vec24()?;
-        if certificate.is_empty() || out.len() >= crate::cert::MAX_CERTIFICATE_ENTRIES {
-            return Err(TlsError::RecordOverflow);
+        if certificate.is_empty() {
+            return Err(TlsError::Decode);
+        }
+        if out.len() >= crate::cert::MAX_CERTIFICATE_ENTRIES {
+            return Err(TlsError::BadCert);
         }
         out.push(certificate.to_vec());
     }
@@ -458,7 +469,7 @@ pub fn ske_signed_content(
 /** @brief 점 형식 확장을 만든다. */
 pub fn ext_ec_point_formats() -> crate::msg::Extension {
     let mut w = Writer::new();
-    w.vec8(|w| w.u8(0));
+    w.vec8(|w| w.u8(EC_POINT_FORMAT_UNCOMPRESSED));
     crate::msg::Extension::new(EXT_EC_POINT_FORMATS, w.buf)
 }
 
@@ -585,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief TLS 1.2도 평문 상한을 넘는 레코드를 만들지 않는지. */
+    /** @brief TLS 1.2도 평문 상한을 넘는 레코드를 만들지 않고, 이쪽 잘못으로 보는지. */
     fn oversized_plaintext_is_rejected_before_encryption() {
         let mut crypto = Tls12RecordCrypto::new(Aead::Aes128Gcm, vec![0x11; 16], [0; 4]);
         assert_eq!(
@@ -593,7 +604,7 @@ mod tests {
                 ContentType::ApplicationData,
                 &vec![0; crate::record::MAX_FRAGMENT + 1]
             ),
-            Err(TlsError::RecordOverflow)
+            Err(TlsError::Internal)
         );
         assert_eq!(crypto.seq, 0);
     }

@@ -103,6 +103,8 @@ impl RecordCrypto {
     /**
      * @brief 레코드 하나를 암호화한다.
      * @warning 순서 번호가 넘칠 지경이면 실패한다. 되감기면 논스가 되풀이돼 보호가 무너진다.
+     * @retval TlsError::Internal 평문이 레코드 상한을 넘는다. 나눠 보내지 않은 호출자의
+     *         잘못이므로 상대에게 record_overflow 를 알리면 안 된다.
      */
     pub fn encrypt(
         &mut self,
@@ -110,7 +112,7 @@ impl RecordCrypto {
         plaintext: &[u8],
     ) -> Result<TlsRecord, TlsError> {
         if plaintext.len() > crate::record::MAX_FRAGMENT {
-            return Err(TlsError::RecordOverflow);
+            return Err(TlsError::Internal);
         }
         if self.seq >= self.aead.encryption_limit() {
             return Err(TlsError::SeqExhausted);
@@ -138,10 +140,18 @@ impl RecordCrypto {
         self.seq = self.aead.encryption_limit().saturating_sub(1);
     }
 
-    /** @brief 레코드 하나를 복호화한다. 인증이 맞지 않으면 실패다. */
+    /**
+     * @brief 레코드 하나를 복호화한다. 인증이 맞지 않으면 실패다.
+     * @details 바깥 버전이 다르면 인증 데이터가 달라져 어차피 풀리지 않으므로, 풀어 보기 전에
+     *          같은 사유인 Decrypt 로 거부한다. 채움을 걷어 낸 뒤 내용 종류가 남지 않으면
+     *          RFC 8446 이 정한 대로 unexpected_message 다.
+     */
     pub fn decrypt(&mut self, record: &TlsRecord) -> Result<(ContentType, Vec<u8>), TlsError> {
-        if record.content_type != ContentType::ApplicationData || record.version != LEGACY_VERSION {
-            return Err(TlsError::Protocol);
+        if record.content_type != ContentType::ApplicationData {
+            return Err(TlsError::UnexpectedMessage);
+        }
+        if record.version != LEGACY_VERSION {
+            return Err(TlsError::Decrypt);
         }
         let nonce = self.nonce();
         let aad = Self::aad(record.fragment.len());
@@ -151,7 +161,7 @@ impl RecordCrypto {
         while plain.last() == Some(&0) {
             plain.pop();
         }
-        let ct = plain.pop().ok_or(TlsError::Decrypt)?;
+        let ct = plain.pop().ok_or(TlsError::UnexpectedMessage)?;
         Ok((ContentType(ct), plain))
     }
 }
@@ -191,7 +201,11 @@ pub(crate) fn aead_seal(
     }
 }
 
-/** @brief 알고리즘을 골라 푼다. */
+/**
+ * @brief 알고리즘을 골라 푼다.
+ * @retval TlsError::Internal 키 길이가 알고리즘과 맞지 않는다. 상대와 무관한 이쪽 잘못이다.
+ * @retval TlsError::Decrypt 인증이 맞지 않는다.
+ */
 pub(crate) fn aead_open(
     aead: Aead,
     key: &[u8],
@@ -202,17 +216,17 @@ pub(crate) fn aead_open(
     use aes_gcm::aead::{Aead as _, KeyInit, Payload};
     let r = match aead {
         Aead::Aes128Gcm => {
-            let c = aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| TlsError::Decrypt)?;
+            let c = aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| TlsError::Internal)?;
             c.decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ct, aad })
         }
         Aead::Aes256Gcm => {
-            let c = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| TlsError::Decrypt)?;
+            let c = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| TlsError::Internal)?;
             c.decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ct, aad })
         }
         Aead::ChaCha20Poly1305 => {
             use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload as CPayload};
             let c = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|_| TlsError::Decrypt)?;
+                .map_err(|_| TlsError::Internal)?;
             c.decrypt(
                 chacha20poly1305::Nonce::from_slice(nonce),
                 CPayload { msg: ct, aad },
@@ -305,7 +319,10 @@ mod tests {
         let mut wrong_type = record.clone();
         wrong_type.content_type = ContentType::Handshake;
         let mut receiver = RecordCrypto::new(Aead::Aes128Gcm, key.clone(), iv);
-        assert_eq!(receiver.decrypt(&wrong_type), Err(TlsError::Protocol));
+        assert_eq!(
+            receiver.decrypt(&wrong_type),
+            Err(TlsError::UnexpectedMessage)
+        );
         assert_eq!(
             receiver.decrypt(&record),
             Ok((ContentType::ApplicationData, b"dns".to_vec()))
@@ -314,7 +331,24 @@ mod tests {
         let mut wrong_version = record;
         wrong_version.version = 0x0302;
         let mut receiver = RecordCrypto::new(Aead::Aes128Gcm, key, iv);
-        assert_eq!(receiver.decrypt(&wrong_version), Err(TlsError::Protocol));
+        assert_eq!(receiver.decrypt(&wrong_version), Err(TlsError::Decrypt));
+    }
+
+    #[test]
+    /** @brief 채움만 있고 내용 종류가 없는 평문을 unexpected_message 사유로 거부하는지. */
+    fn all_zero_inner_plaintext_is_unexpected() {
+        let key = vec![0x11; 16];
+        let iv = [0x22; 12];
+        let nonce = {
+            let sender = RecordCrypto::new(Aead::Aes128Gcm, key.clone(), iv);
+            sender.nonce()
+        };
+        let inner = [0u8; 4];
+        let aad = RecordCrypto::aad(inner.len() + TAG_LEN);
+        let fragment = aead_seal(Aead::Aes128Gcm, &key, &nonce, &aad, &inner);
+        let record = TlsRecord::new(ContentType::ApplicationData, fragment);
+        let mut receiver = RecordCrypto::new(Aead::Aes128Gcm, key, iv);
+        assert_eq!(receiver.decrypt(&record), Err(TlsError::UnexpectedMessage));
     }
 
     #[test]
@@ -348,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 평문 상한을 넘는 레코드를 만들지 않는지. */
+    /** @brief 평문 상한을 넘는 레코드를 만들지 않고, 이쪽 잘못으로 보는지. */
     fn oversized_plaintext_is_rejected_before_encryption() {
         let mut crypto = RecordCrypto::new(Aead::Aes128Gcm, vec![0x11; 16], [0; 12]);
         assert_eq!(
@@ -356,7 +390,7 @@ mod tests {
                 ContentType::ApplicationData,
                 &vec![0; crate::record::MAX_FRAGMENT + 1]
             ),
-            Err(TlsError::RecordOverflow)
+            Err(TlsError::Internal)
         );
         assert_eq!(crypto.seq, 0);
     }
