@@ -288,7 +288,7 @@ pub(crate) fn check_peer_revocation(
     if *checked || !conn.is_handshake_complete() {
         return Ok(());
     }
-    let chain = conn.peer_chain();
+    let chain = conn.verified_chain();
     if !chain.is_empty() {
         crate::check_revocation(chain, server_name)?;
     }

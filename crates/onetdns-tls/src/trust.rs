@@ -8,6 +8,8 @@
  *          이름 제약을 벗어날 수 있다.
  */
 
+use std::sync::OnceLock;
+
 use crate::x509::{IpConstraint, NameConstraints, X509};
 use crate::TlsError;
 
@@ -117,26 +119,55 @@ impl TrustStore {
     }
 
     /**
-     * @brief 시스템 루트 저장소.
-     * @note 하나도 못 읽으면 알린다. 그 상태에서는 모든 암호화 업스트림이 인증서 검증에
-     *       실패하는데, 연결 지점에서는 "검증 실패"로만 보여 원인을 찾을 수 없다.
+     * @brief 시스템 루트 저장소. 프로세스에서 처음 부를 때 읽고, 그 뒤로는 그 사본을 준다.
+     * @note 운영체제 저장소에 넣은 루트는 다시 시작해야 반영된다. 기본 클라이언트 설정이 이
+     *       저장소를 담으므로, 부를 때마다 읽으면 연결을 맺을 때마다 저장소 전체를 다시 읽고
+     *       파싱한다.
      */
     pub fn system() -> TrustStore {
-        let ders = load_system_root_ders();
-        let store = TrustStore::from_ders(ders.iter().map(|d| d.as_slice()));
-        let accepted = store.len();
-        if accepted == 0 {
-            onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates");
-        } else {
-            onetdns_core::debug!(
-                event = "tls.system_roots_loaded",
-                roots = accepted,
-                skipped = ders.len().saturating_sub(accepted),
-                "Loaded system root certificates"
-            );
-        }
-        store
+        /** @brief 처음 읽은 시스템 루트. */
+        static SYSTEM: OnceLock<TrustStore> = OnceLock::new();
+        SYSTEM.get_or_init(load_system_store).clone()
     }
+}
+
+/**
+ * @brief 시스템 루트를 읽어 저장소를 만든다.
+ * @details 파싱하지 못한 인증서는 믿지 않고 건너뛰되 지문과 사유를 남긴다. 그 루트에만 닿는
+ *          서버는 검증에 실패하므로, 원인을 찾을 때 이 기록과 대조한다.
+ * @note 하나도 못 읽으면 오류로 알린다. 그 상태에서는 모든 암호화 업스트림이 인증서 검증에
+ *       실패하는데, 연결 지점에서는 검증 실패로만 보여 원인을 찾을 수 없다.
+ */
+fn load_system_store() -> TrustStore {
+    let ders = load_system_root_ders();
+    let mut store = TrustStore::empty();
+    let mut skipped = 0usize;
+    for der in &ders {
+        match X509::parse(der) {
+            Ok(certificate) => store.add(certificate),
+            Err(error) => {
+                skipped += 1;
+                let sha256: String = crate::keyschedule::Hash::Sha256
+                    .digest(der)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                onetdns_core::debug!(event = "tls.system_root_skipped", sha256 = %sha256, error = %error, "Skipped a system root certificate that could not be parsed; servers that chain only to it fail verification");
+            }
+        }
+    }
+    if store.is_empty() {
+        onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates");
+    } else if skipped > 0 {
+        onetdns_core::info!(event = "tls.system_roots_loaded", roots = store.len(), skipped = skipped, "Loaded system root certificates; the skipped ones could not be parsed and are not trusted");
+    } else {
+        onetdns_core::debug!(
+            event = "tls.system_roots_loaded",
+            roots = store.len(),
+            "Loaded system root certificates"
+        );
+    }
+    store
 }
 
 #[cfg(windows)]
@@ -231,20 +262,25 @@ fn load_system_root_ders() -> Vec<Vec<u8>> {
 
 /**
  * @brief 서버 체인을 검증하고 호스트 이름까지 대조한다.
+ * @return 검증한 인증 경로. 리프에서 시작해 이쪽 저장소에 있는 루트의 사본으로 끝난다.
+ *         상대가 보냈어도 경로에 들지 않은 인증서는 담지 않는다. 인증서 핀으로 믿은
+ *         리프는 리프 하나만 담는다.
  * @warning 이름 대조를 빼면 유효한 인증서를 가진 아무나 남의 이름을 대신할 수 있다.
+ * @warning 리프의 발급자는 상대가 보낸 체인이 아니라 이 경로에서 꺼낸다. 리프를 루트가
+ *          바로 발급했으면 상대가 보낸 두 번째 인증서는 아무도 검증하지 않은 값이다.
  */
 pub fn verify_chain(
     chain: &[X509],
     store: &TrustStore,
     hostname: &str,
     now: i64,
-) -> Result<(), TlsError> {
+) -> Result<Vec<X509>, TlsError> {
     verify_chain_for(chain, store, ChainUsage::Server(hostname), now)
 }
 
 /** @brief 클라이언트 체인을 검증한다. 이름 대조는 하지 않는다. */
 pub fn verify_client_chain(chain: &[X509], store: &TrustStore, now: i64) -> Result<(), TlsError> {
-    verify_chain_for(chain, store, ChainUsage::Client, now)
+    verify_chain_for(chain, store, ChainUsage::Client, now).map(drop)
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +296,7 @@ enum ChainUsage<'a> {
  * @brief 체인을 루트까지 이어 검증한다.
  *
  * @details 각 단계에서 서명, 유효 기간, CA 여부, 경로 길이, 용도, 이름 제약을 본다.
+ * @return 검증한 인증 경로. 마지막 인증서는 저장소에 있는 루트의 사본이다.
  * @warning 루트는 이쪽 저장소의 사본을 쓴다. 상대가 보낸 것을 쓰면 제약을 뺀 사본으로
  *          이름 제약을 벗어날 수 있다.
  */
@@ -268,7 +305,7 @@ fn verify_chain_for(
     store: &TrustStore,
     usage: ChainUsage<'_>,
     now: i64,
-) -> Result<(), TlsError> {
+) -> Result<Vec<X509>, TlsError> {
     let leaf = chain.first().ok_or(TlsError::BadCert)?;
 
     match usage {
@@ -294,7 +331,7 @@ fn verify_chain_for(
     }
 
     if store.certificate_pins.contains(&leaf.cert_sha256) {
-        return Ok(());
+        return Ok(vec![leaf.clone()]);
     }
 
     let Some((anchor_depth, root)) = anchor_for(chain, store, now) else {
@@ -371,18 +408,21 @@ fn verify_chain_for(
         }
     }
 
+    let below_root = if root_is_presented_top {
+        &chain[..chain.len().saturating_sub(1)]
+    } else {
+        chain
+    };
     if let Some(nc) = &root.name_constraints {
-        for subordinate in if root_is_presented_top {
-            &chain[..chain.len().saturating_sub(1)]
-        } else {
-            chain
-        } {
+        for subordinate in below_root {
             if !name_constraints_ok(nc, &subordinate.san_dns, &subordinate.san_ip) {
                 return Err(TlsError::BadCert);
             }
         }
     }
-    Ok(())
+    let mut path = below_root.to_vec();
+    path.push(root.clone());
+    Ok(path)
 }
 
 /** @brief 이 인증서가 그 용도에 쓰일 수 있는지. */
@@ -628,7 +668,7 @@ mod tests {
         assert_eq!(store.len(), 1, "trust store 비어있음 → parse 실패");
         let leaf = X509::parse(&der).unwrap();
         assert_eq!(
-            verify_chain(&[leaf], &store, "dns.test", now()),
+            verify_chain(&[leaf], &store, "dns.test", now()).map(drop),
             Ok(()),
             "verify_chain 실패"
         );
@@ -646,7 +686,7 @@ mod tests {
         different_der[last] ^= 0x01;
         let different = X509::parse(&different_der).unwrap();
         assert_eq!(
-            verify_chain(&[different], &store, "dns.test", now()),
+            verify_chain(&[different], &store, "dns.test", now()).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -659,7 +699,10 @@ mod tests {
         let store = TrustStore::from_ders([ca_der.as_slice()]);
         assert_eq!(store.len(), 1);
 
-        assert_eq!(verify_chain(&[leaf], &store, "host.example", now()), Ok(()));
+        assert_eq!(
+            verify_chain(&[leaf], &store, "host.example", now()).map(drop),
+            Ok(())
+        );
     }
 
     #[test]
@@ -677,7 +720,7 @@ mod tests {
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::from_ders([ca_der.as_slice()]);
         assert_eq!(
-            verify_chain(&[leaf], &store, "evil.example", now()),
+            verify_chain(&[leaf], &store, "evil.example", now()).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -751,7 +794,7 @@ mod tests {
             X509::parse(&cross_der).unwrap(),
         ];
         assert_eq!(
-            verify_chain(&chain, &store, "host.example", now()),
+            verify_chain(&chain, &store, "host.example", now()).map(drop),
             Ok(()),
             "교차 서명 사본이 끝에 붙었다고 체인 전체를 버렸습니다"
         );
@@ -773,7 +816,7 @@ mod tests {
             X509::parse(&cross_der).unwrap(),
         ];
         assert_eq!(
-            verify_chain(&chain, &store, "host.example", now()),
+            verify_chain(&chain, &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -786,7 +829,7 @@ mod tests {
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::from_ders([other_ca_der.as_slice()]);
         assert_eq!(
-            verify_chain(&[leaf], &store, "host.example", now()),
+            verify_chain(&[leaf], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -798,7 +841,7 @@ mod tests {
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::empty();
         assert_eq!(
-            verify_chain(&[leaf], &store, "host.example", now()),
+            verify_chain(&[leaf], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -812,7 +855,7 @@ mod tests {
 
         let long_ago = now() - 100 * 365 * 86400;
         assert_eq!(
-            verify_chain(&[leaf], &store, "host.example", long_ago),
+            verify_chain(&[leaf], &store, "host.example", long_ago).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -967,7 +1010,7 @@ mod tests {
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::from_ders([patched_ca.as_slice()]);
         assert_eq!(
-            verify_chain(&[leaf.clone()], &store, "dns.test", leaf.not_before),
+            verify_chain(&[leaf.clone()], &store, "dns.test", leaf.not_before).map(drop),
             Ok(())
         );
     }
@@ -983,7 +1026,7 @@ mod tests {
 
         let store = TrustStore::from_ders([ca_der.as_slice()]);
         assert_eq!(
-            verify_chain(&[leaf.clone()], &store, "dns.test", leaf.not_before),
+            verify_chain(&[leaf.clone()], &store, "dns.test", leaf.not_before).map(drop),
             Err(TlsError::BadCert)
         );
     }
@@ -998,14 +1041,17 @@ mod tests {
             p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         });
         let ok = X509::parse(&ok).unwrap();
-        assert_eq!(verify_chain(&[ok], &store, "host.example", now()), Ok(()));
+        assert_eq!(
+            verify_chain(&[ok], &store, "host.example", now()).map(drop),
+            Ok(())
+        );
 
         let bad = leaf_signed_by("host.example", &ca, &ca_key, |p| {
             p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         });
         let bad = X509::parse(&bad).unwrap();
         assert_eq!(
-            verify_chain(&[bad], &store, "host.example", now()),
+            verify_chain(&[bad], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert),
             "serverAuth 없는 EKU는 TLS 서버로 거부되어야"
         );
@@ -1033,7 +1079,7 @@ mod tests {
         let leaf = X509::parse(&leaf).unwrap();
         let intermediate = X509::parse(int_cert.der().as_ref()).unwrap();
         assert_eq!(
-            verify_chain(&[leaf, intermediate], &store, "host.example", now()),
+            verify_chain(&[leaf, intermediate], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert),
             "serverAuth를 허용하지 않는 중간 CA는 서버 체인에 사용할 수 없습니다"
         );
@@ -1063,7 +1109,7 @@ mod tests {
         let leaf = X509::parse(&leaf).unwrap();
         let intermediate = X509::parse(int_cert.der().as_ref()).unwrap();
         assert_eq!(
-            verify_chain(&[leaf, intermediate], &store, "host.example", now()),
+            verify_chain(&[leaf, intermediate], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert),
             "루트의 Name Constraints는 중간 CA SAN에도 적용되어야 함"
         );
@@ -1083,14 +1129,14 @@ mod tests {
         let inside = leaf_signed_by("host.example", &ca, &ca_key, |_| {});
         let inside = X509::parse(&inside).unwrap();
         assert_eq!(
-            verify_chain(&[inside], &store, "host.example", now()),
+            verify_chain(&[inside], &store, "host.example", now()).map(drop),
             Ok(())
         );
 
         let outside = leaf_signed_by("host.evil", &ca, &ca_key, |_| {});
         let outside = X509::parse(&outside).unwrap();
         assert_eq!(
-            verify_chain(&[outside], &store, "host.evil", now()),
+            verify_chain(&[outside], &store, "host.evil", now()).map(drop),
             Err(TlsError::BadCert),
             "permitted 밖 dNSName은 거부되어야"
         );
@@ -1110,7 +1156,7 @@ mod tests {
         let blocked = leaf_signed_by("bad.evil.example", &ca, &ca_key, |_| {});
         let blocked = X509::parse(&blocked).unwrap();
         assert_eq!(
-            verify_chain(&[blocked], &store, "bad.evil.example", now()),
+            verify_chain(&[blocked], &store, "bad.evil.example", now()).map(drop),
             Err(TlsError::BadCert),
             "excluded 서브트리는 거부되어야"
         );
@@ -1118,7 +1164,7 @@ mod tests {
         let allowed = leaf_signed_by("good.example", &ca, &ca_key, |_| {});
         let allowed = X509::parse(&allowed).unwrap();
         assert_eq!(
-            verify_chain(&[allowed], &store, "good.example", now()),
+            verify_chain(&[allowed], &store, "good.example", now()).map(drop),
             Ok(())
         );
     }
@@ -1150,7 +1196,7 @@ mod tests {
         let int = X509::parse(int_cert.der().as_ref()).unwrap();
 
         assert_eq!(
-            verify_chain(&[leaf, int], &store, "host.example", now()),
+            verify_chain(&[leaf, int], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert),
             "pathLen=0 루트 아래 중간 CA는 거부되어야"
         );
@@ -1191,7 +1237,7 @@ mod tests {
         let forged_x = X509::parse(&forged_der).unwrap();
 
         assert_eq!(
-            verify_chain(&[leaf_x, forged_x], &store, "host.evil", now()),
+            verify_chain(&[leaf_x, forged_x], &store, "host.evil", now()).map(drop),
             Err(TlsError::BadCert),
             "제시된 top이 저장 앵커의 이름 제약을 우회해선 안 됨"
         );
@@ -1210,7 +1256,7 @@ mod tests {
         let root_x = X509::parse(root.der().as_ref()).unwrap();
 
         assert_eq!(
-            verify_chain(&[leaf, root_x], &store, "host.example", now()),
+            verify_chain(&[leaf, root_x], &store, "host.example", now()).map(drop),
             Ok(()),
             "제시된 pathLen=0 루트가 leaf를 직접 서명하면 유효해야"
         );
@@ -1241,7 +1287,7 @@ mod tests {
         let root_x = X509::parse(root.der().as_ref()).unwrap();
 
         assert_eq!(
-            verify_chain(&[leaf, int, root_x], &store, "host.example", now()),
+            verify_chain(&[leaf, int, root_x], &store, "host.example", now()).map(drop),
             Ok(()),
             "제시된 pathLen=1 루트 + 중간 CA 1개는 유효해야"
         );
@@ -1272,9 +1318,66 @@ mod tests {
         let root_x = X509::parse(root.der().as_ref()).unwrap();
 
         assert_eq!(
-            verify_chain(&[leaf, int, root_x], &store, "host.example", now()),
+            verify_chain(&[leaf, int, root_x], &store, "host.example", now()).map(drop),
             Err(TlsError::BadCert),
             "제시된 루트여도 저장 pathLen=0 아래 중간 CA는 거부"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 루트가 바로 발급한 리프의 경로에 상대가 덧붙인 인증서 대신 저장소의 루트가 드는지.
+     * @details 덧붙인 인증서는 루트와 이름만 같고 키가 다르다. 경로에 들면 폐기 확인이 그 키로
+     *          서명한 가짜 폐기 응답을 믿는다.
+     */
+    fn root_issued_leaf_path_ends_at_the_stored_root_not_a_presented_impostor() {
+        let (root, root_key) = root_ca_with(|_| {});
+        let store = TrustStore::from_ders([root.der().as_ref()]);
+        let leaf = X509::parse(&leaf_signed_by("host.example", &root, &root_key, |_| {})).unwrap();
+        let (impostor, _) = root_ca_with(|_| {});
+        let impostor = X509::parse(impostor.der().as_ref()).unwrap();
+        let root = X509::parse(root.der().as_ref()).unwrap();
+        assert_eq!(impostor.subject_raw, root.subject_raw);
+
+        let path = verify_chain(&[leaf.clone(), impostor], &store, "host.example", now())
+            .expect("루트가 바로 발급한 리프는 통과해야 한다");
+        let path: Vec<[u8; 32]> = path.iter().map(|cert| cert.cert_sha256).collect();
+        assert_eq!(
+            path,
+            vec![leaf.cert_sha256, root.cert_sha256],
+            "경로는 리프와 저장소의 루트로만 이뤄져야 한다"
+        );
+    }
+
+    #[test]
+    /** @brief 중간 CA를 거친 경로가 제시된 중간 CA를 담고 저장소의 루트로 끝나는지. */
+    fn intermediate_path_keeps_the_intermediate_and_ends_at_the_stored_root() {
+        let (root, root_key) = root_ca_with(|_| {});
+        let store = TrustStore::from_ders([root.der().as_ref()]);
+        let int_key = KeyPair::generate().unwrap();
+        let mut ip = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ip.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ip.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        ip.distinguished_name
+            .push(rcgen::DnType::CommonName, "OnetDNS Intermediate");
+        let int_cert = ip.signed_by(&int_key, &root, &root_key).unwrap();
+        let leaf = leaf_signed_by("host.example", &int_cert, &int_key, |_| {});
+
+        let leaf = X509::parse(&leaf).unwrap();
+        let int = X509::parse(int_cert.der().as_ref()).unwrap();
+        let root = X509::parse(root.der().as_ref()).unwrap();
+        let path = verify_chain(
+            &[leaf.clone(), int.clone(), root.clone()],
+            &store,
+            "host.example",
+            now(),
+        )
+        .expect("중간 CA를 거친 체인은 통과해야 한다");
+        let path: Vec<[u8; 32]> = path.iter().map(|cert| cert.cert_sha256).collect();
+        assert_eq!(
+            path,
+            vec![leaf.cert_sha256, int.cert_sha256, root.cert_sha256],
+            "경로는 리프, 중간 CA, 루트 순서여야 한다"
         );
     }
 

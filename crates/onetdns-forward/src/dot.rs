@@ -146,7 +146,7 @@ fn connect(
         ForwardError::Io(format!("DoT handshake failed: {e}"))
     })?;
     if !tls.is_resumed() {
-        crate::check_revocation(tls.peer_chain(), server_name)?;
+        crate::check_revocation(tls.verified_chain(), server_name)?;
     }
     Ok(DotConn {
         tcp,

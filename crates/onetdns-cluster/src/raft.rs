@@ -649,9 +649,13 @@ impl RaftNode {
         self.term_at(index)
     }
 
-    /** @brief 마지막 로그 항목의 임기. 투표 시 최신성 비교에 쓴다. */
+    /**
+     * @brief 마지막 로그 위치의 임기. 투표할 때 로그의 최신성을 비교하는 데 쓴다.
+     * @note 로그를 모두 압축했으면 스냅숏의 임기다. 이때 0을 내면 압축한 노드가 커밋된
+     *       항목을 놓친 후보에게 표를 준다.
+     */
     fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |entry| entry.term)
+        self.term_at(self.last_index())
     }
 
     /**
@@ -2943,6 +2947,145 @@ mod tests {
             b"after-snapshot"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /** @brief 선거를 시작할 때까지 틱을 흘리고, 그때 보낸 투표 요청을 돌려준다. */
+    fn tick_until_vote_request(node: &mut RaftNode) -> Msg {
+        for _ in 0..=node.election_timeout_ceiling() {
+            if let Some(output) = node
+                .tick()
+                .into_iter()
+                .find(|output| matches!(output.msg, Msg::RequestVote { .. }))
+            {
+                return output.msg;
+            }
+        }
+        panic!("선거 타임아웃 안에 투표 요청을 보내지 않았다");
+    }
+
+    #[test]
+    /**
+     * @brief 압축해서 로그가 빈 노드도 스냅숏의 임기로 로그의 최신성을 비교하는지.
+     * @details 커밋된 항목을 놓친 노드가 압축한 노드의 표를 얻으면, 커밋된 항목이 없는
+     *          노드가 리더가 된다. 반대로 압축한 노드는 로그가 더 최신인데도 표를 얻지 못한다.
+     */
+    fn compacted_nodes_compare_logs_by_snapshot_term() {
+        let mut cluster = Cluster::new(3);
+        let mut dropped = HashSet::new();
+        for _ in 0..200 {
+            cluster.step_all(&dropped);
+            if cluster.leader().is_some() {
+                break;
+            }
+        }
+        let leader = cluster.leader().expect("리더 선출");
+        for _ in 0..20 {
+            cluster.step_all(&dropped);
+        }
+        let lagging = (1..=3).find(|id| *id != leader).expect("뒤처질 노드");
+        let follower = (1..=3)
+            .find(|id| *id != leader && *id != lagging)
+            .expect("따라가는 노드");
+        assert!(
+            cluster.node(lagging).last_index() >= 1,
+            "뒤처질 노드도 새 리더의 첫 항목은 받았다"
+        );
+
+        dropped.insert(lagging);
+        for value in [b"one".as_slice(), b"two", b"three"] {
+            cluster.node_mut(leader).propose(value.to_vec()).unwrap();
+        }
+        for _ in 0..20 {
+            cluster.step_all(&dropped);
+        }
+        for id in [leader, follower] {
+            let node = cluster.node_mut(id);
+            let committed = node.commit_index();
+            assert_eq!(
+                node.last_index(),
+                committed,
+                "다수파는 모든 항목을 커밋했다"
+            );
+            node.mark_applied_batch(node.last_applied() + 1, committed)
+                .unwrap();
+            node.compact(b"state".to_vec()).unwrap();
+            assert_eq!(node.retained_log_len(), 0, "적용한 항목을 모두 압축했다");
+        }
+        assert!(cluster.node(lagging).last_index() < cluster.node(follower).last_index());
+
+        let stale_request = tick_until_vote_request(cluster.node_mut(lagging));
+        let replies = cluster.node_mut(follower).step(lagging, stale_request);
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [Output {
+                    msg: Msg::RequestVoteResp { granted: false, .. },
+                    ..
+                }]
+            ),
+            "커밋된 항목을 놓친 후보에게 표를 주면 안 된다: {replies:?}"
+        );
+
+        let request = tick_until_vote_request(cluster.node_mut(follower));
+        let replies = cluster.node_mut(lagging).step(follower, request);
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [Output {
+                    msg: Msg::RequestVoteResp { granted: true, .. },
+                    ..
+                }]
+            ),
+            "압축한 노드도 로그가 더 최신이면 표를 받아야 한다: {replies:?}"
+        );
+    }
+
+    #[test]
+    /** @brief 압축한 뒤 다시 뜬 노드가 투표 요청에 스냅숏의 위치와 임기를 싣는지. */
+    fn restarted_compacted_node_requests_votes_with_snapshot_term() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-raft-compacted-restart-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raft.state");
+
+        let mut node =
+            RaftNode::new_persistent(1, vec![1, 2, 3], Config::default(), path.clone()).unwrap();
+        node.current_term = 3;
+        node.log = (1..=4)
+            .map(|index| LogEntry {
+                term: 3,
+                index,
+                data: vec![index as u8],
+            })
+            .collect();
+        node.commit_index = 4;
+        node.last_applied = 4;
+        node.compact(b"state".to_vec()).unwrap();
+        drop(node);
+
+        let mut restored =
+            RaftNode::new_persistent(1, vec![1, 2, 3], Config::default(), path).unwrap();
+        assert_eq!(
+            restored.retained_log_len(),
+            0,
+            "압축한 항목은 다시 읽지 않는다"
+        );
+        let request = tick_until_vote_request(&mut restored);
+        assert!(
+            matches!(
+                request,
+                Msg::RequestVote {
+                    last_log_index: 4,
+                    last_log_term: 3,
+                    ..
+                }
+            ),
+            "투표 요청에 스냅숏의 위치와 임기가 실려야 한다: {request:?}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -881,34 +881,63 @@ struct ParsedExt {
     eku_ocsp_signing: bool,
 }
 
-/** @brief 확장을 읽는다. 중복은 거부하고, 모르는 필수 확장이 있으면 실패다. */
-fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
-    let exts = Der::new(ext_data).expect(der::SEQUENCE)?;
-    let mut e = Der::new(exts);
-    let mut out = ParsedExt::default();
+/** @brief 확장 하나. */
+pub(crate) struct Extension<'a> {
+    /** @brief 확장 종류. */
+    pub oid: &'a [u8],
+    /** @brief 이 확장을 해석하지 못하면 담긴 인증서나 목록 전체를 쓰지 말아야 하는지. */
+    pub critical: bool,
+    /** @brief OCTET STRING 안에 든 확장 값. */
+    pub value: &'a [u8],
+}
 
-    let mut seen: Vec<&[u8]> = Vec::new();
+/**
+ * @brief Extensions SEQUENCE 의 내용을 확장 목록으로 읽는다. 인증서와 폐기 목록이 이 형식을
+ *        같이 쓴다.
+ * @warning 같은 확장이 두 번 오면 거부한다. 어느 쪽을 따르느냐가 구현마다 달라 그 차이가 곧
+ *          우회 경로가 된다.
+ */
+pub(crate) fn extensions(seq_content: &[u8]) -> Result<Vec<Extension<'_>>, TlsError> {
+    let mut e = Der::new(seq_content);
+    let mut out: Vec<Extension<'_>> = Vec::new();
     while !e.is_empty() {
-        let ext = e.expect(der::SEQUENCE)?;
-        let mut ex = Der::new(ext);
+        let mut ex = Der::new(e.expect(der::SEQUENCE)?);
         let oid = ex.expect(der::OID)?;
-        if seen.contains(&oid) {
+        if out.iter().any(|seen| seen.oid == oid) {
             return Err(TlsError::BadCert);
         }
-        seen.push(oid);
-
-        let n1 = ex.next()?;
-        let (critical, val) = if n1.tag == der::BOOLEAN {
-            let critical = der::boolean_value(n1.value)?;
-            (critical, ex.expect(der::OCTET_STRING)?)
-        } else if n1.tag == der::OCTET_STRING {
-            (false, n1.value)
-        } else {
-            return Err(TlsError::BadCert);
+        let first = ex.next()?;
+        let (critical, value) = match first.tag {
+            der::BOOLEAN => (
+                der::boolean_value(first.value)?,
+                ex.expect(der::OCTET_STRING)?,
+            ),
+            der::OCTET_STRING => (false, first.value),
+            _ => return Err(TlsError::BadCert),
         };
         if !ex.is_empty() {
             return Err(TlsError::BadCert);
         }
+        out.push(Extension {
+            oid,
+            critical,
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/** @brief 확장을 읽는다. 중복은 거부하고, 모르는 필수 확장이 있으면 실패다. */
+fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
+    let exts = Der::new(ext_data).expect(der::SEQUENCE)?;
+    let mut out = ParsedExt::default();
+
+    for Extension {
+        oid,
+        critical,
+        value: val,
+    } in extensions(exts)?
+    {
         let known = oid == OID_SAN
             || oid == OID_BASIC_CONSTRAINTS
             || oid == OID_KEY_USAGE

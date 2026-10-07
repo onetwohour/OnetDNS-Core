@@ -572,7 +572,7 @@ fn system_trust() -> Arc<TrustStore> {
 }
 
 /** @brief 폐기 확인 훅의 형식. */
-type RevocationHook = Arc<dyn Fn(&[Vec<u8>], &str) -> Result<(), String> + Send + Sync>;
+type RevocationHook = Arc<dyn Fn(&[onetdns_tls::X509], &str) -> Result<(), String> + Send + Sync>;
 
 /** @brief 연결 캐시를 신뢰 저장소와 폐기 정책에 묶는 값. */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -666,9 +666,12 @@ fn revocation_test_write_guard() -> RevocationTestWriteGuard {
 /**
  * @brief 인증서 폐기 확인 훅을 설치한다.
  * @details TLS 핸드셰이크 직후, 질의를 보내기 전에 불린다. 폐기된 인증서를 쓰는
- *          업스트림으로 질의가 나가는 것을 막는 지점이다.
+ *          업스트림으로 질의가 나가는 것을 막는 지점이다. 훅은 검증한 인증 경로를 받으며,
+ *          경로에서 리프 바로 다음 인증서가 리프의 발급자다.
  */
-pub fn set_revocation_hook(f: Box<dyn Fn(&[Vec<u8>], &str) -> Result<(), String> + Send + Sync>) {
+pub fn set_revocation_hook(
+    f: Box<dyn Fn(&[onetdns_tls::X509], &str) -> Result<(), String> + Send + Sync>,
+) {
     let mut policy = revocation_policy()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -692,17 +695,20 @@ pub fn clear_revocation_hook() {
 }
 
 /**
- * @brief 설치된 훅으로 상대 인증서 체인의 폐기 여부를 확인한다.
+ * @brief 설치된 훅으로 검증한 인증 경로의 폐기 여부를 확인한다.
  * @details 훅이 없으면 통과다. 폐기 확인은 선택 기능이며, 켜져 있을 때만 강제된다.
  */
-pub(crate) fn check_revocation(peer_chain: &[Vec<u8>], host: &str) -> Result<(), ForwardError> {
+pub(crate) fn check_revocation(
+    verified_chain: &[onetdns_tls::X509],
+    host: &str,
+) -> Result<(), ForwardError> {
     let hook = revocation_policy()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .hook
         .clone();
     if let Some(hook) = hook {
-        hook(peer_chain, host)
+        hook(verified_chain, host)
             .map_err(|e| ForwardError::Io(format!("Certificate revocation check failed: {e}")))?;
     }
     Ok(())

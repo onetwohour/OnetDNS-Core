@@ -124,7 +124,7 @@ fn connect(
         ForwardError::Io(format!("DoH handshake: {e}"))
     })?;
     if !tls.is_resumed() {
-        crate::check_revocation(tls.peer_chain(), server_name)?;
+        crate::check_revocation(tls.verified_chain(), server_name)?;
     }
     let stream = TlsStream::new(tls, tcp);
     let client =

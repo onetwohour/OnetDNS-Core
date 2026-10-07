@@ -8,7 +8,7 @@
  */
 
 use crate::der::{self, bit_string_bytes, Der, Tlv};
-use crate::x509::{parse_time, scheme_from_sig_algid, X509};
+use crate::x509::{extensions, parse_time, scheme_from_sig_algid, X509};
 use crate::TlsError;
 
 use sha1::{Digest, Sha1};
@@ -17,6 +17,10 @@ use sha1::{Digest, Sha1};
 const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
 /** @brief SHA-1. OCSP 식별자 계산이 이 해시를 쓰도록 정해져 있다. */
 const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+/** @brief 델타 폐기 목록 표시. 이 표시가 붙은 목록은 기준 목록 이후의 변경만 담는다. */
+const OID_DELTA_CRL_INDICATOR: &[u8] = &[0x55, 0x1d, 0x1b];
+/** @brief 발급 배포 지점. 폐기 목록이 발급자의 인증서 중 어디까지를 다루는지 정한다. */
+const OID_ISSUING_DISTRIBUTION_POINT: &[u8] = &[0x55, 0x1d, 0x1c];
 /** @brief 시계 차이를 감안해 봐 주는 폭. */
 const OCSP_CLOCK_SKEW_SECS: i64 = 300;
 /** @brief 다음 갱신 시각이 없는 응답을 믿어 줄 기간. 상한이 없으면 오래된 응답이 영원히 유효해진다. */
@@ -429,6 +433,91 @@ pub struct Crl {
     pub this_update: i64,
     /** @brief 다음 목록이 나올 시각. */
     pub next_update: Option<i64>,
+    /** @brief 이 목록이 다루는 인증서의 범위. */
+    scope: CrlScope,
+}
+
+#[derive(Default)]
+/**
+ * @brief 발급 배포 지점 확장이 정한 폐기 목록의 범위. 확장이 없으면 발급자의 인증서 전부다.
+ * @details 발급자는 목록을 여러 조각으로 나눠 낼 수 있고, 조각마다 이 확장으로 자기 범위를
+ *          밝힌다.
+ */
+struct CrlScope {
+    /**
+     * @brief 이 조각의 URI 목록. 있으면 인증서에 적힌 배포 지점 주소 가운데 하나가 이 안에
+     *        있어야 한다.
+     */
+    distribution_point: Option<Vec<String>>,
+    /** @brief CA가 아닌 인증서만 다룬다. */
+    only_user_certs: bool,
+    /** @brief CA 인증서만 다룬다. */
+    only_ca_certs: bool,
+}
+
+impl CrlScope {
+    /**
+     * @brief 발급 배포 지점 확장 값을 읽는다.
+     * @details 상대 이름으로 적은 배포 지점, 일부 사유만 싣는 목록, 다른 발급자의 인증서를 싣는
+     *          간접 목록, 속성 인증서 목록은 해석하지 않으므로 거부한다.
+     */
+    fn parse(value: &[u8]) -> Result<CrlScope, TlsError> {
+        let mut outer = Der::new(value);
+        let body = outer.expect(der::SEQUENCE)?;
+        if !outer.is_empty() {
+            return Err(TlsError::BadCert);
+        }
+        let mut scope = CrlScope::default();
+        let mut fields = Der::new(body);
+        let mut previous: Option<u8> = None;
+        while !fields.is_empty() {
+            let field = fields.next()?;
+            let number = field.tag & 0x1f;
+            if previous.is_some_and(|before| number <= before) {
+                return Err(TlsError::BadCert);
+            }
+            previous = Some(number);
+            match field.tag {
+                0xA0 => scope.distribution_point = Some(Self::full_name_uris(field.value)?),
+                0x81 => scope.only_user_certs = der::boolean_value(field.value)?,
+                0x82 => scope.only_ca_certs = der::boolean_value(field.value)?,
+                _ => return Err(TlsError::BadCert),
+            }
+        }
+        if scope.only_user_certs && scope.only_ca_certs {
+            return Err(TlsError::BadCert);
+        }
+        Ok(scope)
+    }
+
+    /** @brief 배포 지점 이름에서 URI를 모은다. 상대 이름으로 적은 배포 지점은 거부한다. */
+    fn full_name_uris(explicit: &[u8]) -> Result<Vec<String>, TlsError> {
+        let mut name = Der::new(explicit);
+        let full_name = name.expect(der::context(0))?;
+        if !name.is_empty() {
+            return Err(TlsError::BadCert);
+        }
+        let mut names = Der::new(full_name);
+        let mut uris = Vec::new();
+        while !names.is_empty() {
+            let general_name = names.next()?;
+            if general_name.tag == 0x86 {
+                let uri = std::str::from_utf8(general_name.value).map_err(|_| TlsError::BadCert)?;
+                uris.push(uri.to_string());
+            }
+        }
+        Ok(uris)
+    }
+
+    /** @brief 이 범위가 그 인증서를 다루는지. */
+    fn covers(&self, cert: &X509) -> bool {
+        if (self.only_user_certs && cert.is_ca) || (self.only_ca_certs && !cert.is_ca) {
+            return false;
+        }
+        self.distribution_point
+            .as_ref()
+            .is_none_or(|uris| cert.crl_urls.iter().any(|url| uris.contains(url)))
+    }
 }
 
 impl Crl {
@@ -483,6 +572,7 @@ impl Crl {
 
         let mut next_update = None;
         let mut revoked = Vec::new();
+        let mut scope = CrlScope::default();
         let mut seen_revoked = false;
         while !d.is_empty() {
             let field = d.next()?;
@@ -494,8 +584,9 @@ impl Crl {
                     Self::collect_revoked(field.value, &mut revoked)?;
                     seen_revoked = true;
                 }
-
-                t if t == der::context(0) => return Err(TlsError::BadCert),
+                t if t == der::context(0) && d.is_empty() => {
+                    scope = Self::read_extensions(field.value)?;
+                }
                 _ => return Err(TlsError::BadCert),
             }
         }
@@ -506,10 +597,40 @@ impl Crl {
             revoked,
             this_update,
             next_update,
+            scope,
         })
     }
 
-    /** @brief 폐기된 일련번호들을 모은다. */
+    /**
+     * @brief 목록 확장을 읽어 범위를 정한다. 해석하지 못하는 필수 확장이 있으면 목록을 쓰지 않는다.
+     * @details 델타 목록 표시와 발급 배포 지점은 필수 표시와 관계없이 다룬다. 델타 목록을 전체
+     *          목록으로 읽으면 기준 목록에만 실린 폐기를 놓치고, 배포 지점을 무시하면 범위 밖
+     *          인증서를 정상으로 본다.
+     */
+    fn read_extensions(explicit: &[u8]) -> Result<CrlScope, TlsError> {
+        let mut outer = Der::new(explicit);
+        let list = outer.expect(der::SEQUENCE)?;
+        if !outer.is_empty() {
+            return Err(TlsError::BadCert);
+        }
+        let mut scope = CrlScope::default();
+        for ext in extensions(list)? {
+            if ext.oid == OID_DELTA_CRL_INDICATOR {
+                return Err(TlsError::BadCert);
+            } else if ext.oid == OID_ISSUING_DISTRIBUTION_POINT {
+                scope = CrlScope::parse(ext.value)?;
+            } else if ext.critical {
+                return Err(TlsError::BadCert);
+            }
+        }
+        Ok(scope)
+    }
+
+    /**
+     * @brief 폐기된 일련번호들을 모은다.
+     * @details 항목 확장에 해석하지 못하는 필수 확장이 있으면 목록 전체를 쓰지 않는다. 사유
+     *          코드나 무효 시각 같은 나머지 확장은 폐기 여부를 바꾸지 않으므로 넘긴다.
+     */
     fn collect_revoked(seq_of: &[u8], out: &mut Vec<(Vec<u8>, i64)>) -> Result<(), TlsError> {
         let mut entries = Der::new(seq_of);
         while !entries.is_empty() {
@@ -520,28 +641,42 @@ impl Crl {
             let mut fields = Der::new(entry.value);
             let serial = fields.expect(der::INTEGER)?.to_vec();
             let revoked_at = parse_time(fields.next()?)?;
-
             if !fields.is_empty() {
-                return Err(TlsError::BadCert);
+                let entry_extensions = fields.expect(der::SEQUENCE)?;
+                if !fields.is_empty()
+                    || extensions(entry_extensions)?.iter().any(|ext| ext.critical)
+                {
+                    return Err(TlsError::BadCert);
+                }
             }
             out.push((serial, revoked_at));
         }
         Ok(())
     }
 
-    /** @brief 이 일련번호가 폐기됐는지. */
-    pub fn is_revoked(&self, serial: &[u8]) -> bool {
-        self.revoked
-            .iter()
-            .any(|(value, _)| value.as_slice() == serial)
+    /**
+     * @brief 이 목록이 그 인증서를 다루는지.
+     * @warning 같은 발급자가 낸 다른 조각도 서명은 맞는다. 범위를 보지 않으면 그 인증서가 실리지
+     *          않은 조각을 대신 내밀어 폐기를 감출 수 있다.
+     */
+    pub fn covers(&self, cert: &X509) -> bool {
+        self.scope.covers(cert)
     }
 
-    /** @brief 이 시각 기준의 상태. 목록 자체가 오래됐으면 알 수 없음이다. */
-    pub fn status(&self, serial: &[u8], now: i64) -> RevocationStatus {
+    /**
+     * @brief 이 시각에 그 인증서가 폐기됐는지.
+     * @details 목록이 그 인증서를 다루지 않거나 목록 자체가 오래됐으면 알 수 없음이다. 일련번호는
+     *          OCSP 와 같이 앞의 0을 걷어내고 비교한다.
+     */
+    pub fn status(&self, cert: &X509, now: i64) -> RevocationStatus {
+        if !self.covers(cert) {
+            return RevocationStatus::Unknown;
+        }
+        let serial = normalize_positive_integer(&cert.serial);
         if let Some((_, revoked_at)) = self
             .revoked
             .iter()
-            .find(|(value, _)| value.as_slice() == serial)
+            .find(|(value, _)| normalize_positive_integer(value) == serial)
         {
             return if *revoked_at <= now + OCSP_CLOCK_SKEW_SECS {
                 RevocationStatus::Revoked
@@ -846,7 +981,17 @@ mod tests {
         seq(&body)
     }
 
-    /** @brief 테스트용 폐기 목록을 만든다. */
+    /** @brief 서명 대상 필드를 SEQUENCE 로 감싸 서명한 폐기 목록을 만든다. */
+    fn sign_crl(signing: &SigningKey, tbs_fields: &[u8]) -> Vec<u8> {
+        let tbs = seq(tbs_fields);
+        let sig = sign_tbs(signing, &tbs);
+        let mut crl = tbs;
+        crl.extend(ecdsa_sha256_algid());
+        crl.extend(sig);
+        seq(&crl)
+    }
+
+    /** @brief 테스트용 폐기 목록을 만든다. 확장이 없는 v1 형식이다. */
     fn build_crl(
         signing: &SigningKey,
         issuer: &X509,
@@ -866,12 +1011,43 @@ mod tests {
         if !revoked_list.is_empty() {
             tbs.extend(seq(&revoked_list));
         }
-        let tbs = seq(&tbs);
-        let sig = sign_tbs(signing, &tbs);
-        let mut crl = tbs;
-        crl.extend(ecdsa_sha256_algid());
-        crl.extend(sig);
-        seq(&crl)
+        sign_crl(signing, &tbs)
+    }
+
+    /** @brief 확장 하나를 DER 로 만든다. */
+    fn ext(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
+        let mut body = tlv(der::OID, oid);
+        if critical {
+            body.extend_from_slice(&[der::BOOLEAN, 0x01, 0xFF]);
+        }
+        body.extend(tlv(der::OCTET_STRING, value));
+        seq(&body)
+    }
+
+    /** @brief 일련번호 하나를 싣고, 항목 확장과 목록 확장을 지정한 v2 폐기 목록을 만든다. */
+    fn build_crl_v2(
+        signing: &SigningKey,
+        issuer: &X509,
+        serial: &[u8],
+        entry_extensions: &[Vec<u8>],
+        crl_extensions: &[Vec<u8>],
+        now: i64,
+    ) -> Vec<u8> {
+        let mut entry = tlv(der::INTEGER, serial);
+        entry.extend(gen_time(now - 3600));
+        if !entry_extensions.is_empty() {
+            entry.extend(seq(&entry_extensions.concat()));
+        }
+        let mut tbs = tlv(der::INTEGER, &[1]);
+        tbs.extend(ecdsa_sha256_algid());
+        tbs.extend_from_slice(&issuer.subject_raw);
+        tbs.extend(gen_time(now - 600));
+        tbs.extend(gen_time(now + 86400));
+        tbs.extend(seq(&seq(&entry)));
+        if !crl_extensions.is_empty() {
+            tbs.extend(tlv(der::context(0), &seq(&crl_extensions.concat())));
+        }
+        sign_crl(signing, &tbs)
     }
 
     #[test]
@@ -881,8 +1057,10 @@ mod tests {
         let now = 1_700_000_000i64;
         let crl_der = build_crl(&sk, &ca, &[&leaf.serial], now);
         let crl = Crl::parse(&crl_der, &ca).unwrap();
-        assert_eq!(crl.status(&leaf.serial, now), RevocationStatus::Revoked);
-        assert_eq!(crl.status(&[0x99, 0x88], now), RevocationStatus::Good);
+        assert_eq!(crl.status(&leaf, now), RevocationStatus::Revoked);
+        let mut other = leaf.clone();
+        other.serial = vec![0x99, 0x88];
+        assert_eq!(crl.status(&other, now), RevocationStatus::Good);
     }
 
     #[test]
@@ -893,5 +1071,253 @@ mod tests {
         let now = 1_700_000_000i64;
         let crl_der = build_crl(&other, &ca, &[&leaf.serial], now);
         assert!(Crl::parse(&crl_der, &ca).is_err());
+    }
+
+    /** @brief rcgen 이 만든 목록의 갱신 구간 안쪽 시각. */
+    const RCGEN_CRL_NOW: i64 = 1_705_276_800;
+
+    /** @brief 폐기 목록을 내는 CA. rcgen 이 목록을 서명하려면 원래 인증서와 키가 필요하다. */
+    struct CrlIssuer {
+        /** @brief rcgen 인증서. */
+        cert: rcgen::Certificate,
+        /** @brief 그 키. */
+        key: rcgen::KeyPair,
+        /** @brief 이쪽 파서로 읽은 같은 인증서. */
+        x509: X509,
+    }
+
+    /** @brief 폐기 목록을 내는 CA를 만든다. */
+    fn crl_issuer() -> CrlIssuer {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "crl-ca.test");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let x509 = X509::parse(cert.der()).unwrap();
+        CrlIssuer { cert, key, x509 }
+    }
+
+    /** @brief 그 CA가 발급한, 폐기 목록 주소가 적힌 인증서. */
+    fn issued_with_crl_url(issuer: &CrlIssuer, serial: u64, crl_url: &str, is_ca: bool) -> X509 {
+        let mut params = rcgen::CertificateParams::new(vec!["leaf.test".to_string()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        params.crl_distribution_points = vec![rcgen::CrlDistributionPoint {
+            uris: vec![crl_url.to_string()],
+        }];
+        if is_ca {
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer.cert, &issuer.key).unwrap();
+        let x509 = X509::parse(cert.der()).unwrap();
+        assert_eq!(x509.crl_urls, [crl_url]);
+        x509
+    }
+
+    /** @brief 발급 배포 지점 확장. */
+    fn idp(url: &str, scope: Option<rcgen::CrlScope>) -> rcgen::CrlIssuingDistributionPoint {
+        rcgen::CrlIssuingDistributionPoint {
+            distribution_point: rcgen::CrlDistributionPoint {
+                uris: vec![url.to_string()],
+            },
+            scope,
+        }
+    }
+
+    /**
+     * @brief rcgen 으로 폐기 목록을 만든다. 기관 키 식별자와 목록 번호가 늘 붙고, 항목마다 사유
+     *        코드와 무효 시각이 붙는다.
+     */
+    fn rcgen_crl(
+        issuer: &CrlIssuer,
+        revoked: &[u64],
+        distribution_point: Option<rcgen::CrlIssuingDistributionPoint>,
+    ) -> Vec<u8> {
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2024, 1, 1),
+            next_update: rcgen::date_time_ymd(2024, 2, 1),
+            crl_number: rcgen::SerialNumber::from(782u64),
+            issuing_distribution_point: distribution_point,
+            revoked_certs: revoked
+                .iter()
+                .map(|&serial| rcgen::RevokedCertParams {
+                    serial_number: rcgen::SerialNumber::from(serial),
+                    revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+                    reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                    invalidity_date: Some(rcgen::date_time_ymd(2023, 12, 31)),
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        params
+            .signed_by(&issuer.cert, &issuer.key)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    #[test]
+    /** @brief 공개 CA가 붙이는 확장이 달린 목록을 읽고 폐기와 정상을 가려내는지. */
+    fn crl_with_standard_extensions_is_read() {
+        let issuer = crl_issuer();
+        let url = "http://crl.test/7.crl";
+        let revoked = issued_with_crl_url(&issuer, 0x1001, url, false);
+        let good = issued_with_crl_url(&issuer, 0x1002, url, false);
+        for distribution_point in [None, Some(idp(url, Some(rcgen::CrlScope::UserCertsOnly)))] {
+            let with_idp = distribution_point.is_some();
+            let der = rcgen_crl(&issuer, &[0x1001], distribution_point);
+            let crl = Crl::parse(&der, &issuer.x509)
+                .unwrap_or_else(|e| panic!("배포 지점 확장 {with_idp}: 목록을 읽어야 한다: {e}"));
+            assert_eq!(
+                crl.status(&revoked, RCGEN_CRL_NOW),
+                RevocationStatus::Revoked
+            );
+            assert_eq!(crl.status(&good, RCGEN_CRL_NOW), RevocationStatus::Good);
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 같은 발급자가 낸 다른 조각을 내밀면 정상이 아니라 알 수 없음이 되는지. 그 조각에는
+     *        이 인증서가 실리지 않으므로 정상으로 보면 폐기를 감출 수 있다.
+     */
+    fn crl_shard_for_another_distribution_point_does_not_vouch() {
+        let issuer = crl_issuer();
+        let leaf = issued_with_crl_url(&issuer, 0x2001, "http://crl.test/7.crl", false);
+        let shard = |url: &str| {
+            let der = rcgen_crl(&issuer, &[0x2002], Some(idp(url, None)));
+            Crl::parse(&der, &issuer.x509).unwrap()
+        };
+        let other = shard("http://crl.test/8.crl");
+        assert!(!other.covers(&leaf));
+        assert_eq!(
+            other.status(&leaf, RCGEN_CRL_NOW),
+            RevocationStatus::Unknown
+        );
+        let own = shard("http://crl.test/7.crl");
+        assert!(own.covers(&leaf));
+        assert_eq!(own.status(&leaf, RCGEN_CRL_NOW), RevocationStatus::Good);
+    }
+
+    #[test]
+    /** @brief CA가 아닌 인증서만, 또는 CA 인증서만 다루는 목록이 범위 밖 인증서에 답하지 않는지. */
+    fn crl_scope_follows_certificate_kind() {
+        let issuer = crl_issuer();
+        let url = "http://crl.test/7.crl";
+        let leaf = issued_with_crl_url(&issuer, 0x3001, url, false);
+        let sub_ca = issued_with_crl_url(&issuer, 0x3002, url, true);
+        let scoped = |scope| {
+            let der = rcgen_crl(&issuer, &[], Some(idp(url, Some(scope))));
+            Crl::parse(&der, &issuer.x509).unwrap()
+        };
+
+        let users = scoped(rcgen::CrlScope::UserCertsOnly);
+        assert_eq!(users.status(&leaf, RCGEN_CRL_NOW), RevocationStatus::Good);
+        assert_eq!(
+            users.status(&sub_ca, RCGEN_CRL_NOW),
+            RevocationStatus::Unknown
+        );
+
+        let cas = scoped(rcgen::CrlScope::CaCertsOnly);
+        assert_eq!(cas.status(&leaf, RCGEN_CRL_NOW), RevocationStatus::Unknown);
+        assert_eq!(cas.status(&sub_ca, RCGEN_CRL_NOW), RevocationStatus::Good);
+    }
+
+    #[test]
+    /**
+     * @brief 해석하지 못하는 확장이 붙은 목록을 쓰지 않는지. 모르는 필수 확장, 델타 목록 표시,
+     *        이쪽이 다루지 않는 범위 표시가 그렇다. 필수가 아닌 모르는 확장은 넘긴다.
+     */
+    fn crl_extensions_it_cannot_interpret_are_rejected() {
+        let (ca, leaf, sk, _) = gen_ca_and_leaf();
+        let now = 1_700_000_000i64;
+        let unknown_oid: &[u8] = &[0x2a, 0x03, 0x04];
+        let null = [0x05, 0x00];
+        let delta = |critical| ext(OID_DELTA_CRL_INDICATOR, critical, &tlv(der::INTEGER, &[5]));
+        let scope = |fields: &[u8]| ext(OID_ISSUING_DISTRIBUTION_POINT, true, &seq(fields));
+        let full_name = tlv(
+            der::context(0),
+            &tlv(der::context(0), &tlv(0x86, b"http://crl.test/7.crl")),
+        );
+        let relative_name = tlv(
+            der::context(0),
+            &tlv(der::context(1), &tlv(der::SEQUENCE, &[])),
+        );
+
+        let rejected: Vec<(&str, Vec<Vec<u8>>, Vec<Vec<u8>>)> = vec![
+            (
+                "모르는 필수 목록 확장",
+                vec![],
+                vec![ext(unknown_oid, true, &null)],
+            ),
+            (
+                "모르는 필수 항목 확장",
+                vec![ext(unknown_oid, true, &null)],
+                vec![],
+            ),
+            ("필수 표시가 붙은 델타 목록", vec![], vec![delta(true)]),
+            ("필수 표시가 없는 델타 목록", vec![], vec![delta(false)]),
+            ("간접 목록", vec![], vec![scope(&tlv(0x84, &[0xFF]))]),
+            (
+                "일부 사유만 싣는 목록",
+                vec![],
+                vec![scope(&tlv(0x83, &[0x07, 0x80]))],
+            ),
+            ("속성 인증서 목록", vec![], vec![scope(&tlv(0x85, &[0xFF]))]),
+            (
+                "상대 이름으로 적은 배포 지점",
+                vec![],
+                vec![scope(&relative_name)],
+            ),
+            (
+                "리프와 CA를 함께 고른 범위",
+                vec![],
+                vec![scope(&[tlv(0x81, &[0xFF]), tlv(0x82, &[0xFF])].concat())],
+            ),
+            (
+                "순서가 뒤바뀐 범위 필드",
+                vec![],
+                vec![scope(&[tlv(0x81, &[0xFF]), full_name.clone()].concat())],
+            ),
+            (
+                "두 번 나온 목록 확장",
+                vec![],
+                vec![
+                    ext(unknown_oid, false, &null),
+                    ext(unknown_oid, false, &null),
+                ],
+            ),
+        ];
+        for (case, entry_extensions, crl_extensions) in rejected {
+            let der = build_crl_v2(&sk, &ca, &[0x7f], &entry_extensions, &crl_extensions, now);
+            assert!(Crl::parse(&der, &ca).is_err(), "{case}: 거부해야 한다");
+        }
+
+        let tolerated = build_crl_v2(
+            &sk,
+            &ca,
+            &[0x7f],
+            &[ext(unknown_oid, false, &null)],
+            &[ext(unknown_oid, false, &null)],
+            now,
+        );
+        let crl = Crl::parse(&tolerated, &ca).expect("필수가 아닌 모르는 확장은 넘겨야 한다");
+        assert_eq!(crl.status(&leaf, now), RevocationStatus::Good);
+    }
+
+    #[test]
+    /**
+     * @brief 일련번호를 앞의 0을 걷어내고 비교하는지. 인증서와 목록이 다르게 적어도 같은
+     *        번호다.
+     */
+    fn crl_serial_comparison_ignores_leading_zeros() {
+        let (ca, leaf, sk, _) = gen_ca_and_leaf();
+        let now = 1_700_000_000i64;
+        let crl = Crl::parse(&build_crl(&sk, &ca, &[&[0x00, 0x01, 0x02]], now), &ca).unwrap();
+        let mut padded = leaf.clone();
+        padded.serial = vec![0x01, 0x02];
+        assert_eq!(crl.status(&padded, now), RevocationStatus::Revoked);
     }
 }

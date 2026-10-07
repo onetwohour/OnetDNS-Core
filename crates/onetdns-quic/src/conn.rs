@@ -3462,10 +3462,10 @@ impl Connection {
             .unwrap_or_default()
     }
 
-    /** @brief 상대가 보낸 인증서 체인. */
-    pub fn peer_chain(&self) -> &[Vec<u8>] {
+    /** @brief 검증한 상대의 인증 경로. 서버 쪽 연결이면 비어 있다. */
+    pub fn verified_chain(&self) -> &[onetdns_tls::X509] {
         match self.tls_client.as_ref() {
-            Some(e) => e.peer_chain(),
+            Some(e) => e.verified_chain(),
             None => &[],
         }
     }

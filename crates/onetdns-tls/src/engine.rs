@@ -406,7 +406,13 @@ impl ServerHandshake {
         Ok(Some((state, early_ok)))
     }
 
-    /** @brief 클라이언트 인사말을 처리하고 서버 차례를 만든다. */
+    /**
+     * @brief 클라이언트 인사말을 처리하고 서버 차례를 만든다.
+     * @details 다시 시도 요청은 재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도
+     *          인사말은 지원 곡선과 서명 방식을 바꾸거나 재개 제안을 새로 넣을 수 없으므로,
+     *          X25519 를 지원하지 않거나 재개 제안 없이 이쪽 서명 방식을 빠뜨린 인사말은 첫
+     *          인사말에서 거절한다.
+     */
     fn on_client_hello(&mut self, ch_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let ch = ClientHello::from_handshake(ch_msg)?;
         if !ch.is_valid_tls13() || ch.ext(EXT_QUIC_TRANSPORT_PARAMETERS).is_none() {
@@ -442,6 +448,11 @@ impl ServerHandshake {
                 .map(|gs| gs.contains(&X25519))
                 .unwrap_or(false);
             if !supports {
+                return Err(TlsError::Protocol);
+            }
+            if ch.ext(EXT_PRE_SHARED_KEY).is_none()
+                && !ch.offers_signature_scheme(self.cfg.sign_scheme)
+            {
                 return Err(TlsError::Protocol);
             }
             let suite = choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::Protocol)?;
@@ -516,6 +527,9 @@ impl ServerHandshake {
                         .is_none_or(|selected| state.suite == selected)
             });
         let resumed = psk.is_some();
+        if !resumed && !ch.offers_signature_scheme(self.cfg.sign_scheme) {
+            return Err(TlsError::Protocol);
+        }
         let suite = match &psk {
             Some((state, _)) => state.suite,
             None => self
@@ -918,8 +932,8 @@ pub struct ClientHandshake {
     peer_tp: Option<Vec<u8>>,
     /** @brief 협상한 ALPN. */
     alpn: Option<Vec<u8>>,
-    /** @brief 서버가 보낸 인증서 체인. */
-    peer_chain: Vec<Vec<u8>>,
+    /** @brief 검증한 서버의 인증 경로. */
+    verified_chain: Vec<X509>,
 }
 
 impl Drop for ClientHandshake {
@@ -1061,7 +1075,7 @@ impl ClientHandshake {
             pending_secrets: Vec::new(),
             peer_tp: None,
             alpn: None,
-            peer_chain: Vec::new(),
+            verified_chain: Vec::new(),
         })
     }
 
@@ -1321,8 +1335,7 @@ impl ClientHandshake {
                 let leaf = cert.leaf().ok_or(TlsError::BadCert)?;
                 let x = X509::parse(leaf)?;
 
-                self.peer_chain = cert.entries.iter().map(|e| e.cert_data.clone()).collect();
-                match &self.cfg.roots {
+                self.verified_chain = match &self.cfg.roots {
                     Some(store) => {
                         let chain: Vec<X509> = cert
                             .entries
@@ -1334,7 +1347,7 @@ impl ClientHandshake {
                             store,
                             &self.cfg.server_name,
                             now_epoch(),
-                        )?;
+                        )?
                     }
                     None => {
                         if self.cfg.insecure_verifier.is_none() {
@@ -1343,8 +1356,9 @@ impl ClientHandshake {
                         if self.cfg.verify_name && !x.matches_hostname(&self.cfg.server_name) {
                             return Err(TlsError::BadCert);
                         }
+                        Vec::new()
                     }
-                }
+                };
                 self.leaf_cert = Some(x);
                 self.flight_state = CFlightState::CertificateVerify;
                 transcript.update(&msg.encode());
@@ -1524,9 +1538,13 @@ impl ClientHandshake {
         self.alpn.as_deref()
     }
 
-    /** @brief 상대가 보낸 인증서 체인. */
-    pub fn peer_chain(&self) -> &[Vec<u8>] {
-        &self.peer_chain
+    /**
+     * @brief 검증한 서버의 인증 경로. 리프에서 시작해 이쪽 저장소의 루트로 끝난다.
+     * @note 재개한 연결이나 인증서를 검증하지 않은 연결에서는 비어 있다. 리프의 발급자가
+     *       필요하면 서버가 보낸 체인이 아니라 이 경로에서 꺼낸다.
+     */
+    pub fn verified_chain(&self) -> &[X509] {
+        &self.verified_chain
     }
 
     /** @brief 핸드셰이크가 끝났는지. */
@@ -1672,6 +1690,99 @@ mod tests {
                 "{server_name}"
             );
         }
+    }
+
+    #[test]
+    /**
+     * @brief QUIC 서버도 형식이 깨진 인사말과 이쪽 서명 방식을 제안하지 않은 인사말에는 다시
+     *        시도 요청을 포함해 아무것도 내지 않는지. 재개를 제안했으면 서명 방식이 없어도
+     *        다시 시도를 요청한다.
+     */
+    fn quic_server_answers_only_acceptable_client_hellos() {
+        let client_cfg = ClientConfig {
+            server_name: "localhost".to_string(),
+            alpn: vec![b"doq".to_vec()],
+            ..insecure_test_client()
+        };
+        let mut client = ClientHandshake::new(client_cfg, b"ctp".to_vec()).unwrap();
+        let initial = client.take_crypto();
+        let mut reader = HandshakeReader::new();
+        reader.feed(&initial[0].1);
+        let hello = ClientHello::parse(&reader.next_message().unwrap().unwrap().body).unwrap();
+
+        let cfg = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
+        let answer = |hello: &ClientHello| {
+            let mut server = ServerHandshake::new(Arc::clone(&cfg), b"stp".to_vec());
+            let accepted = server
+                .provide(Level::Initial, &hello.to_handshake().encode())
+                .is_ok();
+            (accepted, !server.take_crypto().is_empty())
+        };
+        assert_eq!(answer(&hello), (true, true), "정상 인사말에는 답해야 한다");
+
+        let mut broken_share = hello.clone();
+        broken_share
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_KEY_SHARE)
+            .unwrap()
+            .data
+            .push(0);
+        assert_eq!(
+            answer(&broken_share),
+            (false, false),
+            "키 공유가 깨진 인사말에는 다시 시도 요청도 보내지 않아야 한다"
+        );
+
+        let other_schemes = |hello: &ClientHello| {
+            let mut changed = hello.clone();
+            let signature_algorithms = changed
+                .extensions
+                .iter_mut()
+                .find(|extension| extension.ext_type == EXT_SIGNATURE_ALGORITHMS)
+                .unwrap();
+            let offered: Vec<u16> = signature_algorithms
+                .as_signature_algorithms()
+                .unwrap()
+                .into_iter()
+                .filter(|scheme| *scheme != cfg.sign_scheme)
+                .collect();
+            *signature_algorithms = Extension::signature_algorithms(&offered);
+            changed
+        };
+        assert_eq!(
+            answer(&other_schemes(&hello)),
+            (false, false),
+            "이쪽 서명 방식을 제안하지 않았으면 답하지 않아야 한다"
+        );
+
+        let mut empty_shares = hello;
+        empty_shares
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_KEY_SHARE)
+            .unwrap()
+            .data = vec![0, 0];
+        assert_eq!(
+            answer(&empty_shares),
+            (true, true),
+            "키 공유가 비었으면 다시 시도를 요청해야 한다"
+        );
+        assert_eq!(
+            answer(&other_schemes(&empty_shares)),
+            (false, false),
+            "다시 시도해도 이쪽 서명 방식이 없으면 다시 시도 요청을 보내지 않아야 한다"
+        );
+
+        let mut resuming = other_schemes(&empty_shares);
+        resuming
+            .extensions
+            .push(Extension::pre_shared_key_client(b"ticket", 0, 32));
+        assert_eq!(
+            answer(&resuming),
+            (true, true),
+            "재개를 제안했으면 재개로 마칠 수 있으므로 다시 시도를 요청해야 한다"
+        );
     }
 
     /** @brief 테스트용 다시 시도 요청을 만든다. */
@@ -1994,6 +2105,77 @@ mod tests {
             .find(|p| p.level == Level::Application)
             .unwrap();
         assert_eq!(s_app, c_app, "mTLS에서도 app 시크릿 일치");
+    }
+
+    #[test]
+    /**
+     * @brief 루트가 바로 발급한 리프 뒤에 이름이 같은 가짜 루트를 붙여 보내도, 엔진이 보관하는
+     *        검증 경로는 이쪽 저장소의 루트로 끝나는지.
+     */
+    fn quic_engine_verified_chain_ends_at_the_stored_root() {
+        use crate::trust::TrustStore;
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let impostor_key = KeyPair::generate().unwrap();
+        let mut impostor_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        impostor_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let impostor_der = impostor_params
+            .self_signed(&impostor_key)
+            .unwrap()
+            .der()
+            .to_vec();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["dns.example".to_string()]).unwrap();
+        let leaf_der = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap()
+            .der()
+            .to_vec();
+
+        let (sign_scheme, sign) =
+            crate::conn::signer_from_pkcs8_der(&leaf_key.serialize_der()).unwrap();
+        let scfg = ServerConfig {
+            cert_chain: vec![leaf_der.clone(), impostor_der],
+            sign_scheme,
+            sign,
+            alpn: vec![b"doq".to_vec()],
+            client_ca: None,
+            resumption: None,
+        };
+        let mut server = ServerHandshake::new(Arc::new(scfg), b"stp".to_vec());
+        let client_cfg = ClientConfig {
+            server_name: "dns.example".to_string(),
+            verify_name: true,
+            roots: Some(TrustStore::from_ders([ca_cert.der().as_ref()])),
+            alpn: vec![b"doq".to_vec()],
+            ..Default::default()
+        };
+        let mut client = ClientHandshake::new(client_cfg, b"ctp".to_vec()).unwrap();
+        run_handshake(&mut server, &mut client);
+        assert!(
+            client.is_complete(),
+            "리프가 진짜 루트에 바로 닿으므로 완료해야 한다"
+        );
+
+        let path: Vec<[u8; 32]> = client
+            .verified_chain()
+            .iter()
+            .map(|cert| cert.cert_sha256)
+            .collect();
+        let expected = vec![
+            X509::parse(&leaf_der).unwrap().cert_sha256,
+            X509::parse(ca_cert.der()).unwrap().cert_sha256,
+        ];
+        assert_eq!(
+            path, expected,
+            "발급자 자리에는 이쪽 저장소의 루트가 와야 한다"
+        );
     }
 
     #[test]

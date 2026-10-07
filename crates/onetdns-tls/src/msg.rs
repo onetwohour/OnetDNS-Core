@@ -7,6 +7,7 @@
  */
 
 use crate::handshake::{HandshakeMsg, HandshakeType};
+use crate::tls12::{EXT_EXTENDED_MASTER_SECRET, EXT_RENEGOTIATION_INFO};
 use crate::wire::{Reader, Writer};
 use crate::TlsError;
 
@@ -342,26 +343,36 @@ impl Extension {
         (!key.is_empty() && r.is_empty()).then_some((group, key))
     }
 
-    /** @brief 서버 이름을 읽는다. */
+    /** @brief 서버 이름을 읽는다. 형식이 깨졌거나 쓸 수 있는 호스트 이름이 없으면 None 이다. */
     pub fn as_server_name(&self) -> Option<String> {
+        self.parse_server_name().ok().flatten()
+    }
+
+    /**
+     * @brief 서버 이름 목록을 읽는다.
+     * @return 형식이 깨졌으면 오류, 호스트 이름 항목이 없거나 UTF-8 이 아니면 None.
+     * @details 목록과 호스트 이름은 비어 있으면 안 되고 호스트 이름 항목은 하나뿐이어야 한다.
+     *          다른 종류의 항목도 길이를 붙인 값으로 읽는다.
+     */
+    fn parse_server_name(&self) -> Result<Option<String>, TlsError> {
         let mut r = Reader::new(&self.data);
-        let list = r.vec16().ok()?;
+        let list = r.vec16()?;
         if !r.is_empty() || list.is_empty() {
-            return None;
+            return Err(TlsError::Decode);
         }
         let mut lr = Reader::new(list);
-        let mut host = None;
+        let mut host: Option<&[u8]> = None;
         while !lr.is_empty() {
-            let ntype = lr.u8().ok()?;
-            let name = lr.vec16().ok()?;
+            let ntype = lr.u8()?;
+            let name = lr.vec16()?;
             if ntype == 0 {
                 if name.is_empty() || host.is_some() {
-                    return None;
+                    return Err(TlsError::Decode);
                 }
-                host = String::from_utf8(name.to_vec()).ok();
+                host = Some(name);
             }
         }
-        host
+        Ok(host.and_then(|name| String::from_utf8(name.to_vec()).ok()))
     }
 
     /** @brief 응용 프로토콜 목록을 읽는다. */
@@ -462,6 +473,33 @@ impl Extension {
         let mut r = Reader::new(&self.data);
         let max = r.u32().ok()?;
         r.is_empty().then_some(max)
+    }
+
+    /**
+     * @brief 클라이언트 인사말에 실린 이 확장의 형식이 맞는지.
+     * @return 이 스택이 해석하는 종류면 형식이 맞는지, 해석하지 않는 종류면 None.
+     * @details 해석하지 않는 확장은 RFC 8446 이 정한 대로 내용을 보지 않고 넘긴다. QUIC 전송
+     *          매개변수는 QUIC 층이 따로 읽으므로 여기서는 해석하지 않는 종류로 친다.
+     */
+    pub fn client_hello_syntax_ok(&self) -> Option<bool> {
+        let ok = match self.ext_type {
+            EXT_SERVER_NAME => self.parse_server_name().is_ok(),
+            EXT_SUPPORTED_GROUPS => self.as_supported_groups().is_some(),
+            EXT_SIGNATURE_ALGORITHMS => self.as_signature_algorithms().is_some(),
+            EXT_ALPN => self.as_alpn().is_some(),
+            EXT_EXTENDED_MASTER_SECRET | EXT_EARLY_DATA => self.data.is_empty(),
+            EXT_PRE_SHARED_KEY => self.as_pre_shared_key_client().is_some(),
+            EXT_SUPPORTED_VERSIONS => self.as_supported_versions_client().is_some(),
+            EXT_COOKIE => self.as_cookie().is_some(),
+            EXT_PSK_KEY_EXCHANGE_MODES => self.as_psk_modes().is_some(),
+            EXT_KEY_SHARE => self.as_key_share_client().is_some(),
+            EXT_RENEGOTIATION_INFO => {
+                let mut r = Reader::new(&self.data);
+                r.vec8().is_ok() && r.is_empty()
+            }
+            _ => return None,
+        };
+        Some(ok)
     }
 }
 
@@ -564,10 +602,14 @@ impl ClientHello {
 
     /**
      * @brief 1.3 인사말로서 형태가 맞는지.
+     * @details RFC 8446 이 1.3 인사말에 요구하는 확장도 본다. 재개 제안이 있으면 재개 방식
+     *          확장이, 없으면 서명 방식과 지원 곡선이 있어야 한다. 지원 곡선과 키 공유는 함께
+     *          오거나 함께 빠져야 한다.
      * @warning 재개 확장은 반드시 마지막이어야 한다. 바인더가 그 앞까지의 바이트에
      *          걸리므로, 뒤에 뭔가 오면 그 부분이 인증되지 않는다.
      */
     pub(crate) fn is_valid_tls13(&self) -> bool {
+        let has = |ext_type| self.ext(ext_type).is_some();
         self.legacy_version == TLS12
             && self.compression_methods == [0]
             && self
@@ -579,6 +621,19 @@ impl ClientHello {
                 .iter()
                 .position(|extension| extension.ext_type == EXT_PRE_SHARED_KEY)
                 .is_none_or(|position| position + 1 == self.extensions.len())
+            && has(EXT_SUPPORTED_GROUPS) == has(EXT_KEY_SHARE)
+            && if has(EXT_PRE_SHARED_KEY) {
+                has(EXT_PSK_KEY_EXCHANGE_MODES)
+            } else {
+                has(EXT_SUPPORTED_GROUPS) && has(EXT_SIGNATURE_ALGORITHMS)
+            }
+    }
+
+    /** @brief 서명 방식 확장에 그 방식이 있는지. 인증서로 인증하는 서버는 이 안에서 골라야 한다. */
+    pub(crate) fn offers_signature_scheme(&self, scheme: u16) -> bool {
+        self.ext(EXT_SIGNATURE_ALGORITHMS)
+            .and_then(Extension::as_signature_algorithms)
+            .is_some_and(|algorithms| algorithms.contains(&scheme))
     }
 
     /** @brief HelloRetryRequest 뒤 두 번째 인사말이 허용된 항목만 바꿨는지. */
@@ -642,7 +697,12 @@ impl ClientHello {
         }
     }
 
-    /** @brief 인사말을 읽는다. */
+    /**
+     * @brief 인사말을 읽는다.
+     * @warning 이 스택이 해석하는 확장의 형식이 깨졌으면 인사말 전체를 거부한다. 깨진 확장을
+     *          없는 것으로 보면 다른 구현이 거부하는 인사말에 이쪽만 답하고, 키 공유가 깨진
+     *          인사말에는 다시 시도 요청까지 보낸다.
+     */
     pub fn parse(body: &[u8]) -> Result<ClientHello, TlsError> {
         let mut r = Reader::new(body);
         let legacy_version = r.u16()?;
@@ -665,6 +725,12 @@ impl ClientHello {
             return Err(TlsError::Decode);
         }
         let extensions = Extension::parse_list(r.vec16()?)?;
+        if extensions
+            .iter()
+            .any(|extension| extension.client_hello_syntax_ok() == Some(false))
+        {
+            return Err(TlsError::Decode);
+        }
 
         if !r.is_empty() {
             return Err(TlsError::Decode);
@@ -978,12 +1044,13 @@ mod tests {
             compression_methods: vec![0],
             extensions: vec![
                 Extension::supported_versions_client(&[TLS13]),
+                Extension::psk_key_exchange_modes(&[PSK_DHE_KE]),
                 Extension::pre_shared_key_client(b"ticket", 0, 32),
                 Extension::server_name("dns.example"),
             ],
         };
         assert!(!ch.is_valid_tls13());
-        ch.extensions.swap(1, 2);
+        ch.extensions.swap(2, 3);
         assert!(ch.is_valid_tls13());
     }
 
@@ -1057,6 +1124,203 @@ mod tests {
             .extensions
             .insert(psk_at, Extension::early_data());
         assert!(!retained_early_data.is_valid_retry_of(&first));
+    }
+
+    /** @brief 주어진 확장만 실은 클라이언트 인사말. */
+    fn hello_with(extensions: Vec<Extension>) -> ClientHello {
+        ClientHello {
+            legacy_version: TLS12,
+            random: [0; 32],
+            session_id: Vec::new(),
+            cipher_suites: vec![TLS_AES_128_GCM_SHA256],
+            compression_methods: vec![0],
+            extensions,
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 이 스택이 해석하는 확장의 형식이 깨지면 인사말 전체를 거부하고, 해석하지 않는
+     *        확장은 내용을 보지 않는지.
+     */
+    fn client_hello_rejects_malformed_extensions_it_interprets() {
+        let interpreted = [
+            Extension::server_name("dns.example"),
+            Extension::supported_groups(&[X25519]),
+            Extension::signature_algorithms(&[ECDSA_SECP256R1_SHA256]),
+            Extension::alpn(&[b"dot"]),
+            Extension::new(EXT_EXTENDED_MASTER_SECRET, Vec::new()),
+            Extension::early_data(),
+            Extension::supported_versions_client(&[TLS13]),
+            Extension::cookie(b"cookie"),
+            Extension::psk_key_exchange_modes(&[PSK_DHE_KE]),
+            Extension::key_share_client(&[(X25519, vec![1; 32])]),
+            Extension::new(EXT_RENEGOTIATION_INFO, vec![0]),
+            Extension::pre_shared_key_client(b"ticket", 0, 32),
+        ];
+        for extension in interpreted {
+            let ext_type = extension.ext_type;
+            assert_eq!(
+                extension.client_hello_syntax_ok(),
+                Some(true),
+                "확장 {ext_type}: 정상 형식이어야 한다"
+            );
+            assert!(
+                ClientHello::parse(&hello_with(vec![extension.clone()]).encode()).is_ok(),
+                "확장 {ext_type}: 정상 형식이 실린 인사말은 읽어야 한다"
+            );
+            let mut trailing = extension;
+            trailing.data.push(0);
+            assert_eq!(
+                trailing.client_hello_syntax_ok(),
+                Some(false),
+                "확장 {ext_type}: 뒤에 바이트가 남으면 형식이 깨진 것이다"
+            );
+            assert_eq!(
+                ClientHello::parse(&hello_with(vec![trailing]).encode()),
+                Err(TlsError::Decode),
+                "확장 {ext_type}: 형식이 깨진 확장이 실린 인사말은 거부해야 한다"
+            );
+        }
+
+        let wrong_length = [
+            Extension::new(EXT_SUPPORTED_GROUPS, vec![0, 0]),
+            Extension::new(EXT_SUPPORTED_GROUPS, vec![0, 1, 0x1d]),
+            Extension::new(EXT_SIGNATURE_ALGORITHMS, vec![0, 0]),
+            Extension::new(EXT_ALPN, vec![0, 1, 0]),
+            Extension::new(EXT_SUPPORTED_VERSIONS, vec![0]),
+            Extension::new(EXT_COOKIE, vec![0, 0]),
+            Extension::new(EXT_PSK_KEY_EXCHANGE_MODES, vec![0]),
+            Extension::key_share_client(&[(X25519, Vec::new())]),
+            Extension::pre_shared_key_client(b"ticket", 0, 31),
+        ];
+        for extension in wrong_length {
+            assert_eq!(
+                ClientHello::parse(&hello_with(vec![extension.clone()]).encode()),
+                Err(TlsError::Decode),
+                "{extension:?}: 규격이 정한 길이를 어기면 거부해야 한다"
+            );
+        }
+
+        let ignored = hello_with(vec![
+            Extension::new(0x0a0a, vec![0xff; 3]),
+            Extension::new(0xfe0d, vec![0x00]),
+            Extension::new(0x0039, vec![0xff, 0xff]),
+        ]);
+        assert!(ignored
+            .extensions
+            .iter()
+            .all(|extension| extension.client_hello_syntax_ok().is_none()));
+        assert_eq!(
+            ClientHello::parse(&ignored.encode()),
+            Ok(ignored),
+            "해석하지 않는 확장은 내용이 무엇이든 받아들여야 한다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 서버 이름 목록의 형식이 깨졌으면 거부하고, 형식은 맞지만 쓸 이름이 없을 뿐이면
+     *        받아들이는지.
+     */
+    fn server_name_list_must_be_well_formed() {
+        let list = |entries: &[(u8, &[u8])]| {
+            let mut w = Writer::new();
+            w.vec16(|w| {
+                for (name_type, name) in entries {
+                    w.u8(*name_type);
+                    w.vec16(|w| w.bytes(name));
+                }
+            });
+            Extension::new(EXT_SERVER_NAME, w.buf)
+        };
+        for (case, extension) in [
+            ("빈 목록", list(&[])),
+            ("빈 호스트 이름", list(&[(0, b"")])),
+            (
+                "호스트 이름 두 개",
+                list(&[(0, b"a.example"), (0, b"b.example")]),
+            ),
+            (
+                "길이가 잘린 항목",
+                Extension::new(EXT_SERVER_NAME, vec![0, 3, 0, 0, 5]),
+            ),
+        ] {
+            assert_eq!(extension.client_hello_syntax_ok(), Some(false), "{case}");
+            assert_eq!(extension.as_server_name(), None, "{case}");
+        }
+
+        let mixed = list(&[(1, b"opaque"), (0, b"dns.example")]);
+        assert_eq!(mixed.as_server_name().as_deref(), Some("dns.example"));
+        for (case, extension) in [
+            ("다른 종류만 있는 목록", list(&[(1, b"opaque")])),
+            ("UTF-8 이 아닌 이름", list(&[(0, &[0xff, 0xfe])])),
+        ] {
+            assert_eq!(extension.client_hello_syntax_ok(), Some(true), "{case}");
+            assert_eq!(extension.as_server_name(), None, "{case}");
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 1.3 인사말이 RFC 8446 이 요구하는 확장 조합을 갖췄는지 보는지. 재개 제안이 없으면
+     *        서명 방식과 지원 곡선이, 있으면 재개 방식이 있어야 하고, 지원 곡선과 키 공유는
+     *        함께 다닌다.
+     */
+    fn tls13_hello_requires_the_extensions_rfc_8446_mandates() {
+        let versions = || Extension::supported_versions_client(&[TLS13]);
+        let groups = || Extension::supported_groups(&[X25519]);
+        let schemes = || Extension::signature_algorithms(&[ECDSA_SECP256R1_SHA256]);
+        let shares = || Extension::key_share_client(&[(X25519, vec![1; 32])]);
+        let modes = || Extension::psk_key_exchange_modes(&[PSK_DHE_KE]);
+        let psk = || Extension::pre_shared_key_client(b"ticket", 0, 32);
+
+        for (case, extensions, valid) in [
+            (
+                "완전한 인사말",
+                vec![versions(), groups(), schemes(), shares()],
+                true,
+            ),
+            (
+                "빈 키 공유",
+                vec![
+                    versions(),
+                    groups(),
+                    schemes(),
+                    Extension::key_share_client(&[]),
+                ],
+                true,
+            ),
+            ("키 공유 없음", vec![versions(), groups(), schemes()], false),
+            (
+                "지원 곡선 없음",
+                vec![versions(), schemes(), shares()],
+                false,
+            ),
+            (
+                "서명 방식 없음",
+                vec![versions(), groups(), shares()],
+                false,
+            ),
+            ("재개만 제안", vec![versions(), modes(), psk()], true),
+            (
+                "재개 제안의 서명 방식 생략",
+                vec![versions(), groups(), shares(), modes(), psk()],
+                true,
+            ),
+            (
+                "재개 방식 없는 재개 제안",
+                vec![versions(), groups(), schemes(), shares(), psk()],
+                false,
+            ),
+            (
+                "재개 제안의 키 공유 없음",
+                vec![versions(), groups(), modes(), psk()],
+                false,
+            ),
+        ] {
+            assert_eq!(hello_with(extensions).is_valid_tls13(), valid, "{case}");
+        }
     }
 
     #[test]

@@ -180,6 +180,24 @@ jobs:
         env:
           ONETDNS_SWEEP_ITERS: "1000000"
 
+  # Differential test of the TLS first-message parsers against rustls. It is a separate
+  # workspace so rustls never enters the shipped dependency graph. It fails when the TLS
+  # server answers a ClientHello that rustls still rejects after the extensions this stack
+  # ignores are dropped.
+  tls-diff:
+    name: TLS parser differential (rustls, 10M)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/tls-diff
+      - name: Compare ClientHello and ServerHello parsing with rustls
+        run: cargo run --release --locked --manifest-path tools/tls-diff/Cargo.toml -- 10000000
+        env:
+          RUSTFLAGS: "-D warnings"
+
   # Interop with standard clients (dig, kdig) and dnsperf. Serves a local authoritative
   # zone, so nothing outside the runner is involved.
   interop:
@@ -465,6 +483,7 @@ jobs:
       - release-targets
       - supply-chain
       - parser-panic-sweep
+      - tls-diff
       - interop
     runs-on: ubuntu-latest
     steps:

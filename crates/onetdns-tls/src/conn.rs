@@ -397,8 +397,8 @@ pub struct TlsConnection {
     /** @brief 그 인증서에 적힌 신원. */
     client_auth_identity: Option<String>,
 
-    /** @brief 상대가 보낸 인증서 체인. */
-    peer_chain: Vec<Vec<u8>>,
+    /** @brief 검증한 상대의 인증 경로. */
+    verified_chain: Vec<X509>,
 
     /** @brief 이 연결이 클라이언트 쪽인지. 핸드셰이크 뒤 메시지 방향을 검사한다. */
     is_client: bool,
@@ -470,9 +470,13 @@ impl TlsConnection {
         self.alpn.as_deref()
     }
 
-    /** @brief 상대가 보낸 인증서 체인. */
-    pub fn peer_chain(&self) -> &[Vec<u8>] {
-        &self.peer_chain
+    /**
+     * @brief 검증한 상대의 인증 경로. 리프에서 시작해 이쪽 저장소의 루트로 끝난다.
+     * @note 재개한 연결이나 인증서를 검증하지 않은 연결에서는 비어 있다. 리프의 발급자가
+     *       필요하면 상대가 보낸 체인이 아니라 이 경로에서 꺼낸다.
+     */
+    pub fn verified_chain(&self) -> &[X509] {
+        &self.verified_chain
     }
 
     /** @brief 합의된 버전. */
@@ -736,9 +740,9 @@ impl<S: Read + Write> TlsStream<S> {
         self.conn.client_auth_identity()
     }
 
-    /** @brief 상대가 보낸 인증서 체인. */
-    pub fn peer_chain(&self) -> &[Vec<u8>] {
-        self.conn.peer_chain()
+    /** @brief 검증한 상대의 인증 경로. TlsConnection::verified_chain 과 같다. */
+    pub fn verified_chain(&self) -> &[X509] {
+        self.conn.verified_chain()
     }
 
     /** @brief 이 스트림이 PSK-DHE로 재개됐는지. */
@@ -1144,10 +1148,7 @@ fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(),
         || ch
             .ext(tls12::EXT_RENEGOTIATION_INFO)
             .is_none_or(|extension| extension.data != [0])
-        || !ch
-            .ext(EXT_SIGNATURE_ALGORITHMS)
-            .and_then(Extension::as_signature_algorithms)
-            .is_some_and(|algorithms| algorithms.contains(&sign_scheme))
+        || !ch.offers_signature_scheme(sign_scheme)
     {
         return Err(TlsError::Protocol);
     }
@@ -1204,7 +1205,13 @@ fn validate_tls12_server_hello(
     }
 }
 
-/** @brief 서버로서 핸드셰이크를 마친다. 버전에 따라 갈린다. */
+/**
+ * @brief 서버로서 핸드셰이크를 마친다. 버전에 따라 갈린다.
+ * @details 다시 시도 요청은 재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도
+ *          인사말은 지원 곡선과 서명 방식을 바꾸거나 재개 제안을 새로 넣을 수 없으므로,
+ *          X25519 를 지원하지 않거나 재개 제안 없이 이쪽 서명 방식을 빠뜨린 인사말은 첫
+ *          인사말에서 거절한다.
+ */
 pub fn server_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
@@ -1248,6 +1255,9 @@ pub fn server_handshake<S: Read + Write>(
             .map(|gs| gs.contains(&X25519))
             .unwrap_or(false);
         if !supports_x25519 {
+            return Err(TlsError::Protocol);
+        }
+        if ch.ext(EXT_PRE_SHARED_KEY).is_none() && !ch.offers_signature_scheme(cfg.sign_scheme) {
             return Err(TlsError::Protocol);
         }
 
@@ -1306,6 +1316,9 @@ pub fn server_handshake<S: Read + Write>(
     let psk = accept_client_psk(cfg, &ch, &ch_msg, &negotiated_alpn, &psk_binder_prefix)?
         .filter(|state| state.suite == suite);
     let resumed = psk.is_some();
+    if !resumed && !ch.offers_signature_scheme(cfg.sign_scheme) {
+        return Err(TlsError::Protocol);
+    }
     let client_allows_resumption = ch
         .ext(EXT_PSK_KEY_EXCHANGE_MODES)
         .and_then(Extension::as_psk_modes)
@@ -1495,7 +1508,7 @@ pub fn server_handshake<S: Read + Write>(
         alpn: negotiated_alpn,
         client_authenticated: client_auth_identity.is_some(),
         client_auth_identity,
-        peer_chain: Vec::new(),
+        verified_chain: Vec::new(),
         is_client: false,
         post_handshake: HandshakeReader::new(),
         traffic: Some(Tls13Traffic {
@@ -1773,7 +1786,7 @@ pub fn client_handshake<S: Read + Write>(
             alpn: negotiated_alpn,
             client_authenticated: false,
             client_auth_identity: None,
-            peer_chain: Vec::new(),
+            verified_chain: Vec::new(),
             is_client: true,
             post_handshake: HandshakeReader::new(),
             traffic: Some(Tls13Traffic {
@@ -1810,15 +1823,14 @@ pub fn client_handshake<S: Read + Write>(
     let cert = CertificateMsg::parse(&cert_m.body)?;
     let leaf = cert.leaf().ok_or(TlsError::BadCert)?;
     let x = X509::parse(leaf)?;
-    let peer_chain: Vec<Vec<u8>> = cert.entries.iter().map(|e| e.cert_data.clone()).collect();
-    match &cfg.roots {
+    let verified_chain = match &cfg.roots {
         Some(store) => {
             let chain: Vec<X509> = cert
                 .entries
                 .iter()
                 .map(|e| X509::parse(&e.cert_data))
                 .collect::<Result<_, _>>()?;
-            crate::trust::verify_chain(&chain, store, &cfg.server_name, now_epoch())?;
+            crate::trust::verify_chain(&chain, store, &cfg.server_name, now_epoch())?
         }
 
         None => {
@@ -1828,8 +1840,9 @@ pub fn client_handshake<S: Read + Write>(
             if cfg.verify_name && !x.matches_hostname(&cfg.server_name) {
                 return Err(TlsError::BadCert);
             }
+            Vec::new()
         }
-    }
+    };
     transcript.update(&cert_m.encode());
 
     let th_before_cv = transcript.hash();
@@ -1910,7 +1923,7 @@ pub fn client_handshake<S: Read + Write>(
         alpn: negotiated_alpn,
         client_authenticated: false,
         client_auth_identity: None,
-        peer_chain,
+        verified_chain,
         is_client: true,
         post_handshake: HandshakeReader::new(),
         traffic: Some(Tls13Traffic {
@@ -2069,7 +2082,7 @@ fn server_handshake_tls12<S: Read + Write>(
         alpn: negotiated_alpn,
         client_authenticated: false,
         client_auth_identity: None,
-        peer_chain: Vec::new(),
+        verified_chain: Vec::new(),
         is_client: false,
         post_handshake: HandshakeReader::new(),
         traffic: None,
@@ -2142,14 +2155,13 @@ fn client_handshake_tls12<S: Read + Write>(
 
     let leaf = cert_chain.first().ok_or(TlsError::BadCert)?;
     let x = X509::parse(leaf)?;
-    let peer_chain: Vec<Vec<u8>> = cert_chain.clone();
-    match &cfg.roots {
+    let verified_chain = match &cfg.roots {
         Some(store) => {
             let chain: Vec<X509> = cert_chain
                 .iter()
                 .map(|d| X509::parse(d))
                 .collect::<Result<_, _>>()?;
-            crate::trust::verify_chain(&chain, store, &cfg.server_name, now_epoch())?;
+            crate::trust::verify_chain(&chain, store, &cfg.server_name, now_epoch())?
         }
         None => {
             if cfg.insecure_verifier.is_none() {
@@ -2158,8 +2170,9 @@ fn client_handshake_tls12<S: Read + Write>(
             if cfg.verify_name && !x.matches_hostname(&cfg.server_name) {
                 return Err(TlsError::BadCert);
             }
+            Vec::new()
         }
-    }
+    };
 
     let signed = tls12::ske_signed_content(&client_random, &server_random, &params_bytes);
     x.verify_tls_signature(sig_scheme, &signed, &signature)?;
@@ -2222,7 +2235,7 @@ fn client_handshake_tls12<S: Read + Write>(
         alpn: negotiated_alpn,
         client_authenticated: false,
         client_auth_identity: None,
-        peer_chain,
+        verified_chain,
         is_client: true,
         post_handshake: HandshakeReader::new(),
         traffic: None,
@@ -2294,7 +2307,7 @@ mod tests {
             alpn: None,
             client_authenticated: false,
             client_auth_identity: None,
-            peer_chain: Vec::new(),
+            verified_chain: Vec::new(),
             is_client: true,
             post_handshake: HandshakeReader::new(),
             traffic: Some(Tls13Traffic {
@@ -2703,7 +2716,7 @@ mod tests {
             alpn: None,
             client_authenticated: false,
             client_auth_identity: None,
-            peer_chain: Vec::new(),
+            verified_chain: Vec::new(),
             is_client: false,
             post_handshake: HandshakeReader::new(),
             traffic: None,
@@ -3341,6 +3354,93 @@ mod tests {
         }
     }
 
+    #[test]
+    /**
+     * @brief 루트가 바로 발급한 리프 뒤에 이름이 같은 가짜 루트를 붙여 보내도, 연결이 보관하는
+     *        검증 경로는 이쪽 저장소의 루트로 끝나는지. 1.3과 1.2 모두 본다.
+     */
+    fn verified_chain_ends_at_the_stored_root_not_a_presented_impostor() {
+        use crate::trust::TrustStore;
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_der = ca_cert.der().to_vec();
+
+        let impostor_key = KeyPair::generate().unwrap();
+        let mut impostor_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        impostor_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let impostor_der = impostor_params
+            .self_signed(&impostor_key)
+            .unwrap()
+            .der()
+            .to_vec();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["dns.example".to_string()]).unwrap();
+        let leaf_der = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap()
+            .der()
+            .to_vec();
+        let leaf_key_der = leaf_key.serialize_der();
+
+        let ca = X509::parse(&ca_der).unwrap();
+        let impostor = X509::parse(&impostor_der).unwrap();
+        assert_eq!(
+            impostor.subject_raw, ca.subject_raw,
+            "가짜 루트는 진짜 루트와 이름이 같아야 시험이 성립한다"
+        );
+        let expected = vec![X509::parse(&leaf_der).unwrap().cert_sha256, ca.cert_sha256];
+
+        for force_tls12 in [false, true] {
+            let (scheme, sign) = signer_from_pkcs8_der(&leaf_key_der).unwrap();
+            let server_cfg = ServerConfig {
+                cert_chain: vec![leaf_der.clone(), impostor_der.clone()],
+                sign_scheme: scheme,
+                sign,
+                alpn: vec![],
+                client_ca: None,
+                resumption: None,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let _ = server_handshake(&mut s, &server_cfg);
+                }
+            });
+            let mut c = TcpStream::connect(addr).unwrap();
+            let cfg = ClientConfig {
+                server_name: "dns.example".into(),
+                verify_name: true,
+                roots: Some(TrustStore::from_ders([ca_der.as_slice()])),
+                alpn: vec![],
+                ..Default::default()
+            };
+            let conn = if force_tls12 {
+                client_handshake_force_tls12(&mut c, &cfg)
+            } else {
+                client_handshake(&mut c, &cfg)
+            }
+            .expect("리프가 진짜 루트에 바로 닿으므로 핸드셰이크는 성공해야 한다");
+
+            let path: Vec<[u8; 32]> = conn
+                .verified_chain()
+                .iter()
+                .map(|cert| cert.cert_sha256)
+                .collect();
+            assert_eq!(
+                path, expected,
+                "1.2 강제 여부 {force_tls12}: 발급자 자리에는 이쪽 저장소의 루트가 와야 한다"
+            );
+            drop(c);
+            let _ = server.join();
+        }
+    }
+
     /** @brief 클라이언트 인증 테스트용 CA와 리프. */
     fn mtls_ca_and_leaf(cn: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -3526,6 +3626,246 @@ mod tests {
         assert_eq!(sni("[2001:db8::1]"), None);
         assert_eq!(sni("dns.example"), Some("dns.example".to_string()));
         assert_eq!(sni("dns.example."), Some("dns.example".to_string()));
+    }
+
+    /** @brief 정해 둔 바이트만 읽히고 쓴 바이트는 모아 두는 스트림. */
+    struct Scripted {
+        /** @brief 서버가 읽을 바이트. 다 읽으면 연결이 닫힌 것과 같다. */
+        input: std::io::Cursor<Vec<u8>>,
+        /** @brief 서버가 쓴 바이트. */
+        output: Vec<u8>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /**
+     * @brief 클라이언트 인사말 하나를 받은 서버가 처음 보내는 ServerHello. 다시 시도 요청도
+     *        같은 형식이므로 여기에 들어간다.
+     * @details 답한 뒤에는 더 읽을 바이트가 없어 핸드셰이크가 실패하지만, 첫 레코드는 그 전에
+     *          이미 나간다.
+     */
+    fn first_server_hello(cfg: &ServerConfig, client_hello: Vec<u8>) -> Option<ServerHello> {
+        let mut stream = Scripted {
+            input: std::io::Cursor::new(
+                TlsRecord::new(ContentType::Handshake, client_hello).encode(),
+            ),
+            output: Vec::new(),
+        };
+        let _ = server_handshake(&mut stream, cfg);
+        let (record, _) = TlsRecord::parse(&stream.output).ok()??;
+        if record.content_type != ContentType::Handshake {
+            return None;
+        }
+        let (message, _) = HandshakeMsg::parse(&record.fragment).ok()??;
+        ServerHello::from_handshake(&message).ok()
+    }
+
+    /** @brief 인사말의 서명 방식 목록에서 그 방식을 뺀다. */
+    fn withdraw_signature_scheme(hello: &mut ClientHello, scheme: u16) {
+        let extension = hello
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_SIGNATURE_ALGORITHMS)
+            .expect("서명 방식 확장이 있어야 한다");
+        let offered: Vec<u16> = extension
+            .as_signature_algorithms()
+            .unwrap()
+            .into_iter()
+            .filter(|offered| *offered != scheme)
+            .collect();
+        *extension = Extension::signature_algorithms(&offered);
+    }
+
+    #[test]
+    /**
+     * @brief 형식이 깨졌거나 RFC 8446 이 요구하는 확장이 빠진 인사말, 이쪽 인증서의 서명
+     *        방식을 제안하지 않은 인사말에는 ServerHello 도 다시 시도 요청도 보내지 않는지.
+     *        해석하지 않는 확장은 내용이 무엇이든 답한다.
+     */
+    fn server_answers_only_acceptable_client_hellos() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cfg = ServerConfig::from_pkcs8(
+            ck.cert.der().as_ref().to_vec(),
+            &ck.key_pair.serialize_der(),
+        )
+        .unwrap();
+        let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
+        let client_cfg = ClientConfig {
+            alpn: vec![b"dot".to_vec()],
+            ..insecure_test_client("localhost")
+        };
+        let hello = build_client_hello(&client_cfg, &kx, true, None, None);
+        let answer = |hello: &ClientHello| first_server_hello(&cfg, hello.to_handshake().encode());
+        let reply = answer(&hello).expect("정상 인사말에는 답해야 한다");
+        assert_ne!(
+            reply.random,
+            crate::msg::HRR_RANDOM,
+            "키 공유가 맞으므로 다시 시도 요청이 아니어야 한다"
+        );
+
+        let mut unknown = hello.clone();
+        unknown
+            .extensions
+            .push(Extension::new(0xfe0d, vec![0xff; 5]));
+        assert!(
+            answer(&unknown).is_some(),
+            "해석하지 않는 확장은 내용을 보지 않아야 한다"
+        );
+
+        for extension in &hello.extensions {
+            if extension.client_hello_syntax_ok().is_none() {
+                continue;
+            }
+            let mut broken = hello.clone();
+            broken
+                .extensions
+                .iter_mut()
+                .find(|candidate| candidate.ext_type == extension.ext_type)
+                .unwrap()
+                .data
+                .push(0);
+            assert!(
+                answer(&broken).is_none(),
+                "확장 {}: 형식이 깨진 인사말에는 답하지 않아야 한다",
+                extension.ext_type
+            );
+        }
+
+        let without = |ext_type: u16| {
+            let mut changed = hello.clone();
+            changed
+                .extensions
+                .retain(|extension| extension.ext_type != ext_type);
+            changed
+        };
+        assert!(
+            answer(&without(EXT_SIGNATURE_ALGORITHMS)).is_none(),
+            "재개 제안 없이 서명 방식이 빠지면 답하지 않아야 한다"
+        );
+        assert!(
+            answer(&without(EXT_KEY_SHARE)).is_none(),
+            "지원 곡선만 있고 키 공유가 빠지면 다시 시도 요청도 보내지 않아야 한다"
+        );
+        let mut psk_without_modes = without(EXT_PSK_KEY_EXCHANGE_MODES);
+        psk_without_modes
+            .extensions
+            .push(Extension::pre_shared_key_client(b"ticket", 0, 32));
+        assert!(
+            answer(&psk_without_modes).is_none(),
+            "재개 방식 없이 재개를 제안하면 답하지 않아야 한다"
+        );
+
+        let mut other_schemes = hello.clone();
+        withdraw_signature_scheme(&mut other_schemes, cfg.sign_scheme);
+        assert!(
+            answer(&other_schemes).is_none(),
+            "이쪽 인증서의 서명 방식을 제안하지 않았으면 답하지 않아야 한다"
+        );
+
+        let mut empty_shares = hello;
+        empty_shares
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_KEY_SHARE)
+            .unwrap()
+            .data = vec![0, 0];
+        let retry = answer(&empty_shares).expect("키 공유가 비었으면 다시 시도를 요청해야 한다");
+        assert_eq!(retry.random, crate::msg::HRR_RANDOM);
+        withdraw_signature_scheme(&mut empty_shares, cfg.sign_scheme);
+        assert!(
+            answer(&empty_shares).is_none(),
+            "다시 시도해도 이쪽 서명 방식이 없으면 다시 시도 요청을 보내지 않아야 한다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 티켓으로 재개하면 인증서로 서명하지 않으므로, 이쪽 서명 방식을 제안하지 않은
+     *        인사말에도 재개로 답하는지. 키 공유가 비어 있어도 재개로 마칠 수 있으므로 다시
+     *        시도를 요청해야 한다.
+     */
+    fn resumption_does_not_need_the_certificate_signature_scheme() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let ticketer = Arc::new(crate::session::Ticketer::from_key([0x5b; 32]));
+        let now = crate::session::now_ms();
+        let psk = vec![0x33; Hash::Sha256.len()];
+        let age_add = 0x1020_3040;
+        let lifetime_secs = 60;
+        let ticket = ticketer
+            .seal(&crate::session::ResumptionState {
+                server_name: Some("localhost".to_string()),
+                suite: TLS_AES_128_GCM_SHA256,
+                psk: psk.clone(),
+                alpn: None,
+                issued_ms: now,
+                age_add,
+                lifetime_secs,
+                max_early_data: 0,
+            })
+            .unwrap();
+        let mut cfg = ServerConfig::from_pkcs8(
+            ck.cert.der().as_ref().to_vec(),
+            &ck.key_pair.serialize_der(),
+        )
+        .unwrap();
+        cfg.resumption = Some(ServerResumption {
+            ticketer,
+            lifetime_secs,
+            max_early_data: 0,
+        });
+        let session = crate::session::TlsSession {
+            server_name: "localhost".to_string(),
+            suite: TLS_AES_128_GCM_SHA256,
+            psk,
+            ticket,
+            lifetime_secs,
+            age_add,
+            max_early_data: 0,
+            alpn: None,
+            server_transport_params: vec![],
+            obtained_at_ms: now,
+        };
+        let kx = KeyExchange::from_seed(X25519, &[0x32; 32]).unwrap();
+        let mut hello = build_client_hello(
+            &insecure_test_client("localhost"),
+            &kx,
+            true,
+            None,
+            Some(&session),
+        );
+        withdraw_signature_scheme(&mut hello, cfg.sign_scheme);
+        let wire = encode_client_hello(&hello, Some(&session), &[]).unwrap();
+        let reply = first_server_hello(&cfg, wire).expect("재개 인사말에는 답해야 한다");
+        assert!(
+            reply.ext(EXT_PRE_SHARED_KEY).is_some(),
+            "티켓을 받아들여 재개로 답해야 한다"
+        );
+
+        hello
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.ext_type == EXT_KEY_SHARE)
+            .unwrap()
+            .data = vec![0, 0];
+        let wire = encode_client_hello(&hello, Some(&session), &[]).unwrap();
+        let retry =
+            first_server_hello(&cfg, wire).expect("재개를 제안했으면 다시 시도를 요청해야 한다");
+        assert_eq!(retry.random, crate::msg::HRR_RANDOM);
     }
 
     #[test]
