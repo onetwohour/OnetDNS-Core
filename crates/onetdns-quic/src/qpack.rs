@@ -811,6 +811,16 @@ impl Decoder {
         DecodeResult::Done(out)
     }
 
+    /**
+     * @brief 이 스트림의 남은 헤더 구역을 풀지 않는다고 상대 인코더에 알린다.
+     * @details RFC 9204 의 Stream Cancellation 이다. 끊긴 스트림이나 읽기를 그만둔 스트림에 보낸다.
+     *          인코더는 확인받지 못한 구역이 가리키는 테이블 항목을 지우지 못하므로, 알리지 않으면
+     *          그 항목이 연결이 끝날 때까지 테이블에 묶인다.
+     */
+    pub fn cancel_stream(&mut self, stream_id: u64) {
+        push_int(&mut self.out, stream_id, 6, 0x40);
+    }
+
     /** @brief 상대에게 보낼 확인 지시를 꺼낸다. */
     pub fn take_decoder_stream(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
@@ -1240,6 +1250,20 @@ mod tests {
 
         assert_eq!(enc.on_decoder_stream(&[0]), Err(()));
         assert_eq!(enc.on_decoder_stream(&[1]), Err(()));
+    }
+
+    #[test]
+    /**
+     * @brief Stream Cancellation 이 6비트 접두 정수로 스트림 번호를 싣는지.
+     * @details 접두가 7비트인 확인 지시와 섞어 쓰면 63 이상인 스트림 번호가 다른 번호로 읽힌다.
+     */
+    fn stream_cancellation_uses_a_six_bit_prefix() {
+        let mut dec = Decoder::new(4096);
+        dec.cancel_stream(4);
+        dec.cancel_stream(100);
+        let instructions = dec.take_decoder_stream();
+        assert_eq!(instructions, vec![0x44, 0x7f, 0x25]);
+        assert_eq!(Encoder::new().on_decoder_stream(&instructions), Ok(()));
     }
 
     #[test]

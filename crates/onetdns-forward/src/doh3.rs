@@ -405,12 +405,15 @@ mod tests {
     /** @brief RFC 9114 의 HEADERS 프레임 종류. */
     const HEADERS_FRAME: u64 = 0x01;
 
+    /** @brief DoH 경로를 모르는 웹 서버가 DNS 메시지 대신 내는 페이지. */
+    const HTML_PAGE: &[u8] = b"<html>no DNS here</html>";
+
     /**
      * @brief DNS 메시지 대신 HTML 페이지로 답한다. DoH 경로를 모르는 웹 서버가 내는 답이다.
      * @param status 답에 실을 상태 코드.
+     * @param page 답에 실을 페이지.
      */
-    fn answer_with_html_page(h3c: &mut H3Connection, sid: u64, status: &[u8]) {
-        let page: &[u8] = b"<html>no DNS here</html>";
+    fn answer_with_html_page(h3c: &mut H3Connection, sid: u64, status: &[u8], page: &[u8]) {
         let headers: [(&[u8], &[u8]); 2] = [(b":status", status), (b"content-type", b"text/html")];
         let (section, _) = onetdns_quic::qpack::Encoder::new().encode_field_section(&headers);
         let mut payload = Vec::new();
@@ -747,39 +750,47 @@ mod tests {
      * @brief 404 HTML 페이지를 그 질의의 실패로만 다루고 연결은 계속 쓰는지.
      * @details 200 이 아닌 답은 HTTP 메시지로 온전하고 연결도 멀쩡하다. H3_MESSAGE_ERROR 로
      *          닫으면 서버는 자기 응답이 망가졌다고 받아들인다. 연결을 버리고 다시 보내면 같은
-     *          답을 받으려고 핸드셰이크를 한 번 더 한다.
+     *          답을 받으려고 핸드셰이크를 한 번 더 한다. 응답 버퍼 상한을 넘는 큰 페이지도 같다.
      */
     fn doh3_error_page_fails_only_that_query() {
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counted = requests.clone();
-        let (addr, trust, peers, closes) = doh3_close_recorder_with(move |h3c, sid, _| {
-            counted.fetch_add(1, Ordering::Relaxed);
-            answer_with_html_page(h3c, sid, b"404");
-        });
-        let results =
-            thread::spawn(move || [exchange_once(addr, &trust), exchange_once(addr, &trust)])
-                .join()
-                .unwrap();
-        for result in results {
+        for page in [HTML_PAGE.to_vec(), vec![b'x'; 200 * 1024]] {
+            let size = page.len();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            let (addr, trust, peers, closes) = doh3_close_recorder_with(move |h3c, sid, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                answer_with_html_page(h3c, sid, b"404", &page);
+            });
+            let results =
+                thread::spawn(move || [exchange_once(addr, &trust), exchange_once(addr, &trust)])
+                    .join()
+                    .unwrap();
+            for result in results {
+                assert_eq!(
+                    result.err(),
+                    Some(ForwardError::Io("DoH3 non-200 status: 404".into())),
+                    "페이지 {size} 바이트"
+                );
+            }
             assert_eq!(
-                result.err(),
-                Some(ForwardError::Io("DoH3 non-200 status: 404".into()))
+                requests.load(Ordering::Relaxed),
+                2,
+                "오류 상태를 받은 질의를 다시 보냈습니다 (페이지 {size} 바이트)"
+            );
+            assert_eq!(
+                peers.load(Ordering::Relaxed),
+                1,
+                "오류 상태를 받은 연결을 버렸습니다 (페이지 {size} 바이트)"
+            );
+            let close = closes
+                .recv_timeout(Duration::from_secs(10))
+                .expect("스레드가 끝나며 버린 연결이 서버에 종료를 알리지 않았습니다");
+            assert_eq!(
+                (close.error_code, close.frame_type),
+                (0x100, None),
+                "페이지 {size} 바이트"
             );
         }
-        assert_eq!(
-            requests.load(Ordering::Relaxed),
-            2,
-            "오류 상태를 받은 질의를 다시 보냈습니다"
-        );
-        assert_eq!(
-            peers.load(Ordering::Relaxed),
-            1,
-            "오류 상태를 받은 연결을 버렸습니다"
-        );
-        let close = closes
-            .recv_timeout(Duration::from_secs(10))
-            .expect("스레드가 끝나며 버린 연결이 서버에 종료를 알리지 않았습니다");
-        assert_eq!((close.error_code, close.frame_type), (0x100, None));
     }
 
     #[test]
@@ -790,8 +801,9 @@ mod tests {
      *          실패한다.
      */
     fn doh3_success_status_without_a_dns_message_is_a_bad_response() {
-        let (addr, trust, _peers, closes) =
-            doh3_close_recorder_with(|h3c, sid, _| answer_with_html_page(h3c, sid, b"200"));
+        let (addr, trust, _peers, closes) = doh3_close_recorder_with(|h3c, sid, _| {
+            answer_with_html_page(h3c, sid, b"200", HTML_PAGE)
+        });
         let result = thread::spawn(move || exchange_once(addr, &trust))
             .join()
             .unwrap();

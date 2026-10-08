@@ -59,6 +59,9 @@ const MAX_CLIENT_ID: usize = 256;
 /** @brief DoH 자원이 받는 메서드. 405 응답에 담아 보낸다. */
 const ALLOWED_METHODS: &[u8] = b"GET, POST";
 
+/** @brief 응답이 더는 필요 없는 요청을 거둘 때 쓰는 RFC 9114 스트림 오류 코드. */
+const H3_REQUEST_CANCELLED: u64 = 0x010c;
+
 /** @brief 제어 스트림 종류 번호. */
 const UNI_CONTROL: u64 = 0x00;
 /** @brief 서버 푸시 스트림 종류 번호. */
@@ -1164,6 +1167,8 @@ impl H3Connection {
                 self.requests.remove(&id);
                 self.blocked.retain(|(stream_id, _)| *stream_id != id);
                 self.ready.retain(|request| request.stream_id != id);
+                /* 끊긴 요청의 헤더 구역은 끝내 풀지 않으므로 상대 인코더에 알린다. */
+                self.qp.dec.cancel_stream(id);
             }
         }
         let events = self.conn.take_readable();
@@ -1350,6 +1355,12 @@ struct RespBuf {
     buf: Vec<u8>,
     /** @brief 다 받았는지. */
     done: bool,
+    /**
+     * @brief 결과를 이미 내고 읽기를 그만두었는지.
+     * @details 서버가 STOP_SENDING 을 받기 전에 보낸 데이터는 그대로 도착하므로 버린다. 서버가
+     *          스트림을 끝내거나 끊으면 이 항목도 지운다.
+     */
+    stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1359,8 +1370,8 @@ pub enum H3Response {
     Dns(Vec<u8>),
     /**
      * @brief DNS 메시지를 싣지 않은 최종 응답의 상태 코드. 본문은 버린다.
-     * @details 200 이어도 content-type 이 application/dns-message 하나가 아니거나 본문이 DNS
-     *          메시지 상한을 넘으면 여기에 온다.
+     * @details 200 이어도 content-type 이 application/dns-message 하나가 아니거나, 본문이 DNS
+     *          메시지 상한을 넘거나, 응답이 스트림 버퍼 상한을 넘으면 여기에 온다.
      */
     NotDns(u16),
     /**
@@ -1523,6 +1534,29 @@ impl H3Client {
     }
 
     /**
+     * @brief 스트림 버퍼 상한을 넘은 응답을 최종 상태 코드로 끝내고 남은 본문을 거절한다.
+     * @details DNS 메시지는 이 상한보다 훨씬 작으므로 그런 응답에는 DNS 답이 없다. 연결을 닫으면
+     *          같은 연결의 다른 요청까지 잃으므로 이 요청만 끝낸다. 남은 본문은
+     *          H3_REQUEST_CANCELLED 로 거절하고, 그 스트림의 남은 헤더 구역은 풀지 않는다고 상대
+     *          인코더에 알린다.
+     * @retval H3Error::ExcessiveLoad 최종 응답 헤더가 아직 오지 않았거나 헤더 테이블을 기다려야
+     *         한다. 상태를 모르는 응답을 상한 너머까지 모을 수는 없다.
+     */
+    fn stop_oversized_response(&mut self, id: u64, received: Vec<u8>) -> Result<(), QuicError> {
+        let Some(status) = oversized_response_status(&mut self.qp.dec, id, received)? else {
+            return Err(H3Error::ExcessiveLoad.into());
+        };
+        if self.ready.len() >= MAX_H3_STREAMS {
+            return Err(H3Error::ExcessiveLoad.into());
+        }
+        self.in_flight.remove(&id);
+        self.ready.push((id, H3Response::NotDns(status)));
+        self.qp.dec.cancel_stream(id);
+        self.conn.stop_sending(id, H3_REQUEST_CANCELLED);
+        Ok(())
+    }
+
+    /**
      * @brief 받은 데이터그램을 넣는다.
      * @details HTTP/3 계층에서 연결 오류가 나면 상대에게 알리고 연결을 닫은 뒤 그 오류를
      *          돌려준다. QUIC 계층의 오류는 그 계층이 이미 알렸다. 닫힌 연결에 온 데이터그램은
@@ -1571,11 +1605,21 @@ impl H3Client {
             if !self.resp.contains_key(&id) && self.resp.len() >= MAX_H3_STREAMS {
                 return Err(H3Error::ExcessiveLoad.into());
             }
-            if !fits_connection_buffer(buffered, data.len()) {
-                return Err(H3Error::ExcessiveLoad.into());
-            }
             let rb = self.resp.entry(id).or_default();
+            if rb.stopped {
+                rb.done |= fin;
+                continue;
+            }
             if rb.buf.len().saturating_add(data.len()) > MAX_H3_STREAM_BUFFER {
+                let mut received = std::mem::take(&mut rb.buf);
+                buffered = buffered.saturating_sub(received.len());
+                received.extend_from_slice(&data);
+                rb.stopped = true;
+                rb.done |= fin;
+                self.stop_oversized_response(id, received)?;
+                continue;
+            }
+            if !fits_connection_buffer(buffered, data.len()) {
                 return Err(H3Error::ExcessiveLoad.into());
             }
             rb.buf.extend_from_slice(&data);
@@ -1585,9 +1629,7 @@ impl H3Client {
                 completed.push((id, std::mem::take(&mut rb.buf)));
             }
         }
-        for (id, _) in &completed {
-            self.resp.remove(id);
-        }
+        self.resp.retain(|_, response| !response.done);
         for (id, buf) in std::mem::take(&mut self.blocked) {
             self.try_extract(id, buf)?;
         }
@@ -1611,15 +1653,16 @@ impl H3Client {
 
     /**
      * @brief 서버가 답하지 않을 요청을 답 없음으로 끝낸다.
-     * @details 요청마다 결과는 한 번만 낸다. 이미 답을 받았거나 끝낸 요청이면 아무것도 하지
-     *          않는다.
+     * @details 요청마다 결과는 한 번만 낸다. 이미 결과를 낸 요청이면 그 스트림에 남은 상태만
+     *          지운다. 끝낸 요청의 헤더 구역은 더 풀지 않으므로 상대 인코더에 알린다.
      */
     fn abandon_request(&mut self, id: u64) {
+        self.resp.remove(&id);
         if !self.in_flight.remove(&id) {
             return;
         }
-        self.resp.remove(&id);
         self.blocked.retain(|(stream_id, _)| *stream_id != id);
+        self.qp.dec.cancel_stream(id);
         self.ready.push((id, H3Response::Unanswered));
     }
 
@@ -1753,11 +1796,39 @@ fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
 }
 
 /**
+ * @brief 응답 프레임을 앞에서부터 풀어 최종 응답 헤더를 찾는다.
+ * @details 응답은 1xx 중간 응답 여럿 뒤에 최종 응답이 온다. HEADERS 가 그 가운데 어느 것인지는
+ *          풀어 봐야 알므로 차례로 푼다. 중간 응답에는 본문이 없으므로 최종 응답보다 앞선 DATA 는
+ *          형식 오류다. 헤더보다 앞선 DATA 는 프레임 배치 검사가 먼저 거른다. 최종 응답 뒤의
+ *          프레임은 frames 에 남긴다.
+ * @return 프레임이 다하도록 최종 응답이 없으면 None 이다.
+ */
+fn read_final_head(
+    dec: &mut qpack::Decoder,
+    sid: u64,
+    frames: &mut impl Iterator<Item = (u64, Vec<u8>)>,
+) -> Result<Option<ResponseHead>, Extracted<H3Response>> {
+    for (t, payload) in frames {
+        match t {
+            FRAME_HEADERS => {
+                let fields = decoded(dec.decode_field_section(sid, &payload))?;
+                let head = response_head(fields).ok_or(Extracted::Bad)?;
+                if head.status >= 200 {
+                    return Ok(Some(head));
+                }
+            }
+            FRAME_DATA => return Err(Extracted::Bad),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/**
  * @brief 스트림 버퍼에서 DoH3 응답을 추출한다.
  * @details 요청과 같은 엄격함을 적용한다. 프레임 순서, 상태 헤더 중복, 길이 일치를 모두 본다.
  *          응답은 1xx 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인 트레일러 구역 하나 순서로
- *          온다. HEADERS 가 그 가운데 어느 것인지는 풀어 봐야 알므로 앞에서부터 차례로 푼다.
- *          형식이 온전한 최종 응답은 DNS 메시지를 싣지 않았어도 결과로 낸다.
+ *          온다. 형식이 온전한 최종 응답은 DNS 메시지를 싣지 않았어도 결과로 낸다.
  * @note 어느 구역이든 테이블을 기다려야 하면 하나도 풀지 않는다. 일부를 푼 뒤 기다렸다가 다시
  *       풀면 그 구역의 확인 지시가 두 번 나간다.
  */
@@ -1774,7 +1845,12 @@ fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extra
     {
         return Extracted::Blocked;
     }
-    let mut final_head: Option<ResponseHead> = None;
+    let mut frames = frames.into_iter();
+    let head = match read_final_head(dec, sid, &mut frames) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Extracted::Bad,
+        Err(outcome) => return outcome,
+    };
     let mut trailer_seen = false;
     let mut body = Vec::new();
     for (t, payload) in frames {
@@ -1787,33 +1863,15 @@ fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extra
                     Ok(fields) => fields,
                     Err(outcome) => return outcome,
                 };
-                if final_head.is_some() {
-                    if !valid_trailer_section(&fields) {
-                        return Extracted::Bad;
-                    }
-                    trailer_seen = true;
-                    continue;
-                }
-                let Some(head) = response_head(fields) else {
-                    return Extracted::Bad;
-                };
-                if head.status >= 200 {
-                    final_head = Some(head);
-                }
-            }
-            FRAME_DATA => {
-                /* 중간 응답에는 본문이 없다. 헤더보다 앞선 본문은 프레임 배치 검사가 걸렀다. */
-                if final_head.is_none() {
+                if !valid_trailer_section(&fields) {
                     return Extracted::Bad;
                 }
-                body.extend_from_slice(&payload)
+                trailer_seen = true;
             }
+            FRAME_DATA => body.extend_from_slice(&payload),
             _ => {}
         }
     }
-    let Some(head) = final_head else {
-        return Extracted::Bad;
-    };
     if head
         .content_length
         .is_some_and(|length| length != body.len())
@@ -1824,6 +1882,28 @@ fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extra
         Extracted::Done(H3Response::Dns(body))
     } else {
         Extracted::Done(H3Response::NotDns(head.status))
+    }
+}
+
+/**
+ * @brief 스트림 버퍼 상한을 넘은 응답의 최종 상태 코드를 읽는다.
+ * @details 받은 앞부분에서 다 온 프레임만 보고 최종 응답 헤더까지만 푼다. 그 뒤의 본문과
+ *          트레일러는 풀지 않는다. 프레임 배치나 헤더가 어긋나면 다 받은 응답과 같은 오류로
+ *          알린다.
+ * @return 최종 응답 헤더가 아직 오지 않았거나 헤더 테이블을 기다려야 하면 None 이다.
+ */
+fn oversized_response_status(
+    dec: &mut qpack::Decoder,
+    sid: u64,
+    mut received: Vec<u8>,
+) -> Result<Option<u16>, H3Error> {
+    let frames = drain_complete_frames(&mut received);
+    check_message_frames(&frames, Role::Client)?;
+    match read_final_head(dec, sid, &mut frames.into_iter()) {
+        Ok(head) => Ok(head.map(|head| head.status)),
+        Err(Extracted::Blocked) => Ok(None),
+        Err(Extracted::Fatal(error)) => Err(error),
+        Err(_) => Err(H3Error::Message),
     }
 }
 
@@ -2312,6 +2392,160 @@ mod tests {
         );
     }
 
+    /**
+     * @brief 상대가 이쪽 QPACK 디코더 스트림으로 보낸 Stream Cancellation 의 스트림 번호들.
+     * @details 이 구현의 인코더는 이 지시를 읽고 버리므로 HTTP/3 계층을 거치지 않고 QUIC 계층에서
+     *          꺼낸다. 시험의 스트림 번호와 증가 값이 작아 지시마다 한 바이트다.
+     */
+    fn cancelled_streams(conn: &mut Connection, decoder: u64) -> Vec<u64> {
+        conn.take_readable()
+            .into_iter()
+            .filter(|(id, _, _)| *id == decoder)
+            .flat_map(|(_, data, _)| data)
+            .filter(|instruction| instruction & 0xc0 == 0x40)
+            .map(|instruction| u64::from(instruction & 0x3f))
+            .collect()
+    }
+
+    #[test]
+    /**
+     * @brief 버퍼 상한을 넘는 응답이 그 요청만 끝내고 연결은 남기는지.
+     * @details DNS 메시지는 이 상한보다 훨씬 작으므로 그런 응답에는 DNS 답이 없다. 큰 오류 페이지
+     *          하나에 연결을 닫으면 같은 연결에 실린 다른 요청까지 잃는다. 최종 상태로 결과를 내고,
+     *          남은 본문은 STOP_SENDING 으로 거절하고, 그사이 도착한 데이터는 버린다. 그 스트림의
+     *          남은 헤더 구역은 풀지 않으므로 상대 인코더에 Stream Cancellation 을 보낸다.
+     */
+    fn oversized_response_fails_only_that_request() {
+        /**
+         * @brief 서버 쪽은 QUIC 계층만 거쳐 데이터그램을 주고받는다.
+         * @return 클라이언트가 그사이 보낸 Stream Cancellation 의 스트림 번호들.
+         */
+        fn relay(client: &mut H3Client, server: &mut H3Connection) -> Vec<u64> {
+            let decoder = client.qp.dec_sid.expect("클라이언트 디코더 스트림");
+            let mut cancelled = Vec::new();
+            for _ in 0..30 {
+                let mut moved = false;
+                while let Some(dg) = server.next_datagram() {
+                    client.recv_datagram(&dg).unwrap();
+                    moved = true;
+                }
+                while let Some(dg) = client.next_datagram() {
+                    server.conn_mut().recv_datagram(&dg).unwrap();
+                    moved = true;
+                }
+                cancelled.extend(cancelled_streams(server.conn_mut(), decoder));
+                if !moved {
+                    break;
+                }
+            }
+            cancelled
+        }
+
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+        let stopped = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 stopped")
+            .unwrap();
+        let finished = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 finished")
+            .unwrap();
+        let oversized_dns = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 oversized")
+            .unwrap();
+        let ended = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 ended")
+            .unwrap();
+        let answered = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 answered")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 5);
+
+        /*
+         * 상한 바로 아래까지 먼저 보내고 상한을 넘기는 나머지를 나중에 보낸다. 나머지가 길면 상한을
+         * 넘긴 뒤의 데이터와 FIN 이 STOP_SENDING 보다 먼저 클라이언트에 닿는다. 짧은 나머지는 따로
+         * 보내 상한을 넘기는 조각과 FIN 이 한 패킷에 실리게 한다.
+         */
+        let long_page = vec![b'x'; MAX_H3_STREAM_BUFFER + 4096];
+        let short_page = vec![b'x'; MAX_H3_STREAM_BUFFER];
+        let long_head = MAX_H3_STREAM_BUFFER - 1024;
+        let short_head = MAX_H3_STREAM_BUFFER - 100;
+        let html: &[u8] = b"text/html";
+        let dns: &[u8] = b"application/dns-message";
+        let mut tails = Vec::new();
+        for (id, status, content_type, page, head_len, fin) in [
+            (stopped, b"404", html, &long_page, long_head, false),
+            (finished, b"503", html, &long_page, long_head, true),
+            (oversized_dns, b"200", dns, &long_page, long_head, false),
+            (ended, b"404", html, &short_page, short_head, true),
+        ] {
+            let headers: [(&[u8], &[u8]); 2] =
+                [(b":status", status), (b"content-type", content_type)];
+            let section = server
+                .qp
+                .encode_headers(&mut server.conn, &headers)
+                .unwrap();
+            let mut payload = Vec::new();
+            encode_frame(&mut payload, FRAME_HEADERS, &section);
+            encode_frame(&mut payload, FRAME_DATA, page);
+            let tail = payload.split_off(head_len);
+            server.conn_mut().send_stream(id, &payload, false).unwrap();
+            tails.push((id, tail, fin));
+        }
+        pump_h3(&mut client, &mut server);
+        assert!(client.take_responses().is_empty());
+        let (_, short_tail, _) = tails.pop().expect("짧은 나머지");
+        for (id, tail, fin) in tails {
+            server.conn_mut().send_stream(id, &tail, fin).unwrap();
+        }
+        let mut cancelled = relay(&mut client, &mut server);
+        server
+            .conn_mut()
+            .send_stream(ended, &short_tail, true)
+            .unwrap();
+        cancelled.extend(relay(&mut client, &mut server));
+
+        let mut responses = client.take_responses();
+        responses.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            responses,
+            vec![
+                (stopped, H3Response::NotDns(404)),
+                (finished, H3Response::NotDns(503)),
+                (oversized_dns, H3Response::NotDns(200)),
+                (ended, H3Response::NotDns(404)),
+            ]
+        );
+        assert!(
+            !client.is_closed() && !server.is_closed(),
+            "버퍼 상한을 넘은 응답에 연결이 닫혔습니다"
+        );
+        cancelled.sort_unstable();
+        assert_eq!(
+            cancelled,
+            vec![stopped, finished, oversized_dns, ended],
+            "읽기를 그만둔 스트림마다 Stream Cancellation 이 나가야 합니다"
+        );
+        assert_eq!(
+            server.conn_mut().send_stream(stopped, b"more", false),
+            Err(QuicError::StreamClosed),
+            "남은 본문을 STOP_SENDING 으로 거절해야 합니다"
+        );
+        assert!(
+            client.resp.is_empty(),
+            "끝난 응답 스트림의 상태가 남았습니다"
+        );
+
+        server
+            .send_response(answered, b"\x00\x00 answer", 0)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            client.take_responses(),
+            vec![(answered, H3Response::Dns(b"\x00\x00 answer".to_vec()))]
+        );
+    }
+
     #[test]
     /**
      * @brief 망가진 응답을 즉시 알리는지. 데드라인까지 기다리면 그만큼 붙잡힌다.
@@ -2591,9 +2825,6 @@ mod tests {
         assert!(!server.is_closed());
     }
 
-    /** @brief RFC 9114 의 H3_REQUEST_CANCELLED. 클라이언트가 요청을 거둘 때 쓴다. */
-    const H3_REQUEST_CANCELLED: u64 = 0x010c;
-
     #[test]
     /**
      * @brief 상대가 요청 스트림 하나를 멈추면 그 스트림만 실패하는지.
@@ -2611,7 +2842,7 @@ mod tests {
         assert_eq!(server.take_requests().len(), 1);
         client
             .conn_mut()
-            .send_stop_sending_for_test(cancelled, H3_REQUEST_CANCELLED);
+            .stop_sending(cancelled, H3_REQUEST_CANCELLED);
         pump_h3(&mut client, &mut server);
         assert_eq!(
             server.send_response(cancelled, b"\x00\x00 late", 60),
@@ -2632,6 +2863,66 @@ mod tests {
         assert!(client
             .take_responses()
             .contains(&(next, H3Response::Dns(b"\x00\x00 answer".to_vec()))));
+    }
+
+    #[test]
+    /**
+     * @brief 상대가 끊은 메시지 스트림마다 상대 인코더에 Stream Cancellation 을 보내는지.
+     * @details 끊긴 스트림의 헤더 구역은 끝내 풀지 않는다. 알리지 않으면 상대 인코더는 그 구역이
+     *          가리키는 테이블 항목을 놓지 못한다. RFC 9204 는 끊긴 스트림과 읽기를 그만둔 스트림에
+     *          이 지시를 보내게 한다. 응답 스트림과 요청 스트림을 모두 본다.
+     */
+    fn reset_streams_cancel_their_field_sections() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+
+        let reset_response = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 reset")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 1);
+        server
+            .conn_mut()
+            .send_reset_stream_for_test(reset_response, H3_REQUEST_CANCELLED);
+        while let Some(dg) = server.next_datagram() {
+            client.recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(
+            client.take_responses(),
+            vec![(reset_response, H3Response::Unanswered)]
+        );
+        let client_decoder = client.qp.dec_sid.expect("클라이언트 디코더 스트림");
+        while let Some(dg) = client.next_datagram() {
+            server.conn_mut().recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(
+            cancelled_streams(server.conn_mut(), client_decoder),
+            vec![reset_response],
+            "끊긴 응답 스트림"
+        );
+
+        let reset_request = reset_response + 4;
+        client
+            .conn_mut()
+            .send_stream(reset_request, &request_without_path()[..1], false)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        client
+            .conn_mut()
+            .send_reset_stream_for_test(reset_request, H3_REQUEST_CANCELLED);
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        let server_decoder = server.qp.dec_sid.expect("서버 디코더 스트림");
+        while let Some(dg) = server.next_datagram() {
+            client.conn_mut().recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(
+            cancelled_streams(client.conn_mut(), server_decoder),
+            vec![reset_request],
+            "끊긴 요청 스트림"
+        );
+        assert!(!client.is_closed() && !server.is_closed());
     }
 
     /** @brief 서버 제어 스트림으로 GOAWAY 를 보낸다. 이 서버 구현은 스스로 보내지 않는다. */
@@ -2707,9 +2998,7 @@ mod tests {
             .send_stream(0, &invalid[..1], false)
             .unwrap();
         pump_h3(&mut client, &mut server);
-        client
-            .conn_mut()
-            .send_stop_sending_for_test(0, H3_REQUEST_CANCELLED);
+        client.conn_mut().stop_sending(0, H3_REQUEST_CANCELLED);
         pump_h3(&mut client, &mut server);
         client
             .conn_mut()
@@ -2737,7 +3026,7 @@ mod tests {
         assert_eq!(server.take_requests().len(), 1);
 
         let encoder = server.qp.enc_sid.expect("서버 인코더 스트림");
-        client.conn_mut().send_stop_sending_for_test(encoder, 0);
+        client.conn_mut().stop_sending(encoder, 0);
         /*
          * 서버가 돌려줄 RESET_STREAM 은 클라이언트에게도 필수 스트림 종료라서 연결 오류다.
          * 서버의 판정만 보려고 클라이언트가 보낸 것만 전달한다.
@@ -3459,6 +3748,76 @@ mod tests {
             response(&interim_head, &[]),
             "bad",
             "최종 응답 없이 끝난 응답입니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 버퍼 상한을 넘은 응답의 앞부분에서 최종 상태를 읽어 내는지.
+     * @details 중간 응답은 건너뛰고 덜 온 마지막 프레임은 보지 않는다. 최종 응답 헤더가 아직
+     *          없거나 테이블을 기다려야 하면 상태를 알 수 없다. 형식 오류는 다 받은 응답과 같은
+     *          오류다.
+     */
+    fn oversized_response_reports_its_final_status() {
+        let status = |received: Vec<u8>| {
+            oversized_response_status(&mut qpack::Decoder::new(4096), 0, received)
+        };
+        let unfinished = |mut received: Vec<u8>| {
+            received.pop();
+            received
+        };
+        let interim = encoded_headers(&[(b":status", b"103")]);
+        let not_found = encoded_headers(&[(b":status", b"404"), (b"content-type", b"text/html")]);
+        let dns = encoded_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/dns-message"),
+        ]);
+
+        assert_eq!(
+            status(unfinished(message(
+                &interim,
+                &[(FRAME_HEADERS, &not_found), (FRAME_DATA, b"page")]
+            ))),
+            Ok(Some(404))
+        );
+        assert_eq!(
+            status(unfinished(message(&dns, &[(FRAME_DATA, b"\x12\x34dns")]))),
+            Ok(Some(200))
+        );
+        assert_eq!(
+            status(unfinished(message(&not_found, &[]))),
+            Ok(None),
+            "덜 온 최종 응답 헤더"
+        );
+        assert_eq!(
+            status(message(&interim, &[])),
+            Ok(None),
+            "중간 응답뿐인 앞부분"
+        );
+        assert_eq!(
+            status(message(&interim, &[(FRAME_DATA, b"page")])),
+            Err(H3Error::Message),
+            "중간 응답 뒤의 본문"
+        );
+        let mut data_first = Vec::new();
+        encode_frame(&mut data_first, FRAME_DATA, b"page");
+        assert_eq!(
+            status(data_first),
+            Err(H3Error::FrameUnexpected),
+            "헤더보다 앞선 본문"
+        );
+
+        let mut encoder = qpack::Encoder::new();
+        encoder.set_peer_max_capacity(QPACK_CAPACITY as usize);
+        let page_head: [(&[u8], &[u8]); 2] = [(b":status", b"404"), (b"x-page", b"1")];
+        let _ = encoder.encode_field_section(&page_head);
+        /* 상대가 받았다고 확인한 것처럼 꾸며 디코더가 아직 받지 못한 항목을 참조하게 한다. */
+        encoder.on_decoder_stream(&[0x01]).unwrap();
+        let (blocked_head, _) = encoder.encode_field_section(&page_head);
+        assert_eq!(
+            status(message(&blocked_head, &[(FRAME_DATA, b"page")])),
+            Ok(None),
+            "테이블을 기다리는 최종 응답 헤더"
         );
     }
 

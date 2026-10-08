@@ -1403,10 +1403,32 @@ impl Connection {
         self.retry_scid = Some(scid.clone());
         self.retry_token = token;
 
-        for sp in &self.spaces[INITIAL].sent {
-            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sp.size);
-        }
-        self.spaces[INITIAL] = SpaceState::default();
+        /*
+         * RFC 9002 에서 Retry 를 받은 클라이언트는 손실 복구와 혼잡 제어 상태를 처음으로
+         * 되돌린다. 패킷 번호는 예외로, RFC 9000 은 어느 번호 공간에서도 되돌리지 못하게 한다.
+         * 0-RTT 키는 Retry 로 바뀌지 않으므로 번호를 되돌리면 다른 내용이 같은 nonce 로 보호된다.
+         */
+        let abandoned: u64 = self.spaces[INITIAL]
+            .sent
+            .iter()
+            .chain(&self.spaces[APP].sent)
+            .map(|sent| sent.size)
+            .sum();
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(abandoned);
+        self.pto_count = 0;
+        self.spaces[INITIAL] = SpaceState {
+            next_pn: self.spaces[INITIAL].next_pn,
+            ..SpaceState::default()
+        };
+        /*
+         * Retry 를 보낸 서버는 앞서 받은 0-RTT 를 버렸다. 서버의 Initial 을 받기 전이라 응용
+         * 공간에는 0-RTT 패킷만 있으므로, 그 기록을 지우고 조기 프레임을 처음부터 다시 보낸다.
+         * 손실 판정에 맡기면 응용 공간의 PTO 는 핸드셰이크가 확정된 뒤에야 걸린다.
+         */
+        self.spaces[APP].sent.clear();
+        self.spaces[APP].rtx.clear();
+        self.spaces[APP].loss_time_ms = None;
+        self.out_frames_early = self.early_backup.clone();
 
         self.install_initial_keys(&scid);
         self.spaces[INITIAL].out_crypto = self.initial_crypto.clone();
@@ -3428,7 +3450,11 @@ impl Connection {
         /* 짧은 헤더인지, Initial 인지, 패킷 바이트. */
         let mut packets: Vec<(bool, bool, Vec<u8>)> = Vec::new();
 
-        let pad = if self.role == Role::Client && self.spaces[INITIAL].next_pn == 0 {
+        /*
+         * Retry 뒤에도 패킷 번호는 이어지므로, 연결의 첫 Initial 과 Retry 뒤의 첫 Initial 은 번호가
+         * 아니라 ClientHello 를 처음부터 싣는지로 가린다.
+         */
+        let pad = if self.role == Role::Client && self.spaces[INITIAL].send_crypto_offset == 0 {
             MIN_INITIAL_DATAGRAM
         } else {
             0
@@ -3565,12 +3591,16 @@ impl Connection {
         }
     }
 
-    #[cfg(test)]
     /**
-     * @brief 상대에게 STOP_SENDING 을 보낸다.
-     * @note 이 구현은 스트림을 스스로 취소하지 않는다. 상대가 취소하는 상황을 시험에서 만들 때만 쓴다.
+     * @brief 이 스트림을 더 읽지 않는다고 상대에게 STOP_SENDING 으로 알린다.
+     * @details 상대는 RESET_STREAM 으로 보내는 쪽을 끊는다. 그 전에 상대가 보낸 데이터는 그대로
+     *          도착하므로 버리는 일은 부른 쪽이 맡는다. 이미 다 받았거나 끊긴 스트림에는 보내지
+     *          않는다.
      */
-    pub(crate) fn send_stop_sending_for_test(&mut self, id: u64, error_code: u64) {
+    pub fn stop_sending(&mut self, id: u64, error_code: u64) {
+        if self.closed || self.recv_stream_closed(id) {
+            return;
+        }
         self.queue_app_frame(Frame::StopSending { id, error_code });
         self.flush();
     }
@@ -7057,6 +7087,37 @@ mod tests {
 
     #[test]
     /**
+     * @brief 받는 중인 스트림에만 STOP_SENDING 을 보내는지.
+     * @details 다 받은 스트림에는 거절할 데이터가 없고, RFC 9000 은 RESET_STREAM 을 받은 스트림에
+     *          STOP_SENDING 을 보내지 말라고 한다.
+     */
+    fn stop_sending_skips_streams_that_already_ended() {
+        let mut conn = Connection::new_server(
+            server_cfg(vec![b"h3".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        conn.on_stream(0, 0, true, b"request".to_vec()).unwrap();
+        conn.take_readable();
+        conn.on_stream(4, 0, false, b"partial".to_vec()).unwrap();
+        conn.on_reset_stream(4, 0x010c, 7).unwrap();
+        conn.on_stream(8, 0, false, b"partial".to_vec()).unwrap();
+        for id in [0, 4, 8] {
+            conn.stop_sending(id, 0x010c);
+        }
+        let stopped: Vec<u64> = conn
+            .out_frames_app
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::StopSending { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stopped, [8]);
+    }
+
+    #[test]
+    /**
      * @brief 보내는 쪽을 가리키는 STOP_SENDING 과 MAX_STREAM_DATA 가 스트림 방향과 수 제한을
      *        따르는지.
      * @details 상대가 여는 양방향 스트림은 이 두 프레임으로도 열린다. 중단 요청에는 RESET_STREAM
@@ -8557,6 +8618,87 @@ mod tests {
             client2.recv_datagram(&dg).unwrap();
         }
         assert_eq!(client2.take_stream_requests().len(), 1);
+    }
+
+    #[test]
+    /**
+     * @brief Retry 를 받은 클라이언트가 패킷 번호를 이어 쓰고 조기 데이터를 바로 다시 보내는지.
+     * @details RFC 9000 은 Retry 뒤에 어느 번호 공간의 패킷 번호도 되돌리지 못하게 한다. 0-RTT 키는
+     *          Retry 로 바뀌지 않으므로 번호를 되돌리면 다른 내용이 같은 nonce 로 보호된다.
+     *          Retry 를 보낸 서버는 앞서 받은 0-RTT 를 버렸으므로, 손실 판정을 기다리면 질의가
+     *          PTO 만큼 늦는다.
+     */
+    fn retry_keeps_packet_numbers_and_resends_early_data() {
+        use crate::retry::{build_retry, parse_initial_header, RetryKey};
+
+        let mut res = onetdns_tls::conn::ServerResumption::secure_default();
+        res.max_early_data = 0xffff_ffff;
+        let mut cfg = client_cfg(vec![b"doq".to_vec()]);
+        cfg.session = Some(obtain_session(&res));
+        cfg.enable_early_data = true;
+        let mut client = Connection::new_client(
+            cfg,
+            b"ORIGDCID".to_vec(),
+            b"CLNTSCID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let query = b"\x00\x00 QUERY-BEFORE-RETRY";
+        client.send_dns_message(0, query).unwrap();
+        let first_flight: Vec<Vec<u8>> = std::iter::from_fn(|| client.next_datagram()).collect();
+        let used = [client.spaces[INITIAL].next_pn, client.spaces[APP].next_pn];
+        assert!(
+            used.iter().all(|&next| next > 0),
+            "Initial 과 0-RTT 를 모두 보내지 않아 재려던 것을 재지 못했습니다: {used:?}"
+        );
+
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let header = parse_initial_header(&first_flight[0]).expect("Initial 파싱");
+        let retry_scid = b"RETRYCID".to_vec();
+        let token = RetryKey::generate().issue(ip, header.dcid, &retry_scid, 1_000);
+        let retry = build_retry(header.dcid, header.scid, &retry_scid, &token);
+        client.recv_datagram(&retry).unwrap();
+
+        let mut tp = TransportParams::server_defaults();
+        tp.original_destination_connection_id = Some(b"ORIGDCID".to_vec());
+        tp.retry_source_connection_id = Some(retry_scid);
+        let mut server =
+            Connection::new_server(server_cfg_resumable(&res), b"AFTERRTY".to_vec(), tp);
+        for dg in std::iter::from_fn(|| client.next_datagram()) {
+            if packet_kinds(&dg).contains(&"Initial") {
+                assert_eq!(
+                    dg.len(),
+                    MIN_INITIAL_DATAGRAM,
+                    "Retry 뒤 Initial 의 데이터그램 크기"
+                );
+            }
+            server.recv_datagram(&dg).unwrap();
+        }
+        assert!(!server.is_handshake_complete());
+        assert_eq!(
+            server.take_stream_requests(),
+            vec![(0, query.to_vec())],
+            "Retry 앞에 보낸 0-RTT 질의를 곧바로 다시 보내지 않았습니다"
+        );
+        for (space, first_unused) in [INITIAL, APP].into_iter().zip(used) {
+            let state = &server.spaces[space];
+            /* recv_mask 의 비트 i 는 largest_recv - i 번 패킷이다. */
+            let lowest = state.largest_recv.map(|largest| {
+                largest - u64::from(u128::BITS - 1 - state.recv_mask.leading_zeros())
+            });
+            assert!(
+                lowest.is_some_and(|pn| pn >= first_unused),
+                "Retry 뒤에 {first_unused} 보다 작은 패킷 번호를 다시 썼습니다: {lowest:?}"
+            );
+        }
+
+        pump(&mut client, &mut server);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
+        assert!(client.early_data_accepted() && server.early_data_accepted());
+        assert!(
+            server.take_stream_requests().is_empty(),
+            "같은 질의가 두 번 전달됐습니다"
+        );
     }
 
     #[test]

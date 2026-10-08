@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::frame::{flags, frame_type, settings, DEFAULT_MAX_FRAME};
+use crate::frame::{error_code, flags, frame_type, settings, DEFAULT_MAX_FRAME};
 use crate::hpack::{self, Decoder};
 use crate::wire::{read_frame, send_frame, strip_headers, strip_padding};
 use crate::{valid_header_field, H2Error};
@@ -12,9 +12,35 @@ const MAX_DNS_RESPONSE: usize = u16::MAX as usize;
 const MAX_RESPONSE_HEADERS: usize = 32 * 1024;
 
 /**
+ * @brief 끊은 뒤에도 기억해 둘 스트림 수.
+ * @details RFC 9113 은 이쪽이 끊은 스트림의 프레임을 버리는 기간을 제한해도 된다고 한다.
+ *          서버는 RST_STREAM 을 읽은 뒤로 그 스트림에 보내지 않으므로 늦은 프레임은 끊은 직후
+ *          몇 질의 안에 도착한다. 잊은 스트림의 프레임은 모르는 스트림의 프레임처럼 프로토콜
+ *          오류다.
+ */
+const MAX_CANCELLED_STREAMS: usize = 8;
+
+/**
+ * @brief 응답 헤더와 트레일러에 올 수 없는 연결 전용 필드인지.
+ * @details TE 는 요청에만 trailers 값으로 올 수 있으므로 응답 쪽에서는 함께 거부한다.
+ */
+fn is_connection_specific(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"connection"
+            | b"proxy-connection"
+            | b"keep-alive"
+            | b"te"
+            | b"transfer-encoding"
+            | b"upgrade"
+    )
+}
+
+/**
  * @brief 응답 헤더에서 상태와 본문 길이를 뽑고 검사한다.
  * @details :status는 정확히 하나여야 한다. 중복 의사 헤더를 허용하면 어느 값이 유효한지가
- *          구현마다 갈린다. 200 응답은 content-type이 application/dns-message 하나여야 하고
+ *          구현마다 갈린다. 1xx 중간 응답과 최종 응답이 같은 규칙을 따르고, HTTP/2 에는 101
+ *          응답이 없다. 200 응답은 content-type이 application/dns-message 하나여야 하고
  *          본문이 DNS 메시지 상한 안이어야 한다. 200이 아닌 응답은 본문을 읽지 않으므로 그
  *          둘을 보지 않는다. 404 text/html 같은 답을 여기서 거부하면 상태 오류가 프로토콜
  *          오류로 바뀐다.
@@ -43,7 +69,7 @@ fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usiz
             let parsed = ((value[0] - b'0') as u16) * 100
                 + ((value[1] - b'0') as u16) * 10
                 + (value[2] - b'0') as u16;
-            if !(200..=599).contains(&parsed) {
+            if !(100..=599).contains(&parsed) || parsed == 101 {
                 return None;
             }
             status = Some(parsed);
@@ -51,17 +77,7 @@ fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usiz
         }
 
         regular_seen = true;
-        if name.iter().any(u8::is_ascii_uppercase)
-            || matches!(
-                name.as_slice(),
-                b"connection"
-                    | b"proxy-connection"
-                    | b"keep-alive"
-                    | b"te"
-                    | b"transfer-encoding"
-                    | b"upgrade"
-            )
-        {
+        if name.iter().any(u8::is_ascii_uppercase) || is_connection_specific(name) {
             return None;
         }
         if name == b"content-length" {
@@ -90,6 +106,30 @@ fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usiz
 }
 
 /**
+ * @brief 트레일러 구역이 규칙을 지키는지 본다.
+ * @details 의사 헤더와 연결 전용 필드는 트레일러에 올 수 없다. 이쪽이 광고한 헤더 목록
+ *          상한은 트레일러에도 걸린다. 트레일러의 값은 DNS 응답을 해석하는 데 쓰지 않는다.
+ */
+fn valid_trailer_section(fields: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    let mut size = 0usize;
+    fields.iter().all(|(name, value)| {
+        size = size.saturating_add(name.len() + value.len() + 32);
+        size <= MAX_RESPONSE_HEADERS
+            && valid_header_field(name, value)
+            && !name.starts_with(b":")
+            && !is_connection_specific(name)
+    })
+}
+
+/** @brief 끝난 응답의 본문을 돌려준다. 알린 길이와 다르면 프로토콜 오류다. */
+fn complete_body(body: Vec<u8>, content_length: Option<usize>) -> Result<Vec<u8>, H2Error> {
+    if content_length.is_some_and(|length| length != body.len()) {
+        return Err(H2Error::Protocol);
+    }
+    Ok(body)
+}
+
+/**
  * @brief DoH 업스트림에 붙는 HTTP/2 클라이언트.
  * @details 전송 계층(TLS)은 S가 담당한다. 이 타입은 프레이밍과 헤더만 다룬다.
  */
@@ -105,6 +145,12 @@ pub struct H2Client<S> {
 
     /** @brief 상대의 첫 SETTINGS를 받았는지. 프로토콜 준수 확인용이다. */
     peer_settings_seen: bool,
+
+    /**
+     * @brief 본문을 읽지 않고 끊은 스트림. 서버가 끊김을 알기 전에 보낸 프레임은 여기 있는
+     *        동안 버린다.
+     */
+    cancelled: Vec<u32>,
 }
 
 impl<S: Read + Write> H2Client<S> {
@@ -130,6 +176,7 @@ impl<S: Read + Write> H2Client<S> {
             dec: Decoder::new(4096),
             next_id: 1,
             peer_settings_seen: false,
+            cancelled: Vec::new(),
         })
     }
 
@@ -284,11 +331,34 @@ impl<S: Read + Write> H2Client<S> {
     }
 
     /**
+     * @brief 본문을 읽지 않을 스트림을 CANCEL 로 끊고 기억해 둔다.
+     * @details 끊지 않으면 서버는 아무도 읽지 않을 본문을 계속 보내고, 스트림 윈도우가 차면
+     *          그 스트림을 연 채로 붙잡아 동시 스트림 한도를 하나 차지한다.
+     */
+    fn cancel(&mut self, sid: u32) -> Result<(), H2Error> {
+        send_frame(
+            &mut self.stream,
+            frame_type::RST_STREAM,
+            0,
+            sid,
+            &error_code::CANCEL.to_be_bytes(),
+        )?;
+        if self.cancelled.len() == MAX_CANCELLED_STREAMS {
+            self.cancelled.remove(0);
+        }
+        self.cancelled.push(sid);
+        Ok(())
+    }
+
+    /**
      * @brief 이쪽 스트림의 응답을 다 받을 때까지 프레임을 읽는다.
      *
      * @details 다른 스트림의 프레임과 제어 프레임(SETTINGS·PING·WINDOW_UPDATE)은 규칙대로
-     *          처리하고 넘어간다. 본문은 content-length가 있으면 그 값에서, 없으면
+     *          처리하고 넘어간다. 응답은 1xx 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인
+     *          트레일러 하나 순서로 온다. 본문은 content-length가 있으면 그 값에서, 없으면
      *          절대 상한에서 잘린다. 끝없이 보내는 업스트림이 메모리를 먹지 못하게 한다.
+     * @retval H2Error::BadStatus 최종 응답이 200 이 아니다. 본문은 읽지 않고 그 스트림만
+     *         끊으므로 연결은 계속 쓸 수 있다.
      */
     fn read_response(
         &mut self,
@@ -297,7 +367,7 @@ impl<S: Read + Write> H2Client<S> {
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
         let mut body = Vec::new();
-        let mut status_ok: Option<bool> = None;
+        let mut final_seen = false;
         let mut content_length: Option<usize> = None;
         let mut on_alive = Some(on_alive);
         loop {
@@ -385,26 +455,45 @@ impl<S: Read + Write> H2Client<S> {
                 }
                 frame_type::PRIORITY => {}
                 frame_type::HEADERS if h.stream_id == sid => {
-                    if status_ok.is_some() || !h.has_flag(flags::END_HEADERS) {
+                    if !h.has_flag(flags::END_HEADERS) {
                         return Err(H2Error::Protocol);
                     }
                     let blk = strip_headers(&payload, h.flags)?;
                     let hs = self.dec.decode(blk).ok_or(H2Error::Protocol)?;
-                    let (status, length) = response_metadata(&hs).ok_or(H2Error::Protocol)?;
-                    status_ok = Some(status == 200);
-                    content_length = length;
-                    if status_ok != Some(true) {
-                        return Err(H2Error::BadStatus);
-                    }
-                    if h.has_flag(flags::END_STREAM) {
-                        if content_length.is_some_and(|length| length != body.len()) {
+                    let end_stream = h.has_flag(flags::END_STREAM);
+                    if final_seen {
+                        /* 최종 응답 뒤의 HEADERS 는 트레일러이고, 트레일러는 스트림을 끝낸다. */
+                        if !end_stream || !valid_trailer_section(&hs) {
                             return Err(H2Error::Protocol);
                         }
-                        return Ok(body);
+                        return complete_body(body, content_length);
+                    }
+                    let (status, length) = response_metadata(&hs).ok_or(H2Error::Protocol)?;
+                    match status {
+                        /*
+                         * 중간 응답은 최종 응답을 기다리게 할 뿐 본문이 없고 스트림을 끝내지
+                         * 않는다.
+                         */
+                        100..=199 if end_stream => return Err(H2Error::Protocol),
+                        100..=199 => {}
+                        200 => {
+                            final_seen = true;
+                            content_length = length;
+                            if end_stream {
+                                return complete_body(body, content_length);
+                            }
+                        }
+                        _ => {
+                            /* 서버가 끝낸 스트림은 이미 닫혔으므로 끊을 것이 없다. */
+                            if !end_stream {
+                                self.cancel(sid)?;
+                            }
+                            return Err(H2Error::BadStatus);
+                        }
                     }
                 }
                 frame_type::DATA if h.stream_id == sid => {
-                    if status_ok != Some(true) {
+                    if !final_seen {
                         return Err(H2Error::Protocol);
                     }
                     let data = strip_padding(&payload, h.flags)?;
@@ -419,11 +508,23 @@ impl<S: Read + Write> H2Client<S> {
                         !h.has_flag(flags::END_STREAM),
                     );
                     if h.has_flag(flags::END_STREAM) {
-                        if content_length.is_some_and(|length| length != body.len()) {
-                            return Err(H2Error::Protocol);
-                        }
-                        return Ok(body);
+                        return complete_body(body, content_length);
                     }
+                }
+                frame_type::DATA if self.cancelled.contains(&h.stream_id) => {
+                    /*
+                     * 끊은 스트림의 본문도 연결 윈도우를 쓴다. 버린 만큼 돌려주지 않으면 오류
+                     * 응답이 쌓일수록 연결 윈도우가 줄어 결국 응답이 멈춘다.
+                     */
+                    self.replenish_receive_window(h.stream_id, payload.len(), false)?;
+                }
+                frame_type::HEADERS if self.cancelled.contains(&h.stream_id) => {
+                    /* 버릴 헤더도 풀어야 HPACK 동적 테이블이 서버와 맞는다. */
+                    if !h.has_flag(flags::END_HEADERS) {
+                        return Err(H2Error::Protocol);
+                    }
+                    let blk = strip_headers(&payload, h.flags)?;
+                    self.dec.decode(blk).ok_or(H2Error::Protocol)?;
                 }
                 frame_type::HEADERS
                 | frame_type::DATA
@@ -439,9 +540,10 @@ impl<S: Read + Write> H2Client<S> {
 /** @brief 헤더와 본문 검증, 흐름 제어, 그리고 실제 왕복. */
 mod tests {
     use super::*;
+    use crate::frame::FrameHeader;
     use crate::serve_doh;
     use crate::testutil::{deadline_accept, deadline_connect};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     /** @brief 테스트용 헤더 목록. */
@@ -509,45 +611,21 @@ mod tests {
     #[test]
     /** @brief DoH 경로를 모르는 웹 서버의 404 text/html 답이 상태 오류로 끝나는지. */
     fn error_page_yields_bad_status() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut stream = deadline_accept(&listener);
-            let mut preface = [0u8; 24];
-            stream.read_exact(&mut preface).unwrap();
-            assert_eq!(preface, crate::frame::PREFACE);
-            send_frame(&mut stream, frame_type::SETTINGS, 0, 0, &[]).unwrap();
-            loop {
-                let (header, _) = read_frame(&mut stream).unwrap();
-                if header.stream_id == 1 && header.has_flag(flags::END_STREAM) {
-                    break;
-                }
-            }
-            let page = b"<html>not here</html>";
-            let length = page.len().to_string();
-            let block = hpack::encode_response(&[
-                (":status", "404"),
-                ("content-type", "text/html"),
-                ("content-length", length.as_str()),
-            ]);
-            send_frame(
-                &mut stream,
-                frame_type::HEADERS,
-                flags::END_HEADERS,
-                1,
-                &block,
-            )
-            .unwrap();
-            /* 클라이언트는 헤더만 보고 끊을 수 있으므로 본문 전송 실패는 상관없다. */
-            let _ = send_frame(&mut stream, frame_type::DATA, flags::END_STREAM, 1, page);
-        });
-
-        let tcp = deadline_connect(addr);
-        let mut client = H2Client::connect(tcp).unwrap();
-        let result = client.query("dns.test", "/dns-query", b"query");
+        let page = b"<html>not here</html>";
+        let length = page.len().to_string();
+        let head = hpack::encode_response(&[
+            (":status", "404"),
+            ("content-type", "text/html"),
+            ("content-length", length.as_str()),
+        ]);
+        let result = scripted_response(
+            true,
+            &[
+                (frame_type::HEADERS, flags::END_HEADERS, 1, &head),
+                (frame_type::DATA, flags::END_STREAM, 1, page),
+            ],
+        );
         assert!(matches!(result, Err(H2Error::BadStatus)), "{result:?}");
-        drop(client);
-        server.join().unwrap();
     }
 
     #[test]
@@ -625,17 +703,25 @@ mod tests {
         server.join().unwrap();
     }
 
-    /** @brief 상대가 보낸 프레임을 처리한 결과. */
-    fn peer_frame_result(
+    /** @brief 서버가 보낼 프레임 하나: 종류, 플래그, 스트림 번호, 페이로드. */
+    type ScriptedFrame<'a> = (u8, u8, u32, &'a [u8]);
+
+    /**
+     * @brief 첫 요청에 정해 둔 프레임을 차례로 보내는 서버와 질의 하나를 주고받은 결과.
+     * @param send_settings_first 요청을 읽기 전에 빈 SETTINGS 를 보낼지.
+     */
+    fn scripted_response(
         send_settings_first: bool,
-        frame_type: u8,
-        frame_flags: u8,
-        stream_id: u32,
-        payload: &[u8],
+        frames: &[ScriptedFrame],
     ) -> Result<Vec<u8>, H2Error> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let payload = payload.to_vec();
+        let frames: Vec<(u8, u8, u32, Vec<u8>)> = frames
+            .iter()
+            .map(|&(kind, frame_flags, stream_id, payload)| {
+                (kind, frame_flags, stream_id, payload.to_vec())
+            })
+            .collect();
         let server = thread::spawn(move || {
             let mut stream = deadline_accept(&listener);
             stream
@@ -647,13 +733,11 @@ mod tests {
             if send_settings_first {
                 send_frame(&mut stream, frame_type::SETTINGS, 0, 0, &[]).unwrap();
             }
-            loop {
-                let (header, _) = read_frame(&mut stream).unwrap();
-                if header.stream_id == 1 && header.has_flag(flags::END_STREAM) {
-                    break;
-                }
+            read_request(&mut stream, 1);
+            for (kind, frame_flags, stream_id, payload) in &frames {
+                /* 클라이언트는 앞 프레임에서 오류를 내고 닫을 수 있어 보내기 실패는 상관없다. */
+                let _ = send_frame(&mut stream, *kind, *frame_flags, *stream_id, payload);
             }
-            send_frame(&mut stream, frame_type, frame_flags, stream_id, &payload).unwrap();
             let mut byte = [0u8; 1];
             while stream.read(&mut byte).is_ok_and(|read| read != 0) {}
         });
@@ -668,15 +752,48 @@ mod tests {
         result
     }
 
+    /** @brief 서문을 확인하고 빈 SETTINGS 를 보낸 서버 쪽 연결. */
+    fn accept_client(listener: &TcpListener) -> TcpStream {
+        let mut stream = deadline_accept(listener);
+        let mut preface = [0u8; 24];
+        stream.read_exact(&mut preface).unwrap();
+        assert_eq!(preface, crate::frame::PREFACE);
+        send_frame(&mut stream, frame_type::SETTINGS, 0, 0, &[]).unwrap();
+        stream
+    }
+
+    /** @brief 요청 스트림이 끝날 때까지 읽는다. 그사이 받은 다른 스트림의 프레임을 돌려준다. */
+    fn read_request(stream: &mut TcpStream, sid: u32) -> Vec<(FrameHeader, Vec<u8>)> {
+        let mut others = Vec::new();
+        loop {
+            let (header, payload) = read_frame(stream).unwrap();
+            if header.stream_id != sid {
+                others.push((header, payload));
+            } else if header.has_flag(flags::END_STREAM) {
+                return others;
+            }
+        }
+    }
+
+    /** @brief 헤더 블록 하나를 HEADERS 프레임 하나로 보낸다. */
+    fn send_headers(stream: &mut TcpStream, sid: u32, block: &[u8], end_stream: bool) {
+        let frame_flags = if end_stream {
+            flags::END_HEADERS | flags::END_STREAM
+        } else {
+            flags::END_HEADERS
+        };
+        send_frame(stream, frame_type::HEADERS, frame_flags, sid, block).unwrap();
+    }
+
     #[test]
     /** @brief 상대의 첫 프레임이 규격대로인지 확인하는지. */
     fn first_peer_frame_must_be_non_ack_settings() {
         assert!(matches!(
-            peer_frame_result(false, frame_type::PING, 0, 0, &[0; 8]),
+            scripted_response(false, &[(frame_type::PING, 0, 0, &[0; 8])]),
             Err(H2Error::Protocol)
         ));
         assert!(matches!(
-            peer_frame_result(false, frame_type::SETTINGS, flags::ACK, 0, &[]),
+            scripted_response(false, &[(frame_type::SETTINGS, flags::ACK, 0, &[])]),
             Err(H2Error::Protocol)
         ));
     }
@@ -694,12 +811,254 @@ mod tests {
             (frame_type::PRIORITY, 0, 0, &[0; 5]),
             (frame_type::WINDOW_UPDATE, 0, 0, &[0; 4]),
         ];
-        for &(kind, frame_flags, stream_id, payload) in malformed {
+        for &frame in malformed {
             assert!(matches!(
-                peer_frame_result(true, kind, frame_flags, stream_id, payload),
+                scripted_response(true, &[frame]),
                 Err(H2Error::Protocol)
             ));
         }
+    }
+
+    #[test]
+    /**
+     * @brief 최종 응답 앞의 1xx 중간 응답과 본문 뒤의 트레일러를 받아들이는지.
+     * @details RFC 9113 의 응답은 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인 트레일러
+     *          하나로 이루어진다. 거부하면 규격대로 온 답이 프로토콜 오류가 되어 연결을 버린다.
+     */
+    fn interim_responses_and_trailers_are_accepted() {
+        let continue_head = hpack::encode_response(&[(":status", "100")]);
+        let early_hints =
+            hpack::encode_response(&[(":status", "103"), ("link", "</dns>; rel=preload")]);
+        let head = hpack::encode_response(&[
+            (":status", "200"),
+            ("content-type", "application/dns-message"),
+            ("content-length", "6"),
+        ]);
+        let trailer = hpack::encode_response(&[("x-checksum", "abc")]);
+        let result = scripted_response(
+            true,
+            &[
+                (frame_type::HEADERS, flags::END_HEADERS, 1, &continue_head),
+                (frame_type::HEADERS, flags::END_HEADERS, 1, &early_hints),
+                (frame_type::HEADERS, flags::END_HEADERS, 1, &head),
+                (frame_type::DATA, 0, 1, b"answer"),
+                (
+                    frame_type::HEADERS,
+                    flags::END_HEADERS | flags::END_STREAM,
+                    1,
+                    &trailer,
+                ),
+            ],
+        );
+        assert!(
+            matches!(&result, Ok(body) if body == b"answer"),
+            "중간 응답과 트레일러가 붙은 응답을 받지 못했습니다: {result:?}"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 중간 응답과 트레일러가 순서나 필드 규칙을 어기면 거부하는지.
+     * @details HTTP/2 에는 101 응답이 없다. 중간 응답은 스트림을 끝낼 수 없고 본문을 앞세우지
+     *          못한다. 트레일러는 스트림을 끝내야 하고 의사 헤더와 연결 전용 필드를 싣지 못한다.
+     *          트레일러로 끝나도 알린 본문 길이는 맞아야 한다.
+     */
+    fn interim_and_trailer_violations_are_rejected() {
+        const MORE: u8 = flags::END_HEADERS;
+        const END: u8 = flags::END_HEADERS | flags::END_STREAM;
+        let headers = frame_type::HEADERS;
+        let data = frame_type::DATA;
+        let interim = hpack::encode_response(&[(":status", "103")]);
+        let switching = hpack::encode_response(&[(":status", "101")]);
+        let head = hpack::encode_response(&[
+            (":status", "200"),
+            ("content-type", "application/dns-message"),
+        ]);
+        let longer_head = hpack::encode_response(&[
+            (":status", "200"),
+            ("content-type", "application/dns-message"),
+            ("content-length", "7"),
+        ]);
+        let trailer = hpack::encode_response(&[("x-checksum", "abc")]);
+        let pseudo_trailer = hpack::encode_response(&[(":status", "200")]);
+        let connection_trailer = hpack::encode_response(&[("connection", "close")]);
+        let te_trailer = hpack::encode_response(&[("te", "trailers")]);
+        let with_trailer = |head: &[u8], trailer: &[u8], trailer_flags: u8| {
+            vec![
+                (headers, MORE, 1, head.to_vec()),
+                (data, 0, 1, b"answer".to_vec()),
+                (headers, trailer_flags, 1, trailer.to_vec()),
+            ]
+        };
+        let cases = [
+            (
+                "101 응답",
+                vec![
+                    (headers, MORE, 1, switching),
+                    (headers, MORE, 1, head.clone()),
+                    (data, flags::END_STREAM, 1, b"answer".to_vec()),
+                ],
+            ),
+            (
+                "스트림을 끝낸 중간 응답",
+                vec![(headers, END, 1, interim.clone())],
+            ),
+            (
+                "최종 응답 없이 중간 응답 뒤에 온 본문",
+                vec![
+                    (headers, MORE, 1, interim),
+                    (data, flags::END_STREAM, 1, b"answer".to_vec()),
+                ],
+            ),
+            (
+                "스트림을 끝내지 않은 트레일러",
+                with_trailer(&head, &trailer, MORE),
+            ),
+            (
+                "의사 헤더를 실은 트레일러",
+                with_trailer(&head, &pseudo_trailer, END),
+            ),
+            (
+                "연결 전용 필드를 실은 트레일러",
+                with_trailer(&head, &connection_trailer, END),
+            ),
+            ("TE 를 실은 트레일러", with_trailer(&head, &te_trailer, END)),
+            (
+                "알린 길이보다 짧은 본문",
+                with_trailer(&longer_head, &trailer, END),
+            ),
+        ];
+        for (case, frames) in cases {
+            let frames: Vec<ScriptedFrame> = frames
+                .iter()
+                .map(|(kind, frame_flags, stream_id, payload)| {
+                    (*kind, *frame_flags, *stream_id, payload.as_slice())
+                })
+                .collect();
+            let result = scripted_response(true, &frames);
+            assert!(
+                matches!(result, Err(H2Error::Protocol)),
+                "{case}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 오류 상태를 받은 스트림만 끊고 같은 연결로 다음 질의를 주고받는지.
+     * @details 클라이언트는 오류 응답의 본문을 읽지 않고 그 스트림을 CANCEL 로 끊는다. 서버가
+     *          끊김을 알기 전에 보낸 본문과 트레일러는 다음 질의를 읽는 동안 도착한다. 본문은
+     *          버리되 연결 윈도우를 돌려줘야 하고, 트레일러는 버리더라도 풀어야 HPACK 동적
+     *          테이블이 서버와 맞는다. 서버는 그 테이블에 넣은 필드를 다음 응답에서 번호로
+     *          가리킨다.
+     */
+    fn error_status_cancels_only_that_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let page = vec![b'x'; 3000];
+        let page_len = page.len();
+        let server = thread::spawn(move || {
+            let mut stream = accept_client(&listener);
+            read_request(&mut stream, 1);
+            let error_head =
+                hpack::encode_response(&[(":status", "404"), ("content-type", "text/html")]);
+            send_headers(&mut stream, 1, &error_head, false);
+            send_frame(&mut stream, frame_type::DATA, 0, 1, &page).unwrap();
+            /* 새 이름의 리터럴을 동적 테이블에 넣는 트레일러. 넣은 항목은 62번이 된다. */
+            let mut trailer = vec![0x40, 9];
+            trailer.extend_from_slice(b"x-trailer");
+            trailer.extend_from_slice(&[1, b't']);
+            send_headers(&mut stream, 1, &trailer, true);
+
+            let mut received = read_request(&mut stream, 3);
+            let mut head = hpack::encode_response(&[
+                (":status", "200"),
+                ("content-type", "application/dns-message"),
+            ]);
+            head.push(0x80 | 62);
+            send_headers(&mut stream, 3, &head, false);
+            send_frame(
+                &mut stream,
+                frame_type::DATA,
+                flags::END_STREAM,
+                3,
+                b"answer",
+            )
+            .unwrap();
+            while let Ok(frame) = read_frame(&mut stream) {
+                received.push(frame);
+            }
+            received
+        });
+
+        let mut client = H2Client::connect(deadline_connect(addr)).unwrap();
+        let first = client.query("dns.test", "/dns-query", b"one");
+        assert!(matches!(first, Err(H2Error::BadStatus)), "{first:?}");
+        let second = client.query("dns.test", "/dns-query", b"two");
+        assert!(
+            matches!(&second, Ok(body) if body == b"answer"),
+            "오류 상태를 받은 연결로 다음 질의를 주고받지 못했습니다: {second:?}"
+        );
+        drop(client);
+
+        let received = server.join().unwrap();
+        assert!(
+            received.iter().any(|(header, payload)| {
+                header.frame_type == frame_type::RST_STREAM
+                    && header.stream_id == 1
+                    && payload[..] == crate::frame::error_code::CANCEL.to_be_bytes()
+            }),
+            "오류 응답의 스트림을 CANCEL 로 끊지 않았습니다"
+        );
+        let returned: usize = received
+            .iter()
+            .filter(|(header, _)| {
+                header.frame_type == frame_type::WINDOW_UPDATE && header.stream_id == 0
+            })
+            .map(|(_, payload)| u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize)
+            .sum();
+        assert_eq!(
+            returned,
+            page_len + b"answer".len(),
+            "받은 본문만큼 연결 윈도우를 돌려주지 않았습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 서버가 스트림을 끝낸 오류 응답에는 RST_STREAM 을 보내지 않는지.
+     * @details 양쪽이 END_STREAM 을 보낸 스트림은 닫혔다. RFC 9113 은 닫힌 스트림에 PRIORITY
+     *          말고는 어떤 프레임도 보내지 못하게 한다.
+     */
+    fn ended_error_response_is_not_reset() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = accept_client(&listener);
+            let mut received = read_request(&mut stream, 1);
+            send_headers(
+                &mut stream,
+                1,
+                &hpack::encode_response(&[(":status", "503")]),
+                true,
+            );
+            while let Ok(frame) = read_frame(&mut stream) {
+                received.push(frame);
+            }
+            received
+        });
+
+        let mut client = H2Client::connect(deadline_connect(addr)).unwrap();
+        let result = client.query("dns.test", "/dns-query", b"query");
+        assert!(matches!(result, Err(H2Error::BadStatus)), "{result:?}");
+        drop(client);
+        let received = server.join().unwrap();
+        assert!(
+            !received
+                .iter()
+                .any(|(header, _)| header.frame_type == frame_type::RST_STREAM),
+            "닫힌 스트림에 RST_STREAM 을 보냈습니다"
+        );
     }
 
     #[test]
@@ -741,6 +1100,23 @@ mod tests {
         client.next_id = 0x7fff_ffff;
         assert!(matches!(client.allocate_stream_id(), Ok(0x7fff_ffff)));
         assert!(matches!(client.allocate_stream_id(), Err(H2Error::Closed)));
+    }
+
+    #[test]
+    /**
+     * @brief 끊은 스트림 목록이 상한을 넘지 않는지.
+     * @details 오류 상태만 내는 서버와 연결을 오래 쓰면 목록이 질의마다 하나씩 자란다.
+     */
+    fn cancelled_streams_are_bounded() {
+        let mut client = H2Client::connect(std::io::Cursor::new(Vec::new())).unwrap();
+        for sid in (1..).step_by(2).take(MAX_CANCELLED_STREAMS + 1) {
+            client.cancel(sid).unwrap();
+        }
+        assert_eq!(client.cancelled.len(), MAX_CANCELLED_STREAMS);
+        assert!(
+            !client.cancelled.contains(&1),
+            "가장 오래전에 끊은 스트림을 잊지 않았습니다"
+        );
     }
 
     #[test]

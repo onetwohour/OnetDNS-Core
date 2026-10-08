@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
-use onetdns_http2::H2Client;
+use onetdns_http2::{H2Client, H2Error};
 use onetdns_proto::Message;
 use onetdns_tls::{client_handshake, ClientConfig, TlsSession, TlsStream, TrustStore};
 
@@ -39,7 +39,10 @@ const MAX_CACHED_SESSIONS: usize = 64;
 /**
  * @brief DoH로 질의를 교환한다.
  * @details 재사용 연결에는 PING을 함께 보내 두 단계 데드라인을 만든다. 죽은 연결이면 빨리
- *          포기하고, 살아 있으면 업스트림의 해석 시간을 기다려 준다.
+ *          포기하고, 살아 있으면 업스트림의 해석 시간을 기다려 준다. 연결이 실패하면 풀에서
+ *          빼고 새 연결로 한 번 더 보낸다. 서버가 오류 상태로 답했으면 연결을 그대로 두고 다시
+ *          보내지 않는다. 오류 상태는 서버가 내린 답이라 새 연결로 다시 물어도 달라지지 않고,
+ *          429 와 503 은 곧바로 다시 묻지 말라는 뜻이기도 하다.
  */
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
@@ -78,7 +81,7 @@ pub(crate) fn exchange(
                 SESSIONS.with(|sessions| sessions.borrow_mut().put(session_key.clone(), session));
             }
             match res {
-                Ok(resp) => return Ok(resp),
+                Ok(answer) => return answer,
                 Err(e) => {
                     pool.borrow_mut().pop(&key);
                     if reused && attempt == 0 {
@@ -136,7 +139,11 @@ fn connect(
     Ok(DohConn { client, rtt_hint })
 }
 
-/** @brief 연결 하나로 DoH 질의를 보내고 응답을 받는다. */
+/**
+ * @brief 연결 하나로 DoH 질의를 보내고 응답을 받는다.
+ * @return 바깥 Err 는 이 연결을 더 쓸 수 없다는 뜻이다. 안쪽 Err 는 서버가 이 질의에만 오류
+ *         상태로 답했다는 뜻이고, 연결은 그대로 쓸 수 있다.
+ */
 fn roundtrip(
     conn: &mut DohConn,
     server_name: &str,
@@ -144,7 +151,7 @@ fn roundtrip(
     wire: &[u8],
     request: &Message,
     deadline: Instant,
-) -> Result<Message, ForwardError> {
+) -> Result<Result<Message, ForwardError>, ForwardError> {
     if wire.len() > 0xffff {
         return Err(ForwardError::BadResponse);
     }
@@ -163,27 +170,26 @@ fn roundtrip(
         .stream_mut()
         .inner_mut()
         .set_deadline(probe_deadline);
-    let body = conn
-        .client
-        .query_probed(server_name, path, &q, |stream| {
-            stream.inner_mut().set_deadline(deadline);
-        })
-        .map_err(h2_io)?;
+    let answer = conn.client.query_probed(server_name, path, &q, |stream| {
+        stream.inner_mut().set_deadline(deadline);
+    });
+    let body = match answer {
+        Ok(body) => body,
+        Err(H2Error::BadStatus) => return Ok(Err(ForwardError::Io("DoH non-200 status".into()))),
+        Err(H2Error::Closed) => {
+            return Err(ForwardError::Io("DoH server closed the connection".into()))
+        }
+        Err(H2Error::Protocol) => return Err(ForwardError::BadResponse),
+        Err(H2Error::Io) => {
+            return Err(ForwardError::Io(
+                "I/O error on the DoH HTTP/2 connection".into(),
+            ))
+        }
+    };
     let resp = Message::parse(&body).map_err(|_| ForwardError::BadResponse)?;
 
     validate_response(request, &resp, Some(0))?;
-    Ok(resp)
-}
-
-/** @brief HTTP/2 오류를 전달 오류로 옮긴다. */
-fn h2_io(e: onetdns_http2::H2Error) -> ForwardError {
-    use onetdns_http2::H2Error;
-    match e {
-        H2Error::Closed => ForwardError::Io("DoH server closed the connection".into()),
-        H2Error::BadStatus => ForwardError::Io("DoH non-200 status".into()),
-        H2Error::Protocol => ForwardError::BadResponse,
-        H2Error::Io => ForwardError::Io("I/O error on the DoH HTTP/2 connection".into()),
-    }
+    Ok(Ok(resp))
 }
 
 #[cfg(test)]
@@ -455,6 +461,44 @@ mod tests {
         )
         .with_trust(trust);
         assert!(fwd.resolve(&q(1, "x.test")).is_err());
+    }
+
+    #[test]
+    /**
+     * @brief 오류 상태를 그 질의의 실패로만 다루고 연결은 계속 쓰는지.
+     * @details 오류 상태는 서버가 이 질의에 내린 답이라 새 연결로 다시 물어도 달라지지 않는다.
+     *          연결을 버리고 다시 보내면 같은 답을 받으려고 핸드셰이크를 한 번 더 한다.
+     */
+    fn doh_error_status_fails_only_that_query() {
+        let (addr, trust, accepts, _signatures) = doh_server_ex(Ipv4Addr::new(6, 6, 6, 7), false);
+        let results = thread::spawn(move || {
+            let request = q(1, "page.test");
+            let wire = request.try_encode().unwrap();
+            [(); 2].map(|()| {
+                exchange(
+                    addr,
+                    "dns.test",
+                    "/wrong",
+                    &wire,
+                    &request,
+                    Duration::from_secs(5),
+                    &trust,
+                )
+            })
+        })
+        .join()
+        .unwrap();
+        for result in results {
+            assert_eq!(
+                result.err(),
+                Some(ForwardError::Io("DoH non-200 status".into()))
+            );
+        }
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            1,
+            "오류 상태를 받은 연결을 버리고 새로 맺었습니다"
+        );
     }
 
     #[test]
