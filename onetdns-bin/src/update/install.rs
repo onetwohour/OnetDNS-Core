@@ -401,10 +401,27 @@ impl Install {
     }
 }
 
-/** @brief 잠금을 쥐고 있다는 표시. 떨어뜨리면 파일을 닫아 잠금이 풀린다. */
+/** @brief 잠금을 쥐고 있다는 표시. 떨어뜨리면 잠금이 풀린다. */
 pub(crate) struct UpdateLock {
     /** @brief 잠금을 건 파일. */
     _file: File,
+}
+
+#[cfg(unix)]
+impl Drop for UpdateLock {
+    /**
+     * @brief 파일을 닫기 전에 잠금을 푼다.
+     * @details flock 잠금은 같은 열린 파일을 가리키는 핸들이 모두 닫혀야 풀린다. 다른 스레드가
+     *          같은 때 띄운 자식은 exec 하기 전까지 이 핸들을 물려받으므로, 닫기만 하면 그사이
+     *          잠금이 남아 다음 잠금이 다른 업데이트가 진행 중이라고 판단한다. LOCK_UN 은
+     *          물려받은 핸들의 잠금까지 바로 푼다. 실패해도 핸들이 모두 닫히면 풀리므로 결과는
+     *          보지 않는다.
+     */
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[derive(Debug)]
@@ -704,6 +721,26 @@ mod tests {
         ));
         drop(held);
         install.lock(Duration::ZERO).expect("놓은 뒤의 잠금");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /**
+     * @brief 잠금 파일의 핸들이 복제되어 남아 있어도 놓은 잠금이 바로 풀리는지.
+     * @details 다른 스레드가 같은 때 띄운 자식은 exec 하기 전까지 이 핸들을 물려받는다. 그 상황을
+     *          같은 열린 파일을 가리키는 복제 핸들로 재현한다. 파일을 닫기만 하면 복제가 남은 동안
+     *          다음 잠금이 Busy 가 된다.
+     */
+    fn released_lock_ignores_inherited_handles() {
+        let scratch = Scratch::new("lock-inherited");
+        let install = scratch.install();
+        let held = install.lock(Duration::ZERO).expect("첫 잠금");
+        let inherited = held._file.try_clone().expect("핸들 복제");
+        drop(held);
+        install
+            .lock(Duration::ZERO)
+            .expect("복제 핸들이 남은 채 놓은 잠금");
+        drop(inherited);
     }
 
     #[test]
