@@ -30,7 +30,7 @@ pub mod varint;
 pub use conn::{
     ClosePeriod, Connection, PeerClose, QuicDiagnostic, QuicError, Role, MAX_RECV_UDP_PAYLOAD,
 };
-pub use h3::{H3Client, H3Connection, H3Error};
+pub use h3::{H3Client, H3Connection, H3Error, H3Response};
 
 use sha2::Sha256;
 

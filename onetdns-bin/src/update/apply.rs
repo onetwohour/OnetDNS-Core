@@ -399,7 +399,7 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<Finished, Stri
  *          만들면 그 자식이 exec 하기 전까지 우리가 쓴 파일의 핸들을 잠시 물려받으므로, 잠깐 뒤에
  *          다시 시도한다.
  */
-fn spawn(command: &mut Command) -> Result<Child, String> {
+pub(super) fn spawn(command: &mut Command) -> Result<Child, String> {
     #[cfg(target_os = "linux")]
     for _ in 0..20 {
         match command.spawn() {
@@ -457,4 +457,45 @@ fn collect(receiver: Receiver<Vec<u8>>) -> String {
         .recv_timeout(OUTPUT_GRACE)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+/** @brief 방금 쓴 실행 파일을 띄울 때의 재시도. */
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    /**
+     * @brief 쓰기로 열린 동안 거부되던 실행을 핸들이 닫힌 뒤 띄우는지.
+     * @details 다른 스레드가 띄운 자식이 exec 하기 전까지 쓰기 핸들을 물려받아 쥐는 상황을, 이
+     *          프로세스가 핸들을 쥐었다가 잠시 뒤 닫는 것으로 재현한다. 커널은 어느 프로세스가
+     *          쓰기로 연 파일이든 실행을 거부한다.
+     */
+    fn spawn_retries_while_the_file_is_open_for_writing() {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = crate::update::scratch::Scratch::new("text-busy");
+        let path = scratch.0.join("script");
+        let mut file = std::fs::File::create(&path).expect("스크립트");
+        file.write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("스크립트 쓰기");
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .expect("실행 권한");
+
+        let refused = Command::new(&path).spawn();
+        assert_eq!(
+            refused.err().and_then(|error| error.raw_os_error()),
+            Some(libc::ETXTBSY),
+            "쓰기로 열린 파일의 실행이 거부되지 않아 재시도를 확인할 수 없습니다"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(file);
+        });
+        let mut child = spawn(&mut Command::new(&path)).expect("핸들이 닫힌 뒤의 실행");
+        assert!(child.wait().expect("스크립트 종료").success());
+        release.join().expect("핸들을 닫는 스레드");
+    }
 }

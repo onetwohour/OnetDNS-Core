@@ -19,7 +19,6 @@ const HANDSHAKE: usize = 1;
 /** @brief 응용 데이터 번호 공간. 핸드셰이크 뒤의 모든 통신이 여기 속한다. */
 const APP: usize = 2;
 
-/** @brief 내보낼 데이터그램 크기. 흔한 경로에서 조각나지 않는 값으로 잡는다. */
 /**
  * @brief Initial 을 담은 데이터그램의 최소 크기.
  * @details RFC 9000이 정한 값이다. 받는 쪽은 이보다 작은 데이터그램의 Initial 을
@@ -27,7 +26,14 @@ const APP: usize = 2;
  */
 const MIN_INITIAL_DATAGRAM: usize = 1200;
 
-const MAX_DATAGRAM: usize = 1350;
+/**
+ * @brief 내보낼 데이터그램 크기 상한.
+ * @details RFC 9000 은 경로 MTU 를 찾지 않는 끝점이 1200바이트보다 큰 데이터그램을 보내지 않게
+ *          한다. 이쪽은 경로 MTU 를 찾지 않는다. 상대는 max_udp_payload_size 로 1200 미만을 알릴
+ *          수 없으므로 상대가 받을 수 있는 크기도 넘지 않는다.
+ * @warning 이 값을 올리려면 경로 MTU 탐색과 함께 상대의 max_udp_payload_size 도 지켜야 한다.
+ */
+const MAX_DATAGRAM: usize = 1200;
 
 /**
  * @brief 받아들일 데이터그램 크기.
@@ -35,9 +41,11 @@ const MAX_DATAGRAM: usize = 1350;
  * @details 이 값을 그대로 max_udp_payload_size로 알린다. 실제로 읽는 버퍼보다 큰 값을
  *          알리면 상대가 그 크기로 보내도 되는데 이쪽은 잘라 읽게 되고, 잘린 패킷은 인증에
  *          실패해 조용히 버려져 핸드셰이크가 멈춘다. 소켓에서 읽는 쪽도 이 상수를 써야 한다.
+ *          경로 MTU 를 찾는 상대는 1200바이트보다 크게 보낼 수 있으므로, 흔한 인터넷 경로에서
+ *          조각나지 않는 크기까지 받는다.
  * @invariant RFC 9000이 정한 하한 1200 이상이고, 이쪽이 내보내는 크기보다 작지 않아야 한다.
  */
-pub const MAX_RECV_UDP_PAYLOAD: u64 = MAX_DATAGRAM as u64;
+pub const MAX_RECV_UDP_PAYLOAD: u64 = 1350;
 
 /** @brief 위 두 하한을 어기면 컴파일이 멈춘다. */
 const _: [(); 0] = [(); (MAX_RECV_UDP_PAYLOAD < 1200) as usize];
@@ -49,6 +57,41 @@ const MAX_PACKET_PAYLOAD: usize = 1000;
 const STREAM_FRAME_CHUNK: usize = 900;
 /** @brief 받아들일 Retry 토큰 길이. */
 const MAX_RETRY_TOKEN: usize = 256;
+
+/**
+ * @brief 긴 헤더 패킷에서 프레임 말고 붙는 바이트의 최댓값. Initial 의 토큰 몫은 따로 센다.
+ * @details 첫 바이트, 판, 길이를 앞에 붙인 두 연결 식별자(각 20바이트까지), 2바이트 길이 필드,
+ *          4바이트 패킷 번호, 16바이트 인증 태그다.
+ */
+const MAX_LONG_HEADER_OVERHEAD: usize = 1 + 4 + (1 + 20) + (1 + 20) + 2 + 4 + 16;
+/** @brief 짧은 헤더 패킷에서 프레임 말고 붙는 바이트의 최댓값. */
+const MAX_SHORT_HEADER_OVERHEAD: usize = 1 + 20 + 4 + 16;
+
+/**
+ * @brief 토큰 없는 긴 헤더 패킷은 가득 차도 데이터그램 하나에 들어가야 한다.
+ * @details 어기면 컴파일이 멈춘다. 1 은 Initial 의 빈 토큰 길이 필드다.
+ */
+const _: [(); 0] =
+    [(); (MAX_LONG_HEADER_OVERHEAD + 1 + MAX_PACKET_PAYLOAD > MAX_DATAGRAM) as usize];
+
+/**
+ * @brief 사유 문구를 뺀 종료 프레임의 최대 바이트.
+ * @details 프레임 종류, 오류 코드, 오류를 일으킨 프레임 종류, 사유 길이 필드다.
+ */
+const MAX_CLOSE_FRAME_OVERHEAD: usize = 1 + 8 + 8 + 2;
+
+/**
+ * @brief 종료 프레임에 싣는 사유 문구의 최대 바이트.
+ * @details 핸드셰이크가 확정되기 전의 종료 데이터그램은 Initial, Handshake, 1-RTT 패킷에 종료
+ *          프레임을 하나씩 싣는다. 가장 긴 Retry 토큰을 실은 Initial 과 함께여도 그 데이터그램이
+ *          MAX_DATAGRAM 을 넘지 않는 길이다.
+ */
+const MAX_CLOSE_REASON: usize = (MAX_DATAGRAM
+    - (MAX_LONG_HEADER_OVERHEAD + 2 + MAX_RETRY_TOKEN)
+    - MAX_LONG_HEADER_OVERHEAD
+    - MAX_SHORT_HEADER_OVERHEAD)
+    / 3
+    - MAX_CLOSE_FRAME_OVERHEAD;
 
 /** @brief 핸드셰이크 데이터 프레임 하나에 담을 크기. */
 const CRYPTO_CHUNK: usize = 900;
@@ -2639,6 +2682,11 @@ impl Connection {
         let mut payload = Vec::new();
         let mut rtx_frames: Vec<Frame> = Vec::new();
         let mut ack_eliciting = false;
+        let budget = if space == INITIAL {
+            initial_payload_budget(&self.retry_token)
+        } else {
+            MAX_PACKET_PAYLOAD
+        };
 
         if self.spaces[space].ack_pending {
             if let Some(ack) = self.build_ack(space) {
@@ -2653,7 +2701,7 @@ impl Connection {
                 &mut payload,
                 &mut rtx_frames,
                 &mut ack_eliciting,
-                MAX_PACKET_PAYLOAD,
+                budget,
             );
 
             append_crypto_chunk(
@@ -2661,7 +2709,7 @@ impl Connection {
                 &mut payload,
                 &mut rtx_frames,
                 &mut ack_eliciting,
-                MAX_PACKET_PAYLOAD,
+                budget,
             );
         }
         if payload.is_empty() {
@@ -2681,15 +2729,9 @@ impl Connection {
         } else {
             &[]
         };
-        let mut pkt =
-            packet::protect_long(aead, &keys, ptype_val, &dcid, &scid, token, pn, 4, &payload);
-
-        if pad_to > 0 && pkt.len() < pad_to {
-            let deficit = pad_to - pkt.len();
-            payload.extend(std::iter::repeat_n(0u8, deficit));
-            pkt =
-                packet::protect_long(aead, &keys, ptype_val, &dcid, &scid, token, pn, 4, &payload);
-        }
+        let pkt = seal_padded(&mut payload, pad_to, |payload| {
+            packet::protect_long(aead, &keys, ptype_val, &dcid, &scid, token, pn, 4, payload)
+        });
         self.spaces[space].next_pn += 1;
         if ack_eliciting && !window_open {
             *probe = probe.saturating_sub(1);
@@ -3422,11 +3464,10 @@ impl Connection {
          * 둔다. 그 뒤에는 채움 바이트도 붙일 수 없어서, Initial 을 담은 데이터그램에는 짧은 헤더
          * 패킷을 함께 싣지 않고 따로 보낸다.
          */
-        let max_datagram = self.max_datagram();
         let mut dg = Vec::new();
         let mut dg_has_initial = false;
         for (is_short, is_initial, p) in packets {
-            let full = dg.len() + p.len() > max_datagram;
+            let full = dg.len() + p.len() > MAX_DATAGRAM;
             if !dg.is_empty() && (full || (is_short && dg_has_initial)) {
                 self.queue_datagram(std::mem::take(&mut dg), dg_has_initial);
                 dg_has_initial = false;
@@ -3440,23 +3481,6 @@ impl Connection {
         if !dg.is_empty() {
             self.queue_datagram(dg, dg_has_initial);
         }
-    }
-
-    /**
-     * @brief 패킷을 합쳐 만들 데이터그램의 크기 상한.
-     * @details 상대가 max_udp_payload_size 로 알린 크기보다 큰 데이터그램은 RFC 9000 에 따라
-     *          상대가 처리하지 않을 수 있다. 상대 매개변수를 받기 전에 보내는 0-RTT 에는 지난
-     *          연결에서 기억한 값을 쓴다. 매개변수 해석이 1200 미만을 거부하므로 Initial 을 채우는
-     *          최소 크기보다 작아지지 않는다.
-     */
-    fn max_datagram(&self) -> usize {
-        self.peer_tp
-            .as_ref()
-            .or(self.early_peer_tp.as_ref())
-            .map_or(MAX_DATAGRAM, |tp| {
-                usize::try_from(tp.max_udp_payload_size)
-                    .map_or(MAX_DATAGRAM, |limit| limit.min(MAX_DATAGRAM))
-            })
     }
 
     /**
@@ -4003,7 +4027,7 @@ impl Connection {
         let application = Frame::ConnectionClose {
             error_code,
             frame_type: None,
-            reason: reason.as_bytes().to_vec(),
+            reason: close_reason(reason),
         };
         let concealed = Frame::ConnectionClose {
             error_code: APPLICATION_ERROR,
@@ -4037,7 +4061,7 @@ impl Connection {
         let close = Frame::ConnectionClose {
             error_code,
             frame_type: Some(0),
-            reason: reason.to_string().into_bytes(),
+            reason: close_reason(&reason.to_string()),
         };
         self.send_close(close.clone(), close);
     }
@@ -4171,13 +4195,9 @@ impl Connection {
         };
         let dcid = &self.remote_cid;
         let scid = &self.local_cid;
-        let mut pkt =
-            packet::protect_long(aead, &keys, ptype_val, dcid, scid, token, pn, 4, &payload);
-        if pkt.len() < pad_to {
-            payload.resize(payload.len() + (pad_to - pkt.len()), 0);
-            pkt = packet::protect_long(aead, &keys, ptype_val, dcid, scid, token, pn, 4, &payload);
-        }
-        Some(pkt)
+        Some(seal_padded(&mut payload, pad_to, |payload| {
+            packet::protect_long(aead, &keys, ptype_val, dcid, scid, token, pn, 4, payload)
+        }))
     }
 
     /** @brief 상대가 알린 종료 사유. */
@@ -4327,6 +4347,51 @@ fn parse_retry(pkt: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 /** @brief Retry 무결성 태그를 확인한다. 원래 목적지 식별자에 묶여 있다. */
 fn verify_retry_integrity(odcid: &[u8], retry_pkt: &[u8]) -> bool {
     crate::retry::verify_integrity(odcid, retry_pkt)
+}
+
+/**
+ * @brief 이 토큰을 실은 Initial 패킷에 담을 프레임 바이트.
+ * @details 토큰이 길수록 데이터그램에 남는 자리가 줄어든다. 줄이지 않으면 Retry 뒤의 Initial
+ *          이 MAX_DATAGRAM 을 넘는다.
+ */
+fn initial_payload_budget(token: &[u8]) -> usize {
+    let token_field = crate::varint::len(token.len() as u64) + token.len();
+    MAX_DATAGRAM
+        .saturating_sub(MAX_LONG_HEADER_OVERHEAD + token_field)
+        .min(MAX_PACKET_PAYLOAD)
+}
+
+/**
+ * @brief 긴 헤더 패킷을 보호하고, pad_to 보다 작으면 본문 끝을 채움 바이트로 채워 그 크기에
+ *        맞춘다.
+ * @details 길이 필드는 가장 짧은 형태로 쓰므로, 채운 만큼 값이 커져 필드가 한 바이트 늘면 패킷이
+ *          pad_to 를 넘는다. 그때는 넘은 만큼 덜 채운다.
+ * @param seal 본문을 받아 보호한 패킷을 돌려준다.
+ */
+fn seal_padded(payload: &mut Vec<u8>, pad_to: usize, seal: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let packet = seal(payload);
+    if packet.len() >= pad_to {
+        return packet;
+    }
+    payload.resize(payload.len() + (pad_to - packet.len()), 0);
+    let packet = seal(payload);
+    if packet.len() <= pad_to {
+        return packet;
+    }
+    payload.truncate(payload.len() - (packet.len() - pad_to));
+    seal(payload)
+}
+
+/**
+ * @brief 종료 프레임에 실을 사유 문구. MAX_CLOSE_REASON 바이트를 넘으면 자른다.
+ * @details 사유 문구는 UTF-8 로 쓰게 되어 있으므로 글자 중간에서는 자르지 않는다.
+ */
+fn close_reason(reason: &str) -> Vec<u8> {
+    let mut end = reason.len().min(MAX_CLOSE_REASON);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason.as_bytes()[..end].to_vec()
 }
 
 /** @brief 대기 중인 프레임을 패킷 크기가 허락하는 만큼 담는다. */
@@ -4514,7 +4579,6 @@ mod tests {
         };
         let normalized = normalize_local_transport_params(asked);
         assert_eq!(normalized.max_udp_payload_size, MAX_RECV_UDP_PAYLOAD);
-        assert_eq!(MAX_RECV_UDP_PAYLOAD, MAX_DATAGRAM as u64);
     }
 
     /** @brief 테스트용 서버 설정. 자체 서명 인증서를 쓴다. */
@@ -7130,18 +7194,23 @@ mod tests {
 
     #[test]
     /**
-     * @brief 상대가 max_udp_payload_size 로 알린 크기를 넘도록 패킷을 합치지 않는지.
-     * @details 이 값은 상대가 받을 수 있는 UDP 페이로드 크기다. 넘겨 보낸 데이터그램은 상대가
-     *          처리하지 않을 수 있고, 그 안에 든 Handshake 패킷은 PTO 마다 같은 크기로 다시 나가
-     *          끝내 닿지 않는다.
+     * @brief 상대가 더 큰 데이터그램을 받을 수 있다고 알려도 1200바이트를 넘게 합치지 않는지.
+     * @details 이쪽은 경로 MTU 를 찾지 않으므로 RFC 9000 에 따라 1200바이트까지만 보낸다. 상대의
+     *          max_udp_payload_size 는 상대가 받을 수 있는 크기일 뿐, 경로가 그만큼 나른다는 뜻이
+     *          아니다. 경로에서 버려진 데이터그램에 든 Handshake 패킷은 PTO 마다 같은 크기로 다시
+     *          나가 끝내 닿지 않는다.
      */
-    fn coalesced_datagrams_respect_the_peer_payload_limit() {
+    fn coalesced_datagrams_stay_within_the_unprobed_path_limit() {
+        /*
+         * MAX_DATAGRAM 대신 RFC 9000 의 값을 쓴다. 그 상수를 올리면 이 테스트가 함께 느슨해져
+         * 막으려던 회귀를 놓친다.
+         */
+        let unprobed_path_limit = 1200;
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
             b"SERVERID".to_vec(),
             TransportParams::server_defaults(),
         );
-        server.base_tp.max_udp_payload_size = 1200;
         let mut client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
             b"INITDCID".to_vec(),
@@ -7155,9 +7224,10 @@ mod tests {
         while let Some(dg) = server.next_datagram() {
             client.recv_datagram(&dg).unwrap();
         }
-        assert_eq!(
-            client.peer_tp.as_ref().map(|tp| tp.max_udp_payload_size),
-            Some(1200)
+        let advertised = client.peer_tp.as_ref().map(|tp| tp.max_udp_payload_size);
+        assert!(
+            advertised.is_some_and(|limit| limit > unprobed_path_limit as u64),
+            "상대가 1200바이트보다 큰 크기를 알리지 않아 재려던 것을 재지 못했습니다: {advertised:?}"
         );
         while client.next_datagram().is_some() {}
 
@@ -7171,13 +7241,146 @@ mod tests {
             .collect();
         let total: usize = sizes.iter().sum();
         assert!(
-            total > 1200 && total <= MAX_DATAGRAM,
+            total > unprobed_path_limit && total as u64 <= MAX_RECV_UDP_PAYLOAD,
             "두 패킷을 합친 크기가 두 한도 사이에 있지 않아 재려던 것을 재지 못했습니다: {sizes:?}"
         );
         assert!(
-            sizes.iter().all(|&size| size <= 1200),
-            "상대가 받을 수 있는 크기보다 큰 데이터그램을 보냈습니다: {sizes:?}"
+            sizes.iter().all(|&size| size <= unprobed_path_limit),
+            "1200바이트보다 큰 데이터그램을 보냈습니다: {sizes:?}"
         );
+    }
+
+    /**
+     * @brief 가장 긴 토큰을 실은 Retry 를 받은 클라이언트.
+     * @return 클라이언트와 그 토큰. Retry 를 받고 다시 보낸 Initial 은 아직 꺼내지 않았다.
+     */
+    fn client_after_longest_retry() -> (Connection, Vec<u8>) {
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"ORIGDCID".to_vec(),
+            b"CLNTSCID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let first = client.next_datagram().expect("첫 Initial 이 없습니다");
+        let header = crate::retry::parse_initial_header(&first).expect("Initial 파싱");
+        let token = vec![0xab; MAX_RETRY_TOKEN];
+        let retry = crate::retry::build_retry(header.dcid, header.scid, b"RETRYCID", &token);
+        client.recv_datagram(&retry).unwrap();
+        (client, token)
+    }
+
+    #[test]
+    /**
+     * @brief 가장 긴 Retry 토큰을 실은 Initial 도 1200바이트를 넘지 않는지.
+     * @details 토큰은 Initial 패킷마다 실리므로 그만큼 프레임 자리가 줄어야 한다. 줄이지 않으면
+     *          핸드셰이크 데이터로 가득 찬 Initial 이 상한을 넘는다.
+     */
+    fn initial_with_the_longest_retry_token_fits_the_datagram_limit() {
+        let (mut client, token) = client_after_longest_retry();
+        client.spaces[INITIAL]
+            .out_crypto
+            .extend_from_slice(&[0; 2 * MAX_DATAGRAM]);
+        /* 한 번 내보낼 때 Initial 패킷은 하나만 만든다. */
+        let mut datagrams = Vec::new();
+        for _ in 0..8 {
+            client.flush();
+            datagrams.extend(std::iter::from_fn(|| client.next_datagram()));
+        }
+        assert!(
+            datagrams.len() > 2,
+            "Initial 이 여러 데이터그램으로 나뉘지 않아 재려던 것을 재지 못했습니다: {}",
+            datagrams.len()
+        );
+        for datagram in &datagrams {
+            let header = crate::retry::parse_initial_header(datagram).expect("Initial 파싱");
+            assert_eq!(header.token, token.as_slice());
+            assert!(
+                datagram.len() <= MAX_DATAGRAM,
+                "토큰을 실은 Initial 을 {}바이트 데이터그램으로 보냈습니다",
+                datagram.len()
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 종료 데이터그램이 사유 문구 길이와 무관하게 1200바이트를 넘지 않는지.
+     * @details 핸드셰이크가 확정되기 전에는 보낼 키가 있는 공간마다 같은 사유를 하나씩 싣고,
+     *          클라이언트의 Initial 에는 Retry 토큰도 실린다. 사유를 자르지 않으면 데이터그램이
+     *          상한을 넘는다.
+     */
+    fn close_datagrams_stay_within_the_datagram_limit() {
+        let long_reason = "x".repeat(4 * MAX_DATAGRAM);
+
+        let (mut client, _) = client_after_longest_retry();
+        while client.next_datagram().is_some() {}
+        client.close_on_error(PROTOCOL_VIOLATION, &long_reason);
+        let close = client.next_datagram().expect("종료 데이터그램이 없습니다");
+        assert_eq!(packet_kinds(&close), ["Initial"]);
+        assert!(
+            (MIN_INITIAL_DATAGRAM..=MAX_DATAGRAM).contains(&close.len()),
+            "클라이언트가 {}바이트 종료 데이터그램을 보냈습니다",
+            close.len()
+        );
+
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        while server.next_datagram().is_some() {}
+        server.close_on_error(PROTOCOL_VIOLATION, &long_reason);
+        let close = server.next_datagram().expect("종료 데이터그램이 없습니다");
+        assert_eq!(packet_kinds(&close), ["Initial", "Handshake", "1-RTT"]);
+        assert!(
+            close.len() <= MAX_DATAGRAM,
+            "서버가 {}바이트 종료 데이터그램을 보냈습니다",
+            close.len()
+        );
+        client.recv_datagram(&close).unwrap();
+        let reason = client.peer_close().map(|close| close.reason.clone());
+        assert_eq!(reason, Some(vec![b'x'; MAX_CLOSE_REASON]));
+    }
+
+    #[test]
+    /**
+     * @brief 사유가 짧은 클라이언트 종료가 정확히 1200바이트인지.
+     * @details 채움 바이트가 Initial 의 길이 필드 값을 64 이상으로 키우면 그 필드가 한 바이트
+     *          늘어난다. 그만큼 덜 채우지 않으면 데이터그램이 1201바이트가 된다.
+     */
+    fn short_client_close_is_padded_to_exactly_the_minimum() {
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while client.next_datagram().is_some() {}
+        client.close(0x2, "");
+        let close = client.next_datagram().expect("종료 데이터그램이 없습니다");
+        assert_eq!(close.len(), MIN_INITIAL_DATAGRAM);
+    }
+
+    #[test]
+    /** @brief 긴 사유 문구를 글자 중간에서 자르지 않는지. 잘린 문구도 UTF-8 이어야 한다. */
+    fn close_reason_is_cut_on_a_character_boundary() {
+        let reason = "가".repeat(MAX_CLOSE_REASON);
+        let cut = close_reason(&reason);
+        assert!(cut.len() <= MAX_CLOSE_REASON && cut.len() > MAX_CLOSE_REASON - 3);
+        assert!(std::str::from_utf8(&cut).is_ok());
+        assert_eq!(close_reason("bye"), b"bye");
     }
 
     #[test]

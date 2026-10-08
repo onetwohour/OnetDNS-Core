@@ -1352,6 +1352,34 @@ struct RespBuf {
     done: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/** @brief 요청 하나가 받은 결과. */
+pub enum H3Response {
+    /** @brief 상태 200 과 application/dns-message 로 온 DNS 메시지. */
+    Dns(Vec<u8>),
+    /**
+     * @brief DNS 메시지를 싣지 않은 최종 응답의 상태 코드. 본문은 버린다.
+     * @details 200 이어도 content-type 이 application/dns-message 하나가 아니거나 본문이 DNS
+     *          메시지 상한을 넘으면 여기에 온다.
+     */
+    NotDns(u16),
+    /**
+     * @brief 서버가 답하지 않았다.
+     * @details 스트림이 끊겼거나, 서버가 GOAWAY 로 그 요청을 처리하지 않는다고 알렸다.
+     */
+    Unanswered,
+}
+
+impl H3Response {
+    /** @brief 이 결과가 붙잡고 있는 바이트. 연결 버퍼 상한에 센다. */
+    fn held_bytes(&self) -> usize {
+        match self {
+            H3Response::Dns(body) => body.len(),
+            H3Response::NotDns(_) | H3Response::Unanswered => 0,
+        }
+    }
+}
+
 /** @brief 클라이언트 쪽 HTTP/3 연결. */
 pub struct H3Client {
     /** @brief 아래에 깔린 QUIC 연결. */
@@ -1364,8 +1392,8 @@ pub struct H3Client {
     /** @brief 받고 있는 응답들. */
     resp: HashMap<u64, RespBuf>,
 
-    /** @brief 다 받은 응답들. */
-    ready: Vec<(u64, u16, Vec<u8>)>,
+    /** @brief 결과가 나온 요청들. */
+    ready: Vec<(u64, H3Response)>,
     /** @brief 헤더 압축 상태. */
     qp: QpackCtx,
 
@@ -1464,7 +1492,7 @@ impl H3Client {
             .values()
             .map(|response| response.buf.len())
             .chain(self.blocked.iter().map(|(_, buf)| buf.len()))
-            .chain(self.ready.iter().map(|(_, _, body)| body.len()))
+            .chain(self.ready.iter().map(|(_, response)| response.held_bytes()))
             .fold(0usize, usize::saturating_add)
     }
 
@@ -1475,14 +1503,14 @@ impl H3Client {
      */
     fn try_extract(&mut self, id: u64, buf: Vec<u8>) -> Result<(), QuicError> {
         match extract_dns_response(&mut self.qp.dec, id, &buf) {
-            Extracted::Done((status, body)) => {
+            Extracted::Done(response) => {
                 if self.ready.len() >= MAX_H3_STREAMS
-                    || !fits_connection_buffer(self.buffered_bytes(), body.len())
+                    || !fits_connection_buffer(self.buffered_bytes(), response.held_bytes())
                 {
                     return Err(H3Error::ExcessiveLoad.into());
                 }
                 self.in_flight.remove(&id);
-                self.ready.push((id, status, body));
+                self.ready.push((id, response));
                 Ok(())
             }
             Extracted::Blocked => {
@@ -1582,7 +1610,7 @@ impl H3Client {
     }
 
     /**
-     * @brief 서버가 답하지 않을 요청을 답 없음(상태 0)으로 끝낸다.
+     * @brief 서버가 답하지 않을 요청을 답 없음으로 끝낸다.
      * @details 요청마다 결과는 한 번만 낸다. 이미 답을 받았거나 끝낸 요청이면 아무것도 하지
      *          않는다.
      */
@@ -1592,7 +1620,7 @@ impl H3Client {
         }
         self.resp.remove(&id);
         self.blocked.retain(|(stream_id, _)| *stream_id != id);
-        self.ready.push((id, 0, Vec::new()));
+        self.ready.push((id, H3Response::Unanswered));
     }
 
     /** @brief 이쪽이 테이블에 넣은 항목 수. */
@@ -1605,12 +1633,8 @@ impl H3Client {
         self.qp.enc.known_received()
     }
 
-    /**
-     * @brief 끝난 요청의 결과를 가져간다.
-     * @details send_request 로 보낸 요청마다 한 번씩 나온다. 상태 0 은 서버가 답하지 않았다는
-     *          뜻이다. 스트림이 끊겼거나, GOAWAY 가 그 요청을 처리하지 않는다고 알렸다.
-     */
-    pub fn take_responses(&mut self) -> Vec<(u64, u16, Vec<u8>)> {
+    /** @brief 끝난 요청의 결과를 가져간다. send_request 로 보낸 요청마다 한 번씩 나온다. */
+    pub fn take_responses(&mut self) -> Vec<(u64, H3Response)> {
         std::mem::take(&mut self.ready)
     }
 
@@ -1671,18 +1695,21 @@ struct ResponseHead {
     status: u16,
     /** @brief 알린 본문 길이. */
     content_length: Option<usize>,
-    /** @brief 본문이 DNS 메시지라고 밝혔는지. */
+    /** @brief content-type 이 하나뿐이고 그 값이 application/dns-message 인지. */
     dns_content_type: bool,
 }
 
 /**
  * @brief 응답 헤더 구역 하나를 읽는다.
  * @details 중간 응답과 최종 응답이 같은 규칙을 따른다. HTTP/3 에는 101 응답이 없다.
+ *          content-type 은 본문이 DNS 메시지인지 가리는 데만 쓴다. 404 text/html 같은 응답도
+ *          HTTP 메시지로는 온전하므로 형식 오류가 아니다.
  * @return 형식이 어긋나면 None 이다.
  */
 fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
     let mut status: Option<u16> = None;
     let mut content_length: Option<usize> = None;
+    let mut content_types = 0usize;
     let mut dns_content_type = false;
     let mut regular_seen = false;
     for (n, v) in fields {
@@ -1712,25 +1739,16 @@ fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
             if content_length.is_some() || v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
                 return None;
             }
-            let length = std::str::from_utf8(&v).ok()?.parse::<usize>().ok()?;
-            if length > MAX_DNS_BODY {
-                return None;
-            }
-            content_length = Some(length);
+            content_length = Some(std::str::from_utf8(&v).ok()?.parse::<usize>().ok()?);
         } else if n == b"content-type" {
-            if dns_content_type {
-                return None;
-            }
+            content_types += 1;
             dns_content_type = v.eq_ignore_ascii_case(b"application/dns-message");
-            if !dns_content_type {
-                return None;
-            }
         }
     }
     Some(ResponseHead {
         status: status?,
         content_length,
-        dns_content_type,
+        dns_content_type: content_types == 1 && dns_content_type,
     })
 }
 
@@ -1739,14 +1757,11 @@ fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
  * @details 요청과 같은 엄격함을 적용한다. 프레임 순서, 상태 헤더 중복, 길이 일치를 모두 본다.
  *          응답은 1xx 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인 트레일러 구역 하나 순서로
  *          온다. HEADERS 가 그 가운데 어느 것인지는 풀어 봐야 알므로 앞에서부터 차례로 푼다.
+ *          형식이 온전한 최종 응답은 DNS 메시지를 싣지 않았어도 결과로 낸다.
  * @note 어느 구역이든 테이블을 기다려야 하면 하나도 풀지 않는다. 일부를 푼 뒤 기다렸다가 다시
  *       풀면 그 구역의 확인 지시가 두 번 나간다.
  */
-fn extract_dns_response(
-    dec: &mut qpack::Decoder,
-    sid: u64,
-    buf: &[u8],
-) -> Extracted<(u16, Vec<u8>)> {
+fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extracted<H3Response> {
     let Some(frames) = parse_frames(buf) else {
         return Extracted::Fatal(H3Error::FrameError);
     };
@@ -1788,7 +1803,7 @@ fn extract_dns_response(
             }
             FRAME_DATA => {
                 /* 중간 응답에는 본문이 없다. 헤더보다 앞선 본문은 프레임 배치 검사가 걸렀다. */
-                if final_head.is_none() || body.len().saturating_add(payload.len()) > MAX_DNS_BODY {
+                if final_head.is_none() {
                     return Extracted::Bad;
                 }
                 body.extend_from_slice(&payload)
@@ -1796,16 +1811,19 @@ fn extract_dns_response(
             _ => {}
         }
     }
-    match final_head {
-        Some(head)
-            if head
-                .content_length
-                .is_none_or(|length| length == body.len())
-                && (head.status != 200 || head.dns_content_type) =>
-        {
-            Extracted::Done((head.status, body))
-        }
-        Some(_) | None => Extracted::Bad,
+    let Some(head) = final_head else {
+        return Extracted::Bad;
+    };
+    if head
+        .content_length
+        .is_some_and(|length| length != body.len())
+    {
+        return Extracted::Bad;
+    }
+    if head.status == 200 && head.dns_content_type && body.len() <= MAX_DNS_BODY {
+        Extracted::Done(H3Response::Dns(body))
+    } else {
+        Extracted::Done(H3Response::NotDns(head.status))
     }
 }
 
@@ -1878,7 +1896,7 @@ mod tests {
         let mut response_decoder = qpack::Decoder::new(4096);
         assert!(matches!(
             extract_dns_response(&mut response_decoder, 0, &response),
-            Extracted::Done((200, body)) if body == dns
+            Extracted::Done(H3Response::Dns(body)) if body == dns
         ));
     }
 
@@ -2085,10 +2103,14 @@ mod tests {
                 (b":status".as_slice(), b"200".as_slice()),
                 (b":status", b"400"),
             ],
-            vec![(b":status".as_slice(), b"200".as_slice())],
             vec![
                 (b":status".as_slice(), b"200".as_slice()),
                 (b"content-type", b"application/dns-message"),
+                (b"content-length", b"4"),
+            ],
+            vec![
+                (b":status".as_slice(), b"404".as_slice()),
+                (b"content-type", b"text/html"),
                 (b"content-length", b"4"),
             ],
         ] {
@@ -2140,6 +2162,154 @@ mod tests {
             extract_dns_response(&mut dec, 0, &buf),
             Extracted::Bad
         ));
+    }
+
+    #[test]
+    /**
+     * @brief DNS 메시지를 싣지 않은 응답을 형식 오류가 아니라 그 상태의 결과로 내는지.
+     * @details content-type 과 DNS 본문 상한은 DoH 의 규칙이지 HTTP 메시지 형식이 아니다. 형식
+     *          오류로 다루면 404 text/html 하나에 연결 전체가 H3_MESSAGE_ERROR 로 닫힌다.
+     */
+    fn answers_without_a_dns_message_are_not_malformed() {
+        /** @brief 이 헤더와 본문으로 온 응답의 추출 결과. 형식이 온전해야 한다. */
+        fn answer(headers: &[(&[u8], &[u8])], body: &[u8]) -> H3Response {
+            match extract_dns_response(
+                &mut qpack::Decoder::new(4096),
+                0,
+                &message(&encoded_headers(headers), &[(FRAME_DATA, body)]),
+            ) {
+                Extracted::Done(response) => response,
+                other => panic!("형식이 온전한 응답을 거부했습니다: {}", outcome(other)),
+            }
+        }
+        let dns: &[u8] = b"\x12\x34dns";
+        let page = vec![b'x'; MAX_DNS_BODY + 1];
+        let page_length = page.len().to_string();
+
+        assert_eq!(
+            answer(
+                &[(b":status", b"404"), (b"content-type", b"text/html")],
+                b"<html>not found</html>"
+            ),
+            H3Response::NotDns(404)
+        );
+        assert_eq!(
+            answer(
+                &[
+                    (b":status", b"404"),
+                    (b"content-type", b"text/html"),
+                    (b"content-length", page_length.as_bytes()),
+                ],
+                &page
+            ),
+            H3Response::NotDns(404),
+            "DNS 가 아닌 본문에는 DNS 메시지 상한을 걸지 않습니다"
+        );
+        assert_eq!(
+            answer(&[(b":status", b"503")], b""),
+            H3Response::NotDns(503)
+        );
+        assert_eq!(
+            answer(
+                &[(b":status", b"200"), (b"content-type", b"text/html")],
+                b"<html>portal</html>"
+            ),
+            H3Response::NotDns(200)
+        );
+        assert_eq!(
+            answer(&[(b":status", b"200")], dns),
+            H3Response::NotDns(200)
+        );
+        assert_eq!(
+            answer(
+                &[
+                    (b":status", b"200"),
+                    (b"content-type", b"application/dns-message"),
+                    (b"content-type", b"application/dns-message"),
+                ],
+                dns
+            ),
+            H3Response::NotDns(200),
+            "겹친 content-type 은 본문 형식을 정하지 못합니다"
+        );
+        assert_eq!(
+            answer(
+                &[
+                    (b":status", b"200"),
+                    (b"content-type", b"application/dns-message"),
+                    (b"content-length", page_length.as_bytes()),
+                ],
+                &page
+            ),
+            H3Response::NotDns(200),
+            "DNS 메시지 상한을 넘는 본문은 DNS 메시지가 아닙니다"
+        );
+        assert_eq!(
+            answer(
+                &[
+                    (b":status", b"200"),
+                    (b"content-type", b"Application/DNS-Message"),
+                ],
+                dns
+            ),
+            H3Response::Dns(dns.to_vec())
+        );
+    }
+
+    #[test]
+    /**
+     * @brief DNS 가 아닌 답을 받아도 연결을 닫지 않고 같은 연결의 다른 요청을 받는지.
+     * @details 404 text/html 은 그 요청이 실패했다는 뜻일 뿐이다. 연결을 닫으면 같은 연결에
+     *          실린 다른 요청까지 잃는다.
+     */
+    fn answer_without_a_dns_message_keeps_the_connection() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+        let refused = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 refused")
+            .unwrap();
+        let answered = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 answered")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 2);
+
+        let page: &[u8] = b"<html>not found</html>";
+        let length = page.len().to_string();
+        let headers: [(&[u8], &[u8]); 3] = [
+            (b":status", b"404"),
+            (b"content-type", b"text/html"),
+            (b"content-length", length.as_bytes()),
+        ];
+        let section = server
+            .qp
+            .encode_headers(&mut server.conn, &headers)
+            .unwrap();
+        let mut payload = Vec::new();
+        encode_frame(&mut payload, FRAME_HEADERS, &section);
+        encode_frame(&mut payload, FRAME_DATA, page);
+        server
+            .conn_mut()
+            .send_stream(refused, &payload, true)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            client.take_responses(),
+            vec![(refused, H3Response::NotDns(404))]
+        );
+        assert!(
+            !client.is_closed() && !server.is_closed(),
+            "DNS 가 아닌 답 하나에 연결이 닫혔습니다"
+        );
+
+        server
+            .send_response(answered, b"\x00\x00 answer", 0)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            client.take_responses(),
+            vec![(answered, H3Response::Dns(b"\x00\x00 answer".to_vec()))]
+        );
     }
 
     #[test]
@@ -2216,9 +2386,10 @@ mod tests {
             .unwrap();
         pump_h3(&mut client, &mut server);
         assert_eq!(server.take_requests(), vec![(stream_id, b"query".to_vec())]);
-        client
-            .ready
-            .push((100, 200, vec![0; MAX_H3_CONNECTION_BUFFER - 512]));
+        client.ready.push((
+            100,
+            H3Response::Dns(vec![0; MAX_H3_CONNECTION_BUFFER - 512]),
+        ));
 
         server.send_response(stream_id, &[0x5a; 1024], 0).unwrap();
         let mut rejected = false;
@@ -2416,10 +2587,7 @@ mod tests {
             .unwrap();
         pump_h3(&mut client, &mut server);
 
-        let responses = client.take_responses();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].0, 0);
-        assert_eq!(responses[0].1, 400);
+        assert_eq!(client.take_responses(), vec![(0, H3Response::NotDns(400))]);
         assert!(!server.is_closed());
     }
 
@@ -2463,7 +2631,7 @@ mod tests {
         pump_h3(&mut client, &mut server);
         assert!(client
             .take_responses()
-            .contains(&(next, 200, b"\x00\x00 answer".to_vec())));
+            .contains(&(next, H3Response::Dns(b"\x00\x00 answer".to_vec()))));
     }
 
     /** @brief 서버 제어 스트림으로 GOAWAY 를 보낸다. 이 서버 구현은 스스로 보내지 않는다. */
@@ -2501,7 +2669,10 @@ mod tests {
         send_goaway(&mut server, unprocessed);
         pump_h3(&mut client, &mut server);
         assert!(client.is_going_away());
-        assert_eq!(client.take_responses(), vec![(unprocessed, 0, Vec::new())]);
+        assert_eq!(
+            client.take_responses(),
+            vec![(unprocessed, H3Response::Unanswered)]
+        );
         assert_eq!(
             client.send_request("dns.example", "/dns-query", b"\x00\x00 late"),
             Err(QuicError::GoingAway)
@@ -2514,7 +2685,7 @@ mod tests {
         pump_h3(&mut client, &mut server);
         assert_eq!(
             client.take_responses(),
-            vec![(kept, 200, b"\x00\x00 kept".to_vec())],
+            vec![(kept, H3Response::Dns(b"\x00\x00 kept".to_vec()))],
             "처리하지 않는다고 알린 요청의 결과가 두 번 나왔습니다"
         );
         assert!(!client.is_closed());
@@ -3204,7 +3375,7 @@ mod tests {
         );
         assert!(matches!(
             extract_dns_response(&mut qpack::Decoder::new(4096), 0, &response),
-            Extracted::Done((200, body)) if body == dns
+            Extracted::Done(H3Response::Dns(body)) if body == dns
         ));
     }
 
@@ -3432,11 +3603,10 @@ mod tests {
             .send_response(reqs[0].0, b"\x00\x00 answer-1", 0)
             .unwrap();
         pump_h3(&mut client, &mut server);
-        let resps = client.take_responses();
-        assert_eq!(resps.len(), 1);
-        assert_eq!(resps[0].0, sid1);
-        assert_eq!(resps[0].1, 200);
-        assert_eq!(resps[0].2, b"\x00\x00 answer-1");
+        assert_eq!(
+            client.take_responses(),
+            vec![(sid1, H3Response::Dns(b"\x00\x00 answer-1".to_vec()))]
+        );
 
         assert_eq!(
             client.qpack_known_received(),
@@ -3463,10 +3633,10 @@ mod tests {
             .send_response(reqs2[0].0, b"\x00\x00 answer-2", 0)
             .unwrap();
         pump_h3(&mut client, &mut server);
-        let resps2 = client.take_responses();
-        assert_eq!(resps2.len(), 1);
-        assert_eq!(resps2[0].0, sid2);
-        assert_eq!(resps2[0].2, b"\x00\x00 answer-2");
+        assert_eq!(
+            client.take_responses(),
+            vec![(sid2, H3Response::Dns(b"\x00\x00 answer-2".to_vec()))]
+        );
     }
 
     #[test]
@@ -3544,7 +3714,7 @@ mod tests {
         pump_h3(&mut c2, &mut s2);
         assert_eq!(
             c2.take_responses(),
-            vec![(sid, 200, b"\x00\x00 answer".to_vec())]
+            vec![(sid, H3Response::Dns(b"\x00\x00 answer".to_vec()))]
         );
     }
 
@@ -3667,10 +3837,10 @@ mod tests {
         assert!(c2.conn_mut().early_data_accepted());
         s2.send_response(reqs[0].0, b"\x00\x00 zr-resp", 0).unwrap();
         pump_h3(&mut c2, &mut s2);
-        let resps = c2.take_responses();
-        assert_eq!(resps.len(), 1);
-        assert_eq!(resps[0].0, sid2);
-        assert_eq!(resps[0].1, 200);
+        assert_eq!(
+            c2.take_responses(),
+            vec![(sid2, H3Response::Dns(b"\x00\x00 zr-resp".to_vec()))]
+        );
     }
 
     #[test]

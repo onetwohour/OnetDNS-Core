@@ -13,15 +13,18 @@ const MAX_RESPONSE_HEADERS: usize = 32 * 1024;
 
 /**
  * @brief 응답 헤더에서 상태와 본문 길이를 뽑고 검사한다.
- * @details :status와 content-type이 각각 정확히 하나여야 하고, 본문 종류는
- *          application/dns-message여야 한다. 중복 의사 헤더를 허용하면 어느 값이
- *          유효한지가 구현마다 갈린다.
+ * @details :status는 정확히 하나여야 한다. 중복 의사 헤더를 허용하면 어느 값이 유효한지가
+ *          구현마다 갈린다. 200 응답은 content-type이 application/dns-message 하나여야 하고
+ *          본문이 DNS 메시지 상한 안이어야 한다. 200이 아닌 응답은 본문을 읽지 않으므로 그
+ *          둘을 보지 않는다. 404 text/html 같은 답을 여기서 거부하면 상태 오류가 프로토콜
+ *          오류로 바뀐다.
  * @return 규칙을 어기면 None. 호출자는 프로토콜 오류로 처리한다.
  */
 fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usize>)> {
     let mut status = None;
     let mut content_length = None;
-    let mut content_type = None;
+    let mut content_types = 0usize;
+    let mut dns_content_type = false;
     let mut regular_seen = false;
     let mut header_size = 0usize;
 
@@ -66,19 +69,21 @@ fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usiz
                 return None;
             }
             let length = std::str::from_utf8(value).ok()?.parse::<usize>().ok()?;
-            if length > MAX_DNS_RESPONSE || content_length.replace(length).is_some() {
+            if content_length.replace(length).is_some() {
                 return None;
             }
         } else if name == b"content-type" {
-            let is_dns = value.eq_ignore_ascii_case(b"application/dns-message");
-            if !is_dns || content_type.replace(is_dns).is_some() {
-                return None;
-            }
+            content_types += 1;
+            dns_content_type = value.eq_ignore_ascii_case(b"application/dns-message");
         }
     }
 
     let status = status?;
-    if status == 200 && content_type != Some(true) {
+    if status == 200
+        && (content_types != 1
+            || !dns_content_type
+            || content_length.is_some_and(|length| length > MAX_DNS_RESPONSE))
+    {
         return None;
     }
     Some((status, content_length))
@@ -448,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상태가 겹치거나 형식이 어긋난 헤더를 거부하는지. */
+    /** @brief 상태가 겹치거나, 200 응답이 DNS 메시지를 싣지 않았다고 알리면 거부하는지. */
     fn response_headers_reject_duplicate_status_bad_type_and_oversized_length() {
         let duplicate: [(&[u8], &[u8]); 3] = [
             (b":status", b"200"),
@@ -461,6 +466,13 @@ mod tests {
             [(b":status", b"200"), (b"content-type", b"text/plain")];
         assert!(response_metadata(&owned_headers(&bad_type)).is_none());
 
+        let two_types = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/dns-message"),
+            (b"content-type", b"application/dns-message"),
+        ]);
+        assert!(response_metadata(&two_types).is_none());
+
         let oversized = (MAX_DNS_RESPONSE + 1).to_string();
         let oversized_headers = owned_headers(&[
             (b":status", b"200"),
@@ -468,6 +480,74 @@ mod tests {
             (b"content-length", oversized.as_bytes()),
         ]);
         assert!(response_metadata(&oversized_headers).is_none());
+    }
+
+    #[test]
+    /**
+     * @brief 200이 아닌 응답은 본문 종류와 길이로 거부하지 않는지.
+     * @details 거부하면 상태 오류가 프로토콜 오류로 바뀐다.
+     */
+    fn error_status_is_not_judged_as_a_dns_answer() {
+        let html = owned_headers(&[(b":status", b"404"), (b"content-type", b"text/html")]);
+        assert_eq!(response_metadata(&html), Some((404, None)));
+
+        let page_length = (MAX_DNS_RESPONSE + 1).to_string();
+        let long_page = owned_headers(&[
+            (b":status", b"404"),
+            (b"content-type", b"text/html"),
+            (b"content-length", page_length.as_bytes()),
+        ]);
+        assert_eq!(
+            response_metadata(&long_page),
+            Some((404, Some(MAX_DNS_RESPONSE + 1)))
+        );
+
+        let bare = owned_headers(&[(b":status", b"503")]);
+        assert_eq!(response_metadata(&bare), Some((503, None)));
+    }
+
+    #[test]
+    /** @brief DoH 경로를 모르는 웹 서버의 404 text/html 답이 상태 오류로 끝나는지. */
+    fn error_page_yields_bad_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            let mut preface = [0u8; 24];
+            stream.read_exact(&mut preface).unwrap();
+            assert_eq!(preface, crate::frame::PREFACE);
+            send_frame(&mut stream, frame_type::SETTINGS, 0, 0, &[]).unwrap();
+            loop {
+                let (header, _) = read_frame(&mut stream).unwrap();
+                if header.stream_id == 1 && header.has_flag(flags::END_STREAM) {
+                    break;
+                }
+            }
+            let page = b"<html>not here</html>";
+            let length = page.len().to_string();
+            let block = hpack::encode_response(&[
+                (":status", "404"),
+                ("content-type", "text/html"),
+                ("content-length", length.as_str()),
+            ]);
+            send_frame(
+                &mut stream,
+                frame_type::HEADERS,
+                flags::END_HEADERS,
+                1,
+                &block,
+            )
+            .unwrap();
+            /* 클라이언트는 헤더만 보고 끊을 수 있으므로 본문 전송 실패는 상관없다. */
+            let _ = send_frame(&mut stream, frame_type::DATA, flags::END_STREAM, 1, page);
+        });
+
+        let tcp = deadline_connect(addr);
+        let mut client = H2Client::connect(tcp).unwrap();
+        let result = client.query("dns.test", "/dns-query", b"query");
+        assert!(matches!(result, Err(H2Error::BadStatus)), "{result:?}");
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]

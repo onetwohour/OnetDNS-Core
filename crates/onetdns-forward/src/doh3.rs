@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
 use onetdns_proto::Message;
-use onetdns_quic::{H3Client, H3Error};
+use onetdns_quic::{H3Client, H3Error, H3Response};
 use onetdns_tls::TrustStore;
 
 use crate::quicdrive::{
@@ -61,7 +61,12 @@ thread_local! {
 /** @brief 스레드 하나가 보관할 DoH3 연결 수 상한. */
 const MAX_POOLED_CONNECTIONS: usize = 256;
 
-/** @brief DoH3로 질의를 교환한다. */
+/**
+ * @brief DoH3로 질의를 교환한다.
+ * @details 연결이 실패하면 풀에서 빼고 새 연결로 한 번 더 보낸다. 서버가 오류 상태로 답했으면
+ *          연결을 그대로 두고 다시 보내지 않는다. 오류 상태는 서버가 내린 답이라 새 연결로 다시
+ *          물어도 달라지지 않고, 429 와 503 은 곧바로 다시 묻지 말라는 뜻이기도 하다.
+ */
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
     addr: SocketAddr,
@@ -99,7 +104,7 @@ pub(crate) fn exchange(
                 r
             };
             match res {
-                Ok(resp) => return Ok(resp),
+                Ok(answer) => return answer,
                 Err(e) => {
                     pool.borrow_mut().pop(&key);
                     if reused && attempt == 0 {
@@ -149,7 +154,11 @@ fn connect(
     Ok(c)
 }
 
-/** @brief HTTP/3 요청 하나로 질의를 보내고 응답을 받는다. */
+/**
+ * @brief HTTP/3 요청 하나로 질의를 보내고 응답을 받는다.
+ * @return 바깥 Err 는 이 연결을 더 쓸 수 없다는 뜻이다. 안쪽 Err 는 서버가 이 질의에만 오류
+ *         상태로 답했다는 뜻이고, 연결은 그대로 쓸 수 있다.
+ */
 fn roundtrip(
     c: &mut Doh3Conn,
     authority: &str,
@@ -157,7 +166,7 @@ fn roundtrip(
     wire: &[u8],
     request: &Message,
     deadline: Instant,
-) -> Result<Message, ForwardError> {
+) -> Result<Result<Message, ForwardError>, ForwardError> {
     if wire.len() > 0xffff {
         return Err(ForwardError::BadResponse);
     }
@@ -213,24 +222,35 @@ fn roundtrip(
         flush_out(&c.sock, &mut c.h3)?;
 
         check_peer_revocation(c.h3.conn_mut(), &c.server_name, &mut c.revocation_checked)?;
-        for (rid, status, body) in c.h3.take_responses() {
-            if rid == sid {
-                if status == 0 {
+        for (rid, response) in c.h3.take_responses() {
+            if rid != sid {
+                continue;
+            }
+            /*
+             * RFC 8484 에서 200 응답은 DNS 메시지를 싣는다. 그렇지 않은 200 은 풀리지 않는 DNS
+             * 본문처럼 서버의 규약 위반으로 다루고 연결을 닫는다. 다른 상태는 그 질의만 실패한
+             * 것이다.
+             */
+            let resp = match response {
+                H3Response::Dns(body) => Message::parse(&body)
+                    .map_err(|_| ForwardError::BadResponse)
+                    .and_then(|resp| validate_response(request, &resp, Some(0)).map(|()| resp)),
+                H3Response::NotDns(200) => Err(ForwardError::BadResponse),
+                H3Response::NotDns(status) => {
+                    return Ok(Err(ForwardError::Io(format!(
+                        "DoH3 non-200 status: {status}"
+                    ))))
+                }
+                H3Response::Unanswered => {
                     return Err(ForwardError::Io(
                         "DoH3 request reset or refused by server".into(),
-                    ));
+                    ))
                 }
-                if status != 200 {
-                    return Err(ForwardError::Io(format!("DoH3 non-200 status: {status}")));
-                }
-                let resp = Message::parse(&body)
-                    .map_err(|_| ForwardError::BadResponse)
-                    .and_then(|resp| validate_response(request, &resp, Some(0)).map(|()| resp));
-                if resp.is_err() {
-                    c.h3.close(H3Error::GeneralProtocol);
-                }
-                return resp;
+            };
+            if resp.is_err() {
+                c.h3.close(H3Error::GeneralProtocol);
             }
+            return resp.map(Ok);
         }
     }
     Err(ForwardError::Timeout)
@@ -374,11 +394,52 @@ mod tests {
         Arc<TrustStore>,
         std::sync::mpsc::Receiver<onetdns_quic::PeerClose>,
     ) {
+        let (addr, trust, _peers, closes) = doh3_close_recorder_with(move |h3c, sid, req| {
+            let _ = h3c.send_response(sid, &answer(req).try_encode().unwrap(), 0);
+        });
+        (addr, trust, closes)
+    }
+
+    /** @brief RFC 9114 의 DATA 프레임 종류. */
+    const DATA_FRAME: u64 = 0x00;
+    /** @brief RFC 9114 의 HEADERS 프레임 종류. */
+    const HEADERS_FRAME: u64 = 0x01;
+
+    /**
+     * @brief DNS 메시지 대신 HTML 페이지로 답한다. DoH 경로를 모르는 웹 서버가 내는 답이다.
+     * @param status 답에 실을 상태 코드.
+     */
+    fn answer_with_html_page(h3c: &mut H3Connection, sid: u64, status: &[u8]) {
+        let page: &[u8] = b"<html>no DNS here</html>";
+        let headers: [(&[u8], &[u8]); 2] = [(b":status", status), (b"content-type", b"text/html")];
+        let (section, _) = onetdns_quic::qpack::Encoder::new().encode_field_section(&headers);
+        let mut payload = Vec::new();
+        onetdns_quic::h3::encode_frame(&mut payload, HEADERS_FRAME, &section);
+        onetdns_quic::h3::encode_frame(&mut payload, DATA_FRAME, page);
+        h3c.conn_mut().send_stream(sid, &payload, true).unwrap();
+    }
+
+    /**
+     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림. 답은 respond 가 직접 쓴다.
+     * @param respond 받은 질의마다 그 스트림에 답을 쓴다.
+     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 맺은 연결 수, 연결마다 받은 종료 사유를
+     *         차례로 받는 곳.
+     */
+    fn doh3_close_recorder_with(
+        respond: impl Fn(&mut H3Connection, u64, &Message) + Send + 'static,
+    ) -> (
+        SocketAddr,
+        Arc<TrustStore>,
+        Arc<AtomicUsize>,
+        std::sync::mpsc::Receiver<onetdns_quic::PeerClose>,
+    ) {
         let (scfg, trust) = doh3_server_config();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
+        let peers = Arc::new(AtomicUsize::new(0));
+        let peers_ret = peers.clone();
         let (closes, reported) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut conns: HashMap<SocketAddr, H3Connection> = HashMap::new();
@@ -388,6 +449,7 @@ mod tests {
                     continue;
                 };
                 let h3c = conns.entry(peer).or_insert_with(|| {
+                    peers.fetch_add(1, Ordering::Relaxed);
                     H3Connection::new(Connection::new_server(
                         scfg.clone(),
                         random_cid(),
@@ -408,7 +470,7 @@ mod tests {
                 }
                 for (sid, query) in h3c.take_requests() {
                     if let Ok(req) = Message::parse(&query) {
-                        let _ = h3c.send_response(sid, &answer(&req).try_encode().unwrap(), 0);
+                        respond(h3c, sid, &req);
                     }
                 }
                 while let Some(dg) = h3c.next_datagram() {
@@ -416,7 +478,7 @@ mod tests {
                 }
             }
         });
-        (addr, trust, reported)
+        (addr, trust, peers_ret, reported)
     }
 
     /** @brief 이 서버 구현이 처음 여는 단방향 스트림. HTTP/3 제어 스트림이다. */
@@ -656,6 +718,84 @@ mod tests {
         )
         .with_trust(trust);
         assert!(fwd.resolve(&q(1, "x.test")).is_err());
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x101, None));
+    }
+
+    /**
+     * @brief 이 업스트림에 질의 하나를 보낸 결과.
+     * @note 연결은 이 스레드의 풀에 들어가 스레드와 함께 버려진다.
+     */
+    fn exchange_once(addr: SocketAddr, trust: &TrustStore) -> Result<Message, ForwardError> {
+        let request = q(1, "page.test");
+        let wire = request.try_encode().unwrap();
+        exchange(
+            addr,
+            "dns.test",
+            "/dns-query",
+            &wire,
+            &request,
+            Duration::from_secs(5),
+            trust,
+        )
+    }
+
+    #[test]
+    /**
+     * @brief 404 HTML 페이지를 그 질의의 실패로만 다루고 연결은 계속 쓰는지.
+     * @details 200 이 아닌 답은 HTTP 메시지로 온전하고 연결도 멀쩡하다. H3_MESSAGE_ERROR 로
+     *          닫으면 서버는 자기 응답이 망가졌다고 받아들인다. 연결을 버리고 다시 보내면 같은
+     *          답을 받으려고 핸드셰이크를 한 번 더 한다.
+     */
+    fn doh3_error_page_fails_only_that_query() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let (addr, trust, peers, closes) = doh3_close_recorder_with(move |h3c, sid, _| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            answer_with_html_page(h3c, sid, b"404");
+        });
+        let results =
+            thread::spawn(move || [exchange_once(addr, &trust), exchange_once(addr, &trust)])
+                .join()
+                .unwrap();
+        for result in results {
+            assert_eq!(
+                result.err(),
+                Some(ForwardError::Io("DoH3 non-200 status: 404".into()))
+            );
+        }
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "오류 상태를 받은 질의를 다시 보냈습니다"
+        );
+        assert_eq!(
+            peers.load(Ordering::Relaxed),
+            1,
+            "오류 상태를 받은 연결을 버렸습니다"
+        );
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("스레드가 끝나며 버린 연결이 서버에 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x100, None));
+    }
+
+    #[test]
+    /**
+     * @brief DNS 메시지가 아닌 200 응답을 풀리지 않는 DNS 본문처럼 다루는지.
+     * @details RFC 8484 에서 200 응답은 DNS 메시지를 싣는다. 그 규약을 어긴 서버는
+     *          H3_GENERAL_PROTOCOL_ERROR 로 알리고, 질의는 질의와 맞지 않는 응답을 받았을 때처럼
+     *          실패한다.
+     */
+    fn doh3_success_status_without_a_dns_message_is_a_bad_response() {
+        let (addr, trust, _peers, closes) =
+            doh3_close_recorder_with(|h3c, sid, _| answer_with_html_page(h3c, sid, b"200"));
+        let result = thread::spawn(move || exchange_once(addr, &trust))
+            .join()
+            .unwrap();
+        assert_eq!(result.err(), Some(ForwardError::BadResponse));
         let close = closes
             .recv_timeout(Duration::from_secs(10))
             .expect("클라이언트가 종료를 알리지 않았습니다");

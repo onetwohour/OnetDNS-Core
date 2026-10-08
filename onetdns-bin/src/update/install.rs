@@ -771,7 +771,8 @@ mod tests {
             install.path(),
         )
         .expect("설치 경로에 복사");
-        let child = std::process::Command::new(install.path())
+        let mut command = std::process::Command::new(install.path());
+        command
             .args([
                 "--ignored",
                 "--exact",
@@ -779,9 +780,12 @@ mod tests {
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("설치 경로의 실행");
+            .stderr(std::process::Stdio::null());
+        /*
+         * 다른 테스트 스레드가 같은 때 띄운 자식이 방금 복사한 파일의 쓰기 핸들을 물려받아 쥐고
+         * 있으면 Linux 는 실행을 거부한다. 업데이트가 새 실행 파일을 띄울 때의 재시도를 쓴다.
+         */
+        let child = crate::update::apply::spawn(&mut command).expect("설치 경로의 실행");
         std::thread::sleep(Duration::from_millis(300));
         Running(child)
     }
