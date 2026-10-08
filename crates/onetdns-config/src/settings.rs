@@ -1483,7 +1483,7 @@ impl Default for Config {
             sharded_cache: false,
             cache_shards: 16,
             prefetch_interval_secs: 10,
-            prefetch_min_hits: 0,
+            prefetch_min_hits: 1,
             prefetch_ttl_pct: 90,
             dns64_synthall: false,
             rrset_roundrobin: false,

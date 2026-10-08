@@ -489,6 +489,96 @@ fn fixed_answer_cache() -> (Arc<dyn Resolver>, crate::cache::CacheHandle) {
 }
 
 #[test]
+/**
+ * @brief 질의의 RA·RCODE 비트가 응답 캐시를 정상 질의와 가르지 않는지.
+ * @details 두 비트는 질의에서 뜻이 없다. 지우지 않으면 캐시 키가 갈라져 그런 질의가 올 때마다
+ *          밖으로 나가고, 업스트림이 그 비트를 보고 준 답이 정상 질의와 같은 키에 담길 수도 있다.
+ */
+fn ra_and_rcode_query_bits_share_the_normal_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /** @brief resolve 호출 횟수를 세는 백엔드. */
+    struct Counting(Arc<AtomicUsize>);
+    impl Resolver for Counting {
+        /** @brief 세고 나서 정해진 답을 돌려준다. */
+        fn resolve(&self, request: &Message) -> Option<Message> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut response = base_response(request);
+            let name = request.questions.first().unwrap().name.clone();
+            response.answers.push(ApRecord::new(
+                name,
+                300,
+                ApRData::A(Ipv4Addr::new(1, 2, 3, 4)),
+            ));
+            Some(response)
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn Resolver> = Arc::new(crate::cache::CacheLayer::new(
+        Arc::new(Counting(calls.clone())),
+        64,
+        1,
+        0,
+        86_400,
+        0,
+        86_400,
+    ));
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    );
+
+    let plain = Message::query(
+        0x1001,
+        ApName::from_str("ra.example").unwrap(),
+        RecordType::A,
+    );
+    server.handle(&plain, &ctx()).expect("정상 질의 응답");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "대조군: 첫 질의가 백엔드를 한 번 부릅니다"
+    );
+
+    let mut ra = Message::query(
+        0x1002,
+        ApName::from_str("ra.example").unwrap(),
+        RecordType::A,
+    );
+    ra.header.recursion_available = true;
+    let response = server.handle(&ra, &ctx()).expect("RA 질의 응답");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "RA 비트가 선 질의도 정상 질의가 담은 캐시를 써서 백엔드를 다시 부르지 않아야 합니다"
+    );
+    assert_eq!(response.answers.len(), 1, "캐시에서 답을 돌려받아야 합니다");
+    assert!(
+        response.header.recursion_available,
+        "응답의 RA 는 서버가 세웁니다"
+    );
+
+    let mut other = Message::query(
+        0x1003,
+        ApName::from_str("other.example").unwrap(),
+        RecordType::A,
+    );
+    other.header.recursion_available = true;
+    server.handle(&other, &ctx()).expect("다른 이름 응답");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "대조군: 캐시에 없는 이름은 RA 질의라도 백엔드를 부릅니다"
+    );
+}
+
+#[test]
 /** @brief 빠른 경로가 질의 번호를 고쳐 내보내고, 세대가 다르면 쓰지 않는지. */
 fn wire_lane_hits_patch_id_and_respect_filter_generation() {
     use onetdns_runtime::WireDisposition;
@@ -6305,6 +6395,77 @@ fn empty_zone_predicate_and_block() {
         "home.arpa는 업스트림 미전달 NXDOMAIN"
     );
     assert_eq!(negative_soa_ttl(&resp), 60);
+}
+
+#[test]
+/**
+ * @brief 로컬에서 답해야 하는 IPv4 역방향 영역의 질의가 업스트림으로 나가지 않는지.
+ * @details 100.64.0.0/10 은 영역 64개다. 그중 하나만 잡으면 나머지 주소의 역방향 조회가
+ *          나간다. 영역 아래에 옥텟이 아닌 레이블이 붙은 DNS-SD 질의도 영역 안이다. 테스트
+ *          업스트림은 모든 질의에 NOERROR 로 답하므로 NXDOMAIN 이면 로컬에서 끊은 것이다.
+ */
+fn cgnat_reverse_never_reaches_upstream() {
+    let s = server_local_only(false, false, true);
+    let ptr = |name: &str| Message::query(0x1234, ApName::from_str(name).unwrap(), RecordType::PTR);
+    for name in [
+        "1.0.64.100.in-addr.arpa",
+        "9.8.100.100.in-addr.arpa",
+        "255.255.127.100.in-addr.arpa",
+        "127.100.in-addr.arpa",
+        "b._dns-sd._udp.0.0.65.100.in-addr.arpa",
+        "lb._dns-sd._udp.0.1.168.192.in-addr.arpa",
+        "db._dns-sd._udp.0.0.20.172.in-addr.arpa",
+    ] {
+        let resp = s.handle(&ptr(name), &ctx()).unwrap();
+        assert_eq!(
+            resp.header.rcode,
+            ResponseCode::NXDomain.0,
+            "{name} 의 질의가 업스트림으로 나갔습니다"
+        );
+    }
+    for name in [
+        "1.0.63.100.in-addr.arpa",
+        "1.0.128.100.in-addr.arpa",
+        "100.in-addr.arpa",
+        "lb._dns-sd._udp.0.0.8.8.in-addr.arpa",
+    ] {
+        let resp = s.handle(&ptr(name), &ctx()).unwrap();
+        assert_eq!(
+            resp.header.rcode,
+            ResponseCode::NoError.0,
+            "대조군이 무효입니다: 영역 밖인 {name} 은 업스트림이 답해야 합니다"
+        );
+    }
+}
+
+#[test]
+/**
+ * @brief RFC 6303 의 IPv6 역방향 영역을 빈 영역으로 보는지.
+ * @details 영역 이름의 니블을 손으로 적었으므로, 주소에서 역방향 이름을 따로 만들어 맞춰 본다.
+ */
+fn rfc6303_ipv6_reverse_zones_are_empty_zones() {
+    /** @brief 주소를 ip6.arpa 아래 역방향 이름으로 적는다. */
+    fn reverse(address: &str) -> ApName {
+        let address: std::net::Ipv6Addr = address.parse().unwrap();
+        let mut name = String::new();
+        for byte in address.octets().iter().rev() {
+            name.push_str(&format!("{:x}.{:x}.", byte & 0x0f, byte >> 4));
+        }
+        name.push_str("ip6.arpa");
+        ApName::from_str(&name).unwrap()
+    }
+    for address in ["::", "::1", "2001:db8::1", "2001:db8:ffff:ffff::"] {
+        assert!(
+            is_empty_zone(&reverse(address)),
+            "{address} 의 역방향 이름을 빈 영역으로 보지 않습니다"
+        );
+    }
+    for address in ["::2", "2001:db9::1", "2001:4860::8888"] {
+        assert!(
+            !is_empty_zone(&reverse(address)),
+            "{address} 는 빈 영역이 아닙니다"
+        );
+    }
 }
 
 #[test]

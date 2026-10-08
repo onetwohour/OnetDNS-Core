@@ -3197,6 +3197,71 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 무할당 경로가 받는 질의마다 구조화 키도 같은 바이트로 만드는지.
+     * @details 헤더 플래그 두 바이트는 모든 조합을, OPT 의 UDP 크기와 TTL 은 바이트마다 모든 값을
+     *          넣어 본다. 무할당 경로가 받았는데 구조화 키가 없으면 일반 경로가 캐시하지 않는
+     *          질의에 담아 둔 답을 주고, 키가 다르면 다른 질의와 답을 나눠 쓴다.
+     */
+    fn wire_scanner_accepts_only_what_the_structured_key_accepts() {
+        let name = Name::from_str("Scan.Parity.test").unwrap();
+        let plain = Message::query(1, name.clone(), RecordType::A)
+            .try_encode()
+            .unwrap();
+        let mut padded = Message::query(2, name, RecordType::AAAA);
+        let mut edns = onetdns_proto::Edns::default();
+        edns.options.push((onetdns_proto::EDNS_PADDING, vec![0; 4]));
+        padded.additionals.push(edns.try_to_record().unwrap());
+        let padded = padded.try_encode().unwrap();
+        /* OPT 는 마지막 레코드다. 이름(루트) 1, 종류 2, UDP 크기 2, TTL 4, RDLENGTH 2, 옵션 8. */
+        let opt = padded.len() - (1 + 2 + 2 + 4 + 2 + 8);
+        assert_eq!(
+            &padded[opt..opt + 3],
+            &[0, 0, 41],
+            "대조군이 무효입니다: OPT 위치"
+        );
+
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut check = |packet: &[u8]| {
+            let Some(scanned) = crate::wirecache::scan_query(packet) else {
+                rejected += 1;
+                return;
+            };
+            accepted += 1;
+            let request = Message::parse(packet).unwrap_or_else(|error| {
+                panic!("무할당 경로가 받은 질의를 파서가 거부합니다({error:?}): {packet:02x?}")
+            });
+            let structured = FlightKey::from_request(&request).unwrap_or_else(|| {
+                panic!("무할당 경로가 받은 질의로 구조화 키를 만들지 못합니다: {packet:02x?}")
+            });
+            assert_eq!(
+                scanned.key(),
+                structured.as_slice(),
+                "두 키가 다릅니다: {packet:02x?}"
+            );
+        };
+        for base in [&plain, &padded] {
+            for flags in 0..=u16::MAX {
+                let mut packet = base.clone();
+                packet[2..4].copy_from_slice(&flags.to_be_bytes());
+                check(&packet);
+            }
+        }
+        for offset in opt + 3..opt + 9 {
+            for value in 0..=u8::MAX {
+                let mut packet = padded.clone();
+                packet[offset] = value;
+                check(&packet);
+            }
+        }
+        assert!(
+            accepted > 0 && rejected > 0,
+            "대조군이 무효입니다: 받은 질의 {accepted}개, 거부한 질의 {rejected}개"
+        );
+    }
+
+    #[test]
     /** @brief 질의 종류가 다르면 다른 곳인지. */
     fn qtype_separated() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);

@@ -169,6 +169,20 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
         Some(&self.node(idx).val)
     }
 
+    /**
+     * @brief 값을 가변으로 빌리되 최근성 순서를 바꾸지 않는다.
+     * @note 뒤에서 도는 작업이 항목을 고칠 때 쓴다. 그 작업이 순서를 올리면 아무도 찾지 않는
+     *       항목이 퇴거되지 않고 남는다.
+     */
+    pub fn peek_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = self.find_index(key)?;
+        self.nodes[idx as usize].as_mut().map(|node| &mut node.val)
+    }
+
     /** @brief 모든 항목을 버린다. 아레나 할당은 유지해 재로드 시 다시 잡지 않는다. */
     pub fn clear(&mut self) {
         self.map.clear();
@@ -381,6 +395,29 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
         let hash = self.key_hash(&self.node(tail).key);
         let node = self.remove_index(tail, hash);
         Some((node.key, node.val))
+    }
+
+    /**
+     * @brief keep 이 거짓을 돌려준 항목을 모두 제거한다.
+     * @details 남은 항목의 최근성 순서는 바꾸지 않는다. keep 은 항목마다 한 번 불리며, 부르는
+     *          순서는 정해져 있지 않다.
+     */
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        for slot in 0..self.nodes.len() {
+            let kept = match self.nodes[slot].as_mut() {
+                Some(node) => keep(&node.key, &mut node.val),
+                None => continue,
+            };
+            if !kept {
+                let index = NodeIndex::try_from(slot)
+                    .expect("LRU node index must fit the u32 range checked at construction");
+                let hash = self.key_hash(&self.node(index).key);
+                self.remove_index(index, hash);
+            }
+        }
     }
 
     /**
@@ -680,6 +717,28 @@ mod tests {
                     map.clear();
                     reference.clear();
                     order.clear();
+                }
+                14 if step % 7 == 0 => {
+                    /* 남는 항목은 값만 바뀌고 밀려나는 순서는 그대로여야 한다. */
+                    let keep = |key: u16| (u32::from(key) ^ step) % 4 != 0;
+                    map.retain(|key, value| {
+                        *value = value.wrapping_add(1);
+                        keep(*key)
+                    });
+                    reference.retain(|key, value| {
+                        *value = value.wrapping_add(1);
+                        keep(*key)
+                    });
+                    order.retain(|key| reference.contains_key(key));
+                }
+                15 => {
+                    /* 값을 고쳐도 최근성은 올리지 않는다. 올리면 뒤의 pop_lru 가 다른 키를 낸다. */
+                    if let Some(value) = map.peek_mut(&key) {
+                        *value = step;
+                    }
+                    if let Some(value) = reference.get_mut(&key) {
+                        *value = step;
+                    }
                 }
                 _ => {}
             }

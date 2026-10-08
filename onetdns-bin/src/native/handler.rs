@@ -247,6 +247,15 @@ impl Handler for NativeServer {
             return R::Fallback;
         }
         /*
+         * RA 와 RCODE 는 질의에서 뜻이 없다. 구조적 경로는 그 비트를 지워 정상 질의와 같은
+         * 캐시를 쓰는데, 이 레인은 handle_inner 를 거치지 않아 그 정규화가 없다. 여기서 맡으면
+         * 그 비트가 선 질의의 답이 이 레인 캐시에 정상 질의와 다른 열쇠로 들어간다. 구조적
+         * 경로로 넘긴다.
+         */
+        if request.header.recursion_available || request.header.rcode != 0 {
+            return R::Fallback;
+        }
+        /*
          * lenient는 쿠키 없는 질의만 이 레인에 맡긴다. COOKIE 질의는 정상 경로가 서버
          * 쿠키를 발급·검증해야 하므로, 여기서 답하면 보안 기능이 없는 것처럼 보인다.
          */

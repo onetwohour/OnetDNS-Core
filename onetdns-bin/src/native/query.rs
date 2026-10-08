@@ -652,17 +652,27 @@ impl NativeServer {
             }
         }
 
-        let resolve_req = if resolve_name == *qname && request.additionals.is_empty() {
-            Cow::Borrowed(request)
-        } else {
-            let mut rewritten = request.clone();
-            if let Some(question) = rewritten.questions.first_mut() {
-                question.name = resolve_name.clone();
-                question.qtype = qtype;
-            }
-            strip_client_hop_edns(&mut rewritten);
-            Cow::Owned(rewritten)
-        };
+        /*
+         * RA 와 RCODE 는 질의에서 뜻이 없다. 그대로 두면 업스트림이 그 비트를 보고 다른 답을
+         * 줄 수 있고, 캐시 키가 정상 질의와 갈라져 매번 밖으로 나간다. 지워서 정상 질의와 같은
+         * 캐시를 쓰게 한다. 응답의 RA 와 RCODE 는 이 서버가 따로 정하므로 지워도 클라이언트가
+         * 받는 답은 달라지지 않는다.
+         */
+        let normalize_header = request.header.recursion_available || request.header.rcode != 0;
+        let resolve_req =
+            if resolve_name == *qname && request.additionals.is_empty() && !normalize_header {
+                Cow::Borrowed(request)
+            } else {
+                let mut rewritten = request.clone();
+                if let Some(question) = rewritten.questions.first_mut() {
+                    question.name = resolve_name.clone();
+                    question.qtype = qtype;
+                }
+                strip_client_hop_edns(&mut rewritten);
+                rewritten.header.recursion_available = false;
+                rewritten.header.rcode = 0;
+                Cow::Owned(rewritten)
+            };
 
         onetdns_forward::clear_response_source();
         let response = match self.resolve_for(&resolve_req, &scope.client) {

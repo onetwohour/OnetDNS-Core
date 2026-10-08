@@ -1366,8 +1366,11 @@ impl Recursor {
                         _ => {}
                     }
                 } else {
-                    let status =
+                    let (status, proof) =
                         self.validate_denial_status(qname, qtype, &out, &chain, budget.deadline);
+                    if !proof.is_empty() {
+                        out.authorities = proof;
+                    }
                     rtrace!(
                         "DNSSEC denial proof validation: name={}, status={:?}",
                         qname.to_ascii_lower(),
@@ -1505,7 +1508,12 @@ impl Recursor {
         }
         if resp.header.rcode == ResponseCode::NXDomain.0 {
             let status = if validate {
-                self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline)
+                let (status, proof) =
+                    self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline);
+                if !proof.is_empty() {
+                    resp.authorities = proof;
+                }
+                status
             } else {
                 SecurityStatus::Insecure
             };
@@ -1546,7 +1554,12 @@ impl Recursor {
         }
 
         let status = if validate {
-            self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline)
+            let (status, proof) =
+                self.validate_denial_status(qname, qtype, &resp, &chain, budget.deadline);
+            if !proof.is_empty() {
+                resp.authorities = proof;
+            }
+            status
         } else {
             SecurityStatus::Insecure
         };
@@ -1726,7 +1739,11 @@ impl Recursor {
         })
     }
 
-    /** @brief 부정 응답의 DNSSEC 상태를 판정한다. */
+    /**
+     * @brief 부정 응답의 DNSSEC 상태를 판정하고 검증에 쓴 증명을 함께 돌려준다.
+     * @return 상태와, 검증이 성립할 때 담아도 되는 권한 절 레코드. 성립하지 않으면 레코드는
+     *         비어 있고 호출자는 원래 응답을 그대로 둔다.
+     */
     fn validate_denial_status(
         &self,
         qname: &Name,
@@ -1734,13 +1751,13 @@ impl Recursor {
         out: &Message,
         chain: &[ZoneStep],
         deadline: Instant,
-    ) -> SecurityStatus {
+    ) -> (SecurityStatus, Vec<Record>) {
         if self.is_domain_insecure(qname) {
-            return SecurityStatus::Insecure;
+            return (SecurityStatus::Insecure, Vec::new());
         }
         let keys = match self.validated_chain_keys(chain, deadline) {
             Ok(keys) => keys,
-            Err(status) => return status,
+            Err(status) => return (status, Vec::new()),
         };
         self.validate_denial_with_keys(qname, qtype, out, chain, &keys)
     }
@@ -1752,6 +1769,9 @@ impl Recursor {
      *          그다음 NSEC이나 NSEC3으로 실제 부재를 증명한다.
      * @warning 먼저 구문상 최소 증명을 고르고 그 RRset만 검증한다. 순서를 뒤집으면 응답을
      *          무관한 서명 레코드로 채워 공개키 연산을 강요할 수 있다.
+     * @return 상태와, 검증이 성립할 때 담아도 되는 권한 절 레코드. apex SOA 와 실제로 검증한
+     *         증명, 그 서명만 담는다. 호출자는 검증되지 않은 NSEC 이 응답에 남지 않도록 이
+     *         레코드로 권한 절을 덮어쓴다.
      */
     fn validate_denial_with_keys(
         &self,
@@ -1760,10 +1780,10 @@ impl Recursor {
         out: &Message,
         chain: &[ZoneStep],
         keys: &[onetdns_dnssec::Dnskey],
-    ) -> SecurityStatus {
+    ) -> (SecurityStatus, Vec<Record>) {
         let now = now_secs();
         let Some(apex) = chain.last().map(|step| &step.zone) else {
-            return SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS);
+            return (SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS), Vec::new());
         };
 
         let soa: Vec<Record> = out
@@ -1777,7 +1797,7 @@ impl Recursor {
             .cloned()
             .collect();
         if soa.len() != 1 {
-            return SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS);
+            return (SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS), Vec::new());
         }
         let mut verification_budget = onetdns_dnssec::VerificationBudget::new();
         let soa_sigs = extract_rrsigs(&out.authorities, RecordType::SOA.0, apex);
@@ -1791,7 +1811,7 @@ impl Recursor {
         )
         .is_err()
         {
-            return SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS);
+            return (SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS), Vec::new());
         }
 
         let denial_records = |rtype| {
@@ -1826,7 +1846,8 @@ impl Recursor {
                     now,
                     &mut verification_budget,
                 ) {
-                    return SecurityStatus::Secure;
+                    let records = validated_denial_records(&soa, &proof, &out.authorities);
+                    return (SecurityStatus::Secure, records);
                 }
             }
             if nsec3_allowed {
@@ -1841,15 +1862,17 @@ impl Recursor {
                         now,
                         &mut verification_budget,
                     ) {
-                        return if relies_on_opt_out {
+                        let status = if relies_on_opt_out {
                             SecurityStatus::Insecure
                         } else {
                             SecurityStatus::Secure
                         };
+                        let records = validated_denial_records(&soa, &proof, &out.authorities);
+                        return (status, records);
                     }
                 }
             }
-            return SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS);
+            return (SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS), Vec::new());
         }
 
         if let Some(proof) = onetdns_dnssec::nsec_nodata_proof(&nsec, qname, qtype.0) {
@@ -1861,7 +1884,8 @@ impl Recursor {
                 now,
                 &mut verification_budget,
             ) {
-                return SecurityStatus::Secure;
+                let records = validated_denial_records(&soa, &proof, &out.authorities);
+                return (SecurityStatus::Secure, records);
             }
         }
         if nsec3_allowed {
@@ -1874,11 +1898,12 @@ impl Recursor {
                     now,
                     &mut verification_budget,
                 ) {
-                    return SecurityStatus::Secure;
+                    let records = validated_denial_records(&soa, &proof, &out.authorities);
+                    return (SecurityStatus::Secure, records);
                 }
             }
         }
-        denial_bogus
+        (denial_bogus, Vec::new())
     }
 
     /**
@@ -2096,13 +2121,13 @@ impl Recursor {
         msg: &Message,
         chain: &[ZoneStep],
         positive: bool,
-    ) -> Option<SecurityStatus> {
+    ) -> Option<(SecurityStatus, Vec<Record>)> {
         if positive {
             if let Some(status) = self.answer_status_without_keys(qname, qtype) {
-                return Some(status);
+                return Some((status, Vec::new()));
             }
         } else if self.is_domain_insecure(qname) {
-            return Some(SecurityStatus::Insecure);
+            return Some((SecurityStatus::Insecure, Vec::new()));
         }
         if self.cached_chain_trust(chain).is_none() {
             if !chain.first().is_some_and(|step| step.zone.is_root()) {
@@ -2115,10 +2140,13 @@ impl Recursor {
 
         let keys = match self.validated_chain_keys(chain, Instant::now()) {
             Ok(keys) => keys,
-            Err(status) => return Some(status),
+            Err(status) => return Some((status, Vec::new())),
         };
         Some(if positive {
-            self.validate_answer_with_keys(qname, qtype, msg, chain, &keys)
+            (
+                self.validate_answer_with_keys(qname, qtype, msg, chain, &keys),
+                Vec::new(),
+            )
         } else {
             self.validate_denial_with_keys(qname, qtype, msg, chain, &keys)
         })
@@ -3842,6 +3870,42 @@ fn validate_denial_proof(
             )
             .is_ok()
         })
+}
+
+/**
+ * @brief 검증에 실제로 쓴 부재 증명 레코드만 모은다.
+ * @details apex SOA 와 고른 증명 레코드, 그리고 그것들을 덮는 서명만 남긴다. AD 를 세운
+ *          응답이 검증하지 않은 NSEC 을 싣고 나가면, 위쪽 부재 합성 계층이 그 NSEC 을 믿고
+ *          담아 같은 영역의 무관한 이름까지 없다고 답한다.
+ * @return 담아 둘 수 있는 권한 절 레코드.
+ */
+fn validated_denial_records(
+    soa: &[Record],
+    proof: &[Record],
+    authorities: &[Record],
+) -> Vec<Record> {
+    let mut kept: Vec<Record> = Vec::with_capacity(soa.len() + proof.len());
+    kept.extend(soa.iter().cloned());
+    kept.extend(proof.iter().cloned());
+    let covered: Vec<(Vec<u8>, u16)> = kept
+        .iter()
+        .map(|record| (record.name.canonical_key(), record.rtype.0))
+        .collect();
+    let signatures: Vec<Record> = authorities
+        .iter()
+        .filter(|record| record.class == DnsClass::IN && record.rtype == RecordType::RRSIG)
+        .filter(|record| {
+            onetdns_dnssec::Rrsig::from_record(record).is_some_and(|signature| {
+                let owner = record.name.canonical_key();
+                covered
+                    .iter()
+                    .any(|(name, rtype)| *rtype == signature.type_covered && *name == owner)
+            })
+        })
+        .cloned()
+        .collect();
+    kept.extend(signatures);
+    kept
 }
 
 /** @brief 이름이 zone 안인지. */
@@ -6353,6 +6417,7 @@ mod tests {
                 &chain,
                 Instant::now() + Duration::from_secs(1),
             )
+            .0
         };
 
         assert_eq!(status("test", &soa, true), SecurityStatus::Secure);
@@ -6451,9 +6516,123 @@ mod tests {
 
         assert_eq!(
             recursor
-                .validate_denial_with_keys(&qname, RecordType::AAAA, &response, &chain, &[key],),
+                .validate_denial_with_keys(&qname, RecordType::AAAA, &response, &chain, &[key],)
+                .0,
             SecurityStatus::Secure,
             "무관한 서명 RRset의 개수가 검증 순서나 판정을 좌우하면 안 된다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 검증한 부재 응답이 검증한 증명만 싣고 나가는지.
+     * @details 공격자 키로 서명한 무관한 NSEC을 권한 절에 끼워 넣어도, 그것은 이 질의의 최소
+     *          증명이 아니므로 검증에 쓰이지 않는다. 그런 NSEC이 AD를 세운 응답에 그대로 남으면
+     *          위쪽 부재 합성 계층이 그것을 믿고 담아 같은 영역의 다른 이름을 없다고 답한다.
+     */
+    fn validated_denial_carries_only_the_proven_records() {
+        let (signing_key, key) = ecdsa_key(81);
+        let (attacker_key, attacker_pub) = ecdsa_key(82);
+        let apex = Name::from_str("test").unwrap();
+        let qname = Name::from_str("host.test").unwrap();
+        let recursor = Recursor::new(vec![], Duration::from_secs(1));
+        let chain = [ZoneStep {
+            zone: apex.clone(),
+            servers: vec![],
+            ns_names: vec![],
+            ds_records: vec![],
+            ds_rrsigs: vec![],
+            ds_nsec_records: vec![],
+            ds_nsec_rrsigs: vec![],
+            ds_nsec3_records: vec![],
+            ds_nsec3_rrsigs: vec![],
+            ds: vec![],
+        }];
+        let soa = Record::new(
+            apex.clone(),
+            3600,
+            RData::soa(onetdns_proto::Soa {
+                mname: Name::from_str("ns.test").unwrap(),
+                rname: Name::from_str("hostmaster.test").unwrap(),
+                serial: 1,
+                refresh: 3600,
+                retry: 600,
+                expire: 86_400,
+                minimum: 300,
+            }),
+        );
+        let mut response = Message::default();
+        response.authorities.push(soa.clone());
+        response.authorities.push(rrsig_rec(
+            &signing_key,
+            &key,
+            "test",
+            RecordType::SOA.0,
+            std::slice::from_ref(&soa),
+        ));
+        let proven = nsec_rec(
+            "host.test",
+            "hosta.test",
+            &[RecordType::A.0, RecordType::RRSIG.0, RecordType::NSEC.0],
+        );
+        response.authorities.push(proven.clone());
+        response.authorities.push(rrsig_rec(
+            &signing_key,
+            &key,
+            "test",
+            RecordType::NSEC.0,
+            std::slice::from_ref(&proven),
+        ));
+        let forged = nsec_rec(
+            "test",
+            "host.test",
+            &[
+                RecordType::NS.0,
+                RecordType::SOA.0,
+                RecordType::RRSIG.0,
+                RecordType::NSEC.0,
+            ],
+        );
+        response.authorities.push(forged.clone());
+        response.authorities.push(rrsig_rec(
+            &attacker_key,
+            &attacker_pub,
+            "test",
+            RecordType::NSEC.0,
+            std::slice::from_ref(&forged),
+        ));
+
+        let (status, records) =
+            recursor.validate_denial_with_keys(&qname, RecordType::AAAA, &response, &chain, &[key]);
+        assert_eq!(
+            status,
+            SecurityStatus::Secure,
+            "실제 증명은 유효하므로 Secure"
+        );
+        assert!(
+            records.iter().any(
+                |record| record.rtype == RecordType::NSEC && record.name.eq_ignore_case(&qname)
+            ),
+            "검증한 증명 NSEC은 남아야 합니다"
+        );
+        assert!(
+            records.iter().any(|record| record.rtype == RecordType::SOA),
+            "부정 수명의 근거인 SOA는 남아야 합니다"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.rtype == RecordType::NSEC && record.name.eq_ignore_case(&apex)),
+            "검증에 쓰이지 않은 끼워 넣은 NSEC은 남으면 안 됩니다"
+        );
+        assert!(
+            !records.iter().any(|record| {
+                record.rtype == RecordType::RRSIG
+                    && record.name.eq_ignore_case(&apex)
+                    && onetdns_dnssec::Rrsig::from_record(record)
+                        .is_some_and(|signature| signature.type_covered == RecordType::NSEC.0)
+            }),
+            "끼워 넣은 NSEC의 서명도 남으면 안 됩니다"
         );
     }
 
@@ -6593,13 +6772,15 @@ mod tests {
             response.authorities.push(valid_soa_sig.clone());
             response.authorities.push(nsec.clone());
             response.authorities.push(nsec_sig.clone());
-            recursor.validate_denial_with_keys(
-                &qname,
-                RecordType::AAAA,
-                &response,
-                &chain,
-                std::slice::from_ref(&key),
-            )
+            recursor
+                .validate_denial_with_keys(
+                    &qname,
+                    RecordType::AAAA,
+                    &response,
+                    &chain,
+                    std::slice::from_ref(&key),
+                )
+                .0
         };
 
         assert_eq!(

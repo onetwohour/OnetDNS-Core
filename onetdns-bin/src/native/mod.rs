@@ -341,8 +341,44 @@ pub(crate) fn normalized_text_name(name: &ApName) -> Option<String> {
     Some(out)
 }
 
+/**
+ * @brief in-addr.arpa 아래 이름을 주소의 앞쪽 옥텟부터 읽는다.
+ * @details 위에서부터 읽다가 옥텟이 아닌 레이블을 만나면 멈춘다.
+ * @return in-addr.arpa 아래가 아니면 없다. 읽은 옥텟과, 그 아래 레이블이 모두 옥텟이었는지.
+ */
+fn reverse_v4_octets(name: &ApName) -> Option<(Vec<u8>, bool)> {
+    let mut labels = name.labels().rev();
+    if !labels.next()?.eq_ignore_ascii_case(b"arpa")
+        || !labels.next()?.eq_ignore_ascii_case(b"in-addr")
+    {
+        return None;
+    }
+    let mut octets = Vec::new();
+    for label in labels {
+        match std::str::from_utf8(label)
+            .ok()
+            .and_then(|text| text.parse::<u8>().ok())
+        {
+            Some(octet) => octets.push(octet),
+            None => return Some((octets, false)),
+        }
+    }
+    Some((octets, true))
+}
+
+/** @brief 주소의 앞쪽 옥텟이 내부망 범위인지. 옥텟이 모자라면 아니라고 본다. */
+fn is_private_v4(octets: &[u8]) -> bool {
+    matches!(
+        octets,
+        [10, ..] | [127, ..] | [192, 168, ..] | [169, 254, ..]
+    ) || matches!(octets, [172, b, ..] if (16u8..=31).contains(b))
+}
+
 /** @brief 내부망 주소를 거꾸로 적은 이름인지. */
 pub(crate) fn is_private_reverse(name: &ApName) -> bool {
+    if let Some((octets, whole)) = reverse_v4_octets(name) {
+        return whole && is_private_v4(&octets);
+    }
     let labels: Vec<String> = name
         .labels()
         .iter()
@@ -351,20 +387,6 @@ pub(crate) fn is_private_reverse(name: &ApName) -> bool {
     let n = labels.len();
     if n < 3 {
         return false;
-    }
-    if labels[n - 2] == "in-addr" && labels[n - 1] == "arpa" {
-        let octs: Vec<u8> = labels[..n - 2]
-            .iter()
-            .rev()
-            .filter_map(|s| s.parse::<u8>().ok())
-            .collect();
-        if octs.len() != n - 2 {
-            return false;
-        }
-        return matches!(
-            octs.as_slice(),
-            [10, ..] | [127, ..] | [192, 168, ..] | [169, 254, ..]
-        ) || matches!(octs.as_slice(), [172, b, ..] if (16u8..=31).contains(b));
     }
     if labels[n - 2] == "ip6" && labels[n - 1] == "arpa" {
         let nibs = &labels[..n - 2];
@@ -385,7 +407,16 @@ pub(crate) fn is_private_reverse(name: &ApName) -> bool {
 
 /** @brief 밖에 물으면 안 되는 이름인지. */
 pub(crate) fn is_empty_zone(name: &ApName) -> bool {
-    if is_private_reverse(name) {
+    if let Some((octets, _)) = reverse_v4_octets(name) {
+        /* 영역은 꼭대기의 옥텟으로 정해지고, 그 아래는 옥텟이 아닌 레이블이어도 영역 안이다.
+         * DNS-SD 는 서브넷마다 lb._dns-sd._udp.0.1.168.192.in-addr.arpa 같은 이름을 묻는다.
+         * 100.64.0.0/10 은 통신사 NAT 가 쓰는 공유 주소로, RFC 7793 이 영역 64개로 나눠 둔다. */
+        if is_private_v4(&octets)
+            || matches!(octets.as_slice(), [100, b, ..] if (64u8..=127).contains(b))
+        {
+            return true;
+        }
+    } else if is_private_reverse(name) {
         return true;
     }
     let s = name.to_ascii_lower();
@@ -399,11 +430,13 @@ pub(crate) fn is_empty_zone(name: &ApName) -> bool {
         "2.0.192.in-addr.arpa",
         "100.51.198.in-addr.arpa",
         "113.0.203.in-addr.arpa",
-        "64.100.in-addr.arpa",
         "8.e.f.ip6.arpa",
         "9.e.f.ip6.arpa",
         "a.e.f.ip6.arpa",
         "b.e.f.ip6.arpa",
+        "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+        "8.b.d.0.1.0.0.2.ip6.arpa",
     ];
     ZONES
         .iter()

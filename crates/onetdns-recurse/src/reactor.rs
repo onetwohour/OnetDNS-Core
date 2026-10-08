@@ -959,7 +959,7 @@ impl Reactor {
                             };
                             if hops < limit {
                                 if validating {
-                                    let Some(status) = r.validate_terminal_without_fetch(
+                                    let Some((status, _)) = r.validate_terminal_without_fetch(
                                         &hop.owner, hop.atype, &final_msg, chain, true,
                                     ) else {
                                         self.retry_root(&root, out);
@@ -1099,7 +1099,7 @@ impl Reactor {
                 self.retry_root(&root, out);
                 return;
             }
-            let Some(status) = r.validate_terminal_without_fetch(
+            let Some((status, proof)) = r.validate_terminal_without_fetch(
                 &session.qname,
                 session.qtype,
                 &msg,
@@ -1109,6 +1109,9 @@ impl Reactor {
                 self.retry_root(&root, out);
                 return;
             };
+            if !proof.is_empty() {
+                msg.authorities = proof;
+            }
             match root.acc_status.combine(status) {
                 crate::SecurityStatus::Secure => msg.header.authentic_data = true,
                 crate::SecurityStatus::Bogus(ede) if !r.permissive => {

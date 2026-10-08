@@ -120,6 +120,9 @@ impl ScannedQuery<'_> {
  * @warning 응답을 달리 만들 여지가 있는 것은 모두 거부한다. 여러 질문, 특수한 종류,
  *          내용 있는 EDNS 옵션, 남는 바이트가 그렇다. 하나라도 놓치면 다른 질의에
  *          같은 답을 준다.
+ * @invariant 구조화 캐시가 키를 만들지 않는 질의는 받지 않는다. 받으면 일반 경로는 캐시를
+ *            거치지 않고 해석하는 질의에 이 경로가 담아 둔 답을 내준다. 더 적게 받는 것은
+ *            괜찮다. 그런 질의는 일반 경로로 넘어갈 뿐이다.
  * @return 훑은 결과. 이 경로로 답할 수 없는 질의면 없다.
  */
 pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
@@ -133,7 +136,8 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         return None;
     }
 
-    if flags3 & 0x0F != 0 || flags3 & 0x40 != 0 {
+    /* RA 와 RCODE 는 질의에서 뜻이 없지만 구조화 키가 거부하므로 같이 거부한다. */
+    if flags3 & 0x80 != 0 || flags3 & 0x40 != 0 || flags3 & 0x0F != 0 {
         return None;
     }
     let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
@@ -213,7 +217,9 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         let udp_payload = u16::from_be_bytes([*packet.get(pos + 3)?, *packet.get(pos + 4)?]);
         let ext = packet.get(pos + 5..pos + 9)?;
 
-        if ext[1] != 0 {
+        /* 첫 바이트는 RCODE 의 위쪽 8비트다. 파서가 이것을 헤더의 RCODE 에 합치므로 0 이
+         * 아니면 구조화 키가 거부한다. */
+        if ext[0] != 0 || ext[1] != 0 {
             return None;
         }
         let do_bit = ext[2] & 0x80 != 0;
@@ -982,6 +988,43 @@ mod tests {
 
         let any = query_wire("x.test", RecordType(255), false);
         assert!(scan_query(&any).is_none(), "ANY는 슬로우패스");
+    }
+
+    #[test]
+    /**
+     * @brief 구조화 키가 거부하는 RA 비트와 확장 RCODE 를 거부하는지.
+     * @details 이 둘을 받으면, 일반 경로는 캐시를 거치지 않고 해석하는 질의에 이 경로가 담아 둔
+     *          답을 내준다.
+     */
+    fn scan_rejects_ra_and_extended_rcode() {
+        let mut message = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
+        message
+            .additionals
+            .push(Edns::default().try_to_record().unwrap());
+        let packet = message.try_encode().unwrap();
+        assert!(
+            scan_query(&packet).is_some(),
+            "대조군이 무효입니다: 평범한 EDNS 질의"
+        );
+
+        let mut with_ra = packet.clone();
+        with_ra[3] |= 0x80;
+        assert!(scan_query(&with_ra).is_none(), "RA 를 켠 질의를 받았습니다");
+
+        /* OPT 는 질의의 마지막 레코드다. 이름(루트) 1, 종류 2, UDP 크기 2 다음이 TTL 이고,
+         * 그 첫 바이트가 RCODE 의 위쪽 8비트다. */
+        let ttl = packet.len() - (4 + 2);
+        assert_eq!(
+            &packet[ttl - 4..ttl - 2],
+            &[0, 41],
+            "대조군이 무효입니다: OPT 위치"
+        );
+        let mut with_extended_rcode = packet;
+        with_extended_rcode[ttl] = 1;
+        assert!(
+            scan_query(&with_extended_rcode).is_none(),
+            "확장 RCODE 가 0 이 아닌 질의를 받았습니다"
+        );
     }
 
     #[test]
