@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 /** @brief 실행되는 바이너리에 들어와도 되는 외부 크레이트. */
 const RUNTIME_ALLOWED: &[&str] = &[
-    // 검증된 암호 크레이트
+    /* 검증된 암호 크레이트 */
     "x25519-dalek",
     "ed25519-dalek",
     "chacha20poly1305",
@@ -29,20 +29,25 @@ const RUNTIME_ALLOWED: &[&str] = &[
     "p256",
     "p384",
     "zeroize",
-    // QUIC 헤더 보호와 DNSCrypt 의 crypto_secretbox 구성은 AEAD 가 노출하지 않는 원시
-    // 블록 연산이 필요하다. 세 크레이트는 위 AEAD 의 전이 의존이라 새 코드가 아니다.
+    /*
+     * QUIC 헤더 보호와 DNSCrypt 의 crypto_secretbox 구성은 AEAD 가 노출하지 않는 원시
+     * 블록 연산이 필요하다. 세 크레이트는 위 AEAD 의 전이 의존이라 새 코드가 아니다.
+     */
     "aes",
     "chacha20",
     "poly1305",
-    // Unix 플랫폼 바인딩. Windows 서비스 제어는 트리 안 바인딩을 쓴다.
+    /* Unix 플랫폼 바인딩. Windows 서비스 제어는 트리 안 바인딩을 쓴다. */
     "libc",
 ];
 
 /** @brief 테스트와 벤치에서만 쓰는 크레이트. 출하 바이너리에 들어가지 않는다. */
 const DEV_ALLOWED: &[&str] = &[
-    "hickory-proto", // 이 서버의 코덱 결과와 교차 대조
-    "rcgen",         // 테스트용 인증서 생성
-    "wat",           // WASM 텍스트를 바이너리로
+    /* 이 서버의 코덱 결과와 교차 대조한다. */
+    "hickory-proto",
+    /* 테스트용 인증서를 만든다. */
+    "rcgen",
+    /* WASM 텍스트를 바이너리로 바꾼다. */
+    "wat",
 ];
 
 /** @brief 검사할 매니페스트 전부. */
@@ -130,7 +135,7 @@ fn declared() -> (
                 .insert(where_.clone());
         }
     }
-    // 런타임에도 나오는 크레이트는 dev 전용이 아니다.
+    /* 런타임에도 나오는 크레이트는 dev 전용이 아니다. */
     for crate_name in runtime.keys() {
         dev.remove(crate_name);
     }
@@ -207,7 +212,7 @@ fn section_and_entry_parsing_separate_arrays_from_dependencies() {
         dependency_section("target.'cfg(unix)'.dependencies"),
         (true, false)
     );
-    // 배열 절을 의존성으로 보면 그 안의 name 항목이 크레이트로 새어 들어온다.
+    /* 배열 절을 의존성으로 보면 그 안의 name 항목이 크레이트로 새어 들어온다. */
     assert_eq!(dependency_section("bench"), (false, false));
 
     assert_eq!(

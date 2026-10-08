@@ -1331,8 +1331,10 @@ impl SecondaryXfrAdmission {
             reservation: self.budget.reservation(),
             wire_bytes: 0,
             progress_deadline: XfrProgressDeadline::new(now, timeout),
-            // 접속은 아직 읽을 바이트가 없으므로 기본 전체 시간까지 허용한다. 연결된 뒤부터
-            // write/read 진전마다 짧은 무진전 데드라인으로 바뀐다.
+            /*
+             * 접속은 아직 읽을 바이트가 없으므로 기본 전체 시간까지 허용한다. 연결된 뒤부터
+             * write/read 진전마다 짧은 무진전 데드라인으로 바뀐다.
+             */
             idle_deadline: now + timeout,
             state: SecondaryXfrAdmissionState::Connecting,
         });

@@ -84,7 +84,7 @@ impl DdrLayer {
         })?;
         let mut records = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
-            // 매개변수는 키 오름차순이어야 한다. 인코더가 그것을 검사한다.
+            /* 매개변수는 키 오름차순이어야 한다. 인코더가 그것을 검사한다. */
             let mut params: Vec<(u16, Box<[u8]>)> = Vec::with_capacity(3);
             let mut alpn = Vec::new();
             for id in endpoint.alpn {
@@ -113,8 +113,10 @@ impl DdrLayer {
                 },
             ));
         }
-        // 부정 응답의 SOA 소유자는 영역 꼭대기다. resolver.arpa는 특수 용도 이름이라
-        // 이 서버가 로컬에서 맡는다.
+        /*
+         * 부정 응답의 SOA 소유자는 영역 꼭대기다. resolver.arpa는 특수 용도 이름이라
+         * 이 서버가 로컬에서 맡는다.
+         */
         let apex = Name::from_str("resolver.arpa")
             .map_err(|error| format!("Could not build the resolver.arpa name: {error}"))?;
         let negative_soa = Record::new(
@@ -247,7 +249,7 @@ mod tests {
             }
             other => panic!("SVCB가 아님: {other:?}"),
         };
-        // alpn(1)은 길이 앞붙임 목록, port(3)는 big-endian u16, dohpath(7)는 template이다.
+        /* alpn(1)은 길이 앞붙임 목록, port(3)는 big-endian u16, dohpath(7)는 template이다. */
         assert_eq!(doh[0], (1, Box::from(&b"\x02h2"[..])));
         assert_eq!(doh[1], (3, Box::from(&443u16.to_be_bytes()[..])));
         assert_eq!(doh[2], (7, Box::from(&b"/dns-query{?dns}"[..])));
@@ -256,7 +258,7 @@ mod tests {
             "SVCB 매개변수 키는 오름차순이어야 합니다"
         );
 
-        // 실제로 와이어에 담기는지까지 본다. 매개변수 순서가 틀리면 여기서 걸린다.
+        /* 실제로 와이어에 담기는지까지 본다. 매개변수 순서가 틀리면 여기서 걸린다. */
         let wire = resp.try_encode().expect("DDR 응답 인코딩");
         let parsed = Message::parse(&wire).expect("DDR 응답 재파싱");
         assert_eq!(parsed.answers.len(), 2);
@@ -273,7 +275,7 @@ mod tests {
             let resp = layer.resolve(&q).expect("NODATA 응답");
             assert_eq!(resp.header.rcode, ResponseCode::NoError.0);
             assert!(resp.answers.is_empty(), "{qtype:?}에는 답이 없어야 합니다");
-            // 부정 SOA가 없으면 빈 NOERROR가 되어 바깥 응답 검증이 SERVFAIL로 바꾼다.
+            /* 부정 SOA가 없으면 빈 NOERROR가 되어 바깥 응답 검증이 SERVFAIL로 바꾼다. */
             assert!(
                 resp.authorities.iter().any(|record| {
                     matches!(&record.rdata, RData::Soa(_)) && record.name.eq_ignore_case(&apex)

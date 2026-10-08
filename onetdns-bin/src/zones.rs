@@ -127,7 +127,7 @@ pub(crate) fn build_zone_store(
             ));
         }
         onetdns_core::info!(event = "authority.zones_loaded_config", origin = %zone.origin().to_ascii_lower(), "Loaded authoritative DNS zone from the configuration file");
-        // 서명은 영역을 새로 만들므로 지문은 서명한 뒤에 붙인다.
+        /* 서명은 영역을 새로 만들므로 지문은 서명한 뒤에 붙인다. */
         store.add(zone.with_source_digest(SourceDigest::of(text.as_bytes())));
     }
 
@@ -1020,8 +1020,10 @@ pub(crate) fn apply_zone_mutation_locked(
     bump_soa_serial_if_needed(&mut recs, old_serial);
     let mut signed = false;
     if let Some((_, ctx)) = signers.iter().find(|(o, _)| o.eq_ignore_case(&origin_name)) {
-        // 지난 서명은 이 서버가 만들어 저장소에 가지고 있던 것이다. 바뀐 RRset과 새 부재 증명만
-        // 새로 서명하면 레코드 하나를 고치는 값이 영역 크기에 비례하지 않는다.
+        /*
+         * 지난 서명은 이 서버가 만들어 저장소에 가지고 있던 것이다. 바뀐 RRset과 새 부재 증명만
+         * 새로 서명하면 레코드 하나를 고치는 값이 영역 크기에 비례하지 않는다.
+         */
         recs = ctx.sign_reusing(&recs, &old_recs);
         signed = true;
     }
@@ -1409,7 +1411,7 @@ mod tests {
             "손대지 않은 영역까지 다시 읽었습니다"
         );
 
-        // 같은 초 안에 다시 써도 알아채는지 보려고 수정 시각을 명시적으로 옮긴다.
+        /* 같은 초 안에 다시 써도 알아채는지 보려고 수정 시각을 명시적으로 옮긴다. */
         let handle = std::fs::OpenOptions::new()
             .write(true)
             .open(&second)

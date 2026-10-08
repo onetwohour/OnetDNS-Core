@@ -65,6 +65,14 @@ impl TlsSession {
         let age_secs = now_ms.saturating_sub(self.obtained_at_ms) / 1000;
         age_secs < self.lifetime_secs.min(MAX_TICKET_LIFETIME_SECS) as u64
     }
+
+    /**
+     * @brief 이 세션의 PSK 에 묶인 해시. 모르는 스위트면 없다.
+     * @details RFC 8446 은 해시가 같은 스위트라면 다른 스위트로도 PSK 를 쓰게 한다.
+     */
+    pub(crate) fn hash(&self) -> Option<crate::keyschedule::Hash> {
+        crate::keyschedule::suite_params(self.suite).map(|(hash, _)| hash)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +106,11 @@ impl Drop for ResumptionState {
 }
 
 impl ResumptionState {
+    /** @brief 이 티켓의 PSK 에 묶인 해시. TlsSession::hash 와 같은 규칙이다. */
+    pub(crate) fn hash(&self) -> Option<crate::keyschedule::Hash> {
+        crate::keyschedule::suite_params(self.suite).map(|(hash, _)| hash)
+    }
+
     /** @brief 상태를 바이트로. */
     fn serialize(&self) -> Option<Vec<u8>> {
         if self.psk.is_empty() || self.psk.len() > u8::MAX as usize {

@@ -475,7 +475,7 @@ impl CompactDomainMap {
         edge_targets: &[u32],
         edge_outputs: &[u32],
     ) -> CollapsedArrays {
-        // 뿌리는 접지 않는다. 접으면 시작 자리가 사라진다.
+        /* 뿌리는 접지 않는다. 접으면 시작 자리가 사라진다. */
         let passthrough = |index: usize| -> bool {
             if index == 0 {
                 return false;
@@ -486,8 +486,10 @@ impl CompactDomainMap {
                 && edge_outputs[state.first_edge as usize] == 0
         };
 
-        // 상한에 걸려 멈춘 자리는 남겨야 한다. 지나가는 자리라고 지워 버리면 그 엣지가
-        // 가리킬 상태가 사라진다. 그래서 어디서 멈추는지 먼저 확정하고 나서 번호를 준다.
+        /*
+         * 상한에 걸려 멈춘 자리는 남겨야 한다. 지나가는 자리라고 지워 버리면 그 엣지가
+         * 가리킬 상태가 사라진다. 그래서 어디서 멈추는지 먼저 확정하고 나서 번호를 준다.
+         */
         let mut keep: Vec<bool> = (0..states.len()).map(|index| !passthrough(index)).collect();
         let mut pending: Vec<usize> = (0..states.len()).filter(|index| keep[*index]).collect();
         while let Some(index) = pending.pop() {
@@ -525,7 +527,7 @@ impl CompactDomainMap {
         let mut targets = Vec::with_capacity(edge_total);
         let mut outputs = Vec::with_capacity(edge_total);
         let mut tails = Vec::with_capacity(edge_total);
-        // 0번 자리는 "이어지는 글자 없음" 을 나타내는 값과 겹치지 않도록 비워 둔다.
+        /* 0번 자리는 "이어지는 글자 없음" 을 나타내는 값과 겹치지 않도록 비워 둔다. */
         let mut tail_bytes = vec![0u8];
         let mut tail_at = vec![NONE; states.len()];
 
@@ -729,8 +731,10 @@ impl CompactDomainMap {
 
         let mut reversed = Vec::new();
         let mut forward = Vec::new();
-        // 네 번째 값은 이 칸에 들어오며 밀어 넣은 글자 수다. 엣지 하나가 여러 글자를
-        // 실으므로 돌아 나갈 때 한 글자만 빼면 이름이 어긋난다.
+        /*
+         * 네 번째 값은 이 칸에 들어오며 밀어 넣은 글자 수다. 엣지 하나가 여러 글자를
+         * 실으므로 돌아 나갈 때 한 글자만 빼면 이름이 어긋난다.
+         */
         let mut stack = vec![(0usize, 0usize, 0u32, false, 0usize)];
         while !stack.is_empty() {
             let frame_index = stack.len() - 1;
@@ -1018,8 +1022,10 @@ impl CompactDomainMap {
             return Err("Compact map array length invariant violated");
         }
 
-        // 엣지 수는 이웃한 두 시작 자리의 차이로 얻는다. 그래서 이 배열이 단조가 아니면
-        // 상태 하나가 조용히 사라지고, 검증은 통과한 채로 엉뚱한 엣지를 읽게 된다.
+        /*
+         * 엣지 수는 이웃한 두 시작 자리의 차이로 얻는다. 그래서 이 배열이 단조가 아니면
+         * 상태 하나가 조용히 사라지고, 검증은 통과한 채로 엉뚱한 엣지를 읽게 된다.
+         */
         if self.state_edges.first() != Some(&0)
             || self.state_edges.last().map(|last| *last as usize) != Some(self.edge_labels.len())
         {
@@ -1031,7 +1037,7 @@ impl CompactDomainMap {
         if self.state_terminal.len() != self.state_count().div_ceil(64) {
             return Err("Compact filter final-state bit length does not match the state count");
         }
-        // 남는 비트를 0 으로 못 박지 않으면 같은 집합이 서로 다른 바이트로 인코딩된다.
+        /* 남는 비트를 0 으로 못 박지 않으면 같은 집합이 서로 다른 바이트로 인코딩된다. */
         let spare = self.state_terminal.len() * 64 - self.state_count();
         if spare > 0
             && self
@@ -1045,7 +1051,7 @@ impl CompactDomainMap {
         if self.edge_tails.len() != self.edge_labels.len() {
             return Err("Compact filter edge tail array length does not match");
         }
-        // 0번 자리는 "이어지는 글자 없음" 표시이므로 글자로 읽히면 안 된다.
+        /* 0번 자리는 "이어지는 글자 없음" 표시이므로 글자로 읽히면 안 된다. */
         if self.tail_bytes.len() == 1 && self.edge_tails.iter().any(|at| *at != 0) {
             return Err("Compact filter edge points to tail bytes that do not exist");
         }
@@ -1183,8 +1189,10 @@ impl CompactDomainMap {
         bytes: &[u8],
         eaten: usize,
     ) -> Option<(usize, u32, usize)> {
-        // 엣지를 고를 때는 엣지 범위만 필요하다. 종료 여부까지 함께 읽으면 글자마다 다른
-        // 배열을 한 번 더 건드리게 되고, 그 값은 여기서 쓰이지도 않는다.
+        /*
+         * 엣지를 고를 때는 엣지 범위만 필요하다. 종료 여부까지 함께 읽으면 글자마다 다른
+         * 배열을 한 번 더 건드리게 되고, 그 값은 여기서 쓰이지도 않는다.
+         */
         let first = *self.state_edges.get(state_index)? as usize;
         let end = *self.state_edges.get(state_index + 1)? as usize;
         let labels = self.edge_labels.get(first..end)?;
@@ -2167,8 +2175,10 @@ mod tests {
     #[test]
     /** @brief 빌더 추정이 좁은 usize 폭에서 넘쳐 판정이 뒤집히지 않는지. */
     fn build_peak_estimate_survives_narrow_usize_width() {
-        // 4만 항목 wide 목록에서 실제로 나온 표본값이다. usize가 32비트면 이 곱이 넘쳐
-        // 포화하고, 포화값을 표본 수로 나누면 131,072이 되어 direct를 고른다.
+        /*
+         * 4만 항목 wide 목록에서 실제로 나온 표본값이다. usize가 32비트면 이 곱이 넘쳐
+         * 포화하고, 포화값을 표본 수로 나누면 131,072이 되어 direct를 고른다.
+         */
         const SAMPLE_BYTES: u64 = 5_372_650;
         const ENTRIES: u64 = 40_000;
         const SAMPLE_ENTRIES: u64 = 32 * 1024;
@@ -2180,7 +2190,7 @@ mod tests {
             staging_beats_direct(SAMPLE_BYTES, SAMPLE_ENTRIES, ENTRIES, 960_004),
             "넘치는 곱이 포화해 direct로 뒤집히면 안 됩니다"
         );
-        // 접미사가 잘 겹쳐 오토마톤이 작은 목록은 그대로 direct여야 한다.
+        /* 접미사가 잘 겹쳐 오토마톤이 작은 목록은 그대로 direct여야 한다. */
         assert!(!staging_beats_direct(
             79_768,
             SAMPLE_ENTRIES,
@@ -2212,7 +2222,7 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let value = seed;
-            // 폭에 따라 잘리면 32비트와 64비트가 서로 다른 픽스처를 재게 된다.
+            /* 폭에 따라 잘리면 32비트와 64비트가 서로 다른 픽스처를 재게 된다. */
             wide.insert_if_absent(
                 &format!(
                     "{:016x}.{}",

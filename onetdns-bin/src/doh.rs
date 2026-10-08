@@ -314,8 +314,10 @@ fn serve_conn(
     let tls_auth_identity = conn.client_auth_identity().map(|s| s.to_string());
     let mut stream = TlsStream::new(conn, tcp);
 
-    // 실패는 HTTP 상태로 알린다. 읽지 못한 본문은 요청 잘못이므로 4xx 여야 한다.
-    // 5xx 는 서버 잘못이라는 뜻이라 클라이언트가 같은 서버에 다시 보낸다.
+    /*
+     * 실패는 HTTP 상태로 알린다. 읽지 못한 본문은 요청 잘못이므로 4xx 여야 한다.
+     * 5xx 는 서버 잘못이라는 뜻이라 클라이언트가 같은 서버에 다시 보낸다.
+     */
     let dns = |q: &[u8],
                path_client_id: Option<&str>|
      -> Result<onetdns_http2::DohAnswer, &'static str> {

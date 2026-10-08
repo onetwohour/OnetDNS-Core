@@ -12,12 +12,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use onetdns_proto::Message;
-use onetdns_quic::{H3Connection, QuicError};
+use onetdns_quic::{H3Connection, H3Error, QuicError};
 use onetdns_runtime::Transport as RtTransport;
 use onetdns_tls::ServerConfig;
 
 use crate::native::NativeServer;
-use crate::quic_listener::{self, Intake, QuicListener, QuicService};
+use crate::quic_listener::{self, Abandon, Intake, QuicListener, QuicService};
 use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
@@ -64,11 +64,11 @@ impl QuicService for Doh3 {
     type Conn = H3Connection;
     const NAME: &'static str = "doh3";
 
-    fn dispatch(&self, h3: &mut H3Connection, intake: &mut Intake<'_>) -> bool {
+    fn dispatch(&self, h3: &mut H3Connection, intake: &mut Intake<'_>) {
         for r in h3.take_requests_meta() {
             if !match_doh_path(&r.path, &self.doh_path) {
                 if !send_status(h3, intake.peer(), r.stream_id, b"404") {
-                    return false;
+                    return;
                 }
                 continue;
             }
@@ -82,7 +82,7 @@ impl QuicService for Doh3 {
                         "unsolicited DNS response",
                     );
                     if !send_status(h3, intake.peer(), r.stream_id, b"400") {
-                        return false;
+                        return;
                     }
                     continue;
                 }
@@ -99,7 +99,7 @@ impl QuicService for Doh3 {
                         error,
                     );
                     if !send_status(h3, intake.peer(), r.stream_id, b"400") {
-                        return false;
+                        return;
                     }
                     continue;
                 }
@@ -120,7 +120,7 @@ impl QuicService for Doh3 {
                         "Client ID in the DoH3 URL does not match the client ID in the mTLS certificate"
                     );
                     if !send_status(h3, intake.peer(), r.stream_id, b"403") {
-                        return false;
+                        return;
                     }
                     continue;
                 }
@@ -137,10 +137,9 @@ impl QuicService for Doh3 {
                 auth_identity,
             };
             if !intake.submit::<Self>(h3, &req, job) {
-                return false;
+                return;
             }
         }
-        true
     }
 
     fn send_answer(
@@ -151,14 +150,23 @@ impl QuicService for Doh3 {
     ) -> Result<(), QuicError> {
         h3.send_response_owned(stream_id, wire, max_age)
     }
+
+    fn abandon(h3: &mut H3Connection, why: Abandon) {
+        h3.close(match why {
+            Abandon::Shutdown => H3Error::NoError,
+            Abandon::Internal => H3Error::Internal,
+            Abandon::ExcessiveLoad => H3Error::ExcessiveLoad,
+        });
+    }
 }
 
 /**
  * @brief 본문 없이 상태 코드만 답한다.
- * @return 연결을 계속 쓸 수 있으면 true.
+ * @return 연결을 계속 쓸 수 있으면 true. 못 쓰면 연결은 이미 닫혔다.
  */
 fn send_status(h3: &mut H3Connection, peer: SocketAddr, stream_id: u64, status: &[u8]) -> bool {
-    quic_listener::connection_survives(Doh3::NAME, peer, h3.send_status(stream_id, status))
+    let sent = h3.send_status(stream_id, status);
+    quic_listener::connection_survives::<Doh3>(h3, peer, sent)
 }
 
 #[cfg(test)]

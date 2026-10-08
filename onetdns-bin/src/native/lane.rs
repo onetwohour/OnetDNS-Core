@@ -250,7 +250,7 @@ impl NativeServer {
                         runtime.recursor.as_ref(),
                         cl.request.questions.first(),
                     ) {
-                        // 동기 경로와 같은 규칙으로, 답을 받지 못한 해석은 뒤에서 마저 돌린다.
+                        /* 동기 경로와 같은 규칙으로, 답을 받지 못한 해석은 뒤에서 마저 돌린다. */
                         recursor.complete_in_background(
                             q.name.clone(),
                             q.qtype,
@@ -275,8 +275,10 @@ impl NativeServer {
             let mut resp = match lane_answer {
                 Some(mut resp) => {
                     onetdns_forward::clear_response_source();
-                    // 레인은 체인을 거치지 않으므로 여기서 걷어낸다. 캐시
-                    // 키에 DO가 들어 있어 두 모양이 섞이지는 않는다.
+                    /*
+                     * 레인은 체인을 거치지 않으므로 여기서 걷어낸다. 캐시
+                     * 키에 DO가 들어 있어 두 모양이 섞이지는 않는다.
+                     */
                     strip_dnssec_unless_requested(req, &mut resp);
                     resp
                 }
@@ -416,8 +418,10 @@ fn reactor_fallback_unavailable() {
  */
 #[cfg(unix)]
 pub(crate) fn reactor_response_edns(f: &NativeFeatures, msg: &mut Message, request: &Message) {
-    // 이 서버가 붙인 확장 오류는 살린다. 재귀는 bogus 판정의 사유를 이 옵션으로 담아 오고,
-    // 동기 경로도 같은 사유를 담아 내보내므로 여기서 지우면 두 경로의 답이 갈린다.
+    /*
+     * 이 서버가 붙인 확장 오류는 살린다. 재귀는 bogus 판정의 사유를 이 옵션으로 담아 오고,
+     * 동기 경로도 같은 사유를 담아 내보내므로 여기서 지우면 두 경로의 답이 갈린다.
+     */
     let carried: Vec<(u16, Vec<u8>)> = msg
         .opt()
         .and_then(Edns::from_record)
@@ -462,7 +466,7 @@ mod tests {
             edns_buffer: 1232,
             ..NativeFeatures::default()
         };
-        // 업스트림이 자기 값으로 광고한 OPT. 이 서버의 값(1232)과 다르고 DO도 서 있다.
+        /* 업스트림이 자기 값으로 광고한 OPT. 이 서버의 값(1232)과 다르고 DO도 서 있다. */
         let upstream_opt = Edns {
             udp_payload: 4096,
             dnssec_ok: true,

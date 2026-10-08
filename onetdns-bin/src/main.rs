@@ -396,8 +396,10 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
         ext.push("AAAA responses disabled".into());
     }
     if !cfg.upstream_urls.is_empty() {
-        // 섞여 있으면 "암호화 N개"만 보여 주는 것이 사실을 가린다. 실제로 나가는 질의는
-        // 대부분 평문 쪽이다.
+        /*
+         * 섞여 있으면 "암호화 N개"만 보여 주는 것이 사실을 가린다. 실제로 나가는 질의는
+         * 대부분 평문 쪽이다.
+         */
         if cfg.mixes_plain_and_encrypted_upstreams() {
             ext.push(format!(
                 "{} encrypted + {} plain upstream DNS servers",
@@ -509,7 +511,7 @@ fn ddr_endpoints_from(cfg: &Config) -> Vec<layers::DdrEndpoint> {
         out
     }
 
-    // RFC 9461의 dohpath는 dns 변수를 담은 URI template이어야 한다.
+    /* RFC 9461의 dohpath는 dns 변수를 담은 URI template이어야 한다. */
     let dohpath = format!("{}{{?dns}}", cfg.doh_path);
     let mut out = Vec::new();
     for (priority, alpn, addrs, path) in [
@@ -728,7 +730,7 @@ fn apply_web_defaults(cfg: &mut Config, no_web: bool, config_path: Option<&std::
             }
         }
     }
-    // 토큰을 설정에 적어 둔 사람은 그 값을 이미 안다. 그때는 주소만 알려 준다.
+    /* 토큰을 설정에 적어 둔 사람은 그 값을 이미 안다. 그때는 주소만 알려 준다. */
     println!();
     println!("  Dashboard: http://{addr}/");
     if auto_token {
@@ -2015,7 +2017,7 @@ fn resolve_probe(
             .ok_or("Unknown query type")?,
     );
 
-    // 0.0.0.0이나 ::는 "모든 주소"라 목적지가 될 수 없다. 같은 포트의 루프백으로 바꾼다.
+    /* 0.0.0.0이나 ::는 "모든 주소"라 목적지가 될 수 없다. 같은 포트의 루프백으로 바꾼다. */
     let target = listeners
         .first()
         .map(|addr| match addr.ip() {
@@ -2040,7 +2042,7 @@ fn resolve_probe(
     let elapsed_ms = started.elapsed().as_millis();
 
     let record_json = |record: &onetdns_proto::Record| {
-        // 루트 이름은 소문자로 바꾸면 빈 문자열이 된다. 화면에 빈칸이 뜨지 않게 점으로 적는다.
+        /* 루트 이름은 소문자로 바꾸면 빈 문자열이 된다. 화면에 빈칸이 뜨지 않게 점으로 적는다. */
         let owner = record.name.to_ascii_lower();
         let owner = if owner.is_empty() {
             ".".to_string()
@@ -2784,7 +2786,7 @@ mod tests {
         cfg.listen_dot = vec!["127.0.0.1:853".parse().unwrap()];
         let endpoints = ddr_endpoints_from(&cfg);
 
-        // 같은 포트를 여러 주소에서 듣는 것은 한 번만 알린다.
+        /* 같은 포트를 여러 주소에서 듣는 것은 한 번만 알린다. */
         let doh: Vec<_> = endpoints.iter().filter(|e| e.alpn == ["h2"]).collect();
         assert_eq!(doh.len(), 2);
         assert_eq!(doh[0].port, 443);
@@ -2805,7 +2807,7 @@ mod tests {
             "지원 폭이 넓은 전송을 먼저 권합니다"
         );
 
-        // DNSCrypt는 SVCB로 알릴 ALPN이 없어 대상이 아니다.
+        /* DNSCrypt는 SVCB로 알릴 ALPN이 없어 대상이 아니다. */
         cfg.listen_dnscrypt = vec!["127.0.0.1:5443".parse().unwrap()];
         assert_eq!(ddr_endpoints_from(&cfg).len(), endpoints.len());
     }
@@ -3307,7 +3309,7 @@ mod tests {
         );
         assert!(!applied.contains("also failed"), "{applied}");
 
-        // 되돌리기가 소켓을 닫았으면 이 주소를 다시 열 수 있다.
+        /* 되돌리기가 소켓을 닫았으면 이 주소를 다시 열 수 있다. */
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match UdpSocket::bind(added) {

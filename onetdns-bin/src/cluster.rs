@@ -1114,8 +1114,10 @@ pub(crate) fn spawn_resign_timer(
             }
             let signers = zone_signers.load();
             for (origin, ctx) in signers.iter() {
-                // 영역을 잠금 아래에서 읽는다. 잠그기 전에 읽으면 그사이에 들어온 동적 갱신이
-                // 다시 서명한 이전 내용에 덮여 사라진다.
+                /*
+                 * 영역을 잠금 아래에서 읽는다. 잠그기 전에 읽으면 그사이에 들어온 동적 갱신이
+                 * 다시 서명한 이전 내용에 덮여 사라진다.
+                 */
                 let mut journals = journal.lock_recover();
                 let zone = store
                     .load()

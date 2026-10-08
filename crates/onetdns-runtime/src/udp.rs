@@ -765,7 +765,7 @@ mod tests {
      *          핸들러 단위 테스트는 이 배선을 보지 못하므로 워커 쪽에서 따로 확인한다.
      */
     fn an_unparsable_datagram_reaches_the_handler_instead_of_being_dropped() {
-        // 질문 하나를 적고 둘이라고 말하는 헤더다.
+        /* 질문 하나를 적고 둘이라고 말하는 헤더다. */
         let mut packet = vec![0u8; 12];
         packet[0..2].copy_from_slice(&0x0abcu16.to_be_bytes());
         packet[4..6].copy_from_slice(&2u16.to_be_bytes());

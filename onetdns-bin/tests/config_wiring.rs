@@ -106,11 +106,11 @@ fn the_check_actually_finds_an_unread_key() {
     let dead = dead_fields(&fields, external, "");
     assert_eq!(dead, vec![&"never_read".to_string()]);
 
-    // settings.rs 안의 논리가 읽어도 살아 있는 것으로 본다.
+    /* settings.rs 안의 논리가 읽어도 살아 있는 것으로 본다. */
     let dead = dead_fields(&fields, external, "if self.never_read { reject(); }");
     assert!(dead.is_empty(), "논리에서 읽는 키를 죽었다고 봤습니다");
 
-    // 덤프용 kv 호출만으로는 살아 있다고 보지 않는다.
+    /* 덤프용 kv 호출만으로는 살아 있다고 보지 않는다. */
     let only_dump = logic_lines("    kv(\"never_read\", self.never_read);\n");
     let dead = dead_fields(&fields, external, &only_dump);
     assert_eq!(dead, vec![&"never_read".to_string()]);

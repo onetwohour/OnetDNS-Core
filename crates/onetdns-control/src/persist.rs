@@ -560,7 +560,7 @@ fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
     }
     let dropped = map.len() - crate::metrics::TOP_CAP;
     let mut pairs: Vec<(K, u64)> = std::mem::take(map).into_iter().collect();
-    // 동률은 이름 순으로 갈라 어느 항목이 남는지가 실행마다 달라지지 않게 한다.
+    /* 동률은 이름 순으로 갈라 어느 항목이 남는지가 실행마다 달라지지 않게 한다. */
     pairs.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     pairs.truncate(crate::metrics::TOP_CAP);
     map.extend(pairs);
@@ -719,9 +719,11 @@ fn parse_stats_snapshot(
         dropped_stream_events: counter("dropped_stream_events")?,
         persist_failures: counter("persist_failures")?,
         by_transport,
-        // 살아 있는 집계와 같은 키 규칙으로 바꾼다. 접지 않으면 이전 파일의 대소문자만 다른
-        // 항목이 복원 뒤에도 갈라진 채 남아 flush마다 되쓰인다. 합친 뒤 겹치는 항목이 있으면
-        // 그 파일은 이전 규칙으로 쓰인 것이므로 전체를 버린다. 이 파일의 기존 계약 그대로다.
+        /*
+         * 살아 있는 집계와 같은 키 규칙으로 바꾼다. 접지 않으면 이전 파일의 대소문자만 다른
+         * 항목이 복원 뒤에도 갈라진 채 남아 flush마다 되쓰인다. 합친 뒤 겹치는 항목이 있으면
+         * 그 파일은 이전 규칙으로 쓰인 것이므로 전체를 버린다. 이 파일의 기존 계약 그대로다.
+         */
         domains: parse_pairs(top, "domains", |n| {
             Name::from_str(n)
                 .ok()

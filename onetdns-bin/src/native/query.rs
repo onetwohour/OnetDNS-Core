@@ -174,8 +174,10 @@ impl NativeServer {
         }
 
         if request.header.opcode == 4 || request.header.opcode == 5 {
-            // UPDATE 는 ZCLASS 가 달라도 형식 오류가 아니다. RFC 2136은 그것을
-            // 이 서버가 맡지 않은 영역으로 보고 NOTAUTH 로 답하게 하므로 handle_update 로 넘긴다.
+            /*
+             * UPDATE 는 ZCLASS 가 달라도 형식 오류가 아니다. RFC 2136은 그것을
+             * 이 서버가 맡지 않은 영역으로 보고 NOTAUTH 로 답하게 하므로 handle_update 로 넘긴다.
+             */
             let valid_zone_question = request.questions.len() == 1
                 && request.questions[0].qtype == ApRt::SOA
                 && (request.header.opcode == 5 || request.questions[0].qclass == DnsClass::IN);
@@ -244,8 +246,10 @@ impl NativeServer {
             )));
         }
         let [question] = request.questions.as_slice() else {
-            // RFC 9619는 opcode 0인 DNS 메시지가 QDCOUNT를 1보다 크게 담을 수 없다고 정한다.
-            // 응답도 opcode 0이므로 그대로 돌려주면 이 서버의 답이 같은 규칙을 어긴다. 질문부를 비운다.
+            /*
+             * RFC 9619는 opcode 0인 DNS 메시지가 QDCOUNT를 1보다 크게 담을 수 없다고 정한다. 응답도
+             * opcode 0이므로 그대로 돌려주면 이 서버의 답이 같은 규칙을 어긴다. 질문부를 비운다.
+             */
             let mut response = edns_error_resp(request, ResponseCode::FormErr, f.edns_buffer);
             response.questions.clear();
             return ControlFlow::Break(Some(response));
@@ -279,10 +283,12 @@ impl NativeServer {
                 )));
             }
 
-            // RFC 6891: 요청에 OPT가 있으면 응답에도 반드시 넣는다. 빼면 상대는 이 서버가 EDNS를
-            // 모르는 것으로 보고 512바이트로 전환하고, 쿠키·NSID·패딩·EDE를 담을 슬롯도 없다.
-            // 이미 읽어 둔 요청 EDNS를 그대로 고쳐 쓴다. base_edns를 부르면 같은 OPT를 한 번
-            // 더 파싱하며 곧 버릴 옵션들을 항목마다 복제한다.
+            /*
+             * RFC 6891: 요청에 OPT가 있으면 응답에도 반드시 넣는다. 빼면 상대는 이 서버가 EDNS를
+             * 모르는 것으로 보고 512바이트로 전환하고, 쿠키·NSID·패딩·EDE를 담을 슬롯도 없다.
+             * 이미 읽어 둔 요청 EDNS를 그대로 고쳐 쓴다. base_edns를 부르면 같은 OPT를 한 번
+             * 더 파싱하며 곧 버릴 옵션들을 항목마다 복제한다.
+             */
             let mut response_edns = request_edns;
             response_edns.udp_payload = advertised_udp_payload(f.edns_buffer);
             response_edns.extended_rcode = 0;
@@ -308,9 +314,11 @@ impl NativeServer {
                             );
                         }
                     }
-                    // COOKIE는 OPT 안에만 있으므로 이 요청에는 반드시 OPT가 있었다. 위에서
-                    // 만든 응답 OPT를 그대로 담아야 RFC 6891을 지킨다. 빼면 상대는
-                    // 이 서버가 EDNS를 모르는 것으로 보고 512바이트로 전환한다.
+                    /*
+                     * COOKIE는 OPT 안에만 있으므로 이 요청에는 반드시 OPT가 있었다. 위에서
+                     * 만든 응답 OPT를 그대로 담아야 RFC 6891을 지킨다. 빼면 상대는
+                     * 이 서버가 EDNS를 모르는 것으로 보고 512바이트로 전환한다.
+                     */
                     None => {
                         return ControlFlow::Break(
                             scope.reply(error_resp(request, ResponseCode::FormErr), None),
@@ -409,9 +417,11 @@ impl NativeServer {
             );
         }
 
-        // 이 서버가 맡은 영역 밖이면 이름이 있는지 알 수 없으므로 여기서 바로 합성한다. 안이면
-        // 표준 알고리즘을 먼저 돌린 뒤 답 구간만 바꾼다. 없는 이름에 NOERROR를 주면 존재를
-        // 알리는 셈이고 부정 캐시도 서지 않는다.
+        /*
+         * 이 서버가 맡은 영역 밖이면 이름이 있는지 알 수 없으므로 여기서 바로 합성한다. 안이면
+         * 표준 알고리즘을 먼저 돌린 뒤 답 구간만 바꾼다. 없는 이름에 NOERROR를 주면 존재를
+         * 알리는 셈이고 부정 캐시도 서지 않는다.
+         */
         if scope.minimal_any(f) && !self.serves_zone_for(qname) {
             self.rec(&scope.client, Action::Resolved, Some(qname), Some(qtype));
             return ControlFlow::Break(
@@ -651,9 +661,11 @@ impl NativeServer {
 
         normalize_recursive_response(resp, request);
 
-        // 표준 알고리즘이 낸 응답에서 답 구간만 합성 HINFO로 바꾼다. 없는 이름의 NXDOMAIN,
-        // 자료가 없는 이름의 NODATA, 권한 표시는 그대로 둔다. RFC 8482는 QNAME에 CNAME이
-        // 있으면 합성하지 말라고 하므로 그때도 그대로 둔다.
+        /*
+         * 표준 알고리즘이 낸 응답에서 답 구간만 합성 HINFO로 바꾼다. 없는 이름의 NXDOMAIN,
+         * 자료가 없는 이름의 NODATA, 권한 표시는 그대로 둔다. RFC 8482는 QNAME에 CNAME이
+         * 있으면 합성하지 말라고 하므로 그때도 그대로 둔다.
+         */
         if scope.minimal_any(f)
             && resp.header.rcode == ResponseCode::NoError.0
             && !resp.answers.is_empty()
@@ -717,10 +729,12 @@ impl NativeServer {
             }
         }
 
-        // 근거 없이 비어 온 NOERROR도 그대로 전달한다. RFC 2308이 모든 구간이 빈 것을
-        // NODATA의 한 모양으로 열거해 두었고, SOA가 없을 때 규격이 정한 처분은 거절이 아니라
-        // 캐시 금지다. 특히 RFC 4074는 IPv6 주소가 없는 이름의 AAAA에 SERVFAIL을 주면
-        // 질의자가 A로 다시 묻지 못하고 되풀이한다고 고정한다. 담지 않는 것은 캐시 계층이 한다.
+        /*
+         * 근거 없이 비어 온 NOERROR도 그대로 전달한다. RFC 2308이 모든 구간이 빈 것을
+         * NODATA의 한 모양으로 열거해 두었고, SOA가 없을 때 규격이 정한 처분은 거절이 아니라
+         * 캐시 금지다. 특히 RFC 4074는 IPv6 주소가 없는 이름의 AAAA에 SERVFAIL을 주면
+         * 질의자가 A로 다시 묻지 못하고 되풀이한다고 고정한다. 담지 않는 것은 캐시 계층이 한다.
+         */
         if resp.header.rcode == ResponseCode::NoError.0
             && !response_has_requested_answer(&resolved.request, resp)
             && !has_negative_soa(resp)
@@ -894,8 +908,10 @@ impl NativeServer {
             );
         }
 
-        // 후처리 뒤에도 같은 판단이다. 이 서버의 필터가 답을 걷어내 비게 된 경우는 걷어내는 곳에서
-        // 각자 자기 응답을 만들어 돌려주므로 여기까지 오지 않는다.
+        /*
+         * 후처리 뒤에도 같은 판단이다. 이 서버의 필터가 답을 걷어내 비게 된 경우는 걷어내는 곳에서
+         * 각자 자기 응답을 만들어 돌려주므로 여기까지 오지 않는다.
+         */
         if resp.header.rcode == ResponseCode::NoError.0
             && !response_has_requested_answer(request, &resp)
             && !has_negative_soa(&resp)

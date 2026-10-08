@@ -13,6 +13,8 @@ use crate::varint;
 const MAX_PARSED_FRAMES: usize = 1024;
 /** @brief 확인 프레임 하나에서 읽을 구간 수 상한. */
 const MAX_PARSED_ACK_RANGES: u64 = 256;
+/** @brief 스트림 수로 쓸 수 있는 최대값. 스트림 번호가 2^62 미만이어야 하기 때문이다. */
+pub const MAX_STREAM_COUNT: u64 = 1 << 60;
 
 /** @brief 프레임 유형 번호들. 규격이 정한 값이다. */
 pub mod ftype {
@@ -114,6 +116,11 @@ pub enum Frame {
     MaxStreamData { id: u64, max: u64 },
     /** @brief 스트림을 이만큼까지 열어도 된다. */
     MaxStreams { uni: bool, max: u64 },
+    /**
+     * @brief 이 스트림의 윈도우가 막혀 못 보내고 있다.
+     * @details 스트림 번호를 보고 받는 쪽 상태를 검사해야 하므로 다른 막힘 알림과 달리 따로 읽는다.
+     */
+    StreamDataBlocked { id: u64, limit: u64 },
     /** @brief 연결을 닫는다. */
     ConnectionClose {
         /** @brief 닫는 까닭. */
@@ -248,14 +255,16 @@ pub fn parse(buf: &[u8]) -> Option<Vec<Frame>> {
                 let id = c.vi()?;
                 Frame::MaxStreamData { id, max: c.vi()? }
             }
-            ftype::MAX_STREAMS_BIDI => Frame::MaxStreams {
-                uni: false,
-                max: c.vi()?,
-            },
-            ftype::MAX_STREAMS_UNI => Frame::MaxStreams {
-                uni: true,
-                max: c.vi()?,
-            },
+            ftype::MAX_STREAMS_BIDI | ftype::MAX_STREAMS_UNI => {
+                let max = c.vi()?;
+                if max > MAX_STREAM_COUNT {
+                    return None;
+                }
+                Frame::MaxStreams {
+                    uni: t == ftype::MAX_STREAMS_UNI,
+                    max,
+                }
+            }
             ftype::CONNECTION_CLOSE | ftype::CONNECTION_CLOSE_APP => {
                 let error_code = c.vi()?;
                 let frame_type = if t == ftype::CONNECTION_CLOSE {
@@ -300,12 +309,17 @@ pub fn parse(buf: &[u8]) -> Option<Vec<Frame>> {
                 Frame::Other(t)
             }
             ftype::STREAM_DATA_BLOCKED => {
-                c.vi()?;
-                c.vi()?;
-                Frame::Other(t)
+                let id = c.vi()?;
+                Frame::StreamDataBlocked { id, limit: c.vi()? }
             }
             ftype::STREAMS_BLOCKED_BIDI | ftype::STREAMS_BLOCKED_UNI => {
-                c.vi()?;
+                /*
+                 * RFC 9000 은 2^60 을 넘는 값을 표현할 수 없는 스트림 번호로 보고 연결 오류로
+                 * 정한다.
+                 */
+                if c.vi()? > MAX_STREAM_COUNT {
+                    return None;
+                }
                 Frame::Other(t)
             }
             ftype::NEW_CONNECTION_ID => {
@@ -425,6 +439,11 @@ pub fn encode(out: &mut Vec<u8>, f: &Frame) {
                 },
             );
             varint::write(out, *max);
+        }
+        Frame::StreamDataBlocked { id, limit } => {
+            varint::write(out, ftype::STREAM_DATA_BLOCKED);
+            varint::write(out, *id);
+            varint::write(out, *limit);
         }
         Frame::ConnectionClose {
             error_code,

@@ -114,7 +114,7 @@ impl NativeServer {
         } else {
             Action::Resolved
         };
-        // 요약은 질의 기록에만 담긴다. 꺼져 있으면 만들자마자 버려지므로 만들지 않는다.
+        /* 요약은 질의 기록에만 담긴다. 꺼져 있으면 만들자마자 버려지므로 만들지 않는다. */
         let answers = if recorder.querylog_enabled() {
             answers_summary(&resp.answers)
         } else {

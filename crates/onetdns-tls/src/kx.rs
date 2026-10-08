@@ -69,6 +69,8 @@ impl KeyExchange {
      * @brief 상대 공개값과 합쳐 공유 비밀을 만든다.
      * @warning 낮은 위수 점을 거부한다. 받아들이면 공유 비밀이 고정값이 되어 암호화가
      *          무의미해진다.
+     * @details P-256 공개값은 압축하지 않은 65 바이트 형식만 받는다. RFC 8446 은 이 형식만
+     *          정의하고, 1.2 에서도 이쪽이 알린 점 형식은 압축하지 않은 형식뿐이다.
      */
     pub fn shared_secret(&self, peer: &[u8]) -> Option<Vec<u8>> {
         match &self.inner {
@@ -82,6 +84,9 @@ impl KeyExchange {
                 Some(shared.as_bytes().to_vec())
             }
             Inner::P256(s) => {
+                if peer.len() != 65 || peer[0] != 0x04 {
+                    return None;
+                }
                 let pp = p256::PublicKey::from_sec1_bytes(peer).ok()?;
                 let shared = p256::ecdh::diffie_hellman(s.to_nonzero_scalar(), pp.as_affine());
                 Some(shared.raw_secret_bytes().to_vec())
@@ -151,5 +156,21 @@ mod tests {
     /** @brief 모르는 곡선이면 만들지 않는지. */
     fn unknown_group_none() {
         assert!(KeyExchange::from_seed(0x9999, &[0u8; 32]).is_none());
+    }
+
+    #[test]
+    /** @brief 압축한 P-256 공개값은 곡선 위의 점이어도 거부하는지. */
+    fn p256_rejects_compressed_points() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let a = KeyExchange::from_seed(SECP256R1, &[0x42u8; 32]).unwrap();
+        let b = p256::SecretKey::from_slice(&[0x37u8; 32]).unwrap();
+        let compressed = b.public_key().to_encoded_point(true);
+        assert_eq!(compressed.as_bytes().len(), 33);
+        assert!(
+            a.shared_secret(compressed.as_bytes()).is_none(),
+            "압축한 점은 받지 않아야 합니다"
+        );
+        let uncompressed = b.public_key().to_encoded_point(false);
+        assert!(a.shared_secret(uncompressed.as_bytes()).is_some());
     }
 }

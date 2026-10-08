@@ -40,6 +40,15 @@ pub const EC_POINT_FORMAT_UNCOMPRESSED: u8 = 0;
 pub const EXT_EXTENDED_MASTER_SECRET: u16 = 23;
 /** @brief 재협상 정보. 이쪽은 재협상하지 않으므로 빈 값을 보낸다. */
 pub const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+/**
+ * @brief 스위트 목록에 넣는 재협상 정보 표시. RFC 5746 은 빈 renegotiation_info 확장과 같은
+ *        뜻으로 본다.
+ */
+pub const TLS_EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00ff;
+/** @brief CertificateRequest 의 인증서 종류 값. RSA 서명 키를 담은 인증서. */
+pub const CERT_TYPE_RSA_SIGN: u8 = 1;
+/** @brief CertificateRequest 의 인증서 종류 값. RFC 8422 는 ECDSA 와 EdDSA 키를 여기에 넣는다. */
+pub const CERT_TYPE_ECDSA_SIGN: u8 = 64;
 
 /** @brief 핸드셰이크 확인 값 길이. */
 const VERIFY_DATA_LEN: usize = 12;
@@ -204,41 +213,57 @@ pub fn extended_master_secret(hash: Hash, pms: &[u8], session_hash: &[u8]) -> Ve
     prf(hash, pms, "extended master secret", session_hash, 48)
 }
 
-/** @brief 양방향 키와 논스 기준값. */
+/** @brief 양방향 키와 nonce 고정 부분. */
 pub struct KeyMaterial {
     /** @brief 클라이언트가 보낼 때 쓰는 키. */
     pub client_key: Vec<u8>,
     /** @brief 서버가 보낼 때 쓰는 키. */
     pub server_key: Vec<u8>,
-    /** @brief 클라이언트 쪽 nonce의 고정 부분. */
-    pub client_iv: [u8; 4],
-    /** @brief 서버 쪽 nonce의 고정 부분. */
-    pub server_iv: [u8; 4],
+    /** @brief 클라이언트 쪽 nonce 의 고정 부분. 길이는 fixed_iv_len 이 정한다. */
+    pub client_iv: Vec<u8>,
+    /** @brief 서버 쪽 nonce 의 고정 부분. */
+    pub server_iv: Vec<u8>,
 }
 
-/** @brief 마스터 비밀에서 실제 키들을 갈라낸다. */
+/**
+ * @brief 이 암호 방식이 레코드마다 nonce 의 명시 부분 8 바이트를 싣는지.
+ * @details AES-GCM 은 RFC 5288 대로 싣는다. ChaCha20-Poly1305 는 RFC 7905 대로 싣지 않고
+ *          일련번호를 고정 부분과 XOR 해 nonce 를 만든다.
+ */
+fn explicit_nonce(aead: Aead) -> bool {
+    !matches!(aead, Aead::ChaCha20Poly1305)
+}
+
+/** @brief 키 블록에서 가져오는 nonce 고정 부분의 길이. */
+fn fixed_iv_len(aead: Aead) -> usize {
+    if explicit_nonce(aead) {
+        4
+    } else {
+        12
+    }
+}
+
+/** @brief 마스터 비밀에서 실제 키들을 갈라낸다. 고정 nonce 길이는 스위트의 암호 방식을 따른다. */
 pub fn key_material(
-    hash: Hash,
+    suite: &Suite12,
     master: &[u8],
     client_random: &[u8],
     server_random: &[u8],
-    key_len: usize,
 ) -> KeyMaterial {
     let mut seed = server_random.to_vec();
     seed.extend_from_slice(client_random);
-    let need = 2 * key_len + 2 * 4;
-    let kb = Zeroizing::new(prf(hash, master, "key expansion", &seed, need));
-    let client_key = kb[..key_len].to_vec();
-    let server_key = kb[key_len..2 * key_len].to_vec();
-    let mut client_iv = [0u8; 4];
-    let mut server_iv = [0u8; 4];
-    client_iv.copy_from_slice(&kb[2 * key_len..2 * key_len + 4]);
-    server_iv.copy_from_slice(&kb[2 * key_len + 4..2 * key_len + 8]);
+    let key_len = suite.key_len;
+    let iv_len = fixed_iv_len(suite.aead);
+    let need = 2 * key_len + 2 * iv_len;
+    let kb = Zeroizing::new(prf(suite.hash, master, "key expansion", &seed, need));
+    let (client_key, rest) = kb.split_at(key_len);
+    let (server_key, rest) = rest.split_at(key_len);
+    let (client_iv, server_iv) = rest.split_at(iv_len);
     KeyMaterial {
-        client_key,
-        server_key,
-        client_iv,
-        server_iv,
+        client_key: client_key.to_vec(),
+        server_key: server_key.to_vec(),
+        client_iv: client_iv.to_vec(),
+        server_iv: server_iv.to_vec(),
     }
 }
 
@@ -248,14 +273,14 @@ pub fn finished_verify_data(hash: Hash, master: &[u8], label: &str, transcript: 
     prf(hash, master, label, &session_hash, VERIFY_DATA_LEN)
 }
 
-/** @brief 1.2 레코드 보호. 논스에 명시 부분이 실려 온다. */
+/** @brief 1.2 레코드 보호. nonce 구성은 암호 방식마다 다르다. explicit_nonce 를 본다. */
 pub struct Tls12RecordCrypto {
     /** @brief 쓰는 암호 방식. */
     aead: Aead,
     /** @brief 암호화하고 복호화하는 키. */
     key: Vec<u8>,
-    /** @brief nonce의 고정 부분. */
-    salt: [u8; 4],
+    /** @brief nonce 의 고정 부분. 길이가 fixed_iv_len 과 같다. */
+    iv: Vec<u8>,
     /** @brief 레코드 일련번호. */
     seq: u64,
 }
@@ -265,19 +290,25 @@ impl Drop for Tls12RecordCrypto {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.key.zeroize();
-        self.salt.zeroize();
+        self.iv.zeroize();
     }
 }
 
 impl Tls12RecordCrypto {
-    /** @brief 키와 논스 앞부분으로 만든다. */
-    pub fn new(aead: Aead, key: Vec<u8>, salt: [u8; 4]) -> Self {
-        Self {
+    /**
+     * @brief 키와 nonce 고정 부분으로 만든다.
+     * @retval TlsError::Internal 고정 부분 길이가 암호 방식에 맞지 않는다.
+     */
+    pub fn new(aead: Aead, key: Vec<u8>, iv: Vec<u8>) -> Result<Self, TlsError> {
+        if iv.len() != fixed_iv_len(aead) {
+            return Err(TlsError::Internal);
+        }
+        Ok(Self {
             aead,
             key,
-            salt,
+            iv,
             seq: 0,
-        }
+        })
     }
 
     /** @brief 추가 인증 데이터. 순서 번호와 레코드 헤더가 들어간다. */
@@ -300,12 +331,31 @@ impl Tls12RecordCrypto {
         ]
     }
 
-    /** @brief 고정 앞부분과 명시 뒷부분을 이어 논스를 만든다. */
+    /**
+     * @brief nonce 를 만든다.
+     * @param explicit AES-GCM 이면 레코드에 실린 명시 부분, ChaCha20-Poly1305 면 일련번호.
+     */
     fn nonce(&self, explicit: &[u8; 8]) -> [u8; 12] {
         let mut n = [0u8; 12];
-        n[..4].copy_from_slice(&self.salt);
-        n[4..].copy_from_slice(explicit);
+        if explicit_nonce(self.aead) {
+            n[..4].copy_from_slice(&self.iv);
+            n[4..].copy_from_slice(explicit);
+        } else {
+            n.copy_from_slice(&self.iv);
+            for (byte, seq) in n[4..].iter_mut().zip(explicit) {
+                *byte ^= seq;
+            }
+        }
         n
+    }
+
+    /** @brief 레코드 앞에 싣는 명시 nonce 의 길이. */
+    fn explicit_len(&self) -> usize {
+        if explicit_nonce(self.aead) {
+            8
+        } else {
+            0
+        }
     }
 
     /**
@@ -329,23 +379,36 @@ impl Tls12RecordCrypto {
         let nonce = self.nonce(&explicit);
         let aad = Self::aad(self.seq, content_type, plaintext.len());
         let sealed = aead_seal(self.aead, &self.key, &nonce, &aad, plaintext);
-        let mut fragment = Vec::with_capacity(8 + sealed.len());
-        fragment.extend_from_slice(&explicit);
+        let mut fragment = Vec::with_capacity(self.explicit_len() + sealed.len());
+        fragment.extend_from_slice(&explicit[..self.explicit_len()]);
         fragment.extend_from_slice(&sealed);
 
         self.seq = self.seq.checked_add(1).ok_or(TlsError::SeqExhausted)?;
         Ok(TlsRecord::new(content_type, fragment))
     }
 
-    /** @brief 레코드를 복호화한다. 순서 번호가 어긋나면 실패다. */
+    /**
+     * @brief 레코드를 복호화한다. 순서 번호가 어긋나면 실패다.
+     * @retval TlsError::RecordOverflow 평문이 2^14 바이트를 넘는다. 이쪽은 압축을 쓰지 않으므로
+     *         RFC 5246 이 평문에 정한 상한이 그대로 걸린다.
+     */
     pub fn decrypt(&mut self, record: &TlsRecord) -> Result<Vec<u8>, TlsError> {
-        if record.fragment.len() < 8 + 16 {
+        let explicit_len = self.explicit_len();
+        if record.fragment.len() < explicit_len + 16 {
             return Err(TlsError::Decrypt);
         }
-        let mut explicit = [0u8; 8];
-        explicit.copy_from_slice(&record.fragment[..8]);
-        let ct = &record.fragment[8..];
+        let explicit: [u8; 8] = if explicit_len == 0 {
+            self.seq.to_be_bytes()
+        } else {
+            record.fragment[..8]
+                .try_into()
+                .map_err(|_| TlsError::Decrypt)?
+        };
+        let ct = &record.fragment[explicit_len..];
         let plaintext_len = ct.len() - 16;
+        if plaintext_len > crate::record::MAX_FRAGMENT {
+            return Err(TlsError::RecordOverflow);
+        }
         let nonce = self.nonce(&explicit);
         let aad = Self::aad(self.seq, record.content_type, plaintext_len);
         let plain = aead_open(self.aead, &self.key, &nonce, &aad, ct)?;
@@ -449,6 +512,64 @@ pub fn parse_certificate(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
     Ok(out)
 }
 
+/** @brief 1.2 서버가 보낸 인증서 요청 가운데 이쪽이 쓰는 부분. */
+pub struct CertificateRequest12 {
+    /** @brief 받아 주는 인증서 종류. */
+    pub certificate_types: Vec<u8>,
+    /** @brief 받아 주는 서명 방식. */
+    pub signature_algorithms: Vec<u16>,
+}
+
+impl CertificateRequest12 {
+    /**
+     * @brief 이 서명 방식으로 만든 서명과 그 키를 담은 인증서를 받아 주는지.
+     * @details 인증서 종류는 키 종류로 정한다. RFC 8422 는 Ed25519 키도 ecdsa_sign 에 넣는다.
+     */
+    pub fn accepts(&self, scheme: u16) -> bool {
+        use crate::msg::consts::*;
+        let certificate_type = match scheme {
+            ED25519 | ECDSA_SECP256R1_SHA256 | ECDSA_SECP384R1_SHA384 => CERT_TYPE_ECDSA_SIGN,
+            RSA_PKCS1_SHA256 | RSA_PKCS1_SHA384 | RSA_PKCS1_SHA512 | RSA_PSS_RSAE_SHA256
+            | RSA_PSS_RSAE_SHA384 | RSA_PSS_RSAE_SHA512 => CERT_TYPE_RSA_SIGN,
+            _ => return false,
+        };
+        self.certificate_types.contains(&certificate_type)
+            && self.signature_algorithms.contains(&scheme)
+    }
+}
+
+/**
+ * @brief 1.2 CertificateRequest 를 읽는다. 인증 기관 목록은 쓰지 않으므로 형식만 확인한다.
+ * @retval TlsError::Decode 형식이 깨졌거나, 비어 있으면 안 되는 목록이 비었다.
+ */
+pub fn parse_certificate_request(body: &[u8]) -> Result<CertificateRequest12, TlsError> {
+    let mut r = Reader::new(body);
+    let certificate_types = r.vec8()?.to_vec();
+    let algorithms = r.vec16()?;
+    let authorities = r.vec16()?;
+    if certificate_types.is_empty()
+        || algorithms.is_empty()
+        || algorithms.len() % 2 != 0
+        || !r.is_empty()
+    {
+        return Err(TlsError::Decode);
+    }
+    let mut names = Reader::new(authorities);
+    while !names.is_empty() {
+        if names.vec16()?.is_empty() {
+            return Err(TlsError::Decode);
+        }
+    }
+    let signature_algorithms = algorithms
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
+    Ok(CertificateRequest12 {
+        certificate_types,
+        signature_algorithms,
+    })
+}
+
 /**
  * @brief 서버 키 교환 서명의 대상 바이트.
  * @details 양쪽 무작위 값과 매개변수를 잇는다. 무작위 값이 들어가야 서명을 다른 핸드셰이크에
@@ -517,20 +638,87 @@ mod tests {
         let sr = [2u8; 32];
         let ms = master_secret(Hash::Sha256, &pms, &cr, &sr);
         assert_eq!(ms.len(), 48);
-        let km = key_material(Hash::Sha256, &ms, &cr, &sr, 16);
+        let gcm = suite_info(suites::ECDHE_ECDSA_AES128_GCM_SHA256).unwrap();
+        let km = key_material(&gcm, &ms, &cr, &sr);
         assert_eq!(km.client_key.len(), 16);
         assert_eq!(km.server_key.len(), 16);
+        assert_eq!(km.client_iv.len(), 4);
         assert_ne!(km.client_key, km.server_key);
         assert_ne!(km.client_iv, km.server_iv);
+
+        let chacha = suite_info(suites::ECDHE_ECDSA_CHACHA20_SHA256).unwrap();
+        let km = key_material(&chacha, &ms, &cr, &sr);
+        assert_eq!(km.client_key.len(), 32);
+        assert_eq!(
+            km.client_iv.len(),
+            12,
+            "RFC 7905 는 키 블록에서 12 바이트 고정 nonce 를 가져오게 합니다"
+        );
+        assert_eq!(km.server_iv.len(), 12);
+    }
+
+    #[test]
+    /**
+     * @brief ChaCha20-Poly1305 레코드가 RFC 7905 형식인지.
+     * @details 명시 nonce 없이 암호문과 태그만 싣고, nonce 는 고정 부분과 일련번호의 XOR 이다.
+     */
+    fn chacha20_record_follows_rfc7905() {
+        let key = vec![0x5au8; 32];
+        let iv: Vec<u8> = (0u8..12).collect();
+        let mut enc =
+            Tls12RecordCrypto::new(Aead::ChaCha20Poly1305, key.clone(), iv.clone()).unwrap();
+        let mut dec =
+            Tls12RecordCrypto::new(Aead::ChaCha20Poly1305, key.clone(), iv.clone()).unwrap();
+
+        let first = enc.encrypt(ContentType::Handshake, b"finished").unwrap();
+        let second = enc.encrypt(ContentType::ApplicationData, b"query").unwrap();
+        assert_eq!(
+            first.fragment.len(),
+            8 + 16,
+            "명시 nonce 를 싣지 않아야 합니다"
+        );
+
+        let mut nonce: [u8; 12] = iv.clone().try_into().unwrap();
+        nonce[11] ^= 1;
+        let aad = Tls12RecordCrypto::aad(1, ContentType::ApplicationData, 5);
+        let expected = aead_seal(Aead::ChaCha20Poly1305, &key, &nonce, &aad, b"query");
+        assert_eq!(
+            second.fragment, expected,
+            "nonce 는 고정 부분과 일련번호의 XOR 입니다"
+        );
+
+        assert_eq!(dec.decrypt(&first).unwrap(), b"finished");
+        assert_eq!(dec.decrypt(&second).unwrap(), b"query");
+    }
+
+    #[test]
+    /** @brief 고정 nonce 길이가 암호 방식에 맞지 않으면 만들지 않는지. */
+    fn record_crypto_rejects_wrong_iv_length() {
+        assert!(Tls12RecordCrypto::new(Aead::ChaCha20Poly1305, vec![0; 32], vec![0; 4]).is_err());
+        assert!(Tls12RecordCrypto::new(Aead::Aes128Gcm, vec![0; 16], vec![0; 12]).is_err());
+    }
+
+    #[test]
+    /** @brief 2^14 바이트를 넘는 평문이 든 레코드를 풀기 전에 record_overflow 로 거부하는지. */
+    fn oversized_ciphertext_is_record_overflow() {
+        for (aead, key, iv, explicit) in [
+            (Aead::Aes128Gcm, vec![0x11; 16], vec![0; 4], 8),
+            (Aead::ChaCha20Poly1305, vec![0x11; 32], vec![0; 12], 0),
+        ] {
+            let mut dec = Tls12RecordCrypto::new(aead, key, iv).unwrap();
+            let fragment = vec![0; explicit + crate::record::MAX_FRAGMENT + 1 + 16];
+            let record = TlsRecord::new(ContentType::ApplicationData, fragment);
+            assert_eq!(dec.decrypt(&record), Err(TlsError::RecordOverflow));
+        }
     }
 
     #[test]
     /** @brief 레코드 왕복. */
     fn record_crypto_roundtrip() {
         let key = vec![0x33u8; 16];
-        let salt = [0xAB, 0xCD, 0xEF, 0x12];
-        let mut enc = Tls12RecordCrypto::new(Aead::Aes128Gcm, key.clone(), salt);
-        let mut dec = Tls12RecordCrypto::new(Aead::Aes128Gcm, key, salt);
+        let salt = vec![0xAB, 0xCD, 0xEF, 0x12];
+        let mut enc = Tls12RecordCrypto::new(Aead::Aes128Gcm, key.clone(), salt.clone()).unwrap();
+        let mut dec = Tls12RecordCrypto::new(Aead::Aes128Gcm, key, salt).unwrap();
 
         let r1 = enc
             .encrypt(ContentType::ApplicationData, b"hello dns over tls 1.2")
@@ -551,9 +739,9 @@ mod tests {
     /** @brief 변조와 순서 뒤바뀜을 거부하는지. */
     fn record_crypto_tamper_and_reorder_rejected() {
         let key = vec![0x44u8; 32];
-        let salt = [0u8; 4];
-        let mut enc = Tls12RecordCrypto::new(Aead::Aes256Gcm, key.clone(), salt);
-        let mut dec = Tls12RecordCrypto::new(Aead::Aes256Gcm, key, salt);
+        let salt = vec![0u8; 4];
+        let mut enc = Tls12RecordCrypto::new(Aead::Aes256Gcm, key.clone(), salt.clone()).unwrap();
+        let mut dec = Tls12RecordCrypto::new(Aead::Aes256Gcm, key, salt).unwrap();
         let mut r = enc
             .encrypt(ContentType::ApplicationData, b"secret")
             .unwrap();
@@ -570,8 +758,7 @@ mod tests {
     /** @brief 순서 번호가 다하면 되감지 않고 실패하는지. */
     fn seq_exhaustion_fails_closed() {
         let key = vec![0x33u8; 32];
-        let salt = [0xAB, 0xCD, 0xEF, 0x12];
-        let mut enc = Tls12RecordCrypto::new(Aead::ChaCha20Poly1305, key, salt);
+        let mut enc = Tls12RecordCrypto::new(Aead::ChaCha20Poly1305, key, vec![0xAB; 12]).unwrap();
         enc.seq = u64::MAX;
         assert_eq!(
             enc.encrypt(ContentType::ApplicationData, b"x"),
@@ -586,7 +773,7 @@ mod tests {
             (Aead::Aes128Gcm, vec![0x11; 16]),
             (Aead::Aes256Gcm, vec![0x22; 32]),
         ] {
-            let mut enc = Tls12RecordCrypto::new(aead, key, [0; 4]);
+            let mut enc = Tls12RecordCrypto::new(aead, key, vec![0; 4]).unwrap();
             enc.seq = 1 << 24;
             assert_eq!(
                 enc.encrypt(ContentType::ApplicationData, b"x"),
@@ -598,7 +785,8 @@ mod tests {
     #[test]
     /** @brief TLS 1.2도 평문 상한을 넘는 레코드를 만들지 않고, 이쪽 잘못으로 보는지. */
     fn oversized_plaintext_is_rejected_before_encryption() {
-        let mut crypto = Tls12RecordCrypto::new(Aead::Aes128Gcm, vec![0x11; 16], [0; 4]);
+        let mut crypto =
+            Tls12RecordCrypto::new(Aead::Aes128Gcm, vec![0x11; 16], vec![0; 4]).unwrap();
         assert_eq!(
             crypto.encrypt(
                 ContentType::ApplicationData,
@@ -639,6 +827,40 @@ mod tests {
 
         let excessive = vec![vec![1]; crate::cert::MAX_CERTIFICATE_ENTRIES + 1];
         assert!(parse_certificate(&certificate(&excessive)).is_err());
+    }
+
+    #[test]
+    /** @brief 1.2 CertificateRequest 를 읽고, 인증서 종류와 서명 방식이 함께 맞아야 받아 주는지. */
+    fn certificate_request_parsing_and_acceptance() {
+        let encode = |types: &[u8], algorithms: &[u16], names: &[&[u8]]| {
+            let mut w = Writer::new();
+            w.vec8(|w| w.bytes(types));
+            w.vec16(|w| algorithms.iter().for_each(|scheme| w.u16(*scheme)));
+            w.vec16(|w| names.iter().for_each(|name| w.vec16(|w| w.bytes(name))));
+            w.buf
+        };
+        let request = parse_certificate_request(&encode(
+            &[CERT_TYPE_ECDSA_SIGN],
+            &[0x0403, 0x0804],
+            &[b"dn"],
+        ))
+        .unwrap();
+        assert!(request.accepts(0x0403));
+        assert!(
+            !request.accepts(0x0804),
+            "RSA 키는 rsa_sign 종류가 있어야 받아 줍니다"
+        );
+        assert!(
+            !request.accepts(0x0503),
+            "알리지 않은 서명 방식은 받아 주지 않습니다"
+        );
+
+        assert!(parse_certificate_request(&encode(&[], &[0x0403], &[])).is_err());
+        assert!(parse_certificate_request(&encode(&[64], &[], &[])).is_err());
+        assert!(parse_certificate_request(&encode(&[64], &[0x0403], &[b""])).is_err());
+        let mut trailing = encode(&[64], &[0x0403], &[]);
+        trailing.push(0);
+        assert!(parse_certificate_request(&trailing).is_err());
     }
 
     #[test]

@@ -164,10 +164,12 @@ fn main() {
     let origin = Name::from_str("bench.test").unwrap();
     let allocation_baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(allocation_baseline, Ordering::Relaxed);
-    // 픽스처 생성은 타이머 밖에 둔다. 10만 번의 format!과 Name 파싱이 존 구축보다
-    // 비싸서, 함께 측정하면 build= 가 무엇을 측정한 값인지 알 수 없게 된다. 아래 parse 구간도
-    // 같은 방식이다. 반면 보유·최고점 기준선은 픽스처 앞에 그대로 둔다.
-    // 뒤로 옮기면 from_records가 입력 Vec을 해제할 때 보유량이 그만큼 낮게 잡힌다.
+    /*
+     * 픽스처 생성은 타이머 밖에 둔다. 10만 번의 format!과 Name 파싱이 존 구축보다
+     * 비싸서, 함께 측정하면 build= 가 무엇을 측정한 값인지 알 수 없게 된다. 아래 parse 구간도
+     * 같은 방식이다. 반면 보유·최고점 기준선은 픽스처 앞에 그대로 둔다.
+     * 뒤로 옮기면 from_records가 입력 Vec을 해제할 때 보유량이 그만큼 낮게 잡힌다.
+     */
     let records = zone_records(&origin, 100_000);
     let build_started = Instant::now();
     let zone = Zone::from_records(records).unwrap();

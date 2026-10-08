@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
 use onetdns_proto::Message;
-use onetdns_quic::H3Client;
+use onetdns_quic::{H3Client, H3Error};
 use onetdns_tls::TrustStore;
 
 use crate::quicdrive::{
@@ -34,6 +34,22 @@ struct Doh3Conn {
     server_name: String,
     /** @brief 폐기 확인을 이미 했는지. 연결당 한 번만 한다. */
     revocation_checked: bool,
+}
+
+impl Drop for Doh3Conn {
+    /**
+     * @brief 버려지는 연결의 종료를 서버에 알린다.
+     * @details 오류, 시간 초과, 무응답, LRU 축출, 스레드 종료 가운데 어느 경로로 버려도 여기를
+     *          지난다. 열린 연결은 알릴 오류 없이 닫고, 이미 닫힌 연결은 쌓아 둔 종료 프레임만
+     *          내보낸다. 소켓도 함께 닫으므로 closing 기간은 기다리지 않는다. 알리지 않으면 서버는
+     *          자기 유휴 데드라인까지 연결을 붙들고 있다.
+     */
+    fn drop(&mut self) {
+        if !self.h3.is_closed() {
+            self.h3.close(H3Error::NoError);
+        }
+        let _ = flush_out(&self.sock, &mut self.h3);
+    }
 }
 
 thread_local! {
@@ -118,20 +134,19 @@ fn connect(
         .ok_or(ForwardError::Timeout)?;
     let created = Instant::now();
     let (sock, conn) = new_client_connection(addr, server_name, b"h3", timeout, trust)?;
-    let mut h3 = H3Client::new(conn);
-
-    if !h3.can_send_early() {
-        pump_handshake(&sock, &mut h3, created, deadline).inspect_err(|error| {
-            crate::note_upstream_connect_failure("doh3", addr, server_name, error);
-        })?;
-    }
-    Ok(Doh3Conn {
+    let mut c = Doh3Conn {
         sock,
-        h3,
+        h3: H3Client::new(conn),
         created,
         server_name: server_name.to_string(),
         revocation_checked: false,
-    })
+    };
+    if !c.h3.can_send_early() {
+        pump_handshake(&c.sock, &mut c.h3, created, deadline).inspect_err(|error| {
+            crate::note_upstream_connect_failure("doh3", addr, server_name, error);
+        })?;
+    }
+    Ok(c)
 }
 
 /** @brief HTTP/3 요청 하나로 질의를 보내고 응답을 받는다. */
@@ -163,12 +178,7 @@ fn roundtrip(
     let sid = match c.h3.send_request(authority, path, &q) {
         Ok(sid) => sid,
         Err(error) => {
-            /*
-             * 필수 스트림이 닫혀 HTTP/3 계층이 연결을 닫았으면 그 종료 프레임이 쌓여 있다.
-             * 부른 쪽이 이 연결을 버리므로 먼저 내보낸다. 보내지 못해도 돌려줄 것은 원래
-             * 오류다.
-             */
-            let _ = flush_out(&c.sock, &mut c.h3);
+            c.h3.close(H3Error::Internal);
             return Err(ForwardError::Io(format!("DoH3 request send: {error}")));
         }
     };
@@ -200,9 +210,13 @@ fn roundtrip(
                 if status != 200 {
                     return Err(ForwardError::Io(format!("DoH3 non-200 status: {status}")));
                 }
-                let resp = Message::parse(&body).map_err(|_| ForwardError::BadResponse)?;
-                validate_response(request, &resp, Some(0))?;
-                return Ok(resp);
+                let resp = Message::parse(&body)
+                    .map_err(|_| ForwardError::BadResponse)
+                    .and_then(|resp| validate_response(request, &resp, Some(0)).map(|()| resp));
+                if resp.is_err() {
+                    c.h3.close(H3Error::GeneralProtocol);
+                }
+                return resp;
             }
         }
     }
@@ -234,11 +248,8 @@ mod tests {
         (addr, trust)
     }
 
-    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
-    fn doh3_server_ex(
-        ip: Ipv4Addr,
-        one_shot: bool,
-    ) -> (SocketAddr, Arc<TrustStore>, Arc<AtomicUsize>) {
+    /** @brief dns.test 자체 서명 인증서를 쓰는 DoH3 서버 설정과 그 인증서만 믿는 신뢰 저장소. */
+    fn doh3_server_config() -> (Arc<ServerConfig>, Arc<TrustStore>) {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
         let cert_der = ck.cert.der().to_vec();
         let key_der = ck.key_pair.serialize_der();
@@ -252,7 +263,15 @@ mod tests {
             client_ca: None,
             resumption: None,
         });
+        (scfg, trust)
+    }
 
+    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
+    fn doh3_server_ex(
+        ip: Ipv4Addr,
+        one_shot: bool,
+    ) -> (SocketAddr, Arc<TrustStore>, Arc<AtomicUsize>) {
+        let (scfg, trust) = doh3_server_config();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(200)))
@@ -312,6 +331,128 @@ mod tests {
     /** @brief 테스트용 질의. */
     fn q(id: u16, name: &str) -> Message {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
+    }
+
+    /** @brief 질의를 그대로 되돌려 주는 응답. 답 레코드는 없다. */
+    fn answer_in_kind(req: &Message) -> Message {
+        let mut m = Message::default();
+        m.header.id = req.header.id;
+        m.header.response = true;
+        m.questions = req.questions.clone();
+        m
+    }
+
+    /** @brief 다른 이름을 물은 질의에 대한 응답. */
+    fn answer_other_question(req: &Message) -> Message {
+        let mut m = answer_in_kind(req);
+        m.questions = q(req.header.id, "other.test").questions;
+        m
+    }
+
+    /**
+     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림.
+     * @param answer 받은 질의에 실을 응답을 만든다.
+     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 연결마다 받은 종료 사유를 차례로 받는 곳.
+     */
+    fn doh3_close_recorder(
+        answer: fn(&Message) -> Message,
+    ) -> (
+        SocketAddr,
+        Arc<TrustStore>,
+        std::sync::mpsc::Receiver<onetdns_quic::PeerClose>,
+    ) {
+        let (scfg, trust) = doh3_server_config();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let (closes, reported) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut conns: HashMap<SocketAddr, H3Connection> = HashMap::new();
+            let mut buf = [0u8; onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                let h3c = conns.entry(peer).or_insert_with(|| {
+                    H3Connection::new(Connection::new_server(
+                        scfg.clone(),
+                        random_cid(),
+                        TransportParams::server_defaults(),
+                    ))
+                });
+                let received = h3c.recv_datagram(&buf[..n]);
+                if let Some(close) = h3c.conn_mut().peer_close().cloned() {
+                    conns.remove(&peer);
+                    if closes.send(close).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if received.is_err() {
+                    conns.remove(&peer);
+                    continue;
+                }
+                for (sid, query) in h3c.take_requests() {
+                    if let Ok(req) = Message::parse(&query) {
+                        let _ = h3c.send_response(sid, &answer(&req).try_encode().unwrap(), 0);
+                    }
+                }
+                while let Some(dg) = h3c.next_datagram() {
+                    let _ = sock.send_to(&dg, peer);
+                }
+            }
+        });
+        (addr, trust, reported)
+    }
+
+    #[test]
+    /**
+     * @brief 풀에서 버려지는 연결이 H3_NO_ERROR 로 닫힌다고 서버에 알리는지.
+     * @details 연결을 쥔 스레드가 끝나며 풀이 사라지는 경우다. 알리지 않으면 서버는 자기 유휴
+     *          데드라인까지 연결을 붙들고 있다.
+     */
+    fn doh3_discarded_connection_notifies_the_server() {
+        let (addr, trust, closes) = doh3_close_recorder(answer_in_kind);
+        thread::spawn(move || {
+            let request = q(1, "bye.test");
+            let wire = request.try_encode().unwrap();
+            exchange(
+                addr,
+                "dns.test",
+                "/dns-query",
+                &wire,
+                &request,
+                Duration::from_secs(5),
+                &trust,
+            )
+            .expect("질의에 대한 답을 받지 못했습니다");
+        })
+        .join()
+        .unwrap();
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("버려진 연결이 서버에 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x100, None));
+    }
+
+    #[test]
+    /**
+     * @brief 질의에 맞지 않는 응답을 받으면 H3_GENERAL_PROTOCOL_ERROR 로 연결을 닫는지.
+     * @details 그런 서버가 같은 연결로 보낼 다음 응답도 믿을 수 없다.
+     */
+    fn doh3_mismatched_answer_closes_with_general_protocol_error() {
+        let (addr, trust, closes) = doh3_close_recorder(answer_other_question);
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doh3(addr, "dns.test", "/dns-query")],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+        assert!(fwd.resolve(&q(1, "x.test")).is_err());
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x101, None));
     }
 
     #[test]

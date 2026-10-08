@@ -159,7 +159,7 @@ fn generate_der(hostname: &str) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     let version = tlv(0xa0, &tlv(0x02, &[0x02]));
     let mut rnd = [0u8; 16];
     onetdns_tls::sys::fill_random(&mut rnd);
-    // 첫 바이트를 0으로 두지 않는다. 앞선 0을 걷어내면 그만큼 짧은 일련번호가 된다.
+    /* 첫 바이트를 0으로 두지 않는다. 앞선 0을 걷어내면 그만큼 짧은 일련번호가 된다. */
     rnd[0] |= 0x01;
     let serial = der_positive_integer(&rnd);
 
@@ -488,7 +488,7 @@ mod tests {
      */
     fn first_serial_content(der: &[u8]) -> Vec<u8> {
         let mut i = 0usize;
-        // Certificate SEQUENCE, TBSCertificate SEQUENCE 두 겹을 연다.
+        /* Certificate SEQUENCE, TBSCertificate SEQUENCE 두 겹을 연다. */
         for _ in 0..2 {
             assert_eq!(der[i], 0x30, "SEQUENCE를 기대했습니다");
             i += 1;

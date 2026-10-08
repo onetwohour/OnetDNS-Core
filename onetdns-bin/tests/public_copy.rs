@@ -87,7 +87,7 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
                 index += 1;
                 while index < bytes.len() && bytes[index] != b'"' {
                     if bytes[index] == b'\\' && index + 1 < bytes.len() {
-                        // 줄바꿈 이스케이프는 한 칸으로 본다. 원본 검사기와 같은 취급이다.
+                        /* 줄바꿈 이스케이프는 한 칸으로 본다. 원본 검사기와 같은 취급이다. */
                         if bytes[index + 1] == b'n' {
                             value.push(' ');
                         } else {
@@ -225,7 +225,7 @@ fn the_parsing_helpers_behave() {
     let prefix = production_prefix(source);
     assert!(prefix.contains("보임") && !prefix.contains("안 보임"));
 
-    // cfg(test) 가 붙었어도 테스트 모듈이 아니면 자르지 않는다.
+    /* cfg(test) 가 붙었어도 테스트 모듈이 아니면 자르지 않는다. */
     let other = "#[cfg(test)]\nfn helper() {}\nlet c = \"보임\";\n";
     assert!(production_prefix(other).contains("보임"));
 

@@ -278,10 +278,11 @@ pub(crate) fn new_client_connection(
 
 /**
  * @brief QUIC 상대 인증서의 폐기 여부를 확인한다.
- * @details 연결당 한 번, 핸드셰이크가 끝난 직후에 부른다. DoQ와 DoH3가 공유한다.
+ * @details 연결당 한 번, 핸드셰이크가 끝난 직후에 부른다. DoQ와 DoH3가 공유한다. 거부하면
+ *          TLS 가 인증서를 거부했을 때처럼 CRYPTO_ERROR 로 연결을 닫는다.
  */
 pub(crate) fn check_peer_revocation(
-    conn: &Connection,
+    conn: &mut Connection,
     server_name: &str,
     checked: &mut bool,
 ) -> Result<(), ForwardError> {
@@ -290,7 +291,10 @@ pub(crate) fn check_peer_revocation(
     }
     let chain = conn.verified_chain();
     if !chain.is_empty() {
-        crate::check_revocation(chain, server_name)?;
+        if let Err(error) = crate::check_revocation(chain, server_name) {
+            conn.reject_peer_certificate("Certificate revocation check failed");
+            return Err(error);
+        }
     }
     *checked = true;
     Ok(())
@@ -307,7 +311,7 @@ pub(crate) fn flush_out<D: QuicDriven>(sock: &QuicSocket, d: &mut D) -> Result<(
 /**
  * @brief 데이터그램 하나를 받아 상태에 넣는다.
  * @details 넣다가 연결 오류가 나면 상태 기계는 그 오류를 알리는 종료 프레임을 쌓아 두고
- *          닫힌다. 부른 쪽은 이 오류를 받으면 연결을 버리므로 여기서 그 프레임을 내보낸다.
+ *          닫힌다. 그 프레임은 연결을 쥔 DoqConn 이나 Doh3Conn 이 버려질 때 내보낸다.
  * @return 데이터그램을 받았으면 true, 수신 한도까지 아무것도 오지 않았으면 false.
  */
 pub(crate) fn recv_once<D: QuicDriven>(
@@ -319,10 +323,6 @@ pub(crate) fn recv_once<D: QuicDriven>(
     match sock.wait.recv(&sock.sock, buf) {
         Ok(n) => {
             if let Err(error) = d.recv_datagram(&buf[..n]) {
-                /*
-                 * 종료 프레임을 보내지 못해도 돌려줄 것은 원래 오류다.
-                 */
-                let _ = flush_out(sock, d);
                 return Err(ForwardError::Io(format!(
                     "Could not process QUIC datagram: {error}"
                 )));

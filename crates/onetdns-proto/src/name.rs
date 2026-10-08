@@ -817,26 +817,26 @@ mod tests {
      *          같이 맞아야 파일로 내보냈다 읽는 것만으로 이름이 바뀌지 않는다.
      */
     fn escapes_in_names_are_decoded_and_written_back() {
-        // \X 는 그 글자의 특별한 뜻을 없앤다. 점을 품은 라벨 하나다.
+        /* \X 는 그 글자의 특별한 뜻을 없앤다. 점을 품은 라벨 하나다. */
         let dotted = Name::from_str(r"a\.b.example").unwrap();
         let labels: Vec<&[u8]> = dotted.labels().collect();
         assert_eq!(labels, vec![b"a.b".as_slice(), b"example".as_slice()]);
 
-        // \DDD 는 십진수가 가리키는 옥텟 하나다. 065는 A다.
+        /* \DDD 는 십진수가 가리키는 옥텟 하나다. 065는 A다. */
         let decimal = Name::from_str(r"esc\065ape.example").unwrap();
         let labels: Vec<&[u8]> = decimal.labels().collect();
         assert_eq!(labels[0], b"escAape".as_slice());
 
-        // 공백도 십진 이스케이프로 적는다.
+        /* 공백도 십진 이스케이프로 적는다. */
         let spaced = Name::from_str(r"sp\032ace.example").unwrap();
         assert_eq!(spaced.labels().next().unwrap(), b"sp ace".as_slice());
 
-        // 적는 쪽이 다시 이스케이프해야 왕복한다.
+        /* 적는 쪽이 다시 이스케이프해야 왕복한다. */
         for name in [r"a\.b.example", r"esc\065ape.example", r"sp\032ace.example"] {
             let parsed = Name::from_str(name).unwrap();
             let written = parsed.to_master_lower();
             let again = Name::from_str(&written).unwrap();
-            // 적는 쪽이 소문자로 내리므로 대소문자는 접고 본다. DNS에서 같은 이름이다.
+            /* 적는 쪽이 소문자로 내리므로 대소문자는 접고 본다. DNS에서 같은 이름이다. */
             assert!(
                 parsed.eq_ignore_case(&again),
                 "{name} 이 왕복하지 않습니다: {written}"
@@ -848,7 +848,7 @@ mod tests {
             );
         }
 
-        // 이스케이프하지 않은 끝점만 루트 표기다.
+        /* 이스케이프하지 않은 끝점만 루트 표기다. */
         assert_eq!(
             Name::from_str("example.").unwrap(),
             Name::from_str("example").unwrap()
@@ -863,7 +863,7 @@ mod tests {
             "255를 넘는 십진값은 거부한다"
         );
 
-        // 평범한 이름은 그대로다.
+        /* 평범한 이름은 그대로다. */
         assert_eq!(
             Name::from_str("www.example.com").unwrap().to_master_lower(),
             "www.example.com"
@@ -1104,12 +1104,14 @@ mod tests {
             .collect();
         assert_eq!(folded.len(), 1, "소문자로 바꾼 뒤에는 키가 하나여야 합니다");
 
-        // 이미 소문자면 빌려 준다. 집계 경로가 질의마다 참조계수조차 건드리지 않게 한다.
+        /* 이미 소문자면 빌려 준다. 집계 경로가 질의마다 참조계수조차 건드리지 않게 한다. */
         assert!(matches!(lower.to_ascii_lower_name(), Cow::Borrowed(_)));
         assert!(matches!(mixed.to_ascii_lower_name(), Cow::Owned(_)));
 
-        // 길이 옥텟이 대문자 범위와 겹치지 않는다는 전제를 라벨 길이 65로 넘겨볼 수 없으므로
-        // 상한인 63으로 확인한다.
+        /*
+         * 길이 옥텟이 대문자 범위와 겹치지 않는다는 전제를 라벨 길이 65로 넘겨볼 수 없으므로
+         * 상한인 63으로 확인한다.
+         */
         let long = Name::from_labels(vec![vec![b'A'; 63]]).unwrap();
         assert_eq!(long.to_ascii_lower_name().to_ascii_lower(), "a".repeat(63));
         assert_eq!(long.to_ascii_lower_name().num_labels(), 1);

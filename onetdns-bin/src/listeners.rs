@@ -179,8 +179,10 @@ impl TlsSlots {
         if cfg.tls_self_signed_host.is_some() || cfg.tls_cert.is_none() || cfg.tls_key.is_none() {
             return Ok(Vec::new());
         }
-        // 교체 전체를 이 잠금 아래에서 한다. 다시 적용 요청과 감시 작업이 겹칠 때 서로 다른
-        // 인증서를 슬롯마다 나눠 넣으면 전송마다 다른 인증서를 내밀게 된다.
+        /*
+         * 교체 전체를 이 잠금 아래에서 한다. 다시 적용 요청과 감시 작업이 겹칠 때 서로 다른
+         * 인증서를 슬롯마다 나눠 넣으면 전송마다 다른 인증서를 내밀게 된다.
+         */
         let mut live = self.live_files.lock_recover();
         let material = native_tls_material(cfg)?;
         let fresh = live_tls_files(cfg, material.0.clone())?;
@@ -259,7 +261,7 @@ pub(crate) fn tls_configs_from(
     ),
     String,
 > {
-    // 네 전송이 같은 인증서를 내놓아야 한다. 하나를 넷이 나눠 쓴다.
+    /* 네 전송이 같은 인증서를 내놓아야 한다. 하나를 넷이 나눠 쓴다. */
     Ok((
         native_tls_config(cfg, vec![b"dot".to_vec()], material)?,
         native_tls_config(cfg, vec![b"h2".to_vec(), b"http/1.1".to_vec()], material)?,
@@ -468,7 +470,7 @@ pub(crate) fn reconcile_listeners(
         }
         fresh_plain.push((key.clone(), server));
     }
-    // 새 리스너를 다 연 뒤에 이전 것을 닫는다. 닫기는 Drop이 한다.
+    /* 새 리스너를 다 연 뒤에 이전 것을 닫는다. 닫기는 Drop이 한다. */
     plain.retain(|(key, server)| {
         let keep = wanted_plain.iter().any(|(want, _)| want == key);
         if !keep {
@@ -749,8 +751,10 @@ pub(crate) fn reconcile_dnscrypt(
         if live.iter().any(|(have, _, _)| have == key) {
             continue;
         }
-        // 주소는 그대로인데 설정만 바뀌었으면 이전 리스너를 먼저 닫는다. 잡고 있는 채로
-        // 다시 열면 주소가 이미 쓰이고 있다며 실패한다.
+        /*
+         * 주소는 그대로인데 설정만 바뀌었으면 이전 리스너를 먼저 닫는다. 잡고 있는 채로
+         * 다시 열면 주소가 이미 쓰이고 있다며 실패한다.
+         */
         let prefix = format!("dnscrypt|{addr}|");
         let mut index = 0;
         while index < live.len() {
@@ -793,8 +797,10 @@ pub(crate) fn reconcile_dnscrypt(
                 })?;
             track_service_thread(tracker, thread);
         }
-        // 규격은 인증서 조회와 잘린 응답의 재시도를 TCP 로 시킨다. UDP 만 열면 그 경로가
-        // 전부 막히므로 같은 주소를 둘 다로 받는다.
+        /*
+         * 규격은 인증서 조회와 잘린 응답의 재시도를 TCP 로 시킨다. UDP 만 열면 그 경로가
+         * 전부 막히므로 같은 주소를 둘 다로 받는다.
+         */
         let tcp = open_when_free(|| {
             dnscrypt::serve_tcp(
                 *addr,
@@ -940,7 +946,7 @@ mod tests {
             );
         }
 
-        // 클라이언트 인증서를 확인하는 CA 번들도 경로가 그대로인 채 갈린다.
+        /* 클라이언트 인증서를 확인하는 CA 번들도 경로가 그대로인 채 갈린다. */
         let ca_path = dir.join("ca.pem");
         let (first_ca, _) =
             onetdns_transport::generate_self_signed_pem("ca-one.test").expect("CA 하나");

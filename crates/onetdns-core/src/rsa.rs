@@ -829,8 +829,10 @@ mod tests {
         let n = unhex(E3_N);
         let e = [3u8];
 
-        // 이 벡터가 진짜 위조 시도인지부터 확인한다. 세제곱한 값이 규격 앞부분과
-        // DigestInfo 를 그대로 담고 있어야 느슨한 검증기가 통과시킬 서명이 된다.
+        /*
+         * 이 벡터가 진짜 위조 시도인지부터 확인한다. 세제곱한 값이 규격 앞부분과
+         * DigestInfo 를 그대로 담고 있어야 느슨한 검증기가 통과시킬 서명이 된다.
+         */
         let forged_em = Modulus::parse(&n, MIN_MODULUS_BITS)
             .unwrap()
             .pow(&unhex(E3_FORGED), &e)
@@ -866,7 +868,7 @@ mod tests {
             pkcs1
         };
 
-        // 지수 3은 키로는 받는다. 이 서명은 다른 지수로 만든 것이라 서명에서 걸린다.
+        /* 지수 3은 키로는 받는다. 이 서명은 다른 지수로 만든 것이라 서명에서 걸린다. */
         assert_eq!(verify(&n, &[3], &sig), Err(RsaError::BadSignature));
         assert_eq!(verify(&n, &[1], &sig), Err(RsaError::BadKey));
         assert_eq!(verify(&n, &[1, 0, 0], &sig), Err(RsaError::BadKey));

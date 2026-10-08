@@ -83,6 +83,28 @@ pub enum TlsError {
     /** @brief 인증서나 인증 경로가 어긋났다. bad_certificate 로 알린다. */
     BadCert,
 
+    /** @brief 인증 경로가 이쪽 신뢰 저장소의 어느 루트에도 닿지 않는다. unknown_ca 로 알린다. */
+    UnknownCa,
+
+    /** @brief 경로의 인증서가 만료됐거나 아직 유효하지 않다. certificate_expired 로 알린다. */
+    CertificateExpired,
+
+    /**
+     * @brief 검증을 통과한 인증서를 다른 까닭으로 받아들이지 않는다. certificate_unknown 으로
+     *        알린다.
+     * @details 핸드셰이크 뒤의 폐기 확인처럼 TLS 검증 밖의 정책이 거부할 때다. 그 정책은 폐기를
+     *          확인한 경우와 확인하지 못한 경우를 구분해 알려 주지 않으므로 certificate_revoked
+     *          를 쓰지 않는다.
+     */
+    CertificateUnknown,
+
+    /**
+     * @brief 상대가 제안한 응용 프로토콜 가운데 이쪽이 쓸 수 있는 것이 없다.
+     * @details no_application_protocol 로 알린다. RFC 7301 이 서버에 요구하고, RFC 9001 은
+     *          QUIC 클라이언트도 협상에 실패하면 이 경고로 연결을 닫게 한다.
+     */
+    NoApplicationProtocol,
+
     /** @brief 서명, Finished, PSK 결합자가 맞지 않는다. decrypt_error 로 알린다. */
     BadSignature,
 
@@ -151,6 +173,9 @@ impl TlsError {
             TlsError::HandshakeFailure => Some(40),
             TlsError::BadCert => Some(42),
             TlsError::UnsupportedCertificate => Some(43),
+            TlsError::CertificateExpired => Some(45),
+            TlsError::CertificateUnknown => Some(46),
+            TlsError::UnknownCa => Some(48),
             TlsError::IllegalParameter | TlsError::UnsupportedSig(_) => Some(47),
             TlsError::Decode => Some(50),
             TlsError::BadSignature => Some(51),
@@ -159,6 +184,7 @@ impl TlsError {
             TlsError::MissingExtension => Some(109),
             TlsError::UnsupportedExtension => Some(110),
             TlsError::CertificateRequired => Some(116),
+            TlsError::NoApplicationProtocol => Some(120),
             TlsError::Io
             | TlsError::CloseNotify
             | TlsError::Eof
@@ -176,6 +202,10 @@ impl std::fmt::Display for TlsError {
             TlsError::RecordOverflow => write!(f, "TLS record length exceeds the limit"),
             TlsError::Decrypt => write!(f, "Could not decrypt TLS record"),
             TlsError::BadCert => write!(f, "Invalid certificate or public key"),
+            TlsError::UnknownCa => write!(f, "Certificate chain does not reach a trusted root"),
+            TlsError::CertificateExpired => write!(f, "Certificate is expired or not yet valid"),
+            TlsError::CertificateUnknown => write!(f, "Certificate was rejected by local policy"),
+            TlsError::NoApplicationProtocol => write!(f, "No common application protocol"),
             TlsError::BadSignature => write!(f, "Signature verification failed"),
             TlsError::UnsupportedSig(s) => write!(f, "Unsupported signature scheme: {s}"),
             TlsError::Io => write!(f, "I/O error on the TLS connection"),

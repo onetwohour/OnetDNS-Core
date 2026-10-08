@@ -1805,8 +1805,10 @@ impl Recursor {
         let nsec3 = denial_records(RecordType::NSEC3);
         let nsec3_allowed =
             onetdns_dnssec::nsec3_max_iterations(&nsec3) <= self.nsec3_max_iterations;
-        // 부재 증명이 NSEC3 뿐인데 그 반복이 상한을 넘으면, 증명을 볼 수 없어서 실패한
-        // 것이다. RFC 9276이 이 경우의 사유 코드를 따로 정한다.
+        /*
+         * 부재 증명이 NSEC3 뿐인데 그 반복이 상한을 넘으면, 증명을 볼 수 없어서 실패한
+         * 것이다. RFC 9276이 이 경우의 사유 코드를 따로 정한다.
+         */
         let excessive_nsec3_only = !nsec3_allowed && nsec.is_empty() && !nsec3.is_empty();
         let denial_bogus = if excessive_nsec3_only {
             SecurityStatus::Bogus(ede_code::UNSUPPORTED_NSEC3_ITERATIONS)
@@ -2167,8 +2169,10 @@ impl Recursor {
 
             Err(error) => {
                 onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "Could not fetch the keys for the chain of trust; answering SERVFAIL");
-                // 체인을 만들지 못하는 것은 DNSKEY 를 받지 못했을 때뿐이다. 서명이 깨졌는지는
-                // 알 수 없으므로, 서명이 깨졌다고 알리면 운영자가 엉뚱한 영역을 살핀다.
+                /*
+                 * 체인을 만들지 못하는 것은 DNSKEY 를 받지 못했을 때뿐이다. 서명이 깨졌는지는
+                 * 알 수 없으므로, 서명이 깨졌다고 알리면 운영자가 엉뚱한 영역을 살핀다.
+                 */
                 return Err(SecurityStatus::Bogus(match error {
                     RecurseError::NoResponse | RecurseError::NoReachableNs => {
                         ede_code::NO_REACHABLE_AUTHORITY
@@ -2179,8 +2183,10 @@ impl Recursor {
         };
         if self.chain_has_excessive_nsec3(&links) {
             onetdns_core::debug!(event = "dnssec.chain_nsec3_excessive", zone = %leaf.zone.to_ascii_lower(), "NSEC3 iterations exceed the budget; treating as bogus");
-            // RFC 9276: 이 서버가 계산을 거부한 것이지 서명이 깨진 것이 아니다. 사유를
-            // 갈라 알려야 운영자가 영역 매개변수를 고쳐야 한다는 것을 안다.
+            /*
+             * RFC 9276: 이 서버가 계산을 거부한 것이지 서명이 깨진 것이 아니다. 사유를
+             * 갈라 알려야 운영자가 영역 매개변수를 고쳐야 한다는 것을 안다.
+             */
             return Err(SecurityStatus::Bogus(
                 ede_code::UNSUPPORTED_NSEC3_ITERATIONS,
             ));
@@ -2327,8 +2333,10 @@ impl Recursor {
                     Ok(r) => break r,
                     Err(e) => e,
                 };
-                // 이 영역의 서버가 모두 답하지 않았다. 남겨 둔 네임서버 이름이 있으면 그 주소로
-                // 다시 묻는다.
+                /*
+                 * 이 영역의 서버가 모두 답하지 않았다. 남겨 둔 네임서버 이름이 있으면 그 주소로
+                 * 다시 묻는다.
+                 */
                 if budget.queries > 0 && self.resolve_more_ns_addrs(&mut state, budget) {
                     budget.queries -= 1;
                     continue;
@@ -2560,10 +2568,11 @@ impl Recursor {
         mut pending: PendingReferral,
         missing: Vec<Name>,
     ) -> StepOutcome {
-        // 부모가 준 주소가 하나라도 있으면 그것으로 내려간다. 주소를 이미 쥐고도
-        // 남은 네임서버 이름을 먼저 풀러 가면, 그 하나하나가 다시 루트부터 걷는
-        // 해석이 되어 예산을 전부 소진한다. iana.org가 그랬다. 주소 2개를 손에
-        // 잡은 채 이름 3개를 풀다가 시간이 끝나 SERVFAIL이 나갔다.
+        /*
+         * 부모가 준 주소가 하나라도 있으면 그것으로 내려간다. 주소를 이미 쥐고도
+         * 남은 네임서버 이름을 먼저 풀러 가면, 그 하나하나가 다시 루트부터 걷는
+         * 해석이 되어 예산을 전부 소진한다.
+         */
         if !missing.is_empty() && pending.addrs.is_empty() {
             rtrace!(
                 "Looking up addresses of nameservers without glue: need_address={}, have_address={}",
@@ -3030,8 +3039,10 @@ impl Recursor {
         let mut in_flight = 0usize;
         let mut ask_next_at = Instant::now();
 
-        // 교환마다 제한 시간을 데드라인 안에 잡으므로, 이 상한은 교환이 제 시간을 넘기는
-        // 이상한 경우에만 쓰인다.
+        /*
+         * 교환마다 제한 시간을 데드라인 안에 잡으므로, 이 상한은 교환이 제 시간을 넘기는
+         * 이상한 경우에만 쓰인다.
+         */
         let settled_by = deadline + per_server;
         loop {
             let now = Instant::now();
@@ -3066,9 +3077,11 @@ impl Recursor {
             if in_flight == 0 {
                 break;
             }
-            // 데드라인이 지나면 새로 묻지 않고, 이미 보낸 교환이 끝나 결과를 보낼 때까지만
-            // 기다린다. 끝나기 전에 돌아가면 그 교환이 아직 진행 중으로 남아, 곧 같은 질의를 다시
-            // 보내는 쪽이 끝나 가는 교환에 합쳐져 함께 시간 초과로 끝난다.
+            /*
+             * 데드라인이 지나면 새로 묻지 않고, 이미 보낸 교환이 끝나 결과를 보낼 때까지만
+             * 기다린다. 끝나기 전에 돌아가면 그 교환이 아직 진행 중으로 남아, 곧 같은 질의를 다시
+             * 보내는 쪽이 끝나 가는 교환에 합쳐져 함께 시간 초과로 끝난다.
+             */
             let wake = if !asking {
                 settled_by
             } else if next < ordered.len() && in_flight < MAX_EXCHANGES_PER_QUERY {
@@ -3501,8 +3514,10 @@ fn ede_text_for(code: u16) -> &'static str {
  *       쓸 수 있다.
  */
 fn bogus_servfail(template: &Message, ede: u16) -> Message {
-    // 키를 받지 못한 것은 권한 서버에 닿지 못한 것이지 검증이 실패한 것이 아니다. 검증 실패
-    // 지표에 섞으면 망 장애가 서명 문제로 보인다.
+    /*
+     * 키를 받지 못한 것은 권한 서버에 닿지 못한 것이지 검증이 실패한 것이 아니다. 검증 실패
+     * 지표에 섞으면 망 장애가 서명 문제로 보인다.
+     */
     if ede != ede_code::NO_REACHABLE_AUTHORITY {
         record_validation_bogus();
     }
@@ -5995,7 +6010,7 @@ mod tests {
                 let Ok(req) = Message::parse(&buf[..n]) else {
                     continue;
                 };
-                // UDP에는 절단 표시만 설정해 빈 응답을 보낸다.
+                /* UDP에는 절단 표시만 설정해 빈 응답을 보낸다. */
                 let mut m = base(&req);
                 m.header.truncated = true;
                 if let Ok(wire) = m.try_encode() {
@@ -6818,7 +6833,7 @@ mod tests {
             let mut m = base(req);
             let name = q.name.to_ascii_lower();
             if name.ends_with("slow.test") {
-                // 글루 없는 네임서버들이 사는 곳. 답하지 않는 주소로 넘긴다.
+                /* 글루 없는 네임서버들이 사는 곳. 답하지 않는 주소로 넘긴다. */
                 m.authorities.push(Record::new(
                     Name::from_str("slow.test").unwrap(),
                     3600,
@@ -9134,7 +9149,7 @@ mod tests {
         const PORT: u16 = 5424;
         let root = spawn_server("127.0.0.93", PORT, |req| {
             if req.questions.first().unwrap().qtype == RecordType::DNSKEY {
-                // 답하지 않는 서버를 흉내 내려고, 이 서버가 버리는 ID를 가진 응답을 돌려준다.
+                /* 답하지 않는 서버를 흉내 내려고, 이 서버가 버리는 ID를 가진 응답을 돌려준다. */
                 let mut m = base(req);
                 m.header.id = req.header.id.wrapping_add(1);
                 return m;

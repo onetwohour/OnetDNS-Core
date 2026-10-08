@@ -7,7 +7,7 @@
  */
 
 use crate::msg::consts;
-use crate::record::{ContentType, TlsRecord, LEGACY_VERSION};
+use crate::record::{ContentType, TlsRecord, LEGACY_VERSION, MAX_FRAGMENT};
 use crate::TlsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +145,8 @@ impl RecordCrypto {
      * @details 바깥 버전이 다르면 인증 데이터가 달라져 어차피 풀리지 않으므로, 풀어 보기 전에
      *          같은 사유인 Decrypt 로 거부한다. 채움을 걷어 낸 뒤 내용 종류가 남지 않으면
      *          RFC 8446 이 정한 대로 unexpected_message 다.
+     * @retval TlsError::RecordOverflow 내용 종류와 채움을 더한 평문이 2^14 + 1 바이트를 넘는다.
+     *         바깥 레코드의 여유분 256 바이트는 태그와 확장 몫이고 평문 몫이 아니다.
      */
     pub fn decrypt(&mut self, record: &TlsRecord) -> Result<(ContentType, Vec<u8>), TlsError> {
         if record.content_type != ContentType::ApplicationData {
@@ -157,6 +159,9 @@ impl RecordCrypto {
         let aad = Self::aad(record.fragment.len());
         let mut plain = aead_open(self.aead, &self.key, &nonce, &aad, &record.fragment)?;
         self.seq = self.seq.checked_add(1).ok_or(TlsError::SeqExhausted)?;
+        if plain.len() > MAX_FRAGMENT + 1 {
+            return Err(TlsError::RecordOverflow);
+        }
 
         while plain.last() == Some(&0) {
             plain.pop();
@@ -349,6 +354,30 @@ mod tests {
         let record = TlsRecord::new(ContentType::ApplicationData, fragment);
         let mut receiver = RecordCrypto::new(Aead::Aes128Gcm, key, iv);
         assert_eq!(receiver.decrypt(&record), Err(TlsError::UnexpectedMessage));
+    }
+
+    #[test]
+    /**
+     * @brief 채움까지 더한 평문이 2^14 + 1 바이트를 넘으면 record_overflow 인지.
+     * @details 채움을 걷어 낸 내용은 한도 안이어도 RFC 8446 은 내용 종류와 채움을 더한 평문
+     *          전체에 한도를 건다.
+     */
+    fn padded_inner_plaintext_over_the_limit_is_record_overflow() {
+        let key = vec![0x11; 16];
+        let iv = [0x22; 12];
+        let nonce = RecordCrypto::new(Aead::Aes128Gcm, key.clone(), iv).nonce();
+        let open = |inner: &[u8]| {
+            let aad = RecordCrypto::aad(inner.len() + TAG_LEN);
+            let fragment = aead_seal(Aead::Aes128Gcm, &key, &nonce, &aad, inner);
+            RecordCrypto::new(Aead::Aes128Gcm, key.clone(), iv)
+                .decrypt(&TlsRecord::new(ContentType::ApplicationData, fragment))
+                .map(|(_, plaintext)| plaintext.len())
+        };
+        let mut inner = vec![0x7a; MAX_FRAGMENT];
+        inner.push(ContentType::ApplicationData.0);
+        assert_eq!(open(&inner), Ok(MAX_FRAGMENT));
+        inner.push(0);
+        assert_eq!(open(&inner), Err(TlsError::RecordOverflow));
     }
 
     #[test]

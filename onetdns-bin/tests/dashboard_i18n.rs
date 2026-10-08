@@ -526,8 +526,10 @@ fn raw_render_data(script: &str, translating: &[(usize, usize)]) -> BTreeSet<(St
 #[test]
 fn every_korean_string_the_dashboard_shows_has_a_translation() {
     let source = root().join("crates/onetdns-control/dashboard/index.html");
-    // 템플릿 속성은 줄을 넘길 수 있고 사전 키는 줄바꿈을 한 글자로 담는다. 작업본이
-    // 두 글자짜리 줄바꿈으로 받아져 있으면 같은 문자열이 서로 다르게 보인다.
+    /*
+     * 템플릿 속성은 줄을 넘길 수 있고 사전 키는 줄바꿈을 한 글자로 담는다. 작업본이
+     * 두 글자짜리 줄바꿈으로 받아져 있으면 같은 문자열이 서로 다르게 보인다.
+     */
     let text = read(&source).replace("\r\n", "\n");
     let english = dictionary(&text, "en");
     let japanese = dictionary(&text, "ja");
@@ -636,10 +638,10 @@ fn the_scanning_helpers_behave() {
         ]
     );
 
-    // 이름 끝에 붙은 R 은 렌더 호출이 아니다.
+    /* 이름 끝에 붙은 R 은 렌더 호출이 아니다. */
     assert!(rendering_spans("myR('가')").is_empty());
 
-    // 뒤에 콜론이 따라올 때만 키로 센다.
+    /* 뒤에 콜론이 따라올 때만 키로 센다. */
     assert_eq!(
         literal_keys("{'가':'A','나'}")
             .into_iter()
@@ -647,7 +649,7 @@ fn the_scanning_helpers_behave() {
         vec!["가".to_string()]
     );
 
-    // 접두와 접미 규칙이 실제로 동작한다.
+    /* 접두와 접미 규칙이 실제로 동작한다. */
     let keys: BTreeSet<String> = ["삭제 실패: ".to_string(), "개 항목".to_string()]
         .into_iter()
         .collect();

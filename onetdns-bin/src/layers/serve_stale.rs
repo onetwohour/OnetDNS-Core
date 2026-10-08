@@ -178,9 +178,11 @@ impl ServeStaleLayer {
             max_stale,
             min_ttl,
             max_ttl,
-            // RFC 8767은 만료된 레코드의 수명을 0보다 크게 실으라고 정한다. 0으로 내보내면
-            // 받은 쪽이 담아 두지 못해 같은 이름을 곧바로 다시 물어, 업스트림이 죽어 있는 동안
-            // 질의가 몰린다. 이 기능이 막으려던 상황을 그대로 만든다.
+            /*
+             * RFC 8767은 만료된 레코드의 수명을 0보다 크게 실으라고 정한다. 0으로 내보내면
+             * 받은 쪽이 담아 두지 못해 같은 이름을 곧바로 다시 물어, 업스트림이 죽어 있는 동안
+             * 질의가 몰린다. 이 기능이 막으려던 상황을 그대로 만든다.
+             */
             reply_ttl: reply_ttl.max(1),
             ttl_reset,
             client_timeout: client_timeout.filter(|d| !d.is_zero()),

@@ -206,7 +206,7 @@ fn run_thread(
                 in_flight -= 1;
             }
             Err(_) => {
-                // 데드라인을 넘긴 미회수는 다시 오지 않는다. 잠긴 곳을 풀어 준다.
+                /* 데드라인을 넘긴 미회수는 다시 오지 않는다. 잠긴 곳을 풀어 준다. */
                 in_flight = 0;
             }
         }
@@ -230,7 +230,7 @@ fn percent(part: u64, whole: u64) -> f64 {
 }
 
 fn main() {
-    // 바닥값 측정 모드. 질의 목록도 데드라인도 필요 없으므로 인자 검사 앞에서 갈라진다.
+    /* 바닥값 측정 모드. 질의 목록도 데드라인도 필요 없으므로 인자 검사 앞에서 갈라진다. */
     let raw: Vec<String> = std::env::args().collect();
     if let Some(at) = raw.iter().position(|a| a == "--serve-echo") {
         let port: u16 = raw
@@ -273,7 +273,7 @@ fn main() {
         let completed = Arc::clone(&completed);
         let server = args.server.clone();
         let outstanding = args.outstanding;
-        // 스레드마다 목록의 다른 지점에서 시작해 같은 이름에 몰리지 않게 한다.
+        /* 스레드마다 목록의 다른 지점에서 시작해 같은 이름에 몰리지 않게 한다. */
         let start = worker.wrapping_mul(queries.len() / args.threads.max(1));
         handles.push(std::thread::spawn(move || {
             match run_thread(&server, &queries, start, outstanding, deadline) {

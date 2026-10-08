@@ -374,9 +374,11 @@ impl NativeServer {
             return None;
         }
         let features = self.features.load();
-        // dnstap은 내보낸 envelope마다 한 건씩 남겨야 하는데 이 경로는 미리 만들어 둔 바이트를
-        // 그대로 내보내므로 남길 것을 만들지 못한다. 통계는 성공한 영역 전송을 어느 경로도
-        // 남기지 않으므로 여기서 물러설 이유가 없다.
+        /*
+         * dnstap은 내보낸 envelope마다 한 건씩 남겨야 하는데 이 경로는 미리 만들어 둔 바이트를
+         * 그대로 내보내므로 남길 것을 만들지 못한다. 통계는 성공한 영역 전송을 어느 경로도
+         * 남기지 않으므로 여기서 물러설 이유가 없다.
+         */
         if features.dnstap.is_some() {
             return None;
         }
@@ -609,7 +611,9 @@ impl NativeServer {
         replay_protected: bool,
     ) -> Result<Option<TsigContext>, Message> {
         let authority = self.authority.load();
-        // TSIG 오류 응답도 요청이 담은 OPT를 그대로 돌려줘야 한다. 서명 전에 붙어야 MAC이 덮는다.
+        /*
+         * TSIG 오류 응답도 요청이 담은 OPT를 그대로 돌려줘야 한다. 서명 전에 붙어야 MAC이 덮는다.
+         */
         let edns_buffer = self.features.load().edns_buffer;
         if onetdns_dnssec::tsig::contains_tsig(request) {
             let Some(key_name) = onetdns_dnssec::tsig::peek_key_name(request) else {
@@ -735,7 +739,7 @@ impl NativeServer {
         m.header.authoritative = true;
         m.header.recursion_available = false;
         m.additionals.clear();
-        // RFC 6891은 여기에도 적용된다. TSIG 서명 앞에 붙여야 서명이 이 OPT까지 덮는다.
+        /* RFC 6891은 여기에도 적용된다. TSIG 서명 앞에 붙여야 서명이 이 OPT까지 덮는다. */
         if request.opt().is_some() {
             m = finalize(
                 m,
@@ -827,9 +831,11 @@ impl NativeServer {
             Some(m)
         };
 
-        // RFC 2136은 영역부 개수와 ZTYPE 만 형식 오류로 본다. ZCLASS 가 맞지 않는
-        // 것은 요청이 깨진 것이 아니라 이 서버가 맡지 않은 영역이라는 뜻이라 아래에서 NOTAUTH
-        // 로 답한다.
+        /*
+         * RFC 2136은 영역부 개수와 ZTYPE 만 형식 오류로 본다. ZCLASS 가 맞지 않는
+         * 것은 요청이 깨진 것이 아니라 이 서버가 맡지 않은 영역이라는 뜻이라 아래에서 NOTAUTH
+         * 로 답한다.
+         */
         if request.questions.len() != 1 || request.questions[0].qtype != ApRt::SOA {
             return reply(ResponseCode::FormErr.0);
         }
@@ -916,8 +922,10 @@ impl NativeServer {
             std::collections::HashMap::new();
 
         for p in &request.answers {
-            // RFC 2136 의사코드는 TTL 을 영역 범위보다 먼저 본다. 둘 다 어긋난 요청에
-            // 어느 오류를 낼지가 여기서 갈린다.
+            /*
+             * RFC 2136 의사코드는 TTL 을 영역 범위보다 먼저 본다. 둘 다 어긋난 요청에
+             * 어느 오류를 낼지가 여기서 갈린다.
+             */
             if p.ttl != 0 {
                 return reply(ResponseCode::FormErr.0);
             }
@@ -1020,9 +1028,11 @@ impl NativeServer {
         for u in &request.authorities {
             match u.class.0 {
                 1 => {
-                    // CNAME 은 다른 데이터와 공존하지 못한다. 어느 방향이든 이 갱신 RR
-                    // 하나만 건너뛴다. 메시지 전체를 실패로 돌리면 함께 온 멀쩡한 갱신까지
-                    // 잃고, RFC 2136은 남은 RR 을 마저 처리한 뒤 NOERROR 를 낸다.
+                    /*
+                     * CNAME 은 다른 데이터와 공존하지 못한다. 어느 방향이든 이 갱신 RR
+                     * 하나만 건너뛴다. 메시지 전체를 실패로 돌리면 함께 온 멀쩡한 갱신까지
+                     * 잃고, RFC 2136은 남은 RR 을 마저 처리한 뒤 NOERROR 를 낸다.
+                     */
                     let conflicting_cname = if u.rtype == ApRt::CNAME {
                         recs.iter()
                             .any(|r| r.name.eq_ignore_case(&u.name) && r.rtype != ApRt::CNAME)
@@ -1064,9 +1074,11 @@ impl NativeServer {
                     if u.rtype == ApRt::SOA {
                         continue;
                     }
-                    // 정점의 마지막 NS 를 지우면 영역에 권한 서버가 없어지므로 RFC 2136
-                    // 3.4.2.4 가 이 RR 만 건너뛰라고 한다. 정점이 아닌 NS 는 위임이라
-                    // 마지막 하나를 지우는 것이 위임을 걷는 정상 동작이다.
+                    /*
+                     * 정점의 마지막 NS 를 지우면 영역에 권한 서버가 없어지므로 RFC 2136 이
+                     * 이 RR 만 건너뛰라고 한다. 정점이 아닌 NS 는 위임이라 마지막 하나를
+                     * 지우는 것이 위임을 걷는 정상 동작이다.
+                     */
                     if u.rtype == ApRt::NS
                         && u.name.eq_ignore_case(&apex)
                         && !recs.iter().any(|r| {
@@ -1092,8 +1104,10 @@ impl NativeServer {
             return reply(ResponseCode::NoError.0);
         }
 
-        // RFC 2136은 갱신이 일련번호를 스스로 바꾸지 않았을 때만 서버가 올리라고 한다.
-        // 갱신이 지정한 값 위에 하나를 더 얹으면 요청자가 적어 준 값이 영역에 남지 않는다.
+        /*
+         * RFC 2136은 갱신이 일련번호를 스스로 바꾸지 않았을 때만 서버가 올리라고 한다.
+         * 갱신이 지정한 값 위에 하나를 더 얹으면 요청자가 적어 준 값이 영역에 남지 않는다.
+         */
         if soa_serial_of(&recs) == Some(old_serial) {
             if let Some(soa_rec) = recs.iter_mut().find(|r| r.rtype == ApRt::SOA) {
                 if let ApRData::Soa(s) = &mut soa_rec.rdata {
@@ -1238,8 +1252,10 @@ impl NativeServer {
         {
             return Wire::Fallback;
         }
-        // EDNS 를 쓰지 않은 UDP 질의의 상한은 RFC 1035 의 512바이트다. 이 경로에는
-        // 절단 사다리가 없으므로 넘으면 구조적 경로로 전환한다. TCP 에는 이 상한이 없다.
+        /*
+         * EDNS 를 쓰지 않은 UDP 질의의 상한은 RFC 1035 의 512바이트다. 이 경로에는
+         * 절단 사다리가 없으므로 넘으면 구조적 경로로 전환한다. TCP 에는 이 상한이 없다.
+         */
         if edns.is_none()
             && ctx.transport == RtTransport::Do53Udp
             && out.buf.len() > onetdns_runtime::NON_EDNS_UDP_MAX
@@ -1252,8 +1268,10 @@ impl NativeServer {
             .iter()
             .filter(|limiter| limiter.is_active())
         {
-            // 위에서 꺼져 있다고 본 뒤 제한기가 켜졌으면 클라이언트를 만들지 않았다. 제한을
-            // 건너뛰지 않고 보통 경로로 전환한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
+            /*
+             * 위에서 꺼져 있다고 본 뒤 제한기가 켜졌으면 클라이언트를 만들지 않았다. 제한을
+             * 건너뛰지 않고 보통 경로로 전환한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
+             */
             let Some(client) = client.as_ref() else {
                 out.clear();
                 return Wire::Fallback;
@@ -1550,7 +1568,7 @@ mod tests {
             "요청에 OPT가 없으면 응답에도 넣지 않습니다"
         );
 
-        // TSIG 오류 응답도 같은 규칙을 따르고, OPT가 TSIG 앞에 와야 서명이 그것을 덮는다.
+        /* TSIG 오류 응답도 같은 규칙을 따르고, OPT가 TSIG 앞에 와야 서명이 그것을 덮는다. */
         let key = onetdns_dnssec::tsig::TsigKey::new(
             ApName::from_str("probe-key").unwrap(),
             vec![7u8; 32],

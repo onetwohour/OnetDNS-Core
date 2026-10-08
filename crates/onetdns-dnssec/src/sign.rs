@@ -726,7 +726,7 @@ impl<'a> ReusableSignatures<'a> {
         let expected_algorithm = signer.algorithm().number();
         let apex_wire = signer.owner.canonical_key();
 
-        // 지난 RRset들을 먼저 모은다. 서명은 내용이 그대로일 때만 물려줄 수 있다.
+        /* 지난 RRset들을 먼저 모은다. 서명은 내용이 그대로일 때만 물려줄 수 있다. */
         let mut rrsets: std::collections::HashMap<(Vec<u8>, u16), Vec<&'a Record>> =
             std::collections::HashMap::new();
         for record in previous.iter().filter(|record| record.rtype.0 != 46) {
@@ -779,13 +779,13 @@ fn rrsets_identical(left: &[Record], right: &[&Record]) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    // 순서만 다른 같은 집합도 같은 것으로 본다. 한쪽이 작으므로 이차 비교로 충분하다.
+    /* 순서만 다른 같은 집합도 같은 것으로 본다. 한쪽이 작으므로 이차 비교로 충분하다. */
     let same = |a: &Record, b: &Record| {
         a.ttl == b.ttl && a.class == b.class && a.rtype == b.rtype && a.rdata == b.rdata
     };
     let mut used = [false; 8];
     if left.len() > used.len() {
-        // 큰 RRset은 드물다. 그때만 정렬 가능한 형태로 비교한다.
+        /* 큰 RRset은 드물다. 그때만 정렬 가능한 형태로 비교한다. */
         let key = |record: &Record| {
             (
                 record.ttl,
@@ -845,7 +845,7 @@ fn sign_rrsets_into(out: &mut Vec<Record>, rrsets: &[&Vec<Record>], signer: &Zon
         return;
     }
 
-    // 슬롯을 미리 잡아 이어 붙이는 동안 다시 늘리지 않는다.
+    /* 슬롯을 미리 잡아 이어 붙이는 동안 다시 늘리지 않는다. */
     out.reserve(rrsets.len());
     let chunk = rrsets.len().div_ceil(threads);
     std::thread::scope(|scope| {
@@ -1316,7 +1316,7 @@ mod tests {
         crate::validate_rrset(&rrset, &sigs, &[signer.dnskey()], now as u32)
             .expect("알고리즘 15 서명이 이 서버의 검증기를 통과해야 합니다");
 
-        // DNSKEY RRset도 스스로 검증되어야 한다. 여기가 깨지면 신뢰 진입점이 끊긴다.
+        /* DNSKEY RRset도 스스로 검증되어야 한다. 여기가 깨지면 신뢰 진입점이 끊긴다. */
         let keyset: Vec<Record> = signed
             .iter()
             .filter(|r| r.name.eq_ignore_case(&n("example.com")) && r.rtype.0 == 48)
@@ -1332,7 +1332,7 @@ mod tests {
             .expect("DNSKEY RRset 자기 서명도 검증되어야 합니다");
         assert!(signer.ds().is_some(), "부모에 올릴 DS가 나와야 합니다");
 
-        // 재시작 사이 키가 보존되어야 한다. PEM 왕복이 깨지면 영역이 전부 바뀐다.
+        /* 재시작 사이 키가 보존되어야 한다. PEM 왕복이 깨지면 영역이 전부 바뀐다. */
         let pem = signer.to_pkcs8_pem().expect("Ed25519 PEM 내보내기");
         let restored =
             ZoneSigner::from_pkcs8_pem(&pem, n("example.com")).expect("Ed25519 PEM 읽기");
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(restored.dnskey().public_key, signer.dnskey().public_key);
         assert_eq!(restored.dnskey().key_tag(), signer.dnskey().key_tag());
 
-        // 저장된 키의 종류는 파일이 스스로 말한다. 알고리즘을 따로 안 적어도 된다.
+        /* 저장된 키의 종류는 파일이 스스로 말한다. 알고리즘을 따로 안 적어도 된다. */
         let p256_pem = ZoneSigner::generate(n("example.com"), [7u8; 32])
             .to_pkcs8_pem()
             .expect("P-256 PEM");
@@ -1365,7 +1365,7 @@ mod tests {
         }
         let first = sign_zone(&records, &signer, now);
 
-        // 아무것도 안 바꾸면 서명이 전부 물려받아져 바이트까지 같아야 한다.
+        /* 아무것도 안 바꾸면 서명이 전부 물려받아져 바이트까지 같아야 한다. */
         let again = sign_zone_reusing(&records, &signer, now + 60, &DenialMode::Nsec, &first);
         let sigs = |zone: &[Record]| -> Vec<Vec<u8>> {
             let mut v: Vec<Vec<u8>> = zone
@@ -1382,7 +1382,7 @@ mod tests {
             "내용이 그대로면 지난 서명을 그대로 써야 합니다"
         );
 
-        // 한 이름의 주소를 바꾸면 그 RRset만 새 서명을 받아야 한다.
+        /* 한 이름의 주소를 바꾸면 그 RRset만 새 서명을 받아야 한다. */
         let mut changed = records.clone();
         for record in &mut changed {
             if record.name.eq_ignore_case(&n("h007.example.com")) {
@@ -1414,7 +1414,7 @@ mod tests {
             untouched(&after),
             "안 바뀐 이웃은 지난 서명을 유지해야 합니다"
         );
-        // 물려받은 것이 실제로 검증되는지. 물려받기가 어긋나면 검증기가 Bogus로 본다.
+        /* 물려받은 것이 실제로 검증되는지. 물려받기가 어긋나면 검증기가 Bogus로 본다. */
         let rrset: Vec<Record> = after
             .iter()
             .filter(|r| r.name.eq_ignore_case(&n("h008.example.com")) && r.rtype == RecordType::A)
@@ -1429,7 +1429,7 @@ mod tests {
         crate::validate_rrset(&rrset, &rrsigs, &[signer.dnskey()], (now + 60) as u32)
             .expect("물려받은 서명도 검증되어야 합니다");
 
-        // 만료가 임박하면 물려받지 않는다.
+        /* 만료가 임박하면 물려받지 않는다. */
         let late = now + VALIDITY - REUSE_MIN_REMAINING / 2;
         let refreshed = sign_zone_reusing(&records, &signer, late, &DenialMode::Nsec, &first);
         assert_ne!(
@@ -1438,7 +1438,7 @@ mod tests {
             "만료가 가까운 서명은 새로 만들어야 합니다"
         );
 
-        // 다른 키의 서명은 물려받지 않는다.
+        /* 다른 키의 서명은 물려받지 않는다. */
         let other = ZoneSigner::generate(n("example.com"), [22u8; 32]);
         let foreign = sign_zone_reusing(&records, &other, now + 60, &DenialMode::Nsec, &first);
         assert_ne!(
@@ -1470,7 +1470,7 @@ mod tests {
     fn parallel_signing_matches_the_sequential_order_and_signs_everything() {
         use std::net::Ipv4Addr;
 
-        // 병렬 문턱을 넘기는 크기여야 조각 이어 붙이기가 실제로 걸린다.
+        /* 병렬 문턱을 넘기는 크기여야 조각 이어 붙이기가 실제로 걸린다. */
         let owners = PARALLEL_SIGN_MIN_RRSETS * 4;
         let signer = ZoneSigner::generate(n("example.com"), [9u8; 32]);
         let now = 1_700_000_000u64;
@@ -1489,8 +1489,10 @@ mod tests {
             "병렬 경로를 실제로 태우는 크기여야 합니다"
         );
 
-        // 서명은 정렬된 RRset 순서 그대로 붙는다. 조각을 순서대로 이어 붙이지 않으면
-        // 코어 수에 따라 결과가 달라진다.
+        /*
+         * 서명은 정렬된 RRset 순서 그대로 붙는다. 조각을 순서대로 이어 붙이지 않으면
+         * 코어 수에 따라 결과가 달라진다.
+         */
         let sig_keys: Vec<(Vec<Vec<u8>>, u16)> = signed
             .iter()
             .filter(|r| r.rtype.0 == 46)
@@ -1500,7 +1502,7 @@ mod tests {
         sorted.sort();
         assert_eq!(sig_keys, sorted, "서명이 정규 순서를 벗어났습니다");
 
-        // 서명해야 할 RRset이 하나도 빠지지 않았는지. 조각 하나를 잃으면 여기서 걸린다.
+        /* 서명해야 할 RRset이 하나도 빠지지 않았는지. 조각 하나를 잃으면 여기서 걸린다. */
         let mut unsigned: Vec<String> = Vec::new();
         let signed_set: std::collections::HashSet<(Vec<Vec<u8>>, u16)> =
             sig_keys.into_iter().collect();
@@ -1511,7 +1513,7 @@ mod tests {
         }
         assert!(unsigned.is_empty(), "서명이 빠진 RRset: {unsigned:?}");
 
-        // 값 자체도 유효해야 한다. 순서만 맞고 내용이 틀리면 소용이 없다.
+        /* 값 자체도 유효해야 한다. 순서만 맞고 내용이 틀리면 소용이 없다. */
         let target = n("h00000.example.com");
         let rrset: Vec<Record> = signed
             .iter()

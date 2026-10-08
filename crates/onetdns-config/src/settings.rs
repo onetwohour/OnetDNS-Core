@@ -2165,7 +2165,7 @@ impl Config {
         }
 
         if !self.ddr_name.is_empty() {
-            // 알릴 것이 없는데 알리면 클라이언트가 닿지 못하는 곳으로 올라가려 한다.
+            /* 알릴 것이 없는데 알리면 클라이언트가 닿지 못하는 곳으로 올라가려 한다. */
             if !self.tls_enabled() {
                 return Err(ConfigError::Invalid(
                     "ddr_name is set but there is no encrypted listening address to announce; open at least one of listen_dot, listen_doh, listen_doq, or listen_doh3".into(),
@@ -2539,8 +2539,10 @@ impl Config {
         tcp_addrs.extend(self.listen_doh.iter().map(|a| (*a, "listen_doh")));
         udp_addrs.extend(self.listen_doq.iter().map(|a| (*a, "listen_doq")));
         udp_addrs.extend(self.listen_doh3.iter().map(|a| (*a, "listen_doh3")));
-        // DNSCrypt 는 같은 주소를 UDP 와 TCP 둘 다로 연다. 한쪽만 비교하면 설정 검사를
-        // 통과한 설정이 시작 때 주소를 못 열어 리스너 하나가 조용히 빠진다.
+        /*
+         * DNSCrypt 는 같은 주소를 UDP 와 TCP 둘 다로 연다. 한쪽만 비교하면 설정 검사를
+         * 통과한 설정이 시작 때 주소를 못 열어 리스너 하나가 조용히 빠진다.
+         */
         udp_addrs.extend(self.listen_dnscrypt.iter().map(|a| (*a, "listen_dnscrypt")));
         tcp_addrs.extend(self.listen_dnscrypt.iter().map(|a| (*a, "listen_dnscrypt")));
         if let Some(addr) = self.control_listen {
@@ -5806,9 +5808,11 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     if root.get("listen").is_some() {
         c.listen = gparsevec(root, "listen");
     }
-    // 업스트림 기본값은 upstream_urls 의 암호화 서버다. 평문 upstreams 만 적은 사람에게
-    // 기본 암호화 서버를 남기면, 적은 적 없는 서버로 질의가 나가고 평문과 섞였다는 경고까지
-    // 받는다. 적지 않은 것은 고른 것이 아니므로 한쪽을 적으면 다른 쪽 기본값을 물린다.
+    /*
+     * 업스트림 기본값은 upstream_urls 의 암호화 서버다. 평문 upstreams 만 적은 사람에게
+     * 기본 암호화 서버를 남기면, 적은 적 없는 서버로 질의가 나가고 평문과 섞였다는 경고까지
+     * 받는다. 적지 않은 것은 고른 것이 아니므로 한쪽을 적으면 다른 쪽 기본값을 물린다.
+     */
     let urls_written = root.get("upstream_urls").is_some();
     if urls_written {
         c.upstream_urls = gstrvec(root, "upstream_urls");
@@ -6739,7 +6743,7 @@ answer = \"target.example\"
     #[test]
     /** @brief 권한을 내려놓을 대상이 실제로 낮은 권한인지. root로 내려놓으면 의미가 없다. */
     fn privilege_drop_configuration_requires_non_root_user_and_group() {
-        // 값 자체가 틀린 것은 그대로 거절한다. 빈 이름이나 root는 넘겨받을 대상이 아니다.
+        /* 값 자체가 틀린 것은 그대로 거절한다. 빈 이름이나 root는 넘겨받을 대상이 아니다. */
         for text in [
             "run_as_user = \"\"\n",
             "run_as_user = \"root\"\n",
@@ -6753,7 +6757,7 @@ answer = \"target.example\"
                 "값이 틀렸으면 거절: {text:?}"
             );
         }
-        // 짝이 없는 것은 막지 않고 알린다.
+        /* 짝이 없는 것은 막지 않고 알린다. */
         assert!(saved_with_advisory("run_as_group = \"dns\"\n"));
         Config::from_toml_str("run_as_user = \"dns\"\nrun_as_group = \"dns\"\n")
             .expect("비-root 사용자/그룹은 허용");
@@ -7583,7 +7587,7 @@ rate_limit_burst = 0
             "섞이지 않았는데 섞였다고 알렸습니다"
         );
 
-        // 대조군. 적어 놓은 평문은 그대로 두고, 섞였다는 것을 알린다.
+        /* 대조군. 적어 놓은 평문은 그대로 두고, 섞였다는 것을 알린다. */
         let mixed = Config::from_toml_str(
             "upstreams = [\"9.9.9.9\"]\nupstream_urls = [\"tls://1.1.1.1:853#cloudflare-dns.com\"]\n",
         )
@@ -7714,14 +7718,14 @@ blocked_services = ["youtube"]
     #[test]
     /** @brief DDR이 알릴 것이 없거나 이름이 틀리면 거부하는지. */
     fn ddr_name_requires_a_reachable_encrypted_listener() {
-        // 알릴 암호화 수신 주소가 없으면 클라이언트를 닿지 못하는 곳으로 보내게 된다.
+        /* 알릴 암호화 수신 주소가 없으면 클라이언트를 닿지 못하는 곳으로 보내게 된다. */
         assert!(Config::from_toml_str("ddr_name = \"dns.example.net\"\n").is_err());
         assert!(Config::from_toml_str(
             "ddr_name = \"dns.example.net\"\nlisten_dnscrypt = [\"127.0.0.1:5443\"]\n"
         )
         .is_err());
 
-        // 암호화 수신 주소는 인증서 출처를 요구하므로 함께 준다.
+        /* 암호화 수신 주소는 인증서 출처를 요구하므로 함께 준다. */
         const CERT: &str = "tls_self_signed_host = \"dns.example.net\"\n";
         for key in ["listen_dot", "listen_doh", "listen_doq", "listen_doh3"] {
             let toml =
@@ -7739,7 +7743,7 @@ blocked_services = ["youtube"]
         assert!(Config::from_toml_str(&with_dot("dns example")).is_err());
         assert!(Config::from_toml_str(&with_dot(&"a".repeat(64))).is_err());
 
-        // 비어 있으면 아무것도 요구하지 않는다. 기본값이다.
+        /* 비어 있으면 아무것도 요구하지 않는다. 기본값이다. */
         assert!(Config::from_toml_str("ddr_name = \"\"\n").is_ok());
     }
 
@@ -8027,7 +8031,7 @@ types = ["A", "AAAA", "CAA", "257"]
             Some(std::path::Path::new("anchors.txt"))
         );
 
-        // 전달 방식도 이 앵커로 체인을 세우므로 더 이상 효과가 없는 설정이 아니다.
+        /* 전달 방식도 이 앵커로 체인을 세우므로 더 이상 효과가 없는 설정이 아니다. */
         let toml = concat!(
             "backend = \"forward\"\n",
             "upstreams = [\"1.1.1.1\"]\n",
@@ -8040,7 +8044,7 @@ types = ["A", "AAAA", "CAA", "257"]
             "전달 방식도 이 앵커를 쓰는데 효과가 없다고 알렸습니다"
         );
 
-        // 대조군. 꺼 두면 그때는 정말 쓰이지 않으므로 알려야 한다.
+        /* 대조군. 꺼 두면 그때는 정말 쓰이지 않으므로 알려야 한다. */
         let toml = concat!(
             "backend = \"forward\"\n",
             "upstreams = [\"1.1.1.1\"]\n",

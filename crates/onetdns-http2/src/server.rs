@@ -633,8 +633,10 @@ fn valid_doh_request_headers(
                 return Err(STATUS_BAD_REQUEST);
             }
         } else if name == b"content-type" {
-            // 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는 것은 요청 스머글링의
-            // 경로라 그대로 400 이고, 다른 형식은 415 로 구분해야 클라이언트가 고칠 수 있다.
+            /*
+             * 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는 것은 요청 스머글링의
+             * 경로라 그대로 400 이고, 다른 형식은 415 로 구분해야 클라이언트가 고칠 수 있다.
+             */
             let is_dns = value.eq_ignore_ascii_case(b"application/dns-message");
             if content_type.replace(is_dns).is_some() {
                 return Err(STATUS_BAD_REQUEST);
@@ -709,7 +711,7 @@ where
     Ok(match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
             Ok(answer) if answer.body.len() <= MAX_H2_RESPONSE => AppResponse::Dns(answer),
-            // 답을 만들었는데 담아 보낼 수 없는 것은 이쪽 사정이므로 5xx 로 남긴다.
+            /* 답을 만들었는데 담아 보낼 수 없는 것은 이쪽 사정이므로 5xx 로 남긴다. */
             Ok(_) => AppResponse::Status(STATUS_BAD_GATEWAY),
             Err(status) => AppResponse::Status(status),
         },
@@ -727,8 +729,10 @@ fn queue_response<S: Write>(
 ) -> Result<(), H2Error> {
     match response {
         AppResponse::Status(status) => {
-            // 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
-            // 다시 물어야 하는지 알 길이 없다.
+            /*
+             * 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
+             * 다시 물어야 하는지 알 길이 없다.
+             */
             let block = if status == STATUS_METHOD_NOT_ALLOWED {
                 hpack::encode_response(&[(":status", status), ("allow", ALLOWED_METHODS)])
             } else {
@@ -1006,8 +1010,10 @@ fn write_h1_response<S: Write>(stream: &mut S, body: &[u8], max_age: u32) -> Res
 
 /** @brief 본문 없는 HTTP/1.1 오류 응답을 쓴다. */
 fn write_h1_status<S: Write>(stream: &mut S, status: &str) -> Result<(), H2Error> {
-    // 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
-    // 다시 물어야 하는지 알 길이 없다.
+    /*
+     * 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
+     * 다시 물어야 하는지 알 길이 없다.
+     */
     let allow = if status.starts_with(STATUS_METHOD_NOT_ALLOWED) {
         format!("Allow: {ALLOWED_METHODS}\r\n")
     } else {
@@ -1722,8 +1728,10 @@ mod tests {
             status_for("502")
         );
 
-        // HTTP/2 쪽도 같은 값을 내야 한다. 두 경로가 갈리면 클라이언트가 전송에 따라
-        // 다른 판단을 하게 된다.
+        /*
+         * HTTP/2 쪽도 같은 값을 내야 한다. 두 경로가 갈리면 클라이언트가 전송에 따라
+         * 다른 판단을 하게 된다.
+         */
         let mut output = Vec::new();
         let mut pending = HashMap::new();
         let mut windows = HashMap::from([(1, INITIAL_WINDOW)]);

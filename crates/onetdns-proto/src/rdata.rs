@@ -1068,7 +1068,7 @@ mod typed_rdata_tests {
 
         let apex = Name::from_str("wire.test").unwrap();
         let target = Name::from_str("t.wire.test").unwrap();
-        // NAPTR 의 이름 필드는 order 2, preference 2, 그리고 문자열 셋 뒤인 15 다.
+        /* NAPTR 의 이름 필드는 order 2, preference 2, 그리고 문자열 셋 뒤인 15 다. */
         let cases: Vec<(&str, RData, usize, bool)> = vec![
             (
                 "SRV",
@@ -1120,7 +1120,7 @@ mod typed_rdata_tests {
 
         for (label, rdata, name_at, compressible) in cases {
             let mut writer = Writer::new();
-            // 같은 접미사를 메시지에 미리 두어야 압축이 일어날 곳이 생긴다.
+            /* 같은 접미사를 메시지에 미리 두어야 압축이 일어날 곳이 생긴다. */
             apex.encode(&mut writer);
             let start = writer.buf.len();
             rdata.encode(&mut writer);

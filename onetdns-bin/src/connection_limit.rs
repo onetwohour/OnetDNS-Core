@@ -108,6 +108,11 @@ impl PrefixedTcp {
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
     }
+
+    /** @brief 실제 연결의 논블로킹 모드를 켜거나 끈다. */
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
 }
 
 impl onetdns_core::tcp::SocketTimeouts for PrefixedTcp {

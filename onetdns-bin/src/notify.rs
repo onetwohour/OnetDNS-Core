@@ -279,20 +279,105 @@ fn retry_delay(policy: NotifyRetryPolicy, transmissions: u8) -> Duration {
         .unwrap_or(Duration::MAX)
 }
 
+/**
+ * @brief 알림 워커가 한 바퀴에 하는 일.
+ * @details 이미 온 답부터 거두고 나서 다시 보낼 알림을 고른다. 워커가 늦게 깨어나 재전송 시각이
+ *          지났더라도 그사이 도착한 답이 있으면 같은 알림을 다시 보내지 않는다.
+ * @param sockets IPv4 와 IPv6 소켓. 열지 못한 계열은 None 이다.
+ */
+fn notify_round(
+    active: &mut std::collections::HashMap<NotifyJobKey, OutstandingNotify>,
+    pending: std::collections::HashMap<NotifyJobKey, NotifyJob>,
+    targets: &[NotifyRuntimeTarget],
+    sockets: [Option<&std::net::UdpSocket>; 2],
+    policy: NotifyRetryPolicy,
+) {
+    for socket in sockets.into_iter().flatten() {
+        receive_notify_acks(socket, active, targets);
+    }
+    for (job_key, job) in pending {
+        let Some(target) = targets.get(job_key.target) else {
+            continue;
+        };
+        if let Some(outstanding) = active.get_mut(&job_key) {
+            if outstanding.transmissions == 0 {
+                outstanding.serial = job.serial;
+                continue;
+            }
+        }
+        match outstanding_notify(job.origin, job.serial, target, NOTIFY_COALESCE_DELAY) {
+            Ok(outstanding) => {
+                active.insert(job_key, outstanding);
+            }
+            Err(error) => {
+                onetdns_core::error!(event = "authority.notify_encode_failed", serial = job.serial, %error, "Could not encode DNS NOTIFY")
+            }
+        }
+    }
+
+    let now = std::time::Instant::now();
+    let mut timed_out = Vec::new();
+    for (job_key, outstanding) in active.iter_mut() {
+        if now < outstanding.next_send {
+            continue;
+        }
+        if outstanding.transmissions > policy.retransmissions {
+            timed_out.push(job_key.clone());
+            continue;
+        }
+        let target = &targets[job_key.target];
+        let socket = if target.address.is_ipv4() {
+            sockets[0]
+        } else {
+            sockets[1]
+        };
+        let Some(socket) = socket else {
+            timed_out.push(job_key.clone());
+            continue;
+        };
+        match socket.send_to(&outstanding.wire, target.address) {
+            Ok(length) if length == outstanding.wire.len() => {
+                outstanding.transmissions += 1;
+                outstanding.next_send = now + retry_delay(policy, outstanding.transmissions);
+                onetdns_core::info!(event = "authority.notify_sent", zone = %outstanding.origin.to_ascii_lower(), serial = outstanding.serial, target = %target.address, transmission = outstanding.transmissions, "Sent DNS NOTIFY");
+            }
+            Ok(_) => {
+                outstanding.next_send = now + Duration::from_millis(10);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                outstanding.next_send = now + Duration::from_millis(10);
+            }
+            Err(error) => {
+                outstanding.transmissions += 1;
+                outstanding.next_send = now + retry_delay(policy, outstanding.transmissions);
+                onetdns_core::warn!(event = "authority.notify_send_failed", zone = %outstanding.origin.to_ascii_lower(), target = %target.address, transmission = outstanding.transmissions, %error, "Failed to send DNS NOTIFY");
+            }
+        }
+    }
+    for job_key in timed_out {
+        if let Some(expired) = active.remove(&job_key) {
+            onetdns_core::warn!(event = "authority.notify_timeout", zone = %expired.origin.to_ascii_lower(), serial = expired.serial, target = %targets[job_key.target].address, transmissions = expired.transmissions, "DNS NOTIFY expired without an ACK");
+        }
+    }
+}
+
 /** @brief 알림을 보내고 답을 기다리는 스레드를 시작한다. */
 fn spawn_notify_worker(
     targets: Vec<NotifyRuntimeTarget>,
     policy: NotifyRetryPolicy,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<(NotifySender, std::thread::JoinHandle<()>)> {
-    // 두 계열 소켓을 모두 연다. 대상 목록을 교체할 수 있으므로 지금 목록에 없는 계열도
-    // 나중에 들어올 수 있다.
+    /*
+     * 두 계열 소켓을 모두 연다. 대상 목록을 교체할 수 있으므로 지금 목록에 없는 계열도 나중에
+     * 들어올 수 있다. 소켓 하나로 여러 대상과 주고받으므로, 닫힌 대상 하나가 돌려보낸 ICMP
+     * 오류가 다른 대상의 답을 받지 못하게 하지 않도록 onetdns_core::udp::bind 로 연다.
+     */
     let socket4 = {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let socket = onetdns_core::udp::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_nonblocking(true)?;
         Some(socket)
     };
-    let socket6 = match std::net::UdpSocket::bind("[::]:0") {
+    let socket6 = match onetdns_core::udp::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)) {
         Ok(socket) => {
             socket.set_nonblocking(true)?;
             Some(socket)
@@ -312,96 +397,28 @@ fn spawn_notify_worker(
         .name("dns-notify".into())
         .spawn(move || {
             use std::sync::atomic::Ordering;
-            let mut active = std::collections::HashMap::<
-                NotifyJobKey,
-                OutstandingNotify,
-            >::new();
+            let mut active = std::collections::HashMap::<NotifyJobKey, OutstandingNotify>::new();
             while !shutdown.load(Ordering::Relaxed) {
-                // 한 바퀴 동안은 같은 목록을 본다. 도중에 갈리면 인덱스가 어긋난다.
+                /* 한 바퀴 동안은 같은 목록을 본다. 도중에 갈리면 인덱스가 어긋난다. */
                 let targets = targets.load();
                 let pending = std::mem::take(&mut *queue.pending.lock_recover());
-                for (job_key, job) in pending {
-                    let Some(target) = targets.get(job_key.target) else {
-                        continue;
-                    };
-                    if let Some(outstanding) = active.get_mut(&job_key) {
-                        if outstanding.transmissions == 0 {
-                            outstanding.serial = job.serial;
-                            continue;
-                        }
-                    }
-                    match outstanding_notify(
-                        job.origin,
-                        job.serial,
-                        target,
-                        NOTIFY_COALESCE_DELAY,
-                    ) {
-                        Ok(outstanding) => {
-                            active.insert(job_key, outstanding);
-                        }
-                        Err(error) => onetdns_core::error!(event = "authority.notify_encode_failed", serial = job.serial, %error, "Could not encode DNS NOTIFY"),
-                    }
-                }
-
-                let now = std::time::Instant::now();
-                let mut timed_out = Vec::new();
-                for (job_key, outstanding) in &mut active {
-                    if now < outstanding.next_send {
-                        continue;
-                    }
-                    if outstanding.transmissions > policy.retransmissions {
-                        timed_out.push(job_key.clone());
-                        continue;
-                    }
-                    let target = &targets[job_key.target];
-                    let socket = if target.address.is_ipv4() {
-                        socket4.as_ref()
-                    } else {
-                        socket6.as_ref()
-                    };
-                    let Some(socket) = socket else {
-                        timed_out.push(job_key.clone());
-                        continue;
-                    };
-                    match socket.send_to(&outstanding.wire, target.address) {
-                        Ok(length) if length == outstanding.wire.len() => {
-                            outstanding.transmissions += 1;
-                            outstanding.next_send =
-                                now + retry_delay(policy, outstanding.transmissions);
-                            onetdns_core::info!(event = "authority.notify_sent", zone = %outstanding.origin.to_ascii_lower(), serial = outstanding.serial, target = %target.address, transmission = outstanding.transmissions, "Sent DNS NOTIFY");
-                        }
-                        Ok(_) => {
-                            outstanding.next_send = now + Duration::from_millis(10);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            outstanding.next_send = now + Duration::from_millis(10);
-                        }
-                        Err(error) => {
-                            outstanding.transmissions += 1;
-                            outstanding.next_send =
-                                now + retry_delay(policy, outstanding.transmissions);
-                            onetdns_core::warn!(event = "authority.notify_send_failed", zone = %outstanding.origin.to_ascii_lower(), target = %target.address, transmission = outstanding.transmissions, %error, "Failed to send DNS NOTIFY");
-                        }
-                    }
-                }
-                for job_key in timed_out {
-                    if let Some(expired) = active.remove(&job_key) {
-                        onetdns_core::warn!(event = "authority.notify_timeout", zone = %expired.origin.to_ascii_lower(), serial = expired.serial, target = %targets[job_key.target].address, transmissions = expired.transmissions, "DNS NOTIFY expired without an ACK");
-                    }
-                }
-                if let Some(socket) = &socket4 {
-                    receive_notify_acks(socket, &mut active, &targets);
-                }
-                if let Some(socket) = &socket6 {
-                    receive_notify_acks(socket, &mut active, &targets);
-                }
+                notify_round(
+                    &mut active,
+                    pending,
+                    &targets,
+                    [socket4.as_ref(), socket6.as_ref()],
+                    policy,
+                );
 
                 let wait = if active.is_empty() {
                     Duration::from_millis(100)
                 } else {
                     let until_retry = active
                         .values()
-                        .map(|job| job.next_send.saturating_duration_since(std::time::Instant::now()))
+                        .map(|job| {
+                            job.next_send
+                                .saturating_duration_since(std::time::Instant::now())
+                        })
                         .min()
                         .unwrap_or(Duration::from_millis(10));
                     until_retry.min(Duration::from_millis(10))
@@ -634,6 +651,62 @@ mod tests {
         sender.wake();
         worker.join().unwrap();
         assert_eq!(verified.mac().len(), 32);
+    }
+
+    #[test]
+    /**
+     * @brief 재전송 시각이 지났어도 이미 도착한 답이 있으면 다시 보내지 않는지.
+     * @details 워커가 늦게 깨어나면 재전송 시각과 답의 도착이 한 바퀴 안에 겹친다. 답을 거두기
+     *          전에 보낼 알림부터 고르면 이미 답한 대상에 같은 알림을 또 보낸다.
+     */
+    fn notify_round_collects_arrived_acks_before_retransmitting() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = onetdns_core::udp::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let targets = vec![NotifyRuntimeTarget {
+            address: receiver.local_addr().unwrap(),
+            tsig_key: None,
+        }];
+        let origin = onetdns_proto::Name::from_str("late-ack.test").unwrap();
+        let mut outstanding =
+            outstanding_notify(origin.clone(), 3, &targets[0], Duration::ZERO).unwrap();
+        outstanding.transmissions = 1;
+
+        let mut ack = onetdns_proto::Message::parse(&outstanding.wire).unwrap();
+        ack.header.response = true;
+        receiver
+            .send_to(&ack.try_encode().unwrap(), socket.local_addr().unwrap())
+            .unwrap();
+        let mut wire = [0u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while socket.peek_from(&mut wire).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "답이 알림 소켓에 닿지 않았습니다"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let key = NotifyJobKey {
+            origin: origin.canonical_key(),
+            target: 0,
+        };
+        let mut active = std::collections::HashMap::from([(key, outstanding)]);
+        notify_round(
+            &mut active,
+            std::collections::HashMap::new(),
+            &targets,
+            [Some(&socket), None],
+            NotifyRetryPolicy::default(),
+        );
+        assert!(active.is_empty(), "도착한 답을 거두지 않았습니다");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(
+            receiver.recv_from(&mut wire).is_err(),
+            "답을 받은 알림을 다시 보냈습니다"
+        );
     }
 
     #[test]

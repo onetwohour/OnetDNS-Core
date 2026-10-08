@@ -436,7 +436,7 @@ mod tests {
      *          알 수 없는 옵션이라는 말을 듣는다. 주석은 부탁일 뿐이므로 여기서 판정한다.
      */
     fn every_documented_option_is_accepted() {
-        // 하위 명령을 고르는 표시라서 명령별 목록에 들어갈 슬롯이 없다.
+        /* 하위 명령을 고르는 표시라서 명령별 목록에 들어갈 슬롯이 없다. */
         const NOT_A_COMMAND_FLAG: &[&str] = &["--cli"];
         let accepted: Vec<&str> = COMMAND_FLAGS
             .iter()

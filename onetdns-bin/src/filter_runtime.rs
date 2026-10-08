@@ -183,8 +183,10 @@ impl FilterState {
                 &preset_urls.lock_recover(),
             );
             let cached = load_blocklist_cache(&active, blocklist_cache_dir.as_deref());
-            // 받아 둔 사본이 활성 목록을 모두 덮으면, 그리고 원격 목록이 하나도 없으면
-            // 시작 직후에 다시 받을 것이 없다.
+            /*
+             * 받아 둔 사본이 활성 목록을 모두 덮으면, 그리고 원격 목록이 하나도 없으면
+             * 시작 직후에 다시 받을 것이 없다.
+             */
             let all_loaded = cached.len() == active.len();
             let had_cached = !cached.is_empty();
             if had_cached {
@@ -300,7 +302,7 @@ impl FilterState {
                         }
                         let period = interval.load(Ordering::Acquire);
                         let now_generation = generation.load(Ordering::Acquire);
-                        // 목록이 바뀌면 주기를 기다리지 않고 바로 받아 온다.
+                        /* 목록이 바뀌면 주기를 기다리지 않고 바로 받아 온다. */
                         let due = now_generation != seen_generation
                             || !done_first
                             || (period > 0 && waited >= period);

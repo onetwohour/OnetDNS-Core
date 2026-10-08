@@ -75,6 +75,8 @@ pub mod consts {
     pub const TLS13: u16 = 0x0304;
     /** @brief TLS 1.2 버전 번호. */
     pub const TLS12: u16 = 0x0303;
+    /** @brief SSL 3.0 버전 번호. 인사말의 legacy_version 이 이 값 이하면 protocol_version 이다. */
+    pub const SSL30: u16 = 0x0300;
 }
 
 /**
@@ -626,19 +628,37 @@ impl ClientHello {
     }
 
     /**
+     * @brief 이 인사말이 그 판을 제안했는지.
+     * @details RFC 8446 을 따른다. supported_versions 가 있으면 그 목록만 보고 legacy_version 은
+     *          보지 않는다. 없으면 legacy_version 이 1.2 이상일 때 1.2 를 제안한 것으로 본다.
+     *          legacy_version 이 0x0304 인데 이 확장이 없어도 서버는 1.2 로 답한다.
+     * @retval TlsError::ProtocolVersion legacy_version 이 SSL 3.0 이하다.
+     * @retval TlsError::Decode supported_versions 형식이 틀렸다.
+     */
+    pub(crate) fn offers_version(&self, version: u16) -> Result<bool, TlsError> {
+        if self.legacy_version <= SSL30 {
+            return Err(TlsError::ProtocolVersion);
+        }
+        match self.ext(EXT_SUPPORTED_VERSIONS) {
+            Some(extension) => Ok(extension
+                .as_supported_versions_client()
+                .ok_or(TlsError::Decode)?
+                .contains(&version)),
+            None => Ok(version == TLS12 && self.legacy_version >= TLS12),
+        }
+    }
+
+    /**
      * @brief 1.3 인사말로서 형태가 맞는지 확인한다.
      * @details RFC 8446 이 1.3 인사말에 요구하는 확장도 본다. 재개 제안이 있으면 재개 방식
      *          확장이, 없으면 서명 방식과 지원 곡선이 있어야 한다. 지원 곡선과 키 공유는 함께
-     *          오거나 함께 빠져야 한다.
+     *          오거나 함께 빠져야 한다. legacy_version 은 판 협상에 쓰지 않으므로 SSL 3.0 이하만
+     *          거부한다.
      * @warning 재개 확장은 반드시 마지막이어야 한다. 바인더가 그 앞까지의 바이트에
      *          걸리므로, 뒤에 뭔가 오면 그 부분이 인증되지 않는다.
      */
     pub(crate) fn validate_tls13(&self) -> Result<(), TlsError> {
-        let offers_tls13 = self
-            .ext(EXT_SUPPORTED_VERSIONS)
-            .and_then(Extension::as_supported_versions_client)
-            .is_some_and(|versions| versions.contains(&TLS13));
-        if self.legacy_version != TLS12 || !offers_tls13 {
+        if !self.offers_version(TLS13)? {
             return Err(TlsError::ProtocolVersion);
         }
         if self.compression_methods != [0] {
@@ -665,11 +685,39 @@ impl ClientHello {
         Ok(())
     }
 
-    /** @brief 서명 방식 확장에 그 방식이 있는지. 인증서로 인증하는 서버는 이 안에서 골라야 한다. */
-    pub(crate) fn offers_signature_scheme(&self, scheme: u16) -> bool {
+    /**
+     * @brief 서버로서 쓸 응용 프로토콜을 이쪽 선호 순서로 고른다.
+     * @param supported 이쪽이 받아들이는 목록. 비어 있으면 ALPN 을 쓰지 않는다.
+     * @details 클라이언트가 확장을 보내지 않았으면 고르지 않는다. 양쪽이 모두 ALPN 을 쓰는데
+     *          겹치는 것이 없으면 RFC 7301 대로 핸드셰이크를 끝낸다.
+     * @retval TlsError::NoApplicationProtocol 겹치는 프로토콜이 없다.
+     */
+    pub(crate) fn select_alpn(&self, supported: &[Vec<u8>]) -> Result<Option<Vec<u8>>, TlsError> {
+        if supported.is_empty() {
+            return Ok(None);
+        }
+        let Some(extension) = self.ext(EXT_ALPN) else {
+            return Ok(None);
+        };
+        let offered = extension.as_alpn().ok_or(TlsError::Decode)?;
+        supported
+            .iter()
+            .find(|protocol| offered.contains(protocol))
+            .cloned()
+            .map(Some)
+            .ok_or(TlsError::NoApplicationProtocol)
+    }
+
+    /** @brief 서명 방식 확장에 든 방식들. 확장이 없으면 비어 있다. */
+    pub(crate) fn signature_algorithms(&self) -> Vec<u16> {
         self.ext(EXT_SIGNATURE_ALGORITHMS)
             .and_then(Extension::as_signature_algorithms)
-            .is_some_and(|algorithms| algorithms.contains(&scheme))
+            .unwrap_or_default()
+    }
+
+    /** @brief 서명 방식 확장에 그 방식이 있는지. */
+    pub(crate) fn offers_signature_scheme(&self, scheme: u16) -> bool {
+        self.signature_algorithms().contains(&scheme)
     }
 
     /** @brief HelloRetryRequest 뒤 두 번째 인사말이 허용된 항목만 바꿨는지. */
@@ -843,9 +891,10 @@ impl ServerHello {
      * @note 세션 번호를 클라이언트가 보낸 것과 대조한다. 다르면 중간자가 바꾼 것이다.
      * @details 이 메시지에 올 수 없는 확장은, 이쪽이 제안한 종류면 자리를 어긴 것이므로
      *          IllegalParameter 이고 제안하지 않은 종류면 UnsupportedExtension 이다.
+     *          supported_versions 가 판을 정하므로 legacy_version 은 SSL 3.0 이하만 거부한다.
      */
     pub(crate) fn validate_tls13(&self, hello: &ClientHello, hrr: bool) -> Result<(), TlsError> {
-        if self.legacy_version != TLS12 {
+        if self.legacy_version <= SSL30 {
             return Err(TlsError::ProtocolVersion);
         }
         if self.session_id_echo != hello.session_id {
@@ -876,16 +925,18 @@ impl ServerHello {
     }
 
     /**
-     * @brief 다시 시도 요청이 이쪽이 따를 수 있는 요청인지 확인한다.
+     * @brief 다시 시도 요청이 규격에 맞는지 확인한다.
      * @param hello 이 요청이 답하는 첫 클라이언트 인사말.
      * @details RFC 8446 은 고른 곡선이 첫 인사말의 지원 곡선에 있으면서 키 조각은 보내지 않은
-     *          것이어야 하고, 요청이 인사말에서 무언가를 바꾸게 해야 한다고 정한다. 이쪽은 X25519
-     *          키 조각을 다시 보내는 것으로만 답할 수 있으므로, 규격에는 맞아도 다른 곡선을
-     *          고르거나 쿠키만 담은 요청은 받아들일 매개변수가 없는 것으로 본다.
+     *          것이어야 하고, 요청이 인사말에서 무언가를 바꾸게 해야 한다고 정한다. 쿠키만 담은
+     *          요청에는 첫 인사말의 키 조각을 그대로 두고 쿠키만 더해 답한다.
+     * @return 두 번째 인사말에서 키 조각을 보낼 곡선. 쿠키만 담은 요청이면 없다.
      * @retval TlsError::IllegalParameter 규격을 어긴 요청이다.
-     * @retval TlsError::HandshakeFailure 규격에는 맞지만 이쪽이 따를 수 없다.
      */
-    pub(crate) fn validate_retry_request(&self, hello: &ClientHello) -> Result<(), TlsError> {
+    pub(crate) fn validate_retry_request(
+        &self,
+        hello: &ClientHello,
+    ) -> Result<Option<u16>, TlsError> {
         self.validate_tls13(hello, true)?;
         let selected = match self.ext(EXT_KEY_SHARE) {
             Some(extension) => Some(extension.as_key_share_hrr().ok_or(TlsError::Decode)?),
@@ -906,26 +957,26 @@ impl ServerHello {
             Some(group) if !offered_groups.contains(&group) || shared_groups.contains(&group) => {
                 Err(TlsError::IllegalParameter)
             }
-            Some(X25519) => Ok(()),
-            Some(_) => Err(TlsError::HandshakeFailure),
-            None if self.ext(EXT_COOKIE).is_some() => Err(TlsError::HandshakeFailure),
+            Some(group) => Ok(Some(group)),
+            None if self.ext(EXT_COOKIE).is_some() => Ok(None),
             None => Err(TlsError::IllegalParameter),
         }
     }
 
     /**
-     * @brief 서버 인사말에서 X25519 공개값을 꺼낸다.
+     * @brief 서버 인사말에서 서버의 공개값을 꺼낸다.
+     * @param sent 이쪽이 마지막 인사말에서 키 조각을 보낸 곡선. 보내지 않았으면 없다.
      * @retval TlsError::MissingExtension 키 공유가 없다. 이 스택은 키 공유 없이 재개하는 방식을
      *         제안하지 않으므로 서버는 반드시 보내야 한다.
      * @retval TlsError::IllegalParameter 이쪽이 키 조각을 보내지 않은 곡선을 골랐다.
      */
-    pub(crate) fn x25519_key_share(&self) -> Result<Vec<u8>, TlsError> {
+    pub(crate) fn key_share(&self, sent: Option<u16>) -> Result<Vec<u8>, TlsError> {
         let (group, key) = self
             .ext(EXT_KEY_SHARE)
             .ok_or(TlsError::MissingExtension)?
             .as_key_share_server()
             .ok_or(TlsError::Decode)?;
-        if group != X25519 {
+        if Some(group) != sent {
             return Err(TlsError::IllegalParameter);
         }
         Ok(key)
@@ -1187,10 +1238,15 @@ mod tests {
                 sh.extensions[0] = Extension::new(EXT_SUPPORTED_VERSIONS, data.clone())
             }
         };
+        assert_eq!(
+            with(&|sh| sh.legacy_version = 0x0301).validate_tls13(&hello, false),
+            Ok(()),
+            "지원 버전 확장이 있으면 legacy_version 은 보지 않는다"
+        );
         let cases: [(&str, ServerHello, bool, TlsError); 9] = [
             (
-                "legacy_version 이 0x0303 이 아님",
-                with(&|sh| sh.legacy_version = 0x0301),
+                "legacy_version 이 SSL 3.0 이하",
+                with(&|sh| sh.legacy_version = 0x0300),
                 false,
                 TlsError::ProtocolVersion,
             ),
@@ -1255,6 +1311,70 @@ mod tests {
             Ok(()),
             "다시 시도 요청의 쿠키는 제안하지 않았어도 받아야 한다"
         );
+    }
+
+    #[test]
+    /**
+     * @brief 다시 시도 요청이 제안한 다른 곡선을 고르거나 쿠키만 담았으면 받아들이고, RFC 8446 을
+     *        어긴 요청은 illegal_parameter 로 거부하는지.
+     * @details 고른 곡선은 지원 곡선에 있으면서 첫 인사말에서 키 조각을 보내지 않은 것이어야
+     *          하고, 요청은 인사말에서 무언가를 바꾸게 해야 한다.
+     */
+    fn hello_retry_request_may_select_another_offered_group_or_carry_only_a_cookie() {
+        let hello = hello_with(vec![
+            Extension::supported_versions_client(&[TLS13]),
+            Extension::supported_groups(&[X25519, SECP256R1]),
+            Extension::key_share_client(&[(X25519, vec![1; 32])]),
+        ]);
+        let retry = |extensions: Vec<Extension>| ServerHello {
+            legacy_version: TLS12,
+            random: HRR_RANDOM,
+            session_id_echo: Vec::new(),
+            cipher_suite: TLS_AES_128_GCM_SHA256,
+            extensions: [
+                vec![Extension::supported_versions_server(TLS13)],
+                extensions,
+            ]
+            .concat(),
+        };
+        assert_eq!(
+            retry(vec![Extension::key_share_hrr(SECP256R1)]).validate_retry_request(&hello),
+            Ok(Some(SECP256R1))
+        );
+        assert_eq!(
+            retry(vec![Extension::cookie(b"cookie")]).validate_retry_request(&hello),
+            Ok(None),
+            "쿠키만 담은 요청에는 첫 키 조각을 그대로 보낸다"
+        );
+        for (case, extensions) in [
+            (
+                "이미 키 조각을 보낸 곡선",
+                vec![Extension::key_share_hrr(X25519)],
+            ),
+            (
+                "제안하지 않은 곡선",
+                vec![Extension::key_share_hrr(SECP384R1)],
+            ),
+            ("바꿀 것이 없는 요청", Vec::new()),
+        ] {
+            assert_eq!(
+                retry(extensions).validate_retry_request(&hello),
+                Err(TlsError::IllegalParameter),
+                "{case}"
+            );
+        }
+
+        let answer = ServerHello {
+            random: [0; 32],
+            ..retry(vec![Extension::key_share_server(SECP256R1, &[4; 65])])
+        };
+        assert_eq!(answer.key_share(Some(SECP256R1)), Ok(vec![4; 65]));
+        assert_eq!(
+            answer.key_share(Some(X25519)),
+            Err(TlsError::IllegalParameter),
+            "키 조각을 보내지 않은 곡선으로 답하면 안 된다"
+        );
+        assert_eq!(answer.key_share(None), Err(TlsError::IllegalParameter));
     }
 
     #[test]
@@ -1595,15 +1715,22 @@ mod tests {
         }
 
         let complete = || hello_with(vec![versions(), groups(), schemes(), shares()]);
-        let mut old_version = complete();
-        old_version.legacy_version = 0x0301;
+        let mut tls10_legacy = complete();
+        tls10_legacy.legacy_version = 0x0301;
+        assert_eq!(
+            tls10_legacy.validate_tls13(),
+            Ok(()),
+            "지원 버전 확장이 있으면 legacy_version 은 보지 않는다"
+        );
+        let mut ssl3_legacy = complete();
+        ssl3_legacy.legacy_version = 0x0300;
         let without_versions = hello_with(vec![groups(), schemes(), shares()]);
         let mut compressed = complete();
         compressed.compression_methods = vec![1, 0];
         for (case, hello, expected) in [
             (
-                "legacy_version 이 0x0303 이 아님",
-                old_version,
+                "legacy_version 이 SSL 3.0 이하",
+                ssl3_legacy,
                 TlsError::ProtocolVersion,
             ),
             (

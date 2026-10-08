@@ -511,7 +511,7 @@ mod tests {
             windows::NO_IDEAL_PROCESSOR,
             "선호 코어 지정이 실패했습니다"
         );
-        // 이 스레드는 테스트 하네스가 재사용할 수 있으므로 원래 값으로 되돌린다.
+        /* 이 스레드는 테스트 하네스가 재사용할 수 있으므로 원래 값으로 되돌린다. */
         assert_ne!(
             windows::set_ideal_processor(previous),
             windows::NO_IDEAL_PROCESSOR,

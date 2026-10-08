@@ -110,18 +110,27 @@ pub struct CertificateRequestMsg {
     pub extensions: Vec<crate::msg::Extension>,
 }
 
+/**
+ * @brief 이쪽 1.3 CertificateRequest 가 알리는 서명 방식.
+ * @details 클라이언트의 CertificateVerify 는 이 안에서 골라야 한다. RSA PKCS#1 은 인증서 서명을
+ *          받기 위해 넣었고, CertificateVerify 에는 RFC 8446 이 금하므로 쓸 수 없다.
+ */
+pub(crate) const REQUESTED_SIGNATURE_SCHEMES: [u16; 5] = [
+    consts::ED25519,
+    consts::ECDSA_SECP256R1_SHA256,
+    consts::ECDSA_SECP384R1_SHA384,
+    consts::RSA_PSS_RSAE_SHA256,
+    consts::RSA_PKCS1_SHA256,
+];
+
 impl CertificateRequestMsg {
     /** @brief 이쪽이 지원하는 서명 방식을 담은 표준 요청. */
     pub fn standard() -> Self {
         CertificateRequestMsg {
             context: Vec::new(),
-            extensions: vec![crate::msg::Extension::signature_algorithms(&[
-                consts::ED25519,
-                consts::ECDSA_SECP256R1_SHA256,
-                consts::ECDSA_SECP384R1_SHA384,
-                consts::RSA_PSS_RSAE_SHA256,
-                consts::RSA_PKCS1_SHA256,
-            ])],
+            extensions: vec![crate::msg::Extension::signature_algorithms(
+                &REQUESTED_SIGNATURE_SCHEMES,
+            )],
         }
     }
 
@@ -139,6 +148,24 @@ impl CertificateRequestMsg {
         })
     }
 
+    /**
+     * @brief 핸드셰이크 중에 받은 요청을 확인하고, 이쪽 CertificateVerify 가 골라야 할 서명 방식을
+     *        돌려준다.
+     * @retval TlsError::IllegalParameter 요청 문맥이 비어 있지 않다. RFC 8446 은 핸드셰이크
+     *         중의 요청에 빈 문맥을 요구한다.
+     * @retval TlsError::MissingExtension signature_algorithms 가 없다.
+     * @retval TlsError::Decode signature_algorithms 형식이 틀렸다.
+     */
+    pub(crate) fn handshake_signature_algorithms(&self) -> Result<Vec<u16>, TlsError> {
+        if !self.context.is_empty() {
+            return Err(TlsError::IllegalParameter);
+        }
+        crate::msg::Extension::find(&self.extensions, consts::EXT_SIGNATURE_ALGORITHMS)
+            .ok_or(TlsError::MissingExtension)?
+            .as_signature_algorithms()
+            .ok_or(TlsError::Decode)
+    }
+
     /** @brief 인증서를 달라는 메시지를 적는다. */
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -150,6 +177,19 @@ impl CertificateRequestMsg {
         });
         w.buf
     }
+}
+
+/**
+ * @brief 이 서명 방식으로 1.3 CertificateVerify 를 만들 수 있는지.
+ * @param requested 받는 쪽이 signature_algorithms 로 알린 방식.
+ * @details RFC 8446 은 받는 쪽이 알린 방식만 쓰게 하고, RSA 는 PSS 만 쓰게 한다. RSA PKCS#1 은
+ *          1.3 에서 인증서 서명에만 쓴다.
+ */
+pub(crate) fn tls13_signature_scheme_allowed(scheme: u16, requested: &[u16]) -> bool {
+    !matches!(
+        scheme,
+        consts::RSA_PKCS1_SHA256 | consts::RSA_PKCS1_SHA384 | consts::RSA_PKCS1_SHA512
+    ) && requested.contains(&scheme)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +216,25 @@ impl CertificateVerify {
         })
     }
 
-    /** @brief 인증서 소유 증명을 적는다. */
+    /**
+     * @brief 1.3 CertificateVerify 의 서명을 상대 인증서로 검증한다.
+     * @param requested 이쪽이 signature_algorithms 로 알린 방식.
+     * @param content certificate_verify_content 로 만든 서명 대상.
+     * @retval TlsError::IllegalParameter 서명 방식이 이쪽이 알린 목록에 없거나 RSA PKCS#1 이다.
+     */
+    pub(crate) fn verify_tls13(
+        &self,
+        peer: &crate::x509::X509,
+        requested: &[u16],
+        content: &[u8],
+    ) -> Result<(), TlsError> {
+        if !tls13_signature_scheme_allowed(self.algorithm, requested) {
+            return Err(TlsError::IllegalParameter);
+        }
+        peer.verify_tls_signature(self.algorithm, content, &self.signature)
+    }
+
+    /** @brief 인증서 소유 증명을 적는다. 1.2 와 1.3 의 형식이 같다. */
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u16(self.algorithm);
@@ -271,6 +329,71 @@ rsa_verify!(verify_rsa_pkcs1_sha384, verify_pkcs1, RsaHash::Sha384);
 rsa_verify!(verify_rsa_pkcs1_sha512, verify_pkcs1, RsaHash::Sha512);
 
 #[cfg(test)]
+/**
+ * @brief testdata 의 RSA 키로 만든 자기 서명 인증서와 그 키.
+ * @details 1.3 에서 금하는 RSA PKCS#1 서명은 RSA 키로만 만들 수 있다. EC 키로 시험하면 키 종류
+ *          검사가 먼저 거부하므로 서명 방식 검사를 확인하지 못한다.
+ */
+pub(crate) fn rsa_test_certificate(
+    name: &str,
+) -> (
+    Vec<u8>,
+    std::sync::Arc<onetdns_core::rsa::testsign::TestRsaKey>,
+) {
+    use onetdns_core::rsa::testsign::TestRsaKey;
+    use std::sync::Arc;
+
+    /** @brief rcgen 이 인증서 서명에 쓰는 RSA 키. */
+    struct Remote(Arc<TestRsaKey>, Vec<u8>);
+    impl rcgen::RemoteKeyPair for Remote {
+        fn public_key(&self) -> &[u8] {
+            &self.1
+        }
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+            Ok(self.0.sign_pkcs1(RsaHash::Sha256, message))
+        }
+        fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+            &rcgen::PKCS_RSA_SHA256
+        }
+    }
+
+    let private = crate::trust::base64_decode(include_bytes!(
+        "../../../testdata/rsa_test_private_key_2048.pk8.b64"
+    ))
+    .unwrap();
+    let key = Arc::new(TestRsaKey::from_pkcs8(&private).unwrap());
+    let public = key.public_key_der();
+    let key_pair = rcgen::KeyPair::from_remote(Box::new(Remote(Arc::clone(&key), public))).unwrap();
+    let certificate = rcgen::CertificateParams::new(vec![name.to_string()])
+        .unwrap()
+        .self_signed(&key_pair)
+        .unwrap();
+    (certificate.der().to_vec(), key)
+}
+
+#[cfg(test)]
+/** @brief 그 RSA 키로 이 서명 방식의 서명을 만드는 서명자. */
+pub(crate) fn rsa_test_signer(
+    key: std::sync::Arc<onetdns_core::rsa::testsign::TestRsaKey>,
+    scheme: u16,
+) -> std::sync::Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> {
+    let (hash, pss) = match scheme {
+        consts::RSA_PKCS1_SHA256 => (RsaHash::Sha256, false),
+        consts::RSA_PSS_RSAE_SHA256 => (RsaHash::Sha256, true),
+        consts::RSA_PSS_RSAE_SHA384 => (RsaHash::Sha384, true),
+        consts::RSA_PSS_RSAE_SHA512 => (RsaHash::Sha512, true),
+        other => panic!("Not an RSA signature scheme: {other:#06x}"),
+    };
+    std::sync::Arc::new(move |content: &[u8]| {
+        if pss {
+            key.sign_pss(hash, content, &vec![0x5a; hash.digest_len()])
+        } else {
+            key.sign_pkcs1(hash, content)
+        }
+    })
+}
+
+#[cfg(test)]
 /** @brief 메시지 왕복, 서명 대상 배치, 그리고 방식별 검증. */
 mod tests {
     use super::*;
@@ -353,6 +476,127 @@ mod tests {
         let mut request = CertificateRequestMsg::standard().encode();
         request.push(0);
         assert!(CertificateRequestMsg::parse(&request).is_err());
+    }
+
+    #[test]
+    /**
+     * @brief 1.3 CertificateVerify 가 받는 쪽이 알린 방식만 쓰고, RSA 는 PSS 만 쓰는지.
+     * @details 서명이 맞아도 방식이 어긋나면 RFC 8446 대로 illegal_parameter 다.
+     */
+    fn tls13_certificate_verify_requires_a_requested_non_pkcs1_scheme() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        use p256::pkcs8::DecodePrivateKey;
+
+        assert!(tls13_signature_scheme_allowed(
+            consts::ED25519,
+            &REQUESTED_SIGNATURE_SCHEMES
+        ));
+        assert!(!tls13_signature_scheme_allowed(
+            consts::RSA_PKCS1_SHA256,
+            &REQUESTED_SIGNATURE_SCHEMES
+        ));
+        assert!(!tls13_signature_scheme_allowed(
+            consts::RSA_PSS_RSAE_SHA512,
+            &REQUESTED_SIGNATURE_SCHEMES
+        ));
+
+        let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
+        let peer = crate::x509::X509::parse(ck.cert.der().as_ref()).unwrap();
+        let secret = p256::SecretKey::from_pkcs8_der(&ck.key_pair.serialize_der()).unwrap();
+        let content = certificate_verify_content(&[0x5a; 32], true);
+        let signature: Signature = SigningKey::from(secret).sign(&content);
+        let cv = |algorithm| CertificateVerify {
+            algorithm,
+            signature: signature.to_der().as_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            cv(consts::ECDSA_SECP256R1_SHA256).verify_tls13(
+                &peer,
+                &[consts::ECDSA_SECP256R1_SHA256],
+                &content
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            cv(consts::ECDSA_SECP256R1_SHA256).verify_tls13(&peer, &[consts::ED25519], &content),
+            Err(TlsError::IllegalParameter),
+            "알리지 않은 방식"
+        );
+
+        let (rsa_der, rsa_key) = rsa_test_certificate("dns.test");
+        let rsa_peer = crate::x509::X509::parse(&rsa_der).unwrap();
+        let rsa_cv = |scheme| CertificateVerify {
+            algorithm: scheme,
+            signature: rsa_test_signer(rsa_key.clone(), scheme)(&content),
+        };
+        assert_eq!(
+            rsa_cv(consts::RSA_PSS_RSAE_SHA256).verify_tls13(
+                &rsa_peer,
+                &REQUESTED_SIGNATURE_SCHEMES,
+                &content
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            rsa_cv(consts::RSA_PKCS1_SHA256).verify_tls13(
+                &rsa_peer,
+                &REQUESTED_SIGNATURE_SCHEMES,
+                &content
+            ),
+            Err(TlsError::IllegalParameter),
+            "알렸어도 RSA PKCS#1 은 1.3 서명에 쓸 수 없다"
+        );
+        assert_eq!(
+            rsa_cv(consts::RSA_PSS_RSAE_SHA512).verify_tls13(
+                &rsa_peer,
+                &REQUESTED_SIGNATURE_SCHEMES,
+                &content
+            ),
+            Err(TlsError::IllegalParameter),
+            "서명이 맞아도 알리지 않은 방식"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크 중의 CertificateRequest 를 RFC 8446 대로 확인하는지.
+     * @details 문맥이 비어 있지 않으면 illegal_parameter, signature_algorithms 가 없으면
+     *          missing_extension 이다.
+     */
+    fn handshake_certificate_request_needs_empty_context_and_signature_algorithms() {
+        let standard = CertificateRequestMsg::standard();
+        assert_eq!(
+            standard.handshake_signature_algorithms(),
+            Ok(REQUESTED_SIGNATURE_SCHEMES.to_vec())
+        );
+        let with_context = CertificateRequestMsg {
+            context: vec![1],
+            ..standard
+        };
+        assert_eq!(
+            with_context.handshake_signature_algorithms(),
+            Err(TlsError::IllegalParameter)
+        );
+        let without_algorithms = CertificateRequestMsg {
+            context: Vec::new(),
+            extensions: Vec::new(),
+        };
+        assert_eq!(
+            without_algorithms.handshake_signature_algorithms(),
+            Err(TlsError::MissingExtension)
+        );
+        let malformed = CertificateRequestMsg {
+            context: Vec::new(),
+            extensions: vec![crate::msg::Extension::new(
+                consts::EXT_SIGNATURE_ALGORITHMS,
+                vec![0, 1],
+            )],
+        };
+        assert_eq!(
+            malformed.handshake_signature_algorithms(),
+            Err(TlsError::Decode)
+        );
     }
 
     #[test]

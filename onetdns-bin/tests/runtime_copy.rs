@@ -544,7 +544,7 @@ fn the_string_scanner_behaves() {
         .collect();
     assert_eq!(values, vec!["first", "raw \" quote", "last"]);
 
-    // 매크로 몸통에서 마지막 문자열과 이벤트 코드를 함께 집어낸다.
+    /* 매크로 몸통에서 마지막 문자열과 이벤트 코드를 함께 집어낸다. */
     let source = "    warn!(event = \"a.b\", client = %addr, \"무엇이 잘못됐는지\");\n";
     let calls = macro_calls("보기", source);
     assert_eq!(calls.len(), 1);
@@ -552,7 +552,7 @@ fn the_string_scanner_behaves() {
     assert_eq!(calls[0].event, "a.b");
     assert_eq!(calls[0].message, "무엇이 잘못됐는지");
 
-    // 이름 일부가 겹치는 다른 매크로는 기록으로 세지 않는다.
+    /* 이름 일부가 겹치는 다른 매크로는 기록으로 세지 않는다. */
     assert!(macro_calls("보기", "    my_error!(\"x\");\n").is_empty());
 }
 

@@ -1182,7 +1182,7 @@ mod tests {
             "질의 기록 파일이 있으면 모아야 합니다"
         );
 
-        // 빈 경로는 끈 것이다. 설정 파일에 키만 남기고 값을 지운 경우가 실제로 있다.
+        /* 빈 경로는 끈 것이다. 설정 파일에 키만 남기고 값을 지운 경우가 실제로 있다. */
         cfg.querylog_file = Some(PathBuf::new());
         assert!(
             !telemetry_consumed(&cfg),

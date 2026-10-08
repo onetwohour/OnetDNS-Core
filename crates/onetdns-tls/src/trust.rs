@@ -297,6 +297,9 @@ enum ChainUsage<'a> {
  *
  * @details 각 단계에서 서명, 유효 기간, CA 여부, 경로 길이, 용도, 이름 제약을 본다.
  * @return 검증한 인증 경로. 마지막 인증서는 저장소에 있는 루트의 사본이다.
+ * @retval TlsError::UnknownCa 체인의 어느 인증서도 발급자가 저장소에 없다.
+ * @retval TlsError::CertificateExpired 경로의 인증서가 유효 기간 밖이다.
+ * @retval TlsError::BadCert 그 밖에 경로가 어긋났다.
  * @warning 루트는 이쪽 저장소의 사본을 쓴다. 상대가 보낸 것을 쓰면 제약을 뺀 사본으로
  *          이름 제약을 벗어날 수 있다.
  */
@@ -327,21 +330,19 @@ fn verify_chain_for(
         return Err(TlsError::BadCert);
     }
     if !leaf.valid_at(now) {
-        return Err(TlsError::BadCert);
+        return Err(TlsError::CertificateExpired);
     }
 
     if store.certificate_pins.contains(&leaf.cert_sha256) {
         return Ok(vec![leaf.clone()]);
     }
 
-    let Some((anchor_depth, root)) = anchor_for(chain, store, now) else {
-        return Err(TlsError::BadCert);
-    };
+    let (anchor_depth, root) = anchor_for(chain, store, now)?;
     let chain = &chain[..=anchor_depth];
 
     for c in chain {
         if !c.valid_at(now) {
-            return Err(TlsError::BadCert);
+            return Err(TlsError::CertificateExpired);
         }
     }
 
@@ -371,12 +372,11 @@ fn verify_chain_for(
 
     let top = chain.last().ok_or(TlsError::BadCert)?;
 
-    if !root.is_ca
-        || !root.allows_cert_sign()
-        || !root.valid_at(now)
-        || !allows_chain_usage(root, usage)
-    {
+    if !root.is_ca || !root.allows_cert_sign() || !allows_chain_usage(root, usage) {
         return Err(TlsError::BadCert);
+    }
+    if !root.valid_at(now) {
+        return Err(TlsError::CertificateExpired);
     }
 
     let root_is_presented_top = root.cert_sha256 == top.cert_sha256;
@@ -442,24 +442,38 @@ fn allows_chain_usage(cert: &X509, usage: ChainUsage<'_>) -> bool {
  *          이쪽 루트인지를 본다. 끝만 보면 안 되는 이유는, 상대가 자기 루트를 이쪽이 모르는
  *          더 오래된 루트가 교차 서명한 사본으로 덧붙여 보내는 것이 흔하기 때문이다. 그
  *          사본 아래에서 이미 이쪽 루트에 닿았다면 위쪽은 경로에 들어가지 않는다.
- * @return 닿은 곳의 깊이와 저장소에 있는 루트. 어디에서도 닿지 못하면 없다.
+ * @return 닿은 곳의 깊이와 저장소에 있는 루트.
+ * @retval TlsError::UnknownCa 체인의 어느 인증서도 발급자 이름이 이쪽 루트와 맞지 않는다.
+ * @retval TlsError::BadCert 발급자 이름이 맞는 루트는 있지만 서명이 맞지 않거나 그 루트가
+ *         인증서를 서명할 수 없다. RFC 8446 은 unknown_ca 를 발급자를 찾지 못한 경우로 정하고,
+ *         서명이 맞지 않는 인증서는 bad_certificate 로 알리게 한다.
+ * @retval TlsError::CertificateExpired 발급자 이름이 맞는 루트가 유효 기간 밖이다.
  * @warning 루트는 언제나 저장소의 사본을 돌려준다. 상대가 보낸 사본을 쓰면 이름 제약을
  *          벗긴 판으로 교체할 수 있다.
  */
-fn anchor_for<'a>(chain: &'a [X509], store: &'a TrustStore, now: i64) -> Option<(usize, &'a X509)> {
+fn anchor_for<'a>(
+    chain: &'a [X509],
+    store: &'a TrustStore,
+    now: i64,
+) -> Result<(usize, &'a X509), TlsError> {
+    let mut located_failure = None;
     for (depth, cert) in chain.iter().enumerate() {
         for root in store
             .roots
             .iter()
             .filter(|r| r.subject_raw == cert.issuer_raw)
         {
-            if root.is_ca
-                && root.allows_cert_sign()
-                && root.valid_at(now)
-                && cert.verify_signed_by(root).is_ok()
+            let failure = if !root.is_ca
+                || !root.allows_cert_sign()
+                || cert.verify_signed_by(root).is_err()
             {
-                return Some((depth, root));
-            }
+                TlsError::BadCert
+            } else if !root.valid_at(now) {
+                TlsError::CertificateExpired
+            } else {
+                return Ok((depth, root));
+            };
+            located_failure.get_or_insert(failure);
         }
 
         if let Some(root) = store
@@ -467,10 +481,10 @@ fn anchor_for<'a>(chain: &'a [X509], store: &'a TrustStore, now: i64) -> Option<
             .iter()
             .find(|root| root.cert_sha256 == cert.cert_sha256)
         {
-            return Some((depth, root));
+            return Ok((depth, root));
         }
     }
-    None
+    Err(located_failure.unwrap_or(TlsError::UnknownCa))
 }
 
 /**
@@ -618,9 +632,10 @@ mod tests {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "OnetDNS Test Root");
+        ca_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("OnetDNS Test Root for {host}"),
+        );
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let leaf_key = KeyPair::generate().unwrap();
@@ -677,7 +692,10 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정이 바이트까지 정확히 맞아야 하는지. */
+    /**
+     * @brief 고정이 바이트까지 정확히 맞아야 하는지.
+     * @details 고정과 다른 인증서는 발급자를 찾을 CA 도 없으므로 unknown_ca 로 거부한다.
+     */
     fn certificate_pin_requires_exact_der_fingerprint() {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
         let pinned_der = ck.cert.der().to_vec();
@@ -689,7 +707,49 @@ mod tests {
         let different = X509::parse(&different_der).unwrap();
         assert_eq!(
             verify_chain(&[different], &store, "dns.test", now()).map(drop),
-            Err(TlsError::BadCert)
+            Err(TlsError::UnknownCa)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 발급자를 찾은 뒤의 실패를 unknown_ca 로 알리지 않는지.
+     * @details 발급자 이름이 맞는 루트가 있는데 서명이 맞지 않으면 bad_certificate, 그 루트가
+     *          만료됐으면 certificate_expired 다. unknown_ca 는 이름이 맞는 루트가 없을 때만 쓴다.
+     */
+    fn located_issuer_failures_keep_their_own_alerts() {
+        let (trusted, _) = root_ca_with(|_| {});
+        let (impostor, impostor_key) = root_ca_with(|_| {});
+        let leaf_der = leaf_signed_by("host.example", &impostor, &impostor_key, |_| {});
+        let store = TrustStore::from_ders([trusted.der().as_ref()]);
+        assert_eq!(
+            verify_chain(
+                &[X509::parse(&leaf_der).unwrap()],
+                &store,
+                "host.example",
+                now()
+            )
+            .map(drop),
+            Err(TlsError::BadCert),
+            "이름만 같고 키가 다른 루트"
+        );
+
+        let (expired, expired_key) = root_ca_with(|params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let leaf_der = leaf_signed_by("host.example", &expired, &expired_key, |_| {});
+        let store = TrustStore::from_ders([expired.der().as_ref()]);
+        assert_eq!(
+            verify_chain(
+                &[X509::parse(&leaf_der).unwrap()],
+                &store,
+                "host.example",
+                now()
+            )
+            .map(drop),
+            Err(TlsError::CertificateExpired),
+            "만료된 루트"
         );
     }
 
@@ -819,20 +879,23 @@ mod tests {
         ];
         assert_eq!(
             verify_chain(&chain, &store, "host.example", now()).map(drop),
-            Err(TlsError::BadCert)
+            Err(TlsError::UnknownCa)
         );
     }
 
     #[test]
-    /** @brief 모르는 루트를 거부하는지. */
+    /** @brief 모르는 루트를 unknown_ca 로 거부하는지. */
     fn untrusted_root_rejected() {
         let (_ca_der, leaf_der) = ca_and_leaf("host.example");
         let (other_ca_der, _) = ca_and_leaf("other.example");
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::from_ders([other_ca_der.as_slice()]);
+        let rejected = verify_chain(&[leaf], &store, "host.example", now()).map(drop);
+        assert_eq!(rejected, Err(TlsError::UnknownCa));
         assert_eq!(
-            verify_chain(&[leaf], &store, "host.example", now()).map(drop),
-            Err(TlsError::BadCert)
+            rejected.unwrap_err().alert(),
+            Some(48),
+            "루트를 찾지 못한 거부는 unknown_ca 로 알려야 합니다"
         );
     }
 
@@ -844,21 +907,24 @@ mod tests {
         let store = TrustStore::empty();
         assert_eq!(
             verify_chain(&[leaf], &store, "host.example", now()).map(drop),
-            Err(TlsError::BadCert)
+            Err(TlsError::UnknownCa)
         );
     }
 
     #[test]
-    /** @brief 유효 기간 밖이면 거부하는지. */
+    /** @brief 유효 기간 밖이면 certificate_expired 로 거부하는지. */
     fn outside_validity_rejected() {
         let (ca_der, leaf_der) = ca_and_leaf("host.example");
         let leaf = X509::parse(&leaf_der).unwrap();
         let store = TrustStore::from_ders([ca_der.as_slice()]);
 
         let long_ago = now() - 100 * 365 * 86400;
+        let rejected = verify_chain(&[leaf], &store, "host.example", long_ago).map(drop);
+        assert_eq!(rejected, Err(TlsError::CertificateExpired));
         assert_eq!(
-            verify_chain(&[leaf], &store, "host.example", long_ago).map(drop),
-            Err(TlsError::BadCert)
+            rejected.unwrap_err().alert(),
+            Some(45),
+            "유효 기간 밖의 인증서는 certificate_expired 로 알려야 합니다"
         );
     }
 

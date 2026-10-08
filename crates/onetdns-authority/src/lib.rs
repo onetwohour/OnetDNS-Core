@@ -809,8 +809,10 @@ impl Zone {
         full_records.sort_unstable_by(|left, right| {
             dnssec_name_cmp(&left.name, &right.name).then_with(|| left.rtype.0.cmp(&right.rtype.0))
         });
-        // TTL 을 먼저 맞춰야 한다. RFC 2181로 같은 RRset 의 TTL 이 같아진 뒤라야
-        // 나머지가 모두 같은 레코드가 정말 같은 레코드다.
+        /*
+         * TTL 을 먼저 맞춰야 한다. RFC 2181로 같은 RRset 의 TTL 이 같아진 뒤라야
+         * 나머지가 모두 같은 레코드가 정말 같은 레코드다.
+         */
         normalize_owner_group_ttls(&mut full_records);
         let duplicates = drop_duplicate_records(&mut full_records);
         if duplicates > 0 {
@@ -1931,9 +1933,11 @@ impl ZoneStore {
         let flags = 0x8000 | 0x0400 | (request.request_flags & 0x0190);
         Self::write_question_prologue(out, request, flags, answer_count, 0);
 
-        // 같은 RRset의 답변은 전부 길이가 같고 소유자·타입·클래스·rdlength까지 같다.
-        // 공간을 한 번 확보해 두고 고정 크기로 직접 써서, 레코드마다 생기던 작은 memcpy
-        // 호출을 없앤다. qtype으로 루프를 구분해야 쓰는 길이가 컴파일 시점에 정해진다.
+        /*
+         * 같은 RRset의 답변은 전부 길이가 같고 소유자·타입·클래스·rdlength까지 같다.
+         * 공간을 한 번 확보해 두고 고정 크기로 직접 써서, 레코드마다 생기던 작은 memcpy
+         * 호출을 없앤다. qtype으로 루프를 구분해야 쓰는 길이가 컴파일 시점에 정해진다.
+         */
         let written = match qtype {
             RecordType::A => Self::fill_address_block::<{ 12 + 4 }>(
                 out,
@@ -3329,8 +3333,10 @@ old      IN DNAME target.example.net.
         ));
         assert!(writer.buf.is_empty());
 
-        // 큰 RRset이 상한을 넘으면 반쯤 쓴 응답을 남기지 않고 전부 되돌려야 한다.
-        // 답변 블록은 공간을 한 번에 확보하므로 이 판정이 첫 레코드를 쓰기 전에 난다.
+        /*
+         * 큰 RRset이 상한을 넘으면 반쯤 쓴 응답을 남기지 않고 전부 되돌려야 한다.
+         * 답변 블록은 공간을 한 번에 확보하므로 이 판정이 첫 레코드를 쓰기 전에 난다.
+         */
         let mut wide = ZoneStore::new();
         let mut wide_text =
             String::from("$ORIGIN wide.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n");

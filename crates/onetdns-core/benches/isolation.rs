@@ -79,14 +79,18 @@ fn main() {
     let mut isolated_samples = Vec::with_capacity(round_count);
     let mut expected = None;
 
-    // 첫 회차는 버린다. 두 구성 다 콜드 상태로 실행되는 라운드가 표본에 섞이면 그 회차 하나가
-    // 산포를 지배한다.
+    /*
+     * 첫 회차는 버린다. 두 구성 다 콜드 상태로 실행되는 라운드가 표본에 섞이면 그 회차 하나가
+     * 산포를 지배한다.
+     */
     black_box(plain(count));
     black_box(isolated(count));
 
     for round in 0..round_count {
-        // 뒤집는 것은 실행 순서뿐이다. 묶는 곳은 라운드와 무관하게 고정이어야
-        // 표본이 섞이지 않는다. else 가지의 튜플 순서를 "고치면" 두 표본이 뒤바뀐다.
+        /*
+         * 뒤집는 것은 실행 순서뿐이다. 묶는 곳은 라운드와 무관하게 고정이어야
+         * 표본이 섞이지 않는다. else 가지의 튜플 순서를 "고치면" 두 표본이 뒤바뀐다.
+         */
         let (plain_run, isolated_run) = if round % 2 == 0 {
             let plain_run = plain(count);
             (plain_run, isolated(count))
@@ -106,7 +110,7 @@ fn main() {
     let (plain_ns, plain_drift) = median_and_drift(&mut plain_samples);
     let (isolated_ns, isolated_drift) = median_and_drift(&mut isolated_samples);
     let overhead = isolated_ns - plain_ns;
-    // 다른 하네스와 같은 5% 게이트다. 넘으면 이 구간에서 나온 값은 인용하지 않는다.
+    /* 다른 하네스와 같은 5% 게이트다. 넘으면 이 구간에서 나온 값은 인용하지 않는다. */
     let verdict = if plain_drift.max(isolated_drift) > 5.0 {
         "  ← 5% 게이트 초과: 이 구간의 값은 인용 금지"
     } else {

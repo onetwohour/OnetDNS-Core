@@ -221,9 +221,11 @@ impl HotApplyDeps {
         let _runtime_update_guard = runtime_config_update_lock().lock_recover();
         let previous_cfg = self.runtime_cfg.load();
 
-        // 시작할 때 채워 넣은 기본값은 파일에 적히지 않는다. 파일만 다시 읽으면
-        // 그 항목이 사라진 것으로 보여, 손대지도 않은 관리 주소를 지운 것으로
-        // 처리하고 웹 화면을 닫아 버린다.
+        /*
+         * 시작할 때 채워 넣은 기본값은 파일에 적히지 않는다. 파일만 다시 읽으면
+         * 그 항목이 사라진 것으로 보여, 손대지도 않은 관리 주소를 지운 것으로
+         * 처리하고 웹 화면을 닫아 버린다.
+         */
         let next = &normalize_config_for_comparison(&previous_cfg, next);
 
         let changed = config_changed_keys(&previous_cfg, next);
@@ -242,8 +244,10 @@ impl HotApplyDeps {
         self.commit(next, &groups, &changed, *prepared, effects);
         // hot-apply:end
 
-        // 관리 주소나 저장 파일이 이 경로로 생기고 사라진다. 세대를 다시 만들지
-        // 않으므로 여기서 다시 정하지 않으면 시작할 때의 판정이 그대로 남는다.
+        /*
+         * 관리 주소나 저장 파일이 이 경로로 생기고 사라진다. 세대를 다시 만들지
+         * 않으므로 여기서 다시 정하지 않으면 시작할 때의 판정이 그대로 남는다.
+         */
         self.recorder.set_collecting(telemetry_consumed(next));
         onetdns_core::info!(
             event = "config.runtime_hot_applied",
@@ -298,7 +302,7 @@ impl HotApplyDeps {
         if native_state.is_none() && needs_native_state(groups) {
             return Ok(None);
         }
-        // 교체할 작업이 아직 서지 않았으면 재시작하는 쪽이 안전하다.
+        /* 교체할 작업이 아직 서지 않았으면 재시작하는 쪽이 안전하다. */
         let listeners = if groups.contains(&ApplyGroup::Listeners) {
             let Some(sync) = listener_sync.lock_recover().clone() else {
                 return Ok(None);
@@ -344,8 +348,10 @@ impl HotApplyDeps {
             None
         };
 
-        // 슬롯이 아직 없으면 이 인증서를 쓰는 수신 주소도 없다. 나중에 주소를 열 때 그때
-        // 설정으로 만들어지므로 지금 할 일이 없다.
+        /*
+         * 슬롯이 아직 없으면 이 인증서를 쓰는 수신 주소도 없다. 나중에 주소를 열 때 그때
+         * 설정으로 만들어지므로 지금 할 일이 없다.
+         */
         let slots = tls_slots.lock_recover().clone();
         let tls = match slots {
             Some(slots) if groups.contains(&ApplyGroup::Tls) => {
@@ -412,8 +418,10 @@ impl HotApplyDeps {
                 &next.notify,
                 &settings.tsig_keys,
             )?);
-            // 만들 때 본 저장소를 기억해 둔다. 반영할 때 저장소가 그새 바뀌었으면 동적 갱신이
-            // 들어온 것이므로 다시 만든다. 그대로 넣으면 그 갱신이 사라진다.
+            /*
+             * 만들 때 본 저장소를 기억해 둔다. 반영할 때 저장소가 그새 바뀌었으면 동적 갱신이
+             * 들어온 것이므로 다시 만든다. 그대로 넣으면 그 갱신이 사라진다.
+             */
             let (seen, store) = {
                 let _journals = zone_journal.lock_recover();
                 (
@@ -500,7 +508,7 @@ impl HotApplyDeps {
                 "Restarted DHCP services without stopping DNS"
             );
         }
-        // 체인은 DHCP 임대 풀을 읽으므로 DHCP 서비스를 맞춘 뒤에 만든다.
+        /* 체인은 DHCP 임대 풀을 읽으므로 DHCP 서비스를 맞춘 뒤에 만든다. */
         let chain = match &prepared.chain {
             Some(chain) => {
                 Some(undo.check(chain.chain.prepare(&resolver_chain::ChainPlan::new(next)))?)
@@ -557,8 +565,10 @@ impl HotApplyDeps {
         else {
             return Ok(Effects { chain });
         };
-        // 접근 설정과 영역을 한 잠금 아래에서 바꾼다. 영역이 먼저 바뀌면 그 사이에 이전 저장
-        // 경로로 동적 갱신이 들어가 엉뚱한 파일을 덮는다.
+        /*
+         * 접근 설정과 영역을 한 잠금 아래에서 바꾼다. 영역이 먼저 바뀌면 그 사이에 이전 저장
+         * 경로로 동적 갱신이 들어가 엉뚱한 파일을 덮는다.
+         */
         let native = native_hot_state.lock_recover().clone();
         {
             let mut journals = zone_journal.lock_recover();
@@ -717,7 +727,7 @@ impl HotApplyDeps {
             *preset_urls.lock_recover() = preset_list_urls(next);
             *rpz_url_state.lock_recover() = next.rpz_urls.clone();
             list_refresh_secs.store(next.list_refresh_secs, Ordering::Release);
-            // 세대를 올리면 갱신 스레드가 주기를 기다리지 않고 다음 틱에 받아 온다.
+            /* 세대를 올리면 갱신 스레드가 주기를 기다리지 않고 다음 틱에 받아 온다. */
             list_generation.fetch_add(1, Ordering::AcqRel);
             onetdns_core::info!(
                 event = "filter.subscriptions_reloaded",

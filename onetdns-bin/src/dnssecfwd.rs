@@ -430,11 +430,13 @@ impl ForwardValidateLayer {
     fn verdict_for(&self, response: &Message, now: u32, budget: &mut u32) -> Option<bool> {
         let question = response.questions.first()?;
         if response.answers.is_empty() {
-            // 답이 없는 응답이다. 증명은 권한 구간에 있고 이 계층은 부재 증명까지 확인하지
-            // 않으므로 AD를 설정하지 않고 그대로 낸다. 답 구간에 서명이 없다는 것만으로
-            // 떼어 낸 것으로 보면, 서명된 영역의 NODATA가 전부 SERVFAIL이 된다.
-            // 다만 서명된 영역인데 권한 구간에도 서명이 하나도 없으면 누가 걷어 낸
-            // 것이므로 막는다. 그러지 않으면 답을 지워 부정 응답으로 바꾸는 강등이 통한다.
+            /*
+             * 답이 없는 응답이다. 증명은 권한 구간에 있고 이 계층은 부재 증명까지 확인하지
+             * 않으므로 AD를 설정하지 않고 그대로 낸다. 답 구간에 서명이 없다는 것만으로
+             * 떼어 낸 것으로 보면, 서명된 영역의 NODATA가 전부 SERVFAIL이 된다.
+             * 다만 서명된 영역인데 권한 구간에도 서명이 하나도 없으면 누가 걷어 낸
+             * 것이므로 막는다. 그러지 않으면 답을 지워 부정 응답으로 바꾸는 강등이 통한다.
+             */
             let stripped = matches!(
                 self.chain_to(&question.name, now, budget),
                 Some(ChainVerdict::Secure { .. })
@@ -455,8 +457,10 @@ impl ForwardValidateLayer {
         let signer = match answer_signer(response) {
             Some(signer) => signer,
             None => {
-                // 서명이 하나도 없다. 서명돼야 할 곳인지 체인으로 확인한다. 서명되지 않은
-                // 영역이면 그대로 두고, 서명된 영역인데 서명이 없으면 떼어 낸 것이다.
+                /*
+                 * 서명이 하나도 없다. 서명돼야 할 곳인지 체인으로 확인한다. 서명되지 않은
+                 * 영역이면 그대로 두고, 서명된 영역인데 서명이 없으면 떼어 낸 것이다.
+                 */
                 return match self.chain_to(&question.name, now, budget) {
                     Some(ChainVerdict::Insecure) => Some(false),
                     Some(ChainVerdict::Secure { .. }) => None,
@@ -479,8 +483,10 @@ impl ForwardValidateLayer {
         };
         let rrset = section_records(&response.answers, &question.name, question.qtype);
         if rrset.is_empty() {
-            // 답이 없는 응답이다. 부정 응답의 증명까지 여기서 세우지는 않으므로 서명을
-            // 확인했다고 말하지 않는다. 틀린 AD를 설정하는 것보다 설정하지 않는 편이 낫다.
+            /*
+             * 답이 없는 응답이다. 부정 응답의 증명까지 여기서 세우지는 않으므로 서명을
+             * 확인했다고 말하지 않는다. 틀린 AD를 설정하는 것보다 설정하지 않는 편이 낫다.
+             */
             return Some(false);
         }
         let rrsigs = covering_rrsigs(&response.answers, &question.name, question.qtype);
@@ -934,7 +940,7 @@ mod tests {
         };
         let request = Message::query(9, Name::from_str("nodata.test").unwrap(), RecordType::A);
 
-        // 루트 신뢰 기준이 없으면 체인이 Secure가 아니므로 부정 응답은 그대로 나간다.
+        /* 루트 신뢰 기준이 없으면 체인이 Secure가 아니므로 부정 응답은 그대로 나간다. */
         let layer = layer_without_anchors(build(true));
         let outcome = layer.resolve_outcome(&request);
         let ResolveOutcome::Response(response) = outcome else {
@@ -950,7 +956,7 @@ mod tests {
             "부재 증명을 확인하지 않았으므로 AD를 설정하면 안 됩니다"
         );
 
-        // 권한 구간에 서명이 없어도, 체인이 Secure가 아니면 막을 근거가 없다.
+        /* 권한 구간에 서명이 없어도, 체인이 Secure가 아니면 막을 근거가 없다. */
         let layer = layer_without_anchors(build(false));
         assert!(
             matches!(layer.resolve_outcome(&request), ResolveOutcome::Response(_)),

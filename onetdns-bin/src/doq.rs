@@ -12,12 +12,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use onetdns_proto::Message;
-use onetdns_quic::{Connection, QuicError};
+use onetdns_quic::{doq, Connection, QuicError};
 use onetdns_runtime::Transport as RtTransport;
 use onetdns_tls::ServerConfig;
 
 use crate::native::NativeServer;
-use crate::quic_listener::{self, Intake, QuicListener, QuicService};
+use crate::quic_listener::{self, Abandon, Intake, QuicListener, QuicService};
 use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
@@ -37,9 +37,10 @@ pub fn serve_doq(
  * @brief 이 질의가 DoQ에서 연결을 끊어야 하는 프로토콜 오류인지.
  *
  * @details RFC 9250은 QUIC 위의 DNS Message ID를 0으로 규정한다. 질의와 응답은
- *          스트림으로 짝지어지므로 ID 필드가 필요 없기 때문이다. 4.3.3은 0이 아닌 ID와
+ *          스트림으로 짝지어지므로 ID 필드가 필요 없기 때문이다. 같은 RFC가 0이 아닌 ID와
  *          edns-tcp-keepalive 옵션을 각각 치명적 오류로 열거한다. 후자는 TCP 전용이라
- *          QUIC 연결 관리와 뜻이 겹치고 어긋난다.
+ *          QUIC 연결 관리와 뜻이 겹치고 어긋난다. 치명적 오류는 DOQ_PROTOCOL_ERROR 를 담은
+ *          CONNECTION_CLOSE 로 알린다.
  * @return 끊어야 하면 그 까닭, 정상이면 None.
  */
 fn doq_protocol_error(req: &Message) -> Option<&'static str> {
@@ -56,13 +57,6 @@ fn doq_protocol_error(req: &Message) -> Option<&'static str> {
     None
 }
 
-/**
- * @brief RFC 9250 의 DoQ 오류 코드 중 규격 위반에 쓰는 값.
- * @details 4.3.3 은 이런 오류를 치명적으로 보고 CONNECTION_CLOSE 로 알리게 한다.
- *          알리지 않으면 상대는 자기 유휴 데드라인까지 기다린다.
- */
-const DOQ_PROTOCOL_ERROR: u64 = 0x2;
-
 /** @brief DoQ 의 질의 검사와 응답. */
 pub(crate) struct Doq;
 
@@ -70,7 +64,7 @@ impl QuicService for Doq {
     type Conn = Connection;
     const NAME: &'static str = "doq";
 
-    fn dispatch(&self, conn: &mut Connection, intake: &mut Intake<'_>) -> bool {
+    fn dispatch(&self, conn: &mut Connection, intake: &mut Intake<'_>) {
         let _ = conn.take_resets();
         for (stream_id, query) in conn.take_stream_requests() {
             let req = match Message::parse(&query) {
@@ -82,8 +76,8 @@ impl QuicService for Doq {
                         Some(intake.peer()),
                         "unsolicited DNS response",
                     );
-                    conn.close(DOQ_PROTOCOL_ERROR, "unsolicited DNS response");
-                    return false;
+                    conn.close(doq::PROTOCOL_ERROR, "unsolicited DNS response");
+                    return;
                 }
                 Err(error) => {
                     transport_observe::record_error(
@@ -92,8 +86,8 @@ impl QuicService for Doq {
                         Some(intake.peer()),
                         error,
                     );
-                    conn.close(DOQ_PROTOCOL_ERROR, "malformed DNS message");
-                    return false;
+                    conn.close(doq::PROTOCOL_ERROR, "malformed DNS message");
+                    return;
                 }
             };
             if let Some(reason) = doq_protocol_error(&req) {
@@ -103,8 +97,8 @@ impl QuicService for Doq {
                     Some(intake.peer()),
                     reason,
                 );
-                conn.close(DOQ_PROTOCOL_ERROR, reason);
-                return false;
+                conn.close(doq::PROTOCOL_ERROR, reason);
+                return;
             }
             let auth_identity = conn.client_auth_identity().map(str::to_string);
             let job = QueryJob {
@@ -119,10 +113,9 @@ impl QuicService for Doq {
                 auth_identity,
             };
             if !intake.submit::<Self>(conn, &req, job) {
-                return false;
+                return;
             }
         }
-        true
     }
 
     fn send_answer(
@@ -139,6 +132,15 @@ impl QuicService for Doq {
             id.fill(0);
         }
         conn.send_dns_message_owned(stream_id, wire)
+    }
+
+    fn abandon(conn: &mut Connection, why: Abandon) {
+        let (code, reason) = match why {
+            Abandon::Shutdown => (doq::NO_ERROR, ""),
+            Abandon::Internal => (doq::INTERNAL_ERROR, "Could not send a DNS response"),
+            Abandon::ExcessiveLoad => (doq::EXCESSIVE_LOAD, "Server resource limit exceeded"),
+        };
+        conn.close(code, reason);
     }
 }
 
@@ -346,7 +348,7 @@ mod tests {
         )
         .unwrap();
         let resp = doq_query(l.addr(), "allowed.test", RecordType::A);
-        assert_eq!(resp.header.id, 0, "RFC 9250 4.2.1: QUIC 위 메시지 ID는 0");
+        assert_eq!(resp.header.id, 0, "RFC 9250: QUIC 위 메시지 ID는 0");
         assert_eq!(resp.answers.len(), 1, "A 레코드 1개");
         match &resp.answers[0].rdata {
             ApRData::A(ip) => assert_eq!(*ip, std::net::Ipv4Addr::new(9, 9, 9, 9)),
@@ -357,8 +359,8 @@ mod tests {
     #[test]
     /**
      * @brief 리스너가 핸드셰이크를 거부하면 그 까닭이 클라이언트에 닿는지.
-     * @details 리스너는 오류를 낸 연결을 그 자리에서 표에서 지운다. 쌓인 종료 프레임을 먼저
-     *          보내지 않으면 클라이언트는 자기 유휴 데드라인까지 기다린다.
+     * @details 연결이 쌓아 둔 종료 프레임을 리스너가 보내지 않으면 클라이언트는 자기 유휴
+     *          데드라인까지 기다린다.
      */
     fn rejected_handshake_reaches_the_client() {
         let mut tls = (*self_signed_doq()).clone();
@@ -422,6 +424,78 @@ mod tests {
 
     #[test]
     /**
+     * @brief 리스너를 멈추면 열린 연결의 클라이언트가 종료를 통보받는지.
+     * @details 알리지 않으면 클라이언트는 자기 유휴 데드라인까지 끊긴 연결을 붙들고 있다.
+     *          서버가 핸드셰이크를 마친 것을 질의 하나로 확인한 뒤 멈춰야 종료가 응용 계층
+     *          종료로 나간다.
+     */
+    fn stopping_the_listener_notifies_open_connections() {
+        let listener = serve_doq(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
+            native_handler(),
+            Arc::new(AtomicBool::new(false)),
+            memory_budget(),
+        )
+        .unwrap();
+        let server = listener.addr();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let wait = RecvWait::new(Duration::from_millis(50));
+        wait.install(&sock).unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: false,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![b"doq".to_vec()],
+            ..Default::default()
+        };
+        let mut client = Connection::new_client(
+            cfg,
+            random_cid(),
+            random_cid(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let query = Message::query(0, ApName::from_str("allowed.test").unwrap(), RecordType::A)
+            .try_encode()
+            .unwrap();
+
+        let mut listener = Some(listener);
+        let mut asked = false;
+        let mut b = [0u8; 2048];
+        let clock = Instant::now();
+        let deadline = clock + Duration::from_secs(15);
+        while !client.is_closed() && Instant::now() < deadline {
+            let now_ms = clock.elapsed().as_millis() as u64;
+            client.set_now(now_ms);
+            client.on_timeout(now_ms);
+            if client.is_handshake_complete() && !asked {
+                client.send_dns_message(0, &query).unwrap();
+                asked = true;
+            }
+            while let Some(dg) = client.next_datagram() {
+                let _ = sock.send_to(&dg, server);
+            }
+            if asked && listener.is_some() && !client.take_stream_requests().is_empty() {
+                drop(listener.take());
+            }
+            if let Ok((n, _)) = wait.recv_from(&sock, &mut b) {
+                let _ = client.recv_datagram(&b[..n]);
+            }
+        }
+        assert!(listener.is_none(), "질의에 대한 답을 받지 못했습니다");
+        let close = client
+            .peer_close()
+            .cloned()
+            .expect("리스너가 멈추며 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x0, None));
+    }
+
+    #[test]
+    /**
      * @brief RFC 9250이 열거한 두 프로토콜 오류를 가려내는지.
      * @details 0이 아닌 ID와 edns-tcp-keepalive다. 둘 다 연결을 끊어야 하므로 답이 없다.
      */
@@ -481,7 +555,7 @@ mod tests {
             Duration::from_millis(400),
             random_cid(),
         );
-        assert_eq!(resp.header.id, 0, "RFC 9250 4.2.1: QUIC 위 메시지 ID는 0");
+        assert_eq!(resp.header.id, 0, "RFC 9250: QUIC 위 메시지 ID는 0");
         assert_eq!(resp.answers.len(), 1);
     }
 

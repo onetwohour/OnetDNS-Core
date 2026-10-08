@@ -110,7 +110,7 @@ fn string_at(source: &str, open: usize) -> (String, usize) {
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => {
-                // 이 소스에서 쓰이는 이스케이프는 내용 비교에 영향이 없으므로 그대로 담는다.
+                /* 이 소스에서 쓰이는 이스케이프는 내용 비교에 영향이 없으므로 그대로 담는다. */
                 out.push('\\');
                 if index + 1 < bytes.len() {
                     out.push(bytes[index + 1] as char);
@@ -364,7 +364,7 @@ fn every_enum_value_has_a_label() {
         let call = from + at + 2;
         let mut cursor = call;
         let mut values = Vec::new();
-        // 한 호출 안의 문자열 인자들을 순서대로 읽는다.
+        /* 한 호출 안의 문자열 인자들을 순서대로 읽는다. */
         let end = head[call..]
             .find("\n    f(")
             .map_or(head.len(), |offset| call + offset);

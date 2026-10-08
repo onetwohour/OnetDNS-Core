@@ -39,7 +39,11 @@ pub struct DotListener {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/** @brief 연결 하나의 입출력 데드라인. */
+/**
+ * @brief 핸드셰이크 하나, 또는 질의 하나를 받아 답하는 데 쓸 수 있는 시간.
+ * @details 다음 질의를 기다리는 유휴 한도이기도 하다. 이 시간 동안 아무것도 보내지 않은 연결은
+ *          쉬던 연결로 보고 닫는다.
+ */
 const DOT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DotListener {
@@ -196,6 +200,7 @@ pub fn serve_dot(
                                     &handler,
                                     connection_shutdown.clone(),
                                     connection_stop.clone(),
+                                    DOT_IO_TIMEOUT,
                                 )
                             });
                             if let Ok(Err(error)) = result {
@@ -254,9 +259,9 @@ pub fn serve_dot(
 }
 
 /**
- * @brief DoT 연결을 끝낸 사유.
+ * @brief DoT 연결을 오류로 끝낸 사유.
  * @details TLS 계층이 실패했으면 보낼 경고는 그 계층이 이미 보냈다. DNS 교환이 어긋난 경우는
- *          TLS 로서는 정상이므로 close_notify 를 보내고 닫는다.
+ *          TLS 로서는 정상이므로 정상 종료처럼 close_notify 를 보내고 닫는다.
  */
 enum ConnError {
     /** @brief TLS 계층의 실패. */
@@ -271,40 +276,55 @@ impl From<TlsError> for ConnError {
     }
 }
 
-/** @brief 연결 하나에서 질의를 받아 처리한다. */
+/**
+ * @brief 연결 하나에서 질의를 받아 처리한다.
+ * @param io_timeout 핸드셰이크와 질의 하나에 쓸 수 있는 시간이자 질의 사이의 유휴 한도.
+ */
 fn serve_conn(
     stream: PrefixedTcp,
     tls: &ServerConfig,
     handler: &NativeServer,
     shutdown: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    io_timeout: Duration,
 ) -> Result<(), ConnError> {
     let src = stream.peer_addr().map_err(|_| TlsError::Io)?;
 
-    let mut stream = DeadlineTcp::new(stream, Instant::now() + DOT_IO_TIMEOUT)
+    let mut stream = DeadlineTcp::new(stream, Instant::now() + io_timeout)
         .stop_on(shutdown)
         .stop_on(stop);
     let mut conn = server_handshake(&mut stream, tls)?;
-    let served = serve_queries(&mut conn, &mut stream, handler, src);
-    if let Err(ConnError::Dns(..)) = served {
-        /*
-         * TLS 로서는 정상인 연결을 이쪽에서 닫는다. RFC 8446 은 오류 경고 없이 쓰기를 닫는 쪽에
-         * close_notify 를 요구한다. 없으면 클라이언트는 응답이 중간에 잘린 것과 구분하지 못한다.
-         */
-        let _ = conn.send_close_notify(&mut stream);
-    }
+    let served = serve_queries(&mut conn, &mut stream, handler, src, io_timeout);
+    send_close_notify_without_waiting(&mut conn, &mut stream.into_inner());
     served
 }
 
 /**
+ * @brief 연결을 닫기 전에 close_notify 를 기다리지 않고 한 번만 써 본다.
+ * @details RFC 8446 은 오류 경고 없이 쓰기를 닫는 쪽에 close_notify 를 요구한다. 없으면
+ *          클라이언트는 응답이 중간에 잘린 것과 구분하지 못한다. 경고를 주고받았거나 레코드를 다
+ *          보내지 못한 연결이면 TLS 계층이 보내지 않는다. 쉬던 연결의 데드라인이 지났을 때와
+ *          리스너가 멈출 때도 보내야 하므로 데드라인과 종료 신호가 없는 소켓에 쓰고, 종료가
+ *          늦어지지 않게 기다리지 않는다. 송신 버퍼가 차 있으면 보내지 못한 채 닫힌다.
+ */
+fn send_close_notify_without_waiting(conn: &mut TlsConnection, socket: &mut PrefixedTcp) {
+    if socket.set_nonblocking(true).is_ok() {
+        let _ = conn.send_close_notify(socket);
+    }
+}
+
+/**
  * @brief 핸드셰이크를 마친 연결에서 질의를 받아 답한다.
- * @return 상대가 연결을 닫았으면 Ok. ConnError::Dns 를 돌려줄 때 TLS 연결은 아직 정상이다.
+ * @return 잃은 질의 없이 끝났으면 Ok. 상대가 메시지 사이에서 닫았거나, 다음 질의 없이
+ *         데드라인이 지났거나, 처리기가 질의에 답하지 않기로 한 경우다. ConnError::Dns 를
+ *         돌려줄 때 TLS 연결은 아직 정상이다.
  */
 fn serve_queries(
     conn: &mut TlsConnection,
     stream: &mut DeadlineTcp<PrefixedTcp>,
     handler: &NativeServer,
     src: SocketAddr,
+    io_timeout: Duration,
 ) -> Result<(), ConnError> {
     let tls_authenticated = conn.client_authenticated();
     let tls_auth_identity = conn.client_auth_identity().map(|s| s.to_string());
@@ -313,18 +333,19 @@ fn serve_queries(
     let mut writer = Writer::new();
     let mut framed = Vec::with_capacity(2050);
     loop {
-        stream.set_deadline(Instant::now() + DOT_IO_TIMEOUT);
+        stream.set_deadline(Instant::now() + io_timeout);
         let len_bytes = match read_n(conn, stream, &mut buf, 2) {
             Ok(bytes) => bytes,
-            Err(TlsError::CloseNotify) if buf.is_empty() => {
-                let _ = conn.send_close_notify(stream);
-                return Ok(());
-            }
             /*
              * 길이 프리픽스로 경계가 정해진 DNS 메시지 사이에서 닫혔으면 잃은 질의가 없다.
              * 답을 받고 종료 알림 없이 소켓을 닫는 클라이언트가 흔해서 오류로 세지 않는다.
              */
-            Err(TlsError::Eof) if buf.is_empty() => return Ok(()),
+            Err(TlsError::CloseNotify | TlsError::Eof) if buf.is_empty() => return Ok(()),
+            /*
+             * 다음 질의의 첫 바이트도 오지 않은 채 데드라인이 지났으면 쉬던 연결이다. 질의를
+             * 보내다 멈춘 연결과 달리 잃은 질의가 없다.
+             */
+            Err(TlsError::Io) if buf.is_empty() && stream.idle_expired() => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
@@ -408,10 +429,11 @@ fn serve_queries(
             return Err(error);
         }
         if !completed {
-            return Err(ConnError::Dns(
-                "dns_unanswered",
-                "query dropped without a response",
-            ));
+            /*
+             * 처리기가 답하지 않기로 한 질의다. 정책이 정한 결과이므로 전송 오류로 세지 않는다.
+             * 답이 오지 않을 질의를 클라이언트가 데드라인까지 기다리지 않도록 연결은 닫는다.
+             */
+            return Ok(());
         }
     }
 }
@@ -719,6 +741,232 @@ mod tests {
         assert!(
             transport_observe::count("dot", "dns_short_message") > before,
             "헤더보다 짧은 메시지를 DNS 단계 오류로 세지 않았습니다"
+        );
+    }
+
+    /** @brief 인증서를 검증하지 않는 시험용 클라이언트 설정. */
+    fn client_config() -> ClientConfig {
+        ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: false,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![],
+            ..Default::default()
+        }
+    }
+
+    /** @brief 길이 프리픽스를 붙인 질의. */
+    fn framed_query(name: &str, qtype: RecordType) -> Vec<u8> {
+        let body = Message::query(0x4545, ApName::from_str(name).unwrap(), qtype)
+            .try_encode()
+            .unwrap();
+        let mut framed = (body.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&body);
+        framed
+    }
+
+    /** @brief 질의 하나를 보내고 답을 끝까지 읽는다. */
+    fn exchange(conn: &mut TlsConnection, client: &mut TcpStream) {
+        conn.write_app(client, &framed_query("allowed.test", RecordType::A))
+            .unwrap();
+        let mut buf = Vec::new();
+        let len_bytes = read_n(conn, client, &mut buf, 2).unwrap();
+        let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        read_n(conn, client, &mut buf, len).unwrap();
+    }
+
+    /**
+     * @brief serve_conn 이 처리하는 연결 하나를 연다.
+     * @return 클라이언트 쪽 소켓과, serve_conn 의 결과를 돌려줄 스레드.
+     */
+    fn served_connection(
+        io_timeout: Duration,
+        shutdown: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    ) -> (TcpStream, thread::JoinHandle<Result<(), ConnError>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let tls = self_signed_tls();
+        let handler = native_handler();
+        let serving = thread::spawn(move || {
+            serve_conn(
+                PrefixedTcp::new(server, Vec::new()),
+                &tls,
+                &handler,
+                shutdown,
+                stop,
+                io_timeout,
+            )
+        });
+        (client, serving)
+    }
+
+    /** @brief 서지 않은 종료 신호. */
+    fn calm() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    /**
+     * @brief 다음 질의 없이 유휴 한도가 지난 연결을 close_notify 로 닫고 오류로 끝내지 않는지.
+     * @details 쉬던 연결을 닫는 것은 정상 동작이다. close_notify 가 없으면 클라이언트는 연결이
+     *          도중에 끊긴 것으로 보고, 오류로 세면 연결을 오래 쓰는 클라이언트가 오류 지표를
+     *          채운다.
+     */
+    fn dot_idle_timeout_closes_with_close_notify() {
+        let (mut client, serving) = served_connection(Duration::from_secs(2), calm(), calm());
+        let mut conn = client_handshake(&mut client, &client_config()).expect("클라 핸드셰이크");
+        exchange(&mut conn, &mut client);
+        assert_eq!(
+            conn.read_app(&mut client),
+            Err(TlsError::CloseNotify),
+            "쉬던 연결을 close_notify 없이 닫았습니다"
+        );
+        assert!(
+            serving.join().unwrap().is_ok(),
+            "쉬던 연결을 닫은 것을 오류로 돌려주었습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 질의를 보내다 멈춘 연결은 데드라인이 지나면 오류로 끝나는지.
+     * @details 길이 프리픽스 일부나 TLS 레코드 일부만 보낸 연결은 쉬던 연결이 아니다. 앞 질의와
+     *          한 레코드에 실려 와 이미 받아 둔 다음 질의 일부도 같다. 쉬던 연결처럼 다루면 질의를
+     *          잃은 것이 기록되지 않는다.
+     */
+    fn dot_stalled_query_ends_with_an_error() {
+        let idle = Duration::from_secs(2);
+        let (mut half_prefix, prefix_served) = served_connection(idle, calm(), calm());
+        let mut conn =
+            client_handshake(&mut half_prefix, &client_config()).expect("클라 핸드셰이크");
+        conn.write_app(&mut half_prefix, &[0]).unwrap();
+
+        let (mut half_record, record_served) = served_connection(idle, calm(), calm());
+        client_handshake(&mut half_record, &client_config()).expect("클라 핸드셰이크");
+        half_record.write_all(&[23, 3, 3]).unwrap();
+
+        let (mut leftover, leftover_served) = served_connection(idle, calm(), calm());
+        let mut leftover_conn =
+            client_handshake(&mut leftover, &client_config()).expect("클라 핸드셰이크");
+        let mut pipelined = framed_query("allowed.test", RecordType::A);
+        pipelined.push(0);
+        leftover_conn.write_app(&mut leftover, &pipelined).unwrap();
+
+        assert!(
+            prefix_served.join().unwrap().is_err(),
+            "길이 프리픽스 일부만 온 연결을 쉬던 연결로 보았습니다"
+        );
+        assert!(
+            record_served.join().unwrap().is_err(),
+            "TLS 레코드 일부만 온 연결을 쉬던 연결로 보았습니다"
+        );
+        assert!(
+            leftover_served.join().unwrap().is_err(),
+            "앞 질의와 함께 받은 다음 질의 일부를 버리고 쉬던 연결로 보았습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 리스너나 프로세스가 멈출 때 열린 연결에 close_notify 를 보내고 곧바로 닫는지.
+     * @details 종료 신호를 받은 연결은 유휴 한도와 상관없이 끝나야 한다. 그때도 close_notify 를
+     *          보내야 클라이언트가 연결이 잘린 것으로 보지 않는다.
+     */
+    fn dot_stop_closes_open_connections_with_close_notify() {
+        for listener_stops in [true, false] {
+            let (shutdown, stop) = (calm(), calm());
+            let (mut client, serving) =
+                served_connection(DOT_IO_TIMEOUT, shutdown.clone(), stop.clone());
+            let mut conn =
+                client_handshake(&mut client, &client_config()).expect("클라 핸드셰이크");
+            exchange(&mut conn, &mut client);
+
+            let started = Instant::now();
+            let signal = if listener_stops { stop } else { shutdown };
+            signal.store(true, Ordering::Release);
+            assert_eq!(
+                conn.read_app(&mut client),
+                Err(TlsError::CloseNotify),
+                "멈추는 연결을 close_notify 없이 닫았습니다"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "종료 신호를 받은 연결이 유휴 한도까지 남았습니다"
+            );
+            let _ = serving.join().unwrap();
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 송신 버퍼가 찬 연결에서는 close_notify 를 기다리지 않고 포기하는지.
+     * @details 답을 읽지 않는 클라이언트 하나 때문에 리스너 종료가 늦어지면 안 된다. 소켓에
+     *          남아 있는 쓰기 제한 시간만큼도 기다리지 않아야 한다.
+     */
+    fn close_notify_does_not_wait_for_a_full_send_buffer() {
+        let tls = self_signed_tls();
+        let handshake = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = handshake.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            client_handshake(&mut stream, &client_config()).expect("클라 핸드셰이크");
+        });
+        let (mut stream, _) = handshake.accept().unwrap();
+        let mut conn = server_handshake(&mut stream, &tls).expect("서버 핸드셰이크");
+        client.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _silent_reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 64 * 1024];
+        loop {
+            match (&socket).write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("송신 버퍼를 채우지 못했습니다: {error}"),
+            }
+        }
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        let started = Instant::now();
+        send_close_notify_without_waiting(&mut conn, &mut PrefixedTcp::new(socket, Vec::new()));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "송신 버퍼가 찬 연결에서 close_notify 를 기다렸습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 처리기가 답하지 않기로 한 질의를 오류로 세지 않고 연결을 close_notify 로 닫는지.
+     * @details 답하지 않는 것은 정책이 정한 결과다. 전송 오류로 세면 정책이 질의를 버릴 때마다
+     *          오류 지표가 오른다. 영역 전송을 설정하지 않은 서버는 AXFR 에 답하지 않는다.
+     */
+    fn dot_declined_query_closes_without_an_error() {
+        let (mut client, serving) = served_connection(DOT_IO_TIMEOUT, calm(), calm());
+        let mut conn = client_handshake(&mut client, &client_config()).expect("클라 핸드셰이크");
+        conn.write_app(&mut client, &framed_query("zone.test", RecordType(252)))
+            .unwrap();
+        assert_eq!(
+            conn.read_app(&mut client),
+            Err(TlsError::CloseNotify),
+            "답하지 않은 질의 뒤에 close_notify 없이 닫았습니다"
+        );
+        assert!(
+            serving.join().unwrap().is_ok(),
+            "답하지 않기로 한 질의를 오류로 돌려주었습니다"
         );
     }
 

@@ -1915,15 +1915,19 @@ impl AuditLog {
         });
         drop(q);
 
-        // 진단용 POST는 아무것도 바꾸지 않는다. 그것까지 「변경 요청」으로 남기면 조사 한 번에
-        // 로그가 수백 줄씩 늘어 정작 진짜 변경이 묻힌다. 감사 기록에는 위에서 이미 담았다.
+        /*
+         * 진단용 POST는 아무것도 바꾸지 않는다. 그것까지 「변경 요청」으로 남기면 조사 한 번에
+         * 로그가 수백 줄씩 늘어 정작 진짜 변경이 묻힌다. 감사 기록에는 위에서 이미 담았다.
+         */
         if is_state_changing_request(method, path) || status >= 400 {
-            // 빈 detail 을 그대로 실으면 읽는 사람이 건너뛰어야 할 빈 칸이 된다.
+            /* 빈 detail 을 그대로 실으면 읽는 사람이 건너뛰어야 할 빈 칸이 된다. */
             let detail: Option<&str> = (!detail.is_empty()).then_some(detail.as_str());
             if status >= 400 {
-                // 실패는 요청마다 남기지 않는다. 토큰이 틀린 클라이언트 하나가 초당 수십 번
-                // 두드리면 그 로그가 원래 문제보다 더 큰 문제가 된다. 처음과 2의 거듭제곱
-                // 번째만 남기고, 몇 번째인지 함께 적어 얼마나 쏟아지는지 알 수 있게 한다.
+                /*
+                 * 실패는 요청마다 남기지 않는다. 토큰이 틀린 클라이언트 하나가 초당 수십 번
+                 * 두드리면 그 로그가 원래 문제보다 더 큰 문제가 된다. 처음과 2의 거듭제곱
+                 * 번째만 남기고, 몇 번째인지 함께 적어 얼마나 쏟아지는지 알 수 있게 한다.
+                 */
                 let count = repeated_failure_count(method, path, status);
                 if should_log_repeated_failure(count) {
                     match detail {
@@ -2808,8 +2812,10 @@ fn handle_conn_inner(
             "Malformed HTTP request line",
         );
     }
-    // 질의 문자열은 경로가 아니다. 이것을 떼지 않으면 /?x=1도 /healthz?src=lb도
-    // 등록되지 않은 경로가 되어 404·401이 된다. 감사 기록에도 경로만 남긴다.
+    /*
+     * 질의 문자열은 경로가 아니다. 이것을 떼지 않으면 /?x=1도 /healthz?src=lb도
+     * 등록되지 않은 경로가 되어 404·401이 된다. 감사 기록에도 경로만 남긴다.
+     */
     let path = match target.find('?') {
         Some(mark) => target[..mark].to_string(),
         None => target,
@@ -3345,8 +3351,10 @@ fn handle_setup(
         )
     };
 
-    // 첫 계정은 설정 파일을 고칠 수 있는 사람만 만들어야 한다. 리버스 프록시를 거친 요청은
-    // 인터넷의 누구든 보낼 수 있다.
+    /*
+     * 첫 계정은 설정 파일을 고칠 수 있는 사람만 만들어야 한다. 리버스 프록시를 거친 요청은
+     * 인터넷의 누구든 보낼 수 있다.
+     */
     if caller.proxied.is_some() {
         st.audit
             .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
@@ -3379,7 +3387,7 @@ fn handle_setup(
     let name = field("user").trim().to_string();
     let password = field("password");
 
-    // 비밀번호 해시는 비싸므로 코드부터 본다.
+    /* 비밀번호 해시는 비싸므로 코드부터 본다. */
     if !st.auth.setup_code_matches(&field("code")) {
         st.audit
             .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
@@ -3417,8 +3425,10 @@ fn handle_setup(
             return refuse(stream, status, &error.to_string());
         }
     };
-    // 잠금은 설정 파일 기록 구간에만 건다. 뒤따르는 로그인 검증까지 안고 있으면 느린
-    // 키 파생이 다른 모든 컨트롤 플레인 변경을 함께 멈춘다.
+    /*
+     * 잠금은 설정 파일 기록 구간에만 건다. 뒤따르는 로그인 검증까지 안고 있으면 느린
+     * 키 파생이 다른 모든 컨트롤 플레인 변경을 함께 멈춘다.
+     */
     {
         let _guard = control_mutation_lock().lock_recover();
         if st.auth.has_users() {
@@ -3433,9 +3443,11 @@ fn handle_setup(
                 .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 500);
             return refuse(stream, "500 Internal Server Error", &error);
         }
-        // 설정 파일 기록이 무중단 적용을 거치며 목록을 이미 채웠을 수 있다. 그때는 여기서
-        // 더 넣을 것이 없으므로 실패로 보지 않는다. 계정이 정말 생겼는지는 바로 아래에서
-        // 세션을 열어 보며 확인한다.
+        /*
+         * 설정 파일 기록이 무중단 적용을 거치며 목록을 이미 채웠을 수 있다. 그때는 여기서
+         * 더 넣을 것이 없으므로 실패로 보지 않는다. 계정이 정말 생겼는지는 바로 아래에서
+         * 세션을 열어 보며 확인한다.
+         */
         st.auth.add_first_user(name.clone(), hash);
         st.auth.clear_setup_code();
     }
@@ -3504,9 +3516,11 @@ fn handle_auth(
         return write_simple(stream, "200 OK", "application/json", "", &body);
     }
 
-    // 제어 토큰은 API 전용이다. 유효한 토큰에게 역할은 알려 주되 세션 쿠키는 발급하지
-    // 않는다. 쿠키로 바꿔 주면 사람이 외워 넣을 수 없는 값이 브라우저 자격증명이 되고
-    // 토큰 하나가 새면 콘솔 전체가 함께 열린다.
+    /*
+     * 제어 토큰은 API 전용이다. 유효한 토큰에게 역할은 알려 주되 세션 쿠키는 발급하지
+     * 않는다. 쿠키로 바꿔 주면 사람이 외워 넣을 수 없는 값이 브라우저 자격증명이 되고
+     * 토큰 하나가 새면 콘솔 전체가 함께 열린다.
+     */
     if let Some(role) = st.auth.role_for(bearer) {
         let actor = bearer_actor(bearer);
         st.audit
@@ -3532,8 +3546,10 @@ fn auth_status_body(
     role: &str,
     user: &str,
 ) -> String {
-    // 경로에는 계정 이름 같은 것이 들어 있다. 첫 계정은 이 컴퓨터에서만 만들 수 있으므로
-    // 프록시를 거친 요청에는 알려 주지 않는다.
+    /*
+     * 경로에는 계정 이름 같은 것이 들어 있다. 첫 계정은 이 컴퓨터에서만 만들 수 있으므로
+     * 프록시를 거친 요청에는 알려 주지 않는다.
+     */
     let setup_code_file = if st.auth.has_users() || caller.proxied.is_some() {
         None
     } else {
@@ -4282,8 +4298,10 @@ fn route(
                 "Requested path not found".to_string(),
             );
         }
-        // 아이콘을 링크로만 주면 브라우저와 북마크·점검 도구가 여전히 이 주소를 부르고,
-        // 인증 앞에서 막혀 감사 기록이 침입 시도처럼 보이는 401로 채워진다.
+        /*
+         * 아이콘을 링크로만 주면 브라우저와 북마크·점검 도구가 여전히 이 주소를 부르고,
+         * 인증 앞에서 막혀 감사 기록이 침입 시도처럼 보이는 401로 채워진다.
+         */
         ("GET", "/favicon.ico") => {
             #[cfg(feature = "dashboard")]
             return ("200 OK", "image/svg+xml", FAVICON_SVG.to_string());
@@ -4348,8 +4366,10 @@ fn route(
     };
     let actor = audit_actor(&st.auth, token, session);
 
-    // 읽기 전용 세션이 부를 수 있는 POST. 진단은 조사에 쓰라고 있는 것이라, 이것을 막으면
-    // 조사할 때마다 관리자 토큰을 꺼내게 되고 그쪽이 더 위험하다.
+    /*
+     * 읽기 전용 세션이 부를 수 있는 POST. 진단은 조사에 쓰라고 있는 것이라, 이것을 막으면
+     * 조사할 때마다 관리자 토큰을 꺼내게 되고 그쪽이 더 위험하다.
+     */
     let readonly_safe_post = method == "POST"
         && matches!(
             path,
@@ -5992,7 +6012,7 @@ mod tests {
             firewall_set: Box::new(|_| Ok("{\"ok\":true}".to_string())),
             dns_client_set: Box::new(|_| Ok("{\"ok\":true}".to_string())),
             dns_client_restore: Box::new(|_| Ok("{\"ok\":true}".to_string())),
-            // 이 테스트 모듈은 지원하지 않는 운영체제를 흉내 낸다. 기본 콜백과 같은 답이다.
+            /* 이 테스트 모듈은 지원하지 않는 운영체제를 흉내 낸다. 기본 콜백과 같은 답이다. */
             resolve_probe: Box::new(|_| Err("DNS 수신 주소가 없습니다".to_string())),
             boot_service_status: Box::new(|| {
                 "{\"supported\":false,\"installed\":false,\"running\":false}".to_string()
@@ -6702,8 +6722,10 @@ mod tests {
         let st = test_state("adm", "ro");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("test listener address");
-        // 클라이언트 쪽 단언이 깨지면 두 번째 연결이 오지 않는다. 데드라인이 없으면 accept가
-        // 영원히 붙들려 테스트가 실패 대신 멈춘다. 무엇이 틀렸는지 볼 수 없게 된다.
+        /*
+         * 클라이언트 쪽 단언이 깨지면 두 번째 연결이 오지 않는다. 데드라인이 없으면 accept가
+         * 영원히 붙들려 테스트가 실패 대신 멈춘다. 무엇이 틀렸는지 볼 수 없게 된다.
+         */
         listener
             .set_nonblocking(false)
             .expect("blocking test listener");
@@ -6915,7 +6937,9 @@ mod tests {
      */
     fn repeated_failures_are_counted_and_diagnostics_are_not_mutations() {
         let st = test_state("adm", "ro");
-        // 카운터는 프로세스 전역이라 실제 경로를 쓰면 병렬로 실행되는 다른 테스트의 401이 섞인다.
+        /*
+         * 카운터는 프로세스 전역이라 실제 경로를 쓰면 병렬로 실행되는 다른 테스트의 401이 섞인다.
+         */
         let probe = "/v1/__repeated_failure_probe";
         let before = request_failure_count("POST", probe, 401);
         for _ in 0..20 {
@@ -6927,14 +6951,14 @@ mod tests {
             "실패를 세지 않으면 억제할 기준이 없습니다"
         );
 
-        // 진단 POST는 아무것도 바꾸지 않는다. 변경으로 분류되면 안 된다.
+        /* 진단 POST는 아무것도 바꾸지 않는다. 변경으로 분류되면 안 된다. */
         for path in ["/v1/resolve", "/v1/explain", "/v1/policies/simulate"] {
             assert!(
                 !is_state_changing_request("POST", path),
                 "{path}는 아무것도 바꾸지 않습니다"
             );
         }
-        // 대조군. 진짜 변경은 그대로 변경이어야 한다.
+        /* 대조군. 진짜 변경은 그대로 변경이어야 한다. */
         assert!(is_state_changing_request("POST", "/v1/block"));
         assert!(is_state_changing_request("DELETE", "/v1/tokens"));
     }
@@ -8481,7 +8505,7 @@ mod tests {
             "설정 화면에 코드 파일 경로를 알려 주지 않음: {status}"
         );
 
-        // 다른 테스트가 비밀번호를 해시하는 중이면 503이 온다. 코드는 그때 쓰이지 않는다.
+        /* 다른 테스트가 비밀번호를 해시하는 중이면 503이 온다. 코드는 그때 쓰이지 않는다. */
         let response = loop {
             let response = setup_request(&st, &body(TEST_SETUP_CODE));
             if !response.starts_with("HTTP/1.1 503") {

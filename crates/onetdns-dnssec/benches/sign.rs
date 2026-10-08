@@ -157,13 +157,13 @@ fn breakdown(signer: &ZoneSigner) {
     }
     let full = started.elapsed().as_secs_f64() * 1e6 / iterations as f64;
 
-    // 같은 키로 고정 digest만 서명한다. 앞단(정규 직렬화·SHA-256·레코드 조립)이 빠진 값이다.
+    /* 같은 키로 고정 digest만 서명한다. 앞단(정규 직렬화·SHA-256·레코드 조립)이 빠진 값이다. */
     let curve = signer.bench_raw_sign_us(iterations);
     let _ = &origin;
     println!("sign_rrset_us,{full:.2}");
     println!("raw_ecdsa_us,{curve:.2}");
     println!("prep_us,{:.2}", full - curve);
-    // 알고리즘 15로 바꿀 때 닫히는 폭. 이미 트리에 있는 크레이트라 새 의존성이 없다.
+    /* 알고리즘 15로 바꿀 때 닫히는 폭. 이미 트리에 있는 크레이트라 새 의존성이 없다. */
     println!(
         "raw_ed25519_us,{:.2}",
         ZoneSigner::bench_ed25519_sign_us(iterations)
@@ -188,7 +188,7 @@ fn incremental(origin: &Name, signer: &ZoneSigner) {
     let signed = sign_zone_with(&records, signer, 1_700_000_000, &mode);
     println!("first_sign_secs,{:.3}", started.elapsed().as_secs_f64());
 
-    // 이름 하나의 주소만 바꾼다. NSEC 체인은 그대로이므로 새로 서명할 것은 그 RRset뿐이다.
+    /* 이름 하나의 주소만 바꾼다. NSEC 체인은 그대로이므로 새로 서명할 것은 그 RRset뿐이다. */
     let mut changed = records.clone();
     let target =
         Name::from_str(&format!("host{}.{}", owners / 2, origin.to_ascii_lower())).unwrap();
@@ -238,7 +238,7 @@ fn main() {
         return;
     }
 
-    // 대조 엔진과 나란히 측정할 때는 한 크기만 돌려야 CPU 시간이 그 크기의 것이 된다.
+    /* 대조 엔진과 나란히 측정할 때는 한 크기만 돌려야 CPU 시간이 그 크기의 것이 된다. */
     let sizes: Vec<usize> = match std::env::var("ONETDNS_SIGN_OWNERS") {
         Ok(raw) => raw
             .split(',')
@@ -251,7 +251,7 @@ fn main() {
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(3);
 
-    // 알고리즘을 고를 수 있다. 대조 엔진과 비교할 때 이 축이 곧 결론이다.
+    /* 알고리즘을 고를 수 있다. 대조 엔진과 비교할 때 이 축이 곧 결론이다. */
     let algorithm = match std::env::var("ONETDNS_SIGN_ALGORITHM").as_deref() {
         Ok("ed25519") => SignAlgorithm::Ed25519,
         _ => SignAlgorithm::EcdsaP256,
@@ -272,7 +272,9 @@ fn main() {
                 }),
             ),
         ] {
-            // 첫 회차는 버린다. 할당기와 캐시가 데워지지 않은 상태를 측정하면 방식 비교가 흐려진다.
+            /*
+             * 첫 회차는 버린다. 할당기와 캐시가 데워지지 않은 상태를 측정하면 방식 비교가 흐려진다.
+             */
             let _ = measure(&records, &signer, &mode);
             let mut best = f64::MAX;
             let mut peak = 0.0f64;

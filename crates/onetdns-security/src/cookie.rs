@@ -408,7 +408,7 @@ mod tests {
         assert!(!check(now + 3600), "한 시간 뒤는 거부합니다");
         assert!(check(now + 60), "1분 앞선 시계는 받아 줍니다");
 
-        // 해시가 맞아도 버전이 다르면 이 서버의 것이 아니다.
+        /* 해시가 맞아도 버전이 다르면 이 서버의 것이 아니다. */
         let mut wrong_version = client.to_vec();
         let mut server = keeper.server_cookie_at(&client, ip, now);
         server[0] = 2;

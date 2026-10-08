@@ -61,6 +61,8 @@ pub struct DeadlineTcp<S = TcpStream> {
     deadline: Instant,
     /** @brief 하나라도 서면 기다리던 읽기와 쓰기를 끊는다. */
     stop: Vec<Arc<AtomicBool>>,
+    /** @brief 데드라인을 마지막으로 잡은 뒤 한 바이트라도 읽었는지. */
+    received: bool,
 }
 
 impl DeadlineTcp {
@@ -78,6 +80,7 @@ impl<S> DeadlineTcp<S> {
             stream,
             deadline,
             stop: Vec::new(),
+            received: false,
         }
     }
 
@@ -90,11 +93,26 @@ impl<S> DeadlineTcp<S> {
     /** @brief 데드라인을 다시 잡는다. 요청 하나를 마치고 다음 요청을 기다릴 때 쓴다. */
     pub fn set_deadline(&mut self, deadline: Instant) {
         self.deadline = deadline;
+        self.received = false;
+    }
+
+    /**
+     * @brief 데드라인을 다시 잡은 뒤 한 바이트도 받지 못한 채 데드라인이 지났는지.
+     * @details 다음 요청을 기다리며 데드라인을 잡았다면 쉬다가 끝난 연결이다. 요청을 보내다 멈춘
+     *          상대는 일부라도 보냈으므로 여기에 들지 않는다.
+     */
+    pub fn idle_expired(&self) -> bool {
+        !self.received && Instant::now() >= self.deadline
     }
 
     /** @brief 실제 연결. 소켓 옵션을 바꾸거나 주소를 읽을 때 쓴다. */
     pub fn get_ref(&self) -> &S {
         &self.stream
+    }
+
+    /** @brief 데드라인과 종료 신호를 떼어 내고 실제 연결을 돌려준다. */
+    pub fn into_inner(self) -> S {
+        self.stream
     }
 
     /** @brief 종료 신호가 섰는지. */
@@ -144,7 +162,10 @@ impl<S: Read + SocketTimeouts> Read for DeadlineTcp<S> {
             self.stream.set_read_timeout(Some(wait))?;
             match self.stream.read(buf) {
                 Err(error) if self.waits_again(&error) => {}
-                result => return result,
+                result => {
+                    self.received |= matches!(result, Ok(n) if n > 0);
+                    return result;
+                }
             }
         }
     }
@@ -293,6 +314,41 @@ mod tests {
         stream.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"late");
         peer.join().unwrap();
+    }
+
+    #[test]
+    /**
+     * @brief 데드라인을 잡은 뒤 아무것도 받지 못하고 끝난 대기만 쉬다가 끝난 것으로 보는지.
+     * @details 일부라도 보낸 상대를 쉬던 연결로 보면 요청을 보내다 멈춘 것이 정상 종료에 묻힌다.
+     */
+    fn idle_expiry_requires_silence_since_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let wait = Duration::from_millis(100);
+        let mut stream = DeadlineTcp::new(server, Instant::now() + wait)
+            .stop_on(Arc::new(AtomicBool::new(false)));
+        assert!(stream.read(&mut [0u8; 1]).is_err());
+        assert!(
+            stream.idle_expired(),
+            "아무것도 받지 못한 대기를 쉬다가 끝난 것으로 보지 않았습니다"
+        );
+
+        client.write_all(&[1]).unwrap();
+        stream.set_deadline(Instant::now() + wait);
+        assert!(stream.read_exact(&mut [0u8; 2]).is_err());
+        assert!(
+            !stream.idle_expired(),
+            "요청 일부를 받은 대기를 쉬다가 끝난 것으로 보았습니다"
+        );
+
+        stream.set_deadline(Instant::now() + wait);
+        assert!(stream.read(&mut [0u8; 1]).is_err());
+        assert!(
+            stream.idle_expired(),
+            "데드라인을 다시 잡았는데 앞 대기에서 받은 기록이 남았습니다"
+        );
+        drop(client);
     }
 
     #[test]

@@ -503,9 +503,11 @@ fn handle_conn<H: Handler>(
         let request = match Message::parse(&body) {
             Ok(m) => m,
             Err(_) => {
-                // 파싱하지 못해도 답을 주고 연결은 이어 간다. 길이 프리픽스가 메시지 경계를
-                // 이미 정하므로(RFC 1035) 내용이 깨져도 다음 메시지가 어디서 시작하는지
-                // 안다. 하나가 깨졌다고 끊으면 질의를 이어 보내던 클라이언트가 연결을 잃는다.
+                /*
+                 * 파싱하지 못해도 답을 주고 연결은 이어 간다. 길이 프리픽스가 메시지 경계를
+                 * 이미 정하므로(RFC 1035) 내용이 깨져도 다음 메시지가 어디서 시작하는지
+                 * 안다. 하나가 깨졌다고 끊으면 질의를 이어 보내던 클라이언트가 연결을 잃는다.
+                 */
                 if body.len() >= 12 && body[2] & 0x80 == 0 {
                     if let Some(response) = handler.handle_unparsable(&body, &ctx) {
                         writer.clear();
@@ -716,7 +718,7 @@ mod malformed_tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("Could not set the deadline");
 
-            // 질문 하나를 적고 둘이라고 말하는 헤더다.
+            /* 질문 하나를 적고 둘이라고 말하는 헤더다. */
             let mut broken = vec![0u8; 12];
             broken[0..2].copy_from_slice(&0x4321u16.to_be_bytes());
             broken[4..6].copy_from_slice(&2u16.to_be_bytes());

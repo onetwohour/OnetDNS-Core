@@ -8,6 +8,8 @@
 
 /** @brief 연결 상태 기계. 패킷을 받고 내보낼 데이터그램을 만든다. */
 pub mod conn;
+/** @brief DoQ 오류 코드. */
+pub mod doq;
 /** @brief QUIC 프레임 인코딩과 파싱. */
 pub mod frame;
 /** @brief HTTP/3. */
@@ -26,7 +28,7 @@ pub mod retry;
 pub mod varint;
 
 pub use conn::{Connection, PeerClose, QuicDiagnostic, QuicError, Role, MAX_RECV_UDP_PAYLOAD};
-pub use h3::{H3Client, H3Connection};
+pub use h3::{H3Client, H3Connection, H3Error};
 
 use sha2::Sha256;
 

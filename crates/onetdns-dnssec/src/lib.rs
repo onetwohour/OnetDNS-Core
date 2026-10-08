@@ -3325,7 +3325,7 @@ mod tests {
         zero_prefixed_modulus.extend_from_slice(n);
         assert!(parse_rfc3110(&zero_prefixed_modulus).is_none());
 
-        // 하한은 1024비트다. 실제로 쓰이는 크기를 막지 않으면서 그보다 작은 것은 물린다.
+        /* 하한은 1024비트다. 실제로 쓰이는 크기를 막지 않으면서 그보다 작은 것은 물린다. */
         let mut short_modulus = vec![3, 1, 0, 1];
         short_modulus.extend_from_slice(&[0x81; MIN_RSA_MODULUS_BYTES - 1]);
         assert!(parse_rfc3110(&short_modulus).is_none());
@@ -4685,7 +4685,7 @@ mod tests {
      * @warning 하한을 올리면 그 크기로 서명하는 모든 영역이 해석되지 않는다.
      */
     fn rfc3110_accepts_the_1024_bit_keys_real_zones_still_use() {
-        // exponent 65537 + 홀수 모듈러스. 앞바이트가 0이 아니고 끝바이트가 홀수여야 한다.
+        /* exponent 65537 + 홀수 모듈러스. 앞바이트가 0이 아니고 끝바이트가 홀수여야 한다. */
         let key_with_modulus_bytes = |bytes: usize| {
             let mut raw = vec![3u8, 1, 0, 1];
             raw.extend(std::iter::repeat_n(0xabu8, bytes - 1));
@@ -4701,8 +4701,10 @@ mod tests {
             assert_eq!(n.len(), bytes);
         }
 
-        // 대조군. 1024비트 아래는 그대로 물린다. 받아들일 이유가 없고, 위 단정이
-        // 길이 검사를 전부 지워도 통과하지 않게 한다.
+        /*
+         * 대조군. 1024비트 아래는 그대로 물린다. 받아들일 이유가 없고, 위 단정이
+         * 길이 검사를 전부 지워도 통과하지 않게 한다.
+         */
         for bytes in [64usize, 96, 127] {
             assert!(
                 parse_rfc3110(&key_with_modulus_bytes(bytes)).is_none(),

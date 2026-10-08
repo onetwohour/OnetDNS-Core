@@ -187,8 +187,10 @@ mod tests {
         assert_eq!(run(8), 0x93f5_f579_9a93_2462, "8바이트(블록 경계)");
         assert_eq!(run(15), 0xa129_ca61_49be_45e5, "15바이트");
 
-        // 라운드 수가 다른 변형은 같은 입력에 다른 값을 낸다. 둘을 바꿔 쓰면 조용히
-        // 호환이 깨지므로 여기서 갈라 둔다.
+        /*
+         * 라운드 수가 다른 변형은 같은 입력에 다른 값을 낸다. 둘을 바꿔 쓰면 조용히
+         * 호환이 깨지므로 여기서 갈라 둔다.
+         */
         let mut thirteen = SipHasher13::new_with_keys(k0, k1);
         thirteen.write(&[]);
         assert_ne!(thirteen.finish(), run(0));

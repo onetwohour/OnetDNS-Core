@@ -185,9 +185,11 @@ pub(crate) fn postprocess(
         }
     }
 
-    // RFC 7871: 대역 정보를 쓰는 서버는 클라이언트가 그 옵션을 보냈을 때만, 그러나
-    // 보냈으면 반드시 응답에도 담아야 한다. 하류가 전달 리졸버면 이 값으로 자기 캐시의
-    // 범위를 정하므로, 없으면 대역별 답을 모두에게 주는 캐시가 된다.
+    /*
+     * RFC 7871: 대역 정보를 쓰는 서버는 클라이언트가 그 옵션을 보냈을 때만, 그러나
+     * 보냈으면 반드시 응답에도 담아야 한다. 하류가 전달 리졸버면 이 값으로 자기 캐시의
+     * 범위를 정하므로, 없으면 대역별 답을 모두에게 주는 캐시가 된다.
+     */
     if f.ecs_in_use {
         if let Some(echo) = request
             .opt()
@@ -207,9 +209,11 @@ pub(crate) fn postprocess(
 
 /** @brief 옵션을 붙여 응답을 마무리한다. */
 pub(crate) fn finalize(mut msg: Message, edns: Option<Edns>) -> Message {
-    // 요청에 OPT가 없으면 응답에도 없어야 한다. RFC 6891이 그렇게 정한다. 업스트림이나
-    // 재귀가 담아 온 OPT를 그대로 흘리면 이 서버가 광고한 적 없는 버퍼 크기와 남의 DO 비트가
-    // 클라이언트에 나간다.
+    /*
+     * 요청에 OPT가 없으면 응답에도 없어야 한다. RFC 6891이 그렇게 정한다. 업스트림이나
+     * 재귀가 담아 온 OPT를 그대로 흘리면 이 서버가 광고한 적 없는 버퍼 크기와 남의 DO 비트가
+     * 클라이언트에 나간다.
+     */
     msg.additionals
         .retain(|r| r.rtype != onetdns_proto::RecordType::OPT);
     if let Some(e) = edns {

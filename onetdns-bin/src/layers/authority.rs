@@ -85,8 +85,10 @@ impl Resolver for AuthorityLayer {
 fn attach_dnssec(m: &mut Message, zone: &onetdns_authority::Zone, qname: &Name) {
     let rrsig_t = RecordType(46);
     let nsec_t = RecordType(47);
-    // 서명을 붙인 뒤에는 RRSIG가 별칭과 같은 owner의 다른 타입처럼 보여 terminal 추적을
-    // 방해한다. 원래 answer만 있을 때 최종 이름과 요청 RRset 존재 여부를 확정한다.
+    /*
+     * 서명을 붙인 뒤에는 RRSIG가 별칭과 같은 owner의 다른 타입처럼 보여 terminal 추적을
+     * 방해한다. 원래 answer만 있을 때 최종 이름과 요청 RRset 존재 여부를 확정한다.
+     */
     let terminal = crate::cache::terminal_answer_name(m, &m.answers);
     let has_requested_answer = crate::cache::has_requested_answer(m, &m.answers);
 

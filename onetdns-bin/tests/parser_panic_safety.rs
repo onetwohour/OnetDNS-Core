@@ -500,7 +500,7 @@ fn parsers_never_panic_on_malformed_input() {
                     *slot = *byte;
                 }
                 let _ = onetdns_dnscrypt::decrypt_query(&[0x5a; 32], &nonce, dd);
-                // 패킷 종류를 나누는 진입점. UDP 와 TCP 가 함께 부르고 크기 예산만 다르다.
+                /* 패킷 종류를 나누는 진입점. UDP 와 TCP 가 함께 부르고 크기 예산만 다르다. */
                 let peer: std::net::SocketAddr = "127.0.0.1:1".parse().expect("고정 주소");
                 let answer = |_query: Vec<u8>, _src: std::net::SocketAddr, _budget: usize| None;
                 let allow = |_src: std::net::SocketAddr| true;

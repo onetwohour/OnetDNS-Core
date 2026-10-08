@@ -68,7 +68,7 @@ impl Default for QuicMemoryBudget {
 
 impl QuicMemoryBudget {
     /** @brief 지정한 상한으로 만든다. 작은 상한은 결정적 회귀 테스트에도 쓴다. */
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             used: AtomicUsize::new(0),
             limit,

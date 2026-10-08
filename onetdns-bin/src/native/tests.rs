@@ -353,7 +353,7 @@ fn bench_native_feature_snapshot_reuse() {
  *          한다. 안 보면 거부한 클라이언트에게도 서버가 있다고 알리게 된다.
  */
 fn an_unparsable_query_is_answered_with_formerr_behind_the_usual_gates() {
-    // 질문 하나를 적어 놓고 둘이라고 말하는 헤더. 파서가 거부한다.
+    /* 질문 하나를 적어 놓고 둘이라고 말하는 헤더. 파서가 거부한다. */
     let mut packet = vec![0u8; 12];
     packet[0..2].copy_from_slice(&0xbeefu16.to_be_bytes());
     packet[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
@@ -1063,8 +1063,10 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
         }] if *address == Ipv4Addr::new(192, 0, 2, 99)
     ));
 
-    // 옵션 없는 OPT 하나만 붙은 질의는 빠른 경로가 맡되, 나가는 바이트는 구조적 경로와
-    // 한 바이트도 다르면 안 된다. 실제 클라이언트는 거의 전부 이 모양으로 물어본다.
+    /*
+     * 옵션 없는 OPT 하나만 붙은 질의는 빠른 경로가 맡되, 나가는 바이트는 구조적 경로와
+     * 한 바이트도 다르면 안 된다. 실제 클라이언트는 거의 전부 이 모양으로 물어본다.
+     */
     let mut with_edns = request.clone();
     with_edns
         .additionals
@@ -1094,7 +1096,7 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
     );
     assert!(echoed.options.is_empty());
 
-    // 응답에 담을 것이 생기거나 절단 사다리가 필요한 모양은 전부 물러선다.
+    /* 응답에 담을 것이 생기거나 절단 사다리가 필요한 모양은 전부 물러선다. */
     let mut with_do = request.clone();
     let mut do_edns = Edns::default();
     do_edns.dnssec_ok = true;
@@ -2153,7 +2155,7 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         })
     };
 
-    // FAMILY 1, SOURCE 24, SCOPE 0, 192.0.2.0
+    /* FAMILY 1, SOURCE 24, SCOPE 0, 192.0.2.0 */
     let asked = vec![0, 1, 24, 0, 192, 0, 2];
     let response = using(true)
         .handle(&with_ecs(Some(asked.clone())), &ctx())
@@ -2164,7 +2166,7 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         "FAMILY, SOURCE, ADDRESS 는 질의의 것과 같고 SCOPE 는 0 입니다"
     );
 
-    // 클라이언트가 SCOPE 를 잘못 적어 보내도 이 서버의 응답의 SCOPE 는 0 이다.
+    /* 클라이언트가 SCOPE 를 잘못 적어 보내도 이 서버의 응답의 SCOPE 는 0 이다. */
     let bad_scope = vec![0, 1, 24, 24, 192, 0, 2];
     let response = using(true)
         .handle(&with_ecs(Some(bad_scope)), &ctx())
@@ -2185,8 +2187,10 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         "대역 정보를 쓰지 않으면 그대로 돌려줄 것도 없습니다"
     );
 
-    // SOURCE 24 인데 주소가 두 옥텟뿐이라 형식이 깨졌다. 그대로 돌려주면 어긋난 옵션을
-    // 하류로 퍼뜨리게 되므로 넣지 않는다.
+    /*
+     * SOURCE 24 인데 주소가 두 옥텟뿐이라 형식이 깨졌다. 그대로 돌려주면 어긋난 옵션을
+     * 하류로 퍼뜨리게 되므로 넣지 않는다.
+     */
     let short = vec![0, 1, 24, 0, 192, 0];
     let response = using(true).handle(&with_ecs(Some(short)), &ctx()).unwrap();
     assert_eq!(
@@ -2476,8 +2480,10 @@ fn authority_wire_survives_limiter_activating_mid_dispatch() {
     );
     let packet = request.try_encode().unwrap();
     let mut output = onetdns_proto::Writer::with_limit(1232);
-    // 제한기가 꺼져 있다고 본 뒤 켜졌으므로 클라이언트를 만들지 않았다. 여기서 죽지 않고
-    // 보통 경로로 전환해야 한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
+    /*
+     * 제한기가 꺼져 있다고 본 뒤 켜졌으므로 클라이언트를 만들지 않았다. 여기서 죽지 않고
+     * 보통 경로로 전환해야 한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
+     */
     assert_eq!(
         server.handle_udp_wire(&packet, &ctx(), &mut output, Instant::now()),
         onetdns_runtime::WireDisposition::Fallback
@@ -2712,8 +2718,10 @@ fn axfr_large_zone_streams_multiple_envelopes() {
     );
     assert_eq!(cached_wires, first_cached, "lazy AXFR wire cache is reused");
 
-    // 성공한 영역 전송은 어느 경로도 통계에 남기지 않는다. 기록기가 있다는 이유로 이
-    // 경로가 포기하면 영역을 전부 다시 만들기만 하고 남는 기록은 그대로 없다.
+    /*
+     * 성공한 영역 전송은 어느 경로도 통계에 남기지 않는다. 기록기가 있다는 이유로 이
+     * 경로가 포기하면 영역을 전부 다시 만들기만 하고 남는 기록은 그대로 없다.
+     */
     {
         let (recorder, _stats) = onetdns_control::channel(
             8,
@@ -3577,7 +3585,7 @@ fn dnssec_records_go_only_to_clients_that_asked_for_them() {
         "직접 물을 수 있는 종류를 걷어냈습니다"
     );
 
-    // 대조군. DO를 설정한 쪽에는 그대로 나가야 한다. 걷어내기가 언제나 실행되는 것을 막는다.
+    /* 대조군. DO를 설정한 쪽에는 그대로 나가야 한다. 걷어내기가 언제나 실행되는 것을 막는다. */
     let mut do_request = Message::query(1, name.clone(), ApRt::A);
     let mut edns = Edns::default();
     edns.dnssec_ok = true;
@@ -3674,7 +3682,7 @@ fn a_multi_question_query_gets_formerr_without_echoing_it() {
         "1보다 큰 QDCOUNT를 그대로 돌려주면 응답이 같은 규칙을 어깁니다"
     );
 
-    // 질문이 없는 질의도 같은 분기를 지난다. 비우는 것이 무해해야 한다.
+    /* 질문이 없는 질의도 같은 분기를 지난다. 비우는 것이 무해해야 한다. */
     let mut empty = Message::default();
     empty.header.id = 7;
     let response = srv.handle(&empty, &ctx).expect("응답이 없습니다");
@@ -4242,7 +4250,7 @@ fn any_query_answers_with_the_minimal_hinfo() {
         other => panic!("HINFO wire를 기대했습니다: {other:?}"),
     }
 
-    // DO를 설정하면 합성하지 않는다. 이 서버에는 any.test 영역이 없으므로 관례 경로로 간다.
+    /* DO를 설정하면 합성하지 않는다. 이 서버에는 any.test 영역이 없으므로 관례 경로로 간다. */
     let mut signed_query = query.clone();
     signed_query.additionals.push(ApRecord {
         name: ApName::root(),

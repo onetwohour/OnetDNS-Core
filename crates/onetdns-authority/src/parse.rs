@@ -461,8 +461,10 @@ fn parse_name(tok: &str, origin: &Name) -> Result<Name, String> {
     if tok.ends_with('.') && !tok.ends_with(r"\.") {
         return Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"));
     }
-    // origin은 라벨로 이어 붙인다. 표시 문자열로 합치면 이스케이프가 필요한 바이트가
-    // 그대로 섞여 들어가 다시 읽을 때 라벨 경계가 달라진다.
+    /*
+     * origin은 라벨로 이어 붙인다. 표시 문자열로 합치면 이스케이프가 필요한 바이트가
+     * 그대로 섞여 들어가 다시 읽을 때 라벨 경계가 달라진다.
+     */
     let relative = Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"))?;
     let mut labels: Vec<Vec<u8>> = relative.labels().map(<[u8]>::to_vec).collect();
     labels.extend(origin.labels().map(<[u8]>::to_vec));
@@ -770,7 +772,7 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     {
         return Err(format!("Invalid RRSIG time: {tok}"));
     }
-    // 1970-01-01부터의 일수. 3월을 한 해의 시작으로 옮겨 윤년 보정을 한 줄로 만든다.
+    /* 1970-01-01부터의 일수. 3월을 한 해의 시작으로 옮겨 윤년 보정을 한 줄로 만든다. */
     let shifted_year = if month <= 2 { year - 1 } else { year };
     let era = shifted_year / 400;
     let year_of_era = shifted_year - era * 400;
@@ -1173,7 +1175,7 @@ mod tests {
         assert!(pr("SVCB 1 svc.example.net port=443 port=444").is_err());
         assert!(pr("SVCB 1 svc.example.net key2").is_err());
 
-        // RFC 9460이 정한 등록 키와 그 값 형식. 셋 다 wire 바이트까지 확인한다.
+        /* RFC 9460이 정한 등록 키와 그 값 형식. 셋 다 wire 바이트까지 확인한다. */
         let full = pr("HTTPS 1 svc.example.net alpn=h2,h3 port=8443 ipv4hint=192.0.2.1,192.0.2.2")
             .expect("등록된 키를 읽어야 합니다");
         match full {
@@ -1192,7 +1194,7 @@ mod tests {
             other => panic!("HTTPS 기대: {other:?}"),
         }
 
-        // 항목 안의 쉼표는 역슬래시로 막는다. 먼저 이스케이프를 풀면 구분자와 섞인다.
+        /* 항목 안의 쉼표는 역슬래시로 막는다. 먼저 이스케이프를 풀면 구분자와 섞인다. */
         match pr(r"SVCB 1 . alpn=one\\,two").expect("막은 쉼표") {
             RData::Svcb { params, .. } => {
                 assert_eq!(params[0].1.as_ref(), b"one,two");
@@ -1200,7 +1202,7 @@ mod tests {
             other => panic!("SVCB 기대: {other:?}"),
         }
 
-        // 등록부에 없는 키의 값은 16진수가 아니라 character-string이다.
+        /* 등록부에 없는 키의 값은 16진수가 아니라 character-string이다. */
         match pr("SVCB 1 . key65000=hello").expect("미등록 키") {
             RData::Svcb { params, .. } => assert_eq!(params[0].1.as_ref(), b"hello"),
             other => panic!("SVCB 기대: {other:?}"),
@@ -1209,8 +1211,10 @@ mod tests {
         assert!(pr("SVCB 1 . port=notanumber").is_err());
         assert!(pr("SVCB 1 . ipv4hint=2001:db8::1").is_err());
 
-        // RFC 4034가 정한 DNSSEC 표시 형식. 미리 서명된 zone을 담지 못하면 온라인 서명
-        // 말고는 길이 없다. wire 바이트까지 확인한다. BIND와 대조해 얻은 값이다.
+        /*
+         * RFC 4034가 정한 DNSSEC 표시 형식. 미리 서명된 zone을 담지 못하면 온라인 서명
+         * 말고는 길이 없다. wire 바이트까지 확인한다. BIND와 대조해 얻은 값이다.
+         */
         match pr("DNSKEY 256 3 13 AQIDBA==").expect("DNSKEY") {
             RData::Unknown(48, wire) => {
                 assert_eq!(wire, vec![0x01, 0x00, 3, 13, 1, 2, 3, 4]);
@@ -1268,7 +1272,7 @@ mod tests {
             }
             other => panic!("NSEC3 기대: {other:?}"),
         }
-        // 이름을 모르는 종류는 TYPEnnn으로 비트맵에 넣을 수 있어야 한다.
+        /* 이름을 모르는 종류는 TYPEnnn으로 비트맵에 넣을 수 있어야 한다. */
         assert!(pr("NSEC next.sec.test. A TYPE300").is_ok());
         assert!(pr("DNSKEY 256 3 13 !!!not-base64!!!").is_err());
         assert!(pr("RRSIG A 13 3 3600 20261301000000 20260801000000 1 . AQ==").is_err());

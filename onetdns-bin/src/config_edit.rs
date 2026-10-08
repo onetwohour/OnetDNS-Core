@@ -431,7 +431,7 @@ pub(crate) fn validate_config_patch_values(
     const REDACTED_URLS: &[&str] = &["zones_postgres", "zones_mysql"];
 
     for (key, value) in pairs {
-        // null은 항목을 지우라는 뜻이다. 값 검사는 넣을 때만 한다.
+        /* null은 항목을 지우라는 뜻이다. 값 검사는 넣을 때만 한다. */
         if matches!(value, Json::Null) {
             continue;
         }
@@ -1017,11 +1017,11 @@ mod tests {
         assert!(out.contains("querylog = true"));
         assert!(out.contains("[[users]]"), "테이블이 함께 지워졌습니다");
 
-        // 원래 없던 항목을 지우는 것은 실패가 아니다.
+        /* 원래 없던 항목을 지우는 것은 실패가 아니다. */
         let same = remove_config_key(&out, "control_listen").unwrap();
         assert_eq!(same, out);
 
-        // 테이블 안의 같은 이름은 건드리지 않는다.
+        /* 테이블 안의 같은 이름은 건드리지 않는다. */
         let nested = "[[zones]]
     name = \"a\"
     ";

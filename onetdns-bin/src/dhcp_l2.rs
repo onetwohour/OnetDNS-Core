@@ -1,7 +1,10 @@
-//! 주소를 아직 설정하지 않은 DHCPv4 클라이언트에 chaddr로 직접 답한다.
-//!
-//! Linux는 Ethernet/IP/UDP 프레임을 직접 내보내 커널 이웃표를 건드리지 않는다. Windows는
-//! raw Ethernet 송신 API가 없으므로 IP Helper로 대상 ARP 항목을 전송 동안만 고정한다.
+/*!
+ * @brief 주소를 아직 설정하지 않은 DHCPv4 클라이언트에 chaddr로 직접 답한다.
+ *
+ * @details Linux는 Ethernet/IP/UDP 프레임을 직접 내보내 커널 이웃표를 건드리지 않는다.
+ *          Windows는 raw Ethernet 송신 API가 없으므로 IP Helper로 대상 ARP 항목을
+ *          전송 동안만 고정한다.
+ */
 
 use std::io;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -226,7 +229,7 @@ mod linux {
     /** @brief 받는 데이터그램마다 들어온 인터페이스를 함께 알려 달라고 한다. */
     pub(super) fn report_arrival_interface(socket: &UdpSocket) -> io::Result<()> {
         let on: libc::c_int = 1;
-        // SAFETY: on은 호출 동안 살아 있는 int이고 길이를 정확히 넘긴다.
+        /* @safety on은 호출 동안 살아 있는 int이고 길이를 정확히 넘긴다. */
         let result = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
@@ -253,24 +256,24 @@ mod linux {
     ) -> io::Result<(usize, Option<u32>)> {
         let info_len = u32::try_from(std::mem::size_of::<libc::in_pktinfo>())
             .expect("The size of in_pktinfo fits in u32");
-        // SAFETY: CMSG_SPACE는 길이만 계산한다.
+        /* @safety CMSG_SPACE는 길이만 계산한다. */
         let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
         let mut control = vec![0u8; space];
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         };
-        // SAFETY: 모든 0 비트가 msghdr의 유효한 초기 상태다.
+        /* @safety 모든 0 비트가 msghdr의 유효한 초기 상태다. */
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_iov = &raw mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = space as _;
-        // SAFETY: message가 가리키는 버퍼와 제어 자료는 호출 동안 모두 살아 있다.
+        /* @safety message가 가리키는 버퍼와 제어 자료는 호출 동안 모두 살아 있다. */
         let received = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut message, 0) };
         let len = usize::try_from(received).map_err(|_| io::Error::last_os_error())?;
         let mut interface = None;
-        // SAFETY: 커널이 채운 제어 자료를 CMSG 매크로로만 따라가며 msg_controllen 안에서 읽는다.
+        /* @safety 커널이 채운 제어 자료를 CMSG 매크로로만 따라가며 msg_controllen 안에서 읽는다. */
         unsafe {
             let mut header = libc::CMSG_FIRSTHDR(&raw const message);
             while !header.is_null() {
@@ -300,7 +303,7 @@ mod linux {
         port: u16,
         payload: &[u8],
     ) -> io::Result<()> {
-        // SAFETY: 모든 0 비트가 sockaddr_in의 유효한 초기 상태다.
+        /* @safety 모든 0 비트가 sockaddr_in의 유효한 초기 상태다. */
         let mut destination: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         destination.sin_family = libc::AF_INET as libc::sa_family_t;
         destination.sin_port = port.to_be();
@@ -316,14 +319,14 @@ mod linux {
         };
         let info_len = u32::try_from(std::mem::size_of::<libc::in_pktinfo>())
             .expect("The size of in_pktinfo fits in u32");
-        // SAFETY: CMSG_SPACE는 길이만 계산한다.
+        /* @safety CMSG_SPACE는 길이만 계산한다. */
         let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
         let mut control = vec![0u8; space];
         let mut iov = libc::iovec {
             iov_base: payload.as_ptr().cast_mut().cast(),
             iov_len: payload.len(),
         };
-        // SAFETY: 모든 0 비트가 msghdr의 유효한 초기 상태다.
+        /* @safety 모든 0 비트가 msghdr의 유효한 초기 상태다. */
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_name = (&raw mut destination).cast();
         message.msg_namelen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>())
@@ -332,7 +335,7 @@ mod linux {
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = space as _;
-        // SAFETY: control은 CMSG_SPACE 크기로 잡았으므로 첫 헤더와 자료가 그 안에 들어간다.
+        /* @safety control은 CMSG_SPACE 크기로 잡았으므로 첫 헤더와 자료가 그 안에 들어간다. */
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&raw const message);
             (*header).cmsg_level = libc::IPPROTO_IP;
@@ -340,7 +343,7 @@ mod linux {
             (*header).cmsg_len = libc::CMSG_LEN(info_len) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<libc::in_pktinfo>(), info);
         }
-        // SAFETY: message가 가리키는 주소, 버퍼, 제어 자료는 호출 동안 모두 살아 있다.
+        /* @safety message가 가리키는 주소, 버퍼, 제어 자료는 호출 동안 모두 살아 있다. */
         let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) };
         if sent < 0 {
             return Err(io::Error::last_os_error());
@@ -361,7 +364,7 @@ mod linux {
         /** @brief 지금 인터페이스 주소 목록을 읽는다. */
         fn load() -> io::Result<Self> {
             let mut head = std::ptr::null_mut();
-            // SAFETY: head는 libc가 채우는 출력 포인터이며 성공 뒤 Drop이 한 번 해제한다.
+            /* @safety head는 libc가 채우는 출력 포인터이며 성공 뒤 Drop이 한 번 해제한다. */
             if unsafe { libc::getifaddrs(&mut head) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -375,7 +378,7 @@ mod linux {
                 if cursor.is_null() {
                     return None;
                 }
-                // SAFETY: getifaddrs 목록의 노드는 free 전까지 유효하다.
+                /* @safety getifaddrs 목록의 노드는 free 전까지 유효하다. */
                 let item = unsafe { &*cursor };
                 cursor = item.ifa_next;
                 Some(item)
@@ -385,7 +388,7 @@ mod linux {
 
     impl Drop for Addrs {
         fn drop(&mut self) {
-            // SAFETY: getifaddrs가 성공해 소유한 목록을 정확히 한 번 해제한다.
+            /* @safety getifaddrs가 성공해 소유한 목록을 정확히 한 번 해제한다. */
             unsafe { libc::freeifaddrs(self.0) };
         }
     }
@@ -396,14 +399,14 @@ mod linux {
             .iter()
             .find(|item| {
                 !item.ifa_addr.is_null()
-                    // SAFETY: ifa_addr의 family 필드는 모든 sockaddr 변형의 공통 헤더다.
+                    /* @safety ifa_addr의 family 필드는 모든 sockaddr 변형의 공통 헤더다. */
                     && unsafe { (*item.ifa_addr).sa_family } == libc::AF_INET as libc::sa_family_t
-                    // SAFETY: family가 AF_INET임을 확인했다.
+                    /* @safety family가 AF_INET임을 확인했다. */
                     && unsafe { (*item.ifa_addr.cast::<libc::sockaddr_in>()).sin_addr.s_addr }
                         .to_ne_bytes()
                         == server_ip.octets()
             })
-            // SAFETY: ifa_name은 getifaddrs 계약상 NUL 종료 문자열이다.
+            /* @safety ifa_name은 getifaddrs 계약상 NUL 종료 문자열이다. */
             .map(|item| unsafe { CStr::from_ptr(item.ifa_name) }.to_owned())
             .ok_or_else(|| {
                 io::Error::new(
@@ -411,7 +414,7 @@ mod linux {
                     format!("DHCP server address {server_ip} is not on any local interface"),
                 )
             })?;
-        // SAFETY: name은 NUL 종료 문자열이며 libc는 읽기만 한다.
+        /* @safety name은 NUL 종료 문자열이며 libc는 읽기만 한다. */
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         if index == 0 {
             return Err(io::Error::last_os_error());
@@ -425,12 +428,12 @@ mod linux {
         let (name, index) = interface_name(&addrs, server_ip)?;
         for item in addrs.iter() {
             if !item.ifa_addr.is_null()
-                // SAFETY: sockaddr 공통 헤더만 읽는다.
+                /* @safety sockaddr 공통 헤더만 읽는다. */
                 && unsafe { (*item.ifa_addr).sa_family } == libc::AF_PACKET as libc::sa_family_t
-                // SAFETY: 양쪽 포인터 모두 유효한 NUL 종료 인터페이스 이름이다.
+                /* @safety 양쪽 포인터 모두 유효한 NUL 종료 인터페이스 이름이다. */
                 && unsafe { libc::strcmp(item.ifa_name, name.as_ptr()) } == 0
             {
-                // SAFETY: family가 AF_PACKET임을 확인했다.
+                /* @safety family가 AF_PACKET임을 확인했다. */
                 let link = unsafe { &*item.ifa_addr.cast::<libc::sockaddr_ll>() };
                 if link.sll_halen >= 6 {
                     let mut mac = [0u8; 6];
@@ -467,7 +470,7 @@ mod linux {
             target_ip,
             payload,
         )?;
-        // SAFETY: 인자는 Linux AF_PACKET socket 계약의 정수 값이다.
+        /* @safety 인자는 Linux AF_PACKET socket 계약의 정수 값이다. */
         let raw = unsafe {
             libc::socket(
                 libc::AF_PACKET,
@@ -478,9 +481,9 @@ mod linux {
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: 성공한 socket 호출이 넘긴 fd의 단독 소유권을 받는다.
+        /* @safety 성공한 socket 호출이 넘긴 fd의 단독 소유권을 받는다. */
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        // SAFETY: 모든 0 비트가 sockaddr_ll의 유효한 초기 상태다.
+        /* @safety 모든 0 비트가 sockaddr_ll의 유효한 초기 상태다. */
         let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         address.sll_family = libc::AF_PACKET as u16;
         address.sll_protocol = ETH_P_IP.to_be();
@@ -489,7 +492,7 @@ mod linux {
         })?;
         address.sll_halen = 6;
         address.sll_addr[..6].copy_from_slice(&target_mac);
-        // SAFETY: frame과 sockaddr_ll은 호출 동안 살아 있고 길이는 각각의 실제 크기다.
+        /* @safety frame과 sockaddr_ll은 호출 동안 살아 있고 길이는 각각의 실제 크기다. */
         let sent = unsafe {
             libc::sendto(
                 fd.as_raw_fd(),
@@ -595,7 +598,7 @@ mod windows {
     }
 
     fn socket_error() -> io::Error {
-        // SAFETY: WSAGetLastError는 호출 스레드의 정수 오류 코드만 반환한다.
+        /* @safety WSAGetLastError는 호출 스레드의 정수 오류 코드만 반환한다. */
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
@@ -638,7 +641,7 @@ mod windows {
             if result != NO_ERROR {
                 return Err(error(result));
             }
-            // SAFETY: API 성공 뒤 최소 4바이트 count가 초기화됐다.
+            /* @safety API 성공 뒤 최소 4바이트 count가 초기화됐다. */
             let count = unsafe { *table.cast::<u32>() as usize };
             let required = count
                 .checked_mul(std::mem::size_of::<Row>())
@@ -660,7 +663,7 @@ mod windows {
             let rows = (table as *const u8).wrapping_add(row_offset).cast::<Row>();
             let mut output = Vec::with_capacity(count);
             for item in 0..count {
-                // SAFETY: 위의 checked 범위 검사가 count개 행 전체를 보장한다.
+                /* @safety 위의 checked 범위 검사가 count개 행 전체를 보장한다. */
                 output.push(unsafe { *rows.add(item) });
             }
             return Ok(output);
@@ -673,7 +676,7 @@ mod windows {
 
     fn existing(index: u32, address: u32) -> io::Result<Option<MibIpNetRow>> {
         table_rows::<MibIpNetRow>(|table, size| {
-            // SAFETY: table_rows가 버퍼와 크기의 수명·범위를 보장한다.
+            /* @safety table_rows가 버퍼와 크기의 수명·범위를 보장한다. */
             unsafe { GetIpNetTable(table.cast(), size, 0) }
         })
         .map(|rows| {
@@ -685,7 +688,7 @@ mod windows {
     fn interface_for(server_ip: Ipv4Addr) -> io::Result<u32> {
         let address = u32::from_ne_bytes(server_ip.octets());
         table_rows::<MibIpAddrRow>(|table, size| {
-            // SAFETY: table_rows가 버퍼와 크기의 수명·범위를 보장한다.
+            /* @safety table_rows가 버퍼와 크기의 수명·범위를 보장한다. */
             unsafe { GetIpAddrTable(table.cast(), size, 0) }
         })?
         .into_iter()
@@ -730,7 +733,7 @@ mod windows {
             }) {
                 return;
             }
-            // SAFETY: 두 함수 모두 완전히 초기화된 MIB_IPNETROW를 읽기만 한다.
+            /* @safety 두 함수 모두 완전히 초기화된 MIB_IPNETROW를 읽기만 한다. */
             let result = unsafe {
                 match self.previous {
                     Some(previous) => SetIpNetEntry(&raw const previous),
@@ -757,7 +760,7 @@ mod windows {
     impl Drop for InterfaceGuard {
         fn drop(&mut self) {
             let previous = self.previous.to_be();
-            // SAFETY: socket은 UdpSocket보다 짧게 살고 option은 4바이트 DWORD다.
+            /* @safety socket은 UdpSocket보다 짧게 살고 option은 4바이트 DWORD다. */
             if unsafe {
                 setsockopt(
                     self.socket,
@@ -783,7 +786,7 @@ mod windows {
         let mut previous = 0u32;
         let mut length =
             i32::try_from(std::mem::size_of::<u32>()).expect("The size of DWORD fits in i32");
-        // SAFETY: previous와 length는 4바이트 socket option의 유효한 출력 버퍼다.
+        /* @safety previous와 length는 4바이트 socket option의 유효한 출력 버퍼다. */
         if unsafe {
             getsockopt(
                 socket,
@@ -817,7 +820,7 @@ mod windows {
         let socket = socket.as_raw_socket();
         let previous = current_interface(socket)?;
         let network_index = index.to_be();
-        // SAFETY: network_index는 Microsoft가 요구하는 network-byte-order DWORD다.
+        /* @safety network_index는 Microsoft가 요구하는 network-byte-order DWORD다. */
         if unsafe {
             setsockopt(
                 socket,
@@ -845,7 +848,7 @@ mod windows {
             address,
             kind: MIB_IPNET_TYPE_STATIC,
         };
-        // SAFETY: temporary는 API가 요구하는 모든 필드를 채운 MIB_IPNETROW다.
+        /* @safety temporary는 API가 요구하는 모든 필드를 채운 MIB_IPNETROW다. */
         let result = unsafe {
             if previous.is_some() {
                 SetIpNetEntry(&raw const temporary)
@@ -923,7 +926,7 @@ mod tests {
      *          장비에서 전송 자체가 실패한다.
      */
     fn broadcast_interface_is_the_one_holding_the_server_address() {
-        // SAFETY: 리터럴은 NUL 종료 문자열이다.
+        /* @safety 리터럴은 NUL 종료 문자열이다. */
         let loopback = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
         assert_ne!(loopback, 0);
         assert_eq!(

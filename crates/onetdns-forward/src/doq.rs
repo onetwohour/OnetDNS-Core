@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
 use onetdns_proto::Message;
-use onetdns_quic::Connection;
+use onetdns_quic::{doq, Connection};
 use onetdns_tls::TrustStore;
 
 use crate::quicdrive::{
@@ -40,6 +40,22 @@ struct DoqConn {
     server_name: String,
     /** @brief 폐기 확인을 이미 했는지. 연결당 한 번만 한다. */
     revocation_checked: bool,
+}
+
+impl Drop for DoqConn {
+    /**
+     * @brief 버려지는 연결의 종료를 서버에 알린다.
+     * @details 오류, 시간 초과, 무응답, LRU 축출, 스레드 종료 가운데 어느 경로로 버려도 여기를
+     *          지난다. 열린 연결은 알릴 오류 없이 닫고, 이미 닫힌 연결은 쌓아 둔 종료 프레임만
+     *          내보낸다. 소켓도 함께 닫으므로 closing 기간은 기다리지 않는다. 알리지 않으면 서버는
+     *          자기 유휴 데드라인까지 연결을 붙들고 있다.
+     */
+    fn drop(&mut self) {
+        if !self.conn.is_closed() {
+            self.conn.close(doq::NO_ERROR, "");
+        }
+        let _ = flush_out(&self.sock, &mut self.conn);
+    }
 }
 
 thread_local! {
@@ -115,21 +131,21 @@ fn connect(
         .filter(|d| !d.is_zero())
         .ok_or(ForwardError::Timeout)?;
     let created = Instant::now();
-    let (sock, mut conn) = new_client_connection(addr, server_name, b"doq", timeout, trust)?;
-
-    if !conn.can_send_early() {
-        pump_handshake(&sock, &mut conn, created, deadline).inspect_err(|error| {
-            crate::note_upstream_connect_failure("doq", addr, server_name, error);
-        })?;
-    }
-    Ok(DoqConn {
+    let (sock, conn) = new_client_connection(addr, server_name, b"doq", timeout, trust)?;
+    let mut c = DoqConn {
         sock,
         conn,
         next_bidi: 0,
         created,
         server_name: server_name.to_string(),
         revocation_checked: false,
-    })
+    };
+    if !c.conn.can_send_early() {
+        pump_handshake(&c.sock, &mut c.conn, created, deadline).inspect_err(|error| {
+            crate::note_upstream_connect_failure("doq", addr, server_name, error);
+        })?;
+    }
+    Ok(c)
 }
 
 /**
@@ -157,13 +173,17 @@ fn roundtrip(
         return Err(ForwardError::Io("Idle DoQ connection closed".into()));
     }
 
-    check_peer_revocation(&c.conn, &c.server_name, &mut c.revocation_checked)?;
+    check_peer_revocation(&mut c.conn, &c.server_name, &mut c.revocation_checked)?;
 
     let sid = c.next_bidi << 2;
     c.conn.set_now(c.created.elapsed().as_millis() as u64);
-    c.conn
-        .send_dns_message(sid, &q)
-        .map_err(|error| ForwardError::Io(format!("Could not send DoQ request: {error}")))?;
+    if let Err(error) = c.conn.send_dns_message(sid, &q) {
+        c.conn
+            .close(doq::INTERNAL_ERROR, "Could not send the DNS query");
+        return Err(ForwardError::Io(format!(
+            "Could not send DoQ request: {error}"
+        )));
+    }
     c.next_bidi += 1;
     flush_out(&c.sock, &mut c.conn)?;
 
@@ -187,7 +207,7 @@ fn roundtrip(
         }
         flush_out(&c.sock, &mut c.conn)?;
 
-        check_peer_revocation(&c.conn, &c.server_name, &mut c.revocation_checked)?;
+        check_peer_revocation(&mut c.conn, &c.server_name, &mut c.revocation_checked)?;
         if c.conn
             .take_resets()
             .iter()
@@ -199,9 +219,13 @@ fn roundtrip(
         }
         for (rid, dns) in c.conn.take_stream_requests() {
             if rid == sid {
-                let resp = Message::parse(&dns).map_err(|_| ForwardError::BadResponse)?;
-                validate_response(request, &resp, Some(0))?;
-                return Ok(resp);
+                let resp = Message::parse(&dns)
+                    .map_err(|_| ForwardError::BadResponse)
+                    .and_then(|resp| validate_response(request, &resp, Some(0)).map(|()| resp));
+                if resp.is_err() {
+                    c.conn.close(doq::PROTOCOL_ERROR, "Invalid DNS response");
+                }
+                return resp;
             }
         }
     }
@@ -445,7 +469,53 @@ mod tests {
      *          붙들고 있다.
      */
     fn doq_rejected_certificate_is_reported_to_the_server() {
-        let (scfg, _trust) = doq_server_config("dns.test");
+        let (addr, _trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doq(addr, "dns.test")],
+            Duration::from_secs(3),
+        )
+        .with_trust(Arc::new(TrustStore::empty()));
+        assert!(fwd.resolve(&q(1, "x.test")).is_err());
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 거부 사유를 서버에 보내지 않았습니다");
+        assert_eq!(
+            close.error_code,
+            0x100 + 48,
+            "unknown_ca 경고를 담은 CRYPTO_ERROR 여야 합니다"
+        );
+    }
+
+    /** @brief 질의를 그대로 되돌려 주는 응답. 답 레코드는 없다. */
+    fn answer_in_kind(req: &Message) -> Message {
+        let mut m = Message::default();
+        m.header.id = req.header.id;
+        m.header.response = true;
+        m.questions = req.questions.clone();
+        m
+    }
+
+    /** @brief 다른 이름을 물은 질의에 대한 응답. */
+    fn answer_other_question(req: &Message) -> Message {
+        let mut m = answer_in_kind(req);
+        m.questions = q(req.header.id, "other.test").questions;
+        m
+    }
+
+    /**
+     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림.
+     * @param answer 받은 질의에 실을 응답을 만든다.
+     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 연결마다 받은 종료 사유를 차례로 받는 곳.
+     */
+    fn doq_close_recorder(
+        name: &str,
+        answer: fn(&Message) -> Message,
+    ) -> (
+        SocketAddr,
+        Arc<TrustStore>,
+        std::sync::mpsc::Receiver<onetdns_quic::PeerClose>,
+    ) {
+        let (scfg, trust) = doq_server_config(name);
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(200)))
@@ -466,34 +536,113 @@ mod tests {
                     )
                 });
                 let received = conn.recv_datagram(&buf[..n]);
-                if let Some(close) = conn.peer_close() {
-                    let _ = closes.send(close.clone());
-                    return;
+                if let Some(close) = conn.peer_close().cloned() {
+                    conns.remove(&peer);
+                    if closes.send(close).is_err() {
+                        return;
+                    }
+                    continue;
                 }
                 if received.is_err() {
                     conns.remove(&peer);
                     continue;
+                }
+                for (sid, query) in conn.take_stream_requests() {
+                    if let Ok(req) = Message::parse(&query) {
+                        let _ = conn.send_dns_message(sid, &answer(&req).try_encode().unwrap());
+                    }
                 }
                 while let Some(dg) = conn.next_datagram() {
                     let _ = sock.send_to(&dg, peer);
                 }
             }
         });
+        (addr, trust, reported)
+    }
 
+    #[test]
+    /**
+     * @brief 풀에서 버려지는 연결이 알릴 오류 없이 닫힌다고 서버에 알리는지.
+     * @details 연결을 쥔 스레드가 끝나며 풀이 사라지는 경우다. 알리지 않으면 서버는 자기 유휴
+     *          데드라인까지 연결을 붙들고 있다.
+     */
+    fn doq_discarded_connection_notifies_the_server() {
+        let (addr, trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
+        thread::spawn(move || {
+            let request = q(1, "bye.test");
+            let wire = request.try_encode().unwrap();
+            exchange(
+                addr,
+                "dns.test",
+                &wire,
+                &request,
+                Duration::from_secs(5),
+                &trust,
+            )
+            .expect("질의에 대한 답을 받지 못했습니다");
+        })
+        .join()
+        .unwrap();
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("버려진 연결이 서버에 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x0, None));
+    }
+
+    #[test]
+    /**
+     * @brief 질의에 맞지 않는 응답을 받으면 DOQ_PROTOCOL_ERROR 로 연결을 닫는지.
+     * @details 그런 서버가 같은 연결로 보낼 다음 응답도 믿을 수 없다.
+     */
+    fn doq_mismatched_answer_closes_with_protocol_error() {
+        let (addr, trust, closes) = doq_close_recorder("dns.test", answer_other_question);
         let fwd = Forwarder::with_upstreams(
             vec![Upstream::doq(addr, "dns.test")],
-            Duration::from_secs(3),
+            Duration::from_secs(5),
         )
-        .with_trust(Arc::new(TrustStore::empty()));
+        .with_trust(trust);
         assert!(fwd.resolve(&q(1, "x.test")).is_err());
-        let close = reported
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x2, None));
+    }
+
+    #[test]
+    /**
+     * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 경고로 서버에 알리는지.
+     * @details TLS 가 인증서를 거부했을 때처럼 CRYPTO_ERROR 를 담은 전송 계층 종료로 나간다.
+     */
+    fn doq_revocation_rejection_is_reported_to_the_server() {
+        let _revocation_test_guard = crate::revocation_test_write_guard();
+        let (addr, trust, closes) = doq_close_recorder("revoked.test", answer_in_kind);
+        crate::set_revocation_hook(Box::new(|_, host| {
+            if host == "revoked.test" {
+                Err("폐기됨".to_string())
+            } else {
+                Ok(())
+            }
+        }));
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doq(addr, "revoked.test")],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+        let res = fwd.resolve(&q(1, "x.test"));
+        crate::clear_revocation_hook();
+        assert!(
+            res.is_err(),
+            "폐기 확인이 거부한 서버의 답을 받아들였습니다"
+        );
+        let close = closes
             .recv_timeout(Duration::from_secs(10))
             .expect("클라이언트가 거부 사유를 서버에 보내지 않았습니다");
         assert_eq!(
             close.error_code,
-            0x100 + 42,
-            "bad_certificate 경고를 담은 CRYPTO_ERROR 여야 합니다"
+            0x100 + 46,
+            "certificate_unknown 경고를 담은 CRYPTO_ERROR 여야 합니다"
         );
+        assert!(close.frame_type.is_some(), "전송 계층 종료여야 합니다");
     }
 
     #[test]

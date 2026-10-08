@@ -144,9 +144,11 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         return None;
     }
 
-    // 이름은 중간 배열을 거치지 않고 키에 곧장 소문자로 쓴다. 따로 담았다가 옮기면
-    // 255바이트 배열을 0으로 채우고 이름을 한 번 더 옮기는 값을 질의마다 치른다.
-    // 키 앞부분(버전, 의미 플래그)는 이름보다 먼저 정해지므로 순서를 바꿔도 된다.
+    /*
+     * 이름은 중간 배열을 거치지 않고 키에 곧장 소문자로 쓴다. 따로 담았다가 옮기면
+     * 255바이트 배열을 0으로 채우고 이름을 한 번 더 옮기는 값을 질의마다 치른다.
+     * 키 앞부분(버전, 의미 플래그)는 이름보다 먼저 정해지므로 순서를 바꿔도 된다.
+     */
     let rd = flags2 & 0x01 != 0;
     let ad = flags3 & 0x20 != 0;
     let cd = flags3 & 0x10 != 0;
@@ -155,8 +157,10 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
     key.push(1);
     key.push_array(semantic_flags.to_be_bytes());
     let name_start = key.len;
-    // QTYPE/QCLASS 뒤에는 EDNS 유무 태그와, 있으면 payload/DO/옵션 수가 붙는다. 이름을
-    // 쓰기 전에 그 뒷부분과 루트 라벨 공간까지 남겨 두면 아래 push는 release에서도 안전하다.
+    /*
+     * QTYPE/QCLASS 뒤에는 EDNS 유무 태그와, 있으면 payload/DO/옵션 수가 붙는다. 이름을
+     * 쓰기 전에 그 뒷부분과 루트 라벨 공간까지 남겨 두면 아래 push는 release에서도 안전하다.
+     */
     let key_suffix_len = if arcount == 1 { 11 } else { 5 };
 
     let mut pos = 12usize;
@@ -244,10 +248,12 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
     key.push_array(qclass.to_be_bytes());
     match edns {
         Some((payload, do_bit, _)) => {
-            // 구조적 캐시의 키와 바이트까지 같아야 한다. 어긋나면 승격할 슬롯을 찾지
-            // 못해 그 모양의 질의는 영원히 이 레인을 못 타고, 레인에 들어갔다 나오느라 일을
-            // 두 번 한다. 버전 번호는 위에서 0만 통과시켰고, 패딩은 양쪽 다 의미 있는 옵션으로
-            // 세지 않으므로 옵션 수는 언제나 0이다.
+            /*
+             * 구조적 캐시의 키와 바이트까지 같아야 한다. 어긋나면 승격할 슬롯을 찾지
+             * 못해 그 모양의 질의는 영원히 이 레인을 못 타고, 레인에 들어갔다 나오느라 일을
+             * 두 번 한다. 버전 번호는 위에서 0만 통과시켰고, 패딩은 양쪽 다 의미 있는 옵션으로
+             * 세지 않으므로 옵션 수는 언제나 0이다.
+             */
             key.push(1);
             key.push_array(payload.to_be_bytes());
             key.push(0);

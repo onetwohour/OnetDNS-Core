@@ -7,9 +7,13 @@
  *       각자 갖는다.
  */
 
-use crate::cert::{certificate_verify_content, CertEntry, CertificateMsg, CertificateVerify};
+use crate::cert::{
+    certificate_verify_content, tls13_signature_scheme_allowed, CertEntry, CertificateMsg,
+    CertificateVerify, REQUESTED_SIGNATURE_SCHEMES,
+};
 use crate::conn::{
-    client_config_wire_is_valid, server_config_wire_is_valid, ClientConfig, ServerConfig,
+    choose_server_key_share, client_config_wire_is_valid, new_key_exchange, retry_key_share,
+    server_config_wire_is_valid, ClientConfig, ServerConfig, ServerKeyShare,
 };
 use crate::handshake::{HandshakeMsg, HandshakeReader, HandshakeType};
 use crate::keyschedule::{
@@ -97,15 +101,6 @@ fn short_hex(bytes: &[u8]) -> String {
     out
 }
 
-/** @brief 클라이언트 인사말에서 X25519 공개값을 꺼낸다. */
-fn x25519_client_share(ch: &ClientHello) -> Option<Vec<u8>> {
-    let entries = ch.ext(EXT_KEY_SHARE)?.as_key_share_client()?;
-    entries
-        .into_iter()
-        .find(|(g, _)| *g == X25519)
-        .map(|(_, k)| k)
-}
-
 /** @brief 암호화된 확장 메시지를 만든다. 전송 매개변수가 여기 담긴다. */
 fn encrypted_extensions_quic_full(
     alpn: Option<&[u8]>,
@@ -153,6 +148,8 @@ pub struct ServerHandshake {
     local_tp: Vec<u8>,
     /** @brief 받은 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
+    /** @brief 받을 수준이 바뀔 때 앞 수준의 바이트가 남았는지. 새 수준으로 이어 읽을 수 없다. */
+    stranded_input: bool,
     /** @brief 지금 어느 단계인지. */
     state: SState,
 
@@ -187,6 +184,8 @@ pub struct ServerHandshake {
     hrr_prefix: Option<Vec<u8>>,
     /** @brief 다시 보내기에서 이미 고른 암호 스위트. */
     hrr_suite: Option<u16>,
+    /** @brief 다시 보내기에서 키 조각을 요청한 곡선. */
+    hrr_group: Option<u16>,
     /** @brief 다시 보내라고 하기 전에 받은 첫 메시지. */
     hrr_client_hello: Option<ClientHello>,
 
@@ -223,6 +222,7 @@ impl ServerHandshake {
             cfg,
             local_tp: local_transport_params,
             hr: HandshakeReader::new(),
+            stranded_input: false,
             state: SState::ExpectClientHello,
             hash: Hash::Sha256,
             suite: 0,
@@ -236,6 +236,7 @@ impl ServerHandshake {
             hrr_cookie: None,
             hrr_prefix: None,
             hrr_suite: None,
+            hrr_group: None,
             hrr_client_hello: None,
             out_initial: Vec::new(),
             out_handshake: Vec::new(),
@@ -303,17 +304,24 @@ impl ServerHandshake {
         total
     }
 
-    /** @brief 받은 핸드셰이크 데이터를 넣어 상태를 진행시킨다. */
-    pub fn provide(&mut self, _level: Level, data: &[u8]) -> Result<(), TlsError> {
+    /**
+     * @brief 받은 핸드셰이크 데이터를 넣어 상태를 진행시킨다.
+     * @param level 그 데이터가 실려 온 암호화 수준.
+     * @details 받을 수준을 바꾸는 메시지 뒤에 같은 수준의 바이트가 남으면 처리하지 않고 둔다.
+     *          RFC 9001 은 이것을 QUIC 연결 오류 PROTOCOL_VIOLATION 으로 정하므로 부른 쪽이
+     *          has_unconsumed_input 으로 확인해 끊는다. 그 상태로 다시 부르면 이쪽이 거부한다.
+     * @retval TlsError::UnexpectedMessage 지금 받을 수준이 아닌 데이터이거나, 앞 수준에 남은
+     *         바이트가 있다.
+     */
+    pub fn provide(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
         if !server_config_wire_is_valid(&self.cfg) || self.local_tp.len() > u16::MAX as usize {
             return Err(TlsError::Internal);
         }
+        if self.stranded_input || level != self.receive_level() {
+            return Err(TlsError::UnexpectedMessage);
+        }
         self.hr.feed(data);
-        loop {
-            let msg = match self.hr.next_message()? {
-                Some(m) => m,
-                None => return Ok(()),
-            };
+        while let Some(msg) = self.hr.next_message()? {
             match self.state {
                 SState::ExpectClientHello => self.on_client_hello(&msg)?,
                 SState::ExpectClientCertificate => self.on_client_certificate(&msg)?,
@@ -321,22 +329,49 @@ impl ServerHandshake {
                 SState::ExpectClientFinished => self.on_client_finished(&msg)?,
                 SState::Done => return Err(TlsError::UnexpectedMessage),
             }
+            if self.receive_level() != level {
+                self.stranded_input = self.hr.has_pending();
+                break;
+            }
         }
+        Ok(())
+    }
+
+    /** @brief 지금 핸드셰이크 메시지를 받을 암호화 수준. */
+    pub fn receive_level(&self) -> Level {
+        match self.state {
+            SState::ExpectClientHello => Level::Initial,
+            SState::ExpectClientCertificate
+            | SState::ExpectClientCertVerify
+            | SState::ExpectClientFinished => Level::Handshake,
+            SState::Done => Level::Application,
+        }
+    }
+
+    /** @brief 받았지만 아직 메시지로 처리하지 않은 바이트가 있는지. */
+    pub fn has_unconsumed_input(&self) -> bool {
+        self.hr.has_pending()
     }
 
     /**
      * @brief 재개 제안을 받아들일지 판단한다.
+     * @param suite 이번에 고른 스위트. RFC 8446 은 해시가 같은 스위트끼리 PSK 를 함께 쓰게 하지만
+     *        조기 데이터는 티켓과 같은 스위트일 때만 받는다.
+     * @return 받아들인 티켓과 조기 데이터를 받을 수 있는지.
      * @warning 바인더를 검증한다. 검증하지 않으면 티켓만 흉내 내 남의 세션을 재개할 수 있다.
      */
     fn try_accept_psk(
         &self,
         ch: &ClientHello,
         ch_msg: &HandshakeMsg,
+        suite: u16,
+        negotiated_alpn: &Option<Vec<u8>>,
         binder_prefix: &[u8],
     ) -> Result<Option<(crate::session::ResumptionState, bool)>, TlsError> {
         let Some(res) = &self.cfg.resumption else {
             return Ok(None);
         };
+        let (hash, _) = suite_params(suite).ok_or(TlsError::Internal)?;
         if self.cfg.client_ca.is_some() {
             return Ok(None);
         }
@@ -361,15 +396,12 @@ impl ServerHandshake {
         let Some(state) = res.ticketer.open(identity) else {
             return Ok(None);
         };
-        if state.server_name != ch.ext(EXT_SERVER_NAME).and_then(Extension::as_server_name) {
+        if state.server_name != ch.ext(EXT_SERVER_NAME).and_then(Extension::as_server_name)
+            || state.alpn != *negotiated_alpn
+            || state.hash() != Some(hash)
+        {
             return Ok(None);
         }
-        if !ch.cipher_suites.contains(&state.suite) {
-            return Ok(None);
-        }
-        let Some((hash, _)) = suite_params(state.suite) else {
-            return Ok(None);
-        };
 
         let full = ch_msg.encode();
         let binders_len = 2 + binders.iter().map(|b| 1 + b.len()).sum::<usize>();
@@ -395,17 +427,21 @@ impl ServerHandshake {
             return Ok(None);
         }
 
-        let early_ok =
-            ch.ext(EXT_EARLY_DATA).is_some() && res.max_early_data > 0 && state.max_early_data > 0;
+        let early_ok = ch.ext(EXT_EARLY_DATA).is_some()
+            && res.max_early_data > 0
+            && state.max_early_data > 0
+            && state.suite == suite;
         Ok(Some((state, early_ok)))
     }
 
     /**
      * @brief 클라이언트 인사말을 처리하고 서버 차례를 만든다.
      * @details 다시 시도 요청은 재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도
-     *          인사말은 지원 곡선과 서명 방식을 바꾸거나 재개 제안을 새로 넣을 수 없으므로,
-     *          X25519 를 지원하지 않거나 재개 제안 없이 이쪽 서명 방식을 빠뜨린 인사말은 첫
-     *          인사말에서 거절한다.
+     *          인사말은 지원 곡선과 ALPN 을 바꿀 수 없으므로, 공통 곡선이 없거나 ALPN 이 맞지
+     *          않는 인사말은 첫 인사말에서 거절한다. 클라이언트의 서명 방식 목록에 이쪽 방식이
+     *          없어도 RFC 8446 대로 가진 인증서로 계속한다.
+     * @retval TlsError::NoApplicationProtocol 이쪽이 ALPN 을 쓰는데 합의한 프로토콜이 없다.
+     *         RFC 9001 은 QUIC 에서 ALPN 협상을 필수로 정한다.
      */
     fn on_client_hello(&mut self, ch_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let ch = ClientHello::from_handshake(ch_msg)?;
@@ -432,110 +468,79 @@ impl ServerHandshake {
         self.peer_tp = ch
             .ext(EXT_QUIC_TRANSPORT_PARAMETERS)
             .map(|e| e.data.clone());
-
-        if x25519_client_share(&ch).is_none() {
-            if self.hrr_prefix.is_some() {
-                return Err(TlsError::IllegalParameter);
-            }
-            let supports = ch
-                .ext(EXT_SUPPORTED_GROUPS)
-                .and_then(|e| e.as_supported_groups())
-                .map(|gs| gs.contains(&X25519))
-                .unwrap_or(false);
-            if !supports {
-                return Err(TlsError::HandshakeFailure);
-            }
-            if ch.ext(EXT_PRE_SHARED_KEY).is_none()
-                && !ch.offers_signature_scheme(self.cfg.sign_scheme)
-            {
-                return Err(TlsError::HandshakeFailure);
-            }
-            let suite = choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::HandshakeFailure)?;
-            let (hash, _) = suite_params(suite).ok_or(TlsError::Internal)?;
-            let cookie = random_32().to_vec();
-            let mut t = Transcript::new(hash);
-            t.update(&ch_msg.encode());
-            t.replace_with_message_hash();
-            let hrr = ServerHello {
-                legacy_version: TLS12,
-                random: crate::msg::HRR_RANDOM,
-                session_id_echo: ch.session_id.clone(),
-                cipher_suite: suite,
-                extensions: vec![
-                    Extension::supported_versions_server(TLS13),
-                    Extension::key_share_hrr(X25519),
-                    Extension::cookie(&cookie),
-                ],
-            };
-            let hrr_msg = hrr.to_handshake();
-            self.out_initial.extend_from_slice(&hrr_msg.encode());
-            t.update(&hrr_msg.encode());
-            self.hrr_prefix = Some(t.as_bytes().to_vec());
-            self.hrr_suite = Some(suite);
-            self.hrr_cookie = Some(cookie);
-            self.hrr_client_hello = Some(ch);
-            return Ok(());
+        let negotiated_alpn = ch.select_alpn(&self.cfg.alpn)?;
+        if !self.cfg.alpn.is_empty() && negotiated_alpn.is_none() {
+            return Err(TlsError::NoApplicationProtocol);
         }
 
-        if let Some(expected) = &self.hrr_cookie {
-            let echoed = ch
-                .ext(EXT_COOKIE)
-                .ok_or(TlsError::MissingExtension)?
-                .as_cookie()
-                .ok_or(TlsError::Decode)?;
-            if echoed != *expected {
-                return Err(TlsError::IllegalParameter);
+        let (group, client_pub) = match self.hrr_group.take() {
+            Some(group) => {
+                let echoed = ch
+                    .ext(EXT_COOKIE)
+                    .ok_or(TlsError::MissingExtension)?
+                    .as_cookie()
+                    .ok_or(TlsError::Decode)?;
+                if self.hrr_cookie.as_deref() != Some(&echoed[..]) {
+                    return Err(TlsError::IllegalParameter);
+                }
+                (group, retry_key_share(&ch, group)?)
             }
-            let retry_shares = ch
-                .ext(EXT_KEY_SHARE)
-                .ok_or(TlsError::MissingExtension)?
-                .as_key_share_client()
-                .ok_or(TlsError::Decode)?;
-            if retry_shares.len() != 1
-                || retry_shares[0].0 != X25519
-                || retry_shares[0].1.len() != 32
-            {
-                return Err(TlsError::IllegalParameter);
-            }
-        }
-        let client_pub = x25519_client_share(&ch).ok_or(TlsError::Internal)?;
+            None => match choose_server_key_share(&ch)? {
+                ServerKeyShare::Offered { group, public } => (group, public),
+                ServerKeyShare::Retry(group) => {
+                    let suite =
+                        choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::HandshakeFailure)?;
+                    let (hash, _) = suite_params(suite).ok_or(TlsError::Internal)?;
+                    let cookie = random_32().to_vec();
+                    let mut t = Transcript::new(hash);
+                    t.update(&ch_msg.encode());
+                    t.replace_with_message_hash();
+                    let hrr = ServerHello {
+                        legacy_version: TLS12,
+                        random: crate::msg::HRR_RANDOM,
+                        session_id_echo: ch.session_id.clone(),
+                        cipher_suite: suite,
+                        extensions: vec![
+                            Extension::supported_versions_server(TLS13),
+                            Extension::key_share_hrr(group),
+                            Extension::cookie(&cookie),
+                        ],
+                    };
+                    let hrr_msg = hrr.to_handshake();
+                    self.out_initial.extend_from_slice(&hrr_msg.encode());
+                    t.update(&hrr_msg.encode());
+                    self.hrr_prefix = Some(t.as_bytes().to_vec());
+                    self.hrr_suite = Some(suite);
+                    self.hrr_group = Some(group);
+                    self.hrr_cookie = Some(cookie);
+                    self.hrr_client_hello = Some(ch);
+                    return Ok(());
+                }
+            },
+        };
 
-        let client_alpn = ch
-            .ext(EXT_ALPN)
-            .and_then(|e| e.as_alpn())
-            .unwrap_or_default();
-        let negotiated_alpn: Option<Vec<u8>> = self
-            .cfg
-            .alpn
-            .iter()
-            .find(|sp| client_alpn.iter().any(|cp| cp == *sp))
-            .cloned();
         self.alpn = negotiated_alpn.clone();
         self.client_allows_resumption = ch
             .ext(EXT_PSK_KEY_EXCHANGE_MODES)
             .and_then(Extension::as_psk_modes)
             .is_some_and(|modes| modes.contains(&PSK_DHE_KE));
 
-        let psk = self
-            .try_accept_psk(&ch, ch_msg, self.hrr_prefix.as_deref().unwrap_or_default())?
-            .filter(|(state, _)| {
-                state.alpn == negotiated_alpn
-                    && self
-                        .hrr_suite
-                        .is_none_or(|selected| state.suite == selected)
-            });
-        let resumed = psk.is_some();
-        if !resumed && !ch.offers_signature_scheme(self.cfg.sign_scheme) {
-            return Err(TlsError::HandshakeFailure);
-        }
-        let suite = match &psk {
-            Some((state, _)) => state.suite,
-            None => self
-                .hrr_suite
-                .or_else(|| choose_suite_quic(&ch.cipher_suites))
-                .ok_or(TlsError::HandshakeFailure)?,
-        };
+        let suite = self
+            .hrr_suite
+            .or_else(|| choose_suite_quic(&ch.cipher_suites))
+            .ok_or(TlsError::HandshakeFailure)?;
         let (hash, _key_len) = suite_params(suite).ok_or(TlsError::Internal)?;
+        let psk = self.try_accept_psk(
+            &ch,
+            ch_msg,
+            suite,
+            &negotiated_alpn,
+            self.hrr_prefix.as_deref().unwrap_or_default(),
+        )?;
+        let resumed = psk.is_some();
+        if !resumed && ch.ext(EXT_SIGNATURE_ALGORITHMS).is_none() {
+            return Err(TlsError::MissingExtension);
+        }
 
         let mut transcript = Transcript::new(hash);
         if let Some(prefix) = self.hrr_prefix.take() {
@@ -555,16 +560,14 @@ impl ServerHandshake {
             }
         }
 
-        let mut seed = Zeroizing::new([0u8; 32]);
-        fill_random(&mut *seed);
-        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
+        let kx = new_key_exchange(group)?;
         let shared = Zeroizing::new(
             kx.shared_secret(&client_pub)
                 .ok_or(TlsError::IllegalParameter)?,
         );
         let mut sh_extensions = vec![
             Extension::supported_versions_server(TLS13),
-            Extension::key_share_server(X25519, &kx.public_bytes()),
+            Extension::key_share_server(group, &kx.public_bytes()),
         ];
         if resumed {
             sh_extensions.push(Extension::pre_shared_key_server(0));
@@ -711,7 +714,7 @@ impl ServerHandshake {
         let cv = CertificateVerify::parse(&msg.body)?;
         let certificate = self.client_cert.as_ref().ok_or(TlsError::Internal)?;
         let cv_content = certificate_verify_content(&th_before_cv, false);
-        certificate.verify_tls_signature(cv.algorithm, &cv_content, &cv.signature)?;
+        cv.verify_tls13(certificate, &REQUESTED_SIGNATURE_SCHEMES, &cv_content)?;
         transcript.update(&msg.encode());
         self.state = SState::ExpectClientFinished;
         Ok(())
@@ -869,6 +872,8 @@ pub struct ClientHandshake {
     cfg: ClientConfig,
     /** @brief 키를 주고받는 곳. */
     kx: KeyExchange,
+    /** @brief 마지막 인사말에서 키 조각을 보낸 곡선. 보내지 않았으면 없다. */
+    share_group: Option<u16>,
     /**
      * @brief 서버 인사말 앞까지의 핸드셰이크 기록.
      * @details 다시 시도 요청을 받은 뒤에는 첫 인사말의 해시, 그 요청, 두 번째 인사말을 담는다.
@@ -878,6 +883,8 @@ pub struct ClientHandshake {
     hello: ClientHello,
     /** @brief 받은 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
+    /** @brief 받을 수준이 바뀔 때 앞 수준의 바이트가 남았는지. 새 수준으로 이어 읽을 수 없다. */
+    stranded_input: bool,
     /** @brief 지금 어느 단계인지. */
     state: CState,
     /** @brief 핸드셰이크 메시지 흐름에서 어디까지 왔는지. */
@@ -897,8 +904,8 @@ pub struct ClientHandshake {
     /** @brief 서버가 보낸 리프 인증서. */
     leaf_cert: Option<X509>,
 
-    /** @brief 서버가 이쪽 인증서를 요구했는지. */
-    cert_requested: bool,
+    /** @brief 서버가 이쪽 인증서를 요구하며 받겠다고 한 서명 방식. 요구하지 않았으면 없다. */
+    requested_schemes: Option<Vec<u16>>,
 
     /** @brief 인증서 소유 증명을 이미 봤는지. */
     seen_cert_verify: bool,
@@ -952,19 +959,16 @@ impl ClientHandshake {
         if !client_config_wire_is_valid(&cfg) || local_transport_params.len() > u16::MAX as usize {
             return Err(TlsError::Internal);
         }
-        let mut seed = Zeroizing::new([0u8; 32]);
-        fill_random(&mut *seed);
-        let kx = KeyExchange::from_seed(X25519, &*seed).ok_or(TlsError::Internal)?;
+        let kx = new_key_exchange(X25519)?;
+        let share_group = cfg.send_key_share.then(|| kx.group());
         let session = cfg
             .session
             .clone()
             .filter(|s| s.is_fresh(crate::session::now_ms()) && suite_params(s.suite).is_some());
 
-        let key_shares: Vec<(u16, Vec<u8>)> = if cfg.send_key_share {
-            vec![(X25519, kx.public_bytes())]
-        } else {
-            vec![]
-        };
+        let key_shares: Vec<(u16, Vec<u8>)> = share_group
+            .map(|group| vec![(group, kx.public_bytes())])
+            .unwrap_or_default();
         let mut extensions = vec![
             Extension::supported_versions_client(&[TLS13]),
             Extension::supported_groups(&[X25519]),
@@ -1050,10 +1054,12 @@ impl ClientHandshake {
         Ok(Self {
             cfg,
             kx,
+            share_group,
             out_initial: ch_wire.clone(),
             ch_wire,
             hello: ch,
             hr: HandshakeReader::new(),
+            stranded_input: false,
             state: CState::ExpectServerHello,
             flight_state: CFlightState::EncryptedExtensions,
             transcript: None,
@@ -1063,7 +1069,7 @@ impl ClientHandshake {
             client_hs_secret: Vec::new(),
             server_hs_secret: Vec::new(),
             leaf_cert: None,
-            cert_requested: false,
+            requested_schemes: None,
             seen_cert_verify: false,
             psk_session: session,
             psk_accepted: false,
@@ -1081,24 +1087,51 @@ impl ClientHandshake {
         })
     }
 
-    /** @brief 이 단계에서 받은 핸드셰이크 바이트를 넣는다. */
-    pub fn provide(&mut self, _level: Level, data: &[u8]) -> Result<(), TlsError> {
+    /**
+     * @brief 받은 핸드셰이크 바이트를 넣어 상태를 진행시킨다.
+     * @param level 그 데이터가 실려 온 암호화 수준.
+     * @details 서버 쪽 provide 와 같은 규칙을 따른다. 받을 수준을 바꾸는 메시지 뒤에 남은 바이트는
+     *          처리하지 않고 두며, 부른 쪽이 has_unconsumed_input 으로 확인해 연결을 끊는다.
+     * @retval TlsError::UnexpectedMessage 지금 받을 수준이 아닌 데이터이거나, 앞 수준에 남은
+     *         바이트가 있다.
+     */
+    pub fn provide(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
+        if self.stranded_input || level != self.receive_level() {
+            return Err(TlsError::UnexpectedMessage);
+        }
         self.hr.feed(data);
-        loop {
-            let msg = match self.hr.next_message()? {
-                Some(m) => m,
-                None => return Ok(()),
-            };
+        while let Some(msg) = self.hr.next_message()? {
             match self.state {
                 CState::ExpectServerHello => self.on_server_hello(&msg)?,
                 CState::ExpectFlight => self.on_flight_msg(&msg)?,
                 CState::Done => self.on_post_handshake(&msg)?,
             }
+            if self.receive_level() != level {
+                self.stranded_input = self.hr.has_pending();
+                break;
+            }
         }
+        Ok(())
+    }
+
+    /** @brief 지금 핸드셰이크 메시지를 받을 암호화 수준. */
+    pub fn receive_level(&self) -> Level {
+        match self.state {
+            CState::ExpectServerHello => Level::Initial,
+            CState::ExpectFlight => Level::Handshake,
+            CState::Done => Level::Application,
+        }
+    }
+
+    /** @brief 받았지만 아직 메시지로 처리하지 않은 바이트가 있는지. */
+    pub fn has_unconsumed_input(&self) -> bool {
+        self.hr.has_pending()
     }
 
     /**
      * @brief 다시 시도 요청을 처리한다.
+     * @details 요청이 곡선을 고르면 그 곡선의 새 키 조각을 보내고, 쿠키만 담았으면 앞의 키 조각을
+     *          그대로 두고 쿠키만 더한다. 해시가 고른 스위트와 다른 재개 제안은 뺀다.
      * @warning 한 번만 받는다. 두 번째가 오면 거부한다. 무한히 다시 시도시키는 것을 막는다.
      *          기록도 규격대로 해시로 바꾼다.
      */
@@ -1106,7 +1139,7 @@ impl ClientHandshake {
         if self.hrr_done {
             return Err(TlsError::UnexpectedMessage);
         }
-        sh.validate_retry_request(&self.hello)?;
+        let retry_group = sh.validate_retry_request(&self.hello)?;
         let cookie = match sh.ext(EXT_COOKIE) {
             Some(extension) => Some(extension.as_cookie().ok_or(TlsError::Decode)?),
             None => None,
@@ -1125,17 +1158,22 @@ impl ClientHandshake {
         if self
             .psk_session
             .as_ref()
-            .is_some_and(|session| session.suite != sh.cipher_suite)
+            .is_some_and(|session| session.hash() != Some(hash))
         {
             self.psk_session = None;
         }
+        if let Some(group) = retry_group {
+            self.kx = new_key_exchange(group)?;
+            self.share_group = Some(group);
+        }
+        let key_shares: Vec<(u16, Vec<u8>)> = self
+            .share_group
+            .map(|group| vec![(group, self.kx.public_bytes())])
+            .unwrap_or_default();
         let mut extensions = Vec::with_capacity(first_ch.extensions.len() + 1);
         for extension in &first_ch.extensions {
             match extension.ext_type {
-                EXT_KEY_SHARE => extensions.push(Extension::key_share_client(&[(
-                    X25519,
-                    self.kx.public_bytes(),
-                )])),
+                EXT_KEY_SHARE => extensions.push(Extension::key_share_client(&key_shares)),
                 EXT_EARLY_DATA | EXT_COOKIE | EXT_PRE_SHARED_KEY => {}
                 _ => extensions.push(extension.clone()),
             }
@@ -1198,7 +1236,7 @@ impl ClientHandshake {
             return Err(TlsError::IllegalParameter);
         }
         let (hash, _key_len) = suite_params(suite).ok_or(TlsError::IllegalParameter)?;
-        let server_pub = sh.x25519_key_share()?;
+        let server_pub = sh.key_share(self.share_group)?;
         let shared = Zeroizing::new(
             self.kx
                 .shared_secret(&server_pub)
@@ -1215,7 +1253,7 @@ impl ClientHandshake {
                     .psk_session
                     .as_ref()
                     .ok_or(TlsError::UnsupportedExtension)?;
-                if selected != 0 || session.suite != suite {
+                if selected != 0 || session.hash() != Some(hash) {
                     return Err(TlsError::IllegalParameter);
                 }
                 true
@@ -1298,6 +1336,20 @@ impl ClientHandshake {
                         _ => return Err(TlsError::UnsupportedExtension),
                     }
                 }
+                if !self.cfg.alpn.is_empty() && self.alpn.is_none() {
+                    return Err(TlsError::NoApplicationProtocol);
+                }
+                /*
+                 * 재개한 세션은 처음 맺을 때와 같은 응용 프로토콜이어야 한다. 조기 데이터는
+                 * RFC 8446 대로 티켓과 같은 스위트로 재개할 때만 받아들여질 수 있다.
+                 */
+                let session = self.psk_session.as_ref().filter(|_| self.psk_accepted);
+                if session.is_some_and(|session| session.alpn != self.alpn)
+                    || (self.early_accepted
+                        && session.is_none_or(|session| session.suite != self.suite))
+                {
+                    return Err(TlsError::IllegalParameter);
+                }
                 self.peer_tp = Some(peer_tp.ok_or(TlsError::MissingExtension)?);
                 self.flight_state = if self.psk_accepted {
                     CFlightState::Finished
@@ -1311,8 +1363,8 @@ impl ClientHandshake {
                 if self.flight_state != CFlightState::CertificateOrRequest {
                     return Err(TlsError::UnexpectedMessage);
                 }
-                crate::cert::CertificateRequestMsg::parse(&msg.body)?;
-                self.cert_requested = true;
+                let request = crate::cert::CertificateRequestMsg::parse(&msg.body)?;
+                self.requested_schemes = Some(request.handshake_signature_algorithms()?);
                 self.flight_state = CFlightState::Certificate;
                 transcript.update(&msg.encode());
                 Ok(())
@@ -1365,7 +1417,7 @@ impl ClientHandshake {
                 let cv = CertificateVerify::parse(&msg.body)?;
                 let certificate = self.leaf_cert.as_ref().ok_or(TlsError::Internal)?;
                 let cv_content = certificate_verify_content(&th_before_cv, true);
-                certificate.verify_tls_signature(cv.algorithm, &cv_content, &cv.signature)?;
+                cv.verify_tls13(certificate, &self.hello.signature_algorithms(), &cv_content)?;
                 self.seen_cert_verify = true;
                 self.flight_state = CFlightState::Finished;
                 transcript.update(&msg.encode());
@@ -1382,11 +1434,18 @@ impl ClientHandshake {
                 transcript.update(&msg.encode());
                 let th_after = transcript.hash();
 
-                if self.cert_requested {
-                    let entries: Vec<CertEntry> = self
+                if let Some(requested) = &self.requested_schemes {
+                    /*
+                     * 서버가 받지 않는 서명 방식의 키라면 인증서를 보내지 않고 빈 Certificate 로
+                     * 답한다. RFC 8446 은 알맞은 인증서가 없는 클라이언트에 이렇게 하게 하고,
+                     * 계속할지는 서버가 정한다.
+                     */
+                    let client_cert = self
                         .cfg
                         .client_cert
                         .as_ref()
+                        .filter(|cc| tls13_signature_scheme_allowed(cc.sign_scheme, requested));
+                    let entries: Vec<CertEntry> = client_cert
                         .map(|cc| {
                             cc.chain
                                 .iter()
@@ -1397,7 +1456,6 @@ impl ClientHandshake {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let has_cert = !entries.is_empty();
                     let cmsg = CertificateMsg {
                         request_context: vec![],
                         entries,
@@ -1405,8 +1463,7 @@ impl ClientHandshake {
                     let cert_hs = HandshakeMsg::new(HandshakeType::Certificate, cmsg.encode());
                     self.out_handshake.extend_from_slice(&cert_hs.encode());
                     transcript.update(&cert_hs.encode());
-                    if has_cert {
-                        let cc = self.cfg.client_cert.as_ref().ok_or(TlsError::Internal)?;
+                    if let Some(cc) = client_cert {
                         let content = certificate_verify_content(&transcript.hash(), false);
                         let cv = CertificateVerify {
                             algorithm: cc.sign_scheme,
@@ -1765,9 +1822,8 @@ mod tests {
 
     #[test]
     /**
-     * @brief QUIC 서버도 형식이 깨진 인사말과 이쪽 서명 방식을 제안하지 않은 인사말에는 다시
-     *        시도 요청을 포함해 아무것도 내지 않는지. 재개를 제안했으면 서명 방식이 없어도
-     *        다시 시도를 요청한다.
+     * @brief QUIC 서버가 형식이 깨진 인사말에는 다시 시도 요청을 포함해 아무것도 내지 않는지.
+     * @details 서명 방식 목록에 이쪽 방식이 없는 인사말에는 RFC 8446 대로 가진 인증서로 답한다.
      */
     fn quic_server_answers_only_acceptable_client_hellos() {
         let client_cfg = ClientConfig {
@@ -1823,8 +1879,8 @@ mod tests {
         };
         assert_eq!(
             answer(&other_schemes(&hello)),
-            (false, false),
-            "이쪽 서명 방식을 제안하지 않았으면 답하지 않아야 한다"
+            (true, true),
+            "이쪽 서명 방식이 목록에 없어도 가진 인증서로 답해야 한다"
         );
 
         let mut empty_shares = hello;
@@ -1841,18 +1897,8 @@ mod tests {
         );
         assert_eq!(
             answer(&other_schemes(&empty_shares)),
-            (false, false),
-            "다시 시도해도 이쪽 서명 방식이 없으면 다시 시도 요청을 보내지 않아야 한다"
-        );
-
-        let mut resuming = other_schemes(&empty_shares);
-        resuming
-            .extensions
-            .push(Extension::pre_shared_key_client(b"ticket", 0, 32));
-        assert_eq!(
-            answer(&resuming),
             (true, true),
-            "재개를 제안했으면 재개로 마칠 수 있으므로 다시 시도를 요청해야 한다"
+            "서명 방식 목록과 무관하게 다시 시도를 요청해야 한다"
         );
     }
 
@@ -2097,39 +2143,52 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프로토콜이 안 맞으면 합의되지 않는지. */
-    fn quic_engine_alpn_mismatch_yields_none() {
-        let mut server = ServerHandshake::new(
-            Arc::new(make_server_cfg(vec![b"h3".to_vec()])),
-            b"s".to_vec(),
-        );
-        let client_cfg = ClientConfig {
-            server_name: "localhost".to_string(),
-            verify_name: true,
-            roots: None,
-            insecure_verifier: Some(
-                crate::conn::InsecureVerifier::dangerously_disable_certificate_verification(),
-            ),
-            alpn: vec![b"doq".to_vec()],
-            ..Default::default()
+    /**
+     * @brief 응용 프로토콜을 합의하지 못하면 no_application_protocol 로 끝나는지.
+     * @details RFC 9001 은 QUIC 에서 ALPN 협상을 필수로 정한다. 서버는 겹치는 프로토콜이 없거나
+     *          클라이언트가 ALPN 을 보내지 않았을 때, 클라이언트는 서버가 고르지 않았을 때 끝낸다.
+     */
+    fn quic_engine_alpn_mismatch_is_no_application_protocol() {
+        let client_hello = |alpn: Vec<Vec<u8>>| {
+            let cfg = ClientConfig {
+                server_name: "localhost".to_string(),
+                alpn,
+                ..insecure_test_client()
+            };
+            let mut client = ClientHandshake::new(cfg, b"c".to_vec()).unwrap();
+            let (level, hello) = client.take_crypto().remove(0);
+            assert_eq!(level, Level::Initial);
+            (client, hello)
         };
-        let mut client = ClientHandshake::new(client_cfg, b"c".to_vec()).unwrap();
+        let server = |alpn: Vec<Vec<u8>>| {
+            ServerHandshake::new(Arc::new(make_server_cfg(alpn)), b"s".to_vec())
+        };
 
-        let mut c_out = client.take_crypto();
-        for (lvl, d) in c_out.drain(..) {
-            server.provide(lvl, &d).unwrap();
-        }
-        let mut s_out = server.take_crypto();
-        for (lvl, d) in s_out.drain(..) {
-            client.provide(lvl, &d).unwrap();
-        }
-        let mut c_fin = client.take_crypto();
-        for (lvl, d) in c_fin.drain(..) {
-            server.provide(lvl, &d).unwrap();
-        }
-        assert!(server.is_complete() && client.is_complete());
-        assert_eq!(server.alpn(), None);
-        assert_eq!(client.alpn(), None);
+        let (_, hello) = client_hello(vec![b"doq".to_vec()]);
+        assert_eq!(
+            server(vec![b"h3".to_vec()]).provide(Level::Initial, &hello),
+            Err(TlsError::NoApplicationProtocol),
+            "겹치는 프로토콜이 없다"
+        );
+        let (_, hello) = client_hello(Vec::new());
+        assert_eq!(
+            server(vec![b"doq".to_vec()]).provide(Level::Initial, &hello),
+            Err(TlsError::NoApplicationProtocol),
+            "클라이언트가 ALPN 을 보내지 않았다"
+        );
+
+        let (mut client, hello) = client_hello(vec![b"doq".to_vec()]);
+        let mut silent_server = server(Vec::new());
+        silent_server.provide(Level::Initial, &hello).unwrap();
+        let result = silent_server
+            .take_crypto()
+            .into_iter()
+            .try_for_each(|(level, data)| client.provide(level, &data));
+        assert_eq!(
+            result,
+            Err(TlsError::NoApplicationProtocol),
+            "서버가 프로토콜을 고르지 않았다"
+        );
     }
 
     #[test]
@@ -2638,5 +2697,612 @@ mod tests {
             .find(|p| p.level == Level::Application)
             .unwrap();
         assert_eq!(s_app, c_app, "HRR 후에도 app 시크릿 일치");
+    }
+
+    /** @brief 핸드셰이크 바이트에 든 메시지를 하나씩 고쳐 다시 잇는다. */
+    fn rewrite_messages(data: &[u8], edit: &dyn Fn(&mut HandshakeMsg)) -> Vec<u8> {
+        let mut reader = HandshakeReader::new();
+        reader.feed(data);
+        let mut out = Vec::new();
+        while let Some(mut message) = reader.next_message().unwrap() {
+            edit(&mut message);
+            out.extend_from_slice(&message.encode());
+        }
+        assert!(!reader.has_pending());
+        out
+    }
+
+    /** @brief 테스트용 클라이언트. 응용 프로토콜 목록만 정한다. */
+    fn test_client(alpn: &[&[u8]]) -> ClientHandshake {
+        let cfg = ClientConfig {
+            server_name: "localhost".to_string(),
+            alpn: alpn.iter().map(|protocol| protocol.to_vec()).collect(),
+            ..insecure_test_client()
+        };
+        ClientHandshake::new(cfg, b"ctp".to_vec()).unwrap()
+    }
+
+    #[test]
+    /**
+     * @brief 엔진이 지금 받을 암호화 수준이 아닌 데이터와, 받을 수준이 바뀐 뒤에 남은 바이트를
+     *        unexpected_message 로 거부하는지.
+     * @details 받을 수준을 바꾸는 메시지 뒤에 바이트가 남으면 provide 는 그 메시지까지만 처리하고
+     *          has_unconsumed_input 으로 알린다. RFC 9001 이 정한 PROTOCOL_VIOLATION 으로 연결을
+     *          끊는 일은 QUIC 계층이 한다.
+     */
+    fn quic_engine_takes_handshake_data_only_at_the_receive_level() {
+        let cfg = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
+        let pair = || {
+            (
+                test_client(&[b"doq"]),
+                ServerHandshake::new(Arc::clone(&cfg), b"stp".to_vec()),
+            )
+        };
+
+        let (mut client, mut server) = pair();
+        let hello = client.take_crypto().remove(0).1;
+        assert_eq!(server.receive_level(), Level::Initial);
+        assert_eq!(
+            server.provide(Level::Handshake, &hello),
+            Err(TlsError::UnexpectedMessage),
+            "Handshake 수준으로 온 ClientHello"
+        );
+        assert!(server.take_crypto().is_empty());
+        server.provide(Level::Initial, &hello).unwrap();
+        assert_eq!(server.receive_level(), Level::Handshake);
+        let flight = server.take_crypto();
+        assert_eq!(client.receive_level(), Level::Initial);
+        assert_eq!(
+            client.provide(Level::Handshake, &flight[0].1),
+            Err(TlsError::UnexpectedMessage),
+            "Handshake 수준으로 온 ServerHello"
+        );
+        client.provide(Level::Initial, &flight[0].1).unwrap();
+        assert_eq!(client.receive_level(), Level::Handshake);
+        assert_eq!(
+            client.provide(Level::Initial, &flight[1].1),
+            Err(TlsError::UnexpectedMessage),
+            "Initial 수준으로 온 암호화된 확장"
+        );
+        client.provide(Level::Handshake, &flight[1].1).unwrap();
+        assert_eq!(client.receive_level(), Level::Application);
+        for (level, data) in client.take_crypto() {
+            server.provide(level, &data).unwrap();
+        }
+        assert!(server.is_complete() && client.is_complete());
+        assert_eq!(server.receive_level(), Level::Application);
+        assert!(!server.has_unconsumed_input() && !client.has_unconsumed_input());
+
+        let (mut client, mut server) = pair();
+        let hello = client.take_crypto().remove(0).1;
+        assert_eq!(
+            server.provide(Level::Initial, &[hello.as_slice(), &[20, 0]].concat()),
+            Ok(())
+        );
+        assert!(
+            server.has_unconsumed_input(),
+            "ClientHello 뒤에 남은 바이트를 알려야 한다"
+        );
+        assert_eq!(
+            server.provide(Level::Handshake, &[]),
+            Err(TlsError::UnexpectedMessage),
+            "앞 수준에 바이트가 남은 뒤에는 더 받지 않는다"
+        );
+
+        let (mut client, mut server) = pair();
+        for (level, data) in client.take_crypto() {
+            server.provide(level, &data).unwrap();
+        }
+        let flight = server.take_crypto();
+        let spanning = [flight[0].1.as_slice(), &flight[1].1[..2]].concat();
+        assert_eq!(client.provide(Level::Initial, &spanning), Ok(()));
+        assert!(
+            client.has_unconsumed_input(),
+            "ServerHello 뒤에 남은 바이트를 알려야 한다"
+        );
+        assert_eq!(
+            client.provide(Level::Handshake, &flight[1].1[2..]),
+            Err(TlsError::UnexpectedMessage)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 엔진 클라이언트가 쿠키만 담은 다시 시도 요청에는 첫 키 조각과 쿠키로 답하고, 제안하지
+     *        않은 곡선을 고른 요청은 illegal_parameter 로 거부하는지.
+     */
+    fn quic_engine_client_handles_cookie_only_and_unoffered_group_retries() {
+        let retry = |extension: Extension| {
+            ServerHello {
+                legacy_version: TLS12,
+                random: crate::msg::HRR_RANDOM,
+                session_id_echo: Vec::new(),
+                cipher_suite: TLS_AES_128_GCM_SHA256,
+                extensions: vec![Extension::supported_versions_server(TLS13), extension],
+            }
+            .to_handshake()
+            .encode()
+        };
+        let hello_in = |flight: Vec<(Level, Vec<u8>)>| {
+            assert_eq!(flight.len(), 1);
+            assert_eq!(flight[0].0, Level::Initial);
+            let message = HandshakeMsg::parse(&flight[0].1).unwrap().unwrap().0;
+            ClientHello::from_handshake(&message).unwrap()
+        };
+
+        let mut client = test_client(&[b"doq"]);
+        let first = hello_in(client.take_crypto());
+        client
+            .provide(Level::Initial, &retry(Extension::cookie(b"retry-cookie")))
+            .unwrap();
+        let second = hello_in(client.take_crypto());
+        assert!(second.is_valid_retry_of(&first));
+        assert_eq!(
+            second.ext(EXT_KEY_SHARE),
+            first.ext(EXT_KEY_SHARE),
+            "쿠키만 담은 요청에는 첫 키 조각을 그대로 보낸다"
+        );
+        assert_eq!(
+            second.ext(EXT_COOKIE).and_then(Extension::as_cookie),
+            Some(b"retry-cookie".to_vec())
+        );
+        assert_eq!(client.receive_level(), Level::Initial);
+
+        assert_eq!(
+            test_client(&[b"doq"])
+                .provide(Level::Initial, &retry(Extension::key_share_hrr(SECP256R1))),
+            Err(TlsError::IllegalParameter),
+            "엔진 클라이언트는 P-256 을 제안하지 않는다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 엔진 서버가 P-256 키 교환을 받아들이고, P-256 으로 다시 시도를 요청했으면 그 곡선의
+     *        조각 하나만 받는지.
+     * @details RFC 8446 은 secp256r1 키 교환을 반드시 지원하게 한다. 인사말은 엔진 클라이언트가
+     *          만든 것에서 지원 곡선과 키 조각만 바꾼다.
+     */
+    fn quic_engine_server_negotiates_p256_key_exchange() {
+        let p256 = KeyExchange::from_seed(SECP256R1, &[0x32; 32]).unwrap();
+        let x25519 = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
+        let share = |kx: &KeyExchange| (kx.group(), kx.public_bytes());
+        let original = test_client(&[b"doq"]).take_crypto().remove(0).1;
+        let hello = |shares: Vec<(u16, Vec<u8>)>, cookie: Option<Vec<u8>>| {
+            rewrite_messages(&original, &|message| {
+                let mut ch = ClientHello::from_handshake(message).unwrap();
+                for extension in &mut ch.extensions {
+                    match extension.ext_type {
+                        EXT_KEY_SHARE => *extension = Extension::key_share_client(&shares),
+                        EXT_SUPPORTED_GROUPS => {
+                            *extension = Extension::supported_groups(&[SECP256R1])
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(cookie) = &cookie {
+                    ch.extensions.push(Extension::cookie(cookie));
+                }
+                *message = ch.to_handshake();
+            })
+        };
+        let new_server = || {
+            ServerHandshake::new(
+                Arc::new(make_server_cfg(vec![b"doq".to_vec()])),
+                b"stp".to_vec(),
+            )
+        };
+        let server_hello = |server: &mut ServerHandshake| {
+            let flight = server.take_crypto();
+            assert_eq!(flight[0].0, Level::Initial);
+            let message = HandshakeMsg::parse(&flight[0].1).unwrap().unwrap().0;
+            ServerHello::from_handshake(&message).unwrap()
+        };
+        let agreed = |reply: &ServerHello, kx: &KeyExchange| {
+            let (group, public) = reply
+                .ext(EXT_KEY_SHARE)
+                .and_then(Extension::as_key_share_server)
+                .unwrap();
+            reply.random != crate::msg::HRR_RANDOM
+                && group == kx.group()
+                && kx.shared_secret(&public).is_some()
+        };
+
+        let mut server = new_server();
+        server
+            .provide(Level::Initial, &hello(vec![share(&p256)], None))
+            .unwrap();
+        assert!(
+            agreed(&server_hello(&mut server), &p256),
+            "P-256 조각만 보낸 인사말에는 P-256 으로 답해야 한다"
+        );
+
+        for (retry_share, expected) in [
+            (share(&p256), Ok(())),
+            (share(&x25519), Err(TlsError::IllegalParameter)),
+        ] {
+            let group = retry_share.0;
+            let mut server = new_server();
+            server
+                .provide(Level::Initial, &hello(Vec::new(), None))
+                .unwrap();
+            let retry = server_hello(&mut server);
+            assert_eq!(retry.random, crate::msg::HRR_RANDOM);
+            assert_eq!(
+                retry
+                    .ext(EXT_KEY_SHARE)
+                    .and_then(Extension::as_key_share_hrr),
+                Some(SECP256R1)
+            );
+            let cookie = retry.ext(EXT_COOKIE).and_then(Extension::as_cookie);
+            assert_eq!(
+                server.provide(Level::Initial, &hello(vec![retry_share], cookie)),
+                expected,
+                "재시도 인사말의 조각 곡선 {group:#06x}"
+            );
+            if expected.is_ok() {
+                assert!(agreed(&server_hello(&mut server), &p256));
+            }
+        }
+    }
+
+    /** @brief 테스트 티켓의 재개 비밀. */
+    const TEST_TICKET_PSK: [u8; 32] = [0x44; 32];
+
+    /**
+     * @brief 서버 설정과 그 서버가 받아들일 세션을 함께 만든다.
+     * @param ticket_suite 티켓을 발급한 스위트.
+     * @param known 거짓이면 다른 키로 봉한 티켓이라 서버가 열지 못한다.
+     */
+    fn resumable_pair(
+        ticket_suite: u16,
+        known: bool,
+    ) -> (ServerConfig, crate::session::TlsSession) {
+        use crate::conn::ServerResumption;
+        use crate::session::{ResumptionState, Ticketer};
+
+        let now = crate::session::now_ms();
+        let age_add = 0x0102_0304;
+        let lifetime_secs = 60;
+        let max_early_data = 0xffff_ffff;
+        let ticketer = Arc::new(Ticketer::from_key([0x5c; 32]));
+        let sealing = if known {
+            Arc::clone(&ticketer)
+        } else {
+            Arc::new(Ticketer::from_key([0x5d; 32]))
+        };
+        let ticket = sealing
+            .seal(&ResumptionState {
+                server_name: Some("localhost".to_string()),
+                suite: ticket_suite,
+                psk: TEST_TICKET_PSK.to_vec(),
+                alpn: Some(b"doq".to_vec()),
+                issued_ms: now,
+                age_add,
+                lifetime_secs,
+                max_early_data,
+            })
+            .unwrap();
+        let server = make_server_cfg(vec![b"doq".to_vec()]).with_resumption(ServerResumption {
+            ticketer,
+            lifetime_secs,
+            max_early_data,
+        });
+        let session = crate::session::TlsSession {
+            server_name: "localhost".to_string(),
+            suite: ticket_suite,
+            psk: TEST_TICKET_PSK.to_vec(),
+            ticket,
+            lifetime_secs,
+            age_add,
+            max_early_data,
+            alpn: Some(b"doq".to_vec()),
+            server_transport_params: b"stp".to_vec(),
+            obtained_at_ms: now,
+        };
+        (server, session)
+    }
+
+    /** @brief 세션을 제시하며 조기 데이터를 제안하는 클라이언트. */
+    fn resuming_client(session: crate::session::TlsSession, alpn: &[&[u8]]) -> ClientHandshake {
+        let cfg = ClientConfig {
+            server_name: "localhost".to_string(),
+            alpn: alpn.iter().map(|protocol| protocol.to_vec()).collect(),
+            session: Some(session),
+            enable_early_data: true,
+            ..insecure_test_client()
+        };
+        ClientHandshake::new(cfg, b"ctp".to_vec()).unwrap()
+    }
+
+    #[test]
+    /**
+     * @brief 엔진이 티켓과 해시가 같은 다른 스위트로 재개하고, 조기 데이터는 티켓과 같은
+     *        스위트일 때만 받아들이는지.
+     * @details 서버는 자기 선호대로 AES-128 을 고르므로 ChaCha20 티켓으로 재개해도 스위트가
+     *          바뀐다. RFC 8446 은 해시가 같으면 재개를 허용하고, 조기 데이터는 같은 스위트에서만
+     *          허용한다.
+     */
+    fn quic_engine_resumes_across_suites_of_the_same_hash() {
+        for (ticket_suite, early) in [
+            (TLS_CHACHA20_POLY1305_SHA256, false),
+            (TLS_AES_128_GCM_SHA256, true),
+        ] {
+            let (server_cfg, session) = resumable_pair(ticket_suite, true);
+            let mut server = ServerHandshake::new(Arc::new(server_cfg), b"stp".to_vec());
+            let mut client = resuming_client(session, &[b"doq"]);
+            let (server_secrets, client_secrets, _) = run_handshake(&mut server, &mut client);
+            let case = format!("티켓 {ticket_suite:#06x}");
+            assert!(server.is_complete() && client.is_complete(), "{case}");
+            assert!(server.is_resumed() && client.is_resumed(), "{case}");
+            assert_eq!(server.early_data_accepted(), early, "{case}");
+            assert_eq!(client.early_data_accepted(), early, "{case}");
+            let application = |secrets: &[SecretPair]| {
+                secrets
+                    .iter()
+                    .find(|pair| pair.level == Level::Application)
+                    .map(|pair| (pair.client.suite, pair.client.secret.clone()))
+            };
+            assert_eq!(
+                application(&server_secrets),
+                application(&client_secrets),
+                "{case}"
+            );
+            assert_eq!(
+                application(&server_secrets).map(|(suite, _)| suite),
+                Some(TLS_AES_128_GCM_SHA256),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 서버가 재개하면서 다른 응용 프로토콜을 고르거나, 티켓과 같은 스위트로 재개하지
+     *        않았는데 조기 데이터를 받았다고 하면 클라이언트가 illegal_parameter 로 끊는지.
+     */
+    fn quic_engine_client_checks_resumed_alpn_and_early_data_suite() {
+        let reply = |ticket_suite: u16, known: bool, edit: &dyn Fn(&mut Vec<Extension>)| {
+            let (server_cfg, session) = resumable_pair(ticket_suite, known);
+            let mut server = ServerHandshake::new(Arc::new(server_cfg), b"stp".to_vec());
+            let mut client = resuming_client(session, &[b"doq", b"h3"]);
+            for (level, data) in client.take_crypto() {
+                server.provide(level, &data).unwrap();
+            }
+            let flight = server.take_crypto();
+            client.provide(flight[0].0, &flight[0].1).unwrap();
+            let edited = rewrite_messages(&flight[1].1, &|message| {
+                if message.msg_type == HandshakeType::EncryptedExtensions {
+                    let mut extensions = parse_ee_extensions(&message.body).unwrap();
+                    edit(&mut extensions);
+                    let mut body = Writer::new();
+                    body.vec16(|w| {
+                        extensions
+                            .iter()
+                            .for_each(|extension| extension.encode_into(w))
+                    });
+                    message.body = body.buf;
+                }
+            });
+            client.provide(Level::Handshake, &edited)
+        };
+        let other_protocol = |extensions: &mut Vec<Extension>| {
+            for extension in extensions.iter_mut() {
+                if extension.ext_type == EXT_ALPN {
+                    *extension = Extension::alpn(&[b"h3".as_slice()]);
+                }
+            }
+        };
+        let accept_early_data = |extensions: &mut Vec<Extension>| {
+            extensions.push(Extension::early_data());
+        };
+
+        assert_eq!(
+            reply(TLS_AES_128_GCM_SHA256, true, &|_| {}),
+            Ok(()),
+            "고치지 않은 응답은 받아들여야 한다"
+        );
+        assert_eq!(
+            reply(TLS_AES_128_GCM_SHA256, true, &other_protocol),
+            Err(TlsError::IllegalParameter),
+            "재개하면서 티켓과 다른 응용 프로토콜을 골랐다"
+        );
+        assert_eq!(
+            reply(TLS_CHACHA20_POLY1305_SHA256, true, &accept_early_data),
+            Err(TlsError::IllegalParameter),
+            "티켓과 다른 스위트로 재개하면서 조기 데이터를 받았다고 했다"
+        );
+        assert_eq!(
+            reply(TLS_AES_128_GCM_SHA256, false, &accept_early_data),
+            Err(TlsError::IllegalParameter),
+            "재개하지 않으면서 조기 데이터를 받았다고 했다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 엔진 클라이언트가 RSA 서버의 CertificateVerify 중 RSA PKCS#1 이나 제안하지 않은
+     *        방식의 서명을 illegal_parameter 로 거부하고, 제안한 PSS 서명은 받아들이는지.
+     * @details 서명 자체는 모두 맞다. 키 종류가 맞는 방식이라 서명 방식 검사만 이를 거부한다.
+     *          엔진 클라이언트는 RSA PSS 중 SHA-256 만 제안한다.
+     */
+    fn quic_engine_client_accepts_only_certificate_verify_schemes_rfc_8446_allows() {
+        let (certificate, key) = crate::cert::rsa_test_certificate("localhost");
+        for (scheme, expected) in [
+            (RSA_PSS_RSAE_SHA256, Ok(())),
+            (RSA_PKCS1_SHA256, Err(TlsError::IllegalParameter)),
+            (RSA_PSS_RSAE_SHA384, Err(TlsError::IllegalParameter)),
+        ] {
+            let cfg = ServerConfig {
+                cert_chain: vec![certificate.clone()],
+                sign_scheme: scheme,
+                sign: crate::cert::rsa_test_signer(key.clone(), scheme),
+                alpn: vec![b"doq".to_vec()],
+                client_ca: None,
+                resumption: None,
+            };
+            let mut server = ServerHandshake::new(Arc::new(cfg), b"stp".to_vec());
+            let mut client = test_client(&[b"doq"]);
+            for (level, data) in client.take_crypto() {
+                server.provide(level, &data).unwrap();
+            }
+            let result = server
+                .take_crypto()
+                .into_iter()
+                .try_for_each(|(level, data)| client.provide(level, &data));
+            assert_eq!(result, expected, "서명 방식 {scheme:#06x}");
+            assert_eq!(
+                client.is_complete(),
+                expected.is_ok(),
+                "서명 방식 {scheme:#06x}"
+            );
+        }
+    }
+
+    /** @brief 클라이언트 인증서를 요구하는 서버 설정과, 그 CA 가 발급한 클라이언트 인증서. */
+    fn mtls_pair() -> (ServerConfig, crate::conn::ClientCert) {
+        use crate::trust::TrustStore;
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["client.example".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let server = ServerConfig {
+            client_ca: Some(TrustStore::from_ders([ca_cert.der().as_ref()])),
+            ..make_server_cfg(vec![b"doq".to_vec()])
+        };
+        let client_cert = crate::conn::ClientCert::from_pkcs8(
+            vec![leaf_cert.der().to_vec()],
+            &leaf_key.serialize_der(),
+        )
+        .unwrap();
+        (server, client_cert)
+    }
+
+    /** @brief 클라이언트 인증서를 가진 테스트용 클라이언트. */
+    fn mtls_client(client_cert: crate::conn::ClientCert) -> ClientHandshake {
+        let cfg = ClientConfig {
+            server_name: "localhost".to_string(),
+            alpn: vec![b"doq".to_vec()],
+            client_cert: Some(client_cert),
+            ..insecure_test_client()
+        };
+        ClientHandshake::new(cfg, b"ctp".to_vec()).unwrap()
+    }
+
+    #[test]
+    /**
+     * @brief 클라이언트 인증서를 둘러싼 RFC 8446 규칙을 엔진이 양쪽에서 지키는지.
+     * @details 서버는 RSA PKCS#1 이나 요청하지 않은 방식의 CertificateVerify 를 illegal_parameter
+     *          로 거부한다. 서명은 맞게 만들고 방식 표시만 바꿔, 키 종류 검사가 아니라 서명 방식
+     *          검사가 거부하게 한다. 클라이언트는 문맥이 빈 요청만 받고, 요청한 방식으로 서명할 수
+     *          없는 키면 빈 Certificate 로 답한다.
+     */
+    fn quic_engine_client_certificate_rules() {
+        let (rsa_certificate, rsa_key) = crate::cert::rsa_test_certificate("client.example");
+        for (scheme, expected) in [
+            (RSA_PSS_RSAE_SHA256, Ok(())),
+            (RSA_PKCS1_SHA256, Err(TlsError::IllegalParameter)),
+            (RSA_PSS_RSAE_SHA384, Err(TlsError::IllegalParameter)),
+        ] {
+            let server_cfg = ServerConfig {
+                client_ca: Some(crate::trust::TrustStore::from_ders([
+                    rsa_certificate.as_slice()
+                ])),
+                ..make_server_cfg(vec![b"doq".to_vec()])
+            };
+            let mut server = ServerHandshake::new(Arc::new(server_cfg), b"stp".to_vec());
+            let mut client = mtls_client(crate::conn::ClientCert {
+                chain: vec![rsa_certificate.clone()],
+                sign_scheme: RSA_PSS_RSAE_SHA256,
+                sign: crate::cert::rsa_test_signer(rsa_key.clone(), scheme),
+            });
+            for (level, data) in client.take_crypto() {
+                server.provide(level, &data).unwrap();
+            }
+            for (level, data) in server.take_crypto() {
+                client.provide(level, &data).unwrap();
+            }
+            let flight = client.take_crypto();
+            let relabeled = rewrite_messages(&flight[0].1, &|message| {
+                if message.msg_type == HandshakeType::CertificateVerify {
+                    let mut verify = CertificateVerify::parse(&message.body).unwrap();
+                    verify.algorithm = scheme;
+                    message.body = verify.encode();
+                }
+            });
+            assert_eq!(
+                server.provide(Level::Handshake, &relabeled),
+                expected,
+                "서명 방식 {scheme:#06x}"
+            );
+            assert_eq!(
+                server.is_complete(),
+                expected.is_ok(),
+                "서명 방식 {scheme:#06x}"
+            );
+        }
+
+        let (server_cfg, _) = mtls_pair();
+        let mut server = ServerHandshake::new(Arc::new(server_cfg), b"stp".to_vec());
+        let mut client = mtls_client(crate::conn::ClientCert {
+            sign_scheme: RSA_PKCS1_SHA256,
+            sign: Arc::new(|_: &[u8]| -> Vec<u8> {
+                unreachable!("1.3 에서 쓸 수 없는 방식으로 서명하면 안 된다")
+            }),
+            ..mtls_pair().1
+        });
+        for (level, data) in client.take_crypto() {
+            server.provide(level, &data).unwrap();
+        }
+        for (level, data) in server.take_crypto() {
+            client.provide(level, &data).unwrap();
+        }
+        let flight = client.take_crypto();
+        let mut reader = HandshakeReader::new();
+        reader.feed(&flight[0].1);
+        let certificate = reader.next_message().unwrap().unwrap();
+        assert_eq!(certificate.msg_type, HandshakeType::Certificate);
+        assert!(CertificateMsg::parse(&certificate.body)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            reader
+                .next_message()
+                .unwrap()
+                .map(|message| message.msg_type),
+            Some(HandshakeType::Finished),
+            "빈 Certificate 뒤에는 CertificateVerify 없이 Finished 가 온다"
+        );
+        assert_eq!(
+            server.provide(Level::Handshake, &flight[0].1),
+            Err(TlsError::CertificateRequired)
+        );
+
+        let (server_cfg, client_cert) = mtls_pair();
+        let mut server = ServerHandshake::new(Arc::new(server_cfg), b"stp".to_vec());
+        let mut client = mtls_client(client_cert);
+        for (level, data) in client.take_crypto() {
+            server.provide(level, &data).unwrap();
+        }
+        let flight = server.take_crypto();
+        client.provide(flight[0].0, &flight[0].1).unwrap();
+        let with_context = rewrite_messages(&flight[1].1, &|message| {
+            if message.msg_type == HandshakeType::CertificateRequest {
+                let mut request = crate::cert::CertificateRequestMsg::parse(&message.body).unwrap();
+                request.context = vec![1];
+                message.body = request.encode();
+            }
+        });
+        assert_eq!(
+            client.provide(Level::Handshake, &with_context),
+            Err(TlsError::IllegalParameter),
+            "핸드셰이크 중의 요청은 문맥이 비어 있어야 한다"
+        );
     }
 }

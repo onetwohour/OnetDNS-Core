@@ -391,8 +391,10 @@ pub(crate) fn acme_issue_run(
             }
             (None, None) => {}
         }
-        // 발급은 인증서 파일만 바꾼다. 실행 중인 수신 주소가 쥐고 있는 인증서까지 여기서
-        // 갈지 않으면, 발급에 성공하고도 다시 시작할 때까지 이전 인증서를 계속 내민다.
+        /*
+         * 발급은 인증서 파일만 바꾼다. 실행 중인 수신 주소가 쥐고 있는 인증서까지 여기서
+         * 갈지 않으면, 발급에 성공하고도 다시 시작할 때까지 이전 인증서를 계속 내민다.
+         */
         if let Some(slots) = &tls_slots {
             match slots.refresh_certificate_files(cfg) {
                 Ok(swapped) if !swapped.is_empty() => onetdns_core::info!(

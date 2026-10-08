@@ -608,7 +608,7 @@ mod tests {
         let decrypted = decrypt_query(&server_shared, &client_nonce, &qct).expect("서버 복호화");
         assert_eq!(decrypted, dns_query, "복호화된 질의 = 원본");
 
-        // MAC 을 뒤로 옮기면 거부되어야 한다. 앞에 붙는다는 것을 이렇게 못 고정한다.
+        /* MAC 을 뒤로 옮기면 거부되어야 한다. 앞에 붙는다는 것을 이렇게 못 고정한다. */
         let mut tag_appended = qct[16..].to_vec();
         tag_appended.extend_from_slice(&qct[..16]);
         assert_eq!(

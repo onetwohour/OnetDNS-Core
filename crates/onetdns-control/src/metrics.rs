@@ -676,8 +676,12 @@ struct StatSlot {
     counters: StatCounters,
 }
 
-/** @brief 수집 스레드에 보내는 실제 로그 또는 통계 슬롯 wake 신호. */
-#[allow(clippy::large_enum_variant)] // 전체 로그를 box하면 querylog 질의마다 할당이 하나 늘어난다.
+#[allow(clippy::large_enum_variant)]
+/**
+ * @brief 수집 스레드에 보내는 실제 로그 또는 통계 슬롯 wake 신호.
+ * @note 전체 로그를 box 하면 querylog 질의마다 할당이 하나 늘어나므로 큰 변형을
+ *       그대로 둔다.
+ */
 enum CollectorEvent {
     /** @brief 즉시 처리할 전체 질의 로그. */
     Log(QueryEvent),
@@ -1030,20 +1034,26 @@ impl Recorder {
         stat_client: bool,
         diag: EventDiag,
     ) {
-        // 볼 곳이 없으면 세는 것조차 하지 않는다. 누적 지표도 관리 수신 주소를 거쳐야만
-        // 읽히므로, 여기서 더한 값은 아무도 읽지 못한 채 사라진다.
+        /*
+         * 볼 곳이 없으면 세는 것조차 하지 않는다. 누적 지표도 관리 수신 주소를 거쳐야만
+         * 읽히므로, 여기서 더한 값은 아무도 읽지 못한 채 사라진다.
+         */
         if !self.collecting.load(Ordering::Acquire) {
             return;
         }
         let m = &self.metrics;
-        // 이름은 값으로 담아 보낸다. Name은 Arc라 복제가 참조계수 증가이고, 문자열은
-        // 실제로 쓰는 쪽(상위 목록 키, 질의 기록 JSON)에서 만든다.
+        /*
+         * 이름은 값으로 담아 보낸다. Name은 Arc라 복제가 참조계수 증가이고, 문자열은
+         * 실제로 쓰는 쪽(상위 목록 키, 질의 기록 JSON)에서 만든다.
+         */
         let ignored = self.is_ignored(name);
         let do_log = self.querylog.load(Ordering::Acquire) && log_client && !ignored;
         let do_stat = stat_client && !ignored;
 
-        // 로그 이벤트는 채널로 가므로 누적값도 기존 전역 atomic에 더한다. 기본 log-off 경로는
-        // 아래에서 이미 잡는 통계 슬롯 잠금에 세 값을 함께 누적해 전역 cacheline 쓰기를 없앤다.
+        /*
+         * 로그 이벤트는 채널로 가므로 누적값도 기존 전역 atomic에 더한다. 기본 log-off 경로는
+         * 아래에서 이미 잡는 통계 슬롯 잠금에 세 값을 함께 누적해 전역 cacheline 쓰기를 없앤다.
+         */
         if do_stat && do_log {
             m.total.fetch_add(1, Ordering::Relaxed);
             m.by_transport[transport.index()].fetch_add(1, Ordering::Relaxed);
@@ -1061,16 +1071,20 @@ impl Recorder {
             return;
         }
 
-        // 주소는 값으로 담아 보낸다. 문자열로 만드는 일은 실제로 쓰는 쪽으로 미뤄야
-        // 워커가 할당하고 수집 스레드가 해제하는 왕복이 생기지 않는다.
+        /*
+         * 주소는 값으로 담아 보낸다. 문자열로 만드는 일은 실제로 쓰는 쪽으로 미뤄야
+         * 워커가 할당하고 수집 스레드가 해제하는 왕복이 생기지 않는다.
+         */
         let client_s = if self.anonymize.load(Ordering::Acquire) {
             anonymize_ip(client)
         } else {
             client
         };
         if !do_log {
-            // 통계 집계는 이름·클라이언트·처분만 본다. 전체 QueryEvent를 넣으면 비어 있는
-            // String 여덟 개와 로그 전용 필드까지 슬롯에 쓰고 옮기고 버리게 된다.
+            /*
+             * 통계 집계는 이름·클라이언트·처분만 본다. 전체 QueryEvent를 넣으면 비어 있는
+             * String 여덟 개와 로그 전용 필드까지 슬롯에 쓰고 옮기고 버리게 된다.
+             */
             let ev = StatEvent {
                 client: client_s,
                 name: name.cloned(),
@@ -1100,8 +1114,10 @@ impl Recorder {
             return;
         }
 
-        // 여기부터는 실제 질의 기록에 담기는 값이다. 통계 전용 경로는 이 문자열들과
-        // 시계 읽기를 전혀 거치지 않는다.
+        /*
+         * 여기부터는 실제 질의 기록에 담기는 값이다. 통계 전용 경로는 이 문자열들과
+         * 시계 읽기를 전혀 거치지 않는다.
+         */
         let ev = QueryEvent {
             id: 0,
             ts_ms: now_ms(),
@@ -1347,8 +1363,10 @@ fn push_stat_event(
     slot.events.push(event);
     drop(slot);
     if wake && collector_idle.swap(false, Ordering::AcqRel) {
-        // 채널이 가득 찼다면 collector가 이미 처리할 일을 갖고 있어 다음 loop에서 슬롯도
-        // 비운다. wake 자체를 잃은 통계 이벤트로 세면 안 된다.
+        /*
+         * 채널이 가득 찼다면 collector가 이미 처리할 일을 갖고 있어 다음 loop에서 슬롯도
+         * 비운다. wake 자체를 잃은 통계 이벤트로 세면 안 된다.
+         */
         let _ = wake_tx.try_send(CollectorEvent::StatsReady);
     }
     true
@@ -1387,11 +1405,15 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
     misses: &mut u64,
     key: &K,
 ) {
-    // 힙은 실제 축출이 허용되는 순간에만 쓰인다. 상한에 닿았더라도 새 키가 없거나
-    // admission 문을 아직 통과하지 않았다면 10,000개 키 복제와 힙 메모리가 필요 없다.
+    /*
+     * 힙은 실제 축출이 허용되는 순간에만 쓰인다. 상한에 닿았더라도 새 키가 없거나
+     * admission 문을 아직 통과하지 않았다면 10,000개 키 복제와 힙 메모리가 필요 없다.
+     */
     if let Some(v) = map.get_mut(key) {
-        // 힙은 축출할 때만 읽는다. 올릴 때마다 키를 복제해 밀어 넣을 필요가 없다.
-        // 낡은 항목은 축출이 계수 대조로 걸러내고, 다 걸러지면 그때 다시 만든다.
+        /*
+         * 힙은 축출할 때만 읽는다. 올릴 때마다 키를 복제해 밀어 넣을 필요가 없다.
+         * 낡은 항목은 축출이 계수 대조로 걸러내고, 다 걸러지면 그때 다시 만든다.
+         */
         *v = v.saturating_add(1);
         return;
     }
@@ -1400,8 +1422,10 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
         return;
     }
 
-    // 여기서부터가 교체하는 경로다. 맵 삭제·삽입과 힙 정리가 모두 여기 있으므로,
-    // 이름 종류가 상한보다 많으면 이 값이 질의마다 붙는다.
+    /*
+     * 여기서부터가 교체하는 경로다. 맵 삭제·삽입과 힙 정리가 모두 여기 있으므로,
+     * 이름 종류가 상한보다 많으면 이 값이 질의마다 붙는다.
+     */
     *misses = misses.wrapping_add(1);
     if *misses % ADMIT_EVERY_MISSES != 0 {
         return;
@@ -1410,9 +1434,11 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
     if heap.is_empty() {
         rebuild_heap(map, heap);
     }
-    // 두 바퀴가 상한이다. 첫 바퀴에서 낡은 항목만 나와 힙이 비면 다시 만들고, 그 힙은
-    // 맵과 계수가 정확히 같으므로 두 번째 바퀴의 첫 pop이 반드시 유효하다.
-    // 이 폴백이 없으면 낡은 힙에서 새 이름이 조용히 버려진다.
+    /*
+     * 두 바퀴가 상한이다. 첫 바퀴에서 낡은 항목만 나와 힙이 비면 다시 만들고, 그 힙은
+     * 맵과 계수가 정확히 같으므로 두 번째 바퀴의 첫 pop이 반드시 유효하다.
+     * 이 폴백이 없으면 낡은 힙에서 새 이름이 조용히 버려진다.
+     */
     for attempt in 0..2 {
         while let Some(std::cmp::Reverse((count, candidate))) = heap.pop() {
             if map.get(&candidate) != Some(&count) {
@@ -1746,7 +1772,7 @@ fn process_stat_values_locked(
         clients_misses,
     } = t;
     if let Some(name) = name {
-        // 키는 대소문자를 구분하므로 바꿔서 넣는다. 이미 소문자면 빌린 참조를 그대로 쓴다.
+        /* 키는 대소문자를 구분하므로 바꿔서 넣는다. 이미 소문자면 빌린 참조를 그대로 쓴다. */
         let name = name.to_ascii_lower_name();
         let name = name.as_ref();
         bump(domains, domains_heap, domains_misses, name);
@@ -2077,8 +2103,10 @@ pub fn channel(
             let mut dirty = false;
             let mut persist_warnings = PersistWarnings::default();
 
-            // 슬롯을 비우는 주기이기도 하다. 길게 잡으면 슬롯이 넘쳐 통계가 표본이 된다.
-            // 슬롯 전체 용량을 이 시간 안에 들어오는 질의 수보다 크게 유지해야 한다.
+            /*
+             * 슬롯을 비우는 주기이기도 하다. 길게 잡으면 슬롯이 넘쳐 통계가 표본이 된다.
+             * 슬롯 전체 용량을 이 시간 안에 들어오는 질의 수보다 크게 유지해야 한다.
+             */
             let poll_interval = Duration::from_millis(20);
             let mut process = |mut ev: QueryEvent| {
                 if ev.log {
@@ -2095,8 +2123,10 @@ pub fn channel(
                     &metrics_t,
                 );
             };
-            // 슬롯에 모인 통계 전용 이벤트를 가져온다. slot 잠금은 통째 교체 동안만,
-            // 상위 목록 잠금은 batch 하나 동안만 잡는다.
+            /*
+             * 슬롯에 모인 통계 전용 이벤트를 가져온다. slot 잠금은 통째 교체 동안만,
+             * 상위 목록 잠금은 batch 하나 동안만 잡는다.
+             */
             let drain_slots = || -> bool {
                 let mut seen = false;
                 for slot in collector_slots.iter() {
@@ -2118,16 +2148,20 @@ pub fn channel(
                 seen
             };
 
-            // 슬롯에 일이 있었으면 거의 자지 않고 곧장 다시 본다. 주기 하나로만 비우면
-            // 부하가 높을 때 슬롯이 넘쳐 통계가 표본이 된다.
+            /*
+             * 슬롯에 일이 있었으면 거의 자지 않고 곧장 다시 본다. 주기 하나로만 비우면
+             * 부하가 높을 때 슬롯이 넘쳐 통계가 표본이 된다.
+             */
             loop {
                 let wait = if drain_slots() {
                     collector_idle.store(false, Ordering::Release);
                     dirty = true;
                     BUSY_DRAIN_INTERVAL
                 } else {
-                    // 첫 drain과 idle 표시 사이에 들어온 이벤트는 표시 뒤 재검사로 잡는다.
-                    // 그 뒤 들어온 첫 이벤트는 표시를 내리고 wake token을 보낸다.
+                    /*
+                     * 첫 drain과 idle 표시 사이에 들어온 이벤트는 표시 뒤 재검사로 잡는다.
+                     * 그 뒤 들어온 첫 이벤트는 표시를 내리고 wake token을 보낸다.
+                     */
                     collector_idle.store(true, Ordering::Release);
                     if drain_slots() {
                         collector_idle.store(false, Ordering::Release);
@@ -2145,7 +2179,7 @@ pub fn channel(
                     Ok(CollectorEvent::StatsReady) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        // 보내는 쪽이 사라져도 슬롯에 남은 것은 통계에 반영하고 나간다.
+                        /* 보내는 쪽이 사라져도 슬롯에 남은 것은 통계에 반영하고 나간다. */
                         drain_slots();
                         let persist = persist_state_t
                             .read()
@@ -2721,8 +2755,10 @@ mod tests {
             "볼 곳이 없는데 질의 기록을 남겼습니다"
         );
 
-        // 대조군. 같은 호출이 볼 곳이 생기면 반드시 남아야 한다. 이것이 없으면 위 단정은
-        // 기록기가 전부 고장 나도 통과한다.
+        /*
+         * 대조군. 같은 호출이 볼 곳이 생기면 반드시 남아야 한다. 이것이 없으면 위 단정은
+         * 기록기가 전부 고장 나도 통과한다.
+         */
         recorder.set_collecting(true);
         hit();
         assert_eq!(
@@ -3212,7 +3248,7 @@ mod tests {
         assert_eq!(heap.len(), TOP_CAP, "첫 축출이 힙을 만들어야 합니다");
 
         assert_eq!(map.len(), TOP_CAP);
-        // 첫 축출 뒤 실제로 남은 키를 전부 한 번씩 올려 힙의 계수를 모두 낡게 만든다.
+        /* 첫 축출 뒤 실제로 남은 키를 전부 한 번씩 올려 힙의 계수를 모두 낡게 만든다. */
         let keys: Vec<_> = map.keys().cloned().collect();
         for key in keys {
             bump(&mut map, &mut heap, &mut misses, &key);

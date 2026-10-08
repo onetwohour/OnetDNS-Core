@@ -237,14 +237,18 @@ impl Handler for NativeServer {
         if request.header.opcode != 0 || request.questions.len() != 1 {
             return R::Fallback;
         }
-        // lenient는 쿠키 없는 질의만 이 레인에 맡긴다. COOKIE 질의는 정상 경로가 서버
-        // 쿠키를 발급·검증해야 하므로, 여기서 답하면 보안 기능이 없는 것처럼 보인다.
+        /*
+         * lenient는 쿠키 없는 질의만 이 레인에 맡긴다. COOKIE 질의는 정상 경로가 서버
+         * 쿠키를 발급·검증해야 하므로, 여기서 답하면 보안 기능이 없는 것처럼 보인다.
+         */
         if f.cookies.keeper.is_some() && read_cookie(&request).is_some() {
             return R::Fallback;
         }
-        // 이 레인은 handle_inner 를 거치지 않으므로 거기 있는 EDNS 버전 협상도 돌지 않는다.
-        // 모르는 버전에는 RFC 6891이 BADVERS 를 요구하는데, 여기서 맡으면 답까지
-        // 담아 보내 이 서버가 그 버전을 구현한다고 알리게 된다.
+        /*
+         * 이 레인은 handle_inner 를 거치지 않으므로 거기 있는 EDNS 버전 협상도 돌지 않는다.
+         * 모르는 버전에는 RFC 6891이 BADVERS 를 요구하는데, 여기서 맡으면 답까지
+         * 담아 보내 이 서버가 그 버전을 구현한다고 알리게 된다.
+         */
         if request
             .opt()
             .and_then(Edns::from_record)

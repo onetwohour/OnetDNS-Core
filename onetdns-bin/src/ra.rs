@@ -274,7 +274,7 @@ pub fn spawn_ra(
         return Ok(None);
     }
 
-    // 하드웨어 주소를 실으면 호스트가 이웃 요청 왕복 없이 기본 경로를 쓴다.
+    /* 하드웨어 주소를 실으면 호스트가 이웃 요청 왕복 없이 기본 경로를 쓴다. */
     #[cfg(target_os = "linux")]
     let cfg = RaConfig {
         source_mac: cfg
@@ -779,9 +779,9 @@ mod tests {
     #[test]
     /** @brief 6바이트로 담을 수 없는 주소는 걸러지는지. */
     fn link_layer_address_rejects_unusable_forms() {
-        // 링크 계층 주소가 없는 장치는 전부 0으로 나온다. 그대로 광고하면 안 된다.
+        /* 링크 계층 주소가 없는 장치는 전부 0으로 나온다. 그대로 광고하면 안 된다. */
         assert_eq!(parse_link_layer_address("00:00:00:00:00:00"), None);
-        // 터널은 4바이트, 인피니밴드는 20바이트로 옵션에 담을 수 없다.
+        /* 터널은 4바이트, 인피니밴드는 20바이트로 옵션에 담을 수 없다. */
         assert_eq!(parse_link_layer_address("00:00:00:00"), None);
         assert_eq!(
             parse_link_layer_address("00:00:00:00:fe:80:00:00:00:00:00:00:00:00:00:00:00:00:00:00"),

@@ -269,7 +269,10 @@ impl Session {
         let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         self.plan = self.state.next_query(&ctx);
         let ladder = r.ask_order(&self.state.servers, &self.state.zone)?;
-        // 주소를 풀지 않은 이름 몫의 시간도 남긴다. 동기 경로의 query_any_reserving과 같은 규칙이다.
+        /*
+         * 주소를 풀지 않은 이름 몫의 시간도 남긴다. 동기 경로의 query_any_reserving과 같은
+         * 규칙이다.
+         */
         let candidates = ladder.len() + self.state.unresolved_ns.len();
         self.per_server =
             (r.timeout / candidates.clamp(1, 4) as u32).max(Duration::from_millis(300));
@@ -290,7 +293,7 @@ impl Session {
     fn fire_next(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
         while let Some(&target) = self.ladder.get(self.next_idx) {
             if !self.attempts.is_empty() && self.sock_v6 != target.is_ipv6() {
-                // 소켓을 바꾸면 기다리던 왕복의 답을 받을 수 없다. 그 왕복이 끝나면 보낸다.
+                /* 소켓을 바꾸면 기다리던 왕복의 답을 받을 수 없다. 그 왕복이 끝나면 보낸다. */
                 self.ask_next_at = self
                     .attempts
                     .iter()
@@ -405,8 +408,10 @@ impl Session {
                         {
                             continue;
                         }
-                        // 잘린 응답은 레코드가 비어 있어 아래 검사를 통과하지 못한다. 거기서
-                        // 버리면 TCP 로 넘어가지 못하고 왕복 시간 초과까지 기다린다.
+                        /*
+                         * 잘린 응답은 레코드가 비어 있어 아래 검사를 통과하지 못한다. 거기서
+                         * 버리면 TCP 로 넘어가지 못하고 왕복 시간 초과까지 기다린다.
+                         */
                         if resp.header.truncated {
                             return Some((resp, idx));
                         }
@@ -453,7 +458,7 @@ impl Session {
             StepOutcome::NeedNsAddrs { missing, pending } => {
                 Some(SessionEnd::NeedAddrs { missing, pending })
             }
-            // DS를 따로 묻는 질의는 이 레인에 없다. 드문 경계라 동기 경로에 맡긴다.
+            /* DS를 따로 묻는 질의는 이 레인에 없다. 드문 경계라 동기 경로에 맡긴다. */
             StepOutcome::NeedDs { .. } => Some(SessionEnd::NeedsSync),
             StepOutcome::Failed(error) => Some(SessionEnd::Failed(error)),
         }
@@ -794,8 +799,10 @@ impl Reactor {
                     end = Some(if slot.session.state.unresolved_ns.is_empty() {
                         SessionEnd::Failed(crate::RecurseError::NoResponse)
                     } else {
-                        // 이 영역의 서버가 모두 답하지 않았고 주소를 풀지 않은 이름이 남아 있다.
-                        // 이 레인에는 그 이름을 이어서 푸는 경로가 없으므로 동기 경로에 맡긴다.
+                        /*
+                         * 이 영역의 서버가 모두 답하지 않았고 주소를 풀지 않은 이름이 남아 있다.
+                         * 이 레인에는 그 이름을 이어서 푸는 경로가 없으므로 동기 경로에 맡긴다.
+                         */
                         SessionEnd::NeedsSync
                     });
                 }
@@ -1276,8 +1283,10 @@ impl Reactor {
         parked.addrs.extend(addrs);
         parked.addr_ttl = crate::min_optional_ttl(parked.addr_ttl, addr_ttl);
 
-        // 쓸 수 있는 주소가 생기면 남은 이름은 풀지 않고 내려간다. 그 주소들이 모두 답하지
-        // 않으면 동기 경로가 남은 이름을 이어서 푼다.
+        /*
+         * 쓸 수 있는 주소가 생기면 남은 이름은 풀지 않고 내려간다. 그 주소들이 모두 답하지
+         * 않으면 동기 경로가 남은 이름을 이어서 푼다.
+         */
         let have_usable = parked.addrs.iter().any(|addr| r.usable_server(addr.ip()));
         if !have_usable && parked.next_missing < parked.missing.len() && parked.children_spawned < 8
         {
