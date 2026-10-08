@@ -3634,12 +3634,18 @@ mod tests {
                 true,
             );
         }
+        /*
+         * 기록은 배경 스레드가 처리한다. 최근 기록이 두 개인 것은 앞의 기록 두세 개만 처리된 때도
+         * 같고, 그때는 1번 뒤가 아직 남아 있어 빈틈이 없다. 그래서 마지막 기록을 기다린다.
+         */
         for _ in 0..100 {
-            if stats.recent(10).len() == 2 {
+            if stats.recent(1).first().is_some_and(|event| event.id == 4) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let retained: Vec<u64> = stats.recent(10).iter().map(|event| event.id).collect();
+        assert_eq!(retained, vec![4, 3], "기록 네 개가 다 처리되지 않았습니다");
         let subscription = stats.subscribe_after(Some(0));
 
         assert!(!subscription.replay_gap);

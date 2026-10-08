@@ -5591,17 +5591,18 @@ mod tests {
         failed_ago(&r, SERVER_DOWN_BASE * 2 + Duration::from_secs(1));
         assert_eq!(r.order_by_infra(&[server], &zone), vec![server]);
 
-        r.infra
-            .lock_recover()
-            .get_mut(&key)
-            .unwrap()
-            .consecutive_failures = u8::MAX;
-        failed_ago(&r, SERVER_DOWN_MAX - Duration::from_secs(1));
-        assert!(r.order_by_infra(&[server], &zone).is_empty());
-        failed_ago(&r, SERVER_DOWN_MAX + Duration::from_secs(1));
-        assert_eq!(
-            r.order_by_infra(&[server], &zone),
-            vec![server],
+        /*
+         * 상한은 실패 시각을 과거로 옮기지 않고 판정 시각을 뒤로 잡아 본다. Instant 는 부팅
+         * 무렵부터 세므로, 부팅한 지 상한이 안 된 호스트에서는 실패 시각을 그만큼 과거로 옮길
+         * 수 없다.
+         */
+        let mut infra = r.infra.lock_recover();
+        let state = infra.get_mut(&key).unwrap();
+        state.consecutive_failures = u8::MAX;
+        let failed_at = state.last_fail.expect("마지막 실패 시각");
+        assert!(state.down(failed_at + SERVER_DOWN_MAX - Duration::from_secs(1)));
+        assert!(
+            !state.down(failed_at + SERVER_DOWN_MAX + Duration::from_secs(1)),
             "묻지 않는 기간이 상한을 넘었습니다"
         );
     }

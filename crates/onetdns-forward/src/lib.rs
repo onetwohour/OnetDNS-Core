@@ -3877,13 +3877,19 @@ mod tests {
 
     /**
      * @brief 같은 포트에서 UDP 와 TCP 로 답하는 가짜 업스트림을 띄운다.
+     * @details TCP 에서 빈 임시 포트도 UDP 에서는 못 열 수 있다. Windows 는 Hyper-V 가 예약한
+     *          대역이면 권한 거부를 주고, 그 대역은 프로토콜마다 따로 이어져 있다. 임시 포트는
+     *          번호순으로 나오므로 어긋난 TCP 소켓을 잡은 채로 다시 걸어 대역을 지나간다.
      * @param udp_reply UDP 질의에 돌려줄 바이트를 만든다. TCP 는 항상 9.9.9.9 를 담은 온전한 답이다.
      */
     fn spawn_udp_tcp_upstream(udp_reply: fn(&Message) -> Vec<u8>) -> SocketAddr {
+        /** @brief 이어진 예약 대역을 걸어서 지나가고도 남을 시도 수. */
+        const ATTEMPTS: usize = 512;
+
         let mut pair = None;
         let mut last_error = None;
         let mut taken = Vec::new();
-        for _ in 0..128 {
+        for _ in 0..ATTEMPTS {
             let tcp = TcpListener::bind("127.0.0.1:0").expect("TCP 바인딩");
             let addr = tcp.local_addr().expect("TCP 주소");
             match UdpSocket::bind(addr) {
@@ -3897,8 +3903,9 @@ mod tests {
                 }
             }
         }
-        let (tcp, udp, addr) =
-            pair.unwrap_or_else(|| panic!("같은 포트 UDP/TCP 바인딩 128회 실패: {last_error:?}"));
+        let (tcp, udp, addr) = pair.unwrap_or_else(|| {
+            panic!("같은 포트 UDP/TCP 바인딩 {ATTEMPTS}회 실패: {last_error:?}")
+        });
         drop(taken);
 
         std::thread::spawn(move || {
