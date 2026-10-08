@@ -123,7 +123,8 @@ pub(crate) fn exchange(
 /**
  * @brief 새 DoT 연결을 맺는다.
  * @details TLS 핸드셰이크 직후, 질의를 보내기 전에 폐기 확인 훅을 부른다. 순서를
- *          바꾸면 폐기된 인증서를 쓰는 서버에 질의가 이미 나간 뒤가 된다.
+ *          바꾸면 폐기된 인증서를 쓰는 서버에 질의가 이미 나간 뒤가 된다. 훅이 거부한 인증서는
+ *          TLS 가 거부했을 때처럼 치명 경고로 서버에 알린다.
  */
 fn connect(
     addr: SocketAddr,
@@ -141,12 +142,13 @@ fn connect(
         session,
         ..Default::default()
     };
-    let tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
+    let mut tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
         crate::note_upstream_connect_failure("dot", addr, server_name, &e);
         ForwardError::Io(format!("DoT handshake failed: {e}"))
     })?;
     if !tls.is_resumed() {
-        crate::check_revocation(tls.verified_chain(), server_name)?;
+        crate::check_revocation(tls.verified_chain(), server_name)
+            .inspect_err(|_| tls.reject_peer_certificate(&mut tcp))?;
     }
     Ok(DotConn {
         tcp,
@@ -368,6 +370,45 @@ mod tests {
             "두 번째 연결은 TLS 1.3 PSK-DHE 재개라 인증서 서명이 없어야 함"
         );
         crate::clear_reuse_caps_for_test();
+    }
+
+    #[test]
+    /**
+     * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 치명 경고로 서버에 알리는지.
+     * @details 경고 없이 TCP 만 끊으면 서버는 거부와 중간에서 잘린 연결을 구분하지 못한다.
+     */
+    fn dot_revocation_rejection_is_reported_to_the_server() {
+        let _revocation_test_guard = crate::revocation_test_write_guard();
+        let (addr, trust, reads) = crate::tls_first_read_recorder(b"dot");
+        crate::set_revocation_hook(Box::new(|_, host| {
+            if host == "dns.test" {
+                Err("폐기됨".to_string())
+            } else {
+                Ok(())
+            }
+        }));
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::dot(addr, "dns.test")],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+        let res = fwd.resolve(&q(1, "x.test"));
+        crate::clear_revocation_hook();
+        assert!(
+            res.is_err(),
+            "폐기 확인이 거부한 서버의 답을 받아들였습니다"
+        );
+        let read = reads
+            .recv_timeout(Duration::from_secs(10))
+            .expect("서버가 핸드셰이크를 마치지 못했습니다");
+        assert_eq!(
+            read,
+            Err(onetdns_tls::TlsError::PeerAlert {
+                level: 2,
+                description: 46
+            }),
+            "certificate_unknown 치명 경고가 아닙니다"
+        );
     }
 
     #[test]

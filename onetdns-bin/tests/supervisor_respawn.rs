@@ -25,6 +25,40 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 /** @brief 서버가 종료 신호를 받고 끝나기를 기다리는 상한. */
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/**
+ * @brief 실행할 파일을 쓰는 일과 프로세스를 띄우는 일을 한 번에 하나만 하게 하는 잠금.
+ * @details 테스트는 한 프로세스의 여러 스레드에서 돈다. 한 스레드가 파일을 쓰려고 연 기술자는
+ *          그동안 다른 스레드가 띄운 자식에게 복제되어 그 자식이 exec 할 때까지 남는다. 그사이에
+ *          그 파일을 실행하면 리눅스는 ETXTBSY 로 거부한다. spawn 은 자식이 exec 한 뒤에
+ *          돌아오므로, 쓰기와 띄우기를 이 잠금 안에서 하면 쓰기용 기술자를 쥔 자식이 남지 않는다.
+ */
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+/** @brief EXEC_LOCK 을 잡는다. 잡은 채 실패한 테스트가 있어도 다른 테스트는 계속 잡는다. */
+fn exec_lock() -> std::sync::MutexGuard<'static, ()> {
+    EXEC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/** @brief 실행할 파일을 쓰는 스레드가 없을 때 띄운다. */
+fn spawn(command: &mut Command) -> std::io::Result<Child> {
+    let _exec = exec_lock();
+    command.spawn()
+}
+
+/**
+ * @brief Command::output 처럼 표준 출력과 오류를 모으며 끝날 때까지 기다린다.
+ * @details 띄우는 일은 spawn 이 맡는다. 기다리는 동안에는 잠금을 잡지 않는다.
+ */
+fn output_of(command: &mut Command) -> std::io::Result<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(command)?.wait_with_output()
+}
+
 /** @brief 기록 한 줄에서 꺼낸 사건 이름과 그 기록을 남긴 프로세스. */
 struct Event {
     /** @brief event 필드. */
@@ -86,20 +120,21 @@ impl Server {
 
     /** @brief 띄우고 표준 오류를 읽기 시작한다. */
     fn start(dir: &Path, program: PathBuf, config: &Path, extra: &[&str]) -> Self {
-        let mut process = Command::new(&program)
-            .arg("run")
-            .arg("--config")
-            .arg(config)
-            .arg("--no-web")
-            .args(extra)
-            .current_dir(dir)
-            .env("ONETDNS_LOG_FORMAT", "json")
-            .env_remove("ONETDNS_LOG")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("서버를 띄우지 못했습니다");
+        let mut process = spawn(
+            Command::new(&program)
+                .arg("run")
+                .arg("--config")
+                .arg(config)
+                .arg("--no-web")
+                .args(extra)
+                .current_dir(dir)
+                .env("ONETDNS_LOG_FORMAT", "json")
+                .env_remove("ONETDNS_LOG")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .expect("서버를 띄우지 못했습니다");
         let stderr = process.stderr.take().expect("서버의 표준 오류가 없습니다");
         let (sender, events) = mpsc::channel();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -217,24 +252,26 @@ fn argv0(pid: i32) -> Option<Vec<u8>> {
     cmdline.split(|byte| *byte == 0).next().map(<[u8]>::to_vec)
 }
 
-/** @brief UDP 와 TCP 모두 비어 있는 루프백 포트. */
-fn free_port() -> u16 {
+/**
+ * @brief 비어 있는 루프백 포트의 UDP 와 TCP 를 함께 잡아 둔다. 놓을 때까지 서버는 이 포트에
+ *        묶지 못한다.
+ * @details 찾을 때 잡은 소켓을 그대로 돌려준다. 빈 포트를 찾고 놓았다가 다시 잡으면 그사이에
+ *          다른 소켓이 그 포트를 가져갈 수 있다.
+ */
+fn hold_free_port() -> (u16, (UdpSocket, TcpListener)) {
     for _ in 0..32 {
         let tcp = TcpListener::bind("127.0.0.1:0").expect("TCP 포트를 잡지 못했습니다");
         let port = tcp.local_addr().expect("TCP 주소").port();
-        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+            return (port, (udp, tcp));
         }
     }
     panic!("UDP 와 TCP 가 함께 비어 있는 포트를 찾지 못했습니다");
 }
 
-/** @brief 이 포트의 UDP 와 TCP 를 잡아 둔다. 놓을 때까지 서버는 이 포트에 묶지 못한다. */
-fn hold(port: u16) -> (UdpSocket, TcpListener) {
-    (
-        UdpSocket::bind(("127.0.0.1", port)).expect("UDP 포트를 잡지 못했습니다"),
-        TcpListener::bind(("127.0.0.1", port)).expect("TCP 포트를 잡지 못했습니다"),
-    )
+/** @brief UDP 와 TCP 모두 비어 있는 루프백 포트. 서버가 묶도록 바로 놓는다. */
+fn free_port() -> u16 {
+    hold_free_port().0
 }
 
 /** @brief 이 포트에서 듣는 설정 파일을 쓴다. */
@@ -248,6 +285,7 @@ fn write_config(dir: &Path, port: u16) -> PathBuf {
 /** @brief 이 바이너리를 임시 디렉터리의 설치 경로에 복사한다. */
 fn install_copy(dir: &Path) -> PathBuf {
     let program = dir.join("OnetDNS");
+    let _exec = exec_lock();
     std::fs::copy(env!("CARGO_BIN_EXE_OnetDNS"), &program).expect("바이너리를 복사하지 못했습니다");
     program
 }
@@ -265,9 +303,7 @@ fn sha256_hex(path: &Path) -> String {
 
 /** @brief 실행 파일이 --version 으로 알리는 버전. */
 fn version_of(program: &Path) -> String {
-    let output = Command::new(program)
-        .arg("--version")
-        .output()
+    let output = output_of(Command::new(program).arg("--version"))
         .expect("--version 을 실행하지 못했습니다");
     assert!(output.status.success(), "--version 이 실패했습니다");
     String::from_utf8(output.stdout)
@@ -280,14 +316,14 @@ fn version_of(program: &Path) -> String {
 
 /** @brief 관리 명령을 실행하고 끝날 때까지 기다린다. */
 fn run_cli(program: &Path, dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(program)
-        .arg("--cli")
-        .args(args)
-        .current_dir(dir)
-        .env_remove("ONETDNS_LOG")
-        .stdin(Stdio::null())
-        .output()
-        .expect("관리 명령을 실행하지 못했습니다")
+    output_of(
+        Command::new(program)
+            .arg("--cli")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("ONETDNS_LOG"),
+    )
+    .expect("관리 명령을 실행하지 못했습니다")
 }
 
 /** @brief 디렉터리에 있는 파일 이름들. */
@@ -332,9 +368,11 @@ impl Swapped {
         let previous = dir.join("OnetDNS.previous");
         let mut image = std::fs::read(&program).expect("바이너리를 읽지 못했습니다");
         image.extend_from_slice(b"\0previous\0");
+        let exec = exec_lock();
         std::fs::write(&previous, &image).expect("이전 실행 파일을 쓰지 못했습니다");
         std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o755))
             .expect("이전 실행 파일 권한");
+        drop(exec);
         let version = version_of(&program);
         let new_sha256 = sha256_hex(&program);
         let previous_sha256 = sha256_hex(&previous);
@@ -464,8 +502,7 @@ fn supervised_trial_that_fails_before_ready_starts_the_previous_executable() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
     let swapped = Swapped::prepare(dir);
-    let port = free_port();
-    let held = hold(port);
+    let (port, held) = hold_free_port();
     let config = write_config(dir, port);
 
     let mut server = Server::supervised(dir, swapped.program.clone(), &config);
@@ -506,8 +543,7 @@ fn single_process_trial_that_fails_before_ready_execs_the_previous_executable() 
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
     let swapped = Swapped::prepare(dir);
-    let port = free_port();
-    let _held = hold(port);
+    let (port, _held) = hold_free_port();
     let config = write_config(dir, port);
 
     let server = Server::single_process(dir, swapped.program.clone(), &config);

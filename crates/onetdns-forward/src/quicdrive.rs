@@ -371,6 +371,24 @@ pub(crate) fn pump_handshake<D: QuicDriven>(
 }
 
 #[cfg(test)]
+/**
+ * @brief 상대가 앞선 데이터를 하나도 확인하지 않은 것처럼 보낼 버퍼를 끝까지 채운다.
+ * @details 상대가 허락한 스트림 수 너머의 번호에 쌓으므로 실제로는 나가지 않는다. 이 뒤로는 한
+ *          바이트도 더 보낼 수 없다.
+ */
+pub(crate) fn fill_send_buffer(conn: &mut Connection) {
+    let mut id = 1u64 << 40;
+    let mut size = 64 * 1024;
+    while size > 0 {
+        if conn.send_stream(id, &vec![0; size], false).is_ok() {
+            id += 4;
+        } else {
+            size /= 2;
+        }
+    }
+}
+
+#[cfg(test)]
 /** @brief 담아 둔 세션이 만료되고 상한을 지키는지. */
 mod tests {
     use super::*;

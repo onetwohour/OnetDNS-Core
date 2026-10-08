@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use onetdns_http2::valid_header_field;
 
-use crate::conn::{Connection, QuicError, Role};
+use crate::conn::{ClosePeriod, Connection, QuicError, Role};
 use crate::{qpack, varint};
 
 /** @brief 본문을 전달하는 프레임. */
@@ -90,7 +90,7 @@ pub enum H3Error {
     FrameError,
     /** @brief 이쪽 자원 상한을 넘겼다. */
     ExcessiveLoad,
-    /** @brief 허락한 적 없는 푸시 번호다. */
+    /** @brief 허락하지 않은 푸시 번호이거나 규격에 어긋난 GOAWAY, MAX_PUSH_ID 번호다. */
     IdError,
     /** @brief 설정 값이 규격에 어긋난다. */
     SettingsError,
@@ -139,7 +139,7 @@ impl H3Error {
             Self::FrameUnexpected => "Unexpected HTTP/3 frame",
             Self::FrameError => "Malformed HTTP/3 frame",
             Self::ExcessiveLoad => "HTTP/3 resource limit exceeded",
-            Self::IdError => "HTTP/3 server push is not allowed",
+            Self::IdError => "Invalid HTTP/3 stream or push ID",
             Self::SettingsError => "Invalid HTTP/3 SETTINGS",
             Self::MissingSettings => "HTTP/3 control stream did not start with SETTINGS",
             Self::Message => "Malformed HTTP/3 message",
@@ -192,19 +192,68 @@ fn is_reserved_http2_frame(frame_type: u64) -> bool {
 }
 
 /**
- * @brief 설정 뒤에 제어 스트림으로 온 프레임이 그 자리에 올 수 있는지 본다.
- * @details 이쪽은 서버 푸시를 허락하지도 보내지도 않으므로, 푸시 번호를 가리키는 프레임은
- *          모두 있을 수 없는 번호를 가리킨다.
+ * @brief 값 하나만 담는 프레임의 내용을 읽는다.
+ * @details RFC 9114 는 정해진 필드보다 길거나 짧은 프레임을 H3_FRAME_ERROR 로 정했다.
  */
-fn check_control_frame(frame_type: u64, role: Role) -> Result<(), H3Error> {
-    match frame_type {
-        FRAME_DATA | FRAME_HEADERS | FRAME_SETTINGS | FRAME_PUSH_PROMISE => {
-            Err(H3Error::FrameUnexpected)
+fn single_varint(payload: &[u8]) -> Result<u64, H3Error> {
+    match varint::read(payload) {
+        Some((value, used)) if used == payload.len() => Ok(value),
+        _ => Err(H3Error::FrameError),
+    }
+}
+
+#[derive(Default)]
+/** @brief 상대 제어 스트림에서 설정 뒤에 받은 번호들. */
+struct PeerControl {
+    /**
+     * @brief 상대가 GOAWAY 로 알린 가장 최근 번호.
+     * @details 서버가 보낸 것은 처리하지 않을 첫 요청 스트림 번호이고, 클라이언트가 보낸 것은
+     *          받지 않을 첫 푸시 번호다. RFC 9114 는 이 번호가 커지는 것을 금한다.
+     */
+    goaway: Option<u64>,
+    /** @brief 클라이언트가 MAX_PUSH_ID 로 알린 번호. 줄어들 수 없다. */
+    max_push_id: Option<u64>,
+}
+
+impl PeerControl {
+    /**
+     * @brief 설정 뒤에 제어 스트림으로 온 프레임 하나를 처리한다.
+     * @details 이쪽은 서버 푸시를 허락하지도 보내지도 않으므로 CANCEL_PUSH 가 가리키는 번호는
+     *          모두 있을 수 없는 번호다. 서버의 GOAWAY 는 클라이언트가 연 양방향 스트림 번호만
+     *          담을 수 있다.
+     */
+    fn on_frame(&mut self, frame_type: u64, payload: &[u8], role: Role) -> Result<(), H3Error> {
+        match frame_type {
+            FRAME_DATA | FRAME_HEADERS | FRAME_SETTINGS | FRAME_PUSH_PROMISE => {
+                Err(H3Error::FrameUnexpected)
+            }
+            FRAME_MAX_PUSH_ID if role == Role::Client => Err(H3Error::FrameUnexpected),
+            t if is_reserved_http2_frame(t) => Err(H3Error::FrameUnexpected),
+            FRAME_CANCEL_PUSH => {
+                single_varint(payload)?;
+                Err(H3Error::IdError)
+            }
+            FRAME_GOAWAY => {
+                let id = single_varint(payload)?;
+                let request_stream = id & 0x03 == 0;
+                if (role == Role::Client && !request_stream)
+                    || self.goaway.is_some_and(|last| id > last)
+                {
+                    return Err(H3Error::IdError);
+                }
+                self.goaway = Some(id);
+                Ok(())
+            }
+            FRAME_MAX_PUSH_ID => {
+                let id = single_varint(payload)?;
+                if self.max_push_id.is_some_and(|last| id < last) {
+                    return Err(H3Error::IdError);
+                }
+                self.max_push_id = Some(id);
+                Ok(())
+            }
+            _ => Ok(()),
         }
-        FRAME_MAX_PUSH_ID if role == Role::Client => Err(H3Error::FrameUnexpected),
-        FRAME_CANCEL_PUSH => Err(H3Error::IdError),
-        t if is_reserved_http2_frame(t) => Err(H3Error::FrameUnexpected),
-        _ => Ok(()),
     }
 }
 
@@ -400,6 +449,8 @@ struct QpackCtx {
     peer_dec_sid: Option<u64>,
     /** @brief 상대가 연 단방향 스트림들의 상태. */
     uni_in: HashMap<u64, UniIn>,
+    /** @brief 상대 제어 스트림이 설정 뒤에 알린 번호들. */
+    peer_control: PeerControl,
 }
 
 /** @brief HashMap의 실제 bucket 수보다 작은 공개 capacity를 보수적으로 환산한다. */
@@ -430,6 +481,7 @@ impl QpackCtx {
             peer_enc_sid: None,
             peer_dec_sid: None,
             uni_in: HashMap::new(),
+            peer_control: PeerControl::default(),
         }
     }
 
@@ -528,7 +580,7 @@ impl QpackCtx {
                 Some(UNI_CONTROL) => {
                     for (t, payload) in drain_complete_frames(&mut u.buf) {
                         if u.settings_seen {
-                            check_control_frame(t, self.role)?;
+                            self.peer_control.on_frame(t, &payload, self.role)?;
                             continue;
                         }
                         if t != FRAME_SETTINGS {
@@ -754,12 +806,50 @@ fn client_id_from_path(path: &[u8]) -> Option<String> {
 }
 
 /**
+ * @brief HTTP/3 메시지에 실을 수 없는 연결 전용 필드인지.
+ * @details TE 는 요청 헤더에 trailers 값으로만 올 수 있어 부르는 쪽이 따로 본다.
+ */
+fn is_connection_specific_field(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
+    )
+}
+
+/**
+ * @brief 트레일러 구역이 규격에 맞는지 본다.
+ * @details 의사 헤더와 연결 전용 필드는 트레일러에 올 수 없고, TE 는 요청 헤더에만 허락된다.
+ *          트레일러의 값은 DNS 메시지를 해석하는 데 쓰지 않는다.
+ */
+fn valid_trailer_section(fields: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    fields.iter().all(|(name, value)| {
+        valid_header_field(name, value)
+            && !name.starts_with(b":")
+            && !is_connection_specific_field(name)
+            && name != b"te"
+    })
+}
+
+/** @brief 헤더 구역을 푼 결과를 추출 결과로 옮긴다. */
+fn decoded<T>(result: qpack::DecodeResult) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Extracted<T>> {
+    match result {
+        qpack::DecodeResult::Done(fields) => Ok(fields),
+        qpack::DecodeResult::Blocked => Err(Extracted::Blocked),
+        qpack::DecodeResult::Error => Err(Extracted::Fatal(H3Error::DecompressionFailed)),
+    }
+}
+
+/**
  * @brief 스트림 버퍼에서 DoH3 요청을 추출한다.
  *
  * @details 프레임 순서와 헤더 규칙을 엄격히 본다. 헤더가 본문보다 먼저 와야 하고,
- *          의사 헤더는 중복될 수 없으며, 알린 길이와 실제 본문 길이가 맞아야 한다.
+ *          의사 헤더는 중복될 수 없으며, 알린 길이와 실제 본문 길이가 맞아야 한다. 요청은 헤더
+ *          구역, 본문, 그리고 선택적인 트레일러 구역 하나로 끝난다. 트레일러 뒤에 다시 온 HEADERS
+ *          나 DATA 는 RFC 9114 가 연결 오류로 정했다.
  * @warning 느슨하게 보면 같은 요청을 서로 다르게 해석하는 구현 차이가 생긴다. 그 차이가
  *          곧 앞단 장비를 우회하는 경로다.
+ * @note 두 헤더 구역을 모두 푼 뒤에 내용을 본다. 잘못된 요청에도 연결은 남으므로, 풀지 않고
+ *       버린 구역이 있으면 상대 인코더는 그 구역의 확인 지시를 끝내 받지 못한다.
  */
 fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extracted<H3DnsRequest> {
     let Some(frames) = parse_frames(buf) else {
@@ -768,6 +858,36 @@ fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extrac
     if let Err(error) = check_message_frames(&frames, Role::Server) {
         return Extracted::Fatal(error);
     }
+    let mut head_section: Option<&[u8]> = None;
+    let mut trailer_section: Option<&[u8]> = None;
+    for (t, payload) in &frames {
+        match *t {
+            FRAME_HEADERS | FRAME_DATA if trailer_section.is_some() => {
+                return Extracted::Fatal(H3Error::FrameUnexpected)
+            }
+            FRAME_HEADERS if head_section.is_none() => head_section = Some(payload),
+            FRAME_HEADERS => trailer_section = Some(payload),
+            _ => {}
+        }
+    }
+    let Some(head_section) = head_section else {
+        return Extracted::Bad;
+    };
+    if dec.is_blocked(head_section) || trailer_section.is_some_and(|s| dec.is_blocked(s)) {
+        return Extracted::Blocked;
+    }
+    let head = match decoded(dec.decode_field_section(sid, head_section)) {
+        Ok(fields) => fields,
+        Err(outcome) => return outcome,
+    };
+    if let Some(section) = trailer_section {
+        match decoded(dec.decode_field_section(sid, section)) {
+            Ok(fields) if valid_trailer_section(&fields) => {}
+            Ok(_) => return Extracted::Bad,
+            Err(outcome) => return outcome,
+        }
+    }
+
     let mut method: Option<Vec<u8>> = None;
     let mut scheme: Option<Vec<u8>> = None;
     let mut authority: Option<Vec<u8>> = None;
@@ -775,98 +895,69 @@ fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extrac
     let mut path: Option<Vec<u8>> = None;
     let mut content_length: Option<usize> = None;
     let mut content_type: Option<bool> = None;
-    let mut headers_seen = false;
+    let mut regular_seen = false;
+    for (n, v) in head {
+        if !valid_header_field(&n, &v) {
+            return Extracted::Bad;
+        }
+        if n.starts_with(b":") {
+            if regular_seen {
+                return Extracted::Bad;
+            }
+            let target = match n.as_slice() {
+                b":method" => &mut method,
+                b":scheme" => &mut scheme,
+                b":authority" => &mut authority,
+                b":path" => &mut path,
+                _ => return Extracted::Bad,
+            };
+            if target.replace(v).is_some() {
+                return Extracted::Bad;
+            }
+            continue;
+        }
+        regular_seen = true;
+        if is_connection_specific_field(&n) {
+            return Extracted::Bad;
+        }
+        if n == b"content-length" {
+            if content_length.is_some() || v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+                return Extracted::Bad;
+            }
+            let Ok(s) = std::str::from_utf8(&v) else {
+                return Extracted::Bad;
+            };
+            let Ok(length) = s.parse::<usize>() else {
+                return Extracted::Bad;
+            };
+            if length > MAX_DNS_BODY {
+                return Extracted::Bad;
+            }
+            content_length = Some(length);
+        } else if n == b"content-type" {
+            /*
+             * 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는 것은 요청 스머글링의
+             * 경로라 그대로 400 이고, 다른 형식은 415 로 구분해야 클라이언트가 고칠 수 있다.
+             */
+            let is_dns = v.eq_ignore_ascii_case(b"application/dns-message");
+            if content_type.replace(is_dns).is_some() {
+                return Extracted::Bad;
+            }
+        } else if n == b"host" {
+            if host.replace(v).is_some() {
+                return Extracted::Bad;
+            }
+        } else if n == b"te" && v != b"trailers" {
+            return Extracted::Bad;
+        }
+    }
     let mut body = Vec::new();
-    for (t, payload) in frames {
-        match t {
-            FRAME_HEADERS => {
-                if headers_seen {
-                    return Extracted::Bad;
-                }
-                headers_seen = true;
-                match dec.decode_field_section(sid, &payload) {
-                    qpack::DecodeResult::Done(headers) => {
-                        let mut regular_seen = false;
-                        for (n, v) in headers {
-                            if !valid_header_field(&n, &v) {
-                                return Extracted::Bad;
-                            }
-                            if n.starts_with(b":") {
-                                if regular_seen {
-                                    return Extracted::Bad;
-                                }
-                                let target = match n.as_slice() {
-                                    b":method" => &mut method,
-                                    b":scheme" => &mut scheme,
-                                    b":authority" => &mut authority,
-                                    b":path" => &mut path,
-                                    _ => return Extracted::Bad,
-                                };
-                                if target.replace(v).is_some() {
-                                    return Extracted::Bad;
-                                }
-                            } else {
-                                regular_seen = true;
-                                if matches!(
-                                    n.as_slice(),
-                                    b"connection"
-                                        | b"proxy-connection"
-                                        | b"keep-alive"
-                                        | b"transfer-encoding"
-                                        | b"upgrade"
-                                ) {
-                                    return Extracted::Bad;
-                                }
-                                if n == b"content-length" {
-                                    if content_length.is_some()
-                                        || v.is_empty()
-                                        || !v.iter().all(u8::is_ascii_digit)
-                                    {
-                                        return Extracted::Bad;
-                                    }
-                                    let Ok(s) = std::str::from_utf8(&v) else {
-                                        return Extracted::Bad;
-                                    };
-                                    let Ok(length) = s.parse::<usize>() else {
-                                        return Extracted::Bad;
-                                    };
-                                    if length > MAX_DNS_BODY {
-                                        return Extracted::Bad;
-                                    }
-                                    content_length = Some(length);
-                                } else if n == b"content-type" {
-                                    /*
-                                     * 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는
-                                     * 것은 요청 스머글링의 경로라 그대로 400 이고, 다른 형식은
-                                     * 415 로 구분해야 클라이언트가 고칠 수 있다.
-                                     */
-                                    let is_dns = v.eq_ignore_ascii_case(b"application/dns-message");
-                                    if content_type.replace(is_dns).is_some() {
-                                        return Extracted::Bad;
-                                    }
-                                } else if n == b"host" {
-                                    if host.replace(v).is_some() {
-                                        return Extracted::Bad;
-                                    }
-                                } else if n == b"te" && v != b"trailers" {
-                                    return Extracted::Bad;
-                                }
-                            }
-                        }
-                    }
-                    qpack::DecodeResult::Blocked => return Extracted::Blocked,
-                    qpack::DecodeResult::Error => {
-                        return Extracted::Fatal(H3Error::DecompressionFailed)
-                    }
-                }
+    for (t, payload) in &frames {
+        if *t == FRAME_DATA {
+            if body.len().saturating_add(payload.len()) > MAX_DNS_BODY {
+                return Extracted::Bad;
             }
-            FRAME_DATA => {
-                if body.len().saturating_add(payload.len()) > MAX_DNS_BODY {
-                    return Extracted::Bad;
-                }
-                body.extend_from_slice(&payload)
-            }
-            _ => {}
+            body.extend_from_slice(payload);
         }
     }
     let Some(path) = path else {
@@ -1223,6 +1314,14 @@ impl H3Connection {
         self.conn.is_terminated()
     }
 
+    /**
+     * @brief 닫힌 연결에서 closing 이나 draining 기간에 쓸 상태만 남기고 나머지를 버린다.
+     * @return 남은 기간의 상태. 열린 연결이거나 기간이 이미 끝났으면 None.
+     */
+    pub fn into_close_period(self) -> Option<ClosePeriod> {
+        self.conn.into_close_period()
+    }
+
     /** @brief 이 사유로 연결을 닫는다. 이미 닫힌 연결은 처음 알린 사유를 그대로 둔다. */
     pub fn close(&mut self, error: H3Error) {
         self.conn.close(error.code(), error.reason());
@@ -1272,6 +1371,13 @@ pub struct H3Client {
 
     /** @brief 헤더 테이블이 따라오기를 기다리는 응답들. */
     blocked: Vec<(u64, Vec<u8>)>,
+
+    /**
+     * @brief 보냈지만 아직 답을 받지 못한 요청 스트림.
+     * @details 서버가 GOAWAY 로 알린 번호 이상인 요청은 처리되지 않는다. 그 요청들을 여기서
+     *          골라 다른 연결로 다시 보낼 수 있다고 알린다.
+     */
+    in_flight: HashSet<u64>,
 }
 
 impl H3Client {
@@ -1285,7 +1391,17 @@ impl H3Client {
             ready: Vec::new(),
             qp: QpackCtx::new(Role::Client),
             blocked: Vec::new(),
+            in_flight: HashSet::new(),
         }
+    }
+
+    /**
+     * @brief 서버가 GOAWAY 로 연결 정리를 알렸는지.
+     * @details 연결은 아직 열려 있고 앞서 보낸 요청의 답은 올 수 있지만, 새 요청은 다른 연결로
+     *          보내야 한다.
+     */
+    pub fn is_going_away(&self) -> bool {
+        self.qp.peer_control.goaway.is_some()
     }
 
     /** @brief 아직 안 보냈으면 제어 스트림 설정을 보낸다. */
@@ -1308,13 +1424,19 @@ impl H3Client {
         self.conn.can_send_early()
     }
 
-    /** @brief DNS 질의를 요청으로 보낸다. */
+    /**
+     * @brief DNS 질의를 요청으로 보낸다.
+     * @retval QuicError::GoingAway 서버가 GOAWAY 를 보냈다. RFC 9114 는 그 뒤 새 요청을 금한다.
+     */
     pub fn send_request(
         &mut self,
         authority: &str,
         path: &str,
         body: &[u8],
     ) -> Result<u64, QuicError> {
+        if self.is_going_away() {
+            return Err(QuicError::GoingAway);
+        }
         self.maybe_send_setup()?;
         let id = self.next_bidi << 2;
         let len_s = body.len().to_string();
@@ -1332,6 +1454,7 @@ impl H3Client {
         encode_frame(&mut payload, FRAME_DATA, body);
         self.conn.send_stream(id, &payload, true)?;
         self.next_bidi += 1;
+        self.in_flight.insert(id);
         Ok(id)
     }
 
@@ -1358,6 +1481,7 @@ impl H3Client {
                 {
                     return Err(H3Error::ExcessiveLoad.into());
                 }
+                self.in_flight.remove(&id);
                 self.ready.push((id, status, body));
                 Ok(())
             }
@@ -1395,10 +1519,7 @@ impl H3Client {
             if id & 0x03 == 0x03 {
                 self.qp.on_reset(id)?;
             } else {
-                self.resp.remove(&id);
-                self.blocked.retain(|(stream_id, _)| *stream_id != id);
-                self.ready.retain(|(stream_id, _, _)| *stream_id != id);
-                self.ready.push((id, 0, Vec::new()));
+                self.abandon_request(id);
             }
         }
         let events = self.conn.take_readable();
@@ -1410,6 +1531,13 @@ impl H3Client {
                 continue;
             }
             if id & 0x03 != 0x00 {
+                continue;
+            }
+            /*
+             * GOAWAY 가 처리하지 않는다고 알린 요청은 답 없음으로 끝내므로, 그 스트림에 온
+             * 데이터는 버린다.
+             */
+            if self.qp.peer_control.goaway.is_some_and(|first| id >= first) {
                 continue;
             }
             if !self.resp.contains_key(&id) && self.resp.len() >= MAX_H3_STREAMS {
@@ -1438,8 +1566,33 @@ impl H3Client {
         for (id, buf) in completed {
             self.try_extract(id, buf)?;
         }
+        if let Some(first_refused) = self.qp.peer_control.goaway {
+            let refused: Vec<u64> = self
+                .in_flight
+                .iter()
+                .copied()
+                .filter(|id| *id >= first_refused)
+                .collect();
+            for id in refused {
+                self.abandon_request(id);
+            }
+        }
         self.qp.flush_decoder_stream(&mut self.conn)?;
         Ok(())
+    }
+
+    /**
+     * @brief 서버가 답하지 않을 요청을 답 없음(상태 0)으로 끝낸다.
+     * @details 요청마다 결과는 한 번만 낸다. 이미 답을 받았거나 끝낸 요청이면 아무것도 하지
+     *          않는다.
+     */
+    fn abandon_request(&mut self, id: u64) {
+        if !self.in_flight.remove(&id) {
+            return;
+        }
+        self.resp.remove(&id);
+        self.blocked.retain(|(stream_id, _)| *stream_id != id);
+        self.ready.push((id, 0, Vec::new()));
     }
 
     /** @brief 이쪽이 테이블에 넣은 항목 수. */
@@ -1452,7 +1605,11 @@ impl H3Client {
         self.qp.enc.known_received()
     }
 
-    /** @brief 완성된 응답들을 가져간다. */
+    /**
+     * @brief 끝난 요청의 결과를 가져간다.
+     * @details send_request 로 보낸 요청마다 한 번씩 나온다. 상태 0 은 서버가 답하지 않았다는
+     *          뜻이다. 스트림이 끊겼거나, GOAWAY 가 그 요청을 처리하지 않는다고 알렸다.
+     */
     pub fn take_responses(&mut self) -> Vec<(u64, u16, Vec<u8>)> {
         std::mem::take(&mut self.ready)
     }
@@ -1508,9 +1665,82 @@ impl H3Client {
     }
 }
 
+/** @brief 응답 헤더 구역에서 읽어 낸 값. */
+struct ResponseHead {
+    /** @brief 상태 코드. 1xx 는 최종 응답 앞에 오는 중간 응답이다. */
+    status: u16,
+    /** @brief 알린 본문 길이. */
+    content_length: Option<usize>,
+    /** @brief 본문이 DNS 메시지라고 밝혔는지. */
+    dns_content_type: bool,
+}
+
+/**
+ * @brief 응답 헤더 구역 하나를 읽는다.
+ * @details 중간 응답과 최종 응답이 같은 규칙을 따른다. HTTP/3 에는 101 응답이 없다.
+ * @return 형식이 어긋나면 None 이다.
+ */
+fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
+    let mut status: Option<u16> = None;
+    let mut content_length: Option<usize> = None;
+    let mut dns_content_type = false;
+    let mut regular_seen = false;
+    for (n, v) in fields {
+        if !valid_header_field(&n, &v) {
+            return None;
+        }
+        if n.starts_with(b":") {
+            if regular_seen || n != b":status" || status.is_some() {
+                return None;
+            }
+            if v.len() != 3 || !v.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let parsed =
+                ((v[0] - b'0') as u16) * 100 + ((v[1] - b'0') as u16) * 10 + (v[2] - b'0') as u16;
+            if !(100..=599).contains(&parsed) || parsed == 101 {
+                return None;
+            }
+            status = Some(parsed);
+            continue;
+        }
+        regular_seen = true;
+        if is_connection_specific_field(&n) || n == b"te" {
+            return None;
+        }
+        if n == b"content-length" {
+            if content_length.is_some() || v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let length = std::str::from_utf8(&v).ok()?.parse::<usize>().ok()?;
+            if length > MAX_DNS_BODY {
+                return None;
+            }
+            content_length = Some(length);
+        } else if n == b"content-type" {
+            if dns_content_type {
+                return None;
+            }
+            dns_content_type = v.eq_ignore_ascii_case(b"application/dns-message");
+            if !dns_content_type {
+                return None;
+            }
+        }
+    }
+    Some(ResponseHead {
+        status: status?,
+        content_length,
+        dns_content_type,
+    })
+}
+
 /**
  * @brief 스트림 버퍼에서 DoH3 응답을 추출한다.
  * @details 요청과 같은 엄격함을 적용한다. 프레임 순서, 상태 헤더 중복, 길이 일치를 모두 본다.
+ *          응답은 1xx 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인 트레일러 구역 하나 순서로
+ *          온다. HEADERS 가 그 가운데 어느 것인지는 풀어 봐야 알므로 앞에서부터 차례로 푼다.
+ * @note 어느 구역이든 테이블을 기다려야 하면 하나도 풀지 않는다. 일부를 푼 뒤 기다렸다가 다시
+ *       풀면 그 구역의 확인 지시가 두 번 나간다.
  */
 fn extract_dns_response(
     dec: &mut qpack::Decoder,
@@ -1523,90 +1753,42 @@ fn extract_dns_response(
     if let Err(error) = check_message_frames(&frames, Role::Client) {
         return Extracted::Fatal(error);
     }
-    let mut status: Option<u16> = None;
-    let mut content_length: Option<usize> = None;
-    let mut dns_content_type = false;
-    let mut headers_seen = false;
+    if frames
+        .iter()
+        .any(|(t, section)| *t == FRAME_HEADERS && dec.is_blocked(section))
+    {
+        return Extracted::Blocked;
+    }
+    let mut final_head: Option<ResponseHead> = None;
+    let mut trailer_seen = false;
     let mut body = Vec::new();
     for (t, payload) in frames {
         match t {
+            FRAME_HEADERS | FRAME_DATA if trailer_seen => {
+                return Extracted::Fatal(H3Error::FrameUnexpected)
+            }
             FRAME_HEADERS => {
-                if headers_seen {
-                    return Extracted::Bad;
+                let fields = match decoded(dec.decode_field_section(sid, &payload)) {
+                    Ok(fields) => fields,
+                    Err(outcome) => return outcome,
+                };
+                if final_head.is_some() {
+                    if !valid_trailer_section(&fields) {
+                        return Extracted::Bad;
+                    }
+                    trailer_seen = true;
+                    continue;
                 }
-                headers_seen = true;
-                match dec.decode_field_section(sid, &payload) {
-                    qpack::DecodeResult::Done(headers) => {
-                        let mut regular_seen = false;
-                        for (n, v) in headers {
-                            if !valid_header_field(&n, &v) {
-                                return Extracted::Bad;
-                            }
-                            if n.starts_with(b":") {
-                                if regular_seen || n != b":status" || status.is_some() {
-                                    return Extracted::Bad;
-                                }
-                                if v.len() != 3 || !v.iter().all(u8::is_ascii_digit) {
-                                    return Extracted::Bad;
-                                }
-                                let parsed = ((v[0] - b'0') as u16) * 100
-                                    + ((v[1] - b'0') as u16) * 10
-                                    + (v[2] - b'0') as u16;
-                                if !(200..=599).contains(&parsed) {
-                                    return Extracted::Bad;
-                                }
-                                status = Some(parsed);
-                            } else {
-                                regular_seen = true;
-                                if matches!(
-                                    n.as_slice(),
-                                    b"connection"
-                                        | b"proxy-connection"
-                                        | b"keep-alive"
-                                        | b"te"
-                                        | b"transfer-encoding"
-                                        | b"upgrade"
-                                ) {
-                                    return Extracted::Bad;
-                                }
-                                if n == b"content-length" {
-                                    if content_length.is_some()
-                                        || v.is_empty()
-                                        || !v.iter().all(u8::is_ascii_digit)
-                                    {
-                                        return Extracted::Bad;
-                                    }
-                                    let Ok(s) = std::str::from_utf8(&v) else {
-                                        return Extracted::Bad;
-                                    };
-                                    let Ok(length) = s.parse::<usize>() else {
-                                        return Extracted::Bad;
-                                    };
-                                    if length > MAX_DNS_BODY {
-                                        return Extracted::Bad;
-                                    }
-                                    content_length = Some(length);
-                                } else if n == b"content-type" {
-                                    if dns_content_type {
-                                        return Extracted::Bad;
-                                    }
-                                    dns_content_type =
-                                        v.eq_ignore_ascii_case(b"application/dns-message");
-                                    if !dns_content_type {
-                                        return Extracted::Bad;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    qpack::DecodeResult::Blocked => return Extracted::Blocked,
-                    qpack::DecodeResult::Error => {
-                        return Extracted::Fatal(H3Error::DecompressionFailed)
-                    }
+                let Some(head) = response_head(fields) else {
+                    return Extracted::Bad;
+                };
+                if head.status >= 200 {
+                    final_head = Some(head);
                 }
             }
             FRAME_DATA => {
-                if body.len().saturating_add(payload.len()) > MAX_DNS_BODY {
+                /* 중간 응답에는 본문이 없다. 헤더보다 앞선 본문은 프레임 배치 검사가 걸렀다. */
+                if final_head.is_none() || body.len().saturating_add(payload.len()) > MAX_DNS_BODY {
                     return Extracted::Bad;
                 }
                 body.extend_from_slice(&payload)
@@ -1614,15 +1796,16 @@ fn extract_dns_response(
             _ => {}
         }
     }
-    match status {
-        Some(s)
-            if content_length.is_none_or(|length| length == body.len())
-                && (s != 200 || dns_content_type) =>
+    match final_head {
+        Some(head)
+            if head
+                .content_length
+                .is_none_or(|length| length == body.len())
+                && (head.status != 200 || head.dns_content_type) =>
         {
-            Extracted::Done((s, body))
+            Extracted::Done((head.status, body))
         }
-        None => Extracted::Bad,
-        Some(_) => Extracted::Bad,
+        Some(_) | None => Extracted::Bad,
     }
 }
 
@@ -2283,6 +2466,60 @@ mod tests {
             .contains(&(next, 200, b"\x00\x00 answer".to_vec())));
     }
 
+    /** @brief 서버 제어 스트림으로 GOAWAY 를 보낸다. 이 서버 구현은 스스로 보내지 않는다. */
+    fn send_goaway(server: &mut H3Connection, first_unprocessed: u64) {
+        let control = server.qp.ctrl_sid.expect("서버 제어 스트림");
+        let mut payload = Vec::new();
+        varint::write(&mut payload, first_unprocessed);
+        let mut frame = Vec::new();
+        encode_frame(&mut frame, FRAME_GOAWAY, &payload);
+        server
+            .conn_mut()
+            .send_stream(control, &frame, false)
+            .unwrap();
+    }
+
+    #[test]
+    /**
+     * @brief GOAWAY 를 받은 클라이언트가 새 요청을 열지 않고 처리되지 않을 요청을 곧바로 끝내는지.
+     * @details RFC 9114 는 GOAWAY 를 받은 뒤의 새 요청을 금한다. 알린 번호 이상인 요청은 서버가
+     *          처리하지 않으므로 다른 연결로 다시 보낼 수 있다고 바로 알려야 한다. 그보다 앞선
+     *          요청의 답은 그대로 받는다.
+     */
+    fn goaway_refuses_new_and_unprocessed_requests() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+        let kept = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 kept")
+            .unwrap();
+        let unprocessed = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 unprocessed")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 2);
+
+        send_goaway(&mut server, unprocessed);
+        pump_h3(&mut client, &mut server);
+        assert!(client.is_going_away());
+        assert_eq!(client.take_responses(), vec![(unprocessed, 0, Vec::new())]);
+        assert_eq!(
+            client.send_request("dns.example", "/dns-query", b"\x00\x00 late"),
+            Err(QuicError::GoingAway)
+        );
+
+        server.send_response(kept, b"\x00\x00 kept", 0).unwrap();
+        server
+            .send_response(unprocessed, b"\x00\x00 contradicts goaway", 0)
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            client.take_responses(),
+            vec![(kept, 200, b"\x00\x00 kept".to_vec())],
+            "처리하지 않는다고 알린 요청의 결과가 두 번 나왔습니다"
+        );
+        assert!(!client.is_closed());
+    }
+
     #[test]
     /**
      * @brief 받자마자 내는 상태 답이 멈춘 스트림을 만나도 연결이 남는지.
@@ -2687,6 +2924,100 @@ mod tests {
 
     #[test]
     /**
+     * @brief GOAWAY 와 MAX_PUSH_ID 가 RFC 9114 의 번호 규칙을 어기면 연결 오류로 닫는지.
+     * @details 서버의 GOAWAY 는 클라이언트가 연 양방향 스트림 번호만 담는다. 두 프레임 모두 앞서
+     *          알린 번호를 되돌릴 수 없고, 값 하나보다 길거나 짧은 내용은 프레임 오류다.
+     */
+    fn control_frame_identifiers_follow_rfc_9114() {
+        let id = |value: u64| {
+            let mut out = Vec::new();
+            varint::write(&mut out, value);
+            out
+        };
+        let cases: [(Role, Vec<(u64, Vec<u8>)>, Result<(), H3Error>); 11] = [
+            (
+                Role::Client,
+                vec![
+                    (FRAME_GOAWAY, id(8)),
+                    (FRAME_GOAWAY, id(8)),
+                    (FRAME_GOAWAY, id(4)),
+                ],
+                Ok(()),
+            ),
+            (
+                Role::Client,
+                vec![(FRAME_GOAWAY, id(6))],
+                Err(H3Error::IdError),
+            ),
+            (
+                Role::Client,
+                vec![(FRAME_GOAWAY, id(4)), (FRAME_GOAWAY, id(8))],
+                Err(H3Error::IdError),
+            ),
+            (
+                Role::Server,
+                vec![(FRAME_GOAWAY, id(7)), (FRAME_GOAWAY, id(3))],
+                Ok(()),
+            ),
+            (
+                Role::Server,
+                vec![(FRAME_GOAWAY, id(3)), (FRAME_GOAWAY, id(7))],
+                Err(H3Error::IdError),
+            ),
+            (
+                Role::Server,
+                vec![
+                    (FRAME_MAX_PUSH_ID, id(3)),
+                    (FRAME_MAX_PUSH_ID, id(3)),
+                    (FRAME_MAX_PUSH_ID, id(9)),
+                ],
+                Ok(()),
+            ),
+            (
+                Role::Server,
+                vec![(FRAME_MAX_PUSH_ID, id(9)), (FRAME_MAX_PUSH_ID, id(3))],
+                Err(H3Error::IdError),
+            ),
+            (
+                Role::Client,
+                vec![(FRAME_GOAWAY, vec![])],
+                Err(H3Error::FrameError),
+            ),
+            (
+                Role::Client,
+                vec![(FRAME_GOAWAY, vec![0, 0])],
+                Err(H3Error::FrameError),
+            ),
+            (
+                Role::Server,
+                vec![(FRAME_MAX_PUSH_ID, vec![0x40])],
+                Err(H3Error::FrameError),
+            ),
+            (
+                Role::Server,
+                vec![(FRAME_CANCEL_PUSH, vec![0, 0])],
+                Err(H3Error::FrameError),
+            ),
+        ];
+        for (role, frames, expected) in cases {
+            let mut data = control_bytes(FRAME_SETTINGS, &our_settings());
+            for (frame_type, payload) in &frames {
+                encode_frame(&mut data, *frame_type, payload);
+            }
+            let peer_control_stream = match role {
+                Role::Client => 3,
+                Role::Server => 2,
+            };
+            assert_eq!(
+                QpackCtx::new(role).on_uni(peer_control_stream, &data, false),
+                expected,
+                "{role:?} 가 받은 제어 프레임 {frames:?}"
+            );
+        }
+    }
+
+    #[test]
+    /**
      * @brief 단방향 스트림 오류마다 RFC 9114 와 RFC 9204 코드를 고르는지.
      * @details 서버 푸시 스트림은 서버에게는 열 수 없는 스트림이고, 푸시를 허락하지 않은
      *          클라이언트에게는 있을 수 없는 푸시 번호다.
@@ -2813,6 +3144,237 @@ mod tests {
             assert_eq!(
                 fatal(&undecodable, role),
                 Some(H3Error::DecompressionFailed)
+            );
+        }
+    }
+
+    /** @brief 추출 결과를 비교할 수 있는 이름으로 바꾼다. */
+    fn outcome<T>(extracted: Extracted<T>) -> String {
+        match extracted {
+            Extracted::Done(_) => "done".into(),
+            Extracted::Blocked => "blocked".into(),
+            Extracted::Bad => "bad".into(),
+            Extracted::Fatal(error) => format!("{error:?}"),
+            Extracted::Refused(status) => String::from_utf8_lossy(status).into_owned(),
+        }
+    }
+
+    /** @brief 헤더 구역 하나 뒤에 프레임들을 이어 붙인 메시지. */
+    fn message(head: &[u8], rest: &[(u64, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_frame(&mut buf, FRAME_HEADERS, head);
+        for (frame_type, payload) in rest {
+            encode_frame(&mut buf, *frame_type, payload);
+        }
+        buf
+    }
+
+    #[test]
+    /**
+     * @brief 트레일러가 붙은 요청과 응답, 그리고 중간 응답을 받아들이는지.
+     * @details RFC 9114 는 메시지 끝에 트레일러 구역 하나를, 최종 응답 앞에 1xx 중간 응답을
+     *          허락한다. 거부하면 규격을 지킨 상대와 통신하지 못한다.
+     */
+    fn trailers_and_interim_responses_are_accepted() {
+        let dns: &[u8] = b"\x12\x34dns";
+        let trailer = encoded_headers(&[(b"x-checksum", b"abc")]);
+
+        let request = message(
+            &qpack::doh_post_request_headers("h", "/dns-query", dns.len()),
+            &[(FRAME_DATA, dns), (FRAME_HEADERS, &trailer)],
+        );
+        assert!(matches!(
+            extract_dns_request(&mut qpack::Decoder::new(4096), 0, &request),
+            Extracted::Done(request) if request.wire == dns
+        ));
+
+        let response = message(
+            &encoded_headers(&[(b":status", b"103"), (b"link", b"</a.css>; rel=preload")]),
+            &[
+                (
+                    FRAME_HEADERS,
+                    &encoded_headers(&[
+                        (b":status", b"200"),
+                        (b"content-type", b"application/dns-message"),
+                    ]),
+                ),
+                (FRAME_DATA, dns),
+                (FRAME_HEADERS, &trailer),
+            ],
+        );
+        assert!(matches!(
+            extract_dns_response(&mut qpack::Decoder::new(4096), 0, &response),
+            Extracted::Done((200, body)) if body == dns
+        ));
+    }
+
+    #[test]
+    /**
+     * @brief 트레일러와 중간 응답의 규칙 위반을 맞는 결과로 거부하는지.
+     * @details 트레일러 뒤의 HEADERS 나 DATA 는 프레임 배치 오류라 연결 오류다. 트레일러의 의사
+     *          헤더와 연결 전용 필드, 101 응답, 중간 응답 뒤의 본문, 최종 응답이 없는 응답은
+     *          메시지만 어긋난 것이다.
+     */
+    fn trailer_and_interim_violations_are_rejected() {
+        let dns: &[u8] = b"\x12\x34dns";
+        let request_head = qpack::doh_post_request_headers("h", "/dns-query", dns.len());
+        let final_head = encoded_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/dns-message"),
+        ]);
+        let interim_head = encoded_headers(&[(b":status", b"103")]);
+        let trailer = encoded_headers(&[(b"x-checksum", b"abc")]);
+        let pseudo_trailer = encoded_headers(&[(b":path", b"/other")]);
+        let te_trailer = encoded_headers(&[(b"te", b"trailers")]);
+        let connection_trailer = encoded_headers(&[(b"connection", b"close")]);
+        let request = |rest: &[(u64, &[u8])]| {
+            outcome(extract_dns_request(
+                &mut qpack::Decoder::new(4096),
+                0,
+                &message(&request_head, rest),
+            ))
+        };
+        let response = |head: &[u8], rest: &[(u64, &[u8])]| {
+            outcome(extract_dns_response(
+                &mut qpack::Decoder::new(4096),
+                0,
+                &message(head, rest),
+            ))
+        };
+
+        for rest in [
+            [
+                (FRAME_DATA, dns),
+                (FRAME_HEADERS, &trailer[..]),
+                (FRAME_DATA, dns),
+            ],
+            [
+                (FRAME_DATA, dns),
+                (FRAME_HEADERS, &trailer[..]),
+                (FRAME_HEADERS, &trailer[..]),
+            ],
+        ] {
+            assert_eq!(request(&rest), "FrameUnexpected", "요청 트레일러 뒤 프레임");
+            assert_eq!(
+                response(&final_head, &rest),
+                "FrameUnexpected",
+                "응답 트레일러 뒤 프레임"
+            );
+        }
+        for bad_trailer in [&pseudo_trailer, &te_trailer, &connection_trailer] {
+            let rest = [(FRAME_DATA, dns), (FRAME_HEADERS, &bad_trailer[..])];
+            assert_eq!(request(&rest), "bad", "요청 트레일러 내용");
+            assert_eq!(response(&final_head, &rest), "bad", "응답 트레일러 내용");
+        }
+
+        let switching = encoded_headers(&[(b":status", b"101")]);
+        assert_eq!(
+            response(
+                &switching,
+                &[(FRAME_HEADERS, &final_head), (FRAME_DATA, dns)]
+            ),
+            "bad",
+            "HTTP/3 에는 101 응답이 없습니다"
+        );
+        assert_eq!(
+            response(
+                &interim_head,
+                &[(FRAME_DATA, dns), (FRAME_HEADERS, &final_head)]
+            ),
+            "bad",
+            "중간 응답에는 본문이 없습니다"
+        );
+        assert_eq!(
+            response(&interim_head, &[]),
+            "bad",
+            "최종 응답 없이 끝난 응답입니다"
+        );
+    }
+
+    /**
+     * @brief 헤더 구역은 바로 풀리고 트레일러 구역만 테이블을 기다리는 메시지를 만든다.
+     * @return 디코더, 메시지, 그리고 트레일러가 기다리는 테이블 갱신 지시.
+     */
+    fn message_with_blocked_trailer(head: &[(&[u8], &[u8])]) -> (qpack::Decoder, Vec<u8>, Vec<u8>) {
+        let mut encoder = qpack::Encoder::new();
+        encoder.set_peer_max_capacity(QPACK_CAPACITY as usize);
+        let mut decoder = qpack::Decoder::new(QPACK_CAPACITY as usize);
+
+        /* 헤더 구역이 동적 항목을 참조해야 그 구역에도 확인 지시가 생긴다. */
+        let (_, inserts) = encoder.encode_field_section(&[(b"x-head", b"1")]);
+        decoder.on_encoder_stream(&inserts).unwrap();
+        encoder
+            .on_decoder_stream(&decoder.take_decoder_stream())
+            .unwrap();
+        let mut head = head.to_vec();
+        head.push((b"x-head", b"1"));
+        let (head_section, inserts) = encoder.encode_field_section(&head);
+        decoder.on_encoder_stream(&inserts).unwrap();
+        encoder
+            .on_decoder_stream(&decoder.take_decoder_stream())
+            .unwrap();
+
+        /* 상대가 받았다고 확인한 것처럼 꾸며 디코더가 아직 받지 못한 항목을 참조하게 한다. */
+        let trailer: [(&[u8], &[u8]); 1] = [(b"x-trailer", b"t")];
+        let (_, pending_inserts) = encoder.encode_field_section(&trailer);
+        encoder.on_decoder_stream(&[0x01]).unwrap();
+        let (trailer_section, _) = encoder.encode_field_section(&trailer);
+
+        let bytes = message(
+            &head_section,
+            &[
+                (FRAME_DATA, b"\x12\x34dns"),
+                (FRAME_HEADERS, &trailer_section),
+            ],
+        );
+        (decoder, bytes, pending_inserts)
+    }
+
+    #[test]
+    /**
+     * @brief 트레일러 구역만 테이블을 기다려도 어느 구역의 확인 지시도 미리 내보내지 않는지.
+     * @details 헤더 구역을 먼저 풀고 기다렸다가 다시 풀면 그 구역의 확인 지시가 두 번 나간다.
+     *          RFC 9204 는 모든 구역이 이미 확인된 스트림을 가리키는 확인 지시를
+     *          QPACK_DECODER_STREAM_ERROR 로 정했다.
+     */
+    fn blocked_trailer_holds_every_section_acknowledgment() {
+        let request_head: [(&[u8], &[u8]); 5] = [
+            (b":method", b"POST"),
+            (b":scheme", b"https"),
+            (b":authority", b"dns.test"),
+            (b":path", b"/dns-query"),
+            (b"content-type", b"application/dns-message"),
+        ];
+        let response_head: [(&[u8], &[u8]); 2] = [
+            (b":status", b"200"),
+            (b"content-type", b"application/dns-message"),
+        ];
+        for (role, head) in [
+            (Role::Server, &request_head[..]),
+            (Role::Client, &response_head[..]),
+        ] {
+            let (mut decoder, bytes, pending_inserts) = message_with_blocked_trailer(head);
+            let extract = |decoder: &mut qpack::Decoder| match role {
+                Role::Server => outcome(extract_dns_request(decoder, 0, &bytes)),
+                Role::Client => outcome(extract_dns_response(decoder, 0, &bytes)),
+            };
+            assert_eq!(extract(&mut decoder), "blocked", "{role:?}");
+            assert!(
+                decoder.take_decoder_stream().is_empty(),
+                "기다리는 동안 확인 지시를 내보냈습니다 ({role:?})"
+            );
+
+            decoder.on_encoder_stream(&pending_inserts).unwrap();
+            assert_eq!(
+                decoder.take_decoder_stream(),
+                vec![0x01],
+                "항목 수 증가 지시"
+            );
+            assert_eq!(extract(&mut decoder), "done", "{role:?}");
+            assert_eq!(
+                decoder.take_decoder_stream(),
+                vec![0x80, 0x80],
+                "두 구역에 확인 지시가 하나씩 나가야 합니다 ({role:?})"
             );
         }
     }

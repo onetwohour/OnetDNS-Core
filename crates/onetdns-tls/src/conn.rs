@@ -759,6 +759,24 @@ impl TlsConnection {
     }
 
     /**
+     * @brief 핸드셰이크를 마친 뒤 상대 인증서를 거부하고 연결을 끝낸다.
+     * @details 폐기 확인처럼 TLS 검증 밖의 정책이 인증서를 받아들이지 않을 때 쓴다. 핸드셰이크
+     *          안에서 거부했을 때처럼 certificate_unknown 치명 경고로 알린다. 경고 없이 TCP 만
+     *          끊으면 상대는 거부와 중간에서 잘린 연결을 구분하지 못한다. 이후 읽기와 쓰기는 이
+     *          사유로 거절한다.
+     */
+    pub fn reject_peer_certificate<S: Write>(&mut self, s: &mut S) {
+        if self.failed.is_some() {
+            return;
+        }
+        let error = TlsError::CertificateUnknown;
+        if let Some(description) = error.alert() {
+            self.write.send_fatal_alert(s, description);
+        }
+        self.failed = Some(error);
+    }
+
+    /**
      * @brief 응용 데이터를 받는다. 핸드셰이크 뒤 메시지도 여기서 처리한다.
      * @details 받은 레코드 때문에 실패하면 그 사유를 치명 경고로 알리고 연결을 실패 상태로
      *          둔다. 상대가 보낸 치명 경고를 받았을 때도 실패 상태로 두지만 경고로 답하지 않는다.
@@ -3157,6 +3175,30 @@ mod tests {
         let mut after = Vec::new();
         assert_eq!(conn.send_close_notify(&mut after), Ok(()));
         assert!(!after.is_empty(), "끊긴 연결을 실패 상태로 두었습니다");
+    }
+
+    #[test]
+    /**
+     * @brief 인증서를 거부한 연결이 certificate_unknown 치명 경고를 한 번 보내고 더는 쓰지
+     *        않는지.
+     * @details 경고 없이 연결만 끊으면 상대는 거부와 중간에서 잘린 연결을 구분하지 못한다.
+     */
+    fn rejected_peer_certificate_sends_certificate_unknown() {
+        let mut conn = test_tls13_connection();
+        let mut wire = Vec::new();
+        conn.reject_peer_certificate(&mut wire);
+        let alert = read_record(&mut wire.as_slice()).unwrap();
+        assert_eq!(
+            test_peer_crypto().decrypt(&alert),
+            Ok((ContentType::Alert, vec![2, 46]))
+        );
+        assert_eq!(
+            conn.write_app(&mut NoIo, b"dns"),
+            Err(TlsError::CertificateUnknown)
+        );
+        let mut again = Vec::new();
+        conn.reject_peer_certificate(&mut again);
+        assert!(again.is_empty(), "끝난 연결에 경고를 다시 보냈습니다");
     }
 
     #[test]

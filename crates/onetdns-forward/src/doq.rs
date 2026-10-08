@@ -610,6 +610,30 @@ mod tests {
 
     #[test]
     /**
+     * @brief 질의를 실어 보낼 수 없는 연결을 DOQ_INTERNAL_ERROR 로 닫는지.
+     * @details 서버가 앞선 데이터를 확인하지 않아 보낼 버퍼가 가득 찬 경우다. 그 연결은 버리고,
+     *          서버에는 정상 종료와 구분되는 내부 실패로 알린다.
+     */
+    fn doq_unsendable_query_closes_with_internal_error() {
+        let _revocation_test_guard = crate::revocation_test_read_guard();
+        let (addr, trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut conn =
+            connect(addr, "dns.test", deadline, &trust).expect("업스트림에 연결하지 못했습니다");
+        crate::quicdrive::fill_send_buffer(&mut conn.conn);
+        let request = q(1, "stuck.test");
+        let wire = request.try_encode().unwrap();
+        let result = roundtrip(&mut conn, &wire, &request, deadline);
+        assert!(matches!(result, Err(ForwardError::Io(_))), "{result:?}");
+        drop(conn);
+        let close = closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("클라이언트가 종료를 알리지 않았습니다");
+        assert_eq!((close.error_code, close.frame_type), (0x1, None));
+    }
+
+    #[test]
+    /**
      * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 경고로 서버에 알리는지.
      * @details TLS 가 인증서를 거부했을 때처럼 CRYPTO_ERROR 를 담은 전송 계층 종료로 나간다.
      */

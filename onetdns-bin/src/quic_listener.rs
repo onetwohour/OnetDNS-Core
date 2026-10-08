@@ -20,7 +20,7 @@ use onetdns_core::udp::RecvWait;
 use onetdns_proto::Message;
 use onetdns_quic::params::TransportParams;
 use onetdns_quic::retry::{build_retry, parse_initial_header, RetryKey};
-use onetdns_quic::{packet, Connection, H3Connection, QuicDiagnostic, QuicError};
+use onetdns_quic::{packet, ClosePeriod, Connection, H3Connection, QuicDiagnostic, QuicError};
 use onetdns_tls::ServerConfig;
 
 use crate::native::NativeServer;
@@ -62,8 +62,11 @@ pub(crate) trait ServerConn {
     fn next_datagram(&mut self) -> Option<Vec<u8>>;
     /** @brief 연결이 닫혔는지. */
     fn is_closed(&self) -> bool;
-    /** @brief 닫힌 연결의 closing 이나 draining 기간까지 끝나 이제 버려도 되는지. */
-    fn is_terminated(&self) -> bool;
+    /**
+     * @brief 닫힌 연결에서 closing 이나 draining 기간에 쓸 상태만 남기고 나머지를 버린다.
+     * @return 열린 연결이거나 기간이 이미 끝났으면 None.
+     */
+    fn into_close_period(self) -> Option<ClosePeriod>;
     /** @brief 전역 메모리 예산에 올릴 보유량. */
     fn retained_payload_bytes(&self) -> usize;
     /** @brief 기록에만 남기는 실패 진단. */
@@ -89,8 +92,8 @@ impl ServerConn for Connection {
     fn is_closed(&self) -> bool {
         Connection::is_closed(self)
     }
-    fn is_terminated(&self) -> bool {
-        Connection::is_terminated(self)
+    fn into_close_period(self) -> Option<ClosePeriod> {
+        Connection::into_close_period(self)
     }
     fn retained_payload_bytes(&self) -> usize {
         Connection::retained_payload_bytes(self)
@@ -119,8 +122,8 @@ impl ServerConn for H3Connection {
     fn is_closed(&self) -> bool {
         H3Connection::is_closed(self)
     }
-    fn is_terminated(&self) -> bool {
-        H3Connection::is_terminated(self)
+    fn into_close_period(self) -> Option<ClosePeriod> {
+        H3Connection::into_close_period(self)
     }
     fn retained_payload_bytes(&self) -> usize {
         H3Connection::retained_payload_bytes(self)
@@ -394,10 +397,25 @@ fn shrink_if_sparse<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
     }
 }
 
-/** @brief 살아 있는 연결 하나와 그 상태. */
+/**
+ * @brief 표에 든 연결의 상태.
+ * @details 닫힌 연결도 closing 이나 draining 기간이 끝날 때까지 표에 남긴다. 그동안 늦게 온
+ *          패킷에 종료를 다시 알려야 하고, 같은 연결 식별자로 오는 패킷을 모르는 연결로 다루지
+ *          않아야 한다. RFC 9000 은 새 연결을 계속 받는 서버가 이 기간을 줄이지 않게 한다. 그
+ *          일에는 키도 버퍼도 쓰지 않으므로 기간의 상태만 남겨, 닫힌 연결이 기간 내내 메모리
+ *          예산을 쥐지 않게 한다.
+ */
+enum ConnState<C> {
+    /** @brief 열린 연결의 상태 기계. */
+    Open(C),
+    /** @brief 닫힌 연결에 남은 기간. */
+    Closing(ClosePeriod),
+}
+
+/** @brief 표에 든 연결 하나와 그 상태. */
 struct ConnEntry<C> {
-    /** @brief 이 연결의 상태 기계. */
-    conn: C,
+    /** @brief 열린 연결이거나 닫힌 연결의 남은 기간. */
+    state: ConnState<C>,
     /** @brief 확인된 상대 주소. */
     peer: SocketAddr,
     /** @brief 마지막으로 무언가 오간 시각. */
@@ -410,54 +428,48 @@ struct ConnEntry<C> {
     memory: QuicMemoryLease,
 }
 
+/** @brief 연결에 쌓인 데이터그램을 모두 상대에게 보낸다. */
+fn flush<C: ServerConn>(
+    conn: &mut C,
+    peer: SocketAddr,
+    socket: &UdpSocket,
+    name: &'static str,
+    stage: &'static str,
+) {
+    while let Some(datagram) = conn.next_datagram() {
+        if let Err(error) = socket.send_to(&datagram, peer) {
+            transport_observe::record_error(name, stage, Some(peer), error);
+        }
+    }
+}
+
 impl<C: ServerConn> ConnEntry<C> {
-    /** @brief 쌓인 데이터그램을 모두 상대에게 보낸다. */
-    fn flush(&mut self, socket: &UdpSocket, name: &'static str, stage: &'static str) {
-        while let Some(datagram) = self.conn.next_datagram() {
-            if let Err(error) = socket.send_to(&datagram, self.peer) {
-                transport_observe::record_error(name, stage, Some(self.peer), error);
-            }
-        }
-    }
-
     /**
-     * @brief 지금 보유량으로 전역 예산의 charge 를 맞춘다.
-     * @return 예산을 넘었으면 false. 부른 쪽이 연결을 버린다.
-     */
-    fn refresh_memory(&mut self, name: &'static str) -> bool {
-        if self.memory.refresh(self.conn.retained_payload_bytes()) {
-            return true;
-        }
-        transport_observe::record_error(
-            name,
-            "memory_budget",
-            Some(self.peer),
-            "Total QUIC connection memory budget exceeded",
-        );
-        false
-    }
-
-    /**
-     * @brief 처리를 마친 연결의 출력을 내보내고 표에 남길지 정한다.
-     * @details 닫힌 연결도 closing 이나 draining 기간이 끝날 때까지 남긴다. 그동안 늦게 온 패킷에
-     *          종료를 다시 알려야 하고, 같은 연결 식별자로 오는 패킷을 모르는 연결로 다루지 않아야
-     *          한다. RFC 9000 은 새 연결을 계속 받는 서버가 이 기간을 줄이지 않게 한다. 메모리
-     *          예산을 넘긴 연결만 종료를 알린 뒤 바로 버린다. 붙들어 두면 예산이 거절한 메모리를
-     *          기간 내내 쥐고 있게 된다.
-     * @return 표에 남길 연결이면 true.
+     * @brief 처리를 마친 열린 연결의 출력을 내보내고 메모리 몫을 지금 보유량에 맞춘다.
+     * @details 예산이 늘려 주지 않으면 과부하를 알리고 닫는다.
+     * @return 연결이 아직 열려 있으면 true. 닫혔으면 부른 쪽이 표의 retire 로 기간의 상태만
+     *         남긴다.
      */
     fn settle<S: QuicService<Conn = C>>(
         &mut self,
         socket: &UdpSocket,
         stage: &'static str,
     ) -> bool {
-        self.flush(socket, S::NAME, stage);
-        if !self.refresh_memory(S::NAME) {
-            S::abandon(&mut self.conn, Abandon::ExcessiveLoad);
-            self.flush(socket, S::NAME, stage);
+        let ConnState::Open(conn) = &mut self.state else {
             return false;
+        };
+        flush(conn, self.peer, socket, S::NAME, stage);
+        if !self.memory.refresh(conn.retained_payload_bytes()) {
+            transport_observe::record_error(
+                S::NAME,
+                "memory_budget",
+                Some(self.peer),
+                "Total QUIC connection memory budget exceeded",
+            );
+            S::abandon(conn, Abandon::ExcessiveLoad);
+            flush(conn, self.peer, socket, S::NAME, stage);
         }
-        !self.conn.is_terminated()
+        !conn.is_closed()
     }
 }
 
@@ -499,16 +511,46 @@ impl<S: QuicService> ConnTable<S> {
     /** @brief 연결 하나를 지우고 별칭과 주소별 계수를 맞춘다. */
     fn remove(&mut self, key: &[u8]) {
         if let Some(entry) = self.conns.remove(key) {
-            let ip = entry.peer.ip();
-            if let Some(count) = self.peer_counts.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.peer_counts.remove(&ip);
-                }
-            }
+            self.release_peer(entry.peer);
         }
         self.aliases.retain(|_, primary| primary.as_slice() != key);
         self.shrink();
+    }
+
+    /** @brief 표에서 뺀 연결 하나를 주소별 연결 수에서 뺀다. */
+    fn release_peer(&mut self, peer: SocketAddr) {
+        let ip = peer.ip();
+        if let Some(count) = self.peer_counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.peer_counts.remove(&ip);
+            }
+        }
+    }
+
+    /**
+     * @brief 닫힌 연결에서 closing 이나 draining 기간의 상태만 남긴다. 기간까지 끝났으면 지운다.
+     * @details 메모리 몫도 남은 상태에 맞춰 줄인다. 예산을 넘겨 닫은 연결은 종료 데이터그램
+     *          때문에 몫이 늘어야 할 수도 있는데, 예산이 거절하면 지금 몫을 그대로 둔다. 기본 몫이
+     *          연결 구조 크기의 두 배 이상이라 종료 데이터그램 하나는 그 여유 안에 든다.
+     * @note 열린 연결에는 남은 기간이 없으므로, 닫히지 않은 연결에 부르면 그 연결을 지운다.
+     */
+    fn retire(&mut self, key: &[u8]) {
+        let Some(mut entry) = self.conns.remove(key) else {
+            return;
+        };
+        let period = match entry.state {
+            ConnState::Open(conn) => conn.into_close_period(),
+            ConnState::Closing(period) => Some(period),
+        };
+        let Some(period) = period else {
+            self.release_peer(entry.peer);
+            self.remove(key);
+            return;
+        };
+        entry.memory.refresh(period.retained_bytes());
+        entry.state = ConnState::Closing(period);
+        self.conns.insert(key.to_vec(), entry);
     }
 
     /**
@@ -565,7 +607,7 @@ impl<S: QuicService> ConnTable<S> {
      *               넘기면 왕복 시간 표본이 실제보다 커지고 PTO 도 실제 전송보다 이르게 잡힌다.
      */
     fn apply_completions(&mut self, socket: &UdpSocket, done: &mut Vec<QueryDone>, now_ms: u64) {
-        let mut lost: Vec<Vec<u8>> = Vec::new();
+        let mut closed: Vec<Vec<u8>> = Vec::new();
         for d in done.drain(..) {
             let Some(entry) = self.conns.get_mut(&d.conn_key) else {
                 continue;
@@ -581,32 +623,48 @@ impl<S: QuicService> ConnTable<S> {
              * 닫힌 연결에는 답을 실을 곳이 없다. 실으려 하면 Closed 오류가 나서 정상적인 종료를
              * 응답 송신 실패로 기록하게 된다.
              */
-            if entry.conn.is_closed() {
+            let ConnState::Open(conn) = &mut entry.state else {
+                continue;
+            };
+            if conn.is_closed() {
                 continue;
             }
-            entry.conn.set_now(now_ms);
-            let sent = S::send_answer(&mut entry.conn, d.stream_id, wire, d.max_age);
-            connection_survives::<S>(&mut entry.conn, entry.peer, sent);
+            conn.set_now(now_ms);
+            let sent = S::send_answer(conn, d.stream_id, wire, d.max_age);
+            connection_survives::<S>(conn, entry.peer, sent);
             if !entry.settle::<S>(socket, "send_datagram") {
-                lost.push(d.conn_key);
+                closed.push(d.conn_key);
             }
         }
-        for key in lost {
-            self.remove(&key);
+        for key in closed {
+            self.retire(&key);
         }
     }
 
     /** @brief 데드라인이 지난 연결의 재전송을 돌리고 closing 기간이 끝난 연결을 버린다. */
     fn drive_timeouts(&mut self, socket: &UdpSocket, now_ms: u64) {
-        let mut lost = Vec::new();
+        let mut closed = Vec::new();
+        let mut ended = Vec::new();
         for (key, entry) in self.conns.iter_mut() {
-            entry.conn.set_now(now_ms);
-            entry.conn.on_timeout(now_ms);
-            if !entry.settle::<S>(socket, "timeout_send") {
-                lost.push(key.clone());
+            match &mut entry.state {
+                ConnState::Open(conn) => {
+                    conn.set_now(now_ms);
+                    conn.on_timeout(now_ms);
+                    if !entry.settle::<S>(socket, "timeout_send") {
+                        closed.push(key.clone());
+                    }
+                }
+                ConnState::Closing(period) => {
+                    if period.is_over(now_ms) {
+                        ended.push(key.clone());
+                    }
+                }
             }
         }
-        for key in lost {
+        for key in closed {
+            self.retire(&key);
+        }
+        for key in ended {
             self.remove(&key);
         }
     }
@@ -619,9 +677,11 @@ impl<S: QuicService> ConnTable<S> {
      */
     fn close_all(&mut self, socket: &UdpSocket, now_ms: u64) {
         for entry in self.conns.values_mut() {
-            entry.conn.set_now(now_ms);
-            S::abandon(&mut entry.conn, Abandon::Shutdown);
-            entry.flush(socket, S::NAME, "shutdown_send");
+            if let ConnState::Open(conn) = &mut entry.state {
+                conn.set_now(now_ms);
+                S::abandon(conn, Abandon::Shutdown);
+                flush(conn, entry.peer, socket, S::NAME, "shutdown_send");
+            }
         }
         self.clear();
     }
@@ -761,9 +821,29 @@ impl<S: QuicService> Listener<S> {
             return;
         }
         entry.last = now;
-        entry.conn.set_now(now_ms);
-        let received = entry.conn.recv_datagram(bytes);
-        if let Some(diagnostic) = entry.conn.take_diagnostic() {
+        let conn = match &mut entry.state {
+            ConnState::Open(conn) => conn,
+            /*
+             * 닫힌 연결에 남은 일은 늦게 온 패킷에 종료를 다시 알리는 것뿐이다. 패킷을 풀지
+             * 않으므로 실려 온 요청도 맡기지 않는다.
+             */
+            ConnState::Closing(period) => {
+                if let Some(datagram) = period.answer(bytes.len()) {
+                    if let Err(error) = self.socket.send_to(&datagram, entry.peer) {
+                        transport_observe::record_error(
+                            S::NAME,
+                            "send_datagram",
+                            Some(entry.peer),
+                            error,
+                        );
+                    }
+                }
+                return;
+            }
+        };
+        conn.set_now(now_ms);
+        let received = conn.recv_datagram(bytes);
+        if let Some(diagnostic) = conn.take_diagnostic() {
             transport_observe::record_quic_diagnostic(S::NAME, Some(entry.peer), diagnostic);
         }
         match received {
@@ -776,10 +856,10 @@ impl<S: QuicService> Listener<S> {
                 );
             }
             /*
-             * 닫힌 연결에 남은 일은 늦게 온 패킷에 종료를 다시 알리는 것뿐이다. 같은 데이터그램에
-             * 요청이 실려 왔어도 답할 연결이 없으므로 워커에 맡기지 않는다.
+             * 연결이 닫혔으면 같은 데이터그램에 요청이 실려 왔어도 답할 연결이 없으므로 워커에
+             * 맡기지 않는다.
              */
-            Ok(()) if entry.conn.is_closed() => {}
+            Ok(()) if conn.is_closed() => {}
             Ok(()) => {
                 let mut intake = Intake {
                     key: &key,
@@ -788,11 +868,11 @@ impl<S: QuicService> Listener<S> {
                     inflight: &mut entry.inflight,
                     pool: &self.pool,
                 };
-                self.service.dispatch(&mut entry.conn, &mut intake);
+                self.service.dispatch(conn, &mut intake);
             }
         }
         if !entry.settle::<S>(&self.socket, "send_datagram") {
-            self.table.remove(&key);
+            self.table.retire(&key);
         }
     }
 
@@ -876,7 +956,7 @@ impl<S: QuicService> Listener<S> {
             dcid,
             local_cid.clone(),
             ConnEntry {
-                conn: S::Conn::from_quic(conn),
+                state: ConnState::Open(S::Conn::from_quic(conn)),
                 peer,
                 last: now,
                 epoch: self.next_epoch,
@@ -1052,7 +1132,7 @@ mod tests {
             SERVER_KEY.to_vec(),
             SERVER_KEY.to_vec(),
             ConnEntry {
-                conn: server,
+                state: ConnState::Open(server),
                 peer,
                 last: Instant::now(),
                 epoch: 7,
@@ -1266,9 +1346,20 @@ mod tests {
         );
 
         table.drive_timeouts(&socket, 0);
+        let entry = table
+            .conns
+            .get(SERVER_KEY)
+            .expect("closing 기간이 끝나기 전에 연결을 버렸습니다");
         assert!(
-            table.conns.contains_key(SERVER_KEY),
-            "closing 기간이 끝나기 전에 연결을 버렸습니다"
+            matches!(entry.state, ConnState::Closing(_)),
+            "닫힌 연결의 키와 버퍼를 closing 기간에도 쥐고 있습니다"
+        );
+        assert!(
+            budget.used_bytes()
+                <= crate::quic_memory::QUIC_CONNECTION_BASE_CHARGE
+                    + onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize,
+            "closing 기간의 연결이 종료 데이터그램보다 많은 몫을 쥐고 있습니다: {}",
+            budget.used_bytes()
         );
 
         table.drive_timeouts(&socket, 60_000);
@@ -1359,32 +1450,70 @@ mod tests {
         );
     }
 
+    /** @brief 소켓에 오는 데이터그램 하나. 5초 안에 오지 않으면 None. */
+    fn next_datagram_on(socket: &UdpSocket) -> Option<Vec<u8>> {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        socket
+            .recv_from(&mut buf)
+            .ok()
+            .map(|(n, _)| buf[..n].to_vec())
+    }
+
     #[test]
     /**
-     * @brief 메모리 예산을 넘긴 연결이 과부하를 알린 뒤 바로 표에서 빠지는지.
-     * @details 붙들어 두면 예산이 거절한 메모리를 closing 기간 내내 쥐고 있게 된다.
+     * @brief 메모리 예산을 넘긴 연결이 과부하를 알리고, 버퍼는 버린 채 closing 기간을 지키는지.
+     * @details 기간을 지키지 않으면 종료 패킷을 잃은 클라이언트에 다시 알릴 수 없고, 같은 연결
+     *          식별자로 오는 패킷을 모르는 연결의 것으로 다루게 된다. 버퍼를 쥔 채 남기면 예산이
+     *          거절한 메모리를 기간 내내 쥐고 있게 된다.
      */
-    fn memory_budget_overrun_closes_with_excessive_load() {
+    fn memory_budget_overrun_keeps_only_the_closing_period() {
         let (mut client, server) = handshaked_pair(b"doq");
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = client_socket.local_addr().unwrap();
         let budget = Arc::new(QuicMemoryBudget::new(
             crate::quic_memory::QUIC_CONNECTION_BASE_CHARGE,
         ));
-        let mut table = conn_table::<Doq>(
-            server,
-            client_socket.local_addr().unwrap(),
-            budget.clone(),
-            0,
+        let mut listener = listener_with(
+            Probe::default(),
+            conn_table(server, peer, budget.clone(), 0),
         );
 
-        table.drive_timeouts(&socket, 0);
-        assert!(table.conns.is_empty(), "예산을 넘긴 연결이 표에 남았습니다");
-        assert_eq!(budget.used_bytes(), 0, "버린 연결의 메모리 몫이 남았습니다");
+        listener.table.drive_timeouts(&listener.socket, 0);
+        let close = next_datagram_on(&client_socket).expect("과부하를 알리지 않았습니다");
+        let _ = client.recv_datagram(&close);
         assert_eq!(
-            received_close(&client_socket, &mut client),
+            close_of(&client),
             Some((0x4, None)),
-            "과부하를 알리지 않았습니다"
+            "과부하 코드가 아닙니다"
         );
+        let entry = listener
+            .table
+            .conns
+            .get(SERVER_KEY)
+            .expect("closing 기간이 끝나기 전에 연결을 버렸습니다");
+        assert!(
+            matches!(entry.state, ConnState::Closing(_)),
+            "예산이 거절한 버퍼를 closing 기간에도 쥐고 있습니다"
+        );
+
+        let mut late = vec![0x40];
+        late.extend_from_slice(SERVER_KEY);
+        late.resize(100, 0);
+        listener.on_datagram(&late, peer, &mut None);
+        assert_eq!(
+            next_datagram_on(&client_socket),
+            Some(close),
+            "늦게 온 패킷에 종료를 다시 알리지 않았습니다"
+        );
+
+        listener.table.drive_timeouts(&listener.socket, 60_000);
+        assert!(
+            listener.table.conns.is_empty(),
+            "closing 기간이 끝난 연결이 남았습니다"
+        );
+        assert_eq!(budget.used_bytes(), 0, "버린 연결의 메모리 몫이 남았습니다");
     }
 }

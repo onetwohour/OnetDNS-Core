@@ -27,7 +27,9 @@ pub mod retry;
 /** @brief QUIC 가변 길이 정수. */
 pub mod varint;
 
-pub use conn::{Connection, PeerClose, QuicDiagnostic, QuicError, Role, MAX_RECV_UDP_PAYLOAD};
+pub use conn::{
+    ClosePeriod, Connection, PeerClose, QuicDiagnostic, QuicError, Role, MAX_RECV_UDP_PAYLOAD,
+};
 pub use h3::{H3Client, H3Connection, H3Error};
 
 use sha2::Sha256;

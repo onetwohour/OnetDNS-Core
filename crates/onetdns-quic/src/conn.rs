@@ -93,6 +93,8 @@ const FINAL_SIZE_ERROR: u64 = 0x6;
 const FRAME_ENCODING_ERROR: u64 = 0x7;
 /** @brief 상대의 전송 매개변수가 규격이나 실제로 오간 값과 어긋난다. */
 const TRANSPORT_PARAMETER_ERROR: u64 = 0x8;
+/** @brief 상대가 준 연결 식별자나 버려야 할 식별자가 이쪽 상한을 넘었다. */
+const CONNECTION_ID_LIMIT_ERROR: u64 = 0x9;
 /** @brief 더 구체적인 코드가 없는 규격 위반. */
 const PROTOCOL_VIOLATION: u64 = 0xa;
 /** @brief 순서가 어긋난 핸드셰이크 데이터가 모아 둘 수 있는 양을 넘었다. */
@@ -142,6 +144,8 @@ pub enum QuicError {
     FlowControl,
     /** @brief 상대가 허락한 스트림 수를 넘겼다. */
     StreamLimit,
+    /** @brief 상대가 준 연결 식별자나 버려야 할 식별자가 이쪽 상한을 넘었다. */
+    ConnectionIdLimit,
     /**
      * @brief 응용 계층이 이 코드로 연결을 닫았다.
      * @details QUIC 위의 계층이 자기 규격 위반을 찾았을 때 돌려준다. 종료 프레임에는 이 코드와
@@ -160,6 +164,12 @@ pub enum QuicError {
      * @details 상대가 STOP_SENDING 으로 답을 거절했거나 이쪽이 이미 끝을 보낸 스트림이다.
      */
     StreamClosed,
+    /**
+     * @brief 상대가 연결 정리를 알려 새 요청을 열 수 없다.
+     * @details HTTP/3 서버가 GOAWAY 를 보낸 뒤다. 연결은 아직 열려 있고 앞서 보낸 요청의 답은
+     *          올 수 있다.
+     */
+    GoingAway,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +208,7 @@ impl QuicError {
      * @brief 이 오류로 연결을 닫을 때 상대에게 알릴 전송 오류 코드.
      * @details TLS 오류는 RFC 9001 이 정한 대로 TLS 경고 코드에 CRYPTO_ERROR 를 더해 알린다.
      *          경고가 정해지지 않은 TLS 오류와, 받는 경로에서 나오지 않는 Application, Closed,
-     *          StreamClosed 는 이쪽 내부 실패로 알린다.
+     *          StreamClosed, GoingAway 는 이쪽 내부 실패로 알린다.
      */
     fn transport_code(&self) -> u64 {
         match self {
@@ -212,9 +222,11 @@ impl QuicError {
             QuicError::CryptoBufferExceeded => CRYPTO_BUFFER_EXCEEDED,
             QuicError::FlowControl => FLOW_CONTROL_ERROR,
             QuicError::StreamLimit => STREAM_LIMIT_ERROR,
-            QuicError::Application { .. } | QuicError::Closed | QuicError::StreamClosed => {
-                INTERNAL_ERROR
-            }
+            QuicError::ConnectionIdLimit => CONNECTION_ID_LIMIT_ERROR,
+            QuicError::Application { .. }
+            | QuicError::Closed
+            | QuicError::StreamClosed
+            | QuicError::GoingAway => INTERNAL_ERROR,
         }
     }
 }
@@ -237,8 +249,10 @@ impl std::fmt::Display for QuicError {
             QuicError::CryptoBufferExceeded => "Too much out-of-order handshake data",
             QuicError::FlowControl => "Flow control violation",
             QuicError::StreamLimit => "QUIC stream limit exceeded",
+            QuicError::ConnectionIdLimit => "QUIC connection ID limit exceeded",
             QuicError::Closed => "Connection closed",
             QuicError::StreamClosed => "Stream no longer accepts data",
+            QuicError::GoingAway => "Peer is shutting the connection down",
         };
         f.write_str(reason)
     }
@@ -453,6 +467,7 @@ fn frame_retained_payload_bytes(frame: &Frame) -> usize {
             .saturating_mul(std::mem::size_of::<(u64, u64)>()),
         Frame::Crypto { data, .. } | Frame::Stream { data, .. } => data.capacity(),
         Frame::ConnectionClose { reason, .. } => reason.capacity(),
+        Frame::NewConnectionId { cid, .. } => cid.capacity(),
         _ => 0,
     }
 }
@@ -510,6 +525,12 @@ fn transport_params_retained_bytes(params: &TransportParams) -> usize {
                 .retry_source_connection_id
                 .as_ref()
                 .map_or(0, Vec::capacity),
+        )
+        .saturating_add(
+            params
+                .preferred_address
+                .as_ref()
+                .map_or(0, |address| address.cid.capacity()),
         )
 }
 
@@ -660,14 +681,28 @@ struct PendingStreamSend {
     copies: usize,
 }
 
+/** @brief 상대가 이쪽에 준 연결 식별자 하나. 이쪽이 보내는 패킷의 목적지로 쓴다. */
+struct PeerCid {
+    /** @brief 상대가 붙인 순번. 핸드셰이크에서 정한 식별자가 0 번이다. */
+    sequence: u64,
+    /** @brief 식별자. */
+    cid: Vec<u8>,
+    /**
+     * @brief 이 식별자를 쓰는 동안 상태 없는 재설정을 알아볼 토큰.
+     * @details 클라이언트는 재설정 토큰을 전송 매개변수로 보낼 수 없어서, 서버가 받은 0 번
+     *          식별자에는 토큰이 없다.
+     */
+    reset_token: Option<[u8; 16]>,
+}
+
 /**
  * @brief 닫은 뒤 상태를 버리기 전까지 머무는 기간. RFC 9000 의 closing 과 draining 상태다.
  * @details 이쪽이 닫았으면 closing 이다. 종료 프레임이 사라졌을 수 있으므로 늦게 온 패킷에 같은
  *          종료 데이터그램으로 다시 답한다. 상대가 닫았으면 draining 이고 아무것도 보내지 않는다.
  *          어느 쪽이든 늦게 온 패킷이 새 연결이나 엉뚱한 응답을 끌어내지 않도록 기간 동안 연결을
- *          남겨 둔다.
+ *          남겨 둔다. 이 기간에는 키와 버퍼를 쓰지 않으므로 연결을 버리고 이 상태만 남겨도 된다.
  */
-struct ClosePeriod {
+pub struct ClosePeriod {
     /** @brief closing 이면 다시 보낼 종료 데이터그램. draining 이면 없다. */
     datagram: Option<Vec<u8>>,
     /** @brief 이 시각이 지나면 연결 상태를 버린다. */
@@ -678,6 +713,40 @@ struct ClosePeriod {
     received_bytes: u64,
     /** @brief 이 기간에 다시 보낸 바이트. */
     resent_bytes: u64,
+}
+
+impl ClosePeriod {
+    /**
+     * @brief 기간 중에 받은 데이터그램에 종료 데이터그램으로 다시 답할지 정한다.
+     * @details 종료 프레임이 사라지면 상대는 계속 보내므로 다시 알려야 한다. RFC 9000 이 권하는
+     *          대로 받은 수가 2 의 거듭제곱일 때만 답해 점점 드물게 답한다. 받은 패킷을 풀지 않고
+     *          답하므로, 출발지를 속인 패킷으로 이 연결을 증폭기로 쓰지 못하게 다시 보낸 양을 이
+     *          기간에 받은 양의 세 배로 묶는다. RFC 9000 이 키를 버린 closing 상태에 요구하는
+     *          상한이다.
+     * @param len 받은 데이터그램의 크기.
+     * @return 다시 보낼 종료 데이터그램. draining 이거나 이번에는 답하지 않으면 None.
+     */
+    pub fn answer(&mut self, len: usize) -> Option<Vec<u8>> {
+        let datagram = self.datagram.as_ref()?;
+        self.received = self.received.saturating_add(1);
+        self.received_bytes = self.received_bytes.saturating_add(len as u64);
+        let resent = self.resent_bytes.saturating_add(datagram.len() as u64);
+        if !self.received.is_power_of_two() || resent > self.received_bytes.saturating_mul(3) {
+            return None;
+        }
+        self.resent_bytes = resent;
+        Some(datagram.clone())
+    }
+
+    /** @brief 이 시각에 기간이 끝났는지. 끝났으면 상태를 버려도 된다. */
+    pub fn is_over(&self, now_ms: u64) -> bool {
+        now_ms >= self.until_ms
+    }
+
+    /** @brief 이 상태가 별도 버퍼에 쥔 바이트. */
+    pub fn retained_bytes(&self) -> usize {
+        self.datagram.as_ref().map_or(0, Vec::capacity)
+    }
 }
 
 /**
@@ -703,10 +772,29 @@ pub struct Connection {
     spaces: [SpaceState; 3],
     /** @brief 상대가 이쪽을 부를 때 쓰는 식별자. */
     local_cid: Vec<u8>,
-    /** @brief 이쪽이 상대를 부를 때 쓰는 식별자. */
+    /** @brief 이쪽이 상대를 부를 때 쓰는 식별자. peer_cids 가운데 peer_cid_in_use 번이다. */
     remote_cid: Vec<u8>,
     /** @brief 처음 받은 식별자. 첫 키를 여기서 이끌어 낸다. */
     initial_dcid: Vec<u8>,
+    /**
+     * @brief 상대가 첫 Initial 에 실은 출발지 식별자.
+     * @details RFC 9000 은 이 값으로만 목적지를 정하게 하고, 뒤에 다른 출발지 식별자로 온
+     *          Initial 은 버리게 한다. 전송 매개변수의 initial_source_connection_id 도 이 값과
+     *          대조한다.
+     */
+    peer_initial_scid: Option<Vec<u8>>,
+    /**
+     * @brief 상대가 준 연결 식별자 가운데 아직 버리지 않은 것들. 순번 오름차순이다.
+     * @details 상대의 전송 매개변수를 받아들일 때 0 번과, 서버가 선호 주소를 알렸으면 1 번으로
+     *          채운다. 그 뒤로는 NEW_CONNECTION_ID 가 더하고 retire_prior_to 가 뺀다.
+     */
+    peer_cids: Vec<PeerCid>,
+    /** @brief 지금 목적지로 쓰는 상대 식별자의 순번. */
+    peer_cid_in_use: u64,
+    /** @brief 상대가 알린 가장 큰 retire_prior_to. 이보다 앞선 순번은 모두 버렸다. */
+    peer_retire_prior_to: u64,
+    /** @brief 버린다고 알렸지만 그 알림을 담은 패킷이 아직 확인되지 않은 순번들. */
+    retiring_peer_cids: Vec<u64>,
     /** @brief 핸드셰이크가 끝났는지. */
     handshake_complete: bool,
     /**
@@ -858,7 +946,11 @@ pub struct Connection {
     /** @brief 키를 교체해도 되는지. 교체하자마자 또 교체하면 상대가 따라오지 못한다. */
     key_update_allowed: bool,
 
-    /** @brief 상대가 준 상태 없는 초기화 토큰. */
+    /**
+     * @brief 지금 목적지로 쓰는 상대 식별자에 묶인 상태 없는 재설정 토큰.
+     * @details RFC 9000 은 버린 식별자의 토큰으로 재설정을 알아보지 못하게 하므로, 목적지를 바꿀
+     *          때 함께 바꾼다.
+     */
     peer_reset_token: Option<[u8; 16]>,
 
     /** @brief 그 초기화를 받았는지. */
@@ -915,6 +1007,11 @@ impl Connection {
             local_cid,
             remote_cid: Vec::new(),
             initial_dcid: Vec::new(),
+            peer_initial_scid: None,
+            peer_cids: Vec::new(),
+            peer_cid_in_use: 0,
+            peer_retire_prior_to: 0,
+            retiring_peer_cids: Vec::new(),
             handshake_complete: false,
             handshake_confirmed: false,
             handshake_resumed: false,
@@ -1020,6 +1117,11 @@ impl Connection {
             local_cid: scid,
             remote_cid: dcid.clone(),
             initial_dcid: dcid.clone(),
+            peer_initial_scid: None,
+            peer_cids: Vec::new(),
+            peer_cid_in_use: 0,
+            peer_retire_prior_to: 0,
+            retiring_peer_cids: Vec::new(),
             handshake_complete: false,
             handshake_confirmed: false,
             handshake_resumed: false,
@@ -1235,11 +1337,11 @@ impl Connection {
         }
 
         /*
-         * 서버의 Initial 을 처리한 뒤에는 Retry 를 받지 않는다. Initial 공간을 버린 뒤에는
-         * Handshake 키도 곧 버리므로 키가 있는지만 보면 끝난 연결이 Retry 로 처음부터 다시
+         * RFC 9000 은 서버의 Initial 을 하나라도 처리한 뒤의 Retry 를 버리게 한다. ServerHello
+         * 가 없는 Initial 뒤에도 받으면 이미 오간 Initial 의 상태를 모두 버리고 처음부터 다시
          * 시작한다.
          */
-        if self.spaces[HANDSHAKE].recv_keys.is_some() || self.spaces[INITIAL].discarded {
+        if self.peer_initial_scid.is_some() {
             return;
         }
         let Some((scid, token)) = parse_retry(pkt) else {
@@ -1340,28 +1442,38 @@ impl Connection {
             if let Some(raw) = peer_tp {
                 match self.decode_peer_transport_params(&raw) {
                     Some(tp) => {
-                        let cid_valid = match self.role {
-                            Role::Client => {
-                                tp.original_destination_connection_id.as_deref()
-                                    == Some(self.initial_dcid.as_slice())
-                                    && tp.initial_source_connection_id.as_deref()
-                                        == Some(self.remote_cid.as_slice())
-                                    && match &self.retry_scid {
-                                        Some(expected) => {
-                                            tp.retry_source_connection_id.as_deref()
-                                                == Some(expected.as_slice())
+                        let initial_scid_valid = tp.initial_source_connection_id.is_some()
+                            && tp.initial_source_connection_id == self.peer_initial_scid;
+                        /*
+                         * 선호 주소는 서버만 알릴 수 있고, 길이 0 식별자를 고른 서버는 알릴 수
+                         * 없다(RFC 9000).
+                         */
+                        let preferred_address_valid = tp.preferred_address.is_none()
+                            || (self.role == Role::Client
+                                && tp
+                                    .initial_source_connection_id
+                                    .as_ref()
+                                    .is_some_and(|scid| !scid.is_empty()));
+                        let cid_valid = initial_scid_valid
+                            && preferred_address_valid
+                            && match self.role {
+                                Role::Client => {
+                                    tp.original_destination_connection_id.as_deref()
+                                        == Some(self.initial_dcid.as_slice())
+                                        && match &self.retry_scid {
+                                            Some(expected) => {
+                                                tp.retry_source_connection_id.as_deref()
+                                                    == Some(expected.as_slice())
+                                            }
+                                            None => tp.retry_source_connection_id.is_none(),
                                         }
-                                        None => tp.retry_source_connection_id.is_none(),
-                                    }
-                            }
-                            Role::Server => {
-                                tp.initial_source_connection_id.as_deref()
-                                    == Some(self.remote_cid.as_slice())
-                                    && tp.original_destination_connection_id.is_none()
-                                    && tp.retry_source_connection_id.is_none()
-                                    && tp.stateless_reset_token.is_none()
-                            }
-                        };
+                                }
+                                Role::Server => {
+                                    tp.original_destination_connection_id.is_none()
+                                        && tp.retry_source_connection_id.is_none()
+                                        && tp.stateless_reset_token.is_none()
+                                }
+                            };
                         if !cid_valid {
                             self.note_diagnostic(QuicDiagnostic::TransportParameters);
                             self.close_on_error(
@@ -1374,6 +1486,18 @@ impl Connection {
                         self.peer_max_streams_bidi = tp.initial_max_streams_bidi;
                         self.peer_max_streams_uni = tp.initial_max_streams_uni;
                         self.peer_reset_token = tp.stateless_reset_token;
+                        self.peer_cids = vec![PeerCid {
+                            sequence: 0,
+                            cid: self.remote_cid.clone(),
+                            reset_token: tp.stateless_reset_token,
+                        }];
+                        if let Some(address) = &tp.preferred_address {
+                            self.peer_cids.push(PeerCid {
+                                sequence: 1,
+                                cid: address.cid.clone(),
+                                reset_token: Some(address.reset_token),
+                            });
+                        }
                         self.peer_tp = Some(tp);
                     }
                     None => {
@@ -1602,27 +1726,13 @@ impl Connection {
         received
     }
 
-    /**
-     * @brief closing 기간에 받은 데이터그램에 종료 데이터그램으로 다시 답할지 정한다.
-     * @details 종료 프레임이 사라지면 상대는 계속 보내므로 다시 알려야 한다. RFC 9000 이 권하는
-     *          대로 받은 수가 2 의 거듭제곱일 때만 답해 점점 드물게 답한다. 받은 패킷을 풀지 않고
-     *          답하므로, 출발지를 속인 패킷으로 이 연결을 증폭기로 쓰지 못하게 다시 보낸 양을 이
-     *          기간에 받은 양의 세 배로 묶는다. RFC 9000 이 키를 버린 closing 상태에 요구하는
-     *          상한이다.
-     */
+    /** @brief closing 기간에 받은 데이터그램에 종료 데이터그램으로 다시 답할지 정한다. */
     fn answer_while_closing(&mut self, len: usize) {
-        let Some(period) = self.close_period.as_mut() else {
-            return;
-        };
-        let Some(datagram) = period.datagram.as_ref() else {
-            return;
-        };
-        period.received = period.received.saturating_add(1);
-        period.received_bytes = period.received_bytes.saturating_add(len as u64);
-        let resent = period.resent_bytes.saturating_add(datagram.len() as u64);
-        if period.received.is_power_of_two() && resent <= period.received_bytes.saturating_mul(3) {
-            period.resent_bytes = resent;
-            let datagram = datagram.clone();
+        if let Some(datagram) = self
+            .close_period
+            .as_mut()
+            .and_then(|period| period.answer(len))
+        {
             self.out_datagrams.push_back(datagram);
         }
     }
@@ -1630,9 +1740,9 @@ impl Connection {
     /**
      * @brief 데이터그램에 붙어 온 패킷들을 처리한다.
      * @details 데이터그램에는 패킷이 여러 개 붙어 올 수 있다. 소비한 길이를 따라가며
-     *          끝까지 처리한다. 앞 패킷이 연결을 닫았으면 뒤 패킷은 처리하지 않는다. 종료는 모든
-     *          스트림을 함께 닫으므로 뒤에 붙은 프레임은 이미 끝난 연결의 것이고, 남겨 두는 종료
-     *          사유도 처음 받은 것이어야 한다.
+     *          끝까지 처리한다. 앞 패킷이 연결을 닫았으면 뒤 패킷의 프레임은 처리하지 않는다.
+     *          종료는 모든 스트림을 함께 닫으므로 뒤에 붙은 프레임은 이미 끝난 연결의 것이다. 뒤에
+     *          붙은 1-RTT 패킷에서는 종료 사유만 읽는다.
      * @warning 아직 인증되지 않은 바이트다. 길이와 식별자를 모두 검사하고, 풀리지 않는
      *          패킷은 조용히 버린다. 오류를 내면 그것이 곧 탐색 신호가 된다.
      */
@@ -1662,31 +1772,8 @@ impl Connection {
                 if self.role == Role::Server && !self.handshake_complete {
                     break;
                 }
-                let keys = match self.spaces[APP].recv_keys.clone() {
-                    Some(k) => k,
-                    None => break,
-                };
-                let largest = self.spaces[APP].largest_recv.unwrap_or(0);
-
-                let alt = if self.key_update_allowed && !self.app_recv_secret.is_empty() {
-                    let (_, klen) = suite_aead(self.app_suite);
-                    let next = next_key_update_secret(&self.app_recv_secret);
-                    Some(derive_updated_kv(&next, klen, keys.1.hp.clone()))
-                } else {
-                    None
-                };
-                let res = packet::unprotect_short(
-                    keys.0,
-                    &keys.1,
-                    alt.as_ref(),
-                    self.recv_key_phase,
-                    rest,
-                    self.local_cid.len(),
-                    largest,
-                );
-                let (sp, phase_changed) = match res {
-                    Some(v) => v,
-                    None => break,
+                let Some((sp, phase_changed)) = self.unprotect_one_rtt(rest) else {
+                    break;
                 };
                 if phase_changed {
                     self.commit_key_update();
@@ -1751,8 +1838,21 @@ impl Connection {
                 };
                 pos += lp.consumed;
 
-                if space == INITIAL && self.remote_cid != lp.scid {
-                    self.remote_cid = lp.scid.clone();
+                if space == INITIAL {
+                    /*
+                     * RFC 9000 은 상대의 첫 Initial 로만 목적지를 정하고, 뒤에 다른 출발지
+                     * 식별자로 온 Initial 은 버리게 한다. Initial 키는 목적지 식별자만 알면
+                     * 누구나 만들 수 있어서, 받을 때마다 바꾸면 지어낸 패킷 하나로 이쪽이 보내는
+                     * 목적지가 바뀐다.
+                     */
+                    match &self.peer_initial_scid {
+                        None => {
+                            self.remote_cid = lp.scid.clone();
+                            self.peer_initial_scid = Some(lp.scid.clone());
+                        }
+                        Some(first) if *first != lp.scid => continue,
+                        Some(_) => {}
+                    }
                 }
                 let kind = match ptype_val {
                     ptype::INITIAL => PacketKind::Initial,
@@ -1763,9 +1863,85 @@ impl Connection {
                 self.process_packet_kind(space, lp.pn, &lp.payload, kind)?;
             }
         }
+        if self.closed && pos < dg.len() {
+            self.take_one_rtt_close(&dg[pos..]);
+        }
         self.discard_finished_spaces();
         self.flush();
         Ok(())
+    }
+
+    /**
+     * @brief 1-RTT 패킷의 보호를 벗긴다.
+     * @return 푼 패킷과 상대가 키를 바꿨는지. 1-RTT 키가 없거나 인증에 실패하면 None.
+     */
+    fn unprotect_one_rtt(&self, pkt: &[u8]) -> Option<(packet::ShortPacket, bool)> {
+        let (aead, keys) = self.spaces[APP].recv_keys.as_ref()?;
+        let largest = self.spaces[APP].largest_recv.unwrap_or(0);
+        let alt = if self.key_update_allowed && !self.app_recv_secret.is_empty() {
+            let (_, klen) = suite_aead(self.app_suite);
+            let next = next_key_update_secret(&self.app_recv_secret);
+            Some(derive_updated_kv(&next, klen, keys.hp.clone()))
+        } else {
+            None
+        };
+        packet::unprotect_short(
+            *aead,
+            keys,
+            alt.as_ref(),
+            self.recv_key_phase,
+            pkt,
+            self.local_cid.len(),
+            largest,
+        )
+    }
+
+    /**
+     * @brief 상대의 종료를 받은 데이터그램 뒤쪽에 1-RTT 패킷이 붙어 있으면 그 패킷의 종료
+     *        사유를 남긴다.
+     * @details 핸드셰이크가 확정되기 전에 닫는 쪽은 이쪽이 어느 키까지 가졌는지 몰라 같은 종료를
+     *          공간마다 싣는다. RFC 9000 은 Initial 과 Handshake 사본에서 응용 계층의 코드와 사유를
+     *          감추게 하므로, 상대가 정한 실제 사유는 1-RTT 사본에만 있다. 연결은 이미 닫혔으므로
+     *          그 패킷의 다른 프레임은 처리하지 않는다.
+     * @param rest 종료를 실은 패킷 뒤에 남은 바이트.
+     */
+    fn take_one_rtt_close(&mut self, mut rest: &[u8]) {
+        loop {
+            let Some(&first) = rest.first() else {
+                return;
+            };
+            if first & 0x80 == 0 {
+                if first & 0x40 == 0 {
+                    return;
+                }
+                break;
+            }
+            let Some(len) = packet::long_packet_len(rest) else {
+                return;
+            };
+            rest = &rest[len..];
+        }
+        let Some((packet, _)) = self.unprotect_one_rtt(rest) else {
+            return;
+        };
+        let close = frame::parse(&packet.payload)
+            .into_iter()
+            .flatten()
+            .find_map(|f| match f {
+                Frame::ConnectionClose {
+                    error_code,
+                    frame_type,
+                    reason,
+                } => Some(PeerClose {
+                    error_code,
+                    frame_type,
+                    reason,
+                }),
+                _ => None,
+            });
+        if close.is_some() {
+            self.peer_close = close;
+        }
     }
 
     /**
@@ -1921,7 +2097,7 @@ impl Connection {
                     break;
                 }
                 Frame::PathChallenge(data) => {
-                    if kind != PacketKind::OneRtt {
+                    if matches!(kind, PacketKind::Initial | PacketKind::Handshake) {
                         return Err(QuicError::Frame);
                     }
                     ack_eliciting = true;
@@ -1971,20 +2147,35 @@ impl Connection {
                         self.recv_stream_properties(id)?;
                     }
                 }
-                Frame::Other(frame_type) => {
-                    let one_rtt_only = matches!(
-                        frame_type,
-                        frame::ftype::NEW_TOKEN
-                            | frame::ftype::NEW_CONNECTION_ID
-                            | frame::ftype::RETIRE_CONNECTION_ID
-                    );
-                    if one_rtt_only && kind != PacketKind::OneRtt {
-                        return Err(QuicError::Frame);
-                    }
+                Frame::NewConnectionId {
+                    sequence,
+                    retire_prior_to,
+                    cid,
+                    reset_token,
+                } => {
                     if matches!(kind, PacketKind::Initial | PacketKind::Handshake) {
                         return Err(QuicError::Frame);
                     }
-                    if frame_type == frame::ftype::NEW_TOKEN && self.role != Role::Client {
+                    ack_eliciting = true;
+                    self.on_new_connection_id(sequence, retire_prior_to, cid, reset_token)?;
+                }
+                Frame::RetireConnectionId(_) => {
+                    /*
+                     * 이쪽은 핸드셰이크에서 정한 식별자 하나만 주고, 상대는 모든 패킷을 그
+                     * 식별자로 보낸다. 0 번을 버리라는 요청은 자기를 담은 패킷의 목적지를
+                     * 가리키고, 그보다 큰 순번은 준 적이 없으며, 길이 0 식별자를 준 쪽에는 이
+                     * 프레임이 올 수 없다. RFC 9000 은 첫째를 PROTOCOL_VIOLATION 으로 처리해도
+                     * 되게 하고, 나머지 둘은 반드시 그렇게 처리하게 한다.
+                     */
+                    return Err(QuicError::Frame);
+                }
+                Frame::Other(frame_type) => {
+                    if matches!(kind, PacketKind::Initial | PacketKind::Handshake) {
+                        return Err(QuicError::Frame);
+                    }
+                    if frame_type == frame::ftype::NEW_TOKEN
+                        && (kind != PacketKind::OneRtt || self.role != Role::Client)
+                    {
                         return Err(QuicError::Frame);
                     }
                     ack_eliciting = true;
@@ -2002,6 +2193,102 @@ impl Connection {
             st.ack_pending = true;
         }
         self.last_activity_ms = self.now_ms;
+        Ok(())
+    }
+
+    /**
+     * @brief 상대가 준 새 연결 식별자를 RFC 9000 의 규칙대로 받아들인다.
+     * @details retire_prior_to 가 커지면 그보다 앞선 식별자를 먼저 버리고 새 식별자를 더한다.
+     *          지금 목적지로 쓰는 식별자를 버렸으면 남은 것 가운데 순번이 가장 작은 것으로
+     *          옮긴다. 이미 버리라고 한 순번으로 늦게 온 식별자는 더하지 않고 버린다고 알린다.
+     *          같은 프레임이 재전송으로 다시 오는 것은 오류가 아니다.
+     * @retval QuicError::Frame 이쪽이 길이 0 식별자로 보내고 있거나, 순번이나 식별자가 같은데
+     *         나머지 내용이 다르다.
+     * @retval QuicError::ConnectionIdLimit 살아 있는 식별자가 이쪽이 알린 상한을 넘었거나
+     *         버림 알림이 너무 많이 밀렸다.
+     */
+    fn on_new_connection_id(
+        &mut self,
+        sequence: u64,
+        retire_prior_to: u64,
+        cid: Vec<u8>,
+        reset_token: [u8; 16],
+    ) -> Result<(), QuicError> {
+        if self.remote_cid.is_empty() {
+            return Err(QuicError::Frame);
+        }
+        if let Some(known) = self
+            .peer_cids
+            .iter()
+            .find(|known| known.sequence == sequence || known.cid == cid)
+        {
+            let repeated = known.sequence == sequence
+                && known.cid == cid
+                && known.reset_token == Some(reset_token);
+            return if repeated {
+                Ok(())
+            } else {
+                Err(QuicError::Frame)
+            };
+        }
+        if sequence < self.peer_retire_prior_to {
+            return self.retire_peer_cid(sequence);
+        }
+        if retire_prior_to > self.peer_retire_prior_to {
+            self.peer_retire_prior_to = retire_prior_to;
+            let mut retired = Vec::new();
+            self.peer_cids.retain(|known| {
+                let keep = known.sequence >= retire_prior_to;
+                if !keep {
+                    retired.push(known.sequence);
+                }
+                keep
+            });
+            for retired_sequence in retired {
+                self.retire_peer_cid(retired_sequence)?;
+            }
+        }
+        let index = self
+            .peer_cids
+            .partition_point(|known| known.sequence < sequence);
+        self.peer_cids.insert(
+            index,
+            PeerCid {
+                sequence,
+                cid,
+                reset_token: Some(reset_token),
+            },
+        );
+        if self.peer_cid_in_use < self.peer_retire_prior_to {
+            let next = &self.peer_cids[0];
+            self.peer_cid_in_use = next.sequence;
+            self.remote_cid = next.cid.clone();
+            self.peer_reset_token = next.reset_token;
+        }
+        if self.peer_cids.len() as u64 > self.base_tp.active_connection_id_limit {
+            return Err(QuicError::ConnectionIdLimit);
+        }
+        Ok(())
+    }
+
+    /**
+     * @brief 상대가 준 식별자 하나를 버린다고 알린다.
+     * @details 알림을 담은 패킷이 확인될 때까지 그 순번을 기억해 같은 알림을 거듭 쌓지 않는다.
+     *          RFC 9000 은 확인받지 못한 버림 알림을 이쪽 상한의 두 배까지 감당하라고 하고, 그
+     *          이상은 CONNECTION_ID_LIMIT_ERROR 로 처리해도 되게 한다. 이 상한이 없으면 상대는
+     *          확인을 보내지 않으면서 버릴 식별자를 계속 주어 이쪽이 보낼 알림을 끝없이 늘린다.
+     */
+    fn retire_peer_cid(&mut self, sequence: u64) -> Result<(), QuicError> {
+        if self.retiring_peer_cids.contains(&sequence) {
+            return Ok(());
+        }
+        let limit = self.base_tp.active_connection_id_limit.saturating_mul(2);
+        if self.retiring_peer_cids.len() as u64 >= limit {
+            return Err(QuicError::ConnectionIdLimit);
+        }
+        self.retiring_peer_cids.push(sequence);
+        self.out_frames_app
+            .push(Frame::RetireConnectionId(sequence));
         Ok(())
     }
 
@@ -2523,6 +2810,12 @@ impl Connection {
                 .get(acked.partition_point(|&(lo, _)| lo > sp.pn))
                 .copied();
             if range.is_some_and(|(lo, hi)| (lo..=hi).contains(&sp.pn)) {
+                for frame_value in &sp.frames {
+                    if let Frame::RetireConnectionId(sequence) = frame_value {
+                        self.retiring_peer_cids
+                            .retain(|retiring| retiring != sequence);
+                    }
+                }
                 acked_bytes += sp.size;
                 if self
                     .recovery_start_ms
@@ -2704,7 +2997,7 @@ impl Connection {
             if self
                 .close_period
                 .as_ref()
-                .is_some_and(|period| now_ms >= period.until_ms)
+                .is_some_and(|period| period.is_over(now_ms))
             {
                 self.close_period = None;
             }
@@ -2799,6 +3092,20 @@ impl Connection {
             .saturating_add(self.local_cid.capacity())
             .saturating_add(self.remote_cid.capacity())
             .saturating_add(self.initial_dcid.capacity())
+            .saturating_add(self.peer_initial_scid.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(
+                self.peer_cids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PeerCid>()),
+            )
+            .saturating_add(self.peer_cids.iter().fold(0usize, |sum, known| {
+                sum.saturating_add(known.cid.capacity())
+            }))
+            .saturating_add(
+                self.retiring_peer_cids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
             .saturating_add(
                 self.peer_close
                     .as_ref()
@@ -2892,8 +3199,7 @@ impl Connection {
             .saturating_add(
                 self.close_period
                     .as_ref()
-                    .and_then(|period| period.datagram.as_ref())
-                    .map_or(0, Vec::capacity),
+                    .map_or(0, ClosePeriod::retained_bytes),
             );
 
         for space in &self.spaces {
@@ -3116,10 +3422,11 @@ impl Connection {
          * 둔다. 그 뒤에는 채움 바이트도 붙일 수 없어서, Initial 을 담은 데이터그램에는 짧은 헤더
          * 패킷을 함께 싣지 않고 따로 보낸다.
          */
+        let max_datagram = self.max_datagram();
         let mut dg = Vec::new();
         let mut dg_has_initial = false;
         for (is_short, is_initial, p) in packets {
-            let full = dg.len() + p.len() > MAX_DATAGRAM;
+            let full = dg.len() + p.len() > max_datagram;
             if !dg.is_empty() && (full || (is_short && dg_has_initial)) {
                 self.queue_datagram(std::mem::take(&mut dg), dg_has_initial);
                 dg_has_initial = false;
@@ -3133,6 +3440,23 @@ impl Connection {
         if !dg.is_empty() {
             self.queue_datagram(dg, dg_has_initial);
         }
+    }
+
+    /**
+     * @brief 패킷을 합쳐 만들 데이터그램의 크기 상한.
+     * @details 상대가 max_udp_payload_size 로 알린 크기보다 큰 데이터그램은 RFC 9000 에 따라
+     *          상대가 처리하지 않을 수 있다. 상대 매개변수를 받기 전에 보내는 0-RTT 에는 지난
+     *          연결에서 기억한 값을 쓴다. 매개변수 해석이 1200 미만을 거부하므로 Initial 을 채우는
+     *          최소 크기보다 작아지지 않는다.
+     */
+    fn max_datagram(&self) -> usize {
+        self.peer_tp
+            .as_ref()
+            .or(self.early_peer_tp.as_ref())
+            .map_or(MAX_DATAGRAM, |tp| {
+                usize::try_from(tp.max_udp_payload_size)
+                    .map_or(MAX_DATAGRAM, |limit| limit.min(MAX_DATAGRAM))
+            })
     }
 
     /**
@@ -3651,6 +3975,20 @@ impl Connection {
     }
 
     /**
+     * @brief 닫힌 연결에서 closing 이나 draining 기간에 쓸 상태만 떼어 내고 나머지를 버린다.
+     * @details 기간에 남은 일은 늦게 온 패킷에 종료를 다시 알리고 끝나는 시각을 지키는 것뿐이라
+     *          키와 버퍼가 필요 없다. 연결을 여럿 붙드는 쪽이 닫힌 연결의 메모리를 기간 내내 쥐지
+     *          않게 할 때 쓴다. 아직 꺼내지 않은 데이터그램도 함께 버려진다.
+     * @return 남은 기간의 상태. 열린 연결이거나 기간이 이미 끝났으면 None.
+     */
+    pub fn into_close_period(mut self) -> Option<ClosePeriod> {
+        if !self.closed {
+            return None;
+        }
+        self.close_period.take()
+    }
+
+    /**
      * @brief 이쪽이 먼저 연결을 닫고 그 까닭을 상대에게 알린다.
      *
      * @details 알리지 않고 상태만 지우면 상대는 아무것도 받지 못한 채 자기 유휴 데드라인까지
@@ -4093,6 +4431,8 @@ fn is_retransmittable(f: &Frame) -> bool {
             | Frame::MaxStreamData { .. }
             | Frame::MaxStreams { .. }
             | Frame::HandshakeDone
+            | Frame::NewConnectionId { .. }
+            | Frame::RetireConnectionId(_)
             | Frame::PathChallenge(_)
     )
 }
@@ -5351,13 +5691,13 @@ mod tests {
         assert!(client.is_terminated());
     }
 
-    #[test]
     /**
-     * @brief 연결을 닫은 패킷 뒤에 같은 데이터그램으로 붙어 온 패킷을 처리하지 않는지.
-     * @details 종료는 모든 스트림을 함께 닫는다. 뒤의 스트림 데이터를 받으면 끝난 연결의 데이터를
-     *          응용 계층에 넘기고, 뒤에 붙은 종료는 처음 받은 사유를 덮어쓴다.
+     * @brief 클라이언트는 핸드셰이크를 마쳤지만 서버는 아직 확정하지 못한 연결 한 쌍.
+     * @details 서버가 Handshake 와 1-RTT 키를 함께 가지고 있어 두 패킷을 한 데이터그램에 실어
+     *          보낼 수 있고, 클라이언트는 둘 다 풀 수 있다.
+     * @return 클라이언트와 서버.
      */
-    fn packets_coalesced_after_a_close_are_ignored() {
+    fn unconfirmed_pair() -> (Connection, Connection) {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
             b"SERVERID".to_vec(),
@@ -5383,13 +5723,24 @@ mod tests {
                 && server.spaces[APP].send_keys.is_some(),
             "Handshake 와 1-RTT 패킷을 함께 주고받을 수 없어 이 테스트가 재려던 것을 측정하지 못했습니다"
         );
+        (client, server)
+    }
 
-        let first = Frame::ConnectionClose {
-            error_code: PROTOCOL_VIOLATION,
+    #[test]
+    /**
+     * @brief 연결을 닫은 패킷 뒤에 같은 데이터그램으로 붙어 온 1-RTT 패킷에서 종료 사유만
+     *        읽는지.
+     * @details 종료는 모든 스트림을 함께 닫는다. 뒤의 스트림 데이터를 받으면 끝난 연결의 데이터를
+     *          응용 계층에 넘긴다. 뒤의 종료는 앞의 Handshake 사본이 감춘 실제 사유다.
+     */
+    fn only_the_close_is_read_from_packets_coalesced_after_a_close() {
+        let (mut client, mut server) = unconfirmed_pair();
+        let concealed = Frame::ConnectionClose {
+            error_code: APPLICATION_ERROR,
             frame_type: Some(0),
-            reason: b"first".to_vec(),
+            reason: Vec::new(),
         };
-        let mut datagram = forge_packet(&mut server, HANDSHAKE, &encode_frames(&[first]));
+        let mut datagram = forge_packet(&mut server, HANDSHAKE, &encode_frames(&[concealed]));
         datagram.extend(forge_packet(
             &mut server,
             APP,
@@ -5403,7 +5754,7 @@ mod tests {
                 Frame::ConnectionClose {
                     error_code: 0x2,
                     frame_type: None,
-                    reason: b"second".to_vec(),
+                    reason: b"detail".to_vec(),
                 },
             ]),
         ));
@@ -5411,12 +5762,43 @@ mod tests {
 
         assert!(client.is_closed());
         assert_eq!(
-            client.peer_close().map(|close| close.reason.as_slice()),
-            Some(b"first".as_slice())
+            client.peer_close(),
+            Some(&PeerClose {
+                error_code: 0x2,
+                frame_type: None,
+                reason: b"detail".to_vec(),
+            })
         );
         assert!(
             client.take_stream_requests().is_empty(),
             "닫힌 뒤에 붙어 온 스트림 데이터를 받았습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크가 확정되기 전에 상대가 응용 계층 사유로 닫아도 그 사유를 받는지.
+     * @details 닫는 쪽은 Handshake 와 1-RTT 패킷에 종료를 함께 싣고, Handshake 사본에서는 코드와
+     *          사유를 감춘다. 먼저 풀리는 Handshake 사본만 남기면 응용 계층이 정한 사유가 모두
+     *          APPLICATION_ERROR 로 보인다.
+     */
+    fn application_close_before_confirmation_keeps_its_reason() {
+        let (mut client, mut server) = unconfirmed_pair();
+        server.close(0x2, "application detail");
+        let close = server.next_datagram().expect("종료 데이터그램이 없습니다");
+        assert!(
+            packet_kinds(&close).ends_with(&["Handshake", "1-RTT"]),
+            "종료를 Handshake 와 1-RTT 패킷에 함께 싣지 않았습니다: {:?}",
+            packet_kinds(&close)
+        );
+        client.recv_datagram(&close).unwrap();
+        assert_eq!(
+            client.peer_close(),
+            Some(&PeerClose {
+                error_code: 0x2,
+                frame_type: None,
+                reason: b"application detail".to_vec(),
+            })
         );
     }
 
@@ -5568,6 +5950,38 @@ mod tests {
                 }]),
                 CRYPTO_ERROR + 10,
             ),
+            (
+                "이쪽 상한을 넘는 연결 식별자",
+                encode_frames(&[new_cid(1, 0), new_cid(2, 0)]),
+                CONNECTION_ID_LIMIT_ERROR,
+            ),
+            (
+                "확인받지 못한 버림 알림이 상한의 두 배를 넘게 하는 식별자",
+                encode_frames(
+                    &(1..=5)
+                        .map(|sequence| new_cid(sequence, sequence))
+                        .collect::<Vec<_>>(),
+                ),
+                CONNECTION_ID_LIMIT_ERROR,
+            ),
+            (
+                "같은 순번에 다른 식별자",
+                encode_frames(&[
+                    new_cid(1, 0),
+                    Frame::NewConnectionId {
+                        sequence: 1,
+                        retire_prior_to: 0,
+                        cid: issued_cid(9),
+                        reset_token: issued_token(1),
+                    },
+                ]),
+                PROTOCOL_VIOLATION,
+            ),
+            (
+                "이쪽이 주지 않은 식별자의 RETIRE_CONNECTION_ID",
+                encode_frames(&[Frame::RetireConnectionId(1)]),
+                PROTOCOL_VIOLATION,
+            ),
         ];
         for (case, payload, code) in cases {
             assert_eq!(transport_code_for(&payload), code, "{case}");
@@ -5717,6 +6131,7 @@ mod tests {
          * 직접 한다. 하지 않으면 전송 매개변수의 식별자 검사에서 연결이 닫힌다.
          */
         client.remote_cid = server.local_cid.clone();
+        client.peer_initial_scid = Some(server.local_cid.clone());
         assert_eq!(client.on_crypto(HANDSHAKE, 0, handshake), Ok(()));
         assert_eq!(client.tls_receive_level(), Level::Initial);
         assert_eq!(client.on_crypto(INITIAL, 0, hello), Ok(()));
@@ -6714,6 +7129,58 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 상대가 max_udp_payload_size 로 알린 크기를 넘도록 패킷을 합치지 않는지.
+     * @details 이 값은 상대가 받을 수 있는 UDP 페이로드 크기다. 넘겨 보낸 데이터그램은 상대가
+     *          처리하지 않을 수 있고, 그 안에 든 Handshake 패킷은 PTO 마다 같은 크기로 다시 나가
+     *          끝내 닿지 않는다.
+     */
+    fn coalesced_datagrams_respect_the_peer_payload_limit() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        server.base_tp.max_udp_payload_size = 1200;
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        while let Some(dg) = server.next_datagram() {
+            client.recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(
+            client.peer_tp.as_ref().map(|tp| tp.max_udp_payload_size),
+            Some(1200)
+        );
+        while client.next_datagram().is_some() {}
+
+        client.spaces[HANDSHAKE]
+            .out_crypto
+            .extend_from_slice(&[0; 250]);
+        client.send_stream(0, &[0x5a; 900], true).unwrap();
+        client.flush();
+        let sizes: Vec<usize> = std::iter::from_fn(|| client.next_datagram())
+            .map(|dg| dg.len())
+            .collect();
+        let total: usize = sizes.iter().sum();
+        assert!(
+            total > 1200 && total <= MAX_DATAGRAM,
+            "두 패킷을 합친 크기가 두 한도 사이에 있지 않아 재려던 것을 재지 못했습니다: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|&size| size <= 1200),
+            "상대가 받을 수 있는 크기보다 큰 데이터그램을 보냈습니다: {sizes:?}"
+        );
+    }
+
+    #[test]
     /** @brief 키 갱신 중에도 데이터가 끊기지 않는지. */
     fn key_update_rotates_and_keeps_data_flowing() {
         let mut server = Connection::new_server(
@@ -7335,6 +7802,351 @@ mod tests {
         assert!(client.spaces[INITIAL].send_keys.is_none());
         assert!(client.next_datagram().is_none());
         assert!(!client.is_closed());
+    }
+
+    /** @brief 이 연결의 Initial 송신 키로 PING 하나만 담아 최소 크기로 채운 Initial 데이터그램. */
+    fn ping_initial(sender: &Connection, dcid: &[u8], scid: &[u8], pn: u64) -> Vec<u8> {
+        let (aead, keys) = sender.spaces[INITIAL]
+            .send_keys
+            .clone()
+            .expect("Initial 송신 키가 없습니다");
+        let payload = encode_frames(&[Frame::Ping]);
+        let mut datagram = packet::protect_long(
+            aead,
+            &keys,
+            ptype::INITIAL,
+            dcid,
+            scid,
+            &[],
+            pn,
+            4,
+            &payload,
+        );
+        datagram.resize(MIN_INITIAL_DATAGRAM, 0);
+        datagram
+    }
+
+    #[test]
+    /**
+     * @brief 첫 Initial 뒤에 다른 출발지 식별자로 온 Initial 을 버리는지.
+     * @details RFC 9000 은 목적지를 상대의 첫 Initial 로만 정하고 그런 Initial 은 버리게 한다.
+     *          Initial 키는 목적지 식별자만 알면 만들 수 있어서, 받아들이면 지어낸 패킷 하나로
+     *          이쪽이 보내는 목적지가 바뀐다. 서버의 Initial 을 처리한 클라이언트는 Retry 도
+     *          버려야 한다.
+     */
+    fn later_initial_with_another_source_id_is_discarded() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let first = client.next_datagram().unwrap();
+        server.recv_datagram(&first).unwrap();
+        let largest = server.spaces[INITIAL].largest_recv;
+
+        let forged = ping_initial(&client, b"INITDCID", b"OTHERCID", 5);
+        server.recv_datagram(&forged).unwrap();
+        assert_eq!(
+            server.spaces[INITIAL].largest_recv, largest,
+            "다른 출발지 식별자로 온 Initial 을 처리했습니다"
+        );
+        assert_eq!(server.remote_cid, b"CLIENTID");
+
+        client
+            .recv_datagram(&ping_initial(&server, b"CLIENTID", b"SERVERID", 10))
+            .unwrap();
+        assert_eq!(client.remote_cid, b"SERVERID");
+        client
+            .recv_datagram(&ping_initial(&server, b"CLIENTID", b"OTHERSID", 11))
+            .unwrap();
+        assert_eq!(
+            client.remote_cid, b"SERVERID",
+            "두 번째 서버 Initial 이 목적지를 바꿨습니다"
+        );
+        assert_eq!(client.spaces[INITIAL].largest_recv, Some(10));
+
+        let retry = crate::retry::build_retry(b"INITDCID", b"CLIENTID", b"NEWSCID1", b"token");
+        client.recv_datagram(&retry).unwrap();
+        assert_eq!(
+            client.remote_cid, b"SERVERID",
+            "서버 Initial 을 처리한 뒤의 Retry 를 받아들였습니다"
+        );
+        assert!(client.retry_scid.is_none());
+    }
+
+    /** @brief 순번마다 다른 8 바이트 식별자. 상대 연결은 같은 길이로 짧은 헤더를 읽는다. */
+    fn issued_cid(sequence: u64) -> Vec<u8> {
+        let mut cid = b"PEERCID".to_vec();
+        cid.push(sequence as u8);
+        cid
+    }
+
+    /** @brief 순번마다 다른 재설정 토큰. */
+    fn issued_token(sequence: u64) -> [u8; 16] {
+        [0x40 | sequence as u8; 16]
+    }
+
+    /** @brief issued_cid 와 issued_token 을 담은 NEW_CONNECTION_ID. */
+    fn new_cid(sequence: u64, retire_prior_to: u64) -> Frame {
+        Frame::NewConnectionId {
+            sequence,
+            retire_prior_to,
+            cid: issued_cid(sequence),
+            reset_token: issued_token(sequence),
+        }
+    }
+
+    /** @brief 클라이언트가 1-RTT 패킷에 실어 보낸 프레임들을 서버가 받는다. */
+    fn deliver_frames(
+        client: &mut Connection,
+        server: &mut Connection,
+        frames: &[Frame],
+    ) -> Result<(), QuicError> {
+        let datagram = forge_packet(client, APP, &encode_frames(frames));
+        server.recv_datagram(&datagram)
+    }
+
+    /** @brief 서버가 아직 살려 둔 상대 식별자의 순번들. */
+    fn peer_sequences(conn: &Connection) -> Vec<u64> {
+        conn.peer_cids.iter().map(|known| known.sequence).collect()
+    }
+
+    #[test]
+    /**
+     * @brief 상대가 retire_prior_to 로 버리라고 한 식별자를 버리고 목적지를 옮기는지.
+     * @details RFC 9000 은 그 식별자를 더 쓰지 말고 RETIRE_CONNECTION_ID 로 알리게 한다. 계속
+     *          쓰면 상대는 그 식별자로 온 패킷을 받지 못하고, 재설정 토큰도 버린 식별자의 것으로는
+     *          확인하지 못하게 한다. 버린 순번으로 늦게 온 식별자는 받자마자 버린다고 알린다.
+     */
+    fn peer_connection_ids_are_retired_as_the_peer_asks() {
+        let (mut client, mut server) = established_doq_pair();
+        assert_eq!(peer_sequences(&server), [0]);
+
+        deliver_frames(&mut client, &mut server, &[new_cid(1, 0)]).unwrap();
+        deliver_frames(&mut client, &mut server, &[new_cid(1, 0)])
+            .expect("재전송으로 다시 온 같은 프레임을 오류로 처리했습니다");
+        assert_eq!(peer_sequences(&server), [0, 1]);
+        assert_eq!(server.remote_cid, b"CLIENTID");
+        while server.next_datagram().is_some() {}
+
+        deliver_frames(&mut client, &mut server, &[new_cid(2, 2)]).unwrap();
+        assert_eq!(peer_sequences(&server), [2]);
+        assert_eq!(server.remote_cid, issued_cid(2));
+        assert_eq!(server.peer_reset_token, Some(issued_token(2)));
+        assert_eq!(server.retiring_peer_cids, [0, 1]);
+        let mut announced: Vec<u64> = server.spaces[APP]
+            .sent
+            .iter()
+            .flat_map(|packet| &packet.frames)
+            .filter_map(|frame_value| match frame_value {
+                Frame::RetireConnectionId(sequence) => Some(*sequence),
+                _ => None,
+            })
+            .collect();
+        announced.sort_unstable();
+        assert_eq!(
+            announced,
+            [0, 1],
+            "버린 식별자를 상대에게 알리지 않았습니다"
+        );
+        let datagram = server.next_datagram().expect("버림 알림 데이터그램");
+        assert_eq!(
+            &datagram[1..9],
+            issued_cid(2).as_slice(),
+            "버린 식별자로 계속 보냈습니다"
+        );
+
+        let largest = server.spaces[APP].next_pn - 1;
+        let ack = Frame::Ack {
+            largest,
+            delay: 0,
+            first_range: largest,
+            ranges: Vec::new(),
+        };
+        deliver_frames(&mut client, &mut server, &[ack]).unwrap();
+        assert!(server.retiring_peer_cids.is_empty());
+
+        deliver_frames(&mut client, &mut server, &[new_cid(1, 0)]).unwrap();
+        assert_eq!(peer_sequences(&server), [2]);
+        assert_eq!(
+            server.retiring_peer_cids,
+            [1],
+            "이미 버린 순번으로 온 식별자를 버린다고 알리지 않았습니다"
+        );
+
+        let mut stale = vec![0x40u8; 30];
+        stale.extend_from_slice(&issued_token(1));
+        server.recv_datagram(&stale).unwrap();
+        assert!(
+            !server.reset_received(),
+            "버린 식별자의 토큰으로 재설정을 받아들였습니다"
+        );
+        let mut current = vec![0x40u8; 30];
+        current.extend_from_slice(&issued_token(2));
+        server.recv_datagram(&current).unwrap();
+        assert!(server.reset_received());
+    }
+
+    #[test]
+    /**
+     * @brief 0-RTT 패킷에 실을 수 있는 연결 식별자와 경로 프레임을 RFC 9000 대로 가르는지.
+     * @details NEW_CONNECTION_ID 와 PATH_CHALLENGE 는 0-RTT 에도 실을 수 있다. RETIRE_CONNECTION_ID
+     *          는 0-RTT 에 실을 수 없어 프로토콜 위반으로 처리해도 되고, Initial 과 Handshake
+     *          패킷에는 어느 쪽도 실을 수 없다.
+     */
+    fn zero_rtt_carries_connection_id_and_path_challenge_frames() {
+        let (_client, mut server) = established_doq_pair();
+        let allowed = encode_frames(&[Frame::PathChallenge([7; 8]), new_cid(1, 0)]);
+        assert_eq!(
+            server.process_packet_kind(APP, 100, &allowed, PacketKind::ZeroRtt),
+            Ok(())
+        );
+        assert_eq!(peer_sequences(&server), [0, 1]);
+        assert!(server.out_frames_app.contains(&Frame::PathResponse([7; 8])));
+
+        let retire = encode_frames(&[Frame::RetireConnectionId(0)]);
+        assert_eq!(
+            server.process_packet_kind(APP, 101, &retire, PacketKind::ZeroRtt),
+            Err(QuicError::Frame)
+        );
+        let handshake = encode_frames(&[new_cid(2, 0)]);
+        assert_eq!(
+            server.process_packet_kind(HANDSHAKE, 0, &handshake, PacketKind::Handshake),
+            Err(QuicError::Frame)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 길이 0 식별자로 보내는 쪽이 NEW_CONNECTION_ID 를 거부하는지.
+     * @details RFC 9000 은 길이 0 목적지 식별자로 보내는 쪽이 이 프레임을 받으면 반드시
+     *          PROTOCOL_VIOLATION 으로 처리하게 한다.
+     */
+    fn new_connection_id_is_refused_by_a_zero_length_sender() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            Vec::new(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert!(server.is_handshake_complete() && server.remote_cid.is_empty());
+        assert_eq!(
+            deliver_frames(&mut client, &mut server, &[new_cid(1, 0)]),
+            Err(QuicError::Frame)
+        );
+    }
+
+    /** @brief 테스트용 선호 주소. */
+    fn preferred_address(cid: &[u8]) -> crate::params::PreferredAddress {
+        crate::params::PreferredAddress {
+            ipv4: "192.0.2.1:853".parse().unwrap(),
+            ipv6: "[2001:db8::1]:853".parse().unwrap(),
+            cid: cid.to_vec(),
+            reset_token: [0x3c; 16],
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 서버의 선호 주소에 실린 식별자를 순번 1 로 세는지.
+     * @details 그 식별자도 상대가 준 식별자라서 이쪽 상한에 든다. 빼고 세면 상한을 넘긴 서버를
+     *          알아채지 못한다. 같은 식별자를 NEW_CONNECTION_ID 로 다시 알리는 것은 오류가 아니다.
+     */
+    fn preferred_address_connection_id_counts_as_sequence_one() {
+        let mut tp = TransportParams::server_defaults();
+        tp.preferred_address = Some(preferred_address(b"PREFERID"));
+        let mut server =
+            Connection::new_server(server_cfg(vec![b"doq".to_vec()]), b"SERVERID".to_vec(), tp);
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert!(client.is_handshake_confirmed());
+        assert_eq!(peer_sequences(&client), [0, 1]);
+
+        let repeated = Frame::NewConnectionId {
+            sequence: 1,
+            retire_prior_to: 0,
+            cid: b"PREFERID".to_vec(),
+            reset_token: [0x3c; 16],
+        };
+        let datagram = forge_packet(&mut server, APP, &encode_frames(&[repeated]));
+        client.recv_datagram(&datagram).unwrap();
+
+        let datagram = forge_packet(&mut server, APP, &encode_frames(&[new_cid(2, 0)]));
+        assert_eq!(
+            client.recv_datagram(&datagram),
+            Err(QuicError::ConnectionIdLimit)
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 선호 주소를 잘못 알린 상대를 TRANSPORT_PARAMETER_ERROR 로 거부하는지.
+     * @details RFC 9000 은 선호 주소를 서버만 보낼 수 있고, 길이 0 식별자를 고른 서버는 보낼 수
+     *          없다고 정한다.
+     */
+    fn misplaced_preferred_address_is_a_transport_parameter_error() {
+        let mut client_tp = TransportParams::server_defaults();
+        client_tp.preferred_address = Some(preferred_address(b"PREFERID"));
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            client_tp,
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(
+            client.peer_close().map(|close| close.error_code),
+            Some(TRANSPORT_PARAMETER_ERROR),
+            "클라이언트가 보낸 선호 주소를 받아들였습니다"
+        );
+
+        let mut server_tp = TransportParams::server_defaults();
+        server_tp.preferred_address = Some(preferred_address(b"PREFERID"));
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            server_tp,
+        );
+        server.local_cid.clear();
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(
+            server.peer_close().map(|close| close.error_code),
+            Some(TRANSPORT_PARAMETER_ERROR),
+            "길이 0 식별자를 고른 서버의 선호 주소를 받아들였습니다"
+        );
     }
 
     #[test]

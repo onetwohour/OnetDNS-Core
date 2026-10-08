@@ -665,6 +665,47 @@ impl Decoder {
     }
 
     /**
+     * @brief 헤더 구역 접두부에서 Required Insert Count 를 읽는다.
+     * @return 접두부가 어긋나면 None 이다.
+     */
+    fn required_insert_count(&self, buf: &[u8], pos: &mut usize) -> Option<u64> {
+        let enc_ric = read_int(buf, pos, 8)?;
+        if enc_ric == 0 {
+            return Some(0);
+        }
+        let max_entries = (self.max_capacity / ENTRY_OVERHEAD) as u64;
+        if max_entries == 0 {
+            return None;
+        }
+        let full_range = 2 * max_entries;
+        if enc_ric > full_range {
+            return None;
+        }
+        let max_value = self.table.insert_count + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut ric = max_wrapped + enc_ric - 1;
+        if ric > max_value {
+            if ric <= full_range {
+                return None;
+            }
+            ric -= full_range;
+        }
+        (ric != 0).then_some(ric)
+    }
+
+    /**
+     * @brief 이 헤더 구역이 아직 오지 않은 테이블 항목을 기다려야 하는지.
+     * @details 상태를 바꾸지 않는다. 한 스트림에 헤더 구역이 여럿이면 하나라도 기다릴 때 어느
+     *          구역도 풀지 않아야 한다. 먼저 푼 구역의 확인 지시가 나간 뒤 다시 시도하면 같은
+     *          구역의 확인 지시가 또 나가고, 상대는 그것을 QPACK_DECODER_STREAM_ERROR 로 본다.
+     *          접두부가 어긋난 구역은 기다리지 않는다고 답하며, 실제로 풀 때 오류가 된다.
+     */
+    pub fn is_blocked(&self, buf: &[u8]) -> bool {
+        self.required_insert_count(buf, &mut 0)
+            .is_some_and(|ric| ric > self.table.insert_count)
+    }
+
+    /**
      * @brief 헤더 구역을 푼다.
      * @return 아직 도착하지 않은 동적 항목을 참조하면 대기 상태를 돌려준다. 그 경우 테이블이
      *         채워진 뒤 다시 시도한다.
@@ -672,33 +713,8 @@ impl Decoder {
     pub fn decode_field_section(&mut self, stream_id: u64, buf: &[u8]) -> DecodeResult {
         let mut pos = 0usize;
 
-        let Some(enc_ric) = read_int(buf, &mut pos, 8) else {
+        let Some(ric) = self.required_insert_count(buf, &mut pos) else {
             return DecodeResult::Error;
-        };
-        let max_entries = (self.max_capacity / ENTRY_OVERHEAD) as u64;
-        let ric = if enc_ric == 0 {
-            0
-        } else {
-            if max_entries == 0 {
-                return DecodeResult::Error;
-            }
-            let full_range = 2 * max_entries;
-            if enc_ric > full_range {
-                return DecodeResult::Error;
-            }
-            let max_value = self.table.insert_count + max_entries;
-            let max_wrapped = (max_value / full_range) * full_range;
-            let mut ric = max_wrapped + enc_ric - 1;
-            if ric > max_value {
-                if ric <= full_range {
-                    return DecodeResult::Error;
-                }
-                ric -= full_range;
-            }
-            if ric == 0 {
-                return DecodeResult::Error;
-            }
-            ric
         };
         if ric > self.table.insert_count {
             return DecodeResult::Blocked;

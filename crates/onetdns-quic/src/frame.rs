@@ -133,6 +133,21 @@ pub enum Frame {
     /** @brief 핸드셰이크가 끝났음을 알린다. */
     HandshakeDone,
 
+    /** @brief 이쪽이 목적지로 쓸 수 있는 연결 식별자를 하나 더 준다. */
+    NewConnectionId {
+        /** @brief 상대가 이 식별자에 붙인 순번. 핸드셰이크에서 정한 식별자가 0 번이다. */
+        sequence: u64,
+        /** @brief 이 순번보다 앞선 식별자는 모두 버리라는 요청. */
+        retire_prior_to: u64,
+        /** @brief 새 식별자. 길이는 1 에서 20 바이트다. */
+        cid: Vec<u8>,
+        /** @brief 이 식별자를 쓰는 동안 상태 없는 재설정을 알아볼 토큰. */
+        reset_token: [u8; 16],
+    },
+
+    /** @brief 상대가 준 이 순번의 연결 식별자를 더는 쓰지 않는다. */
+    RetireConnectionId(u64),
+
     /** @brief 경로가 살아 있는지 묻는다. */
     PathChallenge([u8; 8]),
 
@@ -328,19 +343,20 @@ pub fn parse(buf: &[u8]) -> Option<Vec<Frame>> {
                 if retire_prior_to > sequence {
                     return None;
                 }
-                let cid_len = *c.b.get(c.pos)? as usize;
-                c.pos += 1;
+                let cid_len = usize::from(*c.take(1)?.first()?);
                 if !(1..=20).contains(&cid_len) {
                     return None;
                 }
-                c.take(cid_len)?;
-                c.take(16)?;
-                Frame::Other(t)
+                let cid = c.take(cid_len)?.to_vec();
+                let reset_token = c.take(16)?.try_into().ok()?;
+                Frame::NewConnectionId {
+                    sequence,
+                    retire_prior_to,
+                    cid,
+                    reset_token,
+                }
             }
-            ftype::RETIRE_CONNECTION_ID => {
-                c.vi()?;
-                Frame::Other(t)
-            }
+            ftype::RETIRE_CONNECTION_ID => Frame::RetireConnectionId(c.vi()?),
             ftype::PATH_CHALLENGE => {
                 let d: [u8; 8] = c.take(8)?.try_into().ok()?;
                 Frame::PathChallenge(d)
@@ -465,6 +481,23 @@ pub fn encode(out: &mut Vec<u8>, f: &Frame) {
             varint::write(out, reason.len() as u64);
             out.extend_from_slice(reason);
         }
+        Frame::NewConnectionId {
+            sequence,
+            retire_prior_to,
+            cid,
+            reset_token,
+        } => {
+            varint::write(out, ftype::NEW_CONNECTION_ID);
+            varint::write(out, *sequence);
+            varint::write(out, *retire_prior_to);
+            out.push(cid.len() as u8);
+            out.extend_from_slice(cid);
+            out.extend_from_slice(reset_token);
+        }
+        Frame::RetireConnectionId(sequence) => {
+            varint::write(out, ftype::RETIRE_CONNECTION_ID);
+            varint::write(out, *sequence);
+        }
         Frame::PathChallenge(d) => {
             varint::write(out, ftype::PATH_CHALLENGE);
             out.extend_from_slice(d);
@@ -560,6 +593,40 @@ mod tests {
             uni: true,
             max: 100,
         });
+    }
+
+    #[test]
+    /** @brief 연결 식별자 프레임이 식별자와 토큰까지 보존하며 왕복하는지. */
+    fn connection_id_frames_roundtrip() {
+        roundtrip(Frame::NewConnectionId {
+            sequence: 3,
+            retire_prior_to: 2,
+            cid: vec![0x5a; 20],
+            reset_token: [0xc3; 16],
+        });
+        roundtrip(Frame::RetireConnectionId(7));
+    }
+
+    #[test]
+    /** @brief 길이가 규격 밖인 식별자와 잘린 재설정 토큰을 거부하는지. */
+    fn new_connection_id_rejects_bad_lengths() {
+        let frame_with = |cid_len: u8, token_len: usize| {
+            let mut buf = Vec::new();
+            varint::write(&mut buf, ftype::NEW_CONNECTION_ID);
+            varint::write(&mut buf, 1);
+            varint::write(&mut buf, 0);
+            buf.push(cid_len);
+            buf.extend(std::iter::repeat_n(1u8, usize::from(cid_len)));
+            buf.extend(std::iter::repeat_n(2u8, token_len));
+            buf
+        };
+        assert!(parse(&frame_with(8, 16)).is_some());
+        assert!(parse(&frame_with(0, 16)).is_none(), "길이 0 식별자");
+        assert!(
+            parse(&frame_with(21, 16)).is_none(),
+            "20 바이트를 넘는 식별자"
+        );
+        assert!(parse(&frame_with(8, 15)).is_none(), "잘린 재설정 토큰");
     }
 
     #[test]

@@ -44,6 +44,62 @@ pub mod id {
     pub const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
     /** @brief Retry에 쓴 출발지 식별자. */
     pub const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
+    /** @brief 서버가 옮겨 가 달라고 알리는 주소와 그 주소에서 쓸 연결 식별자. */
+    pub const PREFERRED_ADDRESS: u64 = 0x0d;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/**
+ * @brief 서버가 알린 선호 주소.
+ * @details 이쪽은 이 주소로 옮겨 가지 않는다. 그래도 여기 실린 식별자는 서버가 순번 1 로 준
+ *          식별자라서, 상대가 준 식별자 수와 순번 충돌을 셀 때 들어간다.
+ */
+pub struct PreferredAddress {
+    /** @brief IPv4 주소와 포트. 그 주소족을 쓰지 않으면 모두 0 이다. */
+    pub ipv4: std::net::SocketAddrV4,
+    /** @brief IPv6 주소와 포트. 그 주소족을 쓰지 않으면 모두 0 이다. */
+    pub ipv6: std::net::SocketAddrV6,
+    /** @brief 그 주소에서 쓸 연결 식별자. 길이는 1 에서 20 바이트다. */
+    pub cid: Vec<u8>,
+    /** @brief 그 식별자를 쓰는 동안 상태 없는 재설정을 알아볼 토큰. */
+    pub reset_token: [u8; 16],
+}
+
+impl PreferredAddress {
+    /** @brief 매개변수 값을 와이어 형태로 쓴다. */
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41 + self.cid.len());
+        out.extend_from_slice(&self.ipv4.ip().octets());
+        out.extend_from_slice(&self.ipv4.port().to_be_bytes());
+        out.extend_from_slice(&self.ipv6.ip().octets());
+        out.extend_from_slice(&self.ipv6.port().to_be_bytes());
+        out.push(self.cid.len() as u8);
+        out.extend_from_slice(&self.cid);
+        out.extend_from_slice(&self.reset_token);
+        out
+    }
+
+    /**
+     * @brief 매개변수 값을 읽는다.
+     * @return 길이가 맞지 않거나 식별자 길이가 1 에서 20 바이트 밖이면 None. RFC 9000 은 길이
+     *         0 식별자를 담은 선호 주소를 TRANSPORT_PARAMETER_ERROR 로 정한다.
+     */
+    fn decode(value: &[u8]) -> Option<Self> {
+        let ipv4: [u8; 4] = value.get(..4)?.try_into().ok()?;
+        let port4 = u16::from_be_bytes(value.get(4..6)?.try_into().ok()?);
+        let ipv6: [u8; 16] = value.get(6..22)?.try_into().ok()?;
+        let port6 = u16::from_be_bytes(value.get(22..24)?.try_into().ok()?);
+        let cid_len = usize::from(*value.get(24)?);
+        if !(1..=20).contains(&cid_len) || value.len() != 41 + cid_len {
+            return None;
+        }
+        Some(Self {
+            ipv4: std::net::SocketAddrV4::new(ipv4.into(), port4),
+            ipv6: std::net::SocketAddrV6::new(ipv6.into(), port6, 0, 0),
+            cid: value[25..25 + cid_len].to_vec(),
+            reset_token: value[25 + cid_len..].try_into().ok()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +137,8 @@ pub struct TransportParams {
     pub active_connection_id_limit: u64,
     /** @brief 경로를 옮기지 못하게 할지. */
     pub disable_active_migration: bool,
+    /** @brief 서버가 알린 선호 주소. 서버만 보낼 수 있다. */
+    pub preferred_address: Option<PreferredAddress>,
 }
 
 impl Default for TransportParams {
@@ -103,6 +161,7 @@ impl Default for TransportParams {
             max_ack_delay: 25,
             active_connection_id_limit: 2,
             disable_active_migration: false,
+            preferred_address: None,
         }
     }
 }
@@ -197,6 +256,9 @@ impl TransportParams {
             varint::write(&mut out, id::DISABLE_ACTIVE_MIGRATION);
             varint::write(&mut out, 0);
         }
+        if let Some(address) = &self.preferred_address {
+            put_bytes(&mut out, id::PREFERRED_ADDRESS, &address.encode());
+        }
         out
     }
 
@@ -250,11 +312,15 @@ impl TransportParams {
                 }
                 id::MAX_IDLE_TIMEOUT => tp.max_idle_timeout = as_int()?,
                 id::MAX_UDP_PAYLOAD_SIZE => {
+                    /*
+                     * RFC 9000 은 1200 미만만 잘못된 값으로 정한다. 그보다 큰 값은 UDP 가 담을 수
+                     * 있는 65527 로 자른다.
+                     */
                     let v = as_int()?;
-                    if !(1200..=65527).contains(&v) {
+                    if v < 1200 {
                         return None;
                     }
-                    tp.max_udp_payload_size = v;
+                    tp.max_udp_payload_size = v.min(65527);
                 }
 
                 id::INITIAL_MAX_DATA => {
@@ -298,8 +364,12 @@ impl TransportParams {
                     tp.max_ack_delay = v;
                 }
                 id::ACTIVE_CONNECTION_ID_LIMIT => {
+                    /*
+                     * RFC 9000 은 2 미만만 잘못된 값으로 정한다. 이쪽은 핸드셰이크에서 정한
+                     * 식별자 하나만 주므로 상대가 받겠다는 수가 크다고 부담이 늘지 않는다.
+                     */
                     let v = as_int()?;
-                    if !(2..=(1 << 20)).contains(&v) {
+                    if v < 2 {
                         return None;
                     }
                     tp.active_connection_id_limit = v;
@@ -309,6 +379,9 @@ impl TransportParams {
                         return None;
                     }
                     tp.disable_active_migration = true;
+                }
+                id::PREFERRED_ADDRESS => {
+                    tp.preferred_address = Some(PreferredAddress::decode(value)?);
                 }
                 _ => {}
             }
@@ -458,6 +531,71 @@ mod tests {
         let mut bad = Vec::new();
         put_bytes(&mut bad, id::STATELESS_RESET_TOKEN, &[0; 15]);
         assert!(TransportParams::decode(&bad).is_none());
+
+        let mut bad = Vec::new();
+        put_int(&mut bad, id::ACTIVE_CONNECTION_ID_LIMIT, 1);
+        assert!(TransportParams::decode(&bad).is_none());
+    }
+
+    #[test]
+    /**
+     * @brief 규격이 막지 않은 큰 값을 받아들이는지.
+     * @details RFC 9000 은 max_udp_payload_size 의 1200 미만과 active_connection_id_limit 의 2
+     *          미만만 잘못된 값으로 정한다. 그 위를 거부하면 규격을 지킨 상대와 핸드셰이크를
+     *          끝내지 못한다.
+     */
+    fn large_values_the_rfc_allows_are_accepted() {
+        let unlimited = (1u64 << 62) - 1;
+        let mut bytes = Vec::new();
+        put_int(&mut bytes, id::MAX_UDP_PAYLOAD_SIZE, unlimited);
+        put_int(&mut bytes, id::ACTIVE_CONNECTION_ID_LIMIT, unlimited);
+        let tp = TransportParams::decode(&bytes).expect("규격이 허용한 값을 거부했습니다");
+        assert_eq!(tp.max_udp_payload_size, 65527);
+        assert_eq!(tp.active_connection_id_limit, unlimited);
+    }
+
+    /** @brief 테스트용 선호 주소. */
+    fn preferred_address(cid: Vec<u8>) -> PreferredAddress {
+        PreferredAddress {
+            ipv4: "192.0.2.1:853".parse().unwrap(),
+            ipv6: "[2001:db8::1]:853".parse().unwrap(),
+            cid,
+            reset_token: [0x3c; 16],
+        }
+    }
+
+    #[test]
+    /** @brief 선호 주소가 식별자와 토큰까지 보존하며 왕복하는지. */
+    fn preferred_address_roundtrips() {
+        let mut tp = TransportParams::server_defaults();
+        tp.preferred_address = Some(preferred_address(vec![7; 8]));
+        assert_eq!(TransportParams::decode(&tp.encode()).unwrap(), tp);
+    }
+
+    #[test]
+    /**
+     * @brief 길이 0 식별자를 담았거나 길이가 맞지 않는 선호 주소를 거부하는지.
+     * @details RFC 9000 은 길이 0 식별자를 담은 선호 주소를 TRANSPORT_PARAMETER_ERROR 로 정한다.
+     */
+    fn malformed_preferred_address_is_rejected() {
+        let mut empty_cid = Vec::new();
+        put_bytes(
+            &mut empty_cid,
+            id::PREFERRED_ADDRESS,
+            &preferred_address(Vec::new()).encode(),
+        );
+        assert!(TransportParams::decode(&empty_cid).is_none());
+
+        let mut value = preferred_address(vec![7; 8]).encode();
+        value.push(0);
+        let mut trailing = Vec::new();
+        put_bytes(&mut trailing, id::PREFERRED_ADDRESS, &value);
+        assert!(TransportParams::decode(&trailing).is_none());
+
+        value.truncate(value.len() - 2);
+        let mut short = Vec::new();
+        put_bytes(&mut short, id::PREFERRED_ADDRESS, &value);
+        assert!(TransportParams::decode(&short).is_none());
     }
 
     #[test]

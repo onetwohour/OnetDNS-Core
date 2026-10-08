@@ -663,6 +663,53 @@ fn revocation_test_write_guard() -> RevocationTestWriteGuard {
     RevocationTestWriteGuard { _guard: guard }
 }
 
+#[cfg(test)]
+/**
+ * @brief 핸드셰이크를 마친 뒤 처음 읽은 결과를 넘기는 TCP 위 TLS 업스트림.
+ * @details 클라이언트가 핸드셰이크 뒤 연결을 어떻게 끝냈는지 본다. 치명 경고를 보냈으면
+ *          PeerAlert 를, 경고 없이 끊었으면 다른 오류를 받는다.
+ * @param alpn 서버가 받아들일 ALPN.
+ * @return 서버 주소, dns.test 인증서만 믿는 신뢰 저장소, 연결마다 처음 읽은 결과를 받는 곳.
+ */
+fn tls_first_read_recorder(
+    alpn: &[u8],
+) -> (
+    SocketAddr,
+    Arc<onetdns_tls::TrustStore>,
+    std::sync::mpsc::Receiver<Result<Vec<u8>, onetdns_tls::TlsError>>,
+) {
+    let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
+    let cert_der = ck.cert.der().to_vec();
+    let trust = Arc::new(onetdns_tls::TrustStore::from_ders([cert_der.as_slice()]));
+    let (sign_scheme, sign) =
+        onetdns_tls::signer_from_pkcs8_der(&ck.key_pair.serialize_der()).unwrap();
+    let cfg = onetdns_tls::ServerConfig {
+        cert_chain: vec![cert_der],
+        sign_scheme,
+        sign,
+        alpn: vec![alpn.to_vec()],
+        client_ca: None,
+        resumption: None,
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (reads, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let Ok(mut conn) = onetdns_tls::server_handshake(&mut stream, &cfg) else {
+                continue;
+            };
+            if reads.send(conn.read_app(&mut stream)).is_err() {
+                return;
+            }
+        }
+    });
+    (addr, trust, received)
+}
+
 /**
  * @brief 인증서 폐기 확인 훅을 설치한다.
  * @details TLS 핸드셰이크 직후, 질의를 보내기 전에 불린다. 폐기된 인증서를 쓰는
