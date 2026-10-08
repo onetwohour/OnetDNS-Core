@@ -128,6 +128,9 @@ pub fn serve_doh(
                             {
                                 break;
                             }
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -174,6 +177,9 @@ pub fn serve_doh(
                     match listener.accept() {
                         Ok((stream, peer)) => {
                             accepted += 1;
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -316,11 +322,12 @@ fn serve_conn(
 
     /*
      * 실패는 HTTP 상태로 알린다. 읽지 못한 본문은 요청 잘못이므로 4xx 여야 한다.
-     * 5xx 는 서버 잘못이라는 뜻이라 클라이언트가 같은 서버에 다시 보낸다.
+     * 5xx 는 서버 잘못이라는 뜻이라 클라이언트가 같은 서버에 다시 보낸다. 질의 처리기가
+     * 답하지 않기로 한 질의에는 상태도 보내지 않고 연결을 끝낸다.
      */
     let dns = |q: &[u8],
                path_client_id: Option<&str>|
-     -> Result<onetdns_http2::DohAnswer, &'static str> {
+     -> Result<Option<onetdns_http2::DohAnswer>, &'static str> {
         let request = match Message::parse(q) {
             Ok(request) => request,
             Err(error) => {
@@ -367,12 +374,14 @@ fn serve_conn(
             authenticated: tls_authenticated,
             auth_identity: tls_auth_identity.clone(),
         };
-        let response = handler.handle(&request, &ctx).ok_or("502")?;
+        let Some(response) = handler.handle(&request, &ctx) else {
+            return Ok(None);
+        };
         let max_age = http_freshness_secs(&response);
-        Ok(onetdns_http2::DohAnswer {
+        Ok(Some(onetdns_http2::DohAnswer {
             body: response.try_encode().map_err(|_| "502")?,
             max_age,
-        })
+        }))
     };
 
     match alpn.as_deref() {
@@ -519,10 +528,15 @@ mod tests {
 
     /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
+        native_handler_with(Arc::new(IpAcl::allow_all()))
+    }
+
+    /** @brief 이 접근 제어를 건 테스트용 질의 핸들러. */
+    fn native_handler_with(acl: Arc<dyn onetdns_core::AccessControl>) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
             Arc::new(SharedFilter::from_pointee(engine)),
-            Arc::new(IpAcl::allow_all()),
+            acl,
             vec![],
             Arc::new(NativeBackend::Forward(Forwarder::new(
                 vec![mock_upstream()],
@@ -753,5 +767,90 @@ mod tests {
         let resp = Message::parse(&resp_bytes).unwrap();
         assert_eq!(resp.header.id, 0x4242);
         assert_eq!(resp.answers.len(), 1, "A 레코드 1개");
+    }
+
+    #[test]
+    /**
+     * @brief 버리는 주소가 HTTP 상태를 하나도 받지 못하는지.
+     * @details 버리는 주소는 TLS 핸드셰이크도 마치지 못한다. 연결이 열린 뒤에 그 주소를
+     *          버리도록 바뀌면 질의 처리기가 답하지 않고 연결은 상태 없이 닫힌다. 그것을
+     *          502로 바꿔 보내면 클라이언트는 같은 질의를 다시 보낸다.
+     */
+    fn doh_drops_listed_clients_without_an_http_status() {
+        let dropping = || -> Arc<dyn onetdns_core::AccessControl> {
+            Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]))
+        };
+        let acl = Arc::new(crate::native_config::DynamicAccessControl::new(dropping()));
+        let (tls, trust) = self_signed();
+        let l = serve_doh(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(tls)),
+            native_handler_with(acl.clone()),
+            "/dns-query".to_string(),
+            Arc::new(ConnectionLimiter::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: true,
+            roots: Some((*trust).clone()),
+            alpn: vec![b"h2".to_vec()],
+            ..Default::default()
+        };
+        let connect = || {
+            let tcp = TcpStream::connect_timeout(&l.addr(), Duration::from_secs(5)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            tcp
+        };
+
+        let mut tcp = connect();
+        assert!(
+            client_handshake(&mut tcp, &cfg).is_err(),
+            "버리는 주소와 TLS 핸드셰이크를 마쳤습니다"
+        );
+
+        acl.replace(Arc::new(IpAcl::allow_all()));
+        let mut tcp = connect();
+        let conn =
+            client_handshake(&mut tcp, &cfg).expect("허용한 주소와 핸드셰이크하지 못했습니다");
+        let mut s = TlsStream::new(conn, tcp);
+        let mut f = Vec::new();
+        f.extend_from_slice(frame::PREFACE);
+        frame::write_frame(&mut f, frame_type::SETTINGS, 0, 0, &[]);
+        s.write_all(&f).unwrap();
+
+        acl.replace(dropping());
+        let query = Message::query(
+            0x5151,
+            ApName::from_str("allowed.test").unwrap(),
+            RecordType::A,
+        )
+        .try_encode()
+        .unwrap();
+        let block = hpack::encode_response(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "dns.test"),
+            (":path", "/dns-query"),
+            ("content-type", "application/dns-message"),
+        ]);
+        let mut f = Vec::new();
+        frame::write_frame(&mut f, frame_type::HEADERS, flags::END_HEADERS, 1, &block);
+        frame::write_frame(&mut f, frame_type::DATA, flags::END_STREAM, 1, &query);
+        s.write_all(&f).unwrap();
+        let started = Instant::now();
+        let mut frames = Vec::new();
+        while let Some((h, _)) = read_frame(&mut s) {
+            frames.push(h.frame_type);
+        }
+        assert!(
+            !frames.contains(&frame_type::HEADERS),
+            "버리게 된 주소의 요청에 HTTP 상태를 보냈습니다: {frames:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "버리게 된 주소의 연결을 닫지 않고 붙들고 있었습니다"
+        );
     }
 }

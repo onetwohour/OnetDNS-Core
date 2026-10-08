@@ -561,6 +561,8 @@ static KEYS: &[KeySpec] = &[
     key!(local_aaaa, Hot(Chain), Shared, Lanes::OPEN),
     key!(acl_allow, Hot(Acl), Shared, Lanes::OPEN),
     key!(acl_deny, Hot(Acl), Shared, Lanes::OPEN),
+    key!(acl_drop, Hot(Acl), Shared, Lanes::OPEN),
+    key!(acl_unlisted, Hot(Acl), Shared, Lanes::OPEN),
     key!(rate_limit_per_sec, Hot(RateLimit), Shared, Lanes::OPEN),
     key!(rate_limit_burst, Hot(RateLimit), Shared, Lanes::OPEN),
     key!(run_as_user, NewGeneration, Node, Lanes::OPEN),

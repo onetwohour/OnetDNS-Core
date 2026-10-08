@@ -834,11 +834,13 @@
 
           <section style="min-width:0">
             <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">접근 정책</div><div style="font-size:11px;color:var(--muted);margin-top:3px">현재 런타임에서 허용·거부하는 네트워크와 호스트</div></div>
-            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding-top:14px">
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding-top:14px">
               <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--ok)">허용 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessAllowedRows.length }}</span></div><sc-if value="{{ hasAccessAllowed }}"><sc-for list="{{ accessAllowedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessAllowed }}"><div style="font-size:10.5px;color:var(--faint)">제한 없음</div></sc-if></div>
               <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거부 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessBlockedRows.length }}</span></div><sc-if value="{{ hasAccessBlocked }}"><sc-for list="{{ accessBlockedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessBlocked }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
+              <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">응답하지 않을 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessDroppedRows.length }}</span></div><sc-if value="{{ hasAccessDropped }}"><sc-for list="{{ accessDroppedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessDropped }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
               <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거절할 도메인</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessHostRows.length }}</span></div><sc-if value="{{ hasAccessHosts }}"><sc-for list="{{ accessHostRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessHosts }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
             </div>
+            <sc-if value="{{ hasAccessUnlisted }}"><div style="display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:11px;border-top:1px solid var(--border)"><span style="font-size:10.5px;font-weight:700;color:var(--muted);flex:1">규칙에 없는 클라이언트</span><span style="font-size:10.5px;font-weight:700;color:{{ accessUnlistedColor }}">{{ accessUnlistedLabel }}</span></div></sc-if>
           </section>
         </div>
 
@@ -3238,7 +3240,7 @@ Object.assign(I18N.en, {
   '{ok}/{total}개 데이터 원본 정상':'{ok}/{total} data sources available','마지막 갱신 {time}':'Last updated {time}','아직 갱신되지 않음':'Not updated yet','운영 정보를 불러오는 중입니다.':'Loading operations data…',
   '재작성 규칙':'Rewrite rules','활성 규칙':'Active rules','등록된 규칙 없음':'No rules configured','필터 적용률':'Filter coverage','{applied}/{total}개 적용':'{applied}/{total} applied','규칙 {rules}개 · 적중 {hits}회':'{rules} rules · {hits} hits','진행 {running} · 실패 {failed}':'{running} running · {failed} failed',
   '캐시와 백업':'Cache and backup','캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원':'Flush cached responses, and export or restore filter data (rules, services, refused domains, SafeSearch).','최대 1MB':'Up to 1 MB',
-  '접근 정책':'Access policy','현재 런타임에서 허용·거부하는 네트워크와 호스트':'Networks and hosts currently allowed or denied by the running service.','허용 네트워크':'Allowed networks','거부 네트워크':'Denied networks','거절할 도메인':'Domains answered with REFUSED',
+  '접근 정책':'Access policy','현재 런타임에서 허용·거부하는 네트워크와 호스트':'Networks and hosts currently allowed or denied by the running service.','허용 네트워크':'Allowed networks','거부 네트워크':'Denied networks','응답하지 않을 네트워크':'Silently dropped networks','거절할 도메인':'Domains answered with REFUSED','규칙에 없는 클라이언트':'Clients matching no rule','응답하지 않음':'No response','거부로 응답 (REFUSED)':'Answered with REFUSED','허용됨':'Allowed',
   '특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경':'Replace a domain response with a specified IP address or domain.','필터 품질':'Filter quality','읽은 규칙 중 실제 적용된 비율과 제외 사유':'Applied-rule coverage and reasons for excluded rules.','제외':'Excluded','/ 전체':'/ total',
   '출처별 규칙 수와 누적 적중':'Rule counts and cumulative hits by source.','규칙 ·':'rules ·','평가, 차단, 오류와 평균 실행 시간':'Evaluations, blocks, errors, and average execution time.','차단 ·':'blocks ·',
   '규칙별 적중 기록이 활성화된 경우의 상위 항목':'Top entries when per-rule hit tracking is enabled.','필터 목록 갱신 등 비동기 작업의 최근 상태':'Recent status of filter refreshes and other asynchronous jobs.','필터 갱신':'Filter refresh',
@@ -3250,7 +3252,7 @@ Object.assign(I18N.ja, {
   '{ok}/{total}개 데이터 원본 정상':'{ok}/{total} 件のデータソースが利用可能','마지막 갱신 {time}':'最終更新 {time}','아직 갱신되지 않음':'まだ更新されていません','운영 정보를 불러오는 중입니다.':'運用情報を読み込み中…',
   '재작성 규칙':'リライトルール','활성 규칙':'有効なルール','등록된 규칙 없음':'登録ルールなし','필터 적용률':'フィルター適用率','{applied}/{total}개 적용':'{applied}/{total} 件適用','규칙 {rules}개 · 적중 {hits}회':'ルール {rules} 件 · ヒット {hits} 回','진행 {running} · 실패 {failed}':'実行中 {running} · 失敗 {failed}',
   '캐시와 백업':'キャッシュとバックアップ','캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원':'応答キャッシュを消去し、フィルターデータ（ルール・サービス・拒否ドメイン・セーフサーチ）をエクスポートまたは復元します。','최대 1MB':'最大 1 MB',
-  '접근 정책':'アクセス方針','현재 런타임에서 허용·거부하는 네트워크와 호스트':'稼働中のサービスで現在許可・拒否されているネットワークとホストです。','허용 네트워크':'許可ネットワーク','거부 네트워크':'拒否ネットワーク','거절할 도메인':'拒否で応答するドメイン',
+  '접근 정책':'アクセス方針','현재 런타임에서 허용·거부하는 네트워크와 호스트':'稼働中のサービスで現在許可・拒否されているネットワークとホストです。','허용 네트워크':'許可ネットワーク','거부 네트워크':'拒否ネットワーク','응답하지 않을 네트워크':'応答しないネットワーク','거절할 도메인':'拒否で応答するドメイン','규칙에 없는 클라이언트':'どの規則にも当てはまらないクライアント','응답하지 않음':'応答しない','거부로 응답 (REFUSED)':'REFUSED で拒否','허용됨':'許可',
   '특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경':'特定ドメインの応答を指定した IP またはドメインに変更します。','필터 품질':'フィルター品質','읽은 규칙 중 실제 적용된 비율과 제외 사유':'読み込んだルールの適用率と除外理由です。','제외':'除外','/ 전체':'/ 全体',
   '출처별 규칙 수와 누적 적중':'ソース別のルール数と累積ヒット数です。','규칙 ·':'ルール ·','평가, 차단, 오류와 평균 실행 시간':'評価、ブロック、エラー、平均実行時間です。','차단 ·':'ブロック ·',
   '규칙별 적중 기록이 활성화된 경우의 상위 항목':'ルール別ヒット記録が有効な場合の上位項目です。','필터 목록 갱신 등 비동기 작업의 최근 상태':'フィルターリスト更新など非同期ジョブの最近の状態です。','필터 갱신':'フィルター更新',
@@ -4290,7 +4292,12 @@ Object.assign(I18N.zh, {
   "현재 런타임에서 허용·거부하는 네트워크와 호스트":"当前运行时允许和拒绝的网络与主机",
   "허용 네트워크":"允许的网络",
   "거부 네트워크":"拒绝的网络",
+  "응답하지 않을 네트워크":"不予应答的网络",
   "거절할 도메인":"拒绝应答的域名",
+  "규칙에 없는 클라이언트":"不匹配任何规则的客户端",
+  "응답하지 않음":"不应答",
+  "거부로 응답 (REFUSED)":"以 REFUSED 拒绝",
+  "허용됨":"允许",
   "특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경":"将特定域名的响应改为指定的 IP 或域名",
   "필터 품질":"过滤质量",
   "읽은 규칙 중 실제 적용된 비율과 제외 사유":"已读取规则中实际应用的比例和排除原因",
@@ -7003,7 +7010,11 @@ class Component extends DCLogic {
     const access=ops.access&&typeof ops.access==='object'?ops.access:{};
     const accessAllowedRows=(Array.isArray(access.allowed)?access.allowed:[]).map(value=>({value:String(value)}));
     const accessBlockedRows=(Array.isArray(access.blocked)?access.blocked:[]).map(value=>({value:String(value)}));
+    const accessDroppedRows=(Array.isArray(access.dropped)?access.dropped:[]).map(value=>({value:String(value)}));
     const accessHostRows=(Array.isArray(access.refused_domains)?access.refused_domains:[]).map(value=>({value:String(value)}));
+    const accessUnlisted=['allow','deny','drop'].includes(access.unlisted)?access.unlisted:'';
+    const accessUnlistedLabel=accessUnlisted==='drop'?this.t('응답하지 않음'):accessUnlisted==='deny'?this.t('거부로 응답 (REFUSED)'):accessUnlisted==='allow'?this.t('허용됨'):'';
+    const accessUnlistedColor=accessUnlisted==='drop'?'var(--block)':accessUnlisted==='deny'?'var(--warn)':'var(--ok)';
     const availability=ops.availability&&typeof ops.availability==='object'?ops.availability:{};
     const opSourceNames={rewrites:this.t('재작성 규칙'),plugins:this.t('WASM 플러그인'),filterReport:this.t('필터 진단'),topRules:this.t('규칙 적중'),sources:this.t('필터 출처'),jobs:this.t('백그라운드 작업'),access:this.t('접근 정책')};
     const opSourceKeys=Object.keys(opSourceNames),opSourceOk=opSourceKeys.filter(key=>availability[key]===true).length;
@@ -7077,7 +7088,7 @@ class Component extends DCLogic {
       operationsLoaded:!!ops.loaded,operationSummary,operationSourceStatus,operationUpdatedLabel,opPartial,operationFailedLabel,operationStatusColor:opPartial?'var(--warn)':'var(--ok)',refreshOperations:this.refreshOperations,flushCache:this.flushCache,downloadBackup:this.downloadBackup,onRestoreFile:this.onRestoreFile,restoreBackup:this.restoreBackup,restoreReady:!!this._restoreBackup,restoreFileName:localizedForms.restoreFileName,
       rewriteRows,hasRewrites:rewriteRows.length>0,addRewrite:this.addRewrite,reportTotal:reportTotalN.toLocaleString(this.locale()),reportApplied:reportAppliedN.toLocaleString(this.locale()),reportSkipped:reportSkippedN.toLocaleString(this.locale()),filterCoverageLabel,filterCoverageStyle,filterReasonRows,hasFilterReasons:filterReasonRows.length>0,
       topRuleRows,hasTopRules:topRuleRows.length>0,topRulesOff:!!ops.loaded&&topData.enabled!==true,topRulesEmpty:topData.enabled===true&&topRuleRows.length===0,sourceRows,hasSources:sourceRows.length>0,sourceHitsOff:!!ops.loaded&&!sourceHitsEnabled,sourceTotalsText,pluginRows,hasPlugins:pluginRows.length>0,pluginEvalTotal:pluginEvalTotal.toLocaleString(this.locale()),pluginErrorTotal:pluginErrorTotal.toLocaleString(this.locale()),pluginBlockTotal:pluginBlockTotal.toLocaleString(this.locale()),
-      accessAllowedRows,accessBlockedRows,accessHostRows,hasAccessAllowed:accessAllowedRows.length>0,hasAccessBlocked:accessBlockedRows.length>0,hasAccessHosts:accessHostRows.length>0,revocationLabel,revocationColor,revocationDetail,zoneDnssecLabel,zoneDnssecColor,zoneDnssecDetail,checkTlsRevocation:this.checkTlsRevocation,checkZoneDnssec:this.checkZoneDnssec,
+      accessAllowedRows,accessBlockedRows,accessDroppedRows,accessHostRows,hasAccessAllowed:accessAllowedRows.length>0,hasAccessBlocked:accessBlockedRows.length>0,hasAccessDropped:accessDroppedRows.length>0,hasAccessHosts:accessHostRows.length>0,hasAccessUnlisted:accessUnlisted!=='',accessUnlistedLabel,accessUnlistedColor,revocationLabel,revocationColor,revocationDetail,zoneDnssecLabel,zoneDnssecColor,zoneDnssecDetail,checkTlsRevocation:this.checkTlsRevocation,checkZoneDnssec:this.checkZoneDnssec,
       cert:{...s.cert,domain:this.t(s.cert.domain),daysLeftLabel:this.t(s.cert.daysLeftLabel)}, uploadCert:this.uploadCert, requestAcme:this.requestAcme, onCertFile:this.onCertFile,validateTls:this.validateTls,
 
       zones, addRecord:this.addRecord,createZone:this.createZone,

@@ -11,7 +11,9 @@ use onetdns_proto::{Edns, Message, ResponseCode};
 use onetdns_runtime::RequestCtx;
 
 use crate::native::query::base_edns;
-use crate::native::response::{block_resp, ede_text, error_resp, finalize, postprocess, with_ede};
+use crate::native::response::{
+    block_resp, ede_text, error_resp, finalize, postprocess, with_ede, CloakedBlock,
+};
 use crate::native::{
     failure_diagnosis, recurse_failure, strip_dnssec_unless_requested, LaneRuntime, NativeFeatures,
     NativeServer, ResolveFailure, ResolveOutcome, Resolver,
@@ -327,31 +329,31 @@ impl NativeServer {
                 .then(|| Self::cname_uncloak(&filter, &resp.answers, &cl.client))
                 .flatten();
             let blocked = uncloaked.is_some();
-            if let Some(br) = uncloaked {
-                let q = &req.questions[0];
-                resp = block_resp(
-                    req,
-                    &q.name,
-                    q.qtype,
-                    br,
-                    self.block_ttl.load(Ordering::Acquire),
-                );
-                self.rec_rc(
-                    &cl.client,
-                    Action::Blocked,
-                    Some(&q.name),
-                    Some(q.qtype),
-                    ResponseCode(resp.header.rcode),
-                );
-            } else {
-                self.rec_final_answer(
-                    &cl.client,
-                    &req.questions[0].name,
-                    req.questions[0].qtype,
-                    &resp,
-                );
+            let q = &req.questions[0];
+            match uncloaked {
+                Some(CloakedBlock::Respond(br)) => {
+                    resp = block_resp(
+                        req,
+                        &q.name,
+                        q.qtype,
+                        br,
+                        self.block_ttl.load(Ordering::Acquire),
+                    );
+                    self.rec_rc(
+                        &cl.client,
+                        Action::Blocked,
+                        Some(&q.name),
+                        Some(q.qtype),
+                        ResponseCode(resp.header.rcode),
+                    );
+                }
+                Some(CloakedBlock::Drop) => {
+                    self.rec_dropped(&cl.client, &q.name, q.qtype, "");
+                    continue;
+                }
+                None => self.rec_final_answer(&cl.client, &q.name, q.qtype, &resp),
             }
-            self.rec_latency(&cl.client, Some(&req.questions[0].name), timer.elapsed_us());
+            self.rec_latency(&cl.client, Some(&q.name), timer.elapsed_us());
             w.clear();
             onetdns_runtime::encode_limited(req, &resp, &mut w);
             if w.buf.is_empty() {

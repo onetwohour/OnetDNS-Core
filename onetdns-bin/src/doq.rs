@@ -193,10 +193,15 @@ mod tests {
 
     /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
+        native_handler_with(IpAcl::allow_all())
+    }
+
+    /** @brief 이 접근 제어를 건 테스트용 질의 핸들러. */
+    fn native_handler_with(acl: IpAcl) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
             Arc::new(SharedFilter::from_pointee(engine)),
-            Arc::new(IpAcl::allow_all()),
+            Arc::new(acl),
             vec![],
             Arc::new(NativeBackend::Forward(Forwarder::new(
                 vec![mock_upstream()],
@@ -354,6 +359,66 @@ mod tests {
             ApRData::A(ip) => assert_eq!(*ip, std::net::Ipv4Addr::new(9, 9, 9, 9)),
             other => panic!("A 레코드를 예상했지만 실제 값은 {other:?}입니다"),
         }
+    }
+
+    /**
+     * @brief 이 접근 제어를 건 DoQ 리스너에 첫 패킷을 보내고 무엇이든 돌아오는지 본다.
+     * @param wait 답을 기다릴 시간.
+     */
+    fn first_packet_answered(acl: IpAcl, wait: Duration) -> bool {
+        let listener = serve_doq(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
+            native_handler_with(acl),
+            Arc::new(AtomicBool::new(false)),
+            memory_budget(),
+        )
+        .unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: false,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![b"doq".to_vec()],
+            ..Default::default()
+        };
+        let mut client = Connection::new_client(
+            cfg,
+            random_cid(),
+            random_cid(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(wait)).unwrap();
+        let initial = client
+            .next_datagram()
+            .expect("클라이언트가 첫 패킷을 만들지 않았습니다");
+        sock.send_to(&initial, listener.addr()).unwrap();
+        let mut buf = [0u8; 2048];
+        sock.recv_from(&mut buf).is_ok()
+    }
+
+    #[test]
+    /**
+     * @brief 버리는 주소의 첫 패킷에는 DoQ 리스너가 Retry 도 보내지 않는지.
+     * @details 리스너는 데이터그램마다 질의 처리기에 버릴 주소인지 묻는다. 그 연결이 빠지면
+     *          버리는 주소도 Retry 를 받아 서버가 있다는 것을 알게 된다.
+     */
+    fn doq_listener_sends_nothing_to_dropped_clients() {
+        assert!(
+            first_packet_answered(IpAcl::allow_all(), Duration::from_secs(5)),
+            "대조군이 무효입니다. 허용한 주소의 첫 패킷에 답하지 않았습니다"
+        );
+        assert!(
+            !first_packet_answered(
+                IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]),
+                Duration::from_secs(1),
+            ),
+            "버리는 주소의 첫 패킷에 답했습니다"
+        );
     }
 
     #[test]

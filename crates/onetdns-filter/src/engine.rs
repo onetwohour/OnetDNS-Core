@@ -868,6 +868,7 @@ impl EngineParts {
             &self.allow_important,
             &self.refuse,
             &self.nodata,
+            &self.no_response,
         ];
         sets.extend(self.typed_block.iter().map(|(_, set)| set));
         sets.extend(self.typed_block_except.iter().map(|(_, set)| set));
@@ -883,6 +884,7 @@ impl EngineParts {
             &mut self.allow_important,
             &mut self.refuse,
             &mut self.nodata,
+            &mut self.no_response,
         ];
         sets.extend(self.typed_block.iter_mut().map(|(_, s)| s));
         sets.extend(self.typed_block_except.iter_mut().map(|(_, s)| s));
@@ -916,6 +918,9 @@ pub struct EngineParts {
     /** @brief 비어 있다고 답할 이름들. */
     pub nodata: DomainSet,
 
+    /** @brief 아무것도 답하지 않을 이름들. */
+    pub no_response: DomainSet,
+
     /** @brief 이 종류만 막을 이름들. */
     pub typed_block: Vec<(RecordType, DomainSet)>,
 
@@ -936,6 +941,8 @@ pub struct EngineParts {
     pub regex_refuse: Vec<String>,
     /** @brief 정규식 빈 응답. */
     pub regex_nodata: Vec<String>,
+    /** @brief 정규식 무응답. */
+    pub regex_no_response: Vec<String>,
 
     /** @brief 정규식 재작성. */
     pub regex_rewrites: Vec<(String, RewriteTarget)>,
@@ -1215,6 +1222,8 @@ pub struct BlockEngine {
     regex_refuse: RegexMatcher,
     /** @brief 정규식 빈 응답. */
     regex_nodata: RegexMatcher,
+    /** @brief 정규식 무응답. */
+    regex_no_response: RegexMatcher,
 
     /** @brief 정규식 재작성. */
     regex_rewrites: Vec<(String, Regex, RewriteTarget)>,
@@ -1306,6 +1315,7 @@ impl std::fmt::Debug for EngineParts {
             .field("allow_important", &self.allow_important.len())
             .field("refuse", &self.refuse.len())
             .field("nodata", &self.nodata.len())
+            .field("no_response", &self.no_response.len())
             .field("typed_block", &self.typed_block.len())
             .field("regex_block", &self.regex_block.len())
             .field("regex_allow", &self.regex_allow.len())
@@ -1328,6 +1338,7 @@ impl BlockEngine {
             || !parts.regex_allow_important.is_empty()
             || !parts.regex_refuse.is_empty()
             || !parts.regex_nodata.is_empty()
+            || !parts.regex_no_response.is_empty()
             || !parts.regex_rewrites.is_empty()
             || !parts.regex_typed_block.is_empty()
             || !parts.regex_typed_block_except.is_empty()
@@ -1341,6 +1352,7 @@ impl BlockEngine {
         let regex_allow_important = build_regexes(&parts.regex_allow_important);
         let regex_refuse = build_regexes(&parts.regex_refuse);
         let regex_nodata = build_regexes(&parts.regex_nodata);
+        let regex_no_response = build_regexes(&parts.regex_no_response);
         let regex_rewrites = parts
             .regex_rewrites
             .iter()
@@ -1370,6 +1382,7 @@ impl BlockEngine {
             regex_allow_important,
             regex_refuse,
             regex_nodata,
+            regex_no_response,
             regex_rewrites,
             regex_typed,
             regex_typed_except,
@@ -1411,18 +1424,8 @@ impl BlockEngine {
     /** @brief 가장 많이 걸린 규칙들. */
     pub fn top_rule_hits(&self, n: usize) -> Vec<(String, u64)> {
         let p = &self.parts;
-        let mut sets: Vec<&DomainSet> = vec![
-            &p.block,
-            &p.allow,
-            &p.block_important,
-            &p.allow_important,
-            &p.refuse,
-            &p.nodata,
-        ];
-        sets.extend(p.typed_block.iter().map(|(_, s)| s));
-        sets.extend(p.typed_block_except.iter().map(|(_, s)| s));
         let mut out: Vec<(String, u64)> = Vec::new();
-        for set in sets {
+        for set in p.domain_sets() {
             for (k, c) in set.hit_entries() {
                 if c > 0 {
                     out.push((k.to_string(), c));
@@ -1442,19 +1445,8 @@ impl BlockEngine {
     /** @brief 목록별 통계. */
     pub fn source_stats(&self) -> Vec<SourceStat> {
         let p = &self.parts;
-        let mut sets: Vec<&DomainSet> = vec![
-            &p.block,
-            &p.allow,
-            &p.block_important,
-            &p.allow_important,
-            &p.refuse,
-            &p.nodata,
-        ];
-        sets.extend(p.typed_block.iter().map(|(_, s)| s));
-        sets.extend(p.typed_block_except.iter().map(|(_, s)| s));
-
         let mut agg: HashMap<u32, (u64, u64)> = HashMap::new();
-        for set in sets {
+        for set in p.domain_sets() {
             for (src, hits) in set.source_entries() {
                 let e = agg.entry(src).or_default();
                 e.0 += 1;
@@ -1503,10 +1495,12 @@ impl BlockEngine {
             + self.parts.block_important.len()
             + self.parts.refuse.len()
             + self.parts.nodata.len()
+            + self.parts.no_response.len()
             + self.parts.regex_block.len()
             + self.parts.regex_block_important.len()
             + self.parts.regex_refuse.len()
             + self.parts.regex_nodata.len()
+            + self.parts.regex_no_response.len()
             + self.parts.regex_typed_block.len()
             + self.parts.regex_typed_block_except.len()
             + self
@@ -1685,6 +1679,7 @@ impl BlockEngine {
             MatchStage::ImportantBlock => &p.block_important,
             MatchStage::Allow => &p.allow,
             MatchStage::ImportantAllow => &p.allow_important,
+            MatchStage::NoResponse => &p.no_response,
             MatchStage::Refuse => &p.refuse,
             MatchStage::NoData => &p.nodata,
             _ => return None,
@@ -1698,8 +1693,10 @@ impl BlockEngine {
     /**
      * @brief 우선순위 사다리를 따라 처분을 정한다. 엔진의 본체다.
      *
-     * @details 클라이언트 정책, RPZ, 클라이언트 규칙, 중요 허용, 중요 차단, 거부,
-     *          데이터 없음, 재작성, 허용, 정규식, 차단, 타입별 순서다.
+     * @details 클라이언트 정책, RPZ, 클라이언트 규칙, 중요 허용, 무응답, 중요 차단, 거부,
+     *          데이터 없음, 재작성, 허용, 정규식, 차단, 타입별 순서다. 무응답은 모든 차단보다
+     *          앞선다. 차단이 이기면 다른 목록의 규칙 하나 때문에 숨기려던 이름에 서버가 답한다.
+     *          차단 규칙의 뜻은 답하지 않아도 지켜진다.
      * @note 로컬 영역은 가장 구체적인 영역 하나만 찾고, 그 처분을 거부, 재작성, 차단 단계
      *       가운데 맞는 곳에서 쓴다. transparent 영역이 걸리면 로컬 영역 처분은 없다.
      * @warning 이 순서가 규칙의 뜻이다. 바꾸면 운영자가 기대한 동작이 달라진다.
@@ -1806,6 +1803,14 @@ impl BlockEngine {
         if let Some(m) = self.regex_allow_important.find(key) {
             return (FilterVerdict::Allow, MatchStage::ImportantAllow, Some(m));
         }
+
+        if let Some(m) = self.lookup(&p.no_response, key, count) {
+            return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
+        }
+        if let Some(m) = self.regex_no_response.find(key) {
+            return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
+        }
+
         if let Some(m) = self.lookup(&p.block_important, key, count) {
             return (
                 FilterVerdict::Block(self.default_block),
@@ -2718,6 +2723,7 @@ mod tests {
         let lines = vec![
             "||listed.example^".to_string(),
             "@@||ok.listed.example^".to_string(),
+            "||hidden.example^$dnsrewrite=NORESPONSE".to_string(),
         ];
         let parts = crate::loader::load_parts_with_subscriptions(
             &[] as &[std::path::PathBuf],
@@ -2746,6 +2752,13 @@ mod tests {
             Some("https://lists.example/malware.txt")
         );
 
+        let hidden = eng.explain(&name("a.hidden.example."), RecordType::A, &client());
+        assert_eq!(hidden.stage, MatchStage::NoResponse);
+        assert_eq!(
+            hidden.source.as_deref(),
+            Some("https://lists.example/malware.txt")
+        );
+
         let typed = eng.explain(&name("typed.example."), RecordType::A, &client());
         assert_eq!(typed.stage, MatchStage::Block);
         assert!(typed.source.is_none());
@@ -2762,6 +2775,7 @@ mod tests {
         parts.allow.add_exact("allow.test");
         parts.refuse.add_exact("refuse.test");
         parts.nodata.add_suffix("nodata.test");
+        parts.no_response.add_suffix("quiet.test");
         let eng = engine_with(parts);
         for q in [
             "block.test.",
@@ -2769,6 +2783,7 @@ mod tests {
             "allow.test.",
             "refuse.test.",
             "x.nodata.test.",
+            "x.quiet.test.",
             "free.test.",
         ] {
             let v = eng.verdict(&name(q), RecordType::A, &client());
@@ -2779,6 +2794,63 @@ mod tests {
                 "{q}: verdict/explain 일치하지 않습니다"
             );
         }
+    }
+
+    #[test]
+    /**
+     * @brief 무응답 규칙이 중요 허용 다음, 중요 차단 앞에서 판정되는지.
+     * @details 차단이 이기면 다른 목록의 차단이나 거부 규칙 하나 때문에 숨기려던 이름에 서버가
+     *          답한다. 일반 허용은 무응답을 풀지 못하고, 중요 허용만 푼다.
+     */
+    fn noresponse_sits_between_important_allow_and_important_block() {
+        let mut parts = EngineParts::default();
+        parts.no_response.add_suffix("quiet.test");
+        parts.block_important.add_suffix("quiet.test");
+        parts.refuse.add_suffix("quiet.test");
+        parts.allow.add_exact("ok.quiet.test");
+        parts.allow_important.add_exact("vip.quiet.test");
+        parts.regex_no_response.push("^scan[0-9]+\\.test$".into());
+        parts.regex_block_important.push("[0-9]+\\.test$".into());
+        parts.block_important.add_exact("loud.test");
+        parts.refuse.add_exact("refused.test");
+        let eng = engine_with(parts);
+        let ask = |q: &str| eng.explain(&name(q), RecordType::A, &client());
+
+        let quiet = ask("a.quiet.test.");
+        assert!(
+            matches!(quiet.verdict, FilterVerdict::Drop),
+            "같은 이름의 중요 차단이나 거부 규칙이 무응답을 이겼습니다: {quiet:?}"
+        );
+        assert_eq!(quiet.stage, MatchStage::NoResponse);
+        assert_eq!(quiet.matched.as_deref(), Some("quiet.test"));
+        assert!(
+            matches!(ask("ok.quiet.test.").verdict, FilterVerdict::Drop),
+            "일반 허용이 무응답을 풀었습니다"
+        );
+        assert_eq!(ask("vip.quiet.test.").stage, MatchStage::ImportantAllow);
+
+        let scan = ask("scan7.test.");
+        assert!(
+            matches!(scan.verdict, FilterVerdict::Drop),
+            "같은 이름의 정규식 중요 차단이 무응답을 이겼습니다: {scan:?}"
+        );
+        assert_eq!(scan.stage, MatchStage::NoResponse);
+        assert_eq!(scan.matched.as_deref(), Some("^scan[0-9]+\\.test$"));
+
+        for loud in ["loud.test.", "loud7.test."] {
+            assert_eq!(
+                ask(loud).stage,
+                MatchStage::ImportantBlock,
+                "대조군이 무효입니다: 무응답 규칙이 없는 {loud} 에 중요 차단이 걸리지 않았습니다"
+            );
+        }
+        assert!(
+            matches!(
+                ask("refused.test.").verdict,
+                FilterVerdict::Block(BlockResponse::Refused)
+            ),
+            "대조군이 무효입니다: 무응답 규칙이 없는 이름의 거부 규칙이 동작하지 않습니다"
+        );
     }
 
     #[test]

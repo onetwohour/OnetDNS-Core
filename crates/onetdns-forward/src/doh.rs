@@ -279,10 +279,10 @@ mod tests {
                             m.answers
                                 .push(Record::new(qq.name.clone(), 60, RData::A(ip)));
                         }
-                        Ok(onetdns_http2::DohAnswer {
+                        Ok(Some(onetdns_http2::DohAnswer {
                             body: m.try_encode().map_err(|_| "502")?,
                             max_age: 0,
-                        })
+                        }))
                     })
                     .ok();
                 });

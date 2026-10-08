@@ -21,12 +21,13 @@ use onetdns_proto::{
 use onetdns_runtime::{RequestCtx, Transport as RtTransport};
 
 use crate::native::authority::name_ends_with;
+use crate::native::observe::note_dropped;
 use crate::native::response::{
     base_response, block_rcode, block_resp, dns64_negative_ttl, ede_text, edns_error_resp,
     error_resp, finalize, has_alias_answer, has_negative_soa, is_delegation_referral,
     normalize_recursive_response, policy_negative_resp, rdata_in_nets, rdata_ip, records_resp,
     response_has_requested_answer, rfc8482_hinfo, strip_private_records, synthesize_dns64,
-    with_ede,
+    with_ede, CloakedBlock,
 };
 use crate::native::{
     failure_diagnosis, normalized_text_name, policy_transport, wants_dnssec, InflightGuard,
@@ -123,6 +124,42 @@ impl NativeServer {
     }
 
     /**
+     * @brief 이 주소에서 온 것을 아무 응답 없이 버려야 하는지 보고, 버린다면 그 사실을 남긴다.
+     * @details 전송은 질의를 읽거나 핸드셰이크를 하기 전에 이것으로 연결과 패킷을 거른다.
+     *          FORMERR 나 TLS 경고 하나라도 보내면 그 주소에 서버가 있다는 것이 드러난다.
+     */
+    pub fn drops_source(&self, source: IpAddr) -> bool {
+        let source = canonical_source_ip(source);
+        match self.acl.drops(source) {
+            Some(reason) => {
+                note_dropped(source, reason);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /**
+     * @brief 이 클라이언트를 아무 응답 없이 버려야 하는지 보고, 버린다면 그 사실을 남긴다.
+     * @details drops_source 와 달리 클라이언트 ID 까지 본다. ID 규칙이 있으면 목록 밖인지가 ID 로
+     *          정해져서, 주소만 보고는 버리지 못한 클라이언트가 여기까지 온다. 질의를 읽은 뒤 어떤
+     *          응답이든 내보내기 전에 이것으로 거른다.
+     */
+    pub(crate) fn drops_client(&self, ctx: &RequestCtx) -> bool {
+        if self.acl.is_trivially_allow() {
+            return false;
+        }
+        let client = self.identify(ctx);
+        match self.acl.check(&client) {
+            AclDecision::Drop(reason) => {
+                note_dropped(client.source_ip, reason);
+                true
+            }
+            AclDecision::Allow | AclDecision::Deny => false,
+        }
+    }
+
+    /**
      * @brief 질의 하나를 실제로 처리한다.
      * @details 입장, 요청 정책, 해석, 답 완성, 응답 정책을 차례로 거친다. 어느 단계든 응답을
      *          확정하면 뒤 단계는 건너뛴다.
@@ -191,9 +228,18 @@ impl NativeServer {
         }
 
         let client = self.identify(ctx);
+        /*
+         * 버릴 클라이언트는 handle 이 이미 걸렀다. 그 사이 접근 제어가 바뀌어 여기서 버림이
+         * 나오면 바뀐 규칙을 따른다.
+         */
+        let acl = self.acl.check(&client);
+        if let AclDecision::Drop(reason) = acl {
+            note_dropped(client.source_ip, reason);
+            return ControlFlow::Break(None);
+        }
 
         if request.header.opcode == 4 || request.header.opcode == 5 {
-            if self.acl.check(&client) == AclDecision::Deny {
+            if acl == AclDecision::Deny {
                 self.rec(&client, Action::Denied, None, None);
                 let edns = with_ede(
                     None,
@@ -265,7 +311,7 @@ impl NativeServer {
             qtype: question.qtype,
         };
 
-        if self.acl.check(&scope.client) == AclDecision::Deny {
+        if acl == AclDecision::Deny {
             self.rec(&scope.client, Action::Denied, None, None);
             return ControlFlow::Break(scope.reply(
                 error_resp(request, ResponseCode::Refused),
@@ -525,6 +571,11 @@ impl NativeServer {
                         block_resp(request, qname, qtype, br, scope.block_ttl),
                         Some((onetdns_proto::ede_code::BLOCKED, "blocked by filter")),
                     ));
+                }
+                FilterVerdict::Drop => {
+                    let rule = self.filter_rule_label(qname, qtype, &scope.client);
+                    self.rec_dropped(&scope.client, qname, qtype, rule.as_match());
+                    return ControlFlow::Break(None);
                 }
                 FilterVerdict::Rewrite(target) => {
                     let rule = self.filter_rule_label(qname, qtype, &scope.client);
@@ -859,17 +910,24 @@ impl NativeServer {
             clear_dnssec_assertion(&mut resp);
         }
 
-        if let Some(br) = Self::cname_uncloak(filter, &resp.answers, &scope.client) {
-            self.rec_rc(
-                &scope.client,
-                Action::Blocked,
-                Some(qname),
-                Some(qtype),
-                block_rcode(&br, qtype),
-            );
-            return ControlFlow::Break(
-                scope.reply(block_resp(request, qname, qtype, br, scope.block_ttl), None),
-            );
+        match Self::cname_uncloak(filter, &resp.answers, &scope.client) {
+            Some(CloakedBlock::Respond(br)) => {
+                self.rec_rc(
+                    &scope.client,
+                    Action::Blocked,
+                    Some(qname),
+                    Some(qtype),
+                    block_rcode(&br, qtype),
+                );
+                return ControlFlow::Break(
+                    scope.reply(block_resp(request, qname, qtype, br, scope.block_ttl), None),
+                );
+            }
+            Some(CloakedBlock::Drop) => {
+                self.rec_dropped(&scope.client, qname, qtype, "");
+                return ControlFlow::Break(None);
+            }
+            None => {}
         }
 
         if let Some(v) = Self::rpz_ip_check(filter, &resp.answers) {
@@ -887,6 +945,10 @@ impl NativeServer {
                         block_resp(request, qname, qtype, br, scope.block_ttl),
                         Some((onetdns_proto::ede_code::BLOCKED, "blocked by filter")),
                     ));
+                }
+                FilterVerdict::Drop => {
+                    self.rec_dropped(&scope.client, qname, qtype, "rpz-ip");
+                    return ControlFlow::Break(None);
                 }
                 FilterVerdict::Rewrite(t) => {
                     let response = self.rewrite_resp(request, qname, qtype, t, &scope.client);

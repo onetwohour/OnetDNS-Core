@@ -181,6 +181,19 @@ impl CookieMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/**
+ * @brief 어느 접근 규칙에도 걸리지 않은 클라이언트의 처분.
+ * @details 허용 목록이 있을 때만 쓰인다. 허용 목록이 없으면 그런 클라이언트는 모두 받는다.
+ */
+pub enum AclUnlisted {
+    #[default]
+    /** @brief 거부로 답한다. */
+    Deny,
+    /** @brief 아무 응답 없이 버린다. 서버가 있다는 것조차 드러내지 않는다. */
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /** @brief 업스트림을 여럿 둘 때 고르는 방식. */
 pub enum UpstreamStrategy {
     #[default]
@@ -730,6 +743,12 @@ pub struct Config {
 
     /** @brief 차단할 클라이언트 대역. */
     pub acl_deny: Vec<IpNet>,
+
+    /** @brief 아무 응답 없이 버릴 클라이언트 대역. */
+    pub acl_drop: Vec<IpNet>,
+
+    /** @brief 어느 접근 규칙에도 걸리지 않은 클라이언트를 거부할지 버릴지. */
+    pub acl_unlisted: AclUnlisted,
 
     /** @brief 클라이언트당 초당 질의 한도. */
     pub rate_limit_per_sec: u32,
@@ -1359,6 +1378,8 @@ impl Default for Config {
             local_aaaa: vec![],
             acl_allow: Mode::Personal.preset_acl_allow(),
             acl_deny: vec![],
+            acl_drop: vec![],
+            acl_unlisted: AclUnlisted::Deny,
             rate_limit_per_sec: 0,
             rate_limit_burst: 0,
             run_as_user: None,
@@ -1960,6 +1981,9 @@ impl Config {
         }
         if !self.recurse_allow_answers.is_empty() && self.recurse_deny_answers.is_empty() {
             soft.push("`recurse_allow_answers` lists exceptions to `recurse_deny_answers`; the deny list is empty, so it has no effect".into());
+        }
+        if self.acl_unlisted == AclUnlisted::Drop && self.acl_default_allow() {
+            soft.push("`acl_unlisted = \"drop\"` applies to clients outside `acl_allow` and `acl_allow_ids`; both are empty, so every client is allowed and nothing is dropped".into());
         }
         let ipset_named = self.ipset_name_v4.is_some() || self.ipset_name_v6.is_some();
         if ipset_named == self.ipset_domains.is_empty() {
@@ -2824,6 +2848,14 @@ impl Config {
     }
 
     /**
+     * @brief 어느 접근 규칙에도 걸리지 않은 클라이언트가 실제로 받는 처분.
+     * @return 허용 목록이 없어 모두 받으면 None. 그때 acl_unlisted 는 효과가 없다.
+     */
+    pub fn acl_unlisted_effect(&self) -> Option<AclUnlisted> {
+        (!self.acl_default_allow()).then_some(self.acl_unlisted)
+    }
+
+    /**
      * @brief 이 서버의 질의 수신 주소 가운데 다른 호스트에서 닿을 수 있는 것이 있는지.
      * @details 루프백에만 묶여 있으면 이 기계 밖에서는 질의를 보낼 수 없다. 증폭이나 반사
      *          같은 위험은 그 경우 성립하지 않는다.
@@ -3258,6 +3290,8 @@ impl Config {
 
         kv("acl_allow", sarr(&self.acl_allow));
         kv("acl_deny", sarr(&self.acl_deny));
+        kv("acl_drop", sarr(&self.acl_drop));
+        kv("acl_unlisted", lower_dbg(&self.acl_unlisted));
         kv("acl_allow_ids", sarr(&self.acl_allow_ids));
         kv("acl_deny_ids", sarr(&self.acl_deny_ids));
         kv("rate_limit_per_sec", self.rate_limit_per_sec.to_string());
@@ -3754,6 +3788,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         check_kind(root, key, "bool", Value::as_bool)?;
     }
     for key in [
+        "acl_unlisted",
         "acme_account_key_file",
         "acme_cert_file",
         "acme_challenge",
@@ -3884,6 +3919,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         &["nxdomain", "zero_ip", "refused", "custom"],
     )?;
     check_enum(root, "cookies", &["off", "lenient", "strict"])?;
+    check_enum(root, "acl_unlisted", &["deny", "drop"])?;
     check_enum(root, "split_default", &["forward", "recurse"])?;
     check_enum(
         root,
@@ -4035,6 +4071,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
 
     check_typed_array::<IpNet>(root, "acl_allow", "CIDR (for example 192.168.0.0/24)")?;
     check_typed_array::<IpNet>(root, "acl_deny", "CIDR (for example 192.168.0.0/24)")?;
+    check_typed_array::<IpNet>(root, "acl_drop", "CIDR (for example 192.168.0.0/24)")?;
     check_typed_array::<IpNet>(
         root,
         "tftp_write_allow",
@@ -5411,6 +5448,13 @@ fn dec_cookies(s: &str) -> CookieMode {
         _ => CookieMode::Off,
     }
 }
+/** @brief 목록 밖 클라이언트 처분 이름을 값으로. */
+fn dec_acl_unlisted(s: &str) -> AclUnlisted {
+    match s {
+        "drop" => AclUnlisted::Drop,
+        _ => AclUnlisted::Deny,
+    }
+}
 /** @brief 분할 대상 이름을 값으로. */
 fn dec_split(s: &str) -> SplitTarget {
     match s {
@@ -5587,6 +5631,8 @@ const KNOWN_KEYS: &[&str] = &[
     "local_aaaa",
     "acl_allow",
     "acl_deny",
+    "acl_drop",
+    "acl_unlisted",
     "rate_limit_per_sec",
     "rate_limit_burst",
     "run_as_user",
@@ -5932,6 +5978,10 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
         }
     };
     c.acl_deny = gparsevec(root, "acl_deny");
+    c.acl_drop = gparsevec(root, "acl_drop");
+    if let Some(s) = gstr(root, "acl_unlisted") {
+        c.acl_unlisted = dec_acl_unlisted(&s);
+    }
     c.rate_limit_per_sec = gi64(root, "rate_limit_per_sec")
         .map(|i| i as u32)
         .unwrap_or(d.rate_limit_per_sec);
@@ -7968,6 +8018,78 @@ types = ["A", "AAAA", "CAA", "257"]
             "acl_allow = [\"10.0.0.0/8\"]\nlisten = [\"0.0.0.0:53\"]\nupstreams = [\"1.1.1.1\"]\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    /** @brief 버릴 대역을 IPv4 와 IPv6 모두 읽고, 틀린 항목이 하나라도 있으면 거부하는지. */
+    fn acl_drop_reads_networks_and_rejects_invalid_ones() {
+        let cfg =
+            Config::from_toml_str("acl_drop = [\"198.51.100.0/24\", \"2001:db8::/32\"]\n").unwrap();
+        assert_eq!(
+            cfg.acl_drop,
+            vec![
+                "198.51.100.0/24".parse::<IpNet>().unwrap(),
+                "2001:db8::/32".parse::<IpNet>().unwrap(),
+            ]
+        );
+        let error = Config::from_toml_str("acl_drop = [\"198.51.100.0/24\", \"not-a-cidr\"]\n")
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("acl_drop[1]"),
+            "틀린 항목의 위치를 알려야 합니다: {error}"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 목록 밖 처분을 읽고, 모르는 값은 기본값으로 덮지 않고 거부하는지.
+     * @details 오타를 거부로 읽으면 운영자는 버린다고 믿는데 서버는 계속 거부로 답한다.
+     */
+    fn acl_unlisted_reads_values_and_rejects_others() {
+        assert_eq!(Config::default().acl_unlisted, AclUnlisted::Deny);
+        assert_eq!(
+            Config::from_toml_str("acl_unlisted = \"drop\"\n")
+                .unwrap()
+                .acl_unlisted,
+            AclUnlisted::Drop
+        );
+        assert_eq!(
+            Config::from_toml_str("acl_unlisted = \"deny\"\n")
+                .unwrap()
+                .acl_unlisted,
+            AclUnlisted::Deny
+        );
+        for bad in ["acl_unlisted = \"silent\"\n", "acl_unlisted = true\n"] {
+            let error = Config::from_toml_str(bad).unwrap_err();
+            assert!(
+                format!("{error}").contains("acl_unlisted"),
+                "틀린 값을 받아들였거나 키를 알리지 않았습니다: {bad} -> {error}"
+            );
+        }
+    }
+
+    #[test]
+    /**
+     * @brief 허용 목록이 없을 때 목록 밖 버림을 켜면 아무것도 버리지 않는다고 알리는지.
+     * @details 허용 목록이 없으면 모든 클라이언트가 허용되므로 운영자가 기대한 은닉이 일어나지
+     *          않는다. 조용히 넘기면 탐색에 그대로 응답하는 줄 모른다.
+     */
+    fn acl_unlisted_drop_without_allow_list_is_advised() {
+        let mentions = |cfg: &Config| {
+            cfg.advisories()
+                .iter()
+                .any(|line| line.contains("acl_unlisted"))
+        };
+        let open = Config::from_toml_str("acl_allow = []\nacl_unlisted = \"drop\"\n").unwrap();
+        assert!(open.acl_default_allow());
+        assert!(mentions(&open), "{:?}", open.advisories());
+
+        let closed = Config::from_toml_str("acl_unlisted = \"drop\"\n").unwrap();
+        assert!(
+            !closed.acl_default_allow(),
+            "대조군이 무효입니다: 기본 허용 목록이 있어야 합니다"
+        );
+        assert!(!mentions(&closed), "{:?}", closed.advisories());
     }
 
     #[test]

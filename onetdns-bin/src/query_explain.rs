@@ -78,7 +78,7 @@ pub(crate) fn simulate_policy(
         .explain(&name, onetdns_proto::RecordType(qtype), &ci);
     let flt = match &exp.verdict {
         FilterVerdict::Allow => "allow",
-        FilterVerdict::Block(_) => "block",
+        FilterVerdict::Block(_) | FilterVerdict::Drop => "block",
         FilterVerdict::Rewrite(_) => "rewrite",
     };
     let stage = exp.stage.as_str();
@@ -188,7 +188,7 @@ pub(crate) fn explain_query(
     let exp = eng.explain(&name, onetdns_proto::RecordType(qtype), &ci);
     let flt = match &exp.verdict {
         FilterVerdict::Allow => "allow",
-        FilterVerdict::Block(_) => "block",
+        FilterVerdict::Block(_) | FilterVerdict::Drop => "block",
         FilterVerdict::Rewrite(_) => "rewrite",
     };
     let stage = exp.stage.as_str();
@@ -209,8 +209,11 @@ pub(crate) fn explain_query(
     } else {
         flt.to_string()
     };
+    /* 정책이 처분을 정하면 필터를 보지 않으므로, 무응답은 정책이 넘긴 질의에서만 일어난다. */
+    let dropped = pol == "continue" && matches!(exp.verdict, FilterVerdict::Drop);
     let rcode = match (&exp.verdict, decision.as_str()) {
         (_, "refuse") => "REFUSED".to_string(),
+        _ if dropped => "DROPPED".to_string(),
         (FilterVerdict::Block(response), "block") if pol == "continue" => native::rcode_str(
             native::block_rcode(response, onetdns_proto::RecordType(qtype)),
         )
@@ -256,6 +259,10 @@ pub(crate) fn explain_query(
         "rewrite" => ("rewrite", "answered by rewrite rule".to_string()),
         d if d.starts_with("rewrite:") => ("rewrite", "answered by policy rewrite".to_string()),
         "refuse" => ("refused", "refused before resolution".to_string()),
+        _ if dropped => (
+            "blocked",
+            "dropped before resolution without a response".to_string(),
+        ),
         _ => ("blocked", "blocked before resolution".to_string()),
     };
     let ss = safe_search
@@ -383,6 +390,68 @@ mod tests {
         assert_eq!(ask(&nx, &forward, "www.d.test").1, "authority");
         assert_eq!(ask(&nx, &forward, "other.example").1, "forward");
         assert_eq!(ask(&nx, &cfg("recurse"), "other.example").1, "recurse");
+    }
+
+    #[test]
+    /**
+     * @brief NORESPONSE 이름의 설명이 응답 코드 대신 DROPPED 를 말하는지.
+     * @details 설명이 차단 응답의 코드를 말하면 운영자는 실제로는 받지 못할 답을 기대한다. 정책이
+     *          처분을 정한 이름은 필터를 보지 않으므로 무응답이라고 설명하면 안 된다.
+     */
+    fn explain_reports_noresponse_as_dropped() {
+        let filter = onetdns_filter::SharedFilter::from_pointee(onetdns_filter::build_from_str(
+            "||quiet.example^$dnsrewrite=NORESPONSE",
+            "",
+            onetdns_core::BlockResponse::NxDomain,
+        ));
+        let cfg =
+            Config::from_toml_str("backend = \"forward\"\nupstreams = [\"192.0.2.1\"]\n").unwrap();
+        let zones = onetdns_authority::ZoneStore::new();
+        let ask = |policy: &onetdns_policy::PolicyEngine| {
+            let out = explain_query(
+                policy,
+                &filter,
+                &cfg,
+                &zones,
+                "{\"qname\":\"quiet.example\"}",
+            );
+            let j = onetdns_core::json::parse(&out).unwrap();
+            let field = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            (
+                field("decision"),
+                field("rcode"),
+                field("filter_stage"),
+                field("resolution"),
+            )
+        };
+
+        let open =
+            onetdns_policy::PolicyEngine::new(onetdns_policy::RuleEngine::new(vec![]), vec![]);
+        let (decision, rcode, stage, resolution) = ask(&open);
+        assert_eq!(decision, "block");
+        assert_eq!(rcode, "DROPPED");
+        assert_eq!(stage, "noresponse");
+        assert!(resolution.contains("without a response"), "{resolution}");
+        let simulated = simulate_policy(&open, &filter, "{\"qname\":\"quiet.example\"}");
+        assert!(
+            simulated.contains("\"filter\":\"block\"")
+                && simulated.contains("\"filter_stage\":\"noresponse\""),
+            "{simulated}"
+        );
+
+        let allowing = onetdns_policy::PolicyEngine::new(
+            onetdns_policy::RuleEngine::new(vec![onetdns_policy::Rule::new(
+                onetdns_policy::Action::Allow,
+            )
+            .with_suffixes(&["quiet.example".to_string()])]),
+            vec![],
+        );
+        let (decision, rcode, _, _) = ask(&allowing);
+        assert_eq!(decision, "allow");
+        assert_eq!(
+            rcode, "NOERROR",
+            "정책이 허용한 이름을 무응답으로 설명했습니다"
+        );
     }
 
     #[test]

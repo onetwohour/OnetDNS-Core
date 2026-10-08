@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use onetdns_config::{BackendKind, BlockResponseKind, Config, EcsMode};
+use onetdns_config::{AclUnlisted, BackendKind, BlockResponseKind, Config, EcsMode};
 use onetdns_core::{AccessControl, BlockResponse, RateLimiter};
 use onetdns_security::{CookieKeeper, IpAcl, KeyedRateLimiter, SubnetRateLimiter};
 use sha2::{Digest, Sha256};
@@ -145,6 +145,20 @@ impl AccessControl for DynamicAccessControl {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .check(client)
+    }
+
+    /**
+     * @brief 지금 규칙이 이 주소를 버리는지와 그 까닭.
+     * @note 전송이 패킷과 연결마다 부르므로 규칙이 하나도 없으면 잠금 없이 답한다.
+     */
+    fn drops(&self, ip: std::net::IpAddr) -> Option<onetdns_core::DropReason> {
+        if self.is_trivially_allow() {
+            return None;
+        }
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drops(ip)
     }
 
     /** @brief 아무것도 막지 않는지. 빠른 경로가 이 판정을 믿고 검사를 건너뛴다. */
@@ -297,7 +311,9 @@ pub(crate) fn runtime_access_control(cfg: &Config) -> Arc<dyn AccessControl> {
             cfg.acl_deny.clone(),
             cfg.acl_default_allow(),
         )
-        .with_ids(cfg.acl_allow_ids.clone(), cfg.acl_deny_ids.clone()),
+        .with_ids(cfg.acl_allow_ids.clone(), cfg.acl_deny_ids.clone())
+        .with_drop(cfg.acl_drop.clone())
+        .with_unlisted_drop(cfg.acl_unlisted == AclUnlisted::Drop),
     )
 }
 
@@ -1053,6 +1069,43 @@ mod tests {
         acl.replace(Arc::new(IpAcl::allow_all()));
         assert!(acl.is_trivially_allow());
         assert_eq!(acl.check(&client), onetdns_core::AclDecision::Allow);
+    }
+
+    #[test]
+    /**
+     * @brief 목록 밖 처분이 설정에서 실제 접근 제어까지 이어지는지.
+     * @details 기본 허용 목록은 사설 대역뿐이라 공인 주소의 클라이언트는 어느 규칙에도 걸리지
+     *          않는다. 그 클라이언트를 버리라고 했으면 전송이 쓰는 주소만의 판정도 버려야 한다.
+     */
+    fn runtime_access_control_carries_the_unlisted_policy() {
+        use onetdns_core::{AclDecision, DropReason};
+        let client = onetdns_core::ClientInfo {
+            source_ip: "203.0.113.1".parse().unwrap(),
+            client_id: None,
+            transport: onetdns_core::Transport::Do53Udp,
+            authenticated: false,
+        };
+        let mut cfg = Config::default();
+        let refusing = runtime_access_control(&cfg);
+        assert_eq!(
+            refusing.check(&client),
+            AclDecision::Deny,
+            "대조군이 무효입니다: 기본값은 거부여야 합니다"
+        );
+        assert_eq!(refusing.drops(client.source_ip), None);
+
+        cfg.acl_unlisted = AclUnlisted::Drop;
+        let dropping = runtime_access_control(&cfg);
+        assert_eq!(
+            dropping.check(&client),
+            AclDecision::Drop(DropReason::Unlisted)
+        );
+        assert_eq!(dropping.drops(client.source_ip), Some(DropReason::Unlisted));
+        assert_eq!(
+            dropping.drops("192.168.1.10".parse().unwrap()),
+            None,
+            "허용 목록의 주소를 버렸습니다"
+        );
     }
 
     #[test]

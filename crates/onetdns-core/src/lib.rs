@@ -43,8 +43,8 @@ pub use ipnet::IpNet;
 pub use lrumap::LruMap;
 pub use origin::HttpsOrigin;
 pub use policy::{
-    AccessControl, AclDecision, BlockResponse, FilterEngine, FilterExplanation, FilterVerdict,
-    MatchStage, RateDecision, RateLimiter, RewriteTarget,
+    AccessControl, AclDecision, BlockResponse, DropReason, FilterEngine, FilterExplanation,
+    FilterVerdict, MatchStage, RateDecision, RateLimiter, RewriteTarget,
 };
 pub use rng::{
     ephemeral_random_array, fill_ephemeral_random, fill_random, random_array, try_fill_random,

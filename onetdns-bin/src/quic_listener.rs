@@ -320,7 +320,7 @@ pub(crate) fn serve<S: QuicService>(
     let workers = qworker::default_worker_count();
     let (done_notify, wake_source) = qworker::udp_completion_notifier(bound)?;
     let pool = WorkerPool::new(
-        qworker::handler_resolver(handler),
+        qworker::handler_resolver(handler.clone()),
         workers,
         workers * 64,
         Some(done_notify),
@@ -334,6 +334,7 @@ pub(crate) fn serve<S: QuicService>(
                 tls,
                 pool,
                 wake_source,
+                drops: Box::new(move |source| handler.drops_source(source)),
                 control: QuicRunControl::new(shutdown, listener_stop, memory_budget),
                 table: ConnTable::new(),
                 base_tp: TransportParams::server_defaults(),
@@ -699,6 +700,8 @@ struct Listener<S: QuicService> {
     pool: WorkerPool,
     /** @brief 워커가 완료를 알리며 보내는 데이터그램의 출발지. */
     wake_source: SocketAddr,
+    /** @brief 이 주소에서 온 데이터그램을 아무 응답 없이 버려야 하는지. */
+    drops: Box<dyn Fn(IpAddr) -> bool + Send>,
     /** @brief 종료 신호와 전역 메모리 예산. */
     control: QuicRunControl,
     /** @brief 살아 있는 연결들. */
@@ -786,6 +789,24 @@ impl<S: QuicService> Listener<S> {
      */
     fn on_datagram(&mut self, bytes: &[u8], peer: SocketAddr, panic_key: &mut Option<Vec<u8>>) {
         if qworker::is_completion_wake(peer, self.wake_source, bytes) {
+            return;
+        }
+        /*
+         * 버릴 주소에는 Retry 도 ACK 도 보내지 않는다. 버림이 정해지기 전에 그 주소에 열린
+         * 연결이 있으면 상태도 지워 재전송까지 멈춘다.
+         */
+        if (self.drops)(peer.ip()) {
+            if let Some(dcid) = packet::destination_connection_id(bytes, 8) {
+                let key = self.table.key_for(dcid);
+                if self
+                    .table
+                    .conns
+                    .get(&key)
+                    .is_some_and(|entry| same_validated_path(entry.peer, peer))
+                {
+                    self.table.remove(&key);
+                }
+            }
             return;
         }
         let Some(dcid) = packet::destination_connection_id(bytes, 8).map(<[u8]>::to_vec) else {
@@ -1061,8 +1082,8 @@ mod tests {
         }
     }
 
-    /** @brief 핸드셰이크를 마친 클라이언트와 서버 연결. */
-    fn handshaked_pair(alpn: &[u8]) -> (Connection, Connection) {
+    /** @brief 서버 인증서를 확인하지 않는 클라이언트 연결. 아직 아무것도 보내지 않았다. */
+    fn client_connection(alpn: &[u8]) -> Connection {
         let client_cfg = ClientConfig {
             server_name: "dns.test".into(),
             verify_name: false,
@@ -1073,18 +1094,23 @@ mod tests {
             alpn: vec![alpn.to_vec()],
             ..Default::default()
         };
-        let mut server = Connection::new_server(
-            server_config(alpn),
-            SERVER_KEY.to_vec(),
-            TransportParams::server_defaults(),
-        );
-        let mut client = Connection::new_client(
+        Connection::new_client(
             client_cfg,
             SERVER_KEY.to_vec(),
             b"CLIENTID".to_vec(),
             TransportParams::server_defaults(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /** @brief 핸드셰이크를 마친 클라이언트와 서버 연결. */
+    fn handshaked_pair(alpn: &[u8]) -> (Connection, Connection) {
+        let mut server = Connection::new_server(
+            server_config(alpn),
+            SERVER_KEY.to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = client_connection(alpn);
         pump(&mut client, &mut server);
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
         (client, server)
@@ -1151,6 +1177,7 @@ mod tests {
             tls: Arc::new(onetdns_core::ArcSwap::new(server_config(b"doq"))),
             pool: WorkerPool::new(Arc::new(|_: &QueryJob| None), 1, 1, None).unwrap(),
             wake_source: "127.0.0.1:9".parse().unwrap(),
+            drops: Box::new(|_| false),
             control: QuicRunControl::new(
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
@@ -1515,5 +1542,68 @@ mod tests {
             "closing 기간이 끝난 연결이 남았습니다"
         );
         assert_eq!(budget.used_bytes(), 0, "버린 연결의 메모리 몫이 남았습니다");
+    }
+
+    /** @brief 소켓에 데이터그램이 오지 않는지. 보낸 것이 있다면 루프백이라 곧 도착한다. */
+    fn stays_silent(socket: &UdpSocket) -> bool {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        socket.recv_from(&mut buf).is_err()
+    }
+
+    #[test]
+    /**
+     * @brief 버리는 주소에는 Retry 도 ACK 도 보내지 않고, 그 주소에 열려 있던 연결은 지우는지.
+     * @details 모르는 연결의 첫 패킷에 Retry 를, 열린 연결의 패킷에 ACK 를 보내면 서버가 있다는
+     *          것이 드러난다. 버림이 정해지기 전에 열린 연결은 상태를 지워야 재전송도 멈춘다.
+     */
+    fn dropped_peer_gets_no_datagram_and_loses_its_connection() {
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = client_socket.local_addr().unwrap();
+        let initial = client_connection(b"doq")
+            .next_datagram()
+            .expect("클라이언트가 첫 패킷을 만들지 않았습니다");
+
+        let mut listener = listener_with(Probe::default(), ConnTable::new());
+        listener.on_datagram(&initial, peer, &mut None);
+        assert!(
+            next_datagram_on(&client_socket).is_some(),
+            "대조군이 무효입니다. 버리지 않는 주소의 첫 패킷에 Retry 가 나가지 않았습니다"
+        );
+        listener.drops = Box::new(|source| source.is_loopback());
+        listener.on_datagram(&initial, peer, &mut None);
+        assert!(
+            stays_silent(&client_socket),
+            "버리는 주소의 첫 패킷에 답했습니다"
+        );
+
+        let (mut client, server) = handshaked_pair(b"doq");
+        let mut listener = listener_with(
+            Probe::default(),
+            conn_table(server, peer, Arc::new(QuicMemoryBudget::default()), 0),
+        );
+        listener.drops = Box::new(|source| source.is_loopback());
+        let query = Message::query(0, Name::from_str("drop.test").unwrap(), RecordType::A)
+            .try_encode()
+            .unwrap();
+        client.send_dns_message(0, &query).unwrap();
+        while let Some(datagram) = client.next_datagram() {
+            listener.on_datagram(&datagram, peer, &mut None);
+        }
+        assert!(
+            stays_silent(&client_socket),
+            "버리는 주소의 열린 연결에 답했습니다"
+        );
+        assert_eq!(
+            listener.service.dispatched.get(),
+            0,
+            "버리는 주소의 질의를 서비스에 넘겼습니다"
+        );
+        assert!(
+            listener.table.conns.is_empty(),
+            "버리는 주소에 열려 있던 연결이 남았습니다"
+        );
     }
 }

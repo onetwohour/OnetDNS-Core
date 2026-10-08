@@ -383,7 +383,7 @@ impl NativeServer {
             return None;
         }
         let client = self.identify(ctx);
-        if self.acl.check(&client) == AclDecision::Deny
+        if self.acl.check(&client) != AclDecision::Allow
             || !authority
                 .xfr_allow
                 .iter()
@@ -1228,7 +1228,7 @@ impl NativeServer {
             && self
                 .acl
                 .check(client.as_ref().expect("non-trivial ACL needs client"))
-                == AclDecision::Deny
+                != AclDecision::Allow
         {
             return Wire::Fallback;
         }

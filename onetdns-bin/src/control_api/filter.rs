@@ -335,7 +335,10 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 접근을 허용하거나 막는 대역과 거부 도메인. */
+    /**
+     * @brief 접근을 허용하거나 막거나 응답 없이 버리는 대역, 어느 규칙에도 걸리지 않은
+     *        클라이언트의 처분, 거부 도메인.
+     */
     pub(super) fn access_list(&self) -> String {
         let c = self.runtime_cfg.load();
         let arr = |v: &[onetdns_core::IpNet]| {
@@ -350,10 +353,16 @@ impl ControlDeps {
             .map(|h| onetdns_core::json::escape(h))
             .collect::<Vec<_>>()
             .join(",");
+        let unlisted = match c.acl_unlisted_effect() {
+            None => "allow",
+            Some(onetdns_config::AclUnlisted::Deny) => "deny",
+            Some(onetdns_config::AclUnlisted::Drop) => "drop",
+        };
         format!(
-            "{{\"allowed\":[{}],\"blocked\":[{}],\"refused_domains\":[{}]}}",
+            "{{\"allowed\":[{}],\"blocked\":[{}],\"dropped\":[{}],\"unlisted\":\"{unlisted}\",\"refused_domains\":[{}]}}",
             arr(&c.acl_allow),
             arr(&c.acl_deny),
+            arr(&c.acl_drop),
             refused
         )
     }

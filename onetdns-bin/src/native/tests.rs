@@ -392,6 +392,13 @@ fn an_unparsable_query_is_answered_with_formerr_behind_the_usual_gates() {
         denied.handle_unparsable(&packet, &ctx()).is_none(),
         "거부한 클라이언트에게 서버가 있다고 알렸습니다"
     );
+
+    let mut dropped = server_with_chain("", |base| base);
+    dropped.acl = Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.1/32".parse().unwrap()]));
+    assert!(
+        dropped.handle_unparsable(&packet, &ctx()).is_none(),
+        "버린 클라이언트에게 서버가 있다고 알렸습니다"
+    );
 }
 
 #[test]
@@ -4346,6 +4353,445 @@ fn acl_deny_refuses() {
     assert_eq!(resp.header.rcode, ResponseCode::Refused.0);
 }
 
+/** @brief 테스트 문맥의 출발지인 127.0.0.1 을 버리는 접근 제어. */
+fn dropping_loopback() -> Arc<IpAcl> {
+    Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.1/32".parse().unwrap()]))
+}
+
+#[test]
+/**
+ * @brief 버리는 주소의 질의에는 거부 응답도 보내지 않는지.
+ * @details 허용 목록에 든 주소라도 버림이 이긴다. UPDATE 는 일반 질의와 다른 자리에서
+ *          입장하고, IPv6 형태로 들어온 IPv4 주소는 판정 전에 IPv4 로 바뀌어야 하므로 함께 본다.
+ */
+fn acl_drop_answers_nothing_even_to_allowed_clients() {
+    let mut s = server("");
+    s.acl = Arc::new(
+        IpAcl::new(vec!["127.0.0.0/8".parse().unwrap()], vec![], false)
+            .with_drop(vec!["127.0.0.1/32".parse().unwrap()]),
+    );
+    assert!(
+        s.handle(&q("x.test"), &ctx()).is_none(),
+        "버린 클라이언트에게 답했습니다"
+    );
+    let mapped = RequestCtx {
+        src: "[::ffff:127.0.0.1]:5555".parse().unwrap(),
+        ..ctx()
+    };
+    assert!(
+        s.handle(&q("x.test"), &mapped).is_none(),
+        "IPv6 형태로 들어온 IPv4 주소를 놓쳤습니다"
+    );
+
+    let mut update = Message::default();
+    update.header.id = 0x77;
+    update.header.opcode = 5;
+    update.questions = vec![onetdns_proto::Question {
+        name: ApName::from_str("example.com").unwrap(),
+        qtype: ApRt::SOA,
+        qclass: DnsClass::IN,
+    }];
+    assert!(
+        s.handle(&update, &ctx()).is_none(),
+        "버린 클라이언트의 UPDATE 에 답했습니다"
+    );
+}
+
+#[test]
+/**
+ * @brief 빠른 경로에 담아 둔 답도 버리는 주소에는 내보내지 않는지.
+ * @details 담아 둔 답을 내보내는 경로는 접근 제어를 따로 다시 본다. 거부만 걸러 내면 버림이
+ *          허용으로 새어 나간다.
+ */
+fn acl_drop_withholds_cached_wire_answers() {
+    use onetdns_runtime::WireDisposition;
+
+    let (backend, cache) = fixed_answer_cache();
+    let mut server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::build_from_str(
+            "",
+            "",
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_wire_fast_path(Some((
+        crate::wirecache::WireEntryFactory::new(0, 86_400),
+        cache,
+    )));
+    let request = Message::query(0x0101, ApName::from_str("ok.example").unwrap(), ApRt::A);
+    let packet = request.try_encode().unwrap();
+    let mut out = onetdns_proto::Writer::with_limit(1232);
+    assert_eq!(
+        server.handle_udp_wire(&packet, &ctx(), &mut out, Instant::now()),
+        WireDisposition::Respond,
+        "대조군이 무효입니다. 허용된 클라이언트의 답이 담기지 않았습니다"
+    );
+
+    server.acl = dropping_loopback();
+    let mut out = onetdns_proto::Writer::with_limit(1232);
+    assert_ne!(
+        server.handle_udp_wire(&packet, &ctx(), &mut out, Instant::now()),
+        WireDisposition::Respond,
+        "담아 둔 답을 버린 클라이언트에게 내보냈습니다"
+    );
+    assert!(
+        server.handle(&request, &ctx()).is_none(),
+        "빠른 경로가 넘긴 질의에 느린 경로가 답했습니다"
+    );
+}
+
+#[test]
+/** @brief 권한 영역의 빠른 경로도 버리는 주소에는 답하지 않는지. */
+fn acl_drop_withholds_authoritative_wire_answers() {
+    let zone_text = "$ORIGIN fast.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n";
+    let mut zones = onetdns_authority::ZoneStore::new();
+    zones.add(onetdns_authority::parse_zone(zone_text, "fast.test").unwrap());
+    let store = Arc::new(ArcSwap::new(Arc::new(zones)));
+    let authority = Arc::new(crate::layers::AuthorityLayer::new(
+        Arc::new(FixedAnswer),
+        store.clone(),
+    ));
+    let mut server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        authority,
+        60,
+    )
+    .with_authority_wire_path(Some(store), true);
+    let request = Message::query(
+        0x4567,
+        ApName::from_str("www.fast.test").unwrap(),
+        RecordType::A,
+    );
+    let packet = request.try_encode().unwrap();
+    let mut output = onetdns_proto::Writer::with_limit(1232);
+    assert_eq!(
+        server.handle_udp_wire(&packet, &ctx(), &mut output, Instant::now()),
+        onetdns_runtime::WireDisposition::Respond,
+        "대조군이 무효입니다. 허용된 클라이언트에게 권한 영역의 답이 나가지 않았습니다"
+    );
+
+    server.acl = dropping_loopback();
+    let mut output = onetdns_proto::Writer::with_limit(1232);
+    assert_ne!(
+        server.handle_udp_wire(&packet, &ctx(), &mut output, Instant::now()),
+        onetdns_runtime::WireDisposition::Respond,
+        "권한 영역의 답을 버린 클라이언트에게 내보냈습니다"
+    );
+    assert!(
+        server.handle(&request, &ctx()).is_none(),
+        "빠른 경로가 넘긴 질의에 느린 경로가 답했습니다"
+    );
+}
+
+#[test]
+/** @brief 영역 전송도 버리는 주소에는 거부 응답 없이 아무것도 보내지 않는지. */
+fn acl_drop_withholds_zone_transfers() {
+    let mut srv = server("").with_xfr(big_zone_store(10), vec!["127.0.0.0/8".parse().unwrap()]);
+    srv.acl = dropping_loopback();
+    let tcp = RequestCtx {
+        transport: RtTransport::Do53Tcp,
+        ..ctx()
+    };
+    let axfr = Message::query(7, ApName::from_str("big.test").unwrap(), ApRt(252));
+    let mut emitted = 0usize;
+    let mut writer = onetdns_proto::Writer::new();
+    let preencoded = srv.handle_preencoded_stream(&axfr, &tcp, &mut writer, &mut |_| {
+        emitted += 1;
+        true
+    });
+    assert_ne!(
+        preencoded,
+        Some(true),
+        "버린 클라이언트의 영역 전송을 미리 인코딩한 경로가 처리했습니다"
+    );
+    let completed = srv.handle_stream(&axfr, &tcp, &mut |_| {
+        emitted += 1;
+        true
+    });
+    assert!(
+        !completed,
+        "버린 클라이언트의 영역 전송을 끝까지 보냈습니다"
+    );
+    assert_eq!(
+        emitted, 0,
+        "버린 클라이언트에게 영역 전송 응답을 보냈습니다"
+    );
+}
+
+#[test]
+/**
+ * @brief 목록 밖 버림을 켜면 어느 규칙에도 걸리지 않은 클라이언트에게 아무것도 보내지 않는지.
+ * @details 거부 목록에 든 클라이언트는 운영자가 거부를 고른 대상이라 계속 REFUSED 를 받아야
+ *          한다. UPDATE 와 파싱하지 못한 질의의 FORMERR 는 일반 질의와 다른 자리에서 나가므로
+ *          함께 본다.
+ */
+fn acl_unlisted_drop_answers_nothing_outside_the_allow_list() {
+    let acl = |allow: &str, deny: &str, drop_unlisted: bool| {
+        Arc::new(
+            IpAcl::new(
+                vec![allow.parse().unwrap()],
+                vec![deny.parse().unwrap()],
+                false,
+            )
+            .with_unlisted_drop(drop_unlisted),
+        )
+    };
+    let mut s = server("");
+    s.acl = acl("10.0.0.0/8", "192.0.2.0/24", false);
+    let refused = s
+        .handle(&q("x.test"), &ctx())
+        .expect("대조군이 무효입니다: 끄면 거부 응답이 나가야 합니다");
+    assert_eq!(refused.header.rcode, ResponseCode::Refused.0);
+
+    s.acl = acl("10.0.0.0/8", "192.0.2.0/24", true);
+    assert!(
+        s.handle(&q("x.test"), &ctx()).is_none(),
+        "규칙에 없는 클라이언트에게 답했습니다"
+    );
+    let mut update = Message::default();
+    update.header.id = 0x78;
+    update.header.opcode = 5;
+    update.questions = vec![onetdns_proto::Question {
+        name: ApName::from_str("example.com").unwrap(),
+        qtype: ApRt::SOA,
+        qclass: DnsClass::IN,
+    }];
+    assert!(
+        s.handle(&update, &ctx()).is_none(),
+        "규칙에 없는 클라이언트의 UPDATE 에 답했습니다"
+    );
+    /* 질문 하나를 적어 놓고 둘이라고 말하는 헤더. 파서가 거부한다. */
+    let mut packet = vec![0u8; 12];
+    packet[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+    packet[4..6].copy_from_slice(&2u16.to_be_bytes());
+    packet.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 0, 1, 0, 1]);
+    assert!(Message::parse(&packet).is_err());
+    assert!(
+        s.handle_unparsable(&packet, &ctx()).is_none(),
+        "규칙에 없는 클라이언트에게 FORMERR 를 보냈습니다"
+    );
+
+    s.acl = acl("127.0.0.0/8", "192.0.2.0/24", true);
+    let answered = s
+        .handle(&q("x.test"), &ctx())
+        .expect("허용 목록의 클라이언트를 버렸습니다");
+    assert_eq!(answered.header.rcode, ResponseCode::NoError.0);
+
+    s.acl = acl("10.0.0.0/8", "127.0.0.0/8", true);
+    let denied = s
+        .handle(&q("x.test"), &ctx())
+        .expect("거부 목록의 클라이언트를 버렸습니다");
+    assert_eq!(denied.header.rcode, ResponseCode::Refused.0);
+}
+
+#[test]
+/**
+ * @brief ID 규칙이 있으면 목록 밖 버림을 ID 를 본 뒤에 하고, 그보다 먼저 나가는 응답도 막는지.
+ * @details 이때 주소만 보는 판정은 버리지 못한다. 핸드셰이크 전에 버리면 허용된 ID 를 가진
+ *          클라이언트까지 끊긴다. 그래서 질의를 읽은 뒤의 관문이 ID 까지 보고 버려야 한다.
+ *          TSIG 오류는 입장 단계보다 먼저 나가므로 그 관문이 주소만 보면 새어 나간다.
+ */
+fn acl_unlisted_drop_with_client_ids_checks_the_id_before_any_answer() {
+    use onetdns_dnssec::tsig;
+
+    let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+    let known = tsig::TsigKey::new(ApName::from_str("query-key").unwrap(), secret.clone()).unwrap();
+    let unknown = tsig::TsigKey::new(ApName::from_str("unknown-key").unwrap(), secret).unwrap();
+    let mut signed = q("signed.test");
+    tsig::sign_message(&mut signed, &unknown, now_unix(), None).unwrap();
+    let wire = signed.try_encode().unwrap();
+    let anonymous = RequestCtx {
+        raw: Some(&wire),
+        ..ctx()
+    };
+    let acl = |drop_unlisted: bool| {
+        Arc::new(
+            IpAcl::new(vec![], vec![], false)
+                .with_ids(vec!["vip".into()], vec![])
+                .with_unlisted_drop(drop_unlisted),
+        )
+    };
+
+    let mut s = server("").with_tsig(vec![known], false);
+    s.acl = acl(false);
+    let error = s
+        .handle(&signed, &anonymous)
+        .expect("대조군이 무효입니다: TSIG 오류가 입장 단계보다 먼저 나가야 합니다");
+    assert_eq!(error.header.rcode, 9);
+
+    s.acl = acl(true);
+    assert!(
+        !s.drops_source("127.0.0.1".parse().unwrap()),
+        "ID 를 보기 전에 주소만 보고 버렸습니다"
+    );
+    assert!(
+        s.handle(&signed, &anonymous).is_none(),
+        "규칙에 없는 클라이언트에게 TSIG 오류를 보냈습니다"
+    );
+    assert!(
+        s.handle(&q("x.test"), &ctx()).is_none(),
+        "규칙에 없는 클라이언트에게 답했습니다"
+    );
+    let vip = RequestCtx {
+        transport: RtTransport::DoT,
+        client_id: Some("vip".into()),
+        authenticated: true,
+        ..ctx()
+    };
+    let answered = s
+        .handle(&q("x.test"), &vip)
+        .expect("허용된 ID 를 가진 클라이언트를 버렸습니다");
+    assert_eq!(answered.header.rcode, ResponseCode::NoError.0);
+}
+
+/** @brief 질의 기록을 켠 테스트용 기록기와 그 기록을 읽는 쪽. */
+fn querylog_recorder() -> (onetdns_control::Recorder, onetdns_control::Stats) {
+    onetdns_control::channel(
+        64,
+        64,
+        3600,
+        onetdns_control::RecorderOpts {
+            querylog: true,
+            anonymize: false,
+            ignored: vec![],
+            stats_retention_secs: 3600,
+        },
+        onetdns_control::PersistOpts::default(),
+    )
+}
+
+/** @brief 이 이름의 질의 기록이 나타날 때까지 기다린다. 기록은 다른 스레드가 모은다. */
+fn wait_for_event(stats: &onetdns_control::Stats, name: &str) -> onetdns_control::QueryEvent {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let found = stats
+            .recent(8)
+            .into_iter()
+            .find(|event| event.name.as_ref().map(ApName::to_string).as_deref() == Some(name));
+        if let Some(event) = found {
+            return event;
+        }
+        assert!(Instant::now() < deadline, "{name} 의 질의 기록이 없습니다");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+/**
+ * @brief NORESPONSE 규칙에 걸린 이름에 아무것도 답하지 않고, 질의 기록에는 차단으로 남기는지.
+ * @details 같은 이름에 일반 차단 규칙을 걸면 답이 나가야 응답이 없는 까닭이 규칙임이 드러난다.
+ *          기록의 응답 코드가 차단 응답의 코드면 운영자는 클라이언트가 그 답을 받았다고 믿는다.
+ */
+fn filter_noresponse_answers_nothing_and_logs_the_drop() {
+    let blocked = server("||quiet.test^\n")
+        .handle(&q("quiet.test"), &ctx())
+        .expect("대조군이 무효입니다: 일반 차단 규칙은 답해야 합니다");
+    assert_eq!(blocked.header.rcode, ResponseCode::NXDomain.0);
+
+    let (recorder, stats) = querylog_recorder();
+    let s = server("||quiet.test^$dnsrewrite=NORESPONSE\n").with_recorder(Some(recorder));
+    assert!(
+        s.handle(&q("quiet.test"), &ctx()).is_none(),
+        "무응답 규칙에 걸린 이름에 답했습니다"
+    );
+    assert!(
+        s.handle(&q("www.quiet.test"), &ctx()).is_none(),
+        "무응답 규칙에 걸린 이름의 하위 이름에 답했습니다"
+    );
+    let other = s
+        .handle(&q("other.test"), &ctx())
+        .expect("규칙에 없는 이름에 답하지 않았습니다");
+    assert_eq!(other.header.rcode, ResponseCode::NoError.0);
+
+    let event = wait_for_event(&stats, "quiet.test.");
+    assert_eq!(event.action, "blocked");
+    assert_eq!(event.rcode, "DROPPED");
+    assert_eq!(event.reason, "FILTER_BLOCKED");
+    assert_eq!(event.rule, "quiet.test");
+}
+
+#[test]
+/**
+ * @brief 별칭이 NORESPONSE 이름을 가리키면 원래 질의에도 답하지 않는지.
+ * @details 별칭을 거쳤다고 답을 보내면, 답하지 않기로 한 이름에 대한 답을 별칭 하나로 받아 낼
+ *          수 있다.
+ */
+fn cname_to_a_noresponse_name_answers_nothing() {
+    let with_rules = |rules: &str| {
+        NativeServer::new(
+            shared_filter(ArcSwap::from_pointee(onetdns_filter::build_from_str(
+                rules,
+                "",
+                BlockResponse::NxDomain,
+            ))),
+            Arc::new(IpAcl::allow_all()),
+            vec![],
+            Arc::new(ShapedAnswer),
+            60,
+        )
+    };
+    let blocked = with_rules("||target.example^\n")
+        .handle(&q("alias.example"), &ctx())
+        .expect("대조군이 무효입니다: 별칭 뒤의 일반 차단은 차단 응답으로 답해야 합니다");
+    assert_eq!(blocked.header.rcode, ResponseCode::NXDomain.0);
+
+    let (recorder, stats) = querylog_recorder();
+    let s = with_rules("||target.example^$dnsrewrite=NORESPONSE\n").with_recorder(Some(recorder));
+    assert!(
+        s.handle(&q("alias.example"), &ctx()).is_none(),
+        "별칭 뒤에 숨은 무응답 이름에 답했습니다"
+    );
+    let event = wait_for_event(&stats, "alias.example.");
+    assert_eq!(event.action, "blocked");
+    assert_eq!(event.rcode, "DROPPED");
+}
+
+#[test]
+/**
+ * @brief 답을 담아 둔 이름에 NORESPONSE 를 걸면 wire 고속 경로가 그 답을 내보내지 않는지.
+ * @details 규칙을 건 뒤에도 고속 경로가 답하면, 담아 둔 답이 만료될 때까지 숨기려던 이름에
+ *          답한다. 고속 경로가 보통 경로로 넘기든 직접 버리든 아무것도 보내지 않으면 된다.
+ */
+fn wire_fast_path_stops_answering_a_cached_name_that_gets_noresponse() {
+    use onetdns_runtime::WireDisposition;
+
+    let server = shaped_server(true);
+    let request = Message::query(0x0606, ApName::from_str("multi.example").unwrap(), ApRt::A);
+    let wire = request.try_encode().unwrap();
+    for attempt in ["담는 질의", "담아 둔 답을 쓰는 질의"] {
+        let mut out = onetdns_proto::Writer::with_limit(1232);
+        assert_eq!(
+            server.handle_udp_wire(&wire, &ctx(), &mut out, Instant::now()),
+            WireDisposition::Respond,
+            "대조군이 무효입니다: {attempt}가 고속 경로로 답하지 않았습니다"
+        );
+    }
+
+    server.filter.store(Arc::new(onetdns_filter::build_from_str(
+        "||multi.example^$dnsrewrite=NORESPONSE",
+        "",
+        BlockResponse::NxDomain,
+    )));
+    let mut out = onetdns_proto::Writer::with_limit(1232);
+    assert_ne!(
+        server.handle_udp_wire(&wire, &ctx(), &mut out, Instant::now()),
+        WireDisposition::Respond,
+        "무응답 규칙을 건 이름에 고속 경로가 답했습니다"
+    );
+    assert!(
+        server.handle(&request, &ctx()).is_none(),
+        "무응답 규칙을 건 이름에 보통 경로가 답했습니다"
+    );
+}
+
 #[test]
 /** @brief IPv6 답을 끄면 없다가 아니라 비어 있다고 답하는지. */
 fn block_aaaa_returns_nodata() {
@@ -4443,6 +4889,41 @@ fn response_address_blocks_use_blocked_response_ttl() {
     let response = denied.handle(&q("denied-address.test"), &ctx()).unwrap();
     assert_eq!(response.header.rcode, ResponseCode::NXDomain.0);
     assert_eq!(negative_soa_ttl(&response), 79);
+}
+
+#[cfg(unix)]
+#[test]
+/** @brief 리액터 경로가 버리는 주소의 질의를 맡지 않고 보통 경로로 넘기는지. */
+fn reactor_lane_defers_dropped_clients_to_sync_path() {
+    let (backend, cache) = lane_backend_and_cache();
+    let recursor = Arc::new(
+        onetdns_recurse::Recursor::new(
+            vec!["127.0.0.1:5399".parse().unwrap()],
+            std::time::Duration::from_millis(50),
+        )
+        .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]),
+    );
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::build_from_str(
+            "",
+            "",
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.1/32".parse().unwrap()])),
+        vec![],
+        backend,
+        60,
+    )
+    .with_reactor_lane(recursor, cache, 32);
+    let packet = Message::query(0x7, ApName::from_str("ok.example").unwrap(), ApRt::A)
+        .try_encode()
+        .unwrap();
+    let mut out = onetdns_proto::Writer::with_limit(1232);
+    assert_eq!(
+        server.reactor_submit(&packet, &ctx(), &mut out, Instant::now()),
+        onetdns_runtime::ReactorDisposition::Fallback,
+        "버린 클라이언트의 질의를 리액터가 맡았습니다"
+    );
 }
 
 #[cfg(unix)]
@@ -5600,6 +6081,80 @@ fn reactor_lane_applies_cname_uncloaking_to_resolved_answers() {
         ResponseCode::NXDomain.0,
         "클로킹 CNAME 대상이 차단이면 답이 아니라 차단 응답이 나가야 한다"
     );
+}
+
+#[cfg(unix)]
+#[test]
+/**
+ * @brief 레인의 답에서 별칭 뒤에 NORESPONSE 이름이 드러나면 원래 질의에도 답하지 않는지.
+ * @details 레인은 질의 이름만 보고 받아들이므로 숨은 이름은 답을 받은 뒤에야 드러난다. 응답이
+ *          없다는 것만으로는 아직 처리 중인 것과 구별되지 않으므로, 끝났는지는 기록으로 본다.
+ */
+fn reactor_lane_answers_nothing_when_a_cname_target_has_noresponse() {
+    use onetdns_runtime::ReactorDisposition;
+
+    let authority = spawn_cloaking_authority();
+    let (backend, cache) = lane_backend_and_cache();
+    let recursor = Arc::new(
+        onetdns_recurse::Recursor::new(vec![authority], std::time::Duration::from_millis(800))
+            .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]),
+    );
+    let (recorder, stats) = querylog_recorder();
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::build_from_str(
+            "||tracker.evil.example^$dnsrewrite=NORESPONSE",
+            "",
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_reactor_lane(recursor, cache, 32)
+    .with_recorder(Some(recorder));
+
+    let packet = Message::query(
+        0x12,
+        ApName::from_str("cdn.publisher.example").unwrap(),
+        ApRt::A,
+    )
+    .try_encode()
+    .unwrap();
+    let mut w = onetdns_proto::Writer::with_limit(1232);
+    assert_eq!(
+        server.reactor_submit(&packet, &ctx(), &mut w, std::time::Instant::now()),
+        ReactorDisposition::Submitted,
+        "대조군이 무효입니다: 질의 이름 자체는 허용이라 레인에 제출돼야 합니다"
+    );
+
+    let dropped = || {
+        stats
+            .recent(8)
+            .iter()
+            .any(|event| event.action == "blocked" && event.rcode == "DROPPED")
+    };
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while out.is_empty() && !dropped() && std::time::Instant::now() < deadline {
+        let mut fds = Vec::new();
+        let mut map = Vec::new();
+        server.reactor_collect(&mut fds, &mut map);
+
+        if fds.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        } else {
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+            server.reactor_pump(&fds, 0, &map, std::time::Instant::now(), &mut out);
+        }
+        server.reactor_tick(std::time::Instant::now(), &mut out);
+    }
+
+    assert!(
+        out.is_empty(),
+        "별칭 뒤에 숨은 무응답 이름에 레인이 답했습니다"
+    );
+    assert!(dropped(), "레인이 무응답 처리를 마치지 않았습니다");
 }
 
 /** @brief IPv4 답만 내는 테스트용 업스트림. */

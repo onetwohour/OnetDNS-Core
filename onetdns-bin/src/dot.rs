@@ -107,6 +107,9 @@ pub fn serve_dot(
                             {
                                 break;
                             }
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -153,6 +156,9 @@ pub fn serve_dot(
                     match listener.accept() {
                         Ok((stream, peer)) => {
                             accepted += 1;
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -521,10 +527,15 @@ mod tests {
 
     /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
+        native_handler_with(IpAcl::allow_all())
+    }
+
+    /** @brief 이 접근 제어를 건 테스트용 질의 핸들러. */
+    fn native_handler_with(acl: IpAcl) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
             Arc::new(SharedFilter::from_pointee(engine)),
-            Arc::new(IpAcl::allow_all()),
+            Arc::new(acl),
             vec![],
             Arc::new(NativeBackend::Forward(Forwarder::new(
                 vec![mock_upstream()],
@@ -1010,5 +1021,68 @@ mod tests {
         let resp = dot_query(l.addr(), "blocked.test", RecordType::A);
         assert_eq!(resp.header.rcode, onetdns_proto::ResponseCode::NXDomain.0);
         assert!(resp.answers.is_empty());
+    }
+
+    /** @brief 서버에게서 받은 바이트를 세며 그대로 넘기는 연결. */
+    struct Tally(TcpStream, usize);
+
+    impl Read for Tally {
+        /** @brief 읽은 만큼 센다. */
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1 += n;
+            Ok(n)
+        }
+    }
+
+    impl Write for Tally {
+        /** @brief 그대로 쓴다. */
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        /** @brief 그대로 비운다. */
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    /**
+     * @brief 이 접근 제어를 건 DoT 리스너와 TLS 핸드셰이크를 해 본다.
+     * @return 핸드셰이크를 마쳤는지와 서버에게서 받은 바이트 수.
+     */
+    fn dot_handshake_under(acl: IpAcl) -> (bool, usize) {
+        let listener = serve_dot(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
+            native_handler_with(acl),
+            Arc::new(ConnectionLimiter::default()),
+            calm(),
+        )
+        .unwrap();
+        let stream = TcpStream::connect(listener.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut tally = Tally(stream, 0);
+        let finished = client_handshake(&mut tally, &client_config()).is_ok();
+        (finished, tally.1)
+    }
+
+    #[test]
+    /**
+     * @brief 버리는 주소의 연결에는 TLS 핸드셰이크를 하지 않고 한 바이트도 보내지 않는지.
+     * @details ServerHello 나 경고 하나라도 보내면 그 주소에 서버가 있다는 것이 드러난다.
+     */
+    fn dot_drops_listed_clients_before_the_handshake() {
+        let (finished, received) = dot_handshake_under(IpAcl::allow_all());
+        assert!(
+            finished && received > 0,
+            "대조군이 무효입니다. 허용한 주소와 핸드셰이크하지 못했습니다"
+        );
+        let (finished, received) =
+            dot_handshake_under(IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]));
+        assert!(!finished, "버리는 주소와 TLS 핸드셰이크를 마쳤습니다");
+        assert_eq!(received, 0, "버리는 주소에 TLS 바이트를 보냈습니다");
     }
 }

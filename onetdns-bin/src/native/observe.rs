@@ -2,8 +2,10 @@
  * @brief 질의 결과를 지표, dnstap, 질의 로그에 기록한다.
  */
 
+use std::net::IpAddr;
+
 use onetdns_control::{Action, EventDiag, Recorder};
-use onetdns_core::{ClientInfo, FilterEngine};
+use onetdns_core::{ClientInfo, DropReason, FilterEngine};
 use onetdns_proto::{Message, Name as ApName, RecordType as ApRt, ResponseCode};
 
 use crate::native::query::RuleMatch;
@@ -229,6 +231,40 @@ impl NativeServer {
         }
     }
 
+    /**
+     * @brief 필터의 무응답 규칙에 걸려 답하지 않은 질의를 남긴다.
+     * @details 차단으로 세되 응답 코드 자리에는 DROPPED 를 적는다. 나가지 않은 응답의 코드를 적으면
+     *          운영자가 기록을 보고 클라이언트가 그 답을 받았다고 믿는다.
+     */
+    pub(crate) fn rec_dropped<'r>(
+        &self,
+        client: &ClientInfo,
+        name: &ApName,
+        qtype: ApRt,
+        rule: impl Into<RuleMatch<'r>>,
+    ) {
+        if let Some(recorder) = self.events() {
+            let (log, stat) = self.filter.load().client_log_stat(client);
+            let rule = rule.into();
+            recorder.record_detailed(
+                client.transport,
+                Action::Blocked,
+                client.source_ip,
+                Some(name),
+                Some(qtype),
+                log,
+                stat,
+                EventDiag {
+                    rcode: "DROPPED",
+                    reason: "FILTER_BLOCKED",
+                    rule: rule.rule,
+                    list: rule.list,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /**
      * @brief 응답 코드와 사유, 답 요약을 함께 남긴다.
@@ -303,6 +339,36 @@ fn note_rejection(action: Action, client: &ClientInfo) {
         onetdns_core::warn!(event = "dns.client_rejected", reason = "acl", client = %client.source_ip, count = count, "Blocked a query from an address that is not allowed");
     } else {
         onetdns_core::warn!(event = "dns.client_rejected", reason = "rate_limit", client = %client.source_ip, count = count, "Blocked a rate-limited query");
+    }
+}
+
+/**
+ * @brief 접근 제어가 버리라고 한 것을 아무 응답 없이 버렸음을 알린다.
+ * @details 버린 질의는 응답 코드가 없어 질의 기록과 통계에 남지 않는다. 버림이 실제로
+ *          일어나는지 운영자가 알 수 있는 곳은 이 기록뿐이다. 패킷과 연결마다 불리는 경로라
+ *          까닭별로 2의 거듭제곱 번째만 남긴다. 목록 밖 버림은 인터넷 전체의 탐색을 받으므로
+ *          한 카운터로 세면 버림 목록의 기록이 그 사이에 묻힌다.
+ */
+pub(super) fn note_dropped(source: IpAddr, reason: DropReason) {
+    /** @brief 버림 목록으로 버린 누적 수. */
+    static LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /** @brief 어느 규칙에도 걸리지 않아 버린 누적 수. */
+    static UNLISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = match reason {
+        DropReason::DropList => &LISTED,
+        DropReason::Unlisted => &UNLISTED,
+    };
+    let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if !count.is_power_of_two() {
+        return;
+    }
+    match reason {
+        DropReason::DropList => {
+            onetdns_core::warn!(event = "dns.client_rejected", reason = "acl_drop", client = %source, count = count, "Dropped traffic from an address in acl_drop without responding");
+        }
+        DropReason::Unlisted => {
+            onetdns_core::warn!(event = "dns.client_rejected", reason = "acl_unlisted", client = %source, count = count, "Dropped traffic from a client that matches no access rule without responding");
+        }
     }
 }
 

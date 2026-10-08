@@ -857,7 +857,8 @@ impl Controls {
             rewrite_delete: Box::new(|_| Err("No config file path".to_string())),
             services_catalog: Box::new(|| "{\"services\":[]}".to_string()),
             access_list: Box::new(|| {
-                "{\"allowed\":[],\"blocked\":[],\"refused_domains\":[]}".to_string()
+                "{\"allowed\":[],\"blocked\":[],\"dropped\":[],\"unlisted\":\"allow\",\"refused_domains\":[]}"
+                    .to_string()
             }),
             tls_status: Box::new(|| "{\"configured\":false}".to_string()),
             tls_validate: Box::new(|| Err("No TLS certificate is configured".to_string())),
@@ -5329,7 +5330,7 @@ fn openapi_json() -> String {
       "get": { "summary": "Blockable services and whether each is blocked", "responses": { "200": { "description": "{count,services:[{id,name,blocked}]}" } } },
       "post": { "summary": "Change service blocking", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "service": { "type": "string" }, "enable": { "type": "boolean" } }, "required": ["service","enable"] } } } }, "responses": { "200": { "description": "{block,allow}" } } }
     },
-    "/v1/access": { "get": { "summary": "Allowed and blocked networks, and domains answered with REFUSED. Use the config API to change them", "responses": { "200": { "description": "{allowed,blocked,refused_domains}" } } } },
+    "/v1/access": { "get": { "summary": "Allowed, blocked, and silently dropped networks, what happens to clients that match no access rule (allow, deny, or drop), and domains answered with REFUSED. Use the config API to change them", "responses": { "200": { "description": "{allowed,blocked,dropped,unlisted,refused_domains}" } } } },
     "/v1/tls": { "get": { "summary": "TLS certificate and private key paths, and encrypted DNS listener status", "responses": { "200": { "description": "{configured,cert,key,doh_listeners,dot_listeners}" } } } },
     "/v1/tls/validate": { "post": { "summary": "Validate the configured certificate, private key, chain, and validity period (admin only). Trust path and hostname are not checked", "responses": { "200": { "description": "{material_valid,valid:false,trusted:false,hostname_checked:false,chain_len}" }, "400": { "description": "{error}" } } } },
     "/v1/tls/configure": { "post": { "summary": "Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" }, "private_key": { "type": "string" }, "cert_path": { "type": "string" }, "key_path": { "type": "string" } }, "additionalProperties": false } } } }, "responses": { "200": { "description": "{configured,chain_len,reloading,cert,key}" }, "400": { "description": "{error}" } } } },
@@ -5787,7 +5788,8 @@ mod tests {
                 "{\"count\":1,\"services\":[{\"id\":\"youtube\",\"name\":\"YouTube\",\"group\":\"streaming\",\"rule_count\":5,\"blocked\":false}]}".to_string()
             }),
             access_list: Box::new(|| {
-                "{\"allowed\":[\"10.0.0.0/8\"],\"blocked\":[],\"refused_domains\":[]}".to_string()
+                "{\"allowed\":[\"10.0.0.0/8\"],\"blocked\":[],\"dropped\":[],\"unlisted\":\"deny\",\"refused_domains\":[]}"
+                    .to_string()
             }),
             tls_status: Box::new(|| "{\"configured\":true,\"doh_listeners\":1}".to_string()),
             tls_validate: Box::new(|| Ok("{\"valid\":true,\"chain_len\":1}".to_string())),

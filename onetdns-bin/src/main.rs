@@ -145,7 +145,8 @@ use onetdns_core::MutexExt;
 
 use onetdns_config::SplitTarget;
 use onetdns_config::{
-    BackendKind, BlockResponseKind, Config, CookieMode, EcsMode, Mode, UpstreamStrategy,
+    AclUnlisted, BackendKind, BlockResponseKind, Config, CookieMode, EcsMode, Mode,
+    UpstreamStrategy,
 };
 use onetdns_core::{AccessControl, RateLimiter};
 use onetdns_filter::SharedFilter;
@@ -353,9 +354,14 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
         println!("  DNSCrypt listening addresses: {:?}", cfg.listen_dnscrypt);
     }
     println!(
-        "  Access control: {} allowed ranges, {} denied ranges",
+        "  Access control: {} allowed ranges, {} denied ranges, {} silently dropped ranges",
         cfg.acl_allow.len(),
-        cfg.acl_deny.len()
+        cfg.acl_deny.len(),
+        cfg.acl_drop.len()
+    );
+    println!(
+        "  Clients that match no access rule: {}",
+        unlisted_client_policy(&cfg)
     );
     /* 한도 설정의 0은 끔을 뜻한다. 0건으로 적으면 모든 요청을 막는 것처럼 읽힌다. */
     if cfg.rate_limit_per_sec == 0 {
@@ -1672,6 +1678,15 @@ fn wait_for_stop_or_reload(
     }
 }
 
+/** @brief 어느 접근 규칙에도 걸리지 않은 클라이언트를 어떻게 처리하는지 사람이 읽을 말로. */
+fn unlisted_client_policy(cfg: &Config) -> &'static str {
+    match cfg.acl_unlisted_effect() {
+        None => "allowed",
+        Some(AclUnlisted::Deny) => "refused",
+        Some(AclUnlisted::Drop) => "silently dropped",
+    }
+}
+
 /** @brief 이 세대의 보호 설정을 요약하고, 위험하거나 효과가 없는 설정을 경고로 남긴다. */
 fn log_generation_settings(cfg: &Config, rate_state: &DynamicRateLimiter) {
     if cfg.dns64_prefix.is_some() {
@@ -1692,6 +1707,8 @@ fn log_generation_settings(cfg: &Config, rate_state: &DynamicRateLimiter) {
     onetdns_core::info!(event = "serve.protections_summary",
         acl_allow = cfg.acl_allow.len(),
         acl_deny = cfg.acl_deny.len(),
+        acl_drop = cfg.acl_drop.len(),
+        acl_unlisted = unlisted_client_policy(cfg),
         rate_layers = rate_state.layer_count(),
         cookies = ?cfg.cookies,
         mtls = cfg.tls_authenticated(),

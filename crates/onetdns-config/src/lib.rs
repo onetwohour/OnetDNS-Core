@@ -20,9 +20,9 @@ pub use mode::Mode;
 pub use onetdns_core::SecretString;
 pub use settings::validate_acme_request;
 pub use settings::{
-    dns_endpoint_conflicts, known_keys, parse_update_rtype, redact_url_credentials, BackendKind,
-    BlockResponseKind, ClientConfig, Config, ConfigError, CookieMode, DynamicRecord, EcsMode,
-    LocalAnswer, LocalZone, LocalZoneKind, NotifyTarget, PolicyRule, Rewrite, ScheduleWindow,
-    SecondaryZone, SplitTarget, StubZone, TsigKeyConfig, UpdatePolicyRule, UpstreamStrategy,
-    UserConfig, ViewConfig, WasmPluginConfig, ZoneConfig,
+    dns_endpoint_conflicts, known_keys, parse_update_rtype, redact_url_credentials, AclUnlisted,
+    BackendKind, BlockResponseKind, ClientConfig, Config, ConfigError, CookieMode, DynamicRecord,
+    EcsMode, LocalAnswer, LocalZone, LocalZoneKind, NotifyTarget, PolicyRule, Rewrite,
+    ScheduleWindow, SecondaryZone, SplitTarget, StubZone, TsigKeyConfig, UpdatePolicyRule,
+    UpstreamStrategy, UserConfig, ViewConfig, WasmPluginConfig, ZoneConfig,
 };

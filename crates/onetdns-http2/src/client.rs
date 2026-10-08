@@ -1149,8 +1149,8 @@ mod tests {
     }
 
     /** @brief 테스트용 DoH 응답. 수명은 이 테스트들의 관심사가 아니다. */
-    fn answer(body: Vec<u8>) -> Result<crate::server::DohAnswer, &'static str> {
-        Ok(crate::server::DohAnswer { body, max_age: 0 })
+    fn answer(body: Vec<u8>) -> Result<Option<crate::server::DohAnswer>, &'static str> {
+        Ok(Some(crate::server::DohAnswer { body, max_age: 0 }))
     }
 
     #[test]

@@ -56,16 +56,23 @@ impl NativeServer {
         }
     }
 
-    /** @brief 별칭 체인에 차단 대상이 숨어 있는지 본다. 끝만 보면 별칭 뒤에 숨겨 지나갈 수 있다. */
+    /**
+     * @brief 별칭 체인에 차단 대상이 숨어 있는지 본다. 끝만 보면 별칭 뒤에 숨겨 지나갈 수 있다.
+     * @details 숨은 이름에 걸린 차단을 원래 질의에 그대로 적용한다. 무응답 규칙에 걸렸으면 원래
+     *          질의에도 답하지 않는다. 별칭을 거쳤다고 답을 보내면, 답하지 않기로 한 이름에 대한
+     *          답을 별칭 하나로 받아 낼 수 있다.
+     */
     pub(crate) fn cname_uncloak(
         engine: &BlockEngine,
         answers: &[ApRecord],
         client: &ClientInfo,
-    ) -> Option<BlockResponse> {
+    ) -> Option<CloakedBlock> {
         for rec in answers {
             if let ApRData::Cname(cn) = &rec.rdata {
-                if let FilterVerdict::Block(br) = engine.verdict(cn, ApRt::CNAME, client) {
-                    return Some(br);
+                match engine.verdict(cn, ApRt::CNAME, client) {
+                    FilterVerdict::Block(br) => return Some(CloakedBlock::Respond(br)),
+                    FilterVerdict::Drop => return Some(CloakedBlock::Drop),
+                    FilterVerdict::Allow | FilterVerdict::Rewrite(_) => {}
                 }
             }
         }
@@ -135,6 +142,14 @@ impl NativeServer {
             }
         }
     }
+}
+
+/** @brief 별칭 뒤에 숨은 이름이 걸린 차단을 원래 질의에 어떻게 적용할지. */
+pub(crate) enum CloakedBlock {
+    /** @brief 이 형태의 차단 응답으로 답한다. */
+    Respond(BlockResponse),
+    /** @brief 아무것도 답하지 않는다. */
+    Drop,
 }
 
 /**

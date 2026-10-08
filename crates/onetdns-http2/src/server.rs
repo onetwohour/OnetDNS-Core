@@ -110,12 +110,14 @@ fn concurrent_streams(
 /**
  * @brief DoH 연결 하나를 HTTP/2로 처리한다.
  * @param expected_path 허용할 요청 경로. 그 아래 추가 구간은 클라이언트 식별자가 된다.
- * @param handler 질의 와이어와 클라이언트 식별자를 받아 응답을 만든다.
+ * @param handler 질의 와이어와 클라이언트 식별자를 받아 응답을 만든다. None 이면 답하지 않기로
+ *                한 것이므로 아무것도 보내지 않고 연결을 끝낸다. 5xx 를 보내면 클라이언트가 같은
+ *                질의를 다시 보낸다.
  */
 pub fn serve_doh<S, H>(stream: &mut S, expected_path: &str, handler: H) -> Result<(), H2Error>
 where
     S: Read + Write,
-    H: Fn(&[u8], Option<&str>) -> Result<DohAnswer, &'static str>,
+    H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
     serve_doh_with_deadline_reset(stream, expected_path, handler, |_| {})
 }
@@ -135,7 +137,7 @@ pub fn serve_doh_with_deadline_reset<S, H, R>(
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
-    H: Fn(&[u8], Option<&str>) -> Result<DohAnswer, &'static str>,
+    H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
     R: FnMut(&mut S),
 {
     reset_deadline(stream);
@@ -326,7 +328,9 @@ where
                 }
                 if h.has_flag(flags::END_HEADERS) && h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
-                        let response = process_request(st, expected_path, &handler)?;
+                        let Some(response) = process_request(st, expected_path, &handler)? else {
+                            return Ok(());
+                        };
                         reset_deadline(stream);
                         queue_response(
                             stream,
@@ -382,7 +386,10 @@ where
                         .unwrap_or(false);
                     if end_stream {
                         if let Some(st) = streams.remove(&h.stream_id) {
-                            let response = process_request(st, expected_path, &handler)?;
+                            let Some(response) = process_request(st, expected_path, &handler)?
+                            else {
+                                return Ok(());
+                            };
                             reset_deadline(stream);
                             queue_response(
                                 stream,
@@ -433,7 +440,9 @@ where
                 }
                 if h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
-                        let response = process_request(st, expected_path, &handler)?;
+                        let Some(response) = process_request(st, expected_path, &handler)? else {
+                            return Ok(());
+                        };
                         reset_deadline(stream);
                         queue_response(
                             stream,
@@ -681,42 +690,43 @@ fn valid_doh_request_headers(
 /**
  * @brief 완결된 요청을 처리해 응답을 만든다.
  * @details GET이면 dns 질의 매개변수를 base64url로 디코딩하고, POST면 본문을 그대로 쓴다.
- * @return 오류 상태 코드이거나 DNS 응답 본문.
+ * @return 오류 상태 코드이거나 DNS 응답 본문. 처리기가 답하지 않기로 했으면 None 이다.
  */
 fn process_request<H>(
     st: StreamState,
     expected_path: &str,
     handler: &H,
-) -> Result<AppResponse, H2Error>
+) -> Result<Option<AppResponse>, H2Error>
 where
-    H: Fn(&[u8], Option<&str>) -> Result<DohAnswer, &'static str>,
+    H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
     if !st.have_headers {
         return Err(H2Error::Protocol);
     }
     let (method, path) = match valid_doh_request_headers(&st.headers, st.body.len()) {
         Ok(pair) => pair,
-        Err(status) => return Ok(AppResponse::Status(status)),
+        Err(status) => return Ok(Some(AppResponse::Status(status))),
     };
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
     let client_id = match match_doh_path(path_only, expected_path) {
         Some(cid) => cid,
-        None => return Ok(AppResponse::Status("404")),
+        None => return Ok(Some(AppResponse::Status("404"))),
     };
     let query = match method {
         b"POST" => Some(st.body),
         b"GET" => get_dns_param(path),
         _ => None,
     };
-    Ok(match query {
+    Ok(Some(match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
-            Ok(answer) if answer.body.len() <= MAX_H2_RESPONSE => AppResponse::Dns(answer),
+            Ok(Some(answer)) if answer.body.len() <= MAX_H2_RESPONSE => AppResponse::Dns(answer),
             /* 답을 만들었는데 담아 보낼 수 없는 것은 이쪽 사정이므로 5xx 로 남긴다. */
-            Ok(_) => AppResponse::Status(STATUS_BAD_GATEWAY),
+            Ok(Some(_)) => AppResponse::Status(STATUS_BAD_GATEWAY),
+            Ok(None) => return Ok(None),
             Err(status) => AppResponse::Status(status),
         },
         _ => AppResponse::Status(STATUS_BAD_REQUEST),
-    })
+    }))
 }
 
 /** @brief 응답 헤더를 보내고, 본문은 윈도우가 허용하는 만큼만 보낸 뒤 나머지를 미전송으로 남긴다. */
@@ -814,7 +824,7 @@ const MAX_H1_BODY: usize = 64 * 1024;
 pub fn serve_doh_h1<S, H>(stream: &mut S, expected_path: &str, handler: H) -> Result<(), H2Error>
 where
     S: Read + Write,
-    H: Fn(&[u8], Option<&str>) -> Result<DohAnswer, &'static str>,
+    H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
     serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {})
 }
@@ -832,7 +842,7 @@ pub fn serve_doh_h1_with_deadline_reset<S, H, R>(
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
-    H: Fn(&[u8], Option<&str>) -> Result<DohAnswer, &'static str>,
+    H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
     R: FnMut(&mut S),
 {
     reset_deadline(stream);
@@ -986,10 +996,11 @@ where
 
     match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
-            Ok(answer) if answer.body.len() <= MAX_H2_RESPONSE => {
+            Ok(Some(answer)) if answer.body.len() <= MAX_H2_RESPONSE => {
                 write_h1_response(stream, &answer.body, answer.max_age)
             }
-            Ok(_) => write_h1_status(stream, "502 Bad Gateway"),
+            Ok(Some(_)) => write_h1_status(stream, "502 Bad Gateway"),
+            Ok(None) => Ok(()),
             Err(STATUS_BAD_REQUEST) => write_h1_status(stream, "400 Bad Request"),
             Err(status) => write_h1_status(stream, &format!("{status} Error")),
         },
@@ -1188,8 +1199,8 @@ mod tests {
     }
 
     /** @brief 테스트용 DoH 응답. 수명은 이 테스트들의 관심사가 아니다. */
-    fn answer(body: Vec<u8>) -> Result<DohAnswer, &'static str> {
-        Ok(DohAnswer { body, max_age: 0 })
+    fn answer(body: Vec<u8>) -> Result<Option<DohAnswer>, &'static str> {
+        Ok(Some(DohAnswer { body, max_age: 0 }))
     }
 
     /** @brief 두 방식으로 왕복해 본다. */
@@ -1757,6 +1768,73 @@ mod tests {
 
     #[test]
     /**
+     * @brief 처리기가 답하지 않기로 하면 두 HTTP 버전 모두 아무 응답 없이 연결을 끝내는지.
+     * @details 5xx 로 대신 답하면 클라이언트가 같은 질의를 다시 보낸다. 상태 줄도 HEADERS 도
+     *          나가지 않아야 한다.
+     */
+    fn withheld_answers_end_the_connection_without_a_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh(&mut stream, "/dns-query", |_, _| Ok(None))
+        });
+        let mut client = deadline_connect(addr);
+        client.write_all(frame::PREFACE).unwrap();
+        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &[]).unwrap();
+        let path = format!(
+            "/dns-query?dns={}",
+            base64url_encode(&[0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00])
+        );
+        let block = hpack::encode_response(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "dns.test"),
+            (":path", &path),
+            ("accept", "application/dns-message"),
+        ]);
+        send_frame(
+            &mut client,
+            frame_type::HEADERS,
+            flags::END_HEADERS | flags::END_STREAM,
+            1,
+            &block,
+        )
+        .unwrap();
+        let mut frames = Vec::new();
+        while let Ok((frame_header, _)) = read_frame(&mut client) {
+            frames.push(frame_header.frame_type);
+        }
+        assert!(
+            matches!(server.join().unwrap(), Ok(())),
+            "답하지 않기로 한 것을 HTTP/2 연결 오류로 끝냈습니다"
+        );
+        assert!(
+            frames.iter().all(|kind| *kind == frame_type::SETTINGS),
+            "답하지 않기로 한 요청에 HTTP/2 프레임을 보냈습니다: {frames:?}"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh_h1(&mut stream, "/dns-query", |_, _| Ok(None))
+        });
+        let raw = b"POST /dns-query HTTP/1.1\r\nHost: dns.test\r\nContent-Type: application/dns-message\r\nContent-Length: 3\r\n\r\ndns";
+        let response = h1_request(addr, raw);
+        assert!(
+            matches!(server.join().unwrap(), Ok(())),
+            "답하지 않기로 한 것을 HTTP/1.1 연결 오류로 끝냈습니다"
+        );
+        assert!(
+            response.is_empty(),
+            "답하지 않기로 한 요청에 HTTP/1.1 응답을 보냈습니다: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    #[test]
+    /**
      * @brief DoH 응답이 신선도를 밝히는지.
      *
      * @details RFC 8484는 DoH 서버가 명시적인 신선도를 붙이게 하고 그 값이 답변부
@@ -1768,10 +1846,10 @@ mod tests {
         let server = thread::spawn(move || {
             let mut s = deadline_accept(&listener);
             serve_doh_h1(&mut s, "/dns-query", |_q, _id| {
-                Ok(DohAnswer {
+                Ok(Some(DohAnswer {
                     body: vec![1, 2, 3],
                     max_age: 137,
-                })
+                }))
             })
             .ok();
         });

@@ -612,6 +612,10 @@ fn apply_dnsrewrite(dom: &str, value: &str, parts: &mut EngineParts, src: u32) -
             parts.nodata.add_suffix_src(dom, src);
             return true;
         }
+        "NORESPONSE" => {
+            parts.no_response.add_suffix_src(dom, src);
+            return true;
+        }
         _ => {}
     }
 
@@ -645,6 +649,10 @@ fn apply_regex_dnsrewrite(pat: &str, value: &str, parts: &mut EngineParts) -> bo
         }
         "" | "NODATA" | "NOERROR" => {
             parts.regex_nodata.push(pat.to_string());
+            return true;
+        }
+        "NORESPONSE" => {
+            parts.regex_no_response.push(pat.to_string());
             return true;
         }
         _ => {}
@@ -724,6 +732,7 @@ fn apply_badfilter(acc: &mut Accum) {
         acc.parts.allow_important.remove(d);
         acc.parts.refuse.remove(d);
         acc.parts.nodata.remove(d);
+        acc.parts.no_response.remove(d);
         for (_, s) in &mut acc.parts.typed_block {
             s.remove(d);
         }
@@ -741,6 +750,7 @@ fn apply_badfilter(acc: &mut Accum) {
             &mut parts.regex_allow_important,
             &mut parts.regex_refuse,
             &mut parts.regex_nodata,
+            &mut parts.regex_no_response,
         ] {
             list.retain(|x| x != p);
         }
@@ -862,9 +872,10 @@ pub fn parse_rpz_text(text: &str, parts: &mut EngineParts) {
 
 /**
  * @brief RPZ 레코드에서 처분을 정한다.
- * @note rpz-drop 은 원래 답하지 않으라는 뜻이지만 차단 엔진에는 침묵 판정이 없어 설정한 차단
- *       응답으로 답한다. rpz-tcp-only 는 지원하지 않아 규칙을 건너뛴다. 어느 쪽이든 그 이름을
- *       CNAME 대상으로 삼지 않는다.
+ * @note rpz-drop 은 원래 답하지 않으라는 뜻이지만 설정한 차단 응답으로 답한다. 받아 온 영역의
+ *       규칙대로 침묵하면 클라이언트는 차단을 장애로 보고 시간이 다 될 때까지 기다리며 재시도한다.
+ *       침묵은 운영자가 NORESPONSE 로 직접 고른 이름에만 쓴다. rpz-tcp-only 는 지원하지 않아
+ *       규칙을 건너뛴다. 어느 쪽이든 그 이름을 CNAME 대상으로 삼지 않는다.
  */
 fn rpz_action_verdict(rtype: &str, rdata: &[&str]) -> Option<FilterVerdict> {
     match rtype.to_ascii_uppercase().as_str() {
@@ -911,6 +922,7 @@ fn apply_rpz_verdict_qname(
         FilterVerdict::Block(BlockResponse::NoData) => &mut parts.nodata,
         FilterVerdict::Block(BlockResponse::Refused) => &mut parts.refuse,
         FilterVerdict::Block(_) => &mut parts.block,
+        FilterVerdict::Drop => &mut parts.no_response,
         FilterVerdict::Rewrite(target) => {
             if subdomains {
                 parts.rewrites.add_suffix(dom, target);
@@ -1708,6 +1720,39 @@ analytics.bad
     }
 
     #[test]
+    /**
+     * @brief NORESPONSE 재작성이 이름 규칙과 정규식 규칙 모두에서 무응답 판정이 되는지.
+     * @details 값은 다른 응답 코드처럼 대소문자를 가리지 않는다. 규칙 검증이 거절하면
+     *          대시보드에서 이 규칙을 넣을 수 없고, badfilter 가 빼지 못하면 구독 목록에 든
+     *          규칙을 끌 방법이 없다.
+     */
+    fn dnsrewrite_noresponse_drops_names_and_patterns() {
+        let rules = "\
+||quiet.example^$dnsrewrite=NORESPONSE
+/^scan[0-9]+\\.example$/$dnsrewrite=noresponse
+||gone.example^$dnsrewrite=NORESPONSE
+||gone.example^$badfilter
+";
+        let eng = build_from_str(rules, "", BlockResponse::NxDomain);
+        for name in ["quiet.example.", "www.quiet.example.", "scan42.example."] {
+            assert!(
+                matches!(verdict(&eng, name), FilterVerdict::Drop),
+                "{name} 이 무응답 판정을 받지 않았습니다"
+            );
+        }
+        assert!(
+            matches!(verdict(&eng, "gone.example."), FilterVerdict::Allow),
+            "badfilter 가 무응답 규칙을 빼지 못했습니다"
+        );
+        assert!(
+            matches!(verdict(&eng, "scan.example."), FilterVerdict::Allow),
+            "대조군이 무효입니다: 규칙에 없는 이름이 막혔습니다"
+        );
+        assert!(validate_rule("||quiet.example^$dnsrewrite=NORESPONSE").is_ok());
+        assert!(validate_rule("/^scan[0-9]+\\.example$/$dnsrewrite=NORESPONSE").is_ok());
+    }
+
+    #[test]
     /** @brief 로드 보고가 적용과 건너뜀을 모아 주는지. */
     fn load_report_aggregates_applied_and_skipped() {
         let text = "\
@@ -1998,9 +2043,9 @@ tcp.example.com CNAME rpz-tcp-only.
 
     #[test]
     /**
-     * @brief rpz-drop 이 운영자가 고른 차단 응답으로 답하는지.
-     * @details 차단 엔진에는 침묵 판정이 없다. rpz-drop 이 고정된 응답을 쓰면 같은 차단인데도
-     *          목록 형식에 따라 클라이언트가 받는 답이 달라진다.
+     * @brief rpz-drop 이 침묵하지 않고 운영자가 고른 차단 응답으로 답하는지.
+     * @details 받아 온 영역이 침묵을 고르게 두면 차단이 장애처럼 보인다. 고정된 응답을 쓰면 같은
+     *          차단인데도 목록 형식에 따라 클라이언트가 받는 답이 달라진다.
      */
     fn rpz_drop_answers_with_the_configured_block_response() {
         let mut parts = EngineParts::default();

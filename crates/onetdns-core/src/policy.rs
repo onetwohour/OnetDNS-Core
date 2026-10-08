@@ -5,7 +5,7 @@
  *          덕분에 정책 구현을 전부 교체해도 질의 경로가 바뀌지 않는다.
  */
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use onetdns_proto::{Name, RData, RecordType};
 
@@ -16,8 +16,24 @@ use crate::client::ClientInfo;
 pub enum AclDecision {
     /** @brief 받아들인다. */
     Allow,
-    /** @brief 막는다. */
+    /** @brief 막고, 막았다는 응답을 보낸다. */
     Deny,
+    /** @brief 막고, 아무 응답도 보내지 않는다. 어느 규칙으로 버렸는지 함께 담는다. */
+    Drop(DropReason),
+}
+
+/**
+ * @brief 응답 없이 버린 까닭.
+ * @details 버림은 클라이언트에게 아무것도 알리지 않으므로 운영자가 볼 수 있는 것은 로그뿐이다.
+ *          목록 밖 버림은 인터넷 전체의 탐색 트래픽을 받아 버림 목록의 기록을 묻어 버리므로
+ *          까닭을 가려 따로 센다.
+ */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /** @brief 버림 목록에 든 주소다. */
+    DropList,
+    /** @brief 어느 규칙에도 걸리지 않았고, 그런 클라이언트는 버리도록 설정됐다. */
+    Unlisted,
 }
 
 /** @brief 클라이언트 주소 기반 접근 제어. */
@@ -27,6 +43,14 @@ pub trait AccessControl: Send + Sync {
      * @warning 질의마다 불리는 핫패스다. 여기서 잠금을 오래 잡으면 처리량 전체가 눌린다.
      */
     fn check(&self, client: &ClientInfo) -> AclDecision;
+
+    /**
+     * @brief 이 주소에서 온 것을 응답 없이 버려야 하는지와 그 까닭.
+     * @details 주소만으로 정하므로 전송은 질의를 읽거나 핸드셰이크를 하기 전에 이 판정을 쓸 수
+     *          있다. 값이 있으면 그 주소의 클라이언트가 어떤 ID 를 가져오든 check 도 같은 까닭의
+     *          Drop 을 돌려줘야 한다. 클라이언트 ID 규칙이 없으면 두 판정은 정확히 같다.
+     */
+    fn drops(&self, ip: IpAddr) -> Option<DropReason>;
 
     /**
      * @brief 규칙이 없어 항상 허용인지.
@@ -121,6 +145,14 @@ pub enum FilterVerdict {
 
     /** @brief 다른 내용으로 응답을 바꾼다. */
     Rewrite(RewriteTarget),
+
+    /**
+     * @brief 차단하고 아무것도 답하지 않는다.
+     * @details 운영자가 이름에 NORESPONSE 를 고른 규칙에서만 나온다. 응답의 형태가 아니라 응답을
+     *          하지 않는 판정이라 BlockResponse 에 두지 않는다. 거기 두면 기본 차단 응답으로도 고를
+     *          수 있게 되고, 차단 응답을 만드는 곳마다 만들 수 없는 경우를 떠안는다.
+     */
+    Drop,
 }
 
 /**
@@ -150,6 +182,10 @@ pub enum MatchStage {
 
     /** @brief $important 허용. 일반 차단을 무력화한다. */
     ImportantAllow,
+
+    /** @brief 아무것도 답하지 않는 규칙. 전역 규칙 가운데서는 important 허용만 이것을 이긴다. */
+    NoResponse,
+
     /** @brief $important 차단. 일반 허용을 무력화한다. */
     ImportantBlock,
 
@@ -189,6 +225,7 @@ impl MatchStage {
             MatchStage::ClientRuleAllow => "client-rule:allow",
             MatchStage::ClientRuleBlock => "client-rule:block",
             MatchStage::ImportantAllow => "important:allow",
+            MatchStage::NoResponse => "noresponse",
             MatchStage::ImportantBlock => "important:block",
             MatchStage::Refuse => "refuse",
             MatchStage::NoData => "nodata",
@@ -240,6 +277,7 @@ pub trait FilterEngine: Send + Sync {
             FilterVerdict::Allow => MatchStage::DefaultAllow,
             FilterVerdict::Block(_) => MatchStage::Block,
             FilterVerdict::Rewrite(_) => MatchStage::Rewrite,
+            FilterVerdict::Drop => MatchStage::NoResponse,
         };
         FilterExplanation {
             verdict,

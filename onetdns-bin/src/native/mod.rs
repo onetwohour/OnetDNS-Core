@@ -18,7 +18,8 @@ use std::time::SystemTime;
 
 use onetdns_control::Recorder;
 use onetdns_core::{
-    AccessControl, ArcSwap, ClientInfo, FilterVerdict, IpNet, LruMap, RateLimiter, RewriteTarget,
+    AccessControl, ArcSwap, BlockResponse, ClientInfo, FilterVerdict, IpNet, LruMap, RateLimiter,
+    RewriteTarget,
 };
 use onetdns_filter::SharedFilter;
 use onetdns_forward::Forwarder;
@@ -699,6 +700,20 @@ impl Resolver for NativeBackend {
                                     &q.name,
                                     q.qtype,
                                     block,
+                                    block_ttl.load(Ordering::Acquire),
+                                ));
+                            }
+                            FilterVerdict::Drop => {
+                                /*
+                                 * RPZ 트리거는 무응답 처분을 만들지 않는다. 해석 체인은 응답을
+                                 * 거둘 수 없으므로, 그런 처분이 오더라도 rpz-drop 처럼 NXDOMAIN
+                                 * 으로 답한다.
+                                 */
+                                return ResolveOutcome::Response(block_resp(
+                                    request,
+                                    &q.name,
+                                    q.qtype,
+                                    BlockResponse::NxDomain,
                                     block_ttl.load(Ordering::Acquire),
                                 ));
                             }

@@ -158,6 +158,9 @@ pub fn serve_tcp(
                             {
                                 break;
                             }
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -204,6 +207,9 @@ pub fn serve_tcp(
                     match listener.accept() {
                         Ok((stream, peer)) => {
                             accepted += 1;
+                            if handler.drops_source(peer.ip()) {
+                                continue;
+                            }
                             match PendingEncryptedConnection::admit(
                                 stream,
                                 peer,
@@ -379,19 +385,13 @@ mod tests {
         drop(client);
     }
 
-    #[test]
-    /**
-     * @brief TCP 리스너가 인증서 조회에 길이 접두사를 붙여 답하고 연결을 닫는지.
-     *
-     * @details 규격은 연결 하나에 거래 하나다. 클라이언트는 먼저 인증서를 받아야 암호화
-     *          질의를 만들 수 있으므로, 이 경로가 막히면 TCP 로 붙는 길이 전부 막힌다.
-     */
-    fn tcp_listener_answers_a_certificate_lookup_and_closes() {
+    /** @brief 이 접근 제어를 건 DNSCrypt TCP 리스너와, 그 리스너에 보낼 인증서 조회 질의. */
+    fn certificate_listener(acl: onetdns_security::IpAcl) -> (DnscryptTcpListener, Vec<u8>) {
         let handler = Arc::new(NativeServer::new(
             Arc::new(onetdns_filter::SharedFilter::from_pointee(
                 onetdns_filter::build_from_str("", "", onetdns_core::BlockResponse::NxDomain),
             )),
-            Arc::new(onetdns_security::IpAcl::allow_all()),
+            Arc::new(acl),
             vec![],
             Arc::new(crate::native::NativeBackend::Forward(
                 onetdns_forward::Forwarder::new(
@@ -416,7 +416,18 @@ mod tests {
             question.extend_from_slice(label.as_bytes());
         }
         question.extend_from_slice(&[0, 0, 16, 0, 1]);
+        (listener, question)
+    }
 
+    #[test]
+    /**
+     * @brief TCP 리스너가 인증서 조회에 길이 접두사를 붙여 답하고 연결을 닫는지.
+     *
+     * @details 규격은 연결 하나에 거래 하나다. 클라이언트는 먼저 인증서를 받아야 암호화
+     *          질의를 만들 수 있으므로, 이 경로가 막히면 TCP 로 붙는 길이 전부 막힌다.
+     */
+    fn tcp_listener_answers_a_certificate_lookup_and_closes() {
+        let (listener, question) = certificate_listener(onetdns_security::IpAcl::allow_all());
         let mut stream = TcpStream::connect(listener.addr).expect("연결");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -445,5 +456,27 @@ mod tests {
             0,
             "거래 하나를 마친 뒤에도 연결이 열려 있습니다"
         );
+    }
+
+    #[test]
+    /**
+     * @brief 버리는 주소가 연결해 인증서를 물어도 아무것도 보내지 않고 닫는지.
+     * @details 인증서 응답 하나로도 그 주소에 DNSCrypt 서버가 있다는 것이 드러난다.
+     */
+    fn tcp_listener_sends_nothing_to_dropped_clients() {
+        let (listener, question) = certificate_listener(
+            onetdns_security::IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]),
+        );
+        let mut stream = TcpStream::connect(listener.addr).expect("연결");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("수신 제한 시간");
+        let mut framed = (question.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&question);
+        /* 서버가 먼저 닫았으면 보내기부터 실패할 수 있다. 여기서 보는 것은 받은 것이 없는지다. */
+        let _ = stream.write_all(&framed);
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received);
+        assert!(received.is_empty(), "버리는 주소에 인증서를 보냈습니다");
     }
 }

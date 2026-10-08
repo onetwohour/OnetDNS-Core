@@ -18,6 +18,7 @@ use onetdns_runtime::{Handler, RequestCtx};
 use crate::native::ddr_owner;
 #[cfg(unix)]
 use crate::native::lane::{reactor_response_edns, LaneClient, LaneState, LANE};
+use crate::native::observe::note_dropped;
 use crate::native::query::dnstap_proto;
 #[cfg(unix)]
 use crate::native::query::read_cookie;
@@ -29,6 +30,14 @@ use crate::native::{NativeServer, MAX_LARGE_QUERY_BYTES};
 impl Handler for NativeServer {
     /** @brief 질의 하나를 처리한다. */
     fn handle(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
+        /*
+         * TSIG 오류 응답은 입장 단계보다 먼저 나간다. 버릴 클라이언트는 그보다도 먼저 걸러야
+         * 어떤 응답도 나가지 않는다. 클라이언트 ID 규칙이 있으면 목록 밖인지가 ID 로 정해지므로
+         * 주소만 보지 않고 ID 까지 본다.
+         */
+        if self.drops_client(ctx) {
+            return None;
+        }
         let timer = onetdns_control::RequestTimer::start();
         let ordinary_query = request.header.opcode == 0
             && request
@@ -267,7 +276,7 @@ impl Handler for NativeServer {
             return R::Fallback;
         }
         let client = self.identify(ctx);
-        if self.acl.check(&client) == AclDecision::Deny {
+        if self.acl.check(&client) != AclDecision::Allow {
             return R::Fallback;
         }
         let filter = self.filter.load();
@@ -500,8 +509,13 @@ impl NativeServer {
      */
     pub fn client_allowed(&self, ctx: &RequestCtx) -> bool {
         let client = self.identify(ctx);
-        if self.acl.check(&client) == AclDecision::Deny {
-            return false;
+        match self.acl.check(&client) {
+            AclDecision::Allow => {}
+            AclDecision::Deny => return false,
+            AclDecision::Drop(reason) => {
+                note_dropped(client.source_ip, reason);
+                return false;
+            }
         }
         !self
             .rate_limiters
@@ -555,7 +569,7 @@ impl NativeServer {
             let events = self.events();
             let timer = events.is_some().then(onetdns_control::RequestTimer::start);
             let client = self.identify(ctx);
-            if self.acl.check(&client) == AclDecision::Deny {
+            if self.acl.check(&client) != AclDecision::Allow {
                 return Wire::Fallback;
             }
 
@@ -671,6 +685,12 @@ impl NativeServer {
         if !is_xfr {
             return emit(self.handle(request, ctx)?).then_some(());
         }
+        let client = self.identify(ctx);
+        let acl = self.acl.check(&client);
+        if let AclDecision::Drop(reason) = acl {
+            note_dropped(client.source_ip, reason);
+            return None;
+        }
         if request.questions[0].qclass != DnsClass::IN {
             return emit(edns_error_resp(
                 request,
@@ -681,9 +701,8 @@ impl NativeServer {
         }
 
         let _timer = onetdns_control::RequestTimer::start();
-        let client = self.identify(ctx);
         let features = self.features.load();
-        if self.acl.check(&client) == AclDecision::Deny {
+        if acl == AclDecision::Deny {
             self.rec(&client, Action::Denied, None, None);
             let edns = with_ede(
                 None,

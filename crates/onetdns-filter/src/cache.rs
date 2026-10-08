@@ -31,7 +31,7 @@ const MAGIC: &[u8; 8] = b"ONETFST\0";
  *          배치를 바꾸면서 이 글을 고치면 예전에 만든 파일은 저절로 거부되고 다시 만들어진다.
  *          캐시는 언제든 다시 만들 수 있는 파생물이라 옮겨 읽을 이유가 없다.
  */
-const LAYOUT: &str = "states:edge_starts+terminal_bits|edges:labels,targets,outputs|sources";
+const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:edge_starts+terminal_bits|edges:labels,targets,outputs|sources";
 
 /** @brief 저장 배치를 가리키는 값. LAYOUT 해시의 앞 네 바이트다. */
 fn layout_tag() -> [u8; 4] {
@@ -516,6 +516,7 @@ fn encode_domain_sets(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Ca
         &parts.allow_important,
         &parts.refuse,
         &parts.nodata,
+        &parts.no_response,
     ] {
         set.encode_compact(&mut w.bytes).map_err(CacheError::new)?;
     }
@@ -542,6 +543,7 @@ fn encode_domain_sets_streaming<W: Write>(
         &parts.allow_important,
         &parts.refuse,
         &parts.nodata,
+        &parts.no_response,
     ] {
         set.encode_compact_chunks(&mut |bytes| w.write(bytes))
             .map_err(CacheError::new)?;
@@ -573,6 +575,7 @@ fn encode_parts_tail(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Cac
         &parts.regex_allow_important,
         &parts.regex_refuse,
         &parts.regex_nodata,
+        &parts.regex_no_response,
     ] {
         encode_strings(w, strings)?;
     }
@@ -610,6 +613,7 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     let allow_important = decode_domain_set(r)?;
     let refuse = decode_domain_set(r)?;
     let nodata = decode_domain_set(r)?;
+    let no_response = decode_domain_set(r)?;
     let typed_block = decode_vec(r, |r| Ok((RecordType(r.u16()?), decode_domain_set(r)?)))?;
     let typed_block_except =
         decode_vec(r, |r| Ok((decode_record_types(r)?, decode_domain_set(r)?)))?;
@@ -619,6 +623,7 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     let regex_allow_important = decode_strings(r)?;
     let regex_refuse = decode_strings(r)?;
     let regex_nodata = decode_strings(r)?;
+    let regex_no_response = decode_strings(r)?;
     let regex_rewrites = decode_vec(r, |r| Ok((r.string()?, decode_rewrite_target(r)?)))?;
     let regex_typed_block = decode_vec(r, |r| Ok((RecordType(r.u16()?), r.string()?)))?;
     let regex_typed_block_except = decode_vec(r, |r| Ok((decode_record_types(r)?, r.string()?)))?;
@@ -645,6 +650,7 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
         allow_important,
         refuse,
         nodata,
+        no_response,
         typed_block,
         typed_block_except,
         regex_block,
@@ -653,6 +659,7 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
         regex_allow_important,
         regex_refuse,
         regex_nodata,
+        regex_no_response,
         regex_rewrites,
         regex_typed_block,
         regex_typed_block_except,
@@ -976,6 +983,7 @@ fn encode_verdict(w: &mut Encoder<'_>, verdict: &FilterVerdict) -> Result<(), Ca
             w.u8(2);
             encode_rewrite_target(w, target)?;
         }
+        FilterVerdict::Drop => w.u8(3),
     }
     Ok(())
 }
@@ -986,6 +994,7 @@ fn decode_verdict(r: &mut Decoder<'_>) -> Result<FilterVerdict, CacheError> {
         0 => Ok(FilterVerdict::Allow),
         1 => Ok(FilterVerdict::Block(decode_block_response(r)?)),
         2 => Ok(FilterVerdict::Rewrite(decode_rewrite_target(r)?)),
+        3 => Ok(FilterVerdict::Drop),
         _ => Err(CacheError::new(
             "Invalid verdict type in compiled filter cache",
         )),
@@ -1211,6 +1220,43 @@ mod tests {
     }
 
     #[test]
+    /**
+     * @brief 무응답 규칙과 무응답 판정이 왕복에서 보존되는지.
+     * @details 캐시에서 빠지거나 다른 집합으로 읽히면, 다시 시작한 서버가 답하지 않기로 한
+     *          이름에 답한다.
+     */
+    fn engine_cache_roundtrip_keeps_noresponse_rules() {
+        let mut parts = EngineParts::default();
+        parts.no_response.add_suffix_src("quiet.example", 0);
+        parts.regex_no_response.push("^scan[0-9]+\\.".into());
+        parts.rpz_ip.push(RpzIpRule::new(
+            "192.0.2.0/24".parse().unwrap(),
+            FilterVerdict::Drop,
+        ));
+        parts.sources = vec!["quiet.txt".into()];
+
+        let encoded = encode_engine_cache(&mut parts, [4; 32]).unwrap();
+        let restored = decode_engine_cache(&encoded, [4; 32]).unwrap();
+        assert!(
+            matches!(
+                restored.rpz_ip.first().map(|rule| &rule.verdict),
+                Some(FilterVerdict::Drop)
+            ),
+            "무응답 판정이 왕복에서 바뀌었습니다"
+        );
+        let engine = crate::BlockEngine::new(restored, BlockResponse::NxDomain);
+        let ask = |q: &str| engine.explain(&Name::from_str(q).unwrap(), RecordType::A, &client());
+        let quiet = ask("www.quiet.example");
+        assert!(matches!(quiet.verdict, FilterVerdict::Drop), "{quiet:?}");
+        assert_eq!(quiet.source.as_deref(), Some("quiet.txt"));
+        assert!(matches!(ask("scan9.example").verdict, FilterVerdict::Drop));
+        assert!(
+            matches!(ask("other.example").verdict, FilterVerdict::Allow),
+            "대조군이 무효입니다: 규칙에 없는 이름이 막혔습니다"
+        );
+    }
+
+    #[test]
     /** @brief 헤더 필드가 정해진 곳에 있는지. 옮기면 이전 파일 판정이 어긋난다. */
     fn encoded_header_fields_sit_at_pinned_offsets() {
         let mut parts = EngineParts::default();
@@ -1262,6 +1308,8 @@ mod tests {
                 .typed_block_except
                 .push((vec![RecordType::A, RecordType::AAAA], typed_except));
             parts.regex_block.push("^ads[0-9]+\\.".into());
+            parts.no_response.add_suffix_src("quiet.example", 7);
+            parts.regex_no_response.push("^scan[0-9]+\\.".into());
             parts.rpz_ip.push(RpzIpRule::new(
                 "192.0.2.0/24".parse().unwrap(),
                 FilterVerdict::Block(BlockResponse::Custom {
