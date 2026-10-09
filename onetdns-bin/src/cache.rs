@@ -9,248 +9,30 @@
  *       그것을 증명하는 권한 기록이 있어야 한다. 아니면 저장하지 않는다.
  */
 
-use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use onetdns_core::lrumap::LruMap;
 use onetdns_core::MutexExt;
-use onetdns_proto::{Message, Name, RData, Record, RecordType, ResponseCode};
+use onetdns_proto::{Message, Record, RecordType, ResponseCode};
 
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 정규화한 질의를 담은 키. */
-struct FlightKey {
-    /** @brief 정규화한 질의 바이트. */
-    normalized_wire: Box<[u8]>,
-}
+mod answer;
+mod key;
+mod ttl;
 
-impl FlightKey {
-    /** @brief 요청에서 키를 만든다. */
-    fn from_request(request: &Message) -> Option<Self> {
-        NormalizedRequestKey::from_request(request).map(NormalizedRequestKey::into_owned)
-    }
-
-    /** @brief 키 바이트. */
-    fn as_slice(&self) -> &[u8] {
-        &self.normalized_wire
-    }
-}
-
-impl Borrow<[u8]> for FlightKey {
-    /** @brief 바이트로 빌려 조회에 쓴다. 조회할 때마다 키를 새로 만들지 않으려는 것이다. */
-    fn borrow(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl Hash for FlightKey {
-    /** @brief 바이트를 그대로 해시값으로 쓴다. */
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
-    }
-}
-
-/** @brief 이 길이까지는 할당 없이 담는다. */
-const INLINE_REQUEST_KEY_CAPACITY: usize = 64;
-
-/**
- * @brief 만드는 중인 키.
- * @details 흔한 길이는 스택에 담고 넘칠 때만 할당한다. 조회는 대개 여기서 끝나 소유권을
- *          가질 일이 없다.
- */
-enum NormalizedRequestKey {
-    /** @brief 짧아서 스택에 담은 것. */
-    Inline {
-        /** @brief 스택에 담은 키 바이트. */
-        bytes: [u8; INLINE_REQUEST_KEY_CAPACITY],
-        /** @brief 그중 실제로 쓴 길이. */
-        len: usize,
-    },
-    /** @brief 길어서 따로 잡은 것. */
-    Heap(Vec<u8>),
-}
-
-impl NormalizedRequestKey {
-    /** @brief 예상 길이에 맞는 저장소를 고른다. */
-    fn with_capacity(capacity: usize) -> Self {
-        if capacity <= INLINE_REQUEST_KEY_CAPACITY {
-            Self::Inline {
-                bytes: [0; INLINE_REQUEST_KEY_CAPACITY],
-                len: 0,
-            }
-        } else {
-            Self::Heap(Vec::with_capacity(capacity))
-        }
-    }
-
-    /** @brief 한 바이트 붙인다. */
-    fn push(&mut self, value: u8) {
-        match self {
-            Self::Inline { bytes, len } => {
-                debug_assert!(*len < bytes.len());
-                bytes[*len] = value;
-                *len += 1;
-            }
-            Self::Heap(bytes) => bytes.push(value),
-        }
-    }
-
-    /** @brief 여러 바이트 붙인다. */
-    fn extend_from_slice(&mut self, value: &[u8]) {
-        match self {
-            Self::Inline { bytes, len } => {
-                let end = *len + value.len();
-                debug_assert!(end <= bytes.len());
-                bytes[*len..end].copy_from_slice(value);
-                *len = end;
-            }
-            Self::Heap(bytes) => bytes.extend_from_slice(value),
-        }
-    }
-
-    /** @brief 지금까지 담긴 바이트. */
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Inline { bytes, len } => &bytes[..*len],
-            Self::Heap(bytes) => bytes,
-        }
-    }
-
-    /** @brief 소유권 있는 키로. 실제로 저장할 때만 부른다. */
-    fn into_owned(self) -> FlightKey {
-        let normalized_wire = match self {
-            Self::Inline { bytes, len } => bytes[..len].into(),
-            Self::Heap(bytes) => bytes.into_boxed_slice(),
-        };
-        FlightKey { normalized_wire }
-    }
-
-    /**
-     * @brief 요청을 정규화해 키를 만든다.
-     * @details 질의 번호와 이름 대소문자, 내용 없는 채우기 옵션은 응답을 바꾸지 않으므로
-     *          지운다. 나머지는 그대로 담는다.
-     * @return 키. 캐시할 수 없는 모양의 요청이면 없다.
-     */
-    fn from_request(request: &Message) -> Option<Self> {
-        if request.header.response
-            || request.header.opcode != 0
-            || request.header.authoritative
-            || request.header.truncated
-            || request.header.recursion_available
-            || request.header.rcode != 0
-            || request.questions.len() != 1
-            || !request.answers.is_empty()
-            || !request.authorities.is_empty()
-            || request.additionals.len() > 1
-            || request
-                .additionals
-                .iter()
-                .any(|record| record.rtype != RecordType::OPT)
-        {
-            return None;
-        }
-        let question = &request.questions[0];
-        let mut canonical_name = [0u8; 255];
-        let canonical_name = question.name.canonical_key_into(&mut canonical_name)?;
-
-        let opt = request.additionals.first();
-        let mut option_count = 0u16;
-        let mut semantic_option_bytes = 0usize;
-        let edns = if let Some(record) = opt {
-            if !record.name.is_root() {
-                return None;
-            }
-            let raw = match &record.rdata {
-                RData::Unknown(_, raw) => raw.as_slice(),
-                _ => return None,
-            };
-            let mut offset = 0usize;
-            while offset < raw.len() {
-                let header = raw.get(offset..offset.checked_add(4)?)?;
-                let code = u16::from_be_bytes([header[0], header[1]]);
-                let len = u16::from_be_bytes([header[2], header[3]]) as usize;
-                offset = offset.checked_add(4)?;
-                let end = offset.checked_add(len)?;
-                raw.get(offset..end)?;
-                if code == onetdns_proto::EDNS_PADDING {
-                    offset = end;
-                    continue;
-                }
-                option_count = option_count.checked_add(1)?;
-                semantic_option_bytes = semantic_option_bytes.checked_add(4 + len)?;
-                offset = end;
-            }
-            Some((
-                raw,
-                record.class.0,
-                ((record.ttl >> 16) & 0xff) as u8,
-                (record.ttl & 0x0000_8000) != 0,
-            ))
-        } else {
-            None
-        };
-
-        let base_len = 1usize
-            .checked_add(2)?
-            .checked_add(canonical_name.len())?
-            .checked_add(4)?
-            .checked_add(1)?;
-        let key_len = base_len.checked_add(if edns.is_some() {
-            6usize.checked_add(semantic_option_bytes)?
-        } else {
-            0
-        })?;
-        if key_len > MAX_CACHED_REQUEST_WIRE {
-            return None;
-        }
-
-        let mut normalized_wire = Self::with_capacity(key_len);
-        normalized_wire.push(1);
-        let semantic_flags = (u16::from(request.header.recursion_desired) << 8)
-            | (u16::from(request.header.authentic_data) << 5)
-            | (u16::from(request.header.checking_disabled) << 4);
-        normalized_wire.extend_from_slice(&semantic_flags.to_be_bytes());
-        normalized_wire.extend_from_slice(canonical_name);
-        normalized_wire.extend_from_slice(&question.qtype.0.to_be_bytes());
-        normalized_wire.extend_from_slice(&question.qclass.0.to_be_bytes());
-        normalized_wire.push(u8::from(edns.is_some()));
-        if let Some((raw, udp_payload, version, dnssec_ok)) = edns {
-            normalized_wire.extend_from_slice(&udp_payload.to_be_bytes());
-            normalized_wire.push(version);
-            normalized_wire.push(u8::from(dnssec_ok));
-            normalized_wire.extend_from_slice(&option_count.to_be_bytes());
-            let mut offset = 0usize;
-            while offset < raw.len() {
-                let code = u16::from_be_bytes([raw[offset], raw[offset + 1]]);
-                let len = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
-                let end = offset + 4 + len;
-
-                if code == onetdns_proto::EDNS_PADDING {
-                    offset = end;
-                    continue;
-                }
-                normalized_wire.extend_from_slice(&code.to_be_bytes());
-                normalized_wire.extend_from_slice(&(len as u16).to_be_bytes());
-                normalized_wire.extend_from_slice(&raw[offset + 4..end]);
-                offset = end;
-            }
-        }
-        debug_assert_eq!(normalized_wire.as_slice().len(), key_len);
-
-        Some(normalized_wire)
-    }
-}
-
-/** @brief 캐시 키. */
-type CacheKey = FlightKey;
-/** @brief 실패 기억 키. */
-type FailureKey = FlightKey;
+pub(crate) use answer::{
+    age_records, cached_message, has_requested_answer, neg_soa_minimum,
+    relevant_negative_soa_minimum, retarget_response, terminal_answer_name,
+};
+pub(crate) use key::{
+    CacheKey, FailureKey, FlightKey, NormalizedRequestKey, MAX_CACHED_REQUEST_WIRE,
+};
+pub(crate) use ttl::{cache_dnssec_ttl_cap, dnssec_ttl_cap};
 
 /** @brief 진행 중인 해석 하나와 그 결과를 기다리는 곳. */
 struct ClientFlight {
@@ -371,126 +153,10 @@ impl ClientFlight {
 const CLIENT_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 /** @brief 동시에 합칠 수 있는 질의 수. 넘으면 합치지 않고 그냥 각자 나간다. */
 const MAX_CLIENT_FLIGHTS: usize = 4_096;
-/** @brief 캐시할 키 길이 상한. */
-const MAX_CACHED_REQUEST_WIRE: usize = 4_096;
 /** @brief 실패를 기억할 기본 기간. */
 const FAILURE_CACHE_BASE_TTL: Duration = Duration::from_secs(5);
 /** @brief 실패를 기억할 최대 기간. */
 const FAILURE_CACHE_MAX_TTL: Duration = Duration::from_secs(300);
-
-/**
- * @brief 검증된 응답을 담아 둘 수 있는 최대 기간.
- * @warning 서명 만료를 넘겨 담아 두면 안 된다. 넘기면 이미 만료된 서명을 검증된 답이라며
- *          내보낸다.
- */
-pub(crate) fn dnssec_ttl_cap(
-    answers: &[Record],
-    authorities: &[Record],
-    additionals: &[Record],
-) -> Option<u32> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as u32;
-    answers
-        .iter()
-        .chain(authorities)
-        .chain(additionals)
-        .filter(|record| record.rtype == RecordType::RRSIG)
-        .filter_map(|record| {
-            let signature = onetdns_dnssec::Rrsig::from_record(record)?;
-            if !onetdns_dnssec::rrsig_time_valid(&signature, now) {
-                return None;
-            }
-            let covered_ttl = answers
-                .iter()
-                .chain(authorities)
-                .chain(additionals)
-                .filter(|covered| {
-                    covered.class == record.class
-                        && covered.rtype.0 == signature.type_covered
-                        && covered.name.eq_ignore_case(&record.name)
-                })
-                .map(|covered| covered.ttl)
-                .min()?;
-            Some((record.ttl, covered_ttl, signature))
-        })
-        .map(|(rrsig_ttl, covered_ttl, signature)| {
-            rrsig_ttl
-                .min(covered_ttl)
-                .min(signature.original_ttl)
-                .min(signature.expiration.wrapping_sub(now))
-        })
-        .min()
-}
-
-/** @brief RRSIG 존재 여부와 covered RRset 없이도 알 수 있는 자체 수명 상한. */
-fn rrsig_record_ttl_cap(
-    answers: &[Record],
-    authorities: &[Record],
-    additionals: &[Record],
-) -> (bool, Option<u32>) {
-    let mut has_rrsig = false;
-    let mut cap: Option<u32> = None;
-    let mut observed_now: Option<Option<u32>> = None;
-    for record in answers.iter().chain(authorities).chain(additionals) {
-        if record.rtype != RecordType::RRSIG {
-            continue;
-        }
-        has_rrsig = true;
-        let Some(now) = *observed_now.get_or_insert_with(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs() as u32)
-        }) else {
-            continue;
-        };
-        let Some(signature) = onetdns_dnssec::Rrsig::from_record(record) else {
-            continue;
-        };
-        if !onetdns_dnssec::rrsig_time_valid(&signature, now) {
-            continue;
-        }
-        let ttl = record
-            .ttl
-            .min(signature.original_ttl)
-            .min(signature.expiration.wrapping_sub(now));
-        cap = Some(cap.map_or(ttl, |current| current.min(ttl)));
-    }
-    (has_rrsig, cap)
-}
-
-/**
- * @brief 캐시가 지켜야 할 DNSSEC 수명 상한.
- * @details 서명이 없는 AD=0 응답은 별도 상한이 없어 u32::MAX다. AD가 켜졌거나 RRSIG가
- *          하나라도 있으면 수신 TTL·Original TTL·서명 만료를 모두 확인한다. CD 질의나
- *          검증 비활성 경로는 서명 응답이어도 AD=0일 수 있으므로 AD만 보고 건너뛰면 안 된다.
- * @return 유효한 RRSIG 수명 상한을 하나라도 얻으면 그 최솟값, 얻지 못하면 없음.
- */
-pub(crate) fn cache_dnssec_ttl_cap(
-    authentic: bool,
-    answers: &[Record],
-    authorities: &[Record],
-    additionals: &[Record],
-) -> Option<u32> {
-    let (has_rrsig, signature_cap) = rrsig_record_ttl_cap(answers, authorities, additionals);
-    if !has_rrsig {
-        return (!authentic).then_some(u32::MAX);
-    }
-    let signature_cap = signature_cap?;
-    if !authentic {
-        return Some(
-            signature_cap
-                .min(dnssec_ttl_cap(answers, authorities, additionals).unwrap_or(u32::MAX)),
-        )
-        .filter(|ttl| *ttl > 0);
-    }
-    let authenticated_cap = dnssec_ttl_cap(answers, authorities, additionals)?;
-    let cap = signature_cap.min(authenticated_cap);
-    if cap == 0 {
-        None
-    } else {
-        Some(cap)
-    }
-}
 
 #[derive(Clone, Copy)]
 /** @brief 실패 기록 하나. 거듭 실패하면 기억 기간이 늘어난다. */
@@ -1040,188 +706,6 @@ impl NativeCache {
     }
 }
 
-/** @brief 흐른 만큼 수명을 깎고, 다한 것은 뺀다. */
-fn age_records(records: &mut Vec<Record>, elapsed_secs: u64) {
-    records.retain_mut(|record| {
-        let remaining = u64::from(record.ttl).saturating_sub(elapsed_secs);
-        if remaining == 0 {
-            false
-        } else {
-            record.ttl = remaining as u32;
-            true
-        }
-    });
-}
-
-/**
- * @brief 질문한 것이 실제로 답에 들어 있는지.
- * @details 별칭을 따라가며 본다. 순환이 생기거나 별칭과 다른 기록이 같은 이름에 함께
- *          오면 거짓이다.
- * @warning 이것이 거짓인 응답을 긍정 답으로 담으면, 질문과 무관한 기록만 담아 보낸
- *          상대가 캐시를 차지한다.
- */
-pub(crate) fn has_requested_answer(request: &Message, answers: &[Record]) -> bool {
-    let Some(question) = request.questions.first() else {
-        return false;
-    };
-    let mut current = question.name.clone();
-    let mut seen = HashSet::new();
-    for _ in 0..16 {
-        let alias = match next_alias(&current, question.qclass, answers) {
-            Ok(alias) => alias,
-            Err(()) => return false,
-        };
-        let at_current = |record: &Record| record.name.eq_ignore_case(&current);
-        if question.qtype == RecordType::ANY {
-            if answers
-                .iter()
-                .any(|record| record.class == question.qclass && at_current(record))
-            {
-                return true;
-            }
-        } else if answers.iter().any(|record| {
-            record.class == question.qclass
-                && record.name.eq_ignore_case(&current)
-                && record.rtype == question.qtype
-        }) {
-            return true;
-        }
-        if !seen.insert(current.canonical_key()) {
-            return false;
-        }
-        let Some(next) = alias else {
-            return false;
-        };
-        current = next;
-    }
-    false
-}
-
-/** @brief 별칭을 다 따라간 끝의 이름. */
-pub(crate) fn terminal_answer_name(request: &Message, answers: &[Record]) -> Option<Name> {
-    let question = request.questions.first()?;
-    let mut current = question.name.clone();
-    let mut seen = HashSet::new();
-    for _ in 0..16 {
-        if !seen.insert(current.canonical_key()) {
-            return None;
-        }
-        match next_alias(&current, question.qclass, answers) {
-            Ok(Some(next)) => current = next,
-            Ok(None) => return Some(current),
-            Err(()) => return None,
-        }
-    }
-    None
-}
-
-/**
- * @brief 이 이름의 다음 별칭.
- * @warning 같은 이름에 서로 다른 별칭이 오거나 별칭과 다른 기록이 함께 오면 오류다.
- *          그런 응답을 받아들이면 어느 쪽을 따르느냐에 따라 답이 갈린다.
- */
-fn next_alias(
-    current: &Name,
-    qclass: onetdns_proto::DnsClass,
-    answers: &[Record],
-) -> Result<Option<Name>, ()> {
-    let mut cname: Option<Name> = None;
-    for record in answers {
-        if record.class != qclass || !record.name.eq_ignore_case(current) {
-            continue;
-        }
-        if let RData::Cname(target) = &record.rdata {
-            if cname
-                .as_ref()
-                .is_some_and(|existing| !existing.eq_ignore_case(target))
-            {
-                return Err(());
-            }
-            cname = Some(target.clone());
-        }
-    }
-    if cname.is_some()
-        && answers.iter().any(|record| {
-            record.class == qclass
-                && record.name.eq_ignore_case(current)
-                && !matches!(
-                    record.rtype,
-                    RecordType::CNAME | RecordType::RRSIG | RecordType::NSEC
-                )
-        })
-    {
-        return Err(());
-    }
-    if cname.is_some() {
-        return Ok(cname);
-    }
-
-    let Some(record) = answers
-        .iter()
-        .filter(|record| {
-            record.class == qclass
-                && matches!(&record.rdata, RData::Dname(_))
-                && current.num_labels() > record.name.num_labels()
-                && current
-                    .suffix(record.name.num_labels())
-                    .eq_ignore_case(&record.name)
-        })
-        .max_by_key(|record| record.name.num_labels())
-    else {
-        return Ok(None);
-    };
-    let RData::Dname(target) = &record.rdata else {
-        return Ok(None);
-    };
-    if answers.iter().any(|candidate| {
-        candidate.class == qclass
-            && candidate.name.eq_ignore_case(&record.name)
-            && matches!(
-                &candidate.rdata,
-                RData::Dname(other) if !other.eq_ignore_case(target)
-            )
-    }) {
-        return Err(());
-    }
-    let prefix_len = current.num_labels() - record.name.num_labels();
-    let mut labels: Vec<Vec<u8>> = current
-        .labels()
-        .take(prefix_len)
-        .map(<[u8]>::to_vec)
-        .collect();
-    labels.extend(target.labels().map(<[u8]>::to_vec));
-    Ok(Name::from_labels(labels).ok())
-}
-
-/**
- * @brief 이 부정 응답을 덮는 권한 기록의 최소 수명.
- * @warning 질문한 이름을 덮는 것만 본다. 무관한 권한 기록을 받아들이면 남이 이 서버의 캐시에
- *          없다는 답을 심을 수 있다.
- */
-fn relevant_negative_soa_minimum(
-    request: &Message,
-    answers: &[Record],
-    authorities: &[Record],
-) -> Option<u32> {
-    let qclass = request.questions.first()?.qclass;
-    let terminal = terminal_answer_name(request, answers)?;
-    authorities
-        .iter()
-        .filter_map(|record| match &record.rdata {
-            RData::Soa(soa)
-                if record.class == qclass
-                    && record.name.num_labels() <= terminal.num_labels()
-                    && terminal
-                        .suffix(record.name.num_labels())
-                        .eq_ignore_case(&record.name) =>
-            {
-                Some(soa.minimum.min(record.ttl))
-            }
-            _ => None,
-        })
-        .min()
-}
-
 /** @brief 캐시와 질의 합치기를 하는 계층. */
 pub struct CacheLayer {
     /** @brief 다음 계층. */
@@ -1529,25 +1013,6 @@ impl CacheHandle {
     }
 }
 
-/** @brief 이 응답의 부정 수명 근거. */
-fn neg_soa_minimum(request: &Message, msg: &Message) -> Option<u32> {
-    relevant_negative_soa_minimum(request, &msg.answers, &msg.authorities)
-}
-
-/**
- * @brief 남의 결과를 나눠 받을 때 이 요청에 맞게 고친다.
- * @warning 질의 번호와 질문을 되비추지 않으면 클라이언트가 자기 질의의 답으로 알아보지
- *          못한다.
- */
-fn retarget_response(mut response: Message, request: &Message) -> Message {
-    response.header.id = request.header.id;
-    response.header.opcode = request.header.opcode;
-    response.header.recursion_desired = request.header.recursion_desired;
-    response.header.checking_disabled = request.header.checking_disabled;
-    response.questions = request.questions.clone();
-    response
-}
-
 impl Resolver for CacheLayer {
     /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
@@ -1720,38 +1185,15 @@ impl Resolver for CacheLayer {
     }
 }
 
-/** @brief 담아 둔 내용으로 이 요청에 대한 응답을 만든다. */
-fn cached_message(
-    req: &Message,
-    rcode: u16,
-    answers: Vec<Record>,
-    authorities: Vec<Record>,
-    additionals: Vec<Record>,
-    authentic: bool,
-) -> Message {
-    let mut m = Message::default();
-    m.header.id = req.header.id;
-    m.header.response = true;
-    m.header.opcode = req.header.opcode;
-    m.header.recursion_desired = req.header.recursion_desired;
-    m.header.recursion_available = true;
-    m.header.checking_disabled = req.header.checking_disabled;
-    m.header.rcode = rcode;
-    m.header.authentic_data = authentic;
-    m.questions = req.questions.clone();
-    m.answers = answers;
-    m.authorities = authorities;
-    m.additionals = additionals;
-    m
-}
-
 #[cfg(test)]
 /** @brief 담을 자격, 수명 상하한, 질의 합치기, 그리고 승격이 새 답을 덮지 않는지. */
 mod tests {
+    use super::key::INLINE_REQUEST_KEY_CAPACITY;
     use super::*;
-    use onetdns_proto::{RData, Record, Soa};
+    use onetdns_proto::{Name, RData, Record, Soa};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(target_pointer_width = "64")]
     #[test]
@@ -2741,9 +2183,7 @@ mod tests {
             let mut flights = layer.flights.lock_recover();
             for index in 0..MAX_CLIENT_FLIGHTS {
                 flights.insert(
-                    FlightKey {
-                        normalized_wire: Box::new(index.to_be_bytes()),
-                    },
+                    FlightKey::from_normalized_bytes(Box::new(index.to_be_bytes())),
                     Arc::new(ClientFlight::new()),
                 );
             }
