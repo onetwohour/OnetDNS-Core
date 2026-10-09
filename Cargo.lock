@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "ed25519-dalek",
  "hmac",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-authority"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "hmac",
  "onetdns-core",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-cluster"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-config"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "onetdns-core",
  "zeroize",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-control"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "hmac",
  "libc",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-core"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "libc",
  "onetdns-proto",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-dnscrypt"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "chacha20 0.9.1",
  "ed25519-dalek",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-dnssec"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "ed25519-dalek",
  "hmac",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-filter"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "onetdns-core",
  "onetdns-proto",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-forward"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "libc",
  "onetdns-core",
@@ -890,11 +890,11 @@ dependencies = [
 
 [[package]]
 name = "onetdns-http2"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 
 [[package]]
 name = "onetdns-policy"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "onetdns-core",
  "onetdns-proto",
@@ -903,14 +903,14 @@ dependencies = [
 
 [[package]]
 name = "onetdns-proto"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "hickory-proto",
 ]
 
 [[package]]
 name = "onetdns-quic"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-recurse"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "libc",
  "onetdns-core",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-runtime"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "libc",
  "onetdns-core",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-security"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "onetdns-core",
  "zeroize",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-tls"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "onetdns-transport"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "onetdns-tls",
  "p256",
