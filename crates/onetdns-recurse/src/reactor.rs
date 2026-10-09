@@ -615,9 +615,15 @@ impl Reactor {
         }
     }
 
-    /** @brief 지금 살아 있는 슬롯 수. */
+    /**
+     * @brief 지금 살아 있는 슬롯 수.
+     * @details slots 는 줄지 않고 비워진 자리는 모두 free 에 들어오므로, 살아 있는 수는 전체
+     *          길이에서 재사용 대기 수를 뺀 값이다. 매 패킷 입장마다 부르는 자리라 배열 전체를
+     *          훑지 않는다.
+     * @invariant free 에는 중복이 없고 그 인덱스의 슬롯은 항상 None 이다.
+     */
     pub fn live(&self) -> usize {
-        self.slots.iter().flatten().count()
+        self.slots.len() - self.free.len()
     }
 
     /** @brief 새 클라이언트 요청을 더 받을 수 있는지. */

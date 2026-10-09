@@ -17,7 +17,7 @@ use onetdns_runtime::{Handler, RequestCtx};
 #[cfg(unix)]
 use crate::native::ddr_owner;
 #[cfg(unix)]
-use crate::native::lane::{reactor_response_edns, LaneClient, LaneState, LANE};
+use crate::native::lane::{reactor_response_edns, LaneClient, LaneState, LANE, MAX_LANE_PENDING};
 use crate::native::observe::note_dropped;
 use crate::native::query::dnstap_proto;
 #[cfg(unix)]
@@ -362,6 +362,13 @@ impl Handler for NativeServer {
                 *st = None;
             }
             let st = st.get_or_insert_with(|| LaneState::new(lane.chain.clone(), runtime.clone()));
+            /*
+             * 대기 클라이언트가 상한에 차면 더 받지 않고 동기 경로로 돌린다. 제출 전에 막으므로
+             * 슬롯도 follower 도 늘지 않아, 한 이름에 질의가 몰려도 이 맵이 끝없이 커지지 않는다.
+             */
+            if st.clients.len() >= MAX_LANE_PENDING {
+                return R::Fallback;
+            }
             let token = st.next;
             match st.reactor.submit(
                 runtime

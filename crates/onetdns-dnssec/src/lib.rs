@@ -1359,20 +1359,44 @@ impl Nsec {
  * @brief RFC 4034 정규 이름 순서 비교.
  * @details 라벨을 뒤에서부터(TLD 쪽부터) 비교한다. DNS 트리 구조상 이 방향이라야
  *          같은 부모 아래 형제들이 인접해, NSEC의 "사이에 아무것도 없다"가 성립한다.
+ *          라벨을 앞에서부터 한 번 모은 뒤 끝에서부터 본다. 반복자의 역방향은 호출마다 이름을
+ *          처음부터 다시 훑으므로, rev 로 돌리면 비교 하나가 라벨 수의 제곱이 된다. 이 함수는
+ *          정렬 비교자로도 쓰여 한 번 호출이 잦다.
  * @note 라벨이 먼저 떨어지는 쪽이 작다. a.example이 b.a.example보다 앞이다.
  */
 pub fn canonical_name_cmp(a: &Name, b: &Name) -> Ordering {
-    let (mut al, mut bl) = (a.labels().rev(), b.labels().rev());
+    /*
+     * 와이어는 255 옥텟 이하이고 루트가 아닌 라벨마다 길이 옥텟이 하나씩 앞서므로, 라벨은 많아야
+     * 그 절반인 127개다. 128칸 고정 배열이면 힙 없이 다 담는다. take 는 불변식이 깨져도 넘치지
+     * 않게 막는 안전장치일 뿐, 정상 이름에서는 자르지 않는다.
+     */
+    const MAX_LABELS: usize = 128;
+    let empty: &[u8] = &[];
+    let mut abuf = [empty; MAX_LABELS];
+    let mut bbuf = [empty; MAX_LABELS];
+    let mut an = 0usize;
+    for label in a.labels().take(MAX_LABELS) {
+        abuf[an] = label;
+        an += 1;
+    }
+    let mut bn = 0usize;
+    for label in b.labels().take(MAX_LABELS) {
+        bbuf[bn] = label;
+        bn += 1;
+    }
     loop {
-        let (left, right) = match (al.next(), bl.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(left), Some(right)) => (left, right),
-        };
-        match canonical_label_cmp(left, right) {
-            Ordering::Equal => continue,
-            other => return other,
+        match (an, bn) {
+            (0, 0) => return Ordering::Equal,
+            (0, _) => return Ordering::Less,
+            (_, 0) => return Ordering::Greater,
+            _ => {
+                an -= 1;
+                bn -= 1;
+                match canonical_label_cmp(abuf[an], bbuf[bn]) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
         }
     }
 }
@@ -4199,6 +4223,28 @@ mod tests {
         assert_eq!(cmp("a.example.com", "b.example.com"), Ordering::Less);
         assert_eq!(cmp("a.com", "a.net"), Ordering::Less);
         assert_eq!(cmp("example.com", "example.com"), Ordering::Equal);
+    }
+
+    #[test]
+    /** @brief 라벨이 깊은 이름도 정규 순서를 바르게 매기는지. */
+    fn canonical_name_cmp_orders_deep_names() {
+        let deep = |first: &str| {
+            let mut s = String::from(first);
+            for _ in 0..60 {
+                s.push_str(".a");
+            }
+            s.push_str(".test");
+            Name::from_str(&s).unwrap()
+        };
+        let a = deep("a");
+        let b = deep("b");
+        assert_eq!(canonical_name_cmp(&a, &b), Ordering::Less);
+        assert_eq!(canonical_name_cmp(&b, &a), Ordering::Greater);
+        assert_eq!(canonical_name_cmp(&a, &a), Ordering::Equal);
+
+        let parent = Name::from_str("test").unwrap();
+        assert_eq!(canonical_name_cmp(&parent, &a), Ordering::Less);
+        assert_eq!(canonical_name_cmp(&a, &parent), Ordering::Greater);
     }
 
     #[test]

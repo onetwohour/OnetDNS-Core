@@ -5018,6 +5018,73 @@ fn reactor_lane_defers_dropped_clients_to_sync_path() {
 
 #[cfg(unix)]
 #[test]
+/** @brief 대기 클라이언트가 상한에 차면 더 받지 않고 보통 경로로 넘기는지. */
+fn reactor_lane_caps_pending_clients() {
+    use onetdns_runtime::ReactorDisposition;
+
+    /* 스레드 로컬 레인은 앞 테스트의 찌꺼기를 남길 수 있으니 비우고 시작한다. */
+    crate::native::lane::LANE.with(|slot| *slot.borrow_mut() = None);
+
+    let (backend, cache) = lane_backend_and_cache();
+    let recursor = Arc::new(
+        onetdns_recurse::Recursor::new(
+            vec!["127.0.0.1:5399".parse().unwrap()],
+            std::time::Duration::from_millis(50),
+        )
+        .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]),
+    );
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(onetdns_filter::build_from_str(
+            "",
+            "",
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_reactor_lane(recursor, cache, 32);
+
+    let packet = Message::query(0x7, ApName::from_str("slow.example").unwrap(), ApRt::A)
+        .try_encode()
+        .unwrap();
+    let submit = || {
+        let mut out = onetdns_proto::Writer::with_limit(1232);
+        server.reactor_submit(&packet, &ctx(), &mut out, std::time::Instant::now())
+    };
+
+    /*
+     * 같은 이름을 반복 제출하면 첫 건은 슬롯, 나머지는 singleflight 로 follower 가 되어 아직
+     * 펌프하지 않은 동안 모두 대기 맵에 쌓인다. 상한까지는 레인이 받아 준다.
+     */
+    for _ in 0..crate::native::lane::MAX_LANE_PENDING {
+        assert_eq!(submit(), ReactorDisposition::Submitted);
+    }
+    crate::native::lane::LANE.with(|slot| {
+        assert_eq!(
+            slot.borrow().as_ref().unwrap().clients.len(),
+            crate::native::lane::MAX_LANE_PENDING,
+            "대기 맵은 상한까지 찬다"
+        );
+    });
+
+    /* 상한을 넘는 질의는 레인이 맡지 않고 보통 경로로 넘긴다. */
+    assert_eq!(submit(), ReactorDisposition::Fallback);
+    crate::native::lane::LANE.with(|slot| {
+        assert_eq!(
+            slot.borrow().as_ref().unwrap().clients.len(),
+            crate::native::lane::MAX_LANE_PENDING,
+            "넘친 질의는 대기 맵을 늘리지 않는다"
+        );
+    });
+
+    /* 1024개를 남겨 두면 뒤 테스트의 레인을 막으므로 비운다. */
+    crate::native::lane::LANE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(unix)]
+#[test]
 /**
  * @brief 레인 조건이 닫혔거나 레인이 처리하지 않는 차단 규칙이 있으면 보통 경로로 넘기는지.
  * @details 안 넘기면 그 기능이 없는 것처럼 답이 나간다. 어느 설정이 조건을 닫는지는 설정 키
@@ -6321,6 +6388,70 @@ fn dns64_synthesizes_aaaa() {
         }
         _ => panic!("합성 AAAA 기대"),
     }
+}
+
+/** @brief AAAA 에는 SERVFAIL 을, A 에는 정상 답을 주는 상류. */
+fn dns64_servfail_aaaa_upstream() -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = sock.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if let Ok(req) = Message::parse(&buf[..n]) {
+                let mut m = base_response(&req);
+                if let Some(q) = req.questions.first() {
+                    if q.qtype == RecordType::A {
+                        m.header.rcode = ResponseCode::NoError.0;
+                        m.answers.push(ApRecord::new(
+                            q.name.clone(),
+                            60,
+                            ApRData::A(Ipv4Addr::new(7, 7, 7, 7)),
+                        ));
+                    } else {
+                        m.header.rcode = ResponseCode::ServFail.0;
+                    }
+                }
+                let _ = sock.send_to(&m.try_encode().unwrap(), from);
+            }
+        }
+    });
+    addr
+}
+
+#[test]
+/** @brief 상류의 AAAA SERVFAIL 을 DNS64 가 정상 응답으로 둔갑시키지 않는지. */
+fn dns64_does_not_mask_servfail() {
+    let engine = onetdns_filter::build_from_str("", "", BlockResponse::NxDomain);
+    let s = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(engine)),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        Arc::new(NativeBackend::Forward(Forwarder::new(
+            vec![dns64_servfail_aaaa_upstream()],
+            Duration::from_secs(2),
+        ))),
+        60,
+    );
+
+    let mut prefix = [0u8; 16];
+    prefix[0] = 0x00;
+    prefix[1] = 0x64;
+    prefix[2] = 0xff;
+    prefix[3] = 0x9b;
+    update_features(&s, |features| features.dns64_prefix = Some(prefix));
+    let mut query = q("v4only.test");
+    query.questions[0].qtype = RecordType::AAAA;
+    let resp = s.handle(&query, &ctx()).unwrap();
+
+    assert_eq!(
+        resp.header.rcode,
+        ResponseCode::ServFail.0,
+        "상류 SERVFAIL 은 보존돼야 한다"
+    );
+    assert!(
+        resp.answers.is_empty(),
+        "SERVFAIL 에 AAAA 를 합성하면 안 된다"
+    );
 }
 
 #[test]

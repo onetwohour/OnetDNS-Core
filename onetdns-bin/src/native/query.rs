@@ -743,8 +743,12 @@ impl NativeServer {
                 .answers
                 .iter()
                 .any(|record| matches!(&record.rdata, ApRData::Aaaa(_)));
+            /*
+             * NOERROR 응답에만 합성한다. NXDOMAIN 은 그대로 둬야 하고, SERVFAIL 이나 REFUSED 를
+             * A 로 받아 합성하면 상류의 실패가 정상 응답으로 둔갑해 클라이언트가 없는 경로를 쓴다.
+             */
             if qtype == ApRt::AAAA
-                && resp.header.rcode != ResponseCode::NXDomain.0
+                && resp.header.rcode == ResponseCode::NoError.0
                 && (!has_aaaa || f.dns64_synthall)
             {
                 let negative_ttl = dns64_negative_ttl(resp);

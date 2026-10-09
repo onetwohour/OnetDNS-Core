@@ -20,6 +20,23 @@ use crate::native::{
 };
 
 #[cfg(unix)]
+/**
+ * @brief 레인 하나가 동시에 들고 있을 대기 클라이언트 수 상한.
+ * @details 대기 클라이언트는 원본 패킷과 파싱한 질의를 함께 쥐므로, 상한이 없으면 느린 이름에
+ *          질의가 몰릴 때 메모리가 끝없이 는다. 슬롯 리더와 follower 와 대체 대기가 모두 이 맵에
+ *          들어오므로, 이 한 수로 셋을 함께 막는다. 넘치면 그 질의는 동기 경로로 돌린다.
+ */
+pub(crate) const MAX_LANE_PENDING: usize = 1024;
+
+#[cfg(unix)]
+/**
+ * @brief 대체 처리에 쌓아 둘 작업 수 상한.
+ * @details 가득 차면 리액터 스레드가 그 자리에서 동기로 푼다. 무제한 채널은 대체 워커가 느릴 때
+ *          작업이 끝없이 쌓여 메모리를 먹는다.
+ */
+pub(crate) const MAX_FALLBACK_QUEUE: usize = 256;
+
+#[cfg(unix)]
 /** @brief 이 스레드의 레인 상태. */
 pub(crate) struct LaneState {
     /** @brief 이 상태 기계가 시작할 때 잡은 캐시·재귀 리졸버 세대. */
@@ -38,8 +55,8 @@ pub(crate) struct LaneState {
 #[cfg(unix)]
 /** @brief 레인이 끝내지 못한 것을 보통 체인으로 마저 푸는 곳. 안 그러면 그 질의만 답을 못 받는다. */
 struct LaneFallback {
-    /** @brief 마저 풀 일을 맡기는 곳. */
-    jobs: std::sync::mpsc::Sender<(u64, Message, ClientInfo)>,
+    /** @brief 마저 풀 일을 맡기는 곳. 큐가 유한해 가득 차면 맡기지 못한다. */
+    jobs: std::sync::mpsc::SyncSender<(u64, Message, ClientInfo)>,
     /**
      * @brief 마저 푼 결과들.
      * @details 실패도 종류를 담아 돌려준다. 없음으로 접으면 영구 실패까지 전송 실패로 보여
@@ -56,7 +73,8 @@ type LaneFallbackResults = Arc<std::sync::Mutex<Vec<(u64, Result<Message, Resolv
 impl LaneFallback {
     /** @brief 체인을 잡고 워커를 시작한다. */
     fn new(chain: Arc<dyn Resolver>) -> Self {
-        let (jobs, rx) = std::sync::mpsc::channel::<(u64, Message, ClientInfo)>();
+        let (jobs, rx) =
+            std::sync::mpsc::sync_channel::<(u64, Message, ClientInfo)>(MAX_FALLBACK_QUEUE);
         let done: LaneFallbackResults = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = done.clone();
 
@@ -288,7 +306,7 @@ impl NativeServer {
                     match st
                         .fallback
                         .jobs
-                        .send((token, req.clone(), cl.client.clone()))
+                        .try_send((token, req.clone(), cl.client.clone()))
                     {
                         Ok(()) => {
                             st.clients.insert(token, cl);
