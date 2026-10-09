@@ -2160,8 +2160,17 @@ fn udp_exchange_on(
         }
         let received = UDP_RECV_BUFFER.with(|slot| {
             let mut buf = slot.borrow_mut();
-            sock.recv_from(&mut buf)
-                .map(|(n, from)| (from, Message::parse_udp_reply(&buf[..n])))
+            sock.recv_from(&mut buf).map(|(n, from)| {
+                /*
+                 * 우리가 질의를 보낸 그 업스트림에서 온 데이터그램만 파싱한다. 출처가 어긋난
+                 * 것은 아래에서 어차피 버리므로, 파싱 비용을 들이기 전에 먼저 거른다.
+                 */
+                if from == upstream {
+                    (from, Message::parse_udp_reply(&buf[..n]))
+                } else {
+                    (from, None)
+                }
+            })
         });
         let (from, parsed) = match received {
             Ok(v) => v,

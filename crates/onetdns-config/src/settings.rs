@@ -2876,22 +2876,24 @@ impl Config {
 
     /**
      * @brief 열린 리졸버로 동작할 위험을 알리는 경고들.
+     * @details 위험 여부는 운영 모드 이름이 아니라 실제 노출로 가린다. 다른 호스트에서 닿을 수
+     *          있고 허용 목록이 비어 목록 밖 출처까지 받으면, Personal 로 적어 두었어도 사실상
+     *          공개 리졸버이므로 경고한다. 거꾸로 루프백에만 묶였거나 허용 목록으로 출처를
+     *          좁혔으면 경고하지 않는다.
      * @note 속도 제한을 걸지 말지는 운영자가 정하므로 시작은 막지 않는다. 대신 이 경고를
      *       시작할 때마다 로그에 남긴다.
      */
     pub fn open_resolver_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.mode == Mode::Public && self.reachable_from_other_hosts() {
+        if self.reachable_from_other_hosts() && self.acl_default_allow() {
             if self.rate_limit_per_sec == 0 || self.rate_limit_burst == 0 {
                 out.push(
-                    "Public mode has no per-client query rate limit. This server could be abused for DNS amplification and reflection attacks; set rate_limit_per_sec and rate_limit_burst.".into(),
+                    "This server is reachable from other hosts and accepts queries from every source with no per-client rate limit. It could be abused for DNS amplification and reflection attacks; set rate_limit_per_sec and rate_limit_burst.".into(),
                 );
             }
-            if self.acl_default_allow() {
-                out.push(
-                    "Public mode accepts requests from every source address. Set acl_allow to only the address ranges you actually serve.".into(),
-                );
-            }
+            out.push(
+                "This server is reachable from other hosts and accepts requests from every source address. Set acl_allow to only the address ranges you actually serve.".into(),
+            );
         }
         out
     }
@@ -7342,6 +7344,35 @@ rate_limit_burst = 0
         assert!(
             cfg.open_resolver_warnings().is_empty(),
             "밖에서 닿지 못하는 서버에 열린 리졸버 경고를 내면 안 됩니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 열린 리졸버 경고가 모드 이름이 아니라 실제 노출을 따르는지.
+     * @details 공개 주소에 묶고 허용 목록을 비우면 mode 를 적지 않은 Personal 설정이라도 사실상
+     *          공개 리졸버이므로 경고한다. 반대로 허용 목록으로 출처를 좁히면 밖에서 닿더라도
+     *          공개 리졸버가 아니므로 경고하지 않는다.
+     */
+    fn open_resolver_warning_follows_real_exposure_not_mode() {
+        let open = Config::from_toml_str(
+            "listen = [\"0.0.0.0:53\"]\nacl_allow = []\nrate_limit_per_sec = 0\nrate_limit_burst = 0\n",
+        )
+        .expect("mode 를 적지 않은 Personal 설정도 유효합니다");
+        assert!(
+            open.open_resolver_warnings()
+                .iter()
+                .any(|line| line.contains("amplification")),
+            "Personal 이라도 외부에 열려 있으면 증폭 위험을 알려야 합니다"
+        );
+
+        let scoped = Config::from_toml_str(
+            "listen = [\"0.0.0.0:53\"]\nacl_allow = [\"192.0.2.0/24\"]\nrate_limit_per_sec = 0\nrate_limit_burst = 0\n",
+        )
+        .expect("허용 목록으로 출처를 좁힌 설정도 유효합니다");
+        assert!(
+            scoped.open_resolver_warnings().is_empty(),
+            "출처를 좁힌 서버는 공개 리졸버가 아니므로 경고하지 않습니다"
         );
     }
 

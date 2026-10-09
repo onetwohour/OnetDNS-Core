@@ -12,6 +12,13 @@ use crate::wire::{Reader, Writer, MAX_DNS_WIRE_LEN};
 use crate::ProtoError;
 
 /**
+ * @brief 섹션 하나에 담을 항목 수 상한.
+ * @details 개수만 크게 적은 짧은 패킷이 헤더가 선언한 수만큼 미리 할당하게 만들지 못하도록
+ *          막는다. 일반 파서와 잘린 응답 파서가 같은 상한을 공유하도록 모듈 수준에 둔다.
+ */
+const MAX_SECTION_ITEMS: usize = 4096;
+
+/**
  * @brief DNS 응답 코드. 확장 rcode를 담기 위해 12비트를 쓴다.
  *
  * @details 열거형이 아니라 newtype인 이유는 미지의 코드도 그대로 담아 보내야 하기 때문이다.
@@ -183,8 +190,6 @@ impl Message {
         let ar = r.u16()? as usize;
         let mut header = Header::from_flags(id, flags);
 
-        /** @brief 구간 하나에 담을 항목 수 상한. 없으면 개수만 크게 적은 짧은 패킷으로 메모리를 잡게 만든다. */
-        const MAX_SECTION_ITEMS: usize = 4096;
         let remaining = r.remaining();
         if qd > MAX_SECTION_ITEMS
             || an > MAX_SECTION_ITEMS
@@ -293,10 +298,14 @@ impl Message {
             r.u16().ok()?;
         }
         let mut header = Header::from_flags(id, flags);
-        if !header.response || qd == 0 || qd.saturating_mul(5) > r.remaining() {
+        if !header.response
+            || qd == 0
+            || qd > MAX_SECTION_ITEMS
+            || qd.saturating_mul(5) > r.remaining()
+        {
             return None;
         }
-        let mut questions = Vec::with_capacity(qd);
+        let mut questions = Vec::with_capacity(qd.min(64));
         for _ in 0..qd {
             let name = Name::parse(&mut r).ok()?;
             let qtype = RecordType(r.u16().ok()?);
@@ -924,6 +933,26 @@ mod udp_reply_tests {
         let mut trailing = wire.clone();
         trailing.push(0);
         assert!(Message::parse_udp_reply(&trailing).is_none());
+    }
+
+    #[test]
+    /**
+     * @brief 잘린 응답 파서가 일반 파서와 같은 섹션 개수 상한을 스스로 적용하는지.
+     * @details 호출자가 먼저 걸렀다고 가정하지 않는다. 질문 수가 상한을 넘으면 바이트가 그만큼
+     *          있어도 받지 않고, 상한 안이면 잘린 응답으로 받는다.
+     */
+    fn cut_reply_enforces_the_section_item_limit() {
+        let over = 4097usize;
+        let mut too_many = vec![0u8; 12 + over * 5];
+        too_many[2] = 0x80;
+        too_many[4..6].copy_from_slice(&(over as u16).to_be_bytes());
+        assert!(Message::cut_reply(&too_many).is_none());
+
+        let ok = 1usize;
+        let mut one = vec![0u8; 12 + ok * 5];
+        one[2] = 0x80;
+        one[4..6].copy_from_slice(&(ok as u16).to_be_bytes());
+        assert!(Message::cut_reply(&one).is_some());
     }
 }
 
