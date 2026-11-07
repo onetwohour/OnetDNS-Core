@@ -1,25 +1,15 @@
-/*!
- * @brief 설정 항목의 UI 메타데이터.
- *
- * @details 대시보드가 이것을 읽어 편집 화면을 만든다. 항목 이름, 종류, 그룹, 그리고
- *          네 언어(ko, en, ja, zh)의 설명이 들어간다.
- * @warning 설정 키와 여기 항목이 정확히 일대일이어야 한다. 어긋나면 대시보드가 없는
- *          항목을 보여 주거나 있는 항목을 감춘다. 테스트가 그 일치를 강제한다.
- */
+//! Config field metadata the dashboard builds its editor from: name, kind, group and copy in
+//! four languages. Fields and config keys must match one to one, which the tests enforce.
 
-/** @brief 설정 항목 하나의 메타데이터. */
 pub struct Field {
-    /** @brief 설정 항목 이름. */
     pub key: &'static str,
-    /** @brief 값의 형. */
     pub kind: &'static str,
-    /** @brief 대시보드에서 묶어 보일 분류의 식별자. 화면 이름은 group_i18n 이 정한다. */
+    /// Group id; `group_i18n` names it.
     pub group: &'static str,
-    /** @brief 형에 딸린 부가 정보. 고를 값 목록 같은 것. */
+    /// Extra data for the kind, such as the values to pick from.
     pub meta: &'static str,
 }
 
-/** @brief 항목 하나를 만든다. 상수 문맥에서 테이블을 채운다. */
 const fn f(
     key: &'static str,
     kind: &'static str,
@@ -34,12 +24,11 @@ const fn f(
     }
 }
 
-/** @brief 모든 항목. */
 pub fn fields() -> &'static [Field] {
     FIELDS
 }
 
-/** @brief 항목 테이블. 설정 키와 일대일로 맞아야 한다. */
+/// One row per config key.
 static FIELDS: &[Field] = &[
     f("mode", "enum", "general", "personal|public"),
     f("backend", "enum", "general", "forward|recurse|split"),
@@ -268,6 +257,7 @@ static FIELDS: &[Field] = &[
     f("tftp_enable", "bool", "dhcp", ""),
     f("tftp_root", "string", "dhcp", ""),
     f("tftp_listen", "string", "dhcp", "127.0.0.1:69"),
+    f("tftp_read_allow", "array", "dhcp", ""),
     f("tftp_writable", "bool", "dhcp", ""),
     f("tftp_write_allow", "array", "dhcp", ""),
     f("tftp_allow_overwrite", "bool", "dhcp", ""),
@@ -344,7 +334,7 @@ static FIELDS: &[Field] = &[
     f("release_check", "bool", "control", ""),
 ];
 
-/** @brief 그룹 이름의 언어별 표기. 순서는 ko, en, ja, zh 이다. */
+/// Order: ko, en, ja, zh.
 fn group_i18n(group: &str) -> [&'static str; 4] {
     match group {
         "general" => ["일반", "General", "一般", "常规"],
@@ -389,29 +379,19 @@ fn group_i18n(group: &str) -> [&'static str; 4] {
 }
 
 #[derive(Clone, Copy)]
-/** @brief 항목 하나의 언어별 설명. */
 struct FieldCopy {
-    /** @brief 설정 항목 이름. */
     key: &'static str,
-    /** @brief 한국어 이름. */
     label_ko: &'static str,
-    /** @brief 영어 이름. */
     label_en: &'static str,
-    /** @brief 일본어 이름. */
     label_ja: &'static str,
-    /** @brief 중국어(간체) 이름. */
     label_zh: &'static str,
-    /** @brief 한국어 설명. */
     description_ko: &'static str,
-    /** @brief 영어 설명. */
     description_en: &'static str,
-    /** @brief 일본어 설명. */
     description_ja: &'static str,
-    /** @brief 중국어(간체) 설명. */
     description_zh: &'static str,
 }
 
-/** @brief 설명 테이블. 항목 테이블과 일대일로 맞아야 한다. */
+/// One row per field.
 static FIELD_COPY: &[FieldCopy] = &[
     FieldCopy {
         key: "mode",
@@ -2691,6 +2671,17 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_zh: "接收 TFTP 请求的 IP 地址和 UDP 端口。",
     },
     FieldCopy {
+        key: "tftp_read_allow",
+        label_ko: "TFTP 읽기 허용 대역",
+        label_en: "Networks allowed to read by TFTP",
+        label_ja: "TFTP 読み取りを許可するネットワーク",
+        label_zh: "允许 TFTP 读取的网段",
+        description_ko: "부팅 파일을 받을 수 있는 클라이언트 주소 대역입니다. 루프백이 아닌 주소에서 TFTP 요청을 받으려면 반드시 지정해야 합니다.",
+        description_en: "Client address ranges allowed to download boot files. Required when TFTP listens on a non-loopback address.",
+        description_ja: "ブートファイルを取得できるクライアントアドレス範囲です。ループバック以外のアドレスで TFTP を待ち受ける場合は必須です。",
+        description_zh: "允许下载启动文件的客户端地址范围。TFTP 监听非环回地址时必须设置。",
+    },
+    FieldCopy {
         key: "tftp_writable",
         label_ko: "TFTP 파일 업로드 허용",
         label_en: "Allow TFTP uploads",
@@ -2707,10 +2698,10 @@ static FIELD_COPY: &[FieldCopy] = &[
         label_en: "Networks allowed to upload by TFTP",
         label_ja: "TFTP アップロードを許可するネットワーク",
         label_zh: "允许 TFTP 上传的网段",
-        description_ko: "TFTP 파일 업로드를 허용할 클라이언트 주소 대역입니다.",
-        description_en: "Client address ranges allowed to upload files through TFTP.",
-        description_ja: "TFTP でファイルをアップロードできるクライアントアドレス範囲です。",
-        description_zh: "允许通过 TFTP 上传文件的客户端地址范围。",
+        description_ko: "TFTP 파일 업로드를 허용할 클라이언트 주소 대역입니다. 비워 두면 이 기계에서만 올릴 수 있습니다.",
+        description_en: "Client address ranges allowed to upload files through TFTP. When empty, only this machine can upload.",
+        description_ja: "TFTP でファイルをアップロードできるクライアントアドレス範囲です。空の場合はこのマシンからのみアップロードできます。",
+        description_zh: "允许通过 TFTP 上传文件的客户端地址范围。留空时只有本机可以上传。",
     },
     FieldCopy {
         key: "tftp_allow_overwrite",
@@ -3286,7 +3277,6 @@ static FIELD_COPY: &[FieldCopy] = &[
     },
 ];
 
-/** @brief 이 키의 설명을 찾는다. */
 fn field_copy(key: &str) -> &'static FieldCopy {
     FIELD_COPY
         .iter()
@@ -3294,24 +3284,24 @@ fn field_copy(key: &str) -> &'static FieldCopy {
         .unwrap_or_else(|| panic!("setting {key} has no localized copy"))
 }
 
-/** @brief 여러 항목이 함께 쓰는 선택지 표기. */
+/// Shared by several fields.
 const FORWARD_LABELS: [&str; 4] = [
     "업스트림 DNS 서버로 전달",
     "Forward to upstream DNS",
     "上位 DNS サーバーへ転送",
     "转发到上游 DNS",
 ];
-/** @brief 여러 항목이 함께 쓰는 선택지 표기. */
+/// Shared by several fields.
 const RECURSE_LABELS: [&str; 4] = [
     "직접 재귀 조회",
     "Resolve recursively",
     "直接再帰解決",
     "直接递归解析",
 ];
-/** @brief 여러 항목이 함께 쓰는 선택지 표기. */
+/// Shared by several fields.
 const DISABLED_LABELS: [&str; 4] = ["사용 안 함", "Disabled", "使用しない", "不使用"];
 
-/** @brief 열거값의 언어별 표기. 순서는 ko, en, ja, zh 이다. */
+/// Order: ko, en, ja, zh.
 fn enum_label_i18n(key: &str, value: &str) -> Option<[&'static str; 4]> {
     Some(match (key, value) {
         ("mode", "personal") => [
@@ -3463,10 +3453,7 @@ fn enum_label_i18n(key: &str, value: &str) -> Option<[&'static str; 4]> {
     })
 }
 
-/**
- * @brief 이 항목이 비밀을 담는지.
- * @warning 참이면 값을 화면과 API에 그대로 내보내지 않는다. 토큰이나 비밀번호가 여기 든다.
- */
+/// Values of these fields are not shown on screen or returned by the API.
 fn field_sensitive(key: &str) -> bool {
     matches!(
         key,
@@ -3485,7 +3472,6 @@ fn field_sensitive(key: &str) -> bool {
     )
 }
 
-/** @brief 쓰기만 되고 읽을 수 없는 항목인지. */
 fn field_write_only(key: &str) -> bool {
     matches!(
         key,
@@ -3502,23 +3488,17 @@ fn field_write_only(key: &str) -> bool {
     )
 }
 
-/** @brief 대시보드에서 고칠 수 있는 항목인지. */
 fn field_editable(key: &str, kind: &str) -> bool {
     kind != "table" && !matches!(key, "control_admin_tokens" | "control_readonly_tokens")
 }
 
-/**
- * @brief 기본 설정에서 값이 없는 항목인지.
- * @details 이런 항목은 지정하지 않은 상태가 값이 없는 상태이므로, 대시보드는 입력란을 비우면
- *          빈 문자열을 저장하지 않고 항목을 지운다. 빈 호스트나 빈 경로를 저장하면 설정 전체가
- *          거부된다. 기본값이 있는 문자열 항목은 빈 문자열도 값이므로 이 표시가 붙지 않는다.
- * @param defaults 기본 설정을 JSON으로 읽은 값. 값이 없는 항목은 null로 나온다.
- */
+/// Unset means no value for these fields, so clearing the input removes the key instead of
+/// saving an empty string; an empty host or path would make the whole config invalid. A string
+/// field with a default is not marked, since an empty string is a value there.
 fn field_nullable(defaults: &onetdns_core::json::Json, key: &str) -> bool {
     matches!(defaults.get(key), Some(onetdns_core::json::Json::Null))
 }
 
-/** @brief 값의 단위. 화면에 함께 보여 준다. */
 fn field_unit(field: &Field) -> &'static str {
     if field.kind != "int" {
         return "";
@@ -3531,10 +3511,9 @@ fn field_unit(field: &Field) -> &'static str {
     }
 }
 
-/** @brief 대시보드가 고를 수 있는 언어. 언어별 표기 배열의 순서와 같다. */
+/// Same order as the per-language arrays.
 const LANGUAGES: [&str; 4] = ["ko", "en", "ja", "zh"];
 
-/** @brief 언어별 표기 배열을 {"ko":..,"en":..,"ja":..,"zh":..} 객체로 만든다. */
 fn i18n_object(values: [&str; 4]) -> String {
     use onetdns_core::json;
     let pairs: Vec<String> = LANGUAGES
@@ -3545,7 +3524,6 @@ fn i18n_object(values: [&str; 4]) -> String {
     format!("{{{}}}", pairs.join(","))
 }
 
-/** @brief 전체 메타데이터를 JSON으로. 대시보드가 이것을 받아 화면을 만든다. */
 pub fn schema_json() -> String {
     use onetdns_core::json;
     let defaults = json::parse(&crate::Config::default().effective_json())
@@ -3609,13 +3587,11 @@ pub fn schema_json() -> String {
 }
 
 #[cfg(test)]
-/** @brief 설정 키와 메타데이터의 일대일 대응, 그리고 언어별 설명의 완전성. */
 mod tests {
     use super::*;
     use crate::known_keys;
 
     #[test]
-    /** @brief 모든 설정 키가 정확히 한 번씩 나오는지. 어긋나면 대시보드가 항목을 놓치거나 없는 것을 보여 준다. */
     fn schema_covers_every_known_key_exactly_once() {
         for fd in fields() {
             assert!(
@@ -3631,12 +3607,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 기본값이 없는 항목에만 nullable 표시가 붙는지.
-     * @details 대시보드는 이 표시를 보고 비운 입력란을 항목 삭제로 보낸다. 표시가 빠지면 빈 호스트가
-     *          저장되어 설정 전체가 거부되고, 기본값이 있는 항목에 붙으면 빈 문자열로 끄는 설정을
-     *          화면에서 끌 수 없다.
-     */
     fn nullable_marks_only_settings_without_a_default() {
         use onetdns_core::json::{parse, Json};
         let schema = parse(&schema_json()).unwrap();
@@ -3670,7 +3640,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 열거형 항목에 값 목록이 붙어 있는지. */
     fn enum_meta_present_for_enum_kind() {
         for fd in fields() {
             if fd.kind == "enum" {
@@ -3680,7 +3649,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모든 항목에 실제 설명이 있는지. 대충 채운 문구가 없어야 한다. */
     fn localized_copy_covers_every_field_without_generic_fallbacks() {
         assert_eq!(FIELD_COPY.len(), FIELDS.len());
         for fd in fields() {
@@ -3719,7 +3687,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 없앤 키가 남아 있지 않은지. */
     fn schema_omits_removed_keys_and_lifecycle_metadata() {
         let json = schema_json();
         assert!(!json.contains("recursive_auto_fallback"));
@@ -3731,7 +3698,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모든 항목이 네 언어 설명을 갖췄는지. */
     fn every_field_has_multilingual_human_description() {
         let json = schema_json();
         for fd in fields() {

@@ -1,6 +1,4 @@
-/*!
- * @brief 파일 전송을 지원하지 않는 플랫폼용 대체 구현.
- */
+//! TFTP for platforms without safe file access relative to a directory handle.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,10 +7,10 @@ use std::sync::Arc;
 
 use onetdns_core::IpNet;
 
-/** @brief 아무것도 하지 않는다. 이 플랫폼에는 파일 전송이 없다. */
 pub fn spawn_tftp(
     root: PathBuf,
     listen: SocketAddr,
+    read_allow: Vec<IpNet>,
     writable: bool,
     write_allow: Vec<IpNet>,
     allow_overwrite: bool,
@@ -21,6 +19,7 @@ pub fn spawn_tftp(
     let _ = (
         root,
         listen,
+        read_allow,
         writable,
         write_allow,
         allow_overwrite,

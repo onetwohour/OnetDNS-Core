@@ -1,6 +1,5 @@
-/*!
- * @brief DHCP, RA, PXE 같은 가장자리 서비스를 설정에서 만들고, 임대를 관리 API와 클러스터에 맞춘다.
- */
+//! Builds DHCP, RA and PXE services from config, and syncs leases with the control API and the
+//! cluster.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,10 +14,11 @@ use crate::{
     unix_now,
 };
 
-/** @brief 한 번에 받아들일 임대 수 상한. */
+/// Most leases accepted in one sync.
 const MAX_SYNCED_LEASES: usize = 16_384;
 
-/** @brief 공유 DHCP 임대 수명을 두 wire 형식의 32비트 값으로 손실 없이 바꾼다. */
+/// Converts the shared DHCP lease lifetime to the 32-bit value both wire formats carry, without
+/// loss.
 fn wire_dhcp_lease_secs(value: u64) -> Result<u32, String> {
     let value = u32::try_from(value).map_err(|_| {
         "dhcp_lease_secs must not exceed 4294967295 seconds, the DHCP wire limit".to_string()
@@ -29,7 +29,6 @@ fn wire_dhcp_lease_secs(value: u64) -> Result<u32, String> {
     Ok(value)
 }
 
-/** @brief 설정에서 DHCPv4 설정을 만든다. */
 fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     use std::net::Ipv4Addr;
     let p = |o: &Option<String>, name: &str| -> Result<Ipv4Addr, String> {
@@ -126,10 +125,7 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
     })
 }
 
-/**
- * @brief 설정에서 라우터 광고 설정을 만든다.
- * @return ra_prefix가 없거나 읽을 수 없으면 실패. 값의 범위는 설정 검사가 이미 거른다.
- */
+/// Fails without a readable `ra_prefix`; config validation already checks value ranges.
 fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
     let missing = || "ra_enable needs ra_prefix, written like fd00:1::/64".to_string();
     let spec = cfg.ra_prefix.as_deref().ok_or_else(missing)?;
@@ -156,10 +152,7 @@ fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
     })
 }
 
-/**
- * @brief 설정에서 DHCPv6 설정을 만든다.
- * @note 서버 식별자 파일을 만들 수 있다. 검사만 할 때는 dhcp6_addresses를 쓴다.
- */
+/// May create the server identifier file; checks use `dhcp6_addresses` instead.
 fn build_dhcp6_config(cfg: &Config) -> Result<dhcp6::Dhcp6Config, String> {
     let (range_start, range_end, dns) = dhcp6_addresses(cfg)?;
     Ok(dhcp6::Dhcp6Config {
@@ -173,10 +166,8 @@ fn build_dhcp6_config(cfg: &Config) -> Result<dhcp6::Dhcp6Config, String> {
     })
 }
 
-/**
- * @brief DHCPv6 범위와 알릴 DNS 서버를 읽는다. 파일은 건드리지 않는다.
- * @return (범위 시작, 범위 끝, DNS 서버). 주소를 읽을 수 없거나 범위가 뒤집혔으면 실패.
- */
+/// Range start, range end and DNS servers; touches no file. Fails on an unreadable address or an
+/// inverted range.
 #[allow(clippy::type_complexity)]
 fn dhcp6_addresses(
     cfg: &Config,
@@ -213,10 +204,8 @@ fn dhcp6_addresses(
     Ok((range_start, range_end, dns))
 }
 
-/**
- * @brief 켜 둔 가장자리 서비스가 뜰 수 있는 설정인지 파일을 만들지 않고 가린다.
- * @note 저장 파일은 디렉터리만 본다. 없으면 DHCPv4는 임대를 잃고 DHCPv6는 뜨지 않는다.
- */
+/// Checks that enabled edge services can start, without creating files. For state files only the
+/// directory is checked; without it DHCPv4 loses leases and DHCPv6 does not start.
 pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
     let parent_exists = |path: &Option<String>, key: &str| -> Result<(), String> {
         let Some(path) = path else { return Ok(()) };
@@ -270,7 +259,7 @@ pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
         ),
     ] {
         let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
-        /* @safety 버퍼는 IF_NAMESIZE 바이트이고 함수는 그 안에만 쓴다. */
+        // SAFETY: `name` is IF_NAMESIZE bytes and if_indextoname writes only inside it.
         if enabled
             && index != 0
             && unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null()
@@ -288,7 +277,7 @@ pub(crate) fn edge_service_preflight(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/** @brief 서버 식별자를 읽거나 만든다. 재시작해도 같은 것을 써야 클라이언트가 이 서버를 알아본다. */
+/// Clients recognize this server by its identifier, so the same one must survive restarts.
 fn load_or_create_server_duid6(lease_file: Option<&str>) -> Result<Vec<u8>, String> {
     let generate = || {
         let mut seed = [0u8; 6];
@@ -326,7 +315,6 @@ fn load_or_create_server_duid6(lease_file: Option<&str>) -> Result<Vec<u8>, Stri
     Ok(duid)
 }
 
-/** @brief 16진 문자열을 바이트열로. */
 pub(crate) fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || s.len() % 2 != 0 {
         return None;
@@ -336,7 +324,7 @@ pub(crate) fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/** @brief 유한 임대와 wire infinity를 JSON에서 모호하지 않게 구별한다. */
+/// Keeps finite leases and wire infinity apart in JSON.
 fn lease_time_json(expiry: u64, now: u64) -> String {
     if expiry == u64::MAX {
         "\"expires\":null,\"remaining\":null,\"infinite\":true".to_string()
@@ -346,7 +334,6 @@ fn lease_time_json(expiry: u64, now: u64) -> String {
     }
 }
 
-/** @brief 임대 목록을 JSON으로. */
 pub(crate) fn leases_json(
     v4: Option<&Arc<Mutex<dhcp::LeasePool>>>,
     v6: Option<&Arc<Mutex<dhcp6::Lease6Pool>>>,
@@ -409,7 +396,7 @@ pub(crate) fn leases_json(
     )
 }
 
-/** @brief 콜론으로 나뉜 하드웨어 주소를 읽는다. */
+/// Reads a colon-separated hardware address.
 fn parse_mac_colon(s: &str) -> Option<[u8; 6]> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 6 {
@@ -422,12 +409,9 @@ fn parse_mac_colon(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/**
- * @brief 고정 할당 목록과, 지금 고정 할당을 받을 수 있는지를 함께 돌려준다.
- * @details 고정 할당은 실행 중인 DHCPv4 주소 풀에만 있다. 풀이 없을 때 빈 목록만 돌려주면
- *          할당이 없는 것과 넣을 곳이 없는 것을 구분할 수 없어, 화면이 받지 못할 입력을
- *          받아 놓고 제출한 뒤에야 실패한다.
- */
+/// Static reservations, and whether one can be added now. Reservations live only in the running
+/// DHCPv4 pool; returning just an empty list without a pool would not tell no reservations from
+/// nowhere to put one, so the dashboard would take input it cannot store and fail on submit.
 pub(crate) fn static_reservations_json(pool: Option<&Arc<Mutex<dhcp::LeasePool>>>) -> String {
     use onetdns_core::MutexExt;
     let Some(pool) = pool else {
@@ -457,7 +441,6 @@ pub(crate) fn static_reservations_json(pool: Option<&Arc<Mutex<dhcp::LeasePool>>
     )
 }
 
-/** @brief 고정 할당을 넣는다. */
 pub(crate) fn apply_static_add(
     pool: &Arc<Mutex<dhcp::LeasePool>>,
     body: &str,
@@ -494,7 +477,6 @@ pub(crate) fn apply_static_add(
     ))
 }
 
-/** @brief 고정 할당을 뺀다. */
 pub(crate) fn apply_static_remove(
     pool: &Arc<Mutex<dhcp::LeasePool>>,
     identity_s: &str,
@@ -514,7 +496,7 @@ pub(crate) fn apply_static_remove(
     }
 }
 
-/** @brief 다른 서버와 임대를 주고받는 스레드를 시작한다. */
+/// Starts the thread exchanging leases with other servers.
 pub(crate) fn spawn_lease_sync(
     pool: Arc<Mutex<dhcp::LeasePool>>,
     peers: Vec<String>,
@@ -587,11 +569,8 @@ pub(crate) fn spawn_lease_sync(
         .map(Some)
 }
 
-/**
- * @brief 임대 동기화 작업을 새 설정으로 다시 시작하는 함수.
- * @details DHCPv4 임대 풀이 있고 클러스터 동료와 관리 토큰이 모두 있을 때만 띄운다. 설정이 바뀌면
- *          이전 작업을 멈추고 새로 띄운다.
- */
+/// Runs only with a DHCPv4 pool, cluster peers and a control token; a config change stops the
+/// previous job and starts a new one.
 pub(crate) fn lease_sync_restart(
     jobs: Arc<EdgeServices>,
     dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
@@ -626,7 +605,7 @@ pub(crate) fn lease_sync_restart(
     })
 }
 
-/** @brief 받은 임대를 기록에 넣는다. 하나라도 형식이 어긋나면 전체를 거부한다. */
+/// Records received leases; one malformed entry rejects the whole batch.
 pub(crate) fn apply_lease_sync(
     pool: &Arc<Mutex<dhcp::LeasePool>>,
     body: &str,
@@ -721,24 +700,19 @@ pub(crate) fn apply_lease_sync(
     Ok(format!("{{\"synced\":{changed}}}"))
 }
 
-/**
- * @brief 지금 실행 중인 가장자리 서비스들. DHCP·DHCPv6·라우터 광고·TFTP.
- *
- * @details 서비스마다 자기 종료 신호를 하나씩 가지고 있다. 설정이 바뀐 서비스만 멈추고 새
- *          설정으로 재시작한다. DNS 소켓과 워커는 건드리지 않으므로 이름 해석은 이어진다.
- * @invariant 등록한 신호는 세대가 끝날 때 전파 작업이 모두 보낸다. 등록을 빠뜨리면 그
- *            스레드가 남아 포트를 잡는다.
- */
+/// Running DHCP, DHCPv6, router advertisement and TFTP services, each with its own stop signal.
+/// A config change restarts only the services it touches; DNS sockets and workers are left
+/// alone. When a generation ends, every registered signal is sent; a service left unregistered
+/// keeps its port.
 #[derive(Default)]
 pub(crate) struct EdgeServices {
-    /** @brief 서비스 이름과 그것을 멈출 신호. */
     pub(crate) running: Mutex<Vec<(String, Arc<std::sync::atomic::AtomicBool>)>>,
-    /** @brief 가장자리 서비스 이름별 스레드. 같은 포트를 다시 열기 전에 합류하려고 잡는다. */
+    /// Held to join a service before its port is opened again.
     threads: Mutex<std::collections::HashMap<String, std::thread::JoinHandle<()>>>,
 }
 
 impl EdgeServices {
-    /** @brief 등록된 서비스를 모두 멈추고, 이름으로 맡긴 스레드는 끝날 때까지 기다린다. */
+    /// Stops every registered service and waits for the threads handed over by name.
     pub(crate) fn retire_all(&self) {
         for (_, stop) in self.running.lock_recover().iter() {
             stop.store(true, std::sync::atomic::Ordering::Release);
@@ -749,7 +723,7 @@ impl EdgeServices {
         }
     }
 
-    /** @brief 이름으로 맡긴 스레드 하나가 끝날 때까지 기다린다. 신호는 호출한 쪽이 보낸다. */
+    /// The caller sends the signal.
     fn join_service(&self, key: &str) {
         let thread = self.threads.lock_recover().remove(key);
         if let Some(thread) = thread {
@@ -757,24 +731,17 @@ impl EdgeServices {
         }
     }
 
-    /**
-     * @brief 등록된 것을 모두 멈추고 목록을 비운 뒤 새 신호를 하나 낸다.
-     *
-     * @details 재귀 리졸버에 딸린 보조 작업은 그 재귀 리졸버의 앵커 핸들을 가지고 있다. 재귀 리졸버를 새로
-     *          만들면 이전 작업은 이전 핸들을 갱신하므로 반드시 멈추고 새로 시작해야 한다.
-     * @return 새로 시작할 작업들이 함께 볼 종료 신호.
-     */
+    /// Returns the stop signal for the jobs started next. Jobs attached to the recursive resolver
+    /// hold its anchor handle, so a new resolver must stop the old jobs, which would keep updating
+    /// the old handle.
     pub(crate) fn restart_all(&self) -> Arc<std::sync::atomic::AtomicBool> {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.replace_all(Some(stop.clone()));
         stop
     }
 
-    /**
-     * @brief 등록된 것을 모두 멈추고, 이미 시작해 둔 작업의 종료 신호를 대신 등록한다.
-     * @details 새 재귀 리졸버에 딸린 작업은 그 리졸버를 쓰기로 정하기 전에 시작해 둔다. 쓰기로
-     *          정한 순간에 이 함수로 이전 작업과 바꾼다. 없음을 넘기면 이전 작업만 멈춘다.
-     */
+    /// Jobs for a new recursive resolver start before it is chosen; this swaps them in at that
+    /// moment. `None` only stops the old jobs.
     pub(crate) fn replace_all(&self, stop: Option<Arc<std::sync::atomic::AtomicBool>>) {
         let mut running = self.running.lock_recover();
         for (_, old) in running.iter() {
@@ -787,13 +754,8 @@ impl EdgeServices {
     }
 }
 
-/**
- * @brief 가장자리 서비스가 지금 설정에서 어떤 모습이어야 하는지.
- *
- * @details 이름이 같으면 재시작하지 않는다. 설정값 하나라도 다르면 이름이 달라져 이전 것을
- *          멈추고 새로 시작한다.
- * @return (이름, 시작하는 함수) 목록. 꺼져 있는 서비스는 목록에 없다.
- */
+/// One key per enabled service. Any setting change alters the key, which restarts that service;
+/// an unchanged key leaves it running.
 fn edge_service_keys(cfg: &Config) -> Vec<String> {
     let mut keys = Vec::new();
     if cfg.dhcp_enable {
@@ -815,9 +777,10 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
     }
     if cfg.tftp_enable {
         keys.push(format!(
-            "tftp:{:?}:{}:{}:{:?}:{}",
+            "tftp:{:?}:{}:{:?}:{}:{:?}:{}",
             cfg.tftp_root,
             cfg.tftp_listen,
+            cfg.tftp_read_allow,
             cfg.tftp_writable,
             cfg.tftp_write_allow,
             cfg.tftp_allow_overwrite,
@@ -849,13 +812,10 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
     keys
 }
 
-/**
- * @brief 설정에 맞춰 가장자리 서비스를 시작하고 멈춘다.
- * @invariant 이전 스레드가 끝나기 전에 같은 포트를 열지 않는다. 임대 풀은 바꿔 끼우지 않고
- *            이어 쓴다. 관리 API와 DNS 계층이 같은 풀을 본다.
- * @return 설정이 틀리면 아무것도 멈추지 않고 실패. 포트를 열지 못하면 실패하며, 그때는
- *         호출한 쪽이 이전 설정으로 다시 불러야 한다.
- */
+/// Fails without stopping anything when the config is invalid. When a port cannot be opened it
+/// fails, and the caller must call again with the previous config. A port is never reopened
+/// before the previous thread ends, and the lease pool is kept, so the control API and the DNS
+/// layer see the same pool.
 pub(crate) fn reconcile_edge_services(
     cfg: &Config,
     services: &EdgeServices,
@@ -947,6 +907,7 @@ pub(crate) fn reconcile_edge_services(
                 tftp::spawn_tftp(
                     root.into(),
                     cfg.tftp_listen,
+                    cfg.tftp_read_allow.clone(),
                     cfg.tftp_writable,
                     cfg.tftp_write_allow.clone(),
                     cfg.tftp_allow_overwrite,
@@ -993,7 +954,6 @@ pub(crate) fn reconcile_edge_services(
 }
 
 #[cfg(test)]
-/** @brief 가장자리 서비스 구성과 임대 동기화. */
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -1003,7 +963,6 @@ mod tests {
     use crate::dhcp;
 
     #[test]
-    /** @brief DHCP 동적 범위가 서버나 게이트웨이 주소를 삼키면 시작 전에 거부하는지. */
     fn dhcp_range_excludes_server_and_router_addresses() {
         let base = Config {
             dhcp_server_ip: Some("192.168.1.1".into()),
@@ -1029,7 +988,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DHCP 임대 수명을 wire에서 자르지 않고 infinity를 JSON에서도 보존하는지. */
     fn dhcp_lease_lifetime_is_lossless_at_runtime_boundaries() {
         assert!(wire_dhcp_lease_secs(0).is_err());
         assert!(wire_dhcp_lease_secs(u64::from(u32::MAX) + 1).is_err());
@@ -1045,7 +1003,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장된 서버 DUID도 RFC의 3..=130바이트 경계를 정확히 지키는지. */
     fn persisted_server_duid_uses_the_exact_wire_length_range() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1071,7 +1028,6 @@ mod tests {
         std::fs::remove_file(duid_path).unwrap();
     }
 
-    /** @brief 테스트용 임대 기록. */
     fn lease_sync_pool() -> Arc<Mutex<dhcp::LeasePool>> {
         let dc = dhcp::DhcpConfig {
             server_ip: std::net::Ipv4Addr::new(192, 168, 1, 1),
@@ -1091,7 +1047,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당 API가 새 식별자 형식만 받고 opaque ID를 그대로 관리하는지. */
     fn static_reservation_api_uses_one_identity_model() {
         let pool = lease_sync_pool();
         assert!(apply_static_add(
@@ -1119,7 +1074,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 임대를 배치로도 하나씩도 받는지. */
     fn lease_sync_accepts_batch_and_single() {
         use onetdns_core::MutexExt;
         let pool = lease_sync_pool();
@@ -1150,7 +1104,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HA 동기화가 JSON 정밀도 밖의 infinity 만료 시각을 정확히 보존하는지. */
     fn lease_sync_preserves_infinite_expiry_exactly() {
         use onetdns_core::MutexExt;
         let pool = lease_sync_pool();
@@ -1164,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 하나라도 어긋나면 배치 전체를 거부하는지. 반쯤 받으면 기록이 어긋난다. */
+    /// A half-applied batch would leave the lease records inconsistent.
     fn lease_sync_rejects_whole_batch_on_any_bad_item() {
         use onetdns_core::MutexExt;
         let pool = lease_sync_pool();
@@ -1197,7 +1150,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 IP나 식별자를 중복한 HA 배치를 일부도 반영하지 않는지. */
     fn lease_sync_rejects_duplicate_ip_batch_atomically() {
         use onetdns_core::MutexExt;
         let pool = lease_sync_pool();
@@ -1222,7 +1174,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 번에 받는 임대 수에 상한이 있는지. */
     fn lease_sync_bounds_batch_size() {
         let pool = lease_sync_pool();
         let expiry = crate::unix_now() + 3_600;
@@ -1239,7 +1190,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 사용자가 DHCPv6 임대 수명을 바꾸면 실행 중 서버가 새 설정으로 교체되는지. */
     fn dhcp6_lease_lifetime_changes_edge_service_identity() {
         let mut cfg = Config {
             dhcp6_enable: true,
@@ -1255,7 +1205,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DHCPv6 multicast 링크를 바꾸면 이전 socket을 새 인터페이스로 교체하는지. */
     fn dhcp6_interface_changes_edge_service_identity() {
         let mut cfg = Config {
             dhcp6_enable: true,

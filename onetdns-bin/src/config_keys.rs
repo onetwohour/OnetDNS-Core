@@ -1,112 +1,64 @@
-/*!
- * @brief 설정 키마다 실행 중 서버가 그 값을 다루는 방식을 정한 표.
- *
- * @details 키 하나에 세 가지를 정한다. 값을 바꿨을 때 무엇을 교체하는지, 클러스터가 그
- *          값을 공유하는지, 그리고 어느 빠른 경로를 닫는지다. 행을 만드는 매크로가 셋을 모두
- *          인자로 받으므로 키를 추가하면서 하나라도 정하지 않으면 컴파일되지 않는다.
- *
- *          매크로는 키 이름을 Config 필드로 받아 그 필드를 비교하는 함수도 만든다. 설정에서
- *          무엇이 바뀌었는지는 키마다 이 함수로 판정한다. 필드와 이름이 다른 키는 컴파일되지
- *          않으므로, 바뀌었는데 이름을 댈 수 없는 변경은 생기지 않는다.
- *
- *          이 판단이 여러 목록에 흩어져 있으면 새 키를 어느 목록에 빠뜨려도 아무것도
- *          실패하지 않는다. 빠른 경로 조건에서 빠지면 캐시가 그 기능을 거치지 않은 답을
- *          내고, 노드별 목록에서 빠지면 한 노드의 값이 클러스터 전체를 덮어쓴다.
- * @invariant 표의 키 집합은 onetdns_config::known_keys 와 정확히 같다. 테스트가 강제한다.
- */
+//! One row per config key: what a change swaps in, whether the cluster shares the value, and
+//! which fast paths it closes. The `key!` macro takes all three, so a new key without them does
+//! not compile, and it builds the field comparison that tells which keys changed. Keeping these
+//! in separate lists would let a new key go missing from one without any failure.
 
 use crate::native_config::LaneFacts;
 use onetdns_config::{BackendKind, Config, EcsMode};
 use onetdns_core::IpNet;
 
-/**
- * @brief 값이 바뀌었을 때 세대를 새로 만들지 않고 교체하는 부분.
- * @details 순서는 이름의 알파벳 순이다. 바뀐 그룹 목록을 정렬해서 다루므로 순서를 바꾸면
- *          그 목록의 순서도 바뀐다.
- */
+/// Parts swapped without a new generation. Sorted by name; changed groups are handled in sorted
+/// order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ApplyGroup {
-    /** @brief 접근 제어 목록을 교체한다. */
     Acl,
-    /**
-     * @brief 교체할 것이 없다.
-     * @details ACME 발급은 관리 API 로 시킬 때만 돌고, 그때 실행 중 설정을 읽는다.
-     */
+    /// Nothing to swap: ACME issuance runs only when asked through the control API and reads the
+    /// running config then.
     Acme,
-    /** @brief 권한 영역 저장소를 다시 만들고 원본 감시 작업을 설정에 맞춘다. */
     Authority,
-    /** @brief 차단 응답의 TTL 을 바꾼다. */
     BlockTtl,
-    /** @brief 해석 체인을 새로 만들어 슬롯에 교체한다. 소켓과 스레드는 그대로 둔다. */
+    /// Rebuilds the resolver chain into its slot; sockets and threads stay.
     Chain,
-    /** @brief 클러스터 수신 주소와 합의 런타임만 다시 연다. */
+    /// Reopens only the cluster listener and the consensus runtime.
     Cluster,
-    /** @brief 관리 화면 계정을 교체한다. */
     ConsoleAccounts,
-    /** @brief 관리 토큰을 교체한다. */
     ControlTokens,
-    /** @brief DNSSEC 검증에 쓰는 시계 정책을 바꾼다. */
+    /// Clock policy for DNSSEC validation.
     DnssecClock,
-    /**
-     * @brief DHCP, DHCPv6, 라우터 광고, TFTP 서비스만 재시작한다.
-     * @details 이 서비스들은 DNS 와 다른 소켓을 쓰므로 이름 해석은 끊기지 않는다.
-     */
+    /// Restarts only DHCP, DHCPv6, router advertisements and TFTP; they use their own sockets, so
+    /// name resolution continues.
     EdgeServices,
-    /** @brief 차단 엔진을 교체한다. */
     Filter,
-    /** @brief 전달 경로를 교체한다. */
     Forward,
-    /**
-     * @brief 수신 주소를 열고 닫는다.
-     * @details 새 주소를 모두 연 뒤에 빠진 주소를 닫는다.
-     */
+    /// Opens every new address before closing removed ones.
     Listeners,
-    /** @brief 로컬 응답의 TTL 을 바꾼다. */
     LocalTtl,
-    /** @brief 로그 수준을 바꾼다. */
     Log,
-    /** @brief MAC 제조사 데이터베이스를 다시 읽는다. */
     MacVendor,
-    /** @brief 화면에 보이는 정보만 바뀐다. */
+    /// Only what is shown on screen changes.
     Metadata,
-    /** @brief 질의마다 읽는 응답 기능 세트를 교체한다. */
+    /// The response feature set read per query.
     Native,
-    /** @brief 질의 로그와 통계를 저장하는 파일을 바꾼다. */
     Persistence,
-    /** @brief 정책 엔진을 교체한다. */
     Policy,
-    /** @brief 질의 로그 설정을 바꾼다. */
     QueryLog,
-    /** @brief 업스트림으로 나가는 출발 주소를 바꾼다. */
+    /// Source address for upstream queries.
     QuerySource,
-    /** @brief 속도 제한기를 교체한다. */
     RateLimit,
-    /**
-     * @brief 교체할 것이 없다.
-     * @details 주기 확인이 확인할 때마다 실행 중 설정을 읽는다.
-     */
+    /// Nothing to swap: the periodic check reads the running config each time.
     ReleaseCheck,
-    /** @brief 업스트림 TLS 인증서 폐기 확인 정책을 다시 설치한다. */
     Revocation,
-    /** @brief 안전 검색 설정을 바꾼다. */
     SafeSearch,
-    /** @brief 차단 목록 구독을 다시 받는다. */
     Subscriptions,
-    /**
-     * @brief 수신 소켓은 그대로 두고 인증서 슬롯만 교체한다.
-     * @details 이미 맺힌 연결은 이전 인증서로 이어지고 다음 연결부터 새 인증서를 쓴다.
-     */
+    /// Swaps only the certificate slot: open connections keep the old certificate, new ones get
+    /// the new one.
     Tls,
-    /** @brief 클라이언트별 뷰를 교체한다. */
     Views,
 }
 
 impl ApplyGroup {
-    /**
-     * @brief 이 그룹을 교체할 때 함께 다시 만들어야 하는 그룹.
-     * @details 가장자리 서비스를 다시 띄우면 DHCP 임대 풀이 새로 만들어지는데, 해석 체인의 DHCP
-     *          DNS 계층이 체인을 만들 때 그 풀을 붙잡는다.
-     */
+    /// Restarting edge services creates a new DHCP lease pool, and the chain's DHCP DNS layer holds
+    /// the pool it was built with.
     pub(crate) fn also_rebuilds(self) -> Option<ApplyGroup> {
         match self {
             ApplyGroup::EdgeServices => Some(ApplyGroup::Chain),
@@ -115,36 +67,27 @@ impl ApplyGroup {
     }
 }
 
-/** @brief 이전 설정과 새 설정을 받아, 세대를 새로 만들지 않고 반영할 수 있는지 정한다. */
+/// Whether the change from the first config to the second can be applied without a new
+/// generation.
 pub(crate) type Swappable = fn(&Config, &Config) -> bool;
 
-/** @brief 값이 바뀌었을 때 실행 중 서버가 반영하는 방법. */
 #[derive(Clone, Copy)]
 pub(crate) enum Reload {
-    /** @brief 이 그룹만 교체한다. */
     Hot(ApplyGroup),
-    /**
-     * @brief 조건이 참이면 이 그룹만 교체하고, 거짓이면 세대를 새로 만든다.
-     * @details 조건은 이 키가 아닌 다른 키만 읽는다. 그래서 지금 설정에서 이 키 하나만 바꿀 때의
-     *          판정은 지금 설정만 보고 미리 낼 수 있다.
-     */
+    /// Swaps the group when the condition holds, otherwise starts a new generation. The condition
+    /// reads only other keys, so changing this key alone can be judged from the current config.
     HotWhile(ApplyGroup, Swappable),
-    /**
-     * @brief 조건이 참이면 이 그룹만 교체하고, 거짓이면 세대를 새로 만든다.
-     * @details 조건이 이 키의 새 값을 읽으므로, 무엇으로 바꾸는지 보기 전에는 판정할 수 없다.
-     */
+    /// Swaps the group when the condition holds, otherwise starts a new generation. The condition
+    /// reads this key's new value, so it cannot be judged before the value is known.
     HotIf(ApplyGroup, Swappable),
-    /**
-     * @brief 세대를 새로 만든다.
-     * @details 권한을 낮추는 동작은 한 프로세스 안에서 되돌릴 수 없고, 스레드를 띄우기 전에만
-     *          할 수 있다. 그래서 새 세대는 값이 프로세스의 지금 사용자와 같은지만 확인하고,
-     *          다르면 실패해 마지막 설정으로 돌아간다.
-     */
+    /// Dropping privileges cannot be undone within a process and works only before threads start,
+    /// so a new generation only checks that the value matches the current user and otherwise fails
+    /// back to the last config.
     NewGeneration,
 }
 
 impl Reload {
-    /** @brief 교체할 그룹. 세대를 새로 만들어야 하면 없다. */
+    /// `None` when a new generation is needed.
     fn group(self) -> Option<ApplyGroup> {
         match self {
             Reload::Hot(group) | Reload::HotWhile(group, _) | Reload::HotIf(group, _) => {
@@ -155,21 +98,16 @@ impl Reload {
     }
 }
 
-/** @brief 클라이언트별 업스트림 경로가 있는지. */
 pub(crate) fn has_client_routes(cfg: &Config) -> bool {
     cfg.clients
         .iter()
         .any(|client| !client.upstreams.is_empty())
 }
 
-/**
- * @brief 클라이언트 경로와 MAC 식별이 교체할 수 있는 범위에서만 바뀌었는지.
- * @details 클라이언트 경로마다 전달기와 체인을 세대를 시작할 때 만들고 교체하지 않으므로, 경로의
- *          식별 기준이나 업스트림이 바뀌면 세대를 새로 만든다. MAC 으로 식별하는 클라이언트가
- *          처음 생길 때도 그렇다. MAC 조회는 그런 클라이언트가 있을 때만 세대를 시작하면서 켠다.
- */
+/// Client route forwarders and chains are built at generation start and never swapped, so a
+/// change to a route's match or upstreams needs a new generation, as does the first client
+/// matched by MAC: MAC lookup is enabled only at generation start.
 fn clients_swappable(previous: &Config, next: &Config) -> bool {
-    /** @brief 경로마다 식별 기준과 업스트림. */
     fn routes(cfg: &Config) -> Vec<(&[IpNet], &[String], &[String], &[String])> {
         cfg.clients
             .iter()
@@ -188,56 +126,43 @@ fn clients_swappable(previous: &Config, next: &Config) -> bool {
     routes(previous) == routes(next) && (uses_mac(previous) || !uses_mac(next))
 }
 
-/**
- * @brief 클라이언트 경로가 없는지.
- * @details 클라이언트 경로의 전달기는 세대를 시작할 때 질의 제한 시간과 업스트림 전략을 복사하고
- *          교체하지 않는다. 기본 전달기와 재귀 리졸버, 스텁과 예비 업스트림의 전달기는 교체할 때
- *          새 값으로 다시 만든다.
- */
+/// Client route forwarders copy the query timeout and upstream strategy at generation start and
+/// are not swapped; the default forwarder, the recursive resolver, stubs and fallback upstreams
+/// are rebuilt with the new values.
 fn without_client_routes(previous: &Config, next: &Config) -> bool {
     !has_client_routes(previous) && !has_client_routes(next)
 }
 
-/** @brief Raft 클러스터에서 이 값을 복제하는지. */
+/// Whether the Raft cluster replicates the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /** @brief 클러스터가 공유한다. 리더가 바꾸면 모든 노드에 복제된다. */
+    /// Replicated to every node when the leader changes it.
     Shared,
-    /**
-     * @brief 노드마다 따로 둔다.
-     * @details 세 종류다. 비밀 값은 복제하면 한 노드가 유출될 때 전부 유출된다. 수신 주소,
-     *          노드 ID, 인증서, DHCP 같은 노드 고유 값은 복제하면 ID 가 겹치거나 없는 주소에
-     *          바인딩하려다 서비스가 뜨지 않는다. 로컬 파일 경로와 권한 영역 저장소는 같은
-     *          경로가 다른 노드에 있다는 보장이 없고, 권한 영역은 영역 전송으로 따로
-     *          동기화한다.
-     */
+    /// Kept per node. Secrets, since replicating them makes one leaked node leak all. Node-specific
+    /// values such as listen addresses, node ID, certificates and DHCP, which would collide or fail
+    /// to bind elsewhere. Local file paths and authority stores, which need not exist on other
+    /// nodes; zones sync by zone transfer instead.
     Node,
 }
 
-/**
- * @brief 지금 설정에서 이 키가 빠른 경로를 닫는지.
- * @details 설정만으로 알 수 없는 사실은 facts 로 받는다.
- */
+/// Whether the key closes a fast path under this config; facts not in the config come in
+/// `LaneFacts`.
 pub(crate) type Blocks = fn(&Config, &LaneFacts) -> bool;
 
-/**
- * @brief 키 하나가 세 빠른 경로 각각을 닫는 조건.
- * @details 조건이 없다는 것은 그 키의 값이 해당 경로가 내는 응답을 바꾸지 않는다는 뜻이다.
- *          wire 경로는 적중할 때 ACL, 속도 제한, 필터를 현재 세대로 다시 평가하므로 그 셋에
- *          속한 키는 wire 경로를 닫지 않는다.
- */
+/// The condition under which a key closes each fast path; `None` means its value does not
+/// change that path's responses. The wire path reevaluates ACL, rate limits and filters with the
+/// current generation on a hit, so their keys leave it open.
 #[derive(Clone, Copy)]
 pub(crate) struct Lanes {
-    /** @brief 캐시 적중 UDP 빠른 경로. */
+    /// UDP fast path for cache hits.
     pub(crate) wire: Option<Blocks>,
-    /** @brief 캐시에 없는 재귀 질의를 처리하는 reactor 레인. */
+    /// Lane for recursive queries not in the cache.
     pub(crate) reactor: Option<Blocks>,
-    /** @brief 권한 응답 wire 빠른 경로. */
+    /// Wire fast path for authoritative answers.
     pub(crate) authority: Option<Blocks>,
 }
 
 impl Lanes {
-    /** @brief 어느 빠른 경로도 닫지 않는다. */
     const OPEN: Self = Self {
         wire: None,
         reactor: None,
@@ -245,7 +170,7 @@ impl Lanes {
     };
 }
 
-/** @brief wire 경로만 닫는다. reactor 레인은 wire 경로가 열려 있어야 켜지므로 함께 닫힌다. */
+/// The reactor lane needs the wire path open, so it closes too.
 const fn wire(blocks: Blocks) -> Lanes {
     Lanes {
         wire: Some(blocks),
@@ -253,10 +178,8 @@ const fn wire(blocks: Blocks) -> Lanes {
     }
 }
 
-/**
- * @brief reactor 레인만 닫는다.
- * @details 응답은 요청 내용만으로 정해지지만 reactor 레인이 구현하지 않은 해석 기능이다.
- */
+/// For resolution features the reactor lane does not implement, even when the answer depends
+/// only on the request.
 const fn reactor(blocks: Blocks) -> Lanes {
     Lanes {
         reactor: Some(blocks),
@@ -264,7 +187,6 @@ const fn reactor(blocks: Blocks) -> Lanes {
     }
 }
 
-/** @brief wire 경로와 권한 경로를 함께 닫는다. */
 const fn wire_and_authority(blocks: Blocks) -> Lanes {
     Lanes {
         wire: Some(blocks),
@@ -273,12 +195,9 @@ const fn wire_and_authority(blocks: Blocks) -> Lanes {
     }
 }
 
-/**
- * @brief reactor 레인과 권한 경로를 닫는다.
- * @details 해석한 답의 주소를 거르는 기능이다. 두 경로는 거르지 않은 답을 그대로 내보낸다.
- *          wire 경로는 일반 경로가 거른 응답만 담고 이 값이 바뀌면 세대가 올라 이전 항목이
- *          나가지 않으므로 열어 둔다.
- */
+/// For features that filter addresses in resolved answers; both paths would send answers
+/// unfiltered. The wire path stays open: it holds only answers the normal path filtered, and a
+/// change bumps the generation so old entries are not served.
 const fn reactor_and_authority(blocks: Blocks) -> Lanes {
     Lanes {
         wire: None,
@@ -287,24 +206,15 @@ const fn reactor_and_authority(blocks: Blocks) -> Lanes {
     }
 }
 
-/** @brief 설정 키 하나에 대한 결정. */
 pub(crate) struct KeySpec {
-    /** @brief 설정 키 이름. */
     pub(crate) key: &'static str,
-    /** @brief 값이 바뀌었을 때 반영하는 방법. */
     pub(crate) reload: Reload,
-    /** @brief 클러스터 공유 여부. */
     pub(crate) scope: Scope,
-    /** @brief 빠른 경로를 닫는 조건. */
     pub(crate) lanes: Lanes,
-    /** @brief 두 설정에서 이 키의 값이 다른지. */
     changed: fn(&Config, &Config) -> bool,
 }
 
-/**
- * @brief 행 하나를 만든다.
- * @details 키 이름을 Config 필드로 받아, 그 필드를 비교하는 함수를 함께 만든다.
- */
+/// Takes the key name as a `Config` field and builds the comparison of that field.
 macro_rules! key {
     ($field:ident, $reload:expr, $scope:expr, $lanes:expr $(,)?) => {
         KeySpec {
@@ -317,29 +227,28 @@ macro_rules! key {
     };
 }
 
-/** @brief 키에 대한 결정. 알 수 없는 키면 없다. */
+/// `None` for an unknown key.
 pub(crate) fn spec(name: &str) -> Option<&'static KeySpec> {
     KEYS.iter().find(|spec| spec.key == name)
 }
 
-/** @brief 이 키를 바꿨을 때 교체하는 그룹. 세대를 새로 만들어야 하거나 알 수 없는 키면 없다. */
+/// `None` when a new generation is needed or the key is unknown.
 pub(crate) fn hot_group(name: &str) -> Option<ApplyGroup> {
     spec(name)?.reload.group()
 }
 
-/** @brief 세대를 새로 만들지 않고 바꿀 수 있는 키인지. */
 pub(crate) fn is_hot(name: &str) -> bool {
     hot_group(name).is_some()
 }
 
-/** @brief 세대를 새로 만들지 않고 바꿀 수 있는 키들. 표 순서를 따른다. */
+/// In table order.
 pub(crate) fn hot_keys() -> impl Iterator<Item = &'static str> {
     KEYS.iter()
         .filter(|spec| spec.reload.group().is_some())
         .map(|spec| spec.key)
 }
 
-/** @brief 두 설정에서 값이 다른 키들. 표 순서를 따른다. */
+/// In table order.
 pub(crate) fn changed_keys<'a>(
     previous: &'a Config,
     next: &'a Config,
@@ -349,10 +258,7 @@ pub(crate) fn changed_keys<'a>(
         .map(|spec| spec.key)
 }
 
-/**
- * @brief 이 키의 변화를 세대를 새로 만들지 않고 반영할 수 있는지. 알 수 없는 키면 거짓이다.
- * @details 함께 바뀐 다른 키가 체인을 다시 만드는지는 보지 않는다.
- */
+/// False for an unknown key. Ignores whether other changed keys rebuild the chain.
 pub(crate) fn swappable(name: &str, previous: &Config, next: &Config) -> bool {
     spec(name).is_some_and(|spec| match spec.reload {
         Reload::Hot(_) => true,
@@ -361,11 +267,9 @@ pub(crate) fn swappable(name: &str, previous: &Config, next: &Config) -> bool {
     })
 }
 
-/**
- * @brief 지금 설정에서 이 키 하나만 바꿔도 키의 조건 때문에 세대를 새로 만들 수 있는지.
- * @details HotWhile 의 조건은 이 키를 읽지 않으므로, 지금 설정을 이전 설정과 새 설정 양쪽에 넣은
- *          판정이 이 키 하나만 바꿀 때의 판정과 같다. HotIf 의 조건은 새 값을 읽으므로 늘 참이다.
- */
+/// Whether changing only this key could need a new generation under the current config.
+/// `HotWhile` conditions do not read the key, so judging with the current config on both sides
+/// matches changing it alone; `HotIf` conditions read the new value, so this is always true.
 pub(crate) fn may_need_new_generation(name: &str, now: &Config) -> bool {
     spec(name).is_some_and(|spec| match spec.reload {
         Reload::Hot(_) => false,
@@ -374,29 +278,23 @@ pub(crate) fn may_need_new_generation(name: &str, now: &Config) -> bool {
     })
 }
 
-/**
- * @brief 노드마다 따로 두고 클러스터가 복제하지 않는 키인지.
- * @details 복제 요청의 키는 관리 API 입력이다. 대소문자만 바꾼 키가 이 검사를 지나 공유
- *          설정으로 제안되지 않도록 소문자로 맞춰 찾는다. 알 수 없는 키는 공유로 보며,
- *          설정을 해석하는 단계에서 거부된다.
- */
+/// Keys come from control API input, so lookup is lowercased; a key differing only in case must
+/// not pass as shared config. Unknown keys count as shared and are rejected when the config is
+/// parsed.
 pub(crate) fn node_local(name: &str) -> bool {
     spec(&name.to_ascii_lowercase()).is_some_and(|spec| spec.scope == Scope::Node)
 }
 
-/** @brief 세 빠른 경로 중 하나. */
 #[derive(Clone, Copy)]
 pub(crate) enum Lane {
-    /** @brief 캐시 적중 UDP 빠른 경로. */
+    /// UDP fast path for cache hits.
     Wire,
-    /** @brief reactor 레인. */
     Reactor,
-    /** @brief 권한 응답 wire 빠른 경로. */
+    /// Wire fast path for authoritative answers.
     Authority,
 }
 
 impl Lanes {
-    /** @brief 그 경로를 닫는 조건. */
     fn get(&self, lane: Lane) -> Option<Blocks> {
         match lane {
             Lane::Wire => self.wire,
@@ -406,7 +304,6 @@ impl Lanes {
     }
 }
 
-/** @brief 이 설정에서 그 경로를 닫는 키가 하나도 없는지. */
 pub(crate) fn lane_unblocked(lane: Lane, cfg: &Config, facts: &LaneFacts) -> bool {
     KEYS.iter()
         .filter_map(|spec| spec.lanes.get(lane))
@@ -417,7 +314,7 @@ use ApplyGroup::*;
 use Reload::{Hot, HotIf, HotWhile, NewGeneration};
 use Scope::{Node, Shared};
 
-/** @brief 모든 설정 키. 순서는 onetdns_config::known_keys 를 따른다. */
+/// In `onetdns_config::known_keys` order.
 static KEYS: &[KeySpec] = &[
     key!(mode, Hot(Metadata), Shared, Lanes::OPEN),
     key!(
@@ -832,6 +729,7 @@ static KEYS: &[KeySpec] = &[
     key!(tftp_enable, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(tftp_root, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(tftp_listen, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(tftp_read_allow, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(tftp_writable, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(tftp_write_allow, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(tftp_allow_overwrite, Hot(EdgeServices), Node, Lanes::OPEN),
@@ -936,10 +834,7 @@ mod tests {
     use super::*;
 
     #[test]
-    /**
-     * @brief 표가 설정 키를 빠짐없이 한 번씩, 설정 키 목록의 순서대로 담는지.
-     * @details 관리 API 가 내는 키 목록은 표 순서를 따른다.
-     */
+    /// The control API lists keys in table order.
     fn table_covers_every_known_key_once() {
         let table: Vec<&str> = KEYS.iter().map(|spec| spec.key).collect();
         let mut unique = table.clone();
@@ -953,7 +848,6 @@ mod tests {
         );
     }
 
-    /** @brief 그 경로를 닫을 수 있는 키들. 표 순서를 따른다. */
     fn blockers(lane: Lane) -> Vec<&'static str> {
         KEYS.iter()
             .filter(|spec| spec.lanes.get(lane).is_some())
@@ -962,11 +856,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 빠른 경로를 닫는 키가 말없이 줄지 않는지.
-     * @details 조건이 빠진 키는 그 기능이 없는 것처럼 답이 나간다. 목록에서 빼려면 그 키의
-     *          값이 응답을 요청 내용만으로 정한다는 것을 먼저 보여야 한다.
-     */
+    /// A key whose condition goes missing answers as if its feature did not exist; dropping one
+    /// needs proof that its value leaves responses determined by the request alone.
     fn lane_blockers_are_pinned() {
         assert_eq!(
             blockers(Lane::Wire),
@@ -1044,7 +935,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 세대를 새로 만들어야 하는 키가 권한 강등 두 키뿐인지. */
     fn only_privilege_drop_needs_a_new_generation() {
         let cold: Vec<&str> = KEYS
             .iter()

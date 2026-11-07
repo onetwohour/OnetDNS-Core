@@ -4,7 +4,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -588,10 +588,19 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
     }
 }
 
-/// Each request gets its own transfer socket. Writes are accepted only from `write_allow`.
+/// Loopback, or an address inside one of `nets`.
+fn source_allowed(source: IpAddr, nets: &[IpNet]) -> bool {
+    let source = source.to_canonical();
+    source.is_loopback() || nets.iter().any(|net| net.contains(&source))
+}
+
+/// Each request gets its own transfer socket. A request from outside the list for its operation
+/// is dropped without a reply before it takes a transfer slot, since the source of a UDP request
+/// can be forged.
 pub fn spawn_tftp(
     root: PathBuf,
     listen: SocketAddr,
+    read_allow: Vec<IpNet>,
     writable: bool,
     write_allow: Vec<IpNet>,
     allow_overwrite: bool,
@@ -602,7 +611,6 @@ pub fn spawn_tftp(
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
     let transfer_bind = SocketAddr::new(sock.local_addr()?.ip(), 0);
     let active = Arc::new(AtomicUsize::new(0));
-    let write_allow = Arc::new(write_allow);
     std::thread::Builder::new().name("tftp".into()).spawn(move || {
         let mut buf = [0u8; 1024];
         let mut transfers = Vec::new();
@@ -620,14 +628,29 @@ pub fn spawn_tftp(
                     continue;
                 }
             };
+            let may_read = source_allowed(client.ip(), &read_allow);
+            let may_write = source_allowed(client.ip(), &write_allow);
             let request = match parse_request(&buf[..n]) {
                 Ok(request) => request,
                 Err(error) => {
                     onetdns_core::debug!(event = "tftp.request_invalid", %client, %error, "Rejected a malformed TFTP request");
-                    let _ = sock.send_to(&error_packet(4, "Unsupported TFTP request"), client);
+                    if may_read || may_write {
+                        let _ = sock.send_to(&error_packet(4, "Unsupported TFTP request"), client);
+                    }
                     continue;
                 }
             };
+            let (allowed, operation, list) = match request.0 {
+                Op::Read => (may_read, "read", "tftp_read_allow"),
+                Op::Write => (may_write, "write", "tftp_write_allow"),
+            };
+            if !allowed {
+                static SOURCE_REFUSED: AtomicU64 = AtomicU64::new(0);
+                if let Some(count) = sampled(&SOURCE_REFUSED) {
+                    onetdns_core::warn!(event = "tftp.source_refused", %client, operation = operation, list = list, count = count, "Dropped a TFTP request from an address outside the allowed list");
+                }
+                continue;
+            }
             if active
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                     (n < MAX_TRANSFERS).then_some(n + 1)
@@ -656,7 +679,6 @@ pub fn spawn_tftp(
             let root = root.clone();
             let active_worker = active.clone();
             let transfer_shutdown = shutdown.clone();
-            let write_allow = write_allow.clone();
             let spawn = std::thread::Builder::new()
                 .name("tftp-transfer".into())
                 .spawn(move || {
@@ -683,14 +705,10 @@ pub fn spawn_tftp(
                             }
                         },
                         (Op::Write, name) => {
-
-                            let src_ok = write_allow.is_empty()
-                                || write_allow.iter().any(|n| n.contains(&client.ip()));
-                            if !writable || !src_ok {
+                            if !writable {
                                 static WRITE_REJECTED: AtomicU64 = AtomicU64::new(0);
-                                let reason = if writable { "source_not_allowed" } else { "write_disabled" };
                                 if let Some(count) = sampled(&WRITE_REJECTED) {
-                                    onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, reason = reason, count = count, "Rejected a TFTP write request that is not allowed");
+                                    onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, count = count, "Rejected a TFTP write request because tftp_writable is off");
                                 }
                                 let _ = xfer.send_to(&error_packet(2, "Write not permitted"), client);
                             } else {
@@ -764,6 +782,26 @@ mod tests {
 
         let bad = vec![0, 9u8, b'x', 0];
         assert!(parse_request(&bad).is_err());
+    }
+
+    #[test]
+    fn only_loopback_and_listed_sources_are_served() {
+        let lan: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+        for (source, nets, allowed) in [
+            ("127.0.0.1", &[][..], true),
+            ("::1", &[][..], true),
+            ("192.168.1.20", &[][..], false),
+            ("192.168.1.20", &lan[..], true),
+            ("::ffff:192.168.1.20", &lan[..], true),
+            ("192.168.2.20", &lan[..], false),
+            ("2001:db8::20", &lan[..], false),
+        ] {
+            assert_eq!(
+                source_allowed(source.parse().unwrap(), nets),
+                allowed,
+                "{source} in {nets:?}"
+            );
+        }
     }
 
     #[test]
