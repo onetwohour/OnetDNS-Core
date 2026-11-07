@@ -1,9 +1,8 @@
-/*!
- * @brief 권한 영역 요청. AXFR, IXFR, NOTIFY, UPDATE를 처리하고 TSIG를 검증하며 영역 변경을 기록한다.
- */
+//! Authoritative requests: AXFR, IXFR, NOTIFY and UPDATE, with TSIG checks and the zone change
+//! journal.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use onetdns_control::Action;
@@ -18,23 +17,20 @@ use crate::native::query::{advertised_udp_payload, base_edns};
 use crate::native::response::{base_response, edns_error_resp, error_resp, finalize, now_unix};
 use crate::native::{NativeServer, DDR_OWNER_WIRE, EMPTY_OPT_WIRE_LEN, SERVER_UDP_MAX};
 
-/** @brief 검증에 쓴 키와 그 결과. 응답에도 같은 키로 서명해야 한다. */
+/// The key a request was verified with; the response must be signed with the same key.
 type TsigContext = (
     onetdns_dnssec::tsig::TsigKey,
     onetdns_dnssec::tsig::VerifiedTsig,
 );
 
 #[derive(Default)]
-/** @brief 업스트림 서버가 바뀌었다고 알려 온 영역들. */
+/// Zones a primary reported changed, waiting for a refresh.
 pub struct NotifyKick {
-    /** @brief 다시 받아 와야 할 영역들. */
     pending: std::sync::Mutex<HashSet<String>>,
-    /** @brief 기다리는 쪽을 깨우는 곳. */
     wake: std::sync::Condvar,
 }
 
 impl NotifyKick {
-    /** @brief 이 영역을 다시 받아 오라고 알린다. */
     pub fn push(&self, origin: String) {
         let inserted = self.pending.lock_recover().insert(origin);
         if inserted {
@@ -42,7 +38,7 @@ impl NotifyKick {
         }
     }
 
-    /** @brief 알림이 올 때까지 기다렸다 가져간다. */
+    /// Waits up to `timeout` for a push, then takes every pending zone.
     pub fn wait_take(&self, timeout: std::time::Duration) -> HashSet<String> {
         let mut pending = self.pending.lock_recover();
         if pending.is_empty() {
@@ -56,31 +52,26 @@ impl NotifyKick {
 }
 
 #[derive(Clone)]
-/** @brief 누가 무엇을 고칠 수 있는지 정한 규칙 하나. */
+/// One rule on who may change what.
 pub struct UpdateRule {
-    /** @brief 허용인지 거절인지. */
     grant: bool,
-    /** @brief 이 키로 서명한 요청에만 걸린다. 없으면 모두. */
+    /// Only requests signed with this key; `None` matches all.
     identity: Option<ApName>,
-    /** @brief 이 이름 범위에만 걸린다. */
     name: UpdateRuleName,
-    /** @brief 이 기록 종류에만 걸린다. 비면 전부. */
+    /// Empty matches every type.
     types: Vec<u16>,
 }
 
 #[derive(Clone)]
-/** @brief 규칙이 걸린 이름의 범위. */
 enum UpdateRuleName {
-    /** @brief 어느 이름이든. */
     Any,
-    /** @brief 이 이름에만. */
     Exact(ApName),
-    /** @brief 이 이름과 그 아래 전부. */
+    /// The name and everything below it.
     Subtree(ApName),
 }
 
 impl UpdateRule {
-    /** @brief 규칙 하나를 만든다. 이름이 틀리면 없다. */
+    /// `None` when the name is malformed.
     pub fn new(grant: bool, identity: &str, name: &str, types: Vec<u16>) -> Option<Self> {
         let raw_identity = identity.trim();
         if raw_identity != "*" && raw_identity.contains('*') {
@@ -119,12 +110,10 @@ impl UpdateRule {
     }
 }
 
-/** @brief 이 이름이 그 접미사로 끝나는지. */
 pub(crate) fn name_ends_with(name: &ApName, suffix: &ApName) -> bool {
     name.ends_with_ignore_case(suffix)
 }
 
-/** @brief 이 이름이 규칙 범위에 드는지. */
 fn update_name_matches(rule_name: &UpdateRuleName, qname: &ApName) -> bool {
     match rule_name {
         UpdateRuleName::Any => true,
@@ -135,11 +124,8 @@ fn update_name_matches(rule_name: &UpdateRuleName, qname: &ApName) -> bool {
     }
 }
 
-/**
- * @brief 이 업데이트를 허용할지.
- * @warning 규칙이 없으면 거절한다. 기본을 허용으로 두면 규칙을 안 적은 영역이 전부
- *          열린다.
- */
+/// The first matching rule decides. With none the update is denied: a default grant would open
+/// every zone that has no rules.
 fn update_granted(
     rules: &[UpdateRule],
     identity: Option<&ApName>,
@@ -160,22 +146,21 @@ fn update_granted(
     false
 }
 
-/** @brief 내용이 빈 기록인지. 지우라는 뜻이다. */
+/// An empty RDATA means delete.
 fn update_rdata_is_empty(record: &ApRecord) -> bool {
     matches!(&record.rdata, ApRData::Unknown(rtype, bytes) if *rtype == record.rtype.0 && bytes.is_empty())
 }
 
-/** @brief 기록 내용을 비교할 키. */
 fn update_rdata_key(record: &ApRecord) -> Vec<u8> {
     onetdns_dnssec::canonical_rdata(&record.rdata)
 }
 
-/** @brief 밖에서 고치면 안 되는 기록 종류인지. 서명이나 부재 증명을 밖에서 넣게 두면 검증이 깨진다. */
+/// Signatures and denial proofs: letting an update insert them would break validation.
 fn prohibited_update_type(rtype: ApRt) -> bool {
     matches!(rtype.0, 0 | 41 | 249..=254)
 }
 
-/** @brief WKS RDATA 앞부분의 주소 4바이트와 프로토콜 1바이트. 짧으면 있는 만큼만 쓴다. */
+/// The 4-byte address and 1-byte protocol at the start of WKS RDATA, or what there is of them.
 fn wks_endpoint(record: &ApRecord) -> &[u8] {
     match &record.rdata {
         ApRData::Unknown(11, bytes) => &bytes[..bytes.len().min(5)],
@@ -183,14 +168,9 @@ fn wks_endpoint(record: &ApRecord) -> &[u8] {
     }
 }
 
-/**
- * @brief 갱신 RR 이 같은 이름·종류의 기존 RR을 대체하는지.
- *
- * @details RFC 2136은 CNAME 과 SOA 를 하나만 둘 수 있는 종류로 보고, WKS 는 주소와
- *          프로토콜이 같으면 같은 위치로 본다. 나머지는 내용이 같을 때만 대체하고 다르면
- *          RRSet 에 덧붙인다.
- * @return 기존 RR을 덮어써야 하면 참.
- */
+/// RFC 2136 allows one CNAME and one SOA per name, and treats WKS with the same address and
+/// protocol as the same record. Other types replace only an identical record; a different one
+/// joins the RRset.
 fn update_replaces(incoming: &ApRecord, existing: &ApRecord) -> bool {
     if incoming.rtype == ApRt::CNAME || incoming.rtype == ApRt::SOA {
         return true;
@@ -201,16 +181,9 @@ fn update_replaces(incoming: &ApRecord, existing: &ApRecord) -> bool {
     incoming.rdata == existing.rdata
 }
 
-/**
- * @brief 갱신이 담은 SOA 가 현재보다 뒤로 가지 않는지.
- *
- * @details RFC 2136은 일련번호를 되돌리는 SOA 교체를 조용히 무시하라고 정하고, 비교를
- *          RFC 1982 모듈로 산술로 고정한다. 같은 값은 되돌리는 것이 아니므로 통과시키고,
- *          그 경우 실제로 바뀐 것이 없어 뒤에서 서버가 하나 올린다.
- * @param current  지금 영역에 있는 기록들.
- * @param incoming 갱신이 담아 온 SOA 기록.
- * @return 교체해도 되면 참. 현재 SOA 가 없거나 SOA 가 아니면 거짓.
- */
+/// RFC 2136 ignores an SOA replacement that moves the serial back, compared with RFC 1982
+/// arithmetic. An equal serial passes; nothing changed, so the server bumps it later. False
+/// without a current SOA or when `incoming` is not an SOA.
 fn soa_update_moves_forward(current: &[ApRecord], incoming: &ApRecord) -> bool {
     let Some(now) = current.iter().find_map(|r| match &r.rdata {
         ApRData::Soa(soa) if r.rtype == ApRt::SOA => Some(soa.serial),
@@ -224,7 +197,6 @@ fn soa_update_moves_forward(current: &[ApRecord], incoming: &ApRecord) -> bool {
     }
 }
 
-/** @brief 기록들 안의 SOA 일련번호. */
 fn soa_serial_of(records: &[ApRecord]) -> Option<u32> {
     records.iter().find_map(|r| match &r.rdata {
         ApRData::Soa(soa) if r.rtype == ApRt::SOA => Some(soa.serial),
@@ -232,47 +204,37 @@ fn soa_serial_of(records: &[ApRecord]) -> Option<u32> {
     })
 }
 
-/** @brief 이 서버의 권한 영역의 단순 질의를 조립 없이 내보내는 경로가 쓰는 것들. */
+/// What the fast path for plain authoritative queries needs.
 pub(crate) struct AuthorityWirePath {
-    /** @brief 서빙할 권한 영역들. */
     pub(crate) store: Arc<ArcSwap<onetdns_authority::ZoneStore>>,
-    /** @brief 응답에 재귀 가능 표시를 담을지. */
     pub(crate) recursion_available: bool,
 }
 
 #[derive(Clone)]
-/** @brief 영역이 한 판에서 다음 판으로 가며 바뀐 것. */
+/// What changed from one zone serial to the next.
 pub struct ZoneDelta {
-    /** @brief 이 변경 전의 시리얼. */
     pub from: u32,
-    /** @brief 이 변경 뒤의 시리얼. */
     pub to: u32,
 
-    /** @brief 이 변경에서 지운 기록. */
     pub deleted: Vec<ApRecord>,
 
-    /** @brief 이 변경에서 더한 기록. */
     pub added: Vec<ApRecord>,
 
-    /** @brief 이 변경을 보낼 때의 바이트 수. 전체를 보내는 것보다 커지면 버린다. */
+    /// Encoded size; a delta larger than the full zone is dropped.
     wire_bytes: usize,
 }
 
 #[derive(Default)]
-/**
- * @brief 최근 변경 기록. 하위 서버가 바뀐 것만 받아 가게 한다.
- * @note 쌓인 것이 전체를 보내는 것보다 커지면 의미가 없다. 그때는 버리고 전부 보낸다.
- */
+/// Recent zone changes, so secondaries can fetch only what changed. Once the changes add up to
+/// more than the full zone they are dropped, since a full transfer is then cheaper.
 pub struct ZoneJournal {
-    /** @brief 최근 변경들. 오래된 것부터 밀려난다. */
+    /// Oldest first.
     pub deltas: std::collections::VecDeque<ZoneDelta>,
 }
 
 impl ZoneJournal {
-    /** @brief 남겨 둘 변경 기록 수. */
     const MAX: usize = 64;
 
-    /** @brief 이번 변경을 남긴다. */
     pub fn record(&mut self, from: u32, to: u32, old: &[ApRecord], new: &[ApRecord]) {
         let deleted: Vec<ApRecord> = old
             .iter()
@@ -324,7 +286,7 @@ impl ZoneJournal {
         }
     }
 
-    /** @brief 이 판에서 지금 판까지 이어지는 변경 목록. 끊겼으면 없다. */
+    /// `None` when the chain from `client_serial` is broken.
     pub fn path_from(&self, client_serial: u32, current: u32) -> Option<Vec<&ZoneDelta>> {
         if client_serial == current {
             return Some(vec![]);
@@ -343,7 +305,6 @@ impl ZoneJournal {
     }
 }
 
-/** @brief 이 기록들을 보낼 때의 바이트 수. */
 fn journal_records_wire_bytes(records: &[ApRecord]) -> usize {
     let mut writer = onetdns_proto::Writer::new();
     records.iter().fold(0usize, |sum, record| {
@@ -354,7 +315,7 @@ fn journal_records_wire_bytes(records: &[ApRecord]) -> usize {
 }
 
 impl NativeServer {
-    /** @brief 이미 인코딩해 둔 영역 전송 바이트를 그대로 내보낸다. 같은 영역을 매번 다시 짜지 않으려는 것이다. */
+    /// Sends the pre-encoded zone transfer as is, instead of encoding the zone each time.
     pub(crate) fn handle_cached_axfr_wire(
         &self,
         request: &Message,
@@ -374,11 +335,8 @@ impl NativeServer {
             return None;
         }
         let features = self.features.load();
-        /*
-         * dnstap은 내보낸 envelope마다 한 건씩 남겨야 하는데 이 경로는 미리 만들어 둔 바이트를
-         * 그대로 내보내므로 남길 것을 만들지 못한다. 통계는 성공한 영역 전송을 어느 경로도
-         * 남기지 않으므로 여기서 물러설 이유가 없다.
-         */
+        // dnstap needs one entry per envelope, which pre-built bytes cannot provide. Stats record
+        // no successful transfer on either path, so they give no reason to fall back here.
         if features.dnstap.is_some() {
             return None;
         }
@@ -452,11 +410,8 @@ impl NativeServer {
         Some(true)
     }
 
-    /**
-     * @brief 영역 전체 또는 바뀐 부분을 보낸다.
-     * @warning 허용한 대역이고 키 검증을 통과해야 한다. 영역 전체는 그 안의 모든 이름을
-     *          한꺼번에 내주는 것이다.
-     */
+    /// The client must be in `xfr_allow` and pass TSIG: a full transfer hands out every name in
+    /// the zone at once.
     pub(crate) fn handle_axfr(
         &self,
         request: &Message,
@@ -480,7 +435,10 @@ impl NativeServer {
             .iter()
             .any(|net| net.contains(&ctx.src.ip()))
         {
-            onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "not_in_xfr_allow", "Refused zone transfer from an address that is not allowed");
+            static NOT_ALLOWED: AtomicU64 = AtomicU64::new(0);
+            if let Some(count) = sampled(&NOT_ALLOWED) {
+                onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "not_in_xfr_allow", count = count, "Refused zone transfer from an address that is not allowed");
+            }
             self.rec(client, Action::Refused, Some(qname), Some(axfr));
             return emit(error_resp(request, ResponseCode::Refused)).then_some(());
         }
@@ -488,7 +446,10 @@ impl NativeServer {
         let tsig_ctx = match self.check_tsig(request, ctx.raw, authority.xfr_tsig_required, false) {
             Ok(t) => t,
             Err(response) => {
-                onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "tsig", "Refused zone transfer because TSIG verification failed");
+                static TSIG_FAILED: AtomicU64 = AtomicU64::new(0);
+                if let Some(count) = sampled(&TSIG_FAILED) {
+                    onetdns_core::warn!(event = "xfr.refused", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), reason = "tsig", count = count, "Refused zone transfer because TSIG verification failed");
+                }
                 self.rec(client, Action::Refused, Some(qname), Some(axfr));
                 return emit(response).then_some(());
             }
@@ -498,7 +459,10 @@ impl NativeServer {
             .iter()
             .find(|z| z.origin().eq_ignore_case(qname));
         let Some(zone) = zone else {
-            onetdns_core::warn!(event = "xfr.unknown_zone", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), "Refused transfer of a zone this server is not authoritative for");
+            static UNKNOWN_ZONE: AtomicU64 = AtomicU64::new(0);
+            if let Some(count) = sampled(&UNKNOWN_ZONE) {
+                onetdns_core::warn!(event = "xfr.unknown_zone", peer = %ctx.src.ip(), zone = %qname.to_ascii_lower(), count = count, "Refused transfer of a zone this server is not authoritative for");
+            }
             return emit(xfr_single_response(
                 request,
                 ResponseCode(9),
@@ -598,11 +562,7 @@ impl NativeServer {
         xfr_envelopes_stream(request, zone.axfr_records_iter(), tsig_ctx, emit).then_some(())
     }
 
-    /**
-     * @brief 요청의 서명을 검증한다.
-     * @warning 같은 서명을 다시 쓰지 못하게 기억해 둔다. 기억하지 않으면 가로챈 요청을
-     *          그대로 다시 보내는 것만으로 통과한다.
-     */
+    /// Remembers each signature so a captured request cannot be replayed.
     pub(crate) fn check_tsig(
         &self,
         request: &Message,
@@ -611,9 +571,8 @@ impl NativeServer {
         replay_protected: bool,
     ) -> Result<Option<TsigContext>, Message> {
         let authority = self.authority.load();
-        /*
-         * TSIG 오류 응답도 요청이 담은 OPT를 그대로 돌려줘야 한다. 서명 전에 붙어야 MAC이 덮는다.
-         */
+        // TSIG error responses echo the request's OPT too, placed before the signature so the MAC
+        // covers it.
         let edns_buffer = self.features.load().edns_buffer;
         if onetdns_dnssec::tsig::contains_tsig(request) {
             let Some(key_name) = onetdns_dnssec::tsig::peek_key_name(request) else {
@@ -654,7 +613,10 @@ impl NativeServer {
                             .peek(&replay_key)
                             .is_some_and(|expires| *expires >= now)
                         {
-                            onetdns_core::warn!(event = "authority.tsig_replay_blocked", key = %key.name.to_ascii_lower(), "Blocked a replayed TSIG request");
+                            static REPLAYED: AtomicU64 = AtomicU64::new(0);
+                            if let Some(count) = sampled(&REPLAYED) {
+                                onetdns_core::warn!(event = "authority.tsig_replay_blocked", key = %key.name.to_ascii_lower(), count = count, "Blocked a replayed TSIG request");
+                            }
                             return Err(signed_tsig_error_response(
                                 request,
                                 &key,
@@ -716,19 +678,14 @@ impl NativeServer {
         }
     }
 
-    /**
-     * @brief 이 이름을 이 서버가 권한으로 맡고 있는지.
-     * @details 맡고 있으면 이름이 있는지 없는지를 알므로 표준 알고리즘을 돌릴 수 있다.
-     * @param qname 물어본 이름.
-     * @return 이 이름을 덮는 영역이 실려 있으면 참.
-     */
+    /// Whether a loaded zone covers `qname`, so the standard lookup can tell whether it exists.
     pub(crate) fn serves_zone_for(&self, qname: &ApName) -> bool {
         self.authority_wire_path
             .as_ref()
             .is_some_and(|path| path.store.load().zone_for(qname).is_some())
     }
 
-    /** @brief 업스트림 서버가 바뀌었다는 알림을 받는다. 이 서버가 아는 업스트림에서 온 것만 받아들인다. */
+    /// Accepts NOTIFY only from a configured primary.
     pub(crate) fn handle_notify(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
         let authority = self.authority.load();
         if request.header.response {
@@ -739,7 +696,7 @@ impl NativeServer {
         m.header.authoritative = true;
         m.header.recursion_available = false;
         m.additionals.clear();
-        /* RFC 6891은 여기에도 적용된다. TSIG 서명 앞에 붙여야 서명이 이 OPT까지 덮는다. */
+        // RFC 6891 applies here too; the OPT goes before the TSIG so the signature covers it.
         if request.opt().is_some() {
             m = finalize(
                 m,
@@ -804,18 +761,18 @@ impl NativeServer {
                 }
             }
             None => {
-                onetdns_core::warn!(event = "authority.notify_unknown_master", zone = %q.name.to_ascii_lower(), src = %ctx.src, "Ignored DNS NOTIFY from an unknown primary");
+                static UNKNOWN_PRIMARY: AtomicU64 = AtomicU64::new(0);
+                if let Some(count) = sampled(&UNKNOWN_PRIMARY) {
+                    onetdns_core::warn!(event = "authority.notify_unknown_master", zone = %q.name.to_ascii_lower(), src = %ctx.src, count = count, "Ignored DNS NOTIFY from an unknown primary");
+                }
                 return None;
             }
         }
         Some(m)
     }
 
-    /**
-     * @brief 원격에서 영역을 고친다.
-     * @warning 허용 대역, 키, 그리고 규칙을 모두 통과해야 한다. 선행 조건이 붙었으면
-     *          그것부터 확인하고, 하나라도 어긋나면 아무것도 고치지 않는다.
-     */
+    /// The client must pass the address range, the key and the rules. Prerequisites are checked
+    /// first, and if any fails nothing changes.
     pub(crate) fn handle_update(
         &self,
         request: &Message,
@@ -831,11 +788,8 @@ impl NativeServer {
             Some(m)
         };
 
-        /*
-         * RFC 2136은 영역부 개수와 ZTYPE 만 형식 오류로 본다. ZCLASS 가 맞지 않는
-         * 것은 요청이 깨진 것이 아니라 이 서버가 맡지 않은 영역이라는 뜻이라 아래에서 NOTAUTH
-         * 로 답한다.
-         */
+        // RFC 2136 treats only the zone count and ZTYPE as format errors. A wrong ZCLASS names a
+        // zone this server does not hold, which gets NOTAUTH below.
         if request.questions.len() != 1 || request.questions[0].qtype != ApRt::SOA {
             return reply(ResponseCode::FormErr.0);
         }
@@ -922,10 +876,8 @@ impl NativeServer {
             std::collections::HashMap::new();
 
         for p in &request.answers {
-            /*
-             * RFC 2136 의사코드는 TTL 을 영역 범위보다 먼저 본다. 둘 다 어긋난 요청에
-             * 어느 오류를 낼지가 여기서 갈린다.
-             */
+            // RFC 2136's pseudocode checks TTL before the zone range, which decides the error for a
+            // request wrong on both.
             if p.ttl != 0 {
                 return reply(ResponseCode::FormErr.0);
             }
@@ -1028,11 +980,9 @@ impl NativeServer {
         for u in &request.authorities {
             match u.class.0 {
                 1 => {
-                    /*
-                     * CNAME 은 다른 데이터와 공존하지 못한다. 어느 방향이든 이 갱신 RR
-                     * 하나만 건너뛴다. 메시지 전체를 실패로 돌리면 함께 온 멀쩡한 갱신까지
-                     * 잃고, RFC 2136은 남은 RR 을 마저 처리한 뒤 NOERROR 를 낸다.
-                     */
+                    // CNAME cannot coexist with other data, either way round: skip only this RR.
+                    // Failing the whole message would lose the valid updates with it; RFC 2136
+                    // processes the rest and answers NOERROR.
                     let conflicting_cname = if u.rtype == ApRt::CNAME {
                         recs.iter()
                             .any(|r| r.name.eq_ignore_case(&u.name) && r.rtype != ApRt::CNAME)
@@ -1074,11 +1024,9 @@ impl NativeServer {
                     if u.rtype == ApRt::SOA {
                         continue;
                     }
-                    /*
-                     * 정점의 마지막 NS 를 지우면 영역에 권한 서버가 없어지므로 RFC 2136 이
-                     * 이 RR 만 건너뛰라고 한다. 정점이 아닌 NS 는 위임이라 마지막 하나를
-                     * 지우는 것이 위임을 걷는 정상 동작이다.
-                     */
+                    // Deleting the apex's last NS would leave the zone without an authoritative
+                    // server, so RFC 2136 skips this RR. Below the apex an NS is a delegation, and
+                    // removing the last one is normal.
                     if u.rtype == ApRt::NS
                         && u.name.eq_ignore_case(&apex)
                         && !recs.iter().any(|r| {
@@ -1104,10 +1052,8 @@ impl NativeServer {
             return reply(ResponseCode::NoError.0);
         }
 
-        /*
-         * RFC 2136은 갱신이 일련번호를 스스로 바꾸지 않았을 때만 서버가 올리라고 한다.
-         * 갱신이 지정한 값 위에 하나를 더 얹으면 요청자가 적어 준 값이 영역에 남지 않는다.
-         */
+        // RFC 2136 has the server bump the serial only when the update did not set it; bumping on
+        // top would lose the value the requester wrote.
         if soa_serial_of(&recs) == Some(old_serial) {
             if let Some(soa_rec) = recs.iter_mut().find(|r| r.rtype == ApRt::SOA) {
                 if let ApRData::Soa(s) = &mut soa_rec.rdata {
@@ -1159,11 +1105,9 @@ impl NativeServer {
         reply(ResponseCode::NoError.0)
     }
 
-    /**
-     * @brief 이 서버의 권한 영역의 단순 질의를 조립 없이 내보낸다.
-     * @warning 조금이라도 응답이 달라질 여지가 있으면 보통 경로로 보낸다. 위임, 서명 요구,
-     *          부가 옵션, 기록을 남겨야 하는 기능이 모두 그렇다.
-     */
+    /// Answers plain authoritative queries without building a message. Anything that could change
+    /// the response goes the normal way: delegations, signing requests, extra options, and features
+    /// that must record the query.
     pub(crate) fn authority_wire_dispatch(
         &self,
         packet: &[u8],
@@ -1181,12 +1125,10 @@ impl NativeServer {
         if !matches!(scanned.qtype, 1 | 28) {
             return Wire::Fallback;
         }
-        /*
-         * 질의 뒤에 아무것도 없거나, 옵션 없는 OPT 하나만 붙은 것만 맡는다. 옵션이 있거나 DO가
-         * 켜져 있으면 응답에 담을 것이 생기고, 알린 크기가 이 서버의 상한보다 작으면 절단
-         * 사다리가 필요하므로 전부 구조적 경로로 보낸다. 이렇게 맡는 질의는 큰 질의 상한보다
-         * 늘 작으므로 그 검사는 하지 않는다.
-         */
+        // Takes only a bare query or one with an empty OPT. Options or DO need content in the
+        // response, and an advertised size below this server's limit needs the truncation ladder,
+        // so those go the structured way. Queries taken here are always below the large-query
+        // limit, so that check is skipped.
         let bare_len = 12 + scanned.qname.len() + 4;
         let has_opt = match &scanned.edns {
             None => {
@@ -1209,10 +1151,8 @@ impl NativeServer {
         if self.filter.wire_blocked() {
             return Wire::Fallback;
         }
-        /*
-         * 기능 세트는 요청 내용으로 거를 수 있는 질의를 모두 거른 뒤에 한 번만 읽는다. 맡지
-         * 않을 질의에 잠금 비용을 붙이지 않고, 경로 조건과 DDR 판정, EDNS 크기가 같은 세트를 본다.
-         */
+        // Load the feature set once, after every content-based filter, so declined queries pay no
+        // lock and the path conditions, DDR check and EDNS size all see the same set.
         let features = self.features.load();
         if !features.lanes.authority
             || self.safe_search.load(Ordering::Acquire)
@@ -1252,10 +1192,8 @@ impl NativeServer {
         {
             return Wire::Fallback;
         }
-        /*
-         * EDNS 를 쓰지 않은 UDP 질의의 상한은 RFC 1035 의 512바이트다. 이 경로에는
-         * 절단 사다리가 없으므로 넘으면 구조적 경로로 전환한다. TCP 에는 이 상한이 없다.
-         */
+        // Without EDNS, UDP is capped at 512 bytes (RFC 1035). This path has no truncation ladder,
+        // so a larger answer goes the structured way. TCP has no such cap.
         if edns.is_none()
             && ctx.transport == RtTransport::Do53Udp
             && out.buf.len() > onetdns_runtime::NON_EDNS_UDP_MAX
@@ -1268,10 +1206,9 @@ impl NativeServer {
             .iter()
             .filter(|limiter| limiter.is_active())
         {
-            /*
-             * 위에서 꺼져 있다고 본 뒤 제한기가 켜졌으면 클라이언트를 만들지 않았다. 제한을
-             * 건너뛰지 않고 보통 경로로 전환한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
-             */
+            // The limiter came on after the check above, so no client was built. Go the normal way
+            // rather than skip the limit; handing a fast-path query to the general path is always
+            // correct.
             let Some(client) = client.as_ref() else {
                 out.clear();
                 return Wire::Fallback;
@@ -1285,15 +1222,9 @@ impl NativeServer {
         Wire::Respond
     }
 
-    /**
-     * @brief 무할당 경로로 답한 질의를 지표에 남긴다.
-     *
-     * @details 이 경로가 기록하지 못하던 시절에는 기록기가 있다는 것만으로 경로를 닫았다.
-     *          컨트롤 플레인을 수신 주소 없이도 만들어 두게 된 뒤로는 그 조건이 언제나 참이라 경로가
-     *          전부 죽는다. 응답 코드는 방금 쓴 와이어의 헤더에서 그대로 읽어 구조적
-     *          경로와 같은 값을 남긴다.
-     * @param client 접근 제어나 제한기 때문에 이미 만들어 둔 것이 있으면 다시 만들지 않는다.
-     */
+    /// Records a fast-path answer in the metrics, reading the rcode from the wire just written so
+    /// it matches the structured path. `client` is reused when access control or a limiter already
+    /// built it.
     fn record_authority_wire(
         &self,
         ctx: &RequestCtx,
@@ -1331,12 +1262,10 @@ impl NativeServer {
     }
 }
 
-/** @brief 영역 꼭대기 이름을 가리키는 키. */
 fn apex_key(name: &ApName) -> Vec<u8> {
     name.canonical_key()
 }
 
-/** @brief 시리얼만 바꾼 권한 기록. */
 fn soa_with_serial(soa: &ApRecord, serial: u32) -> ApRecord {
     let mut r = soa.clone();
     if let ApRData::Soa(s) = &mut r.rdata {
@@ -1345,7 +1274,7 @@ fn soa_with_serial(soa: &ApRecord, serial: u32) -> ApRecord {
     r
 }
 
-/** @brief 서명 없이 내보내는 오류 응답. 키를 모르는 상대에게는 서명할 수 없다. */
+/// A peer whose key is unknown cannot be signed for.
 fn unsigned_tsig_error_response(
     request: &Message,
     request_tsig: &onetdns_dnssec::tsig::TsigRecordData,
@@ -1362,7 +1291,7 @@ fn unsigned_tsig_error_response(
     response
 }
 
-/** @brief 시각이 어긋났다는 오류에 서명해 답한다. 상대가 시각을 맞출 수 있게 이 서버의 시각을 담는다. */
+/// Carries this server's time so the peer can correct its clock.
 fn signed_badtime_response(
     request: &Message,
     key: &onetdns_dnssec::tsig::TsigKey,
@@ -1382,7 +1311,6 @@ fn signed_badtime_response(
     response
 }
 
-/** @brief 오류 응답에 서명해 답한다. */
 fn signed_tsig_error_response(
     request: &Message,
     key: &onetdns_dnssec::tsig::TsigKey,
@@ -1402,10 +1330,15 @@ fn signed_tsig_error_response(
     response
 }
 
-/** @brief 영역 전송 한 청크에 담을 크기. */
+/// Any client can trigger a refusal, so each kind logs only its 1st, 2nd, 4th, ... occurrence;
+/// a line per request would let one flood the log.
+fn sampled(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    count.is_power_of_two().then_some(count)
+}
+
 const XFR_CHUNK_BUDGET: usize = onetdns_authority::XFR_CHUNK_BUDGET;
 
-/** @brief 한 청크로 끝나는 영역 전송 응답. */
 fn xfr_single_response(
     request: &Message,
     rcode: ResponseCode,
@@ -1426,7 +1359,6 @@ fn xfr_single_response(
     response
 }
 
-/** @brief 영역을 여러 청크로 나눠 보낸다. */
 fn xfr_envelopes_stream<I>(
     request: &Message,
     records: I,
@@ -1472,7 +1404,6 @@ where
     ))
 }
 
-/** @brief 영역 전송 청크 하나. */
 fn xfr_envelope(
     request: &Message,
     answers: Vec<ApRecord>,
@@ -1506,13 +1437,19 @@ fn xfr_envelope(
 }
 
 #[cfg(test)]
-/** @brief 영역 전송, NOTIFY, UPDATE, TSIG 처리. */
 mod tests {
     use super::*;
     use crate::native::tests::{ctx, q, server, shaped_server};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn refusals_are_logged_at_powers_of_two() {
+        let counter = AtomicU64::new(0);
+        let logged: Vec<u64> = (0..20).filter_map(|_| sampled(&counter)).collect();
+        assert_eq!(logged, [1, 2, 4, 8, 16]);
+    }
 
     use onetdns_proto::{
         DnsClass, Edns, Message, Name as ApName, RData as ApRData, Record as ApRecord,
@@ -1521,12 +1458,8 @@ mod tests {
     use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 
     #[test]
-    /**
-     * @brief 오류 응답도 요청이 담은 OPT를 그대로 돌려주는지.
-     * @details RFC 6891이 요청에 OPT가 있으면 응답에도 넣게 한다. 빼면 상대는 이 서버가
-     *          EDNS를 모르는 것으로 보고 512바이트로 전환하므로, 형식 오류 한 번이 그 뒤
-     *          모든 질의의 버퍼 크기를 깎는다.
-     */
+    /// RFC 6891: with an OPT in the request the response carries one too. Dropping it makes the
+    /// peer assume no EDNS and fall back to 512 bytes for every later query.
     fn protocol_error_responses_echo_the_request_opt() {
         let server = shaped_server(true);
 
@@ -1568,7 +1501,8 @@ mod tests {
             "요청에 OPT가 없으면 응답에도 넣지 않습니다"
         );
 
-        /* TSIG 오류 응답도 같은 규칙을 따르고, OPT가 TSIG 앞에 와야 서명이 그것을 덮는다. */
+        // TSIG errors follow the same rule, and the OPT must precede the TSIG for the signature to
+        // cover it.
         let key = onetdns_dnssec::tsig::TsigKey::new(
             ApName::from_str("probe-key").unwrap(),
             vec![7u8; 32],
@@ -1597,11 +1531,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 카탈로그 주 서버가 보낸 NOTIFY로 카탈로그와 구성원 영역을 다시 받아 오는지.
-     * @details 구성원 영역은 카탈로그를 받은 뒤에야 알게 되므로 설정에 이름이 없다. 다른 주소가
-     *          보낸 NOTIFY는 여전히 무시한다.
-     */
+    /// Member zones are learned from the catalog, so the configuration does not name them. NOTIFY
+    /// from other addresses is still ignored.
     fn notify_from_catalog_primary_wakes_member_refresh() {
         let kick = Arc::new(NotifyKick::default());
         let srv = server("").with_notify_secondaries(Vec::new(), kick.clone());
@@ -1638,7 +1569,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아는 업스트림에서 온 알림만 받아들이고 다시 받아 오게 하는지. */
     fn notify_only_acknowledges_known_master_requests_and_wakes_refresh() {
         let origin = ApName::from_str("secondary.test").unwrap();
         let kick = Arc::new(NotifyKick::default());
@@ -1697,7 +1627,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쌓인 변경이 전체를 보내는 것보다 커지면 버리는지. */
     fn ixfr_journal_does_not_retain_deltas_larger_than_axfr() {
         let old = onetdns_authority::parse_zone(
             "$ORIGIN budget.test.\n@ IN SOA ns admin 1 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\na IN A 192.0.2.10\nb IN A 192.0.2.11\nc IN A 192.0.2.12\nd IN A 192.0.2.13\n",
@@ -1723,7 +1652,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 남겨 두는 변경 기록이 영역 크기 안에 머무는지. */
     fn ixfr_journal_retention_is_bounded_by_current_zone_size() {
         let zone = onetdns_authority::parse_zone(
             "$ORIGIN bounded.test.\n@ IN SOA ns admin 1 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\nseed IN A 192.0.2.2\n",
@@ -1752,7 +1680,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업데이트 정책 규칙이 허용과 거절을 제대로 구분하는지. */
     fn update_policy_grant_deny_matching() {
         let rules = vec![
             UpdateRule::new(false, "*", "locked.example", vec![]).unwrap(),
@@ -1784,13 +1711,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 없앤 범위 표기를 거부하는지. 남겨 두면 뜻이 다른 규칙이 조용히 통과한다. */
+    /// A removed alias left accepted would pass a rule with a different meaning.
     fn update_policy_rejects_removed_subtree_alias() {
         assert!(UpdateRule::new(true, "*", ".dyn.example", vec![1]).is_none());
     }
 
     #[test]
-    /** @brief 규칙 이름의 원래 바이트가 바뀌지 않는지. */
     fn update_policy_preserves_raw_name_octets() {
         let rules = vec![UpdateRule::new(true, "*", "�", vec![1]).unwrap()];
         let configured = ApName::from_str("�").unwrap();
@@ -1801,7 +1727,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 예외 이름의 원래 바이트가 바뀌지 않는지. */
     fn rebind_allow_suffix_preserves_raw_name_octets() {
         let configured = ApName::from_str("�").unwrap();
         let child = ApName::from_str("host.�").unwrap();
