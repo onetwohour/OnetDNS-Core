@@ -410,7 +410,7 @@ Block and allow rules, blocklist subscriptions, blocked services, safe search, r
 | GET | `/v1/filter/top-rules` | read-only | Top N rules by hits (when track_rule_hits is enabled) |
 | GET | `/v1/filter/sources` | read-only | Rule count and cumulative hits per block or allow list |
 | GET | `/v1/filter/subscriptions` | read-only | Subscriptions with title, enabled state, and rule count. Built-in lists enabled by safe browsing and parental control are included with a preset value; they are turned on and off only by those settings and cannot be deleted or disabled here |
-| POST | `/v1/filter/subscriptions` | admin | Add a blocklist subscription (admin only) |
+| POST | `/v1/filter/subscriptions` | admin | Add a blocklist subscription (admin only). The list is downloaded first and is not saved if the download fails. With background, the download and save run as a job; follow it at /v1/jobs/{id} |
 | PATCH | `/v1/filter/subscriptions` | admin | Enable or disable a blocklist subscription (admin only) |
 | DELETE | `/v1/filter/subscriptions` | admin | Delete a blocklist subscription (admin only) |
 | POST | `/v1/filter/subscriptions/refresh` | admin | Refresh the given blocklist subscription (admin only) |
@@ -574,11 +574,14 @@ Request body (`application/json`):
 | `url` | string | yes |
 | `title` | string | no |
 | `enabled` | boolean | no |
+| `background` | boolean | no |
 
 | Status | Response |
 |---|---|
-| 200 | `{added,subscriptions,block}` |
+| 200 | {added}, or {id,status} with background |
 | 400 | `{error}` |
+| 409 | {error}: this node is not the cluster leader |
+| 503 | `{error}` |
 
 #### `PATCH /v1/filter/subscriptions`
 

@@ -307,7 +307,8 @@ static CONTROL_ERROR_COUNTS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceL
 /// Serializes state-changing requests.
 static CONTROL_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn control_mutation_lock() -> &'static Mutex<()> {
+/// A handler exempt from the request-level lock takes this around its own save.
+pub fn control_mutation_lock() -> &'static Mutex<()> {
     CONTROL_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
@@ -335,11 +336,13 @@ fn is_state_changing_request(method: &str, path: &str) -> bool {
 /// Requests not locked here also skip cluster consensus. Cluster proposals are exempt because
 /// consensus orders them itself, and locking would make proposals block each other. Self-update
 /// is exempt: it changes no config and only starts a job on this node, and the updater runs
-/// those one at a time.
+/// those one at a time. Adding a blocklist is exempt so its download does not block every other
+/// change; the handler locks and routes through the cluster around the save itself.
 fn requires_control_mutation_lock(method: &str, path: &str) -> bool {
     is_state_changing_request(method, path)
         && path != "/v1/cluster/propose"
         && !path.starts_with("/v1/system/update/")
+        && !(method == "POST" && path == "/v1/filter/subscriptions")
 }
 
 /// Repeated request failures, by a bounded number of fingerprints.
@@ -600,7 +603,9 @@ pub struct Controls {
     /// Subscribed blocklists.
     pub subscriptions_list: Box<dyn Fn() -> String + Send + Sync>,
 
-    pub subscription_add: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    /// Runs without the request-level lock and cluster routing; see
+    /// `requires_control_mutation_lock`.
+    pub subscription_add: Box<dyn Fn(&str) -> ApiResponse + Send + Sync>,
 
     pub subscription_remove: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
@@ -788,7 +793,7 @@ impl Controls {
                 "{\"urls\":[],\"count\":0,\"block_domains\":0}".to_string()
             }),
             subscription_add: Box::new(|_| {
-                Err("Blocklist subscriptions are not available".to_string())
+                result_resp(Err("Blocklist subscriptions are not available".to_string()))
             }),
             subscription_remove: Box::new(|_| {
                 Err("Blocklist subscriptions are not available".to_string())
@@ -4602,14 +4607,7 @@ fn route_dispatch(
             "application/json",
             (st.controls.subscriptions_list)(),
         ),
-        ("POST", "/v1/filter/subscriptions") => match (st.controls.subscription_add)(body) {
-            Ok(j) => ("200 OK", "application/json", j),
-            Err(e) => (
-                "400 Bad Request",
-                "application/json",
-                format!("{{\"error\":\"{}\"}}", jesc(&e)),
-            ),
-        },
+        ("POST", "/v1/filter/subscriptions") => (st.controls.subscription_add)(body),
         ("DELETE", "/v1/filter/subscriptions") => {
             match (st.controls.subscription_remove)(&body_str(body, "url")) {
                 Ok(j) => ("200 OK", "application/json", j),
@@ -5094,7 +5092,7 @@ fn openapi_json() -> String {
     "/v1/filter/sources": { "get": { "tags": ["Filtering"], "summary": "Rule count and cumulative hits per block or allow list", "responses": { "200": { "description": "{hits_enabled,sources:[{source,rules,hits}]}" } } } },
     "/v1/filter/subscriptions": {
       "get": { "tags": ["Filtering"], "summary": "Subscriptions with title, enabled state, and rule count. Built-in lists enabled by safe browsing and parental control are included with a preset value; they are turned on and off only by those settings and cannot be deleted or disabled here", "responses": { "200": { "description": "{lists:[{url,title,enabled,rules,updated_unix,preset?}],count,block_domains}. preset is safe_browsing or parental_control" } } },
-      "post": { "tags": ["Filtering"], "summary": "Add a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "title": { "type": "string" }, "enabled": { "type": "boolean" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{added,subscriptions,block}" }, "400": { "description": "{error}" } } },
+      "post": { "tags": ["Filtering"], "summary": "Add a blocklist subscription (admin only). The list is downloaded first and is not saved if the download fails. With background, the download and save run as a job; follow it at /v1/jobs/{id}", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "title": { "type": "string" }, "enabled": { "type": "boolean" }, "background": { "type": "boolean" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{added}, or {id,status} with background" }, "400": { "description": "{error}" }, "409": { "description": "{error}: this node is not the cluster leader" }, "503": { "description": "{error}" } } },
       "patch": { "tags": ["Filtering"], "summary": "Enable or disable a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "enabled": { "type": "boolean" } }, "required": ["url", "enabled"] } } } }, "responses": { "200": { "description": "{updated}" }, "400": { "description": "{error}" } } },
       "delete": { "tags": ["Filtering"], "summary": "Delete a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{removed,subscriptions,block}" }, "404": { "description": "{error}" } } }
     },
@@ -5652,9 +5650,9 @@ mod tests {
             }),
             subscription_add: Box::new(|url: &str| {
                 if url.trim().is_empty() {
-                    Err("URL을 입력해야 합니다".to_string())
+                    result_resp(Err("URL을 입력해야 합니다".to_string()))
                 } else {
-                    Ok("{\"added\":true}".to_string())
+                    result_resp(Ok("{\"added\":true}".to_string()))
                 }
             }),
             subscription_remove: Box::new(|_| Ok("{\"removed\":true}".to_string())),
@@ -6557,6 +6555,24 @@ mod tests {
             "/v1/cluster/propose"
         ));
         assert!(requires_control_mutation_lock("POST", "/v1/config/set"));
+    }
+
+    #[test]
+    fn adding_a_blocklist_locks_only_its_own_save() {
+        assert!(is_state_changing_request(
+            "POST",
+            "/v1/filter/subscriptions"
+        ));
+        assert!(!requires_control_mutation_lock(
+            "POST",
+            "/v1/filter/subscriptions"
+        ));
+        for method in ["PATCH", "DELETE"] {
+            assert!(requires_control_mutation_lock(
+                method,
+                "/v1/filter/subscriptions"
+            ));
+        }
     }
 
     #[test]

@@ -1,7 +1,3 @@
-/*!
- * @brief 관리 API: 차단 목록 구독.
- */
-
 use super::*;
 use crate::atomic_file::with_rollback_result;
 use crate::config_apply::update_runtime_config;
@@ -9,9 +5,79 @@ use crate::filters::{
     active_subscription_urls, fetch_blocklist, fetch_blocklists_meta, persist_subscription_state,
     preset_list_kind, try_list_refresh_lock, SubMeta,
 };
+use onetdns_control::ApiResponse;
+
+const SUBSCRIPTIONS_PATH: &str = "/v1/filter/subscriptions";
+
+struct NewSubscription {
+    url: String,
+    title: String,
+    background: bool,
+}
+
+impl NewSubscription {
+    fn parse(body: &str) -> Result<Self, String> {
+        let request = onetdns_core::json::parse(body)
+            .map_err(|_| "Could not parse the JSON request body".to_string())?;
+        let text = |key: &str| {
+            request
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let url = text("url");
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("List URL must start with http:// or https://".to_string());
+        }
+        let background = match request.get("background") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| "`background` must be true or false".to_string())?,
+        };
+        Ok(Self {
+            url,
+            title: text("title"),
+            background,
+        })
+    }
+}
+
+fn ensure_not_subscribed(urls: &[String], url: &str) -> Result<(), String> {
+    if urls.iter().any(|item| item == url) {
+        return Err("This filter list is already registered".to_string());
+    }
+    Ok(())
+}
+
+fn json_response(body: &str) -> ApiResponse {
+    ("200 OK", "application/json", body.to_string())
+}
+
+fn error_response(status: &'static str, message: &str) -> ApiResponse {
+    (
+        status,
+        "application/json",
+        format!("{{\"error\":{}}}", onetdns_core::json::escape(message)),
+    )
+}
+
+/// The `error` field of a failed response, or the whole body when it has none.
+fn response_error(response: &ApiResponse) -> String {
+    onetdns_core::json::parse(&response.2)
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(|error| error.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| response.2.clone())
+}
 
 impl ControlDeps {
-    /** @brief 구독한 목록과 내장 목록, 목록마다 규칙 수. */
+    /// Subscribed and built-in lists, with the rule count of each.
     pub(super) fn subscriptions_list(&self) -> String {
         let list = self.filters.sub_urls.lock_recover().clone();
         let preset_list = self.filters.preset_urls.lock_recover().clone();
@@ -28,7 +94,8 @@ impl ControlDeps {
                 None => format!("{{\"url\":{},\"title\":{},\"enabled\":{},\"rules\":0,\"updated_unix\":0}}", onetdns_core::json::escape(u), onetdns_core::json::escape(&title), enabled),
             }
         }).collect();
-        /* 내장 목록도 외부에서 내려받는 목록이다. 숨기면 어디서 받는지, 받아졌는지 볼 수 없다. */
+        // Built-in lists are downloaded too; hiding them would hide where they come from and
+        // whether they arrived.
         let builtin: Vec<&String> = preset_list
             .iter()
             .filter(|url| !list.contains(url))
@@ -57,46 +124,103 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 목록을 한 번 받아 본 뒤 구독에 넣는다. 다시 만들지 못하면 되돌린다. */
-    pub(super) fn subscription_add(&self, body: &str) -> Result<String, String> {
+    /// Downloads the list before subscribing to it, so a list that cannot be downloaded is not
+    /// saved. With `background`, the download and save run as a job and the response carries
+    /// its id.
+    pub(super) fn subscription_add(self: &Arc<Self>, body: &str) -> ApiResponse {
+        let request = match NewSubscription::parse(body) {
+            Ok(request) => request,
+            Err(error) => return error_response("400 Bad Request", &error),
+        };
+        // Lets a cluster follower refuse before the download instead of after it.
+        let check = {
+            let _mutation = onetdns_control::api::control_mutation_lock().lock_recover();
+            cluster_routed_write("POST", SUBSCRIPTIONS_PATH, body, &mut || {
+                match ensure_not_subscribed(&self.filters.sub_urls.lock_recover(), &request.url) {
+                    Ok(()) => json_response("{}"),
+                    Err(error) => error_response("400 Bad Request", &error),
+                }
+            })
+        };
+        if !check.0.starts_with('2') {
+            return check;
+        }
+        if request.background {
+            self.start_add_job(request, body)
+        } else {
+            self.download_and_save(&request, body)
+        }
+    }
+
+    fn start_add_job(self: &Arc<Self>, request: NewSubscription, body: &str) -> ApiResponse {
+        let Some(id) = self.jobs.create("add-list") else {
+            return error_response("503 Service Unavailable", "Too many jobs are running");
+        };
+        let deps = Arc::clone(self);
+        let body = body.to_string();
+        let spawned = std::thread::Builder::new()
+            .name(format!("add-list-{id}"))
+            .spawn(move || {
+                let response = deps.download_and_save(&request, &body);
+                let url = &request.url;
+                if response.0.starts_with('2') {
+                    onetdns_core::info!(event = "filter.subscription_added", %url, "Added a blocklist");
+                    deps.jobs.finish(id, true, String::new());
+                } else {
+                    let error = response_error(&response);
+                    onetdns_core::warn!(event = "filter.subscription_add_failed", %url, %error, "Could not add a blocklist");
+                    deps.jobs.finish(id, false, error);
+                }
+            });
+        match spawned {
+            Ok(thread) => {
+                track_service_thread(&self.service_threads, thread);
+                json_response(&format!("{{\"id\":{id},\"status\":\"running\"}}"))
+            }
+            Err(error) => {
+                let message = format!("Could not start the job thread: {error}");
+                self.jobs.finish(id, false, message.clone());
+                error_response("503 Service Unavailable", &message)
+            }
+        }
+    }
+
+    fn download_and_save(&self, request: &NewSubscription, body: &str) -> ApiResponse {
+        let fresh = match fetch_blocklist(&request.url, &self.blocklist_resolver, None) {
+            Ok(fresh) => fresh,
+            Err(error) => return error_response("400 Bad Request", &error),
+        };
+        // Waits instead of failing as busy: a refresh in progress writes back the list metadata
+        // it started from, which would drop this list.
+        let _refresh = self.filters.list_refresh_lock.lock_recover();
+        let _mutation = onetdns_control::api::control_mutation_lock().lock_recover();
+        cluster_routed_write("POST", SUBSCRIPTIONS_PATH, body, &mut || match self
+            .save_subscription(request, fresh.clone())
+        {
+            Ok(()) => json_response("{\"added\":true}"),
+            Err(error) => error_response("400 Bad Request", &error),
+        })
+    }
+
+    /// Rolls back when the filter cannot be rebuilt with the new list.
+    fn save_subscription(&self, request: &NewSubscription, fresh: SubMeta) -> Result<(), String> {
+        let url = &request.url;
         let urls = &self.filters.sub_urls;
         let titles = &self.filters.sub_titles;
         let disabled = &self.filters.sub_disabled;
-        let request = onetdns_core::json::parse(body)
-            .map_err(|_| "Could not parse the JSON request body".to_string())?;
-        let url = request
-            .get("url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let title = request
-            .get("title")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err("List URL must start with http:// or https://".to_string());
-        }
-
-        let _guard = try_list_refresh_lock(&self.filters.list_refresh_lock)?;
         let previous_urls = urls.lock_recover().clone();
-        if previous_urls.iter().any(|item| item == &url) {
-            return Err("This filter list is already registered".to_string());
-        }
+        ensure_not_subscribed(&previous_urls, url)?;
         let previous_titles = titles.lock_recover().clone();
         let previous_disabled = disabled.lock_recover().clone();
         let previous_meta = self.filters.sub_meta.lock_recover().clone();
-        let fresh = fetch_blocklist(&url, &self.blocklist_resolver, None)?;
 
         let mut next_urls = previous_urls.clone();
         let mut next_titles = previous_titles.clone();
         next_titles.resize(next_urls.len(), String::new());
         next_urls.push(url.clone());
-        next_titles.push(title);
+        next_titles.push(request.title.clone());
         let mut next_disabled = previous_disabled.clone();
-        next_disabled.retain(|item| item != &url);
+        next_disabled.retain(|item| item != url);
         persist_subscription_state(
             self.config_path.as_deref(),
             &next_urls,
@@ -114,7 +238,7 @@ impl ControlDeps {
         );
         let mut next_meta = previous_meta.clone();
         next_meta.retain(|item| active.iter().any(|active_url| active_url == &item.url));
-        next_meta.retain(|item| item.url != url);
+        next_meta.retain(|item| &item.url != url);
         next_meta.push(fresh);
         *self.filters.sub_meta.lock_recover() = next_meta;
         if let Err(error) = (self.filters.rebuild)() {
@@ -147,10 +271,10 @@ impl ControlDeps {
             config.blocklist_titles = applied_titles;
             config.disabled_blocklist_urls = applied_disabled;
         });
-        Ok("{\"added\":true}".to_string())
+        Ok(())
     }
 
-    /** @brief 구독을 뺀다. 다시 만들지 못하면 되돌린다. */
+    /// Rolls back when the filter cannot be rebuilt without the list.
     pub(super) fn subscription_remove(&self, url: &str) -> Result<String, String> {
         let urls = &self.filters.sub_urls;
         let titles = &self.filters.sub_titles;
@@ -225,7 +349,7 @@ impl ControlDeps {
         Ok("{\"removed\":true}".to_string())
     }
 
-    /** @brief 구독을 켜거나 끈다. 다시 만들지 못하면 되돌린다. */
+    /// Enables or disables a subscription; rolls back when the filter cannot be rebuilt.
     pub(super) fn subscription_update(&self, body: &str) -> Result<String, String> {
         let disabled = &self.filters.sub_disabled;
         let request = onetdns_core::json::parse(body)
@@ -300,7 +424,6 @@ impl ControlDeps {
         Ok(format!("{{\"updated\":true,\"enabled\":{enabled}}}"))
     }
 
-    /** @brief 구독한 목록 하나를 지금 다시 받는다. */
     pub(super) fn subscription_refresh(&self, body: &str) -> Result<String, String> {
         let presets = &self.filters.preset_urls;
         let disabled = &self.filters.sub_disabled;

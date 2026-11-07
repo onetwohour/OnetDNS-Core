@@ -3259,14 +3259,18 @@ Object.assign(I18N.en, {
   'DNSKEY {keys}개 · DS {ds}':'{keys} DNSKEY records · DS {ds}','OCSP 주소 {ocsp}개 · CRL 주소 {crl}개':'{ocsp} OCSP URLs · {crl} CRL URLs','서명되지 않음':'Unsigned','서명됨':'Signed','있음':'present','조회 실패':'Query failed','폐기되지 않음':'Not revoked','폐기됨':'Revoked','확인 실패':'Check failed'
 ,
   'HTTP 또는 HTTPS URL을 입력하세요':'Enter an HTTP or HTTPS URL',
-  '차단 목록을 추가했습니다':'Filter list added'
+  '차단 목록을 추가했습니다':'Filter list added',
+  '목록을 받고 있습니다':'Downloading the list',
+  '이 목록을 이미 받고 있습니다':'This list is already downloading'
 });
 Object.assign(I18N.ja, {
   '상태, 정책, 필터 품질 및 유지보수':'状態、方針、フィルター品質、メンテナンス','JSON 선택':'JSON を選択','PEM 선택':'PEM を選択','건너뛴 규칙이 없습니다.':'スキップされたルールはありません。','기록된 백그라운드 작업이 없습니다.':'記録されたバックグラウンドジョブはありません。','로드된 WASM 플러그인이 없습니다.':'読み込まれた WASM プラグインはありません。','제한 없음':'制限なし','평가 ·':'評価 ·','필터 출처 데이터가 없습니다.':'フィルターソースのデータはありません。','{rules} 규칙 · {hits} 적중':'{rules} ルール · {hits} ヒット','{rules} 규칙':'{rules} ルール','{hits} 적중':'{hits} ヒット','규칙 {rules}개':'{rules} 件のルール','규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、ヒット数は集計されません。設定でルール別ヒット回数の記録を有効にしてください。','규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、集計されません。設定でルール別ヒット回数の記録を有効にしてください。',
   'DNSKEY {keys}개 · DS {ds}':'DNSKEY {keys} 件 · DS {ds}','OCSP 주소 {ocsp}개 · CRL 주소 {crl}개':'OCSP URL {ocsp} 件 · CRL URL {crl} 件','서명되지 않음':'未署名','서명됨':'署名済み','있음':'あり','조회 실패':'照会失敗','폐기되지 않음':'失効していません','폐기됨':'失効済み','확인 실패':'確認失敗'
 ,
   'HTTP 또는 HTTPS URL을 입력하세요':'HTTP または HTTPS の URL を入力してください',
-  '차단 목록을 추가했습니다':'フィルタリストを追加しました'
+  '차단 목록을 추가했습니다':'フィルタリストを追加しました',
+  '목록을 받고 있습니다':'リストをダウンロードしています',
+  '이 목록을 이미 받고 있습니다':'このリストはすでにダウンロード中です'
 });
 
 // 중국어 사전. 키는 다른 언어와 같은 한국어 원문이다.
@@ -4336,7 +4340,9 @@ Object.assign(I18N.zh, {
   "폐기됨":"已吊销",
   "확인 실패":"检查失败",
   "HTTP 또는 HTTPS URL을 입력하세요":"请输入 HTTP 或 HTTPS URL",
-  "차단 목록을 추가했습니다":"已添加拦截列表"
+  "차단 목록을 추가했습니다":"已添加拦截列表",
+  "목록을 받고 있습니다":"正在下载列表",
+  "이 목록을 이미 받고 있습니다":"此列表已在下载中"
 });
 
 // 서버는 영어로 응답한다. 화면이 아는 서버 문구는 영어 원문을 키로 각 언어에 옮긴다.
@@ -4767,6 +4773,7 @@ class Component extends DCLogic {
              rewriteDomain:'',rewriteAnswer:'',restoreFileName:'백업 파일 선택…',dnssecZone:'' },
 
     blocklists: [],
+    pendingSubs: [],
     blockRules: [],
     allowRules: [],
     services: [],
@@ -4909,7 +4916,7 @@ class Component extends DCLogic {
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
       log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],
       operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,loaded:false},
-      blocklists:[],blockRules:[],allowRules:[],services:[],leases:{v4:[],v6:[]},pausedEvents:[],pausedDropped:0,schema:[],schemaHot:[],schemaConditional:[],cfgRaw:{},cfgApplied:{},configStatus:{in_sync:true,source:'runtime',changed_keys:[],error:null},
+      blocklists:[],pendingSubs:[],blockRules:[],allowRules:[],services:[],leases:{v4:[],v6:[]},pausedEvents:[],pausedDropped:0,schema:[],schemaHot:[],schemaConditional:[],cfgRaw:{},cfgApplied:{},configStatus:{in_sync:true,source:'runtime',changed_keys:[],error:null},
       forms:{...f,loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',config:'',certPem:'',keyPem:'',cpKey:'',cpVal:'',rewriteDomain:'',rewriteAnswer:'',dnssecZone:'',
         certFileName:'fullchain.pem 선택…',keyFileName:'privkey.pem 선택…',restoreFileName:'백업 파일 선택…'}};
   }
@@ -5488,7 +5495,7 @@ class Component extends DCLogic {
     const lists=Array.isArray(body&&body.lists)?body.lists:[];
     this.setState({blocklists:lists.map((l,i)=>({id:l.id||i+1,name:String(l.title||l.url||''),url:String(l.url||''),preset:String(l.preset||''),enabled:l.enabled!==false,rules:Number(l.rules)||0,updated:this.relTime(l.updated_unix),updating:false}))});
   }
-  async reloadSubs(){ const r=await this.apiGet('/v1/filter/subscriptions');if(r.ok)this.applySubs(r.body||{}); }
+  async reloadSubs(){ const r=await this.apiGet('/v1/filter/subscriptions');if(r.ok)this.applySubs(r.body||{});return r; }
   async bootSubs(){ await this.reloadSubs(); }
   async loadConfigState(){
     const [desiredResp,appliedResp,statusResp]=await Promise.all([
@@ -6327,7 +6334,35 @@ class Component extends DCLogic {
     this.toastMsg(r.ok?'필터 목록 갱신 작업을 시작했습니다':'갱신 실패: '+this.errorText(r),!r.ok);
   };
   refreshLists=async()=>{if(this.state.listsUpdating)return;this.setState({listsUpdating:true});const r=await this.apiSend('/v1/jobs/refresh','POST');this.setState({listsUpdating:false});if(r.ok){this.toastMsg('필터 목록 갱신을 시작했습니다');}else this.toastMsg('갱신 실패: '+this.errorText(r),true);};
-  addSub=async()=>{const f=this.state.forms,url=(f.subUrl||'').trim(),title=(f.subName||'').trim();if(!/^https?:\/\//i.test(url))return this.toastMsg('HTTP 또는 HTTPS URL을 입력하세요',true);const r=await this.apiSend('/v1/filter/subscriptions','POST',{url,title,enabled:true});if(r.ok){this.setState(s=>({forms:{...s.forms,subName:'',subUrl:''}}));await this.reloadSubs();this.toastMsg('차단 목록을 추가했습니다');}else this.toastMsg('추가 실패: '+this.errorText(r),true);};
+  addSub=async()=>{
+    const f=this.state.forms,url=(f.subUrl||'').trim(),title=(f.subName||'').trim();
+    if(!/^https?:\/\//i.test(url))return this.toastMsg('HTTP 또는 HTTPS URL을 입력하세요',true);
+    const pending=()=>this.state.pendingSubs.some(p=>p.url===url);
+    if(pending())return this.toastMsg('이 목록을 이미 받고 있습니다',true);
+    const drop=()=>this.setState(s=>({pendingSubs:s.pendingSubs.filter(p=>p.url!==url)}));
+    this.setState(s=>({pendingSubs:[...s.pendingSubs,{url,name:title||url}],forms:{...s.forms,subName:'',subUrl:''}}));
+    const r=await this.apiSend('/v1/filter/subscriptions','POST',{url,title,enabled:true,background:true});
+    if(!r.ok){drop();return this.toastMsg('추가 실패: '+this.errorText(r),true);}
+    const id=r.body&&r.body.id;
+    let done=!id,failure='';
+    while(id){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      if(!pending())return;
+      const j=await this.apiGet('/v1/jobs/'+encodeURIComponent(String(id)));
+      if(!pending()||j.stale)return;
+      const job=j.ok&&j.body&&typeof j.body==='object'?j.body:null;
+      if(job&&job.status==='running')continue;
+      if(!job&&(j.status===0||j.status===408||j.status>=500))continue;
+      if(job&&job.status==='done')done=true;
+      else failure=job?this.t(String(job.result||'')):this.errorText(j);
+      break;
+    }
+    const listed=await this.reloadSubs();
+    drop();
+    const lists=listed.ok&&listed.body&&Array.isArray(listed.body.lists)?listed.body.lists:[];
+    if(done||lists.some(l=>l.url===url))return this.toastMsg('차단 목록을 추가했습니다');
+    this.toastMsg('추가 실패: '+(failure||this.errorText(listed)),true);
+  };
   removeSub=(id)=>async()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b||!await this.confirmDestructive(this.tr('{name} 차단 목록을 삭제하시겠습니까?',{name:b.name})))return;const r=await this.apiSend('/v1/filter/subscriptions','DELETE',{url:b.url});if(r.ok){await this.reloadSubs();this.toastMsg('차단 목록을 삭제했습니다');}else this.toastMsg('삭제 실패: '+this.errorText(r),true);};
   toggleSub=(id)=>async()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b)return;const r=await this.apiSend('/v1/filter/subscriptions','PATCH',{url:b.url,enabled:!b.enabled});if(r.ok)await this.reloadSubs();else this.toastMsg('상태 변경 실패: '+this.errorText(r),true);};
   mutateRule=async(action,kind,rule)=>{const r=await this.apiSend('/v1/filter/rules',action,{kind,rule});if(r.ok){await this.loadRuleState();return true;}this.toastMsg('규칙 변경 실패: '+this.errorText(r),true);return false;};
@@ -6816,16 +6851,17 @@ class Component extends DCLogic {
     // 보여 주면 누른 뒤에 되살아나 버튼이 고장 난 것처럼 보인다.
     const presetName={safe_browsing:'위험 사이트 차단 (내장 목록)',parental_control:'자녀 보호 (내장 목록)'};
     const presetNote={safe_browsing:'설정의 위험 사이트 차단으로 켜고 끕니다',parental_control:'설정의 자녀 보호로 켜고 끕니다'};
-    const blocklists=s.blocklists.map((b,bi)=>({...b, rulesFmt:this.fmt(b.rules),
+    const pendingLists=s.pendingSubs.map(p=>({id:'pending:'+p.url,name:p.name,url:p.url,preset:'',enabled:true,rules:0,updated:this.relTime(0),updating:true,pending:true}));
+    const blocklists=[...s.blocklists,...pendingLists].map((b,bi)=>({...b, rulesFmt:this.fmt(b.rules),
       name:b.preset?this.t(presetName[b.preset]||presetName.safe_browsing):b.name,
-      editable:!b.preset, presetNote:b.preset?this.t(presetNote[b.preset]||presetNote.safe_browsing):'',
+      editable:!b.preset&&!b.pending, presetNote:b.preset?this.t(presetNote[b.preset]||presetNote.safe_browsing):b.pending?this.t('목록을 받고 있습니다'):'',
       iconColor:listPal[bi%listPal.length],
       icon:React.createElement('svg',{width:15,height:15,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','strokeWidth':1.7,'strokeLinecap':'round','strokeLinejoin':'round'},React.createElement('path',{d:'M12 2 4 5v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V5l-8-3Z'}),React.createElement('path',{d:'m9 12 2 2 4-4'})),
       onToggle:this.toggleSub(b.id), onRemove:this.removeSub(b.id),
       toggleLabel:this.tr(b.enabled?'{name} 목록 비활성화':'{name} 목록 활성화',{name:b.name}), removeLabel:this.tr('{name} 목록 삭제',{name:b.name}),
       onUpdate:this.refreshOneList(b.id),
       updateIcon:React.createElement('svg',{width:14,height:14,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','strokeWidth':1.7,'strokeLinecap':'round','strokeLinejoin':'round',style:b.updating?{animation:'odSpin .8s linear infinite'}:null},React.createElement('path',{d:'M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5'})),
-      updateTitle:this.t(b.updating?'업데이트 중…':'이 목록만 업데이트'),
+      updateTitle:this.t(b.pending?'목록을 받고 있습니다':b.updating?'업데이트 중…':'이 목록만 업데이트'),
       track:`width:38px;height:22px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 38px;background:${b.enabled?'var(--accent)':SW3}`,
       knob:`position:absolute;top:2px;left:${b.enabled?'18px':'2px'};width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`}));
     const blockRules=s.blockRules.map(r=>({rule:r,onRemove:this.rmBlockRule(r),removeLabel:this.tr('차단 규칙 {rule} 삭제',{rule:r})}));
