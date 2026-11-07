@@ -1,14 +1,7 @@
-/*!
- * @brief HTTP/1.1 클라이언트.
- *
- * @details 인증서 발급과 목록 내려받기에 쓴다. 외부 클라이언트를 들이지 않으므로
- *          여기서 요청·응답·전송 계층을 다 다룬다.
- * @warning 이름 해석을 운영체제에 맡기지 않는다. 이 서버가 그 기계의 DNS일 수 있어 순환이
- *          된다. 부를 쪽에서 해석 방법을 넘겨야 한다.
- * @note 응답 구획을 애매하게 만드는 것은 전부 거부한다. 길이와 조각 전송이 함께 오거나
- *       길이가 겹쳐 오면, 이 서버와 중간 장치가 응답 경계를 다르게 읽어 다음 응답이
- *       앞 응답의 본문으로 섞인다.
- */
+//! HTTP/1.1 client for certificate issuance and list downloads.
+//! Host names are never resolved through the operating system: this server may be that
+//! machine's DNS, so the caller passes a resolver. Ambiguous response framing is rejected, so
+//! this client and a middlebox cannot split one response differently.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -18,44 +11,28 @@ use std::time::{Duration, Instant};
 use onetdns_core::tcp::DeadlineTcp;
 use onetdns_tls::{client_handshake, ClientConfig, TlsError, TrustStore};
 
-/** @brief 받아들일 응답 크기 상한. */
 const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
-/** @brief 따라갈 넘김 횟수. 서로 가리키는 순환에서 멈추게 한다. */
 const MAX_REDIRECTS: usize = 6;
-/** @brief 헤더 전체 크기 상한. */
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-/** @brief 헤더 줄 수 상한. */
 const MAX_HEADER_COUNT: usize = 200;
-/** @brief 헤더 한 줄 길이 상한. */
 const MAX_HEADER_LINE: usize = 8 * 1024;
 
-/**
- * @brief 이름을 주소로 푸는 방법.
- * @warning 운영체제 해석을 쓰지 않으려는 것이다. 이 서버가 그 기계의 DNS면 순환이 된다.
- */
+/// Resolves host names; the operating system resolver may be this server itself.
 pub type HostResolver =
     Arc<dyn Fn(&str, Duration) -> Result<Vec<IpAddr>, String> + Send + Sync + 'static>;
 
 #[derive(Debug)]
-/** @brief 요청이 실패한 까닭. */
 pub enum HttpError {
-    /** @brief 주소 표기가 어긋났다. */
     Url(String),
-    /** @brief 접속하지 못했다. */
     Connect(String),
-    /** @brief TLS 핸드셰이크에 실패했다. */
     Tls(String),
-    /** @brief 주고받는 중 오류가 났다. */
     Io(String),
-    /** @brief 응답이 프로토콜에 맞지 않는다. */
     Protocol(String),
-    /** @brief 넘김을 너무 많이 따라갔다. */
     TooManyRedirects,
 }
 
 impl std::fmt::Display for HttpError {
-    /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpError::Url(s) => write!(f, "Invalid URL: {s}"),
@@ -71,31 +48,20 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 #[derive(Clone, Copy)]
-/** @brief 주소 형식. */
 enum Scheme {
-    /** @brief 평문. */
     Http,
-    /** @brief TLS. */
     Https,
 }
 
-/** @brief 쪼개 둔 주소. */
 struct Url {
-    /** @brief 평문인지 TLS인지. */
     scheme: Scheme,
-    /** @brief 붙을 대상 이름. */
     host: String,
-    /** @brief 붙을 포트. */
     port: u16,
-    /** @brief 요청할 경로. */
     path: String,
 }
 
-/**
- * @brief 주소 문자열을 쪼갠다.
- * @warning 포트와 대괄호 표기를 엄격히 본다. 애매한 것을 받아들이면 이 서버가 뜻한 곳과
- *          다른 곳에 접속한다.
- */
+/// Strict about ports and brackets: accepting an ambiguous form could connect somewhere
+/// other than intended.
 fn parse_url(s: &str) -> Result<Url, HttpError> {
     if s.is_empty()
         || s.chars()
@@ -180,38 +146,28 @@ fn parse_url(s: &str) -> Result<Url, HttpError> {
     })
 }
 
-/** @brief GET 요청을 짓기 시작한다. */
 pub fn get(url: &str) -> Req {
     Req::new("GET", url)
 }
 
-/** @brief POST 요청을 짓기 시작한다. */
 pub fn post(url: &str) -> Req {
     Req::new("POST", url)
 }
 
-/** @brief 보낼 요청. */
 pub struct Req {
-    /** @brief 요청 방식. */
     method: &'static str,
-    /** @brief 요청할 주소. */
     url: String,
-    /** @brief 붙일 헤더들. */
     headers: Vec<(String, String)>,
-    /** @brief 보낼 본문. */
     body: Vec<u8>,
-    /** @brief 요청 전체의 데드라인. */
+    /// Deadline for the whole call, redirects included.
     timeout: Duration,
-    /** @brief 받아들일 응답 크기 상한. */
     max_response: u64,
-    /** @brief 내부망을 가리키는 대상을 거부할지. */
     deny_private_targets: bool,
-    /** @brief 이름을 풀 방법. 없으면 이름으로 요청할 수 없다. */
+    /// Without one, only IP-literal and localhost URLs work.
     resolver: Option<HostResolver>,
 }
 
 impl Req {
-    /** @brief 기본값으로 요청을 만든다. */
     fn new(method: &'static str, url: &str) -> Self {
         Req {
             method,
@@ -225,57 +181,44 @@ impl Req {
         }
     }
 
-    /** @brief 헤더를 붙인다. */
     pub fn header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_string(), v.to_string()));
         self
     }
 
-    /** @brief 요청 전체의 데드라인. */
+    /// Deadline for the whole call, redirects included.
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
     }
 
-    /** @brief 받아들일 응답 크기 상한. */
     pub fn max_response(mut self, bytes: u64) -> Self {
         self.max_response = bytes.max(1);
         self
     }
 
-    /**
-     * @brief 내부망을 가리키는 대상을 거부한다.
-     * @warning 밖에서 온 주소로 요청할 때 켠다. 켜지 않으면 그 주소로 이 서버의 내부망을
-     *          훑게 된다.
-     */
+    /// Set this for URLs from outside; otherwise they can probe this server's private network.
     pub fn deny_private_targets(mut self) -> Self {
         self.deny_private_targets = true;
         self
     }
 
-    /** @brief 이름을 풀 방법을 지정한다. */
     pub fn resolver(mut self, resolver: HostResolver) -> Self {
         self.resolver = Some(resolver);
         self
     }
 
-    /** @brief 본문을 문자열로 넣는다. */
     pub fn body_string(mut self, s: &str) -> Self {
         self.body = s.as_bytes().to_vec();
         self
     }
 
-    /** @brief 본문을 바이트로 넣는다. */
     pub fn body_bytes(mut self, b: Vec<u8>) -> Self {
         self.body = b;
         self
     }
 
-    /**
-     * @brief 요청을 보내고 응답을 받는다. 넘김은 상한까지 따라간다.
-     * @note 다른 곳으로 넘어가면 붙인 헤더를 그대로 전달하지 않는다. 인증 정보가
-     *       엉뚱한 서버로 넘어간다.
-     */
+    /// Follows redirects up to a limit, dropping credentials when one leaves the origin.
     pub fn call(mut self) -> Result<Resp, HttpError> {
         let deadline = Instant::now() + self.timeout;
         for _ in 0..MAX_REDIRECTS {
@@ -316,18 +259,14 @@ impl Req {
     }
 }
 
-/** @brief 받은 응답. */
 pub struct Resp {
-    /** @brief 응답 상태. */
     pub status: u16,
-    /** @brief 응답 헤더들. */
     pub headers: Vec<(String, String)>,
-    /** @brief 응답 본문. */
     pub body: Vec<u8>,
 }
 
 impl Resp {
-    /** @brief 이 헤더의 값. 대소문자를 가리지 않는다. */
+    /// Matches the name case-insensitively.
     pub fn header(&self, name: &str) -> Option<String> {
         self.headers
             .iter()
@@ -335,14 +274,12 @@ impl Resp {
             .map(|(_, v)| v.clone())
     }
 
-    /** @brief 본문을 문자열로. */
     pub fn into_string(self) -> Result<String, HttpError> {
         String::from_utf8(self.body)
             .map_err(|e| HttpError::Protocol(format!("Body is not UTF-8: {e}")))
     }
 }
 
-/** @brief 넘김 없이 요청 하나를 주고받는다. */
 fn send_one(req: &Req, deadline: Instant) -> Result<Resp, HttpError> {
     let url = parse_url(&req.url)?;
     let tcp = connect(
@@ -360,11 +297,6 @@ fn send_one(req: &Req, deadline: Instant) -> Result<Resp, HttpError> {
     parse_response(&raw)
 }
 
-/**
- * @brief 접속한다.
- * @warning 이름은 넘겨받은 방법으로만 푼다. 운영체제에 맡기면 자기 자신에게 물어
- *          순환이 된다.
- */
 fn connect(
     host: &str,
     port: u16,
@@ -402,27 +334,44 @@ fn connect(
             "Refusing a private, loopback, or special-purpose address: {host}"
         )));
     }
+    connect_first(&addrs, deadline, ADDRESS_CONNECT_TIMEOUT).map_err(|last| {
+        HttpError::Connect(
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| format!("Could not connect to {host}")),
+        )
+    })
+}
+
+/// Caps each connect attempt but the last, so an unreachable address leaves time for the rest.
+const ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connects to the first address that answers. The error is the last attempt's, or `None` when
+/// the deadline passed before any attempt.
+fn connect_first(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    per_address: Duration,
+) -> Result<DeadlineTcp, Option<std::io::Error>> {
     let mut last = None;
-    for addr in addrs {
-        if onetdns_core::tcp::time_left(deadline).is_err() {
+    for (index, addr) in addrs.iter().enumerate() {
+        let Ok(left) = onetdns_core::tcp::time_left(deadline) else {
             break;
-        }
-        match DeadlineTcp::connect(addr, deadline) {
-            Ok(tcp) => return Ok(tcp),
+        };
+        let attempt = if index + 1 < addrs.len() {
+            left.min(per_address)
+        } else {
+            left
+        };
+        match std::net::TcpStream::connect_timeout(addr, attempt) {
+            Ok(stream) => return Ok(DeadlineTcp::new(stream, deadline)),
             Err(e) => last = Some(e),
         }
     }
-    Err(HttpError::Connect(
-        last.map(|e| e.to_string())
-            .unwrap_or_else(|| format!("Could not connect to {host}")),
-    ))
+    Err(last)
 }
 
-/**
- * @brief 이 주소로 접속하면 안 되는지.
- * @details 내부망, 루프백, 특수 목적 대역을 막는다. IPv4를 담은 IPv6 표기는 먼저 펴서
- *          본다. 펴지 않으면 같은 주소를 다른 표기로 적어 통과한다.
- */
+/// Private, loopback, and special-purpose ranges. IPv4-mapped IPv6 is unwrapped first, or
+/// the same address written another way would pass.
 fn blocked_target(ip: std::net::IpAddr) -> bool {
     let ip = match ip {
         IpAddr::V6(ip) => ip
@@ -461,7 +410,7 @@ fn blocked_target(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/** @brief 요청에 담을 대상 표기. 기본 포트면 포트를 적지 않는다. */
+/// Omits the port when it is the scheme's default.
 fn host_header(url: &Url) -> String {
     let default = matches!(url.scheme, Scheme::Http if url.port == 80)
         || matches!(url.scheme, Scheme::Https if url.port == 443);
@@ -477,10 +426,7 @@ fn host_header(url: &Url) -> String {
     }
 }
 
-/**
- * @brief 헤더 이름으로 써도 되는 글자만 들었는지.
- * @warning 줄바꿈이 든 이름을 그대로 실으면 이 서버가 보내는 요청에 남이 헤더를 끼워 넣는다.
- */
+/// A line break in a name would let the caller inject headers into the request.
 fn valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
@@ -505,10 +451,8 @@ fn valid_header_name(name: &str) -> bool {
         })
 }
 
-/**
- * @brief 헤더 구간의 줄바꿈이 짝을 이루는지.
- * @warning 홀로 선 줄바꿈을 허용하면 이 서버와 중간 장치가 응답 경계를 다르게 읽는다.
- */
+/// Requires CRLF line endings; a bare LF lets this client and a middlebox see different
+/// message boundaries.
 fn validate_http_head(head: &[u8]) -> Result<(), HttpError> {
     for (index, byte) in head.iter().copied().enumerate() {
         let paired = match byte {
@@ -525,7 +469,6 @@ fn validate_http_head(head: &[u8]) -> Result<(), HttpError> {
     Ok(())
 }
 
-/** @brief 헤더 한 줄을 이름과 값으로. */
 fn parse_header_line(line: &[u8]) -> Result<(&str, &str), HttpError> {
     let line = trim_cr(line);
     if line
@@ -560,7 +503,6 @@ fn parse_header_line(line: &[u8]) -> Result<(&str, &str), HttpError> {
     Ok((name, value))
 }
 
-/** @brief 두 주소가 같은 곳인지. 넘어갈 때 헤더를 들고 갈지 정한다. */
 fn same_origin(left: &Url, right: &Url) -> bool {
     matches!(
         (&left.scheme, &right.scheme),
@@ -569,7 +511,6 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port == right.port
 }
 
-/** @brief 보낼 요청 바이트를 만든다. */
 fn build_request(req: &Req, url: &Url) -> Result<Vec<u8>, HttpError> {
     let mut s = format!("{} {} HTTP/1.1\r\n", req.method, url.path);
     s.push_str(&format!("Host: {}\r\n", host_header(url)));
@@ -600,7 +541,6 @@ fn build_request(req: &Req, url: &Url) -> Result<Vec<u8>, HttpError> {
     Ok(bytes)
 }
 
-/** @brief 평문으로 주고받는다. */
 fn send_plain(
     mut tcp: DeadlineTcp,
     request: &[u8],
@@ -627,14 +567,11 @@ fn send_plain(
     Ok(buf)
 }
 
-/** @brief 이 기계의 신뢰 루트 목록. */
 fn system_roots() -> &'static TrustStore {
-    /** @brief 한 번만 읽어 둔다. */
     static ROOTS: OnceLock<TrustStore> = OnceLock::new();
     ROOTS.get_or_init(TrustStore::system)
 }
 
-/** @brief TLS 위에서 주고받는다. */
 fn send_tls(
     host: &str,
     mut tcp: DeadlineTcp,
@@ -685,7 +622,6 @@ fn send_tls(
     Ok(buf)
 }
 
-/** @brief 받은 양이 상한을 넘지 않았는지. */
 fn ensure_response_limit(raw: &[u8], max_response: u64) -> Result<(), HttpError> {
     if raw.len() as u64 > max_response {
         Err(HttpError::Protocol(format!(
@@ -697,15 +633,12 @@ fn ensure_response_limit(raw: &[u8], max_response: u64) -> Result<(), HttpError>
     }
 }
 
-/** @brief 본 응답 앞에 올 수 있는 중간 응답 수. */
+/// 1xx responses allowed before the final one.
 const MAX_INTERIM_RESPONSES: usize = 8;
 
-/**
- * @brief 중간 응답들을 건너뛴 본 응답의 시작 위치.
- * @warning 중간 응답에는 본문 구획 헤더가 올 수 없다. 허용하면 그것을 본문 경계로
- *          읽어 응답 하나가 둘로 쪼개진다.
- * @return 본 응답의 시작. 아직 헤더가 다 안 왔으면 없다.
- */
+/// Where the final response starts after any 1xx responses, or `None` while headers are
+/// still arriving. A 1xx response with framing headers is rejected, since honoring them
+/// would split one response in two.
 fn final_response_start(raw: &[u8]) -> Result<Option<usize>, HttpError> {
     let mut start = 0usize;
     for _ in 0..=MAX_INTERIM_RESPONSES {
@@ -768,33 +701,23 @@ fn final_response_start(raw: &[u8]) -> Result<Option<usize>, HttpError> {
 }
 
 #[derive(Clone, Copy)]
-/** @brief 본문 경계를 정하는 방식. */
 enum ResponseFraming {
-    /** @brief 본문이 없다. */
     Bodyless,
-    /** @brief 길이로 경계를 정한다. */
     ContentLength { body_start: usize, length: usize },
-    /** @brief 조각으로 나눠 보낸다. */
     Chunked { body_start: usize },
-    /** @brief 연결이 닫힐 때까지가 본문이다. */
     CloseDelimited,
 }
 
 #[derive(Default)]
-/** @brief 응답을 다 받았는지 판단하는 상태. */
 struct ResponseCompletion {
-    /** @brief 알아낸 경계 방식. 아직 헤더가 안 왔으면 없다. */
+    /// `None` until the headers have arrived.
     framing: Option<ResponseFraming>,
-    /** @brief 조각을 어디까지 확인했는지. 매번 처음부터 보지 않으려는 것이다. */
+    /// How far chunks have been checked; rescanning from the start on every read would be
+    /// quadratic.
     chunk_position: usize,
 }
 
 impl ResponseCompletion {
-    /**
-     * @brief 지금까지 받은 것으로 응답이 끝났는지.
-     * @note 조각 전송은 이미 확인한 위치부터 이어 본다. 매번 처음부터 훑으면 조각이
-     *       늘수록 확인 비용이 제곱으로 는다.
-     */
     fn is_complete(&mut self, raw: &[u8], max_response: u64) -> Result<bool, HttpError> {
         if self.framing.is_none() {
             self.framing = response_framing(raw, max_response)?;
@@ -816,11 +739,8 @@ impl ResponseCompletion {
     }
 }
 
-/**
- * @brief 헤더에서 본문 경계 방식을 읽는다.
- * @warning 길이와 조각 전송이 함께 오거나 길이가 겹쳐 오면 거부한다. 어느 쪽을 믿느냐가
- *          장치마다 달라 응답 하나를 서로 다르게 쪼갠다.
- */
+/// Rejects Content-Length together with chunked encoding, and conflicting lengths: devices
+/// disagree on which to trust and split the response differently.
 fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFraming>, HttpError> {
     let Some(start) = final_response_start(raw)? else {
         return Ok(None);
@@ -914,12 +834,11 @@ fn response_framing(raw: &[u8], max_response: u64) -> Result<Option<ResponseFram
 }
 
 #[cfg(test)]
-/** @brief 한 번에 판단하는 테스트용 진입점. */
 fn response_is_complete(raw: &[u8], max_response: u64) -> Result<bool, HttpError> {
     ResponseCompletion::default().is_complete(raw, max_response)
 }
 
-/** @brief 조각 전송 본문이 끝난 위치. 아직이면 없다. */
+/// Where the chunked body ends, or `None` if it has not all arrived.
 fn chunked_wire_len_from(
     data: &[u8],
     completed_position: &mut usize,
@@ -979,7 +898,6 @@ fn chunked_wire_len_from(
     }
 }
 
-/** @brief 받은 바이트를 응답으로. */
 fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
     let start = final_response_start(raw)?
         .ok_or_else(|| HttpError::Protocol("No final HTTP response".into()))?;
@@ -1074,7 +992,6 @@ fn parse_response(raw: &[u8]) -> Result<Resp, HttpError> {
     })
 }
 
-/** @brief 상태 줄에서 상태 번호를. */
 fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
     let s = std::str::from_utf8(line)
         .map_err(|_| HttpError::Protocol("Status line encoding".into()))?;
@@ -1100,7 +1017,6 @@ fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
     Ok(code)
 }
 
-/** @brief 조각 전송 본문을 이어 붙인다. */
 fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::new();
     loop {
@@ -1139,7 +1055,6 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, HttpError> {
     }
 }
 
-/** @brief 조각 크기 줄을 읽는다. */
 fn parse_chunk_size(line: &[u8]) -> Result<usize, HttpError> {
     if line.len() > MAX_HEADER_LINE {
         return Err(HttpError::Protocol("Chunk size line is too long".into()));
@@ -1164,7 +1079,7 @@ fn parse_chunk_size(line: &[u8]) -> Result<usize, HttpError> {
         .map_err(|_| HttpError::Protocol(format!("Could not parse the chunk size: {hex}")))
 }
 
-/** @brief 본문 뒤에 붙은 헤더가 형식에 맞는지. 여기도 검사해야 경계가 어긋나지 않는다. */
+/// Trailers are checked like headers, or they too could shift message boundaries.
 fn validate_chunk_trailers(trailers: &[u8]) -> Result<(), HttpError> {
     if trailers.len() > MAX_HEADER_BYTES {
         return Err(HttpError::Protocol(
@@ -1190,7 +1105,6 @@ fn validate_chunk_trailers(trailers: &[u8]) -> Result<(), HttpError> {
     Ok(())
 }
 
-/** @brief 넘어갈 주소를 지금 주소를 기준으로 푼다. */
 fn resolve_redirect(current: &str, location: &str) -> Result<String, HttpError> {
     let location = location.trim();
     if location.is_empty() {
@@ -1225,7 +1139,7 @@ fn resolve_redirect(current: &str, location: &str) -> Result<String, HttpError> 
     Ok(format!("{scheme}://{host}{}", normalize_path(&merged)))
 }
 
-/** @brief 경로의 점 조각을 정리한다. */
+/// Removes `.` and `..` segments.
 fn normalize_path(path: &str) -> String {
     let (path_part, suffix) = match path.find(['?', '#']) {
         Some(i) => (&path[..i], &path[i..]),
@@ -1251,7 +1165,6 @@ fn normalize_path(path: &str) -> String {
     result
 }
 
-/** @brief 바이트열에서 이 조각이 처음 나오는 위치. */
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -1259,7 +1172,6 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/** @brief 줄 끝의 복귀 문자를 뗀다. */
 fn trim_cr(line: &[u8]) -> &[u8] {
     match line.strip_suffix(b"\r") {
         Some(l) => l,
@@ -1268,13 +1180,11 @@ fn trim_cr(line: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
-/** @brief 주소 해석, 데드라인, 내부망 거부, 그리고 응답 경계를 애매하게 만드는 것들의 거부. */
 mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
 
-    /** @brief 정해진 바이트를 돌려주는 테스트용 서버. */
     fn mock_server(response: &'static [u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1289,7 +1199,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 형태의 주소가 제대로 쪼개지는지. */
     fn url_parse_variants() {
         let u = parse_url("http://127.0.0.1:8080/v1/stats").unwrap();
         assert!(matches!(u.scheme, Scheme::Http));
@@ -1309,7 +1218,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 길이로 경계를 정한 응답을 받는지. */
     fn get_plain_content_length() {
         let url =
             mock_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
@@ -1319,7 +1227,17 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 바이트씩 흘려 보내는 상대가 데드라인을 늘리지 못하는지. */
+    fn an_unreachable_address_leaves_time_for_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // TEST-NET-1 is never routed, so a connect there hangs or fails at once.
+        let unreachable = SocketAddr::from(([192, 0, 2, 1], listener.local_addr().unwrap().port()));
+        let addrs = [unreachable, listener.local_addr().unwrap()];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        assert!(connect_first(&addrs, deadline, Duration::from_millis(300)).is_ok());
+        listener.accept().unwrap();
+    }
+
+    #[test]
     fn slow_drip_response_cannot_reset_request_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1345,7 +1263,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 넘겨준 해석 방법을 실제로 쓰는지. */
     fn custom_resolver_bypasses_system_dns() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1372,7 +1289,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 해석 방법이 없으면 운영체제 리졸버로 넘기지 않는지. 넘기면 순환이 된다. */
     fn hostname_never_falls_back_to_system_dns() {
         let error = match get("http://unconfigured.invalid/")
             .timeout(Duration::from_millis(50))
@@ -1385,7 +1301,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 표기를 바꿔 적은 내부망 주소도 걸러지는지. */
     fn private_target_filter_normalizes_mapped_and_reserved_addresses() {
         for address in [
             "127.0.0.1",
@@ -1405,7 +1320,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 접속하기 전에 막는지. 접속한 뒤 막으면 이미 두드린 것이다. */
     fn private_target_filter_rejects_localhost_before_connecting() {
         let result = get("http://localhost/")
             .deny_private_targets()
@@ -1419,7 +1333,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각 전송 본문이 이어 붙는지. */
     fn get_chunked_decodes() {
         let url = mock_server(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
@@ -1429,7 +1342,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 본문과 헤더가 실려 가는지. */
     fn post_with_body_and_header() {
         let url =
             mock_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
@@ -1444,7 +1356,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    /** @brief 실제 서버와의 왕복. */
     fn live_https_fetch() {
         let bootstrap = ["1.1.1.1".parse().unwrap()];
         let resolver: HostResolver = Arc::new(move |host, timeout| {
@@ -1466,7 +1377,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상태와 헤더가 읽히는지. */
     fn status_and_header_parsing() {
         let raw = b"HTTP/1.1 404 Not Found\r\nX-Foo: bar\r\nConnection: close\r\n\r\nnope";
         let r = parse_response(raw).unwrap();
@@ -1476,7 +1386,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 절대 주소와 루트 경로 넘김. */
     fn redirect_absolute_and_root() {
         assert_eq!(
             resolve_redirect("https://a.test/x", "https://b.test/y").unwrap(),
@@ -1489,7 +1398,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 형식만 물려받는 넘김. */
     fn redirect_scheme_relative() {
         assert_eq!(
             resolve_redirect("https://a.test/x", "//cdn.test/p").unwrap(),
@@ -1498,7 +1406,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대 경로 넘김. */
     fn redirect_path_relative() {
         assert_eq!(
             resolve_redirect("https://a.test/dir/page", "next").unwrap(),
@@ -1519,7 +1426,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 문자열만 바뀌는 넘김. */
     fn redirect_query_only() {
         assert_eq!(
             resolve_redirect("https://a.test/search?old=1", "?new=2").unwrap(),
@@ -1528,13 +1434,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 넘길 주소가 비면 오류인지. */
     fn redirect_empty_errors() {
         assert!(resolve_redirect("https://a.test/x", "   ").is_err());
     }
 
     #[test]
-    /** @brief 점 조각이 정리되는지. */
     fn normalize_dot_segments() {
         assert_eq!(normalize_path("/a/b/../c"), "/a/c");
         assert_eq!(normalize_path("/a/./b/"), "/a/b/");
@@ -1542,7 +1446,6 @@ mod tests {
         assert_eq!(normalize_path("/a/b/c?q=1"), "/a/b/c?q=1");
     }
     #[test]
-    /** @brief 경계가 애매한 응답을 거부하는지. 받아들이면 응답 하나가 둘로 읽힌다. */
     fn rejects_ambiguous_or_malformed_framing() {
         assert!(parse_response(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
@@ -1567,7 +1470,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 헤더에 끼워 넣기와 잘못된 포트를 막는지. */
     fn rejects_request_header_injection_and_bad_ports() {
         assert!(parse_url("http://example.com:0/").is_err());
         let url = parse_url("https://example.com/").unwrap();
@@ -1578,7 +1480,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다 받았는지를 프로토콜이 정한 경계로 판단하는지. */
     fn response_completion_uses_http_framing() {
         let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
         let complete = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
@@ -1598,7 +1499,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각 확인이 앞서 본 위치부터 이어지는지. 처음부터 다시 보면 비용이 제곱으로 든다. */
     fn chunked_completion_resumes_after_the_last_complete_chunk() {
         let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         let body_start = raw.len();
@@ -1616,14 +1516,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 길이가 상한을 넘으면 다 받기 전에 끊는지. */
     fn response_completion_rejects_oversized_content_length_early() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\n\r\n";
         assert!(response_is_complete(raw, 1024).is_err());
     }
 
     #[test]
-    /** @brief 본문 없는 상태와 뒤따르는 헤더를 규격대로 다루는지. */
     fn bodyless_status_and_chunk_trailers_obey_http_framing() {
         let not_modified =
             parse_response(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n").unwrap();
