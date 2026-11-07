@@ -50,8 +50,10 @@ pub fn open_private(path: &Path, how: PrivateOpen) -> io::Result<File> {
 pub fn create_new_like(path: &Path, template: &Path) -> io::Result<File> {
     let descriptor = windows::Descriptor::of_file(template)?;
     let file = windows::create(path, PrivateOpen::CreateNew, descriptor.as_ref())?;
-    // Creation drops the auto-inherited flag that later folder ACL changes rely on.
-    if let Some(descriptor) = descriptor.as_ref().filter(|d| !d.is_protected()) {
+    // Creation drops the auto-inherited flag that later folder ACL changes rely on. A DACL
+    // without the flag is already copied as is; re-inheriting would add the folder's entries a
+    // second time.
+    if let Some(descriptor) = descriptor.as_ref().filter(|d| d.inherits_automatically()) {
         descriptor.apply_inheriting(path)?;
     }
     Ok(file)
@@ -89,6 +91,7 @@ mod windows {
 
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
     const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
+    const SE_DACL_AUTO_INHERITED: u16 = 0x0400;
     const SE_DACL_PROTECTED: u16 = 0x1000;
     const SE_FILE_OBJECT: u32 = 1;
     const SDDL_REVISION_1: u32 = 1;
@@ -195,7 +198,11 @@ mod windows {
 
     impl Descriptor {
         pub(super) fn owner_only() -> io::Result<Self> {
-            let sddl: Vec<u16> = OWNER_ONLY.encode_utf16().chain(once(0)).collect();
+            Self::from_sddl(OWNER_ONLY)
+        }
+
+        pub(super) fn from_sddl(sddl: &str) -> io::Result<Self> {
+            let sddl: Vec<u16> = sddl.encode_utf16().chain(once(0)).collect();
             let mut memory = null_mut();
             // SAFETY: `sddl` is NUL-terminated and `memory` receives a buffer that `Descriptor` frees.
             let converted = unsafe {
@@ -270,13 +277,14 @@ mod windows {
             Ok(())
         }
 
-        pub(super) fn is_protected(&self) -> bool {
+        /// Whether the DACL takes entries from its folder through automatic inheritance.
+        pub(super) fn inherits_automatically(&self) -> bool {
             let mut control = 0u16;
             let mut revision = 0u32;
             // SAFETY: the descriptor is valid and both outputs are plain integers.
             let read =
                 unsafe { GetSecurityDescriptorControl(self.as_ptr(), &mut control, &mut revision) };
-            read != 0 && control & SE_DACL_PROTECTED != 0
+            read != 0 && control & SE_DACL_AUTO_INHERITED != 0 && control & SE_DACL_PROTECTED == 0
         }
 
         /// Sets this DACL's explicit entries on `path` and inherits the rest from its folder.
@@ -453,6 +461,28 @@ mod tests {
         for path in [private, plain, replacement] {
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_replacement_copies_an_acl_that_does_not_inherit_automatically() {
+        // SetFileSecurityW leaves out the auto-inherited flag, as on some CI runners' temp folders.
+        let folder = scratch("legacy");
+        std::fs::create_dir(&folder).unwrap();
+        windows::Descriptor::from_sddl("D:(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)")
+            .unwrap()
+            .apply(&folder)
+            .unwrap();
+        let template = folder.join("template");
+        std::fs::write(&template, b"x").unwrap();
+        let replacement = folder.join("replacement");
+        drop(create_new_like(&replacement, &template).unwrap());
+        let rules = (
+            access_rules(&template).unwrap(),
+            access_rules(&replacement).unwrap(),
+        );
+        std::fs::remove_dir_all(folder).unwrap();
+        assert_eq!(rules.1, rules.0);
     }
 
     #[cfg(unix)]
