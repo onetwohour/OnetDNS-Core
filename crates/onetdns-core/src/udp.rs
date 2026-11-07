@@ -1,57 +1,44 @@
-/*!
- * @brief UDP 소켓을 열고 받는 공통 경로.
- *
- * @details 윈도우의 UDP 소켓은 보낸 데이터그램이 ICMP 도달 불가로 돌아오면 그 오류를 다음
- *          수신 호출 하나에 돌려준다. 연결하지 않은 소켓에서는 그 오류가 어느 상대의 것인지
- *          알 수 없다. 발신 교환은 이 오류를 교환 실패로 보므로, 한 상대가 닫혀 있으면 같은
- *          소켓으로 다른 상대와 하던 교환까지 실패한다. 수신 소켓에서는 받지 못한 질의가
- *          없는데도 수신 실패가 기록된다. 그래서 두 보고를 모두 꺼 둔다. 수신 대기에 한도를
- *          두는 루프는 RecvWait 로 받는다.
- */
+//! UDP sockets that behave the same on Windows and Unix. Open every UDP socket with `bind`.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-/**
- * @brief UDP 소켓을 열고 ICMP 오류가 수신을 깨뜨리지 않게 한다.
- * @note 유닉스는 연결하지 않은 UDP 소켓에 ICMP 오류를 전달하지 않으므로 여는 것만 한다.
- */
+/// Opens a UDP socket. On Windows, ICMP errors no longer fail later receives, and port 0 gets a
+/// random port instead of the next one in sequence.
 pub fn bind(addr: impl Into<SocketAddr>) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(addr.into())?;
+    let addr = addr.into();
     #[cfg(windows)]
-    windows::ignore_icmp_errors(&socket)?;
-    Ok(socket)
+    {
+        let socket = if addr.port() == 0 {
+            windows::bind_random_port(addr)?
+        } else {
+            UdpSocket::bind(addr)?
+        };
+        windows::ignore_icmp_errors(&socket)?;
+        Ok(socket)
+    }
+    #[cfg(not(windows))]
+    UdpSocket::bind(addr)
 }
 
-/**
- * @brief 한도를 두고 데이터그램 하나를 기다리는 수신.
- *
- * @details 윈도우에서 소켓 수신 한도에 걸려 끝나는 수신 호출은 그 순간 도착한 데이터그램을
- *          버린다. CPU 가 붐빌수록 자주 버리고, 버린 데이터그램은 보낸 쪽이 다시 보내기 전까지
- *          오지 않는다. 그래서 윈도우에서는 소켓에 한도를 걸지 않고, 읽을 데이터그램이 생길
- *          때까지 WSAPoll 로 기다린 다음에 받는다. 유닉스의 소켓 수신 한도는 데이터그램을
- *          버리지 않으므로 그대로 쓴다.
- * @warning 한 소켓을 한 스레드만 읽을 때 쓴다. 기다리는 사이 다른 스레드가 데이터그램을
- *          가져가면 뒤따르는 수신이 한도 없이 막힌다. 여러 스레드가 나눠 읽는 소켓은 한도 없이
- *          기다리게 하고, 멈출 때 깨우는 데이터그램을 보낸다.
- */
+/// Waits at most `timeout` for one datagram.
+///
+/// A Windows receive that ends on the socket timeout drops the datagram arriving at that moment,
+/// so on Windows the socket gets no timeout and `WSAPoll` does the waiting. Use it only on a
+/// socket one thread reads: if another thread takes the datagram after the poll, the receive
+/// blocks without a limit.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvWait {
-    /** @brief 데이터그램 하나를 기다리는 최대 시간. */
     timeout: Duration,
 }
 
 impl RecvWait {
-    /** @brief 한도를 정한다. install 로 소켓에 건 다음에 받는다. */
+    /// Call `install` on the socket before receiving.
     pub fn new(timeout: Duration) -> Self {
         Self { timeout }
     }
 
-    /**
-     * @brief 소켓의 수신 대기를 이 한도에 맞춘다.
-     * @details 윈도우에서는 소켓 한도를 걷어 내 수신 호출이 한도에 걸려 끝나는 일이 없게 한다.
-     */
     pub fn install(self, socket: &UdpSocket) -> io::Result<()> {
         if cfg!(windows) {
             socket.set_read_timeout(None)
@@ -60,25 +47,18 @@ impl RecvWait {
         }
     }
 
-    /**
-     * @brief 한도 안에 도착한 데이터그램 하나를 받는다.
-     * @retval Err 한도 안에 오지 않았으면 종류가 WouldBlock 이나 TimedOut 인 오류.
-     */
+    /// Fails with `WouldBlock` or `TimedOut` when nothing arrives in time.
     pub fn recv_from(self, socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.wait(socket)?;
         socket.recv_from(buf)
     }
 
-    /**
-     * @brief 연결한 소켓에서 한도 안에 도착한 데이터그램 하나를 받는다.
-     * @retval Err 한도 안에 오지 않았으면 종류가 WouldBlock 이나 TimedOut 인 오류.
-     */
+    /// Fails with `WouldBlock` or `TimedOut` when nothing arrives in time.
     pub fn recv(self, socket: &UdpSocket, buf: &mut [u8]) -> io::Result<usize> {
         self.wait(socket)?;
         socket.recv(buf)
     }
 
-    /** @brief 윈도우에서 읽을 데이터그램이 생길 때까지 기다린다. 유닉스는 소켓 한도가 맡는다. */
     fn wait(self, socket: &UdpSocket) -> io::Result<()> {
         #[cfg(windows)]
         if !windows::wait_readable(socket, self.timeout)? {
@@ -93,31 +73,48 @@ impl RecvWait {
 #[cfg(windows)]
 mod windows {
     use std::io;
-    use std::net::UdpSocket;
-    use std::os::windows::io::AsRawSocket;
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
     use std::time::Duration;
 
-    /** @brief ICMP 포트 도달 불가를 수신 오류로 돌려주는 동작. */
+    const AF_INET: i32 = 2;
+    const AF_INET6: i32 = 23;
+    const SOCK_DGRAM: i32 = 2;
+    const IPPROTO_UDP: i32 = 17;
+    const INVALID_SOCKET: usize = usize::MAX;
+    const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+    const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+    const WSANOTINITIALISED: i32 = 10_093;
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_RANDOMIZE_PORT: i32 = 0x3005;
     const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
-    /** @brief ICMP TTL 만료를 수신 오류로 돌려주는 동작. */
     const SIO_UDP_NETRESET: u32 = 0x9800_000F;
-    /** @brief 보통 데이터를 읽을 수 있게 됐다는 사건. */
     const POLLRDNORM: i16 = 0x0100;
 
-    /** @brief WSAPoll 이 소켓 하나를 기다릴 때 쓰는 항목. */
     #[repr(C)]
     struct PollFd {
-        /** @brief 기다릴 소켓 핸들. */
         fd: usize,
-        /** @brief 기다릴 사건. */
         events: i16,
-        /** @brief 일어난 사건. WSAPoll 이 채운다. */
         revents: i16,
     }
 
+    /// Room for a `SOCKADDR_IN6`, the larger of the two.
+    #[repr(C, align(8))]
+    struct RawSockAddr([u8; 28]);
+
     #[link(name = "ws2_32")]
     unsafe extern "system" {
-        /** @brief 소켓 제어 호출. */
+        fn WSASocketW(
+            af: i32,
+            kind: i32,
+            protocol: i32,
+            protocol_info: *mut core::ffi::c_void,
+            group: u32,
+            flags: u32,
+        ) -> usize;
+        fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
+        #[link_name = "bind"]
+        fn bind_socket(socket: usize, name: *const u8, len: i32) -> i32;
         fn WSAIoctl(
             socket: usize,
             code: u32,
@@ -129,17 +126,85 @@ mod windows {
             overlapped: *mut core::ffi::c_void,
             completion: *mut core::ffi::c_void,
         ) -> i32;
-        /** @brief 소켓들이 준비될 때까지 밀리초 한도 안에서 기다린다. */
         fn WSAPoll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
     }
 
-    /**
-     * @brief 소켓에 읽을 것이 생길 때까지 기다린다.
-     * @return 한도 안에 생겼으면 true. 오류 상태도 읽을 것으로 보고, 뒤따르는 수신이 그 오류를
-     *         돌려준다.
-     * @safety 살아 있는 소켓 핸들을 담은 항목 하나를 넘기고, 호출이 끝날 때까지 그 항목을
-     *         빌려 둔다.
-     */
+    /// Opens a socket the way std does: overlapped and not inherited by child processes.
+    fn open(family: i32) -> usize {
+        // SAFETY: every argument is a plain value or null.
+        unsafe {
+            WSASocketW(
+                family,
+                SOCK_DGRAM,
+                IPPROTO_UDP,
+                core::ptr::null_mut(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+        }
+    }
+
+    fn raw_addr(addr: SocketAddr) -> (RawSockAddr, i32) {
+        let mut raw = RawSockAddr([0; 28]);
+        match addr {
+            SocketAddr::V4(v4) => {
+                raw.0[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+                raw.0[2..4].copy_from_slice(&v4.port().to_be_bytes());
+                raw.0[4..8].copy_from_slice(&v4.ip().octets());
+                (raw, 16)
+            }
+            SocketAddr::V6(v6) => {
+                raw.0[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+                raw.0[2..4].copy_from_slice(&v6.port().to_be_bytes());
+                raw.0[4..8].copy_from_slice(&v6.flowinfo().to_ne_bytes());
+                raw.0[8..24].copy_from_slice(&v6.ip().octets());
+                raw.0[24..28].copy_from_slice(&v6.scope_id().to_ne_bytes());
+                (raw, 28)
+            }
+        }
+    }
+
+    /// Binds `addr` (port 0) with `SO_RANDOMIZE_PORT`, so Windows picks a random free port
+    /// rather than the next one; std's `UdpSocket::bind` gives no chance to set it before `bind`.
+    pub(super) fn bind_random_port(addr: SocketAddr) -> io::Result<UdpSocket> {
+        let family = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
+        let mut handle = open(family);
+        if handle == INVALID_SOCKET
+            && io::Error::last_os_error().raw_os_error() == Some(WSANOTINITIALISED)
+        {
+            // std starts Winsock when it opens its first socket.
+            drop(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)));
+            handle = open(family);
+        }
+        if handle == INVALID_SOCKET {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the socket was just opened and has no other owner; `socket` closes it.
+        let socket = unsafe { UdpSocket::from_raw_socket(handle as RawSocket) };
+        let on: u32 = 1;
+        // SAFETY: a live socket and a 4-byte option value that outlives the call.
+        let rc = unsafe {
+            setsockopt(
+                handle,
+                SOL_SOCKET,
+                SO_RANDOMIZE_PORT,
+                (&on as *const u32).cast(),
+                std::mem::size_of::<u32>() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (raw, len) = raw_addr(addr);
+        // SAFETY: `raw` holds `len` bytes of a valid socket address for this family.
+        if unsafe { bind_socket(handle, raw.0.as_ptr(), len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(socket)
+    }
+
+    /// Returns true when the socket became readable in time. An error state counts as readable;
+    /// the receive that follows reports it.
     pub(super) fn wait_readable(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
         let timeout_ms = i32::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
         let mut entry = PollFd {
@@ -147,6 +212,7 @@ mod windows {
             events: POLLRDNORM,
             revents: 0,
         };
+        // SAFETY: one entry holding a live socket, borrowed for the whole call.
         let ready = unsafe { WSAPoll(&mut entry, 1, timeout_ms) };
         if ready < 0 {
             return Err(io::Error::last_os_error());
@@ -154,15 +220,13 @@ mod windows {
         Ok(ready > 0)
     }
 
-    /**
-     * @brief 두 ICMP 오류 보고를 끈다.
-     * @safety 살아 있는 소켓 핸들과 수명 동안 유효한 4바이트 입력, 반환 길이 칸을 넘기고
-     *         겹침 입출력은 쓰지 않는다.
-     */
+    /// Stops ICMP port-unreachable and TTL-expired errors from failing the next receive.
     pub(super) fn ignore_icmp_errors(socket: &UdpSocket) -> io::Result<()> {
         for code in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
             let off: u32 = 0;
             let mut returned: u32 = 0;
+            // SAFETY: a live socket, a 4-byte input and a length slot that outlive the call,
+            // and no overlapped I/O.
             let rc = unsafe {
                 WSAIoctl(
                     socket.as_raw_socket() as usize,
@@ -187,14 +251,51 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::time::Duration;
 
+    fn ports_in_sequence(ip: IpAddr) -> usize {
+        let sockets: Vec<UdpSocket> = (0..16).map(|_| bind((ip, 0)).expect("bind")).collect();
+        let ports: Vec<u16> = sockets
+            .iter()
+            .map(|socket| {
+                let local = socket.local_addr().unwrap();
+                assert_eq!(local.ip(), ip);
+                local.port()
+            })
+            .collect();
+        ports
+            .windows(2)
+            .filter(|pair| pair[1] == pair[0].wrapping_add(1))
+            .count()
+    }
+
     #[test]
-    /**
-     * @brief 닫힌 포트로 보낸 뒤 첫 수신이 오류 없이 다음 데이터그램을 돌려주는지.
-     * @details 윈도우 기본 동작이면 첫 수신이 연결 재설정 오류로 끝난다. 발신 교환은 그
-     *          오류를 교환 실패로 본다.
-     */
+    fn port_zero_gets_an_unpredictable_port() {
+        assert!(ports_in_sequence(IpAddr::from([127, 0, 0, 1])) < 4);
+    }
+
+    #[test]
+    fn port_zero_gets_an_unpredictable_port_over_ipv6() {
+        if UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        assert!(ports_in_sequence("::1".parse().unwrap()) < 4);
+    }
+
+    #[test]
+    fn a_fixed_port_is_kept() {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let socket = bind(([127, 0, 0, 1], port)).expect("bind");
+        assert_eq!(socket.local_addr().unwrap().port(), port);
+    }
+
+    /// Windows would fail the first receive with a connection reset.
+    #[test]
     fn datagram_after_icmp_unreachable_is_received() {
         let server = bind(([127, 0, 0, 1], 0)).expect("bind");
         server
@@ -218,12 +319,8 @@ mod tests {
         assert_eq!(from, client.local_addr().unwrap());
     }
 
+    /// The datagram loss only shows under CPU load, so this checks what was installed.
     #[test]
-    /**
-     * @brief 윈도우에서는 소켓 한도를 걷어 내고 유닉스에서는 그대로 거는지.
-     * @details 윈도우 소켓에 한도가 남으면 한도에 걸려 끝나는 순간 도착한 데이터그램을 버린다.
-     *          이 손실은 CPU 가 붐빌 때만 드러나 시험으로 재현하기 어려우므로 설치 결과를 본다.
-     */
     fn recv_wait_keeps_windows_sockets_free_of_receive_timeouts() {
         let socket = bind(([127, 0, 0, 1], 0)).expect("bind");
         socket
@@ -241,7 +338,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기다리는 동안 온 데이터그램을 받고, 오지 않으면 한도 뒤에 시간 초과로 끝나는지. */
     fn recv_wait_returns_datagram_or_times_out() {
         let socket = bind(([127, 0, 0, 1], 0)).expect("bind");
         let wait = RecvWait::new(Duration::from_millis(50));
