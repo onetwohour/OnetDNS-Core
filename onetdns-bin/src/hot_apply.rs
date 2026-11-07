@@ -1,17 +1,4 @@
-/*!
- * @brief 설정을 세대를 다시 만들지 않고 교체한다.
- *
- * @details 바뀐 키를 config_keys 의 표로 교체 그룹에 나누고, 그룹마다 이 세대의 핸들을
- *          교체한다. 교체할 수 없는 키가 하나라도 섞여 있으면 아무것도 바꾸지 않고 재시작을
- *          요청한다. 어떤 핸들을 교체하는지는 HotApplyDeps 가 모두 드러낸다.
- *
- *          교체는 세 단계로 나뉜다. 준비 단계는 새 설정으로 만들 것을 모두 만들되 실행 중인
- *          상태를 바꾸지 않는다. 효과 단계는 수신 주소, DHCP, 클러스터처럼 다시 시작해야 하는
- *          작업을 새 설정으로 돌리고, 하나라도 실패하면 이미 돌린 것을 이전 설정으로 되돌린다.
- *          반영 단계는 준비한 것을 슬롯에 넣기만 하므로 실패하지 않는다.
- * @invariant 교체가 실패하면 실행 중인 상태는 이전 설정과 같다. 설정 파일도 이전 것으로
- *            돌아가므로, 반쯤 바뀐 상태가 남으면 파일과 다르게 답한다.
- */
+//! Applies a config change to the running generation without building a new one.
 
 use super::*;
 use crate::config_apply::{
@@ -23,7 +10,7 @@ use crate::edge::{reconcile_edge_services, EdgeServices};
 use crate::filter_runtime::FilterState;
 use crate::filters::{
     blocklist_host_resolver, build_filter_engine_for_config, preset_list_urls,
-    release_subscription_lines, FilterBuildInputs,
+    release_subscription_lines, revocation_host_resolver, FilterBuildInputs,
 };
 use crate::listeners::{PreparedTls, TlsSlots};
 use crate::native_config::{
@@ -36,22 +23,17 @@ use crate::resolver_chain::PreparedChain;
 use crate::zones::{build_zone_store, reconcile_zone_watchers, replace_zone_store, ZoneState};
 use std::sync::atomic::Ordering;
 
-/**
- * @brief 효과 단계에서 이미 일으킨 효과를 되돌리는 작업들.
- * @details 다시 시작한 작업과 다시 연 주소는 뒤에서 실패해도 새 설정으로 계속 돈다. 실패하면
- *          등록한 작업을 거꾸로 실행해 이전 설정으로 되돌린다. 효과를 일으키기 전에 등록해야
- *          한다. 일으키는 도중에 실패해도 절반쯤 바뀌어 있을 수 있기 때문이다.
- */
+/// Steps that undo effects already applied. Register a step before causing its effect: one
+/// that fails midway may have half-applied it.
 #[derive(Default)]
 struct Undo<'a>(Vec<Box<dyn FnOnce() -> Result<(), String> + 'a>>);
 
 impl<'a> Undo<'a> {
-    /** @brief 되돌릴 작업을 등록한다. */
     fn push(&mut self, step: impl FnOnce() -> Result<(), String> + 'a) {
         self.0.push(Box::new(step));
     }
 
-    /** @brief 실패면 등록한 작업을 모두 거꾸로 실행하고, 되돌리지 못한 것까지 오류에 붙인다. */
+    /// On failure runs every step in reverse and adds the steps that failed to the error.
     fn check<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
         result.map_err(|error| {
             let failed: Vec<String> = std::mem::take(&mut self.0)
@@ -71,7 +53,7 @@ impl<'a> Undo<'a> {
     }
 }
 
-/** @brief 통계와 질의 기록을 저장할 설정. 경로가 비어 있으면 저장하지 않는다. */
+/// An empty path turns that storage off.
 pub(crate) fn persist_opts(cfg: &Config) -> onetdns_control::PersistOpts {
     onetdns_control::PersistOpts {
         querylog_file: cfg
@@ -86,114 +68,81 @@ pub(crate) fn persist_opts(cfg: &Config) -> onetdns_control::PersistOpts {
     }
 }
 
-/** @brief 교체 경로가 바꾸는 이 세대의 핸들. */
+/// The handles of this generation that a hot apply swaps.
 pub(crate) struct HotApplyDeps {
-    /** @brief 설정이 바뀌면 다시 시작할 작업들. */
     pub(crate) restarts: RestartHooks,
-    /** @brief 권한 영역 상태. */
     pub(crate) zones: ZoneState,
-    /** @brief 차단 엔진과 그 재료. */
     pub(crate) filters: FilterState,
-    /** @brief 관리 화면 인증. 관리 수신 주소가 없으면 없다. */
+    /// `None` without a dashboard listener.
     pub(crate) console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>>,
-    /** @brief 관리 화면 앞의 리버스 프록시 정책. */
     pub(crate) control_proxy: Arc<ArcSwap<onetdns_control::ProxyPolicy>>,
-    /** @brief 실행 중 설정. */
     pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
-    /** @brief 접근 제어. */
     pub(crate) acl_state: Arc<DynamicAccessControl>,
-    /** @brief 속도 제한. */
     pub(crate) rate_state: Arc<DynamicRateLimiter>,
-    /** @brief 질의 기록. */
     pub(crate) recorder: onetdns_control::Recorder,
-    /** @brief 전달 리졸버 슬롯. */
     pub(crate) forward_slot: native::ResolverSlot,
-    /** @brief 업스트림 통계. 전달 경로가 없으면 없다. */
+    /// `None` while not forwarding.
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
-    /** @brief 질의 처리기와 함께 교체할 상태. 처리기를 만들기 전에는 없다. */
+    /// `None` until the query handler is built.
     pub(crate) native_hot_state: Arc<Mutex<Option<NativeHotState>>>,
-    /** @brief 통계. */
     pub(crate) stats: onetdns_control::Stats,
-    /** @brief 이 세대의 종료 플래그. */
+    /// This generation's shutdown flag.
     pub(crate) zone_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 이 세대가 끝날 때 기다릴 스레드. */
+    /// Threads to join when this generation ends.
     pub(crate) zone_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
-    /** @brief DHCP 계열 서비스. */
     pub(crate) edge_services: Arc<EdgeServices>,
-    /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
+    /// `None` while DHCPv4 is off.
     pub(crate) dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
-    /** @brief DHCPv6 임대 풀. 서비스가 꺼져 있으면 없다. */
+    /// `None` while DHCPv6 is off.
     pub(crate) dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<dhcp6::Lease6Pool>>>>>,
-    /** @brief TLS 인증서 슬롯. 암호화 수신 주소가 없으면 없다. */
+    /// `None` without an encrypted listener.
     pub(crate) tls_slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
-    /** @brief MAC 제조사 데이터베이스. */
     pub(crate) vendor_db: Arc<ArcSwap<mac::VendorDb>>,
-    /** @brief 목록을 받을 때 쓰는 이름 해석기의 교체 슬롯. */
+    /// Resolves the host names in the server's own HTTP requests.
     pub(crate) blocklist_resolver_slot: Arc<Mutex<http::HostResolver>>,
-    /** @brief 목록을 받을 때 쓰는 이름 해석기. */
-    pub(crate) blocklist_resolver: http::HostResolver,
-    /** @brief 응답 캐시. 체인을 만들기 전에는 없다. */
+    /// Resolves the OCSP and CRL hosts of upstream certificates.
+    pub(crate) revocation_resolver_slot: Arc<Mutex<http::HostResolver>>,
+    /// `None` until the chain is built.
     pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
 }
 
-/**
- * @brief 준비 단계에서 만든 것들. 실행 중인 상태에는 아직 들어가지 않았다.
- * @details 효과 단계와 반영 단계는 이것만 읽는다. 단계마다 함수를 나눠 두어야 준비하는 동안
- *          반영 단계의 지역 값까지 한 프레임에 쌓이지 않는다. 관리 연결 스레드는 스택이 작다.
- */
+/// What `prepare` built, not yet in the running state. The steps are separate functions so
+/// their locals do not pile up in one frame; dashboard connection threads have small stacks.
 struct Prepared {
-    /** @brief 질의 처리기와 함께 교체할 상태. 그 상태를 바꾸는 그룹이 없으면 없다. */
+    /// `None` when no group changes it.
     native_state: Option<NativeHotState>,
-    /** @brief 수신 주소를 설정에 맞추는 작업. */
     listeners: Option<SecondaryRestart>,
-    /** @brief Raft 를 다시 시작하는 작업. */
     raft: Option<SecondaryRestart>,
-    /** @brief 임대 정보 동기화를 다시 시작하는 작업. */
     lease_sync: Option<SecondaryRestart>,
-    /** @brief 관리 수신 주소를 다시 여는 작업. 주소가 그대로면 없다. */
+    /// `None` when the dashboard address is unchanged.
     rebind: Option<SecondaryRestart>,
-    /** @brief 기본 체인을 다시 만드는 핸들. */
     chain: Option<ChainRebuild>,
-    /** @brief 새 인증서와 그것을 넣을 슬롯. */
     tls: Option<(PreparedTls, Arc<TlsSlots>)>,
-    /** @brief 새 차단 엔진. */
     filter: Option<onetdns_filter::BlockEngine>,
-    /** @brief 새 전달 리졸버와 그 통계. */
     forward: Option<(Arc<dyn native::Resolver>, onetdns_forward::ForwardStats)>,
-    /** @brief 새 설정으로 만든 기능 세트. 질의 처리기가 아직 없으면 없다. */
+    /// `None` until the query handler exists.
     native: Option<native::NativeFeatures>,
-    /** @brief 새 정책 엔진. */
     policy: Option<Arc<onetdns_policy::PolicyEngine>>,
-    /** @brief 새 뷰. */
     views: Option<Vec<native::NativeView>>,
-    /** @brief 새 관리 화면 계정. */
     users: Option<Vec<onetdns_control::UserCred>>,
-    /** @brief 새 권한 영역 설정과 저장소. 효과 단계가 꺼내 쓴다. */
+    /// Taken by `run_effects`.
     authority: Option<PreparedAuthority>,
-    /** @brief 새 NOTIFY 대상. */
     notify_targets: Option<NotifyTargets>,
 }
 
-/** @brief 준비한 권한 영역 설정과 저장소. */
 struct PreparedAuthority {
-    /** @brief 접근 설정. */
     settings: native::AuthoritySettings,
-    /** @brief 저장소를 만들 때 실행 중이던 저장소. */
+    /// The store that was running when `store` was built.
     seen: Arc<onetdns_authority::ZoneStore>,
-    /** @brief 설정으로 만든 저장소. */
     store: onetdns_authority::ZoneStore,
 }
 
-/** @brief 효과 단계가 끝난 뒤 반영할 것. */
 struct Effects {
-    /** @brief 새 기본 체인. DHCP 서비스를 맞춘 뒤에 만든다. */
     chain: Option<PreparedChain>,
 }
 
-/**
- * @brief 이 그룹들 중 하나라도 바뀌면 질의 처리기 상태가 있어야 한다.
- * @details 클러스터 그룹은 DNS Cookie 서버 비밀이 클러스터 비밀에서 나오기 때문에 든다.
- */
+/// Groups that need the query handler state. Cluster is one because the DNS Cookie server
+/// secret derives from the cluster secret.
 fn needs_native_state(groups: &[ApplyGroup]) -> bool {
     groups.iter().any(|group| {
         matches!(
@@ -210,22 +159,18 @@ fn needs_native_state(groups: &[ApplyGroup]) -> bool {
     })
 }
 
-/** @brief 교체 함수를 만든다. */
 pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
     Arc::new(move |next: &Config, _requested_changed: &[String]| deps.apply(next))
 }
 
 impl HotApplyDeps {
-    /** @brief 바뀐 키가 모두 교체할 수 있으면 교체한다. 재시작해야 하면 거짓을 돌려준다. */
+    /// Returns false when the change needs a restart.
     fn apply(&self, next: &Config) -> Result<(bool, Vec<String>), String> {
         let _runtime_update_guard = runtime_config_update_lock().lock_recover();
         let previous_cfg = self.runtime_cfg.load();
 
-        /*
-         * 시작할 때 채워 넣은 기본값은 파일에 적히지 않는다. 파일만 다시 읽으면
-         * 그 항목이 사라진 것으로 보여, 손대지도 않은 관리 주소를 지운 것으로
-         * 처리하고 웹 화면을 닫아 버린다.
-         */
+        // Defaults filled in at startup are not in the file; comparing with the file alone would
+        // read them as removed and close the untouched dashboard listener.
         let next = &normalize_config_for_comparison(&previous_cfg, next);
 
         let changed = config_changed_keys(&previous_cfg, next);
@@ -244,10 +189,8 @@ impl HotApplyDeps {
         self.commit(next, &groups, &changed, *prepared, effects);
         // hot-apply:end
 
-        /*
-         * 관리 주소나 저장 파일이 이 경로로 생기고 사라진다. 세대를 다시 만들지
-         * 않으므로 여기서 다시 정하지 않으면 시작할 때의 판정이 그대로 남는다.
-         */
+        // A dashboard address or storage file can appear or vanish here, and without a new
+        // generation the startup decision would otherwise stay.
         self.recorder.set_collecting(telemetry_consumed(next));
         onetdns_core::info!(
             event = "config.runtime_hot_applied",
@@ -258,10 +201,8 @@ impl HotApplyDeps {
         Ok((true, changed))
     }
 
-    /**
-     * @brief 새 설정으로 만들 것을 모두 만든다. 실행 중인 상태는 바꾸지 않는다.
-     * @return 교체할 작업이 아직 서지 않아 재시작해야 하면 없음.
-     */
+    /// Builds everything from `next` without touching running state. `None` asks for a restart
+    /// because a restart hook is not set up yet.
     fn prepare(
         &self,
         previous: &Config,
@@ -302,7 +243,6 @@ impl HotApplyDeps {
         if native_state.is_none() && needs_native_state(groups) {
             return Ok(None);
         }
-        /* 교체할 작업이 아직 서지 않았으면 재시작하는 쪽이 안전하다. */
         let listeners = if groups.contains(&ApplyGroup::Listeners) {
             let Some(sync) = listener_sync.lock_recover().clone() else {
                 return Ok(None);
@@ -348,10 +288,8 @@ impl HotApplyDeps {
             None
         };
 
-        /*
-         * 슬롯이 아직 없으면 이 인증서를 쓰는 수신 주소도 없다. 나중에 주소를 열 때 그때
-         * 설정으로 만들어지므로 지금 할 일이 없다.
-         */
+        // No slot means no listener uses the certificate yet; opening one later builds it from the
+        // config of that time.
         let slots = tls_slots.lock_recover().clone();
         let tls = match slots {
             Some(slots) if groups.contains(&ApplyGroup::Tls) => {
@@ -418,10 +356,8 @@ impl HotApplyDeps {
                 &next.notify,
                 &settings.tsig_keys,
             )?);
-            /*
-             * 만들 때 본 저장소를 기억해 둔다. 반영할 때 저장소가 그새 바뀌었으면 동적 갱신이
-             * 들어온 것이므로 다시 만든다. 그대로 넣으면 그 갱신이 사라진다.
-             */
+            // If the store changes before the swap, a dynamic update came in; `run_effects`
+            // rebuilds rather than drop it.
             let (seen, store) = {
                 let _journals = zone_journal.lock_recover();
                 (
@@ -456,12 +392,8 @@ impl HotApplyDeps {
         })))
     }
 
-    /**
-     * @brief 다시 시작해야 하는 작업을 새 설정으로 돌린다.
-     * @details 하나라도 실패하면 이미 돌린 작업을 이전 설정으로 되돌리고 실패를 돌려준다.
-     *          권한 영역 저장소도 여기서 바꾼다. 영역 감시와 세컨더리 작업이 새 저장소를 전제로
-     *          시작하기 때문이다.
-     */
+    /// Restarts work under `next` and undoes what already restarted if any of it fails. The zone
+    /// store is swapped here because zone watchers and secondaries start against the new store.
     fn run_effects(
         &self,
         previous: &Config,
@@ -508,7 +440,7 @@ impl HotApplyDeps {
                 "Restarted DHCP services without stopping DNS"
             );
         }
-        /* 체인은 DHCP 임대 풀을 읽으므로 DHCP 서비스를 맞춘 뒤에 만든다. */
+        // The chain reads the DHCP lease pool, so it is built after DHCP is reconciled.
         let chain = match &prepared.chain {
             Some(chain) => {
                 Some(undo.check(chain.chain.prepare(&resolver_chain::ChainPlan::new(next)))?)
@@ -565,10 +497,8 @@ impl HotApplyDeps {
         else {
             return Ok(Effects { chain });
         };
-        /*
-         * 접근 설정과 영역을 한 잠금 아래에서 바꾼다. 영역이 먼저 바뀌면 그 사이에 이전 저장
-         * 경로로 동적 갱신이 들어가 엉뚱한 파일을 덮는다.
-         */
+        // Access settings and zones change under one lock; swapping zones first would let a dynamic
+        // update write through the old journal path and overwrite the wrong file.
         let native = native_hot_state.lock_recover().clone();
         {
             let mut journals = zone_journal.lock_recover();
@@ -623,7 +553,7 @@ impl HotApplyDeps {
         Ok(Effects { chain })
     }
 
-    /** @brief 준비한 것을 슬롯에 넣는다. 넣기만 하므로 실패하지 않는다. */
+    /// Only puts prepared parts into their slots, so it cannot fail.
     fn commit(
         &self,
         next: &Config,
@@ -667,7 +597,7 @@ impl HotApplyDeps {
             dhcp_slot,
             vendor_db,
             blocklist_resolver_slot,
-            blocklist_resolver,
+            revocation_resolver_slot,
             cache_slot,
             ..
         } = self;
@@ -697,6 +627,7 @@ impl HotApplyDeps {
             .any(|group| matches!(*group, ApplyGroup::Chain | ApplyGroup::Forward))
         {
             *blocklist_resolver_slot.lock_recover() = blocklist_host_resolver(next);
+            *revocation_resolver_slot.lock_recover() = revocation_host_resolver(next);
         }
         if groups.contains(&ApplyGroup::ControlTokens) {
             if let Some(auth) = console_auth.lock_recover().as_ref() {
@@ -727,7 +658,7 @@ impl HotApplyDeps {
             *preset_urls.lock_recover() = preset_list_urls(next);
             *rpz_url_state.lock_recover() = next.rpz_urls.clone();
             list_refresh_secs.store(next.list_refresh_secs, Ordering::Release);
-            /* 세대를 올리면 갱신 스레드가 주기를 기다리지 않고 다음 틱에 받아 온다. */
+            // A new generation makes the refresh threads fetch on their next tick.
             list_generation.fetch_add(1, Ordering::AcqRel);
             onetdns_core::info!(
                 event = "filter.subscriptions_reloaded",
@@ -792,7 +723,7 @@ impl HotApplyDeps {
             onetdns_forward::set_query_source(next.query_source, next.query_source_v6);
         }
         if groups.contains(&ApplyGroup::Revocation) {
-            install_revocation_policy(next, blocklist_resolver);
+            install_revocation_policy(next, revocation_resolver_slot);
         }
         if let Some(targets) = notify_targets {
             zone_notify.replace_targets(targets);
@@ -817,12 +748,10 @@ impl HotApplyDeps {
             _ => None,
         };
 
-        /*
-         * 빠른 경로가 읽는 값은 응답을 바꾸는 상태를 모두 바꾼 뒤 마지막에 한 번 게시한다.
-         * 체인 세대만 먼저 보이면 새 캐시에 이전 조건으로 만든 답이 담기고, wire 세대가 먼저
-         * 오르면 그 뒤에 이전 상태로 만든 항목이 새 태그를 단다. 어느 키가 바뀌었든 조건은
-         * 다시 판정한다. 경로를 닫는 키가 여러 그룹에 흩어져 있기 때문이다.
-         */
+        // The fast path state is published once, after every state that changes answers. Showing
+        // the chain generation first would cache answers made under old conditions; bumping the
+        // wire generation first would tag entries built from old state as new. The gates are
+        // rechecked whatever changed, since the keys that close a path span several groups.
         let native_state = native_state.or_else(|| native_hot_state.lock_recover().clone());
         if let Some(state) = native_state {
             let local_only_changed = native.is_some()
@@ -885,10 +814,8 @@ impl HotApplyDeps {
                     "Reopened and closed fast paths for the changed configuration"
                 );
             }
-            /*
-             * 비우기는 게시한 뒤에 한다. 먼저 비우면 그 사이 이전 조건으로 맡은 레인의 답이 비운
-             * 뒤의 캐시 세대로 담긴다.
-             */
+            // Flush after publishing; flushing first lets a lane still on the old conditions refill
+            // the cache.
             if local_only_changed {
                 let flushed = cache_slot
                     .lock_recover()
@@ -922,11 +849,8 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    /**
-     * @brief 실패하면 등록한 되돌리기를 거꾸로 모두 실행하고, 되돌리지 못한 것도 오류에 남기는지.
-     * @details 앞선 것부터 되돌리면 뒤에서 연 주소나 작업이 앞선 것의 이전 상태와 겹친다. 되돌리기
-     *          하나가 실패해도 나머지는 실행해야 실행 중인 상태가 이전 설정에 가장 가까워진다.
-     */
+    /// Undoing in registration order would overlap later listeners or jobs with the earlier
+    /// ones' old state, and one failed step must not stop the rest.
     fn failure_runs_every_undo_in_reverse() {
         let order = RefCell::new(Vec::new());
         let mut undo = Undo::default();

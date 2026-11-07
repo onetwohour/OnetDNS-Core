@@ -1,13 +1,11 @@
-/*!
- * @brief 차단 목록을 받아 오고 캐시하며, 설정과 합쳐 필터 엔진을 만든다.
- */
+//! Downloads and caches blocklists and compiles them with the config into the filter engine.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use onetdns_config::{Config, LocalZone, LocalZoneKind, Rewrite};
+use onetdns_config::{BackendKind, Config, LocalZone, LocalZoneKind, Rewrite, SplitTarget};
 use onetdns_core::{MutexExt, RewriteTarget};
 use onetdns_filter::{BlockEngine, EngineParts, LocalZoneAction, StaticZone};
 use sha2::{Digest, Sha256};
@@ -19,7 +17,7 @@ use crate::native_config::{days_mask, map_block, parse_hhmm};
 use crate::recursion::{new_recursor, recursor_roots};
 use crate::{http, mac, native, read_text_limited, unix_now, upstream};
 
-/** @brief 사용자가 넣은 규칙을 고친다. 형식을 확인하고 종류를 구분한다. */
+/// Validates an added rule; an `@@` rule goes to the allow list from either tab.
 pub(crate) fn mutate_user_rule(
     overlay: &Mutex<(Vec<String>, Vec<String>)>,
     config_path: Option<&std::path::Path>,
@@ -111,7 +109,6 @@ pub(crate) fn mutate_user_rule(
     }
 }
 
-/** @brief 서비스 이름을 그것이 쓰는 도메인 목록으로 편다. */
 fn expand_services(services: &[String]) -> Result<Vec<String>, String> {
     let mut out = vec![];
     for svc in services {
@@ -123,46 +120,34 @@ fn expand_services(services: &[String]) -> Result<Vec<String>, String> {
 }
 
 #[derive(Clone)]
-/** @brief 내려받은 목록 하나의 정보. */
+/// One downloaded blocklist.
 pub(crate) struct SubMeta {
-    /** @brief 내려받은 곳. */
     pub(crate) url: String,
-    /** @brief 목록에 적힌 제목. */
     pub(crate) title: String,
-    /** @brief 이 목록에 든 규칙 수. */
     pub(crate) rules: usize,
-    /** @brief 마지막으로 내려받은 시각. */
     pub(crate) updated_unix: u64,
 
-    /** @brief 규칙 원문 줄들. 고정한 뒤에는 놓아준다. */
+    /// Raw rule lines, dropped once the engine is compiled and the list is on disk.
     lines: Arc<[String]>,
 }
 
-/** @brief 차단 엔진을 만드는 데 드는 것들. */
 pub(crate) struct FilterBuildInputs<'a> {
-    /** @brief 차단할 서비스 이름들. */
     pub(crate) blocked_services: &'a [String],
-    /** @brief 내려받은 목록들. */
     pub(crate) subscriptions: &'a [SubMeta],
-    /** @brief 설정에 적은 차단 규칙. */
+    /// Block rules from the config.
     pub(crate) overlay_block: &'a [String],
-    /** @brief 설정에 적은 허용 규칙. */
+    /// Allow rules from the config.
     pub(crate) overlay_allow: &'a [String],
-    /** @brief REFUSED로 답할 도메인 접미사. */
+    /// Suffixes answered with REFUSED.
     pub(crate) refused_domains: &'a [String],
-    /** @brief 영역 형식 목록 글. */
+    /// Downloaded RPZ texts.
     pub(crate) rpz_texts: &'a [String],
-    /** @brief 고정한 결과를 담아 둘 곳. */
     pub(crate) compiled_filter_cache: Option<&'a std::path::Path>,
-    /** @brief 내려받은 목록을 담아 둘 곳. */
     pub(crate) subscription_cache_dir: Option<&'a std::path::Path>,
 }
 
-/**
- * @brief 지금이 서비스 차단을 멈추는 시간대인지.
- * @details service_schedule의 구간 안에서는 서비스 차단 규칙만 빠진다. 차단 목록과 사용자
- *          규칙은 그대로 건다. 설정 검증을 통과한 구간만 들어오므로 읽지 못하는 구간은 없다.
- */
+/// Inside a `service_schedule` window only the service rules are lifted; blocklists and user
+/// rules still apply.
 pub(crate) fn service_blocking_paused(cfg: &Config, now: std::time::SystemTime) -> bool {
     let windows = cfg
         .service_schedule
@@ -181,11 +166,8 @@ pub(crate) fn service_blocking_paused(cfg: &Config, now: std::time::SystemTime) 
     native::Schedule { windows }.is_active(now)
 }
 
-/**
- * @brief 설정대로 차단 엔진을 만든다.
- * @details 내려받은 목록, 파일, 설정에 적은 규칙을 모두 모아 하나로 고정한다. 고정하면
- *          질의 경로에서 잠금도 할당도 없다.
- */
+/// Compiles every rule source into one engine, so the query path takes no lock and does not
+/// allocate.
 pub(crate) fn build_filter_engine_for_config(
     config: &Config,
     input: &FilterBuildInputs<'_>,
@@ -310,35 +292,27 @@ pub(crate) fn build_filter_engine_for_config(
         .with_hit_tracking(config.track_rule_hits))
 }
 
-/** @brief 고정한 결과가 어떤 입력에서 나왔는지. */
+/// Everything the compiled engine is built from.
 struct CompiledFilterInputs<'a> {
-    /** @brief 차단 목록 파일들. */
     blocklists: &'a [PathBuf],
-    /** @brief 허용 목록 파일들. */
     allowlists: &'a [PathBuf],
-    /** @brief 서비스에서 편 규칙들. */
     service_rules: &'a [String],
-    /** @brief 내려받은 목록들. */
     subscriptions: &'a [SubMeta],
-    /** @brief 내려받은 목록을 담아 둔 곳. */
     subscription_cache_dir: Option<&'a std::path::Path>,
-    /** @brief 설정에 적은 차단 규칙. */
+    /// Block rules from the config.
     overlay_block: &'a [String],
-    /** @brief 설정에 적은 허용 규칙. */
+    /// Allow rules from the config.
     overlay_allow: &'a [String],
-    /** @brief 재작성 규칙. */
     rewrites: &'a [Rewrite],
-    /** @brief 영역 규칙. */
     local_zones: &'a [LocalZone],
-    /** @brief REFUSED로 답할 도메인 접미사. */
+    /// Suffixes answered with REFUSED.
     refused_domains: &'a [String],
-    /** @brief 영역 형식 목록 파일들. */
     rpz_files: &'a [PathBuf],
-    /** @brief 영역 형식 목록 글. */
+    /// Downloaded RPZ texts.
     rpz_texts: &'a [String],
 }
 
-/** @brief 입력의 지문. 지문이 같아야 고정해 둔 것을 다시 쓸 수 있다. */
+/// The compiled cache is reused only when this matches.
 fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
     let mut digest = Sha256::new();
     fingerprint_bytes(&mut digest, b"format", b"onetdns-compiled-filter-input-v1");
@@ -393,7 +367,7 @@ fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/** @brief 고정한 뒤 원본 줄들을 놓아준다. 고정한 것만 있으면 되므로 그만큼 메모리가 준다. */
+/// Drops the raw lines of lists saved on disk; the compiled engine no longer needs them.
 pub(crate) fn release_subscription_lines(meta: &Mutex<Vec<SubMeta>>, cache_dir: &std::path::Path) {
     for item in meta.lock_recover().iter_mut() {
         if cache_dir.join(blocklist_cache_key(&item.url)).is_file() {
@@ -402,20 +376,17 @@ pub(crate) fn release_subscription_lines(meta: &Mutex<Vec<SubMeta>>, cache_dir: 
     }
 }
 
-/** @brief 지문에 항목 헤더를 넣는다. */
 fn fingerprint_header(digest: &mut Sha256, label: &[u8], count: u64) {
     digest.update((label.len() as u64).to_le_bytes());
     digest.update(label);
     digest.update(count.to_le_bytes());
 }
 
-/** @brief 지문에 바이트를 넣는다. */
 fn fingerprint_bytes(digest: &mut Sha256, label: &[u8], bytes: &[u8]) {
     fingerprint_header(digest, label, bytes.len() as u64);
     digest.update(bytes);
 }
 
-/** @brief 지문에 문자열들을 넣는다. */
 fn fingerprint_strings<'a>(
     digest: &mut Sha256,
     label: &[u8],
@@ -427,11 +398,9 @@ fn fingerprint_strings<'a>(
     }
 }
 
-/** @brief 지문에 파일 내용을 넣는다. */
 fn fingerprint_files(digest: &mut Sha256, label: &[u8], paths: &[PathBuf]) {
     use std::io::Read;
 
-    /** @brief 읽어들일 목록 파일 크기 상한. */
     const MAX_FILTER_FILE: u64 = 128 * 1024 * 1024;
     fingerprint_header(digest, label, paths.len() as u64);
     for path in paths {
@@ -465,7 +434,6 @@ fn fingerprint_files(digest: &mut Sha256, label: &[u8], paths: &[PathBuf]) {
     }
 }
 
-/** @brief 고정해 둔 것을 읽는다. 지문이 다르면 쓰지 않는다. */
 fn load_compiled_filter_cache(
     path: &std::path::Path,
     fingerprint: [u8; 32],
@@ -495,7 +463,7 @@ fn load_compiled_filter_cache(
     }
 }
 
-/** @brief 고정한 것을 저장한다. 전체를 메모리에 담지 않고 흘려 쓴 뒤 교체한다. 다음 시작이 훨씬 빠르다. */
+/// Streams the engine into a new file and swaps it in, without holding the encoding in memory.
 fn save_compiled_filter_cache(
     path: &std::path::Path,
     parts: &mut EngineParts,
@@ -514,7 +482,6 @@ fn save_compiled_filter_cache(
     }
 }
 
-/** @brief 목록 본문에서 제목을 찾는다. */
 fn parse_list_title(body: &str) -> String {
     for raw in body.lines().take(64) {
         let t = raw.trim();
@@ -537,7 +504,6 @@ fn parse_list_title(body: &str) -> String {
     String::new()
 }
 
-/** @brief 목록에 든 규칙 수. */
 fn count_list_rules(body: &str) -> usize {
     body.lines()
         .filter(|l| {
@@ -547,7 +513,7 @@ fn count_list_rules(body: &str) -> usize {
         .count()
 }
 
-/** @brief 목록 대신 오류 문서를 받은 것 같은지. 그대로 규칙으로 읽으면 엉뚱한 것이 차단된다. */
+/// An HTML error page read as rules would block arbitrary names.
 fn looks_like_error_document(body: &str) -> bool {
     let prefix = body
         .trim_start()
@@ -562,7 +528,6 @@ fn looks_like_error_document(body: &str) -> bool {
         || body.as_bytes().contains(&0)
 }
 
-/** @brief 영역 형식 목록에 든 규칙 수. */
 fn likely_rpz_rule_count(body: &str) -> usize {
     body.lines()
         .filter(|raw| {
@@ -584,20 +549,55 @@ fn likely_rpz_rule_count(body: &str) -> usize {
         .count()
 }
 
-/** @brief 내려받을 목록 크기 상한. */
 const BLOCKLIST_MAX_RESPONSE: u64 = 128 * 1024 * 1024;
 
-/** @brief 이름 해석 결과를 담아 둘 개수. */
 const HOST_RESOLVER_CACHE_CAPACITY: usize = 512;
-
-/** @brief 이름 해석 결과를 담아 둘 최대 기간. */
 const HOST_RESOLVER_CACHE_TTL_MAX_SECS: u64 = 300;
-
-/** @brief 이름 해석 실패를 기억할 기간. */
 const HOST_RESOLVER_FAILURE_CACHE_TTL: Duration = Duration::from_secs(10);
 
-/** @brief 목록을 내려받을 때 이름을 풀 서버들. 자기 자신은 쓰지 않는다. 아직 서빙 전일 수 있다. */
-fn blocklist_bootstrap(cfg: &Config) -> Vec<IpAddr> {
+/// Resolves the host names in the server's own HTTP requests (blocklists, update checks, ACME,
+/// cluster peers) the way the server resolves queries, without its filters: through the
+/// upstreams when forwarding, from the root when recursing, by name when split. `bootstrap`
+/// only finds the upstreams themselves.
+pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
+    let source = match cfg.backend {
+        BackendKind::Forward => "The upstream DNS servers",
+        BackendKind::Recurse => "The built-in recursive resolver",
+        BackendKind::Split => "Split resolution",
+    };
+    let backend = configured_backend(cfg);
+    cached_host_resolver(cfg.max_ttl, move |host, _timeout| {
+        let backend = backend
+            .as_ref()
+            .map_err(|error| format!("Cannot look up {host}: {error}"))?;
+        resolve_host_addresses(backend.as_ref(), host, source)
+    })
+}
+
+/// Resolves the OCSP and CRL hosts in upstream certificates. The check is part of connecting
+/// to an upstream, so these names go to `bootstrap`, else the plain `upstreams`, else recursion;
+/// asking the upstream under check would connect to it again.
+pub(crate) fn revocation_host_resolver(cfg: &Config) -> http::HostResolver {
+    let servers = revocation_dns_servers(cfg);
+    let recursion = recursive_backend(cfg);
+    cached_host_resolver(cfg.max_ttl, move |host, timeout| {
+        if servers.is_empty() {
+            return resolve_host_addresses(
+                recursion.as_ref(),
+                host,
+                "The built-in recursive resolver",
+            );
+        }
+        onetdns_forward::resolve_via_bootstrap(host, &servers, timeout)
+            .map(|(ip, ttl)| (vec![ip], ttl))
+            .ok_or_else(|| {
+                format!("The bootstrap DNS servers could not resolve the address: {host}")
+            })
+    })
+}
+
+/// Never this machine: the server may not be serving yet.
+fn revocation_dns_servers(cfg: &Config) -> Vec<IpAddr> {
     let mut addresses = if cfg.bootstrap.is_empty() {
         cfg.upstreams.clone()
     } else {
@@ -611,19 +611,86 @@ fn blocklist_bootstrap(cfg: &Config) -> Vec<IpAddr> {
     addresses
 }
 
-/** @brief 목록을 내려받을 때 쓸 이름 해석 방법. */
-pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
-    let bootstrap = blocklist_bootstrap(cfg);
-    let recursor = Arc::new(
-        new_recursor(recursor_roots(cfg), Duration::from_secs(8))
-            .with_recursive_cache_ttl_max(cfg.max_ttl as u32),
-    );
-    let success_ttl_cap_secs = cfg.max_ttl.min(HOST_RESOLVER_CACHE_TTL_MAX_SECS);
-    let cache = Arc::new(Mutex::new(onetdns_core::LruMap::<
+/// The configured backend, built apart from the one answering queries.
+fn configured_backend(cfg: &Config) -> Result<Arc<dyn native::Resolver>, String> {
+    let forward = || crate::build_forward_backend(cfg).map(|(resolver, _stats)| resolver);
+    let backend: Arc<dyn native::Resolver> = match cfg.backend {
+        BackendKind::Forward => forward()?,
+        BackendKind::Recurse => recursive_backend(cfg),
+        BackendKind::Split => {
+            let default = match cfg.split_default {
+                SplitTarget::Forward => crate::layers::Route::Forward,
+                SplitTarget::Recurse => crate::layers::Route::Recurse,
+            };
+            Arc::new(crate::layers::SplitResolver::new(
+                forward()?,
+                recursive_backend(cfg),
+                default,
+                &cfg.split_recurse,
+                &cfg.split_forward,
+            )?)
+        }
+    };
+    Ok(backend)
+}
+
+fn recursive_backend(cfg: &Config) -> Arc<dyn native::Resolver> {
+    Arc::new(native::NativeBackend::Recurse {
+        recursor: Arc::new(
+            new_recursor(recursor_roots(cfg), Duration::from_secs(8))
+                .with_recursive_cache_ttl_max(cfg.max_ttl as u32),
+        ),
+        ns_rpz: None,
+        block_ttl: Arc::default(),
+        local_ttl: Arc::default(),
+    })
+}
+
+fn resolve_host_addresses(
+    resolver: &dyn native::Resolver,
+    host: &str,
+    source: &str,
+) -> Result<(Vec<IpAddr>, u32), String> {
+    let name = onetdns_proto::Name::from_str(host)
+        .map_err(|_| format!("Invalid host name in the URL: {host}"))?;
+    let mut addresses = Vec::new();
+    let mut ttl: Option<u32> = None;
+    for qtype in [
+        onetdns_proto::RecordType::A,
+        onetdns_proto::RecordType::AAAA,
+    ] {
+        let query = onetdns_proto::Message::query(0, name.clone(), qtype);
+        let Some(response) = resolver.resolve(&query) else {
+            continue;
+        };
+        for answer in response.answers {
+            let address = match answer.rdata {
+                onetdns_proto::RData::A(ip) => IpAddr::V4(ip),
+                onetdns_proto::RData::Aaaa(ip) => IpAddr::V6(ip),
+                _ => continue,
+            };
+            ttl = Some(ttl.map_or(answer.ttl, |current| current.min(answer.ttl)));
+            addresses.push(address);
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(format!("{source} could not resolve the host name: {host}"));
+    }
+    Ok((addresses, ttl.unwrap_or(0)))
+}
+
+/// Keeps an answer for its TTL, capped by `max_ttl` and five minutes, and a failure briefly.
+fn cached_host_resolver(
+    max_ttl: u64,
+    lookup: impl Fn(&str, Duration) -> Result<(Vec<IpAddr>, u32), String> + Send + Sync + 'static,
+) -> http::HostResolver {
+    let success_ttl_cap_secs = max_ttl.min(HOST_RESOLVER_CACHE_TTL_MAX_SECS);
+    let cache = Mutex::new(onetdns_core::LruMap::<
         String,
         (std::time::Instant, Duration, Result<Vec<IpAddr>, String>),
-    >::new(HOST_RESOLVER_CACHE_CAPACITY)));
-
+    >::new(HOST_RESOLVER_CACHE_CAPACITY));
     Arc::new(move |host: &str, timeout: Duration| {
         let cache_key = host.trim_end_matches('.').to_ascii_lowercase();
         if let Some((stored_at, ttl, result)) = cache.lock_recover().get(&cache_key).cloned() {
@@ -631,55 +698,13 @@ pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
                 return result;
             }
         }
-
-        let resolved = if !bootstrap.is_empty() {
-            onetdns_forward::resolve_via_bootstrap(host, &bootstrap, timeout)
-                .map(|(ip, ttl)| (vec![ip], ttl))
-                .ok_or_else(|| {
-                    format!("The bootstrap DNS servers could not resolve the address: {host}")
-                })
-        } else {
-            let name = onetdns_proto::Name::from_str(host)
-                .map_err(|_| format!("Invalid host name in the download URL: {host}"));
-            name.and_then(|name| {
-                let mut addresses = Vec::new();
-                let mut ttl: Option<u32> = None;
-                for qtype in [
-                    onetdns_proto::RecordType::A,
-                    onetdns_proto::RecordType::AAAA,
-                ] {
-                    let Ok(response) = recursor.resolve(&name, qtype) else {
-                        continue;
-                    };
-                    for answer in response.answers {
-                        ttl = Some(ttl.map_or(answer.ttl, |current| current.min(answer.ttl)));
-                        match answer.rdata {
-                            onetdns_proto::RData::A(ip) => addresses.push(IpAddr::V4(ip)),
-                            onetdns_proto::RData::Aaaa(ip) => addresses.push(IpAddr::V6(ip)),
-                            _ => {}
-                        }
-                    }
-                }
-                addresses.sort();
-                addresses.dedup();
-                if addresses.is_empty() {
-                    Err(format!(
-                        "The built-in recursive resolver could not resolve the host name: {host}"
-                    ))
-                } else {
-                    Ok((addresses, ttl.unwrap_or(0)))
-                }
-            })
-        };
-
-        let (ttl, result) = match resolved {
+        let (ttl, result) = match lookup(host, timeout) {
             Ok((addresses, authoritative_ttl)) => (
                 Duration::from_secs(u64::from(authoritative_ttl).min(success_ttl_cap_secs)),
                 Ok(addresses),
             ),
             Err(error) => (HOST_RESOLVER_FAILURE_CACHE_TTL, Err(error)),
         };
-
         if !ttl.is_zero() {
             cache
                 .lock_recover()
@@ -689,7 +714,6 @@ pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
     })
 }
 
-/** @brief 목록 하나를 내려받는다. */
 pub(crate) fn fetch_blocklist(
     url: &str,
     resolver: &http::HostResolver,
@@ -736,7 +760,6 @@ pub(crate) fn fetch_blocklist(
     })
 }
 
-/** @brief 이 주소의 목록을 담아 둘 파일 이름. */
 fn blocklist_cache_key(url: &str) -> String {
     let mut h = 0xcbf29ce484222325u64;
     for b in url.as_bytes() {
@@ -746,7 +769,6 @@ fn blocklist_cache_key(url: &str) -> String {
     format!("{h:016x}.list")
 }
 
-/** @brief 내려받은 목록을 담아 둔다. */
 fn save_blocklist_cache_text(
     url: &str,
     updated_unix: u64,
@@ -770,7 +792,7 @@ fn save_blocklist_cache_text(
         .map_err(|e| format!("Could not save the blocklist cache ({url}): {e}"))
 }
 
-/** @brief 담아 둔 목록을 읽는다. 못 받아도 시작할 수 있게 하려는 것이다. */
+/// Lets the server start with the last lists when downloads fail.
 pub(crate) fn load_blocklist_cache(urls: &[String], dir: Option<&std::path::Path>) -> Vec<SubMeta> {
     let Some(dir) = dir else {
         return Vec::new();
@@ -808,7 +830,6 @@ pub(crate) fn load_blocklist_cache(urls: &[String], dir: Option<&std::path::Path
         .collect()
 }
 
-/** @brief 목록들을 내려받고 그 정보를 모은다. */
 pub(crate) fn fetch_blocklists_meta(
     urls: &[String],
     resolver: &http::HostResolver,
@@ -843,12 +864,10 @@ pub(crate) fn fetch_blocklists_meta(
     meta
 }
 
-/** @brief 이 주소의 영역 형식 목록을 담아 둘 파일 이름. */
 fn rpz_cache_key(url: &str) -> String {
     format!("{}.rpz", blocklist_cache_key(url).trim_end_matches(".list"))
 }
 
-/** @brief 내려받은 영역 형식 목록을 담아 둔다. */
 fn save_rpz_cache(url: &str, body: &str, dir: Option<&std::path::Path>) -> Result<(), String> {
     let Some(dir) = dir else {
         return Ok(());
@@ -867,7 +886,6 @@ fn save_rpz_cache(url: &str, body: &str, dir: Option<&std::path::Path>) -> Resul
         .map_err(|error| format!("Could not save the RPZ cache ({url}): {error}"))
 }
 
-/** @brief 담아 둔 영역 형식 목록을 읽는다. */
 pub(crate) fn load_rpz_cache(urls: &[String], dir: Option<&std::path::Path>) -> Vec<String> {
     let Some(dir) = dir else {
         return vec![String::new(); urls.len()];
@@ -908,16 +926,9 @@ pub(crate) fn load_rpz_cache(urls: &[String], dir: Option<&std::path::Path>) -> 
         .collect()
 }
 
-/** @brief 영역 형식 목록들을 내려받는다. */
-/**
- * @brief 이전에 받아 둔 RPZ 본문을 새 URL 목록 순서로 다시 정렬한다.
- * @details 받아 둔 본문은 URL 목록과 같은 순서로 놓인다. 목록 가운데 하나를 빼면 뒤쪽이
- *          당겨지므로, 위치로 짝지으면 다운로드에 실패한 URL 위치에 다른 목록의 규칙이 들어간다.
- * @param old_urls 받아 둔 본문이 따르는 URL 목록.
- * @param old_texts 받아 둔 본문.
- * @param urls 새 URL 목록.
- * @return urls와 같은 길이. 받아 둔 적 없는 URL 슬롯은 빈 문자열이다.
- */
+/// Pairs the kept RPZ texts with the new URL list by URL, one per URL and empty for a URL never
+/// fetched. Pairing by position would give a failed URL the rules of the list that moved into
+/// its slot after a removal.
 pub(crate) fn rpz_texts_by_url(
     old_urls: &[String],
     old_texts: &[String],
@@ -993,7 +1004,6 @@ pub(crate) fn fetch_rpz_texts(
     out
 }
 
-/** @brief 설정에 적은 규칙을 엔진에 넣는다. */
 fn merge_config_filters(
     parts: &mut EngineParts,
     rewrites: &[Rewrite],
@@ -1022,7 +1032,6 @@ fn merge_config_filters(
     Ok(())
 }
 
-/** @brief 재작성이 답할 값을 읽는다. */
 fn parse_rewrite_answer(answer: &str) -> Option<RewriteTarget> {
     let a = answer.trim();
     if let Ok(ip) = a.parse::<IpAddr>() {
@@ -1034,7 +1043,6 @@ fn parse_rewrite_answer(answer: &str) -> Option<RewriteTarget> {
     }
 }
 
-/** @brief 재작성 규칙 하나를 넣는다. */
 fn add_rewrite(parts: &mut EngineParts, domain: &str, target: RewriteTarget) -> Result<(), String> {
     let domain = domain.trim();
     let parsed = domain.strip_prefix("*.").unwrap_or(domain);
@@ -1049,7 +1057,6 @@ fn add_rewrite(parts: &mut EngineParts, domain: &str, target: RewriteTarget) -> 
     Ok(())
 }
 
-/** @brief 설정에서 읽은 로컬 영역 답을 필터가 쓰는 형태로 바꾼다. */
 fn local_answer_target(answer: &onetdns_config::LocalAnswer) -> Result<RewriteTarget, String> {
     Ok(match answer {
         onetdns_config::LocalAnswer::Addresses(ips) => RewriteTarget::Records(
@@ -1067,12 +1074,8 @@ fn local_answer_target(answer: &onetdns_config::LocalAnswer) -> Result<RewriteTa
     })
 }
 
-/**
- * @brief 설정에 적은 영역 규칙을 엔진에 넣는다.
- * @details 영역은 엔진의 로컬 영역 집합에 따로 들어간다. 한 이름에는 가장 구체적인 영역만
- *          걸리므로 transparent 영역은 둘러싼 로컬 영역의 처분만 거두고, 차단 목록과 사용자
- *          규칙에는 손대지 않는다.
- */
+/// Only the most specific local zone applies to a name, so a transparent zone lifts the
+/// enclosing local zone's action and leaves blocklists and user rules alone.
 fn apply_local_zone(parts: &mut EngineParts, lz: &LocalZone) -> Result<(), String> {
     if onetdns_proto::Name::from_str(lz.name.trim()).is_err() {
         return Err("name needs a valid DNS zone name".to_string());
@@ -1105,26 +1108,13 @@ fn apply_local_zone(parts: &mut EngineParts, lz: &LocalZone) -> Result<(), Strin
     parts.local_zones.insert(&lz.name, action)
 }
 
-/**
- * @brief 목록 갱신 스레드가 한 번 실행되는 간격(초).
- *
- * @details 주기를 기다리는 동안에도 설정이 바뀌었는지 이 간격마다 본다. 짧게 두면 주소를
- *          더한 직후 바로 받아 오지만 그만큼 자주 깬다.
- */
+/// How often the refresh threads wake to notice a changed list before the period ends.
 pub(crate) const LIST_REFRESH_TICK_SECS: u64 = 5;
 
-/**
- * @brief 서비스 차단 일정의 경계를 확인하는 간격.
- * @details 일정은 분 단위로 적으므로 경계를 이만큼 늦게 알아챌 수 있다.
- */
+/// A schedule boundary is noticed up to this late.
 pub(crate) const SERVICE_SCHEDULE_TICK_SECS: u64 = 20;
 
-/**
- * @brief 켜 둔 미리 담긴 차단 목록의 주소들.
- *
- * @details 시작할 때와 교체할 때 모두 이 함수만 부른다. 두 곳에서 따로 만들면 켠 뒤
- *          다시 읽었을 때 목록이 서로 달라진다.
- */
+/// Startup and reload both use this, so the presets read back the same after a reload.
 pub(crate) fn preset_list_urls(cfg: &Config) -> Vec<String> {
     let mut urls = Vec::new();
     if cfg.safe_browsing {
@@ -1146,10 +1136,8 @@ pub(crate) fn preset_list_urls(cfg: &Config) -> Vec<String> {
     urls
 }
 
-/** @brief 이미 갱신 중이라는 문구. */
 pub(crate) const LIST_REFRESH_BUSY: &str = "A blocklist update is already running";
 
-/** @brief 목록 갱신을 한 번에 하나만 돌게 한다. */
 pub(crate) fn try_list_refresh_lock(
     lock: &Mutex<()>,
 ) -> Result<std::sync::MutexGuard<'_, ()>, String> {
@@ -1160,7 +1148,7 @@ pub(crate) fn try_list_refresh_lock(
     }
 }
 
-/** @brief 내장 목록 주소가 어느 설정에서 왔는지. 화면이 켜고 끄는 곳을 안내할 때 쓴다. */
+/// The setting that turns this preset on, so the dashboard can point to it.
 pub(crate) fn preset_list_kind(url: &str) -> &'static str {
     if onetdns_filter::presets::PARENTAL_LISTS.contains(&url) {
         "parental_control"
@@ -1169,7 +1157,7 @@ pub(crate) fn preset_list_kind(url: &str) -> &'static str {
     }
 }
 
-/** @brief 지금 쓰는 목록 주소들. 겹치지 않게 순서를 지켜 모은다. */
+/// Enabled lists, then presets, without duplicates and in order.
 pub(crate) fn active_subscription_urls(
     urls: &[String],
     disabled: &[String],
@@ -1188,7 +1176,6 @@ pub(crate) fn active_subscription_urls(
     active
 }
 
-/** @brief 목록 구독 상태를 설정에 적는다. */
 pub(crate) fn persist_subscription_state(
     path: Option<&std::path::Path>,
     urls: &[String],
@@ -1219,7 +1206,6 @@ pub(crate) fn persist_subscription_state(
 }
 
 #[cfg(test)]
-/** @brief 차단 목록 수집, 캐시, 필터 엔진 구성. */
 mod tests {
     use super::*;
     use std::net::IpAddr;
@@ -1233,7 +1219,6 @@ mod tests {
     use crate::ensure_resolution_sources_not_self;
 
     #[test]
-    /** @brief 고정한 차단 엔진이 흘려 저장되고 다시 읽히는지. */
     fn compiled_filter_cache_streams_atomically_and_loads() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1259,7 +1244,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 재작성과 영역 규칙이 조용히 사라지지 않는지. */
     fn invalid_rewrite_and_local_zone_cannot_disappear_silently() {
         let mut parts = EngineParts::default();
         let rewrites = vec![Rewrite {
@@ -1280,11 +1264,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정의 static 영역이 이름별 답을 엔진까지 그대로 옮기는지.
-     * @details static을 redirect처럼 로드하면 적지 않은 이름까지 같은 주소로 답해, 없어야 할
-     *          이름이 살아난다.
-     */
+    /// Loading a static zone like a redirect would answer unlisted names with the same address.
     fn static_local_zone_from_config_answers_listed_names_only() {
         let zones = vec![LocalZone {
             name: "corp.example".to_string(),
@@ -1330,11 +1310,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정의 transparent 영역이 둘러싼 로컬 영역만 거두는지.
-     * @details 이 값이 아무것도 하지 않으면 deny 영역 아래를 풀려는 설정이 조용히 무시되고,
-     *          차단 목록까지 풀면 구독한 목록이 무력화된다.
-     */
+    /// A no-op transparent zone would silently ignore lifting a deny zone; lifting blocklists too
+    /// would disable the subscribed lists.
     fn transparent_local_zone_lifts_enclosing_local_zone_only() {
         let zone = |name: &str, kind| LocalZone {
             name: name.to_string(),
@@ -1386,7 +1363,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록을 못 읽었을 때 차단이 전부 풀리지 않는지. */
     fn invalid_filter_sources_and_services_cannot_fail_open() {
         assert!(expand_services(&["unknown-service".to_string()]).is_err());
 
@@ -1418,10 +1394,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서비스 차단 일정 구간에서는 서비스 규칙만 빠지고 다른 규칙은 남는지.
-     * @details 구간 안에서 필터 전체를 건너뛰면 차단 목록과 사용자 규칙까지 풀린다.
-     */
     fn service_schedule_pauses_only_service_rules() {
         let services = vec!["youtube".to_string()];
         let kept = vec!["||kept.example^".to_string()];
@@ -1461,7 +1433,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 사용자 규칙이 검사되고 종류가 갈리는지. */
     fn user_rule_mutation_validates_and_classifies() {
         let overlay: Mutex<(Vec<String>, Vec<String>)> = Mutex::new((vec![], vec![]));
         let rebuild = || Ok((0usize, 0usize));
@@ -1503,7 +1474,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief URL 하나를 빼도 남은 URL이 제 본문과 짝지어지는지. */
     fn rpz_texts_follow_their_url_after_removal() {
         let old_urls = vec!["https://a/".to_string(), "https://b/".to_string()];
         let old_texts = vec!["A".to_string(), "B".to_string()];
@@ -1519,7 +1489,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록 주소가 겹치지 않고 순서를 지키는지. */
     fn active_subscription_urls_are_unique_and_keep_order() {
         let urls = vec![
             "https://big.oisd.nl".to_string(),
@@ -1541,8 +1510,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록을 받을 때 자기 자신에게 묻지 않는지. 물으면 시작 중 순환이 된다. */
-    fn blocklist_bootstrap_never_uses_loopback_dns() {
+    /// Asking this machine would loop while the server is starting.
+    fn revocation_dns_servers_never_include_loopback() {
         let mut config = Config::default();
         config.bootstrap = vec![
             "127.0.0.1".parse().unwrap(),
@@ -1550,13 +1519,12 @@ mod tests {
             "1.1.1.1".parse().unwrap(),
         ];
         assert_eq!(
-            blocklist_bootstrap(&config),
+            revocation_dns_servers(&config),
             vec!["1.1.1.1".parse::<IpAddr>().unwrap()]
         );
     }
 
     #[test]
-    /** @brief 모든 주소에 묶었을 때 이 기계를 가리키는 이름 해석 출처를 거부하는지. */
     fn wildcard_listener_rejects_local_interface_resolution_sources() {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         if socket.connect("192.0.2.1:9").is_err() {
@@ -1579,11 +1547,52 @@ mod tests {
         config.root_hints.clear();
         config.upstreams = vec![local_ip];
         assert!(ensure_resolution_sources_not_self(&config).is_err());
-        assert!(blocklist_bootstrap(&config).is_empty());
+        assert!(revocation_dns_servers(&config).is_empty());
     }
 
     #[test]
-    /** @brief 담아 둔 목록에서 제목이 되살아나는지. */
+    /// `bootstrap` points nowhere, so a lookup sent there would fail.
+    fn blocklist_hosts_resolve_through_the_upstreams_not_bootstrap() {
+        let upstream = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = upstream.recv_from(&mut buf) {
+                let Ok(request) = onetdns_proto::Message::parse(&buf[..n]) else {
+                    continue;
+                };
+                let mut response = onetdns_proto::Message::default();
+                response.header.id = request.header.id;
+                response.header.response = true;
+                response.header.recursion_desired = request.header.recursion_desired;
+                response.header.recursion_available = true;
+                response.questions = request.questions.clone();
+                if let Some(question) = request
+                    .questions
+                    .first()
+                    .filter(|question| question.qtype == onetdns_proto::RecordType::A)
+                {
+                    response.answers.push(onetdns_proto::Record::new(
+                        question.name.clone(),
+                        60,
+                        onetdns_proto::RData::A(Ipv4Addr::new(192, 0, 2, 7)),
+                    ));
+                }
+                let _ = upstream.send_to(&response.try_encode().unwrap(), from);
+            }
+        });
+
+        let mut config = Config::default();
+        config.upstream_urls = vec![format!("udp://127.0.0.1:{port}")];
+        config.bootstrap = vec!["192.0.2.1".parse().unwrap()];
+        let resolve = blocklist_host_resolver(&config);
+        assert_eq!(
+            resolve("lists.example", Duration::from_secs(2)),
+            Ok(vec![IpAddr::from([192, 0, 2, 7])])
+        );
+    }
+
+    #[test]
     fn blocklist_cache_restores_title_from_content() {
         let dir = std::env::temp_dir().join(format!("onetdns-blcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1629,7 +1638,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담아 둔 영역 형식 목록의 헤더를 확인하는지. */
     fn rpz_cache_requires_the_complete_current_header() {
         let dir = std::env::temp_dir().join(format!("onetdns-rpzcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1648,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 원본 줄을 놓아준 뒤에도 지문이 그대로인지. 달라지면 매 시작마다 다시 고정한다. */
+    /// A changed fingerprint would recompile the engine on every start.
     fn compiled_fingerprint_survives_releasing_subscription_lines() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-compiled-fingerprint-{}",

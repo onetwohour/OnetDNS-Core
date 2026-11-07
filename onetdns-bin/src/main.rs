@@ -146,7 +146,7 @@ use config_apply::{
 use config_edit::{rewrite_config_kv, toml_quote};
 use ctl::{ctl_add, ctl_reload, ctl_stats, ctl_top};
 use edge::{edge_service_preflight, lease_sync_restart, reconcile_edge_services, EdgeServices};
-use filters::blocklist_host_resolver;
+use filters::{blocklist_host_resolver, revocation_host_resolver};
 use listeners::{
     reconcile_dnscrypt, reconcile_listeners, spawn_tls_cert_watch, ListenerSet, TlsSlots,
 };
@@ -1227,18 +1227,11 @@ pub fn serve(
         );
     }
 
-    // The upstreams and root hints used for name resolution change without restart; keeping the
-    // startup ones would fetch lists from old servers after an address change, so only the inside
-    // is swapped.
-    let blocklist_resolver_slot: Arc<Mutex<http::HostResolver>> =
-        Arc::new(Mutex::new(blocklist_host_resolver(&cfg)));
-    let blocklist_resolver: http::HostResolver = {
-        let slot = blocklist_resolver_slot.clone();
-        Arc::new(move |host: &str, timeout: Duration| {
-            let inner = slot.lock_recover().clone();
-            inner(host, timeout)
-        })
-    };
+    // The servers these resolvers ask change without restart; keeping the startup ones would
+    // fetch lists from old servers after an address change, so only the inside is swapped.
+    let blocklist_resolver_slot = Arc::new(Mutex::new(blocklist_host_resolver(&cfg)));
+    let blocklist_resolver = slot_host_resolver(&blocklist_resolver_slot);
+    let revocation_resolver_slot = Arc::new(Mutex::new(revocation_host_resolver(&cfg)));
     let filters = filter_runtime::FilterState::start(
         &cfg,
         &runtime_cfg,
@@ -1282,7 +1275,7 @@ pub fn serve(
     )
     .map_err(std::io::Error::other)?;
 
-    install_revocation_policy(&cfg, &blocklist_resolver);
+    install_revocation_policy(&cfg, &revocation_resolver_slot);
 
     let acl_state = Arc::new(DynamicAccessControl::new(runtime_access_control(&cfg)));
     let acl: Arc<dyn AccessControl> = acl_state.clone();
@@ -1385,7 +1378,7 @@ pub fn serve(
         tls_slots: tls_slot_handle.clone(),
         vendor_db: vendor_db.clone(),
         blocklist_resolver_slot: blocklist_resolver_slot.clone(),
-        blocklist_resolver: blocklist_resolver.clone(),
+        revocation_resolver_slot: revocation_resolver_slot.clone(),
         cache_slot: cache_slot.clone(),
     });
 
@@ -2459,9 +2452,18 @@ fn cachedb_redis_addr(host: &str, port: u16, bootstrap: &[IpAddr]) -> Result<Soc
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Asks whichever resolver is in `slot` at the time of the lookup.
+fn slot_host_resolver(slot: &Arc<Mutex<http::HostResolver>>) -> http::HostResolver {
+    let slot = slot.clone();
+    Arc::new(move |host: &str, timeout: Duration| {
+        let inner = slot.lock_recover().clone();
+        inner(host, timeout)
+    })
+}
+
 /// A policy change bumps the forward layer's generation, so pooled connections and session
 /// tickets verified under the old policy are not used from the next query.
-fn install_revocation_policy(cfg: &Config, resolver: &http::HostResolver) {
+fn install_revocation_policy(cfg: &Config, resolver_slot: &Arc<Mutex<http::HostResolver>>) {
     let mode = revoke::RevocationMode::parse(&cfg.tls_revocation);
     if mode == revoke::RevocationMode::Off {
         onetdns_forward::clear_revocation_hook();
@@ -2469,7 +2471,7 @@ fn install_revocation_policy(cfg: &Config, resolver: &http::HostResolver) {
     }
     let checker =
         revoke::RevocationChecker::new(mode, cfg.tls_revocation_softfail, Duration::from_secs(10))
-            .with_resolver(resolver.clone());
+            .with_resolver(slot_host_resolver(resolver_slot));
     onetdns_forward::set_revocation_hook(Box::new(move |chain, _host| {
         checker.check_chain(chain, unix_now() as i64).map(|_| ())
     }));
@@ -3453,7 +3455,20 @@ mod tests {
     /// Left out of the group, changing such a key at runtime would keep resolving list and
     /// revocation names through the old servers.
     fn blocklist_resolver_inputs_rebuild_the_resolver_when_changed() {
-        for key in ["bootstrap", "upstreams", "root_hints", "max_ttl"] {
+        for key in [
+            "backend",
+            "upstreams",
+            "upstream_urls",
+            "upstream_strategy",
+            "upstream_concurrency",
+            "query_timeout_secs",
+            "bootstrap",
+            "split_default",
+            "split_recurse",
+            "split_forward",
+            "root_hints",
+            "max_ttl",
+        ] {
             assert!(
                 matches!(
                     config_keys::hot_group(key),
