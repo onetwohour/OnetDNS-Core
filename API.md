@@ -2,9 +2,6 @@
 
 The dashboard is built on this API and served from the same address, so anything you can do in the dashboard you can also script.
 
-> [!WARNING]
-> OnetDNS is in alpha. Endpoints, request bodies, and responses can change between releases.
-
 ## Address
 
 The API listens on `control_listen`, `127.0.0.1:8553` by default, and speaks plain HTTP/1.1. It answers only requests addressed to a loopback host. To manage a server from another machine, use an SSH tunnel, or an HTTPS reverse proxy on the same machine with `control_trusted_proxies` and `control_public_origins` set as the [README](README.md) describes.

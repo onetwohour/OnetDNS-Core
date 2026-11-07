@@ -8,7 +8,7 @@ One small program on one machine. Nothing to install on your phones, TVs, or con
 
 <br>
 
-[![Release](https://img.shields.io/github/v/release/onetwohour/OnetDNS-Core?include_prereleases&style=flat&label=release&color=gray)](https://github.com/onetwohour/OnetDNS-Core/releases)
+[![Release](https://img.shields.io/github/v/release/onetwohour/OnetDNS-Core?style=flat&label=release&color=gray)](https://github.com/onetwohour/OnetDNS-Core/releases)
 ![Platforms](https://img.shields.io/badge/Linux_|_Windows_|_macOS-gray?style=flat)
 [![License](https://img.shields.io/badge/Apache--2.0-gray?style=flat&label=license)](LICENSE)
 
@@ -19,9 +19,6 @@ One small program on one machine. Nothing to install on your phones, TVs, or con
 You can't install an ad blocker on a smart TV, and the one in your browser does nothing for the apps on your phone. What they all have in common is that they look up names before they connect. OnetDNS answers those lookups for your whole network and refuses the ones that lead to ads and trackers, so the connection never happens.
 
 Run it on a PC, a Raspberry Pi, or a small server, point your router at it, and every device on your Wi-Fi is covered.
-
-> [!WARNING]
-> OnetDNS is in alpha. The config file and the management API can change between releases, and old settings are not carried over.
 
 <br>
 

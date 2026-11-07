@@ -336,13 +336,6 @@ jobs:
           OnetDNS is an ad-blocking DNS resolver that ships as a single self-contained binary. It answers over plain DNS, DNS-over-TLS, DNS-over-HTTPS (HTTP/2 and HTTP/3), DNS-over-QUIC and DNSCrypt, resolves by forwarding, full recursion or a split of the two, validates and signs DNSSEC, and can also serve authoritative zones and DHCP. A web dashboard is built in.
 
           EOF
-            if [ "$PRERELEASE" = true ]; then
-              cat <<'EOF'
-          > [!WARNING]
-          > This is a pre-release. The configuration format and management API may change without notice.
-
-          EOF
-            fi
             cat <<'EOF'
           ## Downloads
 
