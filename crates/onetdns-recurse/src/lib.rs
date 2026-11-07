@@ -19,10 +19,16 @@ fn recurse_trace_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| std::env::var_os("ONETDNS_RECURSE_TRACE").is_some())
 }
+/// Trace lines carry names from remote servers, so control characters are escaped.
+fn escaped_trace(args: std::fmt::Arguments<'_>) -> String {
+    let mut line = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut onetdns_core::log::Escaped(&mut line), args);
+    line
+}
 macro_rules! rtrace {
     ($($arg:tt)*) => {
         if recurse_trace_enabled() {
-            eprintln!("[recurse] {}", format_args!($($arg)*));
+            eprintln!("[recurse] {}", escaped_trace(format_args!($($arg)*)));
         }
     };
 }
@@ -3935,6 +3941,14 @@ mod tests {
 
     fn name_key(name: &str) -> Vec<u8> {
         Name::from_str(name).unwrap().canonical_key()
+    }
+
+    #[test]
+    fn trace_lines_escape_control_characters_from_remote_names() {
+        let remote =
+            Name::from_labels(vec![b"a\nforged\x1b[2J".to_vec(), b"test".to_vec()]).unwrap();
+        let line = escaped_trace(format_args!("name={remote}"));
+        assert_eq!(line, "name=a\\x0aforged\\x1b[2J.test.");
     }
 
     #[test]
