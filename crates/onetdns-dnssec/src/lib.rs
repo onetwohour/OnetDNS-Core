@@ -1,11 +1,7 @@
-/*!
- * @brief DNSSEC 검증과 온라인 서명.
- *
- * @details 신뢰 체인은 루트 앵커에서 시작해 DS→DNSKEY→RRSIG 순으로 내려간다. 각 단계에서
- *          위조를 막는 검사가 있으며, 하나라도 건너뛰면 체인 전체가 무의미해진다.
- * @warning 검증 비용은 공격 표면이다. 악의적인 zone이 질의 하나에 막대한 공개키 연산을
- *          강제할 수 있으므로(KeyTrap 계열), 연산 횟수와 반복 횟수에 상한이 걸려 있다.
- */
+//! DNSSEC validation and online signing. The chain of trust runs from the root anchor through
+//! DS, DNSKEY and RRSIG; skipping any check breaks the whole chain. Validation cost is attack
+//! surface: a hostile zone can force many public-key operations per query (KeyTrap), so operations
+//! and hash iterations are capped.
 
 use std::{
     cmp::Ordering,
@@ -14,38 +10,30 @@ use std::{
 
 use onetdns_proto::{Name, RData, Reader, Record, RecordType};
 
-/** @brief P-256 서명 검증 전용 고속 경로. 검증 횟수가 곧 CPU 예산이라 따로 둔다. */
 mod p256fast;
-/** @brief TSIG: 대칭키로 트랜잭션 자체를 인증한다. DNSSEC 체인과는 별개 축이다. */
 pub mod tsig;
 
-/** @brief 온라인 zone 서명. */
 pub mod sign;
 
-/** @brief 신뢰 앵커 관리(RFC 5011 롤오버 포함). */
 pub mod anchor;
 
-/** @brief DNSSEC 검증 실패 사유. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnssecError {
-    /** @brief 이 서버가 다루지 않는 알고리즘·다이제스트. bogus가 아니라 "판단 불가"다. */
+    /// An algorithm or digest this server does not implement: undecidable, not bogus.
     Unsupported(u8),
 
-    /** @brief 공개키 바이트가 그 알고리즘의 형식에 맞지 않는다. */
     BadKey,
 
-    /** @brief 서명이 검증되지 않았거나, 검증 예산을 다 썼다. 둘 다 fail-closed다. */
+    /// The signature did not verify, or the verification budget ran out; both fail closed.
     BadSignature,
 
-    /** @brief DS 다이제스트가 DNSKEY에서 계산한 값과 다르다. */
     BadDigest,
 
-    /** @brief 입력 자체가 비정상: 빈 RRset, 소유자 불일치 등. */
+    /// Malformed input, such as an empty RRset or mismatched owners.
     Invalid,
 }
 
 impl std::fmt::Display for DnssecError {
-    /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DnssecError::Unsupported(a) => write!(f, "Unsupported algorithm or digest: {a}"),
@@ -59,21 +47,16 @@ impl std::fmt::Display for DnssecError {
 
 impl std::error::Error for DnssecError {}
 
-/** @brief DNSKEY 레코드. zone의 공개키다. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dnskey {
-    /** @brief 비트 7이 zone key, 비트 15가 SEP, 비트 8이 revoke다. */
+    /// Bit 7 zone key, bit 8 revoked, bit 15 SEP.
     pub flags: u16,
-    /** @brief 3이 아니면 DNSSEC 키가 아니다. 다른 값은 쓰지 않는다. */
     pub protocol: u8,
-    /** @brief 서명 알고리즘 번호. RRSIG의 것과 일치해야 후보가 된다. */
     pub algorithm: u8,
-    /** @brief 알고리즘별 공개키 바이트. 형식 검사는 검증 시점에 한다. */
     pub public_key: Vec<u8>,
 }
 
 impl Dnskey {
-    /** @brief DNSKEY RDATA를 해석한다. */
     pub fn parse(raw: &[u8]) -> Option<Dnskey> {
         let mut r = Reader::new(raw);
         let flags = r.u16().ok()?;
@@ -87,7 +70,6 @@ impl Dnskey {
         })
     }
 
-    /** @brief 레코드에서 DNSKEY를 꺼낸다. 타입이 다르면 None. */
     pub fn from_record(rec: &Record) -> Option<Dnskey> {
         match &rec.rdata {
             RData::Unknown(_, raw) => Dnskey::parse(raw),
@@ -95,7 +77,7 @@ impl Dnskey {
         }
     }
 
-    /** @brief DNSKEY를 다시 RDATA 바이트로 만든다. DS 다이제스트 계산에 쓴다. */
+    /// Input to the DS digest.
     pub fn rdata_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(4 + self.public_key.len());
         v.extend_from_slice(&self.flags.to_be_bytes());
@@ -105,13 +87,10 @@ impl Dnskey {
         v
     }
 
-    /**
-     * @brief RFC 4034 부록 B의 key tag.
-     * @warning 식별자가 아니라 힌트다. 서로 다른 키가 같은 tag를 가질 수 있고, 악의적인
-     *          zone은 일부러 전부 같게 만들 수 있다(KeyTrap). tag가 맞아도 서명은 반드시
-     *          실제로 검증해야 하며, 시도 횟수에는 상한이 필요하다.
-     * @note 할당하지 않는다. RDATA를 만들어 쓰면 N×M 후보 루프에서 그만큼 할당이 붙는다.
-     */
+    /// The RFC 4034 key tag, a hint and not an identifier: different keys can share it, and a
+    /// hostile zone can make them all equal (KeyTrap). A matching tag still needs a real
+    /// verification, and attempts need a cap. Allocation-free, since it runs in the N x M candidate
+    /// loop.
     pub fn key_tag(&self) -> u16 {
         let flags = self.flags.to_be_bytes();
         let mut ac: u32 = (u32::from(flags[0]) << 8) + u32::from(flags[1]);
@@ -128,40 +107,33 @@ impl Dnskey {
         (ac & 0xFFFF) as u16
     }
 
-    /** @brief zone 키 비트(0x0100)가 서 있는지. 이 비트가 없는 키로는 RRset을 검증하지 않는다. */
+    /// Keys without this bit never validate an RRset.
     pub fn is_zone_key(&self) -> bool {
         self.flags & 0x0100 != 0
     }
 
-    /** @brief SEP 비트. 관례상 KSK를 표시하지만 검증 규칙은 아니다. */
+    /// Marks a KSK by convention; validation does not depend on it.
     pub fn is_sep(&self) -> bool {
         self.flags & 0x0001 != 0
     }
 
-    /**
-     * @brief 폐기 비트(RFC 5011)가 서 있는지.
-     * @warning 폐기된 키로는 어떤 것도 검증하지 않는다. 운영자가 명시적으로 무효화한 키다.
-     */
+    /// RFC 5011. A revoked key validates nothing.
     pub fn is_revoked(&self) -> bool {
         self.flags & 0x0080 != 0
     }
 }
 
-/** @brief DS 레코드. 부모 zone이 자식 zone의 키를 가리키는 다이제스트다. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ds {
-    /** @brief 어느 DNSKEY를 가리키는지 알려 주는 힌트. 식별자가 아니다. */
+    /// A hint, not an identifier.
     pub key_tag: u16,
-    /** @brief 지목한 키의 서명 알고리즘. */
     pub algorithm: u8,
-    /** @brief 다이제스트 알고리즘. SHA-256(2)·SHA-384(4)만 받는다. */
+    /// Only SHA-256 (2) and SHA-384 (4) are accepted.
     pub digest_type: u8,
-    /** @brief 정규 소유자 이름 ‖ DNSKEY RDATA의 다이제스트. */
     pub digest: Vec<u8>,
 }
 
 impl Ds {
-    /** @brief DS RDATA를 해석한다. */
     pub fn parse(raw: &[u8]) -> Option<Ds> {
         let mut r = Reader::new(raw);
         let key_tag = r.u16().ok()?;
@@ -175,7 +147,7 @@ impl Ds {
         })
     }
 
-    /** @brief 레코드에서 DS를 꺼낸다. CDS도 같은 형식이다. */
+    /// CDS has the same format.
     pub fn from_record(rec: &Record) -> Option<Ds> {
         match &rec.rdata {
             RData::Unknown(_, raw) => Ds::parse(raw),
@@ -183,11 +155,7 @@ impl Ds {
         }
     }
 
-    /**
-     * @brief 키에서 DS를 계산한다.
-     * @details 다이제스트 입력은 정규 소유자 이름과 DNSKEY RDATA를 이은 것이다. 이름이
-     *          들어가야 같은 키를 다른 zone에 옮겨 붙일 수 없다.
-     */
+    /// The digest covers the canonical owner name too, so a key cannot be moved to another zone.
     pub fn from_dnskey(key: &Dnskey, owner: &Name, digest_type: u8) -> Option<Ds> {
         let mut input = Vec::new();
         canonical_name_into(owner, &mut input);
@@ -200,7 +168,6 @@ impl Ds {
         })
     }
 
-    /** @brief DS를 RDATA 바이트로 만든다. */
     pub fn rdata_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(4 + self.digest.len());
         v.extend_from_slice(&self.key_tag.to_be_bytes());
@@ -211,19 +178,14 @@ impl Ds {
     }
 }
 
-/**
- * @brief 내장된 루트 신뢰 앵커.
- * @details 모든 검증의 출발점이다. 이 값이 틀리면 정상 응답이 전부 bogus가 되거나,
- *          더 나쁘게는 위조 응답이 통과한다.
- */
+/// The start of all validation: a wrong value makes every answer bogus or, worse, lets forgeries
+/// through.
 pub fn root_trust_anchors() -> Vec<Ds> {
-    /** @brief 2017년 루트 키의 지문. */
     const KSK_2017_DIGEST: [u8; 32] = [
         0xe0, 0x6d, 0x44, 0xb8, 0x0b, 0x8f, 0x1d, 0x39, 0xa9, 0x5c, 0x0b, 0x0d, 0x7c, 0x65, 0xd0,
         0x84, 0x58, 0xe8, 0x80, 0x40, 0x9b, 0xbc, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xc7, 0xf8,
         0xec, 0x8d,
     ];
-    /** @brief 2024년 루트 키의 지문. */
     const KSK_2024_DIGEST: [u8; 32] = [
         0x68, 0x3d, 0x2d, 0x0a, 0xcb, 0x8c, 0x9b, 0x71, 0x2a, 0x19, 0x48, 0xb2, 0x7f, 0x74, 0x12,
         0x19, 0x29, 0x8d, 0x0a, 0x45, 0x0d, 0x61, 0x2c, 0x48, 0x3a, 0xf4, 0x44, 0xa4, 0xc0, 0xfb,
@@ -245,31 +207,25 @@ pub fn root_trust_anchors() -> Vec<Ds> {
     ]
 }
 
-/** @brief RRSIG 레코드. RRset 하나에 대한 서명이다. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rrsig {
-    /** @brief 이 서명이 덮는 RR 타입. 서명 대상 구성에도 이 값이 쓰인다. */
     pub type_covered: u16,
-    /** @brief 서명 알고리즘. 키의 것과 같아야 한다. */
     pub algorithm: u8,
-    /** @brief 서명 당시 소유자 이름의 라벨 수. 실제 이름보다 짧으면 와일드카드 확장이다. */
+    /// Fewer labels than the owner name means wildcard expansion.
     pub labels: u8,
-    /** @brief 서명 대상에 넣을 TTL. 캐시를 거쳐 줄어든 수신 TTL을 쓰면 검증이 깨진다. */
+    /// The TTL in the signed data; the received TTL shrinks in caches and would break validation.
     pub original_ttl: u32,
-    /** @brief 서명 만료 시각(Unix 초, RFC 1982 순환 비교). */
+    /// Compared in RFC 1982 serial arithmetic.
     pub expiration: u32,
-    /** @brief 서명 유효 개시 시각(Unix 초). */
     pub inception: u32,
-    /** @brief 서명 키의 tag 힌트. */
     pub key_tag: u16,
-    /** @brief 서명자 zone apex. 이 이름을 강제해야 다른 zone 키의 서명을 배제한다. */
+    /// Must be the zone apex; enforcing it excludes signatures by other zones' keys.
     pub signer: Name,
-    /** @brief 알고리즘별 서명 바이트. */
     pub signature: Vec<u8>,
 }
 
 impl Rrsig {
-    /** @brief RRSIG RDATA를 해석한다. 서명자 이름은 압축될 수 없다. */
+    /// The signer name is never compressed.
     pub fn parse(raw: &[u8]) -> Option<Rrsig> {
         let mut r = Reader::new(raw);
         let type_covered = r.u16().ok()?;
@@ -293,7 +249,6 @@ impl Rrsig {
         })
     }
 
-    /** @brief 레코드에서 RRSIG를 꺼낸다. */
     pub fn from_record(rec: &Record) -> Option<Rrsig> {
         match &rec.rdata {
             RData::Unknown(_, raw) => Rrsig::parse(raw),
@@ -301,11 +256,7 @@ impl Rrsig {
         }
     }
 
-    /**
-     * @brief RRSIG를 RDATA 바이트로 만든다.
-     * @note 서명 대상 데이터를 조립할 때 서명 값을 뺀 앞부분만 쓴다. 서명이 자기
-     *       자신을 포함할 수는 없기 때문이다.
-     */
+    /// The signed data uses the RDATA without the signature.
     pub fn rdata_bytes(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&self.type_covered.to_be_bytes());
@@ -321,14 +272,8 @@ impl Rrsig {
     }
 }
 
-/**
- * @brief RRset 하나에 대한 서명을 검증한다.
- *
- * @details 서명 대상은 RRSIG 앞부분 + 정규화된 RRset이다. 정규화는 소유자 이름 소문자화,
- *          원본 TTL 사용, RDATA 기준 정렬을 포함한다. 이 셋 중 하나라도 어긋나면 정상
- *          서명이 실패한다.
- * @warning 여기서 실제 공개키 연산이 일어난다. 호출자가 시도 횟수를 제한해야 한다.
- */
+/// The signed data is the RRSIG header and the canonical RRset: lowercase owner, original TTL,
+/// RDATA order. This runs the public-key operation, so callers must cap the attempts.
 pub fn verify_rrsig(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<(), DnssecError> {
     let first = validate_rrset_shape(rrset)?;
     if rrsig.algorithm != key.algorithm || !rrsig_applies_to_rrset(rrsig, first) {
@@ -337,7 +282,6 @@ pub fn verify_rrsig(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<(),
     verify_rrsig_crypto(rrset, rrsig, key)
 }
 
-/** @brief RRset이 한 소유자·클래스·타입으로만 구성됐는지 한 번 검사한다. */
 fn validate_rrset_shape(rrset: &[Record]) -> Result<&Record, DnssecError> {
     let Some(first) = rrset.first() else {
         return Err(DnssecError::Invalid);
@@ -352,19 +296,18 @@ fn validate_rrset_shape(rrset: &[Record]) -> Result<&Record, DnssecError> {
     Ok(first)
 }
 
-/** @brief 공개키 연산 전에 RRSIG가 이 RRset을 덮을 수 있는지 값싸게 거른다. */
+/// Cheap checks before any public-key operation.
 fn rrsig_applies_to_rrset(rrsig: &Rrsig, first: &Record) -> bool {
     rrsig.type_covered == first.rtype.0
         && usize::from(rrsig.labels) <= first.name.num_labels()
         && name_is_within(&first.name, &rrsig.signer)
 }
 
-/** @brief 현재 구현이 실제 공개키 검증을 수행하는 DNSSEC 알고리즘인지. */
 fn signature_algorithm_supported(algorithm: u8) -> bool {
     matches!(algorithm, 8 | 10 | 13 | 14 | 15)
 }
 
-/** @brief 구조 검사를 마친 후보 하나의 공개키 연산만 수행한다. */
+/// The public-key operation for one candidate that passed the structural checks.
 fn verify_rrsig_crypto(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<(), DnssecError> {
     let data = signed_data(rrsig, rrset);
     match key.algorithm {
@@ -377,7 +320,6 @@ fn verify_rrsig_crypto(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<
     }
 }
 
-/** @brief DS 다이제스트가 이 키와 소유자 이름에서 나온 것인지 확인한다. */
 pub fn verify_ds(ds: &Ds, key: &Dnskey, owner: &Name) -> Result<(), DnssecError> {
     if ds.key_tag != key.key_tag() || ds.algorithm != key.algorithm {
         return Err(DnssecError::Invalid);
@@ -391,7 +333,7 @@ pub fn verify_ds(ds: &Ds, key: &Dnskey, owner: &Name) -> Result<(), DnssecError>
     }
 }
 
-/** @brief DS 다이제스트 입력을 중간 DNSKEY RDATA 할당 없이 한 번 만든다. */
+/// Built once, without an intermediate DNSKEY RDATA allocation.
 fn ds_digest_input(key: &Dnskey, owner: &Name) -> Vec<u8> {
     let mut input = Vec::with_capacity(4 + key.public_key.len() + 32);
     canonical_name_into(owner, &mut input);
@@ -404,11 +346,10 @@ fn ds_digest_input(key: &Dnskey, owner: &Name) -> Vec<u8> {
 
 #[cfg(test)]
 thread_local! {
-    /** @brief 한 스레드에서 실제 DS digest를 계산한 횟수. */
     static DS_DIGEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/** @brief DS 다이제스트를 계산한다. SHA-1은 지원하지 않는다. */
+/// SHA-1 is not supported.
 fn digest(digest_type: u8, input: &[u8]) -> Result<Vec<u8>, DnssecError> {
     #[cfg(test)]
     DS_DIGEST_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -420,7 +361,6 @@ fn digest(digest_type: u8, input: &[u8]) -> Result<Vec<u8>, DnssecError> {
     })
 }
 
-/** @brief Ed25519(알고리즘 15) 서명 검증. */
 fn verify_ed25519(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecError> {
     let pk: [u8; 32] = pubkey.try_into().map_err(|_| DnssecError::BadKey)?;
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| DnssecError::BadKey)?;
@@ -430,7 +370,6 @@ fn verify_ed25519(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecErr
         .map_err(|_| DnssecError::BadSignature)
 }
 
-/** @brief ECDSA P-256(알고리즘 13) 서명 검증. 가장 널리 쓰이는 알고리즘이다. */
 fn verify_ecdsa_p256(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecError> {
     if pubkey.len() != 64 {
         return Err(DnssecError::BadKey);
@@ -443,12 +382,7 @@ fn verify_ecdsa_p256(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), Dnssec
     p256fast::verify(pubkey, &digest, sig).map_err(|()| DnssecError::BadSignature)
 }
 
-/**
- * @brief RSA(알고리즘 8/10) 서명 검증. onetdns-core의 rsa 모듈을 쓴다.
- *
- * @warning 모듈러스 하한은 TLS의 것보다 낮다. org, nl을 비롯한 여러 영역이 지금도
- *          1024비트 ZSK로 서명하므로, TLS 하한을 그대로 쓰면 그 영역들이 전부 Bogus가 된다.
- */
+/// The modulus floor is below TLS's, since org, nl and other zones still sign with 1024-bit ZSKs.
 fn verify_rsa(pubkey: &[u8], msg: &[u8], sig: &[u8], sha512: bool) -> Result<(), DnssecError> {
     use onetdns_core::rsa::{verify_pkcs1_min_bits, RsaError, RsaHash, MIN_MODULUS_BITS_DNSSEC};
     let (e, n) = parse_rfc3110(pubkey).ok_or(DnssecError::BadKey)?;
@@ -463,21 +397,12 @@ fn verify_rsa(pubkey: &[u8], msg: &[u8], sig: &[u8], sha512: bool) -> Result<(),
     })
 }
 
-/**
- * @brief 받아들일 RSA 모듈러스 최소 바이트 수.
- *
- * @details 1024비트다. org, nl을 비롯한 여러 영역이 지금도 1024비트 ZSK로 서명하므로,
- *          TLS와 같은 2048비트 하한을 두면 그 영역들이 전부 Bogus가 된다. 검증기가
- *          받아들이지 못하는 것과 서명이 위조된 것은 다른 일이다.
- * @warning 이 값을 올리면 그 크기로 서명하는 모든 영역이 해석되지 않는다.
- */
+/// 1024 bits. org, nl and other zones still sign with 1024-bit ZSKs; a 2048-bit floor as in TLS
+/// would make them all bogus. Raising this breaks every zone that signs at that size.
 const MIN_RSA_MODULUS_BYTES: usize = 128;
 
-/**
- * @brief RFC 3110 형식의 RSA 공개키에서 지수와 모듈러스를 추출한다.
- * @details 지수 길이가 1바이트로 안 담기면 0 다음에 2바이트로 온다. 길이가 0이거나
- *          남은 바이트를 넘으면 거부한다.
- */
+/// RFC 3110: an exponent length that does not fit one byte comes as 0 and two bytes. A zero length
+/// or one past the end is rejected.
 fn parse_rfc3110(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     if raw.is_empty() {
         return None;
@@ -516,7 +441,6 @@ fn parse_rfc3110(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((e, n))
 }
 
-/** @brief ECDSA P-384(알고리즘 14) 서명 검증. */
 fn verify_ecdsa_p384(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecError> {
     use p384::ecdsa::signature::Verifier;
     if pubkey.len() != 96 {
@@ -532,104 +456,79 @@ fn verify_ecdsa_p384(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), Dnssec
         .map_err(|_| DnssecError::BadSignature)
 }
 
-/**
- * @brief RFC 1982 순환 산술 비교(a <= b).
- * @warning 단순 크기 비교를 쓰면 안 된다. 2^32 주기로 되감기는 값이라, 되감긴 시각이
- *          영원히 과거로 판정되어 정상 서명이 만료로 보인다.
- */
+/// RFC 1982 serial comparison. A plain comparison would treat a wrapped time as forever past and
+/// every signature as expired.
 fn serial_le(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < 0x8000_0000
 }
 
-/** @brief 서명 유효 기간 안인지. 전역 만료 허용 설정을 함께 본다. */
+/// Also honours the global accept-expired setting.
 pub fn rrsig_time_valid(rrsig: &Rrsig, now: u32) -> bool {
     rrsig_time_valid_accepting(rrsig, now, false)
 }
 
-/**
- * @brief 만료 허용 여부를 인자로 받아 유효 기간을 본다.
- * @param accept_expired true면 만료된 서명도 통과시킨다. 시계가 어긋난 환경의 임시 조치이며
- *                       재생 공격을 막지 못한다.
- */
+/// `accept_expired` passes expired signatures; it is a stopgap for bad clocks and does not stop
+/// replay.
 pub fn rrsig_time_valid_accepting(rrsig: &Rrsig, now: u32, accept_expired: bool) -> bool {
     serial_le(rrsig.inception, now) && (accept_expired || serial_le(now, rrsig.expiration))
 }
 
-/** @brief 만료된 서명도 받아들일지. 시각이 크게 틀어진 기계에서 쓰려는 것이며, 켜면 방어가 약해진다. */
+/// For machines with badly wrong clocks; it weakens the defense.
 static ACCEPT_EXPIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/**
- * @brief 만료 서명 허용을 전역으로 켠다.
- * @warning 시계 동기화가 없는 환경을 위한 탈출구다. 켜면 오래전에 폐기된 서명도 통과하므로
- *          운영 환경에서는 쓰지 않는다.
- */
+/// An escape hatch for hosts without clock sync: expired, long-revoked signatures pass. Not for
+/// production.
 pub fn set_accept_expired(v: bool) {
     ACCEPT_EXPIRED.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-/** @brief 현재 만료 허용 설정. */
 fn accept_expired_now() -> bool {
     ACCEPT_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/**
- * @brief 신뢰 체인의 한 단계: zone 하나의 DNSKEY와 그 위임 증거.
- * @details 루트부터 리프까지 순서대로 늘어놓으면 검증기가 앵커에서 시작해 내려간다.
- */
+/// One step of the chain of trust: a zone's DNSKEYs and its delegation evidence. Ordered from the
+/// root to the leaf.
 pub struct ChainLink {
-    /** @brief 이 단계가 대표하는 zone apex. */
     pub zone: Name,
 
-    /** @brief zone의 DNSKEY RRset 원본 레코드. 서명 검증에 정규형 그대로 필요하다. */
+    /// The raw records, as signature validation needs their canonical form.
     pub dnskeys: Vec<Record>,
 
-    /** @brief 위 DNSKEY RRset을 덮는 서명들. KSK로 서명돼 있어야 한다. */
+    /// Must be signed by a KSK.
     pub dnskey_rrsigs: Vec<Rrsig>,
 
-    /** @brief 이 zone이 자식에게 준 DS RRset. 비어 있으면 위임이 서명되지 않았다는 뜻이다. */
+    /// The DS RRset for the child; empty means the delegation is unsigned.
     pub ds_records: Vec<Record>,
-    /** @brief 위 DS RRset을 덮는 서명들. 부모 zone 키로 검증한다. */
+    /// Validated with the parent zone's keys.
     pub ds_rrsigs: Vec<Rrsig>,
 
-    /** @brief DS 부재를 NSEC으로 증명하는 레코드들. 안전한 위임 종료 판정에 쓴다. */
+    /// NSEC records proving the DS absent, for a secure end of delegation.
     pub ds_nsec_records: Vec<Record>,
-    /** @brief 위 NSEC들을 덮는 서명들. */
     pub ds_nsec_rrsigs: Vec<Rrsig>,
-    /** @brief DS 부재를 NSEC3으로 증명하는 레코드들. */
     pub ds_nsec3_records: Vec<Record>,
-    /** @brief 위 NSEC3들을 덮는 서명들. */
     pub ds_nsec3_rrsigs: Vec<Rrsig>,
 
-    /** @brief ds_records를 파싱한 형태. 다음 단계의 신뢰 기준이 된다. */
+    /// Parsed `ds_records`, the trust basis for the next step.
     pub ds: Vec<Ds>,
 }
 
-/**
- * @brief 한 RRset을 검증하며 시도할 수 있는 공개키 연산 횟수 상한.
- *
- * @details RFC 4035는 서명이 검증될 때까지 모든 후보 키를 시도하라고 한다. 그대로 두면
- *          key tag가 전부 겹치는 DNSKEY N개와 RRSIG M개를 돌려주는 zone이 질의 한 건에
- *          N×M회 공개키 연산을 강제할 수 있다(KeyTrap, CVE-2023-50387 계열).
- * @note    정상 zone은 활성 ZSK 하나, 롤오버 중이라도 둘로 서명하므로 한 자릿수면 족하다.
- * @warning 초과 시 fail-closed로 Bogus 처리한다. 늘리면 위 소진 경로가 그만큼 열린다.
- */
+/// Public-key operations allowed while validating one RRset. RFC 4035 says to try every
+/// candidate until one verifies; a zone returning N DNSKEYs with colliding tags and M RRSIGs
+/// would then force N x M operations per query (KeyTrap, CVE-2023-50387). A normal zone signs
+/// with one ZSK, two during a rollover. Exceeding this fails closed as bogus.
 const MAX_SIGNATURE_VERIFICATIONS: usize = 8;
 
-/**
- * @brief 한 DNSKEY RRset에서 허용하는 실제 DS 다이제스트 계산 횟수.
- * @note 정상 롤오버는 KSK 1~2개와 다이제스트 종류 1~2개만 필요하다. 키 tag를 충돌시킨
- *       DNSKEY·DS 팬아웃이 해시 계산을 무한히 늘리지 못하도록 넉넉한 32회에서 닫는다.
- */
+/// DS digest computations allowed per DNSKEY RRset. A normal rollover needs one or two KSKs and
+/// digest types; this stops colliding DNSKEY and DS fan-out from hashing without bound.
 const MAX_DS_DIGEST_COMPUTATIONS: usize = 32;
 
 #[derive(Default)]
-/** @brief DNSKEY RRset 하나가 공유하는 DS 다이제스트 계산 예산. */
 struct DsDigestBudget {
     computations: usize,
 }
 
 impl DsDigestBudget {
-    /** @brief 실제 해시 한 번을 예약한다. 상한이면 fail-closed한다. */
+    /// Fails closed at the cap.
     fn charge(&mut self) -> Result<(), DnssecError> {
         if self.computations >= MAX_DS_DIGEST_COMPUTATIONS {
             return Err(DnssecError::BadSignature);
@@ -640,19 +539,17 @@ impl DsDigestBudget {
 }
 
 #[derive(Debug)]
-/** @brief 한 DNS 응답 안에서 공유하는 공개키 검증 시도 예산. */
+/// Shared across one DNS response.
 pub struct VerificationBudget {
-    /** @brief 지금까지 실제 공개키 연산으로 넘긴 후보 수. */
     attempts: usize,
 }
 
 impl VerificationBudget {
-    /** @brief 비어 있는 응답 단위 예산을 만든다. */
     pub fn new() -> Self {
         Self { attempts: 0 }
     }
 
-    /** @brief 공개키 연산 한 번을 예약한다. 상한이면 fail-closed한다. */
+    /// Fails closed at the cap.
     fn charge(&mut self) -> Result<(), DnssecError> {
         if self.attempts >= MAX_SIGNATURE_VERIFICATIONS {
             return Err(DnssecError::BadSignature);
@@ -668,12 +565,8 @@ impl Default for VerificationBudget {
     }
 }
 
-/**
- * @brief signer를 강제하지 않고 RRset 서명을 검증한다.
- * @note signer apex를 이미 아는 호출자는 validate_rrset_in_zone을 써야 한다. 이 형태는
- *       서명자가 어느 zone이든 상관없이 통과시키므로, 다른 zone의 키로 서명된 데이터를
- *       배제하지 못한다.
- */
+/// Does not enforce the signer. Callers that know the apex must use `validate_rrset_in_zone`;
+/// this form accepts data signed with any zone's key.
 pub fn validate_rrset(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -684,11 +577,8 @@ pub fn validate_rrset(
     validate_rrset_for_signer(rrset, rrsigs, keys, now, None, &mut budget, |_, _| true)
 }
 
-/**
- * @brief 서명자가 zone apex인 서명만 인정하며 RRset을 검증한다.
- * @details 이것이 기본형이다. signer를 묶어 두지 않으면 공격자가 자기 zone 키로 서명한
- *          RRset을 남의 zone 응답에 끼워 넣을 수 있다.
- */
+/// The default form. Without binding the signer, an attacker could sign an RRset with their own
+/// zone's key and splice it into another zone's answer.
 pub fn validate_rrset_in_zone(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -700,12 +590,9 @@ pub fn validate_rrset_in_zone(
     validate_rrset_in_zone_with_budget(rrset, rrsigs, keys, zone, now, &mut budget)
 }
 
-/**
- * @brief zone 서명 중 호출자의 추가 조건까지 만족하는 첫 서명에서 검증을 끝낸다.
- * @details 와일드카드처럼 암호학적 검증 뒤 문맥 검사가 필요한 경로가 서명마다 검증 예산을
- *          새로 만들지 않도록 한다. predicate는 공개키 검증에 성공한 서명에만 호출된다.
- * @warning false를 돌려준 정상 서명도 공개키 연산 1회를 썼으므로 같은 8회 예산에 포함된다.
- */
+/// Stops at the first zone signature that also satisfies `predicate`, so checks that follow the
+/// cryptography, such as wildcard context, share one budget. `predicate` runs only on signatures
+/// that verified, and a valid signature it rejects still counts against the budget.
 pub fn validate_rrset_in_zone_with(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -726,7 +613,6 @@ pub fn validate_rrset_in_zone_with(
     )
 }
 
-/** @brief 호출자가 제공한 응답 단위 예산으로 zone RRset을 검증한다. */
 pub fn validate_rrset_in_zone_with_budget(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -738,10 +624,7 @@ pub fn validate_rrset_in_zone_with_budget(
     validate_rrset_for_signer(rrset, rrsigs, keys, now, Some(zone), budget, |_, _| true)
 }
 
-/**
- * @brief 공유 예산으로 검증하고, 성공한 서명에 응답 문맥 조건을 적용한다.
- * @warning predicate가 다른 RRset을 검증할 때도 전달받은 같은 예산을 써야 한다.
- */
+/// `predicate` must use the same budget when it validates other RRsets.
 pub fn validate_rrset_in_zone_with_budget_and(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -754,20 +637,9 @@ pub fn validate_rrset_in_zone_with_budget_and(
     validate_rrset_for_signer(rrset, rrsigs, keys, now, Some(zone), budget, predicate)
 }
 
-/**
- * @brief RRset이 주어진 키 집합 중 하나로 유효하게 서명됐는지 확인한다.
- *
- * @details 서명 하나라도 검증되면 즉시 성공이다. 값싼 걸러내기(key tag·알고리즘·프로토콜·
- *          zone key·revoke)를 먼저 통과한 조합만 실제 공개키 연산으로 넘긴다.
- * @param rrset           검증 대상 레코드 집합.
- * @param rrsigs          이 RRset을 덮는다고 주장하는 서명들.
- * @param keys            신뢰 체인이 확정한 zone 키들.
- * @param now             만료·유효개시 판정에 쓸 현재 시각(Unix 초).
- * @param expected_signer 요구할 signer apex. None이면 signer를 강제하지 않는다.
- * @return 유효한 서명을 찾으면 Ok.
- * @retval DnssecError::BadSignature 유효한 서명이 없거나 검증 예산을 넘겼을 때.
- * @invariant 공개키 연산 횟수는 MAX_SIGNATURE_VERIFICATIONS를 넘지 않는다.
- */
+/// Succeeds on the first signature that verifies. Only combinations that pass the cheap filters
+/// (key tag, algorithm, protocol, zone key, revoke) reach a public-key operation, and those never
+/// exceed `MAX_SIGNATURE_VERIFICATIONS`. `expected_signer` of `None` does not enforce the signer.
 fn validate_rrset_for_signer(
     rrset: &[Record],
     rrsigs: &[Rrsig],
@@ -805,22 +677,10 @@ fn validate_rrset_for_signer(
     Err(DnssecError::BadSignature)
 }
 
-/**
- * @brief DS로 신뢰가 확정된 KSK를 찾아 zone의 DNSKEY RRset 전체를 확정한다.
- *
- * @details 순서가 중요하다. 먼저 DNSKEY 레코드가 정말 이 zone apex 것인지 확인하고,
- *          trusted_ds 중 하나와 다이제스트가 맞는 키만 KSK 후보로 남긴다. 그 후보가
- *          DNSKEY RRset 자체의 서명을 검증해야 비로소 RRset 전체를 신뢰한다.
- *          DS는 KSK 하나만 지목하지만, 그 KSK의 서명이 나머지 ZSK까지 보증하는 구조다.
- * @param dnskeys    zone apex의 DNSKEY 레코드들. 소유자 이름과 타입이 모두 맞아야 한다.
- * @param rrsigs     DNSKEY RRset을 덮는 서명들.
- * @param trusted_ds 상위 단계에서 확정된 DS 집합.
- * @param zone       이 DNSKEY들이 속해야 할 zone apex.
- * @param now        시각 판정에 쓸 Unix 초.
- * @return 확정된 키 집합. 이것으로 zone 내 다른 RRset을 검증한다.
- * @retval DnssecError::Invalid      레코드 구성이 틀렸거나 DS에 맞는 KSK 후보가 없을 때.
- * @retval DnssecError::BadSignature KSK 후보는 있으나 DNSKEY 서명이 검증되지 않을 때.
- */
+/// Checks that the DNSKEY records belong to the apex, keeps only keys whose digest matches a
+/// trusted DS as KSK candidates, and trusts the RRset once a candidate validates its signature:
+/// the DS names one KSK, and its signature vouches for the ZSKs. `Invalid` when the records are
+/// malformed or no key matches a DS, `BadSignature` when no candidate validates the RRset.
 pub fn validate_dnskey_set(
     dnskeys: &[Record],
     rrsigs: &[Rrsig],
@@ -894,11 +754,8 @@ pub fn validate_dnskey_set(
     Err(DnssecError::BadSignature)
 }
 
-/**
- * @brief tag·알고리즘이 같은 DS 후보를 키·다이제스트 종류별 한 번의 해시로 대조한다.
- * @details 동일한 DS가 반복되어도 SHA-256·SHA-384를 각각 최대 한 번만 계산하고, 결과는
- *          앞서 만든 digest 집합에서 O(1)에 찾는다.
- */
+/// Hashes once per key and digest type even when DS records repeat, and looks the result up in the
+/// digest set.
 fn trusted_ds_matches_key(
     key: &Dnskey,
     key_tag: u16,
@@ -921,11 +778,7 @@ fn trusted_ds_matches_key(
     Ok(false)
 }
 
-/**
- * @brief 루트 앵커에서 시작해 체인을 내려간 뒤 최종 응답 RRset까지 검증한다.
- * @details 리프 zone(links의 마지막)을 signer로 강제하므로, 체인 중간 zone의 키로 서명된
- *          응답은 통과하지 못한다.
- */
+/// Enforces the leaf zone as the signer, so an answer signed by an intermediate zone's key fails.
 pub fn validate_chain(
     root_anchors: &[Ds],
     links: &[ChainLink],
@@ -938,16 +791,9 @@ pub fn validate_chain(
     validate_rrset_in_zone(answer, answer_rrsigs, &keys, zone, now)
 }
 
-/**
- * @brief 체인을 루트→리프 순으로 걸어 리프 zone의 신뢰된 키를 얻는다.
- *
- * @details trusted_ds를 갱신하며 내려간다. 각 단계에서 그 zone의 DNSKEY를 확정하고,
- *          그 키로 자식 DS RRset을 검증한 뒤에야 trusted_ds를 자식용으로 교체한다.
- *          DS 검증을 건너뛰고 교체하면 서명되지 않은 DS를 그대로 믿게 된다.
- * @note 위임이 안전하지 않은 경우(DS 부재)는 여기서 구분하지 않는다. Secure/Insecure/Bogus
- *       삼분이 필요하면 validate_chain_status를 쓴다.
- * @return 리프 zone의 확정된 키 집합.
- */
+/// Replaces `trusted_ds` with the child's only after the child DS RRset validates with this zone's
+/// keys; replacing it first would trust an unsigned DS. Does not tell insecure delegations apart;
+/// use `validate_chain_status` for Secure, Insecure and Bogus.
 pub fn validate_chain_keys(
     root_anchors: &[Ds],
     links: &[ChainLink],
@@ -978,11 +824,9 @@ pub fn validate_chain_keys(
     Ok(trusted_keys)
 }
 
-/**
- * @brief 구문상 먼저 고른 최소 부재 증명의 모든 RRset 서명이 유효한지 확인한다.
- * @details 선택은 신뢰 전 자료로 해도 안전하다. 선택된 레코드를 신뢰하는 시점은 여기서
- *          서명이 전부 검증된 뒤다. 이 순서가 무관한 NSEC/RRSIG의 공개키 연산을 없앤다.
- */
+/// Selecting from untrusted data is safe, since the selection is trusted only after every
+/// signature here verifies; this keeps unrelated NSEC and RRSIG records from costing public-key
+/// operations.
 fn denial_proof_valid(
     proof: &[Record],
     sigs: &[Rrsig],
@@ -1007,12 +851,9 @@ fn denial_proof_valid(
         })
 }
 
-/**
- * @brief 부모가 자식 zone의 DS 부재를 서명된 증거로 증명했는지.
- * @details 서명되지 않은 위임이라는 증명만 인정한다. 이름이 있다는 증명이나 위임이 아니라는
- *          증명은 DS 부재가 아니다.
- * @return 증명되면 참. 거짓이면 위임 종료를 믿을 수 없으므로 Insecure가 아니라 Bogus다.
- */
+/// Only a proof of an unsigned delegation counts; a proof that the name exists, or that it is not
+/// a cut, is not DS absence. False means the end of delegation cannot be trusted: Bogus, not
+/// Insecure.
 fn ds_absence_proven(
     link: &ChainLink,
     child_zone: &Name,
@@ -1033,43 +874,28 @@ fn ds_absence_proven(
     ) == DsAbsence::InsecureDelegation
 }
 
-/** @brief DS 질의에 딸려 온 부재 증거. 서명은 아직 확인하지 않은 상태다. */
+/// Signatures not yet checked.
 pub struct DenialEvidence<'a> {
-    /** @brief 권한 구간의 NSEC 레코드. */
     pub nsec: &'a [Record],
-    /** @brief NSEC을 덮는 서명. */
     pub nsec_rrsigs: &'a [Rrsig],
-    /** @brief 권한 구간의 NSEC3 레코드. */
     pub nsec3: &'a [Record],
-    /** @brief NSEC3을 덮는 서명. */
     pub nsec3_rrsigs: &'a [Rrsig],
 }
 
-/** @brief DS가 없는 이름이 무엇인지에 대한 판정. */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsAbsence {
-    /** @brief 서명되지 않은 위임이다. 이 아래는 검증할 것이 없다. */
+    /// Nothing below needs validation.
     InsecureDelegation,
-    /** @brief 위임이 아니다. 이 이름은 부모 zone 안에 있고 부모 키로 서명돼야 한다. */
+    /// The name is inside the parent zone and must be signed with the parent's keys.
     NotACut,
-    /** @brief 서명된 증명이 없다. 무엇인지 알 수 없다. */
     Unproven,
 }
 
-/**
- * @brief DS가 없는 이름이 서명되지 않은 위임인지, 위임이 아닌지 부모 키로 가린다.
- *
- * @details RFC 4035 와 RFC 5155 가 정한 대로 이름과 일치하는 NSEC 또는 NSEC3 의 타입
- *          비트맵을 본다. NS 가 있고 DS 와 SOA 가 없어야 서명되지 않은 위임이다. NS 가 없으면
- *          그 이름은 부모 zone 안의 보통 이름이다. 일치하는 레코드 없이 구간에 덮이면 그
- *          이름에는 RRset 이 없으므로 위임일 수 없다. NSEC3 opt-out 구간에 덮이면 그 안에
- *          서명되지 않은 위임이 있을 수 있으므로 위임으로 본다.
- * @warning DS 비트만 보고 위임이라 판정하면 서명된 zone 의 보통 이름에서 서명을 떼어 낸
- *          답이 서명되지 않은 위임의 답으로 통과한다.
- * @param parent_zone 증명에 서명한 부모 zone apex.
- * @param parent_keys 부모 zone 의 확정된 키.
- * @param child DS 를 물은 이름.
- */
+/// Reads the type bitmap of the NSEC or NSEC3 matching the name (RFC 4035, RFC 5155). NS without
+/// DS or SOA is an unsigned delegation; no NS is an ordinary name in the parent zone. A name only
+/// covered by an interval has no RRsets, so it cannot be a cut; an NSEC3 opt-out interval may hide
+/// an unsigned delegation, so it counts as one. Deciding from the DS bit alone would let an answer
+/// stripped of its signatures pass as an unsigned delegation.
 pub fn classify_ds_absence(
     parent_zone: &Name,
     parent_keys: &[Dnskey],
@@ -1177,40 +1003,20 @@ pub fn classify_ds_absence(
     }
 }
 
-/**
- * @brief 체인 판정 결과 삼분.
- * @note Insecure와 Bogus를 합치면 안 된다. Insecure는 서명 없는 정상 zone이라 응답을 주고,
- *       Bogus는 서명이 깨진 것이라 SERVFAIL로 막아야 한다.
- */
+/// Insecure and Bogus must stay apart: an insecure zone is answered, a bogus one gets SERVFAIL.
 pub enum ChainStatus {
-    /** @brief 루트까지 이어지는 서명이 전부 검증됐다. 리프 zone의 신뢰된 키를 함께 준다. */
+    /// With the leaf zone's trusted keys.
     Secure(Vec<Dnskey>),
-    /** @brief 어느 지점에서 위임이 서명 없이 끝났다. 검증 대상이 아니다. */
     Insecure,
-    /** @brief 서명이 있으나 검증에 실패했다. 응답을 내보내면 안 된다. */
     Bogus,
 }
 
-/**
- * @brief DS 부재 증명을 요구하지 않고 체인을 판정한다.
- * @note DS가 없기만 하면 Insecure로 내려간다. 공격자가 DS를 지워 검증을 무력화하는
- *       다운그레이드를 막으려면 validate_chain_status_with_options로 증명을 요구한다.
- */
 pub fn validate_chain_status(root_anchors: &[Ds], links: &[ChainLink], now: u32) -> ChainStatus {
     validate_chain_status_with_options(root_anchors, links, now, false)
 }
 
-/**
- * @brief 체인을 Secure/Insecure/Bogus로 판정한다.
- *
- * @details 각 단계에서 DNSKEY를 확정한 뒤 자식 DS의 유무로 갈린다. DS가 없고 아래 단계가
- *          남아 있으면 그 지점이 위임 종료다. DS는 있으나 이 서버가 지원하는 알고리즘·
- *          다이제스트가 하나도 없어도 마찬가지로 Insecure다. 검증할 수단이 없는 것이지
- *          위조된 것은 아니기 때문이다.
- * @param require_ds_absence_proof 참이면 DS 부재를 서명된 NSEC/NSEC3으로 증명해야만
- *                                 Insecure로 내려간다. 증명이 없으면 Bogus다.
- * @return 삼분 판정. Secure일 때만 리프 zone 키가 함께 온다.
- */
+/// Without a DS absence proof, a missing DS drops to Insecure; an attacker who strips the DS can
+/// then disable validation. `validate_chain_status_with_options` can require the proof.
 pub fn validate_chain_status_with_options(
     root_anchors: &[Ds],
     links: &[ChainLink],
@@ -1261,21 +1067,18 @@ pub fn validate_chain_status_with_options(
     ChainStatus::Secure(keys)
 }
 
-/** @brief RFC 8509 루트 키 센티널 질의. */
+/// A missing DS with steps left below is the end of delegation; so is a DS set with no algorithm
+/// or digest this server supports, since that is a lack of means, not a forgery. With
+/// `require_ds_absence_proof` the absence must be proven by signed NSEC or NSEC3, or it is Bogus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootKeySentinel {
-    /** @brief 이 key tag의 키를 신뢰하는지 묻는다. */
     IsTa(u16),
-    /** @brief 이 key tag의 키를 신뢰하지 않는지 묻는다. */
     NotTa(u16),
 }
 
 impl RootKeySentinel {
-    /**
-     * @brief 질의 이름의 첫 라벨이 센티널 형식이면 종류와 key tag를 추출한다.
-     * @details RFC 8509 가 정한 라벨은 root-key-sentinel-is-ta- 또는 root-key-sentinel-not-ta-
-     *          뒤에 key tag 를 앞자리 0 을 채운 다섯 자리 십진수로 붙인 것이다.
-     */
+    /// RFC 8509: root-key-sentinel-is-ta- or root-key-sentinel-not-ta- followed by a five-digit
+    /// zero-padded key tag.
     pub fn parse(label: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(label).ok()?.to_ascii_lowercase();
         let (tag, is_ta) = if let Some(rest) = text.strip_prefix("root-key-sentinel-is-ta-") {
@@ -1294,10 +1097,7 @@ impl RootKeySentinel {
         })
     }
 
-    /**
-     * @brief 이 센티널 질의에 SERVFAIL 로 답해야 하는지.
-     * @param anchors 지금 신뢰하는 루트 앵커.
-     */
+    /// Whether to answer SERVFAIL, given the root anchors trusted now.
     pub fn fails(self, anchors: &[Ds]) -> bool {
         match self {
             RootKeySentinel::IsTa(tag) => !anchors.iter().any(|ds| ds.key_tag == tag),
@@ -1306,34 +1106,21 @@ impl RootKeySentinel {
     }
 }
 
-/**
- * @brief 이 DS를 이 서버가 실제로 검증할 수 있는지.
- * @details 알고리즘은 RSA/SHA-256·512(8/10), ECDSA P-256·P-384(13/14), Ed25519(15)만,
- *          다이제스트는 SHA-256(2)·SHA-384(4)만 인정한다. SHA-1(1)은 충돌 공격 때문에 뺐다.
- * @note 지원 밖 DS만 있는 위임은 Bogus가 아니라 Insecure다. 검증 수단이 없을 뿐이다.
- */
+/// Algorithms 8, 10, 13, 14 and 15, digests 2 and 4. SHA-1 is excluded for its collisions. A
+/// delegation with only unsupported DS records is Insecure, not Bogus.
 pub fn ds_is_supported(ds: &Ds) -> bool {
     matches!(ds.algorithm, 8 | 10 | 13 | 14 | 15) && matches!(ds.digest_type, 2 | 4)
 }
 
-/**
- * @brief NSEC 레코드: 정규 순서상 다음 이름과, 이 이름에 존재하는 타입 목록.
- * @details 두 이름 사이에 아무것도 없음을 주장해 부재를 증명한다.
- */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec {
-    /** @brief 정규 순서상 이 소유자 다음에 존재하는 이름. */
     pub next: Name,
-    /** @brief 이 소유자 이름에 실제로 존재하는 RR 타입들. */
     pub types: Vec<u16>,
 }
 
 impl Nsec {
-    /**
-     * @brief NSEC RDATA를 파싱한다.
-     * @note next는 압축될 수 없으므로 오프셋 계산이 안전하다. 남은 바이트 전체가
-     *       타입 비트맵이며, 잘못된 비트맵은 None으로 떨군다.
-     */
+    /// `next` is never compressed, so the offset is safe. The rest is the type bitmap; a malformed
+    /// one yields `None`.
     pub fn parse(raw: &[u8]) -> Option<Nsec> {
         let mut r = Reader::new(raw);
         let next = Name::parse(&mut r).ok()?;
@@ -1341,7 +1128,6 @@ impl Nsec {
         Some(Nsec { next, types })
     }
 
-    /** @brief 레코드에서 NSEC을 꺼낸다. 미해석 RDATA로 보관돼 있어야 한다. */
     pub fn from_record(rec: &Record) -> Option<Nsec> {
         match &rec.rdata {
             RData::Unknown(_, raw) => Nsec::parse(raw),
@@ -1349,27 +1135,18 @@ impl Nsec {
         }
     }
 
-    /** @brief 이 소유자 이름에 해당 타입이 존재한다고 비트맵이 말하는지. */
     pub fn has_type(&self, t: u16) -> bool {
         self.types.contains(&t)
     }
 }
 
-/**
- * @brief RFC 4034 정규 이름 순서 비교.
- * @details 라벨을 뒤에서부터(TLD 쪽부터) 비교한다. DNS 트리 구조상 이 방향이라야
- *          같은 부모 아래 형제들이 인접해, NSEC의 "사이에 아무것도 없다"가 성립한다.
- *          라벨을 앞에서부터 한 번 모은 뒤 끝에서부터 본다. 반복자의 역방향은 호출마다 이름을
- *          처음부터 다시 훑으므로, rev 로 돌리면 비교 하나가 라벨 수의 제곱이 된다. 이 함수는
- *          정렬 비교자로도 쓰여 한 번 호출이 잦다.
- * @note 라벨이 먼저 떨어지는 쪽이 작다. a.example이 b.a.example보다 앞이다.
- */
+/// RFC 4034 canonical order: labels compared from the TLD end, so siblings sit next to each other
+/// and an NSEC interval holds. A shorter name sorts first. The labels are collected once and read
+/// backwards, since reversing the iterator rescans the name per step and a sort comparator would
+/// turn quadratic.
 pub fn canonical_name_cmp(a: &Name, b: &Name) -> Ordering {
-    /*
-     * 와이어는 255 옥텟 이하이고 루트가 아닌 라벨마다 길이 옥텟이 하나씩 앞서므로, 라벨은 많아야
-     * 그 절반인 127개다. 128칸 고정 배열이면 힙 없이 다 담는다. take 는 불변식이 깨져도 넘치지
-     * 않게 막는 안전장치일 뿐, 정상 이름에서는 자르지 않는다.
-     */
+    // A wire name is at most 255 octets and each non-root label has a length octet, so there are at
+    // most 127 labels and this array needs no heap. `take` only guards a broken invariant.
     const MAX_LABELS: usize = 128;
     let empty: &[u8] = &[];
     let mut abuf = [empty; MAX_LABELS];
@@ -1401,11 +1178,8 @@ pub fn canonical_name_cmp(a: &Name, b: &Name) -> Ordering {
     }
 }
 
-/**
- * @brief 라벨 하나를 정규 순서로 비교한다.
- * @details 대소문자를 낮춰 옥텟 단위로 보고, 공통 접두사가 같으면 짧은 쪽이 앞이다.
- *          비교에서 대소문자를 구분하면 같은 이름이 두 위치를 갖게 돼 부재 증명이 깨진다.
- */
+/// Case-insensitive by octet; a shorter common prefix sorts first. A case-sensitive compare would
+/// give one name two positions and break denial proofs.
 fn canonical_label_cmp(a: &[u8], b: &[u8]) -> Ordering {
     for (x, y) in a.iter().zip(b.iter()) {
         let (lx, ly) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
@@ -1416,12 +1190,8 @@ fn canonical_label_cmp(a: &[u8], b: &[u8]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
-/**
- * @brief NSEC 구간 (owner, next)가 qname을 덮는지. 양 끝은 포함하지 않는다.
- * @details zone의 마지막 NSEC은 apex로 되돌아가 next <= owner가 된다. 이 되감김 구간은
- *          두 조건 중 하나만 맞아도 덮는 것으로 봐야 한다. 그냥 범위 비교로 두면 zone 끝부분
- *          이름들의 부재가 전부 증명되지 않는다.
- */
+/// Exclusive at both ends. The last NSEC wraps to the apex (next <= owner), and then either bound
+/// alone covers; a plain range check would leave names past the end unproven.
 pub fn nsec_covers(owner: &Name, next: &Name, qname: &Name) -> bool {
     let owner_lt_q = canonical_name_cmp(owner, qname) == Ordering::Less;
     let q_lt_next = canonical_name_cmp(qname, next) == Ordering::Less;
@@ -1432,14 +1202,9 @@ pub fn nsec_covers(owner: &Name, next: &Name, qname: &Name) -> bool {
     }
 }
 
-/**
- * @brief 이름은 있으나 그 타입이 없음(NODATA)을 NSEC으로 증명한다.
- *
- * @details 두 경로가 있다. 이름과 정확히 일치하는 NSEC이 그 타입을 갖고 있지 않으면 끝이다.
- *          그렇지 않으면 이름 자체가 없는 것이므로, closest encloser를 찾아 next closer가
- *          덮이고 와일드카드도 그 타입을 갖지 않음까지 보여야 한다. 와일드카드를 빼면
- *          *.example이 답을 줄 수 있는데도 NODATA라고 속일 수 있다.
- */
+/// Either the NSEC matching the name lacks the type, or the name does not exist and the closest
+/// encloser, the covered next closer and a wildcard lacking the type are all shown. Without the
+/// wildcard, an answer `*.example` gives could be denied as NODATA.
 pub fn prove_nodata(nsec_records: &[Record], qname: &Name, qtype: u16) -> bool {
     if nsec_record_lacking_type(nsec_records, qname, qtype).is_some() {
         return true;
@@ -1455,12 +1220,7 @@ pub fn prove_nodata(nsec_records: &[Record], qname: &Name, qtype: u16) -> bool {
         && nsec_record_lacking_type(nsec_records, &wildcard, qtype).is_some()
 }
 
-/**
- * @brief prove_nodata와 같은 판정을 하되, 증명에 실제로 쓰인 레코드를 돌려준다.
- * @details 이 서버가 직접 부재 응답을 만들 때 필요하다. 판정만 하고 원본 NSEC을 전부
- *          붙이면 증명과 무관한 레코드까지 노출된다.
- * @return 증명이 서면 최소 레코드 집합, 아니면 None.
- */
+/// Returns only the records the proof used, so a response built from it exposes nothing else.
 pub fn nsec_nodata_proof(nsec_records: &[Record], qname: &Name, qtype: u16) -> Option<Vec<Record>> {
     if let Some(exact) = nsec_record_lacking_type(nsec_records, qname, qtype) {
         return Some(vec![exact.clone()]);
@@ -1474,12 +1234,8 @@ pub fn nsec_nodata_proof(nsec_records: &[Record], qname: &Name, qtype: u16) -> O
     Some(unique_records([ce_record, next_record, wildcard_record]))
 }
 
-/**
- * @brief 이름 자체가 존재하지 않음(NXDOMAIN)을 NSEC으로 증명한다.
- * @details closest encloser를 찾고, next closer와 그 아래 와일드카드가 둘 다 덮여야
- *          한다. 와일드카드 증명이 없으면 실제로는 와일드카드가 답을 주는 이름을
- *          NXDOMAIN으로 위조할 수 있다.
- */
+/// Both the next closer and its wildcard must be covered; without the wildcard proof a name the
+/// wildcard answers could be forged into NXDOMAIN.
 pub fn prove_name_nonexistent(nsec_records: &[Record], qname: &Name) -> bool {
     let Some((ce, _)) = nsec_closest_encloser_record(nsec_records, qname) else {
         return false;
@@ -1492,10 +1248,7 @@ pub fn prove_name_nonexistent(nsec_records: &[Record], qname: &Name) -> bool {
         && nsec_covering_record(nsec_records, &wildcard).is_some()
 }
 
-/**
- * @brief prove_name_nonexistent와 같은 판정을 하되 쓰인 레코드를 돌려준다.
- * @return 증명이 서면 중복을 제거한 최소 레코드 집합, 아니면 None.
- */
+/// Returns the deduplicated records the proof used.
 pub fn nsec_name_nonexistent_proof(nsec_records: &[Record], qname: &Name) -> Option<Vec<Record>> {
     let (ce, ce_record) = nsec_closest_encloser_record(nsec_records, qname)?;
     let next_closer = qname.suffix(ce.num_labels() + 1);
@@ -1505,15 +1258,9 @@ pub fn nsec_name_nonexistent_proof(nsec_records: &[Record], qname: &Name) -> Opt
     Some(unique_records([ce_record, next_record, wildcard_record]))
 }
 
-/**
- * @brief 이 응답이 정말 와일드카드 확장으로 나왔음을 증명한다.
- *
- * @details 와일드카드로 만들어진 답에는 next closer가 존재하지 않는다는 NSEC이 따라와야
- *          한다. 그게 없으면 실제로 존재하는 더 구체적인 이름을 숨기고 와일드카드 답으로
- *          교체할 수 있다.
- * @param closest_encloser_labels RRSIG의 labels 필드에서 얻은 closest encloser 라벨 수.
- * @return 증명되면 참. 라벨 수가 qname보다 짧지 않으면 확장 자체가 성립하지 않아 거짓이다.
- */
+/// A wildcard answer must come with an NSEC showing the next closer absent; otherwise a more
+/// specific name could be hidden behind the wildcard. `closest_encloser_labels` comes from the
+/// RRSIG labels field; false when it is not shorter than `qname`.
 pub fn prove_wildcard_expansion(
     nsec_records: &[Record],
     qname: &Name,
@@ -1522,11 +1269,8 @@ pub fn prove_wildcard_expansion(
     nsec_wildcard_expansion_proof(nsec_records, qname, closest_encloser_labels).is_some()
 }
 
-/**
- * @brief 와일드카드 확장 판정에 실제로 필요한 NSEC 하나만 고른다.
- * @details 서명 검증 전에 이 선택을 하면 응답의 무관한 NSEC/RRSIG가 공개키 연산을
- *          강제하지 못한다. 선택 결과는 아직 신뢰되지 않았으므로 호출자가 서명을 검증해야 한다.
- */
+/// Selecting before signature validation keeps unrelated NSEC and RRSIG records from forcing
+/// public-key operations. The selection is untrusted until the caller validates it.
 pub fn nsec_wildcard_expansion_proof(
     nsec_records: &[Record],
     qname: &Name,
@@ -1539,11 +1283,8 @@ pub fn nsec_wildcard_expansion_proof(
     nsec_covering_record(nsec_records, &next_closer).map(|record| vec![record.clone()])
 }
 
-/**
- * @brief qname의 조상 중 NSEC이 존재하는 가장 긴 것(closest encloser)을 찾는다.
- * @details 긴 접미사부터 훑어 첫 일치를 쓴다. 더 짧은 조상을 골라도 NSEC은 존재하지만,
- *          그러면 next closer가 달라져 증명이 헐거워진다.
- */
+/// Takes the longest suffix: a shorter ancestor also has an NSEC, but its next closer would make
+/// the proof weaker.
 fn nsec_closest_encloser_record<'a>(
     nsec_records: &'a [Record],
     qname: &Name,
@@ -1561,7 +1302,6 @@ fn nsec_closest_encloser_record<'a>(
     })
 }
 
-/** @brief 이 이름을 구간으로 덮는 첫 NSEC 레코드. */
 fn nsec_covering_record<'a>(nsec_records: &'a [Record], name: &Name) -> Option<&'a Record> {
     nsec_records.iter().find(|record| {
         record.rtype == RecordType::NSEC
@@ -1570,11 +1310,8 @@ fn nsec_covering_record<'a>(nsec_records: &'a [Record], name: &Name) -> Option<&
     })
 }
 
-/**
- * @brief 이 이름과 정확히 일치하면서 해당 타입도 CNAME도 갖지 않는 NSEC.
- * @details CNAME까지 함께 보는 이유는, CNAME이 있으면 그 타입 질의도 CNAME을 따라가
- *          답이 나오기 때문이다. CNAME을 빠뜨리면 NODATA가 아닌 것을 NODATA라 하게 된다.
- */
+/// CNAME counts as well, since a query for any type follows a CNAME; ignoring it would call an
+/// answerable query NODATA.
 fn nsec_record_lacking_type<'a>(
     nsec_records: &'a [Record],
     name: &Name,
@@ -1588,11 +1325,8 @@ fn nsec_record_lacking_type<'a>(
     })
 }
 
-/**
- * @brief 증명 레코드들을 중복 없이 모은다.
- * @details 한 NSEC이 closest encloser·next closer·와일드카드 역할을 겸할 수 있어, 그대로
- *          모으면 같은 레코드가 응답에 두세 번 담긴다. TTL은 비교에서 제외한다.
- */
+/// One NSEC can serve as closest encloser, next closer and wildcard, so duplicates go. TTL is not
+/// compared.
 fn unique_records<const N: usize>(records: [&Record; N]) -> Vec<Record> {
     let mut unique = Vec::with_capacity(N);
     for record in records {
@@ -1608,12 +1342,8 @@ fn unique_records<const N: usize>(records: [&Record; N]) -> Vec<Record> {
     unique
 }
 
-/**
- * @brief encloser 앞에 * 라벨을 붙인 와일드카드 이름.
- * @note 라벨 옥텟을 그대로 옮긴다. 문자열로 만들었다 되돌리면 비ASCII 라벨이 손상돼
- *       증명 대상과 다른 이름이 된다.
- * @return 255옥텟 상한을 넘기면 None.
- */
+/// Copies label octets as is; a string round trip would damage non-ASCII labels. `None` past 255
+/// octets.
 fn wildcard_name(encloser: &Name) -> Option<Name> {
     let mut labels = Vec::with_capacity(encloser.labels().len() + 1);
     labels.push(b"*".to_vec());
@@ -1621,27 +1351,22 @@ fn wildcard_name(encloser: &Name) -> Option<Name> {
     Name::from_labels(labels).ok()
 }
 
-/** @brief base32hex 알파벳(RFC 4648). NSEC3 소유자 라벨은 소문자로 쓴다. */
 const BASE32HEX: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
 
-/** @brief 외부 zone의 NSEC3에서 절대로 넘길 수 없는 반복 횟수 하드 상한. */
+/// Hard cap on an external zone's NSEC3 iterations.
 pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 
-/**
- * @brief 부재 증명 하나가 쓸 수 있는 SHA-1 호출 총량.
- * @details 이름 해시 하나는 iterations+1회 SHA-1을 쓴다. 반복 상한만 두면 깊은 QNAME의
- *          closest-encloser 탐색과 곱해지므로, 둘의 곱도 8,192회에서 fail-closed한다.
- */
+/// SHA-1 calls one denial proof may spend. A name hash costs iterations + 1 calls, and the
+/// closest-encloser search over a deep QNAME multiplies that, so the product is capped too.
 const MAX_NSEC3_HASH_ROUNDS: usize = 8_192;
 
 #[derive(Default)]
-/** @brief 한 NSEC3 증명·캐시 후보 탐색 전체가 공유하는 실제 SHA-1 라운드 예산. */
+/// SHA-1 rounds shared by one NSEC3 proof or cache candidate search.
 pub struct Nsec3HashBudget {
     used: usize,
 }
 
 impl Nsec3HashBudget {
-    /** @brief 이름 해시 비용을 예약하고 남으면 실제 해시를 수행한다. */
     pub fn hash(&mut self, name: &Name, salt: &[u8], iterations: u16) -> Option<Vec<u8>> {
         let rounds = usize::from(iterations) + 1;
         let next = self.used.checked_add(rounds)?;
@@ -1655,22 +1380,14 @@ impl Nsec3HashBudget {
 
 #[cfg(test)]
 thread_local! {
-    /** @brief 한 스레드에서 실제 NSEC3 이름 해시를 계산한 횟수. */
     static NSEC3_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /** @brief 한 스레드에서 NSEC3 RDATA를 완전히 파싱한 횟수. */
     static NSEC3_PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/**
- * @brief NSEC3 소유자 해시(RFC 5155).
- *
- * @details SHA1(정규형 이름 ‖ salt)을 구한 뒤, SHA1(직전 해시 ‖ salt)를 iterations회
- *          더 돌린다. 반복 0회도 최초 1회는 반드시 수행한다.
- * @warning 반복 횟수는 질의자가 아니라 zone이 정한다. 이 저수준 함수를 직접 부르는 코드는
- *          상한을 책임져야 한다. 부재 증명 공개 API는 반복 150·총 8,192 SHA 라운드를 강제한다.
- * @note SHA-1은 RFC 5155가 정한 유일한 알고리즘이라 선택지가 없다. 여기서는 충돌 내성이
- *       아니라 이름 은닉이 목적이다.
- */
+/// RFC 5155: SHA1(canonical name || salt), then SHA1(previous || salt) `iterations` more times.
+/// The zone, not the querier, picks the count, so code calling this directly owns the cap; the
+/// public denial API enforces 150 iterations and 8192 rounds per proof. SHA-1 is the only
+/// algorithm RFC 5155 defines, and the goal is hiding names, not collision resistance.
 pub fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     #[cfg(test)]
     NSEC3_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1692,11 +1409,7 @@ pub fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     hash
 }
 
-/**
- * @brief base32hex 인코딩. 패딩(=)은 붙이지 않는다.
- * @note NSEC3 소유자 라벨은 20바이트 고정이라 패딩이 필요 없고, DNS 이름에 =를 넣을
- *       수도 없다.
- */
+/// Unpadded: owner labels are a fixed 20 bytes, and `=` is not allowed in a DNS name.
 pub fn base32hex_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len() * 8 / 5 + 1);
     let mut acc = 0u64;
@@ -1715,13 +1428,8 @@ pub fn base32hex_encode(data: &[u8]) -> String {
     out
 }
 
-/**
- * @brief base32hex 디코딩. 대소문자를 모두 받는다.
- * @details 남은 비트가 5 이상이면 옥텟 하나를 더 낼 수 있었다는 뜻이라 길이가 틀린 것이고,
- *          남은 비트가 0이 아니면 패딩 곳에 값이 들어간 것이다. 둘 다 거부한다. 같은
- *          해시를 여러 문자열로 표현할 수 있으면 소유자 비교가 뚫린다.
- * @return 알파벳 밖 문자나 위 두 조건에 걸리면 None.
- */
+/// Case-insensitive. Rejects five or more leftover bits (a wrong length) and nonzero leftover
+/// bits; otherwise one hash would have several spellings and owner comparison could be fooled.
 fn base32hex_decode(s: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 5 / 8);
     let mut acc = 0u64;
@@ -1741,7 +1449,6 @@ fn base32hex_decode(s: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/** @brief base32hex 문자 하나의 5비트 값. */
 fn base32hex_value(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -1751,15 +1458,9 @@ fn base32hex_value(c: u8) -> Option<u8> {
     }
 }
 
-/**
- * @brief NSEC/NSEC3의 타입 비트맵을 타입 번호 목록으로 푼다.
- *
- * @details 윈도우 블록의 연속이다. 정규형을 강제한다. 윈도우 번호는 엄격히 증가해야
- *          하고, 블록 길이는 1..=32이며, 마지막 옥텟이 0이면 안 된다. 같은 타입 집합을
- *          여러 바이트열로 표현할 수 있으면 서명 검증을 통과한 비트맵과 이 서버가 읽은
- *          비트맵이 달라질 수 있다.
- * @return 형식이 어긋나면 None. 부재 증명에 쓰이므로 애매한 입력은 통과시키지 않는다.
- */
+/// Enforces canonical form: strictly increasing windows, block lengths 1..=32, no trailing zero
+/// octet. Otherwise one type set would have several encodings, and the bitmap the signature
+/// covered could differ from the one read here.
 fn parse_type_bitmaps(bitmap: &[u8]) -> Option<Vec<u16>> {
     let mut types = Vec::new();
     let mut i = 0usize;
@@ -1788,7 +1489,7 @@ fn parse_type_bitmaps(bitmap: &[u8]) -> Option<Vec<u16>> {
     Some(types)
 }
 
-/** @brief 타입 비트맵의 정규형만 무할당으로 검사한다. */
+/// Checks canonical form without allocating.
 fn type_bitmaps_valid(bitmap: &[u8]) -> bool {
     let mut i = 0usize;
     let mut previous_window = None;
@@ -1816,7 +1517,6 @@ fn type_bitmaps_valid(bitmap: &[u8]) -> bool {
     true
 }
 
-/** @brief 검증된 타입 비트맵에 특정 RR 타입이 있는지 무할당으로 찾는다. */
 fn type_bitmap_has(bitmap: &[u8], rtype: u16) -> bool {
     let wanted_window = (rtype >> 8) as u8;
     let wanted_bit = usize::from(rtype & 0xff);
@@ -1838,32 +1538,20 @@ fn type_bitmap_has(bitmap: &[u8], rtype: u16) -> bool {
     false
 }
 
-/**
- * @brief NSEC3 레코드: 이름을 해시한 공간에서의 부재 증명.
- * @details NSEC이 zone의 실제 이름을 그대로 드러내는(zone walking) 문제를 해시로 가린다.
- *          대신 매개변수(알고리즘·salt·반복)가 증명 전체에서 일치해야 한다.
- */
+/// Hides names behind hashes against zone walking; the parameters must match across the proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3 {
-    /** @brief 해시 알고리즘. RFC 5155는 SHA-1(1)만 정의한다. */
+    /// RFC 5155 defines only SHA-1 (1).
     pub hash_alg: u8,
-    /** @brief 최하위 비트가 opt-out 플래그다. 나머지는 예약. */
+    /// The low bit is opt-out; the rest are reserved.
     pub flags: u8,
-    /** @brief 추가 해시 반복 횟수. 검증기가 그대로 따라 계산해야 한다. */
     pub iterations: u16,
-    /** @brief 사전 계산 공격을 늦추는 salt. */
     pub salt: Vec<u8>,
-    /** @brief 해시 순서상 다음 소유자 해시. 이 구간이 비어 있음을 주장한다. */
     pub next_hashed: Vec<u8>,
-    /** @brief 이 소유자 이름에 존재하는 RR 타입들. */
     pub types: Vec<u16>,
 }
 
 impl Nsec3 {
-    /**
-     * @brief NSEC3 RDATA를 파싱한다.
-     * @note salt와 해시는 길이 접두사를 갖는다. 남은 바이트 전체가 타입 비트맵이다.
-     */
     pub fn parse(raw: &[u8]) -> Option<Nsec3> {
         #[cfg(test)]
         NSEC3_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1886,7 +1574,6 @@ impl Nsec3 {
         })
     }
 
-    /** @brief 레코드에서 NSEC3을 꺼낸다. 미해석 RDATA로 보관돼 있어야 한다. */
     pub fn from_record(rec: &Record) -> Option<Nsec3> {
         match &rec.rdata {
             RData::Unknown(_, raw) => Nsec3::parse(raw),
@@ -1894,13 +1581,12 @@ impl Nsec3 {
         }
     }
 
-    /** @brief 이 소유자 이름에 해당 타입이 존재한다고 비트맵이 말하는지. */
     pub fn has_type(&self, t: u16) -> bool {
         self.types.contains(&t)
     }
 }
 
-/** @brief 증명 hot path가 원본 RDATA에서 빌려 쓰는 무할당 NSEC3 view. */
+/// Borrows the variable fields from the RDATA, for the allocation-free proof path.
 #[derive(Clone, Copy)]
 struct Nsec3Ref<'a> {
     hash_alg: u8,
@@ -1912,7 +1598,6 @@ struct Nsec3Ref<'a> {
 }
 
 impl<'a> Nsec3Ref<'a> {
-    /** @brief 전체 형식을 검사하되 가변 필드는 원본 RDATA에서 빌린다. */
     fn from_record(record: &'a Record) -> Option<Self> {
         let RData::Unknown(_, raw) = &record.rdata else {
             return None;
@@ -1941,26 +1626,20 @@ impl<'a> Nsec3Ref<'a> {
         })
     }
 
-    /** @brief 타입 비트맵에 RR 타입이 있는지. */
     fn has_type(self, rtype: u16) -> bool {
         type_bitmap_has(self.type_bitmap, rtype)
     }
 }
 
-/** @brief base32hex_decode의 크레이트 외부 노출용 얇은 껍데기. */
 pub fn base32hex_decode_pub(s: &[u8]) -> Option<Vec<u8>> {
     base32hex_decode(s)
 }
 
-/** @brief hash_covers의 크레이트 외부 노출용 얇은 껍데기. */
 pub fn hash_covers_pub(owner: &[u8], next: &[u8], q: &[u8]) -> bool {
     hash_covers(owner, next, q)
 }
 
-/**
- * @brief NSEC3 레코드의 소유자 해시. 첫 라벨을 base32hex로 푼 값이다.
- * @note 첫 라벨만 본다. 나머지는 zone 이름이라 해시가 아니다.
- */
+/// The first label decoded from base32hex; the rest is the zone name.
 fn nsec3_owner_hash_fixed(rec: &Record) -> Option<[u8; 20]> {
     let label = rec.name.labels().first()?;
     if label.len() != 32 {
@@ -1982,17 +1661,13 @@ fn nsec3_owner_hash_fixed(rec: &Record) -> Option<[u8; 20]> {
     (out == owner.len() && nbits == 0).then_some(owner)
 }
 
-/** @brief 소유자 해시를 소유 벡터로 돌려주는 서명·테스트 호환 경로. */
 #[cfg(test)]
 fn nsec3_owner_hash(rec: &Record) -> Option<Vec<u8>> {
     Some(nsec3_owner_hash_fixed(rec)?.to_vec())
 }
 
-/**
- * @brief 해시 구간 (owner, next)가 q를 덮는지. 양 끝은 포함하지 않는다.
- * @details NSEC과 같은 이유로 zone 마지막 NSEC3은 되감긴다(next <= owner). 그때는 두
- *          조건 중 하나만 맞아도 덮는 것으로 본다.
- */
+/// Exclusive at both ends; the last NSEC3 wraps (next <= owner), and then either bound alone
+/// covers.
 fn hash_covers(owner: &[u8], next: &[u8], q: &[u8]) -> bool {
     if owner < next {
         owner < q && q < next
@@ -2001,12 +1676,8 @@ fn hash_covers(owner: &[u8], next: &[u8], q: &[u8]) -> bool {
     }
 }
 
-/**
- * @brief 이 증명 집합이 요구하는 최대 해시 반복 횟수.
- * @details 호출자가 검증을 시작하기 전에 상한과 견주라고 있는 함수다. 반복 횟수는
- *          질의 하나당 이 서버의 CPU 비용을 그대로 정하므로, 확인 없이 계산에 들어가면
- *          zone 하나가 자원 소진 공격을 성립시킨다.
- */
+/// Callers compare this against the cap before validating: the zone picks the count, and it sets
+/// this server's CPU cost per query.
 pub fn nsec3_max_iterations(nsec3_records: &[Record]) -> u16 {
     nsec3_records
         .iter()
@@ -2022,32 +1693,28 @@ pub fn nsec3_max_iterations(nsec3_records: &[Record]) -> u16 {
         .unwrap_or(0)
 }
 
-/** @brief 한 번 파싱·검증한 NSEC3과 원본 레코드·소유자 해시. */
 struct ValidatedNsec3Record<'a> {
     source: &'a Record,
     parsed: Nsec3Ref<'a>,
     owner: [u8; 20],
 }
 
-/** @brief 한 부재 증명에서 공통 매개변수를 검증하고 재사용하는 NSEC3 집합. */
+/// NSEC3 records of one proof with validated, shared parameters.
 struct ValidatedNsec3Set<'a> {
     records: Vec<ValidatedNsec3Record<'a>>,
 }
 
-/** @brief exact 한 레코드 또는 closest·next·wildcard 세 레코드의 NODATA 선택. */
 enum Nsec3NodataSelection<'a> {
     Exact(&'a Record),
     Expanded([&'a Record; 3]),
 }
 
-/** @brief NXDOMAIN 최소 증명과 next-closer가 opt-out에만 기대는지. */
 struct Nsec3NameSelection<'a> {
     records: [&'a Record; 3],
     relies_on_opt_out: bool,
 }
 
 impl Nsec3NodataSelection<'_> {
-    /** @brief 외부 API가 소유할 최소 중복 제거 증명으로 바꾼다. */
     fn into_records(self) -> Vec<Record> {
         match self {
             Self::Exact(record) => vec![record.clone()],
@@ -2057,7 +1724,7 @@ impl Nsec3NodataSelection<'_> {
 }
 
 impl<'a> ValidatedNsec3Set<'a> {
-    /** @brief 각 RDATA를 정확히 한 번 파싱하며 하나의 온전한 해시 공간인지 확인한다. */
+    /// Parses each RDATA exactly once and checks that the records form one hash space.
     fn new(records: &'a [Record], qname: &Name) -> Option<Self> {
         let mut prepared = Vec::with_capacity(records.len());
         let mut expected: Option<(u16, &'a [u8], Name)> = None;
@@ -2102,13 +1769,11 @@ impl<'a> ValidatedNsec3Set<'a> {
         (!prepared.is_empty()).then_some(Self { records: prepared })
     }
 
-    /** @brief 검증된 공통 salt·반복 횟수로 이름을 한 번 해시한다. */
     fn query_hash(&self, name: &Name, budget: &mut Nsec3HashBudget) -> Option<Vec<u8>> {
         let params = &self.records[0].parsed;
         budget.hash(name, params.salt, params.iterations)
     }
 
-    /** @brief 이름은 존재하지만 qtype과 CNAME은 없다고 말하는 레코드. */
     fn record_lacking_type(
         &self,
         name: &Name,
@@ -2126,7 +1791,6 @@ impl<'a> ValidatedNsec3Set<'a> {
             .map(|record| record.source)
     }
 
-    /** @brief 이름 해시와 owner가 같은 첫 레코드. */
     fn matching_record(&self, name: &Name, budget: &mut Nsec3HashBudget) -> Option<&'a Record> {
         let query_hash = self.query_hash(name, budget)?;
         self.records
@@ -2135,7 +1799,6 @@ impl<'a> ValidatedNsec3Set<'a> {
             .map(|record| record.source)
     }
 
-    /** @brief 이름 해시를 열린 구간으로 덮는 첫 레코드. */
     fn covering_record(&self, name: &Name, budget: &mut Nsec3HashBudget) -> Option<&'a Record> {
         let query_hash = self.query_hash(name, budget)?;
         self.records
@@ -2144,7 +1807,6 @@ impl<'a> ValidatedNsec3Set<'a> {
             .map(|record| record.source)
     }
 
-    /** @brief 첫 covering 레코드와 모든 covering 구간이 opt-out인지 함께 구한다. */
     fn covering_record_with_opt_out_status(
         &self,
         name: &Name,
@@ -2163,7 +1825,6 @@ impl<'a> ValidatedNsec3Set<'a> {
         Some((first?, only_opt_out))
     }
 
-    /** @brief qname의 조상 중 owner가 일치하는 가장 긴 이름과 레코드. */
     fn closest_encloser_record(
         &self,
         qname: &Name,
@@ -2178,7 +1839,6 @@ impl<'a> ValidatedNsec3Set<'a> {
         None
     }
 
-    /** @brief exact match가 없을 때만 wildcard 해시를 덮는 레코드를 돌려준다. */
     fn covering_record_unless_matched(
         &self,
         name: &Name,
@@ -2199,7 +1859,6 @@ impl<'a> ValidatedNsec3Set<'a> {
         covering
     }
 
-    /** @brief opt-out 비트가 켜진 구간으로 이름을 덮는 첫 레코드. */
     fn covering_record_with_opt_out(
         &self,
         name: &Name,
@@ -2215,7 +1874,6 @@ impl<'a> ValidatedNsec3Set<'a> {
             .map(|record| record.source)
     }
 
-    /** @brief 이름이 opt-out 구간으로만 덮이는지 한 번의 해시·스캔으로 판정한다. */
     fn denial_relies_on_opt_out(&self, name: &Name, budget: &mut Nsec3HashBudget) -> Option<bool> {
         let query_hash = self.query_hash(name, budget)?;
         let mut covered = false;
@@ -2232,12 +1890,8 @@ impl<'a> ValidatedNsec3Set<'a> {
     }
 }
 
-/**
- * @brief NSEC3으로 NODATA를 증명한다.
- * @details 구조는 NSEC 버전과 같되, 먼저 ValidatedNsec3Set으로 매개변수 일관성과 반복 하드
- *          상한을 확인한다. 해시 매개변수가 섞인 집합은 서로 다른 해시 공간의 주장을 한데
- *          모은 것이라 증명이 성립하지 않는다.
- */
+/// Checks parameter consistency and the hard iteration cap first: records with mixed parameters
+/// come from different hash spaces and prove nothing.
 pub fn prove_nodata_nsec3(nsec3_records: &[Record], qname: &Name, qtype: u16) -> bool {
     let Some(prepared) = ValidatedNsec3Set::new(nsec3_records, qname) else {
         return false;
@@ -2246,10 +1900,7 @@ pub fn prove_nodata_nsec3(nsec3_records: &[Record], qname: &Name, qtype: u16) ->
     nsec3_nodata_selection(&prepared, qname, qtype, &mut budget).is_some()
 }
 
-/**
- * @brief prove_nodata_nsec3와 같은 판정을 하되 쓰인 레코드를 돌려준다.
- * @return 증명이 서면 중복을 제거한 최소 레코드 집합, 아니면 None.
- */
+/// Returns the deduplicated records the proof used.
 pub fn nsec3_nodata_proof(
     nsec3_records: &[Record],
     qname: &Name,
@@ -2260,7 +1911,6 @@ pub fn nsec3_nodata_proof(
     Some(nsec3_nodata_selection(&prepared, qname, qtype, &mut budget)?.into_records())
 }
 
-/** @brief 준비된 한 NSEC3 집합에서 NODATA 최소 증명을 고른다. */
 fn nsec3_nodata_selection<'a>(
     prepared: &ValidatedNsec3Set<'a>,
     qname: &Name,
@@ -2283,21 +1933,13 @@ fn nsec3_nodata_selection<'a>(
     ]))
 }
 
-/**
- * @brief 자식 zone에 DS가 없음을 NSEC3으로 증명한다.
- * @details 보통의 NODATA 증명을 먼저 시도하고, 실패하면 opt-out 경로를 본다. opt-out
- *          구간에 덮이면 서명되지 않은 위임이 그 안에 있을 수 있다는 뜻이라, 개별 NSEC3
- *          없이도 DS 부재가 성립한다. DS에만 허용되는 완화이며 다른 부재 증명에
- *          끌어다 쓰면 안 된다.
- */
+/// Tries a plain NODATA proof, then opt-out: an opt-out interval may hold unsigned delegations, so
+/// it proves the DS absent without a matching NSEC3. This relaxation is for DS only.
 pub fn prove_ds_absence_nsec3(nsec3_records: &[Record], child_zone: &Name) -> bool {
     nsec3_ds_absence_proof(nsec3_records, child_zone).is_some()
 }
 
-/**
- * @brief DS 부재에 필요한 NSEC3만 고른다. opt-out 경로도 포함한다.
- * @warning 반환된 레코드는 구문상 증명일 뿐이다. 신뢰하기 전에 각 RRset 서명을 검증한다.
- */
+/// The records are only a syntactic proof; validate each RRset's signatures before trusting them.
 pub fn nsec3_ds_absence_proof(nsec3_records: &[Record], child_zone: &Name) -> Option<Vec<Record>> {
     let prepared = ValidatedNsec3Set::new(nsec3_records, child_zone)?;
     let mut budget = Nsec3HashBudget::default();
@@ -2312,11 +1954,8 @@ pub fn nsec3_ds_absence_proof(nsec3_records: &[Record], child_zone: &Name) -> Op
     Some(unique_records([ce_record, next_record]))
 }
 
-/**
- * @brief 이름이 존재하지 않음을 NSEC3으로 증명한다.
- * @details 와일드카드에 대해 "덮임"뿐 아니라 "일치하는 NSEC3이 없음"까지 요구한다.
- *          일치가 있으면 와일드카드가 실재한다는 뜻이라 NXDOMAIN이 성립하지 않는다.
- */
+/// For the wildcard, requires no matching NSEC3 besides coverage: a match means the wildcard
+/// exists.
 pub fn prove_name_nonexistent_nsec3(nsec3_records: &[Record], qname: &Name) -> bool {
     let Some(prepared) = ValidatedNsec3Set::new(nsec3_records, qname) else {
         return false;
@@ -2325,10 +1964,7 @@ pub fn prove_name_nonexistent_nsec3(nsec3_records: &[Record], qname: &Name) -> b
     nsec3_name_nonexistent_selection(&prepared, qname, &mut budget).is_some()
 }
 
-/**
- * @brief prove_name_nonexistent_nsec3와 같은 판정을 하되 쓰인 레코드를 돌려준다.
- * @return 증명이 서면 중복을 제거한 최소 레코드 집합, 아니면 None.
- */
+/// Returns the deduplicated records the proof used.
 pub fn nsec3_name_nonexistent_proof(nsec3_records: &[Record], qname: &Name) -> Option<Vec<Record>> {
     let prepared = ValidatedNsec3Set::new(nsec3_records, qname)?;
     let mut budget = Nsec3HashBudget::default();
@@ -2336,7 +1972,6 @@ pub fn nsec3_name_nonexistent_proof(nsec3_records: &[Record], qname: &Name) -> O
     Some(unique_records(selection.records))
 }
 
-/** @brief NXDOMAIN 최소 증명과 opt-out 의존 여부를 같은 해시 예산·스캔으로 구한다. */
 pub fn nsec3_name_nonexistent_proof_status(
     nsec3_records: &[Record],
     qname: &Name,
@@ -2350,7 +1985,6 @@ pub fn nsec3_name_nonexistent_proof_status(
     ))
 }
 
-/** @brief 준비된 집합에서 NXDOMAIN의 closest·next·wildcard 레코드를 고른다. */
 fn nsec3_name_nonexistent_selection<'a>(
     prepared: &ValidatedNsec3Set<'a>,
     qname: &Name,
@@ -2368,13 +2002,8 @@ fn nsec3_name_nonexistent_selection<'a>(
     })
 }
 
-/**
- * @brief 응답이 와일드카드 확장으로 나왔음을 NSEC3으로 증명한다.
- * @details closest encloser에 일치하는 NSEC3이 있고 next closer가 덮여야 한다.
- *          NSEC 버전과 달리 일치까지 요구하는 이유는, 해시 공간에서는 조상 존재 여부를
- *          덮임만으로 확인할 수 없기 때문이다.
- * @param closest_encloser_labels RRSIG의 labels 필드에서 얻은 closest encloser 라벨 수.
- */
+/// Requires an NSEC3 matching the closest encloser, unlike NSEC, since coverage alone cannot show
+/// an ancestor exists in hash space.
 pub fn prove_wildcard_expansion_nsec3(
     nsec3_records: &[Record],
     qname: &Name,
@@ -2391,11 +2020,7 @@ pub fn prove_wildcard_expansion_nsec3(
         .is_some()
 }
 
-/**
- * @brief 와일드카드 확장에 실제로 필요한 NSEC3 RRset만 고른다.
- * @return closest-encloser 일치와 next-closer 덮임 레코드의 중복 없는 최소 집합.
- * @note 반복 150·증명당 8,192 SHA 라운드 하드 상한은 내부에서 해시 전에 적용한다.
- */
+/// The iteration and per-proof round caps apply before hashing.
 pub fn nsec3_wildcard_expansion_proof(
     nsec3_records: &[Record],
     qname: &Name,
@@ -2414,7 +2039,6 @@ pub fn nsec3_wildcard_expansion_proof(
     )?))
 }
 
-/** @brief 준비된 집합에서 wildcard closest·next 레코드를 고른다. */
 fn nsec3_wildcard_expansion_selection<'a>(
     prepared: &ValidatedNsec3Set<'a>,
     qname: &Name,
@@ -2428,17 +2052,12 @@ fn nsec3_wildcard_expansion_selection<'a>(
     Some([closest_record, next_record])
 }
 
-/** @brief 이름이 zone 안에 있는지(자기 자신 포함). */
 fn name_is_within(name: &Name, zone: &Name) -> bool {
     name.ends_with_ignore_case(zone)
 }
 
-/**
- * @brief 이 부재 판정이 opt-out에 기대고 있는지.
- * @details opt-out 구간에 기댄 증명은 "이 이름이 없다"가 아니라 "있더라도 서명되지
- *          않았다"까지만 말한다. 호출자가 그 결과를 Secure가 아닌 Insecure로 낮춰야 하므로,
- *          증명 성립 여부와 별개로 이 사실을 알려 준다.
- */
+/// An opt-out proof says only that the name, if present, is unsigned; callers must downgrade the
+/// result to Insecure.
 pub fn nsec3_denial_relies_on_opt_out(nsec3_records: &[Record], qname: &Name) -> bool {
     let Some(prepared) = ValidatedNsec3Set::new(nsec3_records, qname) else {
         return false;
@@ -2453,17 +2072,9 @@ pub fn nsec3_denial_relies_on_opt_out(nsec3_records: &[Record], qname: &Name) ->
         .unwrap_or(false)
 }
 
-/**
- * @brief RFC 4034에 따라 서명 대상 옥텟열을 만든다.
- *
- * @details 서명자와 검증자가 바이트 단위로 같은 것을 만들어야 한다. 그래서 정규형이
- *          네 가지를 강제한다. 소유자 이름은 소문자, RDATA는 정규 순서로 정렬,
- *          TTL은 수신 TTL이 아니라 RRSIG의 original_ttl, 레코드 타입은 각 레코드의
- *          것이 아니라 type_covered. 수신 TTL을 쓰면 캐시를 거친 순간 검증이 깨진다.
- * @param rrsig 서명 매개변수. 헤더가 그대로 앞에 붙고, 본문 구성도 여기서 정해진다.
- * @param rrset 서명 대상 레코드들.
- * @return 서명·검증에 그대로 넣을 옥텟열.
- */
+/// RFC 4034 signed data, byte-identical for signer and validator: lowercase owner, RDATA in
+/// canonical order, the RRSIG's original TTL rather than the received one, and type_covered as
+/// the type.
 pub fn signed_data(rrsig: &Rrsig, rrset: &[Record]) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -2494,14 +2105,8 @@ pub fn signed_data(rrsig: &Rrsig, rrset: &[Record]) -> Vec<u8> {
     out
 }
 
-/**
- * @brief 서명 대상에 쓸 소유자 이름: 와일드카드 확장이면 원래 * 형태로 되돌린다.
- * @details RRSIG의 labels가 실제 이름보다 짧으면 그 답은 와일드카드에서 확장된 것이다.
- *          서명은 확장된 이름이 아니라 *.<encloser> 위에 만들어졌으므로, 검증도 같은
- *          이름으로 되돌려야 한다.
- * @return 이름 구성에 실패하면 원래 이름을 그대로 돌려준다. 어차피 서명 검증이 실패해
- *         fail-closed로 끝난다.
- */
+/// Fewer RRSIG labels than the name means wildcard expansion, and the signature covers
+/// `*.<encloser>`. On failure the name is returned unchanged and validation fails closed.
 fn owner_for_signing(name: &Name, labels: u8) -> Name {
     let labels = labels as usize;
     if name.num_labels() > labels {
@@ -2515,10 +2120,7 @@ fn owner_for_signing(name: &Name, labels: u8) -> Name {
     }
 }
 
-/**
- * @brief 이름을 정규형(비압축·소문자)으로 이어 붙인다.
- * @note 압축 포인터를 쓰지 않는다. 서명 대상은 메시지 위치에 의존하면 안 되기 때문이다.
- */
+/// Never compressed, since the signed data must not depend on message position.
 fn canonical_name_into(name: &Name, out: &mut Vec<u8>) {
     for label in name.labels() {
         out.push(label.len() as u8);
@@ -2529,13 +2131,8 @@ fn canonical_name_into(name: &Name, out: &mut Vec<u8>) {
     out.push(0);
 }
 
-/**
- * @brief RDATA를 정규형 옥텟열로 만든다.
- * @details RFC 4034가 지정한 타입(NS/CNAME/SOA/MX/PTR/SRV 등)만 이름을 소문자로
- *          내린다. 목록 밖 타입의 이름을 임의로 소문자화하면 서명자와 결과가 달라진다.
- * @note 미해석 RDATA는 받은 바이트를 그대로 쓴다. 이 서버가 해석하지 못하는 타입도 서명
- *       검증은 되어야 한다.
- */
+/// Lowercases names only in the types RFC 4034 lists; lowercasing others would diverge from the
+/// signer. Unparsed RDATA is used as received, so unknown types still validate.
 pub fn canonical_rdata(rd: &RData) -> Vec<u8> {
     let mut out = Vec::new();
     match rd {
@@ -2649,30 +2246,23 @@ pub fn canonical_rdata(rd: &RData) -> Vec<u8> {
     out
 }
 
-/** @brief ZONEMD RR 타입 번호(RFC 8976). */
 pub const ZONEMD_TYPE: u16 = 63;
 
-/**
- * @brief ZONEMD 레코드: zone 전체의 다이제스트.
- * @details 전송(AXFR/파일)받은 zone이 온전한지 검사한다. RRSIG가 RRset 단위 진위를
- *          보증하는 것과 달리, 이쪽은 zone에서 레코드가 전부 빠졌는지를 잡는다.
- */
+/// Checks that a transferred zone is complete; RRSIG covers single RRsets, while this catches
+/// dropped records.
 pub struct Zonemd {
-    /** @brief 이 다이제스트가 대상으로 삼은 SOA serial. 다르면 계산해 볼 필요도 없다. */
+    /// When it differs from the zone's serial there is nothing to compute.
     pub serial: u32,
-    /** @brief 다이제스트 구성 방식. RFC 8976은 SIMPLE(1)만 정의한다. */
+    /// RFC 8976 defines only SIMPLE (1).
     pub scheme: u8,
-    /** @brief 해시 알고리즘. SHA-384(1) 또는 SHA-512(2). */
+    /// SHA-384 (1) or SHA-512 (2).
     pub hash_alg: u8,
-    /** @brief 다이제스트 값. 길이는 알고리즘이 정한 것과 정확히 같아야 한다. */
+    /// Its length must match the algorithm.
     pub digest: Vec<u8>,
 }
 
 impl Zonemd {
-    /**
-     * @brief 레코드에서 ZONEMD를 꺼낸다.
-     * @return 타입이 다르거나 고정 헤더 6바이트도 못 채우면 None.
-     */
+    /// `None` when the type differs or the 6-byte header is short.
     pub fn from_record(rec: &Record) -> Option<Zonemd> {
         if rec.rtype.0 != ZONEMD_TYPE {
             return None;
@@ -2692,31 +2282,22 @@ impl Zonemd {
     }
 }
 
-/** @brief ZONEMD 검사 결과. */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZonemdResult {
-    /** @brief 다이제스트가 일치한다. zone이 온전하다. */
     Verified,
 
-    /** @brief apex에 ZONEMD가 없다. 검사 대상이 아니다. */
     Absent,
 
-    /** @brief 지원하는 ZONEMD가 있는데 어느 것도 맞지 않는다. zone을 받아들이면 안 된다. */
+    /// A supported ZONEMD exists and none matches; the zone must not be accepted.
     Mismatch,
 
-    /** @brief ZONEMD는 있으나 scheme·알고리즘·길이가 전부 이 서버가 모르는 것이다. */
+    /// Every ZONEMD has an unknown scheme, algorithm or length.
     Unsupported,
 }
 
-/**
- * @brief zone의 ZONEMD를 검사한다.
- *
- * @details apex의 ZONEMD를 모두 훑어 하나라도 맞으면 Verified다. RFC 8976은 여러 개를
- *          둘 수 있게 하므로, 아는 것 하나만 맞으면 충분하다.
- * @note Unsupported와 Mismatch를 나누는 이유는 처분이 다르기 때문이다. 전자는 이 서버가
- *       검사할 수단이 없는 것이고, 후자는 zone이 실제로 어긋난 것이다.
- * @param soa_serial zone의 현재 SOA serial. ZONEMD의 serial과 다르면 그 레코드는 건너뛴다.
- */
+/// Verified when any apex ZONEMD matches; RFC 8976 allows several. Unsupported and Mismatch are
+/// kept apart because the first is a lack of means and the second a broken zone. Records whose
+/// serial differs from `soa_serial` are skipped.
 pub fn verify_zonemd(records: &[Record], apex: &Name, soa_serial: u32) -> ZonemdResult {
     let zonemds: Vec<&Record> = records
         .iter()
@@ -2758,15 +2339,9 @@ pub fn verify_zonemd(records: &[Record], apex: &Name, soa_serial: u32) -> Zonemd
     }
 }
 
-/**
- * @brief SIMPLE scheme(RFC 8976)으로 zone 다이제스트를 계산한다.
- *
- * @details apex의 ZONEMD와 그것을 덮는 RRSIG를 빼고, 나머지를 정규 순서(이름 → 타입 →
- *          RDATA)로 정렬해 이어 붙인 뒤 해시한다. 자기 자신을 넣으면 계산이 순환하므로
- *          제외가 정의의 일부다. 완전히 같은 레코드는 한 번만 넣는다.
- * @param hash_alg SHA-384(1) 또는 SHA-512(2).
- * @return 다이제스트. 지원하지 않는 알고리즘이면 None.
- */
+/// Excludes the apex ZONEMD and its RRSIG, which would make the digest circular, sorts the rest by
+/// name, type and RDATA, and hashes each distinct record once. `None` for an unsupported
+/// algorithm.
 pub fn compute_zonemd_simple(records: &[Record], apex: &Name, hash_alg: u8) -> Option<Vec<u8>> {
     use sha2::Digest;
     let mut incl: Vec<&Record> = records
@@ -2817,19 +2392,16 @@ pub fn compute_zonemd_simple(records: &[Record], apex: &Name, hash_alg: u8) -> O
     }
 }
 
-/** @brief ZONEMD 계산·검사를 RFC 8976 부록 A 벡터에 맞춰 고정한다. */
 #[cfg(test)]
 mod zonemd_tests {
     use super::*;
     use onetdns_proto::{Record, Soa};
 
-    /** @brief 다이제스트를 RFC 벡터와 눈으로 비교할 수 있게 16진 문자열로. */
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
     #[test]
-    /** @brief 영역 요약 확인에서 이름의 원래 바이트가 바뀌지 않는지. */
     fn zonemd_apex_match_preserves_raw_name_octets() {
         let apex = Name::from_str("�").unwrap();
         let raw_owner = Name::from_labels(vec![vec![0xff]]).unwrap();
@@ -2841,7 +2413,6 @@ mod zonemd_tests {
         assert_eq!(verify_zonemd(&[record], &apex, 1), ZonemdResult::Absent);
     }
 
-    /** @brief RFC 8976 부록 A.1의 예제 zone. 공표된 다이제스트와 대조할 기준이다. */
     fn rfc_zone() -> (Vec<Record>, Name) {
         let apex = Name::from_str("example").unwrap();
         let zone = vec![
@@ -2883,7 +2454,6 @@ mod zonemd_tests {
     }
 
     #[test]
-    /** @brief 영역 요약이 규격 예제와 맞는지. */
     fn rfc8976_a1_simple_vector() {
         let (zone, apex) = rfc_zone();
         let digest = compute_zonemd_simple(&zone, &apex, 1).unwrap();
@@ -2894,7 +2464,6 @@ mod zonemd_tests {
     }
 
     #[test]
-    /** @brief 서명한 것을 검증하고, 손대면 걸리는지. */
     fn verify_roundtrip_and_tamper() {
         let (mut zone, apex) = rfc_zone();
         let digest = compute_zonemd_simple(&zone, &apex, 1).unwrap();
@@ -2934,13 +2503,11 @@ mod zonemd_tests {
     }
 }
 
-/** @brief 검증기 전반: 서명 대상 구성, 알고리즘별 검증, 체인 판정, 부재 증명. */
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 와일드카드 이름을 만들 때 원래 바이트가 바뀌지 않는지. */
     fn wildcard_construction_preserves_raw_name_octets() {
         let parent = Name::from_labels(vec![vec![0xff], b"test".to_vec()]).unwrap();
         let wildcard = wildcard_name(&parent).unwrap();
@@ -2960,7 +2527,6 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    /** @brief 내장한 루트 지문이 공표된 값과 같은지. 다르면 이 서버만 다른 루트를 믿는다. */
     fn root_trust_anchors_match_iana_ksk_2017_and_2024() {
         let anchors = root_trust_anchors();
         assert_eq!(anchors.len(), 2);
@@ -2974,7 +2540,6 @@ mod tests {
         assert_eq!(anchors[1].digest[31], 0x16);
     }
 
-    /** @brief 정렬·TTL 정규화를 확인할 때 쓰는 A 레코드 한 건. */
     fn a_record(name: &str, ttl: u32, ip: [u8; 4]) -> Record {
         Record::new(
             Name::from_str(name).unwrap(),
@@ -2984,7 +2549,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 대상 바이트 배치가 규격과 같은지. */
     fn signed_data_matches_rfc4034_layout() {
         let rrset = vec![a_record("example.com", 7200, [192, 0, 2, 1])];
         let rrsig = Rrsig {
@@ -3020,7 +2584,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 전 정렬이 언제나 같은지. 다르면 같은 자료의 서명이 갈린다. */
     fn rrset_canonical_ordering_is_stable() {
         let rrsig = Rrsig {
             type_covered: 1,
@@ -3040,11 +2603,8 @@ mod tests {
         assert_eq!(asc, desc, "정렬로 순서 독립적");
     }
 
-    /**
-     * @brief key tag가 전부 같아지도록 만든 DNSKEY 집합.
-     * @details tag는 RDATA 16비트 워드의 합이라, 앞 두 워드를 합이 일정하게 잡으면 서로 다른
-     *          키가 같은 tag를 갖는다. KeyTrap식 소진을 흉내 내는 재료다.
-     */
+    /// The tag sums the RDATA's 16-bit words, so fixing the sum of the first two words gives
+    /// distinct keys one tag, as a KeyTrap attack would.
     fn colliding_keys(count: usize, algorithm: u8) -> Vec<Dnskey> {
         (0..count)
             .map(|i| {
@@ -3064,7 +2624,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 표식이 겹치는 키를 잔뜩 보내 검증을 무한히 시키지 못하는지. */
     fn colliding_key_tags_cannot_force_unbounded_verifications() {
         let keys = colliding_keys(64, 15);
         let tag = keys[0].key_tag();
@@ -3106,7 +2665,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 RRset의 정상 서명들이 실제 답변 서명의 공개키 예산을 먹지 않는지. */
     fn unrelated_rrsigs_do_not_consume_the_verification_budget() {
         let (sk, key) = p256_key(91);
         let owner = "host.example.";
@@ -3139,7 +2697,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 교체 중처럼 키가 여럿일 때도 검증되는지. */
     fn rollover_sized_key_set_still_validates() {
         let (sk, key) = test_key();
         let rrset = vec![a_record("host.example.", 3600, [10, 0, 0, 1])];
@@ -3170,7 +2727,6 @@ mod tests {
         );
     }
 
-    /** @brief 고정 시드에서 만든 Ed25519 키쌍과 그에 대응하는 DNSKEY. */
     fn test_key() -> (SigningKey, Dnskey) {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let dnskey = Dnskey {
@@ -3183,7 +2739,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 알고리즘의 검증과 위조 탐지. */
     fn ed25519_roundtrip_verifies_and_tamper_fails() {
         let (sk, key) = test_key();
         let rrset = vec![a_record("host.example.", 3600, [10, 0, 0, 1])];
@@ -3229,12 +2784,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 알고리즘의 검증과 위조 탐지. */
     fn ecdsa_p256_roundtrip_verifies_and_tamper_fails() {
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
         let sk = SigningKey::from_slice(&[0x42u8; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let key = Dnskey {
             flags: 257,
             protocol: 3,
@@ -3265,12 +2819,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 알고리즘의 검증과 위조 탐지. */
     fn ecdsa_p384_roundtrip_verifies_and_tamper_fails() {
         use p384::ecdsa::{signature::Signer, Signature, SigningKey};
 
         let sk = SigningKey::from_slice(&[0x42u8; 48]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let key = Dnskey {
             flags: 257,
             protocol: 3,
@@ -3300,10 +2853,7 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 테스트용 RSA-2048 키. 테스트 데이터의 PKCS#8을 읽어 온다.
-     * @warning 서명은 rsa::testsign: 상수 시간이 아니며 테스트 전용이다.
-     */
+    /// Signs with `rsa::testsign`, which is not constant time and is for tests only.
     fn rsa_test_key_pair() -> onetdns_core::rsa::testsign::TestRsaKey {
         let private_der = crate::tsig::b64_decode(include_str!(
             "../../../testdata/rsa_test_private_key_2048.pk8.b64"
@@ -3312,10 +2862,7 @@ mod tests {
         onetdns_core::rsa::testsign::TestRsaKey::from_pkcs8(&private_der).unwrap()
     }
 
-    /**
-     * @brief RSA 키를 RFC 3110 공개키 형식으로 인코딩한다.
-     * @details 지수 길이가 255를 넘으면 1바이트 0에 이어 16비트 길이를 쓰는 이중 형식이다.
-     */
+    /// An exponent longer than 255 bytes uses 0 and a 16-bit length.
     fn rsa_dnskey_public(key: &onetdns_core::rsa::testsign::TestRsaKey) -> Vec<u8> {
         let mut public = Vec::with_capacity(key.e.len() + key.n.len() + 3);
         if key.e.len() < 256 {
@@ -3330,7 +2877,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격을 벗어난 키 표기를 거부하는지. */
     fn rfc3110_public_key_parser_rejects_noncanonical_encodings() {
         let public = rsa_dnskey_public(&rsa_test_key_pair());
         let (e, n) = parse_rfc3110(&public).unwrap();
@@ -3349,7 +2895,7 @@ mod tests {
         zero_prefixed_modulus.extend_from_slice(n);
         assert!(parse_rfc3110(&zero_prefixed_modulus).is_none());
 
-        /* 하한은 1024비트다. 실제로 쓰이는 크기를 막지 않으면서 그보다 작은 것은 물린다. */
+        // The floor is 1024 bits: sizes in real use pass, smaller ones fail.
         let mut short_modulus = vec![3, 1, 0, 1];
         short_modulus.extend_from_slice(&[0x81; MIN_RSA_MODULUS_BYTES - 1]);
         assert!(parse_rfc3110(&short_modulus).is_none());
@@ -3370,7 +2916,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RSA 계열의 검증. */
     fn rsa_sha256_and_sha512_roundtrip() {
         let private_key = rsa_test_key_pair();
         let pk = rsa_dnskey_public(&private_key);
@@ -3425,7 +2970,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다루지 않는 알고리즘을 그렇다고 알리는지. */
     fn unsupported_algorithm_reported() {
         let key = Dnskey {
             flags: 257,
@@ -3452,7 +2996,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 깨진 이전 알고리즘을 받아들이지 않는지. 받아들이면 서명을 지어낼 수 있다. */
     fn legacy_rsa_sha1_algorithms_are_unsupported() {
         let pk = rsa_dnskey_public(&rsa_test_key_pair());
         let rrset = vec![a_record("rsa-sha1.example.", 3600, [192, 0, 2, 9])];
@@ -3483,7 +3026,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지문이 가리키는 알고리즘과 이 서버가 검증하는 것이 맞는지. */
     fn ds_supported_matches_verifier_algorithms() {
         let ds = |alg: u8| Ds {
             key_tag: 0,
@@ -3503,7 +3045,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 지문이 맞고, 손대면 걸리는지. */
     fn ds_digest_matches_and_tamper_fails() {
         let (_, key) = test_key();
         let owner = Name::from_str("example.com").unwrap();
@@ -3532,10 +3073,9 @@ mod tests {
         );
     }
 
-    /** @brief 시드로 고정한 P-256 키쌍. DNSKEY 공개키는 비압축 점에서 0x04 접두사를 뗀다. */
     fn p256_key(seed: u8) -> (p256::ecdsa::SigningKey, Dnskey) {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let dnskey = Dnskey {
             flags: 257,
             protocol: 3,
@@ -3545,7 +3085,6 @@ mod tests {
         (sk, dnskey)
     }
 
-    /** @brief DNSKEY를 미해석 RDATA 레코드로 감싼다. 검증기가 실제로 보는 형태다. */
     fn dnskey_rec(zone: &str, key: &Dnskey) -> Record {
         Record::new(
             Name::from_str(zone).unwrap(),
@@ -3554,11 +3093,8 @@ mod tests {
         )
     }
 
-    /**
-     * @brief 알고리즘 13으로 RRset을 서명해 RRSIG를 만든다.
-     * @details 서명 대상은 signed_data로 만든다. 검증기와 같은 함수를 써야 정규형 불일치가
-     *          아니라 실제 서명 논리를 테스트하게 된다.
-     */
+    /// Builds the signed data with `signed_data`, so the test exercises signing rather than a
+    /// canonical-form mismatch.
     fn sign(
         sk: &p256::ecdsa::SigningKey,
         key: &Dnskey,
@@ -3584,7 +3120,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지문이 맞아도 쓸 수 없는 키는 거부하는지. */
     fn dnskey_set_rejects_unusable_ksk_even_when_the_ds_matches() {
         let (sk, key) = p256_key(77);
         let zone = Name::from_str("example").unwrap();
@@ -3624,7 +3159,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 키를 가리키는 DS 팬아웃이 같은 다이제스트를 반복 계산하지 않는지. */
     fn dnskey_set_coalesces_repeated_ds_digest_work() {
         let (sk, key) = p256_key(78);
         let zone = Name::from_str("digest.example.").unwrap();
@@ -3651,7 +3185,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 다른 충돌 후보도 DS 해시 예산을 넘어 CPU를 소진하지 못하는지. */
     fn dnskey_set_has_a_ds_digest_computation_budget() {
         let zone = Name::from_str("digest-budget.example.").unwrap();
         let mut signing_key = None;
@@ -3686,7 +3219,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNSKEY 자기서명 검증도 충돌 키에 공개키 연산을 무한히 쓰지 않는지. */
     fn dnskey_set_validation_has_a_public_key_operation_budget() {
         let (sk, trusted_key) = p256_key(92);
         let zone = Name::from_str("budget.example.").unwrap();
@@ -3737,7 +3269,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 형태가 어긋난 자료와 키를 거부하는지. */
     fn validation_rejects_structurally_invalid_rrsets_and_keys() {
         let (sk, key) = p256_key(42);
         let valid = a_record("host.example", 3600, [192, 0, 2, 1]);
@@ -3798,7 +3329,6 @@ mod tests {
         );
     }
 
-    /** @brief 자식 키에 대한 DS를 레코드와 파싱 형태로 함께 만든다. */
     fn ds_for(child_zone: &str, child_key: &Dnskey) -> (Record, Ds) {
         let owner = Name::from_str(child_zone).unwrap();
         let mut input = Vec::new();
@@ -3815,7 +3345,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트부터 리프까지 이어지는지, 그리고 손대면 걸리는지. */
     fn chain_validates_root_to_leaf_and_tamper_is_bogus() {
         let (sk_root, k_root) = p256_key(1);
         let (sk_test, k_test) = p256_key(2);
@@ -3918,7 +3447,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 체인 상태가 셋으로 제대로 갈리는지. */
     fn chain_status_secure_insecure_bogus() {
         let (sk_root, k_root) = p256_key(21);
         let (sk_test, k_test) = p256_key(22);
@@ -4150,7 +3678,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 유효 기간을 지키는지. */
     fn rrsig_time_window() {
         let sig = Rrsig {
             type_covered: 1,
@@ -4183,7 +3710,6 @@ mod tests {
         );
     }
 
-    /** @brief NSEC 레코드를 RDATA 바이트부터 손으로 만든다. 비트맵 인코딩까지 테스트 대상이다. */
     fn nsec_record(owner: &str, next: &str, types: &[u16]) -> Record {
         let mut rdata = Vec::new();
         for label in next.trim_end_matches('.').split('.') {
@@ -4208,7 +3734,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부재 증명의 타입 비트맵와 정렬. */
     fn nsec_bitmap_and_canonical_order() {
         let rec = nsec_record("a.test", "c.test", &[1, 28, 46, 47]);
         let nsec = Nsec::from_record(&rec).unwrap();
@@ -4226,7 +3751,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 라벨이 깊은 이름도 정규 순서를 바르게 매기는지. */
     fn canonical_name_cmp_orders_deep_names() {
         let deep = |first: &str| {
             let mut s = String::from(first);
@@ -4248,7 +3772,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋나거나 잘린 타입 비트맵을 거부하는지. */
     fn denial_type_bitmaps_reject_noncanonical_and_truncated_encodings() {
         assert_eq!(
             parse_type_bitmaps(&[0, 1, 0x40, 1, 1, 0x80]),
@@ -4281,7 +3804,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 비었다는 것과 없다는 것을 증명하는지. */
     fn nsec_proves_nodata_and_nonexistence() {
         let nd = nsec_record("host.test", "next.test", &[28, 46]);
         let host = Name::from_str("host.test").unwrap();
@@ -4345,7 +3867,6 @@ mod tests {
         assert!(selected.len() <= 3);
     }
 
-    /** @brief 이름을 감춘 형태의 테스트용 증명 기록. */
     fn nsec3_record(
         owner_hash: &[u8],
         zone: &str,
@@ -4380,7 +3901,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 반복 횟수 상한이 걸리는지. 없으면 질의 하나로 CPU를 태운다. */
     fn nsec3_max_iterations_returns_max() {
         let a = nsec3_record(&[0x11; 20], "example", &[0xaa], 5, &[0xff; 20], &[1]);
         let b = nsec3_record(&[0x22; 20], "example", &[0xaa], 200, &[0xff; 20], &[1]);
@@ -4408,7 +3928,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 매개변수의 NSEC3가 많아도 질의 이름은 한 번만 해시하는지. */
     fn nsec3_exact_match_hash_cost_is_independent_of_record_count() {
         let salt = [0xde, 0xad];
         let iterations = 150;
@@ -4460,7 +3979,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 깊은 이름과 반복 횟수의 곱도 증명 단위 SHA 예산을 넘지 않는지. */
     fn nsec3_total_hash_round_budget_is_fail_closed() {
         let qname = Name::from_labels((0..127).map(|_| vec![b'a']).collect()).unwrap();
         let root = Name::from_labels(Vec::new()).unwrap();
@@ -4516,7 +4034,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 감추기 요약이 규격 예제와 맞는지. */
     fn nsec3_hash_rfc5155_vector() {
         let h = nsec3_hash(
             &Name::from_str("example").unwrap(),
@@ -4527,7 +4044,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름에 쓰는 표기의 왕복. */
     fn base32hex_roundtrip() {
         let data = [0x00, 0x44, 0x32, 0x14, 0xc7, 0x42, 0x54, 0xb6, 0x35, 0xcf];
         let enc = base32hex_encode(&data);
@@ -4543,7 +4059,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 감춘 형태로도 비었음과 없음을 증명하는지. */
     fn nsec3_proves_nodata_and_nonexistence() {
         let salt: &[u8] = &[0xde, 0xad];
         let iter = 5u16;
@@ -4616,7 +4131,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 일부를 비워 두는 방식으로는 없다고 단정하지 않는지. */
     fn nsec3_nxdomain_covered_only_by_opt_out_is_not_authenticated_denial() {
         let salt: &[u8] = &[0xde, 0xad];
         let iter = 5u16;
@@ -4678,7 +4192,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 설정이나 섞인 매개변수를 거부하는지. 섞이면 있는 것을 없다고 한다. */
     fn nsec3_proof_rejects_unknown_algorithm_flags_and_mixed_parameters() {
         let qname = Name::from_str("host.example").unwrap();
         let salt_a = [0x11];
@@ -4722,16 +4235,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1024비트 ZSK로 서명한 영역을 받아들이는지.
-     *
-     * @details org, nl을 비롯한 여러 영역이 지금도 1024비트 ZSK로 서명한다. 하한이 2048이면
-     *          그 영역들의 서명 후보가 아예 만들어지지 않아, 정상 영역이 전부 Bogus가 된다.
-     *          실제로 iana.org, nlnetlabs.nl, internetsociety.org가 전부 SERVFAIL이었다.
-     * @warning 하한을 올리면 그 크기로 서명하는 모든 영역이 해석되지 않는다.
-     */
+    /// org, nl and other zones still sign with 1024-bit ZSKs; a 2048-bit floor would make them all
+    /// bogus.
     fn rfc3110_accepts_the_1024_bit_keys_real_zones_still_use() {
-        /* exponent 65537 + 홀수 모듈러스. 앞바이트가 0이 아니고 끝바이트가 홀수여야 한다. */
+        // Exponent 65537 and an odd modulus with a nonzero first byte.
         let key_with_modulus_bytes = |bytes: usize| {
             let mut raw = vec![3u8, 1, 0, 1];
             raw.extend(std::iter::repeat_n(0xabu8, bytes - 1));
@@ -4747,10 +4254,7 @@ mod tests {
             assert_eq!(n.len(), bytes);
         }
 
-        /*
-         * 대조군. 1024비트 아래는 그대로 물린다. 받아들일 이유가 없고, 위 단정이
-         * 길이 검사를 전부 지워도 통과하지 않게 한다.
-         */
+        // Below 1024 bits is still rejected, so this test fails if the length check is removed.
         for bytes in [64usize, 96, 127] {
             assert!(
                 parse_rfc3110(&key_with_modulus_bytes(bytes)).is_none(),
@@ -4761,7 +4265,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 기록의 읽기와 적기 왕복. */
     fn parse_roundtrips() {
         let (_, key) = test_key();
         let raw = key.rdata_bytes();

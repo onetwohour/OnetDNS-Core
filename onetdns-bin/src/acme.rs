@@ -1,11 +1,6 @@
-/*!
- * @brief ACME 인증서 자동 발급.
- *
- * @details 암호화 전송에 쓸 인증서를 직접 받아 온다. 프로토콜이 JSON과 서명뿐이라 인증
- *          기관 클라이언트를 따로 두지 않고 여기서 다 처리한다.
- * @note 도전 응답을 자기 자신이 서빙한다. TXT 도전은 이 서버가 그 이름에 답하고, HTTP
- *       도전은 컨트롤 플레인이 답한다. 그래서 외부 웹서버 없이 발급이 끝난다.
- */
+//! ACME certificate issuance. The protocol is only JSON and signatures, so it is handled here
+//! without a separate client. This server answers the challenges itself: dns-01 through its own
+//! DNS answers, http-01 through the control plane.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -20,15 +15,13 @@ use onetdns_core::MutexExt;
 
 use crate::http;
 
-/** @brief 지금 응답해야 할 TXT 도전들. */
+/// Pending dns-01 answers, by name.
 static DNS01: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-/** @brief 도전 보관소. */
 fn dns01_store() -> &'static Mutex<HashMap<String, String>> {
     DNS01.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/** @brief 이 이름에 이 값으로 답하도록 걸어 둔다. */
 pub fn set_dns01(name: &str, txt: &str) {
     dns01_store().lock_recover().insert(
         name.trim_end_matches('.').to_ascii_lowercase(),
@@ -36,7 +29,7 @@ pub fn set_dns01(name: &str, txt: &str) {
     );
 }
 
-/** @brief 이 이름에 답할 값. 없으면 도전 중이 아니다. */
+/// `None` when no challenge is pending for the name.
 pub fn dns01_txt(name: &str) -> Option<String> {
     dns01_store()
         .lock_recover()
@@ -44,17 +37,15 @@ pub fn dns01_txt(name: &str) -> Option<String> {
         .cloned()
 }
 
-/** @brief 도전을 걷는다. 끝난 뒤에도 남겨 두면 그 이름이 계속 그 값을 답한다. */
+/// Must run once the challenge ends, or the name keeps answering the value.
 fn clear_dns01(name: &str) {
     dns01_store()
         .lock_recover()
         .remove(&name.trim_end_matches('.').to_ascii_lowercase());
 }
 
-/** @brief URL에 그대로 쓸 수 있는 base64 문자표. */
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-/** @brief URL용 base64. 채움 문자는 붙이지 않는다. */
 pub fn b64url(data: &[u8]) -> String {
     let mut out = String::new();
     for chunk in data.chunks(3) {
@@ -76,14 +67,12 @@ pub fn b64url(data: &[u8]) -> String {
     out
 }
 
-/** @brief SHA-256 요약. */
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize().into()
 }
 
-/** @brief DER 길이 표기. 0x80 이상은 길이의 길이를 먼저 적는다. */
 fn der_len(len: usize, out: &mut Vec<u8>) {
     if len < 0x80 {
         out.push(len as u8);
@@ -100,7 +89,6 @@ fn der_len(len: usize, out: &mut Vec<u8>) {
     }
 }
 
-/** @brief 태그와 길이를 앞에 붙인 DER 조각. */
 fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut v = vec![tag];
     der_len(content.len(), &mut v);
@@ -108,33 +96,26 @@ fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     v
 }
 
-/** @brief DER 열. */
 fn seq(content: &[u8]) -> Vec<u8> {
     tlv(0x30, content)
 }
 
-/** @brief P-256 공개 키 앞에 붙는 고정 헤더. */
+/// SubjectPublicKeyInfo header for an uncompressed P-256 key.
 const SPKI_PREFIX: &[u8] = &[
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
     0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
-/** @brief SHA-256을 쓰는 ECDSA 서명 식별자. */
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-/** @brief 주체 이름 항목 식별자. */
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
-/** @brief 대체 이름 확장 식별자. */
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
-/** @brief 확장 요청 속성 식별자. */
 const OID_EXTENSION_REQUEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e];
 
-/** @brief 계정 또는 인증서에 쓸 P-256 키. */
+/// A P-256 key for the account or the certificate.
 pub struct AccountKey {
-    /** @brief 서명에 쓰는 비밀 키. */
     signing: SigningKey,
 }
 
 impl AccountKey {
-    /** @brief 새 키를 만든다. */
     pub fn generate() -> AccountKey {
         let secret = loop {
             let mut b = Zeroizing::new([0u8; 32]);
@@ -148,7 +129,7 @@ impl AccountKey {
         }
     }
 
-    /** @brief 저장해 둔 키를 읽는다. 두 가지 표기를 모두 받는다. */
+    /// Accepts PKCS#8 and SEC1 (`EC PRIVATE KEY`).
     pub fn from_pkcs8_pem(pem: &str) -> Option<AccountKey> {
         let der = pem_block(pem, "PRIVATE KEY").or_else(|| pem_block(pem, "EC PRIVATE KEY"))?;
         use p256::pkcs8::DecodePrivateKey;
@@ -160,7 +141,6 @@ impl AccountKey {
         })
     }
 
-    /** @brief 키를 저장할 형태로. */
     pub fn to_pkcs8_pem(&self) -> Zeroizing<String> {
         use p256::pkcs8::EncodePrivateKey;
         let der = p256::SecretKey::from(self.signing.clone())
@@ -169,10 +149,9 @@ impl AccountKey {
         der_to_pem(der.as_bytes(), "PRIVATE KEY")
     }
 
-    /** @brief 공개 키의 좌표 두 개. */
     fn coords(&self) -> ([u8; 32], [u8; 32]) {
         let vk = self.signing.verifying_key();
-        let point = vk.to_encoded_point(false);
+        let point = vk.to_sec1_point(false);
         let x: [u8; 32] = point
             .x()
             .expect("P-256 public key is missing its x coordinate")
@@ -188,11 +167,8 @@ impl AccountKey {
         (x, y)
     }
 
-    /**
-     * @brief 공개 키를 JSON으로.
-     * @warning 항목 이름을 사전 순으로 적고 빈칸을 넣지 않는다. 요약값이 이 문자열
-     *          그대로에서 나오므로 순서가 달라지면 다른 계정이 된다.
-     */
+    /// Members in lexicographic order with no whitespace: the thumbprint hashes this exact string,
+    /// so another order would name another account.
     pub fn jwk_json(&self) -> String {
         let (x, y) = self.coords();
         format!(
@@ -202,38 +178,31 @@ impl AccountKey {
         )
     }
 
-    /** @brief 공개 키 요약. 계정을 가리키는 값이다. */
+    /// The JWK thumbprint, which identifies the account.
     pub fn thumbprint(&self) -> String {
         b64url(&sha256(self.jwk_json().as_bytes()))
     }
 
-    /** @brief 도전 토큰과 이 서버의 키를 잇는 값. */
     pub fn key_authorization(&self, token: &str) -> String {
         format!("{token}.{}", self.thumbprint())
     }
 
-    /** @brief TXT 도전에 답할 값. */
     pub fn dns01_value(&self, token: &str) -> String {
         b64url(&sha256(self.key_authorization(token).as_bytes()))
     }
 
-    /** @brief 서명. 좌표를 이어 붙인 형태. */
+    /// r||s, as JWS ES256 expects.
     fn sign_raw(&self, msg: &[u8]) -> Vec<u8> {
         let sig: Signature = self.signing.sign(msg);
         sig.to_bytes().to_vec()
     }
 
-    /** @brief 서명. DER 형태. */
     fn sign_der(&self, msg: &[u8]) -> Vec<u8> {
         let sig: Signature = self.signing.sign(msg);
         sig.to_der().as_bytes().to_vec()
     }
 
-    /**
-     * @brief 요청 본문에 서명해 담는다.
-     * @details 계정을 만들기 전에는 공개 키를, 만든 뒤에는 계정 주소를 헤더에 넣는다.
-     *          서버가 어느 쪽을 기대하는지가 요청마다 다르다.
-     */
+    /// The protected header carries the JWK before the account exists and the account URL after.
     pub fn jws(&self, url: &str, payload: &str, nonce: &str, kid: Option<&str>) -> String {
         let protected = match kid {
             Some(k) => format!(
@@ -263,11 +232,8 @@ impl AccountKey {
     }
 }
 
-/**
- * @brief 인증서 서명 요청을 만든다.
- * @details 첫 도메인을 주체 이름으로 두고 전부를 대체 이름에 넣는다. 요즘 클라이언트는
- *          대체 이름만 본다.
- */
+/// The first domain is the subject CN and every domain goes into subjectAltName, which modern
+/// clients read.
 pub fn build_csr(domains: &[String], cert_key: &AccountKey) -> Vec<u8> {
     let (x, y) = cert_key.coords();
     let mut point = vec![0x04];
@@ -310,7 +276,6 @@ pub fn build_csr(domains: &[String], cert_key: &AccountKey) -> Vec<u8> {
     seq(&csr)
 }
 
-/** @brief PEM에서 이 딱지가 붙은 조각을 꺼낸다. */
 fn pem_block(pem: &str, label: &str) -> Option<Zeroizing<Vec<u8>>> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
@@ -319,7 +284,6 @@ fn pem_block(pem: &str, label: &str) -> Option<Zeroizing<Vec<u8>>> {
     b64_decode(&pem[s..e])
 }
 
-/** @brief DER을 PEM 표기로. */
 fn der_to_pem(der: &[u8], label: &str) -> Zeroizing<String> {
     let b64 = b64_std(der);
     let mut body = Zeroizing::new(String::new());
@@ -333,10 +297,8 @@ fn der_to_pem(der: &[u8], label: &str) -> Zeroizing<String> {
     ))
 }
 
-/** @brief 표준 base64 문자표. */
 const B64STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/** @brief 표준 base64. 줄을 나눠 적는다. */
 fn b64_std(data: &[u8]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::new());
     for chunk in data.chunks(3) {
@@ -362,9 +324,7 @@ fn b64_std(data: &[u8]) -> Zeroizing<String> {
     out
 }
 
-/** @brief base64 디코딩. */
 fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -396,43 +356,29 @@ fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
     Some(out)
 }
 
-/** @brief 인증 기관이 알려 준 주소들. */
+/// URLs from the CA's directory.
 pub struct Directory {
-    /** @brief nonce를 받을 주소. */
     pub new_nonce: String,
-    /** @brief 계정을 등록할 주소. */
     pub new_account: String,
-    /** @brief 인증서를 주문할 주소. */
     pub new_order: String,
 }
 
-/** @brief 도전에 답하는 방법. */
 pub enum Provision<'a> {
-    /** @brief 이 이름에 TXT로 답해 증명한다. */
     Dns01(&'a dyn Fn(&str, &str)),
 
-    /** @brief 웹 경로에 값을 두어 증명한다. */
     Http01(&'a dyn Fn(&str, &str)),
 }
 
-/** @brief 인증 기관과 주고받는 것. */
 pub struct AcmeClient {
-    /** @brief 계정 키. */
     key: AccountKey,
-    /** @brief 기관이 알려 준 주소들. */
     dir: Directory,
-    /** @brief 다음 요청에 쓸 nonce. */
     nonce: Option<String>,
-    /** @brief 등록한 계정 주소. */
     account_url: Option<String>,
-    /** @brief 요청 하나의 데드라인. */
     timeout: Duration,
-    /** @brief 이름을 풀 방법. */
     resolver: http::HostResolver,
 }
 
 impl AcmeClient {
-    /** @brief 주소 목록을 받아 클라이언트를 만든다. */
     pub fn new(
         key: AccountKey,
         directory_url: &str,
@@ -463,10 +409,7 @@ impl AcmeClient {
         })
     }
 
-    /**
-     * @brief 다음 요청에 쓸 nonce.
-     * @note 앞 응답에 실려 온 것이 있으면 그것을 쓴다. 매번 새로 받으면 왕복이 두 배가 된다.
-     */
+    /// Uses the nonce from the previous response when there is one, saving a round trip.
     fn fresh_nonce(&mut self) -> Result<String, String> {
         if let Some(n) = self.nonce.take() {
             return Ok(n);
@@ -480,7 +423,7 @@ impl AcmeClient {
             .ok_or("Response has no Replay-Nonce header".to_string())
     }
 
-    /** @brief 서명한 요청을 보낸다. 응답에 실려 온 nonce를 챙겨 둔다. */
+    /// Keeps the nonce the response carries.
     fn post(&mut self, url: &str, payload: &str, jwk: bool) -> Result<http::Resp, String> {
         let nonce = self.fresh_nonce()?;
         let kid = if jwk {
@@ -502,7 +445,6 @@ impl AcmeClient {
         Ok(resp)
     }
 
-    /** @brief 계정을 등록한다. */
     pub fn register_account(&mut self, contact_email: Option<&str>) -> Result<String, String> {
         let payload = match contact_email {
             Some(email) => format!(
@@ -527,10 +469,7 @@ impl AcmeClient {
         Ok(loc)
     }
 
-    /**
-     * @brief 인증서를 받는다.
-     * @details 주문을 넣고, 도메인마다 도전에 답하고, 서명 요청을 올린 뒤 발급을 기다린다.
-     */
+    /// Places the order, answers each domain's challenge, submits the CSR and waits for issuance.
     pub fn issue(
         &mut self,
         domains: &[String],
@@ -552,7 +491,6 @@ impl AcmeClient {
         self.download_cert(&cert_url)
     }
 
-    /** @brief 이 도메인들에 대한 주문을 넣는다. */
     fn new_order(&mut self, domains: &[String]) -> Result<Order, String> {
         let ids: Vec<String> = domains
             .iter()
@@ -587,11 +525,8 @@ impl AcmeClient {
         })
     }
 
-    /**
-     * @brief 도메인 하나의 도전에 답한다.
-     * @note 답을 걸어 둔 뒤에 검증을 요청하고, 끝나면 걷는다. 걷지 않으면 그 이름이
-     *       계속 도전 값을 답한다.
-     */
+    /// Sets the answer before asking for validation and clears it afterwards; otherwise the name
+    /// keeps answering the challenge value.
     fn do_authz(&mut self, authz_url: &str, provision: &Provision) -> Result<(), String> {
         let resp = self.post(authz_url, "", false)?;
         let body = String::from_utf8_lossy(&resp.body);
@@ -645,7 +580,6 @@ impl AcmeClient {
         result
     }
 
-    /** @brief 검증이 끝날 때까지 상태를 묻는다. */
     fn poll_authz(&mut self, authz_url: &str) -> Result<(), String> {
         for _ in 0..20 {
             let resp = self.post(authz_url, "", false)?;
@@ -661,7 +595,6 @@ impl AcmeClient {
         Err("ACME domain validation did not finish in time".to_string())
     }
 
-    /** @brief 서명 요청을 올린다. */
     fn finalize(&mut self, finalize_url: &str, csr_der: &[u8]) -> Result<(), String> {
         let payload = format!("{{\"csr\":{}}}", json::escape(&b64url(csr_der)));
         let resp = self.post(finalize_url, &payload, false)?;
@@ -675,7 +608,6 @@ impl AcmeClient {
         Ok(())
     }
 
-    /** @brief 발급이 끝나 인증서 주소가 나올 때까지 기다린다. */
     fn poll_order_cert(&mut self, order_url: &str) -> Result<String, String> {
         for _ in 0..20 {
             let resp = self.post(order_url, "", false)?;
@@ -697,7 +629,6 @@ impl AcmeClient {
         Err("ACME order finalization did not finish in time".to_string())
     }
 
-    /** @brief 발급된 인증서를 받는다. */
     fn download_cert(&mut self, cert_url: &str) -> Result<String, String> {
         let resp = self.post(cert_url, "", false)?;
         if resp.status != 200 {
@@ -711,48 +642,32 @@ impl AcmeClient {
     }
 }
 
-/** @brief 주문 하나의 주소들. */
 struct Order {
-    /** @brief 이 주문의 주소. */
     url: String,
-    /** @brief 서명 요청을 올릴 주소. */
     finalize: String,
-    /** @brief 도메인마다 답해야 할 도전 주소. */
     authorizations: Vec<String>,
 }
 
-/** @brief 발급에 필요한 입력. */
 pub struct IssueParams {
-    /** @brief 기관의 주소 목록을 받을 곳. */
     pub directory_url: String,
-    /** @brief 인증서를 받을 도메인들. */
     pub domains: Vec<String>,
-    /** @brief 만료 알림을 받을 주소. */
     pub contact: Option<String>,
-    /** @brief 어떤 방식으로 증명할지. */
     pub challenge: String,
-    /** @brief 이미 있는 계정 키. 없으면 새로 만든다. */
+    /// Generated when absent.
     pub account_key_pem: Option<Zeroizing<String>>,
-    /** @brief 계정만 만들고 인증서는 받지 않는다. */
+    /// Registers the account without requesting a certificate.
     pub account_only: bool,
 }
 
-/** @brief 발급 결과. 계정 키는 다음 발급에 다시 쓴다. */
+/// The account key is reused for the next issuance.
 pub struct IssueResult {
-    /** @brief 등록된 계정 주소. */
     pub account_url: String,
-    /** @brief 계정 키. 다음 발급에 다시 쓴다. */
     pub account_key_pem: Zeroizing<String>,
-    /** @brief 받은 인증서. */
     pub cert_pem: Option<String>,
-    /** @brief 그 인증서의 키. */
     pub cert_key_pem: Option<Zeroizing<String>>,
 }
 
-/**
- * @brief 계정 등록부터 인증서 발급까지 한 번에 한다.
- * @note 계정만 만들고 끝낼 수도 있다. 발급 전에 계정 키를 미리 받아 두려는 것이다.
- */
+/// With `account_only` it stops after registration, to obtain the account key ahead of issuance.
 pub fn run_issue(
     p: IssueParams,
     timeout: Duration,
@@ -802,7 +717,6 @@ pub fn run_issue(
     })
 }
 
-/** @brief JSON 배열에서 문자열만 추린다. */
 fn str_array(j: &Json, key: &str) -> Vec<String> {
     j.get(key)
         .and_then(|v| v.as_array())
@@ -815,12 +729,10 @@ fn str_array(j: &Json, key: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-/** @brief 인코딩 규칙, 공개 키 표기의 고정, 서명과 서명 요청의 형식. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 채움 문자가 붙지 않는지. */
     fn b64url_no_padding() {
         assert_eq!(b64url(b"abc"), "YWJj");
         assert_eq!(b64url(b"a"), "YQ");
@@ -830,7 +742,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 공개 키 표기가 항상 같은 순서인지. 달라지면 계정이 달라진다. */
     fn jwk_is_canonical_and_thumbprint_stable() {
         let k = AccountKey::generate();
         let jwk = k.jwk_json();
@@ -843,7 +754,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 도전 응답 값이 규격대로 만들어지는지. */
     fn key_authorization_and_dns01() {
         let k = AccountKey::generate();
         let ka = k.key_authorization("tok123");
@@ -855,7 +765,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 걸어 둔 도전을 걷을 수 있는지. */
     fn dns01_challenge_can_be_removed() {
         set_dns01("_Acme-Challenge.Example.", "proof");
         assert_eq!(
@@ -867,7 +776,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키를 저장했다 읽으면 같은 키인지. */
     fn account_key_pem_roundtrip() {
         let k = AccountKey::generate();
         let pem = k.to_pkcs8_pem();
@@ -878,7 +786,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명한 요청의 형식과 서명이 맞는지. */
     fn jws_structure_and_signature_verifies() {
         let k = AccountKey::generate();
         let jws = k.jws("https://acme.test/x", "{\"a\":1}", "nonce123", None);
@@ -900,7 +807,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 요청에 공개 키와 대체 이름이 들어 있는지. */
     fn csr_has_spki_and_san() {
         let k = AccountKey::generate();
         let domains = vec!["a.test".to_string(), "b.test".to_string()];

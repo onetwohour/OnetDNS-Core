@@ -1,10 +1,6 @@
-/*!
- * @brief 차단 방식 TLS 연결. DoT와 TCP 위 DoH가 쓴다.
- *
- * @details 소켓을 직접 읽고 쓴다. 1.3을 먼저 시도하고, 상대가 1.2만 알면 그쪽으로 간다.
- * @note engine의 sans-IO 구현과 별개다. 둘이 와이어 원시 요소만 나눠 쓰고 상태 기계는
- *       각자 갖는다.
- */
+//! Blocking TLS over a socket, for DoT and DoH over TCP. Tries TLS 1.3 first and falls back to
+//! 1.2. Separate from the sans-IO engine: the two share wire primitives but keep their own state
+//! machines.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -30,45 +26,31 @@ use crate::wire::{Reader, Writer};
 use crate::x509::X509;
 use crate::TlsError;
 
-/**
- * @brief 위로 넘길 것 없이 버리는 레코드를 연이어 받을 수 있는 수.
- * @details 빈 응용 데이터, 호환용 ChangeCipherSpec, user_canceled 경고가 여기에 든다. 셋 다
- *          상대가 비용 없이 끝없이 보낼 수 있으므로 상한이 없으면 읽기가 끝나지 않는다.
- */
+/// Consecutive records that carry nothing upward: empty application data, compatibility
+/// ChangeCipherSpec, user_canceled. A peer can send them for free, so without a cap a read never
+/// ends.
 const MAX_CONSECUTIVE_IGNORED_RECORDS: usize = 32;
 
-/** @brief 한 연결에서 보낼 수 있는 TLS 1.3 키 세대 수. */
 const MAX_TLS13_KEY_UPDATES: u64 = (1u64 << 48) - 1;
 
-/** @brief 치명 경고의 수준 값. */
 const ALERT_LEVEL_FATAL: u8 = 2;
 
-/** @brief 치명이 아닌 경고의 수준 값. */
 const ALERT_LEVEL_WARNING: u8 = 1;
 
-/** @brief close_notify 경고의 설명 값. */
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 
-/** @brief user_canceled 경고의 설명 값. */
 const ALERT_USER_CANCELED: u8 = 90;
 
-/**
- * @brief TLS 1.3 서버가 1.2 로 협상할 때 server random 끝 8바이트에 싣는 표시.
- * @details RFC 8446 이 1.3 을 아는 서버에 요구한다. 1.3 을 아는 클라이언트는 이 표시를 보고
- *          중간에서 버전을 끌어내린 것을 알아챈다.
- */
+/// RFC 8446 requires a 1.3-capable server negotiating 1.2 to put this at the end of server
+/// random, so a 1.3 client can detect a downgrade.
 const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
 
-/** @brief 1.1 이하로 협상하는 1.3 서버가 싣는 표시. */
 const DOWNGRADE_TLS11: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
 
-/**
- * @brief 경고 레코드를 오류로 옮긴다. 정상 종료 통지는 오류와 구분한다.
- * @details 경고 수준으로 온 user_canceled 는 오류로 보지 않는다. RFC 8446 은 이것을 close_notify
- *          와 함께 종료 경고로 분류하고, 보내는 쪽은 그 뒤에 close_notify 를 보내므로 그것을 마저
- *          읽는다. 1.2 에서 치명 수준으로 온 경고는 RFC 5246 대로 그 자리에서 연결을 끝낸다.
- * @return 레코드에 경고 수준의 user_canceled 만 있으면 없다. 부른 쪽은 다음 레코드를 읽는다.
- */
+/// Keeps close_notify apart from errors. A warning-level user_canceled is not an error: RFC 8446
+/// counts it as a closure alert and the sender follows it with close_notify, which is read next. A
+/// fatal alert in 1.2 ends the connection at once (RFC 5246). `None` when the record holds only a
+/// warning-level user_canceled; the caller reads the next record.
 fn alert_error(payload: &[u8]) -> Option<TlsError> {
     if payload.len() < 2 || payload.len() % 2 != 0 {
         return Some(TlsError::Decode);
@@ -84,13 +66,9 @@ fn alert_error(payload: &[u8]) -> Option<TlsError> {
     close_notify.then_some(TlsError::CloseNotify)
 }
 
-/**
- * @brief 1.3 에서 보호된 경고 레코드를 오류로 옮긴다.
- * @details 1.3 은 한 레코드에 경고를 정확히 하나 담게 하고 수준 값을 쓰지 않으므로,
- *          user_canceled 는 수준과 무관하게 종료 경고다. 내용이 빈 레코드는 경고가 아니므로
- *          받을 수 없는 레코드로 보고, 길이가 다르면 경고를 읽어 내지 못한 것으로 본다.
- * @return alert_error 와 같다.
- */
+/// TLS 1.3 puts exactly one alert per record and ignores the level, so user_canceled is a closure
+/// alert at any level. An empty record is not an alert, and a wrong length means the alert could
+/// not be read. Returns as `alert_error` does.
 fn tls13_alert_error(payload: &[u8]) -> Option<TlsError> {
     match payload {
         [] => Some(TlsError::UnexpectedMessage),
@@ -100,16 +78,12 @@ fn tls13_alert_error(payload: &[u8]) -> Option<TlsError> {
     }
 }
 
-/** @brief 지금 쓰는 레코드 보호. 판마다 방식이 다르다. */
 enum RecordLayer {
-    /** @brief 1.3 방식. */
     Tls13(RecordCrypto),
-    /** @brief 1.2 방식. */
     Tls12(Tls12RecordCrypto),
 }
 
 impl RecordLayer {
-    /** @brief 레코드를 암호화한다. */
     fn encrypt(&mut self, ct: ContentType, pt: &[u8]) -> Result<TlsRecord, TlsError> {
         match self {
             RecordLayer::Tls13(c) => c.encrypt(ct, pt),
@@ -117,21 +91,16 @@ impl RecordLayer {
         }
     }
 
-    /**
-     * @brief 치명 경고를 이 키로 보호해 보낸다.
-     * @note 보내지 못해도 결과는 같다. 이미 실패한 연결이고 호출자는 원래 실패 사유를 돌려준다.
-     */
+    /// Sending may fail; the connection has already failed and the caller returns the original
+    /// error.
     fn send_fatal_alert<S: Write>(&mut self, s: &mut S, description: u8) {
         if let Ok(record) = self.encrypt(ContentType::Alert, &[ALERT_LEVEL_FATAL, description]) {
             let _ = write_record(s, &record);
         }
     }
 
-    /**
-     * @brief 레코드를 복호화한다. 평문 길이 상한은 판마다 복호화 쪽이 검사한다.
-     * @retval TlsError::Decrypt 레코드 버전이 다르다. 버전은 AEAD 의 추가 인증 자료에 들어가므로
-     *         바뀐 레코드는 인증에 실패한 것과 같다.
-     */
+    /// The decrypting side checks the plaintext limit. A changed record version is `Decrypt`: the
+    /// version is AEAD additional data, so it fails authentication.
     fn decrypt(&mut self, rec: &TlsRecord) -> Result<(ContentType, Vec<u8>), TlsError> {
         if rec.version != crate::record::LEGACY_VERSION {
             return Err(TlsError::Decrypt);
@@ -143,23 +112,18 @@ impl RecordLayer {
     }
 }
 
-/**
- * @brief 핸드셰이크 동안 이쪽이 보내는 방향의 보호 상태.
- * @details 핸드셰이크 메시지와 치명 경고가 모두 이 상태를 거쳐 나간다. RFC 8446 은 경고를 그
- *          시점의 송신 보호로 보내게 하는데, 송신 키와 일련번호를 쥔 것이 이것 하나이므로
- *          실패한 자리에서 보내는 경고도 이미 쓴 nonce 를 다시 쓰지 않는다.
- */
+/// The write protection during the handshake. Handshake messages and fatal alerts both go
+/// through it, as RFC 8446 sends alerts under the current write protection; since it alone holds
+/// the write key and sequence number, an alert at a failure never reuses a nonce.
 enum HandshakeWrite {
-    /** @brief 아직 아무것도 보내지 않았다. 이때 실패하면 경고도 보내지 않는다. */
+    /// Nothing sent yet; a failure here sends no alert.
     Silent,
-    /** @brief 평문 레코드로 보낸다. */
     Plain,
-    /** @brief 이 키로 보호해 보낸다. */
     Protected(RecordLayer),
 }
 
 impl HandshakeWrite {
-    /** @brief 핸드셰이크를 끝까지 진행한다. 실패하면 그 시점의 송신 보호로 사유를 알린다. */
+    /// On failure, reports the reason under the current write protection.
     fn run<S: Write>(
         mut self,
         s: &mut S,
@@ -172,7 +136,7 @@ impl HandshakeWrite {
         result
     }
 
-    /** @brief 핸드셰이크 메시지를 지금 보호로 보낸다. 레코드 상한에 맞춰 나눈다. */
+    /// Fragments to the record limit.
     fn send<S: Write>(&mut self, s: &mut S, encoded: &[u8]) -> Result<(), TlsError> {
         match self {
             HandshakeWrite::Protected(layer) => {
@@ -189,12 +153,10 @@ impl HandshakeWrite {
         }
     }
 
-    /** @brief 이후 보내는 것을 이 키로 보호한다. */
     fn protect(&mut self, layer: RecordLayer) {
         *self = HandshakeWrite::Protected(layer);
     }
 
-    /** @brief 핸드셰이크를 마친 연결이 이어 쓸 송신 보호를 넘긴다. */
     fn take_layer(&mut self) -> Result<RecordLayer, TlsError> {
         match std::mem::replace(self, HandshakeWrite::Silent) {
             HandshakeWrite::Protected(layer) => Ok(layer),
@@ -202,7 +164,6 @@ impl HandshakeWrite {
         }
     }
 
-    /** @brief 핸드셰이크를 끝낸 실패를 상대에게 치명 경고로 알린다. */
     fn send_alert<S: Write>(&mut self, s: &mut S, error: &TlsError) {
         let Some(description) = error.alert() else {
             return;
@@ -219,48 +180,35 @@ impl HandshakeWrite {
 }
 
 #[derive(Clone)]
-/** @brief 서버 설정. 인증서와 키, 프로토콜 목록을 담는다. */
 pub struct ServerConfig {
-    /** @brief 보낼 인증서 체인. */
     pub cert_chain: Vec<Vec<u8>>,
-    /** @brief 서명에 쓸 방식. */
     pub sign_scheme: u16,
-    /** @brief 실제로 서명하는 것. 키를 직접 잡지 않는다. */
+    /// Signs without holding the key directly.
     pub sign: Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
 
-    /** @brief 이쪽이 받아들일 ALPN 목록. */
     pub alpn: Vec<Vec<u8>>,
 
-    /** @brief 클라이언트 인증서를 검증할 루트들. 없으면 요구하지 않는다. */
+    /// Client certificates are required only when set.
     pub client_ca: Option<crate::trust::TrustStore>,
 
-    /** @brief 다시 붙기를 허용할 설정. 없으면 매번 처음부터 핸드셰이크한다. */
+    /// Without it every connection does a full handshake.
     pub resumption: Option<ServerResumption>,
 }
 
 #[derive(Clone)]
-/** @brief 세션 재개 설정. */
 pub struct ServerResumption {
-    /** @brief 티켓을 암호화하고 복호화하는 것. */
     pub ticketer: Arc<crate::session::Ticketer>,
 
-    /** @brief 티켓이 유효한 기간. */
     pub lifetime_secs: u32,
 
-    /** @brief 왕복 없이 받아들일 자료 크기. 0이면 받지 않는다. */
+    /// 0 refuses early data.
     pub max_early_data: u32,
 }
 
 impl ServerResumption {
-    /**
-     * @brief 암호화 DNS 전송에 쓸 안전한 기본 재개 설정.
-     *
-     * @warning max_early_data를 0이 아니게 두지 말 것. 이 크레이트에는 안티리플레이가
-     *          없다. 일회용 티켓도, ClientHello 기록도, freshness 구간도 구현돼 있지 않다.
-     *          RFC 8446은 0-RTT를 받는 서버가 그중 하나를 반드시 갖추라고 요구한다.
-     *          지금 서버가 0-RTT를 아예 받지 않는 이유가 이 값 하나이므로, 올리려면
-     *          안티리플레이를 먼저 만들어야 한다. 0-RTT 자료는 전방 비밀성도 없다.
-     */
+    /// Keep `max_early_data` at 0. This crate has no anti-replay: no single-use tickets, no
+    /// ClientHello recording, no freshness window, and RFC 8446 requires one of them before a
+    /// server accepts 0-RTT. 0-RTT data also lacks forward secrecy.
     pub fn secure_default() -> Self {
         ServerResumption {
             ticketer: Arc::new(crate::session::Ticketer::new()),
@@ -272,23 +220,21 @@ impl ServerResumption {
 }
 
 impl ServerConfig {
-    /** @brief 인증서 하나와 키로 설정을 만든다. */
     pub fn from_pkcs8(cert_der: Vec<u8>, key_pkcs8_der: &[u8]) -> Option<Self> {
         Self::from_chain_pkcs8(vec![cert_der], key_pkcs8_der)
     }
 
-    /** @brief 체인과 키로 설정을 만든다. */
     pub fn from_chain_pkcs8(cert_chain: Vec<Vec<u8>>, key_pkcs8_der: &[u8]) -> Option<Self> {
         if !certificate_chain_is_valid(&cert_chain, false) {
             return None;
         }
         let (sign_scheme, sign) = signer_from_pkcs8_der(key_pkcs8_der)?;
 
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         use p256::pkcs8::DecodePrivateKey;
         let secret = p256::SecretKey::from_pkcs8_der(key_pkcs8_der).ok()?;
         let leaf = X509::parse(&cert_chain[0]).ok()?;
-        if leaf.public_key != secret.public_key().to_encoded_point(false).as_bytes() {
+        if leaf.public_key != secret.public_key().to_sec1_point(false).as_bytes() {
             return None;
         }
         Some(ServerConfig {
@@ -301,19 +247,16 @@ impl ServerConfig {
         })
     }
 
-    /** @brief 협상할 응용 프로토콜을 정한다. */
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn = protocols;
         self
     }
 
-    /** @brief 클라이언트 인증을 켠다. 이 저장소로 체인을 검증한다. */
     pub fn with_client_ca(mut self, store: crate::trust::TrustStore) -> Self {
         self.client_ca = Some(store);
         self
     }
 
-    /** @brief 세션 재개를 켠다. */
     pub fn with_resumption(mut self, r: ServerResumption) -> Self {
         self.resumption = Some(r);
         self
@@ -321,18 +264,13 @@ impl ServerConfig {
 }
 
 #[derive(Clone)]
-/** @brief 클라이언트 인증서와 서명 키. */
 pub struct ClientCert {
-    /** @brief 보낼 인증서 체인. */
     pub chain: Vec<Vec<u8>>,
-    /** @brief 서명에 쓸 방식. */
     pub sign_scheme: u16,
-    /** @brief 실제로 서명하는 것. */
     pub sign: Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
 }
 
 impl ClientCert {
-    /** @brief 체인과 키로 만든다. */
     pub fn from_pkcs8(chain: Vec<Vec<u8>>, key_pkcs8_der: &[u8]) -> Option<Self> {
         if !certificate_chain_is_valid(&chain, false) {
             return None;
@@ -346,7 +284,7 @@ impl ClientCert {
     }
 }
 
-/** @brief 키 바이트에서 서명자를 만든다. 키 종류를 알아서 가린다. */
+/// Picks the signer from the key type.
 pub fn signer_from_pkcs8_der(
     der: &[u8],
 ) -> Option<(u16, Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>)> {
@@ -364,50 +302,37 @@ pub fn signer_from_pkcs8_der(
 }
 
 #[derive(Debug, Clone, Copy)]
-/**
- * @brief 인증서 검증을 끄는 표시.
- * @warning 이름 자체가 경고다. 테스트와 명시적으로 위험을 감수한 설정에만 쓴다.
- */
+/// Disables certificate verification. Only for tests and settings that accept the risk
+/// explicitly.
 pub struct InsecureVerifier(());
 
 impl InsecureVerifier {
-    /** @brief 검증을 끈다. 이 이름이 곧 문서다. */
     pub fn dangerously_disable_certificate_verification() -> Self {
         Self(())
     }
 }
 
-/** @brief 클라이언트 설정. */
 pub struct ClientConfig {
-    /** @brief 붙을 서버 이름. */
     pub server_name: String,
 
-    /** @brief 인증서의 이름이 맞는지 볼지. */
     pub verify_name: bool,
 
-    /** @brief 인증서를 검증할 루트들. */
     pub roots: Option<crate::trust::TrustStore>,
 
-    /** @brief 검증을 대신할 것. 테스트 말고는 쓰지 않는다. */
+    /// For tests only.
     pub insecure_verifier: Option<InsecureVerifier>,
 
-    /** @brief 이쪽이 쓰고 싶은 ALPN 목록. */
     pub alpn: Vec<Vec<u8>>,
 
-    /** @brief 이쪽이 낼 인증서. 서버가 요구할 때 쓴다. */
     pub client_cert: Option<ClientCert>,
 
-    /** @brief 다시 붙을 때 쓸 앞선 세션. */
     pub session: Option<crate::session::TlsSession>,
 
-    /** @brief 왕복 없이 자료를 보낼지. */
     pub enable_early_data: bool,
 
-    /** @brief 첫 메시지에 키 조각을 담을지. */
     pub send_key_share: bool,
 }
 
-/** @brief 프로토콜 이름들이 와이어에 담길 수 있는 형태인지. */
 pub(crate) fn alpn_protocols_are_valid(protocols: &[Vec<u8>]) -> bool {
     let mut total = 0usize;
     let mut seen = std::collections::HashSet::new();
@@ -423,7 +348,7 @@ pub(crate) fn alpn_protocols_are_valid(protocols: &[Vec<u8>]) -> bool {
     total <= u16::MAX as usize
 }
 
-/** @brief 이 설정으로 만든 인사말이 와이어에 담기는지. 핸드셰이크 전에 확인한다. */
+/// Checked before the handshake.
 pub(crate) fn client_config_wire_is_valid(cfg: &ClientConfig) -> bool {
     let server_name = cfg.server_name.as_bytes();
     if server_name.is_empty()
@@ -455,7 +380,6 @@ pub(crate) fn client_config_wire_is_valid(cfg: &ClientConfig) -> bool {
     })
 }
 
-/** @brief 서버 설정이 와이어에 담기는지. */
 pub(crate) fn server_config_wire_is_valid(cfg: &ServerConfig) -> bool {
     certificate_chain_is_valid(&cfg.cert_chain, false)
         && alpn_protocols_are_valid(&cfg.alpn)
@@ -465,7 +389,6 @@ pub(crate) fn server_config_wire_is_valid(cfg: &ServerConfig) -> bool {
 }
 
 impl Default for ClientConfig {
-    /** @brief 기본 설정. */
     fn default() -> Self {
         ClientConfig {
             server_name: String::new(),
@@ -482,12 +405,9 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /**
-     * @brief SNI 로 보낼 호스트 이름. 주소로 붙으면 없다.
-     * @details RFC 6066 은 SNI 에 IPv4, IPv6 주소를 넣지 못하게 하고, 이름은 끝 점 없이 쓰게 한다.
-     *          주소로 붙을 때는 확장을 보내지 않고 인증서는 IP SAN 으로 확인한다. 보내지 않았는데
-     *          서버가 server_name 확장으로 답하면 받아들이지 않는다.
-     */
+    /// RFC 6066 forbids IP addresses in SNI and wants names without the trailing dot. When
+    /// connecting by address no SNI is sent, the certificate is checked by IP SAN, and a
+    /// server_name extension in the reply is refused.
     pub(crate) fn sni(&self) -> Option<&str> {
         match crate::x509::peer_host(&self.server_name) {
             crate::x509::PeerHost::Name(name) if !name.is_empty() => Some(name),
@@ -496,9 +416,8 @@ impl ClientConfig {
     }
 }
 
-/** @brief 진단 로그에 쓸 짧은 16진 표기. */
+/// Short hex for diagnostic logs.
 fn short_hex(bytes: &[u8]) -> String {
-    /** @brief 16진 문자표. */
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().min(32) * 2);
     for &b in bytes.iter().take(32) {
@@ -508,73 +427,53 @@ fn short_hex(bytes: &[u8]) -> String {
     out
 }
 
-/** @brief 핸드셰이크를 마친 연결. 응용 데이터를 주고받는다. */
 pub struct TlsConnection {
-    /** @brief 받는 쪽 암호 상태. */
     read: RecordLayer,
-    /** @brief 보내는 쪽 암호 상태. */
     write: RecordLayer,
 
-    /** @brief 협상한 버전. */
     version: u16,
 
-    /** @brief 협상한 ALPN. */
     alpn: Option<Vec<u8>>,
 
-    /** @brief 상대가 인증서로 자신을 증명했는지. */
     client_authenticated: bool,
 
-    /** @brief 그 인증서에 적힌 신원. */
     client_auth_identity: Option<String>,
 
-    /** @brief 검증한 상대의 인증 경로. */
     verified_chain: Vec<X509>,
 
-    /** @brief 이 연결이 클라이언트 쪽인지. 핸드셰이크 뒤 메시지 방향을 검사한다. */
+    /// Checks the direction of post-handshake messages.
     is_client: bool,
 
-    /** @brief 레코드 경계에 걸친 핸드셰이크 뒤 메시지 조각. */
+    /// Post-handshake message fragments spanning records.
     post_handshake: HandshakeReader,
 
-    /** @brief TLS 1.3 방향별 응용 비밀. 키 갱신 때만 필요하다. */
+    /// TLS 1.3 per-direction application secrets, needed only for KeyUpdate.
     traffic: Option<Tls13Traffic>,
 
-    /** @brief 이 연결이 PSK로 재개됐는지. */
     resumed: bool,
 
-    /** @brief 서버가 보낼 다음 티켓의 PSK를 만드는 비밀. */
+    /// Derives the PSK of the next ticket the server sends.
     resumption: Option<ClientResumption>,
 
-    /** @brief 핸드셰이크 뒤 받아 외부가 아직 가져가지 않은 세션. */
+    /// Sessions received after the handshake and not yet taken.
     new_sessions: Vec<crate::session::TlsSession>,
 
-    /**
-     * @brief 치명 경고를 보냈거나 받아서, 또는 레코드를 다 보내지 못해서 끝난 연결의 실패 사유.
-     * @details RFC 8446 은 치명 경고를 주고받은 연결에서 더는 아무것도 보내거나 받지 못하게
-     *          한다. 일부만 나간 레코드 뒤로는 무엇을 써도 상대가 제대로 읽지 못한다. 그래서 이
-     *          값이 있으면 읽기, 쓰기, 종료 통지를 모두 이 사유로 거절한다.
-     */
+    /// Set after a fatal alert was sent or received, or a record was only partly written. RFC 8446
+    /// allows nothing more on such a connection, and after a partial record the peer cannot parse
+    /// anything, so reads, writes and close_notify all fail with this reason.
     failed: Option<TlsError>,
 }
 
-/** @brief TLS 1.3 응용 키를 다음 세대로 바꾸는 데 필요한 최소 상태. */
 struct Tls13Traffic {
-    /** @brief 레코드 보호 알고리즘. */
     aead: Aead,
-    /** @brief 비밀을 늘리는 해시. */
     hash: Hash,
-    /** @brief 파생할 AEAD 키 길이. */
     key_len: usize,
-    /** @brief 상대가 보내는 방향의 현재 비밀. */
     read_secret: Vec<u8>,
-    /** @brief 이쪽이 보내는 방향의 현재 비밀. */
     write_secret: Vec<u8>,
-    /** @brief 이쪽이 이미 보낸 키 갱신 횟수. */
     write_updates: u64,
 }
 
 impl Drop for Tls13Traffic {
-    /** @brief 응용 traffic secret을 연결 종료 때 지운다. */
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.read_secret.zeroize();
@@ -582,20 +481,15 @@ impl Drop for Tls13Traffic {
     }
 }
 
-/** @brief 클라이언트가 NewSessionTicket을 실제 재개 세션으로 바꾸는 상태. */
 struct ClientResumption {
-    /** @brief 티켓을 받을 때 결속할 서버 이름. */
     server_name: String,
-    /** @brief 티켓 nonce를 PSK로 늘리는 해시. */
     hash: Hash,
-    /** @brief 재접속 때 제안할 암호 스위트. */
     suite: u16,
-    /** @brief 서버 Finished까지 묶인 재개 기준 비밀. */
+    /// Covers the handshake through the server Finished.
     master: Vec<u8>,
 }
 
 impl Drop for ClientResumption {
-    /** @brief 연결 종료 때 재개 기준 비밀을 지운다. */
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.master.zeroize();
@@ -603,46 +497,36 @@ impl Drop for ClientResumption {
 }
 
 impl TlsConnection {
-    /** @brief 합의된 응용 프로토콜. */
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
     }
 
-    /**
-     * @brief 검증한 상대의 인증 경로. 리프에서 시작해 이쪽 저장소의 루트로 끝난다.
-     * @note 재개한 연결이나 인증서를 검증하지 않은 연결에서는 비어 있다. 리프의 발급자가
-     *       필요하면 상대가 보낸 체인이 아니라 이 경로에서 꺼낸다.
-     */
+    /// From the leaf to a root in this side's store; empty for a resumed or unverified connection.
+    /// Take the leaf's issuer from here, not from the chain the peer sent.
     pub fn verified_chain(&self) -> &[X509] {
         &self.verified_chain
     }
 
-    /** @brief 합의된 버전. */
     pub fn version(&self) -> u16 {
         self.version
     }
 
-    /** @brief 클라이언트 인증서를 확인했는지. */
     pub fn client_authenticated(&self) -> bool {
         self.client_authenticated
     }
 
-    /** @brief 확인된 클라이언트 신원. */
     pub fn client_auth_identity(&self) -> Option<&str> {
         self.client_auth_identity.as_deref()
     }
 
-    /** @brief 이 연결이 PSK-DHE로 재개됐는지. */
     pub fn is_resumed(&self) -> bool {
         self.resumed
     }
 
-    /** @brief 새로 받은 재개 세션을 소유권과 함께 꺼낸다. */
     pub fn take_sessions(&mut self) -> Vec<crate::session::TlsSession> {
         std::mem::take(&mut self.new_sessions)
     }
 
-    /** @brief 받는 TLS 1.3 응용 키를 다음 세대로 원자 교체한다. */
     fn update_read_key(&mut self) -> Result<(), TlsError> {
         let traffic = self.traffic.as_mut().ok_or(TlsError::Internal)?;
         let secret = traffic_update(traffic.hash, &traffic.read_secret);
@@ -654,7 +538,6 @@ impl TlsConnection {
         Ok(())
     }
 
-    /** @brief 보내는 TLS 1.3 응용 키를 다음 세대로 원자 교체한다. */
     fn update_write_key(&mut self) -> Result<(), TlsError> {
         let traffic = self.traffic.as_mut().ok_or(TlsError::Internal)?;
         if traffic.write_updates >= MAX_TLS13_KEY_UPDATES {
@@ -670,23 +553,18 @@ impl TlsConnection {
         Ok(())
     }
 
-    /** @brief 송신 키 세대를 한 번 더 올릴 수 있는지. */
     fn can_update_write_key(&self) -> bool {
         self.traffic
             .as_ref()
             .is_some_and(|traffic| traffic.write_updates < MAX_TLS13_KEY_UPDATES)
     }
 
-    /**
-     * @brief 보호한 레코드 하나를 보낸다.
-     * @details 보내지 못하면 레코드 일부만 나갔을 수 있다. 상대는 그 뒤에 오는 레코드를 앞
-     *          레코드의 나머지로 읽어 인증에 실패하므로, 연결을 실패 상태로 두어 더 쓰지 않는다.
-     */
+    /// A failed send may have written part of the record; the peer would read the next record as
+    /// its rest and fail authentication, so the connection is marked failed.
     fn send_record<S: Write>(&mut self, s: &mut S, record: &TlsRecord) -> Result<(), TlsError> {
         write_record(s, record).inspect_err(|error| self.failed = Some(error.clone()))
     }
 
-    /** @brief 현재 보내는 키로 KeyUpdate를 보낸 뒤 새 키로 넘어간다. */
     fn send_key_update<S: Write>(
         &mut self,
         s: &mut S,
@@ -708,7 +586,7 @@ impl TlsConnection {
         self.update_write_key()
     }
 
-    /** @brief AES-GCM·sequence 한계의 마지막 한 건을 KeyUpdate에 쓰도록 보장한다. */
+    /// Keeps the last record before the AES-GCM and sequence limits for the KeyUpdate.
     fn ensure_write_key_capacity<S: Write>(&mut self, s: &mut S) -> Result<(), TlsError> {
         let update = match &self.write {
             RecordLayer::Tls13(crypto) => crypto.needs_key_update(),
@@ -720,12 +598,8 @@ impl TlsConnection {
         Ok(())
     }
 
-    /**
-     * @brief 응용 데이터를 보낸다.
-     * @note 평문 크기 상한에 맞춰 나눈다. 넘기면 상대가 레코드를 거부한다.
-     */
+    /// Fragments to the plaintext limit, which the peer enforces.
     pub fn write_app<S: Write>(&mut self, s: &mut S, data: &[u8]) -> Result<(), TlsError> {
-        /** @brief 한 번에 보낼 응용 자료 크기. 조각 상한을 넘지 않게 잡는다. */
         const APP_CHUNK: usize = MAX_FRAGMENT;
         if let Some(error) = &self.failed {
             return Err(error.clone());
@@ -743,13 +617,9 @@ impl TlsConnection {
         Ok(())
     }
 
-    /**
-     * @brief 더 보낼 것이 없음을 알린다.
-     * @details RFC 8446이 쓰기 쪽을 닫기 전에 close_notify를 보내라고 정한다. 알리지 않고
-     *          연결만 끊으면 상대는 중간에서 잘린 것과 구분하지 못한다.
-     */
+    /// RFC 8446 requires close_notify before closing the write side; otherwise the peer cannot tell
+    /// the end from a truncation.
     pub fn send_close_notify<S: Write>(&mut self, s: &mut S) -> Result<(), TlsError> {
-        /** @brief warning 수준 close_notify. */
         const CLOSE_NOTIFY: [u8; 2] = [1, 0];
         if let Some(error) = &self.failed {
             return Err(error.clone());
@@ -758,13 +628,9 @@ impl TlsConnection {
         self.send_record(s, &rec)
     }
 
-    /**
-     * @brief 핸드셰이크를 마친 뒤 상대 인증서를 거부하고 연결을 끝낸다.
-     * @details 폐기 확인처럼 TLS 검증 밖의 정책이 인증서를 받아들이지 않을 때 쓴다. 핸드셰이크
-     *          안에서 거부했을 때처럼 certificate_unknown 치명 경고로 알린다. 경고 없이 TCP 만
-     *          끊으면 상대는 거부와 중간에서 잘린 연결을 구분하지 못한다. 이후 읽기와 쓰기는 이
-     *          사유로 거절한다.
-     */
+    /// For policy outside TLS verification, such as revocation. Sends certificate_unknown as a
+    /// rejection inside the handshake would; closing TCP alone looks like a truncation to the peer.
+    /// Later reads and writes fail with this reason.
     pub fn reject_peer_certificate<S: Write>(&mut self, s: &mut S) {
         if self.failed.is_some() {
             return;
@@ -776,11 +642,9 @@ impl TlsConnection {
         self.failed = Some(error);
     }
 
-    /**
-     * @brief 응용 데이터를 받는다. 핸드셰이크 뒤 메시지도 여기서 처리한다.
-     * @details 받은 레코드 때문에 실패하면 그 사유를 치명 경고로 알리고 연결을 실패 상태로
-     *          둔다. 상대가 보낸 치명 경고를 받았을 때도 실패 상태로 두지만 경고로 답하지 않는다.
-     */
+    /// Also handles post-handshake messages. A failure caused by a received record sends a fatal
+    /// alert and marks the connection failed; a fatal alert from the peer marks it failed without a
+    /// reply.
     pub fn read_app<S: Read + Write>(&mut self, s: &mut S) -> Result<Vec<u8>, TlsError> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
@@ -797,7 +661,6 @@ impl TlsConnection {
         result
     }
 
-    /** @brief 응용 데이터가 든 레코드가 올 때까지 읽는다. */
     fn read_application_data<S: Read + Write>(&mut self, s: &mut S) -> Result<Vec<u8>, TlsError> {
         let mut ignored_records = 0usize;
         let mut post_handshake_messages = 0usize;
@@ -910,20 +773,15 @@ impl TlsConnection {
     }
 }
 
-/** @brief 연결을 읽기와 쓰기로 감싼 것. 평범한 스트림처럼 쓸 수 있다. */
 pub struct TlsStream<S> {
-    /** @brief 이 연결의 암호 상태. */
     conn: TlsConnection,
-    /** @brief 하위 전송 스트림. */
     inner: S,
-    /** @brief 풀어 놓았지만 아직 위로 넘기지 않은 자료. */
+    /// Read position in `rbuf`.
     rbuf: Vec<u8>,
-    /** @brief 그 자료를 어디까지 넘겼는지. */
     rpos: usize,
 }
 
 impl<S: Read + Write> TlsStream<S> {
-    /** @brief 연결과 소켓을 묶는다. */
     pub fn new(conn: TlsConnection, inner: S) -> Self {
         TlsStream {
             conn,
@@ -933,44 +791,36 @@ impl<S: Read + Write> TlsStream<S> {
         }
     }
 
-    /** @brief 협상한 ALPN. */
     pub fn alpn(&self) -> Option<&[u8]> {
         self.conn.alpn()
     }
 
-    /** @brief 클라이언트가 인증서로 자신을 증명했는지. */
     pub fn client_authenticated(&self) -> bool {
         self.conn.client_authenticated()
     }
 
-    /** @brief 그 인증서에 적힌 신원. */
     pub fn client_auth_identity(&self) -> Option<&str> {
         self.conn.client_auth_identity()
     }
 
-    /** @brief 검증한 상대의 인증 경로. TlsConnection::verified_chain 과 같다. */
     pub fn verified_chain(&self) -> &[X509] {
         self.conn.verified_chain()
     }
 
-    /** @brief 이 스트림이 PSK-DHE로 재개됐는지. */
     pub fn is_resumed(&self) -> bool {
         self.conn.is_resumed()
     }
 
-    /** @brief 새로 받은 재개 세션을 꺼낸다. */
     pub fn take_sessions(&mut self) -> Vec<crate::session::TlsSession> {
         self.conn.take_sessions()
     }
 
-    /** @brief 밑에 깔린 소켓. */
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 }
 
 impl<S: Read + Write> Read for TlsStream<S> {
-    /** @brief 응용 데이터를 읽는다. */
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -1005,7 +855,6 @@ impl<S: Read + Write> Read for TlsStream<S> {
 }
 
 impl<S: Read + Write> Write for TlsStream<S> {
-    /** @brief 응용 데이터를 쓴다. */
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -1015,16 +864,12 @@ impl<S: Read + Write> Write for TlsStream<S> {
             .map_err(|_| std::io::Error::other("Could not write TLS data"))?;
         Ok(data.len())
     }
-    /** @brief 밑에 깔린 소켓을 비운다. */
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
 }
 
-/**
- * @brief 레코드 하나를 읽는다.
- * @retval TlsError::Eof 첫 바이트를 읽기 전에 연결이 닫혔다.
- */
+/// `Eof` when the connection closes before the first byte.
 fn read_record<S: Read>(s: &mut S) -> Result<TlsRecord, TlsError> {
     let mut hdr = [0u8; 5];
     let first = loop {
@@ -1049,11 +894,8 @@ fn read_record<S: Read>(s: &mut S) -> Result<TlsRecord, TlsError> {
     })
 }
 
-/**
- * @brief 레코드 하나를 쓴다.
- * @retval TlsError::Internal 레코드가 상한을 넘는다. 이쪽이 만든 레코드이므로 상대에게
- *         record_overflow 를 알릴 일이 아니다.
- */
+/// `Internal` when the record exceeds the limit: this side built it, so record_overflow is not
+/// the peer's to hear.
 fn write_record<S: Write>(s: &mut S, rec: &TlsRecord) -> Result<(), TlsError> {
     if rec.fragment.len() > MAX_CIPHERTEXT {
         return Err(TlsError::Internal);
@@ -1061,7 +903,6 @@ fn write_record<S: Write>(s: &mut S, rec: &TlsRecord) -> Result<(), TlsError> {
     s.write_all(&rec.encode()).map_err(|_| TlsError::Io)
 }
 
-/** @brief 큰 평문 핸드셰이크 메시지를 레코드 상한에 맞춰 보낸다. */
 fn write_plain_handshake<S: Write>(s: &mut S, encoded: &[u8]) -> Result<(), TlsError> {
     for chunk in encoded.chunks(MAX_FRAGMENT) {
         write_record(s, &TlsRecord::new(ContentType::Handshake, chunk.to_vec()))?;
@@ -1069,7 +910,7 @@ fn write_plain_handshake<S: Write>(s: &mut S, encoded: &[u8]) -> Result<(), TlsE
     Ok(())
 }
 
-/** @brief 내용 없는 레코드를 하나 버린다. 연이어 버린 수가 상한을 넘으면 unexpected_message 다. */
+/// Past the cap of consecutive ignored records, unexpected_message.
 fn skip_ignored_record(ignored: &mut usize) -> Result<(), TlsError> {
     *ignored += 1;
     if *ignored > MAX_CONSECUTIVE_IGNORED_RECORDS {
@@ -1078,24 +919,17 @@ fn skip_ignored_record(ignored: &mut usize) -> Result<(), TlsError> {
     Ok(())
 }
 
-/**
- * @brief 암호화되지 않은 핸드셰이크 레코드를 읽어 메시지로 나눈다.
- * @details 평문 단계의 레코드 규칙을 여기서 모두 검사한다. 평문 레코드는 2^14 바이트를 넘을 수
- *          없고, 빈 핸드셰이크 레코드는 받지 않는다. 호환용 ChangeCipherSpec 은 RFC 8446 이 첫
- *          ClientHello 를 주고받은 뒤에만 허용하므로 그 뒤에 만든 읽기만 버린다. TLS 1.2 는 이
- *          자리에 ChangeCipherSpec 이 올 수 없다.
- */
+/// Enforces the plaintext record rules: at most 2^14 bytes, no empty handshake record.
+/// Compatibility ChangeCipherSpec is allowed only after the first ClientHello (RFC 8446), so only
+/// readers created after it drop one; TLS 1.2 never allows it here.
 struct PlainHsReader {
-    /** @brief 평문 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
-    /** @brief 호환용 ChangeCipherSpec 을 버릴지. 거짓이면 unexpected_message 로 끊는다. */
+    /// When false, a ChangeCipherSpec is unexpected_message.
     drop_ccs: bool,
-    /** @brief 지금 메시지를 기다리며 연이어 버린 레코드 수. */
     ignored: usize,
 }
 
 impl PlainHsReader {
-    /** @brief 빈 상태. */
     fn new(drop_ccs: bool) -> Self {
         Self {
             hr: HandshakeReader::new(),
@@ -1104,7 +938,6 @@ impl PlainHsReader {
         }
     }
 
-    /** @brief 핸드셰이크 메시지 하나를 읽는다. 나뉘어 와도 이어 붙인다. */
     fn next<S: Read>(&mut self, s: &mut S) -> Result<HandshakeMsg, TlsError> {
         loop {
             if let Some(m) = self.hr.next_message()? {
@@ -1134,18 +967,15 @@ impl PlainHsReader {
         }
     }
 
-    /**
-     * @brief 키가 바뀌기 전에 오는 마지막 메시지를 읽는다.
-     * @retval TlsError::UnexpectedMessage 메시지 뒤에 바이트가 남았다. RFC 8446 은 핸드셰이크
-     *         메시지가 키 변경을 넘어 이어지지 못하게 하고, 그 바이트는 새 키로 읽을 수 없다.
-     */
+    /// Reads the last message before a key change. Leftover bytes are unexpected_message: RFC 8446
+    /// forbids a handshake message spanning a key change, and those bytes are unreadable under the
+    /// new key.
     fn next_at_boundary<S: Read>(&mut self, s: &mut S) -> Result<HandshakeMsg, TlsError> {
         let message = self.next(s)?;
         self.ensure_boundary()?;
         Ok(message)
     }
 
-    /** @brief 읽어 둔 바이트가 남지 않았는지. 남았으면 unexpected_message 다. */
     fn ensure_boundary(&self) -> Result<(), TlsError> {
         if self.hr.has_pending() {
             return Err(TlsError::UnexpectedMessage);
@@ -1154,16 +984,12 @@ impl PlainHsReader {
     }
 }
 
-/** @brief 1.3 핸드셰이크 키로 암호화된 핸드셰이크 메시지를 읽는 것. */
 struct EncReader {
-    /** @brief 암호를 푼 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
-    /** @brief 지금 메시지를 기다리며 연이어 버린 레코드 수. */
     ignored: usize,
 }
 
 impl EncReader {
-    /** @brief 빈 상태. */
     fn new() -> Self {
         Self {
             hr: HandshakeReader::new(),
@@ -1171,12 +997,8 @@ impl EncReader {
         }
     }
 
-    /**
-     * @brief 다음 핸드셰이크 메시지를 읽는다.
-     * @details 평문 경고도 받는다. 상대가 이쪽 ServerHello 를 처리하다 실패하면 핸드셰이크 키를
-     *          만들기 전이므로 경고를 평문으로 보낸다. 호환용 ChangeCipherSpec 은 상대의
-     *          Finished 앞까지 아무 때나 올 수 있다.
-     */
+    /// Accepts plaintext alerts too: a peer failing on this side's ServerHello has no handshake
+    /// keys yet. A compatibility ChangeCipherSpec may come any time before the peer's Finished.
     fn next<S: Read>(&mut self, s: &mut S, c: &mut RecordCrypto) -> Result<HandshakeMsg, TlsError> {
         loop {
             if let Some(m) = self.hr.next_message()? {
@@ -1217,10 +1039,7 @@ impl EncReader {
         }
     }
 
-    /**
-     * @brief 상대의 Finished 처럼 키가 바뀌기 전에 오는 마지막 메시지를 읽는다.
-     * @retval TlsError::UnexpectedMessage 메시지 뒤에 바이트가 남았다.
-     */
+    /// Leftover bytes after the message are unexpected_message.
     fn next_at_boundary<S: Read>(
         &mut self,
         s: &mut S,
@@ -1234,14 +1053,12 @@ impl EncReader {
     }
 }
 
-/** @brief 논스 기준값을 고정 길이 배열로. */
 fn iv12(v: Vec<u8>) -> [u8; 12] {
     let mut a = [0u8; 12];
     a.copy_from_slice(&v[..12]);
     a
 }
 
-/** @brief 상대가 제안한 것 중 쓸 스위트를 고른다. */
 fn choose_suite(offered: &[u16]) -> Option<u16> {
     [
         TLS_AES_128_GCM_SHA256,
@@ -1252,14 +1069,13 @@ fn choose_suite(offered: &[u16]) -> Option<u16> {
     .find(|&s| offered.contains(&s))
 }
 
-/** @brief 그 곡선의 새 개인키를 만든다. */
 pub(crate) fn new_key_exchange(group: u16) -> Result<KeyExchange, TlsError> {
     let mut seed = Zeroizing::new([0u8; 32]);
     fill_random(&mut *seed);
     KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Internal)
 }
 
-/** @brief 지금 blocking TLS 재접속에 제안할 수 있는 세션. */
+/// A session the blocking client can offer now.
 fn fresh_client_session(cfg: &ClientConfig) -> Option<&crate::session::TlsSession> {
     cfg.session.as_ref().filter(|session| {
         session.server_name == cfg.server_name
@@ -1272,7 +1088,7 @@ fn fresh_client_session(cfg: &ClientConfig) -> Option<&crate::session::TlsSessio
     })
 }
 
-/** @brief placeholder가 든 ClientHello의 PSK binder를 실제 값으로 바꾼다. */
+/// Replaces the PSK binder placeholder with the real value.
 fn encode_client_hello(
     hello: &ClientHello,
     session: Option<&crate::session::TlsSession>,
@@ -1298,11 +1114,8 @@ fn encode_client_hello(
     Ok(wire)
 }
 
-/**
- * @brief 서버가 blocking TLS ClientHello의 첫 PSK 제안을 검증한다.
- * @param hash 이번에 고른 스위트의 해시. RFC 8446 은 해시가 같은 스위트끼리 PSK 를 함께 쓰게
- *        하므로 티켓의 스위트와 같을 필요는 없다.
- */
+/// `hash` belongs to the chosen suite; RFC 8446 allows a PSK with any suite of the same hash,
+/// not only the ticket's.
 fn accept_client_psk(
     cfg: &ServerConfig,
     hello: &ClientHello,
@@ -1369,28 +1182,18 @@ fn accept_client_psk(
     Ok(Some(state))
 }
 
-/**
- * @brief 1.3 서버가 키 교환에 쓰는 곡선. 앞의 것을 먼저 고른다.
- * @details RFC 8446 은 secp256r1 키 교환을 반드시 지원하게 한다.
- */
+/// In preference order. RFC 8446 makes secp256r1 mandatory.
 const SERVER_TLS13_GROUPS: [u16; 2] = [X25519, SECP256R1];
 
 #[derive(Debug, PartialEq)]
-/** @brief 1.3 서버가 클라이언트 인사말을 보고 정한 키 교환. */
 pub(crate) enum ServerKeyShare {
-    /** @brief 클라이언트가 이 곡선으로 보낸 공개값으로 바로 키를 합의한다. */
     Offered { group: u16, public: Vec<u8> },
-    /** @brief 쓸 수 있는 키 조각이 없어 이 곡선으로 다시 시도 요청을 보낸다. */
     Retry(u16),
 }
 
-/**
- * @brief 1.3 서버가 키 교환 곡선을 고른다. TCP 서버와 QUIC 엔진 서버가 함께 쓴다.
- * @details 클라이언트가 보낸 키 조각 가운데 이쪽이 지원하는 곡선의 것을 이쪽 선호 순서로
- *          고른다. 그런 조각이 없으면 클라이언트의 지원 곡선 가운데 이쪽이 지원하는 곡선으로
- *          다시 시도 요청을 보낸다.
- * @retval TlsError::HandshakeFailure 공통 곡선이 없다.
- */
+/// Shared by the TCP server and the QUIC engine. Picks the client's key share in this side's
+/// preference order, else asks for a retry with a supported group the client lists.
+/// `HandshakeFailure` when there is no common group.
 pub(crate) fn choose_server_key_share(ch: &ClientHello) -> Result<ServerKeyShare, TlsError> {
     let shares = ch
         .ext(EXT_KEY_SHARE)
@@ -1415,12 +1218,8 @@ pub(crate) fn choose_server_key_share(ch: &ClientHello) -> Result<ServerKeyShare
         .ok_or(TlsError::HandshakeFailure)
 }
 
-/**
- * @brief 다시 시도 요청에 답한 인사말에서 요청한 곡선의 공개값을 꺼낸다.
- * @details RFC 8446 은 재시도 인사말의 키 조각을 다시 시도 요청이 고른 곡선의 조각 하나로
- *          바꾸게 한다. 공개값의 형식은 키를 합의할 때 확인한다.
- * @retval TlsError::IllegalParameter 조각이 하나가 아니거나 다른 곡선의 조각이다.
- */
+/// RFC 8446 requires the retried hello to carry exactly one share, for the requested group;
+/// otherwise `IllegalParameter`. The public value is checked during key agreement.
 pub(crate) fn retry_key_share(ch: &ClientHello, group: u16) -> Result<Vec<u8>, TlsError> {
     let shares = ch
         .ext(EXT_KEY_SHARE)
@@ -1433,7 +1232,7 @@ pub(crate) fn retry_key_share(ch: &ClientHello, group: u16) -> Result<Vec<u8>, T
     }
 }
 
-/** @brief 1.2 에서 상대의 ChangeCipherSpec 을 받는다. 그 자리에 온 경고는 상대의 실패다. */
+/// An alert in its place is the peer's failure.
 fn expect_ccs<S: Read>(s: &mut S) -> Result<(), TlsError> {
     let mut ignored = 0;
     loop {
@@ -1454,11 +1253,7 @@ fn expect_ccs<S: Read>(s: &mut S) -> Result<(), TlsError> {
     }
 }
 
-/**
- * @brief 1.2 에서 상대의 ChangeCipherSpec 다음에 오는 Finished 를 읽는다.
- * @details 상대는 이미 새 키로 넘어갔으므로 이 자리의 레코드는 모두 보호돼 있다. 경고도 풀어서
- *          읽는다.
- */
+/// The peer has switched keys, so every record here is protected, alerts included.
 fn read_tls12_finished<S: Read>(
     s: &mut S,
     read_c: &mut Tls12RecordCrypto,
@@ -1480,19 +1275,15 @@ fn read_tls12_finished<S: Read>(
     }
 }
 
-/** @brief 더미 레코드가 규격 형태인지. 아무 바이트나 받으면 그것이 경로가 된다. */
+/// Accepting arbitrary bytes would open a path through.
 fn valid_ccs_record(record: &TlsRecord) -> bool {
     record.content_type == ContentType::ChangeCipherSpec
         && record.version == crate::record::LEGACY_VERSION
         && record.fragment == [1]
 }
 
-/**
- * @brief 바이트열이 정확히 핸드셰이크 메시지 하나인지. 뒤에 바이트가 남으면 거부한다.
- * @retval TlsError::Decode 메시지가 덜 왔다.
- * @retval TlsError::UnexpectedMessage 메시지 뒤에 바이트가 남았다. 키가 바뀌는 자리에서는
- *         메시지가 레코드 경계에서 끝나야 한다.
- */
+/// `Decode` when incomplete. Leftover bytes are `UnexpectedMessage`: at a key change the message
+/// must end at the record boundary.
 fn parse_exact_handshake(bytes: &[u8]) -> Result<HandshakeMsg, TlsError> {
     let (message, used) = HandshakeMsg::parse(bytes)?.ok_or(TlsError::Decode)?;
     if used != bytes.len() {
@@ -1501,25 +1292,19 @@ fn parse_exact_handshake(bytes: &[u8]) -> Result<HandshakeMsg, TlsError> {
     Ok(message)
 }
 
-/** @brief 호환용 더미 레코드를 만든다. */
 fn ccs_record() -> TlsRecord {
     TlsRecord::new(ContentType::ChangeCipherSpec, vec![1])
 }
 
-/** @brief 이 서명 방식이 ECDSA인지. */
 fn scheme_is_ecdsa(scheme: u16) -> bool {
     scheme == ECDSA_SECP256R1_SHA256 || scheme == ECDSA_SECP384R1_SHA384
 }
 
-/**
- * @brief 1.2 클라이언트 인사말이 이쪽이 답할 수 있는 형태인지.
- * @details 압축 방식 목록에는 무압축이 들어 있기만 하면 된다. RFC 5246 은 무압축을 반드시 넣게
- *          하고 서버는 그것을 고른다. 첫 연결의 재협상 정보는 RFC 5746 대로 빈 확장이나 SCSV 로
- *          알릴 수 있다. 점 형식 목록을 보냈는데 압축하지 않은 형식이 없으면 거절한다. RFC 8422 는
- *          그런 목록을 받은 서버가 핸드셰이크를 끝내도록 요구한다. 확장 마스터 비밀이나 재협상
- *          정보가 없으면 이쪽이 받아들일 수 있는 매개변수가 없는 것이다.
- * @warning 이쪽 인증서로 쓸 수 있는 서명 방식을 제안했는지 확인한다.
- */
+/// The compression list need only contain null, which RFC 5246 requires and the server picks.
+/// Renegotiation info on a first connection may come as an empty extension or the SCSV (RFC 5746).
+/// A point format list without uncompressed is refused, as RFC 8422 requires. Without extended
+/// master secret or renegotiation info nothing here is acceptable. The client must offer a scheme
+/// this side's certificate can sign with.
 fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(), TlsError> {
     if !ch.compression_methods.contains(&0) {
         return Err(TlsError::IllegalParameter);
@@ -1560,15 +1345,10 @@ fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(),
     Ok(())
 }
 
-/**
- * @brief 1.2 서버 인사말이 이쪽 제안 안에 있는지.
- * @details 서버 이름을 보냈으면 서버는 빈 server_name 확장으로 그 이름을 썼다고 알릴 수 있다.
- *          RFC 6066 이 허용하는 응답이고, 많은 부하 분산기가 이렇게 답한다. 점 형식 목록은
- *          압축하지 않은 형식이 들어 있으면 받아들인다. 이쪽이 제안했지만 1.2 서버 인사말에
- *          올 수 없는 확장은 IllegalParameter 다.
- * @warning 이쪽이 제안하지 않은 스위트나 확장을 받아들이면 다운그레이드가 성립한다.
- * @return 서버가 고른 응용 프로토콜.
- */
+/// A server may confirm the sent name with an empty server_name extension (RFC 6066), as many
+/// load balancers do. A point format list is fine if it contains uncompressed. An offered extension
+/// that cannot appear in a 1.2 ServerHello is `IllegalParameter`. Accepting a suite or extension
+/// this side did not offer would allow a downgrade. Returns the server's ALPN choice.
 fn validate_tls12_server_hello(
     cfg: &ClientConfig,
     ch: &ClientHello,
@@ -1622,15 +1402,11 @@ fn validate_tls12_server_hello(
         .transpose()
 }
 
-/**
- * @brief 서버로서 핸드셰이크를 마친다. 버전에 따라 갈린다.
- * @details 실패하면 그 사유를 그 시점의 송신 보호로 치명 경고를 보내 알린다. 다시 시도 요청은
- *          재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도 인사말은 지원 곡선을
- *          바꿀 수 없으므로 X25519 를 지원하지 않는 인사말은 첫 인사말에서 거절한다. 1.3 에서
- *          클라이언트가 이쪽 서명 방식을 알리지 않았어도 RFC 8446 이 권하는 대로 이쪽 체인과
- *          서명으로 계속한다. 받아들일지는 클라이언트가 정한다.
- * @retval TlsError::Internal 설정이 와이어에 담기지 않는다. 상대에게는 아무것도 보내지 않는다.
- */
+/// A failure sends a fatal alert under the current write protection. A retry is requested only
+/// when the retried hello can finish the handshake; since it cannot change the supported groups, a
+/// hello without X25519 is refused at once. In 1.3 the handshake proceeds with this side's chain
+/// even if the client did not list its scheme, as RFC 8446 suggests; the client decides.
+/// `Internal` when the configuration does not fit the wire, and then nothing is sent.
 pub fn server_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
@@ -1641,7 +1417,7 @@ pub fn server_handshake<S: Read + Write>(
     HandshakeWrite::Plain.run(s, |s, w| run_server_handshake(s, cfg, w))
 }
 
-/** @brief 서버 핸드셰이크 본체. 보내는 것은 모두 w 를 거친다. */
+/// Everything sent goes through `w`.
 fn run_server_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
@@ -1824,10 +1600,8 @@ fn run_server_handshake<S: Read + Write>(
     w.send(s, &fin_msg.encode())?;
     transcript.update(&fin_msg.encode());
 
-    /*
-     * 이쪽 Finished 를 보낸 뒤로 서버의 송신 키는 응용 키다. 클라이언트의 인증서나 Finished 를
-     * 거절하는 경고도 이 키로 보내야 클라이언트가 풀 수 있다.
-     */
+    // After this side's Finished the server writes with application keys, and alerts rejecting the
+    // client's certificate or Finished must use them for the client to read.
     ks.enter_master();
     let th_after = transcript.hash();
     let cap = ks.client_application_traffic_secret(&th_after);
@@ -1942,7 +1716,6 @@ fn run_server_handshake<S: Read + Write>(
     })
 }
 
-/** @brief 클라이언트 인사말을 만든다. */
 fn build_client_hello(
     cfg: &ClientConfig,
     kx: &KeyExchange,
@@ -2014,13 +1787,9 @@ fn build_client_hello(
     }
 }
 
-/**
- * @brief 클라이언트로서 핸드셰이크를 마친다.
- * @details 실패하면 그 사유를 그 시점의 송신 보호로 치명 경고를 보내 알린다. 서버 인사말을
- *          받은 뒤로는 클라이언트 핸드셰이크 키로 보호한다. 이쪽은 조기 데이터를 보내지 않으므로
- *          서버는 그 키로 읽고 있다.
- * @retval TlsError::Internal 설정이 와이어에 담기지 않는다. 상대에게는 아무것도 보내지 않는다.
- */
+/// A failure sends a fatal alert under the current write protection. After the ServerHello that
+/// is the client handshake key; this side sends no early data, so the server reads with it.
+/// `Internal` when the configuration does not fit the wire, and then nothing is sent.
 pub fn client_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ClientConfig,
@@ -2031,7 +1800,7 @@ pub fn client_handshake<S: Read + Write>(
     HandshakeWrite::Silent.run(s, |s, w| run_client_handshake(s, cfg, w))
 }
 
-/** @brief 클라이언트 핸드셰이크 본체. 보내는 것은 모두 w 를 거친다. */
+/// Everything sent goes through `w`.
 fn run_client_handshake<S: Read + Write>(
     s: &mut S,
     cfg: &ClientConfig,
@@ -2299,10 +2068,8 @@ fn run_client_handshake<S: Read + Write>(
 
     let mut th_for_fin = th_after.clone();
     if let Some(requested) = &requested_schemes {
-        /*
-         * 서버가 받지 않는 서명 방식의 키라면 인증서를 보내지 않고 빈 Certificate 로 답한다.
-         * RFC 8446 은 알맞은 인증서가 없는 클라이언트에 이렇게 하게 하고, 계속할지는 서버가 정한다.
-         */
+        // With a key the server does not accept, send an empty Certificate; RFC 8446 has the server
+        // decide whether to continue.
         let client_cert = cfg
             .client_cert
             .as_ref()
@@ -2379,11 +2146,8 @@ fn run_client_handshake<S: Read + Write>(
     })
 }
 
-/**
- * @brief 1.2 서버 핸드셰이크.
- * @details 이쪽 ChangeCipherSpec 을 보내기 전까지는 경고도 평문으로 나간다. 1.2 는 그 레코드를
- *          보낼 때 송신 키를 바꾼다.
- */
+/// Alerts go out in plaintext until this side's ChangeCipherSpec, which switches the write key
+/// in 1.2.
 fn server_handshake_tls12<S: Read + Write>(
     s: &mut S,
     cfg: &ServerConfig,
@@ -2515,12 +2279,9 @@ fn server_handshake_tls12<S: Read + Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/**
- * @brief 1.2 클라이언트 핸드셰이크.
- * @details 이쪽 ChangeCipherSpec 을 보내기 전까지는 경고도 평문으로 나간다. 1.2 는 그 레코드를
- *          보낼 때 송신 키를 바꾼다. 서버가 인증서를 요구하면, 요구한 종류와 서명 방식에 맞는
- *          인증서가 있을 때만 보내고 없으면 RFC 5246 대로 빈 Certificate 로 답한다.
- */
+/// Alerts go out in plaintext until this side's ChangeCipherSpec, which switches the write key
+/// in 1.2. A certificate is sent only when one matches the requested type and scheme; otherwise
+/// an empty Certificate, as RFC 5246 says.
 fn client_handshake_tls12<S: Read + Write>(
     s: &mut S,
     cfg: &ClientConfig,
@@ -2634,10 +2395,8 @@ fn client_handshake_tls12<S: Read + Write>(
     w.send(s, &cke_msg.encode())?;
     transcript.extend_from_slice(&cke_msg.encode());
 
-    /*
-     * RFC 7627 의 세션 해시는 ClientKeyExchange 까지만 덮는다. CertificateVerify 는 그 뒤에
-     * 보내고, 서명 대상은 그 앞까지 오간 핸드셰이크 메시지 전체다.
-     */
+    // The RFC 7627 session hash ends at ClientKeyExchange. CertificateVerify comes after it and
+    // signs every handshake message before it.
     let master = Zeroizing::new(tls12::extended_master_secret(
         info.hash,
         &shared,
@@ -2690,7 +2449,6 @@ fn client_handshake_tls12<S: Read + Write>(
     })
 }
 
-/** @brief 현재 Unix 초. */
 fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2698,7 +2456,6 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/** @brief 암호화된 확장 메시지를 만든다. */
 fn encrypted_extensions(alpn: Option<&[u8]>) -> Vec<u8> {
     let mut w = Writer::new();
     w.vec16(|w| {
@@ -2710,7 +2467,6 @@ fn encrypted_extensions(alpn: Option<&[u8]>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-/** @brief 두 버전의 핸드셰이크, 인증서 검증, 클라이언트 인증, 그리고 다운그레이드 거부. */
 mod tests {
     use super::*;
     use p256::pkcs8::DecodePrivateKey;
@@ -2718,11 +2474,8 @@ mod tests {
     use std::thread;
 
     #[test]
-    /**
-     * @brief 레코드 경계의 종료와 레코드 중간의 종료를 구분하는지.
-     * @details 위층은 경계의 종료만 정상 종료로 볼 수 있다. 중간에서 끊긴 것까지 같게 보면
-     *          잘린 레코드를 알아차리지 못한다.
-     */
+    /// Upper layers may treat only an EOF at a record boundary as a clean close; treating a
+    /// mid-record EOF the same would miss a truncation.
     fn read_record_separates_boundary_eof_from_truncation() {
         assert_eq!(read_record(&mut &[][..]).unwrap_err(), TlsError::Eof);
         assert_eq!(
@@ -2737,7 +2490,6 @@ mod tests {
         assert_eq!(record.fragment, vec![7, 8]);
     }
 
-    /** @brief TLS 1.3 응용 레코드 테스트용 연결. */
     fn test_tls13_connection() -> TlsConnection {
         let secret = vec![0x42; Hash::Sha256.len()];
         let (key, iv) = traffic_keys(Hash::Sha256, &secret, 16);
@@ -2770,7 +2522,6 @@ mod tests {
         }
     }
 
-    /** @brief 입출력이 불리면 즉시 실패하는 테스트용 스트림. */
     struct NoIo;
 
     impl Read for NoIo {
@@ -2789,7 +2540,6 @@ mod tests {
         }
     }
 
-    /** @brief 보호된 레코드를 테스트 연결이 읽을 바이트로 만든다. */
     fn encrypted_records(records: &[(ContentType, &[u8])]) -> std::io::Cursor<Vec<u8>> {
         let secret = vec![0x42; Hash::Sha256.len()];
         let (key, iv) = traffic_keys(Hash::Sha256, &secret, 16);
@@ -2805,12 +2555,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 정상 종료와 치명적 오류를 구분하는지. 합치면 정상 종료가 오류로 보인다.
-     * @details 경고 수준의 user_canceled 도 종료 경고라서 오류가 아니다. 그 레코드만 왔으면
-     *          뒤따르는 close_notify 를 마저 읽도록 아무 결과도 내지 않는다. 1.3 은 수준 값을 쓰지
-     *          않으므로 치명 수준이어도 같다.
-     */
+    /// A warning-level user_canceled is a closure alert, not an error; a record holding only that
+    /// yields nothing so the following close_notify is read. In 1.3 the level is ignored.
     fn close_notify_is_distinct_from_fatal_alerts() {
         let handshake_failure = TlsError::PeerAlert {
             level: 2,
@@ -2840,10 +2586,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief user_canceled 뒤에 오는 레코드를 이어 읽는지.
-     * @details 응용 데이터, 핸드셰이크 메시지, 평문 핸드셰이크 모두 같은 규칙을 따른다.
-     */
     fn user_canceled_does_not_end_the_read() {
         let canceled = (ContentType::Alert, &[1, ALERT_USER_CANCELED][..]);
         assert_eq!(
@@ -2893,11 +2635,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 안전한 기본 재개 설정이 0-RTT를 받지 않는지.
-     * @details 이 크레이트에는 안티리플레이가 없으므로 0이 정책이 아니라 정확성 조건이다.
-     *          올리려면 일회용 티켓이나 freshness 구간을 먼저 만들어야 한다.
-     */
+    /// Without anti-replay, 0 is a correctness condition, not a policy.
     fn secure_resumption_default_refuses_early_data() {
         assert_eq!(
             ServerResumption::secure_default().max_early_data,
@@ -2907,7 +2645,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 응용 버퍼가 네트워크 I/O를 일으키지 않는지. */
     fn tls_stream_empty_io_is_side_effect_free() {
         let mut stream = TlsStream::new(test_tls13_connection(), NoIo);
         assert_eq!(stream.read(&mut []).unwrap(), 0);
@@ -2915,7 +2652,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 application record 홍수를 제한하되 경계 안의 데이터는 받는지. */
     fn consecutive_empty_application_records_are_bounded() {
         let mut allowed = vec![(ContentType::ApplicationData, &[][..]); 32];
         allowed.push((ContentType::ApplicationData, b"dns"));
@@ -2932,7 +2668,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 알 수 없는 보호 content type과 빈 handshake를 무시하지 않는지. */
     fn invalid_protected_content_types_fail_closed() {
         assert_eq!(
             test_tls13_connection().read_app(&mut encrypted_records(&[(ContentType(0xff), b"x")])),
@@ -2957,7 +2692,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재개를 쓰지 않는 클라이언트가 올바른 티켓만 경계와 무관하게 무시하는지. */
     fn post_handshake_ticket_is_validated_across_records() {
         let ticket = crate::msg::NewSessionTicket {
             lifetime_secs: 60,
@@ -3024,7 +2758,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 핸드셰이크 중 예상 밖의 보호 레코드를 조용히 버리지 않는지. */
     fn encrypted_handshake_reader_rejects_unexpected_records() {
         for (content_type, plaintext, expected) in [
             (
@@ -3061,7 +2794,6 @@ mod tests {
         }
     }
 
-    /** @brief encrypted_records 와 테스트 연결이 쓰는 키로 레코드를 푸는 상대 쪽 보호. */
     fn test_peer_crypto() -> RecordCrypto {
         let secret = vec![0x42; Hash::Sha256.len()];
         let (key, iv) = traffic_keys(Hash::Sha256, &secret, 16);
@@ -3069,11 +2801,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크 실패를 그 시점의 송신 보호로 알리는지.
-     * @details 아무것도 보내기 전이면 상대는 이 연결을 모르므로 알리지 않는다. 입출력 실패와
-     *          상대가 보낸 경고에는 답하지 않는다.
-     */
+    /// Before anything is sent the peer does not know the connection, so nothing is sent. I/O
+    /// failures and peer alerts get no reply.
     fn handshake_failure_alert_follows_the_write_protection() {
         let fail = |error: TlsError| {
             move |_: &mut Vec<u8>, _: &mut HandshakeWrite| -> Result<TlsConnection, TlsError> {
@@ -3127,11 +2856,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 받은 레코드 때문에 실패한 연결이 치명 경고를 보낸 뒤 아무것도 주고받지 않는지.
-     * @details RFC 8446 은 치명 경고를 주고받은 연결에서 더는 아무것도 보내거나 받지 못하게
-     *          한다. 상대가 보낸 치명 경고에는 답하지 않고, 끊긴 연결은 실패 상태로 두지 않는다.
-     */
+    /// A fatal alert from the peer gets no reply, and a dropped connection is not marked failed.
     fn fatal_alert_ends_the_connection() {
         let mut conn = test_tls13_connection();
         let mut wire = encrypted_records(&[(ContentType(0xff), b"x")]);
@@ -3178,11 +2903,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 인증서를 거부한 연결이 certificate_unknown 치명 경고를 한 번 보내고 더는 쓰지
-     *        않는지.
-     * @details 경고 없이 연결만 끊으면 상대는 거부와 중간에서 잘린 연결을 구분하지 못한다.
-     */
     fn rejected_peer_certificate_sends_certificate_unknown() {
         let mut conn = test_tls13_connection();
         let mut wire = Vec::new();
@@ -3202,13 +2922,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 레코드를 다 보내지 못한 연결이 그 뒤로 아무것도 쓰지 않는지.
-     * @details 일부만 나간 레코드 뒤에 쓰는 레코드는 상대가 앞 레코드의 나머지로 읽는다. 그 뒤에
-     *          close_notify 를 덧붙이면 상대는 정상 종료 대신 인증 실패를 본다.
-     */
+    /// After a partial record, the peer would read the next record as its rest; a trailing
+    /// close_notify would show up as an authentication failure instead of a clean close.
     fn unfinished_record_write_stops_later_writes() {
-        /** @brief 정해진 바이트만 받고 그 뒤로는 막히는 송신 버퍼. */
+        /// Accepts a fixed number of bytes, then blocks.
         struct SendBuffer(usize);
 
         impl Write for SendBuffer {
@@ -3243,7 +2960,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 와이어에 담기지 않는 설정을 핸드셰이크 전에 거부하는지. */
     fn invalid_wire_configuration_is_rejected_before_handshake() {
         let mut cfg = ClientConfig {
             server_name: "dns.example".to_string(),
@@ -3291,7 +3007,6 @@ mod tests {
         assert!(!server_config_wire_is_valid(&server));
     }
 
-    /** @brief 테스트용 1.2 인사말 짝. */
     fn valid_tls12_hellos() -> (ClientConfig, ClientHello, ServerHello) {
         let cfg = ClientConfig {
             server_name: "dns.example".to_string(),
@@ -3328,7 +3043,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다운그레이드과 제안하지 않은 값을 거부하는지. */
     fn tls12_hello_validation_rejects_downgrade_and_unsolicited_values() {
         let (cfg, mut ch, mut sh) = valid_tls12_hellos();
         assert!(validate_tls12_client_hello(&ch, ECDSA_SECP256R1_SHA256).is_ok());
@@ -3382,11 +3096,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.2 서버 인사말의 확장마다 거절 사유가 경고 종류와 맞는지.
-     * @details 점 형식 목록은 압축하지 않은 형식이 들어 있으면 순서와 개수에 상관없이 받아들인다.
-     *          형식이 맞는 목록을 거절할 경고는 규격에 없다.
-     */
+    /// A point format list containing uncompressed is accepted in any order and count; no alert
+    /// fits refusing a well-formed list.
     fn tls12_server_hello_rejections_name_the_matching_alert() {
         let (cfg, ch, sh) = valid_tls12_hellos();
         let with = |ext_type: u16, data: Vec<u8>| {
@@ -3442,10 +3153,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.2 서버가 클라이언트가 보낸 경우에만 점 형식 확장으로 답하고, 압축하지 않은
-     *        형식이 빠진 목록에는 답하지 않는지.
-     */
     fn tls12_server_answers_point_formats_only_when_offered() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig::from_pkcs8(
@@ -3490,15 +3197,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.2 로 답하는 서버가 server random 끝에 다운그레이드 표식을 넣고, RFC 가 허용하는
-     *        인사말 변형에도 답하는지.
-     * @details RFC 8446 은 1.3 을 지원하는 서버가 1.2 로 협상하면 표식을 넣게 한다.
-     *          supported_versions 없이 legacy_version 이 1.2 보다 높으면 1.2 로 협상한다.
-     *          압축 방식 목록에는 무압축이 들어 있기만 하면 되고, 첫 연결의 재협상 정보는
-     *          RFC 5746 대로 SCSV 로 알려도 된다. legacy_version 이 SSL 3.0 이하면 무엇을
-     *          제안했든 protocol_version 으로 거부한다.
-     */
+    /// supported_versions absent with legacy_version above 1.2 negotiates 1.2. legacy_version of
+    /// SSL 3.0 or lower is refused with protocol_version whatever else is offered.
     fn tls12_server_marks_downgrade_and_accepts_rfc_variants() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig::from_pkcs8(
@@ -3587,7 +3287,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 비정규 더미 레코드와 어긋난 순서를 거부하는지. */
     fn tls12_rejects_noncanonical_ccs_finished_and_server_flight_order() {
         let valid_finished = HandshakeMsg::new(HandshakeType::Finished, vec![1; 12]).encode();
         assert!(parse_exact_handshake(&valid_finished).is_ok());
@@ -3647,7 +3346,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 쓰기가 평문 상한에 맞춰 나뉘는지. */
     fn application_writes_are_fragmented_to_tls_plaintext_limits() {
         let key = vec![0x33; 16];
         let iv = [0x44; 12];
@@ -3688,7 +3386,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 평문 handshake를 여러 레코드로 나누는지. */
     fn plaintext_handshake_is_fragmented_at_the_record_limit() {
         let payload = vec![0x5a; MAX_FRAGMENT + 17];
         let mut wire = Vec::new();
@@ -3709,7 +3406,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 보호 handshake도 암호화 전에 레코드 경계로 나누는지. */
     fn encrypted_handshake_is_fragmented_at_the_record_limit() {
         let key = vec![0x33; 16];
         let iv = [0x44; 12];
@@ -3740,7 +3436,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한과 정확히 같은 크기를 받아들이는지. */
     fn full_size_tls13_plaintext_is_accepted() {
         let key = vec![0x55; 16];
         let iv = [0x66; 12];
@@ -3755,7 +3450,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증됐어도 상한을 넘는 평문을 거부하는지. */
     fn authenticated_oversized_tls13_plaintext_is_rejected() {
         let key = vec![0x55; 16];
         let iv = [0x66; 12];
@@ -3779,7 +3473,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 소켓 위에서 1.3 핸드셰이크가 끝나는지. */
     fn full_tls13_handshake_over_tcp() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -3831,7 +3524,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요청형·사용량 경계 KeyUpdate 뒤 양방향 새 키가 실제 TCP에서 맞는지. */
     fn tls13_key_update_rotates_both_directions() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(
@@ -3878,7 +3570,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HRR 뒤 정상 티켓 재접속도 인증서 서명 없이 PSK-DHE로 끝나는지. */
     fn blocking_tls13_hrr_resumption_skips_certificate_flight() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3963,7 +3654,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 연결이 발급한 티켓으로 두 번째 blocking TLS 연결이 재개되는지. */
     fn blocking_tls13_ticket_issue_and_resume_roundtrip() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let mut server_cfg = ServerConfig::from_pkcs8(
@@ -4022,7 +3712,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 SNI에서 발급한 정상 인증 티켓도 재개에 쓰지 않는지. */
     fn blocking_tls13_ticket_is_bound_to_server_name() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let ticketer = Arc::new(crate::session::Ticketer::from_key([0x7c; 32]));
@@ -4124,7 +3813,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 16KiB보다 큰 실제 인증서 메시지가 레코드 경계를 넘어 핸드셰이크되는지. */
     fn large_certificate_handshake_spans_tls13_records() {
         use rcgen::{CertificateParams, CustomExtension, KeyPair};
 
@@ -4163,11 +3851,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 이름이 다르면 거부하고 그 사유를 핸드셰이크 키로 보호해 알리는지.
-     * @details ServerHello 를 처리한 클라이언트는 핸드셰이크 키를 가졌으므로 경고도 그 키로
-     *          보호한다. 서버는 그 키로 풀어 bad_certificate 를 읽어야 한다.
-     */
+    /// The client has handshake keys after the ServerHello, so its alert is protected with them and
+    /// the server must decrypt it to read bad_certificate.
     fn wrong_hostname_rejected() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -4218,10 +3903,8 @@ mod tests {
             ContentType::ApplicationData,
             "ServerHello 를 처리한 뒤의 경고를 평문으로 보냈습니다"
         );
-        /*
-         * 읽지 않은 서버 응답이 남은 채로 소켓을 닫으면 RST 가 나가 서버가 경고를 읽기 전에
-         * 연결이 끊길 수 있다. 서버가 끝난 뒤에 닫는다.
-         */
+        // Closing with unread server data sends RST, which can drop the connection before the
+        // server reads the alert; close after the server ends.
         assert_eq!(
             server.join().unwrap(),
             Some(TlsError::PeerAlert {
@@ -4233,7 +3916,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 체인이 이쪽 저장소까지 이어지는지 확인하는지. */
     fn handshake_verifies_chain_to_trust_store() {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -4329,10 +4011,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 루트가 바로 발급한 리프 뒤에 이름이 같은 가짜 루트를 붙여 보내도, 연결이 보관하는
-     *        검증 경로는 이쪽 저장소의 루트로 끝나는지. 1.3과 1.2 모두 본다.
-     */
+    /// A leaf issued by the root, followed by a fake root with the same name, still yields a
+    /// verified path ending at the stored root, in 1.3 and 1.2.
     fn verified_chain_ends_at_the_stored_root_not_a_presented_impostor() {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -4415,7 +4095,6 @@ mod tests {
         }
     }
 
-    /** @brief 클라이언트 인증 테스트용 CA와 리프. */
     fn mtls_ca_and_leaf(cn: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let ca_key = KeyPair::generate().unwrap();
@@ -4436,7 +4115,6 @@ mod tests {
         )
     }
 
-    /** @brief 검증을 끈 테스트용 클라이언트. */
     fn insecure_test_client(server_name: &str) -> ClientConfig {
         ClientConfig {
             server_name: server_name.to_string(),
@@ -4448,11 +4126,9 @@ mod tests {
         }
     }
 
-    /** @brief 이쪽이 쓴 바이트를 남겨 두는 테스트용 스트림. */
+    /// Keeps the bytes this side wrote.
     struct Recorded<S> {
-        /** @brief 실제로 주고받는 스트림. */
         inner: S,
-        /** @brief 지금까지 쓴 바이트. */
         written: Vec<u8>,
     }
 
@@ -4474,7 +4150,6 @@ mod tests {
         }
     }
 
-    /** @brief 남겨 둔 바이트에서 마지막 레코드를 꺼낸다. */
     fn last_written_record(mut wire: &[u8]) -> TlsRecord {
         let mut last = None;
         while !wire.is_empty() {
@@ -4483,7 +4158,6 @@ mod tests {
         last.expect("쓴 레코드가 없습니다")
     }
 
-    /** @brief 클라이언트 인증을 켠 테스트용 서버 설정. */
     fn mtls_server_cfg(client_ca: Option<crate::trust::TrustStore>) -> ServerConfig {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -4494,7 +4168,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트 인증이 되는지. */
     fn mtls_handshake_with_client_cert() {
         use crate::trust::TrustStore;
         let (ca_der, leaf_der, leaf_key) = mtls_ca_and_leaf("client.example");
@@ -4520,7 +4193,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증서 없는 클라이언트를 거부하는지. */
     fn mtls_rejects_client_without_cert() {
         use crate::trust::TrustStore;
         let (ca_der, _, _) = mtls_ca_and_leaf("client.example");
@@ -4539,10 +4211,8 @@ mod tests {
         });
 
         let mut c = TcpStream::connect(addr).unwrap();
-        /*
-         * 서버가 경고를 보내지 않으면 클라이언트는 응답을, 서버는 연결 종료를 서로 기다린다.
-         * 멈추지 않고 실패하도록 읽기 한도를 둔다.
-         */
+        // Without an alert the client waits for a reply and the server for the close; the timeout
+        // makes the test fail instead of hanging.
         c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
         let client_cfg = insecure_test_client("localhost");
@@ -4562,7 +4232,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 CA가 발급한 클라이언트 인증서를 unknown_ca 로 거부하는지. */
     fn mtls_rejects_untrusted_client_cert() {
         use crate::trust::TrustStore;
         let (trusted_ca, _, _) = mtls_ca_and_leaf("good.example");
@@ -4588,7 +4257,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 공유가 없으면 다시 시도를 거쳐 끝나는지. */
     fn hrr_round_trip_when_client_omits_key_share() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -4615,7 +4283,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 공유가 있으면 왕복 하나로 끝나는지. */
     fn normal_handshake_no_hrr_when_key_share_present() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -4638,11 +4305,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 주소로 붙을 때는 SNI 를 보내지 않고, 이름은 끝 점 없이 보내는지.
-     * @details RFC 6066 은 SNI 에 주소를 넣지 못하게 한다. 이를 엄격하게 지키는 서버는 주소가 든
-     *          SNI 를 받으면 핸드셰이크를 끊는다.
-     */
+    /// Servers that enforce RFC 6066 strictly drop the handshake on an address in SNI.
     fn client_hello_names_only_host_names() {
         let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
         let sni = |server_name: &str| {
@@ -4657,11 +4320,9 @@ mod tests {
         assert_eq!(sni("dns.example."), Some("dns.example".to_string()));
     }
 
-    /** @brief 정해 둔 바이트만 읽히고 쓴 바이트는 모아 두는 스트림. */
     struct Scripted {
-        /** @brief 서버가 읽을 바이트. 다 읽으면 연결이 닫힌 것과 같다. */
+        /// Reaching the end reads as a closed connection.
         input: std::io::Cursor<Vec<u8>>,
-        /** @brief 서버가 쓴 바이트. */
         output: Vec<u8>,
     }
 
@@ -4682,12 +4343,8 @@ mod tests {
         }
     }
 
-    /**
-     * @brief 클라이언트 인사말 하나를 받은 서버가 처음 보내는 ServerHello. 다시 시도 요청도
-     *        같은 형식이므로 여기에 들어간다.
-     * @details 답한 뒤에는 더 읽을 바이트가 없어 핸드셰이크가 실패하지만, 첫 레코드는 그 전에
-     *          이미 나간다.
-     */
+    /// A HelloRetryRequest has the same format, so it counts. The handshake then fails for lack of
+    /// input, but the first record is already out.
     fn first_server_hello(cfg: &ServerConfig, client_hello: Vec<u8>) -> Option<ServerHello> {
         let mut stream = Scripted {
             input: std::io::Cursor::new(
@@ -4704,7 +4361,6 @@ mod tests {
         ServerHello::from_handshake(&message).ok()
     }
 
-    /** @brief 인사말의 서명 방식 목록에서 그 방식을 뺀다. */
     fn withdraw_signature_scheme(hello: &mut ClientHello, scheme: u16) {
         let extension = hello
             .extensions
@@ -4721,11 +4377,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 형식이 깨졌거나 RFC 8446 이 요구하는 확장이 빠진 인사말, 이쪽 인증서의 서명
-     *        방식을 제안하지 않은 인사말에는 ServerHello 도 다시 시도 요청도 보내지 않는지.
-     *        해석하지 않는 확장은 내용이 무엇이든 답한다.
-     */
+    /// Extensions this side does not parse are answered whatever they contain.
     fn server_answers_only_acceptable_client_hellos() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig::from_pkcs8(
@@ -4824,12 +4476,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.3 서버가 P-256 키 교환도 받아들이고, 쓸 수 있는 키 조각이 없으면 클라이언트가
-     *        지원하는 곡선 가운데 이쪽이 지원하는 것으로 다시 시도를 요청하는지.
-     * @details RFC 8446 은 secp256r1 키 교환을 반드시 지원하게 한다. 두 곡선의 조각이 모두
-     *          있으면 X25519 를 고른다. 재시도 인사말에서는 요청한 곡선의 조각 하나만 받는다.
-     */
+    /// With shares for both groups X25519 is chosen; the retried hello must carry one share for the
+    /// requested group.
     fn tls13_server_negotiates_p256_key_exchange() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig::from_pkcs8(
@@ -4907,10 +4555,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 받아들일 수 없는 인사말을 받은 서버가 그 사유를 평문 경고 하나로 알리는지.
-     * @details ServerHello 를 보내기 전이라 양쪽 모두 핸드셰이크 키가 없다.
-     */
+    /// Before the ServerHello neither side has handshake keys.
     fn rejected_client_hello_is_answered_with_a_plaintext_alert() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig {
@@ -4972,13 +4617,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 평문 핸드셰이크 레코드를 RFC 8446 의 한도대로 읽고, 그 사유를 평문 경고로
-     *        알리는지.
-     * @details 첫 ClientHello 앞의 ChangeCipherSpec 과 빈 핸드셰이크 레코드는 unexpected_message,
-     *          2^14 바이트를 넘는 평문은 record_overflow 다. ClientHello 다음에는 키가 바뀌므로 그
-     *          뒤에 바이트가 남아도 unexpected_message 다.
-     */
+    /// A ChangeCipherSpec before the first ClientHello and an empty handshake record are
+    /// unexpected_message, plaintext over 2^14 bytes is record_overflow, and leftover bytes after
+    /// the ClientHello are unexpected_message because keys change there.
     fn server_reads_plaintext_handshake_records_within_rfc_8446_limits() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cfg = ServerConfig::from_pkcs8(
@@ -5029,13 +4670,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 키가 바뀌기 전의 마지막 핸드셰이크 메시지 뒤에 바이트가 남으면 unexpected_message 로
-     *        끊는지.
-     * @details RFC 8446 은 키 변경 앞의 메시지가 레코드 경계에서 끝나게 한다. 남은 바이트는 새
-     *          키로 읽을 수 없다. 클라이언트는 ServerHello 와 다시 시도 요청 뒤, 양쪽은 상대의
-     *          Finished 뒤를 확인한다.
-     */
+    /// The client checks after ServerHello and HelloRetryRequest, both sides after the peer's
+    /// Finished.
     fn handshake_messages_before_a_key_change_end_at_a_record_boundary() {
         let finished = HandshakeMsg::new(HandshakeType::Finished, vec![7; 32]).encode();
         let secret = vec![0x42; Hash::Sha256.len()];
@@ -5096,10 +4732,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 입출력 실패와 상대가 보낸 경고에는 경고로 답하지 않는지.
-     * @details 끊긴 연결에는 보낼 곳이 없고, 치명 경고를 받은 연결에서는 더 보내지 않는다.
-     */
+    /// A dropped connection has nowhere to send, and nothing more goes out after a fatal alert.
     fn handshake_does_not_answer_eof_io_or_peer_alerts() {
         let cfg = insecure_test_client("localhost");
         for (input, expected) in [
@@ -5135,11 +4768,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 티켓으로 재개하면 인증서로 서명하지 않으므로, 이쪽 서명 방식을 제안하지 않은
-     *        인사말에도 재개로 답하는지. 키 공유가 비어 있어도 재개로 마칠 수 있으므로 다시
-     *        시도를 요청해야 한다.
-     */
+    /// A resumption does not sign with the certificate. An empty key share can still finish as a
+    /// resumption, so a retry must be requested.
     fn resumption_does_not_need_the_certificate_signature_scheme() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let ticketer = Arc::new(crate::session::Ticketer::from_key([0x5b; 32]));
@@ -5210,12 +4840,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 티켓을 받은 스위트와 해시가 같은 다른 스위트로도 재개하고, 해시가 다르면 처음부터
-     *        핸드셰이크하는지.
-     * @details RFC 8446 은 PSK 와 해시가 같은 스위트면 재개를 허용한다. 서버는 자기 선호대로
-     *          스위트를 고르므로, ChaCha20 티켓을 제시해도 AES-128 로 답한다.
-     */
+    /// The server picks its preferred suite, so a ChaCha20 ticket resumes as AES-128.
     fn tcp_resumption_needs_only_the_same_hash() {
         for (ticket_suite, resumed) in [
             (TLS_CHACHA20_POLY1305_SHA256, true),
@@ -5289,11 +4914,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.3 클라이언트가 RSA 서버의 CertificateVerify 중 RSA PKCS#1 이나 제안하지 않은
-     *        방식의 서명을 illegal_parameter 로 거부하고, 제안한 PSS 서명은 받아들이는지.
-     * @details 서명 자체는 모두 맞다. 키 종류가 맞는 방식이라 서명 방식 검사만 이를 거부한다.
-     */
+    /// Every signature is valid and the key type matches, so only the scheme check refuses them.
     fn tcp_client_accepts_only_certificate_verify_schemes_rfc_8446_allows() {
         let (certificate, key) = crate::cert::rsa_test_certificate("localhost");
         for (scheme, expected) in [
@@ -5327,10 +4948,8 @@ mod tests {
                 level: 2,
                 description: 47,
             });
-            /*
-             * 클라이언트는 서버 Finished 를 읽지 않은 채 실패한다. 그대로 소켓을 닫으면 RST 가
-             * 나가 서버가 경고를 읽기 전에 연결이 끊길 수 있으므로 서버가 끝난 뒤에 닫는다.
-             */
+            // The client fails before reading the server Finished; closing now would send RST
+            // before the server reads the alert, so close after the server ends.
             assert_eq!(
                 server.join().unwrap(),
                 peer_alert,
@@ -5341,12 +4960,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 다시 시도 요청이 제안한 다른 곡선을 고르거나 쿠키만 담았을 때 클라이언트가
-     *        핸드셰이크를 이어 가는지.
-     * @details 다른 곡선을 고르면 그 곡선의 키 조각 하나만 보내고, 쿠키만 담았으면 첫 키 조각을
-     *          그대로 두고 쿠키를 더한다. 두 번째 인사말을 받은 서버는 연결을 닫는다.
-     */
+    /// Another group means one share for that group; a cookie alone keeps the first share and adds
+    /// the cookie. The server closes after the second hello.
     fn tcp_client_follows_retry_requests_for_another_group_or_a_cookie() {
         for retry in [
             Extension::key_share_hrr(SECP256R1),
@@ -5408,7 +5023,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소로 붙어 SNI 없이 시작한 핸드셰이크가 끝나는지. */
     fn handshake_by_address_completes_without_sni() {
         let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(
@@ -5431,7 +5045,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /** @brief 1.2만 제안하는 테스트용 클라이언트 핸드셰이크. */
     fn client_handshake_force_tls12<S: Read + Write>(
         s: &mut S,
         cfg: &ClientConfig,
@@ -5471,7 +5084,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 소켓 위에서 1.2 핸드셰이크가 끝나는지. */
     fn full_tls12_handshake_over_tcp() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(
@@ -5502,7 +5114,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 1.2에서도 체인 검증과 프로토콜 협상이 되는지. */
     fn tls12_chain_verification_and_alpn() {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -5552,11 +5163,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.2에서도 이름이 다르면 거부하고 그 사유를 평문 경고로 알리는지.
-     * @details 1.2 클라이언트는 ChangeCipherSpec 을 보내기 전까지 평문으로 보낸다. 보호해서
-     *          보내면 서버는 그 레코드를 풀 키가 없다.
-     */
+    /// A 1.2 client sends plaintext until its ChangeCipherSpec; a protected alert would be
+    /// unreadable to the server.
     fn tls12_wrong_hostname_rejected() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(
@@ -5589,10 +5197,8 @@ mod tests {
         let alert = last_written_record(&c.written);
         assert_eq!(alert.content_type, ContentType::Alert);
         assert_eq!(alert.fragment, [2, 42]);
-        /*
-         * 읽지 않은 서버 응답이 남은 채로 소켓을 닫으면 RST 가 나가 서버가 경고를 읽기 전에
-         * 연결이 끊길 수 있다. 서버가 끝난 뒤에 닫는다.
-         */
+        // Closing with unread server data sends RST, which can drop the connection before the
+        // server reads the alert; close after the server ends.
         assert_eq!(
             server.join().unwrap(),
             Some(TlsError::PeerAlert {
@@ -5604,7 +5210,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보통 클라이언트가 여전히 1.3을 먼저 시도하는지. */
     fn normal_client_still_prefers_tls13() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let server_cfg = ServerConfig::from_pkcs8(

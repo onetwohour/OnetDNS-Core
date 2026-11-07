@@ -1,13 +1,8 @@
-/*!
- * @brief 반복 질의 재귀 해석.
- *
- * @details 루트에서 시작해 위임을 따라 내려가며 스스로 답을 찾는다. 업스트림에 맡기지 않으므로
- *          어느 서버를 믿을지 이 서버가 직접 판단해야 하고, 그 판단이 이 크레이트의 대부분이다.
- * @warning bailiwick이 핵심 안전 속성이다. 참조는 질의 이름 쪽으로 더 가까워지고 현재
- *          zone 안일 때만 따라간다. 이 검사가 느슨하면 어떤 서버든 남의 zone을 가로챌 수 있다.
- * @note 예산 상한이 여럿이다. 참조·CNAME·DNAME·부수 질의 횟수가 각각 묶여 있어야 질의
- *       한 건이 이 서버를 무한정 붙잡지 못한다.
- */
+//! Iterative recursive resolution: walks delegations down from the root and decides itself which
+//! servers to trust. Bailiwick is the core safety property: a referral is followed only when it
+//! moves toward the query name and stays inside the current zone; a looser check would let any
+//! server hijack another zone. Referrals, CNAMEs, DNAMEs and side queries each have a budget, so
+//! one query cannot hold this server indefinitely.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -19,9 +14,8 @@ use onetdns_proto::{
     ResponseCode,
 };
 
-/** @brief 진단 추적이 켜졌는지. 환경 변수를 한 번만 읽어 기억한다. */
+/// Reads the environment variable once.
 fn recurse_trace_enabled() -> bool {
-    /** @brief 한 번만 읽어 둔 판정. */
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| std::env::var_os("ONETDNS_RECURSE_TRACE").is_some())
 }
@@ -34,35 +28,29 @@ macro_rules! rtrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 재귀 해석 실패 사유. */
 pub enum RecurseError {
-    /** @brief 루트 서버 목록이 비어 있다. */
     NoRoots,
 
-    /** @brief 아무 서버도 답하지 않았다. */
     NoResponse,
 
-    /** @brief 참조 예산을 다 썼다. 위임 순환에 걸렸을 수 있다. */
+    /// Referral budget spent; possibly a delegation loop.
     TooManyReferrals,
 
-    /** @brief CNAME 체인이 예산을 넘었다. */
     TooManyCnames,
 
-    /** @brief DNAME 체인이 예산을 넘었다. */
     TooManyDnames,
 
-    /** @brief 네임서버 주소를 푸는 부수 질의가 예산을 넘었다. */
+    /// Side queries resolving name server addresses exceeded their budget.
     TooManyQueries,
 
-    /** @brief 위임된 서버가 전부 응답하지 않거나 권한이 없다. 이 실패는 질의자에게 그대로 전한다. */
+    /// Every delegated server failed to answer or was lame; passed on to the client as is.
     NoReachableNs,
 
-    /** @brief DNSSEC 검증이 깨졌다. 응답을 내보내면 안 된다. */
+    /// DNSSEC validation failed; the answer must not go out.
     Bogus,
 }
 
 impl std::fmt::Display for RecurseError {
-    /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             RecurseError::NoRoots => "No root server hints",
@@ -82,27 +70,21 @@ impl std::error::Error for RecurseError {}
 
 thread_local! {
 
-    /** @brief 클라이언트가 검증을 끄라고 했는지. 질의마다 설정한다. */
+    /// Per query: whether the client asked to skip validation.
     static HONOR_CD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/**
- * @brief 지금 이 스레드가 CD 비트를 존중하는 중인지.
- * @details 질의자가 CD를 설정하면 검증을 건너뛰고 답을 그대로 준다. 이 상태를 인자로
- *          모든 함수에 흘리는 대신 스레드 지역 값으로 둔다.
- */
+/// Thread-local so the CD state does not have to be threaded through every call.
 fn honor_cd_active() -> bool {
     HONOR_CD.with(|h| h.get())
 }
 
-/** @brief CD 존중 상태를 잠시 바꿨다가 되돌리는 범위 보호자. */
+/// Restores the previous CD state on drop, also when nested.
 struct HonorCdScope {
-    /** @brief 이곳에 들어오기 전의 값. 나갈 때 되돌린다. */
     previous: bool,
 }
 
 impl HonorCdScope {
-    /** @brief 상태를 바꾸고 이전 값을 기억한다. */
     fn enter(honor: bool) -> Self {
         Self {
             previous: HONOR_CD.with(|state| state.replace(honor)),
@@ -111,141 +93,108 @@ impl HonorCdScope {
 }
 
 impl Drop for HonorCdScope {
-    /** @brief 이전 값으로 되돌린다. 중첩 호출에서도 상태가 새지 않는다. */
     fn drop(&mut self) {
         HONOR_CD.with(|state| state.set(self.previous));
     }
 }
 
-/** @brief 주어진 CD 존중 상태로 클로저를 실행한다. */
 fn with_honor_cd<T>(honor: bool, f: impl FnOnce() -> T) -> T {
     let _scope = HonorCdScope::enter(honor);
     f()
 }
 
-/**
- * @brief 재귀 리졸버 하나. 캐시와 설정을 함께 가지고 있다.
- * @details 여러 스레드가 같은 인스턴스를 공유한다. 모든 캐시가 뮤텍스 뒤에 있고, 질의
- *          경로는 잠금을 짧게 잡았다 바로 놓는다.
- */
+/// Shared across threads; every cache sits behind a mutex held briefly on the query path.
 pub struct Recursor {
-    /** @brief 루트 서버 주소들. 여기서 모든 해석이 시작된다. */
     roots: Vec<SocketAddr>,
-    /** @brief 질의 하나의 전체 데드라인. 개별 왕복이 아니라 해석 전체에 걸린다. */
+    /// Deadline for the whole resolution, not each round trip.
     timeout: Duration,
 
-    /** @brief 업스트림에 접속할 포트. 테스트에서만 53이 아닌 값을 쓴다. */
+    /// Not 53 only in tests.
     port: u16,
-    /** @brief 따라갈 참조 수 상한. */
     max_referrals: usize,
-    /** @brief 따라갈 CNAME 수 상한. */
     max_cnames: usize,
-    /** @brief 따라갈 DNAME 수 상한. */
     max_dnames: usize,
 
-    /** @brief 네임서버 주소를 푸는 부수 질의 수 상한. 이것이 없으면 위임 체인 하나가 질의를 폭증시킨다. */
+    /// Without it, one delegation chain can multiply queries.
     max_ns_resolves: usize,
 
-    /** @brief 루트 신뢰 앵커. 자동 갱신이 켜지면 밖에서 바뀌므로 원자 교체로 둔다. */
+    /// Swapped atomically, since automatic updates change it from outside.
     trust_anchors: std::sync::Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
 
-    /** @brief 참이면 검증 실패를 전부 Bogus로 본다. */
+    /// Treats every validation failure as Bogus.
     strict: bool,
 
-    /** @brief 참이면 검증 실패를 알리되 응답은 준다. 진단용이며 운영에서는 쓰지 않는다. */
+    /// Reports validation failures but still answers. Diagnostic only, not for production.
     permissive: bool,
 
-    /** @brief 0x20 인코딩. 질의 이름의 대소문자를 섞어 응답 위조 난도를 올린다. */
+    /// 0x20 encoding: mixed-case query names make spoofing harder.
     caps_for_id: bool,
 
-    /**
-     * @brief 참이면 권한 서버에 TCP로만 묻는다.
-     * @details UDP 53번이 중간에서 가로채이는지는 인스턴스가 아니라 호스트 망의 성질이다.
-     *          설정을 다시 읽어 인스턴스를 새로 만들어도 판정이 이어지도록, 판정하는 쪽이
-     *          가진 값을 공유한다.
-     */
+    /// Asks authorities over TCP only. Whether UDP 53 is intercepted is a property of the host
+    /// network, so the flag is shared with whatever detects it and survives a rebuild on reload.
     authority_tcp: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    /** @brief 나가는 질의 이름을 소문자로 내린다. 캐시 적중률을 올리지만 0x20과는 함께 쓸 수 없다. */
+    /// Improves cache hits; cannot be combined with 0x20.
     lowercase_outgoing: bool,
 
-    /** @brief 참이면 질의자의 CD 비트를 무시하고 항상 검증한다. */
+    /// Always validates, ignoring the client's CD bit.
     ignore_cd: bool,
 
-    /** @brief 질의하지 않을 업스트림 주소 대역. */
     deny_servers: Vec<IpNet>,
 
-    /** @brief 비어 있지 않으면 이 대역만 질의한다. */
+    /// When non-empty, only these ranges are queried.
     allow_servers: Vec<IpNet>,
 
-    /** @brief IPv4 업스트림을 쓸지. */
     do_ip4: bool,
-    /** @brief IPv6 업스트림을 쓸지. */
     do_ip6: bool,
-    /** @brief IPv6를 먼저 시도할지. */
     prefer_ip6: bool,
-    /** @brief IPv4를 먼저 시도할지. */
     prefer_ip4: bool,
 
-    /** @brief 이름 최소화를 엄격히 할지. 느슨하면 일부 서버와의 호환을 위해 전체 이름으로 전환한다. */
+    /// Lenient mode falls back to the full name for servers that do not cope with minimization.
     qname_min_strict: bool,
 
-    /** @brief 참조 경로를 더 엄격히 본다. 업스트림 zone이 내려 준 네임서버만 인정한다. */
+    /// Accepts only name servers the upstream zone handed down.
     harden_referral_path: bool,
 
-    /** @brief 검증에서 뺄 도메인들. 운영자가 명시적으로 지정한 것만 들어간다. */
+    /// Only domains the operator lists explicitly.
     domain_insecure: Vec<Name>,
 
-    /** @brief 루트 키 센티널 질의에 답할지. 어떤 앵커를 쓰는지 밖에서 확인할 수 있게 한다. */
+    /// Lets outsiders check which anchor is in use.
     root_key_sentinel: bool,
 
-    /** @brief 받아들일 NSEC3 반복 상한. 이것을 넘는 zone은 검증하지 않는다. */
+    /// Zones above it are not validated.
     nsec3_max_iterations: u16,
 
-    /** @brief 캐시에 담을 TTL 상한. */
     recursive_cache_ttl_max: u32,
 
-    /**
-     * @brief 서버와 zone 쌍마다의 실패 기록. 어느 서버를 먼저 물을지 정하는 근거다.
-     * @note 무응답과 lame 응답은 서버가 그 zone을 제대로 맡고 있는지의 문제라 zone마다 따로 본다.
-     */
+    /// Failure history per server and zone, which orders the servers to ask. Timeouts and lame
+    /// answers concern whether the server serves that zone, so they are kept per zone.
     infra: std::sync::Mutex<LruMap<InfraKey, InfraStat>>,
 
-    /**
-     * @brief 주소마다의 평활 왕복 시간.
-     * @note 왕복 시간은 그 주소까지의 경로가 정하므로 zone과 무관하다. zone마다 따로 재면 한
-     *       zone에서 느리다고 잰 서버를 같은 서버가 맡은 부모 zone에서는 처음 보는 서버로 보고
-     *       가장 먼저 묻는다.
-     */
+    /// Smoothed RTT per address. RTT depends on the path, not the zone; measuring per zone would
+    /// treat a server known to be slow in one zone as new in its parent and ask it first.
     rtt: std::sync::Mutex<LruMap<IpAddr, u32>>,
 
-    /** @brief 네임서버 이름에서 주소로 가는 캐시. 부수 질의를 크게 줄인다. */
+    /// Saves most side queries.
     ns_addr_cache: std::sync::Mutex<LruMap<Vec<u8>, NsAddrEntry>>,
 
-    /** @brief zone별 위임 서버 캐시. 루트부터 다시 내려가지 않게 해 준다. */
+    /// Saves walking down from the root again.
     deleg_cache: std::sync::Mutex<LruMap<Vec<u8>, DelegationEntry>>,
 
-    /** @brief zone별 DNSKEY 응답 캐시. */
     dnskey_cache: std::sync::Mutex<LruMap<Vec<u8>, DnskeyEntry>>,
-    /** @brief 검증까지 끝난 키 캐시. 체인 전체를 매번 다시 걷지 않게 한다. */
+    /// Saves walking the whole chain each time.
     validated_keys: std::sync::Mutex<LruMap<Vec<u8>, ValidatedKeyEntry>>,
 
-    /** @brief 뒤에서 마저 해석 중인 질의. 같은 질의를 두 번 돌리지 않는다. */
+    /// Queries finishing in the background, so one is never run twice.
     background: std::sync::Mutex<HashSet<(Vec<u8>, RecordType)>>,
 }
 
-/**
- * @brief 뒤에서 동시에 마저 해석할 질의 수 상한.
- * @note 끝내지 못한 질의가 이보다 많이 쌓이면 권한 서버 쪽 망이 막힌 것이라, 더 돌려도 채울
- *       캐시 없이 스레드와 질의만 쓴다.
- */
+/// More unfinished queries than this means the authorities' network is jammed; more threads would
+/// spend queries without filling the cache.
 const MAX_BACKGROUND_COMPLETIONS: usize = 16;
 
-/**
- * @brief 뒤에서 마저 해석할 만한 결과인지.
- * @details 아무 서버도 답하지 않았거나, 해석 예산의 데드라인을 넘겨 실패한 경우다. 데드라인을
- *          넘긴 해석은 검증에 쓸 키를 받지 못해 SERVFAIL 응답으로 끝나기도 한다.
- */
+/// No server answered, or the resolution hit its deadline; past the deadline the keys for
+/// validation may be missing, which can also end in SERVFAIL.
 fn unfinished(result: &Result<(Message, NsContext), RecurseError>, deadline: Instant) -> bool {
     match result {
         Err(RecurseError::NoResponse) => true,
@@ -257,16 +206,13 @@ fn unfinished(result: &Result<(Message, NsContext), RecurseError>, deadline: Ins
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/** @brief 서버 통계의 키. 같은 주소라도 zone마다 응답성이 다르므로 둘을 함께 쓴다. */
+/// One address answers differently per zone, so both form the key.
 struct InfraKey {
-    /** @brief 서버 주소. */
     ip: IpAddr,
-    /** @brief 그 서버가 맡은 zone의 정규 키. */
     zone: Vec<u8>,
 }
 
 impl InfraKey {
-    /** @brief 주소와 zone으로 키를 만든다. */
     fn new(ip: IpAddr, zone: &Name) -> Self {
         Self {
             ip,
@@ -276,34 +222,26 @@ impl InfraKey {
 }
 
 #[derive(Default)]
-/** @brief 서버와 zone 쌍 하나의 실패 기록. */
 struct InfraStat {
-    /** @brief 마지막 실패 시각. 잠깐 뒤로 미루는 데 쓴다. */
+    /// For backing off briefly.
     last_fail: Option<Instant>,
 
-    /**
-     * @brief 성공 없이 이어진 전송 실패 횟수. 성공하면 기록째 지워진다.
-     * @note 서버가 내려간 동안 들어온 실패는 세지 않는다. 내려가기 직전에 함께 나간 질의들이
-     *       뒤늦게 실패하면서 묻지 않는 기간을 곧바로 최대로 올리지 않게 한다.
-     */
+    /// Transport failures since the last success, which clears the record. Failures arriving while
+    /// the server is down are not counted, so queries sent just before it went down do not push the
+    /// back-off straight to the maximum.
     consecutive_failures: u8,
 
-    /** @brief 마지막 프로토콜 오류 시각. 응답은 왔지만 쓸 수 없던 경우다. */
+    /// An answer came but could not be used.
     last_protocol_error: Option<Instant>,
 }
 
 impl InfraStat {
-    /** @brief 최근에 실패해 순위를 뒤로 미룰지. */
     fn cooling(&self, now: Instant) -> bool {
         self.failed_within(INFRA_FAIL_COOLDOWN, now)
     }
 
-    /**
-     * @brief 연달아 실패해 아예 묻지 않을지.
-     * @details SERVER_DOWN_AFTER_FAILURES번 연달아 실패하면 SERVER_DOWN_BASE 동안 묻지 않는다.
-     *          그 뒤 한 번 다시 물어 또 실패하면 기간을 두 배로 늘리고, SERVER_DOWN_MAX에서
-     *          멈춘다.
-     */
+    /// After `SERVER_DOWN_AFTER_FAILURES` failures in a row the server is skipped for
+    /// `SERVER_DOWN_BASE`. A failed retry afterwards doubles the period, up to `SERVER_DOWN_MAX`.
     fn down(&self, now: Instant) -> bool {
         let Some(extra) = self
             .consecutive_failures
@@ -317,83 +255,57 @@ impl InfraStat {
         self.failed_within(period, now)
     }
 
-    /** @brief 마지막 전송 실패가 period 안에 있었는지. */
     fn failed_within(&self, period: Duration, now: Instant) -> bool {
         self.last_fail
             .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < period)
     }
 }
 
-/** @brief 재 본 적 없는 서버에 매길 왕복 시간. 새 서버가 무조건 뒤로 밀리지 않게 한다. */
+/// So a new server is not pushed to the back.
 const DEFAULT_RTT_MS: u32 = 50;
 
-/**
- * @brief 처음 보는 서버의 답을 기다렸다가 다음 서버에도 물을 때까지의 시간.
- * @note 대부분의 권한 서버는 UDP로 이 안에 답한다. 더 짧으면 처음 보는 서버마다 질의가 두
- *       배로 나가고, 더 길면 답하지 않는 서버 하나에 그만큼씩 시간을 쓴다.
- */
+/// Wait for a new server before also asking the next. Most authorities answer over UDP within
+/// this; shorter doubles queries to every new server, longer wastes that much on a silent one.
 const UNKNOWN_SERVER_PATIENCE: Duration = Duration::from_millis(400);
 
-/**
- * @brief 질의 하나가 동시에 답을 기다리는 교환 수 상한.
- * @details 느린 서버 하나의 답을 기다리면서 다음 서버에 묻는 데는 둘이면 된다. 더 늘리면
- *          워커 하나가 동시에 걸어 두는 질의가 늘어, 응답을 한꺼번에 몰아오게 하는
- *          DNSBomb류 공격에 쓸 폭이 넓어진다.
- */
+/// Two suffice to wait on a slow server while asking the next. More would widen what a worker
+/// keeps in flight, which DNSBomb-style attacks use to make answers arrive at once.
 const MAX_EXCHANGES_PER_QUERY: usize = 2;
 
-/**
- * @brief 잰 왕복 시간이 아무리 짧아도 다음 서버에 묻기 전에 기다리는 시간.
- * @note 가까운 서버는 스케줄링 지연만으로 왕복 시간의 세 배를 넘길 수 있다. 그때마다 질의를
- *       두 번 보내지 않게 한다.
- */
+/// Even a near server can exceed three times its RTT from scheduling delay alone; this keeps that
+/// from sending every query twice.
 const MIN_SERVER_PATIENCE: Duration = Duration::from_millis(100);
 
-/** @brief 실패한 서버를 뒤로 미룰 기간. 지나면 다시 정상 순위로 돌아온다. */
+/// Afterwards the server returns to its normal rank.
 const INFRA_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
 
-/**
- * @brief 이만큼 연달아 전송에 실패한 서버는 잠시 묻지 않는다.
- * @details 한 번의 실패는 패킷 하나를 잃은 것일 수 있어 순위만 뒤로 미룬다. 여러 번 이어지면
- *          TCP를 받지 않는 서버처럼 지금 경로로는 닿지 않는 서버다. 그런 서버에 계속 물으면
- *          질의마다 제한 시간을 통째로 쓰고, 그동안 bin의 예비 경로(fallback_upstreams)로도
- *          넘어가지 못한다.
- */
+/// One failure may be a lost packet and only lowers the rank. Several in a row mean the server is
+/// unreachable on this path, like one refusing TCP; asking it would spend the full timeout on each
+/// query and keep the bin from reaching `fallback_upstreams`.
 const SERVER_DOWN_AFTER_FAILURES: u8 = 3;
 
-/** @brief 내려간 서버에 처음 묻지 않는 기간. bin이 실패 응답을 기억하는 최소 기간과 같다. */
+/// Equals the minimum time the bin remembers a failed answer.
 const SERVER_DOWN_BASE: Duration = Duration::from_secs(5);
 
-/**
- * @brief 내려간 서버에 묻지 않는 기간의 상한.
- * @note RFC 9520은 해석 실패를 기억하는 기간을 지수로 늘리되 5분을 넘기지 말라고 한다. 더
- *       길면 되살아난 서버를 늦게 알아챈다.
- */
+/// RFC 9520 has resolution failures remembered with exponential back-off, but no longer than five
+/// minutes; longer would notice a recovered server late.
 const SERVER_DOWN_MAX: Duration = Duration::from_secs(300);
 
-/** @brief 최근 실패한 서버에 더할 가상 지연. 순위를 크게 낮추되 완전히 배제하지는 않는다. */
+/// Lowers the rank a lot without excluding the server.
 const INFRA_FAIL_PENALTY_MS: u64 = 100_000;
-/** @brief 프로토콜 오류를 낸 서버에 더할 가상 지연. 무응답보다는 가볍게 본다. */
+/// Lighter than a timeout.
 const INFRA_PROTOCOL_PENALTY_MS: u64 = 10_000;
 
-/** @brief 서버 통계 캐시 크기. */
 const MAX_INFRA: usize = 50_000;
-/** @brief 설정으로 지정할 수 있는 네임서버 캐시 크기 상한. */
 const MAX_NS_CACHE_CONFIGURED: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
-/**
- * @brief 캐시 항목의 만료 시각.
- * @details 시스템 시계가 아니라 프로세스 단조 시계의 밀리초를 쓴다. 시계를 되돌려도
- *          만료가 뒤틀리지 않는다.
- */
+/// In monotonic process milliseconds, so a system clock change does not skew expiry.
 struct TtlLifetime {
-    /** @brief 단조 시계 기준 만료 시각. */
     expires_at_millis: u64,
 }
 
 impl TtlLifetime {
-    /** @brief TTL 초에서 만료 시각을 만든다. */
     fn new(ttl_secs: u32) -> Self {
         Self {
             expires_at_millis: cache_now_millis()
@@ -402,25 +314,23 @@ impl TtlLifetime {
     }
 
     #[cfg(test)]
-    /** @brief 남은 시간. 이미 지났으면 없다. */
     fn remaining(self, now_millis: u64) -> Option<Duration> {
         let millis = self.expires_at_millis.checked_sub(now_millis)?;
         (millis > 0).then(|| Duration::from_millis(millis))
     }
 
-    /** @brief 남은 초. 응답 TTL로 내보낼 때 쓰며 올림한다. 내림하면 0초짜리 답이 나간다. */
+    /// Rounds up, so an answer never goes out with TTL 0.
     fn remaining_secs(self, now_millis: u64) -> Option<u32> {
         let millis = self.expires_at_millis.checked_sub(now_millis)?;
         (millis > 0).then(|| millis.div_ceil(1_000).min(u64::from(u32::MAX)) as u32)
     }
 
-    /** @brief 아직 살아 있는지. */
     fn is_live(self, now_millis: u64) -> bool {
         self.expires_at_millis > now_millis
     }
 
     #[cfg(test)]
-    /** @brief 이미 만료된 값. 테스트에서 만료 경로를 태울 때 쓴다. */
+    /// For tests of the expiry path.
     fn expired() -> Self {
         Self {
             expires_at_millis: 0,
@@ -428,12 +338,8 @@ impl TtlLifetime {
     }
 }
 
-/**
- * @brief 프로세스 시작 기준 경과 밀리초.
- * @note 시작 시각을 한 번만 잡아 두고 그 뒤로는 경과만 측정한다. 시스템 시계 변경에 영향받지 않는다.
- */
+/// Monotonic, unaffected by system clock changes.
 fn cache_now_millis() -> u64 {
-    /** @brief 기준 시각. 시스템 시계가 바뀌어도 흔들리지 않게 한다. */
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     EPOCH
         .get_or_init(Instant::now)
@@ -442,79 +348,53 @@ fn cache_now_millis() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-/** @brief 네임서버 주소 캐시 항목. */
 struct NsAddrEntry {
-    /** @brief 그 이름의 주소들. */
     addrs: Vec<IpAddr>,
-    /** @brief 이 항목의 만료 시각. */
     lifetime: TtlLifetime,
 }
 
-/** @brief 네임서버 주소 캐시 크기. */
 const NS_ADDR_CACHE_MAX: usize = 4_096;
 
-/** @brief 이름 하나에 담을 주소 수 상한. 주소를 잔뜩 담은 응답으로 캐시를 채우지 못하게 한다. */
+/// Keeps an answer packed with addresses from filling the cache.
 const MAX_CACHED_NS_ADDRS: usize = 64;
 
-/** @brief 위임 캐시 항목. */
 struct DelegationEntry {
-    /** @brief 그 zone을 맡은 서버 주소들. */
     servers: Vec<SocketAddr>,
-    /** @brief 이 항목의 만료 시각. */
     lifetime: TtlLifetime,
 }
 
-/** @brief 위임 캐시 크기. */
 const DELEGATION_CACHE_MAX: usize = 4_096;
 
-/** @brief DNSKEY 응답 캐시 항목. 검증 전 상태다. */
+/// Not yet validated.
 struct DnskeyEntry {
-    /** @brief DNSKEY 레코드들. */
     records: Vec<Record>,
-    /** @brief 그 RRset을 덮는 서명들. */
     signatures: Vec<onetdns_dnssec::Rrsig>,
-    /** @brief 이 항목의 만료 시각. */
     lifetime: TtlLifetime,
 }
 
-/** @brief DNSKEY 캐시 크기. */
 const DNSKEY_CACHE_MAX: usize = 4_096;
 
-/**
- * @brief 검증까지 끝난 키 캐시 항목.
- * @note 그때 쓴 앵커를 함께 담는다. 앵커가 바뀌면 이 항목은 더 이상 유효하지 않다.
- */
+/// Holds the anchors used; once they change the entry is stale.
 struct ValidatedKeyEntry {
-    /** @brief 체인을 검증해 얻은 이 zone의 신뢰 상태. */
     trust: ZoneTrust,
-    /** @brief 검증에 쓴 앵커. 이것이 달라지면 캐시를 버려야 한다. */
     anchors: std::sync::Arc<Vec<onetdns_dnssec::Ds>>,
-    /** @brief 이 항목의 만료 시각. */
     lifetime: TtlLifetime,
 }
 
 #[derive(Clone)]
-/**
- * @brief 앵커에서 체인을 끝까지 검증해 얻은 zone의 신뢰 상태.
- * @details 서명되지 않은 영역이라는 판정도 담는다. 담지 않으면 그런 영역은 캐시된 위임에서
- *          시작할 수 없어 질의마다 루트부터 다시 걷는다.
- */
+/// Also records that a zone is unsigned; otherwise such zones could not start from a cached
+/// delegation and every query would walk from the root.
 enum ZoneTrust {
-    /** @brief 앵커에서 이어진 서명으로 확인한 zone 키. */
     Secure(std::sync::Arc<[onetdns_dnssec::Dnskey]>),
-    /** @brief 상위 zone이 서명으로 DS 부재를 증명해 서명을 검증하지 않는 영역. */
+    /// The parent proved the DS absent with signatures, so signatures here are not validated.
     Insecure,
 }
 
-/** @brief 검증된 키 캐시 크기. */
 const VALIDATED_KEY_CACHE_MAX: usize = 4_096;
 
-/**
- * @brief 검증 결과를 얼마나 캐시할 수 있는지.
- * @details 체인에 든 레코드의 TTL과 서명 만료까지 남은 시간 중 가장 짧은 것을 쓴다.
- *          서명이 만료된 뒤에도 검증 결과를 쓰면 폐기된 키를 계속 믿게 된다.
- * @note 만료 비교는 순환 산술이다. 이미 지난 서명은 0으로 바꾼다.
- */
+/// The shortest of the chain's record TTLs and its signatures' remaining lifetimes: using a result
+/// past signature expiry would keep trusting a revoked key. Expiry uses serial arithmetic; an
+/// expired signature gives 0.
 fn chain_validity_ttl(links: &[onetdns_dnssec::ChainLink], now: u32) -> u32 {
     let remaining = |expiration: u32| {
         let left = expiration.wrapping_sub(now);
@@ -552,53 +432,32 @@ fn chain_validity_ttl(links: &[onetdns_dnssec::ChainLink], now: u32) -> u32 {
     }
 }
 
-/**
- * @brief 부재 증명에서 받아들일 NSEC3 해시 반복 횟수 상한.
- *
- * @details 반복 횟수는 응답을 만든 zone이 정하고, 검증기는 그 횟수만큼 해시를 돌려야 한다.
- *          상한이 없으면 질의 한 건으로 임의의 해시 연산을 강제할 수 있다
- *          (CVE-2023-50868·CVE-2026-1519 계열).
- * @note    초과하는 NSEC3는 증명에서 제외되어 인증된 부재로 인정되지 않는다.
- */
+/// The zone sets the iteration count and the validator must hash that often, so without a cap one
+/// query forces arbitrary hashing (CVE-2023-50868, CVE-2026-1519). NSEC3 records above it are left
+/// out of proofs and do not authenticate a denial.
 const DEFAULT_NSEC3_MAX_ITERATIONS: u16 = onetdns_dnssec::MAX_NSEC3_ITERATIONS;
 
-/**
- * @brief 클라이언트 질의 하나가 유발할 수 있는 총 발신 질의 수.
- *
- * @details 위임 추적과 NS 주소 해석이 서로를 부르며 넓어지는 것을 막는 절대 카운터다
- *          (NXNSAttack 계열). BIND의 max-recursion-queries와 같은 목적이다.
- * @note    정상 최악(별칭 8홉 × 위임 5단계 × 위임당 referral 1 + NS 주소 A/AAAA 2)이
- *          대략 120이므로 두 배 여유를 둔다.
- * @warning ns_resolves와 달리 되돌리지 않는다. 되돌리면 상한의 의미가 사라진다.
- */
+/// Total outgoing queries one client query may cause: an absolute counter against delegation
+/// chasing and NS address resolution feeding each other (NXNSAttack), like BIND's
+/// max-recursion-queries. The normal worst case is about half of it. Unlike `ns_resolves` it is
+/// never refunded, or it would stop being a limit.
 const MAX_TOTAL_QUERIES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/**
- * @brief 응답의 DNSSEC 상태.
- * @note 셋을 합치면 안 된다. Insecure는 서명 없는 정상 zone이라 응답을 주고, Bogus는
- *       서명이 깨진 것이라 SERVFAIL로 막는다.
- */
+/// Insecure and Bogus must stay apart: an insecure zone is answered, a bogus one gets SERVFAIL.
 enum SecurityStatus {
-    /** @brief 검증됐다. */
     Secure,
 
-    /** @brief 서명이 없는 구간이다. */
     Insecure,
 
-    /**
-     * @brief 검증을 통과하지 못했다. 값은 클라이언트에 알릴 EDE 사유다.
-     * @details 서명이 맞지 않는 경우뿐 아니라, 검증에 쓸 키를 받지 못해 서명되지 않았다는
-     *          증명도 할 수 없는 경우도 여기에 든다. 둘 다 답을 내보낼 수 없지만 사유는 다르다.
-     */
+    /// Carries the EDE code for the client. Covers a signature that does not verify and also
+    /// missing keys that leave the zone neither validated nor proven unsigned; both block the
+    /// answer, for different reasons.
     Bogus(u16),
 }
 
 impl SecurityStatus {
-    /**
-     * @brief 두 상태를 합친다. 나쁜 쪽이 이긴다.
-     * @details 한 응답에 여러 RRset이 들어오면 그중 하나만 깨져도 응답 전체를 믿을 수 없다.
-     */
+    /// The worse status wins: one broken RRset makes the whole answer untrustworthy.
     fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::Bogus(code), _) => Self::Bogus(code),
@@ -609,145 +468,99 @@ impl SecurityStatus {
     }
 }
 
-/**
- * @brief 클라이언트 질의 하나가 쓸 수 있는 해석 자원.
- *
- * @details 중첩 해석(글루 없는 NS의 A/AAAA 조회 등)에 &mut로 그대로 전달되므로, 재귀
- *          트리 전체가 이 하나를 나눠 쓴다. 호출 깊이마다 새로 만들면 상한이 무의미해진다.
- * @invariant queries는 감소만 한다.
- */
+/// Resources one client query may use, passed as `&mut` into nested resolutions such as glueless
+/// NS lookups so the whole tree shares it; a fresh one per level would void the limits. `queries`
+/// only decreases.
 struct Budget {
-    /**
-     * @brief NS 이름 해석에 쓸 토큰. 이름 하나마다 하나씩 쓴다.
-     * @warning 캐시된 위임에서 시작한 시도가 실패하면 오탐 SERVFAIL을 막으려고 되돌린다.
-     *          그래서 절대 상한이 아니며, queries가 그 역할을 맡는다.
-     */
+    /// One per NS name resolved. Refunded when an attempt from a cached delegation fails, to avoid
+    /// a false SERVFAIL, so it is not an absolute limit; `queries` is.
     ns_resolves: usize,
-    /** @brief 남은 총 발신 질의 수. 되돌리지 않는다. */
+    /// Never refunded.
     queries: usize,
-    /** @brief 이 해석의 벽시계 데드라인. 중첩 해석도 같은 데드라인을 공유한다. */
+    /// Shared by nested resolutions.
     deadline: Instant,
 }
 
-/** @brief 위임을 따라 내려가는 중의 현재 위치. */
 struct IterationState {
-    /** @brief 지금 물어보고 있는 zone. */
     zone: Name,
 
-    /** @brief 그 zone을 맡은 서버 주소들. */
     servers: Vec<SocketAddr>,
 
-    /** @brief 지금까지 확정한 라벨 수. 이름 최소화의 진행 정도다. */
+    /// Labels settled so far: how far minimization has got.
     depth: usize,
 
-    /** @brief 이름 최소화를 계속할지. 상대가 받아 주지 않으면 꺼서 전체 이름으로 전환한다. */
+    /// Turned off, falling back to the full name, when a server rejects minimization.
     minimize: bool,
 
-    /** @brief 루트부터 여기까지의 단계들. DNSSEC 체인을 만들 재료가 된다. */
+    /// Steps from the root, the material for the DNSSEC chain.
     chain: Vec<ZoneStep>,
 
-    /**
-     * @brief 지금 영역의 네임서버 가운데 주소를 아직 풀지 않은 이름들.
-     * @details 주소는 쓸 수 있는 것이 하나 생기면 그만 푼다. 그 주소들이 모두 답하지 않을 때만
-     *          여기서 하나씩 더 푼다.
-     */
+    /// Name servers of the current zone whose addresses are not resolved yet. Resolution stops once
+    /// one address is usable; more are resolved one at a time only when those all fail to answer.
     unresolved_ns: Vec<Name>,
 }
 
-/** @brief 다음에 보낼 질의의 모양. */
 struct NextQuery {
-    /** @brief 물어볼 라벨 수. */
     target: usize,
-    /** @brief 전체 이름을 묻는 마지막 단계인지. */
     is_final: bool,
-    /** @brief 실제로 보낼 이름. 최소화 중이면 접미사만이다. */
+    /// Only a suffix while minimizing.
     mname: Name,
-    /** @brief 보낼 타입. 최소화 중에는 NS를 묻는다. */
+    /// NS while minimizing.
     mtype: RecordType,
 }
 
-/** @brief 반복 내내 바뀌지 않는 질의 정보. */
 struct IterationContext<'a> {
-    /** @brief 최종 목표 이름. */
     qname: &'a Name,
-    /** @brief 최종 목표 타입. */
     qtype: RecordType,
-    /** @brief 목표 이름의 라벨 수. */
     total: usize,
-    /**
-     * @brief 업스트림에 DNSSEC 레코드를 함께 달라고 할지.
-     *
-     * @details 언제나 참이다. 검증하지 않더라도 DO=1로 묻는 질의자에게 줄 서명을 이 서버가
-     *          가지고 있어야 한다. 검증기를 끈 채로 DO를 설정하지 않으면 서명을 애초에 받아
-     *          오지 못해, 이 서버의 뒤에 선 검증하는 스텁이 아무것도 확인하지 못한다.
-     * @note 서명은 담아 두고, DO를 설정하지 않은 질의자에게 나갈 때 걷어낸다.
-     */
+    /// Always true: clients asking with DO=1 need signatures even when this server does not
+    /// validate, and a validating stub behind it would get nothing to check otherwise. Signatures
+    /// are kept and stripped on the way to clients without DO.
     do_bit: bool,
-    /**
-     * @brief 위임마다 DS 증거를 모을지.
-     *
-     * @details 신뢰 체인을 구성할 때만 쓴다. 검증하지 않으면 모아 봐야 쓰지 않으므로
-     *          위임마다 붙는 복제를 하지 않는다.
-     */
+    /// Only for building the chain of trust; without validation the per-delegation copies are
+    /// skipped.
     collect_ds: bool,
 }
 
-/**
- * @brief 주소를 아직 모르는 네임서버가 있어 잠시 멈춘 참조.
- * @details glue가 없는 위임에서 생긴다. 네임서버 주소를 따로 풀어 온 뒤 이어 간다.
- */
+/// A referral paused on a glueless delegation until the name server addresses are resolved.
 struct PendingReferral {
-    /** @brief 이 위임이 가리키는 영역. */
     zone: Name,
-    /** @brief 참조를 담고 있던 원본 응답. */
     resp: Message,
-    /** @brief 그 zone의 네임서버 이름들. */
     ns_names: Vec<Name>,
 
-    /** @brief glue로 이미 알아낸 주소들. */
     addrs: Vec<SocketAddr>,
-    /** @brief 그 주소들의 TTL. 캐시에 담을 때 쓴다. */
+    /// For caching.
     address_ttl: Option<u32>,
-    /**
-     * @brief 부모에게 따로 물어 받은 DS와 그 부재 증명. 답변 절로 드러난 경계에만 있다.
-     * @details 참조라면 DS 증거가 권한 절에 함께 오지만, 권한 있는 답으로 드러난 경계에는 오지
-     *          않는다. 증거 없이 체인에 넣으면 서명된 영역이 증명 없이 Insecure로 내려간다.
-     */
+    /// DS and its denial proof fetched from the parent, only for cuts revealed in an answer
+    /// section. A referral carries DS evidence in its authority section, an authoritative answer
+    /// does not; without it a signed zone would drop to Insecure unproven.
     ds_evidence: Option<Vec<Record>>,
-    /** @brief 주소를 풀지 않고 남긴 네임서버 이름들. 내려간 뒤 반복 상태로 옮긴다. */
+    /// Moved to the iteration state after descending.
     unresolved: Vec<Name>,
 }
 
-/** @brief 한 단계를 밟은 결과. */
 enum StepOutcome {
-    /** @brief 최종 응답을 얻었다. */
     Done(Message),
 
-    /** @brief 한 단계 더 내려간다. */
     Continue,
 
-    /** @brief 네임서버 주소를 먼저 풀어야 한다. */
     NeedNsAddrs {
-        /** @brief 주소를 모르는 이름들. */
         missing: Vec<Name>,
-        /** @brief 주소를 얻은 뒤 이어 갈 참조 상태. */
         pending: Box<PendingReferral>,
     },
 
-    /** @brief 답변 절로 드러난 경계라 부모에게 DS를 먼저 물어야 한다. 검증할 때만 생긴다. */
+    /// A cut revealed in an answer section; ask the parent for the DS first. Only when validating.
     NeedDs {
-        /** @brief glue가 없어 주소를 모르는 네임서버 이름들. */
+        /// No glue, so their addresses are unknown.
         missing: Vec<Name>,
-        /** @brief DS를 받은 뒤 이어 갈 참조 상태. */
         pending: Box<PendingReferral>,
     },
 
-    /** @brief 더 진행할 수 없다. */
     Failed(RecurseError),
 }
 
 impl IterationState {
-    /** @brief 시작 zone과 서버로 반복을 시작한다. 체인의 첫 단계도 함께 만든다. */
+    /// Also creates the chain's first step.
     fn start(zone: Name, servers: Vec<SocketAddr>) -> Self {
         let depth = zone.num_labels();
         let chain = vec![ZoneStep {
@@ -772,11 +585,8 @@ impl IterationState {
         }
     }
 
-    /**
-     * @brief 다음 질의의 이름과 타입을 정한다.
-     * @details 최소화 중이면 라벨을 하나씩 늘려 가며 NS를 묻는다. 전체 이름을 처음부터
-     *          보내면 경로상의 모든 서버가 질의자의 관심사를 알게 된다.
-     */
+    /// While minimizing, asks NS with one more label each time; sending the full name at once would
+    /// tell every server on the path what the client is after.
     fn next_query(&self, ctx: &IterationContext<'_>) -> NextQuery {
         let target = if self.minimize {
             (self.depth + 1).min(ctx.total)
@@ -793,42 +603,33 @@ impl IterationState {
     }
 }
 
-/** @brief 체인의 한 단계. zone 하나와 그 위임 증거를 담는다. */
+/// One step of the chain: a zone and its delegation evidence.
 struct ZoneStep {
-    /** @brief 이 단계에서 물어볼 영역. */
     zone: Name,
-    /** @brief 그 영역의 서버 주소들. */
     servers: Vec<SocketAddr>,
 
-    /** @brief 주소를 아직 모르는 서버 이름들. */
     ns_names: Vec<Name>,
-    /** @brief 그 zone의 DS RRset. */
     ds_records: Vec<Record>,
-    /** @brief DS RRset의 서명들. */
     ds_rrsigs: Vec<onetdns_dnssec::Rrsig>,
-    /** @brief DS 부재를 NSEC으로 증명하는 레코드들. */
+    /// DS absence proven with NSEC.
     ds_nsec_records: Vec<Record>,
-    /** @brief 위 NSEC들의 서명. */
     ds_nsec_rrsigs: Vec<onetdns_dnssec::Rrsig>,
-    /** @brief DS 부재를 NSEC3으로 증명하는 레코드들. */
+    /// DS absence proven with NSEC3.
     ds_nsec3_records: Vec<Record>,
-    /** @brief 위 NSEC3들의 서명. */
     ds_nsec3_rrsigs: Vec<onetdns_dnssec::Rrsig>,
-    /** @brief 파싱한 DS. 다음 단계의 신뢰 기준이 된다. */
+    /// Parsed DS, the trust basis for the next step.
     ds: Vec<onetdns_dnssec::Ds>,
 }
 
 #[derive(Debug, Default, Clone)]
-/** @brief 이 해석에 관여한 네임서버들. 응답과 함께 업스트림 계층에 전한다. */
+/// Name servers involved in this resolution, passed upward with the answer.
 pub struct NsContext {
-    /** @brief 거쳐 온 네임서버 이름들. */
     pub names: Vec<Name>,
-    /** @brief 실제로 물어본 주소들. */
     pub ips: Vec<std::net::IpAddr>,
 }
 
 impl NsContext {
-    /** @brief 체인 전체에서 이름과 주소를 중복 없이 모은다. */
+    /// Deduplicated names and addresses from the whole chain.
     fn from_chain(chain: &[ZoneStep]) -> Self {
         let mut names: Vec<Name> = Vec::new();
         let mut ips: Vec<std::net::IpAddr> = Vec::new();
@@ -850,7 +651,7 @@ impl NsContext {
 }
 
 impl Recursor {
-    /** @brief 루트 목록과 데드라인으로 리졸버를 만든다. 나머지 설정은 with_ 계열로 얹는다. */
+    /// Other settings come from the `with_` methods.
     pub fn new(roots: Vec<SocketAddr>, timeout: Duration) -> Self {
         Self {
             roots,
@@ -892,7 +693,7 @@ impl Recursor {
         }
     }
 
-    /** @brief 권한 서버에 TCP로만 물을지를 이 값으로 정한다. 값은 부른 쪽이 바꾼다. */
+    /// The caller owns and flips the flag.
     pub fn with_authority_tcp(
         mut self,
         switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -901,19 +702,18 @@ impl Recursor {
         self
     }
 
-    /** @brief 지금 권한 서버에 TCP로만 묻고 있는지. */
     pub fn authority_over_tcp(&self) -> bool {
         self.authority_tcp
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /** @brief NSEC3 반복 상한을 바꾼다. 보안 하드 상한 150보다 높게는 설정되지 않는다. */
+    /// Never above the hard cap of 150.
     pub fn with_nsec3_max_iterations(mut self, max: u16) -> Self {
         self.nsec3_max_iterations = max.min(onetdns_dnssec::MAX_NSEC3_ITERATIONS);
         self
     }
 
-    /** @brief 모든 캐시의 크기를 한꺼번에 바꾼다. 0이면 기본값을 유지한다. */
+    /// Resizes every cache; 0 keeps the defaults.
     pub fn with_ns_cache_max(mut self, max: usize) -> Self {
         if max > 0 {
             let max = max.min(MAX_NS_CACHE_CONFIGURED);
@@ -927,13 +727,11 @@ impl Recursor {
         self
     }
 
-    /** @brief 캐시에 담을 TTL 상한을 바꾼다. */
     pub fn with_recursive_cache_ttl_max(mut self, max: u32) -> Self {
         self.recursive_cache_ttl_max = max;
         self
     }
 
-    /** @brief 부수 질의 예산을 바꾼다. */
     pub fn with_ns_side_query_limit(mut self, limit: usize) -> Self {
         if limit > 0 {
             self.max_ns_resolves = limit;
@@ -941,18 +739,14 @@ impl Recursor {
         self
     }
 
-    /** @brief 루트 키 센티널 응답을 켜고 끈다. */
     pub fn with_root_key_sentinel(mut self, on: bool) -> Self {
         self.root_key_sentinel = on;
         self
     }
 
-    /**
-     * @brief 루트 키 센티널 질의면 응답을 바꿔 이 서버가 아는 앵커를 알린다.
-     * @details 이름 앞 라벨이 특정 형태이고 그 tag를 이 서버가 신뢰하는지에 따라 정상 응답과
-     *          SERVFAIL로 갈린다. 질의자는 두 이름의 응답 차이로 이 서버의 앵커 상태를 알아낸다.
-     * @note 검증된 응답에만 적용한다. 검증되지 않은 답으로 신호를 보내면 의미가 없다.
-     */
+    /// Whether the answer or SERVFAIL comes back depends on the label and on whether this server
+    /// trusts that tag, so clients learn the anchor state from the difference. Applied to validated
+    /// answers only; an unvalidated one signals nothing.
     fn apply_sentinel(&self, qname: &Name, qtype: RecordType, out: &mut Message) {
         if !self.root_key_sentinel || !out.header.authentic_data {
             return;
@@ -975,7 +769,6 @@ impl Recursor {
         }
     }
 
-    /** @brief 쓸 주소 계열과 선호를 정한다. */
     pub fn with_ip_family(mut self, do_ip4: bool, do_ip6: bool, prefer: Option<bool>) -> Self {
         self.do_ip4 = do_ip4;
         self.do_ip6 = do_ip6;
@@ -987,17 +780,13 @@ impl Recursor {
         self
     }
 
-    /** @brief 이름 최소화를 엄격히 할지. */
     pub fn with_qname_min_strict(mut self, strict: bool) -> Self {
         self.qname_min_strict = strict;
         self
     }
 
-    /**
-     * @brief 내보낼 질의 이름의 대소문자를 설정대로 바꾼다.
-     * @details 동기 경로와 리액터 레인이 모두 이것을 부른다. 한쪽만 따르면 레인이 켜진 설치에서
-     *          설정이 효과를 잃는다.
-     */
+    /// The synchronous path and the reactor lane both call this; if only one did, the setting would
+    /// do nothing where the lane is enabled.
     pub(crate) fn apply_outgoing_case(&self, query: &mut Message) {
         for question in &mut query.questions {
             if self.caps_for_id {
@@ -1008,24 +797,21 @@ impl Recursor {
         }
     }
 
-    /** @brief 참조 경로 강화를 켜고 끈다. */
     pub fn with_harden_referral_path(mut self, on: bool) -> Self {
         self.harden_referral_path = on;
         self
     }
 
-    /** @brief 검증에서 뺄 도메인을 지정한다. 운영자가 명시한 것만 들어간다. */
+    /// Only domains the operator lists explicitly.
     pub fn with_domain_insecure(mut self, domains: Vec<Name>) -> Self {
         self.domain_insecure = domains;
         self
     }
 
-    /** @brief 이 이름이 검증 제외 목록 안인지. */
     fn is_domain_insecure(&self, name: &Name) -> bool {
         self.domain_insecure.iter().any(|d| is_within(name, d))
     }
 
-    /** @brief 이 주소 계열을 쓰도록 설정돼 있는지. */
     fn family_allowed(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(_) => self.do_ip4,
@@ -1033,7 +819,7 @@ impl Recursor {
         }
     }
 
-    /** @brief 선호 계열이면 0, 아니면 1. 서버 정렬의 첫 기준이다. */
+    /// 0 for the preferred family; the first sort key.
     fn family_rank(&self, ip: IpAddr) -> u8 {
         let is_v6 = ip.is_ipv6();
         if self.prefer_ip6 && is_v6 || self.prefer_ip4 && !is_v6 {
@@ -1043,37 +829,36 @@ impl Recursor {
         }
     }
 
-    /** @brief 내장 루트 목록으로 리졸버를 만든다. */
     pub fn with_default_roots(timeout: Duration) -> Self {
         Self::new(default_roots(), timeout)
     }
 
-    /** @brief 업스트림 포트를 바꾼다. 테스트용이다. */
+    /// For tests.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
     #[cfg(test)]
-    /** @brief 루프백을 질의 대상으로 허용한다. 테스트 전용이며 운영에서는 열리지 않는다. */
+    /// Allows loopback upstreams; test only, never enabled in production.
     fn with_test_loopback(mut self) -> Self {
         self.allow_servers.push("127.0.0.0/8".parse().unwrap());
         self.allow_servers.push("::1/128".parse().unwrap());
         self
     }
 
-    /** @brief 신뢰 앵커를 넣는다. 넣으면 검증이 켜진다. */
+    /// Enables validation.
     pub fn with_trust_anchors(self, anchors: Vec<onetdns_dnssec::Ds>) -> Self {
         self.trust_anchors.store(std::sync::Arc::new(anchors));
         self
     }
 
-    /** @brief 앵커 저장소 핸들. 자동 갱신이 이것으로 앵커를 바꾼다. */
+    /// Automatic anchor updates swap anchors through this.
     pub fn anchors_handle(&self) -> std::sync::Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>> {
         self.trust_anchors.clone()
     }
 
-    /** @brief zone의 DNSKEY를 직접 가져온다. 앵커 갱신이 쓴다. */
+    /// For anchor updates.
     pub fn fetch_zone_dnskey(&self, zone: &Name) -> Result<Vec<Record>, RecurseError> {
         let mut budget = Budget {
             ns_resolves: self.max_ns_resolves,
@@ -1084,48 +869,41 @@ impl Recursor {
         Ok(resp.answers)
     }
 
-    /** @brief 엄격 모드를 켜고 끈다. */
     pub fn with_dnssec_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
     }
 
-    /** @brief 관대 모드를 켜고 끈다. 진단용이며 운영에서는 쓰지 않는다. */
+    /// Diagnostic only, not for production.
     pub fn with_dnssec_permissive(mut self, permissive: bool) -> Self {
         self.permissive = permissive;
         self
     }
 
-    /** @brief 0x20 인코딩을 켜고 끈다. */
     pub fn with_caps_for_id(mut self, on: bool) -> Self {
         self.caps_for_id = on;
         self
     }
 
-    /** @brief 나가는 이름의 소문자화를 켜고 끈다. */
     pub fn with_lowercase_outgoing(mut self, on: bool) -> Self {
         self.lowercase_outgoing = on;
         self
     }
 
-    /** @brief 질의할 업스트림 대역을 제한한다. */
     pub fn with_server_acl(mut self, deny: Vec<IpNet>, allow: Vec<IpNet>) -> Self {
         self.deny_servers = deny;
         self.allow_servers = allow;
         self
     }
 
-    /** @brief 이 주소에 질의해도 되는지. 계열과 대역을 함께 본다. */
+    /// Checks the family and the address ranges.
     fn server_eligible(&self, ip: IpAddr) -> bool {
         self.family_allowed(ip) && self.is_queryable(ip)
     }
 
-    /**
-     * @brief 이 주소가 질의 대상으로 허용되는지.
-     * @details 허용 목록이 먼저고 그다음이 거부 목록, 마지막이 전역 라우팅 가능 여부다.
-     * @warning 기본은 전역 주소만이다. 내부망 주소로 질의하게 두면 위임을 조작해 이 서버를
-     *          내부망 탐색에 쓰는 SSRF가 성립한다.
-     */
+    /// The allow list first, then the deny list, then global routability. By default only global
+    /// addresses: querying internal ones would let a crafted delegation use this server to probe
+    /// the internal network (SSRF).
     fn is_queryable(&self, ip: IpAddr) -> bool {
         if self.allow_servers.iter().any(|n| n.contains(&ip)) {
             return true;
@@ -1136,12 +914,11 @@ impl Recursor {
         is_globally_routable(ip)
     }
 
-    /** @brief 내장 루트 앵커로 검증을 켠다. */
     pub fn with_dnssec(self) -> Self {
         self.with_trust_anchors(onetdns_dnssec::root_trust_anchors())
     }
 
-    /** @brief 참조 예산을 바꾼다. 0은 무시한다. */
+    /// 0 is ignored.
     pub fn with_recursion_limit(mut self, limit: u8) -> Self {
         if limit > 0 {
             self.max_referrals = limit as usize;
@@ -1149,7 +926,7 @@ impl Recursor {
         self
     }
 
-    /** @brief CNAME 예산을 바꾼다. 0은 무시한다. */
+    /// 0 is ignored.
     pub fn with_cname_limit(mut self, limit: u8) -> Self {
         if limit > 0 {
             self.max_cnames = limit as usize;
@@ -1157,7 +934,7 @@ impl Recursor {
         self
     }
 
-    /** @brief DNAME 예산을 바꾼다. 0은 무시한다. */
+    /// 0 is ignored.
     pub fn with_dname_limit(mut self, limit: u8) -> Self {
         if limit > 0 {
             self.max_dnames = limit as usize;
@@ -1165,39 +942,33 @@ impl Recursor {
         self
     }
 
-    /** @brief 지금 검증해야 하는지. 앵커가 있고 CD 존중 상태가 아닐 때다. */
+    /// With anchors set and CD not honoured.
     fn validating(&self) -> bool {
         !self.trust_anchors.load().is_empty()
     }
 
     #[cfg(any(unix, test))]
-    /** @brief 이 리졸버가 검증하도록 설정돼 있는지. */
     pub fn is_validating(&self) -> bool {
         self.validating()
     }
 
-    /** @brief 이 질의의 데드라인 시각. 중첩 해석도 이 데드라인을 나눠 쓴다. */
+    /// Shared by nested resolutions.
     fn query_deadline(&self) -> Instant {
         let now = Instant::now();
         now.checked_add(self.timeout).unwrap_or(now)
     }
 
-    /** @brief 이름과 타입을 해석한다. 가장 바깥 진입점이다. */
     pub fn resolve(&self, qname: &Name, qtype: RecordType) -> Result<Message, RecurseError> {
         self.resolve_collect(qname, qtype).map(|(m, _)| m)
     }
 
-    /** @brief 질의자의 CD 비트를 무시할지. */
     pub fn with_ignore_cd(mut self, ignore: bool) -> Self {
         self.ignore_cd = ignore;
         self
     }
 
-    /**
-     * @brief CD 비트를 지정해 해석하고 거쳐 온 네임서버도 함께 돌려준다.
-     * @details 끝내지 못한 해석은 뒤에서 마저 돌린다(complete_in_background). 클라이언트는
-     *          곧 다시 묻는데, 그때 남은 단계만 진행하면 되도록 이 재귀기의 캐시를 채워 둔다.
-     */
+    /// Unfinished resolutions continue in the background (`complete_in_background`), filling this
+    /// recursor's cache so the client's retry needs only the remaining steps.
     pub fn resolve_with_ns_cd(
         self: &std::sync::Arc<Self>,
         qname: &Name,
@@ -1212,7 +983,7 @@ impl Recursor {
         result
     }
 
-    /** @brief CD 비트를 지정해 한 번 해석한다. 끝내지 못해도 뒤에서 이어 가지 않는다. */
+    /// Does not continue in the background.
     fn resolve_once_cd(
         &self,
         qname: &Name,
@@ -1223,11 +994,9 @@ impl Recursor {
         with_honor_cd(honor, || self.resolve_collect(qname, qtype))
     }
 
-    /**
-     * @brief 끝내지 못한 해석을 다른 스레드에서 한 번 더 돌린다. 결과는 버리고 캐시만 남는다.
-     * @details 같은 질의는 한 번만 돌리고, 동시에 돌리는 수는 MAX_BACKGROUND_COMPLETIONS를
-     *          넘지 않는다. 뒤에서 돌리는 해석이 실패해도 다시 뒤로 넘기지 않는다.
-     */
+    /// The result is dropped; only the cache is kept. A query runs at most once at a time, at most
+    /// `MAX_BACKGROUND_COMPLETIONS` run together, and a failed background run is not handed on
+    /// again.
     pub fn complete_in_background(
         self: &std::sync::Arc<Self>,
         qname: Name,
@@ -1259,7 +1028,6 @@ impl Recursor {
         }
     }
 
-    /** @brief 해석하고 거쳐 온 네임서버도 함께 돌려준다. */
     pub fn resolve_with_ns(
         &self,
         qname: &Name,
@@ -1268,7 +1036,7 @@ impl Recursor {
         self.resolve_collect(qname, qtype)
     }
 
-    /** @brief 해석 본체. 예산을 새로 잡고 체인 정보를 모아 돌려준다. */
+    /// Takes a fresh budget and collects the chain.
     fn resolve_collect(
         &self,
         qname: &Name,
@@ -1280,14 +1048,10 @@ impl Recursor {
         Ok((out, ns))
     }
 
-    /**
-     * @brief 반복 해석을 돌리고 최종 응답을 다듬는다.
-     *
-     * @details 반복이 끝나면 셋 중 하나다. DNAME이 이름 길이를 넘긴 경우, 별칭 없이 끝난
-     *          경우, 별칭을 따라가야 하는 경우. 각각 검증과 정리 방식이 다르다.
-     * @warning 응답을 내보내기 전에 AD 비트를 반드시 먼저 꺼야 한다. 업스트림이 설정한 비트를
-     *          그대로 흘리면 검증하지 않은 답이 검증된 것처럼 나간다.
-     */
+    /// Ends in one of three cases: a DNAME result exceeding the name length, no alias, or an alias
+    /// to follow; each validates and cleans up differently. The AD bit must be cleared before
+    /// anything goes out: passing on the upstream's bit would mark an unvalidated answer as
+    /// validated.
     fn iterate_to_answer(
         &self,
         qname: &Name,
@@ -1444,13 +1208,10 @@ impl Recursor {
         Ok((out, ns))
     }
 
-    /**
-     * @brief 별칭을 따라가며 재귀적으로 해석한다.
-     * @details 체인 깊이를 인자로 물려받아 예산을 이어 쓴다. 깊이를 새로 세면 별칭이
-     *          별칭을 부르는 체인에서 상한이 무의미해진다.
-     * @param validate 거짓이면 DS를 모으지도 검증하지도 않고 Insecure로 돌려준다. 결과를 판정에
-     *                 쓰지 않는 네임서버 주소 풀기만 끈다.
-     */
+    /// Inherits the chain depth so the budget carries on; restarting the count would void the limit
+    /// for aliases that chain to aliases. With `validate` false it neither collects DS nor
+    /// validates and returns Insecure; only name server address lookups, whose result decides
+    /// nothing, turn it off.
     fn resolve_inner(
         &self,
         qname: &Name,
@@ -1573,11 +1334,8 @@ impl Recursor {
         Ok((resp, status))
     }
 
-    /**
-     * @brief 긍정 응답의 DNSSEC 상태를 판정한다.
-     * @details 키가 없어도 알 수 있는 경우를 먼저 걸러 낸다. 그다음 체인을 검증해 키를
-     *          얻고, 그 키로 답변 RRset을 본다.
-     */
+    /// Settles what needs no keys first, then validates the chain for keys and checks the answer
+    /// RRsets with them.
     fn validate_answer_status(
         &self,
         qname: &Name,
@@ -1596,10 +1354,7 @@ impl Recursor {
         self.validate_answer_with_keys(qname, qtype, answer_msg, chain, &keys)
     }
 
-    /**
-     * @brief 키를 얻기 전에 정해지는 상태가 있으면 돌려준다.
-     * @note RRSIG를 직접 물은 경우는 Insecure다. 서명을 서명으로 감싸지 않기 때문이다.
-     */
+    /// A query for RRSIG itself is Insecure, since signatures are not signed.
     fn answer_status_without_keys(
         &self,
         qname: &Name,
@@ -1615,14 +1370,9 @@ impl Recursor {
         None
     }
 
-    /**
-     * @brief 확정된 키로 답변 RRset의 서명을 검증한다.
-     *
-     * @details 서명자가 체인의 리프 zone인 것만 본다. 그리고 서명의 labels가 실제 이름보다
-     *          짧으면 와일드카드 확장이므로, 그 확장이 정당한지까지 증명돼야 한다.
-     * @warning 와일드카드 확장 증명을 빼면 실재하는 더 구체적인 이름을 숨기고 와일드카드
-     *          답으로 교체할 수 있다.
-     */
+    /// Accepts only the leaf zone as signer. Fewer RRSIG labels than the name means wildcard
+    /// expansion, which must also be proven; without that proof a more specific name could be
+    /// hidden behind the wildcard.
     fn validate_answer_with_keys(
         &self,
         qname: &Name,
@@ -1681,11 +1431,8 @@ impl Recursor {
         SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS)
     }
 
-    /**
-     * @brief 반복으로 모은 단계들을 검증용 체인으로 옮긴다.
-     * @details 각 단계의 DNSKEY는 그 zone에 직접 물어 가져오고, DS는 자식 단계에 담겨
-     *          있던 것을 끌어온다. DS는 부모가 준 것이라 자식 단계에 기록돼 있다.
-     */
+    /// Each step's DNSKEY is fetched from that zone; its DS comes from the child step, where the
+    /// parent's referral recorded it.
     fn build_chain_links(
         &self,
         chain: &[ZoneStep],
@@ -1732,18 +1479,15 @@ impl Recursor {
         Ok(links)
     }
 
-    /** @brief 체인 어딘가에 이 서버의 상한을 넘는 NSEC3 반복이 있는지. 있으면 검증하지 않는다. */
+    /// Such a chain is not validated.
     fn chain_has_excessive_nsec3(&self, links: &[onetdns_dnssec::ChainLink]) -> bool {
         links.iter().any(|link| {
             onetdns_dnssec::nsec3_max_iterations(&link.ds_nsec3_records) > self.nsec3_max_iterations
         })
     }
 
-    /**
-     * @brief 부정 응답의 DNSSEC 상태를 판정하고 검증에 쓴 증명을 함께 돌려준다.
-     * @return 상태와, 검증이 성립할 때 담아도 되는 권한 절 레코드. 성립하지 않으면 레코드는
-     *         비어 있고 호출자는 원래 응답을 그대로 둔다.
-     */
+    /// Returns the status and, when validation holds, the authority records to keep; otherwise they
+    /// are empty and the caller keeps the original answer.
     fn validate_denial_status(
         &self,
         qname: &Name,
@@ -1762,17 +1506,12 @@ impl Recursor {
         self.validate_denial_with_keys(qname, qtype, out, chain, &keys)
     }
 
-    /**
-     * @brief 확정된 키로 부재 증명을 검증한다.
-     *
-     * @details SOA를 먼저 검증한다. 그것이 이 부정 응답이 어느 zone에서 왔는지를 정한다.
-     *          그다음 NSEC이나 NSEC3으로 실제 부재를 증명한다.
-     * @warning 먼저 구문상 최소 증명을 고르고 그 RRset만 검증한다. 순서를 뒤집으면 응답을
-     *          무관한 서명 레코드로 채워 공개키 연산을 강요할 수 있다.
-     * @return 상태와, 검증이 성립할 때 담아도 되는 권한 절 레코드. apex SOA 와 실제로 검증한
-     *         증명, 그 서명만 담는다. 호출자는 검증되지 않은 NSEC 이 응답에 남지 않도록 이
-     *         레코드로 권한 절을 덮어쓴다.
-     */
+    /// Validates the SOA first, which decides the zone the answer came from, then proves the denial
+    /// with NSEC or NSEC3. The minimal syntactic proof is selected first and only those RRsets are
+    /// validated; the other order would let an answer padded with unrelated signatures force
+    /// public-key operations. Returns the status and the authority records to keep: the apex SOA,
+    /// the proof actually validated, and their signatures. The caller overwrites the authority
+    /// section with them so no unvalidated NSEC remains.
     fn validate_denial_with_keys(
         &self,
         qname: &Name,
@@ -1825,10 +1564,8 @@ impl Recursor {
         let nsec3 = denial_records(RecordType::NSEC3);
         let nsec3_allowed =
             onetdns_dnssec::nsec3_max_iterations(&nsec3) <= self.nsec3_max_iterations;
-        /*
-         * 부재 증명이 NSEC3 뿐인데 그 반복이 상한을 넘으면, 증명을 볼 수 없어서 실패한
-         * 것이다. RFC 9276이 이 경우의 사유 코드를 따로 정한다.
-         */
+        // With NSEC3 alone and too many iterations, the proof could not be examined. RFC 9276 gives
+        // this case its own code.
         let excessive_nsec3_only = !nsec3_allowed && nsec.is_empty() && !nsec3.is_empty();
         let denial_bogus = if excessive_nsec3_only {
             SecurityStatus::Bogus(ede_code::UNSUPPORTED_NSEC3_ITERATIONS)
@@ -1906,11 +1643,8 @@ impl Recursor {
         (denial_bogus, Vec::new())
     }
 
-    /**
-     * @brief zone의 DNSKEY를 가져온다. 캐시에 있으면 그것을 쓴다.
-     * @details 그 zone의 서버에 직접 묻는다. 루트부터 다시 내려가면 체인 검증마다 전체
-     *          해석이 한 벌씩 더 붙는다.
-     */
+    /// Asks the zone's servers directly; walking from the root again would add a full resolution to
+    /// every chain validation.
     fn fetch_dnskey(
         &self,
         zone: &Name,
@@ -1930,11 +1664,8 @@ impl Recursor {
         Ok(self.absorb_dnskey_response(zone, &resp))
     }
 
-    /**
-     * @brief DNSKEY 응답에서 키와 서명을 뽑고 캐시에 담는다.
-     * @note 캐시 기간은 레코드 TTL과 서명 만료까지 남은 시간 중 짧은 쪽이다. 만료된 서명을
-     *       계속 가지고 있으면 폐기된 키를 믿게 된다.
-     */
+    /// Cached for the shorter of the record TTL and the signatures' remaining lifetime; keeping
+    /// expired signatures would keep trusting a revoked key.
     fn absorb_dnskey_response(
         &self,
         zone: &Name,
@@ -1987,11 +1718,7 @@ impl Recursor {
         (keys, sigs)
     }
 
-    /**
-     * @brief 캐시된 DNSKEY. 만료된 항목은 꺼내면서 버린다.
-     * @note 돌려주는 레코드의 TTL을 남은 시간으로 낮춘다. 저장 당시 TTL을 그대로 주면
-     *       질의자가 실제보다 오래 캐시한다.
-     */
+    /// Lowers the TTLs to the remaining time, or clients would cache longer than they may.
     fn dnskey_cached(&self, key: &[u8]) -> Option<(Vec<Record>, Vec<onetdns_dnssec::Rrsig>)> {
         let mut cache = self.dnskey_cache.lock_recover();
         let now = cache_now_millis();
@@ -2015,7 +1742,7 @@ impl Recursor {
         }
     }
 
-    /** @brief DNSKEY를 캐시에 담는다. TTL이 0이 되면 담지 않는다. */
+    /// Not stored once the TTL reaches 0.
     fn dnskey_store(
         &self,
         key: Vec<u8>,
@@ -2037,11 +1764,8 @@ impl Recursor {
         );
     }
 
-    /**
-     * @brief 검증까지 끝난 zone의 신뢰 상태를 캐시에서 꺼낸다.
-     * @warning 저장 당시의 앵커와 지금 앵커가 같은 객체일 때만 쓴다. 앵커가 바뀌었는데
-     *          이전 결과를 쓰면 더 이상 신뢰하지 않는 키로 검증하게 된다.
-     */
+    /// Used only when the stored anchors are the same object as the current ones; after an anchor
+    /// change, an old result would validate with keys no longer trusted.
     fn validated_keys_cached(
         &self,
         zone_key: &[u8],
@@ -2064,7 +1788,6 @@ impl Recursor {
         }
     }
 
-    /** @brief 검증한 신뢰 상태를 그때 쓴 앵커와 함께 캐시에 담는다. */
     fn validated_keys_store(
         &self,
         zone_key: Vec<u8>,
@@ -2086,7 +1809,6 @@ impl Recursor {
         );
     }
 
-    /** @brief 체인 리프 zone의 신뢰 상태가 캐시에 있으면 꺼낸다. */
     fn cached_chain_trust(&self, chain: &[ZoneStep]) -> Option<ZoneTrust> {
         let leaf = chain.last()?;
         let anchors = self.trust_anchors.load();
@@ -2094,7 +1816,7 @@ impl Recursor {
     }
 
     #[cfg(unix)]
-    /** @brief 체인에서 DNSKEY가 캐시에 없는 첫 zone. 어느 zone을 먼저 받아 와야 할지 정한다. */
+    /// Decides which zone's DNSKEY to fetch first.
     fn first_chain_zone_missing_dnskey(
         &self,
         chain: &[ZoneStep],
@@ -2108,12 +1830,8 @@ impl Recursor {
     }
 
     #[cfg(unix)]
-    /**
-     * @brief 새로 질의하지 않고 검증할 수 있으면 검증한다.
-     * @details 이벤트 구동 경로가 쓴다. 그 경로는 여기서 다시 동기 질의를 낼 수 없으므로,
-     *          필요한 것이 전부 캐시에 있을 때만 판정하고 아니면 판정을 미룬다.
-     * @return 판정할 수 없으면 None. 호출자가 필요한 DNSKEY를 먼저 받아 온다.
-     */
+    /// For the event-driven path, which cannot issue synchronous queries here: decides only when
+    /// everything is cached. `None` means the caller must fetch the missing DNSKEY first.
     fn validate_terminal_without_fetch(
         &self,
         qname: &Name,
@@ -2152,11 +1870,8 @@ impl Recursor {
         })
     }
 
-    /**
-     * @brief 이 zone에서 시작해도 검증이 성립하는지.
-     * @details 검증하지 않는 설정이면 언제나 참이다. 검증한다면 그 zone의 키가 이미
-     *          확정돼 있어야 한다. 중간에서 시작하면 그 위 체인을 걷지 않기 때문이다.
-     */
+    /// Always true without validation. With it, the zone's keys must already be established, since
+    /// starting midway skips the chain above.
     fn validated_start_ok(&self, zone: &Name) -> bool {
         !self.validating() || {
             let anchors = self.trust_anchors.load();
@@ -2165,14 +1880,9 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 체인을 검증해 리프 zone의 신뢰된 키를 얻는다.
-     *
-     * @details 캐시에 있으면 그것을 쓴다. 없으면 각 단계의 DNSKEY를 받아 와 체인을 만들고
-     *          앵커부터 검증한다.
-     * @warning 체인이 루트에서 시작하지 않으면 Bogus다. 중간에서 시작한 체인은 그 위의
-     *          위임을 확인하지 않은 것이라 신뢰의 근거가 없다.
-     */
+    /// Uses the cache when it can, otherwise fetches every step's DNSKEY and validates from the
+    /// anchor. A chain not starting at the root is Bogus: the delegations above it were never
+    /// checked.
     fn validated_chain_keys(
         &self,
         chain: &[ZoneStep],
@@ -2197,10 +1907,9 @@ impl Recursor {
 
             Err(error) => {
                 onetdns_core::debug!(event = "dnssec.chain_build_failed", zone = %leaf.zone.to_ascii_lower(), error = ?error, "Could not fetch the keys for the chain of trust; answering SERVFAIL");
-                /*
-                 * 체인을 만들지 못하는 것은 DNSKEY 를 받지 못했을 때뿐이다. 서명이 깨졌는지는
-                 * 알 수 없으므로, 서명이 깨졌다고 알리면 운영자가 엉뚱한 영역을 살핀다.
-                 */
+                // The chain fails to build only when a DNSKEY could not be fetched. Whether a
+                // signature is broken is unknown, and claiming so would send operators looking at
+                // the wrong zone.
                 return Err(SecurityStatus::Bogus(match error {
                     RecurseError::NoResponse | RecurseError::NoReachableNs => {
                         ede_code::NO_REACHABLE_AUTHORITY
@@ -2211,10 +1920,8 @@ impl Recursor {
         };
         if self.chain_has_excessive_nsec3(&links) {
             onetdns_core::debug!(event = "dnssec.chain_nsec3_excessive", zone = %leaf.zone.to_ascii_lower(), "NSEC3 iterations exceed the budget; treating as bogus");
-            /*
-             * RFC 9276: 이 서버가 계산을 거부한 것이지 서명이 깨진 것이 아니다. 사유를
-             * 갈라 알려야 운영자가 영역 매개변수를 고쳐야 한다는 것을 안다.
-             */
+            // RFC 9276: this server refused the computation, the signature is not broken. A
+            // distinct code tells operators to fix the zone parameters.
             return Err(SecurityStatus::Bogus(
                 ede_code::UNSUPPORTED_NSEC3_ITERATIONS,
             ));
@@ -2250,16 +1957,10 @@ impl Recursor {
         Ok(keys)
     }
 
-    /**
-     * @brief 캐시된 위임에서 시작하고, 실패하면 루트부터 다시 걷는다.
-     *
-     * @details 매번 루트부터 내려가면 질의가 몇 배로 는다. 대신 캐시된 위임에서 출발한
-     *          시도가 실패하면 그 경로를 지우고 루트부터 다시 한다.
-     * @note 다시 시도할 때 부수 질의 예산을 되돌린다. 되돌리지 않으면 캐시가 오래된 것뿐인데
-     *       예산 부족으로 SERVFAIL이 나간다.
-     * @param validate 거짓이면 DS를 모으지 않고, 캐시된 위임에서 시작할 때 검증된 키를 요구하지
-     *                 않는다.
-     */
+    /// Starting from the root every time multiplies queries, so a cached delegation is tried first;
+    /// if that fails, the path is evicted and the walk restarts at the root. The side query budget
+    /// is refunded for the retry, or a merely stale cache would end in SERVFAIL. With `validate`
+    /// false it collects no DS and does not require validated keys for a cached start.
     fn iterate(
         &self,
         qname: &Name,
@@ -2310,14 +2011,9 @@ impl Recursor {
         )
     }
 
-    /**
-     * @brief 주어진 zone에서 시작해 위임을 따라 내려간다. 반복의 본체다.
-     *
-     * @details 한 바퀴마다 질의를 하나 보내고 결과에 따라 한 단계 나아가거나, 네임서버
-     *          주소를 먼저 풀거나, 끝낸다. 바퀴 수에 상한이 있어 참조가 순환해도 멈춘다.
-     * @note 이름 최소화 때문에 바퀴 수는 참조 예산에 라벨 수를 더한 만큼 필요하다. 그래서
-     *       바퀴 수와 따로, 실제로 따라간 위임 횟수를 세어 참조 예산에 맞춘다.
-     */
+    /// One query per turn, then a step down, an address lookup, or the end. The turn count is
+    /// capped, so a referral loop stops. Minimization needs the referral budget plus the label
+    /// count in turns, so followed delegations are counted separately against the referral budget.
     fn iterate_from(
         &self,
         qname: &Name,
@@ -2361,10 +2057,8 @@ impl Recursor {
                     Ok(r) => break r,
                     Err(e) => e,
                 };
-                /*
-                 * 이 영역의 서버가 모두 답하지 않았다. 남겨 둔 네임서버 이름이 있으면 그 주소로
-                 * 다시 묻는다.
-                 */
+                // No server of this zone answered; ask again with the addresses of the name servers
+                // left unresolved.
                 if budget.queries > 0 && self.resolve_more_ns_addrs(&mut state, budget) {
                     budget.queries -= 1;
                     continue;
@@ -2431,20 +2125,13 @@ impl Recursor {
         Err(RecurseError::TooManyReferrals)
     }
 
-    /**
-     * @brief 응답 하나를 보고 다음에 무엇을 할지 정한다.
-     *
-     * @details 순서가 안전성을 만든다. 최종 단계면 이 서버가 물은 것에 대한 답인지 먼저 보고,
-     *          NXDOMAIN이면 그 서버가 그 이름에 대해 권한이 있는지 확인한다. 참조는
-     *          현재 zone보다 가깝고 질의 이름을 포함할 때만 따라간다.
-     * @warning bailiwick 검사가 여기 있다. 두 조건 중 하나라도 빠지면 아무 서버나 남의
-     *          zone으로 이 서버를 끌고 갈 수 있다.
-     * @note 이름 최소화 중에 받은 NXDOMAIN은 그대로 믿지 않고 전체 이름으로 다시 묻는다.
-     *       빈 비단말을 NXDOMAIN으로 답하는 서버가 있기 때문이다.
-     * @note 권한 서버가 위임 없이 빈 답을 주면 그 이름은 지금 영역 안에 있다. 빈 비단말이
-     *       그렇다. 참조 경로 강화는 받아들일 수 없는 위임이나 권한 없는 답처럼 경로가
-     *       의심스러울 때만 멈춘다.
-     */
+    /// The order makes this safe. At the final step the answer must be for the question sent, and
+    /// an NXDOMAIN must come from a server authoritative for the name. A referral is followed only
+    /// when it is closer than the current zone and contains the query name: the bailiwick check,
+    /// without which any server could lead this one into another zone. An NXDOMAIN during
+    /// minimization is retried with the full name, as some servers answer empty non-terminals that
+    /// way. An empty authoritative answer without a delegation means the name is inside the current
+    /// zone, as for an empty non-terminal; referral hardening stops only when the path is suspect.
     fn advance(
         &self,
         state: &mut IterationState,
@@ -2585,10 +2272,8 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 받아들인 경계로 내려간다. 주소를 모르는 네임서버만 있으면 주소부터 풀게 한다.
-     * @param missing glue가 없어 주소를 모르는 네임서버 이름들.
-     */
+    /// Resolves addresses first when every name server lacks one; `missing` are the names without
+    /// glue.
     fn descend(
         &self,
         state: &mut IterationState,
@@ -2596,11 +2281,8 @@ impl Recursor {
         mut pending: PendingReferral,
         missing: Vec<Name>,
     ) -> StepOutcome {
-        /*
-         * 부모가 준 주소가 하나라도 있으면 그것으로 내려간다. 주소를 이미 쥐고도
-         * 남은 네임서버 이름을 먼저 풀러 가면, 그 하나하나가 다시 루트부터 걷는
-         * 해석이 되어 예산을 전부 소진한다.
-         */
+        // Descend as soon as the parent gave one address. Resolving the remaining names first would
+        // turn each into a resolution from the root and exhaust the budget.
         if !missing.is_empty() && pending.addrs.is_empty() {
             rtrace!(
                 "Looking up addresses of nameservers without glue: need_address={}, have_address={}",
@@ -2624,12 +2306,9 @@ impl Recursor {
         self.finish_referral(state, ctx, pending)
     }
 
-    /**
-     * @brief 답변 절로 드러난 경계의 DS와 그 부재 증명을 부모 영역의 서버에 묻는다.
-     * @details 자식 영역도 같은 서버가 맡지만 DS는 부모 영역의 데이터이므로 서버가 부모 쪽에서
-     *          답한다. 받은 증거는 참조의 권한 절처럼 체인 검증이 서명으로 확인한다.
-     * @return 답변 절과 권한 절의 레코드. 체인 단계의 DS 증거로 쓴다.
-     */
+    /// The same server may serve the child zone, but DS is parent data, so it answers from the
+    /// parent side. The chain validates the evidence by signature, as for a referral's authority
+    /// section. Returns the answer and authority records as the step's DS evidence.
     fn fetch_ds_evidence(
         &self,
         zone: &Name,
@@ -2650,12 +2329,8 @@ impl Recursor {
         Ok(resp.answers.into_iter().chain(resp.authorities).collect())
     }
 
-    /**
-     * @brief 주소가 모인 참조로 실제 이동한다.
-     * @details 주소를 정렬해 중복을 없애고 개수를 자른다. 자르지 않으면 주소를 잔뜩 담은
-     *          위임 하나가 캐시와 시도 횟수를 함께 부풀린다.
-     * @return 쓸 수 있는 주소가 하나도 없으면 실패다.
-     */
+    /// Sorts, deduplicates and caps the addresses; otherwise one delegation packed with addresses
+    /// inflates both the cache and the attempts. Fails when no address is usable.
     fn finish_referral(
         &self,
         state: &mut IterationState,
@@ -2720,14 +2395,9 @@ impl Recursor {
         StepOutcome::Continue
     }
 
-    /**
-     * @brief 응답의 추가 절에서 네임서버 주소를 추출한다.
-     *
-     * @details glue는 부모가 준 것이라 자식 zone 데이터만큼 믿을 수 없다. 그래서 현재
-     *          zone 안의 이름에 대한 것만 받아들인다.
-     * @warning bailiwick 밖 glue를 받으면 위임 하나로 임의의 이름에 임의의 주소를 심을 수 있다.
-     * @return 얻은 주소들, 주소를 모르는 이름들, 그리고 그 주소들의 최소 TTL.
-     */
+    /// Glue comes from the parent and deserves less trust than child data, so only glue for names
+    /// inside the current zone is accepted; out-of-bailiwick glue would let one delegation plant
+    /// any address for any name. Returns the addresses, the names without one, and the minimum TTL.
     fn glue_addrs(
         &self,
         resp: &Message,
@@ -2772,16 +2442,12 @@ impl Recursor {
         (out, missing, min_ttl)
     }
 
-    /**
-     * @brief glue가 없는 네임서버의 주소를 앞에서부터 풀되, 쓸 수 있는 주소가 생기면 멈춘다.
-     * @details 이 부수 해석도 같은 예산과 데드라인을 나눠 쓴다. 새로 잡으면 위임 체인 하나가
-     *          질의를 기하급수로 늘린다. 이름을 전부 풀면 느린 서버 하나가 남은 시간을 모두
-     *          가져가, 주소를 쥐고도 정작 그 영역에는 묻지 못한다. 남은 이름은 돌려주고, 받은
-     *          주소들이 모두 답하지 않을 때만 더 푼다.
-     * @note 주소는 어디로 보낼지만 정한다. 답은 체인으로 따로 검증하므로 이 해석은 검증하지
-     *       않는다. 위조된 주소는 틀린 서버로 보낼 뿐이고, 그 서버의 답은 검증에서 걸러진다.
-     * @return 얻은 주소들, 그 최소 TTL, 풀지 않고 남긴 이름들.
-     */
+    /// Resolves in order and stops once an address is usable; the rest is returned and resolved
+    /// only when those addresses all fail to answer. Resolving every name would let one slow server
+    /// take the remaining time. The side resolution shares the budget and deadline, or one
+    /// delegation chain would multiply queries. It is not validated: the address only picks a
+    /// destination, and a forged one leads to a server whose answers validation rejects. Returns
+    /// the addresses, their minimum TTL, and the names left.
     fn resolve_ns_addrs(
         &self,
         ns_names: &[Name],
@@ -2845,19 +2511,13 @@ impl Recursor {
         Ok((all, all_ttl, rest.cloned().collect()))
     }
 
-    /**
-     * @brief 지금 이 호스트에서 실제로 보낼 수 있는 서버 주소인지.
-     * @details 허용 여부에 더해, IPv6 경로가 없는 호스트의 IPv6 주소는 쓸 수 없는 것으로 본다.
-     *          그런 주소만 쥐고 네임서버 풀기를 멈추면 보낼 곳이 없다.
-     */
+    /// An IPv6 address on a host without an IPv6 route is unusable; stopping NS resolution with
+    /// only such addresses would leave nowhere to send.
     fn usable_server(&self, ip: IpAddr) -> bool {
         self.server_eligible(ip) && (ip.is_ipv4() || ipv6_route_available())
     }
 
-    /**
-     * @brief 지금 영역의 서버가 모두 답하지 않을 때 남겨 둔 네임서버 이름의 주소를 더 푼다.
-     * @return 새 주소를 얻어 서버 목록을 바꿨으면 참.
-     */
+    /// True when a new address changed the server list.
     fn resolve_more_ns_addrs(&self, state: &mut IterationState, budget: &mut Budget) -> bool {
         while !state.unresolved_ns.is_empty() {
             let names = std::mem::take(&mut state.unresolved_ns);
@@ -2888,12 +2548,11 @@ impl Recursor {
     }
 
     #[cfg(test)]
-    /** @brief 캐시된 네임서버 주소. */
     fn ns_addr_cached(&self, key: &[u8]) -> Option<Vec<IpAddr>> {
         self.ns_addr_cached_with_ttl(key).map(|(addrs, _)| addrs)
     }
 
-    /** @brief 캐시된 네임서버 주소와 남은 TTL. 만료된 항목은 꺼내면서 버린다. */
+    /// Drops an expired entry on the way out.
     fn ns_addr_cached_with_ttl(&self, key: &[u8]) -> Option<(Vec<IpAddr>, u32)> {
         let mut cache = self.ns_addr_cache.lock_recover();
         let now = cache_now_millis();
@@ -2913,7 +2572,6 @@ impl Recursor {
         }
     }
 
-    /** @brief 네임서버 주소를 캐시에 담는다. */
     fn ns_addr_store(&self, key: Vec<u8>, addrs: Vec<IpAddr>, ttl_secs: u32) {
         let mut addrs = addrs;
         addrs.sort_unstable();
@@ -2932,10 +2590,7 @@ impl Recursor {
         );
     }
 
-    /**
-     * @brief 이 이름에 대해 캐시된 위임 중 가장 깊은 것.
-     * @details 깊을수록 남은 단계가 적다. 얕은 것을 고르면 캐시를 쓰는 의미가 줄어든다.
-     */
+    /// Deeper means fewer steps left.
     fn deepest_cached_delegation(&self, qname: &Name) -> Option<(Name, Vec<SocketAddr>)> {
         let total = qname.num_labels();
         let now = cache_now_millis();
@@ -2957,7 +2612,7 @@ impl Recursor {
     }
 
     #[cfg(test)]
-    /** @brief zone의 캐시된 위임 서버들. 만료된 항목은 꺼내면서 버린다. */
+    /// Drops an expired entry on the way out.
     fn deleg_cached(&self, zone: &Name) -> Option<Vec<SocketAddr>> {
         let mut key = [0u8; 255];
         let key = zone.canonical_key_into(&mut key)?;
@@ -2973,7 +2628,6 @@ impl Recursor {
         }
     }
 
-    /** @brief 위임 서버를 캐시에 담는다. */
     fn deleg_store(&self, zone: &Name, servers: &[SocketAddr], ttl_secs: u32) {
         if servers.is_empty() {
             return;
@@ -2996,11 +2650,8 @@ impl Recursor {
         );
     }
 
-    /**
-     * @brief 이 이름으로 가는 경로의 위임 캐시를 전부 지운다.
-     * @details 캐시된 위임에서 시작한 시도가 실패했을 때 부른다. 어느 단계가 오래됐는지
-     *          알 수 없으므로 경로 전체를 버리고 루트부터 다시 걷는다.
-     */
+    /// Called when an attempt from a cached delegation fails. Which step is stale is unknown, so
+    /// the whole path goes and the walk restarts at the root.
     fn deleg_evict_path(&self, qname: &Name) {
         let total = qname.num_labels();
         let mut cache = self.deleg_cache.lock_recover();
@@ -3012,15 +2663,10 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 서버들을 순서대로 시도해 쓸 만한 응답 하나를 얻는다.
-     *
-     * @details 응답성이 좋은 서버부터 물어본다. 응답이 왔어도 이 서버의 질의와 맞지 않으면
-     *          쓰지 않고 다음 서버로 넘어가되, 마지막 수단으로 남겨 둔다.
-     * @warning 0x20 인코딩을 켰으면 응답의 질문 이름이 보낸 것과 대소문자까지 같아야 한다.
-     *          이 검사가 위조 응답을 걸러 내는 실체다.
-     * @note 서버당 시간을 나눠 준다. 첫 서버가 데드라인을 다 쓰면 나머지를 시도조차 못 한다.
-     */
+    /// Asks the most responsive servers first. An answer that does not match this server's query is
+    /// skipped but kept as a last resort. With 0x20 on, the question must match case for case: that
+    /// check is what rejects forged answers. Each server gets a share of the time, or the first
+    /// could spend the whole deadline.
     fn query_any(
         &self,
         servers: &[SocketAddr],
@@ -3031,16 +2677,12 @@ impl Recursor {
         self.query_any_reserving(servers, q, zone, deadline, 0)
     }
 
-    /**
-     * @brief query_any와 같되, 아직 주소를 풀지 않은 서버 몫의 시간을 남겨 둔다.
-     * @param reserve 이 목록이 모두 실패하면 이어서 풀어 물어볼 네임서버 이름 수.
-     * @details 서버마다 답을 기다릴 시간(server_patience)이 지나면 앞 서버의 답을 기다리는
-     *          채로 다음 서버에도 묻고, 먼저 온 쓸 만한 답을 쓴다. 앞 서버를 버리고 넘어가면
-     *          조금 느린 서버의 답을 받기 직전에 버리게 되고, 끝까지 기다리면 느린 서버 하나가
-     *          남은 시간을 다 쓴다.
-     * @note 네임서버 주소는 쓸 수 있는 것이 생기면 그만 풀므로 목록이 짧다. 그 몇 개로 시간을
-     *       나누면 죽은 서버 하나가 데드라인을 다 써서 남은 이름으로 넘어가지 못한다.
-     */
+    /// Like `query_any`, but reserves time for `reserve` name servers not yet resolved. After a
+    /// server's patience it asks the next while still waiting, and uses whichever usable answer
+    /// comes first: abandoning a slightly slow server would drop its answer just before it arrives,
+    /// and waiting to the end would let one slow server take the rest. Name server resolution stops
+    /// at the first usable address, so the list is short; dividing time among those few would let
+    /// one dead server keep the remaining names from being tried.
     fn query_any_reserving(
         &self,
         servers: &[SocketAddr],
@@ -3067,10 +2709,8 @@ impl Recursor {
         let mut in_flight = 0usize;
         let mut ask_next_at = Instant::now();
 
-        /*
-         * 교환마다 제한 시간을 데드라인 안에 잡으므로, 이 상한은 교환이 제 시간을 넘기는
-         * 이상한 경우에만 쓰인다.
-         */
+        // Each exchange's timeout already falls inside the deadline, so this applies only when an
+        // exchange overruns.
         let settled_by = deadline + per_server;
         loop {
             let now = Instant::now();
@@ -3105,11 +2745,9 @@ impl Recursor {
             if in_flight == 0 {
                 break;
             }
-            /*
-             * 데드라인이 지나면 새로 묻지 않고, 이미 보낸 교환이 끝나 결과를 보낼 때까지만
-             * 기다린다. 끝나기 전에 돌아가면 그 교환이 아직 진행 중으로 남아, 곧 같은 질의를 다시
-             * 보내는 쪽이 끝나 가는 교환에 합쳐져 함께 시간 초과로 끝난다.
-             */
+            // Past the deadline, ask nothing new and wait only until the exchanges in flight report
+            // back. Returning earlier would leave one in flight, and the next identical query would
+            // join it and time out with it.
             let wake = if !asking {
                 settled_by
             } else if next < ordered.len() && in_flight < MAX_EXCHANGES_PER_QUERY {
@@ -3176,14 +2814,10 @@ impl Recursor {
         fallback.ok_or(RecurseError::NoResponse)
     }
 
-    /**
-     * @brief 서버 하나에 묻는 교환을 따로 돌리고 결과를 채널로 보낸다.
-     * @details 부른 쪽은 이 교환을 기다리는 동안 다른 서버에도 물을 수 있어야 한다. 부른 쪽이
-     *          먼저 끝나 채널을 닫아도 교환은 자기 제한 시간 안에 끝나고 결과만 버려진다.
-     *          스레드를 만들지 못하면 이 자리에서 직접 묻는다.
-     * @note 전송은 교환마다 새로 고른다. UDP 53번 가로채기 판정은 해석 도중에도 켜지며, 켜진
-     *       뒤에 UDP로 보낸 질의는 답을 받지 못한다.
-     */
+    /// Lets the caller ask other servers while this one runs. If the caller finishes first and
+    /// drops the channel, the exchange still ends within its own timeout and the result is dropped.
+    /// Without a thread it asks in place. The transport is chosen per exchange, since UDP 53
+    /// interception may be detected mid-resolution and a UDP query after that gets no answer.
     fn spawn_attempt(
         &self,
         server: SocketAddr,
@@ -3219,10 +2853,7 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 답을 받기 전에 그만 기다린 서버들의 왕복 시간을 기다린 시간 이상으로 기록한다.
-     * @param started 서버마다 아직 답을 기다리던 교환의 시작 시각.
-     */
+    /// Records the RTT of servers abandoned before answering as at least the time waited.
     fn record_unanswered(&self, ordered: &[SocketAddr], started: &[Option<Instant>]) {
         for (server, at) in ordered.iter().zip(started) {
             if let Some(at) = at {
@@ -3231,11 +2862,8 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 이 서버의 답을 기다렸다가 다음 서버에도 물을 때까지의 시간.
-     * @details 잰 왕복 시간이 있으면 그 세 배다. RFC 6298이 첫 측정 뒤에 잡는 재전송 시간과
-     *          같은 값으로, 평소의 흔들림으로는 넘지 않는다.
-     */
+    /// Three times the measured RTT, the retransmission timeout RFC 6298 sets after the first
+    /// measurement; normal jitter stays below it.
     fn server_patience(&self, ip: IpAddr) -> Duration {
         match self.srtt(ip) {
             Some(ms) => Duration::from_millis(u64::from(ms) * 3).max(MIN_SERVER_PATIENCE),
@@ -3243,13 +2871,9 @@ impl Recursor {
         }
     }
 
-    /**
-     * @brief 응답성 통계로 서버 순서를 정한다.
-     * @details 선호 계열과 점수로 정렬한다. 최근에 실패한 서버는 점수에 벌점이 붙어 뒤로 가지만
-     *          목록에는 남는다. 앞 서버가 이번 질의에서 답하지 않으면 같은 질의 안에서 그 서버에도
-     *          물어야 하기 때문이다. 연달아 실패해 내려간 서버만 빼므로, 전부 내려갔으면 빈
-     *          목록이다.
-     */
+    /// Sorts by preferred family and score. Recently failed servers get a penalty but stay listed,
+    /// since the query must still try them if the first ones do not answer. Only servers down after
+    /// repeated failures are dropped, so the list is empty when all are down.
     fn order_by_infra(&self, servers: &[SocketAddr], zone: &Name) -> Vec<SocketAddr> {
         let infra = self.infra.lock_recover();
         let rtt = self.rtt.lock_recover();
@@ -3277,12 +2901,9 @@ impl Recursor {
         ranked.into_iter().map(|(_, _, server)| server).collect()
     }
 
-    /**
-     * @brief 이 zone의 서버 가운데 실제로 물을 서버를 물을 순서대로 고른다.
-     * @retval NoReachableNs 정책이나 주소 계열 때문에 물을 수 있는 서버가 하나도 없다.
-     * @retval NoResponse 물을 수 있는 서버가 모두 연달아 실패해 내려가 있다. 전송 실패로
-     *         알려야 bin이 예비 경로(fallback_upstreams)로 넘긴다.
-     */
+    /// `NoReachableNs` when policy or address family leaves no server to ask. `NoResponse` when
+    /// every candidate is down after repeated failures: reported as a transport failure so the bin
+    /// moves to `fallback_upstreams`.
     fn ask_order(
         &self,
         servers: &[SocketAddr],
@@ -3307,15 +2928,13 @@ impl Recursor {
         Ok(ordered)
     }
 
-    /** @brief 이 주소가 재 본 적 있는 왕복 시간. 처음 보는 주소면 없다. */
+    /// `None` for an address not measured yet.
     fn srtt(&self, ip: IpAddr) -> Option<u32> {
         self.rtt.lock_recover().peek(&ip).copied()
     }
 
-    /**
-     * @brief 왕복 시간 측정 하나를 반영한다.
-     * @note 지수 평활이라 새 측정이 8분의 1만 반영된다. 한 번 느렸다고 순위가 뒤집히지 않는다.
-     */
+    /// Exponential smoothing: a new sample counts one eighth, so one slow answer does not flip the
+    /// order.
     fn record_rtt(&self, ip: IpAddr, sample: Duration) {
         let ms = sample.as_millis().min(u128::from(u32::MAX)) as u32;
         let mut rtt = self.rtt.lock_recover();
@@ -3326,11 +2945,8 @@ impl Recursor {
         rtt.put(ip, smoothed);
     }
 
-    /**
-     * @brief 답을 기다리던 중에 다른 서버의 답을 받아 그만 기다린 서버를 기록한다.
-     * @details 이 서버의 왕복 시간은 적어도 기다린 시간만큼이다. 이것을 남기지 않으면 처음 보는
-     *          서버로 남아 다음 질의에서도 가장 먼저 물어진다.
-     */
+    /// Its RTT is at least the time waited; without this the server stays unmeasured and is asked
+    /// first again next time.
     fn record_rtt_at_least(&self, ip: IpAddr, waited: Duration) {
         if self
             .srtt(ip)
@@ -3340,13 +2956,13 @@ impl Recursor {
         }
     }
 
-    /** @brief 성공을 기록한다. 왕복 시간을 갱신하고 이 zone에서의 실패 기록을 지운다. */
+    /// Updates the RTT and clears the zone's failure record.
     fn infra_success(&self, ip: IpAddr, zone: &Name, rtt: Duration) {
         self.record_rtt(ip, rtt);
         self.infra.lock_recover().pop(&InfraKey::new(ip, zone));
     }
 
-    /** @brief 프로토콜 오류를 기록한다. 응답은 왔으므로 전송 실패와는 다르게 센다. */
+    /// An answer came, so it counts differently from a transport failure.
     fn infra_protocol_error(&self, ip: IpAddr, zone: &Name) {
         let key = InfraKey::new(ip, zone);
         let mut infra = self.infra.lock_recover();
@@ -3355,7 +2971,7 @@ impl Recursor {
         infra.put(key, state);
     }
 
-    /** @brief 전송 실패를 기록한다. 순위가 뒤로 밀리고, 연달아 실패하면 한동안 묻지 않는다. */
+    /// Lowers the rank; repeated failures stop queries to it for a while.
     fn infra_fail(&self, ip: IpAddr, zone: &Name) {
         let key = InfraKey::new(ip, zone);
         let now = Instant::now();
@@ -3369,13 +2985,8 @@ impl Recursor {
     }
 }
 
-/**
- * @brief 서버 점수. 낮을수록 먼저 시도한다.
- * @details 왕복 시간에 실패 벌점을 더한다. 벌점을 크게 잡아 실패한 서버가 뒤로 가지만,
- *          완전히 배제하지는 않아 INFRA_FAIL_COOLDOWN이 지나면 자연히 돌아온다.
- * @param state 이 서버와 zone 쌍의 실패 기록.
- * @param srtt_ms 이 주소의 평활 왕복 시간. 재 본 적 없으면 없다.
- */
+/// Lower is tried first: RTT plus a failure penalty. The penalty is large enough to push failed
+/// servers back without excluding them, so they return after `INFRA_FAIL_COOLDOWN`.
 fn infra_score(state: Option<&InfraStat>, srtt_ms: Option<u32>, now: Instant) -> u64 {
     let base = u64::from(srtt_ms.unwrap_or(DEFAULT_RTT_MS));
     let Some(state) = state else {
@@ -3397,14 +3008,10 @@ fn infra_score(state: Option<&InfraStat>, srtt_ms: Option<u32>, now: Instant) ->
     base + transport_penalty + protocol_penalty
 }
 
-/**
- * @brief 이 주소가 전역에서 라우팅되는 정상 주소인지.
- *
- * @details 루프백, 사설, 링크 로컬, 문서화용, 그리고 IPv6에 IPv4를 포함한 형태까지 전부
- *          거른다. 포함한 형태를 놓치면 IPv6 주소로 감싼 내부 IPv4로 우회할 수 있다.
- * @warning 이것이 SSRF 방어의 핵심이다. 위임을 조작해 내부망 주소를 네임서버로 심으면
- *          이 서버가 대신 내부망을 두드리게 된다.
- */
+/// Filters loopback, private, link-local, documentation and IPv4-embedding IPv6 forms; missing the
+/// embedded forms would let an internal IPv4 address slip through wrapped in IPv6. This is the core
+/// SSRF defense: a crafted delegation naming an internal address would make this server probe the
+/// internal network.
 fn is_globally_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(address) => !is_special_v4(address),
@@ -3434,7 +3041,7 @@ fn is_globally_routable(ip: IpAddr) -> bool {
     }
 }
 
-/** @brief IPv6 주소 안에 든 IPv4를 꺼낸다. 매핑, 6to4, NAT64 형태를 모두 본다. */
+/// Mapped, 6to4 and NAT64 forms.
 fn embedded_v4(address: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return Some(mapped);
@@ -3462,7 +3069,6 @@ fn embedded_v4(address: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     None
 }
 
-/** @brief 이 IPv4가 특수 용도 대역인지. 루프백·사설·링크로컬·문서화용 등을 모두 포함한다. */
 fn is_special_v4(address: std::net::Ipv4Addr) -> bool {
     let value = u32::from(address);
     let in_net = |network: [u8; 4], prefix: u8| {
@@ -3491,24 +3097,22 @@ fn is_special_v4(address: std::net::Ipv4Addr) -> bool {
         || in_net([240, 0, 0, 0], 4)
 }
 
-/** @brief 검증 실패로 막은 응답 수. 지표로 내보낸다. */
+/// Answers blocked as bogus, exported as a metric.
 pub static VALIDATION_BOGUS_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 std::thread_local! {
-    /** @brief 병렬 테스트의 전역 계수 간섭 없이 현재 스레드의 증가만 관찰한다. */
+    /// Observes only this thread's increments, so parallel tests do not interfere.
     static TEST_THREAD_VALIDATION_BOGUS_TOTAL: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
 }
 
-/** @brief 지금까지의 검증 실패 수. */
 pub fn validation_bogus_total() -> u64 {
     VALIDATION_BOGUS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/** @brief 검증 실패를 전역 관측성 계수에 한 번 기록한다. */
 fn record_validation_bogus() {
     VALIDATION_BOGUS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -3518,16 +3122,12 @@ fn record_validation_bogus() {
 }
 
 #[cfg(test)]
-/** @brief 현재 테스트 스레드가 기록한 검증 실패 수. */
 fn test_thread_validation_bogus_total() -> u64 {
     TEST_THREAD_VALIDATION_BOGUS_TOTAL.with(std::cell::Cell::get)
 }
 
-/**
- * @brief EDE 사유 코드에 붙일 설명 문구.
- * @details 사유마다 다른 문구를 주어야 운영자가 무엇을 고쳐야 할지 알 수 있다. 서명이
- *          깨진 것과 이 서버가 계산을 거부한 것은 대응이 다르다.
- */
+/// Each code gets its own text so operators know what to fix: a broken signature and a refused
+/// computation need different responses.
 fn ede_text_for(code: u16) -> &'static str {
     match code {
         ede_code::UNSUPPORTED_NSEC3_ITERATIONS => "NSEC3 iterations above local limit",
@@ -3536,16 +3136,10 @@ fn ede_text_for(code: u16) -> &'static str {
     }
 }
 
-/**
- * @brief 검증에 실패한 응답을 SERVFAIL로 바꾼다.
- * @note 질문만 남기고 레코드를 전부 버린다. 깨진 답을 조금이라도 남기면 질의자가 그것을
- *       쓸 수 있다.
- */
+/// Keeps only the question; any record left from a broken answer could be used by the client.
 fn bogus_servfail(template: &Message, ede: u16) -> Message {
-    /*
-     * 키를 받지 못한 것은 권한 서버에 닿지 못한 것이지 검증이 실패한 것이 아니다. 검증 실패
-     * 지표에 섞으면 망 장애가 서명 문제로 보인다.
-     */
+    // A missing key means the authorities were unreachable, not that validation failed. Counting it
+    // as a validation failure would make a network outage look like a signature problem.
     if ede != ede_code::NO_REACHABLE_AUTHORITY {
         record_validation_bogus();
     }
@@ -3559,7 +3153,7 @@ fn bogus_servfail(template: &Message, ede: u16) -> Message {
     sf
 }
 
-/** @brief 업스트림에 보낼 질의 메시지를 만든다. 재귀 요청 비트는 설정하지 않는다. */
+/// RD is not set.
 fn make_query(qname: &Name, qtype: RecordType, do_bit: bool) -> Message {
     let mut m = Message {
         header: Header {
@@ -3588,11 +3182,7 @@ fn make_query(qname: &Name, qtype: RecordType, do_bit: bool) -> Message {
     m
 }
 
-/**
- * @brief 이름의 대소문자를 무작위로 섞는다.
- * @details 응답에 그대로 되비쳐 오므로, 맞히려면 트랜잭션 ID와 포트 외에 이 패턴까지
- *          맞혀야 한다. 위조 난도를 크게 올린다.
- */
+/// The answer echoes the case pattern, so a forger must also guess it besides the ID and port.
 fn randomize_name_case(name: &Name) -> Name {
     let mut bits = onetdns_core::ephemeral_random_array::<32>();
     let mut idx = 0usize;
@@ -3624,7 +3214,7 @@ fn randomize_name_case(name: &Name) -> Name {
     Name::from_labels(labels).unwrap_or_else(|_| name.clone())
 }
 
-/** @brief 이름을 소문자로 내린다. 업스트림 캐시 적중률을 올린다. */
+/// Improves upstream cache hits.
 fn lowercase_name(name: &Name) -> Name {
     Name::from_labels(
         name.labels()
@@ -3635,10 +3225,7 @@ fn lowercase_name(name: &Name) -> Name {
     .unwrap_or_else(|_| name.clone())
 }
 
-/**
- * @brief 응답의 질문이 보낸 것과 대소문자까지 같은지.
- * @warning 0x20 인코딩의 검사 지점이다. 대소문자를 무시하면 이 방어가 전부 사라진다.
- */
+/// The 0x20 check; ignoring case would remove the defense entirely.
 fn questions_case_exact(resp: &[Question], sent: &[Question]) -> bool {
     if resp.len() != sent.len() {
         return false;
@@ -3655,10 +3242,8 @@ fn questions_case_exact(resp: &[Question], sent: &[Question]) -> bool {
     })
 }
 
-/**
- * @brief DS와 그 부재 증명, 서명을 추출한다. 체인 단계에 기록된다.
- * @param records 참조 응답의 권한 절, 또는 부모에게 따로 물은 DS 응답의 레코드.
- */
+/// `records` is a referral's authority section or the answer to a separate DS query to the
+/// parent.
 fn extract_ds(
     records: &[Record],
     child_zone: &Name,
@@ -3729,18 +3314,15 @@ fn extract_ds(
     (recs, sigs, nsec, nsec_sigs, nsec3, nsec3_sigs, ds)
 }
 
-/**
- * @brief 이 호스트에 전역 IPv6 경로가 있는지.
- * @details UDP 소켓의 connect는 경로만 고르고 패킷을 보내지 않으므로, 경로가 없으면 네트워크
- *          도달 불가로 바로 실패한다. 경로가 없는 호스트에서 AAAA를 풀면 쓸 수 없는 주소를
- *          얻으려고 시간만 쓴다. 망은 바뀔 수 있으므로 판정은 30초만 쓴다.
- * @note 대상은 a.root-servers.net 의 IPv6 주소다. 전역 경로가 있는지만 보므로 응답은 필요 없다.
- */
+/// Connecting a UDP socket picks a route without sending, so it fails at once when there is
+/// none; resolving AAAA on such a host only spends time on unusable addresses. The target is
+/// a.root-servers.net's IPv6 address. The network can change, so the result is reused for 30
+/// seconds only.
 fn ipv6_route_available() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /** @brief 판정을 다시 할 간격(초). */
     const RECHECK_SECS: u64 = 30;
-    /** @brief 마지막 판정 시각(Unix 초)을 위 비트에, 결과를 맨 아래 비트에 담는다. 0이면 판정 전이다. */
+    /// The last check time (Unix seconds) in the upper bits, the result in the lowest bit; 0 means
+    /// not checked yet.
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3762,7 +3344,6 @@ fn ipv6_route_available() -> bool {
     available
 }
 
-/** @brief 현재 Unix 초. 서명 유효 기간 판정에 쓴다. */
 fn now_secs() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3770,7 +3351,6 @@ fn now_secs() -> u32 {
         .unwrap_or(0)
 }
 
-/** @brief 특정 소유자와 타입을 덮는 RRSIG만 골라낸다. */
 fn extract_rrsigs(
     records: &[Record],
     type_covered: u16,
@@ -3786,21 +3366,15 @@ fn extract_rrsigs(
         .collect()
 }
 
-/**
- * @brief 와일드카드 확장이 정당함을 증명했는지.
- * @details next closer가 존재하지 않는다는 서명된 NSEC이나 NSEC3이 있어야 한다. 없으면
- *          더 구체적인 이름을 숨긴 것일 수 있다.
- */
+/// A wildcard expansion needs a signed NSEC or NSEC3 proving the next closer absent; otherwise a
+/// more specific name may be hidden.
 struct WildcardValidation<'a> {
-    /** @brief 리프 zone의 검증된 키. */
     keys: &'a [onetdns_dnssec::Dnskey],
-    /** @brief 서명자가 일치해야 하는 리프 apex. */
+    /// The signer must match this apex.
     apex: &'a Name,
-    /** @brief 서명 시간 검사 기준. */
     now: u32,
-    /** @brief 허용할 NSEC3 반복 상한. */
     nsec3_max_iterations: u16,
-    /** @brief 답변 RRset부터 이어 받은 응답 전체 공개키 예산. */
+    /// The response-wide public-key budget, carried on from the answer RRsets.
     verification_budget: &'a mut onetdns_dnssec::VerificationBudget,
 }
 
@@ -3848,7 +3422,7 @@ fn validated_wildcard_expansion(
             })
 }
 
-/** @brief 선택된 최소 NSEC/NSEC3 증명의 RRset 서명을 전부 확인한다. */
+/// Validates the signatures of every RRset in the selected minimal NSEC or NSEC3 proof.
 fn validate_denial_proof(
     proof: &[Record],
     response_records: &[Record],
@@ -3872,13 +3446,9 @@ fn validate_denial_proof(
         })
 }
 
-/**
- * @brief 검증에 실제로 쓴 부재 증명 레코드만 모은다.
- * @details apex SOA 와 고른 증명 레코드, 그리고 그것들을 덮는 서명만 남긴다. AD 를 세운
- *          응답이 검증하지 않은 NSEC 을 싣고 나가면, 위쪽 부재 합성 계층이 그 NSEC 을 믿고
- *          담아 같은 영역의 무관한 이름까지 없다고 답한다.
- * @return 담아 둘 수 있는 권한 절 레코드.
- */
+/// Keeps the apex SOA, the selected proof records and their signatures. An AD answer carrying an
+/// unvalidated NSEC would let the denial synthesis layer above trust it and deny unrelated names
+/// in the zone.
 fn validated_denial_records(
     soa: &[Record],
     proof: &[Record],
@@ -3908,23 +3478,21 @@ fn validated_denial_records(
     kept
 }
 
-/** @brief 이름이 zone 안인지. */
 fn is_within(name: &Name, zone: &Name) -> bool {
     name.ends_with_ignore_case(zone)
 }
 
-/** @brief 현재 zone 밖 소유자의 DNAME을 응답에서 걷어낸다. 남기면 그것으로 이름을 가로챌 수 있다. */
+/// Left in place, it could hijack names.
 fn strip_out_of_bailiwick_dnames(resp: &mut Message, zone: &Name) {
     resp.answers
         .retain(|r| !matches!(r.rdata, RData::Dname(_)) || is_within(&r.name, zone));
 }
 
-/** @brief 후보 zone이 현재보다 질의 이름에 더 가까운지. 참조를 따라가는 조건 중 하나다. */
+/// One of the conditions for following a referral.
 fn is_closer(cand: &Name, cur: &Name) -> bool {
     cand.num_labels() > cur.num_labels() && is_within(cand, cur)
 }
 
-/** @brief 두 TTL 중 작은 쪽. 한쪽이 없으면 나머지. */
 fn min_optional_ttl(left: Option<u32>, right: Option<u32>) -> Option<u32> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -3933,10 +3501,8 @@ fn min_optional_ttl(left: Option<u32>, right: Option<u32>) -> Option<u32> {
     }
 }
 
-/**
- * @brief 경계의 NS 레코드 중 최소 TTL. 위임 캐시 기간이 된다.
- * @note 참조면 권한 절에, 권한 있는 답으로 드러난 경계면 답변 절에 있다.
- */
+/// Becomes the delegation cache lifetime. In the authority section for a referral, in the answer
+/// section for a cut revealed by an authoritative answer.
 fn min_ns_ttl(resp: &Message, zone: &Name) -> Option<u32> {
     resp.authorities
         .iter()
@@ -3948,10 +3514,7 @@ fn min_ns_ttl(resp: &Message, zone: &Name) -> Option<u32> {
         .min()
 }
 
-/**
- * @brief 응답에서 위임 zone과 네임서버 이름들을 추출한다.
- * @note 권한 절의 NS만 본다. 답변 절의 NS는 그 zone 자신에 대한 답이지 위임이 아니다.
- */
+/// Looks only at authority NS; answer NS is about the zone itself, not a delegation.
 fn extract_referral(resp: &Message, qname: &Name) -> (Option<Name>, Vec<Name>) {
     if resp.header.rcode != ResponseCode::NoError.0
         || resp.header.authoritative
@@ -3991,15 +3554,11 @@ fn extract_referral(resp: &Message, qname: &Name) -> (Option<Name>, Vec<Name>) {
     (Some(zone), ns)
 }
 
-/**
- * @brief 최소화 질의에 온 권한 있는 NS 답이 현재 영역 아래의 경계를 드러내는지.
- * @details 부모와 자식 영역을 같은 서버가 맡으면 서버는 자식 영역으로 답하므로, 경계의 NS가
- *          참조의 권한 절이 아니라 답변 절에 온다. RFC 9156은 이 답도 경계로 다룬다. 따라가지
- *          않으면 현재 영역을 부모로 잘못 알아, 자식 영역의 SOA가 붙은 부정 응답을 무관한
- *          것으로 버린다.
- * @note 물은 이름이 현재 영역보다 깊어야 한다. 현재 영역의 꼭대기 NS는 경계가 아니다.
- * @return 경계면 그 영역의 네임서버 이름들.
- */
+/// When one server serves parent and child, it answers from the child, so the cut's NS comes in
+/// the answer section rather than a referral's authority section; RFC 9156 treats that as a cut
+/// too. Not following it would mistake the current zone for the parent and discard a negative
+/// answer carrying the child's SOA as irrelevant. The name asked must be deeper than the current
+/// zone; the zone's own apex NS is not a cut. Returns the cut's name server names.
 fn answer_zone_cut(resp: &Message, plan: &NextQuery, zone: &Name) -> Option<Vec<Name>> {
     if plan.is_final
         || plan.mtype != RecordType::NS
@@ -4024,7 +3583,6 @@ fn answer_zone_cut(resp: &Message, plan: &NextQuery, zone: &Name) -> Option<Vec<
     (!ns.is_empty()).then_some(ns)
 }
 
-/** @brief 이 서버가 물은 이름과 타입에 대한 답이 실제로 있는지. */
 fn has_direct_qtype_answer(resp: &Message, qname: &Name, qtype: RecordType) -> bool {
     resp.answers.iter().any(|record| {
         record.class == DnsClass::IN
@@ -4033,7 +3591,7 @@ fn has_direct_qtype_answer(resp: &Message, qname: &Name, qtype: RecordType) -> b
     })
 }
 
-/** @brief DNAME 합성 이름이 길이 상한을 넘어 YXDOMAIN이 된 경우인지. 이것도 최종 응답이다. */
+/// A DNAME result exceeding the name length gives YXDOMAIN, also a final answer.
 fn is_dname_yxdomain(resp: &Message, qname: &Name) -> bool {
     resp.header.rcode == ResponseCode::YXDomain.0
         && resp.header.authoritative
@@ -4047,7 +3605,7 @@ fn is_dname_yxdomain(resp: &Message, qname: &Name) -> bool {
         })
 }
 
-/** @brief 이 zone에서 온 SOA가 권한 절에 있는지. 부정 응답의 근거가 된다. */
+/// The basis of a negative answer.
 fn has_relevant_soa(resp: &Message, qname: &Name, zone: &Name) -> bool {
     is_within(qname, zone)
         && resp.authorities.iter().any(|record| {
@@ -4057,12 +3615,10 @@ fn has_relevant_soa(resp: &Message, qname: &Name, zone: &Name) -> bool {
         })
 }
 
-/** @brief 이 서버의 질의 이름에 대한 별칭이 답변에 있는지. */
 fn has_relevant_alias(resp: &Message, qname: &Name) -> bool {
     cname_target(resp, qname).is_some() || dname_rewrite(resp, qname).is_some()
 }
 
-/** @brief 이 응답이 이 서버의 질의에 대한 쓸 만한 긍정 답인지. */
 fn is_relevant_positive(resp: &Message, qname: &Name, qtype: RecordType) -> bool {
     resp.header.rcode == ResponseCode::NoError.0
         && resp.header.authoritative
@@ -4070,22 +3626,16 @@ fn is_relevant_positive(resp: &Message, qname: &Name, qtype: RecordType) -> bool
         && (has_direct_qtype_answer(resp, qname, qtype) || has_relevant_alias(resp, qname))
 }
 
-/**
- * @brief 이 NXDOMAIN을 믿어도 되는지.
- * @warning 권한 비트와 zone 관련성을 함께 본다. 무관한 서버의 NXDOMAIN을 그대로 받으면
- *          아무나 임의의 이름을 지울 수 있다.
- */
+/// Requires the AA bit and zone relevance; accepting any server's NXDOMAIN would let anyone
+/// delete arbitrary names.
 fn is_authoritative_negative(resp: &Message, qname: &Name, zone: &Name) -> bool {
     resp.header.authoritative && has_relevant_soa(resp, qname, zone)
 }
 
-/**
- * @brief 권한 서버가 답도 SOA도 위임도 없이 비워 보낸 NOERROR인지.
- * @details RFC 2308은 이 모양도 NODATA의 한 형태로 열거한다. 지역 부하 분산용 권한 서버가
- *          A에만 별칭을 주고 다른 유형에는 이렇게 답하는 일이 흔해서, 받지 않으면 영역의 모든
- *          서버가 실패로 보여 SERVFAIL이 된다. SOA가 없으니 부정 캐시 기한이 없고, 담지 않는 일은
- *          캐시 계층이 맡는다. 서명된 영역이면 부재 증명 검증이 SOA를 요구하므로 bogus가 된다.
- */
+/// RFC 2308 lists this shape as a form of NODATA. Load-balancing authorities often give an alias
+/// for A and answer other types this way; refusing it would make every server of the zone look
+/// failed and end in SERVFAIL. Without an SOA there is no negative TTL, and the cache layer
+/// declines to store it. In a signed zone the denial validation requires an SOA, so it is bogus.
 fn is_bare_authoritative_nodata(resp: &Message, qname: &Name, zone: &Name) -> bool {
     resp.header.rcode == ResponseCode::NoError.0
         && resp.header.authoritative
@@ -4097,7 +3647,6 @@ fn is_bare_authoritative_nodata(resp: &Message, qname: &Name, zone: &Name) -> bo
             .any(|record| matches!(record.rtype, RecordType::NS | RecordType::SOA))
 }
 
-/** @brief 이 응답 코드면 다른 서버에 다시 물어볼 만한지. */
 fn retryable_rcode(rcode: u16) -> bool {
     matches!(
         rcode,
@@ -4108,11 +3657,8 @@ fn retryable_rcode(rcode: u16) -> bool {
     )
 }
 
-/**
- * @brief 이 응답으로 반복을 이어 갈 수 있는지.
- * @details 트랜잭션 ID와 질문이 이 서버가 보낸 것과 맞아야 하고, 응답 코드도 쓸 수 있는
- *          것이어야 한다. 하나라도 어긋나면 다음 서버로 넘어간다.
- */
+/// The ID and question must match what this server sent, and the rcode must be usable; otherwise
+/// the next server is tried.
 fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -> bool {
     let Some(question) = query.questions.first() else {
         return false;
@@ -4138,18 +3684,15 @@ fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -
     }
 }
 
-/** @brief 답변은 없지만 이것으로 끝나는 응답인지. NODATA가 여기 해당한다. */
+/// NODATA, for example.
 fn is_terminal_response(resp: &Message, qname: &Name, zone: &Name) -> bool {
     resp.header.rcode == ResponseCode::NoError.0
         && (is_authoritative_negative(resp, qname, zone)
             || is_bare_authoritative_nodata(resp, qname, zone))
 }
 
-/**
- * @brief 최종 응답에서 이 서버가 보증하지 않는 레코드를 걷어낸다.
- * @warning 업스트림이 끼워 넣은 무관한 레코드를 그대로 흘리면 캐시 오염이 된다. 질의 이름과
- *          zone에 관계있는 것만 남긴다.
- */
+/// Keeps only records related to the query name and zone; passing on unrelated records an
+/// upstream added would poison the cache.
 fn sanitize_terminal_response(
     response: &mut Message,
     qname: &Name,
@@ -4201,20 +3744,15 @@ fn sanitize_terminal_response(
         .retain(|record| record.rtype == RecordType::OPT);
 }
 
-/** @brief 별칭 한 걸음. 따라갈 대상과 그 근거 레코드를 담는다. */
 struct AliasHop {
-    /** @brief 이 별칭이 가리키는 곳. */
     target: Name,
-    /** @brief 이 별칭이 걸린 이름. */
     owner: Name,
-    /** @brief 별칭의 종류. */
     atype: RecordType,
 
-    /** @brief 이 단계에서 얻은 기록들. */
     records: Vec<Record>,
 }
 
-/** @brief 응답에서 따라가야 할 별칭을 찾는다. DNAME이 CNAME보다 우선한다. */
+/// DNAME takes precedence over CNAME.
 fn alias_hop(resp: &Message, qname: &Name, qtype: RecordType) -> Option<AliasHop> {
     if resp.header.rcode == ResponseCode::NXDomain.0 {
         return None;
@@ -4242,7 +3780,7 @@ fn alias_hop(resp: &Message, qname: &Name, qtype: RecordType) -> Option<AliasHop
     })
 }
 
-/** @brief 별칭 RRset과 그 서명을 함께 모은다. 검증에 둘 다 필요하다. */
+/// Validation needs both.
 fn alias_rrset_records(response: &Message, owner: &Name, alias_type: RecordType) -> Vec<Record> {
     response
         .answers
@@ -4259,7 +3797,7 @@ fn alias_rrset_records(response: &Message, owner: &Name, alias_type: RecordType)
         .collect()
 }
 
-/** @brief 이 서버의 질의 이름에 대한 CNAME 대상. 소유자가 올바를 때만 준다. */
+/// Only when the owner is valid.
 fn cname_target(resp: &Message, qname: &Name) -> Option<Name> {
     if !cname_owner_is_valid(resp, qname) {
         return None;
@@ -4283,10 +3821,7 @@ fn cname_target(resp: &Message, qname: &Name) -> Option<Name> {
     target
 }
 
-/**
- * @brief 이 CNAME 소유자를 받아들일 수 있는지.
- * @note 같은 소유자에 서로 다른 CNAME이 있으면 거부한다. 어느 쪽을 따라갈지 정해지지 않는다.
- */
+/// Different CNAMEs at one owner are refused: which to follow would be undecided.
 fn cname_owner_is_valid(resp: &Message, owner: &Name) -> bool {
     let has_cname = resp.answers.iter().any(|record| {
         record.class == DnsClass::IN
@@ -4306,11 +3841,7 @@ fn cname_owner_is_valid(resp: &Message, owner: &Name) -> bool {
     })
 }
 
-/**
- * @brief 응답의 DNAME으로 이름을 다시 쓴다.
- * @details 소유자가 여럿이면 가장 긴 것이 이긴다. 짧은 것을 고르면 더 구체적인 규칙을
- *          건너뛰게 된다.
- */
+/// The longest owner wins; a shorter one would skip a more specific rule.
 fn dname_rewrite(resp: &Message, qname: &Name) -> Option<(Record, Name, Record)> {
     let mut best: Option<&Record> = None;
     for record in &resp.answers {
@@ -4359,7 +3890,6 @@ fn dname_rewrite(resp: &Message, qname: &Name) -> Option<(Record, Name, Record)>
     Some((record.clone(), target, synthetic))
 }
 
-/** @brief 내장 루트 서버 목록. */
 pub fn default_roots() -> Vec<SocketAddr> {
     [
         [198, 41, 0, 4],
@@ -4382,34 +3912,32 @@ pub fn default_roots() -> Vec<SocketAddr> {
 }
 
 #[cfg(unix)]
-/** @brief 이벤트 구동 해석 레인. 동기 경로와 같은 판정을 내되 스레드를 붙잡지 않는다. */
+/// Event-driven resolution lane: the same decisions as the synchronous path without holding a
+/// thread.
 pub mod reactor;
 
 #[cfg(all(test, unix))]
 #[path = "reactor_probe.rs"]
-/** @brief 레인의 수명과 자원 사용을 측정하는 테스트 전용 프로브. */
+/// Test-only probe measuring the lane's lifetime and resource use.
 mod reactor_probe;
 
 #[cfg(all(test, target_os = "linux", target_env = "musl"))]
 #[global_allocator]
-/** @brief 프로브가 할당을 관찰할 수 있도록 테스트 빌드에서만 교체하는 전역 할당기. */
+/// Swapped in test builds only, so the probe can observe allocations.
 static PROBE_ALLOC: onetdns_core::talloc::ThreadCachedSystem =
     onetdns_core::talloc::ThreadCachedSystem;
 
 #[cfg(test)]
-/** @brief bailiwick 판정, 캐시 수명, DNSSEC 검증, 그리고 이벤트 레인과 동기 경로의 동치성. */
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, UdpSocket};
     use std::sync::{Arc, Mutex};
 
-    /** @brief 이름 문자열의 정규 키. */
     fn name_key(name: &str) -> Vec<u8> {
         Name::from_str(name).unwrap().canonical_key()
     }
 
     #[test]
-    /** @brief 와일드카드 확장에 부재 증명이 없으면 Secure로 보지 않는다. 없으면 더 구체적인 이름을 숨길 수 있다. */
     fn wildcard_expansion_requires_authenticated_denial_proof() {
         use onetdns_dnssec::sign::{pick_denial_nsecs, sign_zone, ZoneSigner};
 
@@ -4517,7 +4045,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 네임서버 주소가 만료 전까지 재사용되고 그 뒤에는 버려지는지. */
     fn ns_addr_cache_reuses_until_expiry() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
@@ -4542,7 +4069,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 캐시 키가 이름의 원본 옥텟을 보존하는지. 문자열로 왕복하면 비ASCII 라벨이 깨진다. */
     fn recursive_cache_keys_preserve_raw_name_octets() {
         let first = Name::from_labels(vec![vec![0xff]]).unwrap();
         let second = Name::from_labels(vec![vec![0xfe]]).unwrap();
@@ -4583,7 +4109,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief TTL 0은 담지 않고, 거대한 항목은 개수 상한에 걸리는지. */
     fn zero_ttl_ns_state_is_not_cached_and_large_entries_are_bounded() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let zone = Name::from_str("example").unwrap();
@@ -4612,7 +4137,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 캐시가 권한 서버가 준 TTL보다 오래 살지 않는지. */
     fn recursive_ns_state_never_outlives_authoritative_ttl() {
         assert_eq!(std::mem::size_of::<TtlLifetime>(), 8);
         let rec = Recursor::new(vec![], Duration::from_secs(1));
@@ -4691,7 +4215,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 TTL 상한이 모든 캐시에 함께 걸리는지. */
     fn configured_max_ttl_bounds_every_recursive_cache() {
         assert_eq!(
             Recursor::new(vec![], Duration::from_secs(1))
@@ -4750,7 +4273,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 앵커가 바뀌면 검증된 키 캐시가 따라서 무효가 되는지. */
     fn validated_key_cache_expires_and_follows_anchor_rotation() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let key = name_key("example");
@@ -4780,7 +4302,6 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-    /** @brief 검증해 둔 키를 다시 쓰는 비용. */
     fn bench_validated_key_cache_hit() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let zone_key = name_key("bench.example");
@@ -4800,7 +4321,6 @@ mod tests {
             300,
         );
 
-        /** @brief 반복 횟수. */
         const HITS: u32 = 1_000_000;
         let started = Instant::now();
         for _ in 0..HITS {
@@ -4817,7 +4337,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNSKEY 캐시가 TTL 0과 만료를 지키는지. */
     fn dnskey_cache_honors_zero_ttl_and_expiry() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let key = name_key("example");
@@ -4855,7 +4374,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DS 서명 만료가 검증 결과의 캐시 기간을 묶는지. 만료 뒤에도 쓰면 폐기된 키를 믿게 된다. */
     fn ds_rrsig_ttl_bounds_validated_key_cache_lifetime() {
         let child = Name::from_str("child.example").unwrap();
         let ds = onetdns_dnssec::Ds {
@@ -4910,7 +4428,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 참조의 부재 서명을 레코드마다 다시 훑고 중복 복제하지 않는지. */
     fn extract_ds_parses_each_denial_signature_once() {
         let (signing_key, key) = ecdsa_key(93);
         let child = Name::from_str("child.example").unwrap();
@@ -4939,7 +4456,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 가장 깊은 위임을 고르고, 경로 삭제와 만료가 제대로 도는지. */
     fn delegation_cache_deepest_evict_and_expiry() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let com = Name::from_str("com").unwrap();
@@ -4979,7 +4495,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 캐시 크기가 설정대로 정확히 지켜지는지. */
     fn recursive_state_caches_enforce_exact_lru_capacity() {
         let ip1 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
@@ -5059,7 +4574,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief IN 클래스가 아닌 레코드가 답변·참조·glue 어디에도 끼어들지 못하는지. */
     fn non_in_records_cannot_drive_answers_referrals_or_glue() {
         let qname = Name::from_str("host.test").unwrap();
         let mut response = Message::query(1, qname.clone(), RecordType::A);
@@ -5088,7 +4602,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief ANY 질의에 온 보통의 RRset 응답을 받아들이는지. */
     fn any_query_accepts_normal_rrset_response() {
         let qname = Name::from_str("host.test").unwrap();
         let zone = Name::from_str("test").unwrap();
@@ -5124,12 +4637,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 권한 서버가 SOA 없이 비워 보낸 NOERROR를 NODATA로 받는지.
-     * @details 받지 않으면 다음 서버로 넘어가고, 모든 서버가 같은 답을 주는 영역은 SERVFAIL이
-     *          된다. 권한 비트가 없거나, 위임이 있거나, 영역 밖 이름이거나, 답이 섞여 있으면
-     *          NODATA가 아니다.
-     */
+    /// Otherwise the next server is tried, and a zone whose servers all answer this way gets
+    /// SERVFAIL. No AA bit, a delegation, an out-of-zone name or mixed answers mean it is not
+    /// NODATA.
     fn bare_authoritative_nodata_is_terminal_and_usable() {
         let qname = Name::from_str("host.gslb.test").unwrap();
         let zone = Name::from_str("gslb.test").unwrap();
@@ -5173,7 +4683,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNAME 합성이 길이를 넘긴 경우도 최종 응답으로 다루는지. */
     fn dname_yxdomain_is_terminal_and_usable() {
         let owner = Name::from_str("sub.test").unwrap();
         let qname = Name::from_str("x.sub.test").unwrap();
@@ -5199,7 +4708,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 이름을 덮는 DNAME이 합성 CNAME보다 우선하는지. */
     fn dname_covering_qname_wins_over_synthetic_cname() {
         let owner = Name::from_str("sub.test").unwrap();
         let qname = Name::from_str("a.sub.test").unwrap();
@@ -5225,7 +4733,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RRSIG를 직접 물으면 Insecure다. 서명을 서명으로 감싸지 않으므로 Bogus가 아니다. */
     fn rrsig_query_is_insecure_not_bogus() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         let qname = Name::from_str("host.test").unwrap();
@@ -5245,7 +4752,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief NAT64 지역 사용 접두사를 전역 주소로 보지 않는지. IPv6로 감싼 내부 주소 우회를 막는다. */
     fn nat64_local_use_prefix_is_not_globally_routable() {
         assert!(
             !is_globally_routable("64:ff9b:1::808:808".parse().unwrap()),
@@ -5260,7 +4766,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNAME 소유자가 여럿이면 가장 긴 것이 이기는지. */
     fn dname_rewrite_uses_longest_matching_owner() {
         let qname = Name::from_str("www.deep.old.example").unwrap();
         let mut response = Message::default();
@@ -5286,7 +4791,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 현재 zone 밖 DNAME이 응답에서 걷어내지는지. */
     fn out_of_bailiwick_dname_is_stripped() {
         let zone = Name::from_str("sub.example.com").unwrap();
         let mut resp = Message::default();
@@ -5322,7 +4826,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 이름에 서로 다른 별칭이 오면 답으로 받아들이지 않는지. */
     fn conflicting_alias_data_is_not_accepted_as_an_answer() {
         let qname = Name::from_str("www.example").unwrap();
         let zone = Name::from_str("example").unwrap();
@@ -5361,7 +4864,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빠른 서버가 먼저, 실패한 서버가 뒤로 가는지. */
     fn infra_orders_fast_first_failed_last() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let fast: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5379,7 +4881,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소 계열 필터와 선호가 순서에 반영되는지. */
     fn ip_family_filter_and_prefer() {
         let v4: SocketAddr = "1.2.3.4:53".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
@@ -5398,7 +4899,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 센티널 질의가 이 서버가 신뢰하는 앵커 상태를 그대로 드러내는지. */
     fn root_key_sentinel_rfc8509() {
         let r = Recursor::with_default_roots(Duration::from_millis(50)).with_dnssec();
         let mk = |qname: &str| {
@@ -5466,7 +4966,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검증 제외가 접미사 단위로 걸리는지. */
     fn domain_insecure_suffix_match() {
         let r = Recursor::new(vec![], Duration::from_millis(50))
             .with_domain_insecure(vec![Name::from_str("internal.example").unwrap()]);
@@ -5476,7 +4975,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 성공하면 실패 기록이 즉시 지워지는지. */
     fn infra_success_clears_fail_cooldown() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let ip: IpAddr = "8.8.4.4".parse().unwrap();
@@ -5497,11 +4995,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 실패한 서버가 INFRA_FAIL_COOLDOWN 동안 뒤로 밀렸다가 돌아오는지.
-     * @details 뒤로 밀려도 목록에서 빠지지 않는다. 앞 서버가 답하지 않으면 같은 질의 안에서
-     *          물어야 하기 때문이다.
-     */
+    /// Pushed back but still listed, since the query must ask it when the first server does not
+    /// answer.
     fn failed_servers_are_asked_last_until_cooldown_expires() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let failed: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5524,13 +5019,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 먼저 물은 서버가 답하지 않으면 최근에 한 번 실패한 서버에도 같은 질의 안에서 묻는지.
-     * @details 한 번 실패한 서버를 목록에서 빼면, 남은 서버 하나가 답하지 않을 때 되살아난 서버를
-     *          두고도 질의가 실패한다.
-     */
+    /// Dropping a once-failed server from the list would fail the query when the remaining server
+    /// is silent, even though the dropped one has recovered.
     fn a_recently_failed_server_is_still_asked_when_the_preferred_one_is_silent() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5425;
         let recovered = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 94)), PORT);
         let silent_sock = UdpSocket::bind(SocketAddr::new(
@@ -5572,12 +5063,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 모두 연달아 실패한 zone은 묻지 않고 곧바로 전송 실패로 끝나는지.
-     * @details 한 번 실패한 서버는 패킷 하나를 잃었을 수 있으니 여전히 묻는다. 연달아 실패한
-     *          서버까지 물으면 질의마다 제한 시간을 통째로 쓰고, NoReachableNs로 끝나면 bin이
-     *          예비 경로로 넘기지 않는다.
-     */
+    /// A server that failed once may have lost one packet and is still asked. Asking servers that
+    /// failed repeatedly would spend the full timeout on each query, and ending in `NoReachableNs`
+    /// would keep the bin from moving to the fallback.
     fn a_zone_whose_servers_all_failed_repeatedly_fails_fast() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = blackhole.local_addr().unwrap();
@@ -5613,11 +5101,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 내려간 서버에 묻지 않는 기간이 다시 실패할 때마다 두 배로 늘고 상한에서 멈추는지.
-     * @details 내려가 있는 동안 들어온 실패는 세지 않는다. 내려가기 직전에 함께 나간 질의들이
-     *          뒤늦게 실패하면서 기간을 곧바로 상한까지 올리면 안 된다.
-     */
+    /// Failures while the server is down are not counted, so queries sent just before it went down
+    /// do not push the back-off straight to the maximum.
     fn a_down_server_backs_off_exponentially() {
         let r = Recursor::new(vec![], Duration::from_millis(100));
         let ip: IpAddr = "192.0.2.53".parse().unwrap();
@@ -5655,11 +5140,9 @@ mod tests {
         failed_ago(&r, SERVER_DOWN_BASE * 2 + Duration::from_secs(1));
         assert_eq!(r.order_by_infra(&[server], &zone), vec![server]);
 
-        /*
-         * 상한은 실패 시각을 과거로 옮기지 않고 판정 시각을 뒤로 잡아 본다. Instant 는 부팅
-         * 무렵부터 세므로, 부팅한 지 상한이 안 된 호스트에서는 실패 시각을 그만큼 과거로 옮길
-         * 수 없다.
-         */
+        // Moves the check time forward rather than the failure time back: Instant counts from
+        // around boot, so on a host up for less than the maximum the failure time cannot move that
+        // far back.
         let mut infra = r.infra.lock_recover();
         let state = infra.get_mut(&key).unwrap();
         state.consecutive_failures = u8::MAX;
@@ -5672,7 +5155,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정책으로 거부한 것을 전송 실패로 세지 않는지. 그러면 멀쩡한 서버가 뒤로 밀린다. */
     fn recursion_policy_rejection_is_not_reported_as_transport_failure() {
         let recursor = Recursor::new(vec![], Duration::from_millis(10));
         let blocked: SocketAddr = "127.0.0.1:53".parse().unwrap();
@@ -5686,7 +5168,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부수 질의도 같은 데드라인을 지키는지. 새로 잡으면 해석 하나가 데드라인을 넘긴다. */
     fn authority_exchange_obeys_the_shared_resolution_deadline() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = blackhole.local_addr().unwrap();
@@ -5712,7 +5193,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프로토콜 오류를 전송 실패와 구분하는지. 응답은 온 서버다. */
     fn dns_protocol_error_does_not_open_transport_cooldown() {
         let recursor = Recursor::new(vec![], Duration::from_millis(100));
         let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5727,12 +5207,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 한 zone에서 잰 왕복 시간을 다른 zone에서도 쓰는지.
-     * @details 부모와 자식 zone을 같은 서버가 맡는 일이 흔하다. 자식 zone에서 느리다고 잰
-     *          서버를 부모 zone에서 처음 보는 서버로 치면, 부모 zone의 DNSKEY를 물을 때 그
-     *          느린 서버에 가장 먼저 묻는다.
-     */
+    /// Parent and child zones often share servers; treating a server measured slow in the child as
+    /// new in the parent would ask it first for the parent's DNSKEY.
     fn round_trip_time_is_shared_across_zones() {
         let recursor = Recursor::new(vec![], Duration::from_millis(100));
         let slow: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5748,7 +5224,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 zone에서의 실패가 다른 zone의 순위를 건드리지 않는지. */
     fn infra_failure_is_scoped_to_zone() {
         let recursor = Recursor::new(vec![], Duration::from_millis(100));
         let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -5768,7 +5243,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 앵커를 넣으면 검증이 켜지는지. */
     fn with_dnssec_activates_validation() {
         let plain = Recursor::with_default_roots(Duration::from_secs(1));
         assert!(!plain.validating(), "기본은 검증 비활성");
@@ -5778,7 +5252,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기본 설정이 내부망 주소로의 질의를 막는지. 이것이 SSRF 방어의 기본선이다. */
     fn ssrf_default_denies_internal_servers() {
         let r = Recursor::with_default_roots(Duration::from_secs(1));
         assert!(
@@ -5860,7 +5333,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 엄격 플래그가 실제 판정까지 전달되는지. */
     fn dnssec_strict_flag_plumbs() {
         let r = Recursor::with_default_roots(Duration::from_secs(1));
         assert!(!r.strict, "기본은 fail-closed 비활성(보수적)");
@@ -5869,7 +5341,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대소문자를 섞어도 이름 자체는 같은지. */
     fn caps_for_id_randomizes_but_preserves_name() {
         let n = Name::from_str("www.Example.com").unwrap();
 
@@ -5890,7 +5361,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 0x20이 기본으로 켜져 있고 끌 수 있는지. */
     fn caps_for_id_is_enabled_by_default_and_can_be_disabled() {
         assert!(Recursor::new(vec![], Duration::from_secs(1)).caps_for_id);
         assert!(
@@ -5901,7 +5371,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 패닉으로 풀려도 CD 상태가 되돌아오는지. 새면 다음 질의가 검증을 건너뛴다. */
     fn honor_cd_scope_restores_after_request_isolation_unwind() {
         HONOR_CD.with(|state| state.set(false));
         let result = onetdns_core::isolation::catch_request(|| {
@@ -5915,7 +5384,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중첩된 범위에서도 부모 상태가 되돌아오는지. */
     fn honor_cd_scope_restores_nested_parent() {
         HONOR_CD.with(|state| state.set(false));
         with_honor_cd(true, || {
@@ -5927,7 +5395,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 소문자화 설정이 나가는 이름에 적용되는지. */
     fn lowercase_outgoing_normalizes_name() {
         let n = lowercase_name(&Name::from_str("WwW.Example.COM").unwrap());
         assert_eq!(n.to_ascii_lower(), "www.example.com");
@@ -5957,7 +5424,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대소문자가 다른 응답을 거부하는지. 이 검사가 0x20 방어의 실체다. */
     fn caps_for_id_exact_match_rejects_case_mismatch() {
         let q = |s: &str| {
             vec![Question {
@@ -5978,7 +5444,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 와이어 단계까지 통틀어 대소문자 불일치를 거부하는지. */
     fn caps_for_id_rejects_wire_question_case_mismatch_end_to_end() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -6030,7 +5495,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 참조 예산 설정이 기본값을 덮는지. */
     fn with_recursion_limit_overrides_default() {
         let r = Recursor::with_default_roots(Duration::from_secs(1));
         assert_eq!(r.max_referrals, 16, "기본 위임 추적 상한");
@@ -6041,7 +5505,6 @@ mod tests {
         assert_eq!(r.max_referrals, 16);
     }
 
-    /** @brief 요청에 대응하는 빈 응답 뼈대. */
     fn base(req: &Message) -> Message {
         Message {
             header: Header {
@@ -6055,12 +5518,8 @@ mod tests {
         }
     }
 
-    /**
-     * @brief 절단만 알리는 UDP와 온전히 답하는 TCP를 같은 주소에 시작한다.
-     *
-     * @details 실제 권한 서버가 큰 응답에 하는 일 그대로다. TCP로 다시 묻지 않으면
-     *          질의자는 위임을 따라갈 수 없다.
-     */
+    /// What real authorities do with large answers: without a TCP retry the delegation cannot be
+    /// followed.
     fn spawn_truncating_server(
         bind_ip: &str,
         port: u16,
@@ -6075,7 +5534,6 @@ mod tests {
                 let Ok(req) = Message::parse(&buf[..n]) else {
                     continue;
                 };
-                /* UDP에는 절단 표시만 설정해 빈 응답을 보낸다. */
                 let mut m = base(&req);
                 m.header.truncated = true;
                 if let Ok(wire) = m.try_encode() {
@@ -6087,7 +5545,6 @@ mod tests {
         spawn_tcp_server(addr, respond)
     }
 
-    /** @brief 주어진 응답 규칙으로 답하는 테스트용 TCP DNS 서버를 시작한다. */
     fn spawn_tcp_server(
         addr: SocketAddr,
         respond: impl Fn(&Message) -> Message + Send + Sync + 'static,
@@ -6124,7 +5581,6 @@ mod tests {
         addr
     }
 
-    /** @brief 주어진 응답 규칙으로 답하는 테스트용 DNS 서버를 시작한다. */
     fn spawn_server(
         bind_ip: &str,
         port: u16,
@@ -6144,7 +5600,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝없는 위임 체인이 총 질의 예산에 걸려 멈추는지. */
     fn endless_delegation_chain_is_bounded_by_total_query_budget() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -6152,7 +5607,6 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let counter = seen.clone();
 
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 15987;
         let addr = spawn_server("127.0.0.40", PORT, move |req| {
             let n = counter.fetch_add(1, Ordering::Relaxed);
@@ -6189,7 +5643,6 @@ mod tests {
         );
     }
 
-    /** @brief NS와 glue를 담은 참조 응답. */
     fn referral(req: &Message, zone: &str, ns: &str, glue: Ipv4Addr) -> Message {
         let mut m = base(req);
         m.header.authoritative = false;
@@ -6206,7 +5659,6 @@ mod tests {
         m
     }
 
-    /** @brief A 답변 하나짜리 응답. */
     fn a_answer(req: &Message, ip: Ipv4Addr) -> Message {
         let mut m = base(req);
         m.header.authoritative = true;
@@ -6217,10 +5669,9 @@ mod tests {
         m
     }
 
-    /** @brief 시드로 고정한 P-256 키쌍과 그 DNSKEY. */
     fn ecdsa_key(seed: u8) -> (p256::ecdsa::SigningKey, onetdns_dnssec::Dnskey) {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let dnskey = onetdns_dnssec::Dnskey {
             flags: 257,
             protocol: 3,
@@ -6230,7 +5681,6 @@ mod tests {
         (sk, dnskey)
     }
 
-    /** @brief DNSKEY를 미해석 RDATA 레코드로 감싼다. */
     fn dnskey_rec(owner: &str, key: &onetdns_dnssec::Dnskey) -> Record {
         Record::new(
             Name::from_str(owner).unwrap(),
@@ -6239,7 +5689,6 @@ mod tests {
         )
     }
 
-    /** @brief NSEC 레코드를 손으로 만든다. */
     fn nsec_rec(owner: &str, next: &str, types: &[u16]) -> Record {
         let mut rdata = Vec::new();
         for label in next.trim_end_matches('.').split('.') {
@@ -6263,7 +5712,6 @@ mod tests {
         )
     }
 
-    /** @brief 주어진 RRset을 서명해 RRSIG 레코드를 만든다. */
     fn rrsig_rec(
         sk: &p256::ecdsa::SigningKey,
         key: &onetdns_dnssec::Dnskey,
@@ -6290,7 +5738,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부재 증명이 체인 apex의 SOA를 쓰는지. 자손의 SOA를 쓰면 남의 zone이 부재를 주장할 수 있다. */
     fn terminal_denial_uses_chain_apex_not_descendant_soa() {
         let apex = Name::from_str("test").unwrap();
         let qname = Name::from_str("host.test").unwrap();
@@ -6349,7 +5796,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부재 증명이 리프 apex의 서명을 요구하는지. */
     fn terminal_denial_requires_leaf_apex_signatures() {
         let (signing_key, key) = ecdsa_key(63);
         let apex = Name::from_str("test").unwrap();
@@ -6444,7 +5890,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명된 무관 NSEC가 많아도 실제 최소 증명을 먼저 골라 검증하는지. */
     fn denial_validation_ignores_superfluous_signed_nsec_records() {
         let (signing_key, key) = ecdsa_key(64);
         let apex = Name::from_str("test").unwrap();
@@ -6524,12 +5969,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 검증한 부재 응답이 검증한 증명만 싣고 나가는지.
-     * @details 공격자 키로 서명한 무관한 NSEC을 권한 절에 끼워 넣어도, 그것은 이 질의의 최소
-     *          증명이 아니므로 검증에 쓰이지 않는다. 그런 NSEC이 AD를 세운 응답에 그대로 남으면
-     *          위쪽 부재 합성 계층이 그것을 믿고 담아 같은 영역의 다른 이름을 없다고 답한다.
-     */
     fn validated_denial_carries_only_the_proven_records() {
         let (signing_key, key) = ecdsa_key(81);
         let (attacker_key, attacker_pub) = ecdsa_key(82);
@@ -6637,7 +6076,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 답변의 모든 RRSIG 후보가 RRset 하나의 8회 검증 예산을 공유하는지. */
     fn answer_rrsigs_share_one_verification_budget() {
         let (signing_key, key) = ecdsa_key(65);
         let apex = Name::from_str("test").unwrap();
@@ -6701,7 +6139,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief SOA와 NSEC가 응답 하나의 공개키 연산 예산을 공유하는지. */
     fn denial_rrsets_share_one_response_verification_budget() {
         let (signing_key, key) = ecdsa_key(66);
         let apex = Name::from_str("test").unwrap();
@@ -6796,7 +6233,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /** @brief 루트부터 리프까지 서명된 테스트용 계층을 시작한다. 체인 검증 전체를 거친다. */
     fn spawn_signed_hierarchy(
         port: u16,
         root_ip: &str,
@@ -6884,7 +6320,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /** @brief 이벤트 레인을 끝까지 돌리고 결과를 얻는다. */
     fn drive_lane(
         reactor: &mut crate::reactor::Reactor,
         rec: &Recursor,
@@ -6913,7 +6348,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    /** @brief 이벤트 레인이 스레드를 막지 않고도 검증을 마치는지. */
     fn reactor_lane_validates_dnssec_without_blocking_fetch() {
         use crate::reactor::{Completion, Reactor, ReactorConfig, SubmitOutcome};
 
@@ -6950,7 +6384,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    /** @brief 이벤트 레인도 위조 서명을 SERVFAIL로 막는지. 동기 경로와 판정이 같아야 한다. */
     fn reactor_lane_servfails_forged_signature() {
         use crate::reactor::{Completion, Reactor, ReactorConfig, SubmitOutcome};
 
@@ -6994,20 +6427,13 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 쓸 수 있는 글루가 있으면 그것으로 내려가는지.
-     *
-     * @details 네임서버 이름은 여럿인데 부모가 준 주소는 일부뿐인 위임이 흔하다. 주소를
-     *          이미 쥐고도 남은 이름을 먼저 풀러 가면 그 하나하나가 다시 루트부터 걷는
-     *          해석이 되어 예산을 전부 소진한다. 실제로 iana.org, kernel.org, debian.org,
-     *          bbc.co.uk가 찬 프로세스에서 전부 SERVFAIL이었다. 흔한 이름 10개 중 4개다.
-     * @warning 글루 없는 네임서버는 답하지 않는 주소로 위임된다. 그것을 먼저 풀려 들면
-     *          예산이 말라 이 테스트는 통과할 수 없다.
-     */
+    /// Delegations with several name servers but glue for only some are common. Resolving the
+    /// remaining names first would turn each into a resolution from the root and exhaust the
+    /// budget. The glueless name servers point at a silent address, so resolving them first fails
+    /// this test.
     fn a_referral_with_partial_glue_uses_what_it_has() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5406;
-        /** @brief 아무도 듣지 않는 주소. 여기로 위임하면 그 해석은 시간을 다 쓴다. */
+        /// Nothing listens here; a delegation to it spends the whole timeout.
         const BLACKHOLE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 40);
 
         spawn_server("127.0.0.38", PORT, move |req| {
@@ -7015,7 +6441,6 @@ mod tests {
             let mut m = base(req);
             let name = q.name.to_ascii_lower();
             if name.ends_with("slow.test") {
-                /* 글루 없는 네임서버들이 사는 곳. 답하지 않는 주소로 넘긴다. */
                 m.authorities.push(Record::new(
                     Name::from_str("slow.test").unwrap(),
                     3600,
@@ -7074,13 +6499,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 참조 경로 강화를 켜도 빈 비단말 아래 이름이 풀리고, 권한 없는 빈 답에서는 멈추는지.
-     * @details 이름 최소화는 빈 비단말에서 위임 없는 빈 답을 받는다. 이것을 경로 실패로 보면
-     *          강화를 켠 설치에서 그런 이름은 모두 SERVFAIL이 된다.
-     */
+    /// Minimization gets an empty answer without delegation at an empty non-terminal; treating it
+    /// as a path failure would make such names SERVFAIL wherever hardening is on.
     fn harden_referral_path_allows_empty_non_terminals() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5408;
 
         spawn_server("127.0.0.83", PORT, |req| {
@@ -7132,16 +6553,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief recursion_limit이 실제로 따라간 위임 횟수를 막는지.
-     * @details 바퀴 수 상한에는 이름 최소화 몫으로 라벨 수가 더해진다. 위임을 따로 세지 않으면
-     *          상한을 1로 두어도 두 번 위임받는 이름이 그대로 풀린다.
-     */
+    /// The turn cap adds the label count for minimization, so without counting delegations
+    /// separately a limit of 1 would still resolve a name delegated twice.
     fn recursion_limit_bounds_followed_delegations() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5407;
 
-        /** @brief zone을 ns 이름과 주소로 넘기는 참조 응답. */
         fn referral(req: &Message, zone: &str, ns: &str, ip: Ipv4Addr) -> Message {
             let mut m = base(req);
             m.authorities.push(Record::new(
@@ -7193,18 +6609,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 절단된 응답을 받으면 TCP로 다시 물어 마저 받아 오는지.
-     *
-     * @details UDP 한 장에 담기지 않는 응답은 절단 표시만 달려 온다. 다시 묻지 않으면
-     *          위임을 따라갈 수 없어 그 이름은 아예 풀리지 않는다. 서명을 함께 요청하는
-     *          지금은 위임 응답이 한 장을 넘는 일이 흔하다.
-     * @note 다시 묻는 일은 재귀 리졸버가 아니라 그 아래 교환 계층이 한다. 재귀 경로로 그것을
-     *       확인해 두지 않으면, 교환 계층에서 사라져도 여기서는 드러나지 않는다.
-     * @warning UDP 쪽은 일부러 답을 비워 둔다. TCP로 다시 묻지 않으면 이 테스트는 통과할 수 없다.
-     */
+    /// An answer that does not fit one UDP datagram arrives truncated; without a TCP retry the
+    /// delegation cannot be followed. The retry lives in the exchange layer below; this checks it
+    /// through the recursive path. The UDP side is left empty on purpose, so only a TCP retry
+    /// passes.
     fn a_truncated_referral_is_refetched_over_tcp() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5405;
 
         spawn_truncating_server("127.0.0.36", PORT, move |req| {
@@ -7255,13 +6664,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief UDP가 가로채인 망에서 TCP 판정을 켜면 권한 서버의 진짜 답을 받는지. */
     fn authority_tcp_switch_bypasses_intercepted_udp() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5412;
-        /** @brief 가로챈 쪽이 UDP로 돌려주는 주소. */
         const FORGED: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 9);
-        /** @brief 권한 서버가 TCP로 돌려주는 주소. */
         const REAL: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 44);
 
         let answer = |req: &Message, ip: Ipv4Addr| {
@@ -7305,13 +6710,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의 하나가 동시에 기다리는 교환이 MAX_EXCHANGES_PER_QUERY를 넘지 않는지.
-     * @details 앞의 두 서버는 답하지 않는다. 상한이 없으면 셋째 서버에도 다음 서버에 물을
-     *          시각이 되자마자 묻고, 상한이 있으면 앞의 교환 하나가 시간을 넘긴 뒤에야 묻는다.
-     */
+    /// The first two servers are silent. Without the cap the third would be asked as soon as its
+    /// turn comes; with it, only after one of the first exchanges times out.
     fn a_query_waits_on_at_most_two_exchanges_at_once() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5423;
         let silent = |ip: &str| {
             let sock = UdpSocket::bind(format!("{ip}:{PORT}")).unwrap();
@@ -7361,18 +6762,12 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답을 기다리는 사이 TCP 판정이 켜지면 다음 서버에는 TCP로 묻는지.
-     * @details 판정은 시작 직후의 점검이 끝날 때 켜지므로, 그 전에 시작한 해석의 도중에 바뀐다.
-     *          서버 목록을 시작할 때 전송을 한 번만 고르면 나머지 서버에도 가로채이는 UDP로
-     *          묻는다.
-     */
+    /// The flag turns on when the startup check ends, mid-resolution for anything started earlier.
+    /// Choosing the transport once per server list would keep asking the remaining servers over the
+    /// intercepted UDP.
     fn authority_tcp_switch_applies_to_servers_asked_after_it_turns_on() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5422;
-        /** @brief 가로챈 쪽이 UDP로 돌려주는 주소. */
         const FORGED: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 88);
-        /** @brief 권한 서버가 TCP로 돌려주는 주소. */
         const REAL: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 88);
 
         let switch = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -7413,26 +6808,20 @@ mod tests {
         );
     }
 
-    /** @brief 부모와 자식 영역 테스트에서 최종 이름이 가리키는 주소. */
     const COHOSTED_TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
 
-    /**
-     * @brief parent.test와 그 자식 l.parent.test를 한 서버가 맡는 구성을 시작한다.
-     * @details 루트는 parent.test로 위임한다. 영역 서버는 자식 영역의 NS를 권한 있는 답으로
-     *          주고, 빈 비단말 myaddr.l.parent.test를 NXDOMAIN으로 답한다. DS 질의에는 부모
-     *          영역의 DS를 답변 절에 담아 주고, 받은 횟수를 센다.
-     * @return 루트 서버 주소와 DS 질의 횟수.
-     */
+    /// The root delegates to parent.test. The zone server answers the child's NS authoritatively,
+    /// answers the empty non-terminal myaddr.l.parent.test with NXDOMAIN, and answers DS queries
+    /// with the parent's DS in the answer section, counting them. Returns the root address and the
+    /// DS query count.
     fn spawn_cohosted_zones(
         root_ip: Ipv4Addr,
         zone_ip: Ipv4Addr,
         port: u16,
     ) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        /** @brief 테스트 이름을 만든다. */
         fn name(text: &str) -> Name {
             Name::from_str(text).unwrap()
         }
-        /** @brief 이 영역의 부정 응답에 붙일 SOA. */
         fn soa(apex: &str) -> Record {
             Record::new(
                 name(apex),
@@ -7513,15 +6902,12 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 부모와 자식 영역을 같은 서버가 맡을 때 답변 절의 NS를 영역 경계로 따라가는지.
-     * @details 서버는 자식 영역으로 답하므로 최소화 질의에 대한 NS가 위임이 아니라 권한 있는
-     *          답으로 온다. 경계를 놓치면 현재 영역을 부모로 알아, 자식 영역의 SOA가 붙은
-     *          부정 응답을 무관한 것으로 버리고 SERVFAIL을 낸다. 경계를 따라가야 빈 비단말에
-     *          대한 NXDOMAIN을 받아들이고 전체 이름으로 다시 물을 수 있다.
-     */
+    /// The server answers from the child zone, so NS for a minimized query comes as an
+    /// authoritative answer, not a delegation. Missing the cut would take the current zone for the
+    /// parent, discard the negative answer carrying the child's SOA as irrelevant and return
+    /// SERVFAIL. Following it accepts the NXDOMAIN for the empty non-terminal and asks again with
+    /// the full name.
     fn an_authoritative_ns_answer_is_followed_as_a_zone_cut() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5413;
         let (root, ds_queries) = spawn_cohosted_zones(
             Ipv4Addr::new(127, 0, 0, 50),
@@ -7553,13 +6939,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 검증할 때 답변 절로 드러난 경계의 DS를 부모에게 물어 체인에 넣는지.
-     * @details 참조와 달리 이 경계에는 DS 증거가 함께 오지 않는다. 증거 없이 체인에 넣으면
-     *          서명된 자식 영역이 증명 없이 Insecure로 내려가 검증이 무력화된다.
-     */
+    /// Unlike a referral, this cut comes without DS evidence; without it the signed child zone
+    /// would drop to Insecure unproven and validation would be disabled.
     fn an_answer_zone_cut_fetches_its_ds_when_validating() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5414;
         let (root, ds_queries) = spawn_cohosted_zones(
             Ipv4Addr::new(127, 0, 0, 52),
@@ -7609,24 +6991,19 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 서명된 루트, parent.test, l.parent.test를 시작한다. 두 영역은 한 서버가 맡는다.
-     * @details 영역마다 키가 다르다. 자식 영역의 NS는 권한 있는 답으로 주고, 그 DS는 부모 키로
-     *          서명해 DS 질의에만 준다. child_ds_seed로 DS를 만들 키를 고른다. 자식 키와 다르면
-     *          위조된 DS가 된다.
-     * @return 루트 서버 주소와 루트 신뢰 앵커.
-     */
+    /// Each zone has its own key. The child's NS is answered authoritatively and its DS, signed
+    /// with the parent key, only to DS queries. `child_ds_seed` picks the key the DS is made from;
+    /// a key other than the child's gives a forged DS. Returns the root address and the root trust
+    /// anchor.
     fn spawn_signed_cohosted_zones(
         root_ip: Ipv4Addr,
         zone_ip: Ipv4Addr,
         port: u16,
         child_ds_seed: u8,
     ) -> (SocketAddr, onetdns_dnssec::Ds) {
-        /** @brief 테스트 이름을 만든다. */
         fn name(text: &str) -> Name {
             Name::from_str(text).unwrap()
         }
-        /** @brief DS를 레코드로 감싼다. */
         fn ds_rec(owner: &str, key: &onetdns_dnssec::Dnskey) -> Record {
             let ds = onetdns_dnssec::Ds::from_dnskey(key, &name(owner), 2).unwrap();
             Record::new(
@@ -7726,14 +7103,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답변 절로 드러난 서명된 자식 영역의 답이 부모에게 받은 DS로 끝까지 검증되는지.
-     * @details 루트, 부모, 자식 영역을 모두 실제 키로 서명한다. 자식 영역의 DS를 부모에게 따로
-     *          물어 체인에 넣어야 자식 키를 믿을 수 있고, 그래야 답에 AD가 붙는다. DS 없이
-     *          체인에 넣으면 자식 영역이 Insecure로 내려가 AD가 붙지 않는다.
-     */
+    /// The child key is trusted only through the DS fetched from the parent, and only then does the
+    /// answer get AD; without the DS the child zone drops to Insecure and AD is not set.
     fn a_signed_answer_zone_cut_validates_through_the_fetched_ds() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5415;
         let (root, anchor) = spawn_signed_cohosted_zones(
             Ipv4Addr::new(127, 0, 0, 54),
@@ -7765,13 +7137,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답변 절로 드러난 경계에서 부모가 준 DS가 자식 키와 맞지 않으면 SERVFAIL인지.
-     * @details 부모의 서명은 유효하지만 DS가 다른 키를 가리킨다. 자식 영역의 DNSKEY를 믿을 수
-     *          없으므로 Bogus이고, Insecure로 내려가 답을 그대로 주면 안 된다.
-     */
+    /// The parent's signature is valid but the DS points at another key. The child's DNSKEY cannot
+    /// be trusted: Bogus, never Insecure with the answer passed on.
     fn a_signed_answer_zone_cut_with_a_mismatched_ds_is_bogus() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5416;
         let (root, anchor) = spawn_signed_cohosted_zones(
             Ipv4Addr::new(127, 0, 0, 56),
@@ -7793,17 +7161,11 @@ mod tests {
         assert!(!resp.header.authentic_data);
     }
 
-    /** @brief glue 없는 위임 테스트에서 최종 이름이 가리키는 주소. */
     const GLUELESS_TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 58);
 
-    /**
-     * @brief glue 없이 네임서버 두 개로 위임하는 구성을 시작한다.
-     * @details 루트는 target.test를 ns1.a.test와 ns2.b.test로 위임하되 주소를 주지 않고, 두
-     *          이름의 주소는 스스로 권한 있게 답한다. 한 주소는 답하지 않는 서버, 다른 주소는
-     *          답하는 서버다. 루트가 받은 질의는 이름과 타입으로 기록한다.
-     * @param dead_first 참이면 ns1.a.test가 답하지 않는 서버를 가리킨다.
-     * @return 루트 서버 주소와 루트가 받은 질의 기록.
-     */
+    /// The root delegates target.test to ns1.a.test and ns2.b.test without glue, and each name
+    /// answers its own address authoritatively: one silent server, one answering. The root logs the
+    /// queries it receives by name and type. With `dead_first`, ns1.a.test is the silent one.
     fn spawn_glueless_delegation(
         ips: [Ipv4Addr; 3],
         port: u16,
@@ -7864,7 +7226,6 @@ mod tests {
         (SocketAddr::new(IpAddr::V4(root_ip), port), seen)
     }
 
-    /** @brief 응답에 이 테스트의 최종 주소가 있는지. */
     fn has_glueless_target(resp: &Message) -> bool {
         resp.answers
             .iter()
@@ -7872,13 +7233,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief glue 없는 네임서버의 주소를 쓸 수 있는 것이 생기면 그만 푸는지.
-     * @details 이름을 전부 풀면 느린 서버 하나가 남은 시간을 모두 가져가, 주소를 쥐고도 정작 그
-     *          영역에는 묻지 못한다. 첫 이름이 답하는 서버를 가리키면 둘째 이름은 묻지 않아야 한다.
-     */
+    /// Resolving every name would let one slow server take the remaining time. When the first name
+    /// points at an answering server, the second must not be asked.
     fn glueless_nameserver_lookup_stops_at_the_first_usable_address() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5417;
         let (root, seen) = spawn_glueless_delegation(
             [
@@ -7907,13 +7264,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 먼저 푼 네임서버가 답하지 않으면 남겨 둔 이름을 풀어 다시 묻는지.
-     * @details 서버당 시간은 남겨 둔 이름 몫까지 나눈다. 받은 주소 하나로 시간을 다 쓰면 둘째
-     *          이름으로 넘어갈 시간이 남지 않는다.
-     */
+    /// Time per server is divided including the names left; spending it all on the one address
+    /// would leave no time for the second name.
     fn glueless_nameserver_lookup_resolves_the_next_name_when_the_first_is_dead() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5418;
         let (root, seen) = spawn_glueless_delegation(
             [
@@ -7942,14 +7295,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 네임서버 주소를 풀 때는 검증하지 않는지.
-     * @details 주소는 어디로 보낼지만 정하고 답은 체인으로 따로 검증한다. 이 해석을 검증하면
-     *          결과는 쓰지 않으면서 DNSKEY를 가져오느라 시간만 쓴다. 최종 답은 검증하지 않고
-     *          반복만 돌리므로, 루트가 DNSKEY 질의를 받았다면 주소 풀기가 보낸 것이다.
-     */
+    /// The address only picks a destination and the answer is validated through the chain, so
+    /// validating this lookup would only spend time fetching DNSKEYs. The final answer is not
+    /// validated here either, so a DNSKEY query at the root can only come from the address lookup.
     fn glueless_nameserver_lookup_does_not_validate() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5419;
         let (root, seen) = spawn_glueless_delegation(
             [
@@ -7999,17 +7348,12 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 느린 서버의 답을 기다리는 동안 다음 서버에도 물어 먼저 온 답을 쓰는지.
-     * @details 첫 서버는 처음 보는 서버라 UNKNOWN_SERVER_PATIENCE만큼 기다린 뒤 둘째 서버에도
-     *          묻는다. 첫 서버를 끝까지 기다리면 그 서버의 지연만큼 늦고, 버리고 넘어가면 곧 올
-     *          답을 잃는다. 늦은 서버는 기다린 시간 이상으로 왕복 시간이 기록되어 다음에는
-     *          뒤로 간다.
-     */
+    /// The first server is new, so after `UNKNOWN_SERVER_PATIENCE` the second is asked too. Waiting
+    /// for the first delays by its lag; abandoning it loses an answer about to arrive. The late
+    /// server gets an RTT of at least the time waited and goes last next time.
     fn a_slow_server_is_raced_by_the_next_one() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5420;
-        /** @brief 느린 서버가 답을 미루는 시간. 서버당 제한 시간보다 짧아야 한다. */
+        /// Must be shorter than the per-server timeout.
         const SLOW_DELAY: Duration = Duration::from_millis(1500);
         let answer = |ip: Ipv4Addr| {
             move |req: &Message| {
@@ -8061,13 +7405,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 아무 서버도 답하지 않아 실패한 해석을 뒤에서 마저 돌려 캐시를 채우는지.
-     * @details 루트는 첫 질의에만 답하지 않는다. 클라이언트에게는 실패가 나가지만, 뒤에서 다시
-     *          돌린 해석이 자식 zone의 위임을 캐시에 남겨 다음 질의는 루트부터 걷지 않는다.
-     */
+    /// The root ignores only the first query. The client gets a failure, but the background run
+    /// caches the child delegation, so the next query does not walk from the root.
     fn an_unanswered_resolution_is_finished_in_the_background() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5421;
         let root_ip = Ipv4Addr::new(127, 0, 0, 86);
         let child_ip = Ipv4Addr::new(127, 0, 0, 87);
@@ -8124,17 +7464,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 검증하지 않아도 DO=1로 묻는 질의자에게 서명을 줄 수 있는지.
-     *
-     * @details 업스트림에 DO를 설정하지 않으면 서명을 애초에 받아 오지 못한다. 그러면 이 서버의 뒤에
-     *          선 검증하는 스텁이나, 이 서버를 업스트림으로 삼아 검증하는 전달기가 아무것도 확인하지
-     *          못한다. 여기서 실행한 가짜 권한 서버는 DO가 켜졌을 때만 서명을 담는다.
-     *          언제나 싣게 하면 이 서버가 DO를 세우는지 아닌지를 이 테스트가 구분하지 못한다.
-     * @warning 트러스트 앵커가 없는 리졸버다. 검증은 하지 않고 서명만 전달한다.
-     */
+    /// Without DO upstream the signatures never arrive, and a validating stub behind this server,
+    /// or a forwarder validating through it, has nothing to check. The fake authority here adds
+    /// signatures only when DO is set, so the test can tell whether this server sets it. The
+    /// recursor has no trust anchor: it passes signatures on without validating.
     fn a_non_validating_recursor_still_carries_signatures_for_do_clients() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5404;
         let (sk_root, k_root) = ecdsa_key(21);
         let (sk_zone, k_zone) = ecdsa_key(22);
@@ -8143,7 +7477,6 @@ mod tests {
         let zone_ds = onetdns_dnssec::Ds::from_dnskey(&k_zone, &zone_owner, 2).unwrap();
         let zone_ds_rec = Record::new(zone_owner, 3600, RData::Unknown(43, zone_ds.rdata_bytes()));
 
-        /** @brief 이 질의가 DNSSEC 레코드를 함께 달라고 했는지. */
         fn asked_for_dnssec(request: &Message) -> bool {
             request
                 .opt()
@@ -8260,9 +7593,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정상 체인은 AD를 설정하고 깨진 체인은 SERVFAIL이 되는지. */
     fn dnssec_secure_chain_sets_ad_and_bogus_servfails() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5400;
         let (sk_root, k_root) = ecdsa_key(11);
         let (sk_test, k_test) = ecdsa_key(12);
@@ -8538,13 +7869,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서명 없는 위임은 Insecure다. SERVFAIL로 만들면 서명하지 않은 정상 도메인이 전부 죽는다.
-     * @details 그 판정은 캐시에 남아야 한다. 남지 않으면 같은 영역의 다음 질의가 캐시된
-     *          위임에서 시작하지 못하고 매번 루트부터 다시 걷는다.
-     */
+    /// That verdict must be cached; otherwise the zone's next query cannot start from the cached
+    /// delegation and walks from the root again.
     fn unsigned_delegation_is_insecure_not_servfail() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5402;
         let (sk_root, k_root) = ecdsa_key(21);
         let root_owner = Name::from_str(".").unwrap();
@@ -8673,9 +8000,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트에서 TLD를 거쳐 권한 서버까지 실제로 걸어가는지. */
     fn iterative_walk_root_tld_auth() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5388;
         let root_ip = Ipv4Addr::new(127, 0, 0, 1);
         let com_ip = Ipv4Addr::new(127, 0, 0, 2);
@@ -8711,9 +8036,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검증하지 않을 때 업스트림의 AD 비트를 걷어내는지. 흘리면 검증하지 않은 답이 검증된 것처럼 나간다. */
     fn non_validating_recursor_strips_upstream_ad_bit() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5399;
         let root_ip = Ipv4Addr::new(127, 0, 0, 1);
         let com_ip = Ipv4Addr::new(127, 0, 0, 2);
@@ -8749,9 +8072,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 거쳐 온 네임서버가 함께 모이는지. */
     fn resolve_with_ns_collects_delegation() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5393;
         let root_ip = Ipv4Addr::new(127, 0, 0, 1);
         let com_ip = Ipv4Addr::new(127, 0, 0, 2);
@@ -8799,9 +8120,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief CNAME 체인을 끝까지 따라가는지. */
     fn follows_cname_chain() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5389;
         let auth_ip = Ipv4Addr::new(127, 0, 0, 5);
 
@@ -8855,9 +8174,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 최소화가 경로상의 서버에게 전체 이름을 감추는지. */
     fn qname_minimization_hides_full_name() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5391;
         let com_ip = Ipv4Addr::new(127, 0, 0, 21);
         let auth_ip = Ipv4Addr::new(127, 0, 0, 22);
@@ -8905,7 +8222,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트 목록이 비면 오류가 나는지. */
     fn no_roots_errors() {
         let rec = Recursor::new(vec![], Duration::from_secs(1));
         assert!(matches!(
@@ -8915,9 +8231,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부모 zone 안의 형제 glue는 받아들이는지. */
     fn parent_bailiwick_accepts_valid_sibling_glue() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5395;
         let root_ip = Ipv4Addr::new(127, 0, 0, 30);
         let com_ip = Ipv4Addr::new(127, 0, 0, 31);
@@ -8948,9 +8262,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief zone 밖 glue를 거부하는지. 받으면 위임 하나로 임의의 주소를 심을 수 있다. */
     fn bailiwick_rejects_out_of_zone_glue() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5390;
         let com_ip = Ipv4Addr::new(127, 0, 0, 11);
 
@@ -8991,9 +8303,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부수 질의가 실제로 답에 이어진 주소만 캐시하는지. */
     fn ns_side_query_caches_only_reachable_answer_chain_addresses() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5403;
         let root_ip = Ipv4Addr::new(127, 0, 0, 70);
         let example_ip = Ipv4Addr::new(127, 0, 0, 71);
@@ -9077,9 +8387,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무관한 긍정 응답을 최종 답으로 보지 않는지. */
     fn unrelated_positive_answer_is_not_terminal() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5396;
         let root_ip = Ipv4Addr::new(127, 0, 0, 60);
         spawn_server("127.0.0.60", PORT, move |req| {
@@ -9107,9 +8415,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 최종 응답에서 무관한 절을 걷어내는지. 남기면 캐시 오염이 된다. */
     fn terminal_response_strips_unrelated_sections() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5399;
         let root_ip = Ipv4Addr::new(127, 0, 0, 65);
         spawn_server("127.0.0.65", PORT, move |req| {
@@ -9156,9 +8462,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 망가진 응답을 받으면 다음 서버로 넘어가는지. */
     fn malformed_authority_response_fails_over_to_next_server() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5401;
         let bad_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let good_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9194,9 +8498,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무관한 SOA로 NXDOMAIN을 증명하지 못하는지. */
     fn unrelated_soa_cannot_prove_nxdomain() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5397;
         let root_ip = Ipv4Addr::new(127, 0, 0, 62);
         spawn_server("127.0.0.62", PORT, move |req| {
@@ -9233,9 +8535,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief SERVFAIL 응답의 NS가 위임 캐시에 심어지지 못하는지. */
     fn servfail_authority_ns_cannot_seed_delegation_cache() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5398;
         let root_ip = Ipv4Addr::new(127, 0, 0, 63);
         let attacker_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9273,14 +8573,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief NSEC3 반복이 상한을 넘어 거부할 때 그 사유로 알리는지.
-     *
-     * @details RFC 9276은 반복이 많은 NSEC3 때문에 insecure나 SERVFAIL을 낼 때 EDE 27을
-     *          실으라고 한다. 서명이 깨진 것(EDE 6)과 이 서버가 계산을 거부한 것은 운영자가
-     *          할 일이 다르다. 앞은 영역이 망가진 것이고 뒤는 매개변수를 낮춰야 하는 것이다.
-     * @note 두 사유가 같은 SERVFAIL 로 합쳐지므로 rcode 만 보는 테스트로는 갈라지지 않는다.
-     */
+    /// RFC 9276 asks for EDE 27 when many NSEC3 iterations lead to insecure or SERVFAIL. A broken
+    /// signature (EDE 6) and a refused computation call for different action: the first is a broken
+    /// zone, the second needs lower parameters. Both are SERVFAIL, so checking the rcode alone
+    /// cannot tell them apart.
     fn excessive_nsec3_iterations_report_their_own_ede() {
         let plain = bogus_servfail(
             &make_query(
@@ -9320,18 +8616,14 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 검증에 쓸 키를 받지 못한 SERVFAIL이 서명 문제가 아니라 권한 서버 문제로 알려지는지.
-     * @details 루트는 주소 질의에는 답하고 DNSKEY 질의에는 답하지 않는다. 서명되지 않았다는
-     *          증명도 없으므로 답은 여전히 SERVFAIL이지만, 사유는 EDE 22여야 하고 검증 실패
-     *          지표에 잡히면 안 된다. EDE 6으로 알리면 운영자가 멀쩡한 서명을 살핀다.
-     */
+    /// The root answers address queries but not DNSKEY queries. With no proof of being unsigned the
+    /// answer is still SERVFAIL, but the code must be EDE 22 and the bogus metric must not count
+    /// it; EDE 6 would send operators to check sound signatures.
     fn unfetchable_keys_are_reported_as_an_unreachable_authority() {
-        /** @brief 이 테스트가 쓰는 포트. 다른 테스트와 겹치면 서로 답을 가로챈다. */
         const PORT: u16 = 5424;
         let root = spawn_server("127.0.0.93", PORT, |req| {
             if req.questions.first().unwrap().qtype == RecordType::DNSKEY {
-                /* 답하지 않는 서버를 흉내 내려고, 이 서버가 버리는 ID를 가진 응답을 돌려준다. */
+                // Mimics a silent server by answering with an ID this server discards.
                 let mut m = base(req);
                 m.header.id = req.header.id.wrapping_add(1);
                 return m;
@@ -9367,7 +8659,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검증 실패가 지표에 잡히는지. */
     fn bogus_servfail_increments_observability_counter() {
         let global_before = validation_bogus_total();
         let before = test_thread_validation_bogus_total();

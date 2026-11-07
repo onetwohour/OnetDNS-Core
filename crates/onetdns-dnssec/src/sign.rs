@@ -1,13 +1,7 @@
-/*!
- * @brief 권한 zone 온라인 서명.
- *
- * @details 이 서버가 서빙하는 zone에 RRSIG와 부재 증명 체인을 붙인다. 기본 알고리즘은 13이고,
- *          존별로 15(Ed25519)를 고를 수 있다. 서명이 3배 싸지만 알고리즘 15를 모르는
- *          검증기는 그 zone을 insecure로 떨어뜨리므로 기본값은 바꾸지 않는다.
- * @note 검증기와 같은 signed_data를 써서 서명 대상을 만든다. 서명자와 검증자가 따로
- *       정규형을 구현하면 어긋나는 순간을 알아차릴 수 없다.
- */
+//! Online signing of authoritative zones. Signing builds its input with the same `signed_data`
+//! the validator uses, so the two cannot drift apart.
 
+use ed25519_dalek::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use onetdns_proto::{DnsClass, Name, RData, Record, RecordType};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::SigningKey;
@@ -16,30 +10,21 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{signed_data, Dnskey, Ds, Rrsig};
 
-/** @brief 유효 개시를 현재보다 이만큼 앞당긴다. 검증기와 이 서버의 시계가 어긋나도 견디게 한다. */
+/// Tolerates clock skew between validators and this server.
 const INCEPTION_SKEW: u64 = 3_600;
-/** @brief 서명 유효 기간. 짧으면 재서명이 잦고, 길면 폐기가 늦게 반영된다. */
+/// Shorter means more re-signing; longer means a revoked key stays usable longer.
 const VALIDITY: u64 = 14 * 86_400;
 
-/**
- * @brief zone 서명에 쓸 알고리즘.
- *
- * @details 기본값은 13이다. 서명 비용은 알고리즘 15가 더 싸므로 zone마다 15를 고를 수
- *          있게 열어 두었다. 검증기 조합을 늘리지 않으려고 기본값은 옮기지 않는다.
- * @note 알고리즘 15를 모르는 검증기는 그 zone을 bogus가 아니라 insecure로 떨어뜨린다.
- *       상호운용 판단이 필요한 선택이므로 기본값을 바꾸지 않는다.
- */
+/// Algorithm 15 signs more cheaply, but validators that lack it treat the zone as insecure, so the
+/// default stays 13.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignAlgorithm {
-    /** @brief 알고리즘 13. ECDSA P-256 + SHA-256. */
     #[default]
     EcdsaP256,
-    /** @brief 알고리즘 15. Ed25519(RFC 8080). */
     Ed25519,
 }
 
 impl SignAlgorithm {
-    /** @brief DNSKEY와 RRSIG에 담을 번호. */
     pub fn number(self) -> u8 {
         match self {
             SignAlgorithm::EcdsaP256 => 13,
@@ -47,7 +32,7 @@ impl SignAlgorithm {
         }
     }
 
-    /** @brief 설정 문자열에서. 모르는 이름은 None. */
+    /// `None` for an unknown name.
     pub fn from_str(raw: &str) -> Option<Self> {
         match raw {
             "ecdsap256" => Some(SignAlgorithm::EcdsaP256),
@@ -57,20 +42,13 @@ impl SignAlgorithm {
     }
 }
 
-/**
- * @brief 실제 서명 키. 알고리즘마다 다른 곡선을 쓴다.
- * @invariant 이 열거형이 곧 알고리즘 번호의 단일 출처다. 서명·DNSKEY·PEM이 모두 여기서
- *            갈라지므로 한쪽만 바꾸면 공표한 키와 실제 서명이 어긋난다.
- */
+/// The single source of the algorithm number: signatures, DNSKEYs and PEM all branch here.
 enum SignKey {
-    /** @brief 알고리즘 13. */
     EcdsaP256(SigningKey),
-    /** @brief 알고리즘 15. 서명이 훨씬 싸다. */
     Ed25519(Box<ed25519_dalek::SigningKey>),
 }
 
 impl SignKey {
-    /** @brief 이 키의 알고리즘. */
     fn algorithm(&self) -> SignAlgorithm {
         match self {
             SignKey::EcdsaP256(_) => SignAlgorithm::EcdsaP256,
@@ -78,7 +56,7 @@ impl SignKey {
         }
     }
 
-    /** @brief 시드에서 키를 만든다. 시드가 쓸 수 없으면 다시 해시해 고른다. */
+    /// Rehashes a seed that is not a valid key.
     fn from_seed(algorithm: SignAlgorithm, seed: [u8; 32]) -> Self {
         match algorithm {
             SignAlgorithm::EcdsaP256 => SignKey::EcdsaP256(key_from_seed(seed)),
@@ -91,7 +69,6 @@ impl SignKey {
         }
     }
 
-    /** @brief 서명 대상 바이트에 서명한다. */
     fn sign(&self, data: &[u8]) -> Vec<u8> {
         match self {
             SignKey::EcdsaP256(key) => {
@@ -105,11 +82,11 @@ impl SignKey {
         }
     }
 
-    /** @brief DNSKEY RDATA에 담을 공개 키 바이트. */
+    /// x||y for P-256, the 32-byte key for Ed25519.
     fn public_key(&self) -> Vec<u8> {
         match self {
             SignKey::EcdsaP256(key) => {
-                let point = key.verifying_key().to_encoded_point(false);
+                let point = key.verifying_key().to_sec1_point(false);
                 let mut pk = Vec::with_capacity(64);
                 pk.extend_from_slice(
                     point
@@ -127,7 +104,6 @@ impl SignKey {
         }
     }
 
-    /** @brief PKCS#8 PEM으로 내보낸다. 재시작 사이 키를 보존하는 용도다. */
     fn to_pkcs8_pem(&self) -> Option<Zeroizing<String>> {
         match self {
             SignKey::EcdsaP256(key) => key.to_pkcs8_pem(Default::default()).ok(),
@@ -135,11 +111,7 @@ impl SignKey {
         }
     }
 
-    /**
-     * @brief PKCS#8 PEM에서 읽는다.
-     * @details 알고리즘을 지정하지 않는다. 저장된 키 자체가 무엇인지 말한다. P-256으로
-     *          읽히지 않으면 Ed25519로 시도한다.
-     */
+    /// The PEM says which algorithm it holds: P-256 is tried first, then Ed25519.
     fn from_pkcs8_pem(pem: &str) -> Option<Self> {
         if let Ok(key) = SigningKey::from_pkcs8_pem(pem) {
             return Some(SignKey::EcdsaP256(key));
@@ -150,31 +122,27 @@ impl SignKey {
     }
 }
 
-/**
- * @brief 한 zone의 서명자.
- * @details KSK를 따로 두지 않으면 키 하나가 SEP까지 겸한다. 나눠 두면 DNSKEY RRset은
- *          KSK로, 나머지는 ZSK로 서명한다.
- */
+/// Without a KSK the one key also serves as the SEP. With one, the KSK signs the DNSKEY RRset
+/// and the ZSK signs the rest.
 pub struct ZoneSigner {
-    /** @brief ZSK. KSK가 없으면 이 키가 전부를 서명한다. */
+    /// Signs everything when there is no KSK.
     key: SignKey,
-    /** @brief KSK. 있으면 DNSKEY RRset 전용 서명 키다. */
+    /// Signs only the DNSKEY RRset.
     ksk: Option<SignKey>,
 
-    /** @brief zone apex. 서명자 이름이자 DNSKEY의 소유자다. */
+    /// The zone apex: signer name and DNSKEY owner.
     pub owner: Name,
 
-    /** @brief 서명에는 쓰지 않고 DNSKEY RRset에만 담을 키들. 롤오버 사전 공표용이다. */
+    /// Published in the DNSKEY RRset for a rollover but not used to sign.
     published_extra: Vec<Dnskey>,
 }
 
 impl ZoneSigner {
-    /** @brief 시드에서 ZSK 하나를 만든다. 그 키가 SEP까지 겸한다. */
+    /// One ZSK that also serves as the SEP.
     pub fn generate(owner: Name, seed: [u8; 32]) -> ZoneSigner {
         Self::generate_with(owner, seed, SignAlgorithm::default())
     }
 
-    /** @brief 알고리즘을 골라 ZSK 하나를 만든다. */
     pub fn generate_with(owner: Name, seed: [u8; 32], algorithm: SignAlgorithm) -> ZoneSigner {
         ZoneSigner {
             key: SignKey::from_seed(algorithm, seed),
@@ -184,17 +152,15 @@ impl ZoneSigner {
         }
     }
 
-    /** @brief 이 서명자가 쓰는 알고리즘. */
     pub fn algorithm(&self) -> SignAlgorithm {
         self.key.algorithm()
     }
 
-    /** @brief ZSK와 KSK를 각각 만든다. KSK만 부모에 DS로 올리면 ZSK는 자유롭게 굴릴 수 있다. */
+    /// Only the KSK goes to the parent as a DS, so the ZSK can roll freely.
     pub fn generate_split(owner: Name, zsk_seed: [u8; 32], ksk_seed: [u8; 32]) -> ZoneSigner {
         Self::generate_split_with(owner, zsk_seed, ksk_seed, SignAlgorithm::default())
     }
 
-    /** @brief 알고리즘을 골라 ZSK와 KSK를 만든다. */
     pub fn generate_split_with(
         owner: Name,
         zsk_seed: [u8; 32],
@@ -209,7 +175,7 @@ impl ZoneSigner {
         }
     }
 
-    /** @brief 저장된 ZSK를 PEM에서 읽는다. 재시작해도 같은 키로 서명해야 캐시가 깨지지 않는다. */
+    /// Restarting with the same key keeps cached signatures valid.
     pub fn from_pkcs8_pem(pem: &str, owner: Name) -> Option<ZoneSigner> {
         let key = SignKey::from_pkcs8_pem(pem)?;
         Some(ZoneSigner {
@@ -220,11 +186,8 @@ impl ZoneSigner {
         })
     }
 
-    /**
-     * @brief 저장된 ZSK와 선택적 KSK를 읽는다.
-     * @return 어느 한쪽이라도 해석되지 않으면 None. 절반만 읽고 나머지를 새로 만들면
-     *         공표된 DNSKEY와 실제 서명 키가 어긋난다.
-     */
+    /// `None` when either fails to parse: reading one and generating the other would publish a
+    /// DNSKEY that does not match the signing key.
     pub fn from_pkcs8_pems(
         zsk_pem: &str,
         ksk_pem: Option<&str>,
@@ -243,32 +206,28 @@ impl ZoneSigner {
         })
     }
 
-    /**
-     * @brief 서명에는 쓰지 않되 DNSKEY RRset에 함께 담을 키를 등록한다.
-     * @details 롤오버는 새 키를 먼저 공표하고, 검증기들이 그것을 본 뒤에야 서명을 옮겨야
-     *          한다. 공표 없이 바로 바꾸면 그 사이 응답이 전부 검증 실패한다.
-     */
+    /// A rollover publishes the new key first and moves signing only after validators have seen it;
+    /// switching at once fails validation in between.
     pub fn with_published_keys(mut self, extra: Vec<Dnskey>) -> Self {
         self.published_extra = extra;
         self
     }
 
-    /** @brief ZSK를 PEM으로 내보낸다. 재시작 사이 키를 보존하는 용도다. */
+    /// Keeps the key across restarts.
     pub fn to_pkcs8_pem(&self) -> Option<Zeroizing<String>> {
         self.key.to_pkcs8_pem()
     }
 
-    /** @brief KSK를 PEM으로 내보낸다. 나눠 두지 않았으면 None. */
+    /// `None` when the keys are not split.
     pub fn ksk_pem(&self) -> Option<Zeroizing<String>> {
         self.ksk.as_ref()?.to_pkcs8_pem()
     }
 
-    /** @brief KSK와 ZSK가 나뉘어 있는지. */
     pub fn is_split(&self) -> bool {
         self.ksk.is_some()
     }
 
-    /** @brief DNSKEY RRset에 담길 키 전부: ZSK, 있으면 KSK, 그리고 사전 공표 키들. */
+    /// The ZSK, the KSK if any, and the prepublished keys.
     pub fn dnskeys(&self) -> Vec<Dnskey> {
         let mut v = vec![self.dnskey()];
         if let Some(k) = self.ksk_dnskey() {
@@ -278,21 +237,17 @@ impl ZoneSigner {
         v
     }
 
-    /**
-     * @brief ZSK의 DNSKEY.
-     * @note KSK가 없으면 이 키가 SEP도 겸하므로 플래그가 257이 된다. 나뉘어 있으면 256이다.
-     */
+    /// Flags 257 (SEP) when there is no KSK, 256 otherwise.
     pub fn dnskey(&self) -> Dnskey {
         let flags = if self.ksk.is_some() { 256 } else { 257 };
         dnskey_of(&self.key, flags)
     }
 
-    /** @brief KSK의 DNSKEY. 항상 SEP 플래그가 붙는다. */
+    /// Always flagged SEP.
     pub fn ksk_dnskey(&self) -> Option<Dnskey> {
         self.ksk.as_ref().map(|k| dnskey_of(k, 257))
     }
 
-    /** @brief 공표할 DNSKEY 레코드 전부. apex 소유자로 만든다. */
     pub fn dnskey_records(&self, ttl: u32) -> Vec<Record> {
         let mut v = vec![Record {
             name: self.owner.clone(),
@@ -323,19 +278,15 @@ impl ZoneSigner {
         v
     }
 
-    /**
-     * @brief 부모에 올릴 DS. KSK가 있으면 그것으로, 없으면 ZSK로 만든다.
-     * @note 부모가 지목하는 키가 곧 신뢰 진입점이므로, ZSK를 굴려도 이 DS는 그대로여야 한다.
-     */
+    /// From the KSK if any, else the ZSK. The parent points at this key, so it must not change when
+    /// the ZSK rolls.
     pub fn ds(&self) -> Option<Ds> {
         let key = self.ksk_dnskey().unwrap_or_else(|| self.dnskey());
         Ds::from_dnskey(&key, &self.owner, 2)
     }
 
-    /**
-     * @brief CDS와 CDNSKEY 레코드: 부모에게 DS를 이렇게 바꿔 달라는 자식 쪽 신호다.
-     * @details 부모가 이 값을 그대로 반영하므로 실제 SEP 키와 어긋나면 위임이 끊긴다.
-     */
+    /// The child's request for the parent's DS. The parent applies it as is, so it must match the
+    /// real SEP key or the delegation breaks.
     pub fn cds_cdnskey_records(&self, ttl: u32) -> Vec<Record> {
         let key = self.ksk_dnskey().unwrap_or_else(|| self.dnskey());
         let Some(ds) = self.ds() else {
@@ -359,34 +310,7 @@ impl ZoneSigner {
         ]
     }
 
-    /**
-     * @brief RRset 하나를 서명해 RRSIG 레코드를 만든다.
-     *
-     * @details DNSKEY RRset은 KSK로, 나머지는 ZSK로 서명한다. labels 필드는 빈 라벨과
-     *          와일드카드를 뺀 개수다. 검증기가 이 값으로 와일드카드 확장을 되돌리므로
-     *          별표를 세면 소유자 이름이 어긋난다.
-     * @param rrset 같은 소유자·타입의 레코드들. 첫 레코드에서 메타데이터를 가져온다.
-     * @param now   현재 시각(Unix 초).
-     * @return RRSIG 레코드. 빈 RRset이면 None.
-     */
-    /**
-     * @brief 고정 digest에 곡선 연산만 되풀이해 1회 비용을 낸다.
-     *
-     * @details 서명 한 건의 비용에서 곡선 연산이 차지하는 몫을 갈라 보려는 계측용이다.
-     *          대조 엔진보다 느릴 때 고칠 수 있는 곳이 앞단인지 암호 라이브러리인지를
-     *          이 값으로 정한다.
-     * @param iterations 되풀이 횟수. 0이면 0을 돌려준다.
-     * @return 1회당 마이크로초.
-     */
-    /**
-     * @brief 알고리즘 15(Ed25519)로 같은 일을 할 때의 1회 비용.
-     *
-     * @details 알고리즘 13의 곡선 연산이 대조 엔진보다 비싼 것이 확인되어, 이미 트리에 있는
-     *          검증된 크레이트로 닫을 수 있는지 재려는 계측용이다. 서명 경로를 바꾸지는
-     *          않는다. 알고리즘 선택은 검증기 상호운용에 걸리는 결정이다.
-     * @param iterations 되풀이 횟수. 0이면 0을 돌려준다.
-     * @return 1회당 마이크로초.
-     */
+    /// Microseconds per Ed25519 signature, for comparison with algorithm 13.
     pub fn bench_ed25519_sign_us(iterations: usize) -> f64 {
         if iterations == 0 {
             return 0.0;
@@ -402,6 +326,7 @@ impl ZoneSigner {
         started.elapsed().as_secs_f64() * 1e6 / iterations as f64
     }
 
+    /// Microseconds per signature over a fixed digest, measuring the curve operation alone.
     pub fn bench_raw_sign_us(&self, iterations: usize) -> f64 {
         if iterations == 0 {
             return 0.0;
@@ -414,6 +339,8 @@ impl ZoneSigner {
         started.elapsed().as_secs_f64() * 1e6 / iterations as f64
     }
 
+    /// The KSK signs the DNSKEY RRset and the ZSK the rest. The labels field leaves out a leading
+    /// `*`, since validators use it to undo wildcard expansion. `None` for an empty RRset.
     pub fn sign_rrset(&self, rrset: &[Record], now: u64) -> Option<Record> {
         let first = rrset.first()?;
         let (signing_key, key_tag) = if first.rtype.0 == 48 {
@@ -454,11 +381,8 @@ impl ZoneSigner {
     }
 }
 
-/**
- * @brief 시드에서 서명 키를 만든다.
- * @details 시드가 위수 범위를 벗어나면 해시해서 다시 시도한다. 확률은 무시할 만큼 낮지만,
- *          실패를 그냥 넘기면 키 생성이 패닉으로 끝난다.
- */
+/// Rehashes a seed outside the group order: the chance is negligible, but key generation must not
+/// panic.
 fn key_from_seed(seed: [u8; 32]) -> SigningKey {
     let mut seed = Zeroizing::new(seed);
     loop {
@@ -472,16 +396,12 @@ fn key_from_seed(seed: [u8; 32]) -> SigningKey {
     }
 }
 
-/** @brief PEM에서 ZSK의 공개 부분만 추출한다. 사전 공표 목록을 만들 때 쓴다. */
+/// The public part of a stored ZSK, for the prepublication list.
 pub fn zsk_dnskey_from_pkcs8_pem(pem: &str) -> Option<Dnskey> {
     let key = SignKey::from_pkcs8_pem(pem)?;
     Some(dnskey_of(&key, 256))
 }
 
-/**
- * @brief 서명 키에서 DNSKEY를 만든다.
- * @note 공개키는 비압축 점에서 접두사를 뗀 x와 y를 잇는다. 알고리즘 13의 형식이다.
- */
 fn dnskey_of(key: &SignKey, flags: u16) -> Dnskey {
     Dnskey {
         flags,
@@ -491,41 +411,29 @@ fn dnskey_of(key: &SignKey, flags: u16) -> Dnskey {
     }
 }
 
-/** @brief NSEC3 해시 매개변수. */
 #[derive(Debug, Clone, Default)]
 pub struct Nsec3Params {
-    /** @brief 추가 해시 반복. 검증기 CPU를 그대로 늘리므로 크게 잡지 않는다. */
+    /// Each iteration adds validator CPU, so keep it small.
     pub iterations: u16,
-    /** @brief 사전 계산 공격을 늦추는 salt. */
     pub salt: Vec<u8>,
 }
 
-/** @brief 부재 증명 방식. */
 #[derive(Debug, Clone, Default)]
 pub enum DenialMode {
-    /** @brief NSEC. 단순하지만 zone의 이름 목록이 그대로 드러난다. */
+    /// Simple, but exposes every name in the zone.
     #[default]
     Nsec,
-    /** @brief NSEC3. 이름을 해시로 가리는 대신 검증 비용이 는다. */
+    /// Hides names behind hashes at a higher validation cost.
     Nsec3(Nsec3Params),
 }
 
-/** @brief NSEC 방식으로 zone에 서명한다. */
 pub fn sign_zone(records: &[Record], signer: &ZoneSigner, now: u64) -> Vec<Record> {
     sign_zone_with(records, signer, now, &DenialMode::Nsec)
 }
 
-/**
- * @brief zone 전체에 서명하고 부재 증명 체인을 붙인다.
- *
- * @details 기존 DNSSEC 레코드를 먼저 걷어내고 새로 만든다. 남겨 두면 이전 서명과 새 서명이
- *          섞여 검증기가 어느 쪽을 볼지 알 수 없다.
- * @note 위임 지점 아래는 서명하지 않는다. 그 데이터는 자식 zone 소유라 이 서버의 권한 밖이고,
- *       부모가 서명하면 자식이 바꾼 내용과 어긋난다. 위임에서 이 서버가 서명하는 것은
- *       DS와 부재 증명 레코드뿐이다.
- * @param mode 부재 증명 방식.
- * @return 서명과 부재 증명이 붙은 zone 레코드 전부.
- */
+/// Removes existing DNSSEC records first, so old and new signatures do not mix. Data below a
+/// delegation belongs to the child zone and stays unsigned; at a delegation this server signs only
+/// the DS and the denial records.
 pub fn sign_zone_with(
     records: &[Record],
     signer: &ZoneSigner,
@@ -535,17 +443,10 @@ pub fn sign_zone_with(
     sign_zone_reusing(records, signer, now, mode, &[])
 }
 
-/**
- * @brief 지난 서명을 물려받아 zone에 서명한다.
- *
- * @details 영역을 고칠 때마다 전부 다시 서명하면 레코드 하나를 바꾸는 값이 영역 크기에
- *          비례한다. 내용이 그대로이고 서명이 넉넉히 살아 있는 RRset은 지난 서명을 그대로
- *          쓰고, 바뀐 것과 새 부재 증명만 새로 서명한다.
- * @param previous 지난 서명된 레코드들. 이 서버가 직접 만들어 이 서버의 저장소에 가지고 있던 것만
- *                 넘겨야 한다. 바깥에서 받은 RRSIG를 넣으면 검증하지 않고 내보내게 된다.
- *                 빈 배열이면 전부 새로 서명한다.
- * @return 서명과 부재 증명이 붙은 zone 레코드 전부. 물려받든 새로 만들든 결과 구성은 같다.
- */
+/// Re-signing a whole zone for each edit costs time proportional to its size, so an unchanged
+/// RRset with enough lifetime left keeps its signature. `previous` must hold only records this
+/// server signed and stored itself: an RRSIG from elsewhere would be served unverified. An empty
+/// `previous` signs everything.
 pub fn sign_zone_reusing(
     records: &[Record],
     signer: &ZoneSigner,
@@ -660,36 +561,20 @@ pub fn sign_zone_reusing(
     out
 }
 
-/**
- * @brief 아직 쓸 수 있는 지난 서명을 찾아 주는 것.
- *
- * @details 영역을 고칠 때마다 전부 다시 서명하면 레코드 하나를 바꾸는 값이 영역 크기에
- *          비례한다. 내용이 그대로이고 서명이 넉넉히 살아 있으면 그 서명을 그대로 쓴다.
- * @warning 지난 서명은 이 서버가 직접 만들어 이 서버의 저장소에 가지고 있던 것만 넘겨야 한다.
- *          바깥에서 받은 RRSIG를 여기 넣으면 검증하지 않고 내보내게 된다.
- * @invariant 재사용 조건은 서명자 이름·알고리즘·키 tag·남은 수명·원본 TTL·RRset 내용이
- *            모두 같을 때뿐이다. 하나라도 어긋나면 새로 서명한다.
- */
+/// A signature is reused only when the signer, algorithm, key tag, remaining lifetime, original
+/// TTL and RRset contents all match.
 struct ReusableSignatures<'a> {
-    /**
-     * @brief (정규 소유자, 덮는 타입) → 지난 서명과 그때의 RRset. 모두 빌려 쓴다.
-     * @note 키는 Name::canonical_key의 평평한 바이트열이다. 라벨마다 Vec을 만드는
-     *       형태를 쓰면 이 테이블을 만드는 값이 서명보다 커진다. 실제로 그랬다.
-     */
+    /// Keyed by flat `Name::canonical_key` bytes: per-label vectors would make building this table
+    /// cost more than the signing.
     entries: std::collections::HashMap<(Vec<u8>, u16), (&'a Record, Vec<&'a Record>)>,
 }
 
-/** @brief 남은 수명이 이보다 짧으면 다시 서명한다. 만료가 임박한 서명을 물려주지 않으려는 것이다. */
+/// Never hands on a signature close to expiry.
 const REUSE_MIN_REMAINING: u64 = VALIDITY / 4;
 
-/**
- * @brief RRSIG RDATA에서 물려받기 판정에 쓰는 값만 읽는다.
- *
- * @details 서명 바이트와 서명자 이름을 복사하지 않으려는 것이다. 지난 영역의 RRSIG를
- *          전부 완전 해석하면 그 할당이 재사용 이득을 먹는다.
- * @param apex_wire 이 서버의 apex의 압축 없는 와이어. 서명자 이름을 여기에 대조한다.
- * @return (덮는 타입, 알고리즘, 개시, 만료, key tag). 형식이 어긋나거나 서명자가 다르면 None.
- */
+/// Reads only what the reuse check needs, without copying the signature or signer name. Returns
+/// (covered type, algorithm, inception, expiration, key tag), or `None` when malformed or signed by
+/// a name other than `apex_wire`.
 fn rrsig_reuse_header(record: &Record, apex_wire: &[u8]) -> Option<(u16, u8, u32, u32, u16)> {
     let RData::Unknown(46, raw) = &record.rdata else {
         return None;
@@ -715,7 +600,6 @@ fn rrsig_reuse_header(record: &Record, apex_wire: &[u8]) -> Option<(u16, u8, u32
 }
 
 impl<'a> ReusableSignatures<'a> {
-    /** @brief 지난 서명 목록에서 쓸 수 있는 것만 골라 담는다. 레코드는 복제하지 않는다. */
     fn new(previous: &'a [Record], signer: &ZoneSigner, now: u64) -> Self {
         let mut entries = std::collections::HashMap::new();
         if previous.is_empty() {
@@ -726,7 +610,7 @@ impl<'a> ReusableSignatures<'a> {
         let expected_algorithm = signer.algorithm().number();
         let apex_wire = signer.owner.canonical_key();
 
-        /* 지난 RRset들을 먼저 모은다. 서명은 내용이 그대로일 때만 물려줄 수 있다. */
+        // Reuse needs the old RRset, so collect those first.
         let mut rrsets: std::collections::HashMap<(Vec<u8>, u16), Vec<&'a Record>> =
             std::collections::HashMap::new();
         for record in previous.iter().filter(|record| record.rtype.0 != 46) {
@@ -761,7 +645,6 @@ impl<'a> ReusableSignatures<'a> {
         Self { entries }
     }
 
-    /** @brief 이 RRset에 그대로 쓸 수 있는 지난 서명. 내용이 다르면 없다. */
     fn take(&self, rrset: &[Record]) -> Option<Record> {
         let first = rrset.first()?;
         let mut buffer = [0u8; 255];
@@ -771,21 +654,18 @@ impl<'a> ReusableSignatures<'a> {
     }
 }
 
-/**
- * @brief 두 RRset이 서명 대상으로서 같은지.
- * @details TTL은 서명 대상에 들어가므로 함께 본다. 순서는 정규형에서 정렬되므로 무시한다.
- */
+/// TTL is part of the signed data, so it is compared; order is not, since canonical form sorts.
 fn rrsets_identical(left: &[Record], right: &[&Record]) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    /* 순서만 다른 같은 집합도 같은 것으로 본다. 한쪽이 작으므로 이차 비교로 충분하다. */
+    // Order-insensitive; the small side makes a quadratic scan enough.
     let same = |a: &Record, b: &Record| {
         a.ttl == b.ttl && a.class == b.class && a.rtype == b.rtype && a.rdata == b.rdata
     };
     let mut used = [false; 8];
     if left.len() > used.len() {
-        /* 큰 RRset은 드물다. 그때만 정렬 가능한 형태로 비교한다. */
+        // Large RRsets are rare; only then compare sorted keys.
         let key = |record: &Record| {
             (
                 record.ttl,
@@ -815,20 +695,12 @@ fn rrsets_identical(left: &[Record], right: &[&Record]) -> bool {
     true
 }
 
-/** @brief 병렬 서명으로 넘어가는 RRset 수. 이보다 작으면 스레드를 시작하는 값이 더 크다. */
+/// Below this, starting threads costs more than signing in parallel.
 const PARALLEL_SIGN_MIN_RRSETS: usize = 256;
 
-/**
- * @brief RRset들에 서명한다. 충분히 많으면 코어를 나눠 쓴다.
- *
- * @details 서명은 RRset마다 독립이고 서명자는 안에서 아무것도 바꾸지 않는다. 큰 영역은
- *          로드 시간의 대부분을 여기서 쓰는데 그 동안 코어 하나만 돌고 나머지는 논다.
- * @param out    서명을 이어 붙일 곳. 조각을 순서대로 넣으므로 결과는 코어 수와 무관하게
- *               정렬된 입력 순서 그대로다.
- * @param rrsets 서명 대상. 호출자가 위임 범위를 이미 걸러 둔다.
- * @note 조각 하나가 패닉하면 그대로 다시 던진다. 절반만 서명된 영역을 내보내면 검증기가
- *       그 영역을 전부 Bogus로 본다.
- */
+/// RRsets sign independently and the signer is not mutated, so a large zone spreads the work over
+/// cores. Chunks are appended in order, so the output does not depend on the core count. A panic in
+/// a chunk is re-raised: a half-signed zone would be bogus to validators.
 fn sign_rrsets_into(out: &mut Vec<Record>, rrsets: &[&Vec<Record>], signer: &ZoneSigner, now: u64) {
     let sign_part = |part: &[&Vec<Record>]| -> Vec<Record> {
         part.iter()
@@ -845,7 +717,6 @@ fn sign_rrsets_into(out: &mut Vec<Record>, rrsets: &[&Vec<Record>], signer: &Zon
         return;
     }
 
-    /* 슬롯을 미리 잡아 이어 붙이는 동안 다시 늘리지 않는다. */
     out.reserve(rrsets.len());
     let chunk = rrsets.len().div_ceil(threads);
     std::thread::scope(|scope| {
@@ -862,13 +733,8 @@ fn sign_rrsets_into(out: &mut Vec<Record>, rrsets: &[&Vec<Record>], signer: &Zon
     });
 }
 
-/**
- * @brief 정규 순서로 늘어놓은 이름들을 순환 구조의 NSEC 체인으로 엮는다.
- * @details 마지막 이름의 next는 처음으로 되돌아간다. 이 되감김이 있어야 zone 끝 뒤의
- *          이름들도 부재가 증명된다.
- * @note 각 NSEC은 자기 자신(47)과 RRSIG(46)를 타입 목록에 넣는다. 실제로 존재하는
- *       타입이므로 빠뜨리면 그 타입 질의가 NODATA로 잘못 증명된다.
- */
+/// The last name's next wraps to the first, which covers names past the end. Each NSEC lists NSEC
+/// and RRSIG, which exist at its owner; omitting them would prove NODATA for those types.
 fn build_nsec_chain(ordered: &[(Name, Vec<u16>)], ttl: u32) -> Vec<Record> {
     let n = ordered.len();
     let mut nsecs = Vec::with_capacity(n);
@@ -892,7 +758,6 @@ fn build_nsec_chain(ordered: &[(Name, Vec<u16>)], ttl: u32) -> Vec<Record> {
     nsecs
 }
 
-/** @brief apex의 NSEC3PARAM: 이 zone이 어떤 해시 매개변수를 쓰는지 알린다. */
 fn nsec3param_record(apex: &Name, p: &Nsec3Params, ttl: u32) -> Record {
     let mut rdata = vec![1u8, 0u8];
     rdata.extend_from_slice(&p.iterations.to_be_bytes());
@@ -907,12 +772,8 @@ fn nsec3param_record(apex: &Name, p: &Nsec3Params, ttl: u32) -> Record {
     }
 }
 
-/**
- * @brief 이름들을 해시해 정렬한 뒤 순환 구조의 NSEC3 체인으로 엮는다.
- * @details 정렬 기준은 원래 이름이 아니라 해시다. 해시가 겹치면 하나로 합친다. 같은
- *          소유자에 NSEC3이 둘이면 검증기가 어느 쪽을 볼지 정해지지 않는다.
- * @note apex의 타입 목록에는 NSEC3PARAM(51)을 넣는다. 실제로 apex에 존재하기 때문이다.
- */
+/// Sorted by hash; colliding hashes merge, since two NSEC3s at one owner are ambiguous. The apex
+/// lists NSEC3PARAM.
 fn build_nsec3_chain(
     apex: &Name,
     ordered: &[(Name, Vec<u16>)],
@@ -972,7 +833,7 @@ fn build_nsec3_chain(
     out
 }
 
-/** @brief 정규 순서로 정렬하기 위한 키: 라벨을 뒤집고 소문자로 내린다. */
+/// Labels reversed and lowercased.
 fn canonical_key(name: &Name) -> Vec<Vec<u8>> {
     name.labels()
         .iter()
@@ -981,12 +842,8 @@ fn canonical_key(name: &Name) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/**
- * @brief 타입 목록을 NSEC/NSEC3 비트맵으로 인코딩한다.
- * @details 정규형을 지킨다. 윈도우를 번호 순으로 내고, 뒤쪽 0 옥텟은 잘라 내며, 비어 있는
- *          윈도우는 아예 넣지 않는다. 파서 쪽이 이 형식만 받으므로 어기면 이 서버가 만든
- *          zone을 이 서버가 못 읽는다.
- */
+/// Canonical form: windows in order, trailing zero octets trimmed, empty windows omitted. The
+/// parser accepts only this form.
 fn type_bitmap(types: &[u16]) -> Vec<u8> {
     use std::collections::BTreeMap;
     let mut windows: BTreeMap<u8, [u8; 32]> = BTreeMap::new();
@@ -1009,15 +866,9 @@ fn type_bitmap(types: &[u16]) -> Vec<u8> {
     out
 }
 
-/**
- * @brief 이 질의의 부재를 증명하는 데 필요한 NSEC만 고른다.
- *
- * @details NODATA면 그 이름과 정확히 일치하는 NSEC 하나로 끝난다. NXDOMAIN이면 이름
- *          자체와 가능한 와일드카드 후보들까지 덮는 NSEC을 모아야 한다. 와일드카드를
- *          빼면 검증기가 증명을 받아들이지 않는다.
- * @return 소유자 이름 기준으로 중복을 없앤 최소 집합. 체인 전체를 붙이면 zone의 이름이
- *         그만큼 노출된다.
- */
+/// NODATA needs the one NSEC matching the name; NXDOMAIN also needs NSECs covering the possible
+/// wildcards, or validators reject the proof. Returns the minimal set, deduplicated by owner, so
+/// the response does not expose the whole chain.
 pub fn pick_denial_nsecs(nsecs: &[Record], qname: &Name, nxdomain: bool) -> Vec<Record> {
     let mut out: Vec<Record> = Vec::new();
     let mut push = |r: &Record| {
@@ -1058,15 +909,8 @@ pub fn pick_denial_nsecs(nsecs: &[Record], qname: &Name, nxdomain: bool) -> Vec<
     out
 }
 
-/**
- * @brief 이 질의의 부재를 증명하는 데 필요한 NSEC3만 고른다.
- *
- * @details NXDOMAIN이면 세 조각을 모은다. closest encloser에 일치하는 것, next closer를
- *          덮는 것, 그리고 와일드카드를 덮는 것. 하나라도 빠지면 검증기가 증명을
- *          받아들이지 않는다.
- * @note 해시 매개변수는 체인의 첫 NSEC3에서 가져와 전부에 같은 값을 쓴다. zone 안에서
- *       매개변수가 섞이면 검증기의 일관성 검사에 걸린다.
- */
+/// NXDOMAIN needs three NSEC3s: one matching the closest encloser, one covering the next closer
+/// name and one covering the wildcard. The hash parameters come from the first NSEC3 in the chain.
 pub fn pick_denial_nsec3(nsec3s: &[Record], qname: &Name, nxdomain: bool) -> Vec<Record> {
     let mut out: Vec<Record> = Vec::new();
     let mut push = |r: &Record| {
@@ -1149,19 +993,16 @@ pub fn pick_denial_nsec3(nsec3s: &[Record], qname: &Name, nxdomain: bool) -> Vec
     out
 }
 
-/** @brief 서명 결과를 이 서버의 검증기로 되돌려 확인한다. 서명자와 검증자의 정규형 일치. */
 #[cfg(test)]
 mod tests {
     use super::*;
     use onetdns_proto::Soa;
     use std::net::Ipv4Addr;
 
-    /** @brief 이름 문자열을 Name으로. */
     fn n(s: &str) -> Name {
         Name::from_str(s).unwrap()
     }
 
-    /** @brief apex, NS, glue, 일반 A를 갖춘 최소 zone. */
     fn zone_records() -> Vec<Record> {
         vec![
             Record {
@@ -1193,7 +1034,6 @@ mod tests {
         ]
     }
 
-    /** @brief 부모에 보낼 CDS/CDNSKEY가 실제 SEP 키와 일치하고 서명까지 붙는지. */
     #[test]
     fn cds_cdnskey_published_and_signed() {
         let signer = ZoneSigner::generate_split(n("example.com"), [3u8; 32], [9u8; 32]);
@@ -1242,7 +1082,6 @@ mod tests {
         );
     }
 
-    /** @brief 사전 공표 키가 DNSKEY RRset에 담기고 그 RRset이 여전히 검증되는지. */
     #[test]
     fn pre_published_zsk_in_signed_dnskey_rrset() {
         let next_key = ZoneSigner::generate(n("example.com"), [88u8; 32]).dnskey();
@@ -1286,7 +1125,6 @@ mod tests {
         );
     }
 
-    /** @brief 이 서버가 서명한 zone을 이 서버의 검증기가 통과시키는지. 정규형이 어긋나면 여기서 걸린다. */
     #[test]
     fn ed25519_signed_zone_validates_and_persists() {
         let signer =
@@ -1316,7 +1154,7 @@ mod tests {
         crate::validate_rrset(&rrset, &sigs, &[signer.dnskey()], now as u32)
             .expect("알고리즘 15 서명이 이 서버의 검증기를 통과해야 합니다");
 
-        /* DNSKEY RRset도 스스로 검증되어야 한다. 여기가 깨지면 신뢰 진입점이 끊긴다. */
+        // The DNSKEY RRset must validate too, or the chain of trust breaks.
         let keyset: Vec<Record> = signed
             .iter()
             .filter(|r| r.name.eq_ignore_case(&n("example.com")) && r.rtype.0 == 48)
@@ -1332,7 +1170,7 @@ mod tests {
             .expect("DNSKEY RRset 자기 서명도 검증되어야 합니다");
         assert!(signer.ds().is_some(), "부모에 올릴 DS가 나와야 합니다");
 
-        /* 재시작 사이 키가 보존되어야 한다. PEM 왕복이 깨지면 영역이 전부 바뀐다. */
+        // The key must survive a restart through PEM.
         let pem = signer.to_pkcs8_pem().expect("Ed25519 PEM 내보내기");
         let restored =
             ZoneSigner::from_pkcs8_pem(&pem, n("example.com")).expect("Ed25519 PEM 읽기");
@@ -1340,7 +1178,7 @@ mod tests {
         assert_eq!(restored.dnskey().public_key, signer.dnskey().public_key);
         assert_eq!(restored.dnskey().key_tag(), signer.dnskey().key_tag());
 
-        /* 저장된 키의 종류는 파일이 스스로 말한다. 알고리즘을 따로 안 적어도 된다. */
+        // A stored key says which algorithm it is.
         let p256_pem = ZoneSigner::generate(n("example.com"), [7u8; 32])
             .to_pkcs8_pem()
             .expect("P-256 PEM");
@@ -1365,7 +1203,7 @@ mod tests {
         }
         let first = sign_zone(&records, &signer, now);
 
-        /* 아무것도 안 바꾸면 서명이 전부 물려받아져 바이트까지 같아야 한다. */
+        // With no change every signature is reused, byte for byte.
         let again = sign_zone_reusing(&records, &signer, now + 60, &DenialMode::Nsec, &first);
         let sigs = |zone: &[Record]| -> Vec<Vec<u8>> {
             let mut v: Vec<Vec<u8>> = zone
@@ -1382,7 +1220,7 @@ mod tests {
             "내용이 그대로면 지난 서명을 그대로 써야 합니다"
         );
 
-        /* 한 이름의 주소를 바꾸면 그 RRset만 새 서명을 받아야 한다. */
+        // Changing one address re-signs only that RRset.
         let mut changed = records.clone();
         for record in &mut changed {
             if record.name.eq_ignore_case(&n("h007.example.com")) {
@@ -1414,7 +1252,7 @@ mod tests {
             untouched(&after),
             "안 바뀐 이웃은 지난 서명을 유지해야 합니다"
         );
-        /* 물려받은 것이 실제로 검증되는지. 물려받기가 어긋나면 검증기가 Bogus로 본다. */
+        // Reused signatures must still validate.
         let rrset: Vec<Record> = after
             .iter()
             .filter(|r| r.name.eq_ignore_case(&n("h008.example.com")) && r.rtype == RecordType::A)
@@ -1429,7 +1267,7 @@ mod tests {
         crate::validate_rrset(&rrset, &rrsigs, &[signer.dnskey()], (now + 60) as u32)
             .expect("물려받은 서명도 검증되어야 합니다");
 
-        /* 만료가 임박하면 물려받지 않는다. */
+        // No reuse close to expiry.
         let late = now + VALIDITY - REUSE_MIN_REMAINING / 2;
         let refreshed = sign_zone_reusing(&records, &signer, late, &DenialMode::Nsec, &first);
         assert_ne!(
@@ -1438,7 +1276,7 @@ mod tests {
             "만료가 가까운 서명은 새로 만들어야 합니다"
         );
 
-        /* 다른 키의 서명은 물려받지 않는다. */
+        // No reuse across keys.
         let other = ZoneSigner::generate(n("example.com"), [22u8; 32]);
         let foreign = sign_zone_reusing(&records, &other, now + 60, &DenialMode::Nsec, &first);
         assert_ne!(
@@ -1470,7 +1308,7 @@ mod tests {
     fn parallel_signing_matches_the_sequential_order_and_signs_everything() {
         use std::net::Ipv4Addr;
 
-        /* 병렬 문턱을 넘기는 크기여야 조각 이어 붙이기가 실제로 걸린다. */
+        // Large enough to cross the parallel threshold.
         let owners = PARALLEL_SIGN_MIN_RRSETS * 4;
         let signer = ZoneSigner::generate(n("example.com"), [9u8; 32]);
         let now = 1_700_000_000u64;
@@ -1489,10 +1327,7 @@ mod tests {
             "병렬 경로를 실제로 태우는 크기여야 합니다"
         );
 
-        /*
-         * 서명은 정렬된 RRset 순서 그대로 붙는다. 조각을 순서대로 이어 붙이지 않으면
-         * 코어 수에 따라 결과가 달라진다.
-         */
+        // Signatures follow the sorted RRset order whatever the core count.
         let sig_keys: Vec<(Vec<Vec<u8>>, u16)> = signed
             .iter()
             .filter(|r| r.rtype.0 == 46)
@@ -1502,7 +1337,7 @@ mod tests {
         sorted.sort();
         assert_eq!(sig_keys, sorted, "서명이 정규 순서를 벗어났습니다");
 
-        /* 서명해야 할 RRset이 하나도 빠지지 않았는지. 조각 하나를 잃으면 여기서 걸린다. */
+        // No RRset may be left unsigned.
         let mut unsigned: Vec<String> = Vec::new();
         let signed_set: std::collections::HashSet<(Vec<Vec<u8>>, u16)> =
             sig_keys.into_iter().collect();
@@ -1513,7 +1348,7 @@ mod tests {
         }
         assert!(unsigned.is_empty(), "서명이 빠진 RRset: {unsigned:?}");
 
-        /* 값 자체도 유효해야 한다. 순서만 맞고 내용이 틀리면 소용이 없다. */
+        // The signatures must also validate.
         let target = n("h00000.example.com");
         let rrset: Vec<Record> = signed
             .iter()
@@ -1590,7 +1425,6 @@ mod tests {
         );
     }
 
-    /** @brief NSEC3 방식으로 서명한 zone도 같은 검증기를 통과하는지. */
     #[test]
     fn nsec3_signed_zone_validates() {
         let signer = ZoneSigner::generate(n("example.com"), [21u8; 32]);
@@ -1658,11 +1492,8 @@ mod tests {
             .expect("NSEC3 RRSIG 검증");
     }
 
-    /**
-     * @brief 빈 비단말도 체인에 들어가야 한다.
-     * @details 레코드가 없어도 트리 상 존재하는 이름이다. 빠뜨리면 그 이름이 없다고
-     *          증명돼 아래쪽 이름의 부재 증명이 어긋난다.
-     */
+    /// An empty non-terminal has no records but exists in the tree; leaving it out would prove it
+    /// absent.
     #[test]
     fn denial_chains_include_empty_nonterminals() {
         let signer = ZoneSigner::generate(n("example.com"), [31u8; 32]);
@@ -1709,7 +1540,6 @@ mod tests {
         ));
     }
 
-    /** @brief 위임 아래 데이터는 자식 소유라 부모가 서명하지 않는다. DS와 NSEC만 예외다. */
     #[test]
     fn delegation_ns_and_glue_are_not_zone_signed() {
         let signer = ZoneSigner::generate(n("example.com"), [32u8; 32]);
@@ -1792,7 +1622,6 @@ mod tests {
         assert!(!hashes.contains(&nested_hash));
     }
 
-    /** @brief 여러 부재 상황을 한데 모아, 고른 증명이 실제로 검증기를 통과하는지 확인한다. */
     #[test]
     fn dnssec_negative_proof_corpus() {
         let signer = ZoneSigner::generate(n("example.com"), [42u8; 32]);
@@ -1912,7 +1741,6 @@ mod tests {
         );
     }
 
-    /** @brief PEM 왕복에서 같은 키가 나오는지. 재시작 때 서명 키가 바뀌면 안 된다. */
     #[test]
     fn signer_key_persists_via_pem() {
         let s1 = ZoneSigner::generate(n("example.com"), [7u8; 32]);
@@ -1926,7 +1754,6 @@ mod tests {
         assert_eq!(s1.ds().unwrap().digest, s2.ds().unwrap().digest);
     }
 
-    /** @brief 키를 나눠 두면 DNSKEY는 KSK로, 나머지는 ZSK로 서명되고 체인이 성립하는지. */
     #[test]
     fn ksk_zsk_split_signs_and_validates() {
         let signer = ZoneSigner::generate_split(n("example.com"), [31u8; 32], [32u8; 32]);
