@@ -3,6 +3,8 @@
 //! This is the layer right above onetdns-proto. Its traits are the boundary between the data
 //! plane and the filter, ACL and rate-limit implementations, so upper crates meet only here.
 
+/// Per-client connection limits shared by the TCP and QUIC listeners.
+pub mod admission;
 pub mod client;
 pub mod fs;
 pub mod ipnet;

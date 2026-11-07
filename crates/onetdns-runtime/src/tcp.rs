@@ -1,58 +1,38 @@
-/*!
- * @brief Do53 TCP 리스너와 연결 처리 워커.
- *
- * @details 수락과 처리를 분리한다. 수락 스레드는 연결을 받아 유계 큐에 넣기만 하고,
- *          처리 워커가 그 큐를 나눠 먹는다. 한 덩어리로 두면 느린 클라이언트 하나가
- *          수락 스레드를 붙들어 새 연결이 아예 받아지지 않는다.
- */
+//! Do53 TCP listener and connection workers. Accepting only queues connections and workers
+//! serve them, so a slow client cannot stop new connections from being accepted.
 
-use std::collections::HashMap;
 use std::io::{self, ErrorKind, IoSlice, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use onetdns_core::admission::ClientCounts;
 use onetdns_core::IpNet;
 use onetdns_proto::{Message, Writer};
 
 use crate::{Handler, RequestCtx, Transport, WireDisposition};
 
-/** @brief PROXY 헤더가 다 도착할 때까지 기다릴 시간. */
 const PROXY_HEADER_DEADLINE: Duration = Duration::from_secs(5);
 
-/** @brief 메시지 하나를 다 읽을 때까지 기다릴 시간. 느린 연결이 워커를 붙들지 못하게 한다. */
+/// Bounds how long a slow connection can hold a worker for one message.
 const DNS_MESSAGE_DEADLINE: Duration = Duration::from_secs(10);
 
-/** @brief 연결 처리 워커 수의 하한. */
 const MIN_CONNECTION_WORKERS: usize = 8;
 
-/** @brief 연결 처리 워커 수의 상한. */
 const MAX_CONNECTION_WORKERS: usize = 64;
 
-/** @brief 수락 큐 길이의 하한. */
 const MIN_CONNECTION_QUEUE: usize = 256;
 
-/**
- * @brief 수락 큐 길이의 상한.
- * @details 큐가 유계여야 한다. 무한 큐는 부하가 몰릴 때 메모리로 흘러들어가 결국
- *          응답 불가로 이어진다. 넘치면 새 연결을 거절하는 편이 낫다.
- */
+/// Past this, new connections are refused instead of queued in memory.
 const MAX_CONNECTION_QUEUE: usize = 4096;
 
-/**
- * @brief PROXY 모드에서 한 출발지 IP가 열 수 있는 연결 수.
- * @details 이 모드에서는 모든 연결이 로드밸런서 주소 하나에서 오므로 한도를 크게 잡는다.
- *          평소 한도를 쓰면 프록시 뒤 전체가 그 한도를 나눠 쓰게 된다.
- */
+/// Behind a proxy every connection comes from the proxy's address, so the per-client limit is
+/// raised.
 const MAX_PROXY_CONNECTIONS_PER_IP: usize = 64;
 
-/**
- * @brief 2바이트 길이 접두사를 붙여 메시지를 쓴다.
- * @details 접두사와 본문을 한 번의 벡터 쓰기로 보낸다. 나눠 쓰면 접두사만 담긴
- *          작은 패킷이 따로 나가 왕복이 늘어난다.
- * @note 부분 쓰기가 접두사 중간에서 끊길 수 있어, 남은 위치를 계산해 이어 쓴다.
- */
+/// Sends the length prefix and body in one vectored write, so the prefix does not leave in a
+/// packet of its own. A short write may stop inside the prefix, so the rest is resumed from there.
 fn write_dns_frame<W: Write>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
     let len = u16::try_from(payload.len()).map_err(|_| {
         io::Error::new(ErrorKind::InvalidInput, "DNS/TCP frame exceeds 65535 bytes")
@@ -79,83 +59,58 @@ fn write_dns_frame<W: Write>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-/** @brief 수락된 연결: 스트림, 상대 주소, 그리고 슬롯을 붙잡고 있는 가드. */
+/// The stream, its peer, and the guard holding its slot.
 pub(crate) type Accepted = (TcpStream, SocketAddr, ConnectionGuard);
 
-/** @brief 연결 처리 워커 풀 설정. */
 pub(crate) struct ConnectionPoolConfig {
-    /** @brief 새 연결을 확인하는 주기. */
     pub poll: Duration,
-    /** @brief 앞단 프록시가 알려 주는 주소를 읽을지. */
     pub proxy_protocol: bool,
-    /** @brief 그 알림을 믿어 줄 프록시 주소들. */
     pub trusted_proxies: Arc<Vec<IpNet>>,
-    /** @brief 워커 수. */
     pub workers: usize,
-    /** @brief 대기열 크기. */
     pub queue_capacity: usize,
-    /** @brief 워커를 코어에 묶을지. */
     pub pin_cores: bool,
-    /** @brief 고정할 코어 범위. 수락 스레드와 같은 코어들에 나눠 붙인다. */
+    /// Cores to pin to, shared with the accept threads.
     pub pin_span: usize,
 }
 
-/**
- * @brief 동시 연결 수를 전체와 IP별로 제한한다.
- * @details IP별 한도가 있어야 클라이언트 하나가 연결을 잔뜩 열어 다른 모두를 굶기지 못한다.
- */
+/// Bounds concurrent connections in total and per client, so one client cannot starve the rest.
 pub(crate) struct ConnectionLimiter {
-    /** @brief 동시에 받을 연결 수. */
     max_total: usize,
-    /** @brief 주소 하나가 차지할 수 있는 연결 수. */
-    max_per_ip: usize,
-    /** @brief 지금 세고 있는 것. */
     state: Mutex<LimitState>,
 }
 
-/** @brief 제한기의 계수 상태. */
-#[derive(Default)]
 struct LimitState {
-    /** @brief 지금 열려 있는 연결 수. */
     total: usize,
-    /** @brief 주소별 연결 수. */
-    per_ip: HashMap<IpAddr, usize>,
+    clients: ClientCounts,
 }
 
-/**
- * @brief 연결 하나의 슬롯을 잡은 RAII 가드.
- * @details 드롭 시 계수를 되돌린다. 연결이 어떻게 끝나든: 정상 종료든 패닉이든:
- *          슬롯이 반드시 반납되어야 한다.
- */
+/// Returns the slot on drop, however the connection ends, panic included.
 pub(crate) struct ConnectionGuard {
-    /** @brief 이 슬롯을 돌려줄 곳. */
     limiter: Arc<ConnectionLimiter>,
-    /** @brief 이 연결의 상대 주소. */
     ip: IpAddr,
 }
 
 impl ConnectionLimiter {
-    /** @brief 제한기를 만든다. 두 한도 모두 최소 1로 올린다. */
+    /// Both limits are raised to at least 1.
     fn new(max_total: usize, max_per_ip: usize) -> Arc<Self> {
+        let max_total = max_total.max(1);
         Arc::new(Self {
-            max_total: max_total.max(1),
-            max_per_ip: max_per_ip.max(1),
-            state: Mutex::new(LimitState::default()),
+            max_total,
+            state: Mutex::new(LimitState {
+                total: 0,
+                clients: ClientCounts::new(max_per_ip.max(1), max_total),
+            }),
         })
     }
 
-    /**
-     * @brief 슬롯을 하나 잡는다.
-     * @return 전체나 IP별 한도에 걸리면 None. 호출자는 연결을 즉시 닫는다.
-     */
+    /// `None` when either limit is reached; the caller closes the connection.
     fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionGuard> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let per_ip = state.per_ip.get(&ip).copied().unwrap_or(0);
-        if state.total >= self.max_total || per_ip >= self.max_per_ip {
+        if state.total >= self.max_total || !state.clients.allows(ip) {
             return None;
         }
         state.total += 1;
-        state.per_ip.insert(ip, per_ip + 1);
+        state.clients.add(ip);
         Some(ConnectionGuard {
             limiter: self.clone(),
             ip,
@@ -164,12 +119,9 @@ impl ConnectionLimiter {
 }
 
 impl ConnectionGuard {
-    /**
-     * @brief 이 연결의 계수를 다른 IP로 옮긴다.
-     * @details PROXY 헤더를 읽어 원래 클라이언트 주소를 알게 된 뒤에 부른다. 옮기지
-     *          않으면 IP별 한도가 프록시 주소에만 걸려 실제 클라이언트별 제한이 사라진다.
-     * @return 새 IP가 이미 한도에 찼으면 false. 연결을 거절해야 한다.
-     */
+    /// Moves the slot to the client named in the PROXY header; otherwise the per-client limit would
+    /// apply to the proxy only. False when that client is at its limit, and the connection must be
+    /// refused.
     fn reassign_ip(&mut self, ip: IpAddr) -> bool {
         if self.ip == ip {
             return true;
@@ -179,24 +131,18 @@ impl ConnectionGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let next = state.per_ip.get(&ip).copied().unwrap_or(0);
-        if next >= self.limiter.max_per_ip {
+        state.clients.remove(self.ip);
+        if !state.clients.allows(ip) {
+            state.clients.add(self.ip);
             return false;
         }
-        if let Some(count) = state.per_ip.get_mut(&self.ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.per_ip.remove(&self.ip);
-            }
-        }
-        state.per_ip.insert(ip, next + 1);
+        state.clients.add(ip);
         self.ip = ip;
         true
     }
 }
 
 impl Drop for ConnectionGuard {
-    /** @brief 슬롯을 반납한다. 계수가 0이 된 IP 항목은 지워 맵이 무한정 커지지 않게 한다. */
     fn drop(&mut self) {
         let mut state = self
             .limiter
@@ -204,16 +150,11 @@ impl Drop for ConnectionGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.total = state.total.saturating_sub(1);
-        if let Some(count) = state.per_ip.get_mut(&self.ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.per_ip.remove(&self.ip);
-            }
-        }
+        state.clients.remove(self.ip);
     }
 }
 
-/** @brief 연결 처리 워커 수. 수락 스레드보다 많아야 처리가 수락을 막지 않는다. */
+/// More than the accept threads, so serving never blocks accepting.
 pub(crate) fn connection_worker_count(acceptors: usize) -> usize {
     acceptors
         .max(1)
@@ -221,7 +162,6 @@ pub(crate) fn connection_worker_count(acceptors: usize) -> usize {
         .clamp(MIN_CONNECTION_WORKERS, MAX_CONNECTION_WORKERS)
 }
 
-/** @brief 수락 큐 길이. 순간 몰림을 흡수하되 상한을 넘지 않는다. */
 pub(crate) fn connection_queue_capacity(acceptors: usize) -> usize {
     acceptors
         .max(1)
@@ -229,12 +169,8 @@ pub(crate) fn connection_queue_capacity(acceptors: usize) -> usize {
         .clamp(MIN_CONNECTION_QUEUE, MAX_CONNECTION_QUEUE)
 }
 
-/**
- * @brief 워커 수와 큐 길이에 맞춘 연결 제한기를 만든다.
- * @details 전체 한도는 워커 수 + 큐 길이다. 그보다 많이 받아 봐야 처리도 대기도 못 한다.
- * @param proxy_protocol 켜져 있으면 IP별 한도를 크게 잡는다. 모든 연결이 프록시 주소
- *                       하나에서 오기 때문이다.
- */
+/// The total is workers plus queue length: beyond that a connection can be neither served nor
+/// queued.
 pub(crate) fn connection_limiter(
     workers: usize,
     queue_capacity: usize,
@@ -248,14 +184,8 @@ pub(crate) fn connection_limiter(
     ConnectionLimiter::new(workers.saturating_add(queue_capacity), max_per_ip)
 }
 
-/**
- * @brief 연결 처리 워커를 시작하고 수락 큐의 송신단을 돌려준다.
- *
- * @details 워커들이 하나의 수신단을 뮤텍스로 나눠 쓴다. 연결마다 스레드를 만들지 않으므로
- *          연결 폭주가 스레드 폭주로 번지지 않는다.
- * @note 연결마다 장애 격리 경계를 친다. TCP의 격리 단위는 패킷이 아니라 연결이다.
- * @return 워커를 하나도 시작하지 못하면 오류. 하나라도 뜨면 그만큼으로 진행한다.
- */
+/// Workers share one receiver, so a burst of connections cannot become a burst of threads.
+/// Each connection is a fault isolation boundary. Fails only when no worker starts.
 pub(crate) fn spawn_connection_workers<H: Handler>(
     handler: Arc<H>,
     shutdown: Arc<AtomicBool>,
@@ -327,12 +257,8 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
     Ok((tx, workers))
 }
 
-/**
- * @brief 새 연결이 올 때까지 제한 시간 안에서 기다린다.
- * @details 리스너가 논블로킹이라 그냥 accept를 돌리면 바쁜 대기가 된다. 폴링으로
- *          기다리되 시간을 끊어 종료 신호를 확인할 수 있게 한다.
- * @safety 폴링 구조체는 스택 변수 하나이고 개수를 1로 넘긴다.
- */
+/// Waits up to `timeout` for a connection, so the non-blocking listener neither spins nor misses
+/// shutdown.
 #[cfg(unix)]
 fn wait_for_incoming(listener: &TcpListener, timeout: Duration) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
@@ -355,20 +281,14 @@ fn wait_for_incoming(listener: &TcpListener, timeout: Duration) -> io::Result<bo
     }
 }
 
-/**
- * @brief 유닉스가 아닌 플랫폼에서는 곧바로 accept를 시도한다.
- * @details WouldBlock을 받으면 호출자가 짧게 쉬고 재시도한다.
- */
+/// Accepts at once; the caller sleeps briefly on WouldBlock.
 #[cfg(not(unix))]
 fn wait_for_incoming(_listener: &TcpListener, _timeout: Duration) -> io::Result<bool> {
     Ok(true)
 }
 
-/**
- * @brief 연결을 수락해 처리 큐에 넣는다. 요청 처리는 하지 않는다.
- * @note 큐가 가득 차면 try_send가 실패하고 연결은 그대로 닫힌다. 여기서 기다리면
- *       수락 자체가 멈춰 대기 큐가 커널 백로그로 밀려난다.
- */
+/// Accepts and queues; requests are served elsewhere. A full queue closes the connection: waiting
+/// here would stop accepting and push the backlog into the kernel.
 pub(crate) fn accept_worker(
     listener: TcpListener,
     shutdown: Arc<AtomicBool>,
@@ -399,20 +319,13 @@ pub(crate) fn accept_worker(
     }
 }
 
-/** @brief 이 상대에게서 온 PROXY 헤더를 믿어도 되는지. */
 fn trusted_peer(peer: SocketAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&peer.ip()))
 }
 
-/**
- * @brief 연결 하나를 끝까지 처리한다. 같은 연결에서 여러 질의를 받는다.
- *
- * @details PROXY가 켜져 있으면 신뢰 목록에 없는 상대는 헤더를 읽지도 않고 끊는다.
- *          그러지 않으면 누구나 출발지를 위조할 수 있다.
- * @note 응답 비트가 선 메시지를 받으면 연결을 끊는다. 정상 클라이언트는 보내지 않는
- *       형태이고, 서버끼리 응답을 주고받는 무한 루프가 여기서 시작된다.
- * @note nodelay를 켠다. DNS 응답은 작고 하나로 끝나므로 지연 전송이 순수한 손해다.
- */
+/// Serves every query on one connection. With PROXY on, an untrusted peer is closed before its
+/// header is read; otherwise anyone could forge the source address. A message with the response
+/// bit set closes the connection, since servers answering each other would loop.
 fn handle_conn<H: Handler>(
     accepted: Accepted,
     handler: &Arc<H>,
@@ -503,11 +416,8 @@ fn handle_conn<H: Handler>(
         let request = match Message::parse(&body) {
             Ok(m) => m,
             Err(_) => {
-                /*
-                 * 파싱하지 못해도 답을 주고 연결은 이어 간다. 길이 프리픽스가 메시지 경계를
-                 * 이미 정하므로(RFC 1035) 내용이 깨져도 다음 메시지가 어디서 시작하는지
-                 * 안다. 하나가 깨졌다고 끊으면 질의를 이어 보내던 클라이언트가 연결을 잃는다.
-                 */
+                // Answer and keep the connection: the length prefix still marks where the next
+                // message starts.
                 if body.len() >= 12 && body[2] & 0x80 == 0 {
                     if let Some(response) = handler.handle_unparsable(&body, &ctx) {
                         writer.clear();
@@ -562,24 +472,10 @@ fn handle_conn<H: Handler>(
     }
 }
 
-/**
- * @brief PROXY 헤더를 읽는다.
- *
- * @details 한 바이트씩 읽어 파서가 확정할 때까지만 소비한다. 더 읽으면 뒤따르는 DNS
- *          데이터까지 삼켜 버린다.
- * @note 256바이트와 제한 시간 두 가지로 막는다. 헤더는 그보다 짧으므로, 끝없이 보내는
- *       상대가 버퍼나 워커를 붙들지 못한다.
- * @return Some(Some(addr))는 원래 클라이언트 주소, Some(None)은 프록시 자신의 연결,
- *         None은 헤더가 아니거나 실패라 연결을 끊어야 함을 뜻한다.
- */
-/**
- * @brief 연결을 받자마자 끊은 사유를 남긴다.
- * @details 앞단 프록시 설정이 어긋나면 모든 연결이 여기서 조용히 끊긴다. 사유가 없으면
- *          "아무것도 안 된다"만 남는다. 계속 들어올 수 있어 2의 거듭제곱 번째만 기록한다.
- */
+/// The reason a connection was closed right after accept. A misconfigured front proxy drops every
+/// connection here, so this is logged, sampled at powers of two.
 fn note_tcp_drop(reason: &'static str, peer: SocketAddr, detail: &str) {
     use std::sync::atomic::AtomicU64;
-    /** @brief 누적 거절 수. */
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -587,6 +483,9 @@ fn note_tcp_drop(reason: &'static str, peer: SocketAddr, detail: &str) {
     }
 }
 
+/// Reads a byte at a time so nothing past the header is consumed, within 256 bytes and a deadline.
+/// `Some(Some(addr))` names the client, `Some(None)` is the proxy's own connection, and `None`
+/// means close.
 fn read_proxy_header(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<Option<SocketAddr>> {
     use crate::proxy::{parse, ProxyParse};
     let deadline = Instant::now() + PROXY_HEADER_DEADLINE;
@@ -621,12 +520,8 @@ fn read_proxy_header(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<Op
     }
 }
 
-/**
- * @brief 데드라인 시각까지 버퍼를 정확히 채운다.
- * @details 읽기 타임아웃마다 데드라인과 종료 신호를 다시 본다. 한 바이트씩 아주 느리게 보내는
- *          연결도 총 데드라인에 걸려 끊긴다. 읽기 타임아웃만으로는 그런 연결을 못 막는다.
- * @return 다 채웠으면 true. 데드라인·종료·연결 종료·오류는 전부 false.
- */
+/// Fills `buf` by `deadline`. Each read timeout rechecks the deadline and shutdown, so a
+/// connection sending a byte at a time is still cut off. False on deadline, shutdown, EOF or error.
 fn read_exact_until(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -654,16 +549,14 @@ fn read_exact_until(
 }
 
 #[cfg(test)]
-/** @brief 읽지 못한 메시지 뒤에도 연결이 이어지는지. */
 mod malformed_tests {
     use super::*;
     use onetdns_proto::{Name, RecordType};
 
-    /** @brief 읽지 못한 것에는 FORMERR, 읽은 것에는 NOERROR 를 주는 테스트용 핸들러. */
+    /// FORMERR for unparsable messages, NOERROR for the rest.
     struct TwoAnswerHandler;
 
     impl Handler for TwoAnswerHandler {
-        /** @brief 질문을 그대로 담은 NOERROR. */
         fn handle(&self, request: &Message, _ctx: &RequestCtx<'_>) -> Option<Message> {
             let mut response = Message::default();
             response.header.id = request.header.id;
@@ -672,7 +565,6 @@ mod malformed_tests {
             Some(response)
         }
 
-        /** @brief 헤더만 그대로 돌려준 FORMERR. */
         fn handle_unparsable(&self, packet: &[u8], _ctx: &RequestCtx<'_>) -> Option<Message> {
             let mut response = Message::default();
             response.header.id = u16::from_be_bytes([packet[0], packet[1]]);
@@ -682,14 +574,12 @@ mod malformed_tests {
         }
     }
 
-    /** @brief 길이 프리픽스를 붙여 한 프레임 보낸다. */
     fn send_frame(stream: &mut TcpStream, payload: &[u8]) {
         let mut framed = (payload.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(payload);
         stream.write_all(&framed).expect("Could not send the frame");
     }
 
-    /** @brief 한 프레임 받는다. 연결이 닫혔으면 없다. */
     fn recv_frame(stream: &mut TcpStream) -> Option<Message> {
         let mut length = [0u8; 2];
         if stream.read_exact(&mut length).is_err() {
@@ -701,13 +591,8 @@ mod malformed_tests {
     }
 
     #[test]
-    /**
-     * @brief 읽지 못한 메시지 하나에 답한 뒤에도 같은 연결로 다음 질의를 받는지.
-     *
-     * @details TCP 는 길이 프리픽스가 메시지 경계를 정하므로(RFC 1035) 내용이 깨져도
-     *          다음 메시지가 어디서 시작하는지 안다. 끊어 버리면 질의를 이어 보내던
-     *          클라이언트가 깨진 것 하나에 연결을 전부 잃고 다시 붙어야 한다.
-     */
+    /// Breaking the connection would make a client that pipelines queries lose all of them over one
+    /// broken message.
     fn a_malformed_message_does_not_end_the_tcp_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Could not bind the listen address");
         let address = listener.local_addr().expect("Could not read the address");
@@ -718,7 +603,7 @@ mod malformed_tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("Could not set the deadline");
 
-            /* 질문 하나를 적고 둘이라고 말하는 헤더다. */
+            // The header claims two questions but carries one.
             let mut broken = vec![0u8; 12];
             broken[0..2].copy_from_slice(&0x4321u16.to_be_bytes());
             broken[4..6].copy_from_slice(&2u16.to_be_bytes());
@@ -761,33 +646,25 @@ mod malformed_tests {
 }
 
 #[cfg(test)]
-/** @brief 길이 접두사 쓰기와 연결 수 상한. */
 mod limit_tests {
     use super::*;
 
-    /** @brief 한 번에 조금씩만 쓰는 테스트용 상대. */
     struct ShortVectoredWriter {
-        /** @brief 지금까지 받은 바이트. */
         bytes: Vec<u8>,
-        /** @brief 처음 한 번에 받아 줄 크기. */
         first_limit: usize,
-        /** @brief 여러 조각으로 쓰기가 불린 횟수. */
         vectored_calls: usize,
     }
 
     impl Write for ShortVectoredWriter {
-        /** @brief 조금만 쓴다. */
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.bytes.extend_from_slice(buf);
             Ok(buf.len())
         }
 
-        /** @brief 비운다. */
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
 
-        /** @brief 여러 조각을 조금만 쓴다. */
         fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
             self.vectored_calls += 1;
             let mut remaining = self.first_limit;
@@ -806,7 +683,6 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 길이와 본문이 나뉘어 써져도 이어지는지. */
     fn dns_frame_vectored_write_handles_short_prefix_and_body() {
         for first_limit in [1, 4, usize::MAX] {
             let mut writer = ShortVectoredWriter {
@@ -821,7 +697,6 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 길이 접두사에 담을 수 없는 크기를 거부하는지. */
     fn dns_frame_rejects_oversized_payload() {
         let mut writer = Vec::new();
         let error = write_dns_frame(&mut writer, &vec![0; usize::from(u16::MAX) + 1])
@@ -831,7 +706,6 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 쉬고 있어도 새 연결이 곧바로 처리되는지. */
     fn idle_acceptor_delivers_new_connection_without_poll_interval_delay() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -867,16 +741,12 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 길이와 본문에 하나의 데드라인이 걸리는지. 따로 걸면 조금씩 보내 무한히 붙잡는다. */
     fn length_and_body_share_one_absolute_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        /*
-         * 아래 시간 값들은 비율만 의미가 있다. 길이 두 바이트는 데드라인 안에, 본문은 그
-         * 뒤에 도착하도록 간격을 벌려 두었다. 부하가 걸린 기계에서 sleep 이 늘어져도 순서가
-         * 뒤집히지 않도록, 값을 바꿀 때는 전부 같은 배수로 바꾼다.
-         */
+        // Only the ratios matter: the length arrives before the deadline and the body after it.
+        // Scale every value together so a slow machine cannot reorder them.
         server
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
@@ -909,7 +779,6 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 주소별 상한이 걸리고, 프록시 뒤의 클라이언트는 원래 주소로 세는지. */
     fn shared_limiter_caps_ip_and_reassigns_trusted_proxy_clients() {
         let limiter = ConnectionLimiter::new(512, 64);
         let ip = "192.0.2.1".parse().unwrap();
@@ -926,7 +795,33 @@ mod limit_tests {
     }
 
     #[test]
-    /** @brief 전체 스레드 수에 상한이 걸리고 한 주소가 다 차지하지 못하는지. */
+    fn a_proxied_ipv6_client_counts_against_its_prefix() {
+        let limiter = ConnectionLimiter::new(8, 2);
+        let held: Vec<_> = (1..=4)
+            .map(|host| {
+                limiter
+                    .try_acquire(format!("2001:db8::{host}").parse().unwrap())
+                    .unwrap()
+            })
+            .collect();
+        assert!(limiter
+            .try_acquire("2001:db8::ffff:5".parse().unwrap())
+            .is_none());
+
+        let mut proxied = limiter.try_acquire("192.0.2.2".parse().unwrap()).unwrap();
+        assert!(
+            !proxied.reassign_ip("2001:db8::6".parse().unwrap()),
+            "PROXY 헤더로 알린 주소도 /64 한도를 지켜야 합니다"
+        );
+        assert!(
+            limiter.try_acquire("192.0.2.2".parse().unwrap()).is_some(),
+            "거절된 이전은 원래 주소의 몫을 그대로 둬야 합니다"
+        );
+        assert!(proxied.reassign_ip("2001:db8:0:1::1".parse().unwrap()));
+        drop((held, proxied));
+    }
+
+    #[test]
     fn global_pool_bounds_threads_and_reserves_capacity_from_one_ip() {
         assert_eq!(connection_worker_count(1), 8);
         assert_eq!(connection_worker_count(16), 32);
