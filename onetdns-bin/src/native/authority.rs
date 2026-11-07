@@ -743,7 +743,10 @@ impl NativeServer {
                     }
                 }
                 self.notify_kick.push(origin.to_ascii_lower());
-                onetdns_core::info!(event = "authority.notify_received", zone = %origin.to_ascii_lower(), src = %ctx.src, "Received DNS NOTIFY; scheduled a secondary zone refresh");
+                static RECEIVED: AtomicU64 = AtomicU64::new(0);
+                if let Some(count) = sampled(&RECEIVED) {
+                    onetdns_core::info!(event = "authority.notify_received", zone = %origin.to_ascii_lower(), src = %ctx.src, count = count, "Received DNS NOTIFY; scheduled a secondary zone refresh");
+                }
                 if let Some((key, verified)) = tsig_ctx.as_ref() {
                     if onetdns_dnssec::tsig::sign_response_message(
                         &mut m,
