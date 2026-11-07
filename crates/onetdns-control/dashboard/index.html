@@ -2188,10 +2188,8 @@ Object.assign(I18N.en, {
   "자동 갱신할 원격 필터 목록 주소입니다. 파일을 받을 때 호스트명 확인용 DNS 서버를 사용하고, 이동된 주소도 다시 검증하며, 다운로드 크기를 제한합니다.": "URLs of remote filter lists refreshed automatically. Downloads use the configured hostname-resolution DNS servers, revalidate redirected destinations, and enforce a size limit.",
   "공개 모드로 전환했습니다 — 경고: 속도 제한이 없어 제한 없는 공개 DNS 서버가 되어 DNS 증폭·반사 공격에 악용될 수 있습니다.": "Switched to public mode. Without rate limiting, the server may be abused for DNS amplification attacks.",
   "DoH·DoT·DoQ·DoH3 업스트림 DNS 서버 주소입니다. 인증서 이름과 경로를 포함한 전체 주소를 한 줄에 하나 입력합니다.": "DoH, DoT, DoQ, and DoH3 upstream URLs. Enter one full address per line, including certificate hostname and path.",
-  "일반 DNS 업스트림 서버 주소입니다. 암호화 업스트림 서버의 호스트 이름 조회와 차단 목록 다운로드에도 사용할 수 있습니다.": "Plain DNS upstream IPs. They may also bootstrap encrypted-upstream hostnames and blocklist downloads.",
   "recurse_deny_answers의 예외 CIDR입니다. 허용 목록만 단독으로 사용해 다른 주소를 모두 거부하지는 않습니다.": "Exception CIDRs for recurse_deny_answers. The allow list alone does not reject every other address.",
   "forward는 지정한 업스트림 DNS 서버로 전달하고, recurse는 루트 서버부터 직접 찾으며, split은 도메인 규칙에 따라 두 방식을 나눕니다.": "forward sends queries to configured upstreams, recurse resolves from root servers, and split selects by domain rules.",
-  "업스트림 서버와 외부 목록의 호스트 이름을 찾을 때 사용할 별도 DNS 서버입니다. 비어 있으면 일반 DNS 업스트림 서버를 사용합니다.": "Bootstrap DNS IPs for resolving upstream URLs and external list hosts without using local recursive DNS. Empty uses plain upstream IPs.",
   "최종 A·AAAA 응답이 이 CIDR에 포함되면 NXDOMAIN으로 차단합니다. recurse_allow_answers에 포함된 주소는 예외로 허용합니다.": "Blocks final A/AAAA answers in these CIDRs with NXDOMAIN. Addresses in recurse_allow_answers remain allowed.",
   "personal은 사설·로컬 CIDR만 ACL 허용 목록에 적용합니다. public은 ACL·속도 제한을 강제하지 않고 모든 소스에 열립니다 — 무제한이면 증폭 공격에 악용될 수 있습니다.": "personal applies a private/local CIDR allow list. public does not enforce ACLs or rate limits and accepts every source; without limits it can be abused for amplification attacks.",
   "주 처리 경로가 모두 실패했을 때만 원래 클라이언트 질의를 RD=1로 한 번 전달할 대체 DNS 서버입니다. 일반 DNS 오류 응답과 내부 네임서버 질의에는 사용하지 않습니다.": "When explicitly configured, forwards the original client query once with RD=1 only after all primary transport paths are exhausted. It is not used for DNS responses such as SERVFAIL/REFUSED or internal NS queries; empty disables fallback."
@@ -2485,10 +2483,8 @@ Object.assign(I18N.ja, {
   "자동 갱신할 원격 필터 목록 주소입니다. 파일을 받을 때 호스트명 확인용 DNS 서버를 사용하고, 이동된 주소도 다시 검증하며, 다운로드 크기를 제한합니다.": "自動更新するリモートフィルタ一覧の URL です。取得時はホスト名確認用 DNS サーバーを使い、転送先を改めて検証し、ダウンロードサイズを制限します。",
   "공개 모드로 전환했습니다 — 경고: 속도 제한이 없어 제한 없는 공개 DNS 서버가 되어 DNS 증폭·반사 공격에 악용될 수 있습니다.": "公開モードへ切り替えました — 警告: レート制限がないとオープンリゾルバとなり、DNS 増幅・反射攻撃に悪用される可能性があります。",
   "DoH·DoT·DoQ·DoH3 업스트림 DNS 서버 주소입니다. 인증서 이름과 경로를 포함한 전체 주소를 한 줄에 하나 입력합니다.": "DoH・DoT・DoQ・DoH3 の上位 DNS サーバー URL です。証明書名とパスを含む完全なアドレスを1行に1件入力します。",
-  "일반 DNS 업스트림 서버 주소입니다. 암호화 업스트림 서버의 호스트 이름 조회와 차단 목록 다운로드에도 사용할 수 있습니다.": "平文 DNS 上位 DNS サーバー IP です。暗号化上位 DNS サーバーのホスト解決やブロックリスト取得のブートストラップにも使用できます。",
   "recurse_deny_answers의 예외 CIDR입니다. 허용 목록만 단독으로 사용해 다른 주소를 모두 거부하지는 않습니다.": "recurse_deny_answers の例外 CIDR です。許可リスト単独で他のアドレスをすべて拒否することはありません。",
   "forward는 지정한 업스트림 DNS 서버로 전달하고, recurse는 루트 서버부터 직접 찾으며, split은 도메인 규칙에 따라 두 방식을 나눕니다.": "forward は指定上位 DNS サーバーへ転送し、recurse はルートから直接再帰解決し、split はドメイン規則で両者を使い分けます。",
-  "업스트림 서버와 외부 목록의 호스트 이름을 찾을 때 사용할 별도 DNS 서버입니다. 비어 있으면 일반 DNS 업스트림 서버를 사용합니다.": "上位 DNS サーバー URL と外部リストのホストをローカル DNS に再帰させず解決するブートストラップ DNS IP です。空の場合は平文上位 DNS サーバー IP を使用します。",
   "최종 A·AAAA 응답이 이 CIDR에 포함되면 NXDOMAIN으로 차단합니다. recurse_allow_answers에 포함된 주소는 예외로 허용합니다.": "最終 A・AAAA 応答がこの CIDR に含まれる場合は NXDOMAIN で遮断します。recurse_allow_answers のアドレスは例外です。",
   "personal은 사설·로컬 CIDR만 ACL 허용 목록에 적용합니다. public은 ACL·속도 제한을 강제하지 않고 모든 소스에 열립니다 — 무제한이면 증폭 공격에 악용될 수 있습니다.": "personal はプライベート・ローカル CIDR の許可リストを適用します。public は ACL とレート制限を強制せず全送信元に開くため、無制限では増幅攻撃に悪用される可能性があります。",
   "주 처리 경로가 모두 실패했을 때만 원래 클라이언트 질의를 RD=1로 한 번 전달할 대체 DNS 서버입니다. 일반 DNS 오류 응답과 내부 네임서버 질의에는 사용하지 않습니다.": "明示設定時のみ、主解決器の全転送経路が尽きた後に元のクライアントクエリを RD=1 で1回転送します。SERVFAIL・REFUSED などの DNS 応答や内部 NS クエリには使用せず、空ならフォールバックしません。"
@@ -2762,9 +2758,7 @@ Object.assign(I18N.ja, {
   '업스트림 DNS 서버 장애 시 만료된 캐시 응답 제공':'上位 DNS サーバーに障害がある場合は期限切れのキャッシュ応答を使用',
   '클라이언트 서브넷을 업스트림 DNS 서버에 전달':'クライアントサブネットを上位 DNS サーバーへ送信',
   'DoH·DoT·DoQ·DoH3 업스트림 DNS 서버 주소입니다. 인증서 이름과 경로를 포함한 전체 주소를 한 줄에 하나 입력합니다.':'DoH・DoT・DoQ・DoH3 の上位 DNS サーバーです。証明書名とパスを含む完全なアドレスを1行に1件入力します。',
-  '일반 DNS 업스트림 서버 주소입니다. 암호화 업스트림 서버의 호스트 이름 조회와 차단 목록 다운로드에도 사용할 수 있습니다.':'通常の DNS で利用する上位 DNS サーバーの IP アドレスです。暗号化 DNS サーバーの名前解決やブロックリストの取得にも利用できます。',
-  'forward는 지정한 업스트림 DNS 서버로 전달하고, recurse는 루트 서버부터 직접 찾으며, split은 도메인 규칙에 따라 두 방식을 나눕니다.':'forward は指定した上位 DNS サーバーへ転送し、recurse はルートサーバーから直接名前解決し、split はドメイン規則に応じて両方式を使い分けます。',
-  '업스트림 서버와 외부 목록의 호스트 이름을 찾을 때 사용할 별도 DNS 서버입니다. 비어 있으면 일반 DNS 업스트림 서버를 사용합니다.':'上位サーバーや外部リストのホスト名を解決するための DNS サーバーです。空の場合は通常の上位 DNS サーバーを使用します。'
+  'forward는 지정한 업스트림 DNS 서버로 전달하고, recurse는 루트 서버부터 직접 찾으며, split은 도메인 규칙에 따라 두 방식을 나눕니다.':'forward は指定した上位 DNS サーバーへ転送し、recurse はルートサーバーから直接名前解決し、split はドメイン規則に応じて両方式を使い分けます。'
 });
 
 
@@ -4030,10 +4024,8 @@ Object.assign(I18N.zh, {
   "자동 갱신할 원격 필터 목록 주소입니다. 파일을 받을 때 호스트명 확인용 DNS 서버를 사용하고, 이동된 주소도 다시 검증하며, 다운로드 크기를 제한합니다.":"自动更新的远程过滤列表地址。下载时使用用于解析主机名的 DNS 服务器，会重新验证重定向后的地址，并限制下载大小。",
   "공개 모드로 전환했습니다 — 경고: 속도 제한이 없어 제한 없는 공개 DNS 서버가 되어 DNS 증폭·반사 공격에 악용될 수 있습니다.":"已切换到公共模式。警告：没有速率限制，服务器会成为不受限制的公共 DNS 服务器，可能被利用进行 DNS 放大和反射攻击。",
   "DoH·DoT·DoQ·DoH3 업스트림 DNS 서버 주소입니다. 인증서 이름과 경로를 포함한 전체 주소를 한 줄에 하나 입력합니다.":"DoH、DoT、DoQ、DoH3 上游 DNS 服务器地址。每行输入一个完整地址，包括证书名称和路径。",
-  "일반 DNS 업스트림 서버 주소입니다. 암호화 업스트림 서버의 호스트 이름 조회와 차단 목록 다운로드에도 사용할 수 있습니다.":"普通 DNS 上游服务器地址。也可用于解析加密上游服务器的主机名和下载拦截列表。",
   "recurse_deny_answers의 예외 CIDR입니다. 허용 목록만 단독으로 사용해 다른 주소를 모두 거부하지는 않습니다.":"recurse_deny_answers 的例外 CIDR。仅有允许列表时不会拒绝所有其他地址。",
   "forward는 지정한 업스트림 DNS 서버로 전달하고, recurse는 루트 서버부터 직접 찾으며, split은 도메인 규칙에 따라 두 방식을 나눕니다.":"forward 将查询转发到指定的上游 DNS 服务器，recurse 从根服务器开始直接解析，split 按域名规则在两种方式之间选择。",
-  "업스트림 서버와 외부 목록의 호스트 이름을 찾을 때 사용할 별도 DNS 서버입니다. 비어 있으면 일반 DNS 업스트림 서버를 사용합니다.":"解析上游服务器和外部列表主机名时使用的独立 DNS 服务器。留空则使用普通 DNS 上游服务器。",
   "최종 A·AAAA 응답이 이 CIDR에 포함되면 NXDOMAIN으로 차단합니다. recurse_allow_answers에 포함된 주소는 예외로 허용합니다.":"如果最终的 A/AAAA 应答位于这些 CIDR 中，则以 NXDOMAIN 拦截。recurse_allow_answers 中的地址作为例外允许。",
   "personal은 사설·로컬 CIDR만 ACL 허용 목록에 적용합니다. public은 ACL·속도 제한을 강제하지 않고 모든 소스에 열립니다 — 무제한이면 증폭 공격에 악용될 수 있습니다.":"personal 仅对 ACL 允许列表应用私有和本地 CIDR。public 不强制 ACL 和速率限制，对所有来源开放；不加限制时可能被利用进行放大攻击。",
   "주 처리 경로가 모두 실패했을 때만 원래 클라이언트 질의를 RD=1로 한 번 전달할 대체 DNS 서버입니다. 일반 DNS 오류 응답과 내부 네임서버 질의에는 사용하지 않습니다.":"仅在所有主处理路径都失败时，将原始客户端查询以 RD=1 转发一次的备用 DNS 服务器。不用于 SERVFAIL、REFUSED 等普通 DNS 错误响应，也不用于内部名称服务器查询。",
