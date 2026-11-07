@@ -1,11 +1,7 @@
-/*!
- * @brief 지표와 질의 기록의 디스크 보존.
- *
- * @details 재시작해도 통계와 최근 질의 기록이 남아야 한다. 쓰기는 전부 원자적이라,
- *          중간에 죽어도 반쯤 쓰인 파일이 남지 않는다.
- * @warning 읽어 들이는 파일은 신뢰 입력이 아니다. 형식이 조금이라도 어긋나면 부분 적용
- *          없이 전체를 버린다. 절반만 반영된 통계는 없느니만 못하다.
- */
+//! Saves statistics and the recent query log so they survive a restart.
+//!
+//! Files read back are untrusted. Any deviation from the format discards the whole file,
+//! because half-applied statistics are worse than none.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -19,24 +15,15 @@ use onetdns_proto::Name;
 
 use crate::metrics::{intern_action, intern_transport, Metrics, QueryEvent, TopCounters};
 
-/** @brief 읽어 들일 통계 파일 크기 상한. */
 const MAX_STATS_FILE: usize = 16 * 1024 * 1024;
-/** @brief 질의 기록 한 줄의 길이 상한. */
 const MAX_QUERYLOG_LINE: usize = 64 * 1024;
 
-/**
- * @brief 임시 파일에 쓰고 제자리로 옮겨 원자적으로 저장한다.
- *
- * @details 임시 이름에 프로세스 번호, 일련번호, 난수를 넣는다. 같은 디렉터리에 여러
- *          프로세스가 써도 부딪히지 않는다. 생성은 create_new이라 남의 파일을 덮지 않는다.
- * @note 유닉스에서는 파일과 디렉터리를 모두 동기화한다. 파일만 동기화하면 이름 바꾸기가
- *       디스크에 닿기 전에 전원이 나갈 수 있다.
- * @warning 실패하면 임시 파일을 지운다. 남기면 디렉터리가 쓰레기로 찬다.
- */
+/// Writes `data` to a temporary file and renames it over `path`. Only the owner can read the
+/// result, since the query log holds client addresses. On Unix the directory is synced too,
+/// or the rename may not reach the disk.
 pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /** @brief 임시 파일 이름이 겹치지 않게 하는 일련번호. */
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let fname = path
         .file_name()
@@ -57,15 +44,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
         None => std::path::PathBuf::from(&tmp_name),
     };
     let write_result = (|| -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
+        let mut f = onetdns_core::fs::open_private(&tmp, onetdns_core::fs::PrivateOpen::CreateNew)?;
         f.write_all(data)?;
         f.sync_all()?;
         Ok(())
@@ -86,7 +65,6 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-/** @brief 소유자만 접근할 수 있는 디렉터리를 만든다. 질의 기록에는 클라이언트 주소가 담긴다. */
 fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -96,30 +74,25 @@ fn create_dir_private(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-/** @brief 남이 들여다보지 못하는 디렉터리를 만든다. */
+/// Windows keeps the folder's ACL here; each file is created private instead.
 fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
 #[cfg(not(windows))]
-/** @brief 기존 파일을 새 파일로 교체한다. 플랫폼별로 원자적인 방법이 다르다. */
 fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::rename(src, dst)
 }
 
 #[cfg(windows)]
-/** @brief 파일을 전부 교체한다. */
 fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
 
-    /** @brief 대상이 이미 있어도 덮어쓴다. */
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-    /** @brief 디스크에 닿을 때까지 기다린다. */
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
     #[link(name = "Kernel32")]
     extern "system" {
-        /** @brief 파일을 옮긴다. */
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
 
@@ -139,11 +112,8 @@ fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/**
- * @brief 저장된 질의 기록을 읽어 들인다.
- * @details 보존 기간이 지난 항목은 버리고 개수 상한도 지킨다. 파일이 없는 것은 정상이라
- *          빈 기록으로 시작한다.
- */
+/// Reads the saved query log, dropping entries past retention or over the count limit. A
+/// missing file is an empty log.
 pub(crate) fn load_querylog(
     path: &Path,
     cap: usize,
@@ -220,12 +190,8 @@ pub(crate) fn load_querylog(
     out
 }
 
-/**
- * @brief 길이 상한을 지키며 한 줄을 읽는다.
- * @details 상한을 넘는 줄은 버리되 그 줄 끝까지는 소비한다. 소비하지 않으면 다음 읽기가
- *          그 줄 중간에서 시작해 이후 전부가 어긋난다.
- * @param oversized_lines 버린 줄 수. 호출자가 이것으로 파일 전체를 버릴지 정한다.
- */
+/// Reads one line of at most `max` bytes. A longer line is consumed to its end and counted in
+/// `oversized_lines`, so the next read starts on a line boundary.
 fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     max: usize,
@@ -265,11 +231,7 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
-/**
- * @brief 기록 한 줄을 질의 이벤트로 파싱한다.
- * @details 필드 수와 이름을 정확히 확인한다. 모르는 필드나 빠진 필드가 있으면 이 서버가 쓴
- *          형식이 아니므로 받아들이지 않는다.
- */
+/// Parses one log line. Unknown or missing fields mean this format did not write it.
 fn parse_event(line: &str) -> Option<QueryEvent> {
     let j = json::parse(line).ok()?;
     let Json::Obj(fields) = &j else {
@@ -341,7 +303,6 @@ fn parse_event(line: &str) -> Option<QueryEvent> {
     })
 }
 
-/** @brief 질의 기록을 원자적으로 저장한다. */
 pub(crate) fn save_querylog(path: &Path, buf: &VecDeque<QueryEvent>) -> std::io::Result<()> {
     let mut s = String::with_capacity(buf.len() * 80);
     for ev in buf {
@@ -351,7 +312,6 @@ pub(crate) fn save_querylog(path: &Path, buf: &VecDeque<QueryEvent>) -> std::io:
     atomic_write(path, s.as_bytes())
 }
 
-/** @brief 지표와 상위 목록을 원자적으로 저장한다. */
 pub(crate) fn save_stats(path: &Path, m: &Metrics, top: &TopCounters) -> std::io::Result<()> {
     let snapshot = m.current_snapshot();
     let mut s = String::with_capacity(4096);
@@ -410,7 +370,6 @@ pub(crate) fn save_stats(path: &Path, m: &Metrics, top: &TopCounters) -> std::io
     atomic_write(path, s.as_bytes())
 }
 
-/** @brief 이름-횟수 쌍을 JSON 객체로 쓴다. */
 fn write_pairs<K: std::fmt::Display>(s: &mut String, key: &str, map: &HashMap<K, u64>) {
     s.push_str(&json::escape(key));
     s.push_str(":[");
@@ -427,11 +386,7 @@ fn write_pairs<K: std::fmt::Display>(s: &mut String, key: &str, map: &HashMap<K,
     s.push(']');
 }
 
-/**
- * @brief 저장된 지표를 읽어 적용한다.
- * @warning 파싱을 먼저 끝낸 뒤에야 적용한다. 읽으면서 적용하면 중간에 형식이 깨졌을 때
- *          절반만 반영된 통계가 남는다.
- */
+/// Reads saved statistics and applies them. Nothing is applied until the whole file parses.
 pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
     let mut bytes = Vec::new();
     let file = match std::fs::File::open(path) {
@@ -540,16 +495,8 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
     cap_restored_top(path, "clients", &mut top.clients);
 }
 
-/**
- * @brief 복원한 상위 목록을 상한으로 자른다.
- *
- * @details 살아 있는 맵은 bump가 상한을 지키지만 복원은 파일 내용을 그대로 넣는다.
- *          축출은 항목을 교체할 뿐 개수를 줄이지 않으므로, 상한을 넘겨 채운 프로세스는
- *          그 크기를 종료될 때까지 유지한다. 파일 크기 상한만으로는 항목 수가 묶이지 않는다.
- * @param path 어느 파일에서 왔는지. 경고에 남긴다.
- * @param kind 어느 목록인지.
- * @param map 복원한 이름별 횟수. 상한을 넘으면 횟수가 큰 것부터 남긴다.
- */
+/// Trims a restored top list to its cap, keeping the largest counts. Eviction replaces entries
+/// without shrinking the map, so an oversized restore would stay oversized until exit.
 fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
     path: &Path,
     kind: &'static str,
@@ -560,7 +507,7 @@ fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
     }
     let dropped = map.len() - crate::metrics::TOP_CAP;
     let mut pairs: Vec<(K, u64)> = std::mem::take(map).into_iter().collect();
-    /* 동률은 이름 순으로 갈라 어느 항목이 남는지가 실행마다 달라지지 않게 한다. */
+    // Ties break by name so the kept entries do not vary between runs.
     pairs.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     pairs.truncate(crate::metrics::TOP_CAP);
     map.extend(pairs);
@@ -574,51 +521,30 @@ fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
 }
 
 #[derive(Default)]
-/** @brief 파일에서 읽어 검증까지 마친 통계. 이 형태가 만들어져야 적용한다. */
+/// Statistics read from a file and fully validated. Only this form is applied.
 struct PersistedStatsSnapshot {
-    /** @brief 전체 질의 수. */
     total: u64,
-    /** @brief 정상으로 답한 수. */
     resolved: u64,
-    /** @brief 차단한 수. */
     blocked: u64,
-    /** @brief 다른 답으로 바꾼 수. */
     rewritten: u64,
-    /** @brief 접근 제어에 막힌 수. */
     denied: u64,
-    /** @brief 거절로 답한 수. */
     refused: u64,
-    /** @brief 속도 제한에 막힌 수. */
     throttled: u64,
-    /** @brief 오류로 답한 수. */
     servfail: u64,
-    /** @brief 처리 시간의 합. */
     latency_sum_us: u64,
-    /** @brief 그 합에 들어간 질의 수. */
     latency_count: u64,
-    /** @brief 캐시가 맞은 수. */
     cache_hits: u64,
-    /** @brief 캐시를 찾아본 수. */
     cache_lookups: u64,
-    /** @brief 대기열이 꽉 차 버린 기록 수. */
     dropped_log_events: u64,
-    /** @brief 슬롯이 꽉 차 버린 통계 전용 이벤트 수. */
     dropped_stat_events: u64,
-    /** @brief 대기열이 꽉 차 못 보낸 실시간 이벤트 수. */
     dropped_stream_events: u64,
-    /** @brief 저장에 실패한 횟수. */
     persist_failures: u64,
-    /** @brief 전송별 질의 수. */
     by_transport: Vec<u64>,
-    /** @brief 이름별 질의 수. */
     domains: HashMap<Name, u64>,
-    /** @brief 이름별 차단 수. */
     top_blocked: HashMap<Name, u64>,
-    /** @brief 클라이언트별 질의 수. */
     clients: HashMap<std::net::IpAddr, u64>,
 }
 
-/** @brief 통계 파일을 파싱해 검증한다. 하나라도 어긋나면 오류다. */
 fn parse_stats_snapshot(
     root: &Json,
     transport_count: usize,
@@ -719,11 +645,9 @@ fn parse_stats_snapshot(
         dropped_stream_events: counter("dropped_stream_events")?,
         persist_failures: counter("persist_failures")?,
         by_transport,
-        /*
-         * 살아 있는 집계와 같은 키 규칙으로 바꾼다. 접지 않으면 이전 파일의 대소문자만 다른
-         * 항목이 복원 뒤에도 갈라진 채 남아 flush마다 되쓰인다. 합친 뒤 겹치는 항목이 있으면
-         * 그 파일은 이전 규칙으로 쓰인 것이므로 전체를 버린다. 이 파일의 기존 계약 그대로다.
-         */
+        // Use the live aggregation's key rule, or names differing only in case stay split and are
+        // rewritten on every flush. Names that collide after folding mean the file used the old
+        // rule, so it is discarded.
         domains: parse_pairs(top, "domains", |n| {
             Name::from_str(n)
                 .ok()
@@ -738,16 +662,11 @@ fn parse_stats_snapshot(
     })
 }
 
-/** @brief JSON 객체에서 부호 없는 정수 필드를 읽는다. */
 fn json_u64(object: &Json, key: &str) -> Result<u64, String> {
     exact_u64(object.get(key).ok_or_else(|| "Missing entry".to_string())?)
 }
 
-/**
- * @brief JSON 수를 손실 없이 64비트 정수로 읽는다.
- * @details 부동소수로 거치면 큰 값이 정밀도를 잃는다. 통계 누적값은 그 범위를 넘길 수 있어
- *          정확히 되돌릴 수 있는 값만 받아들인다.
- */
+/// Reads a JSON number as an exact u64. Counters can exceed what a float holds exactly.
 fn exact_u64(value: &Json) -> Result<u64, String> {
     if let Some(text) = value.as_str() {
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -760,7 +679,6 @@ fn exact_u64(value: &Json) -> Result<u64, String> {
     Err("Must be a non-negative 64-bit integer written as a decimal string".to_string())
 }
 
-/** @brief 이름-횟수 쌍 객체를 읽는다. */
 fn parse_pairs<K, F>(top: &Json, key: &str, to_key: F) -> Result<HashMap<K, u64>, String>
 where
     K: Eq + std::hash::Hash,
@@ -803,17 +721,10 @@ where
 }
 
 #[cfg(test)]
-/** @brief 원자적 쓰기, 형식 엄격성, 그리고 부분 적용이 없는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /**
-     * @brief 저장 파일이 상한보다 많은 항목을 담고 있어도 복원이 상한을 지키는지.
-     *
-     * @details 축출은 항목을 교체할 뿐 개수를 줄이지 않으므로, 복원이 상한을 넘기면
-     *          그 프로세스는 그 크기를 종료될 때까지 유지한다. 횟수가 큰 것이 남아야 한다.
-     */
     fn restored_top_lists_are_capped() {
         let cap = crate::metrics::TOP_CAP;
         let mut map: HashMap<String, u64> = HashMap::new();
@@ -838,7 +749,6 @@ mod tests {
         assert_eq!(small.len(), 1, "상한 아래는 건드리지 않아야 합니다");
     }
 
-    /** @brief 테스트용 질의 이벤트 하나. */
     fn ev(ts: u64, client: &str, name: &str, action: &'static str) -> QueryEvent {
         QueryEvent {
             id: ts,
@@ -863,7 +773,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 기록 왕복과 보존 기간 적용. */
     fn querylog_roundtrip_and_retention() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("onetdns-qlog-test-{}.jsonl", std::process::id()));
@@ -905,7 +814,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한을 넘는 줄이 하나라도 있으면 파일 전체를 버리는지. 잘린 기록은 믿을 수 없다. */
     fn querylog_rejects_the_entire_file_after_an_oversized_line() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-qlog-oversized-test-{}.jsonl",
@@ -924,7 +832,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상위 디렉터리가 없으면 만들어 주는지. */
     fn atomic_write_creates_missing_parent_directories() {
         let root = std::env::temp_dir().join(format!(
             "onetdns-persist-dir-test-{}-{}",
@@ -939,7 +846,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    /** @brief 기존 파일의 권한이 느슨해도 좁혀 주는지. 질의 기록에는 클라이언트 주소가 담긴다. */
     fn atomic_write_tightens_existing_sensitive_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -960,8 +866,26 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
-    /** @brief 통계 왕복. */
+    fn atomic_write_leaves_only_the_owner_acl_on_windows() {
+        let path = std::env::temp_dir().join(format!(
+            "onetdns-persist-acl-{}-{:016x}.jsonl",
+            std::process::id(),
+            u64::from_le_bytes(onetdns_core::rng::random_array::<8>())
+        ));
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(
+            onetdns_core::fs::access_rules(&path).unwrap(),
+            "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn stats_roundtrip() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("onetdns-stats-test-{}.json", std::process::id()));
@@ -1020,7 +944,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HTTP 응답 상한보다 큰 통계도 파일로는 왕복하는지. */
     fn stats_larger_than_http_json_limit_roundtrip() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-large-stats-test-{}.json",
@@ -1054,7 +977,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부동소수로 정확히 담기지 않는 큰 값이 그대로 보존되는지. */
     fn stats_roundtrip_preserves_values_above_json_safe_integer() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-large-counter-test-{}.json",
@@ -1072,7 +994,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지금 형식과 정확히 같을 때만 받아들이는지. */
     fn stats_parser_accepts_only_the_complete_current_format() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-current-stats-test-{}.json",
@@ -1107,7 +1028,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 깨진 파일이 통계를 절반만 바꾸지 않는지. */
     fn invalid_stats_file_is_not_partially_applied() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-invalid-stats-test-{}.json",
@@ -1141,7 +1061,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 기록도 형식이 정확히 맞을 때만 받아들이는지. */
     fn querylog_accepts_only_the_complete_current_shape() {
         let good = ev(1, "127.0.0.1", "ok.example", "resolved").to_json();
         assert!(parse_event(&good).is_some());

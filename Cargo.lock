@@ -821,7 +821,6 @@ name = "onetdns-control"
 version = "0.1.0-alpha.7"
 dependencies = [
  "hmac",
- "libc",
  "onetdns-core",
  "onetdns-proto",
  "sha1",
