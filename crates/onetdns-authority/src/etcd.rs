@@ -1,12 +1,7 @@
-/*!
- * @brief etcd에서 zone을 읽는 백엔드.
- *
- * @details etcd의 v3 JSON 게이트웨이를 HTTP로 호출한다. gRPC 스택을 들이지 않으려고
- *          HTTP/1.1 클라이언트와 응답 파서를 이 파일 안에 직접 둔다. 키 접두사 아래의
- *          모든 항목을 한 번에 받아 각각 zone으로 파싱한다.
- * @warning 서버 응답은 신뢰 입력이 아니다. 헤더·본문·청크 인코딩 모두 상한과 형식
- *          검사를 거치며, 애매한 프레이밍은 받아들이지 않는다.
- */
+//! Zone source backed by etcd through its v3 JSON gateway, with a small HTTP/1.1 client here
+//! instead of a gRPC stack. Every key under the prefix is one zone. Server responses are
+//! untrusted: headers, bodies and chunked encoding are bounded and checked, and ambiguous framing
+//! is refused.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,48 +12,42 @@ use onetdns_tls::{client_handshake, ClientConfig, TlsConnection, TrustStore};
 
 use crate::source::ZoneSource;
 use crate::{parse_zone, DeadlineTcp, ZoneStore};
-/** @brief 응답 헤더 전체 크기 상한. */
 const MAX_HTTP_HEADER: usize = 64 * 1024;
-/** @brief 응답 본문 크기 상한. */
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
-/** @brief 헤더와 본문을 합친 상한. 읽는 동안 이 값으로 끊는다. */
+/// Reading stops at this many bytes.
 const MAX_HTTP_RESPONSE: usize = MAX_HTTP_HEADER + MAX_HTTP_BODY;
-/** @brief 헤더 줄 수 상한. */
 const MAX_HTTP_HEADERS: usize = 200;
-/** @brief 헤더 한 줄의 길이 상한. */
 const MAX_HTTP_HEADER_LINE: usize = 8 * 1024;
-/** @brief 요청 하나에 걸리는 전체 데드라인. */
+/// For the whole request, not each read.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/** @brief etcd를 zone 공급자로 쓴다. 키가 origin, 값이 zone 텍스트다. */
+/// Keys are zone origins and values zone text.
 pub struct EtcdZoneSource {
-    /** @brief 접속 주소. http와 https를 모두 받는다. */
     pub endpoint: String,
 
-    /** @brief 훑을 키 접두사. 이 아래의 모든 키가 zone이다. */
+    /// Every key under it is a zone.
     pub prefix: String,
 
-    /** @brief 이름 대신 쓸 접속 주소. 이름 해석을 자기 자신에게 맡기지 않으려는 것이다. */
+    /// Used instead of resolving the endpoint name, which could go through this server itself.
     connect_addr: Option<SocketAddr>,
 
-    /** @brief TLS 신뢰 저장소. 없으면 https를 거부한다. */
+    /// Required for https.
     tls: Option<TrustStore>,
 
-    /** @brief 인증 자격증명. 없으면 인증 없이 접속한다. */
+    /// `None` connects without authentication.
     creds: Option<(String, onetdns_core::SecretString)>,
 
-    /** @brief 발급받은 토큰. 재사용해 매 요청마다 로그인하지 않는다. */
+    /// Reused so each request does not sign in again.
     token: Mutex<Option<onetdns_core::SecretString>>,
 
-    /** @brief 마지막으로 본 항목 수와 리비전. 변경 감지에 쓴다. */
+    /// Key count and highest revision last seen, for change detection.
     seen: Mutex<(usize, u64)>,
 
-    /** @brief 직전 변경 감시가 실패했는지. 상태가 바뀔 때만 기록하려는 것이다. */
+    /// Whether the last change check failed, so only transitions are logged.
     unreachable: std::sync::atomic::AtomicBool,
 }
 
 impl EtcdZoneSource {
-    /** @brief 접속 주소와 키 접두사로 만든다. */
     pub fn new(endpoint: impl Into<String>, prefix: impl Into<String>) -> Self {
         EtcdZoneSource {
             endpoint: endpoint.into(),
@@ -72,18 +61,16 @@ impl EtcdZoneSource {
         }
     }
 
-    /** @brief 기본 키 접두사로 만든다. */
     pub fn with_default_prefix(endpoint: impl Into<String>) -> Self {
         Self::new(endpoint, "/onetdns/zones/")
     }
 
-    /** @brief TLS 신뢰 저장소를 붙인다. https 접속에는 이것이 반드시 있어야 한다. */
+    /// Required for https endpoints.
     pub fn with_tls(mut self, roots: TrustStore) -> Self {
         self.tls = Some(roots);
         self
     }
 
-    /** @brief 사용자 자격증명을 붙인다. */
     pub fn with_auth(
         mut self,
         user: impl Into<String>,
@@ -93,33 +80,51 @@ impl EtcdZoneSource {
         self
     }
 
-    /**
-     * @brief 접속할 주소를 직접 지정한다.
-     * @details 이름으로 된 접속 주소는 해석이 필요한데, 그 해석을 자기 자신에게 맡기면
-     *          시작 중 순환이 생긴다. 그래서 이름을 쓰려면 주소를 함께 줘야 한다.
-     * @note TLS 인증서 검증에는 여전히 접속 주소의 이름을 쓴다.
-     */
+    /// Connects here instead of resolving the endpoint name, which could loop back through this
+    /// server during startup. TLS still verifies the certificate against the endpoint name.
     pub fn with_connect_addr(mut self, addr: SocketAddr) -> Self {
         self.connect_addr = Some(addr);
         self
     }
 
-    /** @brief 접속 주소에서 호스트와 포트를 추출한다. */
     pub fn endpoint_host_port(&self) -> Result<(String, u16), String> {
         endpoint_parts(&self.endpoint)
             .map(|parts| (parts.host, parts.port))
             .map_err(|error| error.to_string())
     }
 
-    /** @brief 접속 주소가 https인지. */
     fn is_https(&self) -> bool {
         self.endpoint.starts_with("https://")
     }
 
-    /**
-     * @brief 인증 토큰을 준비한다. 이미 있으면 그대로 쓴다.
-     * @return 자격증명이 없으면 None. 인증 없이 접속하겠다는 뜻이다.
-     */
+    /// Plain http reaches only this machine and never carries credentials: etcd takes the password
+    /// itself, and zone data could be read or replaced on the way.
+    pub fn check(&self) -> Result<(), String> {
+        let parts = endpoint_parts(&self.endpoint).map_err(|error| error.to_string())?;
+        if parts.https {
+            return Ok(());
+        }
+        if self.creds.is_some() {
+            return Err(
+                "etcd credentials need an https:// endpoint; over http:// the password is sent unencrypted"
+                    .to_string(),
+            );
+        }
+        let loopback = parts.host.eq_ignore_ascii_case("localhost")
+            || parts
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err(format!(
+                "A remote etcd server needs an https:// endpoint; http:// is allowed only for localhost and loopback addresses: {}",
+                self.endpoint
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reuses the token when there is one; `None` without credentials.
     fn ensure_token(&self) -> Result<Option<onetdns_core::SecretString>, String> {
         let Some((user, pass)) = &self.creds else {
             return Ok(None);
@@ -148,12 +153,10 @@ impl EtcdZoneSource {
         Ok(Some(token))
     }
 
-    /**
-     * @brief 토큰을 붙여 요청하고, 만료면 한 번만 다시 받아 재시도한다.
-     * @details 토큰은 서버가 언제든 무효화할 수 있다. 한 번만 다시 시도하는 이유는,
-     *          자격증명 자체가 틀린 경우에 무한히 로그인을 시도하지 않기 위해서다.
-     */
+    /// Gets a new token and retries once when the server rejects the current one; retrying only
+    /// once keeps wrong credentials from signing in endlessly.
     fn request(&self, path: &str, body: &str, _retry: Option<()>) -> Result<String, String> {
+        self.check()?;
         let token = if path == "/v3/auth/authenticate" {
             None
         } else {
@@ -185,11 +188,8 @@ impl EtcdZoneSource {
         }
     }
 
-    /**
-     * @brief 접두사 범위 질의 본문을 만든다.
-     * @param keys_only 참이면 값을 받지 않는다. 변경 감지에는 키와 리비전만 있으면 되므로,
-     *                  zone 텍스트 전체를 매 주기 받아 오지 않는다.
-     */
+    /// With `keys_only`, values are left out: change detection needs only keys and revisions, not
+    /// the zone text every cycle.
     fn range_body(&self, keys_only: bool) -> String {
         let key = b64(self.prefix.as_bytes());
         let range_end = b64(&prefix_end(self.prefix.as_bytes()));
@@ -200,11 +200,8 @@ impl EtcdZoneSource {
         }
     }
 
-    /**
-     * @brief 접두사 아래의 키-값을 받아 온다.
-     * @return 항목들과 개수, 그리고 가장 큰 수정 리비전. 개수와 리비전 둘 다 봐야
-     *         삭제와 수정을 모두 잡는다.
-     */
+    /// Entries, their count and the highest mod revision; both count and revision are needed to
+    /// catch deletes as well as edits.
     fn range(&self, keys_only: bool) -> Result<(Vec<(String, String, u64)>, usize, u64), String> {
         let body = self.request("/v3/kv/range", &self.range_body(keys_only), None)?;
         let j = onetdns_core::json::parse(&body)
@@ -242,11 +239,8 @@ impl EtcdZoneSource {
 }
 
 impl ZoneSource for EtcdZoneSource {
-    /**
-     * @brief 접두사 아래 모든 키를 zone으로 파싱한다.
-     * @warning https인데 신뢰 저장소가 없으면 거부한다. 검증 없이 TLS를 맺으면 암호화만
-     *          하고 상대는 확인하지 않는 꼴이라 아무 서버나 zone을 먹일 수 있다.
-     */
+    /// Refuses https without a trust store; TLS without verifying the peer would let any server
+    /// feed zones.
     fn load(&self) -> Result<ZoneStore, String> {
         if self.is_https() && self.tls.is_none() {
             return Err("https etcd endpoints need tls_ca (a trust store)".to_string());
@@ -266,11 +260,7 @@ impl ZoneSource for EtcdZoneSource {
         Ok(store)
     }
 
-    /**
-     * @brief 키 목록만 받아 개수와 리비전을 비교한다.
-     * @note 질의에 실패하면 거짓이다. 잠깐 닿지 않는 것을 변경으로 보면 매 주기 재로드를
-     *       시도하게 된다.
-     */
+    /// False when the query fails; treating a brief outage as a change would reload every cycle.
     fn changed_since(&self, _last: SystemTime) -> bool {
         let (_, count, max_mod) = match self.range(true) {
             Ok(range) => {
@@ -296,13 +286,12 @@ impl ZoneSource for EtcdZoneSource {
         (count, max_mod) != seen
     }
 
-    /** @brief 공급자 설명. */
     fn describe(&self) -> String {
         format!("etcd({}, prefix={})", self.endpoint, self.prefix)
     }
 }
 
-/** @brief JSON에서 수를 읽는다. etcd는 64비트 값을 문자열로 보내기도 해서 둘 다 받는다. */
+/// etcd sends 64-bit numbers as strings or numbers.
 fn num_field(j: &onetdns_core::json::Json, key: &str) -> u64 {
     match j.get(key) {
         Some(v) => v
@@ -314,11 +303,8 @@ fn num_field(j: &onetdns_core::json::Json, key: &str) -> u64 {
     }
 }
 
-/**
- * @brief 접두사 범위의 끝 키를 만든다. 마지막 바이트를 1 올린 값이다.
- * @note 뒤가 전부 0xff면 올릴 슬롯이 없다. 그 경우 0 하나를 주는데, etcd는 이것을
- *       모든 키를 뜻하는 특수 값으로 해석한다.
- */
+/// The prefix with its last byte incremented. When every byte is 0xff there is nothing to
+/// increment, and the single 0 byte returned means all keys to etcd.
 fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     for i in (0..end.len()).rev() {
@@ -331,17 +317,14 @@ fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     vec![0]
 }
 
-/** @brief HTTP 요청 실패 사유. */
 #[derive(Debug)]
 enum HttpError {
-    /** @brief 401. 토큰을 버리고 다시 받을지 판단하는 데 쓰이므로 따로 구분한다. */
+    /// Kept apart so the caller can drop the token and sign in again.
     Unauthorized,
-    /** @brief 그 밖의 실패. */
     Other(String),
 }
 
 impl std::fmt::Display for HttpError {
-    /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpError::Unauthorized => write!(f, "etcd HTTP 401 (authentication failed)"),
@@ -350,14 +333,9 @@ impl std::fmt::Display for HttpError {
     }
 }
 
-/**
- * @brief JSON 본문으로 POST 하고 응답 본문을 돌려준다.
- *
- * @details 연결마다 새로 맺고 닫는다. etcd 호출은 재로드 주기마다 몇 번뿐이라 연결을
- *          유지할 이유가 없고, 유지하면 그만큼 상태가 는다.
- * @note 이름으로 된 접속 주소는 미리 받은 주소가 있어야 한다. 없으면 이 서버가 이름을
- *       해석해야 하는데, 그 해석이 다시 이 서버를 거치면 시작 중 순환이 생긴다.
- */
+/// A new connection per call; etcd is called a few times per reload, so keeping one open is
+/// not worth the state. An endpoint given by name needs a connect address, or resolving it could
+/// loop back through this server during startup.
 fn http_post(
     endpoint: &str,
     connect_addr: Option<SocketAddr>,
@@ -421,23 +399,17 @@ fn http_post(
     parse_http_response(&resp)
 }
 
-/** @brief 접속 주소를 뜯어 놓은 조각들. */
 struct EndpointParts {
-    /** @brief TLS를 쓰는지. */
     https: bool,
-    /** @brief 호스트. TLS 인증서 이름 검증에도 쓴다. */
+    /// Also the name the TLS certificate is checked against.
     host: String,
-    /** @brief 포트. 생략되면 기본값이 들어간다. */
+    /// Default port filled in when omitted.
     port: u16,
-    /** @brief Host 헤더에 담을 원래 형태. 포트 표기를 그대로 보존한다. */
+    /// As written, for the Host header.
     authority: String,
 }
 
-/**
- * @brief 접속 주소를 해석한다.
- * @details 경로가 붙거나 제어문자가 든 주소는 거부한다. 그런 값이 Host 헤더에 그대로
- *          들어가면 요청 자체를 조작할 수 있다.
- */
+/// Refuses a path or control characters, which would end up in the Host header.
 fn endpoint_parts(endpoint: &str) -> Result<EndpointParts, HttpError> {
     let (https, authority) = endpoint
         .strip_prefix("https://")
@@ -465,11 +437,7 @@ fn endpoint_parts(endpoint: &str) -> Result<EndpointParts, HttpError> {
     })
 }
 
-/**
- * @brief 평문 응답을 끝까지 읽는다.
- * @details Content-Length가 채워지면 연결이 닫히기를 기다리지 않고 멈춘다. 기다리기만
- *          하면 상대가 닫지 않는 한 데드라인까지 붙잡힌다.
- */
+/// Stops once Content-Length is satisfied instead of waiting for the peer to close.
 fn read_plain_response(stream: &mut DeadlineTcp) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -493,7 +461,7 @@ fn read_plain_response(stream: &mut DeadlineTcp) -> Result<Vec<u8>, HttpError> {
     Ok(out)
 }
 
-/** @brief TLS 응답을 끝까지 읽는다. 멈추는 조건은 평문 경로와 같다. */
+/// Stops on the same conditions as the plain path.
 fn read_tls_response(
     conn: &mut TlsConnection,
     stream: &mut DeadlineTcp,
@@ -523,11 +491,7 @@ fn read_tls_response(
     Ok(out)
 }
 
-/**
- * @brief 지금까지 받은 것으로 응답이 완성됐는지.
- * @details 청크 인코딩이면 길이를 미리 알 수 없어 항상 거짓이다. 그 경우 연결이 닫힐
- *          때까지 읽는다.
- */
+/// Always false for chunked responses, which are read until close.
 fn response_content_length_complete(response: &[u8]) -> Result<bool, HttpError> {
     let Some(split) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         if response.len() > MAX_HTTP_HEADER {
@@ -551,18 +515,15 @@ fn response_content_length_complete(response: &[u8]) -> Result<bool, HttpError> 
         .is_some_and(|length| response.len() - split - 4 >= length))
 }
 
-/** @brief 응답 헤더에서 이 서버가 쓰는 것만 추출해 둔 형태. */
+/// The parts of a response head this client uses.
 #[derive(Clone, Copy)]
 struct ParsedHttpHead {
-    /** @brief 상태 코드. */
     status: u16,
-    /** @brief 본문 길이. 청크 인코딩이면 없다. */
+    /// `None` when chunked.
     content_length: Option<usize>,
-    /** @brief 청크 인코딩인지. */
     chunked: bool,
 }
 
-/** @brief 헤더 이름이 토큰 문자로만 이뤄졌는지. */
 fn valid_http_header_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -570,11 +531,8 @@ fn valid_http_header_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
-/**
- * @brief 헤더 한 줄을 이름과 값으로 구분한다.
- * @details 이름은 토큰 문자만, 값은 제어문자를 뺀 것만 받는다. 느슨하게 두면 값에 든
- *          줄바꿈이 헤더를 새로 만들어 내는 밀반입이 성립한다.
- */
+/// Names must be tokens and values free of control characters; a line break in a value would
+/// smuggle in a header.
 fn parse_http_field(line: &str) -> Result<(&str, &str), HttpError> {
     if line.len() > MAX_HTTP_HEADER_LINE {
         return Err(HttpError::Other("etcd HTTP header line is too long".into()));
@@ -596,7 +554,7 @@ fn parse_http_field(line: &str) -> Result<(&str, &str), HttpError> {
     Ok((name, value.trim_matches([' ', '\t'])))
 }
 
-/** @brief 상태 줄에서 코드를 읽는다. 버전은 1.0과 1.1만 받는다. */
+/// Accepts HTTP/1.0 and 1.1 only.
 fn parse_http_status(line: &str) -> Result<u16, HttpError> {
     if line.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
         return Err(HttpError::Other(
@@ -619,14 +577,9 @@ fn parse_http_status(line: &str) -> Result<u16, HttpError> {
         .ok_or_else(|| HttpError::Other("Invalid HTTP status code".into()))
 }
 
-/**
- * @brief 응답 헤더를 해석한다.
- *
- * @details 프레이밍이 애매한 응답을 전부 거부한다. Content-Length가 둘이거나, 그것과
- *          Transfer-Encoding이 함께 있거나, 청크가 아닌 전송 인코딩이 붙은 경우다.
- * @warning 이 검사가 느슨하면 이 서버와 중간 장비가 본문 경계를 다르게 보게 된다. 그
- *          어긋남이 곧 요청 스머글링이다.
- */
+/// Refuses ambiguous framing: two Content-Lengths, Content-Length with Transfer-Encoding, or a
+/// transfer coding other than chunked. Loose checks let this client and intermediaries disagree
+/// on body boundaries, which is how smuggling works.
 fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
     let head = std::str::from_utf8(head)
         .map_err(|_| HttpError::Other("HTTP header is not valid UTF-8".into()))?;
@@ -684,12 +637,8 @@ fn parse_http_head(head: &[u8]) -> Result<ParsedHttpHead, HttpError> {
     })
 }
 
-/**
- * @brief 응답 전체에서 본문을 꺼낸다.
- * @details Content-Length가 있으면 실제 길이와 정확히 같아야 한다. 짧으면 잘린 것이고
- *          길면 다음 응답이 섞인 것이라, 어느 쪽도 그냥 넘길 수 없다.
- * @return 본문 문자열. 401은 토큰 갱신 판단을 위해 따로 구분해 돌려준다.
- */
+/// Content-Length must match the body exactly: shorter is truncated, longer has another
+/// response mixed in. 401 is returned as its own error for token renewal.
 fn parse_http_response(resp: &[u8]) -> Result<String, HttpError> {
     if resp.len() > MAX_HTTP_RESPONSE {
         return Err(HttpError::Other(
@@ -738,12 +687,8 @@ fn parse_http_response(resp: &[u8]) -> Result<String, HttpError> {
     String::from_utf8(decoded).map_err(|_| HttpError::Other("etcd JSON is not valid UTF-8".into()))
 }
 
-/**
- * @brief 청크 인코딩을 푼다.
- * @details 크기 줄에 확장 매개변수가 붙을 수 있어 세미콜론 앞까지만 읽는다. 앞에 0을
- *          덧댄 표기나 공백은 거부한다. 같은 크기를 여러 형태로 쓸 수 있으면 중간
- *          장비와 이 서버가 경계를 다르게 본다.
- */
+/// Reads the size up to any `;` extension. Leading zeros and spaces are refused, since one size
+/// written several ways lets intermediaries and this client disagree on boundaries.
 fn dechunk(body: &[u8]) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -816,10 +761,9 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, HttpError> {
     }
 }
 
-/** @brief 표준 base64 알파벳. */
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/** @brief base64 인코딩. etcd의 JSON은 키와 값을 이 형식으로 주고받는다. */
+/// etcd's JSON carries keys and values in base64.
 fn b64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -845,9 +789,8 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-/** @brief base64 디코딩. 알파벳 밖 문자가 있으면 None. */
+/// `None` on a character outside the alphabet.
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -875,7 +818,6 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/** @brief HTTP 프레이밍 거부 조건, 데드라인 처리, 인증 흐름, 실제 TLS 왕복. */
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,7 +825,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    /** @brief 본문이 다 찼으면 연결이 닫히기를 기다리지 않는지. */
     #[test]
     fn content_length_response_does_not_wait_for_eof() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -913,7 +854,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /** @brief 이름으로 된 접속 주소는 미리 받은 주소가 있어야 한다. 없으면 시작 중 순환이 생긴다. */
     #[test]
     fn hostname_requires_explicit_bootstrap_address() {
         let error = http_post(
@@ -932,7 +872,7 @@ mod tests {
         );
     }
 
-    /** @brief 접속은 주어진 주소로 하되 Host 헤더와 인증서 검증에는 이름을 그대로 쓰는지. */
+    /// Connects to the given address but keeps the name for the Host header and certificate check.
     #[test]
     fn bootstrap_address_preserves_hostname_authority() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -961,7 +901,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /** @brief 대괄호로 감싼 IPv6와 생략된 포트를 제대로 다루는지. */
     #[test]
     fn endpoint_parser_handles_ipv6_and_default_ports() {
         let https = endpoint_parts("https://[::1]:1234/").unwrap();
@@ -977,7 +916,6 @@ mod tests {
         assert!(endpoint_parts("http://host/path").is_err());
     }
 
-    /** @brief 본문 경계가 애매한 응답을 전부 거부하는지. 이 어긋남이 요청 스머글링이다. */
     #[test]
     fn rejects_ambiguous_etcd_http_framing() {
         for response in [
@@ -999,7 +937,7 @@ mod tests {
         .is_err());
     }
 
-    /** @brief 최소 etcd 응답을 내는 테스트용 HTTP 서버. 질의 횟수를 세어 재로드 여부를 확인한다. */
+    /// Minimal etcd for range queries; bumping the returned revision simulates a change.
     fn fake_etcd(zones: Vec<(&'static str, String)>) -> (String, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1066,29 +1004,52 @@ mod tests {
         (format!("http://{addr}"), rev)
     }
 
-    #[allow(clippy::type_complexity)]
-    /** @brief 인증을 요구하는 테스트용 서버. 토큰 발급과 만료를 흉내 낸다. */
+    /// A server certificate for `localhost`, and the DER to trust it by.
+    fn self_signed_localhost() -> (onetdns_tls::ServerConfig, Vec<u8>) {
+        use p256::pkcs8::DecodePrivateKey;
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = ck.cert.der().as_ref().to_vec();
+        let key_der = ck.key_pair.serialize_der();
+        let signing =
+            p256::ecdsa::SigningKey::from(p256::SecretKey::from_pkcs8_der(&key_der).unwrap());
+        let config = onetdns_tls::ServerConfig {
+            cert_chain: vec![cert_der.clone()],
+            sign_scheme: 0x0403,
+            sign: std::sync::Arc::new(move |content: &[u8]| {
+                use p256::ecdsa::{signature::Signer, Signature};
+                let sig: Signature = signing.sign(content);
+                sig.to_der().as_bytes().to_vec()
+            }),
+            alpn: vec![],
+            client_ca: None,
+            resumption: None,
+        };
+        (config, cert_der)
+    }
+
+    /// etcd over TLS requiring authentication: issues a token and rejects requests without it.
+    /// Returns the endpoint, the request heads it saw, and the DER to trust.
     fn fake_etcd_auth(
         zones: Vec<(&'static str, String)>,
-    ) -> (String, Arc<AtomicU64>, Arc<std::sync::Mutex<Vec<String>>>) {
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>, Vec<u8>) {
+        let (server_config, ca_der) = self_signed_localhost();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let rev = Arc::new(AtomicU64::new(1));
-        let rev_thread = rev.clone();
+        let port = listener.local_addr().unwrap().port();
         let observed: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let obs2 = observed.clone();
         std::thread::spawn(move || {
-            let rev = rev_thread;
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
+                let Ok(mut conn) = onetdns_tls::server_handshake(&mut s, &server_config) else {
+                    continue;
+                };
                 let mut got = Vec::new();
-                let mut buf = [0u8; 8192];
                 loop {
-                    match s.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            got.extend_from_slice(&buf[..n]);
+                    match conn.read_app(&mut s) {
+                        Ok(data) if !data.is_empty() => {
+                            got.extend_from_slice(&data);
                             let text = String::from_utf8_lossy(&got);
                             if let Some((head, body)) = text.split_once("\r\n\r\n") {
                                 let cl: usize = head
@@ -1104,7 +1065,7 @@ mod tests {
                                 }
                             }
                         }
-                        Err(_) => break,
+                        _ => break,
                     }
                 }
                 let req = String::from_utf8_lossy(&got).to_string();
@@ -1123,11 +1084,11 @@ mod tests {
                         "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
                         b.len()
                     );
-                    let _ = s.write_all(resp.as_bytes());
+                    let _ = conn.write_app(&mut s, resp.as_bytes());
                     continue;
                 } else {
                     let keys_only = req.contains("\"keys_only\":true");
-                    let r = rev.load(Ordering::SeqCst);
+                    let r = 1;
                     let kvs: Vec<String> = zones
                         .iter()
                         .map(|(origin, text)| {
@@ -1152,20 +1113,18 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = s.write_all(resp.as_bytes());
+                let _ = conn.write_app(&mut s, resp.as_bytes());
             }
         });
-        (format!("http://{addr}"), rev, observed)
+        (format!("https://localhost:{port}"), observed, ca_der)
     }
 
-    /** @brief 테스트용 최소 zone 텍스트. */
     fn zone_text(origin: &str) -> String {
         format!(
             "$ORIGIN {origin}.\n$TTL 300\n@ IN SOA ns1 admin 3 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n"
         )
     }
 
-    /** @brief 접두사 아래 키를 zone으로 담고, 개수와 리비전으로 변경을 잡는지. */
     #[test]
     fn loads_zones_from_etcd_and_detects_changes() {
         let (endpoint, rev) = fake_etcd(vec![
@@ -1202,7 +1161,6 @@ mod tests {
         assert!(!src.changed_since(SystemTime::now()), "재로드 후 변경 없음");
     }
 
-    /** @brief 검증 없는 TLS를 거부하는지. 암호화만 하고 상대를 확인하지 않으면 아무 서버나 zone을 먹인다. */
     #[test]
     fn rejects_https_without_trust_store() {
         let src = EtcdZoneSource::with_default_prefix("https://127.0.0.1:2379");
@@ -1213,14 +1171,16 @@ mod tests {
         assert!(err.contains("tls_ca"), "{err}");
     }
 
-    /** @brief 토큰을 받아 재사용하고, 만료되면 다시 받아 재시도하는지. */
+    /// Gets a token, reuses it, and signs in again when it is rejected.
     #[test]
     fn auth_token_flow() {
-        let (endpoint, _rev, observed) =
+        let (endpoint, observed, ca_der) =
             fake_etcd_auth(vec![("auth.test", zone_text("auth.test"))]);
         let password = onetdns_core::SecretString::from("pw");
         let password_ptr = password.as_ptr();
-        let src = EtcdZoneSource::with_default_prefix(endpoint).with_auth("root", password);
+        let src = EtcdZoneSource::with_default_prefix(endpoint)
+            .with_tls(TrustStore::from_ders([ca_der.as_slice()]))
+            .with_auth("root", password);
         assert_eq!(src.creds.as_ref().unwrap().1.as_ptr(), password_ptr);
         let store = src.load().expect("인증 후 로드");
         assert_eq!(store.zones().len(), 1);
@@ -1243,31 +1203,53 @@ mod tests {
         );
     }
 
-    /** @brief 이 서버의 TLS 구현으로 실제 https etcd와 통하는지. */
+    #[test]
+    fn plain_http_reaches_only_loopback_and_never_carries_credentials() {
+        for endpoint in [
+            "http://127.0.0.1:2379",
+            "http://localhost:2379",
+            "http://[::1]:2379",
+            "https://etcd.example:2379",
+        ] {
+            assert!(
+                EtcdZoneSource::with_default_prefix(endpoint)
+                    .check()
+                    .is_ok(),
+                "{endpoint} was refused"
+            );
+        }
+        for endpoint in ["http://192.0.2.10:2379", "http://etcd.example:2379"] {
+            assert!(
+                EtcdZoneSource::with_default_prefix(endpoint)
+                    .check()
+                    .is_err(),
+                "{endpoint} was accepted for plain http"
+            );
+        }
+        assert!(
+            EtcdZoneSource::with_default_prefix("https://etcd.example:2379")
+                .with_auth("root", "pw")
+                .check()
+                .is_ok()
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let src = EtcdZoneSource::with_default_prefix(endpoint).with_auth("root", "pw");
+        let error = src.load().err().expect("credentials over http were used");
+        assert!(error.contains("https://"), "{error}");
+        assert!(
+            listener.accept().is_err(),
+            "the client connected to send the password over plain http"
+        );
+    }
+
     #[test]
     fn https_etcd_self_tls() {
-        use onetdns_tls::{server_handshake, ServerConfig};
-        use p256::pkcs8::DecodePrivateKey;
+        use onetdns_tls::server_handshake;
 
-        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = ck.cert.der().as_ref().to_vec();
-        let ca_der = cert_der.clone();
-        let key_der = ck.key_pair.serialize_der();
-        let signing =
-            p256::ecdsa::SigningKey::from(p256::SecretKey::from_pkcs8_der(&key_der).unwrap());
-        let scfg = ServerConfig {
-            cert_chain: vec![cert_der],
-            sign_scheme: 0x0403,
-            sign: std::sync::Arc::new(move |content: &[u8]| {
-                use p256::ecdsa::{signature::Signer, Signature};
-                let sig: Signature = signing.sign(content);
-                sig.to_der().as_bytes().to_vec()
-            }),
-            alpn: vec![],
-            client_ca: None,
-            resumption: None,
-        };
-
+        let (scfg, ca_der) = self_signed_localhost();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let body = format!(
@@ -1299,7 +1281,6 @@ mod tests {
             .any(|z| z.origin().to_ascii_lower() == "tls.test"));
     }
 
-    /** @brief base64 왕복과 접두사 끝 키 계산. */
     #[test]
     fn b64_roundtrip_and_prefix_end() {
         assert_eq!(b64(b"abc"), "YWJj");
@@ -1313,7 +1294,6 @@ mod tests {
         assert_eq!(prefix_end(&[0xff, 0xff]), vec![0]);
     }
 
-    /** @brief 청크 인코딩이 원본 바이트로 되돌아오는지. */
     #[test]
     fn dechunk_decodes() {
         assert_eq!(
@@ -1323,13 +1303,12 @@ mod tests {
     }
 }
 
-/** @brief HTTP 파서 패닉 스윕. 크레이트 내부라 통합 스윕이 닿지 못한다. */
+/// Panic sweep of the HTTP parsers, which the integration sweep cannot reach inside the crate.
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
     use crate::fuzzutil::{havoc, Rng};
 
-    /** @brief 헤더·본문·청크 파서가 어떤 바이트에도 패닉하지 않는지. */
     #[test]
     fn http_parsers_never_panic_on_malformed_bytes() {
         let seed = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n{\"kvs\":[],\"more\":0}\r\n0\r\n\r\n";
