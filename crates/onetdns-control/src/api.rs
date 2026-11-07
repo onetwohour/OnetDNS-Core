@@ -955,6 +955,18 @@ const PROXY_LOGIN_FAILURE_BURST: u64 = 2 * MAX_SOURCE_LOGIN_FAILURES as u64;
 const PROXY_LOGIN_FAILURE_INTERVAL_MS: u64 = 1000;
 /// Entries kept per sign-in failure table.
 const MAX_LOGIN_ATTEMPT_KEYS: usize = 4096;
+/// Failures on one account from networks without a recent sign-in to it before that account is
+/// paced. Per-source limits do not stop guesses spread over many networks.
+const ACCOUNT_LOGIN_FAILURE_BURST: u32 = 20;
+/// Once an account is paced, networks without a recent sign-in to it get one attempt per interval.
+const ACCOUNT_LOGIN_INTERVAL_MS: u64 = 30 * 1000;
+/// An account's failure count starts over after this long without a failure.
+const ACCOUNT_LOGIN_QUIET_MS: u64 = 15 * 60 * 1000;
+/// How long a network that signed in to an account bypasses that account's pacing, so a guessing
+/// attacker does not slow down admins signing in from where they usually do.
+const KNOWN_LOGIN_NETWORK_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Account and network pairs remembered; kept in memory only, so a restart forgets them.
+const MAX_KNOWN_LOGIN_NETWORKS: usize = 4096;
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 16 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -975,6 +987,20 @@ struct LoginAttempt {
     failures: u32,
     /// No attempt is accepted before this.
     blocked_until_ms: u64,
+}
+
+struct AccountPace {
+    failures: u32,
+    last_failure_ms: u64,
+    /// Once paced, the next attempt from a network without a recent sign-in waits until this.
+    next_ms: u64,
+}
+
+impl AccountPace {
+    fn paced(&self, now: u64) -> bool {
+        self.failures >= ACCOUNT_LOGIN_FAILURE_BURST
+            && now.saturating_sub(self.last_failure_ms) <= ACCOUNT_LOGIN_QUIET_MS
+    }
 }
 
 /// Keeps a wrong credential apart from an overloaded KDF; merging them would tell a valid user
@@ -1002,6 +1028,12 @@ pub struct Auth {
 
     /// Per reverse proxy: the time, in ms, from which failures are accepted without pacing again.
     proxy_login_pace: Mutex<std::collections::HashMap<String, u64>>,
+
+    /// Per account: failures from networks without a recent sign-in to it.
+    account_login_pace: Mutex<std::collections::HashMap<[u8; 32], AccountPace>>,
+
+    /// Per account and network: when that network last signed in to the account.
+    known_login_networks: Mutex<std::collections::HashMap<[u8; 32], u64>>,
 
     /// One-time code required to create the first admin account; cleared once it exists.
     setup_code: Mutex<Option<SetupCode>>,
@@ -1273,8 +1305,24 @@ impl Auth {
         credential_digest("login-user", &[source, user])
     }
 
+    fn login_account_bucket(user: &str) -> [u8; 32] {
+        credential_digest("login-account", &[user])
+    }
+
+    fn known_login_network_key(source: &str, user: &str) -> [u8; 32] {
+        credential_digest("login-known", &[source, user])
+    }
+
+    fn login_network_known(&self, source: &str, user: &str, now: u64) -> bool {
+        self.known_login_networks
+            .lock_recover()
+            .get(&Self::known_login_network_key(source, user))
+            .is_some_and(|signed_in| now.saturating_sub(*signed_in) <= KNOWN_LOGIN_NETWORK_MS)
+    }
+
     /// Seconds until this source and user may try again, or `None` if they may now. `proxy` is the
-    /// reverse proxy the request came through.
+    /// reverse proxy the request came through. An attempt allowed on a paced account takes that
+    /// account's next slot, so concurrent attempts cannot share one.
     fn login_retry_after(&self, source: &str, proxy: Option<&str>, user: &str) -> Option<u64> {
         let now = now_ms();
         let mut attempts = self.login_attempts.lock_recover();
@@ -1301,8 +1349,78 @@ impl Auth {
                 .unwrap_or(0);
             next.saturating_sub((PROXY_LOGIN_FAILURE_BURST - 1) * PROXY_LOGIN_FAILURE_INTERVAL_MS)
         });
-        let until = blocked_until.max(paced_until);
+        let mut until = blocked_until.max(paced_until);
+        if until <= now && !self.login_network_known(source, user, now) {
+            until = Self::take_account_login_slot(
+                &mut self.account_login_pace.lock_recover(),
+                &Self::login_account_bucket(user),
+                now,
+            );
+        }
         (until > now).then(|| (until - now).div_ceil(1000))
+    }
+
+    /// The time an attempt on a paced account must wait for; when it may go now, it moves the next
+    /// slot one interval on and returns 0.
+    fn take_account_login_slot(
+        pace: &mut std::collections::HashMap<[u8; 32], AccountPace>,
+        account: &[u8; 32],
+        now: u64,
+    ) -> u64 {
+        let Some(entry) = pace.get_mut(account).filter(|entry| entry.paced(now)) else {
+            return 0;
+        };
+        if entry.next_ms > now {
+            return entry.next_ms;
+        }
+        entry.next_ms = now + ACCOUNT_LOGIN_INTERVAL_MS;
+        0
+    }
+
+    /// Stale entries are dropped. When the table is full, the entry with the fewest failures goes,
+    /// so names invented to fill it cannot evict an account under attack.
+    fn record_account_login_failure(
+        pace: &mut std::collections::HashMap<[u8; 32], AccountPace>,
+        account: [u8; 32],
+        now: u64,
+    ) {
+        pace.retain(|_, entry| now.saturating_sub(entry.last_failure_ms) <= ACCOUNT_LOGIN_QUIET_MS);
+        if !pace.contains_key(&account) && pace.len() >= MAX_LOGIN_ATTEMPT_KEYS {
+            if let Some(weakest) = pace
+                .iter()
+                .min_by_key(|(_, entry)| (entry.failures, entry.last_failure_ms))
+                .map(|(key, _)| *key)
+            {
+                pace.remove(&weakest);
+            }
+        }
+        let entry = pace.entry(account).or_insert(AccountPace {
+            failures: 0,
+            last_failure_ms: now,
+            next_ms: 0,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_failure_ms = now;
+        if entry.failures >= ACCOUNT_LOGIN_FAILURE_BURST {
+            entry.next_ms = entry.next_ms.max(now + ACCOUNT_LOGIN_INTERVAL_MS);
+        }
+    }
+
+    /// Only a successful sign-in adds an entry, so the table cannot be filled without a password.
+    fn remember_login_network(&self, source: &str, user: &str, now: u64) {
+        let mut known = self.known_login_networks.lock_recover();
+        known.retain(|_, signed_in| now.saturating_sub(*signed_in) <= KNOWN_LOGIN_NETWORK_MS);
+        let key = Self::known_login_network_key(source, user);
+        if !known.contains_key(&key) && known.len() >= MAX_KNOWN_LOGIN_NETWORKS {
+            if let Some(oldest) = known
+                .iter()
+                .min_by_key(|(_, signed_in)| **signed_in)
+                .map(|(key, _)| *key)
+            {
+                known.remove(&oldest);
+            }
+        }
+        known.insert(key, now);
     }
 
     #[cfg(test)]
@@ -1313,12 +1431,22 @@ impl Auth {
     /// Success clears only that user's failures. Source and proxy records stay; clearing them would
     /// let each sign-in to one's own account refill the guesses against other accounts.
     fn record_login_result(&self, source: &str, proxy: Option<&str>, user: &str, success: bool) {
-        let mut attempts = self.login_attempts.lock_recover();
+        let now = now_ms();
         if success {
-            attempts.remove(&Self::login_user_bucket(source, user));
+            self.login_attempts
+                .lock_recover()
+                .remove(&Self::login_user_bucket(source, user));
+            self.remember_login_network(source, user, now);
             return;
         }
-        let now = now_ms();
+        if !self.login_network_known(source, user, now) {
+            Self::record_account_login_failure(
+                &mut self.account_login_pace.lock_recover(),
+                Self::login_account_bucket(user),
+                now,
+            );
+        }
+        let mut attempts = self.login_attempts.lock_recover();
         for (key, limit) in [
             (Self::login_user_bucket(source, user), MAX_LOGIN_FAILURES),
             (Self::login_source_bucket(source), MAX_SOURCE_LOGIN_FAILURES),
@@ -7876,7 +8004,7 @@ mod tests {
         );
 
         for i in u64::from(MAX_SOURCE_LOGIN_FAILURES)..PROXY_LOGIN_FAILURE_BURST {
-            auth.record_login_result(&format!("client{i}"), proxy, "alice", false);
+            auth.record_login_result(&format!("client{i}"), proxy, &format!("guess{i}"), false);
         }
         assert_eq!(
             auth.login_retry_after("203.0.113.9", proxy, "alice"),
@@ -7924,6 +8052,85 @@ mod tests {
             ),
             "다른 /64 의 클라이언트까지 막힘"
         );
+    }
+
+    #[test]
+    fn guesses_spread_over_networks_pace_the_account_but_not_known_networks() {
+        let auth = Auth::default();
+        auth.record_login_result("192.0.2.1", None, "admin", true);
+        auth.record_login_result("192.0.2.2", None, "ops", true);
+        auth.remember_login_network("192.0.2.3", "admin", now_ms() - KNOWN_LOGIN_NETWORK_MS - 1);
+        for i in 0..ACCOUNT_LOGIN_FAILURE_BURST {
+            auth.record_login_result(&format!("198.51.100.{i}"), None, "admin", false);
+        }
+        assert!(
+            !auth.login_allowed("203.0.113.9", None, "admin"),
+            "guesses from many networks did not pace the account"
+        );
+        assert!(
+            auth.login_allowed("192.0.2.1", None, "admin"),
+            "a network that signed in to the account was paced"
+        );
+        assert!(
+            !auth.login_allowed("192.0.2.2", None, "admin"),
+            "a sign-in to another account exempted the network"
+        );
+        assert!(
+            !auth.login_allowed("192.0.2.3", None, "admin"),
+            "a sign-in older than the exemption still exempted the network"
+        );
+        assert!(
+            auth.login_allowed("203.0.113.9", None, "ops"),
+            "pacing one account slowed another"
+        );
+    }
+
+    #[test]
+    fn a_paced_account_takes_one_attempt_per_interval() {
+        let mut pace = std::collections::HashMap::new();
+        let account = [7u8; 32];
+        let start = 1_000_000;
+        for _ in 1..ACCOUNT_LOGIN_FAILURE_BURST {
+            Auth::record_account_login_failure(&mut pace, account, start);
+        }
+        assert_eq!(
+            Auth::take_account_login_slot(&mut pace, &account, start),
+            0,
+            "paced before the burst was used up"
+        );
+        Auth::record_account_login_failure(&mut pace, account, start);
+        let next = start + ACCOUNT_LOGIN_INTERVAL_MS;
+        assert_eq!(
+            Auth::take_account_login_slot(&mut pace, &account, start),
+            next
+        );
+        assert_eq!(Auth::take_account_login_slot(&mut pace, &account, next), 0);
+        assert_eq!(
+            Auth::take_account_login_slot(&mut pace, &account, next),
+            next + ACCOUNT_LOGIN_INTERVAL_MS,
+            "two attempts shared one slot"
+        );
+        assert_eq!(
+            Auth::take_account_login_slot(&mut pace, &account, start + ACCOUNT_LOGIN_QUIET_MS + 1),
+            0,
+            "pacing outlived the quiet period"
+        );
+    }
+
+    #[test]
+    fn invented_names_cannot_evict_an_account_under_attack() {
+        let mut pace = std::collections::HashMap::new();
+        let target = [0xff; 32];
+        for _ in 0..ACCOUNT_LOGIN_FAILURE_BURST {
+            Auth::record_account_login_failure(&mut pace, target, 1_000);
+        }
+        for i in 0..MAX_LOGIN_ATTEMPT_KEYS as u64 {
+            let mut name = [0; 32];
+            name[..8].copy_from_slice(&i.to_le_bytes());
+            Auth::record_account_login_failure(&mut pace, name, 2_000);
+        }
+        assert_eq!(pace.len(), MAX_LOGIN_ATTEMPT_KEYS);
+        assert!(pace[&target].paced(2_000));
     }
 
     #[test]
