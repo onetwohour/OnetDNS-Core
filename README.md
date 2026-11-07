@@ -68,7 +68,7 @@ All three block ads for your whole network. Where they differ:
 | Two servers kept in sync | ✓ | third-party tool | third-party tool |
 | DHCP server | ✓ | ✓ (not on Windows) | ✓ |
 
-AdGuard Home and Pi-hole have years of releases and large communities behind them. OnetDNS is new; see the warning above.
+AdGuard Home and Pi-hole have years of releases and large communities behind them. OnetDNS is new.
 
 <br>
 
