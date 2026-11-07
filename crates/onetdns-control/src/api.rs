@@ -996,8 +996,9 @@ pub struct Auth {
     readonly: Mutex<Vec<[u8; 32]>>,
     users: Mutex<Vec<UserCred>>,
     sessions: SessionStore,
-    /// Sign-in failures per source, and per source and user.
-    login_attempts: Mutex<std::collections::HashMap<String, LoginAttempt>>,
+    /// Sign-in failures per source, and per source and user. Keyed by digest, since the user name
+    /// comes from the request body and could be up to a megabyte long.
+    login_attempts: Mutex<std::collections::HashMap<[u8; 32], LoginAttempt>>,
 
     /// Per reverse proxy: the time, in ms, from which failures are accepted without pacing again.
     proxy_login_pace: Mutex<std::collections::HashMap<String, u64>>,
@@ -1264,12 +1265,12 @@ impl Auth {
         LoginResult::Success(token, user.role, user.name)
     }
 
-    fn login_source_bucket(source: &str) -> String {
-        format!("src\u{1f}{source}")
+    fn login_source_bucket(source: &str) -> [u8; 32] {
+        credential_digest("login-source", &[source])
     }
 
-    fn login_user_bucket(source: &str, user: &str) -> String {
-        format!("user\u{1f}{source}\u{1f}{user}")
+    fn login_user_bucket(source: &str, user: &str) -> [u8; 32] {
+        credential_digest("login-user", &[source, user])
     }
 
     /// Seconds until this source and user may try again, or `None` if they may now. `proxy` is the
@@ -1355,8 +1356,8 @@ impl Auth {
 
     /// Evicts the oldest entry when the table is full.
     fn record_login_failure(
-        attempts: &mut std::collections::HashMap<String, LoginAttempt>,
-        key: String,
+        attempts: &mut std::collections::HashMap<[u8; 32], LoginAttempt>,
+        key: [u8; 32],
         limit: u32,
         now: u64,
     ) {
@@ -1364,7 +1365,7 @@ impl Auth {
             if let Some(oldest) = attempts
                 .iter()
                 .min_by_key(|(_, attempt)| attempt.window_start_ms)
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| *key)
             {
                 attempts.remove(&oldest);
             }
