@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use onetdns_control::Action;
+use onetdns_core::log::sampled;
 use onetdns_core::{AclDecision, ArcSwap, ClientInfo, MutexExt, RateDecision};
 use onetdns_proto::{
     DnsClass, Message, Name as ApName, RData as ApRData, Record as ApRecord, RecordType as ApRt,
@@ -1330,13 +1331,6 @@ fn signed_tsig_error_response(
     response
 }
 
-/// Any client can trigger a refusal, so each kind logs only its 1st, 2nd, 4th, ... occurrence;
-/// a line per request would let one flood the log.
-fn sampled(counter: &AtomicU64) -> Option<u64> {
-    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    count.is_power_of_two().then_some(count)
-}
-
 const XFR_CHUNK_BUDGET: usize = onetdns_authority::XFR_CHUNK_BUDGET;
 
 fn xfr_single_response(
@@ -1443,13 +1437,6 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
-
-    #[test]
-    fn refusals_are_logged_at_powers_of_two() {
-        let counter = AtomicU64::new(0);
-        let logged: Vec<u64> = (0..20).filter_map(|_| sampled(&counter)).collect();
-        assert_eq!(logged, [1, 2, 4, 8, 16]);
-    }
 
     use onetdns_proto::{
         DnsClass, Edns, Message, Name as ApName, RData as ApRData, Record as ApRecord,

@@ -3,7 +3,7 @@
 //! from the module path.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Lower is more severe; threshold checks rely on this order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +97,13 @@ pub fn set_level_str(s: &str) {
 #[inline]
 pub fn enabled(level: Level) -> bool {
     (level as u8) <= THRESHOLD.load(Ordering::Relaxed)
+}
+
+/// Counts an occurrence and returns the count when it is the 1st, 2nd, 4th, ... one. Warnings
+/// that outside requests can trigger go through this, so a flood of requests cannot flood the log.
+pub fn sampled(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    count.is_power_of_two().then_some(count)
 }
 
 /// Writes the line with one `writeln!` under the stderr lock; split writes interleave across
@@ -334,6 +341,14 @@ mod tests {
         civil_from_days, event_code, fallback_event_code, human_line, json_escape, split_body,
         strip_event, Level, MESSAGE_SEPARATOR,
     };
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn sampled_keeps_powers_of_two() {
+        let counter = AtomicU64::new(0);
+        let logged: Vec<u64> = (0..20).filter_map(|_| super::sampled(&counter)).collect();
+        assert_eq!(logged, [1, 2, 4, 8, 16]);
+    }
 
     #[test]
     fn human_line_shows_the_message_before_the_fields_and_never_repeats_the_event() {

@@ -1,12 +1,6 @@
-/*!
- * @brief PXE 부팅용 TFTP 서버.
- *
- * @details 네트워크 부팅 클라이언트가 부트 이미지를 받아 가는 경로다. 인증이 없는 프로토콜이라
- *          내줄 것과 받을 것을 이쪽에서 좁혀야 한다.
- * @warning 파일 이름은 이름 한 조각만 받는다. 경로 구분자나 상위 참조가 들어오면 루트
- *          바깥을 읽고 쓴다. 게다가 디렉터리를 핸들로 붙들고 그 안에서만 여닫는다.
- *          경로 문자열로 다시 열면 검사와 사용 사이에 루트가 바뀌어 있을 수 있다.
- */
+//! TFTP server for PXE boot. The protocol has no authentication, so this side narrows what it
+//! serves and accepts: a file name is a single component, and every open goes through a handle on
+//! the root directory. Reopening by path would let the root change between check and use.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -16,58 +10,39 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use onetdns_core::log::sampled;
 use onetdns_core::IpNet;
 
-/** @brief 읽기 요청. */
 const OP_RRQ: u16 = 1;
-/** @brief 쓰기 요청. */
 const OP_WRQ: u16 = 2;
-/** @brief 데이터 블록. */
 const OP_DATA: u16 = 3;
-/** @brief 받았다는 응답. */
 const OP_ACK: u16 = 4;
-/** @brief 오류. */
 const OP_ERROR: u16 = 5;
-/** @brief 블록 하나의 크기. */
 const BLOCK: usize = 512;
 
-/**
- * @brief 확장 없이 옮길 수 있는 최대 크기.
- * @details 블록 번호가 16비트라 한 바퀴 돌면 앞의 블록과 구분되지 않는다. 그래서 순환하는
- *          지점 앞에서 끊는다.
- */
+/// Block numbers are 16 bits; a transfer stops before they wrap and become ambiguous.
 const MAX_CLASSIC_TRANSFER: u64 = (u16::MAX as u64) * (BLOCK as u64) - 1;
-/** @brief 받아들일 파일 크기 상한. */
 const MAX_WRITE: u64 = MAX_CLASSIC_TRANSFER;
-/** @brief 내줄 파일 크기 상한. */
 const MAX_READ: u64 = MAX_CLASSIC_TRANSFER;
-/** @brief 동시에 진행할 전송 수. */
 const MAX_TRANSFERS: usize = 16;
-/** @brief 임시 파일 이름이 겹치지 않게 하는 일련번호. */
+/// Keeps temporary file names unique.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/** @brief 전송이 끝나면 진행 수를 되돌린다. */
 struct TransferGuard(Arc<AtomicUsize>);
 
 impl Drop for TransferGuard {
-    /** @brief 진행 수를 하나 줄인다. */
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/**
- * @brief 서빙할 디렉터리를 핸들로 붙든 것.
- * @warning 경로 문자열이 아니라 핸들을 잡는다. 문자열로 매번 다시 열면 검사한 뒤
- *          사용하기 전에 그 경로가 다른 곳을 가리키게 바뀔 수 있다.
- */
+/// The served directory, held as a handle so the path cannot be swapped after the check.
 struct RootHandle {
-    /** @brief 서빙할 디렉터리 핸들. 경로 문자열이 아니라 핸들을 잡는다. */
     dir: File,
 }
 
 impl RootHandle {
-    /** @brief 디렉터리를 연다. 이어진 곳이거나 디렉터리가 아니면 거부한다. */
+    /// Refuses a symlink or a non-directory.
     fn open(root: &Path) -> std::io::Result<Self> {
         let canonical = root.canonicalize()?;
         let metadata = canonical.symlink_metadata()?;
@@ -86,10 +61,7 @@ impl RootHandle {
         Ok(Self { dir })
     }
 
-    /**
-     * @brief 이 디렉터리 안의 파일을 읽기로 연다.
-     * @warning 이어진 곳을 따라가지 않는다. 따라가면 루트 바깥의 파일이 그대로 나간다.
-     */
+    /// Does not follow symlinks, which could point outside the root.
     fn open_read(&self, name: &str) -> std::io::Result<File> {
         let name =
             safe_file_name(name).ok_or_else(|| std::io::Error::other("Unsafe TFTP file name"))?;
@@ -116,11 +88,7 @@ impl RootHandle {
         Ok(file)
     }
 
-    /**
-     * @brief 이 이름에 써도 되는지 확인한다.
-     * @warning 이미 있는 것이 일반 파일이 아니면 거부한다. 이어진 곳이면 그 끝의 파일을
-     *          덮어쓰게 된다.
-     */
+    /// Refuses an existing entry that is not a regular file: a symlink would overwrite its target.
     fn validate_final_name(&self, name: &str, allow_overwrite: bool) -> std::io::Result<()> {
         use std::ffi::CString;
         use std::os::fd::AsRawFd;
@@ -162,28 +130,20 @@ impl RootHandle {
     }
 }
 
-/**
- * @brief 임시 이름으로 받아 두었다가 마지막에 제 이름으로 옮기는 업로드.
- * @details 도중에 끊기면 임시 파일만 남고 원래 파일은 그대로다. 부트 이미지가 반쪽인
- *          채로 놓이면 그것으로 부팅하는 기계가 망가진다.
- */
+/// Received under a temporary name and renamed only when complete, so an interrupted upload never
+/// leaves a half boot image under the real name.
 struct TempUpload {
-    /** @brief 쓰고 있는 임시 파일. */
     file: Option<File>,
-    /** @brief 이 파일이 놓일 디렉터리. */
     root: Arc<RootHandle>,
-    /** @brief 임시 이름. */
     temp_name: String,
-    /** @brief 다 받고 나서 옮길 이름. */
     final_name: String,
-    /** @brief 이미 있는 파일을 덮어도 되는지. */
     allow_overwrite: bool,
-    /** @brief 제 이름으로 옮겼는지. 아니면 임시 파일을 지운다. */
+    /// Without a commit the temporary file is removed on drop.
     committed: bool,
 }
 
 impl TempUpload {
-    /** @brief 임시 파일을 만든다. 같은 이름이 이미 있으면 실패한다. */
+    /// Fails if the name already exists.
     fn create(root: Arc<RootHandle>, name: &str, allow_overwrite: bool) -> std::io::Result<Self> {
         let name =
             safe_file_name(name).ok_or_else(|| std::io::Error::other("Unsafe TFTP file name"))?;
@@ -223,18 +183,13 @@ impl TempUpload {
         })
     }
 
-    /** @brief 쓰고 있는 파일. */
     fn file_mut(&mut self) -> std::io::Result<&mut File> {
         self.file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Upload file is closed"))
     }
 
-    /**
-     * @brief 다 받은 것을 제 이름으로 옮긴다.
-     * @details 옮기기 직전에 대상 이름을 다시 확인한다. 받는 동안 그곳에 다른 것이
-     *          생겼을 수 있다.
-     */
+    /// Rechecks the target right before renaming; something may have appeared there meanwhile.
     fn commit(mut self) -> std::io::Result<()> {
         if let Some(file) = self.file.take() {
             file.sync_all()?;
@@ -263,7 +218,6 @@ impl TempUpload {
 }
 
 impl Drop for TempUpload {
-    /** @brief 옮기지 못했으면 임시 파일을 지운다. */
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -278,13 +232,9 @@ impl Drop for TempUpload {
     }
 }
 
-/**
- * @brief 임시 파일을 제 이름으로 옮긴다.
- * @warning 덮어쓰기를 허용하지 않았으면 대상이 없을 때만 성공해야 한다. 확인하고 옮기는
- *          두 단계로 나누면 그 사이에 생긴 파일을 덮는다.
- * @note 한 단계로 처리하는 방법이 플랫폼마다 다르다. 없으면 링크를 새로 만들고 원본을 지우는 방식을
- *       쓴다.
- */
+/// Without overwrite this must succeed only when the target is absent, in one step: checking and
+/// renaming separately would overwrite a file created in between. Platforms without such a rename
+/// link the new name and remove the temporary one.
 fn atomic_install(
     dirfd: std::os::fd::RawFd,
     temp: *const libc::c_char,
@@ -355,18 +305,12 @@ fn atomic_install(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 요청 종류. */
 pub enum Op {
-    /** @brief 파일을 받아 간다. */
     Read,
-    /** @brief 파일을 올린다. */
     Write,
 }
 
-/**
- * @brief 요청 패킷을 읽는다.
- * @return 요청 종류와 파일 이름. 형식이 어긋나면 사유.
- */
+/// The request kind and file name, or why the packet is malformed.
 pub fn parse_request(buf: &[u8]) -> Result<(Op, String), &'static str> {
     if buf.len() < 4 {
         return Err("Packet is too short");
@@ -405,7 +349,6 @@ pub fn parse_request(buf: &[u8]) -> Result<(Op, String), &'static str> {
     Ok((op, name.to_string()))
 }
 
-/** @brief 데이터 블록 패킷. */
 pub fn data_packet(block: u16, data: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + data.len());
     p.extend_from_slice(&OP_DATA.to_be_bytes());
@@ -414,7 +357,7 @@ pub fn data_packet(block: u16, data: &[u8]) -> Vec<u8> {
     p
 }
 
-/** @brief 오류 패킷. 메시지가 길면 글자 경계에서 자른다. */
+/// Cuts a long message at a character boundary.
 pub fn error_packet(code: u16, msg: &str) -> Vec<u8> {
     let mut end = msg.len().min(256);
     while end > 0 && !msg.is_char_boundary(end) {
@@ -429,7 +372,6 @@ pub fn error_packet(code: u16, msg: &str) -> Vec<u8> {
     p
 }
 
-/** @brief 받았다는 응답 패킷. */
 pub fn ack_packet(block: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(4);
     p.extend_from_slice(&OP_ACK.to_be_bytes());
@@ -437,7 +379,6 @@ pub fn ack_packet(block: u16) -> Vec<u8> {
     p
 }
 
-/** @brief 응답 패킷의 블록 번호. */
 fn parse_ack(buf: &[u8]) -> Option<u16> {
     if buf.len() == 4 && u16::from_be_bytes([buf[0], buf[1]]) == OP_ACK {
         Some(u16::from_be_bytes([buf[2], buf[3]]))
@@ -446,10 +387,7 @@ fn parse_ack(buf: &[u8]) -> Option<u16> {
     }
 }
 
-/**
- * @brief 이 이름을 그대로 써도 되는지.
- * @warning 경로 구분자와 상위 참조를 막는다. 막지 않으면 루트 바깥을 읽고 쓴다.
- */
+/// Refuses path separators and parent references, which would reach outside the root.
 fn safe_file_name(name: &str) -> Option<&str> {
     let name = name.trim();
     if name.is_empty()
@@ -465,10 +403,7 @@ fn safe_file_name(name: &str) -> Option<&str> {
     Some(name)
 }
 
-/**
- * @brief 파일 하나를 받는다.
- * @details 임시 이름으로 받고 끝까지 왔을 때만 제 이름으로 옮긴다. 상한을 넘으면 끊는다.
- */
+/// Stops at the size limit; only a complete upload is renamed into place.
 fn serve_write(
     sock: &UdpSocket,
     client: SocketAddr,
@@ -594,8 +529,9 @@ fn serve_write(
     }
 }
 
-/** @brief 파일 하나를 내보낸다. 응답이 없으면 몇 번 다시 보내고 그만둔다. */
+/// Gives up after a few retransmissions without an ACK.
 fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &AtomicBool) {
+    static ABORTED: AtomicU64 = AtomicU64::new(0);
     let mut block: u16 = 1;
     let mut buf = [0u8; BLOCK];
     loop {
@@ -605,7 +541,9 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
         let n = match file.read(&mut buf) {
             Ok(n) => n,
             Err(error) => {
-                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "Failed to read the boot file; aborted the transfer");
+                if let Some(count) = sampled(&ABORTED) {
+                    onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, count = count, %error, "Failed to read the boot file; aborted the transfer");
+                }
                 return;
             }
         };
@@ -616,7 +554,9 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
                 return;
             }
             if let Err(error) = sock.send_to(&pkt, client) {
-                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, %error, "Could not send a boot file block; aborted the transfer");
+                if let Some(count) = sampled(&ABORTED) {
+                    onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, count = count, %error, "Could not send a boot file block; aborted the transfer");
+                }
                 return;
             }
             let mut ack = [0u8; 64];
@@ -629,7 +569,9 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
             }
         }
         if !acked {
-            onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, "No response after five retries; aborted the transfer, so this device cannot finish network boot");
+            if let Some(count) = sampled(&ABORTED) {
+                onetdns_core::warn!(event = "tftp.read_aborted", %client, block = block, count = count, "No response after five retries; aborted the transfer, so this device cannot finish network boot");
+            }
             return;
         }
         if n < BLOCK {
@@ -646,11 +588,7 @@ fn serve_read(sock: &UdpSocket, client: SocketAddr, file: &mut File, shutdown: &
     }
 }
 
-/**
- * @brief TFTP 서버를 시작한다.
- * @details 요청마다 전송용 소켓을 따로 열어 그 자리에서 주고받는다. 쓰기는 허용한
- *          대역에서만 받는다.
- */
+/// Each request gets its own transfer socket. Writes are accepted only from `write_allow`.
 pub fn spawn_tftp(
     root: PathBuf,
     listen: SocketAddr,
@@ -696,7 +634,10 @@ pub fn spawn_tftp(
                 })
                 .is_err()
             {
-                onetdns_core::warn!(event = "tftp.busy", %client, limit = MAX_TRANSFERS, "Rejected a TFTP request because the concurrent transfer limit was reached");
+                static BUSY: AtomicU64 = AtomicU64::new(0);
+                if let Some(count) = sampled(&BUSY) {
+                    onetdns_core::warn!(event = "tftp.busy", %client, limit = MAX_TRANSFERS, count = count, "Rejected a TFTP request because the concurrent transfer limit was reached");
+                }
                 let _ = sock.send_to(&error_packet(0, "Server busy"), client);
                 continue;
             }
@@ -734,7 +675,10 @@ pub fn spawn_tftp(
                                 serve_read(&xfer, client, &mut file, &transfer_shutdown);
                             }
                             Err(error) => {
-                                onetdns_core::warn!(event = "tftp.read_rejected", %client, file = %name, %error, "Could not serve the requested boot file; this device will fail to network boot");
+                                static READ_REJECTED: AtomicU64 = AtomicU64::new(0);
+                                if let Some(count) = sampled(&READ_REJECTED) {
+                                    onetdns_core::warn!(event = "tftp.read_rejected", %client, file = %name, count = count, %error, "Could not serve the requested boot file; this device will fail to network boot");
+                                }
                                 let _ = xfer.send_to(&error_packet(1, "File not found"), client);
                             }
                         },
@@ -743,8 +687,11 @@ pub fn spawn_tftp(
                             let src_ok = write_allow.is_empty()
                                 || write_allow.iter().any(|n| n.contains(&client.ip()));
                             if !writable || !src_ok {
+                                static WRITE_REJECTED: AtomicU64 = AtomicU64::new(0);
                                 let reason = if writable { "source_not_allowed" } else { "write_disabled" };
-                                onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, reason = reason, "Rejected a TFTP write request that is not allowed");
+                                if let Some(count) = sampled(&WRITE_REJECTED) {
+                                    onetdns_core::warn!(event = "tftp.write_rejected", %client, file = %name, reason = reason, count = count, "Rejected a TFTP write request that is not allowed");
+                                }
                                 let _ = xfer.send_to(&error_packet(2, "Write not permitted"), client);
                             } else {
                                 match serve_write(
@@ -762,8 +709,11 @@ pub fn spawn_tftp(
                                         if error.kind()
                                             == std::io::ErrorKind::ConnectionAborted => {}
                                     Err(error) => {
+                                        static RECEIVE_FAILED: AtomicU64 = AtomicU64::new(0);
                                         let _ = xfer.send_to(&error_packet(2, "Access denied"), client);
-                                        onetdns_core::warn!(event = "tftp.receive_failed", %client, file = %name, %error, "Failed to receive TFTP file");
+                                        if let Some(count) = sampled(&RECEIVE_FAILED) {
+                                            onetdns_core::warn!(event = "tftp.receive_failed", %client, file = %name, count = count, %error, "Failed to receive TFTP file");
+                                        }
                                     }
                                 }
                             }
@@ -784,7 +734,7 @@ pub fn spawn_tftp(
     })
 }
 
-/** @brief 끝난 전송 스레드를 정리한다. 쌓이면 핸들이 계속 는다. */
+/// Joins finished transfer threads so their handles do not pile up.
 fn reap_transfers(transfers: &mut Vec<std::thread::JoinHandle<()>>) {
     let mut index = 0;
     while index < transfers.len() {
@@ -798,12 +748,10 @@ fn reap_transfers(transfers: &mut Vec<std::thread::JoinHandle<()>>) {
 }
 
 #[cfg(test)]
-/** @brief 패킷 형식과, 루트 고정 및 덮어쓰기 관문이 실제로 막는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 읽기와 쓰기 요청이 읽히는지. */
     fn parse_rrq_and_wrq() {
         let mut rrq = vec![0, OP_RRQ as u8];
         rrq.extend_from_slice(b"boot.bin\0octet\0");
@@ -819,14 +767,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답 패킷 형식. */
     fn ack_packet_format() {
         let a = ack_packet(5);
         assert_eq!(a, vec![0, OP_ACK as u8, 0, 5]);
     }
 
     #[test]
-    /** @brief 자료와 오류 패킷 형식. */
     fn data_and_error_packets() {
         let d = data_packet(7, b"abc");
         assert_eq!(&d[..4], &[0, OP_DATA as u8, 0, 7]);
@@ -837,7 +783,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트 경로가 도중에 바뀌어도 이전 디렉터리 안에서만 움직이는지. */
     fn dirfd_pins_root_against_ancestor_replacement() {
         use std::os::unix::fs::symlink;
 
@@ -881,7 +826,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용하지 않았으면 기존 파일을 덮지 않는지. */
     fn overwrite_gate_blocks_existing_file_unless_allowed() {
         let base = std::env::temp_dir().join(format!(
             "onetdns-tftp-overwrite-{}-{}",
@@ -916,7 +860,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동시에 같은 이름으로 올려도 하나만 성공하는지. 둘 다 성공하면 덮어쓴 것이다. */
     fn concurrent_commit_no_overwrite_only_one_wins() {
         let base = std::env::temp_dir().join(format!(
             "onetdns-tftp-race-{}-{}",
@@ -948,12 +891,10 @@ mod tests {
 }
 
 #[cfg(test)]
-/** @brief 망가진 바이트열에도 파서가 패닉하지 않는지. */
 mod fuzz_tests {
     use super::*;
 
     #[test]
-    /** @brief 어떤 바이트열이 와도 오류로 끝날 뿐 패닉하지 않는지. */
     fn request_parsing_never_panics_on_malformed_bytes() {
         use crate::fuzzutil::{havoc, Rng};
 
