@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 /// Concurrent connections per client, limited per address and per IPv6 /64. One IPv6 host usually
 /// holds a whole /64, so with only a per-address limit it could take every slot by changing
@@ -73,6 +73,16 @@ pub fn shrink_if_sparse<K: Eq + Hash, V>(map: &mut HashMap<K, V>) {
     let target = map.len().saturating_mul(2).saturating_add(1);
     if map.capacity() > target.saturating_mul(2) {
         map.shrink_to(target);
+    }
+}
+
+/// The network a per-client limit counts: an IPv4 address, or the /64 holding an IPv6 address,
+/// since one IPv6 host can change addresses within its /64. An IPv4-mapped address counts as its
+/// IPv4 address.
+pub fn client_network(ip: IpAddr) -> IpAddr {
+    match canonical(ip) {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 => v4,
     }
 }
 
@@ -149,6 +159,27 @@ mod tests {
         counts.remove(ip("2001:db8::1"));
         counts.remove(ip("192.0.2.1"));
         assert!(counts.is_empty() && counts.prefixes.is_empty());
+    }
+
+    #[test]
+    fn client_network_is_the_ipv4_address_or_the_ipv6_64() {
+        assert_eq!(
+            client_network(ip("2001:db8:1:2:aaaa::1")),
+            client_network(ip("2001:db8:1:2:bbbb::2"))
+        );
+        assert_eq!(
+            client_network(ip("2001:db8:1:2:aaaa::1")),
+            ip("2001:db8:1:2::")
+        );
+        assert_ne!(
+            client_network(ip("2001:db8:1:2::1")),
+            client_network(ip("2001:db8:1:3::1"))
+        );
+        assert_eq!(client_network(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+        assert_ne!(
+            client_network(ip("192.0.2.1")),
+            client_network(ip("192.0.2.2"))
+        );
     }
 
     #[test]
