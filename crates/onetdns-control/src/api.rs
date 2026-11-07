@@ -5705,6 +5705,17 @@ mod tests {
         })
     }
 
+    /// Retries the 503 that comes while other tests are hashing passwords; it does not consume
+    /// the setup code.
+    fn setup_request_eventually(st: &AppState, body: &str) -> String {
+        loop {
+            let response = setup_request(st, body);
+            if !response.starts_with("HTTP/1.1 503") {
+                return response;
+            }
+        }
+    }
+
     fn raw_control_request(request: &[u8]) -> String {
         let st = test_state("adm", "ro");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5777,7 +5788,7 @@ mod tests {
 
         let body =
             "{\"user\":\"owner\",\"password\":\"correct-horse-battery\",\"code\":\"test-setup-code\"}";
-        let first = setup_request(&st, body);
+        let first = setup_request_eventually(&st, body);
         assert!(
             first.starts_with("HTTP/1.1 200 OK"),
             "첫 계정 만들기가 실패함: {}",
@@ -7988,13 +7999,7 @@ mod tests {
             "설정 화면에 코드 파일 경로를 알려 주지 않음: {status}"
         );
 
-        // A 503 comes while another test is hashing a password; the code is not consumed then.
-        let response = loop {
-            let response = setup_request(&st, &body(TEST_SETUP_CODE));
-            if !response.starts_with("HTTP/1.1 503") {
-                break response;
-            }
-        };
+        let response = setup_request_eventually(&st, &body(TEST_SETUP_CODE));
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(*created.lock_recover(), 1);
         assert!(
