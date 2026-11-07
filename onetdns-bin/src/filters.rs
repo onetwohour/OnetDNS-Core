@@ -566,11 +566,11 @@ pub(crate) fn blocklist_host_resolver(cfg: &Config) -> http::HostResolver {
         BackendKind::Split => "Split resolution",
     };
     let backend = configured_backend(cfg);
-    cached_host_resolver(cfg.max_ttl, move |host, _timeout| {
+    cached_host_resolver(cfg.max_ttl, move |host, timeout| {
         let backend = backend
             .as_ref()
             .map_err(|error| format!("Cannot look up {host}: {error}"))?;
-        resolve_host_addresses(backend.as_ref(), host, source)
+        resolve_host_addresses(backend, host, source, timeout)
     })
 }
 
@@ -583,9 +583,10 @@ pub(crate) fn revocation_host_resolver(cfg: &Config) -> http::HostResolver {
     cached_host_resolver(cfg.max_ttl, move |host, timeout| {
         if servers.is_empty() {
             return resolve_host_addresses(
-                recursion.as_ref(),
+                &recursion,
                 host,
                 "The built-in recursive resolver",
+                timeout,
             );
         }
         onetdns_forward::resolve_via_bootstrap(host, &servers, timeout)
@@ -646,21 +647,46 @@ fn recursive_backend(cfg: &Config) -> Arc<dyn native::Resolver> {
     })
 }
 
+/// Asks for A and AAAA at once and stops at `timeout`, which can be shorter than the backend's
+/// own. A lookup still running then ends at the backend's timeout and its answer is dropped.
 fn resolve_host_addresses(
-    resolver: &dyn native::Resolver,
+    resolver: &Arc<dyn native::Resolver>,
     host: &str,
     source: &str,
+    timeout: Duration,
 ) -> Result<(Vec<IpAddr>, u32), String> {
     let name = onetdns_proto::Name::from_str(host)
         .map_err(|_| format!("Invalid host name in the URL: {host}"))?;
-    let mut addresses = Vec::new();
-    let mut ttl: Option<u32> = None;
-    for qtype in [
+    let deadline = std::time::Instant::now() + timeout;
+    let qtypes = [
         onetdns_proto::RecordType::A,
         onetdns_proto::RecordType::AAAA,
-    ] {
+    ];
+    let (sender, responses) = std::sync::mpsc::channel();
+    for qtype in qtypes {
         let query = onetdns_proto::Message::query(0, name.clone(), qtype);
-        let Some(response) = resolver.resolve(&query) else {
+        let resolver = Arc::clone(resolver);
+        let sender = sender.clone();
+        std::thread::Builder::new()
+            .name("host-lookup".into())
+            .spawn(move || {
+                let _ = sender.send(resolver.resolve(&query));
+            })
+            .map_err(|error| format!("Cannot look up {host}: {error}"))?;
+    }
+    drop(sender);
+    let mut addresses = Vec::new();
+    let mut ttl: Option<u32> = None;
+    let mut timed_out = false;
+    for _ in qtypes {
+        let response = onetdns_core::tcp::time_left(deadline)
+            .ok()
+            .and_then(|left| responses.recv_timeout(left).ok());
+        let Some(response) = response else {
+            timed_out = true;
+            break;
+        };
+        let Some(response) = response else {
             continue;
         };
         for answer in response.answers {
@@ -675,6 +701,9 @@ fn resolve_host_addresses(
     }
     addresses.sort();
     addresses.dedup();
+    if addresses.is_empty() && timed_out {
+        return Err(format!("{source} did not answer in time: {host}"));
+    }
     if addresses.is_empty() {
         return Err(format!("{source} could not resolve the host name: {host}"));
     }
@@ -1590,6 +1619,20 @@ mod tests {
             resolve("lists.example", Duration::from_secs(2)),
             Ok(vec![IpAddr::from([192, 0, 2, 7])])
         );
+    }
+
+    #[test]
+    fn blocklist_host_lookups_stop_at_the_callers_timeout() {
+        // Bound but never read, so queries go unanswered instead of being refused.
+        let upstream = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut config = Config::default();
+        config.upstream_urls = vec![format!("udp://{}", upstream.local_addr().unwrap())];
+        let resolve = blocklist_host_resolver(&config);
+        let started = std::time::Instant::now();
+        let result = resolve("lists.example", Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(2), "{result:?}");
+        assert!(result.unwrap_err().contains("did not answer in time"));
+        drop(upstream);
     }
 
     #[test]
