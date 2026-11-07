@@ -1,11 +1,5 @@
-/*!
- * @brief DHCPv4 서버.
- *
- * @details 주소를 나눠 주면서 이 서버를 DNS로 함께 알리고, 네트워크 부팅에 필요한 값도 담아
- *          보낸다. 임대와 고정 할당은 파일에 남겨 재시작해도 이어진다.
- * @warning 인증이 없는 프로토콜이다. 남의 임대를 가로채지 못하도록 요청한 주소의 임자와
- *          서버 식별자를 확인하고, 이 서버가 내주지 않은 주소는 확정하지 않는다.
- */
+//! DHCPv4 server. The protocol has no authentication, so a request never binds an address that
+//! another client owns or that this server did not hand out.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -13,30 +7,26 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/** @brief 옵션 구간의 시작을 알리는 고정 바이트. */
+/// The DHCP magic cookie, which starts the options.
 const MAGIC: [u8; 4] = [99, 130, 83, 99];
 
-/** @brief 옵션 앞 고정 구간의 길이. */
+/// Length of the fixed BOOTP header.
 const FIXED_LEN: usize = 236;
-/** @brief IPv4 전체 길이에서 최소 IP/UDP 헤더를 뺀 표준 UDP payload 상한. */
+/// Largest UDP payload a standard IPv4 datagram carries.
 const MAX_STANDARD_IPV4_UDP_PAYLOAD: usize = u16::MAX as usize - 20 - 8;
-/** @brief 표준 상한을 넘긴 데이터그램을 절단 prefix와 구별하는 수신 크기. */
+/// One byte over the limit, so an oversized datagram is seen as such instead of cut to fit.
 const DHCP4_RECV_CAPACITY: usize = MAX_STANDARD_IPV4_UDP_PAYLOAD + 1;
 const BROADCAST_FLAG: u16 = 0x8000;
-/** @brief BOOTP 고정 헤더의 서버 이름 필드. */
 const SNAME_RANGE: std::ops::Range<usize> = 44..108;
-/** @brief BOOTP 고정 헤더의 부트 파일 필드. */
 const FILE_RANGE: std::ops::Range<usize> = 108..236;
-/** @brief 읽어들일 저장 파일 크기 상한. */
 const MAX_PERSIST_FILE: u64 = 16 * 1024 * 1024;
-/** @brief 메모리와 저장 파일에 담을 상태 항목 수 상한. */
+/// Cap on entries held in memory and in the state files.
 const MAX_STATE_ENTRIES: usize = 100_000;
-/** @brief 임대 파일의 첫 줄. 형식이 다르면 읽지 않는다. */
+/// A lease file that does not start with this line is not read.
 const LEASE_HEADER: &str = "ONETDNS-DHCP4-LEASES-V1\n";
-/** @brief 고정 할당 파일의 첫 줄. */
 const RESERVATION_HEADER: &str = "ONETDNS-DHCP4-RESERVATIONS-V1\n";
 
-/** @brief wire의 infinity 임대를 내부에서도 만료되지 않는 시각으로 보존한다. */
+/// An infinite lease on the wire stays infinite here.
 fn lease_expiry(now: u64, lease: u32) -> u64 {
     if lease == u32::MAX {
         u64::MAX
@@ -45,7 +35,7 @@ fn lease_expiry(now: u64, lease: u32) -> u64 {
     }
 }
 
-/** @brief 크기 상한을 걸어 저장 파일을 읽는다. 못 읽으면 빈 상태로 시작한다. */
+/// On failure the pool starts empty.
 fn read_persist_text(path: &std::path::Path) -> Option<String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -94,56 +84,34 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/** @brief 서버를 찾는 요청. */
 pub const DISCOVER: u8 = 1;
-/** @brief 서버가 주소를 제안하는 응답. */
 pub const OFFER: u8 = 2;
-/** @brief 주소를 확정해 달라는 요청. */
 pub const REQUEST: u8 = 3;
-/** @brief 받은 주소가 이미 쓰이고 있다는 통지. */
 pub const DECLINE: u8 = 4;
-/** @brief 확정 응답. */
 pub const ACK: u8 = 5;
-/** @brief 거절 응답. */
 pub const NAK: u8 = 6;
-/** @brief 주소를 돌려주는 통지. */
 pub const RELEASE: u8 = 7;
 
-/** @brief 서브넷 마스크 옵션. */
 pub const OPT_SUBNET_MASK: u8 = 1;
-/** @brief 기본 경로 옵션. */
 pub const OPT_ROUTER: u8 = 3;
-/** @brief DNS 서버 목록 옵션. */
 pub const OPT_DNS: u8 = 6;
-/** @brief 클라이언트가 원하는 주소 옵션. */
 pub const OPT_REQUESTED_IP: u8 = 50;
-/** @brief 클라이언트 이름 옵션. */
 pub const OPT_HOSTNAME: u8 = 12;
-/** @brief 임대 기간 옵션. */
 pub const OPT_LEASE_TIME: u8 = 51;
-/** @brief file/sname 필드도 옵션으로 쓰는지 알리는 옵션. */
 const OPT_OVERLOAD: u8 = 52;
-/** @brief 메시지 종류 옵션. */
 pub const OPT_MSG_TYPE: u8 = 53;
-/** @brief 서버 식별 옵션. */
 pub const OPT_SERVER_ID: u8 = 54;
-/** @brief 클라이언트가 선택한 불투명 식별자 옵션. */
 pub const OPT_CLIENT_ID: u8 = 61;
-/** @brief 클라이언트가 짧은 이름 뒤에 붙일 도메인 옵션. */
 pub const OPT_DOMAIN_NAME: u8 = 15;
-/** @brief 네트워크 부팅 서버 이름 옵션. */
 pub const OPT_TFTP_SERVER_NAME: u8 = 66;
-/** @brief 부트 이미지 이름 옵션. */
 pub const OPT_BOOTFILE: u8 = 67;
-/** @brief 옵션 구간의 끝. */
 pub const OPT_END: u8 = 255;
 
-/** @brief 받은 길이가 표준 IPv4 UDP payload 안인지 판정한다. */
 fn standard_dhcp4_datagram_len(received: usize) -> Option<usize> {
     (received <= MAX_STANDARD_IPV4_UDP_PAYLOAD).then_some(received)
 }
 
-/** @brief 이 서버가 실제 소유해 처리하는 옵션의 연결 후 최대 길이. */
+/// Longest value, after joining fragments, of an option this server uses; `None` for the rest.
 fn retained_option_limit(code: u8) -> Option<usize> {
     match code {
         OPT_OVERLOAD | OPT_MSG_TYPE => Some(1),
@@ -153,7 +121,7 @@ fn retained_option_limit(code: u8) -> Option<usize> {
     }
 }
 
-/** @brief RFC 3396 조각 하나를 코드별 단일 소유 버퍼에 이어 붙인다. */
+/// Appends an RFC 3396 fragment to the single buffer kept per option code.
 fn append_option_fragment(
     options: &mut Vec<(u8, Vec<u8>)>,
     code: u8,
@@ -175,7 +143,7 @@ fn append_option_fragment(
     Some(())
 }
 
-/** @brief 옵션 필드 하나를 끝까지 검사하고 지원 값만 RFC 3396 순서로 소유한다. */
+/// Checks a whole option field and keeps only the supported options, in RFC 3396 order.
 fn scan_option_field(
     field: &[u8],
     allow_overload: bool,
@@ -208,7 +176,7 @@ fn scan_option_field(
     None
 }
 
-/** @brief 연결을 끝낸 뒤 각 지원 옵션의 RFC 길이를 검증한다. */
+/// Checks each kept option's length once its fragments are joined.
 fn retained_options_are_valid(options: &[(u8, Vec<u8>)]) -> bool {
     options.iter().all(|(code, value)| match *code {
         OPT_REQUESTED_IP | OPT_SERVER_ID => value.len() == 4,
@@ -221,37 +189,25 @@ fn retained_options_are_valid(options: &[(u8, Vec<u8>)]) -> bool {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 주고받는 메시지 하나. */
 pub struct DhcpMessage {
-    /** @brief 요청인지 응답인지. */
     pub op: u8,
-    /** @brief 거래 번호. 요청과 응답을 짝짓는다. */
     pub xid: u32,
-    /** @brief 방송으로 답해 달라는 등의 표시. */
     pub flags: u16,
-    /** @brief 클라이언트가 이미 잡은 주소. */
     pub ciaddr: Ipv4Addr,
-    /** @brief 이 서버가 주는 주소. */
     pub yiaddr: Ipv4Addr,
-    /** @brief 다음에 접속할 서버 주소. 네트워크 부팅에 쓴다. */
+    /// Next server, for network boot.
     pub siaddr: Ipv4Addr,
-    /** @brief 거쳐 온 중계 장치 주소. */
     pub giaddr: Ipv4Addr,
 
-    /** @brief 클라이언트 하드웨어 주소. */
     pub chaddr: [u8; 6],
-    /** @brief option 61의 불투명 클라이언트 식별자. 없으면 chaddr가 식별자다. */
+    /// Option 61. When absent, `chaddr` identifies the client.
     client_identifier: Option<std::sync::Arc<[u8]>>,
-    /** @brief 담긴 옵션들. */
     pub options: Vec<(u8, Vec<u8>)>,
 }
 
 impl DhcpMessage {
-    /**
-     * @brief 바이트열을 메시지로.
-     * @warning 옵션 길이가 남은 바이트를 넘으면 전체를 거부한다. 거기까지만 받아들이면
-     *          잘린 요청이 온전한 요청처럼 처리된다.
-     */
+    /// Rejects the whole message when an option runs past the end: accepting what came before
+    /// would treat a truncated request as complete.
     pub fn parse(buf: &[u8]) -> Option<DhcpMessage> {
         if buf.len() < FIXED_LEN + 4
             || buf.len() > MAX_STANDARD_IPV4_UDP_PAYLOAD
@@ -304,7 +260,6 @@ impl DhcpMessage {
         })
     }
 
-    /** @brief 메시지를 바이트열로. */
     pub fn encode(&self) -> Vec<u8> {
         let mut b = vec![0u8; FIXED_LEN];
         b[0] = self.op;
@@ -338,7 +293,6 @@ impl DhcpMessage {
         b
     }
 
-    /** @brief 이 옵션의 내용. */
     pub fn option(&self, code: u8) -> Option<&[u8]> {
         if code == OPT_CLIENT_ID {
             return self.client_identifier.as_deref();
@@ -349,13 +303,12 @@ impl DhcpMessage {
             .map(|(_, v)| v.as_slice())
     }
 
-    /** @brief 메시지 종류. */
     pub fn msg_type(&self) -> Option<u8> {
         let value = self.option(OPT_MSG_TYPE)?;
         (value.len() == 1).then_some(value[0])
     }
 
-    /** @brief 클라이언트가 알린 이름. */
+    /// Option 12 without control characters and whitespace.
     pub fn hostname(&self) -> Option<String> {
         let raw = self.option(OPT_HOSTNAME)?;
         let s: String = std::str::from_utf8(raw)
@@ -366,7 +319,6 @@ impl DhcpMessage {
         (!s.is_empty()).then_some(s)
     }
 
-    /** @brief option 61이 있으면 그것, 없으면 chaddr로 정한 단일 소유권 키. */
     fn client_identity(&self) -> ClientIdentity {
         match &self.client_identifier {
             Some(value) => ClientIdentity::Opaque(value.clone()),
@@ -375,7 +327,7 @@ impl DhcpMessage {
     }
 }
 
-/** @brief 서버 수신 경로에서는 BOOTREQUEST만 TLV 파서로 넘긴다. */
+/// Only BOOTREQUESTs reach the option parser.
 fn parse_client_request(buf: &[u8]) -> Option<DhcpMessage> {
     if buf.first().copied() != Some(1) {
         return None;
@@ -383,12 +335,11 @@ fn parse_client_request(buf: &[u8]) -> Option<DhcpMessage> {
     DhcpMessage::parse(buf)
 }
 
-/** @brief 옵션 내용을 주소 하나로. 길이가 맞아야 한다. */
 fn opt_ipv4(v: &[u8]) -> Option<Ipv4Addr> {
     (v.len() == 4).then(|| Ipv4Addr::new(v[0], v[1], v[2], v[3]))
 }
 
-/** @brief 공백 구분 영속 형식에 안전한 DHCP hostname인지. */
+/// Safe to store in the space-separated state files.
 pub fn valid_hostname(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 255
@@ -398,16 +349,16 @@ pub fn valid_hostname(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/** @brief DHCPv4 바인딩의 유일한 소유권 키. */
+/// The one key a DHCPv4 binding belongs to.
 pub enum ClientIdentity {
-    /** @brief option 61이 없을 때 쓰는 Ethernet chaddr. */
+    /// `chaddr`, used when option 61 is absent.
     Hardware([u8; 6]),
-    /** @brief option 61 전체를 해석하지 않고 보존한 값. */
+    /// Option 61, kept as received.
     Opaque(std::sync::Arc<[u8]>),
 }
 
 impl ClientIdentity {
-    /** @brief 저장·HA·관리 API가 공유하는 손실 없는 식별자 표기. */
+    /// Lossless form shared by the state files, HA and the management API.
     pub fn to_text(&self) -> String {
         match self {
             Self::Hardware(mac) => format!("mac:{}", mac_hex(mac)),
@@ -415,7 +366,6 @@ impl ClientIdentity {
         }
     }
 
-    /** @brief 저장·HA·관리 API의 식별자 표기를 읽는다. */
     pub fn from_text(text: &str) -> Option<Self> {
         if let Some(value) = text.strip_prefix("mac:") {
             return mac_from_hex(value).map(Self::Hardware);
@@ -427,7 +377,6 @@ impl ClientIdentity {
             .then(|| Self::Opaque(std::sync::Arc::from(bytes)))
     }
 
-    /** @brief MAC fallback 식별자라면 그 MAC. */
     pub fn hardware(&self) -> Option<[u8; 6]> {
         match self {
             Self::Hardware(mac) => Some(*mac),
@@ -437,130 +386,90 @@ impl ClientIdentity {
 }
 
 #[derive(Clone)]
-/** @brief 임대 하나. */
 struct Lease {
-    /** @brief 마지막으로 관측한 전송용 하드웨어 주소. */
+    /// Hardware address last seen for this client.
     mac: [u8; 6],
-    /** @brief 빌려준 주소. */
     ip: u32,
-    /** @brief 이 임대가 끝나는 시각. */
     expiry: u64,
-    /** @brief 클라이언트가 알린 이름. */
     hostname: Option<String>,
 }
 
-/** @brief 밖에 내보이는 임대 하나. */
 pub struct LeaseInfo {
-    /** @brief 임대 소유권을 정하는 option 61 또는 MAC fallback. */
     pub identity: ClientIdentity,
-    /** @brief 클라이언트 하드웨어 주소. */
     pub mac: [u8; 6],
-    /** @brief 빌려준 주소. */
     pub ip: Ipv4Addr,
-    /** @brief 이 임대가 끝나는 시각. */
     pub expiry_unix: u64,
-    /** @brief 클라이언트가 알린 이름. */
     pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-/** @brief 나눠 줄 범위와 함께 알릴 값들. */
 pub struct DhcpConfig {
-    /** @brief 이 서버의 주소. 응답에 서버 식별자로 담는다. */
+    /// Sent as the server identifier.
     pub server_ip: Ipv4Addr,
-    /** @brief 나눠 줄 범위의 시작. */
     pub range_start: Ipv4Addr,
-    /** @brief 나눠 줄 범위의 끝. */
     pub range_end: Ipv4Addr,
-    /** @brief 함께 알릴 서브넷 마스크. */
     pub subnet_mask: Ipv4Addr,
-    /** @brief 함께 알릴 기본 경로. */
     pub router: Ipv4Addr,
-    /** @brief 함께 알릴 DNS 서버. */
     pub dns: Vec<Ipv4Addr>,
-    /** @brief 임대 기간. */
     pub lease_secs: u32,
 
-    /** @brief 네트워크 부팅 서버 주소. */
     pub tftp_server: Option<Ipv4Addr>,
 
-    /** @brief 네트워크 부팅에 받아 갈 파일 이름. */
     pub boot_file: Option<String>,
 
-    /** @brief 클라이언트에 알릴 로컬 도메인. */
     pub domain_name: Option<String>,
 
-    /** @brief 임대 기록을 담아 둘 파일. */
     pub lease_file: Option<PathBuf>,
 
-    /** @brief 고정 할당을 담아 둘 파일. */
+    /// Where static assignments are saved.
     pub static_file: Option<PathBuf>,
 }
 
-/** @brief 고정 할당 하나. */
 pub struct ReservationInfo {
-    /** @brief 고정 할당을 적용할 클라이언트 식별자. */
     pub identity: ClientIdentity,
-    /** @brief 고정한 주소. */
     pub ip: Ipv4Addr,
-    /** @brief 함께 적어 둔 이름. */
     pub hostname: Option<String>,
 }
 
-/**
- * @brief 임대 기록.
- * @details 확정된 임대 말고도 제안해 둔 것과 거절당한 주소를 따로 잡는다. 제안만 하고
- *          아직 확정되지 않은 주소를 다른 클라이언트에 또 주면 안 된다.
- */
+/// Leases, plus offers not yet confirmed and declined addresses: an offered address must not go
+/// to another client before the offer expires.
 pub struct LeasePool {
-    /** @brief 나눠 줄 범위의 시작. */
     start: u32,
-    /** @brief 나눠 줄 범위의 끝. */
     end: u32,
-    /** @brief 임대 기간. */
     lease_secs: u32,
-    /** @brief 확정된 임대들. */
     leases: HashMap<ClientIdentity, Lease>,
-    /** @brief 임대 기록을 담아 둘 파일. */
     persist: Option<PathBuf>,
 
-    /** @brief 제안만 하고 아직 확정되지 않은 주소들. */
+    /// Offered but not yet confirmed: address, transaction ID, expiry.
     offers: HashMap<ClientIdentity, (u32, u32, u64)>,
 
-    /** @brief 이미 쓰이고 있다고 통지받아 잠시 뺀 주소들. */
+    /// Addresses a client reported in use, held back until the given time.
     declined: HashMap<u32, u64>,
 
-    /** @brief 고정 할당들. */
     reservations: HashMap<ClientIdentity, (u32, Option<String>)>,
-    /** @brief 주소별 임대·제안·거절·고정 할당 참조 수. 새 주소 선택이 기록을 복사하지 않게 한다. */
+    /// References per address from leases, offers, declines and static assignments, so picking a
+    /// free address does not copy the tables.
     address_use: HashMap<u32, u32>,
-    /** @brief 고정 할당을 담아 둘 파일. */
     static_persist: Option<PathBuf>,
 
-    /** @brief 이 서버의 서브넷 마스크. 고정 할당을 검사하는 데 쓴다. */
     subnet_mask: u32,
-    /** @brief 이 서버의 주소. */
     server_ip: u32,
-    /** @brief 관문 주소. */
     router: u32,
-    /** @brief 범위가 바닥났다고 이미 알렸는지. 요청마다 같은 경고를 되풀이하지 않으려는 것이다. */
+    /// Whether the exhausted-range warning was logged, so it is not repeated per request.
     exhausted: bool,
-    /** @brief 동적 상태 상한 도달을 이미 알렸는지. */
+    /// Whether reaching the dynamic state cap was logged.
     dynamic_limited: bool,
-    /** @brief 고정 할당 상한 도달을 이미 알렸는지. */
+    /// Whether reaching the static assignment cap was logged.
     reservations_limited: bool,
-    /** @brief 다음 새 주소 검색을 시작할 위치. */
+    /// Where the next free-address search starts.
     allocation_cursor: u32,
-    /** @brief 임대·제안·거절 주소 중 가장 이른 만료 시각. */
+    /// Earliest expiry among leases, offers and declines.
     next_expiry: u64,
 }
 
 impl LeasePool {
-    /**
-     * @brief 저장된 임대와 고정 할당을 읽어 기록을 만든다.
-     * @note 읽은 것을 지금 설정으로 다시 검사한다. 설정을 바꾼 뒤 이전 주소를 계속 내주면
-     *       그 주소는 어디에도 닿지 않는다.
-     */
+    /// Rechecks what it reads against the current config: an address from an old range reaches
+    /// nothing.
     pub fn new(cfg: &DhcpConfig) -> Self {
         let leases = cfg
             .lease_file
@@ -605,12 +514,9 @@ impl LeasePool {
         pool
     }
 
-    /**
-     * @brief 서비스를 재시작할 때 기록을 버리지 않고 새 설정에 맞춘다.
-     * @details 새 기록을 만들면 이미 나간 주소를 다른 기기에 또 준다. 새 고정 할당 파일이
-     *          있으면 읽고, 없으면 지금 고정 할당을 그 파일에 적는다.
-     * @return 새 고정 할당 파일을 읽지 못하면 실패. 이때 기록은 바뀌지 않는다.
-     */
+    /// Keeps the leases across a service restart: a new pool would hand out addresses already in
+    /// use. Reads the new static assignment file if it exists, else writes the current assignments
+    /// to it. On failure the pool is unchanged.
     pub fn reconfigure(&mut self, cfg: &DhcpConfig) -> Result<(), String> {
         if cfg.static_file != self.static_persist {
             if let Some(path) = cfg.static_file.as_deref() {
@@ -637,7 +543,7 @@ impl LeasePool {
         Ok(())
     }
 
-    /** @brief 입력 크기의 상태가 상한을 넘지 않게 하고 도달·회복을 한 번씩 알린다. */
+    /// Keeps state under its cap and logs reaching and leaving the cap once each.
     fn admit_state(limited: &mut bool, kind: &'static str, entries: usize) -> bool {
         if entries < MAX_STATE_ENTRIES {
             if std::mem::replace(limited, false) {
@@ -664,7 +570,7 @@ impl LeasePool {
         }
     }
 
-    /** @brief 임대·제안·거절 주소가 공유하는 원격 입력 예산의 현재 사용량. */
+    /// Leases, offers and declines share one budget for remote input.
     fn dynamic_entries(&self) -> usize {
         self.leases
             .len()
@@ -672,19 +578,17 @@ impl LeasePool {
             .saturating_add(self.declined.len())
     }
 
-    /** @brief 전이에서 먼저 사라질 항목을 제외한 뒤 동적 상태 한 슬롯을 예약한다. */
+    /// Reserves one dynamic slot, not counting the entries this transition removes.
     fn admit_dynamic_after_removing(&mut self, removing: usize) -> bool {
         let entries = self.dynamic_entries().saturating_sub(removing);
         Self::admit_state(&mut self.dynamic_limited, "dynamic", entries)
     }
 
-    /** @brief 주소 참조를 하나 늘린다. */
     fn occupy_in(address_use: &mut HashMap<u32, u32>, ip: u32) {
         let count = address_use.entry(ip).or_insert(0);
         *count = count.saturating_add(1);
     }
 
-    /** @brief 주소 참조를 하나 줄이고 마지막 참조면 인덱스에서 지운다. */
     fn vacate_in(address_use: &mut HashMap<u32, u32>, ip: u32) {
         let Some(count) = address_use.get_mut(&ip) else {
             return;
@@ -696,7 +600,7 @@ impl LeasePool {
         }
     }
 
-    /** @brief 같은 식별자가 이 주소를 가리키는 임대·제안·고정 할당 참조 수. */
+    /// How many of this client's leases, offers and static assignments point at `ip`.
     fn own_address_references(&self, identity: &ClientIdentity, ip: u32) -> u32 {
         u32::from(
             self.leases
@@ -715,24 +619,22 @@ impl LeasePool {
         ))
     }
 
-    /** @brief 호출자가 만료 정리를 끝낸 상태에서 같은 식별자 이외의 참조가 남는지. */
+    /// Expects the caller to have cleaned up expired state.
     fn address_used_by_other_inner(&self, identity: &ClientIdentity, ip: u32) -> bool {
         self.address_use.get(&ip).copied().unwrap_or(0) > self.own_address_references(identity, ip)
     }
 
-    /** @brief 만료 상태를 치운 뒤 이 클라이언트의 임대 기록이 남아 있는지. */
     fn has_record(&mut self, identity: &ClientIdentity) -> bool {
         self.cleanup_expired(crate::unix_now());
         self.leases.contains_key(identity)
     }
 
-    /** @brief 만료 상태를 치운 뒤 같은 식별자 이외의 주소 참조가 남는지. */
     fn address_used_by_other(&mut self, identity: &ClientIdentity, ip: u32) -> bool {
         self.cleanup_expired(crate::unix_now());
         self.address_used_by_other_inner(identity, ip)
     }
 
-    /** @brief 대량 만료·해제 뒤 희소해진 맵의 고수위 버킷을 기하급수적으로 줄인다. */
+    /// Shrinks a map left sparse by mass expiry or release.
     fn shrink_map_if_sparse<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
         let len = map.len();
         if len == 0 {
@@ -742,7 +644,6 @@ impl LeasePool {
         }
     }
 
-    /** @brief 현재 기록과 서비스 주소로 점유 인덱스와 다음 만료 시각을 다시 만든다. */
     fn rebuild_address_use(&mut self) {
         let mut address_use = HashMap::with_capacity(
             self.dynamic_entries()
@@ -779,7 +680,7 @@ impl LeasePool {
             .unwrap_or(u64::MAX);
     }
 
-    /** @brief 가장 이른 만료 전에는 O(1), 도달했을 때만 만료 상태를 한 번 걷어 낸다. */
+    /// Constant time until the earliest expiry; then sweeps expired state once.
     fn cleanup_expired(&mut self, now: u64) {
         if now < self.next_expiry {
             return;
@@ -820,7 +721,7 @@ impl LeasePool {
         Self::shrink_map_if_sparse(&mut self.address_use);
     }
 
-    /** @brief 점유 인덱스와 순환 커서만 보고 새 주소를 고른다. */
+    /// Picks a free address from the use index and a rotating cursor.
     fn pick_available(&mut self) -> Option<u32> {
         if self.start > self.end {
             return None;
@@ -849,11 +750,8 @@ impl LeasePool {
         None
     }
 
-    /**
-     * @brief 이 주소를 고정 할당해도 되는지.
-     * @warning 서브넷 밖, 망 주소, 방송 주소, 서버와 관문 주소는 막는다. 내주면 그
-     *          클라이언트는 통신을 못 하거나 망 전체를 흔든다.
-     */
+    /// Refuses addresses outside the subnet, the network and broadcast addresses, and the server
+    /// and gateway addresses: the client could not talk, or would disturb the whole network.
     fn validate_reservation_ip(&self, ip: u32) -> Result<(), String> {
         let net = self.server_ip & self.subnet_mask;
         let bcast = net | !self.subnet_mask;
@@ -878,10 +776,8 @@ impl LeasePool {
         Ok(())
     }
 
-    /**
-     * @brief 읽어들인 기록을 지금 설정으로 다시 거른다.
-     * @details 겹치는 고정 할당, 범위 밖 임대, 남의 고정 주소를 잡은 임대를 버린다.
-     */
+    /// Drops overlapping static assignments, leases outside the range, and leases on another
+    /// client's static address.
     fn revalidate_loaded_state(&mut self) {
         let now = crate::unix_now();
         let mut seen = std::collections::HashSet::new();
@@ -936,7 +832,6 @@ impl LeasePool {
         });
     }
 
-    /** @brief 제안한 주소를 잠시 잡아 둔다. */
     pub fn hold_offer(&mut self, identity: &ClientIdentity, xid: u32, ip: u32) -> bool {
         let now = crate::unix_now();
         self.cleanup_expired(now);
@@ -956,11 +851,8 @@ impl LeasePool {
         true
     }
 
-    /**
-     * @brief 이 확정 요청이 이 서버가 제안한 것과 맞는지 보고 잡아 둔 것을 푼다.
-     * @warning 거래 번호와 주소가 모두 맞아야 한다. 맞추지 않으면 다른 서버가 제안한
-     *          주소를 이 서버가 확정해 준다.
-     */
+    /// Both the transaction ID and the address must match; otherwise this server would confirm an
+    /// address another server offered.
     fn consume_offer(&mut self, identity: &ClientIdentity, xid: u32, ip: u32) -> bool {
         let now = crate::unix_now();
         self.cleanup_expired(now);
@@ -976,11 +868,7 @@ impl LeasePool {
         valid
     }
 
-    /**
-     * @brief 이미 쓰이고 있다는 통지를 받아 그 주소를 잠시 뺀다.
-     * @warning 그 주소의 임자만 통지할 수 있다. 아무나 받아 주면 통지 몇 번으로 범위
-     *          전체를 비워 버릴 수 있다.
-     */
+    /// Only the address's holder can decline it; otherwise a few messages would empty the range.
     pub fn decline(&mut self, identity: &ClientIdentity, ip: u32) {
         let now = crate::unix_now();
         self.cleanup_expired(now);
@@ -1016,11 +904,8 @@ impl LeasePool {
         }
     }
 
-    /**
-     * @brief 이 클라이언트에 줄 주소를 고른다.
-     * @details 고정 할당이 있으면 그것, 없으면 이미 잡은 것, 그것도 없으면 비어 있는
-     *          첫 주소. 제안 중이거나 거절당한 주소는 쓰지 않는다.
-     */
+    /// The static address, else the address already held, else the first free one. Offered and
+    /// declined addresses are skipped.
     pub fn allocate(&mut self, identity: &ClientIdentity) -> Option<u32> {
         if let Some((ip, _)) = self.reservations.get(identity) {
             return Some(*ip);
@@ -1056,23 +941,17 @@ impl LeasePool {
         picked
     }
 
-    /** @brief 이 클라이언트에 고정된 주소. */
     pub fn reservation_ip(&self, identity: &ClientIdentity) -> Option<u32> {
         self.reservations.get(identity).map(|(ip, _)| *ip)
     }
 
-    /** @brief 이 주소가 다른 클라이언트에 고정돼 있는지. */
     pub fn is_reserved_by_other(&self, ip: u32, identity: &ClientIdentity) -> bool {
         self.reservations
             .iter()
             .any(|(owner, (reserved, _))| *reserved == ip && owner != identity)
     }
 
-    /**
-     * @brief 고정 할당을 넣는다.
-     * @details 그 주소를 임시로 잡고 있던 다른 클라이언트의 임대는 걷는다. 걷지 않으면
-     *          같은 주소를 둘이 쓴다.
-     */
+    /// Removes another client's lease on that address; otherwise two clients share it.
     pub fn add_reservation(
         &mut self,
         identity: ClientIdentity,
@@ -1135,7 +1014,6 @@ impl LeasePool {
         Ok(())
     }
 
-    /** @brief 고정 할당을 지운다. */
     pub fn remove_reservation(&mut self, identity: &ClientIdentity) -> bool {
         if let Some((ip, _)) = self.reservations.remove(identity) {
             Self::vacate_in(&mut self.address_use, ip);
@@ -1148,7 +1026,6 @@ impl LeasePool {
         }
     }
 
-    /** @brief 고정 할당 목록. */
     pub fn reservations(&self) -> Vec<ReservationInfo> {
         let mut out: Vec<ReservationInfo> = self
             .reservations
@@ -1163,7 +1040,25 @@ impl LeasePool {
         out
     }
 
-    /** @brief 확정한 임대를 기록에 적고 저장한다. */
+    /// Lease names become DNS names, so a client cannot take one another client holds or an
+    /// operator reserved, nor one that other hosts look up to configure a proxy or a tunnel.
+    fn client_may_use(&self, identity: &ClientIdentity, name: &str, now: u64) -> bool {
+        const DISCOVERY_NAMES: [&str; 2] = ["wpad", "isatap"];
+        let held_by_other = |owner: &ClientIdentity, held: Option<&str>| {
+            owner != identity && held.is_some_and(|held| held.eq_ignore_ascii_case(name))
+        };
+        !DISCOVERY_NAMES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+            && !self
+                .reservations
+                .iter()
+                .any(|(owner, (_, held))| held_by_other(owner, held.as_deref()))
+            && !self.leases.iter().any(|(owner, lease)| {
+                lease.expiry > now && held_by_other(owner, lease.hostname.as_deref())
+            })
+    }
+
     pub fn commit(
         &mut self,
         identity: &ClientIdentity,
@@ -1177,17 +1072,21 @@ impl LeasePool {
         {
             return false;
         }
+        let now = crate::unix_now();
+        let previous = self
+            .leases
+            .get(identity)
+            .and_then(|lease| lease.hostname.clone());
         let hostname = self
             .reservations
             .get(identity)
             .and_then(|(_, reserved)| reserved.clone())
-            .or(hostname)
             .or_else(|| {
-                self.leases
-                    .get(identity)
-                    .and_then(|lease| lease.hostname.clone())
+                [hostname, previous]
+                    .into_iter()
+                    .flatten()
+                    .find(|name| self.client_may_use(identity, name, now))
             });
-        let now = crate::unix_now();
         self.cleanup_expired(now);
         if !self.leases.contains_key(identity) {
             let removing = usize::from(self.offers.contains_key(identity));
@@ -1220,7 +1119,7 @@ impl LeasePool {
         true
     }
 
-    /** @brief HA에서 받은 주소가 이 식별자에 안전하게 귀속될 수 있는지 검사한다. */
+    /// Whether an address received over HA can belong to this identity.
     fn validate_synced_lease_inner(
         &self,
         identity: &ClientIdentity,
@@ -1252,7 +1151,7 @@ impl LeasePool {
         Ok(())
     }
 
-    /** @brief HA 배치의 주소 소유권과 순서별 상태 예산을 반영 전에 검사한다. */
+    /// Checks a whole HA batch, address ownership and state budget, before applying any of it.
     pub fn validate_synced_batch(
         &mut self,
         entries: impl IntoIterator<Item = (ClientIdentity, u32, u64)>,
@@ -1288,7 +1187,7 @@ impl LeasePool {
         Ok(())
     }
 
-    /** @brief 밖에서 받은 임대를 넣는다. 이미 더 새 것이 있으면 넣지 않는다. */
+    /// Takes a lease from HA unless a newer one is already held.
     pub fn insert(
         &mut self,
         identity: &ClientIdentity,
@@ -1345,7 +1244,7 @@ impl LeasePool {
         true
     }
 
-    /** @brief 클라이언트가 실제로 잡은 주소만 기록에서 지운다. */
+    /// Removes the lease only when the client holds that address.
     pub fn release(&mut self, identity: &ClientIdentity, ip: u32) {
         if self
             .leases
@@ -1361,13 +1260,12 @@ impl LeasePool {
         }
     }
 
-    /** @brief 살아 있는 임대 수. */
     pub fn active(&self) -> usize {
         let now = crate::unix_now();
         self.leases.values().filter(|l| l.expiry > now).count()
     }
 
-    /** @brief 살아 있는 임대 목록. 대시보드가 쓴다. */
+    /// Live leases, by address. The dashboard shows them.
     pub fn snapshot(&self) -> Vec<LeaseInfo> {
         let now = crate::unix_now();
         let mut out: Vec<LeaseInfo> = self
@@ -1386,7 +1284,6 @@ impl LeasePool {
         out
     }
 
-    /** @brief 임대 기록을 원자적으로 교체해 저장한다. */
     pub fn save(&self) {
         let Some(path) = &self.persist else { return };
         let now = crate::unix_now();
@@ -1410,7 +1307,6 @@ impl LeasePool {
         }
     }
 
-    /** @brief 고정 할당을 원자적으로 교체해 저장한다. */
     fn save_static(&self) {
         let Some(path) = &self.static_persist else {
             return;
@@ -1430,12 +1326,8 @@ impl LeasePool {
     }
 }
 
-/**
- * @brief 고정 할당 파일을 읽는다.
- * @warning 운영자가 고치는 파일이라 어긋나면 읽지 않고 실패한다. 빈 기록으로 덮어쓰면
- *          운영자의 할당이 사라진다.
- * @return 파일이 없으면 빈 목록. 열거나 읽지 못하거나 형식이 어긋나면 그 이유.
- */
+/// Fails on any malformed line instead of skipping it: operators edit this file, and saving an
+/// empty table over it would erase their assignments. A missing file reads as empty.
 pub fn read_reservations(
     path: &std::path::Path,
 ) -> Result<HashMap<ClientIdentity, (u32, Option<String>)>, String> {
@@ -1507,12 +1399,10 @@ pub fn read_reservations(
     Ok(out)
 }
 
-/** @brief 하드웨어 주소를 16진 문자열로. */
 fn mac_hex(mac: &[u8; 6]) -> String {
     mac.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/** @brief 16진 문자열을 하드웨어 주소로. */
 fn mac_from_hex(s: &str) -> Option<[u8; 6]> {
     if s.len() != 12 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -1524,7 +1414,7 @@ fn mac_from_hex(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/** @brief 임의 바이트열을 손실 없는 소문자 16진수로. */
+/// Lossless lowercase hex.
 fn bytes_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
@@ -1535,7 +1425,7 @@ fn bytes_hex(bytes: &[u8]) -> String {
     out
 }
 
-/** @brief 최대 option 61 크기의 짝수 길이 16진수를 바이트열로. */
+/// Even-length hex up to the option 61 size.
 fn bytes_from_hex(text: &str) -> Option<Vec<u8>> {
     if !(4..=510).contains(&text.len())
         || text.len() % 2 != 0
@@ -1550,11 +1440,8 @@ fn bytes_from_hex(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/**
- * @brief 저장된 임대를 읽는다.
- * @warning 한 줄이라도 형식이 어긋나면 전체를 버린다. 반쯤 읽어 들이면 어떤 주소가
- *          이미 나갔는지 알 수 없어 같은 주소를 둘에게 준다.
- */
+/// Drops the whole file on any malformed line: a partial read loses which addresses are out,
+/// and the same address goes to two clients.
 fn load_leases(path: &std::path::Path) -> HashMap<ClientIdentity, Lease> {
     let mut out = HashMap::new();
     let mut seen_ips = std::collections::HashSet::new();
@@ -1632,7 +1519,7 @@ fn load_leases(path: &std::path::Path) -> HashMap<ClientIdentity, Lease> {
     out
 }
 
-/** @brief 상태 변경 전에 확정한 DHCPv4 클라이언트 동작. */
+/// What a client asked for, settled before any state changes.
 enum ClientAction {
     Discover,
     Request { target: Ipv4Addr, selecting: bool },
@@ -1640,7 +1527,7 @@ enum ClientAction {
     Release { target: Ipv4Addr },
 }
 
-/** @brief 없거나 정확히 4바이트인 IPv4 옵션만 구분한다. */
+/// `Some(None)` when absent, `None` when present but not 4 bytes.
 fn optional_ipv4_option(req: &DhcpMessage, code: u8) -> Option<Option<Ipv4Addr>> {
     match req.option(code) {
         Some(raw) => Some(Some(opt_ipv4(raw)?)),
@@ -1648,7 +1535,7 @@ fn optional_ipv4_option(req: &DhcpMessage, code: u8) -> Option<Option<Ipv4Addr>>
     }
 }
 
-/** @brief RFC 2131의 상태별 필드 조합을 상태 변경 전에 검증한다. */
+/// Checks the RFC 2131 field combination for each client state before any state changes.
 fn classify_client_action(req: &DhcpMessage, server_ip: Ipv4Addr) -> Option<ClientAction> {
     if req.flags & !BROADCAST_FLAG != 0
         || req.yiaddr != Ipv4Addr::UNSPECIFIED
@@ -1705,11 +1592,8 @@ fn classify_client_action(req: &DhcpMessage, server_ip: Ipv4Addr) -> Option<Clie
     }
 }
 
-/**
- * @brief 요청 하나를 처리해 응답을 만든다.
- * @warning 서버 식별자가 이 서버의 것이 아니면 끼어들지 않는다. 그리고 남이 잡은 주소나 남에게
- *          고정된 주소는 거절한다. 확정해 주면 같은 주소를 둘이 쓴다.
- */
+/// Stays out of requests for another server, and refuses addresses another client holds or has
+/// reserved; confirming them puts two clients on one address.
 pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Option<DhcpMessage> {
     let identity = req.client_identity();
     match classify_client_action(req, cfg.server_ip)? {
@@ -1748,13 +1632,11 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
                     Some(build_reply(req, NAK, Ipv4Addr::UNSPECIFIED, cfg))
                 }
             } else {
-                /*
-                 * 이 서버에 기록이 없는 클라이언트가 같은 망에서 이 서버의 범위 밖 주소를 요청하면
-                 * 같은 망의 다른 서버가 준 주소다. RFC 2131 은 기록이 없는 클라이언트에게 답하지
-                 * 말라고 정한다. NAK 를 보내면 그 기기가 쓰던 주소를 버린다. 이 서버 범위의 주소는
-                 * 이 서버가 맡으므로 NAK 로 거절하고, 망 밖의 주소는 잘못된 망이라는 뜻이므로 NAK 로
-                 * 알린다.
-                 */
+                // A client unknown here that asks for an address on this subnet but outside
+                // this pool got it from another server. RFC 2131 says not to answer clients
+                // without a record; a NAK would make it drop that address. Addresses in this
+                // pool are ours to refuse, and one off the subnet means the client moved
+                // networks: both get a NAK.
                 let outside_pool = want_u < pool.start || want_u > pool.end;
                 if !selecting
                     && outside_pool
@@ -1784,13 +1666,12 @@ pub fn handle(req: &DhcpMessage, pool: &mut LeasePool, cfg: &DhcpConfig) -> Opti
     }
 }
 
-/** @brief 이 서버가 맡은 서브넷의 주소인지. */
 fn in_served_subnet(ip: Ipv4Addr, cfg: &DhcpConfig) -> bool {
     let mask = u32::from(cfg.subnet_mask);
     u32::from(ip) & mask == u32::from(cfg.server_ip) & mask
 }
 
-/** @brief 응답 메시지를 만든다. 거절에는 설정 값을 담지 않는다. */
+/// Refusals carry no configuration values.
 fn build_reply(req: &DhcpMessage, mtype: u8, yiaddr: Ipv4Addr, cfg: &DhcpConfig) -> DhcpMessage {
     let mut options = vec![
         (OPT_MSG_TYPE, vec![mtype]),
@@ -1843,20 +1724,21 @@ fn build_reply(req: &DhcpMessage, mtype: u8, yiaddr: Ipv4Addr, cfg: &DhcpConfig)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief DHCP 응답이 일반 UDP 경로인지 초기 클라이언트 L2 직접 경로인지. */
+/// Whether a reply can go through the IP stack or needs a direct link-layer send.
 enum ReplyTarget {
-    /** @brief 커널 IP 계층으로 보내도 되는 목적지. */
     Udp(std::net::SocketAddr),
-    /** @brief IP가 아직 없는 클라이언트의 yiaddr와 Ethernet 목적지. */
-    InitialUnicast { ip: Ipv4Addr, mac: [u8; 6] },
+    /// A client with no address yet: its `yiaddr` and Ethernet destination.
+    InitialUnicast {
+        ip: Ipv4Addr,
+        mac: [u8; 6],
+    },
 }
 
-/** @brief Ethernet unicast 목적지로 쓸 수 있는 MAC인지. */
 fn unicast_mac(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
 }
 
-/** @brief 요청과 응답 엔벨로프를 보고 RFC 2131의 IP·L2 목적지를 함께 고른다. */
+/// Picks the RFC 2131 IP and link-layer destination from the request and the reply.
 fn reply_target(req: &DhcpMessage, reply: &DhcpMessage) -> ReplyTarget {
     if req.giaddr != Ipv4Addr::UNSPECIFIED {
         ReplyTarget::Udp(std::net::SocketAddr::from((req.giaddr, 67)))
@@ -1876,7 +1758,7 @@ fn reply_target(req: &DhcpMessage, reply: &DhcpMessage) -> ReplyTarget {
     }
 }
 
-/** @brief 초기 L2 유니캐스트가 불가능하면 RFC 2131이 허용한 방송으로 반드시 한 번 더 보낸다. */
+/// When the link-layer unicast fails, sends once more by broadcast, as RFC 2131 allows.
 fn send_initial_with_fallback<U, B>(unicast: U, broadcast: B) -> std::io::Result<bool>
 where
     U: FnOnce() -> std::io::Result<()>,
@@ -1890,11 +1772,8 @@ where
     }
 }
 
-/**
- * @brief 이 서버가 맡은 망에서 온 요청인지.
- * @details 중계된 요청은 중계기가 서버 주소로 직접 보내므로 들어온 인터페이스와 무관하다.
- *          들어온 인터페이스나 서버 인터페이스를 알 수 없으면 받는다.
- */
+/// Relayed requests come to the server address directly, whatever the interface. Accepts the
+/// request when either interface is unknown.
 fn from_served_link(giaddr: Ipv4Addr, arrival: Option<u32>, served: Option<u32>) -> bool {
     if giaddr != Ipv4Addr::UNSPECIFIED {
         return true;
@@ -1905,7 +1784,6 @@ fn from_served_link(giaddr: Ipv4Addr, arrival: Option<u32>, served: Option<u32>)
     }
 }
 
-/** @brief DHCP 서버를 시작한다. */
 pub fn spawn_dhcp(
     cfg: DhcpConfig,
     port: u16,
@@ -1938,7 +1816,8 @@ pub fn spawn_dhcp(
             };
             let Some(req) = parse_client_request(&buf[..n]) else { continue };
             if !from_served_link(req.giaddr, arrival, served) {
-                /* 인터페이스 번호는 인터페이스를 다시 만들면 바뀌므로 버리기 전에 한 번 다시 찾는다. */
+                // Interface indexes change when an interface is recreated, so look it up
+                // once more first.
                 served = crate::dhcp_l2::served_interface(cfg.server_ip);
                 if !from_served_link(req.giaddr, arrival, served) {
                     continue;
@@ -1985,11 +1864,9 @@ pub fn spawn_dhcp(
 }
 
 #[cfg(test)]
-/** @brief 임대 가로채기 방어, 고정 할당 규칙, 인코딩 왕복과 저장. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 설정. */
     fn cfg() -> DhcpConfig {
         DhcpConfig {
             server_ip: Ipv4Addr::new(192, 168, 1, 1),
@@ -2008,7 +1885,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DHCPv4 infinity 임대가 내부에서 유한한 만료 시각으로 바뀌지 않는지. */
     fn infinite_lease_stays_infinite_in_the_pool() {
         let mut c = cfg();
         c.lease_secs = u32::MAX;
@@ -2019,19 +1895,74 @@ mod tests {
         assert_eq!(pool.leases.get(&identity).unwrap().expiry, u64::MAX);
     }
 
-    /** @brief 큰 상태 상한 테스트에서 겹치지 않는 MAC을 만든다. */
+    fn name_of(pool: &LeasePool, identity: &ClientIdentity) -> Option<String> {
+        pool.leases
+            .get(identity)
+            .and_then(|lease| lease.hostname.clone())
+    }
+
+    #[test]
+    fn a_client_cannot_take_a_name_another_client_holds() {
+        let c = cfg();
+        let mut pool = LeasePool::new(&c);
+        let (owner, other) = (identity_for(1), identity_for(2));
+        assert!(pool.commit(
+            &owner,
+            mac_for(1),
+            u32::from(c.range_end),
+            Some("nas".into())
+        ));
+        // A lower address would win a lookup that goes by address order.
+        assert!(pool.commit(
+            &other,
+            mac_for(2),
+            u32::from(c.range_start),
+            Some("NAS".into())
+        ));
+        assert_eq!(name_of(&pool, &owner).as_deref(), Some("nas"));
+        assert_eq!(name_of(&pool, &other), None);
+
+        pool.release(&owner, u32::from(c.range_end));
+        assert!(pool.commit(
+            &other,
+            mac_for(2),
+            u32::from(c.range_start),
+            Some("nas".into())
+        ));
+        assert_eq!(name_of(&pool, &other).as_deref(), Some("nas"));
+    }
+
+    #[test]
+    fn a_client_cannot_take_a_reserved_name_or_a_proxy_discovery_name() {
+        let c = cfg();
+        let mut pool = LeasePool::new(&c);
+        pool.add_reservation(
+            identity_for(1),
+            u32::from(Ipv4Addr::new(192, 168, 1, 50)),
+            Some("printer".into()),
+        )
+        .unwrap();
+        for name in ["printer", "WPAD", "isatap"] {
+            assert!(pool.commit(
+                &identity_for(2),
+                mac_for(2),
+                u32::from(c.range_start),
+                Some(name.into()),
+            ));
+            assert_eq!(name_of(&pool, &identity_for(2)), None, "{name}");
+        }
+    }
+
     fn mac_for(index: usize) -> [u8; 6] {
         let bytes = (index as u64).to_be_bytes();
         [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]
     }
 
-    /** @brief option 61이 없는 테스트 클라이언트의 소유권 키. */
     fn identity_for(index: usize) -> ClientIdentity {
         ClientIdentity::Hardware(mac_for(index))
     }
 
     #[test]
-    /** @brief 네트워크 부팅에 필요한 값이 확정 응답에 담기는지. */
     fn pxe_boot_options_in_ack() {
         let mut c = cfg();
         c.tftp_server = Some(Ipv4Addr::new(192, 168, 1, 5));
@@ -2050,7 +1981,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료된 임대가 슬롯을 계속 차지하지 않는지. */
     fn allocate_prunes_expired_leases() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2073,7 +2003,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못 넓게 잡은 범위에서도 서버와 게이트웨이 주소를 내주지 않는지. */
     fn allocation_never_uses_server_or_router_address() {
         let mut c = cfg();
         c.range_start = Ipv4Addr::new(192, 168, 1, 1);
@@ -2088,7 +2017,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료 뒤 점유 인덱스의 공격 고수위 capacity까지 반환하는지. */
     fn address_index_releases_high_water_capacity_after_expiry() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2124,7 +2052,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 위조 식별자 수만큼 제안 상태가 상한 없이 늘지 않는지. */
     fn runtime_offer_state_has_a_hard_cardinality_limit() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2156,7 +2083,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 세 동적 맵이 상한 하나를 공유하고 기존 상태 전이는 계속되는지. */
     fn runtime_dynamic_state_has_one_shared_cardinality_limit() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2216,7 +2142,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 관리 API도 식별자 수만큼 고정 할당을 무제한 보관하지 않는지. */
     fn runtime_reservation_state_has_a_hard_cardinality_limit() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2242,7 +2167,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 꽉 찬 동적 예산에서도 임대에서 거절 주소로 안전하게 전이하는지. */
     fn decline_transition_stays_inside_shared_cardinality_limit() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2274,7 +2198,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp4_new_client_allocation_scaling -- --ignored --nocapture"]
-    /** @brief 새 클라이언트 주소 선택 비용이 기존 상태 크기에 비례하는지 측정한다. */
+    /// Measures whether picking an address for a new client scales with the state size.
     fn bench_dhcp4_new_client_allocation_scaling() {
         const OPS: usize = 256;
         const ROUNDS: usize = 6;
@@ -2317,7 +2241,6 @@ mod tests {
         }
     }
 
-    /** @brief 테스트용 탐색 요청. */
     fn discover(mac: [u8; 6]) -> DhcpMessage {
         DhcpMessage {
             op: 1,
@@ -2333,7 +2256,6 @@ mod tests {
         }
     }
 
-    /** @brief 테스트용 확정 요청. */
     fn request(mac: [u8; 6], ip: [u8; 4], server_id: Option<[u8; 4]>) -> DhcpMessage {
         let mut opts = vec![
             (OPT_MSG_TYPE, vec![REQUEST]),
@@ -2347,14 +2269,12 @@ mod tests {
         m
     }
 
-    /** @brief 실제 wire 파서를 거쳐 option 61을 요청에 담는다. */
     fn with_client_id(mut req: DhcpMessage, client_id: &[u8]) -> DhcpMessage {
         req.options.push((OPT_CLIENT_ID, client_id.to_vec()));
         DhcpMessage::parse(&req.encode()).expect("유효한 client identifier 요청")
     }
 
     #[test]
-    /** @brief RFC 2132 최소 길이보다 짧은 option 61을 무시하지 않고 거부하는지. */
     fn client_identifier_requires_type_and_value() {
         let mut req = discover([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 1]);
         req.options.push((OPT_CLIENT_ID, vec![1]));
@@ -2370,7 +2290,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 MAC이어도 서로 다른 option 61은 서로 다른 바인딩인지. */
     fn distinct_client_identifiers_on_one_mac_get_distinct_bindings() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2395,7 +2314,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 option 61은 chaddr가 바뀌어도 같은 바인딩을 찾는지. */
     fn one_client_identifier_across_macs_keeps_one_binding() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2428,7 +2346,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 MAC이라도 다른 option 61이 기존 임대를 RELEASE하지 못하는지. */
     fn release_uses_client_identifier_instead_of_mac() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2467,7 +2384,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 모순되는 DHCPREQUEST 상태 필드가 임대 기록을 바꾸지 않는지. */
     fn contradictory_client_state_fields_are_silently_discarded() {
         let c = cfg();
         let mac = [1, 2, 3, 4, 5, 6];
@@ -2508,7 +2424,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RELEASE가 이 서버의 server-id와 실제 임대 주소를 모두 증명해야만 임대를 지우는지. */
     fn release_requires_our_server_and_the_owned_client_address() {
         let c = cfg();
         let mac = [1, 2, 3, 4, 5, 6];
@@ -2537,7 +2452,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DECLINE이 선택한 서버와 제안 주소를 모두 가리킬 때만 격리되는지. */
     fn decline_requires_our_server_and_the_owned_requested_address() {
         let c = cfg();
         let mac = [1, 2, 3, 4, 5, 6];
@@ -2570,7 +2484,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당 클라이언트도 다른 주소를 요청하면 그 주소를 ACK하지 않는지. */
     fn reservation_does_not_override_a_conflicting_request_target() {
         let c = cfg();
         let mac = [1, 2, 3, 4, 5, 6];
@@ -2588,7 +2501,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기존 임대가 있어도 SELECTING REQUEST는 같은 xid의 OFFER를 대신할 수 없는지. */
     fn selecting_request_cannot_substitute_an_existing_lease_for_its_offer() {
         let c = cfg();
         let mac = [1, 2, 3, 4, 5, 6];
@@ -2606,7 +2518,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RFC 2131의 relay, ciaddr, broadcast bit, yiaddr, NAK 목적지를 모두 고정한다. */
     fn reply_ip_destination_follows_the_rfc_matrix() {
         let c = cfg();
         let mut req = discover([0x02, 2, 3, 4, 5, 6]);
@@ -2650,7 +2561,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소가 없는 초기 클라이언트의 clear broadcast bit를 일반 IP 유니캐스트로 낮추지 않는지. */
     fn initial_client_reply_requires_link_layer_delivery() {
         let c = cfg();
         let mac = [0x02, 0, 0, 0, 0, 1];
@@ -2668,7 +2578,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief L2 고정 또는 유니캐스트 전송이 실패하면 초기 클라이언트에 방송으로 답하는지. */
     fn initial_unicast_failure_falls_back_to_broadcast() {
         let attempts = std::cell::RefCell::new(Vec::new());
         let used_unicast = send_initial_with_fallback(
@@ -2691,7 +2600,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief L2 목적지로 쓸 수 없는 0·multicast MAC이면 곧장 방송 경로를 고르는지. */
     fn invalid_initial_client_mac_uses_broadcast() {
         let c = cfg();
         for mac in [[0; 6], [0x01, 0, 0, 0, 0, 1], [0xff; 6]] {
@@ -2706,7 +2614,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 갱신 ACK와 relay NAK가 RFC 2131의 고정 필드 계약을 보존하는지. */
     fn reply_envelope_preserves_ack_address_and_hardens_relay_nak() {
         let c = cfg();
         let mut req = request([1, 2, 3, 4, 5, 6], [192, 168, 1, 100], None);
@@ -2724,7 +2631,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 망의 다른 서버가 준 주소에는 답하지 않고, 망 밖의 주소와 기록이 있는 클라이언트에는 거절을 알리는지. */
+    /// An address from another server on this subnet gets no reply; one off the subnet, or a client
+    /// with a record here, gets a NAK.
     fn unknown_client_on_same_subnet_outside_pool_gets_no_reply() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2746,7 +2654,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중계되지 않은 요청은 서버 인터페이스로 들어온 것만 받는지. */
     fn requests_from_other_links_are_dropped() {
         let direct = Ipv4Addr::UNSPECIFIED;
         let relay = Ipv4Addr::new(10, 0, 0, 1);
@@ -2758,7 +2665,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 남이 잡은 주소를 달라면 거절하는지. 주면 같은 주소를 둘이 쓴다. */
+    /// Granting it would put two clients on one address.
     fn request_for_ip_leased_to_other_mac_is_nak() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2772,7 +2679,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 남의 제안 주소와 거절된 주소를 제안 없는 REQUEST가 가로채지 못하는지. */
     fn request_rejects_other_offer_and_declined_address() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2822,7 +2728,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp4_init_reboot_request_scaling -- --ignored --nocapture"]
-    /** @brief 제안 없는 REQUEST 주소 판정 비용이 전체 임대·고정 할당 수에 비례하는지 측정한다. */
+    /// Measures whether checking a REQUEST without an offer scales with the leases and assignments.
     fn bench_dhcp4_init_reboot_request_scaling() {
         const OPS: usize = 256;
         const ROUNDS: usize = 6;
@@ -2880,7 +2786,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 서버에 보낸 요청에 끼어들지 않는지. */
     fn request_with_foreign_server_id_is_ignored() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2903,7 +2808,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서브넷 밖과 특수 주소를 고정 할당하지 못하는지. */
     fn static_reservation_rejects_out_of_subnet_and_special() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -2928,7 +2832,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인코딩하고 되읽으면 같은지. */
     fn wire_roundtrip() {
         let m = discover([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
         let back = DhcpMessage::parse(&m.encode()).unwrap();
@@ -2938,7 +2841,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 1,500바이트 뒤 옵션과 END가 잘린 prefix만으로 상태를 바꾸지 않는지. */
     fn receive_capacity_covers_tail_option_validation() {
         assert_eq!(MAX_STANDARD_IPV4_UDP_PAYLOAD, 65_507);
         assert_eq!(DHCP4_RECV_CAPACITY, 65_508);
@@ -2959,7 +2861,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 64KiB unknown 옵션이 파서의 소유 엔트리 수를 증폭하지 않는지. */
     fn unknown_option_flood_is_ignored_without_storage_amplification() {
         let mut wire = discover([1, 2, 3, 4, 5, 6]).encode();
         assert_eq!(wire.pop(), Some(OPT_END));
@@ -2982,7 +2883,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp4_unknown_option_flood_parse -- --ignored --nocapture"]
-    /** @brief 64KiB unknown 옵션을 소유하지 않고 전체 검증하는 비용을 측정한다. */
+    /// Measures validating a 64 KiB unknown-option flood without keeping it.
     fn bench_dhcp4_unknown_option_flood_parse() {
         const OPS: usize = 64;
         const ROUNDS: usize = 12;
@@ -3012,7 +2913,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RFC 3396 조각을 options, file, sname 순서로 한 값으로 읽는지. */
     fn split_options_are_concatenated_in_aggregate_buffer_order() {
         const OPT_OVERLOAD_CODE: u8 = 52;
 
@@ -3046,7 +2946,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 길이 옵션과 hostname의 최종 연결 길이를 엄격히 검사하는지. */
     fn consumed_option_lengths_are_validated_after_concatenation() {
         for options in [
             vec![(OPT_MSG_TYPE, vec![DISCOVER, REQUEST])],
@@ -3072,7 +2971,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief END와 서버가 실제 지원하는 Ethernet 주소 형식이 필수인지. */
     fn request_header_and_end_marker_are_required() {
         let mut no_end = discover([1, 2, 3, 4, 5, 6]).encode();
         assert_eq!(no_end.pop(), Some(OPT_END));
@@ -3104,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 옵션이 전체를 거부되는지. 앞부분만 받아들이면 잘린 요청이 통과한다. */
+    /// Accepting the part before the bad option would let a truncated request through.
     fn malformed_option_is_rejected_instead_of_partially_applied() {
         let mut truncated = discover([1, 2, 3, 4, 5, 6]).encode();
         truncated.truncate(truncated.len() - 2);
@@ -3117,7 +3015,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 탐색에는 제안으로, 확정 요청에는 확정으로 답하는지. */
     fn discover_offers_request_acks() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3140,7 +3037,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제안과 어긋난 요청이 잡아 둔 주소를 풀지 못하는지. */
     fn mismatched_request_does_not_consume_offer() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3155,7 +3051,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 다른 주소를 주고, 다 쓰면 못 준다고 하는지. */
     fn pool_distinct_ips_and_exhaustion() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3182,7 +3077,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 범위 밖 주소 요청을 거절하는지. */
     fn out_of_range_request_naks() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3199,7 +3093,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트 이름이 읽히는지. */
     fn hostname_option_parsed() {
         let mut req = discover([1, 2, 3, 4, 5, 6]);
         req.options.push((OPT_HOSTNAME, b"my-laptop".to_vec()));
@@ -3218,7 +3111,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장했다 읽으면 같은 기록이 되는지. */
     fn persistence_roundtrip_and_snapshot() {
         let path =
             std::env::temp_dir().join(format!("onetdns-lease-persist-{}.txt", std::process::id()));
@@ -3258,7 +3150,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 하드웨어 주소 변환 왕복. */
     fn mac_hex_roundtrip() {
         let mac = [0x00, 0x1a, 0x2b, 0xff, 0xcc, 0x01];
         assert_eq!(mac_hex(&mac), "001a2bffcc01");
@@ -3267,7 +3158,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 관리·저장 식별자 표기가 손실 없이 왕복하고 MAC과 opaque ID가 섞이지 않는지. */
     fn client_identity_text_roundtrip_and_namespaces_are_distinct() {
         let hardware = ClientIdentity::from_text("mac:001a2bffcc01").unwrap();
         let opaque = ClientIdentity::from_text("id:001a2bffcc01").unwrap();
@@ -3280,7 +3170,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief opaque option 61 소유권과 마지막 chaddr가 임대 파일에서 함께 복원되는지. */
     fn opaque_client_identity_persistence_roundtrip() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-client-id-persist-{}-{}.txt",
@@ -3314,7 +3203,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 더 오래된 임대가 새 것을 덮지 않는지. */
     fn insert_takes_newer_only() {
         let mut pool = LeasePool::new(&cfg());
         let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
@@ -3342,7 +3230,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HA 임대가 동적 범위와 기존 주소 소유권을 우회하지 못하는지. */
     fn synced_lease_rejects_out_of_range_and_duplicate_ip() {
         let mut pool = LeasePool::new(&cfg());
         let now = crate::unix_now();
@@ -3368,7 +3255,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HA 배치가 상태 상한에서 앞 항목만 적용할 수 없도록 미리 거부하는지. */
     fn synced_batch_preflights_the_whole_state_budget() {
         let mut c = cfg();
         c.server_ip = Ipv4Addr::new(10, 0, 0, 1);
@@ -3411,7 +3297,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동적 범위 밖의 정상 고정 할당 임대는 재검사 뒤에도 유지되는지. */
     fn reserved_lease_outside_dynamic_range_survives_revalidation() {
         let mut pool = LeasePool::new(&cfg());
         let mac = [0xaa, 0, 0, 0, 0, 1];
@@ -3431,7 +3316,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 손상된 저장 파일에서 같은 IP를 두 식별자에 복원하지 않는지. */
     fn persisted_duplicate_ip_rejects_the_whole_lease_file() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-duplicate-lease-{}-{}.txt",
@@ -3456,7 +3340,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당이 제안과 확정 모두에서 지켜지는지. */
     fn reservation_honored_in_offer_and_request() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3483,7 +3366,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정된 주소를 다른 클라이언트에 주지 않는지. */
     fn dynamic_client_skips_reserved_ip() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3503,7 +3385,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 남에게 고정된 주소를 달라면 거절하는지. */
     fn other_client_requesting_reserved_ip_naks() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3523,7 +3404,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당을 넣을 때 겹치는 임대를 걷는지. */
     fn add_reservation_reclaims_conflicting_dynamic_lease() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3547,7 +3427,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당이 저장됐다 읽히는지. */
     fn reservation_persistence_roundtrip() {
         let path = std::env::temp_dir().join(format!("onetdns-static-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -3584,11 +3463,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서비스를 재시작해도 이미 나간 주소를 다른 기기에 주지 않는지.
-     * @details 임대 파일이 없는 설정에서 기록을 새로 만들면 첫 기기가 쓰는 주소가 다음 기기에
-     *          또 나간다.
-     */
+    /// Without a lease file, a fresh pool would hand the first device's address to the next one.
     fn reconfigure_keeps_issued_leases_without_a_lease_file() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3607,7 +3482,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 할당 파일을 바꾸면 그 파일의 할당을 읽고, 틀린 파일이면 기록을 두는지. */
     fn reconfigure_reads_the_new_reservation_file() {
         let path =
             std::env::temp_dir().join(format!("onetdns-static-switch-{}.txt", std::process::id()));
@@ -3641,7 +3515,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 갱신 요청에 이름이 빠져도 이름을 잃지 않고, 고정 할당의 이름이 앞서는지. */
     fn commit_keeps_hostname_and_prefers_the_reserved_one() {
         let c = cfg();
         let mut pool = LeasePool::new(&c);
@@ -3668,7 +3541,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 로컬 도메인과 네트워크 부팅 서버가 옵션 15와 66으로 담기는지. */
     fn ack_carries_domain_and_tftp_server_name() {
         let mut c = cfg();
         c.domain_name = Some("lan".into());
@@ -3683,7 +3555,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어떤 바이트열이 와도 파서가 패닉하지 않는지. */
     fn parse_never_panics_on_malformed_bytes() {
         use crate::fuzzutil::{havoc, Rng};
 
