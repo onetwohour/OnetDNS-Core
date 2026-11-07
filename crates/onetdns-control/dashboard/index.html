@@ -4638,6 +4638,10 @@ const DEDICATED_HOME = {
   track_rule_hits:'settings-quick', block_response:'settings-quick'
 };
 
+// 접속할 때 새 릴리스를 다시 확인하려면 마지막 확인에서 이만큼(초) 지나야 한다. 새로고침할 때마다
+// 확인하면 출발 주소당 요청 수가 제한된 GitHub API 를 그 한도까지 부를 수 있다.
+const UPDATE_VISIT_CHECK_AGE = 60*60;
+
 class Component extends DCLogic {
   seq = 1;
   qps = [];
@@ -5007,6 +5011,7 @@ class Component extends DCLogic {
     this._booted=true;
     this._socketClosed=false;
     Promise.allSettled([this.loadCollections()]);
+    this.loadUpdate().then(update=>this.checkUpdateOnVisit(update));
     this.loadDashboardFallback();
     this.openSocket();
   }
@@ -5256,7 +5261,7 @@ class Component extends DCLogic {
     return true;
   }
   async loadCollections(){
-    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit(),this.loadUpdate()];
+    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
     await Promise.allSettled(tasks);
     if(this.state.view==='operations')await this.loadOperations();
   }
@@ -5316,6 +5321,21 @@ class Component extends DCLogic {
     }finally{this._operationsLoading=false;}
   }
   async loadUpdate(){const r=await this.apiGet('/v1/system/update');if(!(r.ok&&r.body&&typeof r.body==='object'))return null;this.setState({update:r.body});return r.body;}
+  // 접속할 때 마지막 확인이 없거나 오래됐으면 새 릴리스를 확인한다. 확인은 관리자만 시작할 수 있다.
+  // 주기 확인을 끈 노드는 운영자가 시키지 않은 바깥 연결을 원하지 않으므로 여기서도 확인하지 않는다.
+  // 결과는 버튼으로 확인할 때와 달리 알림 없이 화면에만 반영한다.
+  async checkUpdateOnVisit(u){
+    if(!u||this.state.authRole!=='admin'||u.participating!==true||u.release_check===false||u.task||this._updateWatch)return;
+    const checkedAt=Number(u.checked_at);
+    if(checkedAt>0&&Date.now()/1000-checkedAt<UPDATE_VISIT_CHECK_AGE)return;
+    const r=await this.apiSend('/v1/system/update/check','POST');
+    const id=r.ok&&r.body?r.body.id:null;
+    if(id==null||this._updateWatch)return;
+    const watch={kind:'check',quiet:true};
+    this._updateWatch=watch;
+    this.setState({updateBusy:'check'});
+    await this.followUpdate(watch,id);
+  }
   goUpdate=()=>this.go('operations')();
   updateFailure(kind){return {check:this.t('업데이트를 확인하지 못했습니다'),apply:this.t('업데이트를 설치하지 못했습니다'),rollback:this.t('이전 버전으로 되돌리지 못했습니다')}[kind];}
   updateConfirmDetail(u){
@@ -5353,10 +5373,10 @@ class Component extends DCLogic {
       const job=r.ok&&r.body&&typeof r.body==='object'?r.body:null;
       if(job&&job.status==='running')continue;
       if(!job&&(r.status===0||r.status===408||r.status>=500)){if(watch.kind!=='check')restarting();continue;}
-      if(!job||job.status!=='done'){finish();this.loadUpdate();return this.toastMsg(this.updateFailure(watch.kind)+': '+(job?this.t(String(job.result||'')):this.errorText(r)),true);}
+      if(!job||job.status!=='done'){finish();this.loadUpdate();if(watch.quiet)return;return this.toastMsg(this.updateFailure(watch.kind)+': '+(job?this.t(String(job.result||'')):this.errorText(r)),true);}
       const after=await this.loadUpdate();
       if(this._updateWatch!==watch)return;
-      if(watch.kind==='check'){finish();return after?this.toastUpdateCheck(after):this.toastMsg(String(job.result||''));}
+      if(watch.kind==='check'){finish();if(watch.quiet)return;return after?this.toastUpdateCheck(after):this.toastMsg(String(job.result||''));}
       if(!after)continue;
       if(after.launch==='manual'){finish();const record=after.record&&typeof after.record==='object'?after.record:{};return this.toastMsg(this.tr('{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다',{version:String(record.to||'')}));}
       restarting();
