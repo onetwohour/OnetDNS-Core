@@ -1,31 +1,21 @@
-/*!
- * @brief 구조화 로깅.
- *
- * @details 모든 기록은 event= 코드를 갖는다. 사람이 읽는 문구는 바뀌지만 이벤트 코드는
- *          안정된 계약이라, 경보와 로그 수집이 문구 변경에 깨지지 않는다. 코드가 없는
- *          기록에는 모듈 경로에서 만든 대체 코드를 붙인다.
- */
+//! Structured logging. Every line carries an `event=` code: messages change, but the code is a
+//! stable contract that alerts and collectors match on. A line without one gets a code built
+//! from the module path.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/** @brief 로그 심각도. 값이 작을수록 심각하며 임계값 비교가 이 순서에 기댄다. */
+/// Lower is more severe; threshold checks rely on this order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    /** @brief 그대로 두면 서비스가 어긋난다. */
     Error = 0,
-    /** @brief 눈여겨봐야 한다. */
     Warn = 1,
-    /** @brief 평소에 남길 것. */
     Info = 2,
-    /** @brief 문제를 좇을 때만 남길 것. */
     Debug = 3,
-    /** @brief 아주 자세한 것. */
     Trace = 4,
 }
 
 impl Level {
-    /** @brief 출력에 쓰는 대문자 표기. */
     fn label(self) -> &'static str {
         match self {
             Level::Error => "ERROR",
@@ -37,24 +27,37 @@ impl Level {
     }
 }
 
-/**
- * @brief 필드와 사람이 읽을 문구를 구분하는 표식.
- * @details 값에 공백이 든 필드(경로 따위)가 있어도 문구가 잘리지 않게 매크로가 여기에
- *          넣는다. 출력에는 나가지 않는다.
- */
+/// Separates fields from the message, so a field value with spaces (a path, say) does not run
+/// into it. Never printed.
 pub const MESSAGE_SEPARATOR: char = '\u{1}';
 
-/** @brief 현재 로그 임계값. 이 값 이하 심각도만 출력한다. 무잠금으로 읽어야 핫패스가 안 눌린다. */
+/// Writes text with control characters escaped. Field values and messages carry outside input
+/// such as query names: a raw newline would forge a log line, a raw separator would move fields
+/// into the message, and an escape sequence would reach the operator's terminal.
+#[doc(hidden)]
+pub struct Escaped<'a>(pub &'a mut String);
+
+impl std::fmt::Write for Escaped<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        for ch in text.chars() {
+            if ch.is_control() {
+                write!(self.0, "\\x{:02x}", u32::from(ch))?;
+            } else {
+                self.0.push(ch);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Highest level printed. Read lock-free on the hot path.
 static THRESHOLD: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
-/** @brief 출력 형식. 0이면 사람이 읽는 한 줄, 1이면 JSON Lines다. */
+/// 0 for one human-readable line, 1 for JSON Lines.
 static FORMAT: AtomicU8 = AtomicU8::new(0);
 
-/**
- * @brief 환경 변수에서 로그 수준과 형식을 읽는다.
- * @details ONETDNS_LOG가 수준, ONETDNS_LOG_FORMAT이 json/jsonl이면 JSON 출력이다.
- *          알 수 없는 값은 기본값으로 바꾼다. 오타 하나로 시작이 막히지 않게 한다.
- */
+/// `ONETDNS_LOG` sets the level and `ONETDNS_LOG_FORMAT=json` (or `jsonl`) the format. Unknown
+/// values fall back to the defaults so a typo does not stop startup.
 pub fn init_from_env() {
     let v = std::env::var("ONETDNS_LOG")
         .unwrap_or_default()
@@ -76,11 +79,8 @@ pub fn init_from_env() {
     FORMAT.store(u8::from(format), Ordering::Relaxed);
 }
 
-/**
- * @brief 실행 중에 로그 수준을 바꾼다. 컨트롤 플레인이 호출한다.
- * @note 알 수 없는 문자열은 조용히 무시한다. 잘못된 입력으로 수준이 초기화되면 진단 중에
- *       보고 있던 로그가 갑자기 사라진다.
- */
+/// Ignores an unknown level: resetting it would drop the logs someone is reading while
+/// diagnosing.
 pub fn set_level_str(s: &str) {
     let lvl = match s.trim().to_ascii_lowercase().as_str() {
         "error" => Level::Error,
@@ -93,23 +93,14 @@ pub fn set_level_str(s: &str) {
     THRESHOLD.store(lvl as u8, Ordering::Relaxed);
 }
 
-/**
- * @brief 이 수준이 출력 대상인지.
- * @details 로그 매크로가 인자를 포맷하기 전에 이걸 본다. 꺼진 수준의 기록은 문자열
- *          조립 비용조차 들지 않는다.
- */
+/// Checked before any argument is formatted, so a disabled level costs nothing.
 #[inline]
 pub fn enabled(level: Level) -> bool {
     (level as u8) <= THRESHOLD.load(Ordering::Relaxed)
 }
 
-/**
- * @brief 완성된 기록 한 줄을 표준 오류로 내보낸다.
- *
- * @param target 모듈 경로. 본문에 event=가 없을 때 대체 코드의 재료가 된다.
- * @note 표준 오류를 잠근 채 한 번의 writeln!으로 쓴다. 여러 번 쪼개 쓰면 스레드끼리
- *       줄이 섞인다.
- */
+/// Writes the line with one `writeln!` under the stderr lock; split writes interleave across
+/// threads. `target` builds the fallback event code.
 pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body: &str) {
     let timestamp = utc_timestamp();
     let body = body.trim_end();
@@ -149,13 +140,7 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
     }
 }
 
-/**
- * @brief 본문을 필드와 사람이 읽을 문구로 구분한다.
- *
- * @details 매크로가 넣은 표식으로 나눈다. 공백으로 나누면 값에 공백이 든 필드(경로 따위)의
- *          뒷부분이 문구로 넘어간다.
- * @return (필드, 문구). 표식이 없으면 전부 문구로 본다. 매크로를 거치지 않고 부른 경우다.
- */
+/// Splits at the separator the macro wrote; without one the whole body is the message.
 fn split_body(body: &str) -> (&str, &str) {
     match body.find(MESSAGE_SEPARATOR) {
         Some(at) => (
@@ -166,11 +151,7 @@ fn split_body(body: &str) -> (&str, &str) {
     }
 }
 
-/**
- * @brief 필드에서 event= 하나를 걷어낸다.
- * @details event는 줄 앞자리에 따로 찍으므로, 남겨 두면 같은 값이 한 줄에 두 번 나온다.
- * @param code 본문에서 실제로 뽑힌 코드. 없으면 그대로 둔다.
- */
+/// The event is printed at the front of the line, so the field would repeat it.
 fn strip_event<'a>(fields: &'a str, code: Option<&str>) -> std::borrow::Cow<'a, str> {
     match code {
         Some(code) => std::borrow::Cow::Owned(
@@ -183,15 +164,8 @@ fn strip_event<'a>(fields: &'a str, code: Option<&str>) -> std::borrow::Cow<'a, 
     }
 }
 
-/**
- * @brief 사람이 읽을 한 줄을 만든다.
- *
- * @details 순서는 「언제·얼마나 심각한지·무슨 일인지·무슨 뜻인지·자세한 값」이다. 문구를
- *          필드 뒤에 두면 화면 오른쪽 끝에서 잘려 정작 읽어야 할 것이 안 보인다.
- * @note target, pid, 소스 위치, 스레드 이름은 넣지 않는다. 운영자가 읽는 줄에는 쓸모가 없고
- *       읽는 것을 방해하기만 한다. 수집기가 볼 JSON 쪽에는 그대로 있다.
- * @return 줄바꿈 없는 한 줄. 호출자가 한 번의 writeln으로 내보내야 스레드끼리 섞이지 않는다.
- */
+/// Time, level, event, message, then fields: a message after the fields is cut off at the
+/// right edge of the screen. Target, pid, source and thread go to JSON only.
 fn human_line(timestamp: &str, level: Level, event: &str, message: &str, fields: &str) -> String {
     use std::fmt::Write as _;
     let mut out =
@@ -206,18 +180,14 @@ fn human_line(timestamp: &str, level: Level, event: &str, message: &str, fields:
     out
 }
 
-/** @brief 본문에서 event= 필드 값을 추출한다. 빈 값은 없는 것으로 본다. */
+/// An empty value counts as none.
 fn event_code(body: &str) -> Option<&str> {
     body.split_ascii_whitespace()
         .find_map(|field| field.strip_prefix("event="))
         .filter(|value| !value.is_empty())
 }
 
-/**
- * @brief event=가 없는 기록에 붙일 대체 코드를 만든다.
- * @details 모듈 경로의 구분자를 점으로 접고 수준을 덧붙인다. 결과가 안정적이어야 수집기가
- *          이 코드로 규칙을 걸 수 있다.
- */
+/// Collectors match on this code, so it must stay stable for a module.
 fn fallback_event_code(target: &str, level: Level) -> String {
     let mut event = String::with_capacity(target.len() + 8);
     for ch in target.chars() {
@@ -238,11 +208,7 @@ fn fallback_event_code(target: &str, level: Level) -> String {
     event
 }
 
-/**
- * @brief JSON 문자열 값으로 이스케이프한다.
- * @warning 로그 본문에는 질의 이름 같은 외부 입력이 섞인다. 이스케이프를 빠뜨리면 그 입력이
- *          JSON 구조를 깨뜨려 로그 위조가 가능해진다. 제어문자까지 \uXXXX로 바꾼다.
- */
+/// Escapes quotes, backslashes and C0 controls so outside input in the body cannot break the JSON.
 fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for ch in value.chars() {
@@ -262,7 +228,7 @@ fn json_escape(value: &str) -> String {
     out
 }
 
-/** @brief 밀리초까지 담은 ISO 8601 UTC 시각. */
+/// ISO 8601 UTC with milliseconds.
 fn utc_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
@@ -277,11 +243,8 @@ fn utc_timestamp() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
 }
 
-/**
- * @brief 유닉스 epoch 이후 일수를 (년, 월, 일)로 바꾼다.
- * @details 3월을 해의 시작으로 잡는 시대(era) 기반 변환이라, 윤년 보정이 2월을 마지막 달로
- *          밀어내 분기 없이 처리된다.
- */
+/// Days since the Unix epoch to (year, month, day). Starting the year in March puts the leap
+/// day last, so no branch is needed.
 fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
@@ -296,10 +259,8 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
-/**
- * @brief 수준을 지정해 기록한다. 다른 로그 매크로가 전부 이걸 거친다.
- * @details 임계값 확인이 본문 조립보다 먼저다. 꺼진 수준에서는 인자 평가조차 일어나지 않는다.
- */
+/// Every log macro goes through this. The threshold check comes first, so a disabled level
+/// does not even evaluate its arguments.
 #[macro_export]
 macro_rules! log_at {
     ($lvl:expr, $($rest:tt)+) => {{
@@ -317,62 +278,57 @@ macro_rules! log_at {
     }};
 }
 
-/**
- * @brief 키=값 필드를 본문에 이어 붙인다. 마지막 인자는 사람이 읽을 문구다.
- * @details %는 Display, ?는 Debug로 쓴다. 이름만 준 경우 변수명이 그대로 키가 된다.
- */
+/// `key = %value` uses Display, `key = ?value` Debug, and a bare name becomes its own key. The
+/// last argument is the message.
 #[macro_export]
 macro_rules! log_fields {
     ($m:ident, $k:ident = %$v:expr, $($rest:tt)+) => {{
         use ::std::fmt::Write as _;
-        let _ = write!($m, concat!(stringify!($k), "={} "), $v);
+        let _ = write!($crate::log::Escaped(&mut $m), concat!(stringify!($k), "={} "), $v);
         $crate::log_fields!($m, $($rest)+);
     }};
     ($m:ident, $k:ident = ?$v:expr, $($rest:tt)+) => {{
         use ::std::fmt::Write as _;
-        let _ = write!($m, concat!(stringify!($k), "={:?} "), $v);
+        let _ = write!($crate::log::Escaped(&mut $m), concat!(stringify!($k), "={:?} "), $v);
         $crate::log_fields!($m, $($rest)+);
     }};
     ($m:ident, $k:ident = $v:expr, $($rest:tt)+) => {{
         use ::std::fmt::Write as _;
-        let _ = write!($m, concat!(stringify!($k), "={} "), $v);
+        let _ = write!($crate::log::Escaped(&mut $m), concat!(stringify!($k), "={} "), $v);
         $crate::log_fields!($m, $($rest)+);
     }};
     ($m:ident, %$v:ident, $($rest:tt)+) => {{
         use ::std::fmt::Write as _;
-        let _ = write!($m, concat!(stringify!($v), "={} "), $v);
+        let _ = write!($crate::log::Escaped(&mut $m), concat!(stringify!($v), "={} "), $v);
         $crate::log_fields!($m, $($rest)+);
     }};
     ($m:ident, $v:ident, $($rest:tt)+) => {{
         use ::std::fmt::Write as _;
-        let _ = write!($m, concat!(stringify!($v), "={} "), $v);
+        let _ = write!($crate::log::Escaped(&mut $m), concat!(stringify!($v), "={} "), $v);
         $crate::log_fields!($m, $($rest)+);
     }};
     ($m:ident, $($msg:tt)+) => {{
         use ::std::fmt::Write as _;
         let _ = $m.write_char($crate::log::MESSAGE_SEPARATOR);
-        let _ = write!($m, $($msg)+);
+        let _ = write!($crate::log::Escaped(&mut $m), $($msg)+);
     }};
 }
 
-/** @brief 오류 기록. 운영자 개입이 필요한 이벤트에만 쓴다. */
+/// For events that need an operator.
 #[macro_export]
 macro_rules! error { ($($a:tt)+) => { $crate::log_at!($crate::log::Level::Error, $($a)+) }; }
-/** @brief 경고 기록. 동작은 계속되지만 주의가 필요한 상태다. */
 #[macro_export]
 macro_rules! warn  { ($($a:tt)+) => { $crate::log_at!($crate::log::Level::Warn,  $($a)+) }; }
-/** @brief 정보 기록. 기본 수준이므로 질의마다 남기면 안 된다. */
+/// The default level: never once per query.
 #[macro_export]
 macro_rules! info  { ($($a:tt)+) => { $crate::log_at!($crate::log::Level::Info,  $($a)+) }; }
-/** @brief 디버그 기록. */
 #[macro_export]
 macro_rules! debug { ($($a:tt)+) => { $crate::log_at!($crate::log::Level::Debug, $($a)+) }; }
-/** @brief 추적 기록. 질의 단위 상세 진단용이다. */
+/// Per-query diagnostics.
 #[macro_export]
 macro_rules! trace { ($($a:tt)+) => { $crate::log_at!($crate::log::Level::Trace, $($a)+) }; }
 
 #[cfg(test)]
-/** @brief 날짜 계산, 문자 감싸기, 그리고 이벤트 코드가 기계로 읽히는지. */
 mod tests {
     use super::{
         civil_from_days, event_code, fallback_event_code, human_line, json_escape, split_body,
@@ -380,7 +336,6 @@ mod tests {
     };
 
     #[test]
-    /** @brief 사람이 읽는 줄에 event가 두 번 나오지 않고 문구가 앞에 오는지. */
     fn human_line_shows_the_message_before_the_fields_and_never_repeats_the_event() {
         let body = format!(
             "event=do53.started addr=127.0.0.1:53 udp=true{MESSAGE_SEPARATOR}Listening for plain DNS"
@@ -407,7 +362,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 값에 공백이 있어도 문구가 잘리지 않는지. */
     fn a_field_value_with_spaces_does_not_leak_into_the_message() {
         let body = format!(
             "event=cert.loaded path=C:\\Program Files\\onetdns\\a.pem{MESSAGE_SEPARATOR}인증서를 읽었습니다"
@@ -421,7 +375,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경고 줄도 문구와 값에서 끝나고 소스 위치나 스레드 이름을 붙이지 않는지. */
     fn warnings_end_with_the_fields() {
         let line = human_line(
             "2026-08-02T00:00:00.000Z",
@@ -437,7 +390,20 @@ mod tests {
     }
 
     #[test]
-    /** @brief 날짜 계산이 알려진 날과 맞는지. */
+    fn outside_input_cannot_forge_a_line_or_move_fields_into_the_message() {
+        let name = "a\n2026-08-02T00:00:00.000Z ERROR  forged\u{1}x\u{1b}[2J\u{9b}.";
+        let mut body = String::new();
+        crate::log_fields!(body, event = "xfr.refused", zone = %name, "Refused {}", name);
+        let (fields, message) = split_body(&body);
+        let fields = strip_event(fields, event_code(&body));
+        let line = human_line("t", Level::Warn, "xfr.refused", message, &fields);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        let escaped = "a\\x0a2026-08-02T00:00:00.000Z ERROR  forged\\x01x\\x1b[2J\\x9b.";
+        assert_eq!(message, format!("Refused {escaped}"));
+        assert_eq!(fields.as_ref(), format!("zone={escaped}"));
+    }
+
+    #[test]
     fn civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(10_957), (2000, 1, 1));
@@ -447,13 +413,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 로그 값이 감싸져 형식을 깨지 않는지. */
     fn json_log_values_are_escaped() {
         assert_eq!(json_escape("a\"b\\c\n"), "a\\\"b\\\\c\\n");
     }
 
     #[test]
-    /** @brief 로그에서 이벤트 코드가 뽑히는지. */
     fn structured_event_code_is_extracted() {
         assert_eq!(
             event_code("event=config.applied count=2 설정 적용"),
@@ -463,7 +427,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 코드를 안 적은 로그도 기계로 가를 수 있는 값을 갖는지. */
     fn fallback_event_code_is_stable_and_machine_readable() {
         assert_eq!(
             fallback_event_code("onetdns_control::metrics", Level::Warn),
