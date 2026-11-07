@@ -811,11 +811,11 @@ mod limit_tests {
         let mut proxied = limiter.try_acquire("192.0.2.2".parse().unwrap()).unwrap();
         assert!(
             !proxied.reassign_ip("2001:db8::6".parse().unwrap()),
-            "PROXY 헤더로 알린 주소도 /64 한도를 지켜야 합니다"
+            "an address announced in a PROXY header must respect the /64 limit"
         );
         assert!(
             limiter.try_acquire("192.0.2.2".parse().unwrap()).is_some(),
-            "거절된 이전은 원래 주소의 몫을 그대로 둬야 합니다"
+            "a refused reassignment must keep the original address's share"
         );
         assert!(proxied.reassign_ip("2001:db8:0:1::1".parse().unwrap()));
         drop((held, proxied));
