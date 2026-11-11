@@ -337,12 +337,17 @@ fn is_state_changing_request(method: &str, path: &str) -> bool {
 /// consensus orders them itself, and locking would make proposals block each other. Self-update
 /// is exempt: it changes no config and only starts a job on this node, and the updater runs
 /// those one at a time. Adding a blocklist is exempt so its download does not block every other
-/// change; the handler locks and routes through the cluster around the save itself.
+/// change; the handler locks and routes through the cluster around the save itself. Refreshing
+/// one list changes no config either, and the list refresh lock orders it.
 fn requires_control_mutation_lock(method: &str, path: &str) -> bool {
     is_state_changing_request(method, path)
         && path != "/v1/cluster/propose"
         && !path.starts_with("/v1/system/update/")
-        && !(method == "POST" && path == "/v1/filter/subscriptions")
+        && !(method == "POST"
+            && matches!(
+                path,
+                "/v1/filter/subscriptions" | "/v1/filter/subscriptions/refresh"
+            ))
 }
 
 /// Repeated request failures, by a bounded number of fingerprints.
@@ -476,6 +481,15 @@ pub fn clear_acme_http01(token: &str) {
 /// Status line, content type and body.
 pub type ApiResponse = (&'static str, &'static str, String);
 
+/// When a change reaches the running filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterApply {
+    /// The request answers after the rebuild, and a failed rebuild undoes the change.
+    Wait,
+    /// The request answers once the change is saved; the filter catches up afterward.
+    Background,
+}
+
 /// Runs a state-changing request through cluster consensus.
 pub type ClusterWrite =
     dyn Fn(&str, &str, &str, &mut dyn FnMut() -> ApiResponse) -> ApiResponse + Send + Sync;
@@ -489,7 +503,8 @@ pub struct Controls {
     pub allow_add: Box<dyn Fn(&str) -> Result<ListCounts, String> + Send + Sync>,
 
     /// Turns blocking of a service on or off.
-    pub service_set: Box<dyn Fn(&str, bool) -> Result<ListCounts, String> + Send + Sync>,
+    pub service_set:
+        Box<dyn Fn(&str, bool, FilterApply) -> Result<ListCounts, String> + Send + Sync>,
 
     pub safesearch_set: Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>,
 
@@ -508,7 +523,7 @@ pub struct Controls {
     pub config_apply: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
     /// Changes a few config keys.
-    pub config_set: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub config_set: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// What `config_set` would change and how it would be applied, without applying it.
     pub config_set_diff: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
@@ -523,9 +538,9 @@ pub struct Controls {
 
     pub rewrites_list: Box<dyn Fn() -> String + Send + Sync>,
 
-    pub rewrite_add: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub rewrite_add: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
-    pub rewrite_delete: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub rewrite_delete: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// Services that can be blocked.
     pub services_catalog: Box<dyn Fn() -> String + Send + Sync>,
@@ -607,19 +622,23 @@ pub struct Controls {
     /// `requires_control_mutation_lock`.
     pub subscription_add: Box<dyn Fn(&str) -> ApiResponse + Send + Sync>,
 
-    pub subscription_remove: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub subscription_remove: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// Changes a subscription's settings.
-    pub subscription_update: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub subscription_update: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
-    /// Downloads a subscribed list now.
-    pub subscription_refresh: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    /// Downloads a subscribed list now, or starts a job for it under `FilterApply::Background`.
+    pub subscription_refresh: Box<dyn Fn(&str, FilterApply) -> ApiResponse + Send + Sync>,
 
     /// Rules the user added.
     pub filter_rules_list: Box<dyn Fn() -> String + Send + Sync>,
 
     /// Adds or removes a user rule.
-    pub filter_rule_mutate: Box<dyn Fn(&str, bool) -> Result<String, String> + Send + Sync>,
+    pub filter_rule_mutate:
+        Box<dyn Fn(&str, bool, FilterApply) -> Result<String, String> + Send + Sync>,
+
+    /// Whether changes saved under `FilterApply::Background` have reached the filter.
+    pub filter_apply_status: Box<dyn Fn() -> String + Send + Sync>,
 
     pub clients_list: Box<dyn Fn() -> String + Send + Sync>,
 
@@ -649,13 +668,13 @@ pub struct Controls {
     pub dhcp_static_remove: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
     /// Adds a client group.
-    pub client_add: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub client_add: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// Removes a client group.
-    pub client_remove: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub client_remove: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// Changes a client group.
-    pub client_update: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    pub client_update: Box<dyn Fn(&str, FilterApply) -> Result<String, String> + Send + Sync>,
 
     /// Changes the dashboard sign-in password.
     pub password_change: Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
@@ -734,7 +753,7 @@ impl Controls {
             reload: Box::new(counts),
             block_add: Box::new(move |_| counts()),
             allow_add: Box::new(move |_| counts()),
-            service_set: Box::new(move |_, _| counts()),
+            service_set: Box::new(move |_, _, _| counts()),
             safesearch_set: Box::new(|_| Ok(())),
             export: Box::new(|| "{\"version\":1}".to_string()),
             import: Box::new(move |_| counts()),
@@ -743,7 +762,7 @@ impl Controls {
                 Ok("{\"added\":[],\"removed\":[],\"changed\":[]}".to_string())
             }),
             config_apply: Box::new(|_| Err("No config file path".to_string())),
-            config_set: Box::new(|_| Err("No config file path".to_string())),
+            config_set: Box::new(|_, _| Err("No config file path".to_string())),
             config_set_diff: Box::new(|_| {
                 Ok("{\"added\":[],\"removed\":[],\"changed\":[]}".to_string())
             }),
@@ -751,8 +770,8 @@ impl Controls {
             upstream_test: Box::new(|_| Err("The requested feature is not available".to_string())),
             cache_flush: Box::new(|| "{\"flushed\":0}".to_string()),
             rewrites_list: Box::new(|| "{\"rewrites\":[]}".to_string()),
-            rewrite_add: Box::new(|_| Err("No config file path".to_string())),
-            rewrite_delete: Box::new(|_| Err("No config file path".to_string())),
+            rewrite_add: Box::new(|_, _| Err("No config file path".to_string())),
+            rewrite_delete: Box::new(|_, _| Err("No config file path".to_string())),
             services_catalog: Box::new(|| "{\"services\":[]}".to_string()),
             access_list: Box::new(|| {
                 "{\"allowed\":[],\"blocked\":[],\"dropped\":[],\"unlisted\":\"allow\",\"refused_domains\":[]}"
@@ -795,19 +814,20 @@ impl Controls {
             subscription_add: Box::new(|_| {
                 result_resp(Err("Blocklist subscriptions are not available".to_string()))
             }),
-            subscription_remove: Box::new(|_| {
+            subscription_remove: Box::new(|_, _| {
                 Err("Blocklist subscriptions are not available".to_string())
             }),
-            subscription_update: Box::new(|_| {
+            subscription_update: Box::new(|_, _| {
                 Err("Blocklist subscriptions are not available".to_string())
             }),
-            subscription_refresh: Box::new(|_| {
-                Err("Blocklist subscriptions are not available".to_string())
+            subscription_refresh: Box::new(|_, _| {
+                result_resp(Err("Blocklist subscriptions are not available".to_string()))
             }),
             filter_rules_list: Box::new(|| {
                 "{\"block\":[],\"allow\":[],\"refused_domains\":[]}".to_string()
             }),
-            filter_rule_mutate: Box::new(|_, _| Err("Filtering is not available".to_string())),
+            filter_rule_mutate: Box::new(|_, _, _| Err("Filtering is not available".to_string())),
+            filter_apply_status: Box::new(|| "{\"pending\":false,\"error\":null}".to_string()),
             clients_list: Box::new(|| "[]".to_string()),
             upstreams_list: Box::new(|| "[]".to_string()),
             jobs_list: Box::new(|| "[]".to_string()),
@@ -818,9 +838,9 @@ impl Controls {
             dhcp_static_list: Box::new(|| "{\"available\":false,\"reservations\":[]}".to_string()),
             dhcp_static_add: Box::new(|_| Err("DHCP is not configured".to_string())),
             dhcp_static_remove: Box::new(|_| Err("DHCP is not configured".to_string())),
-            client_add: Box::new(|_| Err("No config file path".to_string())),
-            client_remove: Box::new(|_| Err("No config file path".to_string())),
-            client_update: Box::new(|_| Err("No config file path".to_string())),
+            client_add: Box::new(|_, _| Err("No config file path".to_string())),
+            client_remove: Box::new(|_, _| Err("No config file path".to_string())),
+            client_update: Box::new(|_, _| Err("No config file path".to_string())),
             password_change: Box::new(|_, _| Err("No config file path".to_string())),
             user_create: Box::new(|_, _| Err("No config file path".to_string())),
             upstream_add: Box::new(|_| Err("No config file path".to_string())),
@@ -2068,6 +2088,8 @@ struct Caller {
     peer: Option<SocketAddr>,
     /// Set when the request came through a trusted reverse proxy to a public origin.
     proxied: Option<Proxied>,
+    /// `Background` when the request carries `Prefer: respond-async`.
+    filter_apply: FilterApply,
 }
 
 struct Proxied {
@@ -2080,6 +2102,7 @@ impl Caller {
         Self {
             peer,
             proxied: None,
+            filter_apply: FilterApply::Wait,
         }
     }
 
@@ -2550,6 +2573,7 @@ fn control_caller(
         proxied: Some(Proxied {
             client: policy.forwarded_client(forwarded_for),
         }),
+        filter_apply: FilterApply::Wait,
     })
 }
 
@@ -2581,6 +2605,16 @@ fn handle_conn_until_shutdown(
         prefix,
         Some(admission_bytes),
     )
+}
+
+/// Whether a `Prefer` header value contains `respond-async` (RFC 7240).
+fn prefers_respond_async(value: &str) -> bool {
+    value.split(',').any(|preference| {
+        preference
+            .split(';')
+            .next()
+            .is_some_and(|token| token.trim().eq_ignore_ascii_case("respond-async"))
+    })
 }
 
 /// Reads the request line and headers within limits, checks Host and Origin, reads the body,
@@ -2671,6 +2705,7 @@ fn handle_conn_inner(
     let mut host: Option<String> = None;
     let mut origin: Option<String> = None;
     let mut forwarded_for = String::new();
+    let mut filter_apply = FilterApply::Wait;
     let mut header_bytes = 0usize;
     let mut header_count = 0usize;
     let mut has_transfer_encoding = false;
@@ -2810,6 +2845,10 @@ fn handle_conn_inner(
                 forwarded_for.push(',');
             }
             forwarded_for.push_str(val);
+        } else if name.eq_ignore_ascii_case("prefer") {
+            if prefers_respond_async(val) {
+                filter_apply = FilterApply::Background;
+            }
         } else if name.eq_ignore_ascii_case("authorization") {
             if auth_seen {
                 return write_simple(
@@ -2867,7 +2906,7 @@ fn handle_conn_inner(
             route(&method, &path, "", "", "", &Caller::direct(peer), st);
         return write_simple(stream, status, content_type, "", &body);
     }
-    let caller = match control_caller(
+    let mut caller = match control_caller(
         &st.proxy.load(),
         peer,
         local_port,
@@ -2901,6 +2940,7 @@ fn handle_conn_inner(
             );
         }
     };
+    caller.filter_apply = filter_apply;
     if has_transfer_encoding {
         return write_simple(
             stream,
@@ -4156,7 +4196,7 @@ fn route(
     let _mutation_guard = requires_control_mutation_lock(method, path)
         .then(|| control_mutation_lock().lock_recover());
 
-    let mut dispatch = || route_dispatch(method, path, session, body, st);
+    let mut dispatch = || route_dispatch(method, path, session, body, caller.filter_apply, st);
     let out = if requires_control_mutation_lock(method, path) {
         (st.controls.cluster_write)(method, path, body, &mut dispatch)
     } else {
@@ -4188,6 +4228,7 @@ fn route_dispatch(
     path: &str,
     session: &str,
     body: &str,
+    filter_apply: FilterApply,
     st: &AppState,
 ) -> ApiResponse {
     if let Some(rest) = path.strip_prefix("/v1/zones/").filter(|o| !o.is_empty()) {
@@ -4325,7 +4366,7 @@ fn route_dispatch(
         ("POST", "/v1/services") => {
             let svc = body_str(body, "service");
             let en = body_bool(body, "enable");
-            counts_resp((st.controls.service_set)(&svc, en))
+            counts_resp((st.controls.service_set)(&svc, en, filter_apply))
         }
         ("POST", "/v1/safesearch") => {
             let en = body_bool(body, "enable");
@@ -4452,7 +4493,7 @@ fn route_dispatch(
                 format!("{{\"error\":\"{}\"}}", jesc(&e)),
             ),
         },
-        ("POST", "/v1/config/set") => match (st.controls.config_set)(body) {
+        ("POST", "/v1/config/set") => match (st.controls.config_set)(body, filter_apply) {
             Ok(j) => ("200 OK", "application/json", j),
             Err(e) => (
                 "400 Bad Request",
@@ -4498,7 +4539,7 @@ fn route_dispatch(
             ),
         },
         ("GET", "/v1/rewrites") => ("200 OK", "application/json", (st.controls.rewrites_list)()),
-        ("POST", "/v1/rewrites") => match (st.controls.rewrite_add)(body) {
+        ("POST", "/v1/rewrites") => match (st.controls.rewrite_add)(body, filter_apply) {
             Ok(j) => ("200 OK", "application/json", j),
             Err(e) => (
                 "400 Bad Request",
@@ -4506,7 +4547,7 @@ fn route_dispatch(
                 format!("{{\"error\":\"{}\"}}", jesc(&e)),
             ),
         },
-        ("DELETE", "/v1/rewrites") => match (st.controls.rewrite_delete)(body) {
+        ("DELETE", "/v1/rewrites") => match (st.controls.rewrite_delete)(body, filter_apply) {
             Ok(j) => ("200 OK", "application/json", j),
             Err(e) => (
                 "404 Not Found",
@@ -4609,7 +4650,7 @@ fn route_dispatch(
         ),
         ("POST", "/v1/filter/subscriptions") => (st.controls.subscription_add)(body),
         ("DELETE", "/v1/filter/subscriptions") => {
-            match (st.controls.subscription_remove)(&body_str(body, "url")) {
+            match (st.controls.subscription_remove)(&body_str(body, "url"), filter_apply) {
                 Ok(j) => ("200 OK", "application/json", j),
                 Err(e) => (
                     "404 Not Found",
@@ -4619,27 +4660,35 @@ fn route_dispatch(
             }
         }
         ("PATCH", "/v1/filter/subscriptions") => {
-            result_resp((st.controls.subscription_update)(body))
+            result_resp((st.controls.subscription_update)(body, filter_apply))
         }
         ("POST", "/v1/filter/subscriptions/refresh") => {
-            result_resp((st.controls.subscription_refresh)(body))
+            (st.controls.subscription_refresh)(body, filter_apply)
         }
         ("GET", "/v1/filter/rules") => (
             "200 OK",
             "application/json",
             (st.controls.filter_rules_list)(),
         ),
-        ("POST", "/v1/filter/rules") => result_resp((st.controls.filter_rule_mutate)(body, true)),
-        ("DELETE", "/v1/filter/rules") => {
-            result_resp((st.controls.filter_rule_mutate)(body, false))
+        ("POST", "/v1/filter/rules") => {
+            result_resp((st.controls.filter_rule_mutate)(body, true, filter_apply))
         }
+        ("DELETE", "/v1/filter/rules") => {
+            result_resp((st.controls.filter_rule_mutate)(body, false, filter_apply))
+        }
+        ("GET", "/v1/filter/apply") => (
+            "200 OK",
+            "application/json",
+            (st.controls.filter_apply_status)(),
+        ),
         ("GET", "/v1/clients") => ("200 OK", "application/json", (st.controls.clients_list)()),
 
-        ("POST", "/v1/clients") => result_resp((st.controls.client_add)(body)),
-        ("DELETE", "/v1/clients") => {
-            result_resp((st.controls.client_remove)(&body_str(body, "name")))
-        }
-        ("PATCH", "/v1/clients") => result_resp((st.controls.client_update)(body)),
+        ("POST", "/v1/clients") => result_resp((st.controls.client_add)(body, filter_apply)),
+        ("DELETE", "/v1/clients") => result_resp((st.controls.client_remove)(
+            &body_str(body, "name"),
+            filter_apply,
+        )),
+        ("PATCH", "/v1/clients") => result_resp((st.controls.client_update)(body, filter_apply)),
         ("GET", "/v1/upstreams") => ("200 OK", "application/json", (st.controls.upstreams_list)()),
 
         ("POST", "/v1/upstreams") => match upstream_field(body) {
@@ -5096,7 +5145,8 @@ fn openapi_json() -> String {
       "patch": { "tags": ["Filtering"], "summary": "Enable or disable a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "enabled": { "type": "boolean" } }, "required": ["url", "enabled"] } } } }, "responses": { "200": { "description": "{updated}" }, "400": { "description": "{error}" } } },
       "delete": { "tags": ["Filtering"], "summary": "Delete a blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{removed,subscriptions,block}" }, "404": { "description": "{error}" } } }
     },
-    "/v1/filter/subscriptions/refresh": { "post": { "tags": ["Filtering"], "summary": "Refresh the given blocklist subscription (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{refreshed:true}" }, "400": { "description": "{error}" } } } },
+    "/v1/filter/subscriptions/refresh": { "post": { "tags": ["Filtering"], "summary": "Refresh the given blocklist subscription (admin only). With `Prefer: respond-async`, the download runs as a job", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] } } } }, "responses": { "200": { "description": "{refreshed:true}, or {id,status} with Prefer: respond-async" }, "400": { "description": "{error}" } } } },
+    "/v1/filter/apply": { "get": { "tags": ["Filtering"], "summary": "Whether changes saved with Prefer: respond-async have reached the running filter", "responses": { "200": { "description": "{pending,error}" } } } },
     "/v1/filter/rules": { "get": { "tags": ["Filtering"], "summary": "User block and allow rules, and domains answered with REFUSED", "responses": { "200": { "description": "{block,allow,refused_domains}" } } }, "post": { "tags": ["Filtering"], "summary": "Add a filter rule (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["block", "allow", "refused_domain"] }, "rule": { "type": "string" } }, "required": ["kind", "rule"] } } } }, "responses": { "200": { "description": "{updated:true}" } } }, "delete": { "tags": ["Filtering"], "summary": "Delete a filter rule (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["block", "allow", "refused_domain"] }, "rule": { "type": "string" } }, "required": ["kind", "rule"] } } } }, "responses": { "200": { "description": "{updated:true}" } } } },
     "/v1/clients": { "get": { "tags": ["Clients"], "summary": "Per-client policies", "responses": { "200": { "description": "[{name,nets,client_ids,tags,block_rules,disable_filtering}]" } } }, "post": { "tags": ["Clients"], "summary": "Add a client policy (admin only): ordinary block and allow policies apply without dropping connections; a dedicated upstream DNS server or a new MAC match restarts the DNS service", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "ids": { "type": "array", "items": { "type": "string" } }, "client_ids": { "type": "array", "items": { "type": "string" } }, "mac": { "type": "array", "items": { "type": "string" } }, "tags": { "type": "array", "items": { "type": "string" } }, "block": { "type": "array", "items": { "type": "string" } }, "allow": { "type": "array", "items": { "type": "string" } }, "blocked_services": { "type": "array", "items": { "type": "string" } }, "disable_filtering": { "type": "boolean" }, "safe_search": { "type": "boolean" } }, "required": ["name"] } } } }, "responses": { "200": { "description": "{added,reloading}" }, "400": { "description": "{error}" } } }, "patch": { "tags": ["Clients"], "summary": "Turn filtering on or off for a client (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "disable_filtering": { "type": "boolean" } }, "required": ["name", "disable_filtering"] } } } }, "responses": { "200": { "description": "{updated,disable_filtering,reloading}" } } }, "delete": { "tags": ["Clients"], "summary": "Delete a client policy (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } } } }, "responses": { "200": { "description": "{removed,reloading}" }, "400": { "description": "{error}" } } } },
     "/v1/upstreams": { "get": { "tags": ["Resolution"], "summary": "Upstream DNS servers", "responses": { "200": { "description": "[{id,addr,queries?,ok?,fail?,ewma_ms?}]" } } }, "post": { "tags": ["Resolution"], "summary": "Add an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{added,mode,restart_required}" }, "400": { "description": "{error}" } } }, "delete": { "tags": ["Resolution"], "summary": "Delete an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{removed,mode,restart_required}" }, "400": { "description": "{error}" } } } },
@@ -5435,7 +5485,7 @@ mod tests {
                 Ok(cnt(&s2))
             }),
             allow_add: Box::new(|_| Ok(ListCounts { block: 0, allow: 0 })),
-            service_set: Box::new(|_, _| Ok(ListCounts { block: 0, allow: 0 })),
+            service_set: Box::new(|_, _, _| Ok(ListCounts { block: 0, allow: 0 })),
             safesearch_set: Box::new(|_| Ok(())),
             export: {
                 let s = store.clone();
@@ -5490,7 +5540,7 @@ mod tests {
                     Ok("{\"applied\":true,\"restart_required\":true}".to_string())
                 }
             }),
-            config_set: Box::new(|b| {
+            config_set: Box::new(|b, _| {
                 if b.contains("\"bad\"") {
                     Err("알 수 없는 설정 키".to_string())
                 } else {
@@ -5513,14 +5563,14 @@ mod tests {
                 "{\"rewrites\":[{\"domain\":\"router.lan\",\"answer\":\"192.168.1.1\"}]}"
                     .to_string()
             }),
-            rewrite_add: Box::new(|b| {
+            rewrite_add: Box::new(|b, _| {
                 if b.contains("domain") {
                     Ok("{\"added\":true}".to_string())
                 } else {
                     Err("`domain` 항목을 입력해야 합니다".to_string())
                 }
             }),
-            rewrite_delete: Box::new(|_| Ok("{\"removed\":1}".to_string())),
+            rewrite_delete: Box::new(|_, _| Ok("{\"removed\":1}".to_string())),
             services_catalog: Box::new(|| {
                 "{\"count\":1,\"services\":[{\"id\":\"youtube\",\"name\":\"YouTube\",\"group\":\"streaming\",\"rule_count\":5,\"blocked\":false}]}".to_string()
             }),
@@ -5655,13 +5705,19 @@ mod tests {
                     result_resp(Ok("{\"added\":true}".to_string()))
                 }
             }),
-            subscription_remove: Box::new(|_| Ok("{\"removed\":true}".to_string())),
-            subscription_update: Box::new(|_| Ok("{\"updated\":true}".to_string())),
-            subscription_refresh: Box::new(|_| Ok("{\"id\":1}".to_string())),
+            subscription_remove: Box::new(|_, _| Ok("{\"removed\":true}".to_string())),
+            subscription_update: Box::new(|_, _| Ok("{\"updated\":true}".to_string())),
+            subscription_refresh: Box::new(|_, _| result_resp(Ok("{\"id\":1}".to_string()))),
             filter_rules_list: Box::new(|| {
                 "{\"block\":[],\"allow\":[],\"refused_domains\":[]}".to_string()
             }),
-            filter_rule_mutate: Box::new(|_, _| Ok("{\"updated\":true}".to_string())),
+            filter_rule_mutate: Box::new(|_, _, apply| {
+                Ok(format!(
+                    "{{\"updated\":true,\"background\":{}}}",
+                    apply == FilterApply::Background
+                ))
+            }),
+            filter_apply_status: Box::new(|| "{\"pending\":true,\"error\":null}".to_string()),
             clients_list: Box::new(|| "[]".to_string()),
             upstreams_list: Box::new(|| "[]".to_string()),
             jobs_list: Box::new(|| "[{\"id\":1,\"status\":\"done\"}]".to_string()),
@@ -5703,21 +5759,21 @@ mod tests {
                     Err(format!("고정 할당 항목을 찾을 수 없습니다: {identity}"))
                 }
             }),
-            client_add: Box::new(|body| {
+            client_add: Box::new(|body, _| {
                 if body.contains("\"name\"") {
                     Ok("{\"added\":true,\"reloading\":true}".to_string())
                 } else {
                     Err("`name` 항목을 입력해야 합니다".to_string())
                 }
             }),
-            client_remove: Box::new(|name| {
+            client_remove: Box::new(|name, _| {
                 if name == "kid" {
                     Ok("{\"removed\":true,\"reloading\":true}".to_string())
                 } else {
                     Err(format!("클라이언트를 찾을 수 없습니다: {name}"))
                 }
             }),
-            client_update: Box::new(|_| Ok("{\"updated\":true}".to_string())),
+            client_update: Box::new(|_, _| Ok("{\"updated\":true}".to_string())),
             password_change: Box::new(|_, _| Ok("{\"changed\":true}".to_string())),
             user_create: Box::new(|_, _| Ok("{\"created\":true}".to_string())),
             upstream_add: Box::new(|u| {
@@ -6573,6 +6629,59 @@ mod tests {
                 "/v1/filter/subscriptions"
             ));
         }
+    }
+
+    #[test]
+    fn refreshing_one_list_does_not_hold_up_other_changes() {
+        assert!(is_state_changing_request(
+            "POST",
+            "/v1/filter/subscriptions/refresh"
+        ));
+        assert!(!requires_control_mutation_lock(
+            "POST",
+            "/v1/filter/subscriptions/refresh"
+        ));
+    }
+
+    #[test]
+    fn respond_async_is_read_as_one_preference_among_others() {
+        for value in [
+            "respond-async",
+            "RESPOND-ASYNC",
+            "wait=10, respond-async",
+            "respond-async; foo=bar",
+        ] {
+            assert!(prefers_respond_async(value), "{value}");
+        }
+        for value in ["", "wait=10", "respond-asyncx", "x=respond-async"] {
+            assert!(!prefers_respond_async(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn prefer_respond_async_reaches_the_callback() {
+        let st = test_state("adm", "ro");
+        let request = |extra: &str| {
+            let body = "{\"kind\":\"block\",\"rule\":\"x.example\"}";
+            format!(
+                "POST /v1/filter/rules HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Authorization: Bearer adm\r\nContent-Type: application/json\r\n{extra}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let plain = exchange(&st, &request(""));
+        assert!(plain.contains("\"background\":false"), "{plain}");
+        let deferred = exchange(&st, &request("Prefer: respond-async\r\n"));
+        assert!(deferred.contains("\"background\":true"), "{deferred}");
+    }
+
+    #[test]
+    fn the_filter_apply_status_is_readable_without_admin_rights() {
+        let st = test_state("adm", "ro");
+        let (code, body) = call(&st, "GET", "/v1/filter/apply", "ro", "");
+        assert_eq!(code, 200);
+        assert_eq!(body, "{\"pending\":true,\"error\":null}");
     }
 
     #[test]
@@ -8047,6 +8156,7 @@ mod tests {
             proxied: Some(Proxied {
                 client: Some(client.parse().unwrap()),
             }),
+            filter_apply: FilterApply::Wait,
         };
         for i in 0..MAX_SOURCE_LOGIN_FAILURES {
             let source = caller(&format!("2001:db8:1:2::{:x}", i + 1)).login_source();

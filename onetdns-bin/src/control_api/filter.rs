@@ -1,6 +1,4 @@
-/*!
- * @brief 관리 API: 차단 규칙, 서비스 차단, 안전 검색, 재작성 규칙, 백업과 복원.
- */
+//! Management API: filter rules, blocked services, safe search, rewrites, backup.
 
 use super::*;
 use crate::atomic_file::{atomic_write, with_rollback_result};
@@ -10,15 +8,13 @@ use crate::config_edit::{
 };
 use crate::ctl::counts;
 use crate::filters::mutate_user_rule;
-use onetdns_control::ListCounts;
+use onetdns_control::{FilterApply, ListCounts};
 
 impl ControlDeps {
-    /** @brief 차단 엔진을 지금 목록으로 다시 만든다. */
     pub(super) fn rebuild_filter(&self) -> Result<ListCounts, String> {
         (self.filters.rebuild)().map(counts)
     }
 
-    /** @brief 차단 규칙을 더하고 설정 파일과 실행 중 설정에 함께 적는다. */
     pub(super) fn block_add(&self, rule: &str) -> Result<ListCounts, String> {
         let result = mutate_user_rule(
             &self.filters.overlay,
@@ -36,7 +32,6 @@ impl ControlDeps {
         Ok(counts(result))
     }
 
-    /** @brief 허용 규칙을 더하고 설정 파일과 실행 중 설정에 함께 적는다. */
     pub(super) fn allow_add(&self, rule: &str) -> Result<ListCounts, String> {
         let result = mutate_user_rule(
             &self.filters.overlay,
@@ -54,8 +49,13 @@ impl ControlDeps {
         Ok(counts(result))
     }
 
-    /** @brief 서비스 차단을 켜거나 끈다. 다시 만들지 못하면 파일과 목록을 되돌린다. */
-    pub(super) fn service_set(&self, svc: &str, enable: bool) -> Result<ListCounts, String> {
+    /// Rolls back the file and the list when the filter cannot be rebuilt.
+    pub(super) fn service_set(
+        &self,
+        svc: &str,
+        enable: bool,
+        apply: FilterApply,
+    ) -> Result<ListCounts, String> {
         let service_set = &self.filters.service_set;
         if enable && onetdns_filter::services::service_rules(svc).is_none() {
             return Err(format!("Unknown blocked service: {svc}"));
@@ -74,7 +74,7 @@ impl ControlDeps {
                 .map_err(|e| e.to_string())?;
         }
         *service_set.lock_recover() = next;
-        match (self.filters.rebuild)() {
+        match self.apply_filter(apply) {
             Ok(value) => {
                 let applied = service_set.lock_recover().clone();
                 update_runtime_config(&self.runtime_cfg, |config| {
@@ -99,7 +99,6 @@ impl ControlDeps {
         }
     }
 
-    /** @brief 안전 검색을 켜거나 끈다. */
     pub(super) fn safesearch_set(&self, enable: bool) -> Result<(), String> {
         if let Some(path) = self.config_path.as_deref() {
             let _write_guard = config_write_lock().lock_recover();
@@ -120,7 +119,6 @@ impl ControlDeps {
         Ok(())
     }
 
-    /** @brief 사용자 규칙, 서비스 차단, 거부 도메인, 안전 검색을 백업으로 내보낸다. */
     pub(super) fn export(&self) -> String {
         let (b, a) = {
             let o = self.filters.overlay.lock_recover();
@@ -144,7 +142,7 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 백업을 되읽는다. 다시 만들지 못하면 파일과 실행 중 상태를 모두 되돌린다. */
+    /// Rolls back the file and the running state when the filter cannot be rebuilt.
     pub(super) fn import(&self, body: &str) -> Result<ListCounts, String> {
         let overlay = &self.filters.overlay;
         let service_set = &self.filters.service_set;
@@ -232,7 +230,6 @@ impl ControlDeps {
         }
     }
 
-    /** @brief 재작성 규칙 목록. */
     pub(super) fn rewrites_list(&self) -> String {
         let current = self.runtime_cfg.load();
         let items: Vec<String> = current
@@ -249,8 +246,8 @@ impl ControlDeps {
         format!("{{\"rewrites\":[{}]}}", items.join(","))
     }
 
-    /** @brief 재작성 규칙을 넣는다. 같은 도메인의 규칙은 바꾼다. */
-    pub(super) fn rewrite_add(&self, body: &str) -> Result<String, String> {
+    /// Replaces any rule for the same domain.
+    pub(super) fn rewrite_add(&self, body: &str, apply: FilterApply) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
         let domain = j
@@ -263,7 +260,7 @@ impl ControlDeps {
             .and_then(|v| v.as_str())
             .ok_or("`answer` is required".to_string())?
             .to_string();
-        let result = self.edit_config(|text| {
+        let result = self.edit_config_with(apply, |text| {
             let cur = onetdns_config::Config::from_toml_str(text).map_err(|e| e.to_string())?;
             let mut rw = cur.rewrites;
             rw.retain(|r| r.domain != domain);
@@ -280,8 +277,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 재작성 규칙을 지운다. */
-    pub(super) fn rewrite_delete(&self, body: &str) -> Result<String, String> {
+    pub(super) fn rewrite_delete(&self, body: &str, apply: FilterApply) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
         let domain = j
@@ -290,7 +286,7 @@ impl ControlDeps {
             .ok_or("`domain` is required".to_string())?
             .to_string();
         let mut removed = 0usize;
-        let result = self.edit_config(|text| {
+        let result = self.edit_config_with(apply, |text| {
             let cur = onetdns_config::Config::from_toml_str(text).map_err(|e| e.to_string())?;
             let before = cur.rewrites.len();
             let rw: Vec<_> = cur
@@ -311,7 +307,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 차단할 수 있는 서비스 목록과 서비스마다 지금 차단하는지. */
     pub(super) fn services_catalog(&self) -> String {
         let blocked = self.filters.service_set.lock_recover().clone();
         let all: Vec<String> = onetdns_filter::services::catalog()
@@ -335,10 +330,6 @@ impl ControlDeps {
         )
     }
 
-    /**
-     * @brief 접근을 허용하거나 막거나 응답 없이 버리는 대역, 어느 규칙에도 걸리지 않은
-     *        클라이언트의 처분, 거부 도메인.
-     */
     pub(super) fn access_list(&self) -> String {
         let c = self.runtime_cfg.load();
         let arr = |v: &[onetdns_core::IpNet]| {
@@ -367,12 +358,10 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 차단 규칙을 읽은 결과 요약. */
     pub(super) fn filter_report(&self) -> String {
         self.filters.filter.load().load_report().to_json()
     }
 
-    /** @brief 많이 걸린 차단 규칙 50개. */
     pub(super) fn filter_top_rules(&self) -> String {
         let eng = self.filters.filter.load();
         let items: Vec<String> = eng
@@ -390,7 +379,6 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 차단 목록 출처마다 규칙 수와 걸린 횟수. */
     pub(super) fn filter_sources(&self) -> String {
         let eng = self.filters.filter.load();
         let items: Vec<String> = eng
@@ -411,7 +399,6 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 사용자가 넣은 차단·허용 규칙과 거부 도메인. */
     pub(super) fn filter_rules_list(&self) -> String {
         let g = self.filters.overlay.lock_recover();
         format!(
@@ -422,8 +409,12 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 사용자 규칙이나 거부 도메인을 넣거나 뺀다. */
-    pub(super) fn filter_rule_mutate(&self, body: &str, add: bool) -> Result<String, String> {
+    pub(super) fn filter_rule_mutate(
+        &self,
+        body: &str,
+        add: bool,
+        apply: FilterApply,
+    ) -> Result<String, String> {
         let refused = &self.filters.refused_domains;
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
@@ -437,7 +428,7 @@ impl ControlDeps {
                 mutate_user_rule(
                     &self.filters.overlay,
                     self.config_path.as_deref(),
-                    &*self.filters.rebuild,
+                    &|| self.apply_filter(apply),
                     rule,
                     kind == "allow",
                     add,
@@ -463,7 +454,7 @@ impl ControlDeps {
                         .map_err(|e| e.to_string())?;
                 }
                 *refused.lock_recover() = next;
-                if let Err(error) = (self.filters.rebuild)() {
+                if let Err(error) = self.apply_filter(apply) {
                     *refused.lock_recover() = previous.clone();
                     let error = if let Some(path) = self.config_path.as_deref() {
                         with_rollback_result(

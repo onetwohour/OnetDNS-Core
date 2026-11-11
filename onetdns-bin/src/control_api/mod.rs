@@ -1,10 +1,4 @@
-/*!
- * @brief 관리 API 콜백을 실행 중 서버의 상태에 연결한다.
- *
- * @details 콜백은 서버 세대 하나가 소유한 핸들 묶음 ControlDeps 를 함께 붙든다. 콜백 본문은
- *          API 영역별 파일에 ControlDeps 의 메서드로 있다. ControlDeps 에 없는 세대 상태는 관리
- *          API 가 건드리지 않는다.
- */
+//! Connects the management API callbacks to one server generation through `ControlDeps`.
 
 mod accounts;
 mod clients;
@@ -24,72 +18,90 @@ use crate::config_apply::{apply_config_edit_smart, ConfigApplyResult, HotConfigA
 use crate::filter_runtime::FilterState;
 use crate::listeners::TlsSlots;
 use crate::zones::ZoneState;
+use onetdns_control::FilterApply;
 
-/** @brief 관리 API 가 읽고 바꾸는 이 세대의 핸들. */
+/// The handles of this generation that the management API reads and changes.
 pub(crate) struct ControlDeps {
-    /** @brief 권한 영역 상태. */
     pub(crate) zones: ZoneState,
-    /** @brief 차단 엔진과 그 재료. */
     pub(crate) filters: FilterState,
-    /** @brief 실행 중 설정. */
     pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
-    /** @brief 설정 파일 경로. 없으면 파일 없이 돈다. */
+    /// `None` when running without a config file.
     pub(crate) config_path: Option<PathBuf>,
-    /** @brief 이 세대를 시작할 때 읽은 설정 원문. */
+    /// The config text read when this generation started.
     pub(crate) cfg_text: Option<onetdns_core::SecretString>,
-    /** @brief 세대를 다시 만들라는 요청. */
+    /// Asks for a new generation.
     pub(crate) reload: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 직전에 적용했던 설정 원문. 되돌리기에 쓴다. */
+    /// The config text before the last change, for rollback.
     pub(crate) config_prev: ConfigTextSlot,
-    /** @brief 지금 적용된 설정 원문. */
     pub(crate) applied_config_text: ConfigTextSlot,
-    /** @brief 재시작 없이 설정을 교체한다. */
     pub(crate) hot_config_apply: HotConfigApply,
-    /** @brief 정책 엔진. */
+    /// Like `hot_config_apply`, but leaves the filter build to the background.
+    pub(crate) hot_config_apply_background: HotConfigApply,
     pub(crate) policy_engine: Arc<native::GatedSwap<onetdns_policy::PolicyEngine>>,
-    /** @brief 목록을 받을 때 쓰는 이름 해석기. */
     pub(crate) blocklist_resolver: http::HostResolver,
-    /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
+    /// `None` while DHCPv4 is off.
     pub(crate) dhcp_slot: Arc<Mutex<Option<Arc<Mutex<crate::dhcp::LeasePool>>>>>,
-    /** @brief DHCPv6 임대 풀. 서비스가 꺼져 있으면 없다. */
+    /// `None` while DHCPv6 is off.
     pub(crate) dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<crate::dhcp6::Lease6Pool>>>>>,
-    /** @brief MAC 제조사 데이터베이스. */
     pub(crate) vendor_db: Arc<ArcSwap<mac::VendorDb>>,
-    /** @brief 응답 캐시. 체인을 만들기 전에는 없다. */
+    /// `None` until the chain is built.
     pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
-    /** @brief 업스트림 통계. 전달 경로가 없으면 없다. */
+    /// `None` while not forwarding.
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
-    /** @brief 열려 있는 수신 주소. */
     pub(crate) listener_reg: Arc<Mutex<Vec<(&'static str, String, String)>>>,
-    /** @brief TLS 인증서 슬롯. 암호화 수신 주소가 없으면 없다. */
+    /// `None` without an encrypted listener.
     pub(crate) tls_slot_handle: Arc<Mutex<Option<Arc<TlsSlots>>>>,
-    /** @brief 관리 API 가 시킨 작업. */
     pub(crate) jobs: Arc<JobRegistry>,
-    /** @brief 이 세대가 끝날 때 기다릴 스레드. */
+    /// Threads to join when this generation ends.
     pub(crate) service_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl ControlDeps {
-    /** @brief 설정 원문을 고쳐 반영한다. 바뀐 항목에 따라 교체하거나 세대를 다시 만든다. */
     fn edit_config(
         &self,
         edit: impl FnOnce(&str) -> Result<String, String>,
     ) -> Result<ConfigApplyResult, String> {
+        self.edit_config_with(FilterApply::Wait, edit)
+    }
+
+    /// Edits the config text and applies it, hot or through a new generation as the keys require.
+    fn edit_config_with(
+        &self,
+        filter_apply: FilterApply,
+        edit: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Result<ConfigApplyResult, String> {
+        let hot_apply = match filter_apply {
+            FilterApply::Wait => &self.hot_config_apply,
+            FilterApply::Background => &self.hot_config_apply_background,
+        };
         apply_config_edit_smart(
             &self.config_path,
             &self.config_prev,
             &self.applied_config_text,
             &self.reload,
-            &self.hot_config_apply,
+            hot_apply,
             edit,
         )
     }
+
+    /// Puts changed filter inputs into effect. `Background` returns the current counts at once.
+    fn apply_filter(&self, filter_apply: FilterApply) -> Result<(usize, usize), String> {
+        match filter_apply {
+            FilterApply::Wait => (self.filters.rebuild)(),
+            FilterApply::Background => {
+                self.filters.deferred_rebuild.request();
+                let engine = self.filters.filter.load();
+                Ok((engine.block_count(), engine.allow_count()))
+            }
+        }
+    }
+
+    fn filter_apply_status(&self) -> String {
+        self.filters.deferred_rebuild.status_json()
+    }
 }
 
-/**
- * @brief 메서드 하나를 관리 API 콜백으로 감싼다. 콜백마다 핸들 묶음을 가리키는 Arc 를 하나씩 쥔다.
- * @details 클로저 인자에 타입을 적지 않으면 &str 인자의 수명이 하나로 굳어 콜백 타입과 맞지 않는다.
- */
+/// Wraps one method as a callback. Untyped closure parameters would pin `&str` to one lifetime.
 macro_rules! bind {
     ($deps:ident . $method:ident ( $($arg:ident : $ty:ty),* )) => {{
         let deps = Arc::clone(&$deps);
@@ -97,14 +109,13 @@ macro_rules! bind {
     }};
 }
 
-/** @brief 관리 API 콜백을 만든다. */
 pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
     let deps = Arc::new(deps);
     onetdns_control::Controls {
         reload: bind!(deps.rebuild_filter()),
         block_add: bind!(deps.block_add(rule: &str)),
         allow_add: bind!(deps.allow_add(rule: &str)),
-        service_set: bind!(deps.service_set(svc: &str, enable: bool)),
+        service_set: bind!(deps.service_set(svc: &str, enable: bool, apply: FilterApply)),
         safesearch_set: bind!(deps.safesearch_set(enable: bool)),
         export: bind!(deps.export()),
         import: bind!(deps.import(body: &str)),
@@ -112,13 +123,13 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         config_diff: bind!(deps.config_diff(proposed: &str)),
         config_set_diff: bind!(deps.config_set_diff(body: &str)),
         config_apply: bind!(deps.config_apply(toml: &str)),
-        config_set: bind!(deps.config_set(body: &str)),
+        config_set: bind!(deps.config_set(body: &str, apply: FilterApply)),
         config_schema: bind!(deps.config_schema()),
         upstream_test: bind!(deps.upstream_test(body: &str)),
         cache_flush: bind!(deps.cache_flush()),
         rewrites_list: bind!(deps.rewrites_list()),
-        rewrite_add: bind!(deps.rewrite_add(body: &str)),
-        rewrite_delete: bind!(deps.rewrite_delete(body: &str)),
+        rewrite_add: bind!(deps.rewrite_add(body: &str, apply: FilterApply)),
+        rewrite_delete: bind!(deps.rewrite_delete(body: &str, apply: FilterApply)),
         services_catalog: bind!(deps.services_catalog()),
         access_list: bind!(deps.access_list()),
         tls_status: bind!(deps.tls_status()),
@@ -156,11 +167,12 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         filter_sources: bind!(deps.filter_sources()),
         subscriptions_list: bind!(deps.subscriptions_list()),
         subscription_add: bind!(deps.subscription_add(body: &str)),
-        subscription_remove: bind!(deps.subscription_remove(url: &str)),
-        subscription_update: bind!(deps.subscription_update(body: &str)),
-        subscription_refresh: bind!(deps.subscription_refresh(body: &str)),
+        subscription_remove: bind!(deps.subscription_remove(url: &str, apply: FilterApply)),
+        subscription_update: bind!(deps.subscription_update(body: &str, apply: FilterApply)),
+        subscription_refresh: bind!(deps.subscription_refresh(body: &str, apply: FilterApply)),
         filter_rules_list: bind!(deps.filter_rules_list()),
-        filter_rule_mutate: bind!(deps.filter_rule_mutate(body: &str, add: bool)),
+        filter_rule_mutate: bind!(deps.filter_rule_mutate(body: &str, add: bool, apply: FilterApply)),
+        filter_apply_status: bind!(deps.filter_apply_status()),
         clients_list: bind!(deps.clients_list()),
         upstreams_list: bind!(deps.upstreams_list()),
         jobs_list: bind!(deps.jobs_list()),
@@ -171,9 +183,9 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         dhcp_static_list: bind!(deps.dhcp_static_list()),
         dhcp_static_add: bind!(deps.dhcp_static_add(body: &str)),
         dhcp_static_remove: bind!(deps.dhcp_static_remove(identity: &str)),
-        client_add: bind!(deps.client_add(body: &str)),
-        client_remove: bind!(deps.client_remove(name: &str)),
-        client_update: bind!(deps.client_update(body: &str)),
+        client_add: bind!(deps.client_add(body: &str, apply: FilterApply)),
+        client_remove: bind!(deps.client_remove(name: &str, apply: FilterApply)),
+        client_update: bind!(deps.client_update(body: &str, apply: FilterApply)),
         password_change: bind!(deps.password_change(name: &str, hash: &str)),
         user_create: bind!(deps.user_create(name: &str, hash: &str)),
         upstream_add: bind!(deps.upstream_add(entry: &str)),

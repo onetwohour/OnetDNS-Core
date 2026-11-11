@@ -40,6 +40,7 @@ A request without valid credentials gets 401, and a read-only caller gets 403 fr
 - Responses are JSON unless an endpoint lists otherwise. Most endpoints reject a request with a 4xx status and `{"error":"..."}`. Authentication and access failures (401, 403) come back as plain text.
 - While the server applies new settings, requests that change anything get 503. Retry once `/readyz` returns 200.
 - Every request that changes something, and every authentication or access failure, goes to the audit log (`GET /v1/audit`).
+- A change that rebuilds the filter answers after the rebuild, and a failed rebuild undoes it. Send `Prefer: respond-async` to get the answer once the change is saved; the filter catches up in the background, and `GET /v1/filter/apply` reports when it has. If that rebuild fails, the change stays saved and the previous filter keeps running. The header applies to `POST /v1/services`, `POST /v1/config/set`, `POST` and `DELETE /v1/rewrites`, `PATCH` and `DELETE /v1/filter/subscriptions`, `POST /v1/filter/subscriptions/refresh`, `POST` and `DELETE /v1/filter/rules`, and `POST`, `PATCH`, and `DELETE /v1/clients`. A `/v1/config/set` that changes `blocklists` or `allowlists` still waits, because only a rebuild can check those files.
 
 ## Jobs
 
@@ -413,7 +414,8 @@ Block and allow rules, blocklist subscriptions, blocked services, safe search, r
 | POST | `/v1/filter/subscriptions` | admin | Add a blocklist subscription (admin only). The list is downloaded first and is not saved if the download fails. With background, the download and save run as a job; follow it at /v1/jobs/{id} |
 | PATCH | `/v1/filter/subscriptions` | admin | Enable or disable a blocklist subscription (admin only) |
 | DELETE | `/v1/filter/subscriptions` | admin | Delete a blocklist subscription (admin only) |
-| POST | `/v1/filter/subscriptions/refresh` | admin | Refresh the given blocklist subscription (admin only) |
+| POST | `/v1/filter/subscriptions/refresh` | admin | Refresh the given blocklist subscription (admin only). With `Prefer: respond-async`, the download runs as a job |
+| GET | `/v1/filter/apply` | read-only | Whether changes saved with Prefer: respond-async have reached the running filter |
 | GET | `/v1/filter/rules` | read-only | User block and allow rules, and domains answered with REFUSED |
 | POST | `/v1/filter/rules` | admin | Add a filter rule (admin only) |
 | DELETE | `/v1/filter/rules` | admin | Delete a filter rule (admin only) |
@@ -620,8 +622,14 @@ Request body (`application/json`):
 
 | Status | Response |
 |---|---|
-| 200 | `{refreshed:true}` |
+| 200 | {refreshed:true}, or {id,status} with Prefer: respond-async |
 | 400 | `{error}` |
+
+#### `GET /v1/filter/apply`
+
+| Status | Response |
+|---|---|
+| 200 | `{pending,error}` |
 
 #### `GET /v1/filter/rules`
 

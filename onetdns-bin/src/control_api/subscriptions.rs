@@ -2,10 +2,11 @@ use super::*;
 use crate::atomic_file::with_rollback_result;
 use crate::config_apply::update_runtime_config;
 use crate::filters::{
-    active_subscription_urls, fetch_blocklist, fetch_blocklists_meta, persist_subscription_state,
-    preset_list_kind, try_list_refresh_lock, SubMeta,
+    active_subscription_urls, fetch_blocklist, fetch_blocklists_meta, load_blocklist_cache,
+    persist_subscription_state, preset_list_kind, try_list_refresh_lock, SubMeta,
 };
-use onetdns_control::ApiResponse;
+use onetdns_control::{ApiResponse, FilterApply};
+use std::sync::atomic::Ordering;
 
 const SUBSCRIPTIONS_PATH: &str = "/v1/filter/subscriptions";
 
@@ -146,31 +147,39 @@ impl ControlDeps {
             return check;
         }
         if request.background {
-            self.start_add_job(request, body)
+            let body = body.to_string();
+            self.start_job("add-list", move |deps| {
+                let response = deps.download_and_save(&request, &body);
+                let url = &request.url;
+                if response.0.starts_with('2') {
+                    onetdns_core::info!(event = "filter.subscription_added", %url, "Added a blocklist");
+                    Ok(())
+                } else {
+                    let error = response_error(&response);
+                    onetdns_core::warn!(event = "filter.subscription_add_failed", %url, %error, "Could not add a blocklist");
+                    Err(error)
+                }
+            })
         } else {
             self.download_and_save(&request, body)
         }
     }
 
-    fn start_add_job(self: &Arc<Self>, request: NewSubscription, body: &str) -> ApiResponse {
-        let Some(id) = self.jobs.create("add-list") else {
+    /// Runs `work` on its own thread; the response carries the job id.
+    fn start_job(
+        self: &Arc<Self>,
+        kind: &'static str,
+        work: impl FnOnce(&Self) -> Result<(), String> + Send + 'static,
+    ) -> ApiResponse {
+        let Some(id) = self.jobs.create(kind) else {
             return error_response("503 Service Unavailable", "Too many jobs are running");
         };
         let deps = Arc::clone(self);
-        let body = body.to_string();
         let spawned = std::thread::Builder::new()
-            .name(format!("add-list-{id}"))
-            .spawn(move || {
-                let response = deps.download_and_save(&request, &body);
-                let url = &request.url;
-                if response.0.starts_with('2') {
-                    onetdns_core::info!(event = "filter.subscription_added", %url, "Added a blocklist");
-                    deps.jobs.finish(id, true, String::new());
-                } else {
-                    let error = response_error(&response);
-                    onetdns_core::warn!(event = "filter.subscription_add_failed", %url, %error, "Could not add a blocklist");
-                    deps.jobs.finish(id, false, error);
-                }
+            .name(format!("{kind}-{id}"))
+            .spawn(move || match work(&deps) {
+                Ok(()) => deps.jobs.finish(id, true, String::new()),
+                Err(error) => deps.jobs.finish(id, false, error),
             });
         match spawned {
             Ok(thread) => {
@@ -241,7 +250,12 @@ impl ControlDeps {
         next_meta.retain(|item| &item.url != url);
         next_meta.push(fresh);
         *self.filters.sub_meta.lock_recover() = next_meta;
-        if let Err(error) = (self.filters.rebuild)() {
+        let apply = if request.background {
+            FilterApply::Background
+        } else {
+            FilterApply::Wait
+        };
+        if let Err(error) = self.apply_filter(apply) {
             *urls.lock_recover() = previous_urls.clone();
             *titles.lock_recover() = previous_titles.clone();
             *disabled.lock_recover() = previous_disabled.clone();
@@ -275,7 +289,11 @@ impl ControlDeps {
     }
 
     /// Rolls back when the filter cannot be rebuilt without the list.
-    pub(super) fn subscription_remove(&self, url: &str) -> Result<String, String> {
+    pub(super) fn subscription_remove(
+        &self,
+        url: &str,
+        apply: FilterApply,
+    ) -> Result<String, String> {
         let urls = &self.filters.sub_urls;
         let titles = &self.filters.sub_titles;
         let disabled = &self.filters.sub_disabled;
@@ -313,10 +331,10 @@ impl ControlDeps {
             &next_disabled,
             &self.filters.preset_urls.lock_recover(),
         );
-        let next_meta =
-            fetch_blocklists_meta(&active, &self.blocklist_resolver, &previous_meta, None);
+        let mut next_meta = previous_meta.clone();
+        next_meta.retain(|item| active.contains(&item.url));
         *self.filters.sub_meta.lock_recover() = next_meta;
-        if let Err(error) = (self.filters.rebuild)() {
+        if let Err(error) = self.apply_filter(apply) {
             *urls.lock_recover() = previous_urls.clone();
             *titles.lock_recover() = previous_titles.clone();
             *disabled.lock_recover() = previous_disabled.clone();
@@ -349,8 +367,28 @@ impl ControlDeps {
         Ok("{\"removed\":true}".to_string())
     }
 
-    /// Enables or disables a subscription; rolls back when the filter cannot be rebuilt.
-    pub(super) fn subscription_update(&self, body: &str) -> Result<String, String> {
+    /// Enables or disables a subscription; rolls back when the filter cannot be rebuilt. Only a
+    /// list enabled without a cached copy needs a download; `Background` leaves that to the
+    /// refresh job.
+    pub(super) fn subscription_update(
+        &self,
+        body: &str,
+        apply: FilterApply,
+    ) -> Result<String, String> {
+        let (response, needs_download) = self.update_subscription_state(body, apply)?;
+        // After the list refresh lock is released: a refresh job that finds it busy skips its turn.
+        if needs_download {
+            self.filters.list_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(response)
+    }
+
+    /// Returns the response and whether the refresh job must fetch a list.
+    fn update_subscription_state(
+        &self,
+        body: &str,
+        apply: FilterApply,
+    ) -> Result<(String, bool), String> {
         let disabled = &self.filters.sub_disabled;
         let request = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
@@ -390,10 +428,16 @@ impl ControlDeps {
             &next_disabled,
             &self.filters.preset_urls.lock_recover(),
         );
-        let next_meta =
-            fetch_blocklists_meta(&active, &self.blocklist_resolver, &previous_meta, None);
+        let mut next_meta = previous_meta.clone();
+        next_meta.retain(|item| active.contains(&item.url));
+        let mut needs_download = false;
+        if enabled && !next_meta.iter().any(|item| item.url == url) {
+            let (meta, missing) = self.enabled_list_meta(url, apply);
+            next_meta.push(meta);
+            needs_download = missing;
+        }
         *self.filters.sub_meta.lock_recover() = next_meta;
-        if let Err(error) = (self.filters.rebuild)() {
+        if let Err(error) = self.apply_filter(apply) {
             *disabled.lock_recover() = previous_disabled.clone();
             *self.filters.sub_meta.lock_recover() = previous_meta;
             let error = with_rollback_result(
@@ -421,29 +465,100 @@ impl ControlDeps {
             config.blocklist_titles = applied_titles;
             config.disabled_blocklist_urls = applied_disabled;
         });
-        Ok(format!("{{\"updated\":true,\"enabled\":{enabled}}}"))
+        Ok((
+            format!("{{\"updated\":true,\"enabled\":{enabled}}}"),
+            needs_download,
+        ))
     }
 
-    pub(super) fn subscription_refresh(&self, body: &str) -> Result<String, String> {
-        let presets = &self.filters.preset_urls;
-        let disabled = &self.filters.sub_disabled;
-        let request = onetdns_core::json::parse(body)
-            .map_err(|_| "Could not parse the JSON request body".to_string())?;
-        let target = request
-            .get("url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim();
-        let _guard = try_list_refresh_lock(&self.filters.list_refresh_lock)?;
-        let current_urls = self.filters.sub_urls.lock_recover().clone();
-        let builtin = presets.lock_recover().iter().any(|item| item == target);
-        if !builtin && !current_urls.iter().any(|item| item == target) {
+    /// The metadata of a list being enabled, and whether it still has to be downloaded.
+    fn enabled_list_meta(&self, url: &str, apply: FilterApply) -> (SubMeta, bool) {
+        let cache_dir = self.filters.subscription_cache_dir.as_deref();
+        let urls = [url.to_string()];
+        if let Some(cached) = load_blocklist_cache(&urls, cache_dir).pop() {
+            return (cached, false);
+        }
+        match apply {
+            FilterApply::Background => (SubMeta::unavailable(url), true),
+            FilterApply::Wait => {
+                let fetched =
+                    fetch_blocklists_meta(&urls, &self.blocklist_resolver, &[], cache_dir)
+                        .pop()
+                        .unwrap_or_else(|| SubMeta::unavailable(url));
+                (fetched, false)
+            }
+        }
+    }
+
+    /// Downloads one list now, or as a job under `FilterApply::Background`.
+    pub(super) fn subscription_refresh(
+        self: &Arc<Self>,
+        body: &str,
+        apply: FilterApply,
+    ) -> ApiResponse {
+        let target = match refresh_target(body) {
+            Ok(target) => target,
+            Err(error) => return error_response("400 Bad Request", &error),
+        };
+        if let Err(error) = self.ensure_refreshable(&target) {
+            return error_response("400 Bad Request", &error);
+        }
+        match apply {
+            FilterApply::Wait => match self.refresh_list(&target, apply) {
+                Ok(()) => json_response("{\"refreshed\":true}"),
+                Err(error) => error_response("400 Bad Request", &error),
+            },
+            FilterApply::Background => self.start_job("refresh-list", move |deps| {
+                let result = deps.refresh_list(&target, apply);
+                if let Err(error) = &result {
+                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", url = %target, %error, "Could not update blocklist");
+                }
+                result
+            }),
+        }
+    }
+
+    fn ensure_refreshable(&self, target: &str) -> Result<(), String> {
+        let builtin = self
+            .filters
+            .preset_urls
+            .lock_recover()
+            .iter()
+            .any(|item| item == target);
+        if builtin {
+            return Ok(());
+        }
+        if !self
+            .filters
+            .sub_urls
+            .lock_recover()
+            .iter()
+            .any(|item| item == target)
+        {
             return Err(format!("Subscription not found: {target}"));
         }
-        if !builtin && disabled.lock_recover().iter().any(|item| item == target) {
+        if self
+            .filters
+            .sub_disabled
+            .lock_recover()
+            .iter()
+            .any(|item| item == target)
+        {
             return Err("A disabled subscription cannot be refreshed".to_string());
         }
-        let fresh = fetch_blocklist(target, &self.blocklist_resolver, None)?;
+        Ok(())
+    }
+
+    /// Downloads before taking the list refresh lock, so other list changes are not held up.
+    fn refresh_list(&self, target: &str, apply: FilterApply) -> Result<(), String> {
+        let fresh = fetch_blocklist(
+            target,
+            &self.blocklist_resolver,
+            self.filters.subscription_cache_dir.as_deref(),
+        )?;
+        let _guard = self.filters.list_refresh_lock.lock_recover();
+        // The list may have been removed or disabled during the download.
+        self.ensure_refreshable(target)?;
         let previous_meta = self.filters.sub_meta.lock_recover().clone();
         let mut next_meta = previous_meta.clone();
         match next_meta.iter_mut().find(|item| item.url == target) {
@@ -451,7 +566,7 @@ impl ControlDeps {
             None => next_meta.push(fresh),
         }
         *self.filters.sub_meta.lock_recover() = next_meta;
-        if let Err(error) = (self.filters.rebuild)() {
+        if let Err(error) = self.apply_filter(apply) {
             *self.filters.sub_meta.lock_recover() = previous_meta;
             let error = with_rollback_result(
                 error,
@@ -460,6 +575,17 @@ impl ControlDeps {
             );
             return Err(error);
         }
-        Ok("{\"refreshed\":true}".to_string())
+        Ok(())
     }
+}
+
+fn refresh_target(body: &str) -> Result<String, String> {
+    let request = onetdns_core::json::parse(body)
+        .map_err(|_| "Could not parse the JSON request body".to_string())?;
+    Ok(request
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }

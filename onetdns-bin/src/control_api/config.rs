@@ -1,19 +1,19 @@
-/*!
- * @brief 관리 API: 설정 파일을 읽고 고치고 반영한다.
- */
+//! Management API: reads, edits, and applies the config file.
 
 use super::*;
 use crate::config_apply::{
     conditional_hot_reload_keys, config_changed_keys, config_status_json, desired_config_json,
     normalize_config_for_comparison, service_restart_keys,
 };
+use onetdns_control::FilterApply;
+
 use crate::config_edit::{
     json_to_toml_literal, materialize_mode_acl_patch, merge_config_snippet, remove_config_key,
     rewrite_config_kv, validate_config_patch_values,
 };
 
 impl ControlDeps {
-    /** @brief 설정 조각을 지금 원문에 합쳐 검사한다. 적용하지는 않는다. */
+    /// Checks a snippet merged into the current text without applying it.
     pub(super) fn config_validate(&self, toml: &str) -> Result<(), String> {
         let startup = self.cfg_text.clone().unwrap_or_default();
         let current = current_config_text(self.config_path.as_deref(), &startup)?;
@@ -22,7 +22,6 @@ impl ControlDeps {
         runtime_preflight(&cfg)
     }
 
-    /** @brief 설정 조각을 합치면 무엇이 바뀌고 어떻게 반영되는지. */
     pub(super) fn config_diff(&self, proposed: &str) -> Result<String, String> {
         let startup = self.cfg_text.clone().unwrap_or_default();
         let current = current_config_text(self.config_path.as_deref(), &startup)?;
@@ -30,7 +29,6 @@ impl ControlDeps {
         change_report(&self.runtime_cfg.load(), &current, &proposed)
     }
 
-    /** @brief 항목들을 고치면 무엇이 바뀌고 어떻게 반영되는지. */
     pub(super) fn config_set_diff(&self, body: &str) -> Result<String, String> {
         let startup = self.cfg_text.clone().unwrap_or_default();
         let pairs = config_patch(body)?;
@@ -39,7 +37,6 @@ impl ControlDeps {
         change_report(&self.runtime_cfg.load(), &current, &proposed)
     }
 
-    /** @brief 설정 조각을 합쳐 반영한다. */
     pub(super) fn config_apply(&self, toml: &str) -> Result<String, String> {
         let result = self.edit_config(|text| merge_config_snippet(text, toml))?;
         onetdns_core::info!(
@@ -52,10 +49,9 @@ impl ControlDeps {
         Ok(format!("{{\"applied\":true,{}}}", result.json_fields()))
     }
 
-    /** @brief 항목 몇 개를 고쳐 반영한다. */
-    pub(super) fn config_set(&self, body: &str) -> Result<String, String> {
+    pub(super) fn config_set(&self, body: &str, apply: FilterApply) -> Result<String, String> {
         let pairs = config_patch(body)?;
-        let result = self.edit_config(|text| apply_config_patch(text, &pairs))?;
+        let result = self.edit_config_with(apply, |text| apply_config_patch(text, &pairs))?;
         let keys: Vec<String> = pairs
             .iter()
             .map(|(k, _)| onetdns_core::json::escape(k))
@@ -75,14 +71,10 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 설정 명세와 재시작 없이 바뀌는 항목들. */
     pub(super) fn config_schema(&self) -> String {
         let keys = onetdns_config::known_keys();
         let list: Vec<String> = keys.iter().map(|k| onetdns_core::json::escape(k)).collect();
-        /*
-         * 재시작 여부는 적용할 때와 같은 규칙에서 낸다. 따로 정하면 화면이 실제로
-         * 재시작하는 항목을 무중단이라고 적는다.
-         */
+        // Uses the rule applying uses, or the dashboard would call a restarting key hot.
         let conditional_keys = conditional_hot_reload_keys(&self.runtime_cfg.load());
         let hot: Vec<String> = keys
             .iter()
@@ -104,7 +96,6 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 직전 설정으로 되돌린다. */
     pub(super) fn config_rollback(&self) -> Result<String, String> {
         let snapshot = self.config_prev.lock_recover().clone();
         let Some(text) = snapshot else {
@@ -120,22 +111,19 @@ impl ControlDeps {
         Ok(format!("{{\"rolled_back\":true,{}}}", result.json_fields()))
     }
 
-    /** @brief 파일에 적힌 설정. */
     pub(super) fn config_desired(&self) -> String {
         desired_config_json(self.config_path.as_deref(), &self.runtime_cfg.load())
     }
 
-    /** @brief 지금 적용 중인 설정. */
     pub(super) fn config_effective(&self) -> String {
         self.runtime_cfg.load().effective_json()
     }
 
-    /** @brief 파일과 적용 중인 설정이 어긋나는지. */
     pub(super) fn config_status(&self) -> String {
         config_status_json(self.config_path.as_deref(), &self.runtime_cfg.load())
     }
 
-    /** @brief 파일에 저장된 설정을 반영한다. 항목이 그대로면 인증서 파일만 다시 읽는다. */
+    /// Applies the saved file. With no key changed, only re-reads certificate files.
     pub(super) fn config_reload(&self) -> Result<String, String> {
         let path = self.config_path.as_deref().ok_or_else(|| {
             "There is no configuration file path, so the on-disk configuration cannot be applied".to_string()
@@ -152,10 +140,7 @@ impl ControlDeps {
                 *self.config_prev.lock_recover() = previous_text;
                 *self.applied_config_text.lock_recover() = Some(text);
             }
-            /*
-             * 설정 항목이 그대로여도 그 항목이 가리키는 인증서 파일은 갱신되었을 수 있다. 여기서
-             * 보지 않으면 갱신 뒤 다시 시작할 때까지 만료된 인증서를 계속 내민다.
-             */
+            // A renewed certificate leaves the keys unchanged but must still be picked up.
             if let Some(slots) = self.tls_slot_handle.lock_recover().clone() {
                 let swapped = slots.refresh_certificate_files(&current)?;
                 if !swapped.is_empty() {
@@ -212,7 +197,7 @@ impl ControlDeps {
     }
 }
 
-/** @brief 지금 설정 파일의 원문. 파일 없이 돌면 시작할 때 읽은 원문이다. */
+/// Without a config file, the text read at startup.
 fn current_config_text(
     path: Option<&std::path::Path>,
     startup: &onetdns_core::SecretString,
@@ -230,10 +215,7 @@ fn current_config_text(
     }
 }
 
-/**
- * @brief /v1/config/set 본문을 바꿀 항목 목록으로 읽는다.
- * @details 적용과 미리보기가 이 함수 하나로 읽어야 미리보기가 적용과 같은 항목을 판정한다.
- */
+/// Shared by apply and preview, so a preview judges the same keys.
 fn config_patch(body: &str) -> Result<Vec<(String, onetdns_core::json::Json)>, String> {
     let onetdns_core::json::Json::Obj(mut pairs) = onetdns_core::json::parse(body)
         .map_err(|_| "Could not parse the JSON request body".to_string())?
@@ -248,11 +230,7 @@ fn config_patch(body: &str) -> Result<Vec<(String, onetdns_core::json::Json)>, S
     Ok(pairs)
 }
 
-/**
- * @brief 설정 원문에 항목들을 적는다.
- * @details null 은 항목을 지우라는 뜻이다. 값을 비우는 것과 달리 기본값으로 돌아가고, 선택 항목은
- *          꺼진다.
- */
+/// A null value removes the key, returning it to its default.
 fn apply_config_patch(
     text: &str,
     pairs: &[(String, onetdns_core::json::Json)],
@@ -267,13 +245,8 @@ fn apply_config_patch(
     Ok(out)
 }
 
-/**
- * @brief 설정 원문을 current 에서 proposed 로 바꾸면 무엇이 바뀌고 어떻게 반영되는지 JSON으로.
- * @details 반영하는 경로와 같은 입력으로 같은 판정을 내야 미리보기가 반영 결과와 맞는다. 반영
- *          경로는 파일 원문이 그대로면 아무것도 반영하지 않고, 원문이 바뀌면 실행 중 설정과
- *          비교용으로 맞춘 새 설정 전체를 비교해 service_restart_keys 로 판정한다. 그래서 파일에만
- *          적혀 있고 아직 반영하지 않은 항목은 원문이 함께 바뀔 때만 이번 변경에 들어간다.
- */
+/// Judges a change as applying does: unchanged text applies nothing, and changed text compares
+/// the whole new config with the running one.
 fn change_report(active: &Config, current: &str, proposed: &str) -> Result<String, String> {
     let (added, removed, changed) =
         onetdns_config::Config::diff_toml(current, proposed).map_err(|e| e.to_string())?;

@@ -1356,7 +1356,7 @@ pub fn serve(
     let console_auth: Arc<Mutex<Option<Arc<onetdns_control::Auth>>>> = Arc::new(Mutex::new(None));
     let control_proxy = Arc::new(ArcSwap::from_pointee(control_proxy_policy(&cfg)));
 
-    let hot_config_apply = hot_apply::build(hot_apply::HotApplyDeps {
+    let hot_appliers = hot_apply::build(hot_apply::HotApplyDeps {
         restarts: restarts.clone(),
         zones: zones.clone(),
         filters: filters.clone(),
@@ -1393,7 +1393,8 @@ pub fn serve(
         reload: reload.clone(),
         config_prev: config_prev.clone(),
         applied_config_text: applied_config_text.clone(),
-        hot_config_apply: hot_config_apply.clone(),
+        hot_config_apply: hot_appliers.wait.clone(),
+        hot_config_apply_background: hot_appliers.background,
         policy_engine: policy_engine.clone(),
         blocklist_resolver: blocklist_resolver.clone(),
         dhcp_slot: dhcp_slot.clone(),
@@ -1417,7 +1418,7 @@ pub fn serve(
         config_prev,
         applied_config_text,
         reload.clone(),
-        hot_config_apply,
+        hot_appliers.wait,
     );
     *restarts.raft.lock_recover() = Some({
         let restart_raft = restart_raft.clone();

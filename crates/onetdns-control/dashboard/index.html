@@ -110,6 +110,7 @@
         <sc-if value="{{ desktop }}"><p style="margin:3px 0 0;font-size:12.5px;color:var(--muted);font-weight:500">{{ viewSub }}</p></sc-if>
       </div>
       <div style="flex:1"></div>
+      <div role="status" aria-live="polite" style="display:flex;min-width:0"><sc-if value="{{ activityShown }}"><span style="display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:500;color:var(--muted);white-space:nowrap;animation:odSlideIn .2s ease .3s both"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="animation:odSpin .8s linear infinite"><path d="M21 12a9 9 0 1 1-6.2-8.6"></path></svg><span>{{ activityLabel }}</span></span></sc-if></div>
 
       <button data-hc="" onClick="{{ toggleLang }}" title="{{ langTitle }}" style="height: 38px; padding: 0 12px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--fg2); border-radius: 3px; font: inherit; font-size: 12px; font-weight: 700; letter-spacing: .04em">{{ langLabel }}</button>
 
@@ -322,7 +323,7 @@
               <sc-if value="{{ !b.editable }}"><span aria-hidden="true" style="width:38px;flex:0 0 38px"></span></sc-if>
               <span style="width:32px;height:32px;border-radius:3px;background:var(--surface2);display:flex;align-items:center;justify-content:center;flex:0 0 32px;color:{{ b.iconColor }}">{{ b.icon }}</span>
               <div style="flex:1;min-width:0">
-                <div style="font-size: 13.5px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ b.name }}</div>
+                <div style="font-size: 13.5px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ b.name }}<sc-if value="{{ b.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></div>
                 <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px">{{ b.url }}</div>
                 <sc-if value="{{ b.presetNote }}"><div style="font-size:11px;color:var(--muted);margin-top:2px">{{ b.presetNote }}</div></sc-if>
               </div>
@@ -363,14 +364,14 @@
             <div style="border-right:1px solid var(--border)">
               <div style="display:flex;align-items:center;gap:9px;padding:13px 18px;border-bottom:1px solid var(--border)"><span style="width:9px;height:9px;border-radius:3px;background:var(--block)"></span><span style="font-size:12.5px;font-weight:500;color:var(--fg);font-family:var(--font-display)">차단 규칙</span></div>
               <div style="max-height:240px;overflow-y:auto">
-                <sc-for list="{{ blockRules }}" as="r" hint-placeholder-count="3"><div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border)"><span style="flex:1;font-family:var(--font-mono);font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" style="background:none;border:0;cursor:pointer;color:var(--faint);padding:2px;display:flex"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div></sc-for>
+                <sc-for list="{{ blockRules }}" as="r" hint-placeholder-count="3"><div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border)"><span style="flex:1;font-family:var(--font-mono);font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" style="background:none;border:0;cursor:pointer;color:var(--faint);padding:2px;display:flex"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div></sc-for>
                 <sc-if value="{{ !hasBlockRules }}"><div style="padding:22px 18px;text-align:center;color:var(--muted);font-size:12px">아직 추가한 차단 규칙이 없습니다.</div></sc-if>
               </div>
             </div>
             <div>
               <div style="display:flex;align-items:center;gap:9px;padding:13px 18px;border-bottom:1px solid var(--border)"><span style="width:9px;height:9px;border-radius:3px;background:var(--ok)"></span><span style="font-size:12.5px;font-weight:500;color:var(--fg);font-family:var(--font-display)">허용 규칙</span></div>
               <div style="max-height:240px;overflow-y:auto">
-                <sc-for list="{{ allowRules }}" as="r" hint-placeholder-count="2"><div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border)"><span style="flex:1;font-family:var(--font-mono);font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" style="background:none;border:0;cursor:pointer;color:var(--faint);padding:2px;display:flex"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div></sc-for>
+                <sc-for list="{{ allowRules }}" as="r" hint-placeholder-count="2"><div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border)"><span style="flex:1;font-family:var(--font-mono);font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" style="background:none;border:0;cursor:pointer;color:var(--faint);padding:2px;display:flex"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div></sc-for>
                 <sc-if value="{{ !hasAllowRules }}"><div style="padding:22px 18px;text-align:center;color:var(--muted);font-size:12px">아직 추가한 허용 규칙이 없습니다.</div></sc-if>
               </div>
             </div>
@@ -404,7 +405,7 @@
           <div style="display:grid;grid-template-columns:{{ g2cat }};gap:10px">
             <sc-for list="{{ services }}" as="x" hint-placeholder-count="8">
               <div style="display:flex;align-items:center;gap:13px;border:1px solid var(--border);border-radius:3px;padding:13px 15px">
-                <div style="flex:1"><div style="font-size: 13.5px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ x.name }}</div><div style="font-size:11px;font-weight:600;margin-top:2px;color:{{ x.statusColor }}">{{ x.statusLabel }}</div></div>
+                <div style="flex:1"><div style="font-size: 13.5px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ x.name }}</div><div style="font-size:11px;font-weight:600;margin-top:2px;color:{{ x.statusColor }}">{{ x.statusLabel }}<sc-if value="{{ x.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></div></div>
                 <button onClick="{{ x.onToggle }}" role="switch" aria-checked="{{ x.blocked }}" aria-label="{{ x.toggleLabel }}" style="{{ x.track }}"><span style="{{ x.knob }}"></span></button>
               </div>
             </sc-for>
@@ -432,7 +433,7 @@
             <div style="display: grid; grid-template-columns: 1.4fr 1.6fr 1fr 110px 80px; gap: 0; min-width: 620px; padding: 14px 0; border-bottom: 1px solid var(--border); align-items: center; animation:odRowGrow .42s cubic-bezier(.4,0,.2,1); padding-left: 18px; padding-right: 18px">
               <div style="display:flex;align-items:center;gap:10px">
                 <span style="width:30px;height:30px;border-radius:3px;background:var(--accent-bg);display:flex;align-items:center;justify-content:center;color:var(--accent)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"></rect><path d="M11 18h2"></path></svg></span>
-                <span style="font-size: 13px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ c.name }}</span>
+                <span style="font-size: 13px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ c.name }}</span><sc-if value="{{ c.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if>
               </div>
               <span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg2)">{{ c.idsStr }}</span>
               <span style="font-size:12px;color:var(--muted)">{{ c.blockStr }}</span>
@@ -848,7 +849,7 @@
           <section style="min-width:0">
             <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">DNS 응답 재작성</div><div style="font-size:11px;color:var(--muted);margin-top:3px">특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경</div></div>
             <div data-mform="" data-submit-enter="" style="padding:13px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)"><input data-k="rewriteDomain" value="{{ forms.rewriteDomain }}" onInput="{{ onForm }}" aria-label="재작성 도메인" placeholder="router.lan" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><input data-k="rewriteAnswer" value="{{ forms.rewriteAnswer }}" onInput="{{ onForm }}" aria-label="재작성 응답" placeholder="10.0.0.1" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ addRewrite }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button></div>
-            <sc-if value="{{ hasRewrites }}"><div><sc-for list="{{ rewriteRows }}" as="r" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,.75fr) 32px;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)"><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.domain }}</span><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.answer }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" title="{{ r.removeLabel }}" style="width:30px;height:30px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--block);cursor:pointer">×</button></div></sc-for></div></sc-if>
+            <sc-if value="{{ hasRewrites }}"><div><sc-for list="{{ rewriteRows }}" as="r" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,.75fr) 32px;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)"><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.domain }}<sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></span><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.answer }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" title="{{ r.removeLabel }}" style="width:30px;height:30px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--block);cursor:pointer">×</button></div></sc-for></div></sc-if>
             <sc-if value="{{ !hasRewrites }}"><div style="padding:20px 0;text-align:center;font-size:11.5px;color:var(--muted)">등록된 재작성 규칙이 없습니다.</div></sc-if>
           </section>
 
@@ -4346,6 +4347,12 @@ Object.assign(I18N.zh, {
 });
 
 // 서버는 영어로 응답한다. 화면이 아는 서버 문구는 영어 원문을 키로 각 언어에 옮긴다.
+Object.assign(I18N.en, {'적용 중…':'Applying…','처리 중…':'Working…','필터 적용 중…':'Applying filter…','필터를 적용하지 못했습니다':'Could not apply the filter'});
+Object.assign(I18N.ja, {'적용 중…':'適用中…','처리 중…':'処理中…','필터 적용 중…':'フィルターを適用中…','필터를 적용하지 못했습니다':'フィルターを適用できませんでした'});
+Object.assign(I18N.zh, {'적용 중…':'正在应用…','처리 중…':'正在处理…','필터 적용 중…':'正在应用过滤器…','필터를 적용하지 못했습니다':'无法应用过滤器'});
+Object.assign(I18N.ko, {'The filter build stopped unexpectedly':'필터를 만드는 작업이 비정상적으로 끝났습니다'});
+Object.assign(I18N.ja, {'The filter build stopped unexpectedly':'フィルターの構築が異常終了しました'});
+Object.assign(I18N.zh, {'The filter build stopped unexpectedly':'过滤器构建意外中止'});
 Object.assign(I18N.ko, {
   "Raft is not configured":"Raft 고가용성 기능이 설정되어 있지 않습니다",
   "Raft high availability is not configured":"Raft 고가용성 기능이 설정되어 있지 않습니다",
@@ -4796,7 +4803,7 @@ class Component extends DCLogic {
     cluster: { self:{role:'standalone',listeners:0}, peers:[] },
     security: { rateLimit:0, anonymize:false, querylog:false, aclAllow:'', aclDeny:'' },
     reservations: [],
-    confirm:null, lnEdit:null, diff:null, configValid:null, pageExplain:null, listsUpdating:false, pausedEvents:[], pausedDropped:0, mutationPending:{}, tokenSecret:null, configDraft:{}, configDraftDirty:{}
+    confirm:null, lnEdit:null, diff:null, configValid:null, pageExplain:null, listsUpdating:false, pendingItems:{}, filterApplying:false, pausedEvents:[], pausedDropped:0, mutationPending:{}, tokenSecret:null, configDraft:{}, configDraftDirty:{}
   };
 
   componentDidMount(){
@@ -4912,7 +4919,7 @@ class Component extends DCLogic {
   sessionResetPatch(connectionState,notice){
     const f=this.state.forms||{};
     return {loggedIn:false,authRole:'none',authPending:false,restOnline:false,streamOnline:false,connectionState:connectionState||'offline',connectionAt:0,loginNotice:notice||'',
-      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},
+      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
       log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],
       operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,loaded:false},
@@ -4926,7 +4933,7 @@ class Component extends DCLogic {
     clearTimeout(this._socketRetry);clearTimeout(this._resyncT);clearTimeout(this._bootSubsT);clearTimeout(this._cfgFlush);clearTimeout(this._reverify);
     this._socketClosed=true;
     if(this._ws){this._ws.onclose=null;try{this._ws.close();}catch(e){}this._ws=null;}
-    this._mutationRequests={};this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;this._updateWatch=null;
+    this._mutationRequests={};this._writes={};this._filterWatch=false;this._filterItems=[];this.releaseFilterWaiters();this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;this._updateWatch=null;
     try{localStorage.removeItem('onetdns_token');}catch(e){}
     if(typeof document!=='undefined')document.querySelectorAll('input[type="file"]').forEach(input=>{try{input.value='';}catch(e){}});
     const state=reason==='auth-expired'?'auth-expired':'offline';
@@ -4968,7 +4975,7 @@ class Component extends DCLogic {
     }finally{clearTimeout(timeout);this._requestControllers.delete(controller);}
   }
   apiGet(path){ return this.request(path,{headers:this.apiHdr()}); }
-  apiSend(path,method,body){
+  apiSend(path,method,body,options){
     const readonlySafe=method==='POST'&&(path==='/v1/explain'||path==='/v1/resolve'||path==='/v1/policies/simulate'||path==='/v1/password');
     if(this.state.authRole==='readonly'&&path!=='/v1/logout'&&!readonlySafe){
       const r={ok:false,status:403,body:{error:'읽기 전용 계정에는 변경 권한이 없습니다'}};
@@ -4984,12 +4991,86 @@ class Component extends DCLogic {
     if(this._mutationRequests[key])return this._mutationRequests[key];
     this.setState(st=>({mutationPending:{...st.mutationPending,[key]:true}}));
     const generation=this._sessionGeneration;
-    const promise=this.request(path,{method,headers:this.apiHdr(body==null?{}:{'Content-Type':isStr?'text/plain':'application/json'}),body:body==null?undefined:(isStr?body:JSON.stringify(body))}).finally(()=>{
+    const headers={...(body==null?{}:{'Content-Type':isStr?'text/plain':'application/json'}),...(options&&options.background?{Prefer:'respond-async'}:{})};
+    const promise=this.request(path,{method,headers:this.apiHdr(headers),body:body==null?undefined:(isStr?body:JSON.stringify(body))}).finally(()=>{
       delete this._mutationRequests[key];
       if(generation===this._sessionGeneration)this.setState(st=>{const next={...st.mutationPending};delete next[key];return {mutationPending:next};});
     });
     this._mutationRequests[key]=promise;
     return promise;
+  }
+  // Writes to one resource go out in the order they were made, so the last action wins.
+  writeQueue(resource){this._writes=this._writes||{};return this._writes[resource]||(this._writes[resource]={tail:Promise.resolve(),count:0,epoch:0});}
+  // A read that overlapped a write to its resource is out of date and must not reach the screen.
+  writeGuard(resource){const q=this.writeQueue(resource),epoch=q.epoch;return ()=>q.epoch===epoch&&q.count===0;}
+  serialWrite(resource,send){
+    const q=this.writeQueue(resource);q.epoch++;q.count++;
+    const run=q.tail.then(send);
+    q.tail=run.catch(()=>{});
+    return run.finally(()=>{q.count--;q.epoch++;});
+  }
+  listInsert(list,index,item){const next=list.slice();next.splice(index<0?next.length:index,0,item);return next;}
+  clearPendingItems(keys){
+    if(!keys.length)return;
+    this.setState(state=>{const next={...state.pendingItems};for(const key of keys){if(next[key]>1)next[key]-=1;else delete next[key];}return {pendingItems:next};});
+  }
+  // Changes the screen first, then sends. A rejected write is undone and its reason shown.
+  async optimistic(resource,{item,background,apply,revert,send,reload,failure}){
+    const key=item==null?null:resource+':'+item,generation=this._sessionGeneration;
+    this.setState(state=>{const patch=apply?apply(state):null;return key==null?patch:{...patch,pendingItems:{...state.pendingItems,[key]:(state.pendingItems[key]||0)+1}};});
+    const r=await this.serialWrite(resource,send);
+    if(r.stale||generation!==this._sessionGeneration)return false;
+    if(!r.ok){if(revert)this.setState(revert);this.toastMsg(failure+this.errorText(r),true);}
+    if(r.ok&&background){if(key!=null)(this._filterItems=this._filterItems||[]).push(key);this.watchFilterApply();}
+    else if(key!=null)this.clearPendingItems([key]);
+    if(reload&&this.writeQueue(resource).count===0)reload();
+    return r.ok;
+  }
+  // Follows a saved change until the running filter has it. One poller serves every change.
+  watchFilterApply(){
+    this._filterWatchDirty=true;
+    if(this._filterWatch)return;
+    this._filterWatch=true;
+    const generation=this._sessionGeneration,live=()=>generation===this._sessionGeneration;
+    (async()=>{
+      let error=null,failures=0,sawPending=false;
+      while(live()){
+        this._filterWatchDirty=false;
+        const r=await this.apiGet('/v1/filter/apply');
+        if(!live())return;
+        if(r.ok&&r.body){
+          failures=0;
+          if(!r.body.pending&&!this._filterWatchDirty){error=sawPending&&r.body.error||null;break;}
+          if(r.body.pending){sawPending=true;this.setState(state=>state.filterApplying?null:{filterApplying:true});}
+        }else if(++failures>=10)break;
+        await new Promise(resolve=>setTimeout(resolve,700));
+        if(!live())return;
+      }
+      if(!live())return;
+      this._filterWatch=false;
+      const items=this._filterItems||[];this._filterItems=[];
+      this.clearPendingItems(items);
+      this.setState({filterApplying:false});
+      this.releaseFilterWaiters();
+      if(error)this.toastMsg(this.t('필터를 적용하지 못했습니다')+': '+this.t(String(error)),true);
+      if(sawPending){this.reloadSubs();if(this.state.view==='operations')this.loadOperations();}
+    })();
+  }
+  filterSettled(){return this._filterWatch?new Promise(resolve=>{(this._filterWaiters=this._filterWaiters||[]).push(resolve);}):Promise.resolve();}
+  releaseFilterWaiters(){const waiters=this._filterWaiters||[];this._filterWaiters=[];waiters.forEach(resolve=>resolve());}
+  async waitForJob(id,alive){
+    while(id){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      if(!alive())return {abandoned:true};
+      const j=await this.apiGet('/v1/jobs/'+encodeURIComponent(String(id)));
+      if(!alive()||j.stale)return {abandoned:true};
+      const job=j.ok&&j.body&&typeof j.body==='object'?j.body:null;
+      if(job&&job.status==='running')continue;
+      if(!job&&(j.status===0||j.status===408||j.status>=500))continue;
+      if(job&&job.status==='done')return {done:true,failure:''};
+      return {done:false,failure:job?this.t(String(job.result||'')):this.errorText(j)};
+    }
+    return {done:true,failure:''};
   }
   async checkAuth(){
     this.setState({authPending:true,connectionState:'connecting'});
@@ -5265,35 +5346,36 @@ class Component extends DCLogic {
     if(this.state.view==='operations')await this.loadOperations();
   }
   async loadClients(){
-    const r=await this.apiGet('/v1/clients');if(!(r.ok&&Array.isArray(r.body)))return false;
+    const fresh=this.writeGuard('clients');const r=await this.apiGet('/v1/clients');if(!(r.ok&&Array.isArray(r.body))||!fresh())return false;
     this.setState({clients:r.body.map((c,i)=>({id:i+1,name:c.name,nets:c.nets||[],clientIds:c.client_ids||[],ids:[...(c.nets||[]),...(c.client_ids||[])],tags:c.tags||[],blockCount:Number(c.block_rules)||0,block:[],disable:!!c.disable_filtering}))});return true;
   }
   async loadZones(){
-    const r=await this.apiGet('/v1/zones');if(!(r.ok&&Array.isArray(r.body)))return false;
+    const fresh=this.writeGuard('zones');const r=await this.apiGet('/v1/zones');if(!(r.ok&&Array.isArray(r.body)))return false;
     const zones=await Promise.all(r.body.map(async z=>{
       if(Array.isArray(z.record_items))return {origin:z.origin,serial:z.serial,records:z.record_items.map(x=>({name:x.name,type:x.type,ttl:Number(x.ttl),value:x.value}))};
       const d=await this.apiGet('/v1/zones/'+encodeURIComponent(z.origin));
       return {origin:z.origin,serial:z.serial,records:d.ok&&d.body&&Array.isArray(d.body.records)?d.body.records.map(x=>({name:x.name,type:x.type,ttl:Number(x.ttl),value:x.value})):[]};
-    }));this.setState({zones});return true;
+    }));if(!fresh())return false;this.setState({zones});return true;
   }
   async loadLeases(){
     const r=await this.apiGet('/v1/dhcp/leases');if(!(r.ok&&r.body))return false;const rem=l=>l.infinite===true?this.t('무기한'):(l.remaining==null?'—':this.duration(l.remaining));
     this.setState({leases:{v4:(Array.isArray(r.body.v4)?r.body.v4:[]).map(l=>({ip:l.ip,identity:l.identity||'',mac:l.mac||'',vendor:l.vendor||'',hostname:l.hostname||'',remaining:rem(l)})),v6:(Array.isArray(r.body.v6)?r.body.v6:[]).map(l=>({ip:l.ip,duid:l.duid||'',iaid:l.iaid||'',remaining:rem(l)}))}});return true;
   }
-  async loadReservations(){const r=await this.apiGet('/v1/dhcp/static');if(!(r.ok&&r.body&&Array.isArray(r.body.reservations)))return false;this.setState({reservationsAvailable:r.body.available===true,reservations:r.body.reservations.map(x=>({identity:x.identity||'',ip:x.ip||'',hostname:x.hostname||''}))});return true;}
+  async loadReservations(){const fresh=this.writeGuard('reservations');const r=await this.apiGet('/v1/dhcp/static');if(!(r.ok&&r.body&&Array.isArray(r.body.reservations))||!fresh())return false;this.setState({reservationsAvailable:r.body.available===true,reservations:r.body.reservations.map(x=>({identity:x.identity||'',ip:x.ip||'',hostname:x.hostname||''}))});return true;}
   async loadCluster(){const r=await this.apiGet('/v1/cluster/nodes');if(!(r.ok&&r.body))return false;this.setState({cluster:{identity:r.body.identity||null,self:r.body.self||{role:'standalone',listeners:0},peers:(r.body.peers||[]).map(x=>({url:x.url,healthy:x.healthy,role:x.role,rtt:x.rtt_ms,version:x.version}))}});return true;}
   async loadSchema(){const r=await this.apiGet('/v1/config/schema');if(!(r.ok&&r.body&&Array.isArray(r.body.fields)))return false;this.setState({schema:r.body.fields,schemaHot:Array.isArray(r.body.hot_reload_keys)?r.body.hot_reload_keys:[],schemaConditional:Array.isArray(r.body.conditional_hot_reload_keys)?r.body.conditional_hot_reload_keys:[]});return true;}
-  async loadServices(){const r=await this.apiGet('/v1/services');if(!(r.ok&&r.body&&Array.isArray(r.body.services)))return false;this.setState({services:r.body.services.map(x=>({id:x.id,name:x.name,group:x.group||'other',ruleCount:Number(x.rule_count)||0,blocked:!!x.blocked}))});return true;}
+  async loadServices(){const fresh=this.writeGuard('services');const r=await this.apiGet('/v1/services');if(!(r.ok&&r.body&&Array.isArray(r.body.services))||!fresh())return false;this.setState({services:r.body.services.map(x=>({id:x.id,name:x.name,group:x.group||'other',ruleCount:Number(x.rule_count)||0,blocked:!!x.blocked}))});return true;}
   async loadTls(){const r=await this.apiGet('/v1/tls');if(!(r.ok&&r.body))return false;const configured=!!r.body.configured;this.setState({cert:{configured,domain:configured?'검증 대기':'미설정',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—',valid:null}});return true;}
   async loadTokens(){
-    const tk=await this.apiGet('/v1/tokens');
-    if(tk.ok&&tk.body&&Array.isArray(tk.body.tokens)) this.setState({tokens:tk.body.tokens.map(t=>({id:t.id,name:t.masked,role:t.role}))});
+    const fresh=this.writeGuard('tokens');const tk=await this.apiGet('/v1/tokens');
+    if(tk.ok&&tk.body&&Array.isArray(tk.body.tokens)&&fresh()) this.setState({tokens:tk.body.tokens.map(t=>({id:t.id,name:t.masked,role:t.role}))});
   }
   async loadOperations(){
     if(this._operationsLoading)return false;this._operationsLoading=true;
     if(!this._updateWatch)this.loadUpdate();
     try{
       const names=['rewrites','plugins','filterReport','topRules','sources','jobs','access'];
+      const rewritesFresh=this.writeGuard('rewrites');
       const responses=await Promise.all([
         this.apiGet('/v1/rewrites'),this.apiGet('/v1/plugins'),this.apiGet('/v1/filter/report'),this.apiGet('/v1/filter/top-rules'),this.apiGet('/v1/filter/sources'),this.apiGet('/v1/jobs'),this.apiGet('/v1/access')
       ]);
@@ -5301,7 +5383,7 @@ class Component extends DCLogic {
       const availability={};names.forEach((name,index)=>{availability[name]=responses[index].ok===true;});
       this.setState(state=>{
         const previous=state.operations||{};
-        const rewriteBody=rw.ok?(Array.isArray(rw.body)?rw.body:Array.isArray(rw.body&&rw.body.rewrites)?rw.body.rewrites:[]):previous.rewrites||[];
+        const rewriteBody=rw.ok&&rewritesFresh()?(Array.isArray(rw.body)?rw.body:Array.isArray(rw.body&&rw.body.rewrites)?rw.body.rewrites:[]):previous.rewrites||[];
         const pluginBody=plugins.ok?(Array.isArray(plugins.body)?plugins.body:Array.isArray(plugins.body&&plugins.body.plugins)?plugins.body.plugins:[]):previous.plugins||[];
         const jobBody=jobs.ok?(Array.isArray(jobs.body)?jobs.body:Array.isArray(jobs.body&&jobs.body.jobs)?jobs.body.jobs:[]):state.jobs||[];
         return {
@@ -5433,8 +5515,8 @@ class Component extends DCLogic {
   downloadBackup=async()=>{const r=await this.apiGet('/v1/backup');if(!r.ok)return this.toastMsg(this.t('백업 생성 실패')+': '+this.errorText(r),true);try{const blob=new Blob([JSON.stringify(r.body,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='onetdns-backup-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);this.toastMsg('백업 파일을 생성했습니다');}catch(e){this.toastMsg('백업 파일을 만들지 못했습니다',true);}};
   onRestoreFile=(e)=>{const input=e.target,file=input.files&&input.files[0];if(!file)return;if(file.size>1024*1024){input.value='';return this.toastMsg('백업 파일은 1MB 이하여야 합니다',true);}const reader=new FileReader();reader.onload=()=>{try{const value=JSON.parse(String(reader.result||''));if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('shape');this._restoreBackup=value;this.setState(state=>({forms:{...state.forms,restoreFileName:file.name}}));}catch(err){this._restoreBackup=null;input.value='';this.setState(state=>({forms:{...state.forms,restoreFileName:'백업 파일 선택…'}}));this.toastMsg('올바른 OnetDNS JSON 백업 파일을 선택하세요',true);}};reader.onerror=()=>this.toastMsg('백업 파일을 읽지 못했습니다',true);reader.readAsText(file);};
   restoreBackup=async()=>{if(!this._restoreBackup)return this.toastMsg('복원할 백업 파일을 먼저 선택하세요',true);if(!await this.confirmDestructive('차단·허용 규칙, 차단 서비스, 거절 도메인, 세이프서치를 선택한 백업으로 전체 교체하시겠습니까?'))return;const r=await this.apiSend('/v1/restore','POST',this._restoreBackup);if(!r.ok)return this.toastMsg(this.t('백업 복원 실패')+': '+this.errorText(r),true);this._restoreBackup=null;this.setState(state=>({forms:{...state.forms,restoreFileName:'백업 파일 선택…'}}));await Promise.allSettled([this.loadCollections(),this.loadOperations()]);this.toastMsg('백업을 복원했습니다');};
-  addRewrite=async()=>{const f=this.state.forms,domain=String(f.rewriteDomain||'').trim(),answer=String(f.rewriteAnswer||'').trim();if(!this.validDomain(domain))return this.toastMsg('유효한 재작성 도메인을 입력하세요',true);if(!(this.validIp(answer)||this.validDomain(answer)))return this.toastMsg('재작성 응답에 유효한 IP 또는 도메인을 입력하세요',true);const r=await this.apiSend('/v1/rewrites','POST',{domain,answer});if(!r.ok)return this.toastMsg(this.t('재작성 규칙 추가 실패')+': '+this.errorText(r),true);this.setState(state=>({forms:{...state.forms,rewriteDomain:'',rewriteAnswer:''}}));await this.loadOperations();this.toastMsg('재작성 규칙을 저장했습니다');};
-  removeRewrite=(domain)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 재작성 규칙을 삭제하시겠습니까?',{name:domain})))return;const r=await this.apiSend('/v1/rewrites','DELETE',{domain});if(!r.ok)return this.toastMsg(this.t('재작성 규칙 삭제 실패')+': '+this.errorText(r),true);await this.loadOperations();this.toastMsg('재작성 규칙을 삭제했습니다');};
+  addRewrite=async()=>{const f=this.state.forms,domain=String(f.rewriteDomain||'').trim(),answer=String(f.rewriteAnswer||'').trim();if(!this.validDomain(domain))return this.toastMsg('유효한 재작성 도메인을 입력하세요',true);if(!(this.validIp(answer)||this.validDomain(answer)))return this.toastMsg('재작성 응답에 유효한 IP 또는 도메인을 입력하세요',true);let previous=null;const rows=s=>Array.isArray(s.operations.rewrites)?s.operations.rewrites:[];this.setState(state=>({forms:{...state.forms,rewriteDomain:'',rewriteAnswer:''}}));if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{previous=rows(s).find(x=>x.domain===domain)||null;return {operations:{...s.operations,rewrites:[...rows(s).filter(x=>x.domain!==domain),{domain,answer}]}};},revert:s=>{const kept=rows(s).filter(x=>x.domain!==domain);return {operations:{...s.operations,rewrites:previous?[...kept,previous]:kept}};},send:()=>this.apiSend('/v1/rewrites','POST',{domain,answer},{background:true}),reload:()=>this.loadOperations(),failure:this.t('재작성 규칙 추가 실패')+': '}))this.toastMsg('재작성 규칙을 저장했습니다');else this.setState(s=>s.forms.rewriteDomain||s.forms.rewriteAnswer?null:{forms:{...s.forms,rewriteDomain:domain,rewriteAnswer:answer}});};
+  removeRewrite=(domain)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 재작성 규칙을 삭제하시겠습니까?',{name:domain})))return;let index=-1,row=null;const rows=s=>Array.isArray(s.operations.rewrites)?s.operations.rewrites:[];if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{index=rows(s).findIndex(x=>x.domain===domain);row=rows(s)[index]||null;return {operations:{...s.operations,rewrites:rows(s).filter(x=>x.domain!==domain)}};},revert:s=>row?{operations:{...s.operations,rewrites:this.listInsert(rows(s),index,row)}}:null,send:()=>this.apiSend('/v1/rewrites','DELETE',{domain},{background:true}),reload:()=>this.loadOperations(),failure:this.t('재작성 규칙 삭제 실패')+': '}))this.toastMsg('재작성 규칙을 삭제했습니다');};
   checkTlsRevocation=async()=>{const pem=String(this.state.forms.certPem||'').trim();if(!pem)return this.toastMsg('폐기 상태를 확인할 인증서 체인 PEM을 먼저 선택하세요',true);const r=await this.apiSend('/v1/tls/revocation-check','POST',{certificate_chain:pem});this.setState(state=>({operations:{...state.operations,revocation:r.ok?r.body:{error:this.errorText(r)}}}));this.toastMsg(r.ok?'인증서 폐기 상태를 확인했습니다':'인증서 폐기 상태 확인 실패',!r.ok);};
   checkZoneDnssec=async()=>{const origin=String(this.state.forms.dnssecZone||'').trim();if(!this.validDomain(origin))return this.toastMsg('유효한 DNS 영역 이름을 입력하세요',true);const r=await this.apiGet('/v1/zones/'+encodeURIComponent(origin)+'/dnssec');this.setState(state=>({operations:{...state.operations,zoneDnssec:r.ok?{origin,...r.body}:{origin,error:this.errorText(r)}}}));this.toastMsg(r.ok?'DNSSEC 상태를 조회했습니다':'DNSSEC 상태 조회 실패',!r.ok);};
   upstreamRow=(u)=>{
@@ -5443,8 +5525,8 @@ class Component extends DCLogic {
       queries:Number(u.queries)||0,okCount:Number(u.ok)||0,failCount:Number(u.fail)||0,ewma:u.ewma_ms!=null?Number(u.ewma_ms):null};
   };
   async loadUpstreams(){
-    const up=await this.apiGet('/v1/upstreams');
-    if(!(up.ok&&Array.isArray(up.body))) return;
+    const fresh=this.writeGuard('upstreams');const up=await this.apiGet('/v1/upstreams');
+    if(!(up.ok&&Array.isArray(up.body))||!fresh()) return;
     this.setState({upstreams:up.body.map(this.upstreamRow)});return true;
   }
   testUpstreams=async()=>{
@@ -5474,9 +5556,9 @@ class Component extends DCLogic {
     }else{this.setState(s=>({cert:{...s.cert,valid:false,domain:'검증 실패',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—'}}));this.toastMsg(this.tr('인증서 검증 실패: {error}',{error:this.errorText(r)}),true);}
   }
   async loadRuleState(){
-    const r=await this.apiGet('/v1/filter/rules');
+    const fresh=this.writeGuard('rules');const r=await this.apiGet('/v1/filter/rules');
     // 실패했다고 목록을 비우면 규칙이 지워진 것처럼 보인다. 마지막으로 읽은 값을 남긴다.
-    if(!(r.ok&&r.body))return false;
+    if(!(r.ok&&r.body)||!fresh())return false;
     this.setState({blockRules:Array.isArray(r.body.block)?r.body.block:[],allowRules:Array.isArray(r.body.allow)?r.body.allow:[]});
     return true;
   }
@@ -5493,18 +5575,19 @@ class Component extends DCLogic {
   }
   applySubs(body){
     const lists=Array.isArray(body&&body.lists)?body.lists:[];
-    this.setState({blocklists:lists.map((l,i)=>({id:l.id||i+1,name:String(l.title||l.url||''),url:String(l.url||''),preset:String(l.preset||''),enabled:l.enabled!==false,rules:Number(l.rules)||0,updated:this.relTime(l.updated_unix),updating:false}))});
+    this.setState(state=>{const updating=new Set(state.blocklists.filter(x=>x.updating).map(x=>x.url));return {blocklists:lists.map((l,i)=>({id:l.id||i+1,name:String(l.title||l.url||''),url:String(l.url||''),preset:String(l.preset||''),enabled:l.enabled!==false,rules:Number(l.rules)||0,updated:this.relTime(l.updated_unix),updating:updating.has(String(l.url||''))}))};});
   }
-  async reloadSubs(){ const r=await this.apiGet('/v1/filter/subscriptions');if(r.ok)this.applySubs(r.body||{});return r; }
+  async reloadSubs(){ const fresh=this.writeGuard('subs');const r=await this.apiGet('/v1/filter/subscriptions');if(r.ok&&fresh())this.applySubs(r.body||{});return r; }
   async bootSubs(){ await this.reloadSubs(); }
   async loadConfigState(){
+    const fresh=this.writeGuard('config');
     const [desiredResp,appliedResp,statusResp]=await Promise.all([
       this.apiGet('/v1/config'),this.apiGet('/v1/config/effective'),this.apiGet('/v1/config/status')
     ]);
     const desiredBody=desiredResp.ok&&desiredResp.body&&typeof desiredResp.body==='object'?desiredResp.body:null;
     const desired=desiredBody&&desiredBody._valid!==false?desiredBody:null;
     const applied=appliedResp.ok&&appliedResp.body&&typeof appliedResp.body==='object'?appliedResp.body:null;
-    if(!applied&&!desired)return false;
+    if((!applied&&!desired)||!fresh())return false;
     const c=applied||desired, d=desired||c;
     // 상태 조회가 실패하면 "일치"로 단정하지 않는다 — 확인하지 못했다는 사실을 남겨야
     // 화면이 동기화 상태를 확인한 것처럼 보이지 않는다.
@@ -6224,7 +6307,7 @@ class Component extends DCLogic {
   confirmOk=()=>this.closeConfirm(true);
   confirmCancel=()=>this.closeConfirm(false);
   confirmDestructive(message){return this.askConfirm(message);}
-  removeReservation=(identity)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 예약을 삭제하시겠습니까?',{name:identity})))return;const r=await this.apiSend('/v1/dhcp/static','DELETE',{identity});if(r.ok){this.setState(s=>({reservations:s.reservations.filter(x=>x.identity!==identity)}));this.toastMsg('예약을 삭제했습니다');}else this.toastMsg('삭제 실패: '+this.errorText(r),true);};
+  removeReservation=(identity)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 예약을 삭제하시겠습니까?',{name:identity})))return;let index=-1,row=null;if(await this.optimistic('reservations',{apply:s=>{index=s.reservations.findIndex(x=>x.identity===identity);row=s.reservations[index]||null;return {reservations:s.reservations.filter(x=>x.identity!==identity)};},revert:s=>row?{reservations:this.listInsert(s.reservations,index,row)}:null,send:()=>this.apiSend('/v1/dhcp/static','DELETE',{identity}),failure:'삭제 실패: '}))this.toastMsg('예약을 삭제했습니다');};
   clusterPropose=()=>{const self=this.state.cluster.self;if(this.state.authRole!=='admin'||self.role!=='leader')return this.toastMsg('리더 관리자 노드에서만 설정 동기화 요청을 보낼 수 있습니다',true); const f=this.state.forms; const k=(f.cpKey||'').trim(); if(!k) return this.toastMsg('설정 항목을 입력하세요',true);
     let v=(f.cpVal||'').trim(); let pv; if(v==='true')pv=true; else if(v==='false')pv=false; else if(v!==''&&!isNaN(Number(v)))pv=Number(v); else pv=v;
     const patch={}; patch[k]=pv;
@@ -6314,12 +6397,12 @@ class Component extends DCLogic {
       if(!preview.ok){if(!(options&&options.silent))this.toastMsg(this.t((options&&options.errorPrefix)||'설정 적용 실패')+': '+this.errorText(preview),true);await this.loadConfigState();return false;}
       if(preview.body&&preview.body.restart_required&&!await this.confirmServiceRestart(preview.body.service_restart||[])){await this.loadConfigState();return false;}
     }
-    const r=await this.apiSend('/v1/config/set','POST',obj);
+    const r=await this.serialWrite('config',()=>this.apiSend('/v1/config/set','POST',obj,{background:true}));
     if(r.ok){
       // 방금 적용한 키가 초안에 남아 있으면, 설정을 다시 읽을 때 초안 값이 화면을 덮고
       // 나중에 초안을 적용하는 순간 방금 바꾼 값을 되돌린다. 마지막으로 한 동작이 이긴다.
       this.setState(state=>{const draft={...state.configDraft},dirty={...state.configDraftDirty};for(const key of keys){delete draft[key];delete dirty[key];}return {configDraft:draft,configDraftDirty:dirty};});
-      if(r.body&&r.body.mode==='service_restart')this.expectRestart();
+      if(r.body&&r.body.mode==='service_restart')this.expectRestart();else this.watchFilterApply();
       if(!(options&&options.silent))this.toastMsg((options&&options.successMessage)||this.t('설정을 적용했습니다'),!!(options&&options.successBad));
       await this.loadConfigState();return true;
     }
@@ -6327,11 +6410,18 @@ class Component extends DCLogic {
     await this.loadConfigState();return false;
   }
   refreshOneList=(id)=>async()=>{
-    const b=this.state.blocklists.find(x=>x.id===id);if(!b)return;
-    this.setState(s=>({blocklists:s.blocklists.map(x=>x.id===id?{...x,updating:true}:x)}));
-    const r=await this.apiSend('/v1/filter/subscriptions/refresh','POST',{url:b.url});
+    const b=this.state.blocklists.find(x=>x.id===id);if(!b||b.updating)return;
+    const url=b.url,generation=this._sessionGeneration,live=()=>generation===this._sessionGeneration;
+    const mark=v=>s=>({blocklists:s.blocklists.map(x=>x.url===url?{...x,updating:v}:x)});
+    this.setState(mark(true));
+    const r=await this.apiSend('/v1/filter/subscriptions/refresh','POST',{url},{background:true});
+    if(!r.ok){if(!r.stale){this.setState(mark(false));this.toastMsg('갱신 실패: '+this.errorText(r),true);}return;}
+    this.toastMsg('필터 목록 갱신 작업을 시작했습니다');
+    const result=await this.waitForJob(r.body&&r.body.id,live);
+    if(result.abandoned)return;
+    this.setState(mark(false));
+    if(result.done)this.watchFilterApply();else this.toastMsg('갱신 실패: '+result.failure,true);
     await this.reloadSubs();
-    this.toastMsg(r.ok?'필터 목록 갱신 작업을 시작했습니다':'갱신 실패: '+this.errorText(r),!r.ok);
   };
   refreshLists=async()=>{if(this.state.listsUpdating)return;this.setState({listsUpdating:true});const r=await this.apiSend('/v1/jobs/refresh','POST');this.setState({listsUpdating:false});if(r.ok){this.toastMsg('필터 목록 갱신을 시작했습니다');}else this.toastMsg('갱신 실패: '+this.errorText(r),true);};
   addSub=async()=>{
@@ -6343,32 +6433,24 @@ class Component extends DCLogic {
     this.setState(s=>({pendingSubs:[...s.pendingSubs,{url,name:title||url}],forms:{...s.forms,subName:'',subUrl:''}}));
     const r=await this.apiSend('/v1/filter/subscriptions','POST',{url,title,enabled:true,background:true});
     if(!r.ok){drop();return this.toastMsg('추가 실패: '+this.errorText(r),true);}
-    const id=r.body&&r.body.id;
-    let done=!id,failure='';
-    while(id){
-      await new Promise(resolve=>setTimeout(resolve,1500));
-      if(!pending())return;
-      const j=await this.apiGet('/v1/jobs/'+encodeURIComponent(String(id)));
-      if(!pending()||j.stale)return;
-      const job=j.ok&&j.body&&typeof j.body==='object'?j.body:null;
-      if(job&&job.status==='running')continue;
-      if(!job&&(j.status===0||j.status===408||j.status>=500))continue;
-      if(job&&job.status==='done')done=true;
-      else failure=job?this.t(String(job.result||'')):this.errorText(j);
-      break;
-    }
+    const {abandoned,done,failure}=await this.waitForJob(r.body&&r.body.id,pending);
+    if(abandoned)return;
+    if(done)this.watchFilterApply();
     const listed=await this.reloadSubs();
     drop();
     const lists=listed.ok&&listed.body&&Array.isArray(listed.body.lists)?listed.body.lists:[];
     if(done||lists.some(l=>l.url===url))return this.toastMsg('차단 목록을 추가했습니다');
     this.toastMsg('추가 실패: '+(failure||this.errorText(listed)),true);
   };
-  removeSub=(id)=>async()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b||!await this.confirmDestructive(this.tr('{name} 차단 목록을 삭제하시겠습니까?',{name:b.name})))return;const r=await this.apiSend('/v1/filter/subscriptions','DELETE',{url:b.url});if(r.ok){await this.reloadSubs();this.toastMsg('차단 목록을 삭제했습니다');}else this.toastMsg('삭제 실패: '+this.errorText(r),true);};
-  toggleSub=(id)=>async()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b)return;const r=await this.apiSend('/v1/filter/subscriptions','PATCH',{url:b.url,enabled:!b.enabled});if(r.ok)await this.reloadSubs();else this.toastMsg('상태 변경 실패: '+this.errorText(r),true);};
-  mutateRule=async(action,kind,rule)=>{const r=await this.apiSend('/v1/filter/rules',action,{kind,rule});if(r.ok){await this.loadRuleState();return true;}this.toastMsg('규칙 변경 실패: '+this.errorText(r),true);return false;};
-  addBlockRule=async()=>{const v=(this.state.forms.block||'').trim();if(!v)return; if(await this.mutateRule('POST','block',v))this.setState(s=>({forms:{...s.forms,block:''}}));};
+  removeSub=(id)=>async()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b||!await this.confirmDestructive(this.tr('{name} 차단 목록을 삭제하시겠습니까?',{name:b.name})))return;const url=b.url;let index=-1;if(await this.optimistic('subs',{item:url,background:true,apply:s=>{index=s.blocklists.findIndex(x=>x.url===url);return {blocklists:s.blocklists.filter(x=>x.url!==url)};},revert:s=>({blocklists:this.listInsert(s.blocklists,index,b)}),send:()=>this.apiSend('/v1/filter/subscriptions','DELETE',{url},{background:true}),reload:()=>this.reloadSubs(),failure:'삭제 실패: '}))this.toastMsg('차단 목록을 삭제했습니다');};
+  toggleSub=(id)=>()=>{const b=this.state.blocklists.find(x=>x.id===id);if(!b)return;const url=b.url,enabled=!b.enabled,set=v=>s=>({blocklists:s.blocklists.map(x=>x.url===url?{...x,enabled:v}:x)});return this.optimistic('subs',{item:url,background:true,apply:set(enabled),revert:set(b.enabled),send:()=>this.apiSend('/v1/filter/subscriptions','PATCH',{url,enabled},{background:true}),reload:()=>this.reloadSubs(),failure:'상태 변경 실패: '});};
+  mutateRule=(action,kind,rule)=>{const add=action==='POST',target=kind==='allow'||rule.startsWith('@@')?'allowRules':'blockRules';let had={};return this.optimistic('rules',{item:rule,background:true,
+    apply:s=>{had={blockRules:s.blockRules.includes(rule),allowRules:s.allowRules.includes(rule)};if(add)return had[target]?null:{[target]:[...s[target],rule]};return {blockRules:s.blockRules.filter(x=>x!==rule),allowRules:s.allowRules.filter(x=>x!==rule)};},
+    revert:s=>{if(add)return had[target]?null:{[target]:s[target].filter(x=>x!==rule)};const back=name=>had[name]&&!s[name].includes(rule)?[...s[name],rule]:s[name];return {blockRules:back('blockRules'),allowRules:back('allowRules')};},
+    send:()=>this.apiSend('/v1/filter/rules',action,{kind,rule},{background:true}),reload:()=>this.loadRuleState(),failure:'규칙 변경 실패: '});};
+  addBlockRule=async()=>{const v=(this.state.forms.block||'').trim();if(!v)return;this.setState(s=>({forms:{...s.forms,block:''}}));if(!await this.mutateRule('POST','block',v))this.setState(s=>s.forms.block?null:{forms:{...s.forms,block:v}});};
   setRuleType=(t)=>()=>this.setState(s=>({forms:{...s.forms,ruleType:t}}));
-  addCustomRule=async()=>{const f=this.state.forms,v=(f.ruleText||'').trim();if(!v)return this.toastMsg('규칙을 입력하세요',true);if(await this.mutateRule('POST',f.ruleType==='allow'?'allow':'block',v))this.setState(s=>({forms:{...s.forms,ruleText:''}}));};
+  addCustomRule=async()=>{const f=this.state.forms,v=(f.ruleText||'').trim();if(!v)return this.toastMsg('규칙을 입력하세요',true);this.setState(s=>({forms:{...s.forms,ruleText:''}}));if(!await this.mutateRule('POST',f.ruleType==='allow'?'allow':'block',v))this.setState(s=>s.forms.ruleText?null:{forms:{...s.forms,ruleText:v}});};
   // 규칙은 목록을 정리하며 여러 개를 연달아 지우는 일이 많아 확인창 대신 되돌리기를 준다.
   removeRuleWithUndo=async(kind,rule)=>{if(!await this.mutateRule('DELETE',kind,rule))return;
     this.toastMsg(this.tr(kind==='allow'?'허용 규칙을 삭제했습니다: {rule}':'차단 규칙을 삭제했습니다: {rule}',{rule}),false,
@@ -6380,11 +6462,11 @@ class Component extends DCLogic {
   // 클라이언트 차단은 '*$client=<주소>' 차단 규칙으로 건다. refused_domain 종류는 REFUSED로
   // 답할 도메인 접미사라, 거기에 주소를 넣으면 어떤 질의 이름과도 맞지 않아 아무 일도 하지 않는다.
   clientRule(ip){return '*$client='+ip;}
-  toggleBlockClient=(ip)=>async()=>{const rule=this.clientRule(ip);if(await this.mutateRule(this.clientBlocked(ip)?'DELETE':'POST','block',rule))await this.refreshExplainPanel();};
+  toggleBlockClient=(ip)=>async()=>{const rule=this.clientRule(ip);if(await this.mutateRule(this.clientBlocked(ip)?'DELETE':'POST','block',rule)){await this.filterSettled();await this.refreshExplainPanel();}};
   // 규칙을 바꾼 뒤 조회 결과를 다시 받는다. 버튼 이름만 바뀌고 상태·필터 열이 이전 값으로
   // 남으면 차단했는데 "정상 응답"이 그대로 보인다.
   refreshExplainPanel=async()=>{const d=this.state.pageExplain;if(!d)return;const x=await this.explainData(d.qname,d.qtype,d.client);if(x)this.setState({pageExplain:x});};
-  runDomainAction=(qname,action)=>async()=>{if(await this.domainAction(qname,action).run())await this.refreshExplainPanel();};
+  runDomainAction=(qname,action)=>async()=>{if(await this.domainAction(qname,action).run()){await this.filterSettled();await this.refreshExplainPanel();}};
   domainBlocked(d){return this.state.blockRules.includes('||'+d+'^');}
   // 목록 때문에 막힌 질의에 '차단'을 내밀면 이미 막힌 이름에 같은 규칙만 하나 더 생긴다.
   // 직접 넣은 규칙이 있으면 그것을 거두고, 없는데 막혔으면 허용 규칙으로 목록을 넘어선다.
@@ -6403,12 +6485,12 @@ class Component extends DCLogic {
     return String(url||'');
   }
   clientBlocked(ip){return this.state.blockRules.includes(this.clientRule(ip));}
-  toggleService=(id)=>async()=>{const cur=this.state.services.find(x=>x.id===id),en=!(cur&&cur.blocked);const r=await this.apiSend('/v1/services','POST',{service:id,enable:en});if(r.ok){this.setState(s=>({services:s.services.map(x=>x.id===id?{...x,blocked:en}:x)}));this.toastMsg(en?'서비스 차단':'서비스 허용');}else this.toastMsg('적용 실패: '+this.errorText(r),true);};
-  toggleSafe=(k)=>async()=>{const en=!this.state[k];if(k==='safeSearch'){const r=await this.apiSend('/v1/safesearch','POST',{enable:en});if(r.ok)this.setState({[k]:en});else this.toastMsg('적용 실패: '+this.errorText(r),true);return;}const patch=k==='safeBrowsing'?{safe_browsing:en}:{parental_control:en};const ok=await this.cset(patch,{successMessage:en?'보호 기능을 켰습니다':'보호 기능을 껐습니다'});if(ok)this.setState({[k]:en});};
+  toggleService=(id)=>async()=>{const cur=this.state.services.find(x=>x.id===id),en=!(cur&&cur.blocked),set=v=>s=>({services:s.services.map(x=>x.id===id?{...x,blocked:v}:x)});if(await this.optimistic('services',{item:id,background:true,apply:set(en),revert:set(!en),send:()=>this.apiSend('/v1/services','POST',{service:id,enable:en},{background:true}),reload:()=>this.loadServices(),failure:'적용 실패: '}))this.toastMsg(en?'서비스 차단':'서비스 허용');};
+  toggleSafe=(k)=>async()=>{const en=!this.state[k],set=v=>()=>({[k]:v});if(k==='safeSearch'){await this.optimistic('config',{apply:set(en),revert:set(!en),send:()=>this.apiSend('/v1/safesearch','POST',{enable:en}),failure:'적용 실패: '});return;}this.setState(set(en));const patch=k==='safeBrowsing'?{safe_browsing:en}:{parental_control:en};const ok=await this.cset(patch,{successMessage:en?'보호 기능을 켰습니다':'보호 기능을 껐습니다'});if(!ok)this.setState(set(!en));};
 
-  addClient=async()=>{const f=this.state.forms,name=(f.clName||'').trim(),ids=(f.clId||'').split(',').map(x=>x.trim()).filter(Boolean);if(!name||!ids.length)return this.toastMsg('이름과 식별자를 입력하세요',true);if(name.length>64)return this.toastMsg('클라이언트 이름은 64자 이하여야 합니다',true);for(const id of ids){if(id.includes('/')){const parts=id.split('/'),ip=parts[0],prefix=parts[1],max=ip.includes(':')?128:32;if(parts.length!==2||!this.validIp(ip)||!/^\d+$/.test(prefix)||Number(prefix)<0||Number(prefix)>max)return this.toastMsg('CIDR 형식이 올바르지 않습니다: '+id,true);}else if(/[.:]/.test(id)&&!this.validIp(id))return this.toastMsg('IP 형식이 올바르지 않습니다: '+id,true);}const r=await this.apiSend('/v1/clients','POST',{name,ids});if(r.ok){this.setState(s=>({forms:{...s.forms,clName:'',clId:''}}));await this.loadClients();this.toastMsg('클라이언트를 추가했습니다');}else this.toastMsg('추가 실패: '+this.errorText(r),true);};
-  removeClient=(id)=>async()=>{const c=this.state.clients.find(x=>x.id===id);if(!c||!await this.confirmDestructive(this.tr('{name} 클라이언트를 삭제하시겠습니까?',{name:c.name})))return;const r=await this.apiSend('/v1/clients','DELETE',{name:c.name});if(r.ok){await this.loadClients();this.toastMsg('클라이언트를 삭제했습니다');}else this.toastMsg('삭제 실패: '+this.errorText(r),true);};
-  toggleClientDisable=(id)=>async()=>{const c=this.state.clients.find(x=>x.id===id);if(!c)return;const r=await this.apiSend('/v1/clients','PATCH',{name:c.name,disable_filtering:!c.disable});if(r.ok){await this.loadClients();this.toastMsg(c.disable?'클라이언트 필터링을 활성화했습니다':'클라이언트 필터링을 비활성화했습니다');}else this.toastMsg('변경 실패: '+this.errorText(r),true);};
+  addClient=async()=>{const f=this.state.forms,name=(f.clName||'').trim(),ids=(f.clId||'').split(',').map(x=>x.trim()).filter(Boolean);if(!name||!ids.length)return this.toastMsg('이름과 식별자를 입력하세요',true);if(name.length>64)return this.toastMsg('클라이언트 이름은 64자 이하여야 합니다',true);for(const id of ids){if(id.includes('/')){const parts=id.split('/'),ip=parts[0],prefix=parts[1],max=ip.includes(':')?128:32;if(parts.length!==2||!this.validIp(ip)||!/^\d+$/.test(prefix)||Number(prefix)<0||Number(prefix)>max)return this.toastMsg('CIDR 형식이 올바르지 않습니다: '+id,true);}else if(/[.:]/.test(id)&&!this.validIp(id))return this.toastMsg('IP 형식이 올바르지 않습니다: '+id,true);}const typed={clName:f.clName,clId:f.clId},row={id:'pending:'+name,name,nets:[],clientIds:[],ids,tags:[],blockCount:0,block:[],disable:false};this.setState(s=>({forms:{...s.forms,clName:'',clId:''}}));if(await this.optimistic('clients',{item:name,background:true,apply:s=>({clients:[...s.clients,row]}),revert:s=>({clients:s.clients.filter(x=>x.id!==row.id)}),send:()=>this.apiSend('/v1/clients','POST',{name,ids},{background:true}),reload:()=>this.loadClients(),failure:'추가 실패: '}))this.toastMsg('클라이언트를 추가했습니다');else this.setState(s=>s.forms.clName||s.forms.clId?null:{forms:{...s.forms,...typed}});};
+  removeClient=(id)=>async()=>{const c=this.state.clients.find(x=>x.id===id);if(!c||!await this.confirmDestructive(this.tr('{name} 클라이언트를 삭제하시겠습니까?',{name:c.name})))return;let index=-1;if(await this.optimistic('clients',{item:c.name,background:true,apply:s=>{index=s.clients.findIndex(x=>x.name===c.name);return {clients:s.clients.filter(x=>x.name!==c.name)};},revert:s=>({clients:this.listInsert(s.clients,index,c)}),send:()=>this.apiSend('/v1/clients','DELETE',{name:c.name},{background:true}),reload:()=>this.loadClients(),failure:'삭제 실패: '}))this.toastMsg('클라이언트를 삭제했습니다');};
+  toggleClientDisable=(id)=>async()=>{const c=this.state.clients.find(x=>x.id===id);if(!c)return;const set=v=>s=>({clients:s.clients.map(x=>x.name===c.name?{...x,disable:v}:x)});if(await this.optimistic('clients',{item:c.name,background:true,apply:set(!c.disable),revert:set(c.disable),send:()=>this.apiSend('/v1/clients','PATCH',{name:c.name,disable_filtering:!c.disable},{background:true}),reload:()=>this.loadClients(),failure:'변경 실패: '}))this.toastMsg(c.disable?'클라이언트 필터링을 활성화했습니다':'클라이언트 필터링을 비활성화했습니다');};
   addUpstream=async()=>{
     const tokens=(this.state.forms.upAddr||'').split(/[\s,;]+/).map(t=>t.trim()).filter(Boolean);
     if(!tokens.length)return this.toastMsg(this.t('업스트림 DNS 서버의 IP 주소 또는 URL을 입력하세요'),true);
@@ -6436,9 +6518,9 @@ class Component extends DCLogic {
   };
   removeUpstream=(id)=>async()=>{
     const u=this.state.upstreams.find(x=>x.id===id);if(!u||!await this.confirmDestructive(this.tr('{name} 업스트림 DNS 서버를 삭제하시겠습니까?',{name:u.addr})))return;
-    const r=await this.apiSend('/v1/upstreams','DELETE',{addr:u.addr});
-    if(r.ok){this._upstreamProbeRun=(this._upstreamProbeRun||0)+1;await Promise.all([this.loadConfigState(),this.loadUpstreams()]);this.toastMsg(this.t('업스트림 DNS 서버를 삭제했습니다'));}
-    else this.toastMsg(this.t('삭제')+' '+this.t('실패')+': '+this.errorText(r),true);
+    let index=-1;
+    const ok=await this.optimistic('upstreams',{apply:s=>{index=s.upstreams.findIndex(x=>x.addr===u.addr);return {upstreams:s.upstreams.filter(x=>x.addr!==u.addr)};},revert:s=>({upstreams:this.listInsert(s.upstreams,index,u)}),send:()=>this.apiSend('/v1/upstreams','DELETE',{addr:u.addr}),reload:()=>Promise.all([this.loadConfigState(),this.loadUpstreams()]),failure:this.t('삭제')+' '+this.t('실패')+': '});
+    if(ok){this._upstreamProbeRun=(this._upstreamProbeRun||0)+1;this.toastMsg(this.t('업스트림 DNS 서버를 삭제했습니다'));}
   };
 
   setStrategy=(v)=>()=>{ this.setState({strategy:v}); this.cset({upstream_strategy:({parallel:'parallel',fastest:'query_statistics',sequential:'user_order',roundrobin:'round_robin'}[v]||v)}); };
@@ -6513,12 +6595,12 @@ class Component extends DCLogic {
   restoreAdapterDns=(adapter)=>async()=>{ const r=await this.apiSend('/v1/system/dns-client/restore','POST',{adapter}); if(r.ok){ this.toastMsg(this.tr('{name} DNS를 이전 값으로 복원',{name:'"'+adapter+'"'})); await this.loadAdapters(); } else this.toastMsg(this.t('DNS 복원 실패: ')+this.errorText(r),true); };
 
   createZone=async()=>{const f=this.state.forms,origin=(f.zoneOrigin||'').trim(),text=(f.zoneText||'').trim();if(!this.validDomain(origin)||!text)return this.toastMsg('유효한 DNS 영역 이름과 영역 파일 내용을 입력하세요',true);const r=await this.apiSend('/v1/zones/'+encodeURIComponent(origin),'PUT',text);if(r.ok){this.setState(st=>({forms:{...st.forms,zoneOrigin:'',zoneText:''}}));await this.loadZones();const served=!(r.body&&typeof r.body==='object'&&r.body.served===false);const kept=!(r.body&&typeof r.body==='object'&&r.body.persisted===false);if(!served)this.toastMsg('DNS 영역을 만들었지만 이 서버는 DNS 영역으로 응답하지 않습니다. 설정에서 영역 원본(zones_dir 등)을 지정하세요',true);else if(!kept)this.toastMsg('DNS 영역을 만들었지만 저장되지 않아 다시 시작하면 사라집니다',true);else this.toastMsg('DNS 영역을 생성했습니다');}else this.toastMsg('DNS 영역 만들기 실패: '+this.errorText(r),true);};
-  removeZone=(origin)=>async()=>{if(!origin||!await this.confirmDestructive(this.tr('{name} DNS 영역과 모든 레코드를 삭제하시겠습니까?',{name:origin})))return;const r=await this.apiSend('/v1/zones/'+encodeURIComponent(origin),'DELETE');if(r.ok){await this.loadZones();this.toastMsg('DNS 영역을 삭제했습니다');}else this.toastMsg('DNS 영역 삭제 실패: '+this.errorText(r),true);};
+  removeZone=(origin)=>async()=>{if(!origin||!await this.confirmDestructive(this.tr('{name} DNS 영역과 모든 레코드를 삭제하시겠습니까?',{name:origin})))return;let index=-1,row=null;if(await this.optimistic('zones',{apply:s=>{index=s.zones.findIndex(z=>z.origin===origin);row=s.zones[index]||null;return {zones:s.zones.filter(z=>z.origin!==origin)};},revert:s=>row?{zones:this.listInsert(s.zones,index,row)}:null,send:()=>this.apiSend('/v1/zones/'+encodeURIComponent(origin),'DELETE'),reload:()=>this.loadZones(),failure:'DNS 영역 삭제 실패: '}))this.toastMsg('DNS 영역을 삭제했습니다');};
   addRecord=async()=>{ const f=this.state.forms,name=f.recName.trim(),type=f.recType,val=f.recVal.trim(); if(!this.validRecordName(name)) return this.toastMsg('유효한 레코드 이름을 입력하세요',true);if(!this.validRecordValue(type,val))return this.toastMsg('레코드 유형에 맞는 값을 입력하세요',true);
     const z0=this.state.zones.find(z=>z.origin===f.zoneName)||(this.state.zones.length===1?this.state.zones[0]:null);if(!z0)return this.toastMsg('레코드를 추가할 DNS 영역을 선택하세요',true);
     const r=await this.apiSend('/v1/zones/'+encodeURIComponent(z0.origin)+'/records','POST',name+' 300 IN '+type+' '+val);
     if(r.ok){this.setState(s=>({forms:{...s.forms,recName:'',recVal:''}}));await this.loadZones();this.toastMsg('레코드를 추가했습니다');}else this.toastMsg('추가 실패: '+this.errorText(r),true); };
-  removeRecord=(zi,ri)=>async()=>{const z=this.state.zones[zi],rec=z&&z.records[ri];if(!z||!rec||!await this.confirmDestructive(this.tr('{name} {type} 레코드를 삭제하시겠습니까?',{name:rec.name,type:rec.type})))return;const r=await this.apiSend('/v1/zones/'+encodeURIComponent(z.origin)+'/records','DELETE',{name:rec.name,type:rec.type,value:rec.value});if(r.ok){await this.loadZones();this.toastMsg('레코드를 삭제했습니다');}else this.toastMsg('삭제 실패: '+this.errorText(r),true);};
+  removeRecord=(zi,ri)=>async()=>{const z=this.state.zones[zi],rec=z&&z.records[ri];if(!z||!rec||!await this.confirmDestructive(this.tr('{name} {type} 레코드를 삭제하시겠습니까?',{name:rec.name,type:rec.type})))return;const origin=z.origin,setRecords=edit=>s=>({zones:s.zones.map(x=>x.origin===origin?{...x,records:edit(x.records)}:x)});if(await this.optimistic('zones',{apply:setRecords(records=>records.filter(x=>x!==rec)),revert:setRecords(records=>this.listInsert(records,ri,rec)),send:()=>this.apiSend('/v1/zones/'+encodeURIComponent(origin)+'/records','DELETE',{name:rec.name,type:rec.type,value:rec.value}),reload:()=>this.loadZones(),failure:'삭제 실패: '}))this.toastMsg('레코드를 삭제했습니다');};
 
   refreshJob=async()=>{const r=await this.apiSend('/v1/jobs/refresh','POST');if(r.ok){this.toastMsg('갱신을 시작했습니다');}else this.toastMsg('작업 시작 실패: '+this.errorText(r),true);};
   /**
@@ -6533,7 +6615,7 @@ class Component extends DCLogic {
   copyRaftPeerEntry=async()=>{const id=this.state.cluster.identity;if(!id||!id.peer_entry)return;try{await navigator.clipboard.writeText(id.peer_entry);this.toastMsg('피어 항목을 복사했습니다');}catch(e){this.toastMsg('클립보드 복사 권한이 없습니다',true);}};
   copyNewToken=async()=>{if(!this.state.tokenSecret)return;try{await navigator.clipboard.writeText(this.state.tokenSecret);this.toastMsg('새 토큰을 복사했습니다');}catch(e){this.toastMsg('클립보드 복사 권한이 없습니다',true);}};
   addToken=async()=>{const role=this.state.forms.tokRole==='admin'?'admin':'readonly';const r=await this.apiSend('/v1/tokens','POST',{role});if(r.ok&&r.body&&r.body.token){this.setState({tokenSecret:r.body.token});this.toastMsg('토큰을 발급했습니다. 전체 값은 이번 화면에서만 확인할 수 있습니다.');await this.loadTokens();}else this.toastMsg('발급 실패: '+this.errorText(r),true);};
-  removeToken=(id)=>async()=>{const token=this.state.tokens.find(x=>x.id===id);if(!await this.confirmDestructive(this.tr('{name} 토큰을 회수하시겠습니까?',{name:token&&token.name||id})))return;const r=await this.apiSend('/v1/tokens','DELETE',{id});if(r.ok){await this.loadTokens();this.toastMsg('토큰을 회수했습니다');}else this.toastMsg('회수 실패: '+this.errorText(r),true);};
+  removeToken=(id)=>async()=>{const token=this.state.tokens.find(x=>x.id===id);if(!await this.confirmDestructive(this.tr('{name} 토큰을 회수하시겠습니까?',{name:token&&token.name||id})))return;let index=-1,row=null;if(await this.optimistic('tokens',{apply:s=>{index=s.tokens.findIndex(x=>x.id===id);row=s.tokens[index]||null;return {tokens:s.tokens.filter(x=>x.id!==id)};},revert:s=>row?{tokens:this.listInsert(s.tokens,index,row)}:null,send:()=>this.apiSend('/v1/tokens','DELETE',{id}),reload:()=>this.loadTokens(),failure:'회수 실패: '}))this.toastMsg('토큰을 회수했습니다');};
   SEC_CFG_KEYS={querylog:'querylog',anonymize:'anonymize_client_ip',rateLimit:'rate_limit_per_sec',aclAllow:'acl_allow',aclDeny:'acl_deny'};
   setSecurity=(k)=>(e)=>{const isCheck=e.target.type==='checkbox';const raw=isCheck?e.target.checked:e.target.value;this.setState(s=>({security:{...s.security,[k]:raw}}));if(isCheck)this.cfgQueue({[this.SEC_CFG_KEYS[k]]:raw});};
   commitSecurity=(k)=>(e)=>{const raw=e.target.value;const out=(k==='aclAllow'||k==='aclDeny')?String(raw).split(/\n/).map(x=>x.trim()).filter(Boolean):(k==='rateLimit'?Math.max(0,Number(raw)||0):raw);this.schemaCommit(this.SEC_CFG_KEYS[k],out);};
@@ -6852,7 +6934,8 @@ class Component extends DCLogic {
     const presetName={safe_browsing:'위험 사이트 차단 (내장 목록)',parental_control:'자녀 보호 (내장 목록)'};
     const presetNote={safe_browsing:'설정의 위험 사이트 차단으로 켜고 끕니다',parental_control:'설정의 자녀 보호로 켜고 끕니다'};
     const pendingLists=s.pendingSubs.map(p=>({id:'pending:'+p.url,name:p.name,url:p.url,preset:'',enabled:true,rules:0,updated:this.relTime(0),updating:true,pending:true}));
-    const blocklists=[...s.blocklists,...pendingLists].map((b,bi)=>({...b, rulesFmt:this.fmt(b.rules),
+    const pendingItems=s.pendingItems||{};
+    const blocklists=[...s.blocklists,...pendingLists].map((b,bi)=>({...b, rulesFmt:this.fmt(b.rules),applying:!!pendingItems['subs:'+b.url],
       name:b.preset?this.t(presetName[b.preset]||presetName.safe_browsing):b.name,
       editable:!b.preset&&!b.pending, presetNote:b.preset?this.t(presetNote[b.preset]||presetNote.safe_browsing):b.pending?this.t('목록을 받고 있습니다'):'',
       iconColor:listPal[bi%listPal.length],
@@ -6864,8 +6947,8 @@ class Component extends DCLogic {
       updateTitle:this.t(b.pending?'목록을 받고 있습니다':b.updating?'업데이트 중…':'이 목록만 업데이트'),
       track:`width:38px;height:22px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 38px;background:${b.enabled?'var(--accent)':SW3}`,
       knob:`position:absolute;top:2px;left:${b.enabled?'18px':'2px'};width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`}));
-    const blockRules=s.blockRules.map(r=>({rule:r,onRemove:this.rmBlockRule(r),removeLabel:this.tr('차단 규칙 {rule} 삭제',{rule:r})}));
-    const allowRules=s.allowRules.map(r=>({rule:r,onRemove:this.rmAllowRule(r),removeLabel:this.tr('허용 규칙 {rule} 삭제',{rule:r})}));
+    const blockRules=s.blockRules.map(r=>({rule:r,applying:!!pendingItems['rules:'+r],onRemove:this.rmBlockRule(r),removeLabel:this.tr('차단 규칙 {rule} 삭제',{rule:r})}));
+    const allowRules=s.allowRules.map(r=>({rule:r,applying:!!pendingItems['rules:'+r],onRemove:this.rmAllowRule(r),removeLabel:this.tr('허용 규칙 {rule} 삭제',{rule:r})}));
     const totalRules=this.fmt(s.blocklists.filter(b=>b.enabled).reduce((a,b)=>a+b.rules,0));
     const lrSecs=Number((s.cfgRaw||{}).list_refresh_secs)||0;
     const lrPresets=[[0,'자동 갱신 끔'],[3600,'1시간마다'],[21600,'6시간마다'],[43200,'12시간마다'],[86400,'24시간마다']].map(([v,label])=>[v,this.t(label)]);
@@ -6874,7 +6957,7 @@ class Component extends DCLogic {
 
 
     const serviceGroups={ai:'AI',cdn:'CDN',dating:'데이트',gambling:'도박',gaming:'게임',hosting:'호스팅',messenger:'메신저',privacy:'개인정보',shopping:'쇼핑',social_network:'소셜 네트워크',software:'소프트웨어',streaming:'스트리밍',other:'기타'};
-    const services=s.services.map(x=>({...x,
+    const services=s.services.map(x=>({...x,applying:!!pendingItems['services:'+x.id],
       groupLabel:this.t(serviceGroups[x.group]||x.group||'기타'),
       onToggle:this.toggleService(x.id), toggleLabel:this.tr(x.blocked?'{name} 차단 해제':'{name} 차단',{name:x.name}),
       track:`width:38px;height:22px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 38px;background:${x.blocked?'var(--block)':SW3}`,
@@ -6886,7 +6969,7 @@ class Component extends DCLogic {
       knob:`position:absolute;top:3px;left:${s[k]?'21px':'3px'};width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`}));
 
 
-    const clients=s.clients.map(c=>({...c, idsStr:c.ids.join(', '),
+    const clients=s.clients.map(c=>({...c, applying:!!pendingItems['clients:'+c.name], idsStr:c.ids.join(', '),
       tagsArr:c.tags,blockStr:c.blockCount?this.tr('{count}개 규칙',{count:c.blockCount}):this.t('없음'),
       onRemove:this.removeClient(c.id), onToggle:this.toggleClientDisable(c.id),
       filteringEnabled:!c.disable,toggleLabel:this.tr(c.disable?'{name} 필터링 켜기':'{name} 필터링 끄기',{name:c.name}),removeLabel:this.tr('{name} 클라이언트 삭제',{name:c.name}),
@@ -7044,7 +7127,7 @@ class Component extends DCLogic {
     const schemaNoMatch=_searching&&schemaCount===0&&!schemaHasElsewhere;
     const auditRows=(s.audit||[]).slice(0,100);
     const ops=s.operations||{},report=ops.filterReport||{},topData=ops.topRules||{},sourceData=ops.sources||{};
-    const rewriteRows=(Array.isArray(ops.rewrites)?ops.rewrites:[]).map(row=>({...row,onRemove:this.removeRewrite(row.domain),removeLabel:this.tr('{name} 재작성 규칙 삭제',{name:row.domain})}));
+    const rewriteRows=(Array.isArray(ops.rewrites)?ops.rewrites:[]).map(row=>({...row,applying:!!(s.pendingItems||{})['rewrites:'+row.domain],onRemove:this.removeRewrite(row.domain),removeLabel:this.tr('{name} 재작성 규칙 삭제',{name:row.domain})}));
     const topRuleRows=(Array.isArray(topData.top)?topData.top:[]).slice(0,20).map(row=>({rule:String(row.rule||''),hits:Number(row.hits)||0,hitsLabel:(Number(row.hits)||0).toLocaleString(this.locale())}));
     // 목록별 출처를 두지 않은 규칙은 inline 하나로 모인다. 그대로 보이면 직접 입력한 규칙만 있는 것처럼 읽힌다.
     const sourceHitsEnabled=sourceData.hits_enabled===true;
@@ -7098,7 +7181,7 @@ class Component extends DCLogic {
       isLists:v==='lists', isServices:v==='services', isClients:v==='clients',
       isUpstreams:v==='upstreams', isEncryption:v==='encryption', isZones:v==='zones',
       isDhcp:v==='dhcp', isExplain:v==='explain', isCluster:v==='cluster', isOperations:v==='operations', isSettings:v==='settings',quickSettingsOpen:s.quickSettingsOpen,quickSettingsRotation:s.quickSettingsOpen?180:0,toggleQuickSettings:this.toggleQuickSettings,
-      isAccount:v==='account', isTokens:v==='tokens', readOnly:s.authRole==='readonly', mutationBusy:Object.keys(s.mutationPending||{}).length>0,
+      isAccount:v==='account', isTokens:v==='tokens', readOnly:s.authRole==='readonly', mutationBusy:Object.keys(s.mutationPending||{}).length>0,activityShown:s.filterApplying||Object.keys(s.mutationPending||{}).length>0,activityLabel:this.t(s.filterApplying?'필터 적용 중…':'처리 중…'),
       dd:this.ddSet(), ddPopStyle:`position:fixed;top:${s.ddRect.y+6}px;left:${s.ddRect.x}px;min-width:${Math.max(s.ddRect.w,160)}px;max-height:260px;overflow:auto;z-index:71;background:var(--surface2);border:1px solid var(--border);border-radius:4px;box-shadow:0 16px 40px rgba(40,33,20,.22);padding:6px;animation:odSlideIn .12s ease`, ddOptions:s.ddOptions||[], dropdownOpen:!!s.dropdown, closeDropdown:this.closeDropdown,
 
       blocklists, blockRules, allowRules, totalRules,

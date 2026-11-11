@@ -131,6 +131,19 @@ pub(crate) struct SubMeta {
     lines: Arc<[String]>,
 }
 
+impl SubMeta {
+    /// A list with no rules because it has not been downloaded.
+    pub(crate) fn unavailable(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            title: String::new(),
+            rules: 0,
+            updated_unix: 0,
+            lines: Vec::new().into(),
+        }
+    }
+}
+
 pub(crate) struct FilterBuildInputs<'a> {
     pub(crate) blocked_services: &'a [String],
     pub(crate) subscriptions: &'a [SubMeta],
@@ -290,6 +303,21 @@ pub(crate) fn build_filter_engine_for_config(
     Ok(BlockEngine::new(parts, map_block(config))
         .with_clients(policies)
         .with_hit_tracking(config.track_rule_hits))
+}
+
+/// Checks what a filter build can reject, except list files, without paying for the lists.
+pub(crate) fn validate_filter_config(config: &Config) -> Result<(), String> {
+    expand_services(&config.blocked_services)?;
+    for client in &config.clients {
+        expand_services(&client.blocked_services)?;
+    }
+    merge_config_filters(
+        &mut EngineParts::default(),
+        &config.rewrites,
+        &config.local_zones,
+        &config.refused_domains,
+        &config.rpz_files,
+    )
 }
 
 /// Everything the compiled engine is built from.
@@ -879,13 +907,7 @@ pub(crate) fn fetch_blocklists_meta(
                     meta.push((*old).clone());
                 } else {
                     onetdns_core::warn!(event = "filter.subscription_refresh_failed", %url, %error, "Could not update blocklist");
-                    meta.push(SubMeta {
-                        url: url.clone(),
-                        title: String::new(),
-                        rules: 0,
-                        updated_unix: 0,
-                        lines: Vec::new().into(),
-                    });
+                    meta.push(SubMeta::unavailable(url));
                 }
             }
         }
@@ -1246,6 +1268,28 @@ mod tests {
     use onetdns_filter::{BlockEngine, EngineParts};
 
     use crate::ensure_resolution_sources_not_self;
+
+    #[test]
+    fn a_deferred_change_is_rejected_for_what_a_build_would_reject() {
+        assert!(validate_filter_config(&Config::default()).is_ok());
+
+        let unknown_service = Config {
+            blocked_services: vec!["no-such-service".to_string()],
+            ..Config::default()
+        };
+        let error = validate_filter_config(&unknown_service).unwrap_err();
+        assert!(error.contains("no-such-service"), "{error}");
+
+        let bad_rewrite = Config {
+            rewrites: vec![Rewrite {
+                domain: "a*b.example".to_string(),
+                answer: "192.0.2.1".to_string(),
+            }],
+            ..Config::default()
+        };
+        let error = validate_filter_config(&bad_rewrite).unwrap_err();
+        assert!(error.contains("rewrites[0].domain"), "{error}");
+    }
 
     #[test]
     fn compiled_filter_cache_streams_atomically_and_loads() {

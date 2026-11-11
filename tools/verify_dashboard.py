@@ -405,6 +405,7 @@ def check_restart_verdict_is_confirmed(source: str) -> None:
         + "    apiSend(path) { record.calls.push(path); return Promise.resolve(server[path] || { ok: true, body: { mode: 'hot_reload' } }); }," + chr(10)
         + "    setState(update) { Object.assign(this.state, typeof update === 'function' ? update(this.state) : update); }," + chr(10)
         + "    expectRestart() {}, toastMsg() {}, errorText() { return ''; }," + chr(10)
+        + "    writeGuard() { return () => true; }, serialWrite(_, send) { return send(); }, watchFilterApply() {}," + chr(10)
         + "    applyRoots() {}, loadListenerStatus() {}, loadAdapters() {}, loadBootService() {}," + chr(10)
         + "    loadConfigState() { return Promise.resolve(); }," + chr(10)
         + "    " + found["confirmServiceRestart"] + "," + chr(10)
@@ -487,6 +488,133 @@ def check_restart_verdict_is_confirmed(source: str) -> None:
             " every changed setting hot; a preview that fails must not apply; and the"
             " classification in the config status must re-partition the settings."
         )
+
+
+def check_writes_show_first_and_undo_on_failure(source: str) -> None:
+    """A change appears at once, goes out in order, and is undone if the server rejects it.
+
+    Runs the shipped write queue against answers the test controls. A read that
+    overlaps a write must not reach the screen, or it brings back the value the
+    user just changed. A row saved for a background filter build keeps its marker
+    until the build ends, and an error left by an earlier build is not reported
+    for a change that built nothing.
+    """
+    patterns = {
+        "writeQueue": r"\n  (writeQueue\(resource\)\{[^\n]*\})\n",
+        "writeGuard": r"\n  (writeGuard\(resource\)\{[^\n]*\})\n",
+        "serialWrite": r"\n  (serialWrite\(resource,send\)\{.*?\n  \})\n",
+        "clearPendingItems": r"\n  (clearPendingItems\(keys\)\{.*?\n  \})\n",
+        "optimistic": r"\n  (async optimistic\(resource,.*?\n  \})\n",
+        "watchFilterApply": r"\n  (watchFilterApply\(\)\{.*?\n  \})\n",
+        "filterSettled": r"\n  (filterSettled\(\)\{[^\n]*\})\n",
+        "releaseFilterWaiters": r"\n  (releaseFilterWaiters\(\)\{[^\n]*\})\n",
+    }
+    members = []
+    for name, pattern in patterns.items():
+        match = re.search(pattern, source, re.S)
+        if not match:
+            fail(name + " not found; the write-queue check cannot run")
+        members.append("    " + match.group(1) + ",")
+    harness = "\n".join(
+        [
+            "function host(statuses) {",
+            "  const record = { toasts: [], reloads: 0 };",
+            "  const self = {",
+            "    _sessionGeneration: 1,",
+            "    state: { items: [], pendingItems: {}, filterApplying: false, view: 'lists' },",
+            "    t(text) { return text; }, errorText(r) { return r.body; },",
+            "    toastMsg(text) { record.toasts.push(text); },",
+            "    setState(update) { const patch = typeof update === 'function' ? update(this.state) : update; if (patch) Object.assign(this.state, patch); },",
+            "    reloadSubs() {}, loadOperations() {},",
+            "    apiGet() { return Promise.resolve(statuses.shift()); },",
+            *members,
+            "  };",
+            "  return { self, record };",
+            "}",
+            "const open = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };",
+            "const tick = () => new Promise((done) => setTimeout(done, 0));",
+            "const built = (pending, error) => ({ ok: true, body: { pending, error } });",
+            "(async () => {",
+            "  const got = {};",
+            "  {",
+            "    const { self, record } = host([]);",
+            "    const first = open(), second = open(), sent = [];",
+            "    const write = (name, answer) => self.optimistic('items', { item: name,",
+            "      apply: (s) => ({ items: [...s.items, name] }),",
+            "      revert: (s) => ({ items: s.items.filter((x) => x !== name) }),",
+            "      send: () => { sent.push(name); return answer.promise; },",
+            "      reload: () => { record.reloads += 1; }, failure: 'failed: ' });",
+            "    const one = write('one', first), two = write('two', second);",
+            "    await tick();",
+            "    got.shown = [...self.state.items];",
+            "    got.markers = Object.keys(self.state.pendingItems).sort();",
+            "    got.sentFirst = [...sent];",
+            "    got.readDuringWrite = self.writeGuard('items')();",
+            "    const overlapping = self.writeGuard('items');",
+            "    first.resolve({ ok: false, status: 400, body: 'nope' });",
+            "    got.oneResult = await one;",
+            "    await tick();",
+            "    got.undone = [...self.state.items];",
+            "    got.toasts = [...record.toasts];",
+            "    got.sentAfter = [...sent];",
+            "    got.reloadsQueued = record.reloads;",
+            "    second.resolve({ ok: true, status: 200, body: {} });",
+            "    got.twoResult = await two;",
+            "    got.reloadsDrained = record.reloads;",
+            "    got.markersAfter = Object.keys(self.state.pendingItems);",
+            "    got.overlapping = overlapping();",
+            "    got.readIdle = self.writeGuard('items')();",
+            "  }",
+            "  {",
+            "    const { self, record } = host([built(true, null), built(false, 'bad list')]);",
+            "    await self.optimistic('items', { item: 'x', background: true, send: () => Promise.resolve({ ok: true, body: {} }), failure: '' });",
+            "    got.markerBuilding = Object.keys(self.state.pendingItems);",
+            "    await self.filterSettled();",
+            "    got.markerBuilt = Object.keys(self.state.pendingItems);",
+            "    got.applying = self.state.filterApplying;",
+            "    got.buildToasts = record.toasts;",
+            "  }",
+            "  {",
+            "    const { self, record } = host([built(false, 'old')]);",
+            "    self.watchFilterApply();",
+            "    await self.filterSettled();",
+            "    got.oldErrorToasts = record.toasts;",
+            "  }",
+            "  process.stdout.write(JSON.stringify(got));",
+            "  process.exit(0);",
+            "})();",
+            "",
+        ]
+    )
+    with tempfile.TemporaryDirectory(prefix="onetdns-writes-") as td:
+        script = Path(td) / "writes.js"
+        script.write_text(harness, encoding="utf-8")
+        got = json.loads(
+            subprocess.check_output(["node", str(script)], text=True, encoding="utf-8")
+        )
+    want = {
+        "shown": ["one", "two"],
+        "markers": ["items:one", "items:two"],
+        "sentFirst": ["one"],
+        "readDuringWrite": False,
+        "oneResult": False,
+        "undone": ["two"],
+        "toasts": ["failed: nope"],
+        "sentAfter": ["one", "two"],
+        "reloadsQueued": 0,
+        "twoResult": True,
+        "reloadsDrained": 1,
+        "markersAfter": [],
+        "overlapping": False,
+        "readIdle": True,
+        "markerBuilding": ["items:x"],
+        "markerBuilt": [],
+        "applying": False,
+        "buildToasts": ["필터를 적용하지 못했습니다: bad list"],
+        "oldErrorToasts": [],
+    }
+    if got != want:
+        fail("write queue behaved differently:\n got " + repr(got) + "\nwant " + repr(want))
 
 
 def check_toast_is_never_painted_behind_an_overlay(source: str) -> None:
@@ -855,6 +983,7 @@ def main() -> None:
     check_live_chart_buckets_are_time_anchored(source)
     check_cleared_fields_remove_their_key(source)
     check_restart_verdict_is_confirmed(source)
+    check_writes_show_first_and_undo_on_failure(source)
     check_toast_is_never_painted_behind_an_overlay(source)
     check_hidden_row_controls_keep_their_slot(source)
     check_template_names_are_exposed(source)

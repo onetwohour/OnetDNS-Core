@@ -1,13 +1,10 @@
-/*!
- * @brief 한 세대 동안 차단 엔진과 그 재료를 들고 있는 상태와, 목록을 주기적으로 다시 받는 작업.
- *
- * @details 핫 적용과 관리 API 는 같은 재료를 고치고 같은 방법으로 엔진을 다시 만든다. 재료를
- *          한 값으로 묶어 두 쪽에 넘기므로 어느 쪽이 고친 재료든 다음 재구성에 들어간다.
- */
+//! The filter engine and its inputs for one generation, and the jobs that refresh and rebuild it.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use onetdns_config::Config;
 use onetdns_core::{ArcSwap, MutexExt};
@@ -26,62 +23,131 @@ use crate::filters::{
 use crate::native_config::map_block;
 use crate::{http, sleep_or_shutdown, ServiceCleanup};
 
-/** @brief 구독 목록을 다시 받아 엔진을 다시 만든다. 반환값은 차단과 허용 규칙 수다. */
+/// Downloads the subscribed lists and rebuilds; returns the block and allow rule counts.
 pub(crate) type ListRefresh =
     Arc<dyn Fn() -> Result<(usize, usize), String> + Send + Sync + 'static>;
 
-/**
- * @brief 차단 엔진과 그 재료.
- * @details 모든 필드가 공유 핸들이므로 복제해도 같은 상태를 가리킨다.
- */
+/// How long a requested rebuild waits for more changes, so a burst costs one build.
+const DEFERRED_REBUILD_SETTLE: Duration = Duration::from_millis(250);
+/// How often the idle worker checks for shutdown.
+const DEFERRED_REBUILD_POLL: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct DeferredState {
+    queued: bool,
+    running: bool,
+    /// Why the latest build failed; the running filter stays as it was.
+    error: Option<String>,
+}
+
+/// Rebuilds the filter after a change was saved and answered. Requests made while a build runs
+/// merge into one later build, which reads the newest inputs.
+#[derive(Default)]
+pub(crate) struct DeferredRebuild {
+    state: Mutex<DeferredState>,
+    wake: Condvar,
+}
+
+impl DeferredRebuild {
+    pub(crate) fn request(&self) {
+        self.state.lock_recover().queued = true;
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn status_json(&self) -> String {
+        let state = self.state.lock_recover();
+        let error = state
+            .error
+            .as_deref()
+            .map_or_else(|| "null".to_string(), onetdns_core::json::escape);
+        format!(
+            "{{\"pending\":{},\"error\":{error}}}",
+            state.queued || state.running
+        )
+    }
+
+    /// False once `shutdown` is set.
+    fn wait_for_request(&self, shutdown: &AtomicBool) -> bool {
+        let mut state = self.state.lock_recover();
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return false;
+            }
+            if state.queued {
+                return true;
+            }
+            state = match self.wake.wait_timeout(state, DEFERRED_REBUILD_POLL) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    fn run(
+        &self,
+        rebuild: &dyn Fn() -> Result<(usize, usize), String>,
+        shutdown: &AtomicBool,
+        settle: Duration,
+    ) {
+        while self.wait_for_request(shutdown) {
+            std::thread::sleep(settle);
+            {
+                let mut state = self.state.lock_recover();
+                state.queued = false;
+                state.running = true;
+            }
+            // A panic must not leave `running` set, or the dashboard waits forever.
+            let result = catch_unwind(AssertUnwindSafe(rebuild))
+                .unwrap_or_else(|_| Err("The filter build stopped unexpectedly".to_string()));
+            if let Err(error) = &result {
+                onetdns_core::warn!(
+                    event = "filter.deferred_rebuild_failed",
+                    %error,
+                    "Could not apply saved filter changes; keeping the previous filter"
+                );
+            }
+            let mut state = self.state.lock_recover();
+            state.running = false;
+            state.error = result.err();
+        }
+    }
+}
+
+/// The filter engine and its inputs. Every field is a shared handle, so clones see one state.
 #[derive(Clone)]
 pub(crate) struct FilterState {
-    /** @brief 지금 쓰는 차단 엔진. */
     pub(crate) filter: Arc<SharedFilter>,
-    /** @brief 관리 API 로 더한 차단과 허용 규칙. */
+    /// Block and allow rules added through the management API.
     pub(crate) overlay: Arc<Mutex<(Vec<String>, Vec<String>)>>,
-    /** @brief 차단한 서비스 목록. */
     pub(crate) service_set: Arc<Mutex<Vec<String>>>,
-    /** @brief 거부할 도메인 목록. */
     pub(crate) refused_domains: Arc<Mutex<Vec<String>>>,
-    /** @brief 안전 검색을 켰는지. */
     pub(crate) safe_search: Arc<AtomicBool>,
-    /** @brief 구독 주소. */
     pub(crate) sub_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief 구독 제목. 구독 주소와 길이가 같다. */
+    /// Same length as `sub_urls`.
     pub(crate) sub_titles: Arc<Mutex<Vec<String>>>,
-    /** @brief 꺼 둔 구독 주소. */
     pub(crate) sub_disabled: Arc<Mutex<Vec<String>>>,
-    /** @brief 구독별로 받은 결과. */
     pub(crate) sub_meta: Arc<Mutex<Vec<SubMeta>>>,
-    /** @brief 미리 정해 둔 목록 주소. */
     pub(crate) preset_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief RPZ 구독 주소. */
     pub(crate) rpz_urls: Arc<Mutex<Vec<String>>>,
-    /** @brief 받아 둔 RPZ 본문. */
     pub(crate) rpz_texts: Arc<Mutex<Vec<String>>>,
-    /** @brief 컴파일한 차단 엔진을 저장하는 파일. 설정 파일이 없으면 없다. */
+    /// `None` without a config file.
     pub(crate) compiled_filter_cache: Option<PathBuf>,
-    /** @brief 받은 목록을 저장하는 디렉터리. 설정 파일이 없으면 없다. */
+    /// `None` without a config file.
     pub(crate) subscription_cache_dir: Option<PathBuf>,
-    /** @brief 목록을 다시 받는 주기. */
     pub(crate) list_refresh_secs: Arc<AtomicU64>,
-    /** @brief 목록 구성이 바뀔 때마다 올린다. 갱신 작업은 주기를 기다리지 않고 바로 받는다. */
+    /// Bumped when the lists change, so the refresh jobs fetch without waiting for their period.
     pub(crate) list_generation: Arc<AtomicU64>,
-    /** @brief 목록 받기를 한 번에 하나만 하게 하는 잠금. */
+    /// Lets one job at a time change the downloaded lists.
     pub(crate) list_refresh_lock: Arc<Mutex<()>>,
-    /** @brief 지금 재료로 엔진을 다시 만든다. */
+    /// Held for a whole build, so a build that started earlier cannot replace a newer engine.
+    pub(crate) build_lock: Arc<Mutex<()>>,
     pub(crate) rebuild: FilterRebuild,
-    /** @brief 구독 목록을 다시 받아 엔진을 다시 만든다. */
+    pub(crate) deferred_rebuild: Arc<DeferredRebuild>,
     pub(crate) refresh_url_lists: ListRefresh,
 }
 
 impl FilterState {
-    /**
-     * @brief 받아 둔 사본으로 첫 엔진을 걸고, 일정과 목록 갱신 작업을 시작한다.
-     * @param config_path 설정 파일 경로. 목록 사본은 그 옆 디렉터리에 둔다.
-     * @param service_cleanup 시작한 스레드를 세대가 끝날 때 기다리도록 넘긴다.
-     */
+    /// Installs the first engine from the cached lists and starts the background jobs.
     pub(crate) fn start(
         cfg: &Config,
         runtime_cfg: &Arc<ArcSwap<Config>>,
@@ -117,7 +183,9 @@ impl FilterState {
             Arc::new(Mutex::new(cfg.blocked_services.clone()));
 
         let sub_meta: Arc<Mutex<Vec<SubMeta>>> = Arc::new(Mutex::new(vec![]));
+        let build_lock = Arc::new(Mutex::new(()));
         let rebuild: FilterRebuild = {
+            let build_lock = build_lock.clone();
             let filter = filter.clone();
             let runtime_cfg = runtime_cfg.clone();
             let service_set = service_set.clone();
@@ -128,6 +196,7 @@ impl FilterState {
             let compiled_filter_cache = compiled_filter_cache.clone();
             let subscription_cache_dir = blocklist_cache_dir.clone();
             Arc::new(move || -> Result<(usize, usize), String> {
+                let _build = build_lock.lock_recover();
                 let current = runtime_cfg.load();
                 let subscriptions = sub_meta.lock_recover().clone();
                 let (overlay_block, overlay_allow) = {
@@ -183,10 +252,7 @@ impl FilterState {
                 &preset_urls.lock_recover(),
             );
             let cached = load_blocklist_cache(&active, blocklist_cache_dir.as_deref());
-            /*
-             * 받아 둔 사본이 활성 목록을 모두 덮으면, 그리고 원격 목록이 하나도 없으면
-             * 시작 직후에 다시 받을 것이 없다.
-             */
+            // With every active list cached, or none remote, there is nothing to fetch at start.
             let all_loaded = cached.len() == active.len();
             let had_cached = !cached.is_empty();
             if had_cached {
@@ -302,7 +368,6 @@ impl FilterState {
                         }
                         let period = interval.load(Ordering::Acquire);
                         let now_generation = generation.load(Ordering::Acquire);
-                        /* 목록이 바뀌면 주기를 기다리지 않고 바로 받아 온다. */
                         let due = now_generation != seen_generation
                             || !done_first
                             || (period > 0 && waited >= period);
@@ -398,6 +463,17 @@ impl FilterState {
                 .with_context(|| "Could not start the RPZ refresh thread")?;
             service_cleanup.track(thread);
         }
+        let deferred_rebuild = Arc::new(DeferredRebuild::default());
+        {
+            let deferred = deferred_rebuild.clone();
+            let rebuild = rebuild.clone();
+            let sd = shutdown.clone();
+            let thread = std::thread::Builder::new()
+                .name("filter-rebuild".into())
+                .spawn(move || deferred.run(&*rebuild, &sd, DEFERRED_REBUILD_SETTLE))
+                .with_context(|| "Could not start the filter rebuild thread")?;
+            service_cleanup.track(thread);
+        }
         Ok(Self {
             filter,
             overlay,
@@ -416,8 +492,117 @@ impl FilterState {
             list_refresh_secs,
             list_generation,
             list_refresh_lock,
+            build_lock,
             rebuild,
+            deferred_rebuild,
             refresh_url_lists,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    const NO_SETTLE: Duration = Duration::ZERO;
+
+    /// Runs the worker until `done`, then stops it.
+    fn run_until(
+        deferred: &Arc<DeferredRebuild>,
+        rebuild: impl Fn() -> Result<(usize, usize), String> + Send + Sync,
+        done: impl Fn() -> bool,
+    ) {
+        let shutdown = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| deferred.run(&rebuild, &shutdown, NO_SETTLE));
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            shutdown.store(true, Ordering::Relaxed);
+            deferred.wake.notify_all();
+        });
+    }
+
+    fn pending(deferred: &DeferredRebuild) -> bool {
+        deferred.status_json().contains("\"pending\":true")
+    }
+
+    #[test]
+    fn requests_made_during_a_build_merge_into_one_later_build() {
+        let deferred = Arc::new(DeferredRebuild::default());
+        let builds = AtomicUsize::new(0);
+        deferred.request();
+        run_until(
+            &deferred,
+            || {
+                if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                    for _ in 0..5 {
+                        deferred.request();
+                    }
+                }
+                Ok((0, 0))
+            },
+            || builds.load(Ordering::SeqCst) >= 2 && !pending(&deferred),
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_failed_build_is_reported_and_the_next_success_clears_it() {
+        let deferred = Arc::new(DeferredRebuild::default());
+        let builds = AtomicUsize::new(0);
+        deferred.request();
+        run_until(
+            &deferred,
+            || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Err("bad \"rule\"".to_string())
+            },
+            || builds.load(Ordering::SeqCst) == 1 && !pending(&deferred),
+        );
+        assert_eq!(
+            deferred.status_json(),
+            "{\"pending\":false,\"error\":\"bad \\\"rule\\\"\"}"
+        );
+
+        deferred.request();
+        run_until(
+            &deferred,
+            || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok((0, 0))
+            },
+            || builds.load(Ordering::SeqCst) == 2 && !pending(&deferred),
+        );
+        assert_eq!(deferred.status_json(), "{\"pending\":false,\"error\":null}");
+    }
+
+    #[test]
+    fn a_panicking_build_does_not_stay_pending() {
+        let deferred = Arc::new(DeferredRebuild::default());
+        let builds = AtomicUsize::new(0);
+        deferred.request();
+        run_until(
+            &deferred,
+            || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                panic!("build panicked");
+            },
+            || builds.load(Ordering::SeqCst) == 1 && !pending(&deferred),
+        );
+        assert!(deferred.status_json().contains("stopped unexpectedly"));
+    }
+
+    #[test]
+    fn the_worker_stops_on_shutdown_without_a_request() {
+        let deferred = Arc::new(DeferredRebuild::default());
+        run_until(&deferred, || Ok((0, 0)), || true);
+        assert!(!pending(&deferred));
     }
 }

@@ -10,7 +10,8 @@ use crate::edge::{reconcile_edge_services, EdgeServices};
 use crate::filter_runtime::FilterState;
 use crate::filters::{
     blocklist_host_resolver, build_filter_engine_for_config, preset_list_urls,
-    release_subscription_lines, revocation_host_resolver, FilterBuildInputs,
+    release_subscription_lines, revocation_host_resolver, validate_filter_config,
+    FilterBuildInputs,
 };
 use crate::listeners::{PreparedTls, TlsSlots};
 use crate::native_config::{
@@ -21,6 +22,7 @@ use crate::native_config::{
 use crate::notify::NotifyTargets;
 use crate::resolver_chain::PreparedChain;
 use crate::zones::{build_zone_store, reconcile_zone_watchers, replace_zone_store, ZoneState};
+use onetdns_control::FilterApply;
 use std::sync::atomic::Ordering;
 
 /// Steps that undo effects already applied. Register a step before causing its effect: one
@@ -159,13 +161,31 @@ fn needs_native_state(groups: &[ApplyGroup]) -> bool {
     })
 }
 
-pub(crate) fn build(deps: HotApplyDeps) -> HotConfigApply {
-    Arc::new(move |next: &Config, _requested_changed: &[String]| deps.apply(next))
+/// One hot apply for each way a change can reach the filter.
+pub(crate) struct HotAppliers {
+    pub(crate) wait: HotConfigApply,
+    pub(crate) background: HotConfigApply,
+}
+
+pub(crate) fn build(deps: HotApplyDeps) -> HotAppliers {
+    let deps = Arc::new(deps);
+    let applier = |filter_apply: FilterApply| -> HotConfigApply {
+        let deps = Arc::clone(&deps);
+        Arc::new(move |next: &Config, _requested_changed: &[String]| deps.apply(next, filter_apply))
+    };
+    HotAppliers {
+        wait: applier(FilterApply::Wait),
+        background: applier(FilterApply::Background),
+    }
 }
 
 impl HotApplyDeps {
     /// Returns false when the change needs a restart.
-    fn apply(&self, next: &Config) -> Result<(bool, Vec<String>), String> {
+    fn apply(
+        &self,
+        next: &Config,
+        filter_apply: FilterApply,
+    ) -> Result<(bool, Vec<String>), String> {
         let _runtime_update_guard = runtime_config_update_lock().lock_recover();
         let previous_cfg = self.runtime_cfg.load();
 
@@ -180,8 +200,17 @@ impl HotApplyDeps {
 
         let groups = hot_reload_groups(&previous_cfg, next, &changed);
 
+        // Only a build can tell whether a list file is usable, so those changes wait for one.
+        let defer_filter = filter_apply == FilterApply::Background
+            && groups.contains(&ApplyGroup::Filter)
+            && !changed
+                .iter()
+                .any(|key| matches!(key.as_str(), "blocklists" | "allowlists"));
+        let _filter_build = (groups.contains(&ApplyGroup::Filter) && !defer_filter)
+            .then(|| self.filters.build_lock.lock_recover());
+
         // hot-apply:begin
-        let Some(prepared) = self.prepare(&previous_cfg, next, &groups)? else {
+        let Some(prepared) = self.prepare(&previous_cfg, next, &groups, defer_filter)? else {
             return Ok((false, changed));
         };
         let mut prepared = prepared;
@@ -208,6 +237,7 @@ impl HotApplyDeps {
         previous: &Config,
         next: &Config,
         groups: &[ApplyGroup],
+        defer_filter: bool,
     ) -> Result<Option<Box<Prepared>>, String> {
         let HotApplyDeps {
             restarts:
@@ -297,7 +327,10 @@ impl HotApplyDeps {
             }
             _ => None,
         };
-        let filter = if groups.contains(&ApplyGroup::Filter) {
+        let filter = if defer_filter {
+            validate_filter_config(next)?;
+            None
+        } else if groups.contains(&ApplyGroup::Filter) {
             let subscriptions = sub_meta.lock_recover().clone();
             let rpz_texts_snapshot = rpz_texts.lock_recover().clone();
             Some(build_filter_engine_for_config(
@@ -583,6 +616,7 @@ impl HotApplyDeps {
                     rpz_urls: rpz_url_state,
                     list_refresh_secs,
                     list_generation,
+                    deferred_rebuild,
                     ..
                 },
             console_auth,
@@ -667,12 +701,16 @@ impl HotApplyDeps {
                 "Changed blocklist subscriptions without interrupting DNS"
             );
         }
-        if let Some(engine) = prepared_filter {
-            let counts = (engine.block_count(), engine.allow_count());
-            filter.store(Arc::new(engine));
+        let filter_changed = groups.contains(&ApplyGroup::Filter);
+        let filter_deferred = filter_changed && prepared_filter.is_none();
+        if filter_changed {
             *overlay.lock_recover() = (next.block_rules.clone(), next.allow_rules.clone());
             *service_set.lock_recover() = next.blocked_services.clone();
             *refused_domains.lock_recover() = next.refused_domains.clone();
+        }
+        if let Some(engine) = prepared_filter {
+            let counts = (engine.block_count(), engine.allow_count());
+            filter.store(Arc::new(engine));
             if let Some(dir) = subscription_cache_dir.as_deref() {
                 release_subscription_lines(sub_meta, dir);
             }
@@ -735,6 +773,9 @@ impl HotApplyDeps {
         }
 
         runtime_cfg.store(Arc::new(next.clone()));
+        if filter_deferred {
+            deferred_rebuild.request();
+        }
         let chain_generation = match (chain, effects.chain) {
             (Some(chain), Some(prepared)) => {
                 let installed = chain.chain.install(prepared);
