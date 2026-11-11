@@ -498,6 +498,19 @@ mod linux {
     mod tests {
         use super::*;
 
+        fn becomes_ready(receiver: &ReadinessReceiver, window: Duration) -> bool {
+            let deadline = Instant::now() + window;
+            loop {
+                if matches!(receiver.poll_ready().expect("poll"), ReadyState::Ready) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         #[test]
         fn readiness_requires_matching_token() {
             let (receiver, address, token) = readiness_channel().expect("channel");
@@ -506,15 +519,10 @@ mod linux {
             let mut bogus = token;
             bogus[0] ^= 1;
             signal_readiness(address, bogus).expect("bogus signal");
-            assert!(matches!(
-                receiver.poll_ready().expect("poll"),
-                ReadyState::Pending
-            ));
+            // Loopback delivery is not immediate under WSL mirrored networking.
+            assert!(!becomes_ready(&receiver, Duration::from_millis(50)));
             signal_readiness(address, token).expect("ready signal");
-            assert!(matches!(
-                receiver.poll_ready().expect("poll"),
-                ReadyState::Ready
-            ));
+            assert!(becomes_ready(&receiver, Duration::from_secs(5)));
         }
     }
 }
