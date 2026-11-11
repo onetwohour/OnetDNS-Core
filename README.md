@@ -93,7 +93,9 @@ You can add more lists from the dashboard later.
 OnetDNS --config OnetDNS.toml
 ```
 
-On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it works without admin rights; to start it with Windows, run `OnetDNS service install --config OnetDNS.toml`.
+On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it works without admin rights.
+
+To start it at boot, run `OnetDNS service install --config OnetDNS.toml`. Windows asks for administrator rights; on Linux and macOS, use `sudo`.
 
 **4. Open the dashboard** at <http://127.0.0.1:8553> on the same machine and create your admin account. It asks for a setup code: OnetDNS writes one to `setup-code.txt` next to its configuration file, and the page shows the exact path. The code works once.
 

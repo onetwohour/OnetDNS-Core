@@ -1,11 +1,4 @@
-/*!
- * @brief Windows 서비스 등록과 실행.
- *
- * @details 부팅 때 자동으로 뜨게 하려면 서비스로 등록해야 한다. 서비스 제어 관리자와
- *          주고받는 프로토콜은 외부 크레이트 없이 직접 묶었다.
- * @warning 서비스 제어 관리자는 명령줄 한 줄을 받아 다시 쪼갠다. 인수를 규칙대로 감싸지
- *          않으면 경로에 든 공백만으로 엉뚱한 것이 실행 파일로 읽힌다.
- */
+//! Windows service registration and execution, bound to the service control manager directly.
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::io;
@@ -18,165 +11,104 @@ use std::sync::{Arc, OnceLock};
 use crate::error::BoxResult;
 use onetdns_config::Config;
 
-/** @brief 등록할 서비스 이름. */
 const SERVICE_NAME: &str = "OnetDNS";
-/** @brief 목록에 보일 이름. */
 const SERVICE_DISPLAY: &str = "OnetDNS ad-blocking DNS";
 
-/** @brief 서비스로 뜰 때 쓸 설정 경로. 진입점이 인수를 받지 못해 여기 둔다. */
+/// The service entry point takes no arguments, so the config path waits here.
 static CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-/** @brief 정지 요청을 서비스 반복에 전하는 플래그. */
 static STOP_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-/** @brief 상태 보고 핸들. 시험 기한을 재는 스레드도 정지를 보고하므로 여기 둔다. */
+/// Static because the update trial timer reports a stop too.
 static STATUS: OnceLock<StatusHandle> = OnceLock::new();
 
-/**
- * @brief 서비스가 실패했을 때 다시 시작하기까지 기다리는 밀리초. 실패할 때마다 다음 값으로 넘어간다.
- * @details 업데이트를 마치고 업데이트 종료 코드로 멈춘 서비스도 첫 값만큼 기다렸다가 다시 뜬다.
- */
+/// Milliseconds before each successive restart after a failure.
 const RECOVERY_DELAYS_MS: [u32; 3] = [1_000, 5_000, 30_000];
-/** @brief 이만큼(초) 실패가 없으면 실패 횟수를 0 으로 되돌린다. 하루다. */
+/// A day without failures resets the failure count.
 const RECOVERY_RESET_SECONDS: u32 = 86_400;
 
 #[allow(non_snake_case)]
-/** @brief 서비스 제어 관리자 프로토콜. */
 mod win32 {
     use super::c_void;
 
-    /** @brief 서비스 제어 관리자 핸들. */
     pub type ScHandle = isize;
-    /** @brief 상태 보고용 핸들. */
     pub type ServiceStatusHandle = isize;
 
-    /** @brief 관리자에 붙을 권한. */
     pub const SC_MANAGER_CONNECT: u32 = 0x0001;
-    /** @brief 서비스를 만들 권한. */
     pub const SC_MANAGER_CREATE_SERVICE: u32 = 0x0002;
-    /** @brief 지울 권한. */
     pub const DELETE: u32 = 0x0001_0000;
-    /** @brief 설정을 바꿀 권한. */
     pub const SERVICE_CHANGE_CONFIG: u32 = 0x0002;
-    /** @brief 상태를 물을 권한. */
     pub const SERVICE_QUERY_STATUS: u32 = 0x0004;
-    /** @brief 정지시킬 권한. */
     pub const SERVICE_STOP: u32 = 0x0020;
-    /** @brief 설정을 물을 권한. */
     pub const SERVICE_QUERY_CONFIG: u32 = 0x0001;
-    /** @brief 시작시킬 권한. 복구 동작에 다시 시작을 걸려면 이 권한으로 연 핸들이어야 한다. */
     pub const SERVICE_START: u32 = 0x0010;
-    /** @brief 실패했을 때의 복구 동작 설정. */
     pub const SERVICE_CONFIG_FAILURE_ACTIONS: u32 = 2;
-    /** @brief 충돌이 아닌 실패에도 복구 동작을 적용할지 정하는 설정. */
     pub const SERVICE_CONFIG_FAILURE_ACTIONS_FLAG: u32 = 4;
-    /** @brief 복구 동작 가운데 서비스를 다시 시작하는 것. */
     pub const SC_ACTION_RESTART: u32 = 1;
-    /** @brief 버퍼가 작다. 필요한 크기를 함께 알려 준다. */
     pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 
-    /** @brief 프로세스 하나를 전부 쓰는 서비스. */
     pub const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0010;
-    /** @brief 부팅 때 자동으로 뜬다. */
     pub const SERVICE_AUTO_START: u32 = 0x0002;
-    /** @brief 시작 실패를 기록만 하고 부팅은 계속한다. */
     pub const SERVICE_ERROR_NORMAL: u32 = 0x0001;
-    /** @brief 멈춰 있음. */
     pub const SERVICE_STOPPED: u32 = 0x0001;
-    /** @brief 뜨는 중. */
     pub const SERVICE_START_PENDING: u32 = 0x0002;
-    /** @brief 돌고 있음. */
     pub const SERVICE_RUNNING: u32 = 0x0004;
-    /** @brief 정지 요청을 받는다. */
     pub const SERVICE_ACCEPT_STOP: u32 = 0x0001;
-    /** @brief 정지 요청. */
     pub const SERVICE_CONTROL_STOP: u32 = 0x0001;
-    /** @brief 상태 확인 요청. */
     pub const SERVICE_CONTROL_INTERROGATE: u32 = 0x0004;
-    /** @brief 권한이 모자라다. 관리자 콘솔이 아니면 이것이 온다. */
     pub const ERROR_ACCESS_DENIED: i32 = 5;
-    /** @brief 그런 이름의 서비스가 없다. 등록 여부 판정에 쓴다. */
     pub const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-    /** @brief 같은 이름이 이미 있다. */
     pub const ERROR_SERVICE_EXISTS: i32 = 1073;
-    /** @brief 다루지 않는 요청에 돌려줄 값. */
     pub const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
-    /** @brief 서비스 고유 오류가 있음을 알리는 값. */
     pub const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    /** @brief 관리자에 보고할 상태. */
     pub struct ServiceStatus {
-        /** @brief 서비스 종류. */
         pub dwServiceType: u32,
-        /** @brief 지금 상태. */
         pub dwCurrentState: u32,
-        /** @brief 받아들이는 제어 요청. */
         pub dwControlsAccepted: u32,
-        /** @brief 종료 코드. */
         pub dwWin32ExitCode: u32,
-        /** @brief 서비스 고유 종료 코드. */
         pub dwServiceSpecificExitCode: u32,
-        /** @brief 시작 진행 단계. 늘려 가며 보고한다. */
         pub dwCheckPoint: u32,
-        /** @brief 다음 보고까지 걸릴 예상 시간. */
         pub dwWaitHint: u32,
     }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    /** @brief 복구 동작 하나. */
     pub struct ScAction {
-        /** @brief 동작 종류. */
         pub Type: u32,
-        /** @brief 동작하기 전에 기다릴 밀리초. */
         pub Delay: u32,
     }
 
     #[repr(C)]
-    /** @brief 복구 동작 목록. 실패할 때마다 다음 동작으로 넘어간다. */
     pub struct ServiceFailureActionsW {
-        /** @brief 이만큼(초) 실패가 없으면 실패 횟수를 0 으로 되돌린다. */
         pub dwResetPeriod: u32,
-        /** @brief 재부팅할 때 보낼 메시지. 널이면 바꾸지 않는다. */
         pub lpRebootMsg: *mut u16,
-        /** @brief 실행할 명령. 널이면 바꾸지 않는다. */
         pub lpCommand: *mut u16,
-        /** @brief 동작 수. */
         pub cActions: u32,
-        /** @brief 동작 배열. */
         pub lpsaActions: *mut ScAction,
     }
 
     #[repr(C)]
-    /** @brief 충돌이 아닌 실패에도 복구 동작을 적용할지. */
     pub struct ServiceFailureActionsFlag {
-        /** @brief 0 이 아니면 적용한다. */
         pub fFailureActionsOnNonCrashFailures: i32,
     }
 
-    /** @brief 서비스 진입점. */
     pub type ServiceMainProc = Option<extern "system" fn(u32, *mut *mut u16)>;
-    /** @brief 제어 요청 핸들러. */
     pub type HandlerExProc = Option<extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> u32>;
 
     #[repr(C)]
-    /** @brief 이름과 진입점을 잇는 테이블의 한 줄. */
     pub struct ServiceTableEntryW {
-        /** @brief 서비스 이름. */
         pub lpServiceName: *mut u16,
-        /** @brief 그 서비스의 진입점. */
         pub lpServiceProc: ServiceMainProc,
     }
 
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        /** @brief 서비스 제어 관리자에 붙는다. */
         pub fn OpenSCManagerW(
             machine_name: *const u16,
             database_name: *const u16,
             desired_access: u32,
         ) -> ScHandle;
-        /** @brief 서비스를 만든다. */
         pub fn CreateServiceW(
             manager: ScHandle,
             service_name: *const u16,
@@ -192,21 +124,15 @@ mod win32 {
             service_start_name: *const u16,
             password: *const u16,
         ) -> ScHandle;
-        /** @brief 이미 있는 서비스를 연다. */
         pub fn OpenServiceW(
             manager: ScHandle,
             service_name: *const u16,
             desired_access: u32,
         ) -> ScHandle;
-        /** @brief 서비스 상태를 묻는다. */
         pub fn QueryServiceStatus(service: ScHandle, status: *mut ServiceStatus) -> i32;
-        /** @brief 서비스에 제어 요청을 보낸다. */
         pub fn ControlService(service: ScHandle, control: u32, status: *mut ServiceStatus) -> i32;
-        /** @brief 서비스를 지운다. */
         pub fn DeleteService(service: ScHandle) -> i32;
-        /** @brief 서비스의 추가 설정을 바꾼다. */
         pub fn ChangeServiceConfig2W(service: ScHandle, info_level: u32, info: *mut c_void) -> i32;
-        /** @brief 서비스의 추가 설정을 읽는다. */
         pub fn QueryServiceConfig2W(
             service: ScHandle,
             info_level: u32,
@@ -214,29 +140,71 @@ mod win32 {
             buffer_size: u32,
             bytes_needed: *mut u32,
         ) -> i32;
-        /** @brief 핸들을 닫는다. */
         pub fn CloseServiceHandle(handle: ScHandle) -> i32;
-        /** @brief 관리자와 이어 서비스 진입점을 넘긴다. */
         pub fn StartServiceCtrlDispatcherW(table: *const ServiceTableEntryW) -> i32;
-        /** @brief 제어 요청 핸들러를 등록한다. */
         pub fn RegisterServiceCtrlHandlerExW(
             service_name: *const u16,
             handler: HandlerExProc,
             context: *mut c_void,
         ) -> ServiceStatusHandle;
-        /** @brief 상태를 보고한다. */
         pub fn SetServiceStatus(
             status_handle: ServiceStatusHandle,
             status: *const ServiceStatus,
         ) -> i32;
+        pub fn OpenProcessToken(process: isize, desired_access: u32, token: *mut isize) -> i32;
+        pub fn GetTokenInformation(
+            token: isize,
+            information_class: u32,
+            information: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+
+    pub const TOKEN_QUERY: u32 = 0x0008;
+    pub const TOKEN_ELEVATION_CLASS: u32 = 20;
+    pub const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0040;
+    pub const SEE_MASK_NOASYNC: u32 = 0x0100;
+    pub const SW_HIDE: i32 = 0;
+    pub const INFINITE: u32 = 0xFFFF_FFFF;
+    pub const ERROR_CANCELLED: i32 = 1223;
+
+    #[repr(C)]
+    pub struct ShellExecuteInfoW {
+        pub cbSize: u32,
+        pub fMask: u32,
+        pub hwnd: isize,
+        pub lpVerb: *const u16,
+        pub lpFile: *const u16,
+        pub lpParameters: *const u16,
+        pub lpDirectory: *const u16,
+        pub nShow: i32,
+        pub hInstApp: isize,
+        pub lpIDList: *mut c_void,
+        pub lpClass: *const u16,
+        pub hkeyClass: isize,
+        pub dwHotKey: u32,
+        pub hIcon: isize,
+        pub hProcess: isize,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        pub fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetCurrentProcess() -> isize;
+        pub fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+        pub fn GetExitCodeProcess(process: isize, exit_code: *mut u32) -> i32;
+        pub fn CloseHandle(handle: isize) -> i32;
     }
 }
 
-/** @brief 사라질 때 스스로 닫히는 핸들. */
 struct ScHandle(win32::ScHandle);
 
 impl ScHandle {
-    /** @brief 핸들을 감싼다. 0이면 실패다. */
     fn new(raw: win32::ScHandle) -> io::Result<Self> {
         if raw == 0 {
             Err(io::Error::last_os_error())
@@ -247,7 +215,6 @@ impl ScHandle {
 }
 
 impl Drop for ScHandle {
-    /** @brief 핸들을 닫는다. */
     fn drop(&mut self) {
         unsafe {
             win32::CloseServiceHandle(self.0);
@@ -256,11 +223,9 @@ impl Drop for ScHandle {
 }
 
 #[derive(Clone, Copy)]
-/** @brief 상태 보고용 핸들. */
 struct StatusHandle(win32::ServiceStatusHandle);
 
 impl StatusHandle {
-    /** @brief 제어 요청 핸들러를 등록하고 핸들을 받는다. */
     fn register() -> io::Result<Self> {
         let name = wide_nul(OsStr::new(SERVICE_NAME))?;
         let raw = unsafe {
@@ -277,11 +242,7 @@ impl StatusHandle {
         }
     }
 
-    /**
-     * @brief 지금 상태를 관리자에 보고한다.
-     * @note 뜨는 중에도 주기적으로 보고해야 한다. 끊기면 관리자가 죽은 것으로 보고
-     *       시작을 중단시킨다.
-     */
+    /// Must repeat during startup, or the manager takes the service for dead.
     fn report(
         self,
         state: u32,
@@ -305,7 +266,6 @@ impl StatusHandle {
     }
 }
 
-/** @brief 참거짓으로 오는 결과를 마지막 오류와 함께 돌려준다. */
 fn bool_result(value: i32) -> io::Result<()> {
     if value == 0 {
         Err(io::Error::last_os_error())
@@ -314,7 +274,7 @@ fn bool_result(value: i32) -> io::Result<()> {
     }
 }
 
-/** @brief 문자열을 넓은 문자로 바꾸고 끝을 표시한다. 중간에 끝 표시가 있으면 거부한다. */
+/// Rejects embedded NULs.
 fn wide_nul(value: &OsStr) -> io::Result<Vec<u16>> {
     let mut wide: Vec<u16> = value.encode_wide().collect();
     if wide.contains(&0) {
@@ -327,12 +287,8 @@ fn wide_nul(value: &OsStr) -> io::Result<Vec<u16>> {
     Ok(wide)
 }
 
-/**
- * @brief 인수 하나를 명령줄 규칙대로 감싼다.
- * @warning 관리자는 한 줄을 받아 다시 쪼갠다. 공백이나 따옴표가 든 인수를 감싸지 않으면
- *          경로가 두 조각으로 읽혀 엉뚱한 것이 실행된다.
- * @note 따옴표 앞의 역슬래시는 두 배로 늘려야 한다. 규칙이 그렇게 되어 있다.
- */
+/// Quotes one argument by the Windows command-line rules, since one line is split back into
+/// arguments. Backslashes before a quote double.
 fn escape_argument(value: &OsStr) -> io::Result<Vec<u16>> {
     let units: Vec<u16> = value.encode_wide().collect();
     if units.contains(&0) {
@@ -376,24 +332,27 @@ fn escape_argument(value: &OsStr) -> io::Result<Vec<u16>> {
     Ok(escaped)
 }
 
-/** @brief 실행 파일과 인수들을 관리자에 넘길 한 줄로 잇는다. */
 fn service_command(executable: &OsStr, arguments: &[OsString]) -> io::Result<Vec<u16>> {
     let mut command = escape_argument(executable)?;
-    for argument in arguments {
-        command.push(u16::from(b' '));
-        command.extend(escape_argument(argument)?);
-    }
-    command.push(0);
+    command.push(u16::from(b' '));
+    command.extend(command_parameters(arguments)?);
     Ok(command)
 }
 
-/**
- * @brief 지금 서비스가 등록돼 있는지, 돌고 있는지.
- *
- * @details 관리 화면이 「등록」과 「제거」 중 무엇을 보여 줄지 정하려면 이 값이 필요하다.
- *          상태를 묻는 데는 관리자 권한이 필요 없다. 등록과 제거만 필요하다.
- * @return (등록됨, 돌고 있음). 그런 이름의 서비스가 없으면 (false, false)다.
- */
+/// NUL-terminated.
+fn command_parameters(arguments: &[OsString]) -> io::Result<Vec<u16>> {
+    let mut line = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            line.push(u16::from(b' '));
+        }
+        line.extend(escape_argument(argument)?);
+    }
+    line.push(0);
+    Ok(line)
+}
+
+/// (registered, running). Needs no administrator rights.
 pub fn status() -> BoxResult<(bool, bool)> {
     let manager = ScHandle::new(unsafe {
         win32::OpenSCManagerW(ptr::null(), ptr::null(), win32::SC_MANAGER_CONNECT)
@@ -418,12 +377,7 @@ pub fn status() -> BoxResult<(bool, bool)> {
     Ok((true, running))
 }
 
-/**
- * @brief 서비스 제어 관리자의 오류를 사람이 읽을 문장으로 바꾼다.
- *
- * @details 권한 부족은 이 기능에서 가장 흔한 실패인데, 원래 문구("액세스가 거부되었습니다")
- *          만으로는 무엇을 해야 하는지 알 수 없다.
- */
+/// Access denied is the usual failure here, and the OS text does not say what to do.
 fn describe(error: io::Error) -> io::Error {
     let message = match error.raw_os_error() {
         Some(win32::ERROR_ACCESS_DENIED) => {
@@ -436,7 +390,7 @@ fn describe(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), message)
 }
 
-/** @brief 서비스를 등록한다. 설정 경로는 절대 경로로 고정해 둔다. */
+/// Pins the config to an absolute path.
 pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
     let manager = ScHandle::new(unsafe {
         win32::OpenSCManagerW(
@@ -487,12 +441,116 @@ pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
     ))
 }
 
-/**
- * @brief 서비스가 실패하면 다시 시작하도록 복구 동작을 건다.
- * @details 업데이트를 마친 서비스는 업데이트 종료 코드를 보고하고 멈춘다. 서비스 관리자는 이것을
- *          충돌이 아닌 실패로 보므로, 그런 실패에도 복구 동작을 적용하는 플래그를 함께 건다. 같은
- *          동작이 서비스가 죽었을 때 다시 띄우는 역할도 한다.
- */
+/// Installs from any console, asking for administrator rights through UAC when they are missing.
+pub fn install_elevating(config: Option<PathBuf>) -> BoxResult<String> {
+    if is_elevated()? {
+        return install(config);
+    }
+    if status()?.0 {
+        return Err("A service with the same name is already installed".into());
+    }
+    let mut arguments = vec![OsString::from("service"), OsString::from("install")];
+    if let Some(config) = config {
+        // The elevated process starts in another directory.
+        arguments.push(OsString::from("--config"));
+        arguments.push(std::path::absolute(config)?.into_os_string());
+    }
+    run_elevated(&arguments)?;
+    Ok(format!(
+        "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot"
+    ))
+}
+
+/// Removes from any console, asking for administrator rights through UAC when they are missing.
+pub fn uninstall_elevating() -> BoxResult<String> {
+    if is_elevated()? {
+        return uninstall();
+    }
+    if !status()?.0 {
+        return Err("The service is not installed".into());
+    }
+    run_elevated(&[OsString::from("service"), OsString::from("uninstall")])?;
+    Ok(format!("Removed service '{SERVICE_NAME}'"))
+}
+
+fn is_elevated() -> io::Result<bool> {
+    let mut token = 0;
+    // SAFETY: the pseudo handle needs no closing and `token` is a valid out pointer.
+    bool_result(unsafe {
+        win32::OpenProcessToken(win32::GetCurrentProcess(), win32::TOKEN_QUERY, &mut token)
+    })?;
+    let mut elevated = 0u32;
+    let mut returned = 0u32;
+    // SAFETY: `token` is open and TOKEN_ELEVATION is one u32.
+    let result = bool_result(unsafe {
+        win32::GetTokenInformation(
+            token,
+            win32::TOKEN_ELEVATION_CLASS,
+            (&mut elevated as *mut u32).cast(),
+            4,
+            &mut returned,
+        )
+    });
+    // SAFETY: closes the handle opened above, once.
+    unsafe {
+        win32::CloseHandle(token);
+    }
+    result.map(|()| elevated != 0)
+}
+
+/// Runs this executable as administrator and waits. Its console closes with it, so only the exit
+/// code comes back.
+fn run_elevated(arguments: &[OsString]) -> BoxResult<()> {
+    let executable = wide_nul(std::env::current_exe()?.as_os_str())?;
+    let parameters = command_parameters(arguments)?;
+    let verb = wide_nul(OsStr::new("runas"))?;
+    let mut info = win32::ShellExecuteInfoW {
+        cbSize: std::mem::size_of::<win32::ShellExecuteInfoW>() as u32,
+        fMask: win32::SEE_MASK_NOCLOSEPROCESS | win32::SEE_MASK_NOASYNC,
+        hwnd: 0,
+        lpVerb: verb.as_ptr(),
+        lpFile: executable.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: ptr::null(),
+        nShow: win32::SW_HIDE,
+        hInstApp: 0,
+        lpIDList: ptr::null_mut(),
+        lpClass: ptr::null(),
+        hkeyClass: 0,
+        dwHotKey: 0,
+        hIcon: 0,
+        hProcess: 0,
+    };
+    // SAFETY: `info` matches SHELLEXECUTEINFOW and the strings outlive the call.
+    if let Err(error) = bool_result(unsafe { win32::ShellExecuteExW(&mut info) }) {
+        if error.raw_os_error() == Some(win32::ERROR_CANCELLED) {
+            return Err("The administrator prompt was declined, so nothing changed".into());
+        }
+        return Err(format!("Could not ask for administrator rights: {error}").into());
+    }
+    if info.hProcess == 0 {
+        return Err("Windows did not report the elevated process".into());
+    }
+    let mut code = 1u32;
+    // SAFETY: `hProcess` stays open until the CloseHandle below.
+    let read = unsafe {
+        win32::WaitForSingleObject(info.hProcess, win32::INFINITE);
+        let read = bool_result(win32::GetExitCodeProcess(info.hProcess, &mut code));
+        win32::CloseHandle(info.hProcess);
+        read
+    };
+    read?;
+    if code != 0 {
+        return Err(format!(
+            "The elevated command failed with exit code {code}; run it from an administrator console to see why"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A service stopping with the update exit code is a non-crash failure, so recovery has to be
+/// switched on for those too.
 fn set_recovery(service: &ScHandle) -> io::Result<()> {
     let mut actions = RECOVERY_DELAYS_MS.map(|delay| win32::ScAction {
         Type: win32::SC_ACTION_RESTART,
@@ -524,11 +582,8 @@ fn set_recovery(service: &ScHandle) -> io::Result<()> {
     })
 }
 
-/**
- * @brief 이 서비스에 다시 시작하는 복구 동작이 걸려 있는지.
- * @details 업데이트를 마친 서비스가 스스로 멈춰도 다시 뜨는지를 이것으로 판단한다. 다시 시작하는
- *          동작이 없거나 충돌이 아닌 실패에 복구 동작을 적용하지 않으면 멈춘 채로 남는다.
- */
+/// Whether a service that stops itself for an update comes back. Asked each time, since an
+/// operator can change the service settings.
 pub(crate) fn restarts_on_failure() -> bool {
     match recovery_restarts(SERVICE_NAME) {
         Ok(restarts) => restarts,
@@ -539,7 +594,6 @@ pub(crate) fn restarts_on_failure() -> bool {
     }
 }
 
-/** @brief 이 이름의 서비스가 실패하면 다시 시작하는지. */
 fn recovery_restarts(name: &str) -> io::Result<bool> {
     let manager = ScHandle::new(unsafe {
         win32::OpenSCManagerW(ptr::null(), ptr::null(), win32::SC_MANAGER_CONNECT)
@@ -564,11 +618,7 @@ fn recovery_restarts(name: &str) -> io::Result<bool> {
     Ok(restarts && on_non_crash)
 }
 
-/**
- * @brief 서비스의 추가 설정 하나를 읽는다.
- * @details 8바이트 단위로 잡아 안에 든 포인터와 구조체를 정렬된 채로 읽게 한다.
- * @safety 돌려받은 구조체의 포인터는 이 버퍼 안을 가리키므로 버퍼보다 오래 쓰면 안 된다.
- */
+/// In 8-byte words, so the structs inside stay aligned. Pointers in the result point into it.
 fn query_config(service: &ScHandle, level: u32) -> io::Result<Vec<u64>> {
     let mut needed = 0u32;
     if unsafe { win32::QueryServiceConfig2W(service.0, level, ptr::null_mut(), 0, &mut needed) }
@@ -594,11 +644,7 @@ fn query_config(service: &ScHandle, level: u32) -> io::Result<Vec<u64>> {
     Ok(buffer)
 }
 
-/**
- * @brief 업데이트 종료 코드로 서비스 정지를 보고하고 프로세스를 끝낸다.
- * @details 시험에 실패해 되돌린 직후에 부른다. 준비에 이르지 못한 서버는 정상 종료를 기다리지
- *          않는다. 복구 동작이 걸려 있으면 서비스 관리자가 되돌린 실행 파일로 다시 띄운다.
- */
+/// Called right after reverting an update; recovery starts the reverted executable.
 pub(crate) fn exit_for_update() -> ! {
     let code = crate::update::launch::UPDATE_EXIT_CODE;
     if !restarts_on_failure() {
@@ -615,7 +661,6 @@ pub(crate) fn exit_for_update() -> ! {
     std::process::exit(code)
 }
 
-/** @brief 서비스를 멈추고 지운다. */
 pub fn uninstall() -> BoxResult<String> {
     let manager = ScHandle::new(unsafe {
         win32::OpenSCManagerW(ptr::null(), ptr::null(), win32::SC_MANAGER_CONNECT)
@@ -642,7 +687,6 @@ pub fn uninstall() -> BoxResult<String> {
     Ok(format!("Removed service '{SERVICE_NAME}'"))
 }
 
-/** @brief 관리자와 이어 서비스로 돈다. */
 pub fn run_dispatcher(config: Option<PathBuf>) -> BoxResult<()> {
     let _ = CONFIG_PATH.set(config);
     let mut name = wide_nul(OsStr::new(SERVICE_NAME))?;
@@ -660,14 +704,12 @@ pub fn run_dispatcher(config: Option<PathBuf>) -> BoxResult<()> {
     Ok(())
 }
 
-/** @brief 관리자가 부르는 진입점. */
 extern "system" fn ffi_service_main(_argument_count: u32, _arguments: *mut *mut u16) {
     if let Err(error) = service_run() {
         eprintln!("Service error: {error}");
     }
 }
 
-/** @brief 관리자의 제어 요청을 받는다. */
 extern "system" fn service_control_handler(
     control: u32,
     _event_type: u32,
@@ -686,12 +728,7 @@ extern "system" fn service_control_handler(
     }
 }
 
-/**
- * @brief 서비스가 끝날 때 보고할 서비스 고유 종료 코드. 정상 종료면 없다.
- * @details 시험 중인 새 버전이 준비 전에 오류로 끝났으면 되돌리고 업데이트 종료 코드를 보고해,
- *          복구 동작이 되돌린 버전을 띄우게 한다. 적용을 마치고 멈춘 것이면 같은 코드로 맞바꾼
- *          버전을 띄우게 한다.
- */
+/// The service-specific exit code to report; `None` for a clean stop.
 fn exit_code(result: &BoxResult<()>) -> Option<u32> {
     let update = crate::update::launch::UPDATE_EXIT_CODE as u32;
     match result {
@@ -702,12 +739,7 @@ fn exit_code(result: &BoxResult<()>) -> Option<u32> {
     }
 }
 
-/**
- * @brief 서비스 본체.
- * @details 시작 중에는 진행 중임을 계속 보고하고, 다 뜨면 돌고 있음을 알린다. 정지
- *          요청이 오면 플래그를 설정해 서버 반복을 끝낸다. 설정을 읽기 전에 업데이트 기록을
- *          처리하며, 다른 프로세스의 적용을 기다리는 동안에도 시작 중임을 보고한다.
- */
+/// Handles the update record before reading the config, reporting progress while it waits.
 fn service_run() -> BoxResult<()> {
     let stop = STOP_FLAG
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -836,14 +868,12 @@ fn service_run() -> BoxResult<()> {
 }
 
 #[cfg(test)]
-/** @brief 명령줄 감싸기가 규칙대로인지, 그리고 구조체 배치가 규격과 맞는지. */
 mod tests {
     use std::os::windows::ffi::OsStringExt;
 
     use super::*;
 
     #[test]
-    /** @brief 공백이 든 경로를 감싸되 인수 내용은 바꾸지 않는지. */
     fn service_command_quotes_paths_without_changing_arguments() {
         let command = service_command(
             OsStr::new(r"C:\Program Files\OnetDNS\onetdns.exe"),
@@ -865,7 +895,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 따옴표와 끝의 역슬래시가 규칙대로 늘어나는지. 안 늘리면 감싸기가 깨진다. */
     fn service_command_escapes_quotes_and_trailing_slashes() {
         assert_eq!(
             OsString::from_wide(&escape_argument(OsStr::new(r#"hello \\"quote\\""#)).unwrap()),
@@ -878,14 +907,43 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중간에 끝 표시가 든 인수를 거부하는지. */
+    fn elevated_parameters_are_quoted_and_nul_terminated() {
+        let line = command_parameters(&[
+            OsString::from("service"),
+            OsString::from("install"),
+            OsString::from("--config"),
+            OsString::from(r"C:\Users\A B\OnetDNS.toml"),
+        ])
+        .unwrap();
+        assert_eq!(line.last(), Some(&0));
+        assert_eq!(
+            OsString::from_wide(&line[..line.len() - 1]),
+            OsString::from(r#"service install --config "C:\Users\A B\OnetDNS.toml""#)
+        );
+    }
+
+    #[test]
+    fn the_elevation_of_this_process_can_be_read() {
+        is_elevated().expect("token elevation");
+    }
+
+    #[test]
+    fn shell_execute_info_matches_shellapi_h() {
+        let expected = if std::mem::size_of::<usize>() == 8 {
+            112
+        } else {
+            60
+        };
+        assert_eq!(std::mem::size_of::<win32::ShellExecuteInfoW>(), expected);
+    }
+
+    #[test]
     fn service_command_rejects_embedded_nul() {
         let error = escape_argument(OsStr::new("bad\0argument")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
-    /** @brief 구조체 크기와 필드 위치가 규격과 같은지. 어긋나면 엉뚱한 메모리를 읽는다. */
     fn win32_service_abi_layout_matches_winsvc_h() {
         let word = std::mem::size_of::<usize>();
         assert_eq!(std::mem::size_of::<win32::ServiceStatus>(), 7 * 4);
@@ -908,11 +966,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 복구 설정을 실제로 읽어 내는지.
-     * @details 서비스를 등록하지 않고 확인하려고, 어느 Windows 에나 있는 이벤트 로그 서비스의 설정을
-     *          읽기만 한다. 크기를 먼저 묻고 다시 읽는 과정과 구조체 해석이 여기서 돈다.
-     */
+    // Reads EventLog, present on every Windows, so nothing has to be installed.
     fn recovery_settings_of_an_installed_service_can_be_read() {
         recovery_restarts("EventLog").expect("이벤트 로그 서비스의 복구 설정");
         let missing = recovery_restarts("OnetDNS-no-such-service").unwrap_err();

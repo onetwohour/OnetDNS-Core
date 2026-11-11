@@ -1,103 +1,87 @@
-/*!
- * @brief 명령줄 인자를 읽어 실행할 명령으로 바꾼다.
- */
+//! Parses command-line arguments into the command to run.
 
 use std::path::PathBuf;
 
 use crate::PRODUCT_NAME;
 
-/** @brief 실행할 명령. */
 pub(crate) enum Command {
-    /** @brief 서버로 시작한다. */
     Run {
-        /** @brief 쓸 설정 파일. */
         config: Option<PathBuf>,
-        /** @brief 대시보드를 시작하지 않는다. */
         no_web: bool,
-        /** @brief 프로세스 감독 없이 곧장 돈다. */
         no_supervisor: bool,
     },
-    /** @brief 이름 하나를 물어본다. */
-    Query { name: String, qtype: Option<String> },
-    /** @brief 자체 서명 인증서를 만든다. */
+    Query {
+        name: String,
+        qtype: Option<String>,
+    },
     Cert {
-        /** @brief 인증서에 적을 이름. */
         host: String,
-        /** @brief 인증서를 쓸 곳. */
         cert_out: PathBuf,
-        /** @brief 키를 쓸 곳. */
         key_out: PathBuf,
     },
-    /** @brief 지표를 본다. */
-    Stats { ctl: CtlArgs },
-    /** @brief 설정을 다시 읽게 한다. */
-    Reload { ctl: CtlArgs },
-    /** @brief 차단 목록에 넣는다. */
-    Block { domain: String, ctl: CtlArgs },
-    /** @brief 허용 목록에 넣는다. */
-    Allow { domain: String, ctl: CtlArgs },
-    /** @brief 서비스로 등록하거나 제거한다. */
-    Service { action: ServiceAction },
-    /** @brief 설정만 검사한다. */
-    Check { config: Option<PathBuf> },
-    /** @brief 많이 물은 이름을 본다. */
-    Top { ctl: CtlArgs },
-    /** @brief 차단할 수 있는 서비스 목록을 본다. */
+    Stats {
+        ctl: CtlArgs,
+    },
+    Reload {
+        ctl: CtlArgs,
+    },
+    Block {
+        domain: String,
+        ctl: CtlArgs,
+    },
+    Allow {
+        domain: String,
+        ctl: CtlArgs,
+    },
+    Service {
+        action: ServiceAction,
+    },
+    Check {
+        config: Option<PathBuf>,
+    },
+    Top {
+        ctl: CtlArgs,
+    },
     Services,
-    /** @brief 대시보드 로그인에 쓸 암호 해시를 만든다. */
-    Passwd { name: Option<String> },
-    /** @brief 새 릴리스를 확인하고, 시키면 설치 경로의 실행 파일을 맞바꾼다. */
+    Passwd {
+        name: Option<String>,
+    },
     Update {
-        /** @brief 할 일. */
         action: UpdateAction,
-        /** @brief 서버가 쓰는 설정 파일. 이름 해석과 새 버전의 설정 검사에 쓴다. */
+        /// The server's config: resolves names and checks the new version against it.
         config: Option<PathBuf>,
     },
 }
 
-/** @brief update 명령이 할 일. */
 pub(crate) enum UpdateAction {
-    /** @brief 새 릴리스를 확인만 한다. */
     Check,
-    /** @brief 새 릴리스를 설치한다. */
     Apply {
-        /** @brief 설치할 버전. 주면 확인한 새 버전이 이것일 때만 설치한다. */
+        /// When given, installs only if the new release is this version.
         version: Option<String>,
     },
-    /** @brief 확정된 업데이트를 되돌려 바꾸기 전 버전을 다시 설치한다. */
+    /// Reinstalls the version the last update replaced.
     Rollback,
 }
 
-/** @brief 서비스 관련 동작. */
 pub(crate) enum ServiceAction {
-    /** @brief 서비스로 등록한다. */
     Install {
-        #[cfg(windows)]
-        /** @brief 서비스로 등록할 때 고정해 둘 설정 파일. */
+        /// Pinned into the service definition.
         config: Option<PathBuf>,
     },
-    /** @brief 등록한 서비스를 지운다. */
     Uninstall,
-    /** @brief 서비스로 돈다. */
     Run {
         #[cfg(windows)]
-        /** @brief 서비스로 돌 때 쓸 설정 파일. */
         config: Option<PathBuf>,
     },
 }
 
 #[derive(Default)]
-/** @brief 컨트롤 플레인에 붙을 때 쓰는 인수. */
 pub(crate) struct CtlArgs {
-    /** @brief 설정 파일 경로. */
     pub(crate) config: Option<PathBuf>,
-    /** @brief 컨트롤 플레인 주소. */
     pub(crate) url: Option<String>,
-    /** @brief 컨트롤 플레인 토큰. */
     pub(crate) token: Option<String>,
 }
 
-/** @brief 사용법 안내. */
 const HELP: &str = "\
 OnetDNS: ad-blocking DNS resolver
 
@@ -120,6 +104,10 @@ Management commands (require --cli):
   OnetDNS service install|uninstall|run [--config PATH]
 
 Notes:
+  service    install registers OnetDNS to start at boot: a Windows service, a
+             systemd unit, or a launchd daemon. Windows asks for administrator
+             rights. Linux and macOS need sudo and --config. run is for the
+             Windows service manager only.
   query      Asks the configured upstream directly, not the running server.
              It skips access control, filters, and the cache, so the answer can
              differ from what the server would return.
@@ -134,7 +122,6 @@ Notes:
              checks that configuration before it is installed.
 ";
 
-/** @brief 뒤에 값을 하나 받는 플래그들. */
 const VALUE_FLAGS: &[&str] = &[
     "--config",
     "--url",
@@ -146,19 +133,10 @@ const VALUE_FLAGS: &[&str] = &[
     "--name",
 ];
 
-/** @brief 관리 명령이 쓰는 접속 플래그. */
 const CTL_FLAGS: &[&str] = &["--config", "--url", "--token"];
 
-/**
- * @brief 명령마다 받는 긴 플래그의 전부.
- *
- * @details 목록에 없는 플래그를 조용히 흘리면 진단이 거짓이 된다. query 에 서버를
- *          지정했다고 믿는 운영자는 사실 기본 업스트림이 돌려준 답을 자기 서버의
- *          답으로 읽게 된다. 오타 하나가 자신 있게 틀린 답으로 바뀌므로, 모르는
- *          플래그는 무시하지 않고 거부한다.
- * @invariant 새 플래그를 붙이는 사람은 여기에도 적어야 한다. 빠뜨리면 그 플래그가
- *            거부되므로 빠뜨린 사실이 첫 실행에서 드러난다.
- */
+/// Every long flag each command accepts. Unknown flags are rejected: a mistyped `query` option
+/// would otherwise pass the default upstream's answer off as this server's.
 const COMMAND_FLAGS: &[(&str, &[&str])] = &[
     ("run", &["--config", "--no-web", "--no-supervisor"]),
     ("query", &["--type"]),
@@ -175,13 +153,7 @@ const COMMAND_FLAGS: &[(&str, &[&str])] = &[
     ("update", &["--config"]),
 ];
 
-/**
- * @brief 이 명령이 모르는 긴 플래그가 있으면 거부한다.
- * @note 목록에 없는 명령은 검사하지 않는다. 도움말과 판본 표시가 그렇다.
- * @param sub 하위 명령 이름.
- * @param rest 하위 명령 뒤에 남은 인수 전부.
- * @return 모르는 플래그를 만나면 그 이름을 담은 오류.
- */
+/// Commands missing from `COMMAND_FLAGS`, such as help and version, are not checked.
 fn reject_unknown_flags(sub: &str, rest: &[String]) -> Result<(), String> {
     let Some((_, allowed)) = COMMAND_FLAGS.iter().find(|(name, _)| *name == sub) else {
         return Ok(());
@@ -202,7 +174,7 @@ fn reject_unknown_flags(sub: &str, rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/** @brief 이 플래그의 값. 붙여 쓴 형태와 띄어 쓴 형태를 모두 받는다. */
+/// Accepts both `--flag=value` and `--flag value`.
 fn opt_val(args: &[String], flag: &str) -> Option<String> {
     let pref = format!("{flag}=");
     let mut it = args.iter();
@@ -217,12 +189,10 @@ fn opt_val(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
-/** @brief 이 플래그의 값을 경로로. */
 fn opt_path(args: &[String], flag: &str) -> Option<PathBuf> {
     opt_val(args, flag).map(PathBuf::from)
 }
 
-/** @brief 플래그와 그 값을 뺀 인수들. 순서는 그대로다. */
 fn positionals(args: &[String]) -> Vec<String> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -242,12 +212,10 @@ fn positionals(args: &[String]) -> Vec<String> {
     found
 }
 
-/** @brief 플래그가 아닌 첫 인수. */
 fn positional(args: &[String]) -> Option<String> {
     positionals(args).into_iter().next()
 }
 
-/** @brief 컨트롤 플레인 인수를 모은다. */
 fn ctl_args(args: &[String]) -> CtlArgs {
     CtlArgs {
         config: opt_path(args, "--config"),
@@ -256,21 +224,16 @@ fn ctl_args(args: &[String]) -> CtlArgs {
     }
 }
 
-/** @brief 실행 인수를 읽는다. */
 pub(crate) fn parse_args() -> Result<Command, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     parse_argv(&argv)
 }
 
-/**
- * @brief --version 이 출력하는 한 줄.
- * @note 업데이트 사전 점검이 새 실행 파일의 출력을 이 모양과 맞댄다. 바꾸면 업데이트 계약이 바뀐다.
- */
+/// The update preflight compares a new executable's output with this line.
 pub(crate) fn version_line(version: &str) -> String {
     format!("{PRODUCT_NAME} {version}")
 }
 
-/** @brief 인수 목록을 명령으로. */
 pub(crate) fn parse_argv(argv: &[String]) -> Result<Command, String> {
     if argv.first().map(String::as_str) == Some("--cli") {
         let sub = argv
@@ -307,11 +270,6 @@ pub(crate) fn parse_argv(argv: &[String]) -> Result<Command, String> {
     Err(format!("Unknown command: {first} (see OnetDNS help)"))
 }
 
-/**
- * @brief 하위 명령을 읽는다.
- * @warning 관리 명령은 앞에 표시가 있어야 받는다. 없이 받으면 서버로 시작하려던 것이
- *          엉뚱한 관리 명령으로 실행된다.
- */
 fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
     reject_unknown_flags(sub, rest)?;
     match sub {
@@ -372,7 +330,6 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
         "service" => {
             let action = match rest.first().map(|s| s.as_str()) {
                 Some("install") => ServiceAction::Install {
-                    #[cfg(windows)]
                     config: opt_path(rest, "--config"),
                 },
                 Some("uninstall") => ServiceAction::Uninstall,
@@ -405,12 +362,10 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command, String> {
 }
 
 #[cfg(test)]
-/** @brief 명령줄 인자 해석과 잘못된 인자의 거부. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 관리 명령이 표시 없이 실행되지 않는지. 서버로 시작하려던 것이 엉뚱한 명령이 되면 안 된다. */
     fn management_commands_require_cli_prefix() {
         for command in [
             "query", "cert", "stats", "reload", "top", "block", "allow", "check", "services",
@@ -429,14 +384,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 도움말이 안내하는 옵션을 전부 받는지.
-     *
-     * @details 도움말과 COMMAND_FLAGS 가 따로 놀면, 안내를 보고 그대로 친 운영자가
-     *          알 수 없는 옵션이라는 말을 듣는다. 주석은 부탁일 뿐이므로 여기서 판정한다.
-     */
+    // Help and `COMMAND_FLAGS` must agree, or typing what the help says gets an error.
     fn every_documented_option_is_accepted() {
-        /* 하위 명령을 고르는 표시라서 명령별 목록에 들어갈 슬롯이 없다. */
+        // Selects a subcommand, so no command's list holds it.
         const NOT_A_COMMAND_FLAG: &[&str] = &["--cli"];
         let accepted: Vec<&str> = COMMAND_FLAGS
             .iter()
@@ -471,9 +421,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief update 의 세 가지 형태를 읽고, 그 밖의 인수는 받지 않는지. */
     fn update_forms_parse() {
-        /** @brief --cli update 뒤에 이 인수들을 붙여 읽는다. */
         fn parse(args: &[&str]) -> Result<Command, String> {
             let mut argv = vec!["--cli".to_string(), "update".to_string()];
             argv.extend(args.iter().map(|arg| (*arg).to_string()));
@@ -524,7 +472,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 옵션이 조용히 무시되지 않는지. 무시되면 진단이 자신 있게 틀린다. */
     fn unknown_options_are_rejected_instead_of_ignored() {
         let unknown = parse_argv(&[
             "--cli".to_string(),

@@ -86,6 +86,9 @@ mod secondary;
 #[cfg(windows)]
 /// Windows service registration and execution.
 mod service;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// systemd and launchd registration.
+mod service_unix;
 mod supervisor;
 /// TFTP server for PXE boot.
 mod tftp;
@@ -440,20 +443,36 @@ fn run_service(action: ServiceAction) -> BoxResult<()> {
     {
         match action {
             ServiceAction::Install { config } => {
-                println!("{}", service::install(config)?);
+                println!("{}", service::install_elevating(config)?);
                 Ok(())
             }
             ServiceAction::Uninstall => {
-                println!("{}", service::uninstall()?);
+                println!("{}", service::uninstall_elevating()?);
                 Ok(())
             }
             ServiceAction::Run { config } => service::run_dispatcher(config),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match action {
+            ServiceAction::Install { config } => {
+                println!("{}", service_unix::install(config)?);
+                Ok(())
+            }
+            ServiceAction::Uninstall => {
+                println!("{}", service_unix::uninstall()?);
+                Ok(())
+            }
+            ServiceAction::Run {} => {
+                crate::bail!("`service run` is for the Windows service manager only; use `run`")
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = action;
-        crate::bail!("The service command is available only on Windows")
+        crate::bail!("The service command is not available on this platform")
     }
 }
 
