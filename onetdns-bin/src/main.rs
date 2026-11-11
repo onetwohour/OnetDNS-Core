@@ -567,7 +567,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     let _raft_process_cleanup = RaftProcessCleanup;
     let mut config_path = config_path;
     if config_path.is_none() && !no_web {
-        config_path = ensure_auto_config();
+        config_path = ensure_auto_config()?;
     }
     let stop = install_shutdown_handler();
     update::launch::register(stop.clone());
@@ -737,54 +737,101 @@ fn auto_config_path() -> Option<PathBuf> {
     base.map(|b| b.join(PRODUCT_NAME).join(CONFIG_FILE_NAME))
 }
 
-/// Creates the config file when missing.
-fn ensure_auto_config() -> Option<PathBuf> {
-    let path = auto_config_path()?;
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            onetdns_core::error!(event = "config.autocreate_dir_failed", path = %parent.display(), %error, "Could not create the configuration directory");
-            return None;
+#[cfg(windows)]
+const CONFIG_ACCESS_HINT: &str = "If OnetDNS last ran as administrator, run it as administrator once to restore access for this account";
+#[cfg(not(windows))]
+const CONFIG_ACCESS_HINT: &str = "Check the owner and permissions of the file";
+
+/// Finds the config file, creating it when missing.
+fn ensure_auto_config() -> BoxResult<Option<PathBuf>> {
+    let Some(path) = auto_config_path() else {
+        return Ok(None);
+    };
+    let result = open_auto_config(path);
+    #[cfg(windows)]
+    if let Err(error) = &result {
+        hold_console_window(&error.to_string());
+    }
+    result
+}
+
+fn open_auto_config(path: PathBuf) -> BoxResult<Option<PathBuf>> {
+    let exists = path
+        .try_exists()
+        .map_err(|error| unusable_config(&path, &error))?;
+    let prepared = prepare_auto_config(&path, exists);
+    settle_auto_config(path, exists, prepared)
+}
+
+/// An existing config that cannot be used stops the start: running on defaults would hide its
+/// settings and accounts behind a first-time setup. With no file there is nothing to hide.
+fn settle_auto_config(
+    path: PathBuf,
+    exists: bool,
+    prepared: std::io::Result<()>,
+) -> BoxResult<Option<PathBuf>> {
+    match prepared {
+        Ok(()) => Ok(Some(path)),
+        Err(error) if exists => Err(unusable_config(&path, &error)),
+        Err(error) => {
+            onetdns_core::error!(event = "config.autocreate_failed", path = %path.display(), %error, "Could not create the configuration file; running on defaults without saving changes");
+            Ok(None)
         }
+    }
+}
+
+fn unusable_config(
+    path: &std::path::Path,
+    error: &std::io::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    crate::anyhow!(
+        "OnetDNS did not start because it could not use {}: {error}. {CONFIG_ACCESS_HINT}",
+        path.display()
+    )
+}
+
+fn prepare_auto_config(path: &std::path::Path, exists: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            {
-                onetdns_core::error!(event = "config.autocreate_dir_acl_failed", path = %parent.display(), %error, "Could not set permissions on the configuration directory");
-                return None;
-            }
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    if !path.exists() {
+    if exists {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    } else {
         let body = format!(
             "# Configuration file created automatically by OnetDNS. Edit it in the dashboard or a text editor.\n# Each setting is described in the documentation and on the dashboard's full settings page.\ncontrol_token = \"{}\"\n",
             gen_token()
         );
-
-        if let Err(error) = atomic_write_secret(&path, body.as_bytes()) {
-            onetdns_core::error!(event = "config.autocreate_file_failed", path = %path.display(), %error, "Could not create the configuration file");
-            return None;
-        }
+        atomic_write_secret(path, body.as_bytes())?;
         onetdns_core::info!(event = "config.autocreated", path = %path.display(), "Created a default configuration file");
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            {
-                onetdns_core::error!(event = "config.autocreate_chmod_failed", path = %path.display(), %error, "Could not fix permissions on the configuration file");
-                return None;
-            }
-        }
     }
     #[cfg(windows)]
-    if let Err(error) = atomic_file::harden_windows_secret_acl(&path) {
-        onetdns_core::error!(event = "config.autocreate_acl_failed", path = %path.display(), %error, "Could not fix the Windows access control list on the configuration file");
-        return None;
+    atomic_file::harden_windows_secret_acl(path)?;
+    Ok(())
+}
+
+/// A double-clicked program's window closes when it exits, taking the reason with it. Timed, so
+/// a hidden console cannot hang.
+#[cfg(windows)]
+fn hold_console_window(message: &str) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(processes: *mut u32, count: u32) -> u32;
     }
-    Some(path)
+    let mut processes = [0u32; 2];
+    // SAFETY: the buffer holds the two entries it is declared to.
+    if unsafe { GetConsoleProcessList(processes.as_mut_ptr(), 2) } == 1 {
+        eprintln!("{message}\n\nThis window closes in 60 seconds.");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 
 fn gen_token() -> String {
@@ -2667,6 +2714,47 @@ mod tests {
             let error = etcd(endpoint, auth).unwrap_err();
             assert!(error.starts_with("zones_etcd: "), "{error}");
         }
+    }
+
+    #[test]
+    fn an_existing_config_that_cannot_be_used_stops_the_start() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let error = settle_auto_config(PathBuf::from("locked.toml"), true, Err(denied))
+            .expect_err("must not fall back to defaults")
+            .to_string();
+        assert!(error.contains("did not start"), "{error}");
+        assert!(error.contains("locked.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_created_falls_back_to_defaults() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let path = settle_auto_config(PathBuf::from("new.toml"), false, Err(denied)).unwrap();
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn an_auto_config_is_created_once_and_then_left_as_it_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-auto-config-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(onetdns_core::random_array())
+        ));
+        let path = dir.join(CONFIG_FILE_NAME);
+
+        assert_eq!(
+            open_auto_config(path.clone()).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+        let created = std::fs::read(&path).unwrap();
+        assert_eq!(
+            open_auto_config(path.clone()).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+        let reopened = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(created, reopened);
     }
 
     #[test]

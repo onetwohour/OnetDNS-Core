@@ -44,7 +44,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
         None => std::path::PathBuf::from(&tmp_name),
     };
     let write_result = (|| -> std::io::Result<()> {
-        let mut f = onetdns_core::fs::open_private(&tmp, onetdns_core::fs::PrivateOpen::CreateNew)?;
+        let mut f = onetdns_core::fs::create_private_replacing(&tmp, path)?;
         f.write_all(data)?;
         f.sync_all()?;
         Ok(())
@@ -880,7 +880,7 @@ mod tests {
 
         assert_eq!(
             onetdns_core::fs::access_rules(&path).unwrap(),
-            "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+            onetdns_core::fs::private_rules(&path).unwrap()
         );
         std::fs::remove_file(path).unwrap();
     }

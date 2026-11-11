@@ -393,7 +393,8 @@ mod tests {
         ));
         drop(DnstapWriter::create(&path, "a").unwrap());
         let rules = onetdns_core::fs::access_rules(&path).unwrap();
+        let expected = onetdns_core::fs::private_rules(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(rules, "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)");
+        assert_eq!(rules, expected);
     }
 }

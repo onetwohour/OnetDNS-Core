@@ -1,57 +1,37 @@
-/*!
- * @brief 프로세스 감독자.
- *
- * @details 부모는 필터도 캐시도 읽지 않는다. 자식이 죽으면 재시작만 한다. 그래서
- *          자식이 메모리를 다 쓰거나 강제 종료돼도 서비스가 돌아온다.
- * @warning 시작 자체가 계속 실패하면 포기한다. 설정이 틀린 상태로 무한히 재시작하면
- *          로그만 쌓이고 문제는 그대로다.
- * @note 자식이 준비됐다고 알린 뒤에야 안정으로 본다. 묶기 전에 죽는 것과 돌다가 죽는
- *       것은 다르게 다뤄야 한다.
- */
+//! Process supervisor. The parent loads no filters or caches, so it survives a child that runs
+//! out of memory or is killed, and restarts it. It gives up when startup keeps failing.
 
 #[cfg(any(test, target_os = "linux"))]
 use std::time::Duration;
 
 #[cfg(any(test, target_os = "linux"))]
-/** @brief 첫 재시작까지 기다릴 시간. */
 const BASE_RESTART_DELAY: Duration = Duration::from_millis(10);
 #[cfg(any(test, target_os = "linux"))]
-/** @brief 재시작 대기의 상한. 계속 실패해도 이보다 오래 기다리지는 않는다. */
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(5);
 #[cfg(any(test, target_os = "linux"))]
-/** @brief 이만큼 돌았으면 안정으로 보고 대기 시간을 되돌린다. */
+/// Running this long resets the restart delay.
 const STABLE_RUNTIME: Duration = Duration::from_secs(30);
 #[cfg(any(test, target_os = "linux"))]
-/** @brief 준비 전에 연달아 죽는 것을 참아 줄 횟수. 넘으면 포기한다. */
 const MAX_STARTUP_FAILURES: u32 = 5;
 
 #[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 자식이 죽었을 때의 처분. */
 enum RestartDecision {
-    /** @brief 이만큼 기다렸다 재시작한다. */
     RestartAfter(Duration),
-    /** @brief 더 시작하지 않는다. */
     GiveUp,
 }
 
 #[cfg(any(test, target_os = "linux"))]
 #[derive(Default)]
-/** @brief 재시작 판단 상태. */
 struct RestartPolicy {
-    /** @brief 연달아 죽은 횟수. 대기 시간을 늘리는 데 쓴다. */
     crash_streak: u32,
-    /** @brief 준비 전에 죽은 횟수. 이것이 넘치면 포기한다. */
     startup_failures: u32,
 }
 
 #[cfg(any(test, target_os = "linux"))]
 impl RestartPolicy {
-    /**
-     * @brief 자식이 죽었다. 재시작할지 정한다.
-     * @details 준비까지 갔다가 죽었으면 실패 횟수를 되돌린다. 그러지 않으면 오래 돌던
-     *          서버가 어쩌다 한 번 죽었을 때 누적 횟수로 포기하게 된다.
-     */
+    /// Reaching ready clears the failure count, or occasional crashes of a long-running server
+    /// would add up to giving up.
     fn child_exited(&mut self, ready: bool, runtime: Duration) -> RestartDecision {
         if !ready {
             self.startup_failures = self.startup_failures.saturating_add(1);
@@ -75,7 +55,6 @@ impl RestartPolicy {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 유닉스 전용 감독 구현. */
 mod linux {
     use super::{RestartDecision, RestartPolicy, MAX_STARTUP_FAILURES};
     use crate::error::{BoxResult, Context};
@@ -90,49 +69,28 @@ mod linux {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /**
-     * @brief 자식을 띄울 실행 파일. 부모가 지금 실행 중인 이미지를 가리킨다.
-     * @details 설치 경로로 띄우면 실행 중인 파일을 rename 으로 갈아 끼운 뒤에는 그 경로가
-     *          새 파일을 가리키거나 끝에 (deleted) 가 붙는다. 그러면 재시작한 자식이 부모와
-     *          다른 판으로 뜨거나 아예 뜨지 못한다. 이 경로는 디렉터리를 거치지 않고 이미지로
-     *          바로 가므로, 권한을 낮춘 뒤 확인할 것도 파일 자체의 실행 권한뿐이다.
-     */
+    /// The image this parent is running. The install path would name another version after an
+    /// update's rename, or gain a ` (deleted)` suffix.
     const SELF_IMAGE: &str = "/proc/self/exe";
-    /** @brief 자식이 준비를 알릴 주소를 넘기는 환경 변수. */
     const READY_ADDR_ENV: &str = "ONETDNS_SUPERVISOR_READY_ADDR";
-    /** @brief 준비 통지에 쓸 토큰. 남이 이 서버의 자식인 척 알리지 못하게 한다. */
     const READY_TOKEN_ENV: &str = "ONETDNS_SUPERVISOR_READY_TOKEN";
-    /** @brief 지금까지의 재시작 횟수. 자식이 지표로 내보낸다. */
     const RESTARTS_ENV: &str = "ONETDNS_SUPERVISOR_RESTARTS";
-    /** @brief 자식 상태를 확인하는 주기. */
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
-    /** @brief 종료를 기다려 줄 시간. 지나면 강제로 끝낸다. */
     const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-    /** @brief 덤프 가능 여부 설정 요청. */
     const PR_SET_DUMPABLE: libc::c_int = 4;
 
-    /** @brief 자식이 준비됐는지. */
     enum ReadyState {
-        /** @brief 아직 준비되지 않았다. */
         Pending,
-        /** @brief 준비됐다. */
         Ready,
     }
 
-    /** @brief 자식의 준비 통지를 받는 곳. */
     struct ReadinessReceiver {
-        /** @brief 통지를 받을 소켓. */
         socket: UdpSocket,
-        /** @brief 이 서버의 자식만 아는 토큰. */
         token: [u8; 16],
     }
 
     impl ReadinessReceiver {
-        /**
-         * @brief 통지가 왔는지 확인한다.
-         * @warning 루프백에서 온 것이고 토큰이 맞아야 한다. 확인하지 않으면 아무나 보낸
-         *          패킷으로 자식이 준비됐다고 속일 수 있다.
-         */
+        /// Accepts only the token over loopback, or any packet could claim the child is ready.
         fn poll_ready(&self) -> std::io::Result<ReadyState> {
             let mut token = [0u8; 16];
 
@@ -152,9 +110,7 @@ mod linux {
         }
     }
 
-    /** @brief 토큰을 환경 변수에 담을 형태로. */
     fn encode_token(token: &[u8; 16]) -> String {
-        /** @brief 16진 문자표. */
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut encoded = String::with_capacity(32);
         for byte in token {
@@ -164,7 +120,6 @@ mod linux {
         encoded
     }
 
-    /** @brief 환경 변수의 토큰을 읽는다. */
     fn decode_token(encoded: &str) -> Option<[u8; 16]> {
         if encoded.len() != 32 {
             return None;
@@ -176,7 +131,6 @@ mod linux {
         Some(token)
     }
 
-    /** @brief 준비 통지를 받을 채널를 연다. 주소와 토큰을 함께 준다. */
     fn readiness_channel() -> std::io::Result<(ReadinessReceiver, SocketAddr, [u8; 16])> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
@@ -185,18 +139,13 @@ mod linux {
         Ok((ReadinessReceiver { socket, token }, address, token))
     }
 
-    /** @brief 자식이 준비됐음을 부모에게 알린다. */
     fn signal_readiness(address: SocketAddr, token: [u8; 16]) -> std::io::Result<()> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.send_to(&token, address)?;
         Ok(())
     }
 
-    /**
-     * @brief 코어 덤프를 끈다.
-     * @warning 덤프에는 키와 토큰이 그대로 담긴다. 그리고 큰 덤프를 쓰는 동안 재시작이
-     *          그만큼 늦어진다.
-     */
+    /// A dump would hold keys and tokens, and writing a large one delays the restart.
     fn disable_core_dumps() -> std::io::Result<()> {
         let limit = libc::rlimit {
             rlim_cur: 0,
@@ -208,7 +157,6 @@ mod linux {
         Ok(())
     }
 
-    /** @brief 다른 프로세스가 이 서버의 메모리를 들여다보지 못하게 한다. */
     fn disable_process_dumping() -> std::io::Result<()> {
         if unsafe { libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -216,13 +164,8 @@ mod linux {
         Ok(())
     }
 
-    /**
-     * @brief 프로세스 이름을 argv[0] 의 파일 이름으로 되돌린다.
-     * @details 커널은 실행한 경로의 마지막 부분을 프로세스 이름으로 삼으므로 SELF_IMAGE 로
-     *          뜬 자식의 이름은 exe 가 된다. 그대로 두면 top, pgrep, killall 과 OOM 기록에서
-     *          이 서버를 찾지 못한다.
-     * @warning 스레드는 만들어질 때 이름을 물려받으므로 다른 스레드를 띄우기 전에 부른다.
-     */
+    /// A child started through `SELF_IMAGE` is named exe, which hides it from top, pgrep and OOM
+    /// records. Call before starting threads; they inherit the name.
     fn restore_process_name() -> std::io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
 
@@ -239,20 +182,14 @@ mod linux {
         Ok(())
     }
 
-    /** @brief 이 서버가 시작한 자식 하나. */
     struct ManagedChild {
-        /** @brief 시작한 자식. */
         process: Child,
-        /** @brief 이 자식의 준비 통지를 받을 곳. */
         readiness: Option<ReadinessReceiver>,
-        /** @brief 준비를 알렸는지. */
         ready: bool,
-        /** @brief 시작한 시각. */
         started: Instant,
     }
 
     impl ManagedChild {
-        /** @brief 이 자식이 준비를 알렸는지. */
         fn poll_ready(&mut self) -> std::io::Result<bool> {
             if self.ready {
                 return Ok(true);
@@ -271,11 +208,7 @@ mod linux {
         }
     }
 
-    /**
-     * @brief 자식을 시작한다. 준비 통지 주소와 토큰, 설치 경로를 물려준다.
-     * @param program 자식의 argv[0]. ps 와 서비스 관리자가 보여 주는 이름이고, 자식은 여기서
-     *        프로세스 이름을 되찾는다.
-     */
+    /// `program` is the child's argv[0], the name ps and service managers show.
     fn spawn_child(
         program: &Path,
         config_path: Option<&Path>,
@@ -315,7 +248,6 @@ mod linux {
         })
     }
 
-    /** @brief 자식에게 신호를 보낸다. */
     fn signal_child(child: &Child, signal: libc::c_int) {
         let result = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
         if result != 0 {
@@ -326,7 +258,6 @@ mod linux {
         }
     }
 
-    /** @brief 자식을 끝낸다. 곱게 안 끝나면 강제로 끝낸다. */
     fn terminate_child(child: &mut Child) {
         signal_child(child, libc::SIGTERM);
         let deadline = Instant::now() + SHUTDOWN_GRACE;
@@ -348,7 +279,7 @@ mod linux {
         }
     }
 
-    /** @brief 기다리되 종료 신호가 오면 곧장 돌아온다. */
+    /// Returns false if a stop arrived first.
     fn sleep_until(delay: Duration, stop: &AtomicBool) -> bool {
         let deadline = Instant::now() + delay;
         while Instant::now() < deadline {
@@ -362,10 +293,7 @@ mod linux {
         !stop.load(Ordering::Acquire)
     }
 
-    /**
-     * @brief 이 부모를 설치 경로의 실행 파일로 바꾼다. 인수는 그대로 넘긴다.
-     * @return 돌아오면 exec 가 실패한 것이고 그 이유다.
-     */
+    /// Replaces this process; returning means exec failed, with the reason.
     fn exec_install_path() -> String {
         match crate::update::install::current() {
             Ok(install) => format!(
@@ -377,7 +305,6 @@ mod linux {
         }
     }
 
-    /** @brief 종료 상태를 사람이 읽을 문자열로. */
     fn status_text(status: ExitStatus) -> String {
         use std::os::unix::process::ExitStatusExt;
         match (status.code(), status.signal()) {
@@ -387,14 +314,8 @@ mod linux {
         }
     }
 
-    /**
-     * @brief 감독 반복을 돌린다.
-     * @details 자식을 시작하고, 준비를 기다리고, 죽으면 정책에 따라 재시작한다. 준비된
-     *          뒤에는 부모도 권한을 내려놓는다. 업데이트 기록은 부모가 처리한다. 새 버전을
-     *          시험하는 동안 자식이 준비 전에 끝나거나 기한을 넘기면 재시작하지 않고 되돌린 뒤
-     *          되돌린 실행 파일을 exec 하고, 자식이 업데이트 종료 코드로 끝나면 맞바꾼 실행
-     *          파일을 exec 한다.
-     */
+    /// Also settles updates: a new version that exits before ready or misses its deadline is
+    /// reverted, and a child's update exit execs the swapped executable.
     pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
         let mut trial = match crate::update::trial::on_start(&mut || {}) {
             Startup::Normal => None,
@@ -402,7 +323,7 @@ mod linux {
             Startup::Reverted => return Err(crate::anyhow!(exec_install_path())),
         };
         if config_path.is_none() && !no_web {
-            config_path = crate::ensure_auto_config();
+            config_path = crate::ensure_auto_config()?;
         }
         let program = std::env::current_exe()
             .with_context(|| "Could not find the path of the current executable")?;
@@ -533,11 +454,8 @@ mod linux {
         }
     }
 
-    /**
-     * @brief 준비를 알릴 방법을 가져간다. 감독 없이 돌면 없다.
-     * @details 감독받는 자식이면 덤프를 막고 프로세스 이름을 되찾는 일도 여기서 한다. 다른
-     *          스레드가 뜨기 전에 불러야 한다.
-     */
+    /// `None` when not supervised. Also blocks dumps and restores the process name, so call it
+    /// before starting threads.
     pub fn take_ready_callback() -> BoxResult<Option<Box<dyn FnOnce() + Send>>> {
         let address = std::env::var(READY_ADDR_ENV).ok();
         let token = std::env::var(READY_TOKEN_ENV).ok();
@@ -577,12 +495,10 @@ mod linux {
     }
 
     #[cfg(test)]
-    /** @brief 준비 통지가 토큰으로 지켜지는지. */
     mod tests {
         use super::*;
 
         #[test]
-        /** @brief 토큰이 다르면 준비로 보지 않는지. 보면 아무나 이 서버의 자식인 척한다. */
         fn readiness_requires_matching_token() {
             let (receiver, address, token) = readiness_channel().expect("channel");
             assert_eq!(decode_token(&encode_token(&token)), Some(token));
@@ -607,18 +523,15 @@ mod linux {
 pub use linux::{run, take_ready_callback};
 
 #[cfg(not(target_os = "linux"))]
-/** @brief 준비를 알릴 방법을 가져간다. 감독 없이 돌면 없다. */
 pub fn take_ready_callback() -> crate::error::BoxResult<Option<Box<dyn FnOnce() + Send>>> {
     Ok(None)
 }
 
 #[cfg(test)]
-/** @brief 재시작 정책이 포기 조건과 대기 상한을 지키는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 준비 전에 연달아 죽으면 결국 포기하는지. */
     fn startup_failures_are_bounded() {
         let mut policy = RestartPolicy::default();
         for expected_ms in [10, 20, 40, 80] {
@@ -634,7 +547,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 준비까지 간 자식이 실패 횟수를 되돌리고, 대기 시간에 상한이 있는지. */
     fn ready_child_resets_startup_failures_and_backoff_is_capped() {
         let mut policy = RestartPolicy::default();
         for _ in 0..3 {
@@ -654,7 +566,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오래 돌았으면 대기 시간이 되돌아오는지. */
     fn stable_runtime_resets_restart_delay() {
         let mut policy = RestartPolicy::default();
         let _ = policy.child_exited(true, Duration::from_secs(1));

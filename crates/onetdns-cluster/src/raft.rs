@@ -1931,11 +1931,8 @@ fn write_state_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::process::id()
     ));
     let write_result = (|| -> Result<(), String> {
-        let mut file =
-            onetdns_core::fs::open_private(&tmp, onetdns_core::fs::PrivateOpen::CreateNew)
-                .map_err(|error| {
-                    format!("Could not open a temporary file for Raft state: {error}")
-                })?;
+        let mut file = onetdns_core::fs::create_private_replacing(&tmp, path)
+            .map_err(|error| format!("Could not open a temporary file for Raft state: {error}"))?;
         file.write_all(bytes)
             .map_err(|error| format!("Could not write the Raft state file: {error}"))?;
         file.sync_all()
@@ -2367,7 +2364,7 @@ mod tests {
             #[cfg(windows)]
             assert_eq!(
                 onetdns_core::fs::access_rules(&file).unwrap(),
-                "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+                onetdns_core::fs::private_rules(&file).unwrap()
             );
             #[cfg(unix)]
             {

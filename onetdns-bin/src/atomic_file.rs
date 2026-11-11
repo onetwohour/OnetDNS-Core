@@ -88,7 +88,7 @@ fn open_temporary(
     secret: bool,
 ) -> std::io::Result<std::fs::File> {
     if secret {
-        return onetdns_core::fs::open_private(tmp, onetdns_core::fs::PrivateOpen::CreateNew);
+        return onetdns_core::fs::create_private_replacing(tmp, target);
     }
     #[cfg(windows)]
     {
@@ -320,7 +320,7 @@ mod tests {
         ));
         atomic_write_secret(&path, b"control_token = \"a\"\n").unwrap();
         let private = onetdns_core::fs::access_rules(&path).unwrap();
-        assert_eq!(private, "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)");
+        assert_eq!(private, onetdns_core::fs::private_rules(&path).unwrap());
 
         atomic_write(&path, b"control_token = \"b\"\n").unwrap();
 
