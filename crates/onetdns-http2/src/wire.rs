@@ -1,17 +1,10 @@
-/*!
- * @brief 프레임 입출력과 패딩 제거 함수.
- */
-
 use std::io::{Read, Write};
 
 use crate::frame::{self, flags, FrameHeader, DEFAULT_MAX_FRAME, FRAME_HEADER_LEN};
 use crate::H2Error;
 
-/**
- * @brief 프레임 하나를 읽는다.
- * @warning 페이로드를 할당하기 전에 길이 상한을 검사한다. 선언된 길이를 그대로 믿고
- *          할당하면 9바이트 헤더 하나로 16MiB를 잡게 만들 수 있다.
- */
+/// Checks the length cap before allocating the payload; trusting the declared length would let one
+/// 9-byte header allocate 16 MiB.
 pub(crate) fn read_frame<S: Read>(stream: &mut S) -> Result<(FrameHeader, Vec<u8>), H2Error> {
     let mut hdr = [0u8; FRAME_HEADER_LEN];
     match stream.read_exact(&mut hdr) {
@@ -28,7 +21,7 @@ pub(crate) fn read_frame<S: Read>(stream: &mut S) -> Result<(FrameHeader, Vec<u8
     Ok((h, payload))
 }
 
-/** @brief 프레임 하나를 보낸다. 헤더와 본문을 한 번의 쓰기로 내보낸다. */
+/// Header and payload go out in one write.
 pub(crate) fn send_frame<S: Write>(
     stream: &mut S,
     frame_type: u8,
@@ -41,7 +34,7 @@ pub(crate) fn send_frame<S: Write>(
     stream.write_all(&buf).map_err(|_| H2Error::Io)
 }
 
-/** @brief 버퍼를 정확히 채운다. 연결 종료와 그 밖의 오류를 구분해 돌려준다. */
+/// Distinguishes a closed connection from other errors.
 pub(crate) fn read_exact<S: Read>(stream: &mut S, buf: &mut [u8]) -> Result<(), H2Error> {
     match stream.read_exact(buf) {
         Ok(()) => Ok(()),
@@ -50,10 +43,8 @@ pub(crate) fn read_exact<S: Read>(stream: &mut S, buf: &mut [u8]) -> Result<(), 
     }
 }
 
-/**
- * @brief HEADERS 페이로드에서 패딩과 우선순위 필드를 걷어내 헤더 블록만 남긴다.
- * @warning 패딩 길이가 남은 본문보다 크면 거부한다. 그대로 빼면 길이가 음수로 뒤집힌다.
- */
+/// Removes padding and priority fields from a HEADERS payload, leaving the header block. A pad
+/// length larger than the remaining payload is refused instead of underflowing.
 pub(crate) fn strip_headers(payload: &[u8], fl: u8) -> Result<&[u8], H2Error> {
     let mut p = payload;
     let mut pad = 0usize;
@@ -73,7 +64,7 @@ pub(crate) fn strip_headers(payload: &[u8], fl: u8) -> Result<&[u8], H2Error> {
     Ok(&p[..p.len() - pad])
 }
 
-/** @brief DATA 페이로드에서 패딩을 걷어낸다. 길이 검사는 strip_headers와 같다. */
+/// Removes padding from a DATA payload, with the same length check as `strip_headers`.
 pub(crate) fn strip_padding(payload: &[u8], fl: u8) -> Result<&[u8], H2Error> {
     if fl & flags::PADDED == 0 {
         return Ok(payload);
@@ -86,7 +77,6 @@ pub(crate) fn strip_padding(payload: &[u8], fl: u8) -> Result<&[u8], H2Error> {
     Ok(&body[..body.len() - pad])
 }
 
-/** @brief 헤더 목록에서 이름으로 값을 찾는다. */
 #[cfg(test)]
 pub(crate) fn header<'a>(headers: &'a [(Vec<u8>, Vec<u8>)], name: &[u8]) -> Option<&'a [u8]> {
     headers

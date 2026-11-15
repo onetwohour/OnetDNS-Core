@@ -12,15 +12,12 @@ use onetdns_filter::{
 };
 use onetdns_proto::{Name, RecordType};
 
-/** @brief 잡힌 메모리와 최고점을 세는 할당기. */
+/// Counts live bytes and their peak.
 struct TrackingAllocator;
 
-/** @brief 지금 잡혀 있는 바이트. */
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-/** @brief 잡혔던 최고 바이트. */
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
-/** @brief 잡은 만큼 세고 최고점을 갱신한다. */
 fn add_allocation(bytes: usize) {
     let current = CURRENT.fetch_add(bytes, Ordering::Relaxed) + bytes;
     let mut peak = PEAK.load(Ordering::Relaxed);
@@ -32,9 +29,8 @@ fn add_allocation(bytes: usize) {
     }
 }
 
-/** @safety 세기만 하고 실제 할당은 시스템 할당기에 그대로 넘긴다. */
+// SAFETY: only counts; every allocation is passed to the system allocator.
 unsafe impl GlobalAlloc for TrackingAllocator {
-    /** @brief 잡고 센다. */
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
@@ -43,7 +39,6 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         pointer
     }
 
-    /** @brief 비워서 잡고 센다. */
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
@@ -52,20 +47,15 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         pointer
     }
 
-    /** @brief 돌려주고 뺀다. */
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         unsafe { System.dealloc(pointer, layout) };
         CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
-    /**
-     * @brief 크기를 바꾸고 셈을 맞춘다.
-     *
-     * @details 곳을 옮겨 담았으면 옮기는 동안 이전 버퍼와 새 버퍼가 함께 살아 있다. 그
-     *          겹친 구간을 최고점에 넣지 않으면 배로 늘리며 자라는 자료의 봉우리가 전부
-     *          보이지 않는다. 늘어난 몫만 세면 최고점이 언제나 보유량과 같게 나온다.
-     * @note 같은 위치를 그대로 늘렸으면 겹치는 구간이 없으므로 차이만 센다.
-     */
+    /// When the block moved, the old and new buffers are both live during the copy. Counting that
+    /// overlap is what shows the peaks of a doubling container; counting only the growth would make
+    /// the peak always equal what is held. Growing in place has no overlap, so only the difference
+    /// counts.
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
         if new_pointer.is_null() {
@@ -86,15 +76,13 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 }
 
 #[global_allocator]
-/** @brief 이 벤치가 쓰는 할당기. */
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
-/** @brief 바이트를 MiB로. */
 fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/** @brief 저장한 내용이 같은지 볼 검사값. */
+/// To check that what was stored matches.
 fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
@@ -102,16 +90,12 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 #[derive(Default)]
-/** @brief 쓰기만 세고 버리는 대상. 저장 크기를 재려는 것이다. */
 struct CountingWriter {
-    /** @brief 지금까지 쓴 바이트. */
     position: u64,
-    /** @brief 쓴 것 중 가장 먼 위치. */
     len: u64,
 }
 
 impl IoWrite for CountingWriter {
-    /** @brief 센다. */
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.position = self
             .position
@@ -121,14 +105,12 @@ impl IoWrite for CountingWriter {
         Ok(bytes.len())
     }
 
-    /** @brief 할 일이 없다. */
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
 
 impl Seek for CountingWriter {
-    /** @brief 곳을 옮긴다. */
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         let next = match position {
             SeekFrom::Start(position) => i128::from(position),
@@ -141,7 +123,7 @@ impl Seek for CountingWriter {
     }
 }
 
-/** @brief 규칙 수에 따른 메모리와 저장 크기를 측정한다. */
+/// Memory and stored size by rule count.
 fn main() {
     let rule_count = std::env::var("ONETDNS_DOMAIN_BENCH_RULES")
         .ok()
@@ -189,7 +171,6 @@ fn main() {
     black_box(engine);
 }
 
-/** @brief 조회 비용을 측정한다. */
 fn benchmark_lookup(engine: &BlockEngine, rule_count: usize) {
     let client = ClientInfo {
         source_ip: "192.0.2.1".parse().expect("고정 IP"),
@@ -228,7 +209,6 @@ fn benchmark_lookup(engine: &BlockEngine, rule_count: usize) {
     );
 }
 
-/** @brief 고정해 저장하고 다시 읽는 비용을 측정한다. */
 fn cache_benchmark(rule_count: usize, source_count: usize, baseline: usize) {
     let mut parts = EngineParts::default();
     let wide_dawg = std::env::var_os("ONETDNS_DOMAIN_BENCH_WIDE").is_some();

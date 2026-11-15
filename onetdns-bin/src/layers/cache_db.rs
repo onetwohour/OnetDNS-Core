@@ -1,11 +1,9 @@
-/*!
- * @brief 외부 Redis에 응답을 공유하는 캐시 계층.
- *
- * @details Redis는 믿지 않는 저장소로 다룬다. 값마다 공유 비밀 키로 계산한 HMAC을 붙여 담고,
- *          꺼낼 때 HMAC이 맞지 않으면 버린다. HMAC은 키까지 덮으므로 담긴 값을 다른 키로 옮겨도
- *          통하지 않는다. Redis에 쓸 수 있는 쪽은 값을 지우거나, 같은 키에 담겼던 값을 그 수명
- *          안에서 다시 내놓을 수만 있고 새 답을 만들어 넣지는 못한다.
- */
+//! Cache layer that shares responses through an external Redis, treated as untrusted storage. Each
+//! value carries an HMAC under a shared secret and is dropped when it does not match. The HMAC
+//! covers the key too, so a value moved to another key fails.
+//!
+//! Anyone who can write to Redis can only delete values or replay one stored under the same key
+//! within its lifetime; they cannot plant a new answer.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,25 +19,19 @@ use super::{cap_message_ttls, outcome_to_option, semantic_request_key};
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 use crate::redis::RedisClient;
 
-/** @brief 값과 이름 공간을 계산하는 HMAC. */
 type HmacSha256 = Hmac<Sha256>;
 
-/** @brief 키 앞머리. 키를 만드는 방식이나 값의 형식이 바뀌면 판 번호를 올린다. */
+/// Bump the version when the key derivation or the value format changes.
 const KEY_PREFIX: &str = "onetdns:v4:";
-/** @brief 키에 넣는 이름 공간의 16진 길이. 128비트다. */
+/// 128 bits.
 const NAMESPACE_HEX: usize = 32;
-/** @brief 값 앞에 붙는 HMAC 길이. */
 const MAC_LEN: usize = 32;
-/** @brief 이름 공간을 계산할 때 맨 앞에 넣는 표지. 값 HMAC과 입력이 겹치지 않게 한다. */
+/// Keeps the namespace input apart from the value HMAC input.
 const NAMESPACE_LABEL: &[u8] = b"onetdns cachedb namespace\0";
-/** @brief 값 HMAC을 계산할 때 맨 앞에 넣는 표지. */
 const VALUE_LABEL: &[u8] = b"onetdns cachedb value\0";
 
-/**
- * @brief 이 응답을 담아 두면 안 되는지.
- * @warning 질문과 어긋나거나 잘렸거나 질문한 것이 답에 없으면 담지 않는다. 담으면 남이
- *          끼워 넣은 엉뚱한 답이 눌러앉는다.
- */
+/// A response that mismatches the question, is truncated, or lacks the requested answer is not
+/// stored; otherwise a planted wrong answer would stick.
 fn response_not_cacheable(req: &Message, resp: &Message) -> bool {
     resp.header.rcode != ResponseCode::NoError.0
         || !resp.header.response
@@ -58,33 +50,29 @@ fn response_not_cacheable(req: &Message, resp: &Message) -> bool {
         || !crate::cache::has_requested_answer(req, &resp.answers)
 }
 
-/**
- * @brief 공유 캐시에서 이 체인의 답이 놓이는 자리를 정하는 값.
- * @details 비밀 키와 해석 맥락, 지금 쓰는 신뢰 앵커가 모두 같은 서버끼리만 서로의 답을 본다.
- */
+/// Where this chain's answers sit in the shared cache: only servers with the same secret,
+/// resolution context, and current trust anchors see each other's answers.
 pub struct CacheDbScope {
-    /** @brief 같은 Redis를 쓰는 서버가 함께 갖는 비밀 키. Redis에는 보내지 않는다. */
+    /// Shared by every server using the same Redis; never sent to Redis.
     pub secret: SecretString,
-    /** @brief CacheDbLayer 아래에서 답을 바꾸는 설정을 정규화한 문자열. */
+    /// Normalized settings below `CacheDbLayer` that change answers.
     pub context: String,
-    /**
-     * @brief 아래 계층이 답을 검증할 때 쓰는 신뢰 앵커.
-     * @details 재귀 리졸버의 앵커는 RFC 5011 갱신으로 실행 중에 바뀐다. 그래서 파일 경로가 아니라
-     *          지금 쓰는 앵커의 내용으로 이름 공간을 가른다.
-     */
+    /// Trust anchors the lower layers validate with. The recursive resolver's anchors change at run
+    /// time through RFC 5011 updates, so the namespace follows the anchors' current contents, not a
+    /// file path.
     pub anchors: Vec<Arc<ArcSwap<Vec<Ds>>>>,
 }
 
-/** @brief 신뢰 앵커 한 벌로 계산한 이름 공간. */
+/// Derived from one set of trust anchors.
 struct Namespace {
-    /** @brief 계산에 쓴 앵커. 핸들과 같은 순서다. */
+    /// In the same order as the handles.
     anchors: Vec<Arc<Vec<Ds>>>,
-    /** @brief 키 앞머리. 판 번호와 이름 공간까지 담는다. */
+    /// Includes the version and the namespace.
     prefix: Vec<u8>,
 }
 
 impl Namespace {
-    /** @brief 핸들이 지금 가리키는 앵커가 이 이름 공간을 계산할 때 쓴 것과 같은지. */
+    /// Whether the handles still point at the anchors this was derived from.
     fn is_current(&self, handles: &[Arc<ArcSwap<Vec<Ds>>>]) -> bool {
         self.anchors.len() == handles.len()
             && handles
@@ -93,7 +81,6 @@ impl Namespace {
                 .all(|(handle, anchors)| Arc::ptr_eq(&handle.load(), anchors))
     }
 
-    /** @brief 이 요청의 키. */
     fn key(&self, request: &Message) -> Option<Vec<u8>> {
         let mut key = self.prefix.clone();
         key.extend_from_slice(&semantic_request_key(request)?);
@@ -101,17 +88,14 @@ impl Namespace {
     }
 }
 
-/** @brief 길이를 앞에 붙여 HMAC 입력에 넣는다. 이어 붙인 필드의 경계가 흐려지지 않게 한다. */
+/// Length-prefixed, so field boundaries stay unambiguous.
 fn update_field(mac: &mut HmacSha256, field: &[u8]) {
     mac.update(&(field.len() as u64).to_be_bytes());
     mac.update(field);
 }
 
-/**
- * @brief 해석 맥락과 지금 쓰는 신뢰 앵커로 이름 공간을 계산한다.
- * @details 앵커는 정렬하고 중복을 없애 넣는다. 같은 앵커를 다른 순서로 적은 서버끼리도 답을
- *          나눠 쓴다. 비밀 키로 계산하므로 비밀 키가 다른 서버와는 키가 겹치지 않는다.
- */
+/// Anchors are sorted and deduplicated, so servers listing the same anchors in another order share
+/// answers. Keyed by the secret, so servers with different secrets never share keys.
 fn derive_namespace(
     keyed: &HmacSha256,
     context: &str,
@@ -147,36 +131,26 @@ fn derive_namespace(
     Namespace { anchors, prefix }
 }
 
-/**
- * @brief 여러 대가 나눠 쓰는 외부 캐시 계층.
- * @warning 담고 꺼낼 때 키에 해석 맥락과 신뢰 앵커를 넣는다. 넣지 않으면 다른 설정으로 실행 중인
- *          서버가 담은 답을 이 서버가 그대로 쓴다.
- */
+/// Keys include the resolution context and the trust anchors; otherwise this server would use
+/// answers stored by a server running a different config.
 pub struct CacheDbLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 외부 캐시 클라이언트. */
     redis: Arc<RedisClient>,
-    /** @brief 외부 캐시에 담아 둘 기간. */
+    /// Caps the Redis expiry; 0 leaves it to the records' TTL.
     expire_secs: u64,
-    /** @brief 담을 때 걸 수명 하한. */
     min_ttl: u32,
-    /** @brief 담을 때 걸 수명 상한. */
     max_ttl: u32,
-    /** @brief 비밀 키를 넣어 둔 HMAC. 쓸 때마다 복제한다. */
+    /// Holds the secret; cloned for each use.
     keyed: HmacSha256,
-    /** @brief CacheDbLayer 아래에서 답을 바꾸는 설정. */
     context: String,
-    /** @brief 아래 계층이 쓰는 신뢰 앵커의 핸들. */
     anchors: Vec<Arc<ArcSwap<Vec<Ds>>>>,
-    /** @brief 마지막으로 계산한 이름 공간. 앵커가 바뀌면 다시 계산한다. */
+    /// Last derived; recomputed when the anchors change.
     namespace: ArcSwap<Namespace>,
-    /** @brief HMAC이 맞지 않아 버린 값의 누적 수. 2의 거듭제곱 번째만 기록한다. */
+    /// Values dropped for a bad HMAC; logged at powers of two.
     rejected: AtomicU64,
 }
 
 impl CacheDbLayer {
-    /** @brief 외부 캐시 클라이언트를 잡은 계층을 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         redis: Arc<RedisClient>,
@@ -207,7 +181,6 @@ impl CacheDbLayer {
         }
     }
 
-    /** @brief 지금 쓰는 신뢰 앵커에 맞는 이름 공간. 앵커가 바뀌었으면 다시 계산한다. */
     fn namespace(&self) -> Arc<Namespace> {
         let memo = self.namespace.load();
         if memo.is_current(&self.anchors) {
@@ -218,7 +191,7 @@ impl CacheDbLayer {
         fresh
     }
 
-    /** @brief 이 키에 담긴 값의 HMAC. 담은 시각과 응답까지 덮는다. */
+    /// Covers the key, the storage time, and the response.
     fn value_mac(&self, key: &[u8], stored_at: u64, wire: &[u8]) -> HmacSha256 {
         let mut mac = self.keyed.clone();
         mac.update(VALUE_LABEL);
@@ -228,7 +201,7 @@ impl CacheDbLayer {
         mac
     }
 
-    /** @brief 이 키에 담을 값. HMAC, 담은 시각, 응답 순서다. */
+    /// HMAC, storage time, then the response.
     fn seal(&self, key: &[u8], stored_at: u64, wire: &[u8]) -> Vec<u8> {
         let tag = self.value_mac(key, stored_at, wire).finalize().into_bytes();
         let mut value = Vec::with_capacity(MAC_LEN + 8 + wire.len());
@@ -238,7 +211,7 @@ impl CacheDbLayer {
         value
     }
 
-    /** @brief 이 키에서 꺼낸 값의 HMAC을 확인한다. 맞으면 담은 시각과 응답을 돌려준다. */
+    /// Returns the storage time and the response when the HMAC matches.
     fn open<'a>(&self, key: &[u8], value: &'a [u8]) -> Option<(u64, &'a [u8])> {
         let (tag, rest) = value.split_at_checked(MAC_LEN)?;
         let (stored_at, wire) = rest.split_at_checked(8)?;
@@ -249,11 +222,8 @@ impl CacheDbLayer {
         Some((stored_at, wire))
     }
 
-    /**
-     * @brief HMAC이 맞지 않는 값을 만났음을 기록한다.
-     * @details 같은 비밀 키를 쓰는 서버는 이런 값을 만들지 않는다. 이 서버들 말고 다른 누군가가
-     *          Redis에 쓰고 있거나 Redis가 값을 망가뜨렸다는 뜻이다.
-     */
+    /// Servers sharing the secret never write such values, so someone else is writing to Redis, or
+    /// Redis corrupted the value.
     fn note_rejected(&self) {
         let count = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
@@ -261,11 +231,9 @@ impl CacheDbLayer {
         }
     }
 
-    /**
-     * @brief 담아 둔 응답을 읽고, 담은 뒤 지난 시간만큼 레코드 수명을 줄인다.
-     * @details 담은 시각이 앞날이면 거부한다. 시계가 앞선 서버가 담은 값을 받으면 그 차이만큼 답이
-     *          더 오래 남는다.
-     */
+    /// Ages the records by the time since storing, and caps them so the current max TTL counts from
+    /// storage. Rejects a storage time in the future: a value stored by a server whose clock runs
+    /// ahead would otherwise live longer by the difference.
     fn decode_value(stored_at: u64, wire: &[u8], max_ttl: u32) -> Option<(Message, u64)> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         let elapsed = now.checked_sub(stored_at)?;
@@ -297,7 +265,7 @@ impl CacheDbLayer {
         any_live.then_some((message, u64::from(elapsed)))
     }
 
-    /** @brief 꺼낸 응답을 이 요청의 답으로 쓸 수 있으면 요청에 맞춘다. */
+    /// Fits the cached response to this request; None when it is stale or does not answer it.
     fn cached_response(&self, req: &Message, stored_at: u64, wire: &[u8]) -> Option<Message> {
         let (mut m, _elapsed) = Self::decode_value(stored_at, wire, self.max_ttl)?;
         let ttl_fresh = m
@@ -324,10 +292,7 @@ impl CacheDbLayer {
         Some(m)
     }
 
-    /**
-     * @brief 담을 만한 응답이면 수명 범위를 걸어 담도록 맡긴다.
-     * @return 담기를 맡겼는지.
-     */
+    /// Applies the TTL bounds and queues the write. Returns whether a write was queued.
     fn store(&self, req: &Message, key: &[u8], resp: &Message) -> bool {
         if resp.header.rcode != ResponseCode::NoError.0
             || resp.answers.is_empty()
@@ -391,18 +356,16 @@ impl CacheDbLayer {
 }
 
 impl Resolver for CacheDbLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /**
-     * @brief 외부 캐시를 보고, 없으면 물어 담는다.
-     * @details 꺼낸 값을 쓸 수 없으면 새 답으로 덮고, 새 답을 담지 못하면 지운다. 쓰기는 맡겨
-     *          두고 기다리지 않으며, 한 키에 지우기와 담기를 함께 맡기지 않는다. 묻는 동안 신뢰
-     *          앵커가 바뀌면 담지 않는다. 그 답은 어느 앵커로 검증했는지 알 수 없는데, 이전 앵커의
-     *          이름 공간에 새 앵커로 검증한 답을 담거나 그 반대가 된다.
-     */
+    /// An unusable cached value is overwritten by the new answer, or deleted when that answer
+    /// cannot be stored. Writes are queued without waiting, and one key never gets both a delete
+    /// and a store queued.
+    ///
+    /// Nothing is stored when the trust anchors change during resolution: which anchors validated
+    /// the answer is unknown, so it could land in the old anchors' namespace or the reverse.
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         if req.questions.is_empty() {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -441,7 +404,6 @@ impl Resolver for CacheDbLayer {
 }
 
 #[cfg(test)]
-/** @brief 공유 캐시 키, 값 인증, 신뢰 앵커를 따르는 이름 공간, 나이 계산. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -457,10 +419,9 @@ mod tests {
     use crate::layers::answer_message;
     use crate::native::Resolver;
 
-    /** @brief 공유 비밀 키. */
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
-    /** @brief 키 태그 하나만 다른 신뢰 앵커. */
+    /// Differs only in its key tag.
     fn ds(key_tag: u16) -> Ds {
         Ds {
             key_tag,
@@ -470,12 +431,10 @@ mod tests {
         }
     }
 
-    /** @brief 이 앵커를 든 핸들. */
     fn anchors(set: Vec<Ds>) -> Arc<ArcSwap<Vec<Ds>>> {
         Arc::new(ArcSwap::new(Arc::new(set)))
     }
 
-    /** @brief 이 범위로 묻는 계층. */
     fn cachedb_layer(
         inner: Arc<dyn Resolver>,
         redis: SocketAddr,
@@ -501,7 +460,7 @@ mod tests {
         )
     }
 
-    /** @brief 아무 데도 붙지 않는 계층. 키와 봉투만 볼 때 쓴다. */
+    /// Connects nowhere; for looking at keys and envelopes.
     fn offline(context: &str) -> CacheDbLayer {
         cachedb_layer(
             EmptyMock::new(false),
@@ -512,12 +471,10 @@ mod tests {
         )
     }
 
-    /** @brief 이 계층이 이 요청에 쓰는 키. */
     fn key_of(layer: &CacheDbLayer, request: &Message) -> Vec<u8> {
         layer.namespace().key(request).unwrap()
     }
 
-    /** @brief 지금 시각. */
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -526,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 뜻의 질의가 같은 키를 갖고, 이름 공간이 128비트인지. */
+    /// Equivalent queries share a key, and the namespace is 128 bits.
     fn cachedb_key_normalizes() {
         let layer = offline("ctx");
         let upper = key_of(&layer, &query("Example.COM", RecordType::A));
@@ -541,10 +498,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 해석 맥락, 비밀 키, 신뢰 앵커 가운데 하나만 달라도 키가 다른지.
-     * @details 앵커는 정렬해 넣으므로 순서만 다른 앵커는 같은 키를 쓴다.
-     */
+    /// Anchors are sorted, so a different order alone keeps the same key.
     fn cachedb_key_separates_contexts_secrets_and_anchors() {
         let request = query("example.com", RecordType::A);
         let redis = SocketAddr::from(([127, 0, 0, 1], 1));
@@ -584,7 +538,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질문과 맞고 온전한 긍정 응답만 받아들이는지. */
     fn cachedb_accepts_only_matching_complete_positive_envelopes() {
         let request = query("cache.example", RecordType::A);
         let q = request.questions[0].clone();
@@ -617,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 봉투의 HMAC이 키와 시각과 응답을 모두 덮는지. 하나라도 바뀌면 열리지 않아야 한다. */
+    /// Changing any one of them must break it.
     fn cachedb_envelope_binds_key_time_and_response() {
         let layer = offline("ctx");
         let key = key_of(&layer, &query("cache.example", RecordType::A));
@@ -652,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 앞날로 적힌 시각을 거부하고 구간마다 늙히는지. 안 그러면 남이 수명을 늘릴 수 있다. */
+    /// Otherwise a writer could extend lifetimes.
     fn cachedb_rejects_future_timestamp_and_ages_each_section() {
         let request = query("cache.example", RecordType::A);
         let q = request.questions[0].clone();
@@ -684,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 현재 최대 TTL이 조회 시점부터 다시 시작되지 않고 삽입 시점부터 적용되는지. */
+    /// The current max TTL counts from storage, not from the lookup.
     fn cachedb_max_ttl_is_an_absolute_age_cap() {
         let request = query("cache.example", RecordType::A);
         let q = request.questions[0].clone();
@@ -711,7 +664,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 비밀 키와 맥락과 앵커를 쓰는 서버가 담은 답을 다른 서버가 묻지 않고 쓰는지. */
     fn peer_with_the_same_scope_serves_the_shared_answer() {
         let fake = FakeRedis::start(Behavior::default());
         let request = query("shared.example", RecordType::A);
@@ -741,11 +693,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Redis에 직접 넣은 값을 쓰지 않고, 지운 뒤 제대로 물은 답으로 바꾸는지.
-     * @details 비밀 키 없이 만든 값은 HMAC이 맞지 않는다. 엄격한 DNSSEC 검증 아래에서도 검증하지
-     *          않은 위조 답이 그대로 나가던 경로다.
-     */
+    /// A value made without the secret fails the HMAC.
     fn forged_value_is_rejected_and_replaced() {
         let fake = FakeRedis::start(Behavior::default());
         let request = query("bank.example", RecordType::A);
@@ -784,11 +732,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 쓸 수 없는 값을 새 답으로 덮지 못하면 지우는지.
-     * @details 지우기와 담기를 함께 맡기면 워커에서 순서가 바뀌어 새로 담은 값이 지워질 수 있으므로,
-     *          새 답을 담지 못할 때만 지운다.
-     */
+    /// Queuing the delete and the store together could reorder them in the worker and delete the
+    /// new value, so it deletes only when no new answer is stored.
     fn unusable_value_is_deleted_when_no_new_answer_replaces_it() {
         let fake = FakeRedis::start(Behavior::default());
         let request = query("gone.example", RecordType::A);
@@ -810,7 +755,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 맥락의 키에 담긴 진짜 값을 이 맥락의 키로 옮겨도 쓰지 않는지. */
     fn genuine_value_moved_to_another_context_is_rejected() {
         let fake = FakeRedis::start(Behavior::default());
         let request = query("moved.example", RecordType::A);
@@ -838,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief RFC 5011 갱신으로 앵커가 바뀌면 새 이름 공간으로 옮겨 가 이전 앵커로 담긴 답을 쓰지 않는지. */
+    /// Answers stored under the old anchors are not used.
     fn anchor_update_moves_to_a_new_namespace() {
         let fake = FakeRedis::start(Behavior::default());
         let request = query("anchored.example", RecordType::A);
@@ -869,16 +813,13 @@ mod tests {
         assert!(fake.value(&after).is_some());
     }
 
-    /** @brief 답하는 도중에 신뢰 앵커를 바꾸는 리졸버. RFC 5011 갱신이 끼어든 상황이다. */
+    /// As when an RFC 5011 update lands mid-resolution.
     struct AnchorsChangeDuringResolution {
-        /** @brief 바꿀 핸들. */
         handle: Arc<ArcSwap<Vec<Ds>>>,
-        /** @brief 실제로 답하는 리졸버. */
         inner: Arc<Mock>,
     }
 
     impl Resolver for AnchorsChangeDuringResolution {
-        /** @brief 앵커를 바꾸고 답한다. */
         fn resolve(&self, req: &Message) -> Option<Message> {
             self.handle.store(Arc::new(vec![ds(9)]));
             self.inner.resolve(req)
@@ -886,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 묻는 동안 앵커가 바뀌면 담지 않는지. 어느 앵커로 검증한 답인지 알 수 없다. */
+    /// Which anchors validated the answer is unknown.
     fn anchor_change_during_resolution_skips_the_store() {
         let fake = FakeRedis::start(Behavior::default());
         let handle = anchors(vec![ds(1)]);
@@ -904,12 +845,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담기엔 너무 큰 응답을 오류로 바꿔 담지 않는지. */
     fn cachedb_does_not_store_an_oversized_response() {
-        /** @brief 담을 수 없을 만큼 큰 답을 내는 리졸버. */
         struct Oversized;
         impl Resolver for Oversized {
-            /** @brief 큰 답을 낸다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 let q = req.questions.first()?;
                 Some(answer_message(

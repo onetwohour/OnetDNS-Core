@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use onetdns_proto::{Edns, Message, Name, RData, Record, RecordType, Writer};
 
-/** @brief 측정할 때 쓰는 테스트용 응답. */
 fn response() -> Message {
     let name = Name::from_str("www.performance.example").unwrap();
     let mut message = Message::query(0x5151, name.clone(), RecordType::A);
@@ -32,7 +31,7 @@ fn response() -> Message {
     message
 }
 
-/** @brief 응답을 바이트로 만드는 비용을 측정한다. */
+/// Measures the cost of encoding a response.
 fn main() {
     let message = response();
     let iterations = 2_000_000usize;

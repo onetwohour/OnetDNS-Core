@@ -1,20 +1,13 @@
-/*!
- * @brief 여러 구성 요소가 함께 소유하는 비밀 문자열.
- *
- * @details 복제는 원문 버퍼를 복사하지 않고 참조 수만 늘린다. 마지막 소유자가 사라질
- *          때 버퍼를 지워 설정 재적용과 작업 스레드 생성 과정에 평문 사본이 쌓이지 않는다.
- */
-
 use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
 #[derive(Clone, Default, Eq, PartialEq)]
-/** @brief 복제해도 원문 버퍼가 하나뿐인 비밀 문자열. */
+/// Secret string whose clones share one buffer. The last owner wipes it, so config reloads and
+/// worker threads leave no plaintext copies behind.
 pub struct SecretString(Arc<Zeroizing<String>>);
 
 impl SecretString {
-    /** @brief 비밀값을 빌린다. */
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }

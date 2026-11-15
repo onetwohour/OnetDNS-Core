@@ -1,6 +1,4 @@
-/*!
- * @brief 관리 API: 권한 영역과 그 기록.
- */
+//! Management API: authoritative zones and their records.
 
 use super::*;
 use crate::native_config::qtype_numbers;
@@ -11,7 +9,6 @@ use crate::zones::{
 };
 
 impl ControlDeps {
-    /** @brief 권한 영역 목록과 영역마다의 기록. */
     pub(super) fn zones_list(&self) -> String {
         let store = self.zones.store.load();
         let items: Vec<String> = store
@@ -34,7 +31,6 @@ impl ControlDeps {
         format!("[{}]", items.join(","))
     }
 
-    /** @brief 이 영역의 기록들. */
     pub(super) fn zone_get(&self, origin: &str) -> Result<String, String> {
         let name = onetdns_proto::Name::from_str(origin)
             .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;
@@ -57,7 +53,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 영역을 보낸 내용으로 통째로 바꾼다. */
+    /// Replaces the whole zone.
     pub(super) fn zone_put(&self, origin: &str, text: &str) -> Result<String, String> {
         let current_cfg = self.runtime_cfg.load();
         let target = zone_api_target(&current_cfg, &self.zones.store.load(), origin, "modify")?;
@@ -87,7 +83,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 영역을 지운다. 영역 파일도 지운다. */
+    /// Removes the zone file too.
     pub(super) fn zone_delete(&self, origin: &str) -> Result<String, String> {
         let current_cfg = self.runtime_cfg.load();
         let target = zone_api_target(&current_cfg, &self.zones.store.load(), origin, "delete")?;
@@ -121,7 +117,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 영역에 기록 한 줄을 넣는다. */
     pub(super) fn zone_record_add(&self, origin: &str, body: &str) -> Result<String, String> {
         let current_cfg = self.runtime_cfg.load();
         let target = zone_api_target(&current_cfg, &self.zones.store.load(), origin, "modify")?;
@@ -160,7 +155,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 영역에서 이름과 유형이 맞는 기록을 지운다. */
+    /// Removes records matching the name and type.
     pub(super) fn zone_record_delete(&self, origin: &str, body: &str) -> Result<String, String> {
         let current_cfg = self.runtime_cfg.load();
         let target = zone_api_target(&current_cfg, &self.zones.store.load(), origin, "modify")?;
@@ -235,7 +230,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 영역의 서명 키와 DS. */
+    /// Signing keys and DS records.
     pub(super) fn zone_dnssec(&self, origin: &str) -> Result<String, String> {
         let name = onetdns_proto::Name::from_str(origin)
             .map_err(|_| format!("Invalid DNS zone name: {origin}"))?;

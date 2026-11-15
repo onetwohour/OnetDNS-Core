@@ -1,89 +1,61 @@
-/*!
- * @brief 핸드셰이크 메시지 인코딩과 파싱.
- *
- * @details 클라이언트와 서버의 인사말, 그리고 그 안의 확장들을 다룬다.
- * @warning 비정규 인코딩을 거부한다. 같은 뜻을 여러 형태로 쓸 수 있으면 구현마다 다르게
- *          읽고, 그 차이가 곧 협상을 조종하는 경로가 된다.
- */
+//! Handshake message encoding and parsing: client and server hellos and their extensions.
+//!
+//! Non-canonical encodings are rejected. If one meaning could be written several ways,
+//! implementations would read it differently, and that difference becomes a way to steer
+//! negotiation.
 
 use crate::handshake::{HandshakeMsg, HandshakeType};
 use crate::tls12::{EXT_EC_POINT_FORMATS, EXT_EXTENDED_MASTER_SECRET, EXT_RENEGOTIATION_INFO};
 use crate::wire::{Reader, Writer};
 use crate::TlsError;
 
-/** @brief 프로토콜 상수들. */
 pub mod consts {
 
-    /** @brief AES-128-GCM 스위트. */
     pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-    /** @brief AES-256-GCM 스위트. */
     pub const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
-    /** @brief ChaCha20-Poly1305 스위트. */
     pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
-    /** @brief X25519 곡선. */
     pub const X25519: u16 = 0x001d;
-    /** @brief P-256 곡선. */
     pub const SECP256R1: u16 = 0x0017;
-    /** @brief P-384 곡선. */
     pub const SECP384R1: u16 = 0x0018;
 
-    /** @brief Ed25519 서명. */
     pub const ED25519: u16 = 0x0807;
-    /** @brief P-256 ECDSA 서명. */
     pub const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
-    /** @brief P-384 ECDSA 서명. */
     pub const ECDSA_SECP384R1_SHA384: u16 = 0x0503;
-    /** @brief RSA PSS 서명, SHA-256. */
     pub const RSA_PSS_RSAE_SHA256: u16 = 0x0804;
-    /** @brief RSA PSS 서명, SHA-384. */
     pub const RSA_PSS_RSAE_SHA384: u16 = 0x0805;
-    /** @brief RSA PSS 서명, SHA-512. */
     pub const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
-    /** @brief RSA PKCS#1 서명, SHA-256. 1.3에서는 인증서 서명에만 쓴다. */
+    /// TLS 1.3 uses it only for certificate signatures.
     pub const RSA_PKCS1_SHA256: u16 = 0x0401;
-    /** @brief RSA PKCS#1 서명, SHA-384. */
     pub const RSA_PKCS1_SHA384: u16 = 0x0501;
-    /** @brief RSA PKCS#1 서명, SHA-512. */
     pub const RSA_PKCS1_SHA512: u16 = 0x0601;
 
-    /** @brief 서버 이름 확장. 어느 이름으로 접속하는지 알린다. */
     pub const EXT_SERVER_NAME: u16 = 0;
-    /** @brief 지원 곡선 확장. */
     pub const EXT_SUPPORTED_GROUPS: u16 = 10;
-    /** @brief 지원 서명 방식 확장. */
     pub const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
-    /** @brief 응용 프로토콜 협상 확장. */
     pub const EXT_ALPN: u16 = 16;
-    /** @brief 미리 공유된 키 확장. 반드시 마지막에 와야 한다. */
+    /// Must be the last extension.
     pub const EXT_PRE_SHARED_KEY: u16 = 41;
-    /** @brief 조기 데이터 확장. */
     pub const EXT_EARLY_DATA: u16 = 42;
-    /** @brief 지원 버전 확장. 1.3 협상이 이것으로 이뤄진다. */
+    /// TLS 1.3 is negotiated through this.
     pub const EXT_SUPPORTED_VERSIONS: u16 = 43;
-    /** @brief 재개 시 키 교환 방식 확장. */
     pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
-    /** @brief 키 공유 확장. 공개값을 미리 보내 왕복을 아낀다. */
+    /// Public values sent ahead to save a round trip.
     pub const EXT_KEY_SHARE: u16 = 51;
 
-    /** @brief 재개하면서 키 교환도 하는 방식. 전방 비밀성을 지킨다. */
+    /// Resumption with a key exchange too, keeping forward secrecy.
     pub const PSK_DHE_KE: u8 = 1;
-    /** @brief 쿠키 확장. 다시 시도 요청에 실려 온다. */
+    /// Carried in HelloRetryRequest.
     pub const EXT_COOKIE: u16 = 44;
 
-    /** @brief TLS 1.3 버전 번호. */
     pub const TLS13: u16 = 0x0304;
-    /** @brief TLS 1.2 버전 번호. */
     pub const TLS12: u16 = 0x0303;
-    /** @brief SSL 3.0 버전 번호. 인사말의 legacy_version 이 이 값 이하면 protocol_version 이다. */
+    /// A hello whose legacy_version is at or below this is protocol_version.
     pub const SSL30: u16 = 0x0300;
 }
 
-/**
- * @brief 다시 시도 요청을 나타내는 고정 무작위 값.
- * @note 이 값이면 그것은 서버 인사말이 아니라 다시 시도 요청이다. 구분하지 않으면
- *       핸드셰이크가 어긋난다.
- */
+/// A ServerHello with this random is a HelloRetryRequest; not telling them apart breaks the
+/// handshake.
 pub const HRR_RANDOM: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
@@ -92,27 +64,22 @@ pub const HRR_RANDOM: [u8; 32] = [
 use consts::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 확장 하나. */
 pub struct Extension {
-    /** @brief 확장 종류. */
     pub ext_type: u16,
-    /** @brief 확장 내용. */
     pub data: Vec<u8>,
 }
 
 impl Extension {
-    /** @brief 확장을 만든다. */
     pub fn new(ext_type: u16, data: Vec<u8>) -> Self {
         Self { ext_type, data }
     }
 
-    /** @brief 확장을 쓴다. */
     pub fn encode_into(&self, w: &mut Writer) {
         w.u16(self.ext_type);
         w.vec16(|w| w.bytes(&self.data));
     }
 
-    /** @brief 확장 목록을 읽는다. 중복은 거부한다. */
+    /// Rejects duplicates.
     pub fn parse_list(bytes: &[u8]) -> Result<Vec<Extension>, TlsError> {
         let mut r = Reader::new(bytes);
         let mut out = Vec::new();
@@ -128,7 +95,6 @@ impl Extension {
         Ok(out)
     }
 
-    /** @brief 길이 접두사가 붙은 확장 목록을 읽는다. */
     pub(crate) fn parse_vector(bytes: &[u8]) -> Result<Vec<Extension>, TlsError> {
         let mut reader = Reader::new(bytes);
         let extensions = Self::parse_list(reader.vec16()?)?;
@@ -138,12 +104,10 @@ impl Extension {
         Ok(extensions)
     }
 
-    /** @brief 목록에서 그 종류의 확장을 찾는다. */
     pub fn find(exts: &[Extension], ext_type: u16) -> Option<&Extension> {
         exts.iter().find(|e| e.ext_type == ext_type)
     }
 
-    /** @brief 클라이언트의 지원 버전 확장. */
     pub fn supported_versions_client(versions: &[u16]) -> Extension {
         let mut w = Writer::new();
         w.vec8(|w| {
@@ -154,14 +118,12 @@ impl Extension {
         Extension::new(EXT_SUPPORTED_VERSIONS, w.buf)
     }
 
-    /** @brief 서버가 고른 버전 확장. */
     pub fn supported_versions_server(version: u16) -> Extension {
         let mut w = Writer::new();
         w.u16(version);
         Extension::new(EXT_SUPPORTED_VERSIONS, w.buf)
     }
 
-    /** @brief 클라이언트의 키 공유 확장. */
     pub fn key_share_client(entries: &[(u16, Vec<u8>)]) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| {
@@ -173,7 +135,6 @@ impl Extension {
         Extension::new(EXT_KEY_SHARE, w.buf)
     }
 
-    /** @brief 서버가 고른 키 공유 확장. */
     pub fn key_share_server(group: u16, key: &[u8]) -> Extension {
         let mut w = Writer::new();
         w.u16(group);
@@ -181,7 +142,6 @@ impl Extension {
         Extension::new(EXT_KEY_SHARE, w.buf)
     }
 
-    /** @brief 지원 곡선 확장. */
     pub fn supported_groups(groups: &[u16]) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| {
@@ -192,7 +152,6 @@ impl Extension {
         Extension::new(EXT_SUPPORTED_GROUPS, w.buf)
     }
 
-    /** @brief 지원 서명 방식 확장. */
     pub fn signature_algorithms(schemes: &[u16]) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| {
@@ -203,7 +162,6 @@ impl Extension {
         Extension::new(EXT_SIGNATURE_ALGORITHMS, w.buf)
     }
 
-    /** @brief 서버 이름 확장. */
     pub fn server_name(host: &str) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| {
@@ -213,7 +171,6 @@ impl Extension {
         Extension::new(EXT_SERVER_NAME, w.buf)
     }
 
-    /** @brief 응용 프로토콜 목록 확장. */
     pub fn alpn(protocols: &[&[u8]]) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| {
@@ -224,14 +181,12 @@ impl Extension {
         Extension::new(EXT_ALPN, w.buf)
     }
 
-    /** @brief 재개 시 키 교환 방식 확장. */
     pub fn psk_key_exchange_modes(modes: &[u8]) -> Extension {
         let mut w = Writer::new();
         w.vec8(|w| w.bytes(modes));
         Extension::new(EXT_PSK_KEY_EXCHANGE_MODES, w.buf)
     }
 
-    /** @brief 클라이언트의 재개 제안. 티켓과 바인더가 들어간다. */
     pub fn pre_shared_key_client(
         identity: &[u8],
         obfuscated_age: u32,
@@ -248,54 +203,46 @@ impl Extension {
         Extension::new(EXT_PRE_SHARED_KEY, w.buf)
     }
 
-    /** @brief 서버가 고른 재개 제안 번호. */
     pub fn pre_shared_key_server(selected: u16) -> Extension {
         let mut w = Writer::new();
         w.u16(selected);
         Extension::new(EXT_PRE_SHARED_KEY, w.buf)
     }
 
-    /** @brief 조기 데이터를 쓰겠다는 표시. */
     pub fn early_data() -> Extension {
         Extension::new(EXT_EARLY_DATA, Vec::new())
     }
 
-    /** @brief 티켓에 담는 조기 데이터 허용 크기. */
     pub fn early_data_nst(max: u32) -> Extension {
         let mut w = Writer::new();
         w.u32(max);
         Extension::new(EXT_EARLY_DATA, w.buf)
     }
 
-    /** @brief 다시 시도 요청의 곡선 지정. */
     pub fn key_share_hrr(group: u16) -> Extension {
         let mut w = Writer::new();
         w.u16(group);
         Extension::new(EXT_KEY_SHARE, w.buf)
     }
 
-    /** @brief 다시 시도 요청의 곡선을 읽는다. */
     pub fn as_key_share_hrr(&self) -> Option<u16> {
         let mut r = Reader::new(&self.data);
         let group = r.u16().ok()?;
         r.is_empty().then_some(group)
     }
 
-    /** @brief 쿠키 확장. */
     pub fn cookie(data: &[u8]) -> Extension {
         let mut w = Writer::new();
         w.vec16(|w| w.bytes(data));
         Extension::new(EXT_COOKIE, w.buf)
     }
 
-    /** @brief 쿠키를 읽는다. */
     pub fn as_cookie(&self) -> Option<Vec<u8>> {
         let mut r = Reader::new(&self.data);
         let cookie = r.vec16().ok()?.to_vec();
         (!cookie.is_empty() && r.is_empty()).then_some(cookie)
     }
 
-    /** @brief 클라이언트의 지원 버전 목록을 읽는다. */
     pub fn as_supported_versions_client(&self) -> Option<Vec<u16>> {
         let mut r = Reader::new(&self.data);
         let list = r.vec8().ok()?;
@@ -310,14 +257,12 @@ impl Extension {
         Some(out)
     }
 
-    /** @brief 서버가 고른 버전을 읽는다. */
     pub fn as_supported_versions_server(&self) -> Option<u16> {
         let mut r = Reader::new(&self.data);
         let version = r.u16().ok()?;
         r.is_empty().then_some(version)
     }
 
-    /** @brief 클라이언트의 키 공유들을 읽는다. */
     pub fn as_key_share_client(&self) -> Option<Vec<(u16, Vec<u8>)>> {
         let mut r = Reader::new(&self.data);
         let list = r.vec16().ok()?;
@@ -337,7 +282,6 @@ impl Extension {
         Some(out)
     }
 
-    /** @brief 서버의 키 공유를 읽는다. */
     pub fn as_key_share_server(&self) -> Option<(u16, Vec<u8>)> {
         let mut r = Reader::new(&self.data);
         let group = r.u16().ok()?;
@@ -345,17 +289,14 @@ impl Extension {
         (!key.is_empty() && r.is_empty()).then_some((group, key))
     }
 
-    /** @brief 서버 이름을 읽는다. 형식이 깨졌거나 쓸 수 있는 호스트 이름이 없으면 None 이다. */
+    /// None when malformed or when no usable host name is present.
     pub fn as_server_name(&self) -> Option<String> {
         self.parse_server_name().ok().flatten()
     }
 
-    /**
-     * @brief 서버 이름 목록을 읽는다.
-     * @return 형식이 깨졌으면 오류, 호스트 이름 항목이 없거나 UTF-8 이 아니면 None.
-     * @details 목록과 호스트 이름은 비어 있으면 안 되고 호스트 이름 항목은 하나뿐이어야 한다.
-     *          다른 종류의 항목도 길이를 붙인 값으로 읽는다.
-     */
+    /// An error when malformed; None when there is no host name entry or it is not UTF-8. The list
+    /// and the host name must not be empty, and there must be only one host name entry. Entries of
+    /// other types are read as length-prefixed values too.
     fn parse_server_name(&self) -> Result<Option<String>, TlsError> {
         let mut r = Reader::new(&self.data);
         let list = r.vec16()?;
@@ -377,7 +318,6 @@ impl Extension {
         Ok(host.and_then(|name| String::from_utf8(name.to_vec()).ok()))
     }
 
-    /** @brief 응용 프로토콜 목록을 읽는다. */
     pub fn as_alpn(&self) -> Option<Vec<Vec<u8>>> {
         let mut r = Reader::new(&self.data);
         let list = r.vec16().ok()?;
@@ -396,12 +336,9 @@ impl Extension {
         Some(out)
     }
 
-    /**
-     * @brief 서버가 고른 응용 프로토콜을 읽는다.
-     * @param offered 이쪽이 제안한 프로토콜 목록.
-     * @return 제안한 목록에 든 프로토콜 하나. 제안하지 않았는데 왔으면 UnsupportedExtension,
-     *         형식이 깨졌으면 Decode, 하나가 아니거나 제안한 목록에 없으면 IllegalParameter.
-     */
+    /// Returns one protocol from `offered`. UnsupportedExtension when it came without an offer,
+    /// Decode when malformed, IllegalParameter when it is not exactly one or not in the offered
+    /// list.
     pub(crate) fn selected_alpn(&self, offered: &[Vec<u8>]) -> Result<Vec<u8>, TlsError> {
         if offered.is_empty() {
             return Err(TlsError::UnsupportedExtension);
@@ -413,21 +350,18 @@ impl Extension {
         Ok(protocols.remove(0))
     }
 
-    /** @brief 재개 방식 목록을 읽는다. */
     pub fn as_psk_modes(&self) -> Option<Vec<u8>> {
         let mut r = Reader::new(&self.data);
         let modes = r.vec8().ok()?.to_vec();
         (!modes.is_empty() && r.is_empty()).then_some(modes)
     }
 
-    /** @brief 점 형식 목록을 읽는다. */
     pub fn as_ec_point_formats(&self) -> Option<Vec<u8>> {
         let mut r = Reader::new(&self.data);
         let formats = r.vec8().ok()?.to_vec();
         (!formats.is_empty() && r.is_empty()).then_some(formats)
     }
 
-    /** @brief 지원 곡선 목록을 읽는다. */
     pub fn as_supported_groups(&self) -> Option<Vec<u16>> {
         let mut r = Reader::new(&self.data);
         let list = r.vec16().ok()?;
@@ -442,7 +376,6 @@ impl Extension {
         Some(out)
     }
 
-    /** @brief 지원 서명 방식 목록을 읽는다. */
     pub fn as_signature_algorithms(&self) -> Option<Vec<u16>> {
         let mut reader = Reader::new(&self.data);
         let list = reader.vec16().ok()?;
@@ -457,7 +390,6 @@ impl Extension {
         Some(algorithms)
     }
 
-    /** @brief 재개 제안의 티켓들과 바인더들을 읽는다. */
     pub fn as_pre_shared_key_client(&self) -> Option<(Vec<(Vec<u8>, u32)>, Vec<Vec<u8>>)> {
         let mut r = Reader::new(&self.data);
         let ids_raw = r.vec16().ok()?;
@@ -487,26 +419,21 @@ impl Extension {
         (identities.len() == binders.len()).then_some((identities, binders))
     }
 
-    /** @brief 서버가 고른 제안 번호를 읽는다. */
     pub fn as_pre_shared_key_server(&self) -> Option<u16> {
         let mut r = Reader::new(&self.data);
         let selected = r.u16().ok()?;
         r.is_empty().then_some(selected)
     }
 
-    /** @brief 티켓의 조기 데이터 허용 크기를 읽는다. */
     pub fn as_early_data_max(&self) -> Option<u32> {
         let mut r = Reader::new(&self.data);
         let max = r.u32().ok()?;
         r.is_empty().then_some(max)
     }
 
-    /**
-     * @brief 클라이언트 인사말에 실린 이 확장의 형식이 맞는지.
-     * @return 이 스택이 해석하는 종류면 형식이 맞는지, 해석하지 않는 종류면 None.
-     * @details 해석하지 않는 확장은 RFC 8446 이 정한 대로 내용을 보지 않고 넘긴다. QUIC 전송
-     *          매개변수는 QUIC 층이 따로 읽으므로 여기서는 해석하지 않는 종류로 친다.
-     */
+    /// None for types this stack does not interpret, which are passed over unread as RFC 8446
+    /// requires. QUIC transport parameters are read by the QUIC layer, so they count as not
+    /// interpreted here.
     pub fn client_hello_syntax_ok(&self) -> Option<bool> {
         let ok = match self.ext_type {
             EXT_SERVER_NAME => self.parse_server_name().is_ok(),
@@ -531,22 +458,15 @@ impl Extension {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 새 세션 티켓 메시지. */
 pub struct NewSessionTicket {
-    /** @brief 이 티켓이 유효한 기간. */
     pub lifetime_secs: u32,
-    /** @brief 나이를 가리는 데 더할 값. */
     pub age_add: u32,
-    /** @brief 이 티켓만의 nonce. */
     pub nonce: Vec<u8>,
-    /** @brief 티켓 자체. */
     pub ticket: Vec<u8>,
-    /** @brief 이 티켓에 딸린 확장. */
     pub extensions: Vec<Extension>,
 }
 
 impl NewSessionTicket {
-    /** @brief 티켓 메시지를 읽는다. */
     pub fn parse(body: &[u8]) -> Result<NewSessionTicket, TlsError> {
         let mut r = Reader::new(body);
         let lifetime_secs = r.u32()?;
@@ -566,7 +486,6 @@ impl NewSessionTicket {
         })
     }
 
-    /** @brief 티켓 메시지를 쓴다. */
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u32(self.lifetime_secs);
@@ -581,7 +500,6 @@ impl NewSessionTicket {
         w.buf
     }
 
-    /** @brief 이 티켓으로 보낼 수 있는 조기 데이터 크기. */
     pub fn max_early_data(&self) -> u32 {
         Extension::find(&self.extensions, EXT_EARLY_DATA)
             .and_then(|e| e.as_early_data_max())
@@ -590,24 +508,16 @@ impl NewSessionTicket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 클라이언트 인사말. */
 pub struct ClientHello {
-    /** @brief 이전 규격과 맞추기 위한 버전 표기. */
     pub legacy_version: u16,
-    /** @brief 클라이언트가 고른 난수. */
     pub random: [u8; 32],
-    /** @brief 이전 규격과 맞추기 위한 세션 번호. */
     pub session_id: Vec<u8>,
-    /** @brief 쓸 수 있는 암호 스위트들. */
     pub cipher_suites: Vec<u16>,
-    /** @brief 이전 규격과 맞추기 위한 압축 방식. */
     pub compression_methods: Vec<u8>,
-    /** @brief 실제 협상이 오가는 확장들. */
     pub extensions: Vec<Extension>,
 }
 
 impl ClientHello {
-    /** @brief 이 인사말이 별도 힙 버퍼에 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.session_id
             .capacity()
@@ -627,14 +537,10 @@ impl ClientHello {
             }))
     }
 
-    /**
-     * @brief 이 인사말이 그 판을 제안했는지.
-     * @details RFC 8446 을 따른다. supported_versions 가 있으면 그 목록만 보고 legacy_version 은
-     *          보지 않는다. 없으면 legacy_version 이 1.2 이상일 때 1.2 를 제안한 것으로 본다.
-     *          legacy_version 이 0x0304 인데 이 확장이 없어도 서버는 1.2 로 답한다.
-     * @retval TlsError::ProtocolVersion legacy_version 이 SSL 3.0 이하다.
-     * @retval TlsError::Decode supported_versions 형식이 틀렸다.
-     */
+    /// Follows RFC 8446: with supported_versions, only that list counts and legacy_version is
+    /// ignored; without it, a legacy_version of 1.2 or higher offers 1.2. A legacy_version of
+    /// 0x0304 without the extension still gets a 1.2 answer. ProtocolVersion when legacy_version is
+    /// SSL 3.0 or lower; Decode when supported_versions is malformed.
     pub(crate) fn offers_version(&self, version: u16) -> Result<bool, TlsError> {
         if self.legacy_version <= SSL30 {
             return Err(TlsError::ProtocolVersion);
@@ -648,15 +554,13 @@ impl ClientHello {
         }
     }
 
-    /**
-     * @brief 1.3 인사말로서 형태가 맞는지 확인한다.
-     * @details RFC 8446 이 1.3 인사말에 요구하는 확장도 본다. 재개 제안이 있으면 재개 방식
-     *          확장이, 없으면 서명 방식과 지원 곡선이 있어야 한다. 지원 곡선과 키 공유는 함께
-     *          오거나 함께 빠져야 한다. legacy_version 은 판 협상에 쓰지 않으므로 SSL 3.0 이하만
-     *          거부한다.
-     * @warning 재개 확장은 반드시 마지막이어야 한다. 바인더가 그 앞까지의 바이트에
-     *          걸리므로, 뒤에 뭔가 오면 그 부분이 인증되지 않는다.
-     */
+    /// Also checks the extensions RFC 8446 requires of a TLS 1.3 hello: with a PSK offer,
+    /// psk_key_exchange_modes; without one, signature_algorithms and supported_groups.
+    /// supported_groups and key_share come together or not at all. legacy_version plays no part in
+    /// version negotiation, so only SSL 3.0 or lower is rejected.
+    ///
+    /// The PSK extension must be last: the binder covers the bytes before it, so anything after it
+    /// would go unauthenticated.
     pub(crate) fn validate_tls13(&self) -> Result<(), TlsError> {
         if !self.offers_version(TLS13)? {
             return Err(TlsError::ProtocolVersion);
@@ -685,13 +589,9 @@ impl ClientHello {
         Ok(())
     }
 
-    /**
-     * @brief 서버로서 쓸 응용 프로토콜을 이쪽 선호 순서로 고른다.
-     * @param supported 이쪽이 받아들이는 목록. 비어 있으면 ALPN 을 쓰지 않는다.
-     * @details 클라이언트가 확장을 보내지 않았으면 고르지 않는다. 양쪽이 모두 ALPN 을 쓰는데
-     *          겹치는 것이 없으면 RFC 7301 대로 핸드셰이크를 끝낸다.
-     * @retval TlsError::NoApplicationProtocol 겹치는 프로토콜이 없다.
-     */
+    /// Picks in this side's preference order. An empty `supported` means ALPN is not used, and
+    /// nothing is picked when the client sent no extension. When both sides use ALPN with no
+    /// overlap, the handshake ends with NoApplicationProtocol, as RFC 7301 requires.
     pub(crate) fn select_alpn(&self, supported: &[Vec<u8>]) -> Result<Option<Vec<u8>>, TlsError> {
         if supported.is_empty() {
             return Ok(None);
@@ -708,19 +608,18 @@ impl ClientHello {
             .ok_or(TlsError::NoApplicationProtocol)
     }
 
-    /** @brief 서명 방식 확장에 든 방식들. 확장이 없으면 비어 있다. */
+    /// Empty when the extension is absent.
     pub(crate) fn signature_algorithms(&self) -> Vec<u16> {
         self.ext(EXT_SIGNATURE_ALGORITHMS)
             .and_then(Extension::as_signature_algorithms)
             .unwrap_or_default()
     }
 
-    /** @brief 서명 방식 확장에 그 방식이 있는지. */
     pub(crate) fn offers_signature_scheme(&self, scheme: u16) -> bool {
         self.signature_algorithms().contains(&scheme)
     }
 
-    /** @brief HelloRetryRequest 뒤 두 번째 인사말이 허용된 항목만 바꿨는지. */
+    /// Whether the second ClientHello after a HelloRetryRequest changed only what is allowed.
     pub(crate) fn is_valid_retry_of(&self, first: &ClientHello) -> bool {
         if self.legacy_version != first.legacy_version
             || self.random != first.random
@@ -781,12 +680,9 @@ impl ClientHello {
         }
     }
 
-    /**
-     * @brief 인사말을 읽는다.
-     * @warning 이 스택이 해석하는 확장의 형식이 깨졌으면 인사말 전체를 거부한다. 깨진 확장을
-     *          없는 것으로 보면 다른 구현이 거부하는 인사말에 이쪽만 답하고, 키 공유가 깨진
-     *          인사말에는 다시 시도 요청까지 보낸다.
-     */
+    /// Rejects the whole hello when an extension this stack interprets is malformed. Treating it as
+    /// absent would answer hellos other implementations reject, and would even send a
+    /// HelloRetryRequest for a hello with a broken key share.
     pub fn parse(body: &[u8]) -> Result<ClientHello, TlsError> {
         let mut r = Reader::new(body);
         let legacy_version = r.u16()?;
@@ -829,7 +725,6 @@ impl ClientHello {
         })
     }
 
-    /** @brief 인사말을 쓴다. */
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u16(self.legacy_version);
@@ -849,7 +744,6 @@ impl ClientHello {
         w.buf
     }
 
-    /** @brief 핸드셰이크 메시지에서 인사말을 꺼낸다. 종류가 다르면 오류다. */
     pub fn from_handshake(msg: &HandshakeMsg) -> Result<ClientHello, TlsError> {
         if msg.msg_type != HandshakeType::ClientHello {
             return Err(TlsError::UnexpectedMessage);
@@ -857,42 +751,31 @@ impl ClientHello {
         ClientHello::parse(&msg.body)
     }
 
-    /** @brief 핸드셰이크 메시지로 감싼다. */
     pub fn to_handshake(&self) -> HandshakeMsg {
         HandshakeMsg::new(HandshakeType::ClientHello, self.encode())
     }
 
-    /** @brief 이 종류의 확장을 찾는다. */
     pub fn ext(&self, ext_type: u16) -> Option<&Extension> {
         Extension::find(&self.extensions, ext_type)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 서버 인사말. */
 pub struct ServerHello {
-    /** @brief 이전 규격과 맞추기 위한 버전 표기. */
     pub legacy_version: u16,
-    /** @brief 서버가 고른 난수. */
     pub random: [u8; 32],
-    /** @brief 클라이언트가 보낸 세션 번호를 그대로 되비춘다. */
+    /// The client's session ID, echoed back.
     pub session_id_echo: Vec<u8>,
-    /** @brief 서버가 고른 암호 스위트. */
     pub cipher_suite: u16,
-    /** @brief 실제 협상이 오가는 확장들. */
     pub extensions: Vec<Extension>,
 }
 
 impl ServerHello {
-    /**
-     * @brief 1.3 서버 인사말이나 다시 시도 요청으로서 형태가 맞는지 확인한다.
-     * @param hello 이 메시지가 답하는 클라이언트 인사말.
-     * @param hrr 다시 시도 요청인지.
-     * @note 세션 번호를 클라이언트가 보낸 것과 대조한다. 다르면 중간자가 바꾼 것이다.
-     * @details 이 메시지에 올 수 없는 확장은, 이쪽이 제안한 종류면 자리를 어긴 것이므로
-     *          IllegalParameter 이고 제안하지 않은 종류면 UnsupportedExtension 이다.
-     *          supported_versions 가 판을 정하므로 legacy_version 은 SSL 3.0 이하만 거부한다.
-     */
+    /// `hrr` says whether this is a HelloRetryRequest. The session ID is compared with the
+    /// client's; a difference means a man in the middle changed it. An extension that cannot appear
+    /// in this message is IllegalParameter when this side offered that type, since it is in the
+    /// wrong place, and UnsupportedExtension when it did not. supported_versions sets the version,
+    /// so legacy_version is rejected only at SSL 3.0 or lower.
     pub(crate) fn validate_tls13(&self, hello: &ClientHello, hrr: bool) -> Result<(), TlsError> {
         if self.legacy_version <= SSL30 {
             return Err(TlsError::ProtocolVersion);
@@ -924,15 +807,11 @@ impl ServerHello {
         Ok(())
     }
 
-    /**
-     * @brief 다시 시도 요청이 규격에 맞는지 확인한다.
-     * @param hello 이 요청이 답하는 첫 클라이언트 인사말.
-     * @details RFC 8446 은 고른 곡선이 첫 인사말의 지원 곡선에 있으면서 키 조각은 보내지 않은
-     *          것이어야 하고, 요청이 인사말에서 무언가를 바꾸게 해야 한다고 정한다. 쿠키만 담은
-     *          요청에는 첫 인사말의 키 조각을 그대로 두고 쿠키만 더해 답한다.
-     * @return 두 번째 인사말에서 키 조각을 보낼 곡선. 쿠키만 담은 요청이면 없다.
-     * @retval TlsError::IllegalParameter 규격을 어긴 요청이다.
-     */
+    /// RFC 8446 requires the chosen group to be among the first hello's supported groups with no
+    /// key share sent for it, and the request to change something in the hello. A request with only
+    /// a cookie is answered by keeping the first hello's key shares and adding the cookie. Returns
+    /// the group to send a key share for in the second hello, or None for a cookie-only request.
+    /// IllegalParameter when the request breaks the spec.
     pub(crate) fn validate_retry_request(
         &self,
         hello: &ClientHello,
@@ -963,13 +842,10 @@ impl ServerHello {
         }
     }
 
-    /**
-     * @brief 서버 인사말에서 서버의 공개값을 꺼낸다.
-     * @param sent 이쪽이 마지막 인사말에서 키 조각을 보낸 곡선. 보내지 않았으면 없다.
-     * @retval TlsError::MissingExtension 키 공유가 없다. 이 스택은 키 공유 없이 재개하는 방식을
-     *         제안하지 않으므로 서버는 반드시 보내야 한다.
-     * @retval TlsError::IllegalParameter 이쪽이 키 조각을 보내지 않은 곡선을 골랐다.
-     */
+    /// `sent` is the group this side sent a key share for in its last hello, if any.
+    /// MissingExtension when there is no key share: this stack never offers resumption without one,
+    /// so the server must send it. IllegalParameter when the server picked a group this side sent
+    /// no key share for.
     pub(crate) fn key_share(&self, sent: Option<u16>) -> Result<Vec<u8>, TlsError> {
         let (group, key) = self
             .ext(EXT_KEY_SHARE)
@@ -982,7 +858,6 @@ impl ServerHello {
         Ok(key)
     }
 
-    /** @brief 서버가 보낸 첫 메시지를 읽는다. */
     pub fn parse(body: &[u8]) -> Result<ServerHello, TlsError> {
         let mut r = Reader::new(body);
         let legacy_version = r.u16()?;
@@ -1010,7 +885,6 @@ impl ServerHello {
         })
     }
 
-    /** @brief 서버가 보낼 첫 메시지를 적는다. */
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u16(self.legacy_version);
@@ -1026,7 +900,6 @@ impl ServerHello {
         w.buf
     }
 
-    /** @brief 핸드셰이크 메시지에서 꺼낸다. 종류가 다르면 오류다. */
     pub fn from_handshake(msg: &HandshakeMsg) -> Result<ServerHello, TlsError> {
         if msg.msg_type != HandshakeType::ServerHello {
             return Err(TlsError::UnexpectedMessage);
@@ -1034,24 +907,20 @@ impl ServerHello {
         ServerHello::parse(&msg.body)
     }
 
-    /** @brief 핸드셰이크 메시지로 감싼다. */
     pub fn to_handshake(&self) -> HandshakeMsg {
         HandshakeMsg::new(HandshakeType::ServerHello, self.encode())
     }
 
-    /** @brief 이 확장. 없으면 없다. */
     pub fn ext(&self, ext_type: u16) -> Option<&Extension> {
         Extension::find(&self.extensions, ext_type)
     }
 }
 
 #[cfg(test)]
-/** @brief 인사말 왕복과 비정규 인코딩 거부. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 확장이 든 클라이언트 인사말 왕복. */
     fn client_hello_roundtrip_with_extensions() {
         let ch = ClientHello {
             legacy_version: TLS12,
@@ -1098,7 +967,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버 인사말 왕복. */
     fn server_hello_roundtrip() {
         let sh = ServerHello {
             legacy_version: TLS12,
@@ -1129,7 +997,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 핸드셰이크 메시지로 감싸고 푸는 왕복. */
     fn handshake_wrapping() {
         let ch = ClientHello {
             legacy_version: TLS12,
@@ -1146,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 종류가 다른 메시지를 순서를 어긴 메시지로 거부하는지. */
+    /// As an out-of-order message.
     fn wrong_handshake_type_rejected() {
         let hs = HandshakeMsg::new(HandshakeType::Finished, vec![0; 10]);
         assert_eq!(
@@ -1160,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 비정규 인코딩을 거부하는지. 허용하면 구현 차이가 협상을 조종한다. */
+    /// Accepting them would let implementation differences steer negotiation.
     fn noncanonical_extensions_and_hello_fields_are_rejected() {
         let extension = Extension::supported_versions_server(TLS13);
         let mut encoded = Writer::new();
@@ -1206,10 +1073,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.3 서버 인사말과 다시 시도 요청을 거부할 때 RFC 8446 이 정한 경고에 맞는 사유를
-     *        내는지.
-     */
+    /// Each reason matches the alert RFC 8446 sets.
     fn tls13_server_hello_rejections_name_their_alert() {
         let hello = hello_with(vec![
             Extension::supported_versions_client(&[TLS13]),
@@ -1314,12 +1178,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 다시 시도 요청이 제안한 다른 곡선을 고르거나 쿠키만 담았으면 받아들이고, RFC 8446 을
-     *        어긴 요청은 illegal_parameter 로 거부하는지.
-     * @details 고른 곡선은 지원 곡선에 있으면서 첫 인사말에서 키 조각을 보내지 않은 것이어야
-     *          하고, 요청은 인사말에서 무언가를 바꾸게 해야 한다.
-     */
+    /// The chosen group must be among the supported groups with no key share sent in the first
+    /// hello, and the request must change something in the hello.
     fn hello_retry_request_may_select_another_offered_group_or_carry_only_a_cookie() {
         let hello = hello_with(vec![
             Extension::supported_versions_client(&[TLS13]),
@@ -1378,10 +1238,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 고른 응용 프로토콜을 제안한 목록과 대조하고, 어긋난 까닭에 맞는 사유를
-     *        내는지.
-     */
     fn selected_alpn_names_the_reason_for_rejection() {
         let offered = vec![b"dot".to_vec(), b"h2".to_vec()];
         assert_eq!(
@@ -1419,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재개 확장이 마지막이 아니면 거부하는지. 바인더가 덮는 범위가 어긋난다. */
+    /// The binder's coverage would be wrong.
     fn tls13_psk_extension_must_be_last() {
         let mut ch = ClientHello {
             legacy_version: TLS12,
@@ -1440,7 +1296,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 PSK identity와 SHA-256보다 짧은 binder를 정규 입력으로 받지 않는지. */
     fn tls13_psk_identity_and_binder_minimums_are_enforced() {
         assert!(Extension::pre_shared_key_client(b"", 0, 32)
             .as_pre_shared_key_client()
@@ -1454,7 +1309,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 두 번째 ClientHello가 HRR에서 허용된 항목 외에는 바꾸지 못하는지. */
     fn tls13_retry_client_hello_preserves_the_first_context() {
         let first = ClientHello {
             legacy_version: TLS12,
@@ -1511,7 +1365,6 @@ mod tests {
         assert!(!retained_early_data.is_valid_retry_of(&first));
     }
 
-    /** @brief 주어진 확장만 실은 클라이언트 인사말. */
     fn hello_with(extensions: Vec<Extension>) -> ClientHello {
         ClientHello {
             legacy_version: TLS12,
@@ -1524,10 +1377,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 이 스택이 해석하는 확장의 형식이 깨지면 인사말 전체를 거부하고, 해석하지 않는
-     *        확장은 내용을 보지 않는지.
-     */
+    /// Extensions this stack does not interpret are not looked into.
     fn client_hello_rejects_malformed_extensions_it_interprets() {
         let interpreted = [
             Extension::server_name("dns.example"),
@@ -1606,10 +1456,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버 이름 목록의 형식이 깨졌으면 거부하고, 형식은 맞지만 쓸 이름이 없을 뿐이면
-     *        받아들이는지.
-     */
+    /// Well-formed but with no usable name is accepted.
     fn server_name_list_must_be_well_formed() {
         let list = |entries: &[(u8, &[u8])]| {
             let mut w = Writer::new();
@@ -1649,11 +1496,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 1.3 인사말이 RFC 8446 이 요구하는 확장 조합을 갖췄는지 보는지. 재개 제안이 없으면
-     *        서명 방식과 지원 곡선이, 있으면 재개 방식이 있어야 하고, 지원 곡선과 키 공유는
-     *        함께 다닌다.
-     */
+    /// Without a PSK offer, signature_algorithms and supported_groups; with one,
+    /// psk_key_exchange_modes; supported_groups and key_share go together.
     fn tls13_hello_requires_the_extensions_rfc_8446_mandates() {
         let versions = || Extension::supported_versions_client(&[TLS13]);
         let groups = || Extension::supported_groups(&[X25519]);
@@ -1749,7 +1593,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어떤 바이트에도 패닉하지 않는지. */
     fn tls_parsers_no_panic_on_adversarial_input() {
         use crate::cert::{CertificateMsg, CertificateRequestMsg, CertificateVerify};
         use crate::handshake::HandshakeMsg;

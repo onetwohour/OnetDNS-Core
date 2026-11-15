@@ -1,7 +1,3 @@
-/*!
- * @brief 두 빠른 경로가 보통 경로와 같은 답을 내는지, 그리고 각 관문이 실제로 막는지.
- */
-
 use super::*;
 use crate::native::response::{base_response, now_unix};
 use onetdns_core::{BlockResponse, MutexExt, RateDecision};
@@ -13,7 +9,6 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 #[test]
-/** @brief 비었는지 판정이 값과 함께 교체되는지. */
 fn gated_swap_tracks_emptiness() {
     let views: GatedSwap<Vec<NativeView>> = GatedSwap::from_pointee(Vec::new());
     assert!(!views.present(), "빈 값은 present=false");
@@ -32,18 +27,15 @@ fn gated_swap_tracks_emptiness() {
     assert!(!policy.present(), "기본 정책 엔진은 비어 있다");
 }
 
-/** @brief 언제나 실패하는 테스트용 체인. */
 struct FailBackend;
 
 impl Resolver for FailBackend {
-    /** @brief 언제나 답하지 않는다. */
     fn resolve(&self, _req: &Message) -> Option<Message> {
         None
     }
 }
 
 #[test]
-/** @brief 다른 서버로 가라는 응답이 그대로 클라이언트에 가는지. */
 fn native_server_passes_authority_referral_to_client() {
     let root_text = "$TTL 3600\n. IN SOA ns.root. host.root. 1 3600 900 604800 3600\n. IN NS ns.root.\nns.root. IN A 127.0.1.1\ntest. IN NS ns.test.\nns.test. IN A 127.0.2.1\n";
     let zone = onetdns_authority::parse_zone(root_text, ".").unwrap();
@@ -77,7 +69,6 @@ fn native_server_passes_authority_referral_to_client() {
         .any(|a| matches!(&a.rdata, ApRData::Ns(t) if t.eq_ignore_case(&ApName::from_str("ns.test").unwrap()))));
 }
 
-/** @brief 고정 응답을 내는 테스트용 업스트림. */
 fn mock_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -101,7 +92,6 @@ fn mock_upstream() -> SocketAddr {
     addr
 }
 
-/** @brief 자기가 권한이라고 표시해 보내는 테스트용 업스트림. */
 fn mock_upstream_authoritative() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -126,7 +116,6 @@ fn mock_upstream_authoritative() -> SocketAddr {
     addr
 }
 
-/** @brief 검증됐다고 표시해 보내는 테스트용 업스트림. */
 fn mock_upstream_with_untrusted_ad() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -155,7 +144,6 @@ fn mock_upstream_with_untrusted_ad() -> SocketAddr {
 }
 
 #[test]
-/** @brief 업스트림이 설정한 검증 표시를 지우는지. 그대로 넘기면 검증하지 않은 것을 검증됐다고 하는 셈이다. */
 fn forward_backend_never_reasserts_unvalidated_ad() {
     let backend = NativeBackend::Forward(Forwarder::new(
         vec![mock_upstream_with_untrusted_ad()],
@@ -174,16 +162,12 @@ fn forward_backend_never_reasserts_unvalidated_ad() {
     );
 }
 
-/** @brief 차단 목록을 걸어 만든 테스트용 핸들러. */
 pub(crate) fn server(block_list: &str) -> NativeServer {
     server_with_chain(block_list, |base| base)
 }
 
-/**
- * @brief 기본 백엔드를 계층으로 감싼 테스트용 서버.
- * @details 밖에 물어보면 안 되는 이름을 끊는 일은 업스트림 질의 바로 앞 계층이 한다.
- *          그 계층을 빼고 테스트하면 실제 조립과 다른 것을 재게 된다.
- */
+/// Includes the local-only cut that sits right before the upstream, as in real assembly; without it
+/// the test would measure something else.
 fn server_with_chain(
     block_list: &str,
     wrap: impl FnOnce(Arc<dyn Resolver>) -> Arc<dyn Resolver>,
@@ -202,7 +186,6 @@ fn server_with_chain(
     )
 }
 
-/** @brief 밖에 물어보면 안 되는 이름을 끊는 계층을 씌운 테스트용 서버. */
 fn server_local_only(domain_needed: bool, bogus_priv: bool, empty_zones: bool) -> NativeServer {
     let names = Arc::new(crate::layers::LocalOnlyNames::new(
         domain_needed,
@@ -215,14 +198,12 @@ fn server_local_only(domain_needed: bool, bogus_priv: bool, empty_zones: bool) -
     })
 }
 
-/** @brief 한 이름에만 답하는 테스트용 로컬 소스. 권한 영역 슬롯을 대신한다. */
+/// Stands in for the authority slot.
 struct StaticAnswer {
-    /** @brief 답할 이름. */
     name: ApName,
 }
 
 impl Resolver for StaticAnswer {
-    /** @brief 이 이름이면 답하고, 아니면 없음. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         let question = request.questions.first()?;
         if !question.name.eq_ignore_case(&self.name) {
@@ -241,16 +222,12 @@ impl Resolver for StaticAnswer {
     }
 }
 
-/** @brief 로컬 원천을 먼저 보고 없으면 안으로 넘기는 테스트용 계층. */
 struct StaticFirst {
-    /** @brief 로컬 원천. */
     local: Arc<dyn Resolver>,
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
 }
 
 impl Resolver for StaticFirst {
-    /** @brief 해석한다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         match self.resolve_outcome(request) {
             ResolveOutcome::Response(response) => Some(response),
@@ -258,7 +235,6 @@ impl Resolver for StaticFirst {
         }
     }
 
-    /** @brief 로컬이 답하면 그 답, 아니면 안쪽 결과. */
     fn resolve_outcome(&self, request: &Message) -> ResolveOutcome {
         match self.local.resolve(request) {
             Some(response) => ResolveOutcome::Response(response),
@@ -267,21 +243,18 @@ impl Resolver for StaticFirst {
     }
 }
 
-/** @brief 테스트 중에 기능 세트를 바꾼다. */
 pub(crate) fn update_features(server: &NativeServer, update: impl FnOnce(&mut NativeFeatures)) {
     let mut features = (*server.features.load()).clone();
     update(&mut features);
     server.features.store(Arc::new(features));
 }
 
-/** @brief 테스트용 차단 엔진 슬롯. */
 pub(crate) fn shared_filter(filter: ArcSwap<BlockEngine>) -> Arc<SharedFilter> {
     Arc::new(SharedFilter::new(filter.load()))
 }
 
 #[test]
 #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-/** @brief 같은 질의에서 기능 snapshot을 두 번 잡는 비용과 한 번 재사용하는 비용. */
 fn bench_native_feature_snapshot_reuse() {
     use std::hint::black_box;
 
@@ -345,15 +318,11 @@ fn bench_native_feature_snapshot_reuse() {
 }
 
 #[test]
-/**
- * @brief 읽지 못한 질의를 버리지 않고 FORMERR로 답하는지, 그리고 그 답이 접근 제어와
- *        속도 제한을 지나는지.
- * @details 버리면 클라이언트에게는 무응답이라 데드라인을 다 기다린 뒤 재시도한다. 다만
- *          파싱 전이라 일반 경로의 두 관문을 지나오지 못했으므로 여기서 다시 봐야
- *          한다. 안 보면 거부한 클라이언트에게도 서버가 있다고 알리게 된다.
- */
+/// Dropping it would leave the client waiting until its deadline before retrying. Parsing failed
+/// before the normal path's two gates, so they are checked here; otherwise a refused client would
+/// learn a server is there.
 fn an_unparsable_query_is_answered_with_formerr_behind_the_usual_gates() {
-    /* 질문 하나를 적어 놓고 둘이라고 말하는 헤더. 파서가 거부한다. */
+    // The header claims two questions but holds one, so the parser rejects it.
     let mut packet = vec![0u8; 12];
     packet[0..2].copy_from_slice(&0xbeefu16.to_be_bytes());
     packet[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
@@ -402,12 +371,9 @@ fn an_unparsable_query_is_answered_with_formerr_behind_the_usual_gates() {
 }
 
 #[test]
-/**
- * @brief 전달 백엔드가 업스트림의 권한 표시를 그대로 돌려주지 않는지.
- * @details 업스트림이 권한이지 이 서버가 아니다. 그대로 돌려주면 이 서버가 맡지 않은 이름에 권한이라고
- *          알리는 것이고, 캐시 히트에서는 그 표시가 사라져 같은 서버의 두 경로가 서로
- *          다른 답을 낸다. 이 서버의 영역의 답에 이 표시를 설정하는 것은 위쪽 권한 계층이 한다.
- */
+/// The upstream is the authority, not this server. Echoing it would claim authority for names this
+/// server does not serve, and since cache hits lose the bit, two paths of one server would answer
+/// differently. The authority layer above sets it for this server's zones.
 fn the_forward_backend_does_not_echo_the_upstream_authoritative_bit() {
     let backend = NativeBackend::Forward(Forwarder::new(
         vec![mock_upstream_authoritative()],
@@ -425,7 +391,6 @@ fn the_forward_backend_does_not_echo_the_upstream_authoritative_bit() {
     assert!(!response.header.authentic_data);
 }
 
-/** @brief 테스트용 요청 맥락. */
 pub(crate) fn ctx<'a>() -> RequestCtx<'a> {
     RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
@@ -437,12 +402,10 @@ pub(crate) fn ctx<'a>() -> RequestCtx<'a> {
     }
 }
 
-/** @brief 테스트용 질의. */
 pub(crate) fn q(name: &str) -> Message {
     Message::query(0x1234, ApName::from_str(name).unwrap(), RecordType::A)
 }
 
-/** @brief 응답에 담긴 부정 수명. */
 pub(crate) fn negative_soa_ttl(message: &Message) -> u32 {
     message
         .authorities
@@ -452,11 +415,9 @@ pub(crate) fn negative_soa_ttl(message: &Message) -> u32 {
         .ttl
 }
 
-/** @brief 정해진 응답 코드를 내는 테스트용 체인. */
 struct FixedRcode(u16);
 
 impl Resolver for FixedRcode {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         let mut response = base_response(request);
         response.header.rcode = self.0;
@@ -464,11 +425,9 @@ impl Resolver for FixedRcode {
     }
 }
 
-/** @brief 정해진 답을 내는 테스트용 체인. */
 struct FixedAnswer;
 
 impl Resolver for FixedAnswer {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         let mut response = base_response(request);
         let name = request.questions.first().unwrap().name.clone();
@@ -481,7 +440,6 @@ impl Resolver for FixedAnswer {
     }
 }
 
-/** @brief 정해진 답과 그것을 담을 캐시. */
 fn fixed_answer_cache() -> (Arc<dyn Resolver>, crate::cache::CacheHandle) {
     let layer = crate::cache::CacheLayer::new(Arc::new(FixedAnswer), 64, 1, 0, 86_400, 0, 86_400);
     let handle = layer.handle();
@@ -489,18 +447,14 @@ fn fixed_answer_cache() -> (Arc<dyn Resolver>, crate::cache::CacheHandle) {
 }
 
 #[test]
-/**
- * @brief 질의의 RA·RCODE 비트가 응답 캐시를 정상 질의와 가르지 않는지.
- * @details 두 비트는 질의에서 뜻이 없다. 지우지 않으면 캐시 키가 갈라져 그런 질의가 올 때마다
- *          밖으로 나가고, 업스트림이 그 비트를 보고 준 답이 정상 질의와 같은 키에 담길 수도 있다.
- */
+/// Both bits mean nothing in a query. Left in, they would split the cache key, so such queries
+/// would always go upstream, and an answer the upstream gave because of the bits could land under
+/// the normal key.
 fn ra_and_rcode_query_bits_share_the_normal_cache() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /** @brief resolve 호출 횟수를 세는 백엔드. */
     struct Counting(Arc<AtomicUsize>);
     impl Resolver for Counting {
-        /** @brief 세고 나서 정해진 답을 돌려준다. */
         fn resolve(&self, request: &Message) -> Option<Message> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let mut response = base_response(request);
@@ -579,7 +533,6 @@ fn ra_and_rcode_query_bits_share_the_normal_cache() {
 }
 
 #[test]
-/** @brief 빠른 경로가 질의 번호를 고쳐 내보내고, 세대가 다르면 쓰지 않는지. */
 fn wire_lane_hits_patch_id_and_respect_filter_generation() {
     use onetdns_runtime::WireDisposition;
 
@@ -664,7 +617,6 @@ fn wire_lane_hits_patch_id_and_respect_filter_generation() {
 }
 
 #[test]
-/** @brief 인라인 키보다 긴 정상 질의가 거부되지 않고 구조화 경로에서 답을 받는지. */
 fn wire_lane_long_key_falls_back_to_structured_response() {
     use onetdns_runtime::WireDisposition;
 
@@ -687,11 +639,9 @@ fn wire_lane_long_key_falls_back_to_structured_response() {
         .any(|record| record.name.eq_ignore_case(&name) && record.rtype == ApRt::A));
 }
 
-/** @brief 모양을 정해 둔 답을 내는 테스트용 체인. */
 struct ShapedAnswer;
 
 impl Resolver for ShapedAnswer {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         let q = request.questions.first()?;
         let mut response = base_response(request);
@@ -741,7 +691,6 @@ impl Resolver for ShapedAnswer {
     }
 }
 
-/** @brief 빠른 경로를 켜거나 끈 테스트용 핸들러. */
 pub(crate) fn shaped_server(with_wire: bool) -> NativeServer {
     let layer = crate::cache::CacheLayer::new(Arc::new(ShapedAnswer), 64, 1, 0, 86_400, 0, 86_400);
     let cache = layer.handle();
@@ -766,9 +715,7 @@ pub(crate) fn shaped_server(with_wire: bool) -> NativeServer {
 
 #[test]
 #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-/** @brief 고정해 둔 주소를 캐시 밖에서 답할 때와 담아 둔 바이트로 답할 때의 비용. */
 fn bench_split_local_outside_cache_vs_cached_wire_hit() {
-    /** @brief 테스트용 핸들러. */
     fn local_server(mode: u8) -> NativeServer {
         let ttl = Arc::new(AtomicU32::new(300));
         let addresses = Arc::new(
@@ -826,7 +773,6 @@ fn bench_split_local_outside_cache_vs_cached_wire_hit() {
         }
     }
 
-    /** @brief 반복 횟수. */
     const ITERS: u32 = 1_000_000;
     let packet = Message::query(
         0x1234,
@@ -866,7 +812,6 @@ fn bench_split_local_outside_cache_vs_cached_wire_hit() {
 }
 
 #[test]
-/** @brief 설정을 다시 읽은 뒤 이전 수명으로 만든 항목이 들어오지 못하는지. */
 fn split_local_fixed_wire_rejects_late_old_ttl_generation() {
     let ttl = Arc::new(AtomicU32::new(17));
     let addresses = Arc::new(
@@ -999,7 +944,7 @@ fn split_local_fixed_wire_rejects_late_old_ttl_generation() {
 }
 
 #[test]
-/** @brief 바깥 계층의 답을 고정해 둔 주소의 답으로 오해하지 않는지. 오해하면 수명이 늙지 않는다. */
+/// Mistaking it would stop its TTLs from aging.
 fn outer_override_is_not_mislabeled_as_local_wire() {
     let ttl = Arc::new(AtomicU32::new(17));
     let addresses = Arc::new(
@@ -1057,7 +1002,6 @@ fn outer_override_is_not_mislabeled_as_local_wire() {
 }
 
 #[test]
-/** @brief 단순 질의는 조립 없이 나가고, 기능이 하나라도 켜지면 보통 경로로 전환하는지. */
 fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() {
     let zone_text = "$ORIGIN fast.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n*.wild IN A 192.0.2.99\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -1160,10 +1104,8 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
         }] if *address == Ipv4Addr::new(192, 0, 2, 99)
     ));
 
-    /*
-     * 옵션 없는 OPT 하나만 붙은 질의는 빠른 경로가 맡되, 나가는 바이트는 구조적 경로와
-     * 한 바이트도 다르면 안 된다. 실제 클라이언트는 거의 전부 이 모양으로 물어본다.
-     */
+    // A query with one empty OPT is the fast path's, but its bytes must match the structured path
+    // exactly; almost every real client asks this way.
     let mut with_edns = request.clone();
     with_edns
         .additionals
@@ -1193,7 +1135,7 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
     );
     assert!(echoed.options.is_empty());
 
-    /* 응답에 담을 것이 생기거나 절단 사다리가 필요한 모양은 전부 물러선다. */
+    // Every shape that needs something in the response or the truncation ladder falls back.
     let mut with_do = request.clone();
     let mut do_edns = Edns::default();
     do_edns.dnssec_ok = true;
@@ -1265,7 +1207,6 @@ fn authoritative_wire_exact_address_is_direct_and_optional_features_fall_back() 
 }
 
 #[test]
-/** @brief DDR이 켜져도 권한 고속 경로는 특수 이름 하나만 양보하고 나머지는 유지하는지. */
 fn ddr_only_preempts_its_owner_in_the_authority_wire_lane() {
     let zone_text = "$ORIGIN resolver.arpa.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n_dns IN A 192.0.2.9\nwww IN A 192.0.2.10\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -1319,12 +1260,9 @@ fn ddr_only_preempts_its_owner_in_the_authority_wire_lane() {
 }
 
 #[test]
-/**
- * @brief 권한 빠른 경로를 닫지 않는 설정을 켜도 그 경로의 답이 구조적 경로와 같은지.
- * @details 로컬 전용 이름을 모두 막는 계층을 권한 계층 안쪽에 두고 NSID 와 패딩을 켠다.
- *          옵션 없는 질의는 빠른 경로가 구조적 경로와 같은 바이트로 답하고, NSID 를 묻거나
- *          TXT 를 묻는 질의는 구조적 경로가 맡는다.
- */
+/// A local-only layer blocking every name sits inside the authority layer, with NSID and padding
+/// on. Queries without options get the same bytes from the fast path; queries asking for NSID or
+/// TXT go to the structured path.
 fn authority_lane_answers_ignore_settings_that_leave_it_open() {
     use onetdns_runtime::WireDisposition;
 
@@ -1447,7 +1385,6 @@ fn authority_lane_answers_ignore_settings_that_leave_it_open() {
 }
 
 #[test]
-/** @brief 밖을 가리키는 별칭을 오류로 바꾸지 않는지. */
 fn authoritative_external_alias_is_not_replaced_with_servfail() {
     let zone_text = "$ORIGIN alias.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nalias IN CNAME outside.example.\nold IN DNAME target.example.\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -1511,9 +1448,7 @@ fn authoritative_external_alias_is_not_replaced_with_servfail() {
 
 #[test]
 #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-/** @brief 권한 영역 빠른 경로와 보통 경로의 비용. */
 fn bench_authoritative_exact_wire_vs_structured_path() {
-    /** @brief 테스트용 권한 핸들러. */
     fn authority_server(
         store: Arc<ArcSwap<onetdns_authority::ZoneStore>>,
         direct: bool,
@@ -1538,7 +1473,6 @@ fn bench_authoritative_exact_wire_vs_structured_path() {
         }
     }
 
-    /** @brief 질의 하나를 처리해 바이트를 받는다. */
     fn serve(
         server: &NativeServer,
         packet: &[u8],
@@ -1576,7 +1510,6 @@ fn bench_authoritative_exact_wire_vs_structured_path() {
         serve(&structured, &packet, &context, &mut structured_out, now);
         serve(&direct, &packet, &context, &mut direct_out, now);
     }
-    /** @brief 반복 횟수. */
     const ITERATIONS: usize = 500_000;
     let measure = |server: &NativeServer, packet: &[u8], output: &mut onetdns_proto::Writer| {
         let started = Instant::now();
@@ -1629,7 +1562,7 @@ fn bench_authoritative_exact_wire_vs_structured_path() {
 }
 
 #[test]
-/** @brief 빠른 경로의 답이 보통 경로와 바이트까지 같은지. 다르면 캐시가 맞았는지에 따라 답이 갈린다. */
+/// Otherwise answers would depend on whether the cache hit.
 fn wire_fast_path_answers_match_the_normal_path() {
     use onetdns_runtime::WireDisposition;
 
@@ -1708,7 +1641,6 @@ fn wire_fast_path_answers_match_the_normal_path() {
 }
 
 #[test]
-/** @brief 아무것도 막지 않는 설정에서 빠른 경로를 쓰는지. */
 fn wire_lane_trivial_filter_serves_hit_via_fast_path() {
     use onetdns_runtime::WireDisposition;
 
@@ -1753,7 +1685,7 @@ fn wire_lane_trivial_filter_serves_hit_via_fast_path() {
 }
 
 #[test]
-/** @brief 빠른 경로가 응답 캐시 하나만 쓰는지. 둘로 나누면 같은 답을 두 번 담는다. */
+/// Splitting it would store the same answer twice.
 fn wire_fast_path_uses_the_response_cache_as_its_only_index() {
     use onetdns_runtime::WireDisposition;
 
@@ -1806,7 +1738,6 @@ fn wire_fast_path_uses_the_response_cache_as_its_only_index() {
 }
 
 #[test]
-/** @brief 체인을 바꾸면 새 질의는 새 캐시를 보고, 진행 중 스냅숏은 이전 세대를 안전하게 유지하는지. */
 fn lane_runtime_replacement_is_generation_atomic() {
     let old_layer =
         crate::cache::CacheLayer::new(Arc::new(FixedAnswer), 16, 1, 0, 86_400, 0, 86_400);
@@ -1857,7 +1788,6 @@ fn lane_runtime_replacement_is_generation_atomic() {
 }
 
 #[test]
-/** @brief 체인 교체 뒤 wire 경로도 새 캐시와 새 TTL 상한을 즉시 쓰는지. */
 fn lane_runtime_replacement_applies_the_new_ttl_policy() {
     use onetdns_runtime::WireDisposition;
 
@@ -1912,14 +1842,11 @@ fn lane_runtime_replacement_applies_the_new_ttl_policy() {
 }
 
 #[test]
-/** @brief 빠른 경로에서 일반 경로로 넘어가도 제한을 두 번 세지 않는지. */
 fn wire_lane_hit_charges_rate_limit_once_across_fallback() {
     use onetdns_runtime::WireDisposition;
 
-    /** @brief 호출 수를 세는 테스트용 제한기. */
     struct CountingLimiter(AtomicUsize);
     impl RateLimiter for CountingLimiter {
-        /** @brief 세고 통과시킨다. */
         fn check(&self, _client: &ClientInfo) -> RateDecision {
             self.0.fetch_add(1, Ordering::Relaxed);
             RateDecision::Permit
@@ -1988,7 +1915,6 @@ fn wire_lane_hit_charges_rate_limit_once_across_fallback() {
 }
 
 #[test]
-/** @brief 교체해도 이미 잡고 처리 중인 것이 깨지지 않는지. */
 fn resolver_slot_replaces_new_requests_without_invalidating_old_handles() {
     let slot = ResolverSlot::new(Arc::new(FixedRcode(ResponseCode::ServFail.0)));
     let previous = slot.load();
@@ -2004,7 +1930,6 @@ fn resolver_slot_replaces_new_requests_without_invalidating_old_handles() {
     );
 }
 
-/** @brief 빈 응답을 내는 테스트용 업스트림. */
 fn mock_empty_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -2021,13 +1946,8 @@ fn mock_empty_upstream() -> SocketAddr {
     addr
 }
 
-/**
- * @brief 별칭 하나만 담아 보내는 테스트용 업스트림. 부정 응답 SOA는 담지 않는다.
- *
- * @details 이름이 CNAME으로 이어지고 그 끝에 요청한 종류가 없을 때(IPv6 주소가 없는
- *          이름의 AAAA가 대표적이다) 실제 업스트림이 내는 모양이다. 공개 리졸버 여럿이
- *          이때 SOA를 담지 않는다.
- */
+/// What real upstreams send when a CNAME chain ends without the requested type, such as AAAA for a
+/// name with no IPv6 address; several public resolvers leave out the SOA.
 fn mock_alias_only_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -2051,7 +1971,6 @@ fn mock_alias_only_upstream() -> SocketAddr {
     addr
 }
 
-/** @brief 내부망 주소를 답하는 테스트용 업스트림. */
 fn mock_private_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -2075,7 +1994,6 @@ fn mock_private_upstream() -> SocketAddr {
     addr
 }
 
-/** @brief 이 업스트림을 쓰는 테스트용 핸들러. */
 fn server_with_upstream(upstream: SocketAddr) -> NativeServer {
     NativeServer::new(
         shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
@@ -2091,7 +2009,6 @@ fn server_with_upstream(upstream: SocketAddr) -> NativeServer {
     )
 }
 
-/** @brief 사유 코드를 담아 보내는 테스트용 업스트림. */
 fn mock_upstream_ede() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -2119,7 +2036,6 @@ fn mock_upstream_ede() -> SocketAddr {
 }
 
 #[test]
-/** @brief 답한 주소가 바이트로 오갔다 와도 그대로인지. */
 fn resolved_address_survives_client_wire_roundtrip() {
     let srv = server("");
     let mut request = q("wire.example.");
@@ -2145,15 +2061,8 @@ fn resolved_address_survives_client_wire_roundtrip() {
 }
 
 #[test]
-/**
- * @brief 별칭만 실려 온 응답을 실패로 바꾸지 않는지.
- *
- * @details 이름이 CNAME으로 이어지고 그 끝에 요청한 종류가 없으면 업스트림은 CNAME 하나에
- *          NOERROR로 답한다. 부정 응답 SOA를 함께 담지 않는 업스트림이 흔하다. 그것을
- *          실패로 바꾸면 CNAME 뒤에 선 이름의 AAAA가 전부 실패한다. 실제로
- *          emergency.zeta-ai.io의 AAAA가 그렇게 막혔다.
- * @warning 별칭이 없는 빈 NOERROR는 그대로 막아야 한다. 그것은 근거도 답도 없는 응답이다.
- */
+/// Upstreams answer such a chain with a CNAME and NOERROR, often without a negative SOA; failing it
+/// would fail AAAA for every name behind a CNAME.
 fn an_alias_only_answer_is_not_turned_into_a_failure() {
     let srv = server_with_upstream(mock_alias_only_upstream());
     let response = srv.handle(&q("alias.example."), &ctx()).expect("응답");
@@ -2172,16 +2081,12 @@ fn an_alias_only_answer_is_not_turned_into_a_failure() {
 }
 
 #[test]
-/**
- * @brief 근거 없이 비어 온 응답을 규격대로 그대로 전달하는지.
- *
- * @details RFC 2308이 모든 구간이 빈 것을 NODATA의 한 모양으로 열거해 두었다.
- *          SOA가 없을 때 규격이 정한 처분은 거절이 아니라 캐시 금지이고, 담지 않는 것은
- *          캐시 계층이 따로 한다(unproven_empty_noerror_is_not_cached).
- * @warning 한때 이것을 SERVFAIL로 바꿨다. RFC 4074가 바로 그 동작을 지목한다. IPv6
- *          주소가 없는 이름의 AAAA에 SERVFAIL을 주면 질의자가 A로 다시 묻지 못하고
- *          되풀이한다. 실제로 CNAME 뒤에 선 이름의 AAAA가 전부 막혔다.
- */
+/// RFC 2308 lists all-empty sections as one form of NODATA. Without an SOA the standard says not to
+/// cache it, not to refuse it; the cache layer handles not caching
+/// (`unproven_empty_noerror_is_not_cached`).
+///
+/// SERVFAIL here is the behavior RFC 4074 warns about: for AAAA of a name without IPv6, the client
+/// cannot fall back to A and keeps retrying.
 fn unproven_empty_noerror_is_passed_through_not_failed() {
     let srv = server_with_upstream(mock_empty_upstream());
     let response = srv.handle(&q("empty.example."), &ctx()).expect("응답");
@@ -2197,7 +2102,7 @@ fn unproven_empty_noerror_is_passed_through_not_failed() {
 }
 
 #[test]
-/** @brief 내부망 주소를 걷어 낸 뒤 빈 성공 응답이 남지 않는지. 남으면 없다는 뜻이 된다. */
+/// A leftover empty success would claim the name has no addresses.
 fn rebind_filter_never_leaves_empty_success() {
     let srv = server_with_upstream(mock_private_upstream()).with_features(NativeFeatures {
         rebind_protection: true,
@@ -2219,16 +2124,12 @@ fn rebind_filter_never_leaves_empty_success() {
 }
 
 #[test]
-/**
- * @brief ECS 옵션을 요청한 클라이언트에게만 그대로 돌려주는지.
- *
- * @details RFC 7871은 두 방향을 함께 규정한다. 대역 정보를 쓰는 서버는 질의에
- *          그 옵션이 없었으면 응답에 넣어서는 안 되고, 있었으면 반드시 넣어야 한다.
- *          하류가 전달 리졸버면 이 값으로 자기 캐시의 범위를 정하므로, 빠뜨리면 대역별
- *          답을 모두에게 주는 캐시가 된다.
- * @note SCOPE 는 0 이다. 이 서버는 설정된 고정 대역으로 업스트림에 물으므로 어느 클라이언트에게나
- *       같은 답이 나가고, 0 이 아닌 값을 적으면 하류가 그 대역 전용 답으로 잘못 담는다.
- */
+/// RFC 7871 binds both directions: a server using ECS must not add the option when the query had
+/// none, and must when it had one. A downstream forwarder sets its cache scope from it, so leaving
+/// it out makes a cache that gives per-subnet answers to everyone.
+///
+/// SCOPE is 0: this server asks upstream with a fixed configured subnet, so every client gets the
+/// same answer, and a nonzero value would make downstream cache it for that subnet only.
 fn client_subnet_is_echoed_only_when_the_query_carried_one() {
     let with_ecs = |raw: Option<Vec<u8>>| {
         let mut request = q("a.example.");
@@ -2252,7 +2153,7 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         })
     };
 
-    /* FAMILY 1, SOURCE 24, SCOPE 0, 192.0.2.0 */
+    // FAMILY 1, SOURCE 24, SCOPE 0, 192.0.2.0
     let asked = vec![0, 1, 24, 0, 192, 0, 2];
     let response = using(true)
         .handle(&with_ecs(Some(asked.clone())), &ctx())
@@ -2263,7 +2164,7 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         "FAMILY, SOURCE, ADDRESS 는 질의의 것과 같고 SCOPE 는 0 입니다"
     );
 
-    /* 클라이언트가 SCOPE 를 잘못 적어 보내도 이 서버의 응답의 SCOPE 는 0 이다. */
+    // Even with a wrong SCOPE from the client, this server's response carries 0.
     let bad_scope = vec![0, 1, 24, 24, 192, 0, 2];
     let response = using(true)
         .handle(&with_ecs(Some(bad_scope)), &ctx())
@@ -2284,10 +2185,8 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
         "대역 정보를 쓰지 않으면 그대로 돌려줄 것도 없습니다"
     );
 
-    /*
-     * SOURCE 24 인데 주소가 두 옥텟뿐이라 형식이 깨졌다. 그대로 돌려주면 어긋난 옵션을
-     * 하류로 퍼뜨리게 되므로 넣지 않는다.
-     */
+    // SOURCE 24 with only two address octets is malformed; echoing it would pass a broken option
+    // downstream.
     let short = vec![0, 1, 24, 0, 192, 0];
     let response = using(true).handle(&with_ecs(Some(short)), &ctx()).unwrap();
     assert_eq!(
@@ -2298,7 +2197,6 @@ fn client_subnet_is_echoed_only_when_the_query_carried_one() {
 }
 
 #[test]
-/** @brief 업스트림이 보낸 사유가 그대로 전해지는지. */
 fn ede_passthrough_from_upstream() {
     let srv = NativeServer::new(
         shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
@@ -2329,16 +2227,12 @@ fn ede_passthrough_from_upstream() {
 }
 
 #[test]
-/** @brief 실패에 사유가 담기는지. */
 fn resolver_failure_carries_diagnostic_ede() {
-    /** @brief 정해진 실패를 내는 테스트용 체인. */
     struct FailBackend(ResolveFailure);
     impl Resolver for FailBackend {
-        /** @brief 언제나 답하지 않는다. */
         fn resolve(&self, _req: &Message) -> Option<Message> {
             None
         }
-        /** @brief 정해진 실패를 알린다. */
         fn resolve_outcome(&self, _req: &Message) -> ResolveOutcome {
             ResolveOutcome::Failure(match self.0 {
                 ResolveFailure::TransportExhausted => ResolveFailure::TransportExhausted,
@@ -2409,7 +2303,6 @@ fn resolver_failure_carries_diagnostic_ede() {
 }
 
 #[test]
-/** @brief 접근 제어에 막혔음을 사유로 알리는지. */
 fn acl_denied_query_carries_prohibited_ede() {
     let srv = NativeServer::new(
         shared_filter(ArcSwap::from_pointee(onetdns_filter::BlockEngine::empty(
@@ -2440,7 +2333,6 @@ fn acl_denied_query_carries_prohibited_ede() {
 }
 
 #[test]
-/** @brief 차단됐음을 사유로 알리는지. */
 fn ede_on_filter_block() {
     let srv = server("||blocked.test^\n");
 
@@ -2463,7 +2355,6 @@ fn ede_on_filter_block() {
 }
 
 #[test]
-/** @brief 답에 담긴 주소가 차단 대상이면 막는지. */
 fn rpz_ip_blocks_resolved_answer() {
     let mut parts = onetdns_filter::EngineParts::default();
     parts.rpz_ip.push(onetdns_filter::RpzIpRule::new(
@@ -2496,7 +2387,6 @@ fn rpz_ip_blocks_resolved_answer() {
         .any(|r| r.rdata == ApRData::A(Ipv4Addr::new(7, 7, 7, 7))));
 }
 
-/** @brief 큰 테스트용 영역. */
 pub(crate) fn big_zone_store(n: usize) -> Arc<ArcSwap<onetdns_authority::ZoneStore>> {
     let mut zone_text = String::from(
         "$ORIGIN big.test.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n",
@@ -2515,40 +2405,32 @@ pub(crate) fn big_zone_store(n: usize) -> Arc<ArcSwap<onetdns_authority::ZoneSto
     Arc::new(ArcSwap::new(Arc::new(zs)))
 }
 
-/** @brief 언제나 통과시키는 테스트용 제한기. */
 struct ActivePermitLimiter;
 
 impl RateLimiter for ActivePermitLimiter {
-    /** @brief 통과시킨다. */
     fn check(&self, _client: &ClientInfo) -> RateDecision {
         RateDecision::Permit
     }
 }
 
-/**
- * @brief 첫 판정 뒤에 켜지는 테스트용 제한기.
- * @details DynamicRateLimiter::replace가 질의 처리 도중에 제한기를 거는 것을 결정적으로
- *          흉내 낸다. 실제로는 컨트롤 플레인 스레드가 그 사이에 끼어든다.
- */
+/// Deterministically mimics `DynamicRateLimiter::replace` installing a limiter mid-dispatch, where
+/// a control plane thread would cut in.
 struct LateActivatingLimiter {
-    /** @brief is_active를 몇 번 물었는지. */
     asked: std::sync::atomic::AtomicUsize,
 }
 
 impl RateLimiter for LateActivatingLimiter {
-    /** @brief 통과시킨다. */
     fn check(&self, _client: &ClientInfo) -> RateDecision {
         RateDecision::Permit
     }
 
-    /** @brief 처음 물을 때만 꺼져 있다고 답한다. */
+    /// Off only on the first call.
     fn is_active(&self) -> bool {
         self.asked.fetch_add(1, Ordering::Relaxed) != 0
     }
 }
 
 #[test]
-/** @brief 판정 사이에 제한기가 켜져도 고속 경로가 답으로 수렴하는지. */
 fn authority_wire_survives_limiter_activating_mid_dispatch() {
     let zone_text = "$ORIGIN fast.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -2577,10 +2459,8 @@ fn authority_wire_survives_limiter_activating_mid_dispatch() {
     );
     let packet = request.try_encode().unwrap();
     let mut output = onetdns_proto::Writer::with_limit(1232);
-    /*
-     * 제한기가 꺼져 있다고 본 뒤 켜졌으므로 클라이언트를 만들지 않았다. 여기서 죽지 않고
-     * 보통 경로로 전환해야 한다. 고속 경로는 언제 일반 경로로 넘겨도 정답이다.
-     */
+    // The limiter came on after being seen off, so no client was built. This must fall back rather
+    // than panic; falling back is always correct.
     assert_eq!(
         server.handle_udp_wire(&packet, &ctx(), &mut output, Instant::now()),
         onetdns_runtime::WireDisposition::Fallback
@@ -2592,13 +2472,9 @@ fn authority_wire_survives_limiter_activating_mid_dispatch() {
 }
 
 #[test]
-/**
- * @brief EDNS 없는 UDP 질의에 512바이트를 넘는 답을 무할당 경로가 그대로 내보내지
- *        않는지. TCP 에는 그 상한이 없으므로 거기서는 그대로 답해야 한다.
- * @details 이 경로에는 절단 사다리가 없다. 물러서지 않으면 RFC 1035가 정한
- *          크기를 넘는 데이터그램이 나가고, 클라이언트는 TC 도 못 보므로 TCP 로 다시
- *          묻지도 않는다.
- */
+/// TCP has no such limit, so it must answer there. This path has no truncation ladder: without
+/// falling back, a datagram past the RFC 1035 size goes out, and the client sees no TC, so it never
+/// retries over TCP.
 fn the_allocation_free_path_declines_a_non_edns_udp_answer_over_512_bytes() {
     let mut zone_text = String::from(
         "$ORIGIN wide.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n",
@@ -2657,14 +2533,10 @@ fn the_allocation_free_path_declines_a_non_edns_udp_answer_over_512_bytes() {
 }
 
 #[test]
-/**
- * @brief 이 서버가 맡은 영역의 ANY가 표준 알고리즘을 먼저 따르는지.
- * @details RFC 8482는 최소 응답을 답 구간에만 허용하고 "Except as described below
- *          in this section, the DNS responder MUST follow the standard algorithms"
- *          라고 규정한다. 해석하기 전에 합성하면 없는 이름이 NOERROR가 되어 존재를
- *          알리고 부정 캐시도 서지 않으며, 권한 표시도 서지 않는다. 4.2는 QNAME에
- *          CNAME이 있으면 합성하지 말라고 하므로 그것도 함께 본다.
- */
+/// RFC 8482 allows the minimal response only in the answer section and otherwise requires the
+/// standard algorithms. Synthesizing before resolution would turn a missing name into NOERROR,
+/// revealing existence, and set neither a negative cache nor AA. Synthesis is also skipped when
+/// QNAME has a CNAME, per RFC 8482.
 fn minimal_any_follows_the_standard_algorithm_inside_our_own_zones() {
     let zone_text = concat!(
         "$ORIGIN any.test.\n$TTL 300\n",
@@ -2727,7 +2599,6 @@ fn minimal_any_follows_the_standard_algorithm_inside_our_own_zones() {
 }
 
 #[test]
-/** @brief 큰 영역이 여러 청크로 나뉘어 가는지. */
 fn axfr_large_zone_streams_multiple_envelopes() {
     let store = big_zone_store(2000);
     let mut srv = server("").with_xfr(store, vec!["127.0.0.0/8".parse().unwrap()]);
@@ -2815,10 +2686,8 @@ fn axfr_large_zone_streams_multiple_envelopes() {
     );
     assert_eq!(cached_wires, first_cached, "lazy AXFR wire cache is reused");
 
-    /*
-     * 성공한 영역 전송은 어느 경로도 통계에 남기지 않는다. 기록기가 있다는 이유로 이
-     * 경로가 포기하면 영역을 전부 다시 만들기만 하고 남는 기록은 그대로 없다.
-     */
+    // No path records a successful zone transfer, so falling back because a recorder exists would
+    // only rebuild the zone and record nothing.
     {
         let (recorder, _stats) = onetdns_control::channel(
             8,
@@ -2859,7 +2728,6 @@ fn axfr_large_zone_streams_multiple_envelopes() {
 }
 
 #[test]
-/** @brief 원격 업데이트가 반영되고 시리얼이 오르는지. */
 fn ddns_update_applies_and_bumps_serial() {
     let (store, srv, _file) = ddns_server(
         "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\n",
@@ -2926,7 +2794,7 @@ fn ddns_update_applies_and_bumps_serial() {
 }
 
 #[test]
-/** @brief 선행 조건과 기록 모양을 확인하는지. 어긋난 것이 통과하면 영역이 깨진다. */
+/// A malformed one getting through would break the zone.
 fn ddns_enforces_prerequisite_sets_and_update_record_shape() {
     let (store, srv, file) = ddns_server(
         "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 10 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nmulti IN A 10.0.0.2\nmulti IN A 10.0.0.3\n",
@@ -3016,12 +2884,8 @@ fn ddns_enforces_prerequisite_sets_and_update_record_shape() {
 }
 
 #[test]
-/**
- * @brief 밖에서 고친 영역 파일을 동적 갱신이 덮어쓰지 않는지.
- * @details 감시 작업이 파일 변경을 알아채기 전에 갱신이 들어오면, 메모리의 이전 영역에 갱신을
- *          더해 파일에 쓰게 된다. 그러면 밖에서 고친 내용이 사라지고, 감시 작업이 나중에 읽는
- *          것도 이미 덮인 파일이다.
- */
+/// An update arriving before the watcher noticed a file change would write the old in-memory zone
+/// plus the update, losing the outside edit, and the watcher would later read the overwritten file.
 fn ddns_refuses_to_overwrite_an_externally_edited_zone_file() {
     let dir = std::env::temp_dir().join(format!(
         "onetdns-ddns-digest-{}-{:?}",
@@ -3095,16 +2959,14 @@ fn ddns_refuses_to_overwrite_an_externally_edited_zone_file() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/** @brief 원격 업데이트를 받는 영역의 파일. 값이 사라질 때 파일도 지운다. */
+/// Deletes the file on drop.
 struct UpdateZoneFile {
-    /** @brief 파일을 담은 임시 디렉터리. */
     dir: std::path::PathBuf,
-    /** @brief 업데이트 대상. */
     target: UpdateTarget,
 }
 
 impl UpdateZoneFile {
-    /** @brief 영역 원문을 임시 파일에 쓰고, 그 파일에서 읽은 영역을 함께 돌려준다. */
+    /// Writes the zone text to a temporary file and returns the zone read back from it.
     fn new(text: &str, origin: &str) -> (Self, onetdns_authority::Zone) {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -3130,7 +2992,6 @@ impl Drop for UpdateZoneFile {
     }
 }
 
-/** @brief 이 영역 하나로 업데이트를 받는 저장소와 서버. */
 fn ddns_server(
     text: &str,
     origin: &str,
@@ -3153,7 +3014,6 @@ fn ddns_server(
     (store, srv, file)
 }
 
-/** @brief DDNS 갱신 판정에 쓸 영역과 서버를 새로 만든다. */
 fn ddns_fixture() -> (
     Arc<ArcSwap<onetdns_authority::ZoneStore>>,
     NativeServer,
@@ -3165,7 +3025,6 @@ fn ddns_fixture() -> (
     )
 }
 
-/** @brief 갱신부에 기록들을 담은 UPDATE 한 통. */
 fn ddns_update(records: Vec<ApRecord>) -> Message {
     let mut m = Message::default();
     m.header.opcode = 5;
@@ -3178,7 +3037,6 @@ fn ddns_update(records: Vec<ApRecord>) -> Message {
     m
 }
 
-/** @brief 이 이름에 이 종류가 몇 개나 있는지. */
 fn ddns_count(
     store: &Arc<ArcSwap<onetdns_authority::ZoneStore>>,
     name: &str,
@@ -3193,16 +3051,12 @@ fn ddns_count(
 }
 
 #[test]
-/**
- * @brief 어긋나는 갱신 RR 하나만 건너뛰고 나머지는 그대로 적용하는지.
- *
- * @details RFC 2136은 CNAME 이 다른 데이터와 공존하게 되는 추가와 정점의
- *          마지막 NS 삭제를 그 RR 만 건너뛰고 남은 것을 마저 처리한 뒤 NOERROR 로
- *          답하라고 정한다. 예전에는 일단 적용해 보고 영역 검증이 거부하면 SERVFAIL 을
- *          냈는데, 그러면 같은 메시지에 실려 온 멀쩡한 갱신까지 함께 사라진다.
- * @note 위임의 마지막 NS 는 지울 수 있어야 한다. 정점과 같은 규칙을 걸면 한번 만든
- *       위임을 영영 걷지 못한다.
- */
+/// RFC 2136 says an add that would make a CNAME coexist with other data, or a delete of the apex's
+/// last NS, skips only that RR, processes the rest, and answers NOERROR; failing the whole message
+/// would drop the valid updates with it.
+///
+/// The last NS of a delegation must be deletable; applying the apex rule would make a delegation
+/// impossible to remove.
 fn ddns_skips_only_the_conflicting_record() {
     let tcp = RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
@@ -3373,14 +3227,10 @@ fn ddns_skips_only_the_conflicting_record() {
 }
 
 #[test]
-/**
- * @brief 영역부 클래스가 다른 UPDATE 와 선행조건 검사 차례가 규격대로인지.
- *
- * @details RFC 2136은 영역부 개수와 ZTYPE 만 형식 오류로 보고, ZCLASS 가 이 서버가
- *          맡은 영역과 다르면 NOTAUTH 로 답하게 한다. 형식 오류로 답하면 요청자는 자기
- *          메시지가 깨진 줄 알고 고치려 들지만 실제로는 서버를 잘못 고른 것이다.
- *          선행조건은 3.2.5 의사코드가 TTL 을 영역 범위보다 먼저 보게 정한다.
- */
+/// RFC 2136 treats only the zone count and ZTYPE as format errors, and answers NOTAUTH when ZCLASS
+/// differs from the zone this server serves; FORMERR would make the requester think its message was
+/// broken when it picked the wrong server. Prerequisites check TTL before zone scope, per the RFC
+/// 2136 pseudocode.
 fn ddns_reports_a_foreign_zone_class_as_notauth() {
     let tcp = RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
@@ -3433,14 +3283,8 @@ fn ddns_reports_a_foreign_zone_class_as_notauth() {
 }
 
 #[test]
-/**
- * @brief 갱신이 담아 온 SOA 일련번호를 그대로 두는지.
- *
- * @details RFC 2136은 되돌리는 SOA 교체만 무시하고, 갱신이 일련번호를 직접 바꾸면
- *          서버가 또 올리지 말라고 정한다. 비교는 RFC 1982 모듈로 산술이다. 예전에는
- *          SOA 추가를 늘 버리고 언제나 하나를 올려, 요청자가 적어 준 값이 영역에 남지
- *          않았다.
- */
+/// RFC 2136 ignores only an SOA replacement that goes backward, and when an update sets the serial
+/// itself, the server must not bump it again. Comparison uses RFC 1982 serial arithmetic.
 fn ddns_keeps_an_explicit_soa_serial() {
     let tcp = RequestCtx {
         src: "127.0.0.1:5555".parse().unwrap(),
@@ -3521,15 +3365,10 @@ fn ddns_keeps_an_explicit_soa_serial() {
 }
 
 #[test]
-/**
- * @brief 무할당 경로로 답해도 지표에 남는지.
- *
- * @details 이 경로가 기록하지 못하던 시절의 조건(기록기가 있으면 막는다)이 그대로
- *          남아 있으면, 컨트롤 플레인을 만들어 두는 모든 배치에서 경로가 전부 죽는다. 반대로
- *          조건만 지우고 기록을 안 붙이면 대시보드에서 권한 응답이 조용히 사라진다.
- *          Personal 모드처럼 ACL이 클라이언트를 요구해도 기능 세트는 질의마다 한 번만 읽어야
- *          한다. 셋 다 조용한 사고라 여기서 붙든다.
- */
+/// Records metrics like the structured path. Refusing the path whenever a recorder exists would
+/// disable it in every deployment with a control plane, and answering without recording would drop
+/// authoritative answers from the dashboard. The feature set is read once per query, even when the
+/// ACL needs a client as in Personal mode.
 fn authority_wire_answers_are_recorded_like_the_structured_path() {
     let zone_text = "$ORIGIN rec.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -3610,14 +3449,9 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
 }
 
 #[test]
-/**
- * @brief 묻지 않은 쪽에는 DNSSEC 레코드를 보내지 않는지.
- *
- * @details 재귀 리졸버는 검증 여부와 무관하게 업스트림에 DO=1로 묻는다. 그래야 DO=1로 묻는
- *          질의자에게 줄 서명을 가지고 있을 수 있다. 그 대신 묻지 않은 쪽에 담아 보내면
- *          응답만 커지고 절단으로 이어진다.
- * @warning DNSKEY와 DS는 질의자가 직접 물을 수 있는 종류라 걷어내면 안 된다.
- */
+/// The recursive resolver asks upstream with DO set either way, to hold signatures for clients that
+/// want them; sending them to clients that did not ask only grows the response toward truncation.
+/// DNSKEY and DS stay, since clients ask for them directly.
 fn dnssec_records_go_only_to_clients_that_asked_for_them() {
     let name = ApName::from_str("signed.example").unwrap();
     let signed_response = || {
@@ -3682,7 +3516,7 @@ fn dnssec_records_go_only_to_clients_that_asked_for_them() {
         "직접 물을 수 있는 종류를 걷어냈습니다"
     );
 
-    /* 대조군. DO를 설정한 쪽에는 그대로 나가야 한다. 걷어내기가 언제나 실행되는 것을 막는다. */
+    // Control: a DO client gets them, so stripping cannot be unconditional.
     let mut do_request = Message::query(1, name.clone(), ApRt::A);
     let mut edns = Edns::default();
     edns.dnssec_ok = true;
@@ -3705,12 +3539,9 @@ fn dnssec_records_go_only_to_clients_that_asked_for_them() {
 }
 
 #[test]
-/**
- * @brief 요청에 OPT가 있으면 응답에도 반드시 넣고, 없으면 넣지 않는지.
- * @details RFC 6891이 양쪽을 다 MUST로 정한다. 빼면 상대는 이 서버가 EDNS를 모르는 것으로
- *          보고 512바이트로 전환하고, 쿠키·NSID·패딩·EDE를 담을 슬롯도 사라진다.
- *          반대로 EDNS 없는 요청에 붙이면 이전 클라이언트가 응답을 거부한다.
- */
+/// RFC 6891 makes both MUST. Without it the peer assumes no EDNS and drops to 512 bytes, losing
+/// room for cookies, NSID, padding, and EDE; adding one to a plain request makes old clients reject
+/// the response.
 fn edns_request_gets_an_opt_back_and_a_plain_one_does_not() {
     let srv = server("");
     let ctx = RequestCtx {
@@ -3746,13 +3577,8 @@ fn edns_request_gets_an_opt_back_and_a_plain_one_does_not() {
 }
 
 #[test]
-/**
- * @brief 질문이 둘인 질의에 FORMERR을 주되 그것을 그대로 돌려주지 않는지.
- *
- * @details RFC 9619는 opcode 0인 DNS 메시지가 QDCOUNT를 1보다 크게 담을 수 없다고
- *          정한다. 응답도 opcode 0이므로 질문부를 그대로 돌려주면 이 서버의 답이 같은
- *          규칙을 어긴다. BIND도 이 자리에서 질문부를 비운다.
- */
+/// RFC 9619 forbids QDCOUNT above 1 for opcode 0, and the response is opcode 0 too, so echoing the
+/// question section would break the same rule. BIND clears it here as well.
 fn a_multi_question_query_gets_formerr_without_echoing_it() {
     let srv = server("");
     let ctx = RequestCtx {
@@ -3779,7 +3605,7 @@ fn a_multi_question_query_gets_formerr_without_echoing_it() {
         "1보다 큰 QDCOUNT를 그대로 돌려주면 응답이 같은 규칙을 어깁니다"
     );
 
-    /* 질문이 없는 질의도 같은 분기를 지난다. 비우는 것이 무해해야 한다. */
+    // A query with no question takes the same branch, so clearing must be harmless.
     let mut empty = Message::default();
     empty.header.id = 7;
     let response = srv.handle(&empty, &ctx).expect("응답이 없습니다");
@@ -3788,12 +3614,8 @@ fn a_multi_question_query_gets_formerr_without_echoing_it() {
 }
 
 #[test]
-/**
- * @brief 구현하지 않은 opcode에 NOTIMP로 답하는지.
- * @details FORMERR은 요청이 깨졌다는 뜻이라 보낸 쪽이 질의를 고쳐 다시 보낸다. 모르는
- *          opcode는 요청이 멀쩡한데 이 서버가 못 하는 것이므로 뜻이 다르고, 진단하는
- *          쪽에서 둘을 갈라 봐야 한다.
- */
+/// FORMERR means the request is broken, so the sender fixes and resends it. An unknown opcode means
+/// the request is fine but this server cannot do it, and diagnostics need to tell the two apart.
 fn unimplemented_opcodes_answer_not_implemented() {
     let srv = server("");
     let ctx = RequestCtx {
@@ -3832,7 +3654,6 @@ fn unimplemented_opcodes_answer_not_implemented() {
 }
 
 #[test]
-/** @brief 특수 요청이 올바른 질문 하나만 담았는지 확인하는지. */
 fn special_opcodes_require_exactly_one_well_formed_zone_question() {
     let srv = server("");
     let tcp = RequestCtx {
@@ -3876,7 +3697,6 @@ fn special_opcodes_require_exactly_one_well_formed_zone_question() {
 }
 
 #[test]
-/** @brief 하위 서버마다 정해 둔 키로 알리는지. */
 fn notify_uses_the_secondary_specific_tsig_identity() {
     use onetdns_dnssec::tsig;
 
@@ -3939,7 +3759,6 @@ fn notify_uses_the_secondary_specific_tsig_identity() {
 }
 
 #[test]
-/** @brief 고친 뒤 바뀐 부분만 보내는지. */
 fn ixfr_returns_incremental_after_ddns() {
     let zone_text = "$ORIGIN ix.test.\n$TTL 300\n@ IN SOA ns1 admin 10 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.1\nold IN A 10.0.0.5\nkeep1 IN A 10.0.0.11\nkeep2 IN A 10.0.0.12\nkeep3 IN A 10.0.0.13\nkeep4 IN A 10.0.0.14\nkeep5 IN A 10.0.0.15\nkeep6 IN A 10.0.0.16\nkeep7 IN A 10.0.0.17\nkeep8 IN A 10.0.0.18\n";
     let (file, zone) = UpdateZoneFile::new(zone_text, "ix.test");
@@ -4074,7 +3893,6 @@ fn ixfr_returns_incremental_after_ddns() {
 }
 
 #[test]
-/** @brief 감추기로 했으면 서버 이름과 버전을 답하지 않는지. */
 fn chaos_id_version_respects_hide_flags() {
     let mut feat = NativeFeatures::default();
     feat.server_identity = b"onetdns".to_vec();
@@ -4117,7 +3935,6 @@ fn chaos_id_version_respects_hide_flags() {
 }
 
 #[test]
-/** @brief 클라이언트에 맞는 업스트림이 먼저 쓰이는지. */
 fn per_client_upstream_match_prefers_specific_resolver() {
     let default = mock_upstream();
     let specific = mock_upstream();
@@ -4151,7 +3968,6 @@ fn per_client_upstream_match_prefers_specific_resolver() {
 }
 
 #[test]
-/** @brief 허용된 이름이 업스트림으로 가는지. */
 fn allowed_forwards_to_upstream() {
     let s = server("||blocked.test^\n");
     let resp = s.handle(&q("allowed.test"), &ctx()).unwrap();
@@ -4164,7 +3980,6 @@ fn allowed_forwards_to_upstream() {
 }
 
 #[test]
-/** @brief 차단된 이름이 없다고 답하는지. */
 fn blocked_returns_nxdomain() {
     let s = server("||blocked.test^\n");
     let resp = s.handle(&q("blocked.test"), &ctx()).unwrap();
@@ -4173,11 +3988,8 @@ fn blocked_returns_nxdomain() {
 }
 
 #[test]
-/**
- * @brief 목록 규칙에 막힌 질의가 그 목록을 기록에 남기는지.
- * @details 질의 기록 화면은 이 값으로 어느 구독이 막았는지 보여 주고 허용 버튼을 고른다.
- *          목록 밖에서 직접 넣은 규칙은 목록을 남기지 않아야 한다.
- */
+/// The query log shows which subscription blocked from this value and picks the allow button from
+/// it. Rules added directly, outside any list, must record no list.
 fn filter_block_records_the_subscription_list() {
     let lines = vec!["||listed.test^".to_string()];
     let subscriptions = [onetdns_filter::SubscriptionSource {
@@ -4243,7 +4055,6 @@ fn filter_block_records_the_subscription_list() {
 }
 
 #[test]
-/** @brief 재작성 답이 고정해 둔 주소의 수명을 쓰는지. */
 fn rewrite_uses_local_ttl_instead_of_block_ttl() {
     let mut parts = onetdns_filter::EngineParts::default();
     parts.block.add_exact("blocked.test");
@@ -4280,7 +4091,6 @@ fn rewrite_uses_local_ttl_instead_of_block_ttl() {
 }
 
 #[test]
-/** @brief 안전 검색으로 바꾼 답이 고정해 둔 수명을 쓰는지. */
 fn safe_search_cname_uses_local_ttl() {
     let s = server("");
     s.local_ttl.store(41, Ordering::Release);
@@ -4296,7 +4106,6 @@ fn safe_search_cname_uses_local_ttl() {
 }
 
 #[test]
-/** @brief 정책이 막은 답이 차단 수명을 쓰는지. */
 fn query_policy_block_uses_blocked_response_ttl() {
     let rules = onetdns_policy::RuleEngine::new(vec![onetdns_policy::Rule::new(
         onetdns_policy::Action::Block,
@@ -4313,15 +4122,12 @@ fn query_policy_block_uses_blocked_response_ttl() {
 }
 
 #[test]
-/**
- * @brief 모든 것을 묻는 질의에 RFC 8482의 합성 HINFO로 답하는지.
- *
- * @details 온전한 ANY는 큰 답을 끌어내 증폭에 쓰인다. 다만 RFC 8482는 답하지 않는
- *          방법을 셋만 열거하고 그 밖에는 표준 알고리즘을 따르라고 하므로, 거절이
- *          아니라 합성 HINFO가 규격이 정한 모양이다.
- * @note DO를 설정한 질의자에게는 관례대로 답한다. 4.2가 서명된 영역이면 RRSIG를 함께
- *       요구하는데 합성한 레코드에는 붙일 서명이 없다.
- */
+/// A full ANY answer invites amplification. RFC 8482 lists only three ways to not answer and
+/// otherwise requires the standard algorithm, so a synthesized HINFO is the specified form, not a
+/// refusal.
+///
+/// Clients with DO set get the conventional answer: a signed zone would need RRSIGs, and a
+/// synthesized record has none.
 fn any_query_answers_with_the_minimal_hinfo() {
     let s = server("");
     let mut query = q("any.test");
@@ -4347,7 +4153,7 @@ fn any_query_answers_with_the_minimal_hinfo() {
         other => panic!("HINFO wire를 기대했습니다: {other:?}"),
     }
 
-    /* DO를 설정하면 합성하지 않는다. 이 서버에는 any.test 영역이 없으므로 관례 경로로 간다. */
+    // With DO, no synthesis; no any.test zone exists here, so it takes the conventional path.
     let mut signed_query = query.clone();
     signed_query.additionals.push(ApRecord {
         name: ApName::root(),
@@ -4366,7 +4172,6 @@ fn any_query_answers_with_the_minimal_hinfo() {
 }
 
 #[test]
-/** @brief 뷰에 드는 클라이언트면 다르게 답하는지. */
 fn view_local_overrides_for_matching_client() {
     let s = server("").with_views(vec![NativeView {
         nets: vec!["127.0.0.1/32".parse().unwrap()],
@@ -4401,7 +4206,6 @@ fn view_local_overrides_for_matching_client() {
 }
 
 #[test]
-/** @brief 뷰 이름의 원래 바이트가 바뀌지 않는지. */
 fn view_local_key_preserves_raw_name_octets() {
     let configured = ApName::from_str("�").unwrap();
     let s = server("").with_views(vec![NativeView {
@@ -4431,7 +4235,6 @@ fn view_local_key_preserves_raw_name_octets() {
 }
 
 #[test]
-/** @brief 접근 제어가 막은 질의를 거절하는지. */
 fn acl_deny_refuses() {
     let mut s = server("");
     s.acl = Arc::new(IpAcl::new(
@@ -4443,17 +4246,14 @@ fn acl_deny_refuses() {
     assert_eq!(resp.header.rcode, ResponseCode::Refused.0);
 }
 
-/** @brief 테스트 문맥의 출발지인 127.0.0.1 을 버리는 접근 제어. */
+/// Drops 127.0.0.1, the test context's source.
 fn dropping_loopback() -> Arc<IpAcl> {
     Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.1/32".parse().unwrap()]))
 }
 
 #[test]
-/**
- * @brief 버리는 주소의 질의에는 거부 응답도 보내지 않는지.
- * @details 허용 목록에 든 주소라도 버림이 이긴다. UPDATE 는 일반 질의와 다른 자리에서
- *          입장하고, IPv6 형태로 들어온 IPv4 주소는 판정 전에 IPv4 로 바뀌어야 하므로 함께 본다.
- */
+/// Drop wins even over the allow list. UPDATE is admitted elsewhere than ordinary queries, and an
+/// IPv4-mapped IPv6 address must become IPv4 before the check, so both are covered.
 fn acl_drop_answers_nothing_even_to_allowed_clients() {
     let mut s = server("");
     s.acl = Arc::new(
@@ -4488,11 +4288,8 @@ fn acl_drop_answers_nothing_even_to_allowed_clients() {
 }
 
 #[test]
-/**
- * @brief 빠른 경로에 담아 둔 답도 버리는 주소에는 내보내지 않는지.
- * @details 담아 둔 답을 내보내는 경로는 접근 제어를 따로 다시 본다. 거부만 걸러 내면 버림이
- *          허용으로 새어 나간다.
- */
+/// The path sending stored answers checks access control again; filtering only refusals would leak
+/// drop as allow.
 fn acl_drop_withholds_cached_wire_answers() {
     use onetdns_runtime::WireDisposition;
 
@@ -4535,7 +4332,6 @@ fn acl_drop_withholds_cached_wire_answers() {
 }
 
 #[test]
-/** @brief 권한 영역의 빠른 경로도 버리는 주소에는 답하지 않는지. */
 fn acl_drop_withholds_authoritative_wire_answers() {
     let zone_text = "$ORIGIN fast.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.9\n";
     let mut zones = onetdns_authority::ZoneStore::new();
@@ -4582,7 +4378,6 @@ fn acl_drop_withholds_authoritative_wire_answers() {
 }
 
 #[test]
-/** @brief 영역 전송도 버리는 주소에는 거부 응답 없이 아무것도 보내지 않는지. */
 fn acl_drop_withholds_zone_transfers() {
     let mut srv = server("").with_xfr(big_zone_store(10), vec!["127.0.0.0/8".parse().unwrap()]);
     srv.acl = dropping_loopback();
@@ -4617,12 +4412,9 @@ fn acl_drop_withholds_zone_transfers() {
 }
 
 #[test]
-/**
- * @brief 목록 밖 버림을 켜면 어느 규칙에도 걸리지 않은 클라이언트에게 아무것도 보내지 않는지.
- * @details 거부 목록에 든 클라이언트는 운영자가 거부를 고른 대상이라 계속 REFUSED 를 받아야
- *          한다. UPDATE 와 파싱하지 못한 질의의 FORMERR 는 일반 질의와 다른 자리에서 나가므로
- *          함께 본다.
- */
+/// Clients on the deny list were chosen for refusal by the operator and keep getting REFUSED.
+/// UPDATE and the FORMERR for unparsable queries go out elsewhere than ordinary queries, so both
+/// are covered.
 fn acl_unlisted_drop_answers_nothing_outside_the_allow_list() {
     let acl = |allow: &str, deny: &str, drop_unlisted: bool| {
         Arc::new(
@@ -4658,7 +4450,7 @@ fn acl_unlisted_drop_answers_nothing_outside_the_allow_list() {
         s.handle(&update, &ctx()).is_none(),
         "규칙에 없는 클라이언트의 UPDATE 에 답했습니다"
     );
-    /* 질문 하나를 적어 놓고 둘이라고 말하는 헤더. 파서가 거부한다. */
+    // The header claims two questions but holds one, so the parser rejects it.
     let mut packet = vec![0u8; 12];
     packet[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
     packet[4..6].copy_from_slice(&2u16.to_be_bytes());
@@ -4683,12 +4475,9 @@ fn acl_unlisted_drop_answers_nothing_outside_the_allow_list() {
 }
 
 #[test]
-/**
- * @brief ID 규칙이 있으면 목록 밖 버림을 ID 를 본 뒤에 하고, 그보다 먼저 나가는 응답도 막는지.
- * @details 이때 주소만 보는 판정은 버리지 못한다. 핸드셰이크 전에 버리면 허용된 ID 를 가진
- *          클라이언트까지 끊긴다. 그래서 질의를 읽은 뒤의 관문이 ID 까지 보고 버려야 한다.
- *          TSIG 오류는 입장 단계보다 먼저 나가므로 그 관문이 주소만 보면 새어 나간다.
- */
+/// With ID rules, the address alone cannot decide a drop, since dropping before the handshake would
+/// also cut off clients with allowed IDs; the gate after the query is read drops by ID. TSIG errors
+/// go out before admission, so they are covered too.
 fn acl_unlisted_drop_with_client_ids_checks_the_id_before_any_answer() {
     use onetdns_dnssec::tsig;
 
@@ -4742,7 +4531,6 @@ fn acl_unlisted_drop_with_client_ids_checks_the_id_before_any_answer() {
     assert_eq!(answered.header.rcode, ResponseCode::NoError.0);
 }
 
-/** @brief 질의 기록을 켠 테스트용 기록기와 그 기록을 읽는 쪽. */
 fn querylog_recorder() -> (onetdns_control::Recorder, onetdns_control::Stats) {
     onetdns_control::channel(
         64,
@@ -4758,7 +4546,7 @@ fn querylog_recorder() -> (onetdns_control::Recorder, onetdns_control::Stats) {
     )
 }
 
-/** @brief 이 이름의 질의 기록이 나타날 때까지 기다린다. 기록은 다른 스레드가 모은다. */
+/// Events are collected on another thread.
 fn wait_for_event(stats: &onetdns_control::Stats, name: &str) -> onetdns_control::QueryEvent {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -4775,11 +4563,9 @@ fn wait_for_event(stats: &onetdns_control::Stats, name: &str) -> onetdns_control
 }
 
 #[test]
-/**
- * @brief NORESPONSE 규칙에 걸린 이름에 아무것도 답하지 않고, 질의 기록에는 차단으로 남기는지.
- * @details 같은 이름에 일반 차단 규칙을 걸면 답이 나가야 응답이 없는 까닭이 규칙임이 드러난다.
- *          기록의 응답 코드가 차단 응답의 코드면 운영자는 클라이언트가 그 답을 받았다고 믿는다.
- */
+/// The same name under an ordinary block rule must get an answer, which shows the silence comes
+/// from the rule. A log entry with the block response's code would make the operator believe the
+/// client received that answer.
 fn filter_noresponse_answers_nothing_and_logs_the_drop() {
     let blocked = server("||quiet.test^\n")
         .handle(&q("quiet.test"), &ctx())
@@ -4809,11 +4595,7 @@ fn filter_noresponse_answers_nothing_and_logs_the_drop() {
 }
 
 #[test]
-/**
- * @brief 별칭이 NORESPONSE 이름을 가리키면 원래 질의에도 답하지 않는지.
- * @details 별칭을 거쳤다고 답을 보내면, 답하지 않기로 한 이름에 대한 답을 별칭 하나로 받아 낼
- *          수 있다.
- */
+/// Answering after the alias would let one alias extract an answer for a name meant to get none.
 fn cname_to_a_noresponse_name_answers_nothing() {
     let with_rules = |rules: &str| {
         NativeServer::new(
@@ -4845,11 +4627,8 @@ fn cname_to_a_noresponse_name_answers_nothing() {
 }
 
 #[test]
-/**
- * @brief 답을 담아 둔 이름에 NORESPONSE 를 걸면 wire 고속 경로가 그 답을 내보내지 않는지.
- * @details 규칙을 건 뒤에도 고속 경로가 답하면, 담아 둔 답이 만료될 때까지 숨기려던 이름에
- *          답한다. 고속 경로가 보통 경로로 넘기든 직접 버리든 아무것도 보내지 않으면 된다.
- */
+/// If the fast path kept answering, the hidden name would be answered until the stored answer
+/// expires. Falling back or dropping are both fine, as long as nothing goes out.
 fn wire_fast_path_stops_answering_a_cached_name_that_gets_noresponse() {
     use onetdns_runtime::WireDisposition;
 
@@ -4883,7 +4662,6 @@ fn wire_fast_path_stops_answering_a_cached_name_that_gets_noresponse() {
 }
 
 #[test]
-/** @brief IPv6 답을 끄면 없다가 아니라 비어 있다고 답하는지. */
 fn block_aaaa_returns_nodata() {
     let s = server("");
     update_features(&s, |features| features.block_aaaa = true);
@@ -4901,9 +4679,7 @@ fn block_aaaa_returns_nodata() {
 }
 
 #[test]
-/** @brief 응답 쪽 정책이 최종 답을 막을 수 있는지. */
 fn response_hook_verdict_blocks_final_answer() {
-    /** @brief 테스트용 정책 플러그인. */
     const HOOK_WAT: &str = r#"
         (module
           (memory (export "memory") 1)
@@ -4951,7 +4727,6 @@ fn response_hook_verdict_blocks_final_answer() {
 }
 
 #[test]
-/** @brief 내부망 주소가 답에서 빠지는지. */
 fn rebind_protection_strips_private() {
     let s = server("");
     update_features(&s, |features| features.rebind_protection = true);
@@ -4960,7 +4735,6 @@ fn rebind_protection_strips_private() {
 }
 
 #[test]
-/** @brief 주소 때문에 막은 답이 차단 수명을 쓰는지. */
 fn response_address_blocks_use_blocked_response_ttl() {
     let bogus = server("");
     bogus.block_ttl.store(73, Ordering::Release);
@@ -4983,7 +4757,6 @@ fn response_address_blocks_use_blocked_response_ttl() {
 
 #[cfg(unix)]
 #[test]
-/** @brief 리액터 경로가 버리는 주소의 질의를 맡지 않고 보통 경로로 넘기는지. */
 fn reactor_lane_defers_dropped_clients_to_sync_path() {
     let (backend, cache) = lane_backend_and_cache();
     let recursor = Arc::new(
@@ -5018,11 +4791,10 @@ fn reactor_lane_defers_dropped_clients_to_sync_path() {
 
 #[cfg(unix)]
 #[test]
-/** @brief 대기 클라이언트가 상한에 차면 더 받지 않고 보통 경로로 넘기는지. */
 fn reactor_lane_caps_pending_clients() {
     use onetdns_runtime::ReactorDisposition;
 
-    /* 스레드 로컬 레인은 앞 테스트의 찌꺼기를 남길 수 있으니 비우고 시작한다. */
+    // The thread-local lane may hold leftovers from an earlier test.
     crate::native::lane::LANE.with(|slot| *slot.borrow_mut() = None);
 
     let (backend, cache) = lane_backend_and_cache();
@@ -5054,10 +4826,8 @@ fn reactor_lane_caps_pending_clients() {
         server.reactor_submit(&packet, &ctx(), &mut out, std::time::Instant::now())
     };
 
-    /*
-     * 같은 이름을 반복 제출하면 첫 건은 슬롯, 나머지는 singleflight 로 follower 가 되어 아직
-     * 펌프하지 않은 동안 모두 대기 맵에 쌓인다. 상한까지는 레인이 받아 준다.
-     */
+    // Repeated submits of one name take one slot, and the rest become singleflight followers that
+    // pile up in the pending map while nothing pumps. The lane accepts them up to the cap.
     for _ in 0..crate::native::lane::MAX_LANE_PENDING {
         assert_eq!(submit(), ReactorDisposition::Submitted);
     }
@@ -5069,7 +4839,6 @@ fn reactor_lane_caps_pending_clients() {
         );
     });
 
-    /* 상한을 넘는 질의는 레인이 맡지 않고 보통 경로로 넘긴다. */
     assert_eq!(submit(), ReactorDisposition::Fallback);
     crate::native::lane::LANE.with(|slot| {
         assert_eq!(
@@ -5079,17 +4848,14 @@ fn reactor_lane_caps_pending_clients() {
         );
     });
 
-    /* 1024개를 남겨 두면 뒤 테스트의 레인을 막으므로 비운다. */
+    // Leaving 1024 behind would block the lane in later tests.
     crate::native::lane::LANE.with(|slot| *slot.borrow_mut() = None);
 }
 
 #[cfg(unix)]
 #[test]
-/**
- * @brief 레인 조건이 닫혔거나 레인이 처리하지 않는 차단 규칙이 있으면 보통 경로로 넘기는지.
- * @details 안 넘기면 그 기능이 없는 것처럼 답이 나간다. 어느 설정이 조건을 닫는지는 설정 키
- *          표의 테스트가 본다.
- */
+/// Otherwise answers would go out as if the feature did not exist. Which settings close the gate is
+/// checked by the config key table tests.
 fn reactor_lane_defers_closed_gate_and_ns_rpz_to_sync_path() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -5149,7 +4915,6 @@ fn reactor_lane_defers_closed_gate_and_ns_rpz_to_sync_path() {
 
 #[cfg(unix)]
 #[test]
-/** @brief DDR을 켠 재귀 레인이 특수 이름만 체인에 양보하고 일반 콜드미스는 계속 맡는지. */
 fn ddr_only_preempts_its_owner_in_the_reactor_lane() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -5186,7 +4951,6 @@ fn ddr_only_preempts_its_owner_in_the_reactor_lane() {
 
 #[cfg(unix)]
 #[test]
-/** @brief lenient 쿠키의 무쿠키 콜드미스만 리액터가 맡고 COOKIE 질의는 발급 경로로 넘기는지. */
 fn lenient_cookie_keeps_plain_reactor_and_defers_cookie_requests() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -5238,14 +5002,11 @@ fn lenient_cookie_keeps_plain_reactor_and_defers_cookie_requests() {
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인에서 일반 경로로 넘어가도 제한을 두 번 세지 않는지. */
 fn reactor_submit_charges_rate_limit_once_across_fallback() {
     use onetdns_runtime::ReactorDisposition;
 
-    /** @brief 호출 수를 세는 테스트용 제한기. */
     struct CountingLimiter(AtomicUsize);
     impl RateLimiter for CountingLimiter {
-        /** @brief 세고 통과시킨다. */
         fn check(&self, _client: &ClientInfo) -> RateDecision {
             self.0.fetch_add(1, Ordering::Relaxed);
             RateDecision::Permit
@@ -5316,7 +5077,6 @@ fn reactor_submit_charges_rate_limit_once_across_fallback() {
 }
 
 #[cfg(unix)]
-/** @brief 두 경로 비교에 쓸 테스트용 권한 서버. */
 fn spawn_parity_authority() -> std::net::SocketAddr {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("mock bind");
     let addr = sock.local_addr().unwrap();
@@ -5409,7 +5169,6 @@ fn spawn_parity_authority() -> std::net::SocketAddr {
 }
 
 #[cfg(unix)]
-/** @brief 기록을 남기는 테스트용 핸들러. */
 fn parity_server_recording(
     authority: std::net::SocketAddr,
     with_lane: bool,
@@ -5431,13 +5190,11 @@ fn parity_server_recording(
 }
 
 #[cfg(unix)]
-/** @brief 레인을 켜거나 끈 테스트용 핸들러. */
 fn parity_server(authority: std::net::SocketAddr, with_lane: bool) -> NativeServer {
     parity_server_with(authority, with_lane, None)
 }
 
 #[cfg(unix)]
-/** @brief 설정을 지정한 테스트용 핸들러. */
 fn parity_server_with(
     authority: std::net::SocketAddr,
     with_lane: bool,
@@ -5473,7 +5230,6 @@ fn parity_server_with(
 }
 
 #[cfg(unix)]
-/** @brief 레인으로 답 하나를 받는다. */
 fn lane_answer(server: &NativeServer, request: &Message) -> Message {
     use onetdns_runtime::ReactorDisposition;
     let packet = request.try_encode().expect("질의 인코딩");
@@ -5502,7 +5258,6 @@ fn lane_answer(server: &NativeServer, request: &Message) -> Message {
     Message::parse(&out[0].1).expect("레인 응답 파싱")
 }
 
-/** @brief 기록들을 비교할 문자열 목록으로. */
 fn record_keys(records: &[ApRecord]) -> Vec<String> {
     let mut keys: Vec<String> = records
         .iter()
@@ -5522,7 +5277,7 @@ fn record_keys(records: &[ApRecord]) -> Vec<String> {
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인의 답이 보통 경로와 같은지. 다르면 어느 경로로 갔느냐에 따라 답이 갈린다. */
+/// Otherwise answers would depend on which path took the query.
 fn reactor_lane_answers_match_the_sync_path() {
     let authority = spawn_parity_authority();
     for (name, qtype) in [
@@ -5591,7 +5346,6 @@ fn reactor_lane_answers_match_the_sync_path() {
 }
 
 #[cfg(unix)]
-/** @brief 최근 기록을 가져간다. */
 fn drain_recent(stats: &onetdns_control::Stats) -> Vec<onetdns_control::QueryEvent> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
@@ -5605,7 +5359,6 @@ fn drain_recent(stats: &onetdns_control::Stats) -> Vec<onetdns_control::QueryEve
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인도 보통 경로와 같은 기록을 남기는지. */
 fn reactor_lane_records_query_events_like_the_sync_path() {
     let authority = spawn_parity_authority();
 
@@ -5676,7 +5429,6 @@ fn reactor_lane_records_query_events_like_the_sync_path() {
 }
 
 #[cfg(unix)]
-/** @brief 레인 테스트에 쓸 체인과 캐시. */
 fn lane_backend_and_cache() -> (Arc<dyn Resolver>, crate::cache::CacheHandle) {
     let layer = crate::cache::CacheLayer::new(Arc::new(FixedAnswer), 64, 1, 0, 86_400, 0, 86_400);
     let handle = layer.handle();
@@ -5684,7 +5436,6 @@ fn lane_backend_and_cache() -> (Arc<dyn Resolver>, crate::cache::CacheHandle) {
 }
 
 #[cfg(unix)]
-/** @brief 언제나 잘린 응답을 내는 테스트용 권한 서버. */
 fn spawn_truncating_authority() -> std::net::SocketAddr {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("mock bind");
     let addr = sock.local_addr().unwrap();
@@ -5713,7 +5464,6 @@ fn spawn_truncating_authority() -> std::net::SocketAddr {
 }
 
 #[cfg(unix)]
-/** @brief 일부만 잘린 응답을 내는 테스트용 권한 서버. */
 fn spawn_mixed_truncating_authority() -> std::net::SocketAddr {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("mock bind");
     let addr = sock.local_addr().unwrap();
@@ -5742,12 +5492,10 @@ fn spawn_mixed_truncating_authority() -> std::net::SocketAddr {
 }
 
 #[cfg(unix)]
-/** @brief 느리게 답하는 테스트용 체인. */
 struct SlowAnswer(std::time::Duration);
 
 #[cfg(unix)]
 impl Resolver for SlowAnswer {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         std::thread::sleep(self.0);
         let mut response = base_response(request);
@@ -5764,11 +5512,10 @@ impl Resolver for SlowAnswer {
 #[cfg(unix)]
 #[test]
 #[ignore = "꼬리 지연 프로브: cargo test -p onetdns --release -- --ignored --nocapture"]
-/** @brief 다시 묻는 하나가 뒤의 질의를 막지 않는지. */
+/// One retried query must not delay those behind it.
 fn probe_lane_retry_fallback_head_of_line_delay() {
     use onetdns_runtime::ReactorDisposition;
 
-    /** @brief 대체 경로로 넘어가기까지 기다릴 시간. */
     const FALLBACK: std::time::Duration = std::time::Duration::from_millis(400);
     let authority = spawn_mixed_truncating_authority();
     let recursor = Arc::new(
@@ -5847,7 +5594,7 @@ fn probe_lane_retry_fallback_head_of_line_delay() {
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인이 다시 물어야 할 것을 보통 체인이 마저 푸는지. 안 풀면 그 질의만 오류가 된다. */
+/// Otherwise only that query would fail.
 fn reactor_lane_retry_is_resolved_by_the_sync_chain_not_servfail() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -5911,22 +5658,16 @@ fn reactor_lane_retry_is_resolved_by_the_sync_chain_not_servfail() {
 
 #[cfg(unix)]
 #[test]
-/**
- * @brief 레인이 넘긴 질의를 동기 체인도 풀지 못하면 그 실패 사유가 그대로 나가는지.
- * @details 대체 처리 결과를 없음으로 접으면 영구 실패도 전송 실패로 보여, 클라이언트가
- *          사실과 다른 network error 사유를 받는다.
- */
+/// Folding the fallback result into None would make a permanent failure look like a transport
+/// failure, and the client would get a false network error reason.
 fn reactor_lane_fallback_failure_keeps_its_reason() {
     use onetdns_runtime::ReactorDisposition;
 
-    /** @brief 언제나 영구 실패를 내는 테스트용 체인. */
     struct PermanentFailure;
     impl Resolver for PermanentFailure {
-        /** @brief 언제나 답하지 않는다. */
         fn resolve(&self, _req: &Message) -> Option<Message> {
             None
         }
-        /** @brief 닿을 권한 서버가 없다고 알린다. */
         fn resolve_outcome(&self, _req: &Message) -> ResolveOutcome {
             ResolveOutcome::Failure(ResolveFailure::Permanent(Some(
                 onetdns_proto::ede_code::NO_REACHABLE_AUTHORITY,
@@ -5997,11 +5738,8 @@ fn reactor_lane_fallback_failure_keeps_its_reason() {
 
 #[cfg(unix)]
 #[test]
-/**
- * @brief 레인에 맡긴 뒤 캐시를 비우면 그 답을 담지 않는지.
- * @details 레인은 맡길 때의 설정으로 답을 만들고 끝난 뒤에 따로 담는다. 그 사이에 비운
- *          캐시에 담으면 비우기 전 설정의 답이 다시 들어간다.
- */
+/// The lane builds the answer under the config at submit and stores it separately afterward;
+/// storing into a cache cleared in between would bring back an answer from the old config.
 fn reactor_lane_answer_does_not_land_in_a_cache_cleared_after_submit() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -6055,7 +5793,7 @@ fn reactor_lane_answer_does_not_land_in_a_cache_cleared_after_submit() {
 }
 
 #[cfg(unix)]
-/** @brief 레인이 답을 하나라도 낼 때까지 돌리고 낸 답을 돌려준다. 5초 안에 못 내면 빈 목록이다. */
+/// Empty after 5 seconds without one.
 fn pump_lane_until_answered(server: &NativeServer) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
     let mut out = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6076,11 +5814,8 @@ fn pump_lane_until_answered(server: &NativeServer) -> Vec<(std::net::SocketAddr,
 
 #[cfg(unix)]
 #[test]
-/**
- * @brief 레인에 맡긴 뒤 설정 세대가 바뀌면 그 답이 새 세대의 wire 항목으로 나가지 않는지.
- * @details 레인은 맡길 때의 기능 세트로 답을 고른다. 끝날 때의 세트로 태그를 달면 이전
- *          조건으로 고른 답이 새 설정에서도 캐시 적중으로 나간다.
- */
+/// The lane picks the answer with the feature set at submit; tagging it with the set at completion
+/// would serve an answer chosen under old conditions as a cache hit under the new config.
 fn reactor_lane_answer_carries_the_generation_it_was_submitted_under() {
     use onetdns_runtime::{ReactorDisposition, WireDisposition};
 
@@ -6140,7 +5875,6 @@ fn reactor_lane_answer_carries_the_generation_it_was_submitted_under() {
 }
 
 #[cfg(unix)]
-/** @brief 별칭 뒤에 숨긴 답을 내는 테스트용 권한 서버. */
 fn spawn_cloaking_authority() -> std::net::SocketAddr {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("mock bind");
     let addr = sock.local_addr().unwrap();
@@ -6178,7 +5912,6 @@ fn spawn_cloaking_authority() -> std::net::SocketAddr {
 
 #[cfg(unix)]
 #[test]
-/** @brief 레인의 답에도 별칭 뒤를 들추는 검사가 걸리는지. */
 fn reactor_lane_applies_cname_uncloaking_to_resolved_answers() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -6242,11 +5975,9 @@ fn reactor_lane_applies_cname_uncloaking_to_resolved_answers() {
 
 #[cfg(unix)]
 #[test]
-/**
- * @brief 레인의 답에서 별칭 뒤에 NORESPONSE 이름이 드러나면 원래 질의에도 답하지 않는지.
- * @details 레인은 질의 이름만 보고 받아들이므로 숨은 이름은 답을 받은 뒤에야 드러난다. 응답이
- *          없다는 것만으로는 아직 처리 중인 것과 구별되지 않으므로, 끝났는지는 기록으로 본다.
- */
+/// The lane accepts by the query name alone, so the hidden name shows only in the answer. No
+/// response alone cannot be told from one still in progress, so completion is checked through the
+/// log.
 fn reactor_lane_answers_nothing_when_a_cname_target_has_noresponse() {
     use onetdns_runtime::ReactorDisposition;
 
@@ -6314,7 +6045,6 @@ fn reactor_lane_answers_nothing_when_a_cname_target_has_noresponse() {
     assert!(dropped(), "레인이 무응답 처리를 마치지 않았습니다");
 }
 
-/** @brief IPv4 답만 내는 테스트용 업스트림. */
 fn dns64_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -6355,7 +6085,6 @@ fn dns64_upstream() -> SocketAddr {
 }
 
 #[test]
-/** @brief IPv4 답으로 IPv6 답을 지어내는지. */
 fn dns64_synthesizes_aaaa() {
     let engine = onetdns_filter::build_from_str("", "", BlockResponse::NxDomain);
     let s = NativeServer::new(
@@ -6390,7 +6119,6 @@ fn dns64_synthesizes_aaaa() {
     }
 }
 
-/** @brief AAAA 에는 SERVFAIL 을, A 에는 정상 답을 주는 상류. */
 fn dns64_servfail_aaaa_upstream() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
@@ -6419,7 +6147,6 @@ fn dns64_servfail_aaaa_upstream() -> SocketAddr {
 }
 
 #[test]
-/** @brief 상류의 AAAA SERVFAIL 을 DNS64 가 정상 응답으로 둔갑시키지 않는지. */
 fn dns64_does_not_mask_servfail() {
     let engine = onetdns_filter::build_from_str("", "", BlockResponse::NxDomain);
     let s = NativeServer::new(
@@ -6455,7 +6182,6 @@ fn dns64_does_not_mask_servfail() {
 }
 
 #[test]
-/** @brief 서버 식별이 응답에 담기는지. */
 fn nsid_attached_to_response() {
     let s = server("");
     update_features(&s, |features| features.nsid = Some(b"onetdns".to_vec()));
@@ -6474,7 +6200,6 @@ fn nsid_attached_to_response() {
 }
 
 #[test]
-/** @brief 점 없는 이름과 내부망 역조회 판정. */
 fn domain_needed_and_bogus_priv_predicates() {
     assert!(is_single_label(&ApName::from_str("wpad").unwrap()));
     assert!(!is_single_label(&ApName::from_str("foo.bar").unwrap()));
@@ -6503,7 +6228,6 @@ fn domain_needed_and_bogus_priv_predicates() {
 }
 
 #[test]
-/** @brief 밖에 새 나가면 안 되는 이름을 막는지. */
 fn empty_zone_predicate_and_block() {
     assert!(is_empty_zone(&ApName::from_str("home.arpa").unwrap()));
     assert!(is_empty_zone(&ApName::from_str("foo.home.arpa").unwrap()));
@@ -6529,12 +6253,9 @@ fn empty_zone_predicate_and_block() {
 }
 
 #[test]
-/**
- * @brief 로컬에서 답해야 하는 IPv4 역방향 영역의 질의가 업스트림으로 나가지 않는지.
- * @details 100.64.0.0/10 은 영역 64개다. 그중 하나만 잡으면 나머지 주소의 역방향 조회가
- *          나간다. 영역 아래에 옥텟이 아닌 레이블이 붙은 DNS-SD 질의도 영역 안이다. 테스트
- *          업스트림은 모든 질의에 NOERROR 로 답하므로 NXDOMAIN 이면 로컬에서 끊은 것이다.
- */
+/// 100.64.0.0/10 is 64 zones; catching only one would let reverse lookups for the rest go out.
+/// DNS-SD queries with non-octet labels below a zone are inside it too. The test upstream answers
+/// NOERROR to everything, so NXDOMAIN means the local cut answered.
 fn cgnat_reverse_never_reaches_upstream() {
     let s = server_local_only(false, false, true);
     let ptr = |name: &str| Message::query(0x1234, ApName::from_str(name).unwrap(), RecordType::PTR);
@@ -6570,12 +6291,9 @@ fn cgnat_reverse_never_reaches_upstream() {
 }
 
 #[test]
-/**
- * @brief RFC 6303 의 IPv6 역방향 영역을 빈 영역으로 보는지.
- * @details 영역 이름의 니블을 손으로 적었으므로, 주소에서 역방향 이름을 따로 만들어 맞춰 본다.
- */
+/// The zone names' nibbles are written by hand, so they are checked against names built from
+/// addresses.
 fn rfc6303_ipv6_reverse_zones_are_empty_zones() {
-    /** @brief 주소를 ip6.arpa 아래 역방향 이름으로 적는다. */
     fn reverse(address: &str) -> ApName {
         let address: std::net::Ipv6Addr = address.parse().unwrap();
         let mut name = String::new();
@@ -6600,10 +6318,7 @@ fn rfc6303_ipv6_reverse_zones_are_empty_zones() {
 }
 
 #[test]
-/**
- * @brief 밖에 못 묻게 한 이름이라도 로컬이 답할 수 있으면 그 답이 먼저 나가는지.
- * @details 자기 설정으로 만든 home.arpa 영역을 자기 empty_zones 설정이 덮으면 안 된다.
- */
+/// This server's own home.arpa zone must not be overridden by its own `empty_zones` setting.
 fn local_answers_win_over_the_local_only_cut() {
     let local: Arc<dyn Resolver> = Arc::new(StaticAnswer {
         name: ApName::from_str("nas.home.arpa").unwrap(),
@@ -6641,7 +6356,7 @@ fn local_answers_win_over_the_local_only_cut() {
 }
 
 #[test]
-/** @brief 올바르지 않은 문자를 고쳐서 통과시키지 않는지. 고치면 다른 이름이 규칙에 걸린다. */
+/// Repairing would let a different name hit the rule.
 fn text_policy_name_rejects_invalid_utf8_without_repair() {
     let configured = ApName::from_str("�.Example").unwrap();
     let raw = ApName::from_labels(vec![vec![0xff], b"Example".to_vec()]).unwrap();
@@ -6654,7 +6369,6 @@ fn text_policy_name_rejects_invalid_utf8_without_repair() {
 }
 
 #[test]
-/** @brief 검증 실패가 세어지는지. */
 fn dnssec_bogus_counter_accumulates() {
     let name = onetdns_proto::Name::from_str("dnssec-failed.example").unwrap();
     let before = DNSSEC_BOGUS_TOTAL.load(Ordering::Relaxed);
@@ -6668,7 +6382,6 @@ fn dnssec_bogus_counter_accumulates() {
 }
 
 #[test]
-/** @brief 점 없는 이름을 밖에 묻지 않는지. */
 fn domain_needed_blocks_dotless_forward() {
     let s = server_local_only(true, false, false);
     let resp = s.handle(&q("wpad"), &ctx()).unwrap();
@@ -6681,7 +6394,6 @@ fn domain_needed_blocks_dotless_forward() {
 }
 
 #[test]
-/** @brief 지나치게 큰 질의를 버리는지. */
 fn harden_large_queries_drops_oversized() {
     let s = server("");
     update_features(&s, |features| features.harden_large_queries = true);

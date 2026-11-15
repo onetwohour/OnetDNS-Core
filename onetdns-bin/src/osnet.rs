@@ -1,19 +1,15 @@
-/*!
- * @brief 운영체제의 DNS 설정과 방화벽 조작.
- *
- * @details 대시보드에서 이 기계의 DNS를 이 서버로 돌리고 되돌리는 기능이다. 플랫폼마다
- *          방법이 달라 각각 구현한다.
- * @warning 바꾸기 전에 원래 값을 백업하고, 백업에는 어느 어댑터의 것인지 함께 적는다.
- *          적지 않으면 다른 어댑터의 백업으로 복원해 망을 끊는다.
- * @note 외부 명령을 부를 때 경로와 환경을 고정한다. 고정하지 않으면 경로에 심어 둔 가짜
- *       실행 파일이 이 서버의 권한으로 돌아간다.
- */
+//! OS DNS settings and firewall rules, so the dashboard can point this machine's DNS at this server
+//! and back. Each platform has its own implementation.
+//!
+//! The original values are backed up first, together with the adapter they belong to; restoring
+//! another adapter's backup would cut the network. External commands run with a fixed path and
+//! environment, or a fake executable planted in PATH would run with this server's privileges.
 
 use std::path::Path;
 
-/* 이 모듈의 실제 구현은 windows 와 linux 뿐이고, 나머지 플랫폼은 지원하지 않는다는
- * 오류만 돌려준다. 그래서 구현에서만 쓰는 이름은 같은 조건으로 들여와야 한다. 백업
- * 관련 이름은 시험이 직접 부르므로 test 도 함께 연다. */
+// Only Windows and Linux are implemented; elsewhere every call returns an unsupported error.
+// Imports used only by the implementations share their cfg, plus test, since tests call the backup
+// helpers.
 #[cfg(any(test, windows, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 #[cfg(any(test, windows, target_os = "linux"))]
@@ -22,11 +18,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/** @brief 읽어들일 시스템 파일 크기 상한. */
 const MAX_OS_NETWORK_FILE: u64 = 1024 * 1024;
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/** @brief 크기 상한을 걸어 파일을 읽는다. */
 fn read_text_limited(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
 
@@ -39,15 +33,11 @@ fn read_text_limited(path: &Path) -> std::io::Result<String> {
     String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData.into())
 }
 
-/** @brief 네트워크 어댑터 하나와 거기 설정된 DNS. */
 pub struct Adapter {
-    /** @brief 어댑터 이름. */
     pub name: String,
-    /** @brief 이 어댑터에 설정된 DNS 서버. */
     pub dns: Vec<String>,
 }
 
-/** @brief 지금 플랫폼 이름. */
 pub fn platform() -> &'static str {
     if cfg!(windows) {
         "windows"
@@ -59,11 +49,8 @@ pub fn platform() -> &'static str {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/**
- * @brief 시스템 도구의 전체 경로를 찾는다.
- * @warning 정해진 시스템 디렉터리에서만 찾는다. 경로 환경 변수를 따르면 앞자리에 놓인
- *          가짜 실행 파일이 이 서버의 권한으로 돌아간다.
- */
+/// Searches fixed system directories only; following PATH would let a fake executable placed
+/// earlier run with this server's privileges.
 pub(crate) fn resolve_tool(name: &str) -> Option<std::ffi::OsString> {
     #[cfg(target_os = "linux")]
     {
@@ -89,11 +76,8 @@ pub(crate) fn resolve_tool(name: &str) -> Option<std::ffi::OsString> {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/**
- * @brief 자식 프로세스의 환경을 고정한다.
- * @warning 미리 로드 변수와 라이브러리 경로를 지운다. 남겨 두면 이 서버가 부른 시스템
- *          도구에 남의 코드가 담긴다.
- */
+/// Clears preload variables and library paths, which would otherwise load foreign code into the
+/// system tools this server runs.
 pub(crate) fn harden_child_env(command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
@@ -129,11 +113,9 @@ pub(crate) fn harden_child_env(command: &mut Command) {
 }
 
 #[cfg(windows)]
-/** @brief 시스템 디렉터리 경로. */
 fn windows_system_directory() -> Option<PathBuf> {
     #[link(name = "kernel32")]
     extern "system" {
-        /** @brief 시스템 디렉터리 경로를 가져온다. */
         fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
     }
 
@@ -146,7 +128,6 @@ fn windows_system_directory() -> Option<PathBuf> {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/** @brief 시스템 도구를 부르고 출력을 받는다. 실패하면 사유를 담아 돌려준다. */
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let Some(exe) = resolve_tool(cmd) else {
         return Err(format!(
@@ -159,7 +140,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        /** @brief 창 없이 실행한다. 서비스로 돌 때 창이 뜨면 안 된다. */
+        /// No console window when running as a service.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
@@ -180,7 +161,6 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 이 도구가 쓸 수 있는지. */
 fn have(cmd: &str) -> bool {
     let Some(exe) = resolve_tool(cmd) else {
         return false;
@@ -195,11 +175,8 @@ fn have(cmd: &str) -> bool {
 }
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/**
- * @brief 이 어댑터의 백업 파일 경로.
- * @warning 이름에서 못 쓰는 문자를 바꾸면 서로 다른 어댑터가 같은 이름이 된다. 그래서
- *          원래 이름의 요약값을 뒤에 붙인다.
- */
+/// Replacing unusable characters can map different adapters to one name, so a hash of the original
+/// name is appended.
 fn backup_file(dir: &Path, adapter: &str) -> PathBuf {
     let mut safe: String = adapter
         .chars()
@@ -218,7 +195,6 @@ fn backup_file(dir: &Path, adapter: &str) -> PathBuf {
 }
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/** @brief 백업 안에 적을 어댑터 식별자. */
 fn backup_adapter_id(adapter: &str) -> String {
     adapter
         .as_bytes()
@@ -228,7 +204,6 @@ fn backup_adapter_id(adapter: &str) -> String {
 }
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/** @brief 어댑터 식별자를 앞에 붙인 백업 내용. */
 fn backup_blob(adapter: &str, data: &[u8]) -> Vec<u8> {
     let mut out = format!("ONETDNS-DNS-BACKUP\n{}\n", backup_adapter_id(adapter)).into_bytes();
     out.extend_from_slice(data);
@@ -236,11 +211,8 @@ fn backup_blob(adapter: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(any(test, windows, target_os = "linux"))]
-/**
- * @brief 백업을 읽는다.
- * @warning 안에 적힌 어댑터가 요청한 것과 같아야 한다. 다르면 남의 설정으로 복원해
- *          망을 끊는다.
- */
+/// The adapter recorded inside must match the requested one; restoring another adapter's settings
+/// would cut the network.
 fn read_backup(path: &Path, adapter: &str) -> Result<String, String> {
     let text = read_text_limited(path)
         .map_err(|error| format!("Could not read the DNS backup file to restore: {error}"))?;
@@ -257,7 +229,7 @@ fn read_backup(path: &Path, adapter: &str) -> Result<String, String> {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/** @brief 백업을 원자적으로 교체해 기록한다. 중간에 끊겨도 반쪽 파일이 남지 않는다. */
+/// Replaced atomically, so an interruption leaves no partial file.
 fn write_backup_atomic(path: &Path, adapter: &str, data: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)
@@ -268,7 +240,7 @@ fn write_backup_atomic(path: &Path, adapter: &str, data: &[u8]) -> Result<(), St
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/** @brief 백업이 없을 때만 만든다. 이미 있으면 원래 값을 덮지 않는다. */
+/// Only when none exists, so the original values are never overwritten.
 fn ensure_backup(path: &Path, adapter: &str, data: &[u8]) -> Result<(), String> {
     if path.exists() {
         return Ok(());
@@ -277,13 +249,11 @@ fn ensure_backup(path: &Path, adapter: &str, data: &[u8]) -> Result<(), String> 
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-/** @brief 올바른 IP 주소 표기인지. */
 fn valid_ip(s: &str) -> bool {
     s.parse::<std::net::IpAddr>().is_ok()
 }
 
 #[cfg(windows)]
-/** @brief 어댑터와 각각의 DNS 설정 목록. */
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
     let nonce = u64::from_le_bytes(onetdns_core::try_random_array::<8>().map_err(|error| {
         format!("Could not get random bytes for the adapter temporary file: {error}")
@@ -307,7 +277,8 @@ pub fn list_adapters() -> Result<Vec<Adapter>, String> {
 }
 
 #[cfg(windows)]
-/** @brief 깨진 글자를 되살린다. 도구 출력의 인코딩이 어긋날 때가 있다. */
+/// Re-decodes text that arrived as Latin-1 but was UTF-8; tool output sometimes comes in the wrong
+/// encoding.
 fn fix_mojibake(s: &str) -> String {
     if s.is_empty() || s.chars().any(|c| (c as u32) > 0xFF) {
         return s.to_string();
@@ -320,7 +291,6 @@ fn fix_mojibake(s: &str) -> String {
 }
 
 #[cfg(windows)]
-/** @brief 도구가 내놓은 JSON에서 어댑터 목록을 읽는다. */
 fn parse_windows_adapters(json: &str) -> Result<Vec<Adapter>, String> {
     use onetdns_core::json::Json;
     let parsed = onetdns_core::json::parse(json.trim_start_matches('\u{feff}').trim())
@@ -353,7 +323,6 @@ fn parse_windows_adapters(json: &str) -> Result<Vec<Adapter>, String> {
 }
 
 #[cfg(windows)]
-/** @brief 이 어댑터에 지금 설정된 DNS. */
 fn windows_current_dns(adapter: &str) -> Vec<String> {
     list_adapters()
         .ok()
@@ -362,11 +331,7 @@ fn windows_current_dns(adapter: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-/**
- * @brief 이 어댑터 이름을 그대로 명령에 넘겨도 되는지.
- * @warning 실제로 있는 어댑터만 받아들인다. 확인 없이 넘기면 이름 인자에 끼워 넣은
- *          문자열이 명령 인자가 된다.
- */
+/// Only existing adapters are accepted; an unchecked name could smuggle extra command arguments.
 fn validate_windows_adapter(adapter: &str) -> Result<(), String> {
     if adapter.is_empty() || adapter.chars().count() > 256 || adapter.chars().any(char::is_control)
     {
@@ -379,7 +344,6 @@ fn validate_windows_adapter(adapter: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-/** @brief 이 어댑터의 DNS를 지정한 목록으로 바꾼다. */
 fn windows_apply_dns(adapter: &str, servers: &[String]) -> Result<(), String> {
     if servers.is_empty() || servers.iter().any(|server| !valid_ip(server)) {
         return Err("Enter at least one DNS server address as a valid IP address".to_string());
@@ -415,10 +379,7 @@ fn windows_apply_dns(adapter: &str, servers: &[String]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-/**
- * @brief 시스템 DNS를 이 서버로 돌린다.
- * @details 바꾸기 전에 원래 값을 백업한다. 되돌릴 수 없으면 바꾸지 않는다.
- */
+/// Backs up the original first; nothing changes without a backup to restore from.
 pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(), String> {
     validate_windows_adapter(adapter)?;
     if servers.is_empty() || servers.iter().any(|server| !valid_ip(server)) {
@@ -443,7 +404,6 @@ pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(
 }
 
 #[cfg(windows)]
-/** @brief 백업해 둔 원래 DNS로 되돌린다. */
 pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
     validate_windows_adapter(adapter)?;
     let path = backup_file(backup_dir, adapter);
@@ -476,7 +436,6 @@ pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-/** @brief 이 포트를 방화벽에서 연다. */
 pub fn firewall_allow(udp: bool, tcp: bool, port: u16) -> Result<(), String> {
     let _ = firewall_remove(port);
     if udp {
@@ -515,7 +474,6 @@ pub fn firewall_allow(udp: bool, tcp: bool, port: u16) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-/** @brief 이 서버가 넣은 방화벽 규칙을 지운다. */
 pub fn firewall_remove(port: u16) -> Result<(), String> {
     let _ = run(
         "netsh",
@@ -541,7 +499,6 @@ pub fn firewall_remove(port: u16) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 시스템 해석 설정에 적힌 DNS. */
 fn resolv_conf_dns() -> Vec<String> {
     read_text_limited(Path::new("/etc/resolv.conf"))
         .unwrap_or_default()
@@ -553,7 +510,6 @@ fn resolv_conf_dns() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 어댑터와 각각의 DNS 설정 목록. */
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
     let dns = resolv_conf_dns();
     let mut out = Vec::new();
@@ -578,11 +534,8 @@ pub fn list_adapters() -> Result<Vec<Adapter>, String> {
 }
 
 #[cfg(target_os = "linux")]
-/**
- * @brief 시스템 DNS를 이 서버로 돌린다.
- * @details 관리 도구가 있으면 그것을 쓰고, 없으면 해석 설정 파일을 직접 고친다. 어느
- *          쪽을 썼는지 백업에 남겨야 되돌릴 때 같은 방법을 쓴다.
- */
+/// Uses the system's DNS management tool when present, and edits the resolver config file
+/// otherwise. The backup records which, so the restore uses the same method.
 pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(), String> {
     if servers.iter().any(|s| !valid_ip(s)) {
         return Err("Invalid DNS server address".to_string());
@@ -617,7 +570,6 @@ pub fn set_dns(adapter: &str, servers: &[String], backup_dir: &Path) -> Result<(
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 백업해 둔 원래 DNS로 되돌린다. */
 pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
     let marker = backup_file(backup_dir, adapter);
     if adapter != "system" && read_backup(&marker, adapter).ok().as_deref() == Some("resolvectl") {
@@ -638,7 +590,6 @@ pub fn restore_dns(adapter: &str, backup_dir: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 이 포트를 방화벽에서 연다. */
 pub fn firewall_allow(udp: bool, tcp: bool, port: u16) -> Result<(), String> {
     let p = port.to_string();
     if have("ufw") {
@@ -670,7 +621,6 @@ pub fn firewall_allow(udp: bool, tcp: bool, port: u16) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 이 서버가 넣은 방화벽 규칙을 지운다. */
 pub fn firewall_remove(port: u16) -> Result<(), String> {
     let p = port.to_string();
     if have("ufw") {
@@ -693,42 +643,36 @@ pub fn firewall_remove(port: u16) -> Result<(), String> {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-/** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn list_adapters() -> Result<Vec<Adapter>, String> {
     Err("Listing network adapters is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-/** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn set_dns(_adapter: &str, _servers: &[String], _backup_dir: &Path) -> Result<(), String> {
     Err("Changing the system DNS settings is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-/** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn restore_dns(_adapter: &str, _backup_dir: &Path) -> Result<(), String> {
     Err("Restoring the system DNS settings is not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-/** @brief 이 플랫폼에서는 지원하지 않는다. */
 pub fn firewall_allow(_udp: bool, _tcp: bool, _port: u16) -> Result<(), String> {
     Err("Firewall settings are not supported on this platform".to_string())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-/** @brief 이 플랫폼에서는 할 일이 없다. */
 pub fn firewall_remove(_port: u16) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(test)]
-/** @brief 백업 이름이 겹치지 않고, 백업이 원래 어댑터에 묶이는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 못 쓰는 문자를 바꾼 뒤에도 이름이 겹치지 않는지. 겹치면 남의 설정으로 복원한다. */
+    /// A collision would restore another adapter's settings.
     fn backup_names_do_not_collide_after_sanitizing_adapter_names() {
         let dir = Path::new("backup");
         assert_ne!(
@@ -738,7 +682,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 어댑터의 백업으로 복원되지 않는지. */
     fn backup_payload_is_bound_to_the_original_adapter() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-osnet-backup-{}-{:016x}",

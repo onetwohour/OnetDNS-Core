@@ -1,11 +1,6 @@
-/*!
- * @brief TLS 인증서 재료 준비: PEM 입출력과 자체 서명 생성.
- *
- * @warning 이름과 달리 리스너를 열지 않는다. 실제 전송 처리는 onetdns-bin의 각
- *          핸들러와 onetdns-tls에 있다. 여기는 인증서·키를 다루는 보조 크레이트다.
- */
+//! Certificate and key helpers: PEM input and output, and self-signed certificates. Despite the
+//! crate name it opens no listeners; the transports live in onetdns-bin and onetdns-tls.
 
-/** @brief 인증서와 키를 다루는 보조 도구. */
 pub mod tls;
 
 pub use tls::{

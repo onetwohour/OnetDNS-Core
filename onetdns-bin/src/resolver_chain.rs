@@ -1,10 +1,9 @@
-/*!
- * @brief 설정에서 해석 체인을 조립한다.
- *
- * @details 설정에서 먼저 ChainPlan 을 만들고, 체인은 이 계획만 읽어서 조립한다. 설정이
- *          바뀌면 이전 계획과 새 계획을 비교해 다를 때만 새 체인을 만들어 슬롯에 교체하고,
- *          소켓과 스레드는 그대로 둔다. 계층을 쌓는 순서와 그 이유는 layer-order 문서가 정한다.
- */
+//! Assembles the resolution chain from the config. A `ChainPlan` is built from the config first,
+//! and the chain is assembled from the plan alone. On a config change the old and new plans are
+//! compared, and only when they differ is a new chain built and swapped into the slot; sockets and
+//! threads stay.
+//!
+//! The layer order and its reasons are in the layer-order document.
 
 use super::*;
 use crate::edge::EdgeServices;
@@ -14,28 +13,22 @@ use crate::recursion::{
     recursor_roots, spawn_rfc5011, spawn_ta_signaling,
 };
 
-/**
- * @brief 해석 체인을 조립하는 데 필요한 설정 값.
- *
- * @details 체인 조립 함수는 Config 대신 이 값만 받는다. 따라서 체인에 영향을 주는 설정은
- *          모두 이 구조체에 들어 있고, 두 계획이 같으면 체인을 다시 만들어도 결과가 같다.
- *          설정을 교체할 때 이전 계획과 새 계획을 비교해 체인을 다시 만들지 정한다.
- *
- *          쓰지 않는 구성 요소의 값은 담지 않는다. 재귀를 쓰지 않고 예비 업스트림과 스텁 영역도
- *          없으면 질의 제한 시간이 빠지므로, 그 값만 바꾼 설정은 체인과 캐시를 건드리지 않는다.
- *          조립 함수도 빠진 값을 읽을 수 없다.
- * @invariant 조립 함수가 읽는 값은 모두 이 구조체에서 나온다. 설정을 직접 읽으면 그 값이
- *            바뀌어도 체인을 다시 만들지 않아 이전 값으로 답한다.
- */
+/// Config values the chain assembly needs; assembly takes this instead of `Config`, so every
+/// setting that affects the chain lives here, and equal plans build equal chains. A config swap
+/// compares the old and new plans to decide whether to rebuild.
+///
+/// Values of unused components are left out: with no recursion, fallback upstreams, or stub zones,
+/// the query timeout is absent, so changing only it touches neither the chain nor the cache, and
+/// assembly cannot read it either.
+///
+/// Everything assembly reads comes from this struct. Reading the config directly would leave the
+/// chain answering with the old value after that value changes.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChainPlan {
     base: BasePlan,
     fallback: Option<ForwarderPlan>,
-    /**
-     * @brief 업스트림이 전달한 답을 검증할 때의 방침.
-     * @details dnssec 을 켜면 처리 방식과 상관없이 담는다. 클라이언트 경로는 재귀 방식에서도
-     *          업스트림에 전달하기 때문이다. 어느 체인에 검증 계층을 얹을지는 ChainBase 가 정한다.
-     */
+    /// Present whenever dnssec is on, regardless of backend, since client routes forward upstream
+    /// even under recursion. `ChainBase` decides which chains get the validation layer.
     validation: Option<ValidationPlan>,
     cachedb: Option<CacheDbPlan>,
     ecs_mode: EcsMode,
@@ -70,7 +63,7 @@ pub(crate) struct ChainPlan {
     dynamic_records: Vec<onetdns_config::DynamicRecord>,
 }
 
-/** @brief 처리 방식별 기반 리졸버. 재귀 설정은 재귀를 쓸 때만 담긴다. */
+/// Recursion settings are present only when recursion is used.
 #[derive(Clone, Debug, PartialEq)]
 enum BasePlan {
     Forward,
@@ -83,7 +76,6 @@ enum BasePlan {
     },
 }
 
-/** @brief 재귀 리졸버와 재귀 전용 계층의 설정. */
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecursivePlan {
     query_timeout_secs: u64,
@@ -121,11 +113,9 @@ pub(crate) struct RecursivePlan {
     neg_max_ttl: u64,
 }
 
-/**
- * @brief 예비 업스트림이나 스텁 영역 하나로 보내는 전달기의 설정.
- * @details 이 서버의 수신 주소를 함께 담는다. 업스트림이 수신 주소를 가리키면 질의가 이
- *          서버로 되돌아오므로, 수신 주소가 바뀌면 전달기를 다시 만들면서 다시 확인해야 한다.
- */
+/// Forwarder for one fallback upstream or stub zone. Carries this server's listen addresses: an
+/// upstream pointing at one would loop queries back here, so a listen address change must rebuild
+/// the forwarder and recheck.
 #[derive(Clone, Debug, PartialEq)]
 struct ForwarderPlan {
     servers: Vec<String>,
@@ -136,7 +126,6 @@ struct ForwarderPlan {
     upstream_concurrency: usize,
 }
 
-/** @brief 업스트림이 전달한 답을 이 서버가 직접 검증할 때의 설정. */
 #[derive(Clone, Debug, PartialEq)]
 struct ValidationPlan {
     dnssec_strict: bool,
@@ -147,12 +136,10 @@ struct ValidationPlan {
     dnssec_anchor_file: Option<std::path::PathBuf>,
 }
 
-/**
- * @brief 외부 Redis 공유 캐시의 설정. 호스트 이름은 조립할 때 bootstrap 으로 푼다.
- * @details 기본 전달 업스트림과 로컬 전용 이름 판정은 체인을 조립하는 데 쓰지 않는다. 그래도
- *          CacheDbLayer 아래의 답을 바꾸므로 공유 캐시를 쓸 때만 여기에 담아 해석 맥락에 넣는다.
- *          공유 캐시를 쓰지 않으면 이 값들만 바꾼 설정은 체인을 다시 만들지 않는다.
- */
+/// Host names are resolved through `bootstrap` at assembly. The default forward upstreams and
+/// local-only name settings are not used to assemble the chain, but they change answers below
+/// `CacheDbLayer`, so they are carried here, into the resolution context, only when the shared
+/// cache is on. Without it, changing only these does not rebuild the chain.
 #[derive(Clone, Debug, PartialEq)]
 struct CacheDbPlan {
     host: String,
@@ -164,10 +151,7 @@ struct CacheDbPlan {
     password: Option<onetdns_core::SecretString>,
     tls: bool,
     tls_ca: Option<std::path::PathBuf>,
-    /**
-     * @brief 기본 전달 기반이 질의하는 업스트림.
-     * @details 정렬하고 중복을 없앤 목록을 담으므로, 순서만 바꾼 설정으로는 체인을 다시 만들지 않는다.
-     */
+    /// Sorted and deduplicated, so reordering alone does not rebuild the chain.
     upstreams: Vec<String>,
     domain_needed: bool,
     bogus_priv: bool,
@@ -175,7 +159,7 @@ struct CacheDbPlan {
 }
 
 impl CacheDbPlan {
-    /** @brief Redis 에 붙는 방법. 호스트 이름은 bootstrap 으로 풀고, TLS 를 쓰면 신뢰 저장소를 읽는다. */
+    /// Resolves the host through `bootstrap` and reads the trust store when TLS is on.
     fn redis_options(&self) -> Result<redis::RedisOptions, String> {
         let addr = cachedb_redis_addr(&self.host, self.port, &self.bootstrap)?;
         let tls = if self.tls {
@@ -194,7 +178,6 @@ impl CacheDbPlan {
     }
 }
 
-/** @brief 답한 주소를 커널 주소 집합에 넣는 계층의 설정. */
 #[derive(Clone, Debug, PartialEq)]
 struct IpsetPlan {
     name_v4: Option<String>,
@@ -202,14 +185,14 @@ struct IpsetPlan {
     domains: Vec<String>,
 }
 
-/** @brief 권한 계층의 설정. 영역 원본이 하나라도 있을 때만 담긴다. */
+/// Present only when at least one zone source exists.
 #[derive(Clone, Debug, PartialEq)]
 struct AuthorityPlan {
-    /** @brief 권한 응답에 RA 비트를 켤지. */
+    /// Set RA on authoritative answers.
     recursion_offered: bool,
 }
 
-/** @brief DDR 계층의 설정. 알릴 전송은 암호화 수신 주소에서 나온다. */
+/// The advertised transports come from the encrypted listen addresses.
 #[derive(Clone, Debug, PartialEq)]
 struct DdrPlan {
     name: String,
@@ -217,7 +200,7 @@ struct DdrPlan {
 }
 
 impl ChainPlan {
-    /** @brief 설정에서 체인 계획을 만든다. 파일이나 네트워크는 읽지 않는다. */
+    /// Reads no files or network.
     pub(crate) fn new(cfg: &Config) -> Self {
         let recursive = || RecursivePlan::new(cfg);
         let base = match cfg.backend {
@@ -316,19 +299,17 @@ impl ChainPlan {
         }
     }
 
-    /** @brief 기본 체인이 Split 로컬 주소 계층을 얹는지. */
+    /// Whether the default chain adds the Split local address layer.
     pub(crate) fn is_split(&self) -> bool {
         matches!(self.base, BasePlan::Split { .. })
     }
 
-    /**
-     * @brief 이 계획이 값을 읽는 키 가운데 설정 키 표의 그룹으로는 체인을 다시 만들지 않는 키들.
-     * @details 이 키들은 바뀌면 자기 그룹을 교체하고, 계획에 그 값을 읽는 구성 요소가 있으면
-     *          체인도 다시 만든다. 영역 원본은 하나라도 있는지가 권한 계층을 얹을지 정하므로
-     *          늘 든다. new 가 다른 그룹의 키를 새로 읽으면 여기에도 넣어야 한다. 빠뜨리면
-     *          관리 화면이 그 키를 바꿔도 재시작하지 않는다고 알리는데, 클라이언트 경로가 있으면
-     *          실제로는 재시작한다.
-     */
+    /// Keys this plan reads whose config-key-table group does not rebuild the chain. A change to
+    /// one swaps its own group, and also rebuilds the chain when the plan has a component reading
+    /// it. Zone sources are always included, since whether any exist decides the authority layer.
+    ///
+    /// When `new` starts reading another group's key, add it here; otherwise the dashboard
+    /// announces that key as hot, while with client routes it really restarts.
     pub(crate) fn other_group_inputs(&self) -> Vec<&'static str> {
         let mut keys = vec![
             "zones",
@@ -381,40 +362,32 @@ impl ChainPlan {
     }
 }
 
-/**
- * @brief 공통 계층 아래에 까는 기반이 무엇인지.
- * @details 공유 캐시는 이 값으로 이 체인의 해석 맥락과 신뢰 앵커를 정한다.
- */
+/// What the common layers sit on. The shared cache uses it to pick this chain's resolution context
+/// and trust anchors.
 pub(crate) enum ChainBase {
-    /** @brief 계획의 처리 방식대로 만든 기반. 재귀가 DNSSEC 을 검증하면 그 신뢰 앵커를 든다. */
+    /// The base the plan's backend builds; holds the trust anchors when recursion validates.
     Planned(Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>),
-    /** @brief 이 업스트림으로만 전달하는 클라이언트 경로. */
+    /// Client route forwarding only to these upstreams.
     Route {
-        /** @brief 정규화한 업스트림 목록. */
+        /// Normalized.
         upstreams: String,
-        /**
-         * @brief 같은 세대의 재귀 리졸버가 검증에 쓰는 신뢰 앵커. 재귀가 검증하지 않으면 없다.
-         * @details 경로의 답도 이 앵커로 검증하므로, RFC 5011 갱신이 기본 체인과 경로에 함께
-         *          적용된다.
-         */
+        /// Trust anchors the same generation's recursive resolver validates with; None when it does
+        /// not validate. Route answers are validated with them too, so RFC 5011 updates apply to
+        /// the default chain and routes alike.
         anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
     },
 }
 
 impl ChainBase {
-    /** @brief 같은 세대의 재귀 리졸버가 검증에 쓰는 신뢰 앵커. */
     fn recursor_anchors(&self) -> Option<&Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>> {
         match self {
             ChainBase::Planned(anchors) | ChainBase::Route { anchors, .. } => anchors.as_ref(),
         }
     }
 
-    /**
-     * @brief 이 기반이 업스트림에서 받은 답을 그대로 올려 보내는지.
-     * @details 그렇다면 dnssec 을 켰을 때 그 위에 검증 계층을 얹는다. 재귀 기반은 위임을 따라
-     *          내려가면서 스스로 검증하므로 얹지 않는다. 클라이언트 경로는 처리 방식과 상관없이
-     *          업스트림에 전달한다.
-     */
+    /// Whether this base passes upstream answers up as is; if so and dnssec is on, the validation
+    /// layer goes on top. A recursive base validates itself while walking delegations, so it gets
+    /// none. Client routes forward regardless of backend.
     fn forwards(&self, plan: &ChainPlan) -> bool {
         match self {
             ChainBase::Planned(_) => !matches!(plan.base, BasePlan::Recurse(_)),
@@ -423,16 +396,16 @@ impl ChainBase {
     }
 }
 
-/**
- * @brief 공유 캐시에서 이 체인의 답을 가르는 해석 맥락.
- * @details CacheDbLayer 아래에서 답의 내용을 바꾸는 설정만 담는다. 계획과 그 안의 설정 묶음을
- *          모두 필드 단위로 풀어 쓰므로, 필드를 더하면 여기서 담을지 정하기 전에는 컴파일되지
- *          않는다. 목록은 정렬하고 중복을 없애므로 순서만 다른 설정은 같은 맥락을 쓴다. 신뢰
- *          앵커는 실행 중에 바뀌므로 여기에 넣지 않고 CacheDbLayer 가 요청마다 지금 쓰는 앵커를
- *          더한다. ECS 옵션과 DO, CD 비트는 요청 키에 이미 들어간다.
- * @warning 같은 Redis를 쓰는 서버는 이 값이 같을 때만 서로의 답을 쓴다. 답을 바꾸는 값을 빼면
- *          그 설정이 다른 서버가 담은 답을 이 서버가 그대로 쓴다.
- */
+/// Resolution context separating this chain's answers in the shared cache: only settings below
+/// `CacheDbLayer` that change answer content. The plan and its sub-plans are destructured field by
+/// field, so a new field does not compile until it is decided here. Lists are sorted and
+/// deduplicated, so order alone does not change the context. Trust anchors change at run time, so
+/// `CacheDbLayer` adds the current ones per request instead. ECS options and the DO and CD bits are
+/// already in the request key.
+///
+/// Servers sharing a Redis use each other's answers only when this matches; leaving out a value
+/// that changes answers would let this server use answers stored by a server configured
+/// differently.
 fn shared_cache_context(plan: &ChainPlan, cachedb: &CacheDbPlan, base: &ChainBase) -> String {
     let ChainPlan {
         base: planned,
@@ -520,11 +493,9 @@ fn shared_cache_context(plan: &ChainPlan, cachedb: &CacheDbPlan, base: &ChainBas
     )
 }
 
-/**
- * @brief 재귀 설정 가운데 답이나 검증 결과를 바꾸는 값.
- * @details 제한 시간, 캐시 크기, 주소 계열처럼 닿을 수 있는 서버만 바꾸는 값은 넣지 않는다. 그런
- *          값은 실패하는 질의를 늘리거나 줄일 뿐이고 실패한 답은 공유 캐시에 담지 않는다.
- */
+/// Recursion settings that change answers or validation results. Values that only change which
+/// servers are reachable, such as timeouts, cache size, and address families, are left out: they
+/// only change how many queries fail, and failed answers are not shared.
 fn recursion_context(plan: &RecursivePlan) -> String {
     let RecursivePlan {
         roots,
@@ -575,7 +546,7 @@ fn recursion_context(plan: &RecursivePlan) -> String {
     )
 }
 
-/** @brief 전달기 설정 가운데 답을 바꾸는 값. 어느 업스트림에 묻는지다. */
+/// Which upstreams it asks.
 fn forwarder_context(plan: &ForwarderPlan) -> String {
     let ForwarderPlan {
         servers,
@@ -592,7 +563,7 @@ fn forwarder_context(plan: &ForwarderPlan) -> String {
     )
 }
 
-/** @brief 업스트림 응답 검증 설정 가운데 검증 결과를 바꾸는 값. 신뢰 앵커는 CacheDbLayer 가 더한다. */
+/// Trust anchors are added by `CacheDbLayer`.
 fn validation_context(plan: &ValidationPlan) -> String {
     let ValidationPlan {
         dnssec_strict,
@@ -609,7 +580,7 @@ fn validation_context(plan: &ValidationPlan) -> String {
     )
 }
 
-/** @brief 정렬하고 중복을 없앤 목록. */
+/// Sorted and deduplicated.
 fn canonical_list<T: ToString>(values: impl IntoIterator<Item = T>) -> Vec<String> {
     let mut values: Vec<String> = values.into_iter().map(|value| value.to_string()).collect();
     values.sort_unstable();
@@ -617,7 +588,7 @@ fn canonical_list<T: ToString>(values: impl IntoIterator<Item = T>) -> Vec<Strin
     values
 }
 
-/** @brief 대소문자와 끝 점만 다른 도메인 이름을 같게 만든 목록. */
+/// Names differing only in case or a trailing dot become one.
 fn canonical_names(names: &[String]) -> Vec<String> {
     canonical_list(
         names
@@ -665,24 +636,23 @@ impl RecursivePlan {
         }
     }
 
-    /** @brief 재귀 질의 하나에 기다리는 시간. */
+    /// Per recursive query.
     pub(crate) fn timeout(&self) -> Duration {
         Duration::from_secs(self.query_timeout_secs)
     }
 
-    /** @brief RFC 5011 앵커 상태를 적을 파일. 설정에 없으면 작업 디렉터리의 기본 파일을 쓴다. */
+    /// Defaults to a file in the working directory.
     pub(crate) fn anchor_state_file(&self) -> std::path::PathBuf {
         self.dnssec_anchor_file
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("onetdns-anchors.txt"))
     }
 
-    /** @brief 재귀가 시작할 루트 서버들. */
     pub(crate) fn roots(&self) -> Vec<SocketAddr> {
         self.roots.clone()
     }
 
-    /** @brief 물어볼 권한 서버를 거르는 거부 목록과 허용 목록. */
+    /// Deny and allow lists for the authoritative servers asked.
     pub(crate) fn server_acl(&self) -> (Vec<onetdns_core::IpNet>, Vec<onetdns_core::IpNet>) {
         (
             self.recurse_deny_server.clone(),
@@ -690,25 +660,20 @@ impl RecursivePlan {
         )
     }
 
-    /** @brief 재귀 캐시에 담는 TTL 의 상한. */
     pub(crate) fn max_ttl(&self) -> u32 {
         self.max_ttl as u32
     }
 }
 
 impl ForwarderPlan {
-    /**
-     * @brief 전달할 업스트림을 만든다.
-     * @param label  업스트림이 이 서버를 가리킬 때 오류에 넣을 설정 이름.
-     * @return 업스트림이 이 서버의 수신 주소를 가리키면 실패.
-     */
+    /// `label` names the setting in the error. Fails when an upstream is one of this server's
+    /// listen addresses.
     fn upstreams(&self, label: &str) -> Result<Vec<onetdns_forward::Upstream>, String> {
         let upstreams = upstream::servers_to_upstreams(&self.servers, &self.bootstrap);
         upstream::ensure_not_listener(&upstreams, &self.listeners, label)?;
         Ok(upstreams)
     }
 
-    /** @brief 업스트림으로 전달기를 만든다. */
     fn forwarder(&self, upstreams: Vec<onetdns_forward::Upstream>) -> onetdns_forward::Forwarder {
         onetdns_forward::Forwarder::with_upstreams(
             upstreams,
@@ -719,15 +684,13 @@ impl ForwarderPlan {
     }
 }
 
-/**
- * @brief 새 재귀 리졸버에 딸려 시작한 보조 작업의 종료 신호.
- * @details 리졸버를 쓰기로 정하기 전에 버리면 작업을 멈춘다. 멈추지 않으면 아무도 쓰지 않는
- *          앵커 핸들을 갱신하는 스레드가 세대가 끝날 때까지 남는다.
- */
+/// Stop signal of side tasks started with a new recursive resolver. Dropped before the resolver is
+/// adopted, it stops them; otherwise a thread updating an anchor handle nobody uses would live
+/// until the generation ends.
 pub(crate) struct PendingJobs(Option<Arc<std::sync::atomic::AtomicBool>>);
 
 impl PendingJobs {
-    /** @brief 이전 작업을 멈추고 이 작업을 등록한다. 신호가 없으면 이전 작업만 멈춘다. */
+    /// Stops the previous tasks and registers these; with no signal, only stops the previous ones.
     fn adopt(mut self, jobs: &EdgeServices) {
         jobs.replace_all(self.0.take());
     }
@@ -741,42 +704,34 @@ impl Drop for PendingJobs {
     }
 }
 
-/** @brief 계획대로 만든 기반. 재귀를 쓰면 그 리졸버와 딸린 작업을 함께 가진다. */
+/// With recursion, also holds the resolver and its tasks.
 pub(crate) struct PreparedBase {
-    /** @brief 기반 리졸버. */
     resolver: Arc<dyn native::Resolver>,
-    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    /// For the reactor lane; None when only forwarding.
     recursor: Option<Arc<onetdns_recurse::Recursor>>,
-    /** @brief 재귀 리졸버에 딸린 작업. */
     jobs: PendingJobs,
-    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 검증하지 않으면 없다. */
+    /// None without DNSSEC validation.
     anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
 }
 
-/** @brief 재귀 기반을 만들 때 쓰는 이 세대의 핸들. */
+/// This generation's handles for building the recursive base.
 pub(crate) struct RecursiveBase {
-    /** @brief 차단 응답 TTL. */
     pub(crate) block_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief NS 이름에 적용하는 차단 엔진. */
+    /// Block engine applied to NS names.
     pub(crate) filter: Arc<SharedFilter>,
-    /** @brief 로컬 응답 TTL. */
     pub(crate) local_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /**
-     * @brief 이 세대가 끝날 때 기다릴 스레드.
-     * @details ServiceCleanup 은 드롭될 때 스레드를 전부 내린다. 그것을 복제해 넘기면 기반이
-     *          사라질 때 서비스가 함께 죽으므로 추적 목록만 넘긴다.
-     */
+    /// Threads to wait for at generation end. `ServiceCleanup` stops every thread on drop, and
+    /// passing a clone would kill the service when the base is dropped, so only the tracking list
+    /// is passed.
     pub(crate) thread_tracker: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
-    /** @brief 이 세대의 종료 플래그. */
     pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RecursiveBase {
-    /**
-     * @brief 계획대로 재귀 리졸버를 만들고 재귀 전용 계층을 얹는다.
-     * @details 딸린 작업은 새 종료 신호로 시작하고 등록하지 않는다. 이전 작업은 이 기반을 설치할
-     *          때 멈추므로, 여기서 실패하거나 결과를 버려도 지금 쓰는 리졸버의 작업은 그대로 돈다.
-     */
+    /// Builds the recursive resolver per the plan and adds the recursion-only layers. Side tasks
+    /// start with a fresh stop signal and are not registered; previous tasks stop only when this
+    /// base is installed, so failing here, or discarding the result, leaves the running resolver's
+    /// tasks alone.
     fn build(&self, plan: &RecursivePlan) -> BoxResult<PreparedBase> {
         let Self {
             block_ttl,
@@ -892,21 +847,18 @@ impl RecursiveBase {
     }
 }
 
-/** @brief 계획의 처리 방식에 맞는 기반 리졸버를 만든다. */
+/// Builds the base resolver for the plan's backend.
 pub(crate) struct ResolverBase {
-    /** @brief 전달 리졸버 슬롯. */
     pub(crate) forward_slot: native::ResolverSlot,
-    /** @brief 재귀 기반. */
     pub(crate) recurse: RecursiveBase,
 }
 
 impl ResolverBase {
-    /** @brief 전달 기반. 슬롯을 감싸므로 전달 경로를 교체하면 이 기반도 따라간다. */
+    /// Wraps the slot, so swapping the forward path carries over.
     fn forward(&self) -> Arc<dyn native::Resolver> {
         Arc::new(self.forward_slot.clone())
     }
 
-    /** @brief 계획의 처리 방식에 맞는 기반을 만든다. */
     fn build(&self, plan: &ChainPlan) -> BoxResult<PreparedBase> {
         Ok(match &plan.base {
             BasePlan::Recurse(recurse) => self.recurse.build(recurse)?,
@@ -947,60 +899,45 @@ impl ResolverBase {
     }
 }
 
-/**
- * @brief 기본 해석 체인을 만들고 이 세대에 설치한다.
- *
- * @details 만드는 단계는 실패할 수 있지만 이 세대의 상태를 바꾸지 않는다. 설치 단계는 실패하지
- *          않는다. 설정 교체는 다른 준비가 모두 끝난 뒤에 설치하므로, 어느 단계에서 실패해도
- *          지금 쓰는 체인과 그 캐시, 재귀 리졸버의 보조 작업이 그대로 남는다.
- */
+/// Builds the default resolution chain and installs it in this generation. Building can fail but
+/// changes no generation state; installing cannot fail. A config swap installs only after every
+/// other preparation succeeded, so a failure at any step leaves the running chain, its cache, and
+/// the recursive resolver's side tasks in place.
 pub(crate) struct DefaultChain {
-    /** @brief 기반 리졸버를 만드는 핸들. */
     pub(crate) base: ResolverBase,
-    /** @brief 공통 계층을 쌓는 핸들. */
     pub(crate) layers: ChainLayers,
-    /** @brief 기본 체인의 응답 캐시를 넣어 두는 슬롯. wire 빠른 경로가 읽는다. */
+    /// The default chain's response cache; read by the wire fast path.
     pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
-    /** @brief 재귀 리졸버에 딸린 보조 작업. */
     pub(crate) recursor_jobs: Arc<EdgeServices>,
 }
 
-/** @brief 만들었지만 아직 설치하지 않은 기본 체인. 설치하지 않고 버리면 딸린 작업도 멈춘다. */
+/// Built but not installed; dropping it stops its tasks too.
 pub(crate) struct PreparedChain {
-    /** @brief 공통 계층까지 쌓은 체인. */
     resolver: Arc<dyn native::Resolver>,
-    /** @brief 이 체인의 응답 캐시. */
     cache: cache::CacheHandle,
-    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    /// For the reactor lane; None when only forwarding.
     recursor: Option<Arc<onetdns_recurse::Recursor>>,
-    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 검증하지 않으면 없다. */
+    /// None without DNSSEC validation.
     anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
-    /** @brief 이 체인이 쓰는 공유 캐시 클라이언트. 공유 캐시를 쓰지 않으면 없다. */
+    /// None without a shared cache.
     shared_cache: Option<Arc<redis::RedisClient>>,
-    /** @brief 재귀 리졸버에 딸린 작업. */
     jobs: PendingJobs,
 }
 
-/** @brief 설치한 기본 체인. */
 pub(crate) struct InstalledChain {
-    /** @brief 공통 계층까지 쌓은 체인. */
     pub(crate) resolver: Arc<dyn native::Resolver>,
-    /** @brief 이 체인의 응답 캐시. */
     pub(crate) cache: cache::CacheHandle,
-    /** @brief reactor 레인이 쓸 재귀 리졸버. 전달만 하면 없다. */
+    /// For the reactor lane; None when only forwarding.
     pub(crate) recursor: Option<Arc<onetdns_recurse::Recursor>>,
-    /** @brief 재귀 리졸버가 DNSSEC 검증에 쓰는 신뢰 앵커. 클라이언트 경로의 검증도 이 앵커를 쓴다. */
+    /// Client route validation uses them too.
     pub(crate) anchors: Option<Arc<ArcSwap<Vec<onetdns_dnssec::Ds>>>>,
-    /**
-     * @brief 이 체인이 쓰는 공유 캐시 클라이언트. 공유 캐시를 쓰지 않으면 없다.
-     * @details 클라이언트 경로도 이 클라이언트를 함께 쓴다. 경로마다 따로 만들면 연결 풀도 따로
-     *          생겨, 공유 캐시에 여는 연결 수의 상한이 경로 수만큼 곱해진다.
-     */
+    /// Client routes share this client: a client per route would mean a connection pool per route,
+    /// multiplying the shared cache connection cap by the number of routes.
     pub(crate) shared_cache: Option<Arc<redis::RedisClient>>,
 }
 
 impl DefaultChain {
-    /** @brief 계획대로 기본 체인을 만든다. 이 세대의 상태는 바꾸지 않는다. */
+    /// Changes no generation state.
     pub(crate) fn prepare(&self, plan: &ChainPlan) -> Result<PreparedChain, String> {
         let PreparedBase {
             resolver,
@@ -1030,7 +967,8 @@ impl DefaultChain {
         })
     }
 
-    /** @brief 캐시와 재귀 리졸버를 올리고 이전 보조 작업을 멈춘다. 체인 슬롯은 호출한 쪽이 바꾼다. */
+    /// Brings up the cache and the recursive resolver and stops the previous side tasks; the caller
+    /// swaps the chain slot.
     pub(crate) fn install(&self, prepared: PreparedChain) -> InstalledChain {
         let PreparedChain {
             resolver,
@@ -1052,37 +990,27 @@ impl DefaultChain {
     }
 }
 
-/** @brief 공통 계층을 쌓을 때 쓰는 이 세대의 핸들. */
+/// This generation's handles for stacking the common layers.
 #[derive(Clone)]
 pub(crate) struct ChainLayers {
-    /** @brief 차단 응답 TTL. */
     pub(crate) block_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief DHCPv4 임대 풀. 서비스가 꺼져 있으면 없다. */
+    /// None while the DHCPv4 service is off.
     pub(crate) dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
-    /** @brief 로컬 응답 TTL. */
     pub(crate) local_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief 업스트림으로 흘리지 않을 이름의 판정. */
     pub(crate) local_only_names: Arc<layers::LocalOnlyNames>,
-    /** @brief 캐시 적중을 남길 질의 기록. 없으면 남기지 않는다. */
+    /// Logs cache hits; None logs nothing.
     pub(crate) recorder: Option<onetdns_control::Recorder>,
-    /** @brief 이 세대의 종료 플래그. */
     pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief Split 로컬 주소 응답을 wire 캐시에 넣을 때 쓰는 캐시. */
+    /// The cache Split local address answers go into for the wire path.
     pub(crate) split_local_wire_cache: Arc<std::sync::OnceLock<cache::CacheHandle>>,
-    /** @brief 권한 영역 저장소. */
     pub(crate) zone_store: Arc<ArcSwap<onetdns_authority::ZoneStore>>,
 }
 
 impl ChainLayers {
-    /**
-     * @brief 기반 위에 공통 계층을 쌓는다. 이 세대의 상태는 바꾸지 않는다.
-     * @param report  켜진 기능을 기록에 남길지.
-     * @param split_local_addresses  Split 로컬 주소 계층을 얹을지.
-     * @param kind  base 가 어떤 기반인지. 공유 캐시가 해석 맥락과 신뢰 앵커를 정할 때 쓴다.
-     * @param shared_cache  이 세대의 체인이 함께 쓰는 공유 캐시 클라이언트. 계획에 공유 캐시가
-     *                      있으면 있어야 한다.
-     * @return 쌓은 체인과 그 응답 캐시.
-     */
+    /// Changes no generation state. `report` logs the enabled features; `split_local_addresses`
+    /// adds the Split local address layer; `kind` says what `base` is, which the shared cache uses
+    /// for its context and anchors; `shared_cache` is the client the generation's chains share,
+    /// required when the plan has a shared cache. Returns the chain and its response cache.
     pub(crate) fn wrap_common_layers(
         &self,
         plan: &ChainPlan,
@@ -1123,11 +1051,10 @@ impl ChainLayers {
             }
         }
 
-        /*
-         * 예비 업스트림까지 감싼 뒤에 얹는다. 어느 업스트림이 답했든 이 서버가 검증한 것만
-         * 위로 올라가고, 위쪽 캐시에는 검증된 응답만 담긴다. 같은 세대의 재귀 리졸버가 있으면
-         * 그 앵커를 함께 써서, RFC 5011 갱신이 전달한 답의 검증에도 바로 적용되게 한다.
-         */
+        // Added after the fallback upstreams are wrapped, so whichever upstream answered, only
+        // answers this server validated go up, and the caches above hold only validated responses.
+        // With a recursive resolver in the same generation, its anchors are shared, so RFC 5011
+        // updates apply to forwarded answers at once.
         if let Some(validation) = plan.validation.as_ref().filter(|_| kind.forwards(plan)) {
             let insecure_domains = validation
                 .domain_insecure
@@ -1370,7 +1297,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    /** @brief 전달 기반으로 체인을 만드는 핸들. 재귀 기반은 루트로 탐지 질의를 보내므로 쓰지 않는다. */
+    /// Uses a forward base; a recursive base would send probes to the roots.
     fn default_chain() -> DefaultChain {
         let block_ttl = Arc::new(AtomicU32::new(10));
         let local_ttl = Arc::new(AtomicU32::new(10));
@@ -1403,7 +1330,6 @@ mod tests {
         }
     }
 
-    /** @brief 전달만 하는 설정. */
     fn forward_config() -> Config {
         let mut cfg = Config::default();
         cfg.backend = BackendKind::Forward;
@@ -1412,12 +1338,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 체인을 만들다 실패하거나 만든 것을 버려도 지금 쓰는 캐시와 보조 작업이 그대로인지.
-     * @details 설정 교체는 체인을 다른 준비와 함께 먼저 만들고, 모두 성공한 뒤에 설치한다. 만드는
-     *          단계가 캐시 슬롯을 바꾸거나 이전 작업을 멈추면, 교체가 실패했는데도 빠른 경로가 쓰지
-     *          않는 캐시를 읽고 신뢰 앵커 갱신이 멈춘다.
-     */
+    /// A config swap builds the chain first with the other preparations and installs only after all
+    /// succeed. If building changed the cache slot or stopped the old tasks, a failed swap would
+    /// leave the fast path reading an unused cache and anchor updates stopped.
     fn preparing_a_chain_leaves_the_running_one_alone() {
         let chain = default_chain();
         let cfg = forward_config();
@@ -1440,7 +1363,6 @@ mod tests {
         assert!(old_jobs.load(Ordering::Acquire));
     }
 
-    /** @brief 이 설정으로 만든 기본 체인의 공유 캐시 해석 맥락. */
     fn shared_context(cfg: &Config, kind: &ChainBase) -> String {
         let plan = ChainPlan::new(cfg);
         let cachedb = plan
@@ -1451,10 +1373,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 공유 캐시 해석 맥락이 답을 바꾸는 설정마다 갈리고, 답과 무관한 설정에는 그대로인지.
-     * @details 같은 Redis를 쓰는 서버끼리 맥락이 같으면 서로의 답을 그대로 쓴다.
-     */
+    /// Servers sharing a Redis use each other's answers as is when their contexts match.
     fn external_cache_context_follows_the_resolution_context() {
         let mut base = forward_config();
         base.cachedb_redis_host = Some("127.0.0.1".to_string());
@@ -1584,7 +1503,7 @@ mod tests {
         }
     }
 
-    /** @brief 받은 질의의 CD 비트를 적어 두고 SERVFAIL 로 답하는 업스트림. */
+    /// Records the CD bit of each query and answers SERVFAIL.
     struct CdRecorder(Mutex<Vec<bool>>);
 
     impl native::Resolver for CdRecorder {
@@ -1598,12 +1517,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 업스트림에 전달하는 체인에만 검증 계층이 얹히는지.
-     * @details 검증 계층은 업스트림에 CD 비트를 켜서 묻는다. 클라이언트 경로는 재귀 방식에서도
-     *          업스트림에 전달하므로, 이 계층이 빠지면 dnssec 을 켰는데도 검증하지 않은 답이
-     *          클라이언트에 나간다. 재귀 기반은 스스로 검증하므로 겹쳐 얹지 않는다.
-     */
+    /// The validation layer asks upstream with CD set. Client routes forward upstream even under
+    /// recursion, so without this layer unvalidated answers would reach clients with dnssec on. A
+    /// recursive base validates itself, so it is not stacked twice.
     fn validation_wraps_every_forwarding_base() {
         let route = || ChainBase::Route {
             upstreams: "192.0.2.9".to_string(),
@@ -1653,12 +1569,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트 경로가 기본 체인의 공유 캐시 클라이언트와 그 연결 풀을 함께 쓰는지.
-     * @details 체인마다 클라이언트를 따로 만들면 연결 풀도 따로 생겨, 같은 세대가 공유 캐시에
-     *          여는 연결 수의 상한이 경로 수만큼 곱해진다. 두 체인이 차례로 물으면 뒤의 체인은
-     *          앞의 체인이 돌려놓은 연결을 다시 쓴다.
-     */
+    /// A client per chain would mean a pool per chain, multiplying the generation's connection cap
+    /// by the number of routes. When two chains ask in turn, the second reuses the connection the
+    /// first returned.
     fn routes_share_the_default_chain_shared_cache_client() {
         let fake = crate::redis::fake::FakeRedis::start(Default::default());
         let mut cfg = forward_config();
@@ -1705,7 +1618,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설치하지 않고 버린 체인의 보조 작업이 멈추고, 설치한 체인의 작업은 도는지. */
     fn discarded_recursor_jobs_stop_and_adopted_ones_run() {
         let discarded = Arc::new(AtomicBool::new(false));
         drop(PendingJobs(Some(discarded.clone())));

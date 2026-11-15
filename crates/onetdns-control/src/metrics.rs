@@ -1,12 +1,10 @@
-/*!
- * @brief 지표 수집과 실시간 전달.
- *
- * @details 데이터 경로는 상세 로그를 유계 채널에, 통계 전용 이벤트를 워커별 유계 슬롯에 넣고
- *          즉시 돌아간다. 넘치면 상위 목록 귀속만 버린다. 수집 스레드가 이를 꺼내 상위 목록과
- *          구독자를 갱신하고, 누적 계수는 슬롯 잠금 안에서 별도로 정확하게 유지한다.
- * @warning 이 경로가 질의 처리를 막으면 안 된다. 채널이 가득 찼을 때 기다리는 순간
- *          지표 수집이 곧 서비스 장애가 된다.
- */
+//! Metric collection and live delivery. The data path puts detailed log events in a bounded channel
+//! and stats-only events in bounded per-worker slots, then returns at once; on overflow only
+//! top-list attribution is lost. A collector thread drains them into the top lists and subscribers,
+//! while cumulative counts stay exact under the slot locks.
+//!
+//! This path must never block query handling: waiting on a full channel turns metric collection
+//! into an outage.
 
 use std::borrow::Cow;
 use std::collections::hash_map::RandomState;
@@ -24,11 +22,10 @@ use std::sync::mpsc;
 
 thread_local! {
 
-    /** @brief 이 질의가 시작한 시각. 처리 시간을 재려는 것이다. */
     static REQUEST_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
-/** @brief 이 요청이 시작된 뒤 흐른 시간. 타이머가 없으면 0이다. */
+/// 0 without a running timer.
 fn current_request_latency_us() -> u64 {
     REQUEST_START
         .with(|c| c.get())
@@ -36,66 +33,48 @@ fn current_request_latency_us() -> u64 {
         .unwrap_or(0)
 }
 
-/**
- * @brief 요청 처리 시간을 측정하는 범위 보호자.
- * @details 스레드 지역 시작 시각을 설정하고, 사라질 때 이전 값으로 되돌린다. 중첩 요청에서도
- *          바깥 요청의 시각이 보존된다.
- */
+/// Scope guard timing a request: sets the thread-local start and restores the previous value on
+/// drop, so nested requests keep the outer start.
 pub struct RequestTimer {
-    /** @brief 이 타이머가 덮기 전의 시작 시각. */
     prev: Option<Instant>,
 }
 
 impl RequestTimer {
-    /** @brief 지금부터 측정한다. */
     pub fn start() -> Self {
         Self::start_at(Instant::now())
     }
 
-    /** @brief 지정한 시각부터 측정한다. 요청을 받은 시점을 정확히 넘길 때 쓴다. */
+    /// For passing the exact time the request arrived.
     pub fn start_at(start: Instant) -> Self {
         let prev = REQUEST_START.with(|c| c.replace(Some(start)));
         RequestTimer { prev }
     }
 
-    /** @brief 지금까지 흐른 시간. */
     pub fn elapsed_us(&self) -> u64 {
         current_request_latency_us()
     }
 }
 
 impl Drop for RequestTimer {
-    /** @brief 처리 시간을 남긴다. */
     fn drop(&mut self) {
         REQUEST_START.with(|c| c.set(self.prev));
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-/** @brief 질의 하나에 대해 이 서버가 한 처분. */
 pub enum Action {
-    /** @brief 정상으로 답했다. */
     Resolved,
-    /** @brief 차단했다. */
     Blocked,
-    /** @brief 다른 답으로 바꿨다. */
     Rewritten,
-    /** @brief 접근 제어에 막혔다. */
     Denied,
-    /** @brief 속도 제한에 막혔다. */
     Throttled,
-    /** @brief 오류로 답했다. */
     ServFail,
-    /** @brief 거절로 답했다. */
     Refused,
 }
 
 impl Action {
-    /**
-     * @brief 모든 처분.
-     * @note 질의 하나는 반드시 이 중 하나로 끝나므로, 지표의 총 질의 수는 이것들의 합과
-     *       같아야 한다. 하나라도 내보내지 않으면 수집기에 설명되지 않는 잔차가 남는다.
-     */
+    /// Every query ends in exactly one of these, so the total equals their sum; leaving one out of
+    /// the export leaves an unexplained residue in collectors.
     pub const ALL: [Action; 7] = [
         Action::Resolved,
         Action::Blocked,
@@ -106,7 +85,6 @@ impl Action {
         Action::Refused,
     ];
 
-    /** @brief 지표와 로그에 쓸 이름. */
     pub(crate) fn name(self) -> &'static str {
         match self {
             Action::Resolved => "resolved",
@@ -121,28 +99,22 @@ impl Action {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-/** @brief 한 구간의 누적값. 이력 계산의 단위다. */
+/// Totals for one interval, the unit of history.
 struct MetricBucket {
-    /** @brief 이 구간의 끝 시각. */
+    /// End of the interval.
     ts_sec: u64,
-    /** @brief 이 구간이 덮는 초. 초당 값을 낼 때 나눈다. */
+    /// Seconds covered; per-second values divide by it.
     span_secs: u64,
-    /** @brief 질의 수. */
     queries: u64,
-    /** @brief 차단 수. */
     blocked: u64,
-    /** @brief 지연 합. */
     latency_sum_us: u64,
-    /** @brief 지연을 측정한 횟수. 평균을 낼 때 나눈다. */
     latency_count: u64,
-    /** @brief 캐시 적중 수. */
     cache_hits: u64,
-    /** @brief 캐시 조회 수. */
     cache_lookups: u64,
 }
 
 impl MetricBucket {
-    /** @brief 다른 구간을 더한다. 넘침은 포화로 막는다. */
+    /// Saturates instead of overflowing.
     fn add(&mut self, other: MetricBucket) {
         self.span_secs = self.span_secs.saturating_add(other.span_secs);
         self.queries = self.queries.saturating_add(other.queries);
@@ -155,30 +127,22 @@ impl MetricBucket {
 }
 
 #[derive(Default)]
-/**
- * @brief 시간에 따른 지표 이력.
- * @details 초 단위와 분 단위를 따로 둔다. 긴 구간을 초 단위로만 담으면 메모리가 구간
- *          길이에 그대로 비례한다.
- */
+/// Second and minute resolutions are kept apart; storing a long range at one-second resolution
+/// would grow memory with the range.
 struct MetricHistory {
-    /** @brief 최근 구간의 초 단위 표본. */
+    /// Recent intervals, one per second.
     seconds: VecDeque<MetricBucket>,
-    /** @brief 오래된 구간의 분 단위 표본. */
+    /// Older intervals, one per minute.
     minutes: VecDeque<MetricBucket>,
-    /** @brief 직전 표본의 누적값. 차분을 내는 기준이다. */
+    /// Totals at the previous sample; deltas are taken from it.
     previous: MetricBucket,
-    /** @brief 직전 표본 시각. */
     previous_sample_sec: u64,
-    /** @brief 이력을 얼마나 보관할지. */
     retention_secs: u64,
 }
 
 impl MetricHistory {
-    /**
-     * @brief 기준점을 지금 값으로 다시 잡는다.
-     * @details 저장된 통계를 읽어 들인 직후에 부른다. 그러지 않으면 재시작 직후의 첫
-     *          표본이 누적값 전체를 그 순간의 증가분으로 잘못 본다.
-     */
+    /// Call right after loading saved stats; otherwise the first sample after a restart reads the
+    /// whole total as that moment's increase.
     fn reset_baseline(&mut self, counters: MetricBucket, now_sec: u64) {
         self.previous = counters;
         self.previous_sample_sec = now_sec;
@@ -186,7 +150,7 @@ impl MetricHistory {
         self.minutes.clear();
     }
 
-    /** @brief 지금 누적값으로 표본 하나를 만든다. 직전과의 차분이 그 구간의 값이다. */
+    /// The delta from the previous totals is this interval's value.
     fn sample(&mut self, counters: MetricBucket, now_sec: u64) {
         let span_secs = now_sec.saturating_sub(self.previous_sample_sec).max(1);
         let delta = MetricBucket {
@@ -258,7 +222,6 @@ impl MetricHistory {
     }
 
     #[cfg(test)]
-    /** @brief 최근 몇 초를 하나로 합친다. */
     fn aggregate_recent(&self, now_sec: u64, seconds: u64) -> MetricBucket {
         let cutoff = now_sec.saturating_sub(seconds);
         let mut out = MetricBucket::default();
@@ -268,7 +231,7 @@ impl MetricHistory {
         out
     }
 
-    /** @brief 요청한 구간을 요청한 점 수로 나눠 돌려준다. 대시보드 그래프의 재료다. */
+    /// Splits the requested range into `point_count` points, for dashboard graphs.
     fn points(&self, now_sec: u64, range_secs: u64, point_count: usize) -> Vec<MetricPoint> {
         let point_count = point_count.clamp(2, 240);
         let range_secs = range_secs.clamp(60, 7 * 24 * 60 * 60);
@@ -313,7 +276,7 @@ impl MetricHistory {
 }
 
 #[derive(Clone, Copy, Default)]
-/** @brief 통계 슬롯 잠금 안에서 질의별 전역 atomic 대신 누적하는 값. */
+/// Counts accumulated under a stats slot lock instead of global atomics per query.
 struct StatCounters {
     total: u64,
     resolved: u64,
@@ -327,7 +290,6 @@ struct StatCounters {
 }
 
 impl StatCounters {
-    /** @brief 질의 하나를 샤드에 더한다. */
     fn record(&mut self, transport: Transport, action: Action) {
         self.total = self.total.saturating_add(1);
         self.by_transport[transport.index()] =
@@ -344,7 +306,6 @@ impl StatCounters {
         *counter = counter.saturating_add(1);
     }
 
-    /** @brief 다른 샤드의 누적값을 포화 덧셈한다. */
     fn add(&mut self, other: &Self) {
         self.total = self.total.saturating_add(other.total);
         self.resolved = self.resolved.saturating_add(other.resolved);
@@ -361,56 +322,40 @@ impl StatCounters {
 }
 
 #[derive(Default)]
-/** @brief 누적 지표. 상세 로그는 원자값에, 기본 통계 경로는 워커별 샤드에 더한다. */
+/// Cumulative metrics. The detailed-log path adds to the atomics; the default stats path adds to
+/// per-worker shards.
 pub struct Metrics {
-    /** @brief 전체 질의 수. */
     pub total: AtomicU64,
-    /** @brief 정상 해석 수. */
     pub resolved: AtomicU64,
-    /** @brief 차단 수. */
     pub blocked: AtomicU64,
-    /** @brief 재작성 수. */
     pub rewritten: AtomicU64,
-    /** @brief ACL로 막은 수. */
     pub denied: AtomicU64,
-    /** @brief 정책으로 거부한 수. */
     pub refused: AtomicU64,
-    /** @brief 속도 제한으로 버린 수. */
     pub throttled: AtomicU64,
-    /** @brief SERVFAIL 수. */
     pub servfail: AtomicU64,
-    /** @brief 전송별 질의 수. */
     pub by_transport: [AtomicU64; Transport::COUNT],
 
-    /** @brief 지연 합. */
     pub latency_sum_us: AtomicU64,
-    /** @brief 지연을 측정한 횟수. */
     pub latency_count: AtomicU64,
-    /** @brief 캐시 적중 수. */
     pub cache_hits: AtomicU64,
-    /** @brief 캐시 조회 수. */
     pub cache_lookups: AtomicU64,
 
-    /** @brief 채널이 가득 차 버린 기록 이벤트 수. 이 값이 오르면 수집이 못 따라가는 것이다. */
+    /// Log events dropped because the channel was full; a rising value means collection cannot keep
+    /// up.
     pub dropped_log_events: AtomicU64,
-    /**
-     * @brief 슬롯이 가득 차 버린 통계 전용 이벤트 수.
-     * @details 누적 카운터는 슬롯 상한을 검사하기 전에 이미 샤드에 더하므로 총계는 잃지 않는다. 잃는 것은
-     *          상위 도메인·클라이언트 목록의 귀속이라, 이 값이 오르면 상위 목록이 표본이 된다.
-     */
+    /// Stats-only events dropped on a full slot. Cumulative counters are added to the shard before
+    /// the slot limit is checked, so totals are never lost; only top-list attribution is, so a
+    /// rising value means the top lists are a sample.
     pub dropped_stat_events: AtomicU64,
-    /** @brief 구독자에게 못 보낸 이벤트 수. */
     pub dropped_stream_events: AtomicU64,
-    /** @brief 디스크 저장 실패 수. */
     pub persist_failures: AtomicU64,
-    /** @brief 시간별 이력. 표본 스레드만 쓴다. */
+    /// Written only by the sampler thread.
     history: Mutex<MetricHistory>,
-    /** @brief 질의 로그가 꺼진 hot path가 전역 cacheline 대신 쓰는 샤드. */
+    /// Shards the query-log-off hot path writes instead of a global cache line.
     stat_slots: Option<Arc<Vec<Mutex<StatSlot>>>>,
 }
 
 impl Metrics {
-    /** @brief 통계 전용 샤드의 누적값을 snapshot 시점에 합친다. */
     fn sharded_stat_counters(&self) -> StatCounters {
         let mut total = StatCounters::default();
         if let Some(slots) = &self.stat_slots {
@@ -421,7 +366,6 @@ impl Metrics {
         total
     }
 
-    /** @brief 지금 누적값을 한 번에 읽는다. */
     fn counters(&self) -> MetricBucket {
         let sharded = self.sharded_stat_counters();
         MetricBucket {
@@ -441,19 +385,16 @@ impl Metrics {
         }
     }
 
-    /** @brief 지금 값으로 이력 표본을 하나 남긴다. */
     fn sample_now(&self) {
         let now_sec = now_ms() / 1_000;
         let counters = self.counters();
         self.history.lock_recover().sample(counters, now_sec);
     }
 
-    /** @brief 이력 보관 기간을 바꾼다. */
     fn set_history_retention(&self, retention_secs: u64) {
         self.history.lock_recover().retention_secs = retention_secs;
     }
 
-    /** @brief 이력 기준점을 다시 잡는다. */
     fn reset_history_baseline(&self) {
         let now_sec = now_ms() / 1_000;
         let counters = self.counters();
@@ -462,7 +403,6 @@ impl Metrics {
             .reset_baseline(counters, now_sec);
     }
 
-    /** @brief 그래프용 이력 점들. */
     pub fn history(&self, range_secs: u64, point_count: usize) -> Vec<MetricPoint> {
         self.sample_now();
         let now_sec = now_ms() / 1_000;
@@ -471,13 +411,12 @@ impl Metrics {
             .points(now_sec, range_secs, point_count)
     }
 
-    /** @brief 지금 지표 전체를 한 번에 읽는다. */
     pub fn snapshot(&self) -> MetricsSnapshot {
         self.sample_now();
         self.current_snapshot()
     }
 
-    /** @brief 이력 표본을 추가하지 않고 현재 누적값만 읽는다. 저장 경로도 함께 쓴다. */
+    /// Reads the current totals without adding a history sample; persistence uses it too.
     pub(crate) fn current_snapshot(&self) -> MetricsSnapshot {
         let sharded = self.sharded_stat_counters();
         let by_transport = Transport::ALL
@@ -554,143 +493,96 @@ impl Metrics {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 그래프의 점 하나. */
 pub struct MetricPoint {
-    /** @brief 이 지점의 시각. */
     pub ts_ms: u64,
-    /** @brief 이 구간 동안 받은 질의 수. 폭으로 나눈 평균 속도가 아니라 합계다. */
+    /// A total for the interval, not a rate.
     pub queries: u64,
-    /** @brief 이 구간 동안 차단한 질의 수. */
     pub blocked: u64,
-    /** @brief 평균 처리 시간. */
     pub avg_latency_ms: f64,
-    /** @brief 캐시가 맞은 비율. */
     pub cache_hit_pct: f64,
 }
 
 #[derive(Debug, Clone)]
-/** @brief 대시보드에 보낼 지표 모음. */
 pub struct MetricsSnapshot {
-    /** @brief 전체 질의 수. */
     pub total: u64,
-    /** @brief 정상으로 답한 수. */
     pub resolved: u64,
-    /** @brief 차단한 수. */
     pub blocked: u64,
-    /** @brief 다른 답으로 바꾼 수. */
     pub rewritten: u64,
-    /** @brief 접근 제어에 막힌 수. */
     pub denied: u64,
-    /** @brief 거절로 답한 수. */
     pub refused: u64,
-    /** @brief 속도 제한에 막힌 수. */
     pub throttled: u64,
-    /** @brief 오류로 답한 수. */
     pub servfail: u64,
-    /** @brief 전송별 질의 수. */
     pub by_transport: Vec<(&'static str, u64)>,
-    /** @brief 평균 처리 시간. */
     pub avg_latency_ms: f64,
-    /** @brief 처리 시간 누적. 평균을 수집기가 직접 내도록 원자료로도 낸다. */
+    /// Raw sum, so collectors can compute the average themselves.
     pub latency_sum_us: u64,
-    /** @brief 처리 시간을 측정한 질의 수. */
     pub latency_count: u64,
-    /** @brief 캐시가 맞은 비율. */
     pub cache_hit_pct: f64,
 
-    /** @brief 캐시가 맞은 수. */
     pub cache_hits: u64,
-    /** @brief 캐시를 찾아본 수. */
     pub cache_lookups: u64,
-    /** @brief 대기열이 꽉 차 버린 기록 수. */
     pub dropped_log_events: u64,
-    /** @brief 슬롯이 꽉 차 버린 통계 전용 이벤트 수. 상위 목록만 표본이 된다. */
+    /// Only the top lists become a sample.
     pub dropped_stat_events: u64,
-    /** @brief 대기열이 꽉 차 못 보낸 실시간 이벤트 수. */
     pub dropped_stream_events: u64,
-    /** @brief 저장에 실패한 횟수. */
     pub persist_failures: u64,
 }
 
 #[derive(Debug, Clone)]
-/** @brief 질의 하나에 대한 기록. */
 pub struct QueryEvent {
-    /** @brief 이 기록의 번호. */
     pub id: u64,
-    /** @brief 질의가 온 시각. */
     pub ts_ms: u64,
-    /** @brief 질의를 보낸 곳. */
     pub client: IpAddr,
-    /** @brief 물어본 이름. */
     pub name: Option<Name>,
-    /** @brief 질의 종류. */
     pub qtype: String,
-    /** @brief 어느 전송으로 왔는지. */
     pub transport: &'static str,
-    /** @brief 어떻게 처리했는지. */
     pub action: &'static str,
-    /** @brief 응답 코드. */
     pub rcode: String,
-    /** @brief 그렇게 처리한 까닭. */
     pub reason: String,
-    /** @brief 어느 단계에서 갈렸는지. */
     pub stage: String,
-    /** @brief 덧붙일 내용. */
     pub detail: String,
 
-    /** @brief 답 요약. */
     pub answers: String,
-    /** @brief 어느 업스트림 서버가 답했는지. */
     pub upstream: String,
-    /** @brief 어느 규칙이 걸렸는지. */
+    /// Empty when the rule belongs to no list.
     pub rule: String,
-    /** @brief 그 규칙이 들어 있던 목록. 목록에 속하지 않는 규칙이면 비어 있다. */
     pub list: String,
 
-    /** @brief 처리에 걸린 시간. */
     pub latency_us: u64,
 
-    /** @brief 질의 기록에 남길지. */
     pub log: bool,
-    /** @brief 통계에 넣을지. */
     pub stat: bool,
 }
 
 #[derive(Debug)]
-/** @brief 상위 목록 집계에만 필요한 최소 질의 정보. */
+/// The minimum a top-list update needs.
 struct StatEvent {
-    /** @brief 질의를 보낸 곳. 익명화 설정까지 적용된 값이다. */
+    /// Already anonymized when configured.
     client: IpAddr,
-    /** @brief 물어본 이름. */
     name: Option<Name>,
-    /** @brief 차단 상위 목록을 구분하는 처분. */
+    /// Selects the blocked top list.
     action: Action,
 }
 
 #[derive(Default)]
-/** @brief 워커별 통계 이벤트와 누적 계수를 한 잠금으로 보호하는 샤드. */
+/// Per-worker shard; one lock guards its events and counters.
 struct StatSlot {
-    /** @brief collector가 가져갈 상위 목록 이벤트. */
     events: Vec<StatEvent>,
-    /** @brief snapshot이 직접 합산하는 질의 누적값. collector가 비워도 유지한다. */
+    /// Summed by snapshot directly; kept when the collector empties the slot.
     counters: StatCounters,
 }
 
 #[allow(clippy::large_enum_variant)]
-/**
- * @brief 수집 스레드에 보내는 실제 로그 또는 통계 슬롯 wake 신호.
- * @note 전체 로그를 box 하면 querylog 질의마다 할당이 하나 늘어나므로 큰 변형을
- *       그대로 둔다.
- */
+/// A full log event, or a wake signal for the stats slots. Boxing the large variant would add an
+/// allocation per logged query, so it stays inline.
 enum CollectorEvent {
-    /** @brief 즉시 처리할 전체 질의 로그. */
     Log(QueryEvent),
-    /** @brief 비어 있던 통계 슬롯에 첫 이벤트가 들어왔다. */
+    /// The first event entered an empty stats slot.
     StatsReady,
 }
 
 impl QueryEvent {
-    /** @brief 이 이벤트를 JSON 한 줄로. 저장과 실시간 전달에 같은 형식을 쓴다. */
+    /// One JSON line; persistence and live delivery share the format.
     pub fn to_json(&self) -> String {
         format!(
             "{{\"id\":{},\"ts_ms\":{},\"client\":{},\"name\":{},\"qtype\":{},\"transport\":{},\"action\":{},\"rcode\":{},\"reason\":{},\"stage\":{},\"detail\":{},\"answers\":{},\"upstream\":{},\"rule\":{},\"list\":{},\"latency_us\":{}}}",
@@ -715,27 +607,18 @@ impl QueryEvent {
 }
 
 #[derive(Default, Clone, Copy)]
-/** @brief 이벤트에 붙는 진단 정보. 응답 코드와 사유 등이다. */
 pub struct EventDiag<'a> {
-    /** @brief 응답 코드. */
     pub rcode: &'a str,
-    /** @brief 그렇게 처리한 까닭. */
     pub reason: &'a str,
-    /** @brief 어느 단계에서 갈렸는지. */
     pub stage: &'a str,
-    /** @brief 덧붙일 내용. */
     pub detail: &'a str,
-    /** @brief 답 요약. */
     pub answers: &'a str,
-    /** @brief 어느 업스트림 서버가 답했는지. */
     pub upstream: &'a str,
-    /** @brief 어느 규칙이 걸렸는지. */
     pub rule: &'a str,
-    /** @brief 그 규칙이 들어 있던 목록. */
     pub list: &'a str,
 }
 
-/** @brief 전송 이름을 고정 문자열로 바꾼다. 이벤트마다 문자열을 새로 만들지 않는다. */
+/// Maps to a static string, so events do not allocate one.
 pub(crate) fn intern_transport(s: &str) -> &'static str {
     Transport::ALL
         .into_iter()
@@ -744,9 +627,7 @@ pub(crate) fn intern_transport(s: &str) -> &'static str {
         .unwrap_or("do53-udp")
 }
 
-/** @brief 처분 이름을 고정 문자열로 바꾼다. */
 pub(crate) fn intern_action(s: &str) -> &'static str {
-    /** @brief 알려진 처분 이름들. */
     const NAMES: [&str; 7] = [
         "resolved",
         "blocked",
@@ -760,43 +641,32 @@ pub(crate) fn intern_action(s: &str) -> &'static str {
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
-/** @brief 디스크 보존 설정. */
 pub struct PersistOpts {
-    /** @brief 질의 기록을 담아 둘 파일. */
     pub querylog_file: Option<PathBuf>,
 
-    /** @brief 통계를 담아 둘 파일. */
     pub stats_file: Option<PathBuf>,
 
-    /** @brief 파일에 쓸 간격. */
     pub flush_secs: u64,
 }
 
 impl PersistOpts {
-    /** @brief 보존이 켜져 있는지. */
     fn enabled(&self) -> bool {
         self.querylog_file.is_some() || self.stats_file.is_some()
     }
 }
 
 #[derive(Clone)]
-/** @brief 기록기 설정. */
 pub struct RecorderOpts {
-    /** @brief 질의 기록을 남길지. */
     pub querylog: bool,
 
-    /** @brief 클라이언트 주소를 가릴지. */
     pub anonymize: bool,
 
-    /** @brief 기록에서 뺄 이름들. */
     pub ignored: Vec<String>,
 
-    /** @brief 통계를 남겨 둘 기간. */
     pub stats_retention_secs: u64,
 }
 
 impl Default for RecorderOpts {
-    /** @brief 기본 설정. */
     fn default() -> Self {
         Self {
             querylog: true,
@@ -808,73 +678,55 @@ impl Default for RecorderOpts {
 }
 
 #[derive(Clone)]
-/**
- * @brief 데이터 경로가 쓰는 기록기.
- * @warning record 계열은 절대 막히면 안 된다. 채널이 가득 차면 이벤트를 버리고 즉시 돌아온다.
- */
+/// The data path's recorder. record calls never block: on a full channel they drop the event and
+/// return.
 pub struct Recorder {
-    /** @brief 누적 지표. */
     metrics: Arc<Metrics>,
-    /** @brief 전체 로그와 통계 슬롯 wake를 보내는 유계 채널. */
+    /// Bounded channel for full log events and stats slot wakeups.
     log_tx: mpsc::SyncSender<CollectorEvent>,
 
-    /**
-     * @brief 통계 집계만 쓰는 이벤트를 모아 두는 슬롯들.
-     *
-     * @details 채널 전송은 대기자가 없어도 깨우기 시스템 호출을 낸다. 그 비용이 질의당
-     *          커널 시간의 큰 몫이라, 즉시성이 필요 없는 이벤트는 여기 모은다. 비어 있던
-     *          슬롯의 첫 push만 수집기를 깨우므로 지속 부하는 drain batch당 최대 한 번만
-     *          채널을 건드린다.
-     * @invariant 잠금은 슬롯마다 따로이고 잡은 채로 하는 일은 누적·push 또는 이벤트 통째 교체뿐이다.
-     *            가득 차면 기다리지 않고 버린다. 지표 수집이 서비스를 막지 않는다는
-     *            계약은 그대로다.
-     */
+    /// Slots collecting events used only for stats. A channel send makes a wakeup system call even
+    /// with no waiter, a large share of kernel time per query, so events that need no immediacy
+    /// gather here. Only the first push into an empty slot wakes the collector, so sustained load
+    /// touches the channel at most once per drain batch.
+    ///
+    /// Each slot has its own lock, held only to accumulate, push, or swap out the events. A full
+    /// slot drops instead of waiting, so metric collection still never blocks service.
     stat_slots: Arc<Vec<Mutex<StatSlot>>>,
-    /** @brief collector가 idle wait에 들어가 첫 통계 이벤트의 wake가 필요한지. */
+    /// Set while the collector idles, so the first stats event must wake it.
     stat_collector_idle: Arc<AtomicBool>,
-    /** @brief 질의 기록을 남길지. */
     querylog: Arc<AtomicBool>,
 
-    /**
-     * @brief 모은 것을 볼 수 있는 곳이 있는지.
-     *
-     * @details 관리 수신 주소도 통계·기록 파일도 없으면 이 기록은 어디로도 나가지 못한다.
-     *          그때 질의마다 이벤트를 만드는 것은 만들어서 버리는 일이라 헤드리스 배포가 쓰지도
-     *          않는 통계에 해석당 CPU의 4분의 1을 낸다.
-     * @invariant 참이 기본값이다. 알려 주지 않은 곳은 종전대로 모은다.
-     * @warning 무중단 갱신으로 관리 주소가 생기면 그때 참이 되어야 한다. 세대를 다시
-     *          만들지 않는 갱신 경로가 있으므로 그 자리에서도 다시 정해야 한다.
-     */
+    /// Whether anything can read what is collected. With neither a management listener nor stats or
+    /// log files, nothing can, and building an event per query is pure waste for a headless
+    /// deployment.
+    ///
+    /// Defaults to true: unless told otherwise, collect.
+    ///
+    /// A live update that adds a management address must set it true. Some update paths do not
+    /// rebuild the generation, so they must set it again in place.
     collecting: Arc<AtomicBool>,
-    /** @brief 클라이언트 주소를 가릴지. */
     anonymize: Arc<AtomicBool>,
-    /** @brief 통계에서 뺄 도메인 접미사들. 소문자·끝점 없는 형태로만 들어온다. */
+    /// Lowercase, without a trailing dot.
     ignored: Arc<RwLock<Vec<Box<str>>>>,
 
-    /** @brief 제외 목록이 비어 있지 않은지. 비었으면 잠금조차 잡지 않는다. */
+    /// Whether the ignore list is non-empty; when empty, the lock is not even taken.
     ignored_active: Arc<AtomicBool>,
-    /** @brief 메모리에 둘 최근 기록 수. */
     log_cap: Arc<AtomicUsize>,
-    /** @brief 기록 보존 기간. */
     retention_ms: Arc<AtomicU64>,
-    /** @brief 최근 기록. 대시보드가 여기서 읽는다. */
+    /// The dashboard reads from here.
     recent: Arc<Mutex<VecDeque<QueryEvent>>>,
-    /** @brief 배경 스레드들. 마지막 기록기가 사라질 때 함께 정리된다. */
+    /// Background threads, stopped when the last recorder drops.
     _runtime: Arc<RecorderRuntime>,
 }
 
-/** @brief 표본과 수집 스레드의 수명을 잡고 있는 것. */
 struct RecorderRuntime {
-    /** @brief 멈추라는 신호. */
     stop: Arc<AtomicBool>,
-    /** @brief 주기적으로 이력 표본을 남기는 스레드. */
     sampler: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /** @brief 채널을 비우며 통계를 갱신하는 스레드. */
     collector: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for RecorderRuntime {
-    /** @brief 거두는 스레드를 끝낸다. */
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self
@@ -905,12 +757,11 @@ impl Drop for RecorderRuntime {
 }
 
 impl Recorder {
-    /** @brief 누적 지표 핸들. */
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
     }
 
-    /** @brief 기록 설정을 바꾼다. 누적 통계는 그대로 둔다. */
+    /// Cumulative stats are kept.
     pub fn reconfigure(
         &self,
         querylog: bool,
@@ -950,39 +801,25 @@ impl Recorder {
         }
     }
 
-    /**
-     * @brief 질의 기록이 켜져 있는지.
-     *
-     * @details 기록에만 담기는 값을 호출자가 미리 만들지 않게 하려는 것이다. 꺼진
-     *          상태에서 만든 문자열은 그대로 버려진다.
-     * @return 켜져 있으면 참.
-     */
+    /// Lets callers skip building values only the query log uses; strings built while it is off are
+    /// just thrown away.
     pub fn querylog_enabled(&self) -> bool {
         self.querylog.load(Ordering::Acquire)
     }
 
-    /**
-     * @brief 모은 것을 볼 수 있는 곳이 있는지 알려 준다.
-     *
-     * @param on 관리 수신 주소나 통계·기록 파일이 있으면 참.
-     */
+    /// `on` when a management listener or a stats or log file exists.
     pub fn set_collecting(&self, on: bool) {
         self.collecting.store(on, Ordering::Release);
     }
 
-    /**
-     * @brief 지금 모으고 있는지.
-     *
-     * @details 호출자가 기록에만 쓰는 값을 미리 만들지 않게 하려는 것이다. 이름 짓기와
-     *          시계 읽기는 질의마다 드는 비용이라 볼 곳이 없으면 하지 않아야 한다.
-     * @return 볼 곳이 있으면 참.
-     */
+    /// Lets callers skip building values only the record uses: naming and reading the clock cost
+    /// something per query, so skip them when nothing can read the result.
     pub fn collecting(&self) -> bool {
         self.collecting.load(Ordering::Acquire)
     }
 
     #[allow(clippy::too_many_arguments)]
-    /** @brief 질의 하나를 기록한다. 처분에서 응답 코드와 사유를 정해 상세 기록으로 넘긴다. */
+    /// Derives the rcode and reason from the action and passes on to record_detailed.
     pub fn record(
         &self,
         transport: Transport,
@@ -1018,11 +855,8 @@ impl Recorder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /**
-     * @brief 진단 정보까지 붙여 질의 하나를 기록한다.
-     * @warning 채널에 넣기만 하고 즉시 돌아온다. 가득 차면 버리고 버린 수만 센다.
-     *          여기서 기다리면 지표 수집이 곧 서비스 장애가 된다.
-     */
+    /// Only enqueues and returns at once; on a full channel it drops the event and counts the drop.
+    /// Waiting here would turn metric collection into an outage.
     pub fn record_detailed(
         &self,
         transport: Transport,
@@ -1034,26 +868,21 @@ impl Recorder {
         stat_client: bool,
         diag: EventDiag,
     ) {
-        /*
-         * 볼 곳이 없으면 세는 것조차 하지 않는다. 누적 지표도 관리 수신 주소를 거쳐야만
-         * 읽히므로, 여기서 더한 값은 아무도 읽지 못한 채 사라진다.
-         */
+        // With nothing to read it, do not even count: cumulative metrics are read only through the
+        // management listener, so anything added here would vanish unread.
         if !self.collecting.load(Ordering::Acquire) {
             return;
         }
         let m = &self.metrics;
-        /*
-         * 이름은 값으로 담아 보낸다. Name은 Arc라 복제가 참조계수 증가이고, 문자열은
-         * 실제로 쓰는 쪽(상위 목록 키, 질의 기록 JSON)에서 만든다.
-         */
+        // The name goes by value: Name is an Arc, so a clone is a reference count increment, and
+        // strings are built only where used (top-list keys, query log JSON).
         let ignored = self.is_ignored(name);
         let do_log = self.querylog.load(Ordering::Acquire) && log_client && !ignored;
         let do_stat = stat_client && !ignored;
 
-        /*
-         * 로그 이벤트는 채널로 가므로 누적값도 기존 전역 atomic에 더한다. 기본 log-off 경로는
-         * 아래에서 이미 잡는 통계 슬롯 잠금에 세 값을 함께 누적해 전역 cacheline 쓰기를 없앤다.
-         */
+        // Log events go through the channel, so their totals go to the global atomics. The default
+        // log-off path folds these three into the stats slot lock it takes below, avoiding global
+        // cache line writes.
         if do_stat && do_log {
             m.total.fetch_add(1, Ordering::Relaxed);
             m.by_transport[transport.index()].fetch_add(1, Ordering::Relaxed);
@@ -1071,20 +900,16 @@ impl Recorder {
             return;
         }
 
-        /*
-         * 주소는 값으로 담아 보낸다. 문자열로 만드는 일은 실제로 쓰는 쪽으로 미뤄야
-         * 워커가 할당하고 수집 스레드가 해제하는 왕복이 생기지 않는다.
-         */
+        // The address goes by value; stringifying it where it is used avoids the worker allocating
+        // and the collector freeing.
         let client_s = if self.anonymize.load(Ordering::Acquire) {
             anonymize_ip(client)
         } else {
             client
         };
         if !do_log {
-            /*
-             * 통계 집계는 이름·클라이언트·처분만 본다. 전체 QueryEvent를 넣으면 비어 있는
-             * String 여덟 개와 로그 전용 필드까지 슬롯에 쓰고 옮기고 버리게 된다.
-             */
+            // Top lists look only at name, client, and action. A whole QueryEvent would write,
+            // move, and drop eight empty Strings and log-only fields through the slot.
             let ev = StatEvent {
                 client: client_s,
                 name: name.cloned(),
@@ -1114,10 +939,8 @@ impl Recorder {
             return;
         }
 
-        /*
-         * 여기부터는 실제 질의 기록에 담기는 값이다. 통계 전용 경로는 이 문자열들과
-         * 시계 읽기를 전혀 거치지 않는다.
-         */
+        // From here on, values go into the actual query log. The stats-only path never builds these
+        // strings or reads the clock.
         let ev = QueryEvent {
             id: 0,
             ts_ms: now_ms(),
@@ -1161,7 +984,6 @@ impl Recorder {
         }
     }
 
-    /** @brief 지연만 따로 기록한다. */
     pub fn record_latency_for(&self, micros: u64, stat_client: bool, name: Option<&Name>) {
         if !stat_client {
             return;
@@ -1176,13 +998,8 @@ impl Recorder {
         self.metrics.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /**
-     * @brief 이 이름이 제외 목록에 걸리는지.
-     *
-     * @details 질의마다 불리는 곳이라 이름을 스택 버퍼에 한 번만 정규화하고 목록은 이미
-     *          정규화된 것을 본다. 목록이 비면 잠금조차 잡지 않는다.
-     * @param name 질의 이름. 없으면 걸리지 않는 것으로 본다.
-     */
+    /// Runs per query, so the name is normalized once into a stack buffer and compared against an
+    /// already normalized list. An empty list skips the lock. A missing name never matches.
     fn is_ignored(&self, name: Option<&Name>) -> bool {
         if !self.ignored_active.load(Ordering::Acquire) {
             return false;
@@ -1199,7 +1016,6 @@ impl Recorder {
             .any(|d| suffix_matches(&normalized, d))
     }
 
-    /** @brief 캐시 적중 여부를 기록한다. */
     pub fn record_cache(&self, hit: bool) {
         self.metrics.cache_lookups.fetch_add(1, Ordering::Relaxed);
         if hit {
@@ -1208,17 +1024,12 @@ impl Recorder {
     }
 }
 
-/** @brief 정규화한 이름을 담을 버퍼 크기. 라벨 합은 와이어 길이 상한보다 늘 짧다. */
+/// The labels always sum to less than the wire length limit.
 const MAX_IGNORE_NAME: usize = 256;
 
-/**
- * @brief 제외 목록 항목을 미리 정규화한다.
- *
- * @details 목록은 설정이라 질의마다 바뀌지 않는다. 소문자화와 끝점 제거를 여기서 한 번만
- *          하지 않으면 질의마다 항목 수만큼 문자열을 새로 만들게 된다.
- * @param list 설정에 적힌 그대로의 접미사들.
- * @return 소문자·끝점 없는 형태. 빈 항목은 루트 이름에만 걸리므로 그대로 남긴다.
- */
+/// Normalizes the ignore list once, since it is configuration and does not change per query;
+/// otherwise each query would build a string per entry. Returns lowercase entries without a
+/// trailing dot; an empty entry matches only the root and is kept.
 fn normalize_ignored(list: Vec<String>) -> Vec<Box<str>> {
     list.into_iter()
         .map(|d| {
@@ -1230,14 +1041,10 @@ fn normalize_ignored(list: Vec<String>) -> Vec<Box<str>> {
         .collect()
 }
 
-/**
- * @brief 이름을 소문자 점 표기로 스택 버퍼에 담는다.
- *
- * @details 질의마다 불리므로 할당하지 않는 것이 목적이다. 라벨 경계에서만 점을 넣으므로
- *          결과에 끝점이 붙지 않는다.
- * @param buf 결과를 담을 슬롯. 이름 길이 상한상 항상 충분하지만, 넘치면 할당해 돌려준다.
- * @return 소문자 표기. UTF-8이 아닌 라벨은 손실 변환되어 대체 문자가 된다.
- */
+/// Writes the name in lowercase dotted form into a stack buffer, so the per-query path does not
+/// allocate. Dots go only between labels, so there is no trailing dot. The buffer always suffices
+/// for the name length limit; if not, the result is allocated. Non-UTF-8 labels convert lossily to
+/// replacement characters.
 fn normalize_into<'a>(name: &Name, buf: &'a mut [u8; MAX_IGNORE_NAME]) -> Cow<'a, str> {
     let mut len = 0usize;
     for (index, label) in name.labels().enumerate() {
@@ -1259,11 +1066,7 @@ fn normalize_into<'a>(name: &Name, buf: &'a mut [u8; MAX_IGNORE_NAME]) -> Cow<'a
     String::from_utf8_lossy(&buf[..len])
 }
 
-/**
- * @brief 정규화한 이름이 이 접미사에 걸리는지. 라벨 경계에서만 맞는 것으로 본다.
- * @param name normalize_into가 만든 소문자 표기.
- * @param d normalize_ignored가 만든 소문자 접미사.
- */
+/// Matches only at label boundaries. `name` comes from normalize_into, `d` from normalize_ignored.
 fn suffix_matches(name: &str, d: &str) -> bool {
     name == d
         || (name.len() > d.len()
@@ -1271,7 +1074,7 @@ fn suffix_matches(name: &str, d: &str) -> bool {
             && name.as_bytes()[name.len() - d.len() - 1] == b'.')
 }
 
-/** @brief 주소의 host 부분을 가린다. 통계는 남기되 개인을 특정하지 못하게 한다. */
+/// Masks the host part, so stats stay useful without identifying a person.
 fn anonymize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
@@ -1285,53 +1088,42 @@ fn anonymize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/** @brief 최소 힙. 상위 목록에서 가장 작은 것을 빨리 찾는 데 쓴다. */
+/// Min-heap for finding the smallest top-list entry quickly.
 type CounterHeap<K> = std::collections::BinaryHeap<std::cmp::Reverse<(u64, K)>>;
 
 #[derive(Default)]
-/** @brief 이름별 횟수와 상위 목록 유지 구조. */
 pub struct TopCounters {
-    /** @brief 이름별 질의 수. */
     pub domains: std::collections::HashMap<Name, u64>,
-    /** @brief 이름별 차단 수. */
     pub blocked: std::collections::HashMap<Name, u64>,
-    /** @brief 클라이언트별 질의 수. */
     pub clients: std::collections::HashMap<IpAddr, u64>,
-    /** @brief 이름별 상위 항목을 뽑는 곳. */
     domains_heap: CounterHeap<Name>,
-    /** @brief 차단 이름의 상위 항목을 뽑는 곳. */
     blocked_heap: CounterHeap<Name>,
-    /** @brief 클라이언트의 상위 항목을 뽑는 곳. */
     clients_heap: CounterHeap<IpAddr>,
-    /** @brief 상한에 닿은 뒤 이름이 맵에 없던 횟수. */
+    /// Misses of new names after the map reached `TOP_CAP`.
     domains_misses: u64,
-    /** @brief 상한에 닿은 뒤 차단 이름이 맵에 없던 횟수. */
     blocked_misses: u64,
-    /** @brief 상한에 닿은 뒤 클라이언트가 맵에 없던 횟수. */
     clients_misses: u64,
 }
 
-/** @brief 추적할 서로 다른 이름 수 상한. 종류가 많은 트래픽에서 메모리를 묶는다. */
+/// Bounds memory under high-cardinality traffic.
 pub(crate) const TOP_CAP: usize = 10_000;
 
-/** @brief 통계 전용 이벤트를 모으는 슬롯 수. 워커가 서로 다른 슬롯을 써 경합을 줄인다. */
+/// Workers use different slots to reduce contention.
 const STAT_SLOTS: usize = 16;
 
-/** @brief 슬롯 하나가 담는 이벤트 수. 넘치면 버리고 버린 수를 센다. */
+/// A full slot drops events and counts them.
 const STAT_SLOT_CAP: usize = 4096;
 
-/** @brief 슬롯에 일이 있을 때의 확인 주기. 부하가 높으면 이 간격으로 계속 비운다. */
+/// Under load, slots keep draining at this interval.
 const BUSY_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 
-/** @brief 다음에 배정할 슬롯. */
 static NEXT_STAT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
-    /** @brief 이 스레드가 쓸 슬롯. 처음 쓸 때 하나 배정받고 그대로 쓴다. */
+    /// Assigned on first use and kept.
     static STAT_SLOT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/** @brief 이 스레드에 배정된 슬롯 번호. */
 fn stat_slot_index() -> usize {
     STAT_SLOT.with(|cell| match cell.get() {
         Some(index) => index,
@@ -1343,10 +1135,7 @@ fn stat_slot_index() -> usize {
     })
 }
 
-/**
- * @brief 통계 이벤트를 슬롯에 넣고 비어 있던 슬롯의 첫 push만 collector에 알린다.
- * @return 슬롯이 가득 차지 않아 넣었으면 참.
- */
+/// Only the first push into an empty slot notifies the collector. False when the slot is full.
 fn push_stat_event(
     slot: &Mutex<StatSlot>,
     collector_idle: &AtomicBool,
@@ -1363,16 +1152,14 @@ fn push_stat_event(
     slot.events.push(event);
     drop(slot);
     if wake && collector_idle.swap(false, Ordering::AcqRel) {
-        /*
-         * 채널이 가득 찼다면 collector가 이미 처리할 일을 갖고 있어 다음 loop에서 슬롯도
-         * 비운다. wake 자체를 잃은 통계 이벤트로 세면 안 된다.
-         */
+        // A full channel means the collector already has work and will drain the slots on its next
+        // loop; a lost wakeup must not count as a lost stats event.
         let _ = wake_tx.try_send(CollectorEvent::StatsReady);
     }
     true
 }
 
-/** @brief 힙을 맵에서 다시 만든다. 지연 삭제가 쌓였을 때 정리한다. */
+/// Rebuilt when lazily deleted entries pile up.
 fn rebuild_heap<K: Eq + std::hash::Hash + Ord + Clone>(
     map: &std::collections::HashMap<K, u64>,
     heap: &mut CounterHeap<K>,
@@ -1383,37 +1170,28 @@ fn rebuild_heap<K: Eq + std::hash::Hash + Ord + Clone>(
         .collect();
 }
 
-/**
- * @brief 상한에 닿은 뒤 몇 번에 한 번만 새 이름을 들일지.
- *
- * @details 서로 다른 이름이 상한보다 많으면 빗나간 질의마다 맵에서 빼고 넣고 힙을
- *          정리하게 된다. 리졸버가 보는 이름은 거의 언제나 상한보다 많으므로 그것이
- *          정상 상태다. 기준을 높여도 상위 목록의 뜻은 그대로다. 자주 오는 이름은 여러
- *          번 빗나가므로 곧 들어오고, 교체하는 값만 내려간다.
- * @invariant 2의 거듭제곱이어야 나머지 연산이 비트 마스크로 합쳐진다.
- */
+/// Once at the cap, admit a new name only every this many misses. With more distinct names than the
+/// cap, every miss would remove from the map, insert, and clean the heap, and a resolver nearly
+/// always sees more names than the cap. The top lists keep their meaning: a frequent name misses
+/// repeatedly and soon gets in; only churn goes down.
+///
+/// Must be a power of two, so the modulo becomes a bit mask.
 const ADMIT_EVERY_MISSES: u64 = 16;
 
-/**
- * @brief 이름 하나의 횟수를 올린다. 상한을 넘으면 가장 적은 것을 밀어낸다.
- * @param misses 상한에 닿은 뒤 빗나간 횟수. 이 맵의 문을 좁히는 데 쓴다.
- * @note 종류가 극단적으로 많은 트래픽에서도 메모리가 상한 안에 머물러야 한다.
- */
+/// Increments a key, evicting the smallest when over the cap. `misses` counts misses after the cap
+/// was reached and narrows this map's admission. Memory must stay within the cap even under extreme
+/// cardinality.
 fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
     map: &mut std::collections::HashMap<K, u64>,
     heap: &mut CounterHeap<K>,
     misses: &mut u64,
     key: &K,
 ) {
-    /*
-     * 힙은 실제 축출이 허용되는 순간에만 쓰인다. 상한에 닿았더라도 새 키가 없거나
-     * admission 문을 아직 통과하지 않았다면 10,000개 키 복제와 힙 메모리가 필요 없다.
-     */
+    // The heap is used only when an eviction is actually admitted. At the cap with no new key, or
+    // before the admission gate opens, cloning 10,000 keys and the heap memory are unnecessary.
     if let Some(v) = map.get_mut(key) {
-        /*
-         * 힙은 축출할 때만 읽는다. 올릴 때마다 키를 복제해 밀어 넣을 필요가 없다.
-         * 낡은 항목은 축출이 계수 대조로 걸러내고, 다 걸러지면 그때 다시 만든다.
-         */
+        // The heap is read only on eviction, so increments need not clone and push keys. Eviction
+        // filters stale entries by comparing counts, and the heap is rebuilt when all are filtered.
         *v = v.saturating_add(1);
         return;
     }
@@ -1422,10 +1200,8 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
         return;
     }
 
-    /*
-     * 여기서부터가 교체하는 경로다. 맵 삭제·삽입과 힙 정리가 모두 여기 있으므로,
-     * 이름 종류가 상한보다 많으면 이 값이 질의마다 붙는다.
-     */
+    // From here on is the replacement path: map delete and insert plus heap cleanup all happen
+    // here, so with more distinct names than the cap, this cost would land on every query.
     *misses = misses.wrapping_add(1);
     if *misses % ADMIT_EVERY_MISSES != 0 {
         return;
@@ -1434,11 +1210,9 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
     if heap.is_empty() {
         rebuild_heap(map, heap);
     }
-    /*
-     * 두 바퀴가 상한이다. 첫 바퀴에서 낡은 항목만 나와 힙이 비면 다시 만들고, 그 힙은
-     * 맵과 계수가 정확히 같으므로 두 번째 바퀴의 첫 pop이 반드시 유효하다.
-     * 이 폴백이 없으면 낡은 힙에서 새 이름이 조용히 버려진다.
-     */
+    // Two rounds at most. If the first round yields only stale entries and empties the heap, it is
+    // rebuilt; that heap matches the map's counts exactly, so the second round's first pop is
+    // valid. Without this fallback, a stale heap would silently drop the new name.
     for attempt in 0..2 {
         while let Some(std::cmp::Reverse((count, candidate))) = heap.pop() {
             if map.get(&candidate) != Some(&count) {
@@ -1456,7 +1230,6 @@ fn bump<K: Eq + std::hash::Hash + Ord + Clone>(
     }
 }
 
-/** @brief 상위 n개를 추출한다. */
 fn top_n<K: std::fmt::Display>(
     map: &std::collections::HashMap<K, u64>,
     n: usize,
@@ -1468,57 +1241,43 @@ fn top_n<K: std::fmt::Display>(
 }
 
 #[derive(Debug, Clone)]
-/** @brief 대시보드에 보낼 상위 목록들. */
 pub struct TopLists {
-    /** @brief 많이 물은 이름들. */
     pub domains: Vec<(String, u64)>,
-    /** @brief 많이 차단된 이름들. */
     pub blocked: Vec<(String, u64)>,
-    /** @brief 많이 물은 클라이언트들. */
     pub clients: Vec<(String, u64)>,
 }
 
-/** @brief 실시간 구독자들의 보내는 쪽. */
 type Subscribers = Arc<Mutex<Vec<mpsc::SyncSender<QueryEvent>>>>;
 
-/** @brief 구독 하나. 놓친 구간이 있으면 그 사실도 함께 알린다. */
+/// One subscription, reporting any gap it missed.
 pub struct QuerySubscription {
-    /** @brief 붙기 직전까지의 기록. 붙는 순간의 빈틈을 메운다. */
+    /// Events recorded just before subscribing, closing the gap at the moment of attaching.
     pub replay: Vec<QueryEvent>,
-    /** @brief 앞으로 올 기록을 받을 곳. */
     pub receiver: mpsc::Receiver<QueryEvent>,
-    /** @brief 붙기 전 기록이 이미 밀려나 빠진 것이 있는지. */
+    /// Events from before subscribing were already evicted, so some are missing.
     pub replay_gap: bool,
 }
 
 #[derive(Clone)]
-/** @brief 대시보드가 읽는 쪽 핸들. */
+/// Read-side handle for the dashboard.
 pub struct Stats {
-    /** @brief 누적 지표. */
     pub metrics: Arc<Metrics>,
-    /** @brief 최근 질의 기록. */
     pub recent: Arc<Mutex<VecDeque<QueryEvent>>>,
-    /** @brief 상위 항목 카운터. */
     pub top: Arc<Mutex<TopCounters>>,
 
-    /** @brief 실시간 기록을 받는 쪽들. */
     subscribers: Subscribers,
 
-    /** @brief 남겨 둘 최근 기록 수. */
     log_cap: Arc<AtomicUsize>,
 
-    /** @brief 파일에 담는 설정. */
     persist: Arc<RwLock<PersistOpts>>,
 }
 
 impl Stats {
-    /** @brief 최근 기록 몇 개. */
     pub fn recent(&self, limit: usize) -> Vec<QueryEvent> {
         let b = self.recent.lock_recover();
         b.iter().rev().take(limit).cloned().collect()
     }
 
-    /** @brief 지금 보존 설정. */
     pub fn persist_opts(&self) -> PersistOpts {
         self.persist
             .read()
@@ -1526,11 +1285,8 @@ impl Stats {
             .clone()
     }
 
-    /**
-     * @brief 최근 기록을 지운다.
-     * @note 디스크 삭제가 실패하면 메모리도 지우지 않는다. 한쪽만 지우면 재시작 때
-     *       지운 줄 알았던 기록이 되살아난다.
-     */
+    /// If deleting on disk fails, memory is kept too; clearing only one would bring back records
+    /// thought deleted at restart.
     pub fn clear_recent(&self) -> std::io::Result<()> {
         let querylog_file = self
             .persist
@@ -1546,7 +1302,6 @@ impl Stats {
         Ok(())
     }
 
-    /** @brief 지금 상태를 디스크에 밀어낸다. */
     pub fn flush_persisted(&self) -> std::io::Result<()> {
         let persist = self.persist_opts();
         if let Some(path) = persist.querylog_file.as_deref() {
@@ -1560,7 +1315,7 @@ impl Stats {
         Ok(())
     }
 
-    /** @brief 보존 설정을 바꾼다. 끄기 전에는 마지막 상태를 저장한다. */
+    /// Saves the last state before persistence is turned off.
     pub fn reconfigure_persist(&self, persist: PersistOpts) -> std::io::Result<()> {
         let mut current_guard = self
             .persist
@@ -1618,16 +1373,12 @@ impl Stats {
         Ok(())
     }
 
-    /** @brief 이후 이벤트를 실시간으로 받는다. */
     pub fn subscribe(&self) -> mpsc::Receiver<QueryEvent> {
         self.subscribe_after(None).receiver
     }
 
-    /**
-     * @brief 특정 번호 이후의 이벤트를 받는다. 놓친 것은 먼저 재생한다.
-     * @note 보존 기간이 지나 재생할 수 없으면 그 사실을 함께 알린다. 조용히 건너뛰면
-     *       구독자는 빠진 줄도 모른다.
-     */
+    /// Replays what was missed after `last_id` first. If that is past retention, it says so;
+    /// skipping silently, the subscriber would not know anything was lost.
     pub fn subscribe_after(&self, last_id: Option<u64>) -> QuerySubscription {
         let live_capacity = self.log_cap.load(Ordering::Acquire).max(256);
         let (tx, rx) = mpsc::sync_channel::<QueryEvent>(live_capacity);
@@ -1673,7 +1424,6 @@ impl Stats {
         }
     }
 
-    /** @brief 상위 목록. */
     pub fn top(&self, n: usize) -> TopLists {
         let t = self.top.lock_recover();
         TopLists {
@@ -1684,7 +1434,7 @@ impl Stats {
     }
 }
 
-/** @brief 수집 스레드가 이벤트 하나를 처리한다. 통계 갱신과 구독자 전달을 함께 한다. */
+/// Updates stats and delivers to subscribers.
 fn process_event(
     ev: QueryEvent,
     subs: &Subscribers,
@@ -1742,7 +1492,6 @@ fn process_event(
     }
 }
 
-/** @brief 통계 전용 값으로 상위 목록을 갱신한다. */
 fn process_stat_values(
     client: &IpAddr,
     name: Option<&Name>,
@@ -1753,7 +1502,7 @@ fn process_stat_values(
     process_stat_values_locked(client, name, blocked_action, &mut t);
 }
 
-/** @brief 이미 상위 목록 잠금을 가진 batch 안에서 통계 값 하나를 반영한다. */
+/// For a batch that already holds the top-list lock.
 fn process_stat_values_locked(
     client: &IpAddr,
     name: Option<&Name>,
@@ -1772,7 +1521,7 @@ fn process_stat_values_locked(
         clients_misses,
     } = t;
     if let Some(name) = name {
-        /* 키는 대소문자를 구분하므로 바꿔서 넣는다. 이미 소문자면 빌린 참조를 그대로 쓴다. */
+        // Keys are case-sensitive, so fold first; an already lowercase name is borrowed as is.
         let name = name.to_ascii_lower_name();
         let name = name.as_ref();
         bump(domains, domains_heap, domains_misses, name);
@@ -1784,16 +1533,12 @@ fn process_stat_values_locked(
 }
 
 #[derive(Clone, Copy)]
-/** @brief 파일에 보존하는 통계 자료의 종류. */
 enum PersistKind {
-    /** @brief 상세 질의 기록. */
     Querylog,
-    /** @brief 누적 통계. */
     Stats,
 }
 
 impl PersistKind {
-    /** @brief 구조화 로그에 쓸 고정 이름. */
     fn as_str(self) -> &'static str {
         match self {
             PersistKind::Querylog => "querylog",
@@ -1802,28 +1547,24 @@ impl PersistKind {
     }
 }
 
-/** @brief 저장 종류 하나의 마지막 실패 지문과 경고 시각. */
+/// Fingerprint of the last failure of one kind, and when it was reported.
 struct PersistWarningState {
-    /** @brief 원문을 보관하지 않는 저장 경로 지문. */
+    /// Fingerprint, so the path itself is not kept.
     path: u64,
-    /** @brief 원문을 보관하지 않는 오류 문자열 지문. */
+    /// Fingerprint, so the error text is not kept.
     message: u64,
-    /** @brief 이 실패를 마지막으로 경고한 시각. */
     last: Instant,
 }
 
-/** @brief 저장 종류별 고정 슬롯으로 되풀이 경고를 억제하는 상태. */
+/// Suppresses repeated warnings, with a fixed slot per kind.
 struct PersistWarnings {
-    /** @brief 입력으로 지문 충돌을 고르지 못하게 하는 프로세스별 상태. */
+    /// Per-process seed, so input cannot choose fingerprint collisions.
     fingerprint_state: RandomState,
-    /** @brief 질의 기록 저장 실패 슬롯. */
     querylog: Option<PersistWarningState>,
-    /** @brief 누적 통계 저장 실패 슬롯. */
     stats: Option<PersistWarningState>,
 }
 
 impl Default for PersistWarnings {
-    /** @brief 비어 있는 두 저장 실패 슬롯을 만든다. */
     fn default() -> Self {
         Self {
             fingerprint_state: RandomState::new(),
@@ -1834,7 +1575,6 @@ impl Default for PersistWarnings {
 }
 
 impl PersistWarnings {
-    /** @brief 저장 종류에 대응하는 고정 슬롯. */
     fn slot_mut(&mut self, kind: PersistKind) -> &mut Option<PersistWarningState> {
         match kind {
             PersistKind::Querylog => &mut self.querylog,
@@ -1842,7 +1582,7 @@ impl PersistWarnings {
         }
     }
 
-    /** @brief 이 실패를 지금 경고해야 하는지 판정하고 지문 상태를 갱신한다. */
+    /// Updates the fingerprint state too.
     fn should_log(&mut self, kind: PersistKind, path: &Path, message: &str, now: Instant) -> bool {
         let path = self.fingerprint_state.hash_one(("path", path));
         let message = self.fingerprint_state.hash_one(("message", message));
@@ -1865,19 +1605,16 @@ impl PersistWarnings {
         should_log
     }
 
-    /** @brief 성공한 저장 종류의 실패 상태를 지운다. */
     fn clear(&mut self, kind: PersistKind) {
         *self.slot_mut(kind) = None;
     }
 
     #[cfg(test)]
-    /** @brief 지금 차 있는 저장 실패 슬롯 수. */
     fn retained_slots(&self) -> usize {
         usize::from(self.querylog.is_some()) + usize::from(self.stats.is_some())
     }
 }
 
-/** @brief 저장 실패를 로그로 남긴다. */
 fn persist_warning(
     warnings: &mut PersistWarnings,
     kind: PersistKind,
@@ -1896,7 +1633,6 @@ fn persist_warning(
     }
 }
 
-/** @brief 지표와 기록을 디스크에 쓴다. */
 fn flush_persist(
     persist: &PersistOpts,
     metrics: &Metrics,
@@ -1926,11 +1662,8 @@ fn flush_persist(
     }
 }
 
-/**
- * @brief 기록기와 읽기 핸들을 만들고 배경 스레드를 시작한다.
- * @details 유계 채널 하나로 데이터 경로와 수집을 나눈다. 이 경계가 있어야 지표가 질의
- *          처리를 막지 않는다.
- */
+/// Creates the recorder and read handle and starts the background threads. The bounded channel
+/// separates the data path from collection; that boundary keeps metrics from blocking queries.
 pub fn channel(
     queue: usize,
     log_cap: usize,
@@ -2103,10 +1836,8 @@ pub fn channel(
             let mut dirty = false;
             let mut persist_warnings = PersistWarnings::default();
 
-            /*
-             * 슬롯을 비우는 주기이기도 하다. 길게 잡으면 슬롯이 넘쳐 통계가 표본이 된다.
-             * 슬롯 전체 용량을 이 시간 안에 들어오는 질의 수보다 크게 유지해야 한다.
-             */
+            // Also the slot drain period. Too long and slots overflow, turning stats into a sample:
+            // total slot capacity must exceed the queries arriving in this time.
             let poll_interval = Duration::from_millis(20);
             let mut process = |mut ev: QueryEvent| {
                 if ev.log {
@@ -2123,10 +1854,8 @@ pub fn channel(
                     &metrics_t,
                 );
             };
-            /*
-             * 슬롯에 모인 통계 전용 이벤트를 가져온다. slot 잠금은 통째 교체 동안만,
-             * 상위 목록 잠금은 batch 하나 동안만 잡는다.
-             */
+            // Takes the stats-only events from the slots. A slot lock is held only for the swap,
+            // the top-list lock for one batch.
             let drain_slots = || -> bool {
                 let mut seen = false;
                 for slot in collector_slots.iter() {
@@ -2148,20 +1877,17 @@ pub fn channel(
                 seen
             };
 
-            /*
-             * 슬롯에 일이 있었으면 거의 자지 않고 곧장 다시 본다. 주기 하나로만 비우면
-             * 부하가 높을 때 슬롯이 넘쳐 통계가 표본이 된다.
-             */
+            // If the slots had work, look again almost at once; draining only on the period lets
+            // slots overflow under load.
             loop {
                 let wait = if drain_slots() {
                     collector_idle.store(false, Ordering::Release);
                     dirty = true;
                     BUSY_DRAIN_INTERVAL
                 } else {
-                    /*
-                     * 첫 drain과 idle 표시 사이에 들어온 이벤트는 표시 뒤 재검사로 잡는다.
-                     * 그 뒤 들어온 첫 이벤트는 표시를 내리고 wake token을 보낸다.
-                     */
+                    // Events arriving between the first drain and the idle flag are caught by the
+                    // recheck after setting it. The first event after that clears the flag and
+                    // sends a wake token.
                     collector_idle.store(true, Ordering::Release);
                     if drain_slots() {
                         collector_idle.store(false, Ordering::Release);
@@ -2179,7 +1905,8 @@ pub fn channel(
                     Ok(CollectorEvent::StatsReady) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        /* 보내는 쪽이 사라져도 슬롯에 남은 것은 통계에 반영하고 나간다. */
+                        // Even with every sender gone, what remains in the slots is counted before
+                        // exiting.
                         drain_slots();
                         let persist = persist_state_t
                             .read()
@@ -2264,7 +1991,6 @@ pub fn channel(
     )
 }
 
-/** @brief 현재 Unix 밀리초. */
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2273,12 +1999,10 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
-/** @brief 데이터 경로를 막지 않는 것, 설정 변경에도 통계가 살아남는 것, 그리고 구독 끊김 통지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 통계 전용 슬롯이 로그 문자열 구조체 때문에 다시 커지지 않는지. */
     fn stat_event_keeps_slot_memory_compact() {
         let compact = std::mem::size_of::<StatEvent>();
         let full = std::mem::size_of::<QueryEvent>();
@@ -2301,7 +2025,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief idle collector만 첫 슬롯 이벤트로 깨우고 지속 부하 wake는 합쳐지는지. */
+    /// Only an idle collector is woken by the first slot event, and wakeups under sustained load
+    /// coalesce.
     fn stat_slot_wakes_only_an_idle_collector() {
         let (tx, rx) = mpsc::sync_channel(1);
         let slot = Mutex::new(StatSlot::default());
@@ -2343,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief log-off 샤드 계수가 즉시 정확하고 저장·복원에도 빠지지 않는지. */
+    /// Log-off shard counts are exact at once and survive save and restore.
     fn sharded_stat_counters_are_immediate_and_persisted() {
         let opts = RecorderOpts {
             querylog: false,
@@ -2389,7 +2114,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상위 목록 슬롯이 차도 누적 질의 계수는 한 건도 잃지 않는지. */
     fn full_stat_slot_drops_only_top_attribution() {
         let (tx, _rx) = mpsc::sync_channel(1);
         let slots = Arc::new(vec![Mutex::new(StatSlot::default())]);
@@ -2421,7 +2145,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 워커가 동시에 샤드에 더해도 snapshot 총계가 정확한지. */
     fn sharded_stat_counters_are_exact_under_concurrency() {
         const THREADS: usize = 8;
         const PER_THREAD: usize = 1_000;
@@ -2464,7 +2187,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns-control --release bench_stat_slot_payload -- --ignored --nocapture"]
-    /** @brief 전체 로그 이벤트와 compact 통계 이벤트의 슬롯 쓰기 비용을 같은 바이너리에서 측정한다. */
+    /// Compares slot write cost of full log events and compact stats events in the same binary.
     fn bench_stat_slot_payload() {
         const BATCHES: usize = 256;
         let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -2539,7 +2262,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns-control --release bench_stat_counter_folding -- --ignored --nocapture"]
-    /** @brief 전역 누적 atomic 세 번을 이미 잡는 슬롯 잠금에 합칠 가치가 있는지 구분한다. */
+    /// Whether folding three global atomics into the slot lock already held is worth it.
     fn bench_stat_counter_folding() {
         const EVENTS: usize = 1_000_000;
         let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -2617,7 +2340,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns-control --release bench_stat_top_batch_lock -- --ignored --nocapture"]
-    /** @brief 상위 목록 잠금을 이벤트마다 잡는 것과 슬롯 batch마다 잡는 비용을 구분한다. */
+    /// Top-list lock per event versus per slot batch.
     fn bench_stat_top_batch_lock() {
         const BATCHES: usize = 128;
         let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -2670,7 +2393,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 마지막 기록기가 사라질 때 남은 이벤트를 비우고 스레드를 정리하는지. */
     fn last_recorder_drop_drains_events_and_joins_metrics_threads() {
         let querylog = std::env::temp_dir().join(format!(
             "onetdns-metrics-drain-{}-{}.jsonl",
@@ -2717,13 +2439,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 볼 곳이 없다고 알려 주면 질의마다 아무것도 만들지 않는지.
-     *
-     * @details 헤드리스 배포는 관리 수신 주소도 저장 파일도 없어 여기 쌓인 것을 읽을
-     *          길이 없다. 그런데도 이벤트를 만들어 슬롯에 넣으면 해석당 CPU의 4분의 1을
-     *          쓰지도 않을 통계에 낸다.
-     */
+    /// Headless deployments have neither a management listener nor files, so nothing collected here
+    /// can be read.
     fn nothing_is_collected_when_nobody_can_read_it() {
         let (recorder, stats) = channel(8, 8, 60, RecorderOpts::default(), PersistOpts::default());
         let name = Name::from_str("unread.example").unwrap();
@@ -2755,10 +2472,8 @@ mod tests {
             "볼 곳이 없는데 질의 기록을 남겼습니다"
         );
 
-        /*
-         * 대조군. 같은 호출이 볼 곳이 생기면 반드시 남아야 한다. 이것이 없으면 위 단정은
-         * 기록기가 전부 고장 나도 통과한다.
-         */
+        // Control: once there is a reader, the same calls must be recorded. Without this, the
+        // assertion above would pass even with a completely broken recorder.
         recorder.set_collecting(true);
         hit();
         assert_eq!(
@@ -2774,7 +2489,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정을 바꿔도 누적 통계가 살아남는지. */
     fn reconfigure_preserves_accumulated_metrics() {
         let (recorder, stats) = channel(8, 8, 60, RecorderOpts::default(), PersistOpts::default());
         let name = Name::from_str("keep.example").unwrap();
@@ -2808,7 +2522,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기록 용량을 줄이면 즉시 반영되는지. */
     fn reconfigure_trims_recent_log_immediately() {
         let (recorder, stats) = channel(8, 8, 0, RecorderOpts::default(), PersistOpts::default());
         {
@@ -2852,7 +2565,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장 경로를 계속 바꿔도 실패 경고 상태가 저장 종류 수보다 커지지 않는지. */
     fn persistence_warning_state_is_bounded_by_active_kinds() {
         let mut warnings = PersistWarnings::default();
         let now = Instant::now();
@@ -2896,7 +2608,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장 경로가 바뀌어도 통계가 초기화되지 않는지. */
     fn persistence_paths_can_change_without_resetting_stats() {
         let suffix = format!("{}-{}", std::process::id(), now_ms());
         let querylog =
@@ -2941,7 +2652,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보존을 끄기 전에 마지막 상태를 저장하는지. */
     fn disabling_persistence_flushes_the_previous_files() {
         let suffix = format!("{}-{}", std::process::id(), now_ms());
         let querylog =
@@ -2989,7 +2699,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 디스크 삭제가 실패하면 메모리도 지우지 않는지. 한쪽만 지우면 재시작 때 되살아난다. */
+    /// Clearing only one would bring them back at restart.
     fn clear_recent_keeps_memory_when_persistent_clear_fails() {
         let suffix = format!("{}-{}", std::process::id(), now_ms());
         let querylog =
@@ -3036,7 +2746,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 익명화가 host 부분만 가리고 대역은 남기는지. */
     fn anonymize_masks_host() {
         assert_eq!(
             anonymize_ip("203.0.113.45".parse().unwrap()).to_string(),
@@ -3049,12 +2758,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상한에 닿으면 가장 적은 항목이 밀려나는지.
-     *
-     * @details 상한에 닿은 뒤로는 빗나간 질의 몇 번에 한 번만 들인다. 자주 오는 이름은
-     *          여러 번 빗나가므로 곧 들어오고, 한 번만 오는 이름은 맵을 흔들지 않는다.
-     */
+    /// Once at the cap, a new name is admitted only every few misses. A frequent name misses
+    /// repeatedly and soon gets in; a one-off name does not churn the map.
     fn bump_evicts_least_count_when_full() {
         let mut map = std::collections::HashMap::new();
         for i in 0..TOP_CAP {
@@ -3077,13 +2782,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 한 번만 오는 이름이 맵을 교체하지 않는지.
-     *
-     * @details 리졸버가 보는 이름 종류는 거의 언제나 상한보다 많다. 빗나갈 때마다 맵에서
-     *          빼고 넣고 힙을 정리하면 그 값을 질의마다 내게 되고, 상위 목록은 서로를
-     *          밀어내기만 해 뜻도 없어진다.
-     */
+    /// A resolver nearly always sees more distinct names than the cap. Churning the map and heap on
+    /// every miss would cost that on every query, and the top lists would only push each other out.
     fn one_off_names_do_not_churn_the_map() {
         let mut map = std::collections::HashMap::new();
         for i in 0..TOP_CAP {
@@ -3108,12 +2808,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의 기록이 꺼져 있어도 통계 집계가 온전한지.
-     *
-     * @details 기록에만 담기는 항목은 꺼진 상태에서 만들지 않는다. 그 최적화가 통계까지
-     *          비우면 상위 목록이 빈다. 켠 상태에서는 항목이 실제로 실려야 한다.
-     */
+    /// Values that only go into the query log are not built while it is off; if that optimization
+    /// emptied the stats too, the top lists would be empty. With it on, the values must actually be
+    /// carried.
     fn querylog_off_still_counts_stats_and_on_carries_detail() {
         let name = Name::from_str("gated.example.").unwrap();
         let shot = |querylog: bool| {
@@ -3174,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한에 못 미치면 힙을 아예 건드리지 않는지. 축출이 없으므로 유지가 낭비다. */
+    /// Without eviction, maintaining it is waste.
     fn bump_leaves_heap_untouched_below_capacity() {
         let mut map = std::collections::HashMap::new();
         let mut heap = CounterHeap::new();
@@ -3190,7 +2887,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 축출이 허용되기 전에는 상한에 닿아도 힙을 만들지 않는지. */
     fn bump_builds_heap_only_when_eviction_is_admitted() {
         let mut map = std::collections::HashMap::new();
         let mut heap = CounterHeap::new();
@@ -3227,13 +2923,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 힙이 낡은 항목으로만 차 있어도 새 이름이 버려지지 않는지.
-     *
-     * @details 올릴 때 힙을 갱신하지 않으므로 상한에 닿은 뒤 계수를 올리면 힙 항목이
-     *          전부 낡는다. 축출이 그 상태에서 힙을 다시 만들지 않으면 새 이름이
-     *          조용히 사라진다.
-     */
+    /// Increments do not update the heap, so after reaching the cap, bumping counts makes every
+    /// heap entry stale. If eviction did not rebuild the heap then, the new name would vanish
+    /// silently.
     fn bump_admits_newcomer_even_when_heap_is_entirely_stale() {
         let mut map = std::collections::HashMap::new();
         let mut heap = CounterHeap::new();
@@ -3248,7 +2940,7 @@ mod tests {
         assert_eq!(heap.len(), TOP_CAP, "첫 축출이 힙을 만들어야 합니다");
 
         assert_eq!(map.len(), TOP_CAP);
-        /* 첫 축출 뒤 실제로 남은 키를 전부 한 번씩 올려 힙의 계수를 모두 낡게 만든다. */
+        // Bump every key left after the first eviction once, so all heap counts go stale.
         let keys: Vec<_> = map.keys().cloned().collect();
         for key in keys {
             bump(&mut map, &mut heap, &mut misses, &key);
@@ -3266,7 +2958,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름 종류가 극단적으로 많아도 메모리가 상한 안에 머무는지. */
     fn bump_heap_remains_bounded_under_high_cardinality() {
         let mut map = std::collections::HashMap::new();
         let mut heap = CounterHeap::new();
@@ -3283,7 +2974,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제외 목록이 라벨 경계에서만 걸리는지. */
     fn ignored_domain_suffix_match() {
         let matches = |name: &str, d: &str| {
             let name = Name::from_str(name).unwrap();
@@ -3303,7 +2993,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름 정규화가 질의마다 할당하지 않는지. */
     fn ignored_name_normalization_does_not_allocate() {
         let mut buf = [0u8; MAX_IGNORE_NAME];
         let name = Name::from_str("a.b.tracking.test").unwrap();
@@ -3329,7 +3018,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대소문자만 다른 같은 이름이 상위 목록에서 갈라지지 않는지. */
     fn top_domains_fold_case_variants_into_one_entry() {
         let (recorder, stats) =
             channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
@@ -3361,7 +3049,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 차단 처분이 차단 상위 목록에 실제로 쌓이는지. */
     fn blocked_action_reaches_the_blocked_top_list() {
         let (recorder, stats) =
             channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
@@ -3393,7 +3080,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제외 목록이 비었으면 잠금조차 잡지 않는지. */
+    /// With an empty ignore list, the lock is never taken.
     fn ignored_active_flag_gates_stat_counting() {
         let (rec, _stats) = channel(16, 100, 0, RecorderOpts::default(), PersistOpts::default());
         let total = || rec.metrics().snapshot().total;
@@ -3423,7 +3110,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 타이머가 시간을 재고 중첩에서 이전 값을 되돌리는지. */
     fn request_timer_measures_and_restores() {
         assert_eq!(current_request_latency_us(), 0, "타이머 없으면 0");
         {
@@ -3436,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 구간 지연이 누적 총합이 아니라 차분으로 나오는지. 총합을 쓰면 재시작 직후 값이 튄다. */
+    /// Using the total would spike right after a restart.
     fn rolling_latency_uses_window_delta_not_persisted_total() {
         let mut history = MetricHistory::default();
         history.reset_baseline(
@@ -3469,7 +3155,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 긴 구간을 요청해도 점이 그 구간을 덮는지. */
     fn history_points_keep_requested_long_range() {
         let mut history = MetricHistory::default();
         history.reset_baseline(MetricBucket::default(), 10_000);
@@ -3494,7 +3179,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 바뀐 용량이 읽기 핸들에도 반영되는지. */
     fn stats_shares_reconfigured_log_capacity() {
         let (rec, stats) = channel(8, 32, 0, RecorderOpts::default(), PersistOpts::default());
         assert_eq!(stats.log_cap.load(Ordering::Acquire), 32);
@@ -3504,7 +3188,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 구독자가 이후 이벤트를 받는지. */
     fn subscribe_receives_broadcast_events() {
         let (rec, stats) = channel(16, 100, 0, RecorderOpts::default(), PersistOpts::default());
         let rx = stats.subscribe();
@@ -3531,7 +3214,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 놓친 것만 재생하고 이미 받은 것을 다시 주지 않는지. */
     fn subscribe_after_replays_only_missing_events() {
         let (rec, stats) = channel(32, 100, 0, RecorderOpts::default(), PersistOpts::default());
         for name in ["one.example", "two.example", "three.example"] {
@@ -3564,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기록하지 않는 이벤트가 번호에 구멍을 내지 않는지. 구멍이 나면 구독자가 놓친 줄 안다. */
+    /// A gap would make subscribers think they missed something.
     fn non_log_events_do_not_gap_log_ids() {
         let (rec, stats) = channel(32, 100, 0, RecorderOpts::default(), PersistOpts::default());
         rec.record(
@@ -3620,7 +3302,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보존 기간이 지나 재생할 수 없으면 그 사실을 알리는지. */
     fn subscribe_after_reports_retention_gap() {
         let (rec, stats) = channel(32, 2, 0, RecorderOpts::default(), PersistOpts::default());
         for _ in 0..4 {
@@ -3634,10 +3315,9 @@ mod tests {
                 true,
             );
         }
-        /*
-         * 기록은 배경 스레드가 처리한다. 최근 기록이 두 개인 것은 앞의 기록 두세 개만 처리된 때도
-         * 같고, 그때는 1번 뒤가 아직 남아 있어 빈틈이 없다. 그래서 마지막 기록을 기다린다.
-         */
+        // The background thread processes records. Two recent records also happens when only the
+        // first two or three were processed, and then the record after #1 is still there with no
+        // gap, so wait for the last one.
         for _ in 0..100 {
             if stats.recent(1).first().is_some_and(|event| event.id == 4) {
                 break;
@@ -3655,7 +3335,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 번호가 끊긴 경우를 알리는지. */
     fn subscribe_after_reports_internal_id_gap() {
         let (_rec, stats) = channel(8, 8, 0, RecorderOpts::default(), PersistOpts::default());
         {
@@ -3708,7 +3387,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재시작으로 기록이 비었을 때도 끊김을 알리는지. */
     fn subscribe_after_reports_restart_gap_when_recent_is_empty() {
         let (_rec, stats) = channel(8, 8, 0, RecorderOpts::default(), PersistOpts::default());
         let subscription = stats.subscribe_after(Some(42));
@@ -3717,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 느린 구독자를 끊는지. 붙잡고 있으면 수집 전체가 밀린다. */
+    /// Holding on to it would stall all collection.
     fn slow_subscriber_is_disconnected_on_queue_overflow() {
         let (rec, stats) = channel(1024, 64, 0, RecorderOpts::default(), PersistOpts::default());
         let _rx = stats.subscribe();
@@ -3749,7 +3427,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 사라진 구독자가 목록에서 정리되는지. */
     fn dropped_subscriber_is_pruned() {
         let (rec, stats) = channel(16, 100, 0, RecorderOpts::default(), PersistOpts::default());
         let rx = stats.subscribe();

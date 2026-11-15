@@ -1,9 +1,5 @@
-/*!
- * @brief DoQ 업스트림: QUIC 위의 DNS(RFC 9250).
- *
- * @details 질의마다 새 양방향 스트림을 연다. 스트림이 독립이라 하나가 막혀도 다른 질의가
- *          밀리지 않는 것이 TCP 기반 전송과 다른 점이다.
- */
+//! DNS over QUIC upstream (RFC 9250). Each query opens a new bidirectional stream, so unlike TCP
+//! transports one stalled query does not hold up the others.
 
 use std::cell::RefCell;
 #[cfg(test)]
@@ -24,32 +20,25 @@ use crate::quicdrive::{
 };
 use crate::{validate_response, ForwardError};
 
-/** @brief 보관 중인 DoQ 연결 하나. */
 struct DoqConn {
-    /** @brief 이 연결의 소켓. */
     sock: QuicSocket,
-    /** @brief 이 연결의 QUIC 상태 기계. */
     conn: Connection,
 
-    /** @brief 다음에 열 클라이언트 양방향 스트림 번호. */
     next_bidi: u64,
 
-    /** @brief 이 연결을 연 시각. 너무 오래되면 버린다. */
+    /// Too old connections are dropped.
     created: Instant,
-    /** @brief 붙은 서버 이름. */
     server_name: String,
-    /** @brief 폐기 확인을 이미 했는지. 연결당 한 번만 한다. */
+    /// Checked once per connection.
     revocation_checked: bool,
 }
 
 impl Drop for DoqConn {
-    /**
-     * @brief 버려지는 연결의 종료를 서버에 알린다.
-     * @details 오류, 시간 초과, 무응답, LRU 축출, 스레드 종료 가운데 어느 경로로 버려도 여기를
-     *          지난다. 열린 연결은 알릴 오류 없이 닫고, 이미 닫힌 연결은 쌓아 둔 종료 프레임만
-     *          내보낸다. 소켓도 함께 닫으므로 closing 기간은 기다리지 않는다. 알리지 않으면 서버는
-     *          자기 유휴 데드라인까지 연결을 붙들고 있다.
-     */
+    /// Tells the server the connection is going away, whichever way it is dropped: error, timeout,
+    /// silence, LRU eviction, or thread exit. An open connection closes with no error code; a
+    /// closed one sends only its queued close frame. The socket closes too, so there is no wait for
+    /// the closing period. Without the notice, the server holds the connection until its own idle
+    /// deadline.
     fn drop(&mut self) {
         if !self.conn.is_closed() {
             self.conn.close(doq::NO_ERROR, "");
@@ -59,15 +48,12 @@ impl Drop for DoqConn {
 }
 
 thread_local! {
-    /** @brief (주소, 서버 이름)별 연결 풀. */
     static POOL: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), DoqConn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
 }
 
-/** @brief 스레드 하나가 보관할 DoQ 연결 수 상한. */
 const MAX_POOLED_CONNECTIONS: usize = 256;
 
-/** @brief DoQ로 질의를 교환한다. 보관된 연결이 있으면 재사용한다. */
 pub(crate) fn exchange(
     addr: SocketAddr,
     server_name: &str,
@@ -119,7 +105,6 @@ pub(crate) fn exchange(
     })
 }
 
-/** @brief 새 DoQ 연결을 맺고 핸드셰이크를 끝낸다. */
 fn connect(
     addr: SocketAddr,
     server_name: &str,
@@ -148,11 +133,8 @@ fn connect(
     Ok(c)
 }
 
-/**
- * @brief 스트림 하나를 열어 질의를 보내고 응답을 받는다.
- * @note DoQ 메시지는 트랜잭션 ID를 0으로 보낸다(RFC 9250). 스트림이 이미 질의와 응답을
- *       짝지어 주므로 ID가 필요 없고, 남겨 두면 연결 지문이 된다.
- */
+/// Sends with transaction ID 0, as RFC 9250 requires: the stream already pairs query and response,
+/// and a kept ID would fingerprint the connection.
 fn roundtrip(
     c: &mut DoqConn,
     wire: &[u8],
@@ -233,7 +215,6 @@ fn roundtrip(
 }
 
 #[cfg(test)]
-/** @brief 인증서 검증, 연결 재사용, 그리고 죽은 연결에서의 빠른 복구. */
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
@@ -250,13 +231,12 @@ mod tests {
     use crate::quicdrive::random_cid;
     use crate::{Forwarder, Upstream};
 
-    /** @brief 자체 서명 인증서를 쓰는 테스트용 업스트림. */
     fn doq_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _peers) = doq_server_ex(ip, false, "dns.test");
         (addr, trust)
     }
 
-    /** @brief 자체 서명 인증서를 쓰는 DoQ 서버 설정과 그 인증서만 믿는 신뢰 저장소. */
+    /// DoQ server config with a self-signed certificate, and a trust store that trusts only it.
     fn doq_server_config(name: &str) -> (Arc<ServerConfig>, Arc<TrustStore>) {
         let ck = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
         let cert_der = ck.cert.der().to_vec();
@@ -275,7 +255,7 @@ mod tests {
         (scfg, trust)
     }
 
-    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
+    /// Counts connections.
     fn doq_server_ex(
         ip: Ipv4Addr,
         one_shot: bool,
@@ -336,13 +316,11 @@ mod tests {
         (addr, trust, peers_ret)
     }
 
-    /** @brief 테스트용 질의. */
     fn q(id: u16, name: &str) -> Message {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
     }
 
     #[test]
-    /** @brief 인증서를 검증하고 연결을 다시 쓰는지. */
     fn doq_forward_verified_and_reuses_connection() {
         let (addr, trust) = doq_server(Ipv4Addr::new(3, 3, 3, 3));
         let fwd = Forwarder::with_upstreams(
@@ -365,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쉬고 있어도 살아 있으면 다시 쓰는지. */
     fn doq_idle_alive_connection_is_reused() {
         let (addr, trust, peers) = doq_server_ex(Ipv4Addr::new(7, 7, 7, 7), false, "dns.test");
         let fwd = Forwarder::with_upstreams(
@@ -383,7 +360,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 죽은 연결을 붙잡지 않고 곧바로 다시 잇는지. */
     fn doq_reused_zombie_fails_fast_then_reconnects() {
         let (addr, trust, peers) = doq_server_ex(Ipv4Addr::new(8, 8, 8, 8), true, "dns.test");
         let fwd = Forwarder::with_upstreams(
@@ -408,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 연결로 잇달아 물어도 모두 답을 받는지. */
     fn doq_many_sequential_reuses_all_succeed() {
         let (addr, trust) = doq_server(Ipv4Addr::new(2, 2, 2, 2));
         let fwd = Forwarder::with_upstreams(
@@ -424,7 +399,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 폐기 확인 훅이 실제로 걸리는지. */
     fn doq_enforces_revocation_hook() {
         let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, _) = doq_server_ex(Ipv4Addr::new(4, 4, 4, 4), false, "revoke.test");
@@ -451,7 +425,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 믿을 수 없는 인증서를 거부하는지. */
     fn doq_rejects_untrusted_cert() {
         let (addr, _trust) = doq_server(Ipv4Addr::new(5, 5, 5, 5));
         let fwd = Forwarder::with_upstreams(
@@ -463,11 +436,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 업스트림 인증서를 거부한 클라이언트가 그 까닭을 서버에 알리는지.
-     * @details 알리지 않고 연결을 버리면 서버는 핸드셰이크 중인 연결을 자기 유휴 데드라인까지
-     *          붙들고 있다.
-     */
+    /// Without the notice, the server holds the half-done connection until its own idle deadline.
     fn doq_rejected_certificate_is_reported_to_the_server() {
         let (addr, _trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
         let fwd = Forwarder::with_upstreams(
@@ -486,7 +455,7 @@ mod tests {
         );
     }
 
-    /** @brief 질의를 그대로 되돌려 주는 응답. 답 레코드는 없다. */
+    /// Echoes the question with no answer records.
     fn answer_in_kind(req: &Message) -> Message {
         let mut m = Message::default();
         m.header.id = req.header.id;
@@ -495,18 +464,16 @@ mod tests {
         m
     }
 
-    /** @brief 다른 이름을 물은 질의에 대한 응답. */
+    /// Answers a different name than asked.
     fn answer_other_question(req: &Message) -> Message {
         let mut m = answer_in_kind(req);
         m.questions = q(req.header.id, "other.test").questions;
         m
     }
 
-    /**
-     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림.
-     * @param answer 받은 질의에 실을 응답을 만든다.
-     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 연결마다 받은 종료 사유를 차례로 받는 곳.
-     */
+    /// Upstream that collects the close reasons the client reports. `answer` builds the reply to
+    /// each query. Returns the server address, a trust store for its certificate, and a receiver of
+    /// each connection's close reasons.
     fn doq_close_recorder(
         name: &str,
         answer: fn(&Message) -> Message,
@@ -561,11 +528,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 풀에서 버려지는 연결이 알릴 오류 없이 닫힌다고 서버에 알리는지.
-     * @details 연결을 쥔 스레드가 끝나며 풀이 사라지는 경우다. 알리지 않으면 서버는 자기 유휴
-     *          데드라인까지 연결을 붙들고 있다.
-     */
+    /// Here the pool goes away as its thread ends. Without the notice, the server holds the
+    /// connection until its own idle deadline.
     fn doq_discarded_connection_notifies_the_server() {
         let (addr, trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
         thread::spawn(move || {
@@ -590,10 +554,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의에 맞지 않는 응답을 받으면 DOQ_PROTOCOL_ERROR 로 연결을 닫는지.
-     * @details 그런 서버가 같은 연결로 보낼 다음 응답도 믿을 수 없다.
-     */
+    /// Later answers from such a server on the same connection cannot be trusted either.
     fn doq_mismatched_answer_closes_with_protocol_error() {
         let (addr, trust, closes) = doq_close_recorder("dns.test", answer_other_question);
         let fwd = Forwarder::with_upstreams(
@@ -609,11 +570,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의를 실어 보낼 수 없는 연결을 DOQ_INTERNAL_ERROR 로 닫는지.
-     * @details 서버가 앞선 데이터를 확인하지 않아 보낼 버퍼가 가득 찬 경우다. 그 연결은 버리고,
-     *          서버에는 정상 종료와 구분되는 내부 실패로 알린다.
-     */
+    /// The server has acknowledged nothing, so the send buffer is full. The connection is dropped
+    /// and the server is told of an internal failure, distinct from a normal close.
     fn doq_unsendable_query_closes_with_internal_error() {
         let _revocation_test_guard = crate::revocation_test_read_guard();
         let (addr, trust, closes) = doq_close_recorder("dns.test", answer_in_kind);
@@ -633,10 +591,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 경고로 서버에 알리는지.
-     * @details TLS 가 인증서를 거부했을 때처럼 CRYPTO_ERROR 를 담은 전송 계층 종료로 나간다.
-     */
+    /// Goes out as a transport close carrying CRYPTO_ERROR, as when TLS rejects a certificate.
     fn doq_revocation_rejection_is_reported_to_the_server() {
         let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, closes) = doq_close_recorder("revoked.test", answer_in_kind);
@@ -670,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 업스트림이라도 더 엄격한 신뢰 정책이 이전 QUIC 연결·세션을 재사용하지 않는지. */
+    /// A stricter trust policy must not reuse QUIC connections or sessions from before.
     fn doq_cache_is_scoped_to_trust_policy() {
         let (addr, trust) = doq_server(Ipv4Addr::new(5, 5, 5, 6));
         let trusted = Forwarder::with_upstreams(
@@ -690,7 +645,6 @@ mod tests {
 
     #[test]
     #[ignore = "네트워크 필요(AdGuard DoQ 실서버 상호운용성 테스트)"]
-    /** @brief 실제 공개 업스트림과의 왕복. */
     fn doq_live_adguard() {
         let fwd = Forwarder::with_upstreams(
             vec![Upstream::doq(
@@ -711,7 +665,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담아 둔 세션으로 왕복 없이 이어 붙는지. */
     fn doq_resumes_with_cached_session_and_zero_rtt() {
         let (addr, trust) = doq_server(Ipv4Addr::new(9, 9, 9, 9));
 

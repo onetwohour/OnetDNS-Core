@@ -1,6 +1,4 @@
-/*!
- * @brief 계층 테스트가 함께 쓰는 가짜 리졸버와 레코드 생성기.
- */
+//! Fake resolvers and record builders shared by layer tests.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,17 +9,13 @@ use onetdns_proto::{Message, Name, RData, Record, RecordType};
 use crate::layers::{answer_message, now_secs};
 use crate::native::Resolver;
 
-/** @brief 정해진 응답을 내는 테스트용 리졸버. */
+/// Answers with a fixed rcode; `tag` shows which resolver answered.
 pub(super) struct Mock {
-    /** @brief 이 리졸버를 가리키는 표식. 어느 쪽이 답했는지 본다. */
     tag: u8,
-    /** @brief 돌려줄 응답 코드. */
     rcode: u16,
-    /** @brief 불린 횟수. */
     pub(super) calls: AtomicU32,
 }
 impl Mock {
-    /** @brief 표식과 응답 코드를 정해 만든다. */
     pub(super) fn new(tag: u8, rcode: u16) -> Arc<Self> {
         Arc::new(Mock {
             tag,
@@ -31,7 +25,6 @@ impl Mock {
     }
 }
 impl Resolver for Mock {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let q = req.questions.first().unwrap();
@@ -47,16 +40,13 @@ impl Resolver for Mock {
     }
 }
 
-/** @brief 빈 응답을 내는 테스트용 리졸버. */
+/// Answers with no records, with or without a SOA in authority.
 pub(super) struct EmptyMock {
-    /** @brief 권한 기록을 담을지. */
     with_soa: bool,
-    /** @brief 불린 횟수. */
     pub(super) calls: AtomicU32,
 }
 
 impl EmptyMock {
-    /** @brief 권한 기록을 담을지 정해 만든다. */
     pub(super) fn new(with_soa: bool) -> Arc<Self> {
         Arc::new(Self {
             with_soa,
@@ -66,7 +56,6 @@ impl EmptyMock {
 }
 
 impl Resolver for EmptyMock {
-    /** @brief 미리 정해 둔 응답을 돌려준다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let q = req.questions.first()?;
@@ -90,12 +79,10 @@ impl Resolver for EmptyMock {
     }
 }
 
-/** @brief 테스트용 질의. */
 pub(super) fn query(name: &str, qtype: RecordType) -> Message {
     Message::query(1, Name::from_str(name).unwrap(), qtype)
 }
 
-/** @brief 응답의 첫 주소. */
 pub(super) fn first_a(m: &Message) -> Ipv4Addr {
     for r in &m.answers {
         if let RData::A(ip) = r.rdata {
@@ -105,7 +92,6 @@ pub(super) fn first_a(m: &Message) -> Ipv4Addr {
     Ipv4Addr::UNSPECIFIED
 }
 
-/** @brief 테스트용 부재 증명 기록. */
 pub(super) fn nsec_record(owner: &str, next: &str, types: &[u16]) -> Record {
     let mut rdata = Vec::new();
     for label in next.trim_end_matches('.').split('.') {
@@ -129,7 +115,6 @@ pub(super) fn nsec_record(owner: &str, next: &str, types: &[u16]) -> Record {
     )
 }
 
-/** @brief 테스트용 권한 기록. */
 pub(super) fn soa_record(zone: &str) -> Record {
     Record::new(
         Name::from_str(zone).unwrap(),
@@ -146,7 +131,6 @@ pub(super) fn soa_record(zone: &str) -> Record {
     )
 }
 
-/** @brief 남은 기간을 지정한 테스트용 서명. */
 pub(super) fn rrsig_record_with_lifetime(record: &Record, lifetime: u32) -> Record {
     let now = now_secs() as u32;
     let signature = onetdns_dnssec::Rrsig {
@@ -167,12 +151,10 @@ pub(super) fn rrsig_record_with_lifetime(record: &Record, lifetime: u32) -> Reco
     )
 }
 
-/** @brief 테스트용 서명. */
 pub(super) fn rrsig_record(record: &Record) -> Record {
     rrsig_record_with_lifetime(record, 3600)
 }
 
-/** @brief 기록마다 서명을 붙인다. */
 pub(super) fn with_rrsigs(mut records: Vec<Record>) -> Vec<Record> {
     let signatures = records.iter().map(rrsig_record).collect::<Vec<_>>();
     records.extend(signatures);

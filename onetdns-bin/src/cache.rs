@@ -1,13 +1,10 @@
-/*!
- * @brief 응답 캐시와 같은 질의 합치기.
- *
- * @details 같은 질의가 동시에 여럿 들어오면 하나만 밖으로 나가고 나머지는 그 결과를
- *          나눠 받는다. 캐시는 조각으로 나뉘어 잠금 경합을 줄인다.
- * @warning 키는 응답을 달라지게 하는 모든 것을 담아야 한다. 덜 담으면 다른 질의에 같은
- *          답을 준다. 반대로 응답과 무관한 것까지 담으면 캐시가 맞지 않는다.
- * @note 답으로 인정할 조건이 까다롭다. 질문한 것이 실제로 답에 있어야 하고, 부정 응답은
- *       그것을 증명하는 권한 기록이 있어야 한다. 아니면 저장하지 않는다.
- */
+//! Response cache, plus coalescing of identical queries in flight: when the same query arrives
+//! several times at once, one goes upstream and the rest share its result. The cache is sharded to
+//! reduce lock contention.
+//!
+//! The key must hold everything that changes the response: holding less gives one query another's
+//! answer, and holding more makes the cache miss. A response is stored only when what was asked is
+//! actually in it, and a negative one only with the authority record that proves it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,38 +31,30 @@ pub(crate) use key::{
 };
 pub(crate) use ttl::{cache_dnssec_ttl_cap, dnssec_ttl_cap};
 
-/** @brief 진행 중인 해석 하나와 그 결과를 기다리는 곳. */
+/// A resolution in flight, with the result its followers wait for.
 struct ClientFlight {
-    /** @brief 다 되면 여기에 채운다. */
     result: Mutex<Option<Result<Message, ResolveFailure>>>,
-    /** @brief 기다리는 쪽을 깨우는 곳. */
     ready: Condvar,
 
-    /**
-     * @brief 지금 condvar에서 기다리는 수. 0이면 깨우지 않는다.
-     * @invariant wait 안에서만 늘고 줄어든다. 결과 잠금을 쥔 채로 늘리므로, 결과를 채운 쪽이
-     *            0을 읽었다면 그 뒤에 기다리기 시작한 쪽은 잠들기 전에 결과를 본다.
-     */
+    /// Followers waiting on the condvar; at 0, `complete` skips the notify. Changed only inside
+    /// `wait`, and incremented under the result lock, so a follower arriving after `complete` read
+    /// 0 sees the result before sleeping.
     waiters: std::sync::atomic::AtomicUsize,
 
-    /** @brief 밖으로 내보낸 스레드. 자기 자신을 기다리지 않으려고 본다. */
+    /// So the leader never waits on its own flight.
     leader_thread: std::thread::ThreadId,
 }
 
-/** @brief 대표가 실패해도 기다리는 쪽을 반드시 깨우는 것. */
+/// Wakes the followers even when the leader returns without a result.
 struct FlightLeaderGuard<'a> {
-    /** @brief 이 대표가 맡은 질의. */
     key: FlightKey,
-    /** @brief 결과를 채울 곳. */
     flight: Arc<ClientFlight>,
-    /** @brief 진행 중인 것들의 목록. */
     flights: &'a Mutex<HashMap<FlightKey, Arc<ClientFlight>>>,
-    /** @brief 결과를 이미 알렸는지. */
     finished: bool,
 }
 
 impl FlightLeaderGuard<'_> {
-    /** @brief 결과를 알리고 슬롯을 비운다. */
+    /// Publishes the result and removes the flight from the table.
     fn finish(&mut self, result: Result<Message, ResolveFailure>) {
         self.flight.complete(result);
         self.flights.lock_recover().remove(&self.key);
@@ -74,10 +63,7 @@ impl FlightLeaderGuard<'_> {
 }
 
 impl Drop for FlightLeaderGuard<'_> {
-    /**
-     * @brief 결과를 내지 못하고 끝났으면 실패로 알린다.
-     * @warning 알리지 않으면 기다리는 쪽이 데드라인까지 멈춘다.
-     */
+    /// Otherwise followers would stall until the deadline.
     fn drop(&mut self) {
         if !self.finished {
             self.flight.complete(Err(ResolveFailure::Permanent(None)));
@@ -87,7 +73,7 @@ impl Drop for FlightLeaderGuard<'_> {
 }
 
 impl ClientFlight {
-    /** @brief 지금 스레드를 대표로 삼는다. */
+    /// With the current thread as leader.
     fn new() -> Self {
         Self {
             result: Mutex::new(None),
@@ -97,9 +83,9 @@ impl ClientFlight {
         }
     }
 
-    /** @brief 결과를 기다린다. 데드라인을 넘기면 없다. */
+    /// None past the deadline.
     fn wait(&self, timeout: Duration) -> Option<Result<Message, ResolveFailure>> {
-        /** @brief 어떤 경로로 돌아가든 대기자 수를 되돌린다. */
+        /// Restores the waiter count on every return path.
         struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
         impl Drop for Waiting<'_> {
             fn drop(&mut self) {
@@ -135,11 +121,7 @@ impl ClientFlight {
         )
     }
 
-    /**
-     * @brief 결과를 채우고 기다리는 쪽을 깨운다.
-     * @note 기다리는 쪽이 없으면 깨우지 않는다. 대기자 0에도 깨우기를 호출하면 그것이
-     *       그대로 시스템 호출이 된다.
-     */
+    /// Skips the notify with no waiters, since it would still be a system call.
     fn complete(&self, result: Result<Message, ResolveFailure>) {
         *self.result.lock_recover() = Some(result);
 
@@ -149,66 +131,45 @@ impl ClientFlight {
     }
 }
 
-/** @brief 결과를 기다려 줄 시간. */
+/// Followers still waiting after this answer SERVFAIL.
 const CLIENT_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
-/** @brief 동시에 합칠 수 있는 질의 수. 넘으면 합치지 않고 그냥 각자 나간다. */
+/// Past it, queries go upstream without coalescing.
 const MAX_CLIENT_FLIGHTS: usize = 4_096;
-/** @brief 실패를 기억할 기본 기간. */
+/// Doubles with each repeated failure, up to `FAILURE_CACHE_MAX_TTL`.
 const FAILURE_CACHE_BASE_TTL: Duration = Duration::from_secs(5);
-/** @brief 실패를 기억할 최대 기간. */
 const FAILURE_CACHE_MAX_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
-/** @brief 실패 기록 하나. 거듭 실패하면 기억 기간이 늘어난다. */
 struct FailureEntry {
-    /** @brief 이 실패 기억이 끝나는 시각. */
     expiry: Instant,
-    /** @brief 연달아 실패한 횟수. 기억 기간을 늘리는 데 쓴다. */
     attempts: u8,
 }
 
-/**
- * @brief 레코드로 담아 둔 응답.
- * @details 세 구간을 딱 맞는 크기로 담는다. 여분 슬롯을 남기면 항목마다 그만큼 메모리가
- *          더 든다.
- */
+/// Sections are sized exactly; spare capacity would cost memory in every entry.
 struct StructuredEntry {
-    /** @brief 답 구간. */
     answers: Box<[Record]>,
-    /** @brief 권한 구간. */
     authorities: Box<[Record]>,
-    /** @brief 딸린 기록 구간. */
     additionals: Box<[Record]>,
-    /** @brief 담은 시각. */
     inserted: Instant,
 
-    /** @brief 이 항목의 수명. */
     lifetime_secs: u32,
-    /** @brief 응답 코드. */
     rcode: u16,
-    /** @brief 검증된 답인지. */
     authentic: bool,
 }
 
-/**
- * @brief 설정에 고정해 둔 주소가 답했다는 표시.
- * @warning 이 표시가 있어야 그곳에 있는 것이 바깥 계층의 답이 아님을 알 수 있다.
- *          구분하지 않으면 남의 답을 고정 수명 항목으로 승격시킨다.
- */
+/// Marks a slot answered by a configured fixed address. Without it, promotion could not tell
+/// another layer's answer apart and would turn it into a fixed-TTL entry.
 struct LocalWireMarker;
 
 impl StructuredEntry {
-    /** @brief 담아 둔 뒤 흐른 초. */
     fn elapsed_secs(&self, now: Instant) -> u32 {
         u32::try_from(now.saturating_duration_since(self.inserted).as_secs()).unwrap_or(u32::MAX)
     }
 
-    /** @brief 이만큼 흘렀으면 만료인지. */
     fn is_expired_at(&self, elapsed_secs: u32) -> bool {
         elapsed_secs >= self.lifetime_secs
     }
 
-    /** @brief 남은 수명. 만료면 없다. */
     fn remaining_lifetime(&self, now: Instant) -> Option<u32> {
         let elapsed = self.elapsed_secs(now);
         let remaining = self.lifetime_secs.saturating_sub(elapsed);
@@ -217,27 +178,19 @@ impl StructuredEntry {
 }
 
 #[derive(Clone)]
-/**
- * @brief 캐시 한 곳에 들어가는 것.
- * @details 레코드로 담은 것, 바이트로 담은 것, 고정 수명으로 담은 것, 그리고 아직
- *          승격되지 않았음을 알리는 표시. 슬롯 하나가 이 중 하나만 잡는다.
- */
 enum Entry {
-    /** @brief 레코드로 담은 답. */
     Structured(Arc<StructuredEntry>),
 
-    /** @brief 바이트로 담은 답. */
     Wire(crate::wirecache::WireEntry),
 
-    /** @brief 수명이 변하지 않는 바이트 답. */
+    /// Bytes whose TTLs never age.
     LocalWire(crate::wirecache::WireEntry),
 
-    /** @brief 고정해 둔 주소가 답했다는 표시. 아직 승격되지 않았다. */
+    /// A fixed address answered; not promoted yet.
     LocalWireMarker(Arc<LocalWireMarker>),
 }
 
 impl Entry {
-    /** @brief 담아 둔 뒤 흐른 초. */
     fn elapsed_secs(&self, now: Instant) -> u32 {
         match self {
             Self::Structured(entry) => entry.elapsed_secs(now),
@@ -247,7 +200,6 @@ impl Entry {
         }
     }
 
-    /** @brief 이만큼 흘렀으면 만료인지. */
     fn is_expired_at(&self, elapsed_secs: u32) -> bool {
         match self {
             Self::Structured(entry) => entry.is_expired_at(elapsed_secs),
@@ -257,7 +209,6 @@ impl Entry {
         }
     }
 
-    /** @brief 남은 수명. 만료면 없다. */
     fn remaining_lifetime(&self, now: Instant) -> Option<u32> {
         match self {
             Self::Structured(entry) => entry.remaining_lifetime(now),
@@ -267,10 +218,7 @@ impl Entry {
         }
     }
 
-    /**
-     * @brief 같은 것을 가리키는지.
-     * @warning 승격 직전에 확인한다. 그 사이 다른 답으로 바뀌었으면 승격하면 안 된다.
-     */
+    /// Checked right before promotion, so an entry replaced meanwhile is not overwritten.
     fn same_allocation(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Structured(left), Self::Structured(right)) => Arc::ptr_eq(left, right),
@@ -286,44 +234,31 @@ impl Entry {
     }
 }
 
-/**
- * @brief 해석을 시작하기 전에 잡아 둔 캐시 세대.
- * @details 담는 함수는 모두 이것을 받는다. 캐시를 비운 뒤에 돌아온 답은 세대가 달라 담기지
- *          않는다. 이 모듈 밖에서는 epoch로만 얻는다.
- */
+/// Cache generation taken before resolution starts. Every store takes one, so an answer returning
+/// after a clear carries an old generation and is not stored. Obtained outside this module only
+/// through `epoch`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct CacheEpoch(u64);
 
-/** @brief 조각으로 나눈 응답 캐시와 최근 실패 기억. */
+/// Sharded response cache plus recent failures.
 pub struct NativeCache {
-    /** @brief 조각들. 조각마다 잠금이 따로다. */
     shards: Vec<Mutex<LruMap<CacheKey, Entry>>>,
-    /** @brief 최근 실패 기억. */
     failures: Mutex<LruMap<FailureKey, FailureEntry>>,
-    /**
-     * @brief 비울 때마다 오르는 세대.
-     * @invariant clear는 무엇이든 비우기 전에 이 값을 올리고, 담는 쪽은 담을 곳의 잠금을 잡은
-     *            채 이 값을 다시 본다. 그래서 비우기 전에 시작한 해석의 답은 비운 뒤에 남지
-     *            않는다.
-     */
+    /// Bumped on every clear. `clear` bumps it before emptying anything, and stores recheck it
+    /// under the target lock, so an answer from a resolution started before a clear does not
+    /// survive it.
     epoch: AtomicU64,
-    /** @brief 조각 번호를 뽑는 데 쓰는 가리개. */
     mask: usize,
-    /** @brief 조각을 나누는 비밀값. 프로세스마다 다르다. */
+    /// Per process, so chosen names cannot pile into one shard.
     hash_keys: [u64; 2],
-    /** @brief 담을 때 걸 수명 하한. */
     min_ttl: u32,
-    /** @brief 담을 때 걸 수명 상한. */
     max_ttl: u32,
 
-    /** @brief 부정 응답의 수명 하한. */
     neg_min: u32,
-    /** @brief 부정 응답의 수명 상한. */
     neg_max: u32,
 }
 
 impl NativeCache {
-    /** @brief 정해진 용량을 조각들에 나눠 담는다. */
     pub fn new(
         capacity: usize,
         shards: usize,
@@ -357,17 +292,13 @@ impl NativeCache {
         }
     }
 
-    /**
-     * @brief 밖으로 나가는 응답의 수명을 담을 때와 같은 상한으로 자른다.
-     *
-     * @details 미스는 업스트림이 준 응답을 그대로 내보내는데, 담는 사본만 잘라 두면 처음 물어본
-     *          클라이언트만 설정보다 긴 수명을 받는다. 그 클라이언트가 곧 아래쪽 캐시라
-     *          max_ttl이 묶으려던 시간이 전부 새어 나간다.
-     * @warning 내리기만 하고 올리지 않는다. 밖으로 나가는 값을 올리면 업스트림이 정한 것보다
-     *          오래 가지고 있으라고 말하는 셈이 된다.
-     * @param negative NXDOMAIN 또는 SOA로 증명된 NODATA이면 참. answer가 비었다는 사실만으로
-     *                 정하면 referral을 부정 응답으로 오인한다.
-     */
+    /// Caps outgoing TTLs like the stored copy. A miss sends the upstream response as is; capping
+    /// only the stored copy would give the first client a TTL beyond the config, and since that
+    /// client is often a downstream cache, `max_ttl` would bound nothing. Only lowers TTLs, never
+    /// raises them.
+    ///
+    /// `negative` is true for NXDOMAIN or for NODATA proven by an SOA; judging by an empty answer
+    /// section alone would treat a referral as negative.
     pub fn clamp_outgoing_ttls(&self, response: &mut Message, negative: bool) {
         let section_cap = if negative { self.neg_max } else { self.max_ttl };
         for record in &mut response.answers {
@@ -385,13 +316,12 @@ impl NativeCache {
         }
     }
 
-    /** @brief 캐시 키. 너무 긴 것은 담지 않는다. */
+    /// None when too long to store.
     fn key(request: &Message) -> Option<CacheKey> {
         FlightKey::from_request(request)
             .filter(|key| key.as_slice().len() <= MAX_CACHED_REQUEST_WIRE)
     }
 
-    /** @brief 이 키가 들어갈 조각 번호. */
     fn idx(&self, key: &[u8]) -> usize {
         if self.mask == 0 {
             return 0;
@@ -401,7 +331,7 @@ impl NativeCache {
     }
 
     #[cfg(test)]
-    /** @brief 담아 둔 답을 꺼낸다. 테스트용 진입점. */
+    /// For tests.
     pub fn get(
         &self,
         request: &Message,
@@ -410,10 +340,7 @@ impl NativeCache {
         self.get_by_key(key.as_slice())
     }
 
-    /**
-     * @brief 키로 답을 꺼낸다.
-     * @details 흐른 만큼 수명을 깎아 돌려준다. 수명이 다한 레코드는 빼고 준다.
-     */
+    /// Ages TTLs by the time elapsed and drops records that ran out.
     fn get_by_key(&self, key: &[u8]) -> Option<(u16, Vec<Record>, Vec<Record>, Vec<Record>, bool)> {
         let idx = self.idx(key);
         let mut shard = self.shards[idx].lock_recover();
@@ -465,23 +392,20 @@ impl NativeCache {
         }
     }
 
-    /**
-     * @brief 지금 세대.
-     * @warning 답을 정하는 상태를 읽기 전에 잡아야 한다. 상태를 먼저 읽고 세대를 나중에 잡으면
-     *          비우기 전 상태로 만든 답이 비운 뒤의 세대를 달고 담긴다.
-     */
+    /// Must be taken before reading any state that decides the answer; taken after, an answer built
+    /// from pre-clear state would be stored under the post-clear generation.
     pub(crate) fn epoch(&self) -> CacheEpoch {
         CacheEpoch(self.epoch.load(Ordering::Acquire))
     }
 
-    /** @brief 잡아 둔 세대가 아직 지금 세대인지. 담을 곳의 잠금을 잡은 채 불러야 clear와 엇갈리지 않는다. */
+    /// Call with the target shard's lock held, or it races `clear`.
     fn is_current(&self, epoch: CacheEpoch) -> bool {
         self.epoch.load(Ordering::Acquire) == epoch.0
     }
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    /** @brief 지금 세대로 응답을 담는다. 테스트용 진입점. */
+    /// For tests; stores under the current generation.
     pub fn put(
         &self,
         request: &Message,
@@ -509,15 +433,12 @@ impl NativeCache {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /**
-     * @brief 키로 응답을 담는다.
-     * @warning 담을 자격을 여러 겹으로 본다. 질문한 것이 실제로 답에 있어야 하고, 부정
-     *          응답은 그것을 덮는 권한 기록이 있어야 한다. 없는 채로 담으면 남이 끼워 넣은
-     *          엉뚱한 답이 캐시에 눌러앉는다.
-     * @note 수명은 응답의 가장 짧은 것과 설정 상하한, 그리고 서명 만료 중 가장 짧은 것으로
-     *       정한다.
-     * @param epoch 이 응답을 만든 해석이 시작되기 전에 잡은 세대.
-     */
+    /// Stores only when what was asked is in the answer, and a negative answer only with an
+    /// authority record covering it; otherwise an injected unrelated answer would stay in the
+    /// cache. The lifetime is the response's shortest TTL clamped to the configured bounds, and
+    /// never past the signature expiry.
+    ///
+    /// `epoch` is taken before the resolution that built this response started.
     fn put_by_key(
         &self,
         epoch: CacheEpoch,
@@ -628,7 +549,6 @@ impl NativeCache {
         }
     }
 
-    /** @brief 이 질의가 최근에 실패했는지. 기한이 지났으면 없는 것으로 본다. */
     fn failure_hit(&self, key: &[u8]) -> Option<u16> {
         let mut failures = self.failures.lock_recover();
         match failures.get(key).copied() {
@@ -638,12 +558,10 @@ impl NativeCache {
         }
     }
 
-    /**
-     * @brief 실패를 기억한다.
-     * @note 거듭 실패하면 기억 기간을 배로 늘린다. 죽은 업스트림에 같은 간격으로 계속 나가면
-     *       그것이 더 느리다.
-     * @param epoch 실패한 해석이 시작되기 전에 잡은 세대.
-     */
+    /// Each repeat doubles the period, since retrying a dead upstream at a fixed interval costs
+    /// more.
+    ///
+    /// `epoch` is taken before the failed resolution started.
     fn remember_failure(&self, epoch: CacheEpoch, key: FailureKey) {
         let now = Instant::now();
         let mut failures = self.failures.lock_recover();
@@ -669,22 +587,18 @@ impl NativeCache {
         );
     }
 
-    /** @brief 성공했으니 실패 기억을 지운다. */
     fn forget_failure(&self, key: &[u8]) {
         self.failures.lock_recover().pop(key);
     }
 
     #[allow(dead_code)]
-    /** @brief 담긴 항목 수. */
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock_recover().len()).sum()
     }
 
-    /**
-     * @brief 담긴 답과 실패 기억을 전부 비운다. 비운 개수를 돌려준다.
-     * @warning 답을 달라지게 하는 상태는 이것을 부르기 전에 바꿔 둬야 한다. 순서가 바뀌면 새
-     *          세대를 잡은 해석이 이전 상태를 읽고, 그 답이 비운 캐시에 담긴다.
-     */
+    /// Returns how many were removed. Change any state that affects answers before calling this;
+    /// otherwise a resolution taking the new generation reads the old state, and its answer lands
+    /// in the emptied cache.
     pub fn clear(&self) -> usize {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut n = 0;
@@ -700,29 +614,22 @@ impl NativeCache {
     }
 
     #[allow(dead_code)]
-    /** @brief 비어 있는지. */
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/** @brief 캐시와 질의 합치기를 하는 계층. */
+/// Caches answers and coalesces identical queries.
 pub struct CacheLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 담아 두는 곳. */
     cache: Arc<NativeCache>,
-    /** @brief 성공 응답을 담을지. */
     positive_enabled: bool,
-    /** @brief 지표 기록기. */
     recorder: Option<onetdns_control::Recorder>,
-    /** @brief 지금 나가 있는 같은 질의들. */
     flights: Mutex<HashMap<FlightKey, Arc<ClientFlight>>>,
 }
 
 impl CacheLayer {
     #[allow(clippy::too_many_arguments)]
-    /** @brief 용량과 수명 상하한으로 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         capacity: usize,
@@ -743,28 +650,23 @@ impl CacheLayer {
         }
     }
 
-    /** @brief 지표 기록기를 붙인다. */
     pub fn with_recorder(mut self, recorder: Option<onetdns_control::Recorder>) -> Self {
         self.recorder = recorder;
         self
     }
 
-    /** @brief 성공 응답을 담을지 정한다. */
     pub fn with_positive_cache(mut self, enabled: bool) -> Self {
         self.positive_enabled = enabled;
         self
     }
 
-    /**
-     * @brief 실패만 기억하는 계층. 죽은 업스트림에 매 질의마다 다시 나가지 않게 한다.
-     * @details 성공한 답은 담지 않으므로 그 수명도 고치지 않는다. 고치면 이 계층을 지나는
-     *          답이 모두 이 계층의 짧은 상한을 달고 나간다.
-     */
+    /// Remembers failures only, so a dead upstream is not asked on every query. Successful answers
+    /// are not stored, so their TTLs are left alone; capping them would send every answer through
+    /// this layer with its short cap.
     pub fn failure_guard(inner: Arc<dyn Resolver>, capacity: usize) -> Self {
         Self::new(inner, capacity.max(1), 1, 0, 1, 0, 1).with_positive_cache(false)
     }
 
-    /** @brief 밖에서 캐시를 만질 핸들. */
     pub fn handle(&self) -> CacheHandle {
         CacheHandle {
             cache: self.cache.clone(),
@@ -773,29 +675,22 @@ impl CacheLayer {
 }
 
 #[derive(Clone)]
-/** @brief 캐시를 만질 핸들. */
 pub struct CacheHandle {
-    /** @brief 담아 두는 곳. */
     cache: Arc<NativeCache>,
 }
 
-/** @brief 바이트 형태로 승격할 후보. */
 pub(crate) struct WirePromotionCandidate {
-    /** @brief 승격 직전에 본 것. 그 사이 바뀌지 않았는지 확인한다. */
+    /// What the slot held when seen; promotion checks it has not changed.
     entry: Entry,
-    /** @brief 이 후보의 남은 수명. */
     lifetime_secs: u32,
-    /** @brief 수명이 변하지 않는 항목인지. */
     fixed_local_ttl: bool,
 }
 
 impl WirePromotionCandidate {
-    /** @brief 이 후보의 남은 수명. */
     pub(crate) fn lifetime_secs(&self) -> u32 {
         self.lifetime_secs
     }
 
-    /** @brief 수명이 변하지 않는 항목인지. */
     pub(crate) fn has_fixed_local_ttl(&self) -> bool {
         self.fixed_local_ttl
     }
@@ -803,26 +698,22 @@ impl WirePromotionCandidate {
 
 impl CacheHandle {
     #[cfg(test)]
-    /** @brief 두 핸들이 같은 응답 캐시를 보는지. 세대 교체 테스트용. */
+    /// For generation swap tests.
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cache, &other.cache)
     }
 
-    /** @brief 담긴 것과 실패 기억을 모두 비운다. */
     pub fn clear(&self) -> usize {
         self.cache.clear()
     }
 
-    /** @brief 지금 세대. 해석을 시작하기 전에 잡아 두고 담을 때 넘긴다. */
+    /// Take it before resolution starts and pass it when storing.
     pub(crate) fn epoch(&self) -> CacheEpoch {
         self.cache.epoch()
     }
 
-    /**
-     * @brief 고속 경로가 쓸 바이트 항목을 꺼낸다.
-     * @warning 필터 세대가 다르면 쓰지 않는다. 이전 세대의 허용 응답을 계속 내보내면 차단
-     *          갱신이 그만큼 늦어진다.
-     */
+    /// Entries from another filter generation are not used: serving the old generation's allowed
+    /// answers would delay every new block.
     pub(crate) fn wire_get(
         &self,
         key: &[u8],
@@ -857,7 +748,6 @@ impl CacheHandle {
         None
     }
 
-    /** @brief 지금 이 위치에 있는 것을 승격 후보로 본다. */
     pub(crate) fn wire_candidate(
         &self,
         key: &[u8],
@@ -877,13 +767,12 @@ impl CacheHandle {
         })
     }
 
-    /**
-     * @brief 후보를 바이트 항목으로 바꿔 넣는다.
-     * @warning 후보를 볼 때와 같은 것이 아직 그곳에 있을 때만 바꾼다. 확인하지 않으면
-     *          그 사이 들어온 더 새로운 답을 이전 답으로 덮는다.
-     * @param epoch 바이트를 만든 해석이 시작되기 전에 잡은 세대. 후보는 비운 뒤에 새로 들어온
-     *              것일 수 있으므로 후보가 같다는 것만으로는 바이트가 새 세대의 답이라고 할 수 없다.
-     */
+    /// Replaces the slot only if it still holds the candidate; otherwise a newer answer that
+    /// arrived meanwhile would be overwritten with an older one.
+    ///
+    /// `epoch` is taken before the resolution that built `wire` started. The candidate may have
+    /// been stored after a clear, so an unchanged candidate alone does not prove `wire` belongs to
+    /// the new generation.
     pub(crate) fn promote_wire(
         &self,
         epoch: CacheEpoch,
@@ -910,7 +799,7 @@ impl CacheHandle {
         true
     }
 
-    /** @brief 고정 주소가 답했음을 그곳에 표시해 둔다. 승격할 때 남의 답과 구분하려는 것이다. */
+    /// Marks the slot as answered by a fixed address, so promotion can tell it from other answers.
     pub(crate) fn ensure_local_wire_candidate(&self, request: &Message) {
         let Some(key) = NativeCache::key(request) else {
             return;
@@ -927,7 +816,7 @@ impl CacheHandle {
     }
 
     #[cfg(test)]
-    /** @brief 이 질의 슬롯의 바이트 항목. 테스트용. */
+    /// For tests.
     pub(crate) fn wire_entry_for(&self, request: &Message) -> Option<crate::wirecache::WireEntry> {
         let key = NormalizedRequestKey::from_request(request)?;
         let idx = self.cache.idx(key.as_slice());
@@ -939,7 +828,6 @@ impl CacheHandle {
     }
 
     #[cfg(test)]
-    /** @brief 고정 수명 항목을 직접 넣는다. 테스트용. */
     pub(crate) fn install_local_wire_for_test(
         &self,
         request: &Message,
@@ -956,7 +844,7 @@ impl CacheHandle {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    /** @brief 다른 레인이 캐시만 조회할 때 쓰는 진입점. */
+    /// For other lanes, which look up only the cache.
     pub(crate) fn lane_response(&self, request: &Message) -> Option<Message> {
         let key = NormalizedRequestKey::from_request(request)?;
         let (rcode, answers, authorities, additionals, ad) =
@@ -972,7 +860,7 @@ impl CacheHandle {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    /** @brief 다른 레인이 실패 기억만 조회할 때 쓰는 진입점. */
+    /// For other lanes, which look up only remembered failures.
     pub(crate) fn lane_failure(&self, request: &Message) -> Option<Message> {
         let key = NormalizedRequestKey::from_request(request)?;
         let rcode = self.cache.failure_hit(key.as_slice())?;
@@ -987,14 +875,13 @@ impl CacheHandle {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    /** @brief 다른 레인이 실패를 기억시킬 때 쓰는 진입점. */
     pub(crate) fn lane_remember_failure(&self, epoch: CacheEpoch, request: &Message) {
         if let Some(key) = NormalizedRequestKey::from_request(request) {
             self.cache.remember_failure(epoch, key.into_owned());
         }
     }
 
-    /** @brief 응답을 담는다. epoch는 이 응답을 만든 해석이 시작되기 전에 잡은 세대다. */
+    /// `epoch` is taken before the resolution that built `response` started.
     pub fn store(&self, epoch: CacheEpoch, request: &Message, response: &Message) {
         let Some(key) = NativeCache::key(request) else {
             return;
@@ -1014,7 +901,6 @@ impl CacheHandle {
 }
 
 impl Resolver for CacheLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         match self.resolve_outcome(req) {
             ResolveOutcome::Response(response) => Some(response),
@@ -1022,11 +908,9 @@ impl Resolver for CacheLayer {
         }
     }
 
-    /**
-     * @brief 캐시를 보고, 없으면 하나만 밖으로 내보내 결과를 나눈다.
-     * @details 대표가 나가고 나머지는 기다린다. 대표 슬롯이 꽉 찼거나 같은 스레드가 이미
-     *          대표면 합치지 않고 그냥 나간다. 자기 자신을 기다리면 그대로 멈춘다.
-     */
+    /// Checks the cache, and on a miss sends one query upstream and shares the result: the leader
+    /// goes out and the rest wait. With the flight table full, or when this thread already leads
+    /// the same query, it goes upstream without coalescing, since waiting on itself would deadlock.
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         if req.questions.is_empty() {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -1186,7 +1070,6 @@ impl Resolver for CacheLayer {
 }
 
 #[cfg(test)]
-/** @brief 담을 자격, 수명 상하한, 질의 합치기, 그리고 승격이 새 답을 덮지 않는지. */
 mod tests {
     use super::key::INLINE_REQUEST_KEY_CAPACITY;
     use super::*;
@@ -1197,7 +1080,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    /** @brief 항목 하나의 고정 비용이 커지지 않았는지. 커지면 같은 메모리에 담기는 항목이 준다. */
+    /// A larger fixed cost means fewer entries fit in the same memory.
     fn cache_entry_fixed_overhead_stays_small() {
         assert_eq!(
             std::mem::size_of::<Entry>(),
@@ -1217,7 +1100,6 @@ mod tests {
     }
     use std::sync::Barrier;
 
-    /** @brief 테스트용 레코드. */
     fn rec(name: &str, ttl: u32) -> Record {
         Record::new(
             Name::from_str(name).unwrap(),
@@ -1226,7 +1108,6 @@ mod tests {
         )
     }
 
-    /** @brief 테스트용 서명 레코드. */
     fn rrsig(name: &str, covered: RecordType, ttl: u32, lifetime: u32) -> Record {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1250,7 +1131,6 @@ mod tests {
         )
     }
 
-    /** @brief 테스트용 권한 레코드. */
     fn soa(name: &str, ttl: u32, minimum: u32) -> Record {
         Record::new(
             Name::from_str(name).unwrap(),
@@ -1268,7 +1148,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 꺼낼 때 흐른 만큼 수명이 깎이는지. */
     fn positive_hit_decrements_ttl() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("example.com").unwrap();
@@ -1291,9 +1170,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각을 나눠도 전체 용량을 넘지 않는지. 넘으면 설정한 것보다 많은 메모리를 쓴다. */
+    /// Exceeding it would use more memory than configured.
     fn shard_count_and_total_entries_never_exceed_configured_capacity() {
-        /** @brief 캐시를 이만큼 채운다. */
         fn fill(cache: &NativeCache, count: usize) {
             for index in 0..count {
                 let name = format!("entry-{index}.capacity.test");
@@ -1321,7 +1199,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부정 응답이 담기는지. */
     fn negative_cached() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("nx.test").unwrap();
@@ -1337,7 +1214,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검증된 답을 서명 만료 너머까지 담지 않는지. */
     fn authenticated_cache_is_capped_by_rrsig_expiration() {
         let cache = NativeCache::new(16, 1, 60, 86_400, 0, 60);
         let request = Message::query(
@@ -1380,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief AD가 없어도 운영자 하한이 RRSIG 수명을 연장하지 않는지. */
+    /// Without AD, the operator's TTL floor still does not extend past the RRSIG lifetime.
     fn unauthenticated_signed_cache_is_capped_by_rrsig_expiration() {
         let cache = NativeCache::new(16, 1, 120, 86_400, 0, 60);
         let request = Message::query(
@@ -1410,11 +1286,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 직접 RRSIG 질의를 AD=0에서만 담고 AD=1에서는 담지 않는지.
-     * @details covered RRset이 엔벨로프에 없어 서명이 무엇을 덮는지 묶을 수 없다. AD=0은 RRSIG
-     *          자신의 세 상한으로 담고, AD=1은 담지 않아 잘라 낸 응답이 수명을 정하지 못하게 한다.
-     */
+    /// The covered RRset is not in the envelope, so what the signature covers cannot be bound.
+    /// Without AD it is stored under the RRSIG's own caps; with AD it is not stored, so a trimmed
+    /// response cannot set the lifetime.
     fn direct_rrsig_query_is_cacheable_only_when_not_authenticated() {
         let cache = NativeCache::new(16, 1, 120, 86_400, 0, 60);
         let request = Message::query(
@@ -1455,7 +1329,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명이 덮는 기록의 수명과 맞지 않으면 담지 않는지. */
     fn authenticated_cache_requires_matching_received_ttl_bounds() {
         let answer = rec("www.example.test", 3600);
         let mut signature = rrsig("www.example.test", RecordType::A, 3600, 3600);
@@ -1485,7 +1358,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 승격이 그 사이 들어온 새 답을 덮지 않는지. */
     fn stale_wire_promotion_cannot_replace_a_newer_structured_answer() {
         let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
         let handle = CacheHandle {
@@ -1552,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 세대 확인을 캐시 하나로 하는지. 둘로 나누면 두 배로 담는다. */
+    /// Splitting it into two caches would store everything twice.
     fn wire_lookup_uses_filter_generation_without_a_second_lru() {
         let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
         let handle = CacheHandle {
@@ -1613,23 +1485,16 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-    /** @brief 담아 둔 답을 꺼내는 비용. */
     fn bench_structured_entry_hit() {
-        /** @brief 비교용 이전 저장 형태. */
+        /// Layout with spare `Vec` capacity, for comparison.
         struct LegacyStructuredEntry {
-            /** @brief 답 구간. 여분 슬롯이 남는 이전 형태다. */
             answers: Vec<Record>,
-            /** @brief 권한 구간. */
             authorities: Box<[Record]>,
-            /** @brief 딸린 기록 구간. */
             additionals: Box<[Record]>,
-            /** @brief 담은 시각. */
             inserted: Instant,
-            /** @brief 이 항목의 수명. */
             lifetime_secs: u32,
         }
 
-        /** @brief 이전 형태에서 꺼내기. */
         fn legacy_hit(entry: &Arc<LegacyStructuredEntry>, now: Instant) -> usize {
             let entry = Arc::clone(std::hint::black_box(entry));
             let elapsed = now.saturating_duration_since(entry.inserted).as_secs();
@@ -1647,7 +1512,6 @@ mod tests {
             )
         }
 
-        /** @brief 지금 형태에서 꺼내기. */
         fn packed_hit(entry: &Arc<StructuredEntry>, now: Instant) -> usize {
             let entry = Arc::clone(std::hint::black_box(entry));
             let elapsed = entry.elapsed_secs(now);
@@ -1665,7 +1529,6 @@ mod tests {
             )
         }
 
-        /** @brief 반복해 재고 평균을 낸다. */
         fn measure(mut hit: impl FnMut() -> usize, iterations: usize) -> (f64, usize) {
             let started = Instant::now();
             let mut sink = 0usize;
@@ -1702,7 +1565,6 @@ mod tests {
             std::hint::black_box(legacy_hit(&legacy, now));
             std::hint::black_box(packed_hit(&packed, now));
         }
-        /** @brief 반복 횟수. */
         const ITERATIONS: usize = 500_000;
         let (old_1, sink_1) = measure(|| legacy_hit(&legacy, now), ITERATIONS);
         let (new_1, sink_2) = measure(|| packed_hit(&packed, now), ITERATIONS);
@@ -1716,7 +1578,6 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-    /** @brief 서명 만료 상한 계산 비용. */
     fn bench_dnssec_ttl_cap_typical_response() {
         let mut records = Vec::with_capacity(8);
         for name in [
@@ -1729,7 +1590,6 @@ mod tests {
             records.push(rrsig(name, RecordType::A, 3600, 3600));
         }
 
-        /** @brief 호출 횟수. */
         const CALLS: u32 = 1_000_000;
         let started = Instant::now();
         for _ in 0..CALLS {
@@ -1743,7 +1603,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오류 응답을 긍정 답으로 담지 않는지. */
     fn servfail_not_cached() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("sf.test").unwrap();
@@ -1754,28 +1613,22 @@ mod tests {
             .is_none());
     }
 
-    /** @brief 항상 실패하는 테스트용 리졸버. */
     struct AlwaysFails {
-        /** @brief 불린 횟수. */
         calls: Arc<AtomicUsize>,
     }
 
     impl Resolver for AlwaysFails {
-        /** @brief 언제나 답하지 않는다. */
         fn resolve(&self, _request: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
 
-    /** @brief 느리게 답하는 테스트용 리졸버. */
     struct SlowAnswer {
-        /** @brief 불린 횟수. */
         calls: Arc<AtomicUsize>,
     }
 
     impl Resolver for SlowAnswer {
-        /** @brief 잠시 뒤에 답한다. */
         fn resolve(&self, request: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(150));
@@ -1794,11 +1647,10 @@ mod tests {
         }
     }
 
-    /** @brief 오래 사는 답을 곧바로 돌려주는 업스트림. */
+    /// Answers at once with TTLs far above any configured cap.
     struct LongTtlAnswer;
 
     impl Resolver for LongTtlAnswer {
-        /** @brief 설정 상한보다 훨씬 긴 수명을 담아 답한다. */
         fn resolve(&self, request: &Message) -> Option<Message> {
             let question = request.questions.first()?.clone();
             let mut response = Message::default();
@@ -1817,11 +1669,10 @@ mod tests {
         }
     }
 
-    /** @brief answer는 비었지만 부정 응답이 아닌 테스트용 위임 응답. */
+    /// Empty answer section that is not negative.
     struct ReferralAnswer;
 
     impl Resolver for ReferralAnswer {
-        /** @brief NS와 glue를 긴 수명으로 돌려준다. */
         fn resolve(&self, request: &Message) -> Option<Message> {
             let zone = Name::from_str("example").unwrap();
             let nameserver = Name::from_str("ns1.example").unwrap();
@@ -1842,11 +1693,10 @@ mod tests {
         }
     }
 
-    /** @brief CNAME 뒤에 요청한 RRset이 없어 NODATA가 되는 테스트용 응답. */
+    /// NODATA after a CNAME, with the SOA that proves it.
     struct CnameNodataAnswer;
 
     impl Resolver for CnameNodataAnswer {
-        /** @brief CNAME answer와 부정 수명의 근거인 SOA를 돌려준다. */
         fn resolve(&self, request: &Message) -> Option<Message> {
             let question = request.questions.first()?;
             let mut response = Message::default();
@@ -1865,12 +1715,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 처음 물어본 클라이언트도 상한을 넘는 수명을 받지 않는지.
-     * @details 미스는 업스트림 응답을 그대로 내보내므로, 담는 사본만 자르면 처음 물어본 쪽만
-     *          설정보다 긴 수명을 받는다. 그 클라이언트가 곧 아래쪽 캐시라 상한이 전부
-     *          새어 나가고, 같은 이름인데 물어본 순서에 따라 답이 달라진다.
-     */
+    /// A miss sends the upstream response as is; capping only the stored copy would give the first
+    /// client a longer TTL than later ones, and that client is often a downstream cache.
     fn cache_miss_response_is_capped_like_the_stored_copy() {
         let layer = CacheLayer::new(Arc::new(LongTtlAnswer), 128, 1, 0, 120, 0, 60);
         let request = Message::query(9, Name::from_str("long.example").unwrap(), RecordType::A);
@@ -1897,7 +1743,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief answer가 빈 위임 응답을 NODATA로 오인해 부정 TTL 상한으로 자르지 않는지. */
     fn referral_uses_positive_ttl_cap_instead_of_negative_cap() {
         let layer = CacheLayer::new(Arc::new(ReferralAnswer), 128, 1, 0, 120, 0, 5);
         let request = Message::query(
@@ -1914,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief CNAME 뒤 NODATA의 SOA는 answer 유무가 아니라 부정 의미로 상한을 고르는지. */
+    /// Chosen by negative meaning, not by whether the answer section is empty.
     fn cname_to_nodata_uses_negative_ttl_cap_for_proof() {
         let layer = CacheLayer::new(Arc::new(CnameNodataAnswer), 128, 1, 0, 120, 0, 5);
         let request = Message::query(11, Name::from_str("alias.example").unwrap(), RecordType::A);
@@ -1927,7 +1772,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 질의가 몰려도 밖으로는 하나만 나가는지. */
     fn concurrent_identical_client_queries_share_one_resolution() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = Arc::new(
@@ -1972,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 스레드가 자기 자신을 기다리지 않는지. 기다리면 그대로 멈춘다. */
+    /// Waiting on itself would deadlock.
     fn same_thread_leader_flight_is_bypassed_not_joined() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = CacheLayer::new(
@@ -2009,7 +1853,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담을 수 없는 질의도 답은 받는지. */
     fn oversized_or_malformed_cache_keys_bypass_cache_but_still_resolve() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = CacheLayer::new(
@@ -2043,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답을 바꾸지 않는 것만 지우는지. 더 지우면 다른 질의에 같은 답을 준다. */
+    /// Normalizing more would give one query another's answer.
     fn flight_key_normalizes_only_id_case_and_edns_padding() {
         let mut first = Message::query(1, Name::from_str("WWW.Example").unwrap(), RecordType::A);
         let mut first_edns = onetdns_proto::Edns {
@@ -2085,7 +1928,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 흔한 길이는 할당 없이 담고 조회도 빌려 쓰는지. */
     fn normalized_request_key_uses_inline_storage_and_borrowed_lookup() {
         let short = Message::query(1, Name::from_str("short.example").unwrap(), RecordType::A);
         let long_name = format!(
@@ -2112,7 +1954,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 EDNS가 든 질의를 담지 않는지. */
     fn flight_key_rejects_multiple_or_malformed_opt() {
         let mut multiple = Message::query(1, Name::from_str("opt.example").unwrap(), RecordType::A);
         multiple
@@ -2134,7 +1975,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의가 아닌 것이 캐시를 건드리지 않는지. */
     fn non_query_envelopes_bypass_cache_state() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = CacheLayer::new(
@@ -2164,7 +2004,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 합치는 곳이 상한을 넘으면 합치지 않고 그냥 나가는지. */
     fn client_singleflight_table_is_bounded_and_overflow_bypasses_it() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = CacheLayer::new(
@@ -2200,7 +2039,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기다리는 쪽이 깨어나고 늦게 온 쪽도 결과를 보는지. */
     fn waiting_follower_is_woken_and_late_caller_sees_result() {
         let flight = Arc::new(ClientFlight::new());
         let follower_flight = flight.clone();
@@ -2242,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 최근 실패에 침묵 대신 오류로 답하는지. 침묵하면 클라이언트가 데드라인까지 기다린다. */
+    /// Silence would leave the client waiting until its deadline.
     fn transient_failure_cache_returns_servfail_instead_of_silence() {
         let calls = Arc::new(AtomicUsize::new(0));
         let layer = CacheLayer::new(
@@ -2284,11 +2122,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 실패만 기억하는 계층이 성공한 답의 수명을 건드리지 않는지.
-     * @details 스텁 영역은 이 계층을 거친다. 수명을 자기 상한으로 자르면 스텁 영역의 답이
-     *          모두 1초짜리가 되어 바깥 캐시에도 거의 남지 않는다.
-     */
+    /// Stub zones go through this layer; capping to its own limit would make every stub zone answer
+    /// a 1-second one that barely stays in downstream caches.
     fn failure_guard_keeps_successful_answer_ttls() {
         let layer = CacheLayer::failure_guard(Arc::new(LongTtlAnswer), 64);
         let request = Message::query(
@@ -2301,7 +2136,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 거듭 실패하면 기억 기간이 늘어나는지. */
     fn repeated_failures_increase_backoff_after_expiry() {
         let layer = CacheLayer::failure_guard(
             Arc::new(AlwaysFails {
@@ -2333,18 +2167,14 @@ mod tests {
         assert!(entry.expiry > Instant::now() + FAILURE_CACHE_BASE_TTL);
     }
 
-    /** @brief 첫 질의를 붙잡아 두었다가 놓아 주면 실패로 끝내는 업스트림. */
+    /// Holds the first query until released, and fails every query.
     struct HeldFailure {
-        /** @brief 첫 질의가 들어왔음을 알릴 곳. 한 번 알리면 비운다. */
         entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-        /** @brief 붙잡은 질의를 놓아 줄 신호. */
         release: Mutex<std::sync::mpsc::Receiver<()>>,
-        /** @brief 불린 횟수. */
         calls: AtomicUsize,
     }
 
     impl Resolver for HeldFailure {
-        /** @brief 첫 질의는 신호가 올 때까지 붙잡고, 모든 질의를 실패로 끝낸다. */
         fn resolve(&self, _request: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let entered = self.entered.lock_recover().take();
@@ -2357,11 +2187,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 해석하는 동안 캐시를 비웠다면 그 실패를 기억하지 않는지.
-     * @details 기억하면 비운 뒤에도 기억 기간 동안 그 이름에 SERVFAIL이 나간다. 로컬 전용 범주를
-     *          켜며 비운 경우라면 업스트림 없이 답해야 할 이름이 실패로 남는다.
-     */
+    /// Remembering it would answer SERVFAIL for that name for the whole period after the clear;
+    /// when the clear came from enabling a local-only category, a name meant to be answered without
+    /// upstream would stay failed.
     fn a_failure_in_flight_across_a_clear_is_not_remembered() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2397,12 +2225,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 비우기 전에 잡은 세대로는 아무것도 담기지 않는지.
-     * @details 프리패치와 레인은 해석을 마친 뒤에 따로 담고, 바이트 승격은 응답을 내보낸 뒤에
-     *          한다. 그동안 캐시를 비웠다면 그 답은 비우기 전 설정으로 만든 것이다. 승격 후보는
-     *          비운 뒤에 새로 담긴 답일 수 있으므로 후보가 그대로라는 것만으로는 막지 못한다.
-     */
+    /// Prefetch and lanes store after resolving, and wire promotion happens after the response is
+    /// sent; an answer stored after a clear in between was built from the old config. The promotion
+    /// candidate may itself be new after the clear, so an unchanged candidate does not block it.
     fn writes_that_started_before_a_clear_do_not_land_after_it() {
         let native = Arc::new(NativeCache::new(16, 1, 0, 86_400, 0, 60));
         let handle = CacheHandle {
@@ -2479,7 +2304,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수명 하한이 걸리는지. */
     fn min_ttl_clamp() {
         let c = NativeCache::new(1024, 16, 60, 86400, 0, 60);
         let name = Name::from_str("x.test").unwrap();
@@ -2492,7 +2316,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한이 0이면 아무것도 담지 않는지. */
     fn zero_max_ttl_disables_positive_and_negative_storage() {
         let cache = NativeCache::new(16, 1, 0, 0, 0, 0);
         let positive = Message::query(1, Name::from_str("positive.test").unwrap(), RecordType::A);
@@ -2529,7 +2352,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 구간마다 제 수명대로 늙는지. 함께 늘리면 만료된 보조 기록이 살아남는다. */
+    /// Extending them together would keep expired glue alive.
     fn cached_sections_age_independently_without_extending_glue() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let name = Name::from_str("answer.ttl.test").unwrap();
@@ -2562,7 +2385,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한이 모든 구간에 걸리는지. */
     fn max_ttl_caps_every_cached_response_section() {
         let cache = NativeCache::new(16, 1, 0, 5, 0, 5);
         let name = Name::from_str("answer.ttl.test").unwrap();
@@ -2584,14 +2406,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 두 키 만드는 곳이 같은 질의에 같은 바이트를 내는지.
-     *
-     * @details 무할당 경로는 파싱 없이 바이트에서, 구조적 캐시는 파싱한 Message에서 키를
-     *          만든다. 둘이 어긋나면 무할당 항목으로 승격할 슬롯을 찾지 못해 그 모양의 질의는
-     *          영원히 레인을 못 탄다. 게다가 레인에 들어갔다 나오므로 일을 두 번 한다.
-     *          평문에서만 맞고 EDNS에서 어긋나 있었고, 벤치가 평문만 보내 드러나지 않았다.
-     */
+    /// The wire path builds the key from bytes without parsing, the structured cache from the
+    /// parsed message. If they differ, promotion never finds the slot, so queries of that shape
+    /// never take the lane and do the work twice.
     fn wire_and_structured_cache_keys_agree() {
         let name = Name::from_str("key.parity.test").unwrap();
         let mut cases: Vec<(&str, Message)> = Vec::new();
@@ -2637,12 +2454,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 무할당 경로가 받는 질의마다 구조화 키도 같은 바이트로 만드는지.
-     * @details 헤더 플래그 두 바이트는 모든 조합을, OPT 의 UDP 크기와 TTL 은 바이트마다 모든 값을
-     *          넣어 본다. 무할당 경로가 받았는데 구조화 키가 없으면 일반 경로가 캐시하지 않는
-     *          질의에 담아 둔 답을 주고, 키가 다르면 다른 질의와 답을 나눠 쓴다.
-     */
+    /// Tries every combination of the two header flag bytes, and every value of each byte of the
+    /// OPT UDP size and TTL. If the wire path accepts a query with no structured key, it serves a
+    /// stored answer to a query the normal path does not cache; if the keys differ, two queries
+    /// share one answer.
     fn wire_scanner_accepts_only_what_the_structured_key_accepts() {
         let name = Name::from_str("Scan.Parity.test").unwrap();
         let plain = Message::query(1, name.clone(), RecordType::A)
@@ -2653,7 +2468,7 @@ mod tests {
         edns.options.push((onetdns_proto::EDNS_PADDING, vec![0; 4]));
         padded.additionals.push(edns.try_to_record().unwrap());
         let padded = padded.try_encode().unwrap();
-        /* OPT 는 마지막 레코드다. 이름(루트) 1, 종류 2, UDP 크기 2, TTL 4, RDLENGTH 2, 옵션 8. */
+        // OPT is the last record: root name 1, type 2, UDP size 2, TTL 4, RDLENGTH 2, options 8.
         let opt = padded.len() - (1 + 2 + 2 + 4 + 2 + 8);
         assert_eq!(
             &padded[opt..opt + 3],
@@ -2702,7 +2517,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 종류가 다르면 다른 곳인지. */
     fn qtype_separated() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("a.test").unwrap();
@@ -2719,7 +2533,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부정 응답 수명 하한이 걸리는지. */
     fn negative_ttl_clamped_to_neg_min() {
         let c = NativeCache::new(1024, 16, 0, 86400, 30, 3600);
         let name = Name::from_str("nx2.test").unwrap();
@@ -2735,7 +2548,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭만 온 답을 주소 답인 것처럼 담지 않는지. */
     fn cname_only_partial_answer_is_not_cached_as_address() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("alias.test").unwrap();
@@ -2760,7 +2572,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질문과 무관한 기록으로 담을 자격을 얻지 못하는지. */
     fn unrelated_rrset_cannot_make_lame_response_cacheable() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let request = Message::query(1, Name::from_str("victim.example").unwrap(), RecordType::A);
@@ -2777,7 +2588,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 부류의 기록이 답을 채우거나 섞이지 못하는지. */
     fn mismatched_class_cannot_complete_or_pollute_cache_entry() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let request = Message::query(1, Name::from_str("victim.example").unwrap(), RecordType::A);
@@ -2813,7 +2623,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무관한 권한 기록으로 부정 답을 담지 못하는지. */
     fn unrelated_soa_cannot_prove_negative_answer() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let request = Message::query(1, Name::from_str("victim.example").unwrap(), RecordType::A);
@@ -2830,7 +2639,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 답이 들어 있는데 없다고 하는 응답을 담지 않는지. */
     fn nxdomain_with_terminal_positive_rrset_is_not_cached() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let request = Message::query(1, Name::from_str("victim.example").unwrap(), RecordType::A);
@@ -2847,7 +2655,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭 끝의 답은 그대로 담기는지. */
     fn cname_terminal_rrset_remains_cacheable() {
         let c = NativeCache::new(16, 1, 0, 86400, 0, 60);
         let request = Message::query(1, Name::from_str("alias.example").unwrap(), RecordType::A);
@@ -2869,7 +2676,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 어긋나는 별칭이 든 답을 담지 않는지. 담으면 답이 갈린다. */
     fn conflicting_alias_rrsets_are_never_cached() {
         let cache = NativeCache::new(16, 1, 0, 86_400, 0, 60);
         let owner = Name::from_str("alias.example").unwrap();
@@ -2908,7 +2714,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 근거 없이 비어 있는 응답을 담지 않는지. */
     fn unproven_empty_noerror_is_not_cached() {
         let c = NativeCache::new(1024, 16, 0, 86400, 0, 60);
         let name = Name::from_str("lame.test").unwrap();

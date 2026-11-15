@@ -1,13 +1,12 @@
-/*!
- * @brief 외부 공유 캐시 클라이언트.
- *
- * @details 여러 대가 캐시를 나눠 쓸 때 쓴다. 프로토콜은 이 서버가 쓰는 명령만 구현한다.
- *          연결은 여러 개를 두고 명령마다 하나를 빌려 쓴다. 잠금은 연결을 꺼내고 돌려놓을
- *          때와 회로 상태를 읽고 바꿀 때만 잡고, 접속과 왕복은 잠금 밖에서 한다.
- * @warning 이 캐시가 느리거나 죽어도 질의 처리가 멈추면 안 된다. 질의는 읽기 하나만 기다리고
- *          담기와 지우기는 워커에 맡긴다. 명령마다 데드라인이 짧고, 답이 느리면 실패로 보며,
- *          빌릴 연결이 없으면 기다리지 않고 건너뛰고, 실패하면 잠시 아예 건너뛴다.
- */
+//! Client for the external shared cache, implementing only the commands this server uses.
+//! Connections are pooled and each command borrows one; the lock is held only to check connections
+//! out and in and to read or change the circuit state, while connecting and round trips happen
+//! outside it.
+//!
+//! A slow or dead cache must never stall query handling: a query waits only on a read, and stores
+//! and deletes go to workers. Each command has a short deadline, a slow reply counts as a failure,
+//! a command that finds no free connection is skipped rather than waiting, and after a failure the
+//! cache is skipped for a while.
 
 use std::io::{BufReader, Read, Write};
 use std::net::SocketAddr;
@@ -20,53 +19,35 @@ use onetdns_core::{MutexExt, SecretString};
 use onetdns_tls::{client_handshake, ClientConfig, TlsStream, TrustStore};
 use zeroize::Zeroizing;
 
-/** @brief 응답 한 줄의 길이 상한. */
 const MAX_RESP_LINE: usize = 4 * 1024;
-/**
- * @brief 값 하나의 크기 상한.
- * @details 이 서버가 담는 값은 DNS 메시지 하나와 그 봉투라 64KiB를 조금 넘을 뿐이다. 연결마다
- *          이만큼을 한 번에 잡으므로, 상한에 연결 수를 곱한 값이 응답 값을 담는 데 쓰는 메모리의
- *          최댓값이다.
- */
+/// Values this server stores are one DNS message plus its envelope, just over 64 KiB. Each
+/// connection may hold this much at once, so this times the connection count bounds the memory for
+/// reply values.
 const MAX_BULK_REPLY: usize = 128 * 1024;
-/**
- * @brief 명령 하나의 데드라인.
- * @details 접속, TLS, 인증, 쉬던 연결이 끊겨 새 연결로 다시 보내는 것까지 이 안에 끝내야 한다.
- */
+/// Covers connecting, TLS, authentication, and resending on a new connection after an idle one
+/// dropped.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
-/**
- * @brief 맺어 둔 연결에서 명령을 보내고 답을 받기까지의 상한.
- * @details 넘기면 실패로 보고 회로를 연다. 답은 하지만 느린 캐시를 실패로 보지 않으면 회로가
- *          열리지 않아 질의마다 그만큼 기다린다. 공유 캐시는 업스트림에 다시 묻는 것보다 빨라야
- *          쓸모가 있으므로, 여러 번 오가야 하는 접속보다 훨씬 짧게 잡는다.
- */
+/// Send-to-reply limit on an established connection; past it the command fails and the circuit
+/// opens. Without it, a cache that answers slowly would never open the circuit, and every query
+/// would wait that long. The shared cache is only useful if faster than asking upstream again, so
+/// this is far shorter than a connect, which takes several trips.
 const ROUNDTRIP_TIMEOUT: Duration = Duration::from_millis(100);
-/** @brief 실패 뒤 건너뛸 기간. 죽은 캐시에 매 질의마다 접속을 시도하면 그것이 더 느리다. */
+/// Trying a dead cache on every query is slower than skipping it.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
-/**
- * @brief 이 서버가 공유 캐시에 열어 두는 연결 수의 상한.
- * @details 연결이 모두 쓰이는 중이면 다음 명령은 기다리지 않고 건너뛴다. 기다리게 하면
- *          공유 캐시의 지연이 그대로 질의 처리의 지연이 된다. 상한은 서버마다 공유 캐시에
- *          여는 소켓 수를 묶는다.
- */
+/// With every connection busy, the next command is skipped rather than waiting; waiting would turn
+/// shared cache latency into query latency. The cap also bounds the sockets each server opens to
+/// the shared cache.
 const MAX_CONNECTIONS: usize = 64;
-/**
- * @brief 담기와 지우기를 보내는 워커 수.
- * @details 쓰기는 이만큼의 연결만 차지하므로, 나머지 연결은 질의가 기다리는 읽기에 남는다.
- */
+/// Writes occupy only this many connections, leaving the rest for the reads queries wait on.
 const WRITE_WORKERS: usize = 8;
-/**
- * @brief 쓰기 대기열 크기.
- * @details 워커가 모두 바쁠 때 몰린 쓰기를 받아 두고, 넘치면 버린다. 쓰기마다 응답 하나를 들고
- *          있으므로 상한이 없으면 공유 캐시가 밀릴 때 메모리가 끝없이 는다.
- */
+/// Holds writes while every worker is busy and drops the overflow. Each write holds a response, so
+/// an unbounded queue would grow without limit while the cache lags.
 const WRITE_QUEUE: usize = 64;
-/** @brief 공유 캐시에 맡긴 쓰기 하나. */
 type WriteJob = Box<dyn FnOnce() + Send + 'static>;
-/** @brief 쓰기 워커 풀. 모든 클라이언트가 함께 쓴다. */
+/// Shared by every client.
 static WRITE_EXECUTOR: OnceLock<mpsc::SyncSender<WriteJob>> = OnceLock::new();
 
-/** @brief 쓰기 워커 풀. 처음 쓸 때 시작한다. */
+/// Started on first use.
 fn write_executor() -> &'static mpsc::SyncSender<WriteJob> {
     WRITE_EXECUTOR.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<WriteJob>(WRITE_QUEUE);
@@ -91,20 +72,14 @@ fn write_executor() -> &'static mpsc::SyncSender<WriteJob> {
     })
 }
 
-/** @brief 공유 캐시와 맺은 연결 하나. */
 enum Connection {
-    /**
-     * @brief 평문 TCP.
-     * @details 응답의 줄은 한 바이트씩 읽으므로, 받은 바이트를 버퍼에 모아 두지 않으면 한 바이트마다
-     *          소켓을 읽는다. TLS 연결은 복호화한 레코드를 버퍼에 두고 읽으므로 따로 두지 않는다.
-     */
+    /// Reply lines are read a byte at a time, so without buffering every byte would be a socket
+    /// read. TLS buffers decrypted records already.
     Plain(BufReader<DeadlineTcp>),
-    /** @brief TLS. */
     Tls(Box<TlsStream<DeadlineTcp>>),
 }
 
 impl Connection {
-    /** @brief 이번 명령의 데드라인을 건다. */
     fn set_deadline(&mut self, deadline: Instant) {
         match self {
             Connection::Plain(tcp) => tcp.get_mut().set_deadline(deadline),
@@ -114,7 +89,6 @@ impl Connection {
 }
 
 impl Read for Connection {
-    /** @brief 읽는다. */
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Connection::Plain(tcp) => tcp.read(buf),
@@ -124,7 +98,6 @@ impl Read for Connection {
 }
 
 impl Write for Connection {
-    /** @brief 쓴다. */
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Connection::Plain(tcp) => tcp.get_mut().write(buf),
@@ -132,7 +105,6 @@ impl Write for Connection {
         }
     }
 
-    /** @brief 비운다. */
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Connection::Plain(tcp) => tcp.get_mut().flush(),
@@ -141,70 +113,58 @@ impl Write for Connection {
     }
 }
 
-/** @brief 공유 캐시에 TLS로 붙을 때 확인할 것. */
 pub struct RedisTls {
-    /** @brief 인증서에 있어야 할 이름. 설정에 적은 Redis 호스트다. */
+    /// The Redis host from the config.
     pub server_name: String,
-    /** @brief 인증서를 검증할 신뢰 저장소. */
     pub roots: TrustStore,
 }
 
-/** @brief 접속한 뒤 AUTH 명령으로 보낼 자격 증명. */
+/// Sent with AUTH after connecting.
 pub struct RedisAuth {
-    /** @brief ACL 사용자 이름. 없으면 기본 사용자로 인증한다. */
+    /// ACL user; None authenticates as the default user.
     pub username: Option<String>,
-    /** @brief 비밀번호. */
     pub password: SecretString,
 }
 
-/** @brief 공유 캐시에 붙는 방법. */
 pub struct RedisOptions {
-    /** @brief 붙을 주소. */
     pub addr: SocketAddr,
-    /** @brief TLS 설정. 없으면 평문으로 붙는다. */
+    /// None connects in plain text.
     pub tls: Option<RedisTls>,
-    /** @brief 자격 증명. 없으면 인증하지 않는다. */
+    /// None skips authentication.
     pub auth: Option<RedisAuth>,
 }
 
-/**
- * @brief 공유 캐시로 명령을 보낼지 정하는 상태.
- * @details 실패하면 열리고, 쉬는 시간이 지나면 명령 하나만 보내 본다. 그 명령이 성공해야
- *          다시 닫힌다. 쉬는 시간이 지났을 때 모든 질의가 한꺼번에 접속을 시도하면 죽은
- *          캐시의 접속 대기 시간을 모든 질의가 함께 치른다.
- */
+/// Opens on failure; after the cooldown, only one command probes, and only its success closes it
+/// again. If every query tried to connect when the cooldown ended, all of them would pay a dead
+/// cache's connect timeout together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Circuit {
-    /** @brief 명령을 보낸다. */
     Closed,
-    /** @brief 이 시각까지 건너뛴다. */
+    /// Skipped until this instant.
     Open(Instant),
-    /** @brief 명령 하나가 다시 붙어 보는 중이다. 나머지는 건너뛴다. */
+    /// One command is probing; the rest are skipped.
     Probing,
 }
 
-/** @brief 명령 하나가 받은 허가. */
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
-    /** @brief 회로가 닫혀 있을 때 보낸 명령. */
+    /// Sent while the circuit was closed.
     Normal,
-    /** @brief 회로를 닫을지 정하는 명령. */
+    /// Decides whether the circuit closes.
     Probe,
 }
 
-/** @brief 명령을 보내지 못한 까닭. */
 enum Exchange {
-    /** @brief 연결이 모두 쓰이는 중이라 보내지 않았다. 공유 캐시의 실패가 아니다. */
+    /// Every connection was busy, so nothing was sent; not a cache failure.
     Busy,
-    /** @brief 보냈지만 실패했다. */
     Failed(std::io::Error),
 }
 
-/** @brief 연결 수 상한 안에서 잡은 자리 하나. 버리면 자리를 돌려준다. */
+/// A place under the connection cap, returned on drop.
 struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
-    /** @brief 상한에 닿지 않았으면 자리를 잡는다. */
+    /// None at the cap.
     fn acquire(open: &Arc<AtomicUsize>) -> Option<Slot> {
         open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < MAX_CONNECTIONS).then_some(count + 1)
@@ -215,75 +175,57 @@ impl Slot {
 }
 
 impl Drop for Slot {
-    /** @brief 자리를 돌려준다. */
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/** @brief 연결과 그 연결이 차지한 자리. 함께 버려야 셈이 맞는다. */
+/// A connection with its slot; they drop together so the count stays right.
 struct Pooled {
-    /** @brief 연결. */
     connection: Connection,
-    /** @brief 차지한 자리. */
     _slot: Slot,
 }
 
-/** @brief 공유 캐시 클라이언트. */
 pub struct RedisClient {
-    /** @brief 붙을 주소. */
     addr: SocketAddr,
-    /**
-     * @brief TLS 핸드셰이크 설정. 없으면 평문으로 붙는다.
-     * @note 한 번 만들어 두고 연결마다 빌려 쓴다. 신뢰 저장소를 연결마다 복제하거나 다시
-     *       읽지 않기 위해서다.
-     */
+    /// Built once and shared by every connection, so the trust store is not cloned or reread per
+    /// connection. None connects in plain text.
     tls: Option<ClientConfig>,
-    /** @brief 자격 증명. 없으면 인증하지 않는다. */
     auth: Option<RedisAuth>,
-    /** @brief 쉬고 있는 연결. */
     idle: Mutex<Vec<Pooled>>,
-    /** @brief 열린 연결 수. 쉬는 것과 빌려 간 것을 모두 센다. */
+    /// Idle and checked-out connections alike.
     open: Arc<AtomicUsize>,
-    /** @brief 명령을 보낼지 정하는 상태. */
     circuit: Mutex<Circuit>,
-    /** @brief 서버가 오류로 답한 누적 횟수. 2의 거듭제곱 번째만 기록한다. */
+    /// Error replies from the server; logged at powers of two.
     rejected: AtomicU64,
-    /** @brief 대기열이 꽉 차 버린 쓰기의 누적 수. 2의 거듭제곱 번째만 기록한다. */
+    /// Writes dropped on a full queue; logged at powers of two.
     dropped_writes: AtomicU64,
     #[cfg(test)]
-    /** @brief 맡겨 두고 아직 끝나지 않은 쓰기 수. 테스트가 쓰기가 끝나기를 기다릴 때 본다. */
+    /// Queued writes not yet finished, for tests waiting on them.
     pending_writes: AtomicUsize,
 }
 
-/**
- * @brief 명령 하나의 결과를 회로에 반영한다.
- * @warning 다시 붙어 보는 명령이 결과를 남기지 않고 사라지면 회로가 그 상태에 머물러 공유
- *          캐시를 영영 쓰지 않는다. 결과를 남기지 않고 버려지면 실패로 반영한다.
- */
+/// Applies one command's result to the circuit. If a probe vanished without a result, the circuit
+/// would stay probing and never use the shared cache again, so an unsettled outcome counts as a
+/// failure.
 struct Outcome<'a> {
-    /** @brief 반영할 클라이언트. */
     client: &'a RedisClient,
-    /** @brief 이 명령이 받은 허가. */
     admission: Admission,
-    /** @brief 결과를 반영했는지. */
     settled: bool,
 }
 
 impl Outcome<'_> {
-    /** @brief 성공을 반영한다. */
     fn succeeded(mut self) {
         self.settled = true;
         self.client.on_success(self.admission);
     }
 
-    /** @brief 연결이 없어 보내지 못했음을 반영한다. */
+    /// No connection was free.
     fn skipped(mut self) {
         self.settled = true;
         self.client.on_skip(self.admission);
     }
 
-    /** @brief 실패를 반영한다. */
     fn failed(mut self, error: &std::io::Error) {
         self.settled = true;
         self.client.on_failure(self.admission, error);
@@ -291,7 +233,6 @@ impl Outcome<'_> {
 }
 
 impl Drop for Outcome<'_> {
-    /** @brief 반영하지 않은 결과를 실패로 반영한다. */
     fn drop(&mut self) {
         if !self.settled {
             self.client.on_failure(
@@ -303,7 +244,7 @@ impl Drop for Outcome<'_> {
 }
 
 impl RedisClient {
-    /** @brief 붙는 방법으로 만든다. 접속은 처음 쓸 때 한다. */
+    /// Connects on first use.
     pub fn new(options: RedisOptions) -> Self {
         let RedisOptions { addr, tls, auth } = options;
         let tls = tls.map(|tls| ClientConfig {
@@ -331,12 +272,11 @@ impl RedisClient {
         }
     }
 
-    /** @brief 붙을 주소. */
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /** @brief 이 명령을 보내도 되는지 정한다. 보내지 않으면 없음. */
+    /// None means do not send.
     fn admit(&self) -> Option<Admission> {
         let mut circuit = self.circuit.lock_recover();
         match *circuit {
@@ -350,7 +290,7 @@ impl RedisClient {
         }
     }
 
-    /** @brief 성공한 명령을 반영한다. 다시 붙어 본 명령이 성공했을 때만 회로를 닫는다. */
+    /// Only a successful probe closes the circuit.
     fn on_success(&self, admission: Admission) {
         if admission != Admission::Probe {
             return;
@@ -359,19 +299,16 @@ impl RedisClient {
         onetdns_core::info!(event = "cachedb.recovered", addr = %self.addr, "Shared cache is answering again; resumed using it");
     }
 
-    /** @brief 보내지 못한 명령을 반영한다. 다시 붙어 보지 못했으면 다음 명령이 해 보게 한다. */
+    /// A probe that could not be sent leaves probing to the next command.
     fn on_skip(&self, admission: Admission) {
         if admission == Admission::Probe {
             *self.circuit.lock_recover() = Circuit::Open(Instant::now());
         }
     }
 
-    /**
-     * @brief 실패한 명령을 반영한다.
-     * @details 회로가 닫혀 있을 때 실패한 명령만 회로를 연다. 이미 열린 뒤에 끝난 명령은 그 전에
-     *          보낸 것이므로 다시 붙어 보는 일을 막지 않는다. 열 때 쉬는 연결도 버린다. 캐시가
-     *          다시 뜨면 그 연결은 이미 끊겨 있다.
-     */
+    /// Only a command sent while the circuit was closed opens it; a command finishing after it
+    /// opened was sent earlier and does not hold off the probe. Opening also drops idle
+    /// connections, which are already dead by the time the cache returns.
     fn on_failure(&self, admission: Admission, error: &std::io::Error) {
         let opened = {
             let mut circuit = self.circuit.lock_recover();
@@ -389,11 +326,8 @@ impl RedisClient {
         }
     }
 
-    /**
-     * @brief 공유 캐시를 쓰지 못하게 됐음을 기록한다.
-     * @details 회로가 열릴 때만 남긴다. 이 기록이 없으면 공유 캐시가 전부 죽어도 질의는 그대로
-     *          처리돼 운영자가 알아챌 길이 없다.
-     */
+    /// Logged only when the circuit opens. Without it, a completely dead shared cache would go
+    /// unnoticed, since queries keep being answered.
     fn note_unavailable(&self, error: &std::io::Error) {
         if error.kind() == std::io::ErrorKind::PermissionDenied {
             onetdns_core::warn!(event = "cachedb.credentials_rejected", addr = %self.addr, error = %error, cooldown_secs = FAILURE_COOLDOWN.as_secs(), "Shared cache rejected the configured user name or password; skipping it for now. Queries are still answered but the cache is not shared");
@@ -402,10 +336,11 @@ impl RedisClient {
         }
     }
 
-    /** @brief 접속하고, TLS와 인증까지 마친다. */
+    /// Includes TLS and authentication.
     fn connect(&self, deadline: Instant) -> std::io::Result<Connection> {
         let mut tcp = DeadlineTcp::connect(self.addr, deadline)?;
-        /* 명령은 작은 쓰기 하나 뒤에 응답을 기다리므로, Nagle 지연이 그대로 질의 지연이 된다. */
+        // A command is one small write followed by a wait for the reply, so Nagle delay would
+        // become query delay.
         let _ = tcp.get_ref().set_nodelay(true);
         let mut connection = match &self.tls {
             None => Connection::Plain(BufReader::new(tcp)),
@@ -425,11 +360,8 @@ impl RedisClient {
         Ok(connection)
     }
 
-    /**
-     * @brief 연결 하나를 빌린다.
-     * @param fresh  참이면 쉬는 연결을 쓰지 않고 새로 붙는다.
-     * @return 연결과, 그것이 쉬던 연결이었는지.
-     */
+    /// `fresh` skips idle connections and connects anew. Returns the connection and whether it was
+    /// idle.
     fn checkout(&self, deadline: Instant, fresh: bool) -> Result<(Pooled, bool), Exchange> {
         if !fresh {
             if let Some(pooled) = self.idle.lock_recover().pop() {
@@ -447,14 +379,12 @@ impl RedisClient {
         ))
     }
 
-    /**
-     * @brief 연결을 빌려 명령 하나를 주고받는다.
-     * @details 쉬던 연결이 실패하면 새 연결로 한 번 더 보낸다. 캐시가 다시 떴거나 쉬는 동안
-     *          상대가 연결을 닫았으면 쉬던 연결은 이미 끊겨 있다. 세 명령 모두 다시 보내도
-     *          결과가 같다.
-     * @warning 실패한 연결은 돌려놓지 않는다. 어긋난 연결을 다시 쓰면 다음 명령의 답으로 앞
-     *          명령의 답을 읽는다.
-     */
+    /// When an idle connection fails, the command is sent once more on a new one: after the cache
+    /// restarts, or when the peer closed it while idle, the idle connection is already dead. All
+    /// three commands are safe to resend.
+    ///
+    /// A failed connection is never returned to the pool: reusing an out-of-step connection would
+    /// read the previous command's reply as the next one's.
     fn exchange(&self, args: &[&[u8]]) -> Result<RespValue, Exchange> {
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         let (mut pooled, reused) = self.checkout(deadline, false)?;
@@ -472,7 +402,7 @@ impl RedisClient {
         Ok(value)
     }
 
-    /** @brief 명령 하나를 보내고 답을 받는다. 보내지 않았거나 실패하면 없음. */
+    /// None when not sent or failed.
     fn command(&self, args: &[&[u8]]) -> Option<RespValue> {
         let outcome = Outcome {
             client: self,
@@ -495,11 +425,8 @@ impl RedisClient {
         }
     }
 
-    /**
-     * @brief 서버가 오류로 답했으면 기록한다.
-     * @details 접속과 왕복은 성공했으므로 회로가 열리지 않는다. 메모리 부족처럼 공유 캐시가
-     *          계속 아무 일도 하지 않는 상태가 여기서만 드러난다.
-     */
+    /// Logs error replies. Connecting and the round trip succeeded, so the circuit stays closed;
+    /// this is the only place a cache stuck doing nothing, out of memory for example, shows up.
     fn note_reply(&self, command: &str, value: &RespValue) {
         let RespValue::Error(message) = value else {
             return;
@@ -510,7 +437,7 @@ impl RedisClient {
         }
     }
 
-    /** @brief 값을 읽는다. 실패하면 없는 것으로 본다. */
+    /// A failure reads as absent.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let value = self.command(&[b"GET", key])?;
         self.note_reply("GET", &value);
@@ -520,25 +447,23 @@ impl RedisClient {
         }
     }
 
-    /** @brief 만료 시간과 함께 값을 넣도록 맡긴다. 답을 기다리지 않고, 실패는 무시한다. */
+    /// Queued; the reply is not awaited and failures are ignored.
     pub fn setex(self: &Arc<Self>, key: Vec<u8>, secs: u64, value: Vec<u8>) {
         let secs = secs.max(1).to_string().into_bytes();
         self.write_later("SETEX", vec![b"SETEX".to_vec(), key, secs, value]);
     }
 
-    /** @brief 값을 지우도록 맡긴다. 답을 기다리지 않고, 실패는 무시한다. */
+    /// Queued; the reply is not awaited and failures are ignored.
     pub fn del(self: &Arc<Self>, key: Vec<u8>) {
         self.write_later("DEL", vec![b"DEL".to_vec(), key]);
     }
 
-    /**
-     * @brief 쓰기 명령을 워커에 맡긴다.
-     * @details 질의의 답은 담기와 지우기의 결과에 기대지 않으므로 질의가 그 왕복을 기다릴 까닭이
-     *          없다. 대기열이 꽉 차면 버린다.
-     * @warning 맡긴 쓰기는 여러 워커가 나눠 보내므로 맡긴 순서대로 끝나지 않는다. 한 질의는 한
-     *          키에 쓰기를 하나만 맡겨야 한다. 지우기와 담기를 함께 맡기면 새로 담은 값이 지워질
-     *          수 있다.
-     */
+    /// Query answers never depend on a store or delete, so queries have no reason to wait on the
+    /// round trip. Dropped when the queue is full.
+    ///
+    /// Workers send queued writes in parallel, so they finish out of order: a query must queue at
+    /// most one write per key, since a delete queued with a store could remove the newly stored
+    /// value.
     fn write_later(self: &Arc<Self>, name: &'static str, args: Vec<Vec<u8>>) {
         #[cfg(test)]
         self.pending_writes.fetch_add(1, Ordering::AcqRel);
@@ -558,11 +483,8 @@ impl RedisClient {
         }
     }
 
-    /**
-     * @brief 대기열이 꽉 차 쓰기를 버렸음을 기록한다.
-     * @details 공유 캐시가 받아 주는 속도보다 쓰기가 빨리 쌓인다는 뜻이다. 답은 그대로 나가지만
-     *          다른 서버와 나누지 못한다.
-     */
+    /// Writes pile up faster than the shared cache takes them; answers still go out but are not
+    /// shared with other servers.
     fn note_write_dropped(&self) {
         let count = self.dropped_writes.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
@@ -571,7 +493,6 @@ impl RedisClient {
     }
 
     #[cfg(test)]
-    /** @brief 맡긴 쓰기가 모두 끝나기를 기다린다. */
     pub(crate) fn wait_for_writes(&self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.pending_writes.load(Ordering::Acquire) > 0 {
@@ -584,10 +505,7 @@ impl RedisClient {
     }
 }
 
-/**
- * @brief 새 연결에서 AUTH 명령으로 인증한다.
- * @return 서버가 오류로 답하면 PermissionDenied 종류의 실패.
- */
+/// Fails with PermissionDenied when the server answers with an error.
 fn authenticate(connection: &mut Connection, auth: &RedisAuth) -> std::io::Result<()> {
     let password = auth.password.as_bytes();
     let reply = match &auth.username {
@@ -604,24 +522,16 @@ fn authenticate(connection: &mut Connection, auth: &RedisAuth) -> std::io::Resul
     }
 }
 
-/** @brief 응답 값 하나. */
 enum RespValue {
-    /** @brief 짧은 문자열 응답. */
     Simple(#[allow(dead_code)] String),
-    /** @brief 길이가 붙은 값. */
     Bulk(Vec<u8>),
-    /** @brief 값이 없다. */
     Nil,
-    /** @brief 수. */
     Int(#[allow(dead_code)] i64),
-    /** @brief 오류. */
     Error(String),
 }
 
-/**
- * @brief 데드라인을 걸고 명령을 보내 답을 읽는다.
- * @param deadline 명령 전체의 데드라인. 왕복은 이보다 먼저 ROUNDTRIP_TIMEOUT 에 끊긴다.
- */
+/// `deadline` is for the whole command; the round trip itself is cut earlier at
+/// `ROUNDTRIP_TIMEOUT`.
 fn roundtrip(
     connection: &mut Connection,
     args: &[&[u8]],
@@ -631,11 +541,8 @@ fn roundtrip(
     write_and_read(connection, args)
 }
 
-/**
- * @brief 명령을 보내고 답을 읽는다.
- * @note 요청 버퍼를 쓰고 나서 지운다. AUTH 명령에는 비밀번호가 들어 있다. 버퍼가 자라며 다시
- *       잡히면 지우지 않은 이전 버퍼가 남으므로, 처음부터 전체 길이만큼 잡는다.
- */
+/// The request buffer is wiped after writing, since AUTH carries the password. It is sized to the
+/// full length up front: a growing buffer would leave unwiped earlier copies behind.
 fn write_and_read<S: Read + Write>(stream: &mut S, args: &[&[u8]]) -> std::io::Result<RespValue> {
     let capacity = 32 + args.iter().map(|a| a.len() + 32).sum::<usize>();
     let mut req = Zeroizing::new(Vec::with_capacity(capacity));
@@ -650,7 +557,7 @@ fn write_and_read<S: Read + Write>(stream: &mut S, args: &[&[u8]]) -> std::io::R
     read_reply(stream)
 }
 
-/** @brief 한 줄을 읽는다. 길이 상한이 걸린다. */
+/// With a length cap.
 fn read_line<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut b = [0u8; 1];
@@ -673,11 +580,8 @@ fn read_line<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/**
- * @brief 응답 하나를 읽는다.
- * @warning 배열 응답을 끝까지 소비해야 한다. 중간에 멈추면 남은 바이트가 다음 명령의
- *          답으로 읽혀 연결이 어긋난다.
- */
+/// Array replies must be consumed to the end; stopping midway would leave bytes read as the next
+/// command's reply.
 fn read_reply<R: Read>(stream: &mut R) -> std::io::Result<RespValue> {
     let line = read_line(stream)?;
     if line.is_empty() {
@@ -723,7 +627,6 @@ fn read_reply<R: Read>(stream: &mut R) -> std::io::Result<RespValue> {
     }
 }
 
-/** @brief 수를 읽는다. 형식이 어긋나면 오류다. */
 fn parse_i64(b: &[u8]) -> std::io::Result<i64> {
     std::str::from_utf8(b)
         .map_err(|_| std::io::ErrorKind::InvalidData)?
@@ -732,7 +635,7 @@ fn parse_i64(b: &[u8]) -> std::io::Result<i64> {
 }
 
 #[cfg(test)]
-/** @brief 테스트가 띄우는 가짜 Redis. GET, SETEX, DEL, AUTH 만 처리한다. */
+/// Fake Redis for tests, handling only GET, SETEX, DEL, and AUTH.
 pub(crate) mod fake {
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -743,37 +646,31 @@ pub(crate) mod fake {
 
     use onetdns_core::MutexExt;
 
-    /** @brief 가짜 Redis 가 답하는 방식. */
     #[derive(Clone, Default)]
     pub(crate) struct Behavior {
-        /** @brief 명령마다 답하기 전에 기다릴 시간. */
+        /// Before every reply.
         pub(crate) delay: Duration,
-        /** @brief AUTH 로 받아야 할 사용자 이름과 비밀번호. 없으면 인증 없이 받는다. */
+        /// Username and password AUTH must carry; None accepts without authentication.
         pub(crate) credentials: Option<(Option<String>, String)>,
-        /** @brief TLS 로 받을 때 쓸 서버 설정. */
         pub(crate) tls: Option<Arc<onetdns_tls::ServerConfig>>,
-        /** @brief 참이면 답 하나를 보낸 뒤 연결을 닫는다. */
+        /// Close the connection after one reply.
         pub(crate) close_after_reply: bool,
-        /** @brief 있으면 이것이 참이 될 때까지 데이터 명령에 답하지 않는다. */
+        /// Data commands get no reply until this turns true.
         pub(crate) hold: Option<Arc<AtomicBool>>,
     }
 
-    /** @brief 띄운 가짜 Redis. 버리면 새 연결을 받지 않는다. */
+    /// Stops accepting when dropped.
     pub(crate) struct FakeRedis {
-        /** @brief 받는 주소. */
         pub(crate) addr: SocketAddr,
-        /** @brief 담긴 값. 테스트가 직접 넣고 꺼낸다. */
+        /// Tests read and write it directly.
         pub(crate) store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        /** @brief 받은 연결 수. */
         pub(crate) connections: Arc<AtomicUsize>,
-        /** @brief 처리한 데이터 명령 수. AUTH 는 세지 않는다. */
+        /// Data commands handled; AUTH is not counted.
         pub(crate) commands: Arc<AtomicUsize>,
-        /** @brief 멈출지. */
         stop: Arc<AtomicBool>,
     }
 
     impl FakeRedis {
-        /** @brief 정한 방식으로 띄운다. */
         pub(crate) fn start(behavior: Behavior) -> FakeRedis {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -811,31 +708,28 @@ pub(crate) mod fake {
             }
         }
 
-        /** @brief 담긴 값 하나. */
         pub(crate) fn value(&self, key: &[u8]) -> Option<Vec<u8>> {
             self.store.lock_recover().get(key).cloned()
         }
 
-        /** @brief 담긴 키 전부. */
         pub(crate) fn keys(&self) -> Vec<Vec<u8>> {
             self.store.lock_recover().keys().cloned().collect()
         }
 
-        /** @brief 값을 직접 넣는다. Redis 에 쓸 수 있는 남이 하는 일이다. */
+        /// What anyone able to write to Redis can do.
         pub(crate) fn insert(&self, key: Vec<u8>, value: Vec<u8>) {
             self.store.lock_recover().insert(key, value);
         }
     }
 
     impl Drop for FakeRedis {
-        /** @brief 받기를 멈춘다. 막혀 있는 accept 를 깨우려고 한 번 붙는다. */
+        /// Connects once to wake the blocked accept.
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
             let _ = TcpStream::connect(self.addr);
         }
     }
 
-    /** @brief 연결 하나를 처리한다. */
     fn serve(
         mut stream: TcpStream,
         store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
@@ -854,7 +748,6 @@ pub(crate) mod fake {
         }
     }
 
-    /** @brief 명령을 읽고 답한다. */
     fn handle<S: Read + Write>(
         stream: &mut S,
         store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
@@ -917,7 +810,6 @@ pub(crate) mod fake {
         }
     }
 
-    /** @brief 요청 줄 하나를 읽는다. */
     fn read_line<S: Read>(stream: &mut S) -> Option<Vec<u8>> {
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
@@ -931,7 +823,6 @@ pub(crate) mod fake {
         }
     }
 
-    /** @brief 명령 하나를 인자 목록으로 읽는다. */
     fn read_command<S: Read>(stream: &mut S) -> Option<Vec<Vec<u8>>> {
         let header = read_line(stream)?;
         let count: usize = std::str::from_utf8(header.strip_prefix(b"*")?)
@@ -955,13 +846,11 @@ pub(crate) mod fake {
 }
 
 #[cfg(test)]
-/** @brief 데드라인, 연결 풀, 회로, 인증, TLS, 그리고 연결이 어긋나지 않는지. */
 mod tests {
     use super::fake::{Behavior, FakeRedis};
     use super::*;
     use std::net::TcpListener;
 
-    /** @brief 평문으로 붙는 클라이언트. */
     fn plain_client(addr: SocketAddr) -> Arc<RedisClient> {
         Arc::new(RedisClient::new(RedisOptions {
             addr,
@@ -971,7 +860,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패 뒤 잠시 아예 건너뛰는지. */
     fn connection_failure_opens_fast_fail_circuit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -987,14 +875,13 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 느린 캐시에 동시에 보낸 명령이 줄을 서지 않는지.
-     * @details 연결 하나를 잠금으로 나눠 쓰면 명령마다 앞 명령의 왕복을 기다려 지연이 쌓인다.
-     *          실패가 아니므로 회로도 열리지 않아 질의마다 그 지연을 치른다. 명령은 쉬는 연결을
-     *          먼저 쓰므로, 앞 명령을 기다렸다면 가짜 Redis 는 연결을 하나만 받는다.
-     * @note 걸린 시간이나 회로 상태로는 판정하지 않는다. 테스트 머신이 잠깐 멈추면 명령이 함께
-     *       나갔더라도 왕복 데드라인을 넘겨 회로가 열리고 걸린 시간도 그만큼 늘어난다.
-     */
+    /// Sharing one connection under a lock would make each command wait for the previous round
+    /// trip, and since that is not a failure, the circuit would not open and every query would pay
+    /// the delay. Commands prefer idle connections, so had they waited for each other, the fake
+    /// would accept only one connection.
+    ///
+    /// Not judged by elapsed time or circuit state: a brief stall of the test machine could push
+    /// concurrent commands past the round-trip deadline, open the circuit, and stretch the time.
     fn slow_cache_does_not_serialize_concurrent_commands() {
         let fake = FakeRedis::start(Behavior {
             delay: ROUNDTRIP_TIMEOUT / 4,
@@ -1018,10 +905,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 연결이 모두 쓰이는 중이면 기다리지 않고 건너뛰며, 그것을 실패로 세지 않는지.
-     * @details 연결 수 상한까지 자리를 붙들어 다른 명령이 연결을 모두 빌려 간 상태를 만든다.
-     */
+    /// Skips without waiting and does not count it as a failure. Holding slots up to the cap mimics
+    /// other commands having borrowed every connection.
     fn exhausted_pool_skips_instead_of_waiting() {
         let fake = FakeRedis::start(Behavior::default());
         let client = plain_client(fake.addr);
@@ -1045,7 +930,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쉬는 연결을 다시 쓰는지. */
     fn idle_connections_are_reused() {
         let fake = FakeRedis::start(Behavior::default());
         let client = plain_client(fake.addr);
@@ -1058,7 +942,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대가 닫은 쉬는 연결을 만나면 새 연결로 한 번 더 보내고, 회로는 열지 않는지. */
     fn closed_idle_connection_is_replaced_without_opening_the_circuit() {
         let fake = FakeRedis::start(Behavior {
             close_after_reply: true,
@@ -1074,11 +957,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답은 하지만 느린 캐시를 실패로 보고 건너뛰는지.
-     * @details 명령 데드라인 안에서만 느리면 실패가 아니어서 회로가 열리지 않고, 질의마다 그만큼
-     *          기다린다.
-     */
+    /// Slowness within the command deadline alone would not count as failure, so the circuit would
+    /// not open and every query would wait that long.
     fn slow_replies_open_the_circuit() {
         let fake = FakeRedis::start(Behavior {
             delay: ROUNDTRIP_TIMEOUT * 5,
@@ -1100,11 +980,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 담기와 지우기가 답을 기다리지 않는지.
-     * @details 가짜 Redis는 테스트가 풀어 줄 때까지 답하지 않는다. 쓰기가 답을 기다리면 테스트가
-     *          풀어 주기 전에 데드라인이 지나 쓰기가 실패하고 값이 담기지 않는다.
-     */
+    /// The fake holds replies until the test releases them; a write waiting on the reply would hit
+    /// its deadline first, fail, and store nothing.
     fn writes_do_not_wait_for_the_reply() {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fake = FakeRedis::start(Behavior {
@@ -1122,11 +999,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 쉬는 시간이 지나면 명령 하나만 다시 붙어 보고, 그 결과로만 회로가 바뀌는지.
-     * @details 다시 붙어 보는 명령이 결과 없이 사라지면 회로를 실패로 연다. 그러지 않으면 다시
-     *          붙어 보는 상태에 머물러 공유 캐시를 영영 쓰지 않는다.
-     */
+    /// A probe vanishing without a result opens the circuit as a failure; otherwise it would stay
+    /// probing and never use the shared cache again.
     fn only_one_command_probes_and_only_it_closes_the_circuit() {
         let client = plain_client(SocketAddr::from(([127, 0, 0, 1], 1)));
         *client.circuit.lock_recover() = Circuit::Open(Instant::now());
@@ -1153,7 +1027,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 회로가 열린 뒤에 끝난 이전 명령의 실패가 쉬는 시간을 늘리지 않는지. */
     fn late_failure_of_an_earlier_command_leaves_the_open_circuit_alone() {
         let client = plain_client(SocketAddr::from(([127, 0, 0, 1], 1)));
         let error = std::io::Error::from(std::io::ErrorKind::TimedOut);
@@ -1167,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 새 연결마다 AUTH 로 인증하고, 사용자 이름이 없으면 기본 사용자로 인증하는지. */
+    /// Without a username, it authenticates as the default user.
     fn every_new_connection_authenticates() {
         for username in [Some("dns".to_string()), None] {
             let fake = FakeRedis::start(Behavior {
@@ -1190,7 +1063,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 자격 증명을 거부당하면 명령을 보내지 않고 회로를 여는지. */
     fn rejected_credentials_open_the_circuit_before_any_command() {
         let fake = FakeRedis::start(Behavior {
             credentials: Some((Some("dns".into()), "correct-password".into())),
@@ -1211,7 +1083,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief TLS 로 붙고, 인증서 이름이 설정한 호스트와 다르면 거부하는지. */
     fn tls_connection_checks_the_certificate_name() {
         let (certs, key) = onetdns_transport::self_signed_material("redis.test").unwrap();
         let roots = TrustStore::from_ders([certs[0].as_slice()]);
@@ -1243,11 +1114,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 읽기 버퍼보다 큰 값을 읽은 뒤에도 같은 연결에서 다음 답을 제대로 읽는지.
-     * @details 큰 값은 앞부분이 버퍼에 담기고 나머지는 소켓에서 바로 읽힌다. 그 경계에서 바이트를
-     *          잃거나 겹쳐 읽으면 다음 명령이 앞 명령의 답을 읽는다.
-     */
+    /// A large value is read partly from the buffer and the rest straight from the socket; losing
+    /// or rereading bytes at that boundary would make the next command read the previous reply.
     fn large_reply_keeps_the_pooled_connection_in_step() {
         let fake = FakeRedis::start(Behavior::default());
         let client = plain_client(fake.addr);
@@ -1263,7 +1131,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수 형식을 엄격히 보고, 배열 응답이 연결을 어긋나게 하지 않는지. */
     fn resp_numeric_fields_are_strict_and_arrays_cannot_desync_connection() {
         assert!(parse_i64(b"12").is_ok());
         assert!(parse_i64(b"").is_err());
@@ -1278,7 +1145,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 변형한 응답 바이트를 읽어도 패닉하지 않는지. */
     fn resp_reader_survives_mutated_replies() {
         use crate::fuzzutil::{havoc, Rng};
         let seeds: [&[u8]; 5] = [

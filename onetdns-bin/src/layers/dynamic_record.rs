@@ -1,6 +1,4 @@
-/*!
- * @brief 상태를 확인해 값을 고르는 동적 레코드 계층과 그 상태 확인 실행기.
- */
+//! Records that choose their answer by mode and health, and the executor for their health probes.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -14,46 +12,32 @@ use super::{answer_message, configured_name_key, outcome_to_option};
 use crate::native::{ResolveOutcome, Resolver};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-/** @brief 여러 주소 중 무엇을 답할지 고르는 방식. */
 enum DynMode {
-    /** @brief 무작위로 하나 고른다. */
     Random,
-    /** @brief 몫에 비례해 고른다. */
     Weighted,
-    /** @brief 돌아가며 고른다. */
     RoundRobin,
-    /** @brief 살아 있는 것만 답한다. */
+    /// Answers only addresses known to be up.
     Failover,
 }
 
-/** @brief 상태를 보고 답을 고르는 기록 하나. */
 struct DynRec {
-    /** @brief 이 기록의 종류. */
     qtype: RecordType,
-    /** @brief 고르는 방식. */
     mode: DynMode,
-    /** @brief 후보 주소와 그 몫. */
     values: Vec<(IpAddr, u32)>,
-    /** @brief 답에 담을 수명. */
     ttl: u32,
-    /** @brief 살아 있는지 확인할 포트. 0이면 확인하지 않는다. */
+    /// 0 disables probing.
     probe_port: u16,
-    /** @brief 돌아가며 고를 때의 지금 위치. */
     rr: std::sync::atomic::AtomicUsize,
-    /** @brief 주소별로 마지막에 확인한 결과와 시각. */
+    /// Last probe result and time, per address.
     health: Arc<Mutex<HashMap<IpAddr, (bool, Instant)>>>,
-    /** @brief 지금 확인 중인 주소들. 같은 주소를 겹쳐 확인하지 않으려는 것이다. */
+    /// Keeps one address from being probed twice at once.
     probing: Arc<Mutex<HashSet<IpAddr>>>,
 }
 
 impl DynRec {
-    /**
-     * @brief 이번에 답할 주소를 고른다.
-     * @details 살아 있는 것만 답하려면 확인해야 한다. 확인은 질의 처리를 붙잡지 않도록
-     *          제한된 워커에게 맡기고, 지금 아는 상태로 답한다.
-     * @warning 아는 것이 하나도 없으면 첫 주소를 답한다. 아무것도 답하지 않으면 확인이
-     *          한 번 실패한 것만으로 그 이름이 전부 죽는다.
-     */
+    /// Failover probes on the bounded workers, so queries never wait for a probe; the answer uses
+    /// what is known now. When no address is known to be up, the first one is answered: answering
+    /// nothing would take the name down on a single failed probe.
     fn select(&self) -> Vec<IpAddr> {
         if self.values.is_empty() {
             return Vec::new();
@@ -165,14 +149,12 @@ impl DynRec {
     }
 }
 
-/** @brief 무작위 수 하나. */
 fn rand_usize() -> usize {
     let mut b = [0u8; std::mem::size_of::<usize>()];
     onetdns_core::fill_random(&mut b);
     usize::from_le_bytes(b)
 }
 
-/** @brief 이 주소의 이 포트에 닿는지. */
 fn tcp_reachable(ip: IpAddr, port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::new(ip, port),
@@ -181,29 +163,22 @@ fn tcp_reachable(ip: IpAddr, port: u16) -> bool {
     .is_ok()
 }
 
-/** @brief 상태 확인 일 하나. */
 type HealthProbeJob = Box<dyn FnOnce() + Send + 'static>;
 
-/** @brief 상태 확인 워커 수. */
 const HEALTH_PROBE_WORKERS: usize = 8;
-/** @brief 상태 확인 대기열 크기. 상한이 없으면 확인이 밀릴 때 스레드가 끝없이 늘어난다. */
+/// Without a cap, backed-up probes would pile up without bound.
 const HEALTH_PROBE_QUEUE: usize = 256;
-/** @brief 상태 확인 워커 풀. */
 static HEALTH_PROBE_EXECUTOR: OnceLock<mpsc::SyncSender<HealthProbeJob>> = OnceLock::new();
 #[cfg(test)]
-/** @brief 지금 실행 중인 확인 수. 테스트용. */
 static HEALTH_PROBE_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
-/** @brief 동시에 돈 확인의 최대치. 테스트용. */
 static HEALTH_PROBE_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
-/** @brief 동시 확인 수를 세는 것. 테스트용. */
 struct HealthProbeActivity;
 
 #[cfg(test)]
 impl HealthProbeActivity {
-    /** @brief 확인 하나를 세기 시작한다. */
     fn enter() -> Self {
         use std::sync::atomic::Ordering;
         let active = HEALTH_PROBE_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
@@ -214,13 +189,12 @@ impl HealthProbeActivity {
 
 #[cfg(test)]
 impl Drop for HealthProbeActivity {
-    /** @brief 확인 하나를 뺀다. */
     fn drop(&mut self) {
         HEALTH_PROBE_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/** @brief 상태 확인 워커 풀. 처음 쓸 때 시작한다. */
+/// Started on first use.
 fn health_probe_executor() -> &'static mpsc::SyncSender<HealthProbeJob> {
     HEALTH_PROBE_EXECUTOR.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<HealthProbeJob>(HEALTH_PROBE_QUEUE);
@@ -249,21 +223,17 @@ fn health_probe_executor() -> &'static mpsc::SyncSender<HealthProbeJob> {
     })
 }
 
-/** @brief 확인을 맡긴다. 대기열이 꽉 차면 이번 확인을 건너뛴다. */
+/// A full queue skips this probe.
 fn submit_health_probe(job: impl FnOnce() + Send + 'static) -> bool {
     health_probe_executor().try_send(Box::new(job)).is_ok()
 }
 
-/** @brief 상태를 보고 답을 고르는 기록들을 답하는 계층. */
 pub struct DynamicRecordLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 이름별로 걸린 기록들. */
     records: HashMap<Vec<u8>, Vec<DynRec>>,
 }
 
 impl DynamicRecordLayer {
-    /** @brief 설정한 기록들로 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         cfg: &[onetdns_config::DynamicRecord],
@@ -344,19 +314,16 @@ impl DynamicRecordLayer {
         Ok(DynamicRecordLayer { inner, records })
     }
 
-    /** @brief 답할 기록이 하나도 없는지. */
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 }
 
 impl Resolver for DynamicRecordLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 설정한 이름이면 골라 답하고, 아니면 안으로 넘긴다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         if let Some(q) = req.questions.first() {
             let mut key = [0u8; 255];
@@ -401,7 +368,6 @@ impl Resolver for DynamicRecordLayer {
 }
 
 #[cfg(test)]
-/** @brief 동적 레코드의 선택 방식과 상태 확인 실행기의 한도. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -411,7 +377,6 @@ mod tests {
 
     use onetdns_proto::{Message, Name, RecordType};
 
-    /** @brief 테스트용 동적 기록 설정. */
     fn dynrec(mode: &str, values: &[&str]) -> onetdns_config::DynamicRecord {
         onetdns_config::DynamicRecord {
             name: "dyn.test".into(),
@@ -424,7 +389,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무작위 방식이 설정한 값 중에서만 고르는지. */
     fn dynamic_random_picks_configured_value() {
         let mock = Mock::new(9, 0);
         let layer =
@@ -444,7 +408,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 몫이 0인 값을 고르지 않는지. */
     fn dynamic_weighted_respects_weight_zero() {
         let mock = Mock::new(9, 0);
 
@@ -458,7 +421,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 돌아가며 고르는지. */
     fn dynamic_round_robin_rotates() {
         let mock = Mock::new(9, 0);
         let layer =
@@ -472,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상태 확인이 제한된 워커 안에서만 도는지. 안 그러면 스레드가 끝없이 는다. */
+    /// Otherwise probe threads would grow without bound.
     fn dynamic_failover_health_checks_use_bounded_executor() {
         let values = (1..=64)
             .map(|last| format!("192.0.2.{last}"))
@@ -497,7 +459,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정하지 않은 이름은 그냥 지나가는지. */
     fn dynamic_passthrough_for_other_names() {
         let mock = Mock::new(7, 0);
         let layer =
@@ -508,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름의 원래 바이트가 키에서 바뀌지 않는지. 바뀌면 다른 이름이 같은 답을 받는다. */
+    /// Otherwise different names could share a key and get the same answer.
     fn dynamic_record_key_preserves_raw_name_octets() {
         let mock = Mock::new(7, 0);
         let mut record = dynrec("random", &["10.0.0.1"]);
@@ -535,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 설정이 조용히 무시되지 않는지. 무시되면 운영자는 걸린 줄 안다. */
+    /// Ignored, the operator would believe it applies.
     fn invalid_dynamic_record_cannot_disappear_silently() {
         let mut record = dynrec("random", &["10.0.0.1"]);
         record.name = "bad..name".to_string();

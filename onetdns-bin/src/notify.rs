@@ -1,6 +1,4 @@
-/*!
- * @brief 영역이 바뀌면 세컨더리에 NOTIFY를 보내고, 응답이 없으면 다시 보낸다.
- */
+//! Sends NOTIFY to secondaries when a zone changes, and resends until answered.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,25 +8,18 @@ use onetdns_core::MutexExt;
 use crate::{tsig_for_secondary, unix_now};
 
 #[derive(Clone)]
-/** @brief 알림을 보낼 곳 하나. */
 struct NotifyRuntimeTarget {
-    /** @brief 알림을 보낼 주소. */
     address: std::net::SocketAddr,
-    /** @brief 알림에 쓸 공유 키. */
     tsig_key: Option<onetdns_dnssec::tsig::TsigKey>,
 }
 
 #[derive(Clone, Copy)]
-/** @brief 답이 없을 때 다시 보내는 규칙. */
 struct NotifyRetryPolicy {
-    /** @brief 처음 다시 보내기까지 기다릴 시간. */
     initial: Duration,
-    /** @brief 다시 보낼 횟수. */
     retransmissions: u8,
 }
 
 impl Default for NotifyRetryPolicy {
-    /** @brief 기본 규칙. */
     fn default() -> Self {
         Self {
             initial: Duration::from_secs(1),
@@ -38,43 +29,33 @@ impl Default for NotifyRetryPolicy {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
-/** @brief 알림 하나를 가리키는 키. */
 struct NotifyJobKey {
-    /** @brief 알릴 영역. */
     origin: Vec<u8>,
-    /** @brief 알릴 대상. */
     target: usize,
 }
 
-/** @brief 보낼 알림 하나. */
 struct NotifyJob {
-    /** @brief 알릴 영역 이름. */
     origin: onetdns_proto::Name,
-    /** @brief 알릴 시리얼. */
     serial: u32,
 }
 
 #[derive(Default)]
-/** @brief 보낼 알림들. */
 struct NotifyQueue {
-    /** @brief 아직 보내지 못한 알림들. */
     pending: Mutex<std::collections::HashMap<NotifyJobKey, NotifyJob>>,
-    /** @brief 보내는 쪽을 깨우는 곳. */
     wake: std::sync::Condvar,
 }
 
 #[derive(Clone)]
-/** @brief 알림을 맡기는 곳. */
 pub(crate) struct NotifySender {
-    /** @brief 보낼 알림을 넣을 곳. 없으면 알리지 않는다. */
+    /// None disables notifications.
     queue: Option<Arc<NotifyQueue>>,
-    /** @brief 알림을 보낼 곳들. 설정이 바뀌면 교체한다. */
+    /// Swapped on config change.
     targets: Arc<onetdns_core::ArcSwap<Vec<NotifyRuntimeTarget>>>,
 }
 
 impl NotifySender {
     #[cfg(test)]
-    /** @brief 알리지 않는 곳. 테스트에서만 쓴다. */
+    /// Sends nothing; for tests.
     pub(crate) fn disabled() -> Self {
         Self {
             queue: None,
@@ -82,12 +63,11 @@ impl NotifySender {
         }
     }
 
-    /** @brief 알림을 보낼 곳 목록을 교체한다. */
     pub(crate) fn replace_targets(&self, targets: NotifyTargets) {
         self.targets.store(Arc::new(targets.0));
     }
 
-    /** @brief 이 영역이 바뀌었다고 알릴 것을 맡긴다. 같은 영역의 알림은 하나로 합친다. */
+    /// Notifications for one zone and target are merged.
     pub(crate) fn enqueue(&self, origin: &onetdns_proto::Name, serial: u32) {
         let Some(queue) = &self.queue else {
             return;
@@ -110,13 +90,12 @@ impl NotifySender {
         queue.wake.notify_one();
     }
 
-    /** @brief 이 영역의 지금 판으로 알린다. */
+    /// With the zone's current serial.
     pub(crate) fn enqueue_zone(&self, zone: &onetdns_authority::Zone) {
         self.enqueue(zone.origin(), zone.soa().serial);
     }
 
     #[cfg(test)]
-    /** @brief 보내는 쪽을 깨운다. */
     fn wake(&self) {
         if let Some(queue) = &self.queue {
             queue.wake.notify_one();
@@ -124,28 +103,21 @@ impl NotifySender {
     }
 }
 
-/** @brief 답을 기다리는 알림 하나. */
 struct OutstandingNotify {
-    /** @brief 알린 영역. */
     origin: onetdns_proto::Name,
-    /** @brief 알린 시리얼. */
     serial: u32,
-    /** @brief 이 서버가 보낸 질의 번호. */
     id: u16,
-    /** @brief 보낸 바이트. 다시 보낼 때 그대로 쓴다. */
+    /// Resent as is.
     wire: Vec<u8>,
-    /** @brief 요청에 붙인 서명. */
+    /// The request's TSIG MAC, for checking the ack.
     request_mac: Option<Vec<u8>>,
-    /** @brief 지금까지 보낸 횟수. */
     transmissions: u8,
-    /** @brief 다음에 보낼 시각. */
     next_send: std::time::Instant,
 }
 
-/** @brief 알림을 모으는 시간. 변경이 잇달아 오면 한 번만 보내려는 것이다. */
+/// Changes in quick succession go out as one notification.
 const NOTIFY_COALESCE_DELAY: Duration = Duration::from_millis(20);
 
-/** @brief 알림 패킷 바이트. */
 fn notify_wire(
     origin: &onetdns_proto::Name,
     id: u16,
@@ -175,7 +147,6 @@ fn notify_wire(
         .map_err(|error| error.to_string())
 }
 
-/** @brief 답을 기다리는 알림을 만든다. */
 fn outstanding_notify(
     origin: onetdns_proto::Name,
     serial: u32,
@@ -195,7 +166,7 @@ fn outstanding_notify(
     })
 }
 
-/** @brief 이 답이 이 서버가 보낸 알림에 대한 것인지. 확인하지 않으면 아무 패킷이나 답으로 세어 다시 보내기를 멈춘다. */
+/// Unchecked, any packet would count as an ack and stop the resends.
 fn valid_notify_ack(
     wire: &[u8],
     source: std::net::SocketAddr,
@@ -241,7 +212,6 @@ fn valid_notify_ack(
         && message.questions[0].qclass == DnsClass::IN
 }
 
-/** @brief 온 답들을 거둔다. */
 fn receive_notify_acks(
     socket: &std::net::UdpSocket,
     active: &mut std::collections::HashMap<NotifyJobKey, OutstandingNotify>,
@@ -270,7 +240,7 @@ fn receive_notify_acks(
     }
 }
 
-/** @brief 다시 보내기까지 기다릴 시간. */
+/// Doubles with each transmission.
 fn retry_delay(policy: NotifyRetryPolicy, transmissions: u8) -> Duration {
     let shift = u32::from(transmissions.saturating_sub(1).min(20));
     policy
@@ -279,12 +249,9 @@ fn retry_delay(policy: NotifyRetryPolicy, transmissions: u8) -> Duration {
         .unwrap_or(Duration::MAX)
 }
 
-/**
- * @brief 알림 워커가 한 바퀴에 하는 일.
- * @details 이미 온 답부터 거두고 나서 다시 보낼 알림을 고른다. 워커가 늦게 깨어나 재전송 시각이
- *          지났더라도 그사이 도착한 답이 있으면 같은 알림을 다시 보내지 않는다.
- * @param sockets IPv4 와 IPv6 소켓. 열지 못한 계열은 None 이다.
- */
+/// Collects acks that already arrived before choosing what to resend, so a worker that wakes late,
+/// past a resend time, does not resend a notification already answered. `sockets` holds the IPv4
+/// and IPv6 sockets; None for a family that could not be opened.
 fn notify_round(
     active: &mut std::collections::HashMap<NotifyJobKey, OutstandingNotify>,
     pending: std::collections::HashMap<NotifyJobKey, NotifyJob>,
@@ -361,17 +328,15 @@ fn notify_round(
     }
 }
 
-/** @brief 알림을 보내고 답을 기다리는 스레드를 시작한다. */
 fn spawn_notify_worker(
     targets: Vec<NotifyRuntimeTarget>,
     policy: NotifyRetryPolicy,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<(NotifySender, std::thread::JoinHandle<()>)> {
-    /*
-     * 두 계열 소켓을 모두 연다. 대상 목록을 교체할 수 있으므로 지금 목록에 없는 계열도 나중에
-     * 들어올 수 있다. 소켓 하나로 여러 대상과 주고받으므로, 닫힌 대상 하나가 돌려보낸 ICMP
-     * 오류가 다른 대상의 답을 받지 못하게 하지 않도록 onetdns_core::udp::bind 로 연다.
-     */
+    // Both families are opened: the targets can be swapped, so a family missing from the current
+    // list can arrive later. One socket talks to several targets, so it is opened with
+    // onetdns_core::udp::bind, which keeps an ICMP error from one closed target from blocking the
+    // others' answers.
     let socket4 = {
         let socket = onetdns_core::udp::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_nonblocking(true)?;
@@ -399,7 +364,7 @@ fn spawn_notify_worker(
             use std::sync::atomic::Ordering;
             let mut active = std::collections::HashMap::<NotifyJobKey, OutstandingNotify>::new();
             while !shutdown.load(Ordering::Relaxed) {
-                /* 한 바퀴 동안은 같은 목록을 본다. 도중에 갈리면 인덱스가 어긋난다. */
+                // One list for the whole round; a swap midway would misalign the indexes.
                 let targets = targets.load();
                 let pending = std::mem::take(&mut *queue.pending.lock_recover());
                 notify_round(
@@ -435,7 +400,6 @@ fn spawn_notify_worker(
     Ok((sender, thread))
 }
 
-/** @brief 알림 보내기를 시작한다. */
 pub(crate) fn start_notify_dispatcher(
     configured: &[onetdns_config::NotifyTarget],
     tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -447,14 +411,12 @@ pub(crate) fn start_notify_dispatcher(
     Ok((sender, Some(thread)))
 }
 
-/** @brief 설정에서 푼 알림 대상 목록. 대상마다 TSIG 키를 찾아 둔 상태다. */
+/// Targets from the config, with each TSIG key already resolved.
 pub(crate) struct NotifyTargets(Vec<NotifyRuntimeTarget>);
 
 impl NotifyTargets {
-    /**
-     * @brief 설정에 적힌 대상과 그 TSIG 키를 푼다.
-     * @return 대상의 TSIG 키가 설정에 없으면 실패. 그 대상만 빼고 교체하면 서명 없이 알리게 된다.
-     */
+    /// Fails when a target's TSIG key is not in the config; going ahead without it would send that
+    /// target unsigned notifications.
     pub(crate) fn from_config(
         configured: &[onetdns_config::NotifyTarget],
         tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -463,7 +425,6 @@ impl NotifyTargets {
     }
 }
 
-/** @brief 설정에 적힌 알림 대상을 실행에 쓸 모양으로 푼다. */
 fn notify_runtime_targets(
     configured: &[onetdns_config::NotifyTarget],
     tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -493,7 +454,6 @@ fn notify_runtime_targets(
 }
 
 #[cfg(test)]
-/** @brief NOTIFY 전송, 응답 확인, 재전송. */
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -504,13 +464,10 @@ mod tests {
     use crate::unix_now;
 
     #[test]
-    /** @brief 맞는 답이 올 때까지 다시 보내는지. */
     fn notify_dispatcher_retries_until_a_matching_ack_arrives() {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        /*
-         * 알림과 재전송을 기다리는 읽기 제한 시간이다. 재전송 간격보다 짧으면 재전송이
-         * 오기 전에 읽기가 먼저 끝난다.
-         */
+        // Read timeout for the notification and its resends; shorter than the resend interval, the
+        // read would end before a resend arrives.
         receiver
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -560,11 +517,9 @@ mod tests {
             .send_to(&ack.try_encode().unwrap(), retry_source)
             .unwrap();
 
-        /*
-         * 재전송 간격은 두 배씩 늘어나므로 다음 재전송은 첫 재전송의 600밀리초 뒤다.
-         * 침묵을 기다리는 구간은 그보다 길어야 재전송이 멈췄는지 실제로 확인할 수 있고,
-         * 동시에 보내는 쪽이 ACK 를 처리할 시간도 그만큼 확보된다.
-         */
+        // The interval doubles, so the next resend comes 600 ms after the first. The silence window
+        // must be longer to show the resends really stopped, which also gives the sender that much
+        // time to handle the ACK.
         receiver
             .set_read_timeout(Some(Duration::from_millis(900)))
             .unwrap();
@@ -578,15 +533,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키를 걸었으면 서명된 답만 답으로 세는지. */
     fn notify_dispatcher_requires_a_valid_tsig_ack_when_configured() {
         use onetdns_dnssec::tsig::{self, WireVerification};
 
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        /*
-         * 알림과 재전송을 기다리는 읽기 제한 시간이다. 재전송 간격보다 짧으면 재전송이
-         * 오기 전에 읽기가 먼저 끝난다.
-         */
+        // Read timeout for the notification and its resends; shorter than the resend interval, the
+        // read would end before a resend arrives.
         receiver
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -642,7 +594,7 @@ mod tests {
             .send_to(&signed_ack.try_encode().unwrap(), retry_source)
             .unwrap();
 
-        /* 위 시험과 같은 이유로 다음 재전송 시점보다 길게 기다린다. */
+        // Longer than the next resend, as in the test above.
         receiver
             .set_read_timeout(Some(Duration::from_millis(900)))
             .unwrap();
@@ -654,11 +606,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 재전송 시각이 지났어도 이미 도착한 답이 있으면 다시 보내지 않는지.
-     * @details 워커가 늦게 깨어나면 재전송 시각과 답의 도착이 한 바퀴 안에 겹친다. 답을 거두기
-     *          전에 보낼 알림부터 고르면 이미 답한 대상에 같은 알림을 또 보낸다.
-     */
+    /// A worker that wakes late sees the resend time and the ack in the same round; choosing
+    /// resends before collecting acks would send the same notification to a target that already
+    /// answered.
     fn notify_round_collects_arrived_acks_before_retransmitting() {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let socket = onetdns_core::udp::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -710,7 +660,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 영역과 대상의 알림이 하나로 합쳐지는지. */
     fn notify_pending_work_is_coalesced_per_zone_and_target() {
         let queue = Arc::new(NotifyQueue::default());
         let sender = NotifySender {
@@ -736,15 +685,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief IPv6 대상에 IPv6 소켓을 쓰는지. */
     fn notify_dispatcher_uses_an_ipv6_socket_for_ipv6_targets() {
         let Ok(receiver) = std::net::UdpSocket::bind("[::1]:0") else {
             return;
         };
-        /*
-         * 재전송 횟수를 0으로 두어 첫 알림을 놓치면 다시 오지 않는다. 느린 기계에서도
-         * 받을 수 있도록 읽기 제한 시간을 넉넉히 둔다.
-         */
+        // With zero retransmissions, a missed first notification never comes again, so the timeout
+        // is generous for slow machines.
         receiver
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

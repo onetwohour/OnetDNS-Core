@@ -1,13 +1,10 @@
-/*!
- * @brief 관리 API: 업스트림 서버.
- */
+//! Management API: upstream servers.
 
 use super::*;
 use crate::config_edit::{rewrite_config_string_array, upstream_key, upstream_values};
 use crate::native_config::stable_resource_id;
 
 impl ControlDeps {
-    /** @brief 업스트림 하나에 시험 질의를 보내 닿는지 본다. */
     pub(super) fn upstream_test(&self, body: &str) -> Result<String, String> {
         let bootstrap = self.runtime_cfg.load().bootstrap.clone();
         let j = onetdns_core::json::parse(body)
@@ -64,7 +61,7 @@ impl ControlDeps {
         }
     }
 
-    /** @brief 업스트림 목록과 서버마다의 성적. */
+    /// With per-server stats.
     pub(super) fn upstreams_list(&self) -> String {
         let snapshot = self.runtime_cfg.load();
         let mut ups: Vec<String> = snapshot.upstreams.iter().map(|u| u.to_string()).collect();
@@ -99,7 +96,6 @@ impl ControlDeps {
         format!("[{}]", items.join(","))
     }
 
-    /** @brief 업스트림을 넣는다. */
     pub(super) fn upstream_add(&self, entry: &str) -> Result<String, String> {
         let entry = entry.trim().to_string();
         if entry.is_empty() {
@@ -113,10 +109,8 @@ impl ControlDeps {
                 return Err(format!("Upstream DNS server already registered: {entry}"));
             }
             vals.push(entry.clone());
-            /*
-             * 한쪽 목록만 파일에 적히면 적히지 않은 다른 쪽 기본값이 물러난다. 지금 쓰던 다른 쪽
-             * 목록을 텍스트로 남기지 않으면 화면 목록에서 조용히 사라진다.
-             */
+            // Writing only one list to the file drops the other list's default. Unless the other
+            // list in use is written out too, it silently vanishes from the dashboard.
             let other = if key == "upstream_urls" {
                 "upstreams"
             } else {
@@ -146,7 +140,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 업스트림을 뺀다. */
     pub(super) fn upstream_remove(&self, entry: &str) -> Result<String, String> {
         let entry = entry.trim().to_string();
         let key = upstream_key(&entry);

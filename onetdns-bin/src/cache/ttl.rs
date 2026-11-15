@@ -1,19 +1,11 @@
-/*!
- * @brief 캐시가 지켜야 할 DNSSEC 수명 상한 계산.
- *
- * @details 서명 만료와 covered RRset 의 수신 TTL 을 함께 보아, 이미 만료될 서명을 검증된
- *          답이라며 담아 두지 않게 한다.
- */
+//! DNSSEC lifetime caps for the cache. Signature expiry and the received TTL of the covered RRset
+//! together keep a signature that will expire from being cached as a validated answer.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use onetdns_proto::{Record, RecordType};
 
-/**
- * @brief 검증된 응답을 담아 둘 수 있는 최대 기간.
- * @warning 서명 만료를 넘겨 담아 두면 안 된다. 넘기면 이미 만료된 서명을 검증된 답이라며
- *          내보낸다.
- */
+/// Caching past signature expiry would serve expired signatures as validated.
 pub(crate) fn dnssec_ttl_cap(
     answers: &[Record],
     authorities: &[Record],
@@ -52,7 +44,7 @@ pub(crate) fn dnssec_ttl_cap(
         .min()
 }
 
-/** @brief RRSIG 존재 여부와 covered RRset 없이도 알 수 있는 자체 수명 상한. */
+/// A cap from the RRSIG records alone, without the covered RRset.
 fn rrsig_record_ttl_cap(
     answers: &[Record],
     authorities: &[Record],
@@ -89,13 +81,11 @@ fn rrsig_record_ttl_cap(
     (has_rrsig, cap)
 }
 
-/**
- * @brief 캐시가 지켜야 할 DNSSEC 수명 상한.
- * @details 서명이 없는 AD=0 응답은 별도 상한이 없어 u32::MAX다. AD가 켜졌거나 RRSIG가
- *          하나라도 있으면 수신 TTL·Original TTL·서명 만료를 모두 확인한다. CD 질의나
- *          검증 비활성 경로는 서명 응답이어도 AD=0일 수 있으므로 AD만 보고 건너뛰면 안 된다.
- * @return 유효한 RRSIG 수명 상한을 하나라도 얻으면 그 최솟값, 얻지 못하면 없음.
- */
+/// Some(u32::MAX) for an unsigned AD=0 response. With AD set or any RRSIG present, the received
+/// TTL, the Original TTL and the signature expiry are all checked: CD queries and paths without
+/// validation can return signed answers with AD=0, so AD alone cannot decide.
+///
+/// None when no valid RRSIG cap is found.
 pub(crate) fn cache_dnssec_ttl_cap(
     authentic: bool,
     answers: &[Record],

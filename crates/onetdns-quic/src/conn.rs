@@ -12,80 +12,55 @@ use crate::{
     derive_packet_keys, derive_updated_kv, initial_secrets, next_key_update_secret, PacketKeys,
 };
 
-/** @brief Initial 번호 공간. 핸드셰이크 초반에 쓴다. */
 const INITIAL: usize = 0;
-/** @brief Handshake 번호 공간. */
 const HANDSHAKE: usize = 1;
-/** @brief 응용 데이터 번호 공간. 핸드셰이크 뒤의 모든 통신이 여기 속한다. */
 const APP: usize = 2;
 
-/**
- * @brief Initial 을 담은 데이터그램의 최소 크기.
- * @details RFC 9000이 정한 값이다. 받는 쪽은 이보다 작은 데이터그램의 Initial 을
- *          버려도 되므로, 채우지 않으면 상대 구현에 따라 핸드셰이크가 조용히 멈춘다.
- */
+/// RFC 9000 lets a receiver drop Initial packets in smaller datagrams, so without padding the
+/// handshake stalls silently with some peers.
 const MIN_INITIAL_DATAGRAM: usize = 1200;
 
-/**
- * @brief 내보낼 데이터그램 크기 상한.
- * @details RFC 9000 은 경로 MTU 를 찾지 않는 끝점이 1200바이트보다 큰 데이터그램을 보내지 않게
- *          한다. 이쪽은 경로 MTU 를 찾지 않는다. 상대는 max_udp_payload_size 로 1200 미만을 알릴
- *          수 없으므로 상대가 받을 수 있는 크기도 넘지 않는다.
- * @warning 이 값을 올리려면 경로 MTU 탐색과 함께 상대의 max_udp_payload_size 도 지켜야 한다.
- */
+/// RFC 9000 keeps an endpoint that does no path MTU discovery at or below 1200 bytes, and this side
+/// does none. A peer cannot advertise a max_udp_payload_size below 1200, so this also fits what the
+/// peer accepts.
+///
+/// Raising it needs path MTU discovery and must respect the peer's max_udp_payload_size.
 const MAX_DATAGRAM: usize = 1200;
 
-/**
- * @brief 받아들일 데이터그램 크기.
- *
- * @details 이 값을 그대로 max_udp_payload_size로 알린다. 실제로 읽는 버퍼보다 큰 값을
- *          알리면 상대가 그 크기로 보내도 되는데 이쪽은 잘라 읽게 되고, 잘린 패킷은 인증에
- *          실패해 조용히 버려져 핸드셰이크가 멈춘다. 소켓에서 읽는 쪽도 이 상수를 써야 한다.
- *          경로 MTU 를 찾는 상대는 1200바이트보다 크게 보낼 수 있으므로, 흔한 인터넷 경로에서
- *          조각나지 않는 크기까지 받는다.
- * @invariant RFC 9000이 정한 하한 1200 이상이고, 이쪽이 내보내는 크기보다 작지 않아야 한다.
- */
+/// Advertised as max_udp_payload_size, and the socket read buffer must use it too: advertising more
+/// lets the peer send datagrams that get truncated, fail authentication, and are dropped, stalling
+/// the handshake. Peers doing path MTU discovery may send more than 1200 bytes, so this goes up to
+/// a size common internet paths carry unfragmented.
+///
+/// At least the RFC 9000 minimum of 1200, and no smaller than what this side sends.
 pub const MAX_RECV_UDP_PAYLOAD: u64 = 1350;
 
-/** @brief 위 두 하한을 어기면 컴파일이 멈춘다. */
+/// Build-time checks of the two bounds.
 const _: [(); 0] = [(); (MAX_RECV_UDP_PAYLOAD < 1200) as usize];
 const _: [(); 0] = [(); (MAX_RECV_UDP_PAYLOAD < MAX_DATAGRAM as u64) as usize];
 
-/** @brief 패킷 하나에 담을 프레임 바이트. 헤더와 태그 몫을 뺀 값이다. */
+/// Frame bytes per packet, after header and tag.
 const MAX_PACKET_PAYLOAD: usize = 1000;
-/** @brief 스트림 프레임 하나에 담을 데이터 크기. */
 const STREAM_FRAME_CHUNK: usize = 900;
-/** @brief 받아들일 Retry 토큰 길이. */
 const MAX_RETRY_TOKEN: usize = 256;
 
-/**
- * @brief 긴 헤더 패킷에서 프레임 말고 붙는 바이트의 최댓값. Initial 의 토큰 몫은 따로 센다.
- * @details 첫 바이트, 판, 길이를 앞에 붙인 두 연결 식별자(각 20바이트까지), 2바이트 길이 필드,
- *          4바이트 패킷 번호, 16바이트 인증 태그다.
- */
+/// Most non-frame bytes in a long header packet, not counting an Initial token: first byte,
+/// version, two length-prefixed connection IDs of up to 20 bytes, a 2-byte length, a 4-byte packet
+/// number, and a 16-byte tag.
 const MAX_LONG_HEADER_OVERHEAD: usize = 1 + 4 + (1 + 20) + (1 + 20) + 2 + 4 + 16;
-/** @brief 짧은 헤더 패킷에서 프레임 말고 붙는 바이트의 최댓값. */
 const MAX_SHORT_HEADER_OVERHEAD: usize = 1 + 20 + 4 + 16;
 
-/**
- * @brief 토큰 없는 긴 헤더 패킷은 가득 차도 데이터그램 하나에 들어가야 한다.
- * @details 어기면 컴파일이 멈춘다. 1 은 Initial 의 빈 토큰 길이 필드다.
- */
+/// A full long header packet without a token must fit one datagram; the 1 is the empty token length
+/// of an Initial.
 const _: [(); 0] =
     [(); (MAX_LONG_HEADER_OVERHEAD + 1 + MAX_PACKET_PAYLOAD > MAX_DATAGRAM) as usize];
 
-/**
- * @brief 사유 문구를 뺀 종료 프레임의 최대 바이트.
- * @details 프레임 종류, 오류 코드, 오류를 일으킨 프레임 종류, 사유 길이 필드다.
- */
+/// Frame type, error code, offending frame type, and reason length.
 const MAX_CLOSE_FRAME_OVERHEAD: usize = 1 + 8 + 8 + 2;
 
-/**
- * @brief 종료 프레임에 싣는 사유 문구의 최대 바이트.
- * @details 핸드셰이크가 확정되기 전의 종료 데이터그램은 Initial, Handshake, 1-RTT 패킷에 종료
- *          프레임을 하나씩 싣는다. 가장 긴 Retry 토큰을 실은 Initial 과 함께여도 그 데이터그램이
- *          MAX_DATAGRAM 을 넘지 않는 길이다.
- */
+/// Before the handshake is confirmed, a close datagram carries a close frame in each of an Initial,
+/// a Handshake, and a 1-RTT packet. This keeps it within MAX_DATAGRAM even with the longest Retry
+/// token in the Initial.
 const MAX_CLOSE_REASON: usize = (MAX_DATAGRAM
     - (MAX_LONG_HEADER_OVERHEAD + 2 + MAX_RETRY_TOKEN)
     - MAX_LONG_HEADER_OVERHEAD
@@ -93,139 +68,88 @@ const MAX_CLOSE_REASON: usize = (MAX_DATAGRAM
     / 3
     - MAX_CLOSE_FRAME_OVERHEAD;
 
-/** @brief 핸드셰이크 데이터 프레임 하나에 담을 크기. */
 const CRYPTO_CHUNK: usize = 900;
-/** @brief 순서가 어긋난 핸드셰이크 데이터를 모아 둘 상한. 없으면 큰 오프셋 하나로 메모리를 잡아 둘 수 있다. */
+/// Without it, one large offset could hold memory.
 const MAX_CRYPTO_REASSEMBLY: u64 = 1 << 20;
-/** @brief 스트림 하나에 모아 둘 상한. */
 const MAX_STREAM_REASSEMBLY: u64 = 1 << 18;
-/** @brief 연결 전체에 모아 둘 상한. 스트림당 상한만으로는 스트림을 많이 열어 우회된다. */
+/// Per-stream caps alone could be bypassed by opening many streams.
 const MAX_CONNECTION_REASSEMBLY: u64 = 1 << 20;
-/** @brief 보내려고 쌓아 둘 바이트 상한. */
 const MAX_CONNECTION_SEND_BUFFER: usize = 1 << 20;
-/** @brief 대기 중인 전송 요청 수 상한. */
 const MAX_PENDING_SEND_OPS: usize = 512;
-/** @brief 대기 중인 조각 수 상한. */
 const MAX_PENDING_FRAGMENTS: usize = 256;
-/** @brief 설정과 무관하게 넘길 수 없는 스트림 수. */
+/// Applies whatever the configuration says.
 const MAX_STREAMS_HARD: usize = 256;
-/** @brief 확인 프레임에 담을 구간 수. */
 const MAX_ACK_RANGES: usize = 32;
-/** @brief 중복 판정을 위해 기억할 패킷 번호 범위. 비트맵 하나에 담기는 크기다. */
+/// Packet numbers remembered for duplicate detection; one u128 bitmap.
 const MAX_RECV_PACKET_HISTORY: usize = u128::BITS as usize;
-/** @brief 흐름 제어 값의 상한. 상대가 부른 값을 여기서 자른다. */
+/// Peer flow control values are clamped to this.
 const MAX_FLOW_CONTROL: u64 = 1 << 60;
-/**
- * @brief PTO 한 번에 혼잡 윈도우를 넘겨 보낼 수 있는 패킷 수.
- * @details RFC 9002 가 허용하는 두 개다. 데이터그램 하나를 잃었다고 바로 다음 PTO 까지
- *          기다리지 않게 하되, 윈도우를 무시하는 양은 이만큼으로 묶는다.
- */
+/// Packets a PTO may send beyond the congestion window, the two RFC 9002 allows: one lost datagram
+/// need not wait for the next PTO, and the overshoot stays bounded.
 const PROBE_PACKETS: u8 = 2;
 
-/** @brief RFC 9000 의 전송 오류 코드. 상대와 무관한 이쪽 내부 실패. */
 const INTERNAL_ERROR: u64 = 0x1;
-/** @brief 상대가 흐름 제어 한도를 넘겼다. */
 const FLOW_CONTROL_ERROR: u64 = 0x3;
-/** @brief 상대가 허락된 수보다 많은 스트림을 열었다. */
 const STREAM_LIMIT_ERROR: u64 = 0x4;
-/** @brief 스트림의 상태로는 받을 수 없는 프레임이 왔다. */
 const STREAM_STATE_ERROR: u64 = 0x5;
-/** @brief 스트림의 최종 크기가 바뀌었거나 그 너머의 데이터가 왔다. */
 const FINAL_SIZE_ERROR: u64 = 0x6;
-/** @brief 프레임 형식이 깨졌거나 모르는 프레임 종류다. */
 const FRAME_ENCODING_ERROR: u64 = 0x7;
-/** @brief 상대의 전송 매개변수가 규격이나 실제로 오간 값과 어긋난다. */
 const TRANSPORT_PARAMETER_ERROR: u64 = 0x8;
-/** @brief 상대가 준 연결 식별자나 버려야 할 식별자가 이쪽 상한을 넘었다. */
 const CONNECTION_ID_LIMIT_ERROR: u64 = 0x9;
-/** @brief 더 구체적인 코드가 없는 규격 위반. */
 const PROTOCOL_VIOLATION: u64 = 0xa;
-/** @brief 순서가 어긋난 핸드셰이크 데이터가 모아 둘 수 있는 양을 넘었다. */
 const CRYPTO_BUFFER_EXCEEDED: u64 = 0xd;
-/**
- * @brief 응용 계층 종료를 Initial 이나 Handshake 패킷에 실을 때 대신 쓰는 코드.
- * @details 그 패킷들은 상대를 인증하기 전에도 오간다. 응용 계층의 코드와 사유를 그대로 실으면
- *          응용 상태가 드러나므로, RFC 9000 이 이 코드로 바꾸고 사유를 비우게 한다.
- */
+/// Replaces an application close carried in Initial or Handshake packets. Those can travel before
+/// the peer is authenticated, so RFC 9000 has the application code and reason replaced by this code
+/// and an empty reason.
 const APPLICATION_ERROR: u64 = 0xc;
-/** @brief TLS 경고를 알리는 코드의 시작. 경고 코드를 더한 값으로 알린다(RFC 9001). */
+/// TLS alerts are sent as this plus the alert code, as RFC 9001 specifies.
 const CRYPTO_ERROR: u64 = 0x100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 패킷 종류. 확인 처리 방식이 갈린다. */
 enum PacketKind {
-    /** @brief 핸드셰이크를 시작하는 패킷. */
     Initial,
-    /** @brief 핸드셰이크 중의 패킷. */
     Handshake,
-    /** @brief 왕복 없이 보내는 자료. */
     ZeroRtt,
-    /** @brief 핸드셰이크를 마친 뒤의 패킷. */
     OneRtt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/**
- * @brief QUIC 연결의 오류.
- * @details StreamClosed 만 스트림 하나에 그치는 오류라서 연결은 계속 쓸 수 있다. 상대가 일으킨
- *          연결 오류는 RFC 9000 이 정한 전송 오류 코드마다 하나씩 있다.
- */
+/// Only StreamClosed is limited to one stream; the connection stays usable. Each connection error
+/// the peer causes has its own RFC 9000 transport error code.
 pub enum QuicError {
-    /** @brief TLS 핸드셰이크가 실패했다. 상대에게 알릴 TLS 경고는 이 오류가 정한다. */
+    /// The error decides the TLS alert sent to the peer.
     Tls(TlsError),
-    /** @brief 더 구체적인 코드가 없는 프로토콜 위반이다. */
     Frame,
-    /** @brief 프레임 형식이 깨졌거나 모르는 프레임 종류다. */
     FrameEncoding,
-    /** @brief 스트림의 상태로는 받을 수 없는 프레임이다. */
     StreamState,
-    /** @brief 스트림의 최종 크기가 바뀌었거나 그 너머의 데이터가 왔다. */
     FinalSize,
-    /** @brief 순서가 어긋난 핸드셰이크 데이터가 모아 둘 수 있는 양을 넘었다. */
     CryptoBufferExceeded,
-    /** @brief 상대가 허락한 양을 넘겼다. */
     FlowControl,
-    /** @brief 상대가 허락한 스트림 수를 넘겼다. */
     StreamLimit,
-    /** @brief 상대가 준 연결 식별자나 버려야 할 식별자가 이쪽 상한을 넘었다. */
     ConnectionIdLimit,
-    /**
-     * @brief 응용 계층이 이 코드로 연결을 닫았다.
-     * @details QUIC 위의 계층이 자기 규격 위반을 찾았을 때 돌려준다. 종료 프레임에는 이 코드와
-     *          사유를 응용 계층 종료로 실었다.
-     */
+    /// A layer above QUIC found a violation of its own protocol and closed the connection; the
+    /// close frame carried this code and reason as an application close.
     Application {
-        /** @brief 응용 계층 규격이 정한 오류 코드. */
         code: u64,
-        /** @brief 종료 프레임에 실은 사유. */
         reason: &'static str,
     },
-    /** @brief 연결이 이미 닫혔다. */
     Closed,
-    /**
-     * @brief 이 스트림으로는 더 보낼 수 없다.
-     * @details 상대가 STOP_SENDING 으로 답을 거절했거나 이쪽이 이미 끝을 보낸 스트림이다.
-     */
+    /// The peer refused the reply with STOP_SENDING, or this side already sent the end of the
+    /// stream.
     StreamClosed,
-    /**
-     * @brief 상대가 연결 정리를 알려 새 요청을 열 수 없다.
-     * @details HTTP/3 서버가 GOAWAY 를 보낸 뒤다. 연결은 아직 열려 있고 앞서 보낸 요청의 답은
-     *          올 수 있다.
-     */
+    /// The peer announced shutdown, as after an HTTP/3 server's GOAWAY. The connection is still
+    /// open, and replies to earlier requests can still arrive.
     GoingAway,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 연결이 왜 실패했는지 알려 주는 진단. 로그에만 쓴다. */
+/// Why a connection failed; for logs only.
 pub enum QuicDiagnostic {
-    /** @brief 긴 패킷의 보호를 풀지 못했다. */
     LongPacketProtection,
-    /** @brief 상대가 알린 전송 설정이 어긋났다. */
     TransportParameters,
 }
 
 impl QuicDiagnostic {
-    /** @brief 어느 단계에서 실패했는지. */
     pub const fn stage(self) -> &'static str {
         match self {
             Self::LongPacketProtection => "long_packet_protection",
@@ -235,7 +159,6 @@ impl QuicDiagnostic {
 }
 
 impl std::fmt::Display for QuicDiagnostic {
-    /** @brief 사람이 읽을 설명. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::LongPacketProtection => {
@@ -247,12 +170,9 @@ impl std::fmt::Display for QuicDiagnostic {
 }
 
 impl QuicError {
-    /**
-     * @brief 이 오류로 연결을 닫을 때 상대에게 알릴 전송 오류 코드.
-     * @details TLS 오류는 RFC 9001 이 정한 대로 TLS 경고 코드에 CRYPTO_ERROR 를 더해 알린다.
-     *          경고가 정해지지 않은 TLS 오류와, 받는 경로에서 나오지 않는 Application, Closed,
-     *          StreamClosed, GoingAway 는 이쪽 내부 실패로 알린다.
-     */
+    /// TLS errors are sent as CRYPTO_ERROR plus the alert code, as RFC 9001 specifies. TLS errors
+    /// without an alert, and Application, Closed, StreamClosed and GoingAway, which the receive
+    /// path never produces, are sent as internal errors.
     fn transport_code(&self) -> u64 {
         match self {
             QuicError::Tls(error) => error
@@ -275,10 +195,7 @@ impl QuicError {
 }
 
 impl std::fmt::Display for QuicError {
-    /**
-     * @brief 사람이 읽을 설명.
-     * @note 연결 오류로 닫을 때 이 문구가 CONNECTION_CLOSE 의 사유로 상대에게 간다.
-     */
+    /// This text goes to the peer as the CONNECTION_CLOSE reason.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
             QuicError::Tls(error) => return write!(f, "TLS handshake failed: {error}"),
@@ -302,30 +219,20 @@ impl std::fmt::Display for QuicError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 이 연결에서 이쪽이 클라이언트인지 서버인지. */
 pub enum Role {
-    /** @brief 연결을 받는 쪽. */
     Server,
-    /** @brief 연결을 거는 쪽. */
     Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 상대가 알린 종료 사유. */
 pub struct PeerClose {
-    /** @brief 상대가 알린 오류 번호. */
     pub error_code: u64,
-    /** @brief 그 오류를 일으킨 프레임 종류. */
     pub frame_type: Option<u64>,
-    /** @brief 상대가 적은 사유. */
     pub reason: Vec<u8>,
 }
 
-/**
- * @brief 이쪽이 알릴 매개변수를 안전한 범위로 자른다.
- * @warning 설정으로 지나치게 큰 값을 넣어도 여기서 막힌다. 흐름 제어 윈도우가 크면 상대가
- *          그만큼 이쪽 메모리를 잡아 둘 수 있다.
- */
+/// Clamps what this side advertises, whatever the configuration says: a large flow control window
+/// lets the peer hold that much of this side's memory.
 fn normalize_local_transport_params(mut tp: TransportParams) -> TransportParams {
     tp.max_udp_payload_size = MAX_RECV_UDP_PAYLOAD;
     tp.initial_max_data = tp.initial_max_data.min(MAX_CONNECTION_REASSEMBLY);
@@ -343,7 +250,6 @@ fn normalize_local_transport_params(mut tp: TransportParams) -> TransportParams 
     tp
 }
 
-/** @brief 암호화 수준에 대응하는 번호 공간. */
 fn level_space(level: Level) -> usize {
     match level {
         Level::Initial => INITIAL,
@@ -352,7 +258,6 @@ fn level_space(level: Level) -> usize {
     }
 }
 
-/** @brief 암호 스위트에 맞는 AEAD와 키 길이. */
 fn suite_aead(suite: u16) -> (Aead, usize) {
     match suite {
         0x1302 => (Aead::Aes256Gcm, 32),
@@ -362,21 +267,16 @@ fn suite_aead(suite: u16) -> (Aead, usize) {
 }
 
 #[derive(Default)]
-/**
- * @brief 순서가 어긋나 온 데이터를 이어 붙이는 버퍼.
- * @details 오프셋이 띄엄띄엄 올 수 있어, 이어지는 부분만 꺼내고 나머지는 모아 둔다.
- */
+/// Reassembles data that arrives out of order: the contiguous prefix comes out, the rest waits.
 struct Reasm {
-    /** @brief 여기까지는 빈틈없이 받았다. */
+    /// Contiguous up to here.
     recv_offset: u64,
-    /** @brief 아직 앞이 비어 이어 붙이지 못한 조각들. */
     pending: Vec<(u64, Vec<u8>)>,
-    /** @brief 그 조각들이 차지한 바이트. 상한을 세는 데 쓴다. */
     pending_bytes: usize,
 }
 
 impl Reasm {
-    /** @brief 조각 목록의 예약 슬롯과 각 조각 버퍼가 실제로 보유한 바이트. */
+    /// Includes the spare capacity of the list and of each piece.
     fn retained_payload_bytes(&self) -> usize {
         self.pending
             .capacity()
@@ -386,16 +286,12 @@ impl Reasm {
             }))
     }
 
-    /** @brief 앞이 비어 아직 꺼내지 못한 조각이 있는지. */
     fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
-    /**
-     * @brief 조각을 넣고 이어진 만큼 꺼낸다.
-     * @warning 모아 둔 양에 상한이 있다. 없으면 큰 오프셋에 한 바이트를 보내는 것만으로
-     *          이쪽 메모리를 잡아 둘 수 있다.
-     */
+    /// Takes a piece and returns what became contiguous. The buffered amount is capped; otherwise
+    /// one byte at a large offset could hold memory.
     fn push(&mut self, offset: u64, data: Vec<u8>, max_offset: u64) -> Result<Vec<u8>, QuicError> {
         let end = offset
             .checked_add(u64::try_from(data.len()).map_err(|_| QuicError::FlowControl)?)
@@ -502,7 +398,6 @@ impl Reasm {
     }
 }
 
-/** @brief 프레임 하나가 별도 힙 버퍼에 보유한 payload 바이트. */
 fn frame_retained_payload_bytes(frame: &Frame) -> usize {
     match frame {
         Frame::Ack { ranges, .. } => ranges
@@ -515,7 +410,7 @@ fn frame_retained_payload_bytes(frame: &Frame) -> usize {
     }
 }
 
-/** @brief 프레임 목록의 예약 슬롯과 중첩 버퍼가 실제로 보유한 바이트. */
+/// Includes the list's spare capacity and nested buffers.
 fn frames_retained_payload_bytes(frames: &[Frame], capacity: usize) -> usize {
     capacity
         .saturating_mul(std::mem::size_of::<Frame>())
@@ -524,7 +419,6 @@ fn frames_retained_payload_bytes(frames: &[Frame], capacity: usize) -> usize {
         }))
 }
 
-/** @brief 스트림 번호 구간 목록이 보유한 바이트. */
 fn stream_ranges_retained_bytes(ranges: &[Vec<(u64, u64)>; 4]) -> usize {
     ranges.iter().fold(0usize, |total, range| {
         total.saturating_add(
@@ -535,12 +429,10 @@ fn stream_ranges_retained_bytes(ranges: &[Vec<(u64, u64)>; 4]) -> usize {
     })
 }
 
-/**
- * @brief 표준 HashMap의 예약 bucket을 보수적으로 charge한다.
- * @details capacity는 다시 할당하지 않고 넣을 수 있는 항목 수라 실제 bucket 수보다 작다.
- *          항목+control byte의 두 배와 작은 고정 여유를 잡아 현재 SwissTable 배치를
- *          과소계상하지 않는다. 정확한 RSS 추정이 아니라 공격자가 쓸 수 있는 상한이다.
- */
+/// A conservative charge for HashMap's reserved buckets. `capacity` counts entries that fit without
+/// reallocating, which is fewer than the buckets, so this takes twice entry plus control byte, plus
+/// a small constant, to stay above the current SwissTable layout. An upper bound an attacker can
+/// drive, not an RSS estimate.
 fn hash_map_retained_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     if map.capacity() == 0 {
         return 0;
@@ -551,7 +443,6 @@ fn hash_map_retained_bytes<K, V>(map: &HashMap<K, V>) -> usize {
         .saturating_add(64)
 }
 
-/** @brief 전송 설정 안의 연결 식별자 버퍼가 보유한 바이트. */
 fn transport_params_retained_bytes(params: &TransportParams) -> usize {
     params
         .original_destination_connection_id
@@ -577,7 +468,6 @@ fn transport_params_retained_bytes(params: &TransportParams) -> usize {
         )
 }
 
-/** @brief 패킷 보호 키 세트의 세 비밀 버퍼가 보유한 바이트. */
 fn packet_keys_retained_bytes(keys: &PacketKeys) -> usize {
     keys.key
         .capacity()
@@ -586,82 +476,55 @@ fn packet_keys_retained_bytes(keys: &PacketKeys) -> usize {
 }
 
 #[derive(Default)]
-/** @brief 받는 쪽 스트림 하나의 상태. */
 struct StreamRecv {
-    /** @brief 빈틈을 메우는 슬롯. */
     asm: Reasm,
-    /** @brief 이어 붙인 자료. */
     buf: Vec<u8>,
-    /** @brief 상대가 알린 끝 위치. 아직이면 없다. */
     fin_offset: Option<u64>,
-    /** @brief 끝까지 다 받았는지. */
     done: bool,
-    /** @brief 지금까지 본 가장 먼 위치. 흐름 제어를 세는 데 쓴다. */
+    /// Counted for flow control.
     highest_offset: u64,
-    /** @brief 위에서 가져간 바이트. */
+    /// Bytes the caller has taken.
     app_consumed: u64,
 }
 
 #[derive(Default)]
-/** @brief 번호 공간 하나의 상태. 키와 패킷 번호 추적이 여기 있다. */
 struct SpaceState {
-    /** @brief 이 단계에서 보낼 때 쓰는 키. */
     send_keys: Option<(Aead, PacketKeys)>,
-    /** @brief 이 단계에서 받을 때 쓰는 키. */
     recv_keys: Option<(Aead, PacketKeys)>,
-    /** @brief 다음에 붙일 패킷 번호. */
     next_pn: u64,
-    /** @brief 지금까지 받은 가장 큰 패킷 번호. */
     largest_recv: Option<u64>,
-    /** @brief 그 언저리에서 무엇을 받았는지 나타내는 비트. */
+    /// Bits for packets received just below largest_recv.
     recv_mask: u128,
-    /** @brief 아직 받았다고 알리지 않은 패킷 번호들. */
+    /// Not yet acknowledged.
     recv_pns: Vec<u64>,
-    /** @brief 알릴 것이 밀려 있는지. */
     ack_pending: bool,
-    /** @brief 핸드셰이크 자료를 어디까지 보냈는지. */
     send_crypto_offset: u64,
-    /** @brief 아직 보내지 못한 핸드셰이크 자료. */
     out_crypto: Vec<u8>,
-    /** @brief 받은 핸드셰이크 자료의 빈틈을 메우는 슬롯. */
     crypto_asm: Reasm,
-    /**
-     * @brief 순서는 맞췄지만 TLS 가 아직 이 수준을 받지 않아 넘기지 못한 핸드셰이크 자료.
-     * @details RFC 9001 은 TLS 가 받는 수준보다 높은 수준의 데이터를 그 수준으로 올라올 때까지
-     *          모아 두게 한다.
-     */
+    /// In order, but TLS does not read this level yet. RFC 9001 has data above TLS's current level
+    /// buffered until TLS reaches it.
     crypto_ready: Vec<u8>,
 
-    /** @brief 보냈지만 아직 받았다는 답이 없는 패킷들. */
     sent: Vec<SentPacket>,
 
-    /** @brief 다시 보내야 할 프레임들. */
     rtx: Vec<Frame>,
 
-    /** @brief 상대가 확인한 가장 큰 패킷 번호. 손실 판정의 기준이다. */
+    /// The reference point for loss detection.
     largest_acked: Option<u64>,
-    /**
-     * @brief 확인을 끌어내는 패킷을 이 공간에서 마지막으로 보낸 시각.
-     * @details PTO 는 가장 오래된 미확인 패킷이 아니라 이 시각에서 잰다. 오래된 패킷에서 재면
-     *          프로브를 보낸 직후에도 데드라인이 이미 지나 있어 지수 증가가 먹히지 않는다.
-     */
+    /// The PTO is measured from here, not from the oldest unacknowledged packet: measured from
+    /// that, the deadline would already be past right after a probe, and the exponential backoff
+    /// would do nothing.
     last_ack_eliciting_ms: u64,
-    /** @brief 시간 기준으로 아직 잃었다고 볼 수 없는 패킷이 잃은 것으로 바뀌는 시각. */
+    /// When packets not yet lost by the time threshold become lost.
     loss_time_ms: Option<u64>,
-    /**
-     * @brief 이 공간의 키와 상태를 버렸는지.
-     * @details 버린 공간은 다시 살리지 않는다. 늦게 온 Initial 로 키를 다시 만들면 끝난
-     *          핸드셰이크 상태가 되살아난다.
-     */
+    /// A discarded space is never revived: rebuilding keys from a late Initial would bring a
+    /// finished handshake state back.
     discarded: bool,
 }
 
 impl SpaceState {
-    /**
-     * @brief 이 패킷 번호를 처음 보는지 확인하고 기록한다.
-     * @warning 중복을 받아들이면 재생 공격이 성립한다. 비트맵으로 최근 범위를 기억하고,
-     *          그보다 오래된 번호는 아예 거부한다.
-     */
+    /// Accepting a duplicate would allow replay. A bitmap covers the recent range, and older
+    /// numbers are rejected outright.
     fn accept_packet_number(&mut self, pn: u64) -> bool {
         let Some(largest) = self.largest_recv else {
             self.largest_recv = Some(pn);
@@ -692,83 +555,61 @@ impl SpaceState {
     }
 }
 
-/** @brief 보낸 패킷 하나. 확인이나 손실 판정 때까지 가지고 있는다. */
+/// Kept until acknowledged or declared lost.
 struct SentPacket {
-    /** @brief 이 패킷의 번호. */
     pn: u64,
-    /** @brief 보낸 시각. */
     time_ms: u64,
-    /** @brief 상대가 받았다고 알려야 하는 패킷인지. */
     ack_eliciting: bool,
 
-    /** @brief 이 패킷의 크기. 흐르는 양을 세는 데 쓴다. */
+    /// Counted as bytes in flight.
     size: u64,
 
-    /** @brief 이 패킷에 담은 프레임들. 잃으면 다시 보낸다. */
+    /// Resent if the packet is lost.
     frames: Vec<Frame>,
 }
 
-/** @brief 윈도우가 열리기를 기다리는 전송 요청. */
+/// Waits for the window to open.
 struct PendingStreamSend {
-    /** @brief 보낼 스트림. */
     id: u64,
-    /** @brief 이 조각이 시작하는 위치. */
     offset: u64,
-    /** @brief 보낼 자료. */
     data: Vec<u8>,
-    /** @brief 어디까지 보냈는지. */
     cursor: usize,
-    /** @brief 이것이 마지막 조각인지. */
     fin: bool,
-    /** @brief 이 조각을 몇 번 담아 보냈는지. */
+    /// Times this piece went into a packet.
     copies: usize,
 }
 
-/** @brief 상대가 이쪽에 준 연결 식별자 하나. 이쪽이 보내는 패킷의 목적지로 쓴다. */
+/// A connection ID the peer issued; this side sends to it.
 struct PeerCid {
-    /** @brief 상대가 붙인 순번. 핸드셰이크에서 정한 식별자가 0 번이다. */
+    /// The handshake connection ID is 0.
     sequence: u64,
-    /** @brief 식별자. */
     cid: Vec<u8>,
-    /**
-     * @brief 이 식별자를 쓰는 동안 상태 없는 재설정을 알아볼 토큰.
-     * @details 클라이언트는 재설정 토큰을 전송 매개변수로 보낼 수 없어서, 서버가 받은 0 번
-     *          식별자에는 토큰이 없다.
-     */
+    /// A client cannot send a reset token in its transport parameters, so the server's entry for
+    /// sequence 0 has none.
     reset_token: Option<[u8; 16]>,
 }
 
-/**
- * @brief 닫은 뒤 상태를 버리기 전까지 머무는 기간. RFC 9000 의 closing 과 draining 상태다.
- * @details 이쪽이 닫았으면 closing 이다. 종료 프레임이 사라졌을 수 있으므로 늦게 온 패킷에 같은
- *          종료 데이터그램으로 다시 답한다. 상대가 닫았으면 draining 이고 아무것도 보내지 않는다.
- *          어느 쪽이든 늦게 온 패킷이 새 연결이나 엉뚱한 응답을 끌어내지 않도록 기간 동안 연결을
- *          남겨 둔다. 이 기간에는 키와 버퍼를 쓰지 않으므로 연결을 버리고 이 상태만 남겨도 된다.
- */
+/// The closing or draining period of RFC 9000, before the state is dropped. Closing when this side
+/// closed: the close frame may have been lost, so late packets get the same close datagram again.
+/// Draining when the peer closed: nothing is sent. Either way the connection stays for the period
+/// so late packets cannot start a new connection or draw a wrong reply. Keys and buffers are not
+/// needed meanwhile, so only this state need stay.
 pub struct ClosePeriod {
-    /** @brief closing 이면 다시 보낼 종료 데이터그램. draining 이면 없다. */
+    /// The close datagram to resend while closing; None while draining.
     datagram: Option<Vec<u8>>,
-    /** @brief 이 시각이 지나면 연결 상태를 버린다. */
     until_ms: u64,
-    /** @brief 이 기간에 받은 데이터그램 수. */
     received: u64,
-    /** @brief 이 기간에 받은 바이트. */
     received_bytes: u64,
-    /** @brief 이 기간에 다시 보낸 바이트. */
     resent_bytes: u64,
 }
 
 impl ClosePeriod {
-    /**
-     * @brief 기간 중에 받은 데이터그램에 종료 데이터그램으로 다시 답할지 정한다.
-     * @details 종료 프레임이 사라지면 상대는 계속 보내므로 다시 알려야 한다. RFC 9000 이 권하는
-     *          대로 받은 수가 2 의 거듭제곱일 때만 답해 점점 드물게 답한다. 받은 패킷을 풀지 않고
-     *          답하므로, 출발지를 속인 패킷으로 이 연결을 증폭기로 쓰지 못하게 다시 보낸 양을 이
-     *          기간에 받은 양의 세 배로 묶는다. RFC 9000 이 키를 버린 closing 상태에 요구하는
-     *          상한이다.
-     * @param len 받은 데이터그램의 크기.
-     * @return 다시 보낼 종료 데이터그램. draining 이거나 이번에는 답하지 않으면 None.
-     */
+    /// Resends the close datagram only when the received count is a power of two, as RFC 9000
+    /// suggests, so replies thin out. Packets are answered without decryption, so resent bytes are
+    /// capped at three times the bytes received in the period, the limit RFC 9000 sets for a
+    /// closing state without keys; otherwise a spoofed source could use it as an amplifier.
+    ///
+    /// `len` is the received datagram's size. None while draining, or when this one gets no reply.
     pub fn answer(&mut self, len: usize) -> Option<Vec<u8>> {
         let datagram = self.datagram.as_ref()?;
         self.received = self.received.saturating_add(1);
@@ -781,246 +622,166 @@ impl ClosePeriod {
         Some(datagram.clone())
     }
 
-    /** @brief 이 시각에 기간이 끝났는지. 끝났으면 상태를 버려도 된다. */
     pub fn is_over(&self, now_ms: u64) -> bool {
         now_ms >= self.until_ms
     }
 
-    /** @brief 이 상태가 별도 버퍼에 쥔 바이트. */
     pub fn retained_bytes(&self) -> usize {
         self.datagram.as_ref().map_or(0, Vec::capacity)
     }
 }
 
-/**
- * @brief QUIC 연결 하나. 소켓을 모르는 순수 상태 기계다.
- *
- * @details 데이터그램을 넣으면 상태가 바뀌고, 내보낼 데이터그램을 꺼내 간다. 시간도
- *          밖에서 넣어 준다.
- * @note 이 설계 덕분에 네트워크나 실제 시간 없이 프로토콜 전체를 결정적으로 테스트할 수 있다.
- */
+/// One QUIC connection, sans-IO: datagrams and the current time come in, datagrams to send come
+/// out.
 pub struct Connection {
-    /** @brief 이쪽이 받는 쪽인지 거는 쪽인지. */
     role: Role,
 
-    /** @brief 받는 쪽 TLS 상태 기계. */
     tls_server: Option<ServerHandshake>,
-    /** @brief 받는 쪽 공유 설정. Initial 전에도 큰 인증 자료를 연결마다 복제하지 않는다. */
+    /// Shared, so large certificate material is not copied per connection, even before the Initial.
     cfg_server: Option<Arc<ServerConfig>>,
-    /** @brief 이쪽이 알릴 전송 설정. */
     base_tp: TransportParams,
-    /** @brief 거는 쪽 TLS 상태 기계. */
     tls_client: Option<ClientHandshake>,
-    /** @brief 단계별 패킷 상태. */
     spaces: [SpaceState; 3],
-    /** @brief 상대가 이쪽을 부를 때 쓰는 식별자. */
     local_cid: Vec<u8>,
-    /** @brief 이쪽이 상대를 부를 때 쓰는 식별자. peer_cids 가운데 peer_cid_in_use 번이다. */
+    /// Entry peer_cid_in_use of peer_cids.
     remote_cid: Vec<u8>,
-    /** @brief 처음 받은 식별자. 첫 키를 여기서 이끌어 낸다. */
+    /// Initial keys derive from it.
     initial_dcid: Vec<u8>,
-    /**
-     * @brief 상대가 첫 Initial 에 실은 출발지 식별자.
-     * @details RFC 9000 은 이 값으로만 목적지를 정하게 하고, 뒤에 다른 출발지 식별자로 온
-     *          Initial 은 버리게 한다. 전송 매개변수의 initial_source_connection_id 도 이 값과
-     *          대조한다.
-     */
+    /// The source connection ID of the peer's first Initial. RFC 9000 sets the destination from it
+    /// alone and drops later Initials with another source ID; initial_source_connection_id is
+    /// checked against it too.
     peer_initial_scid: Option<Vec<u8>>,
-    /**
-     * @brief 상대가 준 연결 식별자 가운데 아직 버리지 않은 것들. 순번 오름차순이다.
-     * @details 상대의 전송 매개변수를 받아들일 때 0 번과, 서버가 선호 주소를 알렸으면 1 번으로
-     *          채운다. 그 뒤로는 NEW_CONNECTION_ID 가 더하고 retire_prior_to 가 뺀다.
-     */
+    /// Connection IDs from the peer not yet retired, in sequence order. Sequence 0, and 1 when the
+    /// server sent a preferred address, are filled in when the peer's transport parameters are
+    /// accepted; after that NEW_CONNECTION_ID adds and retire_prior_to removes.
     peer_cids: Vec<PeerCid>,
-    /** @brief 지금 목적지로 쓰는 상대 식별자의 순번. */
     peer_cid_in_use: u64,
-    /** @brief 상대가 알린 가장 큰 retire_prior_to. 이보다 앞선 순번은 모두 버렸다. */
+    /// Everything below it has been retired.
     peer_retire_prior_to: u64,
-    /** @brief 버린다고 알렸지만 그 알림을 담은 패킷이 아직 확인되지 않은 순번들. */
+    /// Retired, but the packet that said so is not acknowledged yet.
     retiring_peer_cids: Vec<u64>,
-    /** @brief 핸드셰이크가 끝났는지. */
     handshake_complete: bool,
-    /**
-     * @brief 핸드셰이크가 확정됐는지.
-     * @details 서버는 핸드셰이크가 끝나는 순간, 클라이언트는 HANDSHAKE_DONE 을 받았을 때
-     *          확정된다. 확정되면 Initial 과 Handshake 공간을 버리고 응용 데이터 PTO 를 건다.
-     */
+    /// A server confirms when the handshake completes, a client when it receives HANDSHAKE_DONE.
+    /// Confirmation drops the Initial and Handshake spaces and arms the application PTO.
     handshake_confirmed: bool,
-    /** @brief 핸드셰이크 결과가 앞선 세션을 재개한 것인지. 서버 TLS 상태를 버린 뒤에도 남긴다. */
+    /// Kept after the server TLS state is dropped.
     handshake_resumed: bool,
-    /** @brief 핸드셰이크 결과가 조기 데이터를 받아들였는지. */
     handshake_early_accepted: bool,
-    /** @brief 연결이 닫혔는지. */
     closed: bool,
-    /** @brief 닫은 뒤 상태를 남겨 두는 기간. 없으면 닫힌 연결은 바로 버려도 된다. */
+    /// None means a closed connection can be dropped at once.
     close_period: Option<ClosePeriod>,
-    /** @brief 어디서 실패했는지. 로그에 남긴다. */
     diagnostic: Option<QuicDiagnostic>,
-    /** @brief 상대가 알린 종료 사유. */
     peer_close: Option<PeerClose>,
-    /** @brief 상대가 알린 전송 설정. */
     peer_tp: Option<TransportParams>,
-    /** @brief 협상한 ALPN. */
     alpn: Option<Vec<u8>>,
-    /** @brief 상대가 인증서로 자신을 증명했는지. */
     client_authenticated: bool,
-    /** @brief 그 인증서에 적힌 신원. */
     client_auth_identity: Option<String>,
-    /** @brief 내보낼 데이터그램들. */
     out_datagrams: VecDeque<Vec<u8>>,
 
-    /** @brief 핸드셰이크 뒤 단계에서 보낼 프레임들. */
     out_frames_app: Vec<Frame>,
-    /** @brief 받는 중인 스트림들. */
     streams: HashMap<u64, StreamRecv>,
-    /** @brief 이미 끝난 스트림 번호 구간들. 같은 번호를 다시 열지 못하게 한다. */
+    /// Finished stream ID ranges, so an ID cannot be reopened.
     closed_recv_ranges: [Vec<(u64, u64)>; 4],
-    /** @brief 상대가 끊은 스트림들. */
     reset_streams: Vec<(u64, u64)>,
-    /** @brief 다 받은 스트림과 그 자료. */
     completed_streams: Vec<(u64, Vec<u8>)>,
-    /** @brief 모든 스트림에서 본 가장 먼 위치의 합. 흐름 제어를 센다. */
+    /// Sum of the highest offsets across streams, for flow control.
     recv_total_highest: u64,
-    /** @brief 아직 위로 넘기지 못하고 잡은 바이트. */
+    /// Held and not yet taken by the caller.
     recv_buffered: u64,
-    /** @brief 이쪽이 상대에게 허락한 전체 양. */
     local_max_data: u64,
-    /** @brief 스트림마다 허락한 양. */
     local_stream_max: HashMap<u64, u64>,
-    /** @brief 이쪽이 허락한 양방향 스트림 수. */
     local_max_streams_bidi: u64,
-    /** @brief 이쪽이 허락한 단방향 스트림 수. */
     local_max_streams_uni: u64,
 
-    /** @brief 위로 넘길 준비가 된 자료들. */
     readable: Vec<(u64, Vec<u8>, bool)>,
-    /** @brief 스트림마다 어디까지 보냈는지. */
     send_offsets: HashMap<u64, u64>,
-    /** @brief 아직 보내지 못한 스트림 자료들. */
     pending_stream_sends: VecDeque<PendingStreamSend>,
-    /** @brief 이미 다 보낸 스트림 번호 구간들. */
     sealed_send_ranges: [Vec<(u64, u64)>; 4],
-    /** @brief 이쪽이 연 스트림 번호 구간들. */
     opened_send_ranges: [Vec<(u64, u64)>; 4],
-    /** @brief 이쪽이 닫은 스트림 번호 구간들. */
     closed_send_ranges: [Vec<(u64, u64)>; 4],
-    /** @brief 상대가 그만 보내라고 한 스트림 구간들. */
+    /// Streams the peer sent STOP_SENDING for.
     stopped_send_ranges: [Vec<(u64, u64)>; 4],
-    /** @brief 지금까지 보낸 전체 바이트. */
     send_total: u64,
-    /** @brief 상대가 이쪽에 허락한 전체 양. */
     peer_max_data: u64,
-    /** @brief 상대가 스트림마다 허락한 양. */
     peer_stream_max: HashMap<u64, u64>,
-    /** @brief 상대가 허락한 양방향 스트림 수. */
     peer_max_streams_bidi: u64,
-    /** @brief 상대가 허락한 단방향 스트림 수. */
     peer_max_streams_uni: u64,
 
-    /** @brief 앞선 연결에서 기억해 둔 상대 설정. 왕복 없이 보낼 때 쓴다. */
+    /// Remembered from the previous connection, for 0-RTT.
     early_peer_tp: Option<TransportParams>,
-    /** @brief 다음에 열 단방향 스트림 번호. */
     next_uni: u64,
 
-    /** @brief 상대가 준 재시도 토큰. */
     retry_token: Vec<u8>,
 
-    /** @brief 재시도를 이미 한 번 했는지. 되풀이하면 무한히 돈다. */
+    /// A second Retry would loop forever.
     retry_done: bool,
 
-    /**
-     * @brief 상대가 보낸 Retry 패킷의 출발지 식별자.
-     * @details 매개변수 대조는 이 값과 해야 한다. 상대는 Retry 뒤에 보내는 첫 Initial에서
-     *          다른 식별자를 골라도 되므로, 지금 쓰는 remote_cid와 같다고 볼 수 없다.
-     */
+    /// Transport parameters are checked against this, not remote_cid: the peer may pick another ID
+    /// in its first Initial after the Retry.
     retry_scid: Option<Vec<u8>>,
 
-    /** @brief 처음 보낸 핸드셰이크 자료. 재시도할 때 그대로 다시 쓴다. */
+    /// Resent unchanged after a Retry.
     initial_crypto: Vec<u8>,
 
-    /** @brief 지금 시각. */
     now_ms: u64,
 
-    /** @brief 마지막으로 무언가 오간 시각. */
     last_activity_ms: u64,
 
-    /** @brief 부드럽게 다듬은 왕복 시간. */
     srtt_ms: u64,
 
-    /** @brief 왕복 시간의 흔들림. */
     rttvar_ms: u64,
 
-    /** @brief 왕복 시간을 한 번이라도 쟀는지. */
     have_rtt: bool,
 
-    /** @brief 지금까지 본 가장 짧은 왕복 시간. */
     min_rtt_ms: u64,
 
-    /** @brief 마지막으로 잰 왕복 시간. 부하로 튄 표본이 손실 판정을 앞당기지 않게 함께 본다. */
+    /// Taken with the smoothed RTT, so a sample inflated by load does not trigger early loss
+    /// detection.
     latest_rtt_ms: u64,
 
-    /** @brief 연달아 데드라인을 넘긴 횟수. 다음 데드라인을 늘리는 데 쓴다. */
+    /// Consecutive PTO expirations; each doubles the next deadline.
     pto_count: u32,
 
-    /** @brief 한 번에 흘려보낼 수 있는 양. */
     cwnd: u64,
 
-    /** @brief 이 값을 넘으면 천천히 늘린다. */
     ssthresh: u64,
 
-    /** @brief 지금 답을 기다리는 바이트. */
     bytes_in_flight: u64,
 
-    /** @brief 혼잡을 겪기 시작한 시각. 그 전에 보낸 것은 다시 줄이지 않는다. */
+    /// Packets sent before it do not shrink the window again.
     recovery_start_ms: Option<u64>,
 
-    /** @brief 핸드셰이크 뒤 보낼 때 쓰는 비밀. */
     app_send_secret: Vec<u8>,
-    /** @brief 핸드셰이크 뒤 받을 때 쓰는 비밀. */
     app_recv_secret: Vec<u8>,
-    /** @brief 쓰는 암호 스위트. */
     app_suite: u16,
 
-    /** @brief 보낼 때의 키 세대. */
     send_key_phase: bool,
-    /** @brief 받을 때의 키 세대. */
     recv_key_phase: bool,
 
-    /** @brief 키를 교체해도 되는지. 교체하자마자 또 교체하면 상대가 따라오지 못한다. */
+    /// Updating again right after an update would leave the peer behind.
     key_update_allowed: bool,
 
-    /**
-     * @brief 지금 목적지로 쓰는 상대 식별자에 묶인 상태 없는 재설정 토큰.
-     * @details RFC 9000 은 버린 식별자의 토큰으로 재설정을 알아보지 못하게 하므로, 목적지를 바꿀
-     *          때 함께 바꾼다.
-     */
+    /// Bound to the peer connection ID in use. RFC 9000 forbids recognizing a reset by a retired
+    /// ID's token, so it changes along with the destination.
     peer_reset_token: Option<[u8; 16]>,
 
-    /** @brief 그 초기화를 받았는지. */
     reset_received: bool,
 
-    /** @brief 유휴 데드라인이 지나 닫혔는지. */
     idle_timed_out: bool,
 
-    /** @brief 보내야 할 경로 확인 값. */
     path_challenge_pending: Option<[u8; 8]>,
 
-    /** @brief 지금 경로가 확인됐는지. */
     path_validated: bool,
 
-    /** @brief 왕복 없이 보낼 때 쓰는 키. */
     early_send_keys: Option<(Aead, PacketKeys)>,
 
-    /** @brief 왕복 없이 받을 때 쓰는 키. */
     early_recv_keys: Option<(Aead, PacketKeys)>,
 
-    /** @brief 왕복 없이 보낼 프레임들. */
     out_frames_early: Vec<Frame>,
 
-    /** @brief 그 프레임들의 사본. 상대가 거절하면 정식으로 다시 보낸다. */
+    /// A copy, resent as 1-RTT if the peer rejects 0-RTT.
     early_backup: Vec<Frame>,
 
-    /** @brief 왕복 없이 이미 보냈는지. */
     early_sent: bool,
 }
 
@@ -1033,7 +794,6 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    /** @brief 서버 쪽 연결을 만든다. */
     pub fn new_server(cfg: Arc<ServerConfig>, local_cid: Vec<u8>, tp: TransportParams) -> Self {
         let tp = normalize_local_transport_params(tp);
         let cid_valid = (1..=20).contains(&local_cid.len());
@@ -1128,7 +888,6 @@ impl Connection {
         }
     }
 
-    /** @brief 클라이언트 쪽 연결을 만든다. */
     pub fn new_client(
         cfg: ClientConfig,
         dcid: Vec<u8>,
@@ -1247,11 +1006,6 @@ impl Connection {
         Ok(c)
     }
 
-    /**
-     * @brief 목적지 식별자에서 Initial 키를 만들어 건다.
-     * @note 이 키는 식별자만 알면 누구나 만들 수 있다. 기밀이 아니라 경로상 장비의
-     *       간섭을 막는 것이 목적이다.
-     */
     fn install_initial_keys(&mut self, dcid: &[u8]) {
         let (client_secret, server_secret) = initial_secrets(dcid);
         let (send, recv) = match self.role {
@@ -1262,7 +1016,6 @@ impl Connection {
         self.spaces[INITIAL].recv_keys = Some((Aead::Aes128Gcm, derive_packet_keys(&recv, 16)));
     }
 
-    /** @brief 핸드셰이크가 내놓은 비밀로 그 수준의 키를 건다. */
     fn install_secrets(&mut self, sp: SecretPair) {
         let space = level_space(sp.level);
         if self.spaces[space].discarded {
@@ -1286,11 +1039,7 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 키 갱신을 시작한다.
-     * @details 오래된 키로 너무 많은 패킷을 보내지 않게 한다. 갱신 중에도 이전 키로 온
-     *          패킷을 잠시 더 받아야 하므로 두 세대를 함께 가지고 있는다.
-     */
+    /// Both generations are kept for a while, since packets under the old key can still arrive.
     pub fn initiate_key_update(&mut self) -> bool {
         if !self.key_update_allowed || self.app_send_secret.is_empty() {
             return false;
@@ -1309,7 +1058,6 @@ impl Connection {
         true
     }
 
-    /** @brief 갱신을 확정하고 이전 세대 키를 버린다. */
     fn commit_key_update(&mut self) {
         let (_, klen) = suite_aead(self.app_suite);
 
@@ -1336,21 +1084,16 @@ impl Connection {
         }
     }
 
-    /** @brief 상대의 재설정 토큰을 기억한다. */
     pub fn set_peer_reset_token(&mut self, token: [u8; 16]) {
         self.peer_reset_token = Some(token);
     }
 
-    /** @brief 상태 없는 재설정을 받았는지. */
     pub fn reset_received(&self) -> bool {
         self.reset_received
     }
 
-    /**
-     * @brief 새 경로가 살아 있는지 확인을 시작한다.
-     * @warning 확인 전에는 그 경로로 많이 보내지 않는다. 출발지를 속인 이동 하나로 이쪽이
-     *          남에게 트래픽을 쏟는 증폭이 되기 때문이다.
-     */
+    /// Little is sent on an unvalidated path; otherwise a spoofed migration could point this side's
+    /// traffic at someone else.
     pub fn initiate_path_validation(&mut self) -> bool {
         if !self.handshake_complete {
             return false;
@@ -1364,26 +1107,18 @@ impl Connection {
         true
     }
 
-    /** @brief 경로 확인이 끝났는지. */
     pub fn path_validated(&self) -> bool {
         self.path_validated
     }
 
-    /**
-     * @brief Retry 패킷을 처리해 토큰을 받고 핸드셰이크를 다시 시작한다.
-     * @warning 무결성 태그를 확인한다. 확인하지 않으면 중간자가 Retry를 지어내 연결을
-     *          자기 쪽으로 돌릴 수 있다. Retry는 연결당 한 번만 받는다.
-     */
+    /// The integrity tag is checked, and only one Retry is accepted per connection.
     fn handle_retry(&mut self, pkt: &[u8]) {
         if self.role != Role::Client || self.retry_done {
             return;
         }
 
-        /*
-         * RFC 9000 은 서버의 Initial 을 하나라도 처리한 뒤의 Retry 를 버리게 한다. ServerHello
-         * 가 없는 Initial 뒤에도 받으면 이미 오간 Initial 의 상태를 모두 버리고 처음부터 다시
-         * 시작한다.
-         */
+        // RFC 9000 drops a Retry once any server Initial has been processed; accepting one even
+        // after an Initial without a ServerHello would throw away all Initial state and start over.
         if self.peer_initial_scid.is_some() {
             return;
         }
@@ -1403,11 +1138,10 @@ impl Connection {
         self.retry_scid = Some(scid.clone());
         self.retry_token = token;
 
-        /*
-         * RFC 9002 에서 Retry 를 받은 클라이언트는 손실 복구와 혼잡 제어 상태를 처음으로
-         * 되돌린다. 패킷 번호는 예외로, RFC 9000 은 어느 번호 공간에서도 되돌리지 못하게 한다.
-         * 0-RTT 키는 Retry 로 바뀌지 않으므로 번호를 되돌리면 다른 내용이 같은 nonce 로 보호된다.
-         */
+        // Under RFC 9002 a client that receives a Retry resets loss recovery and congestion
+        // control. Packet numbers are the exception: RFC 9000 forbids reusing them in any space,
+        // and 0-RTT keys survive a Retry, so reusing a number would protect different content with
+        // the same nonce.
         let abandoned: u64 = self.spaces[INITIAL]
             .sent
             .iter()
@@ -1420,11 +1154,10 @@ impl Connection {
             next_pn: self.spaces[INITIAL].next_pn,
             ..SpaceState::default()
         };
-        /*
-         * Retry 를 보낸 서버는 앞서 받은 0-RTT 를 버렸다. 서버의 Initial 을 받기 전이라 응용
-         * 공간에는 0-RTT 패킷만 있으므로, 그 기록을 지우고 조기 프레임을 처음부터 다시 보낸다.
-         * 손실 판정에 맡기면 응용 공간의 PTO 는 핸드셰이크가 확정된 뒤에야 걸린다.
-         */
+        // A server that sent a Retry dropped the 0-RTT it got. Before the server's Initial the
+        // application space holds only 0-RTT packets, so their records are cleared and early frames
+        // are resent from the start; left to loss detection, the application PTO would arm only
+        // after the handshake is confirmed.
         self.spaces[APP].sent.clear();
         self.spaces[APP].rtx.clear();
         self.spaces[APP].loss_time_ms = None;
@@ -1436,7 +1169,6 @@ impl Connection {
         self.flush();
     }
 
-    /** @brief 핸드셰이크를 한 단계 진행시키고 나온 데이터와 비밀을 옮긴다. */
     fn pump_tls(&mut self) {
         let (
             outs,
@@ -1509,10 +1241,8 @@ impl Connection {
                     Some(tp) => {
                         let initial_scid_valid = tp.initial_source_connection_id.is_some()
                             && tp.initial_source_connection_id == self.peer_initial_scid;
-                        /*
-                         * 선호 주소는 서버만 알릴 수 있고, 길이 0 식별자를 고른 서버는 알릴 수
-                         * 없다(RFC 9000).
-                         */
+                        // RFC 9000 lets only a server send a preferred address, and not a server
+                        // using a zero-length connection ID.
                         let preferred_address_valid = tp.preferred_address.is_none()
                             || (self.role == Role::Client
                                 && tp
@@ -1593,17 +1323,14 @@ impl Connection {
 
             self.key_update_allowed = true;
             if self.role == Role::Server {
-                /*
-                 * RFC 9001 에서 서버의 핸드셰이크는 끝나는 순간 확정된다. 클라이언트는 이
-                 * 서버가 보내는 HANDSHAKE_DONE 을 받아야 확정된다.
-                 */
+                // Under RFC 9001 a server's handshake is confirmed when it completes; the client's
+                // is confirmed when it receives this HANDSHAKE_DONE.
                 self.handshake_confirmed = true;
                 self.out_frames_app.push(Frame::HandshakeDone);
-                /*
-                 * QUIC 서버는 TLS KeyUpdate 를 쓰지 않고, NewSessionTicket 을 포함한 출력과
-                 * 핸드셰이크 결과는 위에서 모두 옮겼다. transcript, ClientHello, mTLS 인증서까지
-                 * 든 상태 기계를 연결 유휴 수명 동안 남겨 둘 이유가 없다.
-                 */
+                // A QUIC server does not use TLS KeyUpdate, and the output, including
+                // NewSessionTicket, and the handshake result have been moved out above. There is no
+                // reason to keep a state machine holding the transcript, the ClientHello, and mTLS
+                // certificates for the connection's idle lifetime.
                 self.tls_server = None;
             }
             if self.role == Role::Client {
@@ -1626,14 +1353,12 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 받은 핸드셰이크 데이터를 TLS에 넣는다.
-     * @retval QuicError::Tls TLS 가 거부했다. 서버는 핸드셰이크가 끝나면 상태 기계를 버리므로,
-     *         그 뒤에 온 핸드셰이크 데이터는 받을 수 없는 메시지로 본다.
-     * @retval QuicError::Frame 받을 수준을 바꾼 메시지 뒤에 같은 수준의 바이트가 남았다. RFC 9001
-     *         이 정한 PROTOCOL_VIOLATION 이다. 서버는 pump_tls 에서 상태 기계를 버리므로 그 전에
-     *         확인한다.
-     */
+    /// Tls when TLS refuses the data. The server drops its state machine once the handshake ends,
+    /// so handshake data after that is an unexpected message.
+    ///
+    /// Frame when bytes of the same level remain after a message that changes the receive level,
+    /// the PROTOCOL_VIOLATION of RFC 9001. Checked here because the server drops its state machine
+    /// in pump_tls.
     fn tls_provide(&mut self, level: Level, data: &[u8]) -> Result<(), QuicError> {
         let provided = match self.role {
             Role::Server => self.tls_server.as_mut().map(|e| e.provide(level, data)),
@@ -1649,7 +1374,6 @@ impl Connection {
         Ok(())
     }
 
-    /** @brief 핸드셰이크 메시지를 받을 TLS 상태 기계가 있는지. */
     fn has_tls_engine(&self) -> bool {
         match self.role {
             Role::Server => self.tls_server.is_some(),
@@ -1657,11 +1381,9 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief TLS 가 지금 핸드셰이크 메시지를 받는 암호화 수준.
-     * @details 서버는 첫 Initial 을 받을 때 TLS 상태 기계를 만들고 핸드셰이크를 마치면 버린다.
-     *          만들기 전에는 ClientHello 를 기다리고, 버린 뒤에는 응용 데이터 수준에 있다.
-     */
+    /// The server creates its TLS state machine at the first Initial and drops it when the
+    /// handshake ends: before that it waits for a ClientHello, after it sits at the application
+    /// level.
     fn tls_receive_level(&self) -> Level {
         match self.role {
             Role::Server => match &self.tls_server {
@@ -1676,7 +1398,6 @@ impl Connection {
         }
     }
 
-    /** @brief TLS 가 받고도 메시지로 처리하지 않은 바이트가 있는지. */
     fn tls_has_unconsumed_input(&self) -> bool {
         match self.role {
             Role::Server => self
@@ -1690,15 +1411,13 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief CRYPTO 프레임의 데이터를 RFC 9001 이 정한 수준 규칙에 따라 TLS 로 보낸다.
-     * @details TLS 가 지금 받는 수준이면 순서를 맞춰 넘기고, 더 높은 수준이면 TLS 가 그 수준으로
-     *          올라올 때까지 모아 둔다. 이미 지나간 수준이면 재전송만 받아들인다. 핸드셰이크를 마친
-     *          서버는 TLS 상태 기계를 버렸으므로, 클라이언트가 보낸 핸드셰이크 메시지는 받을 수
-     *          없는 메시지다.
-     * @retval QuicError::Frame 지나간 수준의 데이터가 이미 받은 끝을 넘었다.
-     * @retval QuicError::CryptoBufferExceeded 모아 둔 데이터가 상한을 넘었다.
-     */
+    /// Routes CRYPTO data by the level rules of RFC 9001: data at TLS's current level is ordered
+    /// and passed on, data at a higher level waits until TLS reaches it, and data at a past level
+    /// is accepted only as a retransmission. A server that finished the handshake has dropped TLS,
+    /// so a handshake message from the client is unexpected.
+    ///
+    /// Frame when past-level data goes beyond what was received; CryptoBufferExceeded when buffered
+    /// data exceeds the limit.
     fn on_crypto(&mut self, space: usize, offset: u64, data: Vec<u8>) -> Result<(), QuicError> {
         if data.is_empty() {
             return Ok(());
@@ -1726,12 +1445,9 @@ impl Connection {
         self.deliver_crypto()
     }
 
-    /**
-     * @brief 모아 둔 핸드셰이크 데이터 가운데 TLS 가 받는 수준의 것을 넘긴다.
-     * @details TLS 가 다음 수준으로 올라가면 그 수준에 모아 둔 데이터를 이어서 넘긴다. 떠난 수준에
-     *          앞이 빈 조각이 남았으면, 그 조각은 TLS 가 끝내 처리하지 못할 데이터이므로 RFC 9001
-     *          이 정한 PROTOCOL_VIOLATION 이다.
-     */
+    /// When TLS moves up a level, the data buffered for that level follows. A piece with a gap
+    /// before it, left at a level TLS has left, can never be processed: the PROTOCOL_VIOLATION of
+    /// RFC 9001.
     fn deliver_crypto(&mut self) -> Result<(), QuicError> {
         while !self.closed {
             let level = self.tls_receive_level();
@@ -1751,14 +1467,13 @@ impl Connection {
         Ok(())
     }
 
-    /** @brief 진단을 기록한다. 처음 것만 남긴다. 뒤의 것은 대개 그 여파다. */
+    /// Keeps only the first; later ones are usually its fallout.
     fn note_diagnostic(&mut self, diagnostic: QuicDiagnostic) {
         if self.diagnostic.is_none() {
             self.diagnostic = Some(diagnostic);
         }
     }
 
-    /** @brief 상대의 전송 매개변수를 읽는다. */
     fn decode_peer_transport_params(&mut self, raw: &[u8]) -> Option<TransportParams> {
         let decoded = TransportParams::decode(raw);
         if decoded.is_none() {
@@ -1767,18 +1482,14 @@ impl Connection {
         decoded
     }
 
-    /** @brief 기록된 진단을 가져간다. */
     pub fn take_diagnostic(&mut self) -> Option<QuicDiagnostic> {
         self.diagnostic.take()
     }
 
-    /**
-     * @brief 데이터그램 하나를 받아 상태를 진행시킨다.
-     * @details 연결 오류를 돌려줄 때는 그 오류를 알리는 종료 프레임을 이미 내보낼 큐에 넣고
-     *          연결을 닫았다. RFC 9000 이 연결 오류를 CONNECTION_CLOSE 로 알리게 하므로, 부른
-     *          쪽은 쌓인 데이터그램을 마저 보낸다. 닫힌 연결은 패킷을 풀지 않고, closing 기간이면
-     *          종료 데이터그램을 다시 보낼지만 정한다.
-     */
+    /// When a connection error is returned, the close frame for it is already queued and the
+    /// connection closed: RFC 9000 has connection errors reported with CONNECTION_CLOSE, so the
+    /// caller still sends the queued datagrams. A closed connection does not decrypt packets;
+    /// during the closing period it only decides whether to resend the close datagram.
     pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         if self.closed {
             self.answer_while_closing(dg.len());
@@ -1791,7 +1502,6 @@ impl Connection {
         received
     }
 
-    /** @brief closing 기간에 받은 데이터그램에 종료 데이터그램으로 다시 답할지 정한다. */
     fn answer_while_closing(&mut self, len: usize) {
         if let Some(datagram) = self
             .close_period
@@ -1802,15 +1512,12 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 데이터그램에 붙어 온 패킷들을 처리한다.
-     * @details 데이터그램에는 패킷이 여러 개 붙어 올 수 있다. 소비한 길이를 따라가며
-     *          끝까지 처리한다. 앞 패킷이 연결을 닫았으면 뒤 패킷의 프레임은 처리하지 않는다.
-     *          종료는 모든 스트림을 함께 닫으므로 뒤에 붙은 프레임은 이미 끝난 연결의 것이다. 뒤에
-     *          붙은 1-RTT 패킷에서는 종료 사유만 읽는다.
-     * @warning 아직 인증되지 않은 바이트다. 길이와 식별자를 모두 검사하고, 풀리지 않는
-     *          패킷은 조용히 버린다. 오류를 내면 그것이 곧 탐색 신호가 된다.
-     */
+    /// A datagram can carry several coalesced packets; each is processed by its consumed length.
+    /// Once an earlier packet closes the connection, later packets' frames are not processed, since
+    /// closing ends every stream; a later 1-RTT packet is read only for the close reason.
+    ///
+    /// The bytes are unauthenticated: lengths and IDs are all checked, and a packet that fails to
+    /// decrypt is dropped silently, since an error would be a probing signal.
     fn recv_packets(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         if let Some(token) = self.peer_reset_token {
             if dg.len() >= 16 && ct_eq(&dg[dg.len() - 16..], &token) {
@@ -1827,13 +1534,11 @@ impl Connection {
                 if first & 0x40 == 0 {
                     break;
                 }
-                /*
-                 * 서버는 핸드셰이크를 끝내기 전에 1-RTT 패킷을 처리하지 않는다(RFC 9001). 이
-                 * 패킷에 확인을 보내면 클라이언트는 핸드셰이크가 확정됐다고 보고 Handshake 키를
-                 * 버릴 수 있다. 그 뒤 클라이언트의 Finished 를 잃으면 클라이언트는 그것을 다시
-                 * 보내지 않고, 서버는 핸드셰이크를 끝내지 못해 응답에 PTO 도 걸지 못한 채
-                 * 멈춘다. 버린 패킷은 핸드셰이크가 확정된 뒤 클라이언트가 다시 보낸다.
-                 */
+                // A server does not process 1-RTT packets before its handshake completes, as RFC
+                // 9001 requires. Acknowledging one would let the client consider the handshake
+                // confirmed and drop its Handshake keys; if the client's Finished were then lost,
+                // it would never be resent, and the server would stall without completing and with
+                // no PTO on its responses. The client resends dropped packets after confirmation.
                 if self.role == Role::Server && !self.handshake_complete {
                     break;
                 }
@@ -1854,10 +1559,9 @@ impl Connection {
                     self.handle_retry(rest);
                     break;
                 }
-                /*
-                 * 풀 수 없는 패킷은 길이만큼 건너뛰고 뒤에 합쳐진 패킷을 계속 처리한다. 버린
-                 * Initial 공간의 패킷 뒤에 Handshake 패킷이 붙어 오는 일이 흔하다.
-                 */
+                // An undecryptable packet is skipped by its length and the coalesced packets after
+                // it are processed. A Handshake packet after one from the discarded Initial space
+                // is common.
                 let Some(packet_len) = packet::long_packet_len(rest) else {
                     break;
                 };
@@ -1904,12 +1608,10 @@ impl Connection {
                 pos += lp.consumed;
 
                 if space == INITIAL {
-                    /*
-                     * RFC 9000 은 상대의 첫 Initial 로만 목적지를 정하고, 뒤에 다른 출발지
-                     * 식별자로 온 Initial 은 버리게 한다. Initial 키는 목적지 식별자만 알면
-                     * 누구나 만들 수 있어서, 받을 때마다 바꾸면 지어낸 패킷 하나로 이쪽이 보내는
-                     * 목적지가 바뀐다.
-                     */
+                    // RFC 9000 sets the destination from the peer's first Initial only and drops
+                    // later Initials with another source ID. Anyone who knows the destination ID
+                    // can derive Initial keys, so switching on every Initial would let one forged
+                    // packet redirect this side's traffic.
                     match &self.peer_initial_scid {
                         None => {
                             self.remote_cid = lp.scid.clone();
@@ -1936,10 +1638,8 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 1-RTT 패킷의 보호를 벗긴다.
-     * @return 푼 패킷과 상대가 키를 바꿨는지. 1-RTT 키가 없거나 인증에 실패하면 None.
-     */
+    /// Returns the packet and whether the peer changed keys; None without 1-RTT keys or on
+    /// authentication failure.
     fn unprotect_one_rtt(&self, pkt: &[u8]) -> Option<(packet::ShortPacket, bool)> {
         let (aead, keys) = self.spaces[APP].recv_keys.as_ref()?;
         let largest = self.spaces[APP].largest_recv.unwrap_or(0);
@@ -1961,15 +1661,12 @@ impl Connection {
         )
     }
 
-    /**
-     * @brief 상대의 종료를 받은 데이터그램 뒤쪽에 1-RTT 패킷이 붙어 있으면 그 패킷의 종료
-     *        사유를 남긴다.
-     * @details 핸드셰이크가 확정되기 전에 닫는 쪽은 이쪽이 어느 키까지 가졌는지 몰라 같은 종료를
-     *          공간마다 싣는다. RFC 9000 은 Initial 과 Handshake 사본에서 응용 계층의 코드와 사유를
-     *          감추게 하므로, 상대가 정한 실제 사유는 1-RTT 사본에만 있다. 연결은 이미 닫혔으므로
-     *          그 패킷의 다른 프레임은 처리하지 않는다.
-     * @param rest 종료를 실은 패킷 뒤에 남은 바이트.
-     */
+    /// Before the handshake is confirmed, the closing side does not know which keys this side has
+    /// and puts the same close in every space. RFC 9000 hides the application code and reason in
+    /// the Initial and Handshake copies, so the real reason is only in the 1-RTT copy. The
+    /// connection is already closed, so the packet's other frames are ignored.
+    ///
+    /// `rest` is the bytes after the packet that carried the close.
     fn take_one_rtt_close(&mut self, mut rest: &[u8]) {
         loop {
             let Some(&first) = rest.first() else {
@@ -2009,12 +1706,9 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 더는 쓰지 않는 Initial 과 Handshake 공간을 RFC 9001 이 정한 시점에 버린다.
-     * @details 서버는 Handshake 패킷을 처음 처리하면 Initial 을 버린다. 핸드셰이크가 확정되면
-     *          양쪽 모두 Handshake 를 버린다. 클라이언트가 Initial 을 버리는 시점은 첫
-     *          Handshake 패킷을 보낼 때라 flush 가 맡는다.
-     */
+    /// At the points RFC 9001 sets: a server drops Initial when it processes its first Handshake
+    /// packet, and both sides drop Handshake once the handshake is confirmed. A client drops
+    /// Initial when it sends its first Handshake packet, which flush handles.
     fn discard_finished_spaces(&mut self) {
         if self.role == Role::Server
             && !self.spaces[INITIAL].discarded
@@ -2031,12 +1725,9 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 번호 공간 하나의 키와 복구 상태를 버린다.
-     * @details 남은 패킷은 확인도 손실 판정도 받지 않으므로 흐르는 양에서 빼고 PTO 횟수도
-     *          처음으로 돌린다. 그대로 두면 끝난 핸드셰이크의 재전송이 응용 데이터의 PTO 를
-     *          앞질러 차지한다.
-     */
+    /// Its remaining packets will never be acknowledged or declared lost, so they leave bytes in
+    /// flight and the PTO count resets. Otherwise retransmissions of a finished handshake would get
+    /// ahead of the application PTO.
     fn discard_space(&mut self, space: usize) {
         let dropped = std::mem::take(&mut self.spaces[space]);
         let in_flight = dropped
@@ -2049,7 +1740,6 @@ impl Connection {
     }
 
     #[cfg(test)]
-    /** @brief 푼 패킷 하나의 프레임들을 처리한다. */
     fn process_packet(&mut self, space: usize, pn: u64, payload: &[u8]) -> Result<(), QuicError> {
         let kind = match space {
             INITIAL => PacketKind::Initial,
@@ -2059,7 +1749,6 @@ impl Connection {
         self.process_packet_kind(space, pn, payload, kind)
     }
 
-    /** @brief 프레임을 하나씩 처리하고 이 패킷이 확인을 끌어내는지 판정한다. */
     fn process_packet_kind(
         &mut self,
         space: usize,
@@ -2131,11 +1820,9 @@ impl Connection {
                     if kind != PacketKind::OneRtt || self.role != Role::Client {
                         return Err(QuicError::Frame);
                     }
-                    /*
-                     * ACK 와 PADDING, CONNECTION_CLOSE 말고는 모두 확인을 끌어낸다. 이 프레임만
-                     * 담은 패킷에 답하지 않으면 서버는 그 패킷을 영영 확인받지 못해 PTO 가
-                     * 계속 커진다.
-                     */
+                    // Everything except ACK, PADDING and CONNECTION_CLOSE elicits an
+                    // acknowledgment. Ignoring a packet with only this frame would leave the
+                    // server's packet unacknowledged forever and its PTO growing.
                     ack_eliciting = true;
                     self.handshake_confirmed = true;
                 }
@@ -2144,10 +1831,8 @@ impl Connection {
                     frame_type,
                     reason,
                 } => {
-                    /*
-                     * 응용 계층 종료는 응용 데이터 공간에만 실을 수 있다. RFC 9000 은 Initial 과
-                     * Handshake 패킷에 실린 것을 프로토콜 위반으로 정한다.
-                     */
+                    // An application close belongs only in the application space; RFC 9000 makes
+                    // one in an Initial or Handshake packet a protocol violation.
                     if frame_type.is_none()
                         && matches!(kind, PacketKind::Initial | PacketKind::Handshake)
                     {
@@ -2225,13 +1910,11 @@ impl Connection {
                     self.on_new_connection_id(sequence, retire_prior_to, cid, reset_token)?;
                 }
                 Frame::RetireConnectionId(_) => {
-                    /*
-                     * 이쪽은 핸드셰이크에서 정한 식별자 하나만 주고, 상대는 모든 패킷을 그
-                     * 식별자로 보낸다. 0 번을 버리라는 요청은 자기를 담은 패킷의 목적지를
-                     * 가리키고, 그보다 큰 순번은 준 적이 없으며, 길이 0 식별자를 준 쪽에는 이
-                     * 프레임이 올 수 없다. RFC 9000 은 첫째를 PROTOCOL_VIOLATION 으로 처리해도
-                     * 되게 하고, 나머지 둘은 반드시 그렇게 처리하게 한다.
-                     */
+                    // This side issues only the handshake connection ID, and the peer sends every
+                    // packet to it. Retiring sequence 0 names the destination of the packet
+                    // carrying the request, a larger sequence was never issued, and a side that
+                    // issued a zero-length ID cannot receive this frame. RFC 9000 allows
+                    // PROTOCOL_VIOLATION for the first case and requires it for the other two.
                     return Err(QuicError::Frame);
                 }
                 Frame::Other(frame_type) => {
@@ -2261,17 +1944,14 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 상대가 준 새 연결 식별자를 RFC 9000 의 규칙대로 받아들인다.
-     * @details retire_prior_to 가 커지면 그보다 앞선 식별자를 먼저 버리고 새 식별자를 더한다.
-     *          지금 목적지로 쓰는 식별자를 버렸으면 남은 것 가운데 순번이 가장 작은 것으로
-     *          옮긴다. 이미 버리라고 한 순번으로 늦게 온 식별자는 더하지 않고 버린다고 알린다.
-     *          같은 프레임이 재전송으로 다시 오는 것은 오류가 아니다.
-     * @retval QuicError::Frame 이쪽이 길이 0 식별자로 보내고 있거나, 순번이나 식별자가 같은데
-     *         나머지 내용이 다르다.
-     * @retval QuicError::ConnectionIdLimit 살아 있는 식별자가 이쪽이 알린 상한을 넘었거나
-     *         버림 알림이 너무 많이 밀렸다.
-     */
+    /// Follows RFC 9000: a larger retire_prior_to retires earlier IDs before the new one is added,
+    /// and if the ID in use was retired, the smallest remaining sequence takes over. An ID arriving
+    /// late with an already retired sequence is not added, only retired. The same frame again, as a
+    /// retransmission, is not an error.
+    ///
+    /// Frame when this side sends with a zero-length ID, or when the same sequence or ID comes with
+    /// different content. ConnectionIdLimit when live IDs exceed the advertised limit or too many
+    /// retirements are pending.
     fn on_new_connection_id(
         &mut self,
         sequence: u64,
@@ -2336,13 +2016,11 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 상대가 준 식별자 하나를 버린다고 알린다.
-     * @details 알림을 담은 패킷이 확인될 때까지 그 순번을 기억해 같은 알림을 거듭 쌓지 않는다.
-     *          RFC 9000 은 확인받지 못한 버림 알림을 이쪽 상한의 두 배까지 감당하라고 하고, 그
-     *          이상은 CONNECTION_ID_LIMIT_ERROR 로 처리해도 되게 한다. 이 상한이 없으면 상대는
-     *          확인을 보내지 않으면서 버릴 식별자를 계속 주어 이쪽이 보낼 알림을 끝없이 늘린다.
-     */
+    /// The sequence is remembered until the packet carrying the retirement is acknowledged, so the
+    /// same notice is not queued again. RFC 9000 asks to handle unacknowledged retirements up to
+    /// twice this side's limit and allows CONNECTION_ID_LIMIT_ERROR beyond that; without a cap, a
+    /// peer that never acknowledges could keep issuing IDs and grow this side's notices without
+    /// end.
     fn retire_peer_cid(&mut self, sequence: u64) -> Result<(), QuicError> {
         if self.retiring_peer_cids.contains(&sequence) {
             return Ok(());
@@ -2357,12 +2035,10 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 이 스트림 번호가 받기에 유효한지 보고 초기 윈도우를 알려 준다.
-     * @retval QuicError::StreamLimit 상대가 허락받은 수를 넘는 스트림을 열었다.
-     * @retval QuicError::StreamState 이쪽이 보내기만 하는 스트림이거나 아직 열지 않은 이쪽
-     *         스트림이다.
-     */
+    /// Returns the initial window.
+    ///
+    /// StreamLimit when the peer opened more streams than allowed; StreamState for a send-only
+    /// stream of this side or one of this side's streams not yet opened.
     fn recv_stream_properties(&self, id: u64) -> Result<(bool, bool, u64), QuicError> {
         let peer_initiator = match self.role {
             Role::Server => 0u64,
@@ -2394,7 +2070,6 @@ impl Connection {
         Ok((initiated_by_peer, unidirectional, stream_limit))
     }
 
-    /** @brief 상대가 연 스트림 번호가 이쪽이 허락한 스트림 수 안에 드는지. */
     fn check_peer_stream_limit(&self, id: u64) -> Result<(), QuicError> {
         let advertised = if id & 0x02 != 0 {
             self.local_max_streams_uni
@@ -2407,17 +2082,14 @@ impl Connection {
         Ok(())
     }
 
-    /** @brief 이 스트림이 이미 닫혔는지. */
     fn recv_stream_closed(&self, id: u64) -> bool {
         stream_range_contains(&self.closed_recv_ranges, id)
     }
 
-    /** @brief 스트림을 닫힌 것으로 표시한다. */
     fn mark_recv_stream_closed(&mut self, id: u64) {
         mark_stream_range(&mut self.closed_recv_ranges, id);
     }
 
-    /** @brief 스트림의 흐름 제어 윈도우를 초기값으로 설정한다. */
     fn ensure_recv_stream_credit(&mut self, id: u64, initial_limit: u64) {
         if self.local_stream_max.contains_key(&id) {
             return;
@@ -2430,7 +2102,7 @@ impl Connection {
         }
     }
 
-    /** @brief 상대가 스트림을 끊었다. 모아 둔 데이터를 버리고 윈도우를 정리한다. */
+    /// Drops buffered data and settles flow control.
     fn on_reset_stream(
         &mut self,
         id: u64,
@@ -2487,10 +2159,8 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 상대가 그만 보내라고 했다. 대기 중인 전송을 버리고 RESET_STREAM 으로 답한다.
-     * @details 아직 데이터를 본 적 없는 상대 스트림이어도 그 스트림의 보내는 쪽을 끊는다.
-     */
+    /// Drops pending sends and answers with RESET_STREAM, even for a peer stream that has carried
+    /// no data yet.
     fn on_stop_sending(&mut self, id: u64, error_code: u64) -> Result<(), QuicError> {
         self.check_send_stream_frame(id)?;
         if stream_range_contains(&self.stopped_send_ranges, id)
@@ -2520,15 +2190,12 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 이쪽이 보내는 쪽을 가리키는 STOP_SENDING 과 MAX_STREAM_DATA 가 이 스트림에 올 수
-     *        있는지.
-     * @details RFC 9000 에서 상대가 여는 양방향 스트림은 이 두 프레임으로도 열린다. 그래서 아직
-     *          데이터를 본 적 없는 상대 스트림은 허락한 수 안인지만 본다.
-     * @retval QuicError::StreamState 이쪽이 받기만 하는 스트림이거나 아직 열지 않은 이쪽
-     *         스트림이다.
-     * @retval QuicError::StreamLimit 허락한 수를 넘는 상대 스트림이다.
-     */
+    /// Whether STOP_SENDING or MAX_STREAM_DATA, which refer to this side's sending part, may arrive
+    /// for this stream. Under RFC 9000 those frames can also open a peer's bidirectional stream, so
+    /// for a peer stream with no data yet only the stream limit is checked.
+    ///
+    /// StreamState for a stream this side only receives on, or one of this side's streams not yet
+    /// opened; StreamLimit for a peer stream above the limit.
     fn check_send_stream_frame(&self, id: u64) -> Result<(), QuicError> {
         let local_initiator = match self.role {
             Role::Client => 0u64,
@@ -2546,7 +2213,7 @@ impl Connection {
         self.check_peer_stream_limit(id)
     }
 
-    /** @brief 스트림 윈도우가 늘었다. 막혀 있던 전송을 다시 시도한다. */
+    /// Retries sends blocked on the window.
     fn on_max_stream_data(&mut self, id: u64, max: u64) -> Result<(), QuicError> {
         self.check_send_stream_frame(id)?;
         if stream_range_contains(&self.closed_send_ranges, id)
@@ -2565,10 +2232,8 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 스트림 데이터를 받는다.
-     * @warning 흐름 제어 윈도우를 넘는 데이터는 연결 오류다. 받아들이면 윈도우를 알리는 의미가 없어진다.
-     */
+    /// Data beyond the flow control window is a connection error; accepting it would make the
+    /// advertised window meaningless.
     fn on_stream(
         &mut self,
         id: u64,
@@ -2653,7 +2318,6 @@ impl Connection {
         Ok(())
     }
 
-    /** @brief 받은 패킷을 알리는 확인 프레임을 만든다. */
     fn build_ack(&mut self, space: usize) -> Option<Frame> {
         let mut sorted = std::mem::take(&mut self.spaces[space].recv_pns);
         if sorted.is_empty() {
@@ -2689,11 +2353,8 @@ impl Connection {
         })
     }
 
-    /**
-     * @brief 긴 헤더 패킷 하나를 만든다. 핸드셰이크 중에 쓴다.
-     * @param probe 혼잡 윈도우가 막혀도 보낼 수 있는 남은 프로브 패킷 수. 윈도우를 넘겨
-     *              보냈으면 하나 줄인다.
-     */
+    /// `probe` counts the probe packets left that may exceed the congestion window; one is used
+    /// when this packet does.
     fn build_long_packet(
         &mut self,
         space: usize,
@@ -2762,10 +2423,7 @@ impl Connection {
         Some(pkt)
     }
 
-    /**
-     * @brief 짧은 헤더 패킷 하나를 만든다. 핸드셰이크 뒤에 쓴다.
-     * @param probe 혼잡 윈도우가 막혀도 보낼 수 있는 남은 프로브 패킷 수.
-     */
+    /// `probe` works as in build_long_packet.
     fn build_short_packet(&mut self, probe: &mut u8) -> Option<Vec<u8>> {
         let (aead, keys) = self.spaces[APP].send_keys.clone()?;
         let mut payload = Vec::new();
@@ -2826,7 +2484,6 @@ impl Connection {
         Some(pkt)
     }
 
-    /** @brief 보낸 패킷을 기억한다. 확인이나 손실 판정에 쓴다. */
     fn track_sent(
         &mut self,
         space: usize,
@@ -2850,7 +2507,6 @@ impl Connection {
         });
     }
 
-    /** @brief 확인을 처리한다. 왕복 시간을 갱신하고 혼잡 윈도우를 늘린다. */
     fn on_ack(
         &mut self,
         space: usize,
@@ -2902,12 +2558,10 @@ impl Connection {
                 .largest_acked
                 .map_or(largest, |prev| prev.max(largest)),
         );
-        /*
-         * ACK 만 담은 패킷은 기록하지 않으므로, 확인받은 바이트가 없어도 새로 확인된 패킷이
-         * 있을 수 있다. 가장 큰 확인 번호가 앞으로 갔다면 그렇다. 이때 손실 판정을 건너뛰면,
-         * 상대가 ACK 만 담은 패킷을 계속 확인해 줘도 그보다 앞서 잃은 패킷은 PTO 로만 다시
-         * 나가고 그 간격은 매번 두 배로 는다.
-         */
+        // ACK-only packets are not tracked, so new packets can be acknowledged with no acknowledged
+        // bytes; an advanced largest acknowledged number shows it. Skipping loss detection then
+        // would leave packets lost before it to the PTO, whose interval doubles each time, even
+        // while the peer keeps acknowledging.
         if acked_bytes == 0 && !largest_advanced {
             return Ok(());
         }
@@ -2935,14 +2589,10 @@ impl Connection {
         Ok(())
     }
 
-    /**
-     * @brief 손실된 패킷을 찾아 다시 보낼 것을 표시한다.
-     * @details 확인된 가장 큰 번호보다 충분히 앞섰거나, 그보다 앞서 보냈고 왕복 시간의 9/8 이
-     *          지난 패킷을 잃은 것으로 본다. 아직 시간이 차지 않은 패킷은 그 시각을 loss_time_ms
-     *          에 남겨, 새 확인이 오지 않아도 on_timeout 이 그때 판정하게 한다.
-     */
+    /// A packet is lost when it is far enough behind the largest acknowledged number, or was sent
+    /// before it more than 9/8 RTT ago. For one not yet past the time threshold, that time goes
+    /// into loss_time_ms so on_timeout decides then without a new ACK.
     fn detect_lost(&mut self, space: usize) {
-        /** @brief 이만큼 뒤의 패킷이 먼저 확인되면 잃은 것으로 본다. */
         const PACKET_THRESHOLD: u64 = 3;
         let Some(largest_acked) = self.spaces[space].largest_acked else {
             return;
@@ -2975,11 +2625,9 @@ impl Connection {
         }
         self.spaces[space].sent = remaining;
         self.spaces[space].loss_time_ms = loss_time;
-        /*
-         * 프레임이 없는 패킷도 흐르는 양에는 들어 있다. PING 만 실었거나 PTO 가 프레임을
-         * 이미 옮겨 간 패킷이 그렇다. 프레임 유무로 거르면 그 크기가 영영 빠지지 않아 혼잡
-         * 윈도우가 닫힌 채로 남는다.
-         */
+        // Packets without frames still count in flight: PING-only ones, or those whose frames a PTO
+        // already moved. Filtering by frames would never subtract their size, and the congestion
+        // window would stay shut.
         if lost_bytes == 0 {
             return;
         }
@@ -2994,17 +2642,13 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 이 공간에 PTO 를 걸어야 하는지.
-     * @details 확인을 기다리는 패킷이 있어야 한다. 응용 데이터 공간은 핸드셰이크가 확정된
-     *          뒤에만 건다. 그 전에는 상대에게 그 패킷을 풀 키가 없거나 이쪽에 확인을 풀 키가
-     *          없을 수 있다.
-     */
+    /// Needs packets awaiting acknowledgment. The application space arms only after the handshake
+    /// is confirmed; before that the peer may lack keys for those packets, or this side for the
+    /// acknowledgments.
     fn pto_armed(&self, space: usize) -> bool {
         !self.spaces[space].sent.is_empty() && (space != APP || self.handshake_confirmed)
     }
 
-    /** @brief PTO 가 걸린 공간들 가운데 가장 이른 데드라인. */
     fn pto_deadline(&self) -> Option<u64> {
         let period = self.pto_ms();
         [INITIAL, HANDSHAKE, APP]
@@ -3018,16 +2662,12 @@ impl Connection {
             .min()
     }
 
-    /**
-     * @brief 이 공간에서 확인받지 못한 프레임을 오래된 것부터 프로브가 실을 만큼 다시 보낼
-     *        차례에 넣는다.
-     * @details 가장 오래된 패킷 하나만 다시 보내면, 확인받지 못한 패킷이 여럿일 때 PTO 마다
-     *          하나씩 돌아가며 보내게 되고 간격은 매번 두 배로 는다. 그 사이 한쪽 사본만 계속
-     *          잃으면 그 데이터는 끝내 가지 않는다. 반대로 전부 옮기면 꼬리 하나를 잃어도 PTO
-     *          한 번에 윈도우 전체를 다시 보낸다. 나머지는 프로브의 확인이 오면 손실 판정이
-     *          맡는다. 원래 패킷은 확인과 왕복 시간 측정에 쓰도록 남겨 두고 프레임만 옮긴다.
-     *          다시 보낼 것이 없으면 PING 을 보낸다.
-     */
+    /// Queues this space's unacknowledged frames, oldest first, as many as the probes carry.
+    /// Resending only the oldest packet would rotate through several unacknowledged packets one per
+    /// PTO with the interval doubling each time, and data whose copies keep getting lost would
+    /// never arrive; moving everything would resend the whole window on one lost tail. Loss
+    /// detection handles the rest once a probe is acknowledged. The original packets stay for
+    /// acknowledgment and RTT; only their frames move. With nothing to resend, a PING goes out.
     fn queue_probe(&mut self, space: usize) {
         let state = &mut self.spaces[space];
         let mut budget = usize::from(PROBE_PACKETS) * MAX_PACKET_PAYLOAD;
@@ -3050,11 +2690,10 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 시각을 넘겨 손실 판정과 PTO 를 돌리고 유휴 데드라인이 지나면 닫는다.
-     * @details 닫힌 연결은 closing 이나 draining 기간이 끝났는지만 본다.
-     * @return 연결이 닫혔거나 기다리는 데드라인이 없으면 false.
-     */
+    /// Runs loss detection and the PTO, and closes after the idle deadline. A closed connection
+    /// only checks whether its closing or draining period has ended.
+    ///
+    /// False when closed or when no deadline is pending.
     pub fn on_timeout(&mut self, now_ms: u64) -> bool {
         self.now_ms = now_ms;
         if self.closed {
@@ -3102,11 +2741,9 @@ impl Connection {
         if now_ms < deadline {
             return true;
         }
-        /*
-         * RFC 9002 는 PTO 가 난 공간 말고도 확인을 기다리는 다른 공간에 함께 프로브를
-         * 보내라고 권한다. 핸드셰이크 중 Initial 과 Handshake 가 함께 남아 있을 때, 한쪽 PTO 가
-         * 횟수를 올려 다른 쪽 데드라인까지 두 배로 밀어내지 않게 한다.
-         */
+        // RFC 9002 suggests probing every space awaiting acknowledgment, not just the one whose PTO
+        // fired. With Initial and Handshake both pending during the handshake, one space's PTO then
+        // cannot double the other's deadline.
         for space in [INITIAL, HANDSHAKE, APP] {
             if self.pto_armed(space) {
                 self.queue_probe(space);
@@ -3117,26 +2754,22 @@ impl Connection {
         true
     }
 
-    /** @brief 지금 시각을 알린다. 이 상태 기계는 시계를 직접 읽지 않는다. */
+    /// This state machine never reads a clock.
     pub fn set_now(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
 
-    /** @brief 평활 왕복 시간. */
     pub fn srtt_ms(&self) -> u64 {
         self.srtt_ms
     }
 
-    /** @brief 확인을 기다리는 바이트 양. */
     pub fn bytes_in_flight(&self) -> u64 {
         self.bytes_in_flight
     }
 
-    /**
-     * @brief 연결이 지금 별도 버퍼에 보유한 가변 payload 바이트.
-     * @details 서버 리스너가 전역 예산을 계산할 때 쓴다. 연결 구조와 map bucket 같은 고정·
-     *          개수 기반 비용은 리스너의 연결당 기본 charge가 별도로 덮는다.
-     */
+    /// Mutable payload bytes the connection holds in separate buffers, for the server listener's
+    /// global budget. Fixed and count-based costs, such as the struct and map buckets, are covered
+    /// by the listener's per-connection base charge.
     pub fn retained_payload_bytes(&self) -> usize {
         let mut total = self
             .tls_server
@@ -3314,18 +2947,18 @@ impl Connection {
         total
     }
 
-    /** @brief 재전송 대기 시간의 기준값. */
+    /// Without the exponential backoff.
     pub fn base_pto_ms(&self) -> u64 {
         self.srtt_ms + (4 * self.rttvar_ms).max(1) + 25
     }
 
-    /** @brief 지금 재전송 대기 시간. 연속 실패마다 배로 늘어난다. */
+    /// Doubles with each consecutive PTO.
     fn pto_ms(&self) -> u64 {
         self.base_pto_ms()
             .saturating_mul(1u64 << self.pto_count.min(6))
     }
 
-    /** @brief 왕복 시간 표본을 반영한다. 상대가 알린 확인 지연을 빼고 측정한다. */
+    /// The peer's reported ACK delay is subtracted.
     fn update_rtt(&mut self, sample_ms: u64, ack_delay_ms: u64) {
         let sample = sample_ms.max(1);
         self.latest_rtt_ms = sample;
@@ -3346,7 +2979,6 @@ impl Connection {
         }
     }
 
-    /** @brief 확인을 받아 혼잡 윈도우를 늘린다. */
     fn on_cc_ack(&mut self, acked: u64) {
         let mss = MAX_DATAGRAM as u64;
         if self.cwnd < self.ssthresh {
@@ -3356,19 +2988,16 @@ impl Connection {
         }
     }
 
-    /** @brief 손실을 감지해 혼잡 윈도우를 줄인다. */
     fn on_cc_loss(&mut self) {
         let mss = MAX_DATAGRAM as u64;
         self.ssthresh = (self.cwnd / 2).max(2 * mss);
         self.cwnd = self.ssthresh;
     }
 
-    /** @brief 혼잡 윈도우에 여유가 있는지. */
     fn can_send_new(&self) -> bool {
         self.bytes_in_flight < self.cwnd
     }
 
-    /** @brief 조기 데이터 패킷을 만든다. 핸드셰이크 완료 전에 보낼 수 있다. */
     fn build_zero_rtt_packet(&mut self) -> Option<Vec<u8>> {
         if self.out_frames_early.is_empty() || !self.can_send_new() {
             return None;
@@ -3405,17 +3034,14 @@ impl Connection {
         Some(pkt)
     }
 
-    /** @brief 만들다 만 출력을 버린다. 아직 보내지 않은 핸드셰이크 데이터도 함께 버린다. */
+    /// Also drops unsent handshake data.
     fn discard_send_output(&mut self) {
         self.out_datagrams.clear();
         self.discard_unsent_frames();
     }
 
-    /**
-     * @brief 패킷으로 만들지 않은 출력과 재전송을 기다리는 프레임을 버린다.
-     * @details 닫은 연결은 종료 데이터그램 말고는 보내지 않는다. 남겨 두면 closing 기간 내내
-     *          리스너의 메모리 예산만 차지한다.
-     */
+    /// A closed connection sends nothing but the close datagram; kept, these would only hold the
+    /// listener's memory budget through the closing period.
     fn discard_unsent_frames(&mut self) {
         self.out_frames_app.clear();
         self.out_frames_early.clear();
@@ -3431,29 +3057,24 @@ impl Connection {
         self.bytes_in_flight = 0;
     }
 
-    /** @brief 보낼 것들을 패킷으로 묶어 내보낼 큐에 넣는다. */
     fn flush(&mut self) {
         self.flush_packets(0);
     }
 
-    /**
-     * @brief 보낼 것들을 패킷으로 묶어 내보낼 큐에 넣는다.
-     * @param probe 혼잡 윈도우를 넘겨서라도 보낼 수 있는 패킷 수. PTO 프로브만 0 이 아닌 값을
-     *              준다. 프로브가 윈도우에 막히면, 윈도우는 확인이 와야 열리는데 확인은 프로브가
-     *              가야 오므로 회복이 멈춘다.
-     */
+    /// `probe` is how many packets may exceed the congestion window; only PTO probes pass a nonzero
+    /// value. A probe blocked by the window would stall recovery: the window opens only on
+    /// acknowledgments, which come only after a probe goes out.
     fn flush_packets(&mut self, mut probe: u8) {
         if self.closed {
             return;
         }
         self.schedule_pending_stream_sends();
-        /* 짧은 헤더인지, Initial 인지, 패킷 바이트. */
+        // Short header, Initial, packet bytes.
         let mut packets: Vec<(bool, bool, Vec<u8>)> = Vec::new();
 
-        /*
-         * Retry 뒤에도 패킷 번호는 이어지므로, 연결의 첫 Initial 과 Retry 뒤의 첫 Initial 은 번호가
-         * 아니라 ClientHello 를 처음부터 싣는지로 가린다.
-         */
+        // Packet numbers continue after a Retry, so the connection's first Initial and the first
+        // one after a Retry are told apart by whether they carry the ClientHello from the start,
+        // not by number.
         let pad = if self.role == Role::Client && self.spaces[INITIAL].send_crypto_offset == 0 {
             MIN_INITIAL_DATAGRAM
         } else {
@@ -3471,10 +3092,8 @@ impl Connection {
             sent_handshake = true;
             packets.push((false, false, p));
         }
-        /*
-         * RFC 9001 에서 클라이언트는 Handshake 패킷을 처음 보낼 때 Initial 을 버린다. 이미 만든
-         * Initial 패킷은 이 데이터그램에 함께 나간다.
-         */
+        // Under RFC 9001 a client drops Initial when it first sends a Handshake packet. Initial
+        // packets already built still go in this datagram.
         if sent_handshake && self.role == Role::Client && !self.spaces[INITIAL].discarded {
             self.discard_space(INITIAL);
         }
@@ -3485,11 +3104,9 @@ impl Connection {
             return;
         }
 
-        /*
-         * 짧은 헤더 패킷은 길이 필드가 없어 데이터그램 끝까지를 자기 몫으로 읽으므로 맨 뒤에만
-         * 둔다. 그 뒤에는 채움 바이트도 붙일 수 없어서, Initial 을 담은 데이터그램에는 짧은 헤더
-         * 패킷을 함께 싣지 않고 따로 보낸다.
-         */
+        // A short header packet has no length field and reads to the end of the datagram, so it
+        // goes last and no padding can follow it. A datagram carrying an Initial therefore gets no
+        // short header packet; that goes separately.
         let mut dg = Vec::new();
         let mut dg_has_initial = false;
         for (is_short, is_initial, p) in packets {
@@ -3509,14 +3126,8 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 완성한 데이터그램을 내보낼 큐에 넣는다.
-     * @details RFC 9000 에서 Initial 을 담은 데이터그램은 1200바이트 이상이어야 한다. 받는 쪽은
-     *          그보다 작은 것을 버려도 되므로, 채우지 않으면 상대에 따라 핸드셰이크가 조용히
-     *          멈춘다. 채움 바이트는 긴 헤더 패킷 뒤에만 붙인다. 받는 쪽은 고정 비트가 0 인 그
-     *          바이트를 패킷으로 보지 않고 버린다.
-     * @param carries_initial 이 데이터그램에 Initial 패킷이 있는지.
-     */
+    /// Pads a datagram carrying an Initial to MIN_INITIAL_DATAGRAM. Padding goes only after long
+    /// header packets; receivers drop those bytes, whose fixed bit is 0, as not a packet.
     fn queue_datagram(&mut self, mut dg: Vec<u8>, carries_initial: bool) {
         if carries_initial && dg.len() < MIN_INITIAL_DATAGRAM {
             dg.resize(MIN_INITIAL_DATAGRAM, 0);
@@ -3524,12 +3135,10 @@ impl Connection {
         self.out_datagrams.push_back(dg);
     }
 
-    /** @brief 내보낼 데이터그램을 꺼낸다. 소비하는 쪽이 실제로 보낸다. */
     pub fn next_datagram(&mut self) -> Option<Vec<u8>> {
         self.out_datagrams.pop_front()
     }
 
-    /** @brief 완성된 스트림 요청들을 가져간다. */
     pub fn take_stream_requests(&mut self) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
         let completed = std::mem::take(&mut self.completed_streams);
@@ -3548,19 +3157,15 @@ impl Connection {
             }
             out.push((id, raw[2..].to_vec()));
         }
-        /*
-         * recv_datagram이 확인은 이미 내보냈다. 여기서 흐름 제어 갱신만 따로 보내지 말고,
-         * 이어지는 응답이나 다음 질의와 묶어 불필요한 ACK-eliciting 패킷을 만들지 않는다.
-         */
+        // recv_datagram already sent the acknowledgments. The flow control update is not sent alone
+        // here; it rides with the next response or query, avoiding an extra ack-eliciting packet.
         out
     }
 
-    /** @brief DNS 메시지 하나를 스트림에 보낸다. */
     pub fn send_dns_message(&mut self, id: u64, dns: &[u8]) -> Result<(), QuicError> {
         self.send_dns_message_owned(id, dns.to_vec())
     }
 
-    /** @brief 소유권을 넘겨받아 DNS 메시지를 보낸다. 복사를 줄인다. */
     pub fn send_dns_message_owned(&mut self, id: u64, mut dns: Vec<u8>) -> Result<(), QuicError> {
         if dns.is_empty() || dns.len() > u16::MAX as usize {
             return Err(QuicError::Frame);
@@ -3573,7 +3178,6 @@ impl Connection {
         self.send_stream_owned(id, dns, true)
     }
 
-    /** @brief DNS 메시지 여럿을 한 스트림에 보낸다. */
     pub fn send_dns_messages(&mut self, id: u64, msgs: &[Vec<u8>]) -> Result<(), QuicError> {
         if msgs.len() != 1 {
             return Err(QuicError::Frame);
@@ -3581,7 +3185,6 @@ impl Connection {
         self.send_dns_message(id, &msgs[0])
     }
 
-    /** @brief 응용 수준 프레임을 보낼 큐에 넣는다. */
     fn queue_app_frame(&mut self, f: Frame) {
         if !self.handshake_complete && self.early_send_keys.is_some() {
             self.early_backup.push(f.clone());
@@ -3591,12 +3194,8 @@ impl Connection {
         }
     }
 
-    /**
-     * @brief 이 스트림을 더 읽지 않는다고 상대에게 STOP_SENDING 으로 알린다.
-     * @details 상대는 RESET_STREAM 으로 보내는 쪽을 끊는다. 그 전에 상대가 보낸 데이터는 그대로
-     *          도착하므로 버리는 일은 부른 쪽이 맡는다. 이미 다 받았거나 끊긴 스트림에는 보내지
-     *          않는다.
-     */
+    /// The peer then resets its sending part with RESET_STREAM. Data it sent before that still
+    /// arrives, and the caller drops it. Not sent for a stream already fully received or reset.
     pub fn stop_sending(&mut self, id: u64, error_code: u64) {
         if self.closed || self.recv_stream_closed(id) {
             return;
@@ -3606,11 +3205,8 @@ impl Connection {
     }
 
     #[cfg(test)]
-    /**
-     * @brief 상대에게 RESET_STREAM 을 보낸다.
-     * @note 이 구현은 보내던 스트림을 스스로 끊지 않는다. 상대가 끊는 상황을 시험에서 만들 때만
-     *       쓴다. 최종 크기는 그 스트림에 지금까지 쌓은 바이트 수다.
-     */
+    /// This implementation never resets its own sending streams; tests use this to simulate a peer
+    /// that does. The final size is the bytes queued on the stream so far.
     pub(crate) fn send_reset_stream_for_test(&mut self, id: u64, error_code: u64) {
         let final_size = self.send_offsets.get(&id).copied().unwrap_or(0);
         self.queue_app_frame(Frame::ResetStream {
@@ -3621,9 +3217,7 @@ impl Connection {
         self.flush();
     }
 
-    /** @brief 보내려고 쌓아 둔 바이트. 연결 상한 판정에 쓴다. */
     fn buffered_stream_send_bytes(&self) -> usize {
-        /** @brief 이 프레임이 차지하는 바이트. */
         fn frame_bytes(frame: &Frame) -> usize {
             match frame {
                 Frame::Stream { data, .. } => data.len(),
@@ -3658,12 +3252,10 @@ impl Connection {
             })
     }
 
-    /** @brief 조기 데이터를 보낼 수 있는 상태인지. */
     pub fn can_send_early(&self) -> bool {
         !self.handshake_complete && self.early_send_keys.is_some()
     }
 
-    /** @brief 읽을 수 있게 된 스트림 데이터를 가져간다. */
     pub fn take_readable(&mut self) -> Vec<(u64, Vec<u8>, bool)> {
         let events = std::mem::take(&mut self.readable);
         let finished: std::collections::HashSet<u64> = events
@@ -3703,12 +3295,10 @@ impl Connection {
         events
     }
 
-    /** @brief 끊긴 스트림 목록을 가져간다. */
     pub fn take_resets(&mut self) -> Vec<(u64, u64)> {
         std::mem::take(&mut self.reset_streams)
     }
 
-    /** @brief 다 쓴 받기 스트림의 자원을 놓는다. */
     fn release_recv_stream(&mut self, id: u64) {
         let Some(stream) = self.streams.remove(&id) else {
             return;
@@ -3724,11 +3314,7 @@ impl Connection {
         self.replenish_recv_credit(remaining, id & 0x01 == peer_initiator, id & 0x02 != 0);
     }
 
-    /**
-     * @brief 소비한 만큼 연결 윈도우를 다시 채워 상대에게 알린다.
-     * @note 윈도우를 채우지 않으면 상대가 곧 막힌다. 매번 알리면 프레임이 너무 잦으니 일정
-     *       분량이 쌓였을 때만 보낸다.
-     */
+    /// Sent only once enough has accumulated; updating on every read would send too many frames.
     fn replenish_connection_credit(&mut self, consumed: u64) {
         if consumed == 0 {
             return;
@@ -3741,7 +3327,6 @@ impl Connection {
             .push(Frame::MaxData(self.local_max_data));
     }
 
-    /** @brief 스트림 윈도우를 다시 채운다. */
     fn extend_recv_stream_credit(&mut self, id: u64, consumed: u64) {
         if consumed == 0 || self.recv_stream_closed(id) {
             return;
@@ -3757,7 +3342,6 @@ impl Connection {
         }
     }
 
-    /** @brief 연결과 스트림 윈도우를 함께 채운다. */
     fn replenish_recv_credit(
         &mut self,
         consumed: u64,
@@ -3789,7 +3373,6 @@ impl Connection {
         }
     }
 
-    /** @brief 이 스트림 번호가 보내기에 유효한지 보고 윈도우를 알려 준다. */
     fn send_stream_properties(&self, id: u64) -> Result<(bool, bool, u64), QuicError> {
         if id >= (1u64 << 62) {
             return Err(QuicError::Frame);
@@ -3822,7 +3405,6 @@ impl Connection {
         Ok((initiated_locally, unidirectional, initial_stream_limit))
     }
 
-    /** @brief 대기 중인 전송 하나를 윈도우가 허락하는 만큼 내보낸다. */
     fn schedule_one_pending(&mut self, pending: &mut PendingStreamSend) -> (bool, bool) {
         let Ok((initiated_locally, unidirectional, initial_stream_limit)) =
             self.send_stream_properties(pending.id)
@@ -3888,7 +3470,6 @@ impl Connection {
         (true, done)
     }
 
-    /** @brief 윈도우가 열린 대기 전송들을 내보낸다. */
     fn schedule_pending_stream_sends(&mut self) {
         let mut blocked_streams = std::collections::HashSet::new();
         loop {
@@ -3920,12 +3501,11 @@ impl Connection {
         }
     }
 
-    /** @brief 스트림에 데이터를 보낸다. 윈도우가 모자라면 대기 큐에 넣는다. */
+    /// Queued when the window is short.
     pub fn send_stream(&mut self, id: u64, data: &[u8], fin: bool) -> Result<(), QuicError> {
         self.send_stream_owned(id, data.to_vec(), fin)
     }
 
-    /** @brief 소유권을 넘겨받아 스트림에 보낸다. */
     pub fn send_stream_owned(
         &mut self,
         id: u64,
@@ -3976,7 +3556,6 @@ impl Connection {
         Ok(())
     }
 
-    /** @brief 단방향 스트림을 연다. */
     pub fn open_uni_stream(&mut self) -> Result<u64, QuicError> {
         if self.closed {
             return Err(QuicError::Closed);
@@ -3994,47 +3573,35 @@ impl Connection {
         Ok(id)
     }
 
-    /** @brief 응용 데이터를 보낼 수 있는 상태인지. */
     pub fn can_send_app(&self) -> bool {
         self.spaces[APP].send_keys.is_some()
     }
 
-    /** @brief 핸드셰이크가 끝났는지. */
     pub fn is_handshake_complete(&self) -> bool {
         self.handshake_complete
     }
 
-    /**
-     * @brief 핸드셰이크가 확정됐는지.
-     * @details 서버는 핸드셰이크가 끝나는 순간, 클라이언트는 HANDSHAKE_DONE 을 받았을 때
-     *          확정된다.
-     */
+    /// A server confirms when the handshake completes, a client when it receives HANDSHAKE_DONE.
     pub fn is_handshake_confirmed(&self) -> bool {
         self.handshake_confirmed
     }
 
-    /** @brief 연결이 닫혔는지. 닫힌 연결로는 더 주고받을 수 없다. */
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    /**
-     * @brief 닫힌 연결의 상태를 이제 버려도 되는지.
-     * @details 닫은 뒤에도 closing 이나 draining 기간 동안은 늦게 온 패킷을 이 연결이 받아야 한다.
-     *          기간은 on_timeout 이 끝낸다. 소켓을 함께 닫는 쪽은 RFC 9000 이 허용하는 대로 기간을
-     *          기다리지 않고 버려도 된다. 늦게 온 패킷이 닿을 곳이 사라지기 때문이다.
-     */
+    /// Even after closing, the connection must receive late packets during the closing or draining
+    /// period, which on_timeout ends. A caller closing the socket as well may drop it without
+    /// waiting, as RFC 9000 allows, since late packets then have nowhere to arrive.
     pub fn is_terminated(&self) -> bool {
         self.closed && self.close_period.is_none()
     }
 
-    /**
-     * @brief 닫힌 연결에서 closing 이나 draining 기간에 쓸 상태만 떼어 내고 나머지를 버린다.
-     * @details 기간에 남은 일은 늦게 온 패킷에 종료를 다시 알리고 끝나는 시각을 지키는 것뿐이라
-     *          키와 버퍼가 필요 없다. 연결을 여럿 붙드는 쪽이 닫힌 연결의 메모리를 기간 내내 쥐지
-     *          않게 할 때 쓴다. 아직 꺼내지 않은 데이터그램도 함께 버려진다.
-     * @return 남은 기간의 상태. 열린 연결이거나 기간이 이미 끝났으면 None.
-     */
+    /// Detaches only what the closing or draining period needs: resending the close to late packets
+    /// and keeping the end time, which needs no keys or buffers. Lets a holder of many connections
+    /// free a closed one's memory during the period. Datagrams not yet taken are dropped too.
+    ///
+    /// None for an open connection or when the period has ended.
     pub fn into_close_period(mut self) -> Option<ClosePeriod> {
         if !self.closed {
             return None;
@@ -4042,17 +3609,12 @@ impl Connection {
         self.close_period.take()
     }
 
-    /**
-     * @brief 이쪽이 먼저 연결을 닫고 그 까닭을 상대에게 알린다.
-     *
-     * @details 알리지 않고 상태만 지우면 상대는 아무것도 받지 못한 채 자기 유휴 데드라인까지
-     *          기다린다. 응용 계층 종료(frame_type 없음)로 보내므로 error_code 의 뜻은
-     *          그 계층이 정한다. DoQ 는 RFC 9250 의 값을 쓴다.
-     * @param error_code 응용 계층이 정한 사유 코드.
-     * @param reason 사람이 읽을 짧은 설명. 빈 문자열도 된다.
-     * @note 이 코드와 사유는 1-RTT 패킷에만 싣는다. 핸드셰이크가 확정되기 전이라 Initial 과
-     *       Handshake 패킷에도 함께 보낼 때는 그쪽에 APPLICATION_ERROR 와 빈 사유를 싣는다.
-     */
+    /// Closes first and tells the peer why; dropping state without a word would leave the peer
+    /// waiting until its idle deadline. Sent as an application close with no frame type, so the
+    /// application defines `error_code`; DoQ uses RFC 9250 values. `reason` may be empty.
+    ///
+    /// The code and reason go only in 1-RTT packets. Before the handshake is confirmed, the copies
+    /// in Initial and Handshake packets carry APPLICATION_ERROR and an empty reason.
     pub fn close(&mut self, error_code: u64, reason: &str) {
         let application = Frame::ConnectionClose {
             error_code,
@@ -4067,22 +3629,15 @@ impl Connection {
         self.send_close(application, concealed);
     }
 
-    /**
-     * @brief 핸드셰이크를 마친 뒤 상대 인증서를 거부하고 연결을 닫는다.
-     * @details 폐기 확인처럼 TLS 검증 밖의 정책이 인증서를 받아들이지 않을 때 쓴다. TLS 가
-     *          거부했을 때와 같은 전송 계층 종료로, certificate_unknown 경고를 CRYPTO_ERROR 로
-     *          알린다.
-     */
+    /// For policy outside TLS validation, such as revocation checks. Closes like a TLS rejection:
+    /// the certificate_unknown alert as CRYPTO_ERROR.
     pub fn reject_peer_certificate(&mut self, reason: &str) {
         let error = QuicError::Tls(TlsError::CertificateUnknown);
         self.close_on_error(error.transport_code(), reason);
     }
 
-    /**
-     * @brief 연결 오류를 상대에게 알리고 연결을 닫는다.
-     * @details 닫는 연결로는 더 보낼 것이 없으므로 쌓아 둔 출력을 먼저 버린다. 오류를 일으킨
-     *          프레임 종류는 추적하지 않으므로 규격이 모를 때 쓰라는 0 을 싣는다.
-     */
+    /// Pending output is dropped first, since nothing else will be sent. The offending frame type
+    /// is not tracked, so it sends 0, as RFC 9000 allows when it is unknown.
     fn close_on_error(&mut self, error_code: u64, reason: impl std::fmt::Display) {
         if self.closed {
             return;
@@ -4096,14 +3651,11 @@ impl Connection {
         self.send_close(close.clone(), close);
     }
 
-    /**
-     * @brief 종료 데이터그램을 내보내고 closing 기간에 들어간다.
-     * @details 이미 쌓인 데이터그램은 종료 데이터그램보다 먼저 나간다. 패킷으로 만들지 않은
-     *          출력은 버린다. RFC 9000 의 즉시 종료는 모든 스트림을 함께 닫기 때문이다. 보낼 키가
-     *          하나도 없으면 알릴 방법이 없으므로 다시 보낼 것 없이 기간만 둔다.
-     * @param in_app 1-RTT 패킷에 실을 종료 프레임.
-     * @param in_handshake Initial 과 Handshake 패킷에 실을 종료 프레임.
-     */
+    /// Datagrams already queued go before the close datagram; output not yet packetized is dropped,
+    /// since an immediate close under RFC 9000 ends every stream. With no send keys at all there is
+    /// no way to tell the peer, so the period starts with nothing to resend.
+    ///
+    /// `in_app` goes in 1-RTT packets, `in_handshake` in Initial and Handshake packets.
     fn send_close(&mut self, in_app: Frame, in_handshake: Frame) {
         if self.closed {
             return;
@@ -4119,16 +3671,13 @@ impl Connection {
         self.enter_close_period(datagram);
     }
 
-    /**
-     * @brief 상대가 닫았거나 상태 없는 재설정을 받아 draining 기간에 들어간다.
-     * @details RFC 9000 은 이 기간에 아무것도 보내지 못하게 한다. 쌓아 둔 출력도 버린다.
-     */
+    /// After the peer closed or a stateless reset. RFC 9000 forbids sending anything in this
+    /// period, so queued output is dropped.
     fn enter_draining(&mut self) {
         self.discard_send_output();
         self.enter_close_period(None);
     }
 
-    /** @brief 연결을 닫고, 다시 보낼 종료 데이터그램과 함께 closing 이나 draining 기간을 둔다. */
     fn enter_close_period(&mut self, datagram: Option<Vec<u8>>) {
         self.closed = true;
         self.close_period = Some(ClosePeriod {
@@ -4140,25 +3689,18 @@ impl Connection {
         });
     }
 
-    /**
-     * @brief closing 이나 draining 기간이 끝나는 시각.
-     * @details RFC 9000 이 권하는 PTO 세 배다. 지수 증가를 뺀 PTO 로 잰다. 실패를 거듭한 연결에
-     *          증가분까지 곱하면 닫힌 연결이 리스너의 연결 슬롯을 몇 분씩 잡는다.
-     */
+    /// Three PTOs, as RFC 9000 suggests, measured without the exponential backoff: with it, a
+    /// connection that failed repeatedly would hold a listener slot for minutes after closing.
     fn close_period_end(&self) -> u64 {
         self.now_ms
             .saturating_add(self.base_pto_ms().saturating_mul(3))
     }
 
-    /**
-     * @brief 종료 프레임만 담은 데이터그램을 만든다.
-     * @details 핸드셰이크가 확정되기 전에는 상대가 어느 키까지 가졌는지 알 수 없어서 보낼 키가
-     *          있는 공간마다 하나씩 싣는다. 확정된 뒤에는 RFC 9000 이 1-RTT 에만 싣게 한다. closing
-     *          기간에 같은 바이트를 다시 보내므로 확인 프레임은 싣지 않는다. 클라이언트는 Initial
-     *          을 담은 데이터그램을 최소 크기로 채워야 하는데, 뒤에 붙는 1-RTT 패킷은 데이터그램
-     *          끝까지를 자기 몫으로 읽으므로 끝에 채움 바이트를 붙이지 않고 Initial 패킷 안을
-     *          채운다.
-     */
+    /// Before confirmation this side cannot know which keys the peer has, so one close goes in each
+    /// space with send keys; after it, RFC 9000 has it only in 1-RTT. The same bytes are resent
+    /// during the closing period, so no ACK frame goes in. A client must pad a datagram carrying an
+    /// Initial, but a trailing 1-RTT packet reads to the datagram's end, so the padding goes inside
+    /// the Initial packet.
     fn build_close_datagram(&mut self, in_app: &Frame, in_handshake: &Frame) -> Vec<u8> {
         let spaces: &[usize] = if self.handshake_confirmed {
             &[APP]
@@ -4187,10 +3729,7 @@ impl Connection {
         datagram
     }
 
-    /**
-     * @brief 종료 프레임 하나만 담은 패킷을 만든다. 보낼 키가 없으면 None.
-     * @param pad_to 패킷을 이 크기까지 채움 프레임으로 채운다.
-     */
+    /// None without send keys. `pad_to` pads the packet with PADDING frames to that size.
     fn build_close_packet(
         &mut self,
         space: usize,
@@ -4230,19 +3769,15 @@ impl Connection {
         }))
     }
 
-    /** @brief 상대가 알린 종료 사유. */
     pub fn peer_close(&self) -> Option<&PeerClose> {
         self.peer_close.as_ref()
     }
 
-    /**
-     * @brief 연결이 닫힌 까닭을 사람이 읽을 문구로.
-     *
-     * @details 닫힘은 상대의 CONNECTION_CLOSE만으로 생기지 않는다. stateless reset, 유휴
-     *          데드라인, 상대 transport parameters 거부도 같은 상태를 만든다. 갈라 두지 않으면
-     *          진단이 무슨 일이 있었든 늘 상대를 지목한다.
-     * @return 닫히지 않았으면 없다.
-     */
+    /// A closed state comes not only from the peer's CONNECTION_CLOSE but also from a stateless
+    /// reset, the idle deadline, or rejected peer transport parameters; without telling them apart,
+    /// diagnostics would always blame the peer.
+    ///
+    /// None while open.
     pub fn close_detail(&self) -> Option<String> {
         if !self.closed {
             return None;
@@ -4267,42 +3802,34 @@ impl Connection {
         Some("Closed without a reason".to_string())
     }
 
-    /** @brief 합의된 응용 프로토콜. */
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
     }
 
-    /** @brief 클라이언트 인증서를 확인했는지. */
     pub fn client_authenticated(&self) -> bool {
         self.client_authenticated
     }
 
-    /** @brief 확인된 클라이언트 신원. */
     pub fn client_auth_identity(&self) -> Option<&str> {
         self.client_auth_identity.as_deref()
     }
 
-    /** @brief 상대가 알린 전송 매개변수. */
     pub fn peer_transport_params(&self) -> Option<&TransportParams> {
         self.peer_tp.as_ref()
     }
 
-    /** @brief 이쪽 연결 식별자. */
     pub fn local_connection_id(&self) -> &[u8] {
         &self.local_cid
     }
 
-    /** @brief 상대 연결 식별자. */
     pub fn remote_connection_id(&self) -> &[u8] {
         &self.remote_cid
     }
 
-    /** @brief 이쪽 역할. */
     pub fn role(&self) -> Role {
         self.role
     }
 
-    /** @brief 세션 재개로 맺어진 연결인지. */
     pub fn is_resumed(&self) -> bool {
         if self.handshake_complete {
             self.handshake_resumed
@@ -4314,7 +3841,7 @@ impl Connection {
         }
     }
 
-    /** @brief 조기 데이터가 받아들여졌는지. 거부되면 다시 보내야 한다. */
+    /// Rejected early data has to be resent.
     pub fn early_data_accepted(&self) -> bool {
         if self.handshake_complete {
             self.handshake_early_accepted
@@ -4332,7 +3859,7 @@ impl Connection {
         }
     }
 
-    /** @brief 새로 받은 세션 티켓을 가져간다. 다음 연결의 재개에 쓴다. */
+    /// For resuming the next connection.
     pub fn take_new_sessions(&mut self) -> Vec<onetdns_tls::TlsSession> {
         self.tls_client
             .as_mut()
@@ -4340,7 +3867,7 @@ impl Connection {
             .unwrap_or_default()
     }
 
-    /** @brief 검증한 상대의 인증 경로. 서버 쪽 연결이면 비어 있다. */
+    /// Empty on a server-side connection.
     pub fn verified_chain(&self) -> &[onetdns_tls::X509] {
         match self.tls_client.as_ref() {
             Some(e) => e.verified_chain(),
@@ -4349,7 +3876,6 @@ impl Connection {
     }
 }
 
-/** @brief Retry 패킷에서 출발지 식별자와 토큰을 추출한다. */
 fn parse_retry(pkt: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut pos = 1 + 4;
     let dcid_len = *pkt.get(pos)? as usize;
@@ -4374,16 +3900,12 @@ fn parse_retry(pkt: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((scid, token))
 }
 
-/** @brief Retry 무결성 태그를 확인한다. 원래 목적지 식별자에 묶여 있다. */
 fn verify_retry_integrity(odcid: &[u8], retry_pkt: &[u8]) -> bool {
     crate::retry::verify_integrity(odcid, retry_pkt)
 }
 
-/**
- * @brief 이 토큰을 실은 Initial 패킷에 담을 프레임 바이트.
- * @details 토큰이 길수록 데이터그램에 남는 자리가 줄어든다. 줄이지 않으면 Retry 뒤의 Initial
- *          이 MAX_DATAGRAM 을 넘는다.
- */
+/// Frame bytes for an Initial carrying this token; without the reduction, an Initial after a Retry
+/// would exceed MAX_DATAGRAM.
 fn initial_payload_budget(token: &[u8]) -> usize {
     let token_field = crate::varint::len(token.len() as u64) + token.len();
     MAX_DATAGRAM
@@ -4391,13 +3913,11 @@ fn initial_payload_budget(token: &[u8]) -> usize {
         .min(MAX_PACKET_PAYLOAD)
 }
 
-/**
- * @brief 긴 헤더 패킷을 보호하고, pad_to 보다 작으면 본문 끝을 채움 바이트로 채워 그 크기에
- *        맞춘다.
- * @details 길이 필드는 가장 짧은 형태로 쓰므로, 채운 만큼 값이 커져 필드가 한 바이트 늘면 패킷이
- *          pad_to 를 넘는다. 그때는 넘은 만큼 덜 채운다.
- * @param seal 본문을 받아 보호한 패킷을 돌려준다.
- */
+/// Protects a long header packet and, when it is below `pad_to`, pads the payload to fit. The
+/// length field is written in its shortest form, so if padding makes it a byte longer the packet
+/// would exceed `pad_to`; then it pads that much less.
+///
+/// `seal` takes a payload and returns the protected packet.
 fn seal_padded(payload: &mut Vec<u8>, pad_to: usize, seal: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
     let packet = seal(payload);
     if packet.len() >= pad_to {
@@ -4412,10 +3932,7 @@ fn seal_padded(payload: &mut Vec<u8>, pad_to: usize, seal: impl Fn(&[u8]) -> Vec
     seal(payload)
 }
 
-/**
- * @brief 종료 프레임에 실을 사유 문구. MAX_CLOSE_REASON 바이트를 넘으면 자른다.
- * @details 사유 문구는 UTF-8 로 쓰게 되어 있으므로 글자 중간에서는 자르지 않는다.
- */
+/// Truncated to MAX_CLOSE_REASON bytes, never inside a UTF-8 character.
 fn close_reason(reason: &str) -> Vec<u8> {
     let mut end = reason.len().min(MAX_CLOSE_REASON);
     while !reason.is_char_boundary(end) {
@@ -4424,7 +3941,6 @@ fn close_reason(reason: &str) -> Vec<u8> {
     reason.as_bytes()[..end].to_vec()
 }
 
-/** @brief 대기 중인 프레임을 패킷 크기가 허락하는 만큼 담는다. */
 fn append_queued_frames(
     queue: &mut Vec<Frame>,
     payload: &mut Vec<u8>,
@@ -4456,7 +3972,6 @@ fn append_queued_frames(
     }
 }
 
-/** @brief 핸드셰이크 데이터를 조각내어 담는다. */
 fn append_crypto_chunk(
     space: &mut SpaceState,
     payload: &mut Vec<u8>,
@@ -4488,10 +4003,7 @@ fn append_crypto_chunk(
     }
 }
 
-/**
- * @brief 이 프레임이 상대의 확인을 끌어내는지.
- * @details RFC 9002 에서 채움, 확인, 종료는 확인을 끌어내지 않는다.
- */
+/// PADDING, ACK and CONNECTION_CLOSE are not, per RFC 9002.
 fn is_ack_eliciting(f: &Frame) -> bool {
     !matches!(
         f,
@@ -4499,10 +4011,7 @@ fn is_ack_eliciting(f: &Frame) -> bool {
     )
 }
 
-/**
- * @brief 상수 시간 비교.
- * @warning 재설정 토큰 비교에 쓴다. 걸린 시간이 새면 토큰을 한 바이트씩 알아낼 수 있다.
- */
+/// Constant time, for reset tokens; a timing leak would reveal a token byte by byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -4514,7 +4023,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     d == 0
 }
 
-/** @brief 손실 시 다시 보내야 하는 프레임인지. 확인과 채움은 다시 보내지 않는다. */
+/// ACK and PADDING are never resent.
 fn is_retransmittable(f: &Frame) -> bool {
     matches!(
         f,
@@ -4532,7 +4041,6 @@ fn is_retransmittable(f: &Frame) -> bool {
     )
 }
 
-/** @brief 이 스트림 번호가 기록된 구간에 들어 있는지. */
 fn stream_range_contains(ranges: &[Vec<(u64, u64)>; 4], id: u64) -> bool {
     let number = id >> 2;
     ranges[(id & 0x03) as usize]
@@ -4540,11 +4048,8 @@ fn stream_range_contains(ranges: &[Vec<(u64, u64)>; 4], id: u64) -> bool {
         .any(|&(low, high)| (low..=high).contains(&number))
 }
 
-/**
- * @brief 스트림 번호를 구간으로 압축해 기록한다.
- * @details 번호마다 항목을 두면 스트림을 많이 여는 상대에게 메모리가 그대로 끌려간다.
- *          이어지는 번호를 하나의 구간으로 합쳐 둔다.
- */
+/// Contiguous IDs merge into one range; an entry per ID would let a peer that opens many streams
+/// drag memory along.
 fn mark_stream_range(ranges: &mut [Vec<(u64, u64)>; 4], id: u64) {
     let number = id >> 2;
     let ranges = &mut ranges[(id & 0x03) as usize];
@@ -4567,7 +4072,7 @@ fn mark_stream_range(ranges: &mut [Vec<(u64, u64)>; 4], id: u64) {
     ranges.insert(index, (low, high));
 }
 
-/** @brief 확인 프레임의 구간 표현을 실제 번호 구간으로 편다. 형식이 깨졌으면 None. */
+/// Expands ACK frame ranges into packet number ranges; None when malformed.
 fn ack_ranges(largest: u64, first_range: u64, ranges: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
     let lo = largest.checked_sub(first_range)?;
     let mut out = Vec::with_capacity(ranges.len().saturating_add(1));
@@ -4582,14 +4087,12 @@ fn ack_ranges(largest: u64, first_range: u64, ranges: &[(u64, u64)]) -> Option<V
     Some(out)
 }
 
-/** @brief 긴 헤더에서 목적지 식별자를 추출한다. */
 fn long_header_dcid(pkt: &[u8]) -> Option<Vec<u8>> {
     let dcid_len = *pkt.get(5)? as usize;
     pkt.get(6..6 + dcid_len).map(|s| s.to_vec())
 }
 
 #[cfg(test)]
-/** @brief 핸드셰이크, 흐름 제어, 손실 복구, 키 갱신, 그리고 재생과 조작 거부. */
 mod tests {
     use super::*;
     use onetdns_tls::ServerConfig;
@@ -4597,11 +4100,8 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    /**
-     * @brief 알리는 데이터그램 크기가 실제로 읽는 버퍼를 넘지 않는지.
-     * @details 넘겨 알리면 상대가 그 크기로 보내도 되는데 이쪽은 잘라 읽고, 잘린 패킷은
-     *          인증에 실패해 조용히 버려진다. 핸드셰이크 도중이면 그대로 멈춘다.
-     */
+    /// Advertising more would let the peer send datagrams that get truncated, fail authentication,
+    /// and are dropped silently, stalling a handshake in progress.
     fn advertised_datagram_size_never_exceeds_the_buffer_we_read() {
         let asked = TransportParams {
             max_udp_payload_size: 65_527,
@@ -4611,7 +4111,6 @@ mod tests {
         assert_eq!(normalized.max_udp_payload_size, MAX_RECV_UDP_PAYLOAD);
     }
 
-    /** @brief 테스트용 서버 설정. 자체 서명 인증서를 쓴다. */
     fn server_cfg(alpn: Vec<Vec<u8>>) -> Arc<ServerConfig> {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.example".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -4633,7 +4132,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수신 연결이 Initial 전후 모두 같은 TLS 설정 Arc를 소유하는지. */
     fn server_connection_keeps_tls_config_shared_through_initial() {
         let config = server_cfg(vec![b"doq".to_vec()]);
         let certificate = config.cert_chain[0].as_ptr();
@@ -4670,7 +4168,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝난 서버 핸드셰이크 상태를 버리되 외부에서 읽는 결과는 보존하는지. */
+    /// Results read from outside must survive the release.
     fn server_releases_completed_tls_state_and_config_generation() {
         let config = server_cfg(vec![b"doq".to_vec()]);
         let mut server = Connection::new_server(
@@ -4701,7 +4199,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 논리 길이가 0이어도 Vec가 돌려주지 않은 예약 메모리를 계속 세는지. */
     fn retained_memory_counts_capacity_after_clear() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -4727,7 +4224,6 @@ mod tests {
         assert_eq!(server.retained_payload_bytes(), retained);
     }
 
-    /** @brief 테스트용 클라이언트 설정. */
     fn client_cfg(alpn: Vec<Vec<u8>>) -> ClientConfig {
         ClientConfig {
             server_name: "dns.example".to_string(),
@@ -4741,7 +4237,6 @@ mod tests {
         }
     }
 
-    /** @brief 양쪽 데이터그램을 서로 전달해 진행시킨다. */
     fn pump(client: &mut Connection, server: &mut Connection) {
         for _ in 0..20 {
             let mut moved = false;
@@ -4760,7 +4255,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 풀리지 않는 패킷을 버리되 연결은 유지하는지. 끊으면 그것이 탐색 신호가 된다. */
+    /// Closing would give a probing signal.
     fn reports_long_packet_protection_drop_without_closing_connection() {
         let mut client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
@@ -4795,7 +4290,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용 범위 밖 매개변수를 거부하고 사유를 남기는지. */
     fn reports_rejected_peer_transport_parameters() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -4816,7 +4310,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief Retry를 거친 핸드셰이크가 정상 경로와 같게 끝나는지. */
     fn retry_path_handshake_completes_like_doq_listener() {
         use crate::retry::{build_retry, parse_initial_header, RetryKey};
 
@@ -4856,11 +4349,9 @@ mod tests {
         tp.original_destination_connection_id = Some(original_dcid);
         tp.retry_source_connection_id = Some(retry_scid.clone());
 
-        /*
-         * Retry를 보낸 서버는 그 뒤 첫 Initial에서 다른 식별자를 골라도 된다. 실제 공개
-         * 서버가 그렇게 하므로, 여기서도 Retry 것과 다른 값을 쓴다. 같은 값을 쓰면 두 매개
-         * 변수를 한 값으로 대조하는 잘못을 이 테스트가 놓친다.
-         */
+        // A server that sent a Retry may pick another ID in its first Initial after it, and real
+        // public servers do. A different value here catches checking both parameters against one
+        // value.
         let server_scid = b"AFTERRTY".to_vec();
         assert_ne!(server_scid, retry_scid);
         let mut server =
@@ -4883,7 +4374,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이쪽이 알린 윈도우가 실제 버퍼 상한과 맞는지. 어긋나면 상대를 굶기거나 이쪽이 넘친다. */
+    /// A mismatch starves the peer or overflows this side.
     fn local_transport_params_match_receive_resource_limits() {
         let mut tp = TransportParams::server_defaults();
         tp.initial_max_data = MAX_CONNECTION_REASSEMBLY + 1;
@@ -4917,7 +4408,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다시 온 같은 조각을 중복으로 쌓지 않는지. */
     fn reassembly_deduplicates_retransmitted_future_fragment() {
         let mut reasm = Reasm::default();
         for _ in 0..(MAX_PENDING_FRAGMENTS * 4) {
@@ -4931,7 +4421,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 겹치는 조각을 합치고 한 번만 전달하는지. */
     fn reassembly_merges_consistent_overlaps_and_delivers_once() {
         let mut reasm = Reasm::default();
         assert!(reasm.push(3, b"def".to_vec(), 1024).unwrap().is_empty());
@@ -4942,7 +4431,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 위치에 다른 내용이 오면 거부하고 상태를 지키는지. */
     fn reassembly_rejects_conflicting_overlap_without_corrupting_state() {
         let mut reasm = Reasm::default();
         assert!(reasm.push(3, b"def".to_vec(), 1024).unwrap().is_empty());
@@ -4952,7 +4440,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 소켓 위에서 핸드셰이크가 끝나는지. */
     fn loopback_quic_handshake_completes() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -4980,12 +4467,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 핸드셰이크를 끝내기 전에 온 1-RTT 패킷을 처리하지도 확인하지도 않는지.
-     * @details 확인을 보내면 클라이언트는 그것으로 핸드셰이크가 확정됐다고 보고 Handshake 키를
-     *          버릴 수 있다. 그 뒤 클라이언트의 Finished 를 잃으면 어느 쪽도 다시 보내지 않아
-     *          연결이 멈춘다. 버린 질의는 핸드셰이크가 확정된 뒤 클라이언트가 다시 보낸다.
-     */
+    /// Acknowledging would let the client drop its Handshake keys; a lost client Finished would
+    /// then never be resent and the connection would stall. The client resends dropped queries
+    /// after confirmation.
     fn server_ignores_one_rtt_before_handshake_completes() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5048,7 +4532,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재설정 토큰이 매개변수에서 제대로 들어오는지. */
     fn server_reset_token_is_installed_from_transport_parameters() {
         let token = [0xa5; 16];
         let mut server_tp = TransportParams::server_defaults();
@@ -5074,13 +4557,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Initial 을 담은 데이터그램이 최소 크기를 채우는지.
-     *
-     * @details RFC 9000은 그 데이터그램이 1200바이트 이상이어야 한다고 정하고, 받는
-     *          쪽은 그보다 작은 데이터그램의 Initial 을 버려도 된다. 채우지 않으면 상대
-     *          구현에 따라 핸드셰이크가 아무 오류 없이 멈춘다. 서버가 보내는 쪽도 같은 규칙이다.
-     */
+    /// RFC 9000 requires datagrams carrying an Initial to be at least 1200 bytes, and a receiver
+    /// may drop smaller ones, stalling the handshake without an error. The rule applies to the
+    /// server's datagrams too.
     fn datagrams_carrying_initial_packets_are_padded_to_the_minimum() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5133,19 +4612,13 @@ mod tests {
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
-    /** @brief 이 데이터그램이 Initial 패킷으로 시작하는지. */
     fn carries_initial(dg: &[u8]) -> bool {
         !dg.is_empty() && dg[0] & 0x80 != 0 && (dg[0] & 0x30) == 0x00
     }
 
     #[test]
-    /**
-     * @brief 이쪽이 닫으면 상대가 그 사유를 실제로 받는지.
-     *
-     * @details 상태만 지우고 알리지 않으면 상대는 아무것도 받지 못한 채 자기 유휴 데드라인까지
-     *          기다린다. DoQ 는 RFC 9250이 규격 위반에 CONNECTION_CLOSE 를 보내게
-     *          하므로, 보낼 수단이 없으면 그 요구를 지킬 방법이 없다.
-     */
+    /// Without it the peer waits until its idle deadline. RFC 9250 has DoQ send CONNECTION_CLOSE on
+    /// protocol violations, which needs a way to send it.
     fn closing_tells_the_peer_why() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5177,19 +4650,15 @@ mod tests {
         assert_eq!(peer.frame_type, None, "응용 계층 종료여야 합니다");
         assert_eq!(peer.reason, b"malformed DNS message");
 
-        /* 두 번 불러도 한 번만 알린다. */
+        // A second call sends nothing more.
         server.close(0x2, "again");
         assert!(server.next_datagram().is_none());
     }
 
     #[test]
-    /**
-     * @brief 혼잡 윈도우가 가득 차 있어도 종료 사유가 나가는지.
-     *
-     * @details 종료 알림을 보통 프레임과 같은 조건에 두면, 정작 알려야 할 때(상대가 답을
-     *          받지 못해 윈도우가 찬 때)에 조용해진다. 그 상태가 바로 상대가 데드라인까지 기다리는
-     *          경우다.
-     */
+    /// Under the same conditions as other frames, the close would go silent exactly when it
+    /// matters: when the window is full because the peer got no replies, which is when the peer
+    /// waits until its deadline.
     fn closing_is_not_held_back_by_the_congestion_window() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5206,10 +4675,8 @@ mod tests {
         pump(&mut client, &mut server);
         assert!(server.is_handshake_complete());
 
-        /*
-         * 윈도우가 찬 상태를 직접 만든다. 트래픽으로 채우면 스트림 흐름 제어가 먼저 걸려
-         * 재려던 조건에 닿지 못한다.
-         */
+        // Sets a full window directly: traffic would hit stream flow control before reaching this
+        // condition.
         server.bytes_in_flight = server.cwnd;
         assert!(
             !server.can_send_new(),
@@ -5237,7 +4704,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대가 알린 종료 사유가 보존되는지. */
     fn peer_connection_close_detail_is_retained() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5268,13 +4734,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트가 재설정 토큰을 보내면 거부하고 그 사유를 알리는지. 규격상 서버만
-     *        보낸다.
-     * @details 닫기로 한 서버가 자기 핸드셰이크 응답까지 보내면 거부한 상대에게 인증서 체인을
-     *          넘기고, 주소를 검증하기 전에 보낼 수 있는 양도 헛되이 쓴다. 종료는 클라이언트가
-     *          가진 Initial 키로 풀려야 한다.
-     */
+    /// Only a server may send one. A server that decided to close but still sent its handshake
+    /// reply would hand its certificate chain to the rejected peer and spend what it may send
+    /// before address validation. The close must be readable with the client's Initial keys.
     fn client_cannot_send_stateless_reset_token_parameter() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5326,7 +4788,7 @@ mod tests {
         );
     }
 
-    /** @brief 데이터그램에 붙은 패킷의 종류를 앞에서부터 나열한다. 채움 바이트에서 멈춘다. */
+    /// Stops at padding.
     fn packet_kinds(dg: &[u8]) -> Vec<&'static str> {
         let mut kinds = Vec::new();
         let mut rest = dg;
@@ -5351,12 +4813,9 @@ mod tests {
         kinds
     }
 
-    /**
-     * @brief 보낸 쪽의 송신 키로 데이터그램의 패킷을 풀어, 패킷마다 번호 공간과 실린 프레임을
-     *        앞에서부터 꺼낸다.
-     * @details 받는 쪽은 CONNECTION_CLOSE 를 처리하면 같은 패킷의 나머지 프레임을 읽지 않는다.
-     *          종료와 함께 무엇이 나갔는지는 보낸 쪽 키로 직접 풀어야 보인다.
-     */
+    /// Decrypts with the sender's keys and lists each packet's space and frames in order. A
+    /// receiver stops reading a packet after CONNECTION_CLOSE, so what went out with the close
+    /// shows only with the sender's keys.
     fn sent_packets(sender: &Connection, dg: &[u8]) -> Vec<(usize, Vec<Frame>)> {
         let mut packets = Vec::new();
         let mut rest = dg;
@@ -5403,7 +4862,6 @@ mod tests {
         packets
     }
 
-    /** @brief 데이터그램에 실린 프레임을 패킷 순서대로 이어서 꺼낸다. */
     fn sent_frames(sender: &Connection, dg: &[u8]) -> Vec<Frame> {
         sent_packets(sender, dg)
             .into_iter()
@@ -5411,10 +4869,7 @@ mod tests {
             .collect()
     }
 
-    /**
-     * @brief 데이터그램들에 실린 핸드셰이크 데이터를 Initial 과 Handshake 공간별로 이어 붙인다.
-     * @details 보낸 쪽이 오프셋 순서대로 보냈다고 보고, 어긋나면 멈춘다.
-     */
+    /// Assumes the sender sent in offset order and panics otherwise.
     fn sent_crypto(sender: &Connection, dgs: &[Vec<u8>]) -> [Vec<u8>; 2] {
         let mut streams = [Vec::new(), Vec::new()];
         for dg in dgs {
@@ -5436,10 +4891,8 @@ mod tests {
         streams
     }
 
-    /**
-     * @brief 보낸 쪽의 송신 키로 임의의 페이로드를 담은 패킷 하나를 만든다.
-     * @details 규격을 어긴 프레임은 보낸 쪽 상태 기계가 만들지 않으므로 바이트를 직접 싣는다.
-     */
+    /// The sender's state machine never builds frames that break the rules, so raw bytes go in
+    /// directly.
     fn forge_packet(sender: &mut Connection, space: usize, payload: &[u8]) -> Vec<u8> {
         let (aead, keys) = sender.spaces[space]
             .send_keys
@@ -5476,7 +4929,6 @@ mod tests {
         )
     }
 
-    /** @brief 프레임들을 차례로 이어 붙인 페이로드. */
     fn encode_frames(frames: &[Frame]) -> Vec<u8> {
         let mut payload = Vec::new();
         for frame in frames {
@@ -5486,11 +4938,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief TLS 가 핸드셰이크를 거부하면 상대가 그 경고를 CRYPTO_ERROR 로 받는지.
-     * @details 알리지 않고 버리면 상대는 자기 유휴 데드라인까지 기다린다. RFC 9001 은 TLS
-     *          경고 코드에 0x100 을 더한 값을 CONNECTION_CLOSE 로 알리게 한다.
-     */
+    /// Dropping silently would leave the peer waiting until its idle deadline. RFC 9001 sends the
+    /// TLS alert plus 0x100 in CONNECTION_CLOSE.
     fn tls_rejection_reaches_the_peer_as_a_crypto_error() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5537,12 +4986,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크가 확정되기 전의 연결 오류를 보낼 키가 있는 공간마다 알리는지.
-     * @details 서버는 클라이언트가 어느 키까지 가졌는지 모른다. 클라이언트는 Handshake 패킷을
-     *          보낸 뒤 Initial 키를 버리므로, Initial 에만 실으면 클라이언트는 종료를 받지
-     *          못한다. 닫는 연결에 쌓여 있던 다른 출력은 나가지 않아야 한다.
-     */
+    /// The server does not know which keys the client has, and the client drops its Initial keys
+    /// after sending a Handshake packet, so a close only in Initial would never reach it. Other
+    /// pending output must not go out with it.
     fn closing_before_confirmation_uses_every_space_with_keys() {
         let ca = rcgen::generate_simple_self_signed(vec!["client.example".to_string()]).unwrap();
         let mut cfg = (*server_cfg(vec![b"doq".to_vec()])).clone();
@@ -5581,10 +5027,8 @@ mod tests {
             rejected,
             Some(QuicError::Tls(TlsError::CertificateRequired))
         );
-        /*
-         * 서버가 Initial 키를 아직 가졌는지는 클라이언트 응답이 데이터그램 몇 개로 나뉘었는지에
-         * 달렸다. 기대값은 서버가 실제로 가진 키에서 뽑는다.
-         */
+        // Whether the server still has Initial keys depends on how many datagrams the client's
+        // reply took, so the expectation comes from the keys the server actually holds.
         let expected: Vec<&str> = [
             (INITIAL, "Initial"),
             (HANDSHAKE, "Handshake"),
@@ -5626,13 +5070,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크 전에 응용 계층이 닫으면 Initial 패킷에 응용 계층의 코드와 사유를 싣지
-     *        않는지.
-     * @details Initial 패킷은 상대를 인증하기 전에 오간다. RFC 9000 은 응용 계층 종료를 이
-     *          패킷에 실을 때 APPLICATION_ERROR 로 바꾸고 사유를 비우게 한다. 1-RTT 키가 없다고
-     *          알리지 않으면 상대는 자기 유휴 데드라인까지 기다린다.
-     */
+    /// Initial packets travel before the peer is authenticated; RFC 9000 replaces an application
+    /// close there with APPLICATION_ERROR and an empty reason. Staying silent for lack of 1-RTT
+    /// keys would leave the peer waiting until its idle deadline.
     fn closing_before_the_handshake_conceals_the_application_reason() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5675,12 +5115,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 닫은 쪽이 늦게 온 패킷에 같은 종료 데이터그램으로 다시 답하는지.
-     * @details 종료 데이터그램이 사라지면 상대는 모른 채 계속 보낸다. RFC 9000 의 closing 상태는
-     *          그런 패킷에 종료로 답하게 한다. 받은 수가 2 의 거듭제곱일 때만 답해 점점 드물게
-     *          답한다.
-     */
+    /// A lost close datagram leaves the peer sending. RFC 9000's closing state answers such packets
+    /// with the close, here only when the received count is a power of two.
     fn closing_endpoint_repeats_its_close_to_late_packets() {
         let (mut client, mut server) = established_doq_pair();
         server.close(0x2, "bye");
@@ -5705,11 +5141,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief closing 상태에서 다시 보내는 양이 받은 양의 세 배를 넘지 않는지.
-     * @details 받은 패킷을 풀지 않고 답하므로, 상한이 없으면 출발지를 속인 작은 패킷으로 이
-     *          연결을 증폭기로 쓸 수 있다.
-     */
+    /// Replies are sent without decryption, so without the cap small spoofed packets could use the
+    /// connection as an amplifier.
     fn closing_replies_stay_within_three_times_the_received_bytes() {
         let (_client, mut server) = established_doq_pair();
         server.close(0x2, "bye");
@@ -5726,11 +5159,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대의 종료를 받은 쪽은 아무것도 보내지 않는지.
-     * @details RFC 9000 의 draining 상태다. 쌓여 있던 출력도 버려야 한다. 종료에 답하면 두 쪽이
-     *          서로의 종료에 계속 답할 수 있다.
-     */
+    /// RFC 9000's draining state; pending output goes too. Answering a close could make both sides
+    /// answer each other's close forever.
     fn draining_endpoint_sends_nothing() {
         let (mut client, mut server) = established_doq_pair();
         server.close(0x2, "bye");
@@ -5753,11 +5183,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief closing 과 draining 기간이 PTO 세 배 뒤에 끝나는지.
-     * @details 기간 동안은 연결을 남겨 둬야 늦게 온 패킷이 새 연결로 오해받지 않는다. 기간이
-     *          끝나면 버려도 된다고 알려야 닫힌 연결이 자원을 계속 차지하지 않는다.
-     */
+    /// During the period the connection must stay, so late packets are not taken for a new
+    /// connection; after it, reporting it as droppable keeps closed connections from holding
+    /// resources.
     fn close_period_ends_after_three_probe_timeouts() {
         let (mut client, mut server) = established_doq_pair();
         server.set_now(1_000);
@@ -5785,12 +5213,9 @@ mod tests {
         assert!(client.is_terminated());
     }
 
-    /**
-     * @brief 클라이언트는 핸드셰이크를 마쳤지만 서버는 아직 확정하지 못한 연결 한 쌍.
-     * @details 서버가 Handshake 와 1-RTT 키를 함께 가지고 있어 두 패킷을 한 데이터그램에 실어
-     *          보낼 수 있고, 클라이언트는 둘 다 풀 수 있다.
-     * @return 클라이언트와 서버.
-     */
+    /// The client has finished the handshake; the server has not confirmed it. The server holds
+    /// Handshake and 1-RTT keys and can coalesce both packets in one datagram, and the client can
+    /// decrypt both. Returns the client and the server.
     fn unconfirmed_pair() -> (Connection, Connection) {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5821,12 +5246,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 연결을 닫은 패킷 뒤에 같은 데이터그램으로 붙어 온 1-RTT 패킷에서 종료 사유만
-     *        읽는지.
-     * @details 종료는 모든 스트림을 함께 닫는다. 뒤의 스트림 데이터를 받으면 끝난 연결의 데이터를
-     *          응용 계층에 넘긴다. 뒤의 종료는 앞의 Handshake 사본이 감춘 실제 사유다.
-     */
+    /// Closing ends every stream, so stream data after it would hand a finished connection's data
+    /// to the application. The close after it carries the real reason the Handshake copy hid.
     fn only_the_close_is_read_from_packets_coalesced_after_a_close() {
         let (mut client, mut server) = unconfirmed_pair();
         let concealed = Frame::ConnectionClose {
@@ -5870,12 +5291,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크가 확정되기 전에 상대가 응용 계층 사유로 닫아도 그 사유를 받는지.
-     * @details 닫는 쪽은 Handshake 와 1-RTT 패킷에 종료를 함께 싣고, Handshake 사본에서는 코드와
-     *          사유를 감춘다. 먼저 풀리는 Handshake 사본만 남기면 응용 계층이 정한 사유가 모두
-     *          APPLICATION_ERROR 로 보인다.
-     */
+    /// The closing side puts the close in both Handshake and 1-RTT packets and hides the code and
+    /// reason in the Handshake copy. Keeping only the Handshake copy, which decrypts first, would
+    /// show every application reason as APPLICATION_ERROR.
     fn application_close_before_confirmation_keeps_its_reason() {
         let (mut client, mut server) = unconfirmed_pair();
         server.close(0x2, "application detail");
@@ -5897,11 +5315,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Initial 과 Handshake 패킷에 실린 응용 계층 종료를 거부하는지.
-     * @details RFC 9000 은 그 패킷에 응용 계층 종료를 싣지 못하게 하고, 받은 쪽은 프로토콜
-     *          위반으로 다루게 한다. 전송 계층 종료는 그대로 받는다.
-     */
+    /// RFC 9000 forbids an application close in those packets and has the receiver treat it as a
+    /// protocol violation; a transport close is still accepted.
     fn application_close_in_handshake_packets_is_a_protocol_violation() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -5935,10 +5350,8 @@ mod tests {
         assert!(server.is_closed());
     }
 
-    /**
-     * @brief 클라이언트가 1-RTT 패킷에 실어 보낸 페이로드를 서버가 거부할 때, 클라이언트가 받는
-     *        전송 오류 코드.
-     */
+    /// The transport error code the client gets when the server rejects this payload sent in a
+    /// 1-RTT packet.
     fn transport_code_for(payload: &[u8]) -> u64 {
         let (mut client, mut server) = established_doq_pair();
         let datagram = forge_packet(&mut client, APP, payload);
@@ -5955,10 +5368,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 일으킨 연결 오류를 RFC 9000 이 정한 전송 오류 코드로 알리는지.
-     * @details 코드를 하나로 뭉뚱그리면 상대는 자기가 무엇을 잘못 보냈는지 알 수 없다.
-     */
+    /// One code for everything would not tell the peer what it sent wrong.
     fn peer_errors_reach_the_peer_with_their_transport_codes() {
         let count_frame = |frame_type: u64, count: u64| {
             let mut payload = Vec::new();
@@ -6083,10 +5493,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 순서가 어긋난 핸드셰이크 데이터가 모아 둘 수 있는 양을 넘으면 CRYPTO_BUFFER_EXCEEDED
-     *        로 알리는지.
-     */
     fn handshake_data_beyond_the_reassembly_limit_is_reported() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6125,11 +5531,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 지나간 암호화 수준의 핸드셰이크 데이터는 재전송만 받아들이는지.
-     * @details 이미 받은 범위 안이면 버린다. 그 끝을 넘는 새 데이터는 TLS 가 그 수준을 떠난 뒤라
-     *          처리할 길이 없으므로 RFC 9001 이 정한 PROTOCOL_VIOLATION 이다.
-     */
+    /// Data inside the received range is dropped. New data past its end comes after TLS left that
+    /// level and cannot be processed: the PROTOCOL_VIOLATION of RFC 9001.
     fn handshake_data_at_a_finished_level_is_only_accepted_as_retransmission() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6166,11 +5569,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 받을 수준을 바꾸는 메시지 뒤에 같은 수준의 바이트가 붙어 오면 연결 오류인지.
-     * @details ServerHello 뒤의 Initial 바이트는 TLS 가 Handshake 수준으로 옮겨 간 뒤라 처리할
-     *          수 없다. RFC 9001 은 이것을 PROTOCOL_VIOLATION 으로 정한다.
-     */
+    /// Initial bytes after ServerHello cannot be processed once TLS has moved to the Handshake
+    /// level; RFC 9001 makes this PROTOCOL_VIOLATION.
     fn bytes_left_behind_a_level_change_are_a_protocol_violation() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6195,11 +5595,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief TLS 가 아직 받지 않는 수준의 핸드셰이크 데이터를 모아 두었다가 넘기는지.
-     * @details RFC 9001 은 그 데이터를 버리지 말고 TLS 가 그 수준에 이를 때까지 모아 두게 한다.
-     *          버리면 재전송을 기다려야 하고, 지금 수준으로 넘기면 TLS 가 거부한다.
-     */
+    /// RFC 9001 has such data kept until TLS reaches the level. Dropping it means waiting for a
+    /// retransmission; passing it at the current level makes TLS reject it.
     fn handshake_data_ahead_of_the_tls_level_waits_for_it() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6220,10 +5617,8 @@ mod tests {
         let [hello, handshake] = sent_crypto(&server, &flight);
         assert!(!hello.is_empty() && !handshake.is_empty());
 
-        /*
-         * 패킷을 거치지 않고 넣으므로, 서버의 Initial 패킷을 받을 때 하는 상대 식별자 갱신을
-         * 직접 한다. 하지 않으면 전송 매개변수의 식별자 검사에서 연결이 닫힌다.
-         */
+        // Data goes in without packets, so update the peer IDs as receiving the server's Initial
+        // would; otherwise the transport parameter ID check closes the connection.
         client.remote_cid = server.local_cid.clone();
         client.peer_initial_scid = Some(server.local_cid.clone());
         assert_eq!(client.on_crypto(HANDSHAKE, 0, handshake), Ok(()));
@@ -6236,12 +5631,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Initial 과 1-RTT 패킷을 함께 보낼 때도 Initial 을 담은 데이터그램이 최소 크기를
-     *        채우는지.
-     * @details 1-RTT 패킷은 데이터그램 끝까지를 자기 몫으로 읽으므로 그 뒤에 채움 바이트를 붙일
-     *          수 없다. 1-RTT 패킷을 따로 보내야 Initial 을 담은 데이터그램을 채울 수 있다.
-     */
+    /// A 1-RTT packet reads to the datagram's end, so no padding can follow it; it must go
+    /// separately for the Initial datagram to be padded.
     fn initial_datagram_is_padded_when_one_rtt_data_is_ready() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6286,7 +5677,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인을 만든 뒤 기록을 놓아 주는지. */
     fn ack_build_releases_received_packet_history() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6305,7 +5695,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끊어진 수신 구간이 제대로 인코딩되는지. */
     fn ack_build_encodes_disjoint_received_ranges() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6332,7 +5721,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 구간이 흩어져도 확인 프레임이 패킷 크기를 넘지 않는지. */
     fn ack_build_caps_sparse_ranges_and_packet_size() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6351,7 +5739,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 거대한 구간도 작게 담기고, 형식이 깨진 구간은 거부되는지. */
     fn huge_ack_range_stays_compact_and_malformed_ranges_are_rejected() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6374,7 +5761,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보낸 적 없는 패킷을 확인했다고 하면 거부하는지. 받아들이면 왕복 시간이 조작된다. */
+    /// Accepting it would let the peer manipulate the RTT.
     fn ack_cannot_claim_an_unsent_packet() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6387,11 +5774,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 확인을 끌어내지 않는 프레임이 RFC 9002 가 정한 채움, 확인, 종료뿐인지.
-     * @details 종료만 담은 패킷을 확인을 기다리는 패킷으로 세면, 닫는 연결이 오지 않을 확인을
-     *          기다리며 손실 복구를 돌린다.
-     */
+    /// Counting a close-only packet as awaiting acknowledgment would make a closing connection run
+    /// loss recovery for acknowledgments that never come.
     fn only_padding_ack_and_close_do_not_elicit_acks() {
         let ack = Frame::Ack {
             largest: 0,
@@ -6412,7 +5796,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조기 데이터에 허용되지 않는 프레임을 거부하는지. */
     fn zero_rtt_rejects_ack_and_crypto_frames() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6449,7 +5832,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프레임이 허용된 암호화 수준과 방향에서만 오는지. 어기면 핸드셰이크를 우회할 수 있다. */
+    /// Breaking that would allow bypassing the handshake.
     fn frame_encryption_level_and_sender_are_enforced() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6491,7 +5874,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인 키가 생기기 전에도 수신 기록이 상한 안에 머무는지. */
     fn receive_packet_history_is_bounded_before_ack_keys_exist() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6514,7 +5896,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재전송도 혼잡 윈도우를 지키는지. 지키지 않으면 손실 구간에서 상황이 더 나빠진다. */
+    /// Otherwise loss would make congestion worse.
     fn retransmissions_respect_congestion_window() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6547,7 +5929,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 윈도우 갱신 상태가 연결 단위로 묶이는지. */
     fn max_stream_data_state_is_connection_bounded() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6570,7 +5951,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쌓아 둔 전송 데이터가 연결 단위로 묶이는지. */
     fn queued_stream_data_is_connection_bounded() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6597,7 +5977,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한계에 닿았을 때 데이터를 버리지 않고 미루는지. */
     fn local_stream_and_flow_limits_are_non_destructive_backpressure() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -6639,7 +6018,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 윈도우가 조금 열렸을 때 한 스트림이 독차지하지 않는지. */
     fn pending_sends_resume_partially_without_starving_other_streams() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6681,7 +6059,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중단 요청 뒤 안 보낸 부분을 버리고 최종 크기를 맞게 알리는지. */
     fn stop_sending_discards_unscheduled_tail_and_uses_accepted_final_size() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -6713,7 +6090,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 전송 요청도 개수 상한에 잡히는지. 안 잡으면 그것만으로 큐를 채울 수 있다. */
+    /// Otherwise empty requests alone could fill the queue.
     fn zero_length_pending_operations_are_count_bounded() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -6734,7 +6111,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 소켓 위에서 DoQ 질의와 응답이 오가는지. */
     fn loopback_doq_query_response() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6774,7 +6150,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요청 소비로 생긴 흐름 제어 갱신을 작은 응답과 한 패킷에 묶는지. */
     fn completed_doq_request_batches_flow_credit_with_response() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6812,7 +6187,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 패킷을 다시 보내도 데이터가 한 번만 전달되는지. */
     fn replayed_protected_packet_delivers_stream_only_once() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6842,7 +6216,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 순서가 바뀐 패킷은 받되 오래된 것은 버리는지. */
     fn packet_number_window_accepts_reordering_once_and_drops_stale_packets() {
         let mut space = SpaceState::default();
         assert!(space.accept_packet_number(10));
@@ -6854,7 +6227,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝난 스트림이 윈도우를 돌려주는지. 돌려주지 않으면 곧 막힌다. */
     fn completed_stream_replenishes_stream_and_connection_credit() {
         let mut server_tp = TransportParams::server_defaults();
         server_tp.initial_max_streams_bidi = 1;
@@ -6892,7 +6264,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응용이 읽으면 버퍼가 풀리고 윈도우가 밀리는지. */
     fn application_reads_release_buffer_and_slide_flow_control_windows() {
         let mut tp = TransportParams::server_defaults();
         tp.initial_max_data = 4;
@@ -6919,7 +6290,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 읽은 뒤 끊기면 남은 몫만 돌려주는지. 두 번 돌려주면 윈도우가 부풀어 오른다. */
+    /// Returning credit twice would inflate the window.
     fn reset_after_application_read_releases_only_unconsumed_credit() {
         let mut tp = TransportParams::server_defaults();
         tp.initial_max_data = 4;
@@ -6939,7 +6310,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 윈도우가 1바이트여도 큰 메시지가 끝까지 가는지. */
     fn one_byte_initial_stream_window_progresses_large_doq_message() {
         let mut server_tp = TransportParams::server_defaults();
         server_tp.initial_max_stream_data_bidi_remote = 1;
@@ -6967,7 +6337,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 읽어 간 데이터가 재전송으로 다시 전달되지 않는지. */
     fn retransmitted_stream_after_application_release_is_not_delivered_twice() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -6995,7 +6364,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 스트림을 끊으면 윈도우가 한 번만 돌아가고 취소가 알려지는지. */
     fn reset_stream_releases_credit_once_and_reports_cancellation() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7021,7 +6389,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중단 요청이 대기 데이터를 취소하고 끊기 프레임을 넣는지. */
     fn stop_sending_cancels_pending_stream_data_and_queues_reset() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7054,7 +6421,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중단 요청 뒤에는 늦은 전송이 나가지 않는지. */
     fn stop_sending_before_response_prevents_late_stream_send() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -7086,11 +6452,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 받는 중인 스트림에만 STOP_SENDING 을 보내는지.
-     * @details 다 받은 스트림에는 거절할 데이터가 없고, RFC 9000 은 RESET_STREAM 을 받은 스트림에
-     *          STOP_SENDING 을 보내지 말라고 한다.
-     */
+    /// A fully received stream has nothing to refuse, and RFC 9000 says not to send STOP_SENDING on
+    /// a stream that got RESET_STREAM.
     fn stop_sending_skips_streams_that_already_ended() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -7117,12 +6480,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 보내는 쪽을 가리키는 STOP_SENDING 과 MAX_STREAM_DATA 가 스트림 방향과 수 제한을
-     *        따르는지.
-     * @details 상대가 여는 양방향 스트림은 이 두 프레임으로도 열린다. 중단 요청에는 RESET_STREAM
-     *          으로 답한다.
-     */
+    /// These frames can also open a peer's bidirectional stream. STOP_SENDING is answered with
+    /// RESET_STREAM.
     fn send_side_frames_follow_stream_direction_and_limits() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -7154,7 +6513,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대가 이쪽 스트림 번호를 열거나 윈도우를 주지 못하는지. 번호 공간이 역할별로 나뉘어 있다. */
+    /// Stream ID spaces are split by role.
     fn peer_cannot_open_or_grant_credit_to_local_stream_ids() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -7173,7 +6532,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 끝난 스트림의 윈도우 갱신이 상태를 되살리지 않는지. */
     fn max_stream_data_after_send_fin_does_not_recreate_state() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"h3".to_vec()]),
@@ -7191,7 +6549,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 윈도우 갱신이 손실되면 다시 보내지는지. 잃으면 상대가 영영 막힌다. */
+    /// A lost update would leave the peer blocked for good.
     fn flow_control_updates_are_retransmittable() {
         assert!(is_retransmittable(&Frame::MaxData(10)));
         assert!(is_retransmittable(&Frame::MaxStreamData { id: 0, max: 10 }));
@@ -7207,7 +6565,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 스트림이 데이터그램 크기 안에서 나뉘는지. */
     fn large_stream_is_packetized_within_datagram_limit() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7254,18 +6611,13 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 더 큰 데이터그램을 받을 수 있다고 알려도 1200바이트를 넘게 합치지 않는지.
-     * @details 이쪽은 경로 MTU 를 찾지 않으므로 RFC 9000 에 따라 1200바이트까지만 보낸다. 상대의
-     *          max_udp_payload_size 는 상대가 받을 수 있는 크기일 뿐, 경로가 그만큼 나른다는 뜻이
-     *          아니다. 경로에서 버려진 데이터그램에 든 Handshake 패킷은 PTO 마다 같은 크기로 다시
-     *          나가 끝내 닿지 않는다.
-     */
+    /// This side does no path MTU discovery, so RFC 9000 keeps it at 1200 bytes; the peer's
+    /// max_udp_payload_size is what the peer can receive, not what the path carries. A Handshake
+    /// packet in a datagram the path drops would be resent at the same size on every PTO and never
+    /// arrive.
     fn coalesced_datagrams_stay_within_the_unprobed_path_limit() {
-        /*
-         * MAX_DATAGRAM 대신 RFC 9000 의 값을 쓴다. 그 상수를 올리면 이 테스트가 함께 느슨해져
-         * 막으려던 회귀를 놓친다.
-         */
+        // Uses the RFC 9000 value instead of MAX_DATAGRAM; tied to that constant, the test would
+        // loosen along with it and miss the regression.
         let unprobed_path_limit = 1200;
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7311,10 +6663,8 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 가장 긴 토큰을 실은 Retry 를 받은 클라이언트.
-     * @return 클라이언트와 그 토큰. Retry 를 받고 다시 보낸 Initial 은 아직 꺼내지 않았다.
-     */
+    /// A client that received a Retry with the longest token. Returns the client and the token; the
+    /// Initial resent after the Retry has not been taken yet.
     fn client_after_longest_retry() -> (Connection, Vec<u8>) {
         let mut client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
@@ -7332,17 +6682,14 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 가장 긴 Retry 토큰을 실은 Initial 도 1200바이트를 넘지 않는지.
-     * @details 토큰은 Initial 패킷마다 실리므로 그만큼 프레임 자리가 줄어야 한다. 줄이지 않으면
-     *          핸드셰이크 데이터로 가득 찬 Initial 이 상한을 넘는다.
-     */
+    /// The token rides in every Initial packet, so the frame room must shrink by that much;
+    /// otherwise an Initial full of handshake data would exceed the limit.
     fn initial_with_the_longest_retry_token_fits_the_datagram_limit() {
         let (mut client, token) = client_after_longest_retry();
         client.spaces[INITIAL]
             .out_crypto
             .extend_from_slice(&[0; 2 * MAX_DATAGRAM]);
-        /* 한 번 내보낼 때 Initial 패킷은 하나만 만든다. */
+        // Each flush builds only one Initial packet.
         let mut datagrams = Vec::new();
         for _ in 0..8 {
             client.flush();
@@ -7365,12 +6712,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 종료 데이터그램이 사유 문구 길이와 무관하게 1200바이트를 넘지 않는지.
-     * @details 핸드셰이크가 확정되기 전에는 보낼 키가 있는 공간마다 같은 사유를 하나씩 싣고,
-     *          클라이언트의 Initial 에는 Retry 토큰도 실린다. 사유를 자르지 않으면 데이터그램이
-     *          상한을 넘는다.
-     */
+    /// Before confirmation the same reason goes in each space with send keys, and the client's
+    /// Initial also carries the Retry token, so an untruncated reason would exceed the limit.
     fn close_datagrams_stay_within_the_datagram_limit() {
         let long_reason = "x".repeat(4 * MAX_DATAGRAM);
 
@@ -7415,11 +6758,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 사유가 짧은 클라이언트 종료가 정확히 1200바이트인지.
-     * @details 채움 바이트가 Initial 의 길이 필드 값을 64 이상으로 키우면 그 필드가 한 바이트
-     *          늘어난다. 그만큼 덜 채우지 않으면 데이터그램이 1201바이트가 된다.
-     */
+    /// When padding pushes the Initial's length value to 64 or more, the field grows by a byte;
+    /// without padding that much less, the datagram would be 1201 bytes.
     fn short_client_close_is_padded_to_exactly_the_minimum() {
         let mut client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
@@ -7435,7 +6775,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 긴 사유 문구를 글자 중간에서 자르지 않는지. 잘린 문구도 UTF-8 이어야 한다. */
+    /// The truncated reason must still be UTF-8.
     fn close_reason_is_cut_on_a_character_boundary() {
         let reason = "가".repeat(MAX_CLOSE_REASON);
         let cut = close_reason(&reason);
@@ -7445,7 +6785,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 갱신 중에도 데이터가 끊기지 않는지. */
     fn key_update_rotates_and_keeps_data_flowing() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7495,7 +6834,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경로 확인 문답이 오가는지. */
     fn path_validation_challenge_response() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7530,7 +6868,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상태 없는 재설정을 받으면 연결을 닫는지. */
     fn stateless_reset_closes_connection() {
         let mut client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
@@ -7557,7 +6894,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잃은 질의가 다시 보내지는지. */
     fn loss_recovery_retransmits_dropped_query() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7598,7 +6934,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인이 왕복 시간을 갱신하고 대기 바이트를 줄이는지. */
     fn ack_processing_updates_rtt_and_clears_inflight() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7619,7 +6954,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인 지연을 빼되 최소 왕복 시간 아래로 내려가지 않는지. 내려가면 재전송이 너무 빨라진다. */
+    /// Going below would make retransmission too eager.
     fn ack_delay_is_removed_without_going_below_minimum_rtt() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7635,7 +6970,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 회복 구간에 윈도우가 한 번만 줄어드는지. 여러 번 줄이면 지나치게 보수적이 된다. */
+    /// Reducing it more than once would be overly conservative.
     fn congestion_window_is_reduced_once_per_recovery_period() {
         let mut conn = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7673,7 +7008,6 @@ mod tests {
         assert_eq!(conn.cwnd, once);
     }
 
-    /** @brief 핸드셰이크를 끝낸 DoQ 클라이언트와 서버. */
     fn established_doq_pair() -> (Connection, Connection) {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -7692,7 +7026,7 @@ mod tests {
         (client, server)
     }
 
-    /** @brief 클라이언트가 보낸 질의를 서버가 받고, 서버의 확인까지 클라이언트에 전한다. */
+    /// Also relays the server's acknowledgment back to the client.
     fn deliver_query(client: &mut Connection, server: &mut Connection, stream: u64) {
         client.send_dns_message(stream, b"\x00\x00 QUERY").unwrap();
         while let Some(dg) = client.next_datagram() {
@@ -7705,11 +7039,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief HANDSHAKE_DONE 만 담은 패킷에도 클라이언트가 확인을 보내는지.
-     * @details 답하지 않으면 서버는 그 패킷을 영영 확인받지 못한다. 서버가 기다리는 확인이
-     *          오지 않으니 PTO 는 계속 두 배로 늘고, 그 뒤에 잃은 응답을 알아챌 길도 없다.
-     */
+    /// Without an acknowledgment the server never gets that packet acknowledged: its PTO keeps
+    /// doubling, and a response lost later goes unnoticed.
     fn handshake_done_alone_is_acknowledged() {
         let (mut client, mut server) = established_doq_pair();
         server.out_frames_app.push(Frame::HandshakeDone);
@@ -7726,13 +7057,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief ACK 만 담은 패킷을 확인받아도 그보다 앞서 잃은 패킷을 손실로 판정하는지.
-     * @details ACK 만 담은 패킷은 기록하지 않으므로 이 확인이 알려 주는 바이트는 없다. 그렇다고
-     *          판정을 건너뛰면 상대가 그런 패킷을 계속 확인해 줘도 잃은 데이터는 PTO 로만 다시
-     *          나간다. 핸드셰이크 중 ServerHello 를 잃으면 클라이언트는 같은 Initial 을 거듭
-     *          보내며 서버의 ACK 를 확인해 주는데, 서버는 그 사이 PTO 만 기다리다 멈췄다.
-     */
+    /// ACK-only packets are not tracked, so this acknowledgment reports no bytes; skipping loss
+    /// detection then would resend lost data only by PTO even while the peer keeps acknowledging.
+    /// With ServerHello lost during the handshake, the client keeps resending its Initial and
+    /// acknowledging the server's ACK, and a server waiting only on the PTO stalls.
     fn ack_of_ack_only_packets_detects_earlier_loss() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7785,12 +7113,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 첫 PTO 프로브가 가장 오래된 패킷 뒤의 데이터까지 싣는지.
-     * @details 서버가 HANDSHAKE_DONE 과 응답을 따로 보냈고 둘 다 잃은 상태다. 프로브마다 가장
-     *          오래된 패킷 하나만 실으면 응답 사본은 PTO 한 번 걸러 나가고 간격은 두 배씩 늘어,
-     *          그 사본만 계속 잃으면 아무것도 보내지 않는 클라이언트는 응답을 끝내 받지 못한다.
-     */
+    /// The server sent HANDSHAKE_DONE and the response separately and lost both. Carrying only the
+    /// oldest packet per probe would send the response copy every other PTO with the interval
+    /// doubling, and if those copies kept getting lost, a client that sends nothing would never get
+    /// the response.
     fn first_probe_carries_data_behind_the_oldest_packet() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7818,11 +7144,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief PTO 가 프로브에 실을 만큼만 다시 보낼 차례에 넣는지.
-     * @details 확인받지 못한 프레임을 전부 옮기면 꼬리 하나를 잃어도 PTO 한 번에 윈도우 전체를
-     *          다시 보낸다. 나머지는 프로브가 확인받은 뒤 손실 판정이 골라 다시 보낸다.
-     */
+    /// Moving every unacknowledged frame would resend the whole window on one lost tail; the rest
+    /// is resent by loss detection once a probe is acknowledged.
     fn pto_requeues_only_what_its_probes_carry() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7852,11 +7175,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 다음 PTO 가 마지막 프로브를 보낸 때부터 두 배를 기다리는지.
-     * @details 원래 패킷은 확인을 받으려고 남겨 두므로, 가장 오래된 패킷의 나이로 재면 프로브를
-     *          보낸 직후에도 데드라인이 이미 지나 있어 PTO 마다 프로브가 몰려 나간다.
-     */
+    /// The original packets stay for acknowledgment, so measuring from the oldest one's age would
+    /// put the deadline in the past right after a probe and send probes on every PTO.
     fn next_pto_waits_twice_as_long_after_the_latest_probe() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7894,11 +7214,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 혼잡 윈도우가 차 있어도 PTO 프로브가 나가는지.
-     * @details PTO 는 원래 패킷을 흐르는 양에 남겨 둔다. 프로브까지 윈도우에 막히면 윈도우는
-     *          확인이 와야 열리는데 확인은 프로브가 가야 오므로 회복이 멈춘다.
-     */
+    /// A PTO leaves the original packets in flight. A probe blocked by the window would stall
+    /// recovery: the window opens only on acknowledgments, which come only after a probe goes out.
     fn probe_is_sent_when_congestion_window_is_full() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7922,12 +7239,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 시간 기준 손실을 새 확인 없이 타이머로 판정하는지.
-     * @details 뒤에 보낸 패킷이 확인됐지만 앞의 패킷이 아직 시간 기준에 못 미치면, 그 시각에
-     *          다시 확인해야 한다. 판정을 확인이 올 때만 하면 다음 확인이 없는 한 PTO 까지
-     *          기다리게 된다.
-     */
+    /// When a later packet is acknowledged but an earlier one has not reached the time threshold,
+    /// it must be checked again at that time; deciding only on ACKs would wait for the PTO unless
+    /// another ACK comes.
     fn time_threshold_loss_fires_without_another_ack() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -7973,11 +7287,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크가 확정되면 양쪽이 Initial 과 Handshake 공간을 버리는지.
-     * @details 남겨 두면 끝난 핸드셰이크의 재전송이 응용 데이터보다 먼저 PTO 를 차지하고,
-     *          키와 재조립 버퍼가 연결 수명 내내 메모리에 남는다.
-     */
+    /// Kept, retransmissions of the finished handshake would take the PTO ahead of application
+    /// data, and keys and reassembly buffers would stay for the connection's lifetime.
     fn confirmed_handshake_discards_initial_and_handshake_spaces() {
         let (client, server) = established_doq_pair();
         for conn in [&client, &server] {
@@ -7993,7 +7304,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 늦게 온 Initial 이 버린 키를 되살리지 않는지. */
     fn late_initial_does_not_restore_discarded_keys() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -8020,11 +7330,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 풀 수 없는 긴 헤더 패킷 뒤에 합쳐진 패킷을 계속 처리하는지.
-     * @details Initial 공간을 버린 뒤에도 상대는 Initial 과 다른 패킷을 한 데이터그램에 합쳐
-     *          보낼 수 있다. 앞 패킷에서 처리를 멈추면 뒤에 붙은 패킷까지 잃는다.
-     */
+    /// Even after the Initial space is dropped, the peer may coalesce an Initial with other
+    /// packets; stopping at the first would lose the ones after it.
     fn packet_after_undecryptable_long_packet_is_processed() {
         let (mut client, mut server) = established_doq_pair();
         deliver_query(&mut client, &mut server, 0);
@@ -8051,11 +7358,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크가 끝난 클라이언트가 Retry 를 무시하는지.
-     * @details Handshake 키를 버린 뒤에도 Retry 를 받으면 연결이 ClientHello 부터 다시
-     *          시작한다. RFC 9000 은 서버의 Initial 을 처리한 뒤의 Retry 를 버리게 한다.
-     */
+    /// Accepting a Retry after the Handshake keys are gone would restart the connection from the
+    /// ClientHello. RFC 9000 drops a Retry once a server Initial has been processed.
     fn retry_after_handshake_is_ignored() {
         let (mut client, _server) = established_doq_pair();
         let remote_before = client.remote_connection_id().to_vec();
@@ -8068,7 +7372,8 @@ mod tests {
         assert!(!client.is_closed());
     }
 
-    /** @brief 이 연결의 Initial 송신 키로 PING 하나만 담아 최소 크기로 채운 Initial 데이터그램. */
+    /// An Initial datagram, padded to the minimum, carrying only PING under this connection's
+    /// Initial send keys.
     fn ping_initial(sender: &Connection, dcid: &[u8], scid: &[u8], pn: u64) -> Vec<u8> {
         let (aead, keys) = sender.spaces[INITIAL]
             .send_keys
@@ -8091,13 +7396,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 첫 Initial 뒤에 다른 출발지 식별자로 온 Initial 을 버리는지.
-     * @details RFC 9000 은 목적지를 상대의 첫 Initial 로만 정하고 그런 Initial 은 버리게 한다.
-     *          Initial 키는 목적지 식별자만 알면 만들 수 있어서, 받아들이면 지어낸 패킷 하나로
-     *          이쪽이 보내는 목적지가 바뀐다. 서버의 Initial 을 처리한 클라이언트는 Retry 도
-     *          버려야 한다.
-     */
+    /// Anyone who knows the destination ID can derive Initial keys, so accepting it would let one
+    /// forged packet redirect this side's traffic. A client that processed a server Initial must
+    /// drop a Retry as well.
     fn later_initial_with_another_source_id_is_discarded() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -8145,19 +7446,17 @@ mod tests {
         assert!(client.retry_scid.is_none());
     }
 
-    /** @brief 순번마다 다른 8 바이트 식별자. 상대 연결은 같은 길이로 짧은 헤더를 읽는다. */
+    /// 8 bytes, distinct per sequence; the peer reads short headers with the same length.
     fn issued_cid(sequence: u64) -> Vec<u8> {
         let mut cid = b"PEERCID".to_vec();
         cid.push(sequence as u8);
         cid
     }
 
-    /** @brief 순번마다 다른 재설정 토큰. */
     fn issued_token(sequence: u64) -> [u8; 16] {
         [0x40 | sequence as u8; 16]
     }
 
-    /** @brief issued_cid 와 issued_token 을 담은 NEW_CONNECTION_ID. */
     fn new_cid(sequence: u64, retire_prior_to: u64) -> Frame {
         Frame::NewConnectionId {
             sequence,
@@ -8167,7 +7466,6 @@ mod tests {
         }
     }
 
-    /** @brief 클라이언트가 1-RTT 패킷에 실어 보낸 프레임들을 서버가 받는다. */
     fn deliver_frames(
         client: &mut Connection,
         server: &mut Connection,
@@ -8177,18 +7475,14 @@ mod tests {
         server.recv_datagram(&datagram)
     }
 
-    /** @brief 서버가 아직 살려 둔 상대 식별자의 순번들. */
     fn peer_sequences(conn: &Connection) -> Vec<u64> {
         conn.peer_cids.iter().map(|known| known.sequence).collect()
     }
 
     #[test]
-    /**
-     * @brief 상대가 retire_prior_to 로 버리라고 한 식별자를 버리고 목적지를 옮기는지.
-     * @details RFC 9000 은 그 식별자를 더 쓰지 말고 RETIRE_CONNECTION_ID 로 알리게 한다. 계속
-     *          쓰면 상대는 그 식별자로 온 패킷을 받지 못하고, 재설정 토큰도 버린 식별자의 것으로는
-     *          확인하지 못하게 한다. 버린 순번으로 늦게 온 식별자는 받자마자 버린다고 알린다.
-     */
+    /// RFC 9000 says to stop using such an ID and send RETIRE_CONNECTION_ID. Using it would send
+    /// packets the peer no longer accepts, and a reset token is not checked against a retired ID.
+    /// An ID arriving late with a retired sequence is retired at once.
     fn peer_connection_ids_are_retired_as_the_peer_asks() {
         let (mut client, mut server) = established_doq_pair();
         assert_eq!(peer_sequences(&server), [0]);
@@ -8259,12 +7553,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 0-RTT 패킷에 실을 수 있는 연결 식별자와 경로 프레임을 RFC 9000 대로 가르는지.
-     * @details NEW_CONNECTION_ID 와 PATH_CHALLENGE 는 0-RTT 에도 실을 수 있다. RETIRE_CONNECTION_ID
-     *          는 0-RTT 에 실을 수 없어 프로토콜 위반으로 처리해도 되고, Initial 과 Handshake
-     *          패킷에는 어느 쪽도 실을 수 없다.
-     */
+    /// NEW_CONNECTION_ID and PATH_CHALLENGE may travel in 0-RTT. RETIRE_CONNECTION_ID may not, and
+    /// receiving it there may be treated as a protocol violation; none of them may appear in
+    /// Initial or Handshake packets.
     fn zero_rtt_carries_connection_id_and_path_challenge_frames() {
         let (_client, mut server) = established_doq_pair();
         let allowed = encode_frames(&[Frame::PathChallenge([7; 8]), new_cid(1, 0)]);
@@ -8288,11 +7579,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 길이 0 식별자로 보내는 쪽이 NEW_CONNECTION_ID 를 거부하는지.
-     * @details RFC 9000 은 길이 0 목적지 식별자로 보내는 쪽이 이 프레임을 받으면 반드시
-     *          PROTOCOL_VIOLATION 으로 처리하게 한다.
-     */
+    /// RFC 9000 requires PROTOCOL_VIOLATION when a sender using a zero-length destination ID
+    /// receives this frame.
     fn new_connection_id_is_refused_by_a_zero_length_sender() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -8314,7 +7602,6 @@ mod tests {
         );
     }
 
-    /** @brief 테스트용 선호 주소. */
     fn preferred_address(cid: &[u8]) -> crate::params::PreferredAddress {
         crate::params::PreferredAddress {
             ipv4: "192.0.2.1:853".parse().unwrap(),
@@ -8325,11 +7612,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버의 선호 주소에 실린 식별자를 순번 1 로 세는지.
-     * @details 그 식별자도 상대가 준 식별자라서 이쪽 상한에 든다. 빼고 세면 상한을 넘긴 서버를
-     *          알아채지 못한다. 같은 식별자를 NEW_CONNECTION_ID 로 다시 알리는 것은 오류가 아니다.
-     */
+    /// That ID is issued by the peer too and counts toward this side's limit; leaving it out would
+    /// miss a server over the limit. Announcing the same ID again with NEW_CONNECTION_ID is not an
+    /// error.
     fn preferred_address_connection_id_counts_as_sequence_one() {
         let mut tp = TransportParams::server_defaults();
         tp.preferred_address = Some(preferred_address(b"PREFERID"));
@@ -8363,11 +7648,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 선호 주소를 잘못 알린 상대를 TRANSPORT_PARAMETER_ERROR 로 거부하는지.
-     * @details RFC 9000 은 선호 주소를 서버만 보낼 수 있고, 길이 0 식별자를 고른 서버는 보낼 수
-     *          없다고 정한다.
-     */
+    /// RFC 9000 lets only a server send a preferred address, and not one using a zero-length
+    /// connection ID.
     fn misplaced_preferred_address_is_a_transport_parameter_error() {
         let mut client_tp = TransportParams::server_defaults();
         client_tp.preferred_address = Some(preferred_address(b"PREFERID"));
@@ -8414,11 +7696,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 길이 0인 연결 식별자를 쓰는 클라이언트와 질의를 주고받는지.
-     * @details 서버는 그런 클라이언트에게 목적지 식별자 없이 짧은 헤더 패킷을 보내고, 전송
-     *          파라미터의 initial_source_connection_id 도 길이 0으로 맞춰 본다.
-     */
+    /// The server sends such a client short header packets with no destination ID and checks
+    /// initial_source_connection_id as zero length.
     fn client_with_zero_length_connection_id_exchanges_query() {
         let mut server = Connection::new_server(
             server_cfg(vec![b"doq".to_vec()]),
@@ -8447,7 +7726,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 유휴 데드라인에 연결이 닫히고 남은 출력이 버려지는지. */
     fn negotiated_idle_timeout_closes_and_discards_pending_output() {
         let mut tp = TransportParams::server_defaults();
         tp.max_idle_timeout = 100;
@@ -8469,14 +7747,12 @@ mod tests {
         assert!(conn.pending_stream_sends.is_empty());
     }
 
-    /** @brief 세션 재개를 지원하는 테스트용 서버 설정. */
     fn server_cfg_resumable(res: &onetdns_tls::conn::ServerResumption) -> Arc<ServerConfig> {
         let mut config = server_cfg(vec![b"doq".to_vec()]);
         Arc::make_mut(&mut config).resumption = Some(res.clone());
         config
     }
 
-    /** @brief 재개에 쓸 세션 티켓을 하나 받아 온다. */
     fn obtain_session(res: &onetdns_tls::conn::ServerResumption) -> onetdns_tls::TlsSession {
         let mut server = Connection::new_server(
             server_cfg_resumable(res),
@@ -8498,7 +7774,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격 밖 길이의 연결 식별자를 거부하는지. */
     fn constructors_reject_unsupported_connection_id_lengths() {
         let client = Connection::new_client(
             client_cfg(vec![b"doq".to_vec()]),
@@ -8517,7 +7792,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조기 데이터 질의가 핸드셰이크 완료 전에 전달되는지. 왕복 하나를 아낀다. */
     fn zero_rtt_query_delivered_before_handshake_completes() {
         let mut res = onetdns_tls::conn::ServerResumption::secure_default();
         res.max_early_data = 0xffff_ffff;
@@ -8577,7 +7851,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조기 데이터가 거부되면 핸드셰이크 뒤 다시 보내지는지. */
     fn zero_rtt_rejected_replays_in_1rtt() {
         let mut res_a = onetdns_tls::conn::ServerResumption::secure_default();
         res_a.max_early_data = 0xffff_ffff;
@@ -8621,13 +7894,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Retry 를 받은 클라이언트가 패킷 번호를 이어 쓰고 조기 데이터를 바로 다시 보내는지.
-     * @details RFC 9000 은 Retry 뒤에 어느 번호 공간의 패킷 번호도 되돌리지 못하게 한다. 0-RTT 키는
-     *          Retry 로 바뀌지 않으므로 번호를 되돌리면 다른 내용이 같은 nonce 로 보호된다.
-     *          Retry 를 보낸 서버는 앞서 받은 0-RTT 를 버렸으므로, 손실 판정을 기다리면 질의가
-     *          PTO 만큼 늦는다.
-     */
+    /// RFC 9000 forbids rolling back packet numbers in any space after a Retry; 0-RTT keys survive
+    /// a Retry, so a rollback would protect different content with the same nonce. A server that
+    /// sent a Retry dropped its 0-RTT, so waiting for loss detection would delay the query by a
+    /// PTO.
     fn retry_keeps_packet_numbers_and_resends_early_data() {
         use crate::retry::{build_retry, parse_initial_header, RetryKey};
 
@@ -8682,7 +7952,7 @@ mod tests {
         );
         for (space, first_unused) in [INITIAL, APP].into_iter().zip(used) {
             let state = &server.spaces[space];
-            /* recv_mask 의 비트 i 는 largest_recv - i 번 패킷이다. */
+            // Bit i of recv_mask is packet largest_recv - i.
             let lowest = state.largest_recv.map(|largest| {
                 largest - u64::from(u128::BITS - 1 - state.recv_mask.leading_zeros())
             });
@@ -8702,7 +7972,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조기 데이터 없이 재개만 하는 경우. */
     fn resumed_connection_without_early_data() {
         let res = onetdns_tls::conn::ServerResumption::secure_default();
         let session = obtain_session(&res);

@@ -1,12 +1,9 @@
-/*!
- * @brief Raft RPC 전송: 인증·암호화된 노드 간 통신.
- *
- * @details 프레임마다 XChaCha20-Poly1305로 봉인하고 발신자 ID를 AAD에 넣는다. 그래서
- *          어떤 노드도 다른 노드를 사칭할 수 없고, 메시지 안의 리더·후보 필드는 인증된
- *          발신자와 대조된다.
- * @warning 클러스터 비밀이 곧 인증의 전부다. 노출되면 아무나 클러스터에 합류해 설정을
- *          복제 경로로 주입할 수 있다.
- */
+//! Raft RPC transport over authenticated, encrypted frames. Each frame is sealed with
+//! XChaCha20-Poly1305 with the sender ID in the AAD, so no node can impersonate another, and leader
+//! and candidate fields in a message are checked against the authenticated sender.
+//!
+//! The cluster secret is the whole of the authentication: whoever has it can join the cluster and
+//! inject configuration through replication.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -28,103 +25,71 @@ use crate::raft::{
     SNAPSHOT_CHUNK_BYTES,
 };
 
-/** @brief XChaCha20 논스 길이. 세션 식별자와 일련번호를 함께 담는다. */
+/// Holds the session ID and the sequence number.
 const RAFT_NONCE_LEN: usize = 24;
 
-/** @brief Poly1305 인증 태그 길이. */
 const RAFT_AEAD_TAG_LEN: usize = 16;
 
-/** @brief Ed25519 서명 길이. 노드 신원 증명에 쓴다. */
 const RAFT_SIG_LEN: usize = 64;
 
-/** @brief 프레임 크기 상한. 스냅숏 조각도 이 안에 들어간다. */
+/// Snapshot chunks fit inside it too.
 const MAX_RAFT_FRAME: usize = 1024 * 1024;
 
-/** @brief 동시에 받아들일 클러스터 연결 수. */
 const MAX_RAFT_CONNECTIONS: usize = 64;
 
-/** @brief 한 출발지 IP가 열 수 있는 연결 수. 한 노드가 슬롯을 다 차지하지 못하게 한다. */
+/// So one node cannot take every slot.
 const MAX_RAFT_CONNS_PER_IP: usize = 8;
 
-/** @brief 한 메시지에 담긴 로그 항목 수의 수신 상한. */
 const MAX_RAFT_ENTRIES: usize = 4096;
 
-/** @brief 로그 항목 하나의 수신 크기 상한. */
 const MAX_RAFT_ENTRY_BYTES: usize = 256 * 1024;
 
-/** @brief 노드별 송신 큐 길이. 넘치면 오래된 메시지를 버린다. 심박은 최신만 의미가 있다. */
+/// When full, the oldest messages are dropped: only the latest heartbeat matters.
 const PEER_QUEUE: usize = 256;
 
-/** @brief 제안 큐 길이. */
 const PROPOSAL_QUEUE: usize = 64;
 
-/**
- * @brief 제안을 모아 한 번에 처리할 시간 구간.
- * @details 짧게 잡아야 지연이 안 늘고, 그래도 이 구간 안에 들어온 제안은 fsync 한 번을 나눠 쓴다.
- */
+/// Short enough not to add latency; proposals arriving within it share one fsync.
 const PROPOSAL_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
-/** @brief 로그 항목 하나의 와이어 부가 길이: 임기 8 + 인덱스 8 + 길이 4. */
+/// Term (8), index (8) and length (4).
 const LOG_ENTRY_WIRE_OVERHEAD: usize = 8 + 8 + 4;
 
-/** @brief 제안이 커밋되기를 기다릴 시간. */
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/** @brief 프레임 하나를 다 읽을 때까지 기다릴 시간. */
 const RAFT_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/**
- * @brief 프레임 형식 버전.
- * @warning 머리의 배치나 봉한 본문의 배치를 바꾸면 올린다. 번호가 다른 프레임은 인증하기 전에
- *          버리므로, 번호가 다른 노드끼리는 서로의 제품 버전도 알 수 없다.
- */
+/// Bump when the header or sealed body layout changes. Frames with another number are dropped
+/// before authentication, so nodes on different numbers cannot even see each other's product
+/// version.
 const RAFT_FRAME_VERSION: u8 = 2;
 
-/**
- * @brief 봉한 본문 앞에 싣는 제품 버전의 최대 길이.
- * @details 길이를 1바이트로 적으므로 255를 넘을 수 없다. 버전 문자열은 이보다 훨씬 짧다.
- */
+/// The length is one byte, so it cannot exceed 255.
 const MAX_PRODUCT_VERSION_LEN: usize = 64;
 
-/**
- * @brief 재생 방어 구간의 폭(비트).
- * @details 순서가 뒤바뀐 프레임을 이 폭만큼은 받아 준다. 구간이 없으면 네트워크 재정렬만으로
- *          정상 프레임이 버려진다.
- */
+/// Frames reordered within this many sequence numbers are still accepted; without a window, network
+/// reordering alone would drop good frames.
 const REPLAY_WINDOW_BITS: u64 = 128;
 
-/** @brief 재생으로 거부한 프레임 수. 진단 지표로 노출된다. */
 static REPLAY_REJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/**
- * @brief 노드 하나에 대한 재생 방어 상태.
- * @details 세션이 바뀌면(상대가 재시작하면) 구간을 새로 연다. 같은 세션 안에서는 일련번호와
- *          비트맵으로 이미 본 프레임을 걸러 낸다.
- */
+/// A new session (the peer restarted) opens a fresh window; within a session the sequence number
+/// and bitmap filter out frames already seen.
 #[derive(Debug, Clone, Copy)]
 struct PeerReplayWindow {
-    /** @brief 이 상대의 현재 epoch. */
     session: [u8; 16],
-    /** @brief 그 epoch에서 본 가장 큰 일련번호. */
     highest_sequence: u64,
-    /** @brief 그 언저리에서 무엇을 봤는지 나타내는 비트. */
     seen_bitmap: u128,
 }
 
-/** @brief 노드별 재생 방어 구간 모음. */
 #[derive(Default)]
 struct ReplayCache {
-    /** @brief 상대별 재사용 방지 상태. */
     peers: HashMap<NodeId, PeerReplayWindow>,
 }
 
 impl ReplayCache {
-    /**
-     * @brief 이 논스를 처음 보는지 판정하고 구간을 갱신한다.
-     * @warning 재생을 허용하면 이전 AppendEntries를 다시 밀어 넣어 커밋된 로그를 되돌릴 수
-     *          있다. 창보다 오래된 것과 이미 본 것은 모두 거부한다.
-     * @return 받아들일 프레임이면 true.
-     */
+    /// Allowing a replay would let an old AppendEntries be pushed again and roll back committed
+    /// entries, so anything older than the window or already seen is rejected.
     fn accept(&mut self, sender: NodeId, nonce: [u8; RAFT_NONCE_LEN]) -> bool {
         let mut session = [0u8; 16];
         session.copy_from_slice(&nonce[..16]);
@@ -178,10 +143,8 @@ impl ReplayCache {
     }
 }
 
-/** @brief 이 Raft 런타임이 시작한 스레드 목록. 종료 시 전부 합류시킨다. */
 type RuntimeThreads = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
 
-/** @brief 스레드를 추적 목록에 넣는다. */
 fn track_thread(threads: &RuntimeThreads, thread: std::thread::JoinHandle<()>) {
     let mut guard = lock(threads);
 
@@ -189,10 +152,8 @@ fn track_thread(threads: &RuntimeThreads, thread: std::thread::JoinHandle<()>) {
     guard.push(thread);
 }
 
-/**
- * @brief 추적 중인 스레드를 전부 합류시킨다.
- * @note 재로드 때 반드시 끝나야 한다. 남으면 다음 세대가 같은 포트를 열지 못한다.
- */
+/// Must finish on reload: a thread left behind keeps the next generation from opening the same
+/// port.
 fn join_threads(threads: &RuntimeThreads) {
     loop {
         let batch = {
@@ -208,28 +169,21 @@ fn join_threads(threads: &RuntimeThreads) {
     }
 }
 
-/**
- * @brief 시작 중 실패했을 때 이미 뜬 스레드를 정리하는 가드.
- * @details 성공 시 disarm으로 무장을 푼다. 그러지 않으면 정상 시작에서도 정리가 돈다.
- */
+/// Cleans up threads already started when startup fails. Call `disarm` on success, or cleanup runs
+/// after a good start too.
 struct RuntimeStartupGuard {
-    /** @brief 시작한 것들에 끝나라고 알릴 표시. */
     shutdown: Arc<AtomicBool>,
-    /** @brief 시작한 스레드들. */
     threads: RuntimeThreads,
-    /** @brief 끝까지 잘 떴는지. 그러면 정리하지 않는다. */
     armed: bool,
 }
 
 impl RuntimeStartupGuard {
-    /** @brief 시작에 성공했음을 알려 정리를 건너뛰게 한다. */
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
 impl Drop for RuntimeStartupGuard {
-    /** @brief 정리한다. */
     fn drop(&mut self) {
         if self.armed {
             self.shutdown.store(true, Ordering::Relaxed);
@@ -238,12 +192,10 @@ impl Drop for RuntimeStartupGuard {
     }
 }
 
-/** @brief 빅엔디언 64비트를 덧붙인다. */
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-/** @brief 빅엔디언 64비트를 읽는다. 범위를 넘으면 None. */
 fn get_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     let end = pos.checked_add(8)?;
     let slice = bytes.get(*pos..end)?;
@@ -251,7 +203,6 @@ fn get_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     Some(u64::from_be_bytes(slice.try_into().ok()?))
 }
 
-/** @brief 빅엔디언 32비트를 읽는다. */
 fn get_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
     let end = pos.checked_add(4)?;
     let slice = bytes.get(*pos..end)?;
@@ -259,12 +210,12 @@ fn get_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
     Some(u32::from_be_bytes(slice.try_into().ok()?))
 }
 
-/** @brief Raft 메시지를 와이어 바이트로 만든다. 표현할 수 없으면 빈 결과다. */
+/// Empty when the message cannot be represented.
 pub fn encode_msg(message: &Msg) -> Vec<u8> {
     try_encode_msg(message).unwrap_or_default()
 }
 
-/** @brief 메시지 인코딩. 크기 상한을 넘기면 None이다. */
+/// `None` over the size limits.
 fn try_encode_msg(message: &Msg) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match message {
@@ -364,12 +315,9 @@ fn try_encode_msg(message: &Msg) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/**
- * @brief 와이어 바이트를 Raft 메시지로 해석한다.
- * @warning 인증된 프레임에서 나온 바이트지만 여전히 신뢰할 수 없다. 클러스터 비밀을 가진
- *          노드가 결함이 있거나 침해됐을 수 있다. 항목 수·크기 상한을 모두 검사하고,
- *          잔여 바이트가 남으면 거부한다.
- */
+/// The bytes come from an authenticated frame but are still untrusted: a node holding the cluster
+/// secret may be faulty or compromised. Every count and size limit is checked and trailing bytes
+/// are rejected.
 pub fn decode_msg(bytes: &[u8]) -> Option<Msg> {
     if bytes.len() > MAX_RAFT_FRAME {
         return None;
@@ -501,19 +449,14 @@ pub fn decode_msg(bytes: &[u8]) -> Option<Msg> {
 }
 
 #[derive(Clone)]
-/**
- * @brief 상태 기계가 내보낸 메시지를 노드별 송신 스레드로 나눠 보낸다.
- * @details 노드마다 큐와 스레드를 따로 둔다. 하나로 묶으면 느린 노드 하나가 다른 노드로
- *          가는 심박까지 막는다.
- */
+/// One queue and thread per node: with a single one, a slow node would also hold up heartbeats to
+/// the others.
 struct Dispatcher {
-    /** @brief 노드마다 보낼 것을 넣는 곳. */
     senders: Arc<HashMap<NodeId, SyncSender<Msg>>>,
 }
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
-    /** @brief 노드마다 송신 스레드를 시작하고 분배기를 만든다. */
     fn new(
         self_id: NodeId,
         version: &'static str,
@@ -559,11 +502,8 @@ impl Dispatcher {
         })
     }
 
-    /**
-     * @brief 메시지를 해당 노드 큐에 넣는다.
-     * @note 큐가 가득 차면 버린다. Raft는 메시지 유실을 전제로 설계돼 있어 재시도가
-     *       내장돼 있고, 여기서 기다리면 상태 기계 잠금을 잡은 채 막힌다.
-     */
+    /// A full queue drops the message: Raft already expects lost messages and retries, while
+    /// waiting here would block with the state machine lock held.
     fn dispatch(&self, outputs: Vec<Output>) {
         for output in outputs {
             let Some(sender) = self.senders.get(&output.to) else {
@@ -589,13 +529,9 @@ impl Dispatcher {
     }
 }
 
-/**
- * @brief 들어온 클러스터 연결을 받지 않았음을 알린다.
- * @details 노드가 아닌 곳에서 오는 접속은 잘못된 설정이거나 이 포트를 훑는 것이다. 어느
- *          쪽이든 알아야 한다. 계속 들어올 수 있어 2의 거듭제곱 번째만 남긴다.
- */
+/// Connections from non-nodes are a misconfiguration or a port scan; either way the operator should
+/// know. They can keep coming, so only every power-of-two rejection is logged.
 fn reject_raft_connection(ip: IpAddr, reason: &str) {
-    /** @brief 누적 거절 수. */
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -604,11 +540,8 @@ fn reject_raft_connection(ip: IpAddr, reason: &str) {
 }
 
 #[allow(clippy::too_many_arguments)]
-/**
- * @brief 노드 하나로 가는 송신 루프.
- * @details 연결이 끊기면 다시 맺으며 계속 시도한다. 프레임마다 봉인하고, 논스에 세션
- *          접두사와 증가하는 일련번호를 담아 상대의 재생 방어가 동작하게 한다.
- */
+/// Reconnects whenever the connection drops. The nonce carries the session prefix and an increasing
+/// sequence number so the peer's replay defence works.
 fn peer_sender(
     self_id: NodeId,
     version: &'static str,
@@ -700,24 +633,18 @@ fn peer_sender(
     }
 }
 
-/**
- * @brief 노드마다 인증을 통과한 프레임에서 알게 된 것: 마지막으로 받은 시각과 그 노드의 제품 버전.
- * @details 클러스터 프레임은 한 방향으로만 흐르고 응답도 별도 프레임으로 오므로, 요청과
- *          응답을 짝지어 왕복 시간을 측정할 수 없다. 대신 서명과 암호를 모두 통과한 프레임을
- *          받았다는 사실은 그 노드가 살아 있고 같은 클러스터 키를 쓴다는 증거가 된다. 버전이 달라
- *          버린 프레임도 인증은 통과했으므로 함께 적는다.
- */
+/// Frames flow one way and replies come as separate frames, so round-trip time cannot be measured.
+/// A frame that passed signature and decryption still proves the node is alive and uses the same
+/// cluster key. Frames dropped for a version mismatch passed authentication too and are recorded as
+/// well.
 struct PeerContact {
-    /** @brief 시각을 측정할 기준점. */
     origin: Instant,
-    /** @brief 노드별 마지막 수신 시각. 기준점부터 지난 밀리초에 1을 더한 값이고, 0은 받은 적 없음이다. */
+    /// Milliseconds since `origin` plus one; 0 means never.
     last: HashMap<NodeId, AtomicU64>,
-    /** @brief 노드별로 마지막에 받은 프레임의 제품 버전. 받은 적이 없으면 없다. */
     versions: HashMap<NodeId, Mutex<Option<String>>>,
 }
 
 impl PeerContact {
-    /** @brief 설정된 노드마다 빈 기록을 만든다. */
     fn new(peers: &HashMap<NodeId, String>) -> Self {
         Self {
             origin: Instant::now(),
@@ -726,10 +653,7 @@ impl PeerContact {
         }
     }
 
-    /**
-     * @brief 이 노드가 보낸 프레임의 제품 버전을 적는다.
-     * @return 적어 둔 버전과 달라졌으면 참이다. 처음 받은 것도 달라진 것으로 본다.
-     */
+    /// Returns true when the version differs from the recorded one, including on the first frame.
     fn note_version(&self, from: NodeId, version: &str) -> bool {
         let Some(slot) = self.versions.get(&from) else {
             return false;
@@ -742,12 +666,10 @@ impl PeerContact {
         true
     }
 
-    /** @brief 이 노드에게서 마지막으로 받은 제품 버전. */
     fn version(&self, peer: NodeId) -> Option<String> {
         lock(self.versions.get(&peer)?).clone()
     }
 
-    /** @brief 이 노드에게서 방금 프레임을 받았다고 적는다. */
     fn record(&self, from: NodeId) {
         if let Some(slot) = self.last.get(&from) {
             let elapsed = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -755,10 +677,6 @@ impl PeerContact {
         }
     }
 
-    /**
-     * @brief 이 노드에게서 마지막으로 받은 뒤 지난 시간.
-     * @return 받은 적이 없으면 없다.
-     */
     fn since(&self, peer: NodeId) -> Option<Duration> {
         let stamp = self.last.get(&peer)?.load(Ordering::Relaxed);
         let at = Duration::from_millis(stamp.checked_sub(1)?);
@@ -767,58 +685,37 @@ impl PeerContact {
 }
 
 #[derive(Clone)]
-/**
- * @brief 실행 중인 Raft 런타임을 가리키는 핸들.
- * @details 데이터 평면이 이걸로 설정 변경을 제안하고 리더 여부를 확인한다.
- */
+/// The data plane proposes config changes and checks leadership through this.
 pub struct RaftHandle {
-    /** @brief 합의 상태. */
     node: Arc<Mutex<RaftNode>>,
-    /** @brief 노드마다의 주소. */
     peers: Arc<HashMap<NodeId, String>>,
-    /** @brief 노드마다 마지막으로 프레임을 받은 시각. */
     contact: Arc<PeerContact>,
-    /**
-     * @brief 이 시간 안에 프레임을 받았으면 살아 있다고 본다.
-     * @details 팔로워가 선거를 시작하는 가장 긴 대기 시간과 같다.
-     */
+    /// A frame within this time means the peer is alive. Equal to the longest wait before a
+    /// follower starts an election.
     contact_window: Duration,
-    /** @brief 이 노드 번호. */
     self_id: NodeId,
-    /** @brief 이 노드의 제품 버전. */
     version: &'static str,
-    /** @brief 끝나라는 표시. */
     shutdown: Arc<AtomicBool>,
-    /** @brief 적용 진도와 그것을 기다리는 곳. */
     progress: Arc<(Mutex<u64>, Condvar)>,
-    /** @brief 새 제안을 받는지. */
     accepting_proposals: Arc<AtomicBool>,
-    /** @brief 제안을 넣는 곳. */
     proposal_tx: SyncSender<ProposalRequest>,
-    /** @brief 아직 답을 못 준 제안 수. */
     pending_proposals: Arc<AtomicUsize>,
-    /** @brief 시작한 스레드들. */
     threads: RuntimeThreads,
 }
 
-/** @brief 제안 하나와 결과를 돌려줄 채널. */
 struct ProposalRequest {
-    /** @brief 제안할 명령. */
     data: Vec<u8>,
-    /** @brief 결과를 돌려줄 곳. */
     response: mpsc::Sender<Result<(u64, u64), String>>,
 }
 
-/** @brief 진행 중인 제안 수를 세는 RAII 가드. 실패 경로에서도 반드시 줄어든다. */
+/// Counts a proposal in flight and releases it on every path, failures included.
 struct PendingProposal {
-    /** @brief 아직 끝나지 않은 제안 수. */
     count: Arc<AtomicUsize>,
-    /** @brief 마지막 제안이 끝날 때 apply 스레드를 깨울 진행 신호. */
     progress: Arc<(Mutex<u64>, Condvar)>,
 }
 
 impl Drop for PendingProposal {
-    /** @brief 제안 수를 돌려주고 마지막이면 apply 스레드를 깨운다. */
+    /// The last one wakes the apply thread.
     fn drop(&mut self) {
         if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             signal_progress(&self.progress);
@@ -826,11 +723,8 @@ impl Drop for PendingProposal {
     }
 }
 
-/**
- * @brief 제안을 모아 한 번에 로그에 올리는 작업 스레드.
- * @details 짧은 시간 구간 안에 들어온 제안을 묶는다. 제안마다 fsync하면 처리량이 디스크
- *          지연에 그대로 묶이므로, 구간 하나에 fsync 한 번을 나눠 쓴다.
- */
+/// Batches proposals that arrive within a short window into one log append: an fsync per proposal
+/// would tie throughput to disk latency.
 fn run_proposal_worker(
     receiver: Receiver<ProposalRequest>,
     node: Arc<Mutex<RaftNode>>,
@@ -906,33 +800,27 @@ fn run_proposal_worker(
     }
 }
 
-/**
- * @brief 노드 서명 키 시드에서 공개 키를 구한다.
- * @details 다른 노드의 cluster_raft_peers 에는 이 공개 키를 적어야 한다. 운영자가 외부 도구
- *          없이 확인할 수 있도록 관리 API가 이 값을 보여 준다.
- */
+/// Other nodes list this key in `cluster_raft_peers`; the management API shows it so operators need
+/// no external tool.
 pub fn node_public_key(seed: &[u8; 32]) -> [u8; 32] {
     SigningKey::from_bytes(seed).verifying_key().to_bytes()
 }
 
-/**
- * @brief 제안이 실패한 방식.
- * @details 부른 쪽이 제안과 함께 바꾼 자기 상태를 어떻게 다룰지가 여기에 달렸다. 로그에
- *          들어간 항목은 기다리다 포기해도 나중에 커밋될 수 있으므로, 적용되지 않는다고
- *          답하면 거짓이 된다.
- */
+/// The caller decides from this what to do with state it changed alongside the proposal. An entry
+/// in the log may still commit after the caller gave up waiting, so answering that it will not
+/// apply would be false.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposalError {
-    /** @brief 로그에 들어가지 않았다. 적용되지 않는다. */
+    /// Never entered the log; will not apply.
     Rejected(String),
-    /** @brief 로그에 들어갔지만 리더 교체로 다른 항목에 덮였다. 적용되지 않는다. */
+    /// Entered the log but was overwritten after a leader change; will not apply.
     Discarded,
-    /** @brief 로그에 들어갔을 수 있으나 커밋되는지 확인하지 못했다. 나중에 커밋되면 모든 노드에 적용된다. */
+    /// May be in the log, but the commit was not confirmed; if it commits later, every node applies
+    /// it.
     Undetermined(String),
 }
 
 impl std::fmt::Display for ProposalError {
-    /** @brief 사람이 읽을 문구로 적는다. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(reason) | Self::Undetermined(reason) => f.write_str(reason),
@@ -942,17 +830,14 @@ impl std::fmt::Display for ProposalError {
 }
 
 impl From<ProposalError> for String {
-    /** @brief 문구만 필요한 쪽을 위해 문자열로 바꾼다. */
     fn from(error: ProposalError) -> Self {
         error.to_string()
     }
 }
 
 impl RaftHandle {
-    /**
-     * @brief 항목을 제안하고 커밋될 때까지 기다린다.
-     * @return 커밋된 인덱스. 실패하면 그 항목이 적용될 수 있는지를 함께 알린다.
-     */
+    /// Waits until the entry commits and returns its index. On failure the error says whether the
+    /// entry might still apply.
     pub fn propose(&self, data: Vec<u8>) -> Result<u64, ProposalError> {
         let rejected = |reason: &str| Err(ProposalError::Rejected(reason.to_string()));
         let undetermined = |reason: &str| Err(ProposalError::Undetermined(reason.to_string()));
@@ -991,7 +876,8 @@ impl RaftHandle {
                 return rejected("The Raft proposal handler has stopped");
             }
         }
-        /* 핸들러에 넘긴 뒤로는 로그에 들어갔는지 모른다. 그때부터의 실패는 확정할 수 없다. */
+        // Once handed to the handler it may already be in the log, so any later failure is
+        // undetermined.
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return undetermined("The Raft change request timed out");
         };
@@ -1040,7 +926,6 @@ impl RaftHandle {
         }
     }
 
-    /** @brief 클러스터 현황을 JSON으로 만든다. 제어 API가 그대로 내보낸다. */
     pub fn status_json(&self, backend: &str, listeners: usize) -> String {
         let node = lock(&self.node);
         let role = match node.role() {
@@ -1102,21 +987,18 @@ impl RaftHandle {
         )
     }
 
-    /** @brief 이 노드가 리더인지. 설정 변경을 받을 수 있는지의 판단 기준이다. */
+    /// Only the leader accepts config changes.
     pub fn is_leader(&self) -> bool {
         lock(&self.node).is_leader()
     }
 
-    /** @brief 이 노드가 아는 리더의 번호. 선거 중이면 None. */
+    /// `None` during an election.
     pub fn leader(&self) -> Option<u64> {
         lock(&self.node).leader()
     }
 
-    /**
-     * @brief 런타임을 멈추고 모든 스레드를 합류시킨다.
-     * @note 새 제안을 먼저 막고 진행 중인 것을 마친 뒤 스레드를 멈춘다. 순서를 바꾸면
-     *       응답을 기다리던 제안이 영영 답을 받지 못한다.
-     */
+    /// Stops new proposals first, finishes those in flight, then stops the threads; in another
+    /// order a waiting proposal would never get an answer.
     pub fn shutdown(&self) {
         self.accepting_proposals.store(false, Ordering::Release);
         let deadline = Instant::now() + PROPOSAL_TIMEOUT;
@@ -1153,14 +1035,9 @@ impl RaftHandle {
     }
 }
 
-/**
- * @brief 상대 노드가 살아 있는지 판정한다.
- * @param since     그 노드에게서 마지막으로 프레임을 받은 뒤 지난 시간.
- * @param window    이 시간 안에 받았으면 살아 있다고 본다.
- * @param expected  그 노드가 이쪽으로 꾸준히 보내야 하는지. 리더는 모든 팔로워에게서
- *                  응답을 받고, 팔로워는 리더에게서만 심박을 받는다.
- * @return 받을 까닭이 없는 노드라서 조용한 것이면 알 수 없으므로 없다.
- */
+/// `expected` says whether the peer should be sending to us steadily: the leader hears from every
+/// follower, a follower only from the leader. Returns `None` when a silent peer has no reason to
+/// send, so nothing can be told.
 fn peer_health(since: Option<Duration>, window: Duration, expected: bool) -> Option<bool> {
     match since {
         Some(age) if age <= window => Some(true),
@@ -1169,15 +1046,12 @@ fn peer_health(since: Option<Duration>, window: Duration, expected: bool) -> Opt
     }
 }
 
-/** @brief 포이즌을 복구하며 잠근다. 스레드 하나의 패닉이 클러스터를 멎게 하지 않는다. */
+/// Recovers poisoned locks so one thread's panic does not stall the cluster.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-/**
- * @brief 종료 신호를 확인하며 대기한다.
- * @return 종료가 요청됐으면 true. 잘게 나눠 자므로 반응이 즉각적이다.
- */
+/// Sleeps in short steps so shutdown is noticed promptly. Returns true when shutdown was requested.
 fn wait_for_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
     let deadline = Instant::now().checked_add(duration);
     loop {
@@ -1192,7 +1066,6 @@ fn wait_for_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
     }
 }
 
-/** @brief 적용 진행을 알려 기다리던 제안을 깨운다. */
 fn signal_progress(progress: &Arc<(Mutex<u64>, Condvar)>) {
     let (generation, condition) = &**progress;
     let mut value = lock(generation);
@@ -1200,7 +1073,7 @@ fn signal_progress(progress: &Arc<(Mutex<u64>, Condvar)>) {
     condition.notify_all();
 }
 
-/** @brief IP별 연결 슬롯을 반납한다. 계수가 0이 된 항목은 지워 맵이 커지지 않게 한다. */
+/// Removes entries that reach zero so the map does not grow.
 fn release_ip_slot(per_ip: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) {
     let mut counts = lock(per_ip);
     if let Some(c) = counts.get_mut(&ip) {
@@ -1211,28 +1084,20 @@ fn release_ip_slot(per_ip: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) {
     }
 }
 
-/**
- * @brief 프레임을 암호화하고 복호화하는 것.
- * @warning 보낸 이를 함께 묶어 봉한다. 묶지 않으면 남의 프레임을 그대로 옮겨 붙여
- *          다른 노드인 척할 수 있다.
- */
+/// Seals the sender in with the frame; otherwise someone could relay another node's frame and pass
+/// as that node.
 struct FrameSealer {
-    /** @brief 프레임을 봉하는 것. */
     cipher: Arc<XChaCha20Poly1305>,
-    /** @brief 이 epoch 번호. 재시작하면 바뀐다. */
+    /// Changes on restart.
     session_id: [u8; 16],
-    /** @brief 다음 프레임의 일련번호. */
     sequence: AtomicU64,
-    /** @brief 보낸 이를 증명하는 키. */
     signing_key: Arc<SigningKey>,
-    /** @brief 이 클러스터를 가리키는 값. 다른 클러스터로 옮겨 붙이지 못하게 묶는다. */
+    /// Binds frames to this cluster so they cannot be replayed into another.
     cluster_context: [u8; 32],
-    /** @brief 보내는 노드의 제품 버전. 봉한 본문 앞에 싣는다. */
     version: &'static str,
 }
 
 impl FrameSealer {
-    /** @brief 봉인기를 만든다. 세션 식별자를 추출해 논스 접두사로 쓴다. */
     fn new(
         cipher: Arc<XChaCha20Poly1305>,
         signing_key: Arc<SigningKey>,
@@ -1251,16 +1116,11 @@ impl FrameSealer {
         })
     }
 
-    /**
-     * @brief 메시지를 인증·암호화된 프레임으로 봉인한다.
-     *
-     * @details 발신자 ID를 AAD에 넣는다. 그래서 프레임을 다른 발신자 이름으로 옮겨 붙일
-     *          수 없다. 서명은 그 위에 노드 신원을 한 겹 더 묶는다. 제품 버전은 봉한 본문 앞에
-     *          길이 1바이트와 함께 싣는다. 받는 쪽은 복호화한 뒤에만 버전을 보므로 머리에 둘 까닭이
-     *          없고, 머리에 두면 클러스터 연결을 엿보는 쪽에 빌드 버전이 드러난다.
-     * @note 논스는 세션 식별자 + 증가하는 일련번호다. 무작위가 아니라 결정적이므로,
-     *       같은 세션 안에서 논스가 겹칠 수 없다.
-     */
+    /// The sender ID goes into the AAD so a frame cannot be relabelled with another sender, and the
+    /// signature binds the node identity on top. The product version travels inside the sealed body
+    /// with a one-byte length: the receiver reads it only after decrypting, and in the header it
+    /// would show the build version to anyone watching cluster traffic. The nonce is the session ID
+    /// plus an increasing sequence number, so nonces never repeat within a session.
     fn frame(&self, from: NodeId, to: NodeId, message: &[u8]) -> Option<Vec<u8>> {
         let version_len = u8::try_from(self.version.len()).ok()?;
         let mut plaintext = Vec::with_capacity(1 + self.version.len() + message.len());
@@ -1313,11 +1173,8 @@ impl FrameSealer {
     }
 }
 
-/**
- * @brief 이번 연결의 세션 식별자를 만든다.
- * @details 시작 세션 번호를 접두사로 쓴다. 재시작 뒤에도 번호가 되감기지 않아 이전 세션의
- *          프레임이 새 세션으로 통과하지 못한다.
- */
+/// Uses the starting session number as the prefix, which never rewinds across restarts, so frames
+/// from an earlier session cannot pass in a new one.
 fn new_session_id(session_prefix: u64) -> Option<[u8; 16]> {
     let mut random = [0u8; 8];
     onetdns_core::try_fill_random(&mut random).ok()?;
@@ -1327,11 +1184,8 @@ fn new_session_id(session_prefix: u64) -> Option<[u8; 16]> {
     Some(session)
 }
 
-/**
- * @brief 프레임의 인증 부가 데이터를 만든다.
- * @details 클러스터 문맥과 헤더(버전·발신자·수신자)을 묶는다. 그래서 다른 클러스터나
- *          다른 수신자에게 프레임을 재사용할 수 없다.
- */
+/// Binds the cluster context and the header (version, sender, receiver), so a frame cannot be
+/// reused in another cluster or for another receiver.
 fn frame_aad(cluster_context: &[u8; 32], header: &[u8]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(cluster_context.len() + header.len());
     aad.extend_from_slice(cluster_context);
@@ -1339,20 +1193,14 @@ fn frame_aad(cluster_context: &[u8; 32], header: &[u8]) -> Vec<u8> {
     aad
 }
 
-/**
- * @brief 제품 버전으로 쓸 수 있는지. 공백과 제어 문자가 없는 ASCII 1..=64바이트여야 한다.
- * @details 받은 버전은 로그와 상태 응답에 그대로 실린다. 보내는 쪽도 같은 규칙으로 확인해, 받는
- *          쪽이 거절할 버전으로는 시작하지 않는다.
- */
+/// ASCII without spaces or control characters, 1 to 64 bytes. Received versions go into logs and
+/// status responses as they are. The sender checks the same rule, so it never starts with a version
+/// receivers would refuse.
 fn product_version_valid(version: &[u8]) -> bool {
     (1..=MAX_PRODUCT_VERSION_LEN).contains(&version.len())
         && version.iter().all(u8::is_ascii_graphic)
 }
 
-/**
- * @brief 복호화한 본문에서 보낸 노드의 제품 버전과 메시지를 나눈다.
- * @return 길이가 맞지 않거나 버전으로 쓸 수 없는 바이트가 있으면 없다.
- */
 fn split_versioned(plaintext: &[u8]) -> Option<(&str, &[u8])> {
     let (&length, rest) = plaintext.split_first()?;
     let (version, message) = rest.split_at_checked(usize::from(length))?;
@@ -1362,11 +1210,8 @@ fn split_versioned(plaintext: &[u8]) -> Option<(&str, &[u8])> {
     Some((std::str::from_utf8(version).ok()?, message))
 }
 
-/**
- * @brief 클러스터 구성에서 문맥 해시를 유도한다.
- * @details 구성이 다르면 문맥도 다르다. 실수로 두 클러스터가 같은 비밀을 써도 프레임이
- *          서로 통하지 않는다.
- */
+/// Different cluster configurations give different contexts, so two clusters that share a secret by
+/// mistake still cannot exchange frames.
 fn derive_cluster_context(
     secret: &[u8],
     self_id: NodeId,
@@ -1391,31 +1236,26 @@ fn derive_cluster_context(
     hash.finalize().into()
 }
 
-/** @brief 클러스터 비밀에서 AEAD 암호를 만든다. 비밀이 짧으면 None. */
+/// `None` when the secret is too short.
 fn raft_cipher(secret: &[u8]) -> Option<XChaCha20Poly1305> {
     let key: Zeroizing<[u8; 32]> = Zeroizing::new(Sha256::digest(secret).into());
     XChaCha20Poly1305::new_from_slice(key.as_slice()).ok()
 }
 
-/** @brief Raft 런타임 시작 진입점. */
 pub struct RaftServer;
 
 impl RaftServer {
     #[allow(clippy::too_many_arguments)]
-    /**
-     * @brief Raft 런타임을 시작한다. 리스너, 틱 스레드, 적용 스레드, 노드별 송신 스레드.
-     *
-     * @param version  이 노드의 제품 버전. 같은 버전의 노드끼리만 메시지를 주고받는다. 복제하는
-     *                 설정의 키와 의미, 로그 항목과 스냅숏 형식, RPC 메시지가 모두 버전에 따라
-     *                 달라질 수 있기 때문이다.
-     * @param listener 다른 노드의 연결을 받을 리스너. 주소가 아니라 bind 한 리스너를 받는다. 포트
-     *                 0 으로 정한 주소를 다른 노드에 알려 준 뒤 다시 bind 하면, 그사이에 다른
-     *                 소켓이 그 포트를 가져갈 수 있다.
-     * @param on_apply 커밋된 항목을 상태 기계에 반영하는 콜백. 설정 복제의 착지점이다.
-     * @warning 클러스터 비밀은 32바이트 이상이어야 한다. 짧으면 시작을 거부한다. 약한
-     *          비밀은 인증이 없는 것과 다름없다.
-     * @return 시작 중 실패하면 이미 뜬 스레드를 정리하고 오류를 낸다.
-     */
+    /// Starts the listener, tick, apply and per-node sender threads.
+    ///
+    /// `version` is this node's product version. Only nodes on the same version exchange messages,
+    /// since the replicated config keys and their meaning, the log and snapshot formats and the RPC
+    /// messages may all change between versions. `listener` is already bound: binding again after
+    /// announcing a port-0 address would let another socket take the port in between. `on_apply`
+    /// applies committed entries; it is where config replication lands.
+    ///
+    /// A cluster secret shorter than 32 bytes is refused: a weak secret is as good as none. On a
+    /// startup failure the threads already started are cleaned up.
     pub fn spawn(
         self_id: NodeId,
         version: &'static str,
@@ -1631,17 +1471,13 @@ impl RaftServer {
                             let spawned = std::thread::Builder::new()
                                 .name("raft-connection".into())
                                 .spawn(move || {
-                                    /** @brief 끝날 때 진행 표시를 지우는 것. */
+                                    /// Releases the connection's slots when it ends.
                                     struct Guard {
-                                        /** @brief 지금 열린 연결 수. */
                                         active: Arc<AtomicUsize>,
-                                        /** @brief 주소별 연결 수. */
                                         per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
-                                        /** @brief 이 연결의 상대 주소. */
                                         ip: IpAddr,
                                     }
                                     impl Drop for Guard {
-                                        /** @brief 진행 표시를 지운다. */
                                         fn drop(&mut self) {
                                             self.active.fetch_sub(1, Ordering::Release);
                                             release_ip_slot(&self.per_ip, self.ip);
@@ -1815,16 +1651,12 @@ impl RaftServer {
 }
 
 #[allow(clippy::too_many_arguments)]
-/**
- * @brief 들어온 클러스터 연결 하나를 처리한다.
- *
- * @details 프레임을 열고, 서명으로 발신자를 확인하고, 재생 구간을 통과시킨 뒤에야 상태
- *          기계에 넘긴다. 세 검사 중 하나라도 실패하면 연결을 끊는다. 그다음 보낸 노드의 제품
- *          버전이 이 노드와 다르면 그 프레임만 버리고 연결은 유지한다. 끊으면 보내는 쪽이
- *          메시지마다 다시 연결한다.
- * @warning 인증된 발신자 ID를 상태 기계에 넘긴다. 메시지 본문의 리더·후보 필드를
- *          그대로 믿으면 아무 노드나 리더를 사칭할 수 있다.
- */
+/// Opens the frame and checks the sender's signature and the replay window before anything reaches
+/// the state machine; any failure closes the connection. A frame from a node on another product
+/// version is dropped but the connection stays, or the sender would reconnect for every message.
+///
+/// The state machine gets the authenticated sender ID: trusting the leader and candidate fields in
+/// the message body would let any node pose as leader.
 fn handle_conn(
     self_id: NodeId,
     version: &'static str,
@@ -1975,14 +1807,11 @@ fn handle_conn(
 }
 
 #[cfg(test)]
-/** @brief 프레임 봉하기와 사칭 거부, 그리고 재시작 뒤 상태 복구. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트 노드들의 제품 버전. */
     const TEST_VERSION: &str = "1.0.0";
 
-    /** @brief 상태 JSON 에서 한 피어의 항목만 잘라 낸다. */
     fn peer_entry(status: &str, id: NodeId) -> String {
         let marker = format!("{{\"id\":{id},");
         let start = status.rfind(&marker).expect("노드 항목");
@@ -1990,7 +1819,6 @@ mod tests {
         status[start..=end].to_string()
     }
 
-    /** @brief Raft 진행 신호를 기다리며 상태 조건을 확인한다. */
     fn wait_for_progress(
         handle: &RaftHandle,
         timeout: Duration,
@@ -2016,7 +1844,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 마지막 제안 가드가 사라질 때만 apply 진행 신호를 보내는지. */
     fn last_pending_proposal_wakes_apply_progress() {
         let count = Arc::new(AtomicUsize::new(2));
         let progress = Arc::new((Mutex::new(0), Condvar::new()));
@@ -2038,7 +1865,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 올라온 제안을 마저 처리하고 끝내는지. */
     fn shutdown_drains_an_already_appended_proposal() {
         let applied = Arc::new(AtomicBool::new(false));
         let applied_in_callback = applied.clone();
@@ -2088,7 +1914,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동시에 올린 제안들이 서로 섞이지 않는지. */
     fn concurrent_proposals_keep_distinct_contiguous_results() {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let applied_in_callback = applied.clone();
@@ -2146,7 +1971,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 묶어 저장한 뒤 앞부분을 놓아주는지. */
     fn applied_state_is_snapshotted_and_log_prefix_is_reclaimed() {
         let applied = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let apply_state = applied.clone();
@@ -2215,11 +2039,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대 노드 상태를 받은 프레임으로만 판정하는지.
-     * @details 이쪽으로 보낼 까닭이 없는 노드가 조용한 것은 죽었다는 뜻이 아니므로 알 수
-     *          없음으로 남겨야 한다.
-     */
+    /// A silent peer with no reason to send is not dead and must stay unknown.
     fn peer_health_follows_authenticated_contact() {
         let window = Duration::from_millis(400);
         assert_eq!(
@@ -2251,7 +2071,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 떨어져 있던 노드가 인증된 채널로 상태를 되찾는지. */
     fn offline_follower_recovers_state_through_authenticated_snapshot_transport() {
         let stop_all = |handles: &[RaftHandle]| {
             for handle in handles {
@@ -2263,11 +2082,8 @@ mod tests {
                 join_threads(&handle.threads);
             }
         };
-        /*
-         * 늦게 뜨는 3번 노드의 리스너도 처음부터 잡아 둔다. 다른 노드에 알린 주소를 그사이 다른
-         * 소켓이 가져가지 못하게 하려는 것이다. 3번 노드가 뜨기 전에 이 리스너로 들어온 연결의
-         * 프레임은 쌓여 있다가 3번 노드가 뜬 뒤에 읽힌다.
-         */
+        // Node 3 starts late, but its listener is bound up front so no other socket takes the
+        // announced address. Frames that arrive before node 3 starts wait in the backlog.
         let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
         let addresses = listeners
             .each_ref()
@@ -2418,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적용이 느려도 심장 박동이 끊기지 않는지. 끊기면 멀쩡한데도 리더를 다시 정한다. */
+    /// Otherwise a healthy cluster would elect a new leader.
     fn slow_state_machine_application_does_not_starve_heartbeats() {
         let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
         let addresses = listeners
@@ -2537,7 +2353,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝난 뒤 올린 제안을 곧바로 거절하는지. */
     fn proposal_after_shutdown_is_rejected_immediately() {
         let handle = RaftServer::spawn(
             1,
@@ -2574,7 +2389,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모든 메시지 종류의 왕복. */
     fn codec_roundtrip_all_variants() {
         let messages = vec![
             Msg::RequestVote {
@@ -2634,7 +2448,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쓰레기와 참거짓이 아닌 값을 거부하는지. */
     fn decode_rejects_garbage_and_non_boolean_flags() {
         assert_eq!(decode_msg(&[]), None);
         assert_eq!(decode_msg(&[99]), None);
@@ -2648,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 송신기가 노드 수만큼 AEAD·개인 키 바이트를 복제하지 않는지. */
+    /// Senders must not copy the AEAD and private key bytes once per node.
     fn frame_sealer_shares_cipher_and_signing_key() {
         let cipher = Arc::new(raft_cipher(&[7u8; 32]).unwrap());
         let signing = Arc::new(SigningKey::from_bytes(&[5u8; 32]));
@@ -2660,7 +2473,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프레임이 봉해지고 위조를 알아채는지. */
     fn raft_frame_encrypts_and_authenticates_payload() {
         let secret = [7u8; 32];
         let signing = SigningKey::from_bytes(&[5u8; 32]);
@@ -2726,7 +2538,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 본문 앞의 제품 버전을 길이와 글자로 확인하는지. */
     fn versioned_plaintext_rejects_malformed_versions() {
         assert_eq!(
             split_versioned(b"\x051.0.0rest"),
@@ -2752,7 +2563,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 노드가 거절할 버전으로는 시작하지 않는지. */
     fn spawn_rejects_versions_peers_would_refuse() {
         let long: &'static str = "1".repeat(65).leak();
         for version in ["", "1.0 0", "1.0\n0", "1.0.0é", long] {
@@ -2785,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 노드 버전을 바뀔 때만 새로 적는지. 버전 로그를 바뀔 때만 남기는 근거다. */
+    /// The version log fires only on a change, which relies on this.
     fn peer_version_is_noted_only_when_it_changes() {
         let peers = HashMap::from([(2, "127.0.0.1:1".to_string())]);
         let contact = PeerContact::new(&peers);
@@ -2802,12 +2612,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버전이 같은 노드끼리만 클러스터를 이루는지.
-     * @details 1, 2번은 버전이 같아 리더를 뽑고 변경을 커밋한다. 3번은 버전이 달라 인증은
-     *          통과하지만 메시지가 버려지므로 리더를 모르고 아무것도 적용하지 않는다. 서로의
-     *          버전은 상태에 남는다.
-     */
+    /// Nodes 1 and 2 share a version, elect a leader and commit a change. Node 3 runs another
+    /// version: its frames pass authentication but are dropped, so it learns no leader and applies
+    /// nothing. Each side still records the other's version.
     fn nodes_with_a_different_version_are_kept_out_of_the_cluster() {
         let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").unwrap());
         let addresses = listeners
@@ -2936,7 +2743,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 남의 프레임을 옮겨 붙여 사칭하지 못하는지. */
     fn raft_frame_signature_rejects_impersonation() {
         let secret = [7u8; 32];
         let attacker = SigningKey::from_bytes(&[1u8; 32]);
@@ -2972,7 +2778,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief epoch가 유지되면서 뒷부분은 예측할 수 없는지. */
     fn session_ids_preserve_the_epoch_and_randomize_the_suffix() {
         let first = new_session_id(0x0102_0304_0506_0708).expect("OS CSPRNG");
         let second = new_session_id(0x1112_1314_1516_1718).expect("OS CSPRNG");
@@ -2983,7 +2788,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 일련번호를 다 쓰면 되돌아가지 않는지. 되돌아가면 이전 프레임을 다시 쓸 수 있다. */
+    /// Wrapping around would let earlier frames be reused.
     fn frame_seq_exhaustion_is_permanent() {
         let sealer = FrameSealer::new(
             Arc::new(raft_cipher(&[7u8; 32]).unwrap()),
@@ -3000,7 +2805,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 너무 큰 기록을 적어 내보내지 않는지. */
     fn oversized_entry_is_not_encoded() {
         let message = Msg::AppendEntries {
             term: 1,
@@ -3018,7 +2822,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 스냅숏 조각의 크기와 형식을 확인하는지. */
     fn snapshot_codec_rejects_oversized_chunks_and_non_boolean_flags() {
         let oversized = Msg::InstallSnapshot {
             term: 1,
@@ -3053,7 +2856,6 @@ mod tests {
         assert_eq!(decode_msg(&invalid_installed), None);
     }
 
-    /** @brief 테스트용 nonce. */
     fn replay_nonce(session: u128, sequence: u64) -> [u8; RAFT_NONCE_LEN] {
         let mut nonce = [0u8; RAFT_NONCE_LEN];
         nonce[..16].copy_from_slice(&session.to_be_bytes());
@@ -3062,7 +2864,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 본 프레임과 이전 epoch를 거부하는지. 안 그러면 가로챈 프레임을 그대로 다시 보낼 수 있다. */
     fn replay_window_rejects_duplicates_old_sessions_and_evicted_sequences() {
         let mut replay = ReplayCache::default();
         assert!(replay.accept(1, replay_nonce(10, 10)));
@@ -3088,7 +2889,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프레임이 받는 이와 클러스터에 묶이는지. 안 묶이면 다른 클러스터로 옮겨 붙일 수 있다. */
     fn frame_signature_binds_destination_and_cluster_context() {
         let secret = [7u8; 32];
         let signing = SigningKey::from_bytes(&[5u8; 32]);

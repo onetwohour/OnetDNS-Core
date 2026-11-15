@@ -1,6 +1,4 @@
-/*!
- * @brief Raft 클러스터 런타임과 클러스터를 거치는 설정 쓰기.
- */
+//! Raft cluster runtime and config writes routed through the cluster.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,45 +21,37 @@ use crate::zones::apply_zone_mutation_locked;
 use crate::{config_keys, http, native, sleep_or_shutdown, ConfigTextSlot};
 
 #[derive(Clone, PartialEq, Eq)]
-/** @brief 이 노드의 클러스터 신원. */
 struct RaftRuntimeIdentity {
-    /** @brief 이 노드 번호. */
     node_id: u64,
-    /** @brief 이 노드가 묶을 주소. */
     listen: String,
-    /** @brief 다른 노드들의 번호·주소·키. */
+    /// Node ID, address, and public key of each other node.
     peers: Vec<(u64, String, [u8; 32])>,
-    /** @brief 이 노드만의 시드. 노드마다 달라야 한다. */
+    /// Must differ per node.
     node_seed: [u8; 32],
-    /** @brief 클러스터 공유 비밀의 지문. 설정이 바뀌었는지 본다. */
+    /// Fingerprint of the cluster secret, for spotting config changes.
     secret_digest: [u8; 32],
-    /** @brief 합의 상태를 담아 둘 파일. */
+    /// Where the consensus state persists.
     state_path: PathBuf,
 }
 
 #[derive(Clone)]
-/** @brief 이 세대에서 Raft 로그 항목을 적용할 방법. */
 struct RaftGenerationApply {
-    /** @brief 설정을 다시 읽게 하는 플래그. */
+    /// Set to make the config reload.
     reload: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 재시작하지 않고 교체하는 방법. */
     hot_apply: HotConfigApply,
 }
 
-/** @brief Raft 로그 항목을 적용하는 곳. 세대가 바뀌면 교체한다. */
+/// Applies Raft log entries; its generation part is replaced at each generation.
 struct RaftApplyContext {
-    /** @brief 설정 파일 경로. */
     path: Option<PathBuf>,
-    /** @brief 앞선 설정 텍스트. */
+    /// For rollback.
     prev: ConfigTextSlot,
-    /** @brief 마지막으로 성공한 설정 텍스트. */
+    /// The last config text that applied successfully.
     applied: ConfigTextSlot,
-    /** @brief 이 세대의 적용 방법. 세대가 바뀌면 교체한다. */
     generation: Mutex<RaftGenerationApply>,
 }
 
 impl RaftApplyContext {
-    /** @brief 만든다. */
     fn new(
         path: Option<PathBuf>,
         prev: ConfigTextSlot,
@@ -76,18 +66,15 @@ impl RaftApplyContext {
         }
     }
 
-    /**
-     * @brief 이 세대의 적용 방법을 끼운다.
-     * @details 세대를 새로 시작할 때는 시작하는 동안 설정 파일이 바뀌었는지 보고, 바뀌었으면
-     *          다시 읽도록 표시한다. 비교와 교체는 설정 쓰기 잠금 하나 안에서 한다. 적용은
-     *          같은 잠금을 잡고 세대를 읽으므로, 비교한 뒤 잠금을 풀고 교체하면 그 사이에 온
-     *          변경은 옛 세대에만 알려지고 파일 비교에도 잡히지 않아 사라진다.
-     * @param expected_text 이 세대가 읽은 설정 텍스트. 없음은 호출자가 이미 설정 쓰기 잠금을
-     *        잡고 있다는 뜻이며, 핫 적용이 그렇게 부른다.
-     * @warning 핫 적용은 설정 쓰기 잠금을 잡은 채 지금 파일 내용으로 부른다. 여기서 잠금을
-     *          다시 잡으면 멈추고, 부팅 때 텍스트와 비교하면 부팅 뒤 바뀐 파일을 보고 서비스
-     *          전체를 재시작한다.
-     */
+    /// A new generation checks whether the config file changed while it started, and if so marks a
+    /// reload. The comparison and the swap happen under one config write lock: applying reads the
+    /// generation under the same lock, so releasing it between them would let a change arriving in
+    /// between reach only the old generation and escape the file comparison too.
+    ///
+    /// `expected_text`: the config text this generation read. None means the caller already holds
+    /// the config write lock, as hot apply does: it calls with the lock held and the current file
+    /// contents, so locking again here would deadlock, and comparing against the boot text would
+    /// see the file changed since boot and restart the whole service.
     fn install_generation(
         &self,
         expected_text: Option<&str>,
@@ -112,11 +99,9 @@ impl RaftApplyContext {
         Ok(changed_during_start)
     }
 
-    /**
-     * @brief 설정 파일을 요청 전 내용으로 되돌린다. 커밋되지 않은 변경을 이 노드에서 취소한다.
-     * @param previous_slot 요청 전의 롤백용 이전 설정. 되돌린 뒤 이 값도 복원해야 설정
-     *        롤백 API가 커밋되지 않은 변경을 다시 적용하지 않는다.
-     */
+    /// Restores the config file as it was before the request, cancelling an uncommitted change on
+    /// this node. `previous_slot`: the rollback text from before the request; restoring it too
+    /// keeps the config rollback API from reapplying the uncommitted change.
     fn restore_text(
         &self,
         text: &str,
@@ -137,37 +122,29 @@ impl RaftApplyContext {
         result
     }
 
-    /** @brief 클러스터가 정한 명령을 적용한다. */
     fn apply_command(&self, data: &[u8]) -> Result<(), String> {
         let patch = decode_raft_command_patch(data)?;
         self.apply_patch(&patch)
     }
 
-    /** @brief 클러스터가 정한 설정 변경을 적용한다. */
     fn apply_patch(&self, patch: &[(String, onetdns_core::json::Json)]) -> Result<(), String> {
         apply_raft_patch(self, patch)
     }
 }
 
-/** @brief 실행 중인 클러스터 노드 하나. */
 struct RaftRuntime {
-    /** @brief 이 노드의 신원. */
     identity: RaftRuntimeIdentity,
-    /** @brief Raft 로그 항목을 적용하는 곳. */
     apply: Arc<RaftApplyContext>,
-    /** @brief 노드를 조종할 핸들. */
     handle: onetdns_cluster::transport::RaftHandle,
 }
 
-/** @brief 이 프로세스의 클러스터 노드. */
 static RAFT: std::sync::OnceLock<Mutex<Option<RaftRuntime>>> = std::sync::OnceLock::new();
 
-/** @brief 클러스터 노드가 들어가는 곳. */
 fn raft_slot() -> &'static Mutex<Option<RaftRuntime>> {
     RAFT.get_or_init(|| Mutex::new(None))
 }
 
-/** @brief 클러스터 노드 핸들. 돌고 있지 않으면 없다. */
+/// None when not running.
 pub fn raft_handle() -> Option<onetdns_cluster::transport::RaftHandle> {
     raft_slot()
         .lock()
@@ -176,7 +153,6 @@ pub fn raft_handle() -> Option<onetdns_cluster::transport::RaftHandle> {
         .map(|runtime| runtime.handle.clone())
 }
 
-/** @brief 클러스터 노드를 멈춘다. */
 pub(crate) fn stop_raft() {
     let runtime = {
         raft_slot()
@@ -189,17 +165,15 @@ pub(crate) fn stop_raft() {
     }
 }
 
-/** @brief 프로세스가 끝날 때 클러스터 노드를 멈추는 것. */
+/// Stops the cluster node at process exit.
 pub(crate) struct RaftProcessCleanup;
 
 impl Drop for RaftProcessCleanup {
-    /** @brief 클러스터 노드를 멈춘다. */
     fn drop(&mut self) {
         stop_raft();
     }
 }
 
-/** @brief 16진 문자열을 32바이트로. */
 fn hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -211,7 +185,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/** @brief 클러스터 노드를 시작하거나 이미 있으면 그대로 쓴다. */
+/// Starts the cluster node, or reuses the one already running.
 pub(crate) fn ensure_raft_runtime(
     cfg: &Config,
     expected_text: Option<&str>,
@@ -393,15 +367,12 @@ pub(crate) fn ensure_raft_runtime(
     Ok(())
 }
 
-/**
- * @brief 클러스터 노드를 설정대로 다시 시작하는 함수. 두 번째 인자는 합의된 설정과 맞춰 볼 원문이다.
- * @details 세대를 시작할 때는 그 세대를 연 설정 원문을 넘기고, 핫 적용으로 다시 시작할 때는 넘길
- *          원문이 없다.
- */
+/// Restarts the cluster node per the config. The second argument is the raw text to check against
+/// the agreed config: a generation start passes the text that opened the generation, and a
+/// hot-apply restart has none.
 pub(crate) type RaftRestart =
     Arc<dyn Fn(&Config, Option<&str>) -> Result<(), String> + Send + Sync>;
 
-/** @brief 이 세대의 설정 원문 슬롯과 교체 함수로 클러스터 노드를 다시 시작하는 함수를 만든다. */
 pub(crate) fn raft_restart(
     path: Option<PathBuf>,
     prev: ConfigTextSlot,
@@ -411,7 +382,7 @@ pub(crate) fn raft_restart(
 ) -> RaftRestart {
     Arc::new(
         move |next: &Config, expected_text: Option<&str>| -> Result<(), String> {
-            /* 언제나 먼저 멈춘다. 켜져 있는 채로 재시작하면 수신 주소가 겹친다. */
+            // Always stops first; restarting while running would collide on the listen address.
             stop_raft();
             if !next.cluster_raft || next.cluster_node_id == 0 {
                 return Ok(());
@@ -429,11 +400,8 @@ pub(crate) fn raft_restart(
     )
 }
 
-/**
- * @brief 클러스터가 정할 수 있는 설정인지 확인한다.
- * @warning 노드별 설정은 거부한다. 퍼뜨리면 모든 노드가 같은 비밀을 쓰거나 서로 신원이
- *          겹친다.
- */
+/// Rejects per-node settings: replicating them would give every node the same secret or overlapping
+/// identities.
 pub(crate) fn validate_raft_patch_scope(value: &onetdns_core::json::Json) -> Result<(), String> {
     let onetdns_core::json::Json::Obj(pairs) = value else {
         return Err("A configuration change sent through Raft must be a JSON object".to_string());
@@ -446,12 +414,9 @@ pub(crate) fn validate_raft_patch_scope(value: &onetdns_core::json::Json) -> Res
     Ok(())
 }
 
-/**
- * @brief 팔로워가 처리 전에 거절할 요청인지. 클러스터 공유 설정을 바꾸는 요청이 대상이다.
- * @details 설정 편집 요청은 본문의 키를 보고 판단한다. 노드별 설정만 바꾸는 편집은 팔로워도
- *          받는다. 본문을 파싱하지 못하면 여기서 거절하지 않고, 요청 처리 단계에서 본문 오류로
- *          응답하게 둔다.
- */
+/// Requests that change cluster-shared config. Config edits are judged by the keys in the body, so
+/// an edit touching only per-node settings passes on a follower. A body that does not parse is not
+/// rejected here; request handling answers it with a body error.
 fn cluster_follower_must_reject(path: &str, body: &str) -> bool {
     match path {
         "/v1/block"
@@ -481,14 +446,12 @@ fn cluster_follower_must_reject(path: &str, body: &str) -> bool {
     }
 }
 
-/** @brief 클러스터 제안을 하나씩 올리게 하는 잠금. 설정 쓰기 잠금과는 따로 둔다. */
+/// Serializes cluster proposals; separate from the config write lock.
 fn cluster_proposal_lock() -> &'static Mutex<()> {
-    /** @brief 제안 잠금. */
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/** @brief 클러스터 요청 처리가 실패로 끝났을 때의 응답. */
 fn cluster_write_error(status: &'static str, message: String) -> onetdns_control::ApiResponse {
     (
         status,
@@ -497,7 +460,7 @@ fn cluster_write_error(status: &'static str, message: String) -> onetdns_control
     )
 }
 
-/** @brief 팔로워가 거절할 때 쓰는 문구. 알면 리더 번호를 알려 준다. */
+/// Names the leader when known.
 fn cluster_not_leader_message(leader: Option<u64>) -> String {
     match leader {
         Some(id) => format!(
@@ -507,10 +470,8 @@ fn cluster_not_leader_message(leader: Option<u64>) -> String {
     }
 }
 
-/**
- * @brief 두 설정 파일 내용을 비교해 바뀐 클러스터 공유 설정을 구한다.
- * @return 바뀐 키와 새 값. 삭제된 키의 값은 null 이다. 바뀐 것이 없으면 빈 목록이다.
- */
+/// Shared settings that differ between the two config texts, with their new values; a removed key's
+/// value is null. Empty when nothing changed.
 fn cluster_config_changes(
     before: &str,
     after: &str,
@@ -534,18 +495,17 @@ fn cluster_config_changes(
         .collect()
 }
 
-/**
- * @brief 상태를 바꾸는 관리 요청을 Raft 합의를 거쳐 처리한다.
- * @details 리더는 요청을 먼저 처리하고, 클러스터 공유 설정이 바뀌었으면 바뀐 값을 제안한다.
- *          제안이 실패하면 설정 파일을 요청 전 상태로 되돌리고 실패로 응답한다. 먼저 처리하는
- *          이유는 요청마다 설정 파일을 고치는 방식이 달라서, 처리 전후 파일 내용을 비교해야
- *          모든 요청을 한 경로로 다룰 수 있기 때문이다.
- *          팔로워는 공유 설정을 바꾸는 요청을 처리 전에 거절한다. 사전에 걸러지지 않은 요청이
- *          공유 설정을 바꿨다면 되돌리고 거절한다. 팔로워에서 바꾼 값은 다음 커밋에 덮어써져
- *          노드 간 설정이 어긋나기 때문이다.
- * @warning 제안은 설정 쓰기 잠금을 잡지 않은 채 커밋을 기다린다. 커밋된 항목을 적용하는 쪽이
- *          그 잠금을 잡기 때문이다. 제안 간 순서는 별도의 제안 잠금으로 보장한다.
- */
+/// Routes a state-changing management request through Raft. The leader handles the request first
+/// and, if shared config changed, proposes the new values; when the proposal fails, the config file
+/// reverts and the request fails. Handling first lets every request take one path: requests edit
+/// the config file in different ways, and comparing the file before and after covers them all.
+///
+/// A follower rejects requests that change shared config before handling them. If one not caught in
+/// advance changed shared config anyway, it is reverted and rejected, since a value changed on a
+/// follower would be overwritten at the next commit and the nodes would diverge.
+///
+/// The proposal waits for the commit without the config write lock, because applying a committed
+/// entry takes that lock; the proposal lock keeps proposals in order.
 pub(crate) fn cluster_routed_write(
     method: &str,
     path: &str,
@@ -593,10 +553,9 @@ pub(crate) fn cluster_routed_write(
                 onetdns_core::json::Json::Obj(changes),
             )])
             .to_text();
-            /*
-             * 확인하지 못한 경우에도 이 노드의 변경은 되돌린다. 나중에 커밋되면 적용 쪽이 이
-             * 노드에도 다시 적어 모든 노드가 같아지고, 폐기되면 되돌린 상태가 맞다.
-             */
+            // Even when the outcome is unknown, this node's change is reverted: if it commits
+            // later, applying writes it to this node again and all nodes agree; if it is dropped,
+            // the reverted state is right.
             match handle.propose(command.into_bytes()) {
                 Ok(_) => return response,
                 Err(onetdns_cluster::transport::ProposalError::Undetermined(error)) => (
@@ -630,21 +589,17 @@ pub(crate) fn cluster_routed_write(
     cluster_write_error(status, message)
 }
 
-/** @brief 클러스터 설정 스냅숏의 매직 바이트. */
 const RAFT_CONFIG_SNAPSHOT_MAGIC: &[u8; 12] = b"ONETCFGSNAP1";
 
-/** @brief 스냅숏에 담을 설정 항목 수 상한. */
 const MAX_RAFT_SNAPSHOT_KEYS: usize = 1_024;
 
 #[derive(Default)]
-/** @brief 클러스터가 합의한 설정 스냅숏. */
 struct RaftConfigSnapshot {
-    /** @brief 클러스터가 합의한 설정 항목들. */
     values: std::collections::BTreeMap<String, onetdns_core::json::Json>,
 }
 
 impl RaftConfigSnapshot {
-    /** @brief 로그 항목 하나를 스냅숏에 반영한다. 나중 것이 이긴다. */
+    /// Later entries win.
     fn merge_command(&mut self, data: &[u8]) -> Result<(), String> {
         let patch = decode_raft_command_patch(data)?;
         for (key, value) in patch {
@@ -653,7 +608,6 @@ impl RaftConfigSnapshot {
         Ok(())
     }
 
-    /** @brief 스냅숏을 바이트로 인코딩한다. */
     fn encode(&self) -> Result<Vec<u8>, String> {
         if self.values.is_empty() || self.values.len() > MAX_RAFT_SNAPSHOT_KEYS {
             return Err("Raft configuration snapshot has too many or too few entries".into());
@@ -675,7 +629,6 @@ impl RaftConfigSnapshot {
         Ok(out)
     }
 
-    /** @brief 바이트를 스냅숏으로 디코딩한다. */
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > onetdns_cluster::raft::MAX_SNAPSHOT_BYTES
             || bytes.get(..RAFT_CONFIG_SNAPSHOT_MAGIC.len())
@@ -720,7 +673,6 @@ impl RaftConfigSnapshot {
         Ok(Self { values })
     }
 
-    /** @brief 스냅숏을 설정 변경 목록으로 바꾼다. */
     fn patch(&self) -> Vec<(String, onetdns_core::json::Json)> {
         self.values
             .iter()
@@ -729,11 +681,8 @@ impl RaftConfigSnapshot {
     }
 }
 
-/**
- * @brief 값 하나를 스냅숏에 담을 바이트로 인코딩한다.
- * @details 맨 위의 null 은 그 항목을 지웠다는 합의라서 담는다. 배열과 테이블은 설정 파일에
- *          있는 모양 그대로 중첩을 허용하되 깊이를 제한한다.
- */
+/// A top-level null is kept, since it records agreement to delete the key. Arrays and tables nest
+/// as in the config file, up to a depth limit.
 fn encode_raft_snapshot_value(
     value: &onetdns_core::json::Json,
     out: &mut Vec<u8>,
@@ -785,14 +734,13 @@ fn encode_raft_snapshot_value(
     Ok(())
 }
 
-/** @brief 스냅숏의 바이트를 값으로 디코딩한다. */
 fn decode_raft_snapshot_value(
     bytes: &[u8],
     pos: &mut usize,
     depth: usize,
 ) -> Result<onetdns_core::json::Json, String> {
     use onetdns_core::json::Json;
-    /** @brief 배열이나 테이블 하나가 가질 수 있는 항목 수 상한. */
+    /// Per array or table.
     const MAX_ITEMS: usize = 100_000;
     if depth > MAX_RAFT_VALUE_DEPTH {
         return Err("Raft configuration snapshot value is nested too deeply".into());
@@ -856,7 +804,6 @@ fn decode_raft_snapshot_value(
     }
 }
 
-/** @brief 바이트를 이만큼 잘라 낸다. */
 fn raft_snapshot_take<'a>(
     bytes: &'a [u8],
     pos: &mut usize,
@@ -872,7 +819,6 @@ fn raft_snapshot_take<'a>(
     Ok(value)
 }
 
-/** @brief 16비트 수를 잘라 낸다. */
 fn raft_snapshot_take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes(
         raft_snapshot_take(bytes, pos, 2)?
@@ -881,7 +827,6 @@ fn raft_snapshot_take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, String> 
     ))
 }
 
-/** @brief 32비트 수를 잘라 낸다. */
 fn raft_snapshot_take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
     Ok(u32::from_be_bytes(
         raft_snapshot_take(bytes, pos, 4)?
@@ -890,7 +835,7 @@ fn raft_snapshot_take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> 
     ))
 }
 
-/** @brief 클러스터에 올릴 제안을 읽는다. 형식이 다르면 거부한다. */
+/// Fails on any other envelope.
 pub(crate) fn parse_cluster_proposal(body: &str) -> Result<onetdns_core::json::Json, String> {
     let json = onetdns_core::json::parse(body)
         .map_err(|error| format!("Could not parse the JSON request body: {error}"))?;
@@ -910,7 +855,6 @@ pub(crate) fn parse_cluster_proposal(body: &str) -> Result<onetdns_core::json::J
     Ok(patch)
 }
 
-/** @brief Raft 로그 항목을 설정 변경 목록으로 바꾼다. */
 fn decode_raft_command_patch(
     data: &[u8],
 ) -> Result<Vec<(String, onetdns_core::json::Json)>, String> {
@@ -939,7 +883,6 @@ fn decode_raft_command_patch(
     Ok(patch)
 }
 
-/** @brief 클러스터가 정한 설정 변경을 실제로 적용한다. */
 fn apply_raft_patch(
     context: &RaftApplyContext,
     patch: &[(String, onetdns_core::json::Json)],
@@ -955,7 +898,8 @@ fn apply_raft_patch(
                 return Err("Raft configuration key length is out of range".into());
             }
             output = match value {
-                /* null 은 항목을 지우라는 합의다. 빈 값으로 적으면 기본값으로 돌아가지 않는다. */
+                // null is agreement to delete the key; writing an empty value would not restore the
+                // default.
                 onetdns_core::json::Json::Null => remove_config_key(&output, key)?,
                 value => rewrite_config_kv(&output, key, &json_to_raft_toml_literal(value, 0)?)?,
             };
@@ -983,12 +927,10 @@ fn apply_raft_patch(
     Ok(())
 }
 
-/**
- * @brief 클러스터 상태 JSON에 이 노드의 Raft 신원을 붙인다.
- * @details 다른 노드의 cluster_raft_peers 에 적을 공개 키와 그대로 붙여 넣을 항목을 알려
- *          준다. 서명 키만 있으면 Raft를 켜기 전에도 보여 준다. 노드를 연결하려면 켜기 전에
- *          서로의 공개 키를 알아야 하기 때문이다. 서명 키가 없거나 형식이 틀리면 null 이다.
- */
+/// Adds this node's Raft identity to the cluster status JSON: the public key and the ready-to-paste
+/// entry for other nodes' `cluster_raft_peers`. Shown even before Raft is on as long as a signing
+/// key exists, since nodes must know each other's public keys before turning it on. null without a
+/// signing key or with a malformed one.
 pub(crate) fn with_raft_identity(status: &str, config: &Config) -> String {
     use onetdns_core::json::Json;
     let public_key = hex32(config.cluster_raft_node_key.trim())
@@ -1016,12 +958,10 @@ pub(crate) fn with_raft_identity(status: &str, config: &Config) -> String {
     }
 }
 
-/** @brief 바이트를 소문자 16진 문자열로. */
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/** @brief 클러스터 없이 실행 중인 상태를 JSON으로. */
 pub(crate) fn standalone_cluster_status_json(backend: &str, listeners: usize) -> String {
     format!(
         "{{\"self\":{{\"id\":null,\"role\":\"standalone\",\"backend\":{},\"listeners\":{listeners},\"leader\":null,\"term\":null,\"commit_index\":null,\"last_applied\":null,\"last_index\":null,\"snapshot_index\":null,\"retained_log_entries\":null,\"fatal\":null,\"healthy\":true,\"version\":{}}},\"peers\":[]}}",
@@ -1030,7 +970,6 @@ pub(crate) fn standalone_cluster_status_json(backend: &str, listeners: usize) ->
     )
 }
 
-/** @brief 클러스터 상태를 JSON으로. */
 pub(crate) fn peer_cluster_status_json(
     peers: &[String],
     backend: &str,
@@ -1093,11 +1032,8 @@ pub(crate) fn peer_cluster_status_json(
     )
 }
 
-/**
- * @brief 하루마다 서명 영역의 RRSIG를 다시 서명하는 스레드를 시작한다.
- * @details 서명 키는 돌 때마다 공유 핸들에서 읽는다. 키 교체나 설정 변경 뒤에도 이전 키로
- *          서명하지 않는다.
- */
+/// Re-signs the RRSIGs of signed zones daily. The signing keys are read from the shared handle on
+/// each run, so a key rollover or config change never leaves it signing with old keys.
 pub(crate) fn spawn_resign_timer(
     zone_signers: SharedZoneSigners,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
@@ -1114,10 +1050,8 @@ pub(crate) fn spawn_resign_timer(
             }
             let signers = zone_signers.load();
             for (origin, ctx) in signers.iter() {
-                /*
-                 * 영역을 잠금 아래에서 읽는다. 잠그기 전에 읽으면 그사이에 들어온 동적 갱신이
-                 * 다시 서명한 이전 내용에 덮여 사라진다.
-                 */
+                // Reads the zone under the lock; reading before locking would let the re-signed old
+                // content overwrite a dynamic update that arrived in between.
                 let mut journals = journal.lock_recover();
                 let zone = store
                     .load()
@@ -1153,7 +1087,6 @@ pub(crate) fn spawn_resign_timer(
 }
 
 #[cfg(test)]
-/** @brief Raft 설정 스냅숏 인코딩과 클러스터 쓰기 경로. */
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -1165,7 +1098,7 @@ mod tests {
     use crate::unix_now;
 
     #[test]
-    /** @brief 클러스터로 비밀을 퍼뜨리지 못하는지. 퍼뜨리면 모든 노드가 같은 키를 쓴다. */
+    /// Replicating them would give every node the same key.
     fn raft_config_patch_rejects_secret_material() {
         for key in [
             "cluster_raft_secret",
@@ -1189,7 +1122,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 노드마다 달라야 하는 설정을 퍼뜨리지 못하는지. */
     fn raft_config_patch_rejects_node_local_identity() {
         for key in [
             "cluster_node_id",
@@ -1206,7 +1138,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정 스냅숏이 형을 지키며 작게 담기고, 나중 것이 이기는지. */
     fn raft_config_snapshot_is_compact_typed_and_last_write_wins() {
         let mut state = RaftConfigSnapshot::default();
         state
@@ -1239,15 +1170,12 @@ mod tests {
         assert!(RaftConfigSnapshot::decode(&trailing).is_err());
     }
 
-    /** @brief 테이블 배열과 노드별 설정이 섞인 설정 파일. 클러스터 복제 테스트가 함께 쓴다. */
+    /// Mixes table arrays and per-node settings; shared by the replication tests.
     const CLUSTER_FIXTURE: &str = "listen = [\"127.0.0.1:53\"]\ncontrol_listen = \"127.0.0.1:8080\"\nblock_rules = [\"ads.example\"]\ncache_size = 4096\nsafe_browsing = true\n\n[[clients]]\nname = \"kid \\\"room\\\"\"\nids = [\"192.0.2.0/24\"]\nblock = [\"games.example\"]\nsafe_search = true\n\n[[local_zones]]\nname = \"lan\"\nkind = \"static\"\nrecords = [\"nas.lan 192.0.2.10\", \"lan 192.0.2.1\"]\n\n[[rewrites]]\ndomain = \"rw.example\"\nanswer = \"192.0.2.53\"\n";
 
     #[test]
-    /**
-     * @brief 공유 설정이 로그 항목과 스냅숏을 거쳐 다른 노드에 같은 값으로 기록되는지.
-     * @details 테이블 배열은 인라인 테이블로 기록되므로 파일 모양은 달라지지만 파싱한 값은 같아야 한다.
-     *          노드별 설정은 옮겨지지 않고 받는 노드의 값이 남아야 한다.
-     */
+    /// Table arrays are written as inline tables, so the file looks different but must parse to the
+    /// same value. Per-node settings are not carried; the receiving node keeps its own.
     fn cluster_changes_replay_to_identical_values_on_another_node() {
         let changes = cluster_config_changes("", CLUSTER_FIXTURE).unwrap();
         let keys: Vec<&str> = changes.iter().map(|(key, _)| key.as_str()).collect();
@@ -1303,7 +1231,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지운 설정이 null 로 합의되고, 받는 노드에서도 지워지는지. */
     fn cluster_changes_carry_removed_keys_as_null() {
         let after = CLUSTER_FIXTURE.replace("safe_browsing = true\n", "");
         let changes = cluster_config_changes(CLUSTER_FIXTURE, &after).unwrap();
@@ -1323,7 +1250,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 스냅숏이 null 을 값 안에 두거나 한도보다 깊은 값을 받지 않는지. */
     fn raft_snapshot_rejects_nested_null_and_excessive_depth() {
         use onetdns_core::json::Json;
         let mut out = Vec::new();
@@ -1345,7 +1271,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 팔로워가 노드별 설정 편집만 받고 클러스터 설정 편집은 처리 전에 거절하는지. */
     fn cluster_follower_rejects_only_shared_config_writes() {
         assert!(cluster_follower_must_reject("/v1/block", ""));
         assert!(cluster_follower_must_reject(
@@ -1372,12 +1297,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 키에서 구한 공개 키와 피어 항목이 상태 JSON에 담기는지. */
     fn cluster_status_shows_the_node_public_key_and_peer_entry() {
         let mut config = Config::default();
         config.cluster_node_id = 2;
         config.cluster_raft_listen = Some("10.0.0.2:7100".into());
-        /* Ed25519 표준 테스트 벡터의 첫 번째 시드와 공개 키다. */
+        // RFC 8032 test vector 1 seed and public key.
         config.cluster_raft_node_key =
             "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60".into();
         let status = with_raft_identity(&standalone_cluster_status_json("forward", 1), &config);
@@ -1404,7 +1328,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지금 형식의 제안만 받는지. */
     fn cluster_proposal_accepts_only_the_current_patch_envelope() {
         assert!(parse_cluster_proposal(r#"{"patch":{"cache_size":4096}}"#).is_ok());
         for invalid in [
@@ -1419,7 +1342,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클러스터가 정한 설정도 교체로 반영되는지. */
     fn raft_config_patch_uses_hot_apply_without_restart() {
         let file_path = std::env::temp_dir().join(format!(
             "onetdns-raft-hot-{}-{}.toml",
@@ -1467,7 +1389,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 세대가 바뀌는 사이 온 변경이 사라지지 않는지. */
     fn raft_generation_switch_cannot_lose_a_concurrent_restart_change() {
         let file_path = std::env::temp_dir().join(format!(
             "onetdns-raft-generation-{}-{}.toml",
@@ -1477,7 +1398,6 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        /** @brief 테스트 시작 설정. */
         const INITIAL: &str = "cache_size = 4096\n";
         std::fs::write(&file_path, INITIAL).unwrap();
         let old_reload = Arc::new(std::sync::atomic::AtomicBool::new(false));

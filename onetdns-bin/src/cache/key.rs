@@ -1,35 +1,27 @@
-/*!
- * @brief 응답을 달라지게 하는 모든 것을 담은 캐시 키와 그 정규화.
- *
- * @details 질의 번호와 이름 대소문자, 내용 없는 채우기 옵션은 응답을 바꾸지 않으므로 키에서
- *          지운다. 덜 담으면 다른 질의에 같은 답을 주고, 무관한 것까지 담으면 캐시가 맞지 않는다.
- */
+//! Cache keys: every request byte that can change the response. The ID, name case, and empty
+//! padding cannot, so they are removed. A key holding less would give one query another's answer;
+//! one holding more would miss.
 
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 
 use onetdns_proto::{Message, RData, RecordType};
 
-/** @brief 캐시할 키 길이 상한. */
 pub(crate) const MAX_CACHED_REQUEST_WIRE: usize = 4_096;
 
-/** @brief 이 길이까지는 할당 없이 담는다. */
 pub(crate) const INLINE_REQUEST_KEY_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 정규화한 질의를 담은 키. */
+/// An owned normalized request; also the cache and failure key.
 pub(crate) struct FlightKey {
-    /** @brief 정규화한 질의 바이트. */
     normalized_wire: Box<[u8]>,
 }
 
 impl FlightKey {
-    /** @brief 요청에서 키를 만든다. */
     pub(crate) fn from_request(request: &Message) -> Option<Self> {
         NormalizedRequestKey::from_request(request).map(NormalizedRequestKey::into_owned)
     }
 
-    /** @brief 키 바이트. */
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.normalized_wire
     }
@@ -37,45 +29,36 @@ impl FlightKey {
 
 #[cfg(test)]
 impl FlightKey {
-    /** @brief 테스트에서 임의의 정규화 바이트로 키를 만든다. */
     pub(crate) fn from_normalized_bytes(normalized_wire: Box<[u8]>) -> Self {
         Self { normalized_wire }
     }
 }
 
 impl Borrow<[u8]> for FlightKey {
-    /** @brief 바이트로 빌려 조회에 쓴다. 조회할 때마다 키를 새로 만들지 않으려는 것이다. */
+    /// Lets lookups use the bytes without building a key.
     fn borrow(&self) -> &[u8] {
         self.as_slice()
     }
 }
 
 impl Hash for FlightKey {
-    /** @brief 바이트를 그대로 해시값으로 쓴다. */
+    /// Must hash like `[u8]` for the `Borrow` lookups to find it.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
     }
 }
 
-/**
- * @brief 만드는 중인 키.
- * @details 흔한 길이는 스택에 담고 넘칠 때만 할당한다. 조회는 대개 여기서 끝나 소유권을
- *          가질 일이 없다.
- */
+/// A key being built: on the stack up to the inline capacity, on the heap past it. Most lookups end
+/// here and never need an owned key.
 pub(crate) enum NormalizedRequestKey {
-    /** @brief 짧아서 스택에 담은 것. */
     Inline {
-        /** @brief 스택에 담은 키 바이트. */
         bytes: [u8; INLINE_REQUEST_KEY_CAPACITY],
-        /** @brief 그중 실제로 쓴 길이. */
         len: usize,
     },
-    /** @brief 길어서 따로 잡은 것. */
     Heap(Vec<u8>),
 }
 
 impl NormalizedRequestKey {
-    /** @brief 예상 길이에 맞는 저장소를 고른다. */
     fn with_capacity(capacity: usize) -> Self {
         if capacity <= INLINE_REQUEST_KEY_CAPACITY {
             Self::Inline {
@@ -87,7 +70,6 @@ impl NormalizedRequestKey {
         }
     }
 
-    /** @brief 한 바이트 붙인다. */
     fn push(&mut self, value: u8) {
         match self {
             Self::Inline { bytes, len } => {
@@ -99,7 +81,6 @@ impl NormalizedRequestKey {
         }
     }
 
-    /** @brief 여러 바이트 붙인다. */
     fn extend_from_slice(&mut self, value: &[u8]) {
         match self {
             Self::Inline { bytes, len } => {
@@ -112,7 +93,6 @@ impl NormalizedRequestKey {
         }
     }
 
-    /** @brief 지금까지 담긴 바이트. */
     pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Inline { bytes, len } => &bytes[..*len],
@@ -120,7 +100,7 @@ impl NormalizedRequestKey {
         }
     }
 
-    /** @brief 소유권 있는 키로. 실제로 저장할 때만 부른다. */
+    /// Call only when storing.
     pub(crate) fn into_owned(self) -> FlightKey {
         let normalized_wire = match self {
             Self::Inline { bytes, len } => bytes[..len].into(),
@@ -129,12 +109,7 @@ impl NormalizedRequestKey {
         FlightKey { normalized_wire }
     }
 
-    /**
-     * @brief 요청을 정규화해 키를 만든다.
-     * @details 질의 번호와 이름 대소문자, 내용 없는 채우기 옵션은 응답을 바꾸지 않으므로
-     *          지운다. 나머지는 그대로 담는다.
-     * @return 키. 캐시할 수 없는 모양의 요청이면 없다.
-     */
+    /// None for a request that cannot be cached.
     pub(crate) fn from_request(request: &Message) -> Option<Self> {
         if request.header.response
             || request.header.opcode != 0
@@ -245,7 +220,5 @@ impl NormalizedRequestKey {
     }
 }
 
-/** @brief 캐시 키. */
 pub(crate) type CacheKey = FlightKey;
-/** @brief 실패 기억 키. */
 pub(crate) type FailureKey = FlightKey;

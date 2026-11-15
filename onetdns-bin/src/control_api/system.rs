@@ -1,11 +1,9 @@
-/*!
- * @brief 관리 API: 이 기계의 네트워크 설정, 부팅 서비스, 자체 업데이트.
- */
+//! Management API: this machine's network settings, boot service, and self-update.
 
 use super::*;
 
 impl ControlDeps {
-    /** @brief 시스템 DNS 설정을 바꾸기 전에 원래 값을 적어 둘 디렉터리. 설정 파일 옆이다. */
+    /// Next to the config file; the original values go here before system DNS settings change.
     fn osnet_backup_dir(&self) -> PathBuf {
         self.config_path
             .as_ref()
@@ -14,7 +12,7 @@ impl ControlDeps {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /** @brief 이 기계의 DNS 서버 설정을 바꾼다. 원래 값은 백업해 둔다. */
+    /// Backs up the original values.
     pub(super) fn dns_client_set(&self, body: &str) -> Result<String, String> {
         let backup = self.osnet_backup_dir();
         let j = onetdns_core::json::parse(body)
@@ -41,7 +39,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 부팅 서비스를 등록하거나 제거한다. */
     #[cfg(windows)]
     pub(super) fn boot_service_set(&self, body: &str) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
@@ -50,10 +47,8 @@ impl ControlDeps {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or("`action` must be install or uninstall")?;
-        /*
-         * 서비스로 뜰 때도 지금 쓰는 설정 파일을 그대로 읽어야 한다. 넘기지 않으면 부팅 뒤에 기본
-         * 설정으로 떠서 지금 화면에 보이는 것과 다르게 돈다.
-         */
+        // The service must read the same config file; otherwise it boots with the default config
+        // and runs differently from what the dashboard shows.
         let outcome = match action {
             "install" => service::install(self.config_path.clone()),
             "uninstall" => service::uninstall(),
@@ -71,7 +66,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 이 기계의 DNS 서버 설정을 백업에서 되돌린다. */
     pub(super) fn dns_client_restore(&self, body: &str) -> Result<String, String> {
         let backup = self.osnet_backup_dir();
         let j = onetdns_core::json::parse(body)
@@ -88,12 +82,10 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 자체 업데이트 상태. */
     pub(super) fn update_status(&self) -> String {
         crate::update::task::status_json(self.runtime_cfg.load().release_check)
     }
 
-    /** @brief 새 릴리스를 확인하는 작업을 시작한다. */
     pub(super) fn update_check(&self) -> Result<String, String> {
         crate::update::task::participation()?;
         let running = crate::update::task::begin(crate::update::task::Task::Check)?;
@@ -104,7 +96,6 @@ impl ControlDeps {
         })
     }
 
-    /** @brief 마지막 확인에서 찾은 버전을 설치하는 작업을 시작한다. */
     pub(super) fn update_apply(&self, version: &str) -> Result<String, String> {
         let running = crate::update::task::begin(crate::update::task::Task::Apply)?;
         let release = crate::update::task::confirmed(version)?;
@@ -116,7 +107,6 @@ impl ControlDeps {
         })
     }
 
-    /** @brief 확정된 업데이트를 되돌리는 작업을 시작한다. */
     pub(super) fn update_rollback(&self) -> Result<String, String> {
         crate::update::apply::rollback_ready()?;
         let running = crate::update::task::begin(crate::update::task::Task::Rollback)?;
@@ -128,7 +118,6 @@ impl ControlDeps {
     }
 }
 
-/** @brief 이 기계의 네트워크 어댑터와 어댑터마다의 DNS 서버. */
 pub(super) fn net_adapters() -> Result<String, String> {
     let adapters = osnet::list_adapters()?;
     let esc = onetdns_core::json::escape;
@@ -146,7 +135,6 @@ pub(super) fn net_adapters() -> Result<String, String> {
     ))
 }
 
-/** @brief 이 기계의 방화벽에 포트를 열거나 그 규칙을 지운다. */
 pub(super) fn firewall_set(body: &str) -> Result<String, String> {
     let j =
         onetdns_core::json::parse(body).map_err(|e| format!("Invalid JSON request body: {e}"))?;
@@ -187,7 +175,6 @@ pub(super) fn firewall_set(body: &str) -> Result<String, String> {
     ))
 }
 
-/** @brief 부팅 서비스 등록 상태. */
 #[cfg(windows)]
 pub(super) fn boot_service_status() -> String {
     match service::status() {
@@ -201,26 +188,24 @@ pub(super) fn boot_service_status() -> String {
     }
 }
 
-/** @brief 부팅 서비스 등록 상태. Windows 가 아니면 지원하지 않는다고 답한다. */
+/// Unsupported outside Windows.
 #[cfg(not(windows))]
 pub(super) fn boot_service_status() -> String {
     "{\"supported\":false,\"installed\":false,\"running\":false}".to_string()
 }
 
-/** @brief 부팅 서비스 등록은 Windows 에서만 할 수 있어 거절한다. */
 #[cfg(not(windows))]
 pub(super) fn boot_service_set(_body: &str) -> Result<String, String> {
     Err("Boot-time service registration is available only on Windows".to_string())
 }
 
-/**
- * @brief 업데이트 작업을 작업 목록에 올리고 따로 띄운 스레드에서 돌린다.
- * @details 이 스레드는 세대가 끝날 때 기다리는 목록에 넣지 않는다. 세대를 바꾸는 동안에는 DNS 가
- *          멈춰 있는데, 실행 파일을 받느라 몇 분 걸릴 수 있는 작업을 그동안 기다리지 않으려는
- *          것이다. 업데이트 작업 표는 스레드가 쥐고 있다가 작업 목록에 결과를 적기 전에 놓는다.
- *          관리 화면은 작업이 끝난 것을 보자마자 다음 작업을 요청할 수 있어야 한다.
- * @return 시작한 작업. 작업을 올리지 못하면 표를 바로 놓고 실패한다.
- */
+/// Runs on its own thread, which generation shutdown does not wait for: DNS is paused during a
+/// generation switch, and downloading a binary can take minutes. The thread holds the update task
+/// slot and releases it before writing the result to the job list, so the dashboard can request the
+/// next job as soon as it sees this one finished.
+///
+/// Returns the started job; if the job cannot be listed, the slot is released at once and this
+/// fails.
 fn start_update_job(
     jobs: &Arc<JobRegistry>,
     running: crate::update::task::Running,

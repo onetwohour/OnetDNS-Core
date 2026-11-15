@@ -1,8 +1,5 @@
-/*!
- * @brief 권한 영역 저장소.
- * @details 저장소를 만들고, 영역 원본을 감시해 바뀐 영역을 교체하며, 관리 API가
- *          보낸 영역 편집을 적용한다.
- */
+//! Authoritative zone store: builds it, watches zone sources and swaps changed zones, and applies
+//! zone edits from the management API.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,19 +23,14 @@ use crate::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-/**
- * @brief 영역을 올리기 전에 ZONEMD를 어떻게 볼지.
- * @details 파일, 디렉터리, 외부 저장소, 영역 전송 어느 길로 들어온 영역이든 같은 방침을 쓴다.
- */
+/// How ZONEMD is checked before a zone loads; the same for zones from files, directories, external
+/// stores, and zone transfers.
 pub(crate) struct ZonemdPolicy {
-    /** @brief ZONEMD를 검증할지. */
     check: bool,
-    /** @brief ZONEMD가 없는 영역을 거부할지. */
     reject_absence: bool,
 }
 
 impl ZonemdPolicy {
-    /** @brief 설정에서 방침을 읽는다. */
     pub(crate) fn of(cfg: &Config) -> Self {
         ZonemdPolicy {
             check: cfg.zonemd_check,
@@ -47,7 +39,7 @@ impl ZonemdPolicy {
     }
 }
 
-/** @brief 영역이 제 안에 적어 둔 요약값과 맞는지. 맞지 않으면 오는 길에 바뀐 것이다. */
+/// A mismatch means the zone changed in transit.
 pub(crate) fn zonemd_ok(zone: &onetdns_authority::Zone, policy: ZonemdPolicy) -> bool {
     if !policy.check {
         return true;
@@ -82,7 +74,6 @@ pub(crate) fn zonemd_ok(zone: &onetdns_authority::Zone, policy: ZonemdPolicy) ->
     }
 }
 
-/** @brief 설정대로 권한 영역들을 올린다. */
 pub(crate) fn build_zone_store(
     cfg: &Config,
     tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -127,7 +118,7 @@ pub(crate) fn build_zone_store(
             ));
         }
         onetdns_core::info!(event = "authority.zones_loaded_config", origin = %zone.origin().to_ascii_lower(), "Loaded authoritative DNS zone from the configuration file");
-        /* 서명은 영역을 새로 만들므로 지문은 서명한 뒤에 붙인다. */
+        // Signing builds a new zone, so the source digest is attached after it.
         store.add(zone.with_source_digest(SourceDigest::of(text.as_bytes())));
     }
 
@@ -281,7 +272,6 @@ pub(crate) fn build_zone_store(
     Ok(store)
 }
 
-/** @brief 목록 영역에 적힌 회원 영역들. */
 pub(crate) fn catalog_members(records: &[onetdns_proto::Record], catalog: &str) -> Vec<String> {
     let catalog = catalog.trim_end_matches('.').to_ascii_lowercase();
     let zones_suffix = format!(".zones.{catalog}");
@@ -299,7 +289,6 @@ pub(crate) fn catalog_members(records: &[onetdns_proto::Record], catalog: &str) 
     out
 }
 
-/** @brief 회원 영역 하나를 가리키는 이름. */
 fn catalog_member_id(member: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -310,16 +299,13 @@ fn catalog_member_id(member: &str) -> String {
     format!("m{:016x}", h.finish())
 }
 
-/**
- * @brief 카탈로그 영역의 SOA serial.
- * @details 영역 저장소를 다시 만들 때마다 카탈로그도 다시 만든다. 구성원이 바뀌어도 serial이
- *          그대로면 소비자는 SOA만 보고 받아 가지 않으므로, 시각에서 계산해 늘 커지게 한다.
- */
+/// The catalog is rebuilt with every zone store rebuild. With an unchanged serial, consumers
+/// checking only the SOA would not fetch new members, so the serial comes from the clock and keeps
+/// rising.
 pub(crate) fn catalog_serial(now: u64) -> u32 {
     (now & u64::from(u32::MAX)) as u32
 }
 
-/** @brief 이 서버가 내보낼 목록 영역을 만든다. */
 fn build_catalog_zone(
     origin: &onetdns_proto::Name,
     members: &[String],
@@ -361,7 +347,6 @@ fn build_catalog_zone(
     onetdns_authority::Zone::from_records(recs)
 }
 
-/** @brief 영역 파일 디렉터리를 지켜보고 바뀌면 다시 올린다. */
 fn spawn_zones_dir_watcher(
     dir: std::path::PathBuf,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
@@ -402,14 +387,12 @@ fn spawn_zones_dir_watcher(
         })
 }
 
-/**
- * @brief 원본에서 다시 읽은 영역들을 저장소에 반영한다.
- * @details 원본을 읽는 일은 잠금 밖에서 끝내고, 저장소와 비교해 교체하는 일만 영역 변경 잠금
- *          아래에서 한다. 시리얼이 바뀐 영역의 IXFR 기록은 새 시리얼로 이어지지 않으므로 지운다.
- * @param prev_origins 지난번에 이 원본에서 읽은 영역들. 이번에 없으면 저장소에서 뺀다.
- * @param on_removed 뺀 영역마다 부른다.
- * @return 이번에 이 원본에서 읽은 영역들.
- */
+/// Reading the source finishes outside the lock; only comparing and swapping take the zone change
+/// lock. IXFR journals of zones whose serial changed are dropped, since they do not lead to the new
+/// serial.
+///
+/// `prev_origins`: zones this source gave last time; those missing now are removed, calling
+/// `on_removed` for each. Returns the zones this source gave this time.
 fn apply_source_reload(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     journal: &ZoneJournals,
@@ -449,24 +432,16 @@ fn apply_source_reload(
     new_origins
 }
 
-/**
- * @brief 지금 실행 중인 영역 원본 감시 작업들.
- *
- * @details 원본마다 종료 신호를 하나씩 가지고 있어서, 설정에서 빠진 원본의 감시만 멈추고
- *          새로 생긴 원본의 감시를 시작할 수 있다. 서버를 내렸다 올리지 않는다.
- */
+/// Running zone source watchers, each with its own stop signal, so a source removed from the config
+/// stops and a new one starts without restarting the server.
 #[derive(Default)]
 pub(crate) struct ZoneWatchers {
-    /** @brief 원본 이름과 그 감시를 멈출 신호. */
     running: Mutex<Vec<(String, Arc<std::sync::atomic::AtomicBool>)>>,
 }
 
-/**
- * @brief 설정에 적힌 영역 원본들을 이름으로 늘어놓는다.
- *
- * @details 이름이 같으면 같은 원본이다. 이름이 달라지면 이전 감시를 멈추고 새로 시작한다.
- * @return (이름, 그 원본을 만드는 함수) 목록. 만들지 못하는 원본은 이름만 남고 함수가 없다.
- */
+/// Configured zone sources by name: the same name is the same source, and a changed name stops the
+/// old watcher and starts a new one. Returns (name, constructor) pairs; a source that cannot be
+/// built has no constructor.
 pub(crate) fn zone_source_specs(
     cfg: &Config,
 ) -> Vec<(String, Option<Arc<dyn onetdns_authority::ZoneSource>>)> {
@@ -533,15 +508,9 @@ pub(crate) fn zone_source_specs(
     specs
 }
 
-/**
- * @brief 설정에 맞춰 영역 원본 감시를 시작하고 멈춘다.
- *
- * @details 시작할 때와 설정을 교체할 때 모두 이 함수만 부른다. 두 곳에서 따로 시작하면
- *          교체한 뒤 이전 원본을 보는 감시가 남아 지운 영역이 되살아난다.
- * @param cfg      맞출 설정.
- * @param watchers 지금 실행 중인 감시들.
- * @return 원본 주소가 틀려 시작하지 못한 것이 있으면 실패. 이미 뜬 것은 그대로 둔다.
- */
+/// Startup and config swaps both go through this alone; starting watchers in two places would leave
+/// one watching the old source after a swap and bring deleted zones back. Fails when a source
+/// address is wrong; watchers already running stay.
 pub(crate) fn reconcile_zone_watchers(
     cfg: &Config,
     watchers: &ZoneWatchers,
@@ -619,7 +588,6 @@ pub(crate) fn reconcile_zone_watchers(
     Ok(())
 }
 
-/** @brief 외부 저장소에서 영역을 읽는 곳을 만든다. */
 fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> {
     let ep = cfg.zones_etcd.as_ref()?;
     let mut src = onetdns_authority::EtcdZoneSource::new(ep.clone(), cfg.zones_etcd_prefix.clone());
@@ -666,7 +634,6 @@ fn build_etcd_source(cfg: &Config) -> Option<onetdns_authority::EtcdZoneSource> 
     Some(src)
 }
 
-/** @brief 외부 저장소를 지켜보고 바뀌면 다시 올린다. */
 fn spawn_zone_source_watcher(
     src: std::sync::Arc<dyn onetdns_authority::ZoneSource>,
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
@@ -720,17 +687,14 @@ fn spawn_zone_source_watcher(
         })
 }
 
-/** @brief 시리얼이 더 새것인지. 한 바퀴 도는 값이라 크기만 비교하면 안 된다. */
+/// RFC 1982 serial arithmetic: serials wrap, so a plain comparison is wrong.
 pub(crate) fn serial_gt(a: u32, b: u32) -> bool {
     a != b && a.wrapping_sub(b) < 0x8000_0000
 }
 
-/**
- * @brief 영역 하나를 교체한다.
- * @param _held 잠근 ZoneJournals. 잡고 있다는 증거로만 받는다. 영역을 바꾸는 모든 경로가 이
- *              잠금 아래에서 읽고, 계산하고, 교체해야 한다. 잠금 밖에서 교체하면 동적 갱신이 읽은
- *              뒤 끼워 넣기 전에 들어온 변경을 그 갱신이 덮어 버린다.
- */
+/// `_held` is the locked ZoneJournals, taken only as proof. Every path that changes a zone must
+/// read, compute, and swap under this lock; swapping outside it would let a dynamic update
+/// overwrite a change that arrived between its read and its swap.
 pub(crate) fn swap_zone(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     _held: &mut ZoneJournalMap,
@@ -748,10 +712,8 @@ pub(crate) fn swap_zone(
     });
 }
 
-/**
- * @brief 영역 하나를 빼고 그 영역의 IXFR 기록도 지운다.
- * @param journals 잠근 ZoneJournals. swap_zone 과 같은 잠금 규칙을 따른다.
- */
+/// Also drops the zone's IXFR journal. `journals` is the locked ZoneJournals, under the same rule
+/// as `swap_zone`.
 pub(crate) fn remove_zone(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     journals: &mut ZoneJournalMap,
@@ -769,21 +731,16 @@ pub(crate) fn remove_zone(
     });
 }
 
-/** @brief 영역을 고친 결과. */
 pub(crate) struct ZoneApplyResult {
-    /** @brief 고친 영역의 이름. */
     pub(crate) origin: String,
-    /** @brief 고친 뒤의 시리얼. */
     pub(crate) serial: u32,
-    /** @brief 고친 뒤의 기록 수. */
     pub(crate) records: usize,
-    /** @brief 파일에 저장했는지. */
+    /// Written to the zone file.
     pub(crate) persisted: bool,
-    /** @brief 다시 서명했는지. */
     pub(crate) signed: bool,
 }
 
-/** @brief 기록 하나를 사람이 읽을 문자열로. */
+/// Presentation format.
 pub(crate) fn zone_record_value(record: &onetdns_proto::Record) -> String {
     let line = onetdns_authority::record_to_master_line(record);
     line.trim_end()
@@ -793,12 +750,9 @@ pub(crate) fn zone_record_value(record: &onetdns_proto::Record) -> String {
         .to_string()
 }
 
-/**
- * @brief 기록 하나를 JSON으로.
- * @invariant 이름은 끝에 점을 붙인 절대 이름으로 낸다. 레코드 삭제 API는 점 없는 이름을
- *            영역 기준 상대 이름으로 읽는다. 목록이 점 없이 내보내면 목록에서 받은 이름을
- *            그대로 돌려준 삭제가 영역 이름이 두 번 붙은 이름을 찾아 늘 실패한다.
- */
+/// Names are absolute, with the trailing dot. The record delete API reads a name without the dot as
+/// relative to the zone, so a listed name sent back without the dot would get the zone name
+/// appended twice and never match.
 pub(crate) fn zone_record_json(record: &onetdns_proto::Record) -> String {
     format!(
         "{{\"name\":{},\"type\":{},\"ttl\":{},\"value\":{}}}",
@@ -809,7 +763,6 @@ pub(crate) fn zone_record_json(record: &onetdns_proto::Record) -> String {
     )
 }
 
-/** @brief 끝맺음 권한 기록을 뺀 기록들. */
 pub(crate) fn zone_records_without_closing_soa(
     zone: &onetdns_authority::Zone,
 ) -> Vec<onetdns_proto::Record> {
@@ -818,7 +771,8 @@ pub(crate) fn zone_records_without_closing_soa(
     recs
 }
 
-/** @brief 내용이 바뀌었으면 시리얼을 올린다. 올리지 않으면 하위 서버가 바뀐 줄 모른다. */
+/// Moves the serial past `old_serial` when the edit did not; otherwise secondaries would not notice
+/// the change.
 fn bump_soa_serial_if_needed(recs: &mut [onetdns_proto::Record], old_serial: Option<u32>) {
     let Some(old) = old_serial else { return };
     for r in recs.iter_mut() {
@@ -833,7 +787,7 @@ fn bump_soa_serial_if_needed(recs: &mut [onetdns_proto::Record], old_serial: Opt
     }
 }
 
-/** @brief 영역 이름을 파일 이름으로 쓸 수 있는 형태로. 경로를 벗어나는 표기는 거부한다. */
+/// Usable as a file name; rejects names that escape the directory.
 fn safe_zone_key(origin: &str) -> Result<String, String> {
     let key = origin.trim_end_matches('.').to_ascii_lowercase();
     if key.is_empty() {
@@ -854,22 +808,19 @@ fn safe_zone_key(origin: &str) -> Result<String, String> {
     Ok(key)
 }
 
-/** @brief 관리 API가 고칠 영역과 고친 내용을 쓸 파일. */
 pub(crate) struct ZoneApiTarget {
-    /** @brief 소문자로 맞춘 영역 이름. */
     pub(crate) key: String,
-    /** @brief 고친 영역을 쓸 파일. 없으면 메모리에만 남는다. */
+    /// None keeps the edit in memory only.
     pub(crate) path: Option<std::path::PathBuf>,
 }
 
-/**
- * @brief 이 영역을 관리 API로 고칠 수 있는지 지금 설정으로 가린다.
- * @details 보조 영역은 주 서버가 내용을 정한다. 외부 저장소(DB, etcd, LMDB, 카탈로그)에서
- *          온 영역은 다음 읽기에서 저장소 내용으로 되돌아가므로, 파일로 관리되는 영역이
- *          아니면 고치지 않는다. 설정은 부를 때마다 읽는다. 부팅 때 값을 붙잡으면 나중에
- *          더한 보조 영역을 고칠 수 있게 되고, 바꾼 영역 디렉터리 대신 이전 디렉터리에 쓴다.
- * @param verb 오류 문구에 넣을 동작 이름.
- */
+/// Whether the current config lets the management API edit this zone. A secondary zone's content
+/// belongs to the primary. Zones from external stores (DB, etcd, LMDB, catalog) revert to the
+/// store's content on the next read, so only file-managed zones are edited.
+///
+/// The config is read on every call: a value held from boot would allow editing a later-added
+/// secondary zone, and would write to the old zone directory after it changed. `verb` names the
+/// action in error messages.
 pub(crate) fn zone_api_target(
     cfg: &Config,
     store: &onetdns_authority::ZoneStore,
@@ -918,7 +869,6 @@ pub(crate) fn zone_api_target(
     })
 }
 
-/** @brief 영역 기준으로 이름을 푼다. */
 pub(crate) fn resolve_zone_name(s: &str, origin: &str) -> Option<onetdns_proto::Name> {
     let o = origin.trim_end_matches('.');
     if s == "@" {
@@ -931,14 +881,12 @@ pub(crate) fn resolve_zone_name(s: &str, origin: &str) -> Option<onetdns_proto::
     }
 }
 
-/**
- * @brief 파일이 이 서버가 마지막으로 본 내용 그대로인지 확인한다.
- * @details base 는 지금 메모리에 있는 영역이다. 그 영역이 파일에서 왔으면 지금 파일의 지문이
- *          그 지문과 같아야 하고, 파일에서 오지 않았으면 파일이 없어야 한다. 다르면 밖에서
- *          파일을 고친 것이다. 그대로 쓰거나 지우면 그 편집이 사라지고, 감시 작업이 나중에
- *          읽는 것도 이미 덮인 파일이다.
- * @warning 확인한 뒤 쓰기 전에 끼어드는 외부 쓰기까지 막지는 못한다.
- */
+/// Whether the file is as this server last saw it. `base` is the zone in memory: if it came from
+/// the file, the file's digest must still match; if not, the file must not exist. Otherwise someone
+/// edited the file outside; writing or deleting would lose that edit, and the watcher would later
+/// read an already overwritten file.
+///
+/// Does not stop an outside write that lands between this check and the write.
 pub(crate) fn ensure_zone_file_unchanged(
     path: &std::path::Path,
     base: Option<&onetdns_authority::Zone>,
@@ -952,11 +900,8 @@ pub(crate) fn ensure_zone_file_unchanged(
     ))
 }
 
-/**
- * @brief 고친 영역을 파일에 쓴다. 파일이 이 서버가 마지막으로 본 내용 그대로일 때만 쓴다.
- * @param base 지금 메모리에 있는 영역. 새로 만드는 영역이면 없다.
- * @return 쓴 내용의 지문을 붙인 영역.
- */
+/// Writes only when the file is as this server last saw it. `base` is the zone in memory, None for
+/// a new zone. Returns the zone with the written content's digest attached.
 pub(crate) fn persist_zone(
     path: &std::path::Path,
     base: Option<&onetdns_authority::Zone>,
@@ -969,7 +914,6 @@ pub(crate) fn persist_zone(
     Ok(zone.with_source_digest(SourceDigest::of(text.as_bytes())))
 }
 
-/** @brief 영역을 고친다. */
 pub(crate) fn apply_zone_mutation(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     zone: onetdns_authority::Zone,
@@ -991,7 +935,8 @@ pub(crate) fn apply_zone_mutation(
     )
 }
 
-/** @brief 영역을 고친다. 저장에 실패하면 저장소와 변경 기록을 되돌린다. 안 되돌리면 파일과 메모리가 어긋난다. */
+/// Reverts the store and the journal when saving fails; otherwise the file and memory would
+/// disagree.
 pub(crate) fn apply_zone_mutation_locked(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     zone: onetdns_authority::Zone,
@@ -1020,10 +965,9 @@ pub(crate) fn apply_zone_mutation_locked(
     bump_soa_serial_if_needed(&mut recs, old_serial);
     let mut signed = false;
     if let Some((_, ctx)) = signers.iter().find(|(o, _)| o.eq_ignore_case(&origin_name)) {
-        /*
-         * 지난 서명은 이 서버가 만들어 저장소에 가지고 있던 것이다. 바뀐 RRset과 새 부재 증명만
-         * 새로 서명하면 레코드 하나를 고치는 값이 영역 크기에 비례하지 않는다.
-         */
+        // The previous signatures were made by this server and kept in the store. Only changed
+        // RRsets and new denial proofs are signed, so editing one record does not cost in
+        // proportion to zone size.
         recs = ctx.sign_reusing(&recs, &old_recs);
         signed = true;
     }
@@ -1056,15 +1000,12 @@ pub(crate) fn apply_zone_mutation_locked(
     })
 }
 
-/** @brief 설정에 직접 적은 영역 파일을 다시 확인하는 주기(초). 디렉터리 감시와 같다. */
+/// For zone files named directly in the config; same as the directory watch.
 const ZONE_FILE_WATCH_SECS: u64 = 10;
 
-/**
- * @brief 설정에 직접 적은 영역 파일을 주기마다 확인하는 스레드를 띄운다.
- * @details 이 파일들도 zones_dir 의 파일과 똑같이 편집된다. 보지 않으면 직렬 번호를 올려도 이
- *          서버가 옛 영역을 계속 답하고, 세컨더리는 변경을 영영 받지 못한다.
- * @param reload 편집된 영역들을 설정 전체로 다시 만드는 함수.
- */
+/// Zone files named directly in the config are edited like those in zones_dir. Unwatched, this
+/// server would keep answering the old zone after a serial bump, and secondaries would never get
+/// the change. `reload` rebuilds the edited zones from the whole config.
 pub(crate) fn spawn_zone_file_watch(
     runtime_cfg: Arc<onetdns_core::ArcSwap<Config>>,
     reload: ZoneKeyReload,
@@ -1095,10 +1036,8 @@ pub(crate) fn spawn_zone_file_watch(
                             "Reloaded changed zone files and replaced the running zones"
                         );
                     }
-                    /*
-                     * mtime 을 남겨 두면 다음 주기에 다시 시도한다. 편집 도중의 반쪽 파일은
-                     * 그렇게 저절로 회복된다.
-                     */
+                    // Keeping the old mtime retries next period, so a half-written file being
+                    // edited recovers by itself.
                     Err(error) => onetdns_core::warn!(
                         event = "authority.zone_file_reload_failed",
                         %error,
@@ -1109,7 +1048,7 @@ pub(crate) fn spawn_zone_file_watch(
         })
 }
 
-/** @brief 설정에 적은 영역과 그 파일. 파일이 없는 영역이 있으면 실패한다. */
+/// Fails when a zone has no file.
 pub(crate) fn configured_zone_files(
     cfg: &Config,
 ) -> Result<Vec<(onetdns_proto::Name, PathBuf)>, String> {
@@ -1127,14 +1066,8 @@ pub(crate) fn configured_zone_files(
         .collect()
 }
 
-/**
- * @brief 파일이 편집된 영역들의 이름.
- *
- * @details 설정에 적힌 파일만 본다. 수정 시각이 달라진 파일과 이번에 처음 보이는 파일이
- *          대상이다. 처음 보이는 파일은 설정이 방금 그 영역을 더했다는 뜻이라 한 번 읽는다.
- * @param previous 지난 주기에 본 수정 시각.
- * @param current 이번 주기에 본 수정 시각.
- */
+/// Zones whose file mtime changed, or whose file appears for the first time: a new file means the
+/// config just added that zone, so it is read once. Only files named in the config count.
 fn zones_with_edited_files(
     cfg: &Config,
     previous: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
@@ -1153,7 +1086,7 @@ fn zones_with_edited_files(
         .collect()
 }
 
-/** @brief 설정에 직접 적은 영역 파일들의 지금 수정 시각. 읽지 못하는 파일은 빠진다. */
+/// Unreadable files are left out.
 fn zone_file_mtimes(cfg: &Config) -> std::collections::HashMap<PathBuf, std::time::SystemTime> {
     cfg.zones
         .iter()
@@ -1167,25 +1100,22 @@ fn zone_file_mtimes(cfg: &Config) -> std::collections::HashMap<PathBuf, std::tim
         .collect()
 }
 
-/** @brief 영역별 IXFR 기록. 영역 이름의 wire 표기로 찾는다. */
+/// Keyed by the zone name's wire form.
 pub(crate) type ZoneJournalMap = std::collections::HashMap<Vec<u8>, native::ZoneJournal>;
 
-/**
- * @brief 영역별 IXFR 기록과 영역 변경 잠금.
- * @details 이 Mutex 가 영역 저장소를 바꾸는 유일한 잠금이다. 동적 갱신, 관리 API, 원본 감시,
- *          secondary 전송, 설정으로 저장소 전체를 다시 만드는 경로가 모두 이것을 잡는다. 설정
- *          잠금처럼 바깥 잠금을 잡은 채 이것을 잡을 수는 있다. 이것을 잡은 채로는 NOTIFY 대기열처럼
- *          이 잠금을 다시 찾지 않는 잠금만 잡는다.
- */
+/// The IXFR journals and the zone change lock. This Mutex is the only lock for changing the zone
+/// store: dynamic update, the management API, source watchers, secondary transfers, and config
+/// rebuilds all take it.
+///
+/// It may be taken while holding an outer lock such as the config lock. While holding it, take only
+/// locks that never come back for it, such as the NOTIFY queue.
 pub(crate) type ZoneJournals = Arc<Mutex<ZoneJournalMap>>;
 
-/**
- * @brief 설정으로 새로 만든 저장소로 통째로 바꾼다.
- * @details 새 저장소는 원본에서 다시 읽은 것이라, 바뀐 영역의 이전 IXFR 기록은 새 시리얼로
- *          이어지지 않는다. 시리얼이 달라졌거나 사라진 영역의 기록을 지운다.
- * @param journals 잠근 ZoneJournals. 새 저장소를 만드는 동안에도 잡고 있어야 한다. 만드는 사이에
- *                 들어온 동적 갱신은 원본을 다시 읽기 전에 저장까지 끝나 있어야 사라지지 않는다.
- */
+/// The new store is reread from the sources, so old IXFR journals of changed zones do not lead to
+/// the new serials; journals of zones whose serial changed or that disappeared are dropped.
+///
+/// `journals` must stay locked while the new store is built: a dynamic update arriving meanwhile is
+/// lost unless saved before the sources are reread.
 pub(crate) fn replace_zone_store(
     store: &onetdns_core::ArcSwap<onetdns_authority::ZoneStore>,
     journals: &mut ZoneJournalMap,
@@ -1208,31 +1138,22 @@ pub(crate) fn replace_zone_store(
     store.store(next);
 }
 
-/**
- * @brief 한 세대 동안의 권한 영역 상태.
- * @details 핫 적용, 관리 API, 재서명, 파일 감시가 같은 저장소와 서명 키를 고친다. 모든 필드가
- *          공유 핸들이므로 복제해도 같은 상태를 가리킨다.
- */
+/// Authoritative zone state for one generation. Hot apply, the management API, re-signing, and file
+/// watchers change the same store and signing keys. Every field is a shared handle, so clones point
+/// at the same state.
 #[derive(Clone)]
 pub(crate) struct ZoneState {
-    /** @brief 지금 답하는 영역 저장소. */
     pub(crate) store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
-    /** @brief 서명하는 영역의 키. */
     pub(crate) signers: SharedZoneSigners,
-    /** @brief 영역별 IXFR 기록. */
     pub(crate) journal: ZoneJournals,
-    /** @brief 영역이 바뀌었을 때 NOTIFY 를 보낸다. */
     pub(crate) notify: NotifySender,
-    /** @brief 영역 원본 감시 작업. */
     pub(crate) watchers: Arc<ZoneWatchers>,
 }
 
 impl ZoneState {
-    /**
-     * @brief 서명 키를 읽고 저장소를 만든 뒤, NOTIFY 발신과 원본 감시를 시작한다.
-     * @details 시작할 때 올린 영역은 모두 NOTIFY 대기열에 넣는다. 서버가 멈춰 있던 동안의
-     *          변경을 세컨더리가 놓치지 않게 하려는 것이다.
-     */
+    /// Reads the signing keys, builds the store, then starts NOTIFY and the source watchers. Every
+    /// zone loaded at start is queued for NOTIFY, so secondaries do not miss changes made while the
+    /// server was down.
     pub(crate) fn start(
         cfg: &Config,
         tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -1291,13 +1212,12 @@ impl ZoneState {
         })
     }
 
-    /**
-     * @brief 설정 전체로 서명 키와 저장소를 다시 만들어 교체하는 함수를 만든다.
-     * @details 원본 하나만 바꿔 끼우지 않는 이유는 서명과 TSIG, ZONEMD 정책이 설정으로 만드는
-     *          경로에만 있기 때문이다. 넘겨받은 영역은 새 시리얼로 NOTIFY 대기열에 넣는다.
-     * @param native_hot_state 질의 처리기의 권한 영역 설정도 함께 바꾼다. 처리기를 만들기 전이면
-     *                         저장소만 바꾼다.
-     */
+    /// Returns a function that rebuilds the signing keys and store from the whole config and swaps
+    /// them. Not one source alone, because signing, TSIG, and ZONEMD policy exist only on the
+    /// config build path. Zones it gets are queued for NOTIFY with their new serial.
+    ///
+    /// `native_hot_state` also swaps the query handler's authority settings; before the handler
+    /// exists, only the store is swapped.
     pub(crate) fn reload_from_config(
         &self,
         runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
@@ -1315,10 +1235,8 @@ impl ZoneState {
                 let cfg = runtime.load();
                 let settings = build_authority_settings(&cfg)?;
                 let native = hot_state.lock_recover().clone();
-                /*
-                 * 원본을 다시 읽는 동안에도 영역 변경 잠금을 잡는다. 읽은 뒤에 들어온 동적 갱신은
-                 * 새 저장소에 없으므로, 교체하면 그 갱신이 사라진다.
-                 */
+                // The zone change lock is held while the sources are reread: a dynamic update
+                // arriving after the read is not in the new store and would be lost by the swap.
                 let mut journals = journal.lock_recover();
                 let store = build_zone_store(&cfg, &settings.tsig_keys, &settings.zone_signers)?;
                 signers.store(Arc::new(settings.zone_signers.clone()));
@@ -1338,7 +1256,6 @@ impl ZoneState {
 }
 
 #[cfg(test)]
-/** @brief 영역 저장소 구성과 영역 편집. */
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -1352,12 +1269,8 @@ mod tests {
     use crate::unix_now;
 
     #[test]
-    /**
-     * @brief 편집된 영역 파일만 다시 읽을 대상이 되는지.
-     *
-     * @details 직렬 번호를 올려도 이 서버가 옛 영역을 답하면 세컨더리는 변경을 영영 받지
-     *          못한다. 반대로 손대지 않은 영역까지 알리면 전송이 필요 없는 세컨더리를 깨운다.
-     */
+    /// If this server answers the old zone after a serial bump, secondaries never get the change;
+    /// announcing untouched zones wakes secondaries that need no transfer.
     fn only_the_edited_zone_file_is_reloaded() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-zone-watch-{}-{}",
@@ -1411,7 +1324,7 @@ mod tests {
             "손대지 않은 영역까지 다시 읽었습니다"
         );
 
-        /* 같은 초 안에 다시 써도 알아채는지 보려고 수정 시각을 명시적으로 옮긴다. */
+        // The mtime is moved explicitly, to show a rewrite within the same second is noticed.
         let handle = std::fs::OpenOptions::new()
             .write(true)
             .open(&second)
@@ -1434,7 +1347,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 권한 영역이 조용히 빠지지 않는지. */
     fn configured_authority_zone_cannot_disappear_silently() {
         let mut config = Config::default();
         config.zones.push(onetdns_config::ZoneConfig {
@@ -1452,7 +1364,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief SQL URL의 비밀번호만 바뀌어도 감시를 교체하되 식별 키에는 원문을 남기지 않는지. */
+    /// A change to the SQL URL password alone replaces the watcher, while the identity key holds no
+    /// plaintext.
     fn sql_source_credentials_are_redacted_and_change_source_identity() {
         let mut applied = Config {
             zones_postgres: Some("postgres://dns:old-postgres-secret@127.0.0.1/zones".into()),
@@ -1487,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 영역 이름으로 경로를 벗어나지 못하는지. 벗어나면 아무 파일이나 덮는다. */
+    /// Escaping would let a zone name overwrite any file.
     fn safe_zone_key_rejects_path_traversal() {
         assert_eq!(safe_zone_key("Example.COM.").unwrap(), "example.com");
         assert_eq!(
@@ -1517,11 +1430,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 관리 API가 지금 설정으로 고칠 수 있는 영역만 고치는지.
-     * @details 나중에 더한 보조 영역과 외부 저장소에서 온 영역은 거절하고, 바꾼 영역
-     *          디렉터리에 쓴다.
-     */
+    /// Later-added secondary zones and zones from external stores are refused, and edits go to the
+    /// changed zone directory.
     fn zone_api_follows_live_config() {
         let dir = std::env::temp_dir().join(format!("onetdns-zone-api-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1556,10 +1466,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 영역 목록이 내보낸 이름을 삭제 API가 같은 레코드로 읽는지.
-     * @details 대시보드는 목록에서 받은 이름을 그대로 삭제 요청에 담는다.
-     */
+    /// The dashboard sends a listed name back as is in delete requests.
     fn listed_zone_record_name_resolves_to_the_same_owner() {
         use onetdns_proto::{DnsClass, Name, RData, Record, RecordType};
         for owner in ["api.d.test", "d.test"] {
@@ -1582,7 +1489,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대·절대·꼭대기 이름이 모두 풀리는지. */
     fn resolve_zone_name_relative_absolute_apex() {
         use onetdns_proto::Name;
         let lc = |n: Name| n.to_ascii_lower();
@@ -1609,7 +1515,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록 영역을 내보내고 받아 오는 왕복. */
     fn catalog_producer_consumer_roundtrip() {
         use onetdns_proto::Name;
         let origin = Name::from_str("catalog.example").unwrap();
@@ -1628,7 +1533,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록 영역에서 회원 영역들을 추출하는지. */
     fn catalog_members_extracts_ptr_under_zones() {
         use onetdns_proto::{Name, RData, Record};
         let recs = vec![
@@ -1658,7 +1562,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 시리얼 비교가 한 바퀴 도는 것을 제대로 다루는지. */
     fn serial_gt_rfc1982() {
         assert!(serial_gt(2, 1));
         assert!(!serial_gt(1, 2));
@@ -1667,7 +1570,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 받아 둔 것이 없어도 시작이 망을 기다리며 멈추지 않는지. */
     fn missing_secondary_cache_never_blocks_service_startup_on_network() {
         let primary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         primary
@@ -1696,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장에 실패하면 저장소와 변경 기록을 되돌리는지. 안 되돌리면 파일과 메모리가 어긋난다. */
+    /// Otherwise the file and memory would disagree.
     fn failed_zone_persistence_keeps_store_and_ixfr_journal_unchanged() {
         let old = onetdns_authority::parse_zone(
             "$ORIGIN atomic.test.\n@ IN SOA ns admin 1 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n",
@@ -1734,11 +1636,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 관리 API 와 재서명도 밖에서 고친 영역 파일을 덮어쓰지 않는지.
-     * @details 메모리에 없는 영역을 새로 만들 때도, 같은 이름의 파일이 이미 있으면 쓰지 않는다.
-     *          감시 작업이 아직 읽지 않은 파일일 수 있다.
-     */
+    /// Also covers the management API and re-signing. When creating a zone not in memory, an
+    /// existing file of the same name is not overwritten either: the watcher may not have read it
+    /// yet.
     fn zone_mutation_refuses_to_overwrite_an_externally_edited_file() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-zone-digest-{}-{}",
@@ -1797,7 +1697,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /** @brief 이름과 시리얼만 다른 작은 영역. */
     fn tiny_zone(origin: &str, serial: u32) -> onetdns_authority::Zone {
         onetdns_authority::parse_zone(
             &format!("$ORIGIN {origin}.\n@ IN SOA ns admin {serial} 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n"),
@@ -1807,11 +1706,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 원본 감시가 진행 중인 영역 변경이 끝날 때까지 기다리는지.
-     * @details 동적 갱신은 영역 변경 잠금을 잡고 읽고, 계산하고, 교체한다. 감시가 그 사이에 끼어들어
-     *          영역을 바꾸면 갱신이 오래된 영역으로 만든 결과로 그 변경을 덮는다.
-     */
+    /// Dynamic update reads, computes, and swaps under the zone change lock. A watcher swapping the
+    /// zone in between would have its change overwritten by the update's result, built from the
+    /// older zone.
     fn source_reload_waits_for_an_in_flight_zone_mutation() {
         let mut zones = onetdns_authority::ZoneStore::new();
         zones.add(tiny_zone("race.test", 1));
@@ -1849,7 +1746,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장소를 통째로 바꿀 때 시리얼이 그대로인 영역의 IXFR 기록만 남기는지. */
     fn replacing_the_store_keeps_journals_only_for_unchanged_zones() {
         let mut zones = onetdns_authority::ZoneStore::new();
         for (origin, serial) in [("same.test", 1), ("bumped.test", 1), ("gone.test", 1)] {

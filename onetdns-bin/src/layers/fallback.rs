@@ -1,6 +1,4 @@
-/*!
- * @brief 주 경로의 전송이 끊겼을 때만 예비 경로로 다시 묻는 계층.
- */
+//! Asks a fallback path again only when the primary path's transport failed.
 
 use std::sync::Arc;
 
@@ -9,36 +7,26 @@ use onetdns_proto::{Message, RecordType, ResponseCode};
 use super::outcome_to_option;
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/**
- * @brief 주 경로가 닿지 못했을 때 다른 경로로 다시 묻는 계층.
- * @warning 전송이 끊긴 실패만 넘긴다. 설정이 틀렸거나 검증에 실패한 것은 다시 물어도
- *          같고, 넘기면 검증 실패를 우회하는 길이 된다.
- */
+/// Only transport failures fall back. A config or validation failure would repeat, and falling back
+/// on it would bypass validation.
 pub struct FallbackLayer {
-    /** @brief 먼저 물어볼 곳. */
     primary: Arc<dyn Resolver>,
-    /** @brief 주 경로가 닿지 못했을 때 물어볼 곳. */
     fallback: Arc<dyn Resolver>,
 }
 
 impl FallbackLayer {
-    /** @brief 주 경로와 보조 경로로 만든다. */
     pub fn new(primary: Arc<dyn Resolver>, fallback: Arc<dyn Resolver>) -> Self {
         FallbackLayer { primary, fallback }
     }
 }
 
 impl Resolver for FallbackLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /**
-     * @brief 주 경로가 닿지 못했을 때만 보조 경로로 다시 묻는다.
-     * @note 다시 물을 때 요청을 처음 상태로 되돌린다. 주 경로가 채워 넣은 표시를 그대로
-     *       전달하면 보조 경로가 그것을 이 서버의 판단으로 오해한다.
-     */
+    /// Retries with a clean query with RD set: response-only flags and records in the client's
+    /// request would otherwise reach the fallback as if this server had sent them.
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         match self.primary.resolve_outcome(req) {
             ResolveOutcome::Response(response) => ResolveOutcome::Response(response),
@@ -77,7 +65,6 @@ impl Resolver for FallbackLayer {
 }
 
 #[cfg(test)]
-/** @brief 예비 경로로 넘어가는 실패와 넘어가지 않는 응답. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -90,14 +77,11 @@ mod tests {
     use crate::layers::answer_message;
     use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-    /** @brief 재귀 요구 표시를 그대로 되비추는 테스트용 리졸버. */
     struct RecursionDesiredMock {
-        /** @brief 재귀 요구 표시가 실려 왔는지. */
         seen: std::sync::atomic::AtomicBool,
     }
 
     impl RecursionDesiredMock {
-        /** @brief 만든다. */
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 seen: std::sync::atomic::AtomicBool::new(false),
@@ -106,7 +90,6 @@ mod tests {
     }
 
     impl Resolver for RecursionDesiredMock {
-        /** @brief 미리 정해 둔 응답을 돌려준다. */
         fn resolve(&self, req: &Message) -> Option<Message> {
             self.seen
                 .store(req.header.recursion_desired, Ordering::SeqCst);
@@ -124,14 +107,11 @@ mod tests {
         }
     }
 
-    /** @brief 전송이 끊긴 실패를 내는 테스트용 리졸버. */
     struct TransportFailureMock {
-        /** @brief 불린 횟수. */
         calls: AtomicU32,
     }
 
     impl TransportFailureMock {
-        /** @brief 만든다. */
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicU32::new(0),
@@ -140,27 +120,22 @@ mod tests {
     }
 
     impl Resolver for TransportFailureMock {
-        /** @brief 언제나 답하지 않는다. */
         fn resolve(&self, _req: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             None
         }
 
-        /** @brief 전송이 끊겼다고 알린다. */
         fn resolve_outcome(&self, _req: &Message) -> ResolveOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ResolveOutcome::Failure(ResolveFailure::TransportExhausted)
         }
     }
 
-    /** @brief 다시 물어도 같은 실패를 내는 테스트용 리졸버. */
     struct PermanentFailureMock {
-        /** @brief 불린 횟수. */
         calls: AtomicU32,
     }
 
     impl PermanentFailureMock {
-        /** @brief 만든다. */
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicU32::new(0),
@@ -169,13 +144,11 @@ mod tests {
     }
 
     impl Resolver for PermanentFailureMock {
-        /** @brief 언제나 답하지 않는다. */
         fn resolve(&self, _req: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             None
         }
 
-        /** @brief 되돌릴 수 없는 실패라고 알린다. */
         fn resolve_outcome(&self, _req: &Message) -> ResolveOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ResolveOutcome::Failure(ResolveFailure::Permanent(None))
@@ -183,7 +156,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 전송이 끊겼을 때 보조 경로로 넘어가는지. */
     fn fallback_on_transport_exhaustion() {
         let primary = TransportFailureMock::new();
         let fallback = Mock::new(2, ResponseCode::NoError.0);
@@ -198,7 +170,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보조 경로에 재귀를 요구해 묻는지. */
     fn fallback_forces_recursion_desired() {
         let primary = TransportFailureMock::new();
         let fallback = RecursionDesiredMock::new();
@@ -220,7 +191,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 되돌릴 수 없는 실패는 넘기지 않는지. 넘기면 검증 실패를 우회하는 길이 된다. */
     fn no_fallback_on_permanent_backend_failure() {
         let primary = PermanentFailureMock::new();
         let fallback = Mock::new(2, ResponseCode::NoError.0);
@@ -238,7 +208,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오류 응답을 받은 것은 실패로 보지 않는지. */
     fn no_fallback_on_servfail_response() {
         let primary = Mock::new(1, ResponseCode::ServFail.0);
         let fallback = Mock::new(2, ResponseCode::NoError.0);
@@ -250,7 +219,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 거절 응답을 받은 것은 실패로 보지 않는지. */
     fn no_fallback_on_refused_response() {
         let primary = Mock::new(1, ResponseCode::Refused.0);
         let fallback = Mock::new(2, ResponseCode::NoError.0);
@@ -261,7 +229,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정상 응답에는 다시 묻지 않는지. */
     fn no_fallback_on_noerror() {
         let primary = Mock::new(1, ResponseCode::NoError.0);
         let fallback = Mock::new(2, ResponseCode::NoError.0);
@@ -272,7 +239,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 근거 없이 비어 온 응답에도 다시 묻지 않는지. */
     fn no_fallback_on_unproven_empty_noerror_packet() {
         let primary = EmptyMock::new(false);
         let fallback = Mock::new(8, ResponseCode::NoError.0);
@@ -286,7 +252,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 근거가 담긴 빈 응답에 다시 묻지 않는지. */
     fn no_fallback_on_proven_nodata() {
         let primary = EmptyMock::new(true);
         let fallback = Mock::new(8, ResponseCode::NoError.0);

@@ -10,18 +10,16 @@ use onetdns_tls::{ClientConfig, TlsSession, TrustStore};
 
 use crate::{io_err, ForwardError};
 
-/** @brief QUIC 연결을 구동할 때의 폴링 간격. */
 const POLL: Duration = Duration::from_millis(200);
 
-/** @brief 보관할 TLS 세션 티켓 수. 0-RTT 재개에 쓴다. */
+/// Session tickets kept for resumption.
 const MAX_CACHED_SESSIONS: usize = 256;
 
-/** @brief (주소, 서버 이름, ALPN, 보안 정책)별 세션 티켓. 워커 사이에서 공유된다. */
+/// Keyed by address, server name, ALPN, and security policy; shared across workers.
 static SESSIONS: Mutex<
     Option<HashMap<(SocketAddr, String, Vec<u8>, crate::TlsCacheScope), TlsSession>>,
 > = Mutex::new(None);
 
-/** @brief 재개에 쓸 세션 티켓을 꺼낸다. */
 pub(crate) fn cached_session(
     addr: SocketAddr,
     server_name: &str,
@@ -44,7 +42,7 @@ pub(crate) fn cached_session(
     map.get(&key).cloned()
 }
 
-/** @brief 세션 티켓을 보관한다. 상한을 넘으면 오래된 것부터 버린다. */
+/// Evicts the oldest past the limit.
 fn cache_session(
     map: &mut HashMap<(SocketAddr, String, Vec<u8>, crate::TlsCacheScope), TlsSession>,
     key: (SocketAddr, String, Vec<u8>, crate::TlsCacheScope),
@@ -64,7 +62,6 @@ fn cache_session(
     map.insert(key, session);
 }
 
-/** @brief 연결에서 새로 받은 세션 티켓을 거둬 보관한다. */
 pub(crate) fn harvest_sessions(
     conn: &mut Connection,
     addr: SocketAddr,
@@ -94,130 +91,97 @@ pub(crate) fn harvest_sessions(
     }
 }
 
-/**
- * @brief 소켓 없이 만들어진 QUIC 상태를 구동하는 인터페이스.
- *
- * @details onetdns-quic은 sans-IO다. 소켓을 몰라서 스스로 데이터그램을 주고받지 못한다.
- *          이 트레이트가 그 상태를 실제 소켓에 연결하는 지점이며, DoQ 연결과 DoH3
- *          클라이언트가 각각 구현한다.
- */
+/// Drives a QUIC state machine built without sockets. onetdns-quic is sans-IO and cannot send or
+/// receive datagrams itself; this trait connects it to a real socket, implemented by DoQ
+/// connections and the DoH3 client.
 pub(crate) trait QuicDriven {
-    /** @brief 받은 데이터그램을 상태에 넣는다. */
     fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError>;
-    /** @brief 내보낼 데이터그램을 꺼낸다. 없으면 None. */
     fn next_datagram(&mut self) -> Option<Vec<u8>>;
-    /** @brief 핸드셰이크가 끝났는지. */
     fn is_handshake_complete(&self) -> bool;
-    /** @brief 응용 데이터를 보낼 수 있는 상태인지. */
     fn can_send_app(&self) -> bool;
-    /** @brief 연결이 닫혔는지. */
     fn is_closed(&self) -> bool;
-    /** @brief 연결이 닫힌 까닭. 진단에 쓴다. */
     fn close_detail(&mut self) -> Option<String>;
 
-    /** @brief 현재 시각을 알려 준다. sans-IO라 시계도 밖에서 넣어 준다. */
+    /// Sans-IO, so the clock comes from outside too.
     fn set_now(&mut self, now_ms: u64);
 
-    /** @brief 타이머 만료를 처리한다. 재전송과 유휴 종료가 여기서 일어난다. */
+    /// Retransmission and idle close happen here.
     fn on_timeout(&mut self, now_ms: u64);
 }
 
 impl QuicDriven for Connection {
-    /** @brief 받은 데이터그램을 상태 기계에 넣는다. */
     fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         Connection::recv_datagram(self, dg)
     }
-    /** @brief 내보낼 데이터그램. 없으면 없다. */
     fn next_datagram(&mut self) -> Option<Vec<u8>> {
         Connection::next_datagram(self)
     }
-    /** @brief 핸드셰이크가 끝났는지. */
     fn is_handshake_complete(&self) -> bool {
         Connection::is_handshake_complete(self)
     }
-    /** @brief 이제 질의를 보낼 수 있는지. */
     fn can_send_app(&self) -> bool {
         Connection::can_send_app(self)
     }
-    /** @brief 연결이 닫혔는지. */
     fn is_closed(&self) -> bool {
         Connection::is_closed(self)
     }
-    /** @brief 연결이 닫힌 까닭. */
     fn close_detail(&mut self) -> Option<String> {
         Connection::close_detail(self)
     }
-    /** @brief 지금 시각을 알린다. */
     fn set_now(&mut self, now_ms: u64) {
         Connection::set_now(self, now_ms)
     }
-    /** @brief 데드라인이 지났음을 알려 재전송을 돌린다. */
     fn on_timeout(&mut self, now_ms: u64) {
         Connection::on_timeout(self, now_ms);
     }
 }
 
 impl QuicDriven for onetdns_quic::H3Client {
-    /** @brief 받은 데이터그램을 상태 기계에 넣는다. */
     fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         onetdns_quic::H3Client::recv_datagram(self, dg)
     }
-    /** @brief 내보낼 데이터그램. 없으면 없다. */
     fn next_datagram(&mut self) -> Option<Vec<u8>> {
         onetdns_quic::H3Client::next_datagram(self)
     }
-    /** @brief 핸드셰이크가 끝났는지. */
     fn is_handshake_complete(&self) -> bool {
         onetdns_quic::H3Client::is_handshake_complete(self)
     }
-    /** @brief 이제 질의를 보낼 수 있는지. */
     fn can_send_app(&self) -> bool {
         onetdns_quic::H3Client::can_send_app(self)
     }
-    /** @brief 연결이 닫혔는지. */
     fn is_closed(&self) -> bool {
         onetdns_quic::H3Client::is_closed(self)
     }
-    /** @brief 연결이 닫힌 까닭. */
     fn close_detail(&mut self) -> Option<String> {
         self.conn_mut().close_detail()
     }
-    /** @brief 지금 시각을 알린다. */
     fn set_now(&mut self, now_ms: u64) {
         self.conn_mut().set_now(now_ms)
     }
-    /** @brief 데드라인이 지났음을 알려 재전송을 돌린다. */
     fn on_timeout(&mut self, now_ms: u64) {
         self.conn_mut().on_timeout(now_ms);
     }
 }
 
-/** @brief 응답이 전혀 없을 때 연결을 포기하기까지의 시간. PTO의 배수로 정한다. */
+/// How long total silence lasts before giving up, as a multiple of the PTO.
 pub(crate) fn silence_limit_ms(base_pto_ms: u64) -> u64 {
     (3 * base_pto_ms).clamp(500, 1500)
 }
 
-/**
- * @brief 무작위 연결 ID를 만든다.
- * @warning 예측 가능한 연결 ID는 경로 밖 공격자가 연결을 흉내 내는 경로가 된다.
- */
+/// A predictable connection ID lets an off-path attacker impersonate the connection.
 pub(crate) fn random_cid() -> Vec<u8> {
     let mut cid = [0u8; 8];
     onetdns_tls::sys::fill_random(&mut cid);
     cid.to_vec()
 }
 
-/**
- * @brief 업스트림 QUIC 클라이언트의 TLS 설정.
- *
- * @details 세션 티켓이 있으면 재개를 시도한다. 재개는 PSK-DHE로만 하므로 전방 비밀성이
- *          유지된다.
- * @warning 0-RTT는 켜지 않는다. 켜면 DoQ·DoH3 질의가 전방 비밀성 없는 early data로 나가
- *          경로상 공격자가 기록해 두었다가 그대로 재생할 수 있고, 티켓 키가 나중에
- *          털리면 어떤 이름을 물었는지가 드러난다. DoH3는 POST를 쓰므로 RFC 8470이
- *          경고하는 형태이기도 하다. doh3·doq의 can_send_early 분기는 이 값이 거짓이라
- *          생산 경로에서 닿지 않는다. 이 값을 바꾸면 그 분기가 살아난다.
- */
+/// Resumes when a session ticket exists, only with PSK-DHE, so forward secrecy holds.
+///
+/// 0-RTT stays off. With it on, DoQ and DoH3 queries would go out as early data without forward
+/// secrecy: an on-path attacker could record and replay them, and a ticket key leaked later would
+/// reveal which names were asked. DoH3 uses POST, the form RFC 8470 warns about. The can_send_early
+/// branches in doh3 and doq are unreachable in production because this is false; changing it brings
+/// them to life.
 pub(crate) fn client_tls_config(
     addr: SocketAddr,
     server_name: &str,
@@ -235,19 +199,15 @@ pub(crate) fn client_tls_config(
     }
 }
 
-/**
- * @brief 상대에 연결한 QUIC 소켓과 그 소켓에 건 수신 한도.
- * @details 수신은 반드시 이 한도로 기다려야 한다. 소켓 수신 한도에 기대면 윈도우에서 한도에
- *          걸리는 순간 도착한 데이터그램을 버린다.
- */
+/// A connected QUIC socket and the receive limit set on it. Receives must wait with this limit;
+/// relying on the socket's own receive timeout drops datagrams arriving at the moment it fires on
+/// Windows.
 pub(crate) struct QuicSocket {
-    /** @brief 상대에 연결한 UDP 소켓. */
     sock: UdpSocket,
-    /** @brief 이 소켓에 건 수신 한도. */
     wait: RecvWait,
 }
 
-/** @brief 클라이언트 QUIC 연결 상태를 만든다. 세션 티켓이 있으면 재개를 시도한다. */
+/// Resumes when a session ticket exists.
 pub(crate) fn new_client_connection(
     addr: SocketAddr,
     server_name: &str,
@@ -276,11 +236,8 @@ pub(crate) fn new_client_connection(
     Ok((QuicSocket { sock, wait }, conn))
 }
 
-/**
- * @brief QUIC 상대 인증서의 폐기 여부를 확인한다.
- * @details 연결당 한 번, 핸드셰이크가 끝난 직후에 부른다. DoQ와 DoH3가 공유한다. 거부하면
- *          TLS 가 인증서를 거부했을 때처럼 CRYPTO_ERROR 로 연결을 닫는다.
- */
+/// Once per connection, right after the handshake, shared by DoQ and DoH3. A rejection closes with
+/// CRYPTO_ERROR, as when TLS rejects a certificate.
 pub(crate) fn check_peer_revocation(
     conn: &mut Connection,
     server_name: &str,
@@ -300,7 +257,6 @@ pub(crate) fn check_peer_revocation(
     Ok(())
 }
 
-/** @brief 상태가 내보낼 데이터그램을 전부 소켓으로 보낸다. */
 pub(crate) fn flush_out<D: QuicDriven>(sock: &QuicSocket, d: &mut D) -> Result<(), ForwardError> {
     while let Some(dg) = d.next_datagram() {
         sock.sock.send(&dg).map_err(io_err)?;
@@ -308,12 +264,9 @@ pub(crate) fn flush_out<D: QuicDriven>(sock: &QuicSocket, d: &mut D) -> Result<(
     Ok(())
 }
 
-/**
- * @brief 데이터그램 하나를 받아 상태에 넣는다.
- * @details 넣다가 연결 오류가 나면 상태 기계는 그 오류를 알리는 종료 프레임을 쌓아 두고
- *          닫힌다. 그 프레임은 연결을 쥔 DoqConn 이나 Doh3Conn 이 버려질 때 내보낸다.
- * @return 데이터그램을 받았으면 true, 수신 한도까지 아무것도 오지 않았으면 false.
- */
+/// Receives one datagram into the state. A connection error there queues a close frame and closes
+/// the state; the frame goes out when the owning DoqConn or Doh3Conn is dropped. True when a
+/// datagram arrived, false when nothing came within the receive limit.
 pub(crate) fn recv_once<D: QuicDriven>(
     sock: &QuicSocket,
     d: &mut D,
@@ -334,11 +287,8 @@ pub(crate) fn recv_once<D: QuicDriven>(
     }
 }
 
-/**
- * @brief 핸드셰이크가 끝날 때까지 연결을 구동한다.
- * @details 데드라인과 무응답 한도를 함께 본다. 응답이 오지만 진전이 없는 경우와 아예 침묵인
- *          경우를 모두 끊어야 한다.
- */
+/// Watches both the deadline and the silence limit: a peer that answers without progress and one
+/// that stays silent must both be cut off.
 pub(crate) fn pump_handshake<D: QuicDriven>(
     sock: &QuicSocket,
     d: &mut D,
@@ -371,11 +321,9 @@ pub(crate) fn pump_handshake<D: QuicDriven>(
 }
 
 #[cfg(test)]
-/**
- * @brief 상대가 앞선 데이터를 하나도 확인하지 않은 것처럼 보낼 버퍼를 끝까지 채운다.
- * @details 상대가 허락한 스트림 수 너머의 번호에 쌓으므로 실제로는 나가지 않는다. 이 뒤로는 한
- *          바이트도 더 보낼 수 없다.
- */
+/// Fills the send buffer to the end as if the peer had acknowledged nothing, on stream numbers
+/// beyond what the peer allows, so nothing actually goes out. After this, not one more byte can be
+/// sent.
 pub(crate) fn fill_send_buffer(conn: &mut Connection) {
     let mut id = 1u64 << 40;
     let mut size = 64 * 1024;
@@ -389,11 +337,9 @@ pub(crate) fn fill_send_buffer(conn: &mut Connection) {
 }
 
 #[cfg(test)]
-/** @brief 담아 둔 세션이 만료되고 상한을 지키는지. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 세션. */
     fn session(obtained_at_ms: u64, lifetime_secs: u32) -> TlsSession {
         TlsSession {
             server_name: "dns.example".to_string(),
@@ -410,12 +356,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 업스트림 QUIC 클라이언트가 0-RTT를 제시하지 않는지.
-     * @details 켜지면 질의가 전방 비밀성 없는 early data로 나가 재생 가능해진다.
-     *          기본값에 기대지 않고 여기서 값을 못 고정한다. doh3·doq의 can_send_early
-     *          분기가 이 값 하나로 생산 경로에서 죽어 있기 때문이다.
-     */
+    /// Early data would carry queries without forward secrecy, open to replay. The value is pinned
+    /// here instead of relying on the default, since this one value keeps the can_send_early
+    /// branches in doh3 and doq dead in production.
     fn forward_quic_client_never_offers_early_data() {
         let trust = TrustStore::empty();
         for alpn in [b"doq".as_slice(), b"h3".as_slice()] {
@@ -434,7 +377,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료된 세션이 걷히고 담는 양이 상한을 지키는지. */
     fn session_cache_prunes_expired_entries_and_stays_bounded() {
         let mut map = HashMap::new();
         let scope = crate::tls_cache_scope(&TrustStore::empty());

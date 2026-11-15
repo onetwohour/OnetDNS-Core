@@ -1,17 +1,12 @@
-/*!
- * @brief 권한 DNS 서빙.
- *
- * @details 이 서버가 소유한 zone에 대해 직접 답한다. 저장 구조는 질의 경로가 할당 없이
- *          돌도록 짜여 있다. 레코드는 단일 아레나에, 소유자 인덱스는 8바이트 범위만
- *          담는다. A/AAAA 같은 흔한 질의는 응답을 조립하지 않고 곧장 와이어로 쓴다.
- * @note zone 데이터는 여러 공급자에서 오지만 전부 parse_zone을 거친다. 어느 경로로
- *       들어오든 같은 검증을 받는다.
- */
+//! Authoritative answers for zones this server owns. Storage is laid out so the query path does not
+//! allocate: records sit in one arena, the owner index holds only 8-byte ranges, and common queries
+//! such as A and AAAA are written straight to the wire without assembling a response.
+//!
+//! Every load path ends in Zone::from_flat_records, so zone data from any source gets the same
+//! validation.
 
 #[cfg(test)]
-/** @brief 파서 훑기 테스트 도구. */
 mod fuzzutil;
-/** @brief 영역 파일 읽기. */
 mod parse;
 
 use std::cmp::Ordering;
@@ -25,43 +20,29 @@ use onetdns_proto::{DnsClass, Message, Name, ProtoError, RData, Record, RecordTy
 
 pub use parse::parse_zone;
 
-/** @brief zone 공급자 추상과 파일·디렉터리·메모리 구현. */
 pub mod source;
 pub use source::{DirZoneSource, FileZoneSource, MemoryZoneSource, ZoneSource};
-/** @brief SQLite 파일 백엔드. */
 pub mod sqlite;
 pub use sqlite::SqliteZoneSource;
-/** @brief etcd 백엔드. */
 pub mod etcd;
 pub use etcd::EtcdZoneSource;
-/** @brief PostgreSQL 백엔드. */
 pub mod postgres;
 pub use postgres::PostgresZoneSource;
-/** @brief MySQL/MariaDB 백엔드. */
 pub mod mysql;
 pub use mysql::MysqlZoneSource;
-/** @brief LMDB 파일 백엔드. */
 pub mod lmdb;
 pub use lmdb::LmdbZoneSource;
 
-/** @brief zone 하나가 가질 수 있는 레코드 수 상한. */
 const MAX_ZONE_RECORDS: usize = 1_000_000;
-/** @brief 소유자 이름 하나에 붙을 수 있는 레코드 수 상한. */
 const MAX_OWNER_RECORDS: usize = 4_096;
-/** @brief zone 전송 메시지 하나에 담을 바이트 예산. TCP 메시지 크기를 넘지 않게 끊는다. */
+/// Bytes per zone transfer message, kept under the TCP message limit.
 pub const XFR_CHUNK_BUDGET: usize = 60_000;
 
-/** @brief 이 이름이 zone에 존재한다. */
 const NAME_EXISTS: u8 = 1;
-/** @brief 이 이름 아래에 와일드카드 자식이 있다. */
 const NAME_HAS_WILDCARD: u8 = 2;
-/** @brief 이 이름 아래에 DNAME이 있다. */
 const NAME_HAS_DNAME: u8 = 4;
 
-/**
- * @brief 정규 키에서 부모의 키를 얻는다. 첫 라벨을 떼어 낸 나머지다.
- * @return 이미 루트면 None.
- */
+/// Drops the first label; None at the root.
 fn parent_canonical_key(key: &[u8]) -> Option<&[u8]> {
     let label_len = usize::from(*key.first()?);
     if label_len == 0 {
@@ -70,12 +51,8 @@ fn parent_canonical_key(key: &[u8]) -> Option<&[u8]> {
     key.get(label_len.checked_add(1)?..)
 }
 
-/**
- * @brief 접속 주소를 호스트와 포트로 구분한다.
- * @details 대괄호로 감싼 IPv6를 먼저 처리한다. 그러지 않으면 주소 안의 콜론을 포트
- *          구분자로 잘못 본다. 콜론이 정확히 하나일 때만 포트로 해석하는 것도 같은 이유다.
- * @return 포트가 0이거나 호스트가 비면 None.
- */
+/// Handles bracketed IPv6 first, and takes a port only when there is exactly one colon, so colons
+/// inside an address are not read as a port separator. None for port 0 or an empty host.
 fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
     if let Some(bracketed) = authority.strip_prefix('[') {
         let end = bracketed.find(']')?;
@@ -96,14 +73,9 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
     (!authority.is_empty()).then_some((authority.to_string(), default_port))
 }
 
-/**
- * @brief DB 접속 주소가 루프백인지 확인하고 소켓 주소로 만든다.
- *
- * @details 이름은 localhost만 받고 나머지는 IP 문자열이어야 한다. 이름을 해석하려면
- *          DNS가 필요한데, 그 DNS가 자기 자신이면 시작 중 순환이 생긴다.
- * @warning 루프백이 아니면 거부한다. mysql과 postgres 백엔드는 TLS 없이 말하므로,
- *          원격으로 향하면 자격증명과 zone 데이터가 평문으로 흐른다.
- */
+/// Accepts only localhost or an IP literal: resolving a name needs DNS, which could be this server,
+/// a loop at startup. Rejects anything but loopback: the mysql and postgres backends speak without
+/// TLS, so a remote target would carry credentials and zone data in the clear.
 fn loopback_socket_addr(host: &str, port: u16, backend: &str) -> Result<SocketAddr, String> {
     let ip = if host.eq_ignore_ascii_case("localhost") {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -124,59 +96,45 @@ fn loopback_socket_addr(host: &str, port: u16, backend: &str) -> Result<SocketAd
 
 pub(crate) use onetdns_core::tcp::DeadlineTcp;
 
-/**
- * @brief zone 하나. 로드 후에는 바뀌지 않는다.
- * @details 레코드를 아레나 하나에 몰아넣고 인덱스는 그 안의 범위만 가리킨다. 질의마다
- *          자료구조를 타고 다니며 할당하지 않으려는 배치다.
- */
+/// Immutable after load. Records live in one arena and the index points at ranges in it, so queries
+/// walk the structure without allocating.
 #[derive(Clone)]
 pub struct Zone {
-    /** @brief zone apex. */
     origin: Name,
-    /** @brief apex의 SOA. 부정 응답과 전송에 쓴다. */
     soa: Soa,
-    /** @brief SOA 레코드의 TTL. */
     soa_ttl: u32,
 
-    /** @brief 소유자 이름에서 아레나 범위로 가는 인덱스. */
     records: OwnerIndex,
-    /** @brief 모든 레코드를 담은 단일 아레나. */
     record_arena: Box<[StoredRecord]>,
-    /** @brief AAAA 주소만 따로 모은 아레나. 레코드 변형 크기를 줄인다. */
+    /// Kept apart to shrink the stored record variant.
     aaaa_arena: Box<[std::net::Ipv6Addr]>,
-    /** @brief A·AAAA가 아닌 레코드를 담은 아레나. 저장 형태는 인덱스만 가지고 있다. */
+    /// Records other than A and AAAA; the stored form holds only an index.
     other_arena: Box<[Record]>,
 
-    /** @brief 이름별 존재·와일드카드·DNAME 표시. 빈 비단말도 여기 들어간다. */
+    /// Existence, wildcard, and DNAME flags per name, empty non-terminals included.
     name_flags: HashMap<Vec<u8>, u8>,
-    /** @brief 위임이 하나라도 있는지. 없으면 질의마다 위임을 찾지 않는다. */
+    /// When false, queries skip the delegation search.
     has_delegations: bool,
-    /** @brief 위임도 DNAME도 와일드카드도 없는 평탄한 zone인지. 무할당 경로의 전제다. */
+    /// No delegation, DNAME, or wildcard: the precondition of the allocation-free path.
     simple_nxdomain: bool,
-    /** @brief 부재 증명 레코드의 위치 인덱스. */
     denial_index: HashMap<RecordType, Vec<RecordLocation>>,
 
-    /** @brief 전송용 와이어 템플릿. 처음 요청될 때 한 번만 만든다. */
+    /// Built once on first request.
     axfr_wire: Arc<OnceLock<Result<Box<[Box<[u8]>]>, ProtoError>>>,
-    /** @brief 이 내용을 읽어 오거나 써 넣은 파일의 지문. 파일에서 오지 않았으면 없다. */
+    /// Digest of the file this content was read from or written to; None when it did not come from
+    /// a file.
     source: Option<source::SourceDigest>,
 }
 
-/** @brief 아레나 안 레코드 하나의 위치. 소유자 키와 그 안에서의 곳이다. */
 #[derive(Clone)]
 struct RecordLocation {
-    /** @brief 소유자 이름의 정규 키. */
     owner: Vec<u8>,
-    /** @brief 그 소유자의 레코드들 중 몇 번째인지. */
+    /// Index among that owner's records.
     offset: usize,
 }
 
-/**
- * @brief 전송 응답 메시지 하나를 미리 인코딩해 둔다.
- * @details 전송은 같은 바이트를 여러 번 보내므로, 매번 조립하지 않고 템플릿으로 만들어
- *          둔다. 보낼 때는 트랜잭션 ID만 덮어쓴다.
- * @param first 첫 메시지만 질문 절을 남긴다. 이후 메시지는 질문 없이 보낸다.
- */
+/// Transfers send the same bytes many times, so each message is encoded once as a template and only
+/// the transaction ID is overwritten on send. Only the first message keeps the question section.
 fn encode_axfr_template(
     origin: &Name,
     answers: Vec<Record>,
@@ -194,52 +152,38 @@ fn encode_axfr_template(
     Ok(message.try_encode()?.into_boxed_slice())
 }
 
-/** @brief 아레나 안의 연속 구간. 소유자 하나의 레코드들이 여기 모여 있다. */
+/// One owner's records, contiguous in the arena.
 #[derive(Clone, Copy)]
 struct RecordRange {
-    /** @brief 아레나에서의 시작 위치. */
     start: u32,
-    /** @brief 레코드 개수. */
     len: u16,
 }
 
-/**
- * @brief 인덱스 슬롯 하나. 8바이트에 맞춰 두어 한 캐시 줄에 여럿이 들어가게 한다.
- * @note 키 자체는 여기 두지 않는다. 태그로 대부분을 걸러 내고, 통과한 것만 메타데이터에서
- *       키를 꺼내 비교한다.
- */
+/// 8 bytes, so several fit in a cache line. The key is not stored here: the tag filters most
+/// mismatches, and only survivors fetch the key from metadata for comparison.
 #[derive(Clone, Copy)]
 struct OwnerSlot {
-    /** @brief 해시 상위 비트. 0은 빈 슬롯을 뜻하므로 최하위 비트를 설정해 0을 피한다. */
+    /// Upper hash bits with the low bit set, since 0 marks an empty slot.
     tag: u32,
-    /** @brief 메타데이터 아레나에서 이 항목의 시작 위치. */
     metadata_start: u32,
-    /** @brief 레코드 아레나에서의 시작 위치. */
     record_start: u32,
 }
 
-/**
- * @brief 소유자 이름에서 레코드 범위로 가는 열린 주소 지정 해시 테이블.
- * @details 표준 해시맵 대신 쓰는 이유는 배치 때문이다. 슬롯이 작아 캐시 줄 하나에 여럿이
- *          들어가고, 키는 별도 아레나에 이어 붙여 두어 소유자마다 할당이 생기지 않는다.
- */
+/// Open-addressing table from owner name to record range, chosen over std's map for layout: small
+/// slots share cache lines, and keys are packed into one arena, so owners need no allocation each.
 #[derive(Clone)]
 struct OwnerIndex {
-    /** @brief 슬롯 배열. 길이는 항상 2의 거듭제곱이라 나머지 연산이 비트 마스크가 된다. */
+    /// Length is always a power of two, so the modulo is a mask.
     slots: Box<[OwnerSlot]>,
 
-    /** @brief 키 길이, 레코드 개수, 키 바이트를 이어 붙인 아레나. */
+    /// Key length, record count, and key bytes, back to back.
     metadata: Vec<u8>,
-    /** @brief 해시 시드. 프로세스마다 달라 충돌을 노린 입력을 막는다. */
     hash_builder: RandomState,
 }
 
 impl OwnerIndex {
-    /**
-     * @brief 예상 크기에 맞춰 인덱스를 만든다.
-     * @details 슬롯을 소유자 수의 1.25배 이상으로 잡는다. 적재율이 높으면 선형 탐색이
-     *          길어지고, 이 테이블은 로드 후 늘어나지 않으므로 처음에 여유를 둔다.
-     */
+    /// At least 1.25 slots per owner: the table never grows after load, and a high load factor
+    /// makes linear probes long.
     fn new(owner_count: usize, metadata_len: usize) -> Result<Self, String> {
         let minimum_slots = owner_count
             .checked_mul(5)
@@ -265,24 +209,19 @@ impl OwnerIndex {
         })
     }
 
-    /** @brief 해시 상위 절반에서 태그를 만든다. 최하위 비트를 설정해 빈 슬롯 표시와 겹치지 않게 한다. */
     fn tag_of(hash: u64) -> u32 {
         ((hash >> 32) as u32) | 1
     }
 
-    /** @brief 키 해시. 0은 쓰지 않는다. */
+    /// Never returns 0.
     fn hash(&self, key: &[u8]) -> u64 {
         let mut hasher = self.hash_builder.build_hasher();
         hasher.write(key);
         hasher.finish().max(1)
     }
 
-    /**
-     * @brief 소유자를 넣는다. 로드 시점에만 호출한다.
-     * @details 메타데이터에 키 길이, 레코드 개수, 키 바이트를 이어 붙이고 슬롯에는 그
-     *          시작 위치만 둔다. 충돌하면 다음 슬롯으로 밀어 넣는다.
-     * @note 같은 키를 두 번 넣는 경우는 없다. 호출자가 소유자별로 묶어 한 번씩 부른다.
-     */
+    /// Load time only, called once per owner. Appends key length, record count, and key bytes to
+    /// metadata and stores the start in the slot, probing to the next slot on collision.
     fn insert(&mut self, key: &[u8], range: RecordRange) -> Result<(), String> {
         let key_len = u8::try_from(key.len())
             .map_err(|_| "Zone owner wire key exceeds 255 bytes".to_string())?;
@@ -309,7 +248,7 @@ impl OwnerIndex {
         }
     }
 
-    /** @brief 슬롯이 가리키는 키 바이트. 메타데이터의 앞 3바이트를 건너뛴다. */
+    /// Skips the 3-byte header in metadata.
     fn key_for_slot(&self, slot: &OwnerSlot) -> Option<&[u8]> {
         let start = slot.metadata_start as usize;
         let key_len = usize::from(*self.metadata.get(start)?);
@@ -318,7 +257,7 @@ impl OwnerIndex {
             .get(key_start..key_start.checked_add(key_len)?)
     }
 
-    /** @brief 슬롯이 가리키는 레코드 범위. 개수는 메타데이터에, 시작은 슬롯에 있다. */
+    /// The count comes from metadata, the start from the slot.
     fn range_for_slot(&self, slot: &OwnerSlot) -> Option<RecordRange> {
         let start = slot.metadata_start as usize;
         let len = u16::from_le_bytes([
@@ -331,11 +270,8 @@ impl OwnerIndex {
         })
     }
 
-    /**
-     * @brief 소유자 키로 레코드 범위를 찾는다. 질의 경로에서 가장 자주 불린다.
-     * @details 태그를 먼저 견주고 통과한 것만 키를 실제로 비교한다. 대부분의 충돌이
-     *          메타데이터를 건드리지 않고 걸러져 캐시 미스가 줄어든다.
-     */
+    /// The query path's hottest lookup. Tags are compared first and only matching slots compare
+    /// keys, so most collisions never touch metadata.
     fn get(&self, key: &[u8]) -> Option<RecordRange> {
         let hash = self.hash(key);
         let tag = Self::tag_of(hash);
@@ -353,12 +289,11 @@ impl OwnerIndex {
         }
     }
 
-    /** @brief 이 소유자가 있는지. */
     fn contains_key(&self, key: &[u8]) -> bool {
         self.get(key).is_some()
     }
 
-    /** @brief 모든 소유자 키. 순서는 슬롯 배치를 따르므로 정렬돼 있지 않다. */
+    /// In slot order, not sorted.
     fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.slots
             .iter()
@@ -367,66 +302,42 @@ impl OwnerIndex {
     }
 }
 
-/**
- * @brief 아레나에 저장하는 레코드 형태.
- *
- * @details 대부분의 zone은 A와 AAAA가 압도적으로 많다. 그 둘은 소유자 이름 없이 값만
- *          담고, 나머지는 상자에 넣어 참조로 둔다. 이렇게 하면 이 변형의 크기가 가장 큰
- *          RData가 아니라 몇 워드로 고정돼, 아레나 전체가 캐시에 훨씬 잘 들어간다.
- * @note 소유자 이름은 인덱스가 갖고 있으므로 여기 두지 않는다. 응답을 만들 때 다시 붙인다.
- */
+/// Arena form of a record. A and AAAA dominate most zones, so they hold only their value, and other
+/// types point into an arena. The variant stays a few words instead of the largest RData, so the
+/// arena fits in cache far better.
+///
+/// The owner name lives in the index and is attached again when building a response.
 #[derive(Clone)]
 struct StoredRecord {
-    /**
-     * @brief 상위 2비트가 종류, 나머지가 TTL.
-     * @details 종류가 Other일 때는 TTL 필드에 레코드 타입을 담는다. 그 레코드의 TTL은
-     *          아레나 안 온전한 레코드가 가지고 있으므로 여기서는 비어 있다.
-     */
+    /// Top 2 bits are the kind, the rest the TTL. For Other, the TTL field holds the record type
+    /// instead, and the TTL lives in the full record in the arena.
     tagged: u32,
-    /** @brief A면 주소, AAAA면 주소 아레나 인덱스, 그 밖이면 레코드 아레나 인덱스. */
+    /// The address for A, an AAAA arena index for AAAA, a record arena index otherwise.
     payload: u32,
 }
 
-/** @brief 종류 필드의 시작 비트. */
 const STORED_TAG_SHIFT: u32 = 30;
-/** @brief A 레코드. */
 const STORED_TAG_A: u32 = 0;
-/** @brief AAAA 레코드. */
 const STORED_TAG_AAAA: u32 = 1;
-/** @brief 그 밖의 타입. */
 const STORED_TAG_OTHER: u32 = 2;
-/** @brief 종류 비트를 뺀 나머지. */
 const STORED_VALUE_MASK: u32 = (1 << STORED_TAG_SHIFT) - 1;
 
-/**
- * @brief 담을 수 있는 TTL 상한. 약 34년이다.
- *
- * @details RFC 2181은 최상위 비트가 선 TTL을 0으로 다루라고 하므로 원래 쓸 수 있는 폭이
- *          31비트다. 타입을 합쳐 넣느라 한 비트를 더 줄였다. 이보다 긴 TTL은 로드할 때
- *          여기로 깎는다. DNS에서 34년을 넘는 수명은 실질적으로 쓰이지 않는다.
- */
+/// About 34 years. RFC 2181 treats TTLs with the top bit set as 0, leaving 31 usable bits, and the
+/// kind takes one more. Longer TTLs are clamped at load.
 const STORED_TTL_MAX: u32 = STORED_VALUE_MASK;
 
-/**
- * @brief 이름이 없거나 타입이 없을 때 무할당 경로가 내릴 수 있는 판정.
- * @details Fallback은 이 경로로 답할 수 없다는 뜻이다. 그 경우 호출자가 구조화된 경로로
- *          넘어간다.
- */
+/// What the allocation-free path can conclude for a missing name or type. Fallback means it cannot
+/// answer, and the caller takes the structured path.
 enum SimpleAbsent<'a> {
-    /** @brief 이름 자체가 없다. */
     NxDomain,
-    /** @brief 이름은 있으나 그 타입이 없다. */
     NoData,
-    /** @brief 와일드카드가 답한다. 그 레코드들을 함께 준다. */
     Wildcard(&'a [StoredRecord]),
-    /** @brief DNAME이 걸린다. */
     Dname(&'a Record),
-    /** @brief 이 경로로 판정할 수 없다. 구조화된 경로로 넘긴다. */
     Fallback,
 }
 
 impl StoredRecord {
-    /** @brief 레코드를 저장 형태로 바꾼다. 주소와 온전한 레코드는 각각 아레나로 옮긴다. */
+    /// Moves addresses and full records into their arenas.
     fn from_record(
         record: Record,
         aaaa_arena: &mut Vec<std::net::Ipv6Addr>,
@@ -460,20 +371,16 @@ impl StoredRecord {
         }
     }
 
-    /** @brief 담긴 종류. */
     fn tag(&self) -> u32 {
         self.tagged >> STORED_TAG_SHIFT
     }
 
-    /** @brief A·AAAA의 TTL. 그 밖의 타입에는 뜻이 없다. */
+    /// Meaningful only for A and AAAA.
     fn ttl(&self) -> u32 {
         self.tagged & STORED_VALUE_MASK
     }
 
-    /**
-     * @brief 레코드 타입.
-     * @note 그 밖의 타입도 TTL 필드에 타입을 담아 두므로 아레나를 보지 않는다.
-     */
+    /// Other keeps its type in the TTL field, so this never reads the arena.
     fn rtype(&self) -> RecordType {
         match self.tag() {
             STORED_TAG_A => RecordType::A,
@@ -482,16 +389,13 @@ impl StoredRecord {
         }
     }
 
-    /** @brief 온전한 레코드가 그대로 있으면 빌려 준다. 압축 변형은 None이다. */
+    /// None for compact variants.
     fn full<'a>(&self, other_arena: &'a [Record]) -> Option<&'a Record> {
         (self.tag() == STORED_TAG_OTHER).then(|| other_arena.get(self.payload as usize))?
     }
 
-    /**
-     * @brief 소유자 이름을 붙여 온전한 레코드로 되살린다.
-     * @note 여기서 이름을 복제한다. 응답을 조립하는 경로에서만 부르고, 무할당 경로는
-     *       이 함수를 거치지 않는다.
-     */
+    /// Attaches the owner name to rebuild a full record. Clones the name, so only response assembly
+    /// calls it; the allocation-free path does not.
     fn materialize(
         &self,
         owner: &Name,
@@ -514,12 +418,11 @@ impl StoredRecord {
     }
 }
 
-/**
- * @brief 타입순으로 붙어 있는 소유자 레코드에서 한 RRset만 빌린다.
- * @details 흔한 단일 타입 owner는 첫·끝 확인만 하고 전부 돌려준다. 혼합 owner만
- *          이진 탐색하므로 큰 A/AAAA RRset을 세고 다시 쓰는 이중 순회가 없다.
- * @invariant from_flat_records가 같은 owner 안을 타입 번호 오름차순으로 정렬한다.
- */
+/// Borrows one RRset from an owner's records, which are sorted by type. A single-type owner, the
+/// common case, is returned whole after checking the first and last; only mixed owners binary
+/// search, so large A/AAAA RRsets are not walked twice.
+///
+/// Relies on from_flat_records sorting each owner's records by type number.
 fn stored_rrset(records: &[StoredRecord], rtype: RecordType) -> &[StoredRecord] {
     let Some(first) = records.first() else {
         return records;
@@ -538,7 +441,7 @@ fn stored_rrset(records: &[StoredRecord], rtype: RecordType) -> &[StoredRecord] 
     &tail[..len]
 }
 
-/** @brief 같은 소유자 이름이 이어지는 구간의 끝. 레코드가 정규 순서로 정렬돼 있어야 한다. */
+/// Records must be in canonical order.
 fn owner_group_end(records: &[Record], start: usize) -> usize {
     let owner = &records[start].name;
     let mut end = start + 1;
@@ -548,44 +451,23 @@ fn owner_group_end(records: &[Record], start: usize) -> usize {
     end
 }
 
-/**
- * @brief CNAME 체인을 zone 안에서 따라가다 멈춘 위치.
- *
- * @details 다섯을 구분하는 이유는 응답이 서로 다르기 때문이다. RFC 6604는 rcode를 체인의
- *          마지막 질의 주기로 정하라고 하므로 부재와 NODATA를 하나로 합치면 안 되고, 둘 다 부정
- *          SOA가 있어야 부정 캐시가 된다.
- */
+/// Where an in-zone CNAME chase stopped. Each ending answers differently: RFC 6604 sets the rcode
+/// from the last step of the chain, so absence and NODATA cannot merge, and both need a negative
+/// SOA to be cached.
 enum ChaseEnd {
-    /** @brief 물어본 종류를 찾았다. 추가부에 담을 것이 따라온다. */
+    /// Found the requested type, with records for the additional section.
     Answered(Vec<Record>),
-    /** @brief 대상 이름이 이 zone에 없다. */
     NoSuchName,
-    /** @brief 이름은 있으나 물어본 종류가 없다. */
     NoData,
-    /** @brief 대상이 위임 아래다. 그 위임으로 넘긴다. */
     Delegated(Name),
-    /** @brief 대상이 이 zone 밖이다. 질의자가 이어서 푼다. */
+    /// The client continues resolution.
     OutOfZone,
 }
 
-/**
- * @brief 로드하면서 RRset마다 수명을 RFC 2181대로 고른다.
- *
- * @details 5.2항은 한 RRSet의 수명이 모두 같아야 한다고 정하고 서버가 다른 값을 담아
- *          보내는 것을 아예 금지한다. 8항은 상한을 넘는 수명을 0으로 본다. 로드 곳에서
- *          한 번 고르면 구조적 응답, 압축 저장, 무할당 wire 경로, 영역 전송 template이
- *          모두 같은 값을 쓴다.
- * @param records 소유자 이름으로 정렬된 목록. 제자리에서 고친다.
- */
-/**
- * @brief 소유자·종류·부류·데이터가 모두 같은 레코드를 하나만 남긴다.
- *
- * @details RFC 2181은 넷이 모두 같은 레코드가 둘 있는 것은 뜻이 없으므로 서버가
- *          억제해야 한다고 한다. 남겨 두면 응답이 그만큼 불어나고, 서명 영역에서는
- *          서명이 덮는 집합과 내보내는 집합이 달라져 검증이 깨진다.
- * @param records 소유자 이름으로 정렬된 목록. 제자리에서 줄인다.
- * @return 덜어 낸 레코드 수.
- */
+/// Keeps one of each set of records with equal owner, type, class, and data. RFC 2181 says such
+/// duplicates are meaningless and servers should suppress them; kept, they inflate answers, and in
+/// signed zones the set the signature covers differs from the set sent, breaking validation.
+/// `records` must be sorted by owner; returns the number removed.
 fn drop_duplicate_records(records: &mut Vec<Record>) -> usize {
     let mut seen: HashSet<(u16, u16, Vec<u8>)> = HashSet::new();
     let mut keep = vec![true; records.len()];
@@ -620,6 +502,8 @@ fn drop_duplicate_records(records: &mut Vec<Record>) -> usize {
     dropped
 }
 
+/// Makes each RRset's TTLs equal at load, as RFC 2181 requires. Doing it once here gives
+/// structured answers, compact storage, the wire fast path, and transfer templates the same value.
 fn normalize_owner_group_ttls(records: &mut [Record]) {
     let mut start = 0usize;
     while start < records.len() {
@@ -629,11 +513,8 @@ fn normalize_owner_group_ttls(records: &mut [Record]) {
     }
 }
 
-/**
- * @brief 정렬된 레코드 목록에서 소유자 인덱스를 만든다.
- * @details 두 번 훑는다. 먼저 소유자 수와 메타데이터 길이를 세어 정확한 크기로 잡고,
- *          그다음 채운다. 늘려 가며 채우면 로드 중 재할당과 복사가 반복된다.
- */
+/// Two passes: count owners and metadata length to allocate exactly, then fill. Growing while
+/// filling would reallocate and copy repeatedly during load.
 fn build_owner_index(records: &[Record]) -> Result<OwnerIndex, String> {
     let mut owner_count = 0usize;
     let mut metadata_len = 0usize;
@@ -684,7 +565,7 @@ fn build_owner_index(records: &[Record]) -> Result<OwnerIndex, String> {
     Ok(index)
 }
 
-/** @brief 로드 중 쓰는 조회. 아직 저장 형태로 바꾸기 전의 원본 레코드를 본다. */
+/// Load-time lookup over the original records, before conversion to stored form.
 fn full_records_for_key<'a>(
     records: &'a [Record],
     index: &OwnerIndex,
@@ -695,7 +576,7 @@ fn full_records_for_key<'a>(
     records.get(start..start.checked_add(range.len as usize)?)
 }
 
-/** @brief 로드 중 쓰는 순회. 소유자별로 묶인 원본 레코드를 준다. */
+/// Load-time walk over the original records grouped by owner.
 fn full_record_groups<'a>(
     records: &'a [Record],
     index: &'a OwnerIndex,
@@ -705,28 +586,23 @@ fn full_record_groups<'a>(
     })
 }
 
-/** @brief 권한 응답 하나. 상위 계층이 이것을 DNS 메시지로 옮긴다. */
+/// The layer above turns this into a DNS message.
 #[derive(Debug, Default, PartialEq)]
 pub struct Response {
-    /** @brief 응답 코드. */
     pub rcode: u8,
 
-    /** @brief 권한 비트. 위임을 넘긴 참조 응답에서는 꺼진다. */
+    /// Off for referrals.
     pub authoritative: bool,
-    /** @brief 답변 절. */
     pub answers: Vec<Record>,
-    /** @brief 권한 절. 부정 응답의 SOA나 참조의 NS가 들어간다. */
+    /// SOA for negative answers, NS for referrals.
     pub authority: Vec<Record>,
-    /** @brief 추가 절. glue 주소가 들어간다. */
+    /// Glue addresses.
     pub additional: Vec<Record>,
 }
 
 impl Zone {
-    /**
-     * @brief 소유자별로 묶인 레코드 맵에서 zone을 만든다.
-     * @details 맵의 키와 레코드의 소유자 이름이 일치하는지 확인한다. 어긋난 채로 인덱스를
-     *          만들면 조회가 엉뚱한 레코드를 준다.
-     */
+    /// Checks that each map key matches its records' owner name; an index built over a mismatch
+    /// would answer with the wrong records.
     pub fn new(
         origin: Name,
         soa: Soa,
@@ -752,7 +628,6 @@ impl Zone {
         Self::from_canonical_records(origin, soa, soa_ttl, canonical_records)
     }
 
-    /** @brief 정규 키로 묶인 맵을 평탄한 목록으로 펼친 뒤 zone을 만든다. */
     fn from_canonical_records(
         origin: Name,
         soa: Soa,
@@ -779,16 +654,8 @@ impl Zone {
         Self::from_flat_records(origin, soa, soa_ttl, records)
     }
 
-    /**
-     * @brief 평탄한 레코드 목록에서 zone을 완성한다. 모든 로드 경로가 여기로 모인다.
-     *
-     * @details 순서가 정해져 있다. 정규 순서로 정렬해 같은 소유자를 붙여 놓고, 인덱스를
-     *          만들고, apex NS 유무를 확인하고, 레코드 전체를 검증한 뒤, 빈 비단말을
-     *          포함한 이름 표시를 채운다. 마지막으로 무할당 경로를 쓸 수 있는 zone인지
-     *          판정한다.
-     * @return apex에 NS가 없거나 zone 밖 소유자가 섞여 있으면 오류.
-     * @invariant 여기서 만들어진 zone은 이후 바뀌지 않는다. 질의 경로는 읽기만 한다.
-     */
+    /// Every load path ends here. Fails when the apex has no NS or an owner lies outside the zone.
+    /// The result is immutable; queries only read it.
     fn from_flat_records(
         origin: Name,
         soa: Soa,
@@ -809,10 +676,8 @@ impl Zone {
         full_records.sort_unstable_by(|left, right| {
             dnssec_name_cmp(&left.name, &right.name).then_with(|| left.rtype.0.cmp(&right.rtype.0))
         });
-        /*
-         * TTL 을 먼저 맞춰야 한다. RFC 2181로 같은 RRset 의 TTL 이 같아진 뒤라야
-         * 나머지가 모두 같은 레코드가 정말 같은 레코드다.
-         */
+        // TTLs first: only after RFC 2181 makes an RRset's TTLs equal are records that match in
+        // everything else true duplicates.
         normalize_owner_group_ttls(&mut full_records);
         let duplicates = drop_duplicate_records(&mut full_records);
         if duplicates > 0 {
@@ -932,29 +797,20 @@ impl Zone {
         })
     }
 
-    /** @brief 이 내용이 어느 파일 내용에서 왔는지. 파일에서 오지 않았으면 없다. */
     pub fn source_digest(&self) -> Option<source::SourceDigest> {
         self.source
     }
 
-    /**
-     * @brief 이 내용을 읽어 오거나 써 넣은 파일의 지문을 붙인다.
-     * @details 파일을 고쳐 쓰는 쪽은 쓰기 전에 지금 파일의 지문이 이 값과 같은지 확인한다.
-     *          다르면 이 서버가 모르는 사이에 파일이 바뀐 것이다.
-     */
+    /// A writer compares the file's current digest with this before writing; a difference means the
+    /// file changed without this server knowing.
     pub fn with_source_digest(mut self, digest: source::SourceDigest) -> Self {
         self.source = Some(digest);
         self
     }
 
-    /**
-     * @brief 전송으로 받은 레코드 목록에서 zone을 만든다.
-     *
-     * @details 전송 응답은 SOA로 시작해 SOA로 끝나므로 SOA가 둘 나온다. 그 둘이 같은지
-     *          확인하고 하나만 남긴다. 다르면 전송 도중 zone이 바뀐 것이라 받아들일 수 없다.
-     * @warning zone 밖 소유자가 하나라도 섞이면 거부한다. 상대가 자기 zone 응답에
-     *          남의 이름을 끼워 넣는 것을 막는 검사다.
-     */
+    /// Builds a zone from transferred records. A transfer starts and ends with SOA, so the two must
+    /// match and one is dropped; a mismatch means the zone changed mid-transfer. Any owner outside
+    /// the zone is rejected, so a peer cannot slip foreign names into its zone.
     pub fn from_records(mut records: Vec<Record>) -> Result<Zone, String> {
         if records.len() > MAX_ZONE_RECORDS {
             return Err(format!(
@@ -1008,17 +864,15 @@ impl Zone {
         Self::from_flat_records(origin, soa, soa_ttl, records)
     }
 
-    /** @brief zone apex. */
     pub fn origin(&self) -> &Name {
         &self.origin
     }
 
-    /** @brief apex의 SOA. */
     pub fn soa(&self) -> &Soa {
         &self.soa
     }
 
-    /** @brief 모든 레코드를 되살려 훑는다. 순서는 인덱스 배치를 따른다. */
+    /// In index order.
     pub fn all_records(&self) -> impl Iterator<Item = Record> + '_ {
         self.records.keys().flat_map(move |owner_key| {
             let owner = Name::from_uncompressed_wire(owner_key);
@@ -1031,12 +885,11 @@ impl Zone {
         })
     }
 
-    /** @brief 전송용 레코드 전부를 모아 돌려준다. */
     pub fn axfr_records(&self) -> Vec<Record> {
         self.axfr_records_iter().collect()
     }
 
-    /** @brief 전송 순서대로 훑는다. SOA로 시작해 SOA로 끝나는 것이 규격이다. */
+    /// Starts and ends with SOA, as transfers require.
     pub fn axfr_records_iter(&self) -> impl Iterator<Item = Record> + '_ {
         let soa = self.soa_record();
         std::iter::once(soa.clone())
@@ -1047,11 +900,8 @@ impl Zone {
             .chain(std::iter::once(soa))
     }
 
-    /**
-     * @brief 미리 인코딩해 둔 전송 메시지들. 처음 요청될 때 한 번만 만든다.
-     * @note 실패도 기억한다. 인코딩할 수 없는 zone에 전송이 올 때마다 다시 시도해 봐야
-     *       같은 결과다.
-     */
+    /// Built once on first request. A failure is remembered too: retrying on every transfer of a
+    /// zone that cannot be encoded gives the same result.
     pub fn axfr_wire_templates(&self) -> Result<&[Box<[u8]>], ProtoError> {
         match self
             .axfr_wire
@@ -1062,12 +912,9 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief 전송 레코드를 예산에 맞춰 메시지 단위로 끊고 각각 인코딩한다.
-     * @details 레코드 하나를 테스트 인코딩해 크기를 재고 예산을 넘기 전에 끊는다. 이름
-     *          압축 때문에 실제 크기는 이보다 작거나 같으므로, 이 추정으로 끊으면 메시지
-     *          한도를 넘지 않는다.
-     */
+    /// Splits transfer records into messages within the budget, measuring each record with a trial
+    /// encoding. Name compression only makes the real size smaller, so the estimate never exceeds
+    /// the message limit.
     fn build_axfr_wire_templates(&self) -> Result<Box<[Box<[u8]>]>, ProtoError> {
         let mut templates = Vec::new();
         let mut chunk = Vec::new();
@@ -1096,7 +943,7 @@ impl Zone {
         Ok(templates.into_boxed_slice())
     }
 
-    /** @brief zone 전체에서 이 타입의 레코드를 모은다. 서명이나 진단에 쓴다. */
+    /// For signing and diagnostics.
     pub fn records_of_type(&self, rtype: RecordType) -> Vec<Record> {
         self.records
             .keys()
@@ -1116,14 +963,14 @@ impl Zone {
             .collect()
     }
 
-    /** @brief 이 타입의 부재 증명 레코드가 있는지. NSEC 방식인지 NSEC3 방식인지 가리는 데 쓴다. */
+    /// Tells NSEC zones from NSEC3 zones.
     pub fn has_denial_records(&self, rtype: RecordType) -> bool {
         self.denial_index
             .get(&rtype)
             .is_some_and(|records| !records.is_empty())
     }
 
-    /** @brief 정규 순서상 첫 부재 증명 레코드. 되감기는 구간을 찾을 때 쓴다. */
+    /// For wrapping around the chain.
     pub fn first_denial_record(&self, rtype: RecordType) -> Option<&Record> {
         self.denial_index
             .get(&rtype)?
@@ -1131,7 +978,7 @@ impl Zone {
             .and_then(|location| self.record_at(location))
     }
 
-    /** @brief 이 이름과 정확히 일치하는 부재 증명 레코드. 인덱스가 정규 순서로 정렬돼 있어 이분 탐색한다. */
+    /// Binary search; the index is in canonical order.
     pub fn exact_denial_record(&self, rtype: RecordType, name: &Name) -> Option<&Record> {
         let locations = self.denial_index.get(&rtype)?;
         let index = locations
@@ -1143,11 +990,8 @@ impl Zone {
         self.record_at(&locations[index])
     }
 
-    /**
-     * @brief 정규 순서상 이 이름 바로 앞의 부재 증명 레코드.
-     * @note 이름이 첫 레코드보다 앞이면 마지막으로 되감는다. 체인이 순환 구조라
-     *       zone 끝의 레코드가 그 앞을 덮는다.
-     */
+    /// Wraps to the last record when the name sorts before the first: the chain is circular, so the
+    /// zone's last record covers that gap.
     pub fn preceding_denial_record(&self, rtype: RecordType, name: &Name) -> Option<&Record> {
         let locations = self.denial_index.get(&rtype)?;
         if locations.is_empty() {
@@ -1162,11 +1006,8 @@ impl Zone {
         self.record_at(&locations[index])
     }
 
-    /**
-     * @brief zone을 파일 형식 텍스트로 내보낸다.
-     * @details 동적 갱신 결과를 디스크에 남길 때 쓴다. 이름을 정렬해 내보내므로 같은
-     *          zone은 같은 텍스트가 되고, 그래야 변경 여부를 파일 비교로 알 수 있다.
-     */
+    /// Writes the zone as master file text, for persisting dynamic updates. Names are sorted, so
+    /// the same zone always gives the same text and a file comparison shows whether it changed.
     pub fn to_master_file(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("$ORIGIN {}.\n", self.origin.to_ascii_lower()));
@@ -1191,13 +1032,12 @@ impl Zone {
         out
     }
 
-    /** @brief 이름으로 그 소유자의 레코드들을 찾는다. 키는 스택 버퍼에 만들어 할당하지 않는다. */
+    /// Builds the key in a stack buffer, without allocating.
     fn owner(&self, name: &Name) -> Option<&[StoredRecord]> {
         let mut key = [0u8; 255];
         self.records_for_key(name.canonical_key_into(&mut key)?)
     }
 
-    /** @brief 정규 키로 아레나 구간을 얻는다. */
     fn records_for_key(&self, key: &[u8]) -> Option<&[StoredRecord]> {
         let range = self.records.get(key)?;
         let start = range.start as usize;
@@ -1205,14 +1045,13 @@ impl Zone {
         self.record_arena.get(start..end)
     }
 
-    /** @brief 위치로 레코드를 꺼낸다. 부재 증명 레코드는 압축 변형이 아니라 항상 온전한 형태다. */
+    /// Denial records are always stored in full, never compact.
     fn record_at(&self, location: &RecordLocation) -> Option<&Record> {
         self.records_for_key(&location.owner)
             .and_then(|records| records.get(location.offset))
             .and_then(|record| record.full(&self.other_arena))
     }
 
-    /** @brief 이 소유자의 레코드 중 타입이 맞는 것만 되살린다. */
     fn of_type(&self, recs: &[StoredRecord], qtype: RecordType, owner: &Name) -> Vec<Record> {
         stored_rrset(recs, qtype)
             .iter()
@@ -1220,7 +1059,7 @@ impl Zone {
             .collect()
     }
 
-    /** @brief apex의 SOA 레코드. 원래 TTL을 그대로 쓴다. */
+    /// With its own TTL.
     fn soa_record(&self) -> Record {
         Record::new(
             self.origin.clone(),
@@ -1229,11 +1068,8 @@ impl Zone {
         )
     }
 
-    /**
-     * @brief 부정 응답에 담을 SOA.
-     * @details TTL을 SOA의 minimum과 비교해 작은 쪽을 쓴다. 부정 응답의 캐시 기간은 그
-     *          필드가 정하므로, 더 오래 캐시되게 두면 안 된다.
-     */
+    /// The TTL is the smaller of the SOA's TTL and its minimum field, which sets how long the
+    /// negative answer is cached; it must not be cached longer.
     fn negative_soa_record(&self) -> Record {
         Record::new(
             self.origin.clone(),
@@ -1242,19 +1078,13 @@ impl Zone {
         )
     }
 
-    /** @brief 이 이름이 zone 범위 안인지. */
     pub fn contains(&self, qname: &Name) -> bool {
         is_subdomain_or_eq(qname, &self.origin)
     }
 
-    /**
-     * @brief 질의에 답한다.
-     *
-     * @details 판정 순서가 정해져 있다. 위임을 먼저 보고, 정확한 소유자, DNAME, 그다음
-     *          와일드카드, 마지막이 부재 판정이다. 위임을 뒤로 미루면 자식 zone의
-     *          이름에 이 서버가 직접 답하게 된다.
-     * @return 응답. 위임을 넘긴 경우 권한 비트가 꺼진다.
-     */
+    /// Checks in order: delegation, exact owner, DNAME, wildcard, then absence. Checking delegation
+    /// later would make this server answer names in a child zone itself. Referrals have the
+    /// authoritative bit off.
     pub fn query(&self, qname: &Name, qtype: RecordType) -> Response {
         if let Some(deleg) = self.delegation_for(qname) {
             if qname.eq_ignore_case(&deleg)
@@ -1298,12 +1128,8 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief 이 이름 위쪽에서 가장 깊은 위임 지점을 찾는다.
-     * @details apex보다 아래에서만 본다. apex의 NS는 zone 자신의 것이지 위임이 아니다.
-     *          가장 깊은 것을 골라야 다단 위임에서 올바른 자식으로 넘긴다.
-     * @return 위임이 없거나 zone에 위임 자체가 없으면 None.
-     */
+    /// Deepest delegation point above the name, looking only below the apex, whose NS belongs to
+    /// the zone itself. The deepest one is the right child in multi-level delegation.
     fn delegation_for(&self, qname: &Name) -> Option<Name> {
         if !self.has_delegations {
             return None;
@@ -1328,11 +1154,8 @@ impl Zone {
         delegation.map(|labels| qname.suffix(labels))
     }
 
-    /**
-     * @brief 위임 참조 응답을 만든다.
-     * @note 권한 비트를 끈다. 이 데이터는 자식 zone의 것이고 이 서버가 보증하는 것이 아니다.
-     *       DS가 있으면 함께 담아야 질의자가 자식의 서명을 검증할 수 있다.
-     */
+    /// Authoritative bit off: the data belongs to the child zone, not this server. DS goes along
+    /// when present, so the client can validate the child's signatures.
     fn referral(&self, deleg: Name) -> Response {
         let recs = self.owner(&deleg).unwrap_or_default();
         let ns = self.of_type(recs, RecordType::NS, &deleg);
@@ -1354,12 +1177,9 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief 이름은 존재할 때의 응답을 만든다.
-     * @details 타입이 정확히 맞으면 그것으로 끝이다. 없으면 CNAME을 보는데, 질의 타입이
-     *          CNAME일 때는 보지 않는다. 그 경우 CNAME이 곧 답이라 따라갈 이유가 없다.
-     *          둘 다 없으면 NODATA다. 이름은 있으니 NXDOMAIN이 아니다.
-     */
+    /// Response for an existing name: the exact type if present; otherwise a CNAME, unless the
+    /// query is for CNAME, where the CNAME itself is the answer; otherwise NODATA, never NXDOMAIN,
+    /// since the name exists.
     fn answer_at(&self, qname: &Name, qtype: RecordType, recs: &[StoredRecord]) -> Response {
         if qtype == RecordType::ANY {
             return Response {
@@ -1405,15 +1225,10 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief CNAME 체인을 zone 안에서 따라간다.
-     *
-     * @details RFC 1034는 CNAME을 만나면 이름을 바꿔 처음부터 다시 풀라고 한다.
-     *          그래서 실재하는 이름뿐 아니라 빈 비단말과 와일드카드까지 같은 규칙으로 본다.
-     * @details 횟수에 상한을 둔다. 서로를 가리키는 CNAME 두 개면 무한 반복이 된다.
-     * @param answers 여기에 체인의 각 단계를 쌓는다.
-     * @return 멈춘 위치. 호출자가 이것으로 rcode와 권한부를 정한다.
-     */
+    /// Follows a CNAME chain within the zone. RFC 1034 restarts resolution at the new name on a
+    /// CNAME, so empty non-terminals and wildcards follow the same rules as real names. The step
+    /// count is capped: two CNAMEs pointing at each other would loop forever. Each step is appended
+    /// to `answers`; the caller sets rcode and authority from the returned end.
     fn chase_cname(&self, target: &Name, qtype: RecordType, answers: &mut Vec<Record>) -> ChaseEnd {
         let mut cur = target.clone();
         for _ in 0..8 {
@@ -1449,11 +1264,8 @@ impl Zone {
         ChaseEnd::OutOfZone
     }
 
-    /**
-     * @brief 이 이름을 덮는 와일드카드 소유자의 레코드.
-     * @details 소유자 이름은 호출자가 질의 이름으로 찍으므로 여기서는 원본만 돌려준다.
-     * @return 덮는 와일드카드가 없으면 None.
-     */
+    /// Records of the wildcard owner covering the name, unmodified; the caller stamps the query
+    /// name as owner.
     fn wildcard_records(&self, qname: &Name) -> Option<&[StoredRecord]> {
         let closest = self.closest_encloser(qname)?;
         if closest.eq_ignore_case(qname) {
@@ -1464,14 +1276,8 @@ impl Zone {
         self.records_for_key(source.canonical_key_into(&mut key)?)
     }
 
-    /**
-     * @brief CNAME 체인이 멈춘 위치에 맞는 응답을 만든다.
-     *
-     * @details RFC 6604는 "The RCODE in the ultimate DNS response MUST BE set based on
-     *          the final query cycle"이라고 정한다. 이미 담은 CNAME은 그대로 두고 마지막
-     *          주기의 판정만 rcode와 권한부에 반영한다.
-     * @param answers 체인의 각 단계. 첫 CNAME이 이미 들어 있다.
-     */
+    /// RFC 6604 requires the rcode to come from the final query cycle, so CNAMEs already in
+    /// `answers` stay and only the last cycle's outcome sets rcode and authority.
     fn cname_response(&self, answers: Vec<Record>, end: ChaseEnd) -> Response {
         let (rcode, authority, additional) = match end {
             ChaseEnd::Answered(additional) => (0, Vec::new(), additional),
@@ -1492,14 +1298,9 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief 조상에 걸린 DNAME으로 응답을 만든다.
-     *
-     * @details DNAME은 이름의 뒷부분을 전부 바꾼다. 질의 이름의 앞 라벨들을 그대로 두고
-     *          뒤를 대상 이름으로 교체한 CNAME을 합성해 함께 보낸다.
-     * @note 합성한 이름이 255옥텟 상한을 넘으면 YXDOMAIN이다. 잘라서 보내면 질의자가
-     *       엉뚱한 이름으로 이어 간다.
-     */
+    /// Answers through a DNAME at an ancestor: keeps the query name's leading labels, replaces the
+    /// rest with the target, and sends the synthesized CNAME along. A synthesized name over 255
+    /// octets is YXDOMAIN; truncating it would send the client on to the wrong name.
     fn dname(&self, qname: &Name, qtype: RecordType) -> Option<Response> {
         let origin_labels = self.origin.num_labels();
         let mut labels = qname.num_labels();
@@ -1552,12 +1353,8 @@ impl Zone {
         None
     }
 
-    /**
-     * @brief 와일드카드로 응답을 합성한다.
-     * @details closest encloser가 질의 이름 자신이면 와일드카드가 끼어들 슬롯이 없다.
-     *          그 이름은 실재하므로 와일드카드보다 우선한다.
-     * @note 합성한 레코드의 소유자는 별표가 아니라 질의 이름으로 바꿔 준다.
-     */
+    /// No wildcard applies when the closest encloser is the query name itself: that name exists and
+    /// wins over the wildcard. Synthesized records get the query name as owner, not the asterisk.
     fn wildcard(&self, qname: &Name, qtype: RecordType) -> Option<Response> {
         let closest = self.closest_encloser(qname)?;
         if closest.eq_ignore_case(qname) {
@@ -1570,11 +1367,8 @@ impl Zone {
         Some(synthesize_owner(resp, qname, &source))
     }
 
-    /**
-     * @brief 이 이름의 조상 중 zone에 실재하는 가장 긴 것.
-     * @note 레코드가 있는 이름뿐 아니라 빈 비단말도 존재로 친다. 트리 구조상 자식이
-     *       있으면 그 이름은 존재하는 것이다.
-     */
+    /// Longest ancestor that exists in the zone, counting empty non-terminals: a name with children
+    /// exists.
     fn closest_encloser(&self, qname: &Name) -> Option<Name> {
         let origin_labels = self.origin.num_labels();
         let mut labels = qname.num_labels();
@@ -1598,7 +1392,7 @@ impl Zone {
         None
     }
 
-    /** @brief 이 이름이 zone에 존재하는지. 빈 비단말도 존재로 친다. */
+    /// Empty non-terminals count as existing.
     fn node_exists(&self, name: &Name) -> bool {
         let mut key = [0u8; 255];
         name.canonical_key_into(&mut key).is_some_and(|key| {
@@ -1610,16 +1404,11 @@ impl Zone {
         })
     }
 
-    /**
-     * @brief 무할당 경로에서 부재를 판정한다.
-     *
-     * @details 평탄한 zone이면 곧장 NXDOMAIN이다. 아니면 조상을 거슬러 올라가며 DNAME과
-     *          와일드카드 가지를 찾는다. DNAME이 먼저다. 그것이 걸리면 와일드카드는
-     *          볼 필요가 없다. 와일드카드 가지가 없으면 확실한 NXDOMAIN이다.
-     * @note 와일드카드 이름은 스택 버퍼에 조립한다. 별표 라벨은 항상 2바이트라 크기가
-     *       미리 정해진다.
-     * @return 판정할 수 없으면 Fallback. 호출자는 구조화된 경로로 넘어간다.
-     */
+    /// Absence check for the allocation-free path. A flat zone is NXDOMAIN at once; otherwise it
+    /// walks ancestors for DNAME and wildcard branches, DNAME first, since a DNAME match makes
+    /// wildcards irrelevant. No wildcard branch means a definite NXDOMAIN. The wildcard name is
+    /// built in a stack buffer, since the asterisk label is always 2 bytes. Fallback when it cannot
+    /// decide.
     fn simple_absent_for_key(&self, canonical_qname: &[u8]) -> SimpleAbsent<'_> {
         if self.simple_nxdomain {
             return SimpleAbsent::NxDomain;
@@ -1703,11 +1492,8 @@ impl Zone {
         }
     }
 
-    /**
-     * @brief 답변이 가리키는 이름들의 주소를 추가 절에 담는다.
-     * @details NS, MX, SRV, SVCB, HTTPS가 대상이다. SVCB 계열은 대상이 루트면 자기
-     *          소유자 이름을 뜻하므로 그쪽을 본다. 같은 대상을 두 번 넣지 않는다.
-     */
+    /// Addresses of names the answer points at (NS, MX, SRV, SVCB, HTTPS) go in the additional
+    /// section, each target once. A root SVCB target means the record's own owner name.
     fn target_glue(&self, recs: &[Record]) -> Vec<Record> {
         let mut out = Vec::new();
         let mut seen_targets = std::collections::HashSet::new();
@@ -1741,7 +1527,7 @@ impl Zone {
         out
     }
 
-    /** @brief 이 이름의 A와 AAAA. zone 안에 있을 때만 나온다. */
+    /// Only for names in this zone.
     fn glue(&self, name: &Name) -> Vec<Record> {
         let mut out = Vec::new();
         if let Some(recs) = self.owner(name) {
@@ -1752,17 +1538,14 @@ impl Zone {
     }
 }
 
-/** @brief 여러 zone을 담고 이름으로 가장 긴 접미사 zone을 찾는다. */
+/// Finds the zone with the longest matching suffix.
 #[derive(Default)]
 pub struct ZoneStore {
-    /** @brief 담고 있는 zone들. */
     zones: Vec<Zone>,
-    /** @brief origin 정규 키에서 zone 위치로 가는 인덱스. */
     index: HashMap<Vec<u8>, usize>,
 }
 
 impl ZoneStore {
-    /** @brief 빈 저장소. */
     pub fn new() -> Self {
         ZoneStore {
             zones: Vec::new(),
@@ -1770,7 +1553,7 @@ impl ZoneStore {
         }
     }
 
-    /** @brief zone을 넣는다. 같은 origin이 이미 있으면 덮어쓴다. */
+    /// Replaces a zone with the same origin.
     pub fn add(&mut self, zone: Zone) {
         let key = zone.origin.canonical_key();
         if let Some(index) = self.index.get(&key).copied() {
@@ -1781,33 +1564,29 @@ impl ZoneStore {
         }
     }
 
-    /** @brief zone이 하나도 없는지. */
     pub fn is_empty(&self) -> bool {
         self.zones.is_empty()
     }
 
-    /** @brief 담고 있는 zone 전부. */
     pub fn zones(&self) -> &[Zone] {
         &self.zones
     }
 
-    /** @brief origin이 정확히 이 이름인 zone. 전송 요청처럼 apex를 지목하는 경로에 쓴다. */
+    /// For paths that name the apex, such as transfer requests.
     pub fn zone_exact(&self, origin: &Name) -> Option<&Zone> {
         let mut storage = [0u8; 255];
         let key = origin.canonical_key_into(&mut storage)?;
         self.index.get(key).and_then(|index| self.zones.get(*index))
     }
 
-    /** @brief 이 이름을 담는 zone 중 가장 깊은 것. */
+    /// Deepest zone containing the name.
     pub fn zone_for(&self, qname: &Name) -> Option<&Zone> {
         let mut storage = [0u8; 255];
         self.zone_for_key(qname.canonical_key_into(&mut storage)?)
     }
 
-    /**
-     * @brief 정규 키에서 조상으로 거슬러 올라가며 zone을 찾는다.
-     * @note 가장 긴 접미사가 이긴다. 짧은 쪽을 고르면 자식 zone의 이름을 부모가 답하게 된다.
-     */
+    /// Longest suffix wins; picking a shorter one would let the parent answer names of a child
+    /// zone.
     fn zone_for_key(&self, mut key: &[u8]) -> Option<&Zone> {
         loop {
             if let Some(index) = self.index.get(key) {
@@ -1817,21 +1596,18 @@ impl ZoneStore {
         }
     }
 
-    /** @brief 이름을 담는 zone에 질의한다. 담는 zone이 없으면 None. */
     pub fn query(&self, qname: &Name, qtype: RecordType) -> Option<Response> {
         self.zone_for(qname).map(|z| z.query(qname, qtype))
     }
 
-    /**
-     * @brief 응답을 조립하지 않고 곧장 와이어로 쓴다.
-     *
-     * @details A와 AAAA 질의, 그리고 평탄한 zone의 부재 응답만 이 경로로 간다. 그 밖에는
-     *          거짓을 돌려 구조화된 경로로 넘긴다.
-     * @warning fail-closed여야 한다. EDNS, 추가 절, 위임, DNSSEC, 그리고 응답을 바꾸는
-     *          어떤 기능이라도 걸리면 이 경로를 쓰면 안 된다. 여기서 거르는 조건과 main의
-     *          바깥 게이트가 함께 그 분리를 지킨다.
-     * @return 실제로 응답을 썼으면 참. 거짓이면 버퍼는 건드리지 않은 상태다.
-     */
+    /// Writes the answer straight to the wire without assembling a response. Only A and AAAA
+    /// answers and absence answers from flat zones take this path; anything else returns false for
+    /// the structured path.
+    ///
+    /// Must fail closed: EDNS options, additional records, delegation, DNSSEC, or any feature that
+    /// changes the answer must keep a query off this path. These checks and the caller's fast-path
+    /// gate hold that line together. Returns true only when it wrote a response; on false the
+    /// buffer is untouched.
     pub fn write_simple_response(
         &self,
         canonical_qname: &[u8],
@@ -1866,14 +1642,9 @@ impl ZoneStore {
         Self::write_address_response(zone, records, request, out)
     }
 
-    /**
-     * @brief 빈 OPT 레코드를 추가 절에 쓴다.
-     *
-     * @details RFC 6891은 요청에 OPT가 있으면 응답에도 넣으라고 정한다. 이 경로가 맡는 질의는
-     *          옵션이 없고 DO가 꺼진 것뿐이므로 담을 것도 없다. 알릴 UDP 크기만 담는다.
-     * @param udp_payload 이 서버가 받아들이겠다고 알릴 크기. 요청 값이 아니라 이 서버의 값이다.
-     * @invariant 호출자가 헤더의 ARCOUNT를 1로 적어 두어야 한다. 어긋나면 파서가 거부한다.
-     */
+    /// RFC 6891 requires an OPT in the response when the request had one. Queries on this path
+    /// carry no options and DO is off, so only the UDP size goes in, and it is this server's value,
+    /// not the request's. The caller must have set ARCOUNT to 1, or parsers reject the message.
     fn push_empty_opt(out: &mut Writer, udp_payload: u16) {
         out.push_u8(0);
         out.push_u16(RecordType::OPT.0);
@@ -1882,11 +1653,8 @@ impl ZoneStore {
         out.push_u16(0);
     }
 
-    /**
-     * @brief 헤더와 질문 절을 쓴다.
-     * @note 질문의 이름은 정규화한 것이 아니라 받은 그대로 되비춘다. 대소문자를 바꾸면
-     *       0x20 인코딩을 쓰는 질의자가 응답을 버린다.
-     */
+    /// Echoes the question name as received, not normalized: changing case makes clients using 0x20
+    /// encoding drop the answer.
     fn write_question_prologue(
         out: &mut Writer,
         request: &SimpleRequest<'_>,
@@ -1909,12 +1677,9 @@ impl ZoneStore {
         prologue[qname_end + 2..qname_end + 4].copy_from_slice(&DnsClass::IN.0.to_be_bytes());
     }
 
-    /**
-     * @brief A 또는 AAAA 답변을 곧장 와이어로 쓴다.
-     * @details 소유자 이름은 질문을 가리키는 압축 포인터 하나로 끝난다. 질문은 항상
-     *          오프셋 12에 있으므로 값이 고정이다.
-     * @return 도중에 실패하면 버퍼를 비우고 거짓을 준다. 반쯤 쓴 응답을 남기면 안 된다.
-     */
+    /// Writes an A or AAAA answer to the wire. The owner is one compression pointer to the
+    /// question, which always sits at offset 12. On failure it clears the buffer and returns false;
+    /// a half-written answer must not remain.
     fn write_address_response(
         zone: &Zone,
         records: &[StoredRecord],
@@ -1933,11 +1698,9 @@ impl ZoneStore {
         let flags = 0x8000 | 0x0400 | (request.request_flags & 0x0190);
         Self::write_question_prologue(out, request, flags, answer_count, 0);
 
-        /*
-         * 같은 RRset의 답변은 전부 길이가 같고 소유자·타입·클래스·rdlength까지 같다.
-         * 공간을 한 번 확보해 두고 고정 크기로 직접 써서, 레코드마다 생기던 작은 memcpy
-         * 호출을 없앤다. qtype으로 루프를 구분해야 쓰는 길이가 컴파일 시점에 정해진다.
-         */
+        // Every answer in one RRset has the same length, owner, type, class, and rdlength.
+        // Reserving once and writing fixed-size records removes a small memcpy call per record;
+        // matching on qtype makes the length a compile-time constant.
         let written = match qtype {
             RecordType::A => Self::fill_address_block::<{ 12 + 4 }>(
                 out,
@@ -1978,19 +1741,13 @@ impl ZoneStore {
         true
     }
 
-    /**
-     * @brief 크기가 같은 답변 레코드들을 미리 잡은 구간에 이어 쓴다.
-     *
-     * @details 소유자는 질문을 가리키는 압축 포인터 하나로 끝난다. 질문은 항상 오프셋
-     *          12에 있으므로 값이 고정이다. 레코드마다 달라지는 것은 TTL과 rdata뿐이라
-     *          나머지 헤더는 루프 밖에서 한 번만 만든다.
-     * @param LEN 레코드 하나의 와이어 길이. 컴파일 시점 상수여야 쓰기가 호출 없이 펼쳐진다.
-     * @param rdata_len rdlength 곳에 적을 값.
-     * @param fill 레코드별 rdata를 채운다. 거짓이면 그 레코드를 쓸 수 없다는 뜻이다.
-     * @return 전부 썼으면 참. 거짓이면 호출자가 버퍼를 비워야 한다.
-     * @invariant LEN은 헤더 12바이트에 rdata_len을 더한 값이다. 둘이 어긋나면 rdlength가
-     *            실제 rdata 길이와 다른 응답이 조용히 나가므로 호출 시점에 못 고정한다.
-     */
+    /// Writes equal-size answer records into reserved space. Only TTL and rdata vary per record, so
+    /// the rest of the header is built once outside the loop. `LEN` is one record's wire length and
+    /// must be a constant so the writes unroll; `fill` writes each rdata and returns false when a
+    /// record cannot be written. Returns true when all were written; on false the caller must clear
+    /// the buffer.
+    ///
+    /// LEN must equal 12 plus rdata_len; otherwise rdlength silently disagrees with the rdata.
     fn fill_address_block<const LEN: usize>(
         out: &mut Writer,
         records: &[StoredRecord],
@@ -2026,11 +1783,8 @@ impl ZoneStore {
         offset == block
     }
 
-    /**
-     * @brief NXDOMAIN 또는 NODATA 응답을 곧장 와이어로 쓴다.
-     * @details 권한 절에 SOA를 담는다. 이름은 압축하지 않고 그대로 쓴다. 압축 테이블을
-     *          만들지 않는 것이 이 경로의 전제다.
-     */
+    /// Writes NXDOMAIN or NODATA with the SOA in the authority section. Names are written
+    /// uncompressed; this path builds no compression table.
     fn write_negative_response(
         zone: &Zone,
         request: &SimpleRequest<'_>,
@@ -2062,15 +1816,13 @@ impl ZoneStore {
         true
     }
 
-    /**
-     * @brief zone 밖을 가리키는 DNAME 응답을 곧장 와이어로 쓴다.
-     *
-     * @details 합성한 CNAME의 대상은 질의 이름의 앞부분과 DNAME 대상을 이은 것이다.
-     *          앞부분은 질문 절에 이미 있으므로 압축 포인터로 가리키고 뒤만 새로 쓴다.
-     * @note 대상이 zone 안이면 이 경로를 쓰지 않는다. 그때는 체인을 더 따라가야 해서
-     *       구조화된 경로가 필요하다. 질의 이름의 대소문자가 바뀐 경우도 제외한다.
-     *       포인터로 가리킨 바이트가 원래 이름이라 합성 결과가 달라진다.
-     */
+    /// Writes a DNAME answer whose target lies outside the zone. The synthesized CNAME target is
+    /// the query name's leading labels plus the DNAME target; the leading part is already in the
+    /// question, so a compression pointer covers it and only the rest is written.
+    ///
+    /// Not used when the target is in the zone, which needs further chasing on the structured path,
+    /// or when the query name's case differs, since the pointed-to bytes are the original name and
+    /// would change the result.
     #[allow(clippy::too_many_arguments)]
     fn write_external_dname_response(
         zone: &Zone,
@@ -2147,35 +1899,25 @@ impl ZoneStore {
     }
 }
 
-/**
- * @brief 빠른 경로가 응답을 만들 때 보는 요청 쪽 값들.
- *
- * @details 이 다섯은 언제나 함께 다닌다. 인자로 흩어 놓으면 하나를 빠뜨려도 컴파일은 되고
- *          질의와 어긋난 응답만 조용히 나간다.
- */
+/// Request values the fast path needs to build a response. The five always travel together; as
+/// separate arguments, dropping one would still compile and silently send an answer that does not
+/// match the query.
 pub struct SimpleRequest<'a> {
-    /** @brief 받은 그대로의 질문 이름. 대소문자를 되돌려줄 때 쓴다. */
+    /// As received, to echo its case.
     pub original_qname: &'a [u8],
-    /** @brief 질의 종류. */
     pub qtype: RecordType,
-    /** @brief 질의 번호. 응답에 그대로 되비춘다. */
     pub id: u16,
-    /** @brief 되비출 요청 플래그. */
     pub request_flags: u16,
-    /** @brief 응답 OPT에 알릴 UDP 크기. 없으면 OPT를 넣지 않는다. */
+    /// UDP size for the response OPT; None means no OPT.
     pub edns: Option<u16>,
 }
 
-/** @brief 바이트를 소문자 16진 문자열로. */
 fn hex_str(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/**
- * @brief SVCB 계열 RDATA를 텍스트로.
- * @note 매개변수는 이름 대신 번호로 적는다. 이 서버가 해석하지 않는 키도 그대로 되살릴 수
- *       있어야 하기 때문이다.
- */
+/// Parameters are written by number, not name, so keys this server does not interpret survive the
+/// round trip.
 fn svcb_text(priority: u16, target: &Name, params: &[(u16, Box<[u8]>)]) -> String {
     let mut s = format!("{priority} {}.", target.to_ascii_lower());
     for (key, val) in params {
@@ -2185,15 +1927,10 @@ fn svcb_text(priority: u16, target: &Name, params: &[(u16, Box<[u8]>)]) -> Strin
     s
 }
 
-/**
- * @brief SvcParam 하나를 RFC 9460 표시 형식으로 적는다.
- *
- * @details 파서가 읽는 것과 같은 형식이어야 한다. 동적 갱신 결과를 파일에 적고 다시 읽는
- *          경로가 이 형식을 왕복하기 때문이다. 뜻을 모르는 값은 keyNNNNN에 character-string
- *          으로 적어 원래 바이트를 그대로 보존한다.
- */
+/// One SvcParam in RFC 9460 presentation format, matching what the parser reads: dynamic update
+/// results are written to a file and read back. Values with unknown meaning are written as keyNNNNN
+/// with a character-string, preserving the original bytes.
 fn svcb_param_text(key: u16, wire: &[u8]) -> String {
-    /** @brief 길이 프리픽스가 붙은 이름 목록을 쉼표로 잇는다. */
     fn prefixed_list(wire: &[u8]) -> Option<String> {
         let mut items = Vec::new();
         let mut i = 0;
@@ -2211,7 +1948,6 @@ fn svcb_param_text(key: u16, wire: &[u8]) -> String {
         }
         (!items.is_empty()).then(|| items.join(","))
     }
-    /** @brief 고정 길이 주소를 쉼표로 잇는다. */
     fn addresses(wire: &[u8], width: usize, render: impl Fn(&[u8]) -> String) -> Option<String> {
         if wire.is_empty() || wire.len() % width != 0 {
             return None;
@@ -2247,7 +1983,7 @@ fn svcb_param_text(key: u16, wire: &[u8]) -> String {
     }
 }
 
-/** @brief SvcParamKey 번호를 표시 이름으로. 등록부에 없으면 keyNNNNN이다. */
+/// keyNNNNN for keys not in the registry.
 fn svcb_key_name(key: u16) -> String {
     match key {
         0 => "mandatory".to_string(),
@@ -2261,9 +1997,8 @@ fn svcb_key_name(key: u16) -> String {
     }
 }
 
-/** @brief base64로 적는다. ech 값이 이 형식을 쓴다. */
+/// The ech value uses this form.
 fn base64_encode(data: &[u8]) -> String {
-    /** @brief 표준 base64 알파벳. */
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {
@@ -2289,11 +2024,9 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/**
- * @brief 문자열을 zone 파일 형식으로 이스케이프해 따옴표로 감싼다.
- * @details 따옴표와 역슬래시는 역슬래시로, 그 밖의 비출력 문자와 주석·괄호 문자는 세 곳
- *          십진 이스케이프로 바꾼다. 그대로 두면 다시 읽을 때 토큰이 갈라진다.
- */
+/// Quotes and escapes for master files: backslash before quotes and backslashes, three-digit
+/// decimal escapes for other non-printing bytes and comment or parenthesis characters. Left as is,
+/// they would split tokens when read back.
 pub(crate) fn escape_char_string(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() + 2);
     s.push('"');
@@ -2314,12 +2047,9 @@ pub(crate) fn escape_char_string(bytes: &[u8]) -> String {
     s
 }
 
-/**
- * @brief 레코드를 zone 파일 한 줄로 만든다.
- * @details 소유자와 이름 인자는 모두 점으로 끝나는 절대 이름으로 쓴다. 상대 이름으로
- *          내보내면 다시 읽을 때 origin에 따라 다른 이름이 된다.
- * @note 이 서버가 해석하지 않는 타입은 형식으로 적는다. 그래야 왕복이 손실 없이 된다.
- */
+/// Owner and name fields are absolute names ending in a dot; relative names would read back as
+/// different names depending on the origin. Types this server does not interpret are written in
+/// generic form, so the round trip is lossless.
 pub fn record_to_master_line(r: &Record) -> String {
     let owner = format!("{}.", r.name.to_master_lower());
     let (ty, rd) = match &r.rdata {
@@ -2429,16 +2159,10 @@ pub fn record_to_master_line(r: &Record) -> String {
     format!("{owner} {} IN {} {}\n", r.ttl, ty, rd)
 }
 
-/**
- * @brief 로드 시점에 zone 전체의 규격 위반을 잡는다.
- *
- * @details 여기서 걸러 두면 질의 경로가 이런 경우를 다루지 않아도 된다. CNAME과 다른
- *          데이터가 한 이름에 공존하면 어느 쪽으로 답할지 정해지지 않고, DNAME이 둘이면
- *          같은 이름이 두 곳으로 향한다. NSEC3 매개변수가 zone 안에서 섞이면 검증기가
- *          부재 증명을 받아들이지 않는다.
- * @return 위반이 하나라도 있으면 오류. 로드 자체가 실패해야 반쯤 잘못된 zone이 서빙되지
- *         않는다.
- */
+/// Catches violations across the whole zone at load, so the query path never has to handle them:
+/// CNAME beside other data leaves the answer undefined, two DNAMEs send one name two ways, and
+/// mixed NSEC3 parameters make validators reject denial proofs. Any violation fails the load, so a
+/// partly broken zone is never served.
 fn validate_zone_records(
     origin: &Name,
     records: &[Record],
@@ -2632,23 +2356,17 @@ fn validate_zone_records(
     Ok(())
 }
 
-/** @brief NSEC3 RDATA에서 검증에 필요한 매개변수만 추출해 둔 형태. */
+/// The NSEC3 parameters validation needs.
 struct Nsec3Metadata<'a> {
-    /** @brief 해시 알고리즘. */
     hash_algorithm: u8,
-    /** @brief 플래그. opt-out 비트 외에는 켜져 있으면 안 된다. */
+    /// Only the opt-out bit may be set.
     flags: u8,
-    /** @brief 추가 해시 반복 횟수. */
     iterations: u16,
-    /** @brief salt. 복사하지 않고 원본을 빌린다. */
     salt: &'a [u8],
 }
 
-/**
- * @brief NSEC3 RDATA를 검사하며 매개변수를 추출한다.
- * @details 길이 필드를 하나씩 따라가며 경계를 확인한다. 다음 해시 길이가 SHA-1의 20이
- *          아니면 이 서버가 다루는 형태가 아니다.
- */
+/// Follows each length field with bounds checks. A next-hash length other than SHA-1's 20 is not a
+/// form this server handles.
 fn parse_nsec3_metadata(record: &Record) -> Result<Nsec3Metadata<'_>, String> {
     let RData::Unknown(50, raw) = &record.rdata else {
         return Err(format!(
@@ -2699,11 +2417,8 @@ fn parse_nsec3_metadata(record: &Record) -> Result<Nsec3Metadata<'_>, String> {
     })
 }
 
-/**
- * @brief 타입 비트맵이 정규형인지.
- * @details 윈도우 번호가 엄격히 증가하고, 블록 길이가 1..=32이며, 마지막 옥텟이 0이 아니어야
- *          한다. 같은 타입 집합을 여러 바이트열로 쓸 수 있으면 서명 검증이 어긋난다.
- */
+/// Canonical form only: strictly increasing window numbers, block lengths in 1..=32, and a nonzero
+/// last octet. If one type set had several encodings, signature validation would disagree.
 fn valid_type_bitmaps(raw: &[u8]) -> bool {
     let mut offset = 0;
     let mut previous_window = None;
@@ -2727,7 +2442,7 @@ fn valid_type_bitmaps(raw: &[u8]) -> bool {
     true
 }
 
-/** @brief 라벨이 SHA-1 해시를 base32hex로 적은 형태인지. 길이 32에 알파벳 안 문자만 온다. */
+/// 32 base32hex characters.
 fn is_sha1_nsec3_owner(label: &[u8]) -> bool {
     label.len() == 32
         && label
@@ -2735,7 +2450,6 @@ fn is_sha1_nsec3_owner(label: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte.to_ascii_uppercase(), b'A'..=b'V'))
 }
 
-/** @brief 이름이 zone 안인지. 자기 자신도 포함이다. */
 fn is_subdomain_or_eq(name: &Name, zone: &Name) -> bool {
     if name.num_labels() < zone.num_labels() {
         return false;
@@ -2743,11 +2457,8 @@ fn is_subdomain_or_eq(name: &Name, zone: &Name) -> bool {
     name.suffix(zone.num_labels()).eq_ignore_case(zone)
 }
 
-/**
- * @brief 정규 이름 순서 비교. 라벨을 뒤에서부터 본다.
- * @details 이 순서로 정렬해야 같은 부모 아래 형제가 인접하고, 부재 증명 체인과 소유자
- *          그룹화가 함께 성립한다.
- */
+/// Canonical name order, comparing labels from the right. This order puts siblings under one parent
+/// next to each other, which both the denial chain and owner grouping rely on.
 fn dnssec_name_cmp(left: &Name, right: &Name) -> Ordering {
     for (left_label, right_label) in left.labels().iter().rev().zip(right.labels().iter().rev()) {
         let order = left_label
@@ -2761,10 +2472,7 @@ fn dnssec_name_cmp(left: &Name, right: &Name) -> Ordering {
     left.num_labels().cmp(&right.num_labels())
 }
 
-/**
- * @brief 부모 앞에 별표 라벨을 붙인다.
- * @note 부모가 이미 zone 안의 이름이라 길이 상한을 넘지 않는다. 그래서 실패를 가정하지 않는다.
- */
+/// Cannot exceed the length limit, since the parent is already a name in the zone.
 fn prepend_wildcard(parent: &Name) -> Name {
     let mut labels = Vec::with_capacity(parent.labels().len() + 1);
     labels.push(b"*".to_vec());
@@ -2772,10 +2480,8 @@ fn prepend_wildcard(parent: &Name) -> Name {
     Name::from_labels(labels).expect("The wildcard name is valid")
 }
 
-/**
- * @brief 와일드카드로 합성한 답변의 소유자를 질의 이름으로 바꾼다.
- * @note 답변 절만 바꾼다. CNAME을 따라가며 붙은 다른 이름의 레코드는 그대로 둬야 한다.
- */
+/// Rewrites only the answer section; records of other names added while chasing a CNAME stay as
+/// they are.
 fn synthesize_owner(mut resp: Response, qname: &Name, wildcard_source: &Name) -> Response {
     for record in &mut resp.answers {
         if record.name.eq_ignore_case(wildcard_source) {
@@ -2785,7 +2491,6 @@ fn synthesize_owner(mut resp: Response, qname: &Name, wildcard_source: &Name) ->
     resp
 }
 
-/** @brief 질의 판정 순서, 위임 경계, 무할당 경로와 구조화 경로의 동치성. */
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2793,13 +2498,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    /**
-     * @brief 넷이 모두 같은 레코드를 하나만 남기는지.
-     * @details RFC 2181은 label, class, type, data가 모두 같은 레코드가 둘 있는 것은
-     *          뜻이 없으므로 서버가 억제해야 한다고 한다. 남겨 두면 응답이 그만큼 커지고,
-     *          서명 영역에서는 서명이 덮는 집합과 내보내는 집합이 달라진다. 수명만 다른
-     *          것은 중복이 아니라 5.2가 맞춰 주는 대상이므로 함께 본다.
-     */
+    /// Kept duplicates inflate answers, and in signed zones the signed set differs from the sent
+    /// set. Records differing only in TTL are not duplicates but get their TTLs aligned, so they
+    /// are checked too.
     fn a_loaded_zone_keeps_only_one_of_two_identical_records() {
         let zone = crate::parse::parse_zone(
             concat!(
@@ -2844,12 +2545,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 로드한 영역이 RFC 2181의 수명 규칙을 지키는지.
-     * @details 5.2항은 한 RRSet의 수명이 모두 같아야 한다 정하고 서버가 다른 값을 담아
-     *          보내는 것을 금지한다. 8항은 상한을 넘는 수명을 0으로 본다. 어느 타입으로
-     *          들어와도 같아야 하므로 A와 TXT를 함께 본다.
-     */
+    /// Checked with both A and TXT, since the rule must hold for any type.
     fn a_loaded_zone_obeys_the_ttl_rules() {
         let zone = crate::parse::parse_zone(
             concat!(
@@ -2890,7 +2586,7 @@ mod tests {
         );
     }
 
-    /** @brief 저장 구조가 커지지 않았는지. 이 배치가 커지면 zone 하나의 메모리와 캐시 효율이 함께 나빠진다. */
+    /// A larger layout costs memory and cache efficiency for every zone.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn authoritative_storage_layout_stays_compact() {
@@ -2900,11 +2596,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 타입을 TTL 필드에 합쳐 넣어도 값이 온전히 돌아오는지.
-     * @details 상한을 넘는 TTL은 깎이고, 그 밖의 타입은 TTL 필드에 타입을 담으므로
-     *          아레나를 보지 않고도 타입이 나와야 한다.
-     */
+    /// Over-limit TTLs are clamped, and other types must report their type without reading the
+    /// arena.
     fn stored_record_packs_tag_and_value_without_losing_either() {
         let mut aaaa = Vec::new();
         let mut other = Vec::new();
@@ -2948,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 owner의 타입이 정렬되고 RRset slice가 이웃 타입을 섞지 않는지. */
+    /// An RRset slice must not include neighboring types.
     fn owner_records_are_type_sorted_for_single_pass_rrset_writes() {
         let zone = parse_zone(
             concat!(
@@ -2978,7 +2671,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns-authority --release bench_sorted_rrset_slice -- --ignored --nocapture"]
-    /** @brief 종전 두 번 필터와 타입 slice 한 번 순회의 격리 비용을 비교한다. */
+    /// Measures two filtering passes against one pass over the type slice.
     fn bench_sorted_rrset_slice() {
         use std::hint::black_box;
 
@@ -3040,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질문 헤더를 한 번에 잡아도 바이트와 한도 실패가 정확한지. */
+    /// Reserving the header at once must keep the bytes and limit failures exact.
     fn question_prologue_is_byte_exact_and_fails_atomically() {
         let qname = [
             3, b'W', b'W', b'W', 4, b'f', b'a', b's', b't', 4, b't', b'e', b's', b't', 0,
@@ -3072,7 +2765,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns-authority --release bench_question_prologue_single_reserve -- --ignored --nocapture"]
-    /** @brief 세 번 append하던 질문 헤더와 한 번 reserve한 후보의 격리 비용을 비교한다. */
+    /// Measures three appends against one reserve for the question header.
     fn bench_question_prologue_single_reserve() {
         use std::hint::black_box;
 
@@ -3147,7 +2840,7 @@ mod tests {
         }
     }
 
-    /** @brief 인덱스를 복제해도 조회 결과가 같은지. 해시 시드가 함께 복제돼야 한다. */
+    /// The hash seed must be cloned too.
     #[test]
     fn cloned_owner_index_preserves_exact_and_missing_lookups() {
         let zone = parse_zone(
@@ -3162,7 +2855,6 @@ mod tests {
         assert_eq!(zone.query(&missing, RecordType::A).rcode, 3);
     }
 
-    /** @brief 루트 zone이 TLD 아래 이름을 직접 답하지 않고 참조로 넘기는지. */
     #[test]
     fn root_zone_refers_below_tld_delegation() {
         let root_text = "$TTL 3600\n. IN SOA ns.root. host.root. 1 3600 900 604800 3600\n. IN NS ns.root.\nns.root. IN A 127.0.1.1\ntest. IN NS ns.test.\nns.test. IN A 127.0.2.1\n";
@@ -3180,7 +2872,6 @@ mod tests {
         );
     }
 
-    /** @brief TLD zone이 위임 아래 이름을 참조로 넘기는지. */
     #[test]
     fn tld_zone_refers_below_second_level_delegation() {
         let tld_text = "$TTL 3600\ntest. IN SOA ns.test. host.test. 1 3600 900 604800 3600\ntest. IN NS ns.test.\nns.test. IN A 127.0.2.1\nz0007.test. IN NS ns-leaf.test.\nns-leaf.test. IN A 127.0.3.1\n";
@@ -3198,7 +2889,6 @@ mod tests {
         );
     }
 
-    /** @brief 와일드카드 이름을 만들 때 부모의 라벨 바이트가 그대로 보존되는지. */
     #[test]
     fn wildcard_owner_preserves_raw_parent_octets() {
         let parent = Name::from_labels(vec![vec![0xff], b"test".to_vec()]).unwrap();
@@ -3209,7 +2899,6 @@ mod tests {
         assert_eq!(labels[2], b"test");
     }
 
-    /** @brief 테스트용 영역 글. */
     const ZONE: &str = r#"
 $ORIGIN example.com.
 $TTL 3600
@@ -3233,12 +2922,12 @@ aliascut IN CNAME ns1.sub.example.com.
 old      IN DNAME target.example.net.
 "#;
 
-    /** @brief 테스트용 zone 하나. 위임·와일드카드·DNAME을 갖춰 두 경로 대조에 쓴다. */
+    /// Has a delegation, a wildcard, and a DNAME, for comparing the two paths.
     fn zone() -> Zone {
         parse_zone(ZONE, "example.com").unwrap()
     }
 
-    /** @brief 무할당 경로와 구조화된 경로가 같은 답을 내는지. 어긋나면 어느 경로로 갔느냐에 따라 응답이 달라진다. */
+    /// A mismatch would make the answer depend on which path a query took.
     #[test]
     fn simple_wire_matches_structured_answers_and_shaped_responses() {
         let zone_text = "$ORIGIN fast.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\nwww IN A 192.0.2.1\nwww IN A 192.0.2.2\nwww IN AAAA 2001:db8::1\n";
@@ -3333,10 +3022,9 @@ old      IN DNAME target.example.net.
         ));
         assert!(writer.buf.is_empty());
 
-        /*
-         * 큰 RRset이 상한을 넘으면 반쯤 쓴 응답을 남기지 않고 전부 되돌려야 한다.
-         * 답변 블록은 공간을 한 번에 확보하므로 이 판정이 첫 레코드를 쓰기 전에 난다.
-         */
+        // A large RRset over the limit must roll back fully instead of leaving a half-written
+        // answer. The answer block reserves its space at once, so this is decided before the first
+        // record is written.
         let mut wide = ZoneStore::new();
         let mut wide_text =
             String::from("$ORIGIN wide.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n");
@@ -3437,7 +3125,7 @@ old      IN DNAME target.example.net.
         }
     }
 
-    /** @brief 무할당 경로가 zone 상태를 바꾸지 않는지. 질의끼리 서로 영향을 주면 안 된다. */
+    /// The fast path must not change zone state; queries must not affect each other.
     #[test]
     fn shaped_zone_direct_wire_is_query_local() {
         let zone_text = "$ORIGIN mixed.test.\n$TTL 300\n@ IN SOA ns admin 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n*.wild IN A 192.0.2.1\nleaf.empty IN A 192.0.2.2\nold IN DNAME target.example.\n";
@@ -3527,7 +3215,6 @@ old      IN DNAME target.example.net.
         }
     }
 
-    /** @brief zone을 파일로 내보내고 다시 읽어도 같은지. */
     #[test]
     fn master_file_roundtrip() {
         let z = zone();
@@ -3567,16 +3254,12 @@ old      IN DNAME target.example.net.
         );
     }
 
-    /** @brief 이름 문자열을 Name으로. */
     fn n(s: &str) -> Name {
         Name::from_str(s).unwrap()
     }
 
-    /**
-     * @brief 메시지 하나에 담을 수 없는 RRset을 로드 시점에 거부하는지.
-     * @details 주소는 전부 달라야 한다. 같은 값을 되풀이하면 RFC 2181의 중복 억제가
-     *          먼저 걷어 내 상한에 닿지 않고, 테스트가 재려던 것을 측정하지 못한다.
-     */
+    /// Every address differs: repeated values would be removed by RFC 2181 duplicate suppression
+    /// first, never reach the limit, and the test would measure nothing.
     #[test]
     fn rejects_owner_rrsets_that_cannot_fit_a_dns_message() {
         let mut records = zone().axfr_records();
@@ -3592,7 +3275,6 @@ old      IN DNAME target.example.net.
         assert!(Zone::from_records(records).is_err());
     }
 
-    /** @brief 문자열이 바이트 그대로 왕복하고, 이스케이프가 토큰을 갈라 놓지 않는지. */
     #[test]
     fn char_string_roundtrip_is_byte_exact_and_injection_safe() {
         let nasty: Vec<u8> = vec![
@@ -3622,7 +3304,6 @@ old      IN DNAME target.example.net.
         }
     }
 
-    /** @brief CAA의 태그와 값이 왕복에서 보존되는지. */
     #[test]
     fn parses_and_roundtrips_caa() {
         let src = "\
@@ -3657,7 +3338,6 @@ $TTL 3600
         );
     }
 
-    /** @brief 기본 zone 파싱. */
     #[test]
     fn parses_soa_and_records() {
         let z = zone();
@@ -3666,7 +3346,6 @@ $TTL 3600
         assert_eq!(z.soa.refresh, 7200);
     }
 
-    /** @brief 정확히 일치하는 이름의 답변에 권한 비트가 서는지. */
     #[test]
     fn exact_a_answer_is_authoritative() {
         let r = zone().query(&n("www.example.com"), RecordType::A);
@@ -3676,7 +3355,6 @@ $TTL 3600
         assert!(matches!(r.answers[0].rdata, RData::A(ip) if ip == Ipv4Addr::new(192, 0, 2, 2)));
     }
 
-    /** @brief NODATA는 답변 없이 SOA만 담는지. */
     #[test]
     fn nodata_returns_soa_no_answer() {
         let r = zone().query(&n("www.example.com"), RecordType::MX);
@@ -3686,7 +3364,7 @@ $TTL 3600
         assert!(matches!(r.authority[0].rdata, RData::Soa(_)));
     }
 
-    /** @brief NXDOMAIN도 SOA를 담는지. 그 TTL이 부정 캐시 기간을 정한다. */
+    /// Its TTL sets the negative cache time.
     #[test]
     fn nxdomain_returns_soa() {
         let r = zone().query(&n("nope.example.com"), RecordType::A);
@@ -3695,7 +3373,6 @@ $TTL 3600
         assert!(matches!(r.authority[0].rdata, RData::Soa(_)));
     }
 
-    /** @brief zone 안의 CNAME은 이 서버가 끝까지 따라가는지. */
     #[test]
     fn cname_is_chased_in_zone() {
         let r = zone().query(&n("ftp.example.com"), RecordType::A);
@@ -3711,13 +3388,8 @@ $TTL 3600
     }
 
     #[test]
-    /**
-     * @brief CNAME 체인이 멈추는 다섯 곳이 각각 맞는 응답을 내는지.
-     *
-     * @details RFC 6604는 rcode를 체인의 마지막 질의 주기로 정하라고 한다. 다섯을
-     *          하나로 합치면 부재가 NOERROR로 나가고, 부정 SOA가 빠져 부정 캐시도 되지 않아
-     *          같은 질의가 되풀이된다.
-     */
+    /// Merging the endings would send absence as NOERROR and drop the negative SOA, so nothing is
+    /// cached negatively and the same query repeats.
     fn a_cname_chain_reports_where_it_stopped() {
         let zone = crate::parse::parse_zone(
             concat!(
@@ -3799,12 +3471,8 @@ $TTL 3600
     }
 
     #[test]
-    /**
-     * @brief SVCB 매개변수가 텍스트를 왕복해도 그대로인지.
-     *
-     * @details 동적 갱신 결과를 파일로 적고 다시 읽는 경로가 이 형식을 지난다. 적는 쪽과
-     *          읽는 쪽이 어긋나면 재시작 한 번에 값이 달라진다.
-     */
+    /// Dynamic update results are written to a file and read back in this form; a writer and reader
+    /// that disagree would change values across one restart.
     fn service_binding_parameters_survive_a_text_round_trip() {
         let source = concat!(
             "$ORIGIN rt.test.
@@ -3845,7 +3513,6 @@ $TTL 3600
         );
     }
 
-    /** @brief 와일드카드 답변의 소유자가 질의 이름으로 바뀌는지. */
     #[test]
     fn wildcard_synthesizes_owner() {
         let r = zone().query(&n("anything.wild.example.com"), RecordType::A);
@@ -3860,7 +3527,6 @@ $TTL 3600
         assert!(matches!(r.answers[0].rdata, RData::A(ip) if ip == Ipv4Addr::new(192,0,2,99)));
     }
 
-    /** @brief 빈 비단말은 존재하므로 NODATA이고, 부모 와일드카드가 끼어들지 못하는지. */
     #[test]
     fn empty_nonterminal_is_nodata_and_blocks_parent_wildcard() {
         let source = r#"
@@ -3884,7 +3550,6 @@ leaf.empty 60 IN A 192.0.2.2
         );
     }
 
-    /** @brief 위임 참조에 NS와 glue가 함께 담기는지. */
     #[test]
     fn delegation_returns_referral_with_glue() {
         let r = zone().query(&n("host.sub.example.com"), RecordType::A);
@@ -3906,7 +3571,7 @@ leaf.empty 60 IN A 192.0.2.2
         );
     }
 
-    /** @brief 위임 지점의 DS는 부모 것이므로 권한 있게 답하는지. */
+    /// The DS at a cut belongs to the parent.
     #[test]
     fn delegation_cut_serves_parent_ds_authoritatively() {
         let r = zone().query(&n("sub.example.com"), RecordType::DS);
@@ -3916,7 +3581,7 @@ leaf.empty 60 IN A 192.0.2.2
         assert_eq!(r.answers[0].rtype, RecordType::DS);
     }
 
-    /** @brief 위임 아래 glue를 답변으로 끌어올리지 않는지. 그것은 자식 zone의 데이터다. */
+    /// Glue below a delegation is child zone data.
     #[test]
     fn cname_chase_never_promotes_glue_below_delegation_to_answer() {
         let response = zone().query(&n("aliascut.example.com"), RecordType::A);
@@ -3929,7 +3594,6 @@ leaf.empty 60 IN A 192.0.2.2
             .any(|record| matches!(record.rdata, RData::A(_))));
     }
 
-    /** @brief DNAME은 자손만 바꾸고 자기 이름은 건드리지 않는지. */
     #[test]
     fn dname_rewrites_descendants_but_not_the_owner() {
         let z = zone();
@@ -3951,7 +3615,6 @@ leaf.empty 60 IN A 192.0.2.2
         assert!(matches!(owner.authority[0].rdata, RData::Soa(_)));
     }
 
-    /** @brief DNAME 대상이 zone 안이면 그 답까지 함께 담는지. */
     #[test]
     fn dname_chases_an_in_zone_terminal_rrset() {
         let source = "$ORIGIN example.\n\
@@ -3973,7 +3636,6 @@ leaf.empty 60 IN A 192.0.2.2
         ));
     }
 
-    /** @brief 체인 끝의 답변이 가리키는 이름의 주소가 추가 절에 담기는지. */
     #[test]
     fn cname_terminal_rrset_contributes_additional_records() {
         let source = "$ORIGIN example.\n\
@@ -3996,7 +3658,6 @@ leaf.empty 60 IN A 192.0.2.2
         ));
     }
 
-    /** @brief CNAME과 다른 데이터의 공존, 그리고 순환을 로드 시점에 거부하는지. */
     #[test]
     fn zone_rejects_alias_conflicts_and_cycles() {
         let base = |body: &str| {
@@ -4039,10 +3700,8 @@ leaf.empty 60 IN A 192.0.2.2
         assert!(parse_zone(apex_dname, "example").is_ok());
     }
 
-    /** @brief 긴 체인과 순환이 질의 경로를 붙잡지 않는지. */
     #[test]
     fn zone_validates_long_cname_chains_and_cycles() {
-        /** @brief 테스트에 쓸 체인 길이. */
         const CHAIN_LEN: usize = 10_000;
         let header = "$ORIGIN example.\n@ 60 IN SOA ns.example. hostmaster.example. 1 60 60 3600 60\n@ 60 IN NS ns.example.\nns 60 IN A 192.0.2.1\n";
         let mut chain = String::from(header);
@@ -4064,7 +3723,6 @@ leaf.empty 60 IN A 192.0.2.2
         assert!(error.contains("CNAME loop"), "{error}");
     }
 
-    /** @brief apex의 SOA와 NS가 제대로 답해지는지. */
     #[test]
     fn apex_soa_and_ns() {
         let z = zone();
@@ -4075,7 +3733,6 @@ leaf.empty 60 IN A 192.0.2.2
         assert_eq!(ns.answers.len(), 2);
     }
 
-    /** @brief MX가 가리키는 이름의 주소가 추가 절에 담기는지. */
     #[test]
     fn mx_includes_target_glue() {
         let r = zone().query(&n("mail.example.com"), RecordType::MX);
@@ -4089,7 +3746,7 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 서비스 기록과 함께 그 대상의 주소도 담아 보내는지. 안 실으면 클라이언트가 한 번 더 묻는다. */
+    /// Without them the client has to ask again.
     fn service_binding_includes_in_zone_target_records_and_addresses() {
         let source = "$ORIGIN example.\n\
             @ 60 IN SOA ns.example. hostmaster.example. 1 60 60 3600 60\n\
@@ -4129,7 +3786,6 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 같은 대상이 여럿이어도 딸린 기록이 늘어나지 않는지. */
     fn repeated_service_binding_target_does_not_amplify_additional_rrsets() {
         let mut source = "$ORIGIN example.\n\
             @ 60 IN SOA ns.example. hostmaster.example. 1 60 60 3600 60\n\
@@ -4167,7 +3823,6 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 영역 전송으로 받은 기록이 다시 영역이 되는지. */
     fn from_records_roundtrips_axfr() {
         let axfr = zone().axfr_records();
         let z2 = Zone::from_records(axfr).unwrap();
@@ -4183,7 +3838,6 @@ leaf.empty 60 IN A 192.0.2.2
         );
     }
 
-    /** @brief 이름을 감춘 형태의 테스트용 증명 기록. */
     fn nsec3_record(owner: &str, iterations: u16, salt: &[u8]) -> Record {
         let mut raw = vec![1, 0];
         raw.extend_from_slice(&iterations.to_be_bytes());
@@ -4196,7 +3850,7 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 미리 서명된 영역의 증명 설정이 어긋나면 거부하는지. 섞이면 없는 것을 있다고 한다. */
+    /// Inconsistent parameters would break denial proofs.
     fn presigned_zone_rejects_unsafe_or_inconsistent_nsec3() {
         let valid = nsec3_record("00000000000000000000000000000000.example.com", 0, b"salt");
         let mut records = zone().axfr_records();
@@ -4250,7 +3904,7 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 글자로 바꿀 수 없는 이름이 서로 겹치지 않는지. 겹치면 남의 답을 준다. */
+    /// A collision would serve another name's answer.
     fn binary_owner_names_do_not_collide_through_lossy_utf8() {
         let first =
             Name::from_labels(vec![vec![0xff], b"example".to_vec(), b"com".to_vec()]).unwrap();
@@ -4286,7 +3940,6 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 가장 좁게 맞는 영역이 이기는지. */
     fn store_matches_most_specific_zone() {
         let mut store = ZoneStore::new();
         store.add(zone());
@@ -4315,7 +3968,6 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 같은 이름의 영역을 두 번 올리면 교체하는지. */
     fn store_replaces_duplicate_zone_origin() {
         let make = |address: &str| {
             parse_zone(
@@ -4340,7 +3992,7 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 데이터베이스 주소를 이름으로 풀지 않는지. 풀면 시작 중 순환이 된다. */
+    /// Resolving it would loop at startup.
     fn plaintext_sql_endpoint_never_uses_hostname_dns() {
         assert_eq!(
             loopback_socket_addr("localhost", 3306, "SQL").unwrap(),
@@ -4355,7 +4007,6 @@ leaf.empty 60 IN A 192.0.2.2
     }
 
     #[test]
-    /** @brief 대괄호로 감싼 IPv6 주소가 읽히는지. */
     fn sql_authority_parser_handles_bracketed_ipv6() {
         assert_eq!(
             split_host_port("[::1]:6543", 5432),

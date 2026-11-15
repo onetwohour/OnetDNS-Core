@@ -1,23 +1,16 @@
-/*!
- * @brief HPACK 헤더 압축(RFC 7541).
- *
- * @details 정적 테이블과 동적 테이블을 함께 쓴다. 동적 테이블은 압축 컨텍스트를 연결 내내 공유하므로,
- *          한쪽이 테이블 상태를 잘못 갱신하면 이후 모든 헤더가 어긋난다. 오류는 스트림이
- *          아니라 연결 수준이다.
- */
+//! HPACK header compression (RFC 7541). The dynamic table is compression context shared for the
+//! whole connection: one wrong table update desyncs every later header, so errors are connection
+//! errors, not stream errors.
 
 use std::collections::VecDeque;
 
 use crate::huffman;
 
-/**
- * @brief 디코딩 결과 헤더 목록의 누적 크기 상한.
- * @warning HPACK은 압축 폭탄이 가능하다. 몇 바이트의 지시로 동적 테이블 항목을 반복 참조하면
- *          거대한 헤더 목록이 만들어지므로, 만들어 낸 총량 자체를 제한해야 한다.
- */
+/// HPACK allows compression bombs: a few bytes that keep referencing a dynamic table entry build a
+/// huge header list, so the decoded total itself is capped.
 const MAX_DECODED_HEADER_LIST: usize = 32 * 1024;
 
-/** @brief RFC 7541 부록 A의 정적 테이블. 인덱스 1부터 시작한다. */
+/// The RFC 7541 static table; indexes start at 1.
 const STATIC: [(&str, &str); 61] = [
     (":authority", ""),
     (":method", "GET"),
@@ -82,12 +75,9 @@ const STATIC: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-/**
- * @brief HPACK 가변 길이 정수를 읽는다.
- * @param prefix_bits 첫 바이트에서 값이 차지하는 비트 수.
- * @return (값, 소비한 바이트 수). 시프트 폭을 넘기는 입력은 None이다. 상한이 없으면
- *         연속 바이트로 무한히 이어 붙일 수 있다.
- */
+/// Reads an HPACK integer whose first byte holds `prefix_bits` bits of the value. Returns the value
+/// and the bytes consumed; `None` when it would overflow, since continuation bytes could otherwise
+/// go on forever.
 pub fn decode_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     if !(1..=8).contains(&prefix_bits) {
         return None;
@@ -119,7 +109,7 @@ pub fn decode_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     Some((value, i))
 }
 
-/** @brief HPACK 가변 길이 정수를 쓴다. first_high는 첫 바이트 상위 비트의 지시자다. */
+/// `first_high` holds the indicator bits above the prefix in the first byte.
 pub fn encode_int(out: &mut Vec<u8>, value: u64, prefix_bits: u8, first_high: u8) {
     let mask = (1u16 << prefix_bits) as u64 - 1;
     if value < mask {
@@ -135,7 +125,7 @@ pub fn encode_int(out: &mut Vec<u8>, value: u64, prefix_bits: u8, first_high: u8
     out.push(v as u8);
 }
 
-/** @brief 문자열을 읽는다. 최상위 비트가 서 있으면 허프만 인코딩이다. */
+/// A set high bit means Huffman encoding.
 fn decode_string(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     let huff = buf.first()? & 0x80 != 0;
     let (len, n) = decode_int(buf, 7)?;
@@ -149,7 +139,7 @@ fn decode_string(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((s, end))
 }
 
-/** @brief 문자열을 쓴다. 허프만은 결과가 더 짧을 때만 의미가 있다. */
+/// Huffman is used only when it comes out shorter.
 fn encode_string(out: &mut Vec<u8>, s: &[u8], use_huffman: bool) {
     let huff = use_huffman && s.iter().all(|&b| b < 128);
     if huff {
@@ -164,29 +154,24 @@ fn encode_string(out: &mut Vec<u8>, s: &[u8], use_huffman: bool) {
     out.extend_from_slice(s);
 }
 
-/**
- * @brief HPACK 디코더. 연결 내내 동적 테이블 상태를 유지한다.
- * @invariant max_size <= allowed_max_size. 상대가 테이블을 이쪽이 광고한 크기 이상으로
- *            키우지 못하게 막는 한도다.
- */
+/// Keeps the dynamic table for the whole connection. `max_size <= allowed_max_size`, so the peer
+/// cannot grow the table past what this side advertised.
 pub struct Decoder {
-    /** @brief 쌓아 둔 헤더들. */
     dynamic: VecDeque<(Vec<u8>, Vec<u8>)>,
-    /** @brief 지금 담긴 크기. */
     size: usize,
-    /** @brief 지금 허락한 테이블 크기. */
+    /// Current limit, set by table size updates.
     max_size: usize,
-    /** @brief 상대가 알린 최대 테이블 크기. 이보다 크게 요구하면 거부한다. */
+    /// Limit advertised to the peer; a larger table size update is refused.
     allowed_max_size: usize,
 }
 
-/** @brief 동적 테이블 항목의 회계상 크기. +32는 명세가 정한 항목 오버헤드다. */
+/// The 32 is the per-entry overhead the protocol defines.
 fn entry_size(n: &[u8], v: &[u8]) -> usize {
     n.len() + v.len() + 32
 }
 
 impl Decoder {
-    /** @brief 디코더를 만든다. max_size가 상대에게 광고한 테이블 크기다. */
+    /// `max_size` is the table size advertised to the peer.
     pub fn new(max_size: usize) -> Self {
         Decoder {
             dynamic: VecDeque::new(),
@@ -196,10 +181,7 @@ impl Decoder {
         }
     }
 
-    /**
-     * @brief 인덱스로 헤더를 찾는다. 정적 테이블이 앞, 동적 테이블이 뒤다.
-     * @note 인덱스 0은 유효하지 않다. 동적 테이블은 최근 삽입이 낮은 인덱스를 갖는다.
-     */
+    /// Static entries come first, then dynamic ones, newest first. Index 0 is invalid.
     fn lookup(&self, index: u64) -> Option<(Vec<u8>, Vec<u8>)> {
         if index == 0 {
             return None;
@@ -213,7 +195,7 @@ impl Decoder {
         }
     }
 
-    /** @brief 동적 테이블 앞에 항목을 넣고, 넘치면 오래된 것부터 퇴거시킨다. */
+    /// Inserts at the front of the dynamic table, evicting the oldest entries on overflow.
     fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) {
         let es = entry_size(&name, &value);
         self.dynamic.push_front((name, value));
@@ -221,7 +203,6 @@ impl Decoder {
         self.evict();
     }
 
-    /** @brief 테이블 크기가 한도 이하가 될 때까지 오래된 항목을 버린다. */
     fn evict(&mut self) {
         while self.size > self.max_size {
             if let Some((n, v)) = self.dynamic.pop_back() {
@@ -232,11 +213,8 @@ impl Decoder {
         }
     }
 
-    /**
-     * @brief 동적 테이블 크기를 바꾼다.
-     * @return 이쪽이 광고한 한도를 넘기려 하면 false. 그대로 받아 주면 상대가 이쪽 메모리
-     *         사용량을 정하게 된다.
-     */
+    /// Refuses a size above the advertised limit; accepting it would let the peer decide this
+    /// side's memory use.
     fn set_max(&mut self, m: usize) -> bool {
         if m > self.allowed_max_size {
             return false;
@@ -246,14 +224,11 @@ impl Decoder {
         true
     }
 
-    /**
-     * @brief 헤더 블록을 해석한다.
-     *
-     * @details 만들어 낸 헤더의 누적 크기를 세어 상한에서 멈춘다. 압축 폭탄 방어다.
-     * @note 테이블 크기 갱신은 헤더 블록 맨 앞에서만 허용한다. 중간에 끼면 같은 블록을
-     *       해석하는 구현마다 테이블 상태가 달라져 이후 헤더가 어긋난다.
-     * @return 규칙 위반이면 None. 호출자는 연결 오류로 처리한다.
-     */
+    /// Stops at the cap on total decoded size, which defends against compression bombs. Table size
+    /// updates are allowed only at the start of a block; elsewhere, implementations would disagree
+    /// on the table state and later headers would desync.
+    ///
+    /// `None` on any violation; the caller treats it as a connection error.
     pub fn decode(&mut self, mut buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut decoded_size = 0usize;
@@ -299,7 +274,7 @@ impl Decoder {
         Some(out)
     }
 
-    /** @brief 리터럴 헤더를 읽는다. 이름은 인덱스로 오거나 문자열로 온다. */
+    /// The name comes as an index or a string.
     fn read_literal(&self, buf: &[u8], prefix_bits: u8) -> Option<(Vec<u8>, Vec<u8>, usize)> {
         let (name_idx, mut pos) = decode_int(buf, prefix_bits)?;
         let name = if name_idx == 0 {
@@ -316,11 +291,8 @@ impl Decoder {
     }
 }
 
-/**
- * @brief 응답 헤더를 인코딩한다.
- * @note 동적 테이블을 쓰지 않는다. 인덱스 없는 리터럴만 내보낸다. DoH 응답은 헤더가 몇 개뿐이라
- *       압축 이득이 미미하고, 인코더 쪽 테이블 상태를 가지고 있지 않아도 되는 편이 단순하다.
- */
+/// Emits only literals without indexing and never touches the dynamic table. DoH responses carry a
+/// few headers, so compression gains little, and having no encoder table state is simpler.
 pub fn encode_response(headers: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for &(name, value) in headers {
@@ -342,17 +314,14 @@ pub fn encode_response(headers: &[(&str, &str)]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-/** @brief 규격 예제와 맞는지, 그리고 상한이 걸리는지. */
 mod tests {
     use super::*;
 
-    /** @brief 바이트열을 문자열로. */
     fn s(v: &[u8]) -> String {
         String::from_utf8(v.to_vec()).unwrap()
     }
 
     #[test]
-    /** @brief 수 표기가 규격 예제와 맞는지. */
     fn integer_rfc_examples() {
         let mut o = Vec::new();
         encode_int(&mut o, 10, 5, 0);
@@ -366,7 +335,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정 테이블의 항목을 읽는지. */
     fn decode_indexed_static() {
         let mut d = Decoder::new(4096);
         let hs = d.decode(&[0x82]).unwrap();
@@ -376,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격 예제 요청이 그대로 읽히는지. */
     fn rfc_c31_request_with_huffman_and_indexing() {
         let block = [
             0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
@@ -398,7 +365,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적었다 읽으면 같은지. */
     fn encode_then_decode_response() {
         let block = encode_response(&[
             (":status", "200"),
@@ -418,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블에 쌓이는 항목의 왕복. */
     fn literal_with_incremental_indexing_roundtrips_dynamic() {
         let mut d = Decoder::new(4096);
 
@@ -435,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블 크기 변경이 헤더 앞에서만 오는지. 중간에 허용하면 양쪽 테이블이 어긋난다. */
+    /// Allowing them mid-block desyncs the two tables.
     fn table_size_updates_are_limited_to_the_start_of_a_header_block() {
         let mut after_header = vec![0x82];
         encode_int(&mut after_header, 0, 5, 0x20);
@@ -446,7 +411,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 읽어 들이는 헤더 크기에 상한이 걸리는지. */
     fn decoded_header_list_is_bounded_at_the_advertised_limit() {
         let block = vec![0x82; 1024];
         assert!(Decoder::new(4096).decode(&block).is_none());
@@ -454,7 +418,6 @@ mod tests {
 
     #[cfg(target_pointer_width = "32")]
     #[test]
-    /** @brief 담을 수 없는 큰 값을 거부하는지. */
     fn rejects_lengths_indexes_and_table_sizes_wider_than_usize() {
         let wider = u64::from(u32::MAX) + 1;
 

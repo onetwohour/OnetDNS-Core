@@ -1,16 +1,13 @@
-/*!
- * @brief 업데이트 테스트가 쓰는 임시 설치 디렉터리.
- */
+//! Temporary install directories for update tests.
 
 use std::path::PathBuf;
 
 use super::install::Install;
 
-/** @brief 테스트마다 따로 쓰는 임시 디렉터리. 테스트가 어디서 끝나도 지운다. */
+/// Removed however the test ends.
 pub(super) struct Scratch(pub(super) PathBuf);
 
 impl Scratch {
-    /** @brief 새 디렉터리를 만든다. */
     pub(super) fn new(label: &str) -> Self {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -24,7 +21,7 @@ impl Scratch {
         Self(dir)
     }
 
-    /** @brief 이 디렉터리에 둔 설치 경로. 파일은 만들지 않는다. */
+    /// No files are created.
     pub(super) fn install(&self) -> Install {
         let name = if cfg!(windows) {
             "OnetDNS.exe"

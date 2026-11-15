@@ -1,9 +1,6 @@
-/*!
- * @brief 서버가 시작할 때 업데이트 기록을 처리하고, 새 버전을 시험 실행한다.
- *
- * @details 시험은 준비 상태에 이르면 확정하고, 준비 전에 실패하거나 기한을 넘기면 되돌린다.
- *          시험하는 동안 잠금을 쥐고 있으므로 그동안 다른 프로세스는 적용을 시작하지 못한다.
- */
+//! Handles the update record at server start and trial-runs a new version: the trial commits once
+//! the server is ready, and reverts on an error before that or past the deadline. The lock is held
+//! for the whole trial, so no other process can start an apply meanwhile.
 
 use std::fs::File;
 use std::sync::{Mutex, PoisonError};
@@ -13,64 +10,44 @@ use super::install::{self, Install, LockError, UpdateLock};
 use super::record::{Record, StartupAction, State};
 use super::VERSION;
 
-/**
- * @brief 시작할 때 다른 프로세스의 적용이나 시험이 끝나기를 기다리는 상한.
- * @details 그래도 잠금을 잡지 못하면 기록을 처리하지 않고 시작한다. 적용은 잠금을 쥔 채 사전
- *          점검을 하므로 점검 제한 시간의 합보다 길어야 한다.
- */
+/// Cap on waiting at startup for another process's apply or trial; past it, the server starts
+/// without handling the record. An apply runs its preflight while holding the lock, so this must
+/// exceed the preflight timeouts combined.
 pub(super) const STARTUP_LOCK_WAIT: Duration = Duration::from_secs(120);
-/** @brief 잠금을 기다리는 동안 기다리고 있다고 알리는 간격. */
 const WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-/** @brief 시험 기한을 확인하는 간격. */
 const DEADLINE_POLL: Duration = Duration::from_secs(1);
 
-/**
- * @brief 시험 실행이 준비 상태에 이르러야 하는 기한.
- * @details 지원하는 가장 느린 장치에서 큰 차단 목록을 캐시에서 읽어 시작하는 시간보다 길어야 한다.
- *          짧으면 정상인 새 버전을 되돌린다.
- */
+/// Must exceed the time to start from cached large blocklists on the slowest supported device;
+/// shorter, it would revert a healthy new version.
 pub(crate) const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
 
-/**
- * @brief 기한이 지나 되돌렸을 때 기록에 남기는 이유.
- * @details 기한을 숫자로 넣지 않는다. 관리 화면이 이 문장을 키로 삼아 번역하고, 기한은 시험을 시작할
- *          때의 로그에 남는다.
- */
+/// No number in it: the dashboard translates this sentence by key, and the deadline is logged when
+/// the trial starts.
 const DEADLINE_REASON: &str = "The new version did not become ready before the trial deadline";
 
-/** @brief 서버가 시작할 때 기록을 처리한 결과. */
 pub(crate) enum Startup {
-    /** @brief 그대로 시작한다. */
     Normal,
-    /** @brief 이 버전을 시험 실행한다. */
     Trial(Trial),
-    /** @brief 앞선 시험이 실패해 되돌렸다. 이 프로세스는 이어서 돌지 않고 되돌린 실행 파일을 띄운다. */
+    /// An earlier trial failed and was reverted; this process does not continue, but starts the
+    /// restored executable.
     Reverted,
 }
 
-/** @brief 시험 중인 업데이트. 확정하거나 되돌릴 때까지 잠금을 쥔다. */
+/// Holds the lock until committed or reverted.
 pub(crate) struct Trial {
-    /** @brief 설치 경로. */
     install: &'static Install,
-    /** @brief 업데이트 잠금. 떨어뜨리면 풀린다. */
     lock: UpdateLock,
-    /** @brief trial 상태의 기록. */
     record: Record,
-    /**
-     * @brief 기록 파일 핸들. 시험을 시작할 때 열어 둔다.
-     * @details 확정은 준비 상태가 된 뒤, 곧 권한을 내려놓은 뒤에 한다. 그때는 설치 디렉터리에 새
-     *          파일을 만들지 못할 수 있어 이 핸들로 덮어쓴다.
-     */
+    /// Opened at trial start. The commit comes after the server is ready, which is after privileges
+    /// are dropped, when the install directory may no longer allow new files, so it overwrites
+    /// through this handle.
     handle: File,
-    /** @brief 시험을 시작한 시각. */
     started: Instant,
 }
 
-/**
- * @brief 업데이트 기록을 처리한다. 서버를 띄우는 명령이 설정을 읽기 전에 부른다.
- * @param waiting 다른 프로세스가 잠금을 쥐고 있어 기다리는 동안 주기적으로 부른다.
- * @details 설치 경로를 정하지 못했으면 업데이트를 쓸 수 없으므로 처리할 기록도 없다.
- */
+/// Called before the server command reads its config. `waiting` is called periodically while
+/// another process holds the lock. Without an install path there are no updates, so there is no
+/// record either.
 pub(crate) fn on_start(waiting: &mut dyn FnMut()) -> Startup {
     match install::current() {
         Ok(install) => process(install, waiting),
@@ -78,11 +55,8 @@ pub(crate) fn on_start(waiting: &mut dyn FnMut()) -> Startup {
     }
 }
 
-/**
- * @brief 이 설치 경로에 남은 업데이트 기록을 처리한다.
- * @details 업데이트가 남긴 파일이 하나도 없으면 잠금 파일도 만들지 않는다. 소스에서 빌드해
- *          띄울 때마다 실행 파일 옆에 파일이 생기지 않게 하려는 것이다.
- */
+/// With no update files present, not even a lock file is created, so runs from a source build leave
+/// nothing beside the executable.
 fn process(install: &'static Install, waiting: &mut dyn FnMut()) -> Startup {
     if !install.has_update_files() {
         return Startup::Normal;
@@ -154,7 +128,6 @@ fn process(install: &'static Install, waiting: &mut dyn FnMut()) -> Startup {
     }
 }
 
-/** @brief 잠금을 기다리며 잡는다. 기다리는 동안 waiting 을 주기적으로 부른다. */
 fn lock_waiting(install: &Install, waiting: &mut dyn FnMut()) -> Result<UpdateLock, LockError> {
     let deadline = Instant::now() + STARTUP_LOCK_WAIT;
     let mut reported = false;
@@ -176,7 +149,6 @@ fn lock_waiting(install: &Install, waiting: &mut dyn FnMut()) -> Result<UpdateLo
     }
 }
 
-/** @brief 지금 실행 파일과 맞지 않는 기록을 지운다. */
 fn discard(install: &Install, lock: &UpdateLock, why: &str) {
     match install.remove_record(lock) {
         Ok(()) => onetdns_core::info!(
@@ -190,11 +162,9 @@ fn discard(install: &Install, lock: &UpdateLock, why: &str) {
     }
 }
 
-/**
- * @brief 기록을 trial 로 바꾸고 시험을 시작한다.
- * @details 기록 핸들을 먼저 열고 그 핸들로 trial 을 쓴다. 기록을 쓴 뒤 핸들을 열지 못하면
- *          시험 없이 도는 새 버전의 기록이 trial 로 남아, 다음 시작이 멀쩡한 버전을 되돌린다.
- */
+/// The record handle opens first and trial is written through it. Opening it after writing could
+/// fail and leave a trial record for a version running untested, and the next start would revert a
+/// healthy version.
 fn begin(install: &'static Install, lock: UpdateLock, record: Record) -> Startup {
     let record = Record {
         state: State::Trial,
@@ -227,12 +197,9 @@ fn begin(install: &'static Install, lock: UpdateLock, record: Record) -> Startup
     }
 }
 
-/**
- * @brief 이전 실행 파일을 설치 경로로 되돌리고 기록을 reverted 로 바꾼다.
- * @return 되돌렸는지. 되돌리지 못했으면 기록을 그대로 두므로 다음 시작이 다시 되돌려 본다.
- * @details 되돌리지 못하는 경우는 .previous 가 없거나 바뀌었을 때와 설치 디렉터리에 쓸 수 없을
- *          때다. 어느 쪽이든 지금 실행 파일로 계속한다. 멈추면 DNS 가 아예 없어진다.
- */
+/// Returns whether it reverted. If not, the record stays and the next start tries again. That
+/// happens when .previous is missing or changed, or the install directory is read-only; either way
+/// the current executable keeps running, since stopping would leave no DNS at all.
 pub(super) fn revert(install: &Install, lock: &UpdateLock, record: &Record, reason: &str) -> bool {
     if let Err(error) = install.restore_previous(lock, &record.from_sha256) {
         onetdns_core::error!(event = "update.revert_failed", version = %record.to, %error, "Could not revert the update; continuing with the installed executable");
@@ -257,12 +224,11 @@ pub(super) fn revert(install: &Install, lock: &UpdateLock, record: &Record, reas
 }
 
 impl Trial {
-    /** @brief 준비 기한을 넘겼는지. */
     pub(crate) fn expired(&self) -> bool {
         self.started.elapsed() >= TRIAL_DEADLINE
     }
 
-    /** @brief 준비 상태에 이르렀다. 기록을 committed 로 바꾸고 잠금을 푼다. */
+    /// The server is ready: commits the record and releases the lock.
     pub(crate) fn commit(self) {
         let Trial {
             mut handle, record, ..
@@ -283,10 +249,7 @@ impl Trial {
         }
     }
 
-    /**
-     * @brief 시험이 실패했다. 이전 실행 파일로 되돌린다.
-     * @return 되돌렸으면 참이고, 호출자는 되돌린 실행 파일을 띄운다.
-     */
+    /// True when reverted; the caller then starts the restored executable.
     pub(crate) fn revert(self, reason: &str) -> bool {
         let Trial {
             install,
@@ -299,40 +262,30 @@ impl Trial {
         revert(install, &lock, &record, reason)
     }
 
-    /** @brief 기한 안에 준비 상태가 되지 않아 되돌린다. */
     pub(crate) fn revert_expired(self) -> bool {
         self.revert(DEADLINE_REASON)
     }
 }
 
-/**
- * @brief 이 프로세스가 시험 중인 업데이트.
- * @details 준비 통지, 기한을 재는 스레드, 준비 전 오류 처리 가운데 먼저 꺼낸 쪽이 처리한다.
- *          나머지는 빈 자리를 보고 아무것도 하지 않는다. 감독자 부모는 자기 반복 안에서 시험을
- *          직접 들고 있으므로 이 자리를 쓰지 않는다.
- */
+/// Whichever takes it first handles it: the ready notice, the deadline thread, or the pre-ready
+/// error path; the others find it empty. The supervisor parent holds its trial inside its own loop
+/// and never uses this slot.
 static ACTIVE: Mutex<Option<Trial>> = Mutex::new(None);
 
-/** @brief 걸어 둔 시험을 꺼낸다. */
 fn take_active() -> Option<Trial> {
     ACTIVE.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
-/**
- * @brief 시험을 이 프로세스에 건다.
- * @details 기한은 시험을 시작한 시각부터 잰다. 기한을 재는 스레드는 start_deadline_timer 가 띄운다.
- */
+/// The deadline counts from trial start; start_deadline_timer starts the thread that enforces it.
 pub(crate) fn hold(trial: Trial) {
     *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some(trial);
 }
 
-/**
- * @brief 걸어 둔 시험이 있으면 기한을 재는 스레드를 띄운다.
- * @details 기한이 지나면 되돌리고 되돌린 실행 파일을 그 스레드에서 곧바로 띄운다.
- * @warning 세대가 권한을 내려놓은 뒤에 불러야 한다. exec 한 프로그램은 부른 스레드의 사용자와
- *          능력을 물려받는데, 내려놓기 전에 뜬 스레드는 능력을 잃어 되돌린 버전이 낮은 포트에
- *          묶지 못한다.
- */
+/// Past the deadline, that thread reverts and starts the restored executable itself.
+///
+/// Call it after the generation drops privileges: an exec'd program inherits the calling thread's
+/// user and capabilities, and a thread started before the drop loses its capabilities, so the
+/// restored version could not bind low ports.
 pub(crate) fn start_deadline_timer() {
     if ACTIVE
         .lock()
@@ -365,17 +318,15 @@ pub(crate) fn start_deadline_timer() {
     }
 }
 
-/** @brief 서버가 준비 상태에 이르렀을 때 부른다. 시험 중이면 확정한다. */
+/// Called when the server is ready; commits a trial in progress.
 pub(crate) fn commit_active() {
     if let Some(trial) = take_active() {
         trial.commit();
     }
 }
 
-/**
- * @brief 서버가 준비 전에 오류로 끝났을 때 부른다. 시험 중이면 되돌린다.
- * @return 되돌렸으면 참이고, 호출자는 되돌린 실행 파일을 띄운다.
- */
+/// Called when the server fails before getting ready; reverts a trial in progress. True when
+/// reverted, and the caller then starts the restored executable.
 pub(crate) fn revert_after_error(error: &dyn std::fmt::Display) -> bool {
     take_active().is_some_and(|trial| {
         trial.revert(&format!(
@@ -385,31 +336,26 @@ pub(crate) fn revert_after_error(error: &dyn std::fmt::Display) -> bool {
 }
 
 #[cfg(test)]
-/** @brief 시작할 때의 기록 처리와, 시험의 확정과 되돌리기. */
 mod tests {
     use super::*;
     use crate::update::scratch::Scratch;
 
-    /** @brief 새 버전 실행 파일의 내용. 시작 판정은 해시만 보므로 실행할 수 있는 파일이 아니어도 된다. */
+    /// Startup decisions only look at hashes, so it need not be executable.
     const NEW: &[u8] = b"new executable";
-    /** @brief 이전 버전 실행 파일의 내용. */
     const OLD: &[u8] = b"old executable";
 
-    /** @brief 바이트의 SHA-256. */
     fn sha256(bytes: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         Sha256::digest(bytes).into()
     }
 
-    /** @brief 프로세스가 시작할 때 정한 설치 경로처럼 끝까지 사는 설치 경로. */
+    /// Lives until exit, like the install path chosen at process start.
     fn installed_in(scratch: &Scratch) -> &'static Install {
         Box::leak(Box::new(scratch.install()))
     }
 
-    /**
-     * @brief 업데이트가 설치 경로를 맞바꾼 직후의 디렉터리에 이 단계의 기록을 쓴다.
-     * @details 두 실행 파일 모두 이 바이너리의 버전으로 기록한다.
-     */
+    /// Writes a record in this state into a directory as an update leaves it right after the swap.
+    /// Both executables are recorded with this binary's version.
     fn swapped(scratch: &Scratch, state: State) -> &'static Install {
         let install = installed_in(scratch);
         std::fs::write(install.path(), NEW).expect("설치 경로");
@@ -426,7 +372,6 @@ mod tests {
         install
     }
 
-    /** @brief 디스크에 남은 기록. */
     fn stored(install: &Install) -> Option<Record> {
         install
             .read_record()
@@ -434,18 +379,16 @@ mod tests {
             .and_then(|text| Record::parse(&text))
     }
 
-    /** @brief 디스크에 남은 기록의 단계. */
     fn stored_state(install: &Install) -> Option<State> {
         stored(install).map(|record| record.state)
     }
 
-    /** @brief 기록을 처리한다. 다른 프로세스가 잠금을 쥘 일이 없는 테스트에서 쓴다. */
+    /// For tests where no other process holds the lock.
     fn start(install: &'static Install) -> Startup {
         process(install, &mut || panic!("잠금을 기다릴 일이 없습니다"))
     }
 
     #[test]
-    /** @brief 업데이트 파일이 없으면 잠금 파일도 만들지 않고 그대로 시작하는지. */
     fn nothing_to_process_leaves_the_directory_alone() {
         let scratch = Scratch::new("trial-none");
         let install = installed_in(&scratch);
@@ -462,7 +405,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief pending 기록이면 시험을 시작하고, 확정하면 committed 로 바꾸고 잠금을 놓는지. */
     fn pending_update_is_tried_out_and_committed() {
         let scratch = Scratch::new("trial-commit");
         let install = swapped(&scratch, State::Pending);
@@ -490,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 맞바꾼 새 버전이 아직 뜨지 않았으면 기록을 그대로 두는지. 이전 버전이 다시 시작한 경우다. */
+    /// The previous version restarted before the new one ran.
     fn pending_update_waits_while_the_previous_version_runs() {
         let scratch = Scratch::new("trial-await");
         let install = installed_in(&scratch);
@@ -509,7 +451,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 시험이 끝나지 않은 채 남은 기록이면 되돌리고, 그다음 시작은 되돌린 기록을 남겨 두는지. */
     fn unfinished_trial_is_reverted_at_the_next_start() {
         let scratch = Scratch::new("trial-crash");
         let install = swapped(&scratch, State::Trial);
@@ -532,11 +473,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 되돌릴 수 없으면 지금 실행 파일로 시작하고 trial 기록을 남기는지.
-     * @details .previous 가 바뀌었거나 없으면 되돌리지 않는다. 기록을 남겨 두면 다음 시작이 다시 되돌려
-     *          본다.
-     */
+    /// Not reverted when .previous changed or is missing; keeping the record lets the next start
+    /// try again.
     fn trial_that_cannot_be_reverted_keeps_its_record() {
         let scratch = Scratch::new("trial-stuck");
         let install = swapped(&scratch, State::Trial);
@@ -551,7 +489,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기한을 넘긴 시험은 기한을 이유로 되돌리고 잠금을 놓는지. */
     fn expired_trial_is_reverted_with_the_deadline_as_reason() {
         let scratch = Scratch::new("trial-expired");
         let install = swapped(&scratch, State::Pending);
@@ -570,11 +507,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 이 프로세스에 건 시험을 준비 전 오류가 한 번만 되돌리는지.
-     * @details 이 프로세스의 시험 자리를 쓰는 테스트는 이것 하나여야 한다. 둘이면 동시에 돌면서 서로의
-     *          시험을 꺼낸다.
-     */
+    /// Must be the only test using this process's trial slot; two would run concurrently and take
+    /// each other's trials.
     fn error_before_ready_reverts_the_active_trial_once() {
         let scratch = Scratch::new("trial-error");
         let install = swapped(&scratch, State::Pending);
@@ -594,10 +528,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 지금 실행 파일과 맞지 않는 기록과 지난 적용이 남긴 파일을 지우는지.
-     * @details 깨진 기록과, 손으로 바꾼 실행 파일을 가리키는 확정 기록이다.
-     */
+    /// A broken record, and a committed record pointing at a hand-replaced executable.
     fn stale_records_and_leftovers_are_removed() {
         let scratch = Scratch::new("trial-stale");
         let install = installed_in(&scratch);

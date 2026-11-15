@@ -1,15 +1,8 @@
-/*!
- * @brief 저장소 전체를 훑는 회귀 테스트들이 함께 쓰는 헬퍼 함수.
- *
- * @details 소스 글자를 읽어 규약이 지켜지는지 보는 테스트가 여럿이라, 파일을 모으는
- *          일과 루트를 찾는 일을 한 곳에 둔다.
- * @note 테스트마다 쓰는 함수가 달라 일부는 특정 테스트에서만 호출된다.
- */
+//! Helpers for tests that scan the repository's sources for convention checks.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
-/** @brief 작업공간 루트. */
 pub fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -17,7 +10,7 @@ pub fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/** @brief 확장자가 맞는 파일을 모두 모은다. 빌드 산출물은 건너뛴다. */
+/// Skips build output.
 pub fn collect(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -35,7 +28,6 @@ pub fn collect(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/** @brief 주어진 디렉터리들 아래의 모든 Rust 소스 경로. */
 pub fn rust_sources(bases: &[&str]) -> Vec<PathBuf> {
     let repo = root();
     let mut out = Vec::new();
@@ -46,11 +38,8 @@ pub fn rust_sources(bases: &[&str]) -> Vec<PathBuf> {
     out
 }
 
-/**
- * @brief 부모 모듈이 #[cfg(test)] 아래에서 선언한 파일인지.
- * @details native/tests.rs 처럼 테스트만 담은 파일은 mod tests 로 감싸지 않으므로
- *          production_prefix 로는 걸러지지 않는다. 선언한 쪽을 보고 판단한다.
- */
+/// Files holding only tests, such as native/tests.rs, are not wrapped in mod tests, so
+/// production_prefix does not filter them; this checks the declaring module.
 pub fn is_test_module_file(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
@@ -68,7 +57,6 @@ pub fn is_test_module_file(path: &Path) -> bool {
         })
 }
 
-/** @brief 주어진 디렉터리들 아래에서 테스트 전용 파일을 뺀 Rust 소스 경로. */
 pub fn production_files(bases: &[&str]) -> Vec<PathBuf> {
     rust_sources(bases)
         .into_iter()
@@ -76,13 +64,13 @@ pub fn production_files(bases: &[&str]) -> Vec<PathBuf> {
         .collect()
 }
 
-/** @brief 파일 하나를 읽는다. 읽지 못하면 그 자리에서 멈춘다. */
+/// Panics if the file cannot be read.
 pub fn read(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("{} 를 읽지 못했습니다: {error}", path.display()))
 }
 
-/** @brief 저장소 기준 상대 경로를 슬래시 표기로 돌려준다. */
+/// With forward slashes.
 pub fn rel(path: &Path) -> String {
     path.strip_prefix(root())
         .unwrap_or(path)
@@ -92,11 +80,8 @@ pub fn rel(path: &Path) -> String {
         .join("/")
 }
 
-/**
- * @brief 중괄호 짝을 세어 선언 본문을 잘라 낸다.
- * @param head 본문을 여는 선언. 예를 들어 pub struct Config {
- * @return 여는 중괄호 다음부터 짝이 맞는 닫는 중괄호 직전까지.
- */
+/// Counts braces to cut out a declaration body. `head` opens it, as in `pub struct Config {`.
+/// Returns the text from after the opening brace to just before its matching close.
 pub fn block_after<'a>(source: &'a str, head: &str) -> Option<&'a str> {
     let start = source.find(head)? + head.len();
     let mut depth = 1usize;
@@ -115,11 +100,8 @@ pub fn block_after<'a>(source: &'a str, head: &str) -> Option<&'a str> {
     None
 }
 
-/**
- * @brief 테스트 모듈 앞까지만 남긴다.
- * @details 테스트 안의 문자열은 사용자에게 보이지 않으므로 검사 대상이 아니다. 속성과
- *          mod tests 사이에 문서 주석이 있어도 테스트 모듈로 본다.
- */
+/// Strings inside tests are never shown to users. A doc comment between the attribute and mod tests
+/// still counts as a test module.
 pub fn production_prefix(source: &str) -> &str {
     let mut from = 0usize;
     while let Some(at) = source[from..].find("#[cfg(test)]") {

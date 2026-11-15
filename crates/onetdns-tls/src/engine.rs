@@ -1,11 +1,8 @@
-/*!
- * @brief sans-IO 핸드셰이크 엔진. QUIC가 쓴다.
- *
- * @details 소켓을 만지지 않는다. 핸드셰이크 데이터를 넣으면 상태가 나아가고, 내보낼 데이터와
- *          유도된 비밀을 꺼내 간다.
- * @note conn의 차단 방식 구현과 별개다. 둘이 와이어 원시 요소만 나눠 쓰고 상태 기계는
- *       각자 갖는다.
- */
+//! Sans-IO handshake engine for QUIC: it never touches a socket. Handshake data goes in, the state
+//! advances, and outgoing data and derived secrets come out.
+//!
+//! Separate from the blocking implementation in conn; the two share only wire primitives and keep
+//! their own state machines.
 
 use crate::cert::{
     certificate_verify_content, tls13_signature_scheme_allowed, CertEntry, CertificateMsg,
@@ -29,26 +26,19 @@ use crate::TlsError;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
-/** @brief QUIC 전송 매개변수를 전달하는 확장. */
 pub const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-/** @brief 암호화 수준. 핸드셰이크 데이터가 어느 키로 보호되는지 정한다. */
+/// Which keys protect the handshake data.
 pub enum Level {
-    /** @brief 핸드셰이크를 시작하는 단계. */
     Initial,
-    /** @brief 핸드셰이크 중인 단계. */
     Handshake,
-    /** @brief 핸드셰이크를 마친 뒤의 단계. */
     Application,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/** @brief 한 방향의 유도된 비밀. */
 pub struct Secret {
-    /** @brief 이 비밀에 쓰는 암호 스위트. */
     pub suite: u16,
-    /** @brief 비밀 값. */
     pub secret: Vec<u8>,
 }
 
@@ -60,17 +50,12 @@ impl Drop for Secret {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/** @brief 한 수준의 양방향 비밀. */
 pub struct SecretPair {
-    /** @brief 어느 단계의 비밀인지. */
     pub level: Level,
-    /** @brief 클라이언트 쪽 비밀. */
     pub client: Secret,
-    /** @brief 서버 쪽 비밀. */
     pub server: Secret,
 }
 
-/** @brief 현재 Unix 초. 인증서 유효 기간 판정에 쓴다. */
 fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -78,7 +63,6 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/** @brief 상대가 제안한 것 중 쓸 스위트를 고른다. */
 fn choose_suite_quic(offered: &[u16]) -> Option<u16> {
     [
         TLS_AES_128_GCM_SHA256,
@@ -89,9 +73,8 @@ fn choose_suite_quic(offered: &[u16]) -> Option<u16> {
     .find(|&s| offered.contains(&s))
 }
 
-/** @brief 진단 로그에 쓸 짧은 16진 표기. */
+/// For diagnostic logs.
 fn short_hex(bytes: &[u8]) -> String {
-    /** @brief 16진 문자표. */
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().min(32) * 2);
     for &b in bytes.iter().take(32) {
@@ -101,7 +84,7 @@ fn short_hex(bytes: &[u8]) -> String {
     out
 }
 
-/** @brief 암호화된 확장 메시지를 만든다. 전송 매개변수가 여기 담긴다. */
+/// Carries the transport parameters.
 fn encrypted_extensions_quic_full(
     alpn: Option<&[u8]>,
     transport_params: &[u8],
@@ -120,91 +103,63 @@ fn encrypted_extensions_quic_full(
     w.buf
 }
 
-/** @brief 암호화된 확장을 읽는다. 중복과 비정규 형태를 거부한다. */
+/// Rejects duplicates and non-canonical forms.
 fn parse_ee_extensions(body: &[u8]) -> Result<Vec<Extension>, TlsError> {
     Extension::parse_vector(body)
 }
 
 #[derive(PartialEq, Eq)]
-/** @brief 서버 핸드셰이크 진행 상태. */
 enum SState {
-    /** @brief 첫 메시지를 기다린다. */
     ExpectClientHello,
-    /** @brief 클라이언트 인증서를 기다린다. */
     ExpectClientCertificate,
-    /** @brief 그 인증서의 소유 증명을 기다린다. */
     ExpectClientCertVerify,
-    /** @brief 마무리 메시지를 기다린다. */
     ExpectClientFinished,
-    /** @brief 핸드셰이크가 끝났다. */
     Done,
 }
 
-/** @brief 서버 쪽 핸드셰이크 상태 기계. */
 pub struct ServerHandshake {
-    /** @brief 이 서버의 공유 설정. 연결마다 인증서와 신뢰 저장소를 복제하지 않는다. */
+    /// Shared, so certificates and trust stores are not copied per connection.
     cfg: Arc<ServerConfig>,
-    /** @brief 이쪽이 알릴 전송 설정. */
     local_tp: Vec<u8>,
-    /** @brief 받은 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
-    /** @brief 받을 수준이 바뀔 때 앞 수준의 바이트가 남았는지. 새 수준으로 이어 읽을 수 없다. */
+    /// Bytes of the previous level were left when the receive level changed; they cannot be read at
+    /// the new level.
     stranded_input: bool,
-    /** @brief 지금 어느 단계인지. */
     state: SState,
 
-    /** @brief 협상한 요약 방식. */
     hash: Hash,
-    /** @brief 협상한 암호 스위트. */
     suite: u16,
-    /** @brief 클라이언트 쪽 핸드셰이크 비밀. */
     client_hs_secret: Vec<u8>,
 
-    /** @brief 지금까지 오간 핸드셰이크 바이트의 요약. */
     transcript: Option<Transcript>,
 
-    /** @brief 비밀을 이끌어 내는 곳. */
     ks: Option<KeySchedule>,
 
-    /** @brief 받은 클라이언트 인증서. */
     client_cert: Option<X509>,
 
-    /** @brief 앞선 세션을 이어 붙였는지. */
     resumed: bool,
 
-    /** @brief 왕복 없이 온 자료를 받아들였는지. */
     early_accepted: bool,
 
-    /** @brief 그 자료를 풀 비밀. */
     early_secret_out: Option<Secret>,
 
-    /** @brief 다시 보내라고 할 때 담을 값. 상태를 가지고 있지 않으려는 것이다. */
+    /// Sent with HelloRetryRequest, so the server need not keep state.
     hrr_cookie: Option<Vec<u8>>,
-    /** @brief 다시 보내기 전까지의 요약 앞부분. */
+    /// Transcript prefix up to the retry.
     hrr_prefix: Option<Vec<u8>>,
-    /** @brief 다시 보내기에서 이미 고른 암호 스위트. */
     hrr_suite: Option<u16>,
-    /** @brief 다시 보내기에서 키 조각을 요청한 곡선. */
     hrr_group: Option<u16>,
-    /** @brief 다시 보내라고 하기 전에 받은 첫 메시지. */
     hrr_client_hello: Option<ClientHello>,
 
-    /** @brief 첫 단계로 내보낼 바이트. */
     out_initial: Vec<u8>,
-    /** @brief 핸드셰이크 단계로 내보낼 바이트. */
     out_handshake: Vec<u8>,
 
-    /** @brief 핸드셰이크 뒤 단계로 내보낼 바이트. */
     out_application: Vec<u8>,
-    /** @brief 위로 넘길 새 비밀들. */
     pending_secrets: Vec<SecretPair>,
-    /** @brief 상대가 알린 전송 설정. */
     peer_tp: Option<Vec<u8>>,
-    /** @brief 협상한 ALPN. */
     alpn: Option<Vec<u8>>,
-    /** @brief 티켓과 결속할 클라이언트 SNI. */
+    /// Client SNI bound into tickets.
     server_name: Option<String>,
-    /** @brief 클라이언트가 PSK-DHE 재접속을 지원하는지. */
     client_allows_resumption: bool,
 }
 
@@ -216,7 +171,6 @@ impl Drop for ServerHandshake {
 }
 
 impl ServerHandshake {
-    /** @brief 설정과 전송 매개변수로 만든다. */
     pub fn new(cfg: Arc<ServerConfig>, local_transport_params: Vec<u8>) -> Self {
         Self {
             cfg,
@@ -249,11 +203,9 @@ impl ServerHandshake {
         }
     }
 
-    /**
-     * @brief 연결이 지금 보유한 가변 핸드셰이크 payload 바이트.
-     * @details QUIC 리스너의 전역 메모리 예산이 연결 수에 따른 입력 증폭을 막는 데 쓴다.
-     *          공유 ServerConfig는 세대당 한 벌이므로 여기서 세지 않는다.
-     */
+    /// Mutable handshake payload bytes this connection holds. The QUIC listener's global memory
+    /// budget uses it to stop input amplification across connections. The shared ServerConfig is
+    /// one per generation, so it is not counted here.
     pub fn retained_payload_bytes(&self) -> usize {
         let mut total = self
             .local_tp
@@ -304,15 +256,13 @@ impl ServerHandshake {
         total
     }
 
-    /**
-     * @brief 받은 핸드셰이크 데이터를 넣어 상태를 진행시킨다.
-     * @param level 그 데이터가 실려 온 암호화 수준.
-     * @details 받을 수준을 바꾸는 메시지 뒤에 같은 수준의 바이트가 남으면 처리하지 않고 둔다.
-     *          RFC 9001 은 이것을 QUIC 연결 오류 PROTOCOL_VIOLATION 으로 정하므로 부른 쪽이
-     *          has_unconsumed_input 으로 확인해 끊는다. 그 상태로 다시 부르면 이쪽이 거부한다.
-     * @retval TlsError::UnexpectedMessage 지금 받을 수준이 아닌 데이터이거나, 앞 수준에 남은
-     *         바이트가 있다.
-     */
+    /// `level` is the encryption level the data arrived at. Bytes of the same level left after a
+    /// message that changes the receive level are kept unprocessed; RFC 9001 makes that a
+    /// PROTOCOL_VIOLATION connection error, so the caller checks `has_unconsumed_input` and closes.
+    /// Calling again in that state is refused.
+    ///
+    /// UnexpectedMessage for data not at the current receive level, or when bytes of the previous
+    /// level remain.
     pub fn provide(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
         if !server_config_wire_is_valid(&self.cfg) || self.local_tp.len() > u16::MAX as usize {
             return Err(TlsError::Internal);
@@ -337,7 +287,6 @@ impl ServerHandshake {
         Ok(())
     }
 
-    /** @brief 지금 핸드셰이크 메시지를 받을 암호화 수준. */
     pub fn receive_level(&self) -> Level {
         match self.state {
             SState::ExpectClientHello => Level::Initial,
@@ -348,18 +297,16 @@ impl ServerHandshake {
         }
     }
 
-    /** @brief 받았지만 아직 메시지로 처리하지 않은 바이트가 있는지. */
     pub fn has_unconsumed_input(&self) -> bool {
         self.hr.has_pending()
     }
 
-    /**
-     * @brief 재개 제안을 받아들일지 판단한다.
-     * @param suite 이번에 고른 스위트. RFC 8446 은 해시가 같은 스위트끼리 PSK 를 함께 쓰게 하지만
-     *        조기 데이터는 티켓과 같은 스위트일 때만 받는다.
-     * @return 받아들인 티켓과 조기 데이터를 받을 수 있는지.
-     * @warning 바인더를 검증한다. 검증하지 않으면 티켓만 흉내 내 남의 세션을 재개할 수 있다.
-     */
+    /// `suite` is the suite chosen now. RFC 8446 lets suites with the same hash share a PSK, but
+    /// early data is accepted only with the ticket's own suite. Returns the accepted ticket and
+    /// whether early data can be accepted.
+    ///
+    /// The binder is verified; without that, mimicking a ticket would resume someone else's
+    /// session.
     fn try_accept_psk(
         &self,
         ch: &ClientHello,
@@ -434,15 +381,14 @@ impl ServerHandshake {
         Ok(Some((state, early_ok)))
     }
 
-    /**
-     * @brief 클라이언트 인사말을 처리하고 서버 차례를 만든다.
-     * @details 다시 시도 요청은 재시도 인사말로 핸드셰이크를 마칠 수 있을 때만 보낸다. 재시도
-     *          인사말은 지원 곡선과 ALPN 을 바꿀 수 없으므로, 공통 곡선이 없거나 ALPN 이 맞지
-     *          않는 인사말은 첫 인사말에서 거절한다. 클라이언트의 서명 방식 목록에 이쪽 방식이
-     *          없어도 RFC 8446 대로 가진 인증서로 계속한다.
-     * @retval TlsError::NoApplicationProtocol 이쪽이 ALPN 을 쓰는데 합의한 프로토콜이 없다.
-     *         RFC 9001 은 QUIC 에서 ALPN 협상을 필수로 정한다.
-     */
+    /// Sends HelloRetryRequest only when the retried hello can finish the handshake. A retried
+    /// hello cannot change supported groups or ALPN, so a hello with no common group or with
+    /// mismatched ALPN is refused at the first hello. When the client's signature algorithms omit
+    /// this side's scheme, the handshake continues with the certificate at hand, as RFC 8446
+    /// allows.
+    ///
+    /// NoApplicationProtocol when this side uses ALPN and nothing was agreed; RFC 9001 makes ALPN
+    /// mandatory for QUIC.
     fn on_client_hello(&mut self, ch_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let ch = ClientHello::from_handshake(ch_msg)?;
         ch.validate_tls13()?;
@@ -680,7 +626,6 @@ impl ServerHandshake {
         Ok(())
     }
 
-    /** @brief 클라이언트 인증서를 받아 체인을 검증한다. */
     fn on_client_certificate(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         if msg.msg_type != HandshakeType::Certificate {
             return Err(TlsError::UnexpectedMessage);
@@ -704,7 +649,6 @@ impl ServerHandshake {
         Ok(())
     }
 
-    /** @brief 클라이언트가 개인키를 갖고 있음을 확인한다. */
     fn on_client_cert_verify(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         if msg.msg_type != HandshakeType::CertificateVerify {
             return Err(TlsError::UnexpectedMessage);
@@ -720,10 +664,7 @@ impl ServerHandshake {
         Ok(())
     }
 
-    /**
-     * @brief 클라이언트의 핸드셰이크 확인 값을 검증한다.
-     * @warning 이것이 핸드셰이크 위조를 막는 마지막 검사다. 상수 시간으로 비교한다.
-     */
+    /// The last check against a forged handshake; compared in constant time.
     fn on_client_finished(&mut self, fin_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         let cfk = Zeroizing::new(finished_key(self.hash, &self.client_hs_secret));
@@ -774,7 +715,6 @@ impl ServerHandshake {
         Ok(())
     }
 
-    /** @brief 내보낼 핸드셰이크 데이터를 꺼낸다. */
     pub fn take_crypto(&mut self) -> Vec<(Level, Vec<u8>)> {
         let mut out = Vec::new();
         if !self.out_initial.is_empty() {
@@ -792,155 +732,108 @@ impl ServerHandshake {
         out
     }
 
-    /** @brief 새로 유도된 비밀을 꺼낸다. */
     pub fn take_secrets(&mut self) -> Vec<SecretPair> {
         std::mem::take(&mut self.pending_secrets)
     }
 
-    /** @brief 조기 데이터 비밀을 꺼낸다. */
     pub fn take_early_secret(&mut self) -> Option<Secret> {
         self.early_secret_out.take()
     }
 
-    /** @brief 재개로 맺어졌는지. */
     pub fn is_resumed(&self) -> bool {
         self.resumed
     }
 
-    /** @brief 조기 데이터를 받아들였는지. */
     pub fn early_data_accepted(&self) -> bool {
         self.early_accepted
     }
 
-    /** @brief 상대가 보낸 전송 매개변수. */
     pub fn peer_transport_params(&self) -> Option<&[u8]> {
         self.peer_tp.as_deref()
     }
 
-    /** @brief 합의된 응용 프로토콜. */
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
     }
 
-    /** @brief 클라이언트 인증서를 확인했는지. */
     pub fn client_authenticated(&self) -> bool {
         self.state == SState::Done && self.cfg.client_ca.is_some() && self.client_cert.is_some()
     }
 
-    /** @brief 확인된 클라이언트 신원. */
     pub fn client_auth_identity(&self) -> Option<String> {
         self.client_cert
             .as_ref()
             .map(|certificate| format!("mtls:{}", short_hex(&certificate.public_key)))
     }
 
-    /** @brief 핸드셰이크가 끝났는지. */
     pub fn is_complete(&self) -> bool {
         self.state == SState::Done
     }
 }
 
 #[derive(PartialEq, Eq)]
-/** @brief 클라이언트 핸드셰이크 진행 상태. */
 enum CState {
-    /** @brief 서버의 첫 메시지를 기다린다. */
     ExpectServerHello,
-    /** @brief 이어지는 핸드셰이크 메시지를 기다린다. */
     ExpectFlight,
-    /** @brief 핸드셰이크가 끝났다. */
     Done,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-/** @brief 서버 차례 안에서 어디까지 받았는지. */
 enum CFlightState {
-    /** @brief 확장 메시지를 기다린다. */
     EncryptedExtensions,
-    /** @brief 인증서나 인증서 요구를 기다린다. */
     CertificateOrRequest,
-    /** @brief 인증서를 기다린다. */
     Certificate,
-    /** @brief 그 인증서의 소유 증명을 기다린다. */
     CertificateVerify,
-    /** @brief 마무리 메시지를 기다린다. */
     Finished,
 }
 
-/** @brief 클라이언트 쪽 핸드셰이크 상태 기계. */
 pub struct ClientHandshake {
-    /** @brief 이 클라이언트의 설정. */
     cfg: ClientConfig,
-    /** @brief 키를 주고받는 곳. */
     kx: KeyExchange,
-    /** @brief 마지막 인사말에서 키 조각을 보낸 곡선. 보내지 않았으면 없다. */
+    /// The group the last hello sent a key share for.
     share_group: Option<u16>,
-    /**
-     * @brief 서버 인사말 앞까지의 핸드셰이크 기록.
-     * @details 다시 시도 요청을 받은 뒤에는 첫 인사말의 해시, 그 요청, 두 번째 인사말을 담는다.
-     */
+    /// The transcript up to the ServerHello. After a HelloRetryRequest it holds the first hello's
+    /// hash, the request, and the second hello.
     ch_wire: Vec<u8>,
-    /** @brief 이쪽이 마지막으로 보낸 인사말. 서버의 응답을 이것과 대조한다. */
+    /// The last hello sent; the server's reply is checked against it.
     hello: ClientHello,
-    /** @brief 받은 핸드셰이크 바이트를 모으는 곳. */
     hr: HandshakeReader,
-    /** @brief 받을 수준이 바뀔 때 앞 수준의 바이트가 남았는지. 새 수준으로 이어 읽을 수 없다. */
+    /// Bytes of the previous level were left when the receive level changed; they cannot be read at
+    /// the new level.
     stranded_input: bool,
-    /** @brief 지금 어느 단계인지. */
     state: CState,
-    /** @brief 핸드셰이크 메시지 흐름에서 어디까지 왔는지. */
     flight_state: CFlightState,
-    /** @brief 지금까지 오간 핸드셰이크 바이트의 요약. */
     transcript: Option<Transcript>,
-    /** @brief 비밀을 이끌어 내는 곳. */
     ks: Option<KeySchedule>,
-    /** @brief 협상한 요약 방식. */
     hash: Hash,
-    /** @brief 협상한 암호 스위트. */
     suite: u16,
-    /** @brief 클라이언트 쪽 핸드셰이크 비밀. */
     client_hs_secret: Vec<u8>,
-    /** @brief 서버 쪽 핸드셰이크 비밀. */
     server_hs_secret: Vec<u8>,
-    /** @brief 서버가 보낸 리프 인증서. */
     leaf_cert: Option<X509>,
 
-    /** @brief 서버가 이쪽 인증서를 요구하며 받겠다고 한 서명 방식. 요구하지 않았으면 없다. */
+    /// Schemes the server accepts when it asks for a client certificate; None when it did not ask.
     requested_schemes: Option<Vec<u16>>,
 
-    /** @brief 인증서 소유 증명을 이미 봤는지. */
     seen_cert_verify: bool,
 
-    /** @brief 다시 붙을 때 쓴 앞선 세션. */
     psk_session: Option<crate::session::TlsSession>,
-    /** @brief 서버가 그것을 받아들였는지. */
     psk_accepted: bool,
-    /** @brief 왕복 없이 자료를 보냈는지. */
     early_offered: bool,
-    /** @brief 서버가 그 자료를 받아들였는지. */
     early_accepted: bool,
 
-    /** @brief 그 자료를 봉할 비밀. */
     early_secret_out: Option<Secret>,
 
-    /** @brief 다음에 다시 붙을 때 쓸 비밀. */
     res_master: Vec<u8>,
 
-    /** @brief 서버가 새로 준 세션들. */
     new_sessions: Vec<crate::session::TlsSession>,
 
-    /** @brief 다시 보내라는 요구를 이미 한 번 받았는지. 되풀이하면 무한히 돈다. */
+    /// A second HelloRetryRequest would loop forever.
     hrr_done: bool,
-    /** @brief 첫 단계로 내보낼 바이트. */
     out_initial: Vec<u8>,
-    /** @brief 핸드셰이크 단계로 내보낼 바이트. */
     out_handshake: Vec<u8>,
-    /** @brief 위로 넘길 새 비밀들. */
     pending_secrets: Vec<SecretPair>,
-    /** @brief 상대가 알린 전송 설정. */
     peer_tp: Option<Vec<u8>>,
-    /** @brief 협상한 ALPN. */
     alpn: Option<Vec<u8>>,
-    /** @brief 검증한 서버의 인증 경로. */
     verified_chain: Vec<X509>,
 }
 
@@ -954,7 +847,6 @@ impl Drop for ClientHandshake {
 }
 
 impl ClientHandshake {
-    /** @brief 설정과 전송 매개변수로 만든다. */
     pub fn new(cfg: ClientConfig, local_transport_params: Vec<u8>) -> Result<Self, TlsError> {
         if !client_config_wire_is_valid(&cfg) || local_transport_params.len() > u16::MAX as usize {
             return Err(TlsError::Internal);
@@ -1087,14 +979,11 @@ impl ClientHandshake {
         })
     }
 
-    /**
-     * @brief 받은 핸드셰이크 바이트를 넣어 상태를 진행시킨다.
-     * @param level 그 데이터가 실려 온 암호화 수준.
-     * @details 서버 쪽 provide 와 같은 규칙을 따른다. 받을 수준을 바꾸는 메시지 뒤에 남은 바이트는
-     *          처리하지 않고 두며, 부른 쪽이 has_unconsumed_input 으로 확인해 연결을 끊는다.
-     * @retval TlsError::UnexpectedMessage 지금 받을 수준이 아닌 데이터이거나, 앞 수준에 남은
-     *         바이트가 있다.
-     */
+    /// Same rules as the server's `provide`: bytes left after a message that changes the receive
+    /// level stay unprocessed, and the caller checks `has_unconsumed_input` and closes.
+    ///
+    /// UnexpectedMessage for data not at the current receive level, or when bytes of the previous
+    /// level remain.
     pub fn provide(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
         if self.stranded_input || level != self.receive_level() {
             return Err(TlsError::UnexpectedMessage);
@@ -1114,7 +1003,6 @@ impl ClientHandshake {
         Ok(())
     }
 
-    /** @brief 지금 핸드셰이크 메시지를 받을 암호화 수준. */
     pub fn receive_level(&self) -> Level {
         match self.state {
             CState::ExpectServerHello => Level::Initial,
@@ -1123,18 +1011,16 @@ impl ClientHandshake {
         }
     }
 
-    /** @brief 받았지만 아직 메시지로 처리하지 않은 바이트가 있는지. */
     pub fn has_unconsumed_input(&self) -> bool {
         self.hr.has_pending()
     }
 
-    /**
-     * @brief 다시 시도 요청을 처리한다.
-     * @details 요청이 곡선을 고르면 그 곡선의 새 키 조각을 보내고, 쿠키만 담았으면 앞의 키 조각을
-     *          그대로 두고 쿠키만 더한다. 해시가 고른 스위트와 다른 재개 제안은 뺀다.
-     * @warning 한 번만 받는다. 두 번째가 오면 거부한다. 무한히 다시 시도시키는 것을 막는다.
-     *          기록도 규격대로 해시로 바꾼다.
-     */
+    /// A request naming a group gets a new key share for it; a cookie-only request keeps the
+    /// earlier key shares and adds the cookie. PSK offers whose hash differs from the chosen suite
+    /// are dropped.
+    ///
+    /// Accepted only once; a second one is rejected, so a server cannot make the client retry
+    /// forever. The transcript is replaced with its hash as the spec requires.
     fn on_hello_retry(&mut self, hrr: &HandshakeMsg, sh: &ServerHello) -> Result<(), TlsError> {
         if self.hrr_done {
             return Err(TlsError::UnexpectedMessage);
@@ -1223,7 +1109,6 @@ impl ClientHandshake {
         Ok(())
     }
 
-    /** @brief 서버 인사말을 처리하고 핸드셰이크 키를 만든다. */
     fn on_server_hello(&mut self, sh_msg: &HandshakeMsg) -> Result<(), TlsError> {
         let sh = ServerHello::from_handshake(sh_msg)?;
 
@@ -1297,7 +1182,6 @@ impl ClientHandshake {
         Ok(())
     }
 
-    /** @brief 서버 차례의 메시지를 순서대로 처리한다. */
     fn on_flight_msg(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         let transcript = self.transcript.as_mut().ok_or(TlsError::Internal)?;
         match msg.msg_type {
@@ -1339,10 +1223,9 @@ impl ClientHandshake {
                 if !self.cfg.alpn.is_empty() && self.alpn.is_none() {
                     return Err(TlsError::NoApplicationProtocol);
                 }
-                /*
-                 * 재개한 세션은 처음 맺을 때와 같은 응용 프로토콜이어야 한다. 조기 데이터는
-                 * RFC 8446 대로 티켓과 같은 스위트로 재개할 때만 받아들여질 수 있다.
-                 */
+                // A resumed session must use the same application protocol as when it was first
+                // made. Early data can be accepted only when resuming with the ticket's own suite,
+                // as RFC 8446 requires.
                 let session = self.psk_session.as_ref().filter(|_| self.psk_accepted);
                 if session.is_some_and(|session| session.alpn != self.alpn)
                     || (self.early_accepted
@@ -1435,11 +1318,9 @@ impl ClientHandshake {
                 let th_after = transcript.hash();
 
                 if let Some(requested) = &self.requested_schemes {
-                    /*
-                     * 서버가 받지 않는 서명 방식의 키라면 인증서를 보내지 않고 빈 Certificate 로
-                     * 답한다. RFC 8446 은 알맞은 인증서가 없는 클라이언트에 이렇게 하게 하고,
-                     * 계속할지는 서버가 정한다.
-                     */
+                    // If the key's scheme is one the server does not accept, reply with an empty
+                    // Certificate instead. RFC 8446 has clients without a suitable certificate do
+                    // this, and the server decides whether to continue.
                     let client_cert = self
                         .cfg
                         .client_cert
@@ -1507,7 +1388,7 @@ impl ClientHandshake {
         }
     }
 
-    /** @brief 핸드셰이크 뒤에 오는 메시지를 처리한다. 세션 티켓이 여기 온다. */
+    /// Session tickets arrive here.
     fn on_post_handshake(&mut self, msg: &HandshakeMsg) -> Result<(), TlsError> {
         match msg.msg_type {
             HandshakeType::NewSessionTicket => {
@@ -1537,7 +1418,6 @@ impl ClientHandshake {
         }
     }
 
-    /** @brief 내보낼 핸드셰이크 바이트를 가져간다. */
     pub fn take_crypto(&mut self) -> Vec<(Level, Vec<u8>)> {
         let mut out = Vec::new();
         if !self.out_initial.is_empty() {
@@ -1549,65 +1429,52 @@ impl ClientHandshake {
         out
     }
 
-    /** @brief 새로 만들어진 키들을 가져간다. */
     pub fn take_secrets(&mut self) -> Vec<SecretPair> {
         std::mem::take(&mut self.pending_secrets)
     }
 
-    /** @brief 왕복 없이 보낼 자료용 키를 가져간다. */
     pub fn take_early_secret(&mut self) -> Option<Secret> {
         self.early_secret_out.take()
     }
 
-    /** @brief 앞선 세션을 이어 붙였는지. */
     pub fn is_resumed(&self) -> bool {
         self.psk_accepted
     }
 
-    /** @brief 왕복 없이 보낸 자료를 상대가 받아들였는지. */
     pub fn early_data_accepted(&self) -> bool {
         self.early_accepted
     }
 
-    /** @brief 새로 받은 세션 티켓을 꺼낸다. */
     pub fn take_sessions(&mut self) -> Vec<crate::session::TlsSession> {
         std::mem::take(&mut self.new_sessions)
     }
 
-    /** @brief 상대가 알린 전송 설정. */
     pub fn peer_transport_params(&self) -> Option<&[u8]> {
         self.peer_tp.as_deref()
     }
 
-    /** @brief 협상한 ALPN. */
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
     }
 
-    /**
-     * @brief 검증한 서버의 인증 경로. 리프에서 시작해 이쪽 저장소의 루트로 끝난다.
-     * @note 재개한 연결이나 인증서를 검증하지 않은 연결에서는 비어 있다. 리프의 발급자가
-     *       필요하면 서버가 보낸 체인이 아니라 이 경로에서 꺼낸다.
-     */
+    /// From the leaf to this side's stored root. Empty for resumed connections and when the
+    /// certificate was not verified. Take the leaf's issuer from this path, not from the chain the
+    /// server sent.
     pub fn verified_chain(&self) -> &[X509] {
         &self.verified_chain
     }
 
-    /** @brief 핸드셰이크가 끝났는지. */
     pub fn is_complete(&self) -> bool {
         self.state == CState::Done
     }
 }
 
 #[cfg(test)]
-/** @brief 실제 구현과의 상호 운용, 재개, 조기 데이터, 그리고 다시 시도 경로. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 다른 구현이 만든 인사말에 이쪽이 제대로 답하는지. */
     fn kdig_gnutls_client_hello_produces_server_hello() {
-        /** @brief 16진 문자열을 바이트열로. */
         fn unhex(s: &str) -> Vec<u8> {
             (0..s.len())
                 .step_by(2)
@@ -1645,7 +1512,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 암호화된 확장이 정규 형태로 맨 앞에 오는지. */
     fn encrypted_extensions_are_canonical_and_first() {
         let valid = encrypted_extensions_quic_full(Some(b"doq"), b"tp", false);
         assert!(parse_ee_extensions(&valid).is_ok());
@@ -1686,11 +1552,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief SNI 를 보낸 경우에만 서버의 server_name 응답을 받아들이는지.
-     * @details 주소로 붙을 때는 SNI 를 보내지 않는다. RFC 8446 은 보내지 않은 확장에 대한 응답을
-     *          받으면 핸드셰이크를 끊게 한다.
-     */
+    /// No SNI is sent when connecting by address, and RFC 8446 requires aborting on a reply to an
+    /// extension that was not sent.
     fn server_name_reply_requires_an_offered_name() {
         for (server_name, offered) in [("localhost", true), ("127.0.0.1", false)] {
             let mut server = ServerHandshake::new(
@@ -1744,11 +1607,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 암호화된 확장의 결함마다 RFC 8446 과 RFC 9001 이 정한 alert 로 거부하는지.
-     * @details 이쪽이 제안한 확장이 올 수 없는 자리에 오면 illegal_parameter, 제안하지 않은
-     *          확장이면 unsupported_extension, 전송 매개변수가 빠지면 missing_extension 이다.
-     */
+    /// illegal_parameter when an offered extension appears where it cannot, unsupported_extension
+    /// when it was not offered, missing_extension when transport parameters are absent.
     fn encrypted_extensions_rejections_name_the_matching_alert() {
         let cfg = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
         let reply = |edit: &dyn Fn(&mut Vec<Extension>)| {
@@ -1821,10 +1681,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief QUIC 서버가 형식이 깨진 인사말에는 다시 시도 요청을 포함해 아무것도 내지 않는지.
-     * @details 서명 방식 목록에 이쪽 방식이 없는 인사말에는 RFC 8446 대로 가진 인증서로 답한다.
-     */
+    /// A hello whose signature algorithms omit this side's scheme is answered with the certificate
+    /// at hand, as RFC 8446 allows.
     fn quic_server_answers_only_acceptable_client_hellos() {
         let client_cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -1902,7 +1760,6 @@ mod tests {
         );
     }
 
-    /** @brief 테스트용 다시 시도 요청을 만든다. */
     fn test_hrr(suite: u16) -> HandshakeMsg {
         ServerHello {
             legacy_version: TLS12,
@@ -1918,10 +1775,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 이미 보낸 키 조각을 다시 요구하는 요청, 두 번째 다시 시도 요청, 스위트 변경을
-     *        각각 RFC 8446 이 정한 alert 로 거부하는지.
-     */
+    /// Each with the alert RFC 8446 sets.
     fn quic_client_rejects_redundant_hrr_and_suite_change() {
         let normal_cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -1974,7 +1828,6 @@ mod tests {
     use p256::pkcs8::DecodePrivateKey;
     use std::sync::Arc;
 
-    /** @brief 테스트용 서버 설정. */
     fn make_server_cfg(alpn: Vec<Vec<u8>>) -> ServerConfig {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = ck.cert.der().as_ref().to_vec();
@@ -1996,7 +1849,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief QUIC 핸드셰이크마다 인증서와 신뢰 저장소를 깊은 복제하지 않는지. */
     fn server_handshake_retains_shared_server_config() {
         let config = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
         let certificate = config.cert_chain[0].as_ptr();
@@ -2007,7 +1859,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&config), 2);
     }
 
-    /** @brief 검증을 끈 테스트용 클라이언트. 테스트 전용이며 운영 경로에는 없다. */
+    /// Test only; not on any production path.
     fn insecure_test_client() -> ClientConfig {
         ClientConfig {
             roots: None,
@@ -2018,7 +1870,6 @@ mod tests {
         }
     }
 
-    /** @brief 한쪽이 낸 핸드셰이크 데이터를 다른 쪽에 넣는다. */
     fn pump(from: &mut Vec<(Level, Vec<u8>)>, to_provide: &mut dyn FnMut(Level, &[u8])) {
         for (lvl, data) in from.drain(..) {
             to_provide(lvl, &data);
@@ -2026,7 +1877,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 양쪽이 같은 비밀에 이르는지. */
     fn quic_engine_full_handshake_matches_secrets() {
         let server_tp = b"\x01\x02SERVER-TRANSPORT-PARAMS".to_vec();
         let client_tp = b"\x03\x04client-transport-params".to_vec();
@@ -2111,7 +1961,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름이 다르면 거부하는지. */
     fn quic_engine_rejects_wrong_hostname() {
         let mut server = ServerHandshake::new(Arc::new(make_server_cfg(vec![])), b"tp".to_vec());
         let client_cfg = ClientConfig {
@@ -2143,11 +1992,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 응용 프로토콜을 합의하지 못하면 no_application_protocol 로 끝나는지.
-     * @details RFC 9001 은 QUIC 에서 ALPN 협상을 필수로 정한다. 서버는 겹치는 프로토콜이 없거나
-     *          클라이언트가 ALPN 을 보내지 않았을 때, 클라이언트는 서버가 고르지 않았을 때 끝낸다.
-     */
+    /// RFC 9001 makes ALPN mandatory for QUIC. The server ends it when there is no overlap or the
+    /// client sent no ALPN; the client ends it when the server picked none.
     fn quic_engine_alpn_mismatch_is_no_application_protocol() {
         let client_hello = |alpn: Vec<Vec<u8>>| {
             let cfg = ClientConfig {
@@ -2192,7 +2038,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트 인증이 되는지. */
     fn quic_engine_mtls_client_auth() {
         use crate::conn::ClientCert;
         use crate::trust::TrustStore;
@@ -2253,10 +2098,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 루트가 바로 발급한 리프 뒤에 이름이 같은 가짜 루트를 붙여 보내도, 엔진이 보관하는
-     *        검증 경로는 이쪽 저장소의 루트로 끝나는지.
-     */
+    /// Even when the peer appends a fake root with the same name after a leaf the root issued
+    /// directly.
     fn quic_engine_verified_chain_ends_at_the_stored_root() {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -2324,7 +2167,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증서를 요구했는데 없으면 거부하는지. */
     fn quic_engine_mtls_rejects_missing_cert() {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -2368,7 +2210,6 @@ mod tests {
         assert!(!server.is_complete());
     }
 
-    /** @brief 핸드셰이크를 끝까지 돌린다. */
     fn run_handshake(
         server: &mut ServerHandshake,
         client: &mut ClientHandshake,
@@ -2390,7 +2231,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재개와 조기 데이터가 함께 되는지. */
     fn quic_engine_psk_resumption_and_zero_rtt() {
         use crate::conn::ServerResumption;
 
@@ -2458,7 +2298,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief HRR 뒤 PSK binder를 다시 계산해 재개하고 변조된 두 번째 binder는 거부하는지. */
+    /// The binder is recomputed after the retry, and a tampered second binder is rejected.
     fn quic_engine_psk_resumption_survives_hello_retry_request() {
         use crate::conn::ServerResumption;
 
@@ -2545,7 +2385,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 위조된 바인더를 거부하는지. 안 하면 티켓만 흉내 내 재개할 수 있다. */
+    /// Otherwise mimicking a ticket would resume.
     fn quic_engine_psk_forged_binder_rejected() {
         use crate::conn::ServerResumption;
 
@@ -2590,7 +2430,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 티켓이면 전체 핸드셰이크로 전환하는지. */
     fn quic_engine_unknown_ticket_falls_back_to_full() {
         use crate::conn::ServerResumption;
 
@@ -2636,7 +2475,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다시 시도 경로가 끝까지 도는지. */
     fn quic_engine_hello_retry_request() {
         let mut server = ServerHandshake::new(
             Arc::new(make_server_cfg(vec![b"doq".to_vec()])),
@@ -2699,7 +2537,6 @@ mod tests {
         assert_eq!(s_app, c_app, "HRR 후에도 app 시크릿 일치");
     }
 
-    /** @brief 핸드셰이크 바이트에 든 메시지를 하나씩 고쳐 다시 잇는다. */
     fn rewrite_messages(data: &[u8], edit: &dyn Fn(&mut HandshakeMsg)) -> Vec<u8> {
         let mut reader = HandshakeReader::new();
         reader.feed(data);
@@ -2712,7 +2549,6 @@ mod tests {
         out
     }
 
-    /** @brief 테스트용 클라이언트. 응용 프로토콜 목록만 정한다. */
     fn test_client(alpn: &[&[u8]]) -> ClientHandshake {
         let cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -2723,13 +2559,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 엔진이 지금 받을 암호화 수준이 아닌 데이터와, 받을 수준이 바뀐 뒤에 남은 바이트를
-     *        unexpected_message 로 거부하는지.
-     * @details 받을 수준을 바꾸는 메시지 뒤에 바이트가 남으면 provide 는 그 메시지까지만 처리하고
-     *          has_unconsumed_input 으로 알린다. RFC 9001 이 정한 PROTOCOL_VIOLATION 으로 연결을
-     *          끊는 일은 QUIC 계층이 한다.
-     */
+    /// After a message that changes the receive level, `provide` processes up to that message and
+    /// reports the rest through `has_unconsumed_input`; closing with PROTOCOL_VIOLATION, as RFC
+    /// 9001 requires, is the QUIC layer's job.
     fn quic_engine_takes_handshake_data_only_at_the_receive_level() {
         let cfg = Arc::new(make_server_cfg(vec![b"doq".to_vec()]));
         let pair = || {
@@ -2807,10 +2639,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 엔진 클라이언트가 쿠키만 담은 다시 시도 요청에는 첫 키 조각과 쿠키로 답하고, 제안하지
-     *        않은 곡선을 고른 요청은 illegal_parameter 로 거부하는지.
-     */
     fn quic_engine_client_handles_cookie_only_and_unoffered_group_retries() {
         let retry = |extension: Extension| {
             ServerHello {
@@ -2857,12 +2685,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 엔진 서버가 P-256 키 교환을 받아들이고, P-256 으로 다시 시도를 요청했으면 그 곡선의
-     *        조각 하나만 받는지.
-     * @details RFC 8446 은 secp256r1 키 교환을 반드시 지원하게 한다. 인사말은 엔진 클라이언트가
-     *          만든 것에서 지원 곡선과 키 조각만 바꾼다.
-     */
+    /// RFC 8446 requires secp256r1 key exchange. The hellos are the engine client's with only
+    /// supported groups and key shares changed.
     fn quic_engine_server_negotiates_p256_key_exchange() {
         let p256 = KeyExchange::from_seed(SECP256R1, &[0x32; 32]).unwrap();
         let x25519 = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
@@ -2946,14 +2770,10 @@ mod tests {
         }
     }
 
-    /** @brief 테스트 티켓의 재개 비밀. */
     const TEST_TICKET_PSK: [u8; 32] = [0x44; 32];
 
-    /**
-     * @brief 서버 설정과 그 서버가 받아들일 세션을 함께 만든다.
-     * @param ticket_suite 티켓을 발급한 스위트.
-     * @param known 거짓이면 다른 키로 봉한 티켓이라 서버가 열지 못한다.
-     */
+    /// `ticket_suite` is the suite that issued the ticket. With `known` false the ticket is sealed
+    /// with another key, so the server cannot open it.
     fn resumable_pair(
         ticket_suite: u16,
         known: bool,
@@ -3003,7 +2823,6 @@ mod tests {
         (server, session)
     }
 
-    /** @brief 세션을 제시하며 조기 데이터를 제안하는 클라이언트. */
     fn resuming_client(session: crate::session::TlsSession, alpn: &[&[u8]]) -> ClientHandshake {
         let cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -3016,13 +2835,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 엔진이 티켓과 해시가 같은 다른 스위트로 재개하고, 조기 데이터는 티켓과 같은
-     *        스위트일 때만 받아들이는지.
-     * @details 서버는 자기 선호대로 AES-128 을 고르므로 ChaCha20 티켓으로 재개해도 스위트가
-     *          바뀐다. RFC 8446 은 해시가 같으면 재개를 허용하고, 조기 데이터는 같은 스위트에서만
-     *          허용한다.
-     */
+    /// The server prefers AES-128, so resuming a ChaCha20 ticket changes the suite. RFC 8446 allows
+    /// resumption with the same hash, and early data only with the same suite.
     fn quic_engine_resumes_across_suites_of_the_same_hash() {
         for (ticket_suite, early) in [
             (TLS_CHACHA20_POLY1305_SHA256, false),
@@ -3057,10 +2871,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 재개하면서 다른 응용 프로토콜을 고르거나, 티켓과 같은 스위트로 재개하지
-     *        않았는데 조기 데이터를 받았다고 하면 클라이언트가 illegal_parameter 로 끊는지.
-     */
+    /// Either one makes the client close with illegal_parameter.
     fn quic_engine_client_checks_resumed_alpn_and_early_data_suite() {
         let reply = |ticket_suite: u16, known: bool, edit: &dyn Fn(&mut Vec<Extension>)| {
             let (server_cfg, session) = resumable_pair(ticket_suite, known);
@@ -3120,12 +2931,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 엔진 클라이언트가 RSA 서버의 CertificateVerify 중 RSA PKCS#1 이나 제안하지 않은
-     *        방식의 서명을 illegal_parameter 로 거부하고, 제안한 PSS 서명은 받아들이는지.
-     * @details 서명 자체는 모두 맞다. 키 종류가 맞는 방식이라 서명 방식 검사만 이를 거부한다.
-     *          엔진 클라이언트는 RSA PSS 중 SHA-256 만 제안한다.
-     */
+    /// The signatures are all valid and the key types fit, so only the scheme check rejects them.
+    /// The engine client offers only SHA-256 among RSA PSS schemes.
     fn quic_engine_client_accepts_only_certificate_verify_schemes_rfc_8446_allows() {
         let (certificate, key) = crate::cert::rsa_test_certificate("localhost");
         for (scheme, expected) in [
@@ -3159,7 +2966,6 @@ mod tests {
         }
     }
 
-    /** @brief 클라이언트 인증서를 요구하는 서버 설정과, 그 CA 가 발급한 클라이언트 인증서. */
     fn mtls_pair() -> (ServerConfig, crate::conn::ClientCert) {
         use crate::trust::TrustStore;
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -3183,7 +2989,6 @@ mod tests {
         (server, client_cert)
     }
 
-    /** @brief 클라이언트 인증서를 가진 테스트용 클라이언트. */
     fn mtls_client(client_cert: crate::conn::ClientCert) -> ClientHandshake {
         let cfg = ClientConfig {
             server_name: "localhost".to_string(),
@@ -3195,13 +3000,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트 인증서를 둘러싼 RFC 8446 규칙을 엔진이 양쪽에서 지키는지.
-     * @details 서버는 RSA PKCS#1 이나 요청하지 않은 방식의 CertificateVerify 를 illegal_parameter
-     *          로 거부한다. 서명은 맞게 만들고 방식 표시만 바꿔, 키 종류 검사가 아니라 서명 방식
-     *          검사가 거부하게 한다. 클라이언트는 문맥이 빈 요청만 받고, 요청한 방식으로 서명할 수
-     *          없는 키면 빈 Certificate 로 답한다.
-     */
+    /// The server rejects CertificateVerify with RSA PKCS#1 or an unrequested scheme as
+    /// illegal_parameter; the signatures are valid and only the scheme label changes, so the scheme
+    /// check rejects them, not the key type check. The client accepts only requests with an empty
+    /// context, and answers with an empty Certificate when its key cannot sign with a requested
+    /// scheme.
     fn quic_engine_client_certificate_rules() {
         let (rsa_certificate, rsa_key) = crate::cert::rsa_test_certificate("client.example");
         for (scheme, expected) in [

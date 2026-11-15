@@ -1,8 +1,5 @@
-/*!
- * @brief 세컨더리 영역 복제.
- * @details 프라이머리에서 AXFR과 IXFR로 영역을 받아 오고, SOA를 확인해 갱신
- *          시점을 정한다.
- */
+//! Secondary zones: transferred from the primary by AXFR and IXFR, refreshed when the SOA serial
+//! says so.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +20,8 @@ use crate::{
     tsig_for_secondary, unix_now,
 };
 
-/** @brief 받아 둔 하위 영역을 읽는다. 못 받아도 시작할 수 있게 하려는 것이다. */
+/// Reads the copy saved by the last transfer, so the zone is served before the first transfer
+/// succeeds. None when the copy is past its SOA expire, belongs to another origin, or fails ZONEMD.
 pub(crate) fn load_secondary_cache(
     config: &onetdns_config::SecondaryZone,
     global: &Config,
@@ -43,14 +41,12 @@ pub(crate) fn load_secondary_cache(
     Some(zone)
 }
 
-/** @brief 마지막으로 받아 온 시각을 적어 둘 경로. */
 fn secondary_refresh_state_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".state");
     std::path::PathBuf::from(value)
 }
 
-/** @brief 마지막으로 받아 온 시각. */
 fn secondary_last_refresh(path: &std::path::Path) -> Option<u64> {
     let now = unix_now();
     let text = read_text_limited(&secondary_refresh_state_path(path), 64).ok()?;
@@ -58,7 +54,6 @@ fn secondary_last_refresh(path: &std::path::Path) -> Option<u64> {
     (timestamp <= now).then_some(timestamp)
 }
 
-/** @brief 지금 받아 왔다고 적는다. */
 fn mark_secondary_refresh(path: &std::path::Path, timestamp: u64) -> std::io::Result<()> {
     atomic_write(
         &secondary_refresh_state_path(path),
@@ -66,33 +61,27 @@ fn mark_secondary_refresh(path: &std::path::Path, timestamp: u64) -> std::io::Re
     )
 }
 
-/** @brief 받아들일 영역 전송 크기 상한. */
 const MAX_AXFR_WIRE_BYTES: usize = 64 * 1024 * 1024;
 
-/** @brief 받아들일 기록 수 상한. */
 const MAX_AXFR_RECORDS: usize = 1_000_000;
 
-/** @brief 받아들일 청크 수 상한. */
 const MAX_AXFR_MESSAGES: usize = 10_000;
 
-/** @brief 상대가 조용할 때 끊기까지 기다릴 시간. */
+/// Without a byte from the peer for this long, the transfer is cut.
 const SECONDARY_XFR_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/** @brief 전체 데드라인을 늘리려면 실제 응답이 유지해야 하는 최소 처리율. */
+/// Throughput a transfer must keep to extend its total deadline.
 const SECONDARY_XFR_MIN_PROGRESS_BYTES_PER_SEC: u64 = 16 * 1024;
 
-/** @brief 실제로 받은 응답 바이트만큼만 늘어나는 XFR 전체 시간 예산. */
+/// Grows only with response bytes actually received, so a peer dripping bytes cannot stretch it.
 struct XfrProgressDeadline {
-    /** @brief 접속을 시작한 시각. */
     started: std::time::Instant,
-    /** @brief 진전이 없어도 허용하는 접속·요청 기본 시간. */
+    /// Allowed even without progress, for connecting and sending the request.
     base_timeout: Duration,
-    /** @brief 소켓에서 실제로 읽은 응답 바이트. */
     response_bytes: u64,
 }
 
 impl XfrProgressDeadline {
-    /** @brief 빈 시간 예산을 만든다. */
     fn new(started: std::time::Instant, base_timeout: Duration) -> Self {
         Self {
             started,
@@ -101,14 +90,12 @@ impl XfrProgressDeadline {
         }
     }
 
-    /** @brief 소켓에서 실제로 읽은 응답 바이트만 시간으로 바꾼다. */
     fn record_response_bytes(&mut self, bytes: usize) {
         self.response_bytes = self
             .response_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    /** @brief 지금까지의 실제 진전으로 허용할 전체 시간. */
     fn allowed(&self) -> Duration {
         let seconds = self.response_bytes / SECONDARY_XFR_MIN_PROGRESS_BYTES_PER_SEC;
         let remainder = self.response_bytes % SECONDARY_XFR_MIN_PROGRESS_BYTES_PER_SEC;
@@ -119,44 +106,33 @@ impl XfrProgressDeadline {
             .saturating_add(Duration::from_nanos(nanos))
     }
 
-    /** @brief 주어진 시각에 전체 시간 예산이 끝났는지. */
     fn expired(&self, now: std::time::Instant) -> bool {
         now.saturating_duration_since(self.started) >= self.allowed()
     }
 }
 
-/** @brief 보낼 전송 요청과 그 서명. */
+/// Kept to verify the response's TSIG.
 struct EncodedXfrRequest {
-    /** @brief 보낼 요청. */
     query: onetdns_proto::Message,
-    /** @brief 길이 접두사를 붙인 바이트. */
     framed_wire: Box<[u8]>,
-    /** @brief 요청에 붙인 서명. 응답 검증에 쓴다. */
     request_mac: Option<Vec<u8>>,
 }
 
-/** @brief 이미 요청을 보내고 종료 SOA까지 받아 둔 전송. */
+/// Request sent and every frame received through the closing SOA.
 struct PreparedXfrIo {
-    /** @brief 이 서버가 보낸 요청. */
     query: onetdns_proto::Message,
-    /** @brief 요청에 붙인 서명. */
     request_mac: Option<Vec<u8>>,
-    /** @brief 종료 SOA까지 받아 둔 응답 frame들. */
     messages: Vec<Box<[u8]>>,
 }
 
-/** @brief AXFR 레코드 열의 시작·끝과 개수만 추적한다. */
+/// Tracks only the opening and closing SOA and the record count.
 struct AxfrSequence {
-    /** @brief 받아야 하는 영역 이름. */
     origin: onetdns_proto::Name,
-    /** @brief 마지막 SOA와 비교할 첫 SOA. */
     opening_soa: Option<onetdns_proto::Record>,
-    /** @brief 지금까지 받은 레코드 수. */
     record_count: usize,
 }
 
 impl AxfrSequence {
-    /** @brief 빈 AXFR 열 추적기를 만든다. */
     fn new(origin: &onetdns_proto::Name) -> Self {
         Self {
             origin: origin.clone(),
@@ -165,7 +141,7 @@ impl AxfrSequence {
         }
     }
 
-    /** @brief 응답 하나를 검사하고 종료 SOA까지 왔는지 돌려준다. */
+    /// Whether the closing SOA has arrived.
     fn accept(&mut self, message: &onetdns_proto::Message) -> Result<bool, String> {
         use onetdns_proto::RecordType;
 
@@ -202,7 +178,6 @@ impl AxfrSequence {
     }
 }
 
-/** @brief 전송 요청을 만든다. 키가 있으면 서명한다. */
 fn encode_xfr_request(
     mut query: onetdns_proto::Message,
     tsig: Option<&onetdns_dnssec::tsig::TsigKey>,
@@ -226,7 +201,6 @@ fn encode_xfr_request(
     })
 }
 
-/** @brief 영역 전체를 달라는 요청. */
 fn build_axfr_query(origin: &onetdns_proto::Name) -> onetdns_proto::Message {
     use onetdns_proto::{DnsClass, Message, Question, RecordType};
 
@@ -240,7 +214,6 @@ fn build_axfr_query(origin: &onetdns_proto::Name) -> onetdns_proto::Message {
     query
 }
 
-/** @brief 이미 열린 연결로 영역 전체를 받아 온다. */
 fn axfr_fetch_prepared(
     origin: &onetdns_proto::Name,
     tsig: Option<&onetdns_dnssec::tsig::TsigKey>,
@@ -251,11 +224,8 @@ fn axfr_fetch_prepared(
     })
 }
 
-/**
- * @brief 받은 청크들을 영역 하나로 모은다.
- * @warning 처음과 끝의 권한 기록이 짝을 이뤄야 끝난 것이다. 확인하지 않으면 중간에
- *          끊긴 영역을 온전한 것으로 받아들인다.
- */
+/// Done only when the opening and closing SOAs match; otherwise a transfer cut midway would be
+/// taken as a whole zone.
 fn collect_axfr(
     origin: &onetdns_proto::Name,
     exchange: impl FnOnce(
@@ -272,7 +242,7 @@ fn collect_axfr(
     Ok(records)
 }
 
-/** @brief nonblocking 리스너가 끝까지 모은 응답 청크들을 검증한다. */
+/// Verifies the frames the nonblocking listener collected to the end.
 fn xfr_exchange_prepared(
     prepared: PreparedXfrIo,
     tsig: Option<&onetdns_dnssec::tsig::TsigKey>,
@@ -296,7 +266,7 @@ fn xfr_exchange_prepared(
     Err("Zone transfer response has no closing SOA".to_string())
 }
 
-/** @brief XFR frame 하나의 크기·TSIG·엔벨로프를 검증하고 내용 소비자에게 넘긴다. */
+/// Checks one frame's size, TSIG, and envelope, then hands it to the content consumer.
 #[allow(clippy::too_many_arguments)]
 fn accept_xfr_message(
     query: &onetdns_proto::Message,
@@ -374,21 +344,16 @@ fn accept_xfr_message(
     accept(&message)
 }
 
-/** @brief 이 응답 코드의 실패 사유. */
 fn xfr_rcode_error(rcode: u16) -> String {
     format!("Zone transfer response code: {rcode}")
 }
 
-/**
- * @brief 상대가 바뀐 부분만 보내기를 지원하지 않는다는 사유인지.
- * @warning 사유를 만드는 쪽과 판별하는 쪽이 같은 곳을 봐야 한다. 문구가 어긋나면 전부
- *          받아 오는 길이 조용히 막힌다.
- */
+/// Must check the same text `xfr_rcode_error` builds; if the two drift apart, the fallback to a
+/// full transfer silently stops.
 fn xfr_error_is_notimp(error: &str) -> bool {
     error == xfr_rcode_error(onetdns_proto::ResponseCode::NotImp.0)
 }
 
-/** @brief 두 기록이 같은지. */
 fn xfr_rr_equal(left: &onetdns_proto::Record, right: &onetdns_proto::Record) -> bool {
     left.name.eq_ignore_case(&right.name)
         && left.rtype == right.rtype
@@ -397,49 +362,34 @@ fn xfr_rr_equal(left: &onetdns_proto::Record, right: &onetdns_proto::Record) -> 
             == onetdns_dnssec::canonical_rdata(&right.rdata)
 }
 
-/** @brief 바뀐 부분만 받아 온 결과. */
 enum IxfrFetchResult {
-    /** @brief 상대의 시리얼이 이 서버와 같다. */
     Unchanged,
-    /** @brief 바뀐 부분만 받아 적용했다. */
     Incremental(onetdns_authority::Zone),
-    /** @brief 상대가 전체를 보내 왔다. */
     Full(onetdns_authority::Zone),
 }
 
 #[derive(Clone, Copy)]
-/** @brief 상대가 어떤 형태로 답했는지. */
 enum IxfrWireMode {
-    /** @brief 아직 어느 형태인지 모른다. */
     Undecided,
-    /** @brief 전체를 보내고 있다. */
     Full,
-    /** @brief 지울 기록을 세는 중이다. */
+    /// Carries the serial of that change.
     Delete,
-    /** @brief 더할 기록을 세는 중이다. 값은 그 변경분의 일련번호. */
     Add(u32),
 }
 
-/** @brief IXFR 변경 열의 형태·연속성·종료만 추적한다. */
+/// Tracks only the shape, continuity, and end of the IXFR stream.
 struct IxfrSequence {
-    /** @brief 받아야 하는 영역 이름. */
     origin: onetdns_proto::Name,
-    /** @brief 이 서버가 가진 시리얼. */
     client_serial: u32,
-    /** @brief 지금까지 받은 레코드 수. */
     record_count: usize,
-    /** @brief 상대가 보내는 열의 현재 형태. */
     mode: IxfrWireMode,
-    /** @brief 상대가 처음 알린 최신 시리얼. */
     server_serial: Option<u32>,
-    /** @brief 변경할 것이 없다는 단일 SOA 응답인지. */
+    /// A single SOA saying nothing changed.
     unchanged: bool,
-    /** @brief 전체 전송 종료와 비교할 첫 SOA. */
     opening_soa: Option<onetdns_proto::Record>,
 }
 
 impl IxfrSequence {
-    /** @brief 현재 영역을 기준으로 빈 IXFR 열 추적기를 만든다. */
     fn new(current: &onetdns_authority::Zone) -> Self {
         Self {
             origin: current.origin().clone(),
@@ -452,7 +402,7 @@ impl IxfrSequence {
         }
     }
 
-    /** @brief 응답 하나를 검사하고 IXFR 열이 끝났는지 돌려준다. */
+    /// Whether the IXFR stream has ended.
     fn accept(&mut self, message: &onetdns_proto::Message) -> Result<bool, String> {
         use onetdns_proto::{DnsClass, RecordType};
 
@@ -575,7 +525,6 @@ impl IxfrSequence {
     }
 }
 
-/** @brief 권한 기록의 시리얼. */
 fn record_soa_serial(record: &onetdns_proto::Record) -> Option<u32> {
     match &record.rdata {
         onetdns_proto::RData::Soa(soa) => Some(soa.serial),
@@ -583,7 +532,6 @@ fn record_soa_serial(record: &onetdns_proto::Record) -> Option<u32> {
     }
 }
 
-/** @brief 이미 열린 연결로 바뀐 부분만 받아 온다. */
 fn ixfr_fetch_prepared(
     current: &onetdns_authority::Zone,
     tsig: Option<&onetdns_dnssec::tsig::TsigKey>,
@@ -594,7 +542,6 @@ fn ixfr_fetch_prepared(
     })
 }
 
-/** @brief 이 시리얼 이후로 바뀐 것을 달라는 요청. */
 fn build_ixfr_query(current: &onetdns_authority::Zone) -> Result<onetdns_proto::Message, String> {
     use onetdns_proto::{DnsClass, Message, Question, RecordType};
 
@@ -614,10 +561,7 @@ fn build_ixfr_query(current: &onetdns_authority::Zone) -> Result<onetdns_proto::
     Ok(query)
 }
 
-/**
- * @brief 받은 변경 청크들을 읽는다.
- * @details 상대가 바뀐 부분 대신 전부 보낼 수도 있다. 형태를 보고 어느 쪽인지 구분한다.
- */
+/// The primary may send the whole zone instead of changes; the shape tells which.
 fn collect_ixfr(
     current: &onetdns_authority::Zone,
     exchange: impl FnOnce(
@@ -649,11 +593,8 @@ fn collect_ixfr(
     apply_ixfr_records(current, &records).map(IxfrFetchResult::Incremental)
 }
 
-/**
- * @brief 변경을 순서대로 적용한다.
- * @warning 지우라는 기록이 실제로 없으면 거부한다. 이 서버의 영역이 상대와 어긋나 있다는 뜻이고,
- *          그대로 적용하면 어긋남이 더 벌어진다.
- */
+/// Applies the changes in order. A delete of a record that does not exist is refused: it means this
+/// zone has drifted from the primary, and applying the rest would widen the drift.
 fn apply_ixfr_records(
     current: &onetdns_authority::Zone,
     transfer: &[onetdns_proto::Record],
@@ -755,25 +696,18 @@ fn apply_ixfr_records(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-/** @brief 받아 올 영역 하나의 설정. */
 struct XferEntry {
-    /** @brief 이 영역의 꼭대기 이름. */
     origin: String,
-    /** @brief 받아 온 영역을 담아 둘 파일. */
     file: Option<std::path::PathBuf>,
-    /** @brief 받아 올 업스트림 서버. */
     primary: std::net::IpAddr,
-    /** @brief 업스트림 서버 포트. */
     port: u16,
-    /** @brief 전송에 쓸 공유 키 이름. */
     tsig_key: Option<String>,
 
-    /** @brief 회원 영역을 담은 목록 영역인지. */
+    /// Holds the member zones.
     is_catalog: bool,
 }
 
 impl XferEntry {
-    /** @brief 설정 한 줄을 항목으로. */
     fn from_cfg(s: &onetdns_config::SecondaryZone, is_catalog: bool) -> Option<XferEntry> {
         Some(XferEntry {
             origin: onetdns_proto::Name::from_str(&s.origin)
@@ -788,40 +722,37 @@ impl XferEntry {
     }
 }
 
-/** @brief 동시에 받아 올 영역 수. */
+/// Transfers parsed at once.
 const SECONDARY_REFRESH_MAX_IN_FLIGHT: usize = 4;
 
-/** @brief 동시에 접속을 진행할 영역 수. 여기서는 스레드를 쓰지 않아 더 많이 열 수 있다. */
+/// Connections in progress at once; more than the parsers, since waiting on the network takes no
+/// thread.
 const SECONDARY_XFR_ADMISSION_MAX_IN_FLIGHT: usize = 64;
 
-/** @brief frame 하나마다 실제 payload 밖에 보수적으로 잡아 둘 관리 메모리. */
+/// Conservative per-frame bookkeeping outside the payload.
 const SECONDARY_XFR_FRAME_OVERHEAD_BYTES: usize = 2 + 2 * std::mem::size_of::<Box<[u8]>>();
 
-/** @brief 모든 진행 중 XFR의 응답 버퍼가 함께 쓸 수 있는 메모리. */
+/// Shared by the response buffers of every transfer in flight.
 const SECONDARY_XFR_BUFFER_BUDGET_BYTES: usize =
     MAX_AXFR_WIRE_BYTES + MAX_AXFR_MESSAGES * (SECONDARY_XFR_FRAME_OVERHEAD_BYTES - 2);
 
 const _: () = assert!(SECONDARY_XFR_BUFFER_BUDGET_BYTES < 65 * 1024 * 1024);
 
-/** @brief 한 coordinator 순회에서 연결 하나가 처리할 최대 frame 수. */
+/// Per connection in one coordinator pass.
 const SECONDARY_XFR_FRAMES_PER_POLL: usize = 4;
 
-/** @brief 한 coordinator 순회에서 연결 하나가 처리할 최대 응답 바이트. */
+/// Per connection in one coordinator pass.
 const SECONDARY_XFR_BYTES_PER_POLL: usize = 256 * 1024;
 
-/** @brief 전송 스레드의 스택 크기. */
 const SECONDARY_XFER_STACK_BYTES: usize = 1024 * 1024;
 
-/** @brief 모든 XFR 리스너가 나눠 쓰는 정확한 응답 버퍼 카운터. */
+/// Exact response buffer count shared by every transfer listener.
 struct XfrBufferBudget {
-    /** @brief 허용한 전체 바이트. */
     limit: usize,
-    /** @brief 지금 빌려 준 전체 바이트. */
     used: std::sync::atomic::AtomicUsize,
 }
 
 impl XfrBufferBudget {
-    /** @brief 주어진 상한의 빈 카운터를 만든다. */
     fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -829,7 +760,6 @@ impl XfrBufferBudget {
         }
     }
 
-    /** @brief 이 카운터에서 아무것도 빌리지 않은 몫을 만든다. */
     fn reservation(self: &Arc<Self>) -> XfrBufferReservation {
         XfrBufferReservation {
             budget: self.clone(),
@@ -838,22 +768,20 @@ impl XfrBufferBudget {
     }
 
     #[cfg(test)]
-    /** @brief 테스트에서 현재 대여량을 확인한다. */
+    /// For tests.
     fn used(&self) -> usize {
         self.used.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/** @brief XFR 하나가 전역 응답 버퍼에서 빌린 몫. 버리면 자동 반환한다. */
+/// One transfer's share of the global response buffer, returned on drop.
 struct XfrBufferReservation {
-    /** @brief 함께 쓰는 카운터. */
     budget: Arc<XfrBufferBudget>,
-    /** @brief 이 전송이 빌린 바이트. */
     bytes: usize,
 }
 
 impl XfrBufferReservation {
-    /** @brief 전역 상한을 넘지 않을 때만 이 몫을 늘린다. */
+    /// Only within the global limit.
     fn try_grow(&mut self, additional: usize) -> bool {
         let mut used = self.budget.used.load(std::sync::atomic::Ordering::Acquire);
         loop {
@@ -880,7 +808,6 @@ impl XfrBufferReservation {
 }
 
 impl Drop for XfrBufferReservation {
-    /** @brief 빌린 응답 버퍼 몫을 정확히 돌려준다. */
     fn drop(&mut self) {
         self.budget
             .used
@@ -888,71 +815,53 @@ impl Drop for XfrBufferReservation {
     }
 }
 
-/** @brief 받아 올 영역 하나와 그 시각들. */
 struct SecondaryRefreshJob {
-    /** @brief 받아 올 영역 설정. */
     entry: XferEntry,
-    /** @brief 이 서버가 잡은 시리얼. */
     current_serial: Option<u32>,
-    /** @brief 이미 영역을 잡고 있었는지. */
     had_zone: bool,
-    /** @brief 마지막으로 받아 온 시각. */
     last_ok: u64,
-    /** @brief 다음에 물어볼 간격. */
     refresh: u64,
-    /** @brief 실패했을 때 다시 물어볼 간격. */
     retry: u64,
-    /** @brief 이 시간이 지나면 잡은 영역을 버린다. */
+    /// The held zone is dropped past this.
     expire: u64,
-    /** @brief 알림을 받아 먼저 처리할 것인지. */
+    /// Set by NOTIFY.
     priority: bool,
 
-    /** @brief 바뀐 부분만 받기를 건너뛰고 전체를 받는다. */
     force_axfr: bool,
 }
 
 #[derive(Clone, Copy)]
-/** @brief 어떤 방식으로 받아 왔는지. */
 enum SecondaryXferKind {
-    /** @brief 전체를 받았다. */
     Axfr,
-    /** @brief 바뀐 부분만 받았다. */
     Ixfr,
-    /** @brief 바뀐 부분을 물었는데 전체가 왔다. */
     IxfrFull,
 }
 
-/** @brief 받아 온 결과. */
 enum SecondaryXferOutcome {
-    /** @brief 이 서버의 시리얼이 최신이라 받을 것이 없다. */
     UpToDate,
-    /** @brief 영역을 받아 왔다. */
     Zone(Box<onetdns_authority::Zone>, SecondaryXferKind),
-    /** @brief 목록 영역을 받아 왔다. */
-    Catalog { serial: u32, members: Vec<String> },
+    Catalog {
+        serial: u32,
+        members: Vec<String>,
+    },
 
-    /** @brief 바뀐 부분만으로는 안 되니 전체를 받아야 한다. */
-    NeedsFullTransfer { remote_serial: u32 },
+    /// Changes alone cannot get there.
+    NeedsFullTransfer {
+        remote_serial: u32,
+    },
 }
 
-/** @brief 지금 받아 오고 있는 영역 하나. */
 struct ActiveSecondaryXfer {
-    /** @brief 받아 오는 중인 영역. */
     job: SecondaryRefreshJob,
-    /** @brief 그 전송을 실행하는 스레드. */
     handle: std::thread::JoinHandle<Result<SecondaryXferOutcome, String>>,
 }
 
-/** @brief 응답 레코드 열이 끝났는지 판별하는 방식. */
 enum SecondaryXfrBoundary {
-    /** @brief 전체 영역 전송. */
     Axfr(AxfrSequence),
-    /** @brief 증분 또는 전체 fallback 전송. */
     Ixfr(IxfrSequence),
 }
 
 impl SecondaryXfrBoundary {
-    /** @brief 응답 하나를 반영하고 영역 전송이 끝났는지 돌려준다. */
     fn accept(&mut self, message: &onetdns_proto::Message) -> Result<bool, String> {
         match self {
             Self::Axfr(sequence) => sequence.accept(message),
@@ -961,78 +870,51 @@ impl SecondaryXfrBoundary {
     }
 }
 
-/** @brief XFR 연결·송신·응답 수신 단계. */
 enum SecondaryXfrAdmissionState {
-    /** @brief 접속을 거는 중. */
     Connecting,
-    /** @brief 요청을 보내는 중. */
     Writing { offset: usize },
-    /** @brief 다음 응답 길이를 읽는 중. */
     ReadingLength { bytes: [u8; 2], offset: usize },
-    /** @brief 다음 응답 본문을 읽는 중. */
     ReadingMessage { bytes: Vec<u8>, offset: usize },
 }
 
-/**
- * @brief 접속부터 종료 SOA까지 nonblocking으로 받는 중인 전송.
- * @details 네트워크를 기다리는 동안은 스레드를 쓰지 않는다. 느린 상대 여럿이 전송 워커를
- *          붙잡으면 멀쩡한 영역까지 못 받아 오므로 완결된 전송만 파서로 넘긴다.
- */
+/// Transfer received without a thread from connect to the closing SOA. Slow peers holding transfer
+/// workers would keep healthy zones from refreshing, so only complete transfers reach the parser.
 struct PendingSecondaryXfrAdmission {
-    /** @brief 받아 올 영역 설정. */
     job: SecondaryRefreshJob,
-    /** @brief 상대가 알린 시리얼. */
     remote_serial: u32,
-    /** @brief 이 서버가 잡은 영역. */
     current: Option<onetdns_authority::Zone>,
-    /** @brief 이어진 연결. */
     stream: std::net::TcpStream,
-    /** @brief 보낸 요청. */
     query: onetdns_proto::Message,
-    /** @brief 길이 접두사를 붙인 바이트. */
     framed_wire: Box<[u8]>,
-    /** @brief 요청에 붙인 서명. */
     request_mac: Option<Vec<u8>>,
-    /** @brief 종료 SOA까지 받은 원본 응답들. */
     messages: Vec<Box<[u8]>>,
-    /** @brief 종료 SOA 판별 상태. */
     boundary: SecondaryXfrBoundary,
-    /** @brief 이 전송이 빌린 응답 버퍼 몫. */
     reservation: XfrBufferReservation,
-    /** @brief 길이 접두사를 포함해 지금까지 받은 응답 바이트. */
+    /// Includes the length prefixes.
     wire_bytes: usize,
-    /** @brief 실제 응답 진전에 비례하는 전체 시간 예산. */
     progress_deadline: XfrProgressDeadline,
-    /** @brief 마지막 진행 뒤 아무 바이트도 오지 않을 때의 데드라인. */
+    /// Since the last progress.
     idle_deadline: std::time::Instant,
-    /** @brief 지금 어느 단계인지. */
     state: SecondaryXfrAdmissionState,
 }
 
-/** @brief 종료 SOA까지 받아 이제 검증·영역 구축할 수 있는 전송. */
+/// Received through the closing SOA, ready for verification and zone building.
 struct PreparedSecondaryXfr {
-    /** @brief 받아 올 영역 설정. */
     job: SecondaryRefreshJob,
-    /** @brief 상대가 알린 시리얼. */
     remote_serial: u32,
-    /** @brief 이 서버가 잡은 영역. */
     current: Option<onetdns_authority::Zone>,
-    /** @brief 종료 SOA까지 받아 둔 응답. */
     io: PreparedXfrIo,
-    /** @brief 영역 구축이 끝날 때까지 유지할 전역 수신 버퍼 몫. */
+    /// Held until the zone is built.
     reservation: XfrBufferReservation,
 }
 
-/** @brief 네트워크 수신을 nonblocking으로 진행하는 전송들. */
 struct SecondaryXfrAdmission {
-    /** @brief 아직 종료 SOA까지 받지 못한 전송들. */
     pending: Vec<PendingSecondaryXfrAdmission>,
-    /** @brief pending·prepared·parser가 함께 쓰는 응답 버퍼 상한. */
     budget: Arc<XfrBufferBudget>,
 }
 
 impl PendingSecondaryXfrAdmission {
-    /** @brief 접속부터 종료 SOA까지 제한된 양만 진행한다. 끝났으면 참. */
+    /// Advances a bounded amount; true when done.
     fn advance(&mut self) -> Result<bool, String> {
         use std::io::{Read, Write};
 
@@ -1207,7 +1089,6 @@ impl PendingSecondaryXfrAdmission {
         }
     }
 
-    /** @brief 완결된 응답을 검증·영역 구축 단계로 넘긴다. */
     fn into_prepared(self) -> PreparedSecondaryXfr {
         let Self {
             job,
@@ -1234,7 +1115,6 @@ impl PendingSecondaryXfrAdmission {
 }
 
 impl Default for SecondaryXfrAdmission {
-    /** @brief 프로세스 전체 수신 버퍼 상한을 공유하는 빈 admission을 만든다. */
     fn default() -> Self {
         Self {
             pending: Vec::new(),
@@ -1244,18 +1124,15 @@ impl Default for SecondaryXfrAdmission {
 }
 
 impl SecondaryXfrAdmission {
-    /** @brief 기다리는 전송 수. */
     fn len(&self) -> usize {
         self.pending.len()
     }
 
-    /** @brief 설정에서 사라진 영역의 전송을 버린다. */
     fn retain_current(&mut self, entries: &[XferEntry]) {
         self.pending
             .retain(|pending| secondary_entry_is_current(entries, &pending.job));
     }
 
-    /** @brief 접속을 걸고 요청을 보낸다. */
     fn start(
         &mut self,
         job: SecondaryRefreshJob,
@@ -1331,17 +1208,15 @@ impl SecondaryXfrAdmission {
             reservation: self.budget.reservation(),
             wire_bytes: 0,
             progress_deadline: XfrProgressDeadline::new(now, timeout),
-            /*
-             * 접속은 아직 읽을 바이트가 없으므로 기본 전체 시간까지 허용한다. 연결된 뒤부터
-             * write/read 진전마다 짧은 무진전 데드라인으로 바뀐다.
-             */
+            // Connecting has no bytes to credit, so the base total time applies; after connecting,
+            // each read or write moves a short no-progress deadline.
             idle_deadline: now + timeout,
             state: SecondaryXfrAdmissionState::Connecting,
         });
         Ok(())
     }
 
-    /** @brief 진행 중 연결들을 공평한 작업량만큼 진행시킨다. */
+    /// Gives each connection a fair share of work.
     fn poll(
         &mut self,
     ) -> (
@@ -1377,59 +1252,41 @@ impl SecondaryXfrAdmission {
     }
 }
 
-/** @brief 영역 수에 맞춘 동시 전송 수. */
 fn secondary_refresh_parallelism(entries: usize) -> usize {
     entries.clamp(1, SECONDARY_REFRESH_MAX_IN_FLIGHT)
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-/** @brief 시리얼을 물은 질의 하나를 가리키는 키. */
 struct SecondarySoaProbeKey {
-    /** @brief 이 소켓과 질의 번호로 응답을 짝짓는다. */
+    /// The response is matched by this socket and the query ID.
     source: std::net::SocketAddr,
-    /** @brief 이 서버가 보낸 질의 번호. */
     id: u16,
 }
 
-/** @brief 시리얼 응답을 기다리는 중인 질의. */
 struct PendingSecondarySoa {
-    /** @brief 이 시리얼을 물어본 영역. */
     job: SecondaryRefreshJob,
-    /** @brief 물어본 이름. */
     origin: onetdns_proto::Name,
-    /** @brief 서명에 쓴 키. */
     tsig_key: Option<usize>,
-    /** @brief 요청에 붙인 서명. */
     request_mac: Option<Vec<u8>>,
-    /** @brief 답을 기다릴 데드라인. */
     deadline: std::time::Instant,
 }
 
-/** @brief 물어본 시리얼 결과. */
 struct SecondarySoaProbeResult {
-    /** @brief 물어본 영역. */
     job: SecondaryRefreshJob,
-    /** @brief 받은 시리얼. 실패하면 사유. */
     result: Result<u32, String>,
 }
 
-/**
- * @brief 여러 영역의 시리얼을 소켓 몇 개로 한꺼번에 묻는 것.
- * @details 영역마다 소켓을 열면 영역이 많을 때 그것만으로 핸들이 동난다.
- */
+/// Asks the serials of many zones over a few sockets; a socket per zone would run out of handles
+/// with many zones.
 struct SecondarySoaProber {
-    /** @brief IPv4 업스트림 서버에 쓸 소켓. */
     ipv4: Option<std::net::UdpSocket>,
-    /** @brief IPv6 업스트림 서버에 쓸 소켓. */
     ipv6: Option<std::net::UdpSocket>,
-    /** @brief 답을 기다리는 질의들. */
     pending: std::collections::HashMap<SecondarySoaProbeKey, PendingSecondarySoa>,
-    /** @brief 지금 묻고 있는 영역들. 같은 영역을 두 번 묻지 않으려는 것이다. */
+    /// So one zone is not asked twice at once.
     pending_origins: std::collections::HashSet<String>,
 }
 
 impl SecondarySoaProber {
-    /** @brief 물어볼 영역들로 만든다. */
     fn new(entries: &[XferEntry]) -> std::io::Result<Self> {
         let ipv4 = if entries.iter().any(|entry| entry.primary.is_ipv4()) {
             let socket = onetdns_core::udp::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
@@ -1453,17 +1310,14 @@ impl SecondarySoaProber {
         })
     }
 
-    /** @brief 이 영역을 지금 묻고 있는지. */
     fn contains(&self, origin: &str) -> bool {
         self.pending_origins.contains(origin)
     }
 
-    /** @brief 답을 기다리는 질의 수. */
     fn len(&self) -> usize {
         self.pending.len()
     }
 
-    /** @brief 설정에서 사라진 영역의 질의를 버린다. */
     fn retain_current(&mut self, entries: &[XferEntry]) {
         self.pending
             .retain(|_, probe| secondary_entry_is_current(entries, &probe.job));
@@ -1475,7 +1329,6 @@ impl SecondarySoaProber {
         );
     }
 
-    /** @brief 시리얼을 묻는다. */
     fn start(
         &mut self,
         job: SecondaryRefreshJob,
@@ -1584,7 +1437,6 @@ impl SecondarySoaProber {
         Ok(())
     }
 
-    /** @brief 이 소켓에 온 응답들을 읽는다. */
     fn receive_socket(
         socket: &std::net::UdpSocket,
         tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -1639,7 +1491,7 @@ impl SecondarySoaProber {
         }
     }
 
-    /** @brief 온 응답을 거두고 데드라인이 지난 것을 버린다. */
+    /// Collects responses and drops queries past their deadline.
     fn poll(
         &mut self,
         tsig_keys: &[onetdns_dnssec::tsig::TsigKey],
@@ -1682,7 +1534,6 @@ impl SecondarySoaProber {
     }
 }
 
-/** @brief 준비된 전송을 실제로 끝까지 받아 온다. */
 fn run_prepared_secondary_transfer(
     entry: &XferEntry,
     current: Option<&onetdns_authority::Zone>,
@@ -1732,23 +1583,18 @@ fn run_prepared_secondary_transfer(
     ))
 }
 
-/** @brief 상대의 시리얼이 더 새것이라 받아 와야 하는지. */
 fn secondary_needs_transfer(job: &SecondaryRefreshJob, remote_serial: u32) -> bool {
     job.current_serial
         .is_none_or(|serial| serial_gt(remote_serial, serial))
 }
 
-/** @brief 이 전송이 지금 설정에도 남아 있는지. */
 fn secondary_entry_is_current(entries: &[XferEntry], job: &SecondaryRefreshJob) -> bool {
     entries.iter().any(|entry| entry == &job.entry)
 }
 
 #[allow(clippy::too_many_arguments)]
-/**
- * @brief 받아 온 것을 영역 저장소에 올리고 다음 시각을 잡는다.
- * @details 파일에서 읽은 영역과 똑같이 ZONEMD를 검사한다. 전송으로 받은 영역을 검사하지 않으면
- *          zonemd_check를 켜도 보조 영역은 변조된 채로 나간다.
- */
+/// Installs the result and schedules the next refresh. ZONEMD is checked as for zones read from
+/// files; otherwise a transferred secondary would be served tampered even with `zonemd_check` on.
 fn complete_secondary_refresh(
     job: SecondaryRefreshJob,
     result: Result<SecondaryXferOutcome, String>,
@@ -1898,7 +1744,6 @@ fn complete_secondary_refresh(
     sched.insert(job.entry.origin, (next_check, last_ok));
 }
 
-/** @brief 하위 영역을 주기적으로 받아 오는 스레드를 시작한다. */
 pub(crate) fn spawn_secondary_refresh(
     cfg: Config,
     tsig_keys: Vec<onetdns_dnssec::tsig::TsigKey>,
@@ -1920,11 +1765,8 @@ pub(crate) fn spawn_secondary_refresh(
     )
 }
 
-/**
- * @brief 세컨더리 영역 갱신 작업을 새 설정으로 다시 시작하는 함수.
- * @details 설정이 바뀔 때마다 이전 작업을 멈추고 새 설정으로 띄운다. 세컨더리와 카탈로그가 모두
- *          비어 있으면 멈추기만 한다.
- */
+/// Stops the previous task and starts one on the new config; with no secondaries or catalogs, only
+/// stops.
 pub(crate) fn refresh_restart(
     jobs: Arc<EdgeServices>,
     zones: &ZoneState,
@@ -1955,11 +1797,8 @@ pub(crate) fn refresh_restart(
     })
 }
 
-/**
- * @brief 하위 영역 받아 오기를 돌린다.
- * @details 시리얼을 먼저 묻고, 더 새것일 때만 받아 온다. 접속부터 종료 SOA까지 스레드 없이
- *          처리해 응답이 느리거나 중간에 멈춘 상대가 워커를 붙잡지 못하게 한다.
- */
+/// Asks the serial first and transfers only when it is newer. Connect through the closing SOA runs
+/// without threads, so a slow or stalled peer cannot hold a worker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_secondary_refresh_with_timeout(
     cfg: Config,
@@ -2396,7 +2235,6 @@ pub(crate) fn spawn_secondary_refresh_with_timeout(
         })
 }
 
-/** @brief 응답에서 시리얼을 읽는다. */
 fn soa_serial_from_response(
     response: &onetdns_proto::Message,
     request_id: u16,
@@ -2435,7 +2273,7 @@ fn soa_serial_from_response(
     Ok(serial)
 }
 
-/** @brief 이 응답이 이 서버가 물은 것에 대한 답인지. 확인하지 않으면 남이 끼워 넣은 시리얼을 믿는다. */
+/// Otherwise a serial injected by someone else would be trusted.
 fn soa_response_matches_question(
     response: &onetdns_proto::Message,
     request_id: u16,
@@ -2451,7 +2289,6 @@ fn soa_response_matches_question(
 }
 
 #[cfg(test)]
-/** @brief 영역 전송 수신, 갱신 판단, 동시 전송 한도. */
 mod tests {
     use super::*;
     use crate::tests::{secondary_xfr_admission_test_server, tcp_udp_test_listeners};
@@ -2464,11 +2301,8 @@ mod tests {
     use crate::notify::NotifySender;
     use crate::{native, unix_now};
 
-    /**
-     * @brief 보조 영역이 실제로 쓰는 논블로킹 리스너로 전송 하나를 끝까지 받는다.
-     * @details 테스트 전용 수신 경로를 따로 두면 그 경로만 검증되고 실제 리스너의 데드라인과
-     *          검증은 테스트 밖에 남는다.
-     */
+    /// Uses the real nonblocking listener; a test-only receive path would test only itself and
+    /// leave the real listener's deadlines and checks untested.
     fn admitted_xfr(
         address: std::net::SocketAddr,
         origin: &str,
@@ -2514,7 +2348,6 @@ mod tests {
         }
     }
 
-    /** @brief 실제 리스너로 영역 전체를 받아 기록을 돌려준다. */
     fn axfr_fetch(
         address: std::net::SocketAddr,
         origin: &onetdns_proto::Name,
@@ -2524,7 +2357,6 @@ mod tests {
         axfr_fetch_prepared(origin, None, io)
     }
 
-    /** @brief 실제 리스너로 바뀐 부분을 받는다. */
     fn ixfr_fetch(
         address: std::net::SocketAddr,
         current: &onetdns_authority::Zone,
@@ -2539,7 +2371,7 @@ mod tests {
         ixfr_fetch_prepared(current, None, io)
     }
 
-    /** @brief 보조 영역이 실제로 쓰는 시리얼 확인기로 시리얼을 묻는다. */
+    /// Uses the real serial prober.
     fn probe_soa_serial(
         address: std::net::SocketAddr,
         origin: &str,
@@ -2585,17 +2417,12 @@ mod tests {
         }
     }
 
-    /**
-     * @brief 테스트용 영역 전송 서버.
-     *
-     * @details 소켓 오류로는 패닉하지 않는다. 데드라인을 지키는지 보는 테스트는 클라이언트가
-     *          먼저 포기하고 연결을 끊게 만드는데, 그때 이쪽에 오는 연결 초기화는
-     *          정상 경로다. 그것을 치명적 오류로 다루면 부하가 걸린 병렬 실행에서만
-     *          이따금 붉어지는 테스트가 되어, 진짜 회귀와 구별할 수 없게 된다.
-     * @param complete 영역을 닫는 SOA 를 하나 더 보낼지.
-     * @param slow 응답을 한 바이트씩 흘려 보낼지.
-     * @return 수신 주소와 서버 스레드.
-     */
+    /// Never panics on socket errors: deadline tests make the client give up and close first, and
+    /// the reset that arrives here is the normal path. Treating it as fatal would make tests fail
+    /// only now and then under parallel load, indistinguishable from a real regression.
+    ///
+    /// `complete` sends the closing SOA; `slow` drips the response a byte at a time. Returns the
+    /// listen address and the server thread.
     fn axfr_test_server(
         complete: bool,
         slow: bool,
@@ -2652,7 +2479,6 @@ mod tests {
         (address, server)
     }
 
-    /** @brief 정해진 기록들을 보내는 테스트용 전송 서버. */
     fn xfr_record_server(
         records: Vec<onetdns_proto::Record>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
@@ -2681,7 +2507,7 @@ mod tests {
         (address, server)
     }
 
-    /** @brief 유효한 전송을 제한된 처리율로 보내는 테스트용 서버. */
+    /// Sends a valid transfer at a limited throughput.
     fn xfr_throttled_record_server(
         records: Vec<onetdns_proto::Record>,
         chunk_bytes: usize,
@@ -2718,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝맺음이 없는 전송을 거부하는지. 받아들이면 중간에 끊긴 영역을 온전한 것으로 쓴다. */
+    /// Accepting it would use a transfer cut midway as a whole zone.
     fn axfr_rejects_transfer_without_closing_soa() {
         let (address, server) = axfr_test_server(false, false);
         let origin = onetdns_proto::Name::from_str("example.test").unwrap();
@@ -2731,7 +2557,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 바이트씩 흘려 보내는 상대가 데드라인을 늘리지 못하는지. */
     fn axfr_slow_drip_cannot_extend_transfer_deadline() {
         let (address, server) = axfr_test_server(false, true);
         let origin = onetdns_proto::Name::from_str("example.test").unwrap();
@@ -2742,7 +2567,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 최소 처리율만큼 실제로 읽어야 정확히 그만큼 시간을 버는지. */
+    /// Exactly the time earned by the bytes read at the minimum throughput.
     fn xfr_progress_deadline_credits_only_received_bytes() {
         let started = std::time::Instant::now();
         let mut deadline = XfrProgressDeadline::new(started, Duration::from_millis(120));
@@ -2754,18 +2579,14 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 충분히 진전하는 큰 전송은 최초 데드라인보다 오래 걸려도 끝낼 수 있는지.
-     *
-     * @details 숫자에는 각각 이유가 있다. 전송 초반에는 적립된 바이트가 없어 예산이
-     *          사실상 기본 시간뿐이므로, 부하가 걸린 기계에서 첫 바이트가 늦어도 견디도록
-     *          기본 시간을 400밀리초로 둔다. 4KB를 40밀리초마다 흘리면 초당 약 102KB로,
-     *          예산이 쌓이는 하한인 초당 16KB의 여섯 배다. 느린 기계에서 sleep이 늘어져
-     *          공급이 느려져도 예산이 경과 시간을 앞선다. 레코드 수는 한 메시지가
-     *          65535바이트를 넘지 않는 선에서 전송이 기본 시간을 넘기도록 정했다.
-     * @warning 숫자를 줄이면 시험이 기본 시간 안에 끝나 아무것도 증명하지 못한다.
-     *          아래의 경과 시간 단언이 그 경우를 잡는다.
-     */
+    /// Early in a transfer no bytes are credited, so the budget is nearly just the base time, which
+    /// is set long enough for a late first byte on a loaded machine. The server sends at several
+    /// times the throughput floor, so the budget stays ahead of elapsed time even when sleeps
+    /// stretch. The record count makes the transfer outlast the base time while keeping each
+    /// message under 65535 bytes.
+    ///
+    /// With smaller numbers the test would finish within the base time and prove nothing; the
+    /// elapsed-time assertion below catches that.
     fn axfr_progress_extends_the_total_deadline() {
         use onetdns_proto::{Name, RData, Record, Soa};
 
@@ -2874,7 +2695,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 처음과 끝이 맞는 전송을 받아들이는지. */
     fn axfr_accepts_matching_opening_and_closing_soa() {
         let (address, server) = axfr_test_server(true, false);
         let origin = onetdns_proto::Name::from_str("example.test").unwrap();
@@ -2885,7 +2705,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 변경을 순서대로 적용하고, 없는 기록을 지우라면 거부하는지. */
     fn ixfr_client_applies_ordered_deltas_and_rejects_impossible_delete() {
         use onetdns_proto::{Name, RData, Record, Soa};
         let current = onetdns_authority::parse_zone(
@@ -2976,7 +2795,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 바뀐 것이 없을 때와 전체가 온 것을 모두 다루는지. */
     fn ixfr_client_handles_unchanged_and_full_fallback() {
         let current = onetdns_authority::parse_zone(
             "$ORIGIN ix-fallback.test.\n@ IN SOA ns admin 20 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n",
@@ -3002,7 +2820,6 @@ mod tests {
         assert!(matches!(fetched, IxfrFetchResult::Full(zone) if zone.soa().serial == 21));
     }
 
-    /** @brief 정해진 응답 코드를 내는 테스트용 전송 서버. */
     fn xfr_rcode_server(rcode: u16) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3029,7 +2846,6 @@ mod tests {
         (address, server)
     }
 
-    /** @brief 응답 하나를 받아 둔 테스트용 전송. */
     fn prepared_xfr_io(
         address: std::net::SocketAddr,
         query: onetdns_proto::Message,
@@ -3056,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 사유를 만드는 쪽과 판별하는 쪽이 같은 문구를 보는지. 어긋나면 전체를 받아 오는 길이 막힌다. */
+    /// If they drift apart, the full transfer fallback stops.
     fn ixfr_notimp_error_text_matches_the_axfr_fallback_predicate() {
         assert!(xfr_error_is_notimp(&xfr_rcode_error(
             onetdns_proto::ResponseCode::NotImp.0
@@ -3067,7 +2883,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 바뀐 부분만 못 받으면 전체를 달라고 하는지. */
     fn ixfr_notimp_asks_the_coordinator_for_a_full_transfer() {
         let current = onetdns_authority::parse_zone(
             "$ORIGIN ix-notimp.test.\n@ IN SOA ns admin 30 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n",
@@ -3095,7 +2910,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 전부 다시 받을 때 이전 영역을 기준으로 삼지 않는지. */
     fn forced_axfr_retry_ignores_the_ixfr_base_zone() {
         let current = onetdns_authority::parse_zone(
             "$ORIGIN ix-forced.test.\n@ IN SOA ns admin 40 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\n",
@@ -3160,7 +2974,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 시리얼을 물을 때 권한 있는 답만 믿고 서명을 확인하는지. */
     fn secondary_soa_probe_requires_authority_and_verifies_tsig() {
         use onetdns_dnssec::tsig;
         use onetdns_proto::{DnsClass, Message, RData, Record, RecordType, Soa};
@@ -3230,7 +3043,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /** @brief 시리얼을 답하는 테스트용 서버. */
     fn secondary_soa_test_server(
         delay: Duration,
         observed: Option<std::sync::mpsc::Sender<std::time::Instant>>,
@@ -3278,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 번호만 같고 질문이 다른 답을 무시하는지. 안 그러면 남이 끼워 넣은 시리얼을 믿는다. */
+    /// Otherwise a serial injected by someone else would be trusted.
     fn multiplexed_soa_probe_ignores_same_id_wrong_question() {
         use onetdns_proto::{DnsClass, Message, RData, Record, RecordType, Soa};
 
@@ -3367,7 +3179,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 답 없는 상대 여럿이 멀쩡한 영역의 갱신을 막지 않는지. */
     fn eight_stalled_secondaries_do_not_block_another_zone_refresh() {
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
         let (fast_addr, fast_server) = secondary_soa_test_server(Duration::ZERO, Some(observed_tx));
@@ -3436,7 +3247,6 @@ mod tests {
         assert_eq!(secondary_refresh_parallelism(usize::MAX), 4);
     }
 
-    /** @brief 바뀐 부분만 보내기를 지원하지 않는 테스트용 업스트림 서버. */
     fn ixfr_notimp_primary(
         origin: String,
         seen: std::sync::mpsc::Sender<onetdns_proto::RecordType>,
@@ -3500,7 +3310,6 @@ mod tests {
         (address, server)
     }
 
-    /** @brief 첫 청크 뒤로 멈추는 테스트용 업스트림 서버. */
     fn stalls_after_first_frame_primary(
         origin: String,
         sent: std::sync::mpsc::Sender<()>,
@@ -3560,7 +3369,7 @@ mod tests {
         (address, server)
     }
 
-    /** @brief SOA와 두 XFR frame을 모두 올바른 TSIG 체인으로 보내는 테스트용 업스트림 서버. */
+    /// SOA and two transfer frames, all under a valid TSIG chain.
     fn signed_secondary_xfr_primary(
         origin: String,
         key: onetdns_dnssec::tsig::TsigKey,
@@ -3638,7 +3447,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 전송이 하나의 수신 버퍼 상한을 공유하고 반환하는지. */
     fn xfr_response_buffer_budget_is_global_and_released_on_drop() {
         let budget = Arc::new(XfrBufferBudget::new(64));
         let mut first = budget.reservation();
@@ -3657,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief nonblocking 다중 frame 수신 뒤에도 요청 MAC부터 이어진 TSIG 체인을 검증하는지. */
+    /// The TSIG chain starts from the request MAC.
     fn secondary_nonblocking_xfr_preserves_multi_frame_tsig_chain() {
         let origin = "signed-secondary.test";
         let key = onetdns_dnssec::tsig::TsigKey::new(
@@ -3736,7 +3544,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 청크 뒤로 멈춘 상대가 워커를 계속 붙잡지 않는지. */
     fn primaries_that_stall_after_the_first_frame_release_their_parser_slot() {
         let mut config = Config::default();
         let mut zones = onetdns_authority::ZoneStore::new();
@@ -3846,7 +3653,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 바뀐 부분만 못 받는 상대에게서도 결국 받아 오는지. */
     fn secondary_recovers_from_an_ixfr_only_notimp_primary() {
         let origin = "notimp.secondary.test";
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
@@ -3919,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 알림에 쓰는 이름과 일정에 쓰는 이름이 같은 형태인지. 다르면 알림이 그 영역을 못 찾는다. */
+    /// Otherwise NOTIFY would not find the zone.
     fn secondary_scheduler_key_matches_notify_name_canonical_form() {
         let config = onetdns_config::SecondaryZone {
             origin: "MiXeD.Secondary.Test.".to_string(),
@@ -3935,7 +3741,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정이 바뀐 뒤 이전 전송 결과를 반영하지 않는지. */
     fn stale_secondary_job_requires_an_exact_configuration_match() {
         let entry = XferEntry {
             origin: "exact.secondary.test".to_string(),
@@ -3971,7 +3776,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 너무 오래된 것은 되살리지 않는지. */
     fn secondary_cache_restores_only_with_unexpired_refresh_state() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-secondary-cache-{}-{}.zone",

@@ -1,61 +1,53 @@
-/*!
- * @brief 서명된 릴리스 매니페스트.
- *
- * @details 릴리스의 버전과 대상별 실행 파일 해시는 이 매니페스트만 정한다. GitHub API 응답과
- *          내려받은 주소는 믿지 않는다.
- * @warning 서명을 확인하기 전에는 내용을 해석하지 않는다. 해석기가 받는 입력은 신뢰 키로
- *          서명된 바이트뿐이어야 한다.
- */
+//! Signed release manifest. Only the manifest decides a release's version and each target's
+//! executable hash; GitHub API responses and download URLs are not trusted.
+//!
+//! Nothing is parsed before the signature checks out, so the parser only ever sees bytes signed by
+//! a trusted key.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use super::{decode_sha256, version::Version, CONTRACT};
 use crate::PRODUCT_NAME;
 
-/** @brief 매니페스트 자산 이름. */
 pub(crate) const MANIFEST_FILE: &str = "OnetDNS-release.toml";
-/** @brief 서명 자산 이름. 매니페스트 원문 바이트에 대한 Ed25519 서명 64바이트다. */
+/// A 64-byte Ed25519 signature over the raw manifest bytes.
 pub(crate) const SIGNATURE_FILE: &str = "OnetDNS-release.toml.sig";
-/** @brief 매니페스트를 받을 때 거는 상한. 대상 수십 개를 적어도 한참 남는다. */
+/// Room for dozens of targets.
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-/** @brief 실행 파일 크기의 상한. 매니페스트가 이보다 크게 적으면 받지 않는다. */
+/// A manifest declaring a larger size is rejected.
 pub(crate) const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
-/** @brief 대상 이름의 길이 상한. */
 const MAX_TARGET_LEN: usize = 64;
 
-/** @brief 믿는 공개 키 목록. 릴리스 워크플로도 이 파일로 서명을 검증한다. */
+/// The release workflow verifies signatures with this file too.
 const TRUSTED_KEYS: &str = include_str!("../../release-keys.txt");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 서명을 확인한 매니페스트. */
+/// Signature already checked.
 pub(crate) struct Manifest {
-    /** @brief 릴리스 버전. 고른 태그의 버전과 같음을 확인했다. */
+    /// Checked to equal the chosen tag's version.
     pub(crate) version: String,
-    /** @brief 대상별 실행 파일. 대상은 겹치지 않는다. */
+    /// No target appears twice.
     pub(crate) assets: Vec<Asset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 대상 하나의 실행 파일. */
 pub(crate) struct Asset {
-    /** @brief 자산 키. 빌드할 때 넣은 대상 트리플이다. */
+    /// The target triple set at build time.
     pub(crate) target: String,
-    /** @brief 릴리스에 올라간 파일 이름. asset_file_name 규칙을 따른다. */
+    /// Follows asset_file_name.
     pub(crate) file: String,
-    /** @brief 바이트 수. 내려받을 때 상한으로 쓴다. */
+    /// Also the download limit.
     pub(crate) size: u64,
-    /** @brief 파일의 SHA-256. */
     pub(crate) sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 매니페스트를 받아들이지 않은 이유. */
 pub(crate) enum ManifestError {
-    /** @brief 맞는 신뢰 키가 없다. 내용은 보지 않았다. */
+    /// No trusted key matches; the contents were not read.
     Signature,
-    /** @brief 계약 번호가 이 바이너리와 다르다. 이 릴리스는 수동으로 설치해야 한다. */
+    /// The contract number differs from this binary's; this release needs a manual install.
     Contract(i64),
-    /** @brief 서명은 맞지만 내용이 계약과 다르다. */
+    /// The signature is good, but the contents break the contract.
     Invalid(String),
 }
 
@@ -75,16 +67,13 @@ impl std::fmt::Display for ManifestError {
 }
 
 impl Manifest {
-    /** @brief 이 대상의 실행 파일. 없으면 이 플랫폼용 실행 파일이 없는 릴리스다. */
+    /// None when the release has no executable for this platform.
     pub(crate) fn asset_for(&self, target: &str) -> Option<&Asset> {
         self.assets.iter().find(|asset| asset.target == target)
     }
 }
 
-/**
- * @brief 대상의 실행 파일 이름.
- * @details Windows 는 확장자가 있어야 실행되므로 .exe 를 붙인다. 이 규칙은 업데이트 계약에 든다.
- */
+/// Windows needs .exe to run it. This naming is part of the update contract.
 pub(crate) fn asset_file_name(version: &str, target: &str) -> String {
     let extension = if target.contains("-windows-") {
         ".exe"
@@ -94,15 +83,11 @@ pub(crate) fn asset_file_name(version: &str, target: &str) -> String {
     format!("{PRODUCT_NAME}-{version}-{target}{extension}")
 }
 
-/**
- * @brief 신뢰 키 목록을 읽는다.
- * @return 한 줄이라도 틀리면 오류다. 틀린 줄을 건너뛰면 소유자가 넣은 키가 조용히 빠진다.
- */
+/// Any bad line is an error; skipping it would silently drop a key the owner added.
 pub(crate) fn trusted_keys() -> Result<Vec<VerifyingKey>, String> {
     parse_keys(TRUSTED_KEYS)
 }
 
-/** @brief 신뢰 키 목록 형식을 읽는다. */
 fn parse_keys(text: &str) -> Result<Vec<VerifyingKey>, String> {
     let mut keys = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -127,10 +112,7 @@ fn parse_keys(text: &str) -> Result<Vec<VerifyingKey>, String> {
     Ok(keys)
 }
 
-/**
- * @brief 서명을 확인하고 매니페스트를 읽는다.
- * @param tag_version 고른 릴리스 태그의 버전. 매니페스트의 버전이 이것과 같아야 한다.
- */
+/// The manifest version must equal `tag_version`, the chosen release tag's.
 pub(crate) fn open(
     bytes: &[u8],
     signature: &[u8],
@@ -148,10 +130,7 @@ pub(crate) fn open(
     Ok(manifest)
 }
 
-/**
- * @brief 신뢰 키 가운데 하나로 서명이 맞는지 본다.
- * @details verify_strict 는 작은 위수의 키와 정규형이 아닌 서명도 거절한다.
- */
+/// verify_strict also rejects small-order keys and non-canonical signatures.
 fn verify(bytes: &[u8], signature: &[u8], keys: &[VerifyingKey]) -> Result<(), ManifestError> {
     let signature = Signature::from_slice(signature).map_err(|_| ManifestError::Signature)?;
     if keys
@@ -164,7 +143,7 @@ fn verify(bytes: &[u8], signature: &[u8], keys: &[VerifyingKey]) -> Result<(), M
     }
 }
 
-/** @brief 서명을 확인한 바이트를 계약 형식으로 읽는다. 모르는 키는 받지 않는다. */
+/// Unknown keys are rejected.
 fn parse(bytes: &[u8]) -> Result<Manifest, ManifestError> {
     use onetdns_config::toml::Value;
 
@@ -217,7 +196,6 @@ fn parse(bytes: &[u8]) -> Result<Manifest, ManifestError> {
     Ok(Manifest { version, assets })
 }
 
-/** @brief 자산 항목 하나를 읽는다. */
 fn parse_asset(entry: &onetdns_config::toml::Value, version: &str) -> Result<Asset, ManifestError> {
     use onetdns_config::toml::Value;
 
@@ -273,17 +251,15 @@ fn parse_asset(entry: &onetdns_config::toml::Value, version: &str) -> Result<Ass
 }
 
 #[cfg(test)]
-/** @brief 서명 확인과 형식 검사. */
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
-    /** @brief 테스트 서명 키. 실제 릴리스 키와 관계없다. */
+    /// Unrelated to the release key.
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    /** @brief 계약 형식을 따르는 매니페스트. */
     fn manifest_text(version: &str) -> String {
         format!(
             "format = 1\nproduct = \"OnetDNS\"\nversion = \"{version}\"\n\n[[asset]]\ntarget = \"x86_64-unknown-linux-musl\"\nfile = \"OnetDNS-{version}-x86_64-unknown-linux-musl\"\nsize = 11836928\nsha256 = \"{}\"\n\n[[asset]]\ntarget = \"x86_64-pc-windows-msvc\"\nfile = \"OnetDNS-{version}-x86_64-pc-windows-msvc.exe\"\nsize = 9437184\nsha256 = \"{}\"\n",
@@ -292,7 +268,6 @@ mod tests {
         )
     }
 
-    /** @brief 이 키로 서명해 연다. */
     fn open_signed(text: &str, key: &SigningKey, tag: &str) -> Result<Manifest, ManifestError> {
         let signature = key.sign(text.as_bytes()).to_bytes();
         open(
@@ -304,7 +279,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 믿는 키로 서명한 매니페스트는 읽히는지. */
     fn manifest_signed_by_a_trusted_key_opens() {
         let manifest = open_signed(
             &manifest_text("0.1.0-alpha.6"),
@@ -329,11 +303,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 바이트 하나만 바뀌어도, 다른 키로 서명해도 거절하는지.
-     * @details 서명이 틀리면 해석하지 않아야 하므로 TOML 로도 읽히지 않는 바이트를 서명 없이 넣어
-     *          보고 Signature 로 끝나는지 본다. 해석했다면 Invalid 가 나왔을 것이다.
-     */
+    /// A bad signature must stop before parsing, so bytes that are not even TOML go in unsigned and
+    /// must fail with Signature; parsing them would give Invalid.
     fn tampered_or_foreign_signatures_are_rejected_before_parsing() {
         let text = manifest_text("0.1.0-alpha.6");
         let trusted = signing_key(7);
@@ -375,7 +346,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 계약 번호가 다르면 내용을 더 보지 않고 수동 설치로 알리는지. */
     fn other_contract_numbers_need_a_manual_install() {
         let text = "format = 2\nproduct = \"OnetDNS\"\nsomething_new = true\n";
         assert_eq!(
@@ -385,7 +355,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명은 맞아도 계약과 다른 내용은 받지 않는지. */
     fn signed_but_malformed_manifests_are_rejected() {
         let good = manifest_text("0.1.0-alpha.6");
         let cases = [
@@ -457,13 +426,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장소의 신뢰 키 목록이 읽히는지. 틀린 줄이 있으면 릴리스가 모두 막힌다. */
+    /// A bad line would block every release.
     fn repository_key_list_parses() {
         trusted_keys().expect("onetdns-bin/release-keys.txt");
     }
 
     #[test]
-    /** @brief 키 목록의 주석과 빈 줄은 건너뛰고, 틀린 줄은 건너뛰지 않고 오류로 내는지. */
     fn key_list_rejects_malformed_lines() {
         let key = signing_key(7).verifying_key();
         let hex = super::super::hex(key.as_bytes());

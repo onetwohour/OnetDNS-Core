@@ -1,11 +1,9 @@
-/*!
- * @brief MySQL/MariaDB에서 zone을 읽는 백엔드.
- *
- * @details 클라이언트 라이브러리를 링크하지 않고 와이어 프로토콜을 직접 말한다. 이 서버에게
- *          필요한 것은 접속·인증·단순 질의뿐이라, 프로토콜 전체를 구현하지 않는다.
- * @warning 서버가 보내는 바이트는 신뢰 입력이 아니다. 인증 전에 닿는 핸드셰이크 파서와
- *          행 파서 모두 어떤 바이트에도 패닉하지 않아야 한다.
- */
+//! Reads zones from MySQL or MariaDB by speaking the wire protocol directly, without linking a
+//! client library. Only connect, authenticate, and simple queries are needed, so the protocol is
+//! not implemented in full.
+//!
+//! Bytes from the server are untrusted: the handshake parser, reached before authentication, and
+//! the row parser must not panic on any input.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,63 +14,41 @@ use sha2::{Digest, Sha256};
 use crate::source::ZoneSource;
 use crate::{parse_zone, DeadlineTcp, ZoneStore};
 
-/** @brief 패킷 하나의 본문 크기 상한. 프로토콜 자체의 한계와 같다. */
+/// The protocol's own limit.
 const MAX_MYSQL_PACKET: usize = 16 * 1024 * 1024;
-/** @brief 결과 집합의 열 수 상한. 이 서버의 질의는 두 열만 쓴다. */
+/// The query uses two.
 const MAX_MYSQL_COLUMNS: usize = 64;
-/** @brief 받아들일 행 수 상한. */
 const MAX_MYSQL_ROWS: usize = 100_000;
-/** @brief 결과 전체의 누적 바이트 상한. 행 수만으로는 메모리를 묶지 못한다. */
+/// Row count alone does not bound memory.
 const MAX_MYSQL_RESULT_BYTES: usize = 512 * 1024 * 1024;
-/** @brief 인증 왕복 상한. 서버가 인증 전환을 무한히 요구하는 것을 막는다. */
+/// Stops a server that keeps demanding auth switches.
 const MAX_AUTH_ROUNDS: usize = 16;
 
-/** @brief 긴 비밀번호 지원. */
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
-/** @brief 4.1 프로토콜. 현대 서버의 기본이다. */
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
-/** @brief 보안 연결 방식 인증. */
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
-/** @brief 인증 플러그인 협상. */
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
-/** @brief 접속과 동시에 데이터베이스 선택. */
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 
-/**
- * @brief MySQL/MariaDB 테이블에서 zone을 읽는 백엔드.
- * @details 클라이언트 라이브러리를 링크하지 않고 와이어 프로토콜을 직접 말한다.
- *          origin과 zone 두 열만 읽으면 되므로 필요한 부분만 구현한다.
- */
 pub struct MysqlZoneSource {
-    /** @brief 접속 호스트. 루프백만 허용한다. */
+    /// Loopback only.
     pub host: String,
-    /** @brief 접속 포트. */
     pub port: u16,
-    /** @brief 사용자 이름. */
     pub user: String,
-    /** @brief 비밀번호. */
     pub password: onetdns_core::SecretString,
-    /** @brief 데이터베이스 이름. */
     pub database: String,
-    /** @brief zone이 담긴 테이블 이름. */
     pub table: String,
 }
 
 impl MysqlZoneSource {
-    /**
-     * @brief 접속하지 않고 확인할 수 있는 조건을 본다.
-     * @details 접속할 때 거절될 주소와 질의문에 넣을 수 없는 테이블 이름을 설정 단계에서
-     *          알린다.
-     */
+    /// Reports, at config time, what can be checked without connecting: an address that connect
+    /// would refuse and a table name that cannot go into the query.
     pub fn check(&self) -> Result<(), String> {
         crate::loopback_socket_addr(&self.host, self.port, "MySQL")?;
         sanitize_table(&self.table).map(|_| ())
     }
 
-    /**
-     * @brief 접속 URL을 해석한다. 자격증명이 없으면 root로 본다.
-     * @return 형식이 어긋나면 None.
-     */
+    /// Without credentials, the user is root.
     pub fn from_url(url: &str, table: &str) -> Option<MysqlZoneSource> {
         let rest = url
             .strip_prefix("mysql://")
@@ -103,7 +79,7 @@ impl MysqlZoneSource {
         })
     }
 
-    /** @brief 접속·인증·질의를 한 번에 하고 행을 가져온다. 연결은 매번 새로 연다. */
+    /// Opens a new connection every time.
     fn fetch_rows(&self) -> Result<Vec<(String, String)>, String> {
         let mut conn = MyConn::connect(&self.host, self.port, Duration::from_secs(10))?;
         conn.handshake(&self.user, &self.password, &self.database)?;
@@ -113,7 +89,7 @@ impl MysqlZoneSource {
 }
 
 impl ZoneSource for MysqlZoneSource {
-    /** @brief 행마다 zone을 파싱한다. 빈 origin은 루트로 본다. */
+    /// An empty origin is the root.
     fn load(&self) -> Result<ZoneStore, String> {
         let rows = self.fetch_rows()?;
         let mut store = ZoneStore::new();
@@ -134,26 +110,20 @@ impl ZoneSource for MysqlZoneSource {
         Ok(store)
     }
 
-    /**
-     * @brief 항상 참.
-     * @details 서버에 변경 시각을 물을 싼 방법이 없다. 매 주기 다시 읽는 쪽이 갱신을
-     *          놓치는 것보다 낫다.
-     */
+    /// Always true: there is no cheap way to ask the server for a change time, and rereading every
+    /// cycle beats missing updates.
     fn changed_since(&self, _last: SystemTime) -> bool {
         true
     }
 
-    /** @brief 공급자 설명. 비밀번호는 넣지 않는다. */
+    /// Leaves out the password.
     fn describe(&self) -> String {
         format!("mysql({}:{}/{})", self.host, self.port, self.database)
     }
 }
 
-/**
- * @brief 테이블 이름을 검사한다.
- * @details 식별자는 자리표시자로 바인딩할 수 없어 질의문에 그대로 들어간다. 영숫자와
- *          밑줄, 점만 허용해 SQL 주입을 막는다.
- */
+/// Identifiers cannot be bound as placeholders and go into the query text, so only letters, digits,
+/// underscore, and dot are allowed, which rules out SQL injection.
 fn sanitize_table(t: &str) -> Result<String, String> {
     if !t.is_empty()
         && t.chars()
@@ -165,19 +135,15 @@ fn sanitize_table(t: &str) -> Result<String, String> {
     }
 }
 
-/** @brief MySQL 연결 하나. 패킷 순번을 함께 가지고 있어야 프로토콜이 맞물린다. */
+/// The packet sequence number travels with the connection, or the protocol falls out of step.
 struct MyConn {
-    /** @brief 데드라인이 걸린 TCP. 응답이 오지 않아도 영원히 기다리지 않는다. */
     stream: DeadlineTcp,
-    /** @brief 다음 패킷의 순번. 명령마다 0으로 되돌린다. */
+    /// Reset to 0 for each command.
     seq: u8,
 }
 
 impl MyConn {
-    /**
-     * @brief 서버에 접속한다.
-     * @warning 루프백 주소만 허용한다. 원격 DB로 향하면 자격증명이 평문으로 흐른다.
-     */
+    /// Loopback addresses only: a remote database would receive credentials in the clear.
     fn connect(host: &str, port: u16, timeout: Duration) -> Result<MyConn, String> {
         let deadline = Instant::now() + timeout;
         let addr = crate::loopback_socket_addr(host, port, "MySQL")?;
@@ -185,11 +151,8 @@ impl MyConn {
         Ok(MyConn { stream, seq: 0 })
     }
 
-    /**
-     * @brief 패킷 하나를 읽는다.
-     * @details 길이를 상한과 견주고 순번도 확인한다. 순번이 어긋나면 프로토콜이 이미
-     *          엇나간 것이라, 그대로 진행하면 엉뚱한 바이트를 결과로 읽는다.
-     */
+    /// Checks the length against the limit and the sequence number; a mismatched sequence means the
+    /// protocol is already out of step, and continuing would read the wrong bytes as results.
     fn read_packet(&mut self) -> Result<Vec<u8>, String> {
         let mut head = [0u8; 4];
         self.stream
@@ -213,7 +176,6 @@ impl MyConn {
         Ok(body)
     }
 
-    /** @brief 3바이트 길이와 순번을 앞에 붙여 패킷을 보낸다. */
     fn write_packet(&mut self, body: &[u8]) -> Result<(), String> {
         if body.len() > MAX_MYSQL_PACKET {
             return Err("Outgoing MySQL packet exceeds the size limit".into());
@@ -228,14 +190,9 @@ impl MyConn {
         self.stream.write_all(&pkt).map_err(|e| e.to_string())
     }
 
-    /**
-     * @brief 인증을 마친다.
-     *
-     * @details 서버가 인증 방식 전환을 요구할 수 있어 왕복이 여러 번일 수 있다. 횟수에
-     *          상한을 두어 서버가 전환만 반복시키는 상황에서 빠져나온다.
-     * @note caching_sha2의 전체 인증은 거부한다. 그 경로는 비밀번호를 평문에 가깝게
-     *       보내므로 TLS 없이는 쓰면 안 된다.
-     */
+    /// The server may demand auth method switches, so this can take several round trips, capped so
+    /// a server repeating switches cannot hold it. caching_sha2 full authentication is refused: it
+    /// sends the password nearly in the clear, which is unsafe without TLS.
     fn handshake(&mut self, user: &str, password: &str, database: &str) -> Result<(), String> {
         let hs = self.read_packet()?;
         let (scramble, plugin) = parse_handshake(&hs)?;
@@ -280,14 +237,10 @@ impl MyConn {
         Err("Too many MySQL authentication round trips".into())
     }
 
-    /**
-     * @brief 질의를 보내고 텍스트 결과의 두 열을 가져온다.
-     *
-     * @details 응답은 열 개수, 열 정의, 선택적 EOF, 행들, 그리고 마지막 EOF 순서다.
-     *          서버 판마다 중간 EOF가 있고 없고 해서 그 슬롯을 봐 가며 건너뛴다.
-     * @note 행 수와 누적 바이트를 모두 센다. 행 수만 세면 거대한 행 몇 개로 메모리를
-     *       채울 수 있다.
-     */
+    /// Sends a query and fetches two text columns. The response is column count, column
+    /// definitions, an optional EOF, rows, and a final EOF; server versions differ on the middle
+    /// EOF, so that slot is checked and skipped. Counts both rows and total bytes: counting rows
+    /// alone lets a few huge rows fill memory.
     fn query(&mut self, sql: &str) -> Result<Vec<(String, String)>, String> {
         self.seq = 0;
         let mut body = vec![0x03u8];
@@ -348,12 +301,9 @@ impl MyConn {
     }
 }
 
-/**
- * @brief 서버의 최초 핸드셰이크에서 스크램블과 인증 플러그인 이름을 추출한다.
- * @details 스크램블은 앞 8바이트와 뒤쪽 조각이 떨어져 있어 이어 붙여야 한다. 모든
- *          오프셋 계산을 넘침 검사와 함께 한다. 이 바이트는 아직 인증되지 않았다.
- * @return 스크램블과 플러그인 이름.
- */
+/// Extracts the scramble and auth plugin name from the server's first handshake. The scramble comes
+/// in two separate pieces that must be joined. Every offset is checked for overflow; these bytes
+/// are not yet authenticated.
 fn parse_handshake(p: &[u8]) -> Result<(Vec<u8>, String), String> {
     if p.first() != Some(&0x0a) {
         return Err("Not a MySQL protocol v10 handshake".into());
@@ -436,7 +386,7 @@ fn parse_handshake(p: &[u8]) -> Result<(Vec<u8>, String), String> {
     ))
 }
 
-/** @brief 뒤쪽 0바이트를 떼어 낸다. 스크램블 조각에 채움용 0이 붙어 온다. */
+/// Scramble pieces come padded with zeros.
 fn trim_nul(b: &[u8]) -> Vec<u8> {
     let mut e = b.len();
     while e > 0 && b[e - 1] == 0 {
@@ -445,10 +395,7 @@ fn trim_nul(b: &[u8]) -> Vec<u8> {
     b[..e].to_vec()
 }
 
-/**
- * @brief 플러그인에 맞는 인증 응답을 만든다.
- * @note 비밀번호가 비면 빈 응답이다. 빈 비밀번호를 해시하면 서버가 인증 실패로 본다.
- */
+/// An empty password gets an empty response; hashing it makes the server reject authentication.
 fn compute_auth(plugin: &str, password: &[u8], scramble: &[u8]) -> Vec<u8> {
     if password.is_empty() {
         return Vec::new();
@@ -459,11 +406,8 @@ fn compute_auth(plugin: &str, password: &[u8], scramble: &[u8]) -> Vec<u8> {
     }
 }
 
-/**
- * @brief mysql_native_password 응답.
- * @details SHA1(비밀번호)를 SHA1(스크램블 ‖ SHA1(SHA1(비밀번호)))와 XOR한다. 서버는
- *          SHA1(SHA1(비밀번호))만 저장하므로 비밀번호 자체는 오가지 않는다.
- */
+/// mysql_native_password: SHA1(password) XOR SHA1(scramble ‖ SHA1(SHA1(password))). The server
+/// stores only SHA1(SHA1(password)), so the password itself never crosses the wire.
 fn scramble_native(password: &[u8], scramble: &[u8]) -> Vec<u8> {
     let h1 = sha1(password);
     let h2 = sha1(&h1);
@@ -473,11 +417,8 @@ fn scramble_native(password: &[u8], scramble: &[u8]) -> Vec<u8> {
     h1.iter().zip(h3.iter()).map(|(a, b)| a ^ b).collect()
 }
 
-/**
- * @brief caching_sha2_password의 빠른 경로 응답.
- * @note 이어 붙이는 순서가 native와 반대다. 서버 캐시가 비어 있으면 전체 인증으로
- *       넘어가는데, 그쪽은 이 서버가 거부한다.
- */
+/// caching_sha2_password fast path; the concatenation order is the reverse of native. An empty
+/// server cache falls back to full authentication, which this server refuses.
 fn scramble_sha256(password: &[u8], scramble: &[u8]) -> Vec<u8> {
     let h1 = sha256(password);
     let h2 = sha256(&h1);
@@ -487,11 +428,8 @@ fn scramble_sha256(password: &[u8], scramble: &[u8]) -> Vec<u8> {
     h1.iter().zip(h3.iter()).map(|(a, b)| a ^ b).collect()
 }
 
-/**
- * @brief 클라이언트 핸드셰이크 응답을 만든다.
- * @details 이 서버가 실제로 쓰는 기능만 요청한다. 압축이나 다중 문장 같은 것을 켜면 그
- *          응답 형식까지 다뤄야 한다.
- */
+/// Requests only the features this server uses; enabling compression or multi-statements would mean
+/// handling their response formats too.
 fn build_handshake_response(user: &str, auth: &[u8], database: &str, plugin: &str) -> Vec<u8> {
     let mut caps =
         CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD;
@@ -516,7 +454,7 @@ fn build_handshake_response(user: &str, auth: &[u8], database: &str, plugin: &st
     b
 }
 
-/** @brief 오류 패킷에서 사람이 읽을 메시지를 추출한다. SQL 상태가 붙어 있으면 건너뛴다. */
+/// Skips the SQL state when present.
 fn err_packet(p: &[u8]) -> String {
     if p.len() < 3 {
         return "MySQL server returned an error".into();
@@ -531,12 +469,8 @@ fn err_packet(p: &[u8]) -> String {
     )
 }
 
-/**
- * @brief 길이 인코딩 정수를 읽는다.
- * @details 첫 바이트가 형식을 정한다. 0xfb는 NULL 표시라 값 0으로 취급하고, 나머지는
- *          뒤따르는 2·3·8바이트를 읽는다.
- * @return 값과 그 다음 위치. 바이트가 모자라면 None.
- */
+/// The first byte selects the form: 0xfb is the NULL marker, read as 0, and the others take the 2,
+/// 3, or 8 bytes that follow. Returns the value and next position; None when bytes run out.
 fn lenenc_int(b: &[u8], pos: usize) -> Option<(u64, usize)> {
     let first = *b.get(pos)?;
     match first {
@@ -562,12 +496,8 @@ fn lenenc_int(b: &[u8], pos: usize) -> Option<(u64, usize)> {
     }
 }
 
-/**
- * @brief 텍스트 프로토콜의 행 하나를 열 값들로 나눈다.
- * @details 길이 계산에 넘침 검사를 붙인다. 조작된 길이가 위치를 되감으면 같은 바이트를
- *          되풀이해 읽거나 범위를 벗어난다.
- * @return 열 값들. NULL은 None이다.
- */
+/// Length arithmetic is overflow-checked: a crafted length that wraps the position would reread
+/// bytes or run out of bounds. NULL is None.
 fn parse_text_row(b: &[u8], ncols: usize) -> Result<Vec<Option<String>>, String> {
     let mut pos: usize = 0;
     let mut out = Vec::with_capacity(ncols);
@@ -590,26 +520,23 @@ fn parse_text_row(b: &[u8], ncols: usize) -> Result<Vec<Option<String>>, String>
     Ok(out)
 }
 
-/** @brief SHA-1 한 번. 인증 방식이 정한 것이라 선택지가 없다. */
+/// Fixed by the auth method.
 fn sha1(d: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
     h.update(d);
     h.finalize().into()
 }
 
-/** @brief SHA-256 한 번. */
 fn sha256(d: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(d);
     h.finalize().into()
 }
 
-/** @brief URL 해석, 와이어 형식 읽기, 인증 계산의 정합성. */
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /** @brief 자격증명 유무와 포트 생략을 모두 처리하는지. */
     #[test]
     fn url_parsing() {
         let s = MysqlZoneSource::from_url("mysql://dns:pw@h:3307/zdb", "zones").unwrap();
@@ -624,7 +551,6 @@ mod tests {
         assert_eq!(d.port, 3306);
     }
 
-    /** @brief 길이 인코딩 정수의 세 형식이 값과 다음 위치를 맞게 주는지. */
     #[test]
     fn lenenc_variants() {
         assert_eq!(lenenc_int(&[0x05], 0), Some((5, 1)));
@@ -635,7 +561,7 @@ mod tests {
         );
     }
 
-    /** @brief NULL 열을 빈 문자열과 구분하는지. 둘을 섞으면 origin이 루트로 둔갑한다. */
+    /// Mixing them would turn the origin into the root.
     #[test]
     fn text_row_parse_with_null() {
         let mut b = vec![6];
@@ -646,7 +572,7 @@ mod tests {
         assert_eq!(cols[1], None);
     }
 
-    /** @brief native 인증 계산을 식대로 되짚어 확인한다. 빈 비밀번호는 빈 응답이어야 한다. */
+    /// An empty password must give an empty response.
     #[test]
     fn native_scramble_known_vector() {
         let scramble: Vec<u8> = (0u8..20).collect();
@@ -665,7 +591,6 @@ mod tests {
         assert_eq!(recovered, sha1(&cat).to_vec());
     }
 
-    /** @brief caching_sha2 응답 길이가 해시 길이와 같은지. */
     #[test]
     fn sha256_scramble_shape() {
         let scramble: Vec<u8> = (0u8..20).collect();
@@ -673,7 +598,6 @@ mod tests {
         assert_eq!(r.len(), 32);
     }
 
-    /** @brief 떨어져 있는 스크램블 두 조각이 하나로 이어지고 플러그인 이름이 읽히는지. */
     #[test]
     fn handshake_v10_parse() {
         let mut p = vec![0x0a];
@@ -698,16 +622,12 @@ mod tests {
     }
 }
 
-/**
- * @brief 와이어 파서 패닉 스윕.
- * @details 이 파서들은 크레이트 내부라 통합 스윕이 닿지 못한다. 그래서 여기서 직접 흔든다.
- */
+/// These parsers are crate-private, out of reach of the integration sweep, so they are fuzzed here.
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
     use crate::fuzzutil::{havoc, Rng};
 
-    /** @brief 핸드셰이크와 행 파서가 어떤 바이트에도 패닉하지 않는지. */
     #[test]
     fn wire_parsers_never_panic_on_malformed_bytes() {
         let mut handshake = vec![10u8];

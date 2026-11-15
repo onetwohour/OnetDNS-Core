@@ -1,46 +1,35 @@
-/*!
- * @brief 세션 재개.
- *
- * @details 티켓에 재개 상태를 담아 클라이언트에게 준다. 서버는 상태를 기억하지 않고
- *          티켓을 열어 복원한다.
- * @warning 티켓은 암호화되고 인증된다. 그러지 않으면 클라이언트가 재개 상태를 지어내
- *          이쪽이 그것을 믿게 된다.
- */
+//! Session resumption: the resumption state goes into a ticket given to the client, and the server
+//! restores it by opening the ticket instead of remembering it.
+//!
+//! Tickets are encrypted and authenticated; otherwise a client could make up resumption state and
+//! this side would trust it.
 
 use crate::sys::fill_random;
 
-/** @brief TLS 1.3이 허용하는 세션 티켓 최대 수명, 7일. */
+/// Seven days, the most TLS 1.3 allows.
 pub const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/** @brief 클라이언트가 가지고 있는 재개 정보. */
 pub struct TlsSession {
-    /** @brief 이 세션을 발급한 서버 이름. 다른 SNI에 재사용하지 않는다. */
+    /// Not reused for another SNI.
     pub server_name: String,
 
-    /** @brief 이 세션의 암호 스위트. */
     pub suite: u16,
 
-    /** @brief 다시 붙을 때 쓸 비밀. */
     pub psk: Vec<u8>,
 
-    /** @brief 서버에 되돌려줄 티켓. */
     pub ticket: Vec<u8>,
-    /** @brief 이 티켓이 유효한 기간. */
+    /// Added to hide the age.
     pub lifetime_secs: u32,
-    /** @brief 나이를 가리는 데 더할 값. */
     pub age_add: u32,
 
-    /** @brief 왕복 없이 보낼 수 있는 자료 크기. */
     pub max_early_data: u32,
 
-    /** @brief 이 세션에서 협상했던 ALPN. */
     pub alpn: Option<Vec<u8>>,
 
-    /** @brief 이 세션에서 상대가 알렸던 전송 설정. */
     pub server_transport_params: Vec<u8>,
 
-    /** @brief 이 티켓을 받은 시각. 나이를 측정하는 기준이다. */
+    /// The age is measured from here.
     pub obtained_at_ms: u64,
 }
 
@@ -52,7 +41,7 @@ impl Drop for TlsSession {
 }
 
 impl TlsSession {
-    /** @brief 티켓 나이를 가린 값. 그대로 보내면 연결을 추적당한다. */
+    /// Sent as is, the age would let connections be tracked.
     pub fn obfuscated_age(&self, now_ms: u64) -> u32 {
         let age = now_ms
             .saturating_sub(self.obtained_at_ms)
@@ -60,41 +49,30 @@ impl TlsSession {
         age.wrapping_add(self.age_add)
     }
 
-    /** @brief 아직 쓸 수 있는지. */
     pub fn is_fresh(&self, now_ms: u64) -> bool {
         let age_secs = now_ms.saturating_sub(self.obtained_at_ms) / 1000;
         age_secs < self.lifetime_secs.min(MAX_TICKET_LIFETIME_SECS) as u64
     }
 
-    /**
-     * @brief 이 세션의 PSK 에 묶인 해시. 모르는 스위트면 없다.
-     * @details RFC 8446 은 해시가 같은 스위트라면 다른 스위트로도 PSK 를 쓰게 한다.
-     */
+    /// None for an unknown suite. RFC 8446 lets a PSK be used with another suite that has the same
+    /// hash.
     pub(crate) fn hash(&self) -> Option<crate::keyschedule::Hash> {
         crate::keyschedule::suite_params(self.suite).map(|(hash, _)| hash)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/** @brief 티켓 안에 담기는 재개 상태. */
+/// Resumption state carried inside a ticket.
 pub struct ResumptionState {
-    /** @brief 티켓을 발급한 SNI. */
     pub server_name: Option<String>,
 
-    /** @brief 이 세션의 암호 스위트. */
     pub suite: u16,
-    /** @brief 다시 붙을 때 쓸 비밀. */
     pub psk: Vec<u8>,
-    /** @brief 이 세션에서 협상했던 ALPN. */
     pub alpn: Option<Vec<u8>>,
 
-    /** @brief 이 티켓을 낸 시각. */
     pub issued_ms: u64,
-    /** @brief 나이를 가리는 데 더할 값. */
     pub age_add: u32,
-    /** @brief 이 티켓이 유효한 기간. */
     pub lifetime_secs: u32,
-    /** @brief 왕복 없이 받아들일 자료 크기. */
     pub max_early_data: u32,
 }
 
@@ -106,12 +84,11 @@ impl Drop for ResumptionState {
 }
 
 impl ResumptionState {
-    /** @brief 이 티켓의 PSK 에 묶인 해시. TlsSession::hash 와 같은 규칙이다. */
+    /// Same rule as `TlsSession::hash`.
     pub(crate) fn hash(&self) -> Option<crate::keyschedule::Hash> {
         crate::keyschedule::suite_params(self.suite).map(|(hash, _)| hash)
     }
 
-    /** @brief 상태를 바이트로. */
     fn serialize(&self) -> Option<Vec<u8>> {
         if self.psk.is_empty() || self.psk.len() > u8::MAX as usize {
             return None;
@@ -153,7 +130,6 @@ impl ResumptionState {
         Some(v)
     }
 
-    /** @brief 바이트에서 상태를 읽는다. 길이가 어긋나면 없다. */
     fn deserialize(b: &[u8]) -> Option<ResumptionState> {
         let suite = u16::from_be_bytes([*b.first()?, *b.get(1)?]);
         let mut i = 2usize;
@@ -206,14 +182,11 @@ impl ResumptionState {
     }
 }
 
-/** @brief 티켓을 암호화하고 복호화하는 것. 비밀 하나를 가지고 있다. */
 pub struct Ticketer {
-    /** @brief 티켓을 암호화하고 복호화하는 키. */
     key: [u8; 32],
 }
 
 impl Ticketer {
-    /** @brief 새 비밀로 만든다. */
     pub fn new() -> Self {
         let mut key = [0u8; 32];
         fill_random(&mut key);
@@ -223,7 +196,6 @@ impl Ticketer {
         ticketer
     }
 
-    /** @brief 주어진 비밀로 만든다. */
     pub fn from_key(mut key: [u8; 32]) -> Self {
         let ticketer = Ticketer { key };
         use zeroize::Zeroize;
@@ -231,7 +203,6 @@ impl Ticketer {
         ticketer
     }
 
-    /** @brief 상태를 티켓으로 봉한다. */
     pub fn seal(&self, state: &ResumptionState) -> Option<Vec<u8>> {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         let cipher = aes_gcm::Aes256Gcm::new_from_slice(&self.key)
@@ -254,10 +225,7 @@ impl Ticketer {
         Some(out)
     }
 
-    /**
-     * @brief 티켓을 열어 상태를 되찾는다.
-     * @warning 인증이 맞지 않으면 없다. 다른 서버가 만든 티켓이나 조작된 티켓이 여기서 걸린다.
-     */
+    /// None when authentication fails; tickets from another server or tampered ones stop here.
     pub fn open(&self, ticket: &[u8]) -> Option<ResumptionState> {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         if ticket.len() < 12 + 16 {
@@ -289,13 +257,11 @@ impl Drop for Ticketer {
 }
 
 impl Default for Ticketer {
-    /** @brief 새 비밀로 만든다. */
     fn default() -> Self {
         Self::new()
     }
 }
 
-/** @brief 현재 Unix 밀리초. */
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -304,11 +270,9 @@ pub fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
-/** @brief 티켓 왕복과, 조작되거나 남의 티켓 거부. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 재개 상태. */
     fn sample_state() -> ResumptionState {
         ResumptionState {
             server_name: Some("dns.example".to_string()),
@@ -323,7 +287,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 암호화하고 복호화하는 왕복. */
     fn ticket_seal_open_roundtrip() {
         let t = Ticketer::new();
         let st = sample_state();
@@ -332,7 +295,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조작된 티켓과 남의 티켓을 거부하는지. */
     fn tampered_or_foreign_ticket_rejected() {
         let t = Ticketer::new();
         let mut ticket = t.seal(&sample_state()).unwrap();
@@ -347,7 +309,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 프로토콜이 없는 상태도 왕복하는지. */
     fn state_alpn_none_roundtrip() {
         let t = Ticketer::from_key([9u8; 32]);
         let mut st = sample_state();
@@ -357,7 +318,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 길이가 어긋난 상태를 거부하는지. */
     fn oversized_or_empty_length_prefixed_state_is_rejected() {
         let t = Ticketer::from_key([9u8; 32]);
         let mut st = sample_state();
@@ -384,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 가린 나이가 되감겨도 계산이 맞는지. */
     fn obfuscated_age_wraps() {
         let s = TlsSession {
             server_name: "dns.example".to_string(),
@@ -405,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버가 더 긴 수명을 적어도 클라이언트가 7일 뒤 재사용하지 않는지. */
+    /// Even when the server states a longer lifetime.
     fn ticket_freshness_never_exceeds_seven_days() {
         let mut session = TlsSession {
             server_name: "dns.example".to_string(),

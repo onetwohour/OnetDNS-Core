@@ -1,10 +1,7 @@
-/*!
- * @brief DNS 이름: 라벨 저장, 파싱, 압축 인코딩.
- *
- * @details 이름은 String이 아니라 라벨 옥텟을 그대로 담은 와이어 형태로 보관한다.
- *          DNS 라벨은 UTF-8일 의무가 없고, 문자열로 왕복시키면 0xFF 같은 옥텟이 손상되어
- *          서로 다른 이름이 같아 보이게 된다. 대소문자는 비교할 때만 무시한다.
- */
+//! DNS names: label storage, parsing, and compressed encoding. A name is stored as its wire-format
+//! label octets, not as a String: labels need not be UTF-8, and a round trip through a string would
+//! corrupt octets like 0xFF and make different names look equal. Case is ignored only when
+//! comparing.
 
 use std::borrow::Cow;
 use std::collections::{hash_map::RandomState, HashMap};
@@ -14,61 +11,45 @@ use std::sync::{Arc, LazyLock};
 use crate::wire::{Reader, Writer};
 use crate::ProtoError;
 
-/**
- * @brief 이름 하나를 파싱하며 따라갈 수 있는 압축 포인터 개수.
- *
- * @warning 상한이 없으면 서로를 가리키는 포인터로 무한 루프에 빠진다. 뒤쪽만 가리키게
- *          강제해도 체인 길이 자체는 제한해야 확장 비용이 유계가 된다.
- */
+/// Compression pointers one name may follow. Without a cap, pointers aiming at each other loop
+/// forever; even with backward-only pointers, the chain length must be bounded to bound expansion
+/// cost.
 const MAX_JUMPS: usize = 20;
 
-/** @brief RFC 1035가 정한 이름 전체 길이 상한. 길이 옥텟과 루트 라벨을 포함한 값이다. */
+/// Including length octets and the root label (RFC 1035).
 const MAX_NAME_LEN: usize = 255;
 
-/**
- * @brief NameMap::clear가 재사용을 위해 남겨 두는 항목 수의 상한.
- *
- * @details 압축 상태는 메시지마다 버려지는데, 병적으로 큰 메시지 하나가 남긴 용량을 그대로
- *          가지고 있으면 그 메모리가 워커 수명 내내 묶인다. 상한을 넘긴 경우에만 전체를 버린다.
- */
+/// Entries NameMap::clear keeps for reuse. Compression state is discarded per message; keeping the
+/// capacity left by one pathological message would tie up that memory for the worker's lifetime, so
+/// everything is dropped past this.
 const MAX_RETAINED_NAME_ENTRIES: usize = 64;
 
-/** @brief 루트 이름의 공유 와이어. 모든 루트 Name이 이 하나를 가리켜 할당을 없앤다. */
+/// Every root Name shares this, so the root never allocates.
 static ROOT_WIRE: LazyLock<Arc<[u8]>> = LazyLock::new(|| Arc::from([0u8]));
 
-/**
- * @brief 이름의 라벨을 앞뒤 양방향으로 훑는 반복자. 복사하지 않는다.
- *
- * @details front/back은 와이어 안의 바이트 오프셋이다. 길이 접두사 구조라 뒤에서
- *          한 칸 뒤로 가려면 앞에서부터 다시 훑어야 한다. next_back이 선형인 이유다.
- * @invariant back은 루트 라벨의 0 옥텟을 제외한 위치를 가리킨다.
- */
+/// Walks labels from either end without copying. `front` and `back` are byte offsets into the wire.
+/// Labels are length-prefixed, so stepping back one label means scanning from the front again,
+/// which is why next_back is linear.
+///
+/// `back` excludes the root label's 0 octet.
 #[derive(Debug, Clone, Copy)]
 pub struct Labels<'a> {
-    /** @brief 이름이 담긴 바이트. */
     wire: &'a [u8],
-    /** @brief 앞에서부터 볼 위치. */
     front: usize,
-    /** @brief 뒤에서부터 볼 위치. */
     back: usize,
 }
 
 impl<'a> Labels<'a> {
-    /** @brief 현재 위치를 그대로 복제한 독립 반복자. 원본은 소비되지 않는다. */
     pub fn iter(&self) -> Self {
         *self
     }
 
-    /** @brief 가장 왼쪽 라벨. 와일드카드·단일 라벨 판정에 쓴다. */
     pub fn first(&self) -> Option<&'a [u8]> {
         let mut labels = *self;
         labels.next()
     }
 
-    /**
-     * @brief 남은 라벨 개수.
-     * @note 저장 구조가 길이 접두사 체인이라 O(라벨 수)로 세어야 한다. 상수 시간이 아니다.
-     */
+    /// Counts in O(labels): the storage is a chain of length prefixes.
     pub fn len(&self) -> usize {
         let mut count = 0;
         let mut cursor = self.front;
@@ -82,17 +63,14 @@ impl<'a> Labels<'a> {
         count
     }
 
-    /** @brief 남은 라벨이 없는지. 루트 이름이면 처음부터 참이다. */
     pub fn is_empty(&self) -> bool {
         self.front >= self.back
     }
 }
 
 impl<'a> Iterator for Labels<'a> {
-    /** @brief 조각 하나. */
     type Item = &'a [u8];
 
-    /** @brief 다음 조각. */
     fn next(&mut self) -> Option<Self::Item> {
         if self.front >= self.back {
             return None;
@@ -108,14 +86,12 @@ impl<'a> Iterator for Labels<'a> {
         Some(label)
     }
 
-    /** @brief 남은 조각 수. */
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, Some(self.back.saturating_sub(self.front) / 2))
     }
 }
 
 impl PartialEq for Labels<'_> {
-    /** @brief 조각들이 같은지. */
     fn eq(&self, other: &Self) -> bool {
         self.iter().eq(other.iter())
     }
@@ -124,7 +100,6 @@ impl PartialEq for Labels<'_> {
 impl Eq for Labels<'_> {}
 
 impl<'a> DoubleEndedIterator for Labels<'a> {
-    /** @brief 뒤에서부터 다음 조각. */
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front >= self.back {
             return None;
@@ -141,43 +116,38 @@ impl<'a> DoubleEndedIterator for Labels<'a> {
     }
 }
 
-/**
- * @brief DNS 이름. 압축을 푼 와이어 형태를 공유 소유로 담는다.
- *
- * @details Arc<[u8]>라 복제가 참조 증가로 끝난다. 이름은 응답 조립과 캐시 키 경로에서
- *          수없이 복제되므로 이 선택이 핫패스 할당을 지운다.
- * @warning 파생된 PartialEq는 대소문자를 구분한다. DNS 비교 의미가 필요하면
- *          eq_ignore_case를 써야 한다. Hash와 Ord도 같은 와이어 바이트를 보므로
- *          해시 맵의 키로 쓰면 대소문자가 다른 이름은 다른 항목이 된다.
- * @invariant wire는 항상 0 옥텟으로 끝나며 전체 길이가 MAX_NAME_LEN 이하다.
- */
+/// Uncompressed wire form in shared ownership. `Arc<[u8]>` makes a clone a reference count
+/// increment; names are cloned constantly in response assembly and cache keys, so this removes
+/// hot-path allocations.
+///
+/// The derived PartialEq is case-sensitive; use eq_ignore_case for DNS comparison. Hash and Ord see
+/// the same bytes, so as hash map keys, names differing in case are different entries.
+///
+/// `wire` always ends in a 0 octet and is at most MAX_NAME_LEN long.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Name {
-    /** @brief 이름 바이트. 복제해도 나눠 쓴다. */
     wire: Arc<[u8]>,
 }
 
 impl Default for Name {
-    /** @brief 루트 이름. */
     fn default() -> Self {
         Self::root()
     }
 }
 
 impl Name {
-    /** @brief 루트 이름 .. 전역 와이어를 공유하므로 할당하지 않는다. */
+    /// Shares the global wire, so it does not allocate.
     pub fn root() -> Self {
         Self {
             wire: Arc::clone(&ROOT_WIRE),
         }
     }
 
-    /** @brief 루트인지. 와이어가 0 옥텟 하나뿐인 것과 동치다. */
     pub fn is_root(&self) -> bool {
         self.wire.len() == 1
     }
 
-    /** @brief 왼쪽부터 라벨을 훑는 반복자. 끝의 루트 라벨은 포함하지 않는다. */
+    /// Excludes the trailing root label.
     pub fn labels(&self) -> Labels<'_> {
         Labels {
             wire: &self.wire,
@@ -186,22 +156,20 @@ impl Name {
         }
     }
 
-    /** @brief 라벨 개수. 루트는 0이다. */
+    /// 0 for the root.
     pub fn num_labels(&self) -> usize {
         self.labels().len()
     }
 
-    /**
-     * @brief 표현 문자열을 이름으로 바꾼다.
-     *
-     * @details RFC 1035가 정한 이스케이프를 푼다. 역슬래시 뒤 세 자리 십진수는 그 값의
-     *          옥텟 하나이고, 그 밖의 역슬래시 뒤 한 글자는 그 글자의 특별한 뜻을 없앤다.
-     *          이스케이프한 점은 라벨 구분자가 아니라 라벨 안의 바이트다.
-     * @warning 이것을 풀지 않으면 다른 서버가 쓴 영역 파일의 이름이 조용히 달라진다.
-     *          점을 품은 라벨 하나가 라벨 둘이 되고, 십진 이스케이프는 네 글자로 남는다.
-     * @param s 점으로 구분된 이름. 끝의 이스케이프하지 않은 . 하나는 루트 표기다.
-     * @return 빈 라벨, 63옥텟 초과 라벨, 255옥텟 초과 전체 길이는 전부 거부한다.
-     */
+    /// Parses presentation format, decoding RFC 1035 escapes: a backslash and three decimal digits
+    /// is one octet of that value, and a backslash before any other character removes its special
+    /// meaning. An escaped dot is a byte inside the label, not a separator.
+    ///
+    /// Without decoding them, names in zone files written by other servers change silently: a label
+    /// containing a dot becomes two labels, and a decimal escape stays four characters.
+    ///
+    /// One trailing unescaped dot marks the root. Empty labels, labels over 63 octets, and names
+    /// over 255 octets are refused.
     pub fn from_str(s: &str) -> Result<Self, ProtoError> {
         let bytes = s.as_bytes();
         let mut labels: Vec<Vec<u8>> = Vec::new();
@@ -257,14 +225,10 @@ impl Name {
         Self::from_labels(labels)
     }
 
-    /**
-     * @brief 영역 파일에 적을 소문자 표현. 특별한 뜻을 가진 바이트는 이스케이프한다.
-     *
-     * @details to_ascii_lower는 표시 전용이라 점이나 공백을 품은 라벨을 되돌릴 수 없다.
-     *          다시 읽을 문자열은 반드시 이쪽으로 만든다. 그러지 않으면 영역을 파일로
-     *          적었다 읽는 것만으로 이름이 달라진다.
-     * @return 끝점은 붙이지 않는다. 호출자가 절대 이름 표기를 정한다.
-     */
+    /// Lowercase form for zone files, escaping bytes with special meaning. to_ascii_lower is
+    /// display-only and cannot round-trip a label containing a dot or space; any string read back
+    /// must come from here, or writing a zone to a file and reading it back changes names. No
+    /// trailing dot; the caller decides on absolute notation.
     pub fn to_master_lower(&self) -> String {
         let mut out = String::with_capacity(self.wire.len());
         for (index, label) in self.labels().enumerate() {
@@ -285,11 +249,8 @@ impl Name {
         out
     }
 
-    /**
-     * @brief 라벨 옥텟을 직접 받아 이름을 만든다. UTF-8이 아니어도 된다.
-     * @param labels 왼쪽부터의 라벨. 각 1~63옥텟이어야 한다.
-     * @return 길이 규칙을 어기면 오류. 합계 검사는 넘침까지 확인한다.
-     */
+    /// Labels need not be UTF-8; each must be 1 to 63 octets, and the total is checked for overflow
+    /// too.
     pub fn from_labels(labels: Vec<Vec<u8>>) -> Result<Self, ProtoError> {
         let mut total = 1usize;
         for label in &labels {
@@ -312,13 +273,8 @@ impl Name {
         Ok(Self { wire: wire.into() })
     }
 
-    /**
-     * @brief 소문자로 바꾼 와이어 형태. 캐시·맵의 키로 쓴다.
-     *
-     * @details 라벨 길이 접두사를 그대로 남긴다. 점으로 잇지 않는 이유는 a.b+c와
-     *          a+b.c가 같은 키가 되어 서로 다른 이름이 충돌하기 때문이다.
-     * @note 할당한다. 핫패스에서는 canonical_key_into를 쓴다.
-     */
+    /// Lowercased wire form, for cache and map keys. Length prefixes stay: joining with dots would
+    /// make a.b+c and a+b.c the same key. Allocates; hot paths use canonical_key_into.
     pub fn canonical_key(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.wire.len());
         for label in self.labels() {
@@ -329,22 +285,15 @@ impl Name {
         out
     }
 
-    /**
-     * @brief 정규화 키를 호출자 버퍼에 쓴다. 할당하지 않는다.
-     * @param out 최소 이름 길이만큼의 버퍼. 통상 [u8; 255] 스택 배열을 넘긴다.
-     * @return 실제로 쓴 구간, 버퍼가 모자라면 None.
-     */
+    /// Writes the canonical key into `out` without allocating; usually a [u8; 255] stack array.
+    /// `None` when `out` is too small.
     pub fn canonical_key_into<'a>(&self, out: &'a mut [u8]) -> Option<&'a [u8]> {
         self.write_canonical_from(0, out)
     }
 
-    /**
-     * @brief 오른쪽 label_count개 라벨만의 정규화 키를 버퍼에 쓴다.
-     *
-     * @details 접미사 이름을 따로 만들지 않고 조상 zone 키를 얻는 경로다. QNAME 최소화와
-     *          zone 선택이 이름 하나에서 여러 접미사를 훑을 때 쓴다.
-     * @param label_count 남길 라벨 수. 실제 개수보다 크면 이름 전체가 된다.
-     */
+    /// Canonical key of the rightmost `label_count` labels, without building the suffix name. QNAME
+    /// minimization and zone selection use it to walk several suffixes of one name. A count above
+    /// the actual one gives the whole name.
     pub fn canonical_suffix_key_into<'a>(
         &self,
         label_count: usize,
@@ -359,10 +308,7 @@ impl Name {
         self.write_canonical_from(start, out)
     }
 
-    /**
-     * @brief 와이어 오프셋 start부터의 소문자 키를 버퍼에 쓰는 공통 구현.
-     * @param start 라벨 경계여야 한다. 중간을 가리키면 결과가 깨진 이름이 된다.
-     */
+    /// `start` must be a label boundary; anywhere else yields a broken name.
     fn write_canonical_from<'a>(&self, start: usize, out: &'a mut [u8]) -> Option<&'a [u8]> {
         let needed = self.wire.len().checked_sub(start)?;
         if needed > out.len() {
@@ -386,11 +332,8 @@ impl Name {
         Some(&out[..needed])
     }
 
-    /**
-     * @brief 소문자 점 표기 문자열. 끝점은 붙이지 않는다.
-     * @warning UTF-8이 아닌 라벨은 손실 변환되어 대체 문자가 된다. 표시·로그 전용이며
-     *          이 결과를 다시 이름으로 되돌리면 안 된다.
-     */
+    /// Lowercase dotted form without a trailing dot. Non-UTF-8 labels convert lossily to
+    /// replacement characters; display and logs only, never parse it back.
     pub fn to_ascii_lower(&self) -> String {
         let mut out = String::with_capacity(self.wire.len().saturating_sub(1));
         for (index, label) in self.labels().enumerate() {
@@ -402,16 +345,12 @@ impl Name {
         out
     }
 
-    /**
-     * @brief 소문자로 내린 이름.
-     *
-     * @details 파생된 PartialEq와 Hash는 대소문자를 구분하므로, 이름을 해시 맵의 키로
-     *          모을 때 이것으로 바꿔야 같은 이름이 갈라지지 않는다.
-     * @return 이미 소문자면 자기 자신을 빌려 준다. 참조계수조차 건드리지 않으려는 것이다.
-     *         집계 경로는 이름이 이미 있으면 복제 없이 계수만 올린다.
-     * @invariant 압축을 푼 와이어의 길이 옥텟은 1..=63이고 끝은 0이라, ASCII 대문자 범위
-     *            (65..=90)와 겹치지 않는다. 그래서 와이어 전체를 훑고 내려도 안전하다.
-     */
+    /// The derived PartialEq and Hash are case-sensitive, so names collected as hash map keys must
+    /// go through this, or one name splits into several. An already lowercase name is borrowed
+    /// without touching even the reference count; aggregation then only bumps a counter.
+    ///
+    /// Length octets in an uncompressed wire are 1..=63 and the end is 0, which never overlaps
+    /// ASCII uppercase (65..=90), so lowering the whole wire is safe.
     pub fn to_ascii_lower_name(&self) -> Cow<'_, Name> {
         if !self.wire.iter().any(|byte| byte.is_ascii_uppercase()) {
             return Cow::Borrowed(self);
@@ -422,10 +361,8 @@ impl Name {
         })
     }
 
-    /**
-     * @brief 오른쪽 n개 라벨로 이루어진 조상 이름.
-     * @param n 남길 라벨 수. 실제보다 크면 자기 자신의 복사본이 나온다.
-     */
+    /// Ancestor made of the rightmost `n` labels; an `n` above the actual count gives a copy of the
+    /// name.
     pub fn suffix(&self, n: usize) -> Name {
         let total = self.num_labels();
         let mut skip = total.saturating_sub(n.min(total));
@@ -439,16 +376,13 @@ impl Name {
         }
     }
 
-    /** @brief DNS 의미의 이름 비교. 라벨 옥텟을 ASCII 대소문자 무시로 비교한다. */
+    /// DNS name comparison: label octets compared ASCII case-insensitively.
     pub fn eq_ignore_case(&self, other: &Name) -> bool {
         self.wire.eq_ignore_ascii_case(&other.wire)
     }
 
-    /**
-     * @brief suffix가 이 이름의 조상인지(자기 자신 포함).
-     * @note 라벨 경계에서만 맞춘다. x.test는 test의 자손이지만 attest는 아니다.
-     *       bailiwick 판정과 zone 소속 판정이 이 성질에 기댄다.
-     */
+    /// Whether `suffix` is this name or an ancestor of it. Matches only at label boundaries: x.test
+    /// is under test, attest is not. Bailiwick and zone membership checks rely on this.
     pub fn ends_with_ignore_case(&self, suffix: &Name) -> bool {
         let own_labels = self.num_labels();
         let suffix_labels = suffix.num_labels();
@@ -462,13 +396,9 @@ impl Name {
         self.wire[start..].eq_ignore_ascii_case(&suffix.wire)
     }
 
-    /**
-     * @brief 압축 없는 와이어 바이트를 검사해 이름으로 받아들인다.
-     *
-     * @details 라벨 체인이 정확히 슬라이스 끝에서 0 옥텟으로 끝나야 한다. 잔여 바이트나
-     *          압축 포인터가 있으면 거부한다. 저장 형식에서 읽은 이름은 메시지 문맥이
-     *          없어 포인터를 풀 방법이 없기 때문이다.
-     */
+    /// Accepts uncompressed wire bytes whose label chain ends in a 0 octet exactly at the slice
+    /// end. Trailing bytes and compression pointers are refused: a name read from storage has no
+    /// message to resolve pointers against.
     pub fn from_uncompressed_wire(bytes: &[u8]) -> Option<Self> {
         if bytes.is_empty() || bytes.len() > MAX_NAME_LEN {
             return None;
@@ -494,21 +424,19 @@ impl Name {
         }
     }
 
-    /** @brief 내부 와이어를 그대로 빌려 준다. 항상 압축이 풀린 형태다. */
     pub fn as_uncompressed_wire(&self) -> &[u8] {
         &self.wire
     }
 
-    /**
-     * @brief 압축 포인터를 따라가며 이름을 읽는다.
-     *
-     * @details 포인터는 뒤쪽만 가리킬 수 있다(ptr >= pos 거부). 이것이 루프를 막는
-     *          1차 방어이고, MAX_JUMPS가 체인 길이의 2차 방어다. 확장 결과도 매 라벨마다
-     *          255옥텟 상한으로 검사한다. 짧은 메시지가 거대한 이름으로 부풀지 못하게 한다.
-     * @note 커서는 최초 점프 직전 위치의 다음으로 놓인다. 포인터를 따라간 곳이 아니라
-     *       원래 흐름을 이어야 뒤따르는 필드가 제자리에서 읽힌다.
-     * @return 루프, 예약 비트, 길이 초과, 범위 초과는 전부 오류다.
-     */
+    /// Follows compression pointers while reading a name. Pointers may only point backward (ptr >=
+    /// pos is refused), the first defense against loops; MAX_JUMPS bounds the chain as the second.
+    /// The expanded result is checked against 255 octets at every label, so a short message cannot
+    /// inflate into a huge name.
+    ///
+    /// The cursor ends after the first pointer, not where the pointers led, so the fields that
+    /// follow are read in place.
+    ///
+    /// Loops, reserved bits, overlong names, and out-of-range pointers are all errors.
     pub fn parse(r: &mut Reader) -> Result<Self, ProtoError> {
         let buf = r.buf;
         let mut wire = [0u8; MAX_NAME_LEN];
@@ -583,11 +511,8 @@ impl Name {
         })
     }
 
-    /**
-     * @brief 압축을 허용하지 않는 이름을 읽는다.
-     * @details DNSSEC 정규 형식과 일부 RDATA는 포인터를 금지한다. 0xC0 비트가 보이면
-     *          역참조하지 않고 즉시 거부한다.
-     */
+    /// DNSSEC canonical form and some RDATA forbid pointers; a set 0xC0 bit is refused without
+    /// following it.
     pub(crate) fn parse_uncompressed(r: &mut Reader) -> Result<Self, ProtoError> {
         let mut wire = [0u8; MAX_NAME_LEN];
         let mut wire_len = 0usize;
@@ -622,14 +547,10 @@ impl Name {
         }
     }
 
-    /**
-     * @brief 이름을 쓰면서 가능한 접미사를 압축 포인터로 대체한다.
-     *
-     * @details 매 라벨 경계에서 남은 접미사의 정규화 키를 조회한다. 대소문자가 달라도
-     *          같은 접미사면 압축이 걸리게 하려는 것이다.
-     * @note 포인터 오프셋은 14비트뿐이라 0x4000 이후 위치는 사전에 등록하지 않는다.
-     *       표현할 수 없는 오프셋을 넣으면 나중에 잘못된 포인터가 나간다.
-     */
+    /// Replaces a known suffix with a compression pointer, looking up the canonical key of the
+    /// remaining suffix at every label boundary so suffixes differing only in case still compress.
+    /// Pointer offsets have 14 bits, so positions from 0x4000 on are not recorded; an offset that
+    /// cannot be expressed would later produce a wrong pointer.
     pub fn encode(&self, w: &mut Writer) {
         let mut key_buf = [0u8; MAX_NAME_LEN];
         let Some(key) = self.canonical_key_into(&mut key_buf) else {
@@ -653,17 +574,14 @@ impl Name {
         w.push_u8(0);
     }
 
-    /**
-     * @brief 압축 없이 이름을 그대로 쓴다.
-     * @details 서명 대상 정규 형식과, 재직렬화 시 압축이 깨질 수 있는 RDATA에 쓴다.
-     */
+    /// For the canonical form under signatures, and for RDATA where compression could break on
+    /// reserialization.
     pub(crate) fn encode_uncompressed(&self, w: &mut Writer) {
         w.push_bytes(&self.wire);
     }
 }
 
 impl std::fmt::Display for Name {
-    /** @brief 사람이 읽을 표기. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_root() {
             return write!(f, ".");
@@ -675,52 +593,36 @@ impl std::fmt::Display for Name {
     }
 }
 
-/**
- * @brief 인코딩 중인 메시지의 이름 압축 오프셋 테이블.
- *
- * @details 항목은 아레나(entries)에 쌓고 heads는 해시 → 체인 머리 인덱스만 가지고 있다.
- *          active가 논리적 길이라, clear가 항목의 Vec 할당을 그대로 재사용한다.
- *          메시지마다 테이블을 새로 만들면 응답 하나마다 할당이 붙는다.
- * @invariant 오프셋은 14비트로 표현 가능한 값(< 0x4000)만 들어온다. 호출자가 보장한다.
- */
+/// Compression offset table of the message being encoded. Entries pile up in the `entries` arena
+/// and `heads` maps a hash to the head of its chain. `active` is the logical length, so clear
+/// reuses the entry allocations; a new table per message would add an allocation to every response.
+///
+/// Offsets are always below 0x4000, expressible in 14 bits; callers guarantee this.
 #[derive(Default)]
 pub(crate) struct NameMap {
-    /** @brief 해시값에서 항목으로 가는 인덱스. */
     heads: HashMap<u64, usize, BuildHasherDefault<IdentityHasher>>,
-    /** @brief 이미 적어 둔 이름들과 그 위치. */
     entries: Vec<NameMapEntry>,
-    /** @brief 지금 쓰이고 있는 항목 수. */
     active: usize,
-    /** @brief 해시 함수. */
     hash_builder: RandomState,
 }
 
-/** @brief 압축 테이블의 한 항목. next는 해시 충돌 체인의 다음 아레나 인덱스다. */
+/// `next` is the next arena index in the hash collision chain.
 struct NameMapEntry {
-    /** @brief 적어 둔 이름. */
     key: Vec<u8>,
-    /** @brief 그 이름이 놓인 위치. 압축 지시자가 여기를 가리킨다. */
     offset: u16,
-    /** @brief 같은 위치로 몰린 다음 항목. */
     next: Option<usize>,
 }
 
-/**
- * @brief 이미 해시된 값을 그대로 통과시키는 해셔.
- *
- * @details 키 해싱은 hash_builder(무작위 시드)가 한 번만 수행하고, 맵은 그 u64를 재해싱
- *          없이 쓴다. 무작위 시드는 그대로 유지되므로 충돌 유도 공격 내성은 잃지 않는다.
- */
+/// Passes an already hashed value through. hash_builder, randomly seeded, hashes each key once and
+/// the map uses that u64 without rehashing; the random seed keeps resistance to collision attacks.
 #[derive(Default)]
 struct IdentityHasher(u64);
 
 impl Hasher for IdentityHasher {
-    /** @brief 지금까지 섞은 값. */
     fn finish(&self) -> u64 {
         self.0
     }
 
-    /** @brief 바이트열을 섞어 넣는다. */
     fn write(&mut self, bytes: &[u8]) {
         let mut value = 0u64;
         for (shift, byte) in bytes.iter().take(8).enumerate() {
@@ -729,25 +631,20 @@ impl Hasher for IdentityHasher {
         self.0 = value;
     }
 
-    /** @brief 64비트 수를 섞어 넣는다. */
     fn write_u64(&mut self, value: u64) {
         self.0 = value;
     }
 }
 
 impl NameMap {
-    /** @brief 무작위 시드 해셔로 키 해시를 구한다. */
     fn hash(&self, key: &[u8]) -> u64 {
         let mut hasher = self.hash_builder.build_hasher();
         hasher.write(key);
         hasher.finish()
     }
 
-    /**
-     * @brief 이 접미사 키가 이미 나온 적 있으면 그 오프셋을 준다.
-     * @note 해시가 같아도 키 전체를 비교한다. 충돌 하나가 잘못된 포인터로 이어지면 응답이
-     *       엉뚱한 이름을 담게 된다.
-     */
+    /// Compares the whole key even when hashes match: one collision turning into a wrong pointer
+    /// would put the wrong name in the response.
     pub(crate) fn get(&self, key: &[u8]) -> Option<u16> {
         let mut current = self.heads.get(&self.hash(key)).copied();
         while let Some(index) = current {
@@ -760,10 +657,7 @@ impl NameMap {
         None
     }
 
-    /**
-     * @brief 접미사 키의 오프셋을 등록한다.
-     * @details 이미 쓰인 아레나 슬롯이 있으면 그 Vec을 비워 다시 채운다. 할당 대신 재사용.
-     */
+    /// Reuses the Vec of a used arena slot instead of allocating.
     pub(crate) fn insert(&mut self, key: &[u8], offset: u16) {
         let hash = self.hash(key);
         let next = self.heads.insert(hash, self.active);
@@ -782,11 +676,8 @@ impl NameMap {
         self.active += 1;
     }
 
-    /**
-     * @brief 다음 메시지를 위해 테이블을 비운다.
-     * @details 보통은 인덱스만 비워 아레나를 재사용하지만, 병적으로 커진 경우에는 전부
-     *          버려 워커가 그 메모리를 영구 점유하지 않게 한다.
-     */
+    /// Usually only the index is cleared so the arena is reused; a pathologically grown table is
+    /// dropped entirely, so the worker does not hold that memory forever.
     pub(crate) fn clear(&mut self) {
         if self.entries.len() > MAX_RETAINED_NAME_ENTRIES {
             self.entries = Vec::new();
@@ -797,46 +688,40 @@ impl NameMap {
         self.active = 0;
     }
 
-    /** @brief 이번 메시지에서 등록된 이름이 아직 없는지. */
     pub(crate) fn is_empty(&self) -> bool {
         self.active == 0
     }
 }
 
 #[cfg(test)]
-/** @brief 압축 지시자, 길이 상한, 그리고 원래 바이트가 보존되는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /**
-     * @brief RFC 1035의 이스케이프를 풀고 다시 적는지.
-     *
-     * @details 풀지 않으면 다른 서버가 쓴 영역 파일의 이름이 조용히 달라진다. 점을 품은
-     *          라벨 하나가 라벨 둘이 되고, 십진 이스케이프는 네 글자로 남는다. 적는 쪽도
-     *          같이 맞아야 파일로 내보냈다 읽는 것만으로 이름이 바뀌지 않는다.
-     */
+    /// Without decoding, names in zone files from other servers change silently: a label containing
+    /// a dot becomes two, and a decimal escape stays four characters. The writer must match too, so
+    /// exporting to a file and reading back does not change names.
     fn escapes_in_names_are_decoded_and_written_back() {
-        /* \X 는 그 글자의 특별한 뜻을 없앤다. 점을 품은 라벨 하나다. */
+        // \X removes the character's special meaning: one label containing a dot.
         let dotted = Name::from_str(r"a\.b.example").unwrap();
         let labels: Vec<&[u8]> = dotted.labels().collect();
         assert_eq!(labels, vec![b"a.b".as_slice(), b"example".as_slice()]);
 
-        /* \DDD 는 십진수가 가리키는 옥텟 하나다. 065는 A다. */
+        // \DDD is the octet the decimal number names; 065 is A.
         let decimal = Name::from_str(r"esc\065ape.example").unwrap();
         let labels: Vec<&[u8]> = decimal.labels().collect();
         assert_eq!(labels[0], b"escAape".as_slice());
 
-        /* 공백도 십진 이스케이프로 적는다. */
+        // A space is written as a decimal escape too.
         let spaced = Name::from_str(r"sp\032ace.example").unwrap();
         assert_eq!(spaced.labels().next().unwrap(), b"sp ace".as_slice());
 
-        /* 적는 쪽이 다시 이스케이프해야 왕복한다. */
+        // The writer must escape again for a round trip.
         for name in [r"a\.b.example", r"esc\065ape.example", r"sp\032ace.example"] {
             let parsed = Name::from_str(name).unwrap();
             let written = parsed.to_master_lower();
             let again = Name::from_str(&written).unwrap();
-            /* 적는 쪽이 소문자로 내리므로 대소문자는 접고 본다. DNS에서 같은 이름이다. */
+            // The writer lowercases, so compare case-insensitively; in DNS these are the same name.
             assert!(
                 parsed.eq_ignore_case(&again),
                 "{name} 이 왕복하지 않습니다: {written}"
@@ -848,7 +733,7 @@ mod tests {
             );
         }
 
-        /* 이스케이프하지 않은 끝점만 루트 표기다. */
+        // Only an unescaped trailing dot marks the root.
         assert_eq!(
             Name::from_str("example.").unwrap(),
             Name::from_str("example").unwrap()
@@ -863,7 +748,7 @@ mod tests {
             "255를 넘는 십진값은 거부한다"
         );
 
-        /* 평범한 이름은 그대로다. */
+        // Plain names come out unchanged.
         assert_eq!(
             Name::from_str("www.example.com").unwrap().to_master_lower(),
             "www.example.com"
@@ -871,7 +756,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적었다 읽으면 같은지. */
     fn roundtrip_simple() {
         let n = Name::from_str("www.example.com").unwrap();
         let mut w = Writer::new();
@@ -885,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 복제해도 조각 저장소를 나눠 쓰는지. 매번 복사하면 이름 하나마다 할당이 는다. */
+    /// Copying every time would allocate per name.
     fn clone_shares_immutable_label_storage() {
         let name = Name::from_str("www.example.com").unwrap();
         let cloned = name.clone();
@@ -895,7 +779,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이어진 바이트에서도 조각을 제대로 보는지. */
     fn contiguous_wire_preserves_label_views_and_reverse_iteration() {
         let name = Name::from_labels(vec![b"WwW".to_vec(), vec![0xff], b"TEST".to_vec()]).unwrap();
 
@@ -917,7 +800,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 압축 지시자를 따라가는지. */
     fn compression_pointer() {
         let base = Name::from_str("example.com").unwrap();
         let sub = Name::from_str("www.example.com").unwrap();
@@ -935,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 앞을 가리키는 지시자를 거부하는지. 허용하면 순환을 만들어 무한히 돌게 할 수 있다. */
+    /// Allowing it would let a loop spin forever.
     fn rejects_forward_pointer_loop() {
         let buf = [0xC0u8, 0x00];
         let mut r = Reader::new(&buf);
@@ -943,7 +825,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트 이름. */
     fn root_name() {
         let n = Name::root();
         let mut w = Writer::new();
@@ -952,7 +833,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 루트 이름이 저장소를 새로 잡지 않는지. */
     fn parsed_root_names_share_the_global_storage() {
         let mut compressed_reader = Reader::new(&[0]);
         let compressed = Name::parse(&mut compressed_reader).unwrap();
@@ -967,7 +847,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 비교용 키가 조각 경계와 원래 바이트를 지키는지. */
     fn canonical_key_preserves_label_boundaries_and_raw_octets() {
         let a = Name::from_labels(vec![b"a.b".to_vec(), b"c".to_vec()]).unwrap();
         let b = Name::from_labels(vec![b"a".to_vec(), b"b.c".to_vec()]).unwrap();
@@ -979,7 +858,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빌려 만든 키와 소유한 키가 같은지. */
     fn borrowed_canonical_keys_match_owned_keys() {
         let name = Name::from_labels(vec![b"WWW".to_vec(), vec![0xff], b"TEST".to_vec()]).unwrap();
         let mut key = [0u8; 255];
@@ -995,7 +873,6 @@ mod tests {
         );
     }
 
-    /** @brief 지시자를 길게 이은 테스트용 바이트열. */
     fn backward_pointer_chain(count: usize) -> (Vec<u8>, usize) {
         let mut wire = vec![0u8];
         for index in 0..count {
@@ -1012,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지시자를 따라가는 횟수에 상한이 있는지. 없으면 짧은 패킷으로 오래 돌게 만든다. */
+    /// Without a cap, a short packet keeps the parser busy.
     fn wire_parse_bounds_pointer_jumps() {
         for count in [1usize, 20] {
             let (wire, last) = backward_pointer_chain(count);
@@ -1034,7 +911,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 펼친 이름 길이에 상한이 있는지. */
     fn wire_parse_bounds_expanded_name_length() {
         let mut wire = Vec::new();
 
@@ -1061,7 +937,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각으로 만들 때도 길이 상한을 지키는지. */
     fn from_labels_enforces_wire_limits() {
         assert!(Name::from_labels(vec![vec![]]).is_err());
         assert!(Name::from_labels(vec![vec![b'a'; 64]]).is_err());
@@ -1069,7 +944,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝의 점이 여럿이면 거부하는지. */
     fn from_str_rejects_multiple_trailing_root_labels() {
         assert!(Name::from_str("example..").is_err());
         assert!(Name::from_str("..").is_err());
@@ -1081,7 +955,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 소문자 접기가 키를 하나로 모으고, 이미 소문자면 할당하지 않는지. */
     fn to_ascii_lower_name_folds_case_and_shares_when_already_lower() {
         use std::collections::HashSet;
 
@@ -1104,21 +977,19 @@ mod tests {
             .collect();
         assert_eq!(folded.len(), 1, "소문자로 바꾼 뒤에는 키가 하나여야 합니다");
 
-        /* 이미 소문자면 빌려 준다. 집계 경로가 질의마다 참조계수조차 건드리지 않게 한다. */
+        // Borrowed when already lowercase, so aggregation does not touch even the reference count
+        // per query.
         assert!(matches!(lower.to_ascii_lower_name(), Cow::Borrowed(_)));
         assert!(matches!(mixed.to_ascii_lower_name(), Cow::Owned(_)));
 
-        /*
-         * 길이 옥텟이 대문자 범위와 겹치지 않는다는 전제를 라벨 길이 65로 넘겨볼 수 없으므로
-         * 상한인 63으로 확인한다.
-         */
+        // A label length of 65 cannot be built to test that length octets never overlap uppercase,
+        // so check the maximum, 63.
         let long = Name::from_labels(vec![vec![b'A'; 63]]).unwrap();
         assert_eq!(long.to_ascii_lower_name().to_ascii_lower(), "a".repeat(63));
         assert_eq!(long.to_ascii_lower_name().num_labels(), 1);
     }
 
     #[test]
-    /** @brief 비울 때 크게 자란 내부 상태도 함께 놓아주는지. */
     fn name_map_clear_discards_pathological_retained_state() {
         let mut names = NameMap::default();
         for index in 0..1024u16 {

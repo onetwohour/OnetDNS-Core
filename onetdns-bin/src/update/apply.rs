@@ -1,9 +1,6 @@
-/*!
- * @brief 검증한 실행 파일로 설치 경로를 맞바꾼다.
- *
- * @details 운영자가 지시한 되돌리기도 .previous 를 원본으로 삼아 같은 절차를 밟는다. 여기서는
- *          맞바꾸기까지만 하고, 새 버전을 띄우는 일은 호출자가 실행 방식에 맞춰 한다.
- */
+//! Swaps the verified executable into the install path. An operator rollback runs the same steps
+//! with .previous as the source. This only swaps; the caller starts the new version in whatever way
+//! the server runs.
 
 use std::io::Read;
 use std::path::Path;
@@ -15,18 +12,17 @@ use super::install::{self, Install, UpdateLock};
 use super::record::{Record, StartupAction, State};
 use super::VERSION;
 
-/** @brief 새 실행 파일의 --version 을 기다리는 시간. */
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
-/** @brief 새 실행 파일의 설정 검사를 기다리는 시간. 영역 원본 데이터베이스에 붙어 보는 시간이 든다. */
+/// Long enough to connect to zone source databases.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
-/** @brief 점검 출력 가운데 운영자에게 보이는 상한. */
+/// Check output shown to the operator is cut here.
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
-/** @brief 점검 프로세스가 끝났는지 확인하는 간격. */
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-/** @brief 점검 프로세스가 끝난 뒤 출력 읽기가 끝나기를 기다리는 시간. 손자 프로세스가 파이프를 쥐고 있으면 이만큼만 기다린다. */
+/// How long to keep reading output after the check exits, in case a grandchild holds the pipe.
 const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
-/** @brief 띄우지 못한 새 버전을 되돌릴 때 잠금을 기다리는 시간. 방금 적용한 프로세스가 놓은 뒤다. */
+/// Lock wait when undoing a new version that failed to start, once the process that applied it lets
+/// go.
 const UNDO_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 const _: () = assert!(
@@ -35,20 +31,15 @@ const _: () = assert!(
 );
 
 #[derive(Debug)]
-/** @brief 맞바꾼 결과. */
 pub(crate) struct Swapped {
-    /** @brief 바꾸기 전 버전. */
     pub(crate) from: String,
-    /** @brief 설치한 버전. */
     pub(crate) to: String,
 }
 
-/**
- * @brief 지금 적용할 수 있는지 내려받기 전에 본다.
- * @details 잠금을 잡아 보고 바로 놓는다. 설치 디렉터리에 쓸 수 없거나 앞선 업데이트의 기동이 끝나지
- *          않았으면 실행 파일을 받기 전에 거절한다. 내려받는 동안에는 잠금을 쥐지 않는다. 그동안
- *          시작하는 서버가 잠금을 기다리지 않게 하려는 것이고, 적용할 때 다시 잡는다.
- */
+/// Checked before the download: takes the lock and releases it at once. A read-only install
+/// directory or an unfinished earlier update fails here, before the executable is fetched. The lock
+/// is not held during the download, so a server starting meanwhile does not wait for it; applying
+/// takes it again.
 pub(crate) fn ready_to_apply() -> Result<(), String> {
     let install = install::current()?;
     let _lock = install
@@ -57,13 +48,9 @@ pub(crate) fn ready_to_apply() -> Result<(), String> {
     refuse_unfinished(install)
 }
 
-/**
- * @brief 서명한 매니페스트로 검증한 실행 파일을 설치 경로에 맞바꿔 넣는다.
- * @param executable 내려받아 크기와 해시를 확인한 실행 파일.
- * @param sha256 매니페스트에 적힌 해시. 디스크에 쓴 파일을 다시 읽어 이것과 맞댄다.
- * @param version 매니페스트의 버전.
- * @param config 서버가 쓰는 설정 파일. 새 버전이 이 설정을 받아들이는지 맞바꾸기 전에 검사한다.
- */
+/// `executable` has been size- and hash-checked against the manifest; the written file is read back
+/// and compared with `sha256` again. Before the swap, the new binary must accept `config`, the
+/// server's config file.
 pub(crate) fn apply(
     executable: &[u8],
     sha256: &[u8; 32],
@@ -104,25 +91,18 @@ pub(crate) fn apply(
     swap(install, &lock, pending).inspect_err(|_| install.discard_staged(&lock))
 }
 
-/** @brief 이 버전으로 확정된 업데이트가 없을 때의 오류. */
 const NOTHING_TO_ROLL_BACK: &str = "There is no confirmed update to go back from";
 
-/**
- * @brief 되돌릴 확정 업데이트가 있는지 잠금을 잡기 전에 본다.
- * @details 기록만 읽고 실행 파일의 해시는 보지 않는다. 되돌릴 것이 없을 때 설치 디렉터리에 잠금
- *          파일을 만들지 않으려는 것이고, 해시는 잠금을 잡은 뒤에 확인한다.
- */
+/// Checked before locking, from the record alone, so nothing creates a lock file in the install
+/// directory when there is nothing to roll back. The executable hash is checked after locking.
 pub(crate) fn rollback_ready() -> Result<(), String> {
     committed(install::current()?)
         .map(|_| ())
         .ok_or_else(|| NOTHING_TO_ROLL_BACK.to_string())
 }
 
-/**
- * @brief 확정된 업데이트를 되돌려 이전 버전을 설치 경로에 넣는다.
- * @details .previous 를 .new 로 옮긴 뒤 적용과 같은 사전 점검을 거친다. 점검이나 맞바꾸기에
- *          실패하면 .previous 로 돌려놓는다. 이전 버전의 유일한 사본이기 때문이다.
- */
+/// Moves .previous to .new and runs the same preflight as an apply. If the preflight or swap fails,
+/// .previous is restored: it is the only copy of the previous version.
 pub(crate) fn rollback(config: Option<&Path>) -> Result<Swapped, String> {
     rollback_ready()?;
     let install = install::current()?;
@@ -163,11 +143,9 @@ pub(crate) fn rollback(config: Option<&Path>) -> Result<Swapped, String> {
 }
 
 #[cfg(unix)]
-/**
- * @brief 맞바꾼 새 버전을 띄우지 못했을 때 이전 실행 파일로 되돌린다.
- * @details 이 프로세스는 이전 버전이고 기록은 pending 이다. 되돌린 뒤 기록을 reverted 로 바꾼다.
- *          Windows 에는 이 프로세스가 새 버전을 직접 띄우는 경로가 없어 쓰지 않는다.
- */
+/// Restores the previous executable when the swapped-in version could not start. This process is
+/// the previous version and the record is pending; after the restore, the record becomes reverted.
+/// Unused on Windows, where this process has no way to start the new version itself.
 pub(crate) fn undo_unstarted(reason: &str) -> Result<(), String> {
     let install = install::current()?;
     let lock = install
@@ -190,11 +168,8 @@ pub(crate) fn undo_unstarted(reason: &str) -> Result<(), String> {
     }
 }
 
-/**
- * @brief 운영자가 되돌릴 수 있는 버전. 이 버전으로 확정된 업데이트가 없으면 없다.
- * @details 설치 경로와 .previous 의 해시는 확인하지 않는다. 상태를 물을 때마다 실행 파일을 읽지
- *          않으려는 것이고, 실제로 되돌릴 때 확인한다.
- */
+/// The version an operator can roll back to; None without a committed update. Hashes are not
+/// checked, so status queries do not read executables; the rollback itself checks them.
 pub(crate) fn rollback_target() -> Option<String> {
     let install = install::current().ok()?;
     committed(install)
@@ -202,7 +177,7 @@ pub(crate) fn rollback_target() -> Option<String> {
         .map(|record| record.from)
 }
 
-/** @brief 이 버전으로 확정된 업데이트 기록. 실행 파일의 해시는 보지 않는다. */
+/// Executable hashes are not checked.
 fn committed(install: &Install) -> Option<Record> {
     install
         .read_record()
@@ -212,11 +187,9 @@ fn committed(install: &Install) -> Option<Record> {
         .filter(|record| record.state == State::Committed && record.to == VERSION)
 }
 
-/**
- * @brief 앞선 업데이트의 기동이 끝나지 않았으면 거절한다.
- * @details pending 이나 trial 기록이 지금 실행 파일과 맞으면 그 업데이트가 아직 시험 중이거나
- *          시험을 기다린다. 맞지 않는 기록은 다음 시작이 지울 오래된 기록이라 덮어써도 된다.
- */
+/// A pending or trial record that matches the current executable means that update is on trial or
+/// waiting for one. A record that does not match is stale, removed by the next start, and safe to
+/// overwrite.
 fn refuse_unfinished(install: &Install) -> Result<(), String> {
     let text = install.read_record().map_err(|error| {
         format!(
@@ -245,7 +218,7 @@ fn refuse_unfinished(install: &Install) -> Result<(), String> {
     ))
 }
 
-/** @brief 되돌릴 수 있는 확정 기록. 지금 실행 파일이 그 업데이트로 설치한 것이어야 한다. */
+/// The installed executable must be the one that update installed.
 fn rollback_record(install: &Install) -> Result<Record, String> {
     let installed = install::sha256_file(install.path()).map_err(|error| {
         format!(
@@ -262,12 +235,9 @@ fn rollback_record(install: &Install) -> Result<Record, String> {
         .ok_or_else(|| NOTHING_TO_ROLL_BACK.to_string())
 }
 
-/**
- * @brief 기록을 pending 으로 쓰고 설치 경로를 맞바꾼다.
- * @details 기록을 먼저 쓴다. 맞바꾼 뒤 기록을 쓰다 죽으면 새 실행 파일이 시험 없이 뜨지만, 맞바꾸기
- *          전에 죽으면 다음 시작이 오래된 기록으로 보고 지운다. 실패하면 기록을 지우고 .new 는
- *          호출자가 정리한다.
- */
+/// The record goes first. Dying after the swap but before the record would start the new executable
+/// without a trial; dying before the swap leaves a record the next start sees as stale and removes.
+/// On failure the record is removed; the caller cleans up .new.
 fn swap(install: &Install, lock: &UpdateLock, pending: Record) -> Result<Swapped, String> {
     install.write_record(lock, &pending).map_err(|error| {
         format!(
@@ -296,10 +266,8 @@ fn swap(install: &Install, lock: &UpdateLock, pending: Record) -> Result<Swapped
     })
 }
 
-/**
- * @brief 새 실행 파일이 이 기계에서 실행되고 지금 설정을 받아들이는지 맞바꾸기 전에 확인한다.
- * @param config 서버가 쓰는 설정 파일. 없으면 서버처럼 기본 설정을 검사한다.
- */
+/// Checks that the new executable runs on this machine and accepts the current config. Without
+/// `config`, it checks the default config, as the server would.
 fn preflight(executable: &Path, version: &str, config: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new(executable);
     command.arg("--version");
@@ -325,20 +293,14 @@ fn preflight(executable: &Path, version: &str, config: Option<&Path>) -> Result<
     Ok(())
 }
 
-/** @brief 끝난 점검 프로세스. */
 struct Finished {
-    /** @brief 0 으로 끝났는지. */
     success: bool,
-    /** @brief 종료 상태를 사람이 읽는 형태로. */
     status: String,
-    /** @brief 표준 출력의 앞부분. */
     stdout: String,
-    /** @brief 표준 오류의 앞부분. */
     stderr: String,
 }
 
 impl Finished {
-    /** @brief 운영자에게 보일 요약. 종료 상태와 출력을 붙인다. */
     fn describe(&self) -> String {
         let output: Vec<&str> = [self.stderr.trim(), self.stdout.trim()]
             .into_iter()
@@ -352,11 +314,8 @@ impl Finished {
     }
 }
 
-/**
- * @brief 명령을 실행하고 제한 시간 안에 끝나기를 기다린다.
- * @details 출력은 앞부분만 보관하고 나머지는 읽어서 버린다. 읽지 않으면 파이프가 차서 점검
- *          프로세스가 끝나지 못한다.
- */
+/// Only the start of the output is kept; the rest is read and dropped, since an unread pipe fills
+/// up and the check never exits.
 fn run_bounded(mut command: Command, timeout: Duration) -> Result<Finished, String> {
     command
         .stdin(Stdio::null())
@@ -393,12 +352,8 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<Finished, Stri
     })
 }
 
-/**
- * @brief 방금 쓴 실행 파일을 띄운다.
- * @details Linux 는 쓰기로 열린 파일을 실행하지 않는다(ETXTBSY). 다른 스레드가 같은 때 프로세스를
- *          만들면 그 자식이 exec 하기 전까지 우리가 쓴 파일의 핸들을 잠시 물려받으므로, 잠깐 뒤에
- *          다시 시도한다.
- */
+/// Linux refuses to execute a file open for writing (ETXTBSY). A child forked by another thread at
+/// the same moment holds our write handle until it execs, so this retries briefly.
 pub(super) fn spawn(command: &mut Command) -> Result<Child, String> {
     #[cfg(target_os = "linux")]
     for _ in 0..20 {
@@ -416,13 +371,12 @@ pub(super) fn spawn(command: &mut Command) -> Result<Child, String> {
         .map_err(|error| format!("Could not run the new executable: {error}"))
 }
 
-/** @brief 점검 프로세스를 강제로 끝내고 거둔다. */
 fn stop(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/** @brief 파이프를 끝까지 읽는 스레드를 띄운다. 앞부분만 보관한다. */
+/// Reads the pipe to the end on its own thread, keeping only the start.
 fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
     let (sender, receiver) = mpsc::channel();
     if let Some(mut pipe) = pipe {
@@ -451,7 +405,7 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
     receiver
 }
 
-/** @brief 읽어 둔 출력. 오래 기다리지 않는다. */
+/// Waits at most OUTPUT_GRACE.
 fn collect(receiver: Receiver<Vec<u8>>) -> String {
     receiver
         .recv_timeout(OUTPUT_GRACE)
@@ -460,16 +414,12 @@ fn collect(receiver: Receiver<Vec<u8>>) -> String {
 }
 
 #[cfg(test)]
-/** @brief 방금 쓴 실행 파일을 띄울 때의 재시도. */
 mod tests {
     #[cfg(target_os = "linux")]
     #[test]
-    /**
-     * @brief 쓰기로 열린 동안 거부되던 실행을 핸들이 닫힌 뒤 띄우는지.
-     * @details 다른 스레드가 띄운 자식이 exec 하기 전까지 쓰기 핸들을 물려받아 쥐는 상황을, 이
-     *          프로세스가 핸들을 쥐었다가 잠시 뒤 닫는 것으로 재현한다. 커널은 어느 프로세스가
-     *          쓰기로 연 파일이든 실행을 거부한다.
-     */
+    /// The child that another thread forked, holding the write handle until it execs, is simulated
+    /// by this process holding a handle and closing it shortly after. The kernel refuses execution
+    /// while any process has the file open for writing.
     fn spawn_retries_while_the_file_is_open_for_writing() {
         use super::*;
         use std::io::Write;

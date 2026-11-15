@@ -1,13 +1,10 @@
-/*!
- * @brief UDP 고속 경로가 쓰는 저장 형태.
- *
- * @details 캐시가 맞았을 때 질의를 파싱하지도, 응답을 다시 조립하지도 않는다. 저장해 둔
- *          응답 바이트를 그대로 내보내고 질의 번호와 이름 대소문자, 남은 수명만 고쳐 쓴다.
- * @warning 이 경로는 응답이 요청·클라이언트·시각에 따라 달라지지 않을 때만 쓸 수 있다.
- *          달라지게 하는 기능을 새로 넣으면 그 기능도 고속 경로 조건에 스스로를 넣어야 한다.
- * @note 훑기는 이 서버가 답을 그대로 재사용할 수 있는 질의만 받아들인다. 조금이라도 다르게
- *       답해야 할 여지가 있으면 거부하고 보통 경로로 보낸다.
- */
+//! Storage form for the UDP fast path. A cache hit neither parses the query nor rebuilds the
+//! response: the stored response bytes go out with only the query ID, the name's case, and the
+//! remaining TTLs patched.
+//!
+//! Usable only when the response does not depend on the request, client, or time; a feature that
+//! makes it depend must add itself to the fast-path conditions. The scan accepts only queries whose
+//! answer can be reused as is; any room for a different answer sends the query to the normal path.
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::ptr::NonNull;
@@ -17,56 +14,40 @@ use std::time::Instant;
 
 use onetdns_proto::{Message, Writer};
 
-/**
- * @brief 할당 없이 wire 레인이 맡을 캐시 키 길이 상한.
- * @details 구조화 캐시의 인라인 키와 같은 크기다. 긴 정상 질의는 구조화 경로가 맡는다.
- */
+/// Longest cache key the wire lane handles without allocating; the same as the structured cache's
+/// inline key. Longer valid queries take the structured path.
 const INLINE_KEY_CAPACITY: usize = 64;
-/** @brief EDNS 유사 레코드 종류. */
 const OPT_TYPE: u16 = 41;
-/** @brief 채우기 옵션. 내용이 없어 응답을 바꾸지 않는다. */
+/// Carries no content, so it does not change the response.
 const EDNS_PADDING: u16 = 12;
 
-/** @brief 파싱 없이 훑어낸 질의. */
 pub struct ScannedQuery<'a> {
-    /** @brief 질의 번호. 응답에 그대로 되비춘다. */
+    /// Echoed in the response.
     pub id: [u8; 2],
 
-    /** @brief 받은 그대로의 이름 바이트. 대소문자를 되돌려줄 때 쓴다. */
+    /// As received, for echoing the original case.
     pub qname: &'a [u8],
-    /** @brief 질의 종류. */
     pub qtype: u16,
-    /** @brief 질의에 붙은 OPT. 없으면 없다. */
     pub edns: Option<ScannedEdns>,
-    /** @brief 이 질의의 캐시 키. */
     key: KeyBuf,
 }
 
 #[derive(Clone, Copy)]
-/**
- * @brief 질의에 붙은 OPT에서 읽은 것들.
- * @details 빠른 경로가 이 질의를 맡아도 되는지 판단하는 데 쓴다. 옵션이 있거나 DO가 켜져
- *          있으면 응답에 담을 것이 생기므로 구조적 경로가 맡아야 한다.
- */
+/// From the query's OPT, to decide whether the fast path may take the query. Options or DO mean the
+/// response has something to carry, so the structured path must take it.
 pub struct ScannedEdns {
-    /** @brief 상대가 받아들이겠다고 알린 UDP 크기. */
     pub udp_payload: u16,
-    /** @brief 서명을 함께 달라는 요구. */
     pub dnssec_ok: bool,
-    /** @brief 옵션이 하나라도 실려 있는지. */
     pub has_options: bool,
 }
 
-/** @brief 키를 담는 고정 크기 버퍼. 할당을 하지 않으려는 것이다. */
+/// Fixed-size, so building a key does not allocate.
 struct KeyBuf {
-    /** @brief 키 바이트. */
     bytes: [u8; INLINE_KEY_CAPACITY],
-    /** @brief 지금까지 담긴 길이. */
     len: usize,
 }
 
 impl KeyBuf {
-    /** @brief 빈 버퍼. */
     fn new() -> Self {
         Self {
             bytes: [0; INLINE_KEY_CAPACITY],
@@ -74,7 +55,6 @@ impl KeyBuf {
         }
     }
 
-    /** @brief 한 바이트 붙인다. */
     #[inline(always)]
     fn push(&mut self, value: u8) {
         debug_assert!(self.len < INLINE_KEY_CAPACITY);
@@ -82,11 +62,8 @@ impl KeyBuf {
         self.len += 1;
     }
 
-    /**
-     * @brief 고정 길이 바이트를 붙인다.
-     * @details 길이를 컴파일 시점 상수로 받아야 이동이 펼쳐진다. 슬라이스로 받으면
-     *          길이가 실행 시점에 정해져 두 바이트를 옮기는 데도 memcpy 호출이 난다.
-     */
+    /// Takes the length as a const so the copy unrolls; a slice length is known only at run time,
+    /// and even two bytes would cost a memcpy call.
     #[inline(always)]
     fn push_array<const N: usize>(&mut self, value: [u8; N]) {
         let end = self.len + N;
@@ -95,36 +72,32 @@ impl KeyBuf {
         self.len = end;
     }
 
-    /** @brief 지금까지 담긴 바이트. */
     fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
 impl ScannedQuery<'_> {
-    /** @brief 이 질의의 캐시 키. */
     pub fn key(&self) -> &[u8] {
         self.key.as_slice()
     }
 
-    /** @brief 대소문자를 맞춘 질의 이름. */
+    /// Lowercased.
     pub fn canonical_qname(&self) -> &[u8] {
         &self.key.as_slice()[3..3 + self.qname.len()]
     }
 }
 
-/**
- * @brief 질의 패킷을 파싱하지 않고 훑어 키를 만든다.
- * @details 이름은 대소문자를 맞춰 키에 넣고, 원래 철자는 그대로 두었다가 응답에
- *          되비춘다. 응답을 바꿀 수 있는 표시는 전부 키에 들어간다.
- * @warning 응답을 달리 만들 여지가 있는 것은 모두 거부한다. 여러 질문, 특수한 종류,
- *          내용 있는 EDNS 옵션, 남는 바이트가 그렇다. 하나라도 놓치면 다른 질의에
- *          같은 답을 준다.
- * @invariant 구조화 캐시가 키를 만들지 않는 질의는 받지 않는다. 받으면 일반 경로는 캐시를
- *            거치지 않고 해석하는 질의에 이 경로가 담아 둔 답을 내준다. 더 적게 받는 것은
- *            괜찮다. 그런 질의는 일반 경로로 넘어갈 뿐이다.
- * @return 훑은 결과. 이 경로로 답할 수 없는 질의면 없다.
- */
+/// Builds the key from the query packet without parsing. The name goes into the key lowercased, and
+/// the original spelling is kept to echo back; every flag that can change the response goes into
+/// the key.
+///
+/// Rejects anything that leaves room for a different response: several questions, special types,
+/// EDNS options with content, trailing bytes. Missing one would give one query another's answer.
+///
+/// Never accepts a query the structured cache makes no key for; otherwise this path would serve a
+/// stored answer to a query the normal path resolves without the cache. Accepting less is fine,
+/// since those queries just take the normal path. None when this path cannot answer the query.
 pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
     if packet.len() < 12 + 1 + 4 {
         return None;
@@ -136,7 +109,7 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         return None;
     }
 
-    /* RA 와 RCODE 는 질의에서 뜻이 없지만 구조화 키가 거부하므로 같이 거부한다. */
+    // RA and RCODE mean nothing in a query, but the structured key rejects them, so this does too.
     if flags3 & 0x80 != 0 || flags3 & 0x40 != 0 || flags3 & 0x0F != 0 {
         return None;
     }
@@ -148,11 +121,9 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         return None;
     }
 
-    /*
-     * 이름은 중간 배열을 거치지 않고 키에 곧장 소문자로 쓴다. 따로 담았다가 옮기면
-     * 255바이트 배열을 0으로 채우고 이름을 한 번 더 옮기는 값을 질의마다 치른다.
-     * 키 앞부분(버전, 의미 플래그)는 이름보다 먼저 정해지므로 순서를 바꿔도 된다.
-     */
+    // The name is written lowercased straight into the key, without a scratch array; copying
+    // through one would zero a 255-byte array and move the name again on every query. The key's
+    // prefix (version, semantic flags) is fixed before the name, so the order can change.
     let rd = flags2 & 0x01 != 0;
     let ad = flags3 & 0x20 != 0;
     let cd = flags3 & 0x10 != 0;
@@ -161,10 +132,9 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
     key.push(1);
     key.push_array(semantic_flags.to_be_bytes());
     let name_start = key.len;
-    /*
-     * QTYPE/QCLASS 뒤에는 EDNS 유무 태그와, 있으면 payload/DO/옵션 수가 붙는다. 이름을
-     * 쓰기 전에 그 뒷부분과 루트 라벨 공간까지 남겨 두면 아래 push는 release에서도 안전하다.
-     */
+    // After QTYPE and QCLASS come the EDNS tag and, with EDNS, payload, DO, and option count.
+    // Reserving that tail and the root label before writing the name keeps the pushes below in
+    // bounds in release builds too.
     let key_suffix_len = if arcount == 1 { 11 } else { 5 };
 
     let mut pos = 12usize;
@@ -217,8 +187,8 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
         let udp_payload = u16::from_be_bytes([*packet.get(pos + 3)?, *packet.get(pos + 4)?]);
         let ext = packet.get(pos + 5..pos + 9)?;
 
-        /* 첫 바이트는 RCODE 의 위쪽 8비트다. 파서가 이것을 헤더의 RCODE 에 합치므로 0 이
-         * 아니면 구조화 키가 거부한다. */
+        // The first byte is the upper 8 bits of RCODE. The parser merges it into the header RCODE,
+        // so the structured key rejects it when nonzero.
         if ext[0] != 0 || ext[1] != 0 {
             return None;
         }
@@ -254,12 +224,10 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
     key.push_array(qclass.to_be_bytes());
     match edns {
         Some((payload, do_bit, _)) => {
-            /*
-             * 구조적 캐시의 키와 바이트까지 같아야 한다. 어긋나면 승격할 슬롯을 찾지
-             * 못해 그 모양의 질의는 영원히 이 레인을 못 타고, 레인에 들어갔다 나오느라 일을
-             * 두 번 한다. 버전 번호는 위에서 0만 통과시켰고, 패딩은 양쪽 다 의미 있는 옵션으로
-             * 세지 않으므로 옵션 수는 언제나 0이다.
-             */
+            // Must match the structured cache key byte for byte; otherwise promotion would never
+            // find the slot, so queries of that shape would never take this lane and would do the
+            // work twice going in and out. Only version 0 passes above, and neither side counts
+            // padding as a meaningful option, so the option count is always 0.
             key.push(1);
             key.push_array(payload.to_be_bytes());
             key.push(0);
@@ -283,54 +251,40 @@ pub fn scan_query(packet: &[u8]) -> Option<ScannedQuery<'_>> {
 }
 
 #[repr(C)]
-/**
- * @brief 응답 바이트와 부가 정보를 한 블록에 담는 헤더.
- * @details 응답 바이트, TTL 테이블, 기록용 요약을 따로 할당하지 않고 이어 붙인다. 캐시
- *          항목 하나가 할당 하나다.
- */
+/// Header of one block holding the response bytes, TTL table, and log summary together, so a cache
+/// entry is one allocation.
 struct WireAllocation {
-    /** @brief 담은 시각. 기준 시점에서 흐른 나노초. */
+    /// Nanoseconds since the process epoch.
     inserted_nanos: i64,
 
-    /** @brief 담을 때의 필터·설정 세대. */
+    /// Filter and config generation at storage.
     filter_tag: usize,
 
-    /** @brief 이 블록을 가리키는 소유자 수. */
     refs: AtomicU32,
-    /** @brief 헤더 뒤에 이어진 내용의 길이. */
+    /// Length of what follows the header.
     storage_len: u32,
 
-    /** @brief 이 항목의 수명. */
     lifetime_secs: u32,
 
-    /** @brief 응답 바이트의 길이. */
     wire_len: u16,
 
-    /** @brief TTL 테이블의 항목 수. */
     ttl_count: u16,
 }
 
-/**
- * @brief 위 블록을 가리키는 소유자.
- * @details 표준 공유 포인터 대신 직접 센다. 약한 소유자가 없어 카운터 하나면 되고,
- *          헤더와 내용이 한 할당에 붙어 있다.
- */
+/// Owner of a block. Counted by hand instead of Arc: with no weak owners one counter is enough, and
+/// the header and contents share one allocation.
 pub(crate) struct WireEntry(NonNull<WireAllocation>);
 
-/** @safety 내용은 만든 뒤 바뀌지 않고 카운터는 원자적이다. */
+// SAFETY: Contents never change after construction, and the count is atomic.
 unsafe impl Send for WireEntry {}
 
-/** @safety 내용은 만든 뒤 바뀌지 않고 카운터는 원자적이다. */
+// SAFETY: Contents never change after construction, and the count is atomic.
 unsafe impl Sync for WireEntry {}
 
 impl Clone for WireEntry {
-    /**
-     * @brief 소유자를 하나 늘린다.
-     * @warning 카운터가 넘칠 만큼 늘어나면 그대로 죽는다. 한 바퀴 돌면 살아 있는 것을
-     *          해제해 메모리를 짓밟는다.
-     */
+    /// Aborts if the count grows near overflow; wrapping would free a live block and corrupt
+    /// memory.
     fn clone(&self) -> Self {
-        /** @brief 이 이상 늘면 넘칠 위험이 있다고 본다. */
         const MAX_REFCOUNT: u32 = i32::MAX as u32;
         let previous = self.header().refs.fetch_add(1, Ordering::Relaxed);
         if previous > MAX_REFCOUNT {
@@ -341,11 +295,8 @@ impl Clone for WireEntry {
 }
 
 impl Drop for WireEntry {
-    /**
-     * @brief 소유자를 하나 줄이고 마지막이면 해제한다.
-     * @safety 줄일 때는 방출, 마지막에 획득 울타리를 둔다. 그래야 다른 스레드가 쓴
-     *         내용이 해제 전에 모두 보인다.
-     */
+    /// Release on each decrement and an Acquire fence on the last, so every other owner's accesses
+    /// happen before the free.
     fn drop(&mut self) {
         if self.header().refs.fetch_sub(1, Ordering::Release) != 1 {
             return;
@@ -355,6 +306,8 @@ impl Drop for WireEntry {
         let layout = wire_allocation_layout(storage_len)
             .expect("The wire cache allocation layout was validated when it was created");
 
+        // SAFETY: The last owner is gone, so nothing else reaches the block, and `layout` is the
+        // one it was allocated with.
         unsafe {
             std::ptr::drop_in_place(self.0.as_ptr());
             dealloc(self.0.as_ptr().cast(), layout);
@@ -363,7 +316,6 @@ impl Drop for WireEntry {
 }
 
 impl WireEntry {
-    /** @brief 블록을 할당하고 내용을 채운다. */
     fn allocate_with(
         storage_len: usize,
         inserted: Instant,
@@ -376,11 +328,13 @@ impl WireEntry {
         let storage_len_u32 = u32::try_from(storage_len).ok()?;
         let layout = wire_allocation_layout(storage_len)?;
 
+        // SAFETY: `layout` is never zero-sized, since it includes the header.
         let raw = unsafe { alloc_zeroed(layout) };
         let Some(pointer) = NonNull::new(raw.cast::<WireAllocation>()) else {
             handle_alloc_error(layout);
         };
 
+        // SAFETY: `pointer` is a fresh allocation sized and aligned for the header.
         unsafe {
             pointer.as_ptr().write(WireAllocation {
                 inserted_nanos: wire_timestamp_nanos(inserted),
@@ -397,23 +351,20 @@ impl WireEntry {
         Some(entry)
     }
 
-    /** @brief 블록 헤더. */
     fn header(&self) -> &WireAllocation {
+        // SAFETY: The block stays allocated while any owner, `self` included, lives.
         unsafe { self.0.as_ref() }
     }
 
-    /** @brief 헤더 뒤에 이어 붙은 내용 전체. */
     fn storage(&self) -> &[u8] {
         let len = self.header().storage_len as usize;
 
+        // SAFETY: `len` bytes follow the header inside the same allocation, zeroed when allocated.
         unsafe { std::slice::from_raw_parts(self.storage_ptr(), len) }
     }
 
-    /**
-     * @brief 내용을 고칠 수 있게 빌린다.
-     * @warning 소유자가 하나일 때만 부를 수 있다. 공유된 것을 고치면 다른 스레드가 읽는
-     *          도중에 바뀐다.
-     */
+    /// Only with a single owner: changing a shared block would change it under another thread's
+    /// read. Asserts the count is 1.
     fn storage_mut_unique(&mut self) -> &mut [u8] {
         assert_eq!(
             self.header().refs.load(Ordering::Acquire),
@@ -422,11 +373,12 @@ impl WireEntry {
         );
         let len = self.header().storage_len as usize;
 
+        // SAFETY: As in `storage`; the count of 1 checked above makes this borrow unique.
         unsafe { std::slice::from_raw_parts_mut(self.storage_ptr(), len) }
     }
 
-    /** @brief 내용이 시작하는 위치. */
     fn storage_ptr(&self) -> *mut u8 {
+        // SAFETY: The storage starts right after the header, inside the same allocation.
         unsafe {
             self.0
                 .as_ptr()
@@ -435,43 +387,38 @@ impl WireEntry {
         }
     }
 
-    /** @brief 같은 블록을 가리키는지. */
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.0 == right.0
     }
 
-    /** @brief 저장된 응답 바이트. */
     fn wire(&self) -> &[u8] {
         &self.storage()[..self.header().wire_len as usize]
     }
 
-    /** @brief TTL 테이블가 끝나는 위치. */
     fn ttl_metadata_end(&self) -> usize {
         self.header().wire_len as usize + usize::from(self.header().ttl_count) * 8
     }
 
-    /** @brief 수명 값이 응답 바이트 어디에 있는지 적어 둔 테이블. */
+    /// Where each TTL sits in the response bytes.
     fn ttl_metadata(&self) -> &[u8] {
         &self.storage()[self.header().wire_len as usize..self.ttl_metadata_end()]
     }
 
-    /** @brief 질의 기록에 남길 답변 요약. */
+    /// For the query log.
     pub(crate) fn answers_summary(&self) -> &str {
         std::str::from_utf8(&self.storage()[self.ttl_metadata_end()..])
             .expect("A wire cache answer summary copied from a String is UTF-8")
     }
 
-    /** @brief 저장한 뒤 흐른 초. */
     pub(crate) fn elapsed_secs(&self, now: Instant) -> u32 {
         u32::try_from(wire_elapsed_secs(self.header().inserted_nanos, now)).unwrap_or(u32::MAX)
     }
 
-    /** @brief 이만큼 흘렀으면 만료인지. */
     pub(crate) fn is_expired_at(&self, elapsed_secs: u32) -> bool {
         elapsed_secs >= self.header().lifetime_secs
     }
 
-    /** @brief 남은 수명. 만료면 없다. */
+    /// None once expired.
     pub(crate) fn remaining_lifetime(&self, now: Instant) -> Option<u32> {
         let header = self.header();
         let elapsed = self.elapsed_secs(now);
@@ -479,20 +426,13 @@ impl WireEntry {
         (remaining > 0).then_some(remaining)
     }
 
-    /**
-     * @brief 저장할 때의 필터·설정 세대가 지금과 같은지.
-     * @warning 다르면 쓰지 않는다. 차단 목록을 갱신했는데 이전 세대의 허용 응답을 계속
-     *          내보내면 차단이 전부 늦어진다.
-     */
+    /// A stored answer from another generation is not used: after a blocklist update, serving the
+    /// old generation's allowed answers would delay every new block.
     pub(crate) fn matches_filter(&self, filter_tag: usize) -> bool {
         self.header().filter_tag == filter_tag
     }
 
-    /**
-     * @brief 흐른 시간만큼 수명을 깎아 적는다.
-     * @note 0까지 깎지 않고 최소 1을 남긴다. 0을 받은 클라이언트는 캐시하지 않아 다음
-     *       질의가 곧바로 다시 온다.
-     */
+    /// Never below 1: a client given 0 does not cache, and its next query comes right back.
     fn age_ttls(&self, elapsed: u32, wire: &mut [u8]) {
         if elapsed == 0 {
             return;
@@ -505,18 +445,14 @@ impl WireEntry {
         }
     }
 
-    /** @brief 수명을 깎은 응답을 메시지로 되읽는다. */
     pub(crate) fn parse_aged_at(&self, elapsed_secs: u32) -> Option<Message> {
         let mut wire = self.wire().to_vec();
         self.age_ttls(elapsed_secs, &mut wire);
         Message::parse(&wire).ok()
     }
 
-    /**
-     * @brief 저장된 응답을 이 질의에 맞춰 내보낸다.
-     * @details 고치는 것은 질의 번호, 이름의 원래 철자, 수명뿐이다. 이름 압축을 다시
-     *          하지 않으므로 길이는 그대로다.
-     */
+    /// Patches only the query ID, the name's original spelling, and the TTLs. Names are not
+    /// recompressed, so the length stays the same.
     pub(crate) fn emit_at_age(
         &self,
         query: &ScannedQuery<'_>,
@@ -538,16 +474,12 @@ impl WireEntry {
     }
 }
 
-/** @brief 1초의 나노초. */
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-/**
- * @brief 프로세스 기준 시점에서 흐른 나노초.
- * @note 부호 있는 값이다. 기준 시점보다 이른 시각도 담을 수 있어야 첫 항목이 기준을
- *       정하기 전에 만들어져도 어긋나지 않는다.
- */
+/// Signed, so a time before the epoch still fits when an entry is made before the first call fixes
+/// the epoch.
 fn wire_timestamp_nanos(now: Instant) -> i64 {
-    /** @brief 프로세스가 처음 시각을 물은 순간. 이후 모든 시각이 여기서 측정한다. */
+    /// The first time the process asked; all timestamps count from it.
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(|| now);
     if now >= epoch {
@@ -557,7 +489,7 @@ fn wire_timestamp_nanos(now: Instant) -> i64 {
     }
 }
 
-/** @brief 시간 간격을 나노초로. 넘치면 최대값으로 붙든다. */
+/// Saturates on overflow.
 fn duration_nanos(duration: std::time::Duration) -> i64 {
     let secs = duration.as_secs();
     if secs > i64::MAX as u64 / NANOS_PER_SEC as u64 {
@@ -567,11 +499,8 @@ fn duration_nanos(duration: std::time::Duration) -> i64 {
     i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
-/**
- * @brief 두 시점 사이에 흐른 초.
- * @warning 어느 쪽이든 붙들린 최대값이면 만료로 본다. 넘친 값으로 계산하면 만료된
- *          항목이 영원히 살아남는다.
- */
+/// Either side at the saturated maximum counts as expired; computing with an overflowed value would
+/// keep an expired entry alive forever.
 fn wire_elapsed_secs_at(inserted_nanos: i64, now_nanos: i64) -> u64 {
     if inserted_nanos.unsigned_abs() == i64::MAX as u64
         || now_nanos.unsigned_abs() == i64::MAX as u64
@@ -581,40 +510,32 @@ fn wire_elapsed_secs_at(inserted_nanos: i64, now_nanos: i64) -> u64 {
     now_nanos.saturating_sub(inserted_nanos).max(0) as u64 / NANOS_PER_SEC as u64
 }
 
-/** @brief 저장 시점에서 지금까지 흐른 초. */
 fn wire_elapsed_secs(inserted_nanos: i64, now: Instant) -> u64 {
     wire_elapsed_secs_at(inserted_nanos, wire_timestamp_nanos(now))
 }
 
-/** @brief 헤더와 내용을 합친 블록의 배치. */
 fn wire_allocation_layout(storage_len: usize) -> Option<Layout> {
     let size = std::mem::size_of::<WireAllocation>().checked_add(storage_len)?;
     Layout::from_size_align(size, std::mem::align_of::<WireAllocation>()).ok()
 }
 
 #[derive(Clone, Copy)]
-/** @brief 저장 항목을 만드는 것. 수명 상하한을 잡고 있다. */
 pub struct WireEntryFactory {
-    /** @brief 담을 때 걸 수명 하한. 0이 아니면 이 경로를 쓰지 않는다. */
+    /// A nonzero floor disables this path.
     min_ttl: u32,
-    /** @brief 담을 때 걸 수명 상한. */
     max_ttl: u32,
 }
 
 impl WireEntryFactory {
-    /** @brief 수명 상하한으로 만든다. */
     pub fn new(min_ttl: u32, max_ttl: u32) -> Self {
         Self { min_ttl, max_ttl }
     }
 
-    /**
-     * @brief 응답 바이트로 저장 항목을 만든다.
-     * @details 각 TTL 위치와 원래 값을 테이블로 적어 둔다. 그래야 내보낼 때 파싱 없이
-     *          그 위치만 고쳐 쓴다.
-     * @warning 잘렸거나 오류인 응답, 수명이 0인 응답은 저장하지 않는다. 최소 수명 설정이
-     *          걸려 있으면 이 경로 자체를 쓰지 않는다. 수명을 늘려 적는 것은 응답을
-     *          바꾸는 일이다.
-     */
+    /// Records each TTL position and original value in a table, so emitting patches only those
+    /// positions without parsing.
+    ///
+    /// Truncated, error, and zero-TTL responses are not stored. A configured TTL floor disables
+    /// this path entirely, since raising TTLs changes the response.
     pub(crate) fn prepare(
         &self,
         response_wire: &[u8],
@@ -675,11 +596,7 @@ impl WireEntryFactory {
         )
     }
 
-    /**
-     * @brief 수명이 변하지 않는 응답으로 저장 항목을 만든다.
-     * @details 설정에 고정해 둔 주소를 답할 때 쓴다. 시간이 지나도 수명을 깎지 않으므로
-     *          TTL 테이블가 필요 없다.
-     */
+    /// For fixed configured addresses, whose TTL does not age, so there is no TTL table.
     pub(crate) fn prepare_fixed(
         &self,
         response_wire: &[u8],
@@ -715,12 +632,8 @@ impl WireEntryFactory {
     }
 }
 
-/**
- * @brief 응답을 훑어 TTL 위치와 그중 가장 짧은 값을 찾는다.
- * @details 항목 수명이 아니라 가장 짧은 수명이 이 항목의 수명이다. 하나라도 만료된
- *          레코드를 내보내면 안 된다.
- * @return TTL 위치와 원래 값의 목록, 그리고 가장 짧은 수명. 형식이 어긋나면 없다.
- */
+/// The entry lives only as long as its shortest TTL, since no expired record may go out. Returns
+/// the TTL positions with their original values, and the shortest TTL; None on malformed input.
 fn walk_response(wire: &[u8]) -> Option<(Vec<(u32, u32)>, u32)> {
     let qdcount = u16::from_be_bytes([*wire.get(4)?, *wire.get(5)?]);
     let ancount = u16::from_be_bytes([*wire.get(6)?, *wire.get(7)?]);
@@ -765,11 +678,8 @@ fn walk_response(wire: &[u8]) -> Option<(Vec<(u32, u32)>, u32)> {
     Some((ttl_offsets, min_ttl))
 }
 
-/**
- * @brief 이 프로세스의 조각 나누기 비밀값.
- * @warning 프로세스마다 달라야 한다. 고정하면 한 조각에 몰리도록 고른 이름들로 잠금
- *          경합을 일으킬 수 있다.
- */
+/// Must differ per process; fixed keys would let chosen names pile into one shard and contend on
+/// its lock.
 pub(crate) fn random_shard_hash_keys() -> [u64; 2] {
     let seed = onetdns_core::random_array::<16>();
     [
@@ -778,9 +688,7 @@ pub(crate) fn random_shard_hash_keys() -> [u64; 2] {
     ]
 }
 
-/** @brief 키를 해시해 샤드 번호를 고른다. */
 pub(crate) fn shard_hash(key: &[u8], keys: [u64; 2]) -> u64 {
-    /** @brief 섞기에 쓰는 곱셈 상수. */
     const M: u64 = 0x9ddf_ea08_eb38_2d69;
     let mut hash = M.wrapping_mul((key.len() as u64).wrapping_add(1) ^ keys[0]);
     let mut chunks = key.chunks_exact(8);
@@ -804,7 +712,7 @@ pub(crate) fn shard_hash(key: &[u8], keys: [u64; 2]) -> u64 {
     hash ^ (hash >> 32)
 }
 
-/** @brief 이름 하나를 건너뛴 곳. 압축 지시자를 만나면 거기서 끝난다. */
+/// Stops after a compression pointer.
 fn skip_name(wire: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *wire.get(pos)? as usize;
@@ -825,7 +733,6 @@ fn skip_name(wire: &[u8], mut pos: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-/** @brief 훑기가 받아들이고 거부하는 범위, 저장 항목의 수명·세대 처리, 그리고 소유권. */
 mod tests {
     use super::*;
     use onetdns_proto::{Edns, Message, Name, RData, Record, RecordType};
@@ -833,7 +740,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    /** @brief 항목 하나의 고정 비용이 커지지 않았는지. 커지면 같은 메모리에 담기는 항목이 준다. */
+    /// A larger fixed cost means fewer entries fit in the same memory.
     fn wire_entry_fixed_overhead_stays_small() {
         assert_eq!(
             std::mem::size_of::<WireEntry>(),
@@ -853,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 줄여 담은 시각이 만료 경계를 그대로 지키고, 넘치면 만료 쪽으로 기우는지. */
+    /// The compact timestamp keeps expiry boundaries and leans toward expired on overflow.
     fn compact_timestamp_preserves_ttl_boundaries_and_fails_closed() {
         let inserted = 123_456_789;
         assert_eq!(
@@ -883,7 +790,6 @@ mod tests {
         );
     }
 
-    /** @brief 테스트용 질의 바이트. */
     fn query_wire(name: &str, qtype: RecordType, edns: bool) -> Vec<u8> {
         let mut message = Message::query(0x1234, Name::from_str(name).unwrap(), qtype);
         if edns {
@@ -899,7 +805,6 @@ mod tests {
         message.try_encode().unwrap()
     }
 
-    /** @brief 테스트용 응답 바이트. */
     fn response_wire(request: &Message, ttl: u32) -> Vec<u8> {
         let mut response = request.clone();
         response.header.response = true;
@@ -913,7 +818,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 평범한 질의와 EDNS 질의를 받아들이는지. */
     fn scan_accepts_plain_and_edns_queries() {
         let plain = query_wire("host.example", RecordType::A, false);
         let scanned = scan_query(&plain).expect("일반 질의 스캔");
@@ -930,7 +834,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키는 대소문자를 맞추되 원래 철자를 되돌려줄 수 있는지. */
     fn scan_normalizes_case_but_preserves_original_span() {
         let lower = query_wire("host.example", RecordType::A, false);
         let upper = query_wire("HOST.EXAMPLE", RecordType::A, false);
@@ -941,7 +844,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인라인 키 경계까지 맡고 더 긴 정상 질의는 안전하게 구조화 경로로 보내는지. */
     fn scan_inline_key_boundary_falls_back_without_rejecting_dns() {
         let plain_edge = "a".repeat(54);
         let plain_edge_wire = query_wire(&plain_edge, RecordType::A, false);
@@ -968,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답을 바꿀 수 있는 질의를 거부하는지. 받아들이면 다른 질의에 같은 답을 준다. */
+    /// Accepting them would give one query another's answer.
     fn scan_rejects_semantic_edns_and_multi_question() {
         let mut message = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
         let mut edns = Edns::default();
@@ -991,11 +893,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 구조화 키가 거부하는 RA 비트와 확장 RCODE 를 거부하는지.
-     * @details 이 둘을 받으면, 일반 경로는 캐시를 거치지 않고 해석하는 질의에 이 경로가 담아 둔
-     *          답을 내준다.
-     */
+    /// Accepting them would let this path serve a stored answer to a query the normal path resolves
+    /// without the cache.
     fn scan_rejects_ra_and_extended_rcode() {
         let mut message = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
         message
@@ -1011,8 +910,8 @@ mod tests {
         with_ra[3] |= 0x80;
         assert!(scan_query(&with_ra).is_none(), "RA 를 켠 질의를 받았습니다");
 
-        /* OPT 는 질의의 마지막 레코드다. 이름(루트) 1, 종류 2, UDP 크기 2 다음이 TTL 이고,
-         * 그 첫 바이트가 RCODE 의 위쪽 8비트다. */
+        // OPT is the query's last record. Its TTL follows the root name (1), type (2), and UDP size
+        // (2), and the TTL's first byte is the upper 8 bits of RCODE.
         let ttl = packet.len() - (4 + 2);
         assert_eq!(
             &packet[ttl - 4..ttl - 2],
@@ -1028,7 +927,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 내보낼 때 번호·철자·수명만 고쳐지는지. */
     fn store_and_emit_patch_id_case_and_ttl() {
         let request = Message::query(7, Name::from_str("host.example").unwrap(), RecordType::A);
         let request_wire = request.try_encode().unwrap();
@@ -1066,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 스레드가 나눠 가져도 할당 하나가 정확히 한 번 해제되는지. */
+    /// One allocation is freed exactly once however threads share it.
     fn wire_entry_clone_drop_keeps_single_allocation_alive_across_threads() {
         let request = Message::query(7, Name::from_str("clone.example").unwrap(), RecordType::A);
         let wire = response_wire(&request, 300);
@@ -1094,7 +992,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수명 상한이 0이면 저장하지 않는지. */
     fn zero_max_ttl_disables_wire_storage() {
         let request = Message::query(7, Name::from_str("host.example").unwrap(), RecordType::A);
         let wire = response_wire(&request, 300);
@@ -1109,7 +1006,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 상한보다 긴 수명을 내보내지 않는지. */
     fn wire_entry_caps_ttl_visible_to_clients() {
         let request = Message::query(7, Name::from_str("host.example").unwrap(), RecordType::A);
         let request_wire = request.try_encode().unwrap();
@@ -1128,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답 캐시의 수명이 이 항목의 수명을 넘지 못하는지. 넘으면 두 경로가 다른 답을 준다. */
+    /// Otherwise the two paths would give different answers.
     fn structured_cache_lifetime_caps_shared_wire_entry() {
         let request = Message::query(7, Name::from_str("signed.example").unwrap(), RecordType::A);
         let request_wire = request.try_encode().unwrap();
@@ -1156,7 +1052,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료됐거나 세대가 다르면 쓰지 않는지. */
     fn expiry_and_filter_generation_invalidate() {
         let request = Message::query(3, Name::from_str("ttl.example").unwrap(), RecordType::A);
         let wire = response_wire(&request, 5);
@@ -1173,7 +1068,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘렸거나 오류인 응답을 저장하지 않는지. */
     fn truncated_or_negative_responses_are_not_stored() {
         let request = Message::query(4, Name::from_str("neg.example").unwrap(), RecordType::A);
 
@@ -1215,7 +1109,6 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release -- --ignored --nocapture"]
-    /** @brief 고속 경로 적중 비용. */
     fn bench_wire_fast_path_hit() {
         use std::time::Instant;
 
@@ -1228,10 +1121,8 @@ mod tests {
         let scanned = scan_query(&request_wire).unwrap();
         let response = response_wire(&request, 300);
         let now = Instant::now();
-        /** @brief 아무것도 하지 않는 리졸버. */
         struct Noop;
         impl crate::native::Resolver for Noop {
-            /** @brief 항상 답하지 않는다. */
             fn resolve(&self, _request: &Message) -> Option<Message> {
                 None
             }
@@ -1306,7 +1197,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어떤 바이트열이 와도 훑기와 저장이 패닉하지 않는지. */
     fn scan_and_store_never_panic_on_malformed_bytes() {
         use crate::fuzzutil::{havoc, Rng};
 
@@ -1332,7 +1222,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각이 고르게 나뉘는지. */
     fn shard_selector_distributes_evenly() {
         let nshards = 16usize;
         let hash_keys = random_shard_hash_keys();
@@ -1354,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 비밀값이 다르면 나뉘는 모양도 달라지는지. 같으면 한 조각에 몰리게 만들 수 있다. */
+    /// Identical keys would let someone pile names into one shard.
     fn shard_selector_changes_with_process_secret() {
         let first = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
         let second = [0x1357_9bdf_2468_ace0, 0x0eca_8642_fdb9_7531];
@@ -1373,7 +1262,6 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release -- --ignored --nocapture"]
-    /** @brief 조각 나누기 비용. */
     fn bench_shard_hash() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

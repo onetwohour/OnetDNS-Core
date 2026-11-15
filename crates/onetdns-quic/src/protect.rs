@@ -1,10 +1,5 @@
-/*!
- * @brief 패킷 본문 암호화와 헤더 보호.
- *
- * @details 두 겹이다. 본문은 AEAD로 감싸고, 헤더의 일부 비트와 패킷 번호는 별도 키로
- *          만든 마스크와 XOR해 가린다. 헤더 보호가 있어야 경로상 장비가 연결을
- *          추적하거나 간섭하기 어려워진다.
- */
+//! Packet protection: AEAD over the payload, and header protection that masks the packet number and
+//! the low bits of the first byte with a separate key.
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
@@ -13,18 +8,13 @@ use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 쓸 수 있는 AEAD 알고리즘. */
 pub enum Aead {
-    /** @brief AES-128 GCM. */
     Aes128Gcm,
-    /** @brief AES-256 GCM. */
     Aes256Gcm,
-    /** @brief ChaCha20-Poly1305. */
     ChaCha20Poly1305,
 }
 
 impl Aead {
-    /** @brief 이 알고리즘의 키 길이. */
     pub fn key_len(&self) -> usize {
         match self {
             Aead::Aes128Gcm => 16,
@@ -33,11 +23,8 @@ impl Aead {
         }
     }
 
-    /**
-     * @brief 패킷 번호로 논스를 만든다. 기준값과 XOR한다.
-     * @warning 같은 키로 같은 논스를 두 번 쓰면 AEAD가 전부 무너진다. 패킷 번호가
-     *          중복되지 않는 것이 그 보장의 근거다.
-     */
+    /// IV XOR packet number. The nonce stays unique only because packet numbers never repeat under
+    /// one key.
     fn nonce(iv: &[u8], pn: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&iv[..12]);
@@ -48,7 +35,6 @@ impl Aead {
         nonce
     }
 
-    /** @brief 본문을 암호화한다. 헤더가 추가 인증 데이터로 들어간다. */
     pub fn seal(&self, key: &[u8], iv: &[u8], pn: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
         let nonce = Self::nonce(iv, pn);
         let pl = Payload {
@@ -71,7 +57,6 @@ impl Aead {
         }
     }
 
-    /** @brief 본문을 복호화한다. 인증이 맞지 않으면 실패다. */
     pub fn open(
         &self,
         key: &[u8],
@@ -101,11 +86,7 @@ impl Aead {
         }
     }
 
-    /**
-     * @brief 헤더 보호에 쓸 마스크를 만든다.
-     * @details 암호문에서 추출한 표본으로 블록 연산을 한 번 돌린다. 표본이 패킷마다 다르므로
-     *          마스크도 매번 달라진다.
-     */
+    /// `sample` is taken from the ciphertext, so the mask differs per packet.
     pub fn header_mask(&self, hp_key: &[u8], sample: &[u8; 16]) -> [u8; 5] {
         match self {
             Aead::Aes128Gcm | Aead::Aes256Gcm => {
@@ -136,11 +117,8 @@ impl Aead {
     }
 }
 
-/**
- * @brief 헤더 보호를 씌우거나 벗긴다. 같은 연산이라 양방향이 하나다.
- * @note 첫 바이트에서 가리는 비트 수가 긴 헤더와 짧은 헤더에서 다르다. 긴 쪽은
- *       하위 4비트, 짧은 쪽은 5비트다.
- */
+/// Applies and removes protection alike. Masks the low 4 bits of the first byte in a long header
+/// and 5 in a short one.
 pub fn apply_header_protection(
     first: &mut u8,
     pn_bytes: &mut [u8],
@@ -155,11 +133,9 @@ pub fn apply_header_protection(
 }
 
 #[cfg(test)]
-/** @brief 블록 연산과 마스크를 공표된 벡터에 대조하고, 왕복이 성립하는지 본다. */
 mod tests {
     use super::*;
 
-    /** @brief 16진 문자열을 바이트로. */
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -168,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief AES 블록 연산을 표준 벡터와 비교한다. */
     fn fips197_aes128_block() {
         let key = hex("000102030405060708090a0b0c0d0e0f");
         let sample: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
@@ -179,7 +154,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief ChaCha20 헤더 마스크를 규격 벡터와 비교한다. */
     fn rfc9001_a5_chacha20_header_mask() {
         let hp = hex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
         let sample: [u8; 16] = hex("5e5cd55c41f69080575d7999c25a5bfb").try_into().unwrap();
@@ -188,7 +162,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief ChaCha20 AEAD 왕복. */
     fn chacha20_aead_roundtrip_with_pn_nonce() {
         let key = hex("c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8");
         let iv = hex("e0459b3474bdd0e44a41c809");
@@ -210,7 +183,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief AES-GCM AEAD 왕복. */
     fn aead_roundtrip_with_pn_nonce() {
         let key = hex("1f369613dd76d5467730efcbe3b1a22d");
         let iv = hex("fa044b2f42a3fd3b46fb255c");
@@ -229,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 연산을 두 번 하면 원래대로 돌아오는지. */
     fn header_protection_is_symmetric() {
         let mask = [0xab, 0xcd, 0xef, 0x12, 0x34];
         let mut first = 0xc3u8;
@@ -244,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 긴 헤더에서 가리는 비트 수가 맞는지. 틀리면 패킷 유형이 새거나 깨진다. */
+    /// Masking more would corrupt the long header packet type.
     fn long_header_masks_low_4_bits_only() {
         let mask = [0xff, 0, 0, 0, 0];
         let mut first = 0xc3u8;

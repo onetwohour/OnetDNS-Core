@@ -1,6 +1,4 @@
-/*!
- * @brief 질의 결과를 지표, dnstap, 질의 로그에 기록한다.
- */
+//! Records query results to metrics, dnstap, and the query log.
 
 use std::net::IpAddr;
 
@@ -12,16 +10,14 @@ use crate::native::query::RuleMatch;
 use crate::native::response::{answers_summary, rcode_str};
 use crate::native::NativeServer;
 
-/** @brief 필터 판정을 설명하는 규칙과 목록. 기록할 때까지 들고 있는 값이다. */
+/// The rule and list behind a filter verdict, held until recorded.
 pub(crate) struct FilterRuleLabel {
-    /** @brief 걸린 규칙. 규칙 원문이 없으면 판정 단계 이름이다. */
+    /// The verdict stage name when there is no rule text.
     rule: String,
-    /** @brief 그 규칙이 들어 있던 목록. */
     list: String,
 }
 
 impl FilterRuleLabel {
-    /** @brief 기록에 넘길 형태로 빌려 준다. */
     pub(crate) fn as_match(&self) -> RuleMatch<'_> {
         RuleMatch {
             rule: &self.rule,
@@ -31,7 +27,6 @@ impl FilterRuleLabel {
 }
 
 impl NativeServer {
-    /** @brief 어느 규칙이 걸렸는지와 그 규칙이 들어 있던 목록. */
     pub(crate) fn filter_rule_label(
         &self,
         name: &ApName,
@@ -47,7 +42,6 @@ impl NativeServer {
         }
     }
 
-    /** @brief 실패를 기록에 남긴다. */
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rec_failure(
         &self,
@@ -80,7 +74,6 @@ impl NativeServer {
         }
     }
 
-    /** @brief 최종 답을 기록에 남긴다. */
     pub(crate) fn rec_final_answer(
         &self,
         client: &ClientInfo,
@@ -116,7 +109,7 @@ impl NativeServer {
         } else {
             Action::Resolved
         };
-        /* 요약은 질의 기록에만 담긴다. 꺼져 있으면 만들자마자 버려지므로 만들지 않는다. */
+        // Only the query log uses the summary.
         let answers = if recorder.querylog_enabled() {
             answers_summary(&resp.answers)
         } else {
@@ -139,7 +132,6 @@ impl NativeServer {
         );
     }
 
-    /** @brief 처리에 걸린 시간을 남긴다. */
     pub(crate) fn rec_latency(&self, client: &ClientInfo, qname: Option<&ApName>, elapsed_us: u64) {
         if let Some(r) = self.events() {
             let (_, stat) = self.filter.load().client_log_stat(client);
@@ -147,7 +139,6 @@ impl NativeServer {
         }
     }
 
-    /** @brief 질의 하나를 기록에 남긴다. */
     pub(crate) fn rec(
         &self,
         client: &ClientInfo,
@@ -170,7 +161,6 @@ impl NativeServer {
         }
     }
 
-    /** @brief 응답 코드와 함께 남긴다. */
     pub(crate) fn rec_rc(
         &self,
         client: &ClientInfo,
@@ -183,7 +173,6 @@ impl NativeServer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /** @brief 응답 코드와 사유를 함께 남긴다. */
     pub(crate) fn rec_rc_diag<'r>(
         &self,
         client: &ClientInfo,
@@ -205,11 +194,8 @@ impl NativeServer {
         }
     }
 
-    /**
-     * @brief 동시 처리 한도에 걸려 거절한 질의를 남긴다.
-     * @details 속도 제한과 같은 Throttled 로 세지만 까닭은 다르다. 운영자는 까닭을 보고
-     *          클라이언트를 볼지 서버 용량을 볼지 정한다.
-     */
+    /// Counted as Throttled like rate limiting, but the reason differs, and it tells the operator
+    /// whether to look at the client or at server capacity.
     pub(crate) fn rec_overloaded(&self, client: &ClientInfo, name: &ApName, qtype: ApRt) {
         note_rejection(Action::Throttled, client);
         if let Some(recorder) = self.events() {
@@ -231,11 +217,8 @@ impl NativeServer {
         }
     }
 
-    /**
-     * @brief 필터의 무응답 규칙에 걸려 답하지 않은 질의를 남긴다.
-     * @details 차단으로 세되 응답 코드 자리에는 DROPPED 를 적는다. 나가지 않은 응답의 코드를 적으면
-     *          운영자가 기록을 보고 클라이언트가 그 답을 받았다고 믿는다.
-     */
+    /// Counted as blocked, with DROPPED where the rcode goes; logging the rcode of a response that
+    /// never went out would tell the operator the client got it.
     pub(crate) fn rec_dropped<'r>(
         &self,
         client: &ClientInfo,
@@ -266,10 +249,8 @@ impl NativeServer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /**
-     * @brief 응답 코드와 사유, 답 요약을 함께 남긴다.
-     * @param reason 동작만으로 까닭이 정해지지 않을 때 넘기는 까닭. 없으면 동작에서 고른다.
-     */
+    /// `reason` is for when the action alone does not decide it; otherwise it comes from the
+    /// action.
     pub(crate) fn rec_rc_diag_with<'r>(
         &self,
         recorder: &Recorder,
@@ -315,16 +296,10 @@ impl NativeServer {
     }
 }
 
-/**
- * @brief 클라이언트를 막아 답하지 않았음을 알린다.
- * @details 접근 제한과 속도 제한 판정은 통계 기록기에만 남았다. 기록기를 끈 배포에서는
- *          "왜 아무것도 안 되는지"를 알 방법이 없다. 판정마다 호출되는 경로라 종류별로
- *          2의 거듭제곱 번째만 남긴다.
- */
+/// Logs refused clients. Otherwise the verdicts reach only the stats recorder, and with it off
+/// nothing shows why queries fail. Called per verdict, so only powers of two are logged per kind.
 fn note_rejection(action: Action, client: &ClientInfo) {
-    /** @brief 접근 제한에 막힌 누적 수. */
     static DENIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    /** @brief 속도 제한에 막힌 누적 수. */
     static THROTTLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (counter, denied) = match action {
         Action::Denied => (&DENIED, true),
@@ -342,17 +317,12 @@ fn note_rejection(action: Action, client: &ClientInfo) {
     }
 }
 
-/**
- * @brief 접근 제어가 버리라고 한 것을 아무 응답 없이 버렸음을 알린다.
- * @details 버린 질의는 응답 코드가 없어 질의 기록과 통계에 남지 않는다. 버림이 실제로
- *          일어나는지 운영자가 알 수 있는 곳은 이 기록뿐이다. 패킷과 연결마다 불리는 경로라
- *          까닭별로 2의 거듭제곱 번째만 남긴다. 목록 밖 버림은 인터넷 전체의 탐색을 받으므로
- *          한 카운터로 세면 버림 목록의 기록이 그 사이에 묻힌다.
- */
+/// Logs silent ACL drops. A dropped query has no rcode and appears in neither the query log nor
+/// stats, so this is the only trace. Called per packet and connection, so only powers of two are
+/// logged per reason. Unlisted drops come from Internet-wide scanning; one shared counter would
+/// bury the drop-list entries.
 pub(super) fn note_dropped(source: IpAddr, reason: DropReason) {
-    /** @brief 버림 목록으로 버린 누적 수. */
     static LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    /** @brief 어느 규칙에도 걸리지 않아 버린 누적 수. */
     static UNLISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = match reason {
         DropReason::DropList => &LISTED,
@@ -372,13 +342,9 @@ pub(super) fn note_dropped(source: IpAddr, reason: DropReason) {
     }
 }
 
-/**
- * @brief 질의를 풀지 못해 SERVFAIL로 답했음을 알린다.
- * @details 통계 기록기를 끈 배포에서는 이 기록이 해석 실패를 알 수 있는 유일한 경로다.
- *          질의마다 호출되는 경로라 2의 거듭제곱 번째만 남긴다.
- */
+/// Logs a SERVFAIL for a query that could not be resolved. With stats off this is the only trace of
+/// resolution failures. Called per query, so only powers of two are logged.
 fn resolution_failed(reason: &'static str, stage: &'static str, name: Option<&ApName>) {
-    /** @brief 누적 실패 수. */
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if !count.is_power_of_two() {

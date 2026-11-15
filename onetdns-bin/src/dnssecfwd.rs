@@ -1,114 +1,80 @@
-/**
- * @file
- * @brief 전달 방식에서 받은 응답을 이 서버가 직접 검증한다.
- *
- * @details 재귀 방식은 위임을 직접 걸으므로 내려오는 길에 DNSKEY와 DS를 함께 모은다.
- *          전달 방식에는 그 길이 없으므로 업스트림 서버에 DNSKEY와 DS를 따로 물어 신뢰 체인을
- *          구성한다. 업스트림이 이미 검증한 결과(AD 비트)는 믿지 않는다. 업스트림이 무엇을 했는지
- *          이 서버가 확인할 수 없기 때문이다.
- * @warning 업스트림에는 언제나 CD=1로 묻는다. 그러지 않으면 서명이 깨진 이름에 업스트림이 먼저
- *          SERVFAIL로 답해 버려 이 서버가 무엇이 잘못됐는지 볼 수 없다.
- */
+//! Validates forwarded responses itself. Recursion collects DNSKEY and DS on its way down the
+//! delegations; forwarding has no such path, so this layer asks the upstream for DNSKEY and DS to
+//! build the chain of trust. The upstream's AD bit is not trusted, since this server cannot check
+//! what the upstream did.
+//!
+//! Upstream queries always set CD: otherwise the upstream answers SERVFAIL first for a name with a
+//! broken signature, and this server cannot see what went wrong.
+
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 use onetdns_core::MutexExt;
 use onetdns_proto::{Edns, Message, Name, Record, RecordType, ResponseCode};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
-/**
- * @brief 체인 하나를 구성하는 동안 업스트림에 물을 수 있는 횟수 상한.
- *
- * @details 이름 하나가 업스트림에 무한정 질의를 일으키지 못하게 한다. 루트부터 리프까지 라벨마다
- *          DS 한 번과 DNSKEY 한 번이면 족하므로, 흔한 깊이에서는 절반도 쓰지 않는다.
- * @warning 초과하면 검증 실패로 본다. 모르는 것을 안전하다고 답하지 않는다.
- */
+/// Upstream queries one chain may spend, so one name cannot cause unbounded upstream queries. One
+/// DS and one DNSKEY per label from the root down is enough, so common depths use less than half.
+/// Going over counts as a validation failure.
 const MAX_CHAIN_QUERIES: u32 = 24;
 
-/** @brief 체인을 구성할 때 따라 내려갈 라벨 수 상한. */
 const MAX_CHAIN_DEPTH: usize = 16;
 
-/** @brief 확정한 체인을 담아 둘 곳 수. */
 const CHAIN_CACHE_ENTRIES: usize = 4096;
 
-/** @brief 확정한 체인을 이보다 오래 가지고 있지 않는다. */
 const CHAIN_CACHE_MAX_TTL: u32 = 3600;
 
-/** @brief 확정한 체인을 최소한 이만큼은 가지고 있는다. 라벨마다 다시 묻지 않으려는 것이다. */
+/// Floor, so a short TTL does not make every query rebuild the chain.
 const CHAIN_CACHE_MIN_TTL: u32 = 60;
 
-/**
- * @brief 한 영역까지 구성한 신뢰 체인의 결과.
- *
- * @details 서명이 없는 위임을 만나면 그 아래는 검증할 것이 없다. 그것과 "검증에 실패했다"를
- *          구분해야 서명 없는 영역을 SERVFAIL로 막지 않는다.
- */
+/// An unsigned delegation leaves nothing to validate below it. Telling that apart from a validation
+/// failure keeps unsigned zones from being answered SERVFAIL.
 #[derive(Clone)]
 enum ChainVerdict {
-    /** @brief 이름을 담는 서명된 영역과 그 확정된 키. */
     Secure {
-        /** @brief 영역의 확정된 키. */
         keys: Arc<[onetdns_dnssec::Dnskey]>,
-        /** @brief 이름을 담는 가장 깊은 영역 apex. */
+        /// The deepest zone apex containing the name.
         apex: Name,
     },
-    /** @brief 위임이 서명되지 않아 검증할 것이 없다. */
+    /// The delegation is unsigned; nothing to validate.
     Insecure,
 }
 
-/** @brief 담아 둔 체인 하나. */
 struct CachedChain {
-    /** @brief 판정. */
     verdict: ChainVerdict,
-    /** @brief 이 시각이 지나면 체인을 다시 구성한다. Unix 초. */
+    /// Unix seconds.
     expires: u32,
-    /** @brief 이 판정을 낼 때 쓴 앵커의 지문. 앵커가 바뀌면 버린다. */
+    /// Fingerprint of the anchors this verdict used; the entry is discarded when they change.
     anchor_tag: u64,
 }
 
-/**
- * @brief 전달받은 응답을 검증하는 계층.
- *
- * @invariant 이 계층 위쪽(캐시 계열)은 이미 검증된 응답만 본다. 아래쪽(예비 업스트림 포함)은
- *            전부 이 계층을 거친다.
- */
+/// Layers above it, the caches, see only validated responses; everything below it, fallback
+/// upstreams included, goes through it.
 pub struct ForwardValidateLayer {
-    /** @brief 실제로 물어볼 곳. */
     inner: Arc<dyn Resolver>,
-    /** @brief 루트 신뢰 기준. 무중단 갱신으로 바뀔 수 있다. */
+    /// Root trust anchors; replaced by hot reload.
     anchors: Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
-    /** @brief 확정한 체인. */
     chains: Mutex<onetdns_core::LruMap<Vec<u8>, CachedChain>>,
-    /** @brief 부수 질의에 붙일 번호. */
     next_id: AtomicU16,
-    /** @brief 판정 방침. */
     policy: ForwardValidationPolicy,
 }
 
-/**
- * @brief 전달 검증기의 판정 방침. 재귀 리졸버와 같은 설정 키에서 온다.
- * @details 전달 방식이 기본값이므로, 이 키들이 재귀 리졸버에만 닿으면 대부분의 설치에서 아무 효과가
- *          없다.
- */
+/// Uses the recursive resolver's config keys. Forwarding is the default, so keys that reached only
+/// the recursive resolver would do nothing on most installations.
 pub struct ForwardValidationPolicy {
-    /** @brief DS 부재에 서명된 증명을 요구할지. */
+    /// Require a signed proof for a missing DS.
     pub strict: bool,
-    /** @brief 검증에 실패한 답을 SERVFAIL 대신 AD 없이 내보낼지. */
+    /// Send a failed answer without AD instead of SERVFAIL.
     pub permissive: bool,
-    /** @brief 클라이언트가 CD=1로 물어도 검증할지. */
+    /// Validate even when the client sets CD.
     pub ignore_cd: bool,
-    /** @brief 검증하지 않을 도메인. 그 아래 이름도 포함한다. */
+    /// Not validated, subdomains included.
     pub insecure_domains: Vec<Name>,
-    /** @brief RFC 8509 루트 키 센티널 질의에 앵커 상태로 답할지. */
+    /// Answer RFC 8509 root key sentinel queries by the anchor state.
     pub root_key_sentinel: bool,
 }
 
 impl ForwardValidateLayer {
-    /**
-     * @brief 계층을 만든다.
-     * @param inner 실제로 물어볼 곳. 예비 업스트림까지 포함한 것이어야 한다.
-     * @param anchors 루트 신뢰 기준 핸들.
-     * @param policy 판정 방침.
-     */
+    /// `inner` must include the fallback upstreams.
     pub fn new(
         inner: Arc<dyn Resolver>,
         anchors: Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
@@ -123,11 +89,9 @@ impl ForwardValidateLayer {
         }
     }
 
-    /**
-     * @brief 검증된 답이 센티널 질의라면 SERVFAIL 로 답해야 하는지.
-     * @details 질의자는 is-ta 와 not-ta 두 이름의 응답 차이로 이 서버가 어느 루트 키를 믿는지
-     *          알아낸다. 검증된 A, AAAA 답에만 적용한다.
-     */
+    /// Whether a validated answer to a sentinel query must become SERVFAIL. Queriers learn which
+    /// root key this server trusts from the difference between the is-ta and not-ta answers.
+    /// Applies only to validated A and AAAA answers.
     fn sentinel_fails(&self, request: &Message) -> bool {
         let Some(question) = request.questions.first() else {
             return false;
@@ -143,15 +107,11 @@ impl ForwardValidateLayer {
             .is_some_and(|sentinel| sentinel.fails(&self.anchors.load()))
     }
 
-    /** @brief 부수 질의에 쓸 번호. */
     fn query_id(&self) -> u16 {
         self.next_id.fetch_add(1, Ordering::Relaxed) | 1
     }
 
-    /**
-     * @brief 업스트림에 한 건 묻는다. 서명을 받아야 하므로 DO=1, 업스트림 판정을 막으려 CD=1이다.
-     * @return 응답. 닿지 못하면 없다.
-     */
+    /// DO to get signatures, CD to keep the upstream from judging. None when unreachable.
     fn ask(&self, name: &Name, qtype: RecordType, budget: &mut u32) -> Option<Message> {
         if *budget == 0 {
             return None;
@@ -173,7 +133,7 @@ impl ForwardValidateLayer {
         Some(response)
     }
 
-    /** @brief 앵커 목록의 지문. 앵커가 바뀌면 담아 둔 판정을 못 쓰게 하려는 것이다. */
+    /// So cached verdicts stop counting once the anchors change.
     fn anchor_tag(anchors: &[onetdns_dnssec::Ds]) -> u64 {
         let mut tag: u64 = 0xcbf2_9ce4_8422_2325;
         for ds in anchors {
@@ -192,7 +152,7 @@ impl ForwardValidateLayer {
         tag
     }
 
-    /** @brief 담아 둔 판정을 꺼낸다. 앵커가 바뀌었거나 수명이 지났으면 없다. */
+    /// None when the anchors changed or the entry expired.
     fn cached(&self, zone: &Name, now: u32, anchor_tag: u64) -> Option<ChainVerdict> {
         let key = zone.canonical_key();
         let mut chains = self.chains.lock_recover();
@@ -204,7 +164,6 @@ impl ForwardValidateLayer {
         Some(entry.verdict.clone())
     }
 
-    /** @brief 판정을 담아 둔다. */
     fn remember(&self, zone: &Name, verdict: &ChainVerdict, now: u32, ttl: u32, anchor_tag: u64) {
         let ttl = ttl.clamp(CHAIN_CACHE_MIN_TTL, CHAIN_CACHE_MAX_TTL);
         self.chains.lock_recover().put(
@@ -217,19 +176,18 @@ impl ForwardValidateLayer {
         );
     }
 
-    /**
-     * @brief 루트부터 이 이름을 담는 영역까지 신뢰 체인을 구성한다.
-     *
-     * @details 루트의 DNSKEY를 앵커로 확정한 뒤, 라벨을 하나씩 내려가며 DS를 묻는다. DS가
-     *          있으면 그 이름이 서명된 위임이므로 DNSKEY까지 확정하고 내려간다. DS가 없으면
-     *          부모 키로 서명된 증명을 보고 서명되지 않은 위임인지, 위임이 아닌 보통 이름인지
-     *          가린다. 위임이 아니면 같은 영역 키를 가지고 다음 라벨로 간다.
-     * @warning 라벨마다 위임이라고 가정하면 서명된 영역의 보통 이름에 대한 DS 부재 증명이
-     *          서명되지 않은 위임의 증명으로 읽힌다. 그러면 서명을 떼어 낸 답이 검증 없이
-     *          나가고, 이름 자신을 서명자로 적은 위조 서명도 통과한다.
-     * @param name 체인 끝. 응답 서명의 signer 이름이거나, 서명이 없을 때는 질의 이름이다.
-     * @return 확정된 판정. 구성하지 못하면 없다. 그때는 검증 실패로 다룬다.
-     */
+    /// Builds the chain of trust from the root to the zone containing `name`. After confirming the
+    /// root DNSKEY against the anchors, it walks down one label at a time asking for DS. A DS means
+    /// a signed delegation: its DNSKEY is confirmed and the walk continues. Without a DS, the
+    /// parent-signed proof tells an unsigned delegation from an ordinary name, and an ordinary name
+    /// continues with the same zone keys.
+    ///
+    /// Assuming every label is a delegation would read the DS denial for an ordinary name in a
+    /// signed zone as proof of an unsigned delegation: a stripped answer would then go out
+    /// unvalidated, and a forged signature naming the name itself as signer would pass.
+    ///
+    /// `name` is the signer of the response signature, or the query name when unsigned. None when
+    /// the chain cannot be built, which counts as a validation failure.
     fn chain_to(&self, name: &Name, now: u32, budget: &mut u32) -> Option<ChainVerdict> {
         let anchors = self.anchors.load();
         if anchors.is_empty() {
@@ -355,7 +313,7 @@ impl ForwardValidateLayer {
         Some(verdict)
     }
 
-    /** @brief 이 영역의 DNSKEY와 그 서명. 어느 하나라도 없으면 없다. */
+    /// None unless both the DNSKEY set and its signatures are present.
     fn dnskey_rrset(
         &self,
         zone: &Name,
@@ -370,10 +328,8 @@ impl ForwardValidateLayer {
         Some((dnskeys, dnskey_rrsigs))
     }
 
-    /**
-     * @brief 이 이름의 DS와, DS가 없다면 그 부재 증명을 모은다.
-     * @return (DS, DS 서명, NSEC, NSEC 서명, NSEC3, NSEC3 서명).
-     */
+    /// The DS for this name, or the proof that it has none. Returns (DS, DS signatures, NSEC, NSEC
+    /// signatures, NSEC3, NSEC3 signatures).
     #[allow(clippy::type_complexity)]
     fn delegation_evidence(
         &self,
@@ -422,21 +378,18 @@ impl ForwardValidateLayer {
         ))
     }
 
-    /**
-     * @brief 응답 하나를 판정한다.
-     * @return 참이면 서명이 확인됐다(AD를 설정한다), 거짓이면 검증할 것이 없다(그대로 낸다).
-     *         실패는 없음으로 답하고 호출자가 SERVFAIL로 바꾼다.
-     */
+    /// True when the signatures check out and AD is set; false when there is nothing to validate
+    /// and the response passes as is. None on failure, which the caller turns into SERVFAIL.
     fn verdict_for(&self, response: &Message, now: u32, budget: &mut u32) -> Option<bool> {
         let question = response.questions.first()?;
         if response.answers.is_empty() {
-            /*
-             * 답이 없는 응답이다. 증명은 권한 구간에 있고 이 계층은 부재 증명까지 확인하지
-             * 않으므로 AD를 설정하지 않고 그대로 낸다. 답 구간에 서명이 없다는 것만으로
-             * 떼어 낸 것으로 보면, 서명된 영역의 NODATA가 전부 SERVFAIL이 된다.
-             * 다만 서명된 영역인데 권한 구간에도 서명이 하나도 없으면 누가 걷어 낸
-             * 것이므로 막는다. 그러지 않으면 답을 지워 부정 응답으로 바꾸는 강등이 통한다.
-             */
+            // No answer records. The proof is in the authority section, and this layer does not
+            // check denial proofs, so the response passes without AD. Treating a missing answer
+            // signature as stripped would SERVFAIL every NODATA in signed zones.
+            //
+            // A signed zone with no signature even in the authority section was stripped, though,
+            // and is blocked; otherwise deleting the answers to fake a negative response would
+            // work.
             let stripped = matches!(
                 self.chain_to(&question.name, now, budget),
                 Some(ChainVerdict::Secure { .. })
@@ -457,10 +410,8 @@ impl ForwardValidateLayer {
         let signer = match answer_signer(response) {
             Some(signer) => signer,
             None => {
-                /*
-                 * 서명이 하나도 없다. 서명돼야 할 곳인지 체인으로 확인한다. 서명되지 않은
-                 * 영역이면 그대로 두고, 서명된 영역인데 서명이 없으면 떼어 낸 것이다.
-                 */
+                // No signatures at all, so the chain tells whether there should be some: an
+                // unsigned zone passes as is, and a signed zone was stripped.
                 return match self.chain_to(&question.name, now, budget) {
                     Some(ChainVerdict::Insecure) => Some(false),
                     Some(ChainVerdict::Secure { .. }) => None,
@@ -483,10 +434,8 @@ impl ForwardValidateLayer {
         };
         let rrset = section_records(&response.answers, &question.name, question.qtype);
         if rrset.is_empty() {
-            /*
-             * 답이 없는 응답이다. 부정 응답의 증명까지 여기서 세우지는 않으므로 서명을
-             * 확인했다고 말하지 않는다. 틀린 AD를 설정하는 것보다 설정하지 않는 편이 낫다.
-             */
+            // No records of the question's name and type, as with an alias only. That is not
+            // checked further here, so AD is not claimed; a missing AD is better than a wrong one.
             return Some(false);
         }
         let rrsigs = covering_rrsigs(&response.answers, &question.name, question.qtype);
@@ -517,21 +466,17 @@ impl ForwardValidateLayer {
 }
 
 impl Resolver for ForwardValidateLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         crate::layers::outcome_to_option(self.resolve_outcome(request))
     }
 
-    /**
-     * @brief 업스트림 응답을 받아 이 서버가 검증한 뒤 AD를 설정한다.
-     *
-     * @details 클라이언트가 CD=1로 물으면 검증을 건너뛴다. 그것이 CD의 뜻이다.
-     * @warning 검증에 실패하면 답을 내보내지 않는다. 사유는 되돌릴 수 없는 실패로 알린다.
-     *          다른 업스트림에 다시 물어도 같은 서명이 온다.
-     * @warning 내보내기 전에 원래 질의 기준으로 DNSSEC 전용 레코드를 걷어낸다. 안쪽 계층은
-     *          이 서버가 DO=1로 바꿔 물은 질의를 보므로 걷어내지 않는다. 여기서 빠뜨리면 DO 없이
-     *          물은 질의자, EDNS 를 모르는 질의자에게도 RRSIG 가 나간다.
-     */
+    /// Validates the upstream answer and sets AD. A client CD skips validation, as CD means. A
+    /// failed answer is not sent, and its reason is reported as a non-retryable failure, since
+    /// another upstream would send the same signatures.
+    ///
+    /// DNSSEC-only records are stripped per the original query before sending. Inner layers see the
+    /// query with DO set by this server and do not strip them, so a querier without DO or without
+    /// EDNS would otherwise get RRSIGs.
     fn resolve_outcome(&self, request: &Message) -> ResolveOutcome {
         let honor_cd = request.header.checking_disabled && !self.policy.ignore_cd;
         if honor_cd || request.questions.len() != 1 {
@@ -612,11 +557,8 @@ impl Resolver for ForwardValidateLayer {
     }
 }
 
-/**
- * @brief 클라이언트가 AD 비트를 받겠다고 했는지.
- * @details RFC 6840 은 DO 나 AD 를 설정해 물은 질의자에게만 AD 를 설정하라고 한다. 둘 다 없는
- *          질의자는 AD 를 해석하지 못할 수 있다.
- */
+/// RFC 6840: set AD only for a querier that set DO or AD; one that set neither may not understand
+/// it.
 fn asks_for_ad(request: &Message) -> bool {
     request.header.authentic_data
         || request
@@ -627,7 +569,7 @@ fn asks_for_ad(request: &Message) -> bool {
             .any(|edns| edns.dnssec_ok)
 }
 
-/** @brief 요청에 DO 비트를 설정한다. OPT가 없으면 만든다. */
+/// Creates the OPT when missing.
 pub(crate) fn set_dnssec_ok(request: &mut Message) {
     if let Some(existing) = request
         .additionals
@@ -655,7 +597,6 @@ pub(crate) fn set_dnssec_ok(request: &mut Message) {
     }
 }
 
-/** @brief 이 이름과 종류의 레코드만 모은다. */
 fn section_records(section: &[Record], name: &Name, qtype: RecordType) -> Vec<Record> {
     section
         .iter()
@@ -664,7 +605,7 @@ fn section_records(section: &[Record], name: &Name, qtype: RecordType) -> Vec<Re
         .collect()
 }
 
-/** @brief 이 종류의 레코드만 모은다. 이름은 보지 않는다. */
+/// The name is ignored.
 fn records_of_type(section: &[Record], qtype: RecordType) -> Vec<Record> {
     section
         .iter()
@@ -673,7 +614,6 @@ fn records_of_type(section: &[Record], qtype: RecordType) -> Vec<Record> {
         .collect()
 }
 
-/** @brief 이 이름과 종류를 덮는 서명들. */
 fn covering_rrsigs(
     section: &[Record],
     name: &Name,
@@ -687,7 +627,7 @@ fn covering_rrsigs(
         .collect()
 }
 
-/** @brief 이 종류를 덮는 서명들. 이름은 보지 않는다. */
+/// The name is ignored.
 fn rrsigs_covering_type(section: &[Record], qtype: RecordType) -> Vec<onetdns_dnssec::Rrsig> {
     section
         .iter()
@@ -697,13 +637,8 @@ fn rrsigs_covering_type(section: &[Record], qtype: RecordType) -> Vec<onetdns_dn
         .collect()
 }
 
-/**
- * @brief 답을 서명한 영역 이름.
- *
- * @details signer 이름을 서명에서 가져온다. 전달 방식에는 위임을 걸은 기록이 없으므로,
- *          어느 영역의 키로 확인해야 하는지는 서명 자신만 알려 줄 수 있다.
- * @return 답 구간에 질문 종류를 덮는 서명이 있으면 그 signer.
- */
+/// Forwarding keeps no record of the delegations, so only the signature itself says which zone's
+/// keys check it. The signer of the answer signature covering the question type.
 fn answer_signer(response: &Message) -> Option<Name> {
     let qtype = response.questions.first()?.qtype;
     response
@@ -715,7 +650,6 @@ fn answer_signer(response: &Message) -> Option<Name> {
         .map(|rrsig| rrsig.signer)
 }
 
-/** @brief 지금 Unix 초. */
 fn now_secs() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -729,11 +663,10 @@ mod tests {
     use crate::native::ResolveOutcome;
     use onetdns_proto::{DnsClass, Question, RData};
 
-    /** @brief 미리 정해 둔 답만 내주는 리졸버. 업스트림에 실제로 묻지 않으려는 것이다. */
+    /// Answers only from preset responses, so tests never reach a real upstream.
     struct Canned {
-        /** @brief (이름 소문자, 종류) 별 답. */
+        /// Keyed by lowercase name and type.
         answers: std::collections::HashMap<(String, u16), Message>,
-        /** @brief 받은 질의 수. */
         asked: std::sync::atomic::AtomicUsize,
     }
 
@@ -749,7 +682,6 @@ mod tests {
         }
     }
 
-    /** @brief 서명 없는 답 하나. */
     fn unsigned_answer(name: &str) -> Message {
         let owner = Name::from_str(name).unwrap();
         let mut message = Message::query(1, owner.clone(), RecordType::A);
@@ -765,7 +697,7 @@ mod tests {
         message
     }
 
-    /** @brief 루트 신뢰 기준이 비어 있는 검증기. 체인을 구성할 수 없다. */
+    /// With no root anchors, no chain can be built.
     fn layer_without_anchors(inner: Arc<dyn Resolver>) -> ForwardValidateLayer {
         ForwardValidateLayer::new(
             inner,
@@ -781,12 +713,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트가 CD=1로 물으면 검증을 건너뛰는지.
-     *
-     * @details CD의 뜻이 그것이다. 건너뛰지 않으면 검증을 끄고 원본을 보려는 진단이
-     *          이 서버의 판정에 막혀 아무것도 볼 수 없게 된다.
-     */
+    /// Otherwise a diagnosis that turns validation off to see the original answer would be blocked
+    /// by this server's verdict.
     fn checking_disabled_passes_through_untouched() {
         let mut answers = std::collections::HashMap::new();
         answers.insert(
@@ -815,12 +743,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DO 없이 물은 질의자에게 DNSSEC 전용 레코드가 나가지 않는지.
-     *
-     * @details 업스트림에는 DO=1로 묻기 때문에 서명이 붙은 답이 돌아온다. 오류 응답을
-     *          그대로 넘기는 분기와 검증을 마친 분기가 같은 걷어내기를 거친다.
-     */
+    /// Upstream queries set DO, so signed answers come back. The branch that passes an error
+    /// response through and the validated branch go through the same stripping.
     fn dnssec_records_do_not_reach_a_client_that_did_not_ask() {
         let owner = Name::from_str("refused.test").unwrap();
         let mut refused = Message::query(1, owner.clone(), RecordType::A);
@@ -862,12 +786,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 체인을 구성하지 못하면 답하지 않는지.
-     *
-     * @details 루트 신뢰 기준이 없으면 서명이 있는지조차 판정할 수 없다. 그때 그대로
-     *          내보내면 검증한다고 말해 놓고 검증하지 않은 답을 주는 것이 된다.
-     */
+    /// Without root anchors, whether signatures exist cannot even be decided; passing the answer
+    /// would claim validation that never happened.
     fn an_unbuildable_chain_is_not_answered() {
         let mut answers = std::collections::HashMap::new();
         answers.insert(
@@ -891,7 +811,7 @@ mod tests {
         );
     }
 
-    /** @brief 답이 없는 응답. 부정 증명을 권한 구간에 담을지 고를 수 있다. */
+    /// `signed_denial` puts a signed denial in the authority section.
     fn nodata_answer(name: &str, signed_denial: bool) -> Message {
         let owner = Name::from_str(name).unwrap();
         let mut message = Message::query(1, owner.clone(), RecordType::A);
@@ -917,15 +837,12 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답이 없는 응답을 서명이 떼인 것으로 오해하지 않는지.
-     *
-     * @details 부정 응답의 증명은 권한 구간에 있으므로 답 구간에는 서명이 없는 것이
-     *          정상이다. 답 구간만 보고 판정하면 서명된 영역의 NODATA가 전부 SERVFAIL이
-     *          된다. AAAA가 없는 이름, HTTPS 기록이 없는 이름이 모두 여기 걸린다.
-     * @note 그 대신 권한 구간에도 서명이 하나도 없으면 막는다. 답을 지워 부정 응답으로
-     *       바꾸는 강등을 그대로 통과시키지 않기 위해서다.
-     */
+    /// A negative answer's proof is in the authority section, so a missing answer signature is
+    /// normal. Judging by the answer section alone would SERVFAIL every NODATA in signed zones,
+    /// such as names without AAAA or HTTPS records.
+    ///
+    /// A signed zone with no signature in the authority section either is still blocked, so
+    /// stripping answers to fake a negative response does not pass.
     fn a_negative_answer_is_not_treated_as_a_stripped_signature() {
         let build = |signed_denial: bool| {
             let mut answers = std::collections::HashMap::new();
@@ -940,7 +857,7 @@ mod tests {
         };
         let request = Message::query(9, Name::from_str("nodata.test").unwrap(), RecordType::A);
 
-        /* 루트 신뢰 기준이 없으면 체인이 Secure가 아니므로 부정 응답은 그대로 나간다. */
+        // No root anchors, so the chain is not Secure and the negative answer passes.
         let layer = layer_without_anchors(build(true));
         let outcome = layer.resolve_outcome(&request);
         let ResolveOutcome::Response(response) = outcome else {
@@ -956,7 +873,7 @@ mod tests {
             "부재 증명을 확인하지 않았으므로 AD를 설정하면 안 됩니다"
         );
 
-        /* 권한 구간에 서명이 없어도, 체인이 Secure가 아니면 막을 근거가 없다. */
+        // Unsigned authority, but without a Secure chain there is no ground to block.
         let layer = layer_without_anchors(build(false));
         assert!(
             matches!(layer.resolve_outcome(&request), ResolveOutcome::Response(_)),
@@ -965,7 +882,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림에 보내는 질의에 DO와 CD가 서는지. */
     fn upstream_queries_carry_do_and_cd() {
         struct Spy(Mutex<Vec<(bool, bool)>>);
         impl Resolver for Spy {
@@ -995,7 +911,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요청에 이미 OPT가 있어도 DO만 설정하고 나머지는 그대로 두는지. */
     fn existing_opt_keeps_its_payload_size() {
         let mut request = Message::query(7, Name::from_str("a.test").unwrap(), RecordType::A);
         let edns = Edns {
@@ -1017,7 +932,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 답을 서명한 영역을 서명 자신에게서 읽는지. */
     fn the_signer_comes_from_the_signature() {
         let owner = Name::from_str("deep.sub.example.test").unwrap();
         let mut response = unsigned_answer("deep.sub.example.test");

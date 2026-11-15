@@ -1,31 +1,25 @@
-/*!
- * @brief 대시보드가 보여 주는 한국어 문구에 영어, 일본어, 중국어 번역이 있는지 검사한다.
- *
- * @details 대시보드는 두 경로로 화면을 그린다. 템플릿 텍스트는 localizeDom 이 실행
- *          중에 바꾸고, React 쪽 코드는 this.t 나 this.tr 로 직접 바꾼다. 둘 다 한국어
- *          원문을 키로 삼아 사전을 찾고, 키가 없으면 그 키를 그대로 돌려준다. 그래서
- *          번역이 없어도 오류가 나지 않고 영어 화면에 한국어가 그대로 나온다.
- * @details localizeDom 은 data-dc-tpl 이 붙은 요소 아래만 바꾼다. React 가 만든
- *          요소에는 그 표시가 없어서, React 에 넘긴 한국어 문자열은 영어 화면에도
- *          그대로 나온다. 사전만 확인해서는 이 경우를 잡을 수 없다. 문자열이 사전에
- *          있는데 아무도 찾지 않은 것이기 때문이다.
- * @details 서버가 보내는 문자열도 함께 확인한다. 관리 API 는 영어로 답하므로, 오류
- *          본문은 한국어, 일본어, 중국어 사전에 영어 원문을 키로 올라 있어야 한다.
- *          그렇지 않으면 errorText 가 대비 문구 뒤에 영어 원문을 붙여 보여 준다. 그
- *          문자열은 Rust 쪽에 있어서 HTML 만으로는 찾을 수 없다.
- * @note 한 가지는 여기서 잡히지 않는다. 렌더 위치에서 변수에 붙은 t 를 빼는 경우다.
- *       소스 텍스트만으로는 그 변수에 무엇이 담기는지 알 수 없다.
- */
+//! Every Korean string the dashboard shows must have en, ja, and zh translations. Template text is
+//! translated at run time by localizeDom, and React code calls this.t or this.tr; both look up the
+//! Korean source as the key and return the key itself when it is missing, so a gap shows Korean on
+//! an English screen with no error. localizeDom only covers elements under data-dc-tpl, which React
+//! elements lack, so a Korean string passed to React shows as is even when the dictionary has it.
+//!
+//! Server strings are checked too: the management API answers in English, so error bodies must be
+//! keys in the ko, ja, and zh dictionaries, or errorText shows a fallback followed by the English
+//! original. Those strings live in Rust, not in the HTML.
+//!
+//! Not caught: removing t from a variable at the render site, since the source alone does not show
+//! what the variable holds.
 
 mod common;
 
 use common::{collect, production_prefix, read, rel, root};
 use std::collections::{BTreeMap, BTreeSet};
 
-/** @brief t 가 접미 일치로 키를 찾을 때 쓰는 시작 조각. 실행 중 규칙과 같아야 한다. */
+/// Where a suffix match may start; must match the runtime rule in t.
 const SUFFIX_STARTS: &[&str] = &[" ", "개 ", "개를 ", "번 ", "\" DNS"];
 
-/** @brief 값이 그대로 화면에 표시되는 렌더 데이터 키. */
+/// Render data keys whose values are shown as is.
 const RENDER_DATA_KEYS: &[&str] = &[
     "label",
     "val",
@@ -37,12 +31,10 @@ const RENDER_DATA_KEYS: &[&str] = &[
     "placeholder",
 ];
 
-/**
- * @brief 렌더 위치에서 번역하기로 정한 데이터. 의도적으로 고정한 목록이다.
- * @details ACT 와 TRANSPORT 는 this.state 가 만들어지기 전에 생성되는 클래스 항목이라,
- *          여기서 번역하면 생성 시점의 언어가 그대로 굳는다. 나머지는 질의 진단 패널이
- *          explainEl 에서 번역한다. 새 항목은 실제로 t 를 거치는지 확인한 뒤에 적는다.
- */
+/// Data translated at the render site, pinned on purpose. ACT and TRANSPORT are class fields built
+/// before this.state exists, so translating them there would freeze the language they were built
+/// in; the query diagnostics panel translates the rest in explainEl. Add an entry only after
+/// checking that it goes through t.
 const RENDER_DATA_LITERALS: &[(&str, &str)] = &[
     ("label", "정상 응답"),
     ("label", "차단"),
@@ -68,15 +60,12 @@ const RENDER_DATA_LITERALS: &[(&str, &str)] = &[
     ("label", "응답"),
 ];
 
-/** @brief 번역을 거치는 호출 이름. */
 const TRANSLATING_CALLS: &[&str] = &["this.t(", "this.tr(", "toastMsg(", "confirmDestructive("];
 
-/** @brief 한글이 한 글자라도 들어 있는지 알려 준다. */
 fn has_korean(text: &str) -> bool {
     text.chars().any(|ch| ('가'..='힣').contains(&ch))
 }
 
-/** @brief 자바스크립트 이스케이프 표기를 실제 문자열로 되돌린다. */
 fn unescape(value: &str) -> String {
     value
         .replace("\\n", "\n")
@@ -84,10 +73,7 @@ fn unescape(value: &str) -> String {
         .replace("\\\"", "\"")
 }
 
-/**
- * @brief 한 줄 안에서 따옴표로 둘러싸인 문자열의 위치를 모은다.
- * @return 내용의 시작 위치와 끝 위치.
- */
+/// Start and end of each quoted string's contents within a line.
 fn quoted_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
@@ -113,14 +99,10 @@ fn quoted_spans(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/**
- * @brief 사전 블록에 선언된 키.
- * @details 화면 문구는 한국어 원문이, 서버 문구는 영어 원문이 키다.
- * @details 키는 뒤에 콜론이 따라오는 문자열이다. 콜론이 없으면 그 따옴표는 키를 여는
- *          곳이 아니었다는 뜻이므로, 닫는 위치 뒤로 건너뛰지 않고 한 글자만
- *          나아가 다시 확인한다. 큰따옴표로 시작하는 키가 실제로 있어서, 건너뛰면
- *          그 키를 전부 놓친다.
- */
+/// Keys in a dictionary block: Korean source for screen copy, English for server copy. A key is a
+/// string followed by a colon. When no colon follows, the quote did not open a key, so this moves
+/// on by one character instead of past the closing quote; some keys start with a double quote, and
+/// skipping would miss them all.
 fn literal_keys(segment: &str) -> BTreeSet<String> {
     let bytes = segment.as_bytes();
     let mut found = BTreeSet::new();
@@ -154,7 +136,6 @@ fn literal_keys(segment: &str) -> BTreeSet<String> {
     found
 }
 
-/** @brief 여는 중괄호에서 시작하는 객체 리터럴 전체. */
 fn balanced_object(text: &str, brace: usize) -> &str {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
@@ -175,7 +156,6 @@ fn balanced_object(text: &str, brace: usize) -> &str {
     panic!("사전 객체의 괄호가 닫히지 않았습니다");
 }
 
-/** @brief 여는 괄호에 짝이 되는 닫는 괄호 위치. */
 fn call_end(source: &str, open: usize) -> usize {
     let bytes = source.as_bytes();
     let mut depth = 0usize;
@@ -200,7 +180,6 @@ fn call_end(source: &str, open: usize) -> usize {
     bytes.len()
 }
 
-/** @brief 번역을 거치는 호출들이 차지하는 구간. */
 fn translating_spans(script: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for head in TRANSLATING_CALLS {
@@ -214,7 +193,6 @@ fn translating_spans(script: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/** @brief 렌더 호출들이 차지하는 구간. */
 fn rendering_spans(script: &str) -> Vec<(usize, usize)> {
     let bytes = script.as_bytes();
     let mut out = Vec::new();
@@ -246,14 +224,12 @@ fn rendering_spans(script: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/** @brief 주어진 위치가 구간 안에 들어 있는지 알려 준다. */
 fn within(position: usize, spans: &[(usize, usize)]) -> bool {
     spans
         .iter()
         .any(|(start, end)| *start < position && position < *end)
 }
 
-/** @brief 한 언어에 등록된 키 전부. */
 fn dictionary(text: &str, lang: &str) -> BTreeSet<String> {
     let start = text
         .find("const I18N = {")
@@ -289,7 +265,7 @@ fn dictionary(text: &str, lang: &str) -> BTreeSet<String> {
     keys
 }
 
-/** @brief t 가 이 문자열을 그대로, 또는 접두나 접미 일치로 찾을 수 있는지 알려 준다. */
+/// Exactly, or by the prefix and suffix matches t uses.
 fn resolvable(key: &str, keys: &BTreeSet<String>) -> bool {
     if keys.contains(key) {
         return true;
@@ -307,10 +283,7 @@ fn resolvable(key: &str, keys: &BTreeSet<String>) -> bool {
     })
 }
 
-/**
- * @brief 관리 API 가 돌려줄 수 있는 오류 본문.
- * @note 테스트 모듈은 흉내 낸 응답이라 세지 않는다.
- */
+/// Test modules are skipped; their responses are mocks.
 fn server_error_strings() -> BTreeMap<String, String> {
     let repo = root();
     let mut sources = Vec::new();
@@ -339,10 +312,7 @@ fn server_error_strings() -> BTreeMap<String, String> {
     found
 }
 
-/**
- * @brief Rust 문자열 리터럴 안에 적힌 error 본문을 추출한다.
- * @return 본문과 그 시작 위치.
- */
+/// Error bodies inside Rust string literals, with their start positions.
 fn escaped_error_bodies(body: &str) -> Vec<(String, usize)> {
     let bytes = body.as_bytes();
     let head = "\\\"error\\\"";
@@ -389,7 +359,6 @@ fn escaped_error_bodies(body: &str) -> Vec<(String, usize)> {
     out
 }
 
-/** @brief 템플릿에서 태그를 걷어 낸 텍스트 조각. */
 fn template_chunks(template: &str) -> Vec<&str> {
     let bytes = template.as_bytes();
     let mut out = Vec::new();
@@ -414,7 +383,6 @@ fn template_chunks(template: &str) -> Vec<&str> {
     out
 }
 
-/** @brief 화면에 표시되는 한국어 문자열과 그 출처. */
 fn wanted_strings(
     template: &str,
     script: &str,
@@ -456,7 +424,6 @@ fn wanted_strings(
     wanted
 }
 
-/** @brief 렌더 호출 안에서 번역을 거치지 않은 한국어 문자열을 모은다. */
 fn untranslated_render_strings(
     script: &str,
     line_offset: usize,
@@ -474,7 +441,6 @@ fn untranslated_render_strings(
         .collect()
 }
 
-/** @brief 렌더 데이터에 직접 붙은 한국어 문자열을 모은다. */
 fn raw_render_data(script: &str, translating: &[(usize, usize)]) -> BTreeSet<(String, String)> {
     let bytes = script.as_bytes();
     let mut out = BTreeSet::new();
@@ -522,14 +488,11 @@ fn raw_render_data(script: &str, translating: &[(usize, usize)]) -> BTreeSet<(St
     out
 }
 
-/** @brief 화면 문구와 서버 오류 본문이 화면의 모든 언어로 번역되는지 확인한다. */
 #[test]
 fn every_korean_string_the_dashboard_shows_has_a_translation() {
     let source = root().join("crates/onetdns-control/dashboard/index.html");
-    /*
-     * 템플릿 속성은 줄을 넘길 수 있고 사전 키는 줄바꿈을 한 글자로 담는다. 작업본이
-     * 두 글자짜리 줄바꿈으로 받아져 있으면 같은 문자열이 서로 다르게 보인다.
-     */
+    // Template attributes can span lines, and dictionary keys hold LF; a CRLF checkout would make
+    // equal strings differ.
     let text = read(&source).replace("\r\n", "\n");
     let english = dictionary(&text, "en");
     let japanese = dictionary(&text, "ja");
@@ -612,7 +575,6 @@ fn every_korean_string_the_dashboard_shows_has_a_translation() {
     );
 }
 
-/** @brief 문자열 추출과 구간 판정이 실제로 동작하는지 확인한다. */
 #[test]
 fn the_scanning_helpers_behave() {
     let script = "R('div', this.t('가'), '나')";
@@ -638,10 +600,10 @@ fn the_scanning_helpers_behave() {
         ]
     );
 
-    /* 이름 끝에 붙은 R 은 렌더 호출이 아니다. */
+    // An R ending a name is not a render call.
     assert!(rendering_spans("myR('가')").is_empty());
 
-    /* 뒤에 콜론이 따라올 때만 키로 센다. */
+    // A key only when a colon follows.
     assert_eq!(
         literal_keys("{'가':'A','나'}")
             .into_iter()
@@ -649,7 +611,7 @@ fn the_scanning_helpers_behave() {
         vec!["가".to_string()]
     );
 
-    /* 접두와 접미 규칙이 실제로 동작한다. */
+    // Prefix and suffix matches.
     let keys: BTreeSet<String> = ["삭제 실패: ".to_string(), "개 항목".to_string()]
         .into_iter()
         .collect();

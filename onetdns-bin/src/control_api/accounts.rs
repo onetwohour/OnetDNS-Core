@@ -1,6 +1,4 @@
-/*!
- * @brief 관리 API: 관리 토큰과 대시보드 계정.
- */
+//! Management API: control tokens and dashboard accounts.
 
 use super::*;
 use crate::config_edit::{
@@ -9,7 +7,7 @@ use crate::config_edit::{
 };
 
 impl ControlDeps {
-    /** @brief 관리 토큰 목록. 토큰 값은 가린다. */
+    /// Token values are masked.
     pub(super) fn tokens_list(&self) -> String {
         let c = self.runtime_cfg.load();
         let mut items: Vec<String> = Vec::new();
@@ -30,7 +28,6 @@ impl ControlDeps {
         format!("{{\"tokens\":[{}]}}", items.join(","))
     }
 
-    /** @brief 관리 토큰을 만들어 설정에 적는다. */
     pub(super) fn token_add(&self, body: &str) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
@@ -69,7 +66,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 관리 토큰을 지운다. */
     pub(super) fn token_delete(&self, body: &str) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
@@ -90,11 +86,8 @@ impl ControlDeps {
         ))
     }
 
-    /**
-     * @brief 대시보드 계정의 암호 해시를 바꾼다.
-     * @details 계정 변경은 DNS 처리와 무관하다. 무조건 재시작하는 경로를 쓰면 비밀번호를 한 번
-     *          바꿀 때마다 이름 풀이가 끊긴다.
-     */
+    /// Account changes do not touch DNS; the unconditional restart path would interrupt resolution
+    /// on every password change.
     pub(super) fn password_change(&self, name: &str, hash: &str) -> Result<String, String> {
         let result = self.edit_config(|text| rewrite_user_password_hash(text, name, hash))?;
         Ok(format!(
@@ -104,7 +97,7 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 첫 관리자 계정을 설정에 적고 설정 코드 파일을 지운다. */
+    /// Writes the first admin account and removes the setup code file.
     pub(super) fn user_create(&self, name: &str, hash: &str) -> Result<String, String> {
         let result = self.edit_config(|text| append_user_block(text, name, hash))?;
         if let Some(code_file) = crate::setup_code_path(self.config_path.as_deref()) {

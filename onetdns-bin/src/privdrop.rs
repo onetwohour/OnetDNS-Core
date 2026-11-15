@@ -1,30 +1,23 @@
-/*!
- * @brief 권한 내려놓기.
- *
- * @details 프로세스가 다른 스레드를 띄우기 전에 지정한 사용자와 그룹으로 내려간다. 낮은 포트
- *          묶기와 네트워크 조작에 필요한 능력만 남기고 나머지는 버린다. 남긴 능력이 있어서
- *          내려간 뒤에도 낮은 포트에 묶을 수 있다.
- * @warning 능력과 no_new_privs 는 스레드마다 따로 있다. setgid 와 setuid 는 C 라이브러리가
- *          모든 스레드에 적용하지만, 능력 유지 요청과 능력 설정, no_new_privs 는 부른 스레드에만
- *          걸린다. 그래서 내려가기 전에 뜬 스레드는 능력을 모두 잃고 잠금도 걸리지 않는다.
- *          내려간 뒤에 뜬 스레드만 부른 스레드의 상태를 물려받는다.
- * @warning 순서가 중요하다. 보조 그룹, 그룹, 사용자 순으로 내려놓는다. 사용자를 먼저
- *          바꾸면 그룹을 바꿀 권한이 없어져 그룹만 그대로 남는다.
- */
+//! Drops to the configured user and group before any other thread starts, keeping only the
+//! capabilities for low ports and network administration.
+//!
+//! Capabilities and no_new_privs are per thread: libc applies setgid and setuid to every thread,
+//! but keepcaps, capset, and no_new_privs only to the caller. A thread started earlier would lose
+//! every capability without being locked; only threads started afterwards inherit the caller's
+//! state.
+//!
+//! Order matters: supplementary groups, group, then user. Changing the user first removes the right
+//! to change groups, and the group stays.
 
 use std::ffi::CString;
 use std::sync::OnceLock;
 
-/** @brief 낮은 포트에 묶을 수 있는 능력. */
 const CAP_NET_BIND_SERVICE: u32 = 10;
-/** @brief 브로드캐스트를 보낼 수 있는 능력. */
 const CAP_NET_BROADCAST: u32 = 11;
-/** @brief 네트워크 설정을 바꿀 수 있는 능력. */
 const CAP_NET_ADMIN: u32 = 12;
-/** @brief 원시 소켓을 열 수 있는 능력. */
 const CAP_NET_RAW: u32 = 13;
 
-/** @brief 내려놓은 뒤에도 남길 능력들. 이것만 있으면 재시작 때 다시 묶을 수 있다. */
+/// Kept after the drop so listeners can be bound again on restart.
 const RETAINED_CAPS: &[u32] = &[
     CAP_NET_BIND_SERVICE,
     CAP_NET_BROADCAST,
@@ -32,35 +25,23 @@ const RETAINED_CAPS: &[u32] = &[
     CAP_NET_RAW,
 ];
 
-/** @brief 사용자를 바꿔도 능력을 유지하게 하는 요청. */
 const PR_SET_KEEPCAPS: libc::c_int = 8;
-/** @brief 덤프 가능 여부. 꺼 두면 비밀이 든 메모리가 파일로 새지 않는다. */
+/// Cleared so memory holding secrets never reaches a core dump.
 const PR_SET_DUMPABLE: libc::c_int = 4;
-/** @brief 앞으로 권한이 오르지 못하게 잠근다. */
 const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
-/** @brief 자식에게 물려줄 능력 조작. */
 const PR_CAP_AMBIENT: libc::c_int = 47;
-/** @brief 물려줄 능력 하나를 올린다. */
 const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
-/** @brief 능력 구조 버전. */
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-/**
- * @brief 이 프로세스가 내려간 UID 와 GID.
- * @details 내려간 뒤에 뜬 스레드는 모두 같은 상태를 물려받으므로, 그 뒤의 세대는 같은 사용자와
- *          그룹인지만 확인한다. 커널은 다른 스레드가 내려간 뒤에 떴는지 알려 주지 않는다.
- */
+/// Later generations only check that they run as the same user and group: every thread started
+/// after the drop inherits its state, and the kernel cannot tell which threads predate it.
 static DROPPED_TO: OnceLock<(libc::uid_t, libc::gid_t)> = OnceLock::new();
 
-/** @brief 마지막 시스템 오류를 읽을 수 있는 문자열로. */
 fn last_err() -> String {
     std::io::Error::last_os_error().to_string()
 }
 
-/**
- * @brief 이 프로세스에서 돌고 있는 스레드 수.
- * @details 읽지 못하면 오류다. 스레드가 하나뿐인지 모르는 채로 내려가면 안 된다.
- */
+/// Fails when unreadable; dropping without knowing the process is single-threaded is not safe.
 fn running_threads() -> Result<usize, String> {
     let status = std::fs::read_to_string("/proc/self/status")
         .map_err(|error| format!("Could not read /proc/self/status to count threads: {error}"))?;
@@ -71,7 +52,6 @@ fn running_threads() -> Result<usize, String> {
         .ok_or_else(|| "/proc/self/status does not report the number of threads".to_string())
 }
 
-/** @brief 사용자 이름을 번호로. */
 fn resolve_uid(user: &str) -> Result<libc::uid_t, String> {
     if let Ok(n) = user.parse::<u32>() {
         return Ok(n);
@@ -95,7 +75,6 @@ fn resolve_uid(user: &str) -> Result<libc::uid_t, String> {
     Ok(pwd.pw_uid)
 }
 
-/** @brief 그룹 이름을 번호로. */
 fn resolve_gid(group: &str) -> Result<libc::gid_t, String> {
     if let Ok(n) = group.parse::<u32>() {
         return Ok(n);
@@ -120,27 +99,20 @@ fn resolve_gid(group: &str) -> Result<libc::gid_t, String> {
 }
 
 #[repr(C)]
-/** @brief 능력 조작 요청의 헤더. */
 struct CapHeader {
-    /** @brief 이 구조체의 버전. */
     version: u32,
-    /** @brief 권한을 바꿀 프로세스. 0이면 자기 자신. */
+    /// 0 for the calling thread.
     pid: libc::c_int,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-/** @brief 능력 비트들. */
 struct CapData {
-    /** @brief 지금 실제로 쓰는 권한. */
     effective: u32,
-    /** @brief 쓸 수 있도록 허락된 권한. */
     permitted: u32,
-    /** @brief 자식에게 물려줄 권한. */
     inheritable: u32,
 }
 
-/** @brief 남길 능력만 설정하고 나머지를 버린다. */
 fn set_caps(caps: &[u32]) -> Result<(), String> {
     let header = CapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
@@ -165,14 +137,11 @@ fn set_caps(caps: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
-/**
- * @brief 지정한 사용자와 그룹으로 내려간다.
- *
- * @details 처음 부를 때 내려간다. 그 뒤로는 같은 사용자와 그룹인지만 확인하고, 다르면 실패한다.
- * @warning 처음 부를 때 다른 스레드가 돌고 있으면 내려가지 않고 실패한다. 내려가면 그 스레드들이
- *          능력을 잃고 잠금 없이 남는다. 그래서 실행 중에 run_as_user 를 새로 넣거나 바꾸려면
- *          서비스를 다시 시작해야 한다.
- */
+/// Drops on the first call; later calls only check for the same user and group and fail otherwise.
+///
+/// The first call fails without dropping while other threads run, since dropping would leave them
+/// without capabilities or the lock. Adding or changing run_as_user therefore needs a service
+/// restart.
 pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
     let uid = resolve_uid(user)?;
     if uid == 0 {
@@ -228,14 +197,12 @@ pub fn drop_privileges(user: &str, group: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/**
- * @brief 스레드가 하나뿐인 프로세스를 지정한 사용자와 그룹으로 내리고 잠근다.
- *
- * @details 이미 그 사용자와 그룹으로 돌고 있으면 남길 능력과 잠금만 건다. 다른 일반 사용자로
- *          돌고 있으면 바꿀 권한이 없어 실패한다.
- * @warning 내려간 뒤 실제로 되돌아갈 수 없는지 확인한다. 확인하지 않으면 내려놓은 줄
- *          알았는데 그대로인 경우를 알아채지 못한다.
- */
+/// Drops a single-threaded process to the user and group and locks it. Already running as them, it
+/// only sets the kept capabilities and the lock; running as another ordinary user, it fails for
+/// lack of permission.
+///
+/// After the drop it checks that going back is impossible; otherwise a drop that did not take would
+/// go unnoticed.
 fn switch_identity(uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
     let current_uid = unsafe { libc::geteuid() };
     let current_gid = unsafe { libc::getegid() };
@@ -324,16 +291,11 @@ fn switch_identity(uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
     Ok(())
 }
 
-/**
- * @brief 권한을 낮춘 뒤에도 이 실행 파일을 다시 실행할 수 있는지 확인한다.
- *
- * @details 감독 프로세스는 자식이 죽으면 자기 실행 파일을 다시 실행해 살린다. 파일이
- *          root 만 실행할 수 있는 권한이거나 noexec 로 마운트된 곳에 있으면 낮춘 사용자는
- *          실행하지 못한다.
- * @return 실행할 수 있으면 Ok, 아니면 운영체제가 알려 준 사유.
- * @warning 여기서 확인하지 않으면 첫 자식이 죽는 순간에야 드러난다. 그때는 다시 띄울
- *          수단이 없어 서비스가 돌아오지 못한다.
- */
+/// The supervisor re-executes its own binary when a child dies. A root-only executable or a noexec
+/// mount stops the dropped user from running it.
+///
+/// Returns the OS error when it cannot run. Unchecked, this would surface only when the first child
+/// dies, with nothing left to restart it.
 pub fn executable_still_runnable(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -346,16 +308,12 @@ pub fn executable_still_runnable(path: &std::path::Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-/** @brief 내려가기 전에 확인하는 조건. */
 mod tests {
     use super::*;
 
     #[test]
-    /**
-     * @brief 다른 스레드가 돌고 있으면 내려가지 않고 실패하는지.
-     * @details 확인이 내려가기 전에 실패하므로 테스트 프로세스의 권한은 그대로다. root 로 돌리면
-     *          0 이 아닌 사용자와 그룹을 고른다. 0 은 스레드를 세기 전에 거절된다.
-     */
+    /// The check fails before dropping, so the test process keeps its privileges. Run as root, it
+    /// picks a non-zero user and group, since 0 is rejected before threads are counted.
     fn refuses_to_drop_while_other_threads_run() {
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let other = std::thread::spawn(move || {

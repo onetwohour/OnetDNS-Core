@@ -1,28 +1,23 @@
-/*!
- * @brief 업데이트 기록과 서버가 시작할 때의 판정.
- *
- * @details 기록은 이 노드의 업데이트가 어디까지 왔는지 정하는 유일한 상태다. 한 줄에
- *          key=value 하나씩 쓴다. 계약 형식과 조금이라도 다른 기록은 오래된 기록으로 보고
- *          지운다. 이전 버전이 쓴 기록을 새 버전이 읽으므로 형식은 업데이트 계약에 든다.
- */
+//! Update records and the startup decision. The record is the only state saying how far this node's
+//! update has come: one key=value per line. A record that differs from the contract format in any
+//! way is stale and removed. A new version reads records an older one wrote, so the format is part
+//! of the update contract.
 
 use super::{decode_sha256, hex, version::Version, CONTRACT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 업데이트가 어디까지 왔는지. */
 pub(crate) enum State {
-    /** @brief 기록을 썼고 맞바꾸는 중이거나 맞바꾼 뒤 기동을 기다린다. */
+    /// Record written; swapping, or swapped and waiting to start.
     Pending,
-    /** @brief 새 버전이 시험 실행 중이다. */
+    /// The new version is on trial.
     Trial,
-    /** @brief 새 버전이 준비 상태에 이르러 확정됐다. */
+    /// The new version got ready and was committed.
     Committed,
-    /** @brief 시험이 실패해 이전 버전으로 되돌렸다. */
+    /// The trial failed and the previous version was restored.
     Reverted,
 }
 
 impl State {
-    /** @brief 기록과 상태 응답에 쓰는 이름. */
     pub(crate) fn name(self) -> &'static str {
         match self {
             State::Pending => "pending",
@@ -32,7 +27,6 @@ impl State {
         }
     }
 
-    /** @brief 기록에 쓴 이름을 읽는다. */
     fn from_name(name: &str) -> Option<Self> {
         [
             State::Pending,
@@ -46,50 +40,39 @@ impl State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 업데이트 기록 하나. */
 pub(crate) struct Record {
-    /** @brief 지금 단계. */
     pub(crate) state: State,
-    /** @brief 바꾸기 전 버전. */
     pub(crate) from: String,
-    /** @brief 바꾼 뒤 버전. */
     pub(crate) to: String,
-    /** @brief 바꾸기 전 실행 파일의 SHA-256. */
     pub(crate) from_sha256: [u8; 32],
-    /** @brief 바꾼 뒤 실행 파일의 SHA-256. */
     pub(crate) to_sha256: [u8; 32],
-    /** @brief 되돌린 이유. reverted 에만 있고 한 줄이다. */
+    /// Only on reverted records; one line.
     pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 서버가 시작할 때 기록을 보고 고르는 처리. */
 pub(crate) enum StartupAction {
-    /** @brief trial 로 바꾸고 시험 실행으로 시작한다. */
+    /// Mark the record trial and start a trial run.
     StartTrial,
-    /** @brief 맞바꾸기는 끝났고 기동만 남았다. 기록에 손대지 않는다. */
+    /// Swapped; only the start remains. The record is left alone.
     AwaitActivation,
-    /** @brief 앞선 시험이 확정도 되돌림도 없이 끝났다. 되돌린다. */
+    /// An earlier trial ended with neither commit nor revert; revert it.
     Revert,
-    /** @brief 확정된 업데이트다. 되돌리기에 쓸 정보로 남겨 둔다. */
+    /// A committed update, kept for rollback.
     Keep,
-    /** @brief 되돌린 업데이트다. 이유를 알리고 남겨 둔다. */
+    /// A reverted update; report the reason and keep it.
     ReportReverted,
-    /** @brief 지금 실행 파일과 맞지 않는 오래된 기록이다. 지운다. */
+    /// A stale record that does not match the current executable; remove it.
     Discard,
 }
 
-/** @brief 기록에 넣을 수 있는 버전인지. */
 fn version_field(value: &str) -> Option<String> {
     Version::parse(value).map(|_| value.to_string())
 }
 
 impl Record {
-    /**
-     * @brief 기록을 읽는다.
-     * @return 계약 형식이 아니면 없다. 모르는 키, 겹친 키, 빠진 키, 다른 계약 번호, reverted 가
-     *         아닌데 붙은 이유가 모두 여기에 든다. 호출자는 그런 기록을 지운다.
-     */
+    /// None outside the contract format: an unknown, repeated, or missing key, another contract
+    /// number, or a reason on a record that is not reverted. The caller removes such records.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let mut format = None;
         let mut state = None;
@@ -131,7 +114,7 @@ impl Record {
         })
     }
 
-    /** @brief 기록 파일에 쓸 글. 이유의 줄바꿈은 공백으로 바꾼다. */
+    /// Newlines in the reason become spaces.
     pub(crate) fn encode(&self) -> String {
         let mut text = format!(
             "format={CONTRACT}\nstate={}\nfrom={}\nto={}\nfrom_sha256={}\nto_sha256={}\n",
@@ -149,14 +132,10 @@ impl Record {
         text
     }
 
-    /**
-     * @brief 서버가 시작할 때 이 기록으로 무엇을 할지 고른다.
-     * @param own_version 지금 시작하는 바이너리의 버전.
-     * @param installed 설치 경로에 있는 실행 파일의 SHA-256.
-     * @details 버전만 보지 않고 설치 경로의 해시까지 맞대는 이유는 기록과 실제 파일이 갈라지는
-     *          경우가 있기 때문이다. 맞바꾸기 전에 죽었거나 운영자가 손으로 파일을 바꿨으면 버전이
-     *          맞아도 기록은 이미 지난 것이다.
-     */
+    /// `own_version` is the starting binary's version, `installed` the SHA-256 of the executable at
+    /// the install path. The hash is compared too because the record and the file can diverge:
+    /// after a crash before the swap, or a file replaced by hand, the version can match while the
+    /// record is stale.
     pub(crate) fn startup_action(&self, own_version: &str, installed: &[u8; 32]) -> StartupAction {
         let runs_to = own_version == self.to && *installed == self.to_sha256;
         let runs_from_with_to_installed = own_version == self.from && *installed == self.to_sha256;
@@ -173,18 +152,13 @@ impl Record {
 }
 
 #[cfg(test)]
-/** @brief 기록 형식과 시작 판정표. */
 mod tests {
     use super::*;
 
-    /** @brief 바꾸기 전 실행 파일의 해시. */
     const OLD: [u8; 32] = [0x11; 32];
-    /** @brief 바꾼 뒤 실행 파일의 해시. */
     const NEW: [u8; 32] = [0x22; 32];
-    /** @brief 어느 쪽도 아닌 실행 파일의 해시. */
     const OTHER: [u8; 32] = [0x33; 32];
 
-    /** @brief 이 단계의 기록. */
     fn record(state: State) -> Record {
         Record {
             state,
@@ -197,7 +171,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쓴 기록을 다시 읽으면 같은 기록인지. */
     fn records_round_trip() {
         for state in [
             State::Pending,
@@ -215,7 +188,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 계약 형식과 조금이라도 다른 기록은 읽지 않는지. 호출자는 그런 기록을 지운다. */
     fn records_outside_the_contract_are_not_read() {
         let good = record(State::Pending).encode();
         let reverted = record(State::Reverted).encode();
@@ -260,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 판정표의 각 줄. 버전이나 해시가 하나라도 어긋나면 오래된 기록이다. */
+    /// Any mismatched version or hash means a stale record.
     fn startup_actions_follow_the_table() {
         let from = "0.1.0-alpha.5";
         let to = "0.1.0-alpha.6";
@@ -291,12 +263,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 적용의 각 단계 사이에서 죽었을 때 다음 시작이 고르는 처리.
-     * @details 기록은 맞바꾸기 전에 쓴다. 그래서 맞바꾸기 전에 죽으면 이전 실행 파일이 그대로라
-     *          기록만 지우고, 맞바꾼 뒤 기동 전에 죽으면 새 버전이 시험 실행으로 시작한다. 시험
-     *          중에 죽으면 다시 뜬 새 버전이 되돌린다.
-     */
+    /// The record is written before the swap. A crash before the swap leaves the old executable, so
+    /// only the record is removed; a crash after the swap but before startup starts the new version
+    /// on trial; a crash during the trial makes the restarted new version revert.
     fn crashes_between_steps_resolve_to_a_consistent_state() {
         let pending = record(State::Pending);
         assert_eq!(

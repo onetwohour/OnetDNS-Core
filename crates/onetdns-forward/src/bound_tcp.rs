@@ -2,12 +2,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-/**
- * @brief bind 주소에서 addr로 데드라인 안에 TCP 연결을 맺는다.
- * @param bind 묶을 로컬 주소. 주소가 지정되지 않았으면 std 연결을 그대로 쓴다.
- * @param addr 이을 업스트림.
- * @param timeout 연결을 기다릴 상한.
- */
+/// With an unspecified `bind` address, std's connect is used as is.
 pub(crate) fn connect(
     bind: SocketAddr,
     addr: SocketAddr,
@@ -34,32 +29,28 @@ pub(crate) fn connect(
     Ok(stream)
 }
 
-/** @brief 연결을 기다릴 밀리초. poll 계열 함수의 인자 범위에 맞춘다. */
+/// Fits poll's argument range.
 fn timeout_millis(timeout: Duration) -> i32 {
     i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX)
 }
 
 #[cfg(unix)]
-/** @brief libc 소켓 호출. */
 mod sys {
     use std::io;
     use std::net::{SocketAddr, TcpStream};
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::time::Duration;
 
-    /**
-     * @brief 소켓 주소를 커널 형식으로 바꾼다.
-     * @return 주소 저장 공간과 그 가운데 쓴 길이.
-     */
+    /// Returns the storage and the length used.
     fn raw_addr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-        /* @safety sockaddr_storage는 모든 바이트가 0이어도 올바른 값이다. */
+        // SAFETY: sockaddr_storage is valid when all bytes are zero.
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let len = match addr {
-            /* BSD 계열은 구조체에 sa_len 필드가 더 있다. 구조체 리터럴로 만들면 그
-             * 플랫폼에서만 필드가 모자라 컴파일이 깨지므로, 0으로 채운 뒤 필드를 하나씩
-             * 넣고 sa_len 은 해당 플랫폼에서만 적는다. */
+            // BSD systems have an extra sa_len field. A struct literal would fail to compile there
+            // for the missing field, so the storage is zeroed, fields are set one by one, and
+            // sa_len is written only on those platforms.
             SocketAddr::V4(v4) => {
-                /* @safety sockaddr_storage는 sockaddr_in보다 크고 정렬도 넉넉하다. */
+                // SAFETY: sockaddr_storage is larger than sockaddr_in and at least as aligned.
                 let raw = (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>();
                 unsafe {
                     (*raw).sin_family = libc::AF_INET as libc::sa_family_t;
@@ -85,7 +76,7 @@ mod sys {
                 std::mem::size_of::<libc::sockaddr_in>()
             }
             SocketAddr::V6(v6) => {
-                /* @safety sockaddr_storage는 sockaddr_in6보다 크고 정렬도 넉넉하다. */
+                // SAFETY: sockaddr_storage is larger than sockaddr_in6 and at least as aligned.
                 let raw =
                     (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
                 unsafe {
@@ -117,36 +108,36 @@ mod sys {
         (storage, len as libc::socklen_t)
     }
 
-    /** @brief 계열에 맞는 TCP 소켓을 열고 bind 주소에 묶는다. */
     pub(super) fn bound_socket(bind: SocketAddr, addr: SocketAddr) -> io::Result<TcpStream> {
         let family = if addr.is_ipv4() {
             libc::AF_INET
         } else {
             libc::AF_INET6
         };
-        /* @safety 인자가 모두 값이다. */
+        // SAFETY: all arguments are plain values.
         let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        /* @safety 방금 연 소켓이라 다른 소유자가 없다. 이후 닫기는 TcpStream이 맡는다. */
+        // SAFETY: the socket was just opened, so nothing else owns it; TcpStream closes it from
+        // here on.
         let stream = unsafe { TcpStream::from_raw_fd(fd) };
-        /* @safety 이 서버가 가진 소켓의 플래그만 바꾼다. 자식 프로세스에 새지 않게 한다. */
+        // SAFETY: fd is a socket this server owns.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let (raw, len) = raw_addr(bind);
-        /* @safety raw는 len 바이트까지 올바른 주소를 담고 있다. */
+        // SAFETY: raw holds a valid address in its first len bytes.
         if unsafe { libc::bind(fd, (&raw as *const libc::sockaddr_storage).cast(), len) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(stream)
     }
 
-    /** @brief 논블로킹 연결을 건다. 진행 중이면 성공으로 본다. */
+    /// Non-blocking; in progress counts as success.
     pub(super) fn start_connect(stream: &TcpStream, addr: SocketAddr) -> io::Result<()> {
         let (raw, len) = raw_addr(addr);
-        /* @safety raw는 len 바이트까지 올바른 주소를 담고 있다. */
+        // SAFETY: raw holds a valid address in its first len bytes.
         let rc = unsafe {
             libc::connect(
                 stream.as_raw_fd(),
@@ -165,7 +156,6 @@ mod sys {
         }
     }
 
-    /** @brief 연결이 끝나 쓸 수 있게 될 때까지 기다린다. */
     pub(super) fn wait_writable(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
         let mut pfd = libc::pollfd {
             fd: stream.as_raw_fd(),
@@ -173,7 +163,7 @@ mod sys {
             revents: 0,
         };
         loop {
-            /* @safety pfd 하나를 가리키고 개수도 1이다. */
+            // SAFETY: points to one pollfd, and the count is 1.
             let rc = unsafe { libc::poll(&mut pfd, 1, super::timeout_millis(timeout)) };
             match rc {
                 0 => {
@@ -195,38 +185,26 @@ mod sys {
 }
 
 #[cfg(windows)]
-/** @brief winsock 소켓 호출. std가 링크하는 ws2_32를 쓴다. */
+/// Winsock calls, through the ws2_32 that std already links.
 mod sys {
     use std::io;
     use std::net::{SocketAddr, TcpStream};
     use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
     use std::time::Duration;
 
-    /** @brief 잘못된 소켓 값. */
     const INVALID_SOCKET: usize = usize::MAX;
-    /** @brief IPv4 계열. */
     const AF_INET: i32 = 2;
-    /** @brief IPv6 계열. */
     const AF_INET6: i32 = 23;
-    /** @brief 스트림 소켓. */
     const SOCK_STREAM: i32 = 1;
-    /** @brief TCP. */
     const IPPROTO_TCP: i32 = 6;
-    /** @brief 논블로킹 연결이 진행 중이라는 오류. */
     const WSAEWOULDBLOCK: i32 = 10035;
-    /** @brief 아직 winsock을 초기화하지 않았다는 오류. */
     const WSANOTINITIALISED: i32 = 10093;
-    /** @brief 쓸 수 있음을 기다린다. */
     const POLLWRNORM: i16 = 0x0010;
 
     #[repr(C)]
-    /** @brief WSAPoll에 넘기는 소켓 하나. */
     struct WsaPollFd {
-        /** @brief 소켓. */
         fd: usize,
-        /** @brief 기다릴 이벤트. */
         events: i16,
-        /** @brief 일어난 이벤트. */
         revents: i16,
     }
 
@@ -240,7 +218,6 @@ mod sys {
         fn WSAGetLastError() -> i32;
     }
 
-    /** @brief 소켓 주소를 winsock 형식 바이트로 바꾼다. */
     fn raw_addr(addr: SocketAddr) -> Vec<u8> {
         match addr {
             SocketAddr::V4(v4) => {
@@ -262,42 +239,41 @@ mod sys {
         }
     }
 
-    /** @brief 마지막 winsock 오류. */
     fn last_error() -> io::Error {
-        /* @safety 인자가 없다. */
+        // SAFETY: takes no arguments.
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
-    /** @brief 계열에 맞는 TCP 소켓을 열고 bind 주소에 묶는다. */
     pub(super) fn bound_socket(bind_to: SocketAddr, addr: SocketAddr) -> io::Result<TcpStream> {
         let family = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
-        /* @safety 인자가 모두 값이다. */
+        // SAFETY: all arguments are plain values.
         let mut s = unsafe { socket(family, SOCK_STREAM, IPPROTO_TCP) };
         if s == INVALID_SOCKET && unsafe { WSAGetLastError() } == WSANOTINITIALISED {
-            /* std는 소켓을 처음 만들 때 winsock을 초기화한다. */
+            // std initializes winsock when it first creates a socket.
             drop(std::net::UdpSocket::bind(("127.0.0.1", 0)));
-            /* @safety 인자가 모두 값이다. */
+            // SAFETY: all arguments are plain values.
             s = unsafe { socket(family, SOCK_STREAM, IPPROTO_TCP) };
         }
         if s == INVALID_SOCKET {
             return Err(last_error());
         }
         let raw = raw_addr(bind_to);
-        /* @safety raw는 raw.len() 바이트의 올바른 주소다. */
+        // SAFETY: raw is a valid address of raw.len() bytes.
         if unsafe { bind(s, raw.as_ptr(), raw.len() as i32) } != 0 {
             let error = last_error();
-            /* @safety 방금 연 소켓을 닫는다. */
+            // SAFETY: closes the socket just opened.
             unsafe { closesocket(s) };
             return Err(error);
         }
-        /* @safety 방금 연 소켓이라 다른 소유자가 없다. 이후 닫기는 TcpStream이 맡는다. */
+        // SAFETY: the socket was just opened, so nothing else owns it; TcpStream closes it from
+        // here on.
         Ok(unsafe { TcpStream::from_raw_socket(s as RawSocket) })
     }
 
-    /** @brief 논블로킹 연결을 건다. 진행 중이면 성공으로 본다. */
+    /// Non-blocking; in progress counts as success.
     pub(super) fn start_connect(stream: &TcpStream, addr: SocketAddr) -> io::Result<()> {
         let raw = raw_addr(addr);
-        /* @safety raw는 raw.len() 바이트의 올바른 주소다. */
+        // SAFETY: raw is a valid address of raw.len() bytes.
         if unsafe {
             connect(
                 stream.as_raw_socket() as usize,
@@ -316,14 +292,13 @@ mod sys {
         }
     }
 
-    /** @brief 연결이 끝나 쓸 수 있게 되거나 실패할 때까지 기다린다. */
     pub(super) fn wait_writable(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
         let mut pfd = WsaPollFd {
             fd: stream.as_raw_socket() as usize,
             events: POLLWRNORM,
             revents: 0,
         };
-        /* @safety pfd 하나를 가리키고 개수도 1이다. */
+        // SAFETY: points to one pollfd, and the count is 1.
         match unsafe { WSAPoll(&mut pfd, 1, super::timeout_millis(timeout)) } {
             0 => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -336,13 +311,11 @@ mod sys {
 }
 
 #[cfg(test)]
-/** @brief 출발 주소가 실제 연결에 쓰이는지. */
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
 
     #[test]
-    /** @brief 묶은 출발 주소가 상대에게 보이고, 지정하지 않으면 운영체제가 고르는지. */
     fn connect_uses_the_configured_source_address() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let target = listener.local_addr().unwrap();
@@ -362,7 +335,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아무도 받지 않는 포트면 데드라인 안에 오류로 끝나는지. */
     fn connect_to_a_closed_port_fails() {
         let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()

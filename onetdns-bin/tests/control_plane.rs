@@ -1,18 +1,14 @@
-/*!
- * @brief 관리 평면의 안전장치가 소스에 남아 있는지 검사한다.
- *
- * @details 이미 적용된 설정과 사용자가 편집 중인 설정은 서로 다르다. 이 둘이 섞이면
- *          화면에는 값이 바뀐 것으로 보이지만 서버는 예전 값으로 계속 동작하고,
- *          되돌릴 방법도 남지 않는다. 그래서 두 설정의 경계, 되돌리기 순서,
- *          그리고 통계와 감사 기록이 재시작 뒤에도 남는 경로를 확인한다.
- * @note 테스트 함수 이름을 직접 확인하는 항목이 있다. 그 테스트를 지우면 여기서 실패한다.
- */
+//! Checks that control-plane safeguards remain in the source. The applied config and the one being
+//! edited differ; mixing them shows changed values on screen while the server keeps the old ones,
+//! with no way back. So this checks the boundary between them, the rollback order, and the paths
+//! that keep stats and audit records across restarts.
+//!
+//! Some items name test functions; removing those tests fails here.
 
 mod common;
 
 use common::{production_files, read, root};
 
-/** @brief onetdns-bin 의 관리 평면이 갖춰야 할 안전장치. */
 const BIN_REQUIRED: &[&str] = &[
     "metrics: Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>",
     "audit: Arc<Mutex<Option<onetdns_control::AuditLog>>>",
@@ -49,7 +45,6 @@ const BIN_REQUIRED: &[&str] = &[
     r#"{{\"removed\":{},\"id\":{},\"key\":{},{} }}"#,
 ];
 
-/** @brief 통계를 유지하는 데 필요한 안전장치. */
 const METRICS_REQUIRED: &[&str] = &[
     "pub fn reconfigure_persist(&self, persist: PersistOpts)",
     "disabling_persistence_flushes_the_previous_files",
@@ -65,7 +60,6 @@ const METRICS_REQUIRED: &[&str] = &[
     "reconfigure_trims_recent_log_immediately",
 ];
 
-/** @brief 관리 API 가 갖춰야 할 안전장치. */
 const API_REQUIRED: &[&str] = &[
     "st.stats.recent(2_000)",
     "dropped_log_events",
@@ -90,7 +84,6 @@ const API_REQUIRED: &[&str] = &[
     "Cache-Control: no-store",
 ];
 
-/** @brief 저장된 통계를 복구할 때 필요한 안전장치. */
 const PERSIST_REQUIRED: &[&str] = &[
     "event = \"querylog.restore_invalid\"",
     "event = \"stats.restore_invalid_value\"",
@@ -99,14 +92,12 @@ const PERSIST_REQUIRED: &[&str] = &[
     "querylog_accepts_only_the_complete_current_shape",
 ];
 
-/** @brief Windows 서비스가 설정을 되돌릴 때 필요한 안전장치. */
 const SERVICE_REQUIRED: &[&str] = &[
     "let session_checkpoint = shared.sessions.checkpoint();",
     "shared.sessions.restore(session_checkpoint);",
     "restore_last_applied_config(config.as_deref(), &shared)",
 ];
 
-/** @brief 대시보드가 서버 상태를 따라가는 데 필요한 안전장치. */
 const DASHBOARD_REQUIRED: &[&str] = &[
     "desiredBody._valid!==false",
     "await this.loadConfigState();",
@@ -132,7 +123,6 @@ const DASHBOARD_REQUIRED: &[&str] = &[
     "nav.inert=hidden",
 ];
 
-/** @brief 소스에서 찾지 못한 항목을 모은다. */
 fn missing(source: &str, required: &[&str]) -> Vec<String> {
     required
         .iter()
@@ -141,7 +131,6 @@ fn missing(source: &str, required: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/** @brief 찾지 못한 항목이 있으면 그 목록을 남기고 중단한다. */
 fn require(source: &str, required: &[&str], subject: &str) {
     let gone = missing(source, required);
     assert!(
@@ -151,11 +140,7 @@ fn require(source: &str, required: &[&str], subject: &str) {
     );
 }
 
-/**
- * @brief 바이너리 소스 전체를 이어 붙인 것.
- * @details 파일을 고르지 않는다. 코드가 다른 파일로 옮겨 가도 검사가 대상을 놓치지 않게
- *          하려는 것이다.
- */
+/// Every file, not a chosen list, so code that moves stays covered.
 fn bin_source() -> String {
     production_files(&["onetdns-bin/src"])
         .iter()
@@ -167,7 +152,6 @@ fn bin_source() -> String {
         )
 }
 
-/** @brief 관리 평면의 각 부분이 안전장치를 갖추고 있는지 확인한다. */
 #[test]
 fn every_control_plane_safeguard_is_present() {
     let repo = root();
@@ -199,7 +183,6 @@ fn every_control_plane_safeguard_is_present() {
     );
 }
 
-/** @brief 형식이 잘못된 TOML 을 적용 중인 설정으로 조용히 대체하면 실패한다. */
 #[test]
 fn an_invalid_desired_file_is_reported_rather_than_replaced() {
     let source = bin_source();
@@ -217,7 +200,6 @@ fn an_invalid_desired_file_is_reported_rather_than_replaced() {
     );
 }
 
-/** @brief 세션 되돌리기가 체크포인트보다 먼저 나오면 실패한다. */
 #[test]
 fn session_rollback_comes_after_its_checkpoint() {
     let repo = root();
@@ -239,7 +221,6 @@ fn session_rollback_comes_after_its_checkpoint() {
     }
 }
 
-/** @brief 업스트림 목록이 배열 순번을 식별자로 다시 쓰면 실패한다. */
 #[test]
 fn upstream_rows_keep_stable_identifiers() {
     let dashboard = read(&root().join("crates/onetdns-control/dashboard/index.html"));
@@ -274,7 +255,6 @@ fn upstream_rows_keep_stable_identifiers() {
     );
 }
 
-/** @brief 열거형 원본 값에 화면 표시용 설명이 섞이면 실패한다. */
 #[test]
 fn enum_raw_values_carry_no_display_annotation() {
     let schema = read(&root().join("crates/onetdns-config/src/schema.rs"));
@@ -288,7 +268,6 @@ fn enum_raw_values_carry_no_display_annotation() {
     );
 }
 
-/** @brief 업스트림 변경 응답이 이름 붙은 인자와 위치 인자를 섞으면 실패한다. */
 #[test]
 fn the_upstream_mutation_response_does_not_mix_argument_styles() {
     let source = bin_source();
@@ -303,7 +282,6 @@ fn the_upstream_mutation_response_does_not_mix_argument_styles() {
     }
 }
 
-/** @brief 누락 판정이 실제로 동작하는지 확인한다. */
 #[test]
 fn the_missing_check_behaves() {
     assert_eq!(missing("가 나 다", &["가", "라"]), vec!["라".to_string()]);

@@ -1,6 +1,4 @@
-/*!
- * @brief 응답 주소로 리눅스 ipset을 채우는 계층.
- */
+//! Adds answered addresses to Linux ipsets, so firewall or routing rules can follow names.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -12,25 +10,16 @@ use onetdns_proto::{Message, Name, RData};
 use super::outcome_to_option;
 use crate::native::{ResolveOutcome, Resolver};
 
-/**
- * @brief 답한 주소를 커널 주소 집합에 넣는 계층.
- * @details 방화벽이나 경로 규칙을 이름 기준으로 걸 수 있게 하려는 것이다.
- */
 pub struct IpsetLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief IPv4 주소를 넣을 집합. 없으면 넣지 않는다. */
     set_v4: Option<String>,
-    /** @brief IPv6 주소를 넣을 집합. 없으면 넣지 않는다. */
     set_v6: Option<String>,
-    /** @brief 지켜볼 이름들. */
     domains: Vec<Name>,
-    /** @brief 최근에 넣은 주소들. 같은 주소를 거듭 넣지 않으려는 것이다. */
+    /// Avoids adding the same address again and again.
     recent: Mutex<HashSet<IpAddr>>,
 }
 
 impl IpsetLayer {
-    /** @brief 지켜볼 접미사와 집합 이름으로 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         set_v4: Option<String>,
@@ -53,14 +42,12 @@ impl IpsetLayer {
         })
     }
 
-    /** @brief 이 이름을 지켜보는지. */
     fn tracked(&self, name: &Name) -> bool {
         self.domains
             .iter()
             .any(|domain| name.ends_with_ignore_case(domain))
     }
 
-    /** @brief 주소를 집합에 넣는다. */
     fn add_ip(&self, ip: IpAddr) {
         let set = match ip {
             IpAddr::V4(_) => &self.set_v4,
@@ -86,7 +73,6 @@ impl IpsetLayer {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 커널 주소 집합에 넣는다. */
 fn ipset_add(set: &str, ip: IpAddr) -> bool {
     let Some(exe) = crate::osnet::resolve_tool("ipset") else {
         onetdns_core::warn!(event = "ipset.binary_missing", set, %ip, "Could not find the ipset executable in a trusted path");
@@ -114,18 +100,15 @@ fn ipset_add(set: &str, ip: IpAddr) -> bool {
     }
 }
 #[cfg(not(target_os = "linux"))]
-/** @brief 이 플랫폼에는 주소 집합이 없다. */
 fn ipset_add(_set: &str, _ip: IpAddr) -> bool {
     false
 }
 
 impl Resolver for IpsetLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 답한 주소를 집합에 넣고 그대로 돌려준다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let resp = match self.inner.resolve_outcome(req) {
             ResolveOutcome::Response(resp) => resp,
@@ -148,7 +131,6 @@ impl Resolver for IpsetLayer {
 }
 
 #[cfg(test)]
-/** @brief 설정한 접미사의 응답만 ipset 대상이 되는지. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -159,7 +141,6 @@ mod tests {
     use crate::native::Resolver;
 
     #[test]
-    /** @brief 지켜보기로 한 이름의 주소만 집합에 넣는지. */
     fn ipset_tracks_configured_suffixes() {
         let inner = Mock::new(1, 0);
         let layer = IpsetLayer::new(

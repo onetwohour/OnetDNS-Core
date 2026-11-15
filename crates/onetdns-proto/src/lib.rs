@@ -1,21 +1,13 @@
-/*!
- * @brief DNS 와이어 포맷 코덱. 이 워크스페이스의 의존성 바닥이다.
- *
- * @details 외부 크레이트를 전혀 쓰지 않으며, 상위 크레이트는 모두 이 타입들 위에 쌓인다.
- *          파싱은 일관되게 fail-closed다. 애매한 입력은 받아 주지 않고 오류로 돌린다.
- *          신뢰할 수 없는 네트워크 바이트가 최초로 닿는 지점이므로, 여기서 통과시킨 것은
- *          상위 계층이 그대로 믿는다.
- * @invariant 이 크레이트의 어떤 경로도 입력 바이트 때문에 패닉하지 않는다. 인덱싱은
- *            전부 get/checked_*를 거친다.
- */
+//! DNS wire format codec, the bottom of this workspace's dependencies: it has no runtime
+//! dependencies, and every other crate builds on these types. Parsing is consistently fail-closed
+//! and turns ambiguous input into an error. Untrusted network bytes reach this crate first, and
+//! what passes here is trusted as is by the layers above.
+//!
+//! No path here panics because of input bytes; all indexing goes through get or checked_*.
 
-/** @brief 메시지 전체의 읽기와 적기. */
 pub mod message;
-/** @brief 도메인 이름. */
 pub mod name;
-/** @brief 기록 종류별 내용. */
 pub mod rdata;
-/** @brief 바이트를 읽고 쓰는 기본 도구. */
 pub mod wire;
 
 pub use message::{
@@ -26,26 +18,21 @@ pub use name::Name;
 pub use rdata::{normalize_ttls, DnsClass, Naptr, RData, Record, RecordType, Soa, MAX_TTL};
 pub use wire::{Reader, Writer};
 
-/**
- * @brief 와이어 코덱이 낼 수 있는 오류.
- *
- * @details 호출자는 이 셋을 구분하지 않고 대개 FORMERR로 바꾼다. 구분을 남겨 두는 이유는
- *          로그와 테스트에서 어느 층에서 거부됐는지 보기 위해서다.
- */
+/// Callers usually map all of these to FORMERR; they stay distinct so logs and tests show which
+/// layer refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtoError {
-    /** @brief 남은 바이트보다 많이 읽으려 했다. 잘린 메시지의 정상 결말이다. */
+    /// Read past the remaining bytes; the normal end of a truncated message.
     Eof,
 
-    /** @brief 이름 문법 위반: 라벨 길이, 전체 길이, 압축 포인터 규칙 등. */
+    /// Name syntax: label length, total length, compression pointer rules.
     Name(String),
 
-    /** @brief 메시지 수준 위반: 섹션 개수, OPT 배치, 잔여 바이트 등. */
+    /// Message level: section counts, OPT placement, trailing bytes.
     Message(String),
 }
 
 impl std::fmt::Display for ProtoError {
-    /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProtoError::Eof => write!(f, "Read past the end of the message"),
@@ -58,18 +45,14 @@ impl std::fmt::Display for ProtoError {
 impl std::error::Error for ProtoError {}
 
 #[cfg(test)]
-/**
- * @brief 다른 구현과 서로 읽히는지 대조한다.
- * @details 자체 구현끼리만 맞으면 규격을 잘못 읽었어도 알 수 없다. 널리 쓰이는 구현과
- *          주고받아 본다.
- */
+/// Cross-checks against hickory: our encoder and parser agreeing with each other proves nothing if
+/// the spec was misread.
 mod xval {
 
     use super::*;
     use std::net::Ipv4Addr;
 
     #[test]
-    /** @brief 이 서버가 만든 질의를 남이 읽을 수 있는지. */
     fn our_query_parsed_by_hickory() {
         let msg = Message::query(
             0x1234,
@@ -87,7 +70,6 @@ mod xval {
     }
 
     #[test]
-    /** @brief 남이 만든 응답을 이 서버가 읽을 수 있는지. */
     fn hickory_response_parsed_by_us() {
         use hickory_proto::op::{Message as HMsg, MessageType};
         use hickory_proto::rr::{
@@ -133,7 +115,6 @@ mod xval {
     }
 
     #[test]
-    /** @brief 여러 기록이 섞인 메시지의 왕복. */
     fn our_roundtrip_mixed() {
         let mut msg = Message {
             header: Header {
@@ -182,7 +163,6 @@ mod xval {
     }
 
     #[test]
-    /** @brief 인증 기관 제한 기록의 왕복. */
     fn caa_roundtrip() {
         let mut msg = Message {
             header: Header {
@@ -227,7 +207,6 @@ mod xval {
     }
 
     #[test]
-    /** @brief 확장 오류 사유의 왕복. */
     fn ede_roundtrip() {
         let mut msg = Message::query(1, Name::from_str("blocked.test").unwrap(), RecordType::A);
         let mut edns = Edns::default();
@@ -244,7 +223,6 @@ mod xval {
     }
 
     #[test]
-    /** @brief 확장 옵션의 왕복. */
     fn edns_opt_roundtrip() {
         let mut msg = Message::query(1, Name::from_str("x.com").unwrap(), RecordType::A);
         let edns = Edns {

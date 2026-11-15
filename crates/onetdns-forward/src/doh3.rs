@@ -1,6 +1,4 @@
-/*!
- * @brief DoH3 업스트림: HTTP/3 위의 DNS.
- */
+//! DNS over HTTP/3 upstream.
 
 use std::cell::RefCell;
 #[cfg(test)]
@@ -21,29 +19,23 @@ use crate::quicdrive::{
 };
 use crate::{validate_response, ForwardError};
 
-/** @brief 보관 중인 DoH3 연결 하나. */
 struct Doh3Conn {
-    /** @brief 이 연결의 소켓. */
     sock: QuicSocket,
-    /** @brief 이 연결의 HTTP/3 클라이언트. */
     h3: H3Client,
 
-    /** @brief 이 연결을 연 시각. 너무 오래되면 버린다. */
+    /// Too old connections are dropped.
     created: Instant,
-    /** @brief 붙은 서버 이름. */
     server_name: String,
-    /** @brief 폐기 확인을 이미 했는지. 연결당 한 번만 한다. */
+    /// Checked once per connection.
     revocation_checked: bool,
 }
 
 impl Drop for Doh3Conn {
-    /**
-     * @brief 버려지는 연결의 종료를 서버에 알린다.
-     * @details 오류, 시간 초과, 무응답, LRU 축출, 스레드 종료 가운데 어느 경로로 버려도 여기를
-     *          지난다. 열린 연결은 알릴 오류 없이 닫고, 이미 닫힌 연결은 쌓아 둔 종료 프레임만
-     *          내보낸다. 소켓도 함께 닫으므로 closing 기간은 기다리지 않는다. 알리지 않으면 서버는
-     *          자기 유휴 데드라인까지 연결을 붙들고 있다.
-     */
+    /// Tells the server the connection is going away, whichever way it is dropped: error, timeout,
+    /// silence, LRU eviction, or thread exit. An open connection closes with no error code; a
+    /// closed one sends only its queued close frame. The socket closes too, so there is no wait for
+    /// the closing period. Without the notice, the server holds the connection until its own idle
+    /// deadline.
     fn drop(&mut self) {
         if !self.h3.is_closed() {
             self.h3.close(H3Error::NoError);
@@ -53,20 +45,18 @@ impl Drop for Doh3Conn {
 }
 
 thread_local! {
-    /** @brief (주소, 서버 이름, 경로)별 연결 풀. */
+    /// Keyed by address, server name, path, and security policy.
     static POOL: RefCell<LruMap<(SocketAddr, String, String, crate::TlsCacheScope), Doh3Conn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
 }
 
-/** @brief 스레드 하나가 보관할 DoH3 연결 수 상한. */
+/// Per thread.
 const MAX_POOLED_CONNECTIONS: usize = 256;
 
-/**
- * @brief DoH3로 질의를 교환한다.
- * @details 연결이 실패하면 풀에서 빼고 새 연결로 한 번 더 보낸다. 서버가 오류 상태로 답했으면
- *          연결을 그대로 두고 다시 보내지 않는다. 오류 상태는 서버가 내린 답이라 새 연결로 다시
- *          물어도 달라지지 않고, 429 와 503 은 곧바로 다시 묻지 말라는 뜻이기도 하다.
- */
+/// On connection failure, drops the connection from the pool and retries once on a new one. An
+/// error status from the server leaves the connection in place and is not retried: it is the
+/// server's answer, a new connection would not change it, and 429 and 503 also ask clients not to
+/// retry at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
     addr: SocketAddr,
@@ -126,7 +116,7 @@ pub(crate) fn exchange(
     })
 }
 
-/** @brief 새 DoH3 연결을 맺고 HTTP/3 제어 스트림까지 준비한다. */
+/// Includes setting up the HTTP/3 control streams.
 fn connect(
     addr: SocketAddr,
     server_name: &str,
@@ -154,11 +144,8 @@ fn connect(
     Ok(c)
 }
 
-/**
- * @brief HTTP/3 요청 하나로 질의를 보내고 응답을 받는다.
- * @return 바깥 Err 는 이 연결을 더 쓸 수 없다는 뜻이다. 안쪽 Err 는 서버가 이 질의에만 오류
- *         상태로 답했다는 뜻이고, 연결은 그대로 쓸 수 있다.
- */
+/// An outer Err means the connection is unusable. An inner Err means the server answered this query
+/// alone with an error status, and the connection is still good.
 fn roundtrip(
     c: &mut Doh3Conn,
     authority: &str,
@@ -180,11 +167,9 @@ fn roundtrip(
     if c.h3.is_closed() {
         return Err(ForwardError::Io("DoH3 connection closed after idle".into()));
     }
-    /*
-     * GOAWAY 를 받은 연결에는 새 요청을 열 수 없다. 여기서 돌려주면 이 연결은 풀에서 빠지며
-     * H3_NO_ERROR 로 닫히고, 질의는 새 연결로 다시 간다. 보내기 실패 경로로 넘기면 서버의 정상
-     * 종료를 이쪽 내부 실패로 알리게 된다.
-     */
+    // A connection that got GOAWAY cannot open new requests. Returning here drops it from the pool
+    // with H3_NO_ERROR and retries the query on a new connection; going through the send-failure
+    // path would report the server's graceful close as our internal failure.
     if c.h3.is_going_away() {
         return Err(ForwardError::Io("DoH3 server sent GOAWAY".into()));
     }
@@ -226,11 +211,9 @@ fn roundtrip(
             if rid != sid {
                 continue;
             }
-            /*
-             * RFC 8484 에서 200 응답은 DNS 메시지를 싣는다. 그렇지 않은 200 은 풀리지 않는 DNS
-             * 본문처럼 서버의 규약 위반으로 다루고 연결을 닫는다. 다른 상태는 그 질의만 실패한
-             * 것이다.
-             */
+            // Under RFC 8484 a 200 response carries a DNS message. A 200 without one is a protocol
+            // violation like an unparsable DNS body and closes the connection; other statuses fail
+            // only this query.
             let resp = match response {
                 H3Response::Dns(body) => Message::parse(&body)
                     .map_err(|_| ForwardError::BadResponse)
@@ -257,7 +240,6 @@ fn roundtrip(
 }
 
 #[cfg(test)]
-/** @brief 인증서 검증, 연결 재사용, 그리고 죽은 연결에서의 빠른 복구. */
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
@@ -275,13 +257,14 @@ mod tests {
     use crate::quicdrive::random_cid;
     use crate::{Forwarder, Upstream};
 
-    /** @brief 자체 서명 인증서를 쓰는 테스트용 업스트림. */
+    /// Upstream with a self-signed certificate.
     fn doh3_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _peers) = doh3_server_ex(ip, false);
         (addr, trust)
     }
 
-    /** @brief dns.test 자체 서명 인증서를 쓰는 DoH3 서버 설정과 그 인증서만 믿는 신뢰 저장소. */
+    /// DoH3 server config with a self-signed dns.test certificate, and a trust store that trusts
+    /// only it.
     fn doh3_server_config() -> (Arc<ServerConfig>, Arc<TrustStore>) {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
         let cert_der = ck.cert.der().to_vec();
@@ -299,7 +282,7 @@ mod tests {
         (scfg, trust)
     }
 
-    /** @brief 접속 수를 셀 수 있는 테스트용 업스트림. */
+    /// Counts connections.
     fn doh3_server_ex(
         ip: Ipv4Addr,
         one_shot: bool,
@@ -361,12 +344,11 @@ mod tests {
         (addr, trust, peers_ret)
     }
 
-    /** @brief 테스트용 질의. */
     fn q(id: u16, name: &str) -> Message {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
     }
 
-    /** @brief 질의를 그대로 되돌려 주는 응답. 답 레코드는 없다. */
+    /// Echoes the question with no answer records.
     fn answer_in_kind(req: &Message) -> Message {
         let mut m = Message::default();
         m.header.id = req.header.id;
@@ -375,18 +357,16 @@ mod tests {
         m
     }
 
-    /** @brief 다른 이름을 물은 질의에 대한 응답. */
+    /// Answers a different name than asked.
     fn answer_other_question(req: &Message) -> Message {
         let mut m = answer_in_kind(req);
         m.questions = q(req.header.id, "other.test").questions;
         m
     }
 
-    /**
-     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림.
-     * @param answer 받은 질의에 실을 응답을 만든다.
-     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 연결마다 받은 종료 사유를 차례로 받는 곳.
-     */
+    /// Upstream that collects the close reasons the client reports. `answer` builds the reply to
+    /// each query. Returns the server address, a trust store for its certificate, and a receiver of
+    /// each connection's close reasons.
     fn doh3_close_recorder(
         answer: fn(&Message) -> Message,
     ) -> (
@@ -400,19 +380,13 @@ mod tests {
         (addr, trust, closes)
     }
 
-    /** @brief RFC 9114 의 DATA 프레임 종류. */
     const DATA_FRAME: u64 = 0x00;
-    /** @brief RFC 9114 의 HEADERS 프레임 종류. */
     const HEADERS_FRAME: u64 = 0x01;
 
-    /** @brief DoH 경로를 모르는 웹 서버가 DNS 메시지 대신 내는 페이지. */
+    /// What a web server that does not know the DoH path sends instead of a DNS message.
     const HTML_PAGE: &[u8] = b"<html>no DNS here</html>";
 
-    /**
-     * @brief DNS 메시지 대신 HTML 페이지로 답한다. DoH 경로를 모르는 웹 서버가 내는 답이다.
-     * @param status 답에 실을 상태 코드.
-     * @param page 답에 실을 페이지.
-     */
+    /// Answers with an HTML page instead of a DNS message.
     fn answer_with_html_page(h3c: &mut H3Connection, sid: u64, status: &[u8], page: &[u8]) {
         let headers: [(&[u8], &[u8]); 2] = [(b":status", status), (b"content-type", b"text/html")];
         let (section, _) = onetdns_quic::qpack::Encoder::new().encode_field_section(&headers);
@@ -422,12 +396,8 @@ mod tests {
         h3c.conn_mut().send_stream(sid, &payload, true).unwrap();
     }
 
-    /**
-     * @brief 클라이언트가 알린 종료 사유를 모으는 테스트용 업스트림. 답은 respond 가 직접 쓴다.
-     * @param respond 받은 질의마다 그 스트림에 답을 쓴다.
-     * @return 서버 주소, 그 인증서만 믿는 신뢰 저장소, 맺은 연결 수, 연결마다 받은 종료 사유를
-     *         차례로 받는 곳.
-     */
+    /// Like doh3_close_recorder, but `respond` writes each answer itself. Also returns the number
+    /// of connections made.
     fn doh3_close_recorder_with(
         respond: impl Fn(&mut H3Connection, u64, &Message) + Send + 'static,
     ) -> (
@@ -484,15 +454,12 @@ mod tests {
         (addr, trust, peers_ret, reported)
     }
 
-    /** @brief 이 서버 구현이 처음 여는 단방향 스트림. HTTP/3 제어 스트림이다. */
+    /// The first unidirectional stream this server implementation opens: the HTTP/3 control stream.
     const SERVER_CONTROL_STREAM: u64 = 3;
-    /** @brief RFC 9114 의 GOAWAY 프레임 종류. */
     const GOAWAY_FRAME: u64 = 0x07;
 
-    /**
-     * @brief 이 스트림부터는 처리하지 않는다는 GOAWAY 를 보낸다.
-     * @note 이 서버 구현은 스스로 GOAWAY 를 보내지 않아 제어 스트림에 직접 쓴다.
-     */
+    /// This server implementation never sends GOAWAY itself, so it is written to the control stream
+    /// directly.
     fn send_goaway(h3c: &mut H3Connection, first_unprocessed: u64) {
         let mut payload = Vec::new();
         onetdns_quic::varint::write(&mut payload, first_unprocessed);
@@ -503,14 +470,11 @@ mod tests {
             .unwrap();
     }
 
-    /**
-     * @brief 질의에 답하면서 GOAWAY 를 보내는 테스트용 업스트림.
-     * @param refuse_later 참이면 연결의 첫 질의에만 답한다. 그 뒤 질의에는 답하지 않고 그
-     *                     스트림부터 처리하지 않는다는 GOAWAY 를 보내며, 소켓이 조용할 때마다 같은
-     *                     GOAWAY 를 다시 보내 연결을 살려 둔다. 거짓이면 다음 스트림부터 처리하지
-     *                     않는다는 GOAWAY 를 보낸 뒤 질의에 답한다.
-     * @return 서버 주소, 신뢰 저장소, 맺은 연결 수, 클라이언트가 알린 종료 사유를 차례로 받는 곳.
-     */
+    /// Upstream that sends GOAWAY while answering. With `refuse_later`, it answers only the first
+    /// query on a connection; later queries get no answer but a GOAWAY saying processing stops at
+    /// that stream, resent whenever the socket is quiet to keep the connection alive. Without it,
+    /// it sends GOAWAY for the next stream and then answers. Returns the server address, trust
+    /// store, connection count, and a receiver of close reasons.
     fn doh3_goaway_server(
         refuse_later: bool,
     ) -> (
@@ -572,7 +536,8 @@ mod tests {
                     };
                     let answer = answer_in_kind(&req).try_encode().unwrap();
                     if !refuse_later {
-                        /* 답보다 먼저 보내야 클라이언트가 답을 받기 전에 GOAWAY 를 읽는다. */
+                        // Sent before the answer, so the client reads GOAWAY before the answer
+                        // arrives.
                         send_goaway(h3c, sid + 4);
                         let _ = h3c.send_response(sid, &answer, 0);
                     } else if sid == 0 {
@@ -591,11 +556,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief GOAWAY 를 받은 연결을 다시 쓰지 않고 H3_NO_ERROR 로 닫는지.
-     * @details 서버가 연결 정리를 알렸으면 다음 질의는 새 연결로 가야 한다. 그 연결에 요청을 열다
-     *          실패한 것으로 처리하면 서버의 정상 종료를 이쪽 내부 실패로 알리게 된다.
-     */
+    /// Once the server announces cleanup, the next query must go to a new connection; treating a
+    /// failed request open as an error would report the server's graceful close as our internal
+    /// failure.
     fn doh3_goaway_moves_the_next_query_to_a_new_connection() {
         let (addr, trust, peers, closes) = doh3_goaway_server(false);
         let fwd = Forwarder::with_upstreams(
@@ -617,12 +580,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief GOAWAY 가 처리하지 않는다고 알린 질의를 데드라인까지 기다리지 않고 새 연결로 보내는지.
-     * @details 서버는 그 요청에 답하지 않으면서 같은 GOAWAY 를 계속 다시 보내므로, 연결이 조용해서
-     *          포기하는 경로는 작동하지 않는다. GOAWAY 를 읽고 바로 알아차리지 못하면 질의는
-     *          데드라인을 다 쓰고 실패한다.
-     */
+    /// The server never answers that request and keeps resending GOAWAY, so the give-up-on-silence
+    /// path never fires; without noticing GOAWAY at once, the query would spend its whole deadline
+    /// and fail.
     fn doh3_query_refused_by_goaway_is_retried_at_once() {
         let (addr, trust, peers, closes) = doh3_goaway_server(true);
         let fwd = Forwarder::with_upstreams(
@@ -648,11 +608,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의를 실어 보낼 수 없는 연결을 H3_INTERNAL_ERROR 로 닫는지.
-     * @details 서버가 앞선 데이터를 확인하지 않아 보낼 버퍼가 가득 찬 경우다. 그 연결은 버리고,
-     *          서버에는 정상 종료와 구분되는 내부 실패로 알린다.
-     */
+    /// The server has acknowledged nothing, so the send buffer is full. The connection is dropped
+    /// and the server is told of an internal failure, distinct from a normal close.
     fn doh3_unsendable_request_closes_with_internal_error() {
         let _revocation_test_guard = crate::revocation_test_read_guard();
         let (addr, trust, closes) = doh3_close_recorder(answer_in_kind);
@@ -679,11 +636,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 풀에서 버려지는 연결이 H3_NO_ERROR 로 닫힌다고 서버에 알리는지.
-     * @details 연결을 쥔 스레드가 끝나며 풀이 사라지는 경우다. 알리지 않으면 서버는 자기 유휴
-     *          데드라인까지 연결을 붙들고 있다.
-     */
+    /// Here the pool goes away as its thread ends. Without the notice, the server holds the
+    /// connection until its own idle deadline.
     fn doh3_discarded_connection_notifies_the_server() {
         let (addr, trust, closes) = doh3_close_recorder(answer_in_kind);
         thread::spawn(move || {
@@ -709,10 +663,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 질의에 맞지 않는 응답을 받으면 H3_GENERAL_PROTOCOL_ERROR 로 연결을 닫는지.
-     * @details 그런 서버가 같은 연결로 보낼 다음 응답도 믿을 수 없다.
-     */
+    /// Later answers from such a server on the same connection cannot be trusted either.
     fn doh3_mismatched_answer_closes_with_general_protocol_error() {
         let (addr, trust, closes) = doh3_close_recorder(answer_other_question);
         let fwd = Forwarder::with_upstreams(
@@ -727,10 +678,7 @@ mod tests {
         assert_eq!((close.error_code, close.frame_type), (0x101, None));
     }
 
-    /**
-     * @brief 이 업스트림에 질의 하나를 보낸 결과.
-     * @note 연결은 이 스레드의 풀에 들어가 스레드와 함께 버려진다.
-     */
+    /// The connection goes into this thread's pool and is dropped with the thread.
     fn exchange_once(addr: SocketAddr, trust: &TrustStore) -> Result<Message, ForwardError> {
         let request = q(1, "page.test");
         let wire = request.try_encode().unwrap();
@@ -746,12 +694,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 404 HTML 페이지를 그 질의의 실패로만 다루고 연결은 계속 쓰는지.
-     * @details 200 이 아닌 답은 HTTP 메시지로 온전하고 연결도 멀쩡하다. H3_MESSAGE_ERROR 로
-     *          닫으면 서버는 자기 응답이 망가졌다고 받아들인다. 연결을 버리고 다시 보내면 같은
-     *          답을 받으려고 핸드셰이크를 한 번 더 한다. 응답 버퍼 상한을 넘는 큰 페이지도 같다.
-     */
+    /// A non-200 answer is a complete HTTP message on a healthy connection. Closing with
+    /// H3_MESSAGE_ERROR would tell the server its response was broken, and reconnecting would
+    /// repeat the handshake to get the same answer. Pages larger than the response buffer limit
+    /// behave the same.
     fn doh3_error_page_fails_only_that_query() {
         for page in [HTML_PAGE.to_vec(), vec![b'x'; 200 * 1024]] {
             let size = page.len();
@@ -794,12 +740,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DNS 메시지가 아닌 200 응답을 풀리지 않는 DNS 본문처럼 다루는지.
-     * @details RFC 8484 에서 200 응답은 DNS 메시지를 싣는다. 그 규약을 어긴 서버는
-     *          H3_GENERAL_PROTOCOL_ERROR 로 알리고, 질의는 질의와 맞지 않는 응답을 받았을 때처럼
-     *          실패한다.
-     */
+    /// Under RFC 8484 a 200 carries a DNS message. A server breaking that is told
+    /// H3_GENERAL_PROTOCOL_ERROR, and the query fails as with a mismatched answer.
     fn doh3_success_status_without_a_dns_message_is_a_bad_response() {
         let (addr, trust, _peers, closes) = doh3_close_recorder_with(|h3c, sid, _| {
             answer_with_html_page(h3c, sid, b"200", HTML_PAGE)
@@ -815,7 +757,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증서를 검증하고 연결을 다시 쓰는지. */
     fn doh3_forward_verified_and_reuses_connection() {
         let (addr, trust) = doh3_server(Ipv4Addr::new(4, 4, 4, 4));
         let fwd = Forwarder::with_upstreams(
@@ -838,7 +779,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쉬고 있어도 살아 있으면 다시 쓰는지. */
     fn doh3_idle_alive_connection_is_reused() {
         let (addr, trust, peers) = doh3_server_ex(Ipv4Addr::new(7, 7, 7, 7), false);
         let fwd = Forwarder::with_upstreams(
@@ -856,7 +796,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 죽은 연결을 붙잡지 않고 곧바로 다시 잇는지. */
     fn doh3_reused_zombie_fails_fast_then_reconnects() {
         let (addr, trust, peers) = doh3_server_ex(Ipv4Addr::new(8, 8, 8, 8), true);
         let fwd = Forwarder::with_upstreams(
@@ -881,7 +820,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 믿을 수 없는 인증서를 거부하는지. */
     fn doh3_rejects_untrusted_cert() {
         let (addr, _trust) = doh3_server(Ipv4Addr::new(6, 6, 6, 6));
         let fwd = Forwarder::with_upstreams(
@@ -893,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 업스트림이라도 더 엄격한 신뢰 정책이 이전 QUIC 연결·세션을 재사용하지 않는지. */
+    /// A stricter trust policy must not reuse QUIC connections or sessions from before.
     fn doh3_cache_is_scoped_to_trust_policy() {
         let (addr, trust) = doh3_server(Ipv4Addr::new(6, 6, 6, 7));
         let trusted = Forwarder::with_upstreams(
@@ -913,7 +851,6 @@ mod tests {
 
     #[test]
     #[ignore = "네트워크 필요(Cloudflare DoH3 실서버 상호운용성 테스트)"]
-    /** @brief 실제 공개 업스트림과의 왕복. */
     fn doh3_live_cloudflare() {
         let fwd = Forwarder::with_upstreams(
             vec![Upstream::doh3(

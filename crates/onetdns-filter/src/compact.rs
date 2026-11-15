@@ -1,59 +1,43 @@
-/*!
- * @brief 도메인 집합의 최소 형태.
- *
- * @details 도메인을 뒤집어 정렬한 뒤 최소 비순환 오토마톤으로 고정한다. 접미사를 공유하는
- *          도메인들이 같은 상태를 나눠 쓰므로, 수백만 항목이 몇 분의 일로 줄어든다.
- * @note 훑는 동안 순위를 누적한다. 그 순위가 곧 정렬 순서상의 번호라 출처 배열을 바로
- *       가리킨다. 일치 문자열은 질의 자체의 정확/접미사 슬라이스이므로 따로 보존하지 않는다.
- * @warning 되읽을 때 구조를 전부 검증한다. 순환이나 범위 밖 인덱스가 남으면 판정 경로가
- *          무한 루프에 빠지거나 엉뚱한 곳을 읽는다.
- */
+//! Compact form of a domain set: domains are reversed, sorted, and frozen into a minimal acyclic
+//! automaton. Domains sharing a suffix share states, so millions of entries shrink to a fraction.
+//!
+//! The rank summed during a walk is the entry's position in sorted order and indexes the source
+//! array directly. The matched text is a slice of the query itself, so it is not stored.
+//!
+//! Decoding validates the whole structure: a cycle or out-of-range index left in would send the
+//! verdict path into an infinite loop or a wrong read.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
 
 use crate::table::{DomainTable, SortedDomains};
 
-/** @brief 없음 표시. */
 const NONE: u32 = u32::MAX;
-/** @brief 이 상태에서 단어가 끝날 수 있음을 뜻하는 비트. */
 const TERMINAL_BIT: u32 = 1 << 31;
-/** @brief 엣지 수를 꺼내는 마스크. */
 const EDGE_COUNT_MASK: u32 = !TERMINAL_BIT;
-/** @brief 인코딩된 맵의 헤더 크기. 상태 수, 엣지 수, 항목 수, 꼬리 길이, 출처 형태다. */
 const MAP_HEADER_BYTES: usize = 17;
 
-/** @brief 엣지 하나가 첫 글자 뒤에 더 먹을 수 있는 글자 수 상한. 길이를 한 바이트에 담는다. */
+/// The length fits in one byte.
 const MAX_EDGE_TAIL: usize = 255;
 
-/** @brief 인코딩된 맵 크기 상한. */
 const MAX_ENCODED_MAP_BYTES: usize = 512 * 1024 * 1024;
-/** @brief 출처가 하나도 없는 형태. */
 const SOURCE_EMPTY: u8 = 0;
-/** @brief 모든 출처가 같은 형태. 값 하나만 담는다. */
 const SOURCE_UNIFORM: u8 = 1;
-/** @brief 출처가 1바이트에 담기는 형태. */
 const SOURCE_U8: u8 = 2;
-/** @brief 출처가 2바이트에 담기는 형태. */
 const SOURCE_U16: u8 = 3;
-/** @brief 출처가 4바이트가 필요한 형태. */
 const SOURCE_U32: u8 = 4;
 
 #[cfg(test)]
-/** @brief 테스트에서 기준으로 쓰는 단순 맵. */
 type DomainMap = std::collections::HashMap<Box<str>, u32>;
 
 #[derive(Debug, Clone, Copy)]
-/** @brief 오토마톤 상태 하나. 엣지 시작, 개수, 종단 여부를 한 워드에 담는다. */
+/// Edge start, edge count, and terminal flag in one word.
 struct PackedState {
-    /** @brief 이 상태에서 나가는 첫 엣지의 곳. */
     first_edge: u32,
-    /** @brief 나가는 엣지 수와 이 상태가 끝인지를 함께 담은 값. */
     edge_count_and_terminal: u32,
 }
 
 impl PackedState {
-    /** @brief 상태를 만든다. */
     fn new(first_edge: u32, edge_count: usize, terminal: bool) -> Self {
         let terminal = if terminal { TERMINAL_BIT } else { 0 };
         Self {
@@ -63,89 +47,66 @@ impl PackedState {
     }
 
     #[inline]
-    /** @brief 이 상태의 엣지 수. */
     fn edge_count(self) -> usize {
         (self.edge_count_and_terminal & EDGE_COUNT_MASK) as usize
     }
 
     #[inline]
-    /** @brief 이 상태에서 단어가 끝날 수 있는지. */
     fn terminal(self) -> bool {
         self.edge_count_and_terminal & TERMINAL_BIT != 0
     }
 }
 
 #[derive(Debug, Default)]
-/** @brief 고정한 도메인 집합. 만들어진 뒤에는 바뀌지 않는다. */
+/// Immutable once built.
 pub(crate) struct CompactDomainMap {
-    /**
-     * @brief 상태마다 나가는 첫 엣지의 자리. 길이는 상태 수 더하기 하나이고 마지막 값은
-     *        엣지의 총 개수다.
-     * @invariant 엣지는 상태 번호 순서대로 빈틈없이 놓인다. 그래서 어떤 상태의 엣지 수는
-     *            다음 상태의 시작 자리에서 자기 시작 자리를 빼면 나온다. 상태마다 엣지 수를
-     *            따로 들고 있으면 이 배열과 똑같은 정보를 두 번 저장하는 셈이 된다.
-     */
+    /// The first edge of each state. Its length is the state count plus one, and the last value is
+    /// the total edge count.
+    ///
+    /// Edges are laid out contiguously in state order, so a state's edge count is the next state's
+    /// start minus its own. Storing a count per state would hold the same information twice.
     state_edges: Box<[u32]>,
-    /** @brief 상태가 종료 상태인지를 담은 비트들. 상태 하나에 한 비트다. */
     state_terminal: Box<[u64]>,
-    /** @brief 엣지마다의 글자. */
     edge_labels: Box<[u8]>,
-    /** @brief 엣지가 가리키는 상태. */
     edge_targets: Box<[u32]>,
-    /** @brief 엣지를 지날 때 더할 값. 이것을 모으면 이름의 곳이 된다. */
+    /// Added when the edge is taken; the sum along a path is the name's rank.
     edge_outputs: Box<[u32]>,
-    /**
-     * @brief 엣지가 첫 글자 뒤에 이어서 먹는 글자들의 자리. 0 이면 이어지는 글자가 없다.
-     * @details 가리키는 자리의 첫 바이트가 길이고 그 뒤로 길이만큼이 글자다. 같은 글자
-     *          묶음은 여러 엣지가 같은 자리를 가리켜 한 번만 저장한다.
-     */
+    /// Where the bytes an edge consumes after its first label sit; 0 means none. The first byte
+    /// there is the length and the bytes follow. Edges with the same bytes point at the same place,
+    /// so each run is stored once.
     edge_tails: Box<[u32]>,
-    /** @brief 이어지는 글자들을 모아 둔 곳. 0번 자리는 없음 표시에 쓰려고 비워 둔다. */
+    /// Index 0 is left empty to mean none.
     tail_bytes: Box<[u8]>,
-    /** @brief 이름마다 어느 목록에서 왔는지. */
     sources: SourceTable,
 }
 
-/** @brief 접은 뒤의 배열 묶음. */
 struct CollapsedArrays {
-    /** @brief 상태마다 나가는 첫 엣지의 자리. */
     state_edges: Box<[u32]>,
-    /** @brief 상태가 종료 상태인지를 담은 비트들. */
     state_terminal: Box<[u64]>,
-    /** @brief 엣지마다의 첫 글자. */
     edge_labels: Box<[u8]>,
-    /** @brief 엣지가 가리키는 상태. */
     edge_targets: Box<[u32]>,
-    /** @brief 엣지를 지날 때 더할 값. */
     edge_outputs: Box<[u32]>,
-    /** @brief 엣지가 첫 글자 뒤에 이어서 먹는 글자들의 자리. */
     edge_tails: Box<[u32]>,
-    /** @brief 이어지는 글자들을 모아 둔 곳. */
     tail_bytes: Box<[u8]>,
 }
 
 #[derive(Debug, Default)]
-/**
- * @brief 출처 번호 배열. 값 범위에 맞춰 표현을 고른다.
- * @details 대부분의 집합은 출처가 몇 개뿐이거나 아예 하나다. 항상 4바이트로 담으면
- *          항목 수에 비례해 메모리가 낭비된다.
- */
+/// The representation is chosen to fit the value range. Most sets have only a few sources or just
+/// one; always using 4 bytes would waste memory in proportion to the entry count.
 enum SourceTable {
     #[default]
-    /** @brief 어느 목록에서 왔는지 두지 않는다. */
     Empty,
-    /** @brief 전부 같은 목록에서 왔다. */
-    Uniform { value: u32, len: u32 },
-    /** @brief 목록 수가 적어 1바이트로 담는다. */
+    Uniform {
+        value: u32,
+        len: u32,
+    },
     U8(Box<[u8]>),
-    /** @brief 목록 수가 조금 많아 2바이트로 담는다. */
     U16(Box<[u16]>),
-    /** @brief 목록 수가 많아 4바이트로 담는다. */
     Dense(Box<[u32]>),
 }
 
 impl SourceTable {
-    /** @brief 값 범위를 보고 가장 작은 표현을 고른다. */
+    /// Picks the smallest representation for the value range.
     fn from_vec(values: Vec<u32>) -> Self {
         let Some(&value) = values.first() else {
             return Self::Empty;
@@ -193,7 +154,6 @@ impl SourceTable {
     }
 
     #[inline]
-    /** @brief 항목 수. */
     fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
@@ -204,13 +164,11 @@ impl SourceTable {
         }
     }
 
-    /** @brief 비었는지. */
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     #[inline]
-    /** @brief 인덱스로 출처를 얻는다. */
     fn get(&self, index: usize) -> Option<u32> {
         match self {
             Self::Empty => None,
@@ -234,7 +192,6 @@ impl SourceTable {
         }
     }
 
-    /** @brief 이 테이블이 쓰는 바이트. */
     fn storage_bytes(&self) -> usize {
         match self {
             Self::U8(values) => std::mem::size_of_val(&**values),
@@ -244,7 +201,6 @@ impl SourceTable {
         }
     }
 
-    /** @brief 인코딩할 때 쓸 표현 번호. */
     fn wire_kind(&self) -> u8 {
         match self {
             Self::Empty => SOURCE_EMPTY,
@@ -255,7 +211,6 @@ impl SourceTable {
         }
     }
 
-    /** @brief 인코딩된 크기. */
     fn wire_len(&self) -> Option<usize> {
         match self {
             Self::Empty => Some(0),
@@ -266,7 +221,6 @@ impl SourceTable {
         }
     }
 
-    /** @brief 테이블 내용을 청크 단위로 스트리밍한다. */
     fn encode_payload_chunks(&self, output: &mut impl FnMut(&[u8])) {
         match self {
             Self::Empty => {}
@@ -287,16 +241,12 @@ impl SourceTable {
 }
 
 #[derive(Debug, Clone, Copy)]
-/** @brief 찾은 결과. 도메인과 출처를 함께 준다. */
 pub(crate) struct CompactMatch<'a> {
-    /** @brief 찾아낸 이름. */
     pub(crate) key: &'a str,
-    /** @brief 그 이름의 곳. */
     pub(crate) index: usize,
 }
 
 #[cfg(test)]
-/** @brief 오토마톤 언어를 순회해 수정 가능한 테이블로 되돌린다. */
 fn rebuild_table(map: &CompactDomainMap) -> Option<DomainTable> {
     let mut table = DomainTable::default();
     table.reserve(map.len());
@@ -307,7 +257,6 @@ fn rebuild_table(map: &CompactDomainMap) -> Option<DomainTable> {
     Some(table)
 }
 
-/** @brief 빌드용 연속 문자열을 수정 가능한 테이블로 되돌린다. */
 fn rebuild_input_table(domains: &str, offsets: &[u32], sources: &SourceTable) -> DomainTable {
     let mut table = DomainTable::default();
     table.reserve(offsets.len().saturating_sub(1));
@@ -323,7 +272,6 @@ fn rebuild_input_table(domains: &str, offsets: &[u32], sources: &SourceTable) ->
     table
 }
 
-/** @brief 정렬 순서에 맞춘 출처 테이블을 만든다. */
 fn collect_sources(sorted: &SortedDomains) -> SourceTable {
     let entry_count = sorted.len();
     let mut uniform_source = None::<(u32, usize)>;
@@ -353,11 +301,10 @@ fn collect_sources(sorted: &SortedDomains) -> SourceTable {
     }
 }
 
-/**
- * @brief 큰 빌더와 정렬 테이블을 겹치기보다 작은 연속 입력을 거치는 편이 나은지 표본으로 고른다.
- * @details 무작위/DGA 목록은 오토마톤이 커서 16바이트 정렬 항목을 먼저 버리는 편이 낫고,
- *          접미사가 잘 겹치는 목록은 오토마톤이 작아 원본에서 바로 만드는 편이 피크가 낮다.
- */
+/// Picks from a sample whether going through a small contiguous input beats overlapping the large
+/// builder with the sorted table. Random or DGA lists build large automata, so dropping the 16-byte
+/// sorted entries first is better; lists whose suffixes overlap well build small automata, so
+/// building straight from the source has a lower peak.
 fn staging_reduces_peak(sorted: &SortedDomains, total_bytes: usize) -> bool {
     const SAMPLE_ENTRIES: usize = 32 * 1024;
     if sorted.len() <= SAMPLE_ENTRIES {
@@ -382,17 +329,10 @@ fn staging_reduces_peak(sorted: &SortedDomains, total_bytes: usize) -> bool {
     )
 }
 
-/**
- * @brief 표본에서 늘린 빌더 추정치가 연속 입력보다 큰지.
- *
- * @details usize가 아니라 u64로 센다. 표본 바이트에 항목 수를 곱하면 4 GiB를 쉽게 넘는데,
- *          32비트에서 포화한 값은 표본 수로 나눈 뒤 오히려 작아져 판정을 뒤집는다. 그러면
- *          메모리가 가장 빠듯한 platform이 피크가 높은 쪽을 고르게 된다.
- * @param sample_bytes 표본 오토마톤이 차지한 바이트.
- * @param sample_entries 표본에 넣은 항목 수. 0이면 안 된다.
- * @param entries 전체 항목 수.
- * @param total_bytes 전체 key 바이트 합.
- */
+/// Whether the builder estimate scaled up from the sample exceeds the contiguous input. Counted in
+/// u64, not usize: sample bytes times entries easily passes 4 GiB, and on 32-bit platforms a
+/// saturated value becomes smaller after dividing by the sample count. That flips the decision, so
+/// the platform with the least memory would pick the higher peak. `sample_entries` must not be 0.
 fn staging_beats_direct(
     sample_bytes: u64,
     sample_entries: u64,
@@ -412,13 +352,11 @@ fn staging_beats_direct(
 
 impl CompactDomainMap {
     #[inline]
-    /** @brief 상태 수. */
     fn state_count(&self) -> usize {
         self.state_edges.len().saturating_sub(1)
     }
 
     #[inline]
-    /** @brief 상태 하나를 읽는다. 범위를 벗어나면 None 이다. */
     fn state(&self, index: usize) -> Option<PackedState> {
         let first = *self.state_edges.get(index)?;
         let end = *self.state_edges.get(index + 1)?;
@@ -429,20 +367,19 @@ impl CompactDomainMap {
         ))
     }
 
-    /** @brief 모든 상태를 차례로 읽는다. */
     fn iter_states(&self) -> impl Iterator<Item = PackedState> + '_ {
         (0..self.state_count()).filter_map(|index| self.state(index))
     }
 
     #[inline]
-    /** @brief 상태 하나를 읽는다. 범위를 벗어나면 빈 상태로 본다. */
+    /// Out of range reads as an empty state.
     fn state_at(&self, index: usize) -> PackedState {
         self.state(index)
             .unwrap_or_else(|| PackedState::new(0, 0, false))
     }
 
     #[inline]
-    /** @brief 엣지가 첫 글자 뒤에 이어서 먹는 글자들. 없으면 빈 조각이다. */
+    /// Empty when there are none.
     fn edge_tail(&self, edge: usize) -> Option<&[u8]> {
         let at = *self.edge_tails.get(edge)? as usize;
         if at == 0 {
@@ -453,7 +390,6 @@ impl CompactDomainMap {
     }
 
     #[inline]
-    /** @brief 이 상태에서 단어가 끝날 수 있는지. */
     fn terminal(&self, index: usize) -> bool {
         let Some(word) = self.state_terminal.get(index / 64) else {
             return false;
@@ -461,21 +397,18 @@ impl CompactDomainMap {
         word >> (index % 64) & 1 == 1
     }
 
-    /**
-     * @brief 분기 없는 중간 상태를 접어 엣지 하나가 여러 글자를 먹게 만든다.
-     * @details 나가는 엣지가 하나뿐이고 종료도 아니며 순위에 더할 값도 없는 상태는 그저
-     *          지나가는 자리다. 그런 상태 하나마다 상태 여덟 바이트와 엣지 열두 바이트를
-     *          쓰는데 실제 정보는 글자 한 바이트뿐이다. 그래서 이어진 구간을 앞 엣지의
-     *          글자 뒤에 붙이고 중간 상태를 없앤다.
-     * @note 같은 글자 묶음을 여러 엣지가 가리킬 수 있으므로 묶음은 한 번만 저장한다.
-     */
+    /// Folds branchless intermediate states so one edge consumes several bytes. A state with one
+    /// outgoing edge, not terminal, and no rank to add is only a pass-through, yet it costs 8 bytes
+    /// of state and 12 of edge for one byte of information. Each such run is appended after the
+    /// leading edge's label and the intermediate states are removed. Several edges can point at the
+    /// same run, so each run is stored once.
     fn collapse_chains(
         states: &[PackedState],
         edge_labels: &[u8],
         edge_targets: &[u32],
         edge_outputs: &[u32],
     ) -> CollapsedArrays {
-        /* 뿌리는 접지 않는다. 접으면 시작 자리가 사라진다. */
+        // The root is never folded; folding it would lose the start.
         let passthrough = |index: usize| -> bool {
             if index == 0 {
                 return false;
@@ -486,10 +419,9 @@ impl CompactDomainMap {
                 && edge_outputs[state.first_edge as usize] == 0
         };
 
-        /*
-         * 상한에 걸려 멈춘 자리는 남겨야 한다. 지나가는 자리라고 지워 버리면 그 엣지가
-         * 가리킬 상태가 사라진다. 그래서 어디서 멈추는지 먼저 확정하고 나서 번호를 준다.
-         */
+        // A state where folding stopped at the length limit must stay: removing it as a
+        // pass-through would leave that edge with no target. So where folding stops is settled
+        // first, and numbering comes after.
         let mut keep: Vec<bool> = (0..states.len()).map(|index| !passthrough(index)).collect();
         let mut pending: Vec<usize> = (0..states.len()).filter(|index| keep[*index]).collect();
         while let Some(index) = pending.pop() {
@@ -527,7 +459,7 @@ impl CompactDomainMap {
         let mut targets = Vec::with_capacity(edge_total);
         let mut outputs = Vec::with_capacity(edge_total);
         let mut tails = Vec::with_capacity(edge_total);
-        /* 0번 자리는 "이어지는 글자 없음" 을 나타내는 값과 겹치지 않도록 비워 둔다. */
+        // Index 0 is left empty so it cannot collide with the none marker.
         let mut tail_bytes = vec![0u8];
         let mut tail_at = vec![NONE; states.len()];
 
@@ -585,12 +517,9 @@ impl CompactDomainMap {
         }
     }
 
-    /**
-     * @brief 테이블을 고정해 최소 오토마톤으로 만든다.
-     * @warning 만든 뒤 모든 항목이 실제로 자기 순위로 되찾아지는지 확인한다. 하나라도
-     *          어긋나면 고정를 포기하고 테이블을 그대로 돌려준다. 조용히 틀린 집합을
-     *          쓰는 것보다 메모리를 더 쓰는 쪽이 낫다.
-     */
+    /// After building, checks that every entry is found again at its own rank. If any is not,
+    /// compaction is abandoned and the table is returned as is: using more memory beats silently
+    /// using a wrong set.
     pub(crate) fn try_from_table(table: DomainTable) -> Result<Self, DomainTable> {
         if table.is_empty() {
             return Ok(Self::default());
@@ -679,17 +608,14 @@ impl CompactDomainMap {
         Ok(built)
     }
 
-    /** @brief 비었는지. */
     pub(crate) fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
 
-    /** @brief 항목 수. */
     pub(crate) fn len(&self) -> usize {
         self.sources.len()
     }
 
-    /** @brief 이 집합이 쓰는 바이트. */
     pub(crate) fn storage_bytes(&self) -> usize {
         self.state_edges.len() * size_of::<u32>()
             + self.state_terminal.len() * size_of::<u64>()
@@ -701,22 +627,20 @@ impl CompactDomainMap {
             + self.sources.storage_bytes()
     }
 
-    /** @brief 순위로 출처를 얻는다. */
     pub(crate) fn source(&self, index: usize) -> Option<u32> {
         self.sources.get(index)
     }
 
-    /** @brief 순위 순서의 출처를 훑는다. 문자열 보존 없이 통계를 만들 때 쓴다. */
+    /// For statistics without keeping the strings.
     pub(crate) fn indexed_sources(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
         (0..self.len()).filter_map(|index| self.source(index).map(|source| (index, source)))
     }
 
-    /**
-     * @brief 오토마톤이 받아들이는 모든 이름을 순위 순서로 재구성한다.
-     * @details 수정 때문에 테이블로 되돌리거나 hit 보고 이름을 만들 때만 쓰는 콜드 경로다.
-     *          질의 경로는 입력 문자열의 슬라이스를 쓰므로 이 순회를 하지 않는다.
-     * @warning 재귀 호출을 쓰지 않는다. 손상 캐시나 긴 테스트 키가 호출 스택을 소진하면 안 된다.
-     */
+    /// Rebuilds every name the automaton accepts, in rank order. This is a cold path, used only to
+    /// turn the set back into a table for edits or to name hits in reports; the query path uses
+    /// slices of its input and never walks this.
+    ///
+    /// Not recursive: a corrupt cache or a long test key must not exhaust the call stack.
     pub(crate) fn for_each_entry(
         &self,
         mut visitor: impl FnMut(usize, &str, u32),
@@ -731,10 +655,8 @@ impl CompactDomainMap {
 
         let mut reversed = Vec::new();
         let mut forward = Vec::new();
-        /*
-         * 네 번째 값은 이 칸에 들어오며 밀어 넣은 글자 수다. 엣지 하나가 여러 글자를
-         * 실으므로 돌아 나갈 때 한 글자만 빼면 이름이 어긋난다.
-         */
+        // The fourth value is how many bytes were pushed on entering this slot. One edge carries
+        // several bytes, so popping a single byte on the way out would corrupt the name.
         let mut stack = vec![(0usize, 0usize, 0u32, false, 0usize)];
         while !stack.is_empty() {
             let frame_index = stack.len() - 1;
@@ -796,7 +718,6 @@ impl CompactDomainMap {
     }
 
     #[cfg(test)]
-    /** @brief 맵을 버퍼에 인코딩한다. */
     pub(crate) fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), &'static str> {
         let encoded_len = self
             .encoded_len()
@@ -810,7 +731,6 @@ impl CompactDomainMap {
         self.encode_chunks(&mut |bytes| output.extend_from_slice(bytes))
     }
 
-    /** @brief 맵을 청크 단위로 스트리밍한다. */
     pub(crate) fn encode_chunks(&self, output: &mut impl FnMut(&[u8])) -> Result<(), &'static str> {
         let encoded_len = self
             .encoded_len()
@@ -846,12 +766,9 @@ impl CompactDomainMap {
         Ok(())
     }
 
-    /**
-     * @brief 인코딩된 맵을 읽는다.
-     * @warning 읽은 뒤 구조를 전부 검증한다. 순환, 범위 밖 인덱스, 엣지 순서, 도달 가능성,
-     *          부분 순위를 모두 본다. 하나라도 어긋난 채 쓰면 판정 경로가 무한 루프에
-     *          빠지거나 엉뚱한 곳을 읽는다.
-     */
+    /// Validates the whole structure after reading: cycles, out-of-range indexes, edge order,
+    /// reachability, and partial ranks. Using it with any of these wrong would send the verdict
+    /// path into an infinite loop or a wrong read.
     pub(crate) fn decode_from(input: &mut &[u8]) -> Result<Self, &'static str> {
         let states_len = read_u32(input)? as usize;
         let edges_len = read_u32(input)? as usize;
@@ -944,7 +861,6 @@ impl CompactDomainMap {
         Ok(map)
     }
 
-    /** @brief 정확히 일치하는 항목을 찾는다. */
     pub(crate) fn lookup_exact<'a>(&self, domain: &'a str) -> Option<CompactMatch<'a>> {
         if self.state_count() == 0 {
             return None;
@@ -962,11 +878,8 @@ impl CompactDomainMap {
         self.matched_entry(rank, domain)
     }
 
-    /**
-     * @brief 가장 긴 접미사 일치를 찾는다.
-     * @note 라벨 경계에서만 맞는 것으로 본다. 그러지 않으면 evil-example.com이
-     *       example.com 규칙에 걸린다.
-     */
+    /// Matches only at label boundaries; otherwise evil-example.com would match an example.com
+    /// rule.
     pub(crate) fn lookup_suffix<'a>(&self, domain: &'a str) -> Option<CompactMatch<'a>> {
         if self.state_count() == 0 {
             return None;
@@ -994,14 +907,12 @@ impl CompactDomainMap {
         self.matched_entry(rank, domain.get(start..)?)
     }
 
-    /** @brief 순위로 항목을 되찾는다. */
     fn matched_entry<'a>(&self, rank: u32, key: &'a str) -> Option<CompactMatch<'a>> {
         let index = rank as usize;
         self.sources.get(index)?;
         Some(CompactMatch { key, index })
     }
 
-    /** @brief 인코딩했을 때의 크기. */
     fn encoded_len(&self) -> Option<usize> {
         MAP_HEADER_BYTES
             .checked_add(self.state_edges.len().checked_mul(4)?)?
@@ -1014,7 +925,6 @@ impl CompactDomainMap {
             .checked_add(self.sources.wire_len()?)
     }
 
-    /** @brief 읽은 구조가 온전한지 전부 확인한다. */
     fn validate_decoded(&self) -> Result<(), &'static str> {
         if self.edge_labels.len() != self.edge_targets.len()
             || self.edge_labels.len() != self.edge_outputs.len()
@@ -1022,10 +932,9 @@ impl CompactDomainMap {
             return Err("Compact map array length invariant violated");
         }
 
-        /*
-         * 엣지 수는 이웃한 두 시작 자리의 차이로 얻는다. 그래서 이 배열이 단조가 아니면
-         * 상태 하나가 조용히 사라지고, 검증은 통과한 채로 엉뚱한 엣지를 읽게 된다.
-         */
+        // Edge counts come from the difference of adjacent starts, so if this array is not
+        // monotonic a state silently disappears and validation passes while reading the wrong
+        // edges.
         if self.state_edges.first() != Some(&0)
             || self.state_edges.last().map(|last| *last as usize) != Some(self.edge_labels.len())
         {
@@ -1037,7 +946,7 @@ impl CompactDomainMap {
         if self.state_terminal.len() != self.state_count().div_ceil(64) {
             return Err("Compact filter final-state bit length does not match the state count");
         }
-        /* 남는 비트를 0 으로 못 박지 않으면 같은 집합이 서로 다른 바이트로 인코딩된다. */
+        // Unless the spare bits are pinned to 0, the same set encodes to different bytes.
         let spare = self.state_terminal.len() * 64 - self.state_count();
         if spare > 0
             && self
@@ -1051,7 +960,7 @@ impl CompactDomainMap {
         if self.edge_tails.len() != self.edge_labels.len() {
             return Err("Compact filter edge tail array length does not match");
         }
-        /* 0번 자리는 "이어지는 글자 없음" 표시이므로 글자로 읽히면 안 된다. */
+        // Index 0 is the none marker and must not be read as bytes.
         if self.tail_bytes.len() == 1 && self.edge_tails.iter().any(|at| *at != 0) {
             return Err("Compact filter edge points to tail bytes that do not exist");
         }
@@ -1174,13 +1083,8 @@ impl CompactDomainMap {
         Ok(())
     }
 
-    /**
-     * @brief 이름을 뒤에서부터 읽으며 엣지 하나만큼 나아간다.
-     * @param bytes 원래 순서의 이름. 뒤에서부터 읽는다.
-     * @param eaten 지금까지 먹은 글자 수.
-     * @return 다음 상태, 누적 순위, 그리고 새로 늘어난 먹은 글자 수.
-     * @note 엣지 하나가 여러 글자를 먹을 수 있으므로 몇 글자를 먹었는지 함께 돌려준다.
-     */
+    /// Reads the name from the end and advances one edge. Returns the next state, the summed rank,
+    /// and the new consumed count; one edge can consume several bytes.
     #[inline]
     fn step(
         &self,
@@ -1189,10 +1093,8 @@ impl CompactDomainMap {
         bytes: &[u8],
         eaten: usize,
     ) -> Option<(usize, u32, usize)> {
-        /*
-         * 엣지를 고를 때는 엣지 범위만 필요하다. 종료 여부까지 함께 읽으면 글자마다 다른
-         * 배열을 한 번 더 건드리게 되고, 그 값은 여기서 쓰이지도 않는다.
-         */
+        // Choosing an edge needs only the edge range. Reading the terminal flag too would touch
+        // another array per byte for a value not used here.
         let first = *self.state_edges.get(state_index)? as usize;
         let end = *self.state_edges.get(state_index + 1)? as usize;
         let labels = self.edge_labels.get(first..end)?;
@@ -1221,13 +1123,11 @@ impl CompactDomainMap {
     }
 }
 
-/** @brief 32비트 값을 읽는다. */
 fn read_u32(input: &mut &[u8]) -> Result<u32, &'static str> {
     let bytes = take_bytes(input, 4)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/** @brief 64비트 값을 읽는다. */
 fn read_u64(input: &mut &[u8]) -> Result<u64, &'static str> {
     let bytes = take_bytes(input, 8)?;
     let mut word = [0u8; 8];
@@ -1235,33 +1135,29 @@ fn read_u64(input: &mut &[u8]) -> Result<u64, &'static str> {
     Ok(u64::from_le_bytes(word))
 }
 
-/** @brief 8비트 값을 읽는다. */
 fn read_u8(input: &mut &[u8]) -> Result<u8, &'static str> {
     Ok(take_bytes(input, 1)?[0])
 }
 
-/** @brief 정해진 길이만큼 가져온다. */
 fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], &'static str> {
     let bytes = input.get(..len).ok_or("Compact map data is truncated")?;
     *input = &input[len..];
     Ok(bytes)
 }
 
-/** @brief 길이를 미리 잡은 벡터. 상한을 넘으면 오류다. */
+/// Fails past the limit.
 fn reserved_vec<T>(len: usize, error: &'static str) -> Result<Vec<T>, &'static str> {
     let mut values = Vec::new();
     values.try_reserve_exact(len).map_err(|_| error)?;
     Ok(values)
 }
 
-/** @brief 값으로 채운 벡터. */
 fn filled_vec<T: Clone>(len: usize, value: T, error: &'static str) -> Result<Vec<T>, &'static str> {
     let mut values = reserved_vec(len, error)?;
     values.resize(len, value);
     Ok(values)
 }
 
-/** @brief 바이트를 복사해 가져온다. */
 fn copy_bytes(input: &mut &[u8], len: usize, error: &'static str) -> Result<Vec<u8>, &'static str> {
     let source = take_bytes(input, len)?;
     let mut bytes = reserved_vec(len, error)?;
@@ -1269,7 +1165,6 @@ fn copy_bytes(input: &mut &[u8], len: usize, error: &'static str) -> Result<Vec<
     Ok(bytes)
 }
 
-/** @brief 32비트 값 배열을 읽는다. */
 fn read_u32_vec(
     input: &mut &[u8],
     len: usize,
@@ -1282,7 +1177,7 @@ fn read_u32_vec(
     Ok(values)
 }
 
-/** @brief 출처 테이블을 읽는다. 표현 번호가 모르는 값이거나 비최소면 거부한다. */
+/// Rejects unknown or nonminimal representations.
 fn decode_source_table(
     input: &mut &[u8],
     len: usize,
@@ -1335,7 +1230,6 @@ fn decode_source_table(
     }
 }
 
-/** @brief 이 표현의 인코딩 크기. */
 fn source_wire_len(kind: u8, len: usize) -> Result<usize, &'static str> {
     if len == 0 {
         return if kind == SOURCE_EMPTY {
@@ -1357,11 +1251,8 @@ fn source_wire_len(kind: u8, len: usize) -> Result<usize, &'static str> {
     }
 }
 
-/**
- * @brief 뒤집은 순서로 문자열을 비교한다.
- * @details 도메인을 뒤에서부터 보면 같은 상위 도메인끼리 모인다. 그 배치라야 접미사를
- *          공유하는 상태를 하나로 합칠 수 있다.
- */
+/// Compares strings by their reversed bytes. Read from the end, domains under the same parent sit
+/// together, which is what lets states sharing a suffix merge.
 fn reverse_cmp(left: &str, right: &str) -> Ordering {
     left.as_bytes()
         .iter()
@@ -1370,22 +1261,16 @@ fn reverse_cmp(left: &str, right: &str) -> Ordering {
 }
 
 #[derive(Debug)]
-/** @brief 엣지를 담는 아레나. 자유 목록으로 곳을 되쓴다. */
+/// Reuses slots through a free list.
 struct EdgeArena {
-    /** @brief 엣지의 글자. */
     label: Vec<u8>,
-    /** @brief 엣지가 가리키는 상태. */
     target: Vec<u32>,
-    /** @brief 같은 상태에서 나가는 다음 엣지. */
     next: Vec<u32>,
-    /** @brief 다시 쓸 수 있는 곳들의 머리. */
     free: u32,
-    /** @brief 지금 쓰이고 있는 엣지 수. */
     live: usize,
 }
 
 impl EdgeArena {
-    /** @brief 빈 아레나. */
     fn new() -> Self {
         Self {
             label: Vec::new(),
@@ -1396,7 +1281,6 @@ impl EdgeArena {
         }
     }
 
-    /** @brief 엣지 하나를 잡는다. */
     fn alloc(&mut self, label: u8, target: u32, next: u32) -> u32 {
         self.live += 1;
         if self.free != NONE {
@@ -1414,7 +1298,6 @@ impl EdgeArena {
         cell
     }
 
-    /** @brief 엣지 체인을 놓아 자유 목록에 넣는다. */
     fn release(&mut self, head: u32) {
         let mut cursor = head;
         while cursor != NONE {
@@ -1429,22 +1312,18 @@ impl EdgeArena {
 }
 
 #[derive(Debug)]
-/** @brief 만드는 중의 상태 하나. */
 struct BuildState {
-    /** @brief 이 상태가 이름의 끝인지. */
     terminal: bool,
 
-    /** @brief 이 상태에서 나가는 첫 엣지. */
     edge_head: u32,
-    /** @brief 같은 모양의 상태를 잇는 다음 위치. */
+    /// Next state of the same shape in the register.
     register_next: u32,
 }
 
-/** @brief 만드는 중 상태 하나의 크기를 못 고정한다. */
+/// Pins the build state size; it scales load memory.
 const _: () = assert!(size_of::<Option<BuildState>>() == 12);
 
 impl BuildState {
-    /** @brief 빈 상태. */
     fn new() -> Self {
         Self {
             terminal: false,
@@ -1454,31 +1333,22 @@ impl BuildState {
     }
 }
 
-/**
- * @brief 최소 비순환 오토마톤을 만드는 것.
- * @details 정렬된 입력을 순서대로 넣으며 확정된 뒷부분을 바로 최소화한다. 전부 넣은 뒤
- *          최소화하면 중간 메모리가 훨씬 커진다.
- */
+/// Builds a minimal acyclic automaton. Sorted input is inserted in order and the settled tail is
+/// minimized right away; minimizing after inserting everything would need far more memory in
+/// between.
 struct DawgBuilder {
-    /** @brief 만드는 중인 상태들. */
     states: Vec<Option<BuildState>>,
-    /** @brief 다시 쓸 수 있는 상태 곳들. */
     free: Vec<u32>,
-    /** @brief 엣지 저장소. */
     edges: EdgeArena,
 
-    /** @brief 같은 모양의 상태를 찾는 곳. */
     buckets: Vec<u32>,
-    /** @brief 이미 고정해 합친 상태 수. */
     registered: usize,
-    /** @brief 지금 넣고 있는 이름이 지나온 상태들. */
     path: Vec<u32>,
-    /** @brief 직전에 넣은 이름. 앞부분이 같으면 그만큼 다시 쓴다. */
+    /// The shared prefix with it is reused.
     previous: Vec<u8>,
 }
 
 impl DawgBuilder {
-    /** @brief 빈 빌더. */
     fn new() -> Self {
         Self {
             states: vec![Some(BuildState::new())],
@@ -1491,7 +1361,7 @@ impl DawgBuilder {
         }
     }
 
-    /** @brief 뒤집은 도메인 하나를 넣는다. 입력은 정렬돼 있어야 한다. */
+    /// The input must be sorted.
     fn insert_reversed(&mut self, domain: &[u8]) {
         let common = self
             .previous
@@ -1516,7 +1386,7 @@ impl DawgBuilder {
         self.previous.extend(domain.iter().rev().copied());
     }
 
-    /** @brief 남은 상태를 최소화하고 입력 검증에 쓸 읽기 전용 그래프로 만든다. */
+    /// Minimizes what is left and makes the read-only graph used to check the input.
     fn complete(&mut self) {
         self.minimize(0);
         self.buckets = Vec::new();
@@ -1524,7 +1394,6 @@ impl DawgBuilder {
         self.previous.clear();
     }
 
-    /** @brief 완성된 그래프가 뒤집은 이름을 받아들이는지. */
     fn contains_reversed(&self, domain: &[u8]) -> bool {
         let mut state_id = 0u32;
         for label in domain.iter().rev() {
@@ -1546,12 +1415,11 @@ impl DawgBuilder {
         self.state(state_id).terminal
     }
 
-    /** @brief 최소화를 마친 그래프를 연속 배열로 고정한다. */
     fn finish_completed(self) -> (Box<[PackedState]>, Box<[u8]>, Box<[u32]>, Box<[u32]>, u32) {
         self.pack(0)
     }
 
-    /** @brief 공통 접두사보다 뒤쪽 상태들을 확정하고 같은 것끼리 합친다. */
+    /// Settles the states past the common prefix and merges equal ones.
     fn minimize(&mut self, prefix_len: usize) {
         while self.path.len() > prefix_len + 1 {
             let child = self.path.pop().unwrap_or(0);
@@ -1566,7 +1434,7 @@ impl DawgBuilder {
         }
     }
 
-    /** @brief 같은 상태가 이미 있으면 그것을 쓰고, 없으면 등록한다. */
+    /// Reuses an equal state if one exists; otherwise registers this one.
     fn register_state(&mut self, state_id: u32) -> u32 {
         let hash = self.state_hash(state_id);
         let mut candidate = self.buckets[(hash & self.bucket_mask()) as usize];
@@ -1592,12 +1460,10 @@ impl DawgBuilder {
     }
 
     #[inline]
-    /** @brief 등록부 버킷 마스크. */
     fn bucket_mask(&self) -> u64 {
         self.buckets.len() as u64 - 1
     }
 
-    /** @brief 등록부를 키운다. */
     fn grow_register(&mut self) {
         let old = std::mem::take(&mut self.buckets);
         self.buckets = vec![NONE; old.len() * 2];
@@ -1615,7 +1481,6 @@ impl DawgBuilder {
         }
     }
 
-    /** @brief 새 상태를 만든다. */
     fn new_state(&mut self) -> u32 {
         let state = BuildState::new();
         if let Some(id) = self.free.pop() {
@@ -1628,21 +1493,19 @@ impl DawgBuilder {
         }
     }
 
-    /** @brief 상태를 빌린다. */
     fn state(&self, id: u32) -> &BuildState {
         self.states[id as usize]
             .as_ref()
             .expect("Active compact filter state must exist")
     }
 
-    /** @brief 상태를 바꿀 수 있게 빌린다. */
     fn state_mut(&mut self, id: u32) -> &mut BuildState {
         self.states[id as usize]
             .as_mut()
             .expect("Active compact filter state must exist")
     }
 
-    /** @brief 두 상태가 같은 언어를 나타내는지. 엣지와 종단 여부를 모두 본다. */
+    /// Same language: compares edges and the terminal flag.
     fn states_equal(&self, left: u32, right: u32) -> bool {
         if self.state(left).terminal != self.state(right).terminal {
             return false;
@@ -1662,7 +1525,6 @@ impl DawgBuilder {
         left == right
     }
 
-    /** @brief 상태의 해시. 같은 상태를 찾는 데 쓴다. */
     fn state_hash(&self, id: u32) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
         hash ^= u64::from(self.state(id).terminal);
@@ -1681,7 +1543,6 @@ impl DawgBuilder {
         hash
     }
 
-    /** @brief 상태의 엣지들을 모은다. */
     fn collect_edges(&self, state_id: u32, out: &mut Vec<u32>) {
         out.clear();
         let mut cursor = self.state(state_id).edge_head;
@@ -1694,7 +1555,6 @@ impl DawgBuilder {
 
     #[cold]
     #[inline(never)]
-    /** @brief 만든 상태들을 연속 배열로 고정한다. */
     fn pack(self, root: u32) -> (Box<[PackedState]>, Box<[u8]>, Box<[u32]>, Box<[u32]>, u32) {
         let live_states = self.states.len().saturating_sub(self.free.len());
         let mut remap = vec![NONE; self.states.len()];
@@ -1759,11 +1619,8 @@ impl DawgBuilder {
     }
 }
 
-/**
- * @brief 각 상태에서 도달할 수 있는 단어 수를 센다.
- * @details 이 값이 순위 누적의 재료다. 훑으면서 지나친 가지의 단어 수를 더하면 정렬
- *          순서상의 번호가 나온다.
- */
+/// Counts the words reachable from each state. Summing the counts of the branches passed over
+/// during a walk gives the position in sorted order.
 fn term_counts(mut counts: Vec<u32>, states: &[PackedState], edge_targets: &[u32]) -> Vec<u32> {
     counts.truncate(states.len());
     counts.fill(NONE);
@@ -1795,15 +1652,13 @@ fn term_counts(mut counts: Vec<u32>, states: &[PackedState], edge_targets: &[u32
 }
 
 #[cfg(test)]
-/** @brief 고정한 형태가 원본과 같은 답을 내는지, 그리고 조작된 인코딩을 거부하는지. */
 mod tests {
     use super::*;
 
     #[test]
     #[ignore = "빌더 계량 프로브: cargo test -p onetdns-filter --release -- --ignored --nocapture"]
-    /** @brief 만드는 중의 자료구조 크기를 확인한다. 커지면 로드 메모리가 함께 커진다. */
+    /// Growth here grows load memory.
     fn probe_dawg_builder_shape() {
-        /** @brief 테스트에 쓸 규칙 수. */
         const N: u32 = 200_000;
 
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -1880,13 +1735,11 @@ mod tests {
         );
     }
 
-    /** @brief 항목들로 고정한 집합을 만든다. */
     fn compact(entries: &[(&str, u32)]) -> CompactDomainMap {
         CompactDomainMap::try_from_table(table_of(entries)).expect("작은 map은 압축 가능")
     }
 
     #[test]
-    /** @brief 고정를 포기하면 모든 항목이 출처와 함께 되돌아오는지. */
     fn abandoning_compaction_restores_every_entry_with_its_source() {
         let entries = [
             ("ads.example.com", 7u32),
@@ -1909,7 +1762,6 @@ mod tests {
         }
     }
 
-    /** @brief 항목들로 테이블을 만든다. */
     fn table_of(entries: &[(&str, u32)]) -> DomainTable {
         let mut table = DomainTable::default();
         for (domain, source) in entries {
@@ -1918,7 +1770,6 @@ mod tests {
         table
     }
 
-    /** @brief 기준 맵에서 테이블을 만든다. */
     fn table_from_reference(reference: &DomainMap) -> DomainTable {
         let mut table = DomainTable::default();
         for (domain, source) in reference {
@@ -1927,8 +1778,6 @@ mod tests {
         table
     }
 
-    /** @brief 인코딩에서 출처 테이블이 시작하는 위치. */
-    /** @brief 상태 영역이 차지하는 바이트. */
     fn state_area_bytes(map: &CompactDomainMap) -> usize {
         map.state_edges.len() * size_of::<u32>() + map.state_terminal.len() * size_of::<u64>()
     }
@@ -1943,7 +1792,6 @@ mod tests {
             + map.tail_bytes.len()
     }
 
-    /** @brief 콜드 순회 결과를 비교하기 쉬운 소유 형태로 모은다. */
     fn owned_entries(map: &CompactDomainMap) -> Vec<(String, u32)> {
         let mut entries = Vec::with_capacity(map.len());
         map.for_each_entry(|_, key, source| entries.push((key.to_string(), source)))
@@ -1952,7 +1800,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정확 일치와 최장 접미사가 원래 값을 주는지. */
     fn exact_and_longest_suffix_return_the_original_value() {
         let map = compact(&[
             ("example.com", 1),
@@ -1983,7 +1830,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 일치 문자열이 보존 복사본이 아니라 질의 버퍼를 빌리는지. */
     fn matches_borrow_the_query_instead_of_retaining_domain_text() {
         let map = compact(&[("ads.example.com", 2)]);
         let query = String::from("deep.ads.example.com");
@@ -2007,7 +1853,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 출처가 모두 같으면 값 하나만 담는지. */
     fn uniform_sources_use_constant_storage_and_one_wire_value() {
         let map = compact(&[
             ("one.example", 17),
@@ -2044,7 +1889,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 작은 값 범위에서 1바이트 표현을 쓰고 없음 표시도 보존되는지. */
     fn small_mixed_sources_use_one_byte_entries_and_preserve_no_source() {
         let map = compact(&[
             ("one.example", 1),
@@ -2082,7 +1926,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중간 값 범위에서 2바이트 표현을 쓰는지. */
     fn medium_sources_use_two_byte_entries() {
         let map = compact(&[("one.example", 255), ("two.example", 65_534)]);
         assert!(matches!(map.sources, SourceTable::U16(_)));
@@ -2114,7 +1957,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 없음 표시와 겹치는 값이 오면 좁은 표현으로 줄이지 않는지. 줄이면 값이 없음으로 둔갑한다. */
+    /// Narrowing would turn the value into the none marker.
     fn source_value_that_conflicts_with_the_u16_sentinel_remains_dense() {
         let map = compact(&[("one.example", 65_535), ("two.example", u32::MAX)]);
         assert!(matches!(map.sources, SourceTable::Dense(_)));
@@ -2129,7 +1972,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 표현과 비최소 인코딩을 거부하는지. */
     fn source_decoder_rejects_unknown_and_nonminimal_encodings() {
         let mut unknown = &[][..];
         assert!(decode_source_table(&mut unknown, 2, 0xff, "allocation").is_err());
@@ -2145,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 접미사 일치가 라벨 경계에서만 걸리는지. 아니면 남의 도메인이 이 서버의 규칙에 걸린다. */
+    /// Otherwise another party's domain would match this server's rule.
     fn suffix_match_requires_a_dns_label_boundary() {
         let map = compact(&[("example.com", 1), ("ample.net", 2)]);
         assert!(map.lookup_suffix("notexample.com").is_none());
@@ -2154,7 +1996,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 누적 순위가 정렬된 모든 항목을 정확히 가리키는지. */
     fn output_rank_indexes_every_sorted_entry() {
         let entries: Vec<(String, u32)> = (0..10_000)
             .map(|index| (format!("ad{index}.tenant{}.example", index % 97), index))
@@ -2173,12 +2014,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빌더 추정이 좁은 usize 폭에서 넘쳐 판정이 뒤집히지 않는지. */
     fn build_peak_estimate_survives_narrow_usize_width() {
-        /*
-         * 4만 항목 wide 목록에서 실제로 나온 표본값이다. usize가 32비트면 이 곱이 넘쳐
-         * 포화하고, 포화값을 표본 수로 나누면 131,072이 되어 direct를 고른다.
-         */
+        // A sample from a 40,000-entry wide list. With a 32-bit usize this product saturates, and
+        // dividing the saturated value by the sample count gives 131,072, which picks direct.
         const SAMPLE_BYTES: u64 = 5_372_650;
         const ENTRIES: u64 = 40_000;
         const SAMPLE_ENTRIES: u64 = 32 * 1024;
@@ -2190,7 +2028,7 @@ mod tests {
             staging_beats_direct(SAMPLE_BYTES, SAMPLE_ENTRIES, ENTRIES, 960_004),
             "넘치는 곱이 포화해 direct로 뒤집히면 안 됩니다"
         );
-        /* 접미사가 잘 겹쳐 오토마톤이 작은 목록은 그대로 direct여야 한다. */
+        // A list whose suffixes overlap well builds a small automaton and must stay direct.
         assert!(!staging_beats_direct(
             79_768,
             SAMPLE_ENTRIES,
@@ -2200,7 +2038,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빌드 피크 경로가 압축이 잘 되는 목록과 wide 목록을 구분하는지. */
     fn build_peak_strategy_adapts_to_automaton_density() {
         const COUNT: usize = 40_000;
 
@@ -2222,7 +2059,7 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let value = seed;
-            /* 폭에 따라 잘리면 32비트와 64비트가 서로 다른 픽스처를 재게 된다. */
+            // Truncating by width would make 32-bit and 64-bit builds measure different fixtures.
             wide.insert_if_absent(
                 &format!(
                     "{:016x}.{}",
@@ -2238,7 +2075,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무작위 질의에서 단순 구현과 답이 같은지. */
     fn randomized_suffix_queries_match_naive_longest_suffix() {
         let mut seed = 0x4f4e_4554_444e_5355u64;
         let mut next = || {
@@ -2347,12 +2183,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 같은 접미사 언어를 가진 상태들이 실제로 합쳐지는지. 최소화의 핵심이다.
-     * @details ab 와 ac 는 뒤에서 읽으면 ba 와 ca 다. 남은 a 를 읽는 자리는 두 갈래가
-     *          같으므로 하나로 합쳐지고, 그 자리는 분기가 없어 앞 엣지에 접힌다. 그래서
-     *          뿌리와 끝 두 상태만 남고, 두 엣지가 같은 끝과 같은 글자 묶음을 가리킨다.
-     */
+    /// The core of minimization. Read from the end, ab and ac are ba and ca. The slots that read
+    /// the remaining a are the same for both branches, so they merge, and having no branch that
+    /// slot folds into the edge before it. Only the root and the end remain, and both edges point
+    /// at the same end and the same byte run.
     fn equivalent_suffix_languages_share_states() {
         let map = compact(&[("ab", 1), ("ac", 2)]);
         assert_eq!(map.state_count(), 2);
@@ -2363,12 +2197,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 접을 글자가 상한을 넘는 이름도 제대로 찾아지는지.
-     * @details 한 엣지가 실을 수 있는 글자 수는 길이를 한 바이트에 담는 탓에 한계가 있다.
-     *          거기서 멈춘 자리를 지나가는 자리로 보고 지워 버리면 그 엣지가 가리킬 상태가
-     *          사라진다. 상한을 여러 번 넘는 길이로 그 경우를 건드린다.
-     */
+    /// The bytes one edge can carry are limited because the length fits in one byte. Removing the
+    /// state where folding stopped as a pass-through would leave that edge with no target; a length
+    /// several times the limit exercises that.
     fn keys_longer_than_one_edge_can_carry_are_still_found() {
         let key = "z".repeat(MAX_EDGE_TAIL * 3 + 7);
         let map = compact(&[(key.as_str(), 4), ("other.example", 5)]);
@@ -2394,7 +2225,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 집합도 특별 처리 없이 질의되는지. */
     fn empty_map_is_queryable_without_special_allocation() {
         let map = CompactDomainMap::try_from_table(DomainTable::default()).expect("empty");
         assert!(map.is_empty());
@@ -2404,7 +2234,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인코딩 왕복에서 순위, 출처, 접미사가 보존되는지. */
     fn binary_roundtrip_preserves_rank_sources_and_suffixes() {
         let map = compact(&[
             ("example.com", 11),
@@ -2437,7 +2266,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 순환이 든 인코딩을 거부하고 어떤 변조에도 패닉하지 않는지. 순환이 남으면 판정이 무한 루프에 빠진다. */
+    /// A cycle left in would send verdicts into an infinite loop.
     fn binary_decoder_rejects_cycles_and_never_panics_on_corruption() {
         let map = compact(&[("a.example", 1), ("b.example", 2), ("deep.a.example", 3)]);
         let mut encoded = Vec::new();
@@ -2467,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아주 긴 키에서도 호출 스택을 쓰지 않는지. 재귀였다면 스택이 넘친다. */
+    /// A recursive walk would overflow the stack.
     fn pathological_key_length_does_not_use_the_call_stack() {
         let key = "a".repeat(100_000);
         let map = compact(&[(&key, 7)]);

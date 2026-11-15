@@ -1,10 +1,5 @@
-/*!
- * @brief DoH3 리스너.
- *
- * @details QUIC 위 HTTP/3로 DNS 메시지를 주고받는다. 연결을 받고 유지하는 일은
- *          quic_listener 가 맡고, 여기서는 요청을 검사해 워커에 맡기는 일과 응답을
- *          스트림에 싣는 일만 한다.
- */
+//! DoH3 listener: DNS over HTTP/3 over QUIC. quic_listener accepts and keeps connections; this
+//! checks requests, hands them to workers, and writes responses to streams.
 
 use std::io;
 use std::net::SocketAddr;
@@ -22,7 +17,6 @@ use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
 
-/** @brief 리스너를 열고 연결을 받는다. */
 pub fn serve_doh3(
     addr: SocketAddr,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
@@ -41,7 +35,6 @@ pub fn serve_doh3(
     )
 }
 
-/** @brief 요청 경로가 이 서버가 서빙하는 것인지. */
 fn match_doh_path(path: &[u8], expected: &str) -> bool {
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(path);
     if path_only == expected.as_bytes() {
@@ -54,9 +47,7 @@ fn match_doh_path(path: &[u8], expected: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && !rest.contains(&b'/'))
 }
 
-/** @brief DoH3 의 요청 검사와 응답. */
 pub(crate) struct Doh3 {
-    /** @brief 이 서버가 답하는 경로. */
     doh_path: String,
 }
 
@@ -87,11 +78,9 @@ impl QuicService for Doh3 {
                     continue;
                 }
                 Err(error) => {
-                    /*
-                     * 읽지 못한 본문은 요청 잘못이다. 아무것도 보내지 않으면 스트림이 매달린
-                     * 채로 클라이언트가 자기 데드라인까지 기다린다. 응답을 질의로 보낸 경우와
-                     * 같은 상태로 답한다.
-                     */
+                    // An unreadable body is the request's fault. Sending nothing would leave the
+                    // stream hanging until the client's deadline, so it gets the same status as a
+                    // response sent as a query.
                     transport_observe::record_error(
                         Self::NAME,
                         "dns_parse",
@@ -160,17 +149,13 @@ impl QuicService for Doh3 {
     }
 }
 
-/**
- * @brief 본문 없이 상태 코드만 답한다.
- * @return 연결을 계속 쓸 수 있으면 true. 못 쓰면 연결은 이미 닫혔다.
- */
+/// True when the connection is still usable; otherwise it is already closed.
 fn send_status(h3: &mut H3Connection, peer: SocketAddr, stream_id: u64, status: &[u8]) -> bool {
     let sent = h3.send_status(stream_id, status);
     quic_listener::connection_survives::<Doh3>(h3, peer, sent)
 }
 
 #[cfg(test)]
-/** @brief 종료, 그리고 실제 HTTP/3 위 질의 왕복. */
 mod tests {
     use super::*;
     use std::net::UdpSocket;
@@ -189,7 +174,6 @@ mod tests {
     use crate::native::NativeBackend;
     use crate::quic_listener::random_cid;
 
-    /** @brief 고정 응답을 내는 테스트용 업스트림. */
     fn mock_upstream() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -216,7 +200,6 @@ mod tests {
         addr
     }
 
-    /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
@@ -231,7 +214,6 @@ mod tests {
         ))
     }
 
-    /** @brief 테스트용 자체 서명 설정. */
     fn self_signed_h3() -> Arc<ServerConfig> {
         let (certs, key) = onetdns_transport::self_signed_material("dns.test").unwrap();
         let cert_der = certs[0].clone();
@@ -243,13 +225,11 @@ mod tests {
         )
     }
 
-    /** @brief 테스트 하나가 쓰는 독립 QUIC 전역 예산. */
     fn memory_budget() -> Arc<QuicMemoryBudget> {
         Arc::new(QuicMemoryBudget::default())
     }
 
     #[test]
-    /** @brief 종료 때 반복이 정리되는지. */
     fn dropping_doh3_listener_joins_event_loop() {
         let listener = serve_doh3(
             "127.0.0.1:0".parse().unwrap(),
@@ -265,7 +245,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /** @brief HTTP/3로 질의를 보내고 답을 받는다. */
     fn doh3_query(server: SocketAddr, name: &str, qtype: RecordType) -> Message {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(500)))
@@ -294,11 +273,9 @@ mod tests {
         let mut sent = false;
         let mut stream0: Vec<u8> = Vec::new();
         let mut b = [0u8; 2048];
-        /*
-         * 한도는 반복 횟수가 아니라 시각으로 둔다. 연결 상태 기계는 시계를 직접 읽지 않으므로
-         * 시각을 넘기고 재전송 타이머를 돌린다. 돌리지 않으면 클라이언트가 보낸 데이터그램
-         * 하나가 사라졌을 때 다시 보내지 않아 응답을 끝내 받지 못한다.
-         */
+        // The limit is a deadline, not an iteration count. The connection never reads a clock, so
+        // time is passed in and retransmission timers run; otherwise one lost client datagram would
+        // never be resent and no answer would arrive.
         let clock = Instant::now();
         let deadline = clock + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -342,7 +319,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용된 이름이 해석되는지. */
     fn doh3_allowed_query_resolves_over_self_h3() {
         let l = serve_doh3(
             "127.0.0.1:0".parse().unwrap(),
@@ -363,7 +339,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 차단된 이름이 막히는지. */
     fn doh3_blocked_query_returns_nxdomain_over_self_h3() {
         let l = serve_doh3(
             "127.0.0.1:0".parse().unwrap(),

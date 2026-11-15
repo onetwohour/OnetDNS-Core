@@ -1,6 +1,4 @@
-/*!
- * @brief EDNS Client Subnet을 붙이고 떼는 계층.
- */
+//! Adds or strips EDNS Client Subnet.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -10,20 +8,15 @@ use onetdns_proto::{Edns, Message, RecordType};
 use super::outcome_to_option;
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/**
- * @brief 클라이언트 대역 정보를 붙이거나 떼는 계층.
- * @warning 붙이면 업스트림이 클라이언트 위치에 따라 다른 답을 준다. 그래서 이 계층이 켜지면
- *          UDP 고속 경로를 쓸 수 없다.
- */
+/// With a subnet attached, upstreams answer by client location, so this layer closes the UDP fast
+/// path.
 pub struct EcsLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 붙일 옵션. 없으면 붙어 온 것을 뗀다. */
+    /// None strips an incoming option.
     option: Option<(u16, Vec<u8>)>,
 }
 
 impl EcsLayer {
-    /** @brief 지정한 대역을 붙이는 계층. */
     pub fn new(inner: Arc<dyn Resolver>, custom_ip: IpAddr) -> Self {
         let (family, addr, prefix): (u16, Vec<u8>, u8) = match custom_ip {
             IpAddr::V4(v4) => (1, v4.octets().to_vec(), 24),
@@ -41,7 +34,7 @@ impl EcsLayer {
         }
     }
 
-    /** @brief 붙어 온 대역 정보를 떼는 계층. 이 서버의 클라이언트 위치를 업스트림에 흘리지 않으려는 것이다. */
+    /// Keeps this server's client locations from reaching upstreams.
     pub fn strip(inner: Arc<dyn Resolver>) -> Self {
         EcsLayer {
             inner,
@@ -50,13 +43,9 @@ impl EcsLayer {
     }
 }
 
-/**
- * @brief EDNS 레코드를 다시 짜지 못해 질의를 접었음을 알린다.
- * @details 질의마다 호출되는 경로라 2의 거듭제곱 번째만 남긴다. 이 실패는 클라이언트에게
- *          SERVFAIL로 보이므로 기록이 없으면 원인을 찾을 수 없다.
- */
+/// The query fails when the EDNS record cannot be rebuilt, and the client sees SERVFAIL; without a
+/// log the cause is invisible. Called per query, so only powers of two are logged.
 fn ecs_encode_failed(error: &impl std::fmt::Display) {
-    /** @brief 누적 실패 수. */
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -65,12 +54,10 @@ fn ecs_encode_failed(error: &impl std::fmt::Display) {
 }
 
 impl Resolver for EcsLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 대역 정보를 붙이거나 떼고 안으로 넘긴다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let mut r = req.clone();
         let opt_index = r
@@ -107,14 +94,12 @@ impl Resolver for EcsLayer {
 }
 
 #[cfg(test)]
-/** @brief 요청에 ECS 옵션이 붙는지. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
     use onetdns_proto::{RecordType, ResponseCode};
 
     #[test]
-    /** @brief 대역 정보가 붙는지. */
     fn ecs_option_attached() {
         let inner = Mock::new(1, ResponseCode::NoError.0);
         let layer = EcsLayer::new(inner, "203.0.113.5".parse().unwrap());

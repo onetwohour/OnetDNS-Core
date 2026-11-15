@@ -1,11 +1,7 @@
-/*!
- * @brief HPACK 허프만 부호(RFC 7541 부록 B).
- */
+//! HPACK Huffman code (RFC 7541).
 
-/**
- * @brief 심볼별 (부호, 비트 수). 인덱스가 곧 심볼값이다.
- * @note 256번은 EOS 심볼이다. 실제 데이터에는 나올 수 없으며, 나오면 디코딩을 거부한다.
- */
+/// (code, bit length) per symbol, indexed by symbol. Entry 256 is EOS, which never appears in data;
+/// decoding refuses it.
 pub const CODES: [(u32, u8); 257] = [
     (0x1ff8, 13),
     (0x7fffd8, 23),
@@ -266,21 +262,17 @@ pub const CODES: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
-/**
- * @brief 디코딩용 이진 트라이.
- * @details 부호표를 그대로 선형 탐색하면 심볼마다 257개를 훑어야 한다. 트라이는 입력 비트를
- *          따라가기만 하면 되므로 비용이 부호 길이에 비례한다.
- */
+/// Decoding trie. Following input bits costs time proportional to code length, where a scan of the
+/// code table checks 257 entries per symbol.
 struct Trie {
-    /** @brief 부호를 따라가는 분기들. */
+    /// Children for bits 0 and 1.
     nodes: Vec<[Option<u32>; 2]>,
 
-    /** @brief 노드가 심볼의 끝이면 그 심볼. 중간 노드는 None이다. */
+    /// Symbol ending at this node; `None` for inner nodes.
     sym: Vec<Option<u16>>,
 }
 
 impl Trie {
-    /** @brief 부호표에서 트라이를 만든다. 첫 디코딩 때 한 번만 수행된다. */
     fn build() -> Trie {
         let mut t = Trie {
             nodes: vec![[None, None]],
@@ -308,17 +300,12 @@ impl Trie {
     }
 }
 
-/** @brief 전역 트라이. 처음 쓸 때 만들고 이후 모든 연결이 공유한다. */
 static TRIE: std::sync::OnceLock<Trie> = std::sync::OnceLock::new();
 
-/**
- * @brief 허프만 부호열을 디코딩한다.
- *
- * @details 거부 조건 셋: EOS 심볼이 실제로 나오면 안 되고, 남은 비트는 7비트 이하의
- *          전부 1이어야 하며(패딩 규칙), 출력 길이가 입력 대비 상한을 넘으면 안 된다.
- * @warning 출력 상한이 압축 폭탄 방어다. 가장 짧은 부호가 5비트라 이론적 팽창률이 1.6배
- *          정도이므로, 2배 + 여유를 넘으면 정상 입력이 아니다.
- */
+/// Rejects an EOS symbol in the data, padding that is not all ones or is longer than 7 bits, and
+/// output too large for the input. The output cap is the compression bomb defense: the shortest
+/// code is 5 bits, so expansion tops out near 1.6x, and anything past 2x plus slack is not a valid
+/// input.
 pub fn decode(input: &[u8]) -> Option<Vec<u8>> {
     let trie = TRIE.get_or_init(Trie::build);
     let max_output = input.len().saturating_mul(2).saturating_add(16);
@@ -358,7 +345,7 @@ pub fn decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/** @brief 허프만으로 인코딩한다. 마지막 바이트는 1비트로 채운다(패딩 규칙). */
+/// Pads the last byte with 1 bits.
 pub fn encode(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut acc: u64 = 0;
@@ -386,12 +373,10 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-/** @brief 규격 예제와 맞는지, 그리고 채우기가 어긋나면 거부하는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 규격 예제 하나. */
     fn rfc_c41_www_example_com() {
         let enc = encode(b"www.example.com");
         assert_eq!(
@@ -402,7 +387,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격 예제 값들. */
     fn rfc_c61_values() {
         assert_eq!(encode(b"302"), vec![0x64, 0x02]);
         assert_eq!(decode(&[0x64, 0x02]).unwrap(), b"302");
@@ -411,7 +395,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 흔한 헤더의 왕복. */
     fn roundtrip_common_headers() {
         for s in [
             "application/dns-message",
@@ -426,7 +409,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모든 바이트의 왕복과, 어긋난 채우기의 거부. */
     fn roundtrip_all_octets_and_rejects_bad_padding() {
         let all: Vec<u8> = (0u16..=255).map(|v| v as u8).collect();
         let encoded = encode(&all);

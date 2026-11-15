@@ -1,7 +1,3 @@
-/*!
- * @brief DNSCrypt UDP 리스너.
- */
-
 use std::net::{SocketAddr, UdpSocket};
 
 use crate::{
@@ -9,54 +5,33 @@ use crate::{
     RESOLVER_MAGIC,
 };
 
-/** @brief 암호화 질의의 고정 헤더 길이: 매직 + 클라이언트 공개키 + 논스. */
 const HEADER_LEN: usize = CLIENT_MAGIC_LEN + PUBKEY_LEN + CLIENT_NONCE_LEN;
 
-/** @brief Poly1305 인증 태그 길이. 이보다 짧은 본문은 복호화할 것이 없다. */
 const AEAD_TAG_LEN: usize = 16;
 
-/** @brief 응답 패킷의 고정 부분: 리졸버 매직 + 논스 + 인증 태그. */
 const RESPONSE_OVERHEAD: usize = RESOLVER_MAGIC.len() + 24 + AEAD_TAG_LEN;
 
-/** @brief 응답 평문을 맞추는 블록 크기. */
 const PAD_BLOCK: usize = 64;
 
-/**
- * @brief 이 질의에 담아 보낼 수 있는 DNS 응답 크기.
- *
- * @details UDP 응답 패킷은 그것을 부른 질의 패킷보다 길면 안 된다. 출처를 속인 작은
- *          질의 하나가 큰 응답을 끌어내는 증폭이 되기 때문이다. 평문은 64의 배수로
- *          채워지고 패딩은 최소 한 바이트라, 남는 곳에서 그만큼을 뺀 값이 예산이다.
- * @return 넘지 않아야 할 DNS 메시지 바이트 수. 0이면 답을 담을 슬롯이 없다.
- */
+/// A UDP response must not be longer than the query that asked for it, or a small spoofed query
+/// becomes an amplifier. The plaintext is padded to a multiple of 64 with at least one byte of
+/// padding, so the budget is what remains after that. Zero means no answer fits.
 fn response_budget(query_len: usize) -> usize {
     let room = query_len.saturating_sub(RESPONSE_OVERHEAD);
     (room / PAD_BLOCK * PAD_BLOCK).saturating_sub(1)
 }
 
-/**
- * @brief TCP 로 담아 보낼 수 있는 DNS 응답 크기.
- * @details TCP 는 핸드셰이크로 출처가 확인되므로 증폭이 성립하지 않는다. 규격도 응답을 그대로
- *          보내라고 한다. 길이 접두사가 16비트인 것만이 상한이다.
- */
+/// TCP confirms the source with its handshake, so amplification does not apply; only the 16-bit
+/// length prefix limits the answer.
 const TCP_RESPONSE_BUDGET: usize = u16::MAX as usize - RESPONSE_OVERHEAD - PAD_BLOCK;
 
-/**
- * @brief 받아들일 TCP 질의 길이 상한.
- * @details 질의를 답 크기에 맞춰 부풀릴 까닭이 TCP 에는 없다. 길이 접두사만 믿고 곳을
- *          잡아 주면 아무 숫자나 적어 보낸 쪽이 메모리를 정하게 된다.
- */
+/// A TCP query has no reason to grow with the answer, and trusting the length prefix alone would
+/// let the sender choose how much memory we allocate.
 pub const MAX_TCP_QUERY: usize = 8192;
 
-/**
- * @brief 패킷 하나에 대한 응답을 만든다. UDP 와 TCP 가 함께 쓴다.
- *
- * @details 앞 8바이트로 두 경우로 나눈다. 클라이언트 매직이면 암호화 질의, 아니면
- *          인증서 조회일 수 있다. 어느 쪽도 아니면 답하지 않는다.
- * @param over_udp UDP 이면 응답을 질의 길이 안으로 줄인다. TCP 는 핸드셰이크로 출처가 확인되어
- *                 증폭이 성립하지 않으므로 그대로 보낸다.
- * @return 보낼 페이로드. TCP 라도 길이 접두사는 붙이지 않는다.
- */
+/// Shared by UDP and TCP. The first 8 bytes tell an encrypted query (client magic) from a possible
+/// certificate lookup; anything else gets no answer. Over UDP the answer is cut to fit the query
+/// length. The returned payload has no TCP length prefix.
 pub fn respond<H, A>(
     provider: &Provider,
     packet: &[u8],
@@ -113,14 +88,10 @@ where
     }
 }
 
-/**
- * @brief 응답 전송 실패를 기록한다.
- * @details 닿지 않는 클라이언트가 대량으로 질의하면 실패마다 기록하는 것 자체가 부하가
- *          된다. 2의 거듭제곱 번째만 남긴다.
- */
+/// Logs only every power-of-two failure: an unreachable client sending many queries would otherwise
+/// turn logging into load.
 fn record_send_error(src: SocketAddr, error: &std::io::Error) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /** @brief 누적 실패 수. */
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -128,20 +99,11 @@ fn record_send_error(src: SocketAddr, error: &std::io::Error) {
     }
 }
 
-/**
- * @brief DNSCrypt 질의를 받아 처리한다.
- *
- * @details 패킷 앞 8바이트로 두 경우로 나눈다. 클라이언트 매직이면 암호화 질의,
- *          아니면 인증서 TXT 질의일 수 있다. 어느 쪽도 아니면 조용히 버린다.
- * @param handler 복호화된 DNS 질의와 응답 크기 예산을 받아 응답을 돌려주는 콜백.
- * @param allowed 이 주소에 답해도 되는지 묻는 콜백. 인증서 조회는 암호도 인증도 없이
- *                누구나 부를 수 있어, 여기서 막지 않으면 접근 제어와 속도 제한을 전혀
- *                거치지 않는 증폭 경로가 된다.
- * @note 패킷 하나마다 장애 격리 경계를 친다. 조작된 패킷이 유발한 패닉이 리스너 전체를
- *       죽이지 않게 하려는 것이다.
- * @note 읽기에 타임아웃을 걸어야 종료 신호를 주기적으로 확인할 수 있다. 무한 대기면
- *       재로드 때 이 스레드가 합류하지 않아 소켓이 계속 묶인다.
- */
+/// `allowed` guards the certificate lookup too: anyone can call it without encryption or
+/// authentication, so without this check it would be an amplification path past access control and
+/// rate limiting. Each packet runs inside a fault isolation boundary, so a panic from a crafted
+/// packet cannot kill the listener. The read timeout lets the loop see the shutdown signal; without
+/// it the thread would not join on reload and the socket would stay bound.
 pub fn serve<H, A>(
     provider: Provider,
     socket: UdpSocket,
@@ -190,14 +152,8 @@ mod tests {
     use super::*;
 
     #[test]
-    /**
-     * @brief 응답 패킷이 질의 패킷보다 길어지지 않는지.
-     *
-     * @details 출처를 속인 작은 질의 하나로 큰 응답을 끌어낼 수 있으면 리졸버가 증폭기가
-     *          된다. 규격이 응답을 질의 길이 안으로 줄이고 TC 비트를 설정하라고 하는 까닭이다.
-     * @note 예산은 DNS 메시지 길이 기준이다. 여기에 매직과 논스, 인증 태그, 그리고 64의
-     *       배수로 맞추는 패딩이 붙은 것이 실제 패킷이다.
-     */
+    /// The budget is the DNS message length; magic, nonce, tag and padding to a multiple of 64 make
+    /// up the rest of the packet.
     fn a_response_never_outgrows_the_query_that_asked_for_it() {
         for query_len in [132usize, 256, 324, 512, 1024, 1500, 4096] {
             let budget = response_budget(query_len);
@@ -211,14 +167,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 답을 담을 슬롯이 없는 짧은 질의는 예산이 0이 되는지. */
     fn a_query_too_short_to_carry_an_answer_gets_no_budget() {
         for query_len in [0usize, 48, 100, 111] {
             assert_eq!(response_budget(query_len), 0, "{query_len}B");
         }
     }
 
-    /** @brief 인증서 조회 하나를 보내고 답이 오는지 본다. */
     fn ask_for_cert(allow: bool) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -256,7 +210,6 @@ mod tests {
         answered
     }
 
-    /** @brief 이 공급자에게 보낼 암호화 질의 하나를 만든다. */
     fn build_query(provider: &Provider, dns: &[u8], pad_to: usize) -> Vec<u8> {
         use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -288,13 +241,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief TCP 는 응답을 질의 길이에 맞춰 줄이지 않는지.
-     *
-     * @details UDP 는 출처를 속일 수 있어 응답을 질의 안으로 줄여야 하지만, TCP 는 핸드셰이크로
-     *          출처가 확인되므로 증폭이 성립하지 않는다. 규격도 TCP 응답은 질의보다 길어도
-     *          그대로 보내라고 한다. 여기서 줄이면 큰 답이 갈 길이 아예 없어진다.
-     */
+    /// TCP sources are confirmed by the handshake, so answers keep their full size; shrinking them
+    /// would leave large answers no way through.
     fn tcp_does_not_shrink_the_answer_to_the_query() {
         let provider = Provider::generate("2.dnscrypt-cert.test", 86_400);
         let dns: &[u8] =
@@ -327,13 +275,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 인증서 조회도 접근 제어와 속도 제한 뒤에 있는지.
-     *
-     * @details 이 경로는 암호도 인증도 없이 누구나 부를 수 있고 질의보다 네 배 큰 답을
-     *          돌려준다. 파이프라인을 타지 않으므로 여기서 막지 않으면 그 경로만 아무
-     *          제한 없이 열린 증폭기가 된다.
-     */
+    /// The certificate lookup needs no encryption or authentication, answers with four times the
+    /// query size and bypasses the pipeline, so it has to be gated here.
     fn the_certificate_lookup_answers_only_allowed_clients() {
         assert!(ask_for_cert(true), "허용된 클라이언트는 답을 받아야 합니다");
         assert!(

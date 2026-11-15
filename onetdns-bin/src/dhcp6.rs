@@ -1,11 +1,8 @@
-/*!
- * @brief DHCPv6 서버.
- *
- * @details 주소를 나눠 주면서 이 서버를 DNS로 함께 알린다. 재시작해도 같은 클라이언트가
- *          같은 주소를 받도록 임대 정보를 파일에 남긴다.
- * @warning 인증이 없는 프로토콜이라 상한이 방어의 전부다. 클라이언트 식별자 길이와 임대
- *          개수를 제한하지 않으면 임의로 만든 식별자로 주소와 메모리를 모두 소진시킬 수 있다.
- */
+//! DHCPv6 server that hands out addresses and announces this server as DNS. Leases persist to a
+//! file, so a client keeps its address across restarts.
+//!
+//! The protocol has no authentication, so limits are the whole defense: without caps on client ID
+//! length and lease count, made-up IDs could exhaust every address and all memory.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -13,54 +10,54 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/** @brief 읽어들일 임대 파일 크기 상한. */
 const MAX_PERSIST_FILE: u64 = 16 * 1024 * 1024;
-/** @brief 임대 파일의 첫 줄. 형식이 다르면 읽지 않는다. */
+/// A file with another first line is not read.
 const LEASE_HEADER: &str = "ONETDNS-DHCP6-LEASES-V1\n";
 
-/** @brief 담을 임대 개수 상한. */
 const MAX_LEASES: usize = 100_000;
 
-/** @brief DUID type 2바이트와 최소 1바이트 식별자를 합친 길이 하한. */
+/// 2-byte DUID type plus at least a 1-byte identifier.
 const MIN_DUID_LEN: usize = 3;
-/** @brief DUID type 2바이트와 최대 128바이트 식별자를 합친 길이 상한. */
+/// 2-byte DUID type plus at most a 128-byte identifier.
 const MAX_DUID_LEN: usize = 130;
-/** @brief IPv6에서 확장 헤더가 없을 때 가능한 표준 UDP payload 최대값. */
+/// Without extension headers.
 const MAX_STANDARD_IPV6_UDP_PAYLOAD: usize = u16::MAX as usize - 8;
-/** @brief 최대 표준 payload와 초과 데이터그램을 구별할 한 바이트까지 받는다. */
+/// One byte past the largest standard payload, to tell an oversized datagram apart.
 const DHCP6_RECV_CAPACITY: usize = MAX_STANDARD_IPV6_UDP_PAYLOAD + 1;
-/** @brief 주소 하나를 담은 IA_NA의 outer TLV까지 포함한 최대 응답 wire 길이. */
+/// An IA_NA holding one address, outer TLV included.
 const IA_NA_ADDRESS_RESPONSE_WIRE_LEN: usize = 4 + 12 + 4 + 24;
-/** @brief 고정 응답 옵션을 빼기 전에도 절대 넘을 수 없는 IA 응답 개수. */
+/// Upper bound before the fixed response options are subtracted.
 const MAX_RESPONSE_IA_COUNT: usize =
     (MAX_STANDARD_IPV6_UDP_PAYLOAD - 4) / IA_NA_ADDRESS_RESPONSE_WIRE_LEN;
-/** @brief 직접 클라이언트가 인접 relay와 server를 찾는 link-local multicast 그룹. */
+/// Link-local group where directly attached clients find relays and servers.
 const DHCP6_CLIENT_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2);
-/** @brief 둘째 IA부터 쓰는 고정 길이 보조 키. 정상 DUID보다 길어 충돌하지 않는다. */
+/// Fixed-length key for the second and later IAs; longer than any valid DUID, so it never collides
+/// with one.
 const SECONDARY_IA_KEY_LEN: usize = 1 + MAX_DUID_LEN + 4;
 
-/** @brief RFC 9915의 DUID type+identifier 길이 범위인지. */
+/// Type plus identifier length within the RFC 9915 range.
 pub(super) fn valid_duid(duid: &[u8]) -> bool {
     (MIN_DUID_LEN..=MAX_DUID_LEN).contains(&duid.len())
 }
 
-/** @brief 표준 UDP 길이 안의 완전한 데이터그램만 파서로 넘긴다. */
+/// Only complete datagrams within the standard UDP length reach the parser.
 fn standard_dhcp6_datagram_len(received: usize) -> Option<usize> {
     (received <= MAX_STANDARD_IPV6_UDP_PAYLOAD).then_some(received)
 }
 
 #[derive(Clone, Copy)]
-/** @brief IAID를 종전 값 구조의 정렬 여백에 함께 두는 주소 상태. */
+/// The IAID sits in what was alignment padding, so it costs no space.
 struct IaValue {
     ip: u128,
     expiry: u64,
     iaid: [u8; 4],
-    /** @brief 첫 값이면 추가 IA의 머리, 추가 값이면 다음 IAID. 자기 IAID는 끝 표식이다. */
+    /// On a first value, the head of the additional IAs; on an additional value, the next IAID. Its
+    /// own IAID marks the end.
     link: [u8; 4],
 }
 
 impl IaValue {
-    /** @brief 연결이 없는 새 IA 값. */
+    /// Unlinked.
     fn new(ip: u128, expiry: u64, iaid: [u8; 4]) -> Self {
         Self {
             ip,
@@ -72,14 +69,14 @@ impl IaValue {
 }
 
 #[derive(Clone, Copy)]
-/** @brief 추가 IA 값. 이전 IAID까지 가져 임의 삭제도 O(1)로 연결한다. */
+/// Also holds the previous IAID, so removing any one relinks in O(1).
 struct AdditionalIaValue {
     value: IaValue,
-    /** @brief 이전 추가 IAID. 머리에서는 자기 IAID가 표식이다. */
+    /// At the head, its own IAID marks it.
     previous: [u8; 4],
 }
 
-/** @brief 같은 DUID의 둘째 IA를 모호하지 않은 빌린 HashMap 키로 만든다. */
+/// Unambiguous borrowed map key for a DUID's second and later IAs.
 fn secondary_ia_key<'a>(
     duid: &[u8],
     iaid: [u8; 4],
@@ -94,7 +91,7 @@ fn secondary_ia_key<'a>(
     Some(storage)
 }
 
-/** @brief 보조 키를 DUID와 IAID로 되돌린다. */
+/// Back to the DUID and IAID.
 fn split_secondary_ia_key(key: &[u8]) -> Option<(&[u8], [u8; 4])> {
     if key.len() != SECONDARY_IA_KEY_LEN {
         return None;
@@ -110,14 +107,15 @@ fn split_secondary_ia_key(key: &[u8]) -> Option<(&[u8], [u8; 4])> {
 }
 
 #[derive(Default)]
-/** @brief 보통 DUID는 한 번만 찾고, 같은 DUID의 추가 IA만 별도 맵에 두는 기록. */
+/// A DUID's first IA lives in one map and takes one lookup; only further IAs of the same DUID go in
+/// a second map.
 struct IaMap {
     primary: HashMap<Vec<u8>, IaValue>,
     additional: HashMap<Vec<u8>, AdditionalIaValue>,
 }
 
 impl IaMap {
-    /** @brief 첫 IA는 맵 한 번, 추가 IA만 보조 키 한 번을 더 찾아 반환한다. */
+    /// One lookup for the first IA; one more, by secondary key, only for further IAs.
     fn get(&self, duid: &[u8], iaid: [u8; 4]) -> Option<&IaValue> {
         let primary = self.primary.get(duid)?;
         if primary.iaid == iaid {
@@ -129,7 +127,6 @@ impl IaMap {
             .map(|additional| &additional.value)
     }
 
-    /** @brief 바인딩을 가변으로 찾는다. */
     fn get_mut(&mut self, duid: &[u8], iaid: [u8; 4]) -> Option<&mut IaValue> {
         let primary_iaid = self.primary.get(duid)?.iaid;
         if primary_iaid == iaid {
@@ -141,7 +138,7 @@ impl IaMap {
             .map(|additional| &mut additional.value)
     }
 
-    /** @brief 첫 IA는 raw DUID로, 추가 IA는 앞뒤 연결된 보조 키로 삽입한다. */
+    /// The first IA keys by raw DUID, further ones by linked secondary keys.
     fn insert(&mut self, duid: &[u8], mut value: IaValue) -> Option<IaValue> {
         if duid.is_empty() || duid.len() > MAX_DUID_LEN {
             return None;
@@ -200,7 +197,7 @@ impl IaMap {
         None
     }
 
-    /** @brief 임의 IA를 O(1)로 제거하고 첫 IA면 다음 IA를 raw DUID 키로 승격한다. */
+    /// Removes any IA in O(1); removing the first promotes the next to the raw DUID key.
     fn remove(&mut self, duid: &[u8], iaid: [u8; 4]) -> Option<IaValue> {
         let primary_iaid = self.primary.get(duid)?.iaid;
         if primary_iaid == iaid {
@@ -266,17 +263,15 @@ impl IaMap {
         Some(removed.value)
     }
 
-    /** @brief 모든 IA 수. */
     fn len(&self) -> usize {
         self.primary.len().saturating_add(self.additional.len())
     }
 
-    /** @brief IA가 하나도 없는지. */
     fn is_empty(&self) -> bool {
         self.primary.is_empty()
     }
 
-    /** @brief 테스트에서 고수위 회수를 확인할 첫 맵 capacity. */
+    /// For tests checking high-water reclamation.
     #[cfg(test)]
     fn capacity(&self) -> usize {
         self.primary
@@ -284,14 +279,13 @@ impl IaMap {
             .saturating_add(self.additional.capacity())
     }
 
-    /** @brief 값만 연속 순회한다. */
     fn values(&self) -> impl Iterator<Item = &IaValue> {
         self.primary
             .values()
             .chain(self.additional.values().map(|entry| &entry.value))
     }
 
-    /** @brief 원래 DUID와 함께 모든 값을 순회한다. */
+    /// With the original DUID.
     fn entries(&self) -> impl Iterator<Item = (&[u8], &IaValue)> {
         self.primary
             .iter()
@@ -302,7 +296,6 @@ impl IaMap {
             }))
     }
 
-    /** @brief 가장 이른 만료 시각. */
     fn next_expiry(&self) -> u64 {
         self.values()
             .map(|value| value.expiry)
@@ -310,7 +303,7 @@ impl IaMap {
             .unwrap_or(u64::MAX)
     }
 
-    /** @brief 만료된 첫·추가 IA를 연결을 유지하며 할당 없이 제거한다. */
+    /// Removes expired first and further IAs, keeping the links, without allocating.
     fn remove_expired(&mut self, now: u64, used: &mut HashSet<u128>) {
         let additional = &mut self.additional;
         self.primary.retain(|duid, primary| loop {
@@ -397,7 +390,7 @@ impl IaMap {
         }
     }
 
-    /** @brief 복원 상태에서 만료·범위 밖·중복 주소를 연결을 유지하며 제거한다. */
+    /// On restore, drops expired, out-of-range, and duplicate addresses, keeping the links.
     fn retain_valid(&mut self, now: u64, start: u128, end: u128, used: &mut HashSet<u128>) {
         let additional = &mut self.additional;
         self.primary.retain(|duid, primary| loop {
@@ -493,7 +486,8 @@ impl IaMap {
         }
     }
 
-    /** @brief 비면 모든 버킷을 반환하고, 드문 IA 맵도 같은 고수위 규칙으로 줄인다. */
+    /// Returns every bucket when empty, and shrinks the rarer additional map under the same
+    /// high-water rule.
     fn release_excess_capacity(&mut self) {
         if self.is_empty() {
             *self = Self::default();
@@ -509,7 +503,7 @@ impl IaMap {
     }
 }
 
-/** @brief 크기 상한을 걸어 임대 파일을 읽는다. 못 읽으면 빈 상태로 시작한다. */
+/// With a size cap; an unreadable file starts empty.
 fn read_persist_text(path: &std::path::Path) -> Option<String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -558,62 +552,37 @@ fn read_persist_text(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/** @brief 서버를 찾는 요청. */
 pub const SOLICIT: u8 = 1;
-/** @brief 서버가 자신을 알리는 응답. */
 pub const ADVERTISE: u8 = 2;
-/** @brief 주소를 달라는 요청. */
 pub const REQUEST: u8 = 3;
-/** @brief 임대를 늘려 달라는 요청. */
 pub const RENEW: u8 = 5;
-/** @brief 확정 응답. */
 pub const REPLY: u8 = 7;
-/** @brief 주소를 돌려주는 요청. */
 pub const RELEASE: u8 = 8;
-/** @brief 주소 없이 DNS 같은 설정만 묻는 요청. */
 pub const INFORMATION_REQUEST: u8 = 11;
 
-/** @brief 클라이언트 식별자 옵션. */
 pub const OPT_CLIENT_ID: u16 = 1;
-/** @brief 서버 식별자 옵션. */
 pub const OPT_SERVER_ID: u16 = 2;
-/** @brief IA_NA(임시가 아닌 주소) 옵션. */
 pub const OPT_IA_NA: u16 = 3;
-/** @brief 주소 하나와 그 수명 옵션. */
 pub const OPT_IA_ADDR: u16 = 5;
-/** @brief 임시 주소 IA 옵션. */
 const OPT_IA_TA: u16 = 4;
-/** @brief 접두사 위임 IA 옵션. */
 const OPT_IA_PD: u16 = 25;
-/** @brief 처리 결과 코드 옵션. */
 pub const OPT_STATUS_CODE: u16 = 13;
-/** @brief DNS 서버 목록 옵션. */
 pub const OPT_DNS_SERVERS: u16 = 23;
 
-/** @brief 요청을 정상 처리했다. */
 const STATUS_SUCCESS: u16 = 0;
-/** @brief 이 IA에는 클라이언트와 결합된 주소가 없다. */
 const STATUS_NO_BINDING: u16 = 3;
-/** @brief 이 IA에 내줄 주소가 없다. */
 const STATUS_NO_ADDRS_AVAIL: u16 = 2;
 
 #[derive(Debug, Clone)]
-/** @brief 주고받는 메시지 하나. */
 pub struct Dhcp6Message {
-    /** @brief 메시지 종류. */
     pub msg_type: u8,
-    /** @brief 거래 번호. 요청과 응답을 짝짓는다. */
     pub txid: [u8; 3],
-    /** @brief 담긴 옵션들. */
     pub options: Vec<(u16, Vec<u8>)>,
 }
 
 impl Dhcp6Message {
-    /**
-     * @brief 바이트열을 메시지로.
-     * @warning 옵션 길이가 남은 바이트를 넘으면 전체를 거부한다. 거기까지만 받아들이면
-     *          잘린 요청이 온전한 요청처럼 처리된다.
-     */
+    /// An option longer than the remaining bytes rejects the whole message; accepting up to there
+    /// would treat a truncated request as complete.
     pub fn parse(buf: &[u8]) -> Option<Dhcp6Message> {
         if buf.len() < 4 {
             return None;
@@ -669,7 +638,6 @@ impl Dhcp6Message {
         })
     }
 
-    /** @brief 메시지를 바이트열로. */
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(4);
         b.push(self.msg_type);
@@ -685,7 +653,7 @@ impl Dhcp6Message {
         b
     }
 
-    /** @brief 정확히 하나만 있는 옵션의 내용. 없거나 중복이면 거부한다. */
+    /// None when absent or repeated.
     fn option(&self, code: u16) -> Option<&[u8]> {
         let mut matching = self.options.iter().filter(|(c, _)| *c == code);
         let value = matching.next()?.1.as_slice();
@@ -693,7 +661,7 @@ impl Dhcp6Message {
     }
 }
 
-/** @brief 연속된 DHCPv6 하위 옵션의 길이 경계를 검사한다. */
+/// Checks the length bounds of a run of sub-options.
 fn valid_nested_options(mut options: &[u8]) -> bool {
     while !options.is_empty() {
         if options.len() < 4 {
@@ -711,14 +679,14 @@ fn valid_nested_options(mut options: &[u8]) -> bool {
     true
 }
 
-/** @brief 검증이 끝난 IA_NA의 빌린 표현. */
+/// Validated and borrowed.
 struct ParsedIaNa<'a> {
     iaid: [u8; 4],
     options: &'a [u8],
 }
 
 impl ParsedIaNa<'_> {
-    /** @brief 이 IA의 첫 주소. 서버 응답은 현재 IA마다 하나를 할당한다. */
+    /// Responses assign one address per IA.
     fn first_address(&self) -> Option<u128> {
         let mut options = self.options;
         while !options.is_empty() {
@@ -735,7 +703,7 @@ impl ParsedIaNa<'_> {
         None
     }
 
-    /** @brief 이 IA에 특정 주소가 들어 있는지 무할당으로 찾는다. */
+    /// Without allocating.
     fn contains_address(&self, expected: u128) -> bool {
         let mut options = self.options;
         while !options.is_empty() {
@@ -754,7 +722,7 @@ impl ParsedIaNa<'_> {
     }
 }
 
-/** @brief IA_NA와 그 안의 모든 IAADDR를 무할당으로 검증한다. */
+/// Validates the IA_NA and every IAADDR in it, without allocating.
 fn parse_ia_na(ia_na: &[u8]) -> Option<ParsedIaNa<'_>> {
     if ia_na.len() < 12 {
         return None;
@@ -783,7 +751,6 @@ fn parse_ia_na(ia_na: &[u8]) -> Option<ParsedIaNa<'_>> {
     })
 }
 
-/** @brief 주소 하나와 수명을 담은 옵션. */
 fn ia_addr_option(addr: Ipv6Addr, pref: u32, valid: u32) -> Vec<u8> {
     let mut d = Vec::with_capacity(24);
     d.extend_from_slice(&addr.octets());
@@ -797,7 +764,7 @@ fn ia_addr_option(addr: Ipv6Addr, pref: u32, valid: u32) -> Vec<u8> {
     o
 }
 
-/** @brief IA_NA 옵션. 갱신 시점 두 개와 주소가 들어간다. */
+/// Carries T1, T2, and the address.
 fn ia_na_option(iaid: [u8; 4], t1: u32, t2: u32, addr: Ipv6Addr, lease: u32) -> (u16, Vec<u8>) {
     let mut d = Vec::new();
     d.extend_from_slice(&iaid);
@@ -807,7 +774,7 @@ fn ia_na_option(iaid: [u8; 4], t1: u32, t2: u32, addr: Ipv6Addr, lease: u32) -> 
     (OPT_IA_NA, d)
 }
 
-/** @brief 사용자 임대 수명을 RFC 9915 권고 T1·T2로 오버플로 없이 바꾼다. */
+/// RFC 9915 recommended T1 and T2 for the configured lease, without overflow.
 fn renewal_timers(lease: u32) -> (u32, u32) {
     if lease == u32::MAX {
         return (u32::MAX, u32::MAX);
@@ -815,7 +782,7 @@ fn renewal_timers(lease: u32) -> (u32, u32) {
     (lease / 2, (u64::from(lease) * 4 / 5) as u32)
 }
 
-/** @brief wire의 infinity 임대를 내부에서도 만료되지 않는 시각으로 보존한다. */
+/// An infinite lease on the wire stays a never-expiring time internally.
 fn lease_expiry(now: u64, lease: u32) -> u64 {
     if lease == u32::MAX {
         u64::MAX
@@ -824,12 +791,12 @@ fn lease_expiry(now: u64, lease: u32) -> u64 {
     }
 }
 
-/** @brief 사람 문자열 없이 고정 크기 Status Code 옵션을 만든다. */
+/// Fixed size, without a message string.
 fn status_option(code: u16) -> (u16, Vec<u8>) {
     (OPT_STATUS_CODE, code.to_be_bytes().to_vec())
 }
 
-/** @brief 주소 대신 IA별 상태만 담은 IA_NA 응답. */
+/// IA_NA response with a per-IA status instead of an address.
 fn ia_na_status_option(iaid: [u8; 4], code: u16) -> (u16, Vec<u8>) {
     let mut data = Vec::with_capacity(18);
     data.extend_from_slice(&iaid);
@@ -841,72 +808,52 @@ fn ia_na_status_option(iaid: [u8; 4], code: u16) -> (u16, Vec<u8>) {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 나눠 줄 범위와 함께 알릴 값들. */
 pub struct Dhcp6Config {
-    /** @brief 이 서버의 서버 식별자. */
     pub server_duid: Vec<u8>,
-    /** @brief 나눠 줄 범위의 시작. */
     pub range_start: Ipv6Addr,
-    /** @brief 나눠 줄 범위의 끝. */
     pub range_end: Ipv6Addr,
-    /** @brief 함께 알릴 DNS 서버. */
     pub dns: Vec<Ipv6Addr>,
-    /** @brief multicast를 가입할 인터페이스. 0은 운영체제 기본. */
+    /// Interface that joins the multicast group; 0 for the OS default.
     pub interface_index: u32,
-    /** @brief 임대 기간. */
     pub lease_secs: u32,
 
-    /** @brief 임대 기록을 담아 둘 파일. */
     pub lease_file: Option<PathBuf>,
 }
 
-/** @brief 임대 하나. */
 pub struct Lease6Info {
-    /** @brief 클라이언트 식별자. */
+    /// Identifies the IA_NA within this client.
     pub duid: Vec<u8>,
-    /** @brief 이 클라이언트 안에서 IA_NA를 식별하는 값. */
     pub iaid: [u8; 4],
-    /** @brief 빌려준 주소. */
     pub ip: Ipv6Addr,
-    /** @brief 이 임대가 끝나는 시각. */
     pub expiry_unix: u64,
 }
 
-/** @brief 임대 기록. */
 pub struct Lease6Pool {
-    /** @brief 나눠 줄 범위의 시작. */
     start: u128,
-    /** @brief 나눠 줄 범위의 끝. */
     end: u128,
-    /** @brief 임대 기간. */
     lease_secs: u32,
-    /** @brief 첫 IA는 raw DUID, 추가 IA는 고정 보조 키로 찾는 확정 임대들. */
+    /// Committed leases: the first IA by raw DUID, further ones by fixed secondary key.
     leases: IaMap,
-    /** @brief 같은 두 단계 키로 찾는 광고 후 미확정 주소들. */
+    /// Advertised but not yet committed addresses, keyed the same way.
     offers: IaMap,
-    /** @brief 임대 또는 offer가 점유한 주소. 새 할당이 기록 전체를 복사하지 않게 한다. */
+    /// Addresses held by a lease or an offer, so a new allocation does not copy the whole table.
     used: HashSet<u128>,
-    /** @brief 임대 기록을 담아 둘 파일. */
     persist: Option<PathBuf>,
-    /** @brief 범위가 바닥났다고 이미 알렸는지. 요청마다 같은 경고를 되풀이하지 않으려는 것이다. */
+    /// Whether exhaustion was already reported, so each request does not repeat the warning.
     exhausted: bool,
-    /** @brief 다음 새 주소 검색을 시작할 위치. */
+    /// Where the next search for a free address starts.
     allocation_cursor: u128,
-    /** @brief 가장 이른 임대 만료 시각. */
     next_expiry: u64,
 }
 
 impl Lease6Pool {
-    /** @brief 원격 DUID가 만드는 확정 임대와 임시 offer의 합계. */
+    /// Committed leases plus pending offers, both created by remote DUIDs.
     fn dynamic_entries(&self) -> usize {
         self.leases.len().saturating_add(self.offers.len())
     }
 
-    /**
-     * @brief 저장된 임대를 읽어 기록을 만든다.
-     * @note 지금 설정한 범위 밖의 임대는 버린다. 설정을 바꾼 뒤에도 이전 주소를 계속
-     *       내주면 그 주소는 어디에도 닿지 않는다.
-     */
+    /// Leases outside the configured range are dropped; still handing out old addresses after a
+    /// config change would give out addresses that reach nowhere.
     pub fn new(cfg: &Dhcp6Config) -> Self {
         let start = u128::from(cfg.range_start);
         let end = u128::from(cfg.range_end);
@@ -935,11 +882,9 @@ impl Lease6Pool {
         pool
     }
 
-    /**
-     * @brief 서비스를 재시작할 때 기록을 버리지 않고 새 설정에 맞춘다.
-     * @details 새 기록을 만들면 이미 나간 주소를 다른 기기에 또 준다. 새 범위 밖의 임대와
-     *          확정되지 않은 광고만 버린다.
-     */
+    /// Keeps the table across a service restart and fits it to the new config; a fresh table would
+    /// give addresses already out to other devices. Only leases outside the new range and
+    /// uncommitted offers are dropped.
     pub fn reconfigure(&mut self, cfg: &Dhcp6Config) {
         let start = u128::from(cfg.range_start);
         let end = u128::from(cfg.range_end);
@@ -960,7 +905,7 @@ impl Lease6Pool {
     }
 
     #[cfg(test)]
-    /** @brief 직접 로드한 테스트 상태까지 포함해 주소 인덱스와 다음 만료 시각을 다시 만든다. */
+    /// Rebuilds the address index and the next expiry, including state tests load directly.
     fn rebuild_runtime(&mut self) {
         self.used = self
             .leases
@@ -972,7 +917,8 @@ impl Lease6Pool {
         self.seek_cursor_to_available();
     }
 
-    /** @brief 시작·복원 단계에서 첫 요청이 찬 앞부분을 걷지 않도록 커서를 옮긴다. */
+    /// Moves the cursor past the filled front at start and restore, so the first request does not
+    /// walk it.
     fn seek_cursor_to_available(&mut self) {
         if self.start > self.end {
             return;
@@ -994,7 +940,7 @@ impl Lease6Pool {
         }
     }
 
-    /** @brief 가장 이른 만료 전에는 O(1), 도달했을 때만 임대 기록을 정리한다. */
+    /// O(1) before the earliest expiry; cleans up only once it is reached.
     fn cleanup_expired(&mut self, now: u64) {
         if now < self.next_expiry {
             return;
@@ -1015,10 +961,8 @@ impl Lease6Pool {
         }
     }
 
-    /**
-     * @brief 범위가 바닥났는지가 바뀌었을 때만 알린다.
-     * @details 클라이언트는 실패해도 계속 다시 묻는다. 요청마다 남기면 같은 경고가 쌓인다.
-     */
+    /// Reports only when exhaustion changes; clients keep asking after failures, so reporting per
+    /// request would pile up the same warning.
     fn note_availability(&mut self, picked: Option<u128>) -> Option<u128> {
         match (picked, self.exhausted) {
             (None, false) => {
@@ -1034,12 +978,9 @@ impl Lease6Pool {
         picked
     }
 
-    /**
-     * @brief 이 클라이언트에 줄 주소를 고른다.
-     * @details 이미 받은 것이 살아 있으면 그대로 준다. 범위가 좁으면 앞에서부터 훑고,
-     *          넓으면 무작위로 몇 번 시도한다. 넓은 범위를 다 훑으면 시간이 끝나지 않는다.
-     * @return 줄 주소. 상한에 닿았거나 남은 슬롯이 없으면 없다.
-     */
+    /// A live address already held is given again. A narrow range is scanned from the front, a wide
+    /// one tried randomly a few times, since scanning a wide range would never finish. None at the
+    /// cap or with no free slot.
     pub fn allocate(&mut self, duid: &[u8], iaid: [u8; 4]) -> Option<u128> {
         if duid.is_empty() || duid.len() > MAX_DUID_LEN {
             return None;
@@ -1093,7 +1034,8 @@ impl Lease6Pool {
         self.note_availability(picked)
     }
 
-    /** @brief SOLICIT에 광고한 주소를 잠시 점유해 다른 DUID에 중복 광고하지 않는다. */
+    /// Holds the address advertised in a SOLICIT for a while, so it is not advertised to another
+    /// DUID.
     fn hold_offer(&mut self, duid: &[u8], iaid: [u8; 4], ip: u128) -> bool {
         if duid.is_empty() || duid.len() > MAX_DUID_LEN {
             return false;
@@ -1128,7 +1070,7 @@ impl Lease6Pool {
         true
     }
 
-    /** @brief 주소를 기록에 적는다. REQUEST면 같은 IA에 살아 있는 offer를 요구한다. */
+    /// A REQUEST must have a live offer for the same IA.
     fn commit_inner(
         &mut self,
         duid: &[u8],
@@ -1179,18 +1121,18 @@ impl Lease6Pool {
         true
     }
 
-    /** @brief 테스트·복원 경로에서 주소를 직접 확정한다. */
+    /// For tests and restore.
     #[cfg(test)]
     pub fn commit(&mut self, duid: &[u8], iaid: [u8; 4], ip: u128) -> bool {
         self.commit_inner(duid, iaid, ip, false, true)
     }
 
-    /** @brief 그 IA에 광고했던 정확한 주소만 확정한다. */
+    /// Only the exact address advertised to that IA.
     fn commit_offer(&mut self, duid: &[u8], iaid: [u8; 4], ip: u128) -> bool {
         self.commit_inner(duid, iaid, ip, true, false)
     }
 
-    /** @brief 그 IA의 살아 있는 정확한 주소만 갱신한다. */
+    /// Only the IA's exact live address.
     fn renew(&mut self, duid: &[u8], iaid: [u8; 4], ip: u128) -> bool {
         if duid.is_empty() || duid.len() > MAX_DUID_LEN {
             return false;
@@ -1209,7 +1151,7 @@ impl Lease6Pool {
         true
     }
 
-    /** @brief 이 IA의 살아 있는 offer 또는 기존 임대 주소. */
+    /// The IA's live offer, or its existing lease.
     fn offered_address(&self, duid: &[u8], iaid: [u8; 4], now: u64) -> Option<u128> {
         self.offers
             .get(duid, iaid)
@@ -1223,7 +1165,6 @@ impl Lease6Pool {
             })
     }
 
-    /** @brief 이 IA의 살아 있는 임대 주소. */
     fn leased_address(&self, duid: &[u8], iaid: [u8; 4], now: u64) -> Option<u128> {
         self.leases
             .get(duid, iaid)
@@ -1231,7 +1172,7 @@ impl Lease6Pool {
             .map(|value| value.ip)
     }
 
-    /** @brief 그 IA가 실제로 가진 정확한 주소만 돌려받는다. */
+    /// Only the exact address the IA holds.
     fn release_address(&mut self, duid: &[u8], iaid: [u8; 4], ip: u128) -> bool {
         if duid.is_empty() || duid.len() > MAX_DUID_LEN {
             return false;
@@ -1261,7 +1202,6 @@ impl Lease6Pool {
         true
     }
 
-    /** @brief 살아 있는 임대 수. */
     pub fn active(&self) -> usize {
         let now = crate::unix_now();
         self.leases
@@ -1270,7 +1210,7 @@ impl Lease6Pool {
             .count()
     }
 
-    /** @brief 살아 있는 임대 목록. 대시보드가 쓴다. */
+    /// For the dashboard.
     pub fn snapshot(&self) -> Vec<Lease6Info> {
         let now = crate::unix_now();
         let mut out: Vec<Lease6Info> = self
@@ -1288,7 +1228,7 @@ impl Lease6Pool {
         out
     }
 
-    /** @brief 기록을 원자적으로 교체해 저장한다. 만료된 것은 빼고 적는다. */
+    /// Replaced atomically, leaving out expired leases.
     fn save(&self) {
         let Some(path) = &self.persist else { return };
         let now = crate::unix_now();
@@ -1312,12 +1252,10 @@ impl Lease6Pool {
     }
 }
 
-/** @brief 바이트열을 16진 문자열로. */
 fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/** @brief 16진 문자열을 바이트열로. */
 fn bytes_from_hex(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -1327,11 +1265,8 @@ fn bytes_from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/**
- * @brief 저장된 임대를 읽는다.
- * @warning 한 줄이라도 형식이 어긋나면 전체를 버린다. 반쯤 읽어 들이면 어떤 주소가
- *          이미 나갔는지 알 수 없어 같은 주소를 둘에게 준다.
- */
+/// One malformed line discards the whole file: reading half would lose track of which addresses are
+/// out and give one address to two clients.
 fn load_leases6(path: &std::path::Path) -> IaMap {
     let mut out = IaMap::default();
     let mut seen_ips = HashSet::new();
@@ -1396,7 +1331,7 @@ fn load_leases6(path: &std::path::Path) -> IaMap {
     out
 }
 
-/** @brief 이 응답이 표준 UDP payload 안에 들어갈 때 처리 가능한 IA 수. */
+/// How many IAs fit in a response within the standard UDP payload.
 fn response_ia_capacity(
     client_id_len: usize,
     cfg: &Dhcp6Config,
@@ -1421,7 +1356,7 @@ fn response_ia_capacity(
     Some(remaining / IA_NA_ADDRESS_RESPONSE_WIRE_LEN)
 }
 
-/** @brief 모든 IA_NA를 한 번씩 검증하고 한 메시지 안의 IAID 중복을 거부한다. */
+/// Validates every IA_NA once and rejects repeated IAIDs within one message.
 fn validate_ia_nas(req: &Dhcp6Message, max_count: usize) -> Option<usize> {
     let mut count = 0usize;
     let mut first_iaid = None;
@@ -1456,11 +1391,8 @@ fn validate_ia_nas(req: &Dhcp6Message, max_count: usize) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-/**
- * @brief 요청 하나를 처리해 응답을 만든다.
- * @warning 확정을 요구하는 요청은 서버 식별자가 이 서버의 것과 같아야 한다. 확인하지 않으면
- *          다른 서버에 보낸 요청에 이 서버가 끼어든다.
- */
+/// Requests that commit must carry this server's server ID; otherwise this server would answer
+/// requests sent to another server.
 pub fn handle(
     req: &Dhcp6Message,
     pool: &mut Lease6Pool,
@@ -1567,11 +1499,8 @@ pub fn handle(
     })
 }
 
-/**
- * @brief 주소 없이 설정만 묻는 요청에 답한다.
- * @details 라우터 광고의 O 플래그를 본 기기는 DNS 서버를 이 요청으로만 묻는다. RFC 8415에
- *          따라 IA 옵션이 있거나 다른 서버를 지목한 요청은 버린다.
- */
+/// Devices that saw the O flag in a router advertisement ask for DNS servers only this way. Per RFC
+/// 8415, requests carrying IA options or naming another server are dropped.
 fn information_reply(req: &Dhcp6Message, cfg: &Dhcp6Config) -> Option<Dhcp6Message> {
     if req
         .options
@@ -1607,7 +1536,7 @@ fn information_reply(req: &Dhcp6Message, cfg: &Dhcp6Config) -> Option<Dhcp6Messa
     })
 }
 
-/** @brief 서버 식별자. 하드웨어 주소를 시드로 만든다. */
+/// Seeded from the hardware address.
 pub fn make_server_duid(seed: &[u8; 6]) -> Vec<u8> {
     let mut d = Vec::with_capacity(10);
     d.extend_from_slice(&3u16.to_be_bytes());
@@ -1616,7 +1545,7 @@ pub fn make_server_duid(seed: &[u8; 6]) -> Vec<u8> {
     d
 }
 
-/** @brief 선택한 링크의 직접 DHCPv6 client multicast 그룹에 가입한다. */
+/// Joins the direct-client group on the chosen link.
 fn join_dhcp6_multicast_with<F>(interface_index: u32, mut join: F) -> std::io::Result<()>
 where
     F: FnMut(&Ipv6Addr, u32) -> std::io::Result<()>,
@@ -1624,13 +1553,12 @@ where
     join(&DHCP6_CLIENT_MULTICAST, interface_index)
 }
 
-/** @brief 직접 client 응답은 source port와 무관하게 UDP 546으로 돌려보낸다. */
+/// Replies to direct clients go to UDP 546 whatever the source port.
 fn direct_client_destination(mut peer: SocketAddr) -> SocketAddr {
     peer.set_port(546);
     peer
 }
 
-/** @brief DHCPv6 서버를 시작한다. */
 pub fn spawn_dhcp6(
     cfg: Dhcp6Config,
     port: u16,
@@ -1699,11 +1627,10 @@ pub fn spawn_dhcp6(
 }
 
 #[cfg(test)]
-/** @brief 인코딩 왕복, 어긋난 옵션 거부, 배분과 저장. */
 mod tests {
     use super::*;
 
-    /** @brief RFC상 무시할 작은 옵션을 최대 데이터그램 가까이 채운 요청. */
+    /// Request filled to near the maximum datagram with small options the RFC says to ignore.
     fn unknown_option_flood_wire(count: usize) -> Vec<u8> {
         let mut wire = solicit(b"unknown-flood", [0, 0, 0, 1]).encode();
         for _ in 0..count {
@@ -1714,7 +1641,7 @@ mod tests {
         wire
     }
 
-    /** @brief singleton 식별자를 되풀이해 표준 데이터그램을 채운 공격 입력. */
+    /// Repeats a singleton identifier to fill a standard datagram.
     fn singleton_identifier_flood_wire(code: u16, count: usize) -> Vec<u8> {
         let mut wire = solicit(b"singleton-flood", [0, 0, 0, 1]).encode();
         for _ in 0..count {
@@ -1726,18 +1653,16 @@ mod tests {
         wire
     }
 
-    /** @brief 큰 임대 기록 테스트에서 겹치지 않는 DUID를 만든다. */
     fn duid_for(index: usize) -> Vec<u8> {
         (index as u64).to_be_bytes().to_vec()
     }
 
-    /** @brief 테스트가 직접 상태를 채울 때도 실제 두 단계 키 계약을 사용한다. */
+    /// Uses the real two-level key contract even when tests fill state directly.
     fn insert_test_binding(map: &mut IaMap, duid: &[u8], iaid: [u8; 4], ip: u128, expiry: u64) {
         assert!(map.insert(duid, IaValue::new(ip, expiry, iaid)).is_none());
     }
 
     #[test]
-    /** @brief IAID가 종전 주소·만료 값의 정렬 여백 안에 들어가는지. */
     fn ia_value_uses_existing_alignment_padding() {
         assert_eq!(
             std::mem::size_of::<IaValue>(),
@@ -1745,7 +1670,6 @@ mod tests {
         );
     }
 
-    /** @brief 테스트용 설정. */
     fn cfg() -> Dhcp6Config {
         Dhcp6Config {
             server_duid: make_server_duid(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
@@ -1758,7 +1682,6 @@ mod tests {
         }
     }
 
-    /** @brief 테스트용 탐색 요청. */
     fn solicit(duid: &[u8], iaid: [u8; 4]) -> Dhcp6Message {
         let mut ia = Vec::new();
         ia.extend_from_slice(&iaid);
@@ -1770,7 +1693,6 @@ mod tests {
         }
     }
 
-    /** @brief 검증된 IA_NA에서 첫 Status Code를 읽는다. */
     fn ia_status(ia_na: &[u8]) -> Option<u16> {
         let parsed = parse_ia_na(ia_na)?;
         let mut options = parsed.options;
@@ -1786,7 +1708,7 @@ mod tests {
         None
     }
 
-    /** @brief 응답의 IAID와 할당 주소를 요청 순서대로 읽는다. */
+    /// In request order.
     fn assigned_ias(message: &Dhcp6Message) -> Vec<([u8; 4], Ipv6Addr)> {
         message
             .options
@@ -1799,7 +1721,6 @@ mod tests {
             .collect()
     }
 
-    /** @brief 서버 IA_NA의 T1·T2·preferred·valid 수명을 읽는다. */
     fn ia_lifetimes(message: &Dhcp6Message) -> (u32, u32, u32, u32) {
         let ia = message.option(OPT_IA_NA).expect("IA_NA 응답");
         assert!(ia.len() >= 40);
@@ -1812,7 +1733,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인코딩하고 되읽으면 같은지. */
     fn wire_roundtrip() {
         let m = solicit(b"client-duid", [9, 9, 9, 9]);
         let back = Dhcp6Message::parse(&m.encode()).unwrap();
@@ -1822,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 사용자 임대 수명도 T2 계산에서 포화되거나 infinity 의미를 잃지 않는지. */
+    /// Neither saturates in the T2 computation nor loses the infinity meaning.
     fn large_lease_lifetime_keeps_rfc_renewal_timers() {
         for lease in [u32::MAX - 1, u32::MAX] {
             let mut c = cfg();
@@ -1852,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수신 버퍼 절단이 후행 중복 CLIENT_ID를 숨길 수 없어야 한다. */
+    /// Truncation at the receive buffer must not hide a trailing duplicate CLIENT_ID.
     fn receive_capacity_covers_tail_option_validation() {
         let c = cfg();
         let mut request = solicit(b"tail-dup", [0, 0, 0, 1]);
@@ -1889,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief DHCPv6 서버가 선택한 링크의 All_DHCP_Relay_Agents_and_Servers에 가입하는지. */
+    /// All_DHCP_Relay_Agents_and_Servers on the chosen link.
     fn multicast_join_uses_rfc_group_and_selected_interface() {
         let mut joined = Vec::new();
         join_dhcp6_multicast_with(17, |group, interface| {
@@ -1902,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 임의 허용 source port의 직접 클라이언트에도 546으로 scope를 보존해 답하는지. */
+    /// Answers a direct client on any source port at 546, keeping the scope.
     fn direct_client_reply_uses_port_546_and_preserves_scope() {
         let peer = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
             "fe80::1234".parse().unwrap(),
@@ -1923,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무시할 옵션 flood가 개별 소유 Vec와 옵션 메타데이터로 증폭되지 않는지. */
+    /// Ignored options are not amplified into owned Vecs and option metadata.
     fn unknown_option_flood_is_ignored_without_storage_amplification() {
         let c = cfg();
         let wire = unknown_option_flood_wire(16_000);
@@ -1935,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief singleton 식별자 flood를 수천 Vec로 소유하기 전에 파서가 끝내는지. */
+    /// The parser stops before owning thousands of Vecs.
     fn duplicate_singleton_flood_is_rejected_during_parse() {
         assert!(
             Dhcp6Message::parse(&singleton_identifier_flood_wire(OPT_CLIENT_ID, 8_000)).is_none()
@@ -1946,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief DUID의 2바이트 type과 1..=128바이트 식별자 길이를 wire에서 강제하는지. */
+    /// Enforced on the wire: 2-byte type and 1 to 128 identifier bytes.
     fn duid_wire_length_is_bounded_before_state_changes() {
         assert!(Dhcp6Message::parse(&solicit(&[0; 2], [0; 4]).encode()).is_none());
         assert!(Dhcp6Message::parse(&solicit(&[0; 3], [0; 4]).encode()).is_some());
@@ -1955,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어떤 응답에도 담을 수 없는 IA 개수를 파서 단계에서 bounded 거부하는지. */
+    /// IA counts no response could carry are rejected in the parser, at bounded cost.
     fn impossible_ia_count_is_rejected_during_parse() {
         let absolute_response_capacity =
             (MAX_STANDARD_IPV6_UDP_PAYLOAD - 4) / IA_NA_ADDRESS_RESPONSE_WIRE_LEN;
@@ -1973,7 +1893,6 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp6_unknown_option_flood_parse -- --ignored --nocapture"]
-    /** @brief 작은 unknown option 16,000개의 파싱 비용을 측정한다. */
     fn bench_dhcp6_unknown_option_flood_parse() {
         const OPS: usize = 64;
         const ROUNDS: usize = 6;
@@ -1994,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다중 IA 최악 응답이 UDP 상한을 넘기 전에 요청 전체를 거부하는지. */
+    /// The worst-case multi-IA response is checked against the UDP limit before any state changes.
     fn multi_ia_response_budget_is_checked_before_state_changes() {
         let mut c = cfg();
         c.range_end = "2001:db8::ffff".parse().unwrap();
@@ -2022,7 +1941,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp6_many_ia_validation -- --ignored --nocapture"]
-    /** @brief 큰 정상 다중 IA 메시지의 검증 비용이 IA 수의 제곱으로 커지는지 측정한다. */
+    /// Whether validation cost grows with the square of the IA count.
     fn bench_dhcp6_many_ia_validation() {
         const IA_COUNT: usize = 1_024;
         const OPS: usize = 64;
@@ -2047,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 옵션이 전체를 거부되는지. 앞부분만 받아들이면 잘린 요청이 통과한다. */
+    /// Accepting the front part would let a truncated request through.
     fn malformed_option_is_rejected_instead_of_partially_applied() {
         let encoded = solicit(b"client-duid", [9, 9, 9, 9]).encode();
 
@@ -2061,7 +1980,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 탐색에는 알림으로, 요청에는 확정으로 답하는지. */
     fn solicit_advertises_request_replies() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2099,11 +2017,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 주소 없이 설정만 묻는 요청에 DNS 서버를 알려 주는지.
-     * @details 라우터 광고의 O 플래그를 본 기기는 이 요청으로만 DNS 서버를 묻는다. IA 옵션이
-     *          든 요청과 다른 서버를 지목한 요청은 RFC 8415에 따라 버린다.
-     */
+    /// Devices that saw the O flag in a router advertisement ask for DNS servers only this way.
+    /// Requests carrying IA options or naming another server are dropped per RFC 8415.
     fn information_request_gets_dns_servers() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2144,7 +2059,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief SOLICIT에 광고한 주소를 같은 DUID의 REQUEST에서 그대로 확정하는지. */
     fn request_commits_the_address_advertised_to_each_duid() {
         let mut c = cfg();
         c.range_end = c.range_start;
@@ -2179,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief REQUEST와 RELEASE의 IAADDR가 실제 offer/lease와 다르면 상태를 바꾸지 않는지. */
+    /// A mismatched IAADDR changes no state.
     fn request_and_release_require_the_owned_ia_address() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2262,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소 할당 메시지가 IA_NA 누락·절단·중복을 받아들이지 않는지. */
+    /// Missing, truncated, or repeated IA_NA is refused.
     fn address_messages_require_one_well_formed_ia_na() {
         let c = cfg();
         let mut truncated_nested = vec![0; 12];
@@ -2325,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중복 SERVER_ID가 정상 offer를 확정하지 못하는지. */
+    /// A repeated SERVER_ID cannot commit a valid offer.
     fn request_requires_one_server_id() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2353,7 +2267,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 DUID의 서로 다른 IAID가 독립된 IA와 주소를 갖는지. */
     fn same_duid_can_hold_distinct_iaids() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2371,7 +2284,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 세 IA의 중간 삭제와 만료 승격 뒤에도 연결과 주소 소유권이 보존되는지. */
+    /// Links and address ownership survive removing the middle of three IAs and promotion on
+    /// expiry.
     fn additional_ia_links_survive_middle_removal_and_expiry_promotion() {
         let mut c = cfg();
         c.range_end = "2001:db8::110".parse().unwrap();
@@ -2412,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 광고 주소를 알아도 다른 IAID로 그 offer를 확정할 수 없는지. */
+    /// Knowing the advertised address is not enough to commit the offer under another IAID.
     fn request_cannot_switch_the_offered_iaid() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2440,7 +2354,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 메시지의 여러 IA_NA를 각각 광고하는지. */
     fn solicit_handles_multiple_identity_associations() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2465,7 +2378,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 IA가 확정·갱신되고 한 IA만 해제되어도 나머지가 유지되는지. */
+    /// Releasing one IA leaves the others.
     fn multiple_identity_associations_have_independent_lifecycles() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2526,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief SERVER_ID를 담은 SOLICIT를 RFC 9915에 따라 폐기하는지. */
+    /// Per RFC 9915.
     fn solicit_with_server_id_is_discarded() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2538,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 임대와 offer가 상한 하나를 공유하고 만료된 offer 주소를 다시 쓰는지. */
+    /// Leases and offers share one cap, and expired offers free their addresses.
     fn dhcp6_offers_share_the_state_cap_and_expire() {
         let mut c = cfg();
         c.range_start = "2001:db8::10".parse().unwrap();
@@ -2585,7 +2498,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 다른 주소를 주고, 다 쓰면 못 준다고 하는지. */
     fn pool_distinct_and_exhaustion() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2602,7 +2514,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 IPv6 주소와 범위 밖 주소를 둘 이상의 DUID에 확정하지 않는지. */
     fn commit_rejects_duplicate_and_out_of_range_ip() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2616,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중복 IPv6 주소가 든 저장 파일은 부분 복원하지 않는지. */
+    /// No partial restore.
     fn persisted_duplicate_ip_rejects_the_whole_dhcp6_file() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-duplicate-lease6-{}-{}.txt",
@@ -2641,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대량 만료 뒤 임대와 주소 인덱스의 고수위 버킷을 모두 반환하는지. */
+    /// Mass expiry returns the high-water buckets of the leases and the address index.
     fn dhcp6_expiry_releases_high_water_capacity() {
         let mut c = cfg();
         c.range_start = "2001:db8::10".parse().unwrap();
@@ -2671,7 +2582,7 @@ mod tests {
 
     #[test]
     #[ignore = "마이크로벤치: cargo test -p onetdns --release bench_dhcp6_new_client_allocation_scaling -- --ignored --nocapture"]
-    /** @brief DHCPv6 새 클라이언트 할당 비용이 전체 임대 수에 비례하는지 측정한다. */
+    /// Whether new-client allocation cost grows with the lease count.
     fn bench_dhcp6_new_client_allocation_scaling() {
         const OPS: usize = 256;
         const ROUNDS: usize = 6;
@@ -2711,7 +2622,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료된 임대가 슬롯을 계속 차지하지 않는지. */
     fn allocate_prunes_expired_leases() {
         let c = cfg();
         let mut pool = Lease6Pool::new(&c);
@@ -2729,7 +2639,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장했다 읽으면 같은 기록이 되는지. */
     fn persistence_roundtrip_and_snapshot() {
         let path =
             std::env::temp_dir().join(format!("onetdns-lease6-persist-{}.txt", std::process::id()));
@@ -2772,7 +2681,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 16진 변환 왕복. */
     fn hex_bytes_roundtrip() {
         assert_eq!(hex_bytes(&[0x00, 0x03, 0xff]), "0003ff");
         assert_eq!(bytes_from_hex("0003ff"), Some(vec![0x00, 0x03, 0xff]));
@@ -2781,7 +2689,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어떤 바이트열이 와도 파서가 패닉하지 않는지. */
     fn parse_never_panics_on_malformed_bytes() {
         use crate::fuzzutil::{havoc, Rng};
 

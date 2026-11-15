@@ -1,20 +1,13 @@
-/*!
- * @brief 전송별 오류 관찰.
- *
- * @details 어느 전송의 어느 단계에서 얼마나 실패했는지 센다. 지표로 내보내 어디가
- *          문제인지 좁힌다.
- * @note 단계 이름은 고정 문자열이다. 상대가 준 값을 키로 쓰면 종류가 무한히 늘어난다.
- */
+//! Error counts per transport and stage, exported as metrics. Stage names are fixed strings; keys
+//! taken from the peer would grow without bound.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 
-/** @brief 전송과 단계별 오류 수. */
 static ERROR_COUNTS: OnceLock<Mutex<HashMap<(&'static str, &'static str), u64>>> = OnceLock::new();
 
-/** @brief 오류를 하나 센다. */
 pub fn record_error(
     transport: &'static str,
     stage: &'static str,
@@ -45,7 +38,6 @@ pub fn record_error(
     }
 }
 
-/** @brief QUIC 진단을 단계 카운터로 옮긴다. */
 pub fn record_quic_diagnostic(
     transport: &'static str,
     peer: Option<SocketAddr>,
@@ -54,7 +46,6 @@ pub fn record_quic_diagnostic(
     record_error(transport, diagnostic.stage(), peer, diagnostic);
 }
 
-/** @brief 지금 카운터 전부. */
 pub fn snapshot() -> Vec<(&'static str, &'static str, u64)> {
     let counters = ERROR_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
     let counters = counters
@@ -69,7 +60,6 @@ pub fn snapshot() -> Vec<(&'static str, &'static str, u64)> {
 }
 
 #[cfg(test)]
-/** @brief 이 전송과 단계의 오류 수. */
 pub fn count(transport: &'static str, stage: &'static str) -> u64 {
     ERROR_COUNTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -81,12 +71,10 @@ pub fn count(transport: &'static str, stage: &'static str) -> u64 {
 }
 
 #[cfg(test)]
-/** @brief 카운터가 쌓이고 지표로 나오는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 오류가 단계별로 세어지는지. */
     fn records_stage_counter() {
         let before = count("test", "parse");
         record_error("test", "parse", None, "synthetic failure");
@@ -94,7 +82,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 센 것이 그대로 나오는지. */
     fn snapshot_reports_recorded_counters() {
         record_error("test_snapshot", "stage", None, "synthetic failure");
         assert!(snapshot()
@@ -103,7 +90,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief QUIC 진단이 고정된 단계 이름만 쓰는지. 상대가 정하는 값을 키로 쓰면 종류가 무한히 는다. */
     fn quic_diagnostics_use_bounded_stage_counters() {
         let stage = onetdns_quic::QuicDiagnostic::LongPacketProtection.stage();
         let before = count("test_quic", stage);

@@ -1,6 +1,4 @@
-/*!
- * @brief 백엔드가 실패하면 만료된 응답을 내주는 serve-stale 계층.
- */
+//! RFC 8767 serve-stale: answers with expired responses when the backend fails.
 
 use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -13,47 +11,35 @@ use super::{cap_message_ttls, outcome_to_option, retarget_message, semantic_requ
 use crate::native::{ResolveOutcome, Resolver};
 
 #[derive(Clone)]
-/** @brief 담아 둔 응답 하나와 그 신선·유예 기한. */
 struct StaleEntry {
-    /** @brief 담아 둔 응답. */
     response: Message,
-    /** @brief 담은 시각. */
     inserted: Instant,
-    /** @brief 이때까지는 그냥 신선한 답으로 내보낸다. */
+    /// Served as a normal fresh answer until then.
     fresh_until: Instant,
-    /** @brief 이때까지는 업스트림이 죽었을 때만 내보낸다. */
+    /// Until then, served only when the upstream fails.
     stale_until: Instant,
-    /** @brief 담을 때의 원래 수명. */
     original_ttl: Duration,
 }
 
-/** @brief 담아 둘 때 쓰는 키. */
 type StaleKey = Vec<u8>;
-/** @brief 담아 둔 응답들. */
 type StaleStore = Arc<Mutex<LruMap<StaleKey, StaleEntry>>>;
-/** @brief 동시에 돌릴 갱신 수. */
+/// Cap on refreshes in flight; also the queue length.
 const MAX_STALE_REFRESHES: usize = 32;
-/** @brief 갱신 일 하나. */
 type StaleRefreshJob = Box<dyn FnOnce() + Send + 'static>;
-/** @brief 갱신 워커 수. */
 const STALE_REFRESH_WORKERS: usize = 8;
-/** @brief 갱신 워커 풀. */
 static STALE_REFRESH_EXECUTOR: OnceLock<mpsc::SyncSender<StaleRefreshJob>> = OnceLock::new();
-/** @brief 실행 중인 갱신 수와 그것이 0이 되기를 기다리는 곳. */
+/// Running refresh count, and the condvar waiting for it to reach 0.
 type StaleJobs = Arc<(Mutex<usize>, Condvar)>;
 
-/** @brief 갱신이 끝나면 진행 표시를 지우고 기다리는 쪽을 깨우는 것. */
+/// Clears the in-flight mark and wakes waiters when a refresh ends.
 struct StaleRefreshGuard {
-    /** @brief 지금 갱신 중인 이름들. */
     inflight: Arc<Mutex<HashSet<StaleKey>>>,
-    /** @brief 이 갱신이 맡은 이름. */
     key: StaleKey,
-    /** @brief 실행 중인 갱신 수와 그것이 0이 되기를 기다리는 곳. */
     jobs: StaleJobs,
 }
 
 impl Drop for StaleRefreshGuard {
-    /** @brief 진행 표시를 지우고 깨운다. 지우지 않으면 그 이름은 다시 갱신되지 않는다. */
+    /// A mark left behind would keep that name from ever refreshing again.
     fn drop(&mut self) {
         self.inflight.lock_recover().remove(&self.key);
         let (count, wake) = &*self.jobs;
@@ -63,7 +49,7 @@ impl Drop for StaleRefreshGuard {
     }
 }
 
-/** @brief 갱신 워커 풀. 처음 쓸 때 시작한다. */
+/// Started on first use.
 fn stale_refresh_executor() -> &'static mpsc::SyncSender<StaleRefreshJob> {
     STALE_REFRESH_EXECUTOR.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<StaleRefreshJob>(MAX_STALE_REFRESHES);
@@ -88,18 +74,14 @@ fn stale_refresh_executor() -> &'static mpsc::SyncSender<StaleRefreshJob> {
     })
 }
 
-/** @brief 갱신을 맡긴다. 대기열이 꽉 차면 이번 갱신을 건너뛴다. */
+/// Skips this refresh when the queue is full.
 fn submit_stale_refresh(job: impl FnOnce() + Send + 'static) -> bool {
     stale_refresh_executor().try_send(Box::new(job)).is_ok()
 }
 
-/**
- * @brief 갱신을 맡기지 못했음을 알린다.
- * @details 계속 실패하면 만료 응답이 갱신되지 않은 채 유예 기간 내내 나간다. 질의마다
- *          호출되는 경로라 2의 거듭제곱 번째만 남긴다.
- */
+/// Persistent failures mean the stale answer is served unrefreshed for the whole grace period. Runs
+/// per query, so only powers of two are logged.
 fn stale_refresh_not_submitted() {
-    /** @brief 누적 실패 수. */
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -107,7 +89,8 @@ fn stale_refresh_not_submitted() {
     }
 }
 
-/** @brief 흐른 만큼 수명을 깎고 다한 것은 뺀다. EDNS 유사 레코드는 수명이 아니므로 건드리지 않는다. */
+/// Reduces TTLs by the time passed and drops expired records; OPT is left alone, since its TTL
+/// field is not a TTL.
 fn age_fresh_records(records: &mut Vec<Record>, elapsed_secs: u64) {
     records.retain_mut(|record| {
         if record.rtype == RecordType::OPT {
@@ -123,43 +106,33 @@ fn age_fresh_records(records: &mut Vec<Record>, elapsed_secs: u64) {
     });
 }
 
-/**
- * @brief 업스트림이 답하지 못할 때 만료된 답이라도 내보내는 계층.
- * @details 아무 답도 못 주는 것보다 조금 지난 답이 낫다는 판단이다. 유예 기간과 다시
- *          물을 시점은 설정으로 정한다.
- */
+/// Serves an expired answer when the upstream cannot answer, on the view that a slightly old answer
+/// beats none. The grace period and the retry timing come from the config.
 pub struct ServeStaleLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 담아 둔 응답들. */
     store: StaleStore,
-    /** @brief 만료 뒤에도 내보낼 수 있는 기간. */
+    /// How long past expiry an answer may still be served.
     max_stale: Duration,
-    /** @brief 담을 때 걸 수명 하한. */
     min_ttl: u32,
-    /** @brief 담을 때 걸 수명 상한. */
     max_ttl: u32,
-    /** @brief 지난 답을 내보낼 때 담을 수명. */
+    /// TTL put on stale answers.
     reply_ttl: u32,
-    /** @brief 다시 물어 성공하면 유예 기한을 처음부터 다시 잡는지. */
+    /// A successful refresh restarts the stale window.
     ttl_reset: bool,
-    /** @brief 이만큼 지나면 지난 답부터 내보낸다. 없으면 끝까지 기다린다. */
+    /// Past this, the stale answer goes out first; None waits to the end.
     client_timeout: Option<Duration>,
-    /** @brief 만료된 답을 기다림 없이 먼저 내보내고 뒤에서 다시 묻는지. */
+    /// Serve the expired answer without waiting and refresh in the background.
     stale_first: bool,
-    /** @brief 지금 갱신 중인 이름들. */
     inflight: Arc<Mutex<HashSet<StaleKey>>>,
-    /** @brief 이 계층이 사라지고 있다는 표시. */
+    /// Set while this layer is being dropped.
     stop: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 서버 전체가 끝나고 있다는 표시. */
+    /// Set while the whole server shuts down.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /** @brief 실행 중인 갱신 수와 그것이 0이 되기를 기다리는 곳. */
     jobs: StaleJobs,
 }
 
 impl ServeStaleLayer {
     #[allow(clippy::too_many_arguments)]
-    /** @brief 유예 기간과 수명 상하한으로 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         max_stale: Duration,
@@ -178,11 +151,9 @@ impl ServeStaleLayer {
             max_stale,
             min_ttl,
             max_ttl,
-            /*
-             * RFC 8767은 만료된 레코드의 수명을 0보다 크게 실으라고 정한다. 0으로 내보내면
-             * 받은 쪽이 담아 두지 못해 같은 이름을 곧바로 다시 물어, 업스트림이 죽어 있는 동안
-             * 질의가 몰린다. 이 기능이 막으려던 상황을 그대로 만든다.
-             */
+            // RFC 8767 requires stale records to carry a TTL above 0. With 0, the receiver could
+            // not cache it and would ask again at once, flooding queries while the upstream is
+            // down, the very situation this feature exists to prevent.
             reply_ttl: reply_ttl.max(1),
             ttl_reset,
             client_timeout: client_timeout.filter(|d| !d.is_zero()),
@@ -194,17 +165,14 @@ impl ServeStaleLayer {
         }
     }
 
-    /** @brief 종료 신호를 붙인다. 갱신이 종료를 막지 않게 하려는 것이다. */
+    /// So refreshes do not hold up shutdown.
     pub fn with_shutdown(mut self, shutdown: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
     }
 
-    /**
-     * @brief 응답을 담아 둔다.
-     * @warning 담을 자격을 확인한다. 질문한 것이 답에 없는 응답을 담으면, 나중에 업스트림이
-     *          죽었을 때 그 엉뚱한 답을 내보낸다.
-     */
+    /// Checks eligibility: a response lacking the requested answer, once stored, would be served
+    /// when the upstream is down.
     fn store_answer_shared(
         store: &StaleStore,
         max_stale: Duration,
@@ -270,7 +238,6 @@ impl ServeStaleLayer {
         );
     }
 
-    /** @brief 응답을 담아 둔다. */
     fn store_answer(&self, request: &Message, key: StaleKey, answer: &Message) {
         Self::store_answer_shared(
             &self.store,
@@ -283,7 +250,7 @@ impl ServeStaleLayer {
         );
     }
 
-    /** @brief 담아 둔 것을 꺼낸다. 유예 기한까지 지났으면 지운다. */
+    /// Removes the entry once its stale window has passed too.
     fn cached(&self, key: &StaleKey) -> Option<StaleEntry> {
         let now = Instant::now();
         let mut store = self.store.lock_recover();
@@ -295,7 +262,7 @@ impl ServeStaleLayer {
         Some(entry.clone())
     }
 
-    /** @brief 아직 신선한 답을 흐른 만큼 깎아 낸다. */
+    /// With TTLs reduced by the time passed.
     fn build_fresh(&self, request: &Message, entry: &StaleEntry) -> Message {
         let elapsed = Instant::now()
             .saturating_duration_since(entry.inserted)
@@ -307,11 +274,8 @@ impl ServeStaleLayer {
         response
     }
 
-    /**
-     * @brief 만료된 답을 내보낼 형태로 만든다.
-     * @note 설정한 짧은 수명으로 바꿔 단다. 원래 수명 그대로 보내면 클라이언트가 오래
-     *       담아 두어 지난 답이 더 오래 산다.
-     */
+    /// Puts the configured short TTL on it; with the original TTL, clients would hold the old
+    /// answer longer.
     fn build_stale(&self, request: &Message, entry: &StaleEntry) -> Message {
         let mut response = retarget_message(entry.response.clone(), request);
 
@@ -360,7 +324,6 @@ impl ServeStaleLayer {
         response
     }
 
-    /** @brief 설정에 따라 유예 기한을 늘린다. */
     fn extend_stale_if_configured(&self, key: &StaleKey) {
         if !self.ttl_reset {
             return;
@@ -370,7 +333,7 @@ impl ServeStaleLayer {
         }
     }
 
-    /** @brief 이 이름의 갱신을 시작한다. 이미 돌고 있으면 시작하지 않는다. */
+    /// False while stopping, when the name is already refreshing, or at the in-flight cap.
     fn begin_refresh(&self, key: &StaleKey) -> bool {
         if self.stop.load(std::sync::atomic::Ordering::Relaxed)
             || self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
@@ -387,7 +350,6 @@ impl ServeStaleLayer {
         true
     }
 
-    /** @brief 뒤에서 다시 묻게 맡긴다. */
     fn spawn_refresh(&self, request: Message, key: StaleKey) {
         if !self.begin_refresh(&key) {
             return;
@@ -434,7 +396,7 @@ impl ServeStaleLayer {
         }
     }
 
-    /** @brief 데드라인을 걸어 안으로 묻는다. 데드라인을 넘기면 담아 둔 답을 먼저 내보내려는 것이다. */
+    /// Asks the inner layer with a deadline, so the cached answer can go out first once it passes.
     fn resolve_with_timeout(
         &self,
         request: &Message,
@@ -498,10 +460,7 @@ impl ServeStaleLayer {
 }
 
 impl Drop for ServeStaleLayer {
-    /**
-     * @brief 실행 중인 갱신이 끝나기를 기다린다.
-     * @warning 기다리지 않으면 갱신이 이미 사라진 것을 건드린다.
-     */
+    /// Waits for running refreshes; otherwise a refresh would touch what is already gone.
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let (count, wake) = &*self.jobs;
@@ -513,12 +472,10 @@ impl Drop for ServeStaleLayer {
 }
 
 impl Resolver for ServeStaleLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, request: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(request))
     }
 
-    /** @brief 신선하면 그대로, 만료됐으면 갱신을 걸고 지난 답을 내보낸다. */
     fn resolve_outcome(&self, request: &Message) -> ResolveOutcome {
         let Some(key) = semantic_request_key(request) else {
             return self.inner.resolve_outcome(request);
@@ -574,7 +531,6 @@ impl Resolver for ServeStaleLayer {
 }
 
 #[cfg(test)]
-/** @brief 만료 응답 제공, 갱신, 보관 한도와 TTL 처리. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -589,13 +545,11 @@ mod tests {
     use crate::layers::{answer_message, semantic_request_key, MAX_SEMANTIC_KEY_WIRE};
     use crate::native::Resolver;
 
-    /** @brief 처음 한 번만 답하고 이후 실패하는 테스트용 리졸버. */
+    /// Answers once, then fails.
     struct FailAfterFirst {
-        /** @brief 지금까지 답한 횟수. */
         n: AtomicU32,
     }
     impl Resolver for FailAfterFirst {
-        /** @brief 미리 정해 둔 응답을 돌려준다. */
         fn resolve(&self, req: &Message) -> Option<Message> {
             let c = self.n.fetch_add(1, Ordering::SeqCst);
             if c == 0 {
@@ -614,7 +568,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림이 죽었을 때 담아 둔 답을 내보내는지. */
     fn serve_stale_on_failure() {
         let inner = Arc::new(FailAfterFirst {
             n: AtomicU32::new(0),
@@ -650,13 +603,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 응답 수명을 0으로 설정해도 0으로 나가지 않는지.
-     *
-     * @details RFC 8767은 만료된 레코드의 수명을 0보다 크게 실으라고 정한다. 0이면 받은
-     *          쪽이 담아 두지 못해 같은 이름을 곧바로 다시 묻고, 업스트림이 죽어 있는 동안
-     *          질의가 몰린다. 이 기능이 막으려던 상황을 그대로 만든다.
-     */
     fn serve_stale_reply_ttl_is_never_zero() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::ServFail.0),
@@ -695,15 +641,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지난 답을 먼저 내보내고 뒤에서 다시 묻는지. */
     fn serve_stale_refresh_serves_stale_then_refreshes() {
-        /** @brief 두 번째부터 느리게 답하는 테스트용 리졸버. */
+        /// Slow from the second call on.
         struct SlowAfterFirst {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for SlowAfterFirst {
-            /** @brief 미리 정해 둔 응답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 let c = self.calls.fetch_add(1, Ordering::SeqCst);
                 if c > 0 {
@@ -757,15 +700,13 @@ mod tests {
     }
 
     #[test]
-    /** @brief 만료 응답 먼저 보내기를 켜면 기다림 없이 지난 답을 내고 뒤에서 다시 묻는지. */
     fn stale_first_answers_without_waiting_for_upstream() {
-        /** @brief 첫 번째 뒤로는 오래 걸리는 테스트용 리졸버. */
+        /// Slow after the first call.
         struct SlowAfterFirst {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for SlowAfterFirst {
-            /** @brief 수명 1초짜리 답을 돌려준다. */
+            /// Answers with a 1-second TTL.
             fn resolve(&self, req: &Message) -> Option<Message> {
                 if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
                     std::thread::sleep(Duration::from_millis(500));
@@ -806,17 +747,14 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실행 중인 갱신이 끝나기를 기다리고 사라지는지. 안 기다리면 사라진 것을 건드린다. */
+    /// Otherwise the refresh would touch what is gone.
     fn dropping_serve_stale_waits_for_active_refresh() {
-        /** @brief 신호를 줄 때까지 답하지 않는 테스트용 리졸버. */
+        /// Blocks until released.
         struct BlockingRefresh {
-            /** @brief 들어왔음을 알릴 곳. */
             entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-            /** @brief 놓아 줄 때까지 기다리는 곳. */
             release: Arc<(Mutex<bool>, Condvar)>,
         }
         impl Resolver for BlockingRefresh {
-            /** @brief 신호가 올 때까지 멈춰 있는다. */
             fn resolve(&self, _req: &Message) -> Option<Message> {
                 if let Some(entered) = self.entered.lock_recover().take() {
                     let _ = entered.send(());
@@ -866,7 +804,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담는 양이 상한을 지키고 오래된 것부터 밀리는지. */
     fn serve_stale_store_honors_capacity_and_lru_recency() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::NoError.0),
@@ -898,7 +835,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 신선 구간이 설정한 수명 상하한을 지키는지. */
     fn serve_stale_fresh_cache_honors_configured_ttl_bounds() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::NoError.0),
@@ -934,7 +870,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 신선 구간이 서명 만료를 넘지 않는지. */
     fn serve_stale_fresh_window_is_capped_by_rrsig_expiration() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::NoError.0),
@@ -985,15 +920,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질문과 무관한 답을 담지 않는지. 담으면 업스트림이 죽었을 때 그것이 나간다. */
+    /// Storing it would serve it when the upstream is down.
     fn serve_stale_rejects_unrelated_lame_answer() {
-        /** @brief 질문과 무관한 답을 내는 테스트용 리졸버. */
         struct UnrelatedAnswer {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for UnrelatedAnswer {
-            /** @brief 무관한 답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first()?;
@@ -1030,12 +962,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 딸려 온 기록도 제 수명대로 늙어 빠지는지. */
     fn serve_stale_fresh_hit_ages_and_expires_each_additional_rr() {
-        /** @brief 딸린 기록의 수명이 짧은 답을 내는 테스트용 리졸버. */
         struct ShortAdditional;
         impl Resolver for ShortAdditional {
-            /** @brief 딸린 기록의 수명이 짧은 답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 let q = req.questions.first()?;
                 let mut response = answer_message(req.header.id, q.name.clone(), q.qtype, vec![]);
@@ -1082,7 +1011,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 짧은 딸림 레코드가 자기 stale 구간을 넘긴 뒤 다시 살아나지 않는지. */
     fn serve_stale_does_not_resurrect_expired_additional_records() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::ServFail.0),
@@ -1133,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief stale 구간 재설정이 주 답만 살리고 훨씬 짧은 딸림 레코드는 되살리지 않는지. */
+    /// Resetting the stale window revives the main answer, not a much shorter additional record.
     fn serve_stale_ttl_reset_preserves_per_record_ttl_offsets() {
         let layer = ServeStaleLayer::new(
             Mock::new(1, ResponseCode::ServFail.0),
@@ -1182,15 +1110,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭 끝에 답이 있으면 담는지. */
     fn serve_stale_accepts_cname_chain_with_terminal_rrset() {
-        /** @brief 별칭 체인이 담긴 답을 내는 테스트용 리졸버. */
         struct AliasAnswer {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for AliasAnswer {
-            /** @brief 별칭 체인이 담긴 답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first()?;
@@ -1232,7 +1156,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키로 삼기엔 너무 큰 질의도 답은 받는지. */
     fn oversized_semantic_key_bypasses_stale_state_without_dropping_query() {
         let inner = Mock::new(60, ResponseCode::NoError.0);
         let layer = ServeStaleLayer::new(
@@ -1261,7 +1184,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의가 아닌 것이 담아 둔 상태를 건드리지 않는지. */
     fn non_query_envelope_bypasses_semantic_state() {
         let inner = Mock::new(60, ResponseCode::NoError.0);
         let layer = ServeStaleLayer::new(

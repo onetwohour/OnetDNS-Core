@@ -1,23 +1,14 @@
-/*!
- * @brief 서비스별 차단 규칙 모음.
- *
- * @details 운영자가 서비스 하나를 고르면 그 서비스가 쓰는 도메인들이 한꺼번에 막힌다.
- *          목록 주소를 받아 오지 않고 내장한다.
- */
+//! Blocking rules per service. Choosing one service blocks every domain it uses. The rules are
+//! built in rather than fetched from a list URL.
 
-/** @brief 차단할 수 있는 서비스 하나. */
 pub struct Service {
-    /** @brief 설정에 적는 이름. */
+    /// The name written in config.
     pub id: &'static str,
-    /** @brief 사람에게 보일 이름. */
     pub name: &'static str,
-    /** @brief 묶어 보일 분류. */
     pub group: &'static str,
-    /** @brief 이 서비스를 막는 규칙들. */
     pub rules: &'static [&'static str],
 }
 
-/** @brief 내장 서비스 목록. */
 pub const SERVICES: &[Service] = &[
     Service {
         id: "4chan",
@@ -672,7 +663,6 @@ pub const SERVICES: &[Service] = &[
     },
 ];
 
-/** @brief 이 서비스의 규칙들. 모르는 식별자면 없다. */
 pub fn service_rules(id: &str) -> Option<&'static [&'static str]> {
     SERVICES
         .iter()
@@ -680,7 +670,6 @@ pub fn service_rules(id: &str) -> Option<&'static [&'static str]> {
         .map(|service| service.rules)
 }
 
-/** @brief 식별자와 이름의 짝 목록. 대시보드가 고르게 보여 준다. */
 pub fn list() -> Vec<(&'static str, &'static str)> {
     SERVICES
         .iter()
@@ -688,7 +677,6 @@ pub fn list() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/** @brief 서비스 목록 전체. */
 pub fn catalog() -> &'static [Service] {
     SERVICES
 }

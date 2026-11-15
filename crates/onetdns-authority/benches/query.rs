@@ -8,23 +8,19 @@ use std::time::Instant;
 use onetdns_authority::{parse_zone, Zone, ZoneStore};
 use onetdns_proto::{Name, RData, Record, RecordType, Soa};
 
-/** @brief 잡힌 메모리와 최고점을 세는 할당기. */
+/// Counts live bytes and the peak.
 struct TrackingAllocator;
 
-/** @brief 지금 잡혀 있는 바이트. */
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-/** @brief 잡혔던 최고 바이트. */
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
-/** @brief 잡은 만큼 세고 최고점을 갱신한다. */
 fn add_allocation(size: usize) {
     let current = CURRENT.fetch_add(size, Ordering::Relaxed) + size;
     PEAK.fetch_max(current, Ordering::Relaxed);
 }
 
-/** @safety 세기만 하고 실제 할당은 시스템 할당기에 그대로 넘긴다. */
+// SAFETY: Only counts; every allocation is passed to the system allocator.
 unsafe impl GlobalAlloc for TrackingAllocator {
-    /** @brief 잡고 센다. */
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
@@ -33,7 +29,6 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         pointer
     }
 
-    /** @brief 비워서 잡고 센다. */
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
@@ -42,20 +37,15 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         pointer
     }
 
-    /** @brief 돌려주고 뺀다. */
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(pointer, layout) };
     }
 
-    /**
-     * @brief 크기를 바꾸고 셈을 맞춘다.
-     *
-     * @details 곳을 옮겨 담았으면 옮기는 동안 이전 버퍼와 새 버퍼가 함께 살아 있다. 그
-     *          겹친 구간을 최고점에 넣지 않으면 배로 늘리며 자라는 자료의 봉우리가 전부
-     *          보이지 않는다. 늘어난 몫만 세면 최고점이 언제나 보유량과 같게 나온다.
-     * @note 같은 위치를 그대로 늘렸으면 겹치는 구간이 없으므로 차이만 센다.
-     */
+    /// A moved block keeps the old and new buffers alive at once during the copy. Leaving that
+    /// overlap out of the peak hides every peak of data that grows by doubling; counting only the
+    /// growth makes the peak always equal the live size. An in-place resize has no overlap, so only
+    /// the difference counts.
     unsafe fn realloc(&self, pointer: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
         let new_pointer = unsafe { System.realloc(pointer, old, new_size) };
         if new_pointer.is_null() {
@@ -76,10 +66,8 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 }
 
 #[global_allocator]
-/** @brief 이 벤치가 쓰는 할당기. */
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
-/** @brief 측정할 때 쓸 영역 기록들. */
 fn zone_records(origin: &Name, host_count: usize) -> Vec<Record> {
     let origin_text = origin.to_ascii_lower();
     let ns = Name::from_str(&format!("ns.{origin_text}")).unwrap();
@@ -110,7 +98,7 @@ fn zone_records(origin: &Name, host_count: usize) -> Vec<Record> {
     records
 }
 
-/** @brief 같은 이름을 되풀이해 물었을 때의 비용. */
+/// Repeating one name.
 fn measure_query(zone: &Zone, name: &Name, iterations: usize) -> f64 {
     let started = Instant::now();
     for _ in 0..iterations {
@@ -119,7 +107,7 @@ fn measure_query(zone: &Zone, name: &Name, iterations: usize) -> f64 {
     started.elapsed().as_nanos() as f64 / iterations as f64
 }
 
-/** @brief 서로 다른 이름을 물었을 때의 비용. 캐시가 도와주지 않는 경우다. */
+/// Different names, where caching does not help.
 fn measure_spread(zone: &Zone, names: &[Name], iterations: usize) -> f64 {
     let started = Instant::now();
     let mut cursor = 0usize;
@@ -133,7 +121,6 @@ fn measure_spread(zone: &Zone, names: &[Name], iterations: usize) -> f64 {
     started.elapsed().as_nanos() as f64 / iterations as f64
 }
 
-/** @brief 흩어진 이름 목록. */
 fn spread_names(origin_text: &str, owner_count: usize) -> Vec<Name> {
     let mut order: Vec<usize> = (0..owner_count).collect();
     let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -149,7 +136,6 @@ fn spread_names(origin_text: &str, owner_count: usize) -> Vec<Name> {
         .collect()
 }
 
-/** @brief 측정할 때 쓸 영역 파일 글. */
 fn zone_text(host_count: usize) -> String {
     let mut text = String::with_capacity(host_count * 36);
     text.push_str("$ORIGIN parsed.test.\n$TTL 300\n@ IN SOA ns hostmaster 1 300 60 3600 60\n@ IN NS ns\nns IN A 192.0.2.53\n");
@@ -159,17 +145,16 @@ fn zone_text(host_count: usize) -> String {
     text
 }
 
-/** @brief 조회 비용과 영역 하나가 차지하는 메모리를 측정한다. */
+/// Measures query cost and the memory one zone takes.
 fn main() {
     let origin = Name::from_str("bench.test").unwrap();
     let allocation_baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(allocation_baseline, Ordering::Relaxed);
-    /*
-     * 픽스처 생성은 타이머 밖에 둔다. 10만 번의 format!과 Name 파싱이 존 구축보다
-     * 비싸서, 함께 측정하면 build= 가 무엇을 측정한 값인지 알 수 없게 된다. 아래 parse 구간도
-     * 같은 방식이다. 반면 보유·최고점 기준선은 픽스처 앞에 그대로 둔다.
-     * 뒤로 옮기면 from_records가 입력 Vec을 해제할 때 보유량이 그만큼 낮게 잡힌다.
-     */
+    // Fixture generation stays outside the timer: 100,000 format! calls and Name parses cost more
+    // than building the zone, so timing them together would leave build= measuring nothing clear.
+    // The parse section below works the same way. The live and peak baselines stay before the
+    // fixture; moving them after would undercount by what from_records frees when it drops its
+    // input Vec.
     let records = zone_records(&origin, 100_000);
     let build_started = Instant::now();
     let zone = Zone::from_records(records).unwrap();

@@ -1,10 +1,5 @@
-/*!
- * @brief DNSCrypt 리스너.
- *
- * @details 같은 주소를 UDP 와 TCP 둘 다로 받는다. 규격은 인증서 조회부터 UDP 로 하고
- *          실패나 절단이면 TCP 로 다시 하라고 하며, 잘린 응답을 본 클라이언트에게도 TCP
- *          재시도를 먼저 시킨다. UDP 만 열면 그 경로가 전부 막힌다.
- */
+//! DNSCrypt listener, on UDP and TCP at the same address. Clients retry over TCP after a failure or
+//! a truncated response, so UDP alone would break them.
 
 use std::io::{self, Read, Write};
 #[cfg(test)]
@@ -27,10 +22,8 @@ use crate::connection_limit::{
 use crate::native::NativeServer;
 use crate::transport_observe;
 
-/** @brief 연결 하나의 입출력 데드라인. */
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/** @brief 질의를 처리해 DNS 응답 와이어를 돌려주는 콜백. */
 fn make_handler(
     handler: Arc<NativeServer>,
 ) -> impl Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>> {
@@ -54,7 +47,7 @@ fn make_handler(
     }
 }
 
-/** @brief 이 주소에 답해도 되는지 묻는 콜백. */
+/// Whether a source address may be answered.
 fn make_gate(handler: Arc<NativeServer>) -> impl Fn(SocketAddr) -> bool {
     move |src: SocketAddr| {
         handler.client_allowed(&RequestCtx {
@@ -68,14 +61,11 @@ fn make_gate(handler: Arc<NativeServer>) -> impl Fn(SocketAddr) -> bool {
     }
 }
 
-/**
- * @brief DNSCrypt 요청을 UDP 로 받아 같은 핸들러로 넘긴다. 다른 전송과 파이프라인을 공유한다.
- *
- * @details 응답은 질의 패킷이 허락하는 크기 안으로 줄인다. 넘치면 Do53 과 같은 사다리로
- *          TC 비트를 설정한 축약을 내보내고, 클라이언트는 규격대로 TCP 로 다시 묻거나
- *          패딩을 늘려 다시 묻는다.
- * @note 인증서 조회는 파이프라인을 타지 않으므로 접근 제어와 속도 제한을 여기서 건다.
- */
+/// Serves DNSCrypt over UDP through the shared pipeline. A response larger than the query packet
+/// allows is truncated with TC set, as Do53 does, and the client retries over TCP or with more
+/// padding.
+///
+/// Certificate lookups bypass the pipeline, so access control and rate limits are applied here.
 pub fn serve(
     handler: Arc<NativeServer>,
     socket: UdpSocket,
@@ -87,18 +77,14 @@ pub fn serve(
     onetdns_dnscrypt::server::serve(provider, socket, h, gate, &shutdown)
 }
 
-/** @brief DNSCrypt TCP 리스너. 사라질 때 연결 스레드를 정리한다. */
+/// Stops the listener and joins its threads when dropped.
 pub struct DnscryptTcpListener {
-    /** @brief 이 리스너가 묶인 주소. */
     addr: SocketAddr,
-    /** @brief 반복을 끝내라는 표시. */
     stop: Arc<AtomicBool>,
-    /** @brief 루프를 실행하는 스레드. */
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for DnscryptTcpListener {
-    /** @brief 종료를 알리고 연결 스레드가 끝나기를 기다린다. */
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         wake_tcp_listener(self.addr);
@@ -108,14 +94,10 @@ impl Drop for DnscryptTcpListener {
     }
 }
 
-/**
- * @brief DNSCrypt 를 TCP 로 받는다.
- *
- * @details 규격은 연결 하나에 거래 하나만 허용한다. 응답을 보내고 나면 양쪽이 연결을
- *          닫으므로 여기서도 한 번 답하고 끝낸다.
- * @warning 길이 접두사를 그대로 믿고 슬롯을 잡으면 아무 숫자나 적어 보낸 쪽이 이 서버의
- *          메모리를 정하게 된다. 상한을 넘으면 읽지 않고 끊는다.
- */
+/// Serves DNSCrypt over TCP, one transaction per connection as the spec requires.
+///
+/// A length prefix over the limit closes the connection unread; allocating what it says would let
+/// any peer choose this server's memory use.
 pub fn serve_tcp(
     addr: SocketAddr,
     handler: Arc<NativeServer>,
@@ -301,11 +283,8 @@ pub fn serve_tcp(
     })
 }
 
-/**
- * @brief 연결 하나를 입출력 데드라인과 종료 신호 아래에 둔다.
- * @param shutdown 서버 전체가 끝나고 있다는 표시.
- * @param stop 이 리스너가 끝나고 있다는 표시.
- */
+/// Puts a connection under the I/O deadline and both stop signals: `shutdown` for the server,
+/// `stop` for this listener.
 fn connection_io(
     stream: PrefixedTcp,
     shutdown: Arc<AtomicBool>,
@@ -316,7 +295,6 @@ fn connection_io(
         .stop_on(stop)
 }
 
-/** @brief 연결 하나에서 거래 하나를 처리한다. */
 fn serve_conn(
     mut stream: DeadlineTcp<PrefixedTcp>,
     peer: SocketAddr,
@@ -358,7 +336,7 @@ mod tests {
     use super::*;
 
     #[test]
-    /** @brief 부분 TCP 프레임이 30초 데드라인까지 리스너 종료를 붙잡지 않는지. */
+    /// A partial frame must not hold shutdown until the I/O deadline.
     fn stalled_tcp_read_observes_listener_stop() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -385,7 +363,7 @@ mod tests {
         drop(client);
     }
 
-    /** @brief 이 접근 제어를 건 DNSCrypt TCP 리스너와, 그 리스너에 보낼 인증서 조회 질의. */
+    /// A listener with this ACL, and a certificate query to send it.
     fn certificate_listener(acl: onetdns_security::IpAcl) -> (DnscryptTcpListener, Vec<u8>) {
         let handler = Arc::new(NativeServer::new(
             Arc::new(onetdns_filter::SharedFilter::from_pointee(
@@ -420,12 +398,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief TCP 리스너가 인증서 조회에 길이 접두사를 붙여 답하고 연결을 닫는지.
-     *
-     * @details 규격은 연결 하나에 거래 하나다. 클라이언트는 먼저 인증서를 받아야 암호화
-     *          질의를 만들 수 있으므로, 이 경로가 막히면 TCP 로 붙는 길이 전부 막힌다.
-     */
+    /// Clients need the certificate before they can send an encrypted query, so without this every
+    /// TCP client fails.
     fn tcp_listener_answers_a_certificate_lookup_and_closes() {
         let (listener, question) = certificate_listener(onetdns_security::IpAcl::allow_all());
         let mut stream = TcpStream::connect(listener.addr).expect("연결");
@@ -459,10 +433,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버리는 주소가 연결해 인증서를 물어도 아무것도 보내지 않고 닫는지.
-     * @details 인증서 응답 하나로도 그 주소에 DNSCrypt 서버가 있다는 것이 드러난다.
-     */
+    /// Even a certificate response shows that a DNSCrypt server is at this address.
     fn tcp_listener_sends_nothing_to_dropped_clients() {
         let (listener, question) = certificate_listener(
             onetdns_security::IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]),
@@ -473,7 +444,7 @@ mod tests {
             .expect("수신 제한 시간");
         let mut framed = (question.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&question);
-        /* 서버가 먼저 닫았으면 보내기부터 실패할 수 있다. 여기서 보는 것은 받은 것이 없는지다. */
+        // The server may already have closed; only what was received matters.
         let _ = stream.write_all(&framed);
         let mut received = Vec::new();
         let _ = stream.read_to_end(&mut received);

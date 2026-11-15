@@ -1,9 +1,6 @@
-/*!
- * @brief 설치 경로와 그 옆에 두는 업데이트 파일.
- *
- * @details 교체에 쓰는 파일은 모두 설치 경로와 같은 디렉터리에 둔다. 같은 파일 시스템 안의
- *          rename 이어야 원자적으로 바뀐다. 파일 이름은 업데이트 계약에 든다.
- */
+//! The install path and the update files beside it. Every file the swap uses lives in the install
+//! path's directory, since only a rename within one file system is atomic. The file names are part
+//! of the update contract.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -14,40 +11,32 @@ use std::time::{Duration, Instant};
 
 use super::record::Record;
 
-/**
- * @brief Linux 감독자가 자식에게 설치 경로를 넘기는 환경 변수.
- * @details 이 변수를 받은 프로세스는 감독자의 자식이다. 업데이트 기록과 시험 실행은 부모가 맡고
- *          자식은 기록을 처리하지 않는다. 자식의 current_exe 는 맞바꾼 뒤에 (deleted) 가 붙으므로
- *          부모가 시작할 때 정한 경로를 받아 쓴다. 부모가 설치 경로를 정하지 못했으면 빈 값을 넘겨
- *          자식이라는 것만 알린다.
- */
+/// Set by the Linux supervisor for its child, so a process that receives it is a supervised child:
+/// the parent handles the update record and the trial, and the child does not. After a swap the
+/// child's current_exe ends in " (deleted)", so it uses the path the parent chose at start.
+///
+/// Empty when the parent could not determine the install path, which still marks the process as a
+/// child.
 pub(crate) const INSTALL_PATH_ENV: &str = "ONETDNS_SUPERVISOR_INSTALL_PATH";
-/** @brief 업데이트 기록을 읽을 때의 상한. 정상 기록은 몇백 바이트다. */
+/// A normal record is a few hundred bytes.
 const MAX_RECORD_BYTES: u64 = 4096;
-/** @brief 잠금을 다시 시도하는 간격. */
 const LOCK_RETRY: Duration = Duration::from_millis(50);
 
-/** @brief 프로세스가 시작할 때 정한 설치 경로. */
 static LOCATED: OnceLock<Located> = OnceLock::new();
 
-/** @brief 시작할 때 정한 설치 경로와, 감독자의 자식인지. */
 struct Located {
-    /** @brief 설치 경로. 정하지 못했으면 그 이유. */
+    /// Err says why it could not be determined.
     install: Result<Install, String>,
-    /** @brief 감독자의 자식인지. */
     supervised: bool,
 }
 
-/**
- * @brief 설치 경로를 정한다. 다른 스레드를 띄우기 전에 main 이 부른다.
- * @details 실행 중인 파일이 나중에 바뀌면 current_exe 가 다른 답을 주므로 시작할 때 한 번만 정한다.
- *          환경 변수를 지우는 일도 다른 스레드가 없을 때 해야 한다.
- */
+/// Called by main before any other thread starts. current_exe answers differently once the running
+/// file is replaced, so the path is fixed once at start; clearing the environment variable also
+/// needs no other threads running.
 pub(crate) fn init() {
     LOCATED.get_or_init(locate);
 }
 
-/** @brief 시작할 때 정한 설치 경로. 정하지 못했으면 그 이유. */
 pub(crate) fn current() -> Result<&'static Install, String> {
     LOCATED
         .get_or_init(locate)
@@ -56,12 +45,11 @@ pub(crate) fn current() -> Result<&'static Install, String> {
         .map_err(Clone::clone)
 }
 
-/** @brief 감독자의 자식인지. 자식은 업데이트 기록을 처리하지 않는다. */
+/// A child does not handle the update record.
 pub(crate) fn supervised_child() -> bool {
     LOCATED.get_or_init(locate).supervised
 }
 
-/** @brief 환경 변수나 current_exe 로 설치 경로를 찾는다. */
 fn locate() -> Located {
     if let Some(path) = std::env::var_os(INSTALL_PATH_ENV) {
         std::env::remove_var(INSTALL_PATH_ENV);
@@ -85,22 +73,16 @@ fn locate() -> Located {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 설치 경로와 그 옆 파일들의 이름. */
 pub(crate) struct Install {
-    /** @brief 설치 경로. */
     path: PathBuf,
-    /** @brief 설치 경로가 든 디렉터리. */
     dir: PathBuf,
-    /** @brief 옆 파일 이름의 앞부분. Windows 는 .exe 를 뗀 이름이다. */
+    /// Prefix of the sibling names; on Windows, the name without .exe.
     stem: OsString,
-    /** @brief 실행 파일 이름 끝에 다시 붙일 확장자. Windows 는 .exe, 그 밖은 비어 있다. */
+    /// Appended back to executable siblings: .exe on Windows, empty elsewhere.
     extension: OsString,
 }
 
-/**
- * @brief 실행 파일 이름에서 옆 파일 이름의 앞부분과 확장자를 가른다.
- * @param windows Windows 이름 규칙을 쓸지. 실행할 파일이 .exe 로 끝나야 실행되는 플랫폼이다.
- */
+/// `windows`: use Windows naming, where a file must end in .exe to run.
 fn split_name(name: &OsStr, windows: bool) -> (OsString, OsString) {
     if windows {
         let text = name.to_string_lossy();
@@ -115,7 +97,8 @@ fn split_name(name: &OsStr, windows: bool) -> (OsString, OsString) {
 }
 
 impl Install {
-    /** @brief 이 경로를 설치 경로로 삼는다. */
+    /// Refuses a Linux path ending in " (deleted)", which points at an executable already swapped
+    /// out.
     pub(crate) fn at(path: PathBuf) -> Result<Self, String> {
         if cfg!(target_os = "linux") && path.to_string_lossy().ends_with(" (deleted)") {
             return Err(
@@ -140,12 +123,11 @@ impl Install {
         })
     }
 
-    /** @brief 설치 경로. */
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    /** @brief 이 이름 뒤에 붙인 옆 파일. 실행 파일이면 확장자를 다시 붙인다. */
+    /// `executable` appends the extension back.
     fn sibling(&self, suffix: &str, executable: bool) -> PathBuf {
         let mut name = self.stem.clone();
         name.push(".");
@@ -156,43 +138,40 @@ impl Install {
         self.dir.join(name)
     }
 
-    /** @brief 내려받아 점검을 기다리는 새 실행 파일. */
+    /// The downloaded new executable, awaiting its checks.
     pub(crate) fn staged(&self) -> PathBuf {
         self.sibling("new", true)
     }
 
-    /** @brief 바로 전 실행 파일. 되돌릴 때 쓴다. */
+    /// For rollback.
     pub(crate) fn previous(&self) -> PathBuf {
         self.sibling("previous", true)
     }
 
-    /** @brief Windows 에서 되돌릴 때 실행 중이던 실패한 실행 파일을 옮겨 두는 곳. */
+    /// Where a Windows rollback moves the running, failed executable.
     pub(crate) fn failed(&self) -> PathBuf {
         self.sibling("failed", true)
     }
 
-    /** @brief 업데이트 기록. */
     pub(crate) fn record_path(&self) -> PathBuf {
         self.sibling("update", false)
     }
 
-    /** @brief 적용과 기록 처리를 한 번에 하나로 묶는 잠금 파일. */
+    /// Serializes applying and record handling.
     fn lock_path(&self) -> PathBuf {
         self.sibling("update.lock", false)
     }
 
-    /** @brief 업데이트가 남긴 파일이 있는지. 없으면 시작할 때 처리할 것이 없다. */
+    /// Without them, startup has nothing to handle.
     pub(crate) fn has_update_files(&self) -> bool {
         [self.record_path(), self.staged(), self.failed()]
             .iter()
             .any(|path| path.exists())
     }
 
-    /**
-     * @brief 잠금을 잡는다. 다른 프로세스가 쥐고 있으면 wait 동안 기다린다.
-     * @details 잠금 파일을 실제로 만들어 보므로, 만들지 못하면 이 프로세스가 설치 디렉터리에 쓸 수
-     *          없다는 뜻이다. 잠금은 프로세스가 죽으면 운영체제가 푼다.
-     */
+    /// Waits up to `wait` while another process holds it. The lock file is really created, so
+    /// failing to create it means this process cannot write the install directory. The OS releases
+    /// the lock when the process dies.
     pub(crate) fn lock(&self, wait: Duration) -> Result<UpdateLock, LockError> {
         let path = self.lock_path();
         let deadline = Instant::now() + wait;
@@ -207,7 +186,8 @@ impl Install {
         }
     }
 
-    /** @brief 기록 파일의 글. 없으면 없다. 글이 UTF-8 이 아니면 빈 글을 돌려 오래된 기록으로 다루게 한다. */
+    /// None when absent. Oversized or non-UTF-8 text reads as empty, which is handled as a stale
+    /// record.
     pub(crate) fn read_record(&self) -> io::Result<Option<String>> {
         let file = match File::open(self.record_path()) {
             Ok(file) => file,
@@ -222,21 +202,17 @@ impl Install {
         Ok(Some(String::from_utf8(bytes).unwrap_or_default()))
     }
 
-    /** @brief 기록을 원자적으로 쓴다. */
     pub(crate) fn write_record(&self, _lock: &UpdateLock, record: &Record) -> io::Result<()> {
         crate::atomic_file::atomic_write(&self.record_path(), record.encode().as_bytes())
     }
 
-    /** @brief 기록을 지운다. 이미 없으면 그대로 성공이다. */
+    /// Succeeds when already absent.
     pub(crate) fn remove_record(&self, _lock: &UpdateLock) -> io::Result<()> {
         remove_if_present(&self.record_path())
     }
 
-    /**
-     * @brief 기록을 쓰기 가능으로 연다.
-     * @details 권한을 내려놓은 뒤에는 설치 디렉터리에 새 파일을 만들 수 없을 수 있다. 시험 실행의
-     *          확정은 이렇게 미리 열어 둔 핸들로 덮어쓴다.
-     */
+    /// After privileges drop, the install directory may not allow new files, so a trial commit
+    /// overwrites through a handle opened in advance.
     pub(crate) fn open_record_for_update(&self, _lock: &UpdateLock) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -244,7 +220,7 @@ impl Install {
             .open(self.record_path())
     }
 
-    /** @brief 지난 적용이 남긴 새 실행 파일과 실패한 실행 파일을 지운다. 진행 중인 적용이 없을 때만 부른다. */
+    /// Only call it while no apply is in progress.
     pub(crate) fn remove_leftovers(&self, _lock: &UpdateLock) {
         for path in [self.staged(), self.failed()] {
             if let Err(error) = remove_if_present(&path) {
@@ -253,13 +229,12 @@ impl Install {
         }
     }
 
-    /**
-     * @brief 새 실행 파일을 .new 에 쓴다.
-     * @details 이전 실행 파일의 소유자, 그룹, 권한 비트를 그대로 준다. 그렇게 할 수 없거나 이전 파일에
-     *          setuid, setgid, 파일 capability 가 붙어 있으면 거절한다. 업데이트가 그런 설치 단계를
-     *          재현할 수 없기 때문이다. Windows 에서는 디렉터리의 상속 ACL 을 받는다.
-     * @return 쓴 파일의 SHA-256.
-     */
+    /// Writes the new executable to .new with the previous executable's owner, group, and mode
+    /// bits. Refuses when that is not possible, or when the previous file has setuid, setgid, or
+    /// file capabilities, since an update cannot reproduce such install steps. On Windows the file
+    /// takes the directory's inherited ACL.
+    ///
+    /// Returns the SHA-256 of the written file.
     pub(crate) fn stage(&self, _lock: &UpdateLock, executable: &[u8]) -> Result<[u8; 32], String> {
         let staged = self.staged();
         let attributes = InstalledAttributes::read(&self.path)?;
@@ -297,12 +272,10 @@ impl Install {
         })
     }
 
-    /**
-     * @brief 설치 경로를 .new 로 맞바꾼다. 실행 중인 프로세스는 이전 이미지를 계속 쓴다.
-     * @details Unix 는 설치 경로를 .previous 로 하드 링크한 뒤 .new 를 설치 경로로 rename 하므로 설치
-     *          경로가 비는 순간이 없다. Windows 는 실행 중인 파일을 지울 수 없지만 이름은 바꿀 수 있어
-     *          두 번 rename 한다. 그 사이에는 설치 경로가 비므로 두 번째가 실패하면 첫 번째를 되돌린다.
-     */
+    /// Running processes keep the old image. Unix hard-links the install path to .previous and
+    /// renames .new over it, so the install path is never missing. Windows cannot delete a running
+    /// file but can rename it, so it renames twice; the install path is missing in between, so a
+    /// failed second rename undoes the first.
     pub(crate) fn swap(&self, _lock: &UpdateLock) -> io::Result<()> {
         let previous = self.previous();
         remove_if_present(&previous)?;
@@ -331,11 +304,8 @@ impl Install {
         }
     }
 
-    /**
-     * @brief .previous 를 설치 경로로 되돌린다.
-     * @param from_sha256 되돌릴 실행 파일의 해시. .previous 가 이것과 다르거나 없으면 되돌리지 않는다.
-     * @details Windows 는 실행 중인 설치 파일을 .failed 로 옮긴 뒤 .previous 를 설치 경로로 옮긴다.
-     */
+    /// Skipped when .previous is missing or its hash is not `from_sha256`. Windows moves the
+    /// running install file to .failed, then .previous to the install path.
     pub(crate) fn restore_previous(
         &self,
         _lock: &UpdateLock,
@@ -381,18 +351,17 @@ impl Install {
         })
     }
 
-    /** @brief .previous 를 .new 로 옮긴다. 운영자가 지시한 되돌리기의 첫 단계다. */
+    /// The first step of an operator-requested rollback.
     pub(crate) fn stage_previous(&self, _lock: &UpdateLock) -> io::Result<()> {
         remove_if_present(&self.staged())?;
         std::fs::rename(self.previous(), self.staged())
     }
 
-    /** @brief .new 를 .previous 로 돌려놓는다. 되돌리기가 사전 점검에서 멈췄을 때 쓴다. */
+    /// For a rollback that stopped at the preflight.
     pub(crate) fn unstage_previous(&self, _lock: &UpdateLock) -> io::Result<()> {
         std::fs::rename(self.staged(), self.previous())
     }
 
-    /** @brief .new 를 지운다. */
     pub(crate) fn discard_staged(&self, _lock: &UpdateLock) {
         let staged = self.staged();
         if let Err(error) = remove_if_present(&staged) {
@@ -401,22 +370,18 @@ impl Install {
     }
 }
 
-/** @brief 잠금을 쥐고 있다는 표시. 떨어뜨리면 잠금이 풀린다. */
+/// Released on drop.
 pub(crate) struct UpdateLock {
-    /** @brief 잠금을 건 파일. */
     _file: File,
 }
 
 #[cfg(unix)]
 impl Drop for UpdateLock {
-    /**
-     * @brief 파일을 닫기 전에 잠금을 푼다.
-     * @details flock 잠금은 같은 열린 파일을 가리키는 핸들이 모두 닫혀야 풀린다. 다른 스레드가
-     *          같은 때 띄운 자식은 exec 하기 전까지 이 핸들을 물려받으므로, 닫기만 하면 그사이
-     *          잠금이 남아 다음 잠금이 다른 업데이트가 진행 중이라고 판단한다. LOCK_UN 은
-     *          물려받은 핸들의 잠금까지 바로 푼다. 실패해도 핸들이 모두 닫히면 풀리므로 결과는
-     *          보지 않는다.
-     */
+    /// Unlocks before closing. A flock lock is released only when every handle to the same open
+    /// file closes, and a child another thread spawns meanwhile inherits this handle until it
+    /// execs. Closing alone would leave the lock held then, and the next lock would think another
+    /// update is running. LOCK_UN releases it at once, inherited handles included; its result is
+    /// ignored, since closing every handle releases it anyway.
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
 
@@ -425,13 +390,11 @@ impl Drop for UpdateLock {
 }
 
 #[derive(Debug)]
-/** @brief 잠금을 잡지 못한 이유. */
 pub(crate) enum LockError {
-    /** @brief 다른 프로세스가 적용 중이거나 시험 실행 중이다. */
+    /// Another process is applying or trialing an update.
     Busy,
-    /** @brief 이 프로세스는 설치 디렉터리에 쓸 수 없다. */
+    /// This process cannot write the install directory.
     Denied(io::Error),
-    /** @brief 그 밖의 입출력 오류. */
     Io(io::Error),
 }
 
@@ -448,7 +411,6 @@ impl std::fmt::Display for LockError {
     }
 }
 
-/** @brief 권한 때문에 실패했는지. */
 fn is_denied(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -457,7 +419,7 @@ fn is_denied(error: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-/** @brief 잠금 파일을 열고 flock 을 한 번 시도한다. 다른 프로세스가 쥐고 있으면 없다. */
+/// Tries flock once; None when another process holds it.
 fn try_lock(path: &Path) -> io::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
@@ -483,11 +445,10 @@ fn try_lock(path: &Path) -> io::Result<Option<File>> {
 }
 
 #[cfg(windows)]
-/** @brief 공유를 허용하지 않고 연다. 다른 프로세스가 열어 두었으면 없다. */
+/// Opens without sharing; None when another process has it open.
 fn try_lock(path: &Path) -> io::Result<Option<File>> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    /** @brief 다른 프로세스가 공유를 막고 열어 둔 파일. */
     const ERROR_SHARING_VIOLATION: i32 = 32;
     match OpenOptions::new()
         .read(true)
@@ -503,7 +464,6 @@ fn try_lock(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/** @brief 있으면 지운다. */
 fn remove_if_present(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
@@ -512,12 +472,11 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-/** @brief 디렉터리 항목의 변경을 디스크에 내린다. 전원이 나가도 rename 이 사라지지 않게 한다. */
+/// So a rename survives a power loss.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/** @brief 파일의 SHA-256. */
 pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
 
@@ -534,12 +493,9 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-/**
- * @brief 기록 핸들을 이 글로 덮어쓴다.
- * @details 권한을 내려놓은 뒤에도 쓸 수 있게 미리 열어 둔 핸들에 쓴다. 쓰는 도중 전원이 나가면
- *          기록이 깨지지만, 깨진 기록은 다음 시작이 오래된 기록으로 지우므로 실행 파일과 어긋나지
- *          않는다.
- */
+/// Writes through the handle opened before privileges dropped. A power loss mid-write breaks the
+/// record, but the next start removes a broken record as stale, so it never disagrees with the
+/// executables.
 pub(crate) fn overwrite(file: &mut File, text: &str) -> io::Result<()> {
     file.rewind()?;
     file.write_all(text.as_bytes())?;
@@ -547,21 +503,18 @@ pub(crate) fn overwrite(file: &mut File, text: &str) -> io::Result<()> {
     file.sync_all()
 }
 
-/** @brief 이전 실행 파일에서 새 파일로 옮길 속성. */
+/// Carried from the previous executable to the new one.
 struct InstalledAttributes {
     #[cfg(unix)]
-    /** @brief 소유자. */
     uid: u32,
     #[cfg(unix)]
-    /** @brief 그룹. */
     gid: u32,
     #[cfg(unix)]
-    /** @brief 권한 비트. */
     mode: u32,
 }
 
 impl InstalledAttributes {
-    /** @brief 설치된 실행 파일의 속성을 읽고, 업데이트가 재현할 수 없는 속성이면 거절한다. */
+    /// Refuses attributes an update cannot reproduce.
     fn read(path: &Path) -> Result<Self, String> {
         let metadata = std::fs::metadata(path).map_err(|error| {
             format!(
@@ -598,7 +551,7 @@ impl InstalledAttributes {
         }
     }
 
-    /** @brief 새 파일에 같은 소유자와 권한을 준다. 소유자를 맞추지 못하면 실패한다. */
+    /// Fails when the owner cannot be set.
     fn apply(&self, file: &File) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -618,7 +571,6 @@ impl InstalledAttributes {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 파일 capability 확장 속성이 붙어 있는지. */
 fn has_file_capabilities(path: &Path) -> Result<bool, String> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -646,13 +598,12 @@ fn has_file_capabilities(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(test)]
-/** @brief 이름 규칙, 잠금, 실제로 실행 중인 파일의 맞바꾸기와 되돌리기. */
 mod tests {
     use super::*;
     use crate::update::scratch::Scratch;
 
     #[test]
-    /** @brief 옆 파일 이름이 계약대로인지. Windows 는 실행할 파일만 .exe 로 끝난다. */
+    /// On Windows, only the executable siblings end in .exe.
     fn sibling_names_follow_the_contract() {
         let dir = PathBuf::from("dir");
         let names = |name: &str, windows: bool| {
@@ -702,7 +653,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 맞바꾼 뒤 지워진 실행 파일을 가리키는 경로는 설치 경로로 받지 않는지. */
     fn deleted_executable_paths_are_refused() {
         let deleted = Install::at(PathBuf::from("/usr/local/bin/OnetDNS (deleted)"));
         assert_eq!(deleted.is_err(), cfg!(target_os = "linux"));
@@ -710,7 +660,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잠금은 한 번에 하나만 쥐고, 놓으면 다음이 잡는지. */
     fn lock_is_exclusive_and_released_on_drop() {
         let scratch = Scratch::new("lock");
         let install = scratch.install();
@@ -725,12 +674,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    /**
-     * @brief 잠금 파일의 핸들이 복제되어 남아 있어도 놓은 잠금이 바로 풀리는지.
-     * @details 다른 스레드가 같은 때 띄운 자식은 exec 하기 전까지 이 핸들을 물려받는다. 그 상황을
-     *          같은 열린 파일을 가리키는 복제 핸들로 재현한다. 파일을 닫기만 하면 복제가 남은 동안
-     *          다음 잠금이 Busy 가 된다.
-     */
+    /// A child another thread spawns meanwhile inherits this handle until it execs; a duplicate
+    /// handle to the same open file reproduces that. Closing the file alone would leave the next
+    /// lock Busy while the duplicate lives.
     fn released_lock_ignores_inherited_handles() {
         let scratch = Scratch::new("lock-inherited");
         let install = scratch.install();
@@ -744,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기록 파일의 상한과 깨진 글. 둘 다 오래된 기록으로 다루도록 빈 글이 된다. */
+    /// Both read as empty, handled as a stale record.
     fn oversized_or_binary_records_read_as_empty() {
         let scratch = Scratch::new("record");
         let install = scratch.install();
@@ -759,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 미리 연 핸들로 덮어쓰면 남은 꼬리 없이 새 글만 남는지. */
+    /// No tail of the old record is left.
     fn overwrite_replaces_the_whole_record() {
         let scratch = Scratch::new("overwrite");
         let path = scratch.0.join("record");
@@ -777,15 +723,12 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 설치 경로에서 실제로 실행 중인 프로세스.
-     * @details 맞바꾸기는 실행 중인 이미지를 대상으로 해야 의미가 있다. Windows 는 실행 중인 파일을
-     *          지울 수 없고, Unix 는 실행 중인 파일에 쓸 수 없다.
-     */
+    /// A process actually running from the install path. The swap only means something against a
+    /// running image: Windows cannot delete a running file, and Unix cannot write one.
     struct Running(std::process::Child);
 
     impl Running {
-        /** @brief 아직 실행 중인지. 끝났으면 맞바꾸기가 실행 중인 파일을 다룬 것이 아니다. */
+        /// If it exited, the swap did not touch a running file.
         fn assert_alive(&mut self) {
             assert!(
                 self.0.try_wait().expect("자식 프로세스 상태").is_none(),
@@ -801,7 +744,7 @@ mod tests {
         }
     }
 
-    /** @brief 이 테스트 바이너리를 설치 경로에 복사하고 기다리기만 하는 테스트 하나를 자식 프로세스로 실행한다. */
+    /// Copies this test binary to the install path and runs, as a child, a test that only waits.
     fn run_copy_of_this_binary(install: &Install) -> Running {
         std::fs::copy(
             std::env::current_exe().expect("테스트 바이너리"),
@@ -818,10 +761,9 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        /*
-         * 다른 테스트 스레드가 같은 때 띄운 자식이 방금 복사한 파일의 쓰기 핸들을 물려받아 쥐고
-         * 있으면 Linux 는 실행을 거부한다. 업데이트가 새 실행 파일을 띄울 때의 재시도를 쓴다.
-         */
+        // Linux refuses to exec while a child another test thread spawned holds an inherited write
+        // handle to the fresh copy, so this uses the retry the update uses to start a new
+        // executable.
         let child = crate::update::apply::spawn(&mut command).expect("설치 경로의 실행");
         std::thread::sleep(Duration::from_millis(300));
         Running(child)
@@ -829,22 +771,16 @@ mod tests {
 
     #[test]
     #[ignore = "맞바꾸기 테스트가 자식 프로세스로 실행한다"]
-    /**
-     * @brief 맞바꾸기 테스트가 설치 경로에서 실행하는 자식 프로세스.
-     * @details 부모 테스트가 표준 입력 파이프를 닫을 때까지 끝나지 않는다. 정해 둔 시간만 자면, 큰
-     *          테스트 바이너리를 여러 번 해시하느라 부모 테스트가 그보다 오래 걸리는 환경에서 먼저
-     *          끝나 버린다. 부모 테스트가 비정상으로 끝나도 운영체제가 파이프를 닫으므로 남지 않는다.
-     */
+    /// Does not end until the parent test closes stdin. A fixed sleep could end first where the
+    /// parent takes longer, hashing a large test binary several times. The OS closes the pipe if
+    /// the parent dies, so nothing is left behind.
     fn waits_while_a_test_swaps_its_executable() {
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
     }
 
     #[test]
-    /**
-     * @brief 실행 중인 실행 파일을 맞바꾸고 되돌리는지.
-     * @details 맞바꾼 뒤 설치 경로는 새 파일이고 .previous 는 이전 파일이다. 되돌린 뒤에는 설치 경로가
-     *          다시 이전 파일이다. .previous 가 바뀐 파일이면 되돌리지 않는다.
-     */
+    /// After the swap, the install path holds the new file and .previous the old one; after the
+    /// revert, the install path holds the old file again. A changed .previous is not restored.
     fn running_executable_swaps_and_reverts() {
         let scratch = Scratch::new("swap");
         let install = scratch.install();
@@ -875,7 +811,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    /** @brief 새 파일이 이전 파일의 권한 비트를 받고, setuid 가 붙은 설치는 거절하는지. */
     fn staged_file_keeps_mode_and_refuses_setuid() {
         use std::os::unix::fs::PermissionsExt;
 

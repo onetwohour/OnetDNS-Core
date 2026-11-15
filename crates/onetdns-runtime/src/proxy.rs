@@ -1,42 +1,33 @@
-/*!
- * @brief PROXY 프로토콜 v1/v2 헤더 파서.
- *
- * @details 로드밸런서 뒤에서 원래 클라이언트 주소를 복원한다.
- * @warning 이 헤더는 신뢰할 수 있는 출발지에서만 받아들여야 한다. 아무에게나 허용하면
- *          누구나 출발지 주소를 위조해 ACL과 속도 제한을 전부 우회한다. 신뢰 판정은
- *          호출자(TCP 워커)가 하며, 이 파서는 형식만 본다.
- */
+//! PROXY protocol v1 and v2 header parser that restores the original client address behind a load
+//! balancer.
+//!
+//! Accept the header only from trusted sources: allowed from anyone, it lets anyone forge the
+//! source address and bypass the ACL and rate limiting. The caller (the TCP worker) decides trust;
+//! this parser checks only the format.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/**
- * @brief PROXY v2 고정 서명.
- * @details 일반 DNS와 겹치지 않도록 고안된 값이라, 이 12바이트로 v2 여부를 확정할 수 있다.
- */
+/// Designed not to overlap with DNS, so these 12 bytes settle whether the header is v2.
 const V2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
-/** @brief 헤더 파싱 결과. */
 pub enum ProxyParse {
-    /** @brief 원래 클라이언트 주소와 헤더가 차지한 바이트 수. */
+    /// Original client address and the header length.
     Addr(SocketAddr, usize),
 
-    /** @brief 프록시 자신의 연결(헬스체크 등). 주소를 바꾸지 않고 헤더만 건너뛴다. */
+    /// The proxy's own connection, such as a health check: skip the header and keep the address.
     Local(usize),
 
-    /** @brief 아직 헤더가 다 오지 않았다. 더 읽고 다시 부른다. */
+    /// Read more and call again.
     Incomplete,
 
-    /** @brief 프록시 헤더가 아니다. 처음부터 DNS 데이터로 취급한다. */
+    /// Treat everything as DNS data.
     NotProxy,
 }
 
-/**
- * @brief 버퍼 앞부분을 PROXY 헤더로 해석한다.
- * @details 두 버전의 서명을 먼저 보고, 어느 쪽도 확정할 수 없을 만큼 짧으면 Incomplete를
- *          돌려준다. 짧다는 이유로 NotProxy로 판정하면 헤더가 DNS 데이터로 오인된다.
- */
+/// Returns `Incomplete` when the buffer is too short to tell either signature; calling that
+/// `NotProxy` would read the header as DNS data.
 pub fn parse(buf: &[u8]) -> ProxyParse {
     if buf.len() >= 12 && buf[..12] == V2_SIG {
         return parse_v2(buf);
@@ -55,13 +46,10 @@ pub fn parse(buf: &[u8]) -> ProxyParse {
     ProxyParse::NotProxy
 }
 
-/**
- * @brief v1 텍스트 헤더를 해석한다.
- * @details 규격상 최대 107바이트다. 그 안에 \r\n이 없으면 헤더가 아니라고 확정한다.
- *          그러지 않으면 종결자를 안 보내는 연결이 버퍼를 무한정 키운다.
- * @note 프로토콜 표기와 주소 계열이 어긋나면 거부한다. TCP4에 IPv6를 담은 헤더를
- *       받아들이면 주소 해석이 구현마다 갈린다.
- */
+/// At most 107 bytes by the specification; without a CRLF inside that, it is not a header.
+/// Otherwise a connection that never sends the terminator would grow the buffer without bound. A
+/// protocol and address family that disagree are rejected: accepting IPv6 in a TCP4 header leaves
+/// address parsing to differ by implementation.
 fn parse_v1(buf: &[u8]) -> ProxyParse {
     let end = match buf.windows(2).position(|w| w == b"\r\n") {
         Some(p) => p,
@@ -111,13 +99,9 @@ fn parse_v1(buf: &[u8]) -> ProxyParse {
     ProxyParse::Addr(SocketAddr::new(src, sport), consumed)
 }
 
-/**
- * @brief v2 이진 헤더를 해석한다.
- * @details 길이 필드로 뒤따르는 주소 블록 크기를 알 수 있다. 선언된 길이만큼 다 오지
- *          않았으면 Incomplete다.
- * @note TCP over IPv4(0x11)와 IPv6(0x21)만 받는다. UDP나 유닉스 소켓 계열은 이 서버가
- *       PROXY로 받을 일이 없으므로 거부한다.
- */
+/// The length field gives the size of the address block; until that much has arrived it is
+/// `Incomplete`. Only TCP over IPv4 (0x11) and IPv6 (0x21) are accepted; this server never receives
+/// UDP or Unix socket families over PROXY.
 fn parse_v2(buf: &[u8]) -> ProxyParse {
     if buf.len() < 16 {
         return ProxyParse::Incomplete;
@@ -168,11 +152,9 @@ fn parse_v2(buf: &[u8]) -> ProxyParse {
 }
 
 #[cfg(test)]
-/** @brief 두 프로토콜 버전의 읽기와, 평범한 질의를 잘못 읽지 않는지. */
 mod tests {
     use super::*;
 
-    /** @brief 읽어 낸 주소와 소비한 길이. */
     fn addr(p: ProxyParse) -> (SocketAddr, usize) {
         match p {
             ProxyParse::Addr(a, n) => (a, n),
@@ -181,7 +163,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief v1 IPv4 헤더. */
     fn v1_tcp4() {
         let line = b"PROXY TCP4 192.168.0.1 10.0.0.1 56324 443\r\nDNSDATA";
         let (a, n) = addr(parse(line));
@@ -190,7 +171,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief v1 IPv6와 모르는 형식. */
     fn v1_tcp6_and_unknown() {
         let line = b"PROXY TCP6 2001:db8::1 2001:db8::2 1234 53\r\n";
         let (a, _) = addr(parse(line));
@@ -203,7 +183,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 나눠 온 헤더가 이어지는지. */
     fn v1_incomplete_then_complete() {
         assert!(matches!(parse(b"PRO"), ProxyParse::Incomplete));
         assert!(matches!(
@@ -213,7 +192,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief v2 IPv4 헤더. */
     fn v2_ipv4() {
         let mut h = V2_SIG.to_vec();
         h.push(0x21);
@@ -230,7 +208,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief v2의 자기 자신 표기. */
     fn v2_local_command() {
         let mut h = V2_SIG.to_vec();
         h.push(0x20);
@@ -243,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 평범한 질의를 헤더로 오해하지 않는지. 오해하면 앞부분을 먹어 치운다. */
+    /// Misreading it would eat the start of the query.
     fn not_proxy_plain_dns() {
         assert!(matches!(
             parse(&[0x00, 0x1d, 0xab, 0xcd]),

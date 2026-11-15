@@ -1,6 +1,4 @@
-/*!
- * @brief 캐시에 없는 UDP 질의를 스레드별 reactor lane에서 비동기로 처리한다.
- */
+//! Resolves uncached UDP queries asynchronously on per-thread reactor lanes.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,58 +18,44 @@ use crate::native::{
 };
 
 #[cfg(unix)]
-/**
- * @brief 레인 하나가 동시에 들고 있을 대기 클라이언트 수 상한.
- * @details 대기 클라이언트는 원본 패킷과 파싱한 질의를 함께 쥐므로, 상한이 없으면 느린 이름에
- *          질의가 몰릴 때 메모리가 끝없이 는다. 슬롯 리더와 follower 와 대체 대기가 모두 이 맵에
- *          들어오므로, 이 한 수로 셋을 함께 막는다. 넘치면 그 질의는 동기 경로로 돌린다.
- */
+/// Cap on waiting clients per lane. Each one holds the raw packet and the parsed query, so without
+/// a cap, queries piling up on a slow name would grow memory without bound. Slot leaders,
+/// followers, and fallback waits all live in this map, so this one number bounds all three. Past
+/// it, queries take the synchronous path.
 pub(crate) const MAX_LANE_PENDING: usize = 1024;
 
 #[cfg(unix)]
-/**
- * @brief 대체 처리에 쌓아 둘 작업 수 상한.
- * @details 가득 차면 리액터 스레드가 그 자리에서 동기로 푼다. 무제한 채널은 대체 워커가 느릴 때
- *          작업이 끝없이 쌓여 메모리를 먹는다.
- */
+/// Cap on queued fallback jobs. When full, the reactor thread resolves the query itself; an
+/// unbounded channel would let jobs pile up while the fallback worker is slow.
 pub(crate) const MAX_FALLBACK_QUEUE: usize = 256;
 
 #[cfg(unix)]
-/** @brief 이 스레드의 레인 상태. */
 pub(crate) struct LaneState {
-    /** @brief 이 상태 기계가 시작할 때 잡은 캐시·재귀 리졸버 세대. */
+    /// The cache and recursion generation taken when this lane started.
     pub(crate) runtime: Arc<LaneRuntime>,
-    /** @brief 재귀를 돌리는 상태 기계. */
     pub(crate) reactor: onetdns_recurse::reactor::Reactor,
-    /** @brief 답을 기다리는 클라이언트들. */
     pub(crate) clients: std::collections::HashMap<u64, LaneClient>,
-    /** @brief 다음에 줄 질의 번호. */
     pub(crate) next: u64,
 
-    /** @brief 레인이 끝내지 못한 것을 마저 푸는 곳. */
     fallback: LaneFallback,
 }
 
 #[cfg(unix)]
-/** @brief 레인이 끝내지 못한 것을 보통 체인으로 마저 푸는 곳. 안 그러면 그 질의만 답을 못 받는다. */
+/// Finishes on the normal chain what the lane could not; otherwise that query alone would get no
+/// answer.
 struct LaneFallback {
-    /** @brief 마저 풀 일을 맡기는 곳. 큐가 유한해 가득 차면 맡기지 못한다. */
+    /// Bounded; submission fails when full.
     jobs: std::sync::mpsc::SyncSender<(u64, Message, ClientInfo)>,
-    /**
-     * @brief 마저 푼 결과들.
-     * @details 실패도 종류를 담아 돌려준다. 없음으로 접으면 영구 실패까지 전송 실패로 보여
-     *          클라이언트가 잘못된 사유를 받는다.
-     */
+    /// Failures keep their kind. Collapsing them to None would report permanent failures as
+    /// transport failures, and the client would get the wrong reason.
     done: LaneFallbackResults,
 }
 
 #[cfg(unix)]
-/** @brief 대체 처리가 끝낸 질의 번호와 그 결과. */
 type LaneFallbackResults = Arc<std::sync::Mutex<Vec<(u64, Result<Message, ResolveFailure>)>>>;
 
 #[cfg(unix)]
 impl LaneFallback {
-    /** @brief 체인을 잡고 워커를 시작한다. */
     fn new(chain: Arc<dyn Resolver>) -> Self {
         let (jobs, rx) =
             std::sync::mpsc::sync_channel::<(u64, Message, ClientInfo)>(MAX_FALLBACK_QUEUE);
@@ -99,7 +83,6 @@ impl LaneFallback {
         Self { jobs, done }
     }
 
-    /** @brief 마저 푼 것들을 가져간다. */
     fn take_done(&self) -> Vec<(u64, Result<Message, ResolveFailure>)> {
         let mut slot = self.done.lock_recover();
         if slot.is_empty() {
@@ -110,7 +93,6 @@ impl LaneFallback {
 }
 
 #[cfg(unix)]
-/** @brief 체인으로 해석한다. */
 fn chain_resolve(
     chain: &Arc<dyn Resolver>,
     request: &Message,
@@ -123,33 +105,25 @@ fn chain_resolve(
 }
 
 #[cfg(unix)]
-/** @brief 레인에 맡긴 질의 하나와 그것을 보낸 클라이언트. */
 pub(crate) struct LaneClient {
-    /** @brief 이 질의를 보낸 곳. */
     pub(crate) src: std::net::SocketAddr,
 
-    /** @brief 받은 그대로의 바이트. */
     pub(crate) raw: Vec<u8>,
-    /** @brief 읽어 낸 질의. */
     pub(crate) request: Message,
-    /** @brief 알아본 클라이언트. */
     pub(crate) client: ClientInfo,
 
-    /** @brief 레인에 맡긴 시각. */
     pub(crate) submitted: std::time::Instant,
-    /** @brief 맡기기 전에 잡은 캐시 세대. 이 질의의 답과 실패는 이 세대로만 담긴다. */
+    /// Taken before submission; this query's answer and failure are stored under this generation
+    /// only.
     pub(crate) epoch: crate::cache::CacheEpoch,
-    /**
-     * @brief 맡길 때 읽은 기능 세트.
-     * @details 끝낸 답을 다듬고 wire 항목으로 담는 판단도 이 세트로 한다. 그사이 교체된 세트로
-     *          하면 이전 조건으로 고른 답에 새 세대의 태그가 붙어, 그 조건이 바뀐 뒤에도 나간다.
-     */
+    /// Read at submission, and used again to shape the finished answer and store it as a wire
+    /// entry. A set swapped in meanwhile would tag an answer chosen under the old conditions with
+    /// the new generation, and it would keep going out after those conditions changed.
     pub(crate) features: Arc<NativeFeatures>,
 }
 
 #[cfg(unix)]
 impl LaneState {
-    /** @brief 이 스레드의 레인을 연다. 마저 풀 곳도 함께 만든다. */
     pub(crate) fn new(chain: Arc<dyn Resolver>, runtime: Arc<LaneRuntime>) -> Self {
         Self {
             runtime,
@@ -165,13 +139,11 @@ impl LaneState {
 
 #[cfg(unix)]
 thread_local! {
-    /** @brief 이 스레드의 레인. 스레드마다 따로 둔다. */
     pub(crate) static LANE: std::cell::RefCell<Option<LaneState>> = const { std::cell::RefCell::new(None) };
 }
 
 impl NativeServer {
     #[cfg(unix)]
-    /** @brief 마저 푼 것들을 거둬 내보낸다. */
     pub(crate) fn lane_drain_fallback(
         &self,
         st: &mut LaneState,
@@ -199,10 +171,7 @@ impl NativeServer {
     }
 
     #[cfg(unix)]
-    /**
-     * @brief 레인이나 대체 처리가 풀지 못한 질의에 실패 응답을 보낸다.
-     * @param failure 실패 종류. 클라이언트에 붙일 확장 오류 코드가 여기서 정해진다.
-     */
+    /// `failure` decides the extended DNS error sent to the client.
     fn lane_fail(
         &self,
         cl: LaneClient,
@@ -242,7 +211,6 @@ impl NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 레인이 끝낸 질의의 응답을 마무리한다. */
     pub(crate) fn lane_finish(
         &self,
         st: &mut LaneState,
@@ -270,7 +238,8 @@ impl NativeServer {
                         runtime.recursor.as_ref(),
                         cl.request.questions.first(),
                     ) {
-                        /* 동기 경로와 같은 규칙으로, 답을 받지 못한 해석은 뒤에서 마저 돌린다. */
+                        // As on the synchronous path, a resolution that ran out of time keeps going
+                        // in the background.
                         recursor.complete_in_background(
                             q.name.clone(),
                             q.qtype,
@@ -295,10 +264,8 @@ impl NativeServer {
             let mut resp = match lane_answer {
                 Some(mut resp) => {
                     onetdns_forward::clear_response_source();
-                    /*
-                     * 레인은 체인을 거치지 않으므로 여기서 걷어낸다. 캐시
-                     * 키에 DO가 들어 있어 두 모양이 섞이지는 않는다.
-                     */
+                    // The lane skips the chain, so DNSSEC records are stripped here. DO is part of
+                    // the cache key, so the two shapes never mix.
                     strip_dnssec_unless_requested(req, &mut resp);
                     resp
                 }
@@ -412,13 +379,9 @@ impl NativeServer {
 }
 
 #[cfg(unix)]
-/**
- * @brief 리액터의 대체 처리 경로가 막혔음을 알린다.
- * @details 이 경로가 막히면 리액터가 풀지 못한 질의를 그 자리에서 동기로 풀어, 수신
- *          루프가 그동안 멈춘다. 질의마다 호출되는 경로라 2의 거듭제곱 번째만 남긴다.
- */
+/// With the fallback path blocked, the reactor resolves queries itself and the receive loop stalls
+/// meanwhile. Called per query, so only powers of two are logged.
 fn reactor_fallback_unavailable() {
-    /** @brief 누적 횟수. */
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -426,22 +389,16 @@ fn reactor_fallback_unavailable() {
     }
 }
 
-/**
- * @brief 리액터 경로 응답의 OPT를 이 서버의 값으로 바꾼다.
- *
- * @details 동기 경로에서는 finalize가 하는 일이다. 이 경로는 그것을 거치지 않아, 두지 않으면
- *          재귀가 업스트림 권한 서버에서 담아 온 OPT가 그대로 나간다. 이 서버가 광고한 적 없는
- *          버퍼 크기와 남의 DO 비트다. RFC 6891은 요청에 OPT가 있을 때만 응답에 넣게
- *          하고, RFC 3225는 DO를 질의에서 복사하게 한다. base_edns가 그 둘을 지킨다.
- * @note 리액터 경로가 unix 에만 있으므로 이 함수도 그렇다. 붙이지 않으면 다른 platform 에서
- *       호출하는 곳이 없어 죽은 코드가 된다.
- */
+/// Replaces the OPT in reactor-path responses with this server's. finalize does this on the
+/// synchronous path; this path skips it, and recursion would otherwise pass on the upstream
+/// authority's OPT, with a buffer size this server never advertised and someone else's DO bit. RFC
+/// 6891 allows OPT in a response only when the request had one, and RFC 3225 copies DO from the
+/// query; base_edns follows both.
 #[cfg(unix)]
 pub(crate) fn reactor_response_edns(f: &NativeFeatures, msg: &mut Message, request: &Message) {
-    /*
-     * 이 서버가 붙인 확장 오류는 살린다. 재귀는 bogus 판정의 사유를 이 옵션으로 담아 오고,
-     * 동기 경로도 같은 사유를 담아 내보내므로 여기서 지우면 두 경로의 답이 갈린다.
-     */
+    // Extended errors this server added stay. Recursion carries the reason for a bogus verdict in
+    // this option, and the synchronous path sends the same reason; dropping it here would make the
+    // two paths answer differently.
     let carried: Vec<(u16, Vec<u8>)> = msg
         .opt()
         .and_then(Edns::from_record)
@@ -465,7 +422,6 @@ pub(crate) fn reactor_response_edns(f: &NativeFeatures, msg: &mut Message, reque
 }
 
 #[cfg(test)]
-/** @brief reactor lane의 실패 처리와 응답. */
 mod tests {
     use super::*;
     use onetdns_proto::{Edns, Message, Name as ApName, RecordType as ApRt};
@@ -473,20 +429,13 @@ mod tests {
     use crate::native::NativeFeatures;
 
     #[test]
-    /**
-     * @brief 리액터 경로가 업스트림의 OPT를 그대로 흘리지 않는지.
-     * @details 재귀는 업스트림 권한 서버의 OPT를 응답에 담아 온다. 이 경로는 finalize를 거치지
-     *          않으므로 여기서 걷지 않으면 이 서버가 광고한 적 없는 버퍼 크기와 남의 DO 비트가
-     *          나간다. RFC 6891은 요청에 OPT가 있을 때만 응답에 넣게 하고, RFC 3225는
-     *          DO를 질의에서 복사하게 한다.
-     */
     #[cfg(unix)]
     fn the_reactor_path_never_forwards_an_upstream_opt() {
         let features = NativeFeatures {
             edns_buffer: 1232,
             ..NativeFeatures::default()
         };
-        /* 업스트림이 자기 값으로 광고한 OPT. 이 서버의 값(1232)과 다르고 DO도 서 있다. */
+        // The upstream's own values: not this server's 1232, and DO set.
         let upstream_opt = Edns {
             udp_payload: 4096,
             dnssec_ok: true,

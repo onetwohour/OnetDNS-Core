@@ -1,10 +1,5 @@
-/*!
- * @brief DoQ 리스너.
- *
- * @details QUIC 스트림 하나에 질의 하나가 오간다. 연결을 받고 유지하는 일은
- *          quic_listener 가 맡고, 여기서는 받은 질의를 검사해 워커에 맡기는 일과 응답을
- *          스트림에 싣는 일만 한다.
- */
+//! DoQ listener: one query per QUIC stream. quic_listener accepts and keeps connections; this
+//! checks queries, hands them to workers, and writes responses to streams.
 
 use std::io;
 use std::net::SocketAddr;
@@ -22,7 +17,6 @@ use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
 
-/** @brief 리스너를 열고 연결을 받는다. */
 pub fn serve_doq(
     addr: SocketAddr,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
@@ -33,16 +27,9 @@ pub fn serve_doq(
     quic_listener::serve(Doq, addr, tls, handler, shutdown, memory_budget)
 }
 
-/**
- * @brief 이 질의가 DoQ에서 연결을 끊어야 하는 프로토콜 오류인지.
- *
- * @details RFC 9250은 QUIC 위의 DNS Message ID를 0으로 규정한다. 질의와 응답은
- *          스트림으로 짝지어지므로 ID 필드가 필요 없기 때문이다. 같은 RFC가 0이 아닌 ID와
- *          edns-tcp-keepalive 옵션을 각각 치명적 오류로 열거한다. 후자는 TCP 전용이라
- *          QUIC 연결 관리와 뜻이 겹치고 어긋난다. 치명적 오류는 DOQ_PROTOCOL_ERROR 를 담은
- *          CONNECTION_CLOSE 로 알린다.
- * @return 끊어야 하면 그 까닭, 정상이면 None.
- */
+/// The reason to close the connection with DOQ_PROTOCOL_ERROR, or None. RFC 9250 makes a non-zero
+/// message ID and the edns-tcp-keepalive option fatal: streams already pair queries with responses,
+/// and keepalive belongs to TCP and conflicts with QUIC's own connection management.
 fn doq_protocol_error(req: &Message) -> Option<&'static str> {
     if req.header.id != 0 {
         return Some("DNS message ID over QUIC must be zero");
@@ -57,7 +44,6 @@ fn doq_protocol_error(req: &Message) -> Option<&'static str> {
     None
 }
 
-/** @brief DoQ 의 질의 검사와 응답. */
 pub(crate) struct Doq;
 
 impl QuicService for Doq {
@@ -124,10 +110,7 @@ impl QuicService for Doq {
         mut wire: Vec<u8>,
         _max_age: u32,
     ) -> Result<(), QuicError> {
-        /*
-         * RFC 9250 에서 QUIC 위로 나가는 DNS 메시지의 ID 는 0 이어야 한다. 받는 쪽에서 0 이 아닌
-         * 질의를 이미 끊지만, 내보내는 곳에서도 강제해 어떤 경로로도 새지 않게 한다.
-         */
+        // Forced on send too, so no path can send a non-zero ID.
         if let Some(id) = wire.get_mut(..2) {
             id.fill(0);
         }
@@ -145,7 +128,6 @@ impl QuicService for Doq {
 }
 
 #[cfg(test)]
-/** @brief 종료, 재전송, 프로토콜 오류 판정, 그리고 실제 QUIC 위 질의 왕복. */
 mod tests {
     use super::*;
     use std::net::UdpSocket;
@@ -164,7 +146,6 @@ mod tests {
     use crate::native::NativeBackend;
     use crate::quic_listener::random_cid;
 
-    /** @brief 고정 응답을 내는 테스트용 업스트림. */
     fn mock_upstream() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -191,12 +172,10 @@ mod tests {
         addr
     }
 
-    /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
         native_handler_with(IpAcl::allow_all())
     }
 
-    /** @brief 이 접근 제어를 건 테스트용 질의 핸들러. */
     fn native_handler_with(acl: IpAcl) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
@@ -211,7 +190,6 @@ mod tests {
         ))
     }
 
-    /** @brief 테스트용 자체 서명 설정. */
     fn self_signed_doq() -> Arc<ServerConfig> {
         let (certs, key) = onetdns_transport::self_signed_material("dns.test").unwrap();
         let cert_der = certs[0].clone();
@@ -222,13 +200,11 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /** @brief 테스트 하나가 쓰는 독립 QUIC 전역 예산. */
     fn memory_budget() -> Arc<QuicMemoryBudget> {
         Arc::new(QuicMemoryBudget::default())
     }
 
     #[test]
-    /** @brief 종료 때 반복이 정리되는지. */
     fn dropping_doq_listener_joins_event_loop() {
         let listener = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -243,15 +219,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /** @brief QUIC로 질의를 보내고 답을 받는다. */
     fn doq_query(server: SocketAddr, name: &str, qtype: RecordType) -> Message {
         doq_query_with_blackout(server, name, qtype, Duration::ZERO, random_cid())
     }
 
-    /**
-     * @brief 패킷이 잠시 끊기는 상황을 만들어 질의를 보낸다.
-     * @param client_cid 클라이언트가 쓸 연결 식별자. 길이 0이어도 된다.
-     */
+    /// Loses packets for `blackout` after sending the query. `client_cid` may be zero-length.
     fn doq_query_with_blackout(
         server: SocketAddr,
         name: &str,
@@ -260,11 +232,9 @@ mod tests {
         client_cid: Vec<u8>,
     ) -> Message {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        /*
-         * 블랙아웃 시험은 질의 뒤 클라이언트 타이머를 멈추므로 잃은 데이터그램을 되찾지 못한다.
-         * 소켓 수신 한도에 기대면 윈도우에서 한도에 걸리는 순간 도착한 응답이 사라져 서버
-         * 재전송과 무관하게 실패한다.
-         */
+        // The blackout test stops the client's timers, so a lost datagram is never recovered. A
+        // socket receive timeout on Windows can drop a response that arrives as it fires, failing
+        // the test whatever the server does.
         let wait = RecvWait::new(Duration::from_millis(50));
         wait.install(&sock).unwrap();
         let cfg = ClientConfig {
@@ -291,22 +261,17 @@ mod tests {
         let mut asked = false;
         let mut blackout_started = None;
         let mut b = [0u8; 2048];
-        /*
-         * 반복 횟수가 아니라 시각으로 끝낸다. 한 바퀴마다 데이터그램 하나를 받거나 50밀리초를
-         * 기다리므로, 횟수로 세면 전체 시험을 병렬로 돌리는 CI 러너에서 서버 스레드가 몇 초
-         * 밀렸을 때 응답보다 한도가 먼저 끝난다. 이 한도는 응답이 아예 오지 않는 경우를
-         * 잡으려는 것이지 지연 요구가 아니다.
-         */
+        // A deadline, not an iteration count: each pass takes one datagram or 50 ms, and on a busy
+        // CI runner a server thread a few seconds late would outlast a count. It catches a response
+        // that never comes; it is not a latency requirement.
         let clock = Instant::now();
         let deadline = clock + Duration::from_secs(15);
         while Instant::now() < deadline {
-            /*
-             * 연결 상태 기계는 시계를 직접 읽지 않으므로 시각을 넘기고 재전송 타이머를 돌린다.
-             * 돌리지 않으면 클라이언트가 보낸 데이터그램 하나가 사라졌을 때 다시 보내지 않아
-             * 응답을 끝내 받지 못한다. 블랙아웃 시험은 질의를 보낸 뒤 타이머를 멈춘다.
-             * 클라이언트가 프로브를 계속 보내면 서버가 그 ACK 로 응답 손실을 알아채 다시
-             * 보낼 수 있어, 서버가 스스로 재전송하는지 증명하지 못한다.
-             */
+            // The connection never reads a clock, so time is passed in and retransmission timers
+            // run; otherwise one lost client datagram would never be resent. The blackout test
+            // stops the timers after the query: client probes would let the server learn of the
+            // loss from their ACKs, and the test would no longer show that the server retransmits
+            // on its own.
             let now_ms = clock.elapsed().as_millis() as u64;
             client.set_now(now_ms);
             if blackout.is_zero() || !asked {
@@ -342,7 +307,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용된 이름이 해석되는지. */
     fn doq_allowed_query_resolves_over_self_quic() {
         let l = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -361,10 +325,7 @@ mod tests {
         }
     }
 
-    /**
-     * @brief 이 접근 제어를 건 DoQ 리스너에 첫 패킷을 보내고 무엇이든 돌아오는지 본다.
-     * @param wait 답을 기다릴 시간.
-     */
+    /// Whether anything at all comes back to a first packet within `wait`.
     fn first_packet_answered(acl: IpAcl, wait: Duration) -> bool {
         let listener = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -402,11 +363,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버리는 주소의 첫 패킷에는 DoQ 리스너가 Retry 도 보내지 않는지.
-     * @details 리스너는 데이터그램마다 질의 처리기에 버릴 주소인지 묻는다. 그 연결이 빠지면
-     *          버리는 주소도 Retry 를 받아 서버가 있다는 것을 알게 된다.
-     */
+    /// Not even a Retry. The listener asks the query handler about every datagram; without that, a
+    /// dropped address would get a Retry and learn a server is there.
     fn doq_listener_sends_nothing_to_dropped_clients() {
         assert!(
             first_packet_answered(IpAcl::allow_all(), Duration::from_secs(5)),
@@ -422,11 +380,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 리스너가 핸드셰이크를 거부하면 그 까닭이 클라이언트에 닿는지.
-     * @details 연결이 쌓아 둔 종료 프레임을 리스너가 보내지 않으면 클라이언트는 자기 유휴
-     *          데드라인까지 기다린다.
-     */
+    /// If the listener does not send the close frame the connection queued, the client waits until
+    /// its idle deadline.
     fn rejected_handshake_reaches_the_client() {
         let mut tls = (*self_signed_doq()).clone();
         tls.client_ca = Some(onetdns_tls::TrustStore::from_ders([
@@ -488,12 +443,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 리스너를 멈추면 열린 연결의 클라이언트가 종료를 통보받는지.
-     * @details 알리지 않으면 클라이언트는 자기 유휴 데드라인까지 끊긴 연결을 붙들고 있다.
-     *          서버가 핸드셰이크를 마친 것을 질의 하나로 확인한 뒤 멈춰야 종료가 응용 계층
-     *          종료로 나간다.
-     */
+    /// Otherwise clients hold dead connections until their idle deadline. One query first confirms
+    /// the handshake finished, so the close goes out as an application close.
     fn stopping_the_listener_notifies_open_connections() {
         let listener = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -560,10 +511,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief RFC 9250이 열거한 두 프로토콜 오류를 가려내는지.
-     * @details 0이 아닌 ID와 edns-tcp-keepalive다. 둘 다 연결을 끊어야 하므로 답이 없다.
-     */
+    /// Both close the connection, so neither gets an answer.
     fn doq_protocol_errors_are_recognized() {
         let ok = Message::query(0, ApName::from_str("allowed.test").unwrap(), RecordType::A);
         assert!(doq_protocol_error(&ok).is_none(), "정상 질의는 통과한다");
@@ -587,7 +535,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 차단된 이름이 막히는지. */
     fn doq_blocked_query_returns_nxdomain_over_self_quic() {
         let l = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -603,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트가 조용해도 서버가 스스로 재전송하는지. 안 하면 잃은 응답이 영영 안 간다. */
+    /// Otherwise a lost response is never sent.
     fn doq_server_pto_retransmits_without_new_client_packets() {
         let l = serve_doq(
             "127.0.0.1:0".parse().unwrap(),
@@ -625,11 +572,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 길이 0인 연결 식별자를 쓰는 클라이언트의 질의에 답하는지.
-     * @details msquic 을 쓰는 클라이언트가 이렇게 연결한다. 리스너가 그 Initial 을 받아들이지
-     *          않으면 핸드셰이크가 시간 초과로 끝난다.
-     */
+    /// msquic clients connect this way; rejecting their Initial times out the handshake.
     fn doq_answers_client_with_zero_length_connection_id() {
         let l = serve_doq(
             "127.0.0.1:0".parse().unwrap(),

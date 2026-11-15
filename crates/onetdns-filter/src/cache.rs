@@ -1,13 +1,8 @@
-/*!
- * @brief 컴파일된 필터 집합을 디스크에 담고 되읽는다.
- *
- * @details 목록을 다시 파싱하는 데는 수십 초가 걸린다. 한 번 만든 집합을 그대로 담아
- *          두면 재시작이 그만큼 빨라진다.
- * @warning 이 파일은 신뢰 입력이 아니다. 헤더에 입력 지문과 본문 해시가 있어 조작을
- *          걸러 내지만, 그 안쪽 파서도 어떤 바이트에도 패닉하지 않아야 한다.
- * @note 되읽을 때 무엇을 확인하느냐가 곧 안전성이다. 엣지 순서, 도달 가능성, 순환,
- *       부분 순위와 오토마톤에서 재구성한 모든 이름을 전부 본다.
- */
+//! Stores compiled filter sets on disk and reads them back. Reparsing the lists takes tens of
+//! seconds; keeping the built sets makes restarts that much faster.
+//!
+//! The file is untrusted input. The header's input fingerprint and payload hash reject tampering,
+//! and the parsers behind them must still not panic on any bytes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -22,46 +17,38 @@ use crate::engine::{
     LocalZoneSet, RewriteSet, RpzIpRule, RpzNameRule, StaticZone,
 };
 
-/** @brief 파일 식별자. */
+/// File identifier.
 const MAGIC: &[u8; 8] = b"ONETFST\0";
 
-/**
- * @brief 저장 배치를 적은 글. 배열 구성이 바뀌면 이 글도 함께 바꾼다.
- * @details 올려야 하는 번호를 두지 않는다. 이 글의 해시를 헤더에 적고 읽을 때 대조하므로,
- *          배치를 바꾸면서 이 글을 고치면 예전에 만든 파일은 저절로 거부되고 다시 만들어진다.
- *          캐시는 언제든 다시 만들 수 있는 파생물이라 옮겨 읽을 이유가 없다.
- */
+/// Describes the stored layout. Change it whenever the layout changes; there is no version number
+/// to bump. Its hash is written in the header and compared on read, so editing this text along with
+/// the layout makes older files get rejected and rebuilt. The cache can always be rebuilt, so there
+/// is no reason to migrate it.
 const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:edge_starts+terminal_bits|edges:labels,targets,outputs|sources";
 
-/** @brief 저장 배치를 가리키는 값. LAYOUT 해시의 앞 네 바이트다. */
 fn layout_tag() -> [u8; 4] {
     let digest: [u8; 32] = Sha256::digest(LAYOUT.as_bytes()).into();
     [digest[0], digest[1], digest[2], digest[3]]
 }
 
-/** @brief 헤더 크기. 식별자, 배치 표시, 지문, 길이, 해시를 담는다. */
+/// Magic, layout tag, fingerprint, length, and hash.
 const HEADER_BYTES: usize = 8 + 4 + 32 + 8 + 32;
-/** @brief 목록 하나의 항목 수 상한. */
 const MAX_ITEMS: usize = 5_000_000;
-/** @brief 문자열 하나의 길이 상한. */
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 
-/** @brief 캐시 파일 전체 크기 상한. */
 pub const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 캐시 해석 실패. 사유는 진단용이며 파일은 전체를 버린다. */
+/// The reason is for diagnostics; the whole file is discarded either way.
 pub struct CacheError(&'static str);
 
 impl CacheError {
-    /** @brief 오류를 만든다. */
     fn new(message: &'static str) -> Self {
         Self(message)
     }
 }
 
 impl fmt::Display for CacheError {
-    /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0)
     }
@@ -70,16 +57,12 @@ impl fmt::Display for CacheError {
 impl std::error::Error for CacheError {}
 
 #[derive(Debug)]
-/** @brief 캐시 쓰기 실패. */
 pub enum CacheWriteError {
-    /** @brief 저장 형식이 어긋났다. */
     Cache(CacheError),
-    /** @brief 파일을 읽고 쓰지 못했다. */
     Io(std::io::Error),
 }
 
 impl fmt::Display for CacheWriteError {
-    /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cache(error) => error.fmt(f),
@@ -89,7 +72,6 @@ impl fmt::Display for CacheWriteError {
 }
 
 impl std::error::Error for CacheWriteError {
-    /** @brief 이 오류를 일으킨 원래 오류. */
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cache(error) => Some(error),
@@ -99,20 +81,17 @@ impl std::error::Error for CacheWriteError {
 }
 
 impl From<CacheError> for CacheWriteError {
-    /** @brief 저장 오류를 감싼다. */
     fn from(error: CacheError) -> Self {
         Self::Cache(error)
     }
 }
 
 impl From<std::io::Error> for CacheWriteError {
-    /** @brief 입출력 오류를 감싼다. */
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-/** @brief 엔진을 메모리 안에서 전부 인코딩한다. */
 pub fn encode_engine_cache(
     parts: &mut EngineParts,
     input_fingerprint: [u8; 32],
@@ -136,11 +115,8 @@ pub fn encode_engine_cache(
     Ok(output)
 }
 
-/**
- * @brief 엔진을 스트림으로 흘려 쓴다.
- * @details 전체를 메모리에 담지 않는다. 필터 집합이 수백 메가일 수 있어, 전부 만들면
- *          저장하는 순간 메모리 사용이 두 배가 된다.
- */
+/// Streams instead of building the whole file in memory: the filter sets can be hundreds of
+/// megabytes, and building them all would double memory use at the moment of saving.
 pub fn write_engine_cache(
     parts: &mut EngineParts,
     input_fingerprint: [u8; 32],
@@ -167,27 +143,18 @@ pub fn write_engine_cache(
     Ok(())
 }
 
-/** @brief 흘려 쓸 때 쓰는 버퍼 크기. */
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
-/** @brief 본문을 흘려 쓰며 해시를 함께 계산하는 것. */
 struct PayloadStream<'a, W> {
-    /** @brief 실제로 쓸 곳. */
     output: &'a mut W,
-    /** @brief 흘려보내며 함께 계산하는 요약값. */
     digest: Sha256,
-    /** @brief 모아 두었다 한꺼번에 쓰는 버퍼. */
     buffer: Vec<u8>,
-    /** @brief 지금까지 흘려보낸 바이트. */
     len: usize,
-    /** @brief 쓰다 난 오류. 한 번 나면 이후는 버린다. */
     error: Option<std::io::Error>,
-    /** @brief 담을 수 있는 크기를 넘겼는지. */
     overflowed: bool,
 }
 
 impl<'a, W: Write> PayloadStream<'a, W> {
-    /** @brief 출력 대상으로 만든다. */
     fn new(output: &'a mut W) -> Self {
         Self {
             output,
@@ -199,7 +166,6 @@ impl<'a, W: Write> PayloadStream<'a, W> {
         }
     }
 
-    /** @brief 버퍼를 거쳐 쓴다. */
     fn write(&mut self, bytes: &[u8]) {
         if self.error.is_some() || self.overflowed {
             return;
@@ -227,7 +193,7 @@ impl<'a, W: Write> PayloadStream<'a, W> {
         }
     }
 
-    /** @brief 큰 청크는 버퍼를 거치지 않고 바로 쓴다. */
+    /// Large chunks skip the buffer.
     fn write_direct(&mut self, bytes: &[u8]) {
         if self.error.is_some() {
             return;
@@ -239,7 +205,6 @@ impl<'a, W: Write> PayloadStream<'a, W> {
         self.digest.update(bytes);
     }
 
-    /** @brief 버퍼를 비운다. */
     fn flush(&mut self) {
         if self.buffer.is_empty() || self.error.is_some() {
             return;
@@ -253,12 +218,10 @@ impl<'a, W: Write> PayloadStream<'a, W> {
         self.buffer.clear();
     }
 
-    /** @brief 16비트 값을 쓴다. */
     fn u16(&mut self, value: u16) {
         self.write(&value.to_le_bytes());
     }
 
-    /** @brief 길이를 쓴다. 상한을 넘으면 실패다. */
     fn len(&mut self, value: usize, max: usize) -> Result<(), CacheError> {
         if value > max {
             return Err(CacheError::new(
@@ -271,7 +234,6 @@ impl<'a, W: Write> PayloadStream<'a, W> {
         Ok(())
     }
 
-    /** @brief 남은 것을 비우고 총 길이와 해시를 돌려준다. */
     fn finish(mut self) -> Result<(usize, [u8; 32]), CacheWriteError> {
         if self.overflowed {
             return Err(CacheError::new("Compiled filter cache is too large").into());
@@ -284,11 +246,8 @@ impl<'a, W: Write> PayloadStream<'a, W> {
     }
 }
 
-/**
- * @brief 캐시 파일을 되읽는다.
- * @warning 헤더의 지문이 지금 입력과 맞고 본문 해시도 맞아야 한다. 어느 하나라도 어긋나면
- *          파일을 버리고 목록을 다시 파싱한다.
- */
+/// The header fingerprint must match the current input and the payload hash must match too. If
+/// either does not, the file is discarded and the lists are parsed again.
 pub fn decode_engine_cache(
     encoded: &[u8],
     expected_fingerprint: [u8; 32],
@@ -345,16 +304,12 @@ pub fn decode_engine_cache(
 }
 
 #[derive(Default)]
-/** @brief 값들을 와이어 형태로 쓰는 것. */
 struct Encoder<'a> {
-    /** @brief 적어 넣을 바이트. */
     bytes: Vec<u8>,
-    /** @brief 전부 잡지 않고 조각마다 넘길 곳. */
     chunks: Option<&'a mut dyn FnMut(&[u8])>,
 }
 
 impl<'a> Encoder<'a> {
-    /** @brief 청크를 넘겨받는 함수로 스트리밍하는 인코더. */
     fn streaming(chunks: &'a mut dyn FnMut(&[u8])) -> Self {
         Self {
             bytes: Vec::new(),
@@ -362,7 +317,6 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /** @brief 바이트를 쓴다. */
     fn write(&mut self, bytes: &[u8]) {
         if let Some(chunks) = &mut self.chunks {
             chunks(bytes);
@@ -371,27 +325,22 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /** @brief 8비트 값. */
     fn u8(&mut self, value: u8) {
         self.write(&[value]);
     }
 
-    /** @brief 16비트 값. */
     fn u16(&mut self, value: u16) {
         self.write(&value.to_le_bytes());
     }
 
-    /** @brief 32비트 값. */
     fn u32(&mut self, value: u32) {
         self.write(&value.to_le_bytes());
     }
 
-    /** @brief 64비트 값. */
     fn u64(&mut self, value: u64) {
         self.write(&value.to_le_bytes());
     }
 
-    /** @brief 길이. 상한을 넘으면 실패다. */
     fn len(&mut self, value: usize, max: usize) -> Result<(), CacheError> {
         if value > max {
             return Err(CacheError::new(
@@ -405,32 +354,28 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /** @brief 길이 접두사 있는 바이트열. */
     fn blob(&mut self, value: &[u8], max: usize) -> Result<(), CacheError> {
         self.len(value.len(), max)?;
         self.write(value);
         Ok(())
     }
 
-    /** @brief 길이 접두사 있는 문자열. */
     fn string(&mut self, value: &str) -> Result<(), CacheError> {
         self.blob(value.as_bytes(), MAX_STRING_BYTES)
     }
 }
 
-/** @brief 와이어 형태를 값으로 읽는 것. 모든 읽기가 경계를 검사한다. */
+/// Every read is bounds-checked.
 struct Decoder<'a> {
-    /** @brief 읽어 들일 바이트. */
     input: &'a [u8],
 }
 
 impl<'a> Decoder<'a> {
-    /** @brief 바이트열로 디코더를 만든다. */
     fn new(input: &'a [u8]) -> Self {
         Self { input }
     }
 
-    /** @brief 정해진 길이만큼 가져온다. 모자라면 오류다. */
+    /// Fails when too short.
     fn take(&mut self, count: usize) -> Result<&'a [u8], CacheError> {
         let (head, tail) = self
             .input
@@ -440,33 +385,28 @@ impl<'a> Decoder<'a> {
         Ok(head)
     }
 
-    /** @brief 8비트 값. */
     fn u8(&mut self) -> Result<u8, CacheError> {
         Ok(self.take(1)?[0])
     }
 
-    /** @brief 16비트 값. */
     fn u16(&mut self) -> Result<u16, CacheError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(
             |_| CacheError::new("Could not read a 16-bit integer from the compiled filter cache"),
         )?))
     }
 
-    /** @brief 32비트 값. */
     fn u32(&mut self) -> Result<u32, CacheError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(
             |_| CacheError::new("Could not read a 32-bit integer from the compiled filter cache"),
         )?))
     }
 
-    /** @brief 64비트 값. */
     fn u64(&mut self) -> Result<u64, CacheError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(
             |_| CacheError::new("Could not read a 64-bit integer from the compiled filter cache"),
         )?))
     }
 
-    /** @brief 길이. 상한을 넘으면 오류다. */
     fn len(&mut self, max: usize) -> Result<usize, CacheError> {
         let value = self.u32()? as usize;
         if value > max {
@@ -477,13 +417,11 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
-    /** @brief 바이트열. */
     fn blob(&mut self, max: usize) -> Result<&'a [u8], CacheError> {
         let len = self.len(max)?;
         self.take(len)
     }
 
-    /** @brief 문자열. UTF-8이 아니면 오류다. */
     fn string(&mut self) -> Result<String, CacheError> {
         let bytes = self.blob(MAX_STRING_BYTES)?;
         let value = std::str::from_utf8(bytes)
@@ -491,7 +429,7 @@ impl<'a> Decoder<'a> {
         Ok(value.to_owned())
     }
 
-    /** @brief 참거짓. 0과 1 외의 값은 오류다. */
+    /// Values other than 0 and 1 are errors.
     fn boolean(&mut self) -> Result<bool, CacheError> {
         match self.u8()? {
             0 => Ok(false),
@@ -501,13 +439,11 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/** @brief 엔진 구성 전체를 쓴다. */
 fn encode_parts(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), CacheError> {
     encode_domain_sets(w, parts)?;
     encode_parts_tail(w, parts)
 }
 
-/** @brief 도메인 집합들을 쓴다. */
 fn encode_domain_sets(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), CacheError> {
     for set in [
         &parts.block,
@@ -531,7 +467,7 @@ fn encode_domain_sets(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Ca
     Ok(())
 }
 
-/** @brief 도메인 집합들을 흘려 쓴다. 가장 큰 부분이라 메모리에 담지 않는다. */
+/// The largest part, so it is not buffered in memory.
 fn encode_domain_sets_streaming<W: Write>(
     w: &mut PayloadStream<'_, W>,
     parts: &EngineParts,
@@ -566,7 +502,6 @@ fn encode_domain_sets_streaming<W: Write>(
     Ok(())
 }
 
-/** @brief 도메인 집합을 뺀 나머지를 쓴다. */
 fn encode_parts_tail(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), CacheError> {
     for strings in [
         &parts.regex_block,
@@ -605,7 +540,6 @@ fn encode_parts_tail(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Cac
     encode_strings(w, &parts.sources)
 }
 
-/** @brief 엔진 구성 전체를 읽는다. */
 fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     let block = decode_domain_set(r)?;
     let allow = decode_domain_set(r)?;
@@ -675,7 +609,6 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     })
 }
 
-/** @brief 목록 하나를 쓴다. */
 fn encode_vec<T>(
     w: &mut Encoder<'_>,
     values: &[T],
@@ -688,7 +621,6 @@ fn encode_vec<T>(
     Ok(())
 }
 
-/** @brief 목록 하나를 읽는다. */
 fn decode_vec<T>(
     r: &mut Decoder<'_>,
     mut decode: impl FnMut(&mut Decoder<'_>) -> Result<T, CacheError>,
@@ -704,22 +636,18 @@ fn decode_vec<T>(
     Ok(values)
 }
 
-/** @brief 도메인 집합 하나를 읽는다. */
 fn decode_domain_set(r: &mut Decoder<'_>) -> Result<DomainSet, CacheError> {
     DomainSet::decode_compact(&mut r.input).map_err(CacheError::new)
 }
 
-/** @brief 문자열 목록을 쓴다. */
 fn encode_strings(w: &mut Encoder<'_>, values: &[String]) -> Result<(), CacheError> {
     encode_vec(w, values, |w, value| w.string(value))
 }
 
-/** @brief 문자열 목록을 읽는다. */
 fn decode_strings(r: &mut Decoder<'_>) -> Result<Vec<String>, CacheError> {
     decode_vec(r, |r| r.string())
 }
 
-/** @brief 레코드 타입 목록을 쓴다. */
 fn encode_record_types(w: &mut Encoder<'_>, types: &[RecordType]) -> Result<(), CacheError> {
     w.len(types.len(), MAX_ITEMS)?;
     for rtype in types {
@@ -728,18 +656,15 @@ fn encode_record_types(w: &mut Encoder<'_>, types: &[RecordType]) -> Result<(), 
     Ok(())
 }
 
-/** @brief 레코드 타입 목록을 읽는다. */
 fn decode_record_types(r: &mut Decoder<'_>) -> Result<Vec<RecordType>, CacheError> {
     decode_vec(r, |r| Ok(RecordType(r.u16()?)))
 }
 
-/** @brief 재작성 집합을 쓴다. */
 fn encode_rewrite_set(w: &mut Encoder<'_>, set: &RewriteSet) -> Result<(), CacheError> {
     encode_rewrite_map(w, &set.exact)?;
     encode_rewrite_map(w, &set.suffix)
 }
 
-/** @brief 재작성 맵을 쓴다. */
 fn encode_rewrite_map(
     w: &mut Encoder<'_>,
     map: &HashMap<Box<str>, RewriteTarget>,
@@ -754,7 +679,6 @@ fn encode_rewrite_map(
     Ok(())
 }
 
-/** @brief 재작성 집합을 읽는다. */
 fn decode_rewrite_set(r: &mut Decoder<'_>) -> Result<RewriteSet, CacheError> {
     Ok(RewriteSet {
         exact: decode_rewrite_map(r)?,
@@ -762,7 +686,6 @@ fn decode_rewrite_set(r: &mut Decoder<'_>) -> Result<RewriteSet, CacheError> {
     })
 }
 
-/** @brief 재작성 맵을 읽는다. */
 fn decode_rewrite_map(r: &mut Decoder<'_>) -> Result<HashMap<Box<str>, RewriteTarget>, CacheError> {
     let entries: Vec<(Box<str>, RewriteTarget)> = decode_vec(r, |r| {
         Ok((r.string()?.into_boxed_str(), decode_rewrite_target(r)?))
@@ -777,7 +700,7 @@ fn decode_rewrite_map(r: &mut Decoder<'_>) -> Result<HashMap<Box<str>, RewriteTa
     Ok(map)
 }
 
-/** @brief 로컬 영역을 이름 순으로 쓴다. 같은 설정이면 같은 바이트가 나와야 한다. */
+/// Sorted by name, so the same config gives the same bytes.
 fn encode_local_zones(w: &mut Encoder<'_>, set: &LocalZoneSet) -> Result<(), CacheError> {
     let mut entries: Vec<_> = set.iter().collect();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -807,7 +730,6 @@ fn encode_local_zones(w: &mut Encoder<'_>, set: &LocalZoneSet) -> Result<(), Cac
     Ok(())
 }
 
-/** @brief 로컬 영역을 읽는다. */
 fn decode_local_zones(r: &mut Decoder<'_>) -> Result<LocalZoneSet, CacheError> {
     let entries = decode_vec(r, |r| {
         let zone = r.string()?;
@@ -844,7 +766,6 @@ fn decode_local_zones(r: &mut Decoder<'_>) -> Result<LocalZoneSet, CacheError> {
     Ok(set)
 }
 
-/** @brief 클라이언트 규칙 하나를 쓴다. */
 fn encode_client_rule(w: &mut Encoder<'_>, rule: &ClientRule) -> Result<(), CacheError> {
     w.string(&rule.domain)?;
     encode_option(w, rule.regex.as_ref(), |w, value| w.string(value))?;
@@ -868,7 +789,6 @@ fn encode_client_rule(w: &mut Encoder<'_>, rule: &ClientRule) -> Result<(), Cach
     encode_strings(w, &rule.denyallow)
 }
 
-/** @brief 클라이언트 규칙 하나를 읽는다. */
 fn decode_client_rule(r: &mut Decoder<'_>) -> Result<ClientRule, CacheError> {
     let domain = r.string()?;
     let regex = decode_option(r, |r| r.string())?;
@@ -905,14 +825,12 @@ fn decode_client_rule(r: &mut Decoder<'_>) -> Result<ClientRule, CacheError> {
     })
 }
 
-/** @brief RPZ 주소 규칙을 쓴다. */
 fn encode_rpz_ip(w: &mut Encoder<'_>, rule: &RpzIpRule) -> Result<(), CacheError> {
     w.string(&rule.net.to_string())?;
     w.string(&rule.display)?;
     encode_verdict(w, &rule.verdict)
 }
 
-/** @brief RPZ 주소 규칙을 읽는다. */
 fn decode_rpz_ip(r: &mut Decoder<'_>) -> Result<RpzIpRule, CacheError> {
     let net = r
         .string()?
@@ -927,7 +845,6 @@ fn decode_rpz_ip(r: &mut Decoder<'_>) -> Result<RpzIpRule, CacheError> {
     })
 }
 
-/** @brief 로드 보고를 쓴다. */
 fn encode_report(w: &mut Encoder<'_>, report: &FilterLoadReport) -> Result<(), CacheError> {
     for value in [
         report.rules_total,
@@ -946,7 +863,6 @@ fn encode_report(w: &mut Encoder<'_>, report: &FilterLoadReport) -> Result<(), C
     Ok(())
 }
 
-/** @brief 로드 보고를 읽는다. */
 fn decode_report(r: &mut Decoder<'_>) -> Result<FilterLoadReport, CacheError> {
     let rules_total = r.u64()?;
     let rules_skipped = r.u64()?;
@@ -971,7 +887,6 @@ fn decode_report(r: &mut Decoder<'_>) -> Result<FilterLoadReport, CacheError> {
     })
 }
 
-/** @brief 판정을 쓴다. */
 fn encode_verdict(w: &mut Encoder<'_>, verdict: &FilterVerdict) -> Result<(), CacheError> {
     match verdict {
         FilterVerdict::Allow => w.u8(0),
@@ -988,7 +903,6 @@ fn encode_verdict(w: &mut Encoder<'_>, verdict: &FilterVerdict) -> Result<(), Ca
     Ok(())
 }
 
-/** @brief 판정을 읽는다. 모르는 종류면 오류다. */
 fn decode_verdict(r: &mut Decoder<'_>) -> Result<FilterVerdict, CacheError> {
     match r.u8()? {
         0 => Ok(FilterVerdict::Allow),
@@ -1001,7 +915,6 @@ fn decode_verdict(r: &mut Decoder<'_>) -> Result<FilterVerdict, CacheError> {
     }
 }
 
-/** @brief 차단 응답 방식을 쓴다. */
 fn encode_block_response(w: &mut Encoder<'_>, response: &BlockResponse) {
     match response {
         BlockResponse::NxDomain => w.u8(0),
@@ -1022,7 +935,6 @@ fn encode_block_response(w: &mut Encoder<'_>, response: &BlockResponse) {
     }
 }
 
-/** @brief 차단 응답 방식을 읽는다. */
 fn decode_block_response(r: &mut Decoder<'_>) -> Result<BlockResponse, CacheError> {
     match r.u8()? {
         0 => Ok(BlockResponse::NxDomain),
@@ -1056,7 +968,6 @@ fn decode_block_response(r: &mut Decoder<'_>) -> Result<BlockResponse, CacheErro
     }
 }
 
-/** @brief 재작성 대상을 쓴다. */
 fn encode_rewrite_target(w: &mut Encoder<'_>, target: &RewriteTarget) -> Result<(), CacheError> {
     match target {
         RewriteTarget::Records(records) => {
@@ -1070,7 +981,6 @@ fn encode_rewrite_target(w: &mut Encoder<'_>, target: &RewriteTarget) -> Result<
     }
 }
 
-/** @brief 재작성 대상을 읽는다. */
 fn decode_rewrite_target(r: &mut Decoder<'_>) -> Result<RewriteTarget, CacheError> {
     match r.u8()? {
         0 => Ok(RewriteTarget::Records(decode_vec(r, decode_rdata)?)),
@@ -1081,7 +991,6 @@ fn decode_rewrite_target(r: &mut Decoder<'_>) -> Result<RewriteTarget, CacheErro
     }
 }
 
-/** @brief 이름을 쓴다. 와이어 형태 그대로다. */
 fn encode_name(w: &mut Encoder<'_>, name: &Name) -> Result<(), CacheError> {
     let mut wire = DnsWriter::new();
     name.encode(&mut wire);
@@ -1093,7 +1002,6 @@ fn encode_name(w: &mut Encoder<'_>, name: &Name) -> Result<(), CacheError> {
     w.blob(&wire.buf, 255)
 }
 
-/** @brief 이름을 읽는다. 형식이 어긋나면 오류다. */
 fn decode_name(r: &mut Decoder<'_>) -> Result<Name, CacheError> {
     let bytes = r.blob(255)?;
     let mut wire = DnsReader::new(bytes);
@@ -1107,7 +1015,6 @@ fn decode_name(r: &mut Decoder<'_>) -> Result<Name, CacheError> {
     Ok(name)
 }
 
-/** @brief RDATA를 쓴다. */
 fn encode_rdata(w: &mut Encoder<'_>, rdata: &RData) -> Result<(), CacheError> {
     let mut wire = DnsWriter::new();
     rdata.encode(&mut wire);
@@ -1120,7 +1027,6 @@ fn encode_rdata(w: &mut Encoder<'_>, rdata: &RData) -> Result<(), CacheError> {
     w.blob(&wire.buf, u16::MAX as usize)
 }
 
-/** @brief RDATA를 읽는다. */
 fn decode_rdata(r: &mut Decoder<'_>) -> Result<RData, CacheError> {
     let rtype = RecordType(r.u16()?);
     let bytes = r.blob(u16::MAX as usize)?;
@@ -1135,7 +1041,7 @@ fn decode_rdata(r: &mut Decoder<'_>) -> Result<RData, CacheError> {
     Ok(rdata)
 }
 
-/** @brief 선택 값을 쓴다. 있는지 여부를 앞에 붙인다. */
+/// Prefixed with a presence flag.
 fn encode_option<T>(
     w: &mut Encoder<'_>,
     value: Option<&T>,
@@ -1153,7 +1059,6 @@ fn encode_option<T>(
     }
 }
 
-/** @brief 선택 값을 읽는다. */
 fn decode_option<T>(
     r: &mut Decoder<'_>,
     decode: impl FnOnce(&mut Decoder<'_>) -> Result<T, CacheError>,
@@ -1168,12 +1073,10 @@ fn decode_option<T>(
 }
 
 #[cfg(test)]
-/** @brief 왕복 정확성, 헤더 배치, 그리고 조작된 파일 거부. */
 mod tests {
     use super::*;
     use onetdns_core::{ClientInfo, FilterEngine, Transport};
 
-    /** @brief 판정에 쓸 테스트용 클라이언트 정보. */
     fn client() -> ClientInfo {
         ClientInfo {
             source_ip: "127.0.0.1".parse().unwrap(),
@@ -1183,7 +1086,6 @@ mod tests {
         }
     }
 
-    /** @brief 되읽은 엔진으로 판정해 결과를 문자열로 얻는다. */
     fn verdict(parts: EngineParts, name: &str, rtype: RecordType) -> String {
         let engine = crate::BlockEngine::new(parts, BlockResponse::NxDomain);
         let name = Name::from_str(name).unwrap();
@@ -1191,7 +1093,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 도메인과 타입별 판정이 왕복에서 보존되는지. */
     fn engine_cache_roundtrip_preserves_domain_and_typed_verdicts() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix_src("blocked.example", 0);
@@ -1220,11 +1121,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 무응답 규칙과 무응답 판정이 왕복에서 보존되는지.
-     * @details 캐시에서 빠지거나 다른 집합으로 읽히면, 다시 시작한 서버가 답하지 않기로 한
-     *          이름에 답한다.
-     */
+    /// If they were dropped or read into another set, a restarted server would answer names it was
+    /// told not to answer.
     fn engine_cache_roundtrip_keeps_noresponse_rules() {
         let mut parts = EngineParts::default();
         parts.no_response.add_suffix_src("quiet.example", 0);
@@ -1257,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 헤더 필드가 정해진 곳에 있는지. 옮기면 이전 파일 판정이 어긋난다. */
+    /// Moving one would misread files written earlier.
     fn encoded_header_fields_sit_at_pinned_offsets() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("blocked.example");
@@ -1274,11 +1172,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 저장 배치가 다른 캐시를 옮겨 읽지 않고 거부하는지.
-     * @details 배치가 다르면 같은 바이트가 다른 배열로 해석된다. 옮겨 읽으려 들면 엉뚱한
-     *          자리를 상태로 읽는다. 캐시는 다시 만들 수 있으니 거부하고 새로 만든다.
-     */
+    /// With a different layout the same bytes would be read as different arrays, so the cache is
+    /// rejected and rebuilt instead.
     fn cache_written_with_another_layout_is_rejected() {
         let fingerprint = [0x5a; 32];
         let encoded = encode_engine_cache(&mut EngineParts::default(), fingerprint).unwrap();
@@ -1292,9 +1187,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 흘려 쓴 결과가 메모리 인코딩과 바이트까지 같은지. 다르면 해시가 어긋난다. */
+    /// Otherwise the hash would not match.
     fn streaming_cache_is_byte_identical_to_the_in_memory_encoder() {
-        /** @brief 테스트용 엔진 부품. */
         fn parts() -> EngineParts {
             let mut parts = EngineParts::default();
             parts.block.add_suffix_src("blocked.example", 7);
@@ -1329,18 +1223,14 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쓰다 실패하면 그것이 위로 전해지는지. 삼키면 깨진 파일이 남는다. */
+    /// Swallowing it would leave a broken file.
     fn streaming_cache_propagates_output_failure() {
-        /** @brief 정해진 지점에서 실패하는 테스트용 대상. */
         struct FailingWriter {
-            /** @brief 실제로 담을 곳. */
             inner: std::io::Cursor<Vec<u8>>,
-            /** @brief 이만큼 쓰고 나면 실패한다. */
             remaining: usize,
         }
 
         impl Write for FailingWriter {
-            /** @brief 정해진 지점에서 실패한다. */
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if self.remaining == 0 {
                     return Err(std::io::Error::new(
@@ -1353,14 +1243,12 @@ mod tests {
                 self.inner.write(&bytes[..count])
             }
 
-            /** @brief 비운다. */
             fn flush(&mut self) -> std::io::Result<()> {
                 self.inner.flush()
             }
         }
 
         impl Seek for FailingWriter {
-            /** @brief 곳을 옮긴다. */
             fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
                 self.inner.seek(position)
             }
@@ -1379,7 +1267,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 입력 불일치, 잘림, 그리고 한 바이트 변조를 모두 거부하는지. */
     fn engine_cache_rejects_wrong_input_truncation_and_every_single_byte_corruption() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("blocked.example");
@@ -1397,7 +1284,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한을 넘는 내용을 쓰는 시점에 거부하는지. */
     fn engine_cache_rejects_over_limit_content_at_encode_time() {
         let mut parts = EngineParts::default();
         parts.sources = vec!["x".repeat(MAX_STRING_BYTES + 1)];
@@ -1414,7 +1300,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재작성, 클라이언트 규칙, RPZ, 보고가 모두 왕복하는지. */
     fn engine_cache_roundtrips_rewrites_clients_rpz_and_report() {
         let mut parts = EngineParts::default();
         parts.rewrites.add_exact(
@@ -1483,7 +1368,7 @@ mod tests {
         assert_eq!(restored.rpz_client_ip.len(), 1);
         assert_eq!(restored.rpz_nsdname.len(), 1);
         assert_eq!(restored.report.unsupported_modifier.get("foo"), Some(&2));
-        /* static 영역은 해시 표라 Debug 순서가 매번 다르다. 이름 순으로 펴서 비교한다. */
+        // Static zones are a hash map, so Debug order varies; compare sorted by name.
         let canonical = |set: &LocalZoneSet| {
             let mut out: Vec<_> = set
                 .iter()
@@ -1522,12 +1407,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 헤더를 다시 봉한 변조 입력에도 디코더가 패닉하지 않는지.
-     * @details 헤더이 해시로 막혀 있어 그냥 변조하면 본문 파서까지 닿지 않는다. 그래서
-     *          변조 후 다시 봉해야 실제 파서를 테스트할 수 있다. 수락률이 0이 아닌지도
-     *          함께 확인해, 지나치게 엄격한 변이가 테스트를 조용히 무력화하지 않게 한다.
-     */
+    /// The header hash would stop a plain mutation before the payload parser, so each mutation is
+    /// resealed to reach the real parser. The acceptance rate is also checked to be nonzero, so
+    /// mutations that are too strict cannot silently disarm the test.
     fn cache_decoder_never_panics_on_resealed_mutations() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix_src("blocked.example", 0);

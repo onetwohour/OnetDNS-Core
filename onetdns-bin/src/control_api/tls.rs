@@ -1,12 +1,9 @@
-/*!
- * @brief 관리 API: TLS 인증서.
- */
+//! Management API: TLS certificates.
 
 use super::*;
 use crate::tls_material::{acme_issue_run, inspect_tls_material, tls_configure};
 
 impl ControlDeps {
-    /** @brief 지금 설정에 적힌 인증서와 암호화 수신 주소. */
     pub(super) fn tls_status(&self) -> String {
         let current = self.runtime_cfg.load();
         let (cert, key) = (&current.tls_cert, &current.tls_key);
@@ -22,10 +19,8 @@ impl ControlDeps {
         )
     }
 
-    /**
-     * @brief 지금 인증서와 키가 맞물리고 기간과 체인이 유효한지 본다.
-     * @details 신뢰와 이름은 보지 않는다.
-     */
+    /// Checks that the certificate and key match and that validity and the chain hold; trust and
+    /// names are not checked.
     pub(super) fn tls_validate(&self) -> Result<String, String> {
         let current = self.runtime_cfg.load();
         let (Some(cp), Some(kp)) = (&current.tls_cert, &current.tls_key) else {
@@ -65,7 +60,6 @@ impl ControlDeps {
         ))
     }
 
-    /** @brief 인증서와 키를 바꾼다. */
     pub(super) fn tls_configure(&self, body: &str) -> Result<String, String> {
         let current = self.runtime_cfg.load();
         tls_configure(
@@ -78,7 +72,6 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 보낸 인증서 체인이 폐기됐는지 확인한다. */
     pub(super) fn tls_revocation_check(&self, body: &str) -> Result<String, String> {
         let j = onetdns_core::json::parse(body)
             .map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
@@ -94,12 +87,9 @@ impl ControlDeps {
         )
     }
 
-    /** @brief ACME 로 인증서를 발급받는다. */
     pub(super) fn acme_issue(&self, body: &str) -> Result<String, String> {
-        /*
-         * 실행 중 설정을 본다. 시작할 때 값을 가지고 있으면 ACME 설정을 바꿔도 이전 디렉터리
-         * 주소와 이전 도메인으로 발급을 시도한다.
-         */
+        // Reads the live config: values captured at startup would keep issuing with the old
+        // directory URL and domains after an ACME config change.
         acme_issue_run(
             &self.runtime_cfg.load(),
             body,

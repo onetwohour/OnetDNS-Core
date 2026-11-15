@@ -2,13 +2,12 @@ use onetdns_dnssec::anchor::AnchorManager;
 use onetdns_dnssec::sign::ZoneSigner;
 use onetdns_proto::Name;
 
-/** @brief 이 키들로 서명하는 것. */
 fn signer_for(zsk_pem: &str, ksk_pem: &str, owner: &str) -> ZoneSigner {
     let owner = Name::from_str(owner).expect("owner 이름");
     ZoneSigner::from_pkcs8_pems(zsk_pem, Some(ksk_pem), owner).expect("PEM 키 로드")
 }
 
-/** @brief 성능을 측정할 때 쓸 서명된 영역을 만든다. */
+/// Builds signed zones for the signing benchmarks.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: dnssec_bench_fixtures <ds|anchor> <zsk.pem> <ksk.pem> <owner>...";

@@ -1,11 +1,8 @@
-/*!
- * @brief 업데이트 확인, 적용, 되돌리기 작업과 그 상태.
- *
- * @details 관리 API, CLI, 주기 확인이 같은 함수를 부른다. 작업은 한 프로세스에서 한 번에 하나만
- *          돌고, 프로세스 사이는 설치 디렉터리의 잠금이 묶는다. 작업과 확인 결과는 서버 세대가
- *          아니라 프로세스에 속한다. 마지막 확인 결과는 메모리에만 두므로 프로세스가 다시 시작하면
- *          다음 확인 때까지 비어 있다.
- */
+//! Update check, apply, and rollback tasks and their state. The management API, the CLI, and the
+//! periodic check all call these functions. One task runs at a time per process, and the install
+//! directory lock serializes processes. Tasks and check results belong to the process, not to a
+//! server generation; the last check result lives only in memory and is empty after a restart until
+//! the next check.
 
 use std::path::Path;
 use std::sync::{Mutex, Once};
@@ -25,30 +22,20 @@ use super::{RELEASE_TARGET, VERSION};
 use crate::cli::UpdateAction;
 use crate::http::HostResolver;
 
-/**
- * @brief 처음 주기 확인은 서버가 준비되고 이만큼 뒤에 한다.
- * @details 시작하자마자 죽고 다시 뜨기를 되풀이하는 프로세스가 GitHub API 를 같은 빈도로 부르지 않게
- *          하려는 것이다.
- */
+/// Delay from server readiness to the first periodic check, so a process stuck in a crash loop does
+/// not call the GitHub API on every start.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(10 * 60);
-/** @brief 주기 확인 간격. */
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/** @brief 주기 확인을 할 때가 됐는지 보는 간격. */
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 업데이트 작업의 종류. */
 pub(crate) enum Task {
-    /** @brief 새 릴리스를 확인한다. */
     Check,
-    /** @brief 확인한 새 버전을 설치한다. */
     Apply,
-    /** @brief 확정된 업데이트를 되돌린다. */
     Rollback,
 }
 
 impl Task {
-    /** @brief 상태 응답과 작업 목록에 쓰는 이름. */
     pub(crate) fn name(self) -> &'static str {
         match self {
             Task::Check => "check",
@@ -58,27 +45,24 @@ impl Task {
     }
 }
 
-/** @brief 지금 도는 작업. */
 static RUNNING: Mutex<Option<Task>> = Mutex::new(None);
 
-/** @brief 작업을 맡은 동안 쥐는 표. 놓으면 다음 작업을 시작할 수 있다. */
+/// Held while a task runs; dropping it lets the next one start.
 pub(crate) struct Running(Task);
 
 impl Running {
-    /** @brief 맡은 작업. */
     pub(crate) fn task(&self) -> Task {
         self.0
     }
 }
 
 impl Drop for Running {
-    /** @brief 작업이 끝났다고 적는다. */
     fn drop(&mut self) {
         *RUNNING.lock_recover() = None;
     }
 }
 
-/** @brief 작업을 시작한다. 다른 업데이트 작업이 돌고 있으면 거절한다. */
+/// Fails while another update task runs.
 pub(crate) fn begin(task: Task) -> Result<Running, String> {
     let mut running = RUNNING.lock_recover();
     if let Some(other) = *running {
@@ -91,21 +75,16 @@ pub(crate) fn begin(task: Task) -> Result<Running, String> {
     Ok(Running(task))
 }
 
-/** @brief 마지막 확인. */
 struct Checked {
-    /** @brief 확인을 마친 시각. 유닉스 초다. */
+    /// Unix seconds.
     at: u64,
-    /** @brief 결과. 확인하지 못했으면 그 이유. */
+    /// Err holds why the check failed.
     outcome: Result<Finding, String>,
 }
 
-/** @brief 이 프로세스의 마지막 확인. */
 static LAST: Mutex<Option<Checked>> = Mutex::new(None);
 
-/**
- * @brief 이 바이너리가 업데이트에 참여하는지 본다.
- * @return 참여하면 자산 키와 믿는 서명 키. 참여하지 않으면 그 이유.
- */
+/// The asset key and trusted signing keys, or why this binary takes no part in updates.
 pub(crate) fn participation() -> Result<(&'static str, Vec<VerifyingKey>), String> {
     let target = RELEASE_TARGET.ok_or_else(|| {
         "This executable was not built by the OnetDNS release workflow, so it does not update itself"
@@ -121,7 +100,7 @@ pub(crate) fn participation() -> Result<(&'static str, Vec<VerifyingKey>), Strin
     Ok((target, keys))
 }
 
-/** @brief 새 릴리스를 확인한다. 결과를 남기지도 로그로 알리지도 않는다. */
+/// Neither records nor logs the result.
 fn find(resolver: &HostResolver) -> Result<Finding, String> {
     let (target, keys) = participation()?;
     let current = Version::parse(VERSION)
@@ -129,7 +108,7 @@ fn find(resolver: &HostResolver) -> Result<Finding, String> {
     release::check(&current, target, &keys, resolver)
 }
 
-/** @brief 새 릴리스를 확인하고 결과를 상태 응답과 로그에 남긴다. */
+/// Records the result for the status response and logs it.
 pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Finding, String> {
     let outcome = find(resolver);
     match &outcome {
@@ -162,11 +141,8 @@ pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Findi
     outcome
 }
 
-/**
- * @brief 마지막 확인에서 찾은, 설치할 수 있는 릴리스.
- * @param version 운영자가 확인한 버전. 마지막 확인 결과와 다르면 거절한다. 확인 주기 사이에 결과가
- *        바뀌어도 운영자가 본 버전만 설치하려는 것이다.
- */
+/// `version` is the one the operator saw. A different result from the last check is refused, so a
+/// result that changed between checks never installs a version the operator did not see.
 pub(crate) fn confirmed(version: &str) -> Result<Release, String> {
     match LAST.lock_recover().as_ref().map(|checked| &checked.outcome) {
         Some(Ok(Finding::Available(release))) if release.version == version => Ok(release.clone()),
@@ -180,10 +156,8 @@ pub(crate) fn confirmed(version: &str) -> Result<Release, String> {
     }
 }
 
-/**
- * @brief 릴리스를 받아 설치 경로의 실행 파일과 맞바꾼다. 새 버전을 띄우는 일은 호출자가 한다.
- * @param config 서버가 쓰는 설정 파일. 새 버전이 이 설정을 받아들이는지 맞바꾸기 전에 검사한다.
- */
+/// The caller starts the new version. The new binary must accept `config`, the server's config
+/// file, before the swap.
 pub(crate) fn install_release(
     _running: &Running,
     release: &Release,
@@ -205,7 +179,7 @@ pub(crate) fn install_release(
         })
 }
 
-/** @brief 확정된 업데이트를 되돌려 바꾸기 전 버전을 다시 설치한다. 띄우는 일은 호출자가 한다. */
+/// The caller starts the restored version.
 pub(crate) fn rollback(_running: &Running, config: Option<&Path>) -> Result<Swapped, String> {
     apply::rollback(config).inspect_err(|error| {
         onetdns_core::warn!(
@@ -216,10 +190,7 @@ pub(crate) fn rollback(_running: &Running, config: Option<&Path>) -> Result<Swap
     })
 }
 
-/**
- * @brief 맞바꾼 실행 파일을 띄우게 한다. 관리 API 의 작업이 맞바꾼 뒤에 부른다.
- * @return 작업 결과로 남길 문구.
- */
+/// Called by management API tasks after the swap. Returns the text for the task result.
 pub(crate) fn activate(swapped: &Swapped) -> String {
     if launch::request_restart() {
         format!(
@@ -234,7 +205,7 @@ pub(crate) fn activate(swapped: &Swapped) -> String {
     }
 }
 
-/** @brief 확인 결과를 한 줄로. 작업 목록과 CLI 에 보인다. */
+/// One line, for the task list and the CLI.
 pub(crate) fn describe(finding: &Finding) -> String {
     match finding {
         Finding::UpToDate => format!("OnetDNS {VERSION} is the newest release"),
@@ -250,17 +221,12 @@ pub(crate) fn describe(finding: &Finding) -> String {
     }
 }
 
-/** @brief 값이 있으면 JSON 문자열, 없으면 null. */
 fn json_text(value: Option<&str>) -> String {
     value.map_or_else(|| "null".to_string(), onetdns_core::json::escape)
 }
 
-/**
- * @brief 관리 API 가 보이는 업데이트 상태.
- * @param release_check 주기 확인이 켜져 있는지. 실행 중 설정에서 읽어 넘긴다.
- * @details 실행 파일의 해시는 계산하지 않는다. 화면이 자주 묻는 응답이라 실행 파일을 읽지 않으려는
- *          것이고, 해시는 실제로 적용하거나 되돌릴 때 확인한다.
- */
+/// `release_check` comes from the running config. Executable hashes are not computed, since the
+/// dashboard asks often; applying and rolling back check them.
 pub(crate) fn status_json(release_check: bool) -> String {
     let reason = participation().err();
     let task = *RUNNING.lock_recover();
@@ -315,23 +281,20 @@ pub(crate) fn status_json(release_check: bool) -> String {
     )
 }
 
-/** @brief 주기 확인이 읽는 지금 세대의 설정과 이름 해석기. */
+/// What the periodic check reads from the current generation.
 struct Feed {
-    /** @brief 주기 확인이 켜져 있는지. 그 세대의 실행 중 설정을 읽는다. */
+    /// Reads that generation's running config.
     enabled: Box<dyn Fn() -> bool + Send>,
-    /** @brief 릴리스를 받을 때 쓰는 이름 해석기. */
     resolver: HostResolver,
 }
 
-/** @brief 가장 최근에 준비된 세대가 넘긴 것. */
+/// From the most recently ready generation.
 static FEED: Mutex<Option<Feed>> = Mutex::new(None);
 
-/**
- * @brief 세대가 준비되면 주기 확인에 그 세대의 설정과 이름 해석기를 넘긴다.
- * @details 처음 부를 때 주기 확인 스레드를 띄운다. 이 스레드는 세대가 끝나도 멈추지 않고 프로세스가
- *          끝날 때까지 돈다. 세대를 바꾸는 동안에는 DNS 가 멈춰 있는데, 몇십 초 걸릴 수 있는 확인을
- *          그동안 기다리지 않으려는 것이다. 업데이트에 참여하지 않는 바이너리는 스레드를 띄우지 않는다.
- */
+/// Called when a generation is ready. The first call starts the periodic thread, which outlives
+/// generations and runs until the process exits: DNS is paused during a generation switch, and the
+/// switch must not wait for a check that can take tens of seconds. A binary that takes no part in
+/// updates starts no thread.
 pub(crate) fn schedule(enabled: impl Fn() -> bool + Send + 'static, resolver: HostResolver) {
     if participation().is_err() {
         return;
@@ -340,7 +303,6 @@ pub(crate) fn schedule(enabled: impl Fn() -> bool + Send + 'static, resolver: Ho
         enabled: Box::new(enabled),
         resolver,
     });
-    /** @brief 주기 확인 스레드를 한 번만 띄운다. */
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         let first = Instant::now() + FIRST_CHECK_DELAY;
@@ -357,11 +319,8 @@ pub(crate) fn schedule(enabled: impl Fn() -> bool + Send + 'static, resolver: Ho
     });
 }
 
-/**
- * @brief 때가 되면 새 릴리스를 확인한다.
- * @details 꺼져 있거나 다른 업데이트 작업이 돌고 있으면 다음 틱에 다시 본다. 확인을 마친 뒤에만
- *          다음 확인 시각을 정한다.
- */
+/// Checks when due. When checks are off or another update task runs, it looks again next tick. The
+/// next due time is set only after a check finishes.
 fn run_schedule(mut due: Instant) {
     loop {
         std::thread::sleep(SCHEDULE_TICK);
@@ -384,11 +343,8 @@ fn run_schedule(mut due: Instant) {
     }
 }
 
-/**
- * @brief CLI 의 update 명령.
- * @details 서버를 띄우지 않으므로 맞바꾸기까지만 하고 다시 시작은 운영자에게 맡긴다. 이름 해석과
- *          새 버전의 설정 검사는 넘겨받은 설정 파일을 쓴다.
- */
+/// The CLI update command. It runs no server, so it only swaps and leaves the restart to the
+/// operator. Name resolution and the new version's config check use the given config file.
 pub(crate) fn run_cli(action: UpdateAction, config: Option<&Path>) -> Result<(), String> {
     let cfg = onetdns_config::Config::load_or_default(config)
         .map_err(|error| format!("Could not read the configuration: {error}"))?;
@@ -438,12 +394,10 @@ pub(crate) fn run_cli(action: UpdateAction, config: Option<&Path>) -> Result<(),
 }
 
 #[cfg(test)]
-/** @brief 작업을 하나씩 돌리는 규칙과 적용할 버전의 확인. */
 mod tests {
     use super::*;
     use crate::update::manifest::Asset;
 
-    /** @brief 마지막 확인에서 이 버전을 찾은 것으로 둔다. */
     fn found(version: &str) {
         *LAST.lock_recover() = Some(Checked {
             at: 1,
@@ -460,10 +414,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 작업은 하나씩만 돌고, 적용은 마지막 확인에서 찾은 버전만 받는지.
-     * @details 둘 다 프로세스 전역 상태라 테스트 하나에서 차례로 본다.
-     */
+    /// Both are process-wide state, so one test checks them in turn.
     fn tasks_run_one_at_a_time_and_apply_only_the_checked_version() {
         let check = begin(Task::Check).expect("첫 작업");
         assert_eq!(check.task(), Task::Check);
@@ -525,7 +476,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 릴리스 워크플로가 만들지 않은 빌드는 참여하지 않고 그 이유를 보이는지. */
     fn builds_without_a_release_target_do_not_participate() {
         if RELEASE_TARGET.is_some() {
             return;

@@ -1,10 +1,7 @@
-/*!
- * @brief DNS 쿠키(RFC 7873). 출발지 주소 위조를 걸러 내는 값싼 왕복 증명이다.
- *
- * @details 서버는 상태를 저장하지 않는다. 서버 쿠키는 클라이언트 쿠키와 출발지 주소를
- *          비밀 키로 해싱한 값이라, 되돌아온 쿠키가 맞으면 그 주소가 실제로 응답을
- *          받았다는 뜻이다. 증폭 공격의 반사 대상이 되는 것을 막는다.
- */
+//! DNS Cookies (RFC 7873): a cheap round-trip proof against spoofed source addresses. The server
+//! keeps no state: the server cookie is a keyed hash of the client cookie and the source address,
+//! so a returned cookie that matches proves the address received our response. This keeps the
+//! server from being reflected in amplification attacks.
 
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,45 +9,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::siphash::SipHasher24;
 use zeroize::Zeroize;
 
-/** @brief RFC 9018이 정한 서버 쿠키 길이: Version 1, Reserved 3, Timestamp 4, Hash 8. */
+/// RFC 9018 layout: version 1, reserved 3, timestamp 4, hash 8.
 pub const SERVER_COOKIE_LEN: usize = 16;
 
-/** @brief 이 구현이 내는 서버 쿠키 버전. */
 const COOKIE_VERSION: u8 = 1;
 
-/** @brief 과거로 받아 주는 폭. RFC 9018이 한 시간을 권한다. */
+/// RFC 9018 recommends one hour.
 const ACCEPT_PAST_SECS: i64 = 3600;
 
-/** @brief 미래로 받아 주는 폭. 시계가 조금 앞선 상대를 위한 여유다. */
+/// Slack for peers whose clock runs slightly ahead.
 const ACCEPT_FUTURE_SECS: i64 = 300;
 
-/** @brief 서버 비밀을 자동으로 교체하는 주기. RFC 9018은 매달 교체를 권한다. */
+/// RFC 9018 recommends rotating the server secret monthly.
 const SECRET_EPOCH_SECS: u32 = 30 * 24 * 60 * 60;
 
-/** @brief epoch별 두 SipHash 키를 서로 갈라 주는 문맥 문자열. */
+/// Domain separation for the per-epoch SipHash keys.
 const EPOCH_KEY_CONTEXT: &[u8] = b"OnetDNS DNS Cookie epoch key v1";
 
-/** @brief 서버 쿠키 생성·검증에 쓰는 비밀 키를 잡은 타입. */
 pub struct CookieKeeper {
-    /** @brief 쿠키를 만드는 비밀값. */
     k0: u64,
-    /** @brief 그 두 번째 값. */
     k1: u64,
-    /** @brief 참이면 k0·k1을 루트로 삼아 쿠키 시각의 30일 epoch 키를 파생한다. */
+    /// Derive a 30-day epoch key from `k0` and `k1` for each cookie's timestamp.
     rotating: bool,
 }
 
-/** @brief 쿠키 검사 결과. */
 pub struct CookieCheck {
-    /** @brief 클라이언트가 보낸 8바이트. 응답에 그대로 되돌려 준다. */
+    /// Echoed back in the response.
     pub client: [u8; 8],
 
-    /** @brief 서버 쿠키가 이 출발지에 대해 유효한지. false면 왕복이 아직 증명되지 않은 것이다. */
+    /// False means the round trip is not proven yet.
     pub valid: bool,
 }
 
 impl CookieKeeper {
-    /** @brief 무작위 루트 비밀로 초기화한다. 쿠키 키는 30일마다 자동으로 바뀐다. */
+    /// Cookie keys rotate every 30 days.
     pub fn random() -> Self {
         let mut secret = onetdns_core::random_array::<16>();
         let keeper = Self::from_master_secret(&secret);
@@ -58,11 +50,8 @@ impl CookieKeeper {
         keeper
     }
 
-    /**
-     * @brief 주어진 비밀로 초기화한다.
-     * @note 여러 인스턴스가 쿠키를 서로 인정하게 하려면 같은 비밀을 써야 한다. 다르면
-     *       클라이언트가 다른 노드로 갈 때마다 왕복 증명을 다시 한다.
-     */
+    /// Instances must share the secret to accept each other's cookies; otherwise a client repeats
+    /// the round trip every time it reaches another node.
     pub fn from_secret(secret: &[u8; 16]) -> Self {
         Self {
             k0: u64::from_le_bytes([
@@ -77,19 +66,16 @@ impl CookieKeeper {
         }
     }
 
-    /**
-     * @brief 주어진 루트 비밀에서 30일 epoch별 서버 비밀을 파생한다.
-     * @details 상태나 잠금 없이 쿠키에 새겨진 시각으로 해당 epoch 키를 다시 얻는다. 그래서
-     *          월 경계 직전 쿠키도 수락 구간 안에서는 이전 epoch 키로 검증되고, 여러 노드가
-     *          같은 루트를 쓰면 어느 노드로 이동해도 같은 쿠키를 인정한다.
-     */
+    /// Derives the server secret for each 30-day epoch from `secret` and the timestamp in the
+    /// cookie, without state or locks. A cookie from just before a boundary still validates with
+    /// the previous epoch key inside the acceptance window, and nodes sharing the root accept each
+    /// other's cookies.
     pub fn from_master_secret(secret: &[u8; 16]) -> Self {
         let mut keeper = Self::from_secret(secret);
         keeper.rotating = true;
         keeper
     }
 
-    /** @brief 고정 키 또는 쿠키 시각이 속한 epoch의 파생 키를 고른다. */
     #[inline]
     fn keys_at(&self, stamp: u32) -> (u64, u64) {
         if !self.rotating {
@@ -106,15 +92,10 @@ impl CookieKeeper {
         (derive(0), derive(1))
     }
 
-    /**
-     * @brief 주어진 시각으로 서버 쿠키 16바이트를 만든다.
-     *
-     * @details RFC 9018이 정한 배치를 그대로 따른다. Version 1바이트, Reserved 3바이트,
-     *          Timestamp 4바이트, 그리고 나머지를 재료로 한 SipHash-2-4 8바이트다. 주소를
-     *          재료에 넣는 것이 핵심이다. 넣지 않으면 한 번 받은 쿠키를 아무 위조 주소에나
-     *          붙여 쓸 수 있어 왕복 증명이 무의미해진다.
-     * @param stamp 쿠키에 새길 Unix 시각. 검증할 때는 받은 쿠키의 값을 그대로 넣는다.
-     */
+    /// RFC 9018 layout: version (1), reserved (3), timestamp (4), then a SipHash-2-4 (8) over the
+    /// rest. The source address must be part of the hash, or a cookie received once could be
+    /// attached to any spoofed address. When validating, `stamp` is the timestamp read from the
+    /// received cookie.
     pub fn server_cookie_at(&self, client_cookie: &[u8], ip: IpAddr, stamp: u32) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[0] = COOKIE_VERSION;
@@ -132,12 +113,11 @@ impl CookieKeeper {
         out
     }
 
-    /** @brief 지금 시각으로 만든 서버 쿠키. */
     pub fn server_cookie(&self, client_cookie: &[u8], ip: IpAddr) -> [u8; 16] {
         self.server_cookie_at(client_cookie, ip, unix_now())
     }
 
-    /** @brief 응답에 담을 24바이트 쿠키: 클라이언트 쿠키 8바이트 + 서버 쿠키 16바이트. */
+    /// Client cookie (8) followed by server cookie (16).
     pub fn response_cookie(&self, client_cookie: &[u8; 8], ip: IpAddr) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + SERVER_COOKIE_LEN);
         out.extend_from_slice(client_cookie);
@@ -145,18 +125,14 @@ impl CookieKeeper {
         out
     }
 
-    /**
-     * @brief 쿠키 옵션을 해석하고 서버 쪽을 검증한다.
-     * @details 길이는 8(클라이언트만) 또는 16~40(서버 쿠키 포함)만 유효하다. 그 밖은 형식
-     *          위반이라 None이다.
-     * @return 형식이 맞으면 클라이언트 쿠키와 유효 여부. 유효하지 않아도 클라이언트 쿠키는
-     *         돌려주므로, 호출자가 올바른 쿠키를 담아 재시도를 유도할 수 있다.
-     */
+    /// Only 8 bytes (client cookie only) or 16 to 40 bytes are well-formed; anything else returns
+    /// `None`. An invalid server cookie still returns the client cookie, so the caller can answer
+    /// with a fresh cookie and invite a retry.
     pub fn parse_and_validate(&self, cookie: &[u8], ip: IpAddr) -> Option<CookieCheck> {
         self.parse_and_validate_at(cookie, ip, unix_now())
     }
 
-    /** @brief 지정한 현재 시각으로 쿠키를 해석한다. 테스트가 월·수락 구간 경계를 고정한다. */
+    /// Takes `now` so tests can pin the epoch and window boundaries.
     fn parse_and_validate_at(&self, cookie: &[u8], ip: IpAddr, now: u32) -> Option<CookieCheck> {
         if cookie.len() != 8 && !(16..=40).contains(&cookie.len()) {
             return None;
@@ -168,14 +144,9 @@ impl CookieKeeper {
         Some(CookieCheck { client, valid })
     }
 
-    /**
-     * @brief 되돌아온 서버 쿠키가 이 서버가 이 주소에 준 것인지.
-     *
-     * @details 시각을 쿠키에서 읽어 그 값으로 다시 계산한다. 해시가 맞아도 구간 밖이면
-     *          받아 주지 않는다. RFC 9018이 한 시간 과거와 5분 미래를 권한다. 구간이
-     *          없으면 한 번 새어 나간 쿠키가 영원히 유효해 왕복 증명이 시간과 무관해진다.
-     * @return 이 서버의 것이고 시각 구간 안이면 참.
-     */
+    /// Recomputes the hash with the timestamp read from the cookie and rejects the cookie outside
+    /// the window even when the hash matches: without a window a leaked cookie would stay valid
+    /// forever.
     fn server_part_is_ours_at(
         &self,
         server: &[u8],
@@ -196,14 +167,12 @@ impl CookieKeeper {
 }
 
 impl Drop for CookieKeeper {
-    /** @brief 정책 교체·종료 때 루트 비밀이 해제된 메모리에 남지 않게 지운다. */
     fn drop(&mut self) {
         self.k0.zeroize();
         self.k1.zeroize();
     }
 }
 
-/** @brief 지금의 Unix 시각(초). 시계를 읽지 못하면 0. */
 fn unix_now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -211,11 +180,8 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
-/**
- * @brief 상수시간 바이트 비교.
- * @warning 짧은 비교라도 조기 종료하면 안 된다. 시간 차이로 서버 쿠키를 한 바이트씩
- *          맞춰 나갈 수 있다.
- */
+/// Constant time, even for short inputs: an early exit would let an attacker guess the server
+/// cookie byte by byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -228,12 +194,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-/** @brief 쿠키가 출발지에 묶이고 어긋난 것을 거부하는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 이 서버가 준 쿠키를 이 서버가 확인할 수 있는지. */
     fn roundtrip_validates() {
         let keeper = CookieKeeper::from_secret(&[7u8; 16]);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
@@ -246,7 +210,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트 쪽만 든 쿠키를 통과로 보지 않는지. */
     fn client_only_is_invalid() {
         let keeper = CookieKeeper::from_secret(&[9u8; 16]);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
@@ -257,7 +220,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 주소에서 온 쿠키를 거부하는지. 안 그러면 쿠키를 훔쳐 출발지를 속인다. */
     fn wrong_ip_fails() {
         let keeper = CookieKeeper::from_secret(&[3u8; 16]);
         let client = [8u8, 7, 6, 5, 4, 3, 2, 1];
@@ -270,7 +232,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 쿠키를 거부하는지. */
     fn malformed_rejected() {
         let keeper = CookieKeeper::from_secret(&[0u8; 16]);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -278,12 +239,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버 쿠키가 RFC 9018이 정한 배치인지.
-     *
-     * @details 4는 128비트를 Version 1, Reserved 3, Timestamp 4, Hash 8로 나눈다. 길이나
-     *          곳이 다르면 같은 비밀을 나눠 가진 다른 구현이 이 서버의 쿠키를 인정하지 못한다.
-     */
+    /// A different length or position would stop other implementations that share the secret from
+    /// accepting our cookies.
     fn server_cookie_has_the_interoperable_layout() {
         let keeper = CookieKeeper::from_secret(&[5u8; 16]);
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
@@ -305,7 +262,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief RFC 9018 Appendix A.1의 공식 IPv4 벡터와 해시 바이트까지 같은지. */
     fn server_cookie_matches_rfc9018_appendix_a1() {
         let secret = [
             0xe5, 0xe9, 0x73, 0xe5, 0xa6, 0xb2, 0xa4, 0x3f, 0x48, 0xe7, 0xdc, 0x84, 0x9e, 0x37,
@@ -326,7 +282,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 루트는 노드가 달라도 같은 쿠키를 만들고 다른 루트는 만들지 않는지. */
     fn shared_master_secret_is_stable_across_nodes() {
         let client = [1u8, 3, 5, 7, 9, 11, 13, 15];
         let ip: IpAddr = "2001:db8::53".parse().unwrap();
@@ -346,7 +301,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 월 경계에서 키가 바뀌되 직전 쿠키는 한 시간 수락 구간 동안 인정하는지. */
     fn rotating_secret_accepts_the_previous_epoch_at_the_boundary() {
         let keeper = CookieKeeper::from_master_secret(&[0x5a; 16]);
         let ip: IpAddr = "192.0.2.53".parse().unwrap();
@@ -381,12 +335,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 시각 구간 밖의 쿠키를 거부하는지.
-     *
-     * @details RFC 9018은 한 시간 과거와 5분 미래를 받아 주라고 한다. 구간이 없으면 한 번
-     *          새어 나간 쿠키가 영원히 유효해, 왕복 증명이 시간과 무관해진다.
-     */
     fn cookie_outside_the_time_window_is_rejected() {
         let keeper = CookieKeeper::from_secret(&[6u8; 16]);
         let ip: IpAddr = "192.0.2.9".parse().unwrap();
@@ -408,7 +356,7 @@ mod tests {
         assert!(!check(now + 3600), "한 시간 뒤는 거부합니다");
         assert!(check(now + 60), "1분 앞선 시계는 받아 줍니다");
 
-        /* 해시가 맞아도 버전이 다르면 이 서버의 것이 아니다. */
+        // A matching hash with another version is still not ours.
         let mut wrong_version = client.to_vec();
         let mut server = keeper.server_cookie_at(&client, ip, now);
         server[0] = 2;

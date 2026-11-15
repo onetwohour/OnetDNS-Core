@@ -1,55 +1,43 @@
-/*!
- * @brief IPv6 라우터 광고.
- *
- * @details 이 서버가 DNS 서버라고 알리려면 라우터 광고에 접두사를 담아 주기적으로 뿌려야
- *          한다. 원시 소켓이 필요해 리눅스에서만 돈다.
- * @warning 받은 요청을 검사하는 조건이 안전의 전부다. 홉 한계, 출발지 범위, 검사합을
- *          확인하지 않으면 망 밖에서 보낸 패킷에 이 서버가 응답한다.
- */
+//! IPv6 router advertisements carrying a prefix, sent periodically and in answer to router
+//! solicitations. Needs a raw socket, so it runs only on Linux.
+//!
+//! Checking received solicitations is the whole of its safety: without the hop limit, source scope,
+//! and checksum checks, packets from off-link would get answers.
 
 use std::net::Ipv6Addr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-/** @brief 라우터 광고 메시지 종류. */
 const ICMP6_RA: u8 = 134;
-/** @brief 라우터 요청 메시지 종류. */
 const ICMP6_RS: u8 = 133;
 
 #[derive(Debug, Clone)]
-/** @brief 광고에 담을 값들. */
 pub struct RaConfig {
-    /** @brief 알릴 주소 접두사. */
     pub prefix: Ipv6Addr,
-    /** @brief 접두사 길이. */
     pub prefix_len: u8,
 
-    /** @brief 주소를 DHCP로 받으라고 알린다. */
+    /// M flag: get addresses from DHCPv6.
     pub managed: bool,
 
-    /** @brief 주소 말고 다른 설정을 DHCP로 받으라고 알린다. */
+    /// O flag: get other settings from DHCPv6.
     pub other: bool,
-    /** @brief 이 서버를 기본 경로로 쓸 기간. 0이면 기본 경로가 아니다. */
+    /// 0 means not a default router.
     pub router_lifetime: u16,
-    /** @brief 이 접두사가 유효한 기간. */
     pub valid_lifetime: u32,
-    /** @brief 이 접두사를 새 연결에 쓸 기간. */
     pub preferred_lifetime: u32,
-    /** @brief 함께 알릴 최대 전송 크기. */
     pub mtu: Option<u32>,
 
-    /** @brief 함께 알릴 이 서버의 하드웨어 주소. */
+    /// Sent as the source link-layer address option.
     pub source_mac: Option<[u8; 6]>,
 
-    /** @brief 주기적으로 뿌릴 간격. 0이면 루트지 않는다. */
+    /// Seconds between advertisements; 0 turns advertising off.
     pub interval: u64,
 
-    /** @brief 내보낼 인터페이스 번호. */
     pub interface_index: u32,
 }
 
 impl Default for RaConfig {
-    /** @brief 접두사가 없으면 광고하지 않는다. */
+    /// No prefix means no advertisements.
     fn default() -> Self {
         RaConfig {
             prefix: Ipv6Addr::UNSPECIFIED,
@@ -67,7 +55,7 @@ impl Default for RaConfig {
     }
 }
 
-/** @brief 광고 패킷을 만든다. 설정에 없는 항목은 담지 않는다. */
+/// Options not configured are left out.
 pub fn build_ra(cfg: &RaConfig) -> Vec<u8> {
     let mut m = Vec::with_capacity(64);
     m.push(ICMP6_RA);
@@ -108,7 +96,7 @@ pub fn build_ra(cfg: &RaConfig) -> Vec<u8> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-/** @brief ICMPv6 검사합. 가짜 헤더를 포함해 계산한다. */
+/// Includes the pseudo-header.
 pub fn icmpv6_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, payload: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut add = |bytes: &[u8]| {
@@ -133,11 +121,7 @@ pub fn icmpv6_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, payload: &[u8]) -> u16 {
 }
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-/**
- * @brief 이 바이트열이 라우터 요청인지.
- * @details 옵션 길이를 끝까지 따라가며 전부 들어맞아야 참이다. 길이가 0이거나 남는
- *          바이트가 있으면 거짓이다.
- */
+/// Every option length must walk exactly to the end; a zero length or leftover bytes fail it.
 pub fn is_router_solicitation(icmp: &[u8]) -> bool {
     if icmp.len() < 8 || icmp[0] != ICMP6_RS || icmp[1] != 0 || icmp[4..8] != [0, 0, 0, 0] {
         return false;
@@ -161,12 +145,10 @@ pub fn is_router_solicitation(icmp: &[u8]) -> bool {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-/**
- * @brief 이 요청에 응답해도 되는 맥락인지.
- * @warning 홉 한계 255는 이 패킷이 라우터를 거치지 않았다는 유일한 증거다. 이것과
- *          출발지 범위, 검사합을 함께 보지 않으면 망 밖에서 이 서버를 부릴 수 있다.
- * @note 출발지가 미지정이면 링크 계층 주소 옵션이 있으면 안 된다. 규격이 금지한다.
- */
+/// Hop limit 255 is the only proof the packet crossed no router; without it, the source scope, and
+/// the checksum, off-link senders could drive this server.
+///
+/// An unspecified source must not carry a link-layer address option, which the spec forbids.
 fn valid_router_solicitation_context(
     icmp: &[u8],
     source: Ipv6Addr,
@@ -197,14 +179,10 @@ fn valid_router_solicitation_context(
 }
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-/**
- * @brief sysfs 표기의 링크 계층 주소를 6바이트로 바꾼다.
- *
- * @details 광고 옵션 1은 이더넷 6바이트만 담을 수 있으므로 길이가 다른 장치는 여기서
- *          걸러진다. 전부 0인 주소는 링크 계층 주소가 없다는 뜻이라 담지 않는다.
- * @param text 콜론으로 나뉜 16진 표기.
- * @return 6바이트 주소. 자릿수나 그룹 수가 다르거나 전부 0이면 None.
- */
+/// Option 1 holds only a 6-byte Ethernet address, so devices with other lengths are filtered here.
+/// An all-zero address means none and is left out.
+///
+/// `text` is colon-separated hex. None on a wrong digit or group count, or all zeros.
 fn parse_link_layer_address(text: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut groups = text.trim().split(':');
@@ -222,11 +200,11 @@ fn parse_link_layer_address(text: &str) -> Option<[u8; 6]> {
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 크기 상한을 걸어 sysfs 항목 하나를 읽는다. */
+/// With a size cap.
 fn read_sysfs_entry(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
 
-    /** @brief 인터페이스 번호도 주소 표기도 이보다 길지 않다. */
+    /// Neither an interface index nor an address is longer.
     const MAX_SYSFS_ENTRY: u64 = 128;
 
     let file = std::fs::File::open(path).ok()?;
@@ -241,14 +219,9 @@ fn read_sysfs_entry(path: &std::path::Path) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-/**
- * @brief 인터페이스 번호에 걸린 하드웨어 주소를 찾는다.
- *
- * @details sysfs를 읽는다. ioctl로 받으려면 요청 번호와 구조체 오프셋을 손으로 고정해야
- *          하고 그 값은 대상 아키텍처를 탄다.
- * @param interface_index 광고를 내보낼 인터페이스 번호. 0은 어느 장치인지 정하지 않았다는 뜻이다.
- * @return 이더넷 6바이트 주소. 장치를 못 찾거나 주소를 못 읽으면 None.
- */
+/// Reads sysfs: an ioctl would need the request number and struct offsets pinned by hand, and those
+/// vary by architecture. `interface_index` 0 means no device was chosen. None when the device or
+/// its address cannot be found.
 fn interface_mac(interface_index: u32) -> Option<[u8; 6]> {
     if interface_index == 0 {
         return None;
@@ -265,7 +238,7 @@ fn interface_mac(interface_index: u32) -> Option<[u8; 6]> {
     None
 }
 
-/** @brief 광고 스레드를 시작한다. 주기나 접두사가 없으면 시작하지 않는다. */
+/// Does not start without an interval or a prefix.
 pub fn spawn_ra(
     cfg: RaConfig,
     shutdown: Arc<AtomicBool>,
@@ -274,7 +247,8 @@ pub fn spawn_ra(
         return Ok(None);
     }
 
-    /* 하드웨어 주소를 실으면 호스트가 이웃 요청 왕복 없이 기본 경로를 쓴다. */
+    // With the link-layer address, hosts use the default route without a neighbor solicitation
+    // round trip.
     #[cfg(target_os = "linux")]
     let cfg = RaConfig {
         source_mac: cfg
@@ -309,7 +283,6 @@ pub fn spawn_ra(
 }
 
 #[cfg(target_os = "linux")]
-/** @brief 원시 ICMPv6 소켓을 쓰는 리눅스 구현. */
 mod linux {
     use super::{build_ra, valid_router_solicitation_context, RaConfig};
     use std::net::Ipv6Addr;
@@ -318,108 +291,68 @@ mod linux {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /**
-     * @brief 광고를 보내지 못한 누적 수.
-     * @details 요청 광고는 링크 위 아무나 유발할 수 있어 실패도 그만큼 잦아진다. 2의
-     *          거듭제곱 번째만 기록해 로그 자체가 부하가 되지 않게 한다.
-     */
+    /// Anyone on the link can trigger solicited advertisements, so failures can be just as
+    /// frequent; only powers of two are logged, so logging adds no load.
     static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-    /** @brief IPv6 주소 계열. */
     const AF_INET6: c_int = 10;
-    /** @brief 원시 소켓. */
     const SOCK_RAW: c_int = 3;
-    /** @brief ICMPv6. */
     const IPPROTO_ICMPV6: c_int = 58;
-    /** @brief IPv6 소켓 옵션 계층. */
     const IPPROTO_IPV6: c_int = 41;
-    /** @brief 다중 전송 홉 한계 설정. */
     const IPV6_MULTICAST_HOPS: c_int = 18;
-    /** @brief 다중 전송을 내보낼 인터페이스 설정. */
     const IPV6_MULTICAST_IF: c_int = 17;
-    /** @brief 다중 전송 그룹 가입. */
     const IPV6_ADD_MEMBERSHIP: c_int = 20;
-    /** @brief 받은 패킷의 목적지와 인터페이스를 함께 달라는 요청. */
     const IPV6_RECVPKTINFO: c_int = 49;
-    /** @brief 목적지와 인터페이스가 담긴 부가 정보 종류. */
     const IPV6_PKTINFO: c_int = 50;
-    /** @brief 받은 패킷의 홉 한계를 함께 달라는 요청. */
     const IPV6_RECVHOPLIMIT: c_int = 51;
-    /** @brief 홉 한계가 담긴 부가 정보 종류. */
     const IPV6_HOPLIMIT: c_int = 52;
-    /** @brief 소켓 공통 옵션 계층. */
     const SOL_SOCKET: c_int = 1;
-    /** @brief 수신 데드라인. 종료 신호를 확인하려면 수신이 깨어나야 한다. */
+    /// Wakes the receive so the shutdown signal is checked.
     const SO_RCVTIMEO: c_int = 20;
 
     #[repr(C)]
-    /** @brief 읽고 쓸 버퍼 하나. */
     struct Iovec {
-        /** @brief 버퍼가 시작하는 위치. */
         iov_base: *mut c_void,
-        /** @brief 버퍼 길이. */
         iov_len: usize,
     }
 
     #[repr(C)]
-    /** @brief 부가 정보까지 함께 주고받는 메시지 헤더. */
     struct Msghdr {
-        /** @brief 상대 주소를 담을 곳. */
         msg_name: *mut c_void,
-        /** @brief 그 주소의 크기. */
         msg_namelen: u32,
-        /** @brief 읽고 쓸 버퍼들. */
         msg_iov: *mut Iovec,
-        /** @brief 버퍼 개수. */
         msg_iovlen: usize,
-        /** @brief 부가 정보를 담을 곳. */
         msg_control: *mut c_void,
-        /** @brief 부가 정보의 크기. */
         msg_controllen: usize,
-        /** @brief 잘림 같은 결과 표시. */
         msg_flags: c_int,
     }
 
     #[repr(C)]
-    /** @brief 부가 정보 한 조각의 헤더. */
     struct Cmsghdr {
-        /** @brief 이 조각 전체의 길이. */
         cmsg_len: usize,
-        /** @brief 이 조각의 계층. */
         cmsg_level: c_int,
-        /** @brief 이 조각의 종류. */
         cmsg_type: c_int,
     }
 
     #[repr(C)]
-    /** @brief 가입할 다중 전송 그룹과 인터페이스. */
     struct Ipv6Mreq {
-        /** @brief 그룹 주소. */
+        /// 0 lets the kernel choose.
         multiaddr: [u8; 16],
-        /** @brief 가입할 인터페이스 번호. 0이면 커널이 고른다. */
         interface: u32,
     }
 
     #[repr(C)]
     #[derive(Default)]
-    /** @brief IPv6 소켓 주소. */
     struct SockaddrIn6 {
-        /** @brief 주소 계열. */
         sin6_family: u16,
-        /** @brief 포트. */
         sin6_port: u16,
-        /** @brief 흐름 정보. */
         sin6_flowinfo: u32,
-        /** @brief 주소. */
         sin6_addr: [u8; 16],
-        /** @brief 링크 지역 주소를 구분하는 번호. */
         sin6_scope_id: u32,
     }
 
     extern "C" {
-        /** @brief 소켓을 연다. */
         fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
-        /** @brief 소켓 옵션을 건다. */
         fn setsockopt(
             fd: c_int,
             level: c_int,
@@ -427,7 +360,6 @@ mod linux {
             optval: *const c_void,
             optlen: u32,
         ) -> c_int;
-        /** @brief 지정한 대상으로 보낸다. */
         fn sendto(
             fd: c_int,
             buf: *const c_void,
@@ -436,19 +368,16 @@ mod linux {
             addr: *const c_void,
             addrlen: u32,
         ) -> isize;
-        /** @brief 부가 정보까지 함께 받는다. */
         fn recvmsg(fd: c_int, msg: *mut Msghdr, flags: c_int) -> isize;
-        /** @brief 소켓을 닫는다. */
         fn close(fd: c_int) -> c_int;
     }
 
-    /** @brief 부가 정보 조각의 정렬 크기. */
     fn cmsg_align(length: usize) -> usize {
         let align = std::mem::size_of::<usize>();
         (length + align - 1) & !(align - 1)
     }
 
-    /** @brief 링크의 모든 노드를 가리키는 주소. 광고는 여기로 뿌린다. */
+    /// ff02::1 on this interface; advertisements go here.
     fn all_nodes(ifindex: u32) -> [u8; 28] {
         let mut b = [0u8; 28];
         b[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
@@ -461,11 +390,9 @@ mod linux {
         b
     }
 
-    /**
-     * @brief 라우터 요청을 하나 받아 응답해도 되는지까지 판단한다.
-     * @warning 잘린 메시지나 잘린 부가 정보는 버린다. 잘린 것을 그대로 믿으면 홉 한계나
-     *          목적지가 빠진 채로 검사를 통과한다.
-     */
+    /// Receives one router solicitation and decides whether to answer it. Truncated messages or
+    /// control data are dropped: trusting them would pass the checks with the hop limit or
+    /// destination missing.
     fn recv_rs(fd: c_int, cfg: &RaConfig, buf: &mut [u8]) -> bool {
         let mut source = SockaddrIn6::default();
         let mut control = [0u8; 128];
@@ -542,11 +469,8 @@ mod linux {
         )
     }
 
-    /**
-     * @brief 광고 반복을 돌린다.
-     * @details 주기마다 루트고, 사이에 들어온 요청에도 응답한다. 필요한 옵션을 걸지
-     *          못했으면 요청 응답은 접고 주기 광고만 한다.
-     */
+    /// Advertises every interval and answers solicitations in between. When the options it needs
+    /// cannot be set, it stops answering solicitations and only advertises periodically.
     pub fn run(cfg: RaConfig, shutdown: Arc<AtomicBool>) {
         let fd = unsafe { socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) };
         if fd < 0 {
@@ -586,7 +510,7 @@ mod linux {
             {
                 ancillary_ready = false;
             }
-            /* 라우터 요청은 ff02::2로 온다. 포워딩이 꺼진 호스트는 이 그룹에 가입하지 않는다. */
+            // Router solicitations go to ff02::2, which hosts with forwarding off do not join.
             let all_routers = Ipv6Mreq {
                 multiaddr: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02],
                 interface: cfg.interface_index,
@@ -678,11 +602,9 @@ mod linux {
 }
 
 #[cfg(test)]
-/** @brief 광고 패킷의 각 항목과, 요청 판별이 규격대로인지. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 설정. */
     fn cfg() -> RaConfig {
         RaConfig {
             prefix: "2001:db8:1::".parse().unwrap(),
@@ -700,7 +622,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 헤더 항목들이 설정대로 담기는지. */
     fn ra_header_fields() {
         let m = build_ra(&cfg());
         assert_eq!(m[0], 134, "type=RA");
@@ -712,7 +633,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소 배정 방식 표시가 담기는지. */
     fn ra_managed_flag() {
         let mut c = cfg();
         c.managed = true;
@@ -722,7 +642,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 옵션들이 담기는지. */
     fn ra_options_present() {
         let m = build_ra(&cfg());
 
@@ -752,7 +671,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정하지 않은 옵션은 빠지는지. */
     fn ra_omits_optional_options() {
         let mut c = cfg();
         c.mtu = None;
@@ -764,7 +682,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief sysfs 표기를 읽어 옵션에 담을 수 있는지. */
     fn link_layer_address_parses_sysfs_form() {
         assert_eq!(
             parse_link_layer_address("00:15:5d:a3:27:58\n"),
@@ -777,11 +694,10 @@ mod tests {
     }
 
     #[test]
-    /** @brief 6바이트로 담을 수 없는 주소는 걸러지는지. */
     fn link_layer_address_rejects_unusable_forms() {
-        /* 링크 계층 주소가 없는 장치는 전부 0으로 나온다. 그대로 광고하면 안 된다. */
+        // Devices without a link-layer address read as all zeros; advertising that would be wrong.
         assert_eq!(parse_link_layer_address("00:00:00:00:00:00"), None);
-        /* 터널은 4바이트, 인피니밴드는 20바이트로 옵션에 담을 수 없다. */
+        // Tunnels have 4 bytes and InfiniBand 20, which the option cannot hold.
         assert_eq!(parse_link_layer_address("00:00:00:00"), None);
         assert_eq!(
             parse_link_layer_address("00:00:00:00:fe:80:00:00:00:00:00:00:00:00:00:00:00:00:00:00"),
@@ -795,19 +711,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    /** @brief 인터페이스를 정하지 않았으면 주소를 지어내지 않는지. */
     fn interface_mac_needs_an_explicit_index() {
         assert_eq!(interface_mac(0), None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    /**
-     * @brief 실제 인터페이스의 주소를 sysfs에서 읽어 오는지.
-     *
-     * @details 이 호스트에 있는 이더넷 장치를 직접 찾아 번호와 주소를 읽고, 같은 번호로
-     *          조회한 결과가 일치하는지 본다. 장치가 없는 환경에서는 건너뛴다.
-     */
+    /// Finds an Ethernet device on this host, reads its index and address, and checks that the
+    /// lookup by that index matches. Skipped where there is no such device.
     fn interface_mac_reads_a_real_device() {
         let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
             return;
@@ -835,7 +746,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검사합이 규격대로인지. */
     fn checksum_matches_rfc_internet_checksum() {
         let src: Ipv6Addr = "fe80::1".parse().unwrap();
         let dst: Ipv6Addr = "ff02::1".parse().unwrap();
@@ -850,7 +760,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요청을 알아보고 어긋난 것을 거르는지. */
     fn detects_router_solicitation() {
         assert!(is_router_solicitation(&[133, 0, 0, 0, 0, 0, 0, 0]));
         assert!(!is_router_solicitation(&[134, 0, 0, 0]));
@@ -859,12 +768,10 @@ mod tests {
 }
 
 #[cfg(test)]
-/** @brief 망가진 바이트열에도 파서가 패닉하지 않는지. */
 mod fuzz_tests {
     use super::*;
 
     #[test]
-    /** @brief 어떤 바이트열이 와도 판별이 오류로 끝날 뿐 패닉하지 않는지. */
     fn router_solicitation_parsing_never_panics_on_malformed_bytes() {
         use crate::fuzzutil::{havoc, Rng};
 

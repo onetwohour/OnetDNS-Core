@@ -1,11 +1,4 @@
-/*!
- * @brief DoH 리스너.
- *
- * @details TLS 위 HTTP/2로 DNS 메시지를 주고받는다. 상대가 HTTP/2를 협상하지 못하면
- *          1.1로 전환한다.
- * @note 경로에 클라이언트 식별자를 담을 수 있다. 다만 그것은 인증된 연결에서만 신뢰한다.
- *       평문 경로에 적힌 값은 누구나 지어낼 수 있다.
- */
+//! DoH listener: DNS over HTTP/2 over TLS, with HTTP/1.1 for clients that do not negotiate h2.
 
 use std::io;
 #[cfg(test)]
@@ -29,28 +22,22 @@ use crate::connection_limit::{
 use crate::native::NativeServer;
 use crate::transport_observe;
 
-/** @brief DoH 리스너. 사라질 때 연결 스레드를 정리한다. */
+/// Stops the listener and joins its threads when dropped.
 pub struct DohListener {
-    /** @brief 이 리스너가 묶인 주소. */
     addr: SocketAddr,
-    /** @brief 반복을 끝내라는 표시. */
     stop: Arc<AtomicBool>,
-    /** @brief 루프를 실행하는 스레드. */
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/** @brief 연결 하나의 입출력 데드라인. */
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DohListener {
-    /** @brief 이 리스너가 묶인 주소. */
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 }
 
 impl Drop for DohListener {
-    /** @brief 종료를 알리고 연결 스레드가 끝나기를 기다린다. */
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         wake_tcp_listener(self.addr);
@@ -60,15 +47,9 @@ impl Drop for DohListener {
     }
 }
 
-/**
- * @brief 이 응답을 HTTP 캐시가 얼마나 신선하다고 볼지.
- *
- * @details RFC 8484는 그 시간이 답변부 최소 TTL을 넘지 못하게 하고, 답변부가 비고
- *          권한부에 SOA가 있으면 그 MINIMUM을 넘지 못하게 한다. 둘 다 없으면 0을 준다.
- *          명시하지 않으면 중간 캐시가 스스로 어림잡아 TTL보다 오래 가지고 있을 수 있다.
- * @param msg 내보낼 응답.
- * @return max-age에 담을 초.
- */
+/// max-age for the response. RFC 8484 caps it at the smallest answer TTL, or the SOA MINIMUM for an
+/// empty answer; 0 when there is neither. Without it, intermediate caches would guess a lifetime
+/// and could keep the answer past its TTL.
 pub(crate) fn http_freshness_secs(msg: &Message) -> u32 {
     if let Some(ttl) = msg.answers.iter().map(|record| record.ttl).min() {
         return ttl;
@@ -83,7 +64,6 @@ pub(crate) fn http_freshness_secs(msg: &Message) -> u32 {
         .unwrap_or(0)
 }
 
-/** @brief 리스너를 열고 연결을 받는다. */
 pub fn serve_doh(
     addr: SocketAddr,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
@@ -276,11 +256,8 @@ pub fn serve_doh(
     })
 }
 
-/**
- * @brief 경로에 담긴 클라이언트 식별자를 신뢰할지 정한다.
- * @warning 인증된 연결에서만 받아들인다. 그러지 않으면 아무나 경로에 남의 식별자를
- *          적어 그 클라이언트의 정책을 가져갈 수 있다.
- */
+/// A client ID in the path counts only on an authenticated connection; otherwise anyone could write
+/// another client's ID there and get its policy.
 pub(crate) fn authenticated_path_identity(
     path_identity: Option<&str>,
     authenticated: bool,
@@ -300,7 +277,6 @@ pub(crate) fn authenticated_path_identity(
     Ok(Some(auth_identity.to_string()))
 }
 
-/** @brief 연결 하나에서 HTTP 요청을 받아 처리한다. */
 fn serve_conn(
     tcp: PrefixedTcp,
     tls: &ServerConfig,
@@ -320,11 +296,9 @@ fn serve_conn(
     let tls_auth_identity = conn.client_auth_identity().map(|s| s.to_string());
     let mut stream = TlsStream::new(conn, tcp);
 
-    /*
-     * 실패는 HTTP 상태로 알린다. 읽지 못한 본문은 요청 잘못이므로 4xx 여야 한다.
-     * 5xx 는 서버 잘못이라는 뜻이라 클라이언트가 같은 서버에 다시 보낸다. 질의 처리기가
-     * 답하지 않기로 한 질의에는 상태도 보내지 않고 연결을 끝낸다.
-     */
+    // Failures are HTTP statuses. An unreadable body is the request's fault, so it gets a 4xx; a
+    // 5xx means a server fault, and clients would resend to the same server. A query the handler
+    // chose not to answer gets no status; the connection just ends.
     let dns = |q: &[u8],
                path_client_id: Option<&str>|
      -> Result<Option<onetdns_http2::DohAnswer>, &'static str> {
@@ -404,11 +378,9 @@ fn serve_conn(
 }
 
 #[cfg(test)]
-/** @brief 데드라인 처리, 경로 식별자의 인증 요구, 그리고 두 HTTP 버전의 왕복. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 SOA. */
     fn soa(minimum: u32) -> onetdns_proto::RData {
         onetdns_proto::RData::Soa(Box::new(onetdns_proto::Soa {
             mname: onetdns_proto::Name::from_str("ns.example.com").unwrap(),
@@ -422,10 +394,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief HTTP 캐시 유효 기간이 RFC 8484의 상한을 넘지 않는지.
-     * @details 답변부가 있으면 그 최소 TTL, 없고 SOA가 있으면 MINIMUM, 둘 다 없으면 0이다.
-     */
     fn http_freshness_never_outlives_the_dns_answer() {
         let name = onetdns_proto::Name::from_str("host.example.com").unwrap();
 
@@ -468,7 +436,6 @@ mod tests {
     use std::net::UdpSocket;
 
     #[test]
-    /** @brief 핸드셰이크 중인 연결도 종료 때 정리되는지. */
     fn dropping_doh_listener_joins_idle_handshake() {
         let (tls, _) = self_signed();
         let listener = serve_doh(
@@ -499,7 +466,6 @@ mod tests {
 
     use crate::native::NativeBackend;
 
-    /** @brief 고정 응답을 내는 테스트용 업스트림. */
     fn mock_upstream() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -526,12 +492,10 @@ mod tests {
         addr
     }
 
-    /** @brief 테스트용 질의 핸들러. */
     fn native_handler() -> Arc<NativeServer> {
         native_handler_with(Arc::new(IpAcl::allow_all()))
     }
 
-    /** @brief 이 접근 제어를 건 테스트용 질의 핸들러. */
     fn native_handler_with(acl: Arc<dyn onetdns_core::AccessControl>) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
@@ -546,12 +510,10 @@ mod tests {
         ))
     }
 
-    /** @brief 테스트용 자체 서명 설정. */
     fn self_signed() -> (Arc<ServerConfig>, Arc<TrustStore>) {
         self_signed_alpn(vec![b"h2".to_vec()])
     }
 
-    /** @brief 프로토콜 목록을 지정한 테스트용 설정. */
     fn self_signed_alpn(alpn: Vec<Vec<u8>>) -> (Arc<ServerConfig>, Arc<TrustStore>) {
         let (certs, key) = onetdns_transport::self_signed_material("dns.test").unwrap();
         let cert_der = certs[0].clone();
@@ -563,7 +525,6 @@ mod tests {
         (Arc::new(cfg), trust)
     }
 
-    /** @brief HTTP/2 프레임 하나를 읽는다. */
     fn read_frame<S: Read>(s: &mut S) -> Option<(FrameHeader, Vec<u8>)> {
         let mut hdr = [0u8; 9];
         s.read_exact(&mut hdr).ok()?;
@@ -573,7 +534,6 @@ mod tests {
         Some((h, p))
     }
 
-    /** @brief HTTP/2로 질의를 보내고 답을 받는다. */
     fn doh_post(addr: SocketAddr, trust: Arc<TrustStore>, query: &[u8]) -> Vec<u8> {
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -639,7 +599,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증되지 않은 연결의 경로 식별자를 무시하는지. 받으면 남의 정책을 가져갈 수 있다. */
     fn path_identity_requires_transport_authentication() {
         assert_eq!(
             authenticated_path_identity(Some("admin"), false, None),
@@ -658,7 +617,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HTTP/2 위에서 질의가 해석되는지. */
     fn doh_h2_over_self_tls_resolves() {
         let (tls, trust) = self_signed();
         let handler = native_handler();
@@ -690,7 +648,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /** @brief HTTP/1.1로 질의를 보내고 답을 받는다. */
     fn doh_post_h1(addr: SocketAddr, trust: Arc<TrustStore>, query: &[u8]) -> Vec<u8> {
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -744,7 +701,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HTTP/1.1로 전환해도 질의가 해석되는지. */
     fn doh_h1_over_self_tls_resolves() {
         let (tls, trust) = self_signed_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let handler = native_handler();
@@ -770,12 +726,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버리는 주소가 HTTP 상태를 하나도 받지 못하는지.
-     * @details 버리는 주소는 TLS 핸드셰이크도 마치지 못한다. 연결이 열린 뒤에 그 주소를
-     *          버리도록 바뀌면 질의 처리기가 답하지 않고 연결은 상태 없이 닫힌다. 그것을
-     *          502로 바꿔 보내면 클라이언트는 같은 질의를 다시 보낸다.
-     */
+    /// A dropped address cannot finish the TLS handshake. If it becomes dropped after connecting,
+    /// the handler gives no answer and the connection closes without a status; a 502 instead would
+    /// make the client resend.
     fn doh_drops_listed_clients_without_an_http_status() {
         let dropping = || -> Arc<dyn onetdns_core::AccessControl> {
             Arc::new(IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]))

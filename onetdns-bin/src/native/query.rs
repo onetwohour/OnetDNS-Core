@@ -1,6 +1,5 @@
-/*!
- * @brief 일반 질의 처리. 접근 제어, 쿠키, 정책 판정, 해석, 응답 후처리를 이 순서로 거친다.
- */
+//! Normal query handling: access control, cookies, policy, resolution, and response
+//! post-processing, in that order.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -36,7 +35,6 @@ use crate::native::{
 };
 
 impl NativeServer {
-    /** @brief 이 뷰에 이 이름의 답이 있는지. */
     fn view_local_answer(
         &self,
         client: &ClientInfo,
@@ -68,7 +66,7 @@ impl NativeServer {
         None
     }
 
-    /** @brief 서버 이름과 버전을 묻는 질의에 답한다. 감추기로 했으면 답하지 않는다. */
+    /// Answers CHAOS name and version queries, unless they are configured hidden.
     fn handle_chaos(&self, request: &Message, qname: &ApName) -> Option<Message> {
         let name = qname.to_ascii_lower();
         let f = self.features.load();
@@ -100,7 +98,6 @@ impl NativeServer {
         Some(m)
     }
 
-    /** @brief 이 요청을 보낸 클라이언트를 알아본다. */
     pub(crate) fn identify(&self, ctx: &RequestCtx) -> ClientInfo {
         let transport = core_transport(ctx.transport);
         let mut client = ClientInfo {
@@ -123,11 +120,8 @@ impl NativeServer {
         client
     }
 
-    /**
-     * @brief 이 주소에서 온 것을 아무 응답 없이 버려야 하는지 보고, 버린다면 그 사실을 남긴다.
-     * @details 전송은 질의를 읽거나 핸드셰이크를 하기 전에 이것으로 연결과 패킷을 거른다.
-     *          FORMERR 나 TLS 경고 하나라도 보내면 그 주소에 서버가 있다는 것이 드러난다.
-     */
+    /// Logs when it drops. Transports call this before reading a query or handshaking: a single
+    /// FORMERR or TLS alert would reveal a server at that address.
     pub fn drops_source(&self, source: IpAddr) -> bool {
         let source = canonical_source_ip(source);
         match self.acl.drops(source) {
@@ -139,12 +133,9 @@ impl NativeServer {
         }
     }
 
-    /**
-     * @brief 이 클라이언트를 아무 응답 없이 버려야 하는지 보고, 버린다면 그 사실을 남긴다.
-     * @details drops_source 와 달리 클라이언트 ID 까지 본다. ID 규칙이 있으면 목록 밖인지가 ID 로
-     *          정해져서, 주소만 보고는 버리지 못한 클라이언트가 여기까지 온다. 질의를 읽은 뒤 어떤
-     *          응답이든 내보내기 전에 이것으로 거른다.
-     */
+    /// Unlike drops_source, this also checks the client ID. With ID rules, the ID decides whether a
+    /// client is listed, so clients the address check could not drop reach this point. Called after
+    /// the query is read and before any response goes out.
     pub(crate) fn drops_client(&self, ctx: &RequestCtx) -> bool {
         if self.acl.is_trivially_allow() {
             return false;
@@ -159,11 +150,8 @@ impl NativeServer {
         }
     }
 
-    /**
-     * @brief 질의 하나를 실제로 처리한다.
-     * @details 입장, 요청 정책, 해석, 답 완성, 응답 정책을 차례로 거친다. 어느 단계든 응답을
-     *          확정하면 뒤 단계는 건너뛴다.
-     */
+    /// Admission, request policy, resolution, answer completion, then response policy. Once a stage
+    /// settles the response, the rest are skipped.
     pub(crate) fn handle_inner(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
         let f = self.features.load();
         let policy = self.policy.load();
@@ -173,7 +161,6 @@ impl NativeServer {
         }
     }
 
-    /** @brief handle_inner 의 단계를 순서대로 잇는다. */
     fn run_pipeline(
         &self,
         request: &Message,
@@ -194,11 +181,9 @@ impl NativeServer {
         ControlFlow::Continue(Some(finalize(response, scope.resp_edns.take())))
     }
 
-    /**
-     * @brief 입장 단계. 메시지 형식, opcode, 접근 제어, EDNS, 쿠키, 속도 제한을 본다.
-     * @details UPDATE 와 NOTIFY 는 여기서 권한 영역 처리로 넘기고 끝낸다. 통과하면 질문이
-     *          정확히 하나인 일반 질의다.
-     */
+    /// Message format, opcode, access control, EDNS, cookies, and rate limits. UPDATE and NOTIFY
+    /// are handed to authority handling here. A query that passes is a normal query with exactly
+    /// one question.
     fn admit<'r>(
         &self,
         request: &'r Message,
@@ -211,10 +196,8 @@ impl NativeServer {
         }
 
         if request.header.opcode == 4 || request.header.opcode == 5 {
-            /*
-             * UPDATE 는 ZCLASS 가 달라도 형식 오류가 아니다. RFC 2136은 그것을
-             * 이 서버가 맡지 않은 영역으로 보고 NOTAUTH 로 답하게 하므로 handle_update 로 넘긴다.
-             */
+            // A different ZCLASS on UPDATE is not a format error: RFC 2136 treats it as a zone this
+            // server is not authoritative for and requires NOTAUTH, so it goes to handle_update.
             let valid_zone_question = request.questions.len() == 1
                 && request.questions[0].qtype == ApRt::SOA
                 && (request.header.opcode == 5 || request.questions[0].qclass == DnsClass::IN);
@@ -228,10 +211,8 @@ impl NativeServer {
         }
 
         let client = self.identify(ctx);
-        /*
-         * 버릴 클라이언트는 handle 이 이미 걸렀다. 그 사이 접근 제어가 바뀌어 여기서 버림이
-         * 나오면 바뀐 규칙을 따른다.
-         */
+        // handle has already filtered dropped clients. If the ACL changed in between and drops
+        // here, the new rule applies.
         let acl = self.acl.check(&client);
         if let AclDecision::Drop(reason) = acl {
             note_dropped(client.source_ip, reason);
@@ -292,10 +273,8 @@ impl NativeServer {
             )));
         }
         let [question] = request.questions.as_slice() else {
-            /*
-             * RFC 9619는 opcode 0인 DNS 메시지가 QDCOUNT를 1보다 크게 담을 수 없다고 정한다. 응답도
-             * opcode 0이므로 그대로 돌려주면 이 서버의 답이 같은 규칙을 어긴다. 질문부를 비운다.
-             */
+            // RFC 9619 forbids QDCOUNT above 1 in opcode 0 messages. The response is opcode 0 too,
+            // so echoing the questions would break the same rule; the question section is cleared.
             let mut response = edns_error_resp(request, ResponseCode::FormErr, f.edns_buffer);
             response.questions.clear();
             return ControlFlow::Break(Some(response));
@@ -329,12 +308,10 @@ impl NativeServer {
                 )));
             }
 
-            /*
-             * RFC 6891: 요청에 OPT가 있으면 응답에도 반드시 넣는다. 빼면 상대는 이 서버가 EDNS를
-             * 모르는 것으로 보고 512바이트로 전환하고, 쿠키·NSID·패딩·EDE를 담을 슬롯도 없다.
-             * 이미 읽어 둔 요청 EDNS를 그대로 고쳐 쓴다. base_edns를 부르면 같은 OPT를 한 번
-             * 더 파싱하며 곧 버릴 옵션들을 항목마다 복제한다.
-             */
+            // RFC 6891: a request with OPT gets a response with OPT. Without it, the peer assumes
+            // no EDNS and falls back to 512 bytes, leaving no room for cookies, NSID, padding, or
+            // EDE. This edits the request EDNS already parsed; base_edns would parse the same OPT
+            // again and clone options about to be dropped.
             let mut response_edns = request_edns;
             response_edns.udp_payload = advertised_udp_payload(f.edns_buffer);
             response_edns.extended_rcode = 0;
@@ -360,11 +337,9 @@ impl NativeServer {
                             );
                         }
                     }
-                    /*
-                     * COOKIE는 OPT 안에만 있으므로 이 요청에는 반드시 OPT가 있었다. 위에서
-                     * 만든 응답 OPT를 그대로 담아야 RFC 6891을 지킨다. 빼면 상대는
-                     * 이 서버가 EDNS를 모르는 것으로 보고 512바이트로 전환한다.
-                     */
+                    // COOKIE lives only in OPT, so this request had one, and the response must
+                    // carry the OPT built above to keep RFC 6891. Without it, the peer falls back
+                    // to 512 bytes.
                     None => {
                         return ControlFlow::Break(
                             scope.reply(error_resp(request, ResponseCode::FormErr), None),
@@ -418,11 +393,9 @@ impl NativeServer {
         ControlFlow::Continue(scope)
     }
 
-    /**
-     * @brief 요청 정책 단계. 해석 전에 답을 정할 수 있는 규칙을 본다.
-     * @details 존 전송, CHAOS, 최소 ANY, 로컬 답, AAAA 차단, 정책 엔진, 필터 순서다. 통과하면
-     *          이후 단계가 같은 필터 판본을 쓰도록 그 판본을 돌려준다.
-     */
+    /// Rules that can decide before resolution, in order: zone transfer, CHAOS, minimal ANY, local
+    /// answers, AAAA blocking, policy engine, filter. On pass, returns the filter snapshot so later
+    /// stages use the same one.
     fn apply_request_policy(
         &self,
         scope: &mut QueryScope<'_>,
@@ -463,11 +436,10 @@ impl NativeServer {
             );
         }
 
-        /*
-         * 이 서버가 맡은 영역 밖이면 이름이 있는지 알 수 없으므로 여기서 바로 합성한다. 안이면
-         * 표준 알고리즘을 먼저 돌린 뒤 답 구간만 바꾼다. 없는 이름에 NOERROR를 주면 존재를
-         * 알리는 셈이고 부정 캐시도 서지 않는다.
-         */
+        // Outside the zones this server serves, whether the name exists is unknown, so the answer
+        // is synthesized right away. Inside them, the standard algorithm runs first and only the
+        // answer section is replaced: NOERROR for a nonexistent name would claim it exists, and no
+        // negative cache entry would form.
         if scope.minimal_any(f) && !self.serves_zone_for(qname) {
             self.rec(&scope.client, Action::Resolved, Some(qname), Some(qtype));
             return ControlFlow::Break(
@@ -595,10 +567,7 @@ impl NativeServer {
         ControlFlow::Continue(filter)
     }
 
-    /**
-     * @brief 동시에 해석 중인 질의 수를 한도 안에 묶는다.
-     * @return 해석이 끝날 때까지 들고 있어야 하는 자리. 한도가 없으면 None 이다.
-     */
+    /// Returns the slot to hold until resolution ends; None without a limit.
     fn acquire_inflight(
         &self,
         scope: &mut QueryScope<'_>,
@@ -618,10 +587,8 @@ impl NativeServer {
         ControlFlow::Continue(Some(InflightGuard(&self.inflight)))
     }
 
-    /**
-     * @brief 해석 단계. 안전 검색이 이름을 바꾸면 바뀐 이름으로 해석 체인에 묻는다.
-     * @details 해석이 실패하면 사유를 기록하고 SERVFAIL 로 끝낸다.
-     */
+    /// When safe search rewrites the name, the chain is asked for the rewritten one. A failure logs
+    /// its reason and ends in SERVFAIL.
     fn resolve_query<'r>(
         &self,
         scope: &mut QueryScope<'r>,
@@ -652,12 +619,10 @@ impl NativeServer {
             }
         }
 
-        /*
-         * RA 와 RCODE 는 질의에서 뜻이 없다. 그대로 두면 업스트림이 그 비트를 보고 다른 답을
-         * 줄 수 있고, 캐시 키가 정상 질의와 갈라져 매번 밖으로 나간다. 지워서 정상 질의와 같은
-         * 캐시를 쓰게 한다. 응답의 RA 와 RCODE 는 이 서버가 따로 정하므로 지워도 클라이언트가
-         * 받는 답은 달라지지 않는다.
-         */
+        // RA and RCODE mean nothing in a query. Left in, an upstream might answer differently, and
+        // the cache key would split from normal queries so every such query goes out. Clearing them
+        // shares the normal cache entry; this server sets the response's RA and RCODE itself, so
+        // clients see no difference.
         let normalize_header = request.header.recursion_available || request.header.rcode != 0;
         let resolve_req =
             if resolve_name == *qname && request.additionals.is_empty() && !normalize_header {
@@ -705,10 +670,8 @@ impl NativeServer {
         })
     }
 
-    /**
-     * @brief 해석 체인이 준 응답을 이 서버의 답으로 완성한다. 최소 ANY 와 DNS64 합성을 한다.
-     * @details 상류가 SERVFAIL 이나 REFUSED 를 주면 필터를 거치지 않고 그대로 끝낸다.
-     */
+    /// Minimal ANY and DNS64 synthesis. An upstream SERVFAIL or REFUSED ends here without the
+    /// filter.
     fn complete_answer<'r>(
         &self,
         scope: &mut QueryScope<'r>,
@@ -722,11 +685,9 @@ impl NativeServer {
 
         normalize_recursive_response(resp, request);
 
-        /*
-         * 표준 알고리즘이 낸 응답에서 답 구간만 합성 HINFO로 바꾼다. 없는 이름의 NXDOMAIN,
-         * 자료가 없는 이름의 NODATA, 권한 표시는 그대로 둔다. RFC 8482는 QNAME에 CNAME이
-         * 있으면 합성하지 말라고 하므로 그때도 그대로 둔다.
-         */
+        // Replaces only the answer section of the standard response with synthesized HINFO;
+        // NXDOMAIN, NODATA, and authority flags stay. RFC 8482 says not to synthesize when the
+        // QNAME has a CNAME, so that case stays too.
         if scope.minimal_any(f)
             && resp.header.rcode == ResponseCode::NoError.0
             && !resp.answers.is_empty()
@@ -743,10 +704,9 @@ impl NativeServer {
                 .answers
                 .iter()
                 .any(|record| matches!(&record.rdata, ApRData::Aaaa(_)));
-            /*
-             * NOERROR 응답에만 합성한다. NXDOMAIN 은 그대로 둬야 하고, SERVFAIL 이나 REFUSED 를
-             * A 로 받아 합성하면 상류의 실패가 정상 응답으로 둔갑해 클라이언트가 없는 경로를 쓴다.
-             */
+            // NOERROR only. NXDOMAIN must stay, and synthesizing from an A-query SERVFAIL or
+            // REFUSED would turn an upstream failure into a normal answer, sending the client down
+            // a path that does not exist.
             if qtype == ApRt::AAAA
                 && resp.header.rcode == ResponseCode::NoError.0
                 && (!has_aaaa || f.dns64_synthall)
@@ -794,12 +754,10 @@ impl NativeServer {
             }
         }
 
-        /*
-         * 근거 없이 비어 온 NOERROR도 그대로 전달한다. RFC 2308이 모든 구간이 빈 것을
-         * NODATA의 한 모양으로 열거해 두었고, SOA가 없을 때 규격이 정한 처분은 거절이 아니라
-         * 캐시 금지다. 특히 RFC 4074는 IPv6 주소가 없는 이름의 AAAA에 SERVFAIL을 주면
-         * 질의자가 A로 다시 묻지 못하고 되풀이한다고 고정한다. 담지 않는 것은 캐시 계층이 한다.
-         */
+        // An unproven empty NOERROR passes through too. RFC 2308 lists all-empty sections as a form
+        // of NODATA, and without a SOA the rule is not to cache it, not to reject it. RFC 4074
+        // records that a SERVFAIL for the AAAA of a name without IPv6 keeps resolvers from falling
+        // back to A. The cache layer handles not storing it.
         if resp.header.rcode == ResponseCode::NoError.0
             && !response_has_requested_answer(&resolved.request, resp)
             && !has_negative_soa(resp)
@@ -837,11 +795,9 @@ impl NativeServer {
         ControlFlow::Continue(resolved)
     }
 
-    /**
-     * @brief 응답 정책 단계. 완성된 답을 보고 걸러 낸다.
-     * @details 리바인드 보호, 가짜 NXDOMAIN 주소, 답 주소 거부 목록, 별칭 뒤 차단, RPZ 주소
-     *          규칙, 응답 정책 엔진 순서다. 답을 걷어내는 규칙은 각자 자기 응답을 만들어 끝낸다.
-     */
+    /// Filters the finished answer, in order: rebind protection, bogus NXDOMAIN addresses, the
+    /// answer address deny list, blocking behind aliases, RPZ IP rules, the response policy engine.
+    /// Rules that strip answers build and return their own response.
     fn apply_response_policy(
         &self,
         scope: &mut QueryScope<'_>,
@@ -984,10 +940,8 @@ impl NativeServer {
             );
         }
 
-        /*
-         * 후처리 뒤에도 같은 판단이다. 이 서버의 필터가 답을 걷어내 비게 된 경우는 걷어내는 곳에서
-         * 각자 자기 응답을 만들어 돌려주므로 여기까지 오지 않는다.
-         */
+        // The same check after post-processing. When this server's filter strips an answer to
+        // empty, the stripping site returns its own response, so that case never reaches here.
         if resp.header.rcode == ResponseCode::NoError.0
             && !response_has_requested_answer(request, &resp)
             && !has_negative_soa(&resp)
@@ -1060,29 +1014,24 @@ impl NativeServer {
     }
 }
 
-/**
- * @brief 단계가 응답을 확정했거나 질의를 버리기로 해 처리를 끝낸다는 표시.
- * @details Break 에 담긴 값이 handle_inner 의 반환값이 된다. None 은 응답하지 않는다는 뜻이다.
- */
+/// Ends processing because a stage settled the response or chose to drop. The Break value becomes
+/// handle_inner's return; None sends no response.
 type Stage<T> = ControlFlow<Option<Message>, T>;
 
-/** @brief 입장을 통과한 질의 하나가 이후 단계를 지나는 동안 함께 쓰는 값. */
+/// Values a query carries through the stages after admission.
 struct QueryScope<'r> {
     request: &'r Message,
     edns_buffer: u16,
     block_ttl: u32,
     client: ClientInfo,
-    /** @brief 응답에 실을 OPT. 요청에 OPT가 없고 NSID 도 붙이지 않았으면 None 이다. */
+    /// None when the request had no OPT and no NSID is attached.
     resp_edns: Option<Edns>,
     qname: ApName,
     qtype: ApRt,
 }
 
 impl QueryScope<'_> {
-    /**
-     * @brief 응답을 확정한다. ede 가 있으면 사유를 붙인다.
-     * @note 응답 OPT를 가져가므로 한 질의에 한 번만 부른다.
-     */
+    /// `ede` adds the reason. Takes the response OPT, so call it once per query.
     fn reply(&mut self, message: Message, ede: Option<(u16, &str)>) -> Option<Message> {
         let edns = self.resp_edns.take();
         let edns = match ede {
@@ -1092,44 +1041,37 @@ impl QueryScope<'_> {
         Some(finalize(message, edns))
     }
 
-    /**
-     * @brief ANY 를 RFC 8482의 합성 HINFO로 줄여 답할지.
-     * @details RFC 8482는 ANY를 온전히 답하지 않는 방법을 셋만 열거하고, 그 밖에는 표준 알고리즘을
-     *          따르라고 정한다. 거절은 그 셋에 없으므로 합성 HINFO로 답한다. DO를 설정한 질의자에게는
-     *          관례대로 답한다. 서명된 영역이면 RRSIG를 함께 요구하는데 합성한 레코드에는 붙일 서명이
-     *          없다. 관례적 응답은 그 자체로 표준 알고리즘이다.
-     */
+    /// RFC 8482 lists only three ways to avoid answering ANY in full, and refusal is not one of
+    /// them; otherwise the standard algorithm applies. A querier with DO gets the conventional
+    /// answer instead: a signed zone needs RRSIGs, and a synthesized record has none to attach. The
+    /// conventional answer is the standard algorithm.
     fn minimal_any(&self, f: &NativeFeatures) -> bool {
         self.qtype == ApRt::ANY && !f.allow_any && !wants_dnssec(self.request)
     }
 }
 
-/** @brief 해석 단계가 넘기는 값. */
 struct Resolved<'r> {
     response: Message,
-    /** @brief 해석 체인에 보낸 요청. 이름을 바꿨거나 클라이언트 구간 EDNS를 걷어냈으면 사본이다. */
+    /// A copy when the name was rewritten or client-hop EDNS was stripped.
     request: Cow<'r, Message>,
-    /** @brief 안전 검색이 원래 이름에서 바꾼 이름으로 잇는 CNAME. 답 맨 앞에 붙인다. */
+    /// CNAME from the original name to the safe-search name, prepended to the answer.
     safe_cname: Option<ApRecord>,
 }
 
-/** @brief 질의 기록에 남길 걸린 규칙과 그 규칙이 들어 있던 목록. */
 #[derive(Default, Clone, Copy)]
 pub(crate) struct RuleMatch<'a> {
-    /** @brief 걸린 규칙. */
     pub(crate) rule: &'a str,
-    /** @brief 그 규칙이 들어 있던 목록. 목록에 속하지 않으면 비어 있다. */
+    /// Empty when the rule belongs to no list.
     pub(crate) list: &'a str,
 }
 
 impl<'a> From<&'a str> for RuleMatch<'a> {
-    /** @brief 목록 없이 규칙 이름만 남긴다. */
     fn from(rule: &'a str) -> Self {
         RuleMatch { rule, list: "" }
     }
 }
 
-/** @brief 출발지 주소를 한 형태로 맞춘다. IPv4를 담은 IPv6 표기를 펴지 않으면 같은 주소가 제한을 두 번 받는다. */
+/// Without unmapping IPv4-mapped IPv6, the same address would be limited twice.
 fn canonical_source_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -1140,7 +1082,6 @@ fn canonical_source_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/** @brief 전송 종류를 공통 표현으로. */
 fn core_transport(t: RtTransport) -> Transport {
     match t {
         RtTransport::Do53Udp => Transport::Do53Udp,
@@ -1153,7 +1094,6 @@ fn core_transport(t: RtTransport) -> Transport {
     }
 }
 
-/** @brief 전송 종류를 기록 형식의 표현으로. */
 pub(crate) fn dnstap_proto(t: RtTransport) -> onetdns_control::DnstapProtocol {
     match t {
         RtTransport::Do53Udp => onetdns_control::DnstapProtocol::Udp,
@@ -1165,7 +1105,6 @@ pub(crate) fn dnstap_proto(t: RtTransport) -> onetdns_control::DnstapProtocol {
     }
 }
 
-/** @brief 요청에 담긴 쿠키. */
 pub(crate) fn read_cookie(request: &Message) -> Option<Vec<u8>> {
     let opt = request.opt()?;
     let edns = Edns::from_record(opt)?;
@@ -1175,11 +1114,8 @@ pub(crate) fn read_cookie(request: &Message) -> Option<Vec<u8>> {
         .map(|(_, b)| b.clone())
 }
 
-/**
- * @brief 클라이언트와 이 서버의 사이에서만 뜻이 있는 옵션을 뗀다.
- * @warning 떼지 않고 업스트림으로 넘기면 그 옵션이 업스트림에 이 서버의 클라이언트 정보를 흘리거나,
- *          응답 캐시 키를 쓸데없이 구분한다.
- */
+/// Strips options that only mean something between the client and this server. Passed upstream,
+/// they would leak client information or split the response cache key for nothing.
 fn strip_client_hop_edns(request: &mut Message) {
     request
         .additionals
@@ -1206,11 +1142,8 @@ fn strip_client_hop_edns(request: &mut Message) {
     }
 }
 
-/**
- * @brief 응답 OPT에 알릴 UDP 크기.
- * @details 설정이 512보다 작으면 기본값으로 올린다. 빠른 경로와 구조적 경로가 같은 값을
- *          알려야 한다. 어긋나면 같은 질의에 경로마다 다른 바이트가 나간다.
- */
+/// Below 512, the default is advertised instead. The fast and structured paths must advertise the
+/// same value, or one query would get different bytes per path.
 pub(crate) fn advertised_udp_payload(configured: u16) -> u16 {
     if configured < 512 {
         DEFAULT_EDNS_PAYLOAD
@@ -1219,7 +1152,6 @@ pub(crate) fn advertised_udp_payload(configured: u16) -> u16 {
     }
 }
 
-/** @brief 응답에 담을 기본 옵션. */
 pub(crate) fn base_edns(request: &Message, udp_payload: u16) -> Edns {
     let payload = advertised_udp_payload(udp_payload);
     let mut edns = request
@@ -1233,14 +1165,13 @@ pub(crate) fn base_edns(request: &Message, udp_payload: u16) -> Edns {
     edns
 }
 
-/** @brief 쿠키를 담은 응답 옵션. */
 fn cookie_edns(request: &Message, cookie: Vec<u8>, udp_payload: u16) -> Edns {
     let mut edns = base_edns(request, udp_payload);
     edns.options.push((OPT_COOKIE, cookie));
     edns
 }
 
-/** @brief 검증됐다는 표시를 지운다. 이 서버가 검증하지 않은 것을 검증됐다고 하면 안 된다. */
+/// This server must not claim validation it did not do.
 fn clear_dnssec_assertion(message: &mut Message) {
     message.header.authentic_data = false;
     let is_proof =
@@ -1251,7 +1182,6 @@ fn clear_dnssec_assertion(message: &mut Message) {
 }
 
 #[cfg(test)]
-/** @brief 일반 질의의 처리 순서와 판정. */
 mod tests {
     use super::*;
     use crate::native::tests::{ctx, q, shaped_server, update_features};
@@ -1270,7 +1200,6 @@ mod tests {
     use crate::native::{CookiePolicy, OPT_COOKIE, OPT_NSID};
 
     #[test]
-    /** @brief 표기가 다른 같은 주소를 하나로 보는지. 안 그러면 제한을 두 배로 받는다. */
     fn ipv4_mapped_v6_canonicalizes_to_v4() {
         let mapped: IpAddr = "::ffff:1.2.3.4".parse().unwrap();
         assert_eq!(
@@ -1286,9 +1215,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 서버와 클라이언트 사이에서만 뜻이 있는 옵션만 떼는지. 더 떼면 응답이 달라진다. */
+    /// Stripping more would change the response.
     fn client_hop_edns_is_stripped_before_resolver_and_semantic_options_remain() {
-        /** @brief 쿠키를 담은 테스트용 질의. */
         fn request(cookie: u8) -> Message {
             let mut request = q("edns-hop.example");
             let mut edns = Edns {
@@ -1335,7 +1263,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief lenient 쿠키가 무쿠키 wire 질의는 늦추지 않고 쿠키 클라이언트에는 발급하는지. */
     fn lenient_cookie_keeps_plain_wire_and_handles_cookie_requests_structurally() {
         use onetdns_runtime::WireDisposition;
 
@@ -1394,12 +1321,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 형식이 틀린 COOKIE를 FORMERR로 거절하되 응답 OPT는 유지하는지.
-     * @details RFC 7873이 길이 8도 16에서 40도 아닌 옵션을 FORMERR로 정하고,
-     *          RFC 6891이 요청에 OPT가 있으면 응답에도 넣게 한다. OPT를 빼면 상대는
-     *          이 서버가 EDNS를 모르는 것으로 보고 512바이트 평문으로 전환한다.
-     */
+    /// RFC 7873 makes a COOKIE whose length is neither 8 nor 16 to 40 a FORMERR, and RFC 6891
+    /// requires OPT in the response when the request had one; without it, the peer falls back to
+    /// 512-byte plain DNS.
     fn malformed_cookie_is_formerr_that_still_carries_opt() {
         let server = shaped_server(true);
         update_features(&server, |features| {
@@ -1448,7 +1372,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 암호화 전송으로 왔다는 사실이 정책까지 전해지는지. */
     fn encrypted_runtime_transport_is_preserved() {
         assert_eq!(core_transport(RtTransport::DoT), Transport::DoT);
         assert_eq!(core_transport(RtTransport::DoH), Transport::DoH);

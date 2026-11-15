@@ -1,6 +1,4 @@
-/*!
- * @brief 접미사에 따라 전달과 재귀로 갈라 보내는 Split 백엔드.
- */
+//! Split backend: forwards or recurses by name suffix.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,30 +9,21 @@ use super::configured_name_key;
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 이 질의를 어디로 보낼지. */
 pub enum Route {
-    /** @brief 전달로 보낸다. */
     Forward,
-    /** @brief 재귀로 보낸다. */
     Recurse,
 }
 
-/** @brief 접미사에 따라 전달과 재귀를 갈라 보내는 것. */
 pub struct SplitResolver {
-    /** @brief 전달 경로. */
     forward: Arc<dyn Resolver>,
-    /** @brief 재귀 경로. */
+    /// Used when no list matches.
     recurse: Arc<dyn Resolver>,
-    /** @brief 어느 목록에도 없을 때 갈 곳. */
     default: Route,
-    /** @brief 재귀로 보낼 접미사들. */
     recurse_suffixes: HashSet<Vec<u8>>,
-    /** @brief 전달로 보낼 접미사들. */
     forward_suffixes: HashSet<Vec<u8>>,
 }
 
 impl SplitResolver {
-    /** @brief 두 경로와 분기 규칙으로 만든다. */
     pub fn new(
         forward: Arc<dyn Resolver>,
         recurse: Arc<dyn Resolver>,
@@ -75,7 +64,6 @@ impl SplitResolver {
         })
     }
 
-    /** @brief 이 이름을 어디로 보낼지. */
     fn route_for(&self, name: &Name) -> Route {
         let mut key = [0u8; 255];
         for labels in (0..=name.num_labels()).rev() {
@@ -94,7 +82,6 @@ impl SplitResolver {
 }
 
 impl Resolver for SplitResolver {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         match self.resolve_outcome(req) {
             ResolveOutcome::Response(response) => Some(response),
@@ -102,7 +89,6 @@ impl Resolver for SplitResolver {
         }
     }
 
-    /** @brief 분기 규칙대로 보낸다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let Some(q) = req.questions.first() else {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -115,7 +101,6 @@ impl Resolver for SplitResolver {
 }
 
 #[cfg(test)]
-/** @brief Split 경로 선택과 로컬 주소 합성. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -128,7 +113,6 @@ mod tests {
     use crate::layers::local_address::{LocalAddressLayer, LocalAddressTable};
 
     #[test]
-    /** @brief 분기 규칙과 고정해 둔 주소가 함께 동작하는지. */
     fn split_local_and_routing() {
         let fwd = Mock::new(3, ResponseCode::NoError.0);
         let rec = Mock::new(4, ResponseCode::NoError.0);

@@ -1,11 +1,8 @@
-/*!
- * @brief 업스트림 인증서의 폐기 확인.
- *
- * @details 인증서에 적힌 주소로 OCSP나 폐기 목록을 받아 온다. 검증 자체는 tls 크레이트가
- *          하고, 여기서는 받아 오는 일과 처분을 맡는다.
- * @warning 확인에 실패했을 때 통과시킬지 막을지가 정책이다. 통과시키면 확인을 막는 것만으로
- *          폐기된 인증서를 쓸 수 있고, 막으면 확인 서버가 죽었을 때 이 서버도 멈춘다.
- */
+//! Revocation checks for upstream certificates: fetches OCSP or CRLs from the URLs in the
+//! certificate. The tls crate verifies them; this fetches and decides.
+//!
+//! What happens when the check fails is policy. Passing lets anyone who can block the check use a
+//! revoked certificate; blocking stops this server whenever the responder is down.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,30 +12,23 @@ use onetdns_tls::X509;
 
 use crate::http;
 
-/** @brief 받아들일 OCSP 응답 크기 상한. */
 const MAX_OCSP_RESPONSE: u64 = 1024 * 1024;
-/** @brief 받아들일 폐기 목록 크기 상한. */
 const MAX_CRL_RESPONSE: u64 = 16 * 1024 * 1024;
 
-/** @brief 확인 없이 통과시킨 누적 횟수. 2의 거듭제곱 번째만 경고해 로그 폭주를 막는다. */
+/// Warned at powers of two.
 static SOFT_PASSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 폐기 확인 방식. */
 pub enum RevocationMode {
-    /** @brief 확인하지 않는다. */
     Off,
-    /** @brief OCSP로 확인한다. */
     Ocsp,
-    /** @brief 폐기 목록으로 확인한다. */
     Crl,
 
-    /** @brief 인증서에 적힌 것을 보고 고른다. */
+    /// Chooses by what the certificate lists.
     Auto,
 }
 
 impl RevocationMode {
-    /** @brief 설정 문자열을 방식으로. */
     pub fn parse(s: &str) -> RevocationMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "ocsp" => RevocationMode::Ocsp,
@@ -49,23 +39,18 @@ impl RevocationMode {
     }
 }
 
-/** @brief 폐기를 확인하는 것. */
 pub struct RevocationChecker {
-    /** @brief 확인 방식. */
     pub mode: RevocationMode,
-    /** @brief 확인하지 못했을 때 통과시킬지. */
+    /// Pass when the check cannot be made.
     pub soft_fail: bool,
-    /**
-     * @brief OCSP와 폐기 목록에 각각 쓸 수 있는 시간. 주소가 여럿이면 이 시간을 나눠 쓴다.
-     * @note 자동 방식은 OCSP 다음에 폐기 목록을 확인하므로 최대 두 배까지 걸린다.
-     */
+    /// For OCSP and for CRLs each, shared across their URLs. Auto checks OCSP and then CRLs, so it
+    /// can take twice this.
     pub timeout: Duration,
-    /** @brief 확인 서버 이름을 풀 방법. 자기 자신에게 묻지 않으려는 것이다. */
+    /// Resolves responder names without asking this server.
     resolver: Option<http::HostResolver>,
 }
 
 impl RevocationChecker {
-    /** @brief 방식과 실패 처분, 데드라인으로 만든다. */
     pub fn new(mode: RevocationMode, soft_fail: bool, timeout: Duration) -> Self {
         RevocationChecker {
             mode,
@@ -75,19 +60,14 @@ impl RevocationChecker {
         }
     }
 
-    /** @brief 확인 서버 이름을 풀 방법을 지정한다. 자기 자신에게 묻지 않으려는 것이다. */
     pub fn with_resolver(mut self, resolver: http::HostResolver) -> Self {
         self.resolver = Some(resolver);
         self
     }
 
-    /**
-     * @brief 검증한 인증 경로에서 리프가 폐기됐는지 확인한다.
-     * @param chain TLS 검증이 돌려준 인증 경로. 리프 바로 다음 인증서를 발급자로 쓴다.
-     * @warning 상대가 보낸 체인을 그대로 넘기면 안 된다. 리프를 루트가 바로 발급했으면 그
-     *          체인의 두 번째 인증서는 아무도 검증하지 않은 값이고, 그 키로 서명한 가짜 폐기
-     *          응답이 통과한다.
-     */
+    /// `chain` must be the path TLS verification built; the certificate after the leaf is taken as
+    /// its issuer. The chain the peer sent will not do: when a root issued the leaf directly, its
+    /// second certificate is unverified, and a forged response signed with that key would pass.
     pub fn check_chain(&self, chain: &[X509], now: i64) -> Result<RevocationStatus, String> {
         if self.mode == RevocationMode::Off {
             return Ok(RevocationStatus::Good);
@@ -121,11 +101,7 @@ impl RevocationChecker {
         }
     }
 
-    /**
-     * @brief 확인하지 못했을 때의 처분.
-     * @warning 통과시키면 확인을 막는 것만으로 폐기된 인증서를 쓸 수 있다. 운영자가
-     *          정한 대로 따르되 사유는 반드시 남긴다.
-     */
+    /// Follows the operator's choice, and always logs why.
     fn soft(&self, why: &str) -> Result<RevocationStatus, String> {
         if self.soft_fail {
             let count = SOFT_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -140,14 +116,12 @@ impl RevocationChecker {
         }
     }
 
-    /** @brief 인증서에 적힌 OCSP 주소를 차례로 물어 확인한다. */
     fn via_ocsp(&self, leaf: &X509, issuer: &X509, now: i64) -> Option<RevocationStatus> {
         first_definitive(&leaf.ocsp_urls, self.timeout, |url, remaining| {
             self.ocsp_once(url, remaining, leaf, issuer, now)
         })
     }
 
-    /** @brief OCSP 응답 서버 하나에 묻는다. */
     fn ocsp_once(
         &self,
         url: &str,
@@ -186,14 +160,12 @@ impl RevocationChecker {
         }
     }
 
-    /** @brief 인증서에 적힌 폐기 목록 주소를 차례로 받아 확인한다. */
     fn via_crl(&self, leaf: &X509, issuer: &X509, now: i64) -> Option<RevocationStatus> {
         first_definitive(&leaf.crl_urls, self.timeout, |url, remaining| {
             self.crl_once(url, remaining, leaf, issuer, now)
         })
     }
 
-    /** @brief 폐기 목록 하나를 받아 확인한다. */
     fn crl_once(
         &self,
         url: &str,
@@ -234,13 +206,10 @@ impl RevocationChecker {
     }
 }
 
-/**
- * @brief 주소를 차례로 시도해 처음 나온 확정 답을 돌려준다.
- * @details 폐기됨이나 정상을 받으면 멈춘다. 알 수 없음을 받았거나 받아 오지 못했으면 다음
- *          주소로 넘어간다. 시도마다 남은 시간만 넘기므로 주소가 많아도 전체가 예산을 넘지
- *          않는다.
- * @return 확정 답이 없을 때 알 수 없음을 한 번이라도 받았으면 알 수 없음, 아니면 없음.
- */
+/// Tries the URLs in order and stops at the first revoked or good answer; an unknown answer or a
+/// failed fetch moves on. Each try gets only the time left, so the total stays within the budget.
+///
+/// Without a definitive answer: Unknown if any server answered unknown, None otherwise.
 fn first_definitive(
     urls: &[String],
     budget: Duration,
@@ -264,7 +233,6 @@ fn first_definitive(
     unknown
 }
 
-/** @brief PEM 체인을 DER 목록으로. */
 pub fn pem_chain_to_ders(pem: &str) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut rest = pem;
@@ -281,9 +249,7 @@ pub fn pem_chain_to_ders(pem: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/** @brief base64 디코딩. */
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -315,7 +281,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/** @brief 체인을 확인하고 결과를 JSON으로. 대시보드가 쓴다. */
+/// For the dashboard.
 pub fn check_pem_chain_json(
     pem: &str,
     now: i64,
@@ -352,7 +318,6 @@ pub fn check_pem_chain_json(
     ))
 }
 
-/** @brief 상태를 JSON 값으로. */
 fn status_json(s: Option<RevocationStatus>) -> &'static str {
     match s {
         Some(RevocationStatus::Good) => "\"good\"",
@@ -363,12 +328,10 @@ fn status_json(s: Option<RevocationStatus>) -> &'static str {
 }
 
 #[cfg(test)]
-/** @brief 방식 해석과 실패 처분. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 방식 이름이 읽히는지. */
     fn mode_parse() {
         assert_eq!(RevocationMode::parse("ocsp"), RevocationMode::Ocsp);
         assert_eq!(RevocationMode::parse("CRL"), RevocationMode::Crl);
@@ -378,14 +341,13 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인을 끄면 그냥 통과하는지. */
     fn off_mode_passes() {
         let c = RevocationChecker::new(RevocationMode::Off, false, Duration::from_secs(1));
         assert_eq!(c.check_chain(&[], 0).unwrap(), RevocationStatus::Good);
     }
 
     #[test]
-    /** @brief 경로에 발급자가 없을 때 정책대로 갈리는지. 인증서 핀으로 믿은 리프가 이렇다. */
+    /// A leaf trusted through a certificate pin has no issuer in the path.
     fn missing_issuer_softfails_or_hardfails() {
         let (certs, _key) = onetdns_transport::self_signed_material("leaf.test").unwrap();
         let leaf = X509::parse(&certs[0]).unwrap();
@@ -398,13 +360,11 @@ mod tests {
         assert!(hard.check_chain(std::slice::from_ref(&leaf), 0).is_err());
     }
 
-    /** @brief 주소 목록을 만든다. */
     fn urls(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()
     }
 
     #[test]
-    /** @brief 첫 주소가 실패하거나 모르면 다음 주소로 넘어가고, 확정 답에서 멈추는지. */
     fn later_urls_are_tried_until_a_definitive_answer() {
         let answers = |url: &str| match url {
             "down" => None,
@@ -442,7 +402,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확정 답이 없을 때, 알 수 없음을 받은 적이 있는지에 따라 결과가 갈리는지. */
     fn no_definitive_answer_reports_unknown_only_if_a_server_answered() {
         let none = first_definitive(&urls(&["a", "b"]), Duration::from_secs(5), |_, _| None);
         assert_eq!(none, None);
@@ -459,7 +418,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소들이 예산 하나를 나눠 쓰는지. 앞 주소가 쓴 시간만큼 뒤 주소의 몫이 준다. */
     fn urls_share_one_budget() {
         let budget = Duration::from_millis(400);
         let mut given = Vec::new();
@@ -495,7 +453,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 인증서가 든 PEM이 풀리는지. */
     fn pem_chain_decodes_multiple() {
         let (cert_pem, _key_pem) = onetdns_transport::generate_self_signed_pem("a.test").unwrap();
         let two = format!("{cert_pem}\n{cert_pem}");

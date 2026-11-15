@@ -1,76 +1,47 @@
-/*!
- * @brief 레인의 처리 한계를 측정하는 테스트 전용 프로브.
- *
- * @details 실제 레인과 별개로 최소한의 세션 기계를 다시 만들어, 판정 논리를 걷어낸
- *          상태의 상한을 측정한다. 그래야 느린 이유가 판정 때문인지 구조 때문인지 갈린다.
- * @note 기본 실행에서 제외돼 있다. 환경 변수로 질의 목록과 업스트림을 지정해야 돌아간다.
- */
+//! Test-only probe for the lane's throughput ceiling. It rebuilds a minimal session machine without
+//! the decision logic, which separates structural cost from decision cost.
+//!
+//! Ignored by default; it runs only when environment variables name the query list and upstream.
 
 use super::*;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 
-/** @brief 프로브의 왕복 하나. */
 struct Exchange {
-    /** @brief 보낸 질의. */
     sent: Message,
-    /** @brief 지금 물어보는 서버. */
     target: SocketAddr,
-    /** @brief 순서대로 시도할 서버들. */
+    /// Servers to try, in order.
     ladder: Vec<SocketAddr>,
-    /** @brief 시도 중인 위치. */
     ladder_idx: usize,
-    /** @brief 서버 하나에 줄 시간. */
     per_server: Duration,
-    /** @brief 이 왕복의 데드라인. */
     deadline: Instant,
-    /** @brief 보낸 시각. */
     sent_at: Instant,
 }
 
-/** @brief 프로브의 해석 하나. */
 struct Session {
-    /** @brief 해석 중인 이름. */
     qname: Name,
-    /** @brief 해석 중인 타입. */
     qtype: RecordType,
-    /** @brief 위임 진행 위치. */
     state: IterationState,
-    /** @brief 다음 질의의 모양. */
     plan: NextQuery,
-    /** @brief 답을 기다리는 왕복. */
     exchange: Option<Exchange>,
-    /** @brief 이 해석 전용 소켓. */
     sock: std::net::UdpSocket,
-    /** @brief 해석 전체의 데드라인. */
     session_deadline: Instant,
-    /** @brief 밟은 단계 수. */
     steps: usize,
-    /** @brief 단계 수 상한. */
     step_cap: usize,
 }
 
-/** @brief 프로브 해석이 멈춘 이유. */
 enum SessionEnd {
-    /** @brief 응답을 얻었다. */
     Done(Message),
-    /** @brief 실패했다. */
     Failed,
 
-    /** @brief 네임서버 주소가 필요하다. */
     NeedAddrs {
-        /** @brief 주소를 알아내야 할 서버 이름들. */
         missing: Vec<Name>,
-        /** @brief 그 주소를 기다리는 위임. */
         pending: Box<PendingReferral>,
     },
 }
 
-/**
- * @brief 질의 문맥을 만든다. 프로브는 검증하지 않는다.
- * @note 프로브가 얻은 답은 질의자에게 나가지 않고 경로를 측정하는 데만 쓰이므로, 서명을
- *       달라고 해서 응답만 키울 이유가 없다.
- */
+/// The probe does not validate: its answers never reach a client, so asking for signatures would
+/// only enlarge replies.
 fn make_ctx(qname: &Name, qtype: RecordType) -> IterationContext<'_> {
     IterationContext {
         qname,
@@ -82,7 +53,7 @@ fn make_ctx(qname: &Name, qtype: RecordType) -> IterationContext<'_> {
 }
 
 impl Session {
-    /** @brief 캐시된 위임이나 루트에서 해석을 시작한다. */
+    /// Starts from a cached delegation or the root.
     fn start(r: &Recursor, qname: Name, qtype: RecordType, now: Instant) -> Option<Self> {
         let (zone, servers) = r
             .deepest_cached_delegation(&qname)
@@ -113,7 +84,6 @@ impl Session {
         Some(s)
     }
 
-    /** @brief 다음 질의를 보낸다. */
     fn send_next(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
         self.steps += 1;
         if self.steps > self.step_cap {
@@ -130,7 +100,6 @@ impl Session {
         self.fire_attempt(r, ladder, 0, per_server, now)
     }
 
-    /** @brief 사다리의 현재 서버에 보낸다. */
     fn fire_attempt(
         &mut self,
         r: &Recursor,
@@ -161,7 +130,6 @@ impl Session {
         Ok(())
     }
 
-    /** @brief 시간 초과 시 다음 서버로 넘어간다. */
     fn on_exchange_timeout(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
         let Some(ex) = self.exchange.take() else {
             return Err(());
@@ -170,7 +138,7 @@ impl Session {
         self.fire_attempt(r, ex.ladder, ex.ladder_idx + 1, ex.per_server, now)
     }
 
-    /** @brief 응답을 읽어 이 서버의 질의에 대한 것인지 확인한다. */
+    /// Accepts only a reply to the current exchange.
     fn try_recv(&mut self, r: &Recursor) -> Option<Message> {
         let ex = self.exchange.as_ref()?;
         let mut buf = [0u8; 4096];
@@ -200,7 +168,6 @@ impl Session {
         }
     }
 
-    /** @brief 응답으로 한 단계 나아간다. */
     fn on_response(&mut self, r: &Recursor, resp: Message, now: Instant) -> Option<SessionEnd> {
         if let Some(ex) = self.exchange.take() {
             r.infra_success(ex.target.ip(), &self.state.zone, ex.sent_at.elapsed());
@@ -219,7 +186,6 @@ impl Session {
         }
     }
 
-    /** @brief 받아 온 주소로 참조를 이어 간다. */
     fn resume_with_addrs(
         &mut self,
         r: &Recursor,
@@ -243,7 +209,7 @@ impl Session {
     }
 }
 
-/** @brief 프로브용 리졸버. 업스트림은 환경 변수로 지정한다. */
+/// The upstream comes from `RP_ROOT`.
 fn build_recursor() -> (Recursor, SocketAddr) {
     let root: SocketAddr = std::env::var("RP_ROOT")
         .unwrap_or_else(|_| "127.0.1.1:53".into())
@@ -254,7 +220,7 @@ fn build_recursor() -> (Recursor, SocketAddr) {
     (r, root)
 }
 
-/** @brief 질의 목록을 파일에서 읽는다. 지정하지 않으면 프로브를 건너뛴다. */
+/// Reads the query list from `RP_QUERIES`; `None` skips the probe.
 fn load_queries() -> Option<Vec<Name>> {
     let path = std::env::var("RP_QUERIES").ok()?;
     let text = std::fs::read_to_string(&path).expect("Query file");
@@ -268,7 +234,6 @@ fn load_queries() -> Option<Vec<Name>> {
     Some(names)
 }
 
-/** @brief 환경 변수를 수로 읽는다. 없으면 기본값. */
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -276,7 +241,7 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/** @brief 세션과 대기 목록에서 같은 위치를 함께 지운다. 둘이 어긋나면 엉뚱한 소켓을 기다린다. */
+/// Removes index `i` from both lists together; if they drift apart, the wrong socket is polled.
 fn remove_at(sessions: &mut Vec<Session>, fds: &mut Vec<libc::pollfd>, i: usize) {
     sessions.swap_remove(i);
     if i < fds.len() {
@@ -286,7 +251,7 @@ fn remove_at(sessions: &mut Vec<Session>, fds: &mut Vec<libc::pollfd>, i: usize)
 
 #[test]
 #[ignore]
-/** @brief 판정 없이 세션만 돌렸을 때의 처리량 상한을 측정한다. */
+/// Throughput ceiling of sessions without decision logic.
 fn reactor_ceiling_probe() {
     let Some(mut names) = load_queries() else {
         eprintln!("RP_QUERIES not set; skipping probe");
@@ -374,91 +339,64 @@ fn reactor_ceiling_probe() {
     assert!(done > 0, "0 completed; is the authoritative tier running?");
 }
 
-/** @brief 프로브 서버가 받은 클라이언트 요청 하나. */
 struct ClientReq {
-    /** @brief 질의를 보낸 곳. */
     addr: SocketAddr,
-    /** @brief 질의 번호. */
     id: u16,
-    /** @brief 물어본 것들. */
     questions: Vec<Question>,
-    /** @brief 재귀를 요구했는지. */
     rd: bool,
 
-    /** @brief 별칭을 따라오며 모은 답들. */
+    /// Answers gathered while following aliases.
     acc_answers: Vec<Record>,
-    /** @brief 별칭을 몇 번 따라왔는지. 상한이 없으면 순환에서 못 빠져나온다. */
+    /// Bounds alias loops.
     cname_hops: usize,
 }
 
-/** @brief 프로브 슬롯의 역할. */
 enum SlotKind {
-    /** @brief 클라이언트가 직접 물은 것. */
     Root(ClientReq),
 
-    /** @brief 서버 주소를 알아내려고 이 서버가 스스로 낸 질의. */
-    NsAddr { parent: usize },
+    /// Resolving a nameserver address for `parent`.
+    NsAddr {
+        parent: usize,
+    },
 }
 
-/** @brief 주소를 기다리며 멈춘 참조. */
+/// A referral parked until its nameserver addresses arrive.
 struct Parked {
-    /** @brief 따라가던 위임. */
     pending: Box<PendingReferral>,
-    /** @brief 주소를 아직 모르는 서버 이름들. */
     missing: Vec<Name>,
-    /** @brief 그중 다음에 물어볼 곳. */
     next_missing: usize,
-    /** @brief 지금까지 알아낸 주소들. */
     addrs: Vec<SocketAddr>,
-    /** @brief 이 슬롯이 낸 하위 질의 수. */
     children_spawned: usize,
 }
 
-/** @brief 프로브의 슬롯 하나. */
 struct Slot {
-    /** @brief 이 슬롯의 해석 상태. */
     session: Session,
-    /** @brief 이 슬롯이 무엇을 위한 것인지. */
     kind: SlotKind,
-    /** @brief 서버 주소를 기다리며 멈춰 있는 상태. */
     parked: Option<Parked>,
 
-    /** @brief 같은 질의를 물어 이 슬롯의 답을 함께 받을 것들. */
     followers: Vec<ClientReq>,
 }
 
 #[derive(Default)]
-/** @brief 프로브 서버가 세는 지표. */
 struct SrvStats {
-    /** @brief 끝낸 수. */
     done: usize,
-    /** @brief 실패한 수. */
     failed: usize,
-    /** @brief 같은 질의로 합쳐진 수. */
     merged: usize,
 }
 
-/** @brief 프로브용 최소 서버. 레인 구조만 흉내 낸다. */
+/// Minimal server that mimics only the lane's structure.
 struct Srv<'a> {
-    /** @brief 돌고 있는 해석 슬롯들. */
     slots: Vec<Option<Slot>>,
-    /** @brief 다시 쓸 수 있는 슬롯들. */
     free: Vec<usize>,
-    /** @brief 쓰는 재귀 리졸버. */
     r: &'a Recursor,
-    /** @brief 클라이언트 질의를 받는 소켓. */
     listener: &'a std::net::UdpSocket,
-    /** @brief 지금까지의 셈. */
     stats: SrvStats,
 
-    /** @brief 같은 질의를 이미 물어본 위치. */
     inflight: std::collections::HashMap<(Vec<u8>, RecordType), usize>,
-    /** @brief 같은 질의를 하나로 합칠지. */
     singleflight: bool,
 }
 
 impl<'a> Srv<'a> {
-    /** @brief 리졸버와 수신 소켓으로 서버를 만든다. */
     fn new(r: &'a Recursor, listener: &'a std::net::UdpSocket) -> Self {
         Self {
             slots: Vec::new(),
@@ -471,12 +409,10 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 살아 있는 슬롯 수. */
     fn live(&self) -> usize {
         self.slots.iter().flatten().count()
     }
 
-    /** @brief 빈 위치에 슬롯을 넣는다. */
     fn insert(&mut self, slot: Slot) -> usize {
         match self.free.pop() {
             Some(i) => {
@@ -490,7 +426,6 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 끝난 해석을 정리한다. */
     fn settle(&mut self, idx: usize, end: SessionEnd, now: Instant) {
         let Some(mut slot) = self.slots[idx].take() else {
             return;
@@ -517,7 +452,6 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 부수 해석을 자식으로 시작한다. */
     fn spawn_child(&mut self, parent: usize, qname: Name, now: Instant) {
         match Session::start(self.r, qname, RecordType::A, now) {
             Some(session) => {
@@ -536,7 +470,6 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 해석을 마무리하고 역할에 맞게 처리한다. */
     fn finish(&mut self, idx: usize, slot: Slot, outcome: Option<Message>, now: Instant) {
         self.free.push(idx);
         match slot.kind {
@@ -607,7 +540,6 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 주소를 받아 온 부모를 이어 간다. */
     fn resume_parent(&mut self, parent: usize, addrs: Vec<SocketAddr>, now: Instant) {
         let Some(mut pslot) = self.slots[parent].take() else {
             return;
@@ -639,7 +571,7 @@ impl<'a> Srv<'a> {
         }
     }
 
-    /** @brief 별칭을 따라 같은 슬롯에서 다시 시작한다. */
+    /// Follows an alias in the same slot.
     fn restart_root(
         &mut self,
         client: ClientReq,
@@ -673,7 +605,6 @@ impl<'a> Srv<'a> {
     }
 }
 
-/** @brief 응답에서 따라갈 별칭 대상을 찾는다. */
 fn chase_target(m: &Message, qname: &Name, qtype: RecordType) -> Option<Name> {
     if qtype == RecordType::CNAME || m.header.rcode != ResponseCode::NoError.0 {
         return None;
@@ -694,7 +625,6 @@ fn chase_target(m: &Message, qname: &Name, qtype: RecordType) -> Option<Name> {
         })
 }
 
-/** @brief 클라이언트에게 최종 응답을 보낸다. */
 fn respond_final(listener: &std::net::UdpSocket, client: &ClientReq, mut m: Message) {
     m.header.id = client.id;
     m.header.response = true;
@@ -711,7 +641,6 @@ fn respond_final(listener: &std::net::UdpSocket, client: &ClientReq, mut m: Mess
     }
 }
 
-/** @brief 클라이언트에게 SERVFAIL을 보낸다. */
 fn respond_servfail(listener: &std::net::UdpSocket, client: &ClientReq) {
     let mut m = Message::default();
     m.header.id = client.id;
@@ -725,7 +654,6 @@ fn respond_servfail(listener: &std::net::UdpSocket, client: &ClientReq) {
     }
 }
 
-/** @brief 여러 워커가 같은 포트를 나눠 받도록 소켓을 연다. */
 fn bind_reuseport(addr: SocketAddr) -> std::net::UdpSocket {
     use std::os::fd::FromRawFd;
     unsafe {
@@ -743,7 +671,7 @@ fn bind_reuseport(addr: SocketAddr) -> std::net::UdpSocket {
         let SocketAddr::V4(v4) = addr else {
             panic!("IPv4 addresses only");
         };
-        /* BSD 계열은 sin_len 필드가 더 있어 구조체 리터럴로는 그 플랫폼에서만 깨진다. */
+        // BSD's sockaddr_in has an extra sin_len field, so a struct literal breaks only there.
         let mut sin: libc::sockaddr_in = std::mem::zeroed();
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
         sin.sin_port = v4.port().to_be();
@@ -774,7 +702,7 @@ fn bind_reuseport(addr: SocketAddr) -> std::net::UdpSocket {
     }
 }
 
-/** @brief 워커를 특정 코어에 묶는다. 측정에서 스케줄러 이동을 뺀다. */
+/// Keeps scheduler migration out of the measurement.
 #[cfg(target_os = "linux")]
 fn pin_to_core(core: usize) {
     unsafe {
@@ -784,15 +712,11 @@ fn pin_to_core(core: usize) {
     }
 }
 
-/**
- * @brief 코어 고정을 지원하지 않는 플랫폼에서는 아무것도 하지 않는다.
- * @details sched_setaffinity 는 리눅스에만 있다. 고정은 측정 잡음을 줄이는 보조
- *          수단이라 리눅스 구현도 실패를 무시한다. 없어도 프로브는 그대로 돈다.
- */
+/// sched_setaffinity is Linux-only. Pinning only reduces noise, and the Linux version ignores
+/// failure too.
 #[cfg(not(target_os = "linux"))]
 fn pin_to_core(_core: usize) {}
 
-/** @brief 프로브 서버 워커 하나를 돌린다. */
 fn run_reactor_worker(
     recursor: &Recursor,
     listener: std::net::UdpSocket,
@@ -940,7 +864,7 @@ fn run_reactor_worker(
 
 #[test]
 #[ignore]
-/** @brief 여러 워커로 실제 서버 모양을 흉내 내 처리량을 측정한다. */
+/// Measures throughput with several workers in a real server's shape.
 fn reactor_server_probe() {
     let listen: SocketAddr = std::env::var("RP_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:5301".into())

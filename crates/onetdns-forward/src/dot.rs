@@ -1,9 +1,5 @@
-/*!
- * @brief DoT 업스트림: TLS 위의 DNS(RFC 7858).
- *
- * @details 연결을 스레드 지역 풀에 보관해 재사용한다. 핸드셰이크는 비싸므로, 질의마다
- *          새로 맺으면 DoT가 평문 대비 크게 느려진다.
- */
+//! DNS over TLS upstream (RFC 7858). Connections are kept in a thread-local pool; a handshake per
+//! query would make DoT far slower than plain DNS.
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -15,39 +11,29 @@ use onetdns_tls::{client_handshake, ClientConfig, TlsConnection, TlsSession, Tru
 
 use crate::{validate_response, DeadlineTcp, ForwardError};
 
-/** @brief 보관 중인 DoT 연결 하나. */
 struct DotConn {
-    /** @brief 이 연결의 스트림. */
     tcp: DeadlineTcp,
-    /** @brief 그 위의 TLS 상태. */
     tls: TlsConnection,
 
-    /** @brief 읽기 버퍼. 연결과 함께 살아 있어 질의마다 다시 잡지 않는다. */
+    /// Lives with the connection, so it is not reallocated per query.
     buf: Vec<u8>,
 
-    /** @brief 마지막 사용 시각. 너무 오래된 연결은 재사용하지 않는다. */
     last_used: Instant,
 }
 
 thread_local! {
-    /** @brief (주소, 서버 이름)별 연결 풀. 스레드 지역이라 잠금이 없다. */
     static POOL: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), DotConn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
-    /** @brief 끊긴 연결을 PSK-DHE로 다시 붙일 최근 세션. */
+    /// Recent sessions for resuming dropped connections with PSK-DHE.
     static SESSIONS: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), TlsSession>> =
         RefCell::new(LruMap::new(MAX_CACHED_SESSIONS));
 }
 
-/** @brief 스레드 하나가 보관할 DoT 연결 수 상한. */
 const MAX_POOLED_CONNECTIONS: usize = 256;
-/** @brief 스레드 하나가 보관할 최근 DoT 세션 수 상한. */
 const MAX_CACHED_SESSIONS: usize = 64;
 
-/**
- * @brief DoT로 질의를 교환한다.
- * @details 보관된 연결이 있으면 짧은 데드라인으로 먼저 시도한다. 죽은 연결에 예산을 다 쓰지
- *          않고 새 연결로 넘어가기 위해서다.
- */
+/// Tries a kept connection first with a short deadline, so a dead one does not use up the budget
+/// before moving to a new connection.
 pub(crate) fn exchange(
     addr: SocketAddr,
     server_name: &str,
@@ -120,12 +106,9 @@ pub(crate) fn exchange(
     })
 }
 
-/**
- * @brief 새 DoT 연결을 맺는다.
- * @details TLS 핸드셰이크 직후, 질의를 보내기 전에 폐기 확인 훅을 부른다. 순서를
- *          바꾸면 폐기된 인증서를 쓰는 서버에 질의가 이미 나간 뒤가 된다. 훅이 거부한 인증서는
- *          TLS 가 거부했을 때처럼 치명 경고로 서버에 알린다.
- */
+/// Calls the revocation hook right after the TLS handshake, before a query is sent; the other order
+/// would send the query to a server with a revoked certificate. A certificate the hook rejects is
+/// reported to the server with a fatal alert, as when TLS rejects it.
 fn connect(
     addr: SocketAddr,
     server_name: &str,
@@ -158,7 +141,7 @@ fn connect(
     })
 }
 
-/** @brief 연결 하나로 질의를 보내고 응답을 받는다. 2바이트 길이 접두사 프레이밍이다. */
+/// 2-byte length framing.
 fn roundtrip(
     conn: &mut DotConn,
     wire: &[u8],
@@ -183,7 +166,6 @@ fn roundtrip(
     Ok(resp)
 }
 
-/** @brief 데드라인 안에서 n바이트를 읽는다. */
 fn read_n(conn: &mut DotConn, n: usize, deadline: Instant) -> Result<Vec<u8>, ForwardError> {
     while conn.buf.len() < n {
         conn.tcp.set_deadline(deadline);
@@ -198,17 +180,13 @@ fn read_n(conn: &mut DotConn, n: usize, deadline: Instant) -> Result<Vec<u8>, Fo
     Ok(out)
 }
 
-/**
- * @brief TLS 오류를 전달 오류로 바꾼다.
- * @note 상세 사유를 밖으로 흘리지 않는다. 어떤 검증에서 걸렸는지가 응답 차이로 드러나면
- *       상대가 그것을 신탁으로 삼을 수 있다.
- */
+/// Keeps the detailed reason inside: if which check failed showed in the response, a peer could use
+/// it as an oracle.
 fn tls_io(_e: onetdns_tls::TlsError) -> ForwardError {
     ForwardError::Io("I/O error on the DoT TLS connection".into())
 }
 
 #[cfg(test)]
-/** @brief 인증서 검증, 연결 재사용, 그리고 죽은 연결에서의 빠른 복구. */
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -223,13 +201,12 @@ mod tests {
 
     use crate::{Forwarder, Upstream};
 
-    /** @brief 자체 서명 인증서를 쓰는 테스트용 업스트림. */
     fn dot_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _accepts, _signatures) = dot_server_ex(ip);
         (addr, trust)
     }
 
-    /** @brief 접속 수와 전체 핸드셰이크 서명 수를 셀 수 있는 테스트용 업스트림. */
+    /// Counts connections and full-handshake signatures.
     fn dot_server_ex(
         ip: Ipv4Addr,
     ) -> (
@@ -305,7 +282,6 @@ mod tests {
         (addr, trust, accepts_ret, signatures)
     }
 
-    /** @brief 이만큼 읽힐 때까지 채운다. */
     fn fill(conn: &mut TlsConnection, s: &mut TcpStream, buf: &mut Vec<u8>, n: usize) -> bool {
         while buf.len() < n {
             match conn.read_app(s) {
@@ -316,13 +292,11 @@ mod tests {
         true
     }
 
-    /** @brief 테스트용 질의. */
     fn q(id: u16, name: &str) -> Message {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
     }
 
     #[test]
-    /** @brief 인증서를 검증하고 연결을 다시 쓰는지. */
     fn dot_forward_verified_and_reuses_connection() {
         let (addr, trust) = dot_server(Ipv4Addr::new(3, 3, 3, 3));
         let fwd = Forwarder::with_upstreams(
@@ -345,7 +319,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오래 쉰 연결을 버리는지. */
     fn dot_drops_idle_pooled_connection() {
         crate::set_reuse_caps_for_test(Duration::from_millis(1500), Duration::from_millis(30));
         let (addr, trust, accepts, signatures) = dot_server_ex(Ipv4Addr::new(7, 7, 7, 7));
@@ -373,10 +346,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 치명 경고로 서버에 알리는지.
-     * @details 경고 없이 TCP 만 끊으면 서버는 거부와 중간에서 잘린 연결을 구분하지 못한다.
-     */
+    /// Closing TCP without an alert leaves the server unable to tell a rejection from a connection
+    /// cut on the way.
     fn dot_revocation_rejection_is_reported_to_the_server() {
         let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, reads) = crate::tls_first_read_recorder(b"dot");
@@ -412,7 +383,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름이 다른 인증서를 거부하는지. */
     fn dot_rejects_wrong_server_name() {
         let (addr, trust) = dot_server(Ipv4Addr::new(4, 4, 4, 4));
 
@@ -425,7 +395,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 믿을 수 없는 인증서를 거부하는지. */
     fn dot_rejects_untrusted_cert() {
         let (addr, _trust) = dot_server(Ipv4Addr::new(5, 5, 5, 5));
 
@@ -438,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 업스트림이라도 더 엄격한 신뢰 정책이 이전 연결·세션을 재사용하지 않는지. */
+    /// A stricter trust policy must not reuse connections or sessions from before.
     fn dot_cache_is_scoped_to_trust_policy() {
         let (addr, trust) = dot_server(Ipv4Addr::new(5, 5, 5, 6));
         let trusted = Forwarder::with_upstreams(

@@ -1,17 +1,12 @@
-/*!
- * @brief 계층 순서와 hot-apply 의 단계 순서가 말없이 바뀌지 않게 붙든다.
- *
- * @details 소스에서 표시 사이 구간을 그대로 잘라 계층 순서를 비교하고, hot-apply 경로에서
- *          검사와 적용의 앞뒤 관계를 확인한다.
- * @warning 계층 목록은 계산해서 나온 값이 아니라 일부러 고정해 둔 것이다.
- */
+//! Keeps the layer order and the hot-apply step order from changing silently. The source between
+//! markers is sliced to compare the layer order, and the hot-apply path is checked for checks
+//! before changes.
+//!
+//! The layer list is pinned on purpose, not computed.
 
-/** @brief 계층 순서를 검사할 소스. */
 const CHAIN_RS: &str = include_str!("../src/resolver_chain.rs");
-/** @brief 재시작 없는 설정 교체를 검사할 소스. */
 const HOT_APPLY_RS: &str = include_str!("../src/hot_apply.rs");
 
-/** @brief 표시 사이의 소스 구간. */
 fn gate_body(begin: &str, end: &str) -> String {
     let start = CHAIN_RS
         .find(begin)
@@ -24,7 +19,7 @@ fn gate_body(begin: &str, end: &str) -> String {
 }
 
 #[test]
-/** @brief 계층을 쌓는 순서가 그대로인지. 순서가 곧 우선순위다. */
+/// The order is the priority.
 fn layer_stack_order_is_pinned() {
     let body = gate_body("// layer-order:begin", "// layer-order:end");
     let mut seen = Vec::new();
@@ -70,14 +65,11 @@ fn layer_stack_order_is_pinned() {
 }
 
 #[test]
-/**
- * @brief 교체가 전부 아니면 전무인지.
- *
- * @details 바뀐 키가 모두 재시작 없이 교체할 수 있는지 보는 검사보다 먼저 무엇을 바꾸면,
- *          재시작해야 하는 키가 섞여 있을 때 이미 바꿔 놓고 "재시작해야 한다"고 답하게 된다.
- *          인증서를 교체하고 DHCP를 재시작한 뒤에 그렇게 답한 적이 실제로 있었다.
- * @warning 새 그룹 적용 코드는 반드시 이 검사 아래에 넣어야 한다.
- */
+/// Changing anything before the check that every changed key can be hot-applied would, when a
+/// restart-only key is mixed in, leave changes applied and then answer that a restart is needed,
+/// for example after swapping a certificate and restarting DHCP.
+///
+/// New group apply code goes below this check.
 fn hot_apply_checks_before_it_changes_anything() {
     let guard = HOT_APPLY_RS
         .find("if !service_restart_keys(&previous_cfg, next, &changed).is_empty() {")
@@ -93,14 +85,11 @@ fn hot_apply_checks_before_it_changes_anything() {
 }
 
 #[test]
-/**
- * @brief 교체가 파일만 보고 판단하지 않는지.
- *
- * @details 시작할 때 채워 넣은 기본값은 파일에 적히지 않는다. 파일만 다시 읽어 비교하면
- *          그 항목이 사라진 것으로 보인다. 실제로 질의 로그 스위치 하나를 껐을 뿐인데
- *          손대지 않은 관리 주소를 지운 것으로 처리해 웹 화면을 닫은 적이 있다.
- * @warning 이 정규화를 빼면 그 사고가 그대로 돌아온다.
- */
+/// Startup defaults are not in the file, so comparing against the file alone shows them as removed:
+/// turning off one query log switch would drop an untouched control address and close the
+/// dashboard.
+///
+/// Removing this normalization brings that back.
 fn hot_apply_fills_startup_defaults_before_comparing() {
     let apply = HOT_APPLY_RS
         .find("let changed = config_changed_keys(&previous_cfg, next);")
@@ -118,14 +107,11 @@ fn hot_apply_fills_startup_defaults_before_comparing() {
 }
 
 #[test]
-/**
- * @brief 교체가 통계를 모을지 여부를 다시 정하는지.
- *
- * @details 관리 수신 주소는 세대를 다시 만들지 않고 교체할 수 있다. 시작할 때 한 번
- *          정한 판정을 그대로 두면, 주소를 나중에 연 사람은 대시보드에 아무것도 보이지
- *          않고 주소를 닫은 사람은 아무도 읽지 않는 통계 비용을 계속 낸다.
- * @warning 이 호출을 지우면 두 증상이 조용히 돌아온다. 어느 쪽도 오류로 드러나지 않는다.
- */
+/// The control listener can be hot-applied without rebuilding the generation. Keeping the startup
+/// decision would show an empty dashboard to someone who opens the address later, and keep
+/// collecting stats nobody reads for someone who closes it.
+///
+/// Removing this call brings both back silently; neither surfaces as an error.
 fn hot_apply_redecides_whether_to_collect() {
     let end = HOT_APPLY_RS
         .find("// hot-apply:end")
@@ -141,15 +127,13 @@ fn hot_apply_redecides_whether_to_collect() {
 }
 
 #[test]
-/**
- * @brief 빠른 경로가 읽는 기능 세트를 응답을 바꾸는 상태를 모두 바꾼 뒤에 한 번만 게시하는지.
- *
- * @details 기능 세트에는 경로 조건, 체인 세대, wire 세대가 함께 담긴다. 이 세트가 체인보다
- *          먼저 보이면 새 세대의 태그를 단 요청이 이전 체인으로 답을 만들어 새 캐시에 담고,
- *          새로 추가한 stub 영역의 이름을 레인이 순수 재귀로 풀어 그 TTL 동안 내보낸다.
- *          캐시를 게시보다 먼저 비우면 그 사이 이전 조건으로 맡은 답이 비운 뒤의 세대로 담긴다.
- * @warning 응답을 바꾸는 상태를 새로 두면 게시보다 앞에서 바꾸고 아래 목록에도 넣는다.
- */
+/// The feature set holds the path conditions and the chain and wire generations. Visible before the
+/// chain, a request tagged with the new generation would build an answer with the old chain and
+/// store it in the new cache, and a lane would resolve a newly added stub zone's name by plain
+/// recursion and serve it for that TTL. Clearing the cache before publishing would let answers
+/// taken under the old conditions meanwhile be stored under the post-clear generation.
+///
+/// New response-changing state is changed before the publish and added to the list below.
 fn hot_apply_publishes_the_fast_path_snapshot_last() {
     let start = HOT_APPLY_RS
         .find("fn commit(")

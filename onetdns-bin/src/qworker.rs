@@ -1,11 +1,8 @@
-/*!
- * @brief 질의 처리 워커 풀.
- *
- * @details 느린 질의 하나가 뒤의 빠른 질의를 막지 않게 한다. 받는 쪽은 큐에 넣기만 하고,
- *          워커들이 꺼내 처리한 뒤 완료를 알린다.
- * @warning 작업 중 패닉해도 그 질의만 실패해야 한다. 잡아서 최소한의 실패 응답으로 바꾸고
- *          워커는 다음 일을 이어 간다.
- */
+//! Query worker pool, so one slow query does not hold up the fast ones behind it. The receiver only
+//! queues; workers resolve and report completion.
+//!
+//! A panic fails only its own query: it is caught and turned into a minimal failure response, and
+//! the worker moves on.
 
 use std::collections::VecDeque;
 use std::io;
@@ -18,70 +15,50 @@ use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 
 use crate::native::NativeServer;
 
-/** @brief 연결 하나가 동시에 맡길 수 있는 질의 수. */
 pub const MAX_INFLIGHT_PER_CONN: usize = 256;
 
 #[derive(Debug)]
-/** @brief 처리할 질의 하나. */
 pub struct QueryJob {
-    /** @brief 이 질의가 온 연결. */
     pub conn_key: Vec<u8>,
-    /** @brief 그 연결의 세대 번호. 끝난 연결의 늦은 응답을 구분한다. */
+    /// Tells late answers for a finished connection apart.
     pub epoch: u64,
-    /** @brief 그 연결 안의 스트림. */
     pub stream_id: u64,
-    /** @brief 받은 그대로의 질의 바이트. */
+    /// As received.
     pub query: Vec<u8>,
-    /** @brief 질의를 보낸 곳. */
     pub peer: SocketAddr,
-    /** @brief 어느 전송으로 왔는지. */
     pub transport: RtTransport,
-    /** @brief 경로나 인증서에서 알아낸 클라이언트 식별자. */
+    /// From the path or the certificate.
     pub client_id: Option<String>,
-    /** @brief 인증된 연결로 왔는지. */
     pub authenticated: bool,
-    /** @brief 인증서에 적힌 신원. */
+    /// Identity named in the certificate.
     pub auth_identity: Option<String>,
 }
 
 #[derive(Debug)]
-/** @brief 처리가 끝난 질의와 그 응답. */
 pub struct QueryDone {
-    /** @brief 이 응답이 갈 연결. */
     pub conn_key: Vec<u8>,
-    /** @brief 그 연결의 세대 번호. */
     pub epoch: u64,
-    /** @brief 그 연결 안의 스트림. */
     pub stream_id: u64,
-    /** @brief 내보낼 응답 바이트. 없으면 답하지 못했다. */
+    /// None when no answer could be made.
     pub wire: Option<Vec<u8>>,
-    /** @brief HTTP 캐시가 신선하다고 볼 시간. DoH3만 쓰고 DoQ는 무시한다. */
+    /// HTTP cache freshness lifetime; DoH3 uses it, DoQ ignores it.
     pub max_age: u32,
 }
 
-/**
- * @brief 워커가 만들어 낸 응답 바이트와 그 수명.
- * @details 수명은 HTTP 전송만 쓴다. 응답을 만든 곳에만 Message가 있어서 여기서 담아 전달한다.
- */
+/// Only the code that built the response has the Message, so the lifetime, which only HTTP
+/// transports use, travels with the bytes.
 pub struct ResolvedAnswer {
-    /** @brief 내보낼 응답 바이트. */
     pub wire: Vec<u8>,
-    /** @brief HTTP 캐시가 신선하다고 볼 시간. */
     pub max_age: u32,
 }
 
-/** @brief 질의를 실제로 푸는 함수. */
 pub type ResolveFn = Arc<dyn Fn(&QueryJob) -> Option<ResolvedAnswer> + Send + Sync>;
-/** @brief 완료를 알리는 함수. */
 pub type DoneNotify = Arc<dyn Fn() + Send + Sync>;
 
-/** @brief 리스너를 깨우는 데 쓰는 바이트. */
 const COMPLETION_WAKE: &[u8] = b"\0";
 
-/**
- * @brief 완료를 알려 UDP 리스너를 깨우는 방법을 만든다.
- * @details 리스너는 소켓에서 자고 있다. 완료됐다고 알리려면 그 소켓에 무언가 보내야 한다.
- */
+/// The listener sleeps in a socket receive, so completion is signaled by sending that socket a
+/// packet. Also returns the sender's address, for `is_completion_wake`.
 pub fn udp_completion_notifier(bound: SocketAddr) -> io::Result<(DoneNotify, SocketAddr)> {
     let bind_ip = match bound.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.into(),
@@ -113,47 +90,31 @@ pub fn udp_completion_notifier(bound: SocketAddr) -> io::Result<(DoneNotify, Soc
     Ok((notify, source))
 }
 
-/**
- * @brief 받은 패킷이 이 서버가 보낸 깨움 신호인지.
- * @warning 출발지가 자기 자신이고 내용도 맞아야 한다. 확인하지 않으면 밖에서 보낸
- *          패킷이 깨움으로 오인된다.
- */
+/// Both the source and the payload must match; otherwise a packet from outside could pass as a
+/// wake.
 pub fn is_completion_wake(source: SocketAddr, expected: SocketAddr, packet: &[u8]) -> bool {
     source == expected && packet == COMPLETION_WAKE
 }
 
-/** @brief 대기 중인 일과 끝난 일. */
 struct Queue {
-    /** @brief 아직 맡지 않은 일들. */
     jobs: VecDeque<QueryJob>,
-    /** @brief 더 받지 않는다는 표시. */
     closed: bool,
 }
 
-/** @brief 워커들이 나눠 쓰는 상태. */
 struct Shared {
-    /** @brief 일 대기열. */
     queue: Mutex<Queue>,
-    /** @brief 일이 들어왔음을 알리는 곳. */
     not_empty: Condvar,
-    /** @brief 대기열 크기 상한. */
     capacity: usize,
-    /** @brief 끝난 일들. */
     done: Mutex<VecDeque<QueryDone>>,
-    /** @brief 끝났음을 리스너에 알리는 방법. */
     done_notify: Option<DoneNotify>,
 }
 
-/** @brief 워커 풀. */
 pub struct WorkerPool {
-    /** @brief 워커들이 나눠 쓰는 상태. */
     shared: Arc<Shared>,
-    /** @brief 실행 중인 워커들. */
     workers: Vec<JoinHandle<()>>,
 }
 
 impl WorkerPool {
-    /** @brief 워커들을 시작한다. */
     pub fn new(
         resolve: ResolveFn,
         workers: usize,
@@ -198,7 +159,7 @@ impl WorkerPool {
         })
     }
 
-    /** @brief 일을 맡긴다. 큐가 꽉 찼으면 되돌려준다. */
+    /// Returns the job when the queue is full or closed.
     pub fn submit(&self, job: QueryJob) -> Result<(), Box<QueryJob>> {
         let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         if q.closed || q.jobs.len() >= self.shared.capacity {
@@ -210,13 +171,11 @@ impl WorkerPool {
         Ok(())
     }
 
-    /** @brief 끝난 일들을 가져간다. */
     pub fn drain_done(&self, out: &mut Vec<QueryDone>) {
         let mut done = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
         out.extend(done.drain(..));
     }
 
-    /** @brief 워커들에게 멈추라고 알린다. */
     fn stop(&mut self) {
         {
             let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -229,24 +188,19 @@ impl WorkerPool {
         }
     }
 
-    /** @brief 워커들을 멈추고 기다린다. */
+    /// Stops the workers and joins them.
     pub fn shutdown(mut self) {
         self.stop();
     }
 }
 
 impl Drop for WorkerPool {
-    /** @brief 워커들을 정리한다. */
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-/**
- * @brief 워커 하나의 반복.
- * @warning 처리 중 패닉을 잡는다. 잡지 않으면 질의 하나 때문에 워커가 죽고, 그만큼
- *          처리 능력이 줄어든다.
- */
+/// Catches panics: an uncaught one would kill the worker over a single query and shrink the pool.
 fn worker_loop(shared: &Arc<Shared>, resolve: &ResolveFn) {
     loop {
         let job = {
@@ -291,7 +245,6 @@ fn worker_loop(shared: &Arc<Shared>, resolve: &ResolveFn) {
     }
 }
 
-/** @brief 질의 핸들러를 푸는 함수로 감싼다. */
 pub fn handler_resolver(handler: Arc<NativeServer>) -> ResolveFn {
     Arc::new(move |job: &QueryJob| {
         let req = Message::parse(&job.query).ok()?;
@@ -315,7 +268,6 @@ pub fn handler_resolver(handler: Arc<NativeServer>) -> ResolveFn {
     })
 }
 
-/** @brief 이 질의에 대한 실패 응답 바이트. */
 pub fn servfail_wire(req: &Message) -> Vec<u8> {
     let mut m = Message::default();
     m.header.id = req.header.id;
@@ -329,11 +281,8 @@ pub fn servfail_wire(req: &Message) -> Vec<u8> {
         .expect("A minimal SERVFAIL built from a parsed request can always be encoded")
 }
 
-/**
- * @brief 파싱하지 않고 실패 응답을 만든다.
- * @details 패닉이 파싱에서 났을 수 있다. 다시 파싱하면 같은 위치에서 또 패닉한다.
- *          그래서 헤더만 손봐서 최소한의 응답을 낸다.
- */
+/// The panic may have come from parsing, and parsing again would panic at the same place, so only
+/// the header is patched.
 fn servfail_wire_from_raw(query: &[u8]) -> Option<Vec<u8>> {
     if query.len() < 12 || query[2] & 0x80 != 0 {
         return None;
@@ -347,7 +296,6 @@ fn servfail_wire_from_raw(query: &[u8]) -> Option<Vec<u8>> {
     Some(wire)
 }
 
-/** @brief 기본 워커 수. */
 pub fn default_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -356,11 +304,9 @@ pub fn default_worker_count() -> usize {
 }
 
 #[cfg(test)]
-/** @brief 느린 일이 빠른 일을 막지 않는지, 그리고 패닉이 그 질의에만 머무는지. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 질의 하나. */
     fn job(id: u8) -> QueryJob {
         QueryJob {
             conn_key: vec![id],
@@ -375,7 +321,6 @@ mod tests {
         }
     }
 
-    /** @brief 끝난 일이 이만큼 모일 때까지 가져간다. */
     fn collect_done(pool: &WorkerPool, expected: usize) -> Vec<QueryDone> {
         let mut out = Vec::new();
         for _ in 0..500 {
@@ -389,7 +334,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 맡긴 일이 처리되고 완료가 돌아오는지. */
     fn pool_resolves_and_returns_completions() {
         let resolve: ResolveFn = Arc::new(|j: &QueryJob| {
             Some(ResolvedAnswer {
@@ -410,7 +354,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 느린 일 하나가 뒤를 막지 않는지. */
     fn slow_job_does_not_stall_fast_jobs() {
         let resolve: ResolveFn = Arc::new(|j: &QueryJob| {
             if j.conn_key == [0xFF] {
@@ -450,7 +393,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큐가 꽉 차면 되돌려주는지. */
     fn pool_rejects_when_full() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let g = gate.clone();
@@ -487,7 +429,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패 응답이 질의 번호와 질문을 되비추는지. */
     fn servfail_echoes_id_and_question() {
         let req = Message::query(
             0xBEEF,
@@ -503,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 패닉 뒤 응답을 만들 때 다시 파싱하지 않는지. 파싱에서 난 패닉이면 또 터진다. */
+    /// Reparsing would hit a parser panic again.
     fn raw_panic_fallback_never_reparses_and_emits_minimal_servfail() {
         assert!(servfail_wire_from_raw(&[0; 11]).is_none());
         let mut response = [0u8; 12];
@@ -524,7 +465,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 완료 알림이 리스너를 깨우는지. */
     fn completion_notifier_wakes_udp_listener_once_work_is_ready() {
         let listener = UdpSocket::bind("0.0.0.0:0").unwrap();
         listener
@@ -551,7 +491,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 패닉한 일이 실패 응답이 되고 워커가 계속 도는지. */
     fn panicking_job_returns_servfail_and_worker_processes_next_job() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_calls = calls.clone();

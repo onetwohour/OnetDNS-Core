@@ -1,69 +1,45 @@
-/*!
- * @brief QUIC 패킷 헤더 인코딩과 파싱.
- *
- * @details 긴 헤더는 핸드셰이크 중에, 짧은 헤더는 그 뒤에 쓴다. 어느 쪽이든 본문 암호화와
- *          헤더 보호가 함께 걸린다.
- * @warning 이 파서는 아직 인증되지 않은 바이트를 본다. 길이와 식별자 크기를 모두 검사해야
- *          하며, 어떤 입력에도 패닉하지 않아야 한다.
- */
+//! QUIC packet header encoding and parsing. Long headers are used during the handshake, short
+//! headers after it.
+//!
+//! The parser reads unauthenticated bytes: every length and connection ID size is checked, and no
+//! input may panic.
 
 use crate::protect::Aead;
 use crate::varint;
 use crate::PacketKeys;
 
-/** @brief QUIC 버전 1. */
 pub const VERSION_1: u32 = 0x0000_0001;
 
-/** @brief 긴 헤더의 패킷 유형. */
 pub mod ptype {
-    /** @brief 최초 패킷. 누구나 풀 수 있는 키로 보호된다. */
     pub const INITIAL: u8 = 0x00;
-    /** @brief 핸드셰이크 완료 전에 보내는 조기 데이터. */
     pub const ZERO_RTT: u8 = 0x01;
-    /** @brief 핸드셰이크 패킷. */
     pub const HANDSHAKE: u8 = 0x02;
-    /** @brief 주소 검증을 요구하는 패킷. */
     pub const RETRY: u8 = 0x03;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 해석한 긴 헤더 패킷. */
 pub struct LongPacket {
-    /** @brief 이 패킷의 종류. */
     pub ptype: u8,
-    /** @brief 프로토콜 버전. */
     pub version: u32,
-    /** @brief 받는 쪽 연결 식별자. */
     pub dcid: Vec<u8>,
-    /** @brief 보내는 쪽 연결 식별자. */
     pub scid: Vec<u8>,
-    /** @brief 재시도 토큰. */
     pub token: Vec<u8>,
-    /** @brief 패킷 번호. */
     pub pn: u64,
-    /** @brief 암호를 푼 내용. */
     pub payload: Vec<u8>,
 
-    /** @brief 이 패킷이 데이터그램에서 차지한 바이트. */
+    /// Bytes this packet took from the datagram; coalesced packets may follow.
     pub consumed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 해석한 짧은 헤더 패킷. */
 pub struct ShortPacket {
-    /** @brief 받는 쪽 연결 식별자. */
     pub dcid: Vec<u8>,
-    /** @brief 패킷 번호. */
     pub pn: u64,
-    /** @brief 암호를 푼 내용. */
     pub payload: Vec<u8>,
 }
 
-/**
- * @brief 아직 풀지 않은 패킷에서 목적지 식별자를 추출한다.
- * @details 어느 연결에 속하는지 정하려면 복호화 전에 이것부터 알아야 한다.
- * @param short_cid_len 짧은 헤더에는 길이 필드가 없다. 이쪽이 발급한 길이를 넘겨야 한다.
- */
+/// Read before decryption to find the connection. Short headers carry no length, so `short_cid_len`
+/// is the length this side issues.
 pub fn destination_connection_id(pkt: &[u8], short_cid_len: usize) -> Option<&[u8]> {
     let first = *pkt.first()?;
     if first & 0x40 == 0 {
@@ -86,18 +62,13 @@ pub fn destination_connection_id(pkt: &[u8], short_cid_len: usize) -> Option<&[u
     }
 }
 
-/** @brief 이 바이트가 Initial 패킷인지. */
 pub fn is_initial_packet(pkt: &[u8]) -> bool {
     pkt.first()
         .is_some_and(|first| first & 0xc0 == 0xc0 && ((first & 0x30) >> 4) == ptype::INITIAL)
         && pkt.get(1..5).is_some_and(|v| v == VERSION_1.to_be_bytes())
 }
 
-/**
- * @brief 잘린 패킷 번호를 복원한다.
- * @details 패킷 번호는 몇 바이트만 실려 온다. 지금까지 본 가장 큰 번호를 기준으로 가장
- *          가까운 후보를 고른다.
- */
+/// Packet numbers arrive truncated; picks the candidate closest to the largest number seen.
 pub fn decode_pn(largest_pn: u64, truncated: u64, pn_nbits: u32) -> u64 {
     let pn_win = 1u64 << pn_nbits;
     let pn_hwin = pn_win / 2;
@@ -114,7 +85,6 @@ pub fn decode_pn(largest_pn: u64, truncated: u64, pn_nbits: u32) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-/** @brief 긴 헤더 패킷을 만들고 보호를 씌운다. */
 pub fn protect_long(
     aead: Aead,
     keys: &PacketKeys,
@@ -166,7 +136,6 @@ pub fn protect_long(
 }
 
 #[allow(clippy::too_many_arguments)]
-/** @brief Initial 패킷을 만든다. */
 pub fn protect_initial(
     aead: Aead,
     keys: &PacketKeys,
@@ -190,7 +159,6 @@ pub fn protect_initial(
     )
 }
 
-/** @brief 짧은 헤더 패킷을 만들고 보호를 씌운다. */
 pub fn protect_short(
     aead: Aead,
     keys: &PacketKeys,
@@ -228,11 +196,6 @@ pub fn protect_short(
     pkt
 }
 
-/**
- * @brief 긴 헤더 패킷의 보호를 벗기고 본문을 푼다.
- * @return 패킷 번호, 평문, 그리고 소비한 길이. 데이터그램에 패킷이 여러 개 붙어 올 수 있어
- *         소비 길이가 필요하다.
- */
 pub fn unprotect_long(
     aead: Aead,
     keys: &PacketKeys,
@@ -276,28 +239,20 @@ pub fn unprotect_long(
     })
 }
 
-/** @brief 암호를 풀기 전에 읽을 수 있는 긴 헤더 필드. */
+/// Long header fields readable before decryption.
 struct LongHeader<'a> {
-    /** @brief 패킷 종류. */
     ptype: u8,
-    /** @brief 프로토콜 버전. */
     version: u32,
-    /** @brief 받는 쪽 연결 식별자. */
     dcid: &'a [u8],
-    /** @brief 보내는 쪽 연결 식별자. */
     scid: &'a [u8],
-    /** @brief 재시도 토큰. Initial 이 아니면 비어 있다. */
+    /// Empty unless Initial.
     token: &'a [u8],
-    /** @brief 패킷 번호가 시작하는 위치. */
     pn_offset: usize,
-    /** @brief 이 패킷이 끝나는 위치. 뒤에 다른 패킷이 합쳐져 있을 수 있다. */
+    /// Coalesced packets may follow.
     end: usize,
 }
 
-/**
- * @brief 길이 필드까지 긴 헤더를 읽는다.
- * @details Retry 에는 길이 필드가 없으므로 받지 않는다.
- */
+/// Reads up to the length field. Retry has no length field, so it is refused.
 fn parse_long_header(pkt: &[u8]) -> Option<LongHeader<'_>> {
     let first = *pkt.first()?;
     if first & 0x80 == 0 {
@@ -354,18 +309,12 @@ fn parse_long_header(pkt: &[u8]) -> Option<LongHeader<'_>> {
     })
 }
 
-/**
- * @brief 긴 헤더 패킷 하나가 데이터그램에서 차지하는 바이트.
- * @details 키가 없거나 풀리지 않는 패킷을 건너뛰고 뒤에 합쳐진 패킷을 계속 처리할 때 쓴다.
- *          RFC 9000 은 합쳐진 패킷 하나를 풀지 못해도 나머지는 처리하라고 한다. 버린 번호
- *          공간의 패킷 뒤에 붙어 온 패킷까지 버리면 핸드셰이크가 멈춘다.
- * @return 헤더가 깨졌거나 Retry 이면 None.
- */
+/// Lets the caller skip a packet it cannot decrypt and go on with the packets coalesced after it,
+/// as RFC 9000 requires; dropping those stalls the handshake. None for a broken header or a Retry.
 pub fn long_packet_len(pkt: &[u8]) -> Option<usize> {
     parse_long_header(pkt).map(|header| header.end)
 }
 
-/** @brief 짧은 헤더 패킷의 보호를 벗기고 본문을 푼다. */
 pub fn unprotect_short(
     aead: Aead,
     keys: &PacketKeys,
@@ -403,7 +352,6 @@ pub fn unprotect_short(
     Some((ShortPacket { dcid, pn, payload }, phase_changed))
 }
 
-/** @brief 헤더 마스크로 패킷 번호를 되돌린다. */
 fn unmask_pn(
     pkt: &[u8],
     pn_offset: usize,
@@ -421,18 +369,15 @@ fn unmask_pn(
     Some((pn, pn_bytes))
 }
 
-/** @brief Initial 패킷을 푼다. */
 pub fn unprotect_initial(aead: Aead, keys: &PacketKeys, pkt: &[u8]) -> Option<(u64, Vec<u8>)> {
     let lp = unprotect_long(aead, keys, pkt, 0)?;
     Some((lp.pn, lp.payload))
 }
 
 #[cfg(test)]
-/** @brief 왕복, 번호 복원, 그리고 조작된 패킷 거부. */
 mod tests {
     use super::*;
 
-    /** @brief 16진 문자열을 바이트로. */
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -441,7 +386,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief Initial 패킷 왕복. */
     fn initial_packet_roundtrip() {
         let dcid = hex("8394c8f03e515708");
         let (client_secret, _) = crate::initial_secrets(&dcid);
@@ -456,7 +400,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버 키로 만든 패킷이 되풀리는지. */
     fn server_keys_roundtrip_with_pn_len_1() {
         let dcid = hex("8394c8f03e515708");
         let (_, server_secret) = crate::initial_secrets(&dcid);
@@ -469,7 +412,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격 상한을 넘는 식별자와 토큰을 거부하는지. */
     fn protect_rejects_oversized_connection_ids_and_tokens() {
         let secret = [0x42u8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);
@@ -498,7 +440,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 바이트만 바꿔도 인증이 실패하는지. */
     fn tampered_packet_fails() {
         let dcid = hex("8394c8f03e515708");
         let (cs, _) = crate::initial_secrets(&dcid);
@@ -510,7 +451,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 번호 복원을 규격 부록 예제와 비교한다. */
     fn rfc9000_a3_decode_pn() {
         assert_eq!(decode_pn(0xa82f30ea, 0x9b32, 16), 0xa82f9b32);
 
@@ -519,7 +459,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 핸드셰이크 패킷 왕복. */
     fn handshake_packet_roundtrip() {
         let secret = [0x5au8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);
@@ -547,7 +486,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 짧은 헤더 패킷 왕복. */
     fn short_packet_roundtrip() {
         let secret = [0x77u8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);
@@ -566,11 +504,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 목적지 연결 식별자가 길이 0인 짧은 헤더 패킷이 왕복하는지.
-     * @details 길이 0인 식별자를 쓰는 클라이언트에게 서버가 보내는 모양이다. 한 바이트짜리
-     *          프레임만 실어도 헤더 보호 표본이 모자라지 않게 채워져야 한다.
-     */
+    /// The shape a server sends to a client using zero-length connection IDs. A one-byte frame must
+    /// still be padded enough for the header protection sample.
     fn short_packet_with_zero_length_dcid_roundtrips() {
         let secret = [0x5au8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);
@@ -585,7 +520,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 번호가 커져도 복원이 맞는지. */
     fn short_packet_large_pn_decoded() {
         let secret = [0x11u8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);
@@ -607,7 +541,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 붙어 온 패킷의 다음 시작 위치가 맞는지. 틀리면 뒤 패킷을 전부 놓친다. */
     fn coalesced_consumed_points_to_next() {
         let secret = [0x33u8; 32];
         let keys = crate::derive_packet_keys(&secret, 16);

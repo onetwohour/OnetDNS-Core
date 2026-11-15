@@ -1,13 +1,11 @@
-/*!
- * @brief 실행 파일이 바뀌는 상황에서 서버가 어느 실행 파일로 프로세스를 띄우는지 확인한다.
- *
- * @details 패키지 관리자와 자체 업데이트는 실행 파일을 rename 으로 바꾼다. 그 뒤 자식이
- *          죽었을 때 감독자가 설치 경로로 다시 띄우면, 그 경로에는 다른 파일이 있으므로
- *          재시작이 실패하거나 다른 판이 뜬다. 반대로 업데이트가 맞바꾼 새 버전은 시험 실행으로
- *          시작해서, 준비 상태에 이르면 확정하고 준비 전에 끝나면 설치 경로를 이전 실행 파일로
- *          되돌린 뒤 그 경로를 exec 해야 한다. 실제 바이너리를 임시 디렉터리에 복사해 감독 모드와
- *          단독 프로세스로 띄워 확인한다.
- */
+//! Which executable the server starts processes from while that executable changes. Package
+//! managers and the self-update replace it by rename; a supervisor that restarted a dead child from
+//! the install path would find another file there, and the restart would fail or start a different
+//! build. A version swapped in by an update, in contrast, starts on trial: committed once ready,
+//! and if it exits before that, the install path is restored to the previous executable and exec'd.
+//!
+//! The real binary is copied to a temporary directory and run both supervised and as a single
+//! process.
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader};
@@ -20,37 +18,30 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/** @brief 사건 하나를 기다리는 상한. 느린 CI 에서 첫 기동이 늦어도 넘지 않을 만큼 둔다. */
+/// Enough for a slow first start on CI.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
-/** @brief 서버가 종료 신호를 받고 끝나기를 기다리는 상한. */
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/**
- * @brief 실행할 파일을 쓰는 일과 프로세스를 띄우는 일을 한 번에 하나만 하게 하는 잠금.
- * @details 테스트는 한 프로세스의 여러 스레드에서 돈다. 한 스레드가 파일을 쓰려고 연 기술자는
- *          그동안 다른 스레드가 띄운 자식에게 복제되어 그 자식이 exec 할 때까지 남는다. 그사이에
- *          그 파일을 실행하면 리눅스는 ETXTBSY 로 거부한다. spawn 은 자식이 exec 한 뒤에
- *          돌아오므로, 쓰기와 띄우기를 이 잠금 안에서 하면 쓰기용 기술자를 쥔 자식이 남지 않는다.
- */
+/// Serializes writing executables and spawning processes. Tests run on threads of one process, and
+/// a descriptor one thread opened for writing is copied into a child another thread spawns
+/// meanwhile, where it stays until that child execs; running the file then fails with ETXTBSY.
+/// spawn returns after the child execs, so writing and spawning under this lock leave no child
+/// holding a write descriptor.
 static EXEC_LOCK: Mutex<()> = Mutex::new(());
 
-/** @brief EXEC_LOCK 을 잡는다. 잡은 채 실패한 테스트가 있어도 다른 테스트는 계속 잡는다. */
+/// Keeps working after a test panicked while holding it.
 fn exec_lock() -> std::sync::MutexGuard<'static, ()> {
     EXEC_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/** @brief 실행할 파일을 쓰는 스레드가 없을 때 띄운다. */
 fn spawn(command: &mut Command) -> std::io::Result<Child> {
     let _exec = exec_lock();
     command.spawn()
 }
 
-/**
- * @brief Command::output 처럼 표준 출력과 오류를 모으며 끝날 때까지 기다린다.
- * @details 띄우는 일은 spawn 이 맡는다. 기다리는 동안에는 잠금을 잡지 않는다.
- */
+/// Like Command::output, but spawns through spawn and does not hold the lock while waiting.
 fn output_of(command: &mut Command) -> std::io::Result<std::process::Output> {
     command
         .stdin(Stdio::null())
@@ -59,19 +50,16 @@ fn output_of(command: &mut Command) -> std::io::Result<std::process::Output> {
     spawn(command)?.wait_with_output()
 }
 
-/** @brief 기록 한 줄에서 꺼낸 사건 이름과 그 기록을 남긴 프로세스. */
 struct Event {
-    /** @brief event 필드. */
     name: String,
-    /** @brief 기록을 남긴 프로세스 번호. */
     pid: i32,
 }
 
-/** @brief 바이너리와 설정을 둘 임시 디렉터리. 테스트가 어디서 실패해도 지운다. */
+/// Removed however the test ends.
 struct ScratchDir(PathBuf);
 
 impl ScratchDir {
-    /** @brief 이 테스트만 쓰는 디렉터리를 만든다. 경로는 심볼릭 링크를 푼 실제 경로다. */
+    /// The path is canonical, with symlinks resolved.
     fn create() -> Self {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -90,35 +78,29 @@ impl Drop for ScratchDir {
     }
 }
 
-/**
- * @brief 띄운 서버.
- * @details 단언이 실패해도 프로세스와 포트가 남지 않도록 drop 에서 정리한다.
- */
+/// Cleaned up on drop, so a failed assertion leaves no process or port behind.
 struct Server {
-    /** @brief 띄운 바이너리의 경로. 자식의 argv[0] 도 이것이다. */
+    /// Also the child's argv[0].
     program: PathBuf,
-    /** @brief 띄운 프로세스. exec 해도 번호는 그대로다. */
+    /// exec keeps the PID.
     process: Child,
-    /** @brief 표준 오류에서 읽은 사건. None 은 표준 오류가 닫혔다는 뜻이다. */
+    /// None means stderr closed.
     events: Receiver<Option<Event>>,
-    /** @brief 실패했을 때 보여 줄 전체 기록. */
+    /// Shown on failure.
     log: Arc<Mutex<Vec<String>>>,
-    /** @brief 준비를 알린 자식들. 감독자가 정리하지 못했을 때 대신 끝낸다. */
+    /// Children that reported ready; ended here if the supervisor failed to.
     children: Vec<i32>,
 }
 
 impl Server {
-    /** @brief 감독 모드로 띄운다. */
     fn supervised(dir: &Path, program: PathBuf, config: &Path) -> Self {
         Self::start(dir, program, config, &[])
     }
 
-    /** @brief 감독자 없이 단독 프로세스로 띄운다. */
     fn single_process(dir: &Path, program: PathBuf, config: &Path) -> Self {
         Self::start(dir, program, config, &["--no-supervisor"])
     }
 
-    /** @brief 띄우고 표준 오류를 읽기 시작한다. */
     fn start(dir: &Path, program: PathBuf, config: &Path, extra: &[&str]) -> Self {
         let mut process = spawn(
             Command::new(&program)
@@ -163,16 +145,12 @@ impl Server {
         }
     }
 
-    /** @brief 띄운 프로세스의 번호. */
     fn pid(&self) -> i32 {
         self.process.id() as i32
     }
 
-    /**
-     * @brief 이 이름의 사건을 남긴 프로세스를 기다린다. 그 앞의 사건은 버린다.
-     * @param exclude 이 프로세스가 남긴 것은 건너뛴다.
-     * @return 사건을 남긴 프로세스 번호. 서버가 먼저 끝나거나 시간이 지나면 실패한다.
-     */
+    /// Earlier events are dropped, and events from `exclude` are skipped. Returns the PID that
+    /// logged it; fails if the server exits first or time runs out.
     fn wait_for(&self, name: &str, exclude: Option<i32>) -> i32 {
         let deadline = Instant::now() + EVENT_TIMEOUT;
         loop {
@@ -192,7 +170,7 @@ impl Server {
         }
     }
 
-    /** @brief 띄운 프로세스가 이 사건을 남기기를 기다린다. exec 한 뒤의 기록도 같은 번호다. */
+    /// Records written after exec carry the same PID.
     fn wait_for_own(&self, name: &str) {
         let pid = self.wait_for(name, None);
         assert_eq!(
@@ -203,12 +181,11 @@ impl Server {
         );
     }
 
-    /** @brief 지금까지 읽은 기록 전체. */
     fn log_text(&self) -> String {
         self.log.lock().expect("기록 잠금").join("\n")
     }
 
-    /** @brief 이 프로세스가 이 테스트가 띄운 바이너리로 돌고 있으면 끝낸다. */
+    /// Kills `pid` only when it runs this test's binary.
     fn kill_if_ours(&self, pid: i32) {
         if argv0(pid).as_deref() == Some(self.program.as_os_str().as_bytes()) {
             unsafe {
@@ -238,7 +215,6 @@ impl Drop for Server {
     }
 }
 
-/** @brief JSON 기록 한 줄에서 사건 이름과 프로세스 번호를 꺼낸다. */
 fn parse_event(line: &str) -> Option<Event> {
     let json = onetdns_core::json::parse(line).ok()?;
     let name = json.get("event")?.as_str()?.to_string();
@@ -246,18 +222,15 @@ fn parse_event(line: &str) -> Option<Event> {
     Some(Event { name, pid })
 }
 
-/** @brief 프로세스의 argv[0]. 이미 끝났으면 없다. */
+/// None once it has exited.
 fn argv0(pid: i32) -> Option<Vec<u8>> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     cmdline.split(|byte| *byte == 0).next().map(<[u8]>::to_vec)
 }
 
-/**
- * @brief 비어 있는 루프백 포트의 UDP 와 TCP 를 함께 잡아 둔다. 놓을 때까지 서버는 이 포트에
- *        묶지 못한다.
- * @details 찾을 때 잡은 소켓을 그대로 돌려준다. 빈 포트를 찾고 놓았다가 다시 잡으면 그사이에
- *          다른 소켓이 그 포트를 가져갈 수 있다.
- */
+/// Holds UDP and TCP on a free loopback port, so the server cannot bind it until they are dropped.
+/// Returns the sockets it found with: releasing and rebinding would let another socket take the
+/// port.
 fn hold_free_port() -> (u16, (UdpSocket, TcpListener)) {
     for _ in 0..32 {
         let tcp = TcpListener::bind("127.0.0.1:0").expect("TCP 포트를 잡지 못했습니다");
@@ -269,12 +242,11 @@ fn hold_free_port() -> (u16, (UdpSocket, TcpListener)) {
     panic!("UDP 와 TCP 가 함께 비어 있는 포트를 찾지 못했습니다");
 }
 
-/** @brief UDP 와 TCP 모두 비어 있는 루프백 포트. 서버가 묶도록 바로 놓는다. */
+/// Released at once for the server to bind.
 fn free_port() -> u16 {
     hold_free_port().0
 }
 
-/** @brief 이 포트에서 듣는 설정 파일을 쓴다. */
 fn write_config(dir: &Path, port: u16) -> PathBuf {
     let config = dir.join("onetdns.toml");
     std::fs::write(&config, format!("listen = [\"127.0.0.1:{port}\"]\n"))
@@ -282,7 +254,6 @@ fn write_config(dir: &Path, port: u16) -> PathBuf {
     config
 }
 
-/** @brief 이 바이너리를 임시 디렉터리의 설치 경로에 복사한다. */
 fn install_copy(dir: &Path) -> PathBuf {
     let program = dir.join("OnetDNS");
     let _exec = exec_lock();
@@ -290,7 +261,7 @@ fn install_copy(dir: &Path) -> PathBuf {
     program
 }
 
-/** @brief 파일의 SHA-256 을 업데이트 기록에 쓰는 소문자 16진 표기로. */
+/// Lowercase hex, as update records use.
 fn sha256_hex(path: &Path) -> String {
     use sha2::{Digest, Sha256};
 
@@ -301,7 +272,6 @@ fn sha256_hex(path: &Path) -> String {
         .collect()
 }
 
-/** @brief 실행 파일이 --version 으로 알리는 버전. */
 fn version_of(program: &Path) -> String {
     let output = output_of(Command::new(program).arg("--version"))
         .expect("--version 을 실행하지 못했습니다");
@@ -314,7 +284,6 @@ fn version_of(program: &Path) -> String {
         .to_string()
 }
 
-/** @brief 관리 명령을 실행하고 끝날 때까지 기다린다. */
 fn run_cli(program: &Path, dir: &Path, args: &[&str]) -> std::process::Output {
     output_of(
         Command::new(program)
@@ -326,7 +295,6 @@ fn run_cli(program: &Path, dir: &Path, args: &[&str]) -> std::process::Output {
     .expect("관리 명령을 실행하지 못했습니다")
 }
 
-/** @brief 디렉터리에 있는 파일 이름들. */
 fn listing(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("디렉터리를 읽지 못했습니다")
@@ -342,27 +310,21 @@ fn listing(dir: &Path) -> Vec<String> {
     names
 }
 
-/** @brief 업데이트가 설치 경로를 맞바꾼 직후의 디렉터리. */
+/// A directory as an update leaves it right after swapping the install path.
 struct Swapped {
-    /** @brief 설치 경로. 새 버전이 들어 있다. */
+    /// The install path, holding the new version.
     program: PathBuf,
-    /** @brief 맞바꾸기 전 실행 파일. */
+    /// The executable from before the swap.
     previous: PathBuf,
-    /** @brief 업데이트 기록. */
     record: PathBuf,
-    /** @brief 새 버전의 해시. */
     new_sha256: String,
-    /** @brief 맞바꾸기 전 실행 파일의 해시. */
     previous_sha256: String,
 }
 
 impl Swapped {
-    /**
-     * @brief 업데이트가 설치 경로를 맞바꾼 직후의 디렉터리를 꾸민다.
-     * @details 설치 경로에는 이 바이너리를, .previous 에는 끝에 바이트를 덧붙여 해시만 다른 같은
-     *          바이너리를 두고 pending 기록을 쓴다. 두 실행 파일의 버전이 같으므로 기록의 from 과
-     *          to 도 같다.
-     */
+    /// Puts this binary at the install path and the same binary with bytes appended at .previous,
+    /// so only the hash differs, and writes a pending record. Both have the same version, so the
+    /// record's from and to match.
     fn prepare(dir: &Path) -> Self {
         let program = install_copy(dir);
         let previous = dir.join("OnetDNS.previous");
@@ -393,12 +355,11 @@ impl Swapped {
         }
     }
 
-    /** @brief 기록 파일의 글. */
     fn record_text(&self) -> String {
         std::fs::read_to_string(&self.record).expect("업데이트 기록을 읽지 못했습니다")
     }
 
-    /** @brief 기록을 확정 상태로 바꾼다. 시험을 마친 업데이트가 남기는 기록과 같다. */
+    /// The same record a finished trial leaves.
     fn commit(&self) {
         let record = self
             .record_text()
@@ -406,7 +367,7 @@ impl Swapped {
         std::fs::write(&self.record, record).expect("업데이트 기록을 쓰지 못했습니다");
     }
 
-    /** @brief 새 버전이 확정됐는지. 설치 경로와 .previous 는 그대로여야 되돌리기에 쓸 수 있다. */
+    /// The install path and .previous must be unchanged, so they remain usable for rollback.
     fn assert_committed(&self) {
         let record = self.record_text();
         assert!(record.contains("state=committed\n"), "{record}");
@@ -418,7 +379,7 @@ impl Swapped {
         );
     }
 
-    /** @brief 이전 실행 파일로 되돌렸는지. 기록에는 이 이유가 남아야 한다. */
+    /// The record must hold `reason`.
     fn assert_reverted(&self, reason: &str) {
         assert_eq!(
             sha256_hex(&self.program),
@@ -436,12 +397,9 @@ impl Swapped {
 }
 
 #[test]
-/**
- * @brief 설치 경로가 다른 파일로 바뀐 뒤 자식이 죽어도 같은 이미지로 다시 뜨는지.
- * @details 설치 경로에는 실행할 수 없는 파일을 둔다. 감독자가 그 경로로 띄우면 재시작이
- *          실패하고 감독자도 끝나므로 다음 준비 통지가 오지 않는다. 다시 뜬 자식은 프로세스
- *          이름과 argv[0] 도 원래 것이어야 pgrep 과 서비스 관리자가 찾는다.
- */
+/// The install path holds a file that cannot run. A supervisor restarting from that path would fail
+/// and exit, and the next ready notice would never come. The restarted child must also keep its
+/// process name and argv[0], so pgrep and service managers still find it.
 fn child_restarts_from_the_running_image_after_the_binary_is_replaced() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -474,7 +432,6 @@ fn child_restarts_from_the_running_image_after_the_binary_is_replaced() {
 }
 
 #[test]
-/** @brief 감독자가 시험 중인 새 버전의 자식이 준비되면 업데이트를 확정하는지. */
 fn supervised_trial_that_becomes_ready_is_committed() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -491,13 +448,10 @@ fn supervised_trial_that_becomes_ready_is_committed() {
 }
 
 #[test]
-/**
- * @brief 시험 중인 새 버전의 자식이 준비 전에 끝나면 감독자가 이전 실행 파일로 되돌려 띄우는지.
- * @details 수신 포트를 미리 잡아 두면 새 버전의 자식은 준비 전에 끝난다. 감독자가 되돌린 뒤
- *          exec 하면 프로세스 번호가 그대로인 채 되돌린 업데이트를 알린다. 포트를 놓으면 되돌린
- *          실행 파일의 자식이 준비된다. 그 자식이 포트를 놓기 전에 묶으려다 실패해도 감독자가
- *          다시 띄운다.
- */
+/// Holding the listen port makes the new version's child exit before it gets ready. The supervisor
+/// reverts, execs, and reports the reverted update under the same PID. Once the port is released,
+/// the restored executable's child gets ready; if it tries to bind before the release and fails,
+/// the supervisor starts it again.
 fn supervised_trial_that_fails_before_ready_starts_the_previous_executable() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -517,7 +471,6 @@ fn supervised_trial_that_fails_before_ready_starts_the_previous_executable() {
 }
 
 #[test]
-/** @brief 감독자 없이 도는 새 버전이 준비되면 업데이트를 확정하는지. */
 fn single_process_trial_that_becomes_ready_is_committed() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -533,12 +486,9 @@ fn single_process_trial_that_becomes_ready_is_committed() {
 }
 
 #[test]
-/**
- * @brief 감독자 없이 도는 새 버전이 준비 전에 오류로 끝나면 되돌린 실행 파일을 exec 하는지.
- * @details 단독 프로세스는 다시 띄워 줄 감독자가 없다. 그래서 exec 한 이전 실행 파일도 포트가
- *          잡혀 있으면 오류로 끝나고, 이 테스트는 exec 한 프로세스가 되돌린 업데이트를 알리는
- *          데까지만 본다.
- */
+/// A single process has no supervisor to start it again, so the exec'd previous executable also
+/// fails while the port is held; this test only checks that the exec'd process reports the reverted
+/// update.
 fn single_process_trial_that_fails_before_ready_execs_the_previous_executable() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -555,12 +505,9 @@ fn single_process_trial_that_fails_before_ready_execs_the_previous_executable() 
 }
 
 #[test]
-/**
- * @brief 확정된 업데이트를 관리 명령으로 되돌리면 이전 실행 파일이 설치 경로에 들어가고, 다음
- *        시작이 그것을 시험해 확정하는지.
- * @details 되돌리기는 새 버전을 설치할 때와 같은 사전 점검과 맞바꾸기를 거친다. 실제 바이너리가
- *          자기 사본을 --version 과 --cli check 로 점검한다.
- */
+/// Rolling back goes through the same preflight and swap as installing a new version: the real
+/// binary checks its own copy with --version and --cli check. The next start trial-runs the
+/// restored executable and commits it.
 fn cli_rollback_installs_the_previous_executable_for_a_trial() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -608,10 +555,7 @@ fn cli_rollback_installs_the_previous_executable_for_a_trial() {
 }
 
 #[test]
-/**
- * @brief 되돌릴 업데이트가 없으면 관리 명령이 실패하고 설치 디렉터리에 아무것도 만들지 않는지.
- * @details 잠금 파일도 만들지 않아야 한다. 되돌릴 것이 없는데 설치 디렉터리에 파일을 남기면 안 된다.
- */
+/// Not even a lock file may appear in the install directory when there is nothing to roll back.
 fn cli_rollback_without_an_update_leaves_the_directory_alone() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;

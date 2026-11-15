@@ -1,6 +1,4 @@
-/*!
- * @brief 관리 API의 질의 판정 미리 보기와 판정 이유 설명.
- */
+//! Verdict preview and explanation for the management API.
 
 use std::net::Ipv4Addr;
 
@@ -9,7 +7,7 @@ use onetdns_config::{BackendKind, Config};
 use crate::native_config::qtype_numbers;
 use crate::{authority_sources_configured, localtime, native};
 
-/** @brief 이 질의가 어떻게 판정될지 실제로 묻지 않고 보여 준다. */
+/// Without sending a query.
 pub(crate) fn simulate_policy(
     policy: &onetdns_policy::PolicyEngine,
     filter: &onetdns_filter::SharedFilter,
@@ -105,7 +103,6 @@ pub(crate) fn simulate_policy(
     )
 }
 
-/** @brief 해석 방식의 API 표기. */
 pub(crate) fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Recurse => "recurse",
@@ -114,13 +111,10 @@ pub(crate) fn backend_label(kind: BackendKind) -> &'static str {
     }
 }
 
-/**
- * @brief 이 질의가 왜 그렇게 판정됐는지 설명한다.
- * @details 해석 방식과 업스트림은 호출할 때의 설정에서 읽는다. 부팅 때 값을 붙잡아 두면
- *          설정을 바꾼 뒤에도 이전 경로를 설명한다.
- * @param cfg 지금 적용된 설정.
- * @param zones 지금 적용된 권한 영역.
- */
+/// The backend and upstreams come from the config at call time; values captured at boot would
+/// explain the old path after a config change.
+///
+/// `cfg` and `zones` are the ones in effect now.
 pub(crate) fn explain_query(
     policy: &onetdns_policy::PolicyEngine,
     filter: &onetdns_filter::SharedFilter,
@@ -209,7 +203,8 @@ pub(crate) fn explain_query(
     } else {
         flt.to_string()
     };
-    /* 정책이 처분을 정하면 필터를 보지 않으므로, 무응답은 정책이 넘긴 질의에서만 일어난다. */
+    // A policy action skips the filter, so a dropped query only comes from one the policy passed
+    // on.
     let dropped = pol == "continue" && matches!(exp.verdict, FilterVerdict::Drop);
     let rcode = match (&exp.verdict, decision.as_str()) {
         (_, "refuse") => "REFUSED".to_string(),
@@ -297,26 +292,14 @@ pub(crate) fn explain_query(
     )
 }
 
-/**
- * @brief 요청이 적은 질의 종류를 번호로 읽는다.
- *
- * @details 읽지 못한 이름을 A 로 되돌리면 물어본 것과 다른 종류를 설명한 응답이
- *          오류 없이 나간다. qname 과 마찬가지로 형식 오류로 알린다.
- * @param text 요청이 적은 종류 이름.
- * @return 번호. 읽지 못하면 없다.
- */
+/// Falling back to A for an unknown name would explain a different type without an error, so it is
+/// a format error, like a bad qname. None when unreadable.
 fn requested_qtype(text: &str) -> Option<u16> {
     qtype_numbers(&[text.to_string()]).first().copied()
 }
 
-/**
- * @brief 질의 타입을 요청과 같은 문자열 모양으로 되돌린다.
- *
- * @details 요청은 "A" 같은 약칭을 받으므로 응답도 같은 모양이어야 화면에 그대로 쓸 수 있다.
- *          약칭을 모르는 타입은 RFC 3597 표기를 쓴다. "UNKNOWN"은 번호를 잃어버린다.
- * @param qtype 타입 번호.
- * @return 약칭 또는 TYPE 뒤에 번호를 붙인 표기.
- */
+/// The same mnemonic form the request takes, so the dashboard can show it as is. Types without one
+/// use the RFC 3597 TYPEnnn form, since UNKNOWN would lose the number.
 pub(crate) fn qtype_text(qtype: u16) -> String {
     let name = onetdns_proto::RecordType(qtype).name();
     if name == "UNKNOWN" {
@@ -327,17 +310,14 @@ pub(crate) fn qtype_text(qtype: u16) -> String {
 }
 
 #[cfg(test)]
-/** @brief 판정 미리 보기와 설명. */
 mod tests {
     use super::*;
     use onetdns_config::Config;
 
     #[test]
-    /**
-     * @brief 질의 설명이 실제 응답과 같은 응답 코드와 경로를 말하는지.
-     * @details 차단 응답 코드는 설정한 차단 방식을 따르고, 로컬 영역에 든 이름은 전달하지
-     *          않고 영역이 답한다. 설명이 이와 다르면 같은 화면의 실제 응답과 어긋난다.
-     */
+    /// The block rcode follows the configured block mode, and a name in a local zone is answered by
+    /// the zone, not forwarded; an explanation that differs would contradict the real response on
+    /// the same screen.
     fn explain_matches_block_response_and_local_zone() {
         let policy =
             onetdns_policy::PolicyEngine::new(onetdns_policy::RuleEngine::new(vec![]), vec![]);
@@ -393,11 +373,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief NORESPONSE 이름의 설명이 응답 코드 대신 DROPPED 를 말하는지.
-     * @details 설명이 차단 응답의 코드를 말하면 운영자는 실제로는 받지 못할 답을 기대한다. 정책이
-     *          처분을 정한 이름은 필터를 보지 않으므로 무응답이라고 설명하면 안 된다.
-     */
+    /// An explanation with the block rcode would make the operator expect an answer that never
+    /// comes. A name the policy decides skips the filter, so it must not be explained as no
+    /// response.
     fn explain_reports_noresponse_as_dropped() {
         let filter = onetdns_filter::SharedFilter::from_pointee(onetdns_filter::build_from_str(
             "||quiet.example^$dnsrewrite=NORESPONSE",
@@ -455,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 미리 보기가 실제 경로와 같은 방식으로 이름을 다루는지. 다르면 미리 보기가 거짓말이 된다. */
+    /// Otherwise the preview would lie.
     fn simulate_policy_normalizes_qname_like_live_path() {
         let policy = onetdns_policy::PolicyEngine::new(
             onetdns_policy::RuleEngine::new(vec![onetdns_policy::Rule::new(
@@ -475,7 +453,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 미리 보기가 클라이언트 식별자도 실제처럼 보는지. */
     fn simulate_policy_honors_client_id_like_explain() {
         let policy =
             onetdns_policy::PolicyEngine::new(onetdns_policy::RuleEngine::new(vec![]), vec![]);

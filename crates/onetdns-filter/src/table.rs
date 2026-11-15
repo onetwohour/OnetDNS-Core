@@ -1,58 +1,42 @@
-/*!
- * @brief 로드 중에만 쓰는 도메인 테이블.
- *
- * @details 목록을 읽는 동안 중복을 걸러 내는 용도다. 다 읽으면 정렬해 최소 오토마톤으로
- *          굳히고 이 테이블은 버린다.
- * @note 표준 해시맵 대신 쓰는 이유는 배치 때문이다. 키를 아레나 하나에 이어 붙여 두어
- *       항목마다 할당이 생기지 않는다. 목록이 수백만 줄이면 그 차이가 크다.
- */
+//! Domain table used only while loading, to drop duplicates as lists are read. Once loading
+//! finishes it is sorted into the compact automaton and dropped.
+//!
+//! It replaces the std HashMap for layout: keys are appended to one arena, so no entry allocates on
+//! its own. With lists of millions of lines that matters.
 
-/** @brief 빈 슬롯 표시. */
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::mem::size_of;
 
-/** @brief 가리키는 곳이 없음을 나타내는 값. */
+/// Empty bucket or end of a chain.
 const NONE: u32 = u32::MAX;
 
-/** @brief 지워진 항목 표시. 슬롯을 재사용하지 않고 건너뛴다. */
+/// Marks a removed entry in its len field; it is skipped, not reused.
 const DEAD: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy)]
-/** @brief 테이블의 항목 하나. 키는 아레나 안의 범위로 가리킨다. */
 struct Entry {
-    /** @brief 이 이름이 텍스트에서 시작하는 위치. */
     start: u32,
 
-    /** @brief 이 이름의 길이. */
     len: u32,
-    /** @brief 어느 목록에서 왔는지. */
     source: u32,
 
-    /** @brief 같은 위치로 몰린 다음 항목. */
     next: u32,
 }
 
 #[derive(Debug)]
-/** @brief 도메인에서 출처 번호로 가는 테이블. */
 pub(crate) struct DomainTable {
-    /** @brief 이름들을 이어 붙인 텍스트. */
     text: String,
-    /** @brief 이름마다의 위치와 길이. */
     entries: Vec<Entry>,
-    /** @brief 해시값에서 항목으로 가는 버킷. */
     buckets: Vec<u32>,
-    /** @brief 해시 함수. 프로세스마다 시드가 다르다. */
+    /// Seeded per process.
     hasher: RandomState,
-    /** @brief 담긴 이름 수. */
     live: usize,
 
-    /** @brief 담을 수 있는 수를 넘겼는지. */
     overflowed: bool,
 }
 
 impl Default for DomainTable {
-    /** @brief 빈 테이블. */
     fn default() -> Self {
         Self {
             text: String::new(),
@@ -65,10 +49,8 @@ impl Default for DomainTable {
     }
 }
 
-/**
- * @brief 아레나가 32비트 오프셋 안에 들어가는지.
- * @warning 넘치면 자르지 않고 거부한다. 자르면 오프셋이 되감겨 엉뚱한 키를 가리킨다.
- */
+/// Past 32-bit offsets the insert is refused, not truncated: a truncated offset wraps and points at
+/// the wrong key.
 fn arena_fits(text_len: usize, key_len: usize, entry_count: usize) -> bool {
     text_len
         .checked_add(key_len)
@@ -77,33 +59,26 @@ fn arena_fits(text_len: usize, key_len: usize, entry_count: usize) -> bool {
 }
 
 impl DomainTable {
-    /** @brief 살아 있는 항목 수. */
     pub(crate) fn len(&self) -> usize {
         self.live
     }
 
-    /** @brief 비었는지. */
     pub(crate) fn is_empty(&self) -> bool {
         self.live == 0
     }
 
-    /** @brief 이 키가 들어갈 버킷 번호. */
     fn slot(&self, key: &str) -> usize {
         let mut hasher = self.hasher.build_hasher();
         hasher.write(key.as_bytes());
         (hasher.finish() & (self.buckets.len() as u64 - 1)) as usize
     }
 
-    /** @brief 항목이 가리키는 키 문자열. */
     fn key_of(&self, entry: &Entry) -> &str {
         key_in(&self.text, entry)
     }
 
-    /**
-     * @brief 없을 때만 넣는다. 이미 있으면 그대로 둔다.
-     * @note 먼저 온 것이 이긴다. 목록 순서가 우선순위를 뜻하므로, 나중 것으로 덮으면
-     *       앞 목록의 규칙이 밀려난다.
-     */
+    /// The first wins: list order is priority, so overwriting would push out an earlier list's
+    /// rule.
     pub(crate) fn insert_if_absent(&mut self, key: &str, source: u32) -> bool {
         if self.buckets.is_empty() {
             self.buckets = vec![NONE; 64];
@@ -143,7 +118,6 @@ impl DomainTable {
         true
     }
 
-    /** @brief 항목을 지운다. 같은 버킷의 다른 항목은 건드리지 않는다. */
     pub(crate) fn remove(&mut self, key: &str) -> bool {
         if self.buckets.is_empty() {
             return false;
@@ -169,7 +143,6 @@ impl DomainTable {
         false
     }
 
-    /** @brief 저장된 키와 출처를 찾는다. */
     pub(crate) fn get_key_value(&self, key: &str) -> Option<(&str, u32)> {
         if self.buckets.is_empty() {
             return None;
@@ -185,7 +158,6 @@ impl DomainTable {
         None
     }
 
-    /** @brief 모든 항목. 순서는 정해져 있지 않다. */
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
         self.entries
             .iter()
@@ -193,12 +165,11 @@ impl DomainTable {
             .map(|entry| (self.key_of(entry), entry.source))
     }
 
-    /** @brief 모든 키. */
     pub(crate) fn keys(&self) -> impl Iterator<Item = &str> + '_ {
         self.iter().map(|(key, _)| key)
     }
 
-    /** @brief 정렬된 형태로 옮긴다. 오토마톤을 만들려면 순서가 정해져 있어야 한다. */
+    /// The automaton builder needs sorted input.
     pub(crate) fn into_sorted(
         mut self,
         order: impl Fn(&str, &str) -> std::cmp::Ordering,
@@ -211,14 +182,12 @@ impl DomainTable {
         SortedDomains { text, entries }
     }
 
-    /** @brief 이 테이블이 쓰는 바이트. 로드 중 메모리 추적에 쓴다. */
     pub(crate) fn storage_bytes(&self) -> usize {
         self.text.capacity()
             + self.entries.capacity() * size_of::<Entry>()
             + self.buckets.capacity() * size_of::<u32>()
     }
 
-    /** @brief 미리 슬롯을 잡는다. 로드 중 재할당을 줄인다. */
     pub(crate) fn reserve(&mut self, additional: usize) {
         self.entries.reserve(additional);
         let wanted = (self.live + additional).next_power_of_two().max(64);
@@ -227,13 +196,11 @@ impl DomainTable {
         }
     }
 
-    /** @brief 테이블을 키운다. */
     fn grow(&mut self) {
         let wanted = (self.buckets.len() * 2).max(64);
         self.rebuild_buckets(wanted);
     }
 
-    /** @brief 버킷을 다시 만든다. 지워진 항목은 옮기지 않는다. */
     fn rebuild_buckets(&mut self, len: usize) {
         self.buckets = vec![NONE; len];
         let mask = len as u64 - 1;
@@ -253,27 +220,22 @@ impl DomainTable {
     }
 }
 
-/** @brief 아레나에서 항목의 키를 잘라 낸다. */
 fn key_in<'a>(text: &'a str, entry: &Entry) -> &'a str {
     let start = entry.start as usize;
     &text[start..start + entry.len as usize]
 }
 
-/** @brief 정렬된 도메인 목록. 오토마톤 만들기의 입력이다. */
+/// Input to the automaton builder.
 pub(crate) struct SortedDomains {
-    /** @brief 이름들을 이어 붙인 텍스트. */
     text: String,
-    /** @brief 정렬한 이름들의 곳과 길이. */
     entries: Vec<Entry>,
 }
 
 impl SortedDomains {
-    /** @brief 항목 수. */
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /** @brief 정렬된 순서로 훑는다. */
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
         self.entries
             .iter()
@@ -282,12 +244,10 @@ impl SortedDomains {
 }
 
 #[cfg(test)]
-/** @brief 먼저 온 것이 이기는 규칙, 삭제 뒤 재삽입, 그리고 아레나 상한. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 아레나 상한에서 자르지 않고 거부하는지. 자르면 엉뚱한 키를 가리킨다. */
     fn arena_limit_refuses_instead_of_truncating_the_offset() {
         assert!(arena_fits(0, 10, 0));
         assert!(arena_fits(u32::MAX as usize - 10, 10, 5));
@@ -299,7 +259,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 먼저 넣은 것이 이기고, 조회가 저장된 키를 주는지. */
     fn insert_is_first_wins_and_lookup_returns_the_stored_key() {
         let mut table = DomainTable::default();
         assert!(table.insert_if_absent("ads.example", 1));
@@ -310,7 +269,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 삭제가 같은 버킷의 다른 항목을 건드리지 않는지. */
     fn remove_unlinks_without_disturbing_bucket_mates() {
         let mut table = DomainTable::default();
         for index in 0..2000u32 {
@@ -336,7 +294,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지운 뒤 다시 넣으면 새 곳을 쓰는지. */
     fn reinsert_after_remove_takes_a_fresh_slot() {
         let mut table = DomainTable::default();
         table.insert_if_absent("a.example", 1);
@@ -347,7 +304,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블을 키워도 항목이 하나도 새지 않는지. */
     fn growth_preserves_every_entry() {
         let mut table = DomainTable::default();
         for index in 0..5000u32 {
@@ -361,7 +317,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정렬 결과가 지운 항목을 빼고 주어진 순서를 따르는지. */
     fn into_sorted_skips_removed_entries_and_follows_the_given_order() {
         let mut table = DomainTable::default();
         for (index, key) in ["c.test", "a.test", "b.test"].iter().enumerate() {

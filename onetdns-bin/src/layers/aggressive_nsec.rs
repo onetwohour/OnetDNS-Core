@@ -1,6 +1,4 @@
-/*!
- * @brief RFC 8198. 캐시한 NSEC, NSEC3 증명으로 부정 응답을 합성하는 계층.
- */
+//! RFC 8198: synthesizes negative answers from cached NSEC and NSEC3 proofs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,36 +13,31 @@ use super::{
 };
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/** @brief 기록 하나를 가리키는 키. */
+/// Owner, type, and RDATA.
 type RecKey = (Vec<u8>, u16, Vec<u8>);
 
-/** @brief 기록에서 키를 만든다. */
 fn rec_key(record: &Record) -> RecKey {
     let mut writer = onetdns_proto::Writer::new();
     record.rdata.encode(&mut writer);
     (record.name.canonical_key(), record.rtype.0, writer.buf)
 }
 
-/**
- * @brief 영역 하나에서 모은 부재 증명 기록과 그 인덱스.
- * @details 정렬된 인덱스를 두고 이진 탐색한다. 인덱스가 없으면 증명 하나를 찾는 데 영역
- *          전체를 훑는다.
- */
+/// Denial proofs collected from one zone, with sorted indexes for binary search; without them,
+/// finding one proof would scan the whole zone.
 struct NsecZoneEntry {
-    /** @brief 이 영역에서 모은 기록과 담은 시각. */
+    /// Each with its expiry.
     records: HashMap<RecKey, (Record, Instant)>,
-    /** @brief 이름 순으로 정렬한 증명 인덱스. */
+    /// Sorted by owner name.
     nsec_index: Vec<RecKey>,
-    /** @brief 요약값 순으로 정렬한 감춘 형태 증명 인덱스. */
+    /// Sorted by hash.
     nsec3_index: Vec<(Vec<u8>, RecKey)>,
-    /** @brief 이름과 종류별로 그것을 덮는 서명들. */
+    /// Signatures by the name and type they cover.
     signatures: HashMap<(Vec<u8>, u16), Vec<RecKey>>,
-    /** @brief 이 영역의 권한 기록. 부정 수명의 근거다. */
+    /// Source of the negative TTL.
     soa: Option<RecKey>,
 }
 
 impl NsecZoneEntry {
-    /** @brief 빈 항목. */
     fn new() -> Self {
         Self {
             records: HashMap::new(),
@@ -55,7 +48,7 @@ impl NsecZoneEntry {
         }
     }
 
-    /** @brief 인덱스를 다시 만든다. 기록이 바뀌면 반드시 불러야 한다. */
+    /// Must run after every change to `records`.
     fn rebuild_indexes(&mut self) {
         let mut nsec_index = Vec::new();
         let mut nsec3_index = Vec::new();
@@ -98,7 +91,7 @@ impl NsecZoneEntry {
         self.soa = soa;
     }
 
-    /** @brief 흐른 만큼 수명을 깎은 기록. 다했으면 없다. */
+    /// TTL set to the time left until expiry.
     fn aged_record(&self, key: &RecKey, now: Instant) -> Option<Record> {
         let (record, expiry) = self.records.get(key)?;
         let mut record = record.clone();
@@ -106,7 +99,6 @@ impl NsecZoneEntry {
         Some(record)
     }
 
-    /** @brief 이 이름의 증명 기록. */
     fn nsec_exact(&self, name: &Name) -> Option<&RecKey> {
         self.nsec_index
             .binary_search_by(|key| {
@@ -117,7 +109,6 @@ impl NsecZoneEntry {
             .map(|index| &self.nsec_index[index])
     }
 
-    /** @brief 이 이름이 그 사이에 없음을 덮는 증명 기록. */
     fn nsec_covering(&self, name: &Name) -> Option<&RecKey> {
         let len = self.nsec_index.len();
         if len == 0 {
@@ -141,7 +132,6 @@ impl NsecZoneEntry {
         onetdns_dnssec::nsec_covers(&record.name, &nsec.next, name).then_some(key)
     }
 
-    /** @brief 이 요약값의 증명 기록. */
     fn nsec3_exact(&self, hash: &[u8]) -> Option<&RecKey> {
         self.nsec3_index
             .binary_search_by(|(owner, _)| owner.as_slice().cmp(hash))
@@ -149,7 +139,6 @@ impl NsecZoneEntry {
             .map(|index| &self.nsec3_index[index].1)
     }
 
-    /** @brief 이 요약값이 그 사이에 없음을 덮는 증명 기록. */
     fn nsec3_covering(&self, hash: &[u8]) -> Option<&RecKey> {
         let len = self.nsec3_index.len();
         if len == 0 {
@@ -170,7 +159,6 @@ impl NsecZoneEntry {
         onetdns_dnssec::hash_covers_pub(owner, &nsec3.next_hashed, hash).then_some(key)
     }
 
-    /** @brief 이 기록을 덮는 서명들. */
     fn signatures_for(&self, covered: &Record, now: Instant) -> Vec<Record> {
         self.signatures
             .get(&(covered.name.canonical_key(), covered.rtype.0))
@@ -180,7 +168,7 @@ impl NsecZoneEntry {
             .collect()
     }
 
-    /** @brief 이 이름이 없음을 보이는 데 쓸 증명과 서명. 서명 없이 내보내면 검증하는 쪽이 거부한다. */
+    /// Proofs and their signatures; without the signatures a validating client would reject them.
     fn denial_candidates(&self, qname: &Name, now: Instant) -> (Vec<Record>, Vec<Record>) {
         let mut nsec_keys = Vec::with_capacity(5);
         Self::push_key(&mut nsec_keys, self.nsec_exact(qname));
@@ -249,7 +237,7 @@ impl NsecZoneEntry {
         (nsecs, nsec3s)
     }
 
-    /** @brief 키를 겹치지 않게 넣는다. */
+    /// Skips duplicates.
     fn push_key(keys: &mut Vec<RecKey>, key: Option<&RecKey>) {
         if let Some(key) = key {
             if !keys.contains(key) {
@@ -259,7 +247,7 @@ impl NsecZoneEntry {
     }
 }
 
-/** @brief 이 이름 바로 아래의 와일드카드 이름. */
+/// `*.encloser`.
 fn wildcard_name(encloser: &Name) -> Option<Name> {
     let mut labels = Vec::with_capacity(encloser.labels().len() + 1);
     labels.push(b"*".to_vec());
@@ -267,42 +255,32 @@ fn wildcard_name(encloser: &Name) -> Option<Name> {
     Name::from_labels(labels).ok()
 }
 
-/** @brief 영역 하나를 가리키는 키. */
 type NsecZoneKey = (Vec<u8>, u16);
 
-/** @brief 영역별 증명 기록 저장소. */
 struct NsecStore {
-    /** @brief 영역별 증명 기록. 가득 차면 영역 단위로 밀어낸다. */
+    /// Evicted a whole zone at a time when full.
     zones: LruMap<NsecZoneKey, NsecZoneEntry>,
-    /** @brief 담아 둔 기록 수. 상한을 세기 위해 따로 둔다. */
+    /// Counted separately to enforce the cap.
     records: usize,
 }
 
-/**
- * @brief 담아 둔 부재 증명으로 없다는 답을 직접 만드는 계층.
- * @details 한 번 받은 증명이 이름 구간 전체를 덮으므로, 그 구간의 다른 이름도 밖에
- *          묻지 않고 답할 수 있다.
- * @warning 검증된 증명만 담는다. 검증되지 않은 것으로 답을 지어내면 남이 이 서버에게
- *          "없다"고 심어 둔 것을 이 서버가 퍼뜨린다.
- */
+/// One proof covers a whole span of names, so other names in it are answered without asking.
+///
+/// Only validated proofs are stored: synthesizing from unvalidated ones would spread a "does not
+/// exist" someone planted.
 pub struct AggressiveNsecLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 담아 둔 증명들. */
     store: Mutex<NsecStore>,
 
-    /** @brief 전체 기록 수 상한. */
+    /// Total records.
     cap: usize,
-    /** @brief 영역 하나가 차지할 수 있는 기록 수. */
+    /// Records one zone may hold.
     per_zone: usize,
-    /** @brief 임의로 만든 답에 담을 수명 하한. */
     neg_min_ttl: u32,
-    /** @brief 임의로 만든 답에 담을 수명 상한. */
     neg_max_ttl: u32,
 }
 
 impl AggressiveNsecLayer {
-    /** @brief 용량과 수명 상하한으로 만든다. */
     pub fn new(inner: Arc<dyn Resolver>, cap: usize, neg_min_ttl: u32, neg_max_ttl: u32) -> Self {
         let cap = cap.max(1);
         Self {
@@ -318,10 +296,8 @@ impl AggressiveNsecLayer {
         }
     }
 
-    /**
-     * @brief 검증된 부재 증명을 담아 둔다.
-     * @warning 수명이 0인 기록은 담지 않는다. 담으면 이미 만료된 증명으로 답을 임의로 만든다.
-     */
+    /// Stores validated denial proofs, skipping records with TTL 0, which would synthesize from an
+    /// already expired proof.
     fn maybe_cache(&self, response: &Message) {
         if !response.header.authentic_data {
             return;
@@ -516,7 +492,7 @@ impl AggressiveNsecLayer {
         store.zones.put(zone_name, zone);
     }
 
-    /** @brief 담아 둔 증명으로 이 질의에 답을 임의로 만든다. 덮는 증명이 없으면 만들지 않는다. */
+    /// None without a covering proof.
     fn try_synthesize(&self, request: &Message) -> Option<Message> {
         let question = request.questions.first()?;
         let qname = &question.name;
@@ -585,12 +561,11 @@ impl AggressiveNsecLayer {
 }
 
 impl Resolver for AggressiveNsecLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 지어낼 수 있으면 짓고, 아니면 물어보고 그 증명을 담는다. */
+    /// Synthesizes when it can; otherwise asks and stores the proofs.
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         if req.questions.is_empty() {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -610,7 +585,6 @@ impl Resolver for AggressiveNsecLayer {
 }
 
 #[cfg(test)]
-/** @brief 캐시한 증명으로 합성한 부정 응답과 그 증명 저장소. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -624,7 +598,6 @@ mod tests {
     use crate::layers::answer_message;
     use crate::native::Resolver;
 
-    /** @brief 이름을 감춘 형태의 테스트용 부재 증명. */
     fn nsec3_nodata_record(name: &str, zone: &str, salt: &[u8]) -> Record {
         let qname = Name::from_str(name).unwrap();
         let hash = onetdns_dnssec::nsec3_hash(&qname, salt, 0);
@@ -642,15 +615,12 @@ mod tests {
         Record::new(owner, 3600, RData::Unknown(RecordType::NSEC3.0, rdata))
     }
 
-    /** @brief 증명이 담긴 부정 응답을 내는 테스트용 리졸버. */
+    /// Answers with a negative response carrying a proof.
     struct NsecNx {
-        /** @brief 검증됐다고 표시할지. */
         ad: bool,
-        /** @brief 불린 횟수. */
         calls: AtomicU32,
     }
     impl Resolver for NsecNx {
-        /** @brief 미리 정해 둔 응답을 돌려준다. */
         fn resolve(&self, req: &Message) -> Option<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let q = req.questions.first()?;
@@ -667,7 +637,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담아 둔 증명으로 없다는 답을 만드는지. */
     fn aggressive_nsec_synthesizes_nxdomain() {
         let inner = Arc::new(NsecNx {
             ad: true,
@@ -731,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 검증되지 않은 증명으로는 만들지 않는지. 만들면 남이 심은 것을 이 서버가 퍼뜨린다. */
+    /// Doing so would spread what someone planted.
     fn aggressive_nsec_skips_unvalidated() {
         let inner = Arc::new(NsecNx {
             ad: false,
@@ -748,7 +717,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 권한 기록이 정한 부정 수명을 지키는지. */
     fn aggressive_nsec_respects_soa_negative_ttl() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 0, 86_400);
         let mut soa = soa_record("example.com");
@@ -782,7 +750,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 수명 상하한을 지키는지. */
     fn aggressive_nsec_honors_configured_negative_ttl_bounds() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 5, 5);
         let mut soa = soa_record("example.com");
@@ -819,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief CNAME 뒤 NODATA에서 검증된 terminal proof도 부정 TTL 정책으로 재사용하는지. */
+    /// A validated terminal proof after a CNAME is reused under the negative TTL policy too.
     fn aggressive_nsec_learns_proof_from_cname_to_nodata() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 0, 7);
         let alias = Name::from_str("alias.example.com").unwrap();
@@ -847,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서명 만료가 설정한 하한보다 짧으면 그쪽을 따르는지. */
+    /// A signature expiring before the configured floor wins.
     fn aggressive_nsec_dnssec_cap_overrides_configured_minimum() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 120, 120);
         let mut response = answer_message(
@@ -885,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수명이 0인 증명을 담지 않는지. 담으면 만료된 것으로 답을 만든다. */
+    /// Storing it would synthesize from an expired proof.
     fn aggressive_nsec_never_caches_zero_ttl_proof_records() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 0, 86_400);
         let mut nsec = nsec_record("example.com", "a.example.com", &[6, 47]);
@@ -908,7 +875,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 담는 양이 상한을 지키고, 밀어낼 때 영역 단위로 밀어내는지. */
     fn aggressive_nsec_store_keeps_exact_record_cap_and_evicts_whole_lru_zone() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 6, 0, 86_400);
         let response = |zone: &str| {
@@ -951,7 +917,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 즉시 predecessor가 덮지 않으면 더 오래된 넓은 proof로 후퇴하지 않는지. */
+    /// When the immediate predecessor does not cover the name, it does not fall back to an older,
+    /// wider proof.
     fn aggressive_denial_covering_never_skips_a_closer_owner() {
         let expiry = Instant::now() + Duration::from_secs(60);
 
@@ -1000,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief aggressive NSEC3 후보 탐색도 깊이×반복 총 SHA 예산을 공유하는지. */
+    /// NSEC3 candidate lookup shares the total SHA budget across depth and iterations.
     fn aggressive_nsec3_candidate_lookup_has_a_total_hash_budget() {
         let qname = Name::from_labels((0..127).map(|_| vec![b'a']).collect()).unwrap();
         let root = Name::from_labels(Vec::new()).unwrap();
@@ -1052,7 +1019,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 영역에서도 맞는 증명을 고르는지. */
     fn aggressive_nsec_selects_proof_from_large_zone_cache() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 64, 0, 86_400);
         let mut response = answer_message(
@@ -1116,7 +1082,6 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-    /** @brief 큰 영역에서 답을 만드는 비용. */
     fn bench_aggressive_nsec_large_zone_synthesis() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 4096, 0, 86_400);
         let mut response = answer_message(
@@ -1144,7 +1109,6 @@ mod tests {
         let request = query("b2.example.com", RecordType::A);
         assert!(layer.try_synthesize(&request).is_some());
 
-        /** @brief 호출 횟수. */
         const CALLS: u32 = 1000;
         let started = Instant::now();
         for _ in 0..CALLS {
@@ -1158,7 +1122,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 증명이 바뀌면 한꺼번에 교체하는지. 섞이면 이전 증명과 새 증명이 함께 담긴다. */
+    /// A changed proof replaces the old one at once; mixed, the old and new proofs would both be
+    /// stored.
     fn aggressive_nsec_replaces_changed_rrset_atomically() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 0, 86_400);
         let response = |next: &str| {
@@ -1205,11 +1170,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 감춘 형태의 증명으로 빈 답을 만드는지. */
     fn aggressive_nsec3_synthesizes_nodata_from_cache() {
-        /** @brief 요약값을 이름에 쓰는 표기로. */
+        /// Base32hex, as NSEC3 owner names use.
         fn b32hex(data: &[u8]) -> String {
-            /** @brief 표기에 쓰는 문자표. */
             const A: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
             let (mut acc, mut bits, mut out) = (0u64, 0u32, String::new());
             for &b in data {
@@ -1226,15 +1189,11 @@ mod tests {
             out
         }
 
-        /** @brief 정해진 응답을 내는 테스트용 리졸버. */
         struct Fixed {
-            /** @brief 돌려줄 응답. */
             resp: Message,
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for Fixed {
-            /** @brief 정해진 응답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut m = self.resp.clone();
@@ -1299,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 감추기 설정이 바뀌면 이전 증명을 버리는지. 섞이면 없는 것을 있다고 하거나 그 반대가 된다. */
+    /// Mixing them would deny names that exist, or the reverse.
     fn aggressive_nsec3_rollover_discards_previous_parameters() {
         let layer = AggressiveNsecLayer::new(Mock::new(1, 0), 16, 0, 86_400);
         let response = |salt: &[u8]| {
@@ -1347,11 +1306,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 감춘 형태의 증명으로 없다는 답을 만드는지. */
     fn aggressive_nsec3_synthesizes_nxdomain_from_cache() {
-        /** @brief 요약값을 이름에 쓰는 표기로. */
+        /// Base32hex, as NSEC3 owner names use.
         fn b32hex(data: &[u8]) -> String {
-            /** @brief 표기에 쓰는 문자표. */
             const A: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
             let (mut acc, mut bits, mut out) = (0u64, 0u32, String::new());
             for &b in data {
@@ -1368,7 +1325,6 @@ mod tests {
             out
         }
 
-        /** @brief 감춘 형태의 테스트용 증명 기록. */
         fn nsec3(owner_hash: &[u8], next: [u8; 20]) -> Record {
             let owner = Name::from_str(&format!("{}.example", b32hex(owner_hash))).unwrap();
             let mut rd = vec![1u8, 0u8];
@@ -1380,15 +1336,11 @@ mod tests {
             Record::new(owner, 3600, RData::Unknown(50, rd))
         }
 
-        /** @brief 정해진 응답을 내는 테스트용 리졸버. */
         struct Fixed {
-            /** @brief 돌려줄 응답. */
             resp: Message,
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for Fixed {
-            /** @brief 정해진 응답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut m = self.resp.clone();

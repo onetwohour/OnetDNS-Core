@@ -1,12 +1,9 @@
-/*!
- * @brief RFC 1035 zone 파일 파서.
- *
- * @details 모든 zone 공급자가 결국 이 함수를 거친다. 파일, 디렉터리, DB 백엔드가 각자
- *          형식을 해석하지 않고 여기로 모이므로, 입력 검증이 한곳에 모인다.
- * @warning 신뢰할 수 없는 입력이 닿는다. 컨트롤 플레인으로 zone 텍스트를 올릴 수 있고, DB 행도
- *          이 서버가 만든 것이 아닐 수 있다. 어떤 입력에도 패닉하지 않아야 하며, 패닉 스윕의
- *          진입점 중 하나다.
- */
+//! RFC 1035 zone file parser. File, directory, and database sources all hand their text here
+//! instead of interpreting formats themselves, so input validation lives in one place.
+//!
+//! Input is untrusted: zone text can be uploaded through the control plane, and database rows may
+//! not come from this server. It must not panic on any input, and it is one of the panic sweep's
+//! entry points.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -14,20 +11,14 @@ use onetdns_proto::{Name, RData, Record, RecordType, Soa};
 
 use crate::{Zone, MAX_ZONE_RECORDS};
 
-/**
- * @brief zone 텍스트를 파싱해 Zone을 만든다.
- *
- * @details 상태를 이어 가며 줄 단위로 읽는다. origin과 기본 TTL은 지시자가 바꾸고,
- *          공백으로 시작하는 줄은 직전 소유자 이름을 물려받는다. 클래스와 TTL은 순서가
- *          자유로워서 타입이 나올 때까지 앞에서 걷어 낸다.
- * @param text           zone 파일 내용. 앞의 BOM은 떼어 낸다.
- * @param default_origin 파일에 지시자가 없을 때 쓸 origin.
- * @return 파싱된 Zone.
- * @retval Err SOA가 없거나 둘 이상일 때, 레코드 수가 상한을 넘을 때, 그리고 각 줄의
- *             형식이 어긋날 때.
- * @invariant SOA는 정확히 하나여야 한다. 둘이면 어느 것이 zone의 직렬번호인지 정해지지
- *            않아 전송과 갱신이 어긋난다.
- */
+/// Reads line by line with carried state: directives change the origin and default TTL, and a line
+/// starting with whitespace inherits the previous owner. Class and TTL may come in either order, so
+/// they are taken off the front until the type appears. A leading BOM is dropped; `default_origin`
+/// applies when the file has no directive.
+///
+/// Fails when there is no SOA or more than one, when the record count exceeds the limit, or when a
+/// line is malformed. Exactly one SOA: with two, the zone's serial is undefined and transfers and
+/// updates disagree.
 pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut origin = Name::from_str(default_origin).map_err(|_| "Invalid origin".to_string())?;
@@ -115,19 +106,12 @@ pub fn parse_zone(text: &str, default_origin: &str) -> Result<Zone, String> {
     Zone::from_flat_records(soa_owner, soa_rec, soa_ttl, records)
 }
 
-/**
- * @brief ZONEMD 다이제스트의 최소 길이.
- * @details RFC 8976은 이보다 짧은 다이제스트를 허용하지 않는다. 짧은 값은 영역이 온전한지
- *          가리는 근거가 되지 못한다.
- */
+/// RFC 8976 allows nothing shorter; a shorter value proves nothing about zone integrity.
 const ZONEMD_MIN_DIGEST: usize = 12;
 
-/**
- * @brief 타입 이름과 토큰들로 RDATA를 만든다.
- * @details 아는 타입은 구조화해서 담고, 모르는 타입은 형식으로 받아 미해석 바이트로 둔다.
- *          마지막에 반드시 validate를 거친다. 파싱만 되고 규격에 어긋나는 값이 zone에
- *          들어가면 응답 인코딩 시점에야 문제가 드러난다.
- */
+/// Known types are parsed into structure; unknown types are taken in generic form as uninterpreted
+/// bytes. Everything goes through validate at the end: a value that parses but violates the spec
+/// would otherwise surface only when encoding a response.
 fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, String> {
     let need = |n: usize| -> Result<(), String> {
         if toks.len() < n {
@@ -429,12 +413,8 @@ fn parse_rdata(rtype: &str, toks: &[String], origin: &Name) -> Result<RData, Str
     Ok(rd)
 }
 
-/**
- * @brief 16진 문자열을 바이트로.
- * @note 바이트 단위로 다루므로 다중바이트 문자가 섞여도 인덱스가 문자 경계를 벗어나지
- *       않는다. to_digit이 걸러 내니 별도 검사는 필요 없다.
- * @return 길이가 홀수이거나 16진수가 아닌 문자가 있으면 None.
- */
+/// Works on bytes, so multibyte characters cannot push an index off a character boundary; to_digit
+/// rejects them. None for odd length or non-hex characters.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     if b.len() % 2 != 0 {
@@ -449,11 +429,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/**
- * @brief 토큰을 이름으로. 상대 이름은 origin을 붙여 절대 이름으로 만든다.
- * @details 골뱅이는 origin 자신이고, 점으로 끝나면 이미 절대 이름이다. 그 밖에는 origin을
- *          이어 붙인다. 이 규칙을 어기면 같은 zone 파일이 origin에 따라 다른 이름을 만든다.
- */
+/// @ is the origin, a trailing dot means absolute, and anything else gets the origin appended.
+/// Breaking this rule would make one zone file produce different names depending on the origin.
 fn parse_name(tok: &str, origin: &Name) -> Result<Name, String> {
     if tok == "@" {
         return Ok(origin.clone());
@@ -461,22 +438,17 @@ fn parse_name(tok: &str, origin: &Name) -> Result<Name, String> {
     if tok.ends_with('.') && !tok.ends_with(r"\.") {
         return Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"));
     }
-    /*
-     * origin은 라벨로 이어 붙인다. 표시 문자열로 합치면 이스케이프가 필요한 바이트가
-     * 그대로 섞여 들어가 다시 읽을 때 라벨 경계가 달라진다.
-     */
+    // The origin is appended as labels; joining presentation strings would mix in bytes that need
+    // escaping and move label boundaries when read back.
     let relative = Name::from_str(tok).map_err(|_| format!("Invalid name: {tok}"))?;
     let mut labels: Vec<Vec<u8>> = relative.labels().map(<[u8]>::to_vec).collect();
     labels.extend(origin.labels().map(<[u8]>::to_vec));
     Name::from_labels(labels).map_err(|_| format!("Invalid name: {tok}"))
 }
 
-/**
- * @brief TTL을 읽는다. 순수한 숫자와 접미사 형식(1h30m 등)을 모두 받는다.
- * @note 누적은 포화 연산으로 하고 마지막에 32비트로 자른다. 큰 값을 적어도 넘치지 않고
- *       상한에 머무른다.
- * @return 숫자가 하나도 없거나 모르는 접미사가 있으면 오류.
- */
+/// Accepts plain numbers and suffixed forms such as 1h30m. Sums saturate and are clamped to 32 bits
+/// at the end, so large values stop at the limit instead of overflowing. Errors on no digits or an
+/// unknown suffix.
 fn parse_ttl(s: &str) -> Result<u32, String> {
     if let Ok(n) = s.parse::<u32>() {
         return Ok(n);
@@ -509,15 +481,10 @@ fn parse_ttl(s: &str) -> Result<u32, String> {
     Ok(total.min(u32::MAX as u64) as u32)
 }
 
-/**
- * @brief 괄호로 이어진 여러 물리 줄을 논리 줄 하나로 묶어 넘긴다.
- *
- * @details SOA처럼 긴 레코드는 괄호로 줄을 나눠 쓴다. 괄호 깊이를 세되 따옴표 안의
- *          괄호는 세지 않는다. 텍스트가 괄호를 닫지 않고 끝나도 마지막 조각을 그대로
- *          넘긴다. 삼키면 잘린 파일이 조용히 통과한다.
- * @param emit 첫 인자는 그 논리 줄이 공백으로 시작했는지다. 소유자 이름을 물려받을지가
- *             여기서 갈리므로 내용과 함께 전달해야 한다.
- */
+/// Joins physical lines continued with parentheses, as long records like SOA use. Counts
+/// parenthesis depth outside quotes. If the text ends with a parenthesis still open, the last piece
+/// is passed on anyway; swallowing it would let a truncated file pass silently. `emit` also gets
+/// whether the logical line started with whitespace, which decides whether the owner is inherited.
 fn for_each_logical_line(
     text: &str,
     mut emit: impl FnMut(bool, &str) -> Result<(), String>,
@@ -555,10 +522,8 @@ fn for_each_logical_line(
     Ok(())
 }
 
-/**
- * @brief 주석을 떼어 낸다. 따옴표 안과 역슬래시 뒤의 세미콜론은 주석이 아니다.
- * @note 버퍼를 재사용해 줄마다 할당이 붙지 않게 한다.
- */
+/// Semicolons inside quotes or after a backslash are not comments. Reuses the buffer, so lines do
+/// not allocate.
 fn strip_comment_into(line: &str, out: &mut String) {
     out.clear();
     let mut in_q = false;
@@ -581,7 +546,7 @@ fn strip_comment_into(line: &str, out: &mut String) {
     }
 }
 
-/** @brief 따옴표 밖에 있는 특정 문자 수를 센다. 역슬래시 다음 문자는 건너뛴다. */
+/// Skips the character after a backslash.
 fn count_unquoted(s: &str, target: char) -> i32 {
     let mut n = 0;
     let mut in_q = false;
@@ -599,11 +564,8 @@ fn count_unquoted(s: &str, target: char) -> i32 {
     n
 }
 
-/**
- * @brief 논리 줄을 토큰으로 나눈다.
- * @details 따옴표 안의 공백은 나누지 않고, 역슬래시 이스케이프는 그대로 남긴다. 해석은
- *          타입별 파서가 한다. 빈 따옴표쌍도 토큰 하나로 친다. TXT의 빈 문자열이다.
- */
+/// Spaces inside quotes do not split, and backslash escapes are left for each type's parser. An
+/// empty quoted pair is one token: TXT's empty string.
 fn tokenize(s: &str) -> Vec<String> {
     let mut toks = Vec::new();
     let mut cur = String::new();
@@ -638,18 +600,13 @@ fn tokenize(s: &str) -> Vec<String> {
     toks
 }
 
-/**
- * @brief RRSIG가 덮는 종류 이름을 번호로.
- * @details 이름을 아는 종류는 약칭으로, 그 밖은 TYPEnnn으로 적힌다.
- */
+/// Known types by mnemonic, others as TYPEnnn.
 fn rrsig_covered_type(tok: &str) -> Result<u16, String> {
     type_number(tok).ok_or_else(|| format!("Unknown type covered by RRSIG: {tok}"))
 }
 
-/**
- * @brief 종류 이름을 번호로. 이름을 모르면 TYPEnnn 형식만 받는다.
- * @details RecordType::name이 번호에서 이름으로 가는 유일한 테이블이라, 여기서 그 테이블을 되짚는다.
- */
+/// Unknown names only in TYPEnnn form. RecordType::name is the only number-to-name table, so this
+/// walks it in reverse.
 fn type_number(tok: &str) -> Option<u16> {
     if let Some(digits) = tok
         .strip_prefix("TYPE")
@@ -663,13 +620,9 @@ fn type_number(tok: &str) -> Option<u16> {
     })
 }
 
-/**
- * @brief NSEC과 NSEC3의 종류 비트맵을 만든다.
- *
- * @details RFC 4034가 정한 형식이다. 종류 번호의 상위 바이트로 윈도를 나누고, 윈도마다
- *          실제로 쓰인 마지막 바이트까지만 적는다. 윈도를 길이대로 자르지 않으면 검증기가
- *          비트맵을 다르게 읽어 부재 증명이 어긋난다.
- */
+/// RFC 4034 type bitmap for NSEC and NSEC3: windows by the type's high byte, each written only up
+/// to its last used byte. Untrimmed windows make validators read the bitmap differently and break
+/// denial proofs.
 fn type_bitmap(toks: &[String]) -> Result<Vec<u8>, String> {
     let mut windows: std::collections::BTreeMap<u8, [u8; 32]> = std::collections::BTreeMap::new();
     for tok in toks {
@@ -692,10 +645,8 @@ fn type_bitmap(toks: &[String]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/**
- * @brief NSEC3와 NSEC3PARAM이 함께 쓰는 앞부분을 만든다.
- * @details 해시 알고리즘, 플래그, 반복 횟수, 소금이다. 소금 없음은 -로 적는다.
- */
+/// Shared prefix of NSEC3 and NSEC3PARAM: hash algorithm, flags, iterations, salt. No salt is
+/// written as -.
 fn nsec3_head(
     hash: &str,
     flags: &str,
@@ -727,7 +678,7 @@ fn nsec3_head(
     Ok(wire)
 }
 
-/** @brief NSEC3의 해시 이름이 쓰는 base32hex를 푼다. 패딩은 받지 않는다. */
+/// For NSEC3 hashed names; no padding.
 fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut acc = 0u64;
@@ -750,11 +701,7 @@ fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/**
- * @brief RRSIG의 시각을 읽는다.
- * @details YYYYMMDDHHmmSS 형식과 초 단위 정수 둘 다 규격이 허용한다.
- * @return 1970년부터의 초.
- */
+/// The spec allows both YYYYMMDDHHmmSS and plain seconds. Returns seconds since 1970.
 fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     if tok.len() != 14 || !tok.bytes().all(|b| b.is_ascii_digit()) {
         return tok
@@ -772,7 +719,8 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     {
         return Err(format!("Invalid RRSIG time: {tok}"));
     }
-    /* 1970-01-01부터의 일수. 3월을 한 해의 시작으로 옮겨 윤년 보정을 한 줄로 만든다. */
+    // Days since 1970-01-01. Starting the year in March puts the leap day last, so the leap year
+    // correction is one line.
     let shifted_year = if month <= 2 { year - 1 } else { year };
     let era = shifted_year / 400;
     let year_of_era = shifted_year - era * 400;
@@ -784,14 +732,9 @@ fn parse_dnssec_time(tok: &str) -> Result<u32, String> {
     u32::try_from(seconds).map_err(|_| format!("RRSIG time is out of range: {tok}"))
 }
 
-/**
- * @brief zone 파일에 적힌 base64를 푼다.
- * @details DNSKEY와 RRSIG와 ech가 이 형식을 쓴다. 여러 토큰으로 나뉘어 오는 경우가 흔해
- *          공백은 건너뛴다.
- * @return 알파벳 밖 문자가 있으면 None.
- */
+/// For DNSKEY, RRSIG, and ech values. These often span several tokens, so whitespace is skipped.
+/// None on characters outside the alphabet.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -822,10 +765,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/**
- * @brief 등록된 SvcParamKey 이름을 번호로.
- * @details RFC 9460의 등록부다. 이름이 아닌 keyNNNNN 형태는 호출자가 다룬다.
- */
+/// The RFC 9460 registry. keyNNNNN is the caller's job.
 fn svcb_key_number(name: &str) -> Option<u16> {
     Some(match name {
         "mandatory" => 0,
@@ -839,10 +779,7 @@ fn svcb_key_number(name: &str) -> Option<u16> {
     })
 }
 
-/**
- * @brief SvcParamKey 이름 또는 keyNNNNN을 번호로.
- * @details mandatory 값도 키 이름 목록이라 같은 규칙으로 푼다.
- */
+/// mandatory lists key names too, so it uses the same rule.
 fn svcb_key_of(name: &str) -> Result<u16, String> {
     if let Some(key) = svcb_key_number(name) {
         return Ok(key);
@@ -852,13 +789,8 @@ fn svcb_key_of(name: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("Invalid SVCB parameter key: {name}"))
 }
 
-/**
- * @brief 쉼표로 나뉜 목록을 구분한다.
- *
- * @details RFC 9460 부록 A.1이 정한 규칙이다. 항목 안의 쉼표는 역슬래시로 막고, 역슬래시
- *          자신도 역슬래시로 막는다. 이스케이프를 먼저 풀면 막아 둔 쉼표와 구분자가
- *          같아져 잘못 갈라진다.
- */
+/// Comma-separated list per RFC 9460: a comma inside an item is escaped with a backslash, as is the
+/// backslash itself. Unescaping first would make escaped commas look like separators.
 fn split_escaped_list(value: &[u8]) -> Vec<Vec<u8>> {
     let mut items = vec![Vec::new()];
     let mut i = 0;
@@ -887,16 +819,9 @@ fn split_escaped_list(value: &[u8]) -> Vec<Vec<u8>> {
     items
 }
 
-/**
- * @brief SvcParam 하나를 번호와 wire 바이트로 옮긴다.
- *
- * @details RFC 9460은 값의 표시 형식을 키마다 따로 정한다. 등록된 키를 모르면 그
- *          영역을 아예 담지 못하므로, 실제로 쓰이는 일곱을 모두 다룬다. 등록부에 없는
- *          keyNNNNN은 같은 항이 정한 대로 character-string을 풀어 그대로 wire로 쓴다.
- * @param name 키 이름 또는 keyNNNNN.
- * @param value = 뒤의 토큰. 없으면 None.
- * @return 키 번호와 wire 바이트.
- */
+/// RFC 9460 defines the presentation format per key. Missing a registered key would make a zone
+/// unloadable, so all seven in use are handled. Unregistered keyNNNNN values are character-strings
+/// decoded straight to wire. `value` is the token after =, if any.
 fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String> {
     let key = svcb_key_of(name)?;
     let raw = value.map(unescape_char_string).unwrap_or_default();
@@ -973,12 +898,9 @@ fn svcb_param(name: &str, value: Option<&str>) -> Result<(u16, Vec<u8>), String>
     Ok((key, wire))
 }
 
-/**
- * @brief 문자열 토큰의 역슬래시 이스케이프를 푼다.
- * @details 역슬래시 뒤 세 자리 십진수는 그 값의 바이트 하나가 된다. 255를 넘거나 자릿수가
- *          모자라면 이스케이프가 아니라 다음 문자 그대로다.
- * @note 바이트 단위로 다루므로 다중바이트 문자가 끼어도 인덱스가 어긋나지 않는다.
- */
+/// A backslash followed by three decimal digits becomes that byte; above 255 or with too few digits
+/// it is not an escape, and the next character is taken literally. Works on bytes, so multibyte
+/// characters do not shift indexes.
 pub(crate) fn unescape_char_string(tok: &str) -> Vec<u8> {
     let b = tok.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -1009,12 +931,11 @@ pub(crate) fn unescape_char_string(tok: &str) -> Vec<u8> {
     out
 }
 
-/** @brief 파서의 형식 처리와, 어떤 쓰레기 입력에도 패닉하지 않음. */
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /** @brief 편집기가 붙인 BOM이 첫 레코드를 삼키지 않는지. */
+    /// An editor's BOM must not swallow the first record.
     #[test]
     fn utf8_bom_prefixed_zone_parses() {
         let body = "$ORIGIN bom.test.\n@ IN SOA ns admin 1 300 60 86400 60\n@ IN NS ns\nns IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
@@ -1029,7 +950,6 @@ mod tests {
         );
     }
 
-    /** @brief 숫자와 접미사 조합이 모두 같은 초로 풀리는지. */
     #[test]
     fn parse_ttl_suffixes() {
         assert_eq!(parse_ttl("3600").unwrap(), 3600);
@@ -1039,14 +959,12 @@ mod tests {
         assert!(parse_ttl("xx").is_err());
     }
 
-    /** @brief 따옴표 안의 공백이 토큰을 나누지 않는지. */
     #[test]
     fn tokenize_quoted_txt() {
         let t = tokenize(r#"@ IN TXT "hello world" "more""#);
         assert_eq!(t, vec!["@", "IN", "TXT", "hello world", "more"]);
     }
 
-    /** @brief 다중바이트 문자가 섞여도 인덱스가 문자 경계를 벗어나지 않는지. */
     #[test]
     fn hex_decode_no_panic_on_multibyte() {
         assert!(hex_decode("€a").is_none());
@@ -1055,7 +973,6 @@ mod tests {
         assert!(hex_decode("fff").is_none());
     }
 
-    /** @brief 십진 이스케이프와 문자 이스케이프가 각각 옳은 바이트로 풀리는지. */
     #[test]
     fn unescape_roundtrips_decimal_and_char_escapes() {
         assert_eq!(unescape_char_string(r"a\010b"), vec![b'a', 10, b'b']);
@@ -1064,11 +981,8 @@ mod tests {
         assert_eq!(unescape_char_string("plain"), b"plain".to_vec());
     }
 
-    /**
-     * @brief 영역 파일의 ZONEMD 표기를 읽는지.
-     * @details ZONEMD를 붙여 공표한 영역 파일을 읽지 못하면 영역 전체를 담지 못하고, 영역
-     *          요약 검사도 쓸 수 없다.
-     */
+    /// Unable to read ZONEMD, a zone published with it could not be loaded at all, and digest
+    /// checks would be unusable.
     #[test]
     fn zonemd_presentation_parses_to_wire() {
         let origin = Name::from_str("example").unwrap();
@@ -1092,7 +1006,6 @@ mod tests {
         parse_zone(&text, "example").expect("괄호로 나눈 ZONEMD가 든 영역");
     }
 
-    /** @brief 미해석 RDATA의 16진 토큰에 다중바이트가 들어와도 패닉하지 않는지. */
     #[test]
     fn hex_rdata_multibyte_token_does_not_panic() {
         let origin = Name::from_str("example.com").unwrap();
@@ -1102,7 +1015,7 @@ mod tests {
         }
     }
 
-    /** @brief 타입별 RDATA가 제대로 구조화되는지. 각 타입의 토큰 배치를 한데 고정한다. */
+    /// Pins each type's token layout in one place.
     #[test]
     fn typed_rdata_zone_parse() {
         let origin = Name::from_str("example.com").unwrap();
@@ -1175,7 +1088,7 @@ mod tests {
         assert!(pr("SVCB 1 svc.example.net port=443 port=444").is_err());
         assert!(pr("SVCB 1 svc.example.net key2").is_err());
 
-        /* RFC 9460이 정한 등록 키와 그 값 형식. 셋 다 wire 바이트까지 확인한다. */
+        // Registered keys and their value formats from RFC 9460, each checked down to wire bytes.
         let full = pr("HTTPS 1 svc.example.net alpn=h2,h3 port=8443 ipv4hint=192.0.2.1,192.0.2.2")
             .expect("등록된 키를 읽어야 합니다");
         match full {
@@ -1194,7 +1107,7 @@ mod tests {
             other => panic!("HTTPS 기대: {other:?}"),
         }
 
-        /* 항목 안의 쉼표는 역슬래시로 막는다. 먼저 이스케이프를 풀면 구분자와 섞인다. */
+        // A comma inside an item is escaped; unescaping first would mix it with separators.
         match pr(r"SVCB 1 . alpn=one\\,two").expect("막은 쉼표") {
             RData::Svcb { params, .. } => {
                 assert_eq!(params[0].1.as_ref(), b"one,two");
@@ -1202,7 +1115,7 @@ mod tests {
             other => panic!("SVCB 기대: {other:?}"),
         }
 
-        /* 등록부에 없는 키의 값은 16진수가 아니라 character-string이다. */
+        // Values of unregistered keys are character-strings, not hex.
         match pr("SVCB 1 . key65000=hello").expect("미등록 키") {
             RData::Svcb { params, .. } => assert_eq!(params[0].1.as_ref(), b"hello"),
             other => panic!("SVCB 기대: {other:?}"),
@@ -1211,10 +1124,8 @@ mod tests {
         assert!(pr("SVCB 1 . port=notanumber").is_err());
         assert!(pr("SVCB 1 . ipv4hint=2001:db8::1").is_err());
 
-        /*
-         * RFC 4034가 정한 DNSSEC 표시 형식. 미리 서명된 zone을 담지 못하면 온라인 서명
-         * 말고는 길이 없다. wire 바이트까지 확인한다. BIND와 대조해 얻은 값이다.
-         */
+        // RFC 4034 DNSSEC presentation formats. Without them presigned zones cannot load, leaving
+        // online signing as the only option. Wire bytes are checked against BIND.
         match pr("DNSKEY 256 3 13 AQIDBA==").expect("DNSKEY") {
             RData::Unknown(48, wire) => {
                 assert_eq!(wire, vec![0x01, 0x00, 3, 13, 1, 2, 3, 4]);
@@ -1247,7 +1158,8 @@ mod tests {
         }
         match pr("NSEC next.sec.test. A AAAA RRSIG NSEC").expect("NSEC") {
             RData::Unknown(47, wire) => {
-                /* 이름 뒤가 비트맵이다. 윈도 0, 길이 6, A(1) AAAA(28) RRSIG(46) NSEC(47). */
+                // The bitmap follows the name: window 0, length 6, A(1) AAAA(28) RRSIG(46)
+                // NSEC(47).
                 let bitmap = &wire[wire.len() - 8..];
                 assert_eq!(bitmap, [0x00, 0x06, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03]);
             }
@@ -1272,7 +1184,7 @@ mod tests {
             }
             other => panic!("NSEC3 기대: {other:?}"),
         }
-        /* 이름을 모르는 종류는 TYPEnnn으로 비트맵에 넣을 수 있어야 한다. */
+        // Unknown types must go into the bitmap as TYPEnnn.
         assert!(pr("NSEC next.sec.test. A TYPE300").is_ok());
         assert!(pr("DNSKEY 256 3 13 !!!not-base64!!!").is_err());
         assert!(pr("RRSIG A 13 3 3600 20261301000000 20260801000000 1 . AQ==").is_err());
@@ -1293,10 +1205,8 @@ mod tests {
         assert!(pr("DS 3643 13 2 zz").is_err(), "16진수 오류 거부");
     }
 
-    /**
-     * @brief 아무 입력이 와도 오류로 끝날 뿐 패닉하지 않는다.
-     * @details 컨트롤 플레인으로 zone 텍스트를 올릴 수 있으므로 이 파서는 신뢰 경계에 있다.
-     */
+    /// Zone text can be uploaded through the control plane, so this parser sits on a trust
+    /// boundary.
     #[test]
     fn parser_no_panic_on_garbage() {
         let mut seed: u32 = 0x2545_f491;
@@ -1306,7 +1216,6 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        /** @brief 망가뜨릴 때 끼워 넣을 글자들. */
         const CH: &[u8] = b"abcXYZ0123 .@\t\n\";()$ORIGIN TTLINSOAANSAAA*";
         for _ in 0..3000 {
             let len = (rng() % 160) as usize;

@@ -1,11 +1,8 @@
-/*!
- * @brief X.509 인증서 파싱.
- *
- * @details 이쪽이 실제로 쓰는 필드만 읽는다. 공개키, 유효 기간, 이름, 그리고 판단에
- *          필요한 확장들이다.
- * @warning 이 파서가 신원 판단의 진입점이다. 확장이 두 번 오거나 형식이 어긋나면 거부한다.
- *          받아들이면 구현마다 다르게 읽어 그 차이가 곧 우회 경로가 된다.
- */
+//! X.509 certificate parsing, limited to the fields this side uses: the public key, validity,
+//! names, and the extensions decisions depend on.
+//!
+//! This parser is where identity decisions start. A duplicated or malformed extension is rejected;
+//! accepting it lets implementations read it differently, and that difference is a bypass.
 
 use crate::cert::verify_signature;
 use crate::der::{self, bit_string_bytes, Der};
@@ -14,92 +11,61 @@ use crate::TlsError;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/** @brief Ed25519 서명 키. */
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
-/** @brief X25519 키 교환 키. 서명에는 쓸 수 없다. */
+/// A key exchange key; it cannot sign.
 const OID_X25519: &[u8] = &[0x2b, 0x65, 0x6e];
-/** @brief RSA 키. */
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-/** @brief 타원곡선 키. 곡선은 매개변수로 따로 온다. */
+/// The curve comes separately as a parameter.
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
-/** @brief P-256 곡선. */
 const OID_EC_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-/** @brief P-384 곡선. */
 const OID_EC_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
-/** @brief PSS의 마스크 생성 함수. */
 const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
-/** @brief ECDSA with SHA-256 서명. */
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-/** @brief ECDSA with SHA-384 서명. */
 const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
-/** @brief RSA PKCS#1 with SHA-256 서명. */
 const OID_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-/** @brief RSA PKCS#1 with SHA-384 서명. */
 const OID_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
-/** @brief RSA PKCS#1 with SHA-512 서명. */
 const OID_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
-/** @brief RSA PSS 서명. 해시와 salt를 매개변수로 정한다. */
+/// Hash and salt come as parameters.
 const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
-/** @brief SHA-256. */
 const OID_HASH_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-/** @brief SHA-384. */
 const OID_HASH_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
-/** @brief SHA-512. */
 const OID_HASH_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
-/** @brief 주체 대체 이름 확장. 호스트 이름 대조가 여기 든 값으로만 된다. */
+/// Host name matching uses only the values here.
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
-/** @brief 기본 제약 확장. CA인지와 경로 길이를 정한다. */
+/// Whether it is a CA, and the path length.
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
-/** @brief 키 용도 확장. */
 const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-/** @brief 확장 키 용도. 서버 인증과 클라이언트 인증을 구분한다. */
+/// Tells server authentication from client authentication.
 const OID_EKU: &[u8] = &[0x55, 0x1d, 0x25];
-/** @brief 이름 제약 확장. CA가 발급할 수 있는 이름 범위를 묶는다. */
+/// Bounds the names a CA may issue.
 const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 
-/** @brief 기관 정보 접근. OCSP 주소가 여기 있다. */
+/// Holds the OCSP address.
 const OID_AIA: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
-/** @brief 폐기 목록 배포 지점. */
 const OID_CRL_DP: &[u8] = &[0x55, 0x1d, 0x1f];
-/** @brief 기관 정보 중 OCSP 항목. */
 const OID_AD_OCSP: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
 
-/** @brief 서버 인증 용도. */
 const EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
-/** @brief 클라이언트 인증 용도. */
 const EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
-/** @brief OCSP 응답 서명 용도. */
 const EKU_OCSP_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
-/** @brief 모든 용도. */
 const EKU_ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
 
-/** @brief 전자 서명 용도 비트. */
 const KU_DIGITAL_SIGNATURE: u16 = 1 << 0;
-/** @brief 인증서 서명 용도 비트. CA에 필요하다. */
+/// Required of a CA.
 const KU_KEY_CERT_SIGN: u16 = 1 << 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 공개키 종류. */
 pub enum PublicKeyAlgorithm {
-    /** @brief Ed25519 서명. */
     Ed25519,
-    /** @brief X25519 키 교환. */
     X25519,
-    /** @brief P-256 곡선. */
     EcP256,
-    /** @brief P-384 곡선. */
     EcP384,
-    /** @brief 이전 채우기를 쓰는 RSA. */
     RsaEncryption,
-    /** @brief 무작위 채우기를 쓰는 RSA. */
     RsaPss { scheme: u16 },
 }
 
 impl PublicKeyAlgorithm {
-    /**
-     * @brief 이 키로 그 서명 방식을 쓸 수 있는지.
-     * @warning 확인하지 않으면 RSA 키로 ECDSA 서명을 검증하는 식의 혼동이 생긴다.
-     */
+    /// Without this check, an RSA key could verify an ECDSA signature and similar confusions.
     pub fn allows_signature_scheme(self, scheme: u16) -> bool {
         match self {
             PublicKeyAlgorithm::Ed25519 => scheme == consts::ED25519,
@@ -121,77 +87,54 @@ impl PublicKeyAlgorithm {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 파싱한 인증서. 이쪽이 쓰는 필드만 담는다. */
 pub struct X509 {
-    /** @brief 서명이 덮는 원래 바이트. 검증할 때 이것을 그대로 쓴다. */
+    /// Verification uses these bytes as is.
     pub tbs_raw: Vec<u8>,
 
-    /**
-     * @brief 서명에 쓴 방식. 0은 이쪽이 검증할 수 없는 방식이라는 뜻이다.
-     *
-     * @invariant 0이면 verify_signature 가 어떤 키로도 통과시키지 않는다.
-     *            allows_signature_scheme 이 모든 키 종류에서 0을 거부하기 때문이다.
-     */
+    /// 0 means a scheme this side cannot verify. With 0, `verify_signature` passes nothing with any
+    /// key, because `allows_signature_scheme` rejects 0 for every key type.
     pub sig_scheme: u16,
 
-    /** @brief 서명. */
     pub signature: Vec<u8>,
 
-    /** @brief 공개 키. */
     pub public_key: Vec<u8>,
-    /** @brief 그 키의 알고리즘. */
     pub public_key_algorithm: PublicKeyAlgorithm,
-    /** @brief 이 인증서의 지문. 못 박기와 비교에 쓴다. */
+    /// For pinning and comparison.
     pub cert_sha256: [u8; 32],
-    /** @brief 이때부터 유효하다. */
     pub not_before: i64,
-    /** @brief 이때까지 유효하다. */
     pub not_after: i64,
-    /** @brief 이 인증서가 덮는 이름들. */
     pub san_dns: Vec<String>,
 
-    /** @brief 이 인증서가 덮는 주소들. */
     pub san_ip: Vec<IpAddr>,
 
-    /** @brief 발급자 이름의 원래 바이트. 체인을 잇는 데 쓴다. */
+    /// Used to link the chain.
     pub issuer_raw: Vec<u8>,
 
-    /** @brief 주체 이름의 원래 바이트. */
     pub subject_raw: Vec<u8>,
 
-    /** @brief 다른 인증서를 발급할 수 있는지. */
     pub is_ca: bool,
 
-    /** @brief 이 아래로 몇 단계까지 발급할 수 있는지. */
     pub path_len: Option<u32>,
 
-    /** @brief 이 키를 어디에 쓸 수 있는지. */
     pub key_usage: Option<u16>,
 
-    /** @brief 서버 인증에 쓸 수 있는지. */
     pub eku_server_auth: Option<bool>,
 
-    /** @brief 클라이언트 인증에 쓸 수 있는지. */
     pub eku_client_auth: Option<bool>,
 
-    /** @brief 이 아래에서 쓸 수 있는 이름의 제한. */
     pub name_constraints: Option<NameConstraints>,
 
-    /** @brief 일련번호. 폐기 목록과 맞춰 본다. */
+    /// Matched against CRLs.
     pub serial: Vec<u8>,
 
-    /** @brief 폐기 여부를 물어볼 주소. */
     pub ocsp_urls: Vec<String>,
 
-    /** @brief 폐기 목록을 받을 주소. */
     pub crl_urls: Vec<String>,
 
-    /** @brief 폐기 응답에 서명할 수 있는 인증서인지. */
     pub eku_ocsp_signing: bool,
 }
 
 impl X509 {
-    /** @brief 파싱된 인증서가 별도 힙 버퍼에 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.tbs_raw
             .capacity()
@@ -244,29 +187,20 @@ impl X509 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 주소 기반 이름 제약 하나. */
 pub struct IpConstraint {
-    /** @brief 제한할 주소. */
     pub address: IpAddr,
-    /** @brief 그 대역 길이. */
     pub prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Default)]
-/** @brief 이름 제약 확장의 내용. 허용과 배제 목록이다. */
 pub struct NameConstraints {
-    /** @brief 허용하는 이름들. */
     pub permitted_dns: Vec<String>,
-    /** @brief 막는 이름들. */
     pub excluded_dns: Vec<String>,
-    /** @brief 허용하는 주소 대역들. */
     pub permitted_ip: Vec<IpConstraint>,
-    /** @brief 막는 주소 대역들. */
     pub excluded_ip: Vec<IpConstraint>,
 }
 
 impl NameConstraints {
-    /** @brief 이름 제약 목록의 예약 슬롯과 중첩 문자열이 보유한 바이트. */
     fn retained_payload_bytes(&self) -> usize {
         self.permitted_dns
             .capacity()
@@ -300,11 +234,8 @@ impl NameConstraints {
 }
 
 impl X509 {
-    /**
-     * @brief 인증서를 파싱한다.
-     * @warning 같은 확장이 두 번 오면 거부한다. 어느 것을 쓸지 정해지지 않고, 구현마다
-     *          다르게 고르면 그 차이로 제약을 우회할 수 있다.
-     */
+    /// Rejects an extension that appears twice: which one applies is undefined, and implementations
+    /// choosing differently opens a way around constraints.
     pub fn parse(der: &[u8]) -> Result<X509, TlsError> {
         let mut top = Der::new(der);
         let cert = top.expect(der::SEQUENCE)?;
@@ -319,12 +250,10 @@ impl X509 {
             return Err(TlsError::BadCert);
         }
         let sig_algid = c.expect(der::SEQUENCE)?;
-        /*
-         * 검증할 수 없는 서명 방식이어도 인증서 자체는 읽는다. 신뢰 루트는 서명을
-         * 확인하는 대상이 아니라 확인의 출발점이라, SHA-1으로 자기 서명한 이전 루트를
-         * 여기서 버리면 그 루트로 이어지는 체인을 전부 못 믿게 된다. 이 값이 0이면
-         * 그 서명으로는 아무것도 검증되지 않으므로 체인 안의 어느 곳에도 쓰이지 못한다.
-         */
+        // The certificate is read even with a signature scheme that cannot be verified. A trusted
+        // root is where verification starts, not something verified, so dropping older roots
+        // self-signed with SHA-1 here would distrust every chain leading to them. With 0 here the
+        // signature verifies nothing, so the certificate cannot be used anywhere inside a chain.
         let sig_scheme = scheme_from_sig_algid(sig_algid)?;
         let signature = bit_string_bytes(c.expect(der::BIT_STRING)?)?.to_vec();
 
@@ -415,17 +344,14 @@ impl X509 {
         })
     }
 
-    /** @brief OCSP 응답을 서명할 수 있는 인증서인지. */
     pub fn allows_ocsp_signing(&self) -> bool {
         self.eku_ocsp_signing
     }
 
-    /** @brief 전자 서명 용도가 있는지. */
     pub fn allows_digital_signature(&self) -> bool {
         self.key_usage.is_none_or(|m| m & KU_DIGITAL_SIGNATURE != 0)
     }
 
-    /** @brief 이 인증서의 공개키로 서명을 검증한다. */
     pub fn verify_signature(
         &self,
         scheme: u16,
@@ -438,13 +364,9 @@ impl X509 {
         verify_signature(scheme, &self.public_key, content, signature)
     }
 
-    /**
-     * @brief 상대가 핸드셰이크에서 한 서명을 이 인증서의 공개키로 검증한다.
-     * @retval TlsError::UnsupportedCertificate RSASSA-PSS 공개키다. 그 키에 맞는 서명 방식을
-     *         다루지 않는다.
-     * @retval TlsError::IllegalParameter 상대가 고른 서명 방식이 공개키 종류와 맞지 않는다.
-     *         인증서가 아니라 상대의 선택이 틀린 것이므로 bad_certificate 가 아니다.
-     */
+    /// UnsupportedCertificate for an RSASSA-PSS public key, whose signature scheme is not handled.
+    /// IllegalParameter when the peer's chosen scheme does not fit the key type: the peer's choice
+    /// is wrong, not the certificate, so it is not bad_certificate.
     pub fn verify_tls_signature(
         &self,
         scheme: u16,
@@ -460,46 +382,36 @@ impl X509 {
         verify_signature(scheme, &self.public_key, content, signature)
     }
 
-    /** @brief 다른 인증서를 서명할 수 있는지. CA 판정이다. */
     pub fn allows_cert_sign(&self) -> bool {
         self.key_usage.is_none_or(|m| m & KU_KEY_CERT_SIGN != 0)
     }
 
-    /** @brief 리프 인증서로 쓸 수 있는 용도인지. */
     pub fn allows_tls_leaf_usage(&self) -> bool {
         self.key_usage.is_none_or(|m| m & KU_DIGITAL_SIGNATURE != 0)
     }
 
-    /** @brief 서버 인증에 쓸 수 있는지. */
     pub fn allows_server_auth(&self) -> bool {
         self.eku_server_auth.unwrap_or(true)
     }
 
-    /** @brief 클라이언트 인증에 쓸 수 있는지. */
     pub fn allows_client_auth(&self) -> bool {
         self.eku_client_auth.unwrap_or(true)
     }
 
-    /** @brief 이 인증서가 그 발급자에게 서명됐는지. */
     pub fn verify_signed_by(&self, issuer: &X509) -> Result<(), TlsError> {
         issuer.verify_signature(self.sig_scheme, &self.tbs_raw, &self.signature)
     }
 
-    /** @brief 자기 자신에게 서명됐는지. 루트 판정에 쓴다. */
     pub fn verify_self_signed(&self) -> Result<(), TlsError> {
         self.verify_signature(self.sig_scheme, &self.tbs_raw, &self.signature)
     }
 
-    /** @brief 이 시각에 유효한지. */
     pub fn valid_at(&self, now: i64) -> bool {
         self.not_before <= now && now <= self.not_after
     }
 
-    /**
-     * @brief 이 인증서가 그 호스트 이름을 위한 것인지.
-     * @warning 주체 대체 이름만 본다. 이전 주체 필드의 공통 이름은 보지 않는다. 그것을
-     *          믿으면 이름 제약이 걸리지 않는 경로가 생긴다.
-     */
+    /// Only subject alternative names count; the legacy subject common name is ignored, since
+    /// trusting it would open a path that name constraints do not cover.
     pub fn matches_hostname(&self, host: &str) -> bool {
         let name = match peer_host(host) {
             PeerHost::Ip(ip) => return self.san_ip.contains(&ip),
@@ -516,18 +428,16 @@ impl X509 {
         })
     }
 
-    /** @brief 발급자를 사람이 읽을 형태로. 진단용이다. */
+    /// For diagnostics.
     pub fn issuer_label(&self) -> Option<String> {
         distinguished_name_label(&self.issuer_raw)
     }
 
-    /** @brief 주체를 사람이 읽을 형태로. */
     pub fn subject_label(&self) -> Option<String> {
         distinguished_name_label(&self.subject_raw)
     }
 }
 
-/** @brief 알고리즘 식별자에서 키 종류를 정한다. */
 fn public_key_algorithm_from_algid(algid: &[u8]) -> Result<PublicKeyAlgorithm, TlsError> {
     let mut d = Der::new(algid);
     let oid = d.expect(der::OID)?;
@@ -578,7 +488,6 @@ fn public_key_algorithm_from_algid(algid: &[u8]) -> Result<PublicKeyAlgorithm, T
     Ok(algorithm)
 }
 
-/** @brief 공개키 바이트가 그 종류의 형식에 맞는지. */
 fn public_key_encoding_valid(algorithm: PublicKeyAlgorithm, key: &[u8]) -> bool {
     match algorithm {
         PublicKeyAlgorithm::Ed25519 | PublicKeyAlgorithm::X25519 => key.len() == 32,
@@ -590,13 +499,10 @@ fn public_key_encoding_valid(algorithm: PublicKeyAlgorithm, key: &[u8]) -> bool 
     }
 }
 
-/**
- * @brief RSA 공개키에서 모듈러스와 지수를 추출한다.
- * @warning 정규 인코딩만 받는다. 앞에 0이 붙은 정수 같은 것을 허용하면 같은 키가 여러
- *          형태로 표현돼 지문이 갈린다.
- */
+/// Only canonical encodings: allowing forms such as integers with leading zeros would let one key
+/// have several encodings with different fingerprints.
 pub(crate) fn rsa_public_key_components(key: &[u8]) -> Result<(&[u8], &[u8]), TlsError> {
-    /** @brief 양의 정수를 꺼낸다. 부호 바이트를 걷어내되 비정규 형태는 거부한다. */
+    /// Strips the sign byte but rejects non-canonical forms.
     fn positive_integer(raw: &[u8]) -> Result<&[u8], TlsError> {
         let (&first, rest) = raw.split_first().ok_or(TlsError::BadCert)?;
         if first == 0 {
@@ -631,30 +537,24 @@ pub(crate) fn rsa_public_key_components(key: &[u8]) -> Result<(&[u8], &[u8]), Tl
     let exponent_value = exponent
         .iter()
         .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
-    /*
-     * 지수 3은 Go Daddy Class 2 같은 이전 루트가 아직 쓴다. 그 서명을 실제로 검증하는
-     * onetdns_core::rsa 가 EM을 전부 다시 만들어 비교하므로 작은 지수로 위조할 경로가 없다.
-     */
+    // Exponent 3 is still used by older roots such as Go Daddy Class 2. `onetdns_core::rsa`, which
+    // verifies those signatures, rebuilds the whole EM and compares it, so a small exponent offers
+    // no forgery path.
     if !(3..=(1u64 << 33) - 1).contains(&exponent_value) || exponent_value & 1 == 0 {
         return Err(TlsError::BadCert);
     }
     Ok((modulus, exponent))
 }
 
-/** @brief 접속할 호스트가 주소인지 이름인지. */
 pub(crate) enum PeerHost<'a> {
-    /** @brief IPv4 나 IPv6 주소. */
     Ip(IpAddr),
-    /** @brief 호스트 이름. 끝 점은 걷어 냈다. */
+    /// Trailing dot stripped.
     Name(&'a str),
 }
 
-/**
- * @brief 접속할 호스트를 주소와 이름으로 가른다.
- * @details 앞뒤 공백과 IPv6 대괄호, 끝 점을 걷어 낸 뒤 주소로 읽히면 주소다. 인증서 이름 확인과
- *          SNI 가 이 판정 하나를 같이 써야, 주소로 붙을 때 SNI 를 빼고 IP SAN 으로 확인하는 두
- *          동작이 어긋나지 않는다.
- */
+/// Strips surrounding whitespace, IPv6 brackets, and the trailing dot; whatever then parses as an
+/// address is an address. Certificate name checks and SNI must share this one decision, so that
+/// leaving out SNI and checking the IP SAN when connecting by address never disagree.
 pub(crate) fn peer_host(host: &str) -> PeerHost<'_> {
     let trimmed = host
         .trim()
@@ -666,11 +566,8 @@ pub(crate) fn peer_host(host: &str) -> PeerHost<'_> {
     }
 }
 
-/** @brief 이름 구조에서 읽을 만한 표기를 만든다. */
 fn distinguished_name_label(raw: &[u8]) -> Option<String> {
-    /** @brief 공통 이름. */
     const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
-    /** @brief 조직 이름. */
     const OID_O: &[u8] = &[0x55, 0x04, 0x0a];
     let mut top = Der::new(raw);
     let mut name = Der::new(top.expect(der::SEQUENCE).ok()?);
@@ -694,7 +591,7 @@ fn distinguished_name_label(raw: &[u8]) -> Option<String> {
     organization
 }
 
-/** @brief 문자열 값을 읽는다. 인코딩이 여럿이라 태그로 갈린다. */
+/// The tag picks among several encodings.
 fn decode_directory_string(tag: u8, value: &[u8]) -> Option<String> {
     match tag {
         0x0c | 0x13 | 0x14 | 0x16 => std::str::from_utf8(value).ok().map(str::to_string),
@@ -709,7 +606,6 @@ fn decode_directory_string(tag: u8, value: &[u8]) -> Option<String> {
     }
 }
 
-/** @brief 서명 알고리즘 식별자에서 TLS 서명 방식 번호를 정한다. */
 pub fn scheme_from_sig_algid(algid: &[u8]) -> Result<u16, TlsError> {
     let mut d = Der::new(algid);
     let oid = d.expect(der::OID)?;
@@ -745,10 +641,8 @@ pub fn scheme_from_sig_algid(algid: &[u8]) -> Result<u16, TlsError> {
             consts::RSA_PKCS1_SHA512
         }
         x if x == OID_RSA_PSS => pss_scheme_from_params(&mut d)?,
-        /*
-         * 검증하지 않을 방식이라 매개변수의 뜻은 보지 않는다. 다만 DER로서 온전한지는
-         * 따져, 뒤에 해석되지 않은 바이트가 남은 인증서는 그대로 거부한다.
-         */
+        // The parameters of a scheme that will not be verified are not interpreted, but they must
+        // still be whole DER: a certificate with uninterpreted bytes left over is rejected.
         _ => {
             while !d.is_empty() {
                 d.next()?;
@@ -762,7 +656,7 @@ pub fn scheme_from_sig_algid(algid: &[u8]) -> Result<u16, TlsError> {
     Ok(scheme)
 }
 
-/** @brief 있으면 널 매개변수를 소비한다. 알고리즘마다 있고 없고가 다르다. */
+/// Whether it is present differs by algorithm.
 fn consume_optional_null(d: &mut Der<'_>) -> Result<(), TlsError> {
     if !d.is_empty() {
         let null = d.next()?;
@@ -773,7 +667,7 @@ fn consume_optional_null(d: &mut Der<'_>) -> Result<(), TlsError> {
     Ok(())
 }
 
-/** @brief PSS 매개변수를 읽어 방식을 정한다. 해시와 마스크 함수, salt 길이가 서로 맞아야 한다. */
+/// The hash, mask function, and salt length must agree.
 fn pss_scheme_from_params(d: &mut Der) -> Result<u16, TlsError> {
     let params = d.expect(der::SEQUENCE)?;
     let mut p = Der::new(params);
@@ -846,7 +740,6 @@ fn pss_scheme_from_params(d: &mut Der) -> Result<u16, TlsError> {
     Ok(scheme)
 }
 
-/** @brief 해시 알고리즘 식별자를 읽는다. */
 fn parse_hash_algid(algid: &[u8]) -> Result<&[u8], TlsError> {
     let mut outer = Der::new(algid);
     let alg = outer.expect(der::SEQUENCE)?;
@@ -856,7 +749,6 @@ fn parse_hash_algid(algid: &[u8]) -> Result<&[u8], TlsError> {
     parse_hash_algid_content(alg)
 }
 
-/** @brief 해시 알고리즘 식별자의 내용을 읽는다. */
 fn parse_hash_algid_content(alg: &[u8]) -> Result<&[u8], TlsError> {
     let mut d = Der::new(alg);
     let oid = d.expect(der::OID)?;
@@ -870,48 +762,31 @@ fn parse_hash_algid_content(alg: &[u8]) -> Result<&[u8], TlsError> {
 }
 
 #[derive(Default)]
-/** @brief 파싱한 확장들. */
 struct ParsedExt {
-    /** @brief 이 인증서가 덮는 이름들. */
     san_dns: Vec<String>,
-    /** @brief 이 인증서가 덮는 주소들. */
     san_ip: Vec<IpAddr>,
-    /** @brief 다른 인증서를 발급할 수 있는지. */
     is_ca: bool,
-    /** @brief 이 아래로 몇 단계까지 발급할 수 있는지. */
     path_len: Option<u32>,
-    /** @brief 이 키를 어디에 쓸 수 있는지. */
     key_usage: Option<u16>,
-    /** @brief 서버 인증에 쓸 수 있는지. */
     eku_server_auth: Option<bool>,
-    /** @brief 클라이언트 인증에 쓸 수 있는지. */
     eku_client_auth: Option<bool>,
-    /** @brief 이 아래에서 쓸 수 있는 이름의 제한. */
     name_constraints: Option<NameConstraints>,
-    /** @brief 폐기 여부를 물어볼 주소. */
     ocsp_urls: Vec<String>,
-    /** @brief 폐기 목록을 받을 주소. */
     crl_urls: Vec<String>,
-    /** @brief 폐기 응답에 서명할 수 있는 인증서인지. */
     eku_ocsp_signing: bool,
 }
 
-/** @brief 확장 하나. */
 pub(crate) struct Extension<'a> {
-    /** @brief 확장 종류. */
     pub oid: &'a [u8],
-    /** @brief 이 확장을 해석하지 못하면 담긴 인증서, 폐기 목록, OCSP 응답을 쓰지 말아야 하는지. */
+    /// When set and the extension cannot be interpreted, the certificate, CRL, or OCSP response
+    /// holding it must not be used.
     pub critical: bool,
-    /** @brief OCTET STRING 안에 든 확장 값. */
+    /// The extension value inside the OCTET STRING.
     pub value: &'a [u8],
 }
 
-/**
- * @brief Extensions SEQUENCE 의 내용을 확장 목록으로 읽는다. 인증서, 폐기 목록, OCSP 응답이
- *        이 형식을 같이 쓴다.
- * @warning 같은 확장이 두 번 오면 거부한다. 어느 쪽을 따르느냐가 구현마다 달라 그 차이가 곧
- *          우회 경로가 된다.
- */
+/// Certificates, CRLs, and OCSP responses share this format. Rejects an extension that appears
+/// twice: which one is followed differs by implementation, and that difference is a bypass.
 pub(crate) fn extensions(seq_content: &[u8]) -> Result<Vec<Extension<'_>>, TlsError> {
     let mut e = Der::new(seq_content);
     let mut out: Vec<Extension<'_>> = Vec::new();
@@ -942,7 +817,7 @@ pub(crate) fn extensions(seq_content: &[u8]) -> Result<Vec<Extension<'_>>, TlsEr
     Ok(out)
 }
 
-/** @brief 확장을 읽는다. 중복은 거부하고, 모르는 필수 확장이 있으면 실패다. */
+/// Fails on an unknown critical extension.
 fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
     let exts = Der::new(ext_data).expect(der::SEQUENCE)?;
     let mut out = ParsedExt::default();
@@ -969,10 +844,8 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
             while !g.is_empty() {
                 let name = g.next()?;
                 if name.tag == 0x82 {
-                    /*
-                     * dNSName 은 IA5String 이다. ASCII 가 아닌 값을 이름으로 받아들이면 다른
-                     * 검증기가 거절하는 인증서를 이쪽만 통과시킬 수 있다.
-                     */
+                    // dNSName is an IA5String. Taking a non-ASCII value as a name would pass
+                    // certificates other verifiers reject.
                     if !name.value.is_ascii() {
                         return Err(TlsError::BadCert);
                     }
@@ -991,11 +864,9 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
                 }
             }
         } else if oid == OID_BASIC_CONSTRAINTS {
-            /*
-             * cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL 순서이고
-             * 그 밖의 값은 없어야 한다. 순서나 중복, 모르는 값을 넘기면 다른 검증기와 다르게
-             * 읽는다.
-             */
+            // cA BOOLEAN DEFAULT FALSE, then pathLenConstraint INTEGER (0..MAX) OPTIONAL, and
+            // nothing else. Passing other orders, duplicates, or unknown values would read it
+            // differently from other verifiers.
             let mut outer = Der::new(val);
             let seq = outer.expect(der::SEQUENCE)?;
             if !outer.is_empty() {
@@ -1087,14 +958,12 @@ fn parse_extensions(ext_data: &[u8]) -> Result<ParsedExt, TlsError> {
     Ok(out)
 }
 
-/** @brief 이름 구조에서 주소들을 모은다. */
 fn collect_uris(data: &[u8], out: &mut Vec<String>) {
     collect_uris_depth(data, out, 0);
 }
 
-/** @brief 깊이를 세며 주소를 모은다. 깊이 상한이 무한 중첩을 막는다. */
 fn collect_uris_depth(data: &[u8], out: &mut Vec<String>, depth: usize) {
-    /** @brief DER 중첩 깊이 상한. 깊게 감싼 인증서에서 스택이 넘치는 것을 막는다. */
+    /// Deeply wrapped certificates would otherwise overflow the stack.
     const MAX_DER_DEPTH: usize = 32;
     if depth >= MAX_DER_DEPTH {
         return;
@@ -1114,7 +983,6 @@ fn collect_uris_depth(data: &[u8], out: &mut Vec<String>, depth: usize) {
     }
 }
 
-/** @brief 이름 제약의 하위 트리 목록을 읽는다. */
 fn parse_name_subtrees(
     data: &[u8],
     dns: &mut Vec<String>,
@@ -1153,7 +1021,7 @@ fn parse_name_subtrees(
     Ok(())
 }
 
-/** @brief 주소 제약을 읽는다. 주소와 마스크가 붙어 온다. */
+/// Address followed by mask.
 fn parse_ip_constraint(value: &[u8]) -> Result<IpConstraint, TlsError> {
     let (address, mask) = match value.len() {
         8 => (&value[..4], &value[4..]),
@@ -1176,7 +1044,7 @@ fn parse_ip_constraint(value: &[u8]) -> Result<IpConstraint, TlsError> {
     })
 }
 
-/** @brief 마스크가 연속된 접두사인지 보고 길이를 준다. 구멍이 있으면 없다. */
+/// None when the mask has holes.
 fn contiguous_prefix_len(mask: &[u8]) -> Option<u8> {
     let mut prefix = 0u8;
     let mut zero_seen = false;
@@ -1196,7 +1064,6 @@ fn contiguous_prefix_len(mask: &[u8]) -> Option<u8> {
     Some(prefix)
 }
 
-/** @brief 키 용도 비트열을 읽는다. */
 fn decode_key_usage(bits: &[u8]) -> u16 {
     let mut mask = 0u16;
     for n in 0u16..9 {
@@ -1210,10 +1077,7 @@ fn decode_key_usage(bits: &[u8]) -> u16 {
     mask
 }
 
-/**
- * @brief 확장 값이 기대한 태그의 TLV 하나로만 이루어졌는지 보고 그 내용을 준다.
- * @details 뒤에 남는 바이트를 무시하면 다른 검증기가 거절하는 인증서를 이쪽만 받아들인다.
- */
+/// Ignoring trailing bytes would accept certificates other verifiers reject.
 fn only_value(val: &[u8], tag: u8) -> Result<&[u8], TlsError> {
     let mut d = Der::new(val);
     let value = d.expect(tag)?;
@@ -1223,7 +1087,6 @@ fn only_value(val: &[u8], tag: u8) -> Result<&[u8], TlsError> {
     Ok(value)
 }
 
-/** @brief 그 달의 날 수. 윤년을 반영한다. */
 fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -1239,7 +1102,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
-/** @brief 인증서 시각을 Unix 초로. 두 곳 연도와 네 곳 연도 형식이 모두 온다. */
+/// Both two-digit and four-digit year forms occur.
 pub fn parse_time(tlv: crate::der::Tlv) -> Result<i64, TlsError> {
     let s = tlv.value;
     let digs = |b: &[u8]| -> Option<i64> {
@@ -1285,7 +1148,6 @@ pub fn parse_time(tlv: crate::der::Tlv) -> Result<i64, TlsError> {
     Ok(days_from_civil(year, mo, d) * 86400 + h * 3600 + mi * 60 + se)
 }
 
-/** @brief 날짜를 기준일부터의 날 수로. */
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1296,12 +1158,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 #[cfg(test)]
-/** @brief 확장 파싱 엄격성, 키와 서명 방식 대조, 그리고 시각 해석. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 필수인데 이쪽이 못 다루는 제약 형태를 거부하는지. 무시하면 제약이 사라진다. */
+    /// Ignoring it would drop the constraint.
     fn nameconstraints_critical_unsupported_form_rejected() {
         let data = [0x30, 0x05, 0x81, 0x03, b'a', b'b', b'c'];
         let (mut dns, mut ips) = (Vec::new(), Vec::new());
@@ -1319,7 +1180,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규격에 없는 최솟값이 든 제약을 거부하는지. */
     fn nameconstraints_critical_nonzero_minimum_rejected() {
         let data = [0x30, 0x06, 0x82, 0x01, b'a', 0x80, 0x01, 0x01];
         let (mut dns, mut ips) = (Vec::new(), Vec::new());
@@ -1330,7 +1190,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름 기반 제약은 정상적으로 읽히는지. */
     fn nameconstraints_dns_subtree_still_parses() {
         let mut d = vec![0x30u8, 0x06, 0x82, 0x04];
         d.extend_from_slice(b"ex.c");
@@ -1340,14 +1199,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 날짜 계산이 알려진 값과 맞는지. */
     fn days_from_civil_known() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 1, 1), 10957);
         assert_eq!(days_from_civil(2021, 1, 1) * 86400, 1609459200);
     }
 
-    /** @brief 테스트용 시각 값을 만든다. */
     fn utctime(s: &[u8]) -> crate::der::Tlv<'_> {
         crate::der::Tlv {
             tag: 0x17,
@@ -1356,7 +1213,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief PSS 매개변수가 서로 맞을 때만 받아들이는지. */
     fn pss_scheme_requires_matching_hash_mgf_and_salt() {
         let algid = [
             0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x34, 0xa0,
@@ -1376,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 종류가 서명 방식을 제한하는지. 안 하면 방식 혼동이 생긴다. */
+    /// Otherwise schemes get confused.
     fn public_key_algorithm_restricts_signature_schemes() {
         assert!(PublicKeyAlgorithm::Ed25519.allows_signature_scheme(consts::ED25519));
         assert!(!PublicKeyAlgorithm::X25519.allows_signature_scheme(consts::ED25519));
@@ -1392,11 +1248,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 핸드셰이크 서명 검증 실패를 원인에 맞는 경고로 나누는지.
-     * @details 상대가 키와 맞지 않는 방식을 고른 것은 인증서 탓이 아니고, 서명이 틀린 것은
-     *          decrypt_error 다. 섞으면 상대에게 엉뚱한 경고가 나간다.
-     */
+    /// A scheme that does not fit the key is the peer's fault, not the certificate's, and a wrong
+    /// signature is decrypt_error. Mixing them sends the peer the wrong alert.
     fn tls_signature_failures_name_their_cause() {
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         use p256::pkcs8::DecodePrivateKey;
@@ -1431,7 +1284,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확장이 두 번 오면 거부하는지. */
     fn duplicate_extension_rejected() {
         let dup = [
             0x30, 0x16, 0x30, 0x09, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x04, 0x02, 0x30, 0x00, 0x30,
@@ -1445,17 +1297,17 @@ mod tests {
         assert!(parse_extensions(&one).is_ok());
     }
 
-    /** @brief 어디에도 속하지 않는 값으로 끼워 넣을 NULL 태그. */
+    /// Inserted as a value that belongs nowhere.
     const NULL_TAG: u8 = 0x05;
 
-    /** @brief 태그와 짧은 길이를 붙인 DER 조각. 테스트 입력은 모두 128바이트보다 짧다. */
+    /// All test inputs are shorter than 128 bytes.
     fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag, u8::try_from(content.len()).unwrap()];
         out.extend_from_slice(content);
         out
     }
 
-    /** @brief 확장 하나만 담은 Extensions. critical 은 BOOLEAN 내용 바이트다. */
+    /// `critical` is the BOOLEAN content byte.
     fn one_extension(oid: &[u8], critical: Option<&[u8]>, value: &[u8]) -> Vec<u8> {
         let mut ext = tlv(der::OID, oid);
         if let Some(critical) = critical {
@@ -1465,16 +1317,12 @@ mod tests {
         tlv(der::SEQUENCE, &tlv(der::SEQUENCE, &ext))
     }
 
-    /** @brief 주어진 내용을 담은 BasicConstraints 확장. */
     fn basic_constraints(fields: &[u8]) -> Vec<u8> {
         one_extension(OID_BASIC_CONSTRAINTS, None, &tlv(der::SEQUENCE, fields))
     }
 
     #[test]
-    /**
-     * @brief 확장의 구조를 DER 그대로만 받아들이는지.
-     * @details 다른 검증기가 거절하는 인증서를 이쪽만 받아들이면 검증기마다 판정이 갈린다.
-     */
+    /// Accepting certificates other verifiers reject would split verdicts between verifiers.
     fn extension_structure_is_strict_der() {
         let empty_seq = tlv(der::SEQUENCE, &[]);
         let with_critical =
@@ -1503,7 +1351,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief BasicConstraints 를 정해진 순서와 값으로만 읽는지. */
     fn basic_constraints_follow_the_grammar() {
         let ca = tlv(der::BOOLEAN, &[0xFF]);
         let zero = tlv(der::INTEGER, &[0x00]);
@@ -1555,7 +1402,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief EKU 안의 OID 가 아닌 값과 ASCII 가 아닌 dNSName 을 거부하는지. */
     fn eku_and_san_reject_foreign_values() {
         let mut purposes = tlv(der::OID, EKU_SERVER_AUTH);
         let eku = one_extension(OID_EKU, None, &tlv(der::SEQUENCE, &purposes));
@@ -1573,7 +1419,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 음이 아닌 INTEGER 를 최소 인코딩으로만 읽는지. */
     fn uint_value_rejects_negative_and_non_minimal() {
         assert_eq!(der::uint_value(&[0x00]).unwrap(), 0);
         assert_eq!(der::uint_value(&[0x7F]).unwrap(), 127);
@@ -1585,7 +1430,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 형식이 깨진 시각을 거부하는지. */
     fn parse_time_rejects_malformed() {
         assert!(parse_time(utctime(b"240101000000Z")).is_ok());
 
@@ -1603,9 +1447,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief RSA 키가 정규 인코딩이고 최소 강도를 넘는지. */
     fn rsa_public_key_der_is_canonical_and_meets_security_floor() {
-        /** @brief 태그와 길이를 앞에 붙인 DER 조각. */
         fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
             let mut out = vec![tag];
             if body.len() < 128 {
@@ -1616,7 +1458,6 @@ mod tests {
             out.extend_from_slice(body);
             out
         }
-        /** @brief 테스트용 공개 키 바이트. */
         fn key(modulus: &[u8], exponent: &[u8]) -> Vec<u8> {
             let mut body = tlv(der::INTEGER, modulus);
             body.extend_from_slice(&tlv(der::INTEGER, exponent));
@@ -1652,7 +1493,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실제 인증서를 읽고 자기 서명을 검증하는지. */
     fn parse_real_cert_and_verify_self_signed() {
         let ck = rcgen::generate_simple_self_signed(vec![
             "dns.example.com".to_string(),

@@ -1,19 +1,15 @@
-/*!
- * @brief 설정 항목마다 ko/en/ja/zh 문구가 실제로 그 항목을 설명하는지 검사한다.
- *
- * @details 변수 이름을 그대로 옮긴 딱지나, 여러 항목에 같은 문장을 복사한 설명은
- *          화면을 채우기만 할 뿐 아무것도 알려 주지 않는다. 번역칸을 한국어로 채운
- *          것도 마찬가지다. 이런 것들을 통과시키면 설정 화면이 거짓으로 완성돼 보인다.
- * @warning 항목 수 252 는 계산해서 나온 값이 아니라 일부러 고정해 둔 것이다. 설정을
- *          더하거나 뺐다면 그것이 의도한 변경인지 스스로 판단하고 손으로 고쳐야 한다.
- */
+//! Checks that each config key's ko/en/ja/zh copy describes it. A label that repeats the variable
+//! name, a description pasted across keys, or Korean in a translation slot fills the settings
+//! screen without telling the reader anything.
+//!
+//! The key count is pinned on purpose; adding or removing a key means updating it by hand.
 
 mod common;
 
 use common::{read, root};
 use std::collections::BTreeMap;
 
-/** @brief 설명이라기보다 곳만 채운 문장들. */
+/// Filler that describes nothing.
 const GENERIC_PHRASES: &[&str] = &[
     "관련 보안",
     "이 설정에 대한 설명",
@@ -23,15 +19,11 @@ const GENERIC_PHRASES: &[&str] = &[
     "用途と影響を確認",
 ];
 
-/**
- * @brief 설정 화면에서 더 쓰지 않는 한국어 용어.
- *
- * @note 업스트림은 여기 없다. 설정 키 이름이 upstream_urls 라서, 화면만 다른 말을 쓰면
- *       읽는 사람이 자기가 적은 항목과 이어 붙이지 못한다.
- */
+/// Korean terms the settings screen no longer uses. 업스트림 stays: the key is upstream_urls, and
+/// another word on screen would not match what the reader wrote.
 const DEPRECATED_KO: &[&str] = &["리스너", "프리페치", "스테일", "롤백", "세대 교체"];
 
-/** @brief 변수 이름을 그대로 옮긴 티가 나는 영어 단어. */
+/// Words that show a label was copied from the variable name.
 const GENERATED_EN: &[&str] = &[
     "Secs",
     "Pct",
@@ -52,7 +44,7 @@ const GENERATED_EN: &[&str] = &[
     "Querylog",
 ];
 
-/** @brief 일본어 딱지에 그대로 남은 영어 변수 조각. */
+/// English variable fragments left in Japanese labels.
 const GENERATED_JA: &[&str] = &[
     "secs",
     "pct",
@@ -94,15 +86,12 @@ const GENERATED_JA: &[&str] = &[
     "querylog",
 ];
 
-/** @brief 스키마 소스. */
 fn schema() -> String {
     read(&root().join("crates/onetdns-config/src/schema.rs"))
 }
 
-/**
- * @brief 여는 따옴표 다음 위치에서 Rust 문자열 리터럴 하나를 읽는다.
- * @return 내용과, 닫는 따옴표 다음 위치.
- */
+/// Reads a string literal from just after its opening quote. Returns the contents and the position
+/// after the closing quote.
 fn string_at(source: &str, open: usize) -> (String, usize) {
     let bytes = source.as_bytes();
     let mut out = String::new();
@@ -110,7 +99,8 @@ fn string_at(source: &str, open: usize) -> (String, usize) {
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => {
-                /* 이 소스에서 쓰이는 이스케이프는 내용 비교에 영향이 없으므로 그대로 담는다. */
+                // Escapes are kept as written; the ones this source uses do not affect the
+                // comparisons.
                 out.push('\\');
                 if index + 1 < bytes.len() {
                     out.push(bytes[index + 1] as char);
@@ -129,21 +119,20 @@ fn string_at(source: &str, open: usize) -> (String, usize) {
     (out, index)
 }
 
-/** @brief 지정한 표지 다음에 나오는 문자열 리터럴 하나. */
 fn string_after(source: &str, from: usize, marker: &str) -> Option<(String, usize)> {
     let at = source[from..].find(marker)? + from + marker.len();
     let quote = source[at..].find('"')? + at;
     Some(string_at(source, quote))
 }
 
-/** @brief FIELD_COPY 선언이 시작하는 위치. 그 앞이 항목 선언 구역이다. */
+/// Start of FIELD_COPY; key declarations come before it.
 fn copy_start(source: &str) -> usize {
     source
         .find("static FIELD_COPY")
         .expect("schema.rs 에서 static FIELD_COPY 를 찾지 못했습니다")
 }
 
-/** @brief f("키" 형태로 선언된 설정 항목 이름. */
+/// Keys declared as `f("key"`.
 fn field_keys(source: &str) -> Vec<String> {
     let head = &source[..copy_start(source)];
     let mut out = Vec::new();
@@ -163,14 +152,13 @@ fn field_keys(source: &str) -> Vec<String> {
     out
 }
 
-/** @brief 한 항목의 언어별 딱지와 설명. 순서는 ko, en, ja, zh 이다. */
+/// Labels and descriptions in ko, en, ja, zh order.
 struct Copy {
     key: String,
     label: [String; 4],
     description: [String; 4],
 }
 
-/** @brief FieldCopy 선언을 모두 읽는다. */
 fn copies(source: &str) -> Vec<Copy> {
     let mut out = Vec::new();
     let mut from = 0usize;
@@ -224,18 +212,16 @@ fn copies(source: &str) -> Vec<Copy> {
     out
 }
 
-/** @brief 한글이 들어 있는지. */
 fn has_hangul(text: &str) -> bool {
     text.chars().any(|c| ('가'..='힣').contains(&c))
 }
 
-/** @brief 영문 단어 단위로 정확히 일치하는 것이 있는지. */
+/// Whole ASCII words only.
 fn has_word(text: &str, words: &[&str]) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| words.contains(&word))
 }
 
-/** @brief 항목과 문구가 1대1로 맞물리는지. */
 #[test]
 fn every_field_has_exactly_one_copy_entry() {
     let source = schema();
@@ -272,7 +258,6 @@ fn every_field_has_exactly_one_copy_entry() {
     );
 }
 
-/** @brief 문구가 너무 짧거나 곳만 채운 문장이면 실패한다. */
 #[test]
 fn every_copy_is_specific_enough() {
     let source = schema();
@@ -329,7 +314,6 @@ fn every_copy_is_specific_enough() {
     );
 }
 
-/** @brief 같은 설명을 여러 항목에 복사해 붙이면 실패한다. */
 #[test]
 fn no_description_is_pasted_across_many_fields() {
     let source = schema();
@@ -353,7 +337,6 @@ fn no_description_is_pasted_across_many_fields() {
     );
 }
 
-/** @brief 선택지 항목의 값마다 딱지가 붙어 있는지. */
 #[test]
 fn every_enum_value_has_a_label() {
     let source = schema();
@@ -364,7 +347,7 @@ fn every_enum_value_has_a_label() {
         let call = from + at + 2;
         let mut cursor = call;
         let mut values = Vec::new();
-        /* 한 호출 안의 문자열 인자들을 순서대로 읽는다. */
+        // String arguments of one call, in order.
         let end = head[call..]
             .find("\n    f(")
             .map_or(head.len(), |offset| call + offset);
@@ -416,7 +399,6 @@ fn every_enum_value_has_a_label() {
     );
 }
 
-/** @brief 단위 필드에 단위가 아닌 것이 새어 들어오면 실패한다. */
 #[test]
 fn the_unit_column_carries_only_units() {
     let source = schema();
@@ -440,7 +422,6 @@ fn the_unit_column_carries_only_units() {
     }
 }
 
-/** @brief 문자열 리터럴과 단어 판정이 실제로 구분하는지 확인한다. */
 #[test]
 fn the_parsing_helpers_behave() {
     let source = r#"key: "a\"b", next: "c""#;

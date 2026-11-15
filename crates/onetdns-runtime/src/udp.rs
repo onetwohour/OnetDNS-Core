@@ -1,10 +1,6 @@
-/*!
- * @brief Do53 UDP 워커.
- *
- * @details 리눅스에서는 recvmmsg/sendmmsg로 여러 데이터그램을 한 번의 시스템 호출로
- *          주고받는다. 다른 플랫폼은 단일 수신 루프다. 두 경로 모두 process_datagram을
- *          공유하므로 파싱 전 고속 경로 시도 순서가 어긋나지 않는다.
- */
+//! Do53 UDP workers. On Linux recvmmsg and sendmmsg move several datagrams per system call; other
+//! platforms use a single-datagram loop. Both share `process_datagram`, so the order of the
+//! pre-parse fast paths cannot drift between them.
 
 #[cfg(not(target_os = "linux"))]
 use std::io::ErrorKind;
@@ -17,29 +13,22 @@ use onetdns_proto::{Edns, Message, Writer};
 
 use crate::{Handler, RequestCtx, Transport};
 
-/** @brief 전송 실패 누적 수. 로그 폭주를 막으려 표본만 기록하고 총계는 여기 쌓는다. */
+/// Only samples are logged to avoid log floods; the total accumulates here.
 static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 
-/** @brief recvmmsg 호출 횟수. 배치 하나마다 하나씩 는다. */
 static RECV_BATCHES: AtomicU64 = AtomicU64::new(0);
 
-/** @brief 그 호출들이 실제로 가져온 데이터그램 수. */
 static RECV_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 
-/**
- * @brief 배치 한 번이 실제로 몇 개를 가져왔는지 센다.
- * @details MSG_WAITFORONE은 하나만 도착해도 깨어난다. 부하가 몰릴 때 배치가 실제로
- *          커지는지는 재 봐야만 알 수 있고, 평균이 1에 가까우면 배치화가 시스템 호출을
- *          전혀 줄이지 못하고 있다는 뜻이다.
- * @note 데이터그램마다가 아니라 배치마다 두 번 더한다. 핫패스 비용은 무시할 수준이다.
- */
+/// MSG_WAITFORONE wakes on a single datagram, so whether batches actually grow under load can only
+/// be measured; an average near 1 means batching saves no system calls. Two additions per batch,
+/// not per datagram, cost nothing on the hot path.
 #[cfg(target_os = "linux")]
 fn note_recv_batch(datagrams: u64) {
     RECV_BATCHES.fetch_add(1, Ordering::Relaxed);
     RECV_DATAGRAMS.fetch_add(datagrams, Ordering::Relaxed);
 }
 
-/** @brief recvmmsg 호출 수와 그것이 가져온 데이터그램 수. 지표 노출용이다. */
 pub fn recv_batch_counters() -> (u64, u64) {
     (
         RECV_BATCHES.load(Ordering::Relaxed),
@@ -47,30 +36,22 @@ pub fn recv_batch_counters() -> (u64, u64) {
     )
 }
 
-/** @brief UDP 응답 크기 상한. 경로 단편화를 피하는 값이며 EDNS 협상값보다 우선한다. */
+/// Avoids fragmentation on the path and takes precedence over the EDNS size the client offers.
 const SERVER_UDP_MAX: usize = 1232;
 
-/**
- * @brief EDNS 를 쓰지 않은 UDP 질의에 답할 수 있는 크기.
- * @details RFC 1035가 정한 값이다. 넘으면 잘라서 TC 를 설정해야 하며, 이 상한을
- *          모르는 경로가 생기면 클라이언트가 받지 못하는 크기가 그대로 나간다.
- */
+/// RFC 1035 limit for queries without EDNS. A larger answer must be truncated with TC set; a path
+/// that ignores this sends answers the client cannot receive.
 pub const NON_EDNS_UDP_MAX: usize = 512;
 
-/** @brief 받아들일 UDP 질의 크기 상한. 이보다 큰 데이터그램은 파싱하지 않고 버린다. */
+/// Larger datagrams are dropped unparsed.
 const MAX_UDP_REQUEST: usize = 4096;
 
-/** @brief 워커가 소켓을 독점할 때의 배치 크기. */
 const FULL_UDP_BATCH: usize = 32;
 
-/** @brief 여러 워커가 소켓을 나눠 읽을 때의 배치 크기. */
 const SHARED_UDP_BATCH: usize = 16;
 
-/**
- * @brief 배치 크기를 정한다.
- * @details 소켓을 공유할 때 배치를 줄인다. 한 워커가 크게 퍼 가면 같은 소켓을 읽는 다른
- *          워커가 굶고, 그만큼 처리 지연이 한쪽에 몰린다.
- */
+/// Smaller batches when workers share a socket: one worker grabbing a big batch starves the others
+/// reading it and piles latency on one side.
 fn batch_size_for(workers: usize, cpus: usize) -> usize {
     if workers > cpus.max(1) {
         SHARED_UDP_BATCH
@@ -79,7 +60,6 @@ fn batch_size_for(workers: usize, cpus: usize) -> usize {
     }
 }
 
-/** @brief 이 호스트의 코어 수를 반영한 배치 크기. */
 pub(crate) fn worker_batch_size(workers: usize) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -87,13 +67,10 @@ pub(crate) fn worker_batch_size(workers: usize) -> usize {
     batch_size_for(workers, cpus)
 }
 
-/**
- * @brief UDP 워커 진입점.
- * @details 리액터를 쓰는 서버면 핸들러가 리액터 사용 여부를 바꿀 때마다 리액터 루프와 동기
- *          루프를 오간다. 그 여부는 설정을 교체할 때 바뀌므로, 스레드를 띄울 때 한 번만 보면
- *          나중에 켠 리액터로는 질의가 가지 않는다.
- * @param reactor 리액터를 쓰는 서버인지. 유닉스가 아니면 무시한다.
- */
+/// In a reactor server the worker switches between the reactor loop and the synchronous loop
+/// whenever the handler's answer changes. That answer changes when the config is replaced, so
+/// reading it once at thread start would keep queries away from a reactor enabled later. `reactor`
+/// is ignored outside Unix.
 pub fn worker<H: Handler>(
     sock: UdpSocket,
     handler: Arc<H>,
@@ -119,7 +96,7 @@ pub fn worker<H: Handler>(
     blocking_worker(&sock, handler.as_ref(), &shutdown, batch_size, || false);
 }
 
-/** @brief 플랫폼에 맞는 동기 루프로 갈라진다. leave 가 참을 돌려주면 돌아온다. */
+/// Returns when `leave` returns true.
 fn blocking_worker<H: Handler>(
     sock: &UdpSocket,
     handler: &H,
@@ -133,11 +110,8 @@ fn blocking_worker<H: Handler>(
     single_worker(sock, handler, shutdown, batch_size, leave);
 }
 
-/**
- * @brief 데이터그램을 하나씩 처리하는 워커 루프.
- * @details 수신이 끝날 때마다 종료 표시와 leave 를 본다. 유닉스는 수신 대기 한도로
- *          주기적으로 깨어나고, 윈도우는 종료할 때 서버가 보내는 데이터그램으로 깨어난다.
- */
+/// Checks the shutdown flag and `leave` after every receive. Unix wakes up on the receive timeout;
+/// Windows wakes on the datagram the server sends at shutdown.
 #[cfg(not(target_os = "linux"))]
 fn single_worker<H: Handler>(
     sock: &UdpSocket,
@@ -174,16 +148,10 @@ fn single_worker<H: Handler>(
     }
 }
 
-/**
- * @brief 데이터그램 하나를 응답 와이어로 바꾼다. 두 워커 구현이 공유한다.
- *
- * @details 순서가 중요하다. 파싱하기 전에 와이어 고속 경로를 먼저 시도한다. 캐시
- *          히트를 파싱 비용 없이 내보내는 것이 이 경로의 존재 이유다.
- * @note 응답 비트가 선 패킷은 즉시 버린다. 그러지 않으면 두 서버가 서로의 응답에
- *       응답하며 무한히 주고받는 반사 루프가 만들어진다.
- * @note 패킷마다 장애 격리 경계를 둔다. 조작된 입력의 패닉이 워커를 죽이지 않는다.
- * @return 보낼 응답이 writer에 담겼으면 true.
- */
+/// The wire fast path runs before parsing: sending cache hits without parsing is why it exists.
+/// Packets with the response bit set are dropped at once, or two servers could answer each other's
+/// responses forever. Each packet runs inside a fault isolation boundary, so a panic from crafted
+/// input does not kill the worker. Returns true when `writer` holds a response to send.
 fn process_datagram<H: Handler>(
     handler: &H,
     packet: &[u8],
@@ -235,20 +203,17 @@ fn process_datagram<H: Handler>(
     handled == Ok(true)
 }
 
-/** @brief 종료 시 진행 중인 교환을 마무리하며 기다릴 최대 시간. */
+/// Longest wait at shutdown for exchanges in progress to finish.
 #[cfg(unix)]
 const REACTOR_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/**
- * @brief 이벤트 구동 UDP 워커.
- *
- * @details 한 루프에서 리스너와 진행 중인 업스트림 교환들을 함께 폴링한다. 새 질의는 캐시
- *          히트면 즉시 응답하고, 아니면 리액터에 제출해 응답 없이 다음으로 넘어간다.
- *          블로킹 워커와 달리 업스트림을 기다리는 동안 스레드가 멈추지 않는다. 핸들러가
- *          리액터를 끄면 소켓을 블로킹으로 되돌리고 돌아온다.
- * @note 한 번에 받아들이는 질의를 64개로 끊는다. 무한정 받으면 이미 제출된 교환의
- *       폴링이 계속 밀려 응답이 늦어진다. 리액터에 슬롯이 없어도 즉시 멈춘다.
- */
+/// Polls the listener and the upstream exchanges in progress in one loop. A new query is answered
+/// at once on a cache hit and otherwise submitted, and the loop moves on; unlike the blocking
+/// worker, the thread never stalls on upstream. When the handler turns the reactor off, the socket
+/// goes back to blocking and the function returns.
+///
+/// At most 64 queries are accepted per round, or polling of submitted exchanges would keep
+/// slipping; it also stops at once when the reactor has no free slot.
 #[cfg(unix)]
 fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBool) {
     use std::os::fd::AsRawFd;
@@ -265,10 +230,9 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
 
     while !shutdown.load(Ordering::Relaxed) {
         if may_leave && !handler.reactor_active() {
-            /*
-             * 동기 루프는 수신 대기 한도까지 기다리는 블로킹 소켓을 전제한다. 논블로킹인 채로
-             * 넘어가면 수신이 기다리지 않고 헛돌므로, 되돌리지 못하면 이 루프에 남는다.
-             */
+            // The synchronous loop expects a blocking socket that waits up to the receive timeout.
+            // Left non-blocking, receives would spin, so stay in this loop if it cannot be
+            // restored.
             match sock.set_nonblocking(false) {
                 Ok(()) => return,
                 Err(error) => {
@@ -395,18 +359,14 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
     }
 }
 
-/**
- * @brief 커널이 채운 주소 저장소를 Rust 주소 타입으로 바꾼다.
- * @safety ss_family를 먼저 확인한 뒤 그 계열의 구조체로만 재해석한다. 아는 계열이
- *         아니면 None을 돌려주고 아무것도 읽지 않는다.
- * @note 부르는 곳은 recvmmsg 와 sendmmsg 를 쓰는 batch 모듈뿐이고 그 모듈은 리눅스
- *       전용이다. unix 로 열어 두면 리눅스가 아닌 unix 에서 죽은 코드가 된다.
- */
+/// Only the batch module, which uses recvmmsg and sendmmsg, calls this, and that module is Linux
+/// only; under `unix` it would be dead code on other Unixes.
 #[cfg(target_os = "linux")]
 fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     match libc::c_int::from(storage.ss_family) {
         libc::AF_INET => {
+            // SAFETY: ss_family says the storage holds a sockaddr_in.
             let v4 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr))),
@@ -414,6 +374,7 @@ fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketA
             ))
         }
         libc::AF_INET6 => {
+            // SAFETY: ss_family says the storage holds a sockaddr_in6.
             let v6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(
                 Ipv6Addr::from(v6.sin6_addr.s6_addr),
@@ -426,11 +387,8 @@ fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketA
     }
 }
 
-/**
- * @brief 응답 전송 실패를 기록한다.
- * @note 2의 거듭제곱 번째에만 로그를 남긴다. 도달 불가 클라이언트가 대량으로 질의하면
- *       실패마다 로그를 쓰는 것 자체가 부하가 되기 때문이다.
- */
+/// Logs only every power-of-two failure: an unreachable client sending many queries would otherwise
+/// turn logging into load.
 fn record_send_error(src: std::net::SocketAddr, bytes: usize, error: &std::io::Error) {
     let count = SEND_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -447,24 +405,20 @@ fn record_send_error(src: std::net::SocketAddr, bytes: usize, error: &std::io::E
 }
 
 #[cfg(unix)]
-/** @brief 응답을 보내고 실패는 표본만 기록한다. 리액터 경로도 같은 카운터를 쓰게 하려는 것이다. */
+/// So the reactor path shares the same counters.
 fn send_or_record(sock: &UdpSocket, wire: &[u8], dst: std::net::SocketAddr) {
     if let Err(error) = sock.send_to(wire, dst) {
         record_send_error(dst, wire.len(), &error);
     }
 }
 
-/**
- * @brief 수신 실패를 기록한다.
- * @note 소켓이 영영 망가지면 이 루프가 계속 헛돌기만 한다. 2의 거듭제곱 번째만 남겨
- *       그 상태를 알리되 로그가 부하가 되지 않게 한다.
- */
+/// A socket broken for good would leave this loop spinning; logging every power-of-two failure
+/// reports that without the log becoming load.
 fn record_recv_error(error: &std::io::Error) {
     use std::io::ErrorKind;
     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
         return;
     }
-    /** @brief 수신 실패 누적 수. */
     static RECV_ERRORS: AtomicU64 = AtomicU64::new(0);
     let count = RECV_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -472,14 +426,9 @@ fn record_recv_error(error: &std::io::Error) {
     }
 }
 
-/**
- * @brief 리눅스 배치 입출력 워커.
- *
- * @details recvmmsg/sendmmsg로 데이터그램 여러 개를 시스템 호출 한 번에 처리한다.
- *          질의당 시스템 호출 수가 처리량의 지배 요인이라, 부하가 높을수록 이득이 커진다.
- * @note 버퍼·헤더 배열은 루프 밖에서 한 번만 잡고 계속 재사용한다. 배치마다 다시 만들면
- *       배치 이득을 할당 비용으로 되돌려준다.
- */
+/// recvmmsg and sendmmsg handle several datagrams per system call. System calls per query dominate
+/// throughput, so the gain grows with load. Buffers and header arrays are allocated once outside
+/// the loop and reused; rebuilding them per batch would spend the gain on allocation.
 #[cfg(target_os = "linux")]
 mod batch {
     use super::*;
@@ -487,17 +436,10 @@ mod batch {
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /** @brief 슬롯 하나의 수신 버퍼 크기. */
     const RECV_BUF: usize = MAX_UDP_REQUEST;
 
-    /**
-     * @brief 배치 수신·처리·전송 루프.
-     * @details 배치를 다 보낼 때마다 종료 표시와 leave 를 본다.
-     * @note MSG_WAITFORONE으로 대기한다. 하나만 와도 깨어나므로 한산할 때 지연이 늘지
-     *       않으면서, 몰릴 때는 배치가 자연히 커진다.
-     * @safety 헤더가 가리키는 버퍼와 주소 저장소는 루프 전체에 살아 있고, 커널에 넘기는
-     *         슬롯 수는 배열 길이를 넘지 않는다.
-     */
+    /// Checks the shutdown flag and `leave` after every batch is sent. MSG_WAITFORONE wakes on a
+    /// single datagram, so latency does not grow when idle while batches grow under load.
     pub(super) fn worker<H: Handler>(
         sock: &UdpSocket,
         handler: &H,
@@ -545,6 +487,8 @@ mod batch {
                 hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
                 hdr.msg_hdr.msg_flags = 0;
             }
+            // SAFETY: the headers point at buffers and address storage that live for the whole
+            // loop, and the slot count never exceeds the array length.
             let received = unsafe {
                 libc::recvmmsg(
                     fd,
@@ -586,6 +530,7 @@ mod batch {
 
             let mut sent = 0usize;
             while sent < out {
+                // SAFETY: the first `out` headers point at live writer buffers and names.
                 let r = unsafe {
                     libc::sendmmsg(
                         fd,
@@ -603,6 +548,7 @@ mod batch {
                     continue;
                 }
 
+                // SAFETY: msg_name was set to a live entry of `names` above.
                 let storage = unsafe {
                     &*(send_hdrs[sent].msg_hdr.msg_name as *const libc::sockaddr_storage)
                 };
@@ -614,37 +560,23 @@ mod batch {
         }
     }
 
-    /**
-     * @brief 수신 중 잘린 메시지인지.
-     * @warning 잘린 질의에 답하면 안 된다. 뒷부분이 사라진 채로 해석되어 클라이언트가
-     *          보내지 않은 질의에 응답하는 꼴이 된다.
-     */
+    /// A truncated query must not be answered: parsed without its tail, it would be a query the
+    /// client never sent.
     pub(super) fn received_message_is_truncated(flags: libc::c_int) -> bool {
         flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
     }
 }
 
-/**
- * @brief 응답을 협상된 UDP 크기 안에 들어가도록 인코딩한다.
- *
- * @details 사다리를 순서대로 내려간다. 전체 → TC 비트를 설정한 축약 → 부가 섹션 제거 →
- *          질문까지 제거. 마지막 수단은 최소 SERVFAIL이라 인코딩이 반드시 성공한다.
- * @note pub인 이유는 wire 고속 경로가 같은 사다리를 재사용하기 때문이다. 두 경로가
- *       다른 축약 규칙을 쓰면 같은 질의가 경로에 따라 다른 크기의 응답을 받는다.
- * @invariant 이 함수를 마치면 writer.buf는 언제나 협상 한도 이하다.
- */
+/// Steps down a ladder: full, truncated with TC, without the additional section, without the
+/// question. The last resort is a minimal SERVFAIL, so encoding always succeeds. Public because the
+/// wire fast path reuses the same ladder; different truncation rules would give the same query
+/// different response sizes by path. `writer.buf` never exceeds the negotiated limit afterwards.
 pub fn encode_limited(request: &Message, response: &Message, writer: &mut Writer) {
     encode_within(request, response, writer, max_udp(request));
 }
 
-/**
- * @brief 응답을 주어진 한도 안에 들어가도록 인코딩한다.
- *
- * @details encode_limited 와 같은 사다리를 쓰되 한도를 밖에서 받는다. DNSCrypt 는 협상된
- *          EDNS 크기가 아니라 질의 패킷 길이가 한도라, 그쪽에서 계산한 값을 넘겨 준다.
- * @param limit 인코딩 결과가 넘지 않아야 할 바이트 수.
- * @invariant 이 함수를 마치면 writer.buf는 언제나 limit 이하다.
- */
+/// The same ladder with the limit given by the caller: DNSCrypt limits by the query packet length,
+/// not the negotiated EDNS size. `writer.buf` never exceeds `limit` afterwards.
 pub fn encode_within(request: &Message, response: &Message, writer: &mut Writer, limit: usize) {
     if encode_response(response, writer) && writer.buf.len() <= limit {
         return;
@@ -669,17 +601,13 @@ pub fn encode_within(request: &Message, response: &Message, writer: &mut Writer,
     debug_assert!(writer.buf.len() <= limit);
 }
 
-/** @brief 버퍼를 비우고 응답을 인코딩한다. 성공 여부만 돌려준다. */
 fn encode_response(response: &Message, writer: &mut Writer) -> bool {
     writer.clear();
     response.try_encode_into(writer).is_ok()
 }
 
-/**
- * @brief 이 질의에 허용되는 UDP 응답 크기.
- * @details EDNS가 없으면 512다. 클라이언트가 더 큰 값을 광고해도 서버 상한으로 자른다.
- *          큰 응답은 경로에서 조각나 유실되기 쉽고 증폭 계수도 커진다.
- */
+/// 512 without EDNS. A larger size the client advertises is capped at the server limit: large
+/// responses fragment and get lost on the path, and raise the amplification factor.
 fn max_udp(req: &Message) -> usize {
     req.opt()
         .and_then(Edns::from_record)
@@ -687,11 +615,8 @@ fn max_udp(req: &Message) -> usize {
         .unwrap_or(NON_EDNS_UDP_MAX)
 }
 
-/**
- * @brief TC 비트를 설정한 축약 응답을 만든다. 클라이언트가 TCP로 재시도하게 하는 신호다.
- * @details 헤더 플래그와 rcode는 원래 응답에서 그대로 가져온다. 축약은 크기 문제일 뿐
- *          판정이 바뀐 것이 아니므로, 재시도한 클라이언트가 다른 결론을 보면 안 된다.
- */
+/// Sets TC so the client retries over TCP. Header flags and rcode come from the original response:
+/// truncation is a size issue, not a different verdict, so the retry must not see another outcome.
 fn truncated(req: &Message, original: &Message) -> Message {
     let mut m = Message::default();
     m.header.id = req.header.id;
@@ -712,21 +637,17 @@ fn truncated(req: &Message, original: &Message) -> Message {
 }
 
 #[cfg(test)]
-/** @brief 잘림 처리와 크기 상한, 그리고 빈 응답을 내보내지 않는지. */
 mod tests {
     use super::*;
     use onetdns_proto::{Edns, Name, Question, RecordType};
 
-    /** @brief 바이트 경로 호출 수를 세는 테스트용 핸들러. */
     struct CountingWireHandler(AtomicU64);
 
     impl Handler for CountingWireHandler {
-        /** @brief 보통 경로로는 답하지 않는다. */
         fn handle(&self, _request: &Message, _ctx: &RequestCtx<'_>) -> Option<Message> {
             None
         }
 
-        /** @brief 호출 횟수를 세고 그대로 반환한다. */
         fn handle_udp_wire(
             &self,
             _packet: &[u8],
@@ -739,16 +660,13 @@ mod tests {
         }
     }
 
-    /** @brief 읽지 못한 질의에 FORMERR로 답하는 테스트용 핸들러. */
     struct FormErrHandler;
 
     impl Handler for FormErrHandler {
-        /** @brief 보통 경로는 쓰지 않는다. */
         fn handle(&self, _request: &Message, _ctx: &RequestCtx<'_>) -> Option<Message> {
             None
         }
 
-        /** @brief 헤더만 그대로 돌려준 FORMERR. */
         fn handle_unparsable(&self, packet: &[u8], _ctx: &RequestCtx<'_>) -> Option<Message> {
             let mut response = Message::default();
             response.header.id = u16::from_be_bytes([packet[0], packet[1]]);
@@ -759,13 +677,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 파싱에 실패한 데이터그램을 조용히 버리지 않고 핸들러에 넘기는지.
-     * @details 넘기지 않으면 클라이언트에게는 무응답이고, RFC 8906 이 지목한 그 실패다.
-     *          핸들러 단위 테스트는 이 배선을 보지 못하므로 워커 쪽에서 따로 확인한다.
-     */
+    /// Without this the client gets no response, the failure RFC 8906 points out. Handler unit
+    /// tests cannot see this wiring, so the worker side is checked here.
     fn an_unparsable_datagram_reaches_the_handler_instead_of_being_dropped() {
-        /* 질문 하나를 적고 둘이라고 말하는 헤더다. */
+        // A header that announces two questions but carries one.
         let mut packet = vec![0u8; 12];
         packet[0..2].copy_from_slice(&0x0abcu16.to_be_bytes());
         packet[4..6].copy_from_slice(&2u16.to_be_bytes());
@@ -786,7 +701,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 워커가 코어보다 많을 때만 배치를 줄이는지. */
     fn udp_batch_shrinks_only_when_workers_outnumber_cpus() {
         assert_eq!(batch_size_for(1, 1), FULL_UDP_BATCH);
         assert_eq!(batch_size_for(4, 4), FULL_UDP_BATCH);
@@ -796,7 +710,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 지나치게 큰 데이터그램을 처리 전에 버리는지. */
     fn oversized_udp_payload_is_dropped_before_the_wire_handler() {
         let handler = CountingWireHandler(AtomicU64::new(0));
         let packet = vec![0u8; MAX_UDP_REQUEST + 1];
@@ -823,7 +736,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘라 낸 응답이 약속한 크기를 넘지 않는지. 넘으면 상대가 받지 못한다. */
     fn truncated_response_never_exceeds_negotiated_udp_limit() {
         let mut request = Message::default();
         request.header.id = 7;
@@ -850,7 +762,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘라 내도 작은 확장 기록은 남기는지. */
     fn truncated_response_preserves_small_opt() {
         let mut request =
             Message::query(9, Name::from_str("large.example").unwrap(), RecordType::A);
@@ -881,7 +792,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적을 수 없는 응답에 빈 데이터그램을 보내지 않는지. */
     fn invalid_internal_response_never_emits_an_empty_datagram() {
         let request = Message::query(
             11,
@@ -903,7 +813,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    /** @brief 묶어 받을 때 잘린 것을 걸러 내는지. */
     fn linux_batch_receiver_rejects_truncated_payload_or_control_data() {
         assert!(!batch::received_message_is_truncated(0));
         assert!(batch::received_message_is_truncated(libc::MSG_TRUNC));

@@ -1,12 +1,9 @@
-/*!
- * @brief 신뢰 저장소와 체인 검증.
- *
- * @details 상대가 보낸 체인을 이쪽이 믿는 루트까지 이어 본다. 서명, 유효 기간, 용도,
- *          이름 제약, 경로 길이를 전부 확인한다.
- * @warning 상대가 보낸 루트를 그대로 믿지 않는다. 이쪽 저장소에 있는 것과 대조하고,
- *          제약도 이쪽이 가진 사본의 것을 쓴다. 그러지 않으면 제약 없는 사본을 보내
- *          이름 제약을 벗어날 수 있다.
- */
+//! Trust store and chain validation: the peer's chain is followed up to a root this side trusts,
+//! checking signatures, validity, usage, name constraints, and path length.
+//!
+//! A root the peer sends is never trusted as is. It is matched against the store, and the store's
+//! copy supplies the constraints; otherwise a copy without constraints would escape name
+//! constraints.
 
 use std::sync::OnceLock;
 
@@ -14,13 +11,11 @@ use crate::x509::{IpConstraint, NameConstraints, X509};
 use crate::TlsError;
 
 #[derive(Debug, Clone)]
-/** @brief 이쪽이 믿는 루트 인증서들. */
 pub struct TrustStore {
-    /** @brief 믿는 루트 인증서들. */
     roots: Vec<X509>,
-    /** @brief 못 고정해 둔 인증서 지문들. 있으면 이것과도 맞아야 한다. */
+    /// SHA-256 of trusted non-CA certificates; a leaf matching one is trusted without a chain.
     certificate_pins: Vec<[u8; 32]>,
-    /** @brief 연결·세션 캐시를 신뢰 정책에 묶는 식별자. */
+    /// Ties connection and session caches to this trust policy.
     cache_key: [u8; 32],
 }
 
@@ -31,7 +26,6 @@ impl Default for TrustStore {
 }
 
 impl TrustStore {
-    /** @brief 빈 저장소. */
     pub fn empty() -> Self {
         TrustStore {
             roots: Vec::new(),
@@ -40,7 +34,7 @@ impl TrustStore {
         }
     }
 
-    /** @brief 루트를 하나 넣는다. */
+    /// A non-CA certificate becomes a pin.
     pub fn add(&mut self, certificate: X509) {
         let mut key_material = [0u8; 65];
         key_material[..32].copy_from_slice(&self.cache_key);
@@ -55,7 +49,6 @@ impl TrustStore {
         }
     }
 
-    /** @brief DER 목록으로 만든다. */
     pub fn from_ders<'a, I: IntoIterator<Item = &'a [u8]>>(ders: I) -> Self {
         let mut s = Self::empty();
         for d in ders {
@@ -66,7 +59,7 @@ impl TrustStore {
         s
     }
 
-    /** @brief PEM 번들로 만든다. 읽히지 않는 항목은 건너뛴다. */
+    /// Skips entries that cannot be read.
     pub fn from_pem(pem: &[u8]) -> Self {
         let mut s = Self::empty();
         for der in pem_certs(pem) {
@@ -77,14 +70,10 @@ impl TrustStore {
         s
     }
 
-    /**
-     * @brief PEM 번들로 만들되 하나라도 깨졌으면 실패한다.
-     * @note 운영자가 명시한 번들에 쓴다. 조용히 건너뛰면 믿으려던 루트가 빠진 채 시작한다.
-     */
+    /// Fails if any entry is broken. For bundles the operator names: skipping silently would start
+    /// without a root meant to be trusted.
     pub fn try_from_pem(pem: &[u8]) -> Result<Self, TlsError> {
-        /** @brief 인증서가 시작하는 줄. */
         const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-        /** @brief 인증서가 끝나는 줄. */
         const END: &[u8] = b"-----END CERTIFICATE-----";
         let mut store = Self::empty();
         let mut rest = pem;
@@ -103,41 +92,34 @@ impl TrustStore {
         Ok(store)
     }
 
-    /** @brief 신뢰하는 인증서 수. 루트와 인증서 핀을 합친 값이다. */
+    /// Roots plus certificate pins.
     pub fn len(&self) -> usize {
         self.roots.len() + self.certificate_pins.len()
     }
 
-    /** @brief 비었는지. */
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty() && self.certificate_pins.is_empty()
     }
 
-    /** @brief 연결·세션 캐시를 이 신뢰 정책에만 묶을 식별자. */
     pub fn cache_key(&self) -> [u8; 32] {
         self.cache_key
     }
 
-    /**
-     * @brief 시스템 루트 저장소. 프로세스에서 처음 부를 때 읽고, 그 뒤로는 그 사본을 준다.
-     * @note 운영체제 저장소에 넣은 루트는 다시 시작해야 반영된다. 기본 클라이언트 설정이 이
-     *       저장소를 담으므로, 부를 때마다 읽으면 연결을 맺을 때마다 저장소 전체를 다시 읽고
-     *       파싱한다.
-     */
+    /// Read on the first call in the process; later calls get a copy. Roots added to the OS store
+    /// take effect after a restart. The default client config holds this store, so reading it per
+    /// call would reread and parse the whole store on every connection.
     pub fn system() -> TrustStore {
-        /** @brief 처음 읽은 시스템 루트. */
         static SYSTEM: OnceLock<TrustStore> = OnceLock::new();
         SYSTEM.get_or_init(load_system_store).clone()
     }
 }
 
-/**
- * @brief 시스템 루트를 읽어 저장소를 만든다.
- * @details 파싱하지 못한 인증서는 믿지 않고 건너뛰되 지문과 사유를 남긴다. 그 루트에만 닿는
- *          서버는 검증에 실패하므로, 원인을 찾을 때 이 기록과 대조한다.
- * @note 하나도 못 읽으면 오류로 알린다. 그 상태에서는 모든 암호화 업스트림이 인증서 검증에
- *       실패하는데, 연결 지점에서는 검증 실패로만 보여 원인을 찾을 수 없다.
- */
+/// Certificates that fail to parse are not trusted and are skipped, with their fingerprint and
+/// reason logged; a server reachable only through such a root fails validation, and this log is
+/// where to look.
+///
+/// Loading none is reported as an error: every encrypted upstream would then fail validation, which
+/// at the connection looks like nothing more than a validation failure.
 fn load_system_store() -> TrustStore {
     let ders = load_system_root_ders();
     let mut store = TrustStore::empty();
@@ -171,35 +153,25 @@ fn load_system_store() -> TrustStore {
 }
 
 #[cfg(windows)]
-/** @brief 이 플랫폼의 루트 인증서를 읽는다. */
 fn load_system_root_ders() -> Vec<Vec<u8>> {
     use core::ffi::c_void;
 
     #[repr(C)]
-    /** @brief 시스템이 돌려주는 인증서 하나. */
     struct CertContext {
-        /** @brief 인증서를 담은 형식. */
         cert_encoding_type: u32,
-        /** @brief 인증서 바이트가 있는 곳. */
         pb_cert_encoded: *const u8,
-        /** @brief 그 길이. */
         cb_cert_encoded: u32,
-        /** @brief 풀어 놓은 인증서 정보. */
         p_cert_info: *mut c_void,
-        /** @brief 이 인증서를 담은 저장소. */
         h_cert_store: *mut c_void,
     }
 
     #[link(name = "crypt32")]
     extern "system" {
-        /** @brief 시스템 인증서 저장소를 연다. */
         fn CertOpenSystemStoreW(h_prov: *mut c_void, sz_subsystem: *const u16) -> *mut c_void;
-        /** @brief 저장소의 인증서를 하나씩 훑는다. */
         fn CertEnumCertificatesInStore(
             h_store: *mut c_void,
             p_prev: *const CertContext,
         ) -> *const CertContext;
-        /** @brief 저장소를 닫는다. */
         fn CertCloseStore(h_store: *mut c_void, dw_flags: u32) -> i32;
     }
 
@@ -226,13 +198,11 @@ fn load_system_root_ders() -> Vec<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-/** @brief 이 기계가 믿는 루트 인증서들을 읽는다. */
 fn load_system_root_ders() -> Vec<Vec<u8>> {
     use std::io::Read;
 
-    /** @brief 읽어 들일 루트 번들 크기 상한. */
     const MAX_ROOT_BUNDLE: u64 = 16 * 1024 * 1024;
-    /** @brief 배포판마다 다른 루트 번들 경로들. 먼저 찾아지는 것을 쓴다. */
+    /// Root bundle paths differ by distribution; the first one found is used.
     const PATHS: &[&str] = &[
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
@@ -260,15 +230,12 @@ fn load_system_root_ders() -> Vec<Vec<u8>> {
     Vec::new()
 }
 
-/**
- * @brief 서버 체인을 검증하고 호스트 이름까지 대조한다.
- * @return 검증한 인증 경로. 리프에서 시작해 이쪽 저장소에 있는 루트의 사본으로 끝난다.
- *         상대가 보냈어도 경로에 들지 않은 인증서는 담지 않는다. 인증서 핀으로 믿은
- *         리프는 리프 하나만 담는다.
- * @warning 이름 대조를 빼면 유효한 인증서를 가진 아무나 남의 이름을 대신할 수 있다.
- * @warning 리프의 발급자는 상대가 보낸 체인이 아니라 이 경로에서 꺼낸다. 리프를 루트가
- *          바로 발급했으면 상대가 보낸 두 번째 인증서는 아무도 검증하지 않은 값이다.
- */
+/// Returns the validated path: from the leaf to the store's copy of the root. Certificates the peer
+/// sent that are not on the path are left out; a leaf trusted by pin is returned alone.
+///
+/// Without name matching, anyone with a valid certificate could stand in for another name. The
+/// leaf's issuer comes from this path, not from the chain the peer sent: when a root issued the
+/// leaf directly, the second certificate the peer sent was never verified.
 pub fn verify_chain(
     chain: &[X509],
     store: &TrustStore,
@@ -278,31 +245,28 @@ pub fn verify_chain(
     verify_chain_for(chain, store, ChainUsage::Server(hostname), now)
 }
 
-/** @brief 클라이언트 체인을 검증한다. 이름 대조는 하지 않는다. */
+/// No name matching.
 pub fn verify_client_chain(chain: &[X509], store: &TrustStore, now: i64) -> Result<(), TlsError> {
     verify_chain_for(chain, store, ChainUsage::Client, now).map(drop)
 }
 
 #[derive(Clone, Copy)]
-/** @brief 이 체인을 무엇에 쓰는지. 요구하는 용도가 갈린다. */
+/// Each use requires a different key usage.
 enum ChainUsage<'a> {
-    /** @brief 서버 인증서로 쓴다. 값은 붙을 이름. */
+    /// The name being connected to.
     Server(&'a str),
-    /** @brief 클라이언트 인증서로 쓴다. */
     Client,
 }
 
-/**
- * @brief 체인을 루트까지 이어 검증한다.
- *
- * @details 각 단계에서 서명, 유효 기간, CA 여부, 경로 길이, 용도, 이름 제약을 본다.
- * @return 검증한 인증 경로. 마지막 인증서는 저장소에 있는 루트의 사본이다.
- * @retval TlsError::UnknownCa 체인의 어느 인증서도 발급자가 저장소에 없다.
- * @retval TlsError::CertificateExpired 경로의 인증서가 유효 기간 밖이다.
- * @retval TlsError::BadCert 그 밖에 경로가 어긋났다.
- * @warning 루트는 이쪽 저장소의 사본을 쓴다. 상대가 보낸 것을 쓰면 제약을 뺀 사본으로
- *          이름 제약을 벗어날 수 있다.
- */
+/// Checks signature, validity, CA flag, path length, usage, and name constraints at every step.
+/// Returns the validated path, ending in the store's copy of the root.
+///
+/// UnknownCa when no certificate in the chain has its issuer in the store; CertificateExpired when
+/// a certificate on the path is outside its validity; BadCert when the path is wrong in any other
+/// way.
+///
+/// The root is the store's copy; using the peer's would let a copy without constraints escape name
+/// constraints.
 fn verify_chain_for(
     chain: &[X509],
     store: &TrustStore,
@@ -427,7 +391,6 @@ fn verify_chain_for(
     Ok(path)
 }
 
-/** @brief 이 인증서가 그 용도에 쓰일 수 있는지. */
 fn allows_chain_usage(cert: &X509, usage: ChainUsage<'_>) -> bool {
     match usage {
         ChainUsage::Server(_) => cert.allows_server_auth(),
@@ -435,22 +398,20 @@ fn allows_chain_usage(cert: &X509, usage: ChainUsage<'_>) -> bool {
     }
 }
 
-/**
- * @brief 체인이 이쪽 저장소에 처음 닿는 곳을 찾는다.
- *
- * @details 리프에서 위로 올라가며, 그 인증서를 이쪽 루트가 서명했는지 또는 그 인증서 자체가
- *          이쪽 루트인지를 본다. 끝만 보면 안 되는 이유는, 상대가 자기 루트를 이쪽이 모르는
- *          더 오래된 루트가 교차 서명한 사본으로 덧붙여 보내는 것이 흔하기 때문이다. 그
- *          사본 아래에서 이미 이쪽 루트에 닿았다면 위쪽은 경로에 들어가지 않는다.
- * @return 닿은 곳의 깊이와 저장소에 있는 루트.
- * @retval TlsError::UnknownCa 체인의 어느 인증서도 발급자 이름이 이쪽 루트와 맞지 않는다.
- * @retval TlsError::BadCert 발급자 이름이 맞는 루트는 있지만 서명이 맞지 않거나 그 루트가
- *         인증서를 서명할 수 없다. RFC 8446 은 unknown_ca 를 발급자를 찾지 못한 경우로 정하고,
- *         서명이 맞지 않는 인증서는 bad_certificate 로 알리게 한다.
- * @retval TlsError::CertificateExpired 발급자 이름이 맞는 루트가 유효 기간 밖이다.
- * @warning 루트는 언제나 저장소의 사본을 돌려준다. 상대가 보낸 사본을 쓰면 이름 제약을
- *          벗긴 판으로 교체할 수 있다.
- */
+/// Finds where the chain first reaches the store, walking up from the leaf and checking whether a
+/// trusted root signed the certificate or the certificate is itself a trusted root. Looking only at
+/// the top fails because peers often send their root as a copy cross-signed by an older root this
+/// side does not know; once a trusted root is reached below that copy, the rest is not on the path.
+/// Returns the depth reached and the store's root.
+///
+/// UnknownCa when no issuer name in the chain matches a trusted root. BadCert when a root with a
+/// matching issuer name exists but the signature does not match or the root cannot sign
+/// certificates; RFC 8446 defines unknown_ca as an issuer that cannot be found and has a bad
+/// signature reported as bad_certificate. CertificateExpired when the matching root is outside its
+/// validity.
+///
+/// The root returned is always the store's copy; the peer's copy could be a version with the name
+/// constraints stripped.
 fn anchor_for<'a>(
     chain: &'a [X509],
     store: &'a TrustStore,
@@ -487,11 +448,8 @@ fn anchor_for<'a>(
     Err(located_failure.unwrap_or(TlsError::UnknownCa))
 }
 
-/**
- * @brief 리프의 이름들이 상위 CA의 제약 안에 있는지.
- * @details 체인 위쪽의 모든 제약이 함께 걸린다. 중간 CA가 자기 제약을 벗어난 이름을
- *          발급했다면 여기서 걸린다.
- */
+/// Every constraint above in the chain applies, so an intermediate CA that issued a name outside
+/// its own constraints is caught here.
 fn name_constraints_ok(
     nc: &NameConstraints,
     dns_sans: &[String],
@@ -525,7 +483,6 @@ fn name_constraints_ok(
     true
 }
 
-/** @brief 주소가 제약 범위 안인지. */
 fn ip_in_subtree(ip: std::net::IpAddr, constraint: &IpConstraint) -> bool {
     match (ip, constraint.address) {
         (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(base)) => {
@@ -550,7 +507,7 @@ fn ip_in_subtree(ip: std::net::IpAddr, constraint: &IpConstraint) -> bool {
     }
 }
 
-/** @brief 이름이 제약 범위 안인지. 라벨 경계에서만 맞는 것으로 본다. */
+/// Only at label boundaries.
 fn dns_in_subtree(name: &str, constraint: &str) -> bool {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
     let c = constraint
@@ -563,11 +520,8 @@ fn dns_in_subtree(name: &str, constraint: &str) -> bool {
     name == c || name.ends_with(&format!(".{c}"))
 }
 
-/** @brief PEM 번들에서 인증서들을 추출한다. */
 fn pem_certs(pem: &[u8]) -> Vec<Vec<u8>> {
-    /** @brief 인증서 시작 표시. */
     const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-    /** @brief 인증서 끝 표시. */
     const END: &[u8] = b"-----END CERTIFICATE-----";
     let mut out = Vec::new();
     let mut rest = pem;
@@ -582,14 +536,11 @@ fn pem_certs(pem: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/** @brief 바이트열에서 부분열의 위치. */
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/** @brief base64 디코딩. */
 pub(crate) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -619,7 +570,6 @@ pub(crate) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-/** @brief 체인 검증의 각 조건과, 제약을 벗기려는 시도의 거부. */
 mod tests {
     use super::*;
     use rcgen::{
@@ -627,7 +577,6 @@ mod tests {
         KeyPair, KeyUsagePurpose, NameConstraints as RcNameConstraints,
     };
 
-    /** @brief 테스트용 CA와 리프 인증서. */
     fn ca_and_leaf(host: &str) -> (Vec<u8>, Vec<u8>) {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -645,7 +594,6 @@ mod tests {
         (ca_cert.der().to_vec(), leaf_cert.der().to_vec())
     }
 
-    /** @brief 지금 Unix 초. */
     fn now() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -654,7 +602,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 리프에 전자 서명 용도가 없으면 거부하는지. */
     fn tls_leaf_requires_digital_signature_key_usage() {
         let build = |ku: KeyUsagePurpose| {
             let key = KeyPair::generate().unwrap();
@@ -675,7 +622,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정한 자체 서명 인증서가 통과하는지. */
     fn pinned_self_signed_leaf_verifies() {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
         let der = ck.cert.der().to_vec();
@@ -692,10 +638,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 고정이 바이트까지 정확히 맞아야 하는지.
-     * @details 고정과 다른 인증서는 발급자를 찾을 CA 도 없으므로 unknown_ca 로 거부한다.
-     */
+    /// A certificate that does not match a pin has no CA to find an issuer with either, so it is
+    /// rejected with unknown_ca.
     fn certificate_pin_requires_exact_der_fingerprint() {
         let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
         let pinned_der = ck.cert.der().to_vec();
@@ -712,11 +656,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 발급자를 찾은 뒤의 실패를 unknown_ca 로 알리지 않는지.
-     * @details 발급자 이름이 맞는 루트가 있는데 서명이 맞지 않으면 bad_certificate, 그 루트가
-     *          만료됐으면 certificate_expired 다. unknown_ca 는 이름이 맞는 루트가 없을 때만 쓴다.
-     */
+    /// With a root whose issuer name matches but whose signature does not, the alert is
+    /// bad_certificate; with that root expired, certificate_expired. unknown_ca is only for no
+    /// matching root.
     fn located_issuer_failures_keep_their_own_alerts() {
         let (trusted, _) = root_ca_with(|_| {});
         let (impostor, impostor_key) = root_ca_with(|_| {});
@@ -754,7 +696,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정상 체인이 루트까지 이어지는지. */
     fn valid_chain_to_trusted_root() {
         let (ca_der, leaf_der) = ca_and_leaf("host.example");
         let leaf = X509::parse(&leaf_der).unwrap();
@@ -768,7 +709,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief CA 표시가 제대로 읽히는지. */
     fn ca_is_recognized_as_ca() {
         let (ca_der, _) = ca_and_leaf("host.example");
         let ca = X509::parse(&ca_der).unwrap();
@@ -776,7 +716,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름이 다르면 거부하는지. */
     fn wrong_hostname_rejected() {
         let (ca_der, leaf_der) = ca_and_leaf("host.example");
         let leaf = X509::parse(&leaf_der).unwrap();
@@ -787,13 +726,10 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 교차 서명된 루트를 끝에 붙인 체인과 그 루트의 자체 서명본.
-     * @details 실제 공개 서버가 흔히 보내는 모양이다. 상대는 자기 루트를 더 오래된 다른
-     *          루트가 교차 서명한 사본으로 보내고, 이쪽 저장소에는 그 루트의 자체 서명본만
-     *          들어 있다. 교차 서명한 쪽은 저장소에 없다.
-     * @return (자체 서명 루트 DER, 리프, 중간, 교차 서명 루트 DER) 순.
-     */
+    /// The shape real public servers often send: the peer sends its root as a copy cross-signed by
+    /// an older root, and the store holds only the self-signed root, not the cross-signer. Returns
+    /// the self-signed root DER, the leaf, the intermediate, and the cross-signed root DER, in that
+    /// order.
     fn cross_signed_root_chain(host: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let bridge_key = KeyPair::generate().unwrap();
         let mut bridge_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -842,11 +778,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 체인 끝에 모르는 루트가 교차 서명한 사본이 붙어 있어도 이어지는지.
-     * @details 체인 중간에서 이미 이쪽 루트에 닿았다면 그 위는 볼 필요가 없다. 끝만 보면
-     *          dns.google처럼 교차 서명 사본을 보내는 서버가 전부 검증에 실패한다.
-     */
+    /// Once a trusted root is reached partway up, nothing above needs checking. Looking only at the
+    /// top would fail every server, such as dns.google, that sends a cross-signed copy.
     fn cross_signed_root_at_chain_top_still_anchors() {
         let (root_self, leaf_der, mid_der, cross_der) = cross_signed_root_chain("host.example");
         let store = TrustStore::from_ders([root_self.as_slice()]);
@@ -863,11 +796,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 이쪽 루트에 닿지 못하는 체인은 길이와 무관하게 거부하는지.
-     * @details 앞 테스트가 통과하도록 고치면서 "끝을 무시한다"가 "아무거나 받는다"가 되지
-     *          않는지 함께 붙든다.
-     */
+    /// Keeps "ignore the top" from turning into "accept anything".
     fn chain_without_any_trusted_link_is_still_rejected() {
         let (_root_self, leaf_der, mid_der, cross_der) = cross_signed_root_chain("host.example");
         let (other_root, _) = ca_and_leaf("other.example");
@@ -884,7 +813,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 루트를 unknown_ca 로 거부하는지. */
     fn untrusted_root_rejected() {
         let (_ca_der, leaf_der) = ca_and_leaf("host.example");
         let (other_ca_der, _) = ca_and_leaf("other.example");
@@ -900,7 +828,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장소가 비면 아무것도 통과하지 않는지. */
     fn empty_store_rejects() {
         let (_ca_der, leaf_der) = ca_and_leaf("host.example");
         let leaf = X509::parse(&leaf_der).unwrap();
@@ -912,7 +839,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 유효 기간 밖이면 certificate_expired 로 거부하는지. */
     fn outside_validity_rejected() {
         let (ca_der, leaf_der) = ca_and_leaf("host.example");
         let leaf = X509::parse(&leaf_der).unwrap();
@@ -929,7 +855,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief base64 왕복. */
     fn base64_roundtrip_known() {
         assert_eq!(base64_decode(b"aGVsbG8=").unwrap(), b"hello");
         assert_eq!(base64_decode(b"Zm9vYmFy").unwrap(), b"foobar");
@@ -938,7 +863,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주소 기반 제약이 걸리는지. */
     fn ip_name_constraints_enforced() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
         let nc = NameConstraints {
@@ -988,7 +912,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 시스템 루트를 읽을 수 있는지. */
     fn system_roots_load() {
         let store = TrustStore::system();
 
@@ -999,7 +922,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief PEM에서 인증서를 뽑는지. */
     fn pem_parse_extracts_cert() {
         let (ca_der, _) = ca_and_leaf("host.example");
         let pem = rcgen_pem(&ca_der);
@@ -1008,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 운영자가 명시한 번들은 하나라도 깨지면 실패하는지. 건너뛰면 루트가 빠진 채 시작한다. */
+    /// Skipping would start without the root.
     fn explicit_pem_bundle_rejects_any_corrupted_certificate() {
         let (ca_der, _) = ca_and_leaf("host.example");
         let pem = format!(
@@ -1019,7 +941,6 @@ mod tests {
         assert!(TrustStore::try_from_pem(rcgen_pem(&ca_der).as_bytes()).is_ok());
     }
 
-    /** @brief 설정을 바꿔 테스트용 루트 CA를 만든다. */
     fn root_ca_with(mutate: impl FnOnce(&mut CertificateParams)) -> (rcgen::Certificate, KeyPair) {
         let key = KeyPair::generate().unwrap();
         let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1032,7 +953,6 @@ mod tests {
         (cert, key)
     }
 
-    /** @brief 그 CA가 서명한 리프를 만든다. */
     fn leaf_signed_by(
         host: &str,
         ca: &rcgen::Certificate,
@@ -1045,7 +965,7 @@ mod tests {
         p.signed_by(&key, ca, ca_key).unwrap().der().to_vec()
     }
 
-    /** @brief ECDSA-SHA256 서명 식별자를 이쪽이 모르는 것으로 바꾼다. 길이가 같아 위치가 밀리지 않는다. */
+    /// The length stays the same, so nothing shifts.
     fn with_unverifiable_sig_algid(der: &[u8]) -> Vec<u8> {
         const ECDSA_SHA256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
         const UNKNOWN_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x09];
@@ -1062,11 +982,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 자기 서명이 이쪽이 검증 못 하는 방식이어도 루트로 쓰이는지.
-     * @details 루트는 서명을 확인하는 대상이 아니라 확인의 출발점이다. SHA-1으로 자기
-     *          서명한 이전 루트를 버리면 그 루트로 이어지는 체인을 전부 못 믿게 된다.
-     */
+    /// A root is where verification starts, not something verified. Dropping older roots
+    /// self-signed with SHA-1 would distrust every chain leading to them.
     fn root_with_unverifiable_self_signature_still_anchors() {
         let (ca_der, leaf_der) = ca_and_leaf("dns.test");
         let patched_ca = with_unverifiable_sig_algid(&ca_der);
@@ -1084,7 +1001,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이쪽이 검증 못 하는 방식으로 서명된 인증서는 체인에 못 들어가는지. */
     fn chain_link_with_unverifiable_signature_is_rejected() {
         let (ca_der, leaf_der) = ca_and_leaf("dns.test");
         let patched_leaf = with_unverifiable_sig_algid(&leaf_der);
@@ -1100,7 +1016,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버 인증 용도가 없는 리프를 거부하는지. */
     fn leaf_eku_server_auth_required() {
         let (ca, ca_key) = root_ca_with(|_| {});
         let store = TrustStore::from_ders([ca.der().as_ref()]);
@@ -1126,7 +1041,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중간 CA의 용도 제한이 경로 전체에 걸리는지. */
     fn intermediate_ca_eku_is_applied_to_the_whole_path() {
         let (root, root_key) = root_ca_with(|_| {});
         let store = TrustStore::from_ders([root.der().as_ref()]);
@@ -1154,7 +1068,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름 제약이 중간 인증서에도 걸리는지. */
     fn name_constraints_apply_to_intermediate_certificate_names() {
         let (root, root_key) = root_ca_with(|p| {
             p.name_constraints = Some(RcNameConstraints {
@@ -1184,7 +1097,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용 목록이 실제로 걸리는지. */
     fn name_constraints_permitted_enforced() {
         let (ca, ca_key) = root_ca_with(|p| {
             p.name_constraints = Some(RcNameConstraints {
@@ -1211,7 +1123,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 배제 목록이 실제로 걸리는지. */
     fn name_constraints_excluded_enforced() {
         let (ca, ca_key) = root_ca_with(|p| {
             p.name_constraints = Some(RcNameConstraints {
@@ -1238,7 +1149,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경로 길이 0인 CA 아래 중간 CA를 막는지. */
     fn pathlen_zero_blocks_intermediate() {
         let (root, root_key) = root_ca_with(|p| {
             p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -1271,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대가 보낸 루트로 이쪽 저장소의 제약을 벗길 수 없는지. 이것이 이름 제약 우회의 핵심 경로다. */
+    /// The central path for bypassing name constraints.
     fn presented_top_cannot_strip_stored_name_constraints() {
         let root_key = KeyPair::generate().unwrap();
         let mut rp = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1312,7 +1222,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경로 길이 0인 루트 아래 직접 리프는 되는지. */
     fn presented_root_direct_leaf_pathlen_zero_ok() {
         let (root, root_key) = root_ca_with(|p| {
             p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -1331,7 +1240,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경로 길이 1이면 중간 하나가 되는지. */
     fn presented_root_with_intermediate_pathlen_one_ok() {
         let (root, root_key) = root_ca_with(|p| {
             p.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
@@ -1362,7 +1270,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이쪽 저장소의 경로 길이 제한이 그대로 걸리는지. */
     fn presented_root_still_enforces_stored_pathlen_zero() {
         let (root, root_key) = root_ca_with(|p| {
             p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -1393,11 +1300,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 루트가 바로 발급한 리프의 경로에 상대가 덧붙인 인증서 대신 저장소의 루트가 드는지.
-     * @details 덧붙인 인증서는 루트와 이름만 같고 키가 다르다. 경로에 들면 폐기 확인이 그 키로
-     *          서명한 가짜 폐기 응답을 믿는다.
-     */
+    /// The appended certificate shares the root's name but has a different key. On the path, the
+    /// revocation check would trust a forged revocation response signed with that key.
     fn root_issued_leaf_path_ends_at_the_stored_root_not_a_presented_impostor() {
         let (root, root_key) = root_ca_with(|_| {});
         let store = TrustStore::from_ders([root.der().as_ref()]);
@@ -1418,7 +1322,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중간 CA를 거친 경로가 제시된 중간 CA를 담고 저장소의 루트로 끝나는지. */
     fn intermediate_path_keeps_the_intermediate_and_ends_at_the_stored_root() {
         let (root, root_key) = root_ca_with(|_| {});
         let store = TrustStore::from_ders([root.der().as_ref()]);
@@ -1449,9 +1352,7 @@ mod tests {
         );
     }
 
-    /** @brief DER을 PEM으로 감싼다. */
     fn rcgen_pem(der: &[u8]) -> String {
-        /** @brief base64 문자표. */
         const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut b = String::new();
         for chunk in der.chunks(3) {

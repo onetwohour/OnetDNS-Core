@@ -5,7 +5,6 @@ use onetdns_core::{BlockResponse, ClientInfo, FilterEngine, Transport};
 use onetdns_filter::build_from_str;
 use onetdns_proto::{Name, RecordType};
 
-/** @brief 측정할 때 쓸 차단 규칙 글. */
 fn make_block_text(n: usize, regexes: bool) -> String {
     let mut s = String::with_capacity(n * 24);
     for i in 0..n {
@@ -20,7 +19,6 @@ fn make_block_text(n: usize, regexes: bool) -> String {
     s
 }
 
-/** @brief 테스트용 클라이언트. */
 fn client() -> ClientInfo {
     ClientInfo {
         source_ip: "192.168.1.10".parse().unwrap(),
@@ -30,7 +28,6 @@ fn client() -> ClientInfo {
     }
 }
 
-/** @brief 이 이름들을 판정하는 비용을 측정한다. */
 fn measure(label: &str, eng: &onetdns_filter::BlockEngine, names: &[Name], cl: &ClientInfo) {
     let run_once = || {
         for n in names {
@@ -59,7 +56,7 @@ fn measure(label: &str, eng: &onetdns_filter::BlockEngine, names: &[Name], cl: &
     println!("{label}: {total} 판정 / {elapsed:?} → {per_ns:.1} ns/query (~{mqps:.1} Mqps)");
 }
 
-/** @brief 규칙 수와 종류에 따른 판정 비용을 측정한다. */
+/// Verdict cost by rule count and kind.
 fn main() {
     let names: Vec<Name> = [
         "ads5.tracker5.example.",

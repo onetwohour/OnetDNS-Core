@@ -1,6 +1,4 @@
-/*!
- * @brief 이름 접미사별로 지정한 업스트림에 전달하는 stub 계층.
- */
+//! Sends names under configured suffixes to their own upstreams.
 
 use std::sync::Arc;
 
@@ -9,16 +7,13 @@ use onetdns_proto::{Message, Name};
 use super::{configured_name_key, outcome_to_option};
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/** @brief 특정 접미사를 지정한 서버로 보내는 계층. */
 pub struct StubLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 접미사와 그 접미사를 보낼 곳. */
     stubs: Vec<(Vec<u8>, Arc<dyn Resolver>)>,
 }
 
 impl StubLayer {
-    /** @brief 접미사 목록으로 만든다. 이름이 틀리거나 겹치면 실패다. */
+    /// Fails on an invalid or duplicate suffix.
     pub fn new(
         inner: Arc<dyn Resolver>,
         stubs: Vec<(String, Arc<dyn Resolver>)>,
@@ -38,7 +33,7 @@ impl StubLayer {
         })
     }
 
-    /** @brief 이 이름에 맞는 서버. 가장 긴 접미사가 이긴다. */
+    /// The longest suffix wins.
     fn match_stub(&self, name: &Name) -> Option<&Arc<dyn Resolver>> {
         let mut key = [0u8; 255];
         for labels in (0..=name.num_labels()).rev() {
@@ -56,12 +51,10 @@ impl StubLayer {
 }
 
 impl Resolver for StubLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 맞는 접미사가 있으면 그리로, 없으면 안으로. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let Some(q) = req.questions.first() else {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -74,7 +67,6 @@ impl Resolver for StubLayer {
 }
 
 #[cfg(test)]
-/** @brief 접미사가 맞는 질의만 stub 업스트림으로 가는지. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -85,7 +77,6 @@ mod tests {
     use crate::native::Resolver;
 
     #[test]
-    /** @brief 접미사가 맞는 질의가 지정한 서버로 가는지. */
     fn stub_routes_matching_suffix() {
         let inner = Mock::new(1, ResponseCode::NoError.0);
         let stub = Mock::new(9, ResponseCode::NoError.0);

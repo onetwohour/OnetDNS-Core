@@ -1,6 +1,5 @@
-/*!
- * @brief 설정 편집을 파일에 쓰고, 바뀐 키에 따라 즉시 교체할지 새 세대로 시작할지 정한다.
- */
+//! Writes config edits to the file and decides, by the changed keys, whether to swap them in now or
+//! start a new generation.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -12,23 +11,20 @@ use crate::atomic_file::atomic_write;
 use crate::config_keys::ApplyGroup;
 use crate::{config_keys, resolver_chain, runtime_preflight, ConfigTextSlot};
 
-/**
- * @brief 응답 캐시 아래에서 판정하는 로컬 전용 이름 설정들.
- * @details 판정 결과가 캐시에 담기므로, 이 값을 바꾸면 캐시를 비워야 바뀐 판정이 바로 나간다.
- */
+/// Local-only name settings decided below the response cache. Their verdicts are cached, so
+/// changing them must clear the cache for the new verdict to show at once.
 pub(crate) const LOCAL_ONLY_CONFIG_KEYS: &[&str] = &["domain_needed", "bogus_priv", "empty_zones"];
 
-/** @brief 직접 바뀐 설정과 그 설정이 다시 만들어야 하는 파생 그룹을 모은다. */
+/// Directly changed groups plus the derived groups they must rebuild.
 pub(crate) fn hot_reload_groups(
     previous: &Config,
     next: &Config,
     changed: &[String],
 ) -> Vec<ApplyGroup> {
     let mut groups = key_groups(changed);
-    /*
-     * 체인은 계획만 읽으므로, 어느 키가 바뀌었든 계획이 달라지면 체인을 다시 만든다.
-     * 질의 제한 시간처럼 전달 그룹에 속한 키도 스텁 영역과 예비 업스트림의 전달기에 쓰인다.
-     */
+    // The chain reads only the plan, so a changed plan rebuilds the chain whatever key changed.
+    // Keys in the forward group, such as the query timeout, also feed the forwarders of stub zones
+    // and fallback upstreams.
     if resolver_chain::ChainPlan::new(previous) != resolver_chain::ChainPlan::new(next) {
         groups.push(ApplyGroup::Chain);
         groups.sort_unstable();
@@ -37,7 +33,8 @@ pub(crate) fn hot_reload_groups(
     groups
 }
 
-/** @brief 바뀐 키가 키 표와 그룹 사이의 의존으로 끌어오는 그룹. 체인 계획은 비교하지 않는다. */
+/// Groups the changed keys pull in through the key table and group dependencies; the chain plan is
+/// not compared.
 fn key_groups(changed: &[String]) -> Vec<ApplyGroup> {
     let mut groups = changed
         .iter()
@@ -50,30 +47,24 @@ fn key_groups(changed: &[String]) -> Vec<ApplyGroup> {
     groups
 }
 
-/** @brief 이 backend가 전달 리졸버를 쓰는지. */
 pub(crate) fn backend_uses_forward(backend: BackendKind) -> bool {
     matches!(backend, BackendKind::Forward | BackendKind::Split)
 }
 
-/**
- * @brief 이 키를 바꾸면 해석 체인을 다시 만드는지.
- * @param plan_inputs 계획이 값을 읽는 다른 그룹의 키들. ChainPlan::other_group_inputs 가 낸다.
- */
+/// `plan_inputs`: keys of other groups the plan reads, from `ChainPlan::other_group_inputs`.
 fn rebuilds_chain(key: &str, plan_inputs: &[&str]) -> bool {
     plan_inputs.contains(&key) || key_groups(&[key.to_string()]).contains(&ApplyGroup::Chain)
 }
 
-/**
- * @brief 바뀐 키 가운데 서비스를 다시 시작해야 반영되는 키들. 비어 있으면 모두 교체한다.
- * @details 교체 적용과 변경 미리보기가 이 판정 하나를 쓴다. 미리보기가 따로 판정하면 실제로는
- *          재시작하는 변경을 무중단이라고 알린다.
- *
- *          클라이언트별 업스트림 경로가 있으면 체인을 다시 만드는 변경은 재시작한다. 경로마다
- *          공통 계층을 감싼 체인은 세대를 시작할 때 한 번만 만들고 교체하지 않으므로, 기본
- *          체인만 다시 만들면 그 경로의 클라이언트는 이전 캐시 크기나 검증 설정으로 답을 받는다.
- *          체인을 다시 만들게 한 키를 가려내지 못해도 재시작은 해야 하므로, 그때는 바뀐 키를
- *          모두 든다.
- */
+/// Changed keys that take effect only after a service restart; empty means all of them hot-swap.
+/// Hot apply and the change preview share this one verdict; a separate preview verdict would
+/// announce a restarting change as hot.
+///
+/// With client upstream routes, a change that rebuilds the chain restarts: each route's chain wraps
+/// the shared layers and is built once at generation start, never swapped, so rebuilding only the
+/// default chain would leave those clients on the old cache size or validation settings. When the
+/// key that triggered the rebuild cannot be singled out, a restart is still needed, so every
+/// changed key is listed.
 pub(crate) fn service_restart_keys(
     current: &Config,
     proposed: &Config,
@@ -105,12 +96,10 @@ pub(crate) fn service_restart_keys(
     restart
 }
 
-/**
- * @brief 표에서는 교체할 수 있는 키지만 지금 설정에서는 바꾸면 재시작할 수 있는 키들.
- * @details 관리 화면이 적용하기 전에 재시작을 알리는 데 쓴다. service_restart_keys 와 같은
- *          규칙에서 내므로, 지금 설정에서 키 하나만 바꿀 때 그 판정이 재시작할 수 있는 키는
- *          모두 여기에 든다. clients 처럼 무엇으로 바꾸느냐에 따라 갈리는 키는 늘 든다.
- */
+/// Keys the table marks hot that can still restart under the current config, so the dashboard can
+/// warn before applying. Derived from the same rules as `service_restart_keys`: every key whose
+/// single change could restart under the current config is included. Keys like `clients`, whose
+/// effect depends on the new value, are always included.
 pub(crate) fn conditional_hot_reload_keys(now: &Config) -> Vec<&'static str> {
     let routes = config_keys::has_client_routes(now);
     let inputs = resolver_chain::ChainPlan::new(now).other_group_inputs();
@@ -122,46 +111,36 @@ pub(crate) fn conditional_hot_reload_keys(now: &Config) -> Vec<&'static str> {
         .collect()
 }
 
-/** @brief 기본 체인을 다시 만드는 핸들과 그 체인이 들어 있는 슬롯. */
 #[derive(Clone)]
 pub(crate) struct ChainRebuild {
-    /** @brief 기본 체인을 만들고 설치한다. */
     pub(crate) chain: Arc<resolver_chain::DefaultChain>,
-    /** @brief 질의 처리기가 읽는 체인 슬롯. */
+    /// Read by the query handler.
     pub(crate) slot: crate::native::ResolverSlot,
 }
 
-/** @brief 세대가 소유한 보조 작업을 새 설정으로 다시 시작하는 함수. */
+/// Restarts a generation-owned side task with a new config.
 pub(crate) type SecondaryRestart = Arc<dyn Fn(&Config) -> Result<(), String> + Send + Sync>;
 
-/**
- * @brief 설정이 바뀌면 다시 시작할 작업들의 핸들.
- * @details 핸들을 채우는 코드는 세대 시작의 뒤쪽에 있지만 핫 적용은 그보다 먼저 만들어진다.
- *          그래서 빈 슬롯을 먼저 잡아 두고 나중에 채운다. 채우기 전에 들어온 핫 적용은 그 작업을
- *          건너뛴다.
- */
+/// Handles of the tasks to restart on a config change. The code that fills them runs late in
+/// generation start, but hot apply is built before that, so empty slots are taken first and filled
+/// later; a hot apply arriving before a slot is filled skips that task.
 #[derive(Clone, Default)]
 pub(crate) struct RestartHooks {
-    /** @brief 해석 체인을 다시 만들어 교체한다. */
     pub(crate) chain: Arc<Mutex<Option<ChainRebuild>>>,
-    /** @brief 관리 수신 주소를 다시 연다. */
+    /// Reopens the control listen address.
     pub(crate) control: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief 세컨더리 영역 갱신 작업을 다시 시작한다. */
+    /// Restarts secondary zone refresh.
     pub(crate) secondary: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief DHCP 임대 동기화 작업을 다시 시작한다. */
+    /// Restarts DHCP lease sync.
     pub(crate) lease_sync: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief Raft 런타임을 다시 시작한다. */
     pub(crate) raft: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief ZSK 교체 작업을 다시 시작한다. */
     pub(crate) zsk_rollover: Arc<Mutex<Option<SecondaryRestart>>>,
-    /** @brief 수신 주소를 설정에 맞춘다. 설정이 그대로인 주소는 건드리지 않는다. */
+    /// Matches listen addresses to the config; addresses with unchanged config are left alone.
     pub(crate) listeners: Arc<Mutex<Option<SecondaryRestart>>>,
 }
 
-/**
- * @brief 슬롯에 작업을 넣고 지금 설정으로 한 번 실행한다.
- * @note 실행하는 동안 슬롯을 잠가 두므로 핫 적용이 같은 작업을 동시에 다시 시작하지 못한다.
- */
+/// Puts the task in the slot and runs it once with the current config. The slot stays locked while
+/// it runs, so hot apply cannot restart the same task concurrently.
 pub(crate) fn install_restart(
     slot: &Mutex<Option<SecondaryRestart>>,
     hook: SecondaryRestart,
@@ -172,30 +151,24 @@ pub(crate) fn install_restart(
     installed.insert(hook)(cfg)
 }
 
-/**
- * @brief 차단 엔진을 지금 설정과 목록으로 다시 만들어 교체하는 함수.
- * @return 차단 규칙 수와 허용 규칙 수.
- */
+/// Rebuilds the block engine from the current config and lists, and swaps it in. Returns the block
+/// and allow rule counts.
 pub(crate) type FilterRebuild =
     Arc<dyn Fn() -> Result<(usize, usize), String> + Send + Sync + 'static>;
 
-/** @brief 교체를 실제로 하는 함수. */
 pub(crate) type HotConfigApply =
     Arc<dyn Fn(&Config, &[String]) -> Result<(bool, Vec<String>), String> + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 설정을 어떻게 반영했는지. */
 pub(crate) enum ConfigApplyMode {
-    /** @brief 바뀐 것이 없다. */
     NoChange,
-    /** @brief 재시작하지 않고 교체했다. */
+    /// Swapped in without a restart.
     HotReload,
-    /** @brief 재시작해야 한다. */
+    /// Needs a restart.
     ServiceRestart,
 }
 
 impl ConfigApplyMode {
-    /** @brief 이름. */
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NoChange => "no_change",
@@ -204,23 +177,18 @@ impl ConfigApplyMode {
         }
     }
 
-    /** @brief 재시작해야 하는지. */
     pub(crate) fn restart_required(self) -> bool {
         matches!(self, Self::ServiceRestart)
     }
 }
 
 #[derive(Debug, Clone)]
-/** @brief 설정 반영 결과. */
 pub(crate) struct ConfigApplyResult {
-    /** @brief 어떻게 반영했는지. */
     pub(crate) mode: ConfigApplyMode,
-    /** @brief 달라진 설정 항목들. */
     pub(crate) changed: Vec<String>,
 }
 
 impl ConfigApplyResult {
-    /** @brief 결과를 JSON 항목들로. */
     pub(crate) fn json_fields(&self) -> String {
         let changed = self
             .changed
@@ -238,7 +206,6 @@ impl ConfigApplyResult {
     }
 }
 
-/** @brief 두 설정 텍스트에서 달라진 항목들. */
 pub(crate) fn changed_config_keys(current: &str, proposed: &str) -> Result<Vec<String>, String> {
     let (added, removed, changed) =
         onetdns_config::Config::diff_toml(current, proposed).map_err(|e| e.to_string())?;
@@ -251,14 +218,13 @@ pub(crate) fn changed_config_keys(current: &str, proposed: &str) -> Result<Vec<S
     Ok(keys)
 }
 
-/** @brief 설정 파일을 한 번에 하나씩만 고치게 한다. */
+/// Serializes config file edits.
 pub(crate) fn config_write_lock() -> &'static Mutex<()> {
-    /** @brief 설정 파일 잠금. */
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/** @brief 바뀐 것만 보고 교체하거나 재시작한다. */
+/// Swaps in or restarts, depending only on what changed.
 pub(crate) fn apply_config_edit_smart(
     path: &Option<std::path::PathBuf>,
     prev: &ConfigTextSlot,
@@ -272,7 +238,7 @@ pub(crate) fn apply_config_edit_smart(
     apply_config_edit_smart_locked(path, prev, applied, reload, hot_apply, edit)
 }
 
-/** @brief 잠금을 잡은 채로 반영한다. */
+/// With the config write lock already held.
 pub(crate) fn apply_config_edit_smart_locked(
     path: &Option<std::path::PathBuf>,
     prev: &ConfigTextSlot,
@@ -301,7 +267,8 @@ pub(crate) fn apply_config_edit_smart_locked(
             changed,
         });
     }
-    /* 검증 API와 같은 기준으로 거른다. 통과시키면 저장한 뒤 재시작할 때 서버가 뜨지 않는다. */
+    // Same check as the validate API; letting it through would save a config the server cannot
+    // start with after the next restart.
     runtime_preflight(&new_cfg)
         .map_err(|e| format!("The changed configuration is invalid: {e}"))?;
 
@@ -331,7 +298,7 @@ pub(crate) fn apply_config_edit_smart_locked(
     })
 }
 
-/** @brief 설정을 고쳐 저장한다. 건드리지 않은 항목은 그대로 둔다. 전체를 덮어쓰면 다른 설정이 사라진다. */
+/// Untouched keys stay; overwriting the whole file would lose other settings.
 pub(crate) fn apply_config_edit(
     path: &Option<std::path::PathBuf>,
     prev: &ConfigTextSlot,
@@ -343,7 +310,7 @@ pub(crate) fn apply_config_edit(
     apply_config_edit_locked(path, prev, reload, edit)
 }
 
-/** @brief 잠금을 잡은 채로 고쳐 저장한다. */
+/// With the config write lock already held.
 pub(crate) fn apply_config_edit_locked(
     path: &Option<std::path::PathBuf>,
     prev: &ConfigTextSlot,
@@ -369,14 +336,13 @@ pub(crate) fn apply_config_edit_locked(
     Ok(())
 }
 
-/** @brief 적용 중인 설정을 한 번에 하나씩만 고치게 한다. */
+/// Serializes changes to the running config.
 pub(crate) fn runtime_config_update_lock() -> &'static Mutex<()> {
-    /** @brief 적용 중인 설정 잠금. */
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/** @brief 적용 중인 설정을 고친다. 잠금 안에서 읽고 고쳐야 동시에 온 다른 변경이 사라지지 않는다. */
+/// Reads and changes under the lock, so a concurrent change is not lost.
 pub(crate) fn update_runtime_config(
     runtime: &Arc<ArcSwap<Config>>,
     update: impl FnOnce(&mut Config),
@@ -388,7 +354,7 @@ pub(crate) fn update_runtime_config(
     runtime.store(Arc::new(config));
 }
 
-/** @brief 비교 전에 기본값으로 채워진 것을 맞춘다. 안 맞추면 바뀌지 않은 것이 바뀐 것으로 보인다. */
+/// Aligns default-filled values before comparing; otherwise unchanged values would look changed.
 pub(crate) fn normalize_config_for_comparison(runtime: &Config, desired: &Config) -> Config {
     let mut normalized = desired.clone();
     let dashboard_default = SocketAddr::from(([127, 0, 0, 1], 8553));
@@ -398,7 +364,7 @@ pub(crate) fn normalize_config_for_comparison(runtime: &Config, desired: &Config
     normalized
 }
 
-/** @brief 두 설정에서 값이 다른 키들. 이름순이다. */
+/// Sorted.
 pub(crate) fn config_changed_keys(runtime: &Config, desired: &Config) -> Vec<String> {
     let mut changed: Vec<String> = config_keys::changed_keys(runtime, desired)
         .map(str::to_string)
@@ -407,7 +373,7 @@ pub(crate) fn config_changed_keys(runtime: &Config, desired: &Config) -> Vec<Str
     changed
 }
 
-/** @brief 파일에 적힌 설정을 JSON으로. */
+/// The config as written in the file.
 pub(crate) fn desired_config_json(path: Option<&std::path::Path>, runtime: &Config) -> String {
     let Some(path) = path else {
         return runtime.effective_json();
@@ -430,11 +396,9 @@ pub(crate) fn desired_config_json(path: Option<&std::path::Path>, runtime: &Conf
     }
 }
 
-/**
- * @brief 파일에 적힌 설정을 반영하면 바뀌는 항목과 그 가운데 서비스를 다시 시작하는 항목.
- * @details 파일을 반영하는 경로와 같이 비교용으로 맞추고 service_restart_keys 로 판정한다. 그래야
- *          관리 화면이 반영하기 전에 묻는 내용이 실제 반영 결과와 맞는다.
- */
+/// Keys applying the file would change, and those among them that restart the service. Normalized
+/// like the file-apply path and judged by `service_restart_keys`, so what the dashboard asks before
+/// applying matches the actual result.
 fn config_changed_keys_for_status(
     runtime: &Config,
     desired: &Config,
@@ -445,7 +409,6 @@ fn config_changed_keys_for_status(
     (changed, restart)
 }
 
-/** @brief 설정 파일을 읽어 config_changed_keys_for_status 로 판정한다. */
 fn disk_change(
     path: &std::path::Path,
     runtime: &Config,
@@ -457,12 +420,10 @@ fn disk_change(
     Ok(config_changed_keys_for_status(runtime, &desired))
 }
 
-/**
- * @brief 파일과 지금 적용 중인 설정이 어긋나는지, 그리고 지금 설정에서 바꾸면 재시작할 수 있는 항목을
- *        JSON으로.
- * @details 관리 화면은 이 응답을 주기적으로 읽는다. 항목 분류는 클라이언트 경로처럼 지금 설정에 따라
- *          달라지므로, 화면을 연 뒤에 설정이 바뀌어도 항목 표시가 따라가도록 여기에 함께 싣는다.
- */
+/// Whether the file and the running config diverge, plus the keys that could restart under the
+/// current config. The dashboard polls this. The key classification depends on the current config,
+/// client routes for example, so it travels here to follow config changes made after the page
+/// opened.
 pub(crate) fn config_status_json(path: Option<&std::path::Path>, runtime: &Config) -> String {
     use onetdns_core::json::escape;
     let list = |keys: &[String]| keys.iter().map(|key| escape(key)).collect::<Vec<_>>();
@@ -492,7 +453,6 @@ pub(crate) fn config_status_json(path: Option<&std::path::Path>, runtime: &Confi
 }
 
 #[cfg(test)]
-/** @brief 바뀐 키의 분류와 적용 방식. */
 mod tests {
     use super::*;
     use std::net::SocketAddr;
@@ -505,7 +465,6 @@ mod tests {
     use crate::{config_keys, unix_now, ConfigTextSlot, CONFIG_FILE_NAME};
 
     #[test]
-    /** @brief 실패한 설정 편집이 파일, 이전 스냅샷, 재시작 표식을 건드리지 않는지. */
     fn failed_config_edit_leaves_file_snapshot_and_reload_untouched() {
         let file_path = std::env::temp_dir().join(format!(
             "onetdns-edit-noop-{}-{}.toml",
@@ -532,7 +491,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동시에 온 다른 변경이 사라지지 않는지. */
     fn runtime_config_updates_preserve_other_recent_changes() {
         let runtime = Arc::new(ArcSwap::from_pointee(Config::default()));
         update_runtime_config(&runtime, |config| config.safe_search = true);
@@ -545,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재시작해야 할 변경이 교체로 가려지지 않는지. 가려지면 반영된 줄 안다. */
+    /// Hidden, it would look applied.
     fn pending_non_hot_file_change_cannot_be_hidden_by_a_hot_edit() {
         let active = Config::default();
         let mut proposed = active.clone();
@@ -561,7 +519,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 파일과 적용 중인 설정이 어긋나면 알리는지. */
     fn stored_and_active_config_diff_reports_runtime_mismatch() {
         let applied = Config::from_toml_str(
             "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\ncache_size = 1000\n",
@@ -578,10 +535,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 가려진 사용자 정보의 변화를 계정 변경이라고 짚어 내는지.
-     * @details 뭉뚱그린 이름으로 두면 비밀번호를 한 번 바꿀 때마다 DNS 처리가 끊긴다.
-     */
+    /// A generic name would interrupt DNS service every time a password changes.
     fn stored_and_active_diff_detects_masked_user_changes() {
         let mut applied = Config::default();
         applied.users = vec![onetdns_config::UserConfig {
@@ -596,11 +550,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 요약에 드러난 항목과 가려진 항목이 한 요청에서 함께 바뀌어도 둘 다 짚는지.
-     * @details 가려진 항목을 놓치면 토큰을 교체한 요청이 적용된 것으로 보고되고 이전 토큰이
-     *          계속 통한다.
-     */
+    /// Missing the masked one would report a token rotation as applied while the old token keeps
+    /// working.
     fn masked_change_is_reported_alongside_a_visible_change() {
         let applied = Config {
             control_token: "control-token-a".into(),
@@ -618,11 +569,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 개수로 요약된 항목이 늘거나 줄어도 무중단 적용 대상으로 분류되는지.
-     * @details 요약에 설정 키와 다른 이름을 쓰면 적용 경로가 그 이름을 몰라 서비스를 전부
-     *          재시작한다.
-     */
+    /// If the summary used names other than the config keys, the apply path would not know them and
+    /// would restart the whole service.
     fn counted_summary_keys_map_to_their_hot_groups() {
         let applied = Config::default();
         let mut desired = applied.clone();
@@ -637,11 +585,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정을 바꾸는 API가 검증 API와 같은 시작 전 검사를 거치는지.
-     * @details 이 검사를 건너뛰면 검증 API는 거절하는 값이 파일에 저장되고, 다음에 재시작할
-     *          때 서버가 뜨지 않는다.
-     */
+    /// Skipping it would save a value the validate API rejects, and the server would not start at
+    /// the next restart.
     fn config_edit_runs_runtime_preflight_before_writing() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-preflight-edit-{}-{}.toml",
@@ -671,7 +616,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 가려진 관리 토큰 값만 바뀌어도 토큰 변경으로 분류하는지. */
     fn stored_and_active_diff_detects_masked_control_token_changes() {
         let mut applied = Config {
             control_token: "control-token-a".into(),
@@ -690,13 +634,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 값만 바뀐 비밀 목록이 제 이름으로 불리는지.
-     *
-     * @details 유효 설정 요약은 이 목록들을 개수나 이름으로만 싣는다. 요약을 비교해서는 개수가
-     *          같은 교체가 드러나지 않고, 바뀐 키를 대지 못하면 그 변경을 반영할 그룹도 정하지
-     *          못한다.
-     */
+    /// The effective config summary lists these only by count or name, so comparing summaries
+    /// misses a same-count rotation, and without the changed key no group can apply it.
     fn rotating_a_secret_list_names_the_key_it_changed() {
         let mut applied = Config {
             control_admin_tokens: vec!["admin-old".into()],
@@ -744,12 +683,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 바뀐 키 목록에 설정 키만 드는지.
-     * @details 유효 설정 요약은 mtls_enforced, cachedb_redis_password_set 처럼 설정 키가 아닌
-     *          파생 항목도 싣는다. 그런 이름은 키 표에 없으므로, 바뀐 키에 섞이면 교체할 수 있는
-     *          변경이 재시작이 된다.
-     */
+    /// The effective config summary also carries derived items that are not config keys, such as
+    /// `mtls_enforced` and `cachedb_redis_password_set`. The key table does not know them, so mixed
+    /// into the changed keys they would turn a hot change into a restart.
     fn only_configuration_keys_are_reported_as_changed() {
         let applied = Config::default();
         for (key, mutate) in [
@@ -776,12 +712,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 요약에 영역 이름만 실리는 목록의 세부 값이 바뀌어도 그 키로 불리는지.
-     * @details 세컨더리 영역은 요약에 이름만 실린다. 주 서버 주소만 바꾼 변경이 다른 키와 함께
-     *          들어올 때 이 키가 빠지면 권한 그룹을 교체하지 않아서, 세컨더리 갱신 작업이 이전 주
-     *          서버에서 계속 받아 온다.
-     */
+    /// The summary lists secondary zones by name only. When a change of only the primary address
+    /// comes with other keys and this key is missing, the authority group is not swapped, and
+    /// secondary refresh keeps pulling from the old primary.
     fn a_secondary_primary_change_is_reported_by_its_key() {
         let applied = Config {
             secondary: vec![onetdns_config::SecondaryZone {
@@ -805,7 +738,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 파일이 깨졌을 때 적용 중인 설정으로 대신 보여 주지 않는지. */
     fn desired_config_reports_invalid_disk_file_instead_of_runtime_fallback() {
         let suffix = format!("{}-{}", std::process::id(), unix_now());
         let path = std::env::temp_dir().join(format!("onetdns-invalid-config-{suffix}.toml"));
@@ -822,7 +754,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기본값으로 채운 것이 어긋남으로 보이지 않는지. */
     fn web_dashboard_default_listener_does_not_create_false_config_drift() {
         let desired = Config::from_toml_str("cache_size = 4096\n").unwrap();
         let mut runtime = desired.clone();
@@ -836,7 +767,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제어 리스너를 뺀 것이 가려지지 않는지. */
     fn runtime_change_comparison_does_not_hide_control_listener_removal() {
         let desired = Config::from_toml_str("cache_size = 4096\n").unwrap();
         let mut runtime = desired.clone();
@@ -850,7 +780,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제어 리스너를 바꾼 것은 그대로 알리는지. */
     fn explicit_control_listener_change_is_still_reported() {
         let desired = Config::from_toml_str(
             "control_listen = \"127.0.0.1:9553\"\ncontrol_token = \"unit-test-token-0123456789\"\n",
@@ -867,7 +796,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 파일과 적용 중인 설정의 차이를 찾아내는지. */
     fn config_status_detects_disk_runtime_divergence() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-cfg-status-{}-{}",
@@ -908,7 +836,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DDR이 광고하는 수신 주소가 바뀌면 해석 체인도 반드시 다시 만들어지는지. */
     fn encrypted_listener_change_rebuilds_ddr_chain_only_when_needed() {
         let plain = Config::default();
         let mut changed = plain.clone();
@@ -930,7 +857,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 전달 설정은 체인이 그 값을 쓰는 전달기가 있을 때만 체인을 다시 만드는지. */
     fn forward_settings_rebuild_the_chain_only_when_the_chain_uses_them() {
         let plain = Config::default();
         let mut slower = plain.clone();
@@ -968,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 영역이 생기거나 사라질 때만 체인을 다시 만들고, 영역 편집은 저장소 교체로 끝나는지. */
+    /// Editing a zone only swaps the store.
     fn zone_edits_rebuild_the_chain_only_when_the_authority_layer_appears() {
         let zone = |origin: &str| onetdns_config::ZoneConfig {
             origin: origin.to_string(),
@@ -995,11 +921,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 로컬 도메인을 바꾸면 DHCP 서비스와 체인을 함께 다시 만드는지.
-     * @details 이 값은 DHCP 옵션 15로 나가고 DHCP DNS 계층의 로컬 이름에도 쓰인다. 한쪽만 다시
-     *          만들면 임대에 알린 도메인과 DNS 가 답하는 이름이 어긋난다.
-     */
+    /// The value goes out as DHCP option 15 and also names local hosts in the DHCP DNS layer;
+    /// rebuilding only one would make the leased domain and the names DNS answers disagree.
     fn local_domain_change_rebuilds_dhcp_and_the_chain() {
         let plain = Config::default();
         let mut next = plain.clone();
@@ -1013,7 +936,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림을 바꾸는 것은 재시작하지 않아도 되는지. */
     fn forward_upstream_change_is_hot_reload() {
         let current =
             Config::from_toml_str("backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n").unwrap();
@@ -1023,12 +945,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 전달을 쓰지 않던 backend에서 전달을 쓰는 backend로 바꾸며 업스트림을 함께 고쳐도
-     *        재시작하지 않는지.
-     * @details 전달 리졸버 슬롯은 backend와 상관없이 시작할 때 만들어지고, 설정 반영이 새
-     *          업스트림으로 만든 리졸버를 그 슬롯에 넣는다.
-     */
+    /// The forward resolver slot exists from startup regardless of backend, and applying the config
+    /// puts a resolver built with the new upstreams into it.
     fn forward_keys_follow_a_backend_switch_without_restart() {
         let current = Config::from_toml_str(
             "backend = \"recurse\"
@@ -1049,7 +967,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 전달 세부 설정이 재시작하지 않아도 되는지. */
     fn forward_runtime_tuning_is_hot_reload() {
         let current =
             Config::from_toml_str("backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n").unwrap();
@@ -1070,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트별 업스트림 설정은 재시작해야 하는지. 체인을 다시 지어야 한다. */
+    /// Route chains are built only at generation start.
     fn client_specific_upstream_tuning_requires_service_restart() {
         let current = Config::from_toml_str(
             "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n[[clients]]\nname = \"office\"\nids = [\"192.0.2.0/24\"]\nupstreams = [\"9.9.9.9\"]\n",
@@ -1091,11 +1008,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 재귀 리졸버의 질의 제한 시간은 체인을 다시 만들어 재시작 없이 반영하는지.
-     * @details 체인을 다시 만들 때 계획으로 재귀 리졸버를 새로 만들고, 계획에 질의 제한 시간이
-     *          들어 있다.
-     */
+    /// The chain rebuild makes a new recursive resolver from the plan, and the plan includes the
+    /// query timeout.
     fn recursive_timeout_is_applied_by_rebuilding_the_chain() {
         let changed = ["query_timeout_secs".to_string()];
         for base in [
@@ -1117,11 +1031,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 처리 방식과 전달 세부 설정을 함께 바꿔도 재시작하지 않는지.
-     * @details 전달기는 새 설정이 전달을 쓰고 이전 설정이 쓰지 않았으면 새로 만들고, 체인은
-     *          처리 방식이 바뀌면 다시 만든다.
-     */
+    /// A forwarder is built anew when the new config forwards and the old one did not; the chain
+    /// rebuilds when the backend changes.
     fn backend_switch_keeps_forward_tuning_hot() {
         let forward = "upstreams = [\"1.1.1.1\"]\nupstream_strategy = \"parallel\"\nupstream_concurrency = 4\nquery_timeout_secs = 2\n";
         let changed: Vec<String> = [
@@ -1151,7 +1062,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정책만 바뀌면 교체하고, 경로가 바뀌면 재시작하는지. */
     fn client_policy_change_is_hot_reload_but_route_change_is_not() {
         let current = Config::from_toml_str(
             "[[clients]]
@@ -1183,7 +1093,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 하드웨어 주소 기준 클라이언트를 처음 넣으면 재시작하는지. */
     fn first_mac_client_requires_service_restart() {
         let current = Config::from_toml_str("").unwrap();
         let proposed = Config::from_toml_str(
@@ -1196,15 +1105,10 @@ mod tests {
         assert!(!config_keys::swappable("clients", &current, &proposed));
     }
 
-    /** @brief 업스트림을 따로 쓰는 클라이언트 경로 하나. */
     const CLIENT_ROUTE: &str =
         "[[clients]]\nname = \"office\"\nids = [\"192.0.2.0/24\"]\nupstreams = [\"9.9.9.9\"]\n";
 
-    /**
-     * @brief 최상위 키 줄에서 key 를 value 로 바꾼 설정 본문.
-     * @param top    최상위 키 줄들.
-     * @param tables 최상위 키 뒤에 오는 표 배열들.
-     */
+    /// `top` holds the top-level key lines; `tables` the table arrays after them.
     fn with_key(top: &str, key: &str, value: &str, tables: &str) -> String {
         let prefix = format!("{key} =");
         let mut text: String = top
@@ -1217,12 +1121,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트 경로가 있으면 체인을 다시 만드는 변경을 재시작으로 판정하는지.
-     * @details 경로의 체인은 세대를 시작할 때만 만들어지므로, 기본 체인만 교체하면 경로의
-     *          클라이언트가 이전 설정으로 답을 받는다. 변경 미리보기도 이 판정을 쓰므로, 여기서
-     *          빠지면 관리 화면이 재시작하는 변경을 무중단이라고 알린다.
-     */
+    /// Route chains are built only at generation start, so swapping only the default chain would
+    /// leave route clients on the old config. The change preview uses this verdict too; missing
+    /// here, the dashboard would announce a restarting change as hot.
     fn chain_changes_restart_while_client_routes_exist() {
         let verdict = |top: &str, key: &str, value: &str, routed: bool| {
             let tables = if routed { CLIENT_ROUTE } else { "" };
@@ -1250,7 +1151,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 관리 화면에 알리는 조건부 키가 지금 설정을 따르는지. */
     fn conditional_keys_follow_the_current_configuration() {
         let forward = "backend = \"forward\"\nupstreams = [\"1.1.1.1\"]\n";
         let plain = Config::from_toml_str(forward).unwrap();
@@ -1279,13 +1179,12 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트 경로가 있을 때 체인 계획을 바꾸는 키를 모두 조건부로 알리는지.
-     * @details 키마다 형에 맞는 값을 넣어 보고, 계획이 달라지는데 무중단으로 알리는 키가 있으면
-     *          실패한다. 계획이 다른 그룹의 키를 새로 읽으면서 ChainPlan::other_group_inputs 에
-     *          넣지 않으면 여기서 드러난다. 기반 설정은 그 함수가 보는 구성 요소를 하나씩만
-     *          켠다. 여럿을 함께 켜면 한 구성 요소의 목록이 다른 구성 요소의 빠진 키를 가린다.
-     */
+    /// Tries a value of the right type for each key and fails when a key changes the plan but is
+    /// announced as hot. A plan that starts reading another group's key without adding it to
+    /// `ChainPlan::other_group_inputs` shows up here.
+    ///
+    /// Each base config turns on only one of the components that function looks at; turning on
+    /// several would let one component's list hide another's missing key.
     fn every_key_that_changes_the_chain_plan_is_announced() {
         let candidates = |kind: &str, meta: &str| -> Vec<String> {
             let quoted = |values: &[&str]| values.iter().map(|v| format!("\"{v}\"")).collect();
@@ -1371,7 +1270,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 달라진 항목 목록이 정렬되고 겹치지 않는지. */
     fn changed_config_keys_are_sorted_and_deduplicated() {
         let cur = "block_rules = [\"a.example\"]\nlisten = [\"127.0.0.1:53\"]\n";
         let new = "block_rules = [\"b.example\"]\nlisten = [\"127.0.0.1:5353\"]\n";

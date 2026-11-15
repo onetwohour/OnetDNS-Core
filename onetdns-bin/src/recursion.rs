@@ -1,6 +1,5 @@
-/*!
- * @brief 재귀 해석기를 준비한다. 루트 서버, 신뢰 앵커와 RFC 5011 갱신, 경로상의 DNS 가로채기 탐지를 맡는다.
- */
+//! Sets up recursion: root servers, trust anchors with RFC 5011 updates, and detection of DNS
+//! interception on the path.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use crate::{
     read_text_limited, resolver_chain, sleep_or_shutdown, unix_now, LOCAL_STATE_MAX_BYTES,
 };
 
-/** @brief 재귀를 시작할 루트 서버들. */
 pub(crate) fn recursor_roots(cfg: &Config) -> Vec<SocketAddr> {
     if cfg.root_hints.is_empty() {
         onetdns_recurse::default_roots()
@@ -25,14 +23,9 @@ pub(crate) fn recursor_roots(cfg: &Config) -> Vec<SocketAddr> {
     }
 }
 
-/**
- * @brief 권한 서버에 TCP로만 물을지의 판정. 프로세스에 하나만 둔다.
- *
- * @details UDP 53번 가로채기는 호스트 망의 성질이라 설정을 다시 읽어도 바뀌지 않는다.
- *          재귀기마다 따로 두면 다시 읽을 때 새로 만든 재귀기가 판정을 잃는다.
- */
+/// One per process: UDP 53 interception is a property of the host network and does not change on
+/// reload, and a per-recursor value would be lost by the recursor a reload builds.
 fn authority_tcp_switch() -> Arc<std::sync::atomic::AtomicBool> {
-    /** @brief 판정 값. */
     static SWITCH: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
         std::sync::OnceLock::new();
     SWITCH
@@ -40,26 +33,20 @@ fn authority_tcp_switch() -> Arc<std::sync::atomic::AtomicBool> {
         .clone()
 }
 
-/** @brief 가로채기 판정을 공유하는 재귀기를 만든다. */
 pub(crate) fn new_recursor(roots: Vec<SocketAddr>, timeout: Duration) -> onetdns_recurse::Recursor {
     onetdns_recurse::Recursor::new(roots, timeout).with_authority_tcp(authority_tcp_switch())
 }
 
-/**
- * @brief 일반 DNS가 중간에서 가로채이는지 확인한다.
- *
- * @details 루트 서버는 비재귀 질의에 위임만 돌려주므로, 주소 답이 오면 중간에서 다른 것이
- *          대신 답한 것이다. UDP로 물은 루트가 하나도 답하지 않는 망도 있다. 두 경우 모두
- *          같은 루트에 TCP로 다시 물어 위임이 오면 권한 서버 질의를 TCP로 돌린다. TCP까지
- *          가로채이면 재귀를 쓸 수 없으므로 경고만 남긴다.
- */
+/// Roots answer non-recursive queries with referrals only, so an address answer means something on
+/// the path answered instead. Some networks get no UDP answer from any root. Either way the same
+/// root is asked over TCP, and a referral switches authority queries to TCP. If TCP is intercepted
+/// too, recursion cannot work, and only a warning is logged.
 pub(crate) fn detect_dns53_interception(
     roots: Vec<SocketAddr>,
     timeout: Duration,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     use std::sync::atomic::{AtomicBool, Ordering};
-    /** @brief 한 번만 확인한다. */
     static PROBED: AtomicBool = AtomicBool::new(false);
     if roots.is_empty() || PROBED.swap(true, Ordering::Relaxed) {
         return None;
@@ -176,18 +163,14 @@ pub(crate) fn detect_dns53_interception(
     }
 }
 
-/** @brief 루트 서버가 비재귀 질의에 줄 수 없는 주소 답이 들어 있는지. */
 fn is_forged_root_answer(resp: &onetdns_proto::Message) -> bool {
     resp.answers
         .iter()
         .any(|r| matches!(r.rdata, onetdns_proto::RData::A(_)))
 }
 
-/**
- * @brief RFC 8145 신호 질의에 쓸 이름의 첫 레이블.
- * @param anchors 검증에 실제로 쓰는 루트 신뢰 앵커.
- * @return 앵커가 없으면 알릴 것이 없으므로 없다.
- */
+/// The first label of the RFC 8145 signal query name. `anchors` are the root anchors validation
+/// actually uses; None when there are none.
 fn ta_signal_label(anchors: &[onetdns_dnssec::Ds]) -> Option<String> {
     let mut tags: Vec<u16> = anchors.iter().map(|anchor| anchor.key_tag).collect();
     tags.sort_unstable();
@@ -204,11 +187,8 @@ fn ta_signal_label(anchors: &[onetdns_dnssec::Ds]) -> Option<String> {
     ))
 }
 
-/**
- * @brief 이 서버가 쓰는 신뢰 루트를 주기적으로 알린다.
- * @param anchors 리졸버가 검증에 쓰는 앵커 저장소. 설정 파일의 앵커나 RFC 5011로 바뀐
- *                앵커가 여기 담기므로, 내장 앵커 대신 이것을 알려야 실제 상태가 나간다.
- */
+/// `anchors` is the resolver's anchor store, holding anchors from the config file or updated by RFC
+/// 5011; signaling these, not the built-in ones, reports the real state.
 pub(crate) fn spawn_ta_signaling(
     anchors: Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
     timeout: Duration,
@@ -247,12 +227,9 @@ pub(crate) fn spawn_ta_signaling(
         })
 }
 
-/**
- * @brief 전달 검증기가 쓸 루트 신뢰 기준.
- * @details 설정 파일로 앵커를 준 사람은 그것을, 아니면 내장 앵커를 쓴다. 체인을 새로 구성할
- *          때마다 이 설정에서 다시 읽는다. 처음 구성할 때 읽은 값을 계속 가지고 있으면 앵커 파일을
- *          바꿔도 이전 키로 검증한다.
- */
+/// The anchor file when configured, the built-in anchors otherwise. Reread on every chain build; a
+/// value kept from the first build would keep validating with old keys after the anchor file
+/// changes.
 pub(crate) fn forward_trust_anchors(
     anchor_file: Option<&std::path::Path>,
 ) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
@@ -262,7 +239,7 @@ pub(crate) fn forward_trust_anchors(
     }
 }
 
-/** @brief 설정한 신뢰 루트를 읽는다. 못 읽으면 시작하지 않는다. */
+/// Startup fails when they cannot be read.
 pub(crate) fn load_configured_trust_anchors(
     path: &std::path::Path,
 ) -> BoxResult<Vec<onetdns_dnssec::Ds>> {
@@ -294,7 +271,6 @@ pub(crate) fn load_configured_trust_anchors(
     Ok(anchors)
 }
 
-/** @brief 신뢰 루트가 바뀌는 것을 따라가는 스레드를 시작한다. */
 pub(crate) fn spawn_rfc5011(
     plan: &resolver_chain::RecursivePlan,
     anchors: Arc<onetdns_core::ArcSwap<Vec<onetdns_dnssec::Ds>>>,
@@ -378,12 +354,10 @@ pub(crate) fn spawn_rfc5011(
 }
 
 #[cfg(test)]
-/** @brief 루트 서버와 신뢰 앵커 준비, 가로채기 탐지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 신뢰 루트를 시작 중에 읽고, 못 읽으면 시작하지 않는지. */
     fn configured_trust_anchor_loads_synchronously_and_fails_closed() {
         let root = onetdns_proto::Name::root();
         let signer = onetdns_dnssec::sign::ZoneSigner::generate(root.clone(), [73; 32]);
@@ -413,7 +387,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 신뢰 앵커 신호가 내장 앵커가 아니라 실제로 쓰는 앵커의 키 태그를 담는지. */
     fn ta_signal_label_uses_the_configured_anchors() {
         let anchor = |key_tag| onetdns_dnssec::Ds {
             key_tag,

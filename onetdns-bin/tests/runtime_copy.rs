@@ -1,39 +1,26 @@
-/*!
- * @brief 운영 기록과 사용자에게 닿는 오류 문구가 읽을 만한 영어 문장으로 남아 있는지
- *        검사한다.
- *
- * @details 장애가 났을 때 기록을 읽는 사람은 이 코드를 쓴 사람이 아니다. 구현 용어를
- *          그대로 적거나 값만 찍어 두면 무엇이 잘못됐는지 알 수 없다. 기록이 아예
- *          사라지는 것도 같은 문제라, 호출 수와 이벤트 코드 수에 바닥을 둔다.
- * @details 서버가 내보내는 문구는 영어 하나로 쓰고, 언어별 표기는 대시보드와 설정
- *          스키마의 번역 사전이 맡는다. 스키마 번역 사전은 그래서 한글 검사에서 뺀다.
- * @note 검사 범위는 실제로 동작하는 소스뿐이다. 테스트 디렉터리와 파일 안의 테스트 모듈은
- *       사용자에게 보이지 않으므로 세지 않는다.
- * @warning 두 최소 기준은 계산해서 얻은 값이 아니라 의도적으로 고정한 값이다. 기록을
- *          크게 줄이는 변경을 할 때에만 의식적으로 내린다.
- */
+//! Operational logs and user-facing errors must stay readable English. Whoever reads the log in an
+//! outage did not write the code, and implementation terms or bare values do not say what went
+//! wrong. Losing the logs is the same problem, so call and event-code counts have floors.
+//!
+//! Server text is English only; the dashboard and schema dictionaries handle other languages, so
+//! the schema dictionary is exempt from the Hangul check. Tests are not scanned.
+//!
+//! The floors are pinned on purpose; lower them only for a change that deliberately removes
+//! logging.
 
 mod common;
 
 use common::{collect, is_test_module_file, production_files, production_prefix, read, rel, root};
 use std::path::PathBuf;
 
-/** @brief 기록 호출이 이 아래로 떨어지면 기록 자체가 무너진 것으로 본다. */
 const MIN_LOG_CALLS: usize = 400;
 
-/** @brief 이벤트 코드를 단 호출의 최소 기준. */
 const MIN_EXPLICIT_EVENTS: usize = 350;
 
-/** @brief 기록 매크로 이름. */
 const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
-/**
- * @brief 사용자에게 닿는 오류 문구에 남으면 안 되는 구현 용어.
- *
- * @note 업스트림은 여기 넣지 않는다. 설정 키가 upstream_urls 이고 대시보드도 같은 말을
- *       쓰므로, 다른 말로 바꾸면 읽는 사람이 자기가 적은 항목과 이어 붙이지 못한다.
- *       이 목록은 운영자가 쓰는 말로 바꿔 적을 수 있는 용어만 담는다.
- */
+/// Implementation terms with an operator's word to replace them. "upstream" is not one: the config
+/// key is upstream_urls and the dashboard uses the same word.
 const BANNED_IN_PUBLIC: &[&str] = &[
     "zone backend",
     "subscription backend",
@@ -47,7 +34,6 @@ const BANNED_IN_PUBLIC: &[&str] = &[
     "vendor DB",
 ];
 
-/** @brief 무엇이 잘못됐는지 알려 주지 않는 짧은 진단 문구. */
 const TERSE_DIAGNOSTICS: &[&str] = &[
     "parse failed",
     "decode failed",
@@ -64,16 +50,12 @@ const TERSE_DIAGNOSTICS: &[&str] = &[
     "delta serial",
 ];
 
-/**
- * @brief 한글을 담아도 되는 소스. 설정 스키마의 언어별 표기 사전이다.
- * @details 이 파일의 한국어는 서버 문구가 아니라 대시보드가 고르는 번역 자료다.
- */
+/// Its Korean is translation data for the dashboard, not server text.
 const LOCALIZATION_SOURCES: &[&str] = &["crates/onetdns-config/src/schema.rs"];
 
-/** @brief 값만 담긴 문구. 무엇에 대한 값인지 알 수 없다. */
+/// Messages that are only a value, with nothing saying what it is.
 const DYNAMIC_ONLY: &[&str] = &["{label}", "{warning}", "{error}"];
 
-/** @brief 기록 호출 하나. */
 struct LogCall {
     where_: String,
     line: usize,
@@ -82,12 +64,10 @@ struct LogCall {
     message: String,
 }
 
-/** @brief 한글이 한 글자라도 들어 있는지. */
 fn has_korean(text: &str) -> bool {
     text.chars().any(|ch| ('가'..='힣').contains(&ch))
 }
 
-/** @brief 대소문자를 가리지 않고 조각을 품는지. */
 fn contains_any(haystack: &str, needles: &[&str]) -> Vec<String> {
     let lowered = haystack.to_lowercase();
     needles
@@ -97,7 +77,6 @@ fn contains_any(haystack: &str, needles: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/** @brief 실제로 동작하는 소스 파일 전부. */
 fn production_sources() -> Vec<PathBuf> {
     let repo = root();
     let mut out = Vec::new();
@@ -115,7 +94,7 @@ fn production_sources() -> Vec<PathBuf> {
     out
 }
 
-/** @brief 닫는 괄호를 찾을 때까지 문자열과 문자 리터럴을 건너뛰며 센다. */
+/// Skips string and char literals.
 fn balanced_end(source: &str, from: usize) -> usize {
     let bytes = source.as_bytes();
     let mut depth = 1usize;
@@ -146,7 +125,7 @@ fn balanced_end(source: &str, from: usize) -> usize {
     index.saturating_sub(1)
 }
 
-/** @brief 큰따옴표 리터럴을 순서대로 추출한다. 이스케이프는 그대로 둔다. */
+/// Escapes are kept as written.
 fn plain_strings(body: &str) -> Vec<String> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
@@ -174,12 +153,12 @@ fn plain_strings(body: &str) -> Vec<String> {
     out
 }
 
-/** @brief 앞 글자가 식별자 일부인지. 다른 매크로 이름에 걸리는 것을 막는다. */
+/// Keeps `my_error!` from matching `error!`.
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/** @brief 매크로 몸통에 적힌 이벤트 코드. 없으면 빈 문자열이다. */
+/// Empty when absent.
 fn event_code(body: &str) -> String {
     for head in ["event = \"", "event=\""] {
         if let Some(at) = body.find(head) {
@@ -192,7 +171,6 @@ fn event_code(body: &str) -> String {
     String::new()
 }
 
-/** @brief 파일 하나에서 기록 매크로 호출을 모은다. */
 fn macro_calls(where_: &str, source: &str) -> Vec<LogCall> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -236,12 +214,7 @@ fn macro_calls(where_: &str, source: &str) -> Vec<LogCall> {
     out
 }
 
-/**
- * @brief Rust 소스에서 한 줄짜리 문자열 리터럴만 추출한다.
- * @details 줄바꿈이 들어간 긴 문구는 도움말이나 문서 본문이라 짧은 오류 문구 검사에서
- *          뺀다.
- * @return 줄 번호와 값의 쌍.
- */
+/// Single-line literals only, as (line, value); multi-line ones are help text, not error messages.
 fn string_literals(source: &str) -> Vec<(usize, String)> {
     every_literal(source)
         .into_iter()
@@ -249,11 +222,7 @@ fn string_literals(source: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/**
- * @brief Rust 소스의 문자열 리터럴을 길이와 관계없이 전부 추출한다.
- * @details 주석 안의 글자와 문자 리터럴은 문자열이 아니므로 걸러 낸다.
- * @return 줄 번호와 값의 쌍.
- */
+/// Every literal as (line, value), skipping comments and char literals.
 fn every_literal(source: &str) -> Vec<(usize, String)> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -353,7 +322,6 @@ fn every_literal(source: &str) -> Vec<(usize, String)> {
     out
 }
 
-/** @brief 실제로 동작하는 소스의 기록 호출 전부. */
 fn all_log_calls() -> Vec<LogCall> {
     production_sources()
         .iter()
@@ -364,7 +332,6 @@ fn all_log_calls() -> Vec<LogCall> {
         .collect()
 }
 
-/** @brief 기록이 전부 사라지면 실패한다. */
 #[test]
 fn operational_logging_does_not_collapse() {
     let calls = all_log_calls();
@@ -380,7 +347,6 @@ fn operational_logging_does_not_collapse() {
     );
 }
 
-/** @brief 문구 없는 기록이나 값만 찍는 기록이 있으면 실패한다. */
 #[test]
 fn every_log_call_says_something() {
     let calls = all_log_calls();
@@ -407,11 +373,7 @@ fn every_log_call_says_something() {
     );
 }
 
-/**
- * @brief 기록 문구에 한글이 섞이면 실패한다.
- * @details 기록은 운영자가 검색하고 이슈에 붙여 넣는 텍스트라 영어 하나로 맞춘다.
- *          대시보드 화면 문구는 이 검사와 무관하다.
- */
+/// Operators search logs and paste them into issues, so they stay in one language.
 #[test]
 fn log_messages_are_english() {
     let korean: Vec<String> = all_log_calls()
@@ -426,7 +388,6 @@ fn log_messages_are_english() {
     );
 }
 
-/** @brief 기록에 붙는 고정 항목이 빠지면 실패한다. */
 #[test]
 fn the_structured_logger_keeps_its_fixed_fields() {
     let logger = read(&root().join("crates/onetdns-core/src/log.rs"));
@@ -450,7 +411,6 @@ fn the_structured_logger_keeps_its_fixed_fields() {
     );
 }
 
-/** @brief 사용자에게 닿는 오류 문구에 구현 용어가 남으면 실패한다. */
 #[test]
 fn user_facing_errors_avoid_implementation_wording() {
     let repo = root();
@@ -480,11 +440,6 @@ fn user_facing_errors_avoid_implementation_wording() {
     );
 }
 
-/**
- * @brief 서버 문자열에 한글이 남으면 실패한다.
- * @details 오류, 도움말, 관리 API 본문, 명령 출력은 모두 영어로 쓴다. 화면 언어에
- *          맞춘 표기는 대시보드와 스키마 번역 사전이 맡는다.
- */
 #[test]
 fn runtime_strings_are_english() {
     let mut found = Vec::new();
@@ -508,7 +463,6 @@ fn runtime_strings_are_english() {
     );
 }
 
-/** @brief 무엇이 잘못됐는지 알려 주지 않는 진단 문구가 남으면 실패한다. */
 #[test]
 fn no_terse_diagnostic_remains() {
     let mut found = Vec::new();
@@ -528,7 +482,6 @@ fn no_terse_diagnostic_remains() {
     );
 }
 
-/** @brief 문자열을 뽑는 판정이 주석과 문자 리터럴을 실제로 걸러 내는지 확인한다. */
 #[test]
 fn the_string_scanner_behaves() {
     let sample = concat!(
@@ -544,7 +497,7 @@ fn the_string_scanner_behaves() {
         .collect();
     assert_eq!(values, vec!["first", "raw \" quote", "last"]);
 
-    /* 매크로 몸통에서 마지막 문자열과 이벤트 코드를 함께 집어낸다. */
+    // Takes the last string and the event code from the macro body.
     let source = "    warn!(event = \"a.b\", client = %addr, \"무엇이 잘못됐는지\");\n";
     let calls = macro_calls("보기", source);
     assert_eq!(calls.len(), 1);
@@ -552,11 +505,10 @@ fn the_string_scanner_behaves() {
     assert_eq!(calls[0].event, "a.b");
     assert_eq!(calls[0].message, "무엇이 잘못됐는지");
 
-    /* 이름 일부가 겹치는 다른 매크로는 기록으로 세지 않는다. */
+    // A macro whose name only ends the same is not a log call.
     assert!(macro_calls("보기", "    my_error!(\"x\");\n").is_empty());
 }
 
-/** @brief 검사 대상 경로가 테스트를 포함하지 않는지 확인한다. */
 #[test]
 fn the_scan_covers_production_sources_only() {
     let scanned: Vec<String> = production_sources().iter().map(|path| rel(path)).collect();

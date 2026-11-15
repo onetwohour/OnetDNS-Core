@@ -1,6 +1,4 @@
-/*!
- * @brief DoH 업스트림: HTTP/2 위의 DNS(RFC 8484).
- */
+//! DNS over HTTPS upstream on HTTP/2 (RFC 8484).
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -13,37 +11,29 @@ use onetdns_tls::{client_handshake, ClientConfig, TlsSession, TlsStream, TrustSt
 
 use crate::{validate_response, DeadlineTcp, ForwardError};
 
-/** @brief 보관 중인 DoH 연결 하나. */
 struct DohConn {
-    /** @brief 이 연결의 HTTP/2 클라이언트. */
     client: H2Client<TlsStream<DeadlineTcp>>,
 
-    /** @brief 관측된 왕복 시간. 재사용 시 PING 대기 시간을 정하는 데 쓴다. */
+    /// Observed round-trip time; sets the PING wait on reuse.
     rtt_hint: Duration,
 }
 
 thread_local! {
-    /** @brief (주소, 서버 이름, 경로)별 연결 풀. */
     static POOL: RefCell<LruMap<(SocketAddr, String, String, crate::TlsCacheScope), DohConn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
-    /** @brief 끊긴 HTTP/2 연결을 TLS 재개로 빠르게 복구할 세션. */
+    /// Sessions for resuming dropped HTTP/2 connections quickly.
     static SESSIONS: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), TlsSession>> =
         RefCell::new(LruMap::new(MAX_CACHED_SESSIONS));
 }
 
-/** @brief 스레드 하나가 보관할 DoH 연결 수 상한. */
 const MAX_POOLED_CONNECTIONS: usize = 256;
-/** @brief 스레드 하나가 보관할 최근 DoH 세션 수 상한. */
 const MAX_CACHED_SESSIONS: usize = 64;
 
-/**
- * @brief DoH로 질의를 교환한다.
- * @details 재사용 연결에는 PING을 함께 보내 두 단계 데드라인을 만든다. 죽은 연결이면 빨리
- *          포기하고, 살아 있으면 업스트림의 해석 시간을 기다려 준다. 연결이 실패하면 풀에서
- *          빼고 새 연결로 한 번 더 보낸다. 서버가 오류 상태로 답했으면 연결을 그대로 두고 다시
- *          보내지 않는다. 오류 상태는 서버가 내린 답이라 새 연결로 다시 물어도 달라지지 않고,
- *          429 와 503 은 곧바로 다시 묻지 말라는 뜻이기도 하다.
- */
+/// Sends a PING with the query on a kept connection, giving a two-stage deadline: a dead connection
+/// is given up quickly, a live one gets the upstream's resolution time. On connection failure,
+/// drops the connection from the pool and retries once on a new one. An error status from the
+/// server leaves the connection in place and is not retried: it is the server's answer, a new
+/// connection would not change it, and 429 and 503 also ask clients not to retry at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
     addr: SocketAddr,
@@ -103,10 +93,8 @@ pub(crate) fn exchange(
     })
 }
 
-/**
- * @brief 새 DoH 연결을 맺는다. 폐기 확인은 핸드셰이크 직후, 질의 전에 한다.
- * @details 훅이 거부한 인증서는 TLS 가 거부했을 때처럼 치명 경고로 서버에 알린다.
- */
+/// Checks revocation right after the handshake, before a query. A certificate the hook rejects is
+/// reported to the server with a fatal alert, as when TLS rejects it.
 fn connect(
     addr: SocketAddr,
     server_name: &str,
@@ -139,11 +127,8 @@ fn connect(
     Ok(DohConn { client, rtt_hint })
 }
 
-/**
- * @brief 연결 하나로 DoH 질의를 보내고 응답을 받는다.
- * @return 바깥 Err 는 이 연결을 더 쓸 수 없다는 뜻이다. 안쪽 Err 는 서버가 이 질의에만 오류
- *         상태로 답했다는 뜻이고, 연결은 그대로 쓸 수 있다.
- */
+/// An outer Err means the connection is unusable. An inner Err means the server answered this query
+/// alone with an error status, and the connection is still good.
 fn roundtrip(
     conn: &mut DohConn,
     server_name: &str,
@@ -193,7 +178,6 @@ fn roundtrip(
 }
 
 #[cfg(test)]
-/** @brief 인증서 검증, 연결 재사용, 그리고 죽은 연결에서의 빠른 복구. */
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
@@ -209,13 +193,12 @@ mod tests {
 
     use crate::{Forwarder, Upstream};
 
-    /** @brief 자체 서명 인증서를 쓰는 테스트용 업스트림. */
     fn doh_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _accepts, _signatures) = doh_server_ex(ip, false);
         (addr, trust)
     }
 
-    /** @brief 접속 수와 전체 핸드셰이크 서명 수를 셀 수 있는 테스트용 업스트림. */
+    /// Counts connections and full-handshake signatures.
     fn doh_server_ex(
         ip: Ipv4Addr,
         one_shot: bool,
@@ -291,13 +274,11 @@ mod tests {
         (addr, trust, accepts_ret, signatures)
     }
 
-    /** @brief 테스트용 질의. */
     fn q(id: u16, name: &str) -> Message {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
     }
 
     #[test]
-    /** @brief 인증서를 검증하고 연결을 다시 쓰는지. */
     fn doh_forward_verified_and_reuses_connection() {
         let (addr, trust) = doh_server(Ipv4Addr::new(3, 3, 3, 3));
         let fwd = Forwarder::with_upstreams(
@@ -320,10 +301,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 폐기 확인이 거부한 인증서를 certificate_unknown 치명 경고로 서버에 알리는지.
-     * @details 경고 없이 TCP 만 끊으면 서버는 거부와 중간에서 잘린 연결을 구분하지 못한다.
-     */
+    /// Closing TCP without an alert leaves the server unable to tell a rejection from a connection
+    /// cut on the way.
     fn doh_revocation_rejection_is_reported_to_the_server() {
         let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, reads) = crate::tls_first_read_recorder(b"h2");
@@ -359,7 +338,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 쉬고 있어도 살아 있으면 다시 쓰는지. */
     fn doh_idle_alive_connection_is_reused() {
         let (addr, trust, accepts, _signatures) = doh_server_ex(Ipv4Addr::new(7, 7, 7, 7), false);
         let fwd = Forwarder::with_upstreams(
@@ -376,7 +354,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이미 죽은 연결을 붙잡지 않고 곧바로 다시 잇는지. */
     fn doh_reused_zombie_fails_fast_then_reconnects() {
         let (addr, trust, accepts, signatures) = doh_server_ex(Ipv4Addr::new(8, 8, 8, 8), true);
         let fwd = Forwarder::with_upstreams(
@@ -406,7 +383,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름이 다른 인증서를 거부하는지. */
     fn doh_rejects_wrong_server_name() {
         let (addr, trust) = doh_server(Ipv4Addr::new(4, 4, 4, 4));
 
@@ -419,7 +395,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 믿을 수 없는 인증서를 거부하는지. */
     fn doh_rejects_untrusted_cert() {
         let (addr, _trust) = doh_server(Ipv4Addr::new(5, 5, 5, 5));
 
@@ -432,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 업스트림이라도 더 엄격한 신뢰 정책이 이전 연결·세션을 재사용하지 않는지. */
+    /// A stricter trust policy must not reuse connections or sessions from before.
     fn doh_cache_is_scoped_to_trust_policy() {
         let (addr, trust) = doh_server(Ipv4Addr::new(5, 5, 5, 6));
         let trusted = Forwarder::with_upstreams(
@@ -451,7 +426,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 경로가 오류가 되는지. */
     fn doh_bad_path_is_error() {
         let (addr, trust) = doh_server(Ipv4Addr::new(6, 6, 6, 6));
 
@@ -464,11 +438,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 오류 상태를 그 질의의 실패로만 다루고 연결은 계속 쓰는지.
-     * @details 오류 상태는 서버가 이 질의에 내린 답이라 새 연결로 다시 물어도 달라지지 않는다.
-     *          연결을 버리고 다시 보내면 같은 답을 받으려고 핸드셰이크를 한 번 더 한다.
-     */
+    /// An error status is the server's answer to this query; dropping the connection and resending
+    /// would repeat the handshake to get the same answer.
     fn doh_error_status_fails_only_that_query() {
         let (addr, trust, accepts, _signatures) = doh_server_ex(Ipv4Addr::new(6, 6, 6, 7), false);
         let results = thread::spawn(move || {
@@ -503,7 +474,6 @@ mod tests {
 
     #[test]
     #[ignore = "네트워크 필요(Cloudflare DoH 실서버)"]
-    /** @brief 실제 공개 업스트림과의 왕복. */
     fn doh_live_cloudflare() {
         let fwd = Forwarder::with_upstreams(
             vec![Upstream::doh(

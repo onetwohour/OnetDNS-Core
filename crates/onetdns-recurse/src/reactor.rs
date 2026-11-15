@@ -1,12 +1,9 @@
-/*!
- * @brief 이벤트 구동 재귀 해석 레인.
- *
- * @details 동기 경로는 해석 하나가 스레드를 끝까지 붙잡는다. 이 레인은 여러 해석을 한
- *          스레드에서 겹쳐 돌린다. 판정 논리는 동기 경로의 것을 그대로 빌려 쓰므로,
- *          어느 경로로 가든 같은 답이 나온다.
- * @warning 결함은 판정이 아니라 수명에서 나온다. 슬롯, 데드라인, 예산이 부모와 자식 사이에서
- *          제대로 이어지지 않으면 해석이 새거나 서로를 굶긴다.
- */
+//! Event-driven recursive resolution: one thread runs many resolutions at once, where the sync path
+//! holds a thread per resolution. Decisions reuse the sync path's logic, so both paths give the
+//! same answer.
+//!
+//! Bugs here come from lifetimes, not decisions: if slots, deadlines, or budgets are not handed
+//! correctly between parent and child, resolutions leak or starve each other.
 
 use crate::{
     make_query, questions_case_exact, response_usable_for_iteration, IterationContext,
@@ -19,50 +16,42 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-/** @brief 제출한 해석을 식별하는 값. 호출자가 정하고 완료 통지에 그대로 실려 온다. */
+/// Identifies a submitted resolution. The caller picks it and gets it back in the completion.
 pub type Token = u64;
 
-/** @brief 해석 하나가 끝난 결과. */
 pub enum Completion {
-    /** @brief 응답을 얻었다. */
     Answer(Token, Message),
 
-    /** @brief 해석이 실패했다. */
     Fail(Token, crate::RecurseError),
 
-    /** @brief 이 레인으로는 처리할 수 없다. 동기 경로로 넘기라는 뜻이다. */
+    /// The lane cannot handle this; hand it to the sync path.
     Retry(Token),
 }
 
-/** @brief 제출 결과. */
 pub enum SubmitOutcome {
-    /** @brief 새 해석으로 받았다. */
     Accepted,
 
-    /** @brief 같은 질의가 이미 진행 중이라 그쪽에 붙였다. */
+    /// Joined an identical resolution already in flight.
     Merged,
 
-    /** @brief 슬롯이 없어 받지 못했다. */
+    /// No free slot.
     Rejected,
 
-    /** @brief 시작조차 하지 못했다. */
+    /// The resolution could not start.
     Failed,
 }
 
-/** @brief 레인 설정. */
 pub struct ReactorConfig {
-    /** @brief 동시에 받을 해석 수. */
     pub inflight_max: usize,
 
-    /** @brief 해석 하나의 전체 데드라인. 자식 해석도 이 데드라인을 나눠 쓴다. */
+    /// Total deadline of one resolution, shared with its children.
     pub session_budget: Duration,
 
-    /** @brief 같은 질의를 하나로 합칠지. 같은 이름이 몰릴 때 업스트림 부하를 크게 줄인다. */
+    /// Merge identical in-flight queries, so a burst for one name sends one upstream query.
     pub singleflight: bool,
 }
 
 impl Default for ReactorConfig {
-    /** @brief 기본 설정. */
     fn default() -> Self {
         Self {
             inflight_max: 32,
@@ -72,68 +61,55 @@ impl Default for ReactorConfig {
     }
 }
 
-/** @brief 지금 답을 기다리는 왕복 하나. */
+/// An outstanding query to one server.
 struct Attempt {
-    /** @brief 보낸 질의. 응답 대조에 쓰므로 그대로 가지고 있어야 한다. */
+    /// Kept as sent; replies are matched against it.
     sent: Message,
-    /** @brief 물어본 서버. */
     target: SocketAddr,
-    /** @brief 이 왕복의 데드라인. */
     deadline: Instant,
-    /** @brief 보낸 시각. 왕복 시간 측정에 쓴다. */
     sent_at: Instant,
 }
 
-/** @brief 해석 하나의 진행 상태. 동기 경로의 지역 변수에 해당하는 것들이다. */
+/// State of one resolution; the sync path keeps the same things in locals.
 struct Session {
-    /** @brief 해석 중인 이름. */
     qname: Name,
-    /** @brief 해석 중인 타입. */
     qtype: RecordType,
-    /** @brief 위임을 따라 내려가는 중의 위치. 동기 경로와 같은 타입이다. */
     state: IterationState,
-    /** @brief 다음에 보낼 질의의 모양. */
     plan: NextQuery,
-    /** @brief 이번 단계에서 순서대로 물을 서버들. */
+    /// Servers to ask at this step, in order.
     ladder: Vec<SocketAddr>,
-    /** @brief 다음에 물을 서버의 순번. */
+    /// Index of the next server in `ladder`.
     next_idx: usize,
-    /** @brief 서버 하나에 줄 시간. */
     per_server: Duration,
-    /**
-     * @brief 답을 기다리는 왕복들.
-     * @details 앞 서버의 답을 기다리는 채로 다음 서버에도 물으므로 여럿일 수 있다. 먼저 온
-     *          쓸 만한 답을 쓰고 나머지는 버린다. 동기 경로의 query_any_reserving과 같은 규칙이다.
-     */
+    /// Outstanding exchanges. The next server is asked while earlier ones are still pending, so
+    /// there can be several; the first usable reply wins. Same rule as the sync path's
+    /// `query_any_reserving`.
     attempts: Vec<Attempt>,
-    /** @brief 이 시각까지 답이 없으면 다음 서버에도 묻는다. */
+    /// Ask the next server too if nothing usable has arrived by then.
     ask_next_at: Instant,
-    /** @brief 이 해석 전용 소켓. 포트 무작위화가 여기서 나온다. */
+    /// Socket for this resolution alone, which randomizes the source port.
     sock: UdpSocket,
 
-    /** @brief 지금 소켓이 IPv6인지. 계열이 바뀌면 소켓을 다시 연다. */
+    /// Family of `sock`; a target in the other family needs a new socket.
     sock_v6: bool,
-    /** @brief 이 해석 전체의 데드라인. */
     session_deadline: Instant,
-    /** @brief 지금까지 밟은 단계 수. */
     steps: usize,
-    /** @brief 밟을 수 있는 단계 수 상한. 참조가 순환해도 멈춘다. */
+    /// Stops the walk even when referrals loop.
     step_cap: usize,
-    /**
-     * @brief 위임마다 DS 증거를 모을지. 검증할 때만 참이다.
-     * @note 네임서버 주소를 푸는 자식 해석은 결과를 검증하지 않으므로 끈다. 켜 두면 답변 절로
-     *       드러난 경계에서 DS를 물으려고 부모까지 동기 경로로 넘어간다.
-     */
+    /// Collect DS evidence at each delegation; set only when validating.
+    ///
+    /// Children resolving nameserver addresses turn it off: their results are not validated, and
+    /// with it on, a zone cut seen in the answer section would push the parent to the sync path to
+    /// fetch DS.
     collect_ds: bool,
 }
 
 thread_local! {
 
-    /** @brief 이 스레드가 재사용하는 수신 버퍼. */
     static RECV_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; 65_535]);
 }
 
-/** @brief 발신용 비차단 소켓을 연다. 대상 계열에 맞춰 바인딩한다. */
+/// Non-blocking socket bound for the target's address family.
 fn bind_outgoing(target: SocketAddr) -> Option<UdpSocket> {
     let sock = match onetdns_core::udp::bind(onetdns_forward::outgoing_bind(target)) {
         Ok(sock) => sock,
@@ -149,13 +125,9 @@ fn bind_outgoing(target: SocketAddr) -> Option<UdpSocket> {
     Some(sock)
 }
 
-/**
- * @brief 발신 소켓을 열지 못했음을 알린다.
- * @details 파일 디스크립터가 바닥나면 여기부터 막힌다. 질의마다 호출되는 경로라 2의 거듭제곱
- *          번째만 남긴다.
- */
+/// Running out of file descriptors fails here first. This runs per query, so only power-of-two
+/// counts are logged.
 fn record_bind_failure(error: &std::io::Error) {
-    /** @brief 누적 실패 수. */
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -163,35 +135,25 @@ fn record_bind_failure(error: &std::io::Error) {
     }
 }
 
-/** @brief 해석 하나가 멈춘 이유. */
 enum SessionEnd {
-    /** @brief 최종 응답을 얻었다. */
     Done(Message),
-    /** @brief 실패했다. */
     Failed(crate::RecurseError),
 
-    /** @brief 이 레인으로는 못 한다. 동기 경로가 이어받아야 한다. */
     NeedsSync,
-    /** @brief 네임서버 주소를 먼저 풀어야 한다. */
     NeedAddrs {
-        /** @brief 주소를 알아내야 할 서버 이름들. */
         missing: Vec<Name>,
-        /** @brief 그 주소를 기다리는 위임. */
         pending: Box<PendingReferral>,
     },
 }
 
-/** @brief 정리 단계에서 확정된 결과. */
+/// Result of `settle`.
 enum Settled {
-    /** @brief 답을 얻었다. */
     Answer(Message),
-    /** @brief 실패했다. */
     Failed(crate::RecurseError),
-    /** @brief 레인에서는 끝내지 못한다. 보통 체인이 마저 풀어야 한다. */
+    /// The lane cannot finish this; the resolver chain usually does.
     NeedsSync,
 }
 
-/** @brief 해석 내내 바뀌지 않는 질의 정보를 만든다. */
 fn make_ctx(qname: &Name, qtype: RecordType, collect_ds: bool) -> IterationContext<'_> {
     IterationContext {
         qname,
@@ -203,7 +165,7 @@ fn make_ctx(qname: &Name, qtype: RecordType, collect_ds: bool) -> IterationConte
 }
 
 impl Session {
-    /** @brief 캐시된 위임에서, 없으면 루트에서 해석을 시작한다. */
+    /// Starts from the cached delegation, else from the root.
     fn start(
         r: &Recursor,
         qname: Name,
@@ -218,7 +180,6 @@ impl Session {
         Self::start_at(r, qname, qtype, zone, servers, budget, now)
     }
 
-    /** @brief 지정한 zone과 서버로 해석을 시작한다. */
     fn start_at(
         r: &Recursor,
         qname: Name,
@@ -260,7 +221,7 @@ impl Session {
         Some(s)
     }
 
-    /** @brief 다음 질의를 만들어 보낸다. 보낼 서버가 없으면 실패다. */
+    /// Sends the next query; an error means no server is left.
     fn send_next(&mut self, r: &Recursor, now: Instant) -> Result<(), crate::RecurseError> {
         self.steps += 1;
         if self.steps > self.step_cap {
@@ -269,10 +230,8 @@ impl Session {
         let ctx = make_ctx(&self.qname, self.qtype, self.collect_ds);
         self.plan = self.state.next_query(&ctx);
         let ladder = r.ask_order(&self.state.servers, &self.state.zone)?;
-        /*
-         * 주소를 풀지 않은 이름 몫의 시간도 남긴다. 동기 경로의 query_any_reserving과 같은
-         * 규칙이다.
-         */
+        // Reserve time for names whose addresses are not resolved yet. Same rule as the sync path's
+        // `query_any_reserving`.
         let candidates = ladder.len() + self.state.unresolved_ns.len();
         self.per_server =
             (r.timeout / candidates.clamp(1, 4) as u32).max(Duration::from_millis(300));
@@ -283,17 +242,14 @@ impl Session {
             .map_err(|()| crate::RecurseError::NoReachableNs)
     }
 
-    /**
-     * @brief 사다리의 다음 서버에 실제로 보낸다.
-     * @details 보내지 못한 서버는 실패로 기록하고 그다음 서버로 넘어간다. 기다리는 왕복이
-     *          남아 있으면 보낼 서버가 더 없어도 실패가 아니다.
-     * @note 0x20이 켜져 있으면 여기서 대소문자를 섞는다. 응답 대조에 쓰이므로 보낸 형태를
-     *       그대로 기억해 둔다.
-     */
+    /// Sends to the next server in `ladder`, recording a server that cannot be sent to as failed
+    /// and moving on. Running out of servers is not an error while exchanges are pending. 0x20 case
+    /// mixing happens here.
     fn fire_next(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
         while let Some(&target) = self.ladder.get(self.next_idx) {
             if !self.attempts.is_empty() && self.sock_v6 != target.is_ipv6() {
-                /* 소켓을 바꾸면 기다리던 왕복의 답을 받을 수 없다. 그 왕복이 끝나면 보낸다. */
+                // A new socket cannot receive replies to pending exchanges, so wait for them to
+                // finish.
                 self.ask_next_at = self
                     .attempts
                     .iter()
@@ -328,7 +284,7 @@ impl Session {
         }
     }
 
-    /** @brief 대상 계열에 맞는 소켓을 준비한다. 계열이 바뀌면 새로 연다. */
+    /// Reopens `sock` when the target's family differs; false if that fails.
     fn use_socket_for(&mut self, target: SocketAddr) -> bool {
         if self.sock_v6 == target.is_ipv6() {
             return true;
@@ -343,12 +299,8 @@ impl Session {
         }
     }
 
-    /**
-     * @brief 시간이 된 일을 처리한다.
-     * @details 데드라인을 넘긴 왕복은 실패로 기록해 버린다. 기다리는 왕복이 없거나 다음 서버에
-     *          물을 시각이 되었으면 다음 서버에 보낸다.
-     * @return 더 물을 서버도 기다리는 왕복도 없으면 Err.
-     */
+    /// Drops timed-out exchanges as failures, then asks the next server when nothing is pending or
+    /// `ask_next_at` has passed. Errors when no server is left and nothing is pending.
     fn on_timers(&mut self, r: &Recursor, now: Instant) -> Result<(), ()> {
         let zone = &self.state.zone;
         self.attempts.retain(|attempt| {
@@ -371,7 +323,7 @@ impl Session {
         Ok(())
     }
 
-    /** @brief 다음에 깨어나야 할 시각. 기다리는 왕복의 데드라인과 다음 서버에 물을 시각이다. */
+    /// Earliest exchange deadline or `ask_next_at`.
     fn next_wake(&self) -> Option<Instant> {
         let deadline = self.attempts.iter().map(|attempt| attempt.deadline).min();
         let ask_next = (self.next_idx < self.ladder.len()
@@ -380,12 +332,10 @@ impl Session {
         deadline.into_iter().chain(ask_next).min()
     }
 
-    /**
-     * @brief 소켓에서 응답을 읽어 기다리는 왕복 가운데 하나에 대한 것인지 확인한다.
-     * @return 받아들인 응답과, 그 응답이 답한 왕복.
-     * @warning 트랜잭션 ID와 질문, 0x20 대소문자까지 맞아야 받아들인다. 이 검사가 위조
-     *          응답을 막는 실체다.
-     */
+    /// Reads a reply and returns it with the exchange it answers.
+    ///
+    /// Transaction ID, question, and 0x20 case must all match; this is the check that stops forged
+    /// replies.
     fn try_recv(&mut self, r: &Recursor) -> Option<(Message, Attempt)> {
         if self.attempts.is_empty() {
             return None;
@@ -408,10 +358,8 @@ impl Session {
                         {
                             continue;
                         }
-                        /*
-                         * 잘린 응답은 레코드가 비어 있어 아래 검사를 통과하지 못한다. 거기서
-                         * 버리면 TCP 로 넘어가지 못하고 왕복 시간 초과까지 기다린다.
-                         */
+                        // A truncated reply has empty sections and fails the checks below. Dropping
+                        // it there skips the TCP fallback and waits out the exchange timeout.
                         if resp.header.truncated {
                             return Some((resp, idx));
                         }
@@ -428,7 +376,7 @@ impl Session {
         matched.map(|(resp, idx)| (resp, self.attempts.swap_remove(idx)))
     }
 
-    /** @brief 받은 응답으로 한 단계 나아간다. 판정은 동기 경로의 advance를 그대로 쓴다. */
+    /// Advances one step; decisions come from the sync path's `advance`.
     fn on_response(
         &mut self,
         r: &Recursor,
@@ -458,13 +406,12 @@ impl Session {
             StepOutcome::NeedNsAddrs { missing, pending } => {
                 Some(SessionEnd::NeedAddrs { missing, pending })
             }
-            /* DS를 따로 묻는 질의는 이 레인에 없다. 드문 경계라 동기 경로에 맡긴다. */
+            // The lane has no separate DS query; this rare zone cut goes to the sync path.
             StepOutcome::NeedDs { .. } => Some(SessionEnd::NeedsSync),
             StepOutcome::Failed(error) => Some(SessionEnd::Failed(error)),
         }
     }
 
-    /** @brief 따로 풀어 온 네임서버 주소로 멈췄던 참조를 이어 간다. */
     fn resume_with_addrs(
         &mut self,
         r: &Recursor,
@@ -491,117 +438,99 @@ impl Session {
     }
 }
 
-/** @brief 최상위 해석 하나의 문맥. 합쳐진 요청과 별칭 진행 상황을 담는다. */
+/// Context of one client resolution: merged requests and alias-chase progress.
 struct RootCtx {
-    /** @brief 이 해석을 처음 요청한 쪽. */
     leader: Token,
-    /** @brief 같은 질의라 여기 합쳐진 요청들. 끝나면 전부에게 같은 답을 준다. */
     followers: Vec<Token>,
 
-    /** @brief 합치기 인덱스의 키. 끝날 때 반드시 지워야 다음 요청이 고아 항목에 붙지 않는다. */
+    /// Singleflight index key. Remove it when the resolution ends, or later requests attach to an
+    /// orphaned entry.
     sf_key: (Vec<u8>, RecordType),
 
-    /** @brief 별칭을 따라오며 모은 답변들. */
+    /// Answers gathered while following aliases.
     acc_answers: Vec<Record>,
-    /** @brief 따라온 CNAME 수. 체인 전체에 걸쳐 센다. */
+    /// Counted across the whole chain.
     cname_hops: usize,
-    /** @brief 따라온 DNAME 수. */
     dname_hops: usize,
 
-    /** @brief 지금까지의 DNSSEC 상태. 체인 어느 한 곳만 깨져도 전체가 깨진다. */
+    /// DNSSEC status so far; one broken link breaks the whole chain.
     acc_status: crate::SecurityStatus,
 }
 
-/** @brief 이 슬롯이 무엇을 하고 있는지. */
 enum SlotKind {
-    /** @brief 클라이언트 요청 자체를 해석 중이다. */
     Root(RootCtx),
 
-    /** @brief 부모를 위해 네임서버 주소를 푸는 중이다. */
-    NsAddr { parent: usize },
+    /// Resolving a nameserver address for `parent`.
+    NsAddr {
+        parent: usize,
+    },
 
-    /** @brief 부모의 검증을 위해 DNSKEY를 받아 오는 중이다. */
-    Dnskey { parent: usize, zone: Name },
+    /// Fetching a DNSKEY for `parent`'s validation.
+    Dnskey {
+        parent: usize,
+        zone: Name,
+    },
 }
 
-/** @brief 검증에 필요한 키를 기다리며 멈춰 둔 응답. */
+/// A reply parked until the keys to validate it arrive.
 struct AwaitingKeys {
-    /** @brief 검증을 기다리는 응답. */
     msg: Message,
-    /** @brief 긍정 응답인지. 검증 방식이 갈린다. */
+    /// Positive and negative replies are validated differently.
     positive: bool,
 
-    /** @brief 지금까지 받아 온 DNSKEY 집합 수. 상한이 걸려 있다. */
+    /// DNSKEY sets fetched so far; capped by `MAX_KEY_FETCHES`.
     fetches: usize,
 
-    /** @brief 이미 시도한 zone들. 같은 zone을 되풀이해 받지 않게 한다. */
+    /// Zones already tried, so none is fetched twice.
     tried: Vec<Vec<u8>>,
 }
 
-/** @brief 네임서버 주소를 기다리며 멈춰 둔 참조. */
+/// A referral parked until its nameserver addresses arrive.
 struct Parked {
-    /** @brief 따라가던 위임. */
     pending: Box<PendingReferral>,
-    /** @brief 주소를 아직 모르는 서버 이름들. */
     missing: Vec<Name>,
-    /** @brief 다음에 풀 이름의 위치. 한 번에 하나씩 자식을 시작한다. */
+    /// Next name to resolve; children start one at a time.
     next_missing: usize,
-    /** @brief 지금까지 알아낸 주소들. */
     addrs: Vec<SocketAddr>,
 
-    /** @brief 그 주소들의 수명. */
     addr_ttl: Option<u32>,
-    /** @brief 이 참조를 위해 시작한 자식 수. 예산에 잡힌다. */
+    /// Children started for this referral; they count against the budget.
     children_spawned: usize,
 }
 
-/** @brief 진행 중인 해석 하나가 차지하는 슬롯. */
 struct Slot {
-    /** @brief 그 해석의 진행 상태. */
     session: Session,
-    /** @brief 이 슬롯의 역할. */
     kind: SlotKind,
-    /** @brief 주소를 기다리며 멈춘 참조가 있으면. */
     parked: Option<Parked>,
 
-    /** @brief 키를 기다리며 멈춘 응답이 있으면. */
     awaiting: Option<Box<AwaitingKeys>>,
 
-    /** @brief 남은 부수 해석 예산. 부모에서 물려받아 자식과 나눈다. */
+    /// Side-resolution budget left, inherited from the parent and shared with children.
     ns_budget: usize,
 }
 
-/** @brief 검증 하나에 받아 올 수 있는 DNSKEY 집합 수 상한. 체인을 길게 만들어 이 서버를 붙잡는 것을 막는다. */
+/// DNSKEY sets one validation may fetch, so a long chain cannot pin this server.
 const MAX_KEY_FETCHES: usize = 20;
 
-/**
- * @brief 이벤트 구동 레인 하나. 여러 해석을 겹쳐 돌린다.
- * @details 워커 스레드마다 하나씩 둔다. 안에서 잠그지 않으므로 여러 스레드가 공유하지 않는다.
- */
+/// One event-driven lane running many resolutions at once, one per worker thread. It takes no
+/// locks, so it is never shared between threads.
 pub struct Reactor {
-    /** @brief 이 레인의 설정. */
     cfg: ReactorConfig,
-    /** @brief 슬롯 배열. 빈 슬롯은 None이다. */
     slots: Vec<Option<Slot>>,
-    /** @brief 재사용할 수 있는 빈 슬롯들. */
     free: Vec<usize>,
 
-    /** @brief 진행 중인 질의 인덱스. 같은 질의를 합치는 데 쓴다. */
+    /// Singleflight index: query key to slot.
     inflight: HashMap<(Vec<u8>, RecordType), usize>,
 
-    /** @brief 합쳐진 요청 수. */
     pub merged: u64,
-    /** @brief 끝낸 해석 수. */
     pub completed: u64,
-    /** @brief 실패한 해석 수. */
     pub failed: u64,
 
-    /** @brief 동기 경로로 넘긴 수. */
+    /// Resolutions handed to the sync path.
     pub retried: u64,
 }
 
 impl Reactor {
-    /** @brief 설정으로 레인을 만든다. */
     pub fn new(cfg: ReactorConfig) -> Self {
         Self {
             cfg,
@@ -615,37 +544,29 @@ impl Reactor {
         }
     }
 
-    /**
-     * @brief 지금 살아 있는 슬롯 수.
-     * @details slots 는 줄지 않고 비워진 자리는 모두 free 에 들어오므로, 살아 있는 수는 전체
-     *          길이에서 재사용 대기 수를 뺀 값이다. 매 패킷 입장마다 부르는 자리라 배열 전체를
-     *          훑지 않는다.
-     * @invariant free 에는 중복이 없고 그 인덱스의 슬롯은 항상 None 이다.
-     */
+    /// `slots` never shrinks and every emptied index goes to `free`, so this subtracts instead of
+    /// scanning; it runs for every admitted packet. `free` has no duplicates, and each slot it
+    /// names is `None`.
     pub fn live(&self) -> usize {
         self.slots.len() - self.free.len()
     }
 
-    /** @brief 새 클라이언트 요청을 더 받을 수 있는지. */
     pub fn has_capacity(&self) -> bool {
         self.live() < self.cfg.inflight_max
     }
 
-    /** @brief 자식까지 포함한 전체 슬롯 상한. 클라이언트 상한의 두 배다. */
+    /// Slot limit including children: twice the client limit.
     fn slot_max(&self) -> usize {
         self.cfg.inflight_max.saturating_mul(2)
     }
 
-    /**
-     * @brief 자식 해석을 더 시작할 위치가 있는지.
-     * @note 클라이언트 상한과 따로 본다. 같은 상한을 쓰면 부모가 슬롯을 다 차지해 자식을
-     *       시작하지 못하고, 부모는 자식을 기다리다 교착한다.
-     */
+    /// Checked against `slot_max`, not the client limit. With one shared limit, parents fill every
+    /// slot, cannot start children, and deadlock waiting for them.
     fn has_child_capacity(&self) -> bool {
         self.live() < self.slot_max()
     }
 
-    /** @brief 자식에게 줄 남은 시간. 부모 데드라인을 넘기지 않는다. */
+    /// Time left for a child; never past the parent's deadline.
     fn child_budget(&self, parent: usize, now: Instant) -> Option<Duration> {
         let remaining = self.slots[parent]
             .as_ref()?
@@ -655,7 +576,6 @@ impl Reactor {
         (!remaining.is_zero()).then_some(remaining)
     }
 
-    /** @brief 빈 위치에 슬롯을 넣고 그 인덱스를 준다. */
     fn insert(&mut self, slot: Slot) -> usize {
         match self.free.pop() {
             Some(i) => {
@@ -669,11 +589,8 @@ impl Reactor {
         }
     }
 
-    /**
-     * @brief 새 해석을 제출한다.
-     * @details 같은 질의가 이미 돌고 있으면 그쪽에 붙인다. 그러지 않으면 같은 이름이
-     *          몰릴 때 업스트림에 같은 질의가 그만큼 나간다.
-     */
+    /// Submits a resolution, joining an identical query already in flight instead of sending it
+    /// again.
     pub fn submit(
         &mut self,
         r: &Recursor,
@@ -686,9 +603,8 @@ impl Reactor {
         if cd && !r.ignore_cd {
             return SubmitOutcome::Rejected;
         }
-        /*
-         * 이 레인은 UDP만 보내므로, TCP로만 물어야 하는 동안에는 동기 경로에 맡긴다.
-         */
+        // The lane sends only UDP, so the sync path takes over while authorities must be asked over
+        // TCP.
         if r.authority_over_tcp() {
             return SubmitOutcome::Rejected;
         }
@@ -735,18 +651,16 @@ impl Reactor {
         }
     }
 
-    /**
-     * @brief 합치기 인덱스에서 이 해석을 지운다.
-     * @warning 인덱스의 값이 지금 이 슬롯일 때만 지운다. 확인하지 않고 지우면 이미 그 위치를
-     *          물려받은 다른 해석의 항목을 없애 버린다.
-     */
+    /// Removes the singleflight entry only if it still points at `idx`; otherwise it would remove
+    /// the entry of another resolution that reused the slot.
     fn forget_inflight(&mut self, key: &(Vec<u8>, RecordType), idx: usize) {
         if self.inflight.get(key) == Some(&idx) {
             self.inflight.remove(key);
         }
     }
 
-    /** @brief 대기할 소켓들을 모은다. 호출자가 이것으로 한 번에 기다린다. */
+    /// Collects the sockets of slots waiting on the network, for the caller to poll in one call;
+    /// `map[i]` is the slot of `fds[i]`.
     pub fn collect_pollfds(&self, fds: &mut Vec<libc::pollfd>, map: &mut Vec<usize>) {
         for (i, s) in self.slots.iter().enumerate() {
             if let Some(slot) = s {
@@ -762,7 +676,7 @@ impl Reactor {
         }
     }
 
-    /** @brief 준비된 소켓에서 응답을 읽어 각 해석을 진행시킨다. */
+    /// Reads replies from ready sockets and advances their resolutions.
     pub fn pump(
         &mut self,
         r: &Recursor,
@@ -791,7 +705,7 @@ impl Reactor {
         }
     }
 
-    /** @brief 시간이 지난 왕복과 데드라인을 넘긴 해석을 정리한다. */
+    /// Expires timed-out exchanges and resolutions past their deadline.
     pub fn on_tick(&mut self, r: &Recursor, now: Instant, out: &mut Vec<Completion>) {
         for i in 0..self.slots.len() {
             let mut end: Option<SessionEnd> = None;
@@ -805,10 +719,8 @@ impl Reactor {
                     end = Some(if slot.session.state.unresolved_ns.is_empty() {
                         SessionEnd::Failed(crate::RecurseError::NoResponse)
                     } else {
-                        /*
-                         * 이 영역의 서버가 모두 답하지 않았고 주소를 풀지 않은 이름이 남아 있다.
-                         * 이 레인에는 그 이름을 이어서 푸는 경로가 없으므로 동기 경로에 맡긴다.
-                         */
+                        // Every server of this zone failed and some names still lack addresses. The
+                        // lane cannot go back and resolve them, so the sync path takes over.
                         SessionEnd::NeedsSync
                     });
                 }
@@ -819,7 +731,7 @@ impl Reactor {
         }
     }
 
-    /** @brief 가장 가까운 데드라인까지 남은 시간. 호출자의 대기 시간을 정한다. */
+    /// Time until the nearest deadline; sets the caller's poll timeout.
     pub fn next_deadline_in(&self, now: Instant) -> Option<Duration> {
         self.slots
             .iter()
@@ -830,7 +742,6 @@ impl Reactor {
             .map(|d| d.saturating_duration_since(now))
     }
 
-    /** @brief 끝난 해석을 정리해 확정된 결과로 옮긴다. */
     fn settle(
         &mut self,
         r: &Recursor,
@@ -877,7 +788,8 @@ impl Reactor {
         }
     }
 
-    /** @brief 부수 해석을 자식 슬롯으로 시작한다. 예산과 데드라인을 부모에게서 물려받는다. */
+    /// Starts a side resolution in a child slot, with budget and deadline inherited from the
+    /// parent.
     fn spawn_child(
         &mut self,
         r: &Recursor,
@@ -924,11 +836,8 @@ impl Reactor {
         }
     }
 
-    /**
-     * @brief 해석 하나를 마무리한다. 역할에 따라 처리가 갈린다.
-     * @details 최상위면 별칭을 더 따라갈지 보고, 자식이면 부모를 깨운다. 어느 쪽이든
-     *          합치기 인덱스와 슬롯을 반드시 정리해야 슬롯이 새지 않는다.
-     */
+    /// A root may chase an alias; a child wakes its parent. Either way the singleflight entry and
+    /// the slot must be released, or the slot leaks.
     fn finish(
         &mut self,
         r: &Recursor,
@@ -1056,11 +965,8 @@ impl Reactor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /**
-     * @brief 최종 응답을 다듬어 요청자들에게 돌려준다.
-     * @details 검증이 필요한데 키가 없으면 여기서 멈추고 키를 받아 온다. 동기 경로처럼
-     *          그 자리에서 질의할 수 없기 때문이다.
-     */
+    /// Finalizes the answer for its requesters. When validation needs keys that are missing, parks
+    /// here and fetches them, since the lane cannot query inline like the sync path.
     fn complete_terminal(
         &mut self,
         r: &Recursor,
@@ -1150,7 +1056,6 @@ impl Reactor {
         self.completed += 1;
     }
 
-    /** @brief 검증에 필요한 DNSKEY를 받아 올 자식을 시작한다. */
     fn spawn_key_child(
         &mut self,
         r: &Recursor,
@@ -1190,7 +1095,6 @@ impl Reactor {
         }
     }
 
-    /** @brief 키를 받아 온 뒤 멈춰 있던 부모의 검증을 이어 간다. */
     fn resume_key_parent(
         &mut self,
         r: &Recursor,
@@ -1240,7 +1144,7 @@ impl Reactor {
         );
     }
 
-    /** @brief 이 해석을 동기 경로로 넘긴다. */
+    /// Hands this resolution to the sync path.
     fn retry_root(&mut self, root: &RootCtx, out: &mut Vec<Completion>) {
         for f in &root.followers {
             out.push(Completion::Retry(*f));
@@ -1250,7 +1154,7 @@ impl Reactor {
         self.retried += 1;
     }
 
-    /** @brief 이 해석과 여기 합쳐진 요청 전부를 실패로 끝낸다. */
+    /// Fails this resolution and every request merged into it.
     fn fail_root(
         &mut self,
         root: &RootCtx,
@@ -1265,7 +1169,6 @@ impl Reactor {
         self.failed += 1;
     }
 
-    /** @brief 주소를 받아 온 뒤 멈춰 있던 부모의 참조를 이어 간다. */
     fn resume_parent(
         &mut self,
         r: &Recursor,
@@ -1292,10 +1195,8 @@ impl Reactor {
         parked.addrs.extend(addrs);
         parked.addr_ttl = crate::min_optional_ttl(parked.addr_ttl, addr_ttl);
 
-        /*
-         * 쓸 수 있는 주소가 생기면 남은 이름은 풀지 않고 내려간다. 그 주소들이 모두 답하지
-         * 않으면 동기 경로가 남은 이름을 이어서 푼다.
-         */
+        // Once a usable address exists, descend without resolving the remaining names. If those
+        // addresses all fail, the sync path resolves the rest.
         let have_usable = parked.addrs.iter().any(|addr| r.usable_server(addr.ip()));
         if !have_usable && parked.next_missing < parked.missing.len() && parked.children_spawned < 8
         {
@@ -1324,7 +1225,7 @@ impl Reactor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /** @brief 별칭을 따라 같은 슬롯에서 새 해석을 시작한다. 누적 상태는 그대로 이어 간다. */
+    /// Follows an alias with a new resolution in the same slot, keeping the accumulated state.
     fn restart_root(
         &mut self,
         r: &Recursor,
@@ -1359,17 +1260,14 @@ impl Reactor {
 }
 
 #[cfg(test)]
-/** @brief 레인이 동기 경로와 같은 판정을 내는지, 그리고 슬롯·데드라인·예산이 새지 않는지. */
 mod tests {
     use super::*;
     use onetdns_proto::{DnsClass, Header, Question, ResponseCode};
 
-    /** @brief 고정 응답을 내는 테스트용 권한 서버. */
     fn spawn_mock_authority() -> SocketAddr {
         spawn_mock_authority_forging_ad(false)
     }
 
-    /** @brief AD 비트를 위조해 보내는 테스트용 서버. */
     fn spawn_mock_authority_forging_ad(forge_ad: bool) -> SocketAddr {
         spawn_mock_answering(
             forge_ad,
@@ -1378,10 +1276,7 @@ mod tests {
         )
     }
 
-    /**
-     * @brief 모든 질의에 주어진 주소로 권한 있게 답하는 테스트용 서버.
-     * @param delay 답하기 전에 기다릴 시간.
-     */
+    /// Answers every query authoritatively with `address`, after `delay`.
     fn spawn_mock_answering(
         forge_ad: bool,
         address: std::net::Ipv4Addr,
@@ -1424,7 +1319,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 공개 API만으로 해석이 끝나고, 같은 질의가 하나로 합쳐지는지. */
     fn reactor_completes_and_merges_via_public_api() {
         let root = spawn_mock_authority();
         let recursor = Recursor::new(vec![root], Duration::from_millis(800))
@@ -1484,7 +1378,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief CD를 존중할 때만 검증을 건너뛰는지. */
     fn reactor_refuses_checking_disabled_only_when_cd_is_honored() {
         let root = spawn_mock_authority();
         let qname = Name::from_str("example.").unwrap();
@@ -1535,7 +1428,6 @@ mod tests {
         assert_eq!(guarded.live(), 0, "거절된 제출은 세션을 만들지 않는다");
     }
 
-    /** @brief 무관한 레코드를 끼워 넣는 테스트용 서버. */
     fn spawn_mock_authority_injecting_extras() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let addr = sock.local_addr().unwrap();
@@ -1591,7 +1483,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 레인도 동기 경로처럼 무관한 레코드를 걷어내는지. */
     fn reactor_strips_unrelated_records_like_sync_path() {
         let root = spawn_mock_authority_injecting_extras();
         let recursor = Recursor::new(vec![root], Duration::from_millis(800))
@@ -1639,11 +1530,6 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 받은 질의에 A 레코드 하나를 담은 권한 응답을 만든다.
-     * @param truncated 잘림 비트를 켤지.
-     * @param with_answer 답 레코드를 담을지.
-     */
     fn authority_reply(req: &Message, truncated: bool, with_answer: bool) -> Vec<u8> {
         let q = req.questions[0].clone();
         let mut resp = Message {
@@ -1672,7 +1558,6 @@ mod tests {
         resp.try_encode().unwrap()
     }
 
-    /** @brief UDP 질의에 reply 가 만든 바이트로 답하는 테스트용 권한 서버. */
     fn spawn_mock_authority_replying(reply: fn(&Message) -> Vec<u8>) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let addr = sock.local_addr().unwrap();
@@ -1692,7 +1577,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 권한 서버에 TCP로만 물어야 하는 동안에는 UDP만 쓰는 레인이 제출을 거절하는지. */
     fn reactor_rejects_while_authority_tcp_switch_is_on() {
         let root: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
         let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1720,7 +1604,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘린 응답은 TCP가 필요하므로 동기 경로로 넘기는지. */
     fn reactor_hands_truncated_response_to_sync_path() {
         assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
             authority_reply(req, true, true)
@@ -1728,11 +1611,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 레코드 없이 잘림 비트만 켠 응답도 동기 경로로 넘기는지.
-     * @details 이 응답은 반복 해석에 쓸 수 있는 응답인지 보는 검사를 통과하지 못한다. 그 검사보다
-     *          잘림을 먼저 보지 않으면 왕복 시간 초과까지 기다렸다가 실패한다.
-     */
+    /// This reply fails the usable-for-iteration check. Unless truncation is checked first, the
+    /// exchange waits out its timeout and fails.
     fn reactor_hands_empty_truncated_response_to_sync_path() {
         assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
             authority_reply(req, true, false)
@@ -1740,7 +1620,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘림 비트 없이 레코드 중간에서 끊긴 응답도 동기 경로로 넘기는지. */
     fn reactor_hands_reply_cut_without_tc_to_sync_path() {
         assert_handed_to_sync_path(spawn_mock_authority_replying(|req| {
             let full = authority_reply(req, false, true);
@@ -1748,7 +1627,6 @@ mod tests {
         }));
     }
 
-    /** @brief root 한 곳에 물은 해석이 재시도 통지로 끝나는지 확인한다. */
     fn assert_handed_to_sync_path(root: SocketAddr) {
         let recursor = Recursor::new(vec![root], Duration::from_millis(500))
             .with_server_acl(vec![], vec!["127.0.0.0/8".parse().unwrap()]);
@@ -1794,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief IPv6 권한 서버에도 닿는지. 계열이 바뀌면 소켓을 다시 열어야 한다. */
+    /// A target in another family must reopen the socket.
     fn reactor_reaches_ipv6_authority_like_sync_path() {
         let sock = UdpSocket::bind("[::1]:0").expect("v6 mock bind");
         let root = sock.local_addr().unwrap();
@@ -1849,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief glue 없는 체인이 전체 데드라인을 넘기지 않는지. 자식이 데드라인을 새로 잡으면 무한정 늘어난다. */
+    /// A child that took a fresh deadline would stretch the chain without bound.
     fn reactor_bounds_total_wall_time_of_a_glueless_chain() {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let root = sock.local_addr().unwrap();
@@ -1944,7 +1822,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief glue 없는 네임서버 체인의 깊이가 예산에 묶이는지. */
     fn reactor_bounds_glueless_ns_chain_depth() {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let root = sock.local_addr().unwrap();
@@ -2032,15 +1909,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭을 따라가도 데드라인이 하나로 유지되는지. */
     fn reactor_shares_one_deadline_across_the_alias_chain() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        /** @brief 테스트에서 한 단계마다 늦출 시간. */
         const HOP_DELAY: Duration = Duration::from_millis(100);
 
-        /** @brief 테스트에서 해석 하나에 줄 전체 예산. */
         const SESSION_BUDGET: Duration = Duration::from_millis(300);
 
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
@@ -2135,9 +2009,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNAME 걸음이 예산에 제대로 잡히는지. */
     fn reactor_counts_dname_hops_against_the_dname_limit() {
-        /** @brief 테스트에 쓸 단계 수. */
         const HOPS: usize = 3;
 
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
@@ -2245,7 +2117,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 레인도 내부망 위임을 거부하는지. 동기 경로와 방어가 같아야 한다. */
     fn reactor_refuses_internal_delegation_like_sync_path() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -2288,7 +2159,6 @@ mod tests {
         );
     }
 
-    /** @brief 별칭을 돌려주는 테스트용 서버. */
     fn spawn_mock_authority_with_alias() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("mock bind");
         let addr = sock.local_addr().unwrap();
@@ -2329,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭을 따라간 뒤 합치기 인덱스가 지워지는지. 남으면 다음 요청이 고아 항목에 붙는다. */
+    /// A leftover entry would attach the next request to an orphan.
     fn reactor_clears_singleflight_index_after_cname_chase() {
         let root = spawn_mock_authority_with_alias();
         let recursor = Recursor::new(vec![root], Duration::from_millis(800))
@@ -2382,7 +2252,6 @@ mod tests {
         );
     }
 
-    /** @brief 레인을 한 해석이 끝날 때까지 돌린다. */
     fn drive_one(reactor: &mut Reactor, recursor: &Recursor) -> Option<Message> {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -2409,7 +2278,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림이 위조한 AD 비트를 그대로 흘리지 않는지. */
     fn reactor_never_relays_forged_authentic_data() {
         let root = spawn_mock_authority_forging_ad(true);
         let recursor = Recursor::new(vec![root], Duration::from_millis(800))
@@ -2439,13 +2307,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 느린 서버의 답을 기다리는 동안 다음 서버에도 물어 먼저 온 답을 쓰는지.
-     * @details 동기 경로의 a_slow_server_is_raced_by_the_next_one과 같은 규칙을 레인에서
-     *          확인한다. 첫 서버를 끝까지 기다리면 그 서버의 지연만큼 늦는다.
-     */
+    /// Same rule as the sync path's `a_slow_server_is_raced_by_the_next_one`; waiting out the first
+    /// server would add its whole delay.
     fn reactor_races_a_slow_server_with_the_next_one() {
-        /** @brief 느린 서버가 답을 미루는 시간. 서버당 제한 시간보다 짧아야 한다. */
+        /// Must be shorter than the per-server timeout.
         const SLOW_DELAY: Duration = Duration::from_millis(1500);
         let slow_ip = std::net::Ipv4Addr::new(192, 0, 2, 8);
         let fast_ip = std::net::Ipv4Addr::new(192, 0, 2, 9);
@@ -2480,12 +2345,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 세션 하나가 동시에 기다리는 왕복이 MAX_EXCHANGES_PER_QUERY를 넘지 않는지.
-     * @details 동기 경로의 a_query_waits_on_at_most_two_exchanges_at_once와 같은 규칙을 레인에서
-     *          확인한다. 앞의 두 서버는 답하지 않으므로, 셋째 서버에는 앞의 왕복 하나가 시간을
-     *          넘긴 뒤에야 물어야 한다.
-     */
+    /// Same rule as the sync path's `a_query_waits_on_at_most_two_exchanges_at_once`. The first two
+    /// servers stay silent, so the third is asked only after one of them times out.
     fn reactor_waits_on_at_most_two_exchanges_at_once() {
         let silent = || {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();

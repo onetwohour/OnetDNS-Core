@@ -1,41 +1,33 @@
-/*!
- * @brief 대시보드 로그인 비밀번호 해시.
- *
- * @details PBKDF2-HMAC-SHA256으로 해시한다. 반복 횟수를 저장 형식에 함께 담아,
- *          나중에 늘려도 이전 해시를 그대로 검증할 수 있다.
- * @warning 검증은 CPU를 크게 쓴다. 인증 전에 닿는 경로이므로 동시 실행 수에 상한이 있어야
- *          로그인 시도만으로 서버를 마비시킬 수 없다.
- */
+//! Dashboard password hashing with PBKDF2-HMAC-SHA256. The iteration count is stored in the hash
+//! string, so it can grow later without breaking older hashes.
+//!
+//! Verification is CPU-heavy and reachable before authentication, so concurrent runs are capped;
+//! otherwise login attempts alone could stall the server.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/** @brief PBKDF2의 의사난수 함수. */
 type HmacSha256 = Hmac<Sha256>;
 
-/** @brief 새 해시에 쓸 반복 횟수. */
 const DEFAULT_ITERS: u32 = 600_000;
-/** @brief 받아들일 최소 반복. 이보다 낮은 값이 담긴 해시는 거부한다. */
+/// Stored hashes below this are refused.
 const MIN_ITERS: u32 = 100_000;
-/** @brief 받아들일 최대 반복. 조작된 저장값으로 이 서버의 CPU를 태우지 못하게 한다. */
+/// So a tampered stored value cannot burn this server's CPU.
 const MAX_ITERS: u32 = 1_000_000;
-/** @brief salt 길이. */
 const SALT_LEN: usize = 16;
-/** @brief 파생 키 길이. 해시 출력과 같다. */
 const HLEN: usize = 32;
-/** @brief 받아들일 비밀번호 길이 상한. 긴 입력은 그 자체로 해시 비용이 된다. */
+/// Long input is hashing cost in itself.
 const MAX_PASSWORD_BYTES: usize = 4096;
-/** @brief 동시에 돌릴 수 있는 파생 연산 수. 로그인 시도로 CPU를 다 쓰지 못하게 한다. */
+/// So login attempts cannot take all CPUs.
 const MAX_CONCURRENT_KDF: usize = 4;
-/** @brief 지금 돌고 있는 파생 연산 수. */
 static ACTIVE_KDF: AtomicUsize = AtomicUsize::new(0);
 
-/** @brief 파생 연산 슬롯을 잡았다 놓는 보호자. */
+/// Holds one KDF slot until dropped.
 struct KdfGuard;
 
 impl KdfGuard {
-    /** @brief 슬롯을 잡는다. 이미 꽉 찼으면 잡지 않는다. */
+    /// `None` when every slot is taken.
     fn acquire() -> Option<Self> {
         ACTIVE_KDF
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
@@ -47,28 +39,21 @@ impl KdfGuard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/**
- * @brief 비밀번호 검증 결과.
- * @note 포화와 불일치를 구분한다. 포화를 실패로 합치면 정상 사용자가 남의 부하 때문에
- *       비밀번호가 틀렸다는 답을 받는다.
- */
+/// Saturation and mismatch are kept apart; folding saturation into failure would tell a legitimate
+/// user their password is wrong because of someone else's load.
 pub(crate) enum VerifyResult {
-    /** @brief 맞았다. */
     Match,
-    /** @brief 틀렸다. */
     Mismatch,
-    /** @brief 계산 슬롯이 없어 지금은 확인하지 못한다. */
+    /// No KDF slot free; cannot check right now.
     Busy,
 }
 
 impl Drop for KdfGuard {
-    /** @brief 슬롯을 돌려준다. */
     fn drop(&mut self) {
         ACTIVE_KDF.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/** @brief PBKDF2-HMAC-SHA256. 필요한 만큼 블록을 이어 만든다. */
 fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
     let iters = iters.max(1);
     let blocks = out.len().div_ceil(HLEN);
@@ -93,29 +78,21 @@ fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
     }
 }
 
-/** @brief 새 비밀번호에 요구하는 최소 글자 수. */
 const MIN_PASSWORD_CHARS: usize = 12;
-/**
- * @brief 새 비밀번호에 허용하는 최대 글자 수.
- * @invariant UTF-8 한 글자는 최대 4바이트이므로 이 글자 수는 MAX_PASSWORD_BYTES 를 넘지 않는다.
- *            넘으면 저장은 되지만 검증이 항상 불일치로 답하는 비밀번호가 생긴다.
- */
+/// A UTF-8 character is at most 4 bytes, so this many characters never exceed MAX_PASSWORD_BYTES;
+/// otherwise a password could be stored that always fails verification.
 const MAX_PASSWORD_CHARS: usize = 1024;
 const _: () = assert!(MAX_PASSWORD_CHARS * 4 <= MAX_PASSWORD_BYTES);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 새 비밀번호를 해시하지 못한 이유. */
 pub enum PasswordError {
-    /** @brief 최소 글자 수보다 짧다. */
     TooShort,
-    /** @brief 최대 글자 수보다 길다. */
     TooLong,
-    /** @brief 계산 슬롯이 없어 지금은 해시하지 못한다. */
+    /// No KDF slot free; cannot hash right now.
     Busy,
 }
 
 impl std::fmt::Display for PasswordError {
-    /** @brief 사용자에게 보일 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PasswordError::TooShort => write!(
@@ -133,20 +110,14 @@ impl std::fmt::Display for PasswordError {
     }
 }
 
-/**
- * @brief 새 비밀번호를 해시한다. salt와 반복 횟수를 결과 문자열에 함께 담는다.
- * @details 길이 규칙을 여기서 검사한다. 호출자마다 검사하게 두면 한 곳이 빠졌을 때 로그인할 수
- *          없는 해시가 저장된다. 검증과 같은 동시 실행 상한을 쓴다. 첫 계정 생성은 인증 전에
- *          닿는 경로이기 때문이다.
- */
+/// Stores salt and iteration count in the result. Length rules are checked here; left to each
+/// caller, one forgotten check would store a hash nobody can sign in with. Shares the verification
+/// concurrency cap, since creating the first account is reachable before authentication.
 pub fn hash_password(pw: &str) -> Result<String, PasswordError> {
     hash_password_with_acquire(pw, KdfGuard::acquire)
 }
 
-/**
- * @brief 슬롯 잡기 방식을 주입받아 해시한다.
- * @param acquire 슬롯 잡기 방식. 테스트에서 포화 상황을 만들 때 교체한다.
- */
+/// `acquire` is replaced in tests to simulate saturation.
 fn hash_password_with_acquire(
     pw: &str,
     acquire: impl FnOnce() -> Option<KdfGuard>,
@@ -156,10 +127,7 @@ fn hash_password_with_acquire(
     Ok(derive_password_hash(pw))
 }
 
-/**
- * @brief 새 비밀번호가 길이 규칙을 지키는지 본다.
- * @details hash_password 도 같은 검사를 한다. 값비싼 검증을 하기 전에 먼저 거르려는 호출자가 쓴다.
- */
+/// hash_password checks the same; for callers that want to reject early, before expensive work.
 pub fn check_new_password(pw: &str) -> Result<(), PasswordError> {
     let chars = pw.chars().count();
     if chars < MIN_PASSWORD_CHARS {
@@ -171,7 +139,7 @@ pub fn check_new_password(pw: &str) -> Result<(), PasswordError> {
     Ok(())
 }
 
-/** @brief 길이 규칙 없이 해시 문자열을 만든다. */
+/// Without the length rules.
 fn derive_password_hash(pw: &str) -> String {
     let salt = onetdns_core::rng::random_array::<SALT_LEN>();
     let mut dk = [0u8; HLEN];
@@ -184,11 +152,8 @@ fn derive_password_hash(pw: &str) -> String {
     )
 }
 
-/**
- * @brief 저장된 해시와 비교한다. 슬롯 잡기 방식을 주입받는다.
- * @details 저장값의 반복 횟수가 허용 범위 안인지 먼저 본다. 비교는 상수 시간이다.
- * @param acquire 슬롯 잡기 방식. 테스트에서 포화 상황을 만들 때 교체한다.
- */
+/// Checks that the stored iteration count is in range first; the comparison is constant-time.
+/// `acquire` is replaced in tests to simulate saturation.
 fn verify_password_with_acquire(
     pw: &str,
     stored: &str,
@@ -234,24 +199,21 @@ fn verify_password_with_acquire(
     }
 }
 
-/** @brief 검증하고 포화 여부까지 구분해 돌려준다. */
 pub(crate) fn verify_password_result(pw: &str, stored: &str) -> VerifyResult {
     verify_password_with_acquire(pw, stored, KdfGuard::acquire)
 }
 
-/** @brief 검증 결과를 참거짓으로만 돌려준다. 포화는 거짓이다. */
+/// Saturation counts as false.
 pub fn verify_password(pw: &str, stored: &str) -> bool {
     verify_password_result(pw, stored) == VerifyResult::Match
 }
 
-/** @brief 새 세션 토큰. 예측할 수 없어야 하므로 난수에서 만든다. */
+/// From the RNG, so it cannot be predicted.
 pub(crate) fn new_session_token() -> String {
     hex(&onetdns_core::rng::random_array::<32>())
 }
 
-/** @brief 바이트를 소문자 16진 문자열로. */
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    /** @brief 16진 문자표. */
     const H: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -261,7 +223,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/** @brief 16진 문자열을 바이트로. 형식이 어긋나면 None. */
 fn unhex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
@@ -282,10 +243,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/**
- * @brief 상수 시간 비교.
- * @warning 조기 반환을 넣지 마라. 걸린 시간으로 옳은 해시를 한 바이트씩 알아낼 수 있다.
- */
+/// Constant-time. Do not add an early return: timing would reveal the right hash byte by byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -298,15 +256,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-/** @brief 해시 왕복, 형식 거부, 그리고 포화와 불일치의 구분. */
 mod tests {
     use super::*;
 
-    /**
-     * @brief 포화를 지나 실제 판정이 나올 때까지 다시 시도한다.
-     * @details 동시 허가는 프로세스 전역이라 같은 실행에서 로그인하는 다른 테스트와 곳을
-     *          다툰다. 한 번만 부르면 판정이 아니라 혼잡을 재게 된다.
-     */
+    /// Retries past saturation until a real verdict. KDF slots are process-wide and shared with
+    /// other tests that sign in during the same run; a single call would measure contention, not
+    /// the verdict.
     fn verify_result_eventually(pw: &str, stored: &str) -> VerifyResult {
         loop {
             match verify_password_with_acquire(pw, stored, KdfGuard::acquire) {
@@ -316,7 +271,6 @@ mod tests {
         }
     }
 
-    /** @brief 포화로 실패하면 잠시 뒤 다시 시도해 실제 판정을 얻는다. */
     fn verify_password_eventually(pw: &str, stored: &str) -> bool {
         loop {
             match verify_password_result(pw, stored) {
@@ -327,7 +281,6 @@ mod tests {
         }
     }
 
-    /** @brief 포화로 실패하면 잠시 뒤 다시 시도해 해시를 얻는다. */
     fn hash_password_eventually(pw: &str) -> Result<String, PasswordError> {
         loop {
             match hash_password(pw) {
@@ -338,7 +291,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 해시한 비밀번호가 다시 검증되는지. */
     fn hash_verify_roundtrip() {
         let h = hash_password_eventually("correct horse battery staple").unwrap();
         assert!(h.starts_with("pbkdf2-sha256$600000$"));
@@ -350,7 +302,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 비밀번호라도 salt가 달라 해시가 달라지는지. */
     fn distinct_salts_distinct_hashes() {
         let a = derive_password_hash("same");
         let b = derive_password_hash("same");
@@ -360,11 +311,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 길이 규칙을 글자 수로 적용하고, 허용한 비밀번호는 모두 로그인에 쓸 수 있는지.
-     * @details 저장만 되고 로그인할 수 없는 계정이 생기면 첫 계정 생성 뒤 복구할 길이 없다.
-     *          가장 긴 비밀번호를 4바이트 문자로 채워 바이트 수가 가장 큰 경우를 확인한다.
-     */
+    /// A stored account that cannot sign in has no recovery after the first account is created. The
+    /// longest password is filled with 4-byte characters to check the largest byte count.
     fn every_accepted_password_can_sign_in() {
         assert_eq!(
             hash_password_eventually("elevenchars"),
@@ -381,7 +329,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 해시 생성도 검증과 같은 동시 실행 상한을 받는지. */
     fn hashing_respects_the_kdf_limit() {
         assert_eq!(
             hash_password_with_acquire("correct horse battery staple", || None),
@@ -390,7 +337,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 형식이 깨진 저장값을 거부하는지. */
     fn rejects_malformed() {
         assert!(!verify_password("x", "not-a-hash"));
         assert!(!verify_password("x", "pbkdf2-sha256$abc$00$00"));
@@ -398,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief PBKDF2 구현을 공표된 벡터에 대조한다. */
+    /// Checks PBKDF2 against a published vector.
     fn pbkdf2_rfc_style_vector() {
         let mut dk = [0u8; 32];
         pbkdf2(b"password", b"salt", 1, &mut dk);
@@ -409,7 +355,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 16진 왕복. */
     fn hex_unhex_roundtrip() {
         let b = [0x00u8, 0x1f, 0xa0, 0xff];
         assert_eq!(hex(&b), "001fa0ff");
@@ -419,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 반복 횟수가 범위 밖인 저장값을 거부하는지. 조작된 값으로 CPU를 태울 수 없다. */
+    /// A tampered value must not burn CPU.
     fn rejects_unbounded_work_parameters() {
         assert!(!verify_password("x", "pbkdf2-sha256$4294967295$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000"));
         assert!(!verify_password("x", "pbkdf2-sha256$100000$00$00"));
@@ -432,7 +377,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 포화와 불일치를 구분해 알리는지. */
     fn reports_kdf_saturation_separately_from_a_wrong_password() {
         let hash = derive_password_hash("correct");
         assert_eq!(

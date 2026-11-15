@@ -1,10 +1,8 @@
-/*!
- * @brief 주소 검증용 Retry와 토큰.
- *
- * @details 연결을 열기 전에 클라이언트가 그 주소에 실제로 있는지 확인한다. 확인하지
- *          않으면 출발지를 속인 요청 하나로 이쪽이 남에게 큰 응답을 보내는 증폭이 된다.
- * @warning 토큰은 인증돼야 한다. 클라이언트가 내용을 지어낼 수 있으면 검증 자체가 무의미하다.
- */
+//! Retry packets and address validation tokens. Before a connection opens, the client shows it can
+//! receive at its address, so a spoofed source cannot make this side send large replies to someone
+//! else.
+//!
+//! Tokens are authenticated; a client that could forge one would skip validation.
 
 use std::net::IpAddr;
 
@@ -13,48 +11,40 @@ use sha2::{Digest, Sha256};
 use crate::packet::{ptype, VERSION_1};
 use crate::protect::Aead;
 
-/** @brief 토큰 형식 버전. 형식을 바꾸면 올린다. */
+/// Bump when the token format changes.
 const TOKEN_VERSION: u8 = 1;
-/** @brief 토큰 유효 기간. 짧게 잡아 재사용할 수 있는 시간을 좁힌다. */
+/// Short, to narrow the window for reuse.
 const TOKEN_TTL_SECS: u64 = 30;
-/** @brief 토큰 인증 태그 길이. */
 const TOKEN_TAG_LEN: usize = 16;
-/** @brief Retry 무결성 태그 키. 규격이 정한 고정값이다. */
+/// Fixed by RFC 9001.
 const RETRY_INTEGRITY_KEY: [u8; 16] = [
     0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 ];
-/** @brief Retry 무결성 태그 논스. 규격이 정한 고정값이다. */
+/// Fixed by RFC 9001.
 const RETRY_INTEGRITY_NONCE: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
 #[derive(Clone)]
-/** @brief 토큰 발급과 검증에 쓰는 비밀. 프로세스마다 새로 만든다. */
+/// Issues and checks tokens; generated per process.
 pub struct RetryKey([u8; 32]);
 
-/** @brief Initial 패킷 헤더에서 추출한 것들. */
+/// Fields read from an Initial packet before decryption.
 pub struct InitialHeader<'a> {
-    /** @brief 받는 쪽 연결 식별자. */
     pub dcid: &'a [u8],
-    /** @brief 보내는 쪽 연결 식별자. */
     pub scid: &'a [u8],
-    /** @brief 실려 온 재시도 토큰. */
     pub token: &'a [u8],
 }
 
 impl RetryKey {
-    /** @brief 새 비밀을 만든다. */
     pub fn generate() -> Self {
         let mut key = [0u8; 32];
         onetdns_tls::sys::fill_random(&mut key);
         Self(key)
     }
 
-    /**
-     * @brief 이 주소와 식별자에 묶인 토큰을 발급한다.
-     * @details 주소, 원래 식별자, 시각을 담고 그 전체를 인증한다. 다른 주소에서 재사용하면
-     *          검증에서 걸린다.
-     */
+    /// Binds the token to the client address, the original connection ID, and the time, and
+    /// authenticates all of it.
     pub fn issue(&self, ip: IpAddr, odcid: &[u8], retry_scid: &[u8], now: u64) -> Vec<u8> {
         let mut token = Vec::with_capacity(64);
         token.push(TOKEN_VERSION);
@@ -69,10 +59,7 @@ impl RetryKey {
         token
     }
 
-    /**
-     * @brief 토큰이 이 주소와 지금 시각에 유효한지 확인한다.
-     * @return 유효하면 원래 목적지 식별자. 이것이 있어야 이후 핸드셰이크가 이어진다.
-     */
+    /// Returns the original destination connection ID when the token is valid for this address now.
     pub fn validate(&self, token: &[u8], ip: IpAddr, dcid: &[u8], now: u64) -> Option<Vec<u8>> {
         if token.len() < 1 + 8 + 1 + 4 + 1 + 1 + TOKEN_TAG_LEN {
             return None;
@@ -116,7 +103,6 @@ impl RetryKey {
     }
 }
 
-/** @brief Initial 패킷에서 식별자와 토큰을 추출한다. 아직 복호화하지 않은 상태다. */
 pub fn parse_initial_header(packet: &[u8]) -> Option<InitialHeader<'_>> {
     let first = *packet.first()?;
     if first & 0xc0 != 0xc0 || ((first & 0x30) >> 4) != ptype::INITIAL {
@@ -135,10 +121,8 @@ pub fn parse_initial_header(packet: &[u8]) -> Option<InitialHeader<'_>> {
     pos += dcid_len;
     let scid_len = *packet.get(pos)? as usize;
     pos += 1;
-    /*
-     * 클라이언트는 길이 0인 출발지 연결 식별자를 쓸 수 있고 msquic 이 기본으로 그렇게 한다.
-     * 여기서 막으면 그런 클라이언트의 Initial 을 조용히 버려 연결이 끝내 열리지 않는다.
-     */
+    // A zero-length source connection ID is valid and msquic uses one by default; rejecting it
+    // would drop those clients' Initial packets silently.
     if scid_len > 20 {
         return None;
     }
@@ -154,7 +138,6 @@ pub fn parse_initial_header(packet: &[u8]) -> Option<InitialHeader<'_>> {
     Some(InitialHeader { dcid, scid, token })
 }
 
-/** @brief Retry 패킷을 만든다. 무결성 태그가 원래 식별자에 묶인다. */
 pub fn build_retry(odcid: &[u8], client_scid: &[u8], retry_scid: &[u8], token: &[u8]) -> Vec<u8> {
     let mut packet =
         Vec::with_capacity(7 + client_scid.len() + retry_scid.len() + token.len() + 16);
@@ -174,11 +157,8 @@ pub fn build_retry(odcid: &[u8], client_scid: &[u8], retry_scid: &[u8], token: &
     packet
 }
 
-/**
- * @brief Retry 패킷의 무결성 태그를 확인한다.
- * @warning 태그가 원래 목적지 식별자에 묶여 있다. 확인하지 않으면 중간자가 Retry를 지어내
- *          연결을 자기 쪽으로 돌릴 수 있다.
- */
+/// The tag shows the sender saw the client's Initial; without this check, an off-path attacker
+/// could inject a Retry.
 pub(crate) fn verify_integrity(odcid: &[u8], packet: &[u8]) -> bool {
     if packet.len() < 16 {
         return false;
@@ -192,7 +172,6 @@ pub(crate) fn verify_integrity(odcid: &[u8], packet: &[u8]) -> bool {
     ct_eq(tag, &expected)
 }
 
-/** @brief 주소를 토큰에 담을 형태로 쓴다. */
 fn encode_ip(out: &mut Vec<u8>, ip: IpAddr) {
     match ip {
         IpAddr::V4(ip) => {
@@ -206,7 +185,6 @@ fn encode_ip(out: &mut Vec<u8>, ip: IpAddr) {
     }
 }
 
-/** @brief 토큰에서 주소를 읽는다. */
 fn decode_ip(input: &[u8]) -> Option<(IpAddr, usize)> {
     match *input.first()? {
         4 => Some((
@@ -225,7 +203,6 @@ fn decode_ip(input: &[u8]) -> Option<(IpAddr, usize)> {
     }
 }
 
-/** @brief HMAC-SHA-256. 토큰 인증에 쓴다. */
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut block = [0u8; 64];
     if key.len() > block.len() {
@@ -249,10 +226,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-/**
- * @brief 상수 시간 비교.
- * @warning 태그 비교에 쓴다. 조기 반환을 넣으면 걸린 시간으로 옳은 태그를 알아낼 수 있다.
- */
+/// Constant time; an early return would let timing reveal the tag.
 fn ct_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -264,12 +238,10 @@ fn ct_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-/** @brief 무결성 태그를 규격 벡터에 대조하고, 토큰이 주소·식별자·시각에 묶이는지 본다. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief Retry 무결성 태그를 규격 부록 벡터와 비교한다. */
     fn rfc9001_a4_retry_integrity_vector() {
         let odcid: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
         let packet: Vec<u8> = vec![
@@ -284,7 +256,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 토큰이 주소·식별자·시각에 묶이고 위조되지 않는지. */
     fn token_binds_ip_cid_time_and_authentication() {
         let key = RetryKey([7; 32]);
         let ip: IpAddr = "192.0.2.10".parse().unwrap();
@@ -304,7 +275,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 태그가 원래 목적지 식별자에 묶이는지. 묶이지 않으면 Retry를 지어낼 수 있다. */
     fn retry_packet_integrity_binds_original_destination_cid() {
         let mut packet = build_retry(b"original", b"client", b"server", b"token");
         assert!(verify_integrity(b"original", &packet));
@@ -314,11 +284,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 출발지 연결 식별자가 길이 0인 Initial 을 받아들이는지.
-     * @details msquic 을 쓰는 클라이언트가 이렇게 보낸다. 거부하면 리스너가 그 Initial 을
-     *          조용히 버려 핸드셰이크가 시간 초과로 끝난다.
-     */
+    /// msquic clients send this.
     fn initial_header_accepts_zero_length_source_connection_id() {
         let mut packet = vec![0xc0];
         packet.extend_from_slice(&VERSION_1.to_be_bytes());

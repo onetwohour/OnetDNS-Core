@@ -1,46 +1,36 @@
-/*!
- * @brief LMDB 파일에서 zone을 읽는 백엔드.
- *
- * @details liblmdb를 링크하지 않고 파일 형식을 직접 읽는다. 쓰기는 하지 않으므로 트랜잭션도
- *          잠금도 필요 없고, 메타 페이지에서 최신 트리를 골라 B+tree를 훑기만 하면 된다.
- * @warning 파일 내용은 이 서버가 만든 것이 아니다. 모든 오프셋을 경계 검사하고, 페이지
- *          번호가 순환하는 트리에도 걸리지 않아야 한다.
- */
+//! Reads zones from an LMDB file by parsing the file format directly, without linking liblmdb.
+//! Read-only, so no transactions or locks: pick the newest tree from the meta pages and walk the
+//! B+tree.
+//!
+//! The file is not written by this server: every offset is bounds-checked, and trees whose page
+//! numbers form a cycle must not trap the reader.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::source::{read_file_limited, ZoneSource};
 use crate::{parse_zone, ZoneStore};
-/** @brief 전부 읽어 들일 DB 파일 크기 상한. */
+/// The file is read whole.
 const MAX_DATABASE_FILE: u64 = 512 * 1024 * 1024;
 
-/** @brief 메타 페이지 식별자. */
 const META_MAGIC: u32 = 0xBEEF_C0DE;
-/** @brief 내부 노드 페이지. */
 const P_BRANCH: u16 = 0x01;
-/** @brief 리프 페이지. 실제 키와 값이 여기 있다. */
 const P_LEAF: u16 = 0x02;
-/** @brief 페이지 하나에 담기지 않는 큰 값이 놓인 페이지. */
 const P_OVERFLOW: u16 = 0x04;
-/** @brief 메타 페이지. */
 const P_META: u16 = 0x08;
-/** @brief 노드의 값이 추가 페이지에 있음을 뜻하는 플래그. */
+/// The node's value is on overflow pages.
 const F_BIGDATA: u16 = 0x01;
 
-/** @brief LMDB 파일을 zone 공급자로 쓴다. 키가 origin, 값이 zone 텍스트다. */
+/// Keys are origins, values zone text.
 pub struct LmdbZoneSource {
-    /** @brief DB 파일 경로. */
     pub path: PathBuf,
 }
 
 impl LmdbZoneSource {
-    /** @brief 파일 경로로 만든다. */
     pub fn new(path: impl Into<PathBuf>) -> Self {
         LmdbZoneSource { path: path.into() }
     }
 
-    /** @brief DB 파일의 수정 시각. */
     fn file_mtime(&self) -> Option<SystemTime> {
         std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -49,7 +39,7 @@ impl LmdbZoneSource {
 }
 
 impl ZoneSource for LmdbZoneSource {
-    /** @brief 모든 키-값 쌍을 읽어 각각 zone으로 파싱한다. 빈 키는 루트를 뜻한다. */
+    /// An empty key is the root.
     fn load(&self) -> Result<ZoneStore, String> {
         let data = read_file_limited(&self.path, MAX_DATABASE_FILE, "database")?;
         let pairs = read_all(&data)?;
@@ -74,22 +64,19 @@ impl ZoneSource for LmdbZoneSource {
         Ok(store)
     }
 
-    /** @brief 수정 시각을 못 읽으면 바뀐 것으로 본다. 갱신을 놓치는 쪽이 더 나쁘다. */
+    /// An unreadable time counts as changed; missing an update is worse.
     fn changed_since(&self, last: SystemTime) -> bool {
         self.file_mtime().map(|m| m > last).unwrap_or(true)
     }
 
-    /** @brief 공급자 설명. */
     fn describe(&self) -> String {
         format!("lmdb({})", self.path.display())
     }
 }
 
-/** @brief 경계 검사를 곁들인 16비트 리틀엔디언 읽기. */
 fn u16le(d: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*d.get(o)?, *d.get(o + 1)?]))
 }
-/** @brief 경계 검사를 곁들인 32비트 리틀엔디언 읽기. */
 fn u32le(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes([
         *d.get(o)?,
@@ -98,7 +85,6 @@ fn u32le(d: &[u8], o: usize) -> Option<u32> {
         *d.get(o + 3)?,
     ]))
 }
-/** @brief 경계 검사를 곁들인 64비트 리틀엔디언 읽기. */
 fn u64le(d: &[u8], o: usize) -> Option<u64> {
     let mut v = 0u64;
     for k in 0..8 {
@@ -107,13 +93,9 @@ fn u64le(d: &[u8], o: usize) -> Option<u64> {
     Some(v)
 }
 
-/**
- * @brief 페이지 크기를 알아낸다.
- * @details 파일 형식에 페이지 크기가 적혀 있지 않아, 두 번째 메타 페이지가 놓일 만한
- *          후보를 흔한 순서로 테스트한다. 흔한 값을 먼저 봐야 잘못된 위치를 메타로
- *          오인할 확률이 준다.
- * @return 찾지 못하면 가장 흔한 4096으로 진행한다. 틀렸다면 이후 경계 검사에서 걸린다.
- */
+/// The file does not record its page size, so candidate offsets for the second meta page are tried,
+/// most common first, which lowers the chance of mistaking another page for a meta page. Falls back
+/// to 4096 when none matches; a wrong guess fails the bounds checks later.
 fn detect_psize(data: &[u8]) -> Result<usize, String> {
     if u32le(data, 16) != Some(META_MAGIC) {
         return Err("The first page identifier of the LMDB metadata file is invalid".into());
@@ -130,16 +112,12 @@ fn detect_psize(data: &[u8]) -> Result<usize, String> {
     Ok(4096)
 }
 
-/** @brief 메타 페이지가 가리키는 주 데이터베이스. */
 struct Db {
-    /** @brief B+tree 루트 페이지 번호. u64::MAX면 빈 트리다. */
+    /// u64::MAX is an empty tree.
     root: u64,
 }
 
-/**
- * @brief 메타 페이지에서 트랜잭션 번호와 루트를 읽는다.
- * @return 메타 페이지가 아니거나 식별자가 틀리면 None.
- */
+/// Transaction ID and root; None unless it is a meta page with the right magic.
 fn parse_meta(page: &[u8]) -> Option<(u64, Db)> {
     let flags = u16le(page, 10)?;
     if flags & P_META == 0 {
@@ -155,11 +133,8 @@ fn parse_meta(page: &[u8]) -> Option<(u64, Db)> {
     Some((txnid, Db { root }))
 }
 
-/**
- * @brief 파일 전체에서 키-값 쌍을 모두 읽는다.
- * @details 메타 페이지가 둘인 이유는 갱신이 번갈아 쓰이기 때문이다. 트랜잭션 번호가 큰
- *          쪽이 최신이며, 그쪽을 골라야 쓰다 만 상태를 읽지 않는다.
- */
+/// Two meta pages alternate between commits; the one with the larger transaction ID is newest, and
+/// choosing it avoids a half-written state.
 fn read_all(data: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
     let psize = detect_psize(data)?;
     let meta0 = parse_meta(&data[0..]).ok_or("Could not parse the page 0 metadata")?;
@@ -180,21 +155,14 @@ fn read_all(data: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
     Ok(out)
 }
 
-/** @brief 페이지 번호로 그 페이지 조각을 얻는다. 곱셈 넘침과 범위를 모두 검사한다. */
+/// Checks multiplication overflow and range.
 fn page_at(data: &[u8], psize: usize, pgno: u64) -> Option<&[u8]> {
     let start = (pgno as usize).checked_mul(psize)?;
     data.get(start..start + psize)
 }
 
-/**
- * @brief B+tree를 훑어 리프의 키-값을 모은다.
- *
- * @details 재귀지만 두 겹으로 막혀 있다. 방문한 페이지 번호를 기억해 순환을 끊고, 깊이
- *          상한으로 정상 트리보다 깊어지는 것을 막는다. 조작된 파일은 자기 자신을
- *          가리키는 페이지로 무한 재귀를 만들 수 있다.
- * @param visited 이미 방문한 페이지 번호. 순환 방지의 핵심이다.
- * @param depth   현재 깊이.
- */
+/// Recursive, with two guards: visited page numbers break cycles, and a depth cap stops trees
+/// deeper than any real one. A crafted file can point a page at itself to recurse forever.
 fn walk(
     data: &[u8],
     psize: usize,
@@ -249,11 +217,8 @@ fn walk(
     Ok(())
 }
 
-/**
- * @brief 추가 페이지에 놓인 큰 값을 읽는다.
- * @note 대상 페이지가 정말 추가 데이터 페이지인지 확인한다. 확인하지 않으면 임의 페이지
- *       번호로 파일의 다른 곳을 값으로 읽어 낼 수 있다.
- */
+/// Checks the target really is an overflow page; otherwise an arbitrary page number would read
+/// another part of the file as the value.
 fn read_overflow(data: &[u8], psize: usize, pgno: u64, dsize: usize) -> Result<Vec<u8>, String> {
     let page = page_at(data, psize, pgno).ok_or("Overflow page number is out of range")?;
     let flags = u16le(page, 10).ok_or("Invalid overflow page header")?;
@@ -267,16 +232,13 @@ fn read_overflow(data: &[u8], psize: usize, pgno: u64, dsize: usize) -> Result<V
         .ok_or("Overflow data exceeds the size limit".into())
 }
 
-/** @brief 최소 LMDB 이미지를 손으로 만들어 형식 해석을 고정한다. */
+/// Builds minimal LMDB images by hand to pin format handling.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /**
-     * @brief 메타 두 장과 리프 한 장으로 이뤄진 최소 LMDB 이미지를 만든다.
-     * @details 노드는 페이지 뒤쪽부터 채우고 포인터 배열은 앞쪽에서 자란다. 실제 형식과
-     *          같은 배치라야 파서를 제대로 테스트한다.
-     */
+    /// Two meta pages and one leaf. Nodes fill from the end of the page and the pointer array grows
+    /// from the front, the real layout, so the parser is tested properly.
     fn build_lmdb(entries: &[(&str, &str)]) -> Vec<u8> {
         let psize = 4096usize;
         let mut file = vec![0u8; psize * 3];
@@ -327,7 +289,6 @@ mod tests {
         file
     }
 
-    /** @brief 페이지 크기 판별과 리프 노드 읽기가 순서까지 맞는지. */
     #[test]
     fn detect_and_read_leaf_entries() {
         let img = build_lmdb(&[("a.test", "zoneA"), ("b.test", "zoneB-longer-text")]);
@@ -340,14 +301,13 @@ mod tests {
         assert_eq!(pairs[1].1, b"zoneB-longer-text");
     }
 
-    /** @brief 메타가 둘일 때 트랜잭션 번호가 큰 쪽을 고르는지. 쓰다 만 상태를 읽지 않는다. */
+    /// Otherwise a half-written state would be read.
     #[test]
     fn picks_higher_txnid_meta() {
         let img = build_lmdb(&[("x.test", "z")]);
         assert_eq!(read_all(&img).unwrap().len(), 1);
     }
 
-    /** @brief DB에서 꺼낸 값이 실제 zone으로 파싱되는지. 키가 origin으로 쓰인다. */
     #[test]
     fn full_zone_roundtrip() {
         let zone = "$ORIGIN ex.lmdb.\n$TTL 300\n@ IN SOA ns1 admin 1 300 60 86400 60\n@ IN NS ns1\nns1 IN A 10.0.0.9\nwww IN A 10.0.0.10\n";
@@ -364,7 +324,6 @@ mod tests {
         let _ = src.describe();
     }
 
-    /** @brief LMDB가 아닌 파일을 전부 거부하는지. */
     #[test]
     fn bad_magic_rejected() {
         let img = vec![0u8; 4096 * 2];

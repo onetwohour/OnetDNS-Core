@@ -1,23 +1,18 @@
-/*!
- * @brief 밖에서 들어오는 것을 읽는 파서들이 어떤 바이트열에도 패닉하지 않는지.
- *
- * @details 시드를 조금씩 망가뜨려 수백만 번 넣는다. 시드를 두는 이유는 완전한 난수는
- *          거의 첫 검사에서 걸려 정작 깊은 코드에 닿지 않기 때문이다.
- * @warning 패닉하면 그 자리에서 멈추고 다시 만들 수 있는 입력을 그대로 찍는다. 찍지
- *          않으면 몇 번째 반복이었는지만 남아 재현할 수 없다.
- * @note 반복 횟수는 환경 변수로 정한다. 개발 중에는 짧게, CI에서는 백만 번 돌린다.
- */
+//! Parsers of external input must not panic on any bytes. Seeds are mutated and fed in repeatedly;
+//! pure random input fails the first check and never reaches deeper code.
+//!
+//! A panic prints the input that caused it, so it can be reproduced. An environment variable sets
+//! the iteration count.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 
-/** @brief 지금 넣고 있는 입력. 패닉했을 때 찍기 위해 둔다. */
+/// The input being fed, printed if it panics.
 static CAP: Mutex<String> = Mutex::new(String::new());
 
-/** @brief 시드에서 되풀이 가능한 난수. 같은 시드면 같은 순서가 나온다. */
+/// Deterministic from its seed.
 struct Rng(u64);
 impl Rng {
-    /** @brief 다음 난수. */
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
@@ -25,7 +20,6 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    /** @brief 이 값보다 작은 수 하나. */
     fn below(&mut self, n: usize) -> usize {
         if n == 0 {
             0
@@ -33,11 +27,9 @@ impl Rng {
             (self.next() % n as u64) as usize
         }
     }
-    /** @brief 바이트 하나. */
     fn byte(&mut self) -> u8 {
         (self.next() & 0xff) as u8
     }
-    /** @brief 만들 입력의 길이. */
     fn len(&mut self) -> usize {
         match self.below(10) {
             0..=5 => self.below(64),
@@ -45,14 +37,12 @@ impl Rng {
             _ => self.below(1500),
         }
     }
-    /** @brief 아무 바이트열. */
     fn rand_bytes(&mut self) -> Vec<u8> {
         let n = self.len();
         (0..n).map(|_| self.byte()).collect()
     }
 }
 
-/** @brief 바이트열을 16진 문자열로. 재현용으로 찍는다. */
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b.iter().take(512) {
@@ -64,16 +54,10 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-/** @brief 어떤 분류를 몇 번 돌렸는지. */
 struct Rec {
-    /** @brief 패닉한 분류들. */
     fails: Vec<String>,
 }
 impl Rec {
-    /**
-     * @brief 입력 하나를 파서에 넣는다.
-     * @warning 넣기 전에 입력을 남겨 둔다. 패닉하면 그 입력을 그대로 찍어야 재현할 수 있다.
-     */
     fn run<F: FnOnce()>(&mut self, cat: &str, input: &[u8], f: F) {
         CAP.lock().unwrap().clear();
         if panic::catch_unwind(AssertUnwindSafe(f)).is_err() && self.fails.len() < 30 {
@@ -87,7 +71,6 @@ impl Rec {
     }
 }
 
-/** @brief 시드를 조금씩 망가뜨린다. 완전한 난수는 첫 검사에서 걸려 깊은 코드에 닿지 못한다. */
 fn havoc(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
     let mut b = seed.to_vec();
     for _ in 0..1 + rng.below(10) {
@@ -121,7 +104,6 @@ fn havoc(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
     b
 }
 
-/** @brief 질의 시드. */
 fn dns_query_seed() -> Vec<u8> {
     vec![
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 3, b'w', b'w',
@@ -129,7 +111,6 @@ fn dns_query_seed() -> Vec<u8> {
         0x00, 0x01,
     ]
 }
-/** @brief 응답 시드. */
 fn dns_response_seed() -> Vec<u8> {
     vec![
         0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 3, b'w', b'w',
@@ -139,7 +120,7 @@ fn dns_response_seed() -> Vec<u8> {
     ]
 }
 
-/** @brief 형태는 갖췄지만 값이 어긋난 DNS 메시지. */
+/// Valid shape, wrong values.
 fn dns_structured(rng: &mut Rng) -> Vec<u8> {
     let mut b = rng.next().to_be_bytes()[..4].to_vec();
     for _ in 0..4 {
@@ -156,7 +137,7 @@ fn dns_structured(rng: &mut Rng) -> Vec<u8> {
     b
 }
 
-/** @brief 형태는 갖췄지만 값이 어긋난 TLS 레코드. */
+/// Valid shape, wrong values.
 fn tls_record(rng: &mut Rng) -> Vec<u8> {
     let mut b = vec![if rng.below(4) == 0 {
         rng.byte()
@@ -176,7 +157,7 @@ fn tls_record(rng: &mut Rng) -> Vec<u8> {
     b
 }
 
-/** @brief 형태는 갖췄지만 값이 어긋난 TLS 핸드셰이크. */
+/// Valid shape, wrong values.
 fn tls_handshake(rng: &mut Rng) -> Vec<u8> {
     let mut b = vec![if rng.below(4) == 0 {
         rng.byte()
@@ -195,7 +176,7 @@ fn tls_handshake(rng: &mut Rng) -> Vec<u8> {
     b
 }
 
-/** @brief 형태는 갖췄지만 값이 어긋난 HTTP/2 프레임. */
+/// Valid shape, wrong values.
 fn http2_frame(rng: &mut Rng) -> Vec<u8> {
     let l = if rng.below(3) == 0 {
         rng.below(0xff_ffff)
@@ -216,7 +197,7 @@ fn http2_frame(rng: &mut Rng) -> Vec<u8> {
     b
 }
 
-/** @brief 형태는 갖췄지만 값이 어긋난 QUIC 프레임. */
+/// Valid shape, wrong values.
 fn quic_frame(rng: &mut Rng) -> Vec<u8> {
     let mut b = vec![if rng.below(4) == 0 {
         rng.byte()
@@ -250,14 +231,12 @@ fn quic_frame(rng: &mut Rng) -> Vec<u8> {
     b
 }
 
-/** @brief 프록시 프로토콜 v1 시드. */
 const PROXY_V1_SEED: &[u8] = b"PROXY TCP4 192.168.0.1 10.0.0.1 56324 443\r\nDNSDATA";
-/** @brief 프록시 프로토콜 v2의 첫 바이트들. */
 const PROXY_V2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
-/** @brief 형태는 갖췄지만 값이 어긋난 프록시 헤더. */
+/// Valid shape, wrong values.
 fn proxy_prologue(rng: &mut Rng) -> Vec<u8> {
     match rng.below(5) {
         0 => havoc(rng, PROXY_V1_SEED),
@@ -284,26 +263,20 @@ fn proxy_prologue(rng: &mut Rng) -> Vec<u8> {
     }
 }
 
-/** @brief 영역 파일 시드. */
 const ZONE_SEED: &str = "$ORIGIN example.com.\n$TTL 3600\n@ IN SOA ns1.example.com. admin.example.com. (2024010101 7200 3600 1209600 3600)\n@ IN NS ns1.example.com.\nwww IN A 93.184.216.34\nwww IN AAAA 2606:2800:220:1:248:1893:25c8:1946\nmail IN MX 10 mail.example.com.\ntxt IN TXT \"v=spf1 -all\"\n_sip._tcp IN SRV 0 5 5060 sipserver.example.com.\n";
-/** @brief 설정 파일 시드. */
 const CONFIG_SEED: &str = "listen = [\"127.0.0.1:53\"]\ncache_size = 10000\nupstreams = [\"udp://1.1.1.1:53\", \"tls://8.8.8.8:853\"]\nacl_allow = [\"10.0.0.0/8\"]\nblocklist_urls = [\"https://example.com/list.txt\"]\nrecursion_limit = 16\n\n[[zones]]\norigin = \"example.com\"\nfile = \"/etc/zones/example.com\"\n";
 
-/** @brief 차단 규칙 시드. */
 const RULES_SEED: &str = "! Title: seed\n||ads.example.com^\n@@||ok.ads.example.com^$important\n||track.example^$dnsrewrite=NOERROR;A;127.0.0.1\n||c.example^$client=10.0.0.0/8,denyallow=a.example\n||d.example^$ctag=device_pc|user_admin\n||e.example^$dnstype=~A|AAAA,badfilter\n0.0.0.0 bad.example\n127.0.0.1 tracker.example other.example\n/^ad[0-9]+\\.example$/\n||f.example^$important,third-party\n";
 
-/** @brief 정책 플러그인 시드. */
 const WASM_SEED: &[u8] = &[
     0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F, 0x03,
     0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x0A, 0x01, 0x06, 0x6D, 0x65, 0x6D, 0x6F,
     0x72, 0x79, 0x02, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2A, 0x0B,
 ];
 
-/** @brief 영역 형식 차단 목록 시드. */
 const RPZ_SEED: &str = "$ORIGIN rpz.example.\n@ SOA ns1.rpz.example. a.rpz.example. 1 2 3 4 5\nbad.example CNAME .\nnodata.example CNAME *.\npassthru.example CNAME rpz-passthru.\n32.1.0.0.127.rpz-client-ip CNAME .\n24.0.0.0.10.rpz-ip CNAME .\nrewrite.example A 127.0.0.1\n";
 
 #[test]
-/** @brief 밖에서 들어오는 모든 파서를 망가진 입력으로 두드린다. */
 fn parsers_never_panic_on_malformed_input() {
     panic::set_hook(Box::new(|info| {
         let loc = info
@@ -500,7 +473,7 @@ fn parsers_never_panic_on_malformed_input() {
                     *slot = *byte;
                 }
                 let _ = onetdns_dnscrypt::decrypt_query(&[0x5a; 32], &nonce, dd);
-                /* 패킷 종류를 나누는 진입점. UDP 와 TCP 가 함께 부르고 크기 예산만 다르다. */
+                // Sorts packet kinds; UDP and TCP both call it, with different size budgets.
                 let peer: std::net::SocketAddr = "127.0.0.1:1".parse().expect("고정 주소");
                 let answer = |_query: Vec<u8>, _src: std::net::SocketAddr, _budget: usize| None;
                 let allow = |_src: std::net::SocketAddr| true;

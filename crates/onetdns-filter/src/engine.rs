@@ -1,12 +1,8 @@
-/*!
- * @brief 차단 판정 엔진.
- *
- * @details 질의마다 정해진 우선순위로 여러 집합을 훑는다. 클라이언트 정책부터 타입별
- *          규칙까지 열여덟 단계가 순서대로 걸린다.
- * @warning 이 순서가 곧 의미다. 중요 표시가 일반 허용을 이기고, 허용이 일반 차단을
- *          이긴다. 순서를 바꾸면 운영자가 쓴 규칙의 뜻이 달라진다.
- * @note 엔진은 전부 원자 교체된다. 질의 경로는 잠금을 잡지 않고 스냅숏을 본다.
- */
+//! Block verdict engine. Each query walks several sets in a fixed priority order, from client
+//! policy to per-type rules.
+//!
+//! The order is the meaning: important rules beat plain allow rules, and allow rules beat plain
+//! block rules. Reordering changes what the operator's rules mean.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,31 +19,27 @@ use onetdns_core::{
 };
 use onetdns_proto::{Name, RecordType};
 
-/** @brief 출처가 기록되지 않았음을 뜻하는 값. */
 pub const NO_SOURCE: u32 = u32::MAX;
 
 #[derive(Debug, Default)]
-/** @brief 규칙별 적중 수. 켰을 때만 슬롯을 잡는다. */
+/// Per-rule hit counts; allocated only when enabled.
 struct HitCounters {
-    /** @brief 고정한 이름마다의 적중 수. */
     dense: Box<[AtomicU64]>,
-    /** @brief 적중 보고에 쓸 고정한 이름. 추적을 켰을 때만 재구성한다. */
+    /// Rebuilt only when tracking is on.
     dense_names: DenseHitNames,
-    /** @brief 굳히지 않은 이름의 적중 수. */
+    /// For names not compacted.
     sparse: HashMap<Box<str>, AtomicU64>,
 }
 
 #[derive(Debug, Default)]
-/** @brief hit-tracking을 켠 경우에만 보존하는 연속 이름 아레나. */
 struct DenseHitNames {
-    /** @brief 이름을 순위 순서로 이어 붙인 글. */
     text: Box<str>,
-    /** @brief 각 이름의 시작점과 마지막 끝점. */
+    /// Each name's start, plus the end of the last.
     offsets: Box<[u32]>,
 }
 
 impl DenseHitNames {
-    /** @brief 오토마톤 언어를 한 번 순회해 보고용 이름을 만든다. */
+    /// Walks the automaton once to build the names for reports.
     fn from_compact(compact: &CompactDomainMap) -> Self {
         if compact.is_empty() {
             return Self::default();
@@ -69,21 +61,18 @@ impl DenseHitNames {
         }
     }
 
-    /** @brief 순위로 이름을 얻는다. */
     fn get(&self, index: usize) -> Option<&str> {
         let start = *self.offsets.get(index)? as usize;
         let end = *self.offsets.get(index + 1)? as usize;
         self.text.get(start..end)
     }
 
-    /** @brief 이름 아레나가 쓰는 바이트. */
     fn storage_bytes(&self) -> usize {
         self.text.len() + self.offsets.len() * size_of::<u32>()
     }
 }
 
 impl HitCounters {
-    /** @brief 집합 크기에 맞춰 카운터를 만든다. */
     fn new(compact: &CompactDomainMap, fallback: &DomainTable) -> Self {
         let dense = std::iter::repeat_with(|| AtomicU64::new(0))
             .take(compact.len())
@@ -100,7 +89,6 @@ impl HitCounters {
         }
     }
 
-    /** @brief 적중을 하나 올린다. */
     fn increment(&self, index: Option<usize>, key: &str) {
         let counter = index
             .and_then(|index| self.dense.get(index))
@@ -110,7 +98,6 @@ impl HitCounters {
         }
     }
 
-    /** @brief 이 규칙의 적중 수. */
     fn value(&self, index: Option<usize>, key: &str) -> u64 {
         index
             .and_then(|index| self.dense.get(index))
@@ -119,7 +106,6 @@ impl HitCounters {
             .unwrap_or(0)
     }
 
-    /** @brief 고정한 항목의 적중 수. */
     fn dense_value(&self, index: usize) -> u64 {
         self.dense
             .get(index)
@@ -127,7 +113,6 @@ impl HitCounters {
             .unwrap_or(0)
     }
 
-    /** @brief 이름과 함께 모든 적중 카운터를 훑는다. */
     fn entries(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
         let dense = self
             .dense
@@ -145,7 +130,6 @@ impl HitCounters {
         dense.chain(sparse)
     }
 
-    /** @brief 카운터가 쓰는 바이트. */
     fn storage_bytes(&self) -> usize {
         self.dense.len() * size_of::<AtomicU64>()
             + self.dense_names.storage_bytes()
@@ -156,48 +140,33 @@ impl HitCounters {
 }
 
 #[derive(Clone, Copy)]
-/** @brief 집합에서 찾은 결과. */
 struct DomainMatch<'a> {
-    /** @brief 찾아낸 이름. */
     key: &'a str,
-    /** @brief 어느 목록에서 온 규칙인지. */
     source: u32,
-    /** @brief 이름 전체가 맞았는지, 접미사로 맞았는지. */
     is_exact: bool,
-    /** @brief 고정한 자료에서의 곳. 적중 수를 셀 때 쓴다. */
+    /// Position in the compact data, for hit counting.
     compact_index: Option<usize>,
 }
 
 #[derive(Debug, Default)]
-/**
- * @brief 도메인 집합 하나. 로드 중에는 테이블, 고정한 뒤에는 최소 오토마톤이다.
- * @details 고치면 다시 테이블로 풀렸다가, 다음 고정에서 오토마톤으로 돌아간다.
- */
+/// One domain set: a table while loading, the minimal automaton once frozen. An edit thaws it back
+/// into a table until the next freeze.
 pub struct DomainSet {
-    /** @brief 로드 중의 이름 전체 일치 테이블. */
     exact: DomainTable,
-    /** @brief 로드 중의 접미사 일치 테이블. */
     suffixes: DomainTable,
-    /** @brief 고정한 이름 전체 일치 자료. */
     exact_compact: CompactDomainMap,
-    /** @brief 고정한 접미사 일치 자료. */
     suffix_compact: CompactDomainMap,
 
-    /** @brief 이름 전체 일치의 적중 수. 켰을 때만 있다. */
     exact_hits: Option<HitCounters>,
-    /** @brief 접미사 일치의 적중 수. 켰을 때만 있다. */
     suffix_hits: Option<HitCounters>,
-    /** @brief 담긴 이름 수. */
     entry_count: usize,
 }
 
 impl DomainSet {
-    /** @brief 고정한 집합을 인코딩한다. */
     pub fn encode_compact(&self, output: &mut Vec<u8>) -> Result<(), &'static str> {
         self.encode_compact_chunks(&mut |bytes| output.extend_from_slice(bytes))
     }
 
-    /** @brief 고정한 집합을 청크 단위로 스트리밍한다. */
     pub(crate) fn encode_compact_chunks(
         &self,
         output: &mut impl FnMut(&[u8]),
@@ -209,7 +178,6 @@ impl DomainSet {
         self.suffix_compact.encode_chunks(output)
     }
 
-    /** @brief 인코딩된 집합을 되읽는다. */
     pub fn decode_compact(input: &mut &[u8]) -> Result<Self, &'static str> {
         let exact_compact = CompactDomainMap::decode_from(input)?;
         let suffix_compact = CompactDomainMap::decode_from(input)?;
@@ -225,17 +193,15 @@ impl DomainSet {
         })
     }
 
-    /** @brief 정확 일치 규칙을 넣는다. */
     pub fn add_exact(&mut self, domain: &str) {
         self.add_exact_src(domain, NO_SOURCE);
     }
 
-    /** @brief 접미사 규칙을 넣는다. 하위 도메인까지 걸린다. */
+    /// Also matches subdomains.
     pub fn add_suffix(&mut self, domain: &str) {
         self.add_suffix_src(domain, NO_SOURCE);
     }
 
-    /** @brief 출처를 함께 기록해 정확 일치 규칙을 넣는다. */
     pub fn add_exact_src(&mut self, domain: &str, source: u32) {
         Self::thaw(
             &mut self.exact,
@@ -247,7 +213,6 @@ impl DomainSet {
         }
     }
 
-    /** @brief 출처를 함께 기록해 접미사 규칙을 넣는다. */
     pub fn add_suffix_src(&mut self, domain: &str, source: u32) {
         let normalized = normalize_str(domain);
 
@@ -264,7 +229,7 @@ impl DomainSet {
         }
     }
 
-    /** @brief 규칙을 지운다. 고정해 있었으면 먼저 푼다. */
+    /// Thaws first if frozen.
     pub fn remove(&mut self, domain: &str) {
         Self::thaw(
             &mut self.exact,
@@ -283,20 +248,19 @@ impl DomainSet {
         self.suffix_hits = None;
     }
 
-    /** @brief 최소 오토마톤으로 고정한다. 로드가 끝난 뒤 한 번 한다. */
+    /// Once, after loading.
     fn finalize(&mut self) {
         Self::compact(&mut self.exact, &mut self.exact_compact);
         Self::compact(&mut self.suffixes, &mut self.suffix_compact);
     }
 
-    /** @brief 적중 카운터를 켠다. */
     fn enable_hits(&mut self) {
         self.finalize();
         self.exact_hits = Some(HitCounters::new(&self.exact_compact, &self.exact));
         self.suffix_hits = Some(HitCounters::new(&self.suffix_compact, &self.suffixes));
     }
 
-    /** @brief 테이블을 오토마톤으로 고정한다. 실패하면 테이블을 그대로 둔다. */
+    /// On failure the table stays.
     fn compact(map: &mut DomainTable, compact: &mut CompactDomainMap) {
         if map.is_empty() {
             return;
@@ -308,7 +272,7 @@ impl DomainSet {
         }
     }
 
-    /** @brief 오토마톤을 테이블로 되돌린다. 고치려면 필요하다. */
+    /// Needed before edits.
     fn thaw(map: &mut DomainTable, compact: &mut CompactDomainMap, hits: &mut Option<HitCounters>) {
         if compact.is_empty() {
             return;
@@ -329,17 +293,14 @@ impl DomainSet {
         *hits = None;
     }
 
-    /** @brief 비었는지. */
     pub fn is_empty(&self) -> bool {
         self.entry_count == 0
     }
 
-    /** @brief 규칙 수. */
     pub fn len(&self) -> usize {
         self.entry_count
     }
 
-    /** @brief 이 집합이 쓰는 바이트. */
     pub fn storage_bytes(&self) -> usize {
         self.exact_compact.storage_bytes()
             + self.suffix_compact.storage_bytes()
@@ -357,17 +318,14 @@ impl DomainSet {
                 .unwrap_or(0)
     }
 
-    /** @brief 이 이름이 걸리는지. */
     pub fn matches(&self, normalized: &str) -> bool {
         self.matched(normalized).is_some()
     }
 
-    /** @brief 걸린 규칙 문자열. */
     pub fn matched<'a>(&self, normalized: &'a str) -> Option<&'a str> {
         self.matched_kv(normalized).map(|found| found.key)
     }
 
-    /** @brief 걸린 규칙의 출처. */
     pub fn source_of(&self, normalized: &str) -> Option<u32> {
         let found = self.matched_kv(normalized)?;
         if let Some(index) = found.compact_index {
@@ -381,7 +339,7 @@ impl DomainSet {
         }
     }
 
-    /** @brief 걸린 규칙을 찾고 적중을 센다. */
+    /// Also counts the hit.
     pub fn hit<'a>(&self, normalized: &'a str) -> Option<&'a str> {
         let found = self.matched_kv(normalized)?;
         let counters = if found.is_exact {
@@ -395,11 +353,8 @@ impl DomainSet {
         Some(found.key)
     }
 
-    /**
-     * @brief 정확 일치를 먼저 보고, 없으면 가장 긴 접미사를 본다.
-     * @note 접미사는 라벨 경계에서만 맞는다. 그러지 않으면 evil-example.com이
-     *       example.com 규칙에 걸린다.
-     */
+    /// Exact match first, then the longest suffix. Suffixes match only at label boundaries;
+    /// otherwise evil-example.com would match an example.com rule.
     fn matched_kv<'a>(&self, normalized: &'a str) -> Option<DomainMatch<'a>> {
         if self.is_empty() {
             return None;
@@ -442,7 +397,6 @@ impl DomainSet {
             .map(|found| Self::compact_match(found, false))
     }
 
-    /** @brief 고정한 형태의 결과를 공통 형태로 옮긴다. */
     fn compact_match<'a>(found: CompactMatch<'a>, is_exact: bool) -> DomainMatch<'a> {
         DomainMatch {
             key: found.key,
@@ -453,7 +407,6 @@ impl DomainSet {
         }
     }
 
-    /** @brief 규칙별 적중 수를 훑는다. */
     fn hit_entries(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
         self.exact_hits
             .iter()
@@ -461,7 +414,6 @@ impl DomainSet {
             .chain(self.suffix_hits.iter().flat_map(HitCounters::entries))
     }
 
-    /** @brief 출처별 적중 수를 훑는다. */
     fn source_entries(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         let exact = self.exact.iter().map(move |(k, src)| {
             let hits = self
@@ -509,39 +461,32 @@ impl DomainSet {
 }
 
 #[derive(Debug, Default)]
-/** @brief 재작성 규칙 집합. */
 pub struct RewriteSet {
-    /** @brief 이름 전체가 맞을 때의 재작성. */
     pub(crate) exact: HashMap<Box<str>, RewriteTarget>,
 
-    /** @brief 접미사가 맞을 때의 재작성. */
     pub(crate) suffix: HashMap<Box<str>, RewriteTarget>,
 }
 
 impl RewriteSet {
-    /** @brief 정확 일치 재작성을 넣는다. */
     pub fn add_exact(&mut self, domain: &str, target: RewriteTarget) {
         self.exact
             .insert(normalize_str(domain).into_boxed_str(), target);
     }
 
-    /** @brief 접미사 재작성을 넣는다. */
     pub fn add_suffix(&mut self, domain: &str, target: RewriteTarget) {
         self.suffix
             .insert(normalize_str(domain).into_boxed_str(), target);
     }
 
-    /** @brief 비었는지. */
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.suffix.is_empty()
     }
 
-    /** @brief 규칙 수. */
     pub fn len(&self) -> usize {
         self.exact.len() + self.suffix.len()
     }
 
-    /** @brief 이 이름에 걸리는 재작성 대상. 정확 일치가 우선이다. */
+    /// An exact match wins.
     fn get(&self, normalized: &str) -> Option<&RewriteTarget> {
         if let Some(t) = self.exact.get(normalized) {
             return Some(t);
@@ -560,48 +505,38 @@ impl RewriteSet {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 설정의 로컬 영역 하나가 그 아래 이름에 내리는 처분. */
+/// What a configured local zone does to names under it.
 pub enum LocalZoneAction {
-    /** @brief 차단 응답. 일반 허용 규칙이 이긴다. */
+    /// Block response; a plain allow rule wins over it.
     Deny,
-    /** @brief REFUSED 응답. */
     Refuse,
-    /** @brief 영역과 그 아래 모든 이름에 적은 레코드나 0 주소로 답한다. */
+    /// Answers the zone and every name under it with the given records or the zero address.
     Rewrite(RewriteTarget),
-    /** @brief 이름별로 적은 답만 있고 영역 안의 나머지 이름은 없는 이름이다. */
+    /// Only the listed names have answers; other names in the zone do not exist.
     Static(StaticZone),
-    /** @brief 둘러싼 로컬 영역의 처분을 이 아래에서 거두고 평소대로 해석한다. */
+    /// Lifts the enclosing local zone's action below here and resolves normally.
     Transparent,
 }
 
 #[derive(Debug, Clone, Default)]
-/**
- * @brief static 영역에 이름별로 적어 둔 답.
- * @details 적은 이름과 영역 이름 사이에 있는 중간 이름은 존재하되 답이 없는 이름이라
- *          NODATA로 답한다. NXDOMAIN으로 답하면 그 아래 이름까지 없다고 캐시하는 리졸버가
- *          있어, 적어 둔 아래 이름이 사라진다.
- */
+/// Answers listed per name in a static zone. Names between a listed name and the zone exist without
+/// data and get NODATA; with NXDOMAIN some resolvers would cache everything below as nonexistent,
+/// and the listed names under them would vanish.
 pub struct StaticZone {
-    /** @brief 영역 이름. 정규화했고 루트 영역은 빈 문자열이다. */
+    /// Normalized; the root zone is the empty string.
     zone: Box<str>,
-    /** @brief 정규화한 이름에서 그 이름의 답으로. */
     names: HashMap<Box<str>, RewriteTarget>,
-    /** @brief 적은 이름과 영역 이름 사이의 중간 이름. */
+    /// Names between the listed names and the zone name.
     interior: HashSet<Box<str>>,
 }
 
-/** @brief static 영역이 한 이름에 내리는 답. */
 pub enum StaticAnswer<'a> {
-    /** @brief 적어 둔 답. */
     Data(&'a RewriteTarget),
-    /** @brief 이름은 있으나 답이 없다. */
     NoData,
-    /** @brief 영역 안에 없는 이름이다. */
     NxDomain,
 }
 
 impl StaticZone {
-    /** @brief 빈 static 영역. */
     pub fn new(zone: &str) -> Self {
         Self {
             zone: normalize_str(zone).into_boxed_str(),
@@ -609,10 +544,7 @@ impl StaticZone {
         }
     }
 
-    /**
-     * @brief 영역 안의 이름 하나에 답을 넣는다.
-     * @retval Err 이름이 영역 밖에 있거나 이미 답이 있다.
-     */
+    /// Fails when the name is outside the zone or already has an answer.
     pub fn insert(&mut self, name: &str, target: RewriteTarget) -> Result<(), String> {
         let name = normalize_str(name);
         let zone: &str = &self.zone;
@@ -642,7 +574,7 @@ impl StaticZone {
         Ok(())
     }
 
-    /** @brief 이 영역 안의 이름에 줄 답. 영역 이름 자체는 답이 없어도 있는 이름이다. */
+    /// The zone name itself exists even without an answer.
     pub fn answer(&self, normalized: &str) -> StaticAnswer<'_> {
         if let Some(target) = self.names.get(normalized) {
             StaticAnswer::Data(target)
@@ -653,7 +585,6 @@ impl StaticZone {
         }
     }
 
-    /** @brief 이름과 답 전부. 순서는 정해져 있지 않다. */
     pub fn iter(&self) -> impl Iterator<Item = (&str, &RewriteTarget)> {
         self.names
             .iter()
@@ -662,28 +593,22 @@ impl StaticZone {
 }
 
 #[derive(Debug)]
-/** @brief 로컬 영역 하나와 적중 수. */
 struct LocalZoneEntry {
-    /** @brief 이 영역의 처분. */
     action: LocalZoneAction,
-    /** @brief 이 영역에 걸린 질의 수. 적중 추적을 켰을 때만 센다. */
+    /// Counted only with hit tracking on.
     hits: AtomicU64,
 }
 
 #[derive(Debug, Default)]
-/**
- * @brief 설정의 로컬 영역 전부.
- * @details 차단 목록, 거절 목록, 재작성 규칙과 섞지 않고 따로 둔다. 한 이름에 여러 영역이
- *          겹치면 가장 구체적인 영역 하나만 적용해야 하는데, 섞어 두면 transparent 영역이
- *          둘러싼 영역만 골라 거둘 수 없고 구독한 차단 목록까지 풀게 된다.
- */
+/// Every configured local zone, kept apart from block, refuse, and rewrite rules. When zones
+/// overlap on a name only the most specific applies; mixed in with the rest, a transparent zone
+/// could not lift just the enclosing zone and would also open subscribed blocklists.
 pub struct LocalZoneSet {
-    /** @brief 정규화한 영역 이름에서 처분으로. */
     zones: HashMap<Box<str>, LocalZoneEntry>,
 }
 
 impl LocalZoneSet {
-    /** @brief 영역을 넣는다. 같은 이름이 이미 있으면 거절한다. */
+    /// Rejects a zone that already exists.
     pub fn insert(&mut self, zone: &str, action: LocalZoneAction) -> Result<(), String> {
         let key = normalize_str(zone).into_boxed_str();
         if self.zones.contains_key(&key) {
@@ -699,28 +624,22 @@ impl LocalZoneSet {
         Ok(())
     }
 
-    /** @brief 비었는지. */
     pub fn is_empty(&self) -> bool {
         self.zones.is_empty()
     }
 
-    /** @brief 영역 수. */
     pub fn len(&self) -> usize {
         self.zones.len()
     }
 
-    /** @brief 영역 이름과 처분 전부. 순서는 정해져 있지 않다. */
     pub fn iter(&self) -> impl Iterator<Item = (&str, &LocalZoneAction)> {
         self.zones
             .iter()
             .map(|(zone, entry)| (zone.as_ref(), &entry.action))
     }
 
-    /**
-     * @brief 이 이름을 품는 가장 구체적인 영역을 찾는다.
-     * @details 이름 자신부터 라벨을 하나씩 떼며 찾으므로 먼저 찾은 영역이 가장 구체적이다.
-     *          루트 영역은 빈 키로 들어 있어 마지막에 본다.
-     */
+    /// Strips one label at a time starting from the name itself, so the first zone found is the
+    /// most specific. The root zone is stored under the empty key and checked last.
     fn lookup(&self, normalized: &str) -> Option<(&str, &LocalZoneAction)> {
         let mut rest = normalized;
         loop {
@@ -735,14 +654,13 @@ impl LocalZoneSet {
         }
     }
 
-    /** @brief 처분을 실제로 적용한 영역의 적중을 센다. */
+    /// Only for the zone whose action was applied.
     fn record_hit(&self, zone: &str) {
         if let Some(entry) = self.zones.get(zone) {
             entry.hits.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /** @brief 영역마다의 적중 수. */
     fn hit_entries(&self) -> impl Iterator<Item = (&str, u64)> {
         self.zones
             .iter()
@@ -750,7 +668,7 @@ impl LocalZoneSet {
     }
 }
 
-/** @brief 이름이 접미사에 걸리는지. 라벨 경계에서만 맞는 것으로 본다. */
+/// Only at label boundaries.
 fn name_matches_suffix(name: &str, suf: &str) -> bool {
     if name == suf {
         return true;
@@ -761,33 +679,27 @@ fn name_matches_suffix(name: &str, suf: &str) -> bool {
 }
 
 #[derive(Debug, Default, Clone)]
-/** @brief 목록 로드 결과 보고. 대시보드가 보여 준다. */
+/// Shown on the dashboard.
 pub struct FilterLoadReport {
-    /** @brief 읽어 본 규칙 수. */
     pub rules_total: u64,
-    /** @brief 건너뛴 규칙 수. */
     pub rules_skipped: u64,
 
-    /** @brief 다루지 않는 수식어와 그 수. */
+    /// Count per unsupported modifier.
     pub unsupported_modifier: BTreeMap<String, u64>,
 
-    /** @brief 형식이 깨진 정규식 수. */
     pub invalid_regex: u64,
 
-    /** @brief 형식이 깨진 규칙 수. */
     pub invalid_pattern: u64,
 
-    /** @brief DNS 차단에는 뜻이 없는 규칙 수. */
+    /// Rules that mean nothing for DNS blocking.
     pub not_applicable: u64,
 }
 
 impl FilterLoadReport {
-    /** @brief 실제로 적용된 규칙 수. */
     pub fn rules_applied(&self) -> u64 {
         self.rules_total.saturating_sub(self.rules_skipped)
     }
 
-    /** @brief 보고를 JSON으로. */
     pub fn to_json(&self) -> String {
         let mods: Vec<String> = self
             .unsupported_modifier
@@ -809,18 +721,14 @@ impl FilterLoadReport {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 주소 대역 기반 RPZ 규칙. */
 pub struct RpzIpRule {
-    /** @brief 이 대역에 걸린다. */
     pub net: IpNet,
-    /** @brief 걸렸을 때의 판정. */
     pub verdict: FilterVerdict,
-    /** @brief 어느 규칙인지 보일 문구. */
+    /// Shown to identify the rule.
     pub display: Box<str>,
 }
 
 impl RpzIpRule {
-    /** @brief 대역과 처분으로 만든다. */
     pub fn new(net: IpNet, verdict: FilterVerdict) -> Self {
         let display = net.to_string().into_boxed_str();
         Self {
@@ -832,34 +740,29 @@ impl RpzIpRule {
 }
 
 #[derive(Debug, Clone)]
-/** @brief 네임서버 기반 RPZ 규칙. */
+/// Nameserver-based RPZ rule.
 pub struct RpzNameRule {
-    /** @brief 이 접미사에 걸린다. */
     pub(crate) suffix: Name,
-    /** @brief 걸렸을 때의 판정. */
     pub verdict: FilterVerdict,
 }
 
 impl RpzNameRule {
-    /** @brief 도메인과 처분으로 만든다. */
     pub fn new(domain: &str, verdict: FilterVerdict) -> Option<Self> {
         let suffix = Name::from_str(domain.trim_end_matches('.')).ok()?;
         Some(Self { suffix, verdict })
     }
 
-    /** @brief 이 네임서버에 걸리는지. */
     pub fn matches(&self, ns: &Name) -> bool {
         ns.ends_with_ignore_case(&self.suffix)
     }
 
-    /** @brief 규칙의 구체성. 여럿 걸리면 더 구체적인 것이 이긴다. */
+    /// When several match, the more specific wins.
     fn specificity(&self) -> usize {
         self.suffix.labels().len()
     }
 }
 
 impl EngineParts {
-    /** @brief 이 구성의 모든 도메인 집합. */
     fn domain_sets(&self) -> Vec<&DomainSet> {
         let mut sets = vec![
             &self.block,
@@ -875,7 +778,6 @@ impl EngineParts {
         sets
     }
 
-    /** @brief 이 구성의 모든 도메인 집합을 바꿀 수 있게. */
     fn domain_sets_mut(&mut self) -> Vec<&mut DomainSet> {
         let mut sets: Vec<&mut DomainSet> = vec![
             &mut self.block,
@@ -891,7 +793,6 @@ impl EngineParts {
         sets
     }
 
-    /** @brief 모든 집합을 고정한다. */
     pub(crate) fn finalize_domain_sets(&mut self) {
         for set in self.domain_sets_mut() {
             set.finalize();
@@ -900,130 +801,95 @@ impl EngineParts {
 }
 
 #[derive(Default)]
-/** @brief 엔진을 이루는 집합과 규칙 전부. 로드 결과이자 캐시 대상이다. */
+/// Every set and rule that makes up an engine: the result of loading, and what the cache stores.
 pub struct EngineParts {
-    /** @brief 차단할 이름들. */
     pub block: DomainSet,
-    /** @brief 허용할 이름들. */
     pub allow: DomainSet,
 
-    /** @brief 무엇보다 먼저 보는 차단. */
     pub block_important: DomainSet,
-    /** @brief 무엇보다 먼저 보는 허용. */
     pub allow_important: DomainSet,
 
-    /** @brief 거절로 답할 이름들. */
     pub refuse: DomainSet,
 
-    /** @brief 비어 있다고 답할 이름들. */
     pub nodata: DomainSet,
 
-    /** @brief 아무것도 답하지 않을 이름들. */
     pub no_response: DomainSet,
 
-    /** @brief 이 종류만 막을 이름들. */
     pub typed_block: Vec<(RecordType, DomainSet)>,
 
-    /** @brief 이 종류만 빼고 막을 이름들. */
     pub typed_block_except: Vec<(Vec<RecordType>, DomainSet)>,
 
-    /** @brief 정규식 차단. */
     pub regex_block: Vec<String>,
-    /** @brief 정규식 허용. */
     pub regex_allow: Vec<String>,
 
-    /** @brief 먼저 보는 정규식 차단. */
     pub regex_block_important: Vec<String>,
-    /** @brief 먼저 보는 정규식 허용. */
     pub regex_allow_important: Vec<String>,
 
-    /** @brief 정규식 거절. */
     pub regex_refuse: Vec<String>,
-    /** @brief 정규식 빈 응답. */
     pub regex_nodata: Vec<String>,
-    /** @brief 정규식 무응답. */
     pub regex_no_response: Vec<String>,
 
-    /** @brief 정규식 재작성. */
     pub regex_rewrites: Vec<(String, RewriteTarget)>,
 
-    /** @brief 종류를 지정한 정규식 차단. */
     pub regex_typed_block: Vec<(RecordType, String)>,
-    /** @brief 종류를 빼고 막는 정규식 차단. */
     pub regex_typed_block_except: Vec<(Vec<RecordType>, String)>,
 
-    /** @brief 재작성 규칙. */
     pub rewrites: RewriteSet,
 
-    /** @brief 설정의 로컬 영역. */
     pub local_zones: LocalZoneSet,
 
-    /** @brief 클라이언트 조건이 붙은 규칙. */
     pub client_rules: Vec<ClientRule>,
 
-    /** @brief 클라이언트 주소로 거는 영역 규칙. */
+    /// Matched on the client's address.
     pub rpz_client_ip: Vec<RpzIpRule>,
 
-    /** @brief 답에 담긴 주소로 거는 영역 규칙. */
+    /// Matched on addresses in the answer.
     pub rpz_ip: Vec<RpzIpRule>,
 
-    /** @brief 답에 담긴 이름 서버로 거는 영역 규칙. */
+    /// Matched on nameserver names in the answer.
     pub rpz_nsdname: Vec<RpzNameRule>,
 
-    /** @brief 그 이름 서버의 주소로 거는 영역 규칙. */
+    /// Matched on those nameservers' addresses.
     pub rpz_nsip: Vec<RpzIpRule>,
 
-    /** @brief 로드 결과 요약. */
     pub report: FilterLoadReport,
 
-    /** @brief 이 엔진을 만든 목록들. */
+    /// The lists this engine was built from.
     pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-/** @brief 목록 하나의 통계. */
 pub struct SourceStat {
-    /** @brief 목록 이름. */
     pub source: String,
-    /** @brief 그 목록의 규칙 수. */
     pub rules: u64,
-    /** @brief 그 목록이 걸린 횟수. */
     pub hits: u64,
 }
 
 #[derive(Debug, Clone)]
-/** @brief 클라이언트 규칙이 걸리는 조건. */
 pub enum ClientCond {
-    /** @brief 이 대역에 든 클라이언트. */
     Net { negated: bool, net: IpNet },
-    /** @brief 이 식별자를 가진 클라이언트. */
     Id { negated: bool, id: String },
 }
 
 #[derive(Debug, Clone, Default)]
-/** @brief 특정 클라이언트에만 걸리는 규칙. */
+/// A rule that applies only to certain clients.
 pub struct ClientRule {
-    /** @brief 이 규칙이 걸릴 이름. */
     pub domain: String,
 
-    /** @brief 이름 대신 쓸 정규식. */
+    /// Used instead of the name.
     pub regex: Option<String>,
 
-    /** @brief 차단이 아니라 허용인지. */
     pub allow: bool,
 
-    /** @brief 이 클라이언트들에만 건다. */
     pub clients: Vec<ClientCond>,
 
-    /** @brief 이 태그가 붙은 클라이언트에만 건다. */
     pub ctags: Vec<(bool, String)>,
 
-    /** @brief 여기 적힌 이름은 이 규칙에서 뺀다. */
+    /// Names excluded from this rule.
     pub denyallow: Vec<String>,
 }
 
 impl ClientRule {
-    /** @brief 이 규칙이 이 클라이언트와 이름에 걸리는지. */
     fn applies(&self, key: &str, client: &ClientInfo, tags: &[String]) -> bool {
         if !self.domain.is_empty() && !name_matches_suffix(key, &self.domain) {
             return false;
@@ -1088,35 +954,26 @@ impl ClientRule {
 }
 
 #[derive(Debug)]
-/** @brief 클라이언트 그룹 하나에 대한 정책. */
+/// Policy for one client group.
 pub struct ClientPolicy {
-    /** @brief 이 그룹에 드는 대역. */
     nets: Vec<IpNet>,
 
-    /** @brief 이 그룹에 드는 식별자. */
     ids: Vec<String>,
 
-    /** @brief 이 그룹에 붙은 태그. */
     tags: Vec<String>,
-    /** @brief 이 그룹에만 적용할 차단. */
     block: DomainSet,
-    /** @brief 이 그룹에만 적용할 허용. */
     allow: DomainSet,
 
-    /** @brief 이 그룹은 차단을 하지 않는다. */
     disable_filtering: bool,
 
-    /** @brief 안전 검색 여부. 없으면 전체 설정을 따른다. */
+    /// None follows the global setting.
     safe_search: Option<bool>,
 
-    /** @brief 이 그룹의 질의는 기록하지 않는다. */
     ignore_querylog: bool,
-    /** @brief 이 그룹의 질의는 통계에 넣지 않는다. */
     ignore_stats: bool,
 }
 
 impl ClientPolicy {
-    /** @brief 이름과 대상으로 정책을 만든다. */
     pub fn new(
         nets: Vec<IpNet>,
         block: &[String],
@@ -1127,12 +984,11 @@ impl ClientPolicy {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /** @brief 이 정책이 판정을 바꾸는지. 아니면 고속 경로가 건너뛸 수 있다. */
+    /// Otherwise the fast path can skip it.
     pub(crate) fn affects_verdict(&self) -> bool {
         !self.block.is_empty() || !self.allow.is_empty() || self.disable_filtering
     }
 
-    /** @brief 세부 설정을 붙인다. */
     pub fn with_options(
         nets: Vec<IpNet>,
         ids: Vec<String>,
@@ -1165,25 +1021,21 @@ impl ClientPolicy {
         }
     }
 
-    /** @brief 기록과 통계 제외 설정을 붙인다. */
     pub fn with_log_flags(mut self, ignore_querylog: bool, ignore_stats: bool) -> Self {
         self.ignore_querylog = ignore_querylog;
         self.ignore_stats = ignore_stats;
         self
     }
 
-    /** @brief 이 정책의 집합에도 적중 추적을 켠다. */
     fn enable_hits(&mut self) {
         self.block.enable_hits();
         self.allow.enable_hits();
     }
 
-    /** @brief 이 정책이 붙는 태그들. */
     pub fn tags(&self) -> &[String] {
         &self.tags
     }
 
-    /** @brief 이 클라이언트가 이 정책 대상인지. */
     fn matches(&self, client: &ClientInfo) -> bool {
         if self.nets.iter().any(|n| n.contains(&client.source_ip)) {
             return true;
@@ -1198,63 +1050,43 @@ impl ClientPolicy {
 }
 
 #[derive(Debug)]
-/**
- * @brief 완성된 판정 엔진. 만들어진 뒤에는 바뀌지 않는다.
- * @note 목록을 교체할 때는 새 엔진을 만들어 전부 바꾼다. 질의 경로가 잠금을 잡지
- *       않는 이유다.
- */
+/// Immutable once built. Replacing lists builds a new engine and swaps it whole, which is why the
+/// query path takes no locks.
 pub struct BlockEngine {
-    /** @brief 고정한 규칙 자료. */
     parts: EngineParts,
 
-    /** @brief 판정을 바꿀 규칙이 하나라도 있는지. */
     has_verdict_rules: bool,
 
-    /** @brief 정규식 차단. */
     regex_block: RegexMatcher,
-    /** @brief 정규식 허용. */
     regex_allow: RegexMatcher,
-    /** @brief 먼저 보는 정규식 차단. */
     regex_block_important: RegexMatcher,
-    /** @brief 먼저 보는 정규식 허용. */
     regex_allow_important: RegexMatcher,
-    /** @brief 정규식 거절. */
     regex_refuse: RegexMatcher,
-    /** @brief 정규식 빈 응답. */
     regex_nodata: RegexMatcher,
-    /** @brief 정규식 무응답. */
     regex_no_response: RegexMatcher,
 
-    /** @brief 정규식 재작성. */
     regex_rewrites: Vec<(String, Regex, RewriteTarget)>,
-    /** @brief 종류를 지정한 정규식 차단. */
     regex_typed: Vec<(RecordType, String, Regex)>,
-    /** @brief 종류를 빼고 막는 정규식 차단. */
     regex_typed_except: Vec<(Vec<RecordType>, String, Regex)>,
 
-    /** @brief 클라이언트 규칙마다 미리 엮어 둔 정규식. */
+    /// Precompiled per client rule.
     client_rule_regex: Vec<Option<Regex>>,
 
-    /** @brief 차단할 때의 기본 답 방식. */
     default_block: BlockResponse,
-    /** @brief 클라이언트별 정책. */
     clients: Vec<ClientPolicy>,
 
-    /** @brief 적중 수를 셀지. */
     track_hits: bool,
 }
 
 #[derive(Debug, Default)]
-/** @brief 정규식 번들. 여럿을 나눠 담아 하나가 커지는 것을 막는다. */
+/// Regex bundles; patterns are split across several so no one bundle grows too large.
 struct RegexMatcher {
-    /** @brief 여러 정규식을 한 번에 훑는 번들들. */
     chunks: Vec<(RegexSet, Vec<(String, Regex)>)>,
-    /** @brief 번들이 맞았을 때 하나씩 확인할 정규식들. */
+    /// Patterns from bundles that exceeded the size limit, checked one by one.
     individual: Vec<(String, Regex)>,
 }
 
 impl RegexMatcher {
-    /** @brief 맞는 첫 패턴. */
     fn find(&self, text: &str) -> Option<&str> {
         for (set, members) in &self.chunks {
             if set.is_match(text) {
@@ -1270,7 +1102,7 @@ impl RegexMatcher {
     }
 }
 
-/** @brief 패턴 하나를 따로 컴파일한다. 실패해도 나머지에 영향을 주지 않는다. */
+/// A failure does not affect the others.
 fn compile_isolated(pattern: &str) -> Option<Regex> {
     match Regex::new(pattern) {
         Ok(re) => Some(re),
@@ -1281,9 +1113,7 @@ fn compile_isolated(pattern: &str) -> Option<Regex> {
     }
 }
 
-/** @brief 패턴들을 번들로 컴파일한다. */
 fn build_regexes(patterns: &[String]) -> RegexMatcher {
-    /** @brief 번들 하나에 담을 패턴 수. */
     const SET_CHUNK: usize = 32;
     let mut compiled: Vec<(String, Regex)> = patterns
         .iter()
@@ -1306,7 +1136,6 @@ fn build_regexes(patterns: &[String]) -> RegexMatcher {
 }
 
 impl std::fmt::Debug for EngineParts {
-    /** @brief 사람이 읽을 설명. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineParts")
             .field("block", &self.block.len())
@@ -1328,7 +1157,7 @@ impl std::fmt::Debug for EngineParts {
 }
 
 impl BlockEngine {
-    /** @brief 구성에서 엔진을 만든다. 집합을 굳히고 정규식을 컴파일한다. */
+    /// Freezes the sets and compiles the regexes.
     pub fn new(mut parts: EngineParts, default_block: BlockResponse) -> Self {
         parts.finalize_domain_sets();
         let has_verdict_rules = parts.domain_sets().iter().any(|set| !set.is_empty())
@@ -1393,7 +1222,6 @@ impl BlockEngine {
         }
     }
 
-    /** @brief 클라이언트 정책을 붙인다. */
     pub fn with_clients(mut self, clients: Vec<ClientPolicy>) -> Self {
         self.has_verdict_rules |= clients
             .iter()
@@ -1402,7 +1230,6 @@ impl BlockEngine {
         self
     }
 
-    /** @brief 적중 추적을 켜고 끈다. */
     pub fn with_hit_tracking(mut self, on: bool) -> Self {
         self.track_hits = on;
         if on {
@@ -1416,12 +1243,10 @@ impl BlockEngine {
         self
     }
 
-    /** @brief 적중 추적이 켜져 있는지. */
     pub fn hits_enabled(&self) -> bool {
         self.track_hits
     }
 
-    /** @brief 가장 많이 걸린 규칙들. */
     pub fn top_rule_hits(&self, n: usize) -> Vec<(String, u64)> {
         let p = &self.parts;
         let mut out: Vec<(String, u64)> = Vec::new();
@@ -1442,7 +1267,6 @@ impl BlockEngine {
         out
     }
 
-    /** @brief 목록별 통계. */
     pub fn source_stats(&self) -> Vec<SourceStat> {
         let p = &self.parts;
         let mut agg: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -1484,12 +1308,10 @@ impl BlockEngine {
         out
     }
 
-    /** @brief 아무것도 막지 않는 엔진. */
     pub fn empty(default_block: BlockResponse) -> Self {
         Self::new(EngineParts::default(), default_block)
     }
 
-    /** @brief 차단 규칙 수. */
     pub fn block_count(&self) -> usize {
         self.parts.block.len()
             + self.parts.block_important.len()
@@ -1511,7 +1333,6 @@ impl BlockEngine {
                 .sum::<usize>()
     }
 
-    /** @brief 도메인 집합들이 쓰는 바이트. */
     pub fn domain_storage_bytes(&self) -> usize {
         self.parts
             .domain_sets()
@@ -1525,7 +1346,6 @@ impl BlockEngine {
                 .sum::<usize>()
     }
 
-    /** @brief 허용 규칙 수. */
     pub fn allow_count(&self) -> usize {
         self.parts.allow.len()
             + self.parts.allow_important.len()
@@ -1533,17 +1353,14 @@ impl BlockEngine {
             + self.parts.regex_allow_important.len()
     }
 
-    /** @brief 로드 보고. */
     pub fn load_report(&self) -> &FilterLoadReport {
         &self.parts.report
     }
 
-    /** @brief 주소 기반 RPZ 규칙이 있는지. */
     pub fn has_rpz_ip(&self) -> bool {
         !self.parts.rpz_ip.is_empty()
     }
 
-    /** @brief 이 주소에 걸리는 RPZ 처분. */
     pub fn rpz_ip_verdict(&self, ip: std::net::IpAddr) -> Option<&FilterVerdict> {
         self.parts
             .rpz_ip
@@ -1553,19 +1370,18 @@ impl BlockEngine {
             .map(|rule| &rule.verdict)
     }
 
-    /** @brief 클라이언트별 규칙이 있는지. 없으면 고속 경로가 열린다. */
+    /// Without any, the fast path opens.
     pub fn has_client_specific_rules(&self) -> bool {
         !self.parts.client_rules.is_empty()
             || !self.parts.rpz_client_ip.is_empty()
             || self.clients.iter().any(|policy| policy.affects_verdict())
     }
 
-    /** @brief 네임서버 기반 RPZ 규칙이 있는지. */
     pub fn has_rpz_ns(&self) -> bool {
         !self.parts.rpz_nsdname.is_empty() || !self.parts.rpz_nsip.is_empty()
     }
 
-    /** @brief 네임서버에 걸리는 RPZ 처분. 가장 구체적인 규칙이 이긴다. */
+    /// The most specific rule wins.
     pub fn rpz_ns_verdict(
         &self,
         ns_names: &[Name],
@@ -1598,7 +1414,6 @@ impl BlockEngine {
             .map(|rule| rule.verdict.clone())
     }
 
-    /** @brief 이 클라이언트의 안전 검색 설정. */
     pub fn client_safe_search(&self, client: &ClientInfo) -> Option<bool> {
         self.clients
             .iter()
@@ -1606,7 +1421,7 @@ impl BlockEngine {
             .and_then(|p| p.safe_search)
     }
 
-    /** @brief 이 클라이언트를 기록과 통계에서 뺄지. */
+    /// Whether to leave this client out of the query log and stats.
     pub fn client_log_stat(&self, client: &ClientInfo) -> (bool, bool) {
         self.clients
             .iter()
@@ -1615,18 +1430,13 @@ impl BlockEngine {
             .unwrap_or((true, true))
     }
 
-    /**
-     * @brief 이 엔진이 아무것도 막지 않는지.
-     * @warning wire 고속 경로가 이 판정을 믿고 필터를 건너뛴다. 잘못 참을 돌려주면
-     *          차단이 전부 우회된다.
-     */
+    /// The wire fast path trusts this and skips the filter; a wrong true bypasses every block.
     pub fn is_trivially_allow(&self) -> bool {
         !self.has_verdict_rules && self.clients.is_empty()
     }
 }
 
 impl FilterEngine for BlockEngine {
-    /** @brief 이 질의의 처분. */
     fn verdict(&self, name: &Name, qtype: RecordType, client: &ClientInfo) -> FilterVerdict {
         if !self.has_verdict_rules {
             return FilterVerdict::Allow;
@@ -1640,7 +1450,7 @@ impl FilterEngine for BlockEngine {
         self.classify(&key, qtype, client, self.track_hits).0
     }
 
-    /** @brief 처분과 함께 어느 단계에서 무엇에 걸렸는지 알려 준다. */
+    /// Also tells which stage matched and on what.
     fn explain(&self, name: &Name, qtype: RecordType, client: &ClientInfo) -> FilterExplanation {
         let mut buf = [0u8; MAX_NAME];
         let key = match normalize_into(name, &mut buf) {
@@ -1667,11 +1477,9 @@ impl FilterEngine for BlockEngine {
 }
 
 impl BlockEngine {
-    /**
-     * @brief 판정을 낸 규칙이 들어 있던 목록의 이름.
-     * @details 단계마다 그 단계가 보는 집합에서 출처를 찾는다. 정규식, 로컬 영역, 클라이언트
-     *          규칙처럼 목록 출처를 두지 않는 단계는 없다고 답한다. 진단 경로에서만 부른다.
-     */
+    /// The list that held the rule behind the verdict, looked up in the set that stage checks.
+    /// Stages without list sources, such as regexes, local zones, and client rules, answer None.
+    /// Diagnostic path only.
     fn source_name(&self, stage: MatchStage, key: &str) -> Option<String> {
         let p = &self.parts;
         let set = match stage {
@@ -1690,17 +1498,18 @@ impl BlockEngine {
         }
         p.sources.get(id as usize).cloned()
     }
-    /**
-     * @brief 우선순위 사다리를 따라 처분을 정한다. 엔진의 본체다.
-     *
-     * @details 클라이언트 정책, RPZ, 클라이언트 규칙, 중요 허용, 무응답, 중요 차단, 거부,
-     *          데이터 없음, 재작성, 허용, 정규식, 차단, 타입별 순서다. 무응답은 모든 차단보다
-     *          앞선다. 차단이 이기면 다른 목록의 규칙 하나 때문에 숨기려던 이름에 서버가 답한다.
-     *          차단 규칙의 뜻은 답하지 않아도 지켜진다.
-     * @note 로컬 영역은 가장 구체적인 영역 하나만 찾고, 그 처분을 거부, 재작성, 차단 단계
-     *       가운데 맞는 곳에서 쓴다. transparent 영역이 걸리면 로컬 영역 처분은 없다.
-     * @warning 이 순서가 규칙의 뜻이다. 바꾸면 운영자가 기대한 동작이 달라진다.
-     */
+    /// Walks the priority ladder; the core of the engine. The order is client policy, RPZ, client
+    /// rules, important allow, no response, important block, refuse, nodata, rewrite, allow, regex,
+    /// block, and per-type rules.
+    ///
+    /// No response comes before every block: if a block won, one rule in another list would make
+    /// the server answer a name it was meant to hide, and the block rule's intent is kept without
+    /// answering.
+    ///
+    /// Only the most specific local zone is looked up, and its action is used at the refuse,
+    /// rewrite, or block stage that fits. A transparent zone leaves no local zone action.
+    ///
+    /// This order is what the rules mean; changing it changes what the operator expects.
     fn classify<'a>(
         &'a self,
         key: &'a str,
@@ -1709,7 +1518,8 @@ impl BlockEngine {
         count: bool,
     ) -> (FilterVerdict, MatchStage, Option<&'a str>) {
         let p = &self.parts;
-        /* 한 이름에는 가장 구체적인 로컬 영역 하나만 걸린다. 처분이 어느 단계에서 쓰이든 한 번만 찾는다. */
+        // Only the most specific local zone applies to a name, so it is looked up once whichever
+        // stage uses it.
         let mut local_zone = None;
         let mut local_zone_looked = false;
         let mut local_zone_of = |key: &'a str| {
@@ -1969,7 +1779,7 @@ impl BlockEngine {
     }
 
     #[inline]
-    /** @brief 집합에서 찾고, 필요하면 적중을 센다. */
+    /// Counts the hit when `count` is set.
     fn lookup<'a>(&'a self, set: &'a DomainSet, key: &'a str, count: bool) -> Option<&'a str> {
         if count {
             set.hit(key)
@@ -1979,7 +1789,6 @@ impl BlockEngine {
     }
 }
 
-/** @brief 클라이언트 규칙의 키. */
 fn rule_key(r: &ClientRule) -> Option<&str> {
     if !r.domain.is_empty() {
         Some(&r.domain)
@@ -1988,16 +1797,14 @@ fn rule_key(r: &ClientRule) -> Option<&str> {
     }
 }
 
-/** @brief 원자 교체되는 엔진 핸들. 고속 경로 게이트를 함께 가지고 있다. */
+/// Atomically swapped engine handle that holds the fast-path gate with it.
 pub struct SharedFilter {
-    /** @brief 지금 엔진. 한꺼번에 교체한다. */
     swap: ArcSwap<BlockEngine>,
-    /** @brief 이 엔진이 무언가 막는지. 복제 없이 답하려고 따로 둔다. */
+    /// Kept apart so it can be read without loading the engine.
     wire_blocked: AtomicBool,
 }
 
 impl SharedFilter {
-    /** @brief 엔진 하나로 만든다. */
     pub fn from_pointee(engine: BlockEngine) -> Self {
         let wire_blocked = Self::blocks_wire(&engine);
         Self {
@@ -2006,7 +1813,6 @@ impl SharedFilter {
         }
     }
 
-    /** @brief 공유 엔진으로 만든다. */
     pub fn new(engine: Arc<BlockEngine>) -> Self {
         let wire_blocked = Self::blocks_wire(&engine);
         Self {
@@ -2015,21 +1821,17 @@ impl SharedFilter {
         }
     }
 
-    /** @brief 이 엔진이 고속 경로를 막는지. */
+    /// Whether this engine closes the wire fast path.
     fn blocks_wire(engine: &BlockEngine) -> bool {
         !engine.is_trivially_allow() || engine.has_rpz_ns() || engine.has_rpz_ip()
     }
 
-    /** @brief 지금 엔진 스냅숏. 질의 경로가 이것을 쓴다. */
     pub fn load(&self) -> Arc<BlockEngine> {
         self.swap.load()
     }
 
-    /**
-     * @brief 엔진을 교체한다.
-     * @note 고속 경로 게이트도 함께 갱신한다. 따로 두면 새 엔진이 막는데도 게이트가
-     *       열려 있는 구간이 생긴다.
-     */
+    /// Updates the fast-path gate in the same step; updated apart, there would be a window where
+    /// the new engine blocks while the gate is still open.
     pub fn store(&self, engine: Arc<BlockEngine>) {
         let wire_blocked = Self::blocks_wire(&engine);
         if wire_blocked {
@@ -2041,19 +1843,14 @@ impl SharedFilter {
         }
     }
 
-    /** @brief 지금 엔진이 고속 경로를 막는지. 잠금 없이 읽는다. */
     pub fn wire_blocked(&self) -> bool {
         self.wire_blocked.load(Ordering::Acquire)
     }
 }
 
-/** @brief 정규화한 이름을 담을 버퍼 크기. */
 const MAX_NAME: usize = 256;
 
-/**
- * @brief 이름을 정규화해 스택 버퍼에 담는다.
- * @note 질의마다 할당하지 않으려는 것이다. 버퍼에 담기지 않는 이름만 따로 할당한다.
- */
+/// Into a stack buffer, so queries do not allocate; only names that do not fit allocate.
 fn normalize_into<'a>(name: &Name, buf: &'a mut [u8; MAX_NAME]) -> Option<Cow<'a, str>> {
     let mut len = 0usize;
     for label in name.labels() {
@@ -2075,12 +1872,11 @@ fn normalize_into<'a>(name: &Name, buf: &'a mut [u8; MAX_NAME]) -> Option<Cow<'a
     Some(String::from_utf8_lossy(&buf[..len]))
 }
 
-/** @brief 이름을 정규화한 문자열로. */
 pub fn normalize_name(name: &Name) -> String {
     name.to_ascii_lower()
 }
 
-/** @brief 문자열을 정규화한다. 소문자로 내리고 끝점을 뗀다. */
+/// Lowercases and drops the trailing dot.
 pub fn normalize_str(domain: &str) -> String {
     let mut s = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if s.starts_with("*.") {
@@ -2090,12 +1886,10 @@ pub fn normalize_str(domain: &str) -> String {
 }
 
 #[cfg(test)]
-/** @brief 우선순위 사다리, 고정 왕복, 그리고 고속 경로 게이트 판정. */
 mod tests {
     use super::*;
     use onetdns_core::Transport;
 
-    /** @brief 테스트용 클라이언트 정보. */
     fn client() -> ClientInfo {
         ClientInfo {
             source_ip: "127.0.0.1".parse().unwrap(),
@@ -2105,16 +1899,13 @@ mod tests {
         }
     }
 
-    /** @brief 이름 문자열을 Name으로. */
     fn name(s: &str) -> Name {
         Name::from_str(s).unwrap()
     }
 
     #[test]
-    /**
-     * @brief 한 이름에는 가장 구체적인 로컬 영역만 걸리고, transparent는 로컬 영역만 거두는지.
-     * @details transparent가 차단 목록까지 풀면 운영자가 구독한 목록이 조용히 무력화된다.
-     */
+    /// If transparent also opened blocklists, the operator's subscribed lists would be silently
+    /// disabled.
     fn most_specific_local_zone_wins_and_transparent_only_lifts_local_zones() {
         let a =
             |ip: &str| RewriteTarget::Records(vec![onetdns_proto::RData::A(ip.parse().unwrap())]);
@@ -2183,12 +1974,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief static 영역이 적은 이름에만 답하고 나머지를 없는 이름으로 답하는지.
-     * @details 중간 이름을 NXDOMAIN으로 답하면 그 아래 이름까지 없다고 캐시하는 리졸버가
-     *          있어, 적어 둔 아래 이름이 사라진다. 영역 밖 이름을 받으면 다른 영역의 답을
-     *          가로챈다.
-     */
+    /// With NXDOMAIN for an intermediate name, some resolvers would cache everything below as
+    /// nonexistent and the listed names would vanish. Taking a name outside the zone would hijack
+    /// another zone's answers.
     fn static_local_zone_answers_only_listed_names() {
         let a =
             |ip: &str| RewriteTarget::Records(vec![onetdns_proto::RData::A(ip.parse().unwrap())]);
@@ -2247,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아무것도 막지 않는다는 판정이 정확한지. 틀리면 wire 고속 경로가 필터를 건너뛴다. */
+    /// If wrong, the wire fast path skips the filter.
     fn is_trivially_allow_is_sound_and_conservative() {
         use crate::build_from_str;
 
@@ -2297,7 +2085,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 엔진을 교체하면 고속 경로 게이트도 따라 바뀌는지. */
     fn shared_filter_gate_tracks_hot_replacement() {
         use crate::build_from_str;
 
@@ -2316,7 +2103,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정한 뒤에도 모든 판정이 같고 임시 구조가 풀려나는지. */
     fn compact_finalize_preserves_all_matches_and_releases_hashmaps() {
         let mut set = DomainSet::default();
         set.add_suffix("blocked.example");
@@ -2347,7 +2133,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인코딩 왕복에서 정확 일치, 접미사, 출처가 보존되는지. */
     fn compact_binary_roundtrip_preserves_exact_suffix_and_sources() {
         let mut set = DomainSet::default();
         set.add_exact_src("only.example", 7);
@@ -2371,7 +2156,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 굳히지 않은 집합의 인코딩을 거부하는지. */
     fn compact_binary_rejects_unfinalized_set() {
         let mut set = DomainSet::default();
         set.add_suffix("blocked.example");
@@ -2379,7 +2163,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 고정한 뒤 고치면 다시 풀리면서 규칙이 하나도 새지 않는지. */
     fn mutation_after_finalize_thaws_without_losing_rules() {
         let mut set = DomainSet::default();
         set.add_exact_src("only.example", 7);
@@ -2397,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 접미사 규칙을 거부하는지. 받으면 모든 이름이 걸려 두 경로의 답이 갈린다. */
+    /// Accepting one would match every name, and the two paths would disagree.
     fn empty_suffix_rule_is_rejected_so_both_paths_agree() {
         for rule in [".", "", ".."] {
             let mut set = DomainSet::default();
@@ -2452,7 +2235,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적중 추적을 끄면 카운터 메모리를 아예 잡지 않는지. */
     fn hit_tracking_off_stores_no_counter_maps() {
         let mut set = DomainSet::default();
         set.add_suffix("blocked.example");
@@ -2463,7 +2245,6 @@ mod tests {
         assert_eq!(set.hit("x.blocked.example"), Some("blocked.example"));
     }
 
-    /** @brief 주소만 지정한 테스트용 클라이언트. */
     fn client_ip(ip: &str) -> ClientInfo {
         ClientInfo {
             source_ip: ip.parse().unwrap(),
@@ -2473,13 +2254,11 @@ mod tests {
         }
     }
 
-    /** @brief 구성으로 엔진을 만든다. */
     fn engine_with(parts: EngineParts) -> BlockEngine {
         BlockEngine::new(parts, BlockResponse::NxDomain)
     }
 
     #[test]
-    /** @brief 클라이언트 주소 기반 RPZ가 걸리는지. */
     fn rpz_client_ip_triggers_verdict() {
         let mut parts = EngineParts::default();
         parts.rpz_client_ip.push(RpzIpRule::new(
@@ -2506,7 +2285,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답 주소 기반 RPZ가 걸리는지. */
     fn rpz_ip_verdict_matches_answer_ip() {
         let mut parts = EngineParts::default();
         parts.rpz_ip.push(RpzIpRule::new(
@@ -2520,7 +2298,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 네임서버 기반 RPZ가 이름과 주소 모두로 걸리는지. */
     fn rpz_ns_verdict_matches_name_and_ip() {
         let mut parts = EngineParts::default();
         parts.rpz_nsdname.push(
@@ -2550,7 +2327,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 네임서버 규칙이 원본 옥텟을 보존하는지. */
     fn rpz_nsdname_preserves_raw_name_octets() {
         let mut parts = EngineParts::default();
         parts
@@ -2565,7 +2341,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 네임서버 규칙 중 가장 구체적인 것이 이기는지. */
     fn rpz_ns_verdict_uses_global_most_specific_rule() {
         let mut parts = EngineParts::default();
         parts.rpz_nsip.push(RpzIpRule::new(
@@ -2598,7 +2373,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규칙별 적중이 따로 세어지는지. */
     fn per_rule_hit_counting() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("ads.example.com");
@@ -2625,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 적중 추적이 기본으로 꺼져 있는지. 켜면 메모리와 시간이 는다. */
+    /// Turning it on costs memory and time.
     fn hit_tracking_off_by_default() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("ads.example.com");
@@ -2636,7 +2410,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정확 일치 차단. */
     fn exact_block() {
         let mut parts = EngineParts::default();
         parts.block.add_exact("ads.example.com");
@@ -2653,7 +2426,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 접미사 차단이 하위 도메인까지 막는지. */
     fn suffix_blocks_subdomains() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("tracker.net");
@@ -2674,7 +2446,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설명이 어느 단계에서 무엇에 걸렸는지 알려 주는지. */
     fn explain_reports_stage_and_matched() {
         let mut parts = EngineParts::default();
         parts.block_important.add_suffix("ads.example.com");
@@ -2714,11 +2485,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설명이 규칙이 들어 있던 목록을 목록 단위로 알려 주는지.
-     * @details 엔진을 만들면 목록이 오토마톤으로 고정되므로, 고정한 뒤에도 출처가 남아야
-     *          한다. 직접 입력한 규칙은 목록이 아니므로 출처가 없어야 한다.
-     */
+    /// Building the engine freezes lists into automata, so sources must survive freezing. Rules
+    /// entered by hand are not a list and have no source.
     fn explain_reports_source_list_after_freezing() {
         let lines = vec![
             "||listed.example^".to_string(),
@@ -2768,7 +2536,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설명 경로와 판정 경로의 답이 같은지. 갈리면 설명이 거짓이 된다. */
+    /// If they disagree, the explanation is false.
     fn explain_verdict_agrees_with_verdict() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("block.test");
@@ -2797,11 +2565,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 무응답 규칙이 중요 허용 다음, 중요 차단 앞에서 판정되는지.
-     * @details 차단이 이기면 다른 목록의 차단이나 거부 규칙 하나 때문에 숨기려던 이름에 서버가
-     *          답한다. 일반 허용은 무응답을 풀지 못하고, 중요 허용만 푼다.
-     */
+    /// If a block won, one block or refuse rule in another list would make the server answer a name
+    /// it was meant to hide. A plain allow does not lift no response; only an important allow does.
     fn noresponse_sits_between_important_allow_and_important_block() {
         let mut parts = EngineParts::default();
         parts.no_response.add_suffix("quiet.test");
@@ -2854,7 +2619,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허용이 일반 차단을 이기는지. */
     fn allow_wins() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("example.com");
@@ -2871,7 +2635,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중요 차단이 허용을 이기는지. */
     fn important_block_beats_allow() {
         let mut parts = EngineParts::default();
         parts.allow.add_suffix("example.com");
@@ -2885,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 중요 허용이 중요 차단을 이기는지. 사다리의 가장 위다. */
+    /// The top of the ladder.
     fn important_allow_beats_important_block() {
         let mut parts = EngineParts::default();
         parts.block_important.add_suffix("example.com");
@@ -2898,7 +2661,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 타입 제한 차단이 그 타입에만 걸리는지. */
     fn dnstype_block_only_matching_type() {
         let mut parts = EngineParts::default();
         let mut set = DomainSet::default();
@@ -2917,7 +2679,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정규식 차단이 걸리는지. */
     fn regex_block_matches() {
         let mut parts = EngineParts::default();
         parts.regex_block.push(r"^ads?\d*\.".to_string());
@@ -2933,7 +2694,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief UTF-8이 아닌 라벨로 접미사 차단을 우회하지 못하는지. */
     fn non_utf8_label_does_not_bypass_suffix_block() {
         let mut parts = EngineParts::default();
         parts.block.add_suffix("blocked.example");
@@ -2958,7 +2718,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재작성이 정확 일치와 별표 모두에서 걸리는지. */
     fn rewrite_exact_and_wildcard() {
         use onetdns_proto::RData;
         let mut parts = EngineParts::default();
@@ -2995,7 +2754,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 거부 집합이 거부 응답을 내는지. */
     fn refuse_set_returns_refused() {
         let mut parts = EngineParts::default();
         parts.refuse.add_suffix("blocked.test");

@@ -1,6 +1,4 @@
-/*!
- * @brief 실행 중인 서버의 관리 API를 부르는 ctl 명령.
- */
+//! The ctl command, which calls a running server's management API.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -11,7 +9,6 @@ use crate::error::BoxResult;
 use crate::filters::blocklist_host_resolver;
 use crate::http;
 
-/** @brief 컨트롤 플레인 주소와 토큰을 정한다. */
 fn resolve_ctl(ctl: &CtlArgs) -> BoxResult<(String, String)> {
     if let Some(p) = &ctl.config {
         let cfg = Config::load_or_default(Some(p))?;
@@ -28,7 +25,6 @@ fn resolve_ctl(ctl: &CtlArgs) -> BoxResult<(String, String)> {
     }
 }
 
-/** @brief 컨트롤 플레인 기본 주소. */
 fn base_url(addr: SocketAddr) -> String {
     let ip = addr.ip();
     if ip.is_unspecified() {
@@ -43,13 +39,9 @@ fn base_url(addr: SocketAddr) -> String {
     }
 }
 
-/**
- * @brief 관리 API 응답이 성공일 때만 본문을 돌려준다.
- *
- * @details 요청이 거절되어도 HTTP 응답 자체는 도착하므로, 상태 코드를 보지 않으면 인증
- *          실패나 리더가 아닌 노드의 거절을 성공으로 출력하게 된다. 서버가 보낸 error
- *          문구가 있으면 그 문구를 오류로 쓴다.
- */
+/// A rejected request still gets an HTTP response, so without checking the status an auth failure
+/// or a non-leader's refusal would print as success. The server's error text, when present, becomes
+/// the error.
 fn ctl_body(resp: http::Resp) -> BoxResult<String> {
     let status = resp.status;
     let body = resp.into_string()?;
@@ -66,12 +58,10 @@ fn ctl_body(resp: http::Resp) -> BoxResult<String> {
     crate::bail!("The management API rejected the request (HTTP {status}): {message}")
 }
 
-/** @brief 토큰을 인증 헤더 값으로. */
 fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
 
-/** @brief 지표를 보여 준다. */
 pub(crate) fn ctl_stats(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
@@ -86,7 +76,6 @@ pub(crate) fn ctl_stats(ctl: &CtlArgs) -> BoxResult<()> {
     Ok(())
 }
 
-/** @brief 많이 물은 이름들을 보여 준다. */
 pub(crate) fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
@@ -116,7 +105,6 @@ pub(crate) fn ctl_top(ctl: &CtlArgs) -> BoxResult<()> {
     Ok(())
 }
 
-/** @brief 설정을 다시 읽게 한다. */
 pub(crate) fn ctl_reload(ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
@@ -130,7 +118,6 @@ pub(crate) fn ctl_reload(ctl: &CtlArgs) -> BoxResult<()> {
     Ok(())
 }
 
-/** @brief 차단 또는 허용 목록에 이름을 넣는다. */
 pub(crate) fn ctl_add(kind: &str, domain: &str, ctl: &CtlArgs) -> BoxResult<()> {
     let (base, token) = resolve_ctl(ctl)?;
     let resolver = blocklist_host_resolver(&Config::default());
@@ -147,7 +134,6 @@ pub(crate) fn ctl_add(kind: &str, domain: &str, ctl: &CtlArgs) -> BoxResult<()> 
     Ok(())
 }
 
-/** @brief 목록 개수. */
 pub(crate) fn counts((block, allow): (usize, usize)) -> onetdns_control::ListCounts {
     onetdns_control::ListCounts { block, allow }
 }

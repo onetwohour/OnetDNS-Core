@@ -1,11 +1,5 @@
-/*!
- * @brief HTTP/3. DoH3에 필요한 만큼만 구현한다.
- *
- * @details 요청과 응답은 양방향 스트림에, 설정과 QPACK 갱신은 단방향 스트림에 오간다.
- *          일반 목적 HTTP 서버가 아니라 DNS 메시지 한 건을 주고받는 데 맞춰져 있다.
- * @warning 스트림 수와 버퍼 크기에 상한이 여럿 걸려 있다. 스트림당 상한만 두면 스트림을
- *          많이 열어 우회할 수 있어, 연결 전체에도 상한이 필요하다.
- */
+//! HTTP/3, only as much as DoH3 needs: one DNS message per request. Requests and responses use
+//! bidirectional streams; settings and QPACK updates use unidirectional ones.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,103 +8,63 @@ use onetdns_http2::valid_header_field;
 use crate::conn::{ClosePeriod, Connection, QuicError, Role};
 use crate::{qpack, varint};
 
-/** @brief 본문을 전달하는 프레임. */
 pub const FRAME_DATA: u64 = 0x00;
-/** @brief 헤더를 전달하는 프레임. */
 pub const FRAME_HEADERS: u64 = 0x01;
-/** @brief 설정을 전달하는 프레임. 제어 스트림의 첫 프레임이어야 한다. */
+/// Must be the first frame on the control stream.
 pub const FRAME_SETTINGS: u64 = 0x04;
-/** @brief 서버 푸시를 취소하는 프레임. 제어 스트림에만 온다. */
 const FRAME_CANCEL_PUSH: u64 = 0x03;
-/** @brief 서버 푸시를 예고하는 프레임. 응답 스트림에만 온다. */
 const FRAME_PUSH_PROMISE: u64 = 0x05;
-/** @brief 연결 종료를 예고하는 프레임. 제어 스트림에만 온다. */
 const FRAME_GOAWAY: u64 = 0x07;
-/** @brief 받을 푸시 번호의 상한을 알리는 프레임. 클라이언트의 제어 스트림에만 온다. */
 const FRAME_MAX_PUSH_ID: u64 = 0x0d;
 
-/** @brief 이쪽이 받아들일 QPACK 테이블 크기. */
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-/** @brief 테이블을 기다리며 멈춰 있어도 되는 스트림 수. */
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
-/** @brief 받아들일 헤더 목록의 펼친 크기. */
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 
-/** @brief 이쪽이 알릴 QPACK 테이블 크기. */
 const QPACK_CAPACITY: u64 = 4096;
-/** @brief 이쪽이 알릴 대기 스트림 수. */
 const QPACK_BLOCKED: u64 = 16;
-/** @brief 헤더 목록의 펼친 크기 상한. 압축 증폭을 막는다. */
+/// Caps the expanded header list against compression amplification.
 const MAX_H3_FIELD_SECTION: u64 = 32 * 1024;
-/** @brief 동시에 다룰 요청 스트림 수. */
 const MAX_H3_STREAMS: usize = 128;
-/** @brief 스트림 하나에 모아 둘 바이트 수. */
 const MAX_H3_STREAM_BUFFER: usize = 128 * 1024;
-/** @brief 연결 전체에 모아 둘 바이트 수. 스트림당 상한만으로는 스트림을 많이 열어 우회할 수 있다. */
+/// Per-stream caps alone could be bypassed by opening many streams.
 const MAX_H3_CONNECTION_BUFFER: usize = 1024 * 1024;
-/** @brief 받아들일 단방향 스트림 수. */
 const MAX_H3_UNI_STREAMS: usize = 16;
-/** @brief 단방향 스트림 하나에 모아 둘 바이트 수. */
 const MAX_H3_UNI_BUFFER: usize = 64 * 1024;
-/** @brief 받아들일 DNS 본문 크기. */
 const MAX_DNS_BODY: usize = 64 * 1024;
-/** @brief 경로에서 뽑을 클라이언트 식별자 길이 상한. */
+/// For the client ID taken from the path.
 const MAX_CLIENT_ID: usize = 256;
-/** @brief DoH 자원이 받는 메서드. 405 응답에 담아 보낸다. */
+/// Sent in the Allow header of a 405.
 const ALLOWED_METHODS: &[u8] = b"GET, POST";
 
-/** @brief 응답이 더는 필요 없는 요청을 거둘 때 쓰는 RFC 9114 스트림 오류 코드. */
 const H3_REQUEST_CANCELLED: u64 = 0x010c;
 
-/** @brief 제어 스트림 종류 번호. */
 const UNI_CONTROL: u64 = 0x00;
-/** @brief 서버 푸시 스트림 종류 번호. */
 const UNI_PUSH: u64 = 0x01;
-/** @brief QPACK 테이블 갱신 스트림 종류 번호. */
 const UNI_QPACK_ENCODER: u64 = 0x02;
-/** @brief QPACK 확인 스트림 종류 번호. */
 const UNI_QPACK_DECODER: u64 = 0x03;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/**
- * @brief 연결을 닫을 때 상대에게 알리는 HTTP/3 와 QPACK 사유.
- * @details 종류마다 RFC 9114 와 RFC 9204 가 정한 오류 코드로 알린다.
- */
+/// Reasons for closing the connection, each sent with its RFC 9114 or RFC 9204 error code.
 pub enum H3Error {
-    /** @brief 알릴 오류 없이 닫는다. */
     NoError,
-    /** @brief 상대가 더 구체적인 코드가 없는 방식으로 규격을 어겼다. */
     GeneralProtocol,
-    /** @brief 이쪽 내부 실패. */
     Internal,
-    /** @brief 같은 종류의 필수 스트림이 또 열렸거나, 열 수 없는 쪽이 푸시 스트림을 열었다. */
     StreamCreation,
-    /** @brief 제어 스트림이나 QPACK 스트림이 닫혔다. */
     ClosedCriticalStream,
-    /** @brief 그 스트림이나 그 순서에는 올 수 없는 프레임이다. */
     FrameUnexpected,
-    /** @brief 프레임 길이와 내용이 맞지 않는다. */
     FrameError,
-    /** @brief 이쪽 자원 상한을 넘겼다. */
     ExcessiveLoad,
-    /** @brief 허락하지 않은 푸시 번호이거나 규격에 어긋난 GOAWAY, MAX_PUSH_ID 번호다. */
     IdError,
-    /** @brief 설정 값이 규격에 어긋난다. */
     SettingsError,
-    /** @brief 제어 스트림이 설정으로 시작하지 않았다. */
     MissingSettings,
-    /** @brief 형식이 어긋난 HTTP 메시지다. */
     Message,
-    /** @brief 헤더 구역을 풀지 못했거나 대기 스트림이 알린 수를 넘었다. */
     DecompressionFailed,
-    /** @brief 테이블 갱신 지시를 해석하지 못했다. */
     EncoderStream,
-    /** @brief 확인 지시를 해석하지 못했다. */
     DecoderStream,
 }
 
 impl H3Error {
-    /** @brief 상대에게 알릴 오류 코드. */
     pub fn code(self) -> u64 {
         match self {
             Self::NoError => 0x0100,
@@ -131,7 +85,6 @@ impl H3Error {
         }
     }
 
-    /** @brief 종료 프레임에 실을 사유. */
     pub fn reason(self) -> &'static str {
         match self {
             Self::NoError => "",
@@ -154,7 +107,6 @@ impl H3Error {
 }
 
 impl From<H3Error> for QuicError {
-    /** @brief 이 코드로 연결을 닫았다는 QUIC 오류. */
     fn from(error: H3Error) -> Self {
         QuicError::Application {
             code: error.code(),
@@ -163,17 +115,13 @@ impl From<H3Error> for QuicError {
     }
 }
 
-/** @brief 이 HTTP/3 오류로 연결을 닫고, 부른 쪽에 돌려줄 오류를 만든다. */
 fn close_with(conn: &mut Connection, error: H3Error) -> QuicError {
     conn.close(error.code(), error.reason());
     error.into()
 }
 
-/**
- * @brief 스트림을 처리하다 난 오류로 연결을 닫고, 상대에게 알린 오류를 돌려준다.
- * @details 보낼 버퍼가 넘친 것은 상대가 답을 읽지 않으면서 요청을 계속 보낸 결과라서
- *          H3_EXCESSIVE_LOAD 로 알린다. 이미 닫힌 연결은 처음 알린 사유를 그대로 둔다.
- */
+/// A full send buffer means the peer kept sending requests without reading replies, so it is
+/// H3_EXCESSIVE_LOAD. An already closed connection keeps its first reason.
 fn close_on_stream_error(conn: &mut Connection, error: QuicError) -> QuicError {
     let error = match error {
         QuicError::Application { .. } => error,
@@ -186,18 +134,12 @@ fn close_on_stream_error(conn: &mut Connection, error: QuicError) -> QuicError {
     error
 }
 
-/**
- * @brief HTTP/2 에만 있던 프레임 종류인지.
- * @details RFC 9114 가 이 번호들을 예약해 두고, 받으면 연결 오류로 정했다.
- */
+/// RFC 9114 reserves these HTTP/2 frame types and makes receiving one a connection error.
 fn is_reserved_http2_frame(frame_type: u64) -> bool {
     matches!(frame_type, 0x02 | 0x06 | 0x08 | 0x09)
 }
 
-/**
- * @brief 값 하나만 담는 프레임의 내용을 읽는다.
- * @details RFC 9114 는 정해진 필드보다 길거나 짧은 프레임을 H3_FRAME_ERROR 로 정했다.
- */
+/// RFC 9114 makes a frame longer or shorter than its fields H3_FRAME_ERROR.
 fn single_varint(payload: &[u8]) -> Result<u64, H3Error> {
     match varint::read(payload) {
         Some((value, used)) if used == payload.len() => Ok(value),
@@ -206,25 +148,17 @@ fn single_varint(payload: &[u8]) -> Result<u64, H3Error> {
 }
 
 #[derive(Default)]
-/** @brief 상대 제어 스트림에서 설정 뒤에 받은 번호들. */
 struct PeerControl {
-    /**
-     * @brief 상대가 GOAWAY 로 알린 가장 최근 번호.
-     * @details 서버가 보낸 것은 처리하지 않을 첫 요청 스트림 번호이고, 클라이언트가 보낸 것은
-     *          받지 않을 첫 푸시 번호다. RFC 9114 는 이 번호가 커지는 것을 금한다.
-     */
+    /// The latest GOAWAY ID. From a server it is the first request stream it will not process; from
+    /// a client, the first push ID it will not accept. RFC 9114 forbids it to grow.
     goaway: Option<u64>,
-    /** @brief 클라이언트가 MAX_PUSH_ID 로 알린 번호. 줄어들 수 없다. */
+    /// Cannot decrease.
     max_push_id: Option<u64>,
 }
 
 impl PeerControl {
-    /**
-     * @brief 설정 뒤에 제어 스트림으로 온 프레임 하나를 처리한다.
-     * @details 이쪽은 서버 푸시를 허락하지도 보내지도 않으므로 CANCEL_PUSH 가 가리키는 번호는
-     *          모두 있을 수 없는 번호다. 서버의 GOAWAY 는 클라이언트가 연 양방향 스트림 번호만
-     *          담을 수 있다.
-     */
+    /// This side neither allows nor sends server push, so every CANCEL_PUSH ID is invalid. A
+    /// server's GOAWAY may only carry a client-initiated bidirectional stream ID.
     fn on_frame(&mut self, frame_type: u64, payload: &[u8], role: Role) -> Result<(), H3Error> {
         match frame_type {
             FRAME_DATA | FRAME_HEADERS | FRAME_SETTINGS | FRAME_PUSH_PROMISE => {
@@ -260,12 +194,9 @@ impl PeerControl {
     }
 }
 
-/**
- * @brief 요청이나 응답 스트림의 프레임 배치를 본다.
- * @details 제어 스트림 전용 프레임, HTTP/2 예약 번호, 헤더보다 앞선 본문은 RFC 9114 가 연결
- *          오류로 정했다. 그래서 메시지 내용보다 먼저 본다. PUSH_PROMISE 는 서버만 보낼 수
- *          있고, 이쪽 클라이언트는 푸시를 허락하지 않는다.
- */
+/// Checked before the message content, since RFC 9114 makes control-only frames, reserved HTTP/2
+/// types, and DATA before HEADERS connection errors. Only a server may send PUSH_PROMISE, and this
+/// side's client never allows push.
 fn check_message_frames(frames: &[(u64, Vec<u8>)], role: Role) -> Result<(), H3Error> {
     let mut headers_seen = false;
     for &(frame_type, _) in frames {
@@ -284,18 +215,13 @@ fn check_message_frames(frames: &[(u64, Vec<u8>)], role: Role) -> Result<(), H3E
     Ok(())
 }
 
-/** @brief 연결 전체 버퍼 상한 안에 들어가는지. */
 fn fits_connection_buffer(buffered: usize, incoming: usize) -> bool {
     buffered
         .checked_add(incoming)
         .is_some_and(|total| total <= MAX_H3_CONNECTION_BUFFER)
 }
 
-/**
- * @brief 헤더 테이블이 따라오기를 기다리는 메시지를 남겨 둔다.
- * @details 이쪽이 알린 대기 스트림 수를 상대가 넘기면 RFC 9204 가 QPACK_DECOMPRESSION_FAILED
- *          로 정했다.
- */
+/// RFC 9204 makes exceeding the advertised blocked stream count QPACK_DECOMPRESSION_FAILED.
 fn hold_blocked(
     blocked: &mut Vec<(u64, Vec<u8>)>,
     buffered: usize,
@@ -312,14 +238,12 @@ fn hold_blocked(
     Ok(())
 }
 
-/** @brief 프레임 하나를 쓴다. 유형과 길이가 앞에 붙는다. */
 pub fn encode_frame(out: &mut Vec<u8>, ftype: u64, payload: &[u8]) {
     varint::write(out, ftype);
     varint::write(out, payload.len() as u64);
     out.extend_from_slice(payload);
 }
 
-/** @brief 버퍼 전체를 프레임 목록으로 읽는다. */
 pub fn parse_frames(buf: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     let mut pos = 0usize;
     let mut out = Vec::new();
@@ -337,10 +261,7 @@ pub fn parse_frames(buf: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     Some(out)
 }
 
-/**
- * @brief 다 온 프레임만 꺼내고 나머지는 남긴다.
- * @details 스트림 데이터는 조각나서 온다. 덜 온 프레임을 오류로 보면 정상 통신이 끊긴다.
- */
+/// Partial frames stay buffered; stream data arrives in pieces.
 fn drain_complete_frames(buf: &mut Vec<u8>) -> Vec<(u64, Vec<u8>)> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -378,11 +299,8 @@ fn drain_complete_frames(buf: &mut Vec<u8>) -> Vec<(u64, Vec<u8>)> {
     out
 }
 
-/**
- * @brief 설정 프레임을 읽는다.
- * @warning 같은 설정이 두 번 오면 거부한다. 어느 값을 쓸지 정해지지 않고, 구현마다 다르게
- *          고르면 그 차이를 노릴 수 있다.
- */
+/// A repeated setting is rejected: which value applies is undefined, and implementations that pick
+/// differently can be played against each other.
 fn parse_settings(payload: &[u8]) -> Result<Vec<(u64, u64)>, H3Error> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -400,7 +318,6 @@ fn parse_settings(payload: &[u8]) -> Result<Vec<(u64, u64)>, H3Error> {
     Ok(out)
 }
 
-/** @brief 이쪽이 알릴 설정. */
 fn our_settings() -> Vec<u8> {
     let mut s = Vec::new();
     varint::write(&mut s, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
@@ -413,50 +330,32 @@ fn our_settings() -> Vec<u8> {
 }
 
 #[derive(Default)]
-/** @brief 받고 있는 단방향 스트림 하나. */
 struct UniIn {
-    /** @brief 아직 온전한 것이 되지 못한 바이트. */
     buf: Vec<u8>,
-    /** @brief 이 스트림의 쓰임새. 첫 값을 읽어야 안다. */
     stype: Option<u64>,
-    /** @brief 설정 메시지를 이미 봤는지. 두 번 오면 프로토콜 위반이다. */
     settings_seen: bool,
 }
 
-/** @brief QPACK 인코더와 디코더, 그리고 제어 스트림 상태. */
 struct QpackCtx {
-    /** @brief 이 연결에서 이쪽이 맡은 역할. 상대가 보낼 수 있는 프레임과 스트림이 갈린다. */
+    /// Decides which frames and streams the peer may send.
     role: Role,
-    /** @brief 헤더를 적는 쪽. */
     enc: qpack::Encoder,
-    /** @brief 헤더를 읽는 쪽. */
     dec: qpack::Decoder,
 
-    /** @brief 이쪽이 연 제어 스트림. */
     ctrl_sid: Option<u64>,
-    /** @brief 이쪽이 연 적는 쪽 스트림. */
     enc_sid: Option<u64>,
-    /** @brief 이쪽이 연 읽는 쪽 스트림. */
     dec_sid: Option<u64>,
-    /** @brief 제어 스트림의 첫 값을 보냈는지. */
     ctrl_sent: bool,
-    /** @brief 적는 쪽 스트림의 첫 값을 보냈는지. */
     enc_sent: bool,
-    /** @brief 읽는 쪽 스트림의 첫 값을 보냈는지. */
     dec_sent: bool,
-    /** @brief 상대가 연 제어 스트림. */
     peer_ctrl_sid: Option<u64>,
-    /** @brief 상대가 연 적는 쪽 스트림. */
     peer_enc_sid: Option<u64>,
-    /** @brief 상대가 연 읽는 쪽 스트림. */
     peer_dec_sid: Option<u64>,
-    /** @brief 상대가 연 단방향 스트림들의 상태. */
     uni_in: HashMap<u64, UniIn>,
-    /** @brief 상대 제어 스트림이 설정 뒤에 알린 번호들. */
     peer_control: PeerControl,
 }
 
-/** @brief HashMap의 실제 bucket 수보다 작은 공개 capacity를 보수적으로 환산한다. */
+/// `HashMap::capacity` is below the real bucket count, so this estimates on the high side.
 fn hash_map_retained_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     if map.capacity() == 0 {
         return 0;
@@ -468,7 +367,6 @@ fn hash_map_retained_bytes<K, V>(map: &HashMap<K, V>) -> usize {
 }
 
 impl QpackCtx {
-    /** @brief 초기 상태. */
     fn new(role: Role) -> Self {
         QpackCtx {
             role,
@@ -488,7 +386,6 @@ impl QpackCtx {
         }
     }
 
-    /** @brief QPACK 테이블과 단방향 제어 입력이 보유한 바이트. */
     fn retained_payload_bytes(&self) -> usize {
         self.enc
             .retained_payload_bytes()
@@ -499,7 +396,6 @@ impl QpackCtx {
             }))
     }
 
-    /** @brief 제어와 QPACK 스트림을 열고 설정을 보낸다. */
     fn send_setup(&mut self, conn: &mut Connection) -> Result<(), QuicError> {
         if self.ctrl_sid.is_none() {
             self.ctrl_sid = Some(conn.open_uni_stream()?);
@@ -533,11 +429,8 @@ impl QpackCtx {
         Ok(())
     }
 
-    /**
-     * @brief 단방향 스트림 데이터를 처리한다.
-     * @warning 제어 스트림은 연결마다 하나뿐이다. 두 번째가 오면 연결을 끊는다. 첫 프레임이
-     *          설정이 아닌 경우도 마찬가지다.
-     */
+    /// There is one control stream per connection; a second one, or one not starting with SETTINGS,
+    /// closes the connection.
     fn on_uni(&mut self, id: u64, data: &[u8], fin: bool) -> Result<(), H3Error> {
         if !self.uni_in.contains_key(&id) && self.uni_in.len() >= MAX_H3_UNI_STREAMS {
             return Err(H3Error::ExcessiveLoad);
@@ -627,10 +520,7 @@ impl QpackCtx {
         Ok(())
     }
 
-    /**
-     * @brief 단방향 스트림이 끊겼음을 처리한다.
-     * @note 제어와 QPACK 스트림이 끊기면 연결을 이어 갈 수 없다. 규격이 그것을 오류로 정했다.
-     */
+    /// Resetting the control stream or a QPACK stream is a connection error.
     fn on_reset(&mut self, id: u64) -> Result<(), H3Error> {
         let critical = self.peer_ctrl_sid == Some(id)
             || self.peer_enc_sid == Some(id)
@@ -649,7 +539,6 @@ impl QpackCtx {
         }
     }
 
-    /** @brief 헤더를 인코딩하고 테이블 갱신 지시를 함께 얻는다. */
     fn encode_headers(
         &mut self,
         conn: &mut Connection,
@@ -670,11 +559,8 @@ impl QpackCtx {
         Ok(section)
     }
 
-    /**
-     * @brief 쌓인 QPACK 확인 지시를 보낸다.
-     * @details 확인 지시를 실을 스트림을 아직 열지 못했으면 지시를 남겨 두었다가 연 뒤에
-     *          보낸다. 지시가 스트림 종류 번호보다 먼저 나가면 상대가 스트림 종류를 잘못 읽는다.
-     */
+    /// Instructions wait until the decoder stream is open and its type has been sent; sent earlier,
+    /// the peer would misread the stream type.
     fn flush_decoder_stream(&mut self, conn: &mut Connection) -> Result<(), QuicError> {
         let Some(sid) = self.dec_sid.filter(|_| self.dec_sent) else {
             return Ok(());
@@ -691,12 +577,9 @@ impl QpackCtx {
     }
 }
 
-/**
- * @brief 제어 스트림이나 QPACK 스트림으로 보낸다.
- * @details 이 스트림들이 닫히면 HTTP/3 연결은 이어 갈 수 없다. 상대가 STOP_SENDING 으로
- *          닫은 것을 스트림 오류로 돌려주면 부른 쪽이 연결을 살려 두고, 그 뒤로 헤더 테이블
- *          갱신이 상대에게 닿지 않는다. 그래서 연결 오류로 바꾸고 그 코드로 연결을 닫는다.
- */
+/// Losing one of these streams ends HTTP/3. A STOP_SENDING returned as a stream error would keep
+/// the connection up while QPACK updates no longer reach the peer, so it becomes a connection error
+/// and closes the connection with that code.
 fn send_critical(conn: &mut Connection, id: u64, data: &[u8]) -> Result<(), QuicError> {
     match conn.send_stream(id, data, false) {
         Err(QuicError::StreamClosed) => Err(close_with(conn, H3Error::ClosedCriticalStream)),
@@ -704,9 +587,7 @@ fn send_critical(conn: &mut Connection, id: u64, data: &[u8]) -> Result<(), Quic
     }
 }
 
-/** @brief base64url 디코딩. GET 방식 DoH3의 질의가 이 형식으로 온다. */
 fn base64url_decode(input: &[u8]) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -737,56 +618,38 @@ fn base64url_decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[derive(Default)]
-/** @brief 아직 다 오지 않은 요청 하나. */
 struct ReqBuf {
-    /** @brief 이 요청에서 모은 바이트. */
     buf: Vec<u8>,
-    /** @brief 상대가 다 보냈는지. */
     fin: bool,
-    /** @brief 이미 위로 넘겼는지. */
+    /// Already handed to the caller.
     done: bool,
 }
 
-/** @brief 요청이나 응답을 추출한 결과. 아직 덜 온 것과 형식이 틀린 것을 구분한다. */
+/// Tells data still arriving from malformed data.
 enum Extracted<T> {
-    /** @brief 다 꺼냈다. */
     Done(T),
-    /** @brief 아직 못 꺼낸다. 헤더 테이블이 따라오기를 기다린다. */
     Blocked,
-    /** @brief HTTP 메시지의 형식이 어긋난다. 그 메시지 하나만 거절한다. */
+    /// Rejects that message only.
     Bad,
-    /**
-     * @brief 프레임 배치나 헤더 압축이 어긋났다.
-     * @details RFC 9114 와 RFC 9204 가 연결 오류로 정한 경우다. 헤더 압축 상태가 상대와 어긋났을
-     *          수 있어 그 연결로는 다음 메시지도 믿을 수 없다.
-     */
+    /// Frame layout or header compression broke a rule that RFC 9114 or RFC 9204 makes a connection
+    /// error. The QPACK state may now differ from the peer's, so later messages on the connection
+    /// cannot be trusted.
     Fatal(H3Error),
-    /**
-     * @brief 프로토콜은 맞지만 이 자원이 받지 않는 요청이다.
-     *
-     * @details 거절하는 까닭을 상태 코드로 담아 보낸다. 400 하나로 접으면 클라이언트가
-     *          헤더를 고쳐야 하는지 메서드를 바꿔야 하는지 알 수 없다.
-     */
+    /// Valid, but not accepted by this resource; the status code says why. Folding everything into
+    /// 400 would not tell the client whether to fix its headers or change the method.
     Refused(&'static [u8]),
 }
 
 #[derive(Debug, Clone)]
-/** @brief 추출한 DoH3 요청 하나. */
 pub struct H3DnsRequest {
-    /** @brief 이 요청이 온 스트림. */
     pub stream_id: u64,
-    /** @brief 요청에 담긴 질의 바이트. */
+    /// The DNS query.
     pub wire: Vec<u8>,
-    /** @brief 요청한 경로. */
     pub path: Vec<u8>,
-    /** @brief 경로에서 읽어 낸 클라이언트 식별자. */
     pub client_id: Option<String>,
 }
 
-/**
- * @brief 경로에서 클라이언트 식별자를 추출한다.
- * @details 경로마다 다른 정책을 걸 수 있게 해 준다. 길이에 상한이 있고, 형식이 어긋나면 없다.
- */
+/// None when malformed or too long.
 fn client_id_from_path(path: &[u8]) -> Option<String> {
     let p = std::str::from_utf8(path).ok()?;
     let base = p.split('?').next().unwrap_or(p).trim_end_matches('/');
@@ -808,10 +671,7 @@ fn client_id_from_path(path: &[u8]) -> Option<String> {
     None
 }
 
-/**
- * @brief HTTP/3 메시지에 실을 수 없는 연결 전용 필드인지.
- * @details TE 는 요청 헤더에 trailers 값으로만 올 수 있어 부르는 쪽이 따로 본다.
- */
+/// TE is allowed only in request headers with the value trailers; the caller checks it.
 fn is_connection_specific_field(name: &[u8]) -> bool {
     matches!(
         name,
@@ -819,11 +679,8 @@ fn is_connection_specific_field(name: &[u8]) -> bool {
     )
 }
 
-/**
- * @brief 트레일러 구역이 규격에 맞는지 본다.
- * @details 의사 헤더와 연결 전용 필드는 트레일러에 올 수 없고, TE 는 요청 헤더에만 허락된다.
- *          트레일러의 값은 DNS 메시지를 해석하는 데 쓰지 않는다.
- */
+/// Pseudo-headers and connection-specific fields cannot appear in trailers, and TE is allowed only
+/// in request headers. Trailer values are not used to read the DNS message.
 fn valid_trailer_section(fields: &[(Vec<u8>, Vec<u8>)]) -> bool {
     fields.iter().all(|(name, value)| {
         valid_header_field(name, value)
@@ -833,7 +690,6 @@ fn valid_trailer_section(fields: &[(Vec<u8>, Vec<u8>)]) -> bool {
     })
 }
 
-/** @brief 헤더 구역을 푼 결과를 추출 결과로 옮긴다. */
 fn decoded<T>(result: qpack::DecodeResult) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Extracted<T>> {
     match result {
         qpack::DecodeResult::Done(fields) => Ok(fields),
@@ -842,18 +698,16 @@ fn decoded<T>(result: qpack::DecodeResult) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Ex
     }
 }
 
-/**
- * @brief 스트림 버퍼에서 DoH3 요청을 추출한다.
- *
- * @details 프레임 순서와 헤더 규칙을 엄격히 본다. 헤더가 본문보다 먼저 와야 하고,
- *          의사 헤더는 중복될 수 없으며, 알린 길이와 실제 본문 길이가 맞아야 한다. 요청은 헤더
- *          구역, 본문, 그리고 선택적인 트레일러 구역 하나로 끝난다. 트레일러 뒤에 다시 온 HEADERS
- *          나 DATA 는 RFC 9114 가 연결 오류로 정했다.
- * @warning 느슨하게 보면 같은 요청을 서로 다르게 해석하는 구현 차이가 생긴다. 그 차이가
- *          곧 앞단 장비를 우회하는 경로다.
- * @note 두 헤더 구역을 모두 푼 뒤에 내용을 본다. 잘못된 요청에도 연결은 남으므로, 풀지 않고
- *       버린 구역이 있으면 상대 인코더는 그 구역의 확인 지시를 끝내 받지 못한다.
- */
+/// Strict about frame order and header rules: HEADERS before DATA, no duplicate pseudo-headers, and
+/// a declared length that matches the body. A request is a header section, a body, and at most one
+/// trailer section; HEADERS or DATA after the trailers is a connection error under RFC 9114.
+///
+/// Reading loosely lets implementations disagree about one request, and that disagreement is a way
+/// past front-end devices.
+///
+/// Both header sections are decoded before their content is checked. A bad request leaves the
+/// connection open, so a section dropped undecoded would never be acknowledged to the peer's
+/// encoder.
 fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extracted<H3DnsRequest> {
     let Some(frames) = parse_frames(buf) else {
         return Extracted::Fatal(H3Error::FrameError);
@@ -938,10 +792,9 @@ fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extrac
             }
             content_length = Some(length);
         } else if n == b"content-type" {
-            /*
-             * 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는 것은 요청 스머글링의
-             * 경로라 그대로 400 이고, 다른 형식은 415 로 구분해야 클라이언트가 고칠 수 있다.
-             */
+            // A different content type and a repeated header mean different things. A repeated
+            // header is a request smuggling path, so it stays 400; a different type gets 415 so the
+            // client can fix it.
             let is_dns = v.eq_ignore_ascii_case(b"application/dns-message");
             if content_type.replace(is_dns).is_some() {
                 return Extracted::Bad;
@@ -1018,25 +871,17 @@ fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extrac
     }
 }
 
-/** @brief 서버 쪽 HTTP/3 연결. */
 pub struct H3Connection {
-    /** @brief 아래에 깔린 QUIC 연결. */
     conn: Connection,
-    /** @brief 제어 스트림의 첫 값을 보냈는지. */
     control_sent: bool,
-    /** @brief 받고 있는 요청들. */
     requests: HashMap<u64, ReqBuf>,
-    /** @brief 위로 넘길 준비가 된 요청들. */
     ready: Vec<H3DnsRequest>,
-    /** @brief 헤더 압축 상태. */
     qp: QpackCtx,
 
-    /** @brief 헤더 테이블이 따라오기를 기다리는 요청들. */
     blocked: Vec<(u64, Vec<u8>)>,
 }
 
 impl H3Connection {
-    /** @brief QUIC 연결 위에 HTTP/3를 얹는다. */
     pub fn new(conn: Connection) -> Self {
         H3Connection {
             conn,
@@ -1048,11 +893,8 @@ impl H3Connection {
         }
     }
 
-    /**
-     * @brief 아직 안 보냈으면 제어 스트림 설정을 보낸다.
-     * @details 1-RTT 키가 생기면 핸드셰이크가 끝나기 전이라도 보낸다. 0-RTT 로 온 QPACK 갱신
-     *          지시에는 확인 지시로 답해야 하는데, 그 지시를 실을 스트림이 여기서 함께 열린다.
-     */
+    /// Sent once 1-RTT keys exist, even before the handshake completes: QPACK updates that arrive
+    /// in 0-RTT need acknowledgments, and the stream that carries them opens here.
     fn maybe_send_control(&mut self) -> Result<(), QuicError> {
         if self.control_sent || !self.conn.can_send_app() {
             return Ok(());
@@ -1062,7 +904,6 @@ impl H3Connection {
         Ok(())
     }
 
-    /** @brief 지금 모아 둔 바이트 총량. 연결 상한 판정에 쓴다. */
     fn buffered_bytes(&self) -> usize {
         self.requests
             .values()
@@ -1072,10 +913,8 @@ impl H3Connection {
             .fold(0usize, usize::saturating_add)
     }
 
-    /**
-     * @brief HTTP/3와 아래 QUIC 연결이 지금 보유한 가변 payload 바이트.
-     * @details DoH3 리스너의 전역 메모리 예산이 연결별 상한의 곱을 막는 데 쓴다.
-     */
+    /// Mutable payload bytes held by HTTP/3 and the QUIC connection under it. The DoH3 listener's
+    /// global memory budget uses it so per-connection caps cannot multiply.
     pub fn retained_payload_bytes(&self) -> usize {
         let requests = hash_map_retained_bytes(&self.requests).saturating_add(
             self.requests.values().fold(0usize, |total, request| {
@@ -1107,7 +946,6 @@ impl H3Connection {
             .saturating_add(self.qp.retained_payload_bytes())
     }
 
-    /** @brief 모은 데이터에서 요청을 추출해 본다. 덜 왔으면 다시 넣어 둔다. */
     fn try_extract(&mut self, id: u64, buf: Vec<u8>) -> Result<(), QuicError> {
         let status = match extract_dns_request(&mut self.qp.dec, id, &buf) {
             Extracted::Done(mut q) => {
@@ -1128,23 +966,19 @@ impl H3Connection {
             Extracted::Bad => b"400".as_slice(),
             Extracted::Refused(status) => status,
         };
-        /*
-         * 상대가 이 스트림의 답을 이미 거절했으면 보낼 곳이 없을 뿐이다. 그 오류를 올리면
-         * recv_datagram 이 실패하고, 부른 쪽은 연결 전체를 버린다.
-         */
+        // The peer already refused this stream's reply, so there is just nowhere to send it.
+        // Returning the error would fail recv_datagram, and the caller would drop the whole
+        // connection.
         match self.send_status(id, status) {
             Ok(()) | Err(QuicError::StreamClosed) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    /**
-     * @brief 데이터그램 하나를 받아 상태를 진행시킨다.
-     * @details HTTP/3 계층에서 연결 오류가 나면 상대에게 알리고 연결을 닫은 뒤 그 오류를
-     *          돌려준다. QUIC 계층의 오류는 그 계층이 이미 알렸다. 닫힌 연결에 온 데이터그램은
-     *          QUIC 계층만 처리한다. 종료는 모든 스트림을 함께 닫으므로 그 안의 요청에는 답할 수
-     *          없다.
-     */
+    /// An HTTP/3 connection error is sent to the peer, the connection is closed, and the error is
+    /// returned; the QUIC layer has already reported its own errors. A datagram for a closed
+    /// connection goes to the QUIC layer only: closing ends every stream, so their requests cannot
+    /// be answered.
     pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         self.conn.recv_datagram(dg)?;
         if self.conn.is_closed() {
@@ -1154,7 +988,6 @@ impl H3Connection {
             .map_err(|error| close_on_stream_error(&mut self.conn, error))
     }
 
-    /** @brief QUIC 계층이 내놓은 스트림 데이터를 요청으로 모으고 끊긴 스트림을 정리한다. */
     fn process_streams(&mut self) -> Result<(), QuicError> {
         match self.maybe_send_control() {
             Ok(()) | Err(QuicError::FlowControl | QuicError::StreamLimit) => {}
@@ -1167,7 +1000,8 @@ impl H3Connection {
                 self.requests.remove(&id);
                 self.blocked.retain(|(stream_id, _)| *stream_id != id);
                 self.ready.retain(|request| request.stream_id != id);
-                /* 끊긴 요청의 헤더 구역은 끝내 풀지 않으므로 상대 인코더에 알린다. */
+                // A reset request's header sections will never be decoded, so tell the peer's
+                // encoder.
                 self.qp.dec.cancel_stream(id);
             }
         }
@@ -1217,12 +1051,10 @@ impl H3Connection {
         Ok(())
     }
 
-    /** @brief 완성된 요청들을 메타 정보와 함께 가져간다. */
     pub fn take_requests_meta(&mut self) -> Vec<H3DnsRequest> {
         std::mem::take(&mut self.ready)
     }
 
-    /** @brief 완성된 요청들을 가져간다. */
     pub fn take_requests(&mut self) -> Vec<(u64, Vec<u8>)> {
         self.take_requests_meta()
             .into_iter()
@@ -1230,16 +1062,12 @@ impl H3Connection {
             .collect()
     }
 
-    /** @brief DNS 응답을 보낸다. */
     pub fn send_response(&mut self, id: u64, dns: &[u8], max_age: u32) -> Result<(), QuicError> {
         self.send_response_owned(id, dns.to_vec(), max_age)
     }
 
-    /**
-     * @brief 소유권을 넘겨받아 DNS 응답을 보낸다. 복사를 줄인다.
-     * @param max_age HTTP 캐시가 신선하다고 볼 시간. RFC 8484가 답변부 최소 TTL을
-     *                넘지 못하게 하므로 응답을 만든 쪽이 측정해서 넘긴다.
-     */
+    /// `max_age` is the HTTP freshness lifetime. RFC 8484 caps it at the smallest TTL in the answer
+    /// section, so the caller computes it.
     pub fn send_response_owned(
         &mut self,
         id: u64,
@@ -1260,13 +1088,9 @@ impl H3Connection {
         self.conn.send_stream_owned(id, payload, true)
     }
 
-    /** @brief 본문 없이 상태 코드만 보낸다. */
     pub fn send_status(&mut self, id: u64, status: &[u8]) -> Result<(), QuicError> {
         self.maybe_send_control()?;
-        /*
-         * 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로 다시 물어야
-         * 하는지 알 길이 없다.
-         */
+        // A 405 must list the accepted methods, or the client cannot tell what to retry with.
         let allow: [(&[u8], &[u8]); 2] = [(b":status", status), (b"allow", ALLOWED_METHODS)];
         let plain: [(&[u8], &[u8]); 1] = [(b":status", status)];
         let section = if status == b"405" {
@@ -1279,110 +1103,86 @@ impl H3Connection {
         self.conn.send_stream_owned(id, payload, true)
     }
 
-    /** @brief 내보낼 데이터그램을 꺼낸다. */
     pub fn next_datagram(&mut self) -> Option<Vec<u8>> {
         self.conn.next_datagram()
     }
 
-    /** @brief 핸드셰이크가 끝났는지. */
     pub fn is_handshake_complete(&self) -> bool {
         self.conn.is_handshake_complete()
     }
 
-    /** @brief 이쪽 연결 식별자. */
     pub fn local_connection_id(&self) -> &[u8] {
         self.conn.local_connection_id()
     }
 
-    /** @brief 상대가 알린 전송 매개변수. */
     pub fn peer_transport_params(&self) -> Option<&crate::params::TransportParams> {
         self.conn.peer_transport_params()
     }
 
-    /** @brief 클라이언트 인증서를 확인했는지. */
     pub fn client_authenticated(&self) -> bool {
         self.conn.client_authenticated()
     }
 
-    /** @brief 확인된 클라이언트 신원. */
     pub fn client_auth_identity(&self) -> Option<&str> {
         self.conn.client_auth_identity()
     }
 
-    /** @brief 연결이 닫혔는지. */
     pub fn is_closed(&self) -> bool {
         self.conn.is_closed()
     }
 
-    /** @brief 닫힌 연결의 closing 이나 draining 기간까지 끝났는지. */
+    /// Whether the closing or draining period has also ended.
     pub fn is_terminated(&self) -> bool {
         self.conn.is_terminated()
     }
 
-    /**
-     * @brief 닫힌 연결에서 closing 이나 draining 기간에 쓸 상태만 남기고 나머지를 버린다.
-     * @return 남은 기간의 상태. 열린 연결이거나 기간이 이미 끝났으면 None.
-     */
+    /// Keeps only the state the closing or draining period needs. None for an open connection or
+    /// when the period has ended.
     pub fn into_close_period(self) -> Option<ClosePeriod> {
         self.conn.into_close_period()
     }
 
-    /** @brief 이 사유로 연결을 닫는다. 이미 닫힌 연결은 처음 알린 사유를 그대로 둔다. */
+    /// An already closed connection keeps its first reason.
     pub fn close(&mut self, error: H3Error) {
         self.conn.close(error.code(), error.reason());
     }
 
-    /** @brief 밑에 깔린 QUIC 연결. */
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
 
-    /** @brief 지금 시각을 알린다. 시간은 밖에서 넣어 준다. */
     pub fn set_now(&mut self, now_ms: u64) {
         self.conn.set_now(now_ms);
     }
 
-    /** @brief 데드라인이 지났을 때 할 일을 한다. */
     pub fn on_timeout(&mut self, now_ms: u64) {
         self.conn.on_timeout(now_ms);
     }
 }
 
 #[derive(Default)]
-/** @brief 아직 다 오지 않은 응답 하나. */
 struct RespBuf {
-    /** @brief 이 응답에서 모은 바이트. */
     buf: Vec<u8>,
-    /** @brief 다 받았는지. */
     done: bool,
-    /**
-     * @brief 결과를 이미 내고 읽기를 그만두었는지.
-     * @details 서버가 STOP_SENDING 을 받기 전에 보낸 데이터는 그대로 도착하므로 버린다. 서버가
-     *          스트림을 끝내거나 끊으면 이 항목도 지운다.
-     */
+    /// The result is out and reading stopped. Data the server sent before seeing STOP_SENDING still
+    /// arrives and is dropped; the entry goes when the server ends or resets the stream.
     stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/** @brief 요청 하나가 받은 결과. */
 pub enum H3Response {
-    /** @brief 상태 200 과 application/dns-message 로 온 DNS 메시지. */
+    /// Status 200 with application/dns-message.
     Dns(Vec<u8>),
-    /**
-     * @brief DNS 메시지를 싣지 않은 최종 응답의 상태 코드. 본문은 버린다.
-     * @details 200 이어도 content-type 이 application/dns-message 하나가 아니거나, 본문이 DNS
-     *          메시지 상한을 넘거나, 응답이 스트림 버퍼 상한을 넘으면 여기에 온다.
-     */
+    /// The status of a final response without a DNS message; the body is dropped. A 200 lands here
+    /// too when content-type is not exactly application/dns-message, the body exceeds the DNS
+    /// message limit, or the response exceeds the stream buffer limit.
     NotDns(u16),
-    /**
-     * @brief 서버가 답하지 않았다.
-     * @details 스트림이 끊겼거나, 서버가 GOAWAY 로 그 요청을 처리하지 않는다고 알렸다.
-     */
+    /// The stream was reset, or the server's GOAWAY said it will not process the request.
     Unanswered,
 }
 
 impl H3Response {
-    /** @brief 이 결과가 붙잡고 있는 바이트. 연결 버퍼 상한에 센다. */
+    /// Counted toward the connection buffer limit.
     fn held_bytes(&self) -> usize {
         match self {
             H3Response::Dns(body) => body.len(),
@@ -1391,36 +1191,24 @@ impl H3Response {
     }
 }
 
-/** @brief 클라이언트 쪽 HTTP/3 연결. */
 pub struct H3Client {
-    /** @brief 아래에 깔린 QUIC 연결. */
     conn: Connection,
-    /** @brief 첫 설정을 보냈는지. */
     setup_sent: bool,
 
-    /** @brief 다음에 열 양방향 스트림 번호. */
     next_bidi: u64,
-    /** @brief 받고 있는 응답들. */
     resp: HashMap<u64, RespBuf>,
 
-    /** @brief 결과가 나온 요청들. */
     ready: Vec<(u64, H3Response)>,
-    /** @brief 헤더 압축 상태. */
     qp: QpackCtx,
 
-    /** @brief 헤더 테이블이 따라오기를 기다리는 응답들. */
     blocked: Vec<(u64, Vec<u8>)>,
 
-    /**
-     * @brief 보냈지만 아직 답을 받지 못한 요청 스트림.
-     * @details 서버가 GOAWAY 로 알린 번호 이상인 요청은 처리되지 않는다. 그 요청들을 여기서
-     *          골라 다른 연결로 다시 보낼 수 있다고 알린다.
-     */
+    /// Sent but unanswered. Requests at or above the server's GOAWAY ID are not processed; picking
+    /// them from here lets the caller retry them on another connection.
     in_flight: HashSet<u64>,
 }
 
 impl H3Client {
-    /** @brief QUIC 연결 위에 HTTP/3 클라이언트를 얹는다. */
     pub fn new(conn: Connection) -> Self {
         H3Client {
             conn,
@@ -1434,16 +1222,12 @@ impl H3Client {
         }
     }
 
-    /**
-     * @brief 서버가 GOAWAY 로 연결 정리를 알렸는지.
-     * @details 연결은 아직 열려 있고 앞서 보낸 요청의 답은 올 수 있지만, 새 요청은 다른 연결로
-     *          보내야 한다.
-     */
+    /// The connection stays open and earlier requests can still be answered, but new requests must
+    /// go to another connection.
     pub fn is_going_away(&self) -> bool {
         self.qp.peer_control.goaway.is_some()
     }
 
-    /** @brief 아직 안 보냈으면 제어 스트림 설정을 보낸다. */
     fn maybe_send_setup(&mut self) -> Result<(), QuicError> {
         if self.setup_sent {
             return Ok(());
@@ -1458,15 +1242,11 @@ impl H3Client {
         Ok(())
     }
 
-    /** @brief 핸드셰이크 완료 전에 데이터를 보낼 수 있는지. */
     pub fn can_send_early(&self) -> bool {
         self.conn.can_send_early()
     }
 
-    /**
-     * @brief DNS 질의를 요청으로 보낸다.
-     * @retval QuicError::GoingAway 서버가 GOAWAY 를 보냈다. RFC 9114 는 그 뒤 새 요청을 금한다.
-     */
+    /// GoingAway after the server's GOAWAY; RFC 9114 forbids new requests then.
     pub fn send_request(
         &mut self,
         authority: &str,
@@ -1497,7 +1277,6 @@ impl H3Client {
         Ok(id)
     }
 
-    /** @brief 아직 처리하지 못하고 잡고 있는 바이트. */
     fn buffered_bytes(&self) -> usize {
         self.resp
             .values()
@@ -1507,11 +1286,8 @@ impl H3Client {
             .fold(0usize, usize::saturating_add)
     }
 
-    /**
-     * @brief 모인 바이트에서 온전한 응답을 꺼낸다.
-     * @details 형식이 어긋난 응답 하나에도 연결을 닫는다. 그런 업스트림이 같은 연결로 보낼
-     *          다음 응답도 믿을 수 없다.
-     */
+    /// One malformed response closes the connection: the next response from that upstream on it
+    /// cannot be trusted either.
     fn try_extract(&mut self, id: u64, buf: Vec<u8>) -> Result<(), QuicError> {
         match extract_dns_response(&mut self.qp.dec, id, &buf) {
             Extracted::Done(response) => {
@@ -1533,15 +1309,14 @@ impl H3Client {
         }
     }
 
-    /**
-     * @brief 스트림 버퍼 상한을 넘은 응답을 최종 상태 코드로 끝내고 남은 본문을 거절한다.
-     * @details DNS 메시지는 이 상한보다 훨씬 작으므로 그런 응답에는 DNS 답이 없다. 연결을 닫으면
-     *          같은 연결의 다른 요청까지 잃으므로 이 요청만 끝낸다. 남은 본문은
-     *          H3_REQUEST_CANCELLED 로 거절하고, 그 스트림의 남은 헤더 구역은 풀지 않는다고 상대
-     *          인코더에 알린다.
-     * @retval H3Error::ExcessiveLoad 최종 응답 헤더가 아직 오지 않았거나 헤더 테이블을 기다려야
-     *         한다. 상태를 모르는 응답을 상한 너머까지 모을 수는 없다.
-     */
+    /// Ends a response over the stream buffer limit at its final status and refuses the rest of the
+    /// body. DNS messages are far below that limit, so such a response has no DNS answer. Closing
+    /// the connection would lose its other requests, so only this request ends: the rest of the
+    /// body is refused with H3_REQUEST_CANCELLED, and the peer's encoder is told its remaining
+    /// header sections will not be decoded.
+    ///
+    /// ExcessiveLoad when the final response headers have not arrived or wait on the table; a
+    /// response of unknown status cannot be buffered past the limit.
     fn stop_oversized_response(&mut self, id: u64, received: Vec<u8>) -> Result<(), QuicError> {
         let Some(status) = oversized_response_status(&mut self.qp.dec, id, received)? else {
             return Err(H3Error::ExcessiveLoad.into());
@@ -1556,12 +1331,9 @@ impl H3Client {
         Ok(())
     }
 
-    /**
-     * @brief 받은 데이터그램을 넣는다.
-     * @details HTTP/3 계층에서 연결 오류가 나면 상대에게 알리고 연결을 닫은 뒤 그 오류를
-     *          돌려준다. QUIC 계층의 오류는 그 계층이 이미 알렸다. 닫힌 연결에 온 데이터그램은
-     *          QUIC 계층만 처리한다.
-     */
+    /// An HTTP/3 connection error is sent to the peer, the connection is closed, and the error is
+    /// returned; the QUIC layer has already reported its own errors. A datagram for a closed
+    /// connection goes to the QUIC layer only.
     pub fn recv_datagram(&mut self, dg: &[u8]) -> Result<(), QuicError> {
         self.conn.recv_datagram(dg)?;
         if self.conn.is_closed() {
@@ -1571,7 +1343,6 @@ impl H3Client {
             .map_err(|error| close_on_stream_error(&mut self.conn, error))
     }
 
-    /** @brief QUIC 계층이 내놓은 스트림 데이터를 응답으로 모으고 끊긴 스트림을 정리한다. */
     fn process_streams(&mut self) -> Result<(), QuicError> {
         match self.maybe_send_setup() {
             Ok(()) | Err(QuicError::FlowControl | QuicError::StreamLimit) => {}
@@ -1595,10 +1366,7 @@ impl H3Client {
             if id & 0x03 != 0x00 {
                 continue;
             }
-            /*
-             * GOAWAY 가 처리하지 않는다고 알린 요청은 답 없음으로 끝내므로, 그 스트림에 온
-             * 데이터는 버린다.
-             */
+            // A request excluded by GOAWAY ends unanswered, so data on its stream is dropped.
             if self.qp.peer_control.goaway.is_some_and(|first| id >= first) {
                 continue;
             }
@@ -1651,11 +1419,8 @@ impl H3Client {
         Ok(())
     }
 
-    /**
-     * @brief 서버가 답하지 않을 요청을 답 없음으로 끝낸다.
-     * @details 요청마다 결과는 한 번만 낸다. 이미 결과를 낸 요청이면 그 스트림에 남은 상태만
-     *          지운다. 끝낸 요청의 헤더 구역은 더 풀지 않으므로 상대 인코더에 알린다.
-     */
+    /// Each request yields one result; for one that already has a result, only its leftover stream
+    /// state goes. Its header sections will not be decoded any more, so the peer's encoder is told.
     fn abandon_request(&mut self, id: u64) {
         self.resp.remove(&id);
         if !self.in_flight.remove(&id) {
@@ -1666,22 +1431,19 @@ impl H3Client {
         self.ready.push((id, H3Response::Unanswered));
     }
 
-    /** @brief 이쪽이 테이블에 넣은 항목 수. */
     pub fn qpack_insert_count(&self) -> u64 {
         self.qp.enc.insert_count()
     }
 
-    /** @brief 상대가 확인한 항목 수. */
     pub fn qpack_known_received(&self) -> u64 {
         self.qp.enc.known_received()
     }
 
-    /** @brief 끝난 요청의 결과를 가져간다. send_request 로 보낸 요청마다 한 번씩 나온다. */
+    /// One result for each request sent with send_request.
     pub fn take_responses(&mut self) -> Vec<(u64, H3Response)> {
         std::mem::take(&mut self.ready)
     }
 
-    /** @brief 이 스트림에 상태만 답한다. */
     pub fn send_status(&mut self, id: u64, status: &[u8]) -> Result<(), QuicError> {
         self.maybe_send_setup()?;
         let headers: [(&[u8], &[u8]); 1] = [(b":status", status)];
@@ -1691,64 +1453,52 @@ impl H3Client {
         self.conn.send_stream(id, &payload, true)
     }
 
-    /** @brief 내보낼 데이터그램. */
     pub fn next_datagram(&mut self) -> Option<Vec<u8>> {
         self.conn.next_datagram()
     }
 
-    /** @brief 핸드셰이크가 끝났는지. */
     pub fn is_handshake_complete(&self) -> bool {
         self.conn.is_handshake_complete()
     }
 
-    /** @brief 응용 데이터를 보낼 수 있는 상태인지. */
     pub fn can_send_app(&self) -> bool {
         self.conn.can_send_app()
     }
 
-    /** @brief 연결이 닫혔는지. */
     pub fn is_closed(&self) -> bool {
         self.conn.is_closed()
     }
 
-    /** @brief 이 사유로 연결을 닫는다. 이미 닫힌 연결은 처음 알린 사유를 그대로 둔다. */
+    /// An already closed connection keeps its first reason.
     pub fn close(&mut self, error: H3Error) {
         self.conn.close(error.code(), error.reason());
     }
 
-    /** @brief 아래 연결을 고칠 수 있게. */
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
 
-    /** @brief 지금 시각을 알린다. */
     pub fn set_now(&mut self, now_ms: u64) {
         self.conn.set_now(now_ms);
     }
 
-    /** @brief 데드라인이 지났음을 알린다. */
     pub fn on_timeout(&mut self, now_ms: u64) {
         self.conn.on_timeout(now_ms);
     }
 }
 
-/** @brief 응답 헤더 구역에서 읽어 낸 값. */
 struct ResponseHead {
-    /** @brief 상태 코드. 1xx 는 최종 응답 앞에 오는 중간 응답이다. */
+    /// 1xx is an interim response before the final one.
     status: u16,
-    /** @brief 알린 본문 길이. */
     content_length: Option<usize>,
-    /** @brief content-type 이 하나뿐이고 그 값이 application/dns-message 인지. */
+    /// Exactly one content-type, equal to application/dns-message.
     dns_content_type: bool,
 }
 
-/**
- * @brief 응답 헤더 구역 하나를 읽는다.
- * @details 중간 응답과 최종 응답이 같은 규칙을 따른다. HTTP/3 에는 101 응답이 없다.
- *          content-type 은 본문이 DNS 메시지인지 가리는 데만 쓴다. 404 text/html 같은 응답도
- *          HTTP 메시지로는 온전하므로 형식 오류가 아니다.
- * @return 형식이 어긋나면 None 이다.
- */
+/// Interim and final responses follow the same rules; HTTP/3 has no 101. content-type only decides
+/// whether the body is a DNS message: a 404 text/html is still a well-formed HTTP message.
+///
+/// None when malformed.
 fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
     let mut status: Option<u16> = None;
     let mut content_length: Option<usize> = None;
@@ -1795,14 +1545,12 @@ fn response_head(fields: Vec<(Vec<u8>, Vec<u8>)>) -> Option<ResponseHead> {
     })
 }
 
-/**
- * @brief 응답 프레임을 앞에서부터 풀어 최종 응답 헤더를 찾는다.
- * @details 응답은 1xx 중간 응답 여럿 뒤에 최종 응답이 온다. HEADERS 가 그 가운데 어느 것인지는
- *          풀어 봐야 알므로 차례로 푼다. 중간 응답에는 본문이 없으므로 최종 응답보다 앞선 DATA 는
- *          형식 오류다. 헤더보다 앞선 DATA 는 프레임 배치 검사가 먼저 거른다. 최종 응답 뒤의
- *          프레임은 frames 에 남긴다.
- * @return 프레임이 다하도록 최종 응답이 없으면 None 이다.
- */
+/// A response is any number of 1xx interim responses, then the final one. Which HEADERS is which
+/// shows only after decoding, so they are decoded in order. Interim responses have no body, so DATA
+/// before the final response is malformed; DATA before any HEADERS is caught earlier by the frame
+/// layout check. Frames after the final response stay in `frames`.
+///
+/// None when there is no final response.
 fn read_final_head(
     dec: &mut qpack::Decoder,
     sid: u64,
@@ -1824,14 +1572,12 @@ fn read_final_head(
     Ok(None)
 }
 
-/**
- * @brief 스트림 버퍼에서 DoH3 응답을 추출한다.
- * @details 요청과 같은 엄격함을 적용한다. 프레임 순서, 상태 헤더 중복, 길이 일치를 모두 본다.
- *          응답은 1xx 중간 응답 여럿, 최종 응답, 본문, 그리고 선택적인 트레일러 구역 하나 순서로
- *          온다. 형식이 온전한 최종 응답은 DNS 메시지를 싣지 않았어도 결과로 낸다.
- * @note 어느 구역이든 테이블을 기다려야 하면 하나도 풀지 않는다. 일부를 푼 뒤 기다렸다가 다시
- *       풀면 그 구역의 확인 지시가 두 번 나간다.
- */
+/// Same strictness as requests: frame order, duplicate status, and length match. A response is
+/// interim responses, the final response, the body, and at most one trailer section. A well-formed
+/// final response is a result even without a DNS message.
+///
+/// If any section must wait for the table, none is decoded: decoding some and retrying after the
+/// wait would acknowledge them twice.
 fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extracted<H3Response> {
     let Some(frames) = parse_frames(buf) else {
         return Extracted::Fatal(H3Error::FrameError);
@@ -1885,13 +1631,10 @@ fn extract_dns_response(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extra
     }
 }
 
-/**
- * @brief 스트림 버퍼 상한을 넘은 응답의 최종 상태 코드를 읽는다.
- * @details 받은 앞부분에서 다 온 프레임만 보고 최종 응답 헤더까지만 푼다. 그 뒤의 본문과
- *          트레일러는 풀지 않는다. 프레임 배치나 헤더가 어긋나면 다 받은 응답과 같은 오류로
- *          알린다.
- * @return 최종 응답 헤더가 아직 오지 않았거나 헤더 테이블을 기다려야 하면 None 이다.
- */
+/// Looks only at the complete frames received and decodes up to the final response headers, not the
+/// body or trailers. Frame layout or header errors are reported as for a complete response.
+///
+/// None when the final headers have not arrived or wait on the table.
 fn oversized_response_status(
     dec: &mut qpack::Decoder,
     sid: u64,
@@ -1908,12 +1651,10 @@ fn oversized_response_status(
 }
 
 #[cfg(test)]
-/** @brief 형식 엄격성, 버퍼 상한, QPACK 동적 테이블, 그리고 조기 데이터 경로. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 프레임 왕복. */
     fn frame_roundtrip() {
         let mut buf = Vec::new();
         encode_frame(&mut buf, FRAME_HEADERS, b"hdr");
@@ -1924,7 +1665,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief POST 요청에서 DNS 질의를 뽑는지. */
     fn extract_post_request() {
         let dns = b"\x12\x34 fake dns query";
         let mut buf = Vec::new();
@@ -1942,9 +1682,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 프레임이 앞에 와도 무시하고 넘어가는지. 앞으로 늘어날 수 있다. */
     fn grease_before_headers_is_ignored() {
-        /** @brief 규격이 무시하라고 정한 프레임 종류. */
+        /// A reserved type that must be ignored.
         const GREASE_FRAME: u64 = 0x21;
         let dns = b"\x12\x34dns";
 
@@ -1980,12 +1719,10 @@ mod tests {
         ));
     }
 
-    /** @brief 헤더 목록을 인코딩한다. */
     fn encoded_headers(headers: &[(&[u8], &[u8])]) -> Vec<u8> {
         qpack::Encoder::new().encode_field_section(headers).0
     }
 
-    /** @brief 이 입력이 잘못된 요청으로 거부되는지 확인한다. */
     fn assert_bad_request(buf: &[u8]) {
         let mut dec = qpack::Decoder::new(4096);
         assert!(matches!(
@@ -1995,15 +1732,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 거절하는 까닭에 맞는 상태 코드를 고르는지.
-     *
-     * @details HTTP/1.1 과 HTTP/2 경로는 415 와 405 를 구분해 답하는데 이 경로만 모두 400
-     *          으로 접고 있었다. 같은 서버의 세 전송이 다른 답을 하면 클라이언트가 무엇을
-     *          고쳐야 할지 알 수 없다. RFC 8484는 다루지 못하는 형식에 415 를 든다.
-     * @note 겹친 content-type 은 415 가 아니라 400 이다. 앞단과 뒷단이 같은 바이트열을
-     *       다르게 읽게 만드는 경로라 형식 문제와 뜻이 다르다.
-     */
+    /// The HTTP/1.1 and HTTP/2 paths answer 415 and 405 too; transports of one server must give the
+    /// same answer. A repeated content-type stays 400, since it lets front and back ends read the
+    /// same bytes differently.
     fn request_rejections_carry_the_matching_status() {
         let dns = b"\x12\x34dns";
         let build = |headers: &[(&[u8], &[u8])]| {
@@ -2064,10 +1795,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 프레임 순서, 의사 헤더 중복, 길이 불일치를 거부하는지.
-     * @details 프레임 순서가 어긋난 것은 연결 오류이고, 나머지는 그 요청만 거절한다.
-     */
+    /// Bad frame order is a connection error; the others reject only that request.
     fn request_rejects_bad_frame_order_duplicate_pseudo_and_length_mismatch() {
         let mut data_first = Vec::new();
         encode_frame(&mut data_first, FRAME_DATA, b"dns");
@@ -2119,7 +1847,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 헤더 문법 오류와 권한 충돌을 거부하는지. */
     fn request_rejects_invalid_field_syntax_and_authority_conflicts() {
         let valid: [(&[u8], &[u8]); 6] = [
             (b":method", b"POST"),
@@ -2165,7 +1892,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답에서도 같은 엄격함이 적용되는지. */
     fn response_rejects_bad_order_duplicate_status_and_invalid_metadata() {
         let mut data_first = Vec::new();
         encode_frame(&mut data_first, FRAME_DATA, b"dns");
@@ -2206,7 +1932,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답 헤더 문법 오류를 거부하는지. */
     fn response_rejects_invalid_field_syntax() {
         let valid: [(&[u8], &[u8]); 3] = [
             (b":status", b"200"),
@@ -2245,13 +1970,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DNS 메시지를 싣지 않은 응답을 형식 오류가 아니라 그 상태의 결과로 내는지.
-     * @details content-type 과 DNS 본문 상한은 DoH 의 규칙이지 HTTP 메시지 형식이 아니다. 형식
-     *          오류로 다루면 404 text/html 하나에 연결 전체가 H3_MESSAGE_ERROR 로 닫힌다.
-     */
+    /// content-type and the DNS body limit are DoH rules, not HTTP message format. Treating them as
+    /// malformed would close the whole connection with H3_MESSAGE_ERROR on one 404 text/html.
     fn answers_without_a_dns_message_are_not_malformed() {
-        /** @brief 이 헤더와 본문으로 온 응답의 추출 결과. 형식이 온전해야 한다. */
         fn answer(headers: &[(&[u8], &[u8])], body: &[u8]) -> H3Response {
             match extract_dns_response(
                 &mut qpack::Decoder::new(4096),
@@ -2337,11 +2058,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DNS 가 아닌 답을 받아도 연결을 닫지 않고 같은 연결의 다른 요청을 받는지.
-     * @details 404 text/html 은 그 요청이 실패했다는 뜻일 뿐이다. 연결을 닫으면 같은 연결에
-     *          실린 다른 요청까지 잃는다.
-     */
+    /// A 404 only means that request failed; closing the connection would lose its other requests.
     fn answer_without_a_dns_message_keeps_the_connection() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2392,11 +2109,9 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 상대가 이쪽 QPACK 디코더 스트림으로 보낸 Stream Cancellation 의 스트림 번호들.
-     * @details 이 구현의 인코더는 이 지시를 읽고 버리므로 HTTP/3 계층을 거치지 않고 QUIC 계층에서
-     *          꺼낸다. 시험의 스트림 번호와 증가 값이 작아 지시마다 한 바이트다.
-     */
+    /// Stream IDs from Stream Cancellations on the peer's QPACK decoder stream. This encoder drops
+    /// those instructions, so the test reads them from the QUIC layer. With these small IDs each
+    /// one is a single byte.
     fn cancelled_streams(conn: &mut Connection, decoder: u64) -> Vec<u64> {
         conn.take_readable()
             .into_iter()
@@ -2408,18 +2123,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버퍼 상한을 넘는 응답이 그 요청만 끝내고 연결은 남기는지.
-     * @details DNS 메시지는 이 상한보다 훨씬 작으므로 그런 응답에는 DNS 답이 없다. 큰 오류 페이지
-     *          하나에 연결을 닫으면 같은 연결에 실린 다른 요청까지 잃는다. 최종 상태로 결과를 내고,
-     *          남은 본문은 STOP_SENDING 으로 거절하고, 그사이 도착한 데이터는 버린다. 그 스트림의
-     *          남은 헤더 구역은 풀지 않으므로 상대 인코더에 Stream Cancellation 을 보낸다.
-     */
+    /// The result is the final status, the rest of the body is refused with STOP_SENDING, data
+    /// arriving meanwhile is dropped, and a Stream Cancellation goes to the peer's encoder.
     fn oversized_response_fails_only_that_request() {
-        /**
-         * @brief 서버 쪽은 QUIC 계층만 거쳐 데이터그램을 주고받는다.
-         * @return 클라이언트가 그사이 보낸 Stream Cancellation 의 스트림 번호들.
-         */
+        /// The server side goes through the QUIC layer only. Returns the stream IDs of Stream
+        /// Cancellations the client sent meanwhile.
         fn relay(client: &mut H3Client, server: &mut H3Connection) -> Vec<u64> {
             let decoder = client.qp.dec_sid.expect("클라이언트 디코더 스트림");
             let mut cancelled = Vec::new();
@@ -2461,11 +2169,9 @@ mod tests {
         pump_h3(&mut client, &mut server);
         assert_eq!(server.take_requests().len(), 5);
 
-        /*
-         * 상한 바로 아래까지 먼저 보내고 상한을 넘기는 나머지를 나중에 보낸다. 나머지가 길면 상한을
-         * 넘긴 뒤의 데이터와 FIN 이 STOP_SENDING 보다 먼저 클라이언트에 닿는다. 짧은 나머지는 따로
-         * 보내 상한을 넘기는 조각과 FIN 이 한 패킷에 실리게 한다.
-         */
+        // Sends up to just below the limit first and the rest later. With a long rest, data past
+        // the limit and FIN would reach the client before STOP_SENDING, so a short rest is sent
+        // alone to put the crossing piece and FIN in one packet.
         let long_page = vec![b'x'; MAX_H3_STREAM_BUFFER + 4096];
         let short_page = vec![b'x'; MAX_H3_STREAM_BUFFER];
         let long_head = MAX_H3_STREAM_BUFFER - 1024;
@@ -2547,10 +2253,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 망가진 응답을 즉시 알리는지. 데드라인까지 기다리면 그만큼 붙잡힌다.
-     * @details 프레임 배치가 어긋난 것과 메시지 내용이 어긋난 것은 다른 코드로 알린다.
-     */
+    /// Waiting for the deadline would hold the request that long. Frame layout errors and message
+    /// content errors get different codes.
     fn malformed_response_is_reported_without_waiting_for_timeout() {
         let (mut client, _) = h3_pair();
         let mut data_first = Vec::new();
@@ -2574,7 +2278,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 버퍼가 연결 단위로 묶이는지. 스트림당 상한만으로는 우회된다. */
     fn h3_application_buffers_are_connection_bounded() {
         assert!(fits_connection_buffer(MAX_H3_CONNECTION_BUFFER - 1, 1));
         assert!(!fits_connection_buffer(MAX_H3_CONNECTION_BUFFER, 1));
@@ -2582,7 +2285,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 처리 대기 중인 요청도 버퍼 상한에 잡히는지. */
     fn queued_requests_count_toward_in_progress_server_buffer_limit() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2611,7 +2313,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 처리 대기 중인 응답도 버퍼 상한에 잡히는지. */
     fn queued_responses_count_toward_in_progress_client_buffer_limit() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2641,7 +2342,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief base64url 왕복. */
     fn base64url_roundtrip_known() {
         assert_eq!(base64url_decode(b"YWJj").unwrap(), b"abc");
 
@@ -2655,7 +2355,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 처리 뒤 비운 H3 요청 버퍼도 allocator가 보유한 capacity만큼 세는지. */
     fn retained_memory_counts_h3_capacity_after_clear() {
         let (_, mut server) = h3_pair();
         let baseline = server.retained_payload_bytes();
@@ -2676,7 +2375,6 @@ mod tests {
 
     use crate::params::TransportParams;
 
-    /** @brief 설정을 지정해 클라이언트와 서버 짝을 만든다. */
     fn h3_pair_with(
         resumption: Option<onetdns_tls::conn::ServerResumption>,
         session: Option<onetdns_tls::TlsSession>,
@@ -2684,7 +2382,6 @@ mod tests {
         h3_pair_with_server_tp(resumption, session, TransportParams::server_defaults())
     }
 
-    /** @brief 서버 전송 매개변수를 지정해 짝을 만든다. */
     fn h3_pair_with_server_tp(
         resumption: Option<onetdns_tls::conn::ServerResumption>,
         session: Option<onetdns_tls::TlsSession>,
@@ -2739,12 +2436,10 @@ mod tests {
         (client, server)
     }
 
-    /** @brief 기본 설정의 클라이언트와 서버 짝. */
     fn h3_pair() -> (H3Client, H3Connection) {
         h3_pair_with(None, None)
     }
 
-    /** @brief 양쪽 데이터그램을 서로 전달해 진행시킨다. */
     fn pump_h3(client: &mut H3Client, server: &mut H3Connection) {
         for _ in 0..30 {
             let mut moved = false;
@@ -2762,7 +2457,6 @@ mod tests {
         }
     }
 
-    /** @brief 프레임 배치는 맞지만 :path 가 빠져 메시지로서 어긋난 요청. */
     fn request_without_path() -> Vec<u8> {
         let mut request = Vec::new();
         encode_frame(
@@ -2780,11 +2474,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 헤더보다 본문이 먼저 온 요청 스트림에 연결 오류로 답하는지.
-     * @details RFC 9114 는 프레임 순서가 어긋난 것을 400 이 아니라 H3_FRAME_UNEXPECTED 연결
-     *          오류로 정했다.
-     */
+    /// RFC 9114 makes bad frame order an H3_FRAME_UNEXPECTED connection error, not a 400.
     fn request_frame_order_violation_closes_the_connection() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2810,7 +2500,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 망가진 요청에 즉시 오류로 답하는지. */
     fn malformed_request_receives_immediate_bad_request_response() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2826,11 +2515,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 요청 스트림 하나를 멈추면 그 스트림만 실패하는지.
-     * @details 워커가 늦게 낸 답을 멈춘 스트림에 실으면 스트림 오류여야 한다. 연결 오류로
-     *          올리면 서버가 같은 연결에 실린 다른 질의까지 버린다.
-     */
+    /// A late reply to a stopped stream must be a stream error; as a connection error, the server
+    /// would drop the other queries on the connection.
     fn stopped_request_stream_fails_alone() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2866,12 +2552,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 끊은 메시지 스트림마다 상대 인코더에 Stream Cancellation 을 보내는지.
-     * @details 끊긴 스트림의 헤더 구역은 끝내 풀지 않는다. 알리지 않으면 상대 인코더는 그 구역이
-     *          가리키는 테이블 항목을 놓지 못한다. RFC 9204 는 끊긴 스트림과 읽기를 그만둔 스트림에
-     *          이 지시를 보내게 한다. 응답 스트림과 요청 스트림을 모두 본다.
-     */
+    /// A reset stream's header sections are never decoded, and without the notice the peer's
+    /// encoder cannot release the entries they reference. Checks both response and request streams.
     fn reset_streams_cancel_their_field_sections() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2925,7 +2607,7 @@ mod tests {
         assert!(!client.is_closed() && !server.is_closed());
     }
 
-    /** @brief 서버 제어 스트림으로 GOAWAY 를 보낸다. 이 서버 구현은 스스로 보내지 않는다. */
+    /// This server never sends one itself.
     fn send_goaway(server: &mut H3Connection, first_unprocessed: u64) {
         let control = server.qp.ctrl_sid.expect("서버 제어 스트림");
         let mut payload = Vec::new();
@@ -2939,12 +2621,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief GOAWAY 를 받은 클라이언트가 새 요청을 열지 않고 처리되지 않을 요청을 곧바로 끝내는지.
-     * @details RFC 9114 는 GOAWAY 를 받은 뒤의 새 요청을 금한다. 알린 번호 이상인 요청은 서버가
-     *          처리하지 않으므로 다른 연결로 다시 보낼 수 있다고 바로 알려야 한다. 그보다 앞선
-     *          요청의 답은 그대로 받는다.
-     */
+    /// Requests at or above the announced ID are reported at once so they can be retried elsewhere;
+    /// earlier ones still get their answers.
     fn goaway_refuses_new_and_unprocessed_requests() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -2983,11 +2661,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 받자마자 내는 상태 답이 멈춘 스트림을 만나도 연결이 남는지.
-     * @details 잘못된 요청에는 그 자리에서 400 을 보낸다. 상대가 그 스트림을 이미 멈췄으면
-     *          보낼 곳이 없을 뿐이다. recv_datagram 이 실패하면 부른 쪽이 연결을 버린다.
-     */
+    /// A malformed request gets 400 on the spot. If the peer stopped that stream there is just
+    /// nowhere to send it, and failing recv_datagram would make the caller drop the connection.
     fn immediate_status_to_a_stopped_stream_keeps_the_connection() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3011,11 +2686,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 이쪽 QPACK 인코더 스트림을 멈추면 연결 오류가 되는지.
-     * @details 필수 스트림이 닫히면 HTTP/3 연결은 이어 갈 수 없다. 스트림 오류로 돌려주면
-     *          부른 쪽이 연결을 살려 두고, 그 뒤 헤더 테이블 갱신이 상대에게 닿지 않는다.
-     */
     fn stopped_critical_stream_is_a_connection_error() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3027,14 +2697,13 @@ mod tests {
 
         let encoder = server.qp.enc_sid.expect("서버 인코더 스트림");
         client.conn_mut().stop_sending(encoder, 0);
-        /*
-         * 서버가 돌려줄 RESET_STREAM 은 클라이언트에게도 필수 스트림 종료라서 연결 오류다.
-         * 서버의 판정만 보려고 클라이언트가 보낸 것만 전달한다.
-         */
+        // The server's RESET_STREAM would end a critical stream for the client too, so only the
+        // client's datagrams are relayed, to see the server's verdict alone.
         while let Some(dg) = client.next_datagram() {
             server.recv_datagram(&dg).unwrap();
         }
-        /* 새 max-age 값은 동적 테이블에 넣어야 하므로 인코더 스트림으로 보낼 것이 생긴다. */
+        // A new max-age value goes into the dynamic table, so there is something for the encoder
+        // stream.
         assert_eq!(
             server.send_response(id, b"\x00\x00 answer", 4242),
             Err(H3Error::ClosedCriticalStream.into())
@@ -3053,11 +2722,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 상대가 자기 QPACK 스트림을 끊으면 H3_CLOSED_CRITICAL_STREAM 으로 닫는지.
-     * @details RFC 9204 가 정한 코드다. 두루뭉술한 코드로 닫으면 상대는 무엇을 잘못했는지 알
-     *          수 없다.
-     */
+    /// The code RFC 9204 sets.
     fn reset_qpack_stream_closes_with_closed_critical_stream() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3085,11 +2750,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief HTTP/3 계층의 연결 오류를 상대에게 RFC 9114 코드로 알리는지.
-     * @details 제어 스트림은 연결마다 하나뿐이라 두 번째가 오면 H3_STREAM_CREATION_ERROR 다.
-     *          알리지 않고 버리면 상대는 자기 유휴 데드라인까지 기다린다.
-     */
+    /// There is one control stream per connection, so a second one is H3_STREAM_CREATION_ERROR.
+    /// Dropping it silently would leave the peer waiting until its idle deadline.
     fn http3_connection_error_reaches_the_peer() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3122,11 +2784,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 클라이언트도 HTTP/3 계층의 연결 오류를 서버에 RFC 9114 코드로 알리는지.
-     * @details 업스트림이 규격을 어기면 클라이언트는 그 연결을 버린다. 알리지 않으면 업스트림은
-     *          자기 유휴 데드라인까지 그 연결을 붙들고 있다.
-     */
+    /// Without it the upstream would hold the connection until its idle deadline.
     fn http3_client_connection_error_reaches_the_server() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3158,10 +2816,6 @@ mod tests {
         assert_eq!(close.frame_type, None, "응용 계층 종료여야 합니다");
     }
 
-    /**
-     * @brief 제어 스트림을 이미 연 연결에서 제어 스트림을 하나 더 열어 설정을 보낸다.
-     * @details 제어 스트림은 연결마다 하나뿐이라 받는 쪽에는 HTTP/3 연결 오류다.
-     */
     fn send_second_control_stream(conn: &mut Connection) {
         let id = conn.open_uni_stream().unwrap();
         let mut data = Vec::new();
@@ -3171,7 +2825,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 스트림 한도가 좁아도 필수 스트림이 중복 예약 없이 열리는지. */
     fn h3_setup_stream_limit_queues_critical_stream_without_duplicate_reservations() {
         let mut server_tp = TransportParams::server_defaults();
         server_tp.initial_max_streams_uni = 2;
@@ -3202,7 +2855,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 윈도우가 1바이트여도 큰 요청이 끝까지 진행되는지. */
     fn one_byte_initial_stream_window_progresses_large_h3_request() {
         let mut server_tp = TransportParams::server_defaults();
         server_tp.initial_max_stream_data_bidi_remote = 1;
@@ -3221,7 +2873,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 단방향 스트림이 닫혀도 상태가 쌓이지 않는지. */
     fn closed_unknown_uni_streams_do_not_exhaust_connection_state() {
         let mut qp = QpackCtx::new(Role::Server);
         let mut stream_type = Vec::new();
@@ -3234,7 +2885,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 필수 스트림을 닫으면 연결이 끊기는지. */
     fn closing_critical_uni_stream_is_rejected() {
         for stream_type in [UNI_CONTROL, UNI_QPACK_ENCODER, UNI_QPACK_DECODER] {
             let mut qp = QpackCtx::new(Role::Server);
@@ -3249,7 +2899,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 필수 스트림을 끊으면 연결이 끊기는지. */
     fn resetting_critical_uni_stream_is_rejected() {
         for stream_type in [UNI_CONTROL, UNI_QPACK_ENCODER, UNI_QPACK_DECODER] {
             let mut qp = QpackCtx::new(Role::Server);
@@ -3265,7 +2914,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 필수 스트림이 두 번 열리면 거부하는지. */
     fn duplicate_critical_uni_stream_is_rejected() {
         for stream_type in [UNI_CONTROL, UNI_QPACK_ENCODER, UNI_QPACK_DECODER] {
             let mut qp = QpackCtx::new(Role::Server);
@@ -3278,7 +2926,6 @@ mod tests {
         }
     }
 
-    /** @brief 제어 스트림에 보낼 바이트를 만든다. */
     fn control_bytes(frame_type: u64, payload: &[u8]) -> Vec<u8> {
         let mut data = Vec::new();
         varint::write(&mut data, UNI_CONTROL);
@@ -3287,7 +2934,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제어 스트림의 첫 프레임이 설정 하나여야 하는지. */
     fn control_stream_requires_exactly_one_initial_settings_frame() {
         let mut qp = QpackCtx::new(Role::Server);
         assert_eq!(
@@ -3306,7 +2952,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정 중복과 잘린 값을 거부하는지. */
     fn settings_reject_duplicate_ids_and_truncated_values() {
         let mut duplicate = Vec::new();
         for value in [1, 2] {
@@ -3340,11 +2985,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정 뒤 제어 스트림에 올 수 없는 프레임을 RFC 9114 코드로 거부하는지.
-     * @details 이쪽은 서버 푸시를 허락하지 않으므로 푸시 번호를 가리키는 CANCEL_PUSH 는 모두
-     *          H3_ID_ERROR 다. MAX_PUSH_ID 는 클라이언트만 보낼 수 있다.
-     */
+    /// This side never allows server push, so every CANCEL_PUSH is H3_ID_ERROR; only a client may
+    /// send MAX_PUSH_ID.
     fn control_stream_rejects_frames_that_belong_elsewhere() {
         let cases: [(u64, Role, Result<(), H3Error>); 14] = [
             (FRAME_DATA, Role::Server, Err(H3Error::FrameUnexpected)),
@@ -3383,11 +3025,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief GOAWAY 와 MAX_PUSH_ID 가 RFC 9114 의 번호 규칙을 어기면 연결 오류로 닫는지.
-     * @details 서버의 GOAWAY 는 클라이언트가 연 양방향 스트림 번호만 담는다. 두 프레임 모두 앞서
-     *          알린 번호를 되돌릴 수 없고, 값 하나보다 길거나 짧은 내용은 프레임 오류다.
-     */
+    /// A server's GOAWAY carries only client-initiated bidirectional stream IDs. Neither frame may
+    /// go back on an earlier ID, and content longer or shorter than one value is a frame error.
     fn control_frame_identifiers_follow_rfc_9114() {
         let id = |value: u64| {
             let mut out = Vec::new();
@@ -3477,11 +3116,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 단방향 스트림 오류마다 RFC 9114 와 RFC 9204 코드를 고르는지.
-     * @details 서버 푸시 스트림은 서버에게는 열 수 없는 스트림이고, 푸시를 허락하지 않은
-     *          클라이언트에게는 있을 수 없는 푸시 번호다.
-     */
+    /// A push stream cannot be opened toward a server, and for a client that allows no push its
+    /// push ID cannot exist.
     fn uni_stream_errors_carry_their_rfc_codes() {
         let mut push = Vec::new();
         varint::write(&mut push, UNI_PUSH);
@@ -3531,11 +3167,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 요청과 응답 스트림의 프레임 배치 오류를 연결 오류로 가리는지.
-     * @details 메시지 내용이 어긋난 것은 그 메시지만 거절하지만, 프레임 배치가 어긋난 것과
-     *          헤더 압축이 풀리지 않는 것은 RFC 9114 와 RFC 9204 가 연결 오류로 정했다.
-     */
+    /// Bad message content rejects only that message, but RFC 9114 and RFC 9204 make bad frame
+    /// layout and undecodable headers connection errors.
     fn message_stream_frame_errors_close_the_connection() {
         let headers = encoded_headers(&[
             (b":method", b"POST"),
@@ -3608,7 +3241,6 @@ mod tests {
         }
     }
 
-    /** @brief 추출 결과를 비교할 수 있는 이름으로 바꾼다. */
     fn outcome<T>(extracted: Extracted<T>) -> String {
         match extracted {
             Extracted::Done(_) => "done".into(),
@@ -3619,7 +3251,6 @@ mod tests {
         }
     }
 
-    /** @brief 헤더 구역 하나 뒤에 프레임들을 이어 붙인 메시지. */
     fn message(head: &[u8], rest: &[(u64, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();
         encode_frame(&mut buf, FRAME_HEADERS, head);
@@ -3630,11 +3261,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 트레일러가 붙은 요청과 응답, 그리고 중간 응답을 받아들이는지.
-     * @details RFC 9114 는 메시지 끝에 트레일러 구역 하나를, 최종 응답 앞에 1xx 중간 응답을
-     *          허락한다. 거부하면 규격을 지킨 상대와 통신하지 못한다.
-     */
+    /// RFC 9114 allows one trailer section at the end and 1xx interim responses before the final
+    /// one; rejecting them breaks conforming peers.
     fn trailers_and_interim_responses_are_accepted() {
         let dns: &[u8] = b"\x12\x34dns";
         let trailer = encoded_headers(&[(b"x-checksum", b"abc")]);
@@ -3669,12 +3297,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 트레일러와 중간 응답의 규칙 위반을 맞는 결과로 거부하는지.
-     * @details 트레일러 뒤의 HEADERS 나 DATA 는 프레임 배치 오류라 연결 오류다. 트레일러의 의사
-     *          헤더와 연결 전용 필드, 101 응답, 중간 응답 뒤의 본문, 최종 응답이 없는 응답은
-     *          메시지만 어긋난 것이다.
-     */
+    /// HEADERS or DATA after trailers is a frame layout error and closes the connection.
+    /// Pseudo-headers or connection-specific fields in trailers, a 101, a body after an interim
+    /// response, and a response with no final head are message errors only.
     fn trailer_and_interim_violations_are_rejected() {
         let dns: &[u8] = b"\x12\x34dns";
         let request_head = qpack::doh_post_request_headers("h", "/dns-query", dns.len());
@@ -3752,12 +3377,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 버퍼 상한을 넘은 응답의 앞부분에서 최종 상태를 읽어 내는지.
-     * @details 중간 응답은 건너뛰고 덜 온 마지막 프레임은 보지 않는다. 최종 응답 헤더가 아직
-     *          없거나 테이블을 기다려야 하면 상태를 알 수 없다. 형식 오류는 다 받은 응답과 같은
-     *          오류다.
-     */
+    /// Interim responses are skipped and an incomplete last frame is ignored. The status is unknown
+    /// when the final headers are missing or wait on the table; format errors match those of a
+    /// complete response.
     fn oversized_response_reports_its_final_status() {
         let status = |received: Vec<u8>| {
             oversized_response_status(&mut qpack::Decoder::new(4096), 0, received)
@@ -3811,7 +3433,7 @@ mod tests {
         encoder.set_peer_max_capacity(QPACK_CAPACITY as usize);
         let page_head: [(&[u8], &[u8]); 2] = [(b":status", b"404"), (b"x-page", b"1")];
         let _ = encoder.encode_field_section(&page_head);
-        /* 상대가 받았다고 확인한 것처럼 꾸며 디코더가 아직 받지 못한 항목을 참조하게 한다. */
+        // Fakes an acknowledgment so the encoder references an entry the decoder has not received.
         encoder.on_decoder_stream(&[0x01]).unwrap();
         let (blocked_head, _) = encoder.encode_field_section(&page_head);
         assert_eq!(
@@ -3821,16 +3443,14 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 헤더 구역은 바로 풀리고 트레일러 구역만 테이블을 기다리는 메시지를 만든다.
-     * @return 디코더, 메시지, 그리고 트레일러가 기다리는 테이블 갱신 지시.
-     */
+    /// The header section decodes at once; only the trailer section waits on the table. Returns the
+    /// decoder, the message, and the table update the trailer waits for.
     fn message_with_blocked_trailer(head: &[(&[u8], &[u8])]) -> (qpack::Decoder, Vec<u8>, Vec<u8>) {
         let mut encoder = qpack::Encoder::new();
         encoder.set_peer_max_capacity(QPACK_CAPACITY as usize);
         let mut decoder = qpack::Decoder::new(QPACK_CAPACITY as usize);
 
-        /* 헤더 구역이 동적 항목을 참조해야 그 구역에도 확인 지시가 생긴다. */
+        // The header section must reference a dynamic entry to produce its own acknowledgment.
         let (_, inserts) = encoder.encode_field_section(&[(b"x-head", b"1")]);
         decoder.on_encoder_stream(&inserts).unwrap();
         encoder
@@ -3844,7 +3464,7 @@ mod tests {
             .on_decoder_stream(&decoder.take_decoder_stream())
             .unwrap();
 
-        /* 상대가 받았다고 확인한 것처럼 꾸며 디코더가 아직 받지 못한 항목을 참조하게 한다. */
+        // Fakes an acknowledgment so the encoder references an entry the decoder has not received.
         let trailer: [(&[u8], &[u8]); 1] = [(b"x-trailer", b"t")];
         let (_, pending_inserts) = encoder.encode_field_section(&trailer);
         encoder.on_decoder_stream(&[0x01]).unwrap();
@@ -3861,12 +3481,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 트레일러 구역만 테이블을 기다려도 어느 구역의 확인 지시도 미리 내보내지 않는지.
-     * @details 헤더 구역을 먼저 풀고 기다렸다가 다시 풀면 그 구역의 확인 지시가 두 번 나간다.
-     *          RFC 9204 는 모든 구역이 이미 확인된 스트림을 가리키는 확인 지시를
-     *          QPACK_DECODER_STREAM_ERROR 로 정했다.
-     */
+    /// Decoding the header section and retrying after the wait would acknowledge it twice; RFC 9204
+    /// makes an acknowledgment for a stream with no unacknowledged sections
+    /// QPACK_DECODER_STREAM_ERROR.
     fn blocked_trailer_holds_every_section_acknowledgment() {
         let request_head: [(&[u8], &[u8]); 5] = [
             (b":method", b"POST"),
@@ -3910,11 +3527,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 헤더 테이블을 기다리는 메시지가 알린 수를 넘으면 QPACK 오류로 닫는지.
-     * @details SETTINGS_QPACK_BLOCKED_STREAMS 로 알린 수를 넘긴 것은 RFC 9204 가
-     *          QPACK_DECOMPRESSION_FAILED 로 정했다. 버퍼 상한을 넘긴 것은 이쪽 자원 문제다.
-     */
+    /// RFC 9204 makes exceeding SETTINGS_QPACK_BLOCKED_STREAMS QPACK_DECOMPRESSION_FAILED;
+    /// exceeding the buffer limit is this side's resource issue.
     fn blocked_messages_respect_the_advertised_limit() {
         let mut blocked = Vec::new();
         for id in 0..QPACK_BLOCKED {
@@ -3931,7 +3545,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이쪽 헤더 크기 상한을 상대에게 알리는지. */
     fn settings_advertise_the_decoder_field_section_limit() {
         assert!(parse_settings(&our_settings())
             .unwrap()
@@ -3939,7 +3552,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동적 테이블을 쓴 왕복과 확인 지시가 오가는지. */
     fn h3_dynamic_qpack_roundtrip_and_ack() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -3999,12 +3611,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정 전에는 정적 테이블만 쓰는지.
-     * @details 상대가 테이블 크기를 알리기 전에 동적 테이블에 넣으면 상대는 그 지시를 받아 둘
-     *          수 없다. 서버는 1-RTT 키가 생기자마자 설정을 보내므로, 핸드셰이크 전에 쌓은
-     *          요청으로 이 상황을 만든다.
-     */
+    /// Inserting before the peer announces a table capacity would send instructions it cannot hold.
+    /// The server sends settings as soon as 1-RTT keys exist, so requests queued before the
+    /// handshake set this up.
     fn h3_request_before_settings_is_static_only() {
         let (mut client, mut server) = h3_pair();
         let dns = b"\x00\x00 early static query";
@@ -4018,12 +3627,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 0-RTT 로 온 QPACK 갱신 지시에 핸드셰이크가 끝나기 전에도 확인으로 답하는지.
-     * @details 지난 연결의 설정을 기억한 클라이언트는 0-RTT 에서도 동적 테이블에 넣는다. 서버가
-     *          확인 지시를 실을 스트림을 핸드셰이크가 끝난 뒤에야 열면, 그 지시가 갈 곳이 없어
-     *          연결이 오류로 끝난다.
-     */
+    /// A client that remembers the previous connection's settings inserts into the dynamic table in
+    /// 0-RTT. If the server opened the acknowledgment stream only after the handshake, the
+    /// acknowledgments would have nowhere to go and the connection would fail.
     fn zero_rtt_qpack_inserts_are_acknowledged_before_the_handshake_ends() {
         let mut res = onetdns_tls::conn::ServerResumption::secure_default();
         res.max_early_data = 0xffff_ffff;
@@ -4078,11 +3684,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 확인 지시 스트림의 종류 번호를 보내기 전에는 확인 지시를 남겨 두는지.
-     * @details 보낼 버퍼가 차면 스트림 설정이 중간에 멈출 수 있다. 그 사이 확인 지시가 먼저
-     *          나가면 상대는 그 바이트를 스트림 종류로 읽는다.
-     */
+    /// A full send buffer can stall stream setup midway; an acknowledgment sent in that gap would
+    /// be read as the stream type.
     fn decoder_instructions_wait_for_their_stream_type() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -4094,12 +3697,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 연결이 닫힌 뒤에는 남은 요청을 HTTP/3 계층이 꺼내지 않는지.
-     * @details 상대의 종료 프레임이 요청과 같은 패킷에 오면 QUIC 계층은 요청을 받아 둔 채
-     *          연결을 닫는다. 종료는 모든 스트림을 함께 닫으므로 그 요청에는 답할 길이 없고,
-     *          꺼내면 워커가 헛일을 한다. closing 기간에 온 패킷에는 종료 프레임만 다시 간다.
-     */
+    /// When the peer's close arrives in the same packet as a request, the QUIC layer keeps the
+    /// request and closes. Closing ends every stream, so the request cannot be answered, and taking
+    /// it would waste a worker. A packet during the closing period gets only the close frame again.
     fn closed_connection_leaves_pending_requests_alone() {
         let (mut client, mut server) = h3_pair();
         pump_h3(&mut client, &mut server);
@@ -4126,11 +3726,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 스트림 처리 중 난 실패마다 맞는 코드로 연결을 닫는지.
-     * @details 보낼 버퍼가 넘친 것은 상대가 답을 읽지 않으면서 요청을 계속 보낸 결과라서
-     *          H3_EXCESSIVE_LOAD 다. HTTP/3 오류는 정한 코드 그대로, 그 밖은 내부 실패로 알린다.
-     */
+    /// HTTP/3 errors keep their code, a full send buffer is H3_EXCESSIVE_LOAD, and anything else is
+    /// internal.
     fn stream_processing_failures_close_with_matching_codes() {
         for (error, expected) in [
             (QuicError::FlowControl, H3Error::ExcessiveLoad),
@@ -4154,7 +3751,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 요청이 조기 데이터로 나가는지. 왕복 하나를 아낀다. */
     fn h3_first_request_rides_zero_rtt() {
         let mut res = onetdns_tls::conn::ServerResumption::secure_default();
         res.max_early_data = 0xffff_ffff;
@@ -4203,7 +3799,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조기 데이터가 거부돼도 요청이 결국 성공하는지. */
     fn h3_zero_rtt_rejected_still_succeeds() {
         let mut res_a = onetdns_tls::conn::ServerResumption::secure_default();
         res_a.max_early_data = 0xffff_ffff;

@@ -1,61 +1,51 @@
-/*!
- * @brief RFC 5011 신뢰 앵커 자동 갱신.
- *
- * @details 앵커는 검증의 출발점이라 아무 근거 없이 바꿀 수 없다. 새 키는 이미 신뢰하는
- *          키가 서명한 DNSKEY RRset에서 관찰되어야 하고, 그 상태로 hold-down 기간을
- *          견뎌야 비로소 신뢰된다. 폐기는 그 키 자신의 서명이 있어야만 인정한다.
- * @warning 이 파일의 판정이 느슨해지면 공격자가 자기 키를 앵커로 심을 수 있다. 갱신을
- *          받아들이지 못하는 쪽은 서비스가 멈추지만, 잘못 받아들이는 쪽은 전부 뚫린다.
- */
+//! Automated trust anchor updates (RFC 5011). An anchor is the starting point of validation and
+//! must not change without evidence: a new key has to be seen in a DNSKEY RRset signed by an
+//! already trusted key and stay through the hold-down period before it is trusted. A revocation
+//! counts only when signed by the revoked key itself.
+//!
+//! Loosening these checks lets an attacker plant their own key as an anchor. Refusing a valid
+//! update stops service; accepting a wrong one breaks everything.
 
 use onetdns_proto::{Name, Record, RecordType};
 
 use crate::{validate_rrset_in_zone, Dnskey, Ds, Rrsig};
 
-/** @brief 새 키를 신뢰하기까지 관찰을 이어가야 하는 기간. RFC 5011이 권하는 30일이다. */
+/// RFC 5011 recommends 30 days.
 pub const DEFAULT_HOLD_DOWN_SECS: u64 = 30 * 86_400;
 
-/** @brief 관리 중인 앵커 키의 상태. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyState {
-    /** @brief 신뢰한다. 이 키만 active_ds에 실려 검증의 기준이 된다. */
+    /// Trusted; only these keys go into `active_ds`.
     Valid,
 
-    /** @brief 관찰은 됐으나 아직 hold-down 중이다. since는 관찰이 끊기면 다시 시작한다. */
+    /// Seen but still in hold-down; `since` restarts when observation breaks.
     AddPend { since: u64 },
 
-    /** @brief 자기 서명으로 폐기가 확인됐다. 다시 Valid로 돌아가지 않는다. */
+    /// Revoked by its own signature; never returns to `Valid`.
     Revoked,
 }
 
-/** @brief 앵커 키 하나와 그 상태, 마지막 관찰 시각. */
 #[derive(Debug, Clone)]
 pub struct ManagedKey {
-    /** @brief 키 자체. */
     pub key: Dnskey,
-    /** @brief 현재 상태. */
     pub state: KeyState,
-    /** @brief 이 키를 마지막으로 본 시각. 관찰 공백 판정에 쓴다. */
+    /// Detects gaps in observation.
     pub last_seen: u64,
 }
 
-/** @brief 한 zone의 앵커 집합과 갱신 상태 기계. */
 #[derive(Debug, Clone)]
 pub struct AnchorManager {
-    /** @brief 이 앵커들이 속한 zone. 보통 루트다. */
+    /// Usually the root.
     pub zone: Name,
-    /** @brief 관리 중인 키 전부. Valid가 아닌 것도 상태 추적을 위해 남는다. */
+    /// Keys that are not `Valid` stay for state tracking.
     pub keys: Vec<ManagedKey>,
-    /** @brief hold-down 기간. 테스트에서만 줄여 쓴다. */
+    /// Shortened only in tests.
     pub hold_down_secs: u64,
 }
 
 impl AnchorManager {
-    /**
-     * @brief 설정에서 받은 키들을 그대로 Valid로 놓고 시작한다.
-     * @note 최초 키는 운영자가 대역 밖에서 확인해 넣은 것이므로 hold-down을 거치지 않는다.
-     *       이후 추가되는 키만 관찰과 대기를 거친다.
-     */
+    /// Initial keys skip hold-down because the operator verified them out of band. Only keys added
+    /// later go through observation and waiting.
     pub fn bootstrap(zone: Name, initial: Vec<Dnskey>, now: u64) -> AnchorManager {
         let keys = initial
             .into_iter()
@@ -72,7 +62,7 @@ impl AnchorManager {
         }
     }
 
-    /** @brief 현재 신뢰하는 키들. 갱신 검증의 기준이자 유일한 판단 근거다. */
+    /// The only basis for verifying updates.
     fn valid_keys(&self) -> Vec<Dnskey> {
         self.keys
             .iter()
@@ -81,10 +71,7 @@ impl AnchorManager {
             .collect()
     }
 
-    /**
-     * @brief 검증기에 넘길 DS 형태의 앵커.
-     * @details Valid 상태만 내보낸다. AddPend는 아직 신뢰 대상이 아니고 Revoked는 폐기됐다.
-     */
+    /// Only `Valid` keys: `AddPend` is not trusted yet and `Revoked` is gone.
     pub fn active_ds(&self) -> Vec<Ds> {
         self.keys
             .iter()
@@ -93,23 +80,16 @@ impl AnchorManager {
             .collect()
     }
 
-    /**
-     * @brief 관찰한 DNSKEY RRset으로 앵커 상태를 갱신한다.
-     *
-     * @details 순서가 곧 안전성이다. 먼저 현재 Valid 키로 RRset 서명을 검증하고, 실패하면
-     *          아무것도 건드리지 않는다. 그다음 폐기 표시된 키를 처리하는데, 이때는 그 키
-     *          자신이 서명한 것만 인정한다. 다른 키의 서명으로 폐기를 허용하면 침해된 키
-     *          하나가 나머지를 전부 지울 수 있다. 마지막으로 새 키를 AddPend로 넣고,
-     *          hold-down을 채운 것을 Valid로 올린다.
-     * @note 관찰 공백은 hold-down을 처음부터 다시 시작시킨다. 기준은 RRset의 최소 TTL
-     *       두 배다. 그보다 오래 못 봤다면 연속 관찰이 끊긴 것이므로, 공격자가 잠깐
-     *       시작한 키가 시간만 흘러 승격되는 것을 막는다.
-     * @param dnskeys 관찰한 DNSKEY 레코드들.
-     * @param rrsigs  그 RRset을 덮는 서명들.
-     * @param now     현재 시각(Unix 초).
-     * @return 상태가 바뀌어 저장이 필요하면 참.
-     * @invariant Valid 키가 하나도 없으면 갱신을 거부한다. 검증 기준이 없기 때문이다.
-     */
+    /// The order is the safety. First the RRset signature is verified with the current `Valid`
+    /// keys; on failure nothing changes. Then revoked keys are processed, accepting only a
+    /// revocation signed by that key itself: allowing another key's signature would let one
+    /// compromised key remove all the others. Last, new keys enter `AddPend` and those that
+    /// completed hold-down become `Valid`.
+    ///
+    /// A gap longer than twice the RRset's minimum TTL restarts hold-down: observation was not
+    /// continuous, so a key an attacker showed briefly cannot be promoted by time alone. With no
+    /// `Valid` key nothing can be verified, so the update is refused. Returns true when the state
+    /// changed and needs saving.
     pub fn update(&mut self, dnskeys: &[Record], rrsigs: &[Rrsig], now: u64) -> bool {
         let valid = self.valid_keys();
         if valid.is_empty() {
@@ -207,13 +187,9 @@ impl AnchorManager {
         changed
     }
 
-    /**
-     * @brief 앵커 상태를 텍스트로 직렬화한다.
-     * @details 재시작해도 hold-down 진행 상황이 남아야 한다. 상태를 잃으면 진행 중이던
-     *          대기가 처음부터 다시 시작돼 롤오버를 놓친다.
-     * @note 루트 zone은 빈 문자열이 아니라 점 하나로 적는다. 역직렬화가 필드 수로 형식을
-     *       검사하기 때문에 공백이 들어가면 줄이 깨진다.
-     */
+    /// Hold-down progress must survive restarts; losing it restarts the wait and misses the
+    /// rollover. The root zone is written as a single dot rather than an empty string, because
+    /// deserialization checks the field count.
     pub fn serialize(&self) -> String {
         let zone = if self.zone.is_root() {
             ".".to_string()
@@ -242,16 +218,11 @@ impl AnchorManager {
         out
     }
 
-    /**
-     * @brief 직렬화된 앵커 상태를 되읽는다.
-     *
-     * @details 형식을 엄격히 본다. 헤더, 줄 순서, 필드 수, 상태 이름과 since의 정합성이
-     *          하나라도 어긋나면 전체를 거부한다. 같은 키가 두 번 나오는 것도 거부한다.
-     *          중복이 있으면 어느 상태가 진짜인지 정할 수 없다.
-     * @warning 이 파일은 디스크에 있으므로 신뢰 입력이 아니다. 절반만 읽고 나머지를 기본값으로
-     *          채우면 조작된 파일이 임의 키를 Valid로 만들 수 있다.
-     * @return 한 군데라도 어긋나면 None. 그 경우 호출자는 설정의 초기 앵커로 되돌아간다.
-     */
+    /// Strict: any mismatch in header, line order, field count, state name or `since` rejects the
+    /// whole file, as does a duplicate key, since there would be no telling which state is real.
+    /// The file sits on disk and is not trusted input: reading half and defaulting the rest would
+    /// let a tampered file make any key `Valid`. On `None` the caller falls back to the configured
+    /// initial anchors.
     pub fn deserialize(text: &str) -> Option<AnchorManager> {
         let mut lines = text.lines();
         if lines.next()? != "ONETDNS-ANCHOR" {
@@ -315,11 +286,8 @@ impl AnchorManager {
     }
 }
 
-/**
- * @brief 응답에서 zone apex의 DNSKEY RRset과 그것을 덮는 서명만 골라낸다.
- * @details 소유자 이름과 type_covered를 모두 확인한다. 다른 이름이나 다른 타입을 덮는
- *          서명이 섞이면 갱신 판정이 엉뚱한 데이터를 근거로 삼게 된다.
- */
+/// Checks both the owner name and `type_covered`: signatures over another name or type would make
+/// the update decide on the wrong data.
 pub fn extract_dnskey_rrset(records: &[Record], zone: &Name) -> (Vec<Record>, Vec<Rrsig>) {
     let keys: Vec<Record> = records
         .iter()
@@ -335,19 +303,16 @@ pub fn extract_dnskey_rrset(records: &[Record], zone: &Name) -> (Vec<Record>, Ve
     (keys, sigs)
 }
 
-/** @brief 앵커 갱신 규칙: hold-down, 자기서명 폐기, 미검증 갱신 거부, 상태 보존. */
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sign::ZoneSigner;
     use onetdns_proto::{DnsClass, RData};
 
-    /** @brief 이름 문자열을 Name으로. */
     fn n(s: &str) -> Name {
         Name::from_str(s).unwrap()
     }
 
-    /** @brief 주어진 키들로 DNSKEY RRset을 만들고 signer로 서명해 붙인다. */
     fn dnskey_rrset(keys: &[Dnskey], signer: &ZoneSigner, zone: &Name, now: u64) -> Vec<Record> {
         let mut recs: Vec<Record> = keys
             .iter()
@@ -364,7 +329,6 @@ mod tests {
         recs
     }
 
-    /** @brief 새 키가 hold-down을 채우기 전에는 앵커로 쓰이지 않음을 고정한다. */
     #[test]
     fn new_key_held_down_then_promoted() {
         let zone = n("example.com");
@@ -395,7 +359,6 @@ mod tests {
         );
     }
 
-    /** @brief 자기 서명이 붙은 폐기는 그 키를 즉시 앵커에서 뺀다. */
     #[test]
     fn revoked_key_removed() {
         let zone = n("example.com");
@@ -416,10 +379,6 @@ mod tests {
         assert_eq!(ds[0].key_tag, k2.dnskey().key_tag());
     }
 
-    /**
-     * @brief 침해된 키 하나가 다른 앵커를 지우지 못하게 막는다.
-     * @details 폐기 표시가 붙었더라도 서명이 그 키 자신의 것이 아니면 무시해야 한다.
-     */
     #[test]
     fn revoke_requires_self_signature_not_other_key() {
         let zone = n("example.com");
@@ -437,7 +396,6 @@ mod tests {
         assert_eq!(mgr.active_ds().len(), 2, "타 키 서명으로는 폐기 불가");
     }
 
-    /** @brief 현재 앵커로 검증되지 않는 RRset은 공격자 키를 심지 못한다. */
     #[test]
     fn unsigned_update_ignored() {
         let zone = n("example.com");
@@ -455,10 +413,6 @@ mod tests {
         assert_eq!(mgr.active_ds().len(), 1, "공격자 키 미추가");
     }
 
-    /**
-     * @brief 관찰이 끊겼다 돌아온 키는 대기 시간을 처음부터 다시 채워야 한다.
-     * @details 시간 경과만으로 승격되면 잠깐 띄웠다 사라진 키가 나중에 신뢰된다.
-     */
     #[test]
     fn pending_key_gap_restarts_hold_down() {
         let zone = n("example.com");
@@ -479,7 +433,6 @@ mod tests {
         assert_eq!(mgr.active_ds().len(), 1, "관찰 공백 뒤 즉시 승격 금지");
     }
 
-    /** @brief 상태가 왕복해도 보존되고, 형식이 깨진 입력은 전체를 거부된다. */
     #[test]
     fn serialize_roundtrip() {
         let zone = n("example.com");
@@ -501,10 +454,6 @@ mod tests {
         assert!(AnchorManager::deserialize(&(text.clone() + "extra value\n")).is_none());
     }
 
-    /**
-     * @brief 루트 앵커가 왕복에서 살아남는지. 실제로 쓰이는 유일한 zone이다.
-     * @details 루트 이름을 빈 문자열로 적으면 줄의 필드 수가 어긋나 상태를 전부 잃는다.
-     */
     #[test]
     fn root_zone_state_survives_serialize_roundtrip() {
         let root = Name::root();

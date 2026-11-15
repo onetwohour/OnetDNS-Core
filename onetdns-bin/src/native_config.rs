@@ -1,6 +1,5 @@
-/*!
- * @brief 설정에서 질의 처리기가 쓰는 정책, 접근 제어, 속도 제한, 빠른 경로 조건을 만든다.
- */
+//! Builds the query handler's policy, access control, rate limits, and fast-path gates from the
+//! config.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +17,6 @@ use crate::{
     tsig_for_secondary, PRODUCT_NAME, WASM_MODULE_MAX_BYTES,
 };
 
-/** @brief 클라이언트별로 다르게 답할 뷰들을 만든다. */
 pub(crate) fn build_views(cfg: &Config) -> Result<Vec<native::NativeView>, String> {
     cfg.views
         .iter()
@@ -64,7 +62,6 @@ pub(crate) fn build_views(cfg: &Config) -> Result<Vec<native::NativeView>, Strin
         .collect()
 }
 
-/** @brief 누가 무엇을 고칠 수 있는지 정한 규칙들을 만든다. */
 fn build_update_policy(cfg: &Config) -> Result<Vec<native::UpdateRule>, String> {
     cfg.update_policy
         .iter()
@@ -102,16 +99,14 @@ fn build_update_policy(cfg: &Config) -> Result<Vec<native::UpdateRule>, String> 
         .collect()
 }
 
-/** @brief 교체할 수 있는 접근 제어. 아무것도 막지 않는지를 값싸게 답한다. */
+/// Swappable access control that answers cheaply whether it blocks nothing.
 pub(crate) struct DynamicAccessControl {
-    /** @brief 지금 걸린 규칙. */
     inner: std::sync::RwLock<Arc<dyn AccessControl>>,
-    /** @brief 아무것도 막지 않는지. 복제 없이 답하려고 따로 둔다. */
+    /// Kept apart so answering needs no lock.
     trivially_allow: std::sync::atomic::AtomicBool,
 }
 
 impl DynamicAccessControl {
-    /** @brief 지금 규칙으로 만든다. */
     pub(crate) fn new(inner: Arc<dyn AccessControl>) -> Self {
         let trivially_allow = inner.is_trivially_allow();
         Self {
@@ -120,7 +115,7 @@ impl DynamicAccessControl {
         }
     }
 
-    /** @brief 규칙을 교체하고 요약 판정도 함께 맞춘다. */
+    /// Also updates the trivial-allow flag.
     pub(crate) fn replace(&self, next: Arc<dyn AccessControl>) {
         let trivially_allow = next.is_trivially_allow();
         if !trivially_allow {
@@ -139,7 +134,6 @@ impl DynamicAccessControl {
 }
 
 impl AccessControl for DynamicAccessControl {
-    /** @brief 이 클라이언트를 받아 줄지. */
     fn check(&self, client: &onetdns_core::ClientInfo) -> onetdns_core::AclDecision {
         self.inner
             .read()
@@ -147,10 +141,8 @@ impl AccessControl for DynamicAccessControl {
             .check(client)
     }
 
-    /**
-     * @brief 지금 규칙이 이 주소를 버리는지와 그 까닭.
-     * @note 전송이 패킷과 연결마다 부르므로 규칙이 하나도 없으면 잠금 없이 답한다.
-     */
+    /// Transports call this per packet and per connection, so with no rules it answers without
+    /// locking.
     fn drops(&self, ip: std::net::IpAddr) -> Option<onetdns_core::DropReason> {
         if self.is_trivially_allow() {
             return None;
@@ -161,57 +153,41 @@ impl AccessControl for DynamicAccessControl {
             .drops(ip)
     }
 
-    /** @brief 아무것도 막지 않는지. 빠른 경로가 이 판정을 믿고 검사를 건너뛴다. */
+    /// Fast paths skip the check on its word.
     fn is_trivially_allow(&self) -> bool {
         self.trivially_allow
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/** @brief 교체할 수 있는 속도 제한. */
+/// Swappable rate limiting.
 pub(crate) struct DynamicRateLimiter {
-    /** @brief 지금 걸린 제한기들. */
     inner: std::sync::RwLock<Vec<Arc<dyn RateLimiter>>>,
-    /** @brief 걸린 제한기 수. 복제 없이 답하려고 따로 둔다. */
+    /// Kept apart so answering needs no lock.
     active: std::sync::atomic::AtomicUsize,
 }
 
-/**
- * @brief 빠른 경로 조건을 볼 때 설정만으로는 알 수 없는 사실들.
- *
- * @details 셋 다 이번 세대 안에서 바뀔 수 있어서 설정에서 다시 계산할 수 없다. DHCP 임대
- *          풀은 세대가 바뀔 때만 서고, 뷰와 정책은 살아 있는 값을 봐야 한다.
- */
+/// Facts the fast-path gates need that the config cannot tell: whether the DHCP lease pool came up,
+/// which is known only once a generation starts, and whether views and policy rules exist, read
+/// from their live values.
 pub(crate) struct LaneFacts {
-    /** @brief DHCP 임대 풀이 서 있는지. */
     pub(crate) dhcp_pool: bool,
-    /** @brief 클라이언트별로 다르게 답할 뷰가 있는지. */
     pub(crate) views_present: bool,
-    /** @brief 정책 규칙이 하나라도 있는지. */
     pub(crate) policy_present: bool,
 }
 
-/**
- * @brief 답한 주소를 커널 주소 집합에 넣는 계층이 이 설정에서 붙는지.
- * @details 집합 이름과 대상 도메인이 함께 있어야 하고, 커널 집합은 Linux에만 있다. 붙지 않는
- *          설정으로 빠른 경로를 끄면 하는 일 없이 느려지기만 한다.
- */
+/// Whether this config adds the layer that puts answered addresses into a kernel set: it needs both
+/// a set name and target domains, and kernel sets exist only on Linux. Closing a fast path for a
+/// config that adds no such layer only slows things down.
 pub(crate) fn ipset_layer_active(cfg: &Config) -> bool {
     cfg!(target_os = "linux")
         && (cfg.ipset_name_v4.is_some() || cfg.ipset_name_v6.is_some())
         && !cfg.ipset_domains.is_empty()
 }
 
-/**
- * @brief 지금 설정으로 세 빠른 경로가 적격인지 판정한다.
- *
- * @details 시작할 때와 설정을 교체할 때 모두 이 함수 하나만 부른다. 두 곳에서 따로
- *          판정하면 교체한 뒤 레인이 이전 조건으로 남아 없는 기능처럼 답한다. 어느 키가
- *          경로를 닫는지는 config_keys 의 표가 정하고, 여기서는 경로마다의 전제만 본다.
- * @param cfg    판정할 설정.
- * @param facts  설정만으로 알 수 없는 사실들.
- * @return 세 경로 각각의 적격 여부.
- */
+/// Startup and config swaps both call only this; judging in two places would leave a lane on the
+/// old conditions after a swap, answering as if a feature did not exist. The `config_keys` table
+/// decides which keys close a lane; this checks only each lane's prerequisites.
 pub(crate) fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> native::LaneGates {
     use config_keys::{lane_unblocked, Lane};
     let wire = lane_unblocked(Lane::Wire, cfg, facts);
@@ -226,26 +202,19 @@ pub(crate) fn evaluate_lane_gates(cfg: &Config, facts: &LaneFacts) -> native::La
 }
 
 #[derive(Clone)]
-/** @brief 설정을 다시 읽을 때 교체할 것들. */
+/// Swapped on config reload.
 pub(crate) struct NativeHotState {
-    /** @brief 기능 세트. 빠른 경로 조건과 체인 세대도 여기에 함께 담긴다. */
+    /// Also carries the fast-path gates and the chain generation.
     pub(crate) features: Arc<native::NativeFeatureSwap>,
-    /** @brief 정책 엔진. */
     pub(crate) policy: Arc<native::GatedSwap<onetdns_policy::PolicyEngine>>,
-    /** @brief 클라이언트별 뷰. */
     pub(crate) views: Arc<native::GatedSwap<Vec<native::NativeView>>>,
-    /** @brief 차단 답의 수명. */
     pub(crate) block_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief 고정해 둔 주소의 수명. */
     pub(crate) local_ttl: Arc<std::sync::atomic::AtomicU32>,
-    /** @brief 밖에 물어보면 안 되는 이름의 범주. */
     pub(crate) local_only_names: Arc<layers::LocalOnlyNames>,
-    /** @brief 권한 영역 설정 세트. */
     pub(crate) authority: Arc<onetdns_core::ArcSwap<native::AuthoritySettings>>,
 }
 
 impl DynamicRateLimiter {
-    /** @brief 지금 제한기들로 만든다. */
     pub(crate) fn new(inner: Vec<Arc<dyn RateLimiter>>) -> Self {
         let active = inner.len();
         Self {
@@ -254,7 +223,6 @@ impl DynamicRateLimiter {
         }
     }
 
-    /** @brief 제한기들을 교체한다. */
     pub(crate) fn replace(&self, next: Vec<Arc<dyn RateLimiter>>) {
         let active = next.len();
         if active != 0 {
@@ -271,14 +239,12 @@ impl DynamicRateLimiter {
         }
     }
 
-    /** @brief 걸린 제한기 수. */
     pub(crate) fn layer_count(&self) -> usize {
         self.active.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 impl RateLimiter for DynamicRateLimiter {
-    /** @brief 이번 질의를 받아 줄지. */
     fn check(&self, client: &onetdns_core::ClientInfo) -> onetdns_core::RateDecision {
         if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
             return onetdns_core::RateDecision::Permit;
@@ -297,13 +263,11 @@ impl RateLimiter for DynamicRateLimiter {
         }
     }
 
-    /** @brief 제한이 걸려 있는지. */
     fn is_active(&self) -> bool {
         self.layer_count() != 0
     }
 }
 
-/** @brief 설정대로 접근 제어를 만든다. */
 pub(crate) fn runtime_access_control(cfg: &Config) -> Arc<dyn AccessControl> {
     Arc::new(
         IpAcl::new(
@@ -317,13 +281,9 @@ pub(crate) fn runtime_access_control(cfg: &Config) -> Arc<dyn AccessControl> {
     )
 }
 
-/**
- * @brief 설정대로 권한 영역 설정 세트를 만든다.
- *
- * @details 시작할 때와 교체할 때 모두 이 함수만 부른다. 영역 목록에서 저장 경로와
- *          고칠 수 있는 영역이 함께 나오므로 따로 만들면 서로 어긋난다.
- * @return 키나 규칙이 올바르지 않으면 실패. 그때는 이전 설정을 그대로 둔다.
- */
+/// Startup and swaps both call only this: the zone list yields both the storage paths and the
+/// editable zones, so building them separately would let them disagree. Fails on an invalid key or
+/// rule, keeping the previous settings.
 pub(crate) fn build_authority_settings(cfg: &Config) -> Result<native::AuthoritySettings, String> {
     let tsig_keys = build_tsig_keys(cfg)?;
     let zone_signers = cfg
@@ -389,19 +349,14 @@ pub(crate) fn build_authority_settings(cfg: &Config) -> Result<native::Authority
     })
 }
 
-/**
- * @brief 이 설정이 재귀를 제공한다고 알릴지.
- *
- * @details 체인을 다시 만들 때마다 그때 설정으로 다시 본다. 처리 방식이나 업스트림 서버가
- *          바뀌면 답의 RA 비트도 함께 바뀌어야 한다.
- */
+/// Whether answers advertise recursion (RA). Rechecked with every chain rebuild, so a change of
+/// backend or upstreams changes RA too.
 pub(crate) fn recursion_offered_by(cfg: &Config) -> bool {
     cfg.backend != BackendKind::Forward
         || !cfg.upstreams.is_empty()
         || !cfg.upstream_urls.is_empty()
 }
 
-/** @brief 설정대로 속도 제한을 만든다. */
 pub(crate) fn runtime_rate_limiters(cfg: &Config) -> Vec<Arc<dyn RateLimiter>> {
     let mut rate_limiters: Vec<Arc<dyn RateLimiter>> = Vec::new();
     if let Some(srl) = SubnetRateLimiter::new(cfg.subnet_rrl_per_sec, cfg.subnet_rrl_burst, 24, 56)
@@ -417,7 +372,6 @@ pub(crate) fn runtime_rate_limiters(cfg: &Config) -> Vec<Arc<dyn RateLimiter>> {
     rate_limiters
 }
 
-/** @brief 설정대로 정책 엔진을 만든다. */
 pub(crate) fn build_policy_engine(cfg: &Config) -> Result<onetdns_policy::PolicyEngine, String> {
     use onetdns_policy::{Action, Rule, RuleEngine, WasmPolicy};
     let mut rules = Vec::new();
@@ -513,7 +467,7 @@ pub(crate) fn build_policy_engine(cfg: &Config) -> Result<onetdns_policy::Policy
     ))
 }
 
-/** @brief 대시보드가 쓰는 항목 식별자. 목록 순서가 바뀌어도 그대로다. */
+/// Dashboard item ID; unaffected by list order.
 pub(crate) fn stable_resource_id(namespace: &str, value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(namespace.as_bytes());
@@ -527,9 +481,9 @@ pub(crate) fn stable_resource_id(namespace: &str, value: &str) -> String {
     format!("{namespace}-{short}")
 }
 
-/** @brief 로그에 원문을 담지 않으면서 프로세스 안에서 비밀 자원을 구분하는 식별자. */
+/// Tells secret resources apart within the process without logging the plaintext.
 pub(crate) fn private_resource_id(namespace: &str, value: &str) -> String {
-    /** @brief 사전 대입으로 약한 비밀번호를 지문과 대조하지 못하게 하는 프로세스 키. */
+    /// Per-process key, so a dictionary attack cannot match weak passwords against the fingerprint.
     static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     let mut digest = Sha256::new();
     digest.update(KEY.get_or_init(onetdns_core::random_array::<32>));
@@ -545,13 +499,9 @@ pub(crate) fn private_resource_id(namespace: &str, value: &str) -> String {
     format!("{namespace}-{short}")
 }
 
-/**
- * @brief 질의 종류 이름들을 번호로.
- *
- * @details 약칭은 RecordType::name 이 내는 것을 모두 받는다. 빠진 약칭은 걸러지고,
- *          호출자는 대개 A 로 되돌리므로 물어본 것과 다른 종류를 답하게 된다.
- *          약칭이 없는 종류는 RFC 3597 의 TYPE 표기로 적는다.
- */
+/// Accepts every mnemonic `RecordType::name` produces. A missing mnemonic is filtered out, and
+/// callers usually fall back to A, answering a type other than the one asked. Types without a
+/// mnemonic use the RFC 3597 TYPE form.
 pub(crate) fn qtype_numbers(names: &[String]) -> Vec<u16> {
     names
         .iter()
@@ -587,7 +537,6 @@ pub(crate) fn qtype_numbers(names: &[String]) -> Vec<u16> {
         .collect()
 }
 
-/** @brief 시간대 설정을 읽는다. */
 fn parse_time_window(
     days: &[String],
     start: &Option<String>,
@@ -639,13 +588,9 @@ fn parse_time_window(
     })
 }
 
-/**
- * @brief 모은 통계와 질의 기록을 볼 수 있는 곳이 있는지.
- *
- * @details 관리 수신 주소가 있으면 대시보드와 REST가, 저장 파일이 있으면 그 파일이 본다.
- *          셋 다 없으면 질의마다 만드는 이벤트는 만들어지자마자 버려진다.
- * @return 볼 곳이 하나라도 있으면 참.
- */
+/// Whether anything reads the collected statistics and query log: the dashboard and REST when there
+/// is a control listen address, or the files when configured. With none, the events built per query
+/// are discarded as soon as they are made.
 pub(crate) fn telemetry_consumed(cfg: &Config) -> bool {
     let has_file = |path: &Option<PathBuf>| {
         path.as_ref()
@@ -654,17 +599,15 @@ pub(crate) fn telemetry_consumed(cfg: &Config) -> bool {
     cfg.control_listen.is_some() || has_file(&cfg.stats_file) || has_file(&cfg.querylog_file)
 }
 
-/** @brief 쿠키 서버 비밀을 끌어낼 클러스터 비밀. 없으면 노드마다 무작위 비밀을 쓴다. */
+/// Cluster secret the server cookie secret derives from; None means each node uses a random secret.
 fn cookie_root(cfg: &Config) -> Option<&str> {
     (cfg.cluster_raft && cfg.cluster_raft_secret.len() >= 32)
         .then_some(cfg.cluster_raft_secret.as_str())
 }
 
-/**
- * @brief 설정에서 DNS Cookie 정책을 만든다.
- * @param previous 지금 쓰는 설정과 쿠키 정책. 서버 비밀을 정하는 입력이 그대로면 그 비밀을
- *                 이어 쓴다. 새 비밀을 만들면 클라이언트가 가진 서버 쿠키가 모두 맞지 않게 된다.
- */
+/// `previous`: the running config and cookie policy. When the inputs that decide the server secret
+/// are unchanged, that secret carries over; a new secret would invalidate every server cookie
+/// clients hold.
 fn build_cookie_policy(
     cfg: &Config,
     previous: Option<(&Config, &native::CookiePolicy)>,
@@ -678,10 +621,9 @@ fn build_cookie_policy(
     let keeper = kept.unwrap_or_else(|| {
         Arc::new(match cookie_root(cfg) {
             Some(secret) => {
-                /*
-                 * Raft 인증과 쿠키가 같은 원시 키를 직접 공유하지 않도록 문맥을 붙여 별도 루트를
-                 * 만든다. 같은 클러스터 비밀을 가진 노드는 같은 루트와 epoch 키를 얻게 된다.
-                 */
+                // A context label derives a separate root, so Raft authentication and cookies never
+                // share the raw key. Nodes with the same cluster secret get the same root and epoch
+                // keys.
                 let mut digest = Sha256::new();
                 digest.update(b"OnetDNS DNS Cookie cluster master v1\0");
                 digest.update(secret.as_bytes());
@@ -699,7 +641,7 @@ fn build_cookie_policy(
     }
 }
 
-/** @brief DNS64 접두사의 16바이트 표현. 뒤 4바이트는 합성할 때 IPv4 주소로 채우므로 0이다. */
+/// The last 4 bytes are 0; synthesis fills them with the IPv4 address.
 fn dns64_prefix(cfg: &Config) -> Option<[u8; 16]> {
     let address = cfg.dns64_prefix.as_ref()?.split('/').next()?;
     let mut octets = address.parse::<std::net::Ipv6Addr>().ok()?.octets();
@@ -707,14 +649,13 @@ fn dns64_prefix(cfg: &Config) -> Option<[u8; 16]> {
     Some(octets)
 }
 
-/**
- * @brief 설정으로 기능 세트를 만든다. 시작할 때와 설정을 교체할 때 이 함수 하나를 쓴다.
- * @details 어느 키가 바뀌었는지 보지 않고 설정 전체에서 만든다. 바뀐 키의 그룹으로 고칠 필드를
- *          고르면, 다른 그룹에 속하면서 응답 기능 값도 정하는 키를 빠뜨린다.
- * @param previous 지금 쓰는 설정과 기능 세트. 시작할 때는 없다. 쿠키 비밀과 dnstap 스트림을
- *                 이어 쓸지 정하는 데만 쓴다.
- * @note 빠른 경로 상태는 비워 둔다. 체인 세대와 경로 조건은 부른 쪽이 정해 넣는다.
- */
+/// Startup and config swaps both use this alone. It builds from the whole config without looking at
+/// which keys changed: picking fields by the changed keys' groups would miss a key that belongs to
+/// another group but also sets a response feature.
+///
+/// `previous`: the running config and features, None at startup; used only to decide whether the
+/// cookie secret and the dnstap stream carry over. Fast-path state is left empty; the caller sets
+/// the chain generation and the gates.
 pub(crate) fn build_native_features(
     cfg: &Config,
     previous: Option<(&Config, &native::NativeFeatures)>,
@@ -776,7 +717,7 @@ pub(crate) fn build_native_features(
     })
 }
 
-/** @brief dnstap 기록에 적을 서버 이름. 따로 정하지 않으면 제품 이름이다. */
+/// Defaults to the product name.
 fn dnstap_identity(cfg: &Config) -> &str {
     if cfg.dnstap_identity.is_empty() {
         PRODUCT_NAME
@@ -785,11 +726,9 @@ fn dnstap_identity(cfg: &Config) -> &str {
     }
 }
 
-/**
- * @brief 질의 기록 파일을 연다. 열지 못하면 조용히 끄지 않고 실패로 알린다.
- * @param open 지금 쓰는 기록기. 같은 파일이면 그 스트림을 이어 쓰고 서버 이름만 바꾼다. 같은
- *             파일에 스트림을 하나 더 열면 두 스트림의 프레임이 한 파일에 섞인다.
- */
+/// Fails rather than silently disabling when the file cannot be opened. `open`: the running writer;
+/// for the same file its stream continues and only the identity changes, since a second stream on
+/// one file would interleave frames.
 fn build_dnstap(
     cfg: &Config,
     open: Option<&Arc<onetdns_control::DnstapWriter>>,
@@ -811,7 +750,6 @@ fn build_dnstap(
     Ok(Some(Arc::new(writer)))
 }
 
-/** @brief 요일 이름들을 비트로. */
 pub(crate) fn days_mask(days: &[String]) -> u8 {
     let mut m = 0u8;
     for d in days {
@@ -834,7 +772,7 @@ pub(crate) fn days_mask(days: &[String]) -> u8 {
     m
 }
 
-/** @brief 시각 문자열을 분으로. */
+/// Minutes since midnight.
 pub(crate) fn parse_hhmm(s: &str) -> Option<u32> {
     let (h, m) = s.split_once(':')?;
     let h: u32 = h.trim().parse().ok()?;
@@ -842,7 +780,6 @@ pub(crate) fn parse_hhmm(s: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
-/** @brief 설정한 차단 방식. */
 pub(crate) fn map_block(cfg: &Config) -> BlockResponse {
     match cfg.block_response {
         BlockResponseKind::Nxdomain => BlockResponse::NxDomain,
@@ -855,7 +792,6 @@ pub(crate) fn map_block(cfg: &Config) -> BlockResponse {
     }
 }
 
-/** @brief 질의 종류 이름을 읽는다. */
 pub(crate) fn parse_qtype(s: Option<&str>) -> BoxResult<onetdns_proto::RecordType> {
     use onetdns_proto::RecordType as Rt;
     let t = match s {
@@ -879,7 +815,6 @@ pub(crate) fn parse_qtype(s: Option<&str>) -> BoxResult<onetdns_proto::RecordTyp
 }
 
 #[cfg(test)]
-/** @brief 정책, 접근 제어, 빠른 경로 조건 구성. */
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -892,11 +827,8 @@ mod tests {
     use crate::{config_keys, native};
 
     #[test]
-    /**
-     * @brief 화면에 내는 종류 약칭을 그대로 다시 읽어 같은 번호가 되는지.
-     * @details 두 테이블이 어긋나면 물어본 종류가 조용히 걸러지고 호출자가 A 로 되돌린다.
-     *          CAA 를 물었는데 A 를 설명하는 응답이 나가도 오류 하나 남지 않는다.
-     */
+    /// If the two tables disagree, the asked type is silently filtered and the caller falls back to
+    /// A; a CAA query would get an answer about A without a single error.
     fn every_displayed_qtype_name_parses_back_to_its_own_number() {
         for number in 0u16..=u16::MAX {
             let rtype = onetdns_proto::RecordType(number);
@@ -916,11 +848,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 설정에 적은 요일 이름이 지역 시각으로 바꾼 요일과 같은 위치를 가리키는지.
-     * @details 비트를 정하는 곳과 그 비트를 읽는 위치가 갈라져 있어, 한쪽만 바꾸면 모든
-     *          시간대 규칙이 하루씩 어긋난 채로도 각 단위 테스트는 그대로 통과한다.
-     */
+    /// The bit is set in one place and read in another, so changing only one would shift every time
+    /// window rule by a day while each unit test still passes.
     fn policy_time_window_day_names_match_the_local_weekday_fold() {
         let window = parse_time_window(
             &["fri".to_string()],
@@ -966,7 +895,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서비스 시간표와 정책 규칙이 같은 요일 이름을 같은 비트로 옮기는지. */
     fn schedule_and_policy_day_masks_agree() {
         for (index, name) in ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
             .iter()
@@ -993,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 업데이트 정책 규칙이 조용히 사라지지 않는지. 사라지면 운영자는 걸린 줄 안다. */
+    /// A vanished rule leaves the operator believing it applies.
     fn invalid_update_policy_name_cannot_disappear_silently() {
         let mut cfg = Config::default();
         cfg.update_policy.push(onetdns_config::UpdatePolicyRule {
@@ -1006,7 +934,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 정책 규칙이 건너뛰어지거나 더 넓게 해석되지 않는지. */
     fn invalid_policy_rule_cannot_be_skipped_or_broadened() {
         let mut cfg = Config::default();
         cfg.policy.push(onetdns_config::PolicyRule {
@@ -1026,7 +953,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘못된 배치 기록이 조용히 사라지지 않는지. */
     fn invalid_view_record_name_cannot_disappear_silently() {
         let mut cfg = Config::default();
         cfg.views.push(onetdns_config::ViewConfig {
@@ -1038,18 +964,15 @@ mod tests {
         assert!(build_views(&cfg).is_err());
     }
 
-    /** @brief 언제나 막는 테스트용 제한기. */
     struct AlwaysThrottle;
 
     impl RateLimiter for AlwaysThrottle {
-        /** @brief 언제나 막는다. */
         fn check(&self, _client: &onetdns_core::ClientInfo) -> onetdns_core::RateDecision {
             onetdns_core::RateDecision::Throttle
         }
     }
 
     #[test]
-    /** @brief 접근 제어를 교체하면 아무것도 막지 않는지 판정도 함께 바뀌는지. */
     fn dynamic_acl_trivial_gate_tracks_hot_reload() {
         let acl = DynamicAccessControl::new(Arc::new(IpAcl::allow_all()));
         let client = onetdns_core::ClientInfo {
@@ -1072,11 +995,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 목록 밖 처분이 설정에서 실제 접근 제어까지 이어지는지.
-     * @details 기본 허용 목록은 사설 대역뿐이라 공인 주소의 클라이언트는 어느 규칙에도 걸리지
-     *          않는다. 그 클라이언트를 버리라고 했으면 전송이 쓰는 주소만의 판정도 버려야 한다.
-     */
+    /// The default allow list holds only private ranges, so a client with a public address matches
+    /// no rule. When the config says to drop such clients, the address-only check transports use
+    /// must drop them too.
     fn runtime_access_control_carries_the_unlisted_policy() {
         use onetdns_core::{AclDecision, DropReason};
         let client = onetdns_core::ClientInfo {
@@ -1109,7 +1030,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제한기를 교체하면 걸렸는지 판정도 함께 바뀌는지. */
     fn dynamic_rate_limiter_tracks_empty_hot_reload() {
         let limiter = DynamicRateLimiter::new(vec![]);
         let client = onetdns_core::ClientInfo {
@@ -1135,7 +1055,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 목록 순서가 바뀌어도 식별자가 그대로인지. */
     fn stable_resource_ids_do_not_depend_on_array_position() {
         let a1 = stable_resource_id("upstream", "https://dns.example/dns-query");
         let a2 = stable_resource_id("upstream", "https://dns.example/dns-query");
@@ -1146,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정책 플러그인을 못 올렸을 때 그냥 통과시키지 않는지. */
+    /// A policy plugin that failed to load does not let queries through.
     fn closed_wasm_policy_rejects_load_failures() {
         let missing = std::env::temp_dir().join(format!(
             "onetdns-missing-policy-{}-{}.wasm",
@@ -1169,7 +1088,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 플러그인마다 정한 실패 처분이 전체 설정을 이기는지. */
     fn per_plugin_fail_mode_overrides_global() {
         let missing = std::env::temp_dir().join(format!(
             "onetdns-missing-plugin-{}-{}.wasm",
@@ -1198,13 +1116,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 통계를 볼 수 있는 곳을 빠짐없이 세는지.
-     *
-     * @details 하나라도 빠뜨리면 그 설정을 쓰는 사람은 대시보드나 저장 파일이 비는 것을
-     *          보게 되고, 거꾸로 넓게 잡으면 헤드리스 배포가 아무도 읽지 않는 통계에
-     *          해석당 CPU의 4분의 1을 낸다.
-     */
+    /// Missing one would leave the dashboard or the file empty for that config; counting too
+    /// broadly would make headless deployments pay for statistics nobody reads.
     fn telemetry_is_collected_only_where_something_reads_it() {
         let mut cfg = Config::default();
         cfg.control_listen = None;
@@ -1235,7 +1148,7 @@ mod tests {
             "질의 기록 파일이 있으면 모아야 합니다"
         );
 
-        /* 빈 경로는 끈 것이다. 설정 파일에 키만 남기고 값을 지운 경우가 실제로 있다. */
+        // An empty path means off; configs with the key left and the value cleared do occur.
         cfg.querylog_file = Some(PathBuf::new());
         assert!(
             !telemetry_consumed(&cfg),
@@ -1244,14 +1157,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 무중단으로 바뀌는 설정이 빠른 경로 조건을 깨면 그 경로가 닫히는지.
-     *
-     * @details 빠른 경로는 지어질 때의 설정을 전제로 답한다. 조건을 깨는 설정을 무중단으로
-     *          받아 놓고 경로를 열어 두면 캐시를 껐는데 이전 답이 나가고, 켠 기능이 없는 것
-     *          처럼 답한다. 여기서 걸리면 그 설정을 무중단 목록에서 빼거나 조건에 넣어야
-     *          한다.
-     */
+    /// Fast paths answer on the assumption of the config they were built with. Accepting a setting
+    /// that breaks that assumption hot while the lane stays open would keep serving old answers
+    /// after the cache is turned off, or answer as if an enabled feature were absent.
+    ///
+    /// A failure here means the setting must leave the hot-reload list or join the lane conditions.
     fn hot_settings_that_break_a_lane_close_that_lane() {
         let facts = LaneFacts {
             dhcp_pool: true,
@@ -1406,7 +1316,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기본 설정이 실제 질의 기능 세트에도 lenient 쿠키를 만드는지. */
     fn default_native_features_enable_lenient_cookies() {
         let features = build_native_features(&Config::default(), None).unwrap();
 
@@ -1420,7 +1329,7 @@ mod tests {
         );
     }
 
-    /** @brief 이 기능 세트가 정해진 클라이언트 쿠키와 주소, 시각에 내는 서버 쿠키. */
+    /// For a fixed client cookie, address, and time.
     fn server_cookie(features: &native::NativeFeatures) -> Vec<u8> {
         features
             .cookies
@@ -1436,12 +1345,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 같은 Raft 비밀의 노드는 쿠키를 공유하고, 비밀을 바꾸면 쿠키도 바로 바뀌는지.
-     * @details Raft 를 켜기 전에 노드가 쓰던 무작위 비밀도 켜는 순간 공용 루트로 바뀌어야 한다.
-     *          남아 있으면 노드마다 다른 서버 쿠키를 내서, 다른 노드로 간 클라이언트의 쿠키가
-     *          맞지 않는다.
-     */
+    /// A random secret a node used before Raft was on must also switch to the shared root the
+    /// moment Raft turns on; otherwise nodes would issue different server cookies, and a client
+    /// moving to another node would fail the cookie check.
     fn raft_nodes_share_cookie_keys_and_secret_reload_rotates_them() {
         let first_cfg = Config {
             cluster_raft: true,
@@ -1490,12 +1396,9 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 쿠키 비밀을 정하는 입력이 그대로면 설정을 교체해도 같은 비밀을 쓰는지.
-     * @details 비밀을 새로 만들면 클라이언트가 받아 둔 서버 쿠키가 모두 맞지 않게 된다. 엄격
-     *          모드에서는 그 클라이언트들이 거부된다. 모드만 바꾸거나, Raft 를 끈 채 비밀만 적어
-     *          둔 경우도 입력이 그대로인 경우다.
-     */
+    /// A new secret would invalidate every server cookie clients hold, and strict mode would refuse
+    /// those clients. Changing only the mode, or writing a secret while Raft is off, also leaves
+    /// the inputs unchanged.
     fn cookie_secret_survives_reloads_that_keep_its_root() {
         let running_cfg = Config::default();
         let running = build_native_features(&running_cfg, None).unwrap();
@@ -1548,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief DDR은 특수 이름 하나만 가로채므로 나머지 cache-hit·cold-miss 레인을 닫지 않는지. */
+    /// DDR intercepts one special name only, so the other cache-hit and cold-miss lanes stay open.
     fn ddr_keeps_general_udp_lanes_open() {
         let mut cfg = Config {
             backend: BackendKind::Recurse,
@@ -1574,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 권한 빠른 경로가 그 답을 바꾸는 무중단 설정에만 닫히는지. */
+    /// The authority lane closes only for hot settings that change its answers.
     fn hot_settings_that_break_the_authority_lane_close_it() {
         let facts = LaneFacts {
             dhcp_pool: false,
@@ -1592,11 +1495,10 @@ mod tests {
             "lenient 쿠키는 COOKIE 옵션이 붙은 질의만 일반 경로로 보내므로 경로를 닫지 않아야 합니다"
         );
 
-        /*
-         * 권한 빠른 경로는 옵션 없는 A, AAAA 질의를 권한 계층과 같은 영역 자료로 답한다. 로컬
-         * 전용 이름은 권한 계층보다 안쪽에서 판정하고, NSID 와 패딩은 그 옵션을 단 질의에만,
-         * ACME 도전은 TXT 질의에만 답을 바꾸므로 이 경로의 답을 바꾸지 못한다.
-         */
+        // The authority lane answers optionless A and AAAA queries from the same zone data as the
+        // authority layer. Local-only names are decided below the authority layer, NSID and padding
+        // change only answers to queries carrying those options, and ACME challenges change only
+        // TXT answers, so none of them alter this lane's answers.
         let keepers: Vec<(&str, fn(&mut Config))> = vec![
             ("acme_directory_url", |c| {
                 c.acme_directory_url = Some("https://acme.test/dir".to_string())
@@ -1671,7 +1573,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기록 파일을 못 열었을 때 조용히 끄지 않는지. */
     fn configured_dnstap_open_failure_is_not_silently_disabled() {
         let mut config = Config::default();
         config.dnstap_file = Some(std::env::temp_dir());
@@ -1679,11 +1580,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 같은 dnstap 파일로 설정을 교체하면 스트림을 새로 열지 않는지.
-     * @details 새로 열면 시작 프레임이 하나 더 붙고, 이전 기록기가 마저 쓰는 프레임과 새
-     *          기록기의 프레임이 한 파일에 섞여 읽는 쪽이 스트림을 해석하지 못한다.
-     */
+    /// A new stream would add another start frame and interleave the old writer's remaining frames
+    /// with the new writer's, so readers could not parse the stream.
     fn dnstap_reload_on_the_same_file_keeps_one_stream() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-dnstap-reload-{}-{}.fstrm",

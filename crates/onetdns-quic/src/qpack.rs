@@ -1,14 +1,10 @@
-/*!
- * @brief QPACK 헤더 압축.
- *
- * @details HPACK과 달리 스트림 순서가 보장되지 않는다. 그래서 동적 테이블 갱신이 별도
- *          단방향 스트림으로 오가고, 아직 상대가 못 본 항목은 참조할 수 없다.
- * @warning 압축은 그 자체로 증폭 경로다. 작은 입력이 큰 헤더 목록으로 부풀 수 있으므로
- *          펼친 크기에 상한이 있어야 한다.
- * @note 이 구현은 DoH3에 필요한 만큼만 한다. 일반 목적 QPACK이 아니다.
- */
+//! QPACK header compression. Streams arrive in no fixed order, so dynamic table updates travel on
+//! separate unidirectional streams, and an entry the peer has not acknowledged is never referenced.
+//!
+//! Compression amplifies: a small input can expand into a large header list, so the expanded size
+//! is capped. This implements what DoH3 needs, not general-purpose QPACK.
 
-/** @brief 정적 테이블. 흔한 헤더를 번호 하나로 줄인다. */
+/// RFC 9204 static table.
 pub static STATIC: &[(&str, &str)] = &[
     (":authority", ""),
     (":path", "/"),
@@ -120,16 +116,11 @@ pub static STATIC: &[(&str, &str)] = &[
     ("x-frame-options", "sameorigin"),
 ];
 
-/** @brief 번호로 정적 테이블 항목을 찾는다. */
 fn static_entry(idx: u64) -> Option<(&'static str, &'static str)> {
     STATIC.get(usize::try_from(idx).ok()?).copied()
 }
 
-/**
- * @brief 접두사 있는 정수를 읽는다.
- * @details 앞 몇 비트가 값의 일부이고, 다 차면 뒤에 이어서 온다. 이어지는 바이트 수에
- *          상한을 두어 값이 무한정 커지지 못하게 한다.
- */
+/// Caps the continuation bytes so the value cannot grow without bound.
 fn read_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> Option<u64> {
     if !(1..=8).contains(&prefix_bits) {
         return None;
@@ -161,7 +152,6 @@ fn read_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> Option<u64> {
     Some(val)
 }
 
-/** @brief 길이 접두사 있는 문자열을 읽는다. 허프만 부호일 수 있다. */
 fn read_string(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     let huff = buf.get(*pos)? & 0x80 != 0;
     let len = usize::try_from(read_int(buf, pos, 7)?).ok()?;
@@ -175,21 +165,14 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     }
 }
 
-/**
- * @brief 스트림에서 읽은 결과.
- * @note 데이터가 모자란 것과 형식이 틀린 것을 구분한다. 스트림은 조각나서 오므로,
- *       모자란 것을 오류로 보면 정상 통신이 끊긴다.
- */
+/// Tells missing bytes from malformed ones. Stream data arrives in pieces, so treating a short read
+/// as an error would cut off normal traffic.
 enum StreamParse<T> {
-    /** @brief 다 읽었다. */
     Done(T),
-    /** @brief 아직 바이트가 모자란다. */
     Incomplete,
-    /** @brief 형식이 어긋난다. */
     Invalid,
 }
 
-/** @brief 스트림에서 정수를 읽는다. 모자라면 실패가 아니라 대기다. */
 fn read_stream_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> StreamParse<u64> {
     if !(1..=8).contains(&prefix_bits) {
         return StreamParse::Invalid;
@@ -227,7 +210,6 @@ fn read_stream_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> StreamParse
     }
 }
 
-/** @brief 스트림에서 문자열을 읽는다. 모자라면 대기다. */
 fn read_stream_string(buf: &[u8], pos: &mut usize) -> StreamParse<Vec<u8>> {
     let Some(first) = buf.get(*pos).copied() else {
         return StreamParse::Incomplete;
@@ -258,10 +240,7 @@ fn read_stream_string(buf: &[u8], pos: &mut usize) -> StreamParse<Vec<u8>> {
     }
 }
 
-/**
- * @brief 동적 테이블 없이 헤더 목록을 푼다.
- * @note 정적 테이블과 문자열만 다룬다. 동적 참조가 오면 거부한다. 이 경로는 테이블 상태를 갖지 않는다.
- */
+/// Static table and literals only; a dynamic reference is rejected.
 pub fn decode_field_section(buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut pos = 0usize;
 
@@ -320,7 +299,6 @@ pub fn decode_field_section(buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     Some(out)
 }
 
-/** @brief 접두사 있는 정수를 쓴다. */
 fn push_int(out: &mut Vec<u8>, mut val: u64, prefix_bits: u32, flags: u8) {
     let mask = (1u64 << prefix_bits) - 1;
     if val < mask {
@@ -336,19 +314,18 @@ fn push_int(out: &mut Vec<u8>, mut val: u64, prefix_bits: u32, flags: u8) {
     out.push(val as u8);
 }
 
-/** @brief 길이 접두사 있는 문자열을 쓴다. */
 fn push_string(out: &mut Vec<u8>, s: &[u8]) {
     push_int(out, s.len() as u64, 7, 0x00);
     out.extend_from_slice(s);
 }
 
-/** @brief 헤더 블록 프리픽스를 쓴다. 테이블 참조 기준점이 여기 들어간다. */
+/// No dynamic references: Required Insert Count 0 and Base 0.
 fn prefix(out: &mut Vec<u8>) {
     out.push(0x00);
     out.push(0x00);
 }
 
-/** @brief DoH3 응답 헤더. 형태가 고정이라 미리 만들어 둔다. */
+/// Static references only, so it needs no encoder state.
 pub fn doh_response_headers() -> Vec<u8> {
     let mut out = Vec::new();
     prefix(&mut out);
@@ -357,7 +334,6 @@ pub fn doh_response_headers() -> Vec<u8> {
     out
 }
 
-/** @brief DoH3 요청 헤더. */
 pub fn doh_post_request_headers(authority: &str, path: &str, content_len: usize) -> Vec<u8> {
     let mut out = Vec::new();
     prefix(&mut out);
@@ -373,28 +349,22 @@ pub fn doh_post_request_headers(authority: &str, path: &str, content_len: usize)
     out
 }
 
-/** @brief 항목 하나의 고정 부대 비용. 규격이 정한 값으로, 테이블 크기 계산에 더한다. */
+/// Per-entry overhead from RFC 9204, added in table size accounting.
 const ENTRY_OVERHEAD: usize = 32;
 
 #[derive(Default)]
-/**
- * @brief 동적 테이블. 최근에 쓴 헤더를 번호로 줄인다.
- * @details 크기가 상한을 넘으면 오래된 것부터 버린다. 절대 번호는 계속 늘어나므로,
- *          버려진 항목을 가리키는 참조는 거부해야 한다.
- */
+/// Evicts the oldest entries when over capacity. Absolute indices keep growing, so a reference to
+/// an evicted entry is rejected.
 pub struct DynamicTable {
-    /** @brief 테이블에 담긴 헤더들. */
     entries: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
-    /** @brief 지금까지 넣은 항목 수. 상대와 맞춰 보는 기준이다. */
+    /// Entries ever inserted; absolute indices count from it.
     insert_count: u64,
-    /** @brief 테이블에 담을 수 있는 크기. */
     capacity: usize,
-    /** @brief 지금 담긴 크기. */
     size: usize,
 }
 
 impl DynamicTable {
-    /** @brief 동적 테이블의 예약 슬롯과 이름·값 버퍼가 실제로 보유한 바이트. */
+    /// Includes the spare capacity of the deque and of the name and value buffers.
     fn retained_payload_bytes(&self) -> usize {
         self.entries
             .capacity()
@@ -406,12 +376,11 @@ impl DynamicTable {
             }))
     }
 
-    /** @brief 항목 하나가 차지하는 크기. 부대 비용을 더한 값이다. */
     fn entry_size(name: &[u8], value: &[u8]) -> usize {
         name.len() + value.len() + ENTRY_OVERHEAD
     }
 
-    /** @brief 테이블 크기를 바꾼다. 줄이면 넘치는 만큼 버린다. */
+    /// Shrinking evicts what no longer fits.
     fn set_capacity(&mut self, cap: usize) {
         self.capacity = cap;
         while self.size > self.capacity {
@@ -419,14 +388,13 @@ impl DynamicTable {
         }
     }
 
-    /** @brief 가장 오래된 항목을 버린다. */
     fn evict_oldest(&mut self) {
         if let Some((n, v)) = self.entries.pop_front() {
             self.size -= Self::entry_size(&n, &v);
         }
     }
 
-    /** @brief 항목을 넣는다. 슬롯이 모자라면 오래된 것을 버려 가며 넣는다. */
+    /// Evicts the oldest entries to make room.
     fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) -> bool {
         let es = Self::entry_size(&name, &value);
         if es > self.capacity {
@@ -446,10 +414,8 @@ impl DynamicTable {
         true
     }
 
-    /**
-     * @brief 버리지 않고 넣는다. 슬롯이 없으면 넣지 않는다.
-     * @details 아직 상대가 참조 중일 수 있는 항목을 버리면 상대가 그 번호를 풀지 못한다.
-     */
+    /// Fails rather than evict: the peer may still reference the oldest entry and could not decode
+    /// it.
     fn insert_no_evict(&mut self, name: Vec<u8>, value: Vec<u8>) -> bool {
         let es = Self::entry_size(&name, &value);
         if self.size.checked_add(es).is_none_or(|n| n > self.capacity) {
@@ -461,7 +427,7 @@ impl DynamicTable {
         true
     }
 
-    /** @brief 절대 번호로 항목을 찾는다. 이미 버려졌으면 없다. */
+    /// None once evicted.
     fn get_abs(&self, abs: u64) -> Option<(&[u8], &[u8])> {
         let oldest = self.insert_count - self.entries.len() as u64;
         if abs < oldest || abs >= self.insert_count {
@@ -472,7 +438,6 @@ impl DynamicTable {
             .map(|(n, v)| (n.as_slice(), v.as_slice()))
     }
 
-    /** @brief 같은 이름과 값을 가진 항목의 절대 번호. */
     fn find(&self, name: &[u8], value: &[u8]) -> Option<u64> {
         let oldest = self.insert_count - self.entries.len() as u64;
         self.entries
@@ -483,13 +448,11 @@ impl DynamicTable {
             .map(|(i, _)| oldest + i as u64)
     }
 
-    /** @brief 지금까지 넣은 항목 수. 절대 번호의 기준이다. */
     pub fn insert_count(&self) -> u64 {
         self.insert_count
     }
 }
 
-/** @brief 정적 테이블에서 이름과 값이 모두 맞는 항목. */
 fn static_find(name: &[u8], value: &[u8]) -> Option<u64> {
     STATIC
         .iter()
@@ -497,7 +460,6 @@ fn static_find(name: &[u8], value: &[u8]) -> Option<u64> {
         .map(|i| i as u64)
 }
 
-/** @brief 정적 테이블에서 이름만 맞는 항목. 값은 문자열로 붙인다. */
 fn static_find_name(name: &[u8]) -> Option<u64> {
     STATIC
         .iter()
@@ -506,39 +468,28 @@ fn static_find_name(name: &[u8]) -> Option<u64> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-/**
- * @brief 헤더 구역을 푼 결과.
- * @note 아직 못 푸는 경우가 있다. 참조하는 동적 항목이 아직 도착하지 않았을 때다. 그것은
- *       오류가 아니라 대기다.
- */
+/// A section that references a dynamic entry not yet received is Blocked, not an error.
 pub enum DecodeResult {
-    /** @brief 다 읽었다. */
     Done(Vec<(Vec<u8>, Vec<u8>)>),
 
-    /** @brief 테이블이 아직 따라오지 못했다. */
     Blocked,
 
-    /** @brief 형식이 어긋난다. */
     Error,
 }
 
-/** @brief QPACK 디코더. 동적 테이블과 대기 중인 구역을 가지고 있다. */
 pub struct Decoder {
-    /** @brief 이쪽이 읽는 쪽 테이블. */
     table: DynamicTable,
 
-    /** @brief 이 테이블에 허락한 최대 크기. */
     max_capacity: usize,
 
-    /** @brief 상대의 적는 쪽에서 온 바이트. */
+    /// Unparsed bytes from the peer's encoder stream.
     enc_buf: Vec<u8>,
 
-    /** @brief 상대에게 내보낼 바이트. */
+    /// Instructions for the decoder stream.
     out: Vec<u8>,
 }
 
 impl Decoder {
-    /** @brief 테이블 크기 상한을 정해 만든다. */
     pub fn new(max_capacity: usize) -> Self {
         Decoder {
             table: DynamicTable::default(),
@@ -548,7 +499,6 @@ impl Decoder {
         }
     }
 
-    /** @brief 디코더 테이블과 입출력 조각이 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.table
             .retained_payload_bytes()
@@ -556,14 +506,9 @@ impl Decoder {
             .saturating_add(self.out.capacity())
     }
 
-    /**
-     * @brief 상대의 테이블 갱신 지시를 처리한다.
-     * @details 조각나서 올 수 있으므로, 다 읽지 못한 지시는 남겨 두고 다음 데이터를 기다린다.
-     * @warning 테이블 크기 요청이 이쪽 상한을 넘으면 거부한다. 상대가 정하는 대로 두면 연결
-     *          하나로 이쪽 메모리를 정할 수 있다.
-     */
+    /// A partial instruction stays buffered until more data arrives. A capacity request above this
+    /// side's limit is rejected; otherwise the peer would decide this side's memory.
     pub fn on_encoder_stream(&mut self, data: &[u8]) -> Result<(), ()> {
-        /** @brief 적는 쪽 버퍼 상한. */
         const MAX_ENCODER_BUFFER: usize = 64 * 1024;
         if self.enc_buf.len().saturating_add(data.len()) > MAX_ENCODER_BUFFER {
             self.enc_buf.clear();
@@ -664,10 +609,6 @@ impl Decoder {
         Ok(())
     }
 
-    /**
-     * @brief 헤더 구역 접두부에서 Required Insert Count 를 읽는다.
-     * @return 접두부가 어긋나면 None 이다.
-     */
     fn required_insert_count(&self, buf: &[u8], pos: &mut usize) -> Option<u64> {
         let enc_ric = read_int(buf, pos, 8)?;
         if enc_ric == 0 {
@@ -693,23 +634,16 @@ impl Decoder {
         (ric != 0).then_some(ric)
     }
 
-    /**
-     * @brief 이 헤더 구역이 아직 오지 않은 테이블 항목을 기다려야 하는지.
-     * @details 상태를 바꾸지 않는다. 한 스트림에 헤더 구역이 여럿이면 하나라도 기다릴 때 어느
-     *          구역도 풀지 않아야 한다. 먼저 푼 구역의 확인 지시가 나간 뒤 다시 시도하면 같은
-     *          구역의 확인 지시가 또 나가고, 상대는 그것을 QPACK_DECODER_STREAM_ERROR 로 본다.
-     *          접두부가 어긋난 구역은 기다리지 않는다고 답하며, 실제로 풀 때 오류가 된다.
-     */
+    /// Does not change state. When a stream carries several field sections, none is decoded while
+    /// any one is blocked: retrying after an earlier one was decoded would send its acknowledgment
+    /// twice, which the peer treats as QPACK_DECODER_STREAM_ERROR. A malformed prefix reports not
+    /// blocked and fails at decode.
     pub fn is_blocked(&self, buf: &[u8]) -> bool {
         self.required_insert_count(buf, &mut 0)
             .is_some_and(|ric| ric > self.table.insert_count)
     }
 
-    /**
-     * @brief 헤더 구역을 푼다.
-     * @return 아직 도착하지 않은 동적 항목을 참조하면 대기 상태를 돌려준다. 그 경우 테이블이
-     *         채워진 뒤 다시 시도한다.
-     */
+    /// Blocked when a referenced entry has not arrived yet; retry once the table catches up.
     pub fn decode_field_section(&mut self, stream_id: u64, buf: &[u8]) -> DecodeResult {
         let mut pos = 0usize;
 
@@ -811,59 +745,48 @@ impl Decoder {
         DecodeResult::Done(out)
     }
 
-    /**
-     * @brief 이 스트림의 남은 헤더 구역을 풀지 않는다고 상대 인코더에 알린다.
-     * @details RFC 9204 의 Stream Cancellation 이다. 끊긴 스트림이나 읽기를 그만둔 스트림에 보낸다.
-     *          인코더는 확인받지 못한 구역이 가리키는 테이블 항목을 지우지 못하므로, 알리지 않으면
-     *          그 항목이 연결이 끝날 때까지 테이블에 묶인다.
-     */
+    /// Sends Stream Cancellation from RFC 9204, for a reset or abandoned stream. The encoder cannot
+    /// evict entries that unacknowledged sections reference, so without this they stay pinned until
+    /// the connection ends.
     pub fn cancel_stream(&mut self, stream_id: u64) {
         push_int(&mut self.out, stream_id, 6, 0x40);
     }
 
-    /** @brief 상대에게 보낼 확인 지시를 꺼낸다. */
     pub fn take_decoder_stream(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
     }
 
-    /** @brief 보내지 못한 확인 지시를 되돌린다. 순서를 지켜 앞에 붙인다. */
+    /// Puts unsent instructions back in front, keeping their order.
     pub(crate) fn restore_decoder_stream(&mut self, mut data: Vec<u8>) {
         data.append(&mut self.out);
         self.out = data;
     }
 
-    /** @brief 지금까지 테이블에 넣은 항목 수. */
     pub fn insert_count(&self) -> u64 {
         self.table.insert_count
     }
 }
 
-/** @brief QPACK 인코더. */
 pub struct Encoder {
-    /** @brief 이쪽이 적는 쪽 테이블. */
     table: DynamicTable,
 
-    /** @brief 상대가 허락한 테이블 크기. */
     peer_max_capacity: usize,
 
-    /** @brief 쓸 크기를 상대에게 알렸는지. */
     capacity_sent: bool,
 
-    /** @brief 상대가 여기까지는 받았음을 확인한 항목 수. */
+    /// Entries the peer has acknowledged.
     known_received: u64,
 
-    /** @brief 상대에게 내보낼 바이트. */
+    /// Instructions for the encoder stream.
     out: Vec<u8>,
 
-    /** @brief 상대의 읽는 쪽에서 온 바이트. */
+    /// Unparsed bytes from the peer's decoder stream.
     dec_buf: Vec<u8>,
 }
 
-/** @brief 이쪽이 쓰겠다고 정한 테이블 크기 상한. */
 const OUR_MAX_CAPACITY: usize = 4096;
 
 impl Encoder {
-    /** @brief 인코더를 만든다. */
     pub fn new() -> Self {
         Encoder {
             table: DynamicTable::default(),
@@ -875,7 +798,6 @@ impl Encoder {
         }
     }
 
-    /** @brief 인코더 테이블과 입출력 조각이 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.table
             .retained_payload_bytes()
@@ -883,7 +805,7 @@ impl Encoder {
             .saturating_add(self.dec_buf.capacity())
     }
 
-    /** @brief 상대가 허용한 테이블 크기를 반영한다. 이쪽 상한과 작은 쪽을 쓴다. */
+    /// Uses the smaller of the peer's limit and this side's.
     pub fn set_peer_max_capacity(&mut self, cap: usize) {
         self.peer_max_capacity = cap;
         let ours = cap.min(OUR_MAX_CAPACITY);
@@ -894,9 +816,8 @@ impl Encoder {
         }
     }
 
-    /** @brief 상대의 확인 지시를 처리한다. 어디까지 참조해도 되는지가 여기서 정해진다. */
+    /// Acknowledgments set how far references may go.
     pub fn on_decoder_stream(&mut self, data: &[u8]) -> Result<(), ()> {
-        /** @brief 읽는 쪽 버퍼 상한. */
         const MAX_DECODER_BUFFER: usize = 64 * 1024;
         if self.dec_buf.len().saturating_add(data.len()) > MAX_DECODER_BUFFER {
             self.dec_buf.clear();
@@ -941,12 +862,11 @@ impl Encoder {
         Ok(())
     }
 
-    /**
-     * @brief 헤더 목록을 인코딩한다.
-     * @details 정적 테이블, 이미 확인된 동적 항목, 그리고 문자열 순으로 고른다. 확인되지 않은
-     *          동적 항목을 참조하면 상대가 그 번호를 풀지 못해 스트림이 멈춘다.
-     * @return 헤더 구역과 테이블 갱신 지시. 지시는 별도 스트림으로 보낸다.
-     */
+    /// Prefers the static table, then acknowledged dynamic entries, then literals; referencing an
+    /// unacknowledged entry would block the peer's stream.
+    ///
+    /// Returns the field section and the encoder stream instructions, which go on a separate
+    /// stream.
     pub fn encode_field_section(&mut self, headers: &[(&[u8], &[u8])]) -> (Vec<u8>, Vec<u8>) {
         let mut plan: Vec<FieldPlan> = Vec::with_capacity(headers.len());
         for (name, value) in headers {
@@ -1027,48 +947,39 @@ impl Encoder {
         (sec, std::mem::take(&mut self.out))
     }
 
-    /** @brief 보내지 못한 테이블 갱신 지시를 되돌린다. */
+    /// Puts unsent instructions back in front, keeping their order.
     pub(crate) fn restore_encoder_stream(&mut self, mut data: Vec<u8>) {
         data.append(&mut self.out);
         self.out = data;
     }
 
-    /** @brief 상대가 확인한 항목 수. 여기까지만 참조할 수 있다. */
+    /// Only entries up to here may be referenced.
     pub fn known_received(&self) -> u64 {
         self.known_received
     }
 
-    /** @brief 지금까지 테이블에 넣은 항목 수. */
     pub fn insert_count(&self) -> u64 {
         self.table.insert_count
     }
 }
 
 impl Default for Encoder {
-    /** @brief 기본 인코더. */
     fn default() -> Self {
         Self::new()
     }
 }
 
-/** @brief 헤더 하나를 어떻게 인코딩할지 정한 결과. */
 enum FieldPlan {
-    /** @brief 고정 테이블에서 그대로 가리킨다. */
     Static(u64),
-    /** @brief 이쪽 테이블에서 가리킨다. */
     Dynamic(u64),
-    /** @brief 이름만 가리키고 값은 그대로 적는다. */
     LiteralNameRef(u64, Vec<u8>),
-    /** @brief 이름과 값을 모두 그대로 적는다. */
     Literal(Vec<u8>, Vec<u8>),
 }
 
 #[cfg(test)]
-/** @brief 테이블 참조 규칙, 조각난 스트림 처리, 그리고 상한 적용. */
 mod tests {
     use super::*;
 
-    /** @brief 푼 헤더 목록에서 이름으로 값을 찾는다. */
     fn find<'a>(h: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
         h.iter()
             .find(|(n, _)| n == name.as_bytes())
@@ -1076,7 +987,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 파싱 뒤 clear한 QPACK 조각도 allocator가 놓지 않은 capacity만큼 세는지. */
     fn retained_memory_counts_qpack_capacity_after_clear() {
         let mut decoder = Decoder::new(4096);
         let baseline = decoder.retained_payload_bytes();
@@ -1089,7 +999,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 정적 테이블의 주요 항목이 규격과 맞는지. */
     fn static_table_key_entries() {
         assert_eq!(STATIC[20], (":method", "POST"));
         assert_eq!(STATIC[25], (":status", "200"));
@@ -1098,7 +1007,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요청 헤더 왕복. */
     fn request_headers_roundtrip() {
         let enc = doh_post_request_headers("dns.example", "/dns-query", 33);
         let h = decode_field_section(&enc).unwrap();
@@ -1114,7 +1022,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답 헤더 왕복. */
     fn response_headers_roundtrip() {
         let enc = doh_response_headers();
         let h = decode_field_section(&enc).unwrap();
@@ -1126,7 +1033,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 허프만 부호로 온 값이 풀리는지. */
     fn literal_name_huffman_value_decodes() {
         let mut enc = Vec::new();
         prefix(&mut enc);
@@ -1139,21 +1045,18 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블 없는 경로가 동적 참조를 거부하는지. */
     fn dynamic_table_reference_rejected() {
         let buf = [0x01u8, 0x00];
         assert!(decode_field_section(&buf).is_none());
     }
 
     #[test]
-    /** @brief 펼친 헤더 크기에 상한이 걸리는지. 압축은 증폭 경로다. */
     fn static_decoder_bounds_expanded_header_lists() {
         let mut buf = vec![0, 0];
         buf.extend(std::iter::repeat_n(0xc0 | 20, 1024));
         assert!(decode_field_section(&buf).is_none());
     }
 
-    /** @brief 동적 테이블을 써서 인코딩하고 디코딩한다. */
     fn roundtrip_dyn(
         enc: &mut Encoder,
         dec: &mut Decoder,
@@ -1173,7 +1076,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블에 넣은 항목을 번호로 참조하는 왕복. */
     fn dynamic_insert_and_reference_roundtrip() {
         let mut enc = Encoder::new();
         let mut dec = Decoder::new(4096);
@@ -1203,7 +1105,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 확인 전 항목을 참조하지 않는지. 참조하면 상대가 풀지 못해 멈춘다. */
     fn new_dynamic_entries_are_not_referenced_until_acknowledged() {
         let mut enc = Encoder::new();
         let mut dec = Decoder::new(4096);
@@ -1230,7 +1131,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 조각나서 온 지시가 이어 붙고, 잘못된 증가는 거부되는지. */
     fn decoder_stream_instructions_survive_fragmentation_and_validate_increment() {
         let mut enc = Encoder::new();
         enc.set_peer_max_capacity(4096);
@@ -1253,10 +1153,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief Stream Cancellation 이 6비트 접두 정수로 스트림 번호를 싣는지.
-     * @details 접두가 7비트인 확인 지시와 섞어 쓰면 63 이상인 스트림 번호가 다른 번호로 읽힌다.
-     */
+    /// Mixing it up with the 7-bit prefix of acknowledgments would misread stream IDs of 63 and
+    /// above.
     fn stream_cancellation_uses_a_six_bit_prefix() {
         let mut dec = Decoder::new(4096);
         dec.cancel_stream(4);
@@ -1267,7 +1165,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 데이터가 모자란 것과 형식이 틀린 것을 구분하는지. 합치면 정상 통신이 끊긴다. */
     fn encoder_stream_distinguishes_fragmentation_from_invalid_instructions() {
         let mut dec = Decoder::new(128);
         let mut capacity = Vec::new();
@@ -1292,7 +1189,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 넘치는 정수를 버퍼가 차기 전에 거부하는지. */
     fn qpack_streams_reject_overflowing_integers_before_buffer_limit() {
         let mut malformed = vec![0x3f];
         malformed.extend(std::iter::repeat_n(0xff, 10));
@@ -1307,7 +1203,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블 크기 변경이 여러 번 와도 처리되는지. */
     fn many_capacity_updates_are_processed() {
         let updates = vec![0x20; 32 * 1024];
         let mut dec = Decoder::new(4096);
@@ -1316,7 +1211,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상대가 테이블을 안 쓰겠다고 하면 정적 테이블만 쓰는지. */
     fn peer_capacity_zero_means_static_only() {
         let mut enc = Encoder::new();
         let mut dec = Decoder::new(0);
@@ -1333,7 +1227,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블이 넘치면 오래된 항목이 버려지는지. */
     fn decoder_evicts_when_capacity_exceeded() {
         let mut dec = Decoder::new(128);
         let mut stream = Vec::new();
@@ -1355,7 +1248,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블이 꽉 차면 문자열로 전환하는지. */
     fn encoder_full_table_falls_back_to_literal() {
         let mut enc = Encoder::new();
 

@@ -1,10 +1,6 @@
-/*!
- * @brief 자체 업데이트.
- *
- * @details 새 릴리스를 확인하고, 서명한 매니페스트로 실행 파일을 검증해 설치 경로에서 맞바꾸고,
- *          새 버전을 시험 실행해 확정하거나 되돌린다. 설계와 그 이유는
- *          docs/architecture/self-update.md 가 맡는다.
- */
+//! Self-update: checks for releases, verifies the binary against a signed manifest, swaps it at the
+//! install path, and trial-runs the new version to confirm or roll back.
+//! docs/architecture/self-update.md owns the design.
 
 pub(crate) mod apply;
 pub(crate) mod install;
@@ -18,27 +14,21 @@ pub(crate) mod task;
 pub(crate) mod trial;
 pub(crate) mod version;
 
-/**
- * @brief 업데이트 계약 번호. 매니페스트와 업데이트 기록의 format 이 이 값이다.
- * @warning 매니페스트 형식, 서명 방식, 자산 이름 규칙, 기록 형식, 교체 파일 이름, --version 출력과
- *          check 의 종료 코드, 서버를 띄우는 명령줄 가운데 하나라도 바꾸면 올린다. 이전 버전은
- *          번호가 다른 릴리스를 자동으로 설치하지 않으므로 그 릴리스로는 한 번 수동으로 넘어간다.
- */
+/// The format of manifests and update records.
+///
+/// Bump it when any of these change: the manifest format, the signature scheme, asset naming, the
+/// record format, replacement file names, the --version output and check exit codes, or the server
+/// start command line. Older versions do not install a release with another number automatically,
+/// so that release takes one manual step.
 pub(crate) const CONTRACT: u32 = 1;
 
-/** @brief 이 바이너리의 버전. */
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/**
- * @brief 이 바이너리의 자산 키. 릴리스 워크플로가 빌드할 때만 넣는다.
- * @details 없으면 업데이트에 참여하지 않는다. 기능을 골라 직접 빌드한 바이너리를 공식 빌드로
- *          바꿔 버리지 않으려는 것이다.
- */
+/// Asset key, set only by the release workflow. Without it the binary takes no part in updates, so
+/// a custom build with chosen features is never replaced by an official one.
 pub(crate) const RELEASE_TARGET: Option<&str> = option_env!("ONETDNS_RELEASE_TARGET");
 
-/** @brief 바이트를 소문자 16진수로. */
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    /** @brief 16진 문자표. */
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -48,13 +38,9 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/**
- * @brief 소문자 16진수 64자를 32바이트로 읽는다.
- * @details 대문자를 받지 않아 한 값의 표기가 하나뿐이다. 기록과 매니페스트를 글자 그대로 비교해도
- *          값을 비교한 것과 같다.
- */
+/// Lowercase only, so each value has one spelling and comparing record and manifest text compares
+/// values.
 pub(crate) fn decode_sha256(text: &str) -> Option<[u8; 32]> {
-    /** @brief 소문자 16진 숫자 하나의 값. */
     fn nibble(digit: u8) -> Option<u8> {
         match digit {
             b'0'..=b'9' => Some(digit - b'0'),
@@ -74,14 +60,11 @@ pub(crate) fn decode_sha256(text: &str) -> Option<[u8; 32]> {
 }
 
 #[cfg(test)]
-/**
- * @brief 업데이트 계약을 고정한다.
- *
- * @details 이전 버전이 새 버전을 내려받아 점검하고 띄우며, 새 버전은 이전 버전이 쓴 기록을
- *          읽는다. 그래서 여기 고정한 모양은 두 버전에 걸친 약속이다.
- * @warning 이 테스트가 깨지면 계약을 바꾼 것이다. 예제를 새 모양으로 고칠 때 CONTRACT 를 함께
- *          올린다. 올리지 않으면 이전 버전이 새 형식의 릴리스를 자동으로 설치하다 실패한다.
- */
+/// Pins the update contract. An older version downloads, checks, and launches the newer one, and
+/// the newer one reads the older one's records, so these shapes bind two versions.
+///
+/// If this breaks, the contract changed: update the fixtures and bump CONTRACT with them, or older
+/// versions will fail installing the new format automatically.
 mod tests {
     use super::manifest;
     use super::record::{Record, State};
@@ -89,7 +72,6 @@ mod tests {
     use crate::cli::{parse_argv, version_line, Command, ServiceAction};
     use ed25519_dalek::{Signer, SigningKey};
 
-    /** @brief 계약 1 의 매니페스트. */
     const MANIFEST: &str = "format = 1
 product = \"OnetDNS\"
 version = \"0.1.0-alpha.6\"
@@ -107,7 +89,6 @@ size = 9437184
 sha256 = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"
 ";
 
-    /** @brief 계약 1 의 업데이트 기록. */
     const RECORD: &str = "format=1
 state=reverted
 from=0.1.0-alpha.5
@@ -117,13 +98,12 @@ to_sha256=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
 reason=The new version did not become ready before the trial deadline
 ";
 
-    /** @brief 문자열 인수 목록. */
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
     }
 
     #[test]
-    /** @brief 계약 1 의 매니페스트와 서명 방식. 원문 바이트에 대한 Ed25519 서명 64바이트다. */
+    /// A 64-byte Ed25519 signature over the raw bytes.
     fn manifest_fixture_opens() {
         let key = SigningKey::from_bytes(&[42; 32]);
         let signature = key.sign(MANIFEST.as_bytes()).to_bytes();
@@ -156,7 +136,7 @@ reason=The new version did not become ready before the trial deadline
     }
 
     #[test]
-    /** @brief 계약 1 의 기록. 읽은 것을 다시 쓰면 글자 하나 다르지 않아야 한다. */
+    /// Writing back what was read must be byte-identical.
     fn record_fixture_round_trips() {
         let record = Record::parse(RECORD).expect("계약 1 의 기록");
         assert_eq!(record.state, State::Reverted);
@@ -166,18 +146,16 @@ reason=The new version did not become ready before the trial deadline
     }
 
     #[test]
-    /** @brief 사전 점검이 맞대는 --version 출력. */
+    /// The --version output the preflight compares.
     fn version_line_is_product_and_version() {
         assert_eq!(version_line("0.1.0-alpha.6"), "OnetDNS 0.1.0-alpha.6");
     }
 
     #[test]
-    /**
-     * @brief 이전 버전이 만든 명령줄을 새 버전이 읽는지.
-     * @details 이전 감독자는 자기 인수 그대로 새 바이너리를 띄우고, 서비스 등록도 이전 버전이 만든
-     *          명령줄을 쓴다. 새 버전이 이 인수를 읽지 못하면 기록을 보기 전에 끝나 시험 실행이
-     *          돌지 않는다. 사전 점검의 설정 검사 명령도 여기 든다.
-     */
+    /// An older supervisor launches the new binary with its own arguments, and the service
+    /// registration uses the older version's command line; if the new version cannot parse them, it
+    /// exits before reading the record and the trial never runs. The preflight's config check
+    /// command is included.
     fn server_start_command_lines_parse() {
         let Ok(Command::Run {
             config,
@@ -241,12 +219,8 @@ reason=The new version did not become ready before the trial deadline
     }
 
     #[test]
-    /**
-     * @brief 릴리스 워크플로가 매니페스트의 format 에 이 계약 번호를 적는지.
-     * @details 워크플로는 UPDATE_CONTRACT 값을 format 으로 쓴다. CONTRACT 만 올리고 이 값을 두면
-     *          형식이 바뀐 릴리스가 옛 번호를 달고 나가, 이전 버전이 그 릴리스를 자동으로 설치하다
-     *          실패한다.
-     */
+    /// The workflow writes UPDATE_CONTRACT as format. Bumping only CONTRACT would ship a changed
+    /// format under the old number, and older versions would fail installing it automatically.
     fn release_workflow_writes_this_contract_number() {
         let declared: Vec<&str> = include_str!("../../../.github/workflows/release.yml")
             .lines()

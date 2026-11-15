@@ -1,6 +1,4 @@
-/*!
- * @brief DHCP 임대 풀에서 정방향과 역방향 이름을 답하는 계층.
- */
+//! Answers forward and reverse names from the DHCP lease pool.
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -11,20 +9,16 @@ use onetdns_proto::{Message, Name, RData, Record, RecordType};
 use super::{answer_message, outcome_to_option};
 use crate::native::{ResolveOutcome, Resolver};
 
-/** @brief 이 서버가 나눠 준 주소를 이름으로도 답하는 계층. */
 pub struct DhcpDnsLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 임대 기록. */
     pool: Arc<Mutex<crate::dhcp::LeasePool>>,
-    /** @brief 임대에 붙일 도메인 접미사. 없으면 이름으로 답하지 않는다. */
+    /// None disables name answers.
     domain: Option<Name>,
-    /** @brief 답에 담을 수명 상한. */
+    /// Cap on answer TTLs.
     local_ttl: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DhcpDnsLayer {
-    /** @brief 임대 기록을 잡은 계층을 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         pool: Arc<Mutex<crate::dhcp::LeasePool>>,
@@ -41,7 +35,7 @@ impl DhcpDnsLayer {
         }
     }
 
-    /** @brief 이 임대가 끝날 때까지 남은 수명. 임대보다 길게 답하면 안 된다. */
+    /// Never longer than the lease.
     fn lease_ttl(&self, expiry_unix: u64) -> Option<u32> {
         let remaining = expiry_unix
             .saturating_sub(crate::unix_now())
@@ -53,7 +47,6 @@ impl DhcpDnsLayer {
         })
     }
 
-    /** @brief 이 이름에 임대된 주소. */
     fn forward_lookup(&self, name: &Name) -> Option<(Ipv4Addr, u32)> {
         let domain = self.domain.as_ref()?;
         if name.num_labels() != domain.num_labels() + 1 || !name.ends_with_ignore_case(domain) {
@@ -69,7 +62,6 @@ impl DhcpDnsLayer {
         })
     }
 
-    /** @brief 이 주소를 잡은 클라이언트의 이름. */
     fn reverse_lookup(&self, name: &Name) -> Option<(Name, u32)> {
         let domain = self.domain.as_ref()?;
         let ip = ptr_to_ipv4(name)?;
@@ -87,7 +79,6 @@ impl DhcpDnsLayer {
     }
 }
 
-/** @brief 거꾸로 적힌 이름에서 주소를 읽는다. */
 fn ptr_to_ipv4(name: &Name) -> Option<Ipv4Addr> {
     let mut labels = name.labels();
     if labels.len() != 6 {
@@ -110,12 +101,10 @@ fn ptr_to_ipv4(name: &Name) -> Option<Ipv4Addr> {
 }
 
 impl Resolver for DhcpDnsLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 임대 기록에 있으면 답하고, 아니면 안으로 넘긴다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         if let Some(q) = req.questions.first() {
             match q.qtype {
@@ -155,7 +144,6 @@ impl Resolver for DhcpDnsLayer {
 }
 
 #[cfg(test)]
-/** @brief 임대 이름의 정방향, 역방향 응답과 위임. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -168,7 +156,6 @@ mod tests {
     use crate::native::Resolver;
 
     #[test]
-    /** @brief 임대 기록으로 이름과 주소를 서로 답하고, 없으면 넘기는지. */
     fn dhcp_dns_forward_reverse_and_delegate() {
         use crate::dhcp::{ClientIdentity, DhcpConfig, LeasePool};
         let dc = DhcpConfig {

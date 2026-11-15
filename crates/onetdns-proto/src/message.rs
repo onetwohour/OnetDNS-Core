@@ -1,91 +1,63 @@
-/*!
- * @brief DNS 메시지. 헤더, 섹션, EDNS(0) OPT 처리.
- *
- * @details 파싱은 의도적으로 엄격하다. 예약 비트, 중복 OPT, 잔여 바이트, 불가능한 섹션
- *          개수를 전부 거부한다. 관대하게 받아들이면 같은 바이트열을 이 서버와 상위 리졸버가
- *          다르게 읽어 캐시 오염과 필터 우회의 경로가 된다.
- */
+//! DNS messages: header, sections, and EDNS(0) OPT. Parsing is deliberately strict and refuses
+//! duplicate OPT, trailing bytes, and impossible section counts. Leniency would let this server and
+//! an upstream resolver read the same bytes differently, a path to cache poisoning and filter
+//! bypass.
 
 use crate::name::Name;
 use crate::rdata::{DnsClass, Record, RecordType};
 use crate::wire::{Reader, Writer, MAX_DNS_WIRE_LEN};
 use crate::ProtoError;
 
-/**
- * @brief 섹션 하나에 담을 항목 수 상한.
- * @details 개수만 크게 적은 짧은 패킷이 헤더가 선언한 수만큼 미리 할당하게 만들지 못하도록
- *          막는다. 일반 파서와 잘린 응답 파서가 같은 상한을 공유하도록 모듈 수준에 둔다.
- */
+/// Stops a short packet with huge counts from preallocating what the header declares. Module-level
+/// so the normal and cut-reply parsers share it.
 const MAX_SECTION_ITEMS: usize = 4096;
 
-/**
- * @brief DNS 응답 코드. 확장 rcode를 담기 위해 12비트를 쓴다.
- *
- * @details 열거형이 아니라 newtype인 이유는 미지의 코드도 그대로 담아 보내야 하기 때문이다.
- *          하위 4비트는 헤더에, 상위 8비트는 OPT의 TTL 필드에 나뉘어 들어간다.
- */
+/// 12 bits, to hold extended rcodes: the low 4 go in the header, the high 8 in the OPT TTL field. A
+/// newtype rather than an enum, so unknown codes pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseCode(pub u16);
 
 #[allow(non_upper_case_globals)]
 impl ResponseCode {
-    /** @brief 성공. 레코드가 없는 NODATA도 이 코드다. */
+    /// Also NODATA, with no records.
     pub const NoError: ResponseCode = ResponseCode(0);
-    /** @brief 질의 형식이 잘못됨. 파서가 거부한 입력에 돌려준다. */
+    /// Returned for input the parser refused.
     pub const FormErr: ResponseCode = ResponseCode(1);
-    /** @brief 서버 내부 실패. DNSSEC bogus 판정도 여기로 합쳐진다. */
+    /// DNSSEC bogus also maps here.
     pub const ServFail: ResponseCode = ResponseCode(2);
-    /** @brief 이름이 존재하지 않음. */
     pub const NXDomain: ResponseCode = ResponseCode(3);
-    /** @brief 지원하지 않는 요청. 미구현 opcode와 XFR 거부에 쓴다. */
+    /// Unimplemented opcodes and refused XFR.
     pub const NotImp: ResponseCode = ResponseCode(4);
-    /** @brief 정책상 거부. ACL 차단이 이 코드로 나간다. */
+    /// ACL blocks go out with this code.
     pub const Refused: ResponseCode = ResponseCode(5);
-    /** @brief UPDATE 선결 조건 위반: 없어야 할 이름이 있다. */
+    /// UPDATE prerequisite failed: a name that should not exist does.
     pub const YXDomain: ResponseCode = ResponseCode(6);
-    /** @brief 지원하지 않는 EDNS 버전. 확장 rcode라 OPT가 있어야 전달된다. */
+    /// Extended rcode, so it needs an OPT to be sent.
     pub const BadVers: ResponseCode = ResponseCode(16);
-    /** @brief DNS 쿠키가 틀림. 클라이언트가 올바른 쿠키로 재시도하게 만든다. */
+    /// Makes the client retry with the right cookie.
     pub const BadCookie: ResponseCode = ResponseCode(23);
 }
 
-/**
- * @brief 12바이트 DNS 헤더를 풀어 놓은 형태.
- *
- * @details rcode는 12비트다. OPT에서 합친 확장 rcode가 여기 들어온다. 인코딩할 때
- *          상위 비트가 있는데 OPT가 없으면 코덱이 OPT를 하나 만들어 붙인다. 그러지 않으면
- *          상위 8비트가 조용히 사라진다.
- */
+/// The 12-byte header, unpacked. `rcode` is 12 bits and includes the extended rcode merged from
+/// OPT; when high bits are set and there is no OPT, the codec adds one, or the high 8 bits would
+/// vanish.
 #[derive(Debug, Clone, Default)]
 pub struct Header {
-    /** @brief 질의 번호. 요청과 응답을 짝짓는다. */
     pub id: u16,
-    /** @brief 응답인지. */
     pub response: bool,
-    /** @brief 질의 종류를 넘어선 동작 코드. */
     pub opcode: u8,
-    /** @brief 이 답이 권한 있는 것인지. */
     pub authoritative: bool,
-    /** @brief 크기가 모자라 잘렸는지. */
     pub truncated: bool,
-    /** @brief 재귀해 달라는 요구. */
     pub recursion_desired: bool,
-    /** @brief 재귀할 수 있다는 알림. */
     pub recursion_available: bool,
-    /** @brief 검증됐다는 표시. */
     pub authentic_data: bool,
-    /** @brief 검증하지 말라는 요구. */
     pub checking_disabled: bool,
-    /** @brief 응답 코드. */
     pub rcode: u16,
 }
 
 impl Header {
-    /**
-     * @brief 플래그 필드를 와이어 16비트로 다시 합친다.
-     * @note Z 비트는 항상 0으로 남는다. 헤더가 그 비트를 담지 않으므로 받은 질의가 설정해
-     *       두었더라도 그대로 돌려주지 않는다. RFC 1035가 요구하는 것이 그것이다.
-     */
+    /// The Z bit is always 0: the header does not store it, so a query that set it does not get it
+    /// back, as RFC 1035 requires.
     fn flags(&self) -> u16 {
         let mut f = 0u16;
         if self.response {
@@ -114,7 +86,7 @@ impl Header {
         f
     }
 
-    /** @brief 와이어 플래그 16비트를 풀어 헤더를 만든다. rcode는 하위 4비트만 담긴다. */
+    /// `rcode` gets only the low 4 bits.
     fn from_flags(id: u16, f: u16) -> Self {
         Self {
             id,
@@ -131,50 +103,35 @@ impl Header {
     }
 }
 
-/** @brief 질문 섹션 항목: 이름, 타입, 클래스. */
 #[derive(Debug, Clone)]
 pub struct Question {
-    /** @brief 물어본 이름. */
     pub name: Name,
-    /** @brief 질의 종류. */
     pub qtype: RecordType,
-    /** @brief 질의 부류. */
     pub qclass: DnsClass,
 }
 
-/**
- * @brief 파싱된 DNS 메시지. 모든 전송이 이 형태로 수렴한다.
- *
- * @details OPT는 별도 필드가 아니라 additionals 안에 레코드로 남는다. 확장 rcode만
- *          파싱 시 header.rcode로 합쳐진다. 호출자가 두 곳을 보지 않게 하려는 것이다.
- */
+/// Every transport converges on this. OPT stays a record in `additionals`; only the extended rcode
+/// is merged into `header.rcode` at parse time, so callers do not look in two places.
 #[derive(Debug, Clone, Default)]
 pub struct Message {
-    /** @brief 헤더. */
     pub header: Header,
-    /** @brief 물어본 것들. */
     pub questions: Vec<Question>,
-    /** @brief 답. */
     pub answers: Vec<Record>,
-    /** @brief 권한 기록. */
     pub authorities: Vec<Record>,
-    /** @brief 딸린 기록. */
     pub additionals: Vec<Record>,
 }
 
 impl Message {
-    /**
-     * @brief 와이어 바이트를 메시지로 해석한다. 신뢰 경계의 최전선이다.
-     *
-     * @details 관대함을 거부하는 지점들: OPT는 Additional에 최대 하나, OPT owner는 루트,
-     *          끝에 남는 바이트가 있으면 거부. 섹션 개수는 남은 바이트로 나눈 하한(질문
-     *          5바이트·레코드 11바이트)과 대조해, 헤더가 선언한 수만큼 미리 할당하지
-     *          못하게 막는다.
-     * @note 예약된 Z 비트는 거부하지 않고 버린다. 헤더에 담지 않으므로 그대로 돌려줄 수도 없다.
-     *       거부하면 응답이 아니라 무응답이 되는데, RFC 8906은 그 질의에도
-     *       NOERROR 로 답할 것을 요구한다.
-     * @return 위 규칙 중 하나라도 어기면 오류. 부분 파싱 결과는 절대 돌려주지 않는다.
-     */
+    /// The front line of the trust boundary. Refuses more than one OPT, an OPT outside Additional
+    /// or with a non-root owner, and trailing bytes. Section counts are checked against the bytes
+    /// left (5 per question, 11 per record), so a header cannot make the parser preallocate what it
+    /// declares.
+    ///
+    /// The reserved Z bit is dropped, not refused: the header does not store it, so it cannot be
+    /// echoed either. Refusing would mean no answer, and RFC 8906 requires a NOERROR answer to such
+    /// a query.
+    ///
+    /// Any violation is an error; a partial parse is never returned.
     pub fn parse(buf: &[u8]) -> Result<Message, ProtoError> {
         if buf.len() > MAX_DNS_WIRE_LEN {
             return Err(ProtoError::Message(
@@ -267,19 +224,15 @@ impl Message {
         })
     }
 
-    /**
-     * @brief UDP 로 받은 응답을 해석한다. 바이트가 모자라 끝난 응답은 잘린 응답으로 읽는다.
-     *
-     * @details UDP 53 을 가로채 대신 답하는 ISP 프록시 가운데는 512바이트를 넘는 응답을 TC 비트
-     *          없이 512바이트에서 잘라 보내는 것이 있다. 그런 응답은 레코드 중간에서 끊겨 parse 가
-     *          거부하고, 버린 채 기다려도 온전한 응답은 오지 않으므로 질의가 데드라인까지 묶인다.
-     *          헤더가 응답이고 질문 구간까지 온전하면 TC 가 켜진 빈 응답으로 돌려주어, 호출자가
-     *          원래의 TC 처리대로 TCP 로 다시 묻게 한다. 바이트가 모자란 것이 아닌 형식 위반은
-     *          잘림으로 보지 않고 버린다.
-     * @warning 잘린 응답에는 질문 뒤의 레코드를 하나도 담지 않는다. 잘린 나머지를 답으로 쓰면
-     *          안 된다. 호출자는 이 결과에도 보통 응답과 같은 ID 와 질문 검사를 해야 한다.
-     * @return 해석할 수 없으면 없다.
-     */
+    /// Parses a reply received over UDP, reading one that runs out of bytes as truncated. Some ISP
+    /// proxies that intercept UDP 53 cut replies over 512 bytes at 512 without setting TC. Such a
+    /// reply breaks mid-record, parse refuses it, and waiting brings no complete reply, so the
+    /// query stalls until its deadline. If the header says response and the question section is
+    /// whole, it becomes an empty reply with TC set, and the caller retries over TCP as for any TC.
+    /// Format violations other than running out of bytes are not truncation and are dropped.
+    ///
+    /// A truncated result carries no records after the question; the cut remainder must not be used
+    /// as an answer. Callers still check its ID and question like any reply.
     pub fn parse_udp_reply(buf: &[u8]) -> Option<Message> {
         match Message::parse(buf) {
             Ok(message) => Some(message),
@@ -288,7 +241,7 @@ impl Message {
         }
     }
 
-    /** @brief 잘린 응답의 헤더와 질문만으로 TC 가 켜진 빈 응답을 만든다. */
+    /// An empty TC reply built from the header and question of a cut reply.
     fn cut_reply(buf: &[u8]) -> Option<Message> {
         let mut r = Reader::new(buf);
         let id = r.u16().ok()?;
@@ -324,21 +277,16 @@ impl Message {
         })
     }
 
-    /**
-     * @brief 메시지를 새 버퍼에 인코딩한다.
-     * @return 표현 불가능한 메시지는 오류다. 잘린 결과를 성공으로 돌려주지 않는다.
-     */
+    /// A message that cannot be represented is an error; a truncated result is never returned as
+    /// success.
     pub fn try_encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut w = Writer::new();
         self.encode_checked_into(&mut w)?;
         w.finish()
     }
 
-    /**
-     * @brief 재사용 중인 버퍼에 인코딩한다. 응답 경로의 할당을 없애는 경로다.
-     * @param w 반드시 비어 있고 실패 표시가 없어야 한다. 남은 압축 오프셋이 있으면
-     *          새 메시지가 이전 메시지 위치를 가리키는 포인터를 쓰게 되므로 거부한다.
-     */
+    /// Encodes into a reused buffer, so the response path does not allocate. `w` must be empty and
+    /// not failed: leftover compression offsets would make the new message point into the old one.
     pub fn try_encode_into(&self, w: &mut Writer) -> Result<(), ProtoError> {
         if !w.buf.is_empty() || !w.names.is_empty() || w.is_failed() {
             return Err(ProtoError::Message(
@@ -348,15 +296,12 @@ impl Message {
         self.encode_checked_into(w)
     }
 
-    /**
-     * @brief 인코딩 전 구조 검사와 실제 쓰기를 수행하는 공통 구현.
-     *
-     * @details 파서가 거부하는 것은 인코더도 만들지 않는다는 대칭을 지킨다. OPT 중복·위치,
-     *          TYPE과 RDATA 종류 불일치, 섹션 개수 초과가 검사 대상이다. 불일치를 허용하면
-     *          이 서버가 만든 응답을 이 서버의 파서가 되읽지 못하는 상태가 생긴다.
-     * @note 확장 rcode가 있는데 OPT가 없으면 여기서 OPT를 합성한다. 그러지 않으면 상위
-     *       8비트가 와이어에서 사라져 클라이언트가 잘못된 코드를 본다.
-     */
+    /// Checks structure before writing: what the parser refuses, the encoder never produces.
+    /// Checked are OPT duplicates and placement, TYPE and RDATA mismatches, and section counts;
+    /// allowing a mismatch would produce responses this server's own parser cannot read back.
+    ///
+    /// An extended rcode without an OPT gets one synthesized here, or its high 8 bits would vanish
+    /// on the wire and the client would see the wrong code.
     fn encode_checked_into(&self, w: &mut Writer) -> Result<(), ProtoError> {
         if self.header.opcode > 0x0f {
             return Err(ProtoError::Message(
@@ -468,11 +413,8 @@ impl Message {
         Ok(())
     }
 
-    /**
-     * @brief 버퍼가 실패 상태면 즉시 오류로 빠져나온다.
-     * @details 한 번 실패한 버퍼는 이후 쓰기를 전부 버리므로, 매 항목 뒤에 확인해야 잘린
-     *          결과가 성공으로 흘러나가지 않는다.
-     */
+    /// A failed writer drops every later write, so checking after each item keeps a truncated
+    /// result from passing as success.
     fn stop_on_writer_error(w: &Writer) -> Result<(), ProtoError> {
         match w.error() {
             Some(error) => Err(error.clone()),
@@ -480,7 +422,7 @@ impl Message {
         }
     }
 
-    /** @brief 재귀 요청 비트가 선 IN 클래스 질의 하나를 만든다. */
+    /// An IN-class query with RD set.
     pub fn query(id: u16, name: Name, qtype: RecordType) -> Message {
         Message {
             header: Header {
@@ -497,12 +439,11 @@ impl Message {
         }
     }
 
-    /** @brief OPT 레코드를 찾는다. 파서가 중복을 막으므로 최대 하나다. */
+    /// At most one; the parser refuses duplicates.
     pub fn opt(&self) -> Option<&Record> {
         self.additionals.iter().find(|r| r.rtype == RecordType::OPT)
     }
 
-    /** @brief 클라이언트가 EDNS 패딩을 요청했는지. 암호화 전송에서 크기 노출을 줄이는 신호다. */
     pub fn requested_padding(&self) -> bool {
         self.opt()
             .and_then(Edns::from_record)
@@ -510,13 +451,9 @@ impl Message {
             .unwrap_or(false)
     }
 
-    /**
-     * @brief 와이어 크기를 block 배수로 맞추는 EDNS 패딩을 넣는다.
-     *
-     * @details 기존 패딩을 먼저 걷어내고 그 상태의 크기를 재야 정확한 패딩 길이가 나온다.
-     *          +4는 패딩 옵션 자체의 헤더(코드 2 + 길이 2)이다.
-     * @param block 0이거나 OPT가 없으면 아무것도 하지 않는다.
-     */
+    /// Pads the wire size to a multiple of `block`. Existing padding is removed first and the size
+    /// measured without it, to get the right padding length; the 4 is the padding option's own
+    /// header (code 2, length 2). Does nothing when `block` is 0 or there is no OPT.
     pub fn pad_to(&mut self, block: usize) -> Result<(), ProtoError> {
         if block == 0 {
             return Ok(());
@@ -540,10 +477,8 @@ impl Message {
         Ok(())
     }
 
-    /**
-     * @brief edns-tcp-keepalive 옵션을 설정한다. OPT가 없으면 만들어 붙인다.
-     * @param timeout_100ms 유휴 유지 시간, 100밀리초 단위(RFC 7828).
-     */
+    /// Adds an OPT if there is none. `timeout_100ms` is the idle timeout in units of 100 ms (RFC
+    /// 7828).
     pub fn set_tcp_keepalive(&mut self, timeout_100ms: u16) -> Result<(), ProtoError> {
         match self
             .additionals
@@ -564,10 +499,8 @@ impl Message {
         Ok(())
     }
 
-    /**
-     * @brief edns-client-subnet 옵션을 설정한다. OPT가 없으면 만들어 붙인다.
-     * @param option FAMILY, SOURCE PREFIX-LENGTH, SCOPE PREFIX-LENGTH, ADDRESS 를 담은 원시 바이트.
-     */
+    /// Adds an OPT if there is none. `option` holds FAMILY, SOURCE PREFIX-LENGTH, SCOPE
+    /// PREFIX-LENGTH, and ADDRESS, raw.
     pub fn set_client_subnet(&mut self, option: Vec<u8>) -> Result<(), ProtoError> {
         match self
             .additionals
@@ -589,85 +522,67 @@ impl Message {
     }
 }
 
-/** @brief Extended DNS Error 옵션 코드(RFC 8914). 실패 사유를 기계가 읽게 해 준다. */
+/// Extended DNS Error option (RFC 8914).
 pub const EDE_OPTION: u16 = 15;
 
-/** @brief edns-tcp-keepalive 옵션 코드(RFC 7828). */
+/// RFC 7828.
 pub const EDNS_TCP_KEEPALIVE: u16 = 11;
 
-/** @brief edns-client-subnet 옵션 코드(RFC 7871). */
+/// RFC 7871.
 pub const EDNS_CLIENT_SUBNET: u16 = 8;
 
-/** @brief EDNS 패딩 옵션 코드(RFC 7830). 암호화 전송의 크기 노출을 줄인다. */
+/// RFC 7830.
 pub const EDNS_PADDING: u16 = 12;
 
-/**
- * @brief 이 서버가 내보내는 Extended DNS Error 정보 코드.
- *
- * @details 전부가 아니라 실제로 쓰는 것만 정의한다. rcode 하나로는 "왜"가 전달되지 않아
- *          클라이언트가 차단과 장애를 구분하지 못하기 때문에 붙인다.
- */
+/// Extended DNS Error info codes this server sends; only those in use. An rcode alone does not say
+/// why, so clients could not tell a block from an outage.
 pub mod ede_code {
 
-    /** @brief 분류되지 않은 사유. 텍스트에 설명이 담긴다. */
+    /// Unclassified; the text explains.
     pub const OTHER: u16 = 0;
 
-    /** @brief 만료된 캐시 응답을 냈다(RFC 8767 serve-stale). */
+    /// Served a stale cache entry (RFC 8767).
     pub const STALE_ANSWER: u16 = 3;
 
-    /** @brief DNSSEC 검증이 bogus로 끝났다. 서명이 데이터와 맞지 않는다. */
     pub const DNSSEC_BOGUS: u16 = 6;
 
-    /** @brief RRSIG 유효 기간이 지났다. bogus의 흔한 원인이라 따로 구분한다. */
+    /// Split out because it is a common cause of bogus.
     pub const SIGNATURE_EXPIRED: u16 = 7;
 
-    /** @brief 운영자 정책으로 차단됨. 이 서버의 블록리스트 판정. */
+    /// This server's blocklist verdict.
     pub const BLOCKED: u16 = 15;
 
-    /** @brief 외부 요구로 차단됨. */
     pub const CENSORED: u16 = 16;
 
-    /** @brief 클라이언트가 스스로 요청한 필터링. */
+    /// Filtering the client asked for.
     pub const FILTERED: u16 = 17;
 
-    /** @brief 이 클라이언트에게 허용되지 않는 질의: ACL 거부. */
+    /// ACL refusal.
     pub const PROHIBITED: u16 = 18;
 
-    /** @brief 권한 서버 어디에도 닿지 못했다. */
     pub const NO_REACHABLE_AUTHORITY: u16 = 22;
 
-    /** @brief 업스트림으로 가는 길에서 네트워크 오류가 났다. */
     pub const NETWORK_ERROR: u16 = 23;
-    /** @brief NSEC3 반복 횟수가 검증기가 받아들이는 상한을 넘음(RFC 9276). */
+    /// RFC 9276.
     pub const UNSUPPORTED_NSEC3_ITERATIONS: u16 = 27;
 }
 
-/**
- * @brief OPT 레코드를 풀어 놓은 EDNS(0) 상태.
- *
- * @details OPT는 필드를 엉뚱한 곳에 숨겨 둔다. 클래스가 UDP 페이로드 크기, TTL이
- *          확장 rcode·버전·DO 비트다. 이 타입이 그 변환을 한곳에 모은다.
- */
+/// EDNS(0) state unpacked from an OPT record. OPT hides fields in odd places: CLASS is the UDP
+/// payload size and TTL holds extended rcode, version, and DO. This type keeps that conversion in
+/// one place.
 #[derive(Debug, Clone)]
 pub struct Edns {
-    /** @brief 받아들일 UDP 크기. */
     pub udp_payload: u16,
-    /** @brief 응답 코드의 윗자리. */
+    /// High 8 bits of the rcode.
     pub extended_rcode: u8,
-    /** @brief 확장 버전. */
     pub version: u8,
-    /** @brief 서명을 함께 달라는 요구. */
     pub dnssec_ok: bool,
-    /** @brief 담긴 옵션들. */
     pub options: Vec<(u16, Vec<u8>)>,
 }
 
 impl Default for Edns {
-    /**
-     * @brief 기본 EDNS 상태.
-     * @note 페이로드 1232는 IPv6 최소 MTU에서 헤더를 뺀 값으로, 경로 단편화를 피하는
-     *       널리 쓰이는 안전값이다. 이보다 키우면 응답이 조각나 유실 위험이 커진다.
-     */
+    /// 1232 is the IPv6 minimum MTU minus headers, the common safe value that avoids fragmentation;
+    /// larger replies risk fragments and loss.
     fn default() -> Self {
         Self {
             udp_payload: 1232,
@@ -680,10 +595,8 @@ impl Default for Edns {
 }
 
 impl Edns {
-    /**
-     * @brief OPT 레코드에서 TTL과 원시 옵션 바이트를 꺼낸다.
-     * @return OPT가 아니거나 owner가 루트가 아니면 오류. RDATA는 미해석 형태여야 한다.
-     */
+    /// TTL and raw option bytes of an OPT record. Errors when it is not OPT, the owner is not the
+    /// root, or the RDATA is not raw.
     fn record_parts(rec: &Record) -> Result<(u32, &[u8]), ProtoError> {
         if rec.rtype != RecordType::OPT {
             return Err(ProtoError::Message("Not an OPT record".into()));
@@ -697,13 +610,8 @@ impl Edns {
         }
     }
 
-    /**
-     * @brief 옵션 목록을 훑으며 각 (코드, 데이터)에 콜백을 부른다.
-     *
-     * @details 검사와 수집 두 용도를 한 구현으로 묶는다. 검사 전용 경로가 따로 있으면
-     *          둘의 엄격함이 어긋나 검사에서 통과한 것이 수집에서 깨지는 일이 생긴다.
-     * @return 옵션 헤더가 끊겼거나 길이가 남은 바이트를 넘으면 오류.
-     */
+    /// Calls `visit` for each (code, data). Validation and collection share this, so they cannot
+    /// disagree on strictness. Errors on a cut option header or a length past the remaining bytes.
     fn visit_options(raw: &[u8], mut visit: impl FnMut(u16, &[u8])) -> Result<(), ProtoError> {
         let mut i = 0usize;
         while i < raw.len() {
@@ -727,17 +635,15 @@ impl Edns {
         Ok(())
     }
 
-    /**
-     * @brief OPT를 검사만 하고 확장 rcode를 추출한다. 옵션을 복사하지 않는다.
-     * @return 확장 rcode 상위 8비트. 헤더 rcode와 합쳐 12비트가 된다.
-     */
+    /// Validates without copying options and returns the extended rcode's high 8 bits, which
+    /// combine with the header rcode into 12.
     fn validate_record(rec: &Record) -> Result<u8, ProtoError> {
         let (ttl, raw) = Self::record_parts(rec)?;
         Self::visit_options(raw, |_, _| {})?;
         Ok(((ttl >> 24) & 0xff) as u8)
     }
 
-    /** @brief OPT 레코드를 완전히 풀어 옵션까지 복사한다. */
+    /// Copies the options too.
     pub fn try_from_record(rec: &Record) -> Result<Edns, ProtoError> {
         let (ttl, raw) = Self::record_parts(rec)?;
         let mut options = vec![];
@@ -751,41 +657,35 @@ impl Edns {
         })
     }
 
-    /** @brief 사유가 필요 없을 때 쓰는 try_from_record의 Option 버전. */
     pub fn from_record(rec: &Record) -> Option<Edns> {
         Self::try_from_record(rec).ok()
     }
 
-    /**
-     * @brief Extended DNS Error를 덧붙인다.
-     * @param info_code ede_code의 값 중 하나.
-     * @param extra_text 사람이 읽을 보충 설명. 와이어에서 길이 종결이라 종단 널을 넣지 않는다.
-     */
+    /// `info_code` is one of `ede_code`. `extra_text` is human-readable and length-delimited on the
+    /// wire, so it has no terminating NUL.
     pub fn push_ede(&mut self, info_code: u16, extra_text: &str) {
         let mut data = info_code.to_be_bytes().to_vec();
         data.extend_from_slice(extra_text.as_bytes());
         self.options.push((EDE_OPTION, data));
     }
 
-    /** @brief 해당 코드의 옵션이 있는지. */
     pub fn has_option(&self, code: u16) -> bool {
         self.options.iter().any(|(c, _)| *c == code)
     }
 
-    /** @brief keepalive 옵션을 설정한다. 기존 값은 덮어쓰지 않고 지운 뒤 다시 넣는다. */
+    /// Replaces any existing value.
     pub fn set_tcp_keepalive(&mut self, timeout_100ms: u16) {
         self.options.retain(|(c, _)| *c != EDNS_TCP_KEEPALIVE);
         self.options
             .push((EDNS_TCP_KEEPALIVE, timeout_100ms.to_be_bytes().to_vec()));
     }
 
-    /** @brief ECS 옵션을 설정한다. 기존 값은 지운 뒤 다시 넣는다. */
+    /// Replaces any existing value.
     pub fn set_client_subnet(&mut self, option: Vec<u8>) {
         self.options.retain(|(c, _)| *c != EDNS_CLIENT_SUBNET);
         self.options.push((EDNS_CLIENT_SUBNET, option));
     }
 
-    /** @brief ECS 옵션의 원시 바이트. */
     pub fn client_subnet(&self) -> Option<&[u8]> {
         self.options
             .iter()
@@ -793,11 +693,8 @@ impl Edns {
             .map(|(_, data)| data.as_slice())
     }
 
-    /**
-     * @brief 첫 EDE 옵션의 코드와 설명 문자열.
-     * @note 데이터가 2바이트 미만이면 코드 0으로 바꾼다. 잘린 옵션 하나 때문에 응답 전체를
-     *       버리는 것보다 낫다. 이건 진단 정보일 뿐이다.
-     */
+    /// Code and text of the first EDE option. Data shorter than 2 bytes becomes code 0: it is only
+    /// diagnostics, not worth dropping the whole response over.
     pub fn ede(&self) -> Option<(u16, String)> {
         self.options
             .iter()
@@ -813,10 +710,7 @@ impl Edns {
             })
     }
 
-    /**
-     * @brief 이 상태를 OPT 레코드로 되돌린다.
-     * @return 옵션 하나 또는 전체가 16비트 길이를 넘으면 오류. 잘라 내지 않는다.
-     */
+    /// Errors when one option or the total exceeds a 16-bit length, instead of truncating.
     pub fn try_to_record(&self) -> Result<Record, ProtoError> {
         let mut raw = Vec::new();
         for (code, data) in &self.options {
@@ -851,12 +745,10 @@ impl Edns {
 }
 
 #[cfg(test)]
-/** @brief 아무 바이트열에도 파서가 패닉하지 않는지. */
 mod robustness_tests {
     use super::Message;
 
     #[test]
-    /** @brief 쓰레기 바이트열에 패닉하지 않는지. */
     fn parse_no_panic_on_garbage() {
         let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut rng = || {
@@ -880,13 +772,11 @@ mod robustness_tests {
 }
 
 #[cfg(test)]
-/** @brief UDP 응답이 도중에 끊겼을 때만 잘린 응답으로 읽는지. */
 mod udp_reply_tests {
     use super::*;
     use crate::rdata::RData;
     use std::net::Ipv4Addr;
 
-    /** @brief A 레코드 여러 개를 담은 응답의 와이어. */
     fn reply_wire() -> Vec<u8> {
         let name = Name::from_str("cut.example").unwrap();
         let mut m = Message::query(7, name.clone(), RecordType::A);
@@ -902,7 +792,6 @@ mod udp_reply_tests {
     }
 
     #[test]
-    /** @brief 온전한 응답은 그대로 해석하는지. */
     fn whole_reply_is_parsed_as_is() {
         let m = Message::parse_udp_reply(&reply_wire()).unwrap();
         assert!(!m.header.truncated);
@@ -910,7 +799,6 @@ mod udp_reply_tests {
     }
 
     #[test]
-    /** @brief 레코드 중간에서 끊긴 응답을 레코드 없는 TC 응답으로 읽는지. */
     fn reply_cut_mid_record_reads_as_truncated() {
         let wire = reply_wire();
         let m = Message::parse_udp_reply(&wire[..wire.len() - 3]).unwrap();
@@ -921,7 +809,6 @@ mod udp_reply_tests {
     }
 
     #[test]
-    /** @brief 질문이 끊겼거나 질의이거나 형식 위반이면 잘림으로 보지 않는지. */
     fn only_a_cut_reply_with_a_whole_question_counts() {
         let wire = reply_wire();
         assert!(Message::parse_udp_reply(&wire[..14]).is_none());
@@ -936,11 +823,9 @@ mod udp_reply_tests {
     }
 
     #[test]
-    /**
-     * @brief 잘린 응답 파서가 일반 파서와 같은 섹션 개수 상한을 스스로 적용하는지.
-     * @details 호출자가 먼저 걸렀다고 가정하지 않는다. 질문 수가 상한을 넘으면 바이트가 그만큼
-     *          있어도 받지 않고, 상한 안이면 잘린 응답으로 받는다.
-     */
+    /// The cut-reply parser applies the same section count limit as the normal parser itself,
+    /// without assuming the caller filtered first. Over the limit the reply is refused even with
+    /// enough bytes; within it, it reads as truncated.
     fn cut_reply_enforces_the_section_item_limit() {
         let over = 4097usize;
         let mut too_many = vec![0u8; 12 + over * 5];
@@ -957,11 +842,9 @@ mod udp_reply_tests {
 }
 
 #[cfg(test)]
-/** @brief 확장 옵션을 붙이고 읽는 동작. */
 mod edns_option_tests {
     use super::*;
 
-    /** @brief 확장 옵션이 붙은 테스트용 응답. */
     fn resp_with_opt() -> Message {
         let mut m = Message::query(1, Name::from_str("example.com").unwrap(), RecordType::A);
         m.header.response = true;
@@ -970,7 +853,6 @@ mod edns_option_tests {
     }
 
     #[test]
-    /** @brief 채우기가 크기를 정해진 단위로 맞추는지. */
     fn pad_to_rounds_wire_size_to_block() {
         let mut m = resp_with_opt();
         m.pad_to(128).unwrap();
@@ -989,7 +871,6 @@ mod edns_option_tests {
     }
 
     #[test]
-    /** @brief 확장 옵션이 없으면 채우지 않는지. */
     fn pad_to_noop_without_opt() {
         let mut m = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
         m.header.response = true;
@@ -1003,7 +884,6 @@ mod edns_option_tests {
     }
 
     #[test]
-    /** @brief 상대가 채우기를 요청했는지 알아보는지. */
     fn requested_padding_detects_query_option() {
         let mut q = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
         let mut e = Edns::default();
@@ -1016,7 +896,6 @@ mod edns_option_tests {
     }
 
     #[test]
-    /** @brief 연결 유지 옵션이 붙는지. */
     fn tcp_keepalive_attaches_option() {
         let mut m = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A);
         m.set_tcp_keepalive(100).unwrap();
@@ -1031,12 +910,11 @@ mod edns_option_tests {
 }
 
 #[cfg(test)]
-/** @brief 어긋난 메시지를 받아들이지 않는지. */
 mod hardening_tests {
     use super::*;
 
     #[test]
-    /** @brief 개수만 크게 적은 짧은 패킷을 거부하는지. 받아들이면 그것만으로 메모리가 동난다. */
+    /// Accepting it would exhaust memory on its own.
     fn rejects_count_allocation_bomb() {
         let mut wire = vec![0u8; 12];
         wire[4..12].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
@@ -1044,11 +922,8 @@ mod hardening_tests {
     }
 
     #[test]
-    /**
-     * @brief 예약된 Z 비트를 설정한 질의를 버리지 않고, 답에는 그대로 돌려주지 않는지.
-     * @details 거부하면 응답이 아니라 무응답이 된다. RFC 8906은 그 질의에도
-     *          NOERROR 로 답하고 그 비트는 응답에 없을 것을 요구한다.
-     */
+    /// Refusing would mean no answer. RFC 8906 requires a NOERROR answer that does not carry the
+    /// bit.
     fn reserved_header_z_bit_is_ignored_not_rejected() {
         let mut query = Message::query(
             0x1234,
@@ -1073,7 +948,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 빈 내용을 허용하는 곳을 규격대로 구분하는지. */
     fn update_accepts_empty_rdata_only_for_rfc2136_classes() {
         let mut update = Message::default();
         update.header.opcode = 5;
@@ -1101,7 +975,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 확장 응답 코드의 왕복. */
     fn extended_rcode_roundtrip() {
         let mut m = Message::query(7, Name::from_str("cookie.test").unwrap(), RecordType::A);
         m.header.response = true;
@@ -1113,7 +986,7 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 확장 기록이 여럿이거나 어긋나면 거부하는지. 둘이면 어느 쪽을 믿느냐가 갈린다. */
+    /// With two, which one to trust is ambiguous.
     fn rejects_multiple_or_malformed_opt() {
         let mut multiple = vec![0u8; 12];
         multiple[10..12].copy_from_slice(&2u16.to_be_bytes());
@@ -1138,7 +1011,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 적을 수 없는 상태를 모두 오류로 알리는지. */
     fn strict_encoder_reports_every_invalid_state() {
         let message = Message::query(0x1234, Name::from_str("x.test").unwrap(), RecordType::A);
         let mut edns = Edns::default();
@@ -1151,7 +1023,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 바로 적는 경로가 같은 바이트를 내고 버퍼를 다시 쓰는지. */
     fn direct_encoder_matches_wire_and_reuses_writer_capacity() {
         let message = Message::query(
             0x5151,
@@ -1173,7 +1044,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 크기를 넘길 것 같으면 잡기 전에 멈추는지. */
     fn bounded_writer_stops_before_allocating_an_oversized_wire() {
         let mut message = Message::query(
             0x5252,
@@ -1199,7 +1069,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 메시지 뒤에 남는 바이트를 거부하는지. */
     fn parser_rejects_trailing_bytes() {
         let mut wire = Message::query(1, Name::from_str("x.test").unwrap(), RecordType::A)
             .try_encode()
@@ -1209,7 +1078,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 크기 상한을 읽기 전에 거는지. */
     fn parser_enforces_the_dns_wire_size_limit_before_decoding() {
         let wire = vec![0u8; crate::wire::MAX_DNS_WIRE_LEN + 1];
         let error = Message::parse(&wire).unwrap_err();
@@ -1217,7 +1085,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 확장 기록이 정해진 구간 밖에 있으면 거부하는지. */
     fn opt_is_rejected_outside_the_additional_section() {
         let mut wire = vec![0u8; 12];
         wire[6..8].copy_from_slice(&1u16.to_be_bytes());
@@ -1232,7 +1099,6 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 범위를 벗어난 동작 코드를 거부하는지. */
     fn strict_encoder_rejects_out_of_range_opcode() {
         let mut message = Message::default();
         message.header.opcode = 16;
@@ -1240,7 +1106,7 @@ mod hardening_tests {
     }
 
     #[test]
-    /** @brief 기록 종류와 내용이 어긋나면 거부하는지. 적어 내보내면 상대가 다르게 읽는다. */
+    /// Sent out, the peer would read it differently.
     fn strict_encoder_rejects_record_type_and_rdata_mismatch() {
         let mut message = Message::default();
         message.answers.push(Record {

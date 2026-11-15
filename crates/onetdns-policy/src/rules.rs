@@ -1,32 +1,23 @@
-/*!
- * @brief 네이티브 정책 규칙: 클라이언트·이름·타입·시간대 조건.
- */
-
 use std::net::IpAddr;
 
 use crate::{Action, PolicyInput};
 
-/**
- * @brief 요일과 하루 중 구간으로 정의한 시간 구간.
- * @details 시각은 지역 시각 기준이다. start_min > end_min이면 자정을 넘는 창으로 해석한다.
- */
+/// Weekday and time-of-day window in local time. start_min > end_min means the window crosses
+/// midnight.
 #[derive(Debug, Clone, Copy)]
 pub struct TimeWindow {
-    /** @brief 요일 비트마스크(비트 0이 일요일). 0이면 모든 요일이다. */
+    /// Weekday bitmask, bit 0 is Sunday; 0 means every day.
     pub days: u8,
-    /** @brief 시작 시각. 자정부터 흐른 분. */
+    /// Minutes since midnight.
     pub start_min: u16,
-    /** @brief 끝 시각. 자정부터 흐른 분. */
+    /// Minutes since midnight.
     pub end_min: u16,
 }
 
 impl TimeWindow {
-    /**
-     * @brief 이 시각이 구간 안인지.
-     * @details 자정을 넘는 구간에서는 앞부분이 오늘 요일, 뒷부분이 전날 요일에 속한다.
-     *          이걸 구분하지 않으면 "금요일 22시~2시" 같은 구간이 토요일 새벽에 어긋난다.
-     * @param minute_of_week 일요일 0시부터 흐른 분. 지역 시각 기준이다.
-     */
+    /// In a window that crosses midnight, the part after midnight counts as the previous weekday;
+    /// otherwise a Friday 22:00 to 02:00 window misses early Saturday. `minute_of_week` counts from
+    /// Sunday 00:00, local time.
     fn contains(&self, minute_of_week: u32) -> bool {
         let weekday = ((minute_of_week / 1_440) % 7) as u8;
         let minute = (minute_of_week % 1_440) as u16;
@@ -43,17 +34,15 @@ impl TimeWindow {
     }
 }
 
-/** @brief 규칙이 쓰는 CIDR. 접두사가 없으면 호스트 경로다. */
+/// Without a prefix it is a host route.
 #[derive(Debug, Clone, Copy)]
 struct Cidr {
-    /** @brief 대역의 시작 주소. */
     base: IpAddr,
-    /** @brief 대역 길이. */
     prefix: u8,
 }
 
 impl Cidr {
-    /** @brief CIDR 문자열을 해석한다. 계열 최대 길이를 넘는 접두사는 거부한다. */
+    /// A prefix longer than the family allows is refused.
     fn parse(s: &str) -> Option<Cidr> {
         let (ip_s, pfx) = match s.split_once('/') {
             Some((a, b)) => (a, b.parse::<u8>().ok()?),
@@ -68,7 +57,7 @@ impl Cidr {
         Some(Cidr { base, prefix })
     }
 
-    /** @brief 주소가 이 대역에 속하는지. 계열이 다르면 언제나 거짓이다. */
+    /// Always false across address families.
     fn contains(&self, ip: IpAddr) -> bool {
         match (self.base, ip) {
             (IpAddr::V4(b), IpAddr::V4(x)) => mask_match(&b.octets(), &x.octets(), self.prefix),
@@ -78,7 +67,7 @@ impl Cidr {
     }
 }
 
-/** @brief 앞의 prefix비트가 같은지. 온전한 바이트를 먼저 보고 남은 비트를 마스크로 비교한다. */
+/// Whether the first `prefix` bits are equal.
 fn mask_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
     let full = (prefix / 8) as usize;
     if a[..full] != b[..full] {
@@ -92,11 +81,8 @@ fn mask_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
     (a[full] & mask) == (b[full] & mask)
 }
 
-/**
- * @brief 이름이 접미사에 속하는지.
- * @warning 라벨 경계에서만 맞춘다. 단순 ends_with를 쓰면 evil-example.com이
- *          example.com 규칙에 걸려 의도하지 않은 대상까지 적용된다.
- */
+/// Matches only at label boundaries; a plain ends_with would make evil-example.com match a rule for
+/// example.com.
 fn suffix_match(qname: &str, suffix: &str) -> bool {
     let s = suffix.trim_matches('.');
     if s.is_empty() {
@@ -108,26 +94,19 @@ fn suffix_match(qname: &str, suffix: &str) -> bool {
             && qname.as_bytes()[qname.len() - s.len() - 1] == b'.')
 }
 
-/**
- * @brief 규칙 하나. 조건은 모두 만족해야 하고, 한 조건 안의 여러 값은 하나만 맞으면 된다.
- * @details 비어 있는 조건은 "무엇이든"으로 본다. 모든 조건을 만족해야 판정이 적용된다.
- */
+/// All conditions must hold; within one condition, any value may match. An empty condition matches
+/// anything.
 #[derive(Debug, Clone)]
 pub struct Rule {
-    /** @brief 이 클라이언트들에만 건다. */
     clients: Vec<Cidr>,
-    /** @brief 이 이름들에만 건다. */
     suffixes: Vec<String>,
-    /** @brief 이 질의 종류에만 건다. */
     qtypes: Vec<u16>,
-    /** @brief 이 시간대에만 건다. */
     window: Option<TimeWindow>,
-    /** @brief 맞았을 때 할 일. */
     action: Action,
 }
 
 impl Rule {
-    /** @brief 조건이 하나도 없는(=모든 질의에 맞는) 규칙을 만든다. */
+    /// A rule with no conditions, which matches every query.
     pub fn new(action: Action) -> Self {
         Rule {
             clients: vec![],
@@ -137,16 +116,13 @@ impl Rule {
             action,
         }
     }
-    /**
-     * @brief 클라이언트 대역 조건을 건다.
-     * @note 해석할 수 없는 항목은 조용히 버린다. 규칙 하나의 오타가 서버 시작을 막지
-     *       않게 하려는 것이며, 설정 검증이 별도로 형식을 확인한다.
-     */
+    /// Entries that do not parse are dropped silently, so a typo in one rule cannot stop the server
+    /// from starting; config validation checks the format separately.
     pub fn with_clients(mut self, cidrs: &[String]) -> Self {
         self.clients = cidrs.iter().filter_map(|c| Cidr::parse(c)).collect();
         self
     }
-    /** @brief 이름 접미사 조건을 건다. 소문자로 정규화해 보관한다. */
+    /// Stored lowercased.
     pub fn with_suffixes(mut self, suffixes: &[String]) -> Self {
         self.suffixes = suffixes
             .iter()
@@ -154,18 +130,15 @@ impl Rule {
             .collect();
         self
     }
-    /** @brief 레코드 타입 조건을 건다. */
     pub fn with_qtypes(mut self, qtypes: &[u16]) -> Self {
         self.qtypes = qtypes.to_vec();
         self
     }
-    /** @brief 시간대 조건을 건다. */
     pub fn with_window(mut self, w: TimeWindow) -> Self {
         self.window = Some(w);
         self
     }
 
-    /** @brief 이 질의가 모든 조건을 만족하는지. */
     fn matches(&self, input: &PolicyInput) -> bool {
         if !self.clients.is_empty() && !self.clients.iter().any(|c| c.contains(input.client)) {
             return false;
@@ -186,26 +159,20 @@ impl Rule {
     }
 }
 
-/** @brief 규칙 목록. 설정에 적힌 순서가 곧 우선순위다. */
+/// Rules in config order, which is their priority; the first match wins.
 #[derive(Default)]
 pub struct RuleEngine {
-    /** @brief 순서대로 보는 규칙들. 먼저 맞은 것이 이긴다. */
     rules: Vec<Rule>,
 }
 
 impl RuleEngine {
-    /** @brief 규칙 목록으로 엔진을 만든다. */
     pub fn new(rules: Vec<Rule>) -> Self {
         RuleEngine { rules }
     }
-    /** @brief 규칙이 하나도 없는지. */
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
-    /**
-     * @brief 처음으로 맞는 규칙의 판정을 돌려준다.
-     * @return 아무 규칙에도 맞지 않으면 Continue.
-     */
+    /// The first matching rule's action, or Continue if none matches.
     pub fn evaluate(&self, input: &PolicyInput) -> Action {
         for r in &self.rules {
             if r.matches(input) {
@@ -217,12 +184,11 @@ impl RuleEngine {
 }
 
 #[cfg(test)]
-/** @brief 규칙이 맞는 것만 걸고, 앞선 규칙이 이기는지. */
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    /** @brief 테스트용 입력. t는 일요일 0시부터 흐른 분이다. */
+    /// `t` is minutes since Sunday 00:00.
     fn input<'a>(client: &str, qname: &'a str, qtype: u16, t: u32) -> PolicyInput<'a> {
         PolicyInput {
             client: client.parse().unwrap(),
@@ -237,7 +203,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대역 판정. */
     fn cidr_match_v4() {
         let c = Cidr::parse("192.168.1.0/24").unwrap();
         assert!(c.contains("192.168.1.50".parse().unwrap()));
@@ -248,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 접미사가 조각 경계에서만 맞는지. 아니면 다른 이름이 걸린다. */
     fn suffix_is_label_bounded() {
         assert!(suffix_match("ads.example.com", "example.com"));
         assert!(suffix_match("example.com", "example.com"));
@@ -257,7 +221,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트와 이름 조건이 함께 걸리는지. */
     fn rule_combines_client_and_suffix() {
         let r = Rule::new(Action::Block)
             .with_clients(&["192.168.1.0/24".into()])
@@ -281,7 +244,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 먼저 맞은 규칙이 이기는지. */
     fn first_match_wins() {
         let allow = Rule::new(Action::Allow).with_suffixes(&["good.example".into()]);
         let block = Rule::new(Action::Block).with_suffixes(&["example".into()]);
@@ -299,7 +261,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 질의 종류 조건. */
     fn qtype_filter() {
         let r = Rule::new(Action::Refuse).with_qtypes(&[28]);
         let eng = RuleEngine::new(vec![r]);
@@ -314,7 +275,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 요일과 시각 조건. */
     fn time_window_weekday_and_minute() {
         let wed_midnight = 3 * 1_440u32;
 
@@ -341,7 +301,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 자정을 넘는 구간이 다음 날 새벽에도 전날 요일로 걸리는지. */
     fn time_window_across_midnight_uses_previous_weekday() {
         let w = TimeWindow {
             days: 1 << 5,
@@ -359,7 +318,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재작성이 답할 주소를 포함하는지. */
     fn rewrite_action_carries_ip() {
         let r = Rule::new(Action::Rewrite(Ipv4Addr::new(10, 0, 0, 1)))
             .with_suffixes(&["router.lan".into()]);

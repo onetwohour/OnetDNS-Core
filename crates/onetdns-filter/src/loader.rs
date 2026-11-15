@@ -1,24 +1,18 @@
-/*!
- * @brief 차단 목록 형식 파서.
- *
- * @details AdGuard, ABP, hosts, RPZ를 모두 읽는다. 어느 형식이든 결국 도메인 집합과
- *          규칙 목록으로 수렴한다.
- * @warning 파일을 읽지 못하면 실패로 끝난다. 조용히 넘어가면 필터가 전부 사라진 채
- *          정상 시작한 것처럼 보인다. 파일 하나가 어긋나면 그 파일의 규칙을 하나도
- *          적용하지 않는다. 절반만 걸린 필터는 없느니만 못하다.
- */
+//! Blocklist parsers for AdGuard, ABP, hosts, and RPZ formats; every format ends up as domain sets
+//! and rule lists.
+//!
+//! A file that cannot be read is an error: skipping it would start normally with the filter gone. A
+//! file that fails partway applies none of its rules, since a half-loaded filter is worse than
+//! none.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::Path;
 
-/** @brief 읽어 들일 목록 파일 크기 상한. */
 const MAX_LOCAL_LIST_FILE: u64 = 128 * 1024 * 1024;
-/** @brief 목록 한 줄의 길이 상한. */
 const MAX_LOCAL_LIST_LINE: u64 = 1024 * 1024;
 
-/** @brief 상한 초과 오류를 만든다. */
 fn list_too_large() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -26,7 +20,6 @@ fn list_too_large() -> std::io::Error {
     )
 }
 
-/** @brief 상한을 지키며 한 줄을 읽는다. */
 fn read_list_line(reader: &mut impl BufRead, line: &mut String) -> std::io::Result<usize> {
     let mut bounded = reader.take(MAX_LOCAL_LIST_LINE + 1);
     let read = bounded.read_line(line)?;
@@ -39,7 +32,6 @@ fn read_list_line(reader: &mut impl BufRead, line: &mut String) -> std::io::Resu
     Ok(read)
 }
 
-/** @brief 목록 파일을 열고 크기와 형식을 확인한다. */
 fn open_validated_list_file(path: &Path) -> std::io::Result<File> {
     let mut file = File::open(path)?;
     {
@@ -62,10 +54,7 @@ fn open_validated_list_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-/**
- * @brief 파일의 모든 줄을 넘겨준다.
- * @warning 도중에 실패하면 전부 오류다. 호출자는 그 파일의 규칙을 하나도 적용하지 않는다.
- */
+/// A failure partway makes the whole file an error; the caller applies none of its rules.
 fn parse_validated_list_file(file: File, mut on_line: impl FnMut(&str)) -> std::io::Result<()> {
     let mut reader = BufReader::new(file.take(MAX_LOCAL_LIST_FILE + 1));
     let mut line = String::new();
@@ -91,22 +80,16 @@ use onetdns_proto::{Name, RecordType};
 use crate::engine::{BlockEngine, DomainSet, EngineParts, RpzIpRule, RpzNameRule};
 
 #[derive(Default)]
-/** @brief 목록을 읽는 동안 쌓이는 것들. 규칙, 집합, 보고가 여기 모인다. */
 struct Accum {
-    /** @brief 만드는 중인 엔진 부품. */
     parts: EngineParts,
 
-    /** @brief 무효로 만들 규칙들. 나중에 걷어 낸다. */
     badfilter: Vec<String>,
-    /** @brief 무효로 만들 정규식 규칙들. */
     badfilter_regex: Vec<String>,
 
-    /** @brief 지금 읽고 있는 목록 번호. */
     cur_source: u32,
 }
 
 impl Accum {
-    /** @brief 빈 상태. */
     fn new() -> Self {
         Accum {
             cur_source: crate::engine::NO_SOURCE,
@@ -114,14 +97,12 @@ impl Accum {
         }
     }
 
-    /** @brief 목록 하나를 출처로 등록하고 번호를 받는다. */
     fn register_source(&mut self, name: String) {
         self.cur_source = self.parts.sources.len() as u32;
         self.parts.sources.push(name);
     }
 }
 
-/** @brief 규칙 본문과 수식어를 구분한다. */
 fn split_mods(s: &str) -> (&str, Vec<&str>) {
     match s.find('$') {
         Some(i) => (&s[..i], s[i + 1..].split(',').collect()),
@@ -129,31 +110,19 @@ fn split_mods(s: &str) -> (&str, Vec<&str>) {
     }
 }
 
-/** @brief 해석한 수식어들. */
 struct RuleMods<'a> {
-    /** @brief 무엇보다 먼저 보라는 표시. */
     important: bool,
-    /** @brief 다른 규칙을 무효로 만드는 규칙인지. */
     badfilter: bool,
-    /** @brief 이 종류에만 건다. */
     dnstypes: Vec<RecordType>,
-    /** @brief 이 종류는 빼고 건다. */
     dnstype_excluded: Vec<RecordType>,
-    /** @brief 다른 답으로 바꾸라는 지시. */
     dnsrewrite: Option<&'a str>,
-    /** @brief 이 클라이언트들에만 건다. */
     client_conds: Vec<crate::engine::ClientCond>,
-    /** @brief 이 태그에만 건다. */
     ctags: Vec<(bool, String)>,
-    /** @brief 이 이름들은 뺀다. */
     denyallow: Vec<String>,
 }
 
-/**
- * @brief 수식어 목록을 해석한다.
- * @note 이 서버와 무관한 브라우저 전용 수식어는 오류가 아니라 적용 대상 아님으로 분류한다.
- *       오류로 세면 보고가 실제 문제를 가린다.
- */
+/// Browser-only modifiers that mean nothing to a DNS server are counted as not applicable, not as
+/// errors; counting them as errors would bury real problems in the report.
 fn parse_mods<'a>(mods: &[&'a str], acc: &mut Accum, line: &str) -> Option<RuleMods<'a>> {
     let mut out = RuleMods {
         important: false,
@@ -256,7 +225,6 @@ fn parse_mods<'a>(mods: &[&'a str], acc: &mut Accum, line: &str) -> Option<RuleM
     Some(out)
 }
 
-/** @brief 정규식 규칙에서 패턴과 수식어를 구분한다. */
 fn split_regex_rule(body: &str) -> Option<(&str, Vec<&str>)> {
     let rest = body.strip_prefix('/')?;
     let bytes = rest.as_bytes();
@@ -278,7 +246,6 @@ fn split_regex_rule(body: &str) -> Option<(&str, Vec<&str>)> {
     Some((pat, mods))
 }
 
-/** @brief 정규식 규칙을 수식어에 따라 알맞은 집합으로 보낸다. */
 fn route_regex_rule(pat: &str, m: RuleMods, allow: bool, acc: &mut Accum) {
     let RuleMods {
         important,
@@ -340,11 +307,8 @@ fn route_regex_rule(pat: &str, m: RuleMods, allow: bool, acc: &mut Accum) {
     list.push(pat.to_string());
 }
 
-/**
- * @brief 규칙 한 줄을 읽어 알맞은 집합에 넣는다.
- * @details 형식이 여럿이라 접두 문자로 구분된다. 두 세로줄은 도메인, 골뱅이 둘은 허용,
- *          빗금은 정규식, 그 밖에는 hosts 형식이나 평범한 도메인이다.
- */
+/// Formats are told apart by prefix: `||` is a domain, `@@` an allow rule, `/` a regex, anything
+/// else a hosts line or a bare domain.
 fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
@@ -488,13 +452,12 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
     target_set(&mut acc.parts, allow, important, false).add_suffix_src(&dom, src);
 }
 
-/** @brief 잘못된 패턴을 건너뛴 것으로 센다. */
 fn skip_invalid_pattern(acc: &mut Accum) {
     acc.parts.report.rules_skipped += 1;
     acc.parts.report.invalid_pattern += 1;
 }
 
-/** @brief 이 수식어가 브라우저 전용인지. DNS 서버에는 적용 대상이 아니다. */
+/// Browser-only modifiers, which do not apply to a DNS server.
 fn is_network_modifier(key: &str) -> bool {
     matches!(
         key,
@@ -546,7 +509,6 @@ fn is_network_modifier(key: &str) -> bool {
     )
 }
 
-/** @brief 수식어에 맞는 대상 집합을 고른다. */
 fn target_set(
     parts: &mut EngineParts,
     allow: bool,
@@ -565,7 +527,6 @@ fn target_set(
     }
 }
 
-/** @brief 이 타입 전용 집합. */
 fn typed_set(parts: &mut EngineParts, t: RecordType) -> &mut DomainSet {
     if let Some(idx) = parts.typed_block.iter().position(|(rt, _)| *rt == t) {
         &mut parts.typed_block[idx].1
@@ -576,7 +537,7 @@ fn typed_set(parts: &mut EngineParts, t: RecordType) -> &mut DomainSet {
     }
 }
 
-/** @brief 나열한 타입을 뺀 나머지에 걸리는 집합. */
+/// The set that applies to every type except those listed.
 fn typed_except_set<'a>(parts: &'a mut EngineParts, excluded: &[RecordType]) -> &'a mut DomainSet {
     if let Some(idx) = parts
         .typed_block_except
@@ -593,7 +554,7 @@ fn typed_except_set<'a>(parts: &'a mut EngineParts, excluded: &[RecordType]) -> 
     }
 }
 
-/** @brief 재작성 규칙을 적용한다. 주소, 이름, 응답 코드를 지정할 수 있다. */
+/// The value can give an address, a name, or a response code.
 fn apply_dnsrewrite(dom: &str, value: &str, parts: &mut EngineParts, src: u32) -> bool {
     let segs: Vec<&str> = value.split(';').collect();
     let val = if segs.len() == 3 { segs[2] } else { segs[0] };
@@ -632,7 +593,6 @@ fn apply_dnsrewrite(dom: &str, value: &str, parts: &mut EngineParts, src: u32) -
     false
 }
 
-/** @brief 정규식 규칙의 재작성을 적용한다. */
 fn apply_regex_dnsrewrite(pat: &str, value: &str, parts: &mut EngineParts) -> bool {
     let segs: Vec<&str> = value.split(';').collect();
     let val = if segs.len() == 3 { segs[2] } else { segs[0] };
@@ -675,7 +635,6 @@ fn apply_regex_dnsrewrite(pat: &str, value: &str, parts: &mut EngineParts) -> bo
     false
 }
 
-/** @brief 패턴에서 도메인 부분을 추출한다. 도메인 형태가 아니면 없다. */
 fn extract_domain(pattern: &str) -> Option<String> {
     let p = pattern.trim();
     let p = p.strip_prefix("||").unwrap_or(p);
@@ -689,7 +648,6 @@ fn extract_domain(pattern: &str) -> Option<String> {
     }
 }
 
-/** @brief 타입 이름을 번호로. */
 fn parse_rtype(s: &str) -> Option<RecordType> {
     Some(match s.trim().to_ascii_uppercase().as_str() {
         "A" => RecordType::A,
@@ -710,7 +668,6 @@ fn parse_rtype(s: &str) -> Option<RecordType> {
     })
 }
 
-/** @brief 이 문자열이 도메인처럼 생겼는지. */
 fn looks_like_domain(s: &str) -> bool {
     !s.is_empty()
         && s.contains('.')
@@ -718,12 +675,12 @@ fn looks_like_domain(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-/** @brief 이 주소가 hosts 형식에서 차단을 뜻하는 값인지. */
+/// The addresses that mean blocked in hosts format.
 fn is_unspecified_or_loopback(ip: &IpAddr) -> bool {
     ip.is_unspecified() || ip.is_loopback()
 }
 
-/** @brief 취소 규칙들을 적용해 대상 규칙을 꺼 준다. 모든 규칙을 읽은 뒤에 한다. */
+/// Runs after every rule has been read.
 fn apply_badfilter(acc: &mut Accum) {
     for d in &acc.badfilter {
         acc.parts.block.remove(d);
@@ -760,7 +717,7 @@ fn apply_badfilter(acc: &mut Accum) {
     }
 }
 
-/** @brief 규칙 한 줄이 유효한지 검사하고 사유를 알려 준다. 대시보드가 쓴다. */
+/// The dashboard shows the reason.
 pub fn validate_rule(line: &str) -> Result<(), String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
@@ -795,10 +752,7 @@ pub fn validate_rule(line: &str) -> Result<(), String> {
     Err("Not a valid domain or rule pattern".to_string())
 }
 
-/**
- * @brief RPZ zone 텍스트를 읽는다.
- * @note 이 서버가 지원하는 부분집합만 다룬다. 이름 기반 규칙과 주소 기반 규칙이다.
- */
+/// Handles the subset this server supports: name-based and address-based rules.
 pub fn parse_rpz_text(text: &str, parts: &mut EngineParts) {
     for line in text.lines() {
         let line = line.trim();
@@ -870,13 +824,10 @@ pub fn parse_rpz_text(text: &str, parts: &mut EngineParts) {
     }
 }
 
-/**
- * @brief RPZ 레코드에서 처분을 정한다.
- * @note rpz-drop 은 원래 답하지 않으라는 뜻이지만 설정한 차단 응답으로 답한다. 받아 온 영역의
- *       규칙대로 침묵하면 클라이언트는 차단을 장애로 보고 시간이 다 될 때까지 기다리며 재시도한다.
- *       침묵은 운영자가 NORESPONSE 로 직접 고른 이름에만 쓴다. rpz-tcp-only 는 지원하지 않아
- *       규칙을 건너뛴다. 어느 쪽이든 그 이름을 CNAME 대상으로 삼지 않는다.
- */
+/// rpz-drop means no answer, but it is answered with the configured block response: silence from a
+/// fetched zone makes clients treat the block as an outage and retry until they time out. Silence
+/// is used only for names the operator chose with NORESPONSE. rpz-tcp-only is not supported and the
+/// rule is skipped. Neither is taken as a CNAME target.
 fn rpz_action_verdict(rtype: &str, rdata: &[&str]) -> Option<FilterVerdict> {
     match rtype.to_ascii_uppercase().as_str() {
         "CNAME" => {
@@ -904,13 +855,9 @@ fn rpz_action_verdict(rtype: &str, rdata: &[&str]) -> Option<FilterVerdict> {
     }
 }
 
-/**
- * @brief 이름 기반 RPZ 규칙을 적용한다.
- * @details RPZ 의 소유자 이름은 그 이름 하나만 가리킨다. 하위 도메인은 *. 로 시작하는 소유자가
- *          따로 가리킨다.
- * @warning 엔진의 접미사 규칙은 부모 이름 자체도 덮으므로 *.example 규칙은 example 에도 걸린다.
- *          하위 도메인만 덮는 규칙이 엔진에 없어서다.
- */
+/// An RPZ owner name covers only that name; subdomains are covered by a separate owner starting
+/// with `*.`. The engine's suffix rules also cover the parent name itself, so a `*.example` rule
+/// matches example too: the engine has no rule that covers subdomains only.
 fn apply_rpz_verdict_qname(
     parts: &mut EngineParts,
     dom: &str,
@@ -939,7 +886,6 @@ fn apply_rpz_verdict_qname(
     }
 }
 
-/** @brief RPZ 소유자 이름에서 주소 부분을 추출한다. */
 fn rpz_ip_owner<'a>(owner: &'a str, marker: &str) -> Option<&'a str> {
     let pat = format!(".{marker}");
     let idx = owner.find(&pat)?;
@@ -947,7 +893,7 @@ fn rpz_ip_owner<'a>(owner: &'a str, marker: &str) -> Option<&'a str> {
     (!enc.is_empty()).then_some(enc)
 }
 
-/** @brief RPZ의 뒤집힌 주소 표기를 대역으로 바꾼다. */
+/// Decodes RPZ's reversed address notation into a network.
 fn rpz_ip_to_net(enc: &str) -> Option<IpNet> {
     let labels: Vec<&str> = enc.split('.').collect();
     if labels.len() < 2 {
@@ -1001,7 +947,6 @@ fn rpz_ip_to_net(enc: &str) -> Option<IpNet> {
     format!("{}/{}", groups.join(":"), prefix).parse().ok()
 }
 
-/** @brief 레코드 줄에서 타입과 그 뒤를 찾는다. */
 fn find_type<'a>(rest: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
     for (i, t) in rest.iter().enumerate() {
         let up = t.to_ascii_uppercase();
@@ -1012,7 +957,6 @@ fn find_type<'a>(rest: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
     None
 }
 
-/** @brief 설정된 목록들을 읽어 엔진 구성을 만든다. */
 pub fn load_parts(
     blocklists: &[impl AsRef<Path>],
     allowlists: &[impl AsRef<Path>],
@@ -1022,27 +966,19 @@ pub fn load_parts(
     load_parts_with_subscriptions(blocklists, allowlists, &[], extra_block, extra_allow)
 }
 
-/** @brief 구독한 차단 목록 하나의 규칙이 어디에 있는지. */
 pub enum SubscriptionRules<'a> {
-    /** @brief 내려받아 디스크에 둔 캐시 파일. */
     File(&'a Path),
-    /** @brief 메모리에 있는 줄들. 캐시 디렉터리를 쓰지 않을 때다. */
+    /// In memory, when no cache directory is used.
     Lines(&'a [String]),
 }
 
-/**
- * @brief 구독한 차단 목록 하나.
- * @details 이름은 그 목록의 출처로 등록된다. 질의 기록이 어느 목록 때문에 막혔는지를
- *          목록 단위로 보여 주는 값이며, 규칙 원문은 따로 보존하지 않는다.
- */
+/// One subscribed blocklist. Its name is registered as the source of its rules, which is how the
+/// query log shows which list blocked a name; the rule text itself is not kept.
 pub struct SubscriptionSource<'a> {
-    /** @brief 출처 이름. 구독 주소를 쓴다. */
     pub name: &'a str,
-    /** @brief 규칙이 있는 곳. */
     pub rules: SubscriptionRules<'a>,
 }
 
-/** @brief 구독 목록까지 포함해 엔진 구성을 만든다. */
 pub fn load_parts_with_subscriptions(
     blocklists: &[impl AsRef<Path>],
     allowlists: &[impl AsRef<Path>],
@@ -1140,7 +1076,6 @@ pub fn load_parts_with_subscriptions(
     Ok(acc.parts)
 }
 
-/** @brief 목록들을 읽어 엔진을 만든다. */
 pub fn load_lists(
     blocklists: &[impl AsRef<Path>],
     allowlists: &[impl AsRef<Path>],
@@ -1149,7 +1084,6 @@ pub fn load_lists(
     load_lists_with(blocklists, allowlists, &[], &[], default_block)
 }
 
-/** @brief 추가 목록까지 포함해 엔진을 만든다. */
 pub fn load_lists_with(
     blocklists: &[impl AsRef<Path>],
     allowlists: &[impl AsRef<Path>],
@@ -1161,7 +1095,7 @@ pub fn load_lists_with(
     Ok(BlockEngine::new(parts, default_block))
 }
 
-/** @brief 문자열 하나에서 엔진을 만든다. 테스트와 검증에 쓴다. */
+/// For tests and validation.
 pub fn build_from_str(
     block_text: &str,
     allow_text: &str,
@@ -1178,7 +1112,7 @@ pub fn build_from_str(
     BlockEngine::new(acc.parts, default_block)
 }
 
-/** @brief 이름 붙은 문자열들에서 엔진을 만든다. 출처가 보존된다. */
+/// Keeps each source's name.
 pub fn build_from_named(
     sources: &[(String, String)],
     extra_allow: &str,
@@ -1200,12 +1134,10 @@ pub fn build_from_named(
 }
 
 #[cfg(test)]
-/** @brief 형식별 파싱, 수식어 우선순위, 그리고 실패 시 열리지 않는지. */
 mod tests {
     use super::*;
     use onetdns_core::{ClientInfo, FilterEngine, FilterVerdict, Transport};
 
-    /** @brief 엔진에 이름 하나를 물어 판정을 얻는다. */
     fn verdict(engine: &BlockEngine, q: &str) -> FilterVerdict {
         let client = ClientInfo {
             source_ip: "127.0.0.1".parse().unwrap(),
@@ -1217,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 서버와 무관한 브라우저 전용 수식어를 적용 대상 아님으로 분류하는지. 오류로 세면 보고가 쓸모없어진다. */
+    /// Counting them as errors would make the report useless.
     fn network_modifiers_classified_not_applicable() {
         let text = "\
 ||ads.example.com^$third-party
@@ -1237,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규칙이 어느 목록에서 왔는지 추적되는지. 어떤 목록 때문에 막혔는지 알려면 필요하다. */
+    /// Needed to show which list blocked a name.
     fn per_list_source_tracking() {
         let eng = build_from_named(
             &[
@@ -1275,7 +1207,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 타입 부정이 나열한 것만 빼고 막는지. */
     fn dnstype_negation_blocks_except_listed() {
         let eng = build_from_str("||tracker.test^$dnstype=~A\n", "", BlockResponse::NxDomain);
         let q = |name: &str, qt: RecordType| {
@@ -1309,7 +1240,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 형식이 섞인 목록을 읽는지. */
     fn parses_mixed_formats() {
         let block = "\
 # comment
@@ -1341,7 +1271,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 중요 표시가 허용 규칙을 이기는지. */
     fn important_modifier() {
         let eng = build_from_str(
             "||ads.example.com^$important\n",
@@ -1359,7 +1288,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 취소 규칙이 대상 규칙을 꺼 주는지. */
     fn badfilter_disables_rule() {
         let eng = build_from_str(
             "||example.com^\n||example.com^$badfilter\n",
@@ -1373,7 +1301,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 재작성 규칙이 주소를 지정하는지. */
     fn dnsrewrite_to_ip() {
         let eng = build_from_str(
             "||rw.example.com^$dnsrewrite=1.2.3.4\n",
@@ -1387,7 +1314,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 규칙의 재작성. */
     fn regex_dnsrewrite_to_ip() {
         let eng = build_from_str(
             "/^[a-z0-9]{32}\\.t\\.e\\.s\\.t\\.onetwohour\\.com$/$dnsrewrite=158.247.221.46\n",
@@ -1416,7 +1342,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 재작성의 응답 코드 지정. */
     fn regex_dnsrewrite_status_values() {
         let eng = build_from_str(
             "/^rf\\./$dnsrewrite=REFUSED\n/^nd\\./$dnsrewrite=NODATA\n/^nx\\./$dnsrewrite=NXDOMAIN\n",
@@ -1438,7 +1363,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 허용 규칙. */
     fn regex_allow_rule_with_at_at() {
         let eng = build_from_str(
             "||metrics.example.com^\n",
@@ -1462,7 +1386,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 중요 표시가 일반 허용을 이기는지. */
     fn regex_important_beats_plain_allow() {
         let eng = build_from_str(
             "/banner\\./$important\n",
@@ -1476,7 +1399,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 규칙의 타입 제한이 나열한 것만 막는지. */
     fn regex_dnstype_blocks_only_listed() {
         let eng = build_from_str("/^svc\\./$dnstype=HTTPS\n", "", BlockResponse::NxDomain);
         let client = ClientInfo {
@@ -1492,7 +1414,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 규칙의 타입 부정. */
     fn regex_dnstype_negation() {
         let eng = build_from_str("/^svc\\./$dnstype=~A\n", "", BlockResponse::NxDomain);
         let client = ClientInfo {
@@ -1508,7 +1429,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 대역 표기가 든 클라이언트 수식어가 정규식과 섞여도 갈리는지. */
     fn regex_client_modifier_with_cidr_slash() {
         let eng = build_from_str("/^cam\\./$client=10.0.0.0/8\n", "", BlockResponse::NxDomain);
         let q = |ip: &str| {
@@ -1529,7 +1449,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 정규식 규칙의 취소. */
     fn regex_badfilter_cancels_rule() {
         let eng = build_from_str(
             "/^ads\\./\n/^ads\\./$badfilter\n",
@@ -1543,7 +1462,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 지원하지 않는 수식어가 보고에 남는지. */
     fn regex_unsupported_modifier_reported() {
         let eng = build_from_str("/^x\\./$removeparam=id\n", "", BlockResponse::NxDomain);
         let r = eng.load_report();
@@ -1556,7 +1474,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 규칙 검증이 사유를 알려 주는지. 대시보드가 이것을 보여 준다. */
     fn validate_rule_reports_reasons() {
         assert!(validate_rule("||ads.example.com^").is_ok());
         assert!(validate_rule("@@||example.com^$important").is_ok());
@@ -1584,11 +1501,8 @@ analytics.bad
     }
 
     #[test]
-    /**
-     * @brief 구독 목록의 규칙이 그 목록 이름을 출처로 남기는지.
-     * @details 캐시 파일에서 읽든 메모리의 줄에서 읽든 같아야 하고, 목록에 속하지 않는
-     *          추가 규칙은 출처가 없어야 한다. 그래야 질의 기록이 목록을 잘못 지목하지 않는다.
-     */
+    /// Whether read from a cache file or from lines in memory; extra rules outside any list have no
+    /// source. Otherwise the query log would name the wrong list.
     fn subscription_rules_keep_their_list_as_source() {
         let path =
             std::env::temp_dir().join(format!("onetdns-filter-extra-{}.list", std::process::id()));
@@ -1632,7 +1546,7 @@ analytics.bad
     }
 
     #[test]
-    /** @brief UTF-8이 아닌 파일이 규칙을 하나도 적용하기 전에 거부되는지. 절반만 적용되면 안 된다. */
+    /// A half-applied file must not happen.
     fn invalid_utf8_file_is_rejected_before_any_rule_is_applied() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-filter-invalid-utf8-{}.list",
@@ -1651,7 +1565,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 지나치게 긴 줄이 있으면 그 파일 전체를 적용하지 않는지. */
     fn oversized_rule_line_is_rejected_before_any_rule_is_applied() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-filter-oversized-line-{}.list",
@@ -1672,7 +1585,7 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 설정된 파일을 읽지 못하면 차단이 열리지 않고 실패하는지. 열리면 필터가 조용히 사라진다. */
+    /// Otherwise the filter would silently disappear.
     fn configured_filter_files_cannot_fail_open() {
         let missing = std::env::temp_dir().join(format!(
             "onetdns-filter-missing-{}-{}.list",
@@ -1697,7 +1610,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 재작성의 데이터 없음이 빈 정상 응답이 되는지. */
     fn dnsrewrite_nodata_is_empty_noerror() {
         for rule in [
             "$dnsrewrite=NODATA",
@@ -1720,12 +1632,9 @@ analytics.bad
     }
 
     #[test]
-    /**
-     * @brief NORESPONSE 재작성이 이름 규칙과 정규식 규칙 모두에서 무응답 판정이 되는지.
-     * @details 값은 다른 응답 코드처럼 대소문자를 가리지 않는다. 규칙 검증이 거절하면
-     *          대시보드에서 이 규칙을 넣을 수 없고, badfilter 가 빼지 못하면 구독 목록에 든
-     *          규칙을 끌 방법이 없다.
-     */
+    /// The value is case-insensitive like the other response codes. If rule validation rejected it,
+    /// the dashboard could not add the rule; if badfilter could not remove it, a rule in a
+    /// subscribed list could not be turned off.
     fn dnsrewrite_noresponse_drops_names_and_patterns() {
         let rules = "\
 ||quiet.example^$dnsrewrite=NORESPONSE
@@ -1753,7 +1662,6 @@ analytics.bad
     }
 
     #[test]
-    /** @brief 로드 보고가 적용과 건너뜀을 모아 주는지. */
     fn load_report_aggregates_applied_and_skipped() {
         let text = "\
 # comment ignored
@@ -1783,7 +1691,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief RPZ 주소 표기를 두 계열 모두 읽는지. */
     fn rpz_ip_decoder_v4_and_v6() {
         let n = rpz_ip_to_net("32.3.2.1.10").unwrap();
         assert!(n.contains(&"10.1.2.3".parse().unwrap()));
@@ -1803,7 +1710,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief RPZ 주소 규칙이 실제로 걸리는지. */
     fn rpz_ip_triggers_parsed() {
         let mut parts = EngineParts::default();
         parse_rpz_text(
@@ -1849,7 +1755,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief RPZ의 별표 별칭이 데이터 없음으로 해석되는지. */
     fn rpz_wildcard_cname_is_nodata() {
         let mut parts = EngineParts::default();
         parse_rpz_text("nd.example.com CNAME *.\n", &mut parts);
@@ -1861,7 +1766,7 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 클라이언트 수식어가 없는 질의에서는 그 규칙이 걸리지 않는지. */
+    /// A `$client` rule does not block other clients.
     fn client_modifier_skipped() {
         let eng = build_from_str(
             "||x.example.com^$client=10.0.0.0/8\n",
@@ -1874,7 +1779,6 @@ $dnsrewrite=NXDOMAIN
         ));
     }
 
-    /** @brief 주어진 클라이언트 정보로 판정한다. */
     fn verdict_from(engine: &BlockEngine, q: &str, ip: &str, id: Option<&str>) -> FilterVerdict {
         let client = ClientInfo {
             source_ip: ip.parse().unwrap(),
@@ -1886,7 +1790,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 클라이언트 수식어가 맞는 클라이언트에만 걸리는지. */
     fn client_modifier_targets_matching_client() {
         let eng = build_from_str(
             "||ads.example.com^$client=10.0.0.0/8\n||t.example.com^$client=~10.1.1.1\n",
@@ -1913,7 +1816,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 클라이언트 식별자로도 걸리는지. */
     fn client_modifier_matches_client_id() {
         let eng = build_from_str(
             "||g.example.com^$client=kids-tablet\n",
@@ -1931,7 +1833,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 예외 수식어가 나열한 도메인을 빼 주는지. */
     fn denyallow_modifier_excepts_domains() {
         let eng = build_from_str(
             "||example.org^$denyallow=safe.example.org\n",
@@ -1953,7 +1854,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 클라이언트 태그로 걸리는지. */
     fn ctag_modifier_matches_client_tags() {
         let eng = build_from_str(
             "||game.example.com^$ctag=kids\n",
@@ -1986,7 +1886,6 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /** @brief 클라이언트 예외가 일반 차단을 이기는지. */
     fn client_rule_exception_wins() {
         let eng = build_from_str(
             "||news.example.com^\n@@||news.example.com^$client=10.0.0.5\n",
@@ -2004,11 +1903,8 @@ $dnsrewrite=NXDOMAIN
     }
 
     #[test]
-    /**
-     * @brief RPZ 소유자 이름의 범위와 특수 대상을 규격대로 읽는지.
-     * @details 정확한 소유자가 하위 도메인까지 덮으면 허용 규칙 하나가 영역 전체를 풀고,
-     *          rpz-drop 을 CNAME 으로 읽으면 차단해야 할 이름이 그 이름으로 해석된다.
-     */
+    /// If an exact owner covered subdomains, one allow rule would open the whole zone; if rpz-drop
+    /// were read as a CNAME, a name meant to be blocked would resolve to that name.
     fn rpz_owner_scope_and_special_targets() {
         let mut parts = EngineParts::default();
         let rpz = "\
@@ -2042,11 +1938,8 @@ tcp.example.com CNAME rpz-tcp-only.
     }
 
     #[test]
-    /**
-     * @brief rpz-drop 이 침묵하지 않고 운영자가 고른 차단 응답으로 답하는지.
-     * @details 받아 온 영역이 침묵을 고르게 두면 차단이 장애처럼 보인다. 고정된 응답을 쓰면 같은
-     *          차단인데도 목록 형식에 따라 클라이언트가 받는 답이 달라진다.
-     */
+    /// Silence chosen by a fetched zone makes a block look like an outage. A fixed response would
+    /// give clients different answers for the same block depending on the list format.
     fn rpz_drop_answers_with_the_configured_block_response() {
         let mut parts = EngineParts::default();
         parse_rpz_text("drop.example.com CNAME rpz-drop.\n", &mut parts);
@@ -2058,7 +1951,6 @@ tcp.example.com CNAME rpz-tcp-only.
     }
 
     #[test]
-    /** @brief 이 서버가 지원하는 RPZ 부분집합이 동작하는지. */
     fn rpz_subset() {
         let mut parts = EngineParts::default();
         let rpz = "\

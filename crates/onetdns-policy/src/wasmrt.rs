@@ -1,81 +1,58 @@
-/*!
- * @brief WASM 인터프리터.
- *
- * @details 정책 플러그인을 격리해 실행하려고 만들었다. JIT이 아니라 트리 순회 방식이라
- *          실행 가능 메모리를 만들지 않는다. 신뢰할 수 없는 코드를 돌리는 데 그 편이 안전하다.
- * @warning 전체가 신뢰할 수 없는 입력을 다룬다. 파싱 단계의 모든 상한은 방어 장치이며,
- *          느슨하게 풀면 짧은 모듈 하나로 메모리나 스택을 고갈시킬 수 있다.
- */
+//! WASM interpreter for policy plugins. It walks decoded instructions instead of compiling them, so
+//! it never creates executable memory, which is safer for untrusted code.
+//!
+//! Everything here handles untrusted input. Every parse-time limit is a defense; loosening one lets
+//! a short module exhaust memory or stack.
 
 use std::collections::HashMap;
 
-/** @brief WASM 선형 메모리 한 페이지의 크기. 명세가 정한 값이다. */
 const PAGE: usize = 65536;
 
-/** @brief 모듈 바이트열 크기 상한. */
 const MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
 
-/** @brief 함수 형식 개수 상한. */
 const MAX_TYPES: u32 = 16_384;
 
-/** @brief 함수 개수 상한. */
 const MAX_FUNCTIONS: u32 = 65_536;
 
-/** @brief 함수 하나의 매개변수 개수 상한. */
 const MAX_PARAMS: u32 = 1_024;
 
-/** @brief 자체 실행기가 지원하는 함수 반환값 개수. */
+/// The interpreter supports at most one result.
 const MAX_RESULTS: u32 = 1;
 
-/** @brief 테이블 원소 수 상한. */
 const MAX_TABLE_ELEMS: u32 = 65_536;
 
-/** @brief 전역 변수 개수 상한. */
 const MAX_GLOBALS: u32 = 65_536;
 
-/** @brief 데이터 세그먼트 총 바이트 상한. */
 const MAX_DATA_BYTES: usize = 16 * 1024 * 1024;
 
-/** @brief 데이터 세그먼트 개수 상한. 빈 조각으로 파서 시간을 늘리지 못하게 한다. */
+/// Stops empty segments from stretching parse time.
 const MAX_DATA_SEGMENTS: u32 = 4_096;
 
-/** @brief 내보내기 항목 수 상한. 이름 HashMap의 호스트 메모리를 묶는다. */
+/// Bounds host memory for the export name map.
 const MAX_EXPORTS: u32 = 4_096;
 
-/** @brief 모듈 전체의 디코딩된 명령 수 상한. 작은 opcode의 enum 팽창을 묶는다. */
+/// One-byte opcodes decode into much larger enum values, so the decoded total is capped.
 const MAX_DECODED_INSTRUCTIONS: usize = 262_144;
 
-/**
- * @brief 호출 깊이 상한.
- * @warning 인터프리터가 재귀라 이 값이 곧 호스트 스택 넘침 방어다. 게스트의 무한 재귀가
- *          연료보다 먼저 스택을 밀어내는 것을 막는다.
- */
+/// The interpreter recurses, so this is the host stack overflow defense: unbounded guest recursion
+/// would overflow the stack before fuel runs out.
 const MAX_CALL_DEPTH: usize = 128;
 
-/** @brief 함수 하나의 지역 변수 개수 상한. */
 const MAX_LOCALS_PER_FUNCTION: usize = 1_024;
 
-/** @brief 함수 프레임 하나의 실행 값 스택 상한. */
 const MAX_VALUE_STACK: usize = 4_096;
 
-/** @brief 함수 프레임 하나의 중첩 제어 라벨 상한. */
 const MAX_LABEL_STACK: usize = 1_024;
 
-/** @brief WASM 값. */
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
-    /** @brief 32비트 정수. */
     I32(i32),
-    /** @brief 64비트 정수. */
     I64(i64),
-    /** @brief 32비트 실수. */
     F32(f32),
-    /** @brief 64비트 실수. */
     F64(f64),
 }
 
 impl Value {
-    /** @brief 이 값의 WASM 형식. 로드·호출 경계의 형식 검증에 쓴다. */
     fn value_type(self) -> ValType {
         match self {
             Value::I32(_) => ValType::I32,
@@ -85,14 +62,12 @@ impl Value {
         }
     }
 
-    /** @brief i32로 꺼낸다. 다른 형식이면 오류다. */
     fn as_i32(self) -> Result<i32, String> {
         match self {
             Value::I32(v) => Ok(v),
             _ => Err("Invalid WASM value type; expected a 32-bit integer".into()),
         }
     }
-    /** @brief i64로 꺼낸다. 다른 형식이면 오류다. */
     fn as_i64(self) -> Result<i64, String> {
         match self {
             Value::I64(v) => Ok(v),
@@ -101,20 +76,15 @@ impl Value {
     }
 }
 
-/** @brief WASM 값 형식. ABI 검사에서 함수 서명을 대조하는 데 쓴다. */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
-    /** @brief 32비트 정수. */
     I32,
-    /** @brief 64비트 정수. */
     I64,
-    /** @brief 32비트 실수. */
     F32,
-    /** @brief 64비트 실수. */
     F64,
 }
 
-/** @brief 형식 바이트를 해석한다. 참조 형식 등 지원하지 않는 값은 거부한다. */
+/// Unsupported types, such as reference types, are rejected.
 fn val_type(b: u8) -> Result<ValType, String> {
     match b {
         0x7f => Ok(ValType::I32),
@@ -125,7 +95,6 @@ fn val_type(b: u8) -> Result<ValType, String> {
     }
 }
 
-/** @brief 형식의 0값. 지역 변수 초기화에 쓴다. */
 fn default_val(t: ValType) -> Value {
     match t {
         ValType::I32 => Value::I32(0),
@@ -135,113 +104,83 @@ fn default_val(t: ValType) -> Value {
     }
 }
 
-/** @brief 함수 서명. */
 #[derive(Debug)]
 struct FuncType {
-    /** @brief 받는 값들의 형. */
     params: Vec<ValType>,
-    /** @brief 돌려주는 값들의 형. */
     results: Vec<ValType>,
 }
 
-/**
- * @brief 디코딩된 명령.
- * @details 블록·루프·분기의 목표 위치를 파싱 시점에 미리 풀어 둔다. 실행 중에 매번
- *          짝을 찾아 훑으면 중첩이 깊은 코드에서 비용이 급격히 커진다.
- */
+/// Block, loop, and branch targets are resolved at parse time; searching for the matching end at
+/// run time gets expensive in deeply nested code.
 #[derive(Debug, Clone)]
 enum Instr {
-    /** @brief 여기 닿으면 덫에 걸린다. */
     Unreachable,
-    /** @brief 아무것도 하지 않는다. */
     Nop,
-    /** @brief 블록을 연다. */
-    Block { arity: u32, end: usize },
-    /** @brief 반복할 블록(loop)을 연다. */
-    Loop { arity: u32, end: usize },
-    /** @brief 조건이 참일 때의 블록. */
-    If {
-        /** @brief 이 블록이 남길 값의 수. */
+    Block {
         arity: u32,
-        /** @brief 거짓일 때 뛸 곳. */
-        else_: usize,
-        /** @brief 이 블록이 끝나는 위치. */
         end: usize,
     },
-    /** @brief 거짓일 때의 블록. */
-    Else { end: usize },
-    /** @brief 블록을 닫는다. */
+    Loop {
+        arity: u32,
+        end: usize,
+    },
+    If {
+        arity: u32,
+        else_: usize,
+        end: usize,
+    },
+    Else {
+        end: usize,
+    },
     End,
-    /** @brief 이만큼 바깥 블록으로 빠져나간다. */
     Br(u32),
-    /** @brief 조건이 참이면 빠져나간다. */
     BrIf(u32),
-    /** @brief 테이블에서 골라 빠져나간다. */
     BrTable(Vec<u32>, u32),
-    /** @brief 함수에서 돌아간다. */
     Return,
-    /** @brief 함수를 부른다. */
     Call(u32),
-    /** @brief 테이블을 거쳐 함수를 부른다. */
     CallIndirect(u32),
-    /** @brief 값 하나를 버린다. */
     Drop,
-    /** @brief 조건에 따라 둘 중 하나를 고른다. */
     Select,
-    /** @brief 지역 변수를 읽는다. */
     LocalGet(u32),
-    /** @brief 지역 변수에 쓴다. */
     LocalSet(u32),
-    /** @brief 지역 변수에 쓰면서 값도 남긴다. */
     LocalTee(u32),
-    /** @brief 전역 변수를 읽는다. */
     GlobalGet(u32),
-    /** @brief 전역 변수에 쓴다. */
     GlobalSet(u32),
-    /** @brief 메모리에서 읽는다. */
-    Load { op: u8, offset: u32 },
-    /** @brief 메모리에 쓴다. */
-    Store { op: u8, offset: u32 },
-    /** @brief 메모리 크기를 묻는다. */
+    Load {
+        op: u8,
+        offset: u32,
+    },
+    Store {
+        op: u8,
+        offset: u32,
+    },
     MemSize,
-    /** @brief 메모리를 늘린다. */
     MemGrow,
-    /** @brief 32비트 정수 상수. */
     I32Const(i32),
-    /** @brief 64비트 정수 상수. */
     I64Const(i64),
-    /** @brief 32비트 실수 상수. */
     F32Const(f32),
-    /** @brief 64비트 실수 상수. */
     F64Const(f64),
-    /** @brief 값 계산 명령. 번호가 어느 연산인지 구분한다. */
+    /// Numeric instruction; the opcode selects the operation.
     Num(u8),
 }
 
-/** @brief 모듈 바이트열을 훑는 커서. */
 struct Reader<'a> {
-    /** @brief 읽어 들일 바이트. */
     b: &'a [u8],
-    /** @brief 지금 위치. */
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    /** @brief 커서를 만든다. */
     fn new(b: &'a [u8]) -> Self {
         Reader { b, pos: 0 }
     }
-    /** @brief 끝까지 읽었는지. */
     fn done(&self) -> bool {
         self.pos >= self.b.len()
     }
-    /** @brief 1바이트를 읽는다. */
     fn byte(&mut self) -> Result<u8, String> {
         let v = *self.b.get(self.pos).ok_or("EOF")?;
         self.pos += 1;
         Ok(v)
     }
-    /** @brief n바이트를 빌린다. 범위를 넘으면 오류다. */
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .pos
@@ -251,10 +190,8 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
-    /**
-     * @brief LEB128 부호 없는 32비트를 읽는다.
-     * @warning 시프트 폭을 제한한다. 0x80이 계속 이어지는 입력이 무한 루프가 되지 않게 막는다.
-     */
+    /// Unsigned LEB128. The shift width is bounded, so an endless run of 0x80 bytes cannot loop
+    /// forever.
     fn u32(&mut self) -> Result<u32, String> {
         let mut r = 0u32;
         let mut shift = 0;
@@ -270,11 +207,11 @@ impl<'a> Reader<'a> {
             }
         }
     }
-    /** @brief LEB128 부호 있는 32비트를 읽는다. */
+    /// Signed LEB128.
     fn i32(&mut self) -> Result<i32, String> {
         Ok(self.i64()? as i32)
     }
-    /** @brief LEB128 부호 있는 64비트를 읽는다. 마지막 바이트의 부호 비트를 확장한다. */
+    /// Signed LEB128, sign-extended from the last byte.
     fn i64(&mut self) -> Result<i64, String> {
         let mut r = 0i64;
         let mut shift = 0u32;
@@ -293,19 +230,17 @@ impl<'a> Reader<'a> {
             }
         }
     }
-    /** @brief 32비트 실수 하나를 읽는다. */
     fn f32(&mut self) -> Result<f32, String> {
         let b = self.bytes(4)?;
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
-    /** @brief 64비트 실수 하나를 읽는다. */
     fn f64(&mut self) -> Result<f64, String> {
         let b = self.bytes(8)?;
         Ok(f64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
     }
-    /** @brief 길이 접두사가 붙은 UTF-8 이름을 읽는다. */
+    /// Length-prefixed UTF-8 name.
     fn name(&mut self) -> Result<String, String> {
         let n = self.u32()? as usize;
         let s = self.bytes(n)?;
@@ -313,78 +248,56 @@ impl<'a> Reader<'a> {
     }
 }
 
-/** @brief 디코딩된 함수: 서명 인덱스, 지역 변수 형식, 명령열. */
 struct Func {
-    /** @brief 이 함수의 형. */
     type_idx: u32,
-    /** @brief 지역 변수들의 형. */
     locals: Vec<ValType>,
-    /** @brief 이 함수의 명령들. */
     body: Vec<Instr>,
 }
 
-/** @brief 내보내기 종류. */
 #[derive(Clone, Copy)]
 enum ExportKind {
-    /** @brief 함수. */
     Func,
-    /** @brief 메모리. */
     Memory,
-    /** @brief 전역 변수. */
     Global,
-    /** @brief 함수 테이블. */
     Table,
 }
 
-/**
- * @brief 파싱된 WASM 모듈. 인스턴스와 달리 불변이며 여러 호출이 공유한다.
- * @details 모듈을 한 번만 파싱해 두는 것이 호출당 비용을 결정한다. 인스턴스는 메모리와
- *          전역만 새로 잡는다.
- */
+/// Parsed module: immutable and shared by all calls. Parsing once keeps per-call cost low; an
+/// instance only allocates memory and globals.
 pub struct Module {
-    /** @brief 이 플러그인에 쓰인 함수 형들. */
     types: Vec<FuncType>,
-    /** @brief 이 플러그인이 담은 함수들. */
     funcs: Vec<Func>,
-    /** @brief 함수마다의 형 번호. */
     func_types: Vec<u32>,
-    /** @brief 밖에 내놓은 이름들. */
     exports: HashMap<String, (ExportKind, u32)>,
-    /** @brief 처음 잡을 메모리 쪽 수. */
+    /// Initial size, in pages.
     mem_min: u32,
-    /** @brief 늘릴 수 있는 최대 쪽 수. */
+    /// Maximum size, in pages.
     mem_max: Option<u32>,
-    /** @brief 모듈 안에 선형 메모리 0번이 실제로 정의됐는지. */
+    /// Whether the module defines memory 0.
     memory_defined: bool,
-    /** @brief 전역 변수들의 형, 고칠 수 있는지, 처음 값. */
+    /// Type, mutability, and initial value of each global.
     globals: Vec<(ValType, bool, Value)>,
-    /** @brief 올리자마자 부를 함수. */
+    /// Function run at instantiation.
     start: Option<u32>,
-    /** @brief 테이블을 거쳐 부를 함수들. */
     table: Vec<Option<u32>>,
-    /** @brief 모듈 안에 함수 테이블 0번이 실제로 정의됐는지. */
+    /// Whether the module defines table 0.
     table_defined: bool,
-    /** @brief 메모리에 미리 채워 둘 자료. */
+    /// Segments copied into memory at instantiation.
     data: Vec<(u32, Vec<u8>)>,
 }
 
 impl Module {
-    /** @brief 이 이름의 내보내기가 있는지. 종류는 보지 않는다. */
+    /// Ignores the export kind.
     pub fn has_export(&self, name: &str) -> bool {
         self.exports.contains_key(name)
     }
 
-    /** @brief 이 이름으로 메모리 0번을 내보내는지. 호스트가 문맥을 쓸 대상이다. */
+    /// Whether `name` exports memory 0, which the host writes the context into.
     pub fn has_memory_export(&self, name: &str) -> bool {
         self.memory_defined && matches!(self.exports.get(name), Some((ExportKind::Memory, 0)))
     }
 
-    /**
-     * @brief 내보낸 함수의 서명을 돌려준다.
-     * @details 로드 시점 ABI 검사가 이걸 쓴다. 함수 인덱스는 가져오기 개수를 뺀 뒤 지역
-     *          정의 배열을 가리킨다. 이 보정을 빼먹으면 엉뚱한 함수의 서명을 본다.
-     * @return 함수가 아니거나 인덱스가 범위를 벗어나면 None.
-     */
+    /// Signature of an exported function, for the load-time ABI check.
     pub fn func_export_signature(&self, name: &str) -> Option<(&[ValType], &[ValType])> {
         let idx = match self.exports.get(name)? {
             (ExportKind::Func, idx) => *idx,
@@ -395,13 +308,9 @@ impl Module {
         Some((&ftype.params, &ftype.results))
     }
 
-    /**
-     * @brief WASM 바이너리를 파싱한다.
-     * @details 매직과 버전을 먼저 확인하고 섹션을 순서대로 읽는다. 각 섹션은 자기 개수
-     *          상한을 검사한다. 개수를 그대로 믿고 미리 할당하면 몇 바이트짜리 모듈이
-     *          거대한 벡터를 만든다.
-     * @return 신뢰할 수 없는 입력이므로 어떤 형태로 깨져 있어도 패닉하지 않고 오류를 돌려준다.
-     */
+    /// Checks magic and version, then reads sections in order, each checking its own count cap;
+    /// trusting a count and preallocating would let a module of a few bytes build a huge vector.
+    /// Any malformed module returns an error, never a panic.
     pub fn parse(bytes: &[u8]) -> Result<Module, String> {
         if bytes.len() > MAX_MODULE_BYTES {
             return Err("WASM module is too large".into());
@@ -512,7 +421,7 @@ impl Module {
         Ok(m)
     }
 
-    /** @brief 디코딩된 인덱스와 정의가 런타임이 지원하는 모듈 의미에 맞는지 검사한다. */
+    /// Checks that decoded indexes and definitions match the module semantics the runtime supports.
     fn validate_semantics(&self) -> Result<(), String> {
         for (kind, idx) in self.exports.values() {
             let valid = match kind {
@@ -600,7 +509,6 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 타입 섹션. 함수 서명 목록이다. */
     fn parse_types(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_TYPES {
@@ -631,10 +539,7 @@ impl Module {
         Ok(())
     }
 
-    /**
-     * @brief 가져오기 섹션.
-     * @note 호스트 기능을 하나도 노출하지 않으므로 빈 섹션 외에는 전부 거부한다.
-     */
+    /// No host functions are exposed, so anything but an empty section is rejected.
     fn parse_imports(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n != 0 {
@@ -643,7 +548,6 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 테이블 섹션. call_indirect의 대상 표다. */
     fn parse_tables(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > 1 {
@@ -663,7 +567,7 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 메모리 섹션. 선형 메모리 하나만 허용한다. */
+    /// Only one linear memory.
     fn parse_memory(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > 1 {
@@ -681,7 +585,6 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 전역 섹션. 형식·가변성·초기값을 읽는다. */
     fn parse_globals(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_GLOBALS {
@@ -700,7 +603,6 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 내보내기 섹션. 호스트가 부를 수 있는 이름 테이블을 만든다. */
     fn parse_exports(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_EXPORTS {
@@ -724,7 +626,6 @@ impl Module {
         Ok(())
     }
 
-    /** @brief 원소 섹션. 테이블 항목을 함수 인덱스로 채운다. */
     fn parse_elements(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_TABLE_ELEMS {
@@ -755,10 +656,7 @@ impl Module {
         Ok(())
     }
 
-    /**
-     * @brief 데이터 섹션. 인스턴스 생성 시 메모리에 로드할 조각이다.
-     * @note 누적 바이트 상한을 검사한다. 세그먼트를 잘게 쪼개 상한을 우회하지 못하게 한다.
-     */
+    /// Caps the total bytes, so splitting segments cannot get around the limit.
     fn parse_data(&mut self, s: &mut Reader) -> Result<(), String> {
         let n = s.u32()?;
         if n > MAX_DATA_SEGMENTS {
@@ -793,7 +691,6 @@ impl Module {
     }
 }
 
-/** @brief 메모리·테이블의 최소/최대 한계를 읽는다. */
 fn read_limits(s: &mut Reader) -> Result<(u32, Option<u32>), String> {
     let flag = s.byte()?;
     if flag > 1 {
@@ -807,11 +704,8 @@ fn read_limits(s: &mut Reader) -> Result<(u32, Option<u32>), String> {
     Ok((min, max))
 }
 
-/**
- * @brief 상수 식을 평가한다. 전역 초기값과 세그먼트 오프셋에 쓴다.
- * @note 리터럴만 받는다. 다른 전역을 참조하는 형태는 거부한다. 초기화 순서에 의존하는
- *       모듈을 받아들이지 않는 편이 단순하고 안전하다.
- */
+/// Constant expressions for global initializers and segment offsets. Only literals: a reference to
+/// another global is refused, which keeps modules from depending on initialization order.
 fn eval_const_expr(s: &mut Reader, expected: ValType) -> Result<Value, String> {
     let op = s.byte()?;
     let v = match op {
@@ -834,11 +728,8 @@ fn eval_const_expr(s: &mut Reader, expected: ValType) -> Result<Value, String> {
     Ok(v)
 }
 
-/**
- * @brief 블록 타입에서 결과 개수를 읽는다.
- * @note 다중값 블록과 타입 인덱스 블록은 지원하지 않는다. 플러그인 ABI가 요구하지 않고,
- *       지원하지 않는 형태를 조용히 통과시키면 실행 중에 스택이 어긋난다.
- */
+/// Multi-value and type-index blocks are not supported: the plugin ABI does not need them, and
+/// letting an unsupported form through would misalign the stack at run time.
 fn blocktype_arity(s: &mut Reader) -> Result<u32, String> {
     let b = s.byte()?;
     match b {
@@ -848,13 +739,9 @@ fn blocktype_arity(s: &mut Reader) -> Result<u32, String> {
     }
 }
 
-/**
- * @brief 함수 본문을 명령열로 디코딩한다.
- * @details 제어 명령의 짝(end/else) 위치를 여기서 찾아 명령 안에 고정해 둔다. 실행 중에
- *          짝을 찾아 훑지 않아도 되므로 중첩이 깊어도 분기 비용이 일정하다.
- * @param nparams 매개변수 개수. 지역 변수 총량 상한 검사에 함께 들어간다.
- * @param instruction_budget 이 함수가 디코딩할 수 있는 남은 모듈 명령 수.
- */
+/// Resolves the matching end and else of each control instruction here and stores them in the
+/// instruction, so branch cost stays constant however deep the nesting. `nparams` counts toward the
+/// local limit; `instruction_budget` is what remains of the module's decoded instruction cap.
 fn decode_function(
     body: &[u8],
     nparams: usize,
@@ -966,7 +853,7 @@ fn decode_function(
             0x0e => {
                 let cnt = s.u32()? as usize;
 
-                /** @brief 분기 테이블에 담을 수 있는 대상 수. 없으면 짧은 플러그인으로 메모리를 잡게 만든다. */
+                /// Without it, a short plugin could allocate a huge table.
                 const MAX_BR_TABLE_TARGETS: usize = 65_536;
                 if cnt > MAX_BR_TABLE_TARGETS {
                     return Err("WASM br_table has too many targets".into());
@@ -1053,73 +940,50 @@ fn decode_function(
     Ok((locals, instrs))
 }
 
-/**
- * @brief 실행 중인 인스턴스: 모듈 하나에 대한 가변 상태.
- * @invariant fuel은 명령마다 줄고 0이 되면 트랩이다. call_depth는 상한을 넘지 않는다.
- */
+/// Mutable state for one module. `fuel` drops with every instruction and traps at 0; `call_depth`
+/// stays within `MAX_CALL_DEPTH`.
 pub struct Instance<'m> {
-    /** @brief 돌리고 있는 플러그인. */
     module: &'m Module,
-    /** @brief 이 실행의 메모리. */
     memory: Vec<u8>,
-    /** @brief 메모리를 늘릴 수 있는 한계. */
     mem_max_bytes: usize,
-    /** @brief 전역 변수 값들. */
     globals: Vec<Value>,
-    /** @brief 남은 연료. 0이 되면 덫에 걸린다. */
     fuel: u64,
-    /** @brief 겹쳐 부른 깊이. 상한이 없으면 스택이 넘친다. */
     call_depth: usize,
 }
 
-/** @brief 호출 프레임. 지역 변수와 실행 중인 함수. */
 struct Frame {
-    /** @brief 이 호출의 지역 변수들. */
     locals: Vec<Value>,
-    /** @brief 부른 함수 번호. */
     func_idx: u32,
 }
 
-/**
- * @brief 제어 흐름 라벨.
- * @details height는 이 라벨에 들어올 때의 값 스택 높이다. 분기할 때 스택을 그 높이로
- *          되돌려야 블록이 남긴 값이 새지 않는다. 루프는 목표가 자기 시작점이라 따로 구분한다.
- */
+/// `height` is the value stack height on entering the block. A branch cuts the stack back to it, so
+/// values the block pushed do not leak. A loop's target is its own start, hence `is_loop`.
 struct Label {
-    /** @brief 이 라벨로 분기할 때 보존할 값의 수. */
+    /// Values kept when branching to this label.
     arity: u32,
-    /** @brief 정상적으로 end에 닿았을 때 이 블록이 남길 값의 수. */
+    /// Values the block leaves when it reaches end normally.
     end_arity: u32,
-    /** @brief 이 블록에 들어올 때의 값 스택 높이. */
     height: usize,
-    /** @brief 여기서 빠져나갈 곳. */
     target: usize,
-    /** @brief 반복하는 블록(loop)인지. 그러면 처음으로 돌아간다. */
     is_loop: bool,
 }
 
-/**
- * @brief 인스턴스에서 회수한 재사용 가능 상태.
- * @details 메모리와 전역 벡터의 할당만 재사용한다. 내용은 인스턴스를 만들 때 전부
- *          초기화되므로 이전 호출의 값이 다음 호출로 새지 않는다.
- */
+/// Allocations reclaimed from an instance; only the memory and globals buffers are reused. Their
+/// contents are reset when an instance is built, so values from one call never reach the next.
 #[derive(Default)]
 pub struct InstanceState {
-    /** @brief 다시 쓰려고 남겨 둔 메모리. */
     memory: Vec<u8>,
-    /** @brief 다시 쓰려고 남겨 둔 전역 변수들. */
     globals: Vec<Value>,
 }
 
 impl InstanceState {
-    /** @brief 보관 중인 메모리 용량. 너무 크면 풀에 되돌리지 않고 버린다. */
+    /// A state that grew too large is dropped instead of pooled.
     pub fn memory_capacity(&self) -> usize {
         self.memory.capacity()
     }
 }
 
 impl<'m> Instance<'m> {
-    /** @brief 상태를 새로 잡아 인스턴스를 만든다. */
     #[cfg(test)]
     pub fn instantiate(
         module: &'m Module,
@@ -1129,12 +993,9 @@ impl<'m> Instance<'m> {
         Self::instantiate_with(module, fuel, mem_max_bytes, InstanceState::default())
     }
 
-    /**
-     * @brief 재사용 상태 위에 인스턴스를 만든다.
-     * @details 메모리를 0으로 되돌린 뒤 데이터 세그먼트를 로드하고 전역을 초기값으로
-     *          되돌린다. 재사용해도 이전 호출의 흔적이 남지 않는 근거다.
-     * @param mem_max_bytes 메모리 상한. 초기 크기가 이를 넘으면 인스턴스를 만들지 않는다.
-     */
+    /// Builds an instance on a reused state: memory is zeroed, data segments loaded, and globals
+    /// reset, so reuse leaves no trace of earlier calls. Fails if the initial memory exceeds
+    /// `mem_max_bytes`.
     pub fn instantiate_with(
         module: &'m Module,
         fuel: u64,
@@ -1180,7 +1041,6 @@ impl<'m> Instance<'m> {
         Ok(inst)
     }
 
-    /** @brief 인스턴스를 해체해 재사용할 할당을 꺼낸다. */
     pub fn into_state(self) -> InstanceState {
         InstanceState {
             memory: self.memory,
@@ -1188,11 +1048,8 @@ impl<'m> Instance<'m> {
         }
     }
 
-    /**
-     * @brief 게스트 메모리에 쓴다.
-     * @warning 주소는 게스트가 준 값이라 신뢰할 수 없다. 덧셈부터 넘침을 검사하고 범위를
-     *          확인한다. 검사를 빠뜨리면 게스트가 호스트 메모리를 건드릴 수 있다.
-     */
+    /// The address comes from the guest and is untrusted: the addition is checked for overflow
+    /// before the range.
     pub fn write_mem(&mut self, addr: usize, data: &[u8]) -> Result<(), String> {
         let end = addr.checked_add(data.len()).ok_or("Address overflowed")?;
         if end > self.memory.len() {
@@ -1202,7 +1059,7 @@ impl<'m> Instance<'m> {
         Ok(())
     }
 
-    /** @brief 게스트 메모리를 읽는다. 범위 검사는 write_mem과 같다. */
+    /// Same range checks as `write_mem`.
     pub fn read_mem(&self, addr: usize, len: usize) -> Result<&[u8], String> {
         let end = addr
             .checked_add(len)
@@ -1212,7 +1069,6 @@ impl<'m> Instance<'m> {
             .ok_or("Memory read out of bounds".into())
     }
 
-    /** @brief 내보낸 함수의 인덱스. 함수가 아니면 None. */
     pub fn export_func(&self, name: &str) -> Option<u32> {
         match self.module.exports.get(name) {
             Some((ExportKind::Func, idx)) => Some(*idx),
@@ -1220,12 +1076,11 @@ impl<'m> Instance<'m> {
         }
     }
 
-    /** @brief 남은 연료. 0이면 예산 소진으로 트랩한 것이다. */
+    /// 0 means the call trapped on an exhausted budget.
     pub fn fuel_remaining(&self) -> u64 {
         self.fuel
     }
 
-    /** @brief 내보낸 함수를 이름으로 호출한다. */
     pub fn call_export(&mut self, name: &str, args: Vec<Value>) -> Result<Vec<Value>, String> {
         let idx = self
             .export_func(name)
@@ -1233,10 +1088,7 @@ impl<'m> Instance<'m> {
         self.invoke(idx, args)
     }
 
-    /**
-     * @brief 인덱스로 함수를 찾는다.
-     * @note import는 로드 단계에서 거부하므로 인덱스는 곧 지역 함수 배열의 인덱스다.
-     */
+    /// Imports are refused at load, so a function index is an index into the local functions.
     fn func(&self, idx: u32) -> Result<&'m Func, String> {
         self.module
             .funcs
@@ -1244,7 +1096,6 @@ impl<'m> Instance<'m> {
             .ok_or("WASM function index is out of range".into())
     }
 
-    /** @brief 함수 인덱스의 서명을 찾는다. */
     fn ftype(&self, idx: u32) -> Result<&'m FuncType, String> {
         let f = self.func(idx)?;
         self.module
@@ -1253,11 +1104,8 @@ impl<'m> Instance<'m> {
             .ok_or("WASM type index is out of range".into())
     }
 
-    /**
-     * @brief 함수를 호출한다. 프레임을 만들고 지역 변수를 0으로 채운다.
-     * @warning 깊이 상한을 먼저 확인한다. 인터프리터가 재귀라 이 검사가 호스트 스택
-     *          넘침을 막는 유일한 장치다.
-     */
+    /// Checks the depth limit first: the interpreter recurses, so this is the only guard against
+    /// host stack overflow.
     fn invoke(&mut self, idx: u32, args: Vec<Value>) -> Result<Vec<Value>, String> {
         if self.call_depth >= MAX_CALL_DEPTH {
             return Err("WASM call depth limit exceeded".into());
@@ -1291,12 +1139,9 @@ impl<'m> Instance<'m> {
         result
     }
 
-    /**
-     * @brief 함수 본문을 실행한다.
-     * @details 값 스택과 라벨 스택을 따로 둔다. 라벨은 블록 진입 시의 스택 높이를 가지고
-     *          있어, 분기할 때 그 높이로 되돌려 블록이 남긴 값이 새지 않게 한다.
-     * @note 명령마다 연료를 확인한다. 어느 명령에서 시작하든 예산을 넘길 수 없다.
-     */
+    /// Value and label stacks are separate. A label keeps the stack height at block entry, and a
+    /// branch cuts back to it so the block's values do not leak. Fuel is checked on every
+    /// instruction, so no starting point can exceed the budget.
     fn run(
         &mut self,
         mut frame: Frame,
@@ -1557,13 +1402,10 @@ impl<'m> Instance<'m> {
         Ok(out)
     }
 
-    /**
-     * @brief 라벨 depth만큼 바깥으로 분기한다.
-     * @details 라벨 arity만큼의 값을 떼어 두고 스택을 그 라벨의 높이로 자른 뒤 되돌려
-     *          놓는다. 이 절차가 없으면 블록 안에서 쌓은 중간값이 바깥으로 새어 나간다.
-     * @note 루프 라벨은 자기 자신을 남긴다. 다시 돌아올 목표이기 때문이다.
-     * @return 이어서 실행할 명령 위치.
-     */
+    /// Branches out `depth` labels: sets aside the label's arity values, cuts the stack to the
+    /// label's height, then puts them back; without that, intermediate values from inside the block
+    /// leak out. A loop label stays, since the branch returns to it. Returns the next instruction
+    /// index.
     fn do_branch(
         &self,
         depth: u32,
@@ -1598,11 +1440,8 @@ impl<'m> Instance<'m> {
         }
     }
 
-    /**
-     * @brief 메모리 로드 명령을 실행한다.
-     * @warning 주소는 게스트가 계산한 값이다. 폭마다 넘침과 범위를 확인해 트랩으로 돌린다.
-     *          여기서 검사를 놓치면 게스트가 호스트 메모리를 읽는다.
-     */
+    /// The address is computed by the guest. Every width checks overflow and range and traps; a
+    /// missed check would let the guest read host memory.
     fn exec_load(&self, op: u8, addr: usize) -> Result<Value, String> {
         let rd = |n: usize| -> Result<&[u8], String> {
             let end = addr.checked_add(n).ok_or("Address overflowed")?;
@@ -1663,7 +1502,7 @@ impl<'m> Instance<'m> {
         })
     }
 
-    /** @brief 메모리 저장 명령을 실행한다. 범위 검사는 로드와 같다. */
+    /// Same range checks as `exec_load`.
     fn exec_store(&mut self, op: u8, addr: usize, v: Value) -> Result<(), String> {
         let wr = |mem: &mut Vec<u8>, bytes: &[u8]| -> Result<(), String> {
             let end = addr.checked_add(bytes.len()).ok_or("Address overflowed")?;
@@ -1701,24 +1540,20 @@ impl<'m> Instance<'m> {
     }
 }
 
-/** @brief 스택에서 i32를 꺼낸다. 비었거나 형식이 다르면 트랩이다. */
+/// Traps when the stack is empty or the type differs.
 fn pop_i32(s: &mut Vec<Value>) -> Result<i32, String> {
     s.pop()
         .ok_or("Stack underflow".into())
         .and_then(Value::as_i32)
 }
-/** @brief 스택에서 i64를 꺼낸다. */
 fn pop_i64(s: &mut Vec<Value>) -> Result<i64, String> {
     s.pop()
         .ok_or("Stack underflow".into())
         .and_then(Value::as_i64)
 }
 
-/**
- * @brief 수치 연산 명령을 실행한다.
- * @note 0으로 나누기와 i32::MIN / -1 같은 넘침은 명세대로 트랩이다. Rust의 기본 나눗셈을
- *       그대로 쓰면 그 자리에서 패닉하므로 반드시 먼저 걸러야 한다.
- */
+/// Division by zero and overflow such as i32::MIN / -1 trap as the spec requires. Rust's plain
+/// division panics there, so they are filtered first.
 fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
     macro_rules! i32_un {
         ($f:expr) => {{
@@ -1927,11 +1762,9 @@ fn exec_num(op: u8, s: &mut Vec<Value>) -> Result<(), String> {
 }
 
 #[cfg(test)]
-/** @brief 계산과 분기, 연료 상한, 그리고 잘못된 주소 접근이 패닉이 아닌 덫이 되는지. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 unsigned LEB128을 붙인다. */
     fn push_u32_leb(out: &mut Vec<u8>, mut value: u32) {
         loop {
             let mut byte = (value & 0x7f) as u8;
@@ -1946,7 +1779,7 @@ mod tests {
         }
     }
 
-    /** @brief NOP 명령 수를 정확히 정한 최소 모듈. */
+    /// Minimal module with exactly `instructions` NOPs.
     fn nop_module(instructions: usize) -> Vec<u8> {
         let mut module = b"\0asm\x01\0\0\0".to_vec();
         module.extend_from_slice(&[1, 4, 1, 0x60, 0, 0]);
@@ -1965,7 +1798,6 @@ mod tests {
         module
     }
 
-    /** @brief 이 플러그인을 돌려 결과를 받는다. */
     fn run_eval(wat: &str, args: &[Value]) -> Result<Vec<Value>, String> {
         let wasm = wat::parse_str(wat).unwrap();
         let m = Module::parse(&wasm)?;
@@ -1974,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 표준 섹션 중복·알 수 없는 ID·남은 payload를 조용히 받지 않는지. */
+    /// Duplicate standard sections, unknown IDs, and leftover payload are not accepted silently.
     fn malformed_section_envelopes_are_rejected() {
         let header = b"\0asm\x01\0\0\0";
         let mut duplicate = header.to_vec();
@@ -2022,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief export/start/예약 필드가 존재하는 정의와 정확히 맞아야 하는지. */
+    /// Export, start, and reserved fields must match existing definitions.
     fn malformed_module_semantics_are_rejected_on_load() {
         let header = b"\0asm\x01\0\0\0";
 
@@ -2102,14 +1934,14 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 바이트 명령이 디코딩 뒤 큰 enum 벡터로 팽창하지 못하는지. */
+    /// One-byte instructions cannot blow up into a large enum vector after decoding.
     fn decoded_instruction_count_is_bounded() {
         assert!(Module::parse(&nop_module(MAX_DECODED_INSTRUCTIONS - 1)).is_ok());
         assert!(Module::parse(&nop_module(MAX_DECODED_INSTRUCTIONS)).is_err());
     }
 
     #[test]
-    /** @brief 실행할 수 없는 import를 호환 명목으로 로드하지 않는지. */
+    /// Imports that cannot run are not loaded for compatibility's sake.
     fn imports_are_rejected() {
         let mut module = b"\0asm\x01\0\0\0".to_vec();
         let mut payload = Vec::new();
@@ -2121,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 선형 메모리 밖의 호스트 값 스택도 요청 단위 상한을 갖는지. */
+    /// The host value stack outside linear memory has a per-call cap too.
     fn execution_value_stack_is_bounded() {
         let mut wat = String::from("(module (func (export \"f\") (result i32) ");
         for _ in 0..4_097 {
@@ -2135,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재귀 호출마다 복제되는 local 벡터가 함수 하나에서 과대해지지 않는지. */
+    /// The locals vector, copied on every recursive call, stays small per function.
     fn function_local_count_is_tightly_bounded() {
         let mut wat = String::from("(module (func (export \"f\") (result i32) (local");
         for _ in 0..1_025 {
@@ -2147,7 +1979,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 사칙연산과 비교. */
     fn arithmetic_and_compare() {
         let wat = r#"(module (func (export "f") (param i32 i32) (result i32)
             (i32.add (local.get 0) (i32.mul (local.get 1) (i32.const 3)))))"#;
@@ -2158,7 +1989,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 분기와 반복. */
     fn if_else_and_loop_sum() {
         let wat = r#"(module (func (export "f") (param $n i32) (result i32)
             (local $i i32) (local $acc i32)
@@ -2176,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief loop의 분기 arity와 정상 종료 result arity를 따로 보존하는지. */
+    /// A loop keeps its branch arity apart from its result arity at end.
     fn loop_result_arity_is_checked_at_end() {
         let wat = r#"(module (func (export "f") (result i32)
             (loop (result i32) (i32.const 7))))"#;
@@ -2184,7 +2014,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 메모리 읽고 쓰기와 전역 값. */
     fn memory_store_load_and_globals() {
         let wat = r#"(module (memory (export "memory") 1)
             (global $g (mut i32) (i32.const 100))
@@ -2199,7 +2028,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 연료가 떨어지면 덫에 걸리는지. */
     fn fuel_exhaustion_traps() {
         let wat = r#"(module (func (export "f") (result i32)
             (loop $l (br $l)) (i32.const 1)))"#;
@@ -2210,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 범위를 넘는 주소 접근이 패닉이 아니라 덫이 되는지. 패닉하면 질의 하나가 이 서버를 흔든다. */
+    /// A panic here would let one query take down the server.
     fn load_at_overflowing_address_traps_not_panics() {
         let wat = r#"(module (memory 1) (func (export "f") (result i32)
             (i32.load (i32.const -1))))"#;
@@ -2218,7 +2046,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블을 거친 호출. */
     fn call_indirect_dispatch() {
         let wat = r#"(module
             (table 2 funcref) (elem (i32.const 0) $a $b)
@@ -2238,7 +2065,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief call_indirect가 매개변수 개수만 같은 다른 형식의 함수를 실행하지 않는지. */
+    /// call_indirect does not run a function of another type that only has the same parameter
+    /// count.
     fn call_indirect_requires_the_exact_function_type() {
         let wat = r#"(module
             (type $expected (func (param i32) (result i32)))
@@ -2252,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief signed division의 유일한 표현 범위 넘침이 값 반환이 아니라 trap인지. */
+    /// The one overflow of signed division traps instead of returning a value.
     fn signed_division_overflow_traps() {
         let i32_wat = r#"(module (func (export "f") (result i32)
             (i32.div_s (i32.const -2147483648) (i32.const -1))))"#;
@@ -2263,7 +2091,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 바이트가 다르면 거부하는지. */
     fn bad_magic_rejected() {
         assert!(Module::parse(b"not wasm at all").is_err());
     }

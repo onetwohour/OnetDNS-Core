@@ -7,45 +7,31 @@ use std::sync::Mutex;
 use crate::wasmrt::{Instance, InstanceState, Module, ValType, Value};
 use crate::{Action, PolicyError, PolicyInput, ResponseInput, ResponseVerdict};
 
-/**
- * @brief 플러그인 호출 하나가 쓸 수 있는 명령 예산.
- * @warning 이 상한이 없으면 무한 루프를 담은 플러그인 하나가 워커를 영구히 붙든다.
- *          소진되면 트랩이 나고 실패 모드 정책이 적용된다.
- * @note 대표 정책의 최장 테스트 분기는 62 fuel이다. 이 값은 800배 이상의 여유를 둔다.
- */
+/// Instruction budget for one plugin call; without it, a plugin that loops forever holds a worker
+/// forever. Running out traps, and the failure mode applies.
 const FUEL_LIMIT: u64 = 50_000;
 
-/** @brief 플러그인 선형 메모리 상한. 정책 문맥 처리에 충분한 2 MiB로 요청별 메모리를 묶는다. */
+/// Linear memory cap per call; enough for the policy context.
 const MEM_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/** @brief 재사용을 위해 보관할 인스턴스 상태 수. */
 const STATE_POOL_MAX: usize = 4;
 
-/**
- * @brief 재사용 대상으로 남길 인스턴스 메모리의 상한.
- * @details 크게 자란 상태는 되돌려 받지 않고 버린다. 그러지 않으면 한 번의 큰 호출이
- *          키워 놓은 메모리를 플러그인 수명 내내 붙잡고 있게 된다.
- */
+/// States whose memory grew past this are dropped instead of pooled; otherwise one large call would
+/// keep its memory for the plugin's lifetime.
 const STATE_POOL_RETAIN_MEM_MAX: usize = 2 * 1024 * 1024;
 
-/**
- * @brief 플러그인이 실패했을 때의 처리 방식.
- * @details 기본은 거절(fail-closed)이다. 정책이 판단하지 못한 질의를 통과시키는 것은
- *          정책을 껐다는 뜻이므로, 운영자가 명시적으로 open을 고를 때만 통과시킨다.
- */
+/// What a plugin failure does. The default refuses (fail-closed): passing queries the policy could
+/// not judge amounts to turning the policy off, so that happens only when the operator picks open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureMode {
-    /** @brief 실패를 무시하고 통과시킨다. 가용성을 정확성보다 앞세우는 선택이다. */
+    /// Pass despite the failure, trading correctness for availability.
     Open,
-    /** @brief 차단으로 처리한다. */
     ClosedBlock,
-    /** @brief REFUSED로 처리한다. 기본값이다. */
     #[default]
     ClosedRefuse,
 }
 
 impl FailureMode {
-    /** @brief 실패 시 적용할 질의 판정. */
     fn action(self) -> Action {
         match self {
             FailureMode::Open => Action::Continue,
@@ -54,7 +40,6 @@ impl FailureMode {
         }
     }
 
-    /** @brief 실패 시 적용할 응답 판정. */
     fn response_verdict(self) -> ResponseVerdict {
         match self {
             FailureMode::Open => ResponseVerdict::Pass,
@@ -63,7 +48,6 @@ impl FailureMode {
         }
     }
 
-    /** @brief 설정 문자열을 실패 모드로 바꾼다. 알 수 없는 값은 오류다. */
     pub fn parse(s: &str) -> Result<FailureMode, PolicyError> {
         let mode = match s {
             "closed-block" => FailureMode::ClosedBlock,
@@ -79,67 +63,47 @@ impl FailureMode {
     }
 }
 
-/** @brief 플러그인 실행 카운터. 잠금 없이 갱신되도록 전부 원자값이다. */
 #[derive(Debug, Default)]
 pub struct PluginMetrics {
-    /** @brief 부른 횟수. */
     pub eval_total: AtomicU64,
-    /** @brief 실패한 횟수. */
     pub error_total: AtomicU64,
 
-    /** @brief 연료 소진으로 끝난 횟수. 예산이 모자란 플러그인을 찾아내는 지표다. */
+    /// Calls that ran out of fuel; finds plugins whose budget is too small.
     pub timeout_total: AtomicU64,
-    /** @brief 막은 횟수. */
     pub block_total: AtomicU64,
 
-    /** @brief 걸린 시간의 합. */
     pub latency_us_total: AtomicU64,
 }
 
-/** @brief 카운터를 한 시점에서 읽은 값. */
 #[derive(Debug, Clone, Copy)]
 pub struct PluginMetricsSnapshot {
-    /** @brief 부른 횟수. */
     pub eval_total: u64,
-    /** @brief 실패한 횟수. */
     pub error_total: u64,
-    /** @brief 연료가 떨어진 횟수. */
+    /// Calls that ran out of fuel.
     pub timeout_total: u64,
-    /** @brief 막은 횟수. */
     pub block_total: u64,
-    /** @brief 걸린 시간의 합. */
     pub latency_us_total: u64,
 }
 
-/**
- * @brief WASM 정책 플러그인 하나.
- * @details 모듈은 한 번 파싱해 두고 호출마다 인스턴스를 만든다. 인스턴스 상태를 풀에
- *          모아 두어 재사용하므로, 호출마다 메모리를 새로 잡지 않는다.
- */
+/// One WASM policy plugin. The module is parsed once and instantiated per call; instance states are
+/// pooled, so calls do not allocate memory afresh.
 pub struct WasmPolicy {
-    /** @brief 올려 둔 플러그인. */
     module: Module,
-    /** @brief 로그와 대시보드에 보일 이름. */
+    /// Shown in logs and the dashboard.
     name: String,
-    /** @brief 실패했을 때의 처분. */
     fail_mode: FailureMode,
-    /** @brief 이 플러그인의 지표. */
     metrics: PluginMetrics,
-    /** @brief 다시 쓰려고 모아 둔 실행 상태들. */
     state_pool: Mutex<Vec<InstanceState>>,
-    /** @brief 응답 쪽에도 걸리는 플러그인인지. */
+    /// Whether the plugin exports on_response.
     response_hook: bool,
 }
 
 impl WasmPolicy {
-    /**
-     * @brief WASM 바이트열을 파싱하고 ABI를 검사한다.
-     *
-     * @details 필수 내보내기(memory, alloc, evaluate)의 형식까지 대조한다.
-     *          이름만 확인하면 형식이 다른 함수가 호출 시점에야 트랩을 내는데, 그때는
-     *          이미 질의 처리 중이라 실패 모드로 떨어진다. 로드 시점에 걸러야 한다.
-     * @note on_response는 선택이다. 있으면 형식을 검사하고, 없으면 응답 훅을 끈다.
-     */
+    /// Parses the module and checks the ABI, including the signatures of the required exports
+    /// (memory, alloc, evaluate). Checking names alone would let a mismatched function trap only
+    /// when called, mid-query, where it falls to the failure mode; it must be caught at load.
+    ///
+    /// on_response is optional: checked when present, otherwise the response hook is off.
     pub fn from_wasm(bytes: &[u8]) -> Result<Self, PolicyError> {
         let module = Module::parse(bytes).map_err(PolicyError::Wasm)?;
         if !module.has_memory_export("memory") {
@@ -187,29 +151,24 @@ impl WasmPolicy {
         })
     }
 
-    /** @brief 응답 훅을 내보내는 플러그인인지. */
     pub fn has_response_hook(&self) -> bool {
         self.response_hook
     }
 
-    /** @brief 로그·지표에 쓸 이름을 지정한다. */
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
-    /** @brief 실패 모드를 지정한다. 기본은 거절이다. */
     pub fn with_failure_mode(mut self, mode: FailureMode) -> Self {
         self.fail_mode = mode;
         self
     }
 
-    /** @brief 플러그인 이름. */
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /** @brief 현재 카운터 값. */
     pub fn metrics(&self) -> PluginMetricsSnapshot {
         PluginMetricsSnapshot {
             eval_total: self.metrics.eval_total.load(Ordering::Relaxed),
@@ -220,11 +179,8 @@ impl WasmPolicy {
         }
     }
 
-    /**
-     * @brief 질의를 평가하고 카운터를 갱신한다.
-     * @details 실행 오류·트랩·연료 소진은 모두 실패 모드로 합쳐진다. 플러그인 결함이
-     *          질의 처리 자체를 깨뜨리지 않게 하는 경계다.
-     */
+    /// Execution errors, traps, and fuel exhaustion all map to the failure mode, so a plugin defect
+    /// cannot break query handling.
     pub fn evaluate(&self, input: &PolicyInput) -> Action {
         let start = std::time::Instant::now();
         self.metrics.eval_total.fetch_add(1, Ordering::Relaxed);
@@ -248,13 +204,11 @@ impl WasmPolicy {
         action
     }
 
-    /**
-     * @brief 인스턴스를 만들어 evaluate를 호출한다.
-     * @note 남은 연료가 0인 채로 실패했으면 예산 소진으로 따로 센다. 다른 트랩과 구분해야
-     *       예산이 모자란 플러그인을 찾을 수 있다.
-     * @note 인스턴스 상태는 실패했더라도 풀에 되돌린다. 메모리는 다음 호출 시작에서
-     *       어차피 초기화되므로 재사용해도 값이 새지 않는다.
-     */
+    /// A failure with no fuel left counts as budget exhaustion, apart from other traps, so plugins
+    /// with too small a budget can be found.
+    ///
+    /// The instance state goes back to the pool even after a failure: memory is reset when the next
+    /// call starts, so nothing leaks between calls.
     fn try_eval(&self, input: &PolicyInput) -> Result<Action, String> {
         let state = {
             let mut pool = self.state_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -276,7 +230,6 @@ impl WasmPolicy {
         result
     }
 
-    /** @brief 응답을 평가한다. 훅이 없으면 곧바로 통과다. */
     pub fn evaluate_response(&self, input: &ResponseInput) -> ResponseVerdict {
         if !self.response_hook {
             return ResponseVerdict::Pass;
@@ -303,7 +256,6 @@ impl WasmPolicy {
         verdict
     }
 
-    /** @brief 인스턴스를 만들어 on_response를 호출한다. */
     fn try_eval_response(&self, input: &ResponseInput) -> Result<ResponseVerdict, String> {
         let state = {
             let mut pool = self.state_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,14 +277,12 @@ impl WasmPolicy {
         result
     }
 
-    /** @brief 응답 문맥에 담을 주소 개수 상한. 문맥 크기를 유계로 만든다. */
+    /// Bounds the response context size.
     const RESP_CTX_MAX_ADDRS: usize = 16;
 
-    /**
-     * @brief 응답 문맥을 게스트 ABI 배치로 직렬화한다.
-     * @details 전부 리틀엔디언이며, 이름과 주소 목록은 상한에서 잘린다. 상한이 없으면
-     *          거대한 응답 하나가 그만큼의 문맥을 게스트 메모리에 밀어 넣는다.
-     */
+    /// Serializes the response context in the guest ABI layout, all little-endian. The name and
+    /// address list are cut at their caps; without them, one huge response would push that much
+    /// context into guest memory.
     fn encode_response_context(input: &ResponseInput) -> Vec<u8> {
         let qname = input.qname.as_bytes();
         let qname = &qname[..qname.len().min(255)];
@@ -363,12 +313,9 @@ impl WasmPolicy {
         ctx
     }
 
-    /**
-     * @brief 게스트에 문맥을 써 넣고 on_response를 호출한다.
-     * @details 게스트의 alloc으로 메모리를 받아야 한다. 임의의 주소에 쓰면 게스트가
-     *          쓰고 있는 메모리를 덮는다.
-     * @return 모르는 반환 코드는 오류다. 실패 모드 정책이 적용된다.
-     */
+    /// Memory for the context must come from the guest's alloc; writing anywhere else would
+    /// overwrite memory the guest is using. An unknown return code is an error, so the failure mode
+    /// applies.
     fn eval_response_in(
         inst: &mut Instance,
         input: &ResponseInput,
@@ -400,24 +347,18 @@ impl WasmPolicy {
         }
     }
 
-    /**
-     * @brief 질의 문맥 ABI 버전.
-     * @warning 배치를 바꾸면 반드시 함께 올린다. 협상 절차가 없으므로 게스트는 이 값으로만
-     *          자기가 이해할 수 있는 문맥인지 판단한다.
-     */
+    /// Query context ABI version. Bump it with any layout change: there is no negotiation, so this
+    /// is the only way a guest knows whether it understands the context.
     const CTX_VERSION: u16 = 1;
 
-    /** @brief 문맥 안에서 클라이언트 주소가 시작되는 오프셋. */
+    /// Offset of the client address in the context.
     const CTX_ADDR: usize = 8;
 
-    /** @brief 가변 길이 뒷부분 앞까지의 고정 헤더 길이. */
+    /// Fixed header length before the variable-length tail.
     const CTX_HEADER_LEN: usize = 36;
 
-    /**
-     * @brief 질의 문맥을 게스트 ABI 배치로 직렬화한다.
-     * @details 리틀엔디언 고정 헤더 뒤에 이름과 클라이언트 ID가 붙는다. 둘 다 255옥텟에서
-     *          자른다.
-     */
+    /// Serializes the query context in the guest ABI layout: a little-endian fixed header, then the
+    /// name and client ID, each cut at 255 octets.
     fn encode_context(input: &PolicyInput) -> Vec<u8> {
         let qname = input.qname.as_bytes();
         let qname = &qname[..qname.len().min(255)];
@@ -450,11 +391,8 @@ impl WasmPolicy {
         ctx
     }
 
-    /**
-     * @brief 게스트에 문맥을 써 넣고 evaluate를 호출한다.
-     * @note 재작성(코드 4)은 게스트가 문맥 안의 클라이언트 주소 필드를 덮어써서 새 주소를
-     *       전달한다. 반환값 하나로 주소를 담을 방법이 없어 택한 방식이다.
-     */
+    /// A rewrite (code 4) passes its address by overwriting the client address field in the
+    /// context, since one return value cannot carry an address.
     fn eval_in(inst: &mut Instance, input: &PolicyInput) -> Result<Action, String> {
         let call_i32 = |inst: &mut Instance, name: &str, args: Vec<Value>| -> Result<i32, String> {
             match inst.call_export(name, args)?.first() {
@@ -481,11 +419,9 @@ impl WasmPolicy {
 }
 
 #[cfg(test)]
-/** @brief 플러그인 인터페이스를 지키지 않는 것을 올리지 않고, 연료 상한이 걸리는지. */
 mod tests {
     use super::*;
 
-    /** @brief 테스트용 정책 플러그인. */
     const POLICY_WAT: &str = r#"
         (module
           (memory (export "memory") 1)
@@ -526,7 +462,6 @@ mod tests {
                       (else (i32.const 0)))))))))
     "#;
 
-    /** @brief 테스트용 입력. */
     fn input<'a>(qname: &'a str, qtype: u16) -> PolicyInput<'a> {
         PolicyInput {
             client: "1.2.3.4".parse().unwrap(),
@@ -539,7 +474,6 @@ mod tests {
             authenticated: false,
         }
     }
-    /** @brief 클라이언트 주소가 붙은 테스트용 입력. */
     fn input_ip<'a>(qname: &'a str, qtype: u16, ip: &str) -> PolicyInput<'a> {
         PolicyInput {
             client: ip.parse().unwrap(),
@@ -554,7 +488,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 플러그인이 질의 종류로 막을 수 있는지. */
     fn wasm_policy_blocks_by_qtype() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -571,7 +504,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대표 정책의 모든 주요 분기가 작은 명령 예산 안에 머무는지. */
     fn representative_policy_fuel_usage_is_bounded() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -591,7 +523,7 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark: run with --release -- --ignored --nocapture"]
-    /** @brief 인스턴스 풀·문맥 복사·자체 실행기를 합친 대표 정책 종단 비용. */
+    /// End-to-end cost of the representative policy: instance pool, context copy, and interpreter.
     fn bench_representative_policy_evaluation() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let policy = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -613,7 +545,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 플러그인이 돌려준 주소를 읽는지. */
     fn wasm_rewrite_action_reads_ip_from_buffer() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -630,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief IPv6 클라이언트가 넘어가도 패닉하지 않는지. */
     fn wasm_ipv6_client_passed_without_panic() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -645,9 +575,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 끝나지 않는 플러그인이 연료 상한에 걸리는지. 없으면 질의 하나가 영영 안 끝난다. */
+    /// Without the cap, one query never finishes.
     fn infinite_loop_plugin_is_bounded_by_fuel_and_refused_by_default() {
-        /** @brief 끝나지 않는 테스트용 플러그인. */
         const LOOP_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -689,7 +618,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패 처분 표기를 읽는지. */
     fn failure_mode_parse() {
         assert_eq!(FailureMode::parse("open").unwrap(), FailureMode::Open);
         assert_eq!(
@@ -707,7 +635,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 플러그인이 질의 이름을 읽는지. */
     fn wasm_policy_reads_qname_bytes() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -720,7 +647,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다시 부를 때 앞 질의의 상태가 남지 않는지. */
     fn wasm_eval_reuses_module_without_state_leak() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -731,9 +657,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 재사용할 때 메모리가 처음 상태로 돌아가는지. 남으면 남의 질의 자료가 보인다. */
+    /// Leftover memory would expose another query's data.
     fn pooled_instance_reuse_resets_memory_and_data_segments() {
-        /** @brief 상태를 남기는 테스트용 플러그인. */
         const STATEFUL_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -760,7 +685,6 @@ mod tests {
         }
     }
 
-    /** @brief 맥락을 읽는 테스트용 플러그인. */
     const CONTEXT_WAT: &str = r#"
         (module
           (memory (export "memory") 1)
@@ -796,7 +720,6 @@ mod tests {
     "#;
 
     #[test]
-    /** @brief 전송·인증·식별자가 플러그인에 전해지는지. */
     fn evaluate_receives_transport_auth_and_client_id() {
         let wasm = wat::parse_str(CONTEXT_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -821,9 +744,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인터페이스와 다른 형태의 플러그인을 올릴 때 거부하는지. 부를 때 알면 이미 늦다. */
+    /// Finding out at call time is too late.
     fn evaluate_bad_signature_is_rejected_on_load() {
-        /** @brief 형태가 어긋난 테스트용 플러그인. */
         const BAD_SIGNATURE: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -835,9 +757,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 반환값을 그냥 통과로 보지 않는지. */
     fn unknown_return_code_triggers_fail_mode_not_continue() {
-        /** @brief 모르는 값을 돌려주는 테스트용 플러그인. */
         const BAD_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -866,9 +786,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 시각이 플러그인에 전해지는지. */
     fn evaluate_context_receives_unix_time() {
-        /** @brief 시각을 읽는 테스트용 플러그인. */
         const TIME_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -898,9 +816,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인자 수가 다른 함수를 거부하는지. */
     fn multi_argument_evaluate_signature_is_rejected() {
-        /** @brief 인자 수가 다른 테스트용 플러그인. */
         const BADSIG_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -913,14 +829,13 @@ mod tests {
     }
 
     #[test]
-    /** @brief 필요한 것을 다 갖추지 않은 플러그인을 거부하는지. */
     fn incomplete_module_is_rejected_on_load() {
         let wasm = wat::parse_str("(module (memory (export \"memory\") 1))").unwrap();
         assert!(WasmPolicy::from_wasm(&wasm).is_err());
     }
 
     #[test]
-    /** @brief 첫 질의에서만 실패할 초기 메모리와 data 범위를 로드 시점에 거부하는지. */
+    /// Initial memory and data ranges that would fail only on the first query are refused at load.
     fn impossible_initial_instance_is_rejected_on_load() {
         const TOO_LARGE: &str = r#"
             (module
@@ -941,16 +856,13 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보조 함수의 형태도 확인하는지. */
     fn invalid_alloc_and_response_signatures_are_rejected_on_load() {
-        /** @brief 슬롯 잡기 함수가 어긋난 테스트용 플러그인. */
         const BAD_ALLOC: &str = r#"
             (module
               (memory (export "memory") 1)
               (func (export "alloc") (param i64) (result i32) (i32.const 0))
               (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))
         "#;
-        /** @brief 응답 쪽 함수가 어긋난 테스트용 플러그인. */
         const BAD_RESPONSE: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -966,12 +878,10 @@ mod tests {
     }
 
     #[test]
-    /** @brief 깨진 바이트열을 올릴 때 오류가 나는지. */
     fn invalid_wasm_bytes_error_on_load() {
         assert!(WasmPolicy::from_wasm(b"not wasm").is_err());
     }
 
-    /** @brief 응답 쪽 테스트용 플러그인. */
     const RESP_WAT: &str = r#"
         (module
           (memory (export "memory") 1)
@@ -1002,7 +912,6 @@ mod tests {
     "#;
 
     #[test]
-    /** @brief 응답 쪽 플러그인이 답을 막을 수 있는지. */
     fn response_hook_blocks_private_answers() {
         let wasm = wat::parse_str(RESP_WAT).unwrap();
         let p = WasmPolicy::from_wasm(&wasm).unwrap();
@@ -1049,7 +958,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 규칙이 허용해도 플러그인의 차단을 건너뛰지 않는지. */
     fn rule_allow_does_not_bypass_plugin_block() {
         let wasm = wat::parse_str(POLICY_WAT).unwrap();
         let plugin = WasmPolicy::from_wasm(&wasm).unwrap();

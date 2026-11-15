@@ -1,28 +1,18 @@
-/*!
- * @brief 업스트림 전달: 평문·암호화 전송으로 질의를 넘긴다.
- *
- * @details 전송마다 별도 모듈(doh/dot/doq/doh3)이 있고, 이 파일이 업스트림 선택,
- *          단일 비행(single-flight), 소켓 풀, 통계 관리를 맡는다.
- * @warning 업스트림 응답의 AD 비트는 절대 그대로 넘기지 않는다. 이 서버가 검증하지 않은
- *          DNSSEC 진정성을 클라이언트에게 보증하는 꼴이 되기 때문이다.
- */
+//! Forwarding to upstreams over plain and encrypted transports. Each transport has its own module
+//! (doh, dot, doq, doh3); this file handles upstream selection, single-flight, socket pools, and
+//! stats.
+//!
+//! Never pass an upstream's AD bit through: that would vouch to clients for DNSSEC authenticity
+//! this server did not check.
 
-/**
- * @brief 출발 주소를 묶은 뒤 업스트림에 TCP로 잇는다.
- * @details std의 연결 함수는 로컬 주소를 먼저 묶을 방법이 없다. query_source를 정한
- *          다중 홈 호스트에서 TCP만 다른 경로로 나가면, 방화벽이 UDP 질의는 통과시키고 TC 뒤
- *          TCP 재시도와 암호화 업스트림은 막는다.
- */
+/// Binds the source address before connecting over TCP; std's connect cannot bind a local address
+/// first. On a multihomed host with query_source set, TCP leaving by another route lets a firewall
+/// pass UDP queries while blocking TCP retries after TC and encrypted upstreams.
 mod bound_tcp;
-/** @brief HTTP/2 위 DoH 업스트림. */
 mod doh;
-/** @brief HTTP/3 위 DoH3 업스트림. */
 mod doh3;
-/** @brief QUIC 위 DoQ 업스트림. */
 mod doq;
-/** @brief TLS 위 DoT 업스트림. */
 mod dot;
-/** @brief QUIC 상태 기계에 데이터그램을 전달하는 것. */
 mod quicdrive;
 
 use std::cell::RefCell;
@@ -37,30 +27,23 @@ pub use onetdns_proto::Message;
 use onetdns_proto::{Name, RData, RecordType, ResponseCode};
 pub use onetdns_tls::TrustStore;
 
-/** @brief 업스트림으로 나갈 때 바인딩할 출발 주소. 설정에서 지정한다. */
+/// Source addresses for upstream sockets, from config.
 static QUERY_SRC: RwLock<(Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)> =
     RwLock::new((None, None));
 
-/**
- * @brief 단일 비행을 묶는 키: 목적지 서버와 정규화한 질의 와이어.
- * @note 트랜잭션 ID와 (설정에 따라) 질의 이름 대소문자를 지운 형태로 비교한다. 그러지
- *       않으면 같은 질의가 매번 다른 키가 되어 단일 비행이 아무것도 묶지 못한다.
- */
+/// Single-flight key: destination server and normalized query wire, with the transaction ID cleared
+/// and, when configured, the question name's case folded. Otherwise the same query would get a new
+/// key every time and single-flight would group nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AuthorityQueryKey {
-    /** @brief 물어본 업스트림. */
     server: SocketAddr,
 
-    /** @brief 정규화한 질의 바이트. */
     normalized_wire: Arc<[u8]>,
 }
 
 impl AuthorityQueryKey {
-    /**
-     * @brief 와이어에서 키를 만든다.
-     * @param normalize_question_case 0x20 대소문자 인코딩을 쓰는 경우 대소문자를 지운다.
-     * @return 키 재료가 상한을 넘으면 None: 그 질의는 단일 비행에 묶지 않는다.
-     */
+    /// `normalize_question_case` folds case for 0x20 encoding. None when the key material exceeds
+    /// the limit; that query is not grouped.
     fn from_wire(server: SocketAddr, wire: &[u8], normalize_question_case: bool) -> Option<Self> {
         if wire.len() < 12 || wire.len() > MAX_AUTHORITY_FLIGHT_KEY_BYTES {
             return None;
@@ -96,7 +79,6 @@ impl AuthorityQueryKey {
         })
     }
 
-    /** @brief 파싱된 요청에서 키를 만든다. */
     fn from_request(
         server: SocketAddr,
         request: &Message,
@@ -127,26 +109,21 @@ impl AuthorityQueryKey {
     }
 }
 
-/**
- * @brief 진행 중인 업스트림 교환 하나. 같은 질의를 하는 후속 요청이 여기 붙어 기다린다.
- * @details 같은 이름을 동시에 묻는 요청이 업스트림으로 각각 나가면, 캐시가 비었을 때 업스트림에
- *          이 서버의 부하가 그대로 증폭돼 걸린다. 하나만 내보내고 결과를 나눠 갖는다.
- */
+/// One upstream exchange in progress; later requests for the same query wait on it. Sending each
+/// concurrent request for a name upstream would pass this server's load straight to the upstream
+/// when the cache is cold, so one goes out and the result is shared.
 struct AuthorityFlight {
-    /** @brief 다 되면 여기에 채운다. */
     result: Mutex<Option<Result<Message, ForwardError>>>,
-    /** @brief 기다리는 쪽을 깨우는 곳. */
     ready: Condvar,
 
-    /** @brief 지금 기다리는 수. 0이면 깨우지 않는다. */
+    /// No notify when 0.
     waiters: AtomicUsize,
 
-    /** @brief 밖으로 내보낸 스레드. 자기 자신을 기다리지 않으려고 본다. */
+    /// So the leader never waits on itself.
     leader_thread: std::thread::ThreadId,
 }
 
 impl AuthorityFlight {
-    /** @brief 비어 있는 비행을 만든다. */
     fn new() -> Self {
         Self {
             result: Mutex::new(None),
@@ -156,11 +133,7 @@ impl AuthorityFlight {
         }
     }
 
-    /**
-     * @brief 앞선 요청의 결과를 기다린다.
-     * @param timeout 이 시간을 넘기면 기다리지 않고 실패로 돌아간다. 선두 요청이 멎어도
-     *                뒤따르는 요청이 함께 묶여 멎지 않게 한다.
-     */
+    /// Gives up after `timeout`, so a stalled leader does not stall its followers.
     fn wait(&self, timeout: Duration) -> Result<Message, ForwardError> {
         let deadline = deadline_after(timeout);
         let mut result = self
@@ -186,7 +159,6 @@ impl AuthorityFlight {
         }
     }
 
-    /** @brief 결과를 채우고 기다리던 모두를 깨운다. */
     fn complete(&self, result: Result<Message, ForwardError>) {
         *self
             .result
@@ -199,51 +171,40 @@ impl AuthorityFlight {
     }
 }
 
-/** @brief 지금 나가 있는 같은 질의들. 하나만 내보내고 결과를 나눈다. */
 static AUTHORITY_FLIGHTS: OnceLock<Mutex<HashMap<AuthorityQueryKey, Arc<AuthorityFlight>>>> =
     OnceLock::new();
-/** @brief 동시에 추적할 비행 수 상한. 넘으면 새 질의는 묶지 않고 그대로 내보낸다. */
+/// Past this, new queries go out ungrouped.
 const MAX_AUTHORITY_FLIGHTS: usize = 1024;
 
-/** @brief 비행 키로 삼을 와이어 크기 상한. 큰 질의가 키 맵을 부풀리지 못하게 한다. */
+/// Keeps large queries from bloating the key map.
 const MAX_AUTHORITY_FLIGHT_KEY_BYTES: usize = 4_096;
 
 thread_local! {
 
-    /** @brief 이 스레드가 재사용하는 수신 버퍼. 질의마다 새로 잡지 않으려는 것이다. */
+    /// Reused per thread instead of allocated per query.
     static UDP_RECV_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; 65_535]);
 
-    /** @brief 이 스레드가 목적지별로 보관 중인 소켓들. */
     static UDP_SOCKET_POOL: RefCell<HashMap<SocketAddr, UdpSocketPool>> =
         RefCell::new(HashMap::new());
 }
 
-/** @brief 목적지별로 보관할 UDP 소켓 수. */
 const UDP_SOCKET_POOL_SIZE: usize = 16;
 
-/**
- * @brief 소켓 하나를 재사용할 최대 횟수.
- * @warning 출발 포트 무작위화가 캐시 오염 방어의 한 축이다. 소켓을 무한정 재사용하면
- *          같은 포트가 오래 노출되어 그 방어가 약해지므로, 일정 횟수마다 새로 연다.
- */
+/// Source port randomization is one leg of the cache poisoning defense. Reusing a socket
+/// indefinitely exposes one port for long and weakens it, so sockets are reopened after this many
+/// uses.
 const UDP_SOCKET_POOL_MAX_USES: u32 = 16;
 
-/** @brief 재사용을 위해 보관 중인 소켓과 그 상태. */
 struct PooledUdpSocket {
-    /** @brief 보관 중인 소켓. */
     sock: UdpSocket,
-    /** @brief 이 소켓을 쓴 횟수. 정해진 수를 넘으면 새로 연다. */
     uses: u32,
 
-    /** @brief 이 소켓에 지금 걸린 수신 데드라인. */
+    /// The receive timeout currently set.
     rcv_timeout: Option<Duration>,
 }
 
-/**
- * @brief 보관된 소켓의 수신 타임아웃을 그대로 써도 되는지.
- * @details 매번 타임아웃을 다시 설정하면 소켓 하나당 시스템 호출이 붙는다. 남은 시간과
- *          큰 차이가 없으면 재설정을 건너뛴다.
- */
+/// Resetting the timeout each time costs a system call per socket; skip it when the cached value is
+/// close to the time left.
 fn rcv_timeout_reusable(cached: Option<Duration>, remaining: Duration) -> bool {
     match cached {
         Some(cached) => {
@@ -254,18 +215,13 @@ fn rcv_timeout_reusable(cached: Option<Duration>, remaining: Duration) -> bool {
 }
 
 #[derive(Default)]
-/** @brief 바인드 주소별 소켓 풀. 스레드 지역이라 잠금이 없다. */
+/// Thread-local, so no locks.
 struct UdpSocketPool {
-    /** @brief 쉬고 있는 소켓들. */
     idle: Vec<PooledUdpSocket>,
-    /** @brief 이 목적지로 잡아 둔 소켓 수. */
     owned: usize,
 }
 
-/**
- * @brief 풀에서 소켓을 꺼내거나 새로 연다.
- * @return (소켓, 지금까지 쓴 횟수, 설정돼 있던 수신 타임아웃).
- */
+/// Returns the socket, its use count, and its current receive timeout.
 fn take_pooled_udp_socket(bind: SocketAddr) -> std::io::Result<(UdpSocket, u32, Option<Duration>)> {
     let reused = UDP_SOCKET_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -295,7 +251,7 @@ fn take_pooled_udp_socket(bind: SocketAddr) -> std::io::Result<(UdpSocket, u32, 
     }
 }
 
-/** @brief 소켓을 풀에 돌려준다. 사용 횟수 상한을 넘겼으면 버린다. */
+/// Drops it past the use limit.
 fn return_pooled_udp_socket(
     bind: SocketAddr,
     sock: UdpSocket,
@@ -317,11 +273,8 @@ fn return_pooled_udp_socket(
     });
 }
 
-/**
- * @brief 이 바인드 주소의 보관 소켓을 전부 버린다.
- * @details 위조 의심 응답을 받았을 때 부른다. 그 포트는 이미 상대에게 알려진 것이므로
- *          계속 쓰면 다음 질의도 같은 포트로 나간다.
- */
+/// Called on a suspected spoofed response: the attacker already knows that port, and reusing it
+/// would send the next query from it too.
 fn discard_pooled_udp_socket(bind: SocketAddr) {
     UDP_SOCKET_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -330,15 +283,11 @@ fn discard_pooled_udp_socket(bind: SocketAddr) {
     });
 }
 
-/** @brief 진행 중인 비행 테이블. 처음 쓸 때 만든다. */
 fn authority_flights() -> &'static Mutex<HashMap<AuthorityQueryKey, Arc<AuthorityFlight>>> {
     AUTHORITY_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/**
- * @brief 이 질의의 비행을 잡거나 기존 비행에 올라탄다.
- * @return 선두가 되었으면 이 서버가 업스트림에 내보내고 결과를 채운다. 아니면 기다린다.
- */
+/// Returns whether this request leads; the leader sends upstream and fills the result, others wait.
 fn acquire_authority_flight(
     flights: &mut HashMap<AuthorityQueryKey, Arc<AuthorityFlight>>,
     key: &AuthorityQueryKey,
@@ -358,14 +307,14 @@ fn acquire_authority_flight(
     Some((flight, true))
 }
 
-/** @brief 업스트림으로 나갈 때 쓸 출발 주소를 설정한다. 다중 홈 호스트에서 경로를 고정한다. */
+/// Pins the route on multihomed hosts.
 pub fn set_query_source(v4: Option<std::net::Ipv4Addr>, v6: Option<std::net::Ipv6Addr>) {
     *QUERY_SRC
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = (v4, v6);
 }
 
-/** @brief 목적지 계열에 맞는 바인드 주소를 고른다. 포트는 0(임의)이다. */
+/// Matches the destination's family; port 0.
 fn pick_bind(
     upstream: SocketAddr,
     v4: Option<std::net::Ipv4Addr>,
@@ -378,7 +327,6 @@ fn pick_bind(
     }
 }
 
-/** @brief 이 업스트림으로 나갈 때 바인딩할 로컬 주소. */
 pub fn outgoing_bind(upstream: SocketAddr) -> SocketAddr {
     let (v4, v6) = *QUERY_SRC
         .read()
@@ -388,11 +336,8 @@ pub fn outgoing_bind(upstream: SocketAddr) -> SocketAddr {
 
 pub(crate) use onetdns_core::tcp::DeadlineTcp;
 
-/**
- * @brief 업스트림으로 나갈 주소에 묶어 데드라인 안에 TCP 연결을 맺는다.
- * @note 이 크레이트의 TCP 연결은 이것으로 맺는다. DeadlineTcp::connect 는 나갈 주소를 고르지
- *       않아 query_source 설정을 지키지 못한다.
- */
+/// All TCP connections in this crate go through here: DeadlineTcp::connect picks no source address
+/// and would ignore query_source.
 pub(crate) fn connect_upstream(
     addr: SocketAddr,
     deadline: Instant,
@@ -404,56 +349,43 @@ pub(crate) fn connect_upstream(
     ))
 }
 
-/** @brief 업스트림 여러 개를 어떻게 고를지. */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
-    /** @brief 앞에서부터 순서대로 시도한다. 첫 업스트림이 사실상 주 서버가 된다. */
+    /// Tries in order, so the first upstream is effectively primary.
     #[default]
     Sequential,
 
-    /** @brief 돌아가며 고른다. 부하가 고르게 퍼진다. */
     RoundRobin,
 
-    /** @brief 관측된 응답 시간과 성공률로 고른다. */
+    /// Picks by observed latency and success rate.
     QueryStatistics,
 
-    /** @brief 동시에 여러 곳에 보내고 가장 빠른 응답을 쓴다. 지연을 줄이되 업스트림 부하가 는다. */
+    /// Sends to several at once and takes the fastest answer: lower latency, more upstream load.
     Parallel,
 }
 
-/** @brief 업스트림으로 가는 전송 방식. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    /** @brief 평문 UDP. */
     Udp,
 
-    /** @brief 평문 TCP. */
     Tcp,
 
-    /** @brief TLS 위의 DNS. server_name으로 인증서를 검증한다. */
     Dot { server_name: String },
 
-    /** @brief HTTP/2 위의 DNS. */
     Doh { server_name: String, path: String },
 
-    /** @brief QUIC 위의 DNS. */
     Doq { server_name: String },
 
-    /** @brief HTTP/3 위의 DNS. */
     Doh3 { server_name: String, path: String },
 }
 
-/** @brief 업스트림 하나: 주소와 전송 방식. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstream {
-    /** @brief 이 업스트림의 주소. */
     pub addr: SocketAddr,
-    /** @brief 어느 전송으로 물을지. */
     pub transport: Transport,
 }
 
 impl Upstream {
-    /** @brief 평문 UDP 업스트림. */
     pub fn udp(addr: SocketAddr) -> Self {
         Upstream {
             addr,
@@ -461,7 +393,6 @@ impl Upstream {
         }
     }
 
-    /** @brief 평문 TCP 업스트림. */
     pub fn tcp(addr: SocketAddr) -> Self {
         Upstream {
             addr,
@@ -469,7 +400,7 @@ impl Upstream {
         }
     }
 
-    /** @brief DoT 업스트림. server_name은 인증서 검증 대상 이름이다. */
+    /// `server_name` is the name the certificate is checked against.
     pub fn dot(addr: SocketAddr, server_name: impl Into<String>) -> Self {
         Upstream {
             addr,
@@ -479,7 +410,6 @@ impl Upstream {
         }
     }
 
-    /** @brief DoH 업스트림. */
     pub fn doh(addr: SocketAddr, server_name: impl Into<String>, path: impl Into<String>) -> Self {
         Upstream {
             addr,
@@ -490,7 +420,6 @@ impl Upstream {
         }
     }
 
-    /** @brief DoQ 업스트림. */
     pub fn doq(addr: SocketAddr, server_name: impl Into<String>) -> Self {
         Upstream {
             addr,
@@ -500,7 +429,7 @@ impl Upstream {
         }
     }
 
-    /** @brief 로그·통계에 쓰는 업스트림 표시. 전송 종류와 주소가 함께 들어간다. */
+    /// Transport and address, for logs and stats.
     pub fn label(&self) -> String {
         match &self.transport {
             Transport::Udp => self.addr.to_string(),
@@ -512,7 +441,6 @@ impl Upstream {
         }
     }
 
-    /** @brief DoH3 업스트림. */
     pub fn doh3(addr: SocketAddr, server_name: impl Into<String>, path: impl Into<String>) -> Self {
         Upstream {
             addr,
@@ -524,32 +452,29 @@ impl Upstream {
     }
 }
 
-/** @brief 마지막 응답이 어디서 왔는지. 질의 로그에 담긴다. */
+/// Where the last response came from, for the query log.
 enum ResponseSource {
-    /** @brief 이름으로 적어 둔 출처. */
     Label(std::borrow::Cow<'static, str>),
-    /** @brief 주소로 적어 둔 출처. 문자열 만들기를 늦춘다. */
+    /// Defers building the string.
     Addr(SocketAddr),
 }
 
 thread_local! {
 
-    /** @brief 이 스레드가 마지막으로 답을 받은 곳. */
     static LAST_SOURCE: std::cell::RefCell<Option<ResponseSource>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/** @brief 이 스레드의 응답 출처를 기록한다. 질의 처리 뒤 로그가 꺼내 쓴다. */
+/// The query log takes it after handling.
 pub fn note_response_source(label: impl Into<std::borrow::Cow<'static, str>>) {
     LAST_SOURCE.with(|slot| *slot.borrow_mut() = Some(ResponseSource::Label(label.into())));
 }
 
-/** @brief 응답 출처를 주소로 기록한다. 문자열 조립을 늦추기 위한 형태다. */
 fn note_response_addr(addr: SocketAddr) {
     LAST_SOURCE.with(|slot| *slot.borrow_mut() = Some(ResponseSource::Addr(addr)));
 }
 
-/** @brief 기록된 응답 출처를 꺼내며 지운다. */
+/// Takes and clears it.
 pub fn take_response_source() -> Option<std::borrow::Cow<'static, str>> {
     LAST_SOURCE
         .with(|slot| slot.borrow_mut().take())
@@ -559,42 +484,35 @@ pub fn take_response_source() -> Option<std::borrow::Cow<'static, str>> {
         })
 }
 
-/** @brief 응답 출처를 지운다. 이전 질의의 값이 다음 로그에 새지 않게 한다. */
+/// So a previous query's source does not leak into the next log.
 pub fn clear_response_source() {
     LAST_SOURCE.with(|slot| *slot.borrow_mut() = None);
 }
 
-/** @brief 시스템 신뢰 저장소. 한 번 읽어 모든 TLS 업스트림이 공유한다. */
+/// Read once and shared by every TLS upstream.
 fn system_trust() -> Arc<TrustStore> {
-    /** @brief 한 번만 읽어 두는 신뢰 저장소. */
     static S: OnceLock<Arc<TrustStore>> = OnceLock::new();
     S.get_or_init(|| Arc::new(TrustStore::system())).clone()
 }
 
-/** @brief 폐기 확인 훅의 형식. */
 type RevocationHook = Arc<dyn Fn(&[onetdns_tls::X509], &str) -> Result<(), String> + Send + Sync>;
 
-/** @brief 연결 캐시를 신뢰 저장소와 폐기 정책에 묶는 값. */
+/// Ties the connection cache to the trust store and revocation policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TlsCacheScope {
-    /** @brief 신뢰 저장소 내용 식별자. */
+    /// Identifies the trust store contents.
     trust: [u8; 32],
-    /** @brief 폐기 훅이 바뀔 때마다 증가하는 세대. */
+    /// Bumped whenever the revocation hook changes.
     revocation_generation: u64,
 }
 
-/** @brief 현재 폐기 정책과 캐시 무효화 세대. */
 struct RevocationPolicy {
-    /** @brief 설치된 폐기 확인 훅. */
     hook: Option<RevocationHook>,
-    /** @brief 정책 변경 세대. */
     generation: u64,
 }
 
-/** @brief 설치된 폐기 정책. */
 static REVOCATION_POLICY: OnceLock<Mutex<RevocationPolicy>> = OnceLock::new();
 
-/** @brief 폐기 확인 훅 슬롯. */
 fn revocation_policy() -> &'static Mutex<RevocationPolicy> {
     REVOCATION_POLICY.get_or_init(|| {
         Mutex::new(RevocationPolicy {
@@ -604,7 +522,6 @@ fn revocation_policy() -> &'static Mutex<RevocationPolicy> {
     })
 }
 
-/** @brief 현재 TLS 캐시의 보안 정책 범위를 얻는다. */
 fn tls_cache_scope(trust: &TrustStore) -> TlsCacheScope {
     let policy = revocation_policy()
         .lock()
@@ -616,17 +533,16 @@ fn tls_cache_scope(trust: &TrustStore) -> TlsCacheScope {
 }
 
 #[cfg(test)]
-/** @brief 전역 폐기 훅을 바꾸는 테스트와 암호화 전송 테스트를 직렬화한다. */
+/// Serializes tests that change the global revocation hook against encrypted transport tests.
 static REVOCATION_TEST_LOCK: RwLock<()> = RwLock::new(());
 
 #[cfg(test)]
 thread_local! {
-    /** @brief 쓰기 잠금을 든 테스트 스레드는 자신의 exchange에서 읽기 잠금을 건너뛴다. */
+    /// A test thread holding the write lock skips the read lock in its own exchanges.
     static REVOCATION_TEST_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
-/** @brief 보통 암호화 전송 테스트가 폐기 정책 변경과 겹치지 않게 한다. */
 fn revocation_test_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
     if REVOCATION_TEST_WRITER.with(std::cell::Cell::get) {
         None
@@ -640,9 +556,7 @@ fn revocation_test_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()
 }
 
 #[cfg(test)]
-/** @brief 폐기 정책 변경 테스트가 가지고 있을 배타 잠금. */
 struct RevocationTestWriteGuard {
-    /** @brief 수명 동안 배타성을 유지한다. */
     _guard: std::sync::RwLockWriteGuard<'static, ()>,
 }
 
@@ -654,7 +568,6 @@ impl Drop for RevocationTestWriteGuard {
 }
 
 #[cfg(test)]
-/** @brief 폐기 정책을 바꾸는 테스트를 시작한다. */
 fn revocation_test_write_guard() -> RevocationTestWriteGuard {
     let guard = REVOCATION_TEST_LOCK
         .write()
@@ -664,13 +577,10 @@ fn revocation_test_write_guard() -> RevocationTestWriteGuard {
 }
 
 #[cfg(test)]
-/**
- * @brief 핸드셰이크를 마친 뒤 처음 읽은 결과를 넘기는 TCP 위 TLS 업스트림.
- * @details 클라이언트가 핸드셰이크 뒤 연결을 어떻게 끝냈는지 본다. 치명 경고를 보냈으면
- *          PeerAlert 를, 경고 없이 끊었으면 다른 오류를 받는다.
- * @param alpn 서버가 받아들일 ALPN.
- * @return 서버 주소, dns.test 인증서만 믿는 신뢰 저장소, 연결마다 처음 읽은 결과를 받는 곳.
- */
+/// TLS-over-TCP upstream that reports its first read after the handshake, to see how the client
+/// ended the connection: PeerAlert when it sent a fatal alert, another error when it closed without
+/// one. Returns the server address, a trust store that trusts only the dns.test certificate, and a
+/// receiver of each connection's first read.
 fn tls_first_read_recorder(
     alpn: &[u8],
 ) -> (
@@ -710,12 +620,9 @@ fn tls_first_read_recorder(
     (addr, trust, received)
 }
 
-/**
- * @brief 인증서 폐기 확인 훅을 설치한다.
- * @details TLS 핸드셰이크 직후, 질의를 보내기 전에 불린다. 폐기된 인증서를 쓰는
- *          업스트림으로 질의가 나가는 것을 막는 지점이다. 훅은 검증한 인증 경로를 받으며,
- *          경로에서 리프 바로 다음 인증서가 리프의 발급자다.
- */
+/// Runs right after the TLS handshake, before a query is sent, so no query goes to an upstream with
+/// a revoked certificate. The hook gets the verified chain, where the certificate after the leaf is
+/// the leaf's issuer.
 pub fn set_revocation_hook(
     f: Box<dyn Fn(&[onetdns_tls::X509], &str) -> Result<(), String> + Send + Sync>,
 ) {
@@ -729,7 +636,6 @@ pub fn set_revocation_hook(
     policy.hook = Some(Arc::from(f));
 }
 
-/** @brief 폐기 확인 훅을 제거한다. */
 pub fn clear_revocation_hook() {
     let mut policy = revocation_policy()
         .lock()
@@ -741,10 +647,7 @@ pub fn clear_revocation_hook() {
     policy.hook = None;
 }
 
-/**
- * @brief 설치된 훅으로 검증한 인증 경로의 폐기 여부를 확인한다.
- * @details 훅이 없으면 통과다. 폐기 확인은 선택 기능이며, 켜져 있을 때만 강제된다.
- */
+/// Passes when no hook is installed: revocation checking is optional and enforced only when on.
 pub(crate) fn check_revocation(
     verified_chain: &[onetdns_tls::X509],
     host: &str,
@@ -761,24 +664,20 @@ pub(crate) fn check_revocation(
     Ok(())
 }
 
-/** @brief 전달 실패 사유. */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardError {
-    /** @brief 시도할 업스트림이 남지 않았다. */
+    /// No upstream left to try.
     NoUpstream,
 
-    /** @brief 데드라인 안에 답이 오지 않았다. */
     Timeout,
 
-    /** @brief 주고받는 중 오류가 났다. */
     Io(String),
 
-    /** @brief 응답이 질의와 맞지 않는다. 위조 의심 신호이기도 하다. */
+    /// The response does not match the query, which may also mean spoofing.
     BadResponse,
 }
 
 impl std::fmt::Display for ForwardError {
-    /** @brief 사람이 읽을 문구. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ForwardError::NoUpstream => write!(f, "No upstream DNS server available"),
@@ -796,28 +695,19 @@ impl std::fmt::Display for ForwardError {
 
 impl std::error::Error for ForwardError {}
 
-/**
- * @brief 업스트림 하나의 관측 통계.
- * @details ewma_ms는 지수 이동 평균 응답 시간이다. 최근 표본에 가중치를 두어, 느려진
- *          업스트림이 곧바로 순위에서 밀리게 한다.
- */
 #[derive(Debug, Clone, Copy)]
 struct UpstreamStat {
-    /** @brief 부드럽게 다듬은 응답 시간. 최근 표본에 무게를 둔다. */
+    /// Weighted toward recent samples, so a slowed upstream drops in rank at once.
     ewma_ms: f64,
-    /** @brief 연속 실패 수. 성공하면 0으로 되돌아간다. */
+    /// Consecutive; reset on success.
     failures: u32,
-    /** @brief 지금까지의 표본 수. */
     samples: u64,
 
-    /** @brief 성공한 수. */
     ok: u64,
-    /** @brief 실패한 수. */
     fail: u64,
 }
 
 impl Default for UpstreamStat {
-    /** @brief 표본이 없는 처음 상태. */
     fn default() -> Self {
         Self {
             ewma_ms: 0.0,
@@ -829,35 +719,26 @@ impl Default for UpstreamStat {
     }
 }
 
-/** @brief 업스트림 통계를 밖으로 내보내는 형태. 대시보드와 저장에 쓴다. */
+/// For the dashboard and persistence.
 #[derive(Debug, Clone)]
 pub struct UpstreamStatReport {
-    /** @brief 이 업스트림을 가리키는 이름. */
     pub label: String,
-    /** @brief 물어본 수. */
     pub queries: u64,
-    /** @brief 성공한 수. */
     pub ok: u64,
-    /** @brief 실패한 수. */
     pub fail: u64,
-    /** @brief 부드럽게 다듬은 응답 시간. */
     pub ewma_ms: f64,
 }
 
-/** @brief 업스트림 통계를 담은 공유 핸들. 전달기와 컨트롤 플레인이 함께 본다. */
+/// Shared between the forwarder and the control plane.
 #[derive(Clone)]
 pub struct ForwardStats {
-    /** @brief 업스트림마다의 이름. */
     labels: Vec<String>,
-    /** @brief 업스트림마다의 성적. */
     stats: Arc<Vec<Mutex<UpstreamStat>>>,
 }
 
 impl ForwardStats {
-    /**
-     * @brief 저장된 통계를 되살린다. 재시작 후 학습을 처음부터 다시 하지 않게 한다.
-     * @note 아직 표본이 없는 업스트림만 채운다. 이미 관측이 쌓였다면 그쪽이 더 최신이다.
-     */
+    /// Restores saved stats, so a restart does not lose what was learned. Fills only upstreams with
+    /// no samples yet; existing observations are newer.
     pub fn seed(&self, reports: &[UpstreamStatReport]) {
         for (label, stat) in self.labels.iter().zip(self.stats.iter()) {
             let Some(r) = reports.iter().find(|r| &r.label == label) else {
@@ -873,7 +754,6 @@ impl ForwardStats {
         }
     }
 
-    /** @brief 현재 통계를 읽어 보고 형태로 만든다. */
     pub fn snapshot(&self) -> Vec<UpstreamStatReport> {
         self.labels
             .iter()
@@ -892,33 +772,27 @@ impl ForwardStats {
     }
 }
 
-/** @brief 업스트림 전달기. 업스트림 목록·선택 전략·신뢰 저장소·통계를 함께 가지고 있다. */
 pub struct Forwarder {
-    /** @brief 쓸 업스트림들. */
+    /// Per request.
     upstreams: Vec<Upstream>,
-    /** @brief 요청 하나의 데드라인. */
     timeout: Duration,
-    /** @brief 업스트림을 고르는 방식. */
     strategy: Strategy,
-    /** @brief 라운드로빈 커서. */
+    /// Upstreams tried at once under Parallel.
     rr: AtomicUsize,
 
-    /** @brief 병렬 전략에서 동시에 시도할 업스트림 수의 상한. */
+    /// None uses the system store.
     parallel_limit: usize,
 
-    /** @brief 업스트림 인증서를 검증할 루트들. */
     trust: Option<Arc<TrustStore>>,
-    /** @brief 업스트림마다의 성적. */
     stats: Arc<Vec<Mutex<UpstreamStat>>>,
 }
 
 impl Forwarder {
-    /** @brief 평문 UDP 업스트림 목록으로 전달기를 만든다. */
+    /// Plain UDP upstreams.
     pub fn new(upstreams: Vec<SocketAddr>, timeout: Duration) -> Self {
         Self::with_upstreams(upstreams.into_iter().map(Upstream::udp).collect(), timeout)
     }
 
-    /** @brief 전송 방식이 지정된 업스트림 목록으로 전달기를 만든다. */
     pub fn with_upstreams(upstreams: Vec<Upstream>, timeout: Duration) -> Self {
         let stats = Arc::new(
             (0..upstreams.len())
@@ -936,7 +810,7 @@ impl Forwarder {
         }
     }
 
-    /** @brief 통계 핸들을 얻는다. 컨트롤 플레인이 이걸로 현황을 읽는다. */
+    /// The control plane reads current stats through it.
     pub fn stats_handle(&self) -> ForwardStats {
         ForwardStats {
             labels: self.upstreams.iter().map(Upstream::label).collect(),
@@ -944,42 +818,34 @@ impl Forwarder {
         }
     }
 
-    /** @brief 업스트림 선택 전략을 지정한다. */
     pub fn with_strategy(mut self, s: Strategy) -> Self {
         self.strategy = s;
         self
     }
 
-    /** @brief 병렬 전략의 동시 시도 수를 제한한다. 크게 잡을수록 업스트림 부하가 는다. */
+    /// Higher limits load upstreams more.
     pub fn with_parallel_limit(mut self, limit: usize) -> Self {
         self.parallel_limit = limit;
         self
     }
 
-    /** @brief 암호화 업스트림 검증에 쓸 신뢰 저장소를 지정한다. 없으면 시스템 저장소를 쓴다. */
+    /// Without one, the system store is used.
     pub fn with_trust(mut self, trust: Arc<TrustStore>) -> Self {
         self.trust = Some(trust);
         self
     }
 
-    /** @brief 설정된 업스트림 목록. */
     pub fn upstreams(&self) -> &[Upstream] {
         &self.upstreams
     }
 
-    /** @brief 쓸 신뢰 저장소. 지정된 것이 없으면 시스템 저장소다. */
     fn trust(&self) -> Arc<TrustStore> {
         self.trust.clone().unwrap_or_else(system_trust)
     }
 
-    /**
-     * @brief 질의를 업스트림으로 전달한다.
-     *
-     * @details 나가는 트랜잭션 ID를 새로 뽑고, 돌아온 응답에는 원래 ID를 되돌려 놓는다.
-     *          클라이언트가 고른 ID를 그대로 업스트림에 쓰면 예측 가능해져 위조가 쉬워진다.
-     * @warning 응답의 AD 비트를 지운다. 이 서버가 검증하지 않은 진정성 표시를 그대로
-     *          중계하면 클라이언트가 검증된 응답으로 착각한다.
-     */
+    /// Picks a fresh outgoing transaction ID and restores the original on the response: reusing the
+    /// client's ID upstream would make it predictable and spoofing easier. Clears AD: relaying an
+    /// authenticity flag this server did not check would make clients take the answer as validated.
     pub fn resolve(&self, request: &Message) -> Result<Message, ForwardError> {
         let n = self.upstreams.len();
         if n == 0 {
@@ -1007,11 +873,8 @@ impl Forwarder {
         self.resolve_sequential(start, request, &wire, wire_id, deadline)
     }
 
-    /**
-     * @brief 관측 통계로 업스트림 순서를 정해 시도한다.
-     * @details 점수는 응답 시간 이동 평균과 연속 실패 수로 정한다. 실패가 쌓인 업스트림은
-     *          뒤로 밀리되 완전히 배제되지는 않는다. 회복했는지 확인할 기회는 남긴다.
-     */
+    /// Orders upstreams by latency EWMA and consecutive failures. Failing upstreams sink but are
+    /// never excluded, so they keep a chance to show recovery.
     fn resolve_by_statistics(
         &self,
         request: &Message,
@@ -1085,11 +948,8 @@ impl Forwarder {
         best.map(|(_, message)| message).ok_or(last)
     }
 
-    /**
-     * @brief 시도 결과를 통계에 반영한다.
-     * @note 성공으로 세는 것은 최종 응답뿐이다. 참조나 빈 응답까지 성공으로 치면
-     *       실제로는 답을 못 주는 업스트림이 계속 1순위에 남는다.
-     */
+    /// Only final answers count as success. Counting referrals or empty answers would keep an
+    /// upstream that cannot answer at the top.
     fn record_upstream_result(&self, index: usize, elapsed: Duration, success: bool) {
         let mut stat = self.stats[index]
             .lock()
@@ -1110,7 +970,7 @@ impl Forwarder {
         }
     }
 
-    /** @brief 주어진 순서대로 업스트림을 시도한다. 총 데드라인을 남은 시도 수로 나눠 배분한다. */
+    /// Splits the total deadline across the attempts left.
     fn resolve_sequential(
         &self,
         start: usize,
@@ -1156,11 +1016,8 @@ impl Forwarder {
         best.map(|(_, m)| m).ok_or(last)
     }
 
-    /**
-     * @brief 여러 업스트림에 동시에 보내고 가장 좋은 응답을 고른다.
-     * @details 첫 응답이 아니라 응답 등급을 본다. 참조나 빈 응답보다 최종 답이 늦게
-     *          와도 그쪽을 택한다. 빠른 "모르겠다"를 답으로 삼으면 안 된다.
-     */
+    /// Picks by response class, not arrival: a final answer beats a referral or empty answer even
+    /// when it arrives later. A fast "don't know" must not become the answer.
     fn resolve_parallel(
         &self,
         request: &Message,
@@ -1229,7 +1086,6 @@ impl Forwarder {
                 continue;
             }
 
-            /** @brief 병렬 시도 하나의 결과. */
             type JobResult = (usize, Duration, Upstream, Result<Message, ForwardError>);
             let (tx, rx) = mpsc::channel::<JobResult>();
             let mut submitted = 0usize;
@@ -1330,10 +1186,8 @@ impl Forwarder {
     }
 }
 
-/**
- * @brief 남은 데드라인을 남은 시도 수로 나눠 이번 시도의 제한 시간을 정한다.
- * @return 남은 시간이 없거나 나눈 몫이 0이면 None: 더 시도하지 않는다.
- */
+/// Splits the time left across the attempts left. None when no time is left or the share is 0,
+/// ending the attempts.
 fn attempt_timeout(deadline: Instant, attempts_left: usize) -> Option<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() || attempts_left == 0 {
@@ -1344,45 +1198,35 @@ fn attempt_timeout(deadline: Instant, attempts_left: usize) -> Option<Duration> 
     (!timeout.is_zero()).then_some(timeout)
 }
 
-/**
- * @brief 지금부터 timeout 뒤의 데드라인 시각.
- * @note 극단적으로 큰 설정값이 시각 계산을 넘치게 하지 않도록 검사한다. 넘치면 즉시 만료로 바꾼다.
- */
+/// A huge configured timeout that would overflow the clock becomes an immediate expiry.
 pub(crate) fn deadline_after(timeout: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(timeout).unwrap_or(now)
 }
 
-/**
- * @brief 재사용 연결의 첫 시도에 허용할 시간 상한.
- * @details 재사용 연결은 이미 끊겼을 수 있다. 첫 시도를 짧게 끊어야 죽은 연결에 총 예산을
- *          다 쓰지 않고 새 연결로 넘어갈 수 있다.
- */
+/// A reused connection may already be dead; cutting its first try short moves to a fresh connection
+/// without spending the whole budget on it.
 const FIRST_TRY_CAP_DEFAULT: Duration = Duration::from_millis(1500);
 
-/** @brief 유휴 TCP 연결을 재사용할 수 있는 최대 시간. 넘으면 새로 연다. */
 const TCP_IDLE_REUSE_MAX_DEFAULT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 thread_local! {
-    /** @brief 재사용 판정 시간을 테스트에서 바꿔 넣는 슬롯. */
     static REUSE_OVERRIDE: std::cell::Cell<Option<(Duration, Duration)>> =
         const { std::cell::Cell::new(None) };
 }
 
-/** @brief 테스트에서 재사용 상한을 바꾼다. 실시간을 기다리지 않고 만료를 확인하려는 용도다. */
+/// Lets tests check expiry without waiting in real time.
 #[cfg(test)]
 pub(crate) fn set_reuse_caps_for_test(first_try: Duration, tcp_idle: Duration) {
     REUSE_OVERRIDE.with(|c| c.set(Some((first_try, tcp_idle))));
 }
 
-/** @brief 테스트용 재사용 상한 재정의를 해제한다. */
 #[cfg(test)]
 pub(crate) fn clear_reuse_caps_for_test() {
     REUSE_OVERRIDE.with(|c| c.set(None));
 }
 
-/** @brief 현재 적용할 첫 시도 상한. */
 pub(crate) fn first_try_cap() -> Duration {
     #[cfg(test)]
     if let Some((f, _)) = REUSE_OVERRIDE.with(|c| c.get()) {
@@ -1391,7 +1235,6 @@ pub(crate) fn first_try_cap() -> Duration {
     FIRST_TRY_CAP_DEFAULT
 }
 
-/** @brief 현재 적용할 유휴 재사용 상한. */
 pub(crate) fn tcp_idle_reuse_max() -> Duration {
     #[cfg(test)]
     if let Some((_, t)) = REUSE_OVERRIDE.with(|c| c.get()) {
@@ -1400,11 +1243,8 @@ pub(crate) fn tcp_idle_reuse_max() -> Duration {
     TCP_IDLE_REUSE_MAX_DEFAULT
 }
 
-/**
- * @brief 재사용 연결의 첫 시도 데드라인.
- * @details 고정 상한과 남은 예산의 5분의 2 중 작은 쪽이다. 비율을 함께 쓰는 이유는 총
- *          예산이 짧을 때 고정값이 예산 전부를 삼키지 않게 하려는 것이다.
- */
+/// The smaller of the fixed cap and two fifths of the budget left, so a short total budget is not
+/// swallowed by the fixed value.
 pub(crate) fn bounded_first_try(deadline: Instant) -> Instant {
     let now = Instant::now();
     let slice = deadline.saturating_duration_since(now);
@@ -1412,31 +1252,21 @@ pub(crate) fn bounded_first_try(deadline: Instant) -> Instant {
     now.checked_add(cap).unwrap_or(deadline).min(deadline)
 }
 
-/**
- * @brief 업스트림 응답의 등급.
- * @details 전달기가 "이 응답을 답으로 삼을지, 다른 업스트림을 더 볼지"를 정하는 기준이다.
- */
+/// Decides whether a response becomes the answer or other upstreams are tried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RespClass {
-    /** @brief 질문에 실제로 답한 응답. 통계에서 성공으로 세는 것도 이것뿐이다. */
+    /// Actually answers the question; the only class counted as success.
     Final,
 
-    /** @brief 오류라 다른 업스트림을 시도해 볼 만하다. */
     Retryable,
 
-    /**
-     * @brief 형식은 성공이지만 답이 없다.
-     * @details 근거 SOA 없는 NXDOMAIN, 요청한 이름의 레코드가 없는 NOERROR 등이다.
-     *          그대로 쓰면 "없다"는 잘못된 결론을 캐시에 남기게 된다.
-     */
+    /// Formally successful but with no answer: NXDOMAIN without a proving SOA, NOERROR without
+    /// records for the name asked. Taking it would cache a false "does not exist".
     Incomplete,
 }
 
-/**
- * @brief 응답을 등급으로 분류한다.
- * @details NXDOMAIN은 근거 SOA가 있어야 최종으로 인정한다. SOA 없는 부정 응답은 캐시할
- *          수 없으므로 미완성으로 본다.
- */
+/// NXDOMAIN is final only with a proving SOA; a negative answer without one cannot be cached, so it
+/// is Incomplete.
 fn response_class(request: &Message, resp: &Message) -> RespClass {
     let rcode = resp.header.rcode;
     if rcode == ResponseCode::NXDomain.0 {
@@ -1459,12 +1289,10 @@ fn response_class(request: &Message, resp: &Message) -> RespClass {
     }
 }
 
-/** @brief 최종 답이 아닌 응답을 업스트림별로 센 것. */
 static NON_FINAL_COUNTS: OnceLock<Mutex<HashMap<(SocketAddr, RespClass), u64>>> = OnceLock::new();
-/** @brief 셀 수 있는 업스트림 수 상한. 없으면 업스트림을 지어내는 것만으로 메모리가 는다. */
+/// Bounds memory however many servers send such responses.
 const MAX_NON_FINAL_COUNTERS: usize = 1024;
 
-/** @brief 최종이 아닌 응답의 누적 수를 센다. 진단 로그의 빈도를 정하는 데 쓴다. */
 fn increment_non_final_count(
     counts: &mut HashMap<(SocketAddr, RespClass), u64>,
     key: (SocketAddr, RespClass),
@@ -1479,11 +1307,8 @@ fn increment_non_final_count(
     *count
 }
 
-/**
- * @brief 최종이 아닌 응답을 진단 로그로 남긴다.
- * @note 카운터가 유계이며 로그도 빈도를 줄여 남긴다. 업스트림이 계속 미완성 응답을 보내는
- *       상황에서 로그 자체가 부하가 되지 않게 한다.
- */
+/// Counters are bounded and logging is rate-limited, so an upstream that keeps sending incomplete
+/// answers does not turn the log into load.
 fn observe_non_final(upstream: &Upstream, class: RespClass, request: &Message, response: &Message) {
     let count = {
         let mut counts = NON_FINAL_COUNTS
@@ -1518,7 +1343,6 @@ fn observe_non_final(upstream: &Upstream, class: RespClass, request: &Message, r
     }
 }
 
-/** @brief 지금까지 본 것 중 더 좋은 등급의 응답을 남긴다. */
 fn keep_best(best: &mut Option<(RespClass, Message)>, cls: RespClass, resp: Message) {
     let replace = match best {
         None => true,
@@ -1530,11 +1354,9 @@ fn keep_best(best: &mut Option<(RespClass, Message)>, cls: RespClass, resp: Mess
     }
 }
 
-/**
- * @brief 부정 응답의 근거 SOA가 질의 이름의 조상 zone에서 왔는지.
- * @warning 소속을 확인하지 않으면 아무 SOA나 붙인 응답이 "이 이름은 없다"의 근거가 되어,
- *          공격자가 임의 이름에 대한 부정 응답을 캐시에 심을 수 있다.
- */
+/// Whether the proving SOA comes from an ancestor zone of the query name. Without this check, a
+/// response with any SOA attached would prove a name absent, letting an attacker plant negative
+/// answers for arbitrary names in the cache.
 fn has_negative_soa(request: &Message, resp: &Message) -> bool {
     let Some(question) = request.questions.first() else {
         return false;
@@ -1552,11 +1374,8 @@ fn has_negative_soa(request: &Message, resp: &Message) -> bool {
     })
 }
 
-/**
- * @brief 응답이 실제로 질문한 것에 답했는지.
- * @details CNAME/DNAME 체인을 따라가 종착 이름의 레코드가 있는지 본다. 체인을 따라가지
- *          않으면 정상적인 별칭 응답을 미완성으로 잘못 판정한다.
- */
+/// Follows the CNAME/DNAME chain and checks the final name has records; without following it,
+/// normal alias answers would be judged incomplete.
 fn has_requested_answer(req: &Message, resp: &Message) -> bool {
     let Some(question) = req.questions.first() else {
         return false;
@@ -1594,7 +1413,6 @@ fn has_requested_answer(req: &Message, resp: &Message) -> bool {
     false
 }
 
-/** @brief 이 이름의 CNAME 대상을 찾는다. */
 fn cname_target_at(
     owner: &Name,
     qclass: onetdns_proto::DnsClass,
@@ -1630,7 +1448,6 @@ fn cname_target_at(
     Ok(target)
 }
 
-/** @brief DNAME 치환으로 만들어지는 대상 이름을 구한다. */
 fn dname_target(
     current: &Name,
     qclass: onetdns_proto::DnsClass,
@@ -1670,10 +1487,7 @@ fn dname_target(
     Name::from_labels(labels).ok()
 }
 
-/**
- * @brief 별칭 체인을 따라가 최종 이름을 구한다.
- * @note 체인 길이에 상한이 있다. 없으면 서로를 가리키는 CNAME 쌍에서 무한히 돈다.
- */
+/// The chain length is capped; two CNAMEs pointing at each other would loop forever.
 fn terminal_answer_name(
     question: &onetdns_proto::Question,
     answers: &[onetdns_proto::Record],
@@ -1697,7 +1511,6 @@ fn terminal_answer_name(
     None
 }
 
-/** @brief 업스트림 하나와 한 번 교환한다. 전송 방식에 맞는 모듈로 갈라진다. */
 fn exchange_one(
     up: &Upstream,
     wire: &[u8],
@@ -1725,26 +1538,19 @@ fn exchange_one(
 }
 
 #[derive(Clone, Copy, PartialEq)]
-/**
- * @brief 질의 이름의 대소문자를 어떻게 다룰지.
- * @details 대소문자를 섞어 보내면 위조 응답을 맞히기가 어려워진다. 다만 그 섞은 형태를
- *          그대로 되받아야 하므로, 업스트림이 그러지 못하면 쓸 수 없다.
- */
+/// Mixed case in queries makes spoofed answers harder to match, but the answer must echo the mix
+/// exactly, so it works only with upstreams that do.
 enum CasePolicy {
-    /** @brief 소문자로 맞춘다. */
     Normalized,
 
-    /** @brief 섞은 형태를 그대로 되받아야 한다. */
     Exact,
 
-    /** @brief 합칠 때는 대소문자를 무시하되 부른 쪽 형태로 돌려준다. */
+    /// Compares ignoring case but returns the caller's form.
     MergedExact,
 }
 
-/**
- * @brief 지정한 서버에 직접 질의한다. 재귀 리졸버가 권한 서버에 물을 때 쓴다.
- * @details 질의 이름 대소문자는 응답에서 합쳐 준다(대소문자 무시 비교).
- */
+/// Queries a given server directly, as the recursive resolver does with authoritative servers.
+/// Question case is merged in the response.
 pub fn query_server(
     server: SocketAddr,
     request: &Message,
@@ -1759,11 +1565,9 @@ pub fn query_server(
     )
 }
 
-/**
- * @brief 응답의 질의 이름 대소문자가 보낸 것과 정확히 같아야 하는 질의.
- * @details 0x20 대소문자 인코딩의 검증 지점이다. 응답의 대소문자 패턴이 이 서버가 보낸
- *          무작위 패턴과 다르면 위조로 보고 버린다.
- */
+/// The answer's question case must match what was sent exactly: this is where 0x20 encoding is
+/// checked, and a case pattern different from the random one sent is treated as spoofed and
+/// dropped.
 pub fn query_server_case_sensitive(
     server: SocketAddr,
     request: &Message,
@@ -1778,7 +1582,7 @@ pub fn query_server_case_sensitive(
     )
 }
 
-/** @brief 대소문자를 합쳐 비교하는 질의. 0x20 인코딩을 쓰지 않을 때의 경로다. */
+/// For when 0x20 encoding is off.
 pub fn query_server_case_merged(
     server: SocketAddr,
     request: &Message,
@@ -1794,24 +1598,17 @@ pub fn query_server_case_merged(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/** @brief 권한 서버에 직접 질의할 때 쓰는 전송. */
 pub enum AuthorityTransport {
-    /** @brief UDP로 보내고, 잘린 응답이면 TCP로 다시 받는다. */
+    /// Falls back to TCP on a truncated answer.
     Udp,
 
-    /**
-     * @brief 처음부터 TCP로 보낸다.
-     * @details 중간 장비가 UDP 53번만 가로채 대신 답하는 망에서 쓴다. 그런 망에서는
-     *          UDP 응답이 권한 서버가 보낸 것이 아니다.
-     */
+    /// TCP from the start, for networks where a middlebox intercepts UDP 53 and answers itself;
+    /// there, UDP answers do not come from the authoritative server.
     Tcp,
 }
 
-/**
- * @brief 전송을 골라 권한 서버에 직접 질의한다.
- * @param merge_case 참이면 대소문자를 합쳐 비교하고 부른 쪽 형태로 돌려준다. 거짓이면
- *                   소문자로 맞춘다.
- */
+/// `merge_case` compares ignoring case and returns the caller's form; otherwise names are
+/// lowercased.
 pub fn query_server_over(
     server: SocketAddr,
     request: &Message,
@@ -1827,7 +1624,6 @@ pub fn query_server_over(
     query_server_with_case_policy(server, request, timeout, policy, transport)
 }
 
-/** @brief 대소문자 정책을 인자로 받는 직접 질의의 공통 구현. */
 fn query_server_with_case_policy(
     server: SocketAddr,
     request: &Message,
@@ -1905,7 +1701,7 @@ fn query_server_with_case_policy(
     result
 }
 
-/** @brief 응답의 질문 섹션이 보낸 것과 옥텟 단위로 같은지. 0x20 검증의 핵심 비교다. */
+/// Octet-for-octet comparison of question sections, the core of the 0x20 check.
 fn questions_case_exact(
     sent: &[onetdns_proto::Question],
     received: &[onetdns_proto::Question],
@@ -1924,7 +1720,7 @@ fn questions_case_exact(
         })
 }
 
-/** @brief 단일 비행에 묶지 않고 곧바로 업스트림과 교환한다. */
+/// Exchanges directly, outside single-flight.
 fn query_server_uncollapsed(
     server: SocketAddr,
     request: &Message,
@@ -1950,15 +1746,10 @@ fn query_server_uncollapsed(
     Ok(response)
 }
 
-/**
- * @brief DoH/DoT 서버 이름을 부트스트랩 리졸버로 푼다.
- *
- * @details 암호화 업스트림에 붙으려면 그 서버의 주소를 알아야 하는데, 그 조회 자체를 그
- *          업스트림으로 할 수는 없다. 그래서 별도의 부트스트랩 서버를 쓴다.
- * @warning 질의한 이름의 CNAME 체인 위에 있는 주소만 받아들인다. 응답에 딸려 온
- *          다른 이름의 주소를 그대로 쓰면, 부트스트랩 서버가 이 서버를 임의의 서버로
- *          유도할 수 있다.
- */
+/// Connecting to an encrypted upstream needs its address, and that lookup cannot go through the
+/// upstream itself, so a separate bootstrap server is used. Only addresses on the queried name's
+/// CNAME chain are accepted; using addresses of other names in the response would let the bootstrap
+/// server steer this server anywhere.
 pub fn resolve_via_bootstrap(
     host: &str,
     bootstrap: &[std::net::IpAddr],
@@ -2009,11 +1800,8 @@ pub fn resolve_via_bootstrap(
     None
 }
 
-/**
- * @brief 부트스트랩 응답에서 주소를 추출한다.
- * @details 별칭 체인을 따라가며 그 체인에 속한 이름의 주소만 모은다. 체인이 서로 어긋나는
- *          응답은 전체를 버린다.
- */
+/// Collects addresses only for names on the alias chain; a response whose chains disagree is
+/// discarded whole.
 fn bootstrap_answer(
     response: &Message,
     start: &onetdns_proto::Name,
@@ -2078,7 +1866,7 @@ fn bootstrap_answer(
     (None, cname)
 }
 
-/** @brief 평문 UDP로 한 번 교환한다. 소켓은 풀에서 꺼내 쓴다. */
+/// Takes a socket from the pool.
 fn udp_exchange(
     upstream: SocketAddr,
     wire: &[u8],
@@ -2113,23 +1901,14 @@ fn udp_exchange(
     result
 }
 
-/** @brief 주고받는 데 쓰는 소켓과 지금 걸린 데드라인. */
 struct ExchangeSocket<'a> {
-    /** @brief 쓰고 있는 소켓. */
     sock: &'a UdpSocket,
-    /** @brief 그 소켓에 지금 걸린 수신 데드라인. */
     rcv_timeout: Option<Duration>,
 }
 
-/**
- * @brief 주어진 소켓으로 UDP 교환을 수행한다.
- *
- * @details 데드라인까지 응답을 계속 받아 본다. 트랜잭션 ID나 질문이 어긋난 응답은 버리고
- *          계속 기다린다. 위조 시도가 정상 응답의 슬롯을 뺏지 못하게 하려는 것이다.
- * @warning 다만 그 반복이 데드라인 안에서만 일어난다. 무효 응답을 쏟아붓는 공격자가 질의
- *          예산을 늘리지 못한다.
- * @note TC 비트가 선 응답을 받으면 TCP로 재시도한다.
- */
+/// Keeps receiving until the deadline, dropping answers whose ID or question does not match, so
+/// spoofing attempts cannot take the real answer's place. The loop never runs past the deadline, so
+/// flooding invalid answers cannot extend the query budget. Retries over TCP on TC.
 fn udp_exchange_on(
     exchange: &mut ExchangeSocket<'_>,
     upstream: SocketAddr,
@@ -2161,10 +1940,8 @@ fn udp_exchange_on(
         let received = UDP_RECV_BUFFER.with(|slot| {
             let mut buf = slot.borrow_mut();
             sock.recv_from(&mut buf).map(|(n, from)| {
-                /*
-                 * 우리가 질의를 보낸 그 업스트림에서 온 데이터그램만 파싱한다. 출처가 어긋난
-                 * 것은 아래에서 어차피 버리므로, 파싱 비용을 들이기 전에 먼저 거른다.
-                 */
+                // Only datagrams from the upstream we queried are parsed; mismatched sources are
+                // dropped below anyway, so filter before paying for the parse.
                 if from == upstream {
                     (from, Message::parse_udp_reply(&buf[..n]))
                 } else {
@@ -2209,47 +1986,34 @@ fn udp_exchange_on(
     }
 }
 
-/** @brief 보관 중인 유휴 평문 TCP 연결 하나. */
 struct IdleTcp {
-    /** @brief 이어진 연결. */
     stream: TcpStream,
-    /** @brief 마지막으로 응답을 받은 시각. */
     last_used: Instant,
 }
 
-/** @brief 유휴 평문 TCP 연결을 보관하는 풀. 키는 (바인드 주소, 서버 주소)다. */
+/// Keyed by bind address and server address.
 #[derive(Default)]
 struct TcpIdlePool {
-    /** @brief 서버별 유휴 연결. */
     idle: HashMap<(SocketAddr, SocketAddr), Vec<IdleTcp>>,
-    /** @brief 모든 서버에 걸친 유휴 연결 수. */
     total: usize,
 }
 
-/** @brief 서버 하나에 보관할 유휴 연결 수 상한. 같은 서버에 동시에 묻는 질의 수만큼 필요하다. */
+/// As many as concurrent queries to one server need.
 const TCP_IDLE_PER_SERVER: usize = 2;
 
-/**
- * @brief 모든 서버에 걸쳐 보관할 유휴 연결 수 상한.
- * @note 재귀는 서버를 수백 곳 거친다. 상한이 없으면 유휴 연결이 파일 디스크립터를 다 쓴다.
- */
+/// Recursion goes through hundreds of servers; without a cap idle connections would use up file
+/// descriptors.
 const TCP_IDLE_TOTAL: usize = 256;
 
-/**
- * @brief 프로세스가 공유하는 유휴 평문 TCP 연결 풀.
- * @details 스레드마다 두면 재귀가 서버마다 따로 띄우는 교환 스레드가 서로의 연결을 쓰지 못한다.
- */
+/// Shared by the process: per-thread pools would keep the exchange threads recursion starts per
+/// server from using each other's connections.
 fn tcp_idle_pool() -> &'static Mutex<TcpIdlePool> {
-    /** @brief 처음 쓸 때 만드는 풀. */
     static POOL: OnceLock<Mutex<TcpIdlePool>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(TcpIdlePool::default()))
 }
 
-/**
- * @brief 이 서버로 이어 둔 유휴 연결을 꺼낸다. 너무 오래 쉰 연결은 버린다.
- * @note 서버가 그사이 닫은 연결도 꺼내질 수 있다. 그런 연결은 질의를 보내면 곧바로 EOF가
- *       읽혀 새 연결로 넘어가므로 따로 확인하지 않는다.
- */
+/// Drops connections idle too long. A connection the server has since closed can still come out;
+/// sending on it reads EOF at once and moves to a new connection, so it is not checked separately.
 fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
     let mut pool = tcp_idle_pool()
         .lock()
@@ -2270,7 +2034,7 @@ fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
     found
 }
 
-/** @brief 응답을 온전히 받은 연결을 풀에 돌려놓는다. 상한을 넘으면 닫는다. */
+/// Only connections whose answer was read in full; closes past the cap.
 fn return_idle_tcp(bind: SocketAddr, upstream: SocketAddr, stream: TcpStream) {
     let mut pool = tcp_idle_pool()
         .lock()
@@ -2289,12 +2053,10 @@ fn return_idle_tcp(bind: SocketAddr, upstream: SocketAddr, stream: TcpStream) {
     pool.total += 1;
 }
 
-/**
- * @brief 평문 TCP로 교환한다. 2바이트 길이 접두사 프레이밍을 쓴다.
- * @details 이 서버로 이어 둔 연결이 있으면 먼저 그것으로 묻는다. 새 연결은 핸드셰이크 왕복이
- *          한 번 더 들어, 멀리 있는 서버는 질의 하나에 수백 밀리초가 붙는다. 이어 둔 연결은
- *          그사이 끊겼을 수 있으므로 첫 시도를 짧게 끊고, 실패하면 새 연결로 다시 묻는다.
- */
+/// Plain TCP with 2-byte length framing. Asks over a kept connection to the server first: a new
+/// connection costs another handshake round trip, hundreds of milliseconds per query for distant
+/// servers. A kept connection may have died, so its first try is cut short and a failure retries on
+/// a fresh connection.
 fn tcp_exchange(
     upstream: SocketAddr,
     wire: &[u8],
@@ -2344,7 +2106,6 @@ fn tcp_exchange(
     Ok(resp)
 }
 
-/** @brief 이어진 연결로 길이 접두사가 붙은 질의 하나를 보내고 응답 하나를 읽는다. */
 fn tcp_roundtrip(
     stream: &mut TcpStream,
     framed: &[u8],
@@ -2365,7 +2126,7 @@ fn tcp_roundtrip(
     Ok(resp)
 }
 
-/** @brief 데드라인 안에서 전부 쓴다. 부분 쓰기마다 남은 시간을 다시 계산한다. */
+/// Recomputes the time left after each partial write.
 fn write_all_deadline(
     stream: &mut TcpStream,
     mut buf: &[u8],
@@ -2390,11 +2151,8 @@ fn write_all_deadline(
     Ok(())
 }
 
-/**
- * @brief 데드라인 안에서 버퍼를 정확히 채운다.
- * @warning 부분 읽기마다 절대 데드라인을 다시 본다. 소켓 타임아웃만 쓰면 한 바이트씩
- *          천천히 보내는 상대가 예산을 무한정 늘릴 수 있다.
- */
+/// Checks the absolute deadline after each partial read; socket timeouts alone would let a peer
+/// sending one byte at a time stretch the budget forever.
 fn read_exact_deadline(
     stream: &mut TcpStream,
     mut buf: &mut [u8],
@@ -2415,7 +2173,6 @@ fn read_exact_deadline(
     Ok(())
 }
 
-/** @brief 응답의 질문이 이 서버가 보낸 것과 같은지. */
 pub(crate) fn question_matches(req: &Message, resp: &Message) -> bool {
     req.questions.len() == resp.questions.len()
         && req.questions.iter().zip(&resp.questions).all(|(a, b)| {
@@ -2423,11 +2180,7 @@ pub(crate) fn question_matches(req: &Message, resp: &Message) -> bool {
         })
 }
 
-/**
- * @brief 이 응답을 받아들여도 되는지.
- * @warning 번호와 질문이 모두 맞아야 한다. 확인하지 않으면 아무나 보낸 응답이 이 서버의
- *          캐시에 들어간다.
- */
+/// Both ID and question must match; otherwise anyone's response would enter this server's cache.
 pub(crate) fn validate_response(
     request: &Message,
     response: &Message,
@@ -2443,7 +2196,6 @@ pub(crate) fn validate_response(
     Ok(())
 }
 
-/** @brief 입출력 오류를 전달 실패 사유로. */
 pub(crate) fn io_err(e: std::io::Error) -> ForwardError {
     if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
         ForwardError::Timeout
@@ -2452,13 +2204,10 @@ pub(crate) fn io_err(e: std::io::Error) -> ForwardError {
     }
 }
 
-/**
- * @brief 암호화 업스트림에 연결하지 못한 사유를 남긴다.
- * @details 이 사유는 위로 올라가며 TransportExhausted로 접혀 사라진다. 인증서 만료인지
- *          미지 CA인지 그냥 닿지 않는 것인지는 여기서만 알 수 있고, 그것이 암호화 업스트림
- *          장애의 대부분이다.
- * @note 전송별로 2의 거듭제곱 번째만 남긴다. 업스트림이 죽으면 질의마다 실패하기 때문이다.
- */
+/// Logs why an encrypted upstream connection failed. The reason is folded into TransportExhausted
+/// on the way up, and only here is it known whether the certificate expired, the CA is unknown, or
+/// the server is unreachable, which covers most encrypted upstream failures. Logs only power-of-two
+/// occurrences per transport, since a dead upstream fails every query.
 pub(crate) fn note_upstream_connect_failure(
     transport: &'static str,
     addr: SocketAddr,
@@ -2466,7 +2215,7 @@ pub(crate) fn note_upstream_connect_failure(
     error: &impl std::fmt::Display,
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /** @brief 전송별 누적 실패 수. dot·doh·doq·doh3 순이다. */
+    /// Per transport: dot, doh, doq, doh3.
     static COUNTS: [AtomicU64; 4] = [
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -2485,52 +2234,39 @@ pub(crate) fn note_upstream_connect_failure(
     }
 }
 
-/** @brief 병렬로 돌릴 일 하나. */
 type ParallelJob = Box<dyn FnOnce() + Send + 'static>;
 
-/** @brief 동시에 진행할 병렬 시도 수 상한. */
 const MAX_PARALLEL_INFLIGHT: usize = 512;
-/** @brief 병렬 워커가 일이 없을 때 남아 있을 시간. */
+/// How long an idle parallel worker stays.
 const PARALLEL_WORKER_IDLE: Duration = Duration::from_secs(30);
-/** @brief 지금 진행 중인 병렬 시도 수. */
 static PARALLEL_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-/** @brief 병렬 시도를 돌리는 워커 풀. */
 static PARALLEL_EXECUTOR: OnceLock<ParallelExecutor> = OnceLock::new();
 
-/** @brief 아직 시작하지 않은 병렬 시도들. */
 struct ParallelQueue {
-    /** @brief 먼저 들어온 일을 먼저 꺼낸다. */
     jobs: VecDeque<ParallelJob>,
 }
 
-/** @brief 수요에 따라 커졌다가 유휴 시 비워지는 병렬 워커 공유 상태. */
+/// Grows with demand and empties when idle.
 struct ParallelExecutorShared {
-    /** @brief 대기열. */
     queue: Mutex<ParallelQueue>,
-    /** @brief 새 일이 들어왔음을 알린다. */
     ready: Condvar,
-    /** @brief 현재 살아 있는 워커 수. */
     live: AtomicUsize,
-    /** @brief 일을 맡을 수 있는 워커 수. 새로 시작하는 중인 워커도 포함한다. */
+    /// Workers free to take a job, including ones still starting.
     idle: AtomicUsize,
-    /** @brief 스레드 이름에 붙일 단조 번호. */
     next_worker: AtomicUsize,
 }
 
-/** @brief 병렬 전략의 bounded 동적 워커 풀. */
+/// Bounded dynamic worker pool for the Parallel strategy.
 struct ParallelExecutor {
-    /** @brief 워커들이 공유하는 상태. */
     shared: Arc<ParallelExecutorShared>,
-    /** @brief 대기열 크기 상한. */
+    /// Queue length limit.
     capacity: usize,
-    /** @brief 살아 있을 수 있는 워커 수 상한. */
     max_workers: usize,
-    /** @brief 일이 없어진 워커를 회수할 때까지 기다릴 시간. */
     idle_timeout: Duration,
 }
 
 impl ParallelExecutor {
-    /** @brief 빈 풀을 만든다. 첫 일이 오기 전에는 스레드가 없다. */
+    /// No threads until the first job.
     fn new(max_workers: usize, capacity: usize, idle_timeout: Duration) -> Self {
         Self {
             shared: Arc::new(ParallelExecutorShared {
@@ -2548,7 +2284,7 @@ impl ParallelExecutor {
         }
     }
 
-    /** @brief 워커 하나를 예약하고 시작한다. 호출자는 queue 잠금을 잡고 있어야 한다. */
+    /// The caller must hold the queue lock.
     fn spawn_worker_locked(&self) -> bool {
         let index = self.shared.next_worker.fetch_add(1, Ordering::Relaxed);
         self.shared.live.fetch_add(1, Ordering::Relaxed);
@@ -2563,7 +2299,7 @@ impl ParallelExecutor {
             Err(error) => {
                 self.shared.live.fetch_sub(1, Ordering::Relaxed);
                 self.shared.idle.fetch_sub(1, Ordering::Relaxed);
-                /** @brief 반복 자원 고갈이 로그 고갈로 번지지 않게 표본만 남긴다. */
+                /// Logs only samples, so repeated resource exhaustion does not exhaust the log too.
                 static FAILURES: AtomicUsize = AtomicUsize::new(0);
                 let count = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_power_of_two() {
@@ -2574,7 +2310,7 @@ impl ParallelExecutor {
         }
     }
 
-    /** @brief 일을 넣고, 지금 밀린 양을 받을 만큼만 워커를 늘린다. */
+    /// Adds workers only as far as the current backlog needs.
     fn try_submit(&self, job: ParallelJob) -> bool {
         let mut queue = self
             .shared
@@ -2604,7 +2340,7 @@ impl ParallelExecutor {
     }
 }
 
-/** @brief 병렬 워커 하나의 반복. 작업 패닉은 이 일에만 가두고 다음 일을 받는다. */
+/// A job's panic is contained to that job; the worker takes the next one.
 fn parallel_worker_loop(shared: Arc<ParallelExecutorShared>, idle_timeout: Duration) {
     loop {
         let job = {
@@ -2634,7 +2370,6 @@ fn parallel_worker_loop(shared: Arc<ParallelExecutorShared>, idle_timeout: Durat
     }
 }
 
-/** @brief 병렬 전략이 쓸 실행 스레드 수. */
 fn parallel_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_mul(4))
@@ -2642,7 +2377,6 @@ fn parallel_worker_count() -> usize {
         .clamp(8, 128)
 }
 
-/** @brief 병렬 시도를 실행할 공용 동적 풀. */
 fn parallel_executor() -> &'static ParallelExecutor {
     PARALLEL_EXECUTOR.get_or_init(|| {
         ParallelExecutor::new(
@@ -2653,7 +2387,7 @@ fn parallel_executor() -> &'static ParallelExecutor {
     })
 }
 
-/** @brief 병렬 작업을 제출한다. 큐가 가득 차면 false: 호출자가 직렬로 처리한다. */
+/// False when the queue is full; the caller runs the job serially.
 fn submit_parallel_job<F>(job: F) -> bool
 where
     F: FnOnce() + Send + 'static,
@@ -2661,10 +2395,8 @@ where
     parallel_executor().try_submit(Box::new(job))
 }
 
-/**
- * @brief 병렬 시도 슬롯을 잡는다.
- * @return 실제로 확보한 수. 전역 상한이 있어 동시 질의가 많아도 업스트림 부하가 폭발하지 않는다.
- */
+/// Returns how many were granted. The global cap keeps upstream load bounded however many queries
+/// run at once.
 fn acquire_parallel_slots(want: usize) -> usize {
     let mut granted = 0;
     for _ in 0..want {
@@ -2678,38 +2410,31 @@ fn acquire_parallel_slots(want: usize) -> usize {
     granted
 }
 
-/** @brief 병렬 시도 슬롯을 반납한다. */
 fn release_parallel_slot() {
     PARALLEL_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
 }
 
-/** @brief 병렬 시도 슬롯 하나. 끝나면 스스로 반납한다. */
+/// Releases itself on drop.
 struct ParallelSlot;
 impl Drop for ParallelSlot {
-    /** @brief 슬롯을 반납한다. */
     fn drop(&mut self) {
         release_parallel_slot();
     }
 }
 
-/**
- * @brief 업스트림으로 나갈 트랜잭션 ID를 추출한다.
- * @warning 반드시 보안 난수여야 한다. 순차 증가나 예측 가능한 값이면 위조 응답을 맞히기가
- *          쉬워져 캐시 오염의 문턱이 크게 낮아진다.
- */
+/// Must be secure random: a sequential or predictable ID makes spoofed answers easy to match and
+/// lowers the bar for cache poisoning.
 fn next_id() -> u16 {
     u16::from_be_bytes(onetdns_core::ephemeral_random_array())
 }
 
 #[cfg(test)]
-/** @brief 응답 검증, 같은 질의 합치기, 데드라인이 늘어나지 않는지, 그리고 업스트림 고르기. */
 mod tests {
     use super::*;
     use onetdns_proto::{Name, RData, Record, RecordType, ResponseCode};
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::{Arc, Barrier};
 
-    /** @brief 짧은 동시성 테스트에서 조건이 될 때까지만 기다린다. */
     fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -2722,7 +2447,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 병렬 풀이 실제 수요만큼만 커지고, 쉰 뒤 0으로 줄었다가 다시 깨어나는지. */
     fn parallel_executor_scales_on_demand_and_retires_idle_workers() {
         let executor = ParallelExecutor::new(16, 32, Duration::from_millis(20));
         let active = Arc::new(AtomicUsize::new(0));
@@ -2772,7 +2496,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 병렬 시도 하나의 패닉이 유일한 워커를 죽이지 않는지. */
     fn parallel_executor_isolates_job_panics() {
         let executor = ParallelExecutor::new(1, 4, Duration::from_secs(1));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -2788,7 +2511,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 합치는 곳이 상한을 지키면서도 이미 합쳐진 것이 깨지지 않는지. */
     fn authority_single_flight_state_is_bounded_without_breaking_existing_sharing() {
         let mut flights = HashMap::new();
         for index in 0..MAX_AUTHORITY_FLIGHTS {
@@ -2823,7 +2545,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 바이트로 만든 키와 메시지로 만든 키가 같은지. */
     fn wire_key_matches_message_key_and_collapses_case() {
         let server = SocketAddr::from(([192, 0, 2, 7], 53));
         let upper = query("MiXeD.Example");
@@ -2847,7 +2568,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 스레드가 자기 자신을 기다리지 않는지. 기다리면 그대로 멈춘다. */
+    /// Waiting on itself would hang.
     fn same_thread_leader_flight_is_bypassed_not_joined() {
         let server = SocketAddr::from(([192, 0, 2, 1], 53));
         let request = Message::query(1, Name::from_str("nest.example").unwrap(), RecordType::A);
@@ -2875,7 +2596,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 너무 큰 질의는 합치지 않고 그냥 나가는지. */
     fn oversized_authority_queries_bypass_global_single_flight_state() {
         let server = SocketAddr::from(([192, 0, 2, 1], 53));
         let mut request =
@@ -2889,7 +2609,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키에서 이름의 원래 바이트가 바뀌지 않는지. */
     fn authority_single_flight_key_preserves_raw_qname_octets() {
         let server = SocketAddr::from(([192, 0, 2, 1], 53));
         let request = |id, label| {
@@ -2913,7 +2632,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아주 큰 데드라인 값이 시각 계산을 넘치게 하지 않는지. */
     fn extreme_timeout_cannot_overflow_instant_deadline() {
         let before = Instant::now();
         let deadline = deadline_after(Duration::MAX);
@@ -2922,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 소켓을 여러 개 열어 출발 포트를 분산하는지. 한 포트만 쓰면 위조를 맞히기 쉬워진다. */
+    /// A single port makes spoofing easier to match.
     fn udp_socket_pool_grows_to_distinct_ports_before_reusing() {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -2946,7 +2664,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보관한 소켓의 데드라인이 지금 데드라인을 넘지 않는지. */
     fn cached_receive_timeout_never_outlives_the_deadline() {
         let ms = Duration::from_millis;
 
@@ -2969,7 +2686,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 소켓을 정해진 횟수마다 새로 여는지. */
     fn udp_socket_pool_retires_by_use_count() {
         let bind: SocketAddr = "127.0.0.2:0".parse().unwrap();
         let (sock, _, _) = take_pooled_udp_socket(bind).unwrap();
@@ -2981,7 +2697,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 실패해도 소켓 슬롯이 새 나가지 않는지. */
     fn failed_exchange_does_not_leak_pool_capacity() {
         let bind: SocketAddr = "127.0.0.3:0".parse().unwrap();
 
@@ -2996,7 +2711,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인코딩하지 못한 질의를 오류 응답 바이트로 내보내지 않는지. */
     fn malformed_in_memory_query_is_never_sent_as_servfail_wire() {
         let server = SocketAddr::from(([127, 0, 0, 1], 9));
         let mut request = query("malformed.example");
@@ -3014,7 +2728,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림별 카운터가 상한을 지키는지. */
     fn non_final_observation_counters_stay_bounded() {
         let mut counts = HashMap::new();
         for port in 1..=MAX_NON_FINAL_COUNTERS as u16 {
@@ -3037,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부트스트랩이 물어본 체인 위의 주소만 받아들이는지. 아니면 남이 끼워 넣은 주소로 접속한다. */
+    /// Otherwise it would connect to an address someone slipped in.
     fn bootstrap_accepts_only_the_queried_cname_chain() {
         let start = Name::from_str("resolver.example").unwrap();
         let target = Name::from_str("edge.example").unwrap();
@@ -3073,7 +2786,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서로 어긋나는 별칭이 든 답을 거부하는지. */
     fn bootstrap_rejects_conflicting_alias_data() {
         let start = Name::from_str("resolver.example").unwrap();
         let first = Name::from_str("one.example").unwrap();
@@ -3104,7 +2816,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부트스트랩 데드라인이 전체에 걸리는지. */
     fn bootstrap_timeout_is_an_overall_deadline() {
         let started = Instant::now();
         assert!(resolve_via_bootstrap(
@@ -3116,11 +2827,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    /**
-     * @brief 연결마다 질의를 받아 빈 응답을 돌려주는 TCP 서버를 띄운다.
-     * @param close_after_answer 참이면 응답 하나를 보낸 뒤 연결을 닫는다.
-     * @return 서버 주소와, 지금까지 받아들인 연결 수.
-     */
+    /// TCP server answering each query with an empty response. With `close_after_answer` it closes
+    /// after one answer. Returns the address and the number of connections accepted.
     fn spawn_tcp_answerer(close_after_answer: bool) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3155,7 +2863,6 @@ mod tests {
         (addr, accepted)
     }
 
-    /** @brief 이 서버에 TCP로 한 번 묻는다. */
     fn ask_over_tcp(addr: SocketAddr, id: u16) -> Result<Message, ForwardError> {
         let request = Message::query(id, Name::from_str("pool.example").unwrap(), RecordType::A);
         let wire = request.try_encode().unwrap();
@@ -3163,11 +2870,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 같은 서버에 잇따라 물으면 이어 둔 연결을 다시 쓰는지.
-     * @details 새 연결은 핸드셰이크 왕복이 한 번 더 든다. UDP 53번이 막혀 권한 서버에 TCP로
-     *          묻는 망에서는 질의마다 이 왕복이 붙는다.
-     */
+    /// A new connection costs another handshake round trip, which every query pays on networks
+    /// where UDP 53 is blocked and authoritative servers are asked over TCP.
     fn tcp_exchange_reuses_the_connection_to_the_same_server() {
         let (addr, accepted) = spawn_tcp_answerer(false);
         ask_over_tcp(addr, 0x7001).expect("첫 질의");
@@ -3176,11 +2880,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 서버가 닫은 연결로 묻다 실패하면 곧바로 새 연결로 다시 묻는지.
-     * @details 권한 서버는 유휴 연결을 몇 초 만에 닫기도 한다. 이어 둔 연결이 닫혔다고 질의가
-     *          실패하거나 제한 시간까지 기다리면 재사용이 오히려 해가 된다.
-     */
+    /// Authoritative servers may close idle connections within seconds; if a closed kept connection
+    /// failed the query or waited for the timeout, reuse would do harm.
     fn tcp_exchange_retries_on_a_new_connection_when_the_kept_one_was_closed() {
         let (addr, accepted) = spawn_tcp_answerer(true);
         ask_over_tcp(addr, 0x7003).expect("첫 질의");
@@ -3192,7 +2893,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 한 바이트씩 흘려 보내는 업스트림이 데드라인을 늘리지 못하는지. */
     fn tcp_slow_drip_cannot_extend_query_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3239,7 +2939,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 엉뚱한 응답을 쏟아부어도 데드라인이 늘지 않는지. */
     fn invalid_udp_flood_cannot_extend_query_deadline() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
@@ -3272,9 +2971,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 업스트림을 차례로 시도하는 동안 데드라인이 하나로 유지되는지. */
     fn failover_strategies_share_one_overall_deadline() {
-        /** @brief 답하지 않는 테스트용 주소들. */
         fn blackholes(count: usize) -> Vec<SocketAddr> {
             (0..count)
                 .map(|_| {
@@ -3312,7 +3009,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 나갈 때 묶을 주소를 제대로 고르는지. */
     fn query_source_bind_selection() {
         let v4srv: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let v6srv: SocketAddr = "[2001:4860:4860::8888]:53".parse().unwrap();
@@ -3328,7 +3024,6 @@ mod tests {
         assert_eq!(pick_bind(v4srv, Some(s4), None).port(), 0);
     }
 
-    /** @brief 이 질의에 대한 테스트용 답. */
     fn answer_for(req: &Message, ip: Ipv4Addr) -> Message {
         let mut m = Message::default();
         m.header.id = req.header.id;
@@ -3342,7 +3037,6 @@ mod tests {
         m
     }
 
-    /** @brief 고정 답을 내는 테스트용 업스트림. */
     fn mock_udp(ip: Ipv4Addr) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -3357,7 +3051,6 @@ mod tests {
         addr
     }
 
-    /** @brief 빈 응답을 내는 테스트용 업스트림. */
     fn mock_udp_empty(rcode: u16, delay: Duration) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -3381,7 +3074,6 @@ mod tests {
         addr
     }
 
-    /** @brief 별칭만 답하는 테스트용 업스트림. */
     fn mock_udp_cname_only() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -3408,13 +3100,11 @@ mod tests {
         addr
     }
 
-    /** @brief 테스트용 질의. */
     fn query(name: &str) -> Message {
         Message::query(0xBEEF, Name::from_str(name).unwrap(), RecordType::A)
     }
 
     #[test]
-    /** @brief 어느 방식으로 골라도 성적이 기록되는지. */
     fn stats_recorded_for_all_strategies() {
         let good = mock_udp(Ipv4Addr::new(9, 9, 9, 9));
         for strategy in [
@@ -3438,7 +3128,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장해 둔 성적이 이어지되 지금 성적을 덮지 않는지. */
     fn stats_seed_carries_over_by_label_without_clobbering_live() {
         let good: SocketAddr = "127.0.0.1:53001".parse().unwrap();
         let old = Forwarder::new(vec![good], Duration::from_secs(3));
@@ -3465,7 +3154,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 닿지 않는 업스트림의 실패가 기록되는지. */
     fn stats_record_failures_on_unreachable_upstream() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = blackhole.local_addr().unwrap();
@@ -3479,7 +3167,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 평문으로 전달되는지. */
     fn forwards_udp() {
         let up = mock_udp(Ipv4Addr::new(5, 6, 7, 8));
         let fwd = Forwarder::new(vec![up], Duration::from_secs(2));
@@ -3494,7 +3181,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 질의가 몰려도 밖으로는 하나만 나가는지. */
     fn concurrent_identical_authority_queries_share_one_exchange() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3536,7 +3222,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 기다리는 쪽이 깨어나는지. */
     fn waiting_follower_is_still_woken_when_leader_completes() {
         let flight = Arc::new(AuthorityFlight::new());
         let follower_flight = flight.clone();
@@ -3560,7 +3245,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 늦게 온 쪽도 결과를 보는지. */
     fn completion_without_waiters_is_still_observed_by_late_callers() {
         let flight = AuthorityFlight::new();
         let mut answer = Message::default();
@@ -3573,7 +3257,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 대소문자를 섞어 보낼 때 그 형태가 유지되는지. 소문자로 바꾸면 위조 방어가 사라진다. */
+    /// Lowercasing would remove the spoofing defense.
     fn case_sensitive_authority_queries_do_not_collapse_or_rewrite_questions() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3623,7 +3307,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 되받은 형태가 다르면 거부하는지. */
     fn case_sensitive_authority_query_rejects_case_mismatch() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3647,7 +3330,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 응답을 무시하고 맞는 응답을 계속 기다리는지. */
     fn case_sensitive_authority_query_ignores_mismatch_before_valid_response() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3688,7 +3370,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 합칠 때 대소문자를 무시하되 부른 쪽 형태로 돌려주는지. */
     fn case_merged_authority_queries_collapse_across_case_and_keep_caller_case() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3738,7 +3419,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 임의로 만든 소문자 응답을 무시하는지. */
     fn case_merged_authority_query_ignores_forged_lowercase_echo() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3773,7 +3453,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다른 곳에서 온 그럴싸한 응답을 무시하는지. */
     fn udp_query_ignores_valid_looking_response_from_wrong_source() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.local_addr().unwrap();
@@ -3812,14 +3491,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 답을 못 받은 질의가 걸렸던 소켓을 다시 쓰지 않는지.
-     *
-     * @details SAD DNS 방어 네 겹 중 마지막이다. 답이 오지 않았다는 것은 그 포트가 이미
-     *          관측됐을 수 있다는 뜻이므로, 소켓을 풀에 돌려주면 다음 질의가 같은 포트로
-     *          나가 관측 구간이 이어진다. 소켓 재사용은 바인드 시스템 호출을 아끼는 그럴듯한
-     *          최적화로 보이기 때문에 여기서 못 고정해 둔다.
-     */
+    /// The last of four SAD DNS defenses. No answer means the port may have been observed;
+    /// returning the socket to the pool would send the next query from the same port and extend the
+    /// observation window. Socket reuse looks like a harmless saving of a bind call, so this pins
+    /// it.
     fn unanswered_exchange_never_parks_its_socket_for_reuse() {
         let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = responder.local_addr().unwrap();
@@ -3884,15 +3559,13 @@ mod tests {
         );
     }
 
-    /**
-     * @brief 같은 포트에서 UDP 와 TCP 로 답하는 가짜 업스트림을 띄운다.
-     * @details TCP 에서 빈 임시 포트도 UDP 에서는 못 열 수 있다. Windows 는 Hyper-V 가 예약한
-     *          대역이면 권한 거부를 주고, 그 대역은 프로토콜마다 따로 이어져 있다. 임시 포트는
-     *          번호순으로 나오므로 어긋난 TCP 소켓을 잡은 채로 다시 걸어 대역을 지나간다.
-     * @param udp_reply UDP 질의에 돌려줄 바이트를 만든다. TCP 는 항상 9.9.9.9 를 담은 온전한 답이다.
-     */
+    /// Fake upstream answering over UDP and TCP on one port. A port free for TCP may still fail for
+    /// UDP: on Windows, ranges reserved by Hyper-V give permission denied, and those ranges differ
+    /// per protocol. Ephemeral ports come out in order, so the mismatched TCP sockets are held
+    /// while walking past the range. `udp_reply` builds the UDP answer; TCP always gives a full
+    /// answer with 9.9.9.9.
     fn spawn_udp_tcp_upstream(udp_reply: fn(&Message) -> Vec<u8>) -> SocketAddr {
-        /** @brief 이어진 예약 대역을 걸어서 지나가고도 남을 시도 수. */
+        /// Enough to walk past a contiguous reserved range.
         const ATTEMPTS: usize = 512;
 
         let mut pair = None;
@@ -3951,7 +3624,7 @@ mod tests {
         addr
     }
 
-    /** @brief 가짜 업스트림에 물어 TCP 로 받은 온전한 답이 나오는지 확인하고 걸린 시간을 돌려준다. */
+    /// Checks the full TCP answer comes back and returns the time taken.
     fn resolve_through_tcp_fallback(addr: SocketAddr) -> Duration {
         let fwd = Forwarder::new(vec![addr], Duration::from_secs(20));
         let started = Instant::now();
@@ -3966,7 +3639,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 잘린 응답에 TCP로 다시 묻는지. */
     fn tcp_fallback_on_truncation() {
         let addr = spawn_udp_tcp_upstream(|req| {
             let mut tc = Message::default();
@@ -3980,11 +3652,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief TC 없이 레코드 중간에서 끊긴 UDP 응답에 곧바로 TCP 로 다시 묻는지.
-     * @details UDP 53 을 가로채는 프록시가 512바이트에서 이렇게 자른다. 버리고 기다리면
-     *          질의 제한 시간을 다 쓰고 실패한다.
-     */
+    /// A proxy intercepting UDP 53 cuts answers this way at 512 bytes; dropping and waiting would
+    /// spend the whole query timeout and fail.
     fn tcp_fallback_on_reply_cut_without_tc() {
         let addr = spawn_udp_tcp_upstream(|req| {
             let full = answer_for(req, Ipv4Addr::new(9, 9, 9, 9))
@@ -4000,7 +3669,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 업스트림이 안 되면 다음으로 넘어가는지. */
     fn fails_over_to_second_upstream() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dead = blackhole.local_addr().unwrap();
@@ -4021,7 +3689,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오류 응답에 다음 업스트림으로 넘어가는지. */
     fn fails_over_on_servfail_rcode() {
         let failing = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
         let healthy = mock_udp(Ipv4Addr::new(4, 3, 2, 1));
@@ -4036,7 +3703,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 오류 응답이 성적에 반영되는지. */
     fn query_statistics_penalizes_parseable_servfail() {
         let failing = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
         let healthy = mock_udp(Ipv4Addr::new(203, 0, 113, 8));
@@ -4062,7 +3728,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 근거 없이 비어 온 응답에 다음 업스트림으로 넘어가는지. */
     fn fails_over_on_empty_noerror() {
         let lame = mock_udp_empty(ResponseCode::NoError.0, Duration::ZERO);
         let healthy = mock_udp(Ipv4Addr::new(6, 5, 4, 3));
@@ -4077,7 +3742,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭만 온 응답에 다음 업스트림으로 넘어가는지. */
     fn fails_over_on_cname_only() {
         let partial = mock_udp_cname_only();
         let healthy = mock_udp(Ipv4Addr::new(9, 8, 7, 6));
@@ -4091,7 +3755,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 전부 실패하면 오류로 답하는지. */
     fn all_upstreams_servfail_returns_servfail() {
         let a = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
         let b = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
@@ -4102,7 +3765,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 근거 없는 부정 응답에 다음 업스트림으로 넘어가는지. */
     fn unproven_nxdomain_fails_over() {
         let nx = mock_udp_empty(ResponseCode::NXDomain.0, Duration::ZERO);
         let healthy = mock_udp(Ipv4Addr::new(1, 2, 3, 4));
@@ -4117,7 +3779,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 최종 답으로 인정하려면 부류가 맞고 근거가 있어야 하는지. */
     fn final_response_requires_relevant_class_and_negative_soa() {
         let request = query("host.example");
         let question = request.questions[0].clone();
@@ -4178,7 +3839,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 다시 물어도 같은 오류는 최종으로 보는지. */
     fn yxdomain_is_final_not_retryable() {
         let request = Message::query(1, Name::from_str("host.example").unwrap(), RecordType::A);
         let mut response = request.clone();
@@ -4188,7 +3848,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 무관하거나 서로 어긋나는 답을 최종으로 보지 않는지. */
     fn final_response_rejects_unrelated_any_and_conflicting_cname_data() {
         let mut any_request =
             Message::query(1, Name::from_str("host.example").unwrap(), RecordType::ANY);
@@ -4226,7 +3885,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림이 하나도 없으면 그 사유로 실패하는지. */
     fn no_upstream_errors() {
         let fwd = Forwarder::new(vec![], Duration::from_secs(1));
         assert!(matches!(
@@ -4235,7 +3893,6 @@ mod tests {
         ));
     }
 
-    /** @brief 느리게 답하는 테스트용 업스트림. */
     fn mock_udp_slow(ip: Ipv4Addr, delay: Duration) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -4252,7 +3909,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동시에 물었을 때 가장 빠른 답을 쓰는지. */
     fn parallel_picks_fastest() {
         let slow = mock_udp_slow(Ipv4Addr::new(2, 2, 2, 2), Duration::from_millis(600));
         let fast = mock_udp(Ipv4Addr::new(1, 1, 1, 1));
@@ -4274,7 +3930,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빠른 오류보다 늦은 최종 답을 고르는지. 빠른 것만 보면 오류가 이긴다. */
+    /// Looking only at speed, the error would win.
     fn parallel_prefers_final_over_fast_servfail() {
         let failing = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
         let healthy = mock_udp_slow(Ipv4Addr::new(3, 3, 3, 3), Duration::from_millis(80));
@@ -4290,7 +3946,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 동시 수 상한이 업스트림 선택을 줄이지 않는지. */
     fn parallel_limit_is_concurrency_not_upstream_selection() {
         let failing = mock_udp_empty(ResponseCode::ServFail.0, Duration::ZERO);
         let healthy = mock_udp(Ipv4Addr::new(8, 8, 4, 4));
@@ -4311,7 +3966,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 죽은 업스트림이 섞여 있어도 답을 받는지. */
     fn parallel_survives_dead_upstream() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dead = blackhole.local_addr().unwrap();
@@ -4338,19 +3992,15 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버와 전달을 이어 실제로 질의가 오가는지. */
     fn e2e_runtime_plus_forwarder() {
         use onetdns_runtime::{Handler, RequestCtx, Server, ServerConfig};
 
         let up = mock_udp(Ipv4Addr::new(2, 2, 2, 2));
 
-        /** @brief 전달로 답하는 테스트용 핸들러. */
         struct FwdHandler {
-            /** @brief 전달로 답하는 것. */
             fwd: Forwarder,
         }
         impl Handler for FwdHandler {
-            /** @brief 전달해 답한다. */
             fn handle(&self, request: &Message, _ctx: &RequestCtx) -> Option<Message> {
                 self.fwd.resolve(request).ok()
             }

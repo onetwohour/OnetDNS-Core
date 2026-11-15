@@ -1,6 +1,4 @@
-/*!
- * @brief Split 모드에서 로컬 A와 AAAA를 합성하는 계층과 그 주소표.
- */
+//! Synthesizes local A and AAAA answers in split mode, and the table behind them.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -11,29 +9,20 @@ use onetdns_proto::{Message, Name, RData, Record, RecordType};
 use super::{answer_message, configured_name_key, outcome_to_option};
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/**
- * @brief 설정에 고정해 둔 이름별 주소.
- * @note 수명을 원자 값으로 잡는다. 설정을 다시 읽었을 때 다음 질의부터 곧바로 반영되게
- *       하려는 것이다.
- */
+/// The TTL is an atomic so a reload applies from the next query.
 pub struct LocalAddressTable {
-    /** @brief 이름별로 고정해 둔 주소. */
     addresses: HashMap<Vec<u8>, LocalAddresses>,
-    /** @brief 답에 담을 수명. 설정을 다시 읽으면 곧바로 반영되도록 따로 둔다. */
     local_ttl: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Default)]
-/** @brief 이름 하나에 걸린 주소들. */
 struct LocalAddresses {
-    /** @brief 이 이름의 IPv4 주소. */
     a: Option<Ipv4Addr>,
-    /** @brief 이 이름의 IPv6 주소. */
     aaaa: Option<Ipv6Addr>,
 }
 
 impl LocalAddressTable {
-    /** @brief 설정 목록으로 만든다. 이름이 틀리거나 겹치면 실패다. */
+    /// Fails on an invalid or duplicate name.
     pub fn new(
         local_a: &[(String, Ipv4Addr)],
         local_aaaa: &[(String, Ipv6Addr)],
@@ -68,7 +57,6 @@ impl LocalAddressTable {
         })
     }
 
-    /** @brief 이 이름에 고정해 둔 답. */
     fn local_answer(&self, name: &Name, qtype: RecordType) -> Option<(Vec<Record>, u32)> {
         let mut key = [0u8; 255];
         let key = name.canonical_key_into(&mut key)?;
@@ -89,22 +77,15 @@ impl LocalAddressTable {
     }
 }
 
-/**
- * @brief 고정해 둔 주소를 답하는 계층.
- * @warning 답할 때 그곳에 표시를 남긴다. 남기지 않으면 나중에 바깥 계층의 답을 이
- *          계층의 답으로 오해해 고정 수명 항목으로 승격시킨다.
- */
+/// Marks its answers in the cache; otherwise an outer layer's answer could later be taken for this
+/// layer's and promoted to a fixed-TTL entry.
 pub struct LocalAddressLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 고정해 둔 주소표. */
     addresses: Arc<LocalAddressTable>,
-    /** @brief 답했음을 표시해 둘 캐시. 승격할 때 남의 답과 구분하려는 것이다. */
     wire_cache: Option<Arc<OnceLock<crate::cache::CacheHandle>>>,
 }
 
 impl LocalAddressLayer {
-    /** @brief 주소표를 잡은 계층을 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         addresses: Arc<LocalAddressTable>,
@@ -119,12 +100,10 @@ impl LocalAddressLayer {
 }
 
 impl Resolver for LocalAddressLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 고정해 둔 이름이면 답하고, 아니면 안으로 넘긴다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let Some(q) = req.questions.first() else {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));

@@ -1,6 +1,5 @@
-/*!
- * @brief 이 서버가 권한을 가진 영역을 재귀보다 먼저 답하는 계층과 그 DNSSEC 증명 조립.
- */
+//! Answers this server's authoritative zones ahead of recursion, with DNSSEC signatures and denial
+//! proofs.
 
 use std::sync::Arc;
 
@@ -9,22 +8,16 @@ use onetdns_proto::{Edns, Message, Name, Record, RecordType, ResponseCode};
 use super::outcome_to_option;
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
-/**
- * @brief 이 서버가 권한을 가진 영역을 먼저 답하는 계층.
- * @details 여기서 답이 나오면 재귀로 내려가지 않는다.
- */
 pub struct AuthorityLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 서빙할 권한 영역들. 한꺼번에 교체한다. */
+    /// Swapped as a whole on reload.
     store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
 
-    /** @brief 응답에 재귀 가능 표시를 담을지. */
+    /// Whether answers set RA.
     recursion_offered: bool,
 }
 
 impl AuthorityLayer {
-    /** @brief 영역 저장소를 잡은 계층을 만든다. */
     pub fn new(
         inner: Arc<dyn Resolver>,
         store: Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>,
@@ -36,7 +29,6 @@ impl AuthorityLayer {
         }
     }
 
-    /** @brief 응답에 재귀 가능 표시를 담을지. */
     pub fn with_recursion_offered(mut self, offered: bool) -> Self {
         self.recursion_offered = offered;
         self
@@ -44,12 +36,10 @@ impl AuthorityLayer {
 }
 
 impl Resolver for AuthorityLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 이 서버의 영역이면 답하고, 아니면 안으로 넘긴다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let Some(q) = req.questions.first() else {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -77,18 +67,12 @@ impl Resolver for AuthorityLayer {
     }
 }
 
-/**
- * @brief 응답에 서명과 부재 증명을 붙인다.
- * @details 클라이언트가 요구했을 때만 붙인다. 있는 답에는 그 서명을, 없는 답에는 없다는
- *          증명을 붙여야 검증하는 쪽이 이 서버의 답을 믿을 수 있다.
- */
+/// Adds signatures, and denial proofs for negative answers, when the client set DO.
 fn attach_dnssec(m: &mut Message, zone: &onetdns_authority::Zone, qname: &Name) {
     let rrsig_t = RecordType(46);
     let nsec_t = RecordType(47);
-    /*
-     * 서명을 붙인 뒤에는 RRSIG가 별칭과 같은 owner의 다른 타입처럼 보여 terminal 추적을
-     * 방해한다. 원래 answer만 있을 때 최종 이름과 요청 RRset 존재 여부를 확정한다.
-     */
+    // Decided before signing: added RRSIGs share owners with aliases and would look like other
+    // types there, breaking the terminal-name walk.
     let terminal = crate::cache::terminal_answer_name(m, &m.answers);
     let has_requested_answer = crate::cache::has_requested_answer(m, &m.answers);
 
@@ -193,7 +177,6 @@ fn attach_dnssec(m: &mut Message, zone: &onetdns_authority::Zone, qname: &Name) 
     }
 }
 
-/** @brief 증명 기록을 겹치지 않게 넣는다. */
 fn push_unique_proof(out: &mut Vec<Record>, record: &Record) {
     if !out.iter().any(|existing| {
         existing.rtype == record.rtype && existing.name.eq_ignore_case(&record.name)
@@ -202,7 +185,6 @@ fn push_unique_proof(out: &mut Vec<Record>, record: &Record) {
     }
 }
 
-/** @brief 이 이름이 없다는 증명 기록을 찾는다. */
 fn indexed_nsec_proof(zone: &onetdns_authority::Zone, qname: &Name, nxdomain: bool) -> Vec<Record> {
     let rtype = RecordType::NSEC;
     if !nxdomain {
@@ -250,7 +232,6 @@ fn indexed_nsec_proof(zone: &onetdns_authority::Zone, qname: &Name, nxdomain: bo
     proof
 }
 
-/** @brief 이름을 감춘 형태의 부재 증명 기록을 찾는다. */
 fn indexed_nsec3_proof(
     zone: &onetdns_authority::Zone,
     qname: &Name,
@@ -337,7 +318,6 @@ fn indexed_nsec3_proof(
     proof
 }
 
-/** @brief 서명해야 할 RRset 목록. 같은 것은 한 번만. */
 fn unique_rrsets(records: &[Record], excluded: &[RecordType]) -> Vec<(Name, u16)> {
     let mut seen = std::collections::HashSet::with_capacity(records.len());
     let mut pairs = Vec::new();
@@ -353,7 +333,6 @@ fn unique_rrsets(records: &[Record], excluded: &[RecordType]) -> Vec<(Name, u16)
     pairs
 }
 
-/** @brief 영역 조회 결과로 응답을 만든다. */
 fn authority_message(req: &Message, resp: onetdns_authority::Response) -> Message {
     let mut m = Message::default();
     m.header.id = req.header.id;
@@ -371,7 +350,6 @@ fn authority_message(req: &Message, resp: onetdns_authority::Response) -> Messag
 }
 
 #[cfg(test)]
-/** @brief 권한 영역 응답과 서명 증명이 검증 가능한 형태로 나가는지. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -383,7 +361,6 @@ mod tests {
     use crate::native::Resolver;
 
     #[test]
-    /** @brief 이 서버의 영역이 답할 수 있으면 안쪽으로 내려가지 않는지. */
     fn authority_layer_refers_below_root_delegation_without_hitting_backend() {
         let root_text = "$TTL 3600\n. IN SOA ns.root. host.root. 1 3600 900 604800 3600\n. IN NS ns.root.\nns.root. IN A 127.0.1.1\ntest. IN NS ns.test.\nns.test. IN A 127.0.2.1\n";
         let zone = onetdns_authority::parse_zone(root_text, ".").unwrap();
@@ -414,9 +391,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 큰 영역에서도 증명 조회가 훑기로 떨어지지 않는지. */
+    /// A large zone must not fall back to a linear scan.
     fn indexed_denial_lookup_handles_ten_thousand_node_chain() {
-        /** @brief 테스트에 쓸 이름 수. */
         const NODES: usize = 10_000;
         let unsigned = onetdns_authority::parse_zone(
             "$ORIGIN sec.test.\n@ 60 IN SOA ns.sec.test. hostmaster.sec.test. 1 60 60 3600 60\n@ 60 IN NS ns.sec.test.\nns 60 IN A 192.0.2.1\n",
@@ -454,7 +430,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이 서버가 서명해 낸 답을 남이 실제로 검증할 수 있는지. */
     fn signed_authority_serves_validatable_dnssec() {
         use onetdns_dnssec::sign::{sign_zone, ZoneSigner};
 
@@ -649,7 +624,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 와일드카드 이름과 빈 중간 이름의 답에 증명이 붙는지. */
     fn signed_authority_proves_wildcard_and_empty_nonterminal_answers() {
         use onetdns_dnssec::sign::{sign_zone_with, DenialMode, Nsec3Params, ZoneSigner};
 
@@ -794,7 +768,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 위임 지점에서 다음 영역의 키와 그 서명을 주는지. */
     fn signed_delegation_serves_ds_and_its_signature() {
         use onetdns_dnssec::sign::{sign_zone, ZoneSigner};
 
@@ -904,7 +877,8 @@ mod tests {
     }
 
     #[test]
-    /** @brief 와일드카드 이름으로 만든 답의 서명이 원래 임자 이름을 유지하는지. 바꾸면 검증이 깨진다. */
+    /// The RRSIG is re-owned to the query name but keeps the wildcard's label count, from which
+    /// validators rebuild the signed owner.
     fn wildcard_answer_carries_reowned_rrsig() {
         use onetdns_dnssec::sign::{sign_zone, ZoneSigner};
 

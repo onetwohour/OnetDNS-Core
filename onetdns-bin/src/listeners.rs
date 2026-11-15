@@ -1,6 +1,4 @@
-/*!
- * @brief DNS 수신 소켓과 암호화 전송 리스너를 설정에 맞춰 열고 닫는다.
- */
+//! Opens and closes DNS sockets and encrypted listeners to match the config.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -19,7 +17,6 @@ use crate::{
     track_service_thread, LOCAL_CA_MAX_BYTES,
 };
 
-/** @brief DNSCrypt 제공자 키를 둘 경로. */
 fn dnscrypt_provider_key_path(
     config_path: &Option<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
@@ -28,7 +25,6 @@ fn dnscrypt_provider_key_path(
     Some(dir.join("dnscrypt-provider.key"))
 }
 
-/** @brief DNSCrypt 제공자 키를 읽거나 만든다. */
 fn load_or_create_dnscrypt_provider(
     cfg: &Config,
     config_path: &Option<std::path::PathBuf>,
@@ -81,40 +77,27 @@ fn load_or_create_dnscrypt_provider(
     Ok(provider)
 }
 
-/**
- * @brief 전송별 TLS 설정을 담는 교체 가능한 슬롯들.
- *
- * @details 인증서를 갈 때 수신 소켓을 다시 열지 않기 위해 있다. 이미 맺힌 연결은 이전
- *          인증서로 이어지고, 다음 연결부터 새 인증서를 쓴다.
- * @invariant 네 슬롯은 항상 같은 인증서에서 나온다. ALPN만 다르다.
- */
+/// Swappable per-transport TLS configs, so a certificate change needs no listener reopen:
+/// established connections keep the old certificate, and new ones get the new one.
+///
+/// All four slots always come from the same certificate; only ALPN differs.
 pub(crate) struct TlsSlots {
-    /** @brief DoT용. */
     dot: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
-    /** @brief DoH용. */
     doh: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
-    /** @brief DoQ용. */
     doq: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
-    /** @brief DoH3용. */
     doh3: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
-    /**
-     * @brief 지금 네 슬롯이 쓰고 있는 파일 기반 재료.
-     * @details 파일 경로가 그대로여도 내용이 갱신되었는지 가리는 근거다. 공개 값만 담는다.
-     *          개인키는 슬롯 안에만 두고 여기에 사본을 남기지 않는다.
-     */
+    /// The file-based material the slots use now, which tells whether contents changed under an
+    /// unchanged path. Public values only; the private key stays in the slots, with no copy here.
     live_files: Mutex<LiveTlsFiles>,
 }
 
-/** @brief 슬롯이 파일에서 읽어 쓰고 있는 값들. 갱신 여부를 가리는 데만 쓴다. */
 #[derive(PartialEq, Eq)]
 struct LiveTlsFiles {
-    /** @brief 내밀고 있는 인증서 체인. */
     certs: Vec<Vec<u8>>,
-    /** @brief 클라이언트 인증서를 확인하는 CA 번들 원문. mTLS 를 쓰지 않으면 없다. */
+    /// None without mTLS.
     client_ca: Option<Vec<u8>>,
 }
 
-/** @brief 설정이 가리키는 파일들을 지금 내용대로 읽는다. */
 fn live_tls_files(cfg: &Config, certs: Vec<Vec<u8>>) -> Result<LiveTlsFiles, String> {
     let client_ca = match &cfg.tls_client_ca {
         Some(path) => Some(
@@ -131,13 +114,9 @@ fn live_tls_files(cfg: &Config, certs: Vec<Vec<u8>>) -> Result<LiveTlsFiles, Str
 }
 
 impl TlsSlots {
-    /**
-     * @brief 인증서 슬롯을 얻는다. 아직 없으면 지금 설정으로 만든다.
-     *
-     * @details 시작할 때 암호화 수신 주소가 없었어도, 나중에 인증서와 주소를 넣으면 그때
-     *          만들어서 쓴다. 미리 만들어 두려 하면 인증서가 없을 때 시작이 실패한다.
-     * @return 인증서를 읽지 못하면 실패.
-     */
+    /// Built from the current config if absent, so slots appear when a certificate and an encrypted
+    /// address are added later. Building them up front would fail startup without a certificate.
+    /// Fails when the certificate cannot be read.
     fn get_or_build(
         handle: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
         cfg: &Config,
@@ -150,7 +129,6 @@ impl TlsSlots {
         Ok(slots)
     }
 
-    /** @brief 설정에 적힌 인증서로 네 슬롯을 만든다. */
     fn from_config(cfg: &Config) -> Result<Self, String> {
         let material = native_tls_material(cfg)?;
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
@@ -163,15 +141,12 @@ impl TlsSlots {
         })
     }
 
-    /**
-     * @brief 경로는 그대로인 채 내용만 갱신된 인증서를 다시 읽어 슬롯에 올린다.
-     *
-     * @details 갱신 도구는 같은 경로에 새 인증서를 덮어쓴다. 설정 항목은 그대로이므로
-     *          항목 비교만으로는 아무것도 바뀌지 않은 것으로 보이고, 그대로 두면 다시
-     *          시작할 때까지 만료된 인증서를 계속 내민다.
-     * @return 내용이 달라져 교체한 설정 항목들. 바뀐 것이 없거나 자체 서명으로 돌고
-     *         있으면 빈 목록이다. 자체 서명은 파일이 근거가 아니므로 읽지 않는다.
-     */
+    /// Reloads certificates whose contents changed under the same path. Renewal tools overwrite the
+    /// certificate in place; the config keys stay the same, so comparing keys sees no change, and
+    /// without this the expired certificate would keep being presented until restart.
+    ///
+    /// Returns the config keys whose material was swapped; empty when nothing changed or when
+    /// running self-signed, which does not read files.
     pub(crate) fn refresh_certificate_files(
         &self,
         cfg: &Config,
@@ -179,10 +154,8 @@ impl TlsSlots {
         if cfg.tls_self_signed_host.is_some() || cfg.tls_cert.is_none() || cfg.tls_key.is_none() {
             return Ok(Vec::new());
         }
-        /*
-         * 교체 전체를 이 잠금 아래에서 한다. 다시 적용 요청과 감시 작업이 겹칠 때 서로 다른
-         * 인증서를 슬롯마다 나눠 넣으면 전송마다 다른 인증서를 내밀게 된다.
-         */
+        // The whole swap happens under this lock. With a reapply and the watcher overlapping, slots
+        // filled from different certificates would present a different one per transport.
         let mut live = self.live_files.lock_recover();
         let material = native_tls_material(cfg)?;
         let fresh = live_tls_files(cfg, material.0.clone())?;
@@ -205,10 +178,7 @@ impl TlsSlots {
         Ok(changed)
     }
 
-    /**
-     * @brief 설정에 적힌 인증서를 읽어 네 슬롯에 넣을 설정을 만든다. 슬롯은 건드리지 않는다.
-     * @return 인증서나 개인키가 올바르지 않으면 실패.
-     */
+    /// Leaves the slots alone. Fails on an invalid certificate or private key.
     pub(crate) fn prepare(cfg: &Config) -> Result<PreparedTls, String> {
         let material = native_tls_material(cfg)?;
         let files = live_tls_files(cfg, material.0.clone())?;
@@ -222,7 +192,7 @@ impl TlsSlots {
         })
     }
 
-    /** @brief 준비한 설정으로 네 슬롯을 한꺼번에 교체한다. 절반만 바꾸면 전송마다 다른 인증서를 내민다. */
+    /// All four at once; swapping half would present different certificates per transport.
     pub(crate) fn install(&self, prepared: PreparedTls) {
         let mut live = self.live_files.lock_recover();
         self.dot.store(prepared.dot);
@@ -233,21 +203,16 @@ impl TlsSlots {
     }
 }
 
-/** @brief 읽어 두었지만 아직 슬롯에 넣지 않은 TLS 설정. */
+/// Read but not yet installed.
 pub(crate) struct PreparedTls {
-    /** @brief DoT 설정. */
     dot: Arc<onetdns_tls::ServerConfig>,
-    /** @brief DoH 설정. */
     doh: Arc<onetdns_tls::ServerConfig>,
-    /** @brief DoQ 설정. */
     doq: Arc<onetdns_tls::ServerConfig>,
-    /** @brief DoH3 설정. */
     doh3: Arc<onetdns_tls::ServerConfig>,
-    /** @brief 이 설정을 만든 인증서 파일 내용. */
     files: LiveTlsFiles,
 }
 
-/** @brief 이미 읽어 둔 인증서로 전송 넷에 쓸 TLS 설정을 만든다. ALPN만 다르다. */
+/// One certificate shared by all four transports; only ALPN differs.
 #[allow(clippy::type_complexity)]
 pub(crate) fn tls_configs_from(
     cfg: &Config,
@@ -261,7 +226,6 @@ pub(crate) fn tls_configs_from(
     ),
     String,
 > {
-    /* 네 전송이 같은 인증서를 내놓아야 한다. 하나를 넷이 나눠 쓴다. */
     Ok((
         native_tls_config(cfg, vec![b"dot".to_vec()], material)?,
         native_tls_config(cfg, vec![b"h2".to_vec(), b"http/1.1".to_vec()], material)?,
@@ -270,34 +234,24 @@ pub(crate) fn tls_configs_from(
     ))
 }
 
-/**
- * @brief 지금 열려 있는 수신 주소들.
- *
- * @details 주소마다 그 주소를 연 설정을 이름으로 함께 가지고 있다. 이름이 그대로면 그 리스너는
- *          손대지 않는다. 그 주소로 오던 질의는 한 건도 끊기지 않는다.
- * @invariant 새 리스너를 모두 연 뒤에 이전 것을 닫는다. 반대로 하면 그 사이에 아무도 받지
- *            않는 구간이 생긴다. 리눅스는 SO_REUSEPORT라 같은 주소를 겹쳐 열 수 있다.
- */
+/// Open listen addresses, each with a key naming the config it was opened with. An unchanged key
+/// leaves that listener alone, so not one query to it is cut.
+///
+/// New listeners all open before the old ones close; the other way around would leave a gap with
+/// nobody receiving. On Linux, SO_REUSEPORT lets the same address be opened twice.
 #[derive(Default)]
 pub(crate) struct ListenerSet {
-    /** @brief 일반 DNS. */
     plain: Mutex<Vec<(String, onetdns_runtime::Server)>>,
-    /** @brief DoT. */
     dot: Mutex<Vec<(String, dot::DotListener)>>,
-    /** @brief DoH. */
     doh: Mutex<Vec<(String, doh::DohListener)>>,
-    /** @brief DoQ. */
     doq: Mutex<Vec<(String, quic_listener::QuicListener)>>,
-    /** @brief DoH3. */
     doh3: Mutex<Vec<(String, quic_listener::QuicListener)>>,
-    /** @brief 모든 주소의 DoQ·DoH3 연결이 함께 쓰는 전역 메모리 예산. */
+    /// Shared by DoQ and DoH3 connections on every address.
     quic_memory: Arc<quic_memory::QuicMemoryBudget>,
-    /** @brief 모든 주소의 DoH·DoT·DNSCrypt TCP 연결이 함께 쓰는 admission. */
+    /// Admission shared by DoH, DoT, and DNSCrypt TCP connections on every address.
     encrypted_tcp_admission: Arc<connection_limit::ConnectionLimiter>,
-    /**
-     * @brief DNSCrypt. UDP 리스너가 스레드라 종료 신호를 가지고 있고, 같은 주소의 TCP
-     *        리스너는 사라질 때 스스로 합류하므로 함께 가지고 있는다.
-     */
+    /// The UDP listener is a thread, so its stop signal is kept; the TCP listener at the same
+    /// address joins itself on drop, so it is kept alongside.
     dnscrypt: Mutex<
         Vec<(
             String,
@@ -308,7 +262,7 @@ pub(crate) struct ListenerSet {
 }
 
 impl ListenerSet {
-    /** @brief 모든 수신 주소를 닫는다. 세대를 끝낼 때 부른다. */
+    /// Called when a generation ends.
     pub(crate) fn close_all(&self) {
         for (_, server) in self.plain.lock_recover().drain(..) {
             server.shutdown();
@@ -324,7 +278,6 @@ impl ListenerSet {
     }
 }
 
-/** @brief 일반 DNS 리스너 하나를 여는 설정을 이름으로 만든다. */
 fn plain_listener_key(cfg: &Config, addr: &SocketAddr, workers: usize, acceptors: usize) -> String {
     format!(
         "{addr}|{}|{}|{}|{}|{:?}",
@@ -339,17 +292,9 @@ fn plain_listener_key(cfg: &Config, addr: &SocketAddr, workers: usize, acceptors
     )
 }
 
-/**
- * @brief 수신 주소를 열지 못한 이유를 운영자가 고칠 수 있게 적는다.
- *
- * @details 주소가 이미 쓰이고 있다는 사실만으로는 누가 잡고 있는지 알 수 없어 고칠 방법이
- *          없다. 특히 와일드카드 주소는 구체 주소가 모두 비어 있어도 막히므로, 포트가 비어
- *          보인다는 이유로 설정을 의심하게 된다. 점유자를 찾는 명령을 함께 알려 준다.
- * @param role  어떤 수신 주소인지.
- * @param addr  열려던 주소.
- * @param error 바인딩이 낸 오류.
- * @return 운영자에게 보일 문장.
- */
+/// "Address in use" alone does not say who holds it, so the operator cannot fix it. A wildcard
+/// address is blocked even when every specific address looks free, which makes the config look
+/// wrong. The message adds a command that finds the holder.
 fn listener_open_error(role: &str, addr: SocketAddr, error: &std::io::Error) -> String {
     let mut text = format!("Could not open the {role} listening address: {addr}: {error}");
     if error.kind() != std::io::ErrorKind::AddrInUse {
@@ -370,14 +315,12 @@ fn listener_open_error(role: &str, addr: SocketAddr, error: &std::io::Error) -> 
     text
 }
 
-/**
- * @brief 닫은 리스너 하나를 수신 상태 목록에서 뺀다.
- *
- * @details 설정 주소나 실제 주소가 같은 항목 가운데 먼저 들어간 것 하나만 뺀다. 같은
- *          주소로 새 리스너를 먼저 연 뒤 이전 것을 닫으므로, 같은 주소의 항목을 모두 지우면
- *          방금 연 리스너까지 목록에서 사라진다.
- * @warning 빼지 않으면 설정에서 지운 주소가 관리 화면에 계속 수신 중으로 남는다.
- */
+/// Removes the first entry whose configured or actual address matches. A new listener on the same
+/// address opens before the old one closes, so removing every match would also drop the one just
+/// opened.
+///
+/// Without this, an address removed from the config would stay listed as listening in the
+/// dashboard.
 fn forget_listener(
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
     kind: &str,
@@ -391,13 +334,10 @@ fn forget_listener(
     }
 }
 
-/**
- * @brief 설정에 맞춰 수신 주소를 열고 닫는다.
- *
- * @details 시작할 때와 교체할 때 모두 이 함수만 부른다. 설정이 그대로인 주소는 건드리지
- *          않으므로 그 주소의 질의는 끊기지 않는다. 새 것을 다 연 뒤에 이전 것을 닫는다.
- * @return 주소를 열지 못하면 실패. 그때 이전 리스너는 그대로 살아 있어 계속 답한다.
- */
+/// Startup and every swap go through this. Addresses whose config is unchanged are left alone, so
+/// their queries are never cut. New listeners open before old ones close.
+///
+/// Fails when an address cannot be opened; the old listeners then stay up and keep answering.
 pub(crate) fn reconcile_listeners(
     cfg: &Config,
     set: &ListenerSet,
@@ -428,7 +368,8 @@ pub(crate) fn reconcile_listeners(
         if plain.iter().any(|(have, _)| have == key) {
             continue;
         }
-        /* 같은 주소는 이전 리스너가 포트를 놓아야 열 수 있다. 드롭이 워커 합류까지 기다린다. */
+        // The old listener must release the port before the same address reopens; its drop waits
+        // for the workers to join.
         let same_addr = format!("{addr}|");
         plain.retain(|(have, server)| {
             let replaced = have.starts_with(&same_addr);
@@ -470,7 +411,7 @@ pub(crate) fn reconcile_listeners(
         }
         fresh_plain.push((key.clone(), server));
     }
-    /* 새 리스너를 다 연 뒤에 이전 것을 닫는다. 닫기는 Drop이 한다. */
+    // Old listeners close, through Drop, only after all new ones are open.
     plain.retain(|(key, server)| {
         let keep = wanted_plain.iter().any(|(want, _)| want == key);
         if !keep {
@@ -489,7 +430,7 @@ pub(crate) fn reconcile_listeners(
     reconcile_encrypted(cfg, set, handler, tls, shutdown, registry)
 }
 
-/** @brief 암호화 수신 주소들만 설정에 맞춘다. 일반 DNS는 건드리지 않는다. */
+/// Plain DNS is left alone.
 fn reconcile_encrypted(
     cfg: &Config,
     set: &ListenerSet,
@@ -498,10 +439,10 @@ fn reconcile_encrypted(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
 ) -> Result<(), String> {
-    /** @brief 인증서 슬롯이 없으면 암호화 수신 주소를 열 수 없다. */
     const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
 
-    /* DoH 경로는 리스너가 열 때 고정한다. 같은 주소는 이전 리스너를 먼저 내려야 다시 열 수 있다. */
+    // The DoH path is fixed when the listener opens. The same address reopens only after the old
+    // listener is taken down.
     macro_rules! sync_one {
         ($field:ident, $addrs:expr, $kind:literal, $open:expr) => {{
             let mut live = set.$field.lock_recover();
@@ -605,21 +546,14 @@ fn reconcile_encrypted(
     Ok(())
 }
 
-/** @brief DNSCrypt 인증서의 유효 기간. */
 const DNSCRYPT_CERT_VALID_SECS: u32 = 24 * 60 * 60;
 
-/**
- * @brief TLS 인증서 파일을 다시 확인하는 주기(초).
- * @details 갱신은 드물고 몇 분 늦게 반영되어도 무방하다. 짧게 잡을수록 아무 일도 없는
- *          동안 파일을 읽는 횟수만 늘어난다.
- */
+/// Renewals are rare and a few minutes' delay is fine; a shorter period only adds reads while
+/// nothing happens.
 pub(crate) const TLS_CERT_WATCH_SECS: u64 = 300;
 
-/**
- * @brief 인증서 파일을 주기마다 다시 읽는 스레드를 띄운다.
- * @details 인증서 갱신은 설정을 건드리지 않고 같은 경로의 내용만 바꾼다. 갱신 도구가 이 서버에
- *          아무것도 알리지 않아도 다음 연결부터 새 인증서를 쓰게 하려는 것이다.
- */
+/// A renewal changes only the file contents at the same path, not the config. This lets new
+/// connections use the new certificate even though the renewal tool tells this server nothing.
 pub(crate) fn spawn_tls_cert_watch(
     runtime_cfg: Arc<onetdns_core::ArcSwap<Config>>,
     slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
@@ -647,10 +581,8 @@ pub(crate) fn spawn_tls_cert_watch(
                             );
                         }
                     }
-                    /*
-                     * 갱신 도구가 파일을 쓰는 중이면 한두 번은 읽기에 실패한다. 같은 실패를 반복해
-                     * 적으면 기록이 그것으로 덮인다.
-                     */
+                    // A read or two fail while a renewal tool is writing the file; logging the same
+                    // failure repeatedly would drown the log.
                     Err(error) => {
                         if last_error.as_deref() != Some(error.as_str()) {
                             onetdns_core::warn!(
@@ -666,20 +598,8 @@ pub(crate) fn spawn_tls_cert_watch(
         })
 }
 
-/**
- * @brief DNSCrypt 수신 주소를 설정에 맞춘다.
- *
- * @details 주소와 공급자 이름을 이름으로 삼는다. 이름이 그대로면 그 리스너는 손대지 않는다.
- *          수신 반복은 500밀리초마다 종료 신호를 보므로 보내면 곧 포트를 놓는다.
- * @return 주소를 열지 못하거나 공급자 키를 읽지 못하면 실패. 이전 리스너는 그대로 둔다.
- */
-/**
- * @brief 주소가 풀릴 때까지 잠깐 기다리며 리스너를 연다.
- *
- * @details 앞서 닫은 리스너의 반복은 종료 신호를 확인하고 나가야 소켓을 놓는다. 그
- *          사이를 기다리지 않으면 같은 주소를 다시 열 때 이미 쓰이고 있다며 실패한다.
- * @return 열린 리스너, 또는 기다려도 풀리지 않았을 때의 오류.
- */
+/// A listener closed just before releases its socket only after its loop sees the stop signal;
+/// without waiting, reopening the address fails as in use. Returns the error if it never frees.
 fn open_when_free<T>(mut open: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -696,6 +616,8 @@ fn open_when_free<T>(mut open: impl FnMut() -> std::io::Result<T>) -> std::io::R
     }
 }
 
+/// Keyed by address and provider name; a listener whose key is unchanged is left alone.
+/// Fails when the provider key cannot be read or an address cannot be opened.
 pub(crate) fn reconcile_dnscrypt(
     cfg: &Config,
     set: &ListenerSet,
@@ -751,10 +673,8 @@ pub(crate) fn reconcile_dnscrypt(
         if live.iter().any(|(have, _, _)| have == key) {
             continue;
         }
-        /*
-         * 주소는 그대로인데 설정만 바뀌었으면 이전 리스너를 먼저 닫는다. 잡고 있는 채로
-         * 다시 열면 주소가 이미 쓰이고 있다며 실패한다.
-         */
+        // The address is unchanged but its config changed, so the old listener closes first;
+        // reopening while it holds the address would fail as in use.
         let prefix = format!("dnscrypt|{addr}|");
         let mut index = 0;
         while index < live.len() {
@@ -797,10 +717,8 @@ pub(crate) fn reconcile_dnscrypt(
                 })?;
             track_service_thread(tracker, thread);
         }
-        /*
-         * 규격은 인증서 조회와 잘린 응답의 재시도를 TCP 로 시킨다. UDP 만 열면 그 경로가
-         * 전부 막히므로 같은 주소를 둘 다로 받는다.
-         */
+        // The spec sends certificate lookups and truncated-response retries over TCP, and UDP alone
+        // would break them, so the same address listens on both.
         let tcp = open_when_free(|| {
             dnscrypt::serve_tcp(
                 *addr,
@@ -838,7 +756,6 @@ pub(crate) fn reconcile_dnscrypt(
 }
 
 #[cfg(test)]
-/** @brief 리스너 교체와 인증서 슬롯. */
 mod tests {
     use super::*;
     use onetdns_config::Config;
@@ -846,14 +763,9 @@ mod tests {
     use crate::CONFIG_FILE_NAME;
 
     #[test]
-    /**
-     * @brief 주소가 이미 쓰이고 있을 때 점유자를 찾는 방법까지 알려 주는지.
-     *
-     * @details 포트를 잡고 있는 것이 다른 서비스면 오류 문구만으로는 설정을 의심하게 된다.
-     *          와일드카드는 구체 주소가 다 비어 있어도 막히므로 특히 그렇다. 찾는 명령과
-     *          구체 주소로 우회할 수 있다는 사실을 함께 내보내야 운영자가 다음 행동을
-     *          정할 수 있다.
-     */
+    /// When another service holds the port, the error alone points at the config, especially for a
+    /// wildcard address that is blocked while every specific address is free. The message must name
+    /// a command to find the holder and mention binding a specific address instead.
     fn an_occupied_listen_address_says_how_to_find_what_holds_it() {
         let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "이미 쓰는 중");
         let wildcard = listener_open_error("일반 DNS", "0.0.0.0:53".parse().unwrap(), &busy);
@@ -885,13 +797,6 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 경로가 그대로인 채 내용만 갱신된 인증서를 다시 적용하는지.
-     *
-     * @details 갱신 도구와 ACME 발급은 같은 경로에 새 인증서를 덮어쓴다. 설정 항목 비교만
-     *          보면 바뀐 것이 없어 보이므로, 파일 내용을 근거로 삼지 않으면 다시 시작할
-     *          때까지 만료된 인증서를 계속 내민다.
-     */
     fn replacing_the_certificate_file_swaps_the_live_certificate() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-tls-refresh-{}-{}",
@@ -946,7 +851,7 @@ mod tests {
             );
         }
 
-        /* 클라이언트 인증서를 확인하는 CA 번들도 경로가 그대로인 채 갈린다. */
+        // The client CA bundle is also replaced under the same path.
         let ca_path = dir.join("ca.pem");
         let (first_ca, _) =
             onetdns_transport::generate_self_signed_pem("ca-one.test").expect("CA 하나");
@@ -990,7 +895,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DNSCrypt 장기 신원 키가 한 번 저장되고 재시작 뒤 같은 공개키로 복원되는지. */
     fn dnscrypt_provider_identity_survives_reload() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

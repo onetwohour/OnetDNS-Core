@@ -1,6 +1,4 @@
-/*!
- * @brief 권한 영역 서명 키를 읽거나 만들고 ZSK를 교체한다.
- */
+//! Loads or creates signing keys for authoritative zones and rolls ZSKs.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +13,6 @@ use crate::{
     LOCAL_KEY_MAX_BYTES, LOCAL_STATE_MAX_BYTES,
 };
 
-/** @brief 이 영역의 서명 키 경로. */
 pub(crate) fn zsk_path_for(zc: &onetdns_config::ZoneConfig) -> std::path::PathBuf {
     zc.dnssec_key.clone().unwrap_or_else(|| {
         let base = zc.file.clone().unwrap_or_default();
@@ -23,7 +20,7 @@ pub(crate) fn zsk_path_for(zc: &onetdns_config::ZoneConfig) -> std::path::PathBu
     })
 }
 
-/** @brief 이 영역이 키를 둘로 나눠 쓰는지. */
+/// KSK and ZSK as separate keys.
 pub(crate) fn zone_is_split_key(zc: &onetdns_config::ZoneConfig) -> bool {
     if zc.dnssec_ksk.is_some() {
         return true;
@@ -32,7 +29,6 @@ pub(crate) fn zone_is_split_key(zc: &onetdns_config::ZoneConfig) -> bool {
     std::path::PathBuf::from(format!("{}.ksk", base.display())).exists()
 }
 
-/** @brief 서명 키를 주기적으로 교체하는 스레드를 시작한다. */
 pub(crate) fn spawn_zsk_rollover(
     zones: Vec<(onetdns_proto::Name, std::path::PathBuf)>,
     interval: u64,
@@ -117,11 +113,8 @@ pub(crate) fn spawn_zsk_rollover(
         .map(Some)
 }
 
-/**
- * @brief ZSK 교체 작업을 새 설정으로 다시 시작하는 함수.
- * @details 키를 둘로 나눠 쓰는 서명 영역만 교체한다. 영역 목록이나 주기가 바뀌면 이전 작업을
- *          멈추고 새로 띄운다.
- */
+/// Only split-key signed zones roll. A changed zone list or period stops the old job and starts a
+/// new one.
 pub(crate) fn rollover_restart(
     jobs: Arc<EdgeServices>,
     reload_keys: ZoneKeyReload,
@@ -153,26 +146,22 @@ pub(crate) fn rollover_restart(
     })
 }
 
-/** @brief 서명 영역과 그 키. 키 교체와 설정 변경이 이 핸들 하나를 교체한다. */
+/// Signed zones and their keys. Key rolls and config changes swap this one handle.
 pub(crate) type SharedZoneSigners =
     Arc<onetdns_core::ArcSwap<Vec<(onetdns_proto::Name, ZoneSigningCtx)>>>;
 
-/** @brief 키를 교체한 영역들을 새 키로 다시 만든다. */
+/// Rebuilds the zones whose keys rolled.
 pub(crate) type ZoneKeyReload =
     Arc<dyn Fn(&[onetdns_proto::Name]) -> Result<(), String> + Send + Sync>;
 
-/** @brief 교체 전 키. 실패하면 되돌린다. */
+/// Keys before the roll, restored on failure.
 struct RollKeyBackup {
-    /** @brief 지금 쓰는 키. */
     active: FileBackup,
-    /** @brief 다음에 쓸 키. */
     next: FileBackup,
-    /** @brief 직전에 쓰던 키. */
     prev: FileBackup,
 }
 
 impl RollKeyBackup {
-    /** @brief 지금 키를 담아 둔다. */
     fn capture(zsk: &std::path::Path) -> std::io::Result<Self> {
         Ok(Self {
             active: FileBackup::capture(zsk, true)?,
@@ -181,7 +170,6 @@ impl RollKeyBackup {
         })
     }
 
-    /** @brief 담아 둔 키로 되돌린다. */
     fn restore(&self, zsk: &std::path::Path) -> std::io::Result<()> {
         let next_path = rollover::next_path(zsk);
         let prev_path = rollover::prev_path(zsk);
@@ -204,7 +192,8 @@ impl RollKeyBackup {
     }
 }
 
-/** @brief 키 교체를 한 단계 진행한다. 새 키를 미리 알리고 충분히 기다린 뒤에 바꿔야 검증이 끊기지 않는다. */
+/// Advances a key roll one step. The new key must be published and waited on long enough before the
+/// switch, or validation breaks.
 fn apply_roll_transition(
     origin: &onetdns_proto::Name,
     zsk: &std::path::Path,
@@ -272,25 +261,18 @@ fn apply_roll_transition(
 }
 
 #[derive(Clone)]
-/** @brief 영역 하나를 서명할 키들. */
 pub(crate) struct ZoneSigningCtx {
-    /** @brief 실제로 서명하는 것. */
     pub(crate) signer: Arc<onetdns_dnssec::sign::ZoneSigner>,
-    /** @brief 부재 증명 방식. */
     mode: onetdns_dnssec::sign::DenialMode,
 }
 
 impl ZoneSigningCtx {
-    /** @brief 이 기록들에 서명한다. */
     pub(crate) fn sign(&self, records: &[onetdns_proto::Record]) -> Vec<onetdns_proto::Record> {
         self.sign_reusing(records, &[])
     }
 
-    /**
-     * @brief 지난 서명을 물려받아 서명한다.
-     * @param previous 이 서버가 직접 서명해 저장소에 가지고 있던 레코드들. 바깥에서 받은 것을
-     *                 넘기면 검증하지 않은 서명을 내보내게 된다.
-     */
+    /// Reuses signatures from `previous`, which must be records this server signed; signatures from
+    /// elsewhere would go out unverified.
     pub(crate) fn sign_reusing(
         &self,
         records: &[onetdns_proto::Record],
@@ -306,17 +288,13 @@ impl ZoneSigningCtx {
     }
 }
 
-/** @brief 무작위 시드. */
 fn random_seed() -> [u8; 32] {
     let mut s = [0u8; 32];
     onetdns_tls::sys::fill_random(&mut s);
     s
 }
 
-/**
- * @brief 키를 읽거나 만든다.
- * @param algorithm 새로 만들 때 쓸 알고리즘. 이미 있는 키는 파일이 스스로 무엇인지 말한다.
- */
+/// `algorithm` applies only to a new key; an existing file carries its own.
 fn load_or_create_key_pem(
     path: &std::path::Path,
     label: &str,
@@ -350,7 +328,6 @@ fn load_or_create_key_pem(
     Ok(pem)
 }
 
-/** @brief 이 영역의 서명기를 올린다. */
 pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSigningCtx, String> {
     use onetdns_dnssec::sign::{DenialMode, Nsec3Params, ZoneSigner};
     let origin = onetdns_proto::Name::from_str(&zc.origin)
@@ -461,7 +438,6 @@ pub(crate) fn load_zone_signer(zc: &onetdns_config::ZoneConfig) -> Result<ZoneSi
     })
 }
 
-/** @brief 영역에 서명을 붙인다. */
 pub(crate) fn sign_authority_zone(
     zone: onetdns_authority::Zone,
     ctx: &ZoneSigningCtx,
@@ -490,13 +466,12 @@ pub(crate) fn sign_authority_zone(
 }
 
 #[cfg(test)]
-/** @brief 영역 서명. */
 mod tests {
     use super::*;
     use crate::{unix_now, LOCAL_KEY_MAX_BYTES};
 
     #[test]
-    /** @brief 키를 못 읽었을 때 조용히 새로 만들지 않는지. 만들면 서명이 전부 바뀐다. */
+    /// A new key would change every signature.
     fn unreadable_dnssec_key_is_not_silently_replaced() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-oversized-key-{}-{}",

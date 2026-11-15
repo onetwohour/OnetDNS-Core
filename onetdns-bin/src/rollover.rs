@@ -1,27 +1,19 @@
-/*!
- * @brief 키 롤오버 단계 관리.
- *
- * @details 새 키를 바로 쓰지 않는다. 먼저 공표해 검증기들이 보게 하고, 그다음 서명을
- *          옮기고, 마지막에 이전 키를 뺀다. 각 단계 사이에 충분히 기다린다.
- * @warning 단계를 건너뛰면 그 사이 응답이 검증 실패한다. 캐시에 남은 이전 키를 쓰는
- *          검증기가 새 서명을 확인하지 못하기 때문이다.
- */
+//! ZSK rollover phases: publish the new key so validators see it, sign with it, then drop the old
+//! key, waiting between each step. Skipping a wait fails validation in between: a validator with
+//! only the old key cached cannot check the new signatures.
 
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 롤오버 진행 단계. */
 pub enum Phase {
-    /** @brief 교체 중이 아니다. */
     Stable,
-    /** @brief 새 키를 알리고 퍼지기를 기다린다. */
+    /// The new key is published; waiting for it to reach validators.
     Publish,
-    /** @brief 새 키로 서명하기 시작한다. */
+    /// Signing with the new key; the old one stays published.
     Activate,
 }
 
 impl Phase {
-    /** @brief 상태 파일에 적을 이름. */
     fn as_str(self) -> &'static str {
         match self {
             Phase::Stable => "stable",
@@ -29,7 +21,6 @@ impl Phase {
             Phase::Activate => "activate",
         }
     }
-    /** @brief 상태 파일의 이름을 단계로. */
     fn from_str(s: &str) -> Option<Phase> {
         match s {
             "stable" => Some(Phase::Stable),
@@ -41,24 +32,20 @@ impl Phase {
 }
 
 #[derive(Debug, Clone, Copy)]
-/** @brief 각 단계에서 기다릴 시간. */
 pub struct RollTiming {
-    /** @brief 교체를 시작할 간격. */
+    /// How often a roll starts.
     pub interval: u64,
 
-    /** @brief 새 키를 알린 뒤 기다릴 시간. 짧으면 검증이 끊긴다. */
+    /// Too short breaks validation.
     pub publish_wait: u64,
 
-    /** @brief 새 키로 바꾼 뒤 이전 키를 지우기까지 기다릴 시간. */
+    /// Wait after the switch before the old key is removed.
     pub activate_wait: u64,
 }
 
 impl RollTiming {
-    /**
-     * @brief 전체 주기에서 단계별 대기 시간을 나눈다.
-     * @note 0이면 롤오버를 하지 않는다. 대기 시간에 하한이 있어, 주기를 아무리 짧게 잡아도
-     *       검증기가 새 키를 볼 틈은 남는다.
-     */
+    /// 0 disables rollover. The waits have a floor, so even a short period leaves validators time
+    /// to see the new key.
     pub fn from_interval(interval: u64) -> Self {
         RollTiming {
             interval,
@@ -69,16 +56,12 @@ impl RollTiming {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 지금 단계와 그 단계에 들어간 시각. */
 pub struct RollState {
-    /** @brief 지금 어느 단계인지. */
     pub phase: Phase,
-    /** @brief 이 단계에 들어온 시각. */
     pub since: u64,
 }
 
 impl RollState {
-    /** @brief 롤오버 중이 아닌 상태. */
     pub fn stable(now: u64) -> Self {
         RollState {
             phase: Phase::Stable,
@@ -86,12 +69,11 @@ impl RollState {
         }
     }
 
-    /** @brief 상태를 파일에 적을 형태로. */
     pub fn serialize(&self) -> String {
         format!("phase {}\nsince {}\n", self.phase.as_str(), self.since)
     }
 
-    /** @brief 상태 파일을 읽는다. 형식이 어긋나면 없다. */
+    /// None when malformed.
     pub fn parse(s: &str) -> Option<RollState> {
         let mut lines = s.lines();
         let phase = Phase::from_str(lines.next()?.strip_prefix("phase ")?)?;
@@ -107,10 +89,7 @@ impl RollState {
     }
 }
 
-/**
- * @brief 대기 시간이 지났으면 다음 단계로 넘어간다.
- * @return 아직 기다릴 때가 남았으면 없다. 호출자는 다음 주기에 다시 묻는다.
- */
+/// None while the current phase is still waiting; the caller asks again next cycle.
 pub fn advance(state: RollState, now: u64, t: RollTiming) -> Option<RollState> {
     if t.interval == 0 {
         return None;
@@ -135,20 +114,17 @@ pub fn advance(state: RollState, now: u64, t: RollTiming) -> Option<RollState> {
     })
 }
 
-/** @brief 다음 키 파일 경로. */
 pub fn next_path(active: &Path) -> PathBuf {
     with_ext(active, "next")
 }
-/** @brief 이전 키 파일 경로. 이전 키를 아직 공표해야 할 때 쓴다. */
+/// Holds the old key while it must stay published.
 pub fn prev_path(active: &Path) -> PathBuf {
     with_ext(active, "prev")
 }
-/** @brief 상태 파일 경로. */
 pub fn state_path(active: &Path) -> PathBuf {
     with_ext(active, "roll")
 }
 
-/** @brief 경로에 확장자를 붙인다. */
 fn with_ext(p: &Path, ext: &str) -> PathBuf {
     let mut s = p.as_os_str().to_os_string();
     s.push(".");
@@ -157,12 +133,10 @@ fn with_ext(p: &Path, ext: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-/** @brief 단계가 순서대로 나아가고 대기 시간이 지켜지는지. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 상태가 파일 왕복에서 보존되는지. */
     fn state_roundtrips() {
         let s = RollState {
             phase: Phase::Activate,
@@ -176,14 +150,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주기가 0이면 롤오버하지 않는지. */
     fn disabled_when_interval_zero() {
         let t = RollTiming::from_interval(0);
         assert!(advance(RollState::stable(0), 1_000_000, t).is_none());
     }
 
     #[test]
-    /** @brief 단계가 건너뛰지 않고 순서대로 도는지. */
     fn full_cycle_advances_in_order() {
         let t = RollTiming {
             interval: 1000,
@@ -209,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 키 파일 경로들이 서로 겹치지 않는지. */
+    /// Key file paths are distinct.
     fn path_slots() {
         let p = Path::new("/etc/onetdns/example.com.zone.key");
         assert_eq!(
@@ -227,7 +199,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 주기를 짧게 잡아도 대기 시간에 하한이 남는지. */
     fn from_interval_waits_are_bounded() {
         let t = RollTiming::from_interval(30 * 86_400);
         assert!(t.publish_wait >= 1 && t.publish_wait < t.interval);

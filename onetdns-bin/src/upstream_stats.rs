@@ -1,6 +1,4 @@
-/*!
- * @brief 업스트림 통계를 파일에 저장하고 다시 시작할 때 읽는다.
- */
+//! Saves upstream stats to a file and loads them on restart.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -10,26 +8,23 @@ use onetdns_core::MutexExt;
 use crate::atomic_file::atomic_write;
 use crate::{read_text_limited, sleep_or_shutdown};
 
-/** @brief 업스트림 성적을 담아 둘 파일 이름. */
 const UPSTREAM_STATS_FILE: &str = "upstream-stats.json";
 
-/** @brief 읽어들일 업스트림 성적 파일 크기 상한. */
 const MAX_UPSTREAM_STATS_BYTES: u64 = 16 * 1024 * 1024;
 
-/** @brief 업스트림 성적 파일 경로. */
 pub(crate) fn upstream_stats_path(
     config_path: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     Some(config_path?.parent()?.join(UPSTREAM_STATS_FILE))
 }
 
-/** @brief 업스트림 성적을 저장한다. 재시작해도 어느 업스트림이 좋았는지 잊지 않으려는 것이다. */
+/// So a restart does not forget which upstreams did well.
 pub(crate) fn save_upstream_stats(
     path: &std::path::Path,
     reports: &[onetdns_forward::UpstreamStatReport],
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /** @brief 연달아 실패한 횟수. 계속 실패하면 경고 소리를 줄인다. */
+    /// Consecutive save failures; warned at powers of two.
     static CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
     let items: Vec<String> = reports
@@ -76,7 +71,6 @@ pub(crate) fn save_upstream_stats(
     }
 }
 
-/** @brief 저장된 업스트림 성적을 읽는다. */
 pub(crate) fn load_upstream_stats(
     path: &std::path::Path,
 ) -> Vec<onetdns_forward::UpstreamStatReport> {
@@ -167,11 +161,8 @@ pub(crate) fn load_upstream_stats(
     reports
 }
 
-/**
- * @brief 업스트림 성적을 주기마다 파일에 쓰는 스레드를 띄운다.
- * @details 전달 경로가 없어도 띄운다. 핫 적용이 나중에 전달 리졸버를 만들면 그 통계가 이 슬롯에
- *          들어온다. 종료 신호를 받으면 한 번 더 쓰고 끝난다.
- */
+/// Spawned even without a forwarding path: a later hot apply may build a forwarding resolver whose
+/// stats land in this slot. Writes once more on shutdown.
 pub(crate) fn spawn_flush(
     path: std::path::PathBuf,
     stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
@@ -194,12 +185,10 @@ pub(crate) fn spawn_flush(
 }
 
 #[cfg(test)]
-/** @brief 업스트림 통계 파일의 저장과 복원. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 업스트림 성적이 저장됐다 읽히는지. */
     fn upstream_stats_persist_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "onetdns-upstat-{}-{}",

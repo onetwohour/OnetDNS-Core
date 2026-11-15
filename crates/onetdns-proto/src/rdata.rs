@@ -1,10 +1,7 @@
-/*!
- * @brief 레코드 타입과 RDATA: 타입별 파싱, 검사, 인코딩.
- *
- * @details 모르는 타입은 RData::Unknown으로 원시 바이트를 보존해 그대로 중계한다.
- *          단, 압축 이름을 품을 수 있는 이전 타입은 예외로 거부한다. 원시 바이트를 다시
- *          쓰면 이전 메시지 기준의 포인터가 새 메시지에서 엉뚱한 곳을 가리키기 때문이다.
- */
+//! Record types and RDATA: per-type parsing, validation, and encoding. Unknown types keep their raw
+//! bytes in RData::Unknown and are relayed as is, except obsolete types that can carry compressed
+//! names: rewriting their raw bytes would leave pointers into the old message aimed at the wrong
+//! place in the new one.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -13,75 +10,42 @@ use crate::name::Name;
 use crate::wire::{Reader, Writer};
 use crate::ProtoError;
 
-/**
- * @brief DNS 레코드 타입 코드.
- *
- * @details 열거형이 아닌 newtype이라 미지의 타입도 값으로 담아 전달한다. 새 타입이 등록될
- *          때마다 코드를 고치지 않아도 캐시와 중계가 동작하게 하려는 설계다.
- */
+/// A newtype rather than an enum, so unknown types are carried as values and caching and relaying
+/// need no code change for each new type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecordType(pub u16);
 
 #[allow(non_upper_case_globals)]
 impl RecordType {
-    /** @brief IPv4 주소. */
     pub const A: RecordType = RecordType(1);
-    /** @brief 이름 서버. */
     pub const NS: RecordType = RecordType(2);
-    /** @brief 별칭. */
     pub const CNAME: RecordType = RecordType(5);
-    /** @brief 영역의 권한 정보. */
     pub const SOA: RecordType = RecordType(6);
-    /** @brief 주소에서 이름으로. */
     pub const PTR: RecordType = RecordType(12);
-    /** @brief 메일 서버. */
     pub const MX: RecordType = RecordType(15);
-    /** @brief 임의의 글. */
     pub const TXT: RecordType = RecordType(16);
-    /** @brief IPv6 주소. */
     pub const AAAA: RecordType = RecordType(28);
-    /** @brief 규칙으로 다른 이름을 이끌어 낸다. */
     pub const NAPTR: RecordType = RecordType(35);
-    /** @brief 이름 아래를 전부 옮긴다. */
     pub const DNAME: RecordType = RecordType(39);
-    /** @brief 서비스가 있는 곳과 포트. */
     pub const SRV: RecordType = RecordType(33);
-    /** @brief 원격 접속 키 지문. */
     pub const SSHFP: RecordType = RecordType(44);
-    /** @brief 이 이름이 쓸 인증서를 못 고정한다. */
     pub const TLSA: RecordType = RecordType(52);
-    /** @brief 주소 하나. */
     pub const URI: RecordType = RecordType(256);
-    /** @brief 확장 옵션을 담는 유사 기록. */
     pub const OPT: RecordType = RecordType(41);
-    /** @brief 아래 영역의 키 지문. */
     pub const DS: RecordType = RecordType(43);
-    /** @brief 서명. */
     pub const RRSIG: RecordType = RecordType(46);
-    /** @brief 이름 사이에 아무것도 없다는 증명. */
     pub const NSEC: RecordType = RecordType(47);
-    /** @brief 서명에 쓰는 공개 키. */
     pub const DNSKEY: RecordType = RecordType(48);
-    /** @brief 이름을 감춘 형태의 부재 증명. */
     pub const NSEC3: RecordType = RecordType(50);
-    /** @brief 위 영역에 올릴 키 지문. */
     pub const CDS: RecordType = RecordType(59);
-    /** @brief 위 영역에 올릴 공개 키. */
     pub const CDNSKEY: RecordType = RecordType(60);
-    /** @brief 서비스가 있는 곳과 그 성질. */
     pub const SVCB: RecordType = RecordType(64);
-    /** @brief 웹 서비스가 있는 곳과 그 성질. */
     pub const HTTPS: RecordType = RecordType(65);
-    /** @brief 이 이름의 인증서를 낼 수 있는 기관. */
     pub const CAA: RecordType = RecordType(257);
-    /** @brief 모든 종류를 묻는 질의 전용. */
     pub const ANY: RecordType = RecordType(255);
 
-    /**
-     * @brief 표시용 타입 이름.
-     * @return 이름을 아는 타입의 약칭, 모르면 "UNKNOWN". 로그·대시보드 전용이며
-     *         이 문자열을 파싱해 되돌리는 용도로 쓰지 않는다.
-     */
+    /// Display name: the mnemonic, or "UNKNOWN". For logs and the dashboard only; never parse it
+    /// back.
     pub fn name(self) -> &'static str {
         match self.0 {
             1 => "A",
@@ -112,179 +76,123 @@ impl RecordType {
     }
 }
 
-/**
- * @brief DNS 클래스 코드.
- * @note OPT 레코드는 이 필드를 클래스가 아니라 UDP 페이로드 크기로 쓴다.
- *       UPDATE(RFC 2136)도 254/255를 연산 부호로 전용한다.
- */
+/// OPT uses this field for the UDP payload size, and UPDATE (RFC 2136) uses 254 and 255 as
+/// operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DnsClass(pub u16);
 
 #[allow(non_upper_case_globals)]
 impl DnsClass {
-    /** @brief 인터넷 클래스. 실질적으로 유일하게 쓰이는 값이다. */
     pub const IN: DnsClass = DnsClass(1);
 }
 
-/**
- * @brief 타입별로 해석된 레코드 데이터.
- *
- * @details 크기가 캐시 비용을 직접 좌우한다. 가장 큰 변형이 모든 캐시 레코드의
- *          비용을 정하므로, 드물고 큰 변형은 Box로 간접화한다(SOA, NAPTR).
- *          typed_rdata_tests의 레이아웃 단언이 이 크기를 고정해 두는 감시 장치다.
- * @invariant record_type()이 돌려주는 타입은 이 변형과 항상 일치한다. 메시지 인코더가
- *            레코드의 TYPE 필드와 이 값을 대조해 어긋나면 인코딩을 거부한다.
- */
+/// Size directly sets cache cost: the largest variant prices every cached record, so rare large
+/// variants are boxed (SOA, NAPTR). The layout assertion in typed_rdata_tests pins the size.
+///
+/// record_type() always matches the variant; the message encoder compares it with each record's
+/// TYPE field and refuses to encode on a mismatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub enum RData {
-    /** @brief IPv4 주소. */
     A(Ipv4Addr),
-    /** @brief IPv6 주소. */
     Aaaa(Ipv6Addr),
-    /** @brief 이 영역의 이름 서버. */
     Ns(Name),
-    /** @brief 이 이름의 별칭. */
     Cname(Name),
-    /** @brief 이 이름 아래를 전부 옮긴다. */
     Dname(Name),
-    /** @brief 주소에서 이름으로. */
     Ptr(Name),
-    /** @brief 메일 서버. */
-    Mx { preference: u16, exchange: Name },
-    /** @brief 임의의 글. */
+    Mx {
+        preference: u16,
+        exchange: Name,
+    },
     Txt(Vec<Vec<u8>>),
 
-    /** @brief 영역의 권한 정보. */
     Soa(Box<Soa>),
-    /** @brief 서비스가 있는 곳과 포트. */
     Srv {
-        /** @brief 먼저 볼 순서. 작을수록 먼저다. */
+        /// Lower is tried first.
         priority: u16,
-        /** @brief 같은 순서 안에서 나눠 가질 몫. */
+        /// Share among records of equal priority.
         weight: u16,
-        /** @brief 붙을 포트. */
         port: u16,
-        /** @brief 붙을 이름. */
         target: Name,
     },
 
-    /** @brief 인증서를 낼 수 있는 기관. */
     Caa {
-        /** @brief 이 항목을 반드시 이해해야 하는지 나타내는 표시. */
+        /// Holds the critical bit: whether this entry must be understood.
         flags: u8,
-        /** @brief 무엇을 제한하는지. */
         tag: Box<[u8]>,
-        /** @brief 그 값. */
         value: Box<[u8]>,
     },
 
-    /** @brief 이 이름이 쓸 인증서를 못 고정한다. */
     Tlsa {
-        /** @brief 이 기록을 어떻게 쓸지. */
         usage: u8,
-        /** @brief 인증서의 어느 부분을 가리키는지. */
         selector: u8,
-        /** @brief 그 부분을 어떻게 맞춰 볼지. */
         matching: u8,
-        /** @brief 맞춰 볼 값. */
         data: Vec<u8>,
     },
 
-    /** @brief 원격 접속 키 지문. */
     Sshfp {
-        /** @brief 키 알고리즘. */
         algorithm: u8,
-        /** @brief 지문을 만든 방식. */
         fp_type: u8,
-        /** @brief 지문. */
         fingerprint: Vec<u8>,
     },
 
-    /** @brief 규칙으로 다른 이름을 이끌어 낸다. */
     Naptr(Box<Naptr>),
 
-    /** @brief 주소 하나. */
     Uri {
-        /** @brief 먼저 볼 순서. */
         priority: u16,
-        /** @brief 같은 순서 안에서 나눠 가질 몫. */
         weight: u16,
-        /** @brief 가리키는 주소. */
         target: Vec<u8>,
     },
 
-    /** @brief 서비스가 있는 곳과 그 성질. */
     Svcb {
-        /** @brief 먼저 볼 순서. 0이면 다른 이름으로 넘긴다는 뜻이다. */
+        /// 0 means AliasMode, which hands off to another name.
         priority: u16,
-        /** @brief 붙을 이름. */
         target: Name,
-        /** @brief 이 서비스의 성질들. */
         params: Box<[(u16, Box<[u8]>)]>,
     },
 
-    /** @brief 웹 서비스가 있는 곳과 그 성질. */
     Https {
-        /** @brief 먼저 볼 순서. 0이면 다른 이름으로 넘긴다는 뜻이다. */
+        /// 0 means AliasMode, which hands off to another name.
         priority: u16,
-        /** @brief 붙을 이름. */
         target: Name,
-        /** @brief 이 서비스의 성질들. */
         params: Box<[(u16, Box<[u8]>)]>,
     },
 
-    /** @brief 이 서버가 뜻을 모르는 종류. 바이트를 그대로 전달한다. */
+    /// A type this server does not interpret; the bytes are relayed as is.
     Unknown(u16, Vec<u8>),
 }
 
-/** @brief NAPTR RDATA(RFC 3403). 크기가 커서 RData에서 Box로 간접 참조한다. */
+/// NAPTR RDATA (RFC 3403); boxed in RData because of its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Naptr {
-    /** @brief 먼저 볼 순서. */
     pub order: u16,
-    /** @brief 같은 순서 안에서의 우선순위. */
     pub preference: u16,
-    /** @brief 이 기록을 어떻게 쓸지 나타내는 글자. */
     pub flags: Vec<u8>,
-    /** @brief 어떤 서비스에 쓰는지. */
     pub services: Vec<u8>,
-    /** @brief 이름을 바꾸는 규칙. */
     pub regexp: Vec<u8>,
-    /** @brief 규칙 대신 쓸 이름. */
     pub replacement: Name,
 }
 
-/**
- * @brief SOA RDATA. zone의 권한 정보와 2차 서버 타이머를 담는다.
- * @note serial은 RFC 1982 순환 산술로 비교한다. 단순 크기 비교를 하면 되감긴 직렬번호가
- *       영원히 최신으로 남는다.
- */
+/// Compare `serial` with RFC 1982 serial arithmetic; a plain comparison would keep a wrapped serial
+/// newest forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Soa {
-    /** @brief 이 영역의 주 서버. */
     pub mname: Name,
-    /** @brief 관리자 주소를 이름으로 적은 것. */
     pub rname: Name,
-    /** @brief 시리얼. 바뀌면 하위 서버가 다시 받아 간다. */
     pub serial: u32,
-    /** @brief 하위 서버가 다시 물어볼 간격. */
     pub refresh: u32,
-    /** @brief 실패했을 때 다시 물어볼 간격. */
     pub retry: u32,
-    /** @brief 이 시간이 지나면 하위 서버가 잡은 영역을 버린다. */
     pub expire: u32,
-    /** @brief 부정 응답을 담아 둘 기간. */
     pub minimum: u32,
 }
 
-/** @brief 길이 접두사가 붙은 character-string(최대 255옥텟)을 읽는다. */
+/// Length-prefixed character-string, at most 255 octets.
 fn read_char_string(r: &mut Reader) -> Result<Vec<u8>, ProtoError> {
     let n = r.u8()? as usize;
     Ok(r.bytes(n)?.to_vec())
 }
 
-/** @brief character-string을 쓴다. 255옥텟을 넘으면 자르지 않고 인코딩을 실패시킨다. */
+/// Longer than 255 octets fails the encoding instead of truncating.
 fn write_char_string(w: &mut Writer, s: &[u8]) {
     let Ok(n) = u8::try_from(s.len()) else {
         w.fail("DNS character string exceeds 255 bytes");
@@ -294,13 +202,10 @@ fn write_char_string(w: &mut Writer, s: &[u8]) {
     w.push_bytes(s);
 }
 
-/**
- * @brief RDATA에 압축 이름을 품을 수 있는데 이 서버가 해석하지 않는 이전 타입인지.
- *
- * @details MD/MF/MB/MG/MR/MINFO/RP/AFSDB/RT/SIG/PX/NXT 계열이다. 미해석 바이트로 보관한 뒤
- *          다른 메시지에 그대로 다시 쓰면, 원본 메시지 기준의 압축 포인터가 새 메시지의
- *          엉뚱한 위치를 가리켜 이름이 조작된다. 파싱 단계에서 아예 거부하는 이유다.
- */
+/// Obsolete types whose RDATA can carry compressed names that this server does not interpret (MD,
+/// MF, MB, MG, MR, MINFO, RP, AFSDB, RT, SIG, PX, NXT). Kept as raw bytes and written into another
+/// message, their compression pointers would aim at the wrong place and alter names, so parsing
+/// refuses them.
 fn is_unsupported_name_bearing(rtype: RecordType) -> bool {
     matches!(
         rtype.0,
@@ -308,15 +213,9 @@ fn is_unsupported_name_bearing(rtype: RecordType) -> bool {
     )
 }
 
-/**
- * @brief SVCB/HTTPS 매개변수 목록의 문법을 검사한다(RFC 9460).
- *
- * @details 키는 엄격한 오름차순이어야 하고 65535는 예약이다. 정렬 강제는 mandatory
- *          자기참조 검사가 이진 탐색을 쓸 수 있게 하는 전제이기도 하다.
- * @param priority 0이면 AliasMode다. 이때는 매개변수 의미가 정의되지 않아 순서 검사만 한다.
- * @return 키 순서, mandatory 자기일관성, alpn 길이 표기, port·ipv4hint·ipv6hint 길이 중
- *         하나라도 어긋나면 오류.
- */
+/// SVCB/HTTPS parameter syntax (RFC 9460). Keys must be strictly increasing and 65535 is reserved;
+/// the ordering also lets the mandatory self-reference check use binary search. Priority 0 is
+/// AliasMode, where parameters have no defined meaning, so only the order is checked.
 fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<(), ProtoError> {
     if params.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(ProtoError::Message(
@@ -395,12 +294,11 @@ fn validate_svcb_params(priority: u16, params: &[(u16, Box<[u8]>)]) -> Result<()
 }
 
 impl RData {
-    /** @brief SOA를 박싱해 변형으로 감싼다. */
     pub fn soa(soa: Soa) -> Self {
         Self::Soa(Box::new(soa))
     }
 
-    /** @brief 이 변형이 나타내는 레코드 타입. 인코더가 TYPE 필드와 대조하는 값이다. */
+    /// The encoder checks this against the TYPE field.
     pub fn record_type(&self) -> RecordType {
         match self {
             RData::A(_) => RecordType::A,
@@ -424,11 +322,8 @@ impl RData {
         }
     }
 
-    /**
-     * @brief 인코딩 전 RDATA 내부 제약을 검사한다.
-     * @details 지금은 SVCB/HTTPS만 대상이다. 직접 조립한 값이 파서가 거부할 형태로
-     *          나가지 않게 막는 대칭 장치다.
-     */
+    /// Checks internal RDATA constraints before encoding; only SVCB/HTTPS have any. Keeps
+    /// hand-built values from going out in a form the parser would refuse.
     pub fn validate(&self) -> Result<(), ProtoError> {
         match self {
             RData::Svcb {
@@ -441,15 +336,12 @@ impl RData {
         }
     }
 
-    /**
-     * @brief 타입에 맞춰 RDATA를 해석한다.
-     *
-     * @param rdlen 선언된 RDATA 길이. 가변 길이 뒷부분(CAA 값, TLSA 데이터 등)의 길이를 여기서
-     *              역산하므로, 고정 헤더보다 작으면 checked_sub가 오류로 잡는다.
-     * @note 호출자(Record::parse_inner)가 이미 Reader::limit을 RDATA 끝으로 좁혀 두었다.
-     *       이름 파싱이 자기 레코드 밖을 넘겨다보지 못하게 하는 장치다.
-     * @return 이름을 품는 미지원 이전 타입은 오류, 그 밖의 미지 타입은 Unknown으로 보존.
-     */
+    /// `rdlen` is the declared RDATA length. Variable-length tails (CAA value, TLSA data) are sized
+    /// from it, and checked_sub catches one shorter than the fixed part. The caller
+    /// (Record::parse_inner) has already narrowed Reader::limit to the end of the RDATA, so name
+    /// parsing cannot read past its own record.
+    ///
+    /// Obsolete name-bearing types are an error; other unknown types are kept as Unknown.
     pub fn parse(rtype: RecordType, r: &mut Reader, rdlen: usize) -> Result<RData, ProtoError> {
         Ok(match rtype {
             RecordType::A => {
@@ -585,14 +477,10 @@ impl RData {
         })
     }
 
-    /**
-     * @brief RDATA 본문을 쓴다. 길이 접두사는 호출자가 백패치한다.
-     *
-     * @note RDATA 안 이름을 압축해도 되는 것은 RFC 1035 가 정의한 종류뿐이다. RFC 3597이
-     *       그 밖의 종류를 금하는 까닭은, 압축 포인터가 그 메시지 안에서만 뜻이 있어서
-     *       RDATA 를 전부 옮겨 담는 쪽이 엉뚱한 위치를 가리키는 이름을 만들기 때문이다.
-     *       SRV, NAPTR, DNAME, SVCB, HTTPS 가 여기 해당한다.
-     */
+    /// Writes the RDATA body; the caller backpatches the length. Only types defined in RFC 1035 may
+    /// compress names in RDATA. RFC 3597 forbids it elsewhere because a pointer means something
+    /// only inside its message, so a party copying the RDATA whole would produce names pointing at
+    /// the wrong place. SRV, NAPTR, DNAME, SVCB, and HTTPS fall under this.
     pub fn encode(&self, w: &mut Writer) {
         match self {
             RData::A(ip) => w.push_bytes(&ip.octets()),
@@ -714,27 +602,19 @@ impl RData {
     }
 }
 
-/**
- * @brief 자원 레코드 하나: owner 이름, 타입, 클래스, TTL, 데이터.
- * @invariant rtype은 rdata.record_type()과 같아야 한다. 메시지 인코더가 이 불변식을
- *            검사해 어긋난 레코드를 내보내지 않는다.
- */
+/// `rtype` must equal `rdata.record_type()`; the message encoder checks this and refuses mismatched
+/// records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /** @brief 이 기록의 이름. */
     pub name: Name,
-    /** @brief 기록 종류. */
     pub rtype: RecordType,
-    /** @brief 기록 부류. */
     pub class: DnsClass,
-    /** @brief 이 기록의 수명. */
     pub ttl: u32,
-    /** @brief 기록 내용. */
     pub rdata: RData,
 }
 
 impl Record {
-    /** @brief IN 클래스 레코드를 만든다. 타입은 RDATA에서 끌어와 불일치를 원천 차단한다. */
+    /// An IN-class record whose type comes from the RDATA, so the two cannot disagree.
     pub fn new(name: Name, ttl: u32, rdata: RData) -> Self {
         Self {
             rtype: rdata.record_type(),
@@ -745,38 +625,28 @@ impl Record {
         }
     }
 
-    /** @brief 일반 레코드를 읽는다. 빈 RDATA는 타입 규칙대로만 허용된다. */
+    /// Empty RDATA is accepted only where the type allows it.
     pub fn parse(r: &mut Reader) -> Result<Record, ProtoError> {
         Self::parse_inner(r, None)
     }
 
-    /**
-     * @brief UPDATE 선결 조건 섹션의 레코드를 읽는다.
-     * @details 클래스 NONE(254)/ANY(255)는 "이 이름이 있는가/없는가"만 묻는 곳이라
-     *          타입별 RDATA 없이 빈 본문이 정상이다.
-     */
+    /// Prerequisite-section records of UPDATE. Classes NONE (254) and ANY (255) only ask whether a
+    /// name exists, so an empty RDATA is normal there.
     pub(crate) fn parse_update_empty(r: &mut Reader) -> Result<Record, ProtoError> {
         Self::parse_inner(r, Some(&[254, 255]))
     }
 
-    /**
-     * @brief UPDATE 갱신 섹션의 레코드를 읽는다.
-     * @details 클래스 ANY(255)는 삭제 연산이라 빈 RDATA가 정상이다. NONE은 지울 대상
-     *          데이터를 담아야 하므로 여기서는 허용하지 않는다.
-     */
+    /// Update-section records. Class ANY (255) is a delete, so an empty RDATA is normal; NONE must
+    /// carry the data to delete and is not accepted empty.
     pub(crate) fn parse_update_operation(r: &mut Reader) -> Result<Record, ProtoError> {
         Self::parse_inner(r, Some(&[255]))
     }
 
-    /**
-     * @brief 레코드 헤더와 RDATA를 읽는 공통 구현.
-     *
-     * @details RDATA를 읽는 동안 Reader::limit을 선언된 끝으로 좁혔다가 되돌린다. 이름
-     *          파싱이 자기 레코드 경계를 넘어 읽는 것을 막는 핵심 장치다. 다 읽은 뒤 커서가
-     *          정확히 그 끝에 있는지 확인해, 선언한 길이와 실제 소비량이 어긋난 레코드를
-     *          거부한다.
-     * @param empty_rdata_classes 빈 RDATA를 허용할 클래스 목록. UPDATE 섹션에만 준다.
-     */
+    /// Narrows Reader::limit to the declared end while reading the RDATA, then restores it, so name
+    /// parsing cannot cross the record boundary. Afterwards the cursor must sit exactly at that
+    /// end, which refuses records whose declared length disagrees with what was consumed.
+    /// `empty_rdata_classes` lists the classes allowed an empty RDATA; only UPDATE sections pass
+    /// any.
     fn parse_inner(
         r: &mut Reader,
         empty_rdata_classes: Option<&[u16]>,
@@ -814,16 +684,13 @@ impl Record {
         })
     }
 
-    /** @brief 레코드 전체를 쓴다. */
     pub fn encode(&self, w: &mut Writer) {
         self.encode_with_ttl(w, self.ttl);
     }
 
-    /**
-     * @brief TTL 필드에 다른 값을 넣어 레코드를 쓴다.
-     * @details OPT 전용 경로다. OPT는 TTL 필드에 확장 rcode·버전·DO 비트를 싣기 때문에,
-     *          헤더에서 합쳐 둔 확장 rcode를 다시 이 필드로 돌려놓아야 한다.
-     */
+    /// Writes the record with another TTL field value. Only for OPT, whose TTL field carries
+    /// extended rcode, version, and DO; the extended rcode merged into the header goes back into
+    /// this field.
     pub(crate) fn encode_with_ttl(&self, w: &mut Writer, ttl: u32) {
         self.name.encode(w);
         w.push_u16(self.rtype.0);
@@ -835,22 +702,18 @@ impl Record {
     }
 }
 
-/** @brief RFC 2181이 정한 TTL 상한. 이보다 큰 값은 0으로 본다. */
+/// TTL ceiling from RFC 2181; larger values count as 0.
 pub const MAX_TTL: u32 = 0x7fff_ffff;
 
-/**
- * @brief TTL 필드가 수명이 아니라 다른 뜻인 메타 타입인지.
- * @details OPT는 확장 rcode와 DO 비트를, TSIG와 TKEY는 규격이 0으로 고정한 곳을 쓴다.
- */
+/// Meta types whose TTL field means something else: OPT carries extended rcode and DO, and TSIG and
+/// TKEY fix it at 0.
 fn ttl_field_is_not_a_lifetime(rtype: RecordType) -> bool {
     matches!(rtype.0, 41 | 249 | 250)
 }
 
-/**
- * @brief 같은 RRSet인지 구분하는 키.
- * @details 소유자 이름은 대소문자를 무시하고 비교한다. RRSIG는 covered type이 다르면 서로 다른
- *          RRSet이고 각자 덮는 RRSet과 수명이 같아야 하므로 앞 2바이트까지 키에 넣는다.
- */
+/// Key identifying an RRset. The owner name compares case-insensitively. RRSIGs covering different
+/// types are different RRsets, each sharing the TTL of the RRset it covers, so the first 2 bytes
+/// (type covered) are part of the key.
 fn rrset_key(record: &Record) -> (Vec<u8>, u16, u16, u16) {
     let covered = if record.rtype == RecordType::RRSIG {
         match &record.rdata {
@@ -868,16 +731,12 @@ fn rrset_key(record: &Record) -> (Vec<u8>, u16, u16, u16) {
     )
 }
 
-/**
- * @brief 한 구간의 수명을 RFC 2181대로 고른다.
- *
- * @details 8항은 최상위 비트가 선 수명을 받으면 값 전체를 0으로 보라고 한다. 5.2항은 한
- *          RRSet의 수명이 모두 같아야 한다고 정하고 서버가 다른 값을 담아 보내는 것을
- *          금지하므로, 같은 RRset은 가장 작은 값으로 맞춘다. 낮추기만 하므로 업스트림이 정한
- *          것보다 오래 가지고 있으라고 말하게 되지 않는다.
- * @param records 한 구간의 레코드. 제자리에서 고친다.
- * @note 구간이 다르면 서로 다른 RRset으로 본다. 호출자가 구간마다 부른다.
- */
+/// Applies the RFC 2181 TTL rules to one section. A TTL with the high bit set counts as 0 in full.
+/// All TTLs in an RRset must be equal and a server must not send them differing, so each RRset
+/// takes its smallest value. Values only go down, so the result never tells a client to keep data
+/// longer than the upstream said.
+///
+/// Different sections are different RRsets; the caller calls this per section.
 pub fn normalize_ttls(records: &mut [Record]) {
     for record in records.iter_mut() {
         if !ttl_field_is_not_a_lifetime(record.rtype) && record.ttl > MAX_TTL {
@@ -909,11 +768,9 @@ pub fn normalize_ttls(records: &mut [Record]) {
 }
 
 #[cfg(test)]
-/** @brief 기록 종류별 내용이 바이트로 오갔다 와도 그대로인지. */
 mod typed_rdata_tests {
     use super::*;
 
-    /** @brief 적었다 읽는다. */
     fn roundtrip(rd: RData) -> RData {
         let rec = Record::new(Name::from_str("svc.example.com").unwrap(), 300, rd);
         let mut w = Writer::new();
@@ -922,7 +779,6 @@ mod typed_rdata_tests {
         Record::parse(&mut r).unwrap().rdata
     }
 
-    /** @brief 테스트용 매개변수 목록. */
     fn boxed_params(params: Vec<(u16, Vec<u8>)>) -> Box<[(u16, Box<[u8]>)]> {
         params
             .into_iter()
@@ -933,7 +789,7 @@ mod typed_rdata_tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    /** @brief 내용 하나의 크기가 커지지 않았는지. 가장 큰 변형이 모든 기록의 비용을 정한다. */
+    /// The largest variant sets the cost of every record.
     fn rdata_layout_stays_cache_compact() {
         assert_eq!(
             std::mem::size_of::<RData>(),
@@ -945,7 +801,6 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /** @brief 종류별 내용의 왕복. */
     fn typed_rdata_wire_roundtrip() {
         let tlsa = RData::Tlsa {
             usage: 3,
@@ -1005,9 +860,8 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /** @brief 이름이 든 이전 기록을 거부하는지. 그대로 다시 적으면 안에 든 압축 지시자가 깨진다. */
+    /// Rewritten as is, their compression pointers break.
     fn rejects_unknown_name_bearing_rdata() {
-        /** @brief 이름이 든 이전 기록 종류들. */
         const NAME_BEARING: [u16; 13] = [3, 4, 7, 8, 9, 14, 17, 18, 21, 23, 26, 30, 36];
         for rtype in NAME_BEARING {
             let [high, low] = rtype.to_be_bytes();
@@ -1024,7 +878,6 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /** @brief 압축된 대상 이름과 순서가 어긋난 매개변수를 거부하는지. */
     fn svcb_wire_rejects_compressed_target_and_non_increasing_keys() {
         let compressed = [0, 0, 64, 0, 1, 0, 0, 0, 0, 0, 4, 0, 1, 0xc0, 0x00];
         assert!(Record::parse(&mut Reader::new(&compressed)).is_err());
@@ -1036,22 +889,17 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /**
-     * @brief RFC 1035 밖의 종류가 RDATA 안 이름을 압축하지 않는지.
-     *
-     * @details RFC 3597은 압축을 RFC 1035 가 정의한 종류로만 한정한다. 포인터는 그
-     *          메시지 안에서만 뜻이 있어서, RDATA 를 전부 옮겨 담는 쪽이 엉뚱한 위치를
-     *          가리키는 이름을 만든다. 소유자 이름을 먼저 적어 같은 접미사가 이미 메시지에
-     *          있는 상태로 만들어야 압축이 일어날 곳이 생긴다.
-     * @note 같은 메시지의 MX 는 RFC 1035 종류라 압축해야 한다. 압축을 전부 끄는 것으로
-     *       고치면 응답이 커지므로 양쪽을 함께 붙든다.
-     */
+    /// RFC 3597 limits compression to RFC 1035 types: a pointer means something only inside its
+    /// message, so a party copying RDATA whole would produce names pointing at the wrong place. The
+    /// owner name is written first so the shared suffix is already in the message and compression
+    /// has somewhere to happen.
+    ///
+    /// MX in the same message is an RFC 1035 type and must be compressed; turning compression off
+    /// entirely would grow responses, so both sides are pinned.
     fn rdata_names_outside_rfc1035_are_never_compressed() {
-        /**
-         * @brief RDATA 안 이름 필드를 훑으며 압축 포인터를 만나는지.
-         * @details 포인터는 이름의 첫 바이트가 아니라 리터럴 라벨 몇 개 뒤에 온다. 버퍼
-         *          전체에서 0xC0 비트를 찾으면 포트나 TTL 같은 평범한 값도 걸린다.
-         */
+        /// Walks the name field in RDATA looking for a compression pointer. The pointer comes after
+        /// some literal labels, not at the first byte, and searching the whole buffer for 0xC0 bits
+        /// would also hit ordinary values like ports or TTLs.
         fn name_is_compressed(rdata: &[u8], mut at: usize) -> bool {
             while at < rdata.len() {
                 let len = rdata[at];
@@ -1068,7 +916,7 @@ mod typed_rdata_tests {
 
         let apex = Name::from_str("wire.test").unwrap();
         let target = Name::from_str("t.wire.test").unwrap();
-        /* NAPTR 의 이름 필드는 order 2, preference 2, 그리고 문자열 셋 뒤인 15 다. */
+        // NAPTR's name field starts at 15: after order 2, preference 2, and three strings.
         let cases: Vec<(&str, RData, usize, bool)> = vec![
             (
                 "SRV",
@@ -1120,7 +968,8 @@ mod typed_rdata_tests {
 
         for (label, rdata, name_at, compressible) in cases {
             let mut writer = Writer::new();
-            /* 같은 접미사를 메시지에 미리 두어야 압축이 일어날 곳이 생긴다. */
+            // The suffix must already be in the message for compression to have somewhere to
+            // happen.
             apex.encode(&mut writer);
             let start = writer.buf.len();
             rdata.encode(&mut writer);
@@ -1135,7 +984,6 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /** @brief 대상 이름을 압축하지 않고 적는지. */
     fn svcb_encoder_never_compresses_target_name() {
         let name = Name::from_str("svc.example").unwrap();
         let record = Record::new(
@@ -1155,7 +1003,6 @@ mod typed_rdata_tests {
     }
 
     #[test]
-    /** @brief 아는 매개변수의 형식을 엄격히 보는지. */
     fn svcb_known_parameter_formats_are_strict() {
         let invalid = [
             vec![(3, vec![0, 53]), (3, vec![0, 54])],
@@ -1190,11 +1037,9 @@ mod typed_rdata_tests {
 }
 
 #[cfg(test)]
-/** @brief RFC 2181이 정한 수명 규칙. */
 mod ttl_normalization_tests {
     use super::*;
 
-    /** @brief 주어진 수명의 A 레코드. */
     fn a(name: &str, ttl: u32, last: u8) -> Record {
         Record::new(
             Name::from_str(name).unwrap(),
@@ -1204,7 +1049,6 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief 최상위 비트가 선 수명은 값 전체가 0이 된다. RFC 2181. */
     fn a_ttl_above_the_ceiling_becomes_zero() {
         let mut records = vec![
             a("x.example.com", 0x8000_0000, 1),
@@ -1220,7 +1064,6 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief 한 RRSet의 수명은 가장 작은 값으로 고른다. RFC 2181. */
     fn one_rrset_leaves_with_one_ttl() {
         let mut records = vec![
             a("host.example.com", 900, 10),
@@ -1234,7 +1077,7 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief 소유자 이름의 대소문자는 같은 RRset으로 본다. RFC 4343. */
+    /// Case-insensitive, per RFC 4343.
     fn case_does_not_split_an_rrset() {
         let mut records = vec![
             a("Host.Example.COM", 900, 10),
@@ -1245,7 +1088,7 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief 상한을 넘겨 0이 된 값이 같은 RRset 전체를 0으로 끌어내린다. */
+    /// A value zeroed by the ceiling pulls its whole RRset to 0.
     fn the_ceiling_rule_runs_before_the_rrset_rule() {
         let mut records = vec![
             a("host.example.com", 0x8000_0000, 10),
@@ -1256,7 +1099,7 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief OPT의 TTL 필드는 수명이 아니라 확장 rcode와 DO 비트라 건드리지 않는다. */
+    /// OPT's TTL field holds extended rcode and DO, not a lifetime.
     fn the_opt_pseudo_record_is_left_alone() {
         let flags = 0x8000_0000u32;
         let mut records = vec![Record {
@@ -1271,7 +1114,6 @@ mod ttl_normalization_tests {
     }
 
     #[test]
-    /** @brief covered type이 다른 RRSIG는 서로 다른 RRSet이라 함께 깎이지 않는다. */
     fn signatures_over_different_types_are_different_rrsets() {
         let sig = |covered: u16, ttl: u32| {
             let mut raw = covered.to_be_bytes().to_vec();

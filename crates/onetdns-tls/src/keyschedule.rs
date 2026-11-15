@@ -1,27 +1,20 @@
-/*!
- * @brief TLS 1.3 키 유도 일정.
- *
- * @details 하나의 비밀이 단계를 거치며 자란다. 초기, 핸드셰이크, 응용 순으로 나아가고 각
- *          단계에서 방향별 키가 갈라져 나온다.
- * @note 각 유도에 레이블과 핸드셰이크 기록 해시가 들어간다. 그래서 같은 키 교환이라도 핸드셰이크
- *       내용이 다르면 다른 키가 나온다.
- */
+//! TLS 1.3 key schedule. One secret advances through the early, handshake, and application stages,
+//! and each stage splits off keys per direction.
+//!
+//! Every derivation mixes in a label and the transcript hash, so the same key exchange gives
+//! different keys when the handshake content differs.
 
 use hmac::Mac;
 
 use crate::msg::consts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/** @brief 이 스위트가 쓰는 해시. */
 pub enum Hash {
-    /** @brief SHA-256. */
     Sha256,
-    /** @brief SHA-384. */
     Sha384,
 }
 
 impl Hash {
-    /** @brief 해시 출력 길이. */
     pub fn len(&self) -> usize {
         match self {
             Hash::Sha256 => 32,
@@ -29,7 +22,6 @@ impl Hash {
         }
     }
 
-    /** @brief 해시를 계산한다. */
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
         use sha2::Digest as _;
         match self {
@@ -39,7 +31,6 @@ impl Hash {
     }
 }
 
-/** @brief 스위트에 맞는 해시와 키 길이. */
 pub fn suite_params(suite: u16) -> Option<(Hash, usize)> {
     match suite {
         consts::TLS_AES_128_GCM_SHA256 => Some((Hash::Sha256, 16)),
@@ -49,7 +40,6 @@ pub fn suite_params(suite: u16) -> Option<(Hash, usize)> {
     }
 }
 
-/** @brief 입력 재료에서 의사난수 키를 추출한다. */
 pub fn hkdf_extract(hash: Hash, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     match hash {
         Hash::Sha256 => hkdf::Hkdf::<sha2::Sha256>::extract(Some(salt), ikm)
@@ -61,7 +51,6 @@ pub fn hkdf_extract(hash: Hash, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     }
 }
 
-/** @brief 의사난수 키를 필요한 길이로 늘린다. */
 pub fn hkdf_expand(hash: Hash, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let mut okm = vec![0u8; len];
     match hash {
@@ -81,10 +70,8 @@ pub fn hkdf_expand(hash: Hash, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     okm
 }
 
-/**
- * @brief 레이블을 붙여 확장한다.
- * @note 레이블에 고정 접두사가 붙는다. 같은 비밀에서 용도별로 다른 키가 나오게 하는 장치다.
- */
+/// A fixed prefix on the label makes keys for different uses come out of the same secret
+/// differently.
 pub fn hkdf_expand_label(
     hash: Hash,
     secret: &[u8],
@@ -102,37 +89,29 @@ pub fn hkdf_expand_label(
     hkdf_expand(hash, secret, &info, len)
 }
 
-/** @brief 레이블과 핸드셰이크 기록 해시로 다음 비밀을 만든다. */
 pub fn derive_secret(hash: Hash, secret: &[u8], label: &str, transcript_hash: &[u8]) -> Vec<u8> {
     hkdf_expand_label(hash, secret, label, transcript_hash, hash.len())
 }
 
-/** @brief 비밀에서 레코드 보호용 키와 논스 기준값을 만든다. */
 pub fn traffic_keys(hash: Hash, secret: &[u8], key_len: usize) -> (Vec<u8>, Vec<u8>) {
     let key = hkdf_expand_label(hash, secret, "key", &[], key_len);
     let iv = hkdf_expand_label(hash, secret, "iv", &[], 12);
     (key, iv)
 }
 
-/** @brief 다음 세대 응용 traffic secret을 만든다. */
 pub fn traffic_update(hash: Hash, secret: &[u8]) -> Vec<u8> {
     hkdf_expand_label(hash, secret, "traffic upd", &[], hash.len())
 }
 
-/** @brief 핸드셰이크 확인 값 계산에 쓸 키. */
 pub fn finished_key(hash: Hash, base_key: &[u8]) -> Vec<u8> {
     hkdf_expand_label(hash, base_key, "finished", &[], hash.len())
 }
 
-/** @brief 재개에 쓸 미리 공유된 키. */
 pub fn resumption_psk(hash: Hash, res_master: &[u8], nonce: &[u8]) -> Vec<u8> {
     hkdf_expand_label(hash, res_master, "resumption", nonce, hash.len())
 }
 
-/**
- * @brief 상수 시간 비교.
- * @warning 핸드셰이크 확인 값 비교에 쓴다. 걸린 시간이 새면 올바른 값을 한 바이트씩 맞힐 수 있다.
- */
+/// Used for Finished comparisons; leaking timing would let the right value be guessed byte by byte.
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -144,10 +123,8 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     d == 0
 }
 
-/**
- * @brief 핸드셰이크 기록 전체를 확인하는 값.
- * @warning 이 값이 핸드셰이크 위조를 막는 마지막 검사다. 중간자가 메시지를 바꿨다면 여기서 어긋난다.
- */
+/// The last check against a forged handshake: if a man in the middle changed any message, this does
+/// not match.
 pub fn finished_verify_data(hash: Hash, finished_key: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
     match hash {
         Hash::Sha256 => {
@@ -163,16 +140,12 @@ pub fn finished_verify_data(hash: Hash, finished_key: &[u8], transcript_hash: &[
     }
 }
 
-/** @brief 핸드셰이크 기록. 오간 메시지를 순서대로 해시한다. */
 pub struct Transcript {
-    /** @brief 쓰는 요약 방식. */
     hash: Hash,
-    /** @brief 지금까지 오간 핸드셰이크 바이트. */
     data: Vec<u8>,
 }
 
 impl Transcript {
-    /** @brief 빈 기록. */
     pub fn new(hash: Hash) -> Self {
         Self {
             hash,
@@ -180,31 +153,25 @@ impl Transcript {
         }
     }
 
-    /** @brief 핸드셰이크 기록 버퍼가 allocator에서 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.data.capacity()
     }
 
-    /** @brief 메시지를 기록에 더한다. 와이어 바이트 그대로다. */
+    /// Wire bytes as is.
     pub fn update(&mut self, msg_wire: &[u8]) {
         self.data.extend_from_slice(msg_wire);
     }
 
-    /** @brief 지금까지의 기록 해시. */
     pub fn hash(&self) -> Vec<u8> {
         self.hash.digest(&self.data)
     }
 
-    /** @brief 기록 원본. */
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
-    /**
-     * @brief 기록을 그 해시로 바꾼다.
-     * @details 서버가 다시 시도를 요청할 때 규격이 정한 절차다. 원본을 그대로 두면
-     *          양쪽 기록이 갈린다.
-     */
+    /// Required when the server sends HelloRetryRequest; keeping the original would split the two
+    /// sides' transcripts.
     pub fn replace_with_message_hash(&mut self) {
         let ch_hash = self.hash.digest(&self.data);
         let mut synthetic = vec![254u8, 0x00, 0x00, ch_hash.len() as u8];
@@ -213,11 +180,8 @@ impl Transcript {
     }
 }
 
-/** @brief 지금 단계의 비밀을 가지고 있는 것. */
 pub struct KeySchedule {
-    /** @brief 쓰는 요약 방식. */
     hash: Hash,
-    /** @brief 여기서 다음 비밀을 이끌어 낸다. */
     secret: Vec<u8>,
 }
 
@@ -229,7 +193,7 @@ impl Drop for KeySchedule {
 }
 
 impl KeySchedule {
-    /** @brief 미리 공유된 키 없이 시작한다. */
+    /// Without a PSK.
     pub fn new(hash: Hash) -> Self {
         let zeros = vec![0u8; hash.len()];
         let early = hkdf_extract(hash, &zeros, &zeros);
@@ -239,12 +203,11 @@ impl KeySchedule {
         }
     }
 
-    /** @brief 현재 key schedule 비밀 버퍼가 보유한 바이트. */
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         self.secret.capacity()
     }
 
-    /** @brief 미리 공유된 키로 시작한다. 재개에 쓴다. */
+    /// With a PSK, for resumption.
     pub fn new_with_psk(hash: Hash, psk: &[u8]) -> Self {
         let zeros = vec![0u8; hash.len()];
         let early = hkdf_extract(hash, &zeros, psk);
@@ -254,7 +217,8 @@ impl KeySchedule {
         }
     }
 
-    /** @brief 재개 제안을 핸드셰이크 기록에 묶고 중간 비밀은 반환 전에 지운다. */
+    /// Binds the resumption offer to the transcript; the intermediate secret is zeroed before
+    /// returning.
     pub fn psk_binder(&self, truncated_ch_hash: &[u8]) -> Vec<u8> {
         use zeroize::Zeroizing;
         let binder_key = Zeroizing::new(derive_secret(
@@ -267,27 +231,22 @@ impl KeySchedule {
         finished_verify_data(self.hash, &finished, truncated_ch_hash)
     }
 
-    /** @brief 조기 데이터 보호에 쓸 비밀. */
     pub fn client_early_traffic_secret(&self, ch_transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "c e traffic", ch_transcript_hash)
     }
 
-    /** @brief 다음 재개에 쓸 비밀. */
     pub fn resumption_master_secret(&self, transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "res master", transcript_hash)
     }
 
-    /** @brief 이 일정이 쓰는 해시. */
     pub fn hash(&self) -> Hash {
         self.hash
     }
 
-    /** @brief 지금 단계의 비밀. */
     pub fn current_secret(&self) -> &[u8] {
         &self.secret
     }
 
-    /** @brief 키 교환 결과를 넣어 핸드셰이크 단계로 나아간다. */
     pub fn enter_handshake(&mut self, ecdhe: &[u8]) {
         use zeroize::Zeroize;
         let mut derived = derive_secret(self.hash, &self.secret, "derived", &self.empty_hash());
@@ -297,7 +256,6 @@ impl KeySchedule {
         self.secret = next;
     }
 
-    /** @brief 응용 단계로 나아간다. */
     pub fn enter_master(&mut self) {
         use zeroize::Zeroize;
         let mut derived = derive_secret(self.hash, &self.secret, "derived", &self.empty_hash());
@@ -308,35 +266,29 @@ impl KeySchedule {
         self.secret = next;
     }
 
-    /** @brief 클라이언트 방향 핸드셰이크 비밀. */
     pub fn client_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "c hs traffic", transcript_hash)
     }
-    /** @brief 서버 방향 핸드셰이크 비밀. */
     pub fn server_handshake_traffic_secret(&self, transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "s hs traffic", transcript_hash)
     }
-    /** @brief 클라이언트 방향 응용 비밀. */
     pub fn client_application_traffic_secret(&self, transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "c ap traffic", transcript_hash)
     }
-    /** @brief 서버 방향 응용 비밀. */
     pub fn server_application_traffic_secret(&self, transcript_hash: &[u8]) -> Vec<u8> {
         derive_secret(self.hash, &self.secret, "s ap traffic", transcript_hash)
     }
 
-    /** @brief 빈 입력의 해시. 단계 사이 유도에 쓰인다. */
+    /// Used in derivations between stages.
     fn empty_hash(&self) -> Vec<u8> {
         self.hash.digest(&[])
     }
 }
 
 #[cfg(test)]
-/** @brief 유도 결과를 공표된 벡터에 대조하고, 단계 진행이 결정적인지 본다. */
 mod tests {
     use super::*;
 
-    /** @brief 16진 문자열을 바이트로. */
     fn hx(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -345,7 +297,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief HKDF 구현을 규격 벡터와 비교한다. */
     fn rfc5869_hkdf_sha256_vector() {
         let ikm = vec![0x0b; 22];
         let salt = hx("000102030405060708090a0b0c");
@@ -363,7 +314,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 레이블 확장의 입력 배치가 규격과 맞는지. */
     fn expand_label_info_layout() {
         let secret = vec![0xABu8; 32];
         let got = hkdf_expand_label(Hash::Sha256, &secret, "key", &[], 4);
@@ -379,7 +329,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 같은 입력에서 같은 비밀이 나오는지. */
     fn key_schedule_progression_deterministic() {
         let hash = Hash::Sha256;
         let mut ks = KeySchedule::new(hash);
@@ -416,7 +365,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 스위트에서 해시와 키 길이가 제대로 골라지는지. */
     fn suite_params_lookup() {
         assert_eq!(
             suite_params(consts::TLS_AES_128_GCM_SHA256),

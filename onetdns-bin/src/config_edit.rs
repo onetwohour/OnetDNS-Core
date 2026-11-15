@@ -1,6 +1,4 @@
-/*!
- * @brief 설정 파일의 TOML 텍스트를 고친다. 사용자가 적은 주석과 순서는 그대로 둔다.
- */
+//! Edits the config file's TOML text, keeping the user's comments and order.
 
 use onetdns_config::Config;
 
@@ -8,7 +6,6 @@ use crate::atomic_file::atomic_write;
 use crate::config_apply::config_write_lock;
 use crate::native_config::stable_resource_id;
 
-/** @brief 설정 파일의 이 배열을 다시 쓴다. */
 pub(crate) fn persist_config_string_array(
     path: &std::path::Path,
     key: &str,
@@ -24,7 +21,6 @@ pub(crate) fn persist_config_string_array(
     atomic_write(path, updated.as_bytes())
 }
 
-/** @brief 설정 텍스트에서 이 배열만 바꿔 넣는다. */
 pub(crate) fn rewrite_config_string_array<T: AsRef<str>>(
     text: &str,
     key: &str,
@@ -33,24 +29,18 @@ pub(crate) fn rewrite_config_string_array<T: AsRef<str>>(
     rewrite_config_kv(text, key, &toml_string_array(values))
 }
 
-/** @brief 설정 텍스트의 항목 하나. */
 type TomlEntry = onetdns_config::toml::TopEntry;
 
-/** @brief 설정 텍스트에서 이 항목이 차지하는 구간. */
+/// The span one top-level item occupies in the config text.
 struct TomlBlock {
-    /** @brief 이 구간의 맨 위 항목 이름. */
     root: String,
-    /** @brief 테이블 배열 구간인지. */
     is_array: bool,
-    /** @brief 테이블 헤더 줄 번호. */
+    /// Index of the header in the entries.
     header_idx: usize,
-    /** @brief 구간이 시작하는 위치. */
     start: usize,
-    /** @brief 구간이 끝나는 위치. */
     end: usize,
 }
 
-/** @brief 항목마다 텍스트에서 차지하는 구간을 찾는다. */
 fn toml_blocks(entries: &[TomlEntry]) -> Vec<TomlBlock> {
     let mut blocks: Vec<TomlBlock> = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
@@ -84,7 +74,7 @@ fn toml_blocks(entries: &[TomlEntry]) -> Vec<TomlBlock> {
     blocks
 }
 
-/** @brief 설정 텍스트의 여러 구간을 한꺼번에 바꾼다. 뒤에서부터 바꿔야 앞 구간의 위치가 틀어지지 않는다. */
+/// Ranges are byte offsets into the original `text`.
 fn splice_config_edits(text: &str, mut edits: Vec<(usize, usize, String)>) -> String {
     edits.sort_by_key(|(start, end, _)| (*start, *end));
     let mut out = String::with_capacity(text.len());
@@ -100,15 +90,11 @@ fn splice_config_edits(text: &str, mut edits: Vec<(usize, usize, String)>) -> St
     out
 }
 
-/** @brief 설정 텍스트에서 이 항목의 값만 바꾼다. */
-/**
- * @brief 설정 파일에서 항목 하나를 지운다.
- *
- * @details 값을 비우는 것과 항목을 지우는 것은 다르다. 지워야 기본값으로 돌아가고, 선택
- *          항목은 꺼진다. 이것이 없으면 한 번 넣은 선택 항목을 되돌릴 방법이 없다.
- * @param key 지울 최상위 항목 이름. 테이블 안의 항목은 건드리지 않는다.
- * @return 원래 없었으면 그대로 돌려준다. 지우는 것은 실패로 보지 않는다.
- */
+/// Removing a key differs from emptying it: removal restores the default, or turns an optional item
+/// off. Without this, an optional item once set could not be undone.
+///
+/// Only top-level keys; a key of the same name inside a table is left alone. Returns the text
+/// unchanged when the key was absent.
 pub(crate) fn remove_config_key(text: &str, key: &str) -> Result<String, String> {
     let text = &drop_config_tables(text, key)?;
     let entries = onetdns_config::toml::top_entries(text)?;
@@ -133,12 +119,8 @@ pub(crate) fn remove_config_key(text: &str, key: &str) -> Result<String, String>
     Ok(splice_config_edits(text, cuts))
 }
 
-/**
- * @brief 이 이름의 테이블과 테이블 배열 블록을 설정 텍스트에서 걷어 낸다.
- * @details 최상위 항목으로 값을 주면 같은 이름의 테이블 블록은 그 값으로 대체돼야 한다. 남겨 두면
- *          같은 키가 두 번 적혀 테이블 쪽이 이기므로, 마지막 항목을 지우려고 빈 배열을 줘도 아무
- *          것도 지워지지 않는다.
- */
+/// A top-level value for `key` replaces its `[key]` and `[[key]]` blocks. Left in place, the key
+/// would appear twice and the table would win, so an empty array could not remove the last entry.
 fn drop_config_tables(text: &str, key: &str) -> Result<String, String> {
     let entries = onetdns_config::toml::top_entries(text)?;
     let cuts: Vec<(usize, usize, String)> = toml_blocks(&entries)
@@ -152,6 +134,8 @@ fn drop_config_tables(text: &str, key: &str) -> Result<String, String> {
     Ok(splice_config_edits(text, cuts))
 }
 
+/// Replaces the top-level value, or adds it before the first table header when absent, since a
+/// key after a header would belong to that table.
 pub(crate) fn rewrite_config_kv(text: &str, key: &str, rhs: &str) -> Result<String, String> {
     let text = &drop_config_tables(text, key)?;
     let entries = onetdns_config::toml::top_entries(text)?;
@@ -187,7 +171,7 @@ pub(crate) fn rewrite_config_kv(text: &str, key: &str, rhs: &str) -> Result<Stri
     })
 }
 
-/** @brief 설정 조각을 지금 텍스트에 합친다. 건드리지 않은 항목과 주석은 그대로 둔다. */
+/// Keys the snippet does not touch, and comments, stay as they are.
 pub(crate) fn merge_config_snippet(current: &str, snippet: &str) -> Result<String, String> {
     let snip_entries = onetdns_config::toml::top_entries(snippet)?;
     if snip_entries.is_empty() {
@@ -276,7 +260,6 @@ pub(crate) fn merge_config_snippet(current: &str, snippet: &str) -> Result<Strin
     Ok(out)
 }
 
-/** @brief 문자열을 설정 텍스트에 적을 형태로 감싼다. */
 pub(crate) fn toml_quote(s: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len().saturating_add(2));
@@ -305,17 +288,14 @@ pub(crate) fn toml_quote(s: &str) -> String {
     out
 }
 
-/** @brief 토큰을 가리키는 이름. 토큰 자체는 드러내지 않는다. */
+/// Does not reveal the token.
 pub(crate) fn token_id(tok: &str) -> String {
     stable_resource_id("token", tok)
 }
 
-/**
- * @brief 지문이 일치하는 제어 토큰을 설정 본문에서 지운다.
- * @return 고친 본문과 지운 개수.
- * @details 일치하는 토큰이 없으면 반드시 오류를 낸다. 바뀐 것 없는 본문을 그대로
- *          돌려주면 호출자가 파일을 다시 쓰고 서비스 재시작까지 걸게 된다.
- */
+/// Removes the control tokens whose fingerprint matches, returning the new text and the count.
+/// Fails when none matches; returning the text unchanged would make the caller rewrite the file and
+/// restart the service.
 pub(crate) fn remove_token_by_id(text: &str, id: &str) -> Result<(String, usize), String> {
     let cur = onetdns_config::Config::from_toml_str(text).map_err(|e| e.to_string())?;
     let before = cur.control_admin_tokens.len() + cur.control_readonly_tokens.len();
@@ -341,7 +321,6 @@ pub(crate) fn remove_token_by_id(text: &str, id: &str) -> Result<(String, usize)
     Ok((out, removed))
 }
 
-/** @brief 토큰을 가린 표기. */
 pub(crate) fn token_mask(tok: &str) -> String {
     let count = tok.chars().count();
     if count > 10 {
@@ -353,7 +332,6 @@ pub(crate) fn token_mask(tok: &str) -> String {
     }
 }
 
-/** @brief 재작성 규칙들을 설정 텍스트로. */
 pub(crate) fn rewrites_to_toml(rw: &[onetdns_config::Rewrite]) -> String {
     let items: Vec<String> = rw
         .iter()
@@ -368,7 +346,6 @@ pub(crate) fn rewrites_to_toml(rw: &[onetdns_config::Rewrite]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/** @brief 수를 설정 텍스트에 적을 형태로. */
 fn toml_num(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 9.0e15 {
         format!("{}", n as i64)
@@ -377,7 +354,7 @@ fn toml_num(n: f64) -> String {
     }
 }
 
-/** @brief 모드를 바꿀 때 접근 제어도 함께 적어 준다. */
+/// A mode change without `acl_allow` also writes that mode's default ACL.
 pub(crate) fn materialize_mode_acl_patch(
     pairs: &mut Vec<(String, onetdns_core::json::Json)>,
 ) -> Result<(), String> {
@@ -407,18 +384,14 @@ pub(crate) fn materialize_mode_acl_patch(
     Ok(())
 }
 
-/**
- * @brief 대시보드가 보낸 설정 변경을 받아들여도 되는지 본다.
- * @warning 가려서 보여 준 값을 그대로 되돌려받으면 거부한다. 그대로 저장하면 진짜 비밀이
- *          가림 문자열로 덮인다.
- */
+/// Rejects a redacted value sent back as is; saving it would overwrite the real secret with the
+/// mask.
 pub(crate) fn validate_config_patch_values(
     pairs: &[(String, onetdns_core::json::Json)],
 ) -> Result<(), String> {
     use onetdns_core::json::Json;
-    /** @brief 토큰이 든 배열들. */
     const TOKEN_ARRAYS: &[&str] = &["control_admin_tokens", "control_readonly_tokens"];
-    /** @brief 넣을 수만 있고 되읽어 주지 않는 항목들. */
+    /// Accepted on write, never read back.
     const WRITE_ONLY_STRINGS: &[&str] = &[
         "control_token",
         "cluster_raft_secret",
@@ -427,11 +400,11 @@ pub(crate) fn validate_config_patch_values(
         "cachedb_redis_secret",
         "cachedb_redis_password",
     ];
-    /** @brief 암호가 섞여 있어 가려서 보여 주는 주소들. */
+    /// Shown redacted because they embed passwords.
     const REDACTED_URLS: &[&str] = &["zones_postgres", "zones_mysql"];
 
     for (key, value) in pairs {
-        /* null은 항목을 지우라는 뜻이다. 값 검사는 넣을 때만 한다. */
+        // null deletes the key; values are checked only when set.
         if matches!(value, Json::Null) {
             continue;
         }
@@ -468,7 +441,6 @@ pub(crate) fn validate_config_patch_values(
     Ok(())
 }
 
-/** @brief JSON 값을 설정 텍스트의 값으로. */
 pub(crate) fn json_to_toml_literal(v: &onetdns_core::json::Json) -> Result<String, String> {
     use onetdns_core::json::Json;
     Ok(match v {
@@ -496,20 +468,17 @@ pub(crate) fn json_to_toml_literal(v: &onetdns_core::json::Json) -> Result<Strin
     })
 }
 
-/** @brief 클러스터 설정 값의 중첩 깊이 상한. 설정 파일에 이보다 깊은 값은 없다. */
+/// No config value nests deeper.
 pub(crate) const MAX_RAFT_VALUE_DEPTH: usize = 8;
 
-/**
- * @brief 설정 파일의 TOML 값을 Raft 로그 항목에 담을 JSON 값으로 바꾼다.
- * @warning 2의 53제곱을 넘는 정수는 거부한다. JSON 수는 실수라 그 위에서는 다른 수로 바뀐
- *          채 모든 노드에 퍼진다.
- */
+/// For the Raft log. Rejects integers beyond 2^53: JSON numbers are doubles, and past that a
+/// different number would replicate to every node.
 pub(crate) fn toml_value_to_json(
     value: &onetdns_config::toml::Value,
 ) -> Result<onetdns_core::json::Json, String> {
     use onetdns_config::toml::Value;
     use onetdns_core::json::Json;
-    /** @brief 실수로 정확히 담을 수 있는 정수 상한. */
+    /// The largest integer a double holds exactly.
     const MAX_EXACT: i64 = 9_007_199_254_740_991;
     Ok(match value {
         Value::String(text) => Json::Str(text.to_string()),
@@ -538,14 +507,12 @@ pub(crate) fn toml_value_to_json(
     })
 }
 
-/**
- * @brief Raft 로그 항목의 값을 TOML 값 표기로 바꾼다.
- * @details 설정 편집 API가 쓰는 json_to_toml_literal 과 달리 테이블과 중첩 배열도 받는다.
- *          clients, local_zones 같은 테이블 배열도 클러스터가 공유해야 하기 때문이다. 테이블은
- *          인라인 테이블로 쓴다. 파일 모양은 원래와 달라지지만 파싱한 값은 같다.
- * @retval Err 값 안에 null 이 있거나 중첩이 너무 깊을 때. 최상위 null 은 키 삭제를 뜻하므로
- *             호출하는 쪽이 따로 처리한다.
- */
+/// Unlike `json_to_toml_literal`, accepts tables and nested arrays, since the cluster must share
+/// table arrays such as `clients` and `local_zones`. Tables become inline tables: the file looks
+/// different but parses to the same value.
+///
+/// Fails on a null inside the value or nesting too deep. A top-level null means deleting the key,
+/// and the caller handles it.
 pub(crate) fn json_to_raft_toml_literal(
     value: &onetdns_core::json::Json,
     depth: usize,
@@ -585,7 +552,7 @@ pub(crate) fn json_to_raft_toml_literal(
     })
 }
 
-/** @brief 이 업스트림 표기가 어느 설정 항목에 속하는지. */
+/// Which config key this upstream entry belongs to.
 pub(crate) fn upstream_key(entry: &str) -> &'static str {
     if entry.contains("://") {
         "upstream_urls"
@@ -594,7 +561,6 @@ pub(crate) fn upstream_key(entry: &str) -> &'static str {
     }
 }
 
-/** @brief 이 설정 항목에 적힌 업스트림들. */
 pub(crate) fn upstream_values(cfg: &onetdns_config::Config, key: &str) -> Vec<String> {
     if key == "upstream_urls" {
         cfg.upstream_urls.clone()
@@ -603,7 +569,7 @@ pub(crate) fn upstream_values(cfg: &onetdns_config::Config, key: &str) -> Vec<St
     }
 }
 
-/** @brief 대시보드가 보낸 클라이언트 설정을 설정 텍스트로. */
+/// Returns the `[[clients]]` block and the client name.
 pub(crate) fn client_block_from_json(body: &str) -> Result<(String, String), String> {
     use onetdns_core::json;
     let j = json::parse(body).map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
@@ -651,7 +617,6 @@ pub(crate) fn client_block_from_json(body: &str) -> Result<(String, String), Str
     Ok((b, name.to_string()))
 }
 
-/** @brief 설정 텍스트에서 이 클라이언트 구간을 뺀다. */
 pub(crate) fn remove_client_block(text: &str, name: &str) -> Option<String> {
     let entries = onetdns_config::toml::top_entries(text).ok()?;
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
@@ -673,7 +638,6 @@ pub(crate) fn remove_client_block(text: &str, name: &str) -> Option<String> {
     Some(splice_config_edits(text, edits))
 }
 
-/** @brief 클라이언트 설정을 설정 텍스트로. */
 fn client_to_toml(client: &onetdns_config::ClientConfig) -> String {
     let mut out = String::from("\n[[clients]]\n");
     out.push_str(&format!("name = {}\n", toml_quote(&client.name)));
@@ -707,7 +671,6 @@ fn client_to_toml(client: &onetdns_config::ClientConfig) -> String {
     out
 }
 
-/** @brief 이 클라이언트를 켜거나 끈다. */
 pub(crate) fn update_client_disable(
     text: &str,
     name: &str,
@@ -726,12 +689,9 @@ pub(crate) fn update_client_disable(
     Ok(updated)
 }
 
-/** @brief 첫 관리자 계정을 설정 텍스트 끝에 덧붙인다.
- *
- * @details 테이블 배열 항목은 글 끝에 붙여야 안전하다. 중간에 끼우면 뒤따르는 키들이 이
- *          테이블에 속하게 되어 다른 설정이 전부 옮겨 간다.
- * @return 이미 users 항목이 있으면 실패한다. 첫 계정 만들기 외의 용도로는 쓰지 않는다.
- */
+/// Appends the first admin account at the end of the text: a table array entry inserted midway
+/// would capture the keys after it. Fails when a `users` entry already exists, so it is only for
+/// creating the first account.
 pub(crate) fn append_user_block(text: &str, name: &str, hash: &str) -> Result<String, String> {
     let entries = onetdns_config::toml::top_entries(text)?;
     if toml_blocks(&entries)
@@ -802,7 +762,6 @@ pub(crate) fn rewrite_user_password_hash(
     Ok(splice_config_edits(text, edits))
 }
 
-/** @brief 문자열 목록을 설정 텍스트의 배열로. */
 pub(crate) fn toml_string_array<T: AsRef<str>>(values: &[T]) -> String {
     let items: Vec<String> = values
         .iter()
@@ -812,7 +771,6 @@ pub(crate) fn toml_string_array<T: AsRef<str>>(values: &[T]) -> String {
 }
 
 #[cfg(test)]
-/** @brief 설정 텍스트 편집이 다른 줄을 건드리지 않는지. */
 mod tests {
     use super::*;
     use onetdns_config::Config;
@@ -820,7 +778,6 @@ mod tests {
     use crate::unix_now;
 
     #[test]
-    /** @brief 토큰 식별자가 토큰 자체를 드러내지 않는지. */
     fn token_ids_are_stable_without_exposing_token_contents() {
         let first = token_id("secret-token-value");
         let same = token_id("secret-token-value");
@@ -832,7 +789,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 일치하는 토큰이 없으면 본문을 고치지 않고 오류를 내는지. */
     fn removing_an_unknown_token_id_fails_without_touching_the_config() {
         let admin = "a".repeat(24);
         let ro = "b".repeat(24);
@@ -848,7 +804,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 가려서 보여 준 값을 그대로 되돌려받으면 거부하는지. 저장하면 진짜 비밀이 덮인다. */
     fn config_patch_rejects_redacted_or_destructive_secret_placeholders() {
         use onetdns_core::json::Json;
         for pair in [
@@ -873,7 +828,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 구독 항목만 고치고 나머지 설정은 그대로 두는지. */
     fn persist_subscriptions_rewrites_key_preserving_rest() {
         let dir = std::env::temp_dir();
 
@@ -939,7 +893,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정 파일이 없을 때 새로 만들지 않는지. */
     fn persist_config_array_does_not_create_missing_config() {
         let path = std::env::temp_dir().join(format!(
             "onetdns-persist-missing-{}-{}.toml",
@@ -959,7 +912,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 클라이언트 구간을 넣고 빼는 도구들. */
     fn client_block_crud_helpers() {
         let (block, name) = client_block_from_json(
             "{\"name\":\"kid\",\"ids\":[\"192.168.1.5/32\"],\"tags\":[\"child\"],\"disable_filtering\":false}",
@@ -990,7 +942,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 특수 문자가 든 이름의 구간도 정확히 빼는지. */
     fn remove_client_block_matches_escaped_name() {
         let name = "a\"b\\c";
         let block = format!("[[clients]]\nname = {}\n", toml_quote(name));
@@ -1002,7 +953,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 문자열 안의 괄호를 값 경계로 오해하지 않는지. */
     fn removing_a_key_leaves_the_rest_alone() {
         let text = "listen = [\"0.0.0.0:53\"]
     control_listen = \"127.0.0.1:8553\"
@@ -1017,11 +967,11 @@ mod tests {
         assert!(out.contains("querylog = true"));
         assert!(out.contains("[[users]]"), "테이블이 함께 지워졌습니다");
 
-        /* 원래 없던 항목을 지우는 것은 실패가 아니다. */
+        // Removing an absent key is not a failure.
         let same = remove_config_key(&out, "control_listen").unwrap();
         assert_eq!(same, out);
 
-        /* 테이블 안의 같은 이름은 건드리지 않는다. */
+        // The same name inside a table is left alone.
         let nested = "[[zones]]
     name = \"a\"
     ";
@@ -1029,7 +979,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 값 검사가 지우기를 막지 않는지. */
     fn deleting_a_key_skips_value_checks() {
         use onetdns_core::json::Json;
         let pairs = vec![("control_token".to_string(), Json::Null)];
@@ -1040,7 +989,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 배열 안의 대괄호에 속지 않는지. */
     fn rewrite_config_kv_handles_bracket_in_string() {
         let text = "blocklist_urls = [\n  \"https://x/a]b.txt\",  # note ] here\n  \"https://x/c.txt\",\n]\nupstreams = [\"1.1.1.1\"]\n";
         let out = rewrite_config_kv(text, "blocklist_urls", "[\"https://new.txt\"]").unwrap();
@@ -1051,7 +999,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 합칠 때 건드리지 않은 항목과 주석이 그대로인지. */
     fn merge_config_snippet_preserves_unrelated_keys_and_comments() {
         let cur = "# 헤더 주석\ncontrol_token = \"0123456789abcdef01234567\"\ncache_size = 8192\nupstreams = [\"1.1.1.1\", \"1.0.0.1\"]\n";
         let out = merge_config_snippet(
@@ -1072,7 +1019,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 줄에 걸친 배열도 전부 갈리는지. */
     fn merge_config_snippet_replaces_existing_and_multiline_arrays() {
         let cur = "cache_size = 1024\nblocklist_urls = [\n  \"https://a.txt\",\n  \"https://b.txt\",\n]\nmin_ttl = 5\n";
         let out = merge_config_snippet(
@@ -1089,7 +1035,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 테이블 구간이 루트 이름 기준으로 갈리는지. */
     fn merge_config_snippet_replaces_table_blocks_by_root() {
         let cur =
             "cache_size = 8192\n[[clients]]\nname = \"old\"\nids = [\"10.0.0.1\"]\nupstreams = [\"9.9.9.9\"]\n";
@@ -1105,7 +1050,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 빈 조각이 지금 설정을 지우지 않는지. */
     fn merge_config_snippet_empty_or_comment_only_keeps_current() {
         let cur = "cache_size = 8192\n";
         assert_eq!(merge_config_snippet(cur, "").unwrap(), cur);
@@ -1113,7 +1057,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 업스트림 표기가 어느 설정 항목에 속하는지 구분하는지. */
     fn upstream_key_classifies() {
         assert_eq!(upstream_key("1.1.1.1"), "upstreams");
         assert_eq!(upstream_key("tls://1.1.1.1#cf"), "upstream_urls");
@@ -1121,11 +1064,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 테이블 배열의 마지막 항목을 빈 배열로 지울 수 있는지.
-     * @details 대시보드는 테이블 키를 조각으로만 고친다. 빈 배열이 테이블 블록을 대체하지 않으면
-     *          마지막 NOTIFY 대상이나 보조 영역을 지울 방법이 없다.
-     */
+    /// The dashboard edits table keys only through snippets; without this, the last NOTIFY target
+    /// or secondary zone could not be removed.
     fn empty_array_replaces_the_last_table_entry() {
         let current = "listen = [\"127.0.0.1:5300\"]\n\n[[notify]]\naddress = \"192.0.2.9:53\"\n";
         let merged = merge_config_snippet(current, "notify = []\n").unwrap();
@@ -1147,7 +1087,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정 텍스트에 못 쓰는 문자를 제대로 감싸는지. */
     fn toml_quote_escapes_control_characters() {
         assert_eq!(toml_quote("a\n\tb\u{7f}"), "\"a\\n\\tb\\u007F\"");
         assert_eq!(

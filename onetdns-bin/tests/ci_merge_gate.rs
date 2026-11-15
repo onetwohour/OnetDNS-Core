@@ -1,23 +1,16 @@
-/*!
- * @brief 병합을 막아야 하는 CI 작업이 모두 merge gate 에 묶여 있는지 확인한다.
- *
- * @details main 의 룰셋은 merge gate 작업 하나만 필수 검사로 요구한다. merge gate 는 needs 로
- *          묶은 작업이 모두 성공해야 통과하므로, needs 에서 빠진 작업은 실패해도 병합을 막지
- *          못한다. 작업 단위 if 로 일부 실행에서만 도는 작업은 반대로 needs 에 넣을 수 없다.
- *          건너뛴 결과가 성공이 아니어서 그 작업이 돌지 않는 push 와 PR 에서 merge gate 가 늘
- *          실패한다.
- */
+//! Every CI job that must block a merge is in merge-gate's needs. The main ruleset requires only
+//! merge-gate, which passes when all its needs succeed, so a job left out can fail without blocking
+//! a merge.
+//!
+//! A job with a job-level if cannot go in needs: a skipped result is not success, so merge-gate
+//! would always fail on runs that skip that job.
 
-/** @brief 검사할 워크플로. */
 const CI_YML: &str = include_str!("../../.github/workflows/ci.yml");
 
-/** @brief merge gate 작업의 식별자. */
 const GATE: &str = "merge-gate";
 
-/**
- * @brief jobs 아래의 작업마다 식별자와 그 작업에 속한 줄들.
- * @details 워크플로는 작업을 두 칸, 작업의 키를 네 칸 들여 쓴다. 이 파일의 형식만 읽는다.
- */
+/// Each job under jobs, with its lines. Jobs are indented two spaces and job keys four; only this
+/// file's layout is read.
 fn jobs(text: &str) -> Vec<(&str, Vec<&str>)> {
     let mut jobs: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut inside = false;
@@ -45,7 +38,7 @@ fn jobs(text: &str) -> Vec<(&str, Vec<&str>)> {
     jobs
 }
 
-/** @brief 작업의 키 하나에 적힌 값. 블록으로 적은 키는 빈 문자열이다. */
+/// Empty for a block-valued key.
 fn value<'a>(body: &[&'a str], key: &str) -> Option<&'a str> {
     let prefix = format!("    {key}:");
     body.iter()
@@ -53,7 +46,7 @@ fn value<'a>(body: &[&'a str], key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/** @brief 작업의 needs 목록. 블록 목록과 한 줄 목록을 모두 읽는다. */
+/// Reads both block and inline lists.
 fn needs<'a>(body: &[&'a str]) -> Vec<&'a str> {
     match value(body, "needs") {
         None => Vec::new(),
@@ -79,10 +72,7 @@ fn needs<'a>(body: &[&'a str]) -> Vec<&'a str> {
 }
 
 #[test]
-/**
- * @brief merge gate 가 작업 단위 if 가 없는 작업을 모두 needs 로 묶는지.
- * @details 작업을 새로 더하면서 needs 에 넣지 않으면 그 작업은 실패해도 병합을 막지 못한다.
- */
+/// A new job left out of needs could fail without blocking a merge.
 fn merge_gate_needs_every_unconditional_job() {
     let jobs = jobs(CI_YML);
     let (_, gate) = jobs
@@ -110,12 +100,9 @@ fn merge_gate_needs_every_unconditional_job() {
 }
 
 #[test]
-/**
- * @brief merge gate 의 이름과 실행 조건이 그대로인지.
- * @details 룰셋은 작업 이름으로 필수 검사를 가리키므로, 이름이 바뀌면 모든 PR 이 오지 않을
- *          검사 결과를 기다린다. if: always() 가 없으면 앞선 작업이 실패했을 때 merge gate 를
- *          건너뛰는데, GitHub 은 건너뛴 필수 검사를 통과로 친다.
- */
+/// The ruleset names the required check by job name, so a rename leaves every PR waiting for a
+/// result that never comes. Without if: always(), merge-gate is skipped when an earlier job fails,
+/// and GitHub counts a skipped required check as passed.
 fn merge_gate_keeps_its_name_and_always_runs() {
     let jobs = jobs(CI_YML);
     let (_, gate) = jobs

@@ -1,13 +1,8 @@
-/*!
- * @brief 어느 플랫폼에서나 실행되는 DNS 부하 발생기.
- *
- * @details dnsperf는 윈도우에 없다. WSL에서 가상 스위치를 건너 때리면 경로가 초당
- *          1만 질의에서 막혀 서버를 채우지 못하고, 그러면 측정하는 값이 서버가 아니라
- *          가상 스위치의 성질이 된다. 루프백으로 부하를 넣을 수 있는 도구가 있어야
- *          윈도우에서 서버를 판정할 수 있다.
- * @details 질의 목록과 요약 출력은 dnsperf와 같은 모양이라 기존 하네스가 그대로 읽는다.
- * @note 루트 워크스페이스에 넣지 않는다. tls-diff와 같은 방식으로 따로 빌드한다.
- */
+//! DNS load generator that runs on every platform. dnsperf does not exist on Windows, and from WSL
+//! the virtual switch saturates before the server does, so it measures the switch instead of the
+//! server. The query list and summary output match dnsperf, so existing harnesses read them.
+//!
+//! Built separately, like tls-diff, outside the root workspace.
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,24 +11,17 @@ use std::time::{Duration, Instant};
 
 use onetdns_proto::{Message, Name, RecordType};
 
-/** @brief 응답을 받을 버퍼 크기. 잘린 응답도 세어야 하므로 넉넉히 잡는다. */
+/// Large enough that truncated responses are still counted.
 const RECV_BUF: usize = 4096;
 
-/** @brief 응답을 기다리다 포기하는 시간. 이보다 길면 종료가 굼떠진다. */
+/// A longer wait makes shutdown slow.
 const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
-/** @brief 데드라인을 확인하기 전에 보낼 질의 수. 매번 시계를 보면 그 비용이 측정을 흔든다. */
+/// Reading the clock on every send would skew the measurement.
 const DEADLINE_CHECK_EVERY: u64 = 256;
 
-/**
- * @brief 이 호스트의 UDP 왕복 바닥값을 재기 위한 최소 에코 서버.
- *
- * @details 측정한 지연이 서버 탓인지 이 플랫폼의 UDP 경로 탓인지 가르려면 비교 대상이
- *          있어야 한다. 받은 바이트를 그대로 돌려주므로 DNS 처리 비용이 0인 서버다.
- *          여기서 나온 값이 어떤 DNS 서버도 넘을 수 없는 바닥이다.
- * @param port 받을 포트.
- * @param workers 수신 스레드 수.
- */
+/// Minimal echo server for this host's UDP round-trip floor. It does no DNS work, so no DNS server
+/// can answer faster; comparing against it separates server cost from platform UDP cost.
 fn serve_echo(port: u16, workers: usize) -> Result<(), String> {
     let sock = UdpSocket::bind(("127.0.0.1", port))
         .map_err(|e| format!("{port} 포트를 열지 못했습니다: {e}"))?;
@@ -61,21 +49,17 @@ fn serve_echo(port: u16, workers: usize) -> Result<(), String> {
     Ok(())
 }
 
-/** @brief 명령줄 설정. */
 struct Args {
-    /** @brief 때릴 서버 주소. */
     server: String,
-    /** @brief 질의 목록 파일. 한 줄에 "이름 타입". */
+    /// One `name type` per line.
     queries: String,
-    /** @brief 부하를 넣을 시간. */
     seconds: u64,
-    /** @brief 스레드 수. 스레드마다 소켓 하나를 쓴다. */
+    /// One socket per thread.
     threads: usize,
-    /** @brief 스레드당 미회수 질의 상한. */
+    /// Unanswered queries allowed per thread.
     outstanding: usize,
 }
 
-/** @brief 인자를 읽는다. 없으면 기본값을 쓴다. */
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         server: "127.0.0.1:15353".to_string(),
@@ -115,7 +99,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-/** @brief 이름 문자열을 레코드 타입으로. 목록에 없는 타입은 A로 본다. */
+/// Types not listed map to A.
 fn record_type(text: &str) -> RecordType {
     match text.to_ascii_uppercase().as_str() {
         "AAAA" => RecordType::AAAA,
@@ -128,13 +112,8 @@ fn record_type(text: &str) -> RecordType {
     }
 }
 
-/**
- * @brief 질의 목록을 미리 와이어 바이트로 굽는다.
- *
- * @details 보낼 때마다 인코딩하면 그 비용이 발생기 쪽 병목이 된다. 응답은 개수만 세므로
- *          거래 번호를 위치마다 고정해도 된다.
- * @return 질의 하나당 바이트열. 목록이 비었으면 오류.
- */
+/// Encodes the list up front: encoding on every send would bottleneck the generator. Responses are
+/// only counted, so a fixed transaction ID per position is fine.
 fn bake_queries(path: &str) -> Result<Vec<Vec<u8>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}를 읽지 못했습니다: {e}"))?;
     let mut out = Vec::new();
@@ -162,14 +141,9 @@ fn bake_queries(path: &str) -> Result<Vec<Vec<u8>>, String> {
     Ok(out)
 }
 
-/**
- * @brief 스레드 하나가 데드라인까지 질의를 넣고 응답을 센다.
- *
- * @details 미회수 상한까지 보내고 하나 받으면 하나 더 보낸다. 상한이 곧 이 스레드가
- *          서버에 거는 압력이다. 수신이 시간을 넘기면 그 시점의 미회수는 잃은 것으로
- *          보고 다시 채운다 — 그러지 않으면 상한이 영구히 잠긴다.
- * @return (보낸 수, 받은 수).
- */
+/// Keeps up to `outstanding` queries in flight and sends one for each answer; that cap is the
+/// pressure on the server. When a receive times out, the queries in flight count as lost and are
+/// refilled, or the cap would stay full forever. Returns (sent, received).
 fn run_thread(
     server: &str,
     queries: &[Vec<u8>],
@@ -206,7 +180,7 @@ fn run_thread(
                 in_flight -= 1;
             }
             Err(_) => {
-                /* 데드라인을 넘긴 미회수는 다시 오지 않는다. 잠긴 곳을 풀어 준다. */
+                // Queries past the deadline will not come back; free their slots.
                 in_flight = 0;
             }
         }
@@ -221,7 +195,6 @@ fn run_thread(
     Ok((sent, completed))
 }
 
-/** @brief 두 수의 비율을 백분율로. 분모가 0이면 0. */
 fn percent(part: u64, whole: u64) -> f64 {
     if whole == 0 {
         return 0.0;
@@ -230,7 +203,8 @@ fn percent(part: u64, whole: u64) -> f64 {
 }
 
 fn main() {
-    /* 바닥값 측정 모드. 질의 목록도 데드라인도 필요 없으므로 인자 검사 앞에서 갈라진다. */
+    // Floor measurement mode needs no query list or deadline, so it branches before the argument
+    // checks.
     let raw: Vec<String> = std::env::args().collect();
     if let Some(at) = raw.iter().position(|a| a == "--serve-echo") {
         let port: u16 = raw
@@ -273,7 +247,8 @@ fn main() {
         let completed = Arc::clone(&completed);
         let server = args.server.clone();
         let outstanding = args.outstanding;
-        /* 스레드마다 목록의 다른 지점에서 시작해 같은 이름에 몰리지 않게 한다. */
+        // Each thread starts at a different point in the list so they do not pile onto the same
+        // name.
         let start = worker.wrapping_mul(queries.len() / args.threads.max(1));
         handles.push(std::thread::spawn(move || {
             match run_thread(&server, &queries, start, outstanding, deadline) {

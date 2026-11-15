@@ -1,6 +1,5 @@
-/*!
- * @brief 전송 계층이 부르는 진입점과, 캐시가 맞은 UDP 질의를 파싱 없이 내보내는 wire 빠른 경로.
- */
+//! Entry points the transports call, and the wire fast path that sends cached UDP answers without
+//! parsing.
 
 use std::sync::atomic::Ordering;
 #[cfg(unix)]
@@ -28,13 +27,10 @@ use crate::native::response::{
 use crate::native::{NativeServer, MAX_LARGE_QUERY_BYTES};
 
 impl Handler for NativeServer {
-    /** @brief 질의 하나를 처리한다. */
     fn handle(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
-        /*
-         * TSIG 오류 응답은 입장 단계보다 먼저 나간다. 버릴 클라이언트는 그보다도 먼저 걸러야
-         * 어떤 응답도 나가지 않는다. 클라이언트 ID 규칙이 있으면 목록 밖인지가 ID 로 정해지므로
-         * 주소만 보지 않고 ID 까지 본다.
-         */
+        // Ahead of TSIG errors, which go out before admission, so a dropped client gets no response
+        // at all. With client-ID rules the ID decides whether a client is listed, not just the
+        // address.
         if self.drops_client(ctx) {
             return None;
         }
@@ -97,7 +93,7 @@ impl Handler for NativeServer {
         Some(resp)
     }
 
-    /** @brief 파싱하기 전에 빠른 경로로 답할 수 있는지 본다. 못 하면 보통 경로로 보낸다. */
+    /// Tries the fast path before parsing.
     fn handle_udp_wire(
         &self,
         packet: &[u8],
@@ -112,7 +108,7 @@ impl Handler for NativeServer {
         self.wire_dispatch(packet, ctx, out, now, false)
     }
 
-    /** @brief 파싱하기 전에 권한 영역 빠른 경로로 답할 수 있는지 본다. */
+    /// Tries the authority fast path before parsing.
     fn handle_tcp_wire(
         &self,
         packet: &[u8],
@@ -123,7 +119,6 @@ impl Handler for NativeServer {
         self.authority_wire_dispatch(packet, ctx, out)
     }
 
-    /** @brief 이미 인코딩해 둔 응답을 그대로 내보낸다. */
     fn handle_preencoded_stream(
         &self,
         request: &Message,
@@ -135,7 +130,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 레인이 이미 캐시에 넣은 답을 빠른 경로로 내보낸다. */
     fn handle_udp_wire_hit(
         &self,
         packet: &[u8],
@@ -146,11 +140,8 @@ impl Handler for NativeServer {
         self.wire_dispatch(packet, ctx, out, now, true)
     }
     #[cfg(unix)]
-    /**
-     * @brief 이 스레드가 리액터 루프를 돌아야 하는지.
-     * @details 레인 조건이 닫혀도 이 스레드에 맡긴 교환이 남아 있으면 참이다. 워커가 루프를
-     *          떠나면 그 교환을 더 진행하지 않아 기다리는 클라이언트가 답을 받지 못한다.
-     */
+    /// True while exchanges handed to this thread remain, even after the lane conditions close; if
+    /// the worker left the loop, those exchanges would stall and their clients get no answer.
     fn reactor_active(&self) -> bool {
         self.reactor_lane.is_some()
             && (self.features.load().lanes.reactor
@@ -162,7 +153,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 레인에 더 맡길 슬롯이 있는지. */
     fn reactor_has_capacity(&self) -> bool {
         let Some(lane) = &self.reactor_lane else {
             return false;
@@ -175,7 +165,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 다음 데드라인까지 기다릴 밀리초. */
     fn reactor_deadline_ms(&self, now: std::time::Instant) -> i32 {
         LANE.with(|slot| {
             slot.borrow()
@@ -187,7 +176,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 레인이 지켜보는 소켓들을 모은다. */
     fn reactor_collect(&self, fds: &mut Vec<libc::pollfd>, map: &mut Vec<usize>) {
         LANE.with(|slot| {
             if let Some(st) = slot.borrow().as_ref() {
@@ -197,11 +185,8 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /**
-     * @brief 이 질의를 레인에 맡긴다.
-     * @warning 레인 조건이 닫혀 있으면 맡기지 않는다. 레인은 응답을 바꾸는 기능의 처리를
-     *          하지 않으므로 맡기면 그 기능이 없는 것처럼 답이 나간다.
-     */
+    /// Not submitted while the lane conditions are closed: the lane skips response-changing
+    /// features, so its answers would go out as if they were off.
     fn reactor_submit(
         &self,
         packet: &[u8],
@@ -227,10 +212,9 @@ impl Handler for NativeServer {
             return R::Fallback;
         };
         let epoch = runtime.cache.epoch();
-        /*
-         * 레인이 끝낸 답은 조건을 다시 보지 않고 이 캐시 세대로 담긴다. 세대를 잡기 전에 기능
-         * 세트가 바뀌었다면 이전 조건으로 고른 답이 비운 뒤의 세대를 달게 되므로 맡기지 않는다.
-         */
+        // Lane answers are stored under this cache generation without rechecking conditions. If the
+        // feature set changed before the generation was taken, an answer chosen under the old
+        // conditions would carry the post-flush generation.
         if !Arc::ptr_eq(&f, &self.features.load()) {
             return R::Fallback;
         }
@@ -246,27 +230,20 @@ impl Handler for NativeServer {
         if request.header.opcode != 0 || request.questions.len() != 1 {
             return R::Fallback;
         }
-        /*
-         * RA 와 RCODE 는 질의에서 뜻이 없다. 구조적 경로는 그 비트를 지워 정상 질의와 같은
-         * 캐시를 쓰는데, 이 레인은 handle_inner 를 거치지 않아 그 정규화가 없다. 여기서 맡으면
-         * 그 비트가 선 질의의 답이 이 레인 캐시에 정상 질의와 다른 열쇠로 들어간다. 구조적
-         * 경로로 넘긴다.
-         */
+        // RA and RCODE mean nothing in a query. The structured path clears them so such queries
+        // share the normal cache entry; this lane skips handle_inner and that normalization, and
+        // would cache their answers under a different key.
         if request.header.recursion_available || request.header.rcode != 0 {
             return R::Fallback;
         }
-        /*
-         * lenient는 쿠키 없는 질의만 이 레인에 맡긴다. COOKIE 질의는 정상 경로가 서버
-         * 쿠키를 발급·검증해야 하므로, 여기서 답하면 보안 기능이 없는 것처럼 보인다.
-         */
+        // With lenient cookies only cookie-less queries come here. A COOKIE query needs the normal
+        // path to issue and verify server cookies; answering here would look as if cookies were
+        // off.
         if f.cookies.keeper.is_some() && read_cookie(&request).is_some() {
             return R::Fallback;
         }
-        /*
-         * 이 레인은 handle_inner 를 거치지 않으므로 거기 있는 EDNS 버전 협상도 돌지 않는다.
-         * 모르는 버전에는 RFC 6891이 BADVERS 를 요구하는데, 여기서 맡으면 답까지
-         * 담아 보내 이 서버가 그 버전을 구현한다고 알리게 된다.
-         */
+        // This lane skips handle_inner's EDNS version negotiation. RFC 6891 requires BADVERS for an
+        // unknown version; answering here would claim support for it.
         if request
             .opt()
             .and_then(Edns::from_record)
@@ -362,10 +339,9 @@ impl Handler for NativeServer {
                 *st = None;
             }
             let st = st.get_or_insert_with(|| LaneState::new(lane.chain.clone(), runtime.clone()));
-            /*
-             * 대기 클라이언트가 상한에 차면 더 받지 않고 동기 경로로 돌린다. 제출 전에 막으므로
-             * 슬롯도 follower 도 늘지 않아, 한 이름에 질의가 몰려도 이 맵이 끝없이 커지지 않는다.
-             */
+            // Past the waiting-client cap, queries go to the synchronous path. Checked before
+            // submitting, so neither slots nor followers grow, and a flood on one name cannot grow
+            // this map without bound.
             if st.clients.len() >= MAX_LANE_PENDING {
                 return R::Fallback;
             }
@@ -406,7 +382,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 준비된 소켓을 읽어 레인을 진행한다. */
     fn reactor_pump(
         &self,
         fds: &[libc::pollfd],
@@ -439,7 +414,6 @@ impl Handler for NativeServer {
     }
 
     #[cfg(unix)]
-    /** @brief 데드라인이 지난 것을 처리한다. */
     fn reactor_tick(
         &self,
         now: std::time::Instant,
@@ -465,7 +439,6 @@ impl Handler for NativeServer {
         })
     }
 
-    /** @brief 응답이 여럿인 질의를 처리한다. */
     fn handle_multi(&self, request: &Message, ctx: &RequestCtx) -> Option<Vec<Message>> {
         let mut responses = Vec::new();
         self.emit_responses(request, ctx, &mut |message| {
@@ -475,13 +448,9 @@ impl Handler for NativeServer {
         Some(responses)
     }
 
-    /**
-     * @brief 파싱하지 못한 질의에 FORMERR로 답한다.
-     *
-     * @details 버리면 클라이언트는 데드라인을 다 기다린 뒤 재시도한다. 응답은 머리말뿐이라
-     *          질의보다 크지 않으므로 증폭이 되지 않는다. 파싱 전이라 일반 경로를 지나오지
-     *          못했으므로 접근 제어와 속도 제한을 여기서 본다.
-     */
+    /// FORMERR, not silence: a dropped query makes the client wait out its deadline before
+    /// retrying. The response is a bare header, never larger than the query, so it cannot amplify.
+    /// This runs before the normal path, so access control and rate limits are checked here.
     fn handle_unparsable(&self, packet: &[u8], ctx: &RequestCtx) -> Option<Message> {
         if !self.client_allowed(ctx) {
             return None;
@@ -503,7 +472,6 @@ impl Handler for NativeServer {
         Some(response)
     }
 
-    /** @brief 스트림 전송의 질의를 처리한다. */
     fn handle_stream(
         &self,
         request: &Message,
@@ -516,13 +484,8 @@ impl Handler for NativeServer {
 }
 
 impl NativeServer {
-    /**
-     * @brief 이 클라이언트에게 답해도 되는지.
-     *
-     * @details 질의를 해석하기 전에 답을 내보내는 경로들이 쓴다. 파이프라인을 타지 않는
-     *          응답도 접근 제어와 속도 제한 뒤에 있어야 한다. 그렇지 않으면 그 경로만
-     *          누구에게나 열린 증폭기가 된다.
-     */
+    /// For paths that answer before resolving. Responses outside the pipeline must also pass access
+    /// control and rate limits, or that path becomes an open amplifier.
     pub fn client_allowed(&self, ctx: &RequestCtx) -> bool {
         let client = self.identify(ctx);
         match self.acl.check(&client) {
@@ -539,11 +502,9 @@ impl NativeServer {
             .any(|limiter| limiter.check(&client) == RateDecision::Throttle)
     }
 
-    /**
-     * @brief 캐시가 맞은 UDP 질의를 파싱 없이 내보낸다.
-     * @warning 맞았더라도 접근 제어·속도 제한·차단은 지금 세대로 다시 본다. 통과하지 못하면
-     *          보통 경로로 보낸다.
-     */
+    /// Sends a cached UDP answer without parsing. Access control, rate limits, and blocking are
+    /// still checked against the current generation even on a hit; failing that, the query takes
+    /// the normal path.
     fn wire_dispatch(
         &self,
         packet: &[u8],
@@ -685,7 +646,6 @@ impl NativeServer {
         Wire::Respond
     }
 
-    /** @brief 만든 응답들을 실제로 내보낸다. */
     fn emit_responses(
         &self,
         request: &Message,

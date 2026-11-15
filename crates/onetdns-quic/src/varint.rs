@@ -1,15 +1,9 @@
-/*!
- * @brief QUIC 가변 길이 정수.
- *
- * @details 첫 두 비트가 길이를 정한다. 1, 2, 4, 8바이트 중 하나이고 나머지 비트가 값이다.
- * @note 같은 값을 여러 길이로 쓸 수 있다. 파싱은 그것을 받아들이지만, 이쪽이 쓸 때는
- *       항상 가장 짧은 형태를 쓴다.
- */
+//! QUIC variable-length integers. The top two bits of the first byte give the length: 1, 2, 4 or 8
+//! bytes.
+//!
+//! Reading accepts non-minimal encodings; writing always uses the shortest one.
 
-/**
- * @brief 가변 길이 정수를 읽는다.
- * @return 값과 소비한 바이트 수. 바이트가 모자라면 None.
- */
+/// Returns the value and the bytes consumed; None when truncated.
 pub fn read(buf: &[u8]) -> Option<(u64, usize)> {
     let first = *buf.first()?;
     let len = 1usize << (first >> 6);
@@ -20,7 +14,6 @@ pub fn read(buf: &[u8]) -> Option<(u64, usize)> {
     Some((val, len))
 }
 
-/** @brief 값을 담을 수 있는 가장 짧은 형태로 쓴다. */
 pub fn write(out: &mut Vec<u8>, v: u64) {
     if v < (1 << 6) {
         out.push(v as u8);
@@ -33,7 +26,6 @@ pub fn write(out: &mut Vec<u8>, v: u64) {
     }
 }
 
-/** @brief 이 값을 쓰는 데 필요한 바이트 수. 길이를 미리 잡을 때 쓴다. */
 pub fn len(v: u64) -> usize {
     if v < (1 << 6) {
         1
@@ -47,12 +39,10 @@ pub fn len(v: u64) -> usize {
 }
 
 #[cfg(test)]
-/** @brief 규격 예제 값과 경계에서의 왕복. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 규격에 담긴 예제 값들이 그대로 읽히는지. */
     fn rfc9000_examples() {
         let mut o = Vec::new();
         write(&mut o, 151_288_809_941_952_652);
@@ -74,7 +64,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 각 길이의 경계값이 왕복에서 보존되는지. */
     fn roundtrip_boundaries() {
         for v in [
             0u64,
@@ -94,7 +83,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 길이 비트를 값에서 제대로 걷어내는지. 남기면 값이 커진다. */
     fn two_byte_decode_value_masks_prefix() {
         assert_eq!(read(&[0x7b, 0xbd]).unwrap(), (15293, 2));
     }

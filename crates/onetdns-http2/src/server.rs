@@ -6,22 +6,16 @@ use crate::hpack::{self, Decoder};
 use crate::wire::{read_exact, read_frame, send_frame, strip_headers, strip_padding};
 use crate::{valid_header_field, H2Error};
 
-/** @brief 진행 중인 요청 스트림 하나의 상태. */
 struct StreamState {
-    /** @brief 이 스트림에서 받은 헤더들. */
     headers: Vec<(Vec<u8>, Vec<u8>)>,
-    /** @brief 이 스트림에서 받은 본문. */
     body: Vec<u8>,
-    /** @brief 헤더가 다 왔는지. */
     have_headers: bool,
-    /** @brief 상대가 다 보냈는지. */
     end_stream: bool,
-    /** @brief 이 스트림에 남은 수신 윈도우. 소비한 만큼 WINDOW_UPDATE로 되돌려 준다. */
+    /// Receive window left on this stream; consumed bytes are returned with WINDOW_UPDATE.
     recv_window: i64,
 }
 
 impl Default for StreamState {
-    /** @brief 새 스트림의 초기 상태. 윈도우는 명세가 정한 기본값에서 시작한다. */
     fn default() -> Self {
         Self {
             headers: Vec::new(),
@@ -33,73 +27,56 @@ impl Default for StreamState {
     }
 }
 
-/**
- * @brief 아직 다 보내지 못한 응답 본문.
- * @details 상대의 흐름 제어 윈도우가 모자라면 여기 남겨 두고, 윈도우가 열릴 때 이어서 보낸다.
- */
+/// Response body the peer's flow-control window has not let through yet; the rest goes out when the
+/// window opens.
 struct PendingBody {
-    /** @brief 아직 다 보내지 못한 응답 본문. */
     body: Vec<u8>,
-    /** @brief 그중 어디까지 보냈는지. */
+    /// Bytes of `body` already sent.
     offset: usize,
 }
 
-/** @brief 요청 처리 결과: 오류 상태 코드이거나 DNS 응답 본문이다. */
 enum AppResponse {
-    /** @brief 상태만 답한다. */
     Status(&'static str),
-    /** @brief DNS 응답을 답한다. */
     Dns(DohAnswer),
 }
 
-/**
- * @brief DoH 응답 본문과 HTTP 캐시가 신선하다고 볼 시간.
- *
- * @details 이 계층은 DNS 형식을 모른다. 수명은 응답을 만든 쪽이 측정해서 넘긴다.
- *          RFC 8484는 그 값이 답변부 최소 TTL을 넘지 못하게 규정한다.
- */
+/// DoH response body and its HTTP freshness lifetime. This layer does not parse DNS, so whoever
+/// built the response measures the lifetime; RFC 8484 caps it at the minimum TTL of the answer
+/// section.
 pub struct DohAnswer {
-    /** @brief DNS 응답 wire. */
     pub body: Vec<u8>,
-    /** @brief Cache-Control max-age 초. */
+    /// Cache-Control max-age, in seconds.
     pub max_age: u32,
 }
 
-/** @brief 연결 하나가 동시에 열 수 있는 스트림 수. */
 const MAX_H2_STREAMS: usize = 128;
 
-/** @brief 요청 본문 크기 상한. DoH 질의는 이보다 훨씬 작다. */
+/// DoH queries are far smaller.
 const MAX_H2_BODY: usize = 64 * 1024;
 
-/** @brief 응답 본문 크기 상한. DNS 메시지의 절대 상한이다. */
+/// The largest DNS message.
 const MAX_H2_RESPONSE: usize = u16::MAX as usize;
 
-/** @brief 헤더 블록 하나의 크기 상한. */
 const MAX_H2_HEADER_BLOCK: usize = 32 * 1024;
 
-/**
- * @brief 연결 전체에 걸쳐 버퍼링을 허용할 헤더 총량.
- * @warning 스트림별 상한만으로는 부족하다. 스트림을 여러 개 열어 조금씩 채우면 합계가
- *          제한 없이 커지므로, 연결 단위 총량도 함께 막는다.
- */
+/// Header bytes buffered across the whole connection. A per-stream cap is not enough: many streams
+/// each filling a little would grow without bound.
 const MAX_H2_BUFFERED_HEADERS: usize = 1024 * 1024;
 
-/** @brief 연결 전체 요청 본문 버퍼 총량. */
 const MAX_H2_BUFFERED_REQUESTS: usize = 1024 * 1024;
 
-/** @brief 연결 전체 미전송 응답 버퍼 총량. 윈도우를 열지 않는 클라이언트를 막는다. */
+/// Unsent response bytes across the connection; stops a client that never opens its window.
 const MAX_H2_BUFFERED_RESPONSES: usize = 1024 * 1024;
 
-/** @brief 경로에서 뽑는 클라이언트 식별자의 길이 상한. */
+/// Length cap of the client ID taken from the path.
 const MAX_CLIENT_ID: usize = 256;
 
-/** @brief 흐름 제어 윈도우의 명세 기본값. */
 const INITIAL_WINDOW: i64 = 65_535;
 
-/** @brief 흐름 제어 윈도우의 최댓값. 넘기면 FLOW_CONTROL_ERROR다. */
+/// Exceeding it is FLOW_CONTROL_ERROR.
 const MAX_WINDOW: i64 = 0x7fff_ffff;
 
-/** @brief 열려 있는 스트림 수: 수신 중인 것과 응답 대기 중인 것의 합. */
+/// Open streams: those still receiving plus those with a response pending.
 fn concurrent_streams(
     streams: &HashMap<u32, StreamState>,
     pending: &HashMap<u32, PendingBody>,
@@ -107,13 +84,10 @@ fn concurrent_streams(
     streams.len().saturating_add(pending.len())
 }
 
-/**
- * @brief DoH 연결 하나를 HTTP/2로 처리한다.
- * @param expected_path 허용할 요청 경로. 그 아래 추가 구간은 클라이언트 식별자가 된다.
- * @param handler 질의 와이어와 클라이언트 식별자를 받아 응답을 만든다. None 이면 답하지 않기로
- *                한 것이므로 아무것도 보내지 않고 연결을 끝낸다. 5xx 를 보내면 클라이언트가 같은
- *                질의를 다시 보낸다.
- */
+/// Serves one DoH connection over HTTP/2. Path segments under `expected_path` become the client ID.
+///
+/// `handler` turns the query wire and client ID into a response. `None` means no answer: the
+/// connection closes without sending anything, since a 5xx would make the client resend the query.
 pub fn serve_doh<S, H>(stream: &mut S, expected_path: &str, handler: H) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -122,13 +96,8 @@ where
     serve_doh_with_deadline_reset(stream, expected_path, handler, |_| {})
 }
 
-/**
- * @brief 데드라인 갱신 훅이 붙은 DoH 서버 루프.
- *
- * @details 서문 확인 → SETTINGS 교환 → 프레임 루프 순이다. 요청이 하나 완결될 때마다
- *          reset_deadline을 불러, 유휴 연결은 끊으면서도 활발한 연결은 유지한다.
- * @param reset_deadline 새 요청을 받았을 때 소켓 데드라인을 다시 잡는다.
- */
+/// Calls `reset_deadline` after each complete request, so idle connections time out while busy ones
+/// stay open.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
@@ -459,11 +428,8 @@ where
     }
 }
 
-/**
- * @brief 흐름 제어 윈도우를 늘린다.
- * @return 최댓값을 넘으면 오류다. 명세가 FLOW_CONTROL_ERROR로 규정한 상황이며,
- *         그대로 두면 윈도우가 뒤집혀 흐름 제어가 무력화된다.
- */
+/// Exceeding `MAX_WINDOW` is FLOW_CONTROL_ERROR; letting it through would wrap the window and
+/// defeat flow control.
 fn add_window(current: i64, increment: u32) -> Result<i64, H2Error> {
     let next = current
         .checked_add(i64::from(increment))
@@ -474,7 +440,7 @@ fn add_window(current: i64, increment: u32) -> Result<i64, H2Error> {
     Ok(next)
 }
 
-/** @brief 소비한 수신 윈도우를 연결과 스트림 양쪽에 되돌려 준다. */
+/// Returns consumed receive window to both the connection and the stream.
 fn restore_receive_credit<S: Write>(
     stream: &mut S,
     sid: u32,
@@ -495,11 +461,8 @@ fn restore_receive_credit<S: Write>(
     )
 }
 
-/**
- * @brief 윈도우가 허용하는 만큼 미전송 응답을 내보낸다.
- * @details 연결 윈도우와 스트림 윈도우 중 작은 쪽, 그리고 최대 프레임 크기까지가 한 번에 보낼 수
- *          있는 양이다. 다 보낸 스트림만 목록에서 지운다.
- */
+/// Sends pending responses as far as the windows allow: the smaller of the connection and stream
+/// windows, in frames of at most the max frame size. Only fully sent streams leave the list.
 fn flush_pending<S: Write>(
     stream: &mut S,
     pending: &mut HashMap<u32, PendingBody>,
@@ -551,38 +514,31 @@ fn flush_pending<S: Write>(
     Ok(())
 }
 
-/** @brief 헤더 목록의 회계상 크기. 항목당 32바이트 오버헤드를 더한다. */
+/// Header list size as the protocol counts it, with 32 bytes of overhead per entry.
 fn header_list_size(headers: &[(Vec<u8>, Vec<u8>)]) -> usize {
     headers
         .iter()
         .fold(0usize, |n, (k, v)| n.saturating_add(k.len() + v.len() + 32))
 }
 
-/** @brief 스트림 하나만 끊는다. 연결은 유지된다. */
+/// Resets one stream; the connection stays up.
 fn send_rst_stream<S: Write>(stream: &mut S, sid: u32, code: u32) -> Result<(), H2Error> {
     send_frame(stream, frame_type::RST_STREAM, 0, sid, &code.to_be_bytes())
 }
 
-/**
- * @brief 요청 헤더가 DoH 규격에 맞는지 검사한다.
- *
- * @details 의사 헤더는 일반 헤더보다 앞에 있어야 하고 각각 하나뿐이어야 한다.
- *          content-length가 있으면 실제 본문 길이와 일치해야 한다.
- * @warning 순서와 중복 규칙을 느슨하게 두면 요청 스머글링(request smuggling)의 경로가 된다.
- *          같은 바이트열을 앞단과 뒷단이 다른 요청으로 해석하게 된다.
- */
-/** @brief 요청 자체가 어긋났을 때. */
 const STATUS_BAD_REQUEST: &str = "400";
 
-/** @brief 답을 만들었지만 그대로 담아 보낼 수 없을 때. 요청이 아니라 이쪽 사정이다. */
+/// An answer exists but cannot be sent as is: a server problem, not a bad request.
 const STATUS_BAD_GATEWAY: &str = "502";
-/** @brief 메서드가 이 자원에 쓰이지 않을 때. HTTP/1.1 경로와 같은 코드다. */
 const STATUS_METHOD_NOT_ALLOWED: &str = "405";
-/** @brief 본문 형식을 다루지 못할 때. RFC 8484가 이곳에 이 코드를 든다. */
+/// RFC 8484 names this code for a body type the server does not handle.
 const STATUS_UNSUPPORTED_MEDIA_TYPE: &str = "415";
-/** @brief DoH 자원이 받는 메서드. 405 응답에 담아 보낸다. */
+/// Sent in the Allow header of a 405.
 const ALLOWED_METHODS: &str = "GET, POST";
 
+/// Pseudo-headers come before regular ones, once each, and a content-length must match the body.
+/// Loosening the order or duplicate rules is a request smuggling path: a front end and this server
+/// would read the same bytes as different requests.
 fn valid_doh_request_headers(
     headers: &[(Vec<u8>, Vec<u8>)],
     body_len: usize,
@@ -642,10 +598,9 @@ fn valid_doh_request_headers(
                 return Err(STATUS_BAD_REQUEST);
             }
         } else if name == b"content-type" {
-            /*
-             * 형식이 다른 것과 헤더가 겹치는 것은 뜻이 다르다. 겹치는 것은 요청 스머글링의
-             * 경로라 그대로 400 이고, 다른 형식은 415 로 구분해야 클라이언트가 고칠 수 있다.
-             */
+            // A different type and a duplicated header mean different things. A duplicate is a
+            // request smuggling path and stays 400; a different type is 415, so the client can fix
+            // it.
             let is_dns = value.eq_ignore_ascii_case(b"application/dns-message");
             if content_type.replace(is_dns).is_some() {
                 return Err(STATUS_BAD_REQUEST);
@@ -687,11 +642,8 @@ fn valid_doh_request_headers(
     }
 }
 
-/**
- * @brief 완결된 요청을 처리해 응답을 만든다.
- * @details GET이면 dns 질의 매개변수를 base64url로 디코딩하고, POST면 본문을 그대로 쓴다.
- * @return 오류 상태 코드이거나 DNS 응답 본문. 처리기가 답하지 않기로 했으면 None 이다.
- */
+/// GET decodes the base64url `dns` parameter; POST uses the body as is. `None` means the handler
+/// chose not to answer.
 fn process_request<H>(
     st: StreamState,
     expected_path: &str,
@@ -720,7 +672,7 @@ where
     Ok(Some(match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
             Ok(Some(answer)) if answer.body.len() <= MAX_H2_RESPONSE => AppResponse::Dns(answer),
-            /* 답을 만들었는데 담아 보낼 수 없는 것은 이쪽 사정이므로 5xx 로 남긴다. */
+            // An answer that cannot be sent is a server problem, so it stays 5xx.
             Ok(Some(_)) => AppResponse::Status(STATUS_BAD_GATEWAY),
             Ok(None) => return Ok(None),
             Err(status) => AppResponse::Status(status),
@@ -729,7 +681,7 @@ where
     }))
 }
 
-/** @brief 응답 헤더를 보내고, 본문은 윈도우가 허용하는 만큼만 보낸 뒤 나머지를 미전송으로 남긴다. */
+/// Sends the response headers and as much body as the windows allow; the rest stays pending.
 fn queue_response<S: Write>(
     stream: &mut S,
     sid: u32,
@@ -739,10 +691,7 @@ fn queue_response<S: Write>(
 ) -> Result<(), H2Error> {
     match response {
         AppResponse::Status(status) => {
-            /*
-             * 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
-             * 다시 물어야 하는지 알 길이 없다.
-             */
+            // A 405 must list the accepted methods, or the client cannot know what to retry with.
             let block = if status == STATUS_METHOD_NOT_ALLOWED {
                 hpack::encode_response(&[(":status", status), ("allow", ALLOWED_METHODS)])
             } else {
@@ -792,10 +741,8 @@ fn queue_response<S: Write>(
     Ok(())
 }
 
-/**
- * @brief 요청 경로가 설정된 DoH 경로인지 보고, 뒤에 붙은 클라이언트 식별자를 추출한다.
- * @return 경로가 맞지 않으면 None. 맞으면 식별자(없을 수 있음)를 돌려준다.
- */
+/// Matches the configured DoH path and extracts the client ID after it. `None` when the path does
+/// not match; `Some(None)` when it matches without an ID.
 fn match_doh_path(path_only: &[u8], expected: &str) -> Option<Option<String>> {
     if path_only == expected.as_bytes() {
         return Some(None);
@@ -811,16 +758,11 @@ fn match_doh_path(path_only: &[u8], expected: &str) -> Option<Option<String>> {
     Some(Some(std::str::from_utf8(segment).ok()?.to_string()))
 }
 
-/** @brief HTTP/1.1 요청 헤더 크기 상한. */
 const MAX_H1_HEADERS: usize = 16 * 1024;
 
-/** @brief HTTP/1.1 요청 본문 크기 상한. */
 const MAX_H1_BODY: usize = 64 * 1024;
 
-/**
- * @brief HTTP/1.1로 DoH를 처리한다.
- * @details ALPN에서 h2를 협상하지 못한 클라이언트를 위한 대체 경로다.
- */
+/// Fallback for clients that did not negotiate h2 in ALPN.
 pub fn serve_doh_h1<S, H>(stream: &mut S, expected_path: &str, handler: H) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -829,11 +771,8 @@ where
     serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {})
 }
 
-/**
- * @brief 데드라인 갱신 훅이 붙은 HTTP/1.1 DoH 루프.
- * @note Content-Length만 받는다. 청크 전송은 지원하지 않는다. 앞단과 해석이 어긋나면
- *       요청 스머글링이 되므로, 지원하지 않는 인코딩은 받아들이지 않는 편이 안전하다.
- */
+/// Only Content-Length bodies are accepted, not chunked. An encoding the front end reads
+/// differently is a request smuggling path, so unsupported encodings are refused.
 pub fn serve_doh_h1_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
@@ -1008,7 +947,6 @@ where
     }
 }
 
-/** @brief HTTP/1.1 200 응답과 DNS 본문을 쓴다. */
 fn write_h1_response<S: Write>(stream: &mut S, body: &[u8], max_age: u32) -> Result<(), H2Error> {
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nCache-Control: max-age={max_age}\r\nConnection: close\r\n\r\n",
@@ -1019,12 +957,8 @@ fn write_h1_response<S: Write>(stream: &mut S, body: &[u8], max_age: u32) -> Res
     Ok(())
 }
 
-/** @brief 본문 없는 HTTP/1.1 오류 응답을 쓴다. */
 fn write_h1_status<S: Write>(stream: &mut S, status: &str) -> Result<(), H2Error> {
-    /*
-     * 405 는 받는 메서드를 알려야 한다. 알려 주지 않으면 클라이언트가 무엇으로
-     * 다시 물어야 하는지 알 길이 없다.
-     */
+    // A 405 must list the accepted methods, or the client cannot know what to retry with.
     let allow = if status.starts_with(STATUS_METHOD_NOT_ALLOWED) {
         format!("Allow: {ALLOWED_METHODS}\r\n")
     } else {
@@ -1035,12 +969,10 @@ fn write_h1_status<S: Write>(stream: &mut S, status: &str) -> Result<(), H2Error
     stream.write_all(head.as_bytes()).map_err(|_| H2Error::Io)
 }
 
-/** @brief 줄 끝의 CR을 떼어 낸다. */
 fn trim_cr(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-/** @brief 부분열의 위치를 찾는다. */
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -1048,7 +980,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/** @brief GET 경로의 질의 문자열에서 dns 매개변수 값을 추출해 디코딩한다. */
+/// Decoded value of the `dns` query parameter.
 fn get_dns_param(path: &[u8]) -> Option<Vec<u8>> {
     let q = path.split(|&b| b == b'?').nth(1)?;
     for kv in q.split(|&b| b == b'&') {
@@ -1059,12 +991,8 @@ fn get_dns_param(path: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/**
- * @brief base64url을 디코딩한다(RFC 8484의 GET 질의 인코딩).
- * @note 패딩 없는 형태를 받는다. 알파벳 밖 문자는 거부한다.
- */
+/// Unpadded only; characters outside the alphabet are rejected.
 fn base64url_decode(input: &[u8]) -> Option<Vec<u8>> {
-    /** @brief 문자 하나를 6비트 값으로. */
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -1095,7 +1023,6 @@ fn base64url_decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-/** @brief 헤더 검증, 경로 처리, 그리고 두 HTTP 버전의 왕복. */
 mod tests {
     use super::*;
     use crate::testutil::{deadline_accept, deadline_connect};
@@ -1103,7 +1030,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    /** @brief HTTP/2로 질의를 보내는 테스트용 클라이언트. */
     fn h2_client_doh(addr: std::net::SocketAddr, dns_query: &[u8], use_get: bool) -> Vec<u8> {
         let mut c = deadline_connect(addr);
         c.write_all(frame::PREFACE).unwrap();
@@ -1176,9 +1102,7 @@ mod tests {
         body
     }
 
-    /** @brief URL용 base64. */
     fn base64url_encode(data: &[u8]) -> String {
-        /** @brief base64 문자표. */
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut s = String::new();
         for chunk in data.chunks(3) {
@@ -1198,12 +1122,10 @@ mod tests {
         s
     }
 
-    /** @brief 테스트용 DoH 응답. 수명은 이 테스트들의 관심사가 아니다. */
     fn answer(body: Vec<u8>) -> Result<Option<DohAnswer>, &'static str> {
         Ok(Some(DohAnswer { body, max_age: 0 }))
     }
 
-    /** @brief 두 방식으로 왕복해 본다. */
     fn run(use_get: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1226,7 +1148,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경로에서 클라이언트 식별자를 읽는지. */
     fn doh_path_extracts_client_id() {
         assert_eq!(match_doh_path(b"/dns-query", "/dns-query"), Some(None));
         assert_eq!(
@@ -1245,7 +1166,6 @@ mod tests {
         assert_eq!(match_doh_path(b"/dns-query/", "/dns-query"), None);
     }
 
-    /** @brief 테스트용 헤더 목록. */
     fn owned_headers(headers: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
         headers
             .iter()
@@ -1254,19 +1174,14 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 거절하는 까닭에 맞는 상태 코드를 고르는지.
-     *
-     * @details HTTP/1.1 경로는 415 와 405 를 구분해 답하는데 HTTP/2 경로는 모두 400 으로
-     *          접고 있었다. 같은 서버의 두 전송이 다른 답을 하면 클라이언트가 무엇을
-     *          고쳐야 할지 알 수 없다. RFC 8484는 다루지 못하는 형식에 415 를
-     *          들고, 그 코드를 본 클라이언트는 다른 서버로 옮겨 갈 수 있다.
-     * @note 형식을 아예 밝히지 않은 것도 415 다. RFC 9110은 content-type 이 없으면
-     *       application/octet-stream 으로 봐도 된다고 하고, 15.5.16 은 본문을 들여다본
-     *       결과로도 415 를 들 수 있다고 한다. 둘 다 이쪽이 받는 형식이 아니다.
-     * @note 겹친 content-type 은 415 가 아니라 400 이다. 앞단과 뒷단이 같은 바이트열을
-     *       다르게 읽게 만드는 경로라 형식 문제와 뜻이 다르다.
-     */
+    /// Each rejection gets the status that matches its reason, the same on both transports. RFC
+    /// 8484 names 415 for an unsupported type, and a client seeing it may move to another server.
+    ///
+    /// A missing content-type is 415 too: RFC 9110 lets it be read as application/octet-stream,
+    /// which this server does not accept either.
+    ///
+    /// A duplicated content-type is 400, not 415: it lets a front end and this server read the same
+    /// bytes differently, which is not a type problem.
     fn doh_header_rejections_carry_the_matching_status() {
         let base: [(&[u8], &[u8]); 5] = [
             (b":method", b"POST"),
@@ -1321,7 +1236,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 겹치거나 순서가 어긋난 헤더, 길이가 안 맞는 본문을 거부하는지. */
     fn doh_headers_reject_duplicates_bad_order_and_body_length_mismatch() {
         let valid: [(&[u8], &[u8]); 6] = [
             (b":method", b"POST"),
@@ -1385,19 +1299,17 @@ mod tests {
     }
 
     #[test]
-    /** @brief 보내기 방식의 왕복. */
     fn doh_post_roundtrip() {
         run(false);
     }
 
     #[test]
-    /** @brief 가져오기 방식의 왕복. */
     fn doh_get_roundtrip() {
         run(true);
     }
 
     #[test]
-    /** @brief 클라이언트가 밀어 보내려는 것을 거부하는지. 규격상 서버만 할 수 있다. */
+    /// Only servers may push.
     fn server_rejects_client_push_promise() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1428,7 +1340,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 첫 프레임이 설정인지 확인하는지. */
     fn server_requires_client_settings_as_first_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1448,7 +1359,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제어 프레임만 보내는 상대가 데드라인을 늘리지 못하는지. */
     fn deadline_reset_ignores_control_only_traffic() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1479,7 +1389,6 @@ mod tests {
         assert_eq!(resets.load(Ordering::Relaxed), 1);
     }
 
-    /** @brief DoH 요청 헤더 한 벌. 테스트에서 스트림을 열 때 쓴다. */
     fn doh_post_header_block() -> Vec<u8> {
         hpack::encode_response(&[
             (":method", "POST"),
@@ -1490,7 +1399,6 @@ mod tests {
         ])
     }
 
-    /** @brief 설정 교환까지 마친 연결을 연다. */
     fn h2_connect(addr: std::net::SocketAddr) -> TcpStream {
         let mut client = deadline_connect(addr);
         client.write_all(frame::PREFACE).unwrap();
@@ -1498,7 +1406,6 @@ mod tests {
         client
     }
 
-    /** @brief 이 연결에서 질의 하나를 주고받는다. 스트림 번호를 지정한다. */
     fn h2_exchange_on(client: &mut TcpStream, sid: u32, query: &[u8]) -> Vec<u8> {
         send_frame(
             client,
@@ -1541,11 +1448,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 끝나지 않는 CONTINUATION 흐름이 헤더 버퍼를 무한히 키우지 못하는지.
-     * @details 상한을 넘는 순간 그 스트림을 끊어야 한다. 끊지 않으면 상대가 END_HEADERS를
-     *          영원히 미루며 메모리를 채울 수 있다.
-     */
+    /// Past the limit the stream must be cut, or the peer can postpone END_HEADERS forever and fill
+    /// memory.
     fn continuation_flood_is_cut_at_the_header_block_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1591,11 +1495,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 열자마자 끊기를 되풀이해도 스트림 예산이 새지 않는지.
-     * @details 끊긴 스트림이 예산을 물고 있으면 상한만큼 되풀이한 뒤 정상 질의가 거절된다.
-     *          요청 처리는 프레임 루프 안에서 동기로 끝나므로 되풀이가 일을 늘리지도 않는다.
-     */
+    /// A reset stream that kept its budget would refuse normal queries after enough cycles.
+    /// Requests finish synchronously in the frame loop, so the cycles add no work either.
     fn rapid_reset_cycles_do_not_leak_the_stream_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1641,7 +1542,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief URL용 base64의 왕복. */
     fn base64url_roundtrip() {
         let data = vec![0u8, 1, 2, 250, 255, 128, 64];
         let enc = base64url_encode(&data);
@@ -1651,7 +1551,6 @@ mod tests {
         assert!(base64url_decode(b"YR").is_none());
     }
 
-    /** @brief HTTP/1.1로 요청을 보내는 테스트용 클라이언트. */
     fn h1_request(addr: std::net::SocketAddr, raw: &[u8]) -> Vec<u8> {
         let mut c = deadline_connect(addr);
         c.write_all(raw).unwrap();
@@ -1660,7 +1559,6 @@ mod tests {
         resp
     }
 
-    /** @brief HTTP/1.1로 왕복해 본다. */
     fn run_h1(get: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1700,16 +1598,11 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 본문을 거절할 때 4xx 와 5xx 를 가려 내는지.
-     *
-     * @details RFC 8484는 DoH 클라이언트가 다른 HTTP 클라이언트와 같은 방식으로
-     *          상태 코드를 해석하게 한다. 그러면 5xx 는 서버 잘못이라는 뜻이라 클라이언트가
-     *          같은 서버에 다시 보내고, 서버 오류 지표도 요청 잘못으로 오염된다. 읽지 못한
-     *          본문은 요청 잘못이다. HTTP/1.1 과 HTTP/2 가 같은 값을 내야 한다.
-     */
+    /// RFC 8484 has DoH clients read status codes like any HTTP client. A 5xx means a server fault:
+    /// the client resends to the same server, and server error metrics fill with request errors. An
+    /// unreadable body is a request error, and HTTP/1.1 and HTTP/2 must agree.
     fn doh_body_rejections_are_client_errors_not_server_errors() {
-        /** @brief 요청 하나를 보내고 상태 줄만 돌려준다. */
+        /// Sends one request and returns only the status line.
         fn status_for(reply: &'static str) -> String {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1739,10 +1632,7 @@ mod tests {
             status_for("502")
         );
 
-        /*
-         * HTTP/2 쪽도 같은 값을 내야 한다. 두 경로가 갈리면 클라이언트가 전송에 따라
-         * 다른 판단을 하게 된다.
-         */
+        // HTTP/2 must give the same status.
         let mut output = Vec::new();
         let mut pending = HashMap::new();
         let mut windows = HashMap::from([(1, INITIAL_WINDOW)]);
@@ -1767,11 +1657,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 처리기가 답하지 않기로 하면 두 HTTP 버전 모두 아무 응답 없이 연결을 끝내는지.
-     * @details 5xx 로 대신 답하면 클라이언트가 같은 질의를 다시 보낸다. 상태 줄도 HEADERS 도
-     *          나가지 않아야 한다.
-     */
+    /// A 5xx instead would make the client resend the query; neither a status line nor HEADERS may
+    /// go out.
     fn withheld_answers_end_the_connection_without_a_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1834,12 +1721,7 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DoH 응답이 신선도를 밝히는지.
-     *
-     * @details RFC 8484는 DoH 서버가 명시적인 신선도를 붙이게 하고 그 값이 답변부
-     *          최소 TTL을 넘지 못하게 한다.
-     */
+    /// RFC 8484 requires explicit freshness no longer than the minimum TTL of the answer section.
     fn doh_responses_declare_their_freshness() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1888,19 +1770,16 @@ mod tests {
     }
 
     #[test]
-    /** @brief HTTP/1.1 보내기 방식의 왕복. */
     fn doh_h1_post_roundtrip() {
         run_h1(false);
     }
 
     #[test]
-    /** @brief HTTP/1.1 가져오기 방식의 왕복. */
     fn doh_h1_get_roundtrip() {
         run_h1(true);
     }
 
     #[test]
-    /** @brief 잘못된 경로를 거부하는지. */
     fn doh_h1_rejects_bad_path() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1914,7 +1793,6 @@ mod tests {
         drop(server);
     }
 
-    /** @brief 응답의 상태 줄. */
     fn h1_status(raw: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1928,12 +1806,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 405 응답이 받는 메서드를 알려 주는지.
-     *
-     * @details RFC 9110은 405 에 Allow 를 반드시 실으라고 한다. 없으면 클라이언트가
-     *          어떤 메서드로 다시 물어야 하는지 알 길이 없어 그냥 포기한다.
-     */
+    /// RFC 9110 requires Allow on a 405; without it the client cannot know which method to retry
+    /// with.
     fn method_not_allowed_lists_the_methods_we_take() {
         let put = b"PUT /dns-query HTTP/1.1\r\nHost: dns.test\r\nContent-Type: application/dns-message\r\nContent-Length: 3\r\n\r\ndns";
         let response = h1_status(put.to_vec());
@@ -1945,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 경계가 애매한 요청을 거부하는지. 받아들이면 요청 하나가 둘로 읽힌다. */
+    /// Accepting one would let a single request be read as two.
     fn doh_h1_rejects_malformed_or_ambiguous_requests() {
         let no_type = b"POST /dns-query HTTP/1.1\r\nHost: dns.test\r\nContent-Length: 3\r\n\r\ndns";
         let status = h1_status(no_type.to_vec());
@@ -1976,7 +1850,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 응답이 DNS 크기 상한을 넘지 않는지. */
     fn doh_h1_caps_handler_response_to_dns_message_size() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1994,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    /** @brief 아직 못 보낸 응답도 동시 스트림 몫을 쓰는지. 안 세면 상한이 무의미하다. */
+    /// Uncounted pending responses would make the limit meaningless.
     fn pending_responses_consume_concurrent_stream_budget() {
         let streams = HashMap::new();
         let pending = (0..MAX_H2_STREAMS)
@@ -2012,7 +1885,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 못 보낸 응답 바이트에 연결 단위 상한이 걸리는지. */
     fn pending_response_bytes_are_connection_bounded() {
         let mut output = Vec::new();
         let mut pending = HashMap::from([(

@@ -1,12 +1,8 @@
-/*!
- * @brief DNSCrypt v2: 인증서 발급과 질의 암복호화.
- *
- * @details 클라이언트는 TXT 질의로 서명된 인증서를 받아 리졸버 공개키를 얻고, 그 뒤
- *          X25519 공유키로 질의를 XChaCha20-Poly1305 암호화해 보낸다. 서명 키가 장기
- *          신뢰 근거이고, 리졸버 키는 인증서를 재발급하며 교체할 수 있다.
- */
+//! DNSCrypt v2: certificates and query encryption. A client fetches the signed certificate over TXT
+//! to learn the resolver key, then seals queries with XChaCha20-Poly1305 under an X25519 shared
+//! key. The signing key is the long-term trust anchor; the resolver key can change because clients
+//! learn it from the certificate.
 
-/** @brief DNSCrypt 수신 쪽. */
 pub mod server;
 
 use std::sync::{Arc, Mutex};
@@ -20,56 +16,39 @@ use poly1305::Poly1305;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-/** @brief 인증서 시작 표식. */
 pub const CERT_MAGIC: [u8; 4] = *b"DNSC";
 
-/** @brief XChaCha20-Poly1305 암호 스위트 버전. 이 구현이 지원하는 유일한 값이다. */
+/// The only es-version this implementation supports.
 pub const ES_VERSION_XCHACHA: u16 = 0x0002;
 
-/** @brief 암호화된 응답 앞에 붙는 고정 표식. 클라이언트가 응답을 알아보는 근거다. */
 pub const RESOLVER_MAGIC: [u8; 8] = [0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38];
 
-/** @brief 클라이언트 매직 길이. 리졸버 공개키 앞부분에서 따온다. */
+/// Taken from the start of the resolver public key.
 pub const CLIENT_MAGIC_LEN: usize = 8;
 
-/** @brief 클라이언트가 제공하는 논스 절반의 길이. */
+/// The client's half of the 24-byte nonce.
 pub const CLIENT_NONCE_LEN: usize = 12;
 
-/** @brief X25519 공개키 길이. */
 pub const PUBKEY_LEN: usize = 32;
 
-/**
- * @brief DNSCrypt 제공자 상태: 서명 키, 리졸버 키 쌍, 현재 인증서.
- *
- * @details 인증서만 Mutex 뒤에 둔다. 갱신되는 것은 인증서뿐이고 키는 수명 동안 고정이라,
- *          질의 처리 경로의 키 접근에 잠금이 걸리지 않는다.
- */
+/// Only the certificate is behind a mutex: it is the only part that changes, so the query path
+/// reads the keys without locking.
 #[derive(Clone)]
 pub struct Provider {
-    /** @brief 인증서에 서명하는 키. */
     signing: SigningKey,
 
-    /** @brief 질의를 푸는 비밀 키. */
     resolver_sk: StaticSecret,
 
-    /** @brief 그 짝이 되는 공개 키. */
     pub resolver_pk: [u8; 32],
 
-    /** @brief 클라이언트가 질의 앞에 붙일 값. */
     pub client_magic: [u8; CLIENT_MAGIC_LEN],
 
-    /** @brief 지금 내주는 인증서. */
     cert: Arc<Mutex<Vec<u8>>>,
-    /** @brief 이 서버를 가리키는 이름. */
     pub provider_name: String,
 }
 
-/**
- * @brief 서명된 인증서 바이트열을 만든다.
- * @details 서명 대상은 리졸버 공개키·클라이언트 매직·일련번호·유효 구간이다. 서명 키를
- *          가진 쪽만 리졸버 키를 바꿔 넣을 수 있게 하는 구조다.
- * @param valid_secs 유효 기간(초). 짧을수록 키 노출 구간이 좁아지지만 재발급이 잦아진다.
- */
+/// Signs the resolver public key, client magic, serial and validity window, so only the holder of
+/// the signing key can substitute a resolver key.
 fn build_cert(
     signing: &SigningKey,
     resolver_pk: &[u8; 32],
@@ -100,18 +79,14 @@ fn build_cert(
 }
 
 impl Provider {
-    /** @brief 새 서명 키로 제공자를 만든다. 기존 클라이언트는 인증서를 다시 받아야 한다. */
     pub fn generate(provider_name: &str, valid_secs: u32) -> Self {
         let mut seed = Zeroizing::new([0u8; 32]);
         onetdns_core::fill_random(&mut *seed);
         Self::with_signing_seed(&seed, provider_name, valid_secs)
     }
 
-    /**
-     * @brief 기존 서명 시드로 제공자를 복원한다. 재시작 후에도 같은 신뢰를 유지한다.
-     * @note 리졸버 키는 매번 새로 만든다. 그건 인증서로 배포되므로 바뀌어도 무방하고,
-     *       주기적 교체가 오히려 바람직하다.
-     */
+    /// Restores a provider from a stored signing seed, so clients keep trusting it across restarts.
+    /// The resolver key is new every time; clients learn it from the certificate.
     pub fn with_signing_seed(seed: &[u8; 32], provider_name: &str, valid_secs: u32) -> Self {
         let signing = SigningKey::from_bytes(seed);
 
@@ -136,15 +111,13 @@ impl Provider {
         }
     }
 
-    /**
-     * @brief 서명 시드를 꺼낸다. 재시작 간 신원 유지를 위해 저장할 때만 쓴다.
-     * @warning 장기 개인키다. 노출되면 임의의 리졸버 키를 담은 인증서를 위조할 수 있다.
-     */
+    /// The long-term private key: whoever holds it can forge a certificate for any resolver key.
+    /// Use it only to persist the provider across restarts.
     pub fn signing_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing.to_bytes())
     }
 
-    /** @brief 유효 구간을 새로 잡아 인증서를 다시 서명한다. 키는 그대로다. */
+    /// Re-signs with a new validity window; the keys stay the same.
     pub fn reissue_cert(&self, valid_secs: u32) {
         let fresh = build_cert(
             &self.signing,
@@ -155,23 +128,18 @@ impl Provider {
         *self.cert.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
     }
 
-    /** @brief 현재 인증서 사본. 포이즌된 락을 복구해 잠근다. */
     pub fn cert_bytes(&self) -> Vec<u8> {
         self.cert.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /** @brief 인증서 검증에 쓰이는 공개 서명 키. 클라이언트가 미리 알아야 하는 값이다. */
+    /// Clients must know this key in advance to verify the certificate.
     pub fn provider_public_key(&self) -> [u8; 32] {
         self.signing.verifying_key().to_bytes()
     }
 
-    /**
-     * @brief 클라이언트 공개키와의 공유 비밀. 질의 복호화 키가 된다.
-     * @details X25519 결과를 그대로 쓰지 않고 hchacha20 을 한 번 더 건다. DNSCrypt v2 가
-     *          es-version 2 의 키 교환을 그렇게 정의하며, libsodium 의 crypto_box 계열이
-     *          beforenm 단계에서 하는 일과 같다. 이 단계를 빼면 어떤 표준 클라이언트도
-     *          같은 키에 이르지 못한다.
-     */
+    /// X25519 followed by HChaCha20, which is how DNSCrypt es-version 2 defines the key exchange
+    /// (libsodium's crypto_box_beforenm). Without that step no standard client derives the same
+    /// key.
     pub fn shared_key(&self, client_pk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         let raw = Zeroizing::new(
             self.resolver_sk
@@ -181,13 +149,9 @@ impl Provider {
         Zeroizing::new(box_beforenm(&raw))
     }
 
-    /**
-     * @brief 인증서 TXT 질의에 응답을 만든다.
-     *
-     * @details 질의 이름을 설정된 제공자 이름과 원시 옥텟으로 대조한다. 문자열로
-     *          변환해 비교하면 UTF-8이 아닌 이름이 손실 변환되어 서로 다른 이름이 같아진다.
-     * @return 이 서버의 인증서 질의가 아니면 None. 일반 DNS 경로로 넘어간다.
-     */
+    /// Compares the query name with the provider name as raw octets: converting to a string would
+    /// map distinct non-UTF-8 names to the same text. Returns `None` for anything but this server's
+    /// certificate query, which then takes the normal DNS path.
     pub fn cert_txt_response(&self, packet: &[u8]) -> Option<Vec<u8>> {
         if packet.len() < 12 {
             return None;
@@ -228,11 +192,8 @@ impl Provider {
     }
 }
 
-/**
- * @brief 압축 없는 QNAME을 소문자 정규 형태로 읽는다.
- * @details 인증서 질의는 이 서버가 직접 해석한다. 압축 포인터는 따라가지 않는다. 질문
- *          섹션의 첫 이름은 압축될 수 없기 때문이다.
- */
+/// Does not follow compression pointers: the first name in the question section cannot be
+/// compressed.
 fn read_qname(buf: &[u8], mut i: usize) -> Option<(Vec<u8>, usize)> {
     let mut name = Vec::new();
     loop {
@@ -254,7 +215,6 @@ fn read_qname(buf: &[u8], mut i: usize) -> Option<(Vec<u8>, usize)> {
     Some((name, i))
 }
 
-/** @brief 설정된 제공자 이름을 질의와 대조할 정규 키로 바꾼다. */
 fn configured_qname_key(name: &str) -> Option<Vec<u8>> {
     let name = name.trim_end_matches('.');
     if name.is_empty() {
@@ -272,12 +232,9 @@ fn configured_qname_key(name: &str) -> Option<Vec<u8>> {
     Some(key)
 }
 
-/**
- * @brief 암호화된 질의를 복호화하고 패딩을 벗긴다.
- * @details 논스 24바이트 중 앞 12바이트만 클라이언트가 정한다. 나머지는 0이다. 질의
- *          방향에서는 클라이언트 논스만으로 유일성이 보장된다.
- * @return 인증 실패나 패딩 이상이면 None. 두 경우를 구분하지 않는다.
- */
+/// The client fills only the first 12 nonce bytes and the rest are zero; in the query direction the
+/// client nonce alone is unique. Returns `None` on an authentication or padding failure, without
+/// telling which.
 pub fn decrypt_query(
     key: &[u8; 32],
     client_nonce: &[u8; 12],
@@ -289,7 +246,6 @@ pub fn decrypt_query(
     unpad_checked(&pt)
 }
 
-/** @brief libsodium crypto_box 의 beforenm: X25519 결과에 hchacha20 을 건다. */
 fn box_beforenm(raw_shared: &[u8; 32]) -> [u8; 32] {
     let zero = chacha20::cipher::generic_array::GenericArray::from([0u8; 16]);
     chacha20::hchacha::<chacha20::cipher::consts::U10>(
@@ -299,24 +255,21 @@ fn box_beforenm(raw_shared: &[u8; 32]) -> [u8; 32] {
     .into()
 }
 
-/**
- * @brief crypto_secretbox_xchacha20poly1305 의 Poly1305 키와 본문용 키 스트림.
- * @details 논스 앞 16바이트로 서브키를 만들고, 뒤 8바이트를 ChaCha20 논스로 쓴다. 블록 0
- *          의 앞 32바이트가 Poly1305 키이고, 본문의 앞 32바이트는 블록 0 의 뒤 32바이트로,
- *          나머지는 블록 1부터 암호화한다. AEAD 버전과 달리 길이 블록도 AAD 도 섞지 않는다.
- * @warning 본문을 블록 1부터 흘리면 자체 구현끼리는 봉인과 열기가 맞아도 libsodium 과
- *          dnscrypt-proxy 같은 표준 클라이언트와는 한 바이트도 통하지 않는다. 자체 왕복
- *          테스트로는 이 차이가 드러나지 않으므로 외부 구현에서 추출한 기지 답으로 검사한다.
- */
+/// Poly1305 key and keystream of crypto_secretbox_xchacha20poly1305. The first 16 nonce bytes
+/// derive the subkey and the last 8 are the ChaCha20 nonce. The first 32 bytes of block 0 are the
+/// Poly1305 key, the first 32 message bytes use the rest of block 0, and the remainder starts at
+/// block 1. Unlike the AEAD construction there is no length block and no AAD.
+///
+/// Starting the message at block 1 still round-trips between our own seal and open but fails
+/// against libsodium and dnscrypt-proxy, so the tests check known answers from an external
+/// implementation.
 struct SecretboxStream {
-    /** @brief 블록 0 의 뒤 32바이트. 본문의 앞 32바이트에 쓴다. */
     head: Zeroizing<[u8; 32]>,
-    /** @brief 블록 1부터 이어지는 키 스트림. */
     cipher: ChaCha20Legacy,
 }
 
 impl SecretboxStream {
-    /** @brief 본문에 키 스트림을 XOR 한다. 봉인과 열기가 같은 동작이다. */
+    /// Sealing and opening are the same XOR.
     fn apply(mut self, data: &mut [u8]) {
         let split = data.len().min(self.head.len());
         let (front, rest) = data.split_at_mut(split);
@@ -327,7 +280,6 @@ impl SecretboxStream {
     }
 }
 
-/** @brief 서브키로 Poly1305 키와 본문용 키 스트림을 만든다. */
 fn secretbox_parts(key: &[u8; 32], nonce: &[u8; 24]) -> (Poly1305, SecretboxStream) {
     let subkey = chacha20::hchacha::<chacha20::cipher::consts::U10>(
         chacha20::cipher::generic_array::GenericArray::from_slice(key),
@@ -343,10 +295,7 @@ fn secretbox_parts(key: &[u8; 32], nonce: &[u8; 24]) -> (Poly1305, SecretboxStre
     (mac, SecretboxStream { head, cipher })
 }
 
-/**
- * @brief 봉인한다. MAC 16바이트가 암호문 앞에 온다.
- * @return MAC 뒤에 암호문을 이은 바이트열.
- */
+/// The 16-byte MAC comes before the ciphertext.
 fn secretbox_seal(key: &[u8; 32], nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
     let (mac, stream) = secretbox_parts(key, nonce);
     let mut body = plaintext.to_vec();
@@ -358,10 +307,6 @@ fn secretbox_seal(key: &[u8; 32], nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8>
     out
 }
 
-/**
- * @brief 봉인을 푼다.
- * @return 인증이 어긋나면 없음. 성공하면 평문.
- */
 fn secretbox_open(key: &[u8; 32], nonce: &[u8; 24], boxed: &[u8]) -> Option<Vec<u8>> {
     if boxed.len() < 16 {
         return None;
@@ -376,10 +321,7 @@ fn secretbox_open(key: &[u8; 32], nonce: &[u8; 24], boxed: &[u8]) -> Option<Vec<
     Some(out)
 }
 
-/**
- * @brief 상수시간 바이트 비교.
- * @warning 조기 종료하면 시간 차이로 MAC 을 한 바이트씩 맞춰 나갈 수 있다.
- */
+/// Constant time: an early exit would let an attacker guess the MAC byte by byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -391,12 +333,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/**
- * @brief 응답을 패딩해 암호화한다.
- * @details 논스 뒷 12바이트를 서버가 무작위로 채운다. 같은 질의 논스에 여러 응답을 보내도
- *          논스가 재사용되지 않게 하는 장치다. AEAD에서 논스 재사용은 치명적이다.
- * @return (전체 논스, 암호문). 논스는 그대로 응답에 담긴다.
- */
+/// The server fills the last 12 nonce bytes at random, so several responses to one query nonce
+/// never reuse a nonce. Returns the full nonce, which the response carries, and the ciphertext.
 pub fn encrypt_response(
     key: &[u8; 32],
     client_nonce: &[u8; 12],
@@ -412,7 +350,7 @@ pub fn encrypt_response(
     (nonce, secretbox_seal(key, &nonce, &padded))
 }
 
-/** @brief ISO/IEC 7816-4 패딩: 0x80 뒤에 0을 채워 블록 배수로 맞춘다. */
+/// ISO/IEC 7816-4 padding: 0x80, then zeros up to a multiple of `block`.
 pub fn pad(msg: &[u8], block: usize) -> Vec<u8> {
     let block = block.max(1);
     let mut v = msg.to_vec();
@@ -423,16 +361,12 @@ pub fn pad(msg: &[u8], block: usize) -> Vec<u8> {
     v
 }
 
-/** @brief 패딩을 벗긴다. 형식이 틀리면 빈 결과가 된다. */
 pub fn unpad(padded: &[u8]) -> Vec<u8> {
     unpad_checked(padded).unwrap_or_default()
 }
 
-/**
- * @brief 패딩을 검사하며 벗긴다.
- * @return 0을 걷어낸 곳에 0x80이 없거나 전부 0이면 None. 잘못된 패딩을 조용히
- *         받아들이면 조작된 평문 길이가 통과한다.
- */
+/// Returns `None` when no 0x80 precedes the zeros or everything is zero; accepting bad padding
+/// would let a tampered plaintext length through.
 fn unpad_checked(padded: &[u8]) -> Option<Vec<u8>> {
     let mut i = padded.len();
     while i > 0 && padded[i - 1] == 0x00 {
@@ -444,7 +378,6 @@ fn unpad_checked(padded: &[u8]) -> Option<Vec<u8>> {
     Some(padded[..i - 1].to_vec())
 }
 
-/** @brief 현재 유닉스 시각(초). 시계가 epoch 이전이면 0으로 바꾼다. */
 fn unix_now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -453,12 +386,10 @@ fn unix_now() -> u32 {
 }
 
 #[cfg(test)]
-/** @brief 인증서 발급과 왕복, 그리고 어긋난 채우기의 거부. */
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    /** @brief 인증서를 묻는 테스트용 질의. */
     fn txt_query(label: &[u8]) -> Vec<u8> {
         let mut packet = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
         packet.push(label.len() as u8);
@@ -468,7 +399,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 제공자 이름의 원래 바이트가 바뀌지 않는지. */
     fn provider_name_preserves_raw_query_octets() {
         let provider = Provider::generate("�", 86400);
         assert!(provider
@@ -477,7 +407,6 @@ mod tests {
         assert!(provider.cert_txt_response(&txt_query(&[0xff])).is_none());
     }
 
-    /** @brief 받은 인증서를 클라이언트처럼 읽는다. */
     fn client_parse_cert(cert: &[u8], provider_pub: &[u8; 32]) -> ([u8; 32], [u8; 8]) {
         assert_eq!(&cert[0..4], &CERT_MAGIC);
         assert_eq!(u16::from_be_bytes([cert[4], cert[5]]), ES_VERSION_XCHACHA);
@@ -493,7 +422,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 저장한 시드로 공개 키가 그대로인지. 바뀌면 클라이언트가 이 서버를 못 알아본다. */
     fn persisted_signing_seed_keeps_provider_pubkey_stable() {
         let a = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
         let seed = a.signing_seed();
@@ -502,14 +430,10 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 봉인 결과가 외부 구현이 낸 기지 답과 같은지.
-     *
-     * @details 기대값은 이 크레이트와 무관한 구현에서 뽑았다. HChaCha20 은 XChaCha 초안의
-     *          공개 벡터로, 본문 배치는 libsodium 의 crypto_secretbox 결과로 먼저 맞춘 뒤
-     *          같은 배치로 계산했다. 본문을 32바이트보다 길게 잡아 블록 0 의 뒤쪽과 블록 1
-     *          이후를 모두 지나게 했다. 자체 왕복 테스트만 있으면 양쪽이 똑같이 틀려도 통과한다.
-     */
+    /// Expected values come from implementations independent of this crate: HChaCha20 from the
+    /// XChaCha draft's public vectors, the message layout from libsodium's crypto_secretbox. The
+    /// message is longer than 32 bytes so it spans the end of block 0 and block 1. A round-trip
+    /// test alone passes when both sides are wrong the same way.
     fn secretbox_matches_libsodium_layout() {
         let key: [u8; 32] = core::array::from_fn(|i| i as u8);
         let nonce: [u8; 24] = core::array::from_fn(|i| 100 + i as u8);
@@ -527,7 +451,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 어긋난 채우기를 거부하는지. */
     fn malformed_padding_is_rejected() {
         assert_eq!(unpad(&[]), Vec::<u8>::new());
         assert_eq!(unpad(&[1, 2, 0, 0]), Vec::<u8>::new());
@@ -542,7 +465,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 인증서를 다시 낼 때 키는 두고 기간만 미는지. */
     fn reissue_cert_keeps_keys_and_refreshes_window() {
         let p = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
         let before = p.cert_bytes();
@@ -559,7 +481,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 암호화된 질의의 전체 왕복. */
     fn full_dnscrypt_roundtrip() {
         let provider = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
 
@@ -608,7 +529,7 @@ mod tests {
         let decrypted = decrypt_query(&server_shared, &client_nonce, &qct).expect("서버 복호화");
         assert_eq!(decrypted, dns_query, "복호화된 질의 = 원본");
 
-        /* MAC 을 뒤로 옮기면 거부되어야 한다. 앞에 붙는다는 것을 이렇게 못 고정한다. */
+        // A MAC moved to the end must be rejected; this pins it to the front.
         let mut tag_appended = qct[16..].to_vec();
         tag_appended.extend_from_slice(&qct[..16]);
         assert_eq!(
@@ -624,13 +545,8 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief 실제 UDP 소켓 위에서 인증서 조회와 암호화 질의가 오가는지.
-     *
-     * @details 암호 계층만 맞아도 와이어 배치가 어긋나면 어떤 클라이언트도 붙지 못한다.
-     *          리스너 루프를 그대로 돌려 인증서 TXT 응답에서 리졸버 키를 꺼내고, 그 키로
-     *          봉인한 질의를 보내고, 리졸버 매직이 붙은 응답을 풀어 본다.
-     */
+    /// Runs the real listener loop: correct crypto with a wrong wire layout would still lock out
+    /// every client.
     fn dnscrypt_listener_answers_over_a_real_socket() {
         use std::net::UdpSocket;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -671,7 +587,8 @@ mod tests {
         question.extend_from_slice(&[0, 0, 16, 0, 1]);
         client.send_to(&question, server_addr).expect("인증서 조회");
         let (n, _) = client.recv_from(&mut buf).expect("인증서 응답");
-        /* 응답은 질문을 되울린 뒤 압축 포인터 2, 유형 2, 클래스 2, TTL 4, 길이 2, 문자열 길이 1 다음이 인증서다. */
+        // The answer echoes the question; a compression pointer (2), type (2), class (2), TTL (4),
+        // length (2) and string length (1) precede the certificate.
         let cert_start = question.len() + 13;
         let (resolver_pk, client_magic) = client_parse_cert(&buf[cert_start..n], &provider_pub);
 

@@ -1,6 +1,4 @@
-/*!
- * @brief RFC 8020. NXDOMAIN인 이름 아래를 합성으로 답하는 계층.
- */
+//! RFC 8020: answers names below an NXDOMAIN name with a synthesized NXDOMAIN.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,38 +13,26 @@ use super::{
 use crate::native::{ResolveFailure, ResolveOutcome, Resolver};
 
 #[derive(Clone)]
-/** @brief 없다고 확인된 이름 하나와 그 증명. */
 struct BelowNxEntry {
-    /** @brief 이 판정이 만료되는 시각. */
     expiry: Instant,
-    /** @brief 임의로 만든 답에 그대로 담을 증명. */
+    /// Copied as is into synthesized answers.
     proof: Arc<[Record]>,
 }
 
-/** @brief 없다고 확인된 이름을 가리키는 키. */
 type BelowNxKey = (Vec<u8>, u16);
 
-/**
- * @brief 없는 이름 아래는 전부 없다고 답하는 계층.
- * @details 어떤 이름이 없으면 그 아래 이름도 있을 수 없다. 그래서 한 번 확인한 것으로
- *          그 아래 질의를 밖에 묻지 않고 답한다.
- */
+/// When a name does not exist, no name below it can, so one confirmed NXDOMAIN answers every query
+/// below it without asking upstream.
 pub struct BelowNxdomainLayer {
-    /** @brief 다음 계층. */
     inner: Arc<dyn Resolver>,
-    /** @brief 없다고 확인된 이름들. */
     nx: Mutex<LruMap<BelowNxKey, BelowNxEntry>>,
-    /** @brief 임의로 만든 답에 담을 수명 하한. */
     neg_min_ttl: u32,
-    /** @brief 임의로 만든 답에 담을 수명 상한. */
     neg_max_ttl: u32,
 }
 
-/** @brief 함께 담아 둘 증명 기록 수 상한. */
 const MAX_BELOW_NX_PROOF_RECORDS: usize = 16;
 
 impl BelowNxdomainLayer {
-    /** @brief 용량과 수명 상하한으로 만든다. */
     pub fn new(inner: Arc<dyn Resolver>, cap: usize, neg_min_ttl: u32, neg_max_ttl: u32) -> Self {
         BelowNxdomainLayer {
             inner,
@@ -56,12 +42,10 @@ impl BelowNxdomainLayer {
         }
     }
 
-    /** @brief 담아 둘 때 쓰는 키. */
     fn cache_key(name: &Name, qclass: DnsClass) -> BelowNxKey {
         (name.canonical_key(), qclass.0)
     }
 
-    /** @brief 이 이름을 덮는, 없다고 확인된 윗 이름. */
     fn ancestor_nx(&self, qname: &Name, qclass: DnsClass) -> Option<BelowNxEntry> {
         let now = Instant::now();
         let mut nx = self.nx.lock_recover();
@@ -78,11 +62,8 @@ impl BelowNxdomainLayer {
         None
     }
 
-    /**
-     * @brief 임의로 만든 답에 그대로 담을 수 있는 증명을 고른다.
-     * @warning 검증하는 클라이언트가 이 서버의 답을 받아들이려면 증명이 그 이름에도 들어맞아야
-     *          한다. 들어맞지 않는 증명을 실으면 그 클라이언트는 이 서버의 답을 거부한다.
-     */
+    /// A validating client accepts the synthesized answer only when the proof also covers the
+    /// queried name; any other proof makes it reject the answer.
     fn authenticated_proof(
         response: &Message,
         denied_name: &Name,
@@ -170,12 +151,10 @@ impl BelowNxdomainLayer {
 }
 
 impl Resolver for BelowNxdomainLayer {
-    /** @brief 해석한다. 실패는 없음으로 바꾼다. */
     fn resolve(&self, req: &Message) -> Option<Message> {
         outcome_to_option(self.resolve_outcome(req))
     }
 
-    /** @brief 윗 이름이 없다고 확인됐으면 그대로 답한다. */
     fn resolve_outcome(&self, req: &Message) -> ResolveOutcome {
         let Some(q) = req.questions.first() else {
             return ResolveOutcome::Failure(ResolveFailure::Permanent(None));
@@ -216,7 +195,7 @@ impl Resolver for BelowNxdomainLayer {
 }
 
 impl BelowNxdomainLayer {
-    /** @brief 서명으로 확인된 NXDOMAIN이면 그 증명을 담아 둔다. */
+    /// Only AD-validated NXDOMAIN answers are remembered.
     fn remember(&self, req: &Message, qclass: DnsClass, resp: &Message) {
         if resp.header.rcode == ResponseCode::NXDomain.0 && resp.header.authentic_data {
             let signature_ttl =
@@ -259,7 +238,6 @@ impl BelowNxdomainLayer {
 }
 
 #[cfg(test)]
-/** @brief NXDOMAIN 아래 합성과 증명 요구, TTL 한도. */
 mod tests {
     use super::*;
     use crate::layers::test_support::*;
@@ -274,7 +252,6 @@ mod tests {
     use crate::native::Resolver;
 
     #[test]
-    /** @brief 담아 둘 때 이름의 원래 바이트가 바뀌지 않는지. */
     fn below_nxdomain_cache_preserves_raw_name_octets() {
         let layer = BelowNxdomainLayer::new(Mock::new(1, ResponseCode::NoError.0), 16, 0, 86_400);
         let first = Name::from_labels(vec![vec![0xff]]).unwrap();
@@ -296,15 +273,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 없는 이름 아래를 밖에 묻지 않고 답하는지. */
     fn below_nxdomain_synthesizes_descendants() {
-        /** @brief 없다고 답하며 호출 수를 세는 테스트용 리졸버. */
         struct NxThenCount {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for NxThenCount {
-            /** @brief 없다고 답하고 호출을 센다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first().unwrap();
@@ -380,19 +353,14 @@ mod tests {
     }
 
     #[test]
-    /**
-     * @brief DO 없이 묻는 클라이언트에게서도 부재 증명을 배우는지.
-     * @details 해석 백엔드는 DO가 없는 요청의 답에서 NSEC과 RRSIG를 걷어낸다. 계층이 받은 요청
-     *          그대로 물으면 대부분의 클라이언트에게서는 배울 증명이 없다.
-     */
+    /// Backends strip NSEC and RRSIG from answers to requests without DO; asking with the request
+    /// as received would learn nothing from most clients.
     fn below_nxdomain_learns_from_clients_without_do() {
-        /** @brief 백엔드처럼 DO가 없는 요청의 답에서 DNSSEC 레코드를 걷어내는 리졸버. */
+        /// Strips DNSSEC records for requests without DO, as the backends do.
         struct StrippingBackend {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for StrippingBackend {
-            /** @brief 서명된 NXDOMAIN을 만들고 요청대로 걷어낸다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first().unwrap();
@@ -433,15 +401,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 별칭 끝의 이름을 기준으로 담는지. */
     fn below_nxdomain_caches_the_terminal_alias_target() {
-        /** @brief 별칭 뒤에 없다고 답하는 테스트용 리졸버. */
         struct AliasNx {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for AliasNx {
-            /** @brief 별칭 체인 끝에서 없다고 답한다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first()?;
@@ -506,12 +470,9 @@ mod tests {
     }
 
     #[test]
-    /** @brief 설정한 부정 수명 상하한을 지키는지. */
     fn below_nxdomain_honors_configured_negative_ttl_bounds() {
-        /** @brief 수명이 짧은 부정 응답을 내는 테스트용 리졸버. */
         struct ShortNx;
         impl Resolver for ShortNx {
-            /** @brief 수명이 짧은 부정 응답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 let q = req.questions.first()?;
                 let mut message = answer_message(req.header.id, q.name.clone(), q.qtype, vec![]);
@@ -554,15 +515,11 @@ mod tests {
     }
 
     #[test]
-    /** @brief 수명이 0인 권한 기록을 담지 않는지. */
     fn below_nxdomain_never_caches_zero_ttl_soa() {
-        /** @brief 수명이 0인 부정 응답을 내는 테스트용 리졸버. */
         struct ZeroTtlNx {
-            /** @brief 불린 횟수. */
             calls: AtomicU32,
         }
         impl Resolver for ZeroTtlNx {
-            /** @brief 수명이 0인 부정 응답을 돌려준다. */
             fn resolve(&self, req: &Message) -> Option<Message> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let q = req.questions.first().unwrap();
@@ -592,7 +549,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 임의로 만든 답에 그대로 담을 수 있는 증명만 쓰는지. 아니면 검증하는 클라이언트가 거부한다. */
     fn below_nxdomain_requires_replayable_signed_proof() {
         let denied_name = Name::from_str("gone.example").unwrap();
         let mut response = answer_message(1, denied_name.clone(), RecordType::A, vec![]);

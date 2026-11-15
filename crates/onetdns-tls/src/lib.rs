@@ -1,45 +1,25 @@
-/*!
- * @brief TLS 1.2와 1.3.
- *
- * @details 서로 다른 두 구현이 와이어 원시 요소를 나눠 쓴다. conn은 소켓을 직접 읽고 쓰는
- *          차단 방식이고, engine은 QUIC에 붙는 sans-IO 방식이다. 둘을 뒤섞지 않는다.
- * @warning 이쪽은 이 코드로 상대의 신원을 판단한다. 인증서 검증, 서명 확인, 이름 대조가
- *          하나라도 헐거우면 암호화만 하고 상대는 확인하지 않는 꼴이 된다.
- */
+//! TLS 1.2 and 1.3. Two implementations share the wire primitives: conn reads and writes sockets
+//! directly and blocks, and engine is sans-IO for QUIC. They are not mixed.
+//!
+//! This code decides who the peer is. If certificate validation, signature checks, or name matching
+//! is loose anywhere, the connection is encrypted without checking whom it talks to.
 
-/** @brief 레코드 보호. */
 pub mod aead;
-/** @brief 인증서 체인 검증. */
 pub mod cert;
-/** @brief 차단 방식 연결. DoT와 TCP 위 DoH가 쓴다. */
 pub mod conn;
-/** @brief DER 인코딩 파서. */
 pub mod der;
-/** @brief sans-IO 핸드셰이크 엔진. QUIC가 쓴다. */
 pub mod engine;
-/** @brief 핸드셰이크 메시지 프레이밍. */
 pub mod handshake;
-/** @brief 1.3 키 유도 일정. */
 pub mod keyschedule;
-/** @brief 키 교환. */
 pub mod kx;
-/** @brief 핸드셰이크 메시지 인코딩과 파싱. */
 pub mod msg;
-/** @brief 레코드 계층 프레이밍. */
 pub mod record;
-/** @brief 인증서 폐기 확인. */
 pub mod revoke;
-/** @brief 세션 재개. */
 pub mod session;
-/** @brief 난수 등 플랫폼 의존 요소. */
 pub mod sys;
-/** @brief TLS 1.2 전용 부분. */
 pub mod tls12;
-/** @brief 신뢰 저장소. */
 pub mod trust;
-/** @brief 길이 접두사 있는 값 읽기와 쓰기. */
 pub mod wire;
-/** @brief 인증서 파싱. */
 pub mod x509;
 
 pub use aead::{Aead, RecordCrypto};
@@ -64,107 +44,79 @@ pub use wire::{Reader, Writer};
 pub use x509::X509;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/**
- * @brief TLS 처리 실패 사유.
- * @details 사유마다 상대에게 알릴 치명 경고가 하나로 정해져 있고 alert 가 그 대응을 맡는다.
- *          거부하는 자리가 경고를 따로 고르지 않으므로, 같은 거부가 경로에 따라 다른 경고로
- *          나가지 않는다.
- */
+/// Each reason maps to exactly one fatal alert, chosen by `alert`. The rejecting site does not pick
+/// an alert, so the same rejection never goes out as different alerts depending on the path.
 pub enum TlsError {
-    /** @brief 바이트를 읽어 내지 못했다. decode_error 로 알린다. */
     Decode,
 
-    /** @brief 레코드가 규격 크기를 넘겼다. record_overflow 로 알린다. */
     RecordOverflow,
 
-    /** @brief 레코드의 암호를 풀지 못했다. bad_record_mac 으로 알린다. */
     Decrypt,
 
-    /** @brief 인증서나 인증 경로가 어긋났다. bad_certificate 로 알린다. */
     BadCert,
 
-    /** @brief 인증 경로가 이쪽 신뢰 저장소의 어느 루트에도 닿지 않는다. unknown_ca 로 알린다. */
+    /// The chain reaches none of this side's trusted roots.
     UnknownCa,
 
-    /** @brief 경로의 인증서가 만료됐거나 아직 유효하지 않다. certificate_expired 로 알린다. */
+    /// Also when a certificate is not yet valid.
     CertificateExpired,
 
-    /**
-     * @brief 검증을 통과한 인증서를 다른 까닭으로 받아들이지 않는다. certificate_unknown 으로
-     *        알린다.
-     * @details 핸드셰이크 뒤의 폐기 확인처럼 TLS 검증 밖의 정책이 거부할 때다. 그 정책은 폐기를
-     *          확인한 경우와 확인하지 못한 경우를 구분해 알려 주지 않으므로 certificate_revoked
-     *          를 쓰지 않는다.
-     */
+    /// A certificate that passed validation is refused for another reason, such as the revocation
+    /// check after the handshake. That policy does not tell a confirmed revocation from an
+    /// unchecked one, so certificate_revoked is not used.
     CertificateUnknown,
 
-    /**
-     * @brief 상대가 제안한 응용 프로토콜 가운데 이쪽이 쓸 수 있는 것이 없다.
-     * @details no_application_protocol 로 알린다. RFC 7301 이 서버에 요구하고, RFC 9001 은
-     *          QUIC 클라이언트도 협상에 실패하면 이 경고로 연결을 닫게 한다.
-     */
+    /// RFC 7301 requires this of servers, and RFC 9001 has QUIC clients close with this alert when
+    /// negotiation fails too.
     NoApplicationProtocol,
 
-    /** @brief 서명, Finished, PSK 결합자가 맞지 않는다. decrypt_error 로 알린다. */
+    /// A signature, Finished, or PSK binder does not match.
     BadSignature,
 
-    /** @brief 다루지 않는 서명 방식이다. illegal_parameter 로 알린다. */
     UnsupportedSig(u16),
 
-    /** @brief 주고받는 중 오류가 났다. */
     Io,
 
-    /** @brief 지금 받을 수 없는 메시지나 레코드가 왔다. unexpected_message 로 알린다. */
     UnexpectedMessage,
 
-    /** @brief 형식은 맞지만 값이 규격이나 협상 결과와 맞지 않는다. illegal_parameter 로 알린다. */
+    /// Well-formed, but the value breaks the spec or what was negotiated.
     IllegalParameter,
 
-    /** @brief 양쪽이 함께 받아들일 수 있는 매개변수가 없다. handshake_failure 로 알린다. */
     HandshakeFailure,
 
-    /** @brief 상대가 고른 프로토콜 버전을 지원하지 않는다. protocol_version 으로 알린다. */
     ProtocolVersion,
 
-    /** @brief 반드시 있어야 할 확장이 없다. missing_extension 으로 알린다. */
     MissingExtension,
 
-    /** @brief 이쪽이 제안하지 않은 확장이 응답에 왔다. unsupported_extension 으로 알린다. */
     UnsupportedExtension,
 
-    /** @brief 인증서의 공개 키 형식을 다루지 않는다. unsupported_certificate 로 알린다. */
     UnsupportedCertificate,
 
-    /** @brief 요구한 클라이언트 인증서가 오지 않았다. certificate_required 로 알린다. */
     CertificateRequired,
 
-    /** @brief 상대와 무관하게 이쪽 내부에서 실패했다. internal_error 로 알린다. */
+    /// A local failure unrelated to the peer.
     Internal,
 
-    /** @brief 상대가 곱게 끝냈다. */
     CloseNotify,
 
-    /**
-     * @brief 상대가 종료 알림 없이 레코드 경계에서 연결을 닫았다.
-     * @details 레코드 중간에서 끊긴 것과 구분한다. 길이를 스스로 밝히는 위층 프로토콜은
-     *          자기 메시지 경계에서 이것을 정상 종료로 볼 수 있다.
-     */
+    /// The peer closed at a record boundary without close_notify, as distinct from a cut in the
+    /// middle of a record. A protocol above that states its own lengths can treat this as a normal
+    /// close at its own message boundary.
     Eof,
 
-    /** @brief 상대가 오류를 알렸다. */
-    PeerAlert { level: u8, description: u8 },
+    PeerAlert {
+        level: u8,
+        description: u8,
+    },
 
-    /** @brief 레코드 일련번호를 다 썼다. 더 쓰면 같은 nonce를 되쓴다. */
+    /// Sending more would reuse a nonce.
     SeqExhausted,
 }
 
 impl TlsError {
-    /**
-     * @brief 이 실패를 상대에게 알릴 치명 경고의 설명 코드.
-     * @return 상대에게 알리지 않는 실패면 없다. 입출력 실패와 상대의 종료가 그렇고, 상대가
-     *         보낸 경고에는 경고로 답하지 않는다. 일련번호 소진은 경고를 보낼 nonce 도 남지
-     *         않았다.
-     */
+    /// None for failures the peer is not told about: I/O failures and the peer's own close, and an
+    /// alert from the peer is not answered with an alert. A spent sequence number leaves no nonce
+    /// to send an alert with.
     pub fn alert(&self) -> Option<u8> {
         match self {
             TlsError::UnexpectedMessage => Some(10),
@@ -195,7 +147,6 @@ impl TlsError {
 }
 
 impl std::fmt::Display for TlsError {
-    /** @brief 사람이 읽을 실패 사유. */
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TlsError::Decode => write!(f, "Could not parse TLS message"),
@@ -234,12 +185,10 @@ impl std::fmt::Display for TlsError {
 impl std::error::Error for TlsError {}
 
 #[cfg(test)]
-/** @brief 레코드와 핸드셰이크 프레이밍, 그리고 와이어 원시 요소의 경계 검사. */
 mod tests {
     use super::*;
 
     #[test]
-    /** @brief 레코드 왕복. */
     fn record_roundtrip() {
         let rec = TlsRecord::new(ContentType::Handshake, vec![1, 2, 3, 4, 5]);
         let bytes = rec.encode();
@@ -255,7 +204,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 덜 온 레코드는 오류가 아니라 대기인지. */
     fn record_incomplete_returns_none() {
         let rec = TlsRecord::new(ContentType::ApplicationData, vec![9; 100]);
         let bytes = rec.encode();
@@ -266,7 +214,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 상한을 넘는 레코드를 거부하는지. */
     fn record_overflow_errors() {
         let mut bytes = vec![23u8, 0x03, 0x03];
         bytes.extend_from_slice(&0xFFFFu16.to_be_bytes());
@@ -275,7 +222,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이어 붙은 레코드를 하나씩 꺼내는지. */
     fn record_reader_streams_multiple() {
         let r1 = TlsRecord::new(ContentType::Handshake, vec![1, 2, 3]);
         let r2 = TlsRecord::new(ContentType::ApplicationData, vec![4, 5]);
@@ -293,7 +239,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 핸드셰이크 메시지 왕복. */
     fn handshake_roundtrip() {
         let msg = HandshakeMsg::new(HandshakeType::ClientHello, vec![0xAA; 300]);
         let bytes = msg.encode();
@@ -307,7 +252,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 레코드 여럿에 걸친 핸드셰이크 메시지를 이어 붙이는지. */
     fn handshake_reader_spans_records() {
         let msg = HandshakeMsg::new(HandshakeType::ServerHello, vec![7; 50]);
         let full = msg.encode();
@@ -319,7 +263,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 길이 접두사 있는 값의 왕복. */
     fn wire_vectors_roundtrip() {
         let mut w = Writer::new();
         w.u16(0x0304);
@@ -339,7 +282,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모자란 바이트에서 오류가 나는지. */
     fn wire_bounds_checked() {
         let mut r = Reader::new(&[0x00, 0x05]);
         assert_eq!(r.vec16(), Err(TlsError::Decode));

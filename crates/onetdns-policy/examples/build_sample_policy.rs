@@ -1,4 +1,3 @@
-/** @brief 예제 정책의 원본. */
 const WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -23,7 +22,7 @@ const WAT: &str = r#"
           (else (i32.const 0)))))))
 "#;
 
-/** @brief 예제 정책 플러그인을 만들어 낸다. */
+/// Builds the sample policy plugin.
 fn main() {
     let wasm = wat::parse_str(WAT).expect("WAT 컴파일");
     let out = std::env::args()

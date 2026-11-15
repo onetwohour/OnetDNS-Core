@@ -1,25 +1,15 @@
-/*!
- * @brief 업스트림 주소 해석.
- *
- * @details 설정에 적힌 업스트림 표기를 실제 접속 대상으로 바꾼다. 이름으로 적힌 업스트림은
- *          부트스트랩 서버로 먼저 풀어야 한다.
- * @warning 자기 자신을 가리키는 업스트림을 거부한다. 가리키면 질의가 무한히 돌아온다.
- * @note 이름 해석을 자기 자신에게 맡기지 않는다. 맡기면 시작 중 순환이 생긴다.
- */
+//! Turns configured upstream URLs into connect targets. An upstream that points back at this server
+//! is rejected, since queries would loop.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use onetdns_forward::Upstream;
 
-/** @brief 부트스트랩 해석의 데드라인. */
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/**
- * @brief 이 업스트림이 이 서버의 리스너를 가리키지 않는지 확인한다.
- * @warning 이름으로 적힌 업스트림은 풀어 본 뒤에 확인해야 한다. 표기만 보면 이름 뒤에 숨은
- *          자기 자신을 놓친다.
- */
+/// Hostname upstreams are checked after resolving; the URL alone would miss this server hidden
+/// behind a name.
 pub fn ensure_not_listener(
     upstreams: &[Upstream],
     listeners: &[SocketAddr],
@@ -42,7 +32,7 @@ pub fn ensure_not_listener(
     Ok(())
 }
 
-/** @brief 이 주소가 이 기계의 것인지. */
+/// Loopback, unspecified, or assigned to this machine.
 pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
     let ip = match ip {
         IpAddr::V6(ip) => ip
@@ -63,7 +53,6 @@ pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
         .is_ok_and(|local| local.ip() == ip)
 }
 
-/** @brief 설정의 업스트림 표기들을 접속 대상으로 바꾼다. */
 pub fn native_upstreams(plain: &[IpAddr], urls: &[String], bootstrap: &[IpAddr]) -> Vec<Upstream> {
     let mut out: Vec<Upstream> = plain
         .iter()
@@ -80,7 +69,6 @@ pub fn native_upstreams(plain: &[IpAddr], urls: &[String], bootstrap: &[IpAddr])
     out
 }
 
-/** @brief 서버 목록을 업스트림으로 바꾼다. */
 pub fn servers_to_upstreams(servers: &[String], bootstrap: &[IpAddr]) -> Vec<Upstream> {
     let mut out = Vec::new();
     for s in servers {
@@ -96,7 +84,7 @@ pub fn servers_to_upstreams(servers: &[String], bootstrap: &[IpAddr]) -> Vec<Ups
     out
 }
 
-/** @brief 이 표기가 이름을 쓰는지. 쓰면 부트스트랩이 필요하다. */
+/// Hostnames need bootstrap servers.
 pub fn url_uses_hostname(url: &str) -> bool {
     let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url);
     let rest = rest.split_once('#').map(|(r, _)| r).unwrap_or(rest);
@@ -117,7 +105,7 @@ pub fn url_uses_hostname(url: &str) -> bool {
     !host.is_empty() && host.parse::<IpAddr>().is_err()
 }
 
-/** @brief 표기 하나를 업스트림으로. 모르는 형식이면 없다. */
+/// None for an unknown scheme, a malformed URL, or a hostname without bootstrap servers.
 fn parse_native_upstream(url: &str, bootstrap: &[IpAddr]) -> Option<Upstream> {
     let url = url.trim();
     if url.is_empty() || url.chars().any(char::is_control) {
@@ -194,7 +182,6 @@ fn parse_native_upstream(url: &str, bootstrap: &[IpAddr]) -> Option<Upstream> {
     }
 }
 
-/** @brief 이름을 주소로. IP 문자열이면 그대로 쓴다. */
 fn resolve_host(host: &str, bootstrap: &[IpAddr]) -> Option<IpAddr> {
     let resolved = resolve_host_via_bootstrap(host, bootstrap);
     if resolved.is_none() && host.parse::<IpAddr>().is_err() {
@@ -207,11 +194,8 @@ fn resolve_host(host: &str, bootstrap: &[IpAddr]) -> Option<IpAddr> {
     resolved
 }
 
-/**
- * @brief 부트스트랩 서버로 이름을 푼다.
- * @note 자기 자신에게 묻지 않는다. 시작 중에는 아직 서빙할 수 없고, 서빙 중이라도
- *       업스트림을 풀려고 이 서버에게 물으면 순환이 된다.
- */
+/// Never asks this server: it cannot answer during startup, and resolving its own upstreams through
+/// itself is circular.
 pub fn resolve_host_via_bootstrap(host: &str, bootstrap: &[IpAddr]) -> Option<IpAddr> {
     host.parse::<IpAddr>().ok().or_else(|| {
         (!bootstrap.is_empty())
@@ -222,13 +206,11 @@ pub fn resolve_host_via_bootstrap(host: &str, bootstrap: &[IpAddr]) -> Option<Ip
 }
 
 #[cfg(test)]
-/** @brief 표기별 해석과, 자기 자신을 가리키는 업스트림의 거부. */
 mod tests {
     use super::*;
     use onetdns_forward::Transport;
 
     #[test]
-    /** @brief 이름 뒤에 숨은 자기 자신도 잡히는지. 표기만 보면 놓친다. */
     fn resolved_upstream_cannot_point_back_to_listener() {
         let upstreams = vec![Upstream::doh(
             "127.0.0.1:443".parse().unwrap(),
@@ -266,7 +248,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 여러 전송이 섞여도 모두 읽히는지. */
     fn native_upstreams_mixes_all_transports() {
         let plain = vec!["9.9.9.9".parse().unwrap()];
         let urls = vec![
@@ -311,7 +292,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 이름은 부트스트랩이 필요하고 주소는 아닌지. */
     fn hostname_upstream_needs_bootstrap_but_ip_literal_does_not() {
         assert!(parse_native_upstream("h3://cloudflare-dns.com/dns-query", &[]).is_none());
         assert!(url_uses_hostname("h3://cloudflare-dns.com/dns-query"));
@@ -333,7 +313,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DoH 표기의 기본값과 지정값. */
     fn parses_doh_defaults_and_overrides() {
         let up = parse_native_upstream("https://1.1.1.1", &[]).unwrap();
         assert_eq!(up.addr, "1.1.1.1:443".parse().unwrap());
@@ -357,7 +336,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief DoQ와 DoH3 표기. */
     fn parses_doq_and_doh3() {
         let up = parse_native_upstream("quic://1.1.1.1", &[]).unwrap();
         assert_eq!(up.addr, "1.1.1.1:853".parse().unwrap());
@@ -380,7 +358,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 서버 목록이 주소와 암호화 전송 모두로 읽히는지. */
     fn servers_to_upstreams_ip_and_tls() {
         let ups = servers_to_upstreams(
             &[
@@ -395,14 +372,12 @@ mod tests {
     }
 
     #[test]
-    /** @brief 모르는 형식을 건너뛰는지. */
     fn unknown_scheme_skipped() {
         assert!(parse_native_upstream("ftp://1.2.3.4", &[]).is_none());
         assert!(parse_native_upstream("gopher://8.8.8.8", &[]).is_none());
     }
 
     #[test]
-    /** @brief 없앤 별칭 표기를 거부하는지. */
     fn removed_scheme_aliases_are_rejected() {
         for scheme in ["dot", "doh", "h2", "doq", "doh3"] {
             assert!(
@@ -412,7 +387,6 @@ mod tests {
         }
     }
     #[test]
-    /** @brief 대괄호로 감싼 IPv6와 포트가 읽히는지. */
     fn bracketed_ipv6_with_port_is_parsed() {
         let up =
             parse_native_upstream("tls://[2001:4860:4860::8888]:8853#dns.google", &[]).unwrap();
@@ -420,7 +394,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 부트스트랩 없이 이름만 적으면 거부하는지. */
     fn hostname_without_bootstrap_is_rejected() {
         assert!(parse_native_upstream("https://dns.example/dns-query", &[]).is_none());
         assert!(resolve_host_via_bootstrap("dns.example", &[]).is_none());
@@ -431,7 +404,6 @@ mod tests {
     }
 
     #[test]
-    /** @brief 형식이 깨진 주소를 거부하는지. */
     fn malformed_authority_is_rejected() {
         assert!(parse_native_upstream("udp://1.1.1.1:not-a-port", &[]).is_none());
         assert!(parse_native_upstream("udp://1.1.1.1:0", &[]).is_none());

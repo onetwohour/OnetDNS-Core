@@ -1,6 +1,5 @@
-/*!
- * @brief TLS 인증서와 키를 읽고 검사해 서버 설정으로 만들고, 관리 API의 인증서 교체를 처리한다.
- */
+//! TLS certificates and keys: loading, checks, server config, and replacement through the
+//! management API.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,13 +18,9 @@ use crate::{
     LOCAL_CA_MAX_BYTES, LOCAL_KEY_MAX_BYTES,
 };
 
-/**
- * @brief 암호화 전송이 함께 쓸 인증서와 개인키를 한 번만 마련한다.
- *
- * @details 전송마다 따로 만들면 자체 서명일 때 DoT·DoH·DoQ·DoH3 이 서로 다른 인증서를
- *          내놓는다. 자체 서명은 고정해 쓰는 것이므로, 한 곳에서 받은 인증서로 다른
- *          전송에 붙지 못한다. DDR 로 여러 암호화 주소를 알리는 배포에서 특히 드러난다.
- */
+/// One certificate and key for every encrypted transport. Per-transport self-signed certificates
+/// would differ, and a client that pinned one could not connect over another; DDR announcing
+/// several encrypted endpoints makes this visible.
 pub(crate) fn native_tls_material(cfg: &Config) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     if let Some(host) = &cfg.tls_self_signed_host {
         onetdns_core::warn!(event = "tls.self_signed_in_use", host = %host, "Serving encrypted DNS with a self-signed certificate; clients will not connect unless they disable certificate verification");
@@ -40,7 +35,6 @@ pub(crate) fn native_tls_material(cfg: &Config) -> Result<(Vec<Vec<u8>>, Vec<u8>
     Err("There is no TLS certificate for the encrypted DNS listening addresses".to_string())
 }
 
-/** @brief 암호화 전송에 쓸 TLS 설정을 만든다. */
 pub(crate) fn native_tls_config(
     cfg: &Config,
     alpn: Vec<Vec<u8>>,
@@ -66,7 +60,6 @@ pub(crate) fn native_tls_config(
     Ok(Arc::new(sc))
 }
 
-/** @brief 클라이언트 인증서를 확인할 CA 번들을 읽는다. */
 pub(crate) fn load_client_ca(path: &std::path::Path) -> Result<onetdns_tls::TrustStore, String> {
     let pem = read_bytes_limited(path, LOCAL_CA_MAX_BYTES).map_err(|error| {
         format!(
@@ -79,7 +72,7 @@ pub(crate) fn load_client_ca(path: &std::path::Path) -> Result<onetdns_tls::Trus
     })
 }
 
-/** @brief 공유 캐시의 TLS 인증서를 검증할 신뢰 저장소. CA 파일이 없으면 시스템 신뢰 저장소를 쓴다. */
+/// Trust store for the Redis TLS connection; the system store when no CA file is given.
 pub(crate) fn cachedb_redis_roots(
     ca: Option<&std::path::Path>,
 ) -> Result<onetdns_tls::TrustStore, String> {
@@ -99,7 +92,6 @@ pub(crate) fn cachedb_redis_roots(
     })
 }
 
-/** @brief 자체 서명 인증서를 만든다. */
 pub(crate) fn gen_cert(host: String, cert_out: PathBuf, key_out: PathBuf) -> BoxResult<()> {
     let (cert_pem, key_pem) = onetdns_transport::generate_self_signed_pem(&host)?;
     commit_cert_key(&cert_out, cert_pem.as_bytes(), &key_out, key_pem.as_bytes()).with_context(
@@ -119,21 +111,14 @@ pub(crate) fn gen_cert(host: String, cert_out: PathBuf, key_out: PathBuf) -> Box
     Ok(())
 }
 
-/** @brief 인증서와 키에서 읽어 낸 정보. */
 pub(crate) struct TlsMaterialInfo {
-    /** @brief 읽어 낸 인증서들. */
     pub(crate) parsed: Vec<onetdns_tls::X509>,
-    /** @brief 모든 인증서가 유효 기간 안인지. */
     pub(crate) all_times_valid: bool,
-    /** @brief 체인의 연결이 맞는지. */
     pub(crate) chain_links_valid: bool,
-    /** @brief 체인의 제약이 지켜지는지. */
     pub(crate) chain_constraints_valid: bool,
-    /** @brief 스스로 서명한 인증서인지. */
     pub(crate) self_signed: bool,
 }
 
-/** @brief 인증서와 키를 살펴본다. */
 pub(crate) fn inspect_tls_material(
     certs: &[Vec<u8>],
     key: &[u8],
@@ -183,7 +168,7 @@ pub(crate) fn inspect_tls_material(
     })
 }
 
-/** @brief 이 인증서와 키로 실제로 서빙할 수 있는지 확인한다. 확인 없이 바꾸면 다음 연결부터 전부 실패한다. */
+/// Replacing with material that cannot be served would fail every new connection.
 fn require_servable_tls_material(certs: &[Vec<u8>], key: &[u8]) -> Result<(), String> {
     let info = inspect_tls_material(certs, key)?;
     if !info.all_times_valid {
@@ -204,7 +189,6 @@ fn require_servable_tls_material(certs: &[Vec<u8>], key: &[u8]) -> Result<(), St
     Ok(())
 }
 
-/** @brief 인증서와 키를 바꾼다. */
 pub(crate) fn tls_configure(
     body: &str,
     cfg_cert: &Option<std::path::PathBuf>,
@@ -219,7 +203,6 @@ pub(crate) fn tls_configure(
     let onetdns_core::json::Json::Obj(fields) = &j else {
         return Err("The TLS settings request must be a JSON object".into());
     };
-    /** @brief 인증서 설정 항목들. */
     const TLS_FIELDS: [&str; 4] = ["certificate_chain", "private_key", "cert_path", "key_path"];
     if fields
         .iter()
@@ -308,7 +291,6 @@ pub(crate) fn tls_configure(
     ))
 }
 
-/** @brief 인증서 발급을 돌린다. */
 pub(crate) fn acme_issue_run(
     cfg: &Config,
     body: &str,
@@ -391,10 +373,8 @@ pub(crate) fn acme_issue_run(
             }
             (None, None) => {}
         }
-        /*
-         * 발급은 인증서 파일만 바꾼다. 실행 중인 수신 주소가 쥐고 있는 인증서까지 여기서
-         * 갈지 않으면, 발급에 성공하고도 다시 시작할 때까지 이전 인증서를 계속 내민다.
-         */
+        // Issuance only writes the files; without this, listeners keep presenting the old
+        // certificate until restart.
         if let Some(slots) = &tls_slots {
             match slots.refresh_certificate_files(cfg) {
                 Ok(swapped) if !swapped.is_empty() => onetdns_core::info!(
