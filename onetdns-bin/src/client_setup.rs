@@ -567,20 +567,17 @@ mod tests {
     }
 
     #[test]
-    fn dnscrypt_stamp_carries_the_provider_key_and_name() {
-        let mut e = endpoints(true, Some("192.0.2.1"));
+    fn dnscrypt_stamp_matches_a_published_one() {
+        // AdGuard's published stamp also sets the no-log bit.
+        let mut published = decode("sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20");
+        let mut e = endpoints(true, Some("94.140.14.14"));
         e.dnscrypt = Some(DnscryptIdentity {
-            provider_name: "2.dnscrypt-cert.example".to_string(),
-            public_key: [7; 32],
+            provider_name: "2.dnscrypt.default.ns1.adguard.com".to_string(),
+            public_key: published[28..60].try_into().unwrap(),
         });
-        let bytes = decode(&e.stamp(Transport::Dnscrypt, 443).unwrap().unwrap());
-        let mut expected = vec![0x01, 1, 0, 0, 0, 0, 0, 0, 0, 9];
-        expected.extend_from_slice(b"192.0.2.1");
-        expected.push(32);
-        expected.extend_from_slice(&[7; 32]);
-        expected.push(23);
-        expected.extend_from_slice(b"2.dnscrypt-cert.example");
-        assert_eq!(bytes, expected);
+        let stamp = e.stamp(Transport::Dnscrypt, 5443).unwrap().unwrap();
+        published[1] = STAMP_PROP_DNSSEC as u8;
+        assert_eq!(decode(&stamp), published);
     }
 
     fn serving(host: &str, kinds: &[(&'static str, &str)]) -> (Served, Vec<u8>) {
