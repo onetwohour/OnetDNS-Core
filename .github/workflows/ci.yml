@@ -44,6 +44,15 @@ jobs:
       - name: rustfmt (deny diffs)
         run: cargo fmt --all --check
 
+      # The tools are separate workspaces, so the steps above skip them. Their lockfiles record
+      # the version of the onetdns crates they use and must follow each version bump.
+      - name: tool workspaces (rustfmt, lockfile)
+        run: |
+          for tool in tools/dnsload tools/tls-diff; do
+            cargo fmt --check --manifest-path "$tool/Cargo.toml"
+            cargo metadata --locked --format-version 1 --manifest-path "$tool/Cargo.toml" > /dev/null
+          done
+
       # Zero clippy warnings. Subjective lints are allowed in [workspace.lints.clippy];
       # the groups that catch real bugs stay denied.
       - name: clippy (deny warnings)

@@ -27,8 +27,16 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    fn below(&mut self, n: usize) -> usize { if n == 0 { 0 } else { (self.next() % n as u64) as usize } }
-    fn byte(&mut self) -> u8 { (self.next() & 0xff) as u8 }
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
+    }
+    fn byte(&mut self) -> u8 {
+        (self.next() & 0xff) as u8
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -40,7 +48,9 @@ fn hex(b: &[u8]) -> String {
 /// bodies without parsing them and ignores bytes past the declared length; without this filter
 /// those would show up as rustls-only accepts.
 fn rustls_accepts(data: &[u8]) -> bool {
-    let [typ, l0, l1, l2, body @ ..] = data else { return false };
+    let [typ, l0, l1, l2, body @ ..] = data else {
+        return false;
+    };
     let declared = usize::from(*l0) << 16 | usize::from(*l1) << 8 | usize::from(*l2);
     let first_flight = *typ == HandshakeType::ClientHello.0 || *typ == HandshakeType::ServerHello.0;
     if !first_flight || declared != body.len() {
@@ -121,7 +131,9 @@ fn probe_server() -> ServerConfig {
 /// Sends the message as one plaintext handshake record and checks that the first record written is
 /// a handshake. A HelloRetryRequest has the same form and counts as an answer.
 fn ours_server_answers(data: &[u8], cfg: &ServerConfig) -> bool {
-    let Ok(len) = u16::try_from(data.len()) else { return false };
+    let Ok(len) = u16::try_from(data.len()) else {
+        return false;
+    };
     let handshake = onetdns_tls::ContentType::Handshake.0;
     let mut record = vec![handshake, 3, 1];
     record.extend_from_slice(&len.to_be_bytes());
@@ -137,13 +149,30 @@ fn ours_server_answers(data: &[u8], cfg: &ServerConfig) -> bool {
 fn havoc(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
     let mut b = seed.to_vec();
     for _ in 0..1 + rng.below(8) {
-        if b.is_empty() { break; }
+        if b.is_empty() {
+            break;
+        }
         match rng.below(6) {
-            0 => { let i = rng.below(b.len()); b[i] = rng.byte(); }
-            1 => { let i = rng.below(b.len()); b[i] ^= 1 << rng.below(8); }
-            2 => { let i = rng.below(b.len()); b.insert(i, rng.byte()); }
-            3 => { let i = rng.below(b.len()); b.remove(i); }
-            4 => { let i = rng.below(b.len()); b.truncate(i); }
+            0 => {
+                let i = rng.below(b.len());
+                b[i] = rng.byte();
+            }
+            1 => {
+                let i = rng.below(b.len());
+                b[i] ^= 1 << rng.below(8);
+            }
+            2 => {
+                let i = rng.below(b.len());
+                b.insert(i, rng.byte());
+            }
+            3 => {
+                let i = rng.below(b.len());
+                b.remove(i);
+            }
+            4 => {
+                let i = rng.below(b.len());
+                b.truncate(i);
+            }
             _ => b.push(rng.byte()),
         }
     }
@@ -153,7 +182,10 @@ fn havoc(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
 /// Exits with 1 when our server answered a ClientHello that rustls rejects even without the
 /// extensions OnetDNS does not interpret.
 fn main() {
-    let iters: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let iters: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
     let ch_seed = sample_client_hello();
     let sh_seed = sample_server_hello();
 
@@ -166,7 +198,10 @@ fn main() {
 
     for i in 0..iters {
         let data = match i % 5 {
-            0 => { let n = rng.below(300); (0..n).map(|_| rng.byte()).collect::<Vec<u8>>() }
+            0 => {
+                let n = rng.below(300);
+                (0..n).map(|_| rng.byte()).collect::<Vec<u8>>()
+            }
             1 | 2 => havoc(&mut rng, &ch_seed),
             _ => havoc(&mut rng, &sh_seed),
         };
@@ -175,8 +210,12 @@ fn main() {
             (false, false) => both_reject += 1,
             (true, false) => {
                 we_only += 1;
-                let Ok(Some((message, _))) = HandshakeMsg::parse(&data) else { continue };
-                let Ok(hello) = ClientHello::from_handshake(&message) else { continue };
+                let Ok(Some((message, _))) = HandshakeMsg::parse(&data) else {
+                    continue;
+                };
+                let Ok(hello) = ClientHello::from_handshake(&message) else {
+                    continue;
+                };
                 if rustls_accepts_interpreted_part(&hello) {
                     uninterpreted_only += 1;
                     continue;
@@ -199,12 +238,16 @@ fn main() {
     println!("both reject : {both_reject}");
     println!("rustls-only (rustls accepts, we reject): {rustls_only}");
     println!("we-only (we accept, rustls rejects): {we_only}");
-    println!("  client hellos rustls accepts without the extensions we ignore: {uninterpreted_only}");
+    println!(
+        "  client hellos rustls accepts without the extensions we ignore: {uninterpreted_only}"
+    );
     println!("  client hellos rustls still rejects: {still_rejected}");
     println!("    answered by our server with a ServerHello: {answered}");
     if !answered_examples.is_empty() {
         println!("--- answered client hellos (hex) ---");
-        for e in &answered_examples { println!("  {e}"); }
+        for e in &answered_examples {
+            println!("  {e}");
+        }
         std::process::exit(1);
     }
 }

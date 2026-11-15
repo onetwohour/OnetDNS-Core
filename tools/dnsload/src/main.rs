@@ -70,12 +70,17 @@ fn parse_args() -> Result<Args, String> {
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
-        let mut value = || it.next().ok_or_else(|| format!("{flag} 뒤에 값이 없습니다"));
+        let mut value = || {
+            it.next()
+                .ok_or_else(|| format!("{flag} 뒤에 값이 없습니다"))
+        };
         match flag.as_str() {
             "-s" | "--server" => args.server = value()?,
             "-d" | "--queries" => args.queries = value()?,
             "-l" | "--seconds" => {
-                args.seconds = value()?.parse().map_err(|_| "초는 숫자여야 합니다".to_string())?
+                args.seconds = value()?
+                    .parse()
+                    .map_err(|_| "초는 숫자여야 합니다".to_string())?
             }
             "-T" | "--threads" => {
                 args.threads = value()?
@@ -115,7 +120,8 @@ fn record_type(text: &str) -> RecordType {
 /// Encodes the list up front: encoding on every send would bottleneck the generator. Responses are
 /// only counted, so a fixed transaction ID per position is fine.
 fn bake_queries(path: &str) -> Result<Vec<Vec<u8>>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}를 읽지 못했습니다: {e}"))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("{path}를 읽지 못했습니다: {e}"))?;
     let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -281,7 +287,10 @@ fn main() {
         "  Queries completed:    {completed} ({:.2}%)",
         percent(completed, sent)
     );
-    println!("  Queries lost:         {lost} ({:.2}%)", percent(lost, sent));
+    println!(
+        "  Queries lost:         {lost} ({:.2}%)",
+        percent(lost, sent)
+    );
     println!();
     println!("  Run time (s):         {elapsed:.6}");
     println!("  Queries per second:   {rate:.6}");
