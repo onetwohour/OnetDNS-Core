@@ -35,8 +35,7 @@ pub(crate) struct Release {
 pub(crate) enum Finding {
     UpToDate,
     Available(Release),
-    /// This binary cannot install the highest candidate automatically; lower candidates are not
-    /// tried.
+    /// Self-update cannot install the highest candidate; lower candidates are not tried.
     Manual {
         version: String,
         reason: String,
@@ -168,7 +167,7 @@ fn open_release(
     };
     let (Some(manifest), Some(signature)) = (manifest, signature) else {
         return manual(format!(
-            "Version {version} has no signed update manifest, so it cannot be installed automatically"
+            "Version {version} has no signed update manifest, so this installation cannot update itself to it"
         ));
     };
     let opened = match manifest::open(manifest, signature, keys, version) {

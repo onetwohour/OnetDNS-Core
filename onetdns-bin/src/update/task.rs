@@ -126,7 +126,7 @@ pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Findi
             event = "update.manual_install",
             %version,
             %reason,
-            "A newer OnetDNS release cannot be installed automatically; install it manually"
+            "A newer OnetDNS release is out, but this installation cannot update itself to it; install it manually"
         ),
         Err(error) => onetdns_core::warn!(
             event = "update.check_failed",
