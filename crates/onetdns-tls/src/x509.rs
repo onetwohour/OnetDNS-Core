@@ -1148,6 +1148,27 @@ pub fn parse_time(tlv: crate::der::Tlv) -> Result<i64, TlsError> {
     Ok(days_from_civil(year, mo, d) * 86400 + h * 3600 + mi * 60 + se)
 }
 
+/// The DER Time that RFC 5280 requires for certificate validity: UTCTime through 2049,
+/// GeneralizedTime from 2050. The year must fit in four digits.
+pub fn encode_time(unix: i64) -> Vec<u8> {
+    let (y, m, d) = civil_from_days(unix.div_euclid(86400));
+    let secs = unix.rem_euclid(86400);
+    let clock = format!(
+        "{m:02}{d:02}{:02}{:02}{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    );
+    let (tag, text) = if (1950..2050).contains(&y) {
+        (0x17, format!("{:02}{clock}", y % 100))
+    } else {
+        (0x18, format!("{y:04}{clock}"))
+    };
+    let mut out = vec![tag, text.len() as u8];
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1155,6 +1176,19 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
+}
+
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -1203,6 +1237,18 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 1, 1), 10957);
         assert_eq!(days_from_civil(2021, 1, 1) * 86400, 1609459200);
+    }
+
+    #[test]
+    fn encoded_times_parse_back_on_both_sides_of_2050() {
+        let utc_end = days_from_civil(2049, 12, 31) * 86400 + 86399;
+        for unix in [0, 951_782_400, 1_609_459_199, utc_end, utc_end + 1] {
+            let der = encode_time(unix);
+            let tlv = crate::der::Der::new(&der).next().unwrap();
+            assert_eq!(parse_time(tlv), Ok(unix), "{unix}");
+        }
+        assert_eq!(encode_time(utc_end), b"\x17\x0d491231235959Z");
+        assert_eq!(encode_time(utc_end + 1), b"\x18\x0f20500101000000Z");
     }
 
     fn utctime(s: &[u8]) -> crate::der::Tlv<'_> {

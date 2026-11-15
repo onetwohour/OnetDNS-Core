@@ -85,6 +85,13 @@ const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 /// Modern clients read subjectAltName, not the CN.
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 
+const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+
+const OID_KP_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+
+/// Apple platforms reject a TLS server certificate valid for longer, even one the user trusts.
+const MAX_VALIDITY_DAYS: i64 = 825;
+
 /// SubjectPublicKeyInfo header for an uncompressed P-256 point; curve and length are fixed.
 const SPKI_PREFIX: &[u8] = &[
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
@@ -112,10 +119,17 @@ fn san_ext(host: &str) -> Vec<u8> {
     seq(&c)
 }
 
-/// A self-signed P-256 certificate and its PKCS#8 key, in DER. The serial is 16 random bytes kept
-/// positive. The validity practically never expires: trust in a self-signed certificate comes from
-/// the operator accepting it, not from its dates. The key is drawn in a loop because a random
-/// 32-byte value can fall outside the group order, and reducing it would bias the key.
+/// Apple platforms also reject a TLS server certificate without serverAuth.
+fn server_auth_ext() -> Vec<u8> {
+    let mut c = tlv(0x06, OID_EXT_KEY_USAGE);
+    c.extend(tlv(0x04, &seq(&tlv(0x06, OID_KP_SERVER_AUTH))));
+    seq(&c)
+}
+
+/// A self-signed P-256 server certificate and its PKCS#8 key, in DER. The serial is 16 random
+/// bytes kept positive. The validity starts an hour back to absorb client clock skew and stays
+/// under `MAX_VALIDITY_DAYS`, the notAfter second included. The key is drawn in a loop because a
+/// random 32-byte value can fall outside the group order, and reducing it would bias the key.
 fn generate_der(hostname: &str) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
@@ -140,14 +154,22 @@ fn generate_der(hostname: &str) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     let serial = der_positive_integer(&rnd);
 
     let validity = {
-        let nb = tlv(0x17, b"200101000000Z");
-        let na = tlv(0x17, b"491231235959Z");
-        let mut c = nb;
-        c.extend(na);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let not_before = now - 3600;
+        let mut c = onetdns_tls::x509::encode_time(not_before);
+        c.extend(onetdns_tls::x509::encode_time(
+            not_before + (MAX_VALIDITY_DAYS - 1) * 86400,
+        ));
         seq(&c)
     };
     let name = x509_name(hostname);
-    let extensions = tlv(0xa3, &seq(&san_ext(hostname)));
+    let extensions = {
+        let mut c = san_ext(hostname);
+        c.extend(server_auth_ext());
+        tlv(0xa3, &seq(&c))
+    };
 
     let mut tbs_inner = version;
     tbs_inner.extend(serial);
@@ -446,6 +468,22 @@ mod tests {
         assert!(x.matches_hostname("dns.example.test"), "SAN dNSName 매칭");
 
         assert!(onetdns_tls::ServerConfig::from_pkcs8(certs[0].clone(), &key).is_some());
+    }
+
+    #[test]
+    fn self_signed_meets_apple_server_certificate_rules() {
+        let (certs, _key) = self_signed_material("dns.example.test").unwrap();
+        let x = onetdns_tls::X509::parse(&certs[0]).unwrap();
+        assert_eq!(x.eku_server_auth, Some(true), "serverAuth EKU가 없습니다");
+        assert!(
+            x.not_after - x.not_before < MAX_VALIDITY_DAYS * 86400,
+            "유효 기간이 {MAX_VALIDITY_DAYS}일을 넘습니다"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(x.valid_at(now), "만든 즉시 유효해야 합니다");
     }
 
     #[test]
