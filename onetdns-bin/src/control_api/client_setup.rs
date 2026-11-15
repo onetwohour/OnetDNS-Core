@@ -1,7 +1,7 @@
 //! Management API: DNS stamps and Apple configuration profiles for clients.
 
 use super::*;
-use crate::client_setup::{Endpoints, Served, Transport};
+use crate::client_setup::{parse_address, Endpoints, Served, Transport};
 
 impl ControlDeps {
     fn endpoints(&self, request: &onetdns_core::json::Json) -> Result<Endpoints, String> {
@@ -12,13 +12,7 @@ impl ControlDeps {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
-        let address = text("address")
-            .map(|value| {
-                value
-                    .parse::<std::net::IpAddr>()
-                    .map_err(|_| format!("Invalid IP address: {value}"))
-            })
-            .transpose()?;
+        let address = text("address").map(parse_address).transpose()?;
         let served = Served {
             listeners: self.listener_reg.lock_recover().clone(),
             chain: self

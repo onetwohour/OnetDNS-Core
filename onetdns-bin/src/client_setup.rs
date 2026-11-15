@@ -395,6 +395,15 @@ impl Endpoints {
     }
 }
 
+/// The address clients connect to. A port is refused: each stamp takes its listener's port.
+pub(crate) fn parse_address(text: &str) -> Result<IpAddr, String> {
+    if text.parse::<SocketAddr>().is_ok() {
+        return Err(format!("Enter the IP address without a port: {text}"));
+    }
+    text.parse()
+        .map_err(|_| format!("Invalid IP address: {text}"))
+}
+
 /// IPv6 goes in brackets even without a port.
 fn ip_literal(ip: IpAddr) -> String {
     match ip {
@@ -555,6 +564,25 @@ mod tests {
         e.hostname = Some("dns.example".to_string());
         let dot = decode(&e.stamp(Transport::Dot, 853).unwrap().unwrap());
         assert_eq!(&dot[9..], b"\x00\x00\x0fdns.example:853");
+    }
+
+    #[test]
+    fn an_address_with_a_port_is_refused_with_its_own_reason() {
+        assert_eq!(parse_address("192.0.2.1"), Ok("192.0.2.1".parse().unwrap()));
+        assert_eq!(
+            parse_address("2001:db8::1"),
+            Ok("2001:db8::1".parse().unwrap())
+        );
+        for text in ["127.0.0.1:5443", "[2001:db8::1]:853"] {
+            assert_eq!(
+                parse_address(text),
+                Err(format!("Enter the IP address without a port: {text}"))
+            );
+        }
+        assert_eq!(
+            parse_address("dns.example"),
+            Err("Invalid IP address: dns.example".to_string())
+        );
     }
 
     #[test]
