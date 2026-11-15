@@ -289,13 +289,12 @@ pub(crate) fn catalog_members(records: &[onetdns_proto::Record], catalog: &str) 
     out
 }
 
+/// Must not change between builds: a consumer resets a member whose ID changes. Zero keys and the
+/// 0xff terminator keep the IDs earlier releases published.
 fn catalog_member_id(member: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    member
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .hash(&mut h);
+    let mut h = onetdns_security::siphash::SipHasher13::new_with_keys(0, 0);
+    h.write(member.trim_end_matches('.').to_ascii_lowercase().as_bytes());
+    h.write(&[0xff]);
     format!("m{:016x}", h.finish())
 }
 
@@ -1512,6 +1511,16 @@ mod tests {
             lc(resolve_zone_name("a", "example.com.").unwrap()),
             "a.example.com"
         );
+    }
+
+    #[test]
+    /// Values earlier releases published; a consumer resets every member whose ID changes.
+    fn catalog_member_ids_are_pinned() {
+        assert_eq!(catalog_member_id("example.com."), "m48f6f9c480b4e2ac");
+        assert_eq!(catalog_member_id("Example.COM"), "m48f6f9c480b4e2ac");
+        assert_eq!(catalog_member_id("a.example."), "m510e234a2f16be7d");
+        assert_eq!(catalog_member_id("b.test."), "mf13a2f9fee1ce3c8");
+        assert_eq!(catalog_member_id("zone-1.internal."), "m102f777cd2f94aad");
     }
 
     #[test]
