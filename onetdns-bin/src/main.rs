@@ -6,6 +6,8 @@ mod atomic_file;
 /// Response cache and coalescing of identical queries.
 mod cache;
 mod cli;
+/// DNS stamps and Apple configuration profiles for clients.
+mod client_setup;
 /// Raft cluster and config writes through it.
 mod cluster;
 /// Classifies and applies config changes.
@@ -1263,6 +1265,7 @@ pub fn serve(
 
     let listener_reg: Arc<Mutex<Vec<(&'static str, String, String)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let dnscrypt_identity = listeners::DnscryptIdentitySlot::default();
 
     let runtime_cfg = Arc::new(ArcSwap::from_pointee(cfg.clone()));
 
@@ -1473,6 +1476,7 @@ pub fn serve(
         forward_stats: forward_stats.clone(),
         listener_reg: listener_reg.clone(),
         tls_slot_handle: tls_slot_handle.clone(),
+        dnscrypt_identity: dnscrypt_identity.clone(),
         jobs: shared.jobs.clone(),
         service_threads: service_cleanup.tracker(),
     });
@@ -1543,9 +1547,10 @@ pub fn serve(
             let registry = listener_reg.clone();
             let path = config_path.clone();
             let tracker = service_cleanup.tracker();
+            let identity = dnscrypt_identity.clone();
             Arc::new(move |next: &Config| -> Result<(), String> {
                 reconcile_listeners(next, &set, &handler, &slots, &sd, &registry)?;
-                reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry)
+                reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
             }) as SecondaryRestart
         },
         &cfg,

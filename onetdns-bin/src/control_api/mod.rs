@@ -1,6 +1,7 @@
 //! Connects the management API callbacks to one server generation through `ControlDeps`.
 
 mod accounts;
+mod client_setup;
 mod clients;
 mod config;
 mod dhcp;
@@ -53,6 +54,7 @@ pub(crate) struct ControlDeps {
     pub(crate) listener_reg: Arc<Mutex<Vec<(&'static str, String, String)>>>,
     /// `None` without an encrypted listener.
     pub(crate) tls_slot_handle: Arc<Mutex<Option<Arc<TlsSlots>>>>,
+    pub(crate) dnscrypt_identity: crate::listeners::DnscryptIdentitySlot,
     pub(crate) jobs: Arc<JobRegistry>,
     /// Threads to join when this generation ends.
     pub(crate) service_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
@@ -138,6 +140,8 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         tls_validate: bind!(deps.tls_validate()),
         tls_configure: bind!(deps.tls_configure(body: &str)),
         tls_revocation_check: bind!(deps.tls_revocation_check(body: &str)),
+        client_stamps: bind!(deps.client_stamps(body: &str)),
+        client_apple_profile: bind!(deps.client_apple_profile(body: &str)),
         acme_issue: bind!(deps.acme_issue(body: &str)),
         tokens_list: bind!(deps.tokens_list()),
         token_add: bind!(deps.token_add(body: &str)),

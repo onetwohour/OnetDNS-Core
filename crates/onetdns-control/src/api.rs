@@ -327,6 +327,8 @@ fn is_state_changing_request(method: &str, path: &str) -> bool {
                 | "/v1/policies/simulate"
                 | "/v1/tls/validate"
                 | "/v1/tls/revocation-check"
+                | "/v1/client-setup/stamps"
+                | "/v1/client-setup/apple-profile"
                 | "/v1/upstreams/test"
         ),
         _ => false,
@@ -557,6 +559,12 @@ pub struct Controls {
 
     pub tls_revocation_check: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
+    /// DNS stamps for the open listeners.
+    pub client_stamps: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+
+    /// An Apple configuration profile, as plist XML.
+    pub client_apple_profile: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+
     /// Starts certificate issuance.
     pub acme_issue: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
@@ -781,6 +789,10 @@ impl Controls {
             tls_validate: Box::new(|| Err("No TLS certificate is configured".to_string())),
             tls_configure: Box::new(|_| Err("No config file path".to_string())),
             tls_revocation_check: Box::new(|_| Err("Certificate chain not found".to_string())),
+            client_stamps: Box::new(|_| Err("The requested feature is not available".to_string())),
+            client_apple_profile: Box::new(|_| {
+                Err("The requested feature is not available".to_string())
+            }),
             acme_issue: Box::new(
                 |_| Err("ACME certificate issuance is not configured".to_string()),
             ),
@@ -4574,6 +4586,13 @@ fn route_dispatch(
         ("POST", "/v1/tls/revocation-check") => {
             result_resp((st.controls.tls_revocation_check)(body))
         }
+        ("POST", "/v1/client-setup/stamps") => result_resp((st.controls.client_stamps)(body)),
+        ("POST", "/v1/client-setup/apple-profile") => {
+            match (st.controls.client_apple_profile)(body) {
+                Ok(profile) => ("200 OK", "application/x-apple-aspen-config", profile),
+                Err(error) => result_resp(Err(error)),
+            }
+        }
         ("POST", "/v1/acme/issue") => result_resp((st.controls.acme_issue)(body)),
         ("POST", "/v1/config/rollback") => conflict_resp((st.controls.config_rollback)()),
         ("POST", "/v1/policies/simulate") => (
@@ -5053,6 +5072,7 @@ fn openapi_json() -> String {
     { "name": "Clients", "description": "Per-client policies." },
     { "name": "Resolution", "description": "Listen addresses, upstream DNS servers, the response cache, and query diagnostics." },
     { "name": "TLS", "description": "Certificates for encrypted DNS: status, validation, replacement, revocation checks, and ACME issuance." },
+    { "name": "Client setup", "description": "DNS stamps and Apple configuration profiles that point clients at this server." },
     { "name": "Zones", "description": "Authoritative zones, their records, and their DNSSEC status." },
     { "name": "DHCP", "description": "DHCP leases and static assignments." },
     { "name": "Cluster", "description": "Cluster node status and Raft config proposals." },
@@ -5134,6 +5154,8 @@ fn openapi_json() -> String {
     "/v1/tls/validate": { "post": { "tags": ["TLS"], "summary": "Validate the configured certificate, private key, chain, and validity period (admin only). Trust path and hostname are not checked", "responses": { "200": { "description": "{material_valid,valid:false,trusted:false,hostname_checked:false,chain_len}" }, "400": { "description": "{error}" } } } },
     "/v1/tls/configure": { "post": { "tags": ["TLS"], "summary": "Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" }, "private_key": { "type": "string" }, "cert_path": { "type": "string" }, "key_path": { "type": "string" } }, "additionalProperties": false } } } }, "responses": { "200": { "description": "{configured,chain_len,reloading,cert,key}" }, "400": { "description": "{error}" } } } },
     "/v1/tls/revocation-check": { "post": { "tags": ["TLS"], "summary": "Check OCSP and CRL revocation status of a certificate chain (admin only). Fetches from the URLs in the certificate and verifies signatures", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "certificate_chain": { "type": "string" } }, "required": ["certificate_chain"] } } } }, "responses": { "200": { "description": "{ocsp,crl,ocsp_urls,crl_urls,revoked}" }, "400": { "description": "{error}" } } } },
+    "/v1/client-setup/stamps": { "post": { "tags": ["Client setup"], "summary": "DNS stamps (sdns://) for the open listeners, one per protocol and port (admin only). Plain DNS and DNSCrypt stamps need `address`; DoH, DoT, and DoQ stamps need a name the served certificate covers, by default `ddr_name` or the first name in the certificate. A chain this machine does not trust is pinned by the hash of its topmost certificate", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "address": { "type": "string" }, "hostname": { "type": "string" } } } } } }, "responses": { "200": { "description": "{address,hostname,certificate:{trusted,changes_on_restart},stamps:[{protocol,port,stamp}]}" }, "400": { "description": "{error}" } } } },
+    "/v1/client-setup/apple-profile": { "post": { "tags": ["Client setup"], "summary": "Apple configuration profile (.mobileconfig) that sets the system DNS to this server over DoH or DoT (admin only). It carries the root certificate when this machine does not trust the chain, and with `ssids` it applies only on those Wi-Fi networks. Refused when Apple devices would reject the certificate or when the certificate changes at every start", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "protocol": { "type": "string", "enum": ["doh", "dot"] }, "address": { "type": "string" }, "hostname": { "type": "string" }, "ssids": { "type": "array", "items": { "type": "string" } } }, "required": ["protocol"] } } } }, "responses": { "200": { "description": "application/x-apple-aspen-config plist" }, "400": { "description": "{error}" } } } },
     "/v1/acme/issue": { "post": { "tags": ["TLS"], "summary": "Issue an ACME certificate or register an account (admin only). Answers HTTP-01 and DNS-01 challenges automatically and saves the issued certificate and private key to the configured files", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "directory": { "type": "string" }, "domains": { "type": "array" }, "contact": { "type": "string" }, "challenge": { "type": "string" }, "account_only": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "{account,issued,cert_file,key_file}" }, "400": { "description": "{error}" } } } },
     "/v1/plugins": { "get": { "tags": ["Filtering"], "summary": "WASM plugin metrics", "responses": { "200": { "description": "[{name,eval,error,block,latency_us}]" } } } },
     "/v1/filter/report": { "get": { "tags": ["Filtering"], "summary": "Filter rule load results and why rules were skipped", "responses": { "200": { "description": "{rules_total,rules_applied,rules_skipped,skip_reasons}" } } } },
@@ -5592,6 +5614,14 @@ mod tests {
                     Ok("{\"ocsp\":\"good\",\"crl\":\"unavailable\",\"revoked\":false}".to_string())
                 } else {
                     Err("`certificate_chain` 항목을 입력해야 합니다".to_string())
+                }
+            }),
+            client_stamps: Box::new(|_| Ok("{\"stamps\":[]}".to_string())),
+            client_apple_profile: Box::new(|body| {
+                if body.contains("\"doh\"") {
+                    Ok("<plist version=\"1.0\"></plist>".to_string())
+                } else {
+                    Err("`protocol` must be doh or dot".to_string())
                 }
             }),
             acme_issue: Box::new(|body| {
@@ -6594,6 +6624,8 @@ mod tests {
             "/v1/policies/simulate",
             "/v1/tls/validate",
             "/v1/tls/revocation-check",
+            "/v1/client-setup/stamps",
+            "/v1/client-setup/apple-profile",
             "/v1/upstreams/test",
         ] {
             assert!(!is_state_changing_request("POST", path), "{path}");
@@ -6601,6 +6633,41 @@ mod tests {
         assert!(is_state_changing_request("POST", "/v1/config/set"));
         assert!(is_state_changing_request("PATCH", "/v1/clients"));
         assert!(!is_state_changing_request("GET", "/v1/config"));
+    }
+
+    #[test]
+    fn client_setup_is_admin_only_and_the_profile_keeps_its_media_type() {
+        let st = test_state("adm", "ro");
+        let profile = |body: &str| {
+            route(
+                "POST",
+                "/v1/client-setup/apple-profile",
+                "Bearer adm",
+                "",
+                body,
+                &Caller::direct(None),
+                &st,
+            )
+        };
+        let (status, ctype, body) = profile("{\"protocol\":\"doh\"}");
+        assert_eq!(status_code(status), 200);
+        assert_eq!(ctype, "application/x-apple-aspen-config");
+        assert!(body.starts_with("<plist"));
+        let (status, ctype, body) = profile("{\"protocol\":\"dot\"}");
+        assert_eq!(status_code(status), 400);
+        assert_eq!(
+            ctype, "application/json",
+            "오류가 프로필 형식으로 나갔습니다"
+        );
+        assert!(body.contains("\"error\""));
+
+        assert_eq!(
+            call(&st, "POST", "/v1/client-setup/stamps", "adm", "{}").0,
+            200
+        );
+        for path in ["/v1/client-setup/stamps", "/v1/client-setup/apple-profile"] {
+            assert_eq!(call(&st, "POST", path, "ro", "{}").0, 403, "{path}");
+        }
     }
 
     #[test]

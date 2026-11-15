@@ -299,7 +299,7 @@ fn der_to_pem(der: &[u8], label: &str) -> Zeroizing<String> {
 
 const B64STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn b64_std(data: &[u8]) -> Zeroizing<String> {
+pub(crate) fn b64_std(data: &[u8]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::new());
     for chunk in data.chunks(3) {
         let b = [
@@ -324,7 +324,7 @@ fn b64_std(data: &[u8]) -> Zeroizing<String> {
     out
 }
 
-fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
+pub(crate) fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

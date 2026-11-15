@@ -17,6 +17,16 @@ use crate::{
     track_service_thread, LOCAL_CA_MAX_BYTES,
 };
 
+/// The provider name and public key DNSCrypt clients must trust; `None` while no DNSCrypt listener
+/// is open.
+#[derive(Clone)]
+pub(crate) struct DnscryptIdentity {
+    pub(crate) provider_name: String,
+    pub(crate) public_key: [u8; 32],
+}
+
+pub(crate) type DnscryptIdentitySlot = Arc<Mutex<Option<DnscryptIdentity>>>;
+
 fn dnscrypt_provider_key_path(
     config_path: &Option<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
@@ -200,6 +210,11 @@ impl TlsSlots {
         self.doq.store(prepared.doq);
         self.doh3.store(prepared.doh3);
         *live = prepared.files;
+    }
+
+    /// The chain every encrypted transport presents now, leaf first.
+    pub(crate) fn served_chain(&self) -> Vec<Vec<u8>> {
+        self.dot.load().cert_chain.clone()
     }
 }
 
@@ -625,6 +640,7 @@ pub(crate) fn reconcile_dnscrypt(
     config_path: &Option<PathBuf>,
     tracker: &Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
+    identity: &DnscryptIdentitySlot,
 ) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -653,10 +669,17 @@ pub(crate) fn reconcile_dnscrypt(
             }
             keep
         });
+        if live.is_empty() {
+            *identity.lock_recover() = None;
+        }
         return Ok(());
     }
 
     let provider = load_or_create_dnscrypt_provider(cfg, config_path, DNSCRYPT_CERT_VALID_SECS)?;
+    *identity.lock_recover() = Some(DnscryptIdentity {
+        provider_name: cfg.dnscrypt_provider_name.clone(),
+        public_key: provider.provider_public_key(),
+    });
     let pubkey: String = provider
         .provider_public_key()
         .iter()
