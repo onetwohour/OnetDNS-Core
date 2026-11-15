@@ -152,28 +152,77 @@ impl ForwardValidateLayer {
         tag
     }
 
-    /// None when the anchors changed or the entry expired.
-    fn cached(&self, zone: &Name, now: u32, anchor_tag: u64) -> Option<ChainVerdict> {
-        let key = zone.canonical_key();
+    /// The deepest walked name at or above `name`, as (its label count, verdict, expiry). Entries
+    /// that expired or came from other anchors are dropped on the way up.
+    fn deepest_cached(
+        &self,
+        name: &Name,
+        now: u32,
+        anchor_tag: u64,
+    ) -> Option<(usize, ChainVerdict, u32)> {
         let mut chains = self.chains.lock_recover();
-        let entry = chains.get(&key)?;
-        if entry.anchor_tag != anchor_tag || entry.expires <= now {
+        for labels in (0..=name.num_labels()).rev() {
+            let key = name.suffix(labels).canonical_key();
+            let Some(entry) = chains.get(&key) else {
+                continue;
+            };
+            if entry.anchor_tag == anchor_tag && entry.expires > now {
+                return Some((labels, entry.verdict.clone(), entry.expires));
+            }
             chains.pop(&key);
-            return None;
         }
-        Some(entry.verdict.clone())
+        None
     }
 
-    fn remember(&self, zone: &Name, verdict: &ChainVerdict, now: u32, ttl: u32, anchor_tag: u64) {
-        let ttl = ttl.clamp(CHAIN_CACHE_MIN_TTL, CHAIN_CACHE_MAX_TTL);
+    fn remember(&self, name: &Name, verdict: &ChainVerdict, expires: u32, anchor_tag: u64) {
         self.chains.lock_recover().put(
-            zone.canonical_key(),
+            name.canonical_key(),
             CachedChain {
                 verdict: verdict.clone(),
-                expires: now.saturating_add(ttl),
+                expires,
                 anchor_tag,
             },
         );
+    }
+
+    fn expiry(now: u32, ttl: u32) -> u32 {
+        now.saturating_add(ttl.clamp(CHAIN_CACHE_MIN_TTL, CHAIN_CACHE_MAX_TTL))
+    }
+
+    /// The zone's DNSKEY set checked against the DS above it, and the set's TTL. None when the set
+    /// cannot be fetched or does not match.
+    fn zone_keys(
+        &self,
+        zone: &Name,
+        trusted_ds: &[onetdns_dnssec::Ds],
+        now: u32,
+        budget: &mut u32,
+    ) -> Option<(Arc<[onetdns_dnssec::Dnskey]>, u32)> {
+        let Some((dnskeys, dnskey_rrsigs)) = self.dnskey_rrset(zone, budget) else {
+            onetdns_core::debug!(
+                event = "dnssec.forward_no_dnskey",
+                zone = %zone.to_ascii_lower(),
+                "Could not get this zone's DNSKEY and its signatures; cannot build the chain"
+            );
+            return None;
+        };
+        let ttl = dnskeys
+            .iter()
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(CHAIN_CACHE_MIN_TTL);
+        match onetdns_dnssec::validate_dnskey_set(&dnskeys, &dnskey_rrsigs, trusted_ds, zone, now) {
+            Ok(keys) => Some((keys.into(), ttl)),
+            Err(error) => {
+                onetdns_core::debug!(
+                    event = "dnssec.forward_chain_bogus",
+                    zone = %zone.to_ascii_lower(),
+                    error = ?error,
+                    "Zone key does not match the DS established above"
+                );
+                None
+            }
+        }
     }
 
     /// Builds the chain of trust from the root to the zone containing `name`. After confirming the
@@ -186,6 +235,10 @@ impl ForwardValidateLayer {
     /// signed zone as proof of an unsigned delegation: a stripped answer would then go out
     /// unvalidated, and a forged signature naming the name itself as signer would pass.
     ///
+    /// Every name walked is cached with its verdict, so names sharing ancestors share the walk: the
+    /// next one resumes below the deepest cached ancestor, and an insecure ancestor decides it at
+    /// once. An entry expires no later than the ancestors it was derived from.
+    ///
     /// `name` is the signer of the response signature, or the query name when unsigned. None when
     /// the chain cannot be built, which counts as a validation failure.
     fn chain_to(&self, name: &Name, now: u32, budget: &mut u32) -> Option<ChainVerdict> {
@@ -193,90 +246,76 @@ impl ForwardValidateLayer {
         if anchors.is_empty() {
             return None;
         }
-        let anchor_tag = Self::anchor_tag(&anchors);
-        if let Some(verdict) = self.cached(name, now, anchor_tag) {
-            return Some(verdict);
-        }
-
         let labels = name.num_labels();
         if labels > MAX_CHAIN_DEPTH {
             return None;
         }
+        let anchor_tag = Self::anchor_tag(&anchors);
 
-        let mut trusted_ds: Vec<onetdns_dnssec::Ds> = anchors.to_vec();
-        let mut apex = Name::root();
-        let mut examined = 0usize;
-        let mut ttl = u32::MAX;
-        let verdict = 'zones: loop {
-            let Some((dnskeys, dnskey_rrsigs)) = self.dnskey_rrset(&apex, budget) else {
+        let (mut examined, mut keys, mut apex, mut expires) =
+            match self.deepest_cached(name, now, anchor_tag) {
+                Some((_, ChainVerdict::Insecure, _)) => return Some(ChainVerdict::Insecure),
+                Some((walked, ChainVerdict::Secure { keys, apex }, expires)) => {
+                    (walked, keys, apex, expires)
+                }
+                None => {
+                    let root = Name::root();
+                    let (keys, ttl) = self.zone_keys(&root, &anchors, now, budget)?;
+                    let expires = Self::expiry(now, ttl);
+                    let verdict = ChainVerdict::Secure {
+                        keys: keys.clone(),
+                        apex: root.clone(),
+                    };
+                    self.remember(&root, &verdict, expires, anchor_tag);
+                    (0, keys, root, expires)
+                }
+            };
+
+        while examined < labels {
+            examined += 1;
+            let child = name.suffix(examined);
+            let Some((ds_records, ds_rrsigs, nsec, nsec_rrsigs, nsec3, nsec3_rrsigs)) =
+                self.delegation_evidence(&child, budget)
+            else {
                 onetdns_core::debug!(
-                    event = "dnssec.forward_no_dnskey",
-                    zone = %apex.to_ascii_lower(),
-                    "Could not get this zone's DNSKEY and its signatures; cannot build the chain"
+                    event = "dnssec.forward_no_ds",
+                    zone = %child.to_ascii_lower(),
+                    "Could not get a DS response; cannot build the chain"
                 );
                 return None;
             };
-            ttl = dnskeys.iter().map(|record| record.ttl).fold(ttl, u32::min);
-            let keys = match onetdns_dnssec::validate_dnskey_set(
-                &dnskeys,
-                &dnskey_rrsigs,
-                &trusted_ds,
-                &apex,
-                now,
-            ) {
-                Ok(keys) => keys,
-                Err(error) => {
+            let secure = if !ds_records.is_empty() {
+                if onetdns_dnssec::validate_rrset_in_zone(
+                    &ds_records,
+                    &ds_rrsigs,
+                    &keys,
+                    &apex,
+                    now,
+                )
+                .is_err()
+                {
                     onetdns_core::debug!(
-                        event = "dnssec.forward_chain_bogus",
-                        zone = %apex.to_ascii_lower(),
-                        error = ?error,
-                        "Zone key does not match the DS established above"
-                    );
-                    return None;
-                }
-            };
-            while examined < labels {
-                examined += 1;
-                let child = name.suffix(examined);
-                let Some((ds_records, ds_rrsigs, nsec, nsec_rrsigs, nsec3, nsec3_rrsigs)) =
-                    self.delegation_evidence(&child, budget)
-                else {
-                    onetdns_core::debug!(
-                        event = "dnssec.forward_no_ds",
+                        event = "dnssec.forward_ds_bogus",
                         zone = %child.to_ascii_lower(),
-                        "Could not get a DS response; cannot build the chain"
+                        "Delegation's DS signature does not verify with the parent key"
                     );
                     return None;
-                };
-                if !ds_records.is_empty() {
-                    if onetdns_dnssec::validate_rrset_in_zone(
-                        &ds_records,
-                        &ds_rrsigs,
-                        &keys,
-                        &apex,
-                        now,
-                    )
-                    .is_err()
-                    {
-                        onetdns_core::debug!(
-                            event = "dnssec.forward_ds_bogus",
-                            zone = %child.to_ascii_lower(),
-                            "Delegation's DS signature does not verify with the parent key"
-                        );
-                        return None;
-                    }
-                    let supported: Vec<onetdns_dnssec::Ds> = ds_records
-                        .iter()
-                        .filter_map(onetdns_dnssec::Ds::from_record)
-                        .filter(onetdns_dnssec::ds_is_supported)
-                        .collect();
-                    if supported.is_empty() {
-                        break 'zones ChainVerdict::Insecure;
-                    }
-                    trusted_ds = supported;
-                    apex = child;
-                    continue 'zones;
                 }
+                let supported: Vec<onetdns_dnssec::Ds> = ds_records
+                    .iter()
+                    .filter_map(onetdns_dnssec::Ds::from_record)
+                    .filter(onetdns_dnssec::ds_is_supported)
+                    .collect();
+                if supported.is_empty() {
+                    false
+                } else {
+                    let (child_keys, ttl) = self.zone_keys(&child, &supported, now, budget)?;
+                    expires = expires.min(Self::expiry(now, ttl));
+                    keys = child_keys;
+                    apex = child.clone();
+                    true
+                }
+            } else {
                 let evidence = onetdns_dnssec::DenialEvidence {
                     nsec: &nsec,
                     nsec_rrsigs: &nsec_rrsigs,
@@ -284,10 +323,8 @@ impl ForwardValidateLayer {
                     nsec3_rrsigs: &nsec3_rrsigs,
                 };
                 match onetdns_dnssec::classify_ds_absence(&apex, &keys, &evidence, &child, now) {
-                    onetdns_dnssec::DsAbsence::InsecureDelegation => {
-                        break 'zones ChainVerdict::Insecure;
-                    }
-                    onetdns_dnssec::DsAbsence::NotACut => {}
+                    onetdns_dnssec::DsAbsence::InsecureDelegation => false,
+                    onetdns_dnssec::DsAbsence::NotACut => true,
                     onetdns_dnssec::DsAbsence::Unproven if self.policy.strict => {
                         onetdns_core::debug!(
                             event = "dnssec.forward_ds_unproven",
@@ -296,21 +333,20 @@ impl ForwardValidateLayer {
                         );
                         return None;
                     }
-                    onetdns_dnssec::DsAbsence::Unproven => break 'zones ChainVerdict::Insecure,
+                    onetdns_dnssec::DsAbsence::Unproven => false,
                 }
-            }
-            break ChainVerdict::Secure {
-                keys: keys.into(),
-                apex,
             };
-        };
-        let ttl = if ttl == u32::MAX {
-            CHAIN_CACHE_MIN_TTL
-        } else {
-            ttl
-        };
-        self.remember(name, &verdict, now, ttl, anchor_tag);
-        Some(verdict)
+            if !secure {
+                self.remember(&child, &ChainVerdict::Insecure, expires, anchor_tag);
+                return Some(ChainVerdict::Insecure);
+            }
+            let verdict = ChainVerdict::Secure {
+                keys: keys.clone(),
+                apex: apex.clone(),
+            };
+            self.remember(&child, &verdict, expires, anchor_tag);
+        }
+        Some(ChainVerdict::Secure { keys, apex })
     }
 
     /// None unless both the DNSKEY set and its signatures are present.
@@ -929,6 +965,243 @@ mod tests {
         assert_eq!(found.len(), 1, "OPT가 하나여야 합니다");
         assert!(found[0].dnssec_ok, "DO를 설정하지 않았습니다");
         assert_eq!(found[0].udp_payload, 4096, "요청이 알린 크기를 바꿨습니다");
+    }
+
+    /// Signed root and `com`. `com` delegates `signed.com` with a DS and `example.com` and
+    /// `other.com` without one. DNSKEY and DS queries are answered from the signed zones, A queries
+    /// with an unsigned record, and every query is recorded.
+    struct SignedTree {
+        zones: Vec<(Name, Vec<Record>)>,
+        anchor: onetdns_dnssec::Ds,
+        asked: Mutex<Vec<(String, RecordType)>>,
+    }
+
+    impl SignedTree {
+        fn new() -> Arc<Self> {
+            use onetdns_dnssec::sign::{sign_zone, ZoneSigner};
+            let now = u64::from(now_secs());
+            let name = |text: &str| Name::from_str(text).unwrap();
+            let record = |owner: &str, rtype: RecordType, rdata: RData| Record {
+                name: name(owner),
+                rtype,
+                class: DnsClass::IN,
+                ttl: 3600,
+                rdata,
+            };
+            let ns = |owner: &str| record(owner, RecordType::NS, RData::Ns(name("ns.test")));
+            let ds = |owner: &str, signer: &ZoneSigner| {
+                let ds = signer.ds().unwrap();
+                record(
+                    owner,
+                    RecordType::DS,
+                    RData::Unknown(RecordType::DS.0, ds.rdata_bytes()),
+                )
+            };
+            let a = |owner: &str| record(owner, RecordType::A, RData::A([192, 0, 2, 1].into()));
+
+            let root = ZoneSigner::generate(Name::root(), [81; 32]);
+            let com = ZoneSigner::generate(name("com"), [82; 32]);
+            let signed = ZoneSigner::generate(name("signed.com"), [83; 32]);
+            let zones = vec![
+                (
+                    Name::root(),
+                    sign_zone(&[ns("com"), ds("com", &com)], &root, now),
+                ),
+                (
+                    name("com"),
+                    sign_zone(
+                        &[
+                            ns("example.com"),
+                            ns("other.com"),
+                            ns("signed.com"),
+                            ds("signed.com", &signed),
+                        ],
+                        &com,
+                        now,
+                    ),
+                ),
+                (
+                    name("signed.com"),
+                    sign_zone(&[a("www.signed.com"), a("mail.signed.com")], &signed, now),
+                ),
+            ];
+            Arc::new(SignedTree {
+                zones,
+                anchor: root.ds().unwrap(),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn layer(self: &Arc<Self>) -> ForwardValidateLayer {
+            ForwardValidateLayer::new(
+                self.clone(),
+                Arc::new(onetdns_core::ArcSwap::new(Arc::new(vec![self
+                    .anchor
+                    .clone()]))),
+                ForwardValidationPolicy {
+                    strict: true,
+                    permissive: false,
+                    ignore_cd: false,
+                    insecure_domains: Vec::new(),
+                    root_key_sentinel: false,
+                },
+            )
+        }
+
+        /// The queries recorded since the last call.
+        fn take_asked(&self) -> Vec<(String, RecordType)> {
+            std::mem::take(&mut *self.asked.lock_recover())
+        }
+
+        /// The RRset and its signatures at `owner`.
+        fn signed_rrset(records: &[Record], owner: &Name, rtype: RecordType) -> Vec<Record> {
+            records
+                .iter()
+                .filter(|record| record.name.eq_ignore_case(owner))
+                .filter(|record| {
+                    record.rtype == rtype
+                        || record.rtype == RecordType::RRSIG
+                            && onetdns_dnssec::Rrsig::from_record(record)
+                                .is_some_and(|rrsig| rrsig.type_covered == rtype.0)
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Resolver for SignedTree {
+        fn resolve(&self, request: &Message) -> Option<Message> {
+            let question = request.questions.first()?;
+            self.asked
+                .lock_recover()
+                .push((question.name.to_ascii_lower(), question.qtype));
+            let mut response =
+                Message::query(request.header.id, question.name.clone(), question.qtype);
+            response.header.response = true;
+            match question.qtype {
+                RecordType::A => {
+                    response.answers = unsigned_answer(&question.name.to_ascii_lower()).answers;
+                }
+                RecordType::DNSKEY => {
+                    let (_, records) = self
+                        .zones
+                        .iter()
+                        .find(|(apex, _)| apex.eq_ignore_case(&question.name))?;
+                    response.answers =
+                        Self::signed_rrset(records, &question.name, RecordType::DNSKEY);
+                }
+                RecordType::DS => {
+                    let (_, records) = self
+                        .zones
+                        .iter()
+                        .filter(|(apex, _)| {
+                            !apex.eq_ignore_case(&question.name)
+                                && question.name.ends_with_ignore_case(apex)
+                        })
+                        .max_by_key(|(apex, _)| apex.num_labels())?;
+                    response.answers = Self::signed_rrset(records, &question.name, RecordType::DS);
+                    if response.answers.is_empty() {
+                        response.authorities =
+                            Self::signed_rrset(records, &question.name, RecordType::NSEC);
+                    }
+                }
+                _ => return None,
+            }
+            Some(response)
+        }
+    }
+
+    fn a_query(name: &str) -> Message {
+        Message::query(7, Name::from_str(name).unwrap(), RecordType::A)
+    }
+
+    fn asked(list: &[(&str, RecordType)]) -> Vec<(String, RecordType)> {
+        list.iter()
+            .map(|(name, rtype)| (name.to_string(), *rtype))
+            .collect()
+    }
+
+    #[test]
+    /// The root and TLD keys are shared by every name, so they are fetched once, and an unsigned
+    /// delegation decides every name below it.
+    fn names_sharing_ancestors_share_the_chain_walk() {
+        let tree = SignedTree::new();
+        let layer = tree.layer();
+        let passes = |outcome: ResolveOutcome| {
+            matches!(outcome, ResolveOutcome::Response(ref r)
+                if r.answers.len() == 1 && !r.header.authentic_data)
+        };
+
+        assert!(passes(layer.resolve_outcome(&a_query("a.example.com"))));
+        assert_eq!(
+            tree.take_asked(),
+            asked(&[
+                ("a.example.com", RecordType::A),
+                ("", RecordType::DNSKEY),
+                ("com", RecordType::DS),
+                ("com", RecordType::DNSKEY),
+                ("example.com", RecordType::DS),
+            ]),
+            "처음 보는 이름은 루트부터 체인을 구성해야 합니다"
+        );
+
+        assert!(passes(layer.resolve_outcome(&a_query("b.example.com"))));
+        assert_eq!(
+            tree.take_asked(),
+            asked(&[("b.example.com", RecordType::A)]),
+            "서명 없는 위임 아래 이름인데 체인을 다시 구성했습니다"
+        );
+
+        assert!(passes(layer.resolve_outcome(&a_query("www.other.com"))));
+        assert_eq!(
+            tree.take_asked(),
+            asked(&[
+                ("www.other.com", RecordType::A),
+                ("other.com", RecordType::DS)
+            ]),
+            "루트와 com 키를 다시 받았습니다"
+        );
+    }
+
+    #[test]
+    /// Resuming from a cached signed zone must still find the answer stripped.
+    fn a_resumed_walk_still_blocks_a_stripped_answer() {
+        let tree = SignedTree::new();
+        let layer = tree.layer();
+        let blocked = |outcome: ResolveOutcome| {
+            matches!(outcome, ResolveOutcome::Failure(ResolveFailure::Permanent(Some(code)))
+                if code == onetdns_proto::ede_code::DNSSEC_BOGUS)
+        };
+
+        assert!(
+            blocked(layer.resolve_outcome(&a_query("www.signed.com"))),
+            "서명된 영역에서 서명이 떼인 답을 내보냈습니다"
+        );
+        assert_eq!(
+            tree.take_asked(),
+            asked(&[
+                ("www.signed.com", RecordType::A),
+                ("", RecordType::DNSKEY),
+                ("com", RecordType::DS),
+                ("com", RecordType::DNSKEY),
+                ("signed.com", RecordType::DS),
+                ("signed.com", RecordType::DNSKEY),
+                ("www.signed.com", RecordType::DS),
+            ])
+        );
+
+        assert!(
+            blocked(layer.resolve_outcome(&a_query("mail.signed.com"))),
+            "캐시에서 이어 간 체인이 서명이 떼인 답을 내보냈습니다"
+        );
+        assert_eq!(
+            tree.take_asked(),
+            asked(&[
+                ("mail.signed.com", RecordType::A),
+                ("mail.signed.com", RecordType::DS)
+            ]),
+            "signed.com 아래에서 체인을 이어 가지 않았습니다"
+        );
     }
 
     #[test]
