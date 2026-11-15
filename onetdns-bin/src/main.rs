@@ -1410,6 +1410,8 @@ pub fn serve(
     )));
 
     let cache_slot: Arc<Mutex<Option<cache::CacheHandle>>> = Arc::new(Mutex::new(None));
+    let query_handler: Arc<std::sync::OnceLock<std::sync::Weak<native::NativeServer>>> =
+        Arc::default();
 
     let config_prev = shared.previous_config_text.clone();
     let applied_config_text = shared.applied_config_text.clone();
@@ -1467,6 +1469,7 @@ pub fn serve(
         dhcp6_slot: dhcp6_slot.clone(),
         vendor_db: vendor_db.clone(),
         cache_slot: cache_slot.clone(),
+        query_handler: query_handler.clone(),
         forward_stats: forward_stats.clone(),
         listener_reg: listener_reg.clone(),
         tls_slot_handle: tls_slot_handle.clone(),
@@ -1527,6 +1530,7 @@ pub fn serve(
         threads: service_cleanup.tracker(),
     })?;
     *native_hot_state.lock_recover() = Some(native_state);
+    let _ = query_handler.set(Arc::downgrade(&native_handler));
 
     let listeners = Arc::new(ListenerSet::default());
     install_restart(
@@ -1911,13 +1915,14 @@ fn query(name: String, qtype: Option<String>) -> BoxResult<()> {
     Ok(())
 }
 
-/// Sends a real query to this server's first plain listen address, so the answer passes access
-/// control, filters, cache and backends, as a client would get it; explain only describes the
-/// decision. Returns JSON with the rcode and answers, or an error message. `timeout` bounds one
-/// round trip.
+/// Runs one query through this server's query handler, so the answer passes access control,
+/// filters, cache and backends as a client of the first plain listen address would get it;
+/// explain only describes the decision. It stays in process because software that intercepts
+/// port 53, such as a VPN, also catches this server's queries to itself. Returns JSON with the
+/// rcode and answers, or an error message.
 fn resolve_probe(
+    handler: &native::NativeServer,
     listeners: &[SocketAddr],
-    timeout: Duration,
     body: &str,
 ) -> Result<String, String> {
     let esc = onetdns_core::json::escape;
@@ -1942,8 +1947,7 @@ fn resolve_probe(
             .ok_or("Unknown query type")?,
     );
 
-    // 0.0.0.0 and :: mean every address and cannot be a destination; use loopback on the same
-    // port.
+    // 0.0.0.0 and :: mean every address; a local client reaches them through loopback.
     let target = listeners
         .first()
         .map(|addr| match addr.ip() {
@@ -1962,9 +1966,22 @@ fn resolve_probe(
         name,
         qtype,
     );
+    let wire = request
+        .try_encode()
+        .map_err(|_| "Could not encode the query".to_string())?;
+    // A query this host sends to its own address arrives from that address. A stream transport
+    // never truncates the answer.
+    let ctx = onetdns_runtime::RequestCtx {
+        src: SocketAddr::new(target.ip(), 0),
+        transport: onetdns_runtime::Transport::Do53Tcp,
+        raw: Some(&wire),
+        client_id: None,
+        authenticated: false,
+        auth_identity: None,
+    };
     let started = std::time::Instant::now();
-    let response = onetdns_forward::query_server(target, &request, timeout)
-        .map_err(|error| format!("Could not query this server: {error}"))?;
+    let response = onetdns_runtime::Handler::handle(handler, &request, &ctx)
+        .ok_or("This server dropped the query without answering")?;
     let elapsed_ms = started.elapsed().as_millis();
 
     let record_json = |record: &onetdns_proto::Record| {
@@ -2603,6 +2620,79 @@ mod tests {
     use crate::secondary::spawn_secondary_refresh_with_timeout;
     use crate::tls_material::native_tls_material;
     use std::net::UdpSocket;
+
+    /// Blocks `blocked.test` and has no upstream, so every answer comes from the handler itself.
+    fn probe_handler(acl: onetdns_security::IpAcl) -> native::NativeServer {
+        let engine = onetdns_filter::build_from_str(
+            "||blocked.test^\n",
+            "",
+            onetdns_core::BlockResponse::NxDomain,
+        );
+        native::NativeServer::new(
+            Arc::new(SharedFilter::from_pointee(engine)),
+            Arc::new(acl),
+            vec![],
+            Arc::new(native::NativeBackend::Forward(
+                onetdns_forward::Forwarder::new(vec![], Duration::from_secs(1)),
+            )),
+            60,
+        )
+    }
+
+    fn probe_field(body: &str, key: &str) -> Option<String> {
+        let json = onetdns_core::json::parse(body).ok()?;
+        json.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    }
+
+    #[test]
+    /// Nothing listens on the listen address, so only an answer that stays in the process passes.
+    fn resolve_probe_answers_without_a_network_round_trip() {
+        let idle = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let handler = probe_handler(onetdns_security::IpAcl::allow_all());
+        let body = resolve_probe(&handler, &[idle], r#"{"qname":"blocked.test"}"#)
+            .expect("확인 질의가 실패했습니다");
+        assert_eq!(
+            probe_field(&body, "rcode").as_deref(),
+            Some("NXDOMAIN"),
+            "{body}"
+        );
+        assert_eq!(
+            probe_field(&body, "server"),
+            Some(idle.to_string()),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn resolve_probe_goes_through_access_control() {
+        let idle = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let refusing = probe_handler(onetdns_security::IpAcl::new(
+            vec![],
+            vec!["127.0.0.0/8".parse().unwrap()],
+            true,
+        ));
+        let body = resolve_probe(&refusing, &[idle], r#"{"qname":"blocked.test"}"#)
+            .expect("거부도 응답이어야 합니다");
+        assert_eq!(
+            probe_field(&body, "rcode").as_deref(),
+            Some("REFUSED"),
+            "{body}"
+        );
+
+        let dropping = probe_handler(
+            onetdns_security::IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]),
+        );
+        assert!(
+            resolve_probe(&dropping, &[idle], r#"{"qname":"blocked.test"}"#).is_err(),
+            "버리는 주소에서 온 확인 질의가 답을 받았습니다"
+        );
+    }
 
     #[test]
     /// Clients pin a self-signed certificate; if transports differed, a certificate taken from one
@@ -3248,6 +3338,8 @@ mod tests {
 
         let explained = control_request(control, "POST", "/v1/explain", "{\"qname\":\"old.test\"}");
         assert!(explained.contains("\"filter\":\"block"), "{explained}");
+        let resolved = control_request(control, "POST", "/v1/resolve", "{\"qname\":\"old.test\"}");
+        assert!(resolved.contains("\"rcode\":\"NXDOMAIN\""), "{resolved}");
         let explained = control_request(control, "POST", "/v1/explain", "{\"qname\":\"new.test\"}");
         assert!(explained.starts_with("HTTP/1.1 200"), "{explained}");
         assert!(!explained.contains("\"filter\":\"block"), "{explained}");

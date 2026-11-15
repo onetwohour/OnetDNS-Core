@@ -46,6 +46,8 @@ pub(crate) struct ControlDeps {
     pub(crate) vendor_db: Arc<ArcSwap<mac::VendorDb>>,
     /// `None` until the chain is built.
     pub(crate) cache_slot: Arc<Mutex<Option<cache::CacheHandle>>>,
+    /// Set once the query handler is built. Weak, so it does not outlive this generation.
+    pub(crate) query_handler: Arc<std::sync::OnceLock<std::sync::Weak<native::NativeServer>>>,
     /// `None` while not forwarding.
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     pub(crate) listener_reg: Arc<Mutex<Vec<(&'static str, String, String)>>>,

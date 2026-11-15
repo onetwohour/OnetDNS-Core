@@ -1,6 +1,4 @@
-/*!
- * @brief 관리 API: 실행 중인 서버의 상태를 보고 다룬다.
- */
+//! Management API handlers that read and act on the running server.
 
 use super::*;
 use crate::cluster::{
@@ -11,7 +9,6 @@ use crate::query_explain::{backend_label, explain_query, simulate_policy};
 use std::sync::atomic::Ordering;
 
 impl ControlDeps {
-    /** @brief 담아 둔 응답을 모두 비운다. */
     pub(super) fn cache_flush(&self) -> String {
         let n = self
             .cache_slot
@@ -27,19 +24,19 @@ impl ControlDeps {
         format!("{{\"flushed\":{n}}}")
     }
 
-    /** @brief 이 질의가 정책에서 어떻게 판정될지 실제로 묻지 않고 보여 준다. */
     pub(super) fn policy_simulate(&self, body: &str) -> String {
         simulate_policy(&self.policy_engine.load(), &self.filters.filter, body)
     }
 
-    /** @brief 이름 하나를 이 서버의 수신 주소에 실제로 물어본다. */
     pub(super) fn resolve_probe(&self, body: &str) -> Result<String, String> {
-        let current = self.runtime_cfg.load();
-        let timeout = Duration::from_secs(current.query_timeout_secs.clamp(1, 10));
-        resolve_probe(&current.listen, timeout, body)
+        let handler = self
+            .query_handler
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or("This server is not answering queries right now")?;
+        resolve_probe(&handler, &self.runtime_cfg.load().listen, body)
     }
 
-    /** @brief 이 질의가 어떻게 처리될지 단계마다 설명한다. */
     pub(super) fn explain(&self, body: &str) -> String {
         explain_query(
             &self.policy_engine.load(),
@@ -50,7 +47,6 @@ impl ControlDeps {
         )
     }
 
-    /** @brief 이 노드와 클러스터 동료들의 상태. */
     pub(super) fn cluster_status(&self) -> String {
         let current = self.runtime_cfg.load();
         let backend = backend_label(current.backend);
@@ -64,7 +60,6 @@ impl ControlDeps {
         with_raft_identity(&status, &current)
     }
 
-    /** @brief 지금 열려 있는 수신 주소. */
     pub(super) fn listeners_status(&self) -> String {
         use onetdns_core::MutexExt;
         let esc = onetdns_core::json::escape;
@@ -84,19 +79,17 @@ impl ControlDeps {
         format!("[{}]", items.join(","))
     }
 
-    /** @brief 오래 걸리는 작업 목록. */
     pub(super) fn jobs_list(&self) -> String {
         self.jobs.list_json()
     }
 
-    /** @brief 이 작업의 진행 상황. */
     pub(super) fn job_get(&self, id: u64) -> Result<String, String> {
         self.jobs
             .get_json(id)
             .ok_or_else(|| format!("Job not found: {id}"))
     }
 
-    /** @brief 목록 갱신 작업을 띄운다. */
+    /// Starts a background job that refreshes the subscribed lists.
     pub(super) fn job_refresh(&self) -> String {
         let Some(id) = self.jobs.create("refresh-lists") else {
             return "{\"error\":\"Too many jobs are running\",\"busy\":true}".to_string();
@@ -126,7 +119,6 @@ impl ControlDeps {
         }
     }
 
-    /** @brief 정책 플러그인마다의 지표. */
     pub(super) fn plugins_metrics(&self) -> String {
         let items: Vec<String> = self
             .policy_engine
@@ -149,7 +141,6 @@ impl ControlDeps {
     }
 }
 
-/** @brief 클러스터에 설정 변경을 제안한다. */
 pub(super) fn cluster_propose(body: &str) -> Result<String, String> {
     match raft_handle() {
         Some(h) => {
@@ -164,7 +155,7 @@ pub(super) fn cluster_propose(body: &str) -> Result<String, String> {
     }
 }
 
-/** @brief 데이터 경로가 따로 내보내는 지표. */
+/// Metrics the data path keeps outside the control plane's counters.
 pub(super) fn metrics_extra() -> String {
     let mut s = String::new();
     let failures = transport_observe::snapshot();
