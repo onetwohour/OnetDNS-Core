@@ -58,6 +58,7 @@ impl RestartPolicy {
 mod linux {
     use super::{RestartDecision, RestartPolicy, MAX_STARTUP_FAILURES};
     use crate::error::{BoxResult, Context};
+    use crate::tui::ChildConsole;
     use crate::update::launch::UPDATE_EXIT_CODE;
     use crate::update::trial::{Startup, Trial};
     use onetdns_config::Config;
@@ -258,7 +259,7 @@ mod linux {
         }
     }
 
-    fn terminate_child(child: &mut Child) {
+    fn terminate_child(child: &mut Child, console: Option<&ChildConsole>) {
         signal_child(child, libc::SIGTERM);
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {
@@ -274,8 +275,15 @@ mod linux {
         if let Err(error) = child.kill() {
             onetdns_core::warn!(event = "supervisor.child_kill_failed", pid = child.id(), %error, "Could not kill the child process; a process holding the ports may be left behind");
         }
-        if let Err(error) = child.wait() {
-            onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.id(), %error, "Could not reap the exited child process");
+        match child.wait() {
+            Ok(status) => {
+                if let Some(console) = console {
+                    console.child_exited(status);
+                }
+            }
+            Err(error) => {
+                onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.id(), %error, "Could not reap the exited child process");
+            }
         }
     }
 
@@ -339,6 +347,8 @@ mod linux {
             .with_context(|| "Could not make the supervisor process non-dumpable")?;
 
         let stop: Arc<AtomicBool> = crate::install_shutdown_handler();
+        let console = ChildConsole::capture();
+        let console = console.as_ref();
         let mut policy = RestartPolicy::default();
         let mut restarts = 0u64;
         let mut parent_privileges_dropped = run_as.is_none();
@@ -357,7 +367,7 @@ mod linux {
 
             let status = loop {
                 if stop.load(Ordering::Acquire) {
-                    terminate_child(&mut child.process);
+                    terminate_child(&mut child.process, console);
                     return Ok(());
                 }
                 if child.poll_ready()? {
@@ -368,7 +378,7 @@ mod linux {
                         let (user, group) = run_as.as_ref().expect("run_as is set");
                         if let Err(error) = crate::privdrop::drop_privileges(user, group.as_deref())
                         {
-                            terminate_child(&mut child.process);
+                            terminate_child(&mut child.process, console);
                             return Err(crate::anyhow!(format!(
                                 "Stopping the service because the supervisor could not drop privileges: {error}"
                             )));
@@ -376,7 +386,7 @@ mod linux {
                         if let Err(error) =
                             crate::privdrop::executable_still_runnable(Path::new(SELF_IMAGE))
                         {
-                            terminate_child(&mut child.process);
+                            terminate_child(&mut child.process, console);
                             return Err(crate::anyhow!(format!(
                                 "Stopping the service because {user} cannot run {} to restart the DNS service process: {error}",
                                 program.display()
@@ -393,7 +403,7 @@ mod linux {
                 if trial.as_ref().is_some_and(Trial::expired)
                     && trial.take().is_some_and(Trial::revert_expired)
                 {
-                    terminate_child(&mut child.process);
+                    terminate_child(&mut child.process, console);
                     return Err(crate::anyhow!(exec_install_path()));
                 }
                 match child.process.try_wait()? {
@@ -401,6 +411,9 @@ mod linux {
                     None => std::thread::sleep(POLL_INTERVAL),
                 }
             };
+            if let Some(console) = console {
+                console.child_exited(status);
+            }
 
             if stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -488,6 +501,7 @@ mod linux {
         .ok_or_else(|| crate::anyhow!("The supervisor readiness token is malformed"))?;
         Ok(Some(Box::new(move || {
             if let Err(error) = signal_readiness(address, token) {
+                crate::tui::leave();
                 onetdns_core::error!(event = "supervisor.ready_signal_failed", %error, "Could not send the service ready signal; aborting startup");
                 std::process::exit(1);
             }

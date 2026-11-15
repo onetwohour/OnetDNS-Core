@@ -47,12 +47,16 @@ pub fn install_request_panic_hook() {
     INSTALL_HOOK.call_once(|| {
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let contained = REQUEST_DEPTH.with(|depth| depth.get() != 0);
-            if !contained {
+            if !panic_is_contained() {
                 original(info);
             }
         }));
     });
+}
+
+/// True on a thread inside a request boundary, where `catch_request` reports the panic.
+pub fn panic_is_contained() -> bool {
+    REQUEST_DEPTH.with(|depth| depth.get() != 0)
 }
 
 /// Runs a request handler and contains its panic. The unit differs by transport: a packet or task

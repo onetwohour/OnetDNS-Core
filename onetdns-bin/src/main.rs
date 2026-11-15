@@ -98,6 +98,8 @@ mod tftp;
 mod tls_material;
 /// Per-transport metrics.
 mod transport_observe;
+/// Full-screen console for `run` in a terminal.
+mod tui;
 /// Release checks, binary swap, trial run and rollback.
 mod update;
 /// Resolving upstream addresses.
@@ -575,6 +577,7 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     update::launch::register(stop.clone());
 
     let shared = ServeShared::default();
+    let _console = tui::start(shared.metrics.clone(), shared.console.clone(), stop.clone());
     let ready_callback = Arc::new(Mutex::new(supervisor::take_ready_callback()?));
     let mut recovery_error: Option<String> = None;
     loop {
@@ -701,20 +704,18 @@ fn apply_web_defaults(cfg: &mut Config, no_web: bool, config_path: Option<&std::
         }
     }
     // Whoever wrote the token into the config already knows it, so only the address is shown.
-    println!();
-    println!("  Dashboard: http://{addr}/");
+    let mut banner = vec![format!("Dashboard: http://{addr}/")];
     if auto_token {
-        println!("  Token: {}", cfg.control_token.as_str());
-        if persisted {
-            println!(
-                "  The token is saved in the configuration file, so it stays the same next time."
-            );
+        banner.push(format!("Token: {}", cfg.control_token.as_str()));
+        banner.push(if persisted {
+            "The token is saved in the configuration file, so it stays the same next time."
+                .to_string()
         } else {
-            println!("  This token is for this run only. To keep it, set control_token in the configuration file.");
-        }
-        println!("  Pass --no-web to run DNS without the dashboard.");
+            "This token is for this run only. To keep it, set control_token in the configuration file.".to_string()
+        });
+        banner.push("Pass --no-web to run DNS without the dashboard.".to_string());
     }
-    println!();
+    tui::print_block(&banner);
 }
 
 /// Writes a generated control token into the config file.
@@ -983,8 +984,10 @@ pub struct ServeShared {
     /// 1, so the dashboard would read another job's result.
     jobs: Arc<JobRegistry>,
 
-    metrics: Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>,
+    metrics: tui::MetricsSlot,
     audit: Arc<Mutex<Option<onetdns_control::AuditLog>>>,
+    /// What the console shows of the running generation.
+    console: tui::GenerationSlot,
 
     /// Last config text that started.
     applied_config_text: ConfigTextSlot,
@@ -1247,9 +1250,10 @@ pub fn serve(
             "Running with user and group privileges dropped and further privilege gain blocked"
         );
     }
-    // The deadline thread also starts after privileges are dropped; it execs when the deadline
-    // passes.
+    // The deadline and console threads also start after privileges are dropped; the deadline
+    // thread execs when the deadline passes.
     update::trial::start_deadline_timer();
+    tui::start_drawing();
 
     let restarts = RestartHooks::default();
     // Certificates live in a swappable slot: a new certificate applies from the next connection
@@ -1271,6 +1275,11 @@ pub fn serve(
 
     let forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>> =
         Arc::new(Mutex::new(None));
+    *shared.console.lock_recover() = Some(tui::Generation {
+        cfg: runtime_cfg.clone(),
+        listeners: listener_reg.clone(),
+        upstreams: forward_stats.clone(),
+    });
     let forward_slot = if backend_uses_forward(cfg.backend) {
         let (resolver, stats) =
             build_forward_backend(&cfg).map_err(|error| crate::anyhow!(error))?;

@@ -112,6 +112,7 @@ pub(crate) fn restart_requested() -> bool {
 pub(crate) fn exec_installed(install: &Install) -> std::io::Error {
     use std::os::unix::process::CommandExt;
 
+    crate::tui::leave();
     let mut args = std::env::args_os();
     let argv0 = args
         .next()
@@ -126,6 +127,7 @@ pub(crate) fn exec_installed(install: &Install) -> std::io::Error {
 /// the stop flag, so this does not wait for a clean shutdown. A Windows console cannot start it, so
 /// this asks for a restart and exits.
 pub(crate) fn start_reverted() -> ! {
+    crate::tui::leave();
     #[cfg(windows)]
     if SERVER.get().is_some_and(|server| server.service) {
         crate::service::exit_for_update();
@@ -155,6 +157,7 @@ pub(crate) fn start_reverted() -> ! {
 ///
 /// Returns only when neither could start, with the reason.
 pub(crate) fn start_installed() -> String {
+    crate::tui::leave();
     if super::install::supervised_child() {
         std::process::exit(UPDATE_EXIT_CODE);
     }

@@ -1,4 +1,4 @@
-//! Local time for policy schedules, which are in local time. Conversion differs per platform.
+//! Local time for policy schedules and the console. Conversion differs per platform.
 //!
 //! Falls back to UTC when conversion fails: a schedule slightly off beats one that never runs.
 
@@ -77,20 +77,29 @@ fn utc_parts(seconds: u64) -> (u8, u16) {
     (weekday, minute)
 }
 
+/// Hour, minute and second, falling back to UTC.
+pub fn local_clock(now: SystemTime) -> (u8, u8, u8) {
+    let seconds = unix_seconds(now);
+    match local_tm(seconds) {
+        Some(local) if (0..=60).contains(&local.tm_sec) => (
+            local.tm_hour as u8,
+            local.tm_min as u8,
+            local.tm_sec.min(59) as u8,
+        ),
+        _ => {
+            let of_day = seconds % 86_400;
+            (
+                (of_day / 3600) as u8,
+                (of_day % 3600 / 60) as u8,
+                (of_day % 60) as u8,
+            )
+        }
+    }
+}
+
 fn local_weekday_minute_from_unix(seconds: u64) -> Option<(u8, u16)> {
-    let time: LocalTimeT = seconds.try_into().ok()?;
-    let mut local: LocalTm = unsafe { std::mem::zeroed() };
-    #[cfg(unix)]
-    let ok = unsafe { !libc::localtime_r(&time, &mut local).is_null() };
-    #[cfg(windows)]
-    let ok = unsafe { localtime64_s(&mut local, &time) == 0 };
-    #[cfg(not(any(unix, windows)))]
-    let ok = false;
-    if !ok
-        || !(0..=6).contains(&local.tm_wday)
-        || !(0..=23).contains(&local.tm_hour)
-        || !(0..=59).contains(&local.tm_min)
-    {
+    let local = local_tm(seconds)?;
+    if !(0..=6).contains(&local.tm_wday) {
         return None;
     }
     Some((
@@ -99,9 +108,30 @@ fn local_weekday_minute_from_unix(seconds: u64) -> Option<(u8, u16)> {
     ))
 }
 
+/// `None` when conversion fails or the hour or minute is out of range.
+fn local_tm(seconds: u64) -> Option<LocalTm> {
+    let time: LocalTimeT = seconds.try_into().ok()?;
+    let mut local: LocalTm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let ok = unsafe { !libc::localtime_r(&time, &mut local).is_null() };
+    #[cfg(windows)]
+    let ok = unsafe { localtime64_s(&mut local, &time) == 0 };
+    #[cfg(not(any(unix, windows)))]
+    let ok = false;
+    (ok && (0..=23).contains(&local.tm_hour) && (0..=59).contains(&local.tm_min)).then_some(local)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_time_is_in_range() {
+        for when in [UNIX_EPOCH, SystemTime::now()] {
+            let (hour, minute, second) = local_clock(when);
+            assert!(hour < 24 && minute < 60 && second < 60);
+        }
+    }
 
     #[test]
     fn policy_time_stays_in_one_week() {

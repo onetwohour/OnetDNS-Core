@@ -4,9 +4,10 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{PoisonError, RwLock};
 
 /// Lower is more severe; threshold checks rely on this order.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Error = 0,
     Warn = 1,
@@ -16,7 +17,7 @@ pub enum Level {
 }
 
 impl Level {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Level::Error => "ERROR",
             Level::Warn => "WARN",
@@ -56,6 +57,29 @@ static THRESHOLD: AtomicU8 = AtomicU8::new(Level::Info as u8);
 /// 0 for one human-readable line, 1 for JSON Lines.
 static FORMAT: AtomicU8 = AtomicU8::new(0);
 
+/// A text-format line handed to a sink in place of stderr.
+pub struct Record<'a> {
+    pub level: Level,
+    pub timestamp: &'a str,
+    pub event: &'a str,
+    pub message: &'a str,
+    pub fields: &'a str,
+}
+
+pub type Sink = Box<dyn Fn(&Record<'_>) + Send + Sync>;
+
+static SINK: RwLock<Option<Sink>> = RwLock::new(None);
+
+/// Text-format lines go to `sink` instead of stderr until it is cleared with `None`. JSON lines
+/// always go to stderr. The sink must not log.
+pub fn set_sink(sink: Option<Sink>) {
+    *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
+}
+
+pub fn json_format() -> bool {
+    FORMAT.load(Ordering::Relaxed) == 1
+}
+
 /// `ONETDNS_LOG` sets the level and `ONETDNS_LOG_FORMAT=json` (or `jsonl`) the format. Unknown
 /// values fall back to the defaults so a typo does not stop startup.
 pub fn init_from_env() {
@@ -90,7 +114,21 @@ pub fn set_level_str(s: &str) {
         "trace" => Level::Trace,
         _ => return,
     };
-    THRESHOLD.store(lvl as u8, Ordering::Relaxed);
+    set_level(lvl);
+}
+
+pub fn set_level(level: Level) {
+    THRESHOLD.store(level as u8, Ordering::Relaxed);
+}
+
+pub fn level() -> Level {
+    match THRESHOLD.load(Ordering::Relaxed) {
+        0 => Level::Error,
+        1 => Level::Warn,
+        2 => Level::Info,
+        3 => Level::Debug,
+        _ => Level::Trace,
+    }
 }
 
 /// Checked before any argument is formatted, so a disabled level costs nothing.
@@ -115,12 +153,24 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
     let matched_event = event_code(body);
     let event = matched_event.unwrap_or(&fallback_event);
     let pid = std::process::id();
-    let json = FORMAT.load(Ordering::Relaxed) == 1;
+    let json = json_format();
 
     let (raw_fields, message) = split_body(body);
     let fields = strip_event(raw_fields, matched_event);
     let fields = fields.as_ref();
 
+    if !json {
+        if let Some(sink) = SINK.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            sink(&Record {
+                level,
+                timestamp: &timestamp,
+                event,
+                message,
+                fields,
+            });
+            return;
+        }
+    }
     let mut out = std::io::stderr().lock();
     if json {
         let current = std::thread::current();
@@ -386,6 +436,36 @@ mod tests {
         assert_eq!(
             strip_event(fields, event_code(&body)).as_ref(),
             "path=C:\\Program Files\\onetdns\\a.pem"
+        );
+    }
+
+    #[test]
+    fn a_sink_takes_the_line_apart_until_it_is_cleared() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        super::set_sink(Some(Box::new(move |record| {
+            sink_seen.lock().unwrap().push((
+                record.level,
+                record.event.to_string(),
+                record.message.to_string(),
+                record.fields.to_string(),
+            ));
+        })));
+        let body = format!("event=sink.test path=/x{MESSAGE_SEPARATOR}Read the file");
+        super::emit_with_context(Level::Warn, "onetdns_core::log", "log.rs", 1, &body);
+        super::set_sink(None);
+        super::emit_with_context(Level::Warn, "onetdns_core::log", "log.rs", 1, &body);
+        let seen = seen.lock().unwrap();
+        let ours: Vec<_> = seen.iter().filter(|line| line.1 == "sink.test").collect();
+        assert_eq!(
+            ours,
+            [&(
+                Level::Warn,
+                "sink.test".to_string(),
+                "Read the file".to_string(),
+                "path=/x".to_string()
+            )]
         );
     }
 
