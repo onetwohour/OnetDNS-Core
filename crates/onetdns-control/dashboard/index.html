@@ -589,7 +589,6 @@
             <input data-k="setupHost" value="{{ forms.setupHost }}" onInput="{{ onForm }}" aria-label="인증서 호스트명" placeholder="인증서 호스트명" style="flex:1 1 170px;min-width:0;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
             <button data-enter-submit="" onClick="{{ makeStamps }}" style="padding:7px 14px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer">스탬프 만들기</button>
           </div>
-          <div style="padding:0 20px 12px;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">주소를 비우면 일반 DNS와 DNSCrypt 스탬프는 만들지 않습니다. 호스트명을 비우면 인증서에 든 이름을 씁니다.</div>
           <sc-if value="{{ clientSetup.notice }}"><div style="padding:10px 20px;font-size:11.5px;color:var(--fg2);border-bottom:1px solid var(--border)">{{ clientSetup.notice }}</div></sc-if>
           <sc-for list="{{ clientSetup.rows }}" as="s" hint-placeholder-count="3">
             <div style="display:flex;align-items:center;gap:12px;padding:11px 20px;border-bottom:1px solid var(--border)">
@@ -599,7 +598,7 @@
             </div>
           </sc-for>
           <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px">
-            <input data-k="setupSsids" value="{{ forms.setupSsids }}" onInput="{{ onForm }}" aria-label="프로필을 쓸 Wi-Fi 이름" placeholder="Wi-Fi 이름, 쉼표로 구분 (비우면 어디서나)" style="flex:1 1 220px;min-width:0;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
+            <input data-k="setupSsids" value="{{ forms.setupSsids }}" onInput="{{ onForm }}" aria-label="프로필을 쓸 Wi-Fi 이름" placeholder="Wi-Fi 이름(쉼표로 구분)" style="flex:1 1 220px;min-width:0;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
             <button onClick="{{ appleProfileDoh }}" style="padding:7px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">Apple 프로필 · DoH</button>
             <button onClick="{{ appleProfileDot }}" style="padding:7px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">Apple 프로필 · DoT</button>
           </div>
@@ -4647,9 +4646,8 @@ Object.assign(I18N.en, {
   "클라이언트가 접속할 IP 주소":"IP address clients connect to",
   "인증서 호스트명":"Certificate hostname",
   "스탬프 만들기":"Make stamps",
-  "주소를 비우면 일반 DNS와 DNSCrypt 스탬프는 만들지 않습니다. 호스트명을 비우면 인증서에 든 이름을 씁니다.":"Without an address, no plain DNS or DNSCrypt stamps are made. Without a hostname, the name in the certificate is used.",
   "프로필을 쓸 Wi-Fi 이름":"Wi-Fi networks that use the profile",
-  "Wi-Fi 이름, 쉼표로 구분 (비우면 어디서나)":"Wi-Fi names, comma-separated (empty: everywhere)",
+  "Wi-Fi 이름(쉼표로 구분)":"Wi-Fi names (comma-separated)",
   "Apple 프로필 · DoH":"Apple profile · DoH",
   "Apple 프로필 · DoT":"Apple profile · DoT",
   "스탬프를 만들지 못했습니다: {error}":"Could not make stamps: {error}",
@@ -4659,18 +4657,16 @@ Object.assign(I18N.en, {
   "프로필 파일을 저장하지 못했습니다":"Could not save the profile file",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"Profile downloaded. Install it on the device in Settings > General > VPN & Device Management.",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치한 뒤, 설정 > 일반 > 정보 > 인증서 신뢰 설정에서 이 인증서를 켜세요.":"Profile downloaded. Install it on the device in Settings > General > VPN & Device Management, then turn on its certificate in Settings > General > About > Certificate Trust Settings.",
-  "열린 리스너로 만들 수 있는 스탬프가 없습니다":"No stamp can be made for the open listeners",
-  "tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.":"The tls_self_signed_host certificate changes at every start. After a restart, make the DoH, DoT, and DoQ stamps again.",
-  "이 컴퓨터가 신뢰하지 않는 인증서라서 DoH, DoT, DoQ 스탬프에 인증서 해시를 넣었습니다.":"This computer does not trust the certificate, so the DoH, DoT, and DoQ stamps carry its hash."
+  "만들 수 있는 스탬프가 없습니다":"No stamps available",
+  "tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.":"The tls_self_signed_host certificate changes at every start. After a restart, make the DoH, DoT, and DoQ stamps again."
 });
 Object.assign(I18N.ja, {
   "클라이언트 접속 정보":"クライアント接続情報",
   "클라이언트가 접속할 IP 주소":"クライアントが接続する IP アドレス",
   "인증서 호스트명":"証明書のホスト名",
   "스탬프 만들기":"スタンプを作成",
-  "주소를 비우면 일반 DNS와 DNSCrypt 스탬프는 만들지 않습니다. 호스트명을 비우면 인증서에 든 이름을 씁니다.":"アドレスが空なら、通常の DNS と DNSCrypt のスタンプは作りません。ホスト名が空なら、証明書にある名前を使います。",
   "프로필을 쓸 Wi-Fi 이름":"プロファイルを使う Wi-Fi 名",
-  "Wi-Fi 이름, 쉼표로 구분 (비우면 어디서나)":"Wi-Fi 名、カンマ区切り (空ならどこでも)",
+  "Wi-Fi 이름(쉼표로 구분)":"Wi-Fi 名（カンマ区切り）",
   "Apple 프로필 · DoH":"Apple プロファイル · DoH",
   "Apple 프로필 · DoT":"Apple プロファイル · DoT",
   "스탬프를 만들지 못했습니다: {error}":"スタンプを作成できませんでした: {error}",
@@ -4680,9 +4676,8 @@ Object.assign(I18N.ja, {
   "프로필 파일을 저장하지 못했습니다":"プロファイルを保存できませんでした",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"プロファイルをダウンロードしました。デバイスの「設定 > 一般 > VPNとデバイス管理」でインストールしてください。",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치한 뒤, 설정 > 일반 > 정보 > 인증서 신뢰 설정에서 이 인증서를 켜세요.":"プロファイルをダウンロードしました。デバイスの「設定 > 一般 > VPNとデバイス管理」でインストールしたあと、「設定 > 一般 > 情報 > 証明書信頼設定」でこの証明書をオンにしてください。",
-  "열린 리스너로 만들 수 있는 스탬프가 없습니다":"開いているリスナーから作れるスタンプはありません",
+  "만들 수 있는 스탬프가 없습니다":"作れるスタンプがありません",
   "tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.":"tls_self_signed_host の証明書は起動のたびに変わります。再起動したら DoH、DoT、DoQ のスタンプを作り直してください。",
-  "이 컴퓨터가 신뢰하지 않는 인증서라서 DoH, DoT, DoQ 스탬프에 인증서 해시를 넣었습니다.":"このコンピューターが信頼していない証明書なので、DoH、DoT、DoQ のスタンプに証明書のハッシュを入れました。",
   "Invalid IP address: ":"IP アドレスの形式が正しくありません: ",
   "The served certificate does not cover this name: ":"提供中の証明書に含まれない名前です: ",
   "Could not parse the served certificate: ":"提供中の証明書を解析できませんでした: ",
@@ -4707,9 +4702,8 @@ Object.assign(I18N.zh, {
   "클라이언트가 접속할 IP 주소":"客户端连接的 IP 地址",
   "인증서 호스트명":"证书主机名",
   "스탬프 만들기":"生成 Stamp",
-  "주소를 비우면 일반 DNS와 DNSCrypt 스탬프는 만들지 않습니다. 호스트명을 비우면 인증서에 든 이름을 씁니다.":"地址留空时不生成普通 DNS 和 DNSCrypt Stamp。主机名留空时使用证书中的名称。",
   "프로필을 쓸 Wi-Fi 이름":"使用描述文件的 Wi-Fi 名称",
-  "Wi-Fi 이름, 쉼표로 구분 (비우면 어디서나)":"Wi-Fi 名称，以逗号分隔（留空则在任何网络使用）",
+  "Wi-Fi 이름(쉼표로 구분)":"Wi-Fi 名称（用逗号分隔）",
   "Apple 프로필 · DoH":"Apple 描述文件 · DoH",
   "Apple 프로필 · DoT":"Apple 描述文件 · DoT",
   "스탬프를 만들지 못했습니다: {error}":"无法生成 Stamp：{error}",
@@ -4719,9 +4713,8 @@ Object.assign(I18N.zh, {
   "프로필 파일을 저장하지 못했습니다":"无法保存描述文件",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"已下载描述文件。请在设备的“设置 > 通用 > VPN与设备管理”中安装。",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치한 뒤, 설정 > 일반 > 정보 > 인증서 신뢰 설정에서 이 인증서를 켜세요.":"已下载描述文件。请在设备的“设置 > 通用 > VPN与设备管理”中安装，然后在“设置 > 通用 > 关于本机 > 证书信任设置”中启用此证书。",
-  "열린 리스너로 만들 수 있는 스탬프가 없습니다":"当前打开的监听器无法生成 Stamp",
+  "만들 수 있는 스탬프가 없습니다":"没有可生成的 Stamp",
   "tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.":"tls_self_signed_host 证书每次启动都会改变。重启后需要重新生成 DoH、DoT、DoQ Stamp。",
-  "이 컴퓨터가 신뢰하지 않는 인증서라서 DoH, DoT, DoQ 스탬프에 인증서 해시를 넣었습니다.":"本机不信任该证书，因此 DoH、DoT、DoQ Stamp 中包含了证书哈希。",
   "Invalid IP address: ":"IP 地址格式不正确：",
   "The served certificate does not cover this name: ":"当前证书不包含此名称：",
   "Could not parse the served certificate: ":"无法解析当前证书：",
@@ -5730,9 +5723,8 @@ class Component extends DCLogic {
     const names={dns:'DNS',dnscrypt:'DNSCrypt',doh:'DoH',dot:'DoT',doq:'DoQ'};
     const rows=(Array.isArray(c.stamps)?c.stamps:[]).map(x=>{const name=names[x.protocol]||String(x.protocol);return {label:name+' :'+x.port,stamp:x.stamp,onCopy:()=>this.copyStamp(x.stamp),copyLabel:this.tr('{name} 스탬프 복사',{name})};});
     const cert=c.certificate;
-    const notice=!rows.length?this.t('열린 리스너로 만들 수 있는 스탬프가 없습니다')
-      :cert&&cert.changes_on_restart?this.t('tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.')
-      :cert&&!cert.trusted?this.t('이 컴퓨터가 신뢰하지 않는 인증서라서 DoH, DoT, DoQ 스탬프에 인증서 해시를 넣었습니다.'):'';
+    const notice=!rows.length?this.t('만들 수 있는 스탬프가 없습니다')
+      :cert&&cert.changes_on_restart?this.t('tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.'):'';
     return {notice,rows};
   }
   async loadRuleState(){
