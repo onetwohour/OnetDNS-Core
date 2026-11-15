@@ -107,11 +107,15 @@ pub fn production_prefix(source: &str) -> &str {
     while let Some(at) = source[from..].find("#[cfg(test)]") {
         let start = from + at;
         let mut after = source[start + "#[cfg(test)]".len()..].trim_start();
-        while let Some(rest) = after.strip_prefix("/*") {
-            after = rest
-                .split_once("*/")
-                .map_or("", |(_, tail)| tail)
-                .trim_start();
+        loop {
+            let tail = if let Some(rest) = after.strip_prefix("//") {
+                rest.split_once('\n').map_or("", |(_, tail)| tail)
+            } else if let Some(rest) = after.strip_prefix("/*") {
+                rest.split_once("*/").map_or("", |(_, tail)| tail)
+            } else {
+                break;
+            };
+            after = tail.trim_start();
         }
         if after.starts_with("mod tests") {
             return &source[..start];

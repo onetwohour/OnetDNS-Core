@@ -209,6 +209,10 @@ fn the_parsing_helpers_behave() {
     let prefix = production_prefix(source);
     assert!(prefix.contains("보임") && !prefix.contains("안 보임"));
 
+    let documented = "let a = \"보임\";\n#[cfg(test)]\n/// 설명.\n// 메모.\nmod tests {\n    let b = \"안 보임\";\n}\n";
+    let prefix = production_prefix(documented);
+    assert!(prefix.contains("보임") && !prefix.contains("안 보임"));
+
     // cfg(test) on something that is not a test module does not cut.
     let other = "#[cfg(test)]\nfn helper() {}\nlet c = \"보임\";\n";
     assert!(production_prefix(other).contains("보임"));
