@@ -21,6 +21,29 @@ use crate::listeners::TlsSlots;
 use crate::zones::ZoneState;
 use onetdns_control::FilterApply;
 
+/// State-changing management requests go through here. A successor taking over may already have
+/// read the configuration, so they wait until the handoff ends.
+fn config_write(
+    method: &str,
+    path: &str,
+    body: &str,
+    dispatch: &mut dyn FnMut() -> onetdns_control::ApiResponse,
+) -> onetdns_control::ApiResponse {
+    if crate::supervisor::handing_over() {
+        return (
+            "409 Conflict",
+            "application/json",
+            format!(
+                "{{\"error\":{}}}",
+                onetdns_core::json::escape(
+                    "OnetDNS is switching to the new version. Try again in a moment"
+                )
+            ),
+        );
+    }
+    cluster_routed_write(method, path, body, dispatch)
+}
+
 /// The handles of this generation that the management API reads and changes.
 pub(crate) struct ControlDeps {
     pub(crate) zones: ZoneState,
@@ -155,7 +178,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         explain: bind!(deps.explain(body: &str)),
         cluster_status: bind!(deps.cluster_status()),
         cluster_propose: Box::new(runtime::cluster_propose),
-        cluster_write: Box::new(cluster_routed_write),
+        cluster_write: Box::new(config_write),
         listeners_status: bind!(deps.listeners_status()),
         net_adapters: Box::new(system::net_adapters),
         firewall_set: Box::new(system::firewall_set),

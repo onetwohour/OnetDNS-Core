@@ -136,12 +136,18 @@ impl ControlDeps {
         // Lets a cluster follower refuse before the download instead of after it.
         let check = {
             let _mutation = onetdns_control::api::control_mutation_lock().lock_recover();
-            cluster_routed_write("POST", SUBSCRIPTIONS_PATH, body, &mut || {
-                match ensure_not_subscribed(&self.filters.sub_urls.lock_recover(), &request.url) {
+            config_write(
+                "POST",
+                SUBSCRIPTIONS_PATH,
+                body,
+                &mut || match ensure_not_subscribed(
+                    &self.filters.sub_urls.lock_recover(),
+                    &request.url,
+                ) {
                     Ok(()) => json_response("{}"),
                     Err(error) => error_response("400 Bad Request", &error),
-                }
-            })
+                },
+            )
         };
         if !check.0.starts_with('2') {
             return check;
@@ -204,7 +210,7 @@ impl ControlDeps {
         // it started from, which would drop this list.
         let _refresh = self.filters.list_refresh_lock.lock_recover();
         let _mutation = onetdns_control::api::control_mutation_lock().lock_recover();
-        cluster_routed_write("POST", SUBSCRIPTIONS_PATH, body, &mut || match self
+        config_write("POST", SUBSCRIPTIONS_PATH, body, &mut || match self
             .save_subscription(request, fresh.clone())
         {
             Ok(()) => json_response("{\"added\":true}"),

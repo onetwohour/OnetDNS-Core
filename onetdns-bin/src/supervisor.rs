@@ -880,6 +880,8 @@ mod linux {
 
     /// Kept for the successor requests of the worker side.
     static LINKS: OnceLock<Arc<Links>> = OnceLock::new();
+    /// Set from a successor request until the supervisor says this process serves on.
+    static HANDING_OVER: AtomicBool = AtomicBool::new(false);
 
     /// Introduces this process to the supervisor that started it. A successor also takes the link
     /// to its predecessor into `links`. Blocks dumps and restores the process name, so call it
@@ -960,10 +962,17 @@ mod linux {
 
     /// Asks the supervisor to start the installed version beside this process.
     pub(crate) fn request_successor() -> Requested {
+        HANDING_OVER.store(true, Ordering::Release);
         let stream = match channel::request_successor() {
             Ok(Reply::Link(stream)) => stream,
-            Ok(Reply::Cancelled) => return Requested::Cancelled,
-            Ok(Reply::Fallback(reason)) | Err(reason) => return Requested::Unavailable(reason),
+            Ok(Reply::Cancelled) => {
+                HANDING_OVER.store(false, Ordering::Release);
+                return Requested::Cancelled;
+            }
+            Ok(Reply::Fallback(reason)) | Err(reason) => {
+                HANDING_OVER.store(false, Ordering::Release);
+                return Requested::Unavailable(reason);
+            }
         };
         if let Err(error) = wire::introduce(&stream, &onetdns_control::credential_key()) {
             onetdns_core::warn!(event = "handoff.introduce_failed", %error, "Could not introduce this process to the new version");
@@ -977,7 +986,16 @@ mod linux {
     /// After a handoff, whether this process ends. `handed` is how the handoff went here; the
     /// supervisor's verdict decides.
     pub fn settle(handed: bool, abort: &dyn Fn() -> bool) -> bool {
-        channel::settle(handed, abort)
+        let ends = channel::settle(handed, abort);
+        if !ends {
+            HANDING_OVER.store(false, Ordering::Release);
+        }
+        ends
+    }
+
+    /// While true, a successor may already have read the configuration.
+    pub fn handing_over() -> bool {
+        HANDING_OVER.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -996,7 +1014,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{join, run, settle};
+pub use linux::{handing_over, join, run, settle};
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{request_successor, Requested};
 
@@ -1008,6 +1026,11 @@ pub fn join(_links: &std::sync::Arc<crate::handoff::Links>) -> crate::error::Box
 #[cfg(not(target_os = "linux"))]
 pub fn settle(handed: bool, _abort: &dyn Fn() -> bool) -> bool {
     handed
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handing_over() -> bool {
+    false
 }
 
 #[cfg(test)]
