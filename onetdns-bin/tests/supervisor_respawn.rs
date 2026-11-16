@@ -606,18 +606,31 @@ struct Ports {
     dns: u16,
     dot: u16,
     doh: u16,
+    doq: u16,
+    doh3: u16,
     dnscrypt: u16,
     control: u16,
 }
 
-/// An install directory right after an update, serving Do53, DoT, DoH, DNSCrypt, and the
-/// management API, each on its own free port.
+/// What a lane may see while the processes trade sockets.
+#[derive(Clone, Copy, PartialEq)]
+enum Promise {
+    Answered,
+    /// QUIC connection state stays with the old process, so a query on a connection it closes can
+    /// fail; the client connects again.
+    Reconnects,
+}
+
+/// An install directory right after an update, serving every DNS transport and the management
+/// API, each on its own free port.
 struct Handoff {
     swapped: Swapped,
     config: PathBuf,
     ports: Ports,
     /// Trusts the server's self-signed certificate.
     trust: Arc<TrustStore>,
+    /// Kept to ask again once the load stops.
+    quic: Vec<(&'static str, Arc<Forwarder>)>,
 }
 
 impl Handoff {
@@ -650,6 +663,8 @@ impl Handoff {
             dns: free_port(),
             dot: free_port(),
             doh: free_port(),
+            doq: free_port(),
+            doh3: free_port(),
             dnscrypt: free_port(),
             control: free_port(),
         };
@@ -657,10 +672,12 @@ impl Handoff {
         std::fs::write(
             &config,
             format!(
-                "listen = [\"127.0.0.1:{}\"]\nlisten_dot = [\"127.0.0.1:{}\"]\nlisten_doh = [\"127.0.0.1:{}\"]\nlisten_dnscrypt = [\"127.0.0.1:{}\"]\ntls_cert = \"{}\"\ntls_key = \"{}\"\ncontrol_listen = \"127.0.0.1:{}\"\ncontrol_token = \"{CONTROL_TOKEN}\"\nrewrites = [{{ domain = \"{LOCAL_NAME}\", answer = \"192.0.2.1\" }}]\n",
+                "listen = [\"127.0.0.1:{}\"]\nlisten_dot = [\"127.0.0.1:{}\"]\nlisten_doh = [\"127.0.0.1:{}\"]\nlisten_doq = [\"127.0.0.1:{}\"]\nlisten_doh3 = [\"127.0.0.1:{}\"]\nlisten_dnscrypt = [\"127.0.0.1:{}\"]\ntls_cert = \"{}\"\ntls_key = \"{}\"\ncontrol_listen = \"127.0.0.1:{}\"\ncontrol_token = \"{CONTROL_TOKEN}\"\nrewrites = [{{ domain = \"{LOCAL_NAME}\", answer = \"192.0.2.1\" }}]\n",
                 ports.dns,
                 ports.dot,
                 ports.doh,
+                ports.doq,
+                ports.doh3,
                 ports.dnscrypt,
                 cert.display(),
                 key.display(),
@@ -668,17 +685,33 @@ impl Handoff {
             ),
         )
         .expect("설정을 쓰지 못했습니다");
+        let trust = Arc::new(TrustStore::from_pem(&pem));
+        let quic = vec![
+            ("DoQ", Upstream::doq(loopback(ports.doq), LOCAL_NAME)),
+            (
+                "DoH3",
+                Upstream::doh3(loopback(ports.doh3), LOCAL_NAME, "/dns-query"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, upstream)| {
+            let forwarder =
+                Forwarder::with_upstreams(vec![upstream], ANSWER_TIMEOUT).with_trust(trust.clone());
+            (name, Arc::new(forwarder))
+        })
+        .collect();
         Self {
             swapped,
             config,
             ports,
-            trust: Arc::new(TrustStore::from_pem(&pem)),
+            trust,
+            quic,
         }
     }
 
-    /// One lane per transport. Do53 TCP opens a new connection per query; DoT and DoH keep theirs
+    /// One lane per transport. Do53 TCP opens a new connection per query; the others keep theirs
     /// as clients do, and connect again once the process that served it closes it.
-    fn lanes(&self) -> Vec<(&'static str, Ask)> {
+    fn lanes(&self) -> Vec<(&'static str, Promise, Ask)> {
         let ports = &self.ports;
         let udp = connected_udp(ports.dns);
         let dnscrypt = connected_udp(ports.dnscrypt);
@@ -693,20 +726,52 @@ impl Handoff {
             ANSWER_TIMEOUT,
         )
         .with_trust(self.trust.clone());
-        vec![
+        let mut lanes = vec![
             (
                 "UDP",
+                Promise::Answered,
                 Box::new(move |id| ask_udp(&udp, id, LOCAL_NAME, TYPE_A)) as Ask,
             ),
-            ("TCP", Box::new(move |id| ask_tcp(dns, id))),
-            ("DoT", Box::new(move |id| ask_forwarder(&dot, id))),
-            ("DoH", Box::new(move |id| ask_forwarder(&doh, id))),
+            (
+                "TCP",
+                Promise::Answered,
+                Box::new(move |id| ask_tcp(dns, id)),
+            ),
+            (
+                "DoT",
+                Promise::Answered,
+                Box::new(move |id| ask_forwarder(&dot, id)),
+            ),
+            (
+                "DoH",
+                Promise::Answered,
+                Box::new(move |id| ask_forwarder(&doh, id)),
+            ),
             // The DNSCrypt listener answers its certificate query without encryption.
             (
                 "DNSCrypt",
+                Promise::Answered,
                 Box::new(move |id| ask_udp(&dnscrypt, id, DNSCRYPT_PROVIDER, TYPE_TXT)),
             ),
-        ]
+        ];
+        for (name, forwarder) in &self.quic {
+            let forwarder = forwarder.clone();
+            lanes.push((
+                *name,
+                Promise::Reconnects,
+                Box::new(move |id| ask_forwarder(&forwarder, id)),
+            ));
+        }
+        lanes
+    }
+
+    /// The QUIC clients from the lanes get answers again.
+    fn assert_quic_reconnected(&self) {
+        for (name, forwarder) in &self.quic {
+            if let Err(error) = ask_forwarder(forwarder, 1) {
+                panic!("{name} 클라이언트가 다시 연결하지 못했습니다: {error}");
+            }
+        }
     }
 
     /// Creates the first account with the setup code, as the dashboard does, and returns its
@@ -906,7 +971,10 @@ type Ask = Box<dyn FnMut(u16) -> Result<(), String> + Send>;
 #[derive(Default)]
 struct Tally {
     answered: u64,
+    /// Failures a lane's promise does not allow.
     failures: Vec<String>,
+    /// Failures a lane's promise allows.
+    allowed: u64,
 }
 
 /// Each lane asks in turn on its own thread until finished.
@@ -916,11 +984,11 @@ struct Load {
 }
 
 impl Load {
-    fn start(lanes: Vec<(&'static str, Ask)>) -> Self {
+    fn start(lanes: Vec<(&'static str, Promise, Ask)>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let lanes = lanes
             .into_iter()
-            .map(|(name, mut ask)| {
+            .map(|(name, promise, mut ask)| {
                 let stop = stop.clone();
                 std::thread::spawn(move || {
                     let mut tally = Tally::default();
@@ -929,6 +997,7 @@ impl Load {
                         id = id.wrapping_add(1);
                         match ask(id) {
                             Ok(()) => tally.answered += 1,
+                            Err(_) if promise == Promise::Reconnects => tally.allowed += 1,
                             Err(error) => tally.failures.push(format!("{name}: {error}")),
                         }
                         std::thread::sleep(QUERY_PACE);
@@ -952,6 +1021,7 @@ impl Load {
             let tally = lane.join().expect("질의 스레드가 패닉했습니다");
             total.answered += tally.answered;
             total.failures.extend(tally.failures);
+            total.allowed += tally.allowed;
         }
         total
     }
@@ -988,9 +1058,10 @@ fn assert_no_query_failed(load: Load, server: &Server) {
     let tally = load.finish();
     assert!(
         tally.failures.is_empty(),
-        "질의 {}개가 답을 받았고 {}개가 실패했습니다: {:?}\n{}",
+        "질의 {}개가 답을 받았고 {}개가 실패했습니다(QUIC 에서 허용한 실패 {}개 제외): {:?}\n{}",
         tally.answered,
         tally.failures.len(),
+        tally.allowed,
         tally.failures,
         server.log_text()
     );
@@ -998,9 +1069,10 @@ fn assert_no_query_failed(load: Load, server: &Server) {
 
 #[test]
 /// A rollback through the management API starts the previous executable beside the running worker,
-/// which hands its sockets and state over. Queries over every transport keep being answered, the
-/// counts, the dashboard session, and the DNSCrypt key carry over, and the supervisor then runs
-/// from the install path with the successor as its only child.
+/// which hands its sockets and state over. Queries keep being answered on every transport but
+/// QUIC, whose clients connect again; the counts, the dashboard session, and the DNSCrypt key
+/// carry over; and the supervisor then runs from the install path with the successor as its only
+/// child.
 fn an_update_hands_over_without_failing_a_query() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -1023,6 +1095,7 @@ fn an_update_hands_over_without_failing_a_query() {
     // Lets the successor answer under the supervisor's new image for a while.
     std::thread::sleep(Duration::from_secs(1));
     assert_no_query_failed(load, &server);
+    handoff.assert_quic_reconnected();
 
     assert!(
         children.len() == 1 && children[0] != first,
@@ -1075,6 +1148,7 @@ fn a_successor_that_dies_during_the_handoff_fails_no_query() {
     server.wait_for_own("update.reverted");
     std::thread::sleep(Duration::from_secs(1));
     assert_no_query_failed(load, &server);
+    handoff.assert_quic_reconnected();
 
     assert_eq!(children_of(server.pid()), vec![first]);
     let record = handoff.swapped.record_text();
