@@ -144,10 +144,18 @@ pub(crate) struct FilterState {
     pub(crate) rebuild: FilterRebuild,
     pub(crate) deferred_rebuild: Arc<DeferredRebuild>,
     pub(crate) refresh_url_lists: ListRefresh,
+    blocklist_resolver: http::HostResolver,
+    /// Until set, a started refresh job fetches the URL lists at once instead of after its period.
+    lists_fetched_once: Arc<AtomicBool>,
+    /// The same for the RPZ feeds.
+    rpz_fetched_once: Arc<AtomicBool>,
+    /// The RPZ URLs whose texts `rpz_texts` holds.
+    rpz_fetched_urls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FilterState {
-    /// Installs the first engine from the cached lists and starts the background jobs.
+    /// Installs the first engine from the cached lists and starts the background jobs other than
+    /// the list refresh, which `spawn_refresh` starts.
     pub(crate) fn start(
         cfg: &Config,
         runtime_cfg: &Arc<ArcSwap<Config>>,
@@ -358,126 +366,8 @@ impl FilterState {
         };
         let list_refresh_secs = Arc::new(AtomicU64::new(cfg.list_refresh_secs));
         let list_generation = Arc::new(AtomicU64::new(0));
-        {
-            let refresh_lists = refresh_url_lists.clone();
-            let interval = list_refresh_secs.clone();
-            let generation = list_generation.clone();
-            let sd = shutdown.clone();
-            let mut done_first = subscriptions_settled;
-            let thread = std::thread::Builder::new()
-                .name("blocklist-refresh".into())
-                .spawn(move || {
-                    let mut seen_generation = 0u64;
-                    let mut waited = 0u64;
-                    loop {
-                        if sd.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let period = interval.load(Ordering::Acquire);
-                        let now_generation = generation.load(Ordering::Acquire);
-                        let due = now_generation != seen_generation
-                            || !done_first
-                            || (period > 0 && waited >= period);
-                        if due {
-                            seen_generation = now_generation;
-                            done_first = true;
-                            waited = 0;
-                            match refresh_lists() {
-                                Ok((block, _)) => {
-                                    onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
-                                }
-                                Err(error) if error == LIST_REFRESH_STOPPED => break,
-                                Err(error) if error == LIST_REFRESH_BUSY => {
-                                    onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
-                                }
-                                Err(error) => {
-                                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "Could not update remote blocklists")
-                                }
-                            }
-                        }
-                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                            break;
-                        }
-                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
-                    }
-                })
-                .with_context(|| "Could not start the URL blocklist refresh thread")?;
-            service_cleanup.track(thread);
-        }
 
         let rpz_url_state: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(cfg.rpz_urls.clone()));
-        {
-            let urls = rpz_url_state.clone();
-            let rpz_texts = rpz_texts.clone();
-            let rebuild3 = rebuild.clone();
-            let interval = list_refresh_secs.clone();
-            let generation = list_generation.clone();
-            let sd = shutdown.clone();
-            let resolver = blocklist_resolver.clone();
-            let cache_dir = blocklist_cache_dir.clone();
-            let mut done_first = all_rpz_cached;
-            let mut fetched_urls = cfg.rpz_urls.clone();
-            let thread = std::thread::Builder::new()
-                .name("rpz-refresh".into())
-                .spawn(move || {
-                    let mut seen_generation = 0u64;
-                    let mut waited = 0u64;
-                    loop {
-                        if sd.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let period = interval.load(Ordering::Acquire);
-                        let now_generation = generation.load(Ordering::Acquire);
-                        let due = now_generation != seen_generation
-                            || !done_first
-                            || (period > 0 && waited >= period);
-                        let urls_now = urls.lock_recover().clone();
-                        if !due || (urls_now.is_empty() && fetched_urls.is_empty()) {
-                            seen_generation = now_generation;
-                            if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                                break;
-                            }
-                            waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
-                            continue;
-                        }
-                        seen_generation = now_generation;
-                        done_first = true;
-                        waited = 0;
-                        let previous = rpz_texts.lock_recover().clone();
-                        let kept = rpz_texts_by_url(&fetched_urls, &previous, &urls_now);
-                        let Some(fetched) = fetch_rpz_texts(
-                            &urls_now,
-                            &resolver,
-                            &kept,
-                            cache_dir.as_deref(),
-                            &sd,
-                        ) else {
-                            break;
-                        };
-                        *rpz_texts.lock_recover() = fetched;
-                        let previous_urls = std::mem::replace(&mut fetched_urls, urls_now);
-                        match rebuild3() {
-                            Ok((b, _)) => onetdns_core::info!(event = "filter.rpz_applied", block = b, "Applied downloaded RPZ rules"),
-                            Err(e) => {
-                                *rpz_texts.lock_recover() = previous;
-                                fetched_urls = previous_urls;
-                                let error = with_rollback_result(
-                                    e,
-                                    "Could not restore the previous RPZ runtime state",
-                                    rebuild3().map(|_| ()),
-                                );
-                                onetdns_core::warn!(event = "filter.rpz_rebuild_failed", error = %error, "Could not rebuild RPZ rules; keeping the previous rules");
-                            }
-                        }
-                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                            break;
-                        }
-                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
-                    }
-                })
-                .with_context(|| "Could not start the RPZ refresh thread")?;
-            service_cleanup.track(thread);
-        }
         let deferred_rebuild = Arc::new(DeferredRebuild::default());
         {
             let deferred = deferred_rebuild.clone();
@@ -511,7 +401,142 @@ impl FilterState {
             rebuild,
             deferred_rebuild,
             refresh_url_lists,
+            blocklist_resolver: blocklist_resolver.clone(),
+            lists_fetched_once: Arc::new(AtomicBool::new(subscriptions_settled)),
+            rpz_fetched_once: Arc::new(AtomicBool::new(all_rpz_cached)),
+            rpz_fetched_urls: Arc::new(Mutex::new(cfg.rpz_urls.clone())),
         })
+    }
+
+    /// Starts the jobs that fetch the URL blocklists and RPZ feeds on their schedule; they end when
+    /// `stop` is set. Started again, they go on from what was already fetched.
+    pub(crate) fn spawn_refresh(
+        &self,
+        stop: &Arc<AtomicBool>,
+    ) -> BoxResult<Vec<std::thread::JoinHandle<()>>> {
+        let mut threads = Vec::new();
+        {
+            let refresh_lists = self.refresh_url_lists.clone();
+            let interval = self.list_refresh_secs.clone();
+            let generation = self.list_generation.clone();
+            let sd = stop.clone();
+            let fetched_once = self.lists_fetched_once.clone();
+            let thread = std::thread::Builder::new()
+                .name("blocklist-refresh".into())
+                .spawn(move || {
+                    let mut seen_generation = 0u64;
+                    let mut waited = 0u64;
+                    loop {
+                        if sd.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let period = interval.load(Ordering::Acquire);
+                        let now_generation = generation.load(Ordering::Acquire);
+                        let due = now_generation != seen_generation
+                            || !fetched_once.load(Ordering::Acquire)
+                            || (period > 0 && waited >= period);
+                        if due {
+                            seen_generation = now_generation;
+                            fetched_once.store(true, Ordering::Release);
+                            waited = 0;
+                            match refresh_lists() {
+                                Ok((block, _)) => {
+                                    onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
+                                }
+                                Err(error) if error == LIST_REFRESH_STOPPED => break,
+                                Err(error) if error == LIST_REFRESH_BUSY => {
+                                    onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
+                                }
+                                Err(error) => {
+                                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "Could not update remote blocklists")
+                                }
+                            }
+                        }
+                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
+                            break;
+                        }
+                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
+                    }
+                })
+                .with_context(|| "Could not start the URL blocklist refresh thread")?;
+            threads.push(thread);
+        }
+
+        {
+            let urls = self.rpz_urls.clone();
+            let rpz_texts = self.rpz_texts.clone();
+            let rebuild3 = self.rebuild.clone();
+            let interval = self.list_refresh_secs.clone();
+            let generation = self.list_generation.clone();
+            let sd = stop.clone();
+            let resolver = self.blocklist_resolver.clone();
+            let cache_dir = self.subscription_cache_dir.clone();
+            let fetched_once = self.rpz_fetched_once.clone();
+            let fetched_slot = self.rpz_fetched_urls.clone();
+            let mut fetched_urls = fetched_slot.lock_recover().clone();
+            let thread = std::thread::Builder::new()
+                .name("rpz-refresh".into())
+                .spawn(move || {
+                    let mut seen_generation = 0u64;
+                    let mut waited = 0u64;
+                    loop {
+                        if sd.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let period = interval.load(Ordering::Acquire);
+                        let now_generation = generation.load(Ordering::Acquire);
+                        let due = now_generation != seen_generation
+                            || !fetched_once.load(Ordering::Acquire)
+                            || (period > 0 && waited >= period);
+                        let urls_now = urls.lock_recover().clone();
+                        if !due || (urls_now.is_empty() && fetched_urls.is_empty()) {
+                            seen_generation = now_generation;
+                            if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
+                                break;
+                            }
+                            waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
+                            continue;
+                        }
+                        seen_generation = now_generation;
+                        fetched_once.store(true, Ordering::Release);
+                        waited = 0;
+                        let previous = rpz_texts.lock_recover().clone();
+                        let kept = rpz_texts_by_url(&fetched_urls, &previous, &urls_now);
+                        let Some(fetched) = fetch_rpz_texts(
+                            &urls_now,
+                            &resolver,
+                            &kept,
+                            cache_dir.as_deref(),
+                            &sd,
+                        ) else {
+                            break;
+                        };
+                        *rpz_texts.lock_recover() = fetched;
+                        let previous_urls = std::mem::replace(&mut fetched_urls, urls_now);
+                        match rebuild3() {
+                            Ok((b, _)) => onetdns_core::info!(event = "filter.rpz_applied", block = b, "Applied downloaded RPZ rules"),
+                            Err(e) => {
+                                *rpz_texts.lock_recover() = previous;
+                                fetched_urls = previous_urls;
+                                let error = with_rollback_result(
+                                    e,
+                                    "Could not restore the previous RPZ runtime state",
+                                    rebuild3().map(|_| ()),
+                                );
+                                onetdns_core::warn!(event = "filter.rpz_rebuild_failed", error = %error, "Could not rebuild RPZ rules; keeping the previous rules");
+                            }
+                        }
+                        fetched_slot.lock_recover().clone_from(&fetched_urls);
+                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
+                            break;
+                        }
+                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
+                    }
+                })
+                .with_context(|| "Could not start the RPZ refresh thread")?;
+            threads.push(thread);
+        }
+        Ok(threads)
     }
 }
 

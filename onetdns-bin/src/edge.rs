@@ -723,6 +723,12 @@ impl EdgeServices {
         }
     }
 
+    /// Joins `thread` when the group retires, after any earlier thread under the same name.
+    pub(crate) fn keep(&self, name: &str, thread: std::thread::JoinHandle<()>) {
+        self.join_service(name);
+        self.threads.lock_recover().insert(name.to_string(), thread);
+    }
+
     /// The caller sends the signal.
     fn join_service(&self, key: &str) {
         let thread = self.threads.lock_recover().remove(key);

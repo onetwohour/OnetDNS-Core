@@ -848,6 +848,54 @@ fn gen_token() -> String {
     s
 }
 
+/// Starts the list refresh, DNSSEC re-signing and upstream statistics writer, stopping the ones
+/// started before. The re-signing and statistics threads are joined when `jobs` retires, so their
+/// files are finished by then; a list download in progress ends on its own.
+fn singletons_restart(
+    jobs: Arc<EdgeServices>,
+    filters: filter_runtime::FilterState,
+    zones: ZoneState,
+    forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
+    stats_path: Option<PathBuf>,
+    threads: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> SecondaryRestart {
+    Arc::new(move |next: &Config| -> Result<(), String> {
+        let stop = jobs.restart_all();
+        for thread in filters
+            .spawn_refresh(&stop)
+            .map_err(|error| error.to_string())?
+        {
+            track_service_thread(&threads, thread);
+        }
+        let zone_files = configured_zone_files(next)?;
+        if let Some(thread) = spawn_resign_timer(
+            zones.signers.clone(),
+            zones.store.clone(),
+            zones.journal.clone(),
+            zone_files,
+            zones.notify.clone(),
+            stop.clone(),
+        )
+        .map_err(|error| format!("Could not start the DNSSEC re-signing thread: {error}"))?
+        {
+            jobs.keep("dnssec-resign", thread);
+        }
+        if let Some(path) = &stats_path {
+            let thread = upstream_stats::spawn_flush(
+                path.clone(),
+                forward_stats.clone(),
+                next.persist_flush_secs,
+                stop,
+            )
+            .map_err(|error| {
+                format!("Could not start the upstream DNS server statistics writer thread: {error}")
+            })?;
+            jobs.keep("upstream-stats-flush", thread);
+        }
+        Ok(())
+    })
+}
+
 /// Holds every thread a generation started, to stop them together.
 struct ServiceCleanup {
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -925,6 +973,9 @@ struct GenerationJobs {
     lease_sync: Arc<EdgeServices>,
     /// Restarted when the zone list or interval changes.
     zsk_rollover: Arc<EdgeServices>,
+    /// Jobs only one process may run, so a handoff stops them before the next process starts its
+    /// own.
+    singletons: Arc<EdgeServices>,
 }
 
 impl GenerationJobs {
@@ -937,6 +988,7 @@ impl GenerationJobs {
             secondary: Arc::default(),
             lease_sync: Arc::default(),
             zsk_rollover: Arc::default(),
+            singletons: Arc::default(),
         }
     }
 
@@ -966,6 +1018,7 @@ impl GenerationJobs {
                 jobs.secondary.retire_all();
                 jobs.lease_sync.retire_all();
                 jobs.zsk_rollover.retire_all();
+                jobs.singletons.retire_all();
             })
     }
 }
@@ -1294,18 +1347,6 @@ pub fn serve(
         native::ResolverSlot::new(Arc::new(native::UnbuiltForward))
     };
 
-    if let Some(stats_path) = upstream_stats_path(config_path.as_deref()) {
-        service_cleanup.track(
-            upstream_stats::spawn_flush(
-                stats_path,
-                forward_stats.clone(),
-                cfg.persist_flush_secs,
-                shutdown.clone(),
-            )
-            .with_context(|| "Could not start the upstream DNS server statistics writer thread")?,
-        );
-    }
-
     // The servers these resolvers ask change without restart; keeping the startup ones would
     // fetch lists from old servers after an address change, so only the inside is swapped.
     let blocklist_resolver_slot = Arc::new(Mutex::new(blocklist_host_resolver(&cfg)));
@@ -1374,19 +1415,19 @@ pub fn serve(
         )
         .with_context(|| "Could not start the TLS certificate watch task")?,
     );
-    let resign_zone_files = configured_zone_files(&cfg).map_err(|error| crate::anyhow!(error))?;
-    if let Some(thread) = spawn_resign_timer(
-        zones.signers.clone(),
-        zones.store.clone(),
-        zones.journal.clone(),
-        resign_zone_files,
-        zones.notify.clone(),
-        shutdown.clone(),
+    install_restart(
+        &restarts.singletons,
+        singletons_restart(
+            jobs.singletons.clone(),
+            filters.clone(),
+            zones.clone(),
+            forward_stats.clone(),
+            upstream_stats_path(config_path.as_deref()),
+            service_cleanup.tracker(),
+        ),
+        &cfg,
     )
-    .with_context(|| "Could not start the DNSSEC re-signing thread")?
-    {
-        service_cleanup.track(thread);
-    }
+    .map_err(std::io::Error::other)?;
     let reload_zone_keys = zones.reload_from_config(&runtime_cfg, &native_hot_state);
     service_cleanup.track(
         spawn_zone_file_watch(

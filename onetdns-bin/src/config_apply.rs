@@ -135,6 +135,9 @@ pub(crate) struct RestartHooks {
     pub(crate) lease_sync: Arc<Mutex<Option<SecondaryRestart>>>,
     pub(crate) raft: Arc<Mutex<Option<SecondaryRestart>>>,
     pub(crate) zsk_rollover: Arc<Mutex<Option<SecondaryRestart>>>,
+    /// Starts the jobs only one process may run: list refresh, DNSSEC re-signing and the upstream
+    /// statistics writer.
+    pub(crate) singletons: Arc<Mutex<Option<SecondaryRestart>>>,
     /// Matches listen addresses to the config; addresses with unchanged config are left alone.
     pub(crate) listeners: Arc<Mutex<Option<SecondaryRestart>>>,
 }
