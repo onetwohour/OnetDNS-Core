@@ -4584,7 +4584,7 @@ Object.assign(I18N.zh, {
 // 업데이트 상태와 실패 사유. 버전이나 경로가 들어가는 문장은 원문 그대로 보인다.
 Object.assign(I18N.ko, {
   "Updates are not available":"업데이트를 사용할 수 없습니다",
-  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"OnetDNS 릴리스 과정에서 빌드한 실행 파일이 아니어서 스스로 업데이트하지 않습니다",
+  "This is not an official release build, so it does not check for or install updates":"공식 릴리스 빌드가 아니어서 업데이트를 확인하거나 설치하지 않습니다",
   "This executable has no release signing key, so it cannot verify releases":"릴리스 서명 키가 들어 있지 않은 실행 파일이어서 릴리스를 검증할 수 없습니다",
   "The request body must be an object with the version shown by the last check":"요청 본문은 마지막 확인에서 찾은 버전을 담은 객체여야 합니다",
   "There is no confirmed update to go back from":"되돌릴 수 있는 확정된 업데이트가 없습니다",
@@ -4603,7 +4603,7 @@ Object.assign(I18N.ko, {
 });
 Object.assign(I18N.ja, {
   "Updates are not available":"更新は利用できません",
-  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"OnetDNS のリリース手順でビルドされた実行ファイルではないため、自動更新しません",
+  "This is not an official release build, so it does not check for or install updates":"公式リリースのビルドではないため、更新の確認もインストールも行いません",
   "This executable has no release signing key, so it cannot verify releases":"リリース署名鍵を含まない実行ファイルのため、リリースを検証できません",
   "The request body must be an object with the version shown by the last check":"リクエスト本文は、最後の確認で見つかったバージョンを含むオブジェクトである必要があります",
   "There is no confirmed update to go back from":"戻せる確定済みの更新がありません",
@@ -4622,7 +4622,7 @@ Object.assign(I18N.ja, {
 });
 Object.assign(I18N.zh, {
   "Updates are not available":"无法使用更新功能",
-  "This executable was not built by the OnetDNS release workflow, so it does not update itself":"此可执行文件不是由 OnetDNS 发布流程构建的，因此不会自行更新",
+  "This is not an official release build, so it does not check for or install updates":"此版本不是官方发布构建，因此不检查也不安装更新",
   "This executable has no release signing key, so it cannot verify releases":"此可执行文件不含发布签名密钥，无法验证发布版本",
   "The request body must be an object with the version shown by the last check":"请求正文必须是包含上次检查所发现版本的对象",
   "There is no confirmed update to go back from":"没有可回退的已确认更新",
@@ -5634,12 +5634,12 @@ class Component extends DCLogic {
     if(!notice&&!participating){notice=this.t(String(u.reason||''));tone='muted';}
     else if(!notice&&pending){notice=pendingText;tone='warn';}
     else if(!notice&&record&&record.state==='reverted'){notice=this.tr('{to} 버전으로 업데이트하지 못해 {from} 버전으로 되돌렸습니다',{to:String(record.to||''),from:String(record.from||'')})+(record.reason?': '+this.t(String(record.reason)):'');tone='block';}
-    const checkLabel=!result?this.t('아직 확인하지 않았습니다')
+    const checkLabel=!participating?'—':!result?this.t('아직 확인하지 않았습니다')
       :result==='up_to_date'?this.t('최신 버전입니다')
       :result==='available'?this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion})
       :result==='manual'?this.tr('{version} 버전은 직접 설치해야 합니다',{version:newVersion})+detail
       :this.t('확인하지 못했습니다')+detail;
-    const launchLabel={supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),service:this.t('Windows 서비스가 새 버전으로 다시 시작합니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
+    const launchLabel=!participating?'—':{supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),service:this.t('Windows 서비스가 새 버전으로 다시 시작합니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
     const rollbackTo=typeof u.rollback==='string'?u.rollback:'';
     const canApply=participating&&result==='available'&&!!newVersion&&!pending;
     const releaseUrl=(result==='available'||result==='manual')&&typeof u.release_url==='string'&&/^https:\/\//.test(u.release_url)?u.release_url:'';

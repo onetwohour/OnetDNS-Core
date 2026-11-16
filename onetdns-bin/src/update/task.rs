@@ -87,7 +87,7 @@ static LAST: Mutex<Option<Checked>> = Mutex::new(None);
 /// The asset key and trusted signing keys, or why this binary takes no part in updates.
 pub(crate) fn participation() -> Result<(&'static str, Vec<VerifyingKey>), String> {
     let target = RELEASE_TARGET.ok_or_else(|| {
-        "This executable was not built by the OnetDNS release workflow, so it does not update itself"
+        "This is not an official release build, so it does not check for or install updates"
             .to_string()
     })?;
     let keys = manifest::trusted_keys()?;
@@ -481,6 +481,6 @@ mod tests {
             return;
         }
         let reason = participation().expect_err("참여하지 않아야 합니다");
-        assert!(reason.contains("release workflow"), "{reason}");
+        assert!(reason.contains("official release build"), "{reason}");
     }
 }
