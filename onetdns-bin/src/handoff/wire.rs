@@ -16,6 +16,12 @@ use super::{
 };
 use crate::listeners::TicketKeys;
 
+/// The handoff protocol: the frames on the supervisor channel and on the link between two workers,
+/// the messages in them, and the formats of the state they carry. Each process states its number
+/// in its first frame, and both must use the same; it is separate from the update contract so a
+/// change here does not cut off self-updates.
+pub(crate) const PROTOCOL: u32 = 1;
+
 /// Kind, payload length, and descriptor count.
 const HEADER: usize = 9;
 const MAX_PAYLOAD: usize = 1 << 28;
@@ -134,35 +140,8 @@ pub(crate) fn recv(
     deadline: Instant,
     abort: &dyn Fn() -> bool,
 ) -> Result<Frame, LinkError> {
-    let mut fds = Vec::new();
-    let mut header = [0u8; HEADER];
-    recv_exact(stream, &mut header, &mut fds, deadline, abort)?;
-    let length = u32::from_be_bytes(header[1..5].try_into().expect("four bytes")) as usize;
-    let count = u32::from_be_bytes(header[5..9].try_into().expect("four bytes")) as usize;
-    if length > MAX_PAYLOAD || count > MAX_FDS {
-        return Err(LinkError::Unreadable);
-    }
-    let mut payload = Zeroizing::new(vec![0u8; length]);
-    recv_exact(stream, &mut payload, &mut fds, deadline, abort)?;
-    if fds.len() != count {
-        return Err(LinkError::Unreadable);
-    }
-    Ok(Frame {
-        kind: header[0],
-        payload,
-        fds,
-    })
-}
-
-fn recv_exact(
-    stream: &UnixStream,
-    buf: &mut [u8],
-    fds: &mut Vec<OwnedFd>,
-    deadline: Instant,
-    abort: &dyn Fn() -> bool,
-) -> Result<(), LinkError> {
-    let mut filled = 0;
-    while filled < buf.len() {
+    let mut reader = FrameReader::default();
+    loop {
         if abort() {
             return Err(LinkError::Aborted);
         }
@@ -173,23 +152,75 @@ fn recv_exact(
         stream
             .set_read_timeout(Some(left.min(LINK_POLL)))
             .map_err(|_| LinkError::Gone)?;
-        match recv_with_fds(stream, &mut buf[filled..], fds) {
-            Ok(0) => return Err(LinkError::Gone),
-            Ok(received) => filled += received,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) => {}
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                return Err(LinkError::Unreadable)
-            }
-            Err(_) => return Err(LinkError::Gone),
+        if let Some(frame) = reader.read(stream)? {
+            return Ok(frame);
         }
     }
-    Ok(())
+}
+
+/// Puts a frame together from what has arrived, across calls.
+#[derive(Default)]
+pub(crate) struct FrameReader {
+    header: [u8; HEADER],
+    /// Allocated once the header is complete.
+    payload: Option<Zeroizing<Vec<u8>>>,
+    filled: usize,
+    fds: Vec<OwnedFd>,
+}
+
+impl FrameReader {
+    /// Reads until the socket has nothing more, by its timeout or because it does not block. Some
+    /// once a whole frame has arrived.
+    pub(crate) fn read(&mut self, stream: &UnixStream) -> Result<Option<Frame>, LinkError> {
+        loop {
+            if self.payload.is_none() && self.filled == HEADER {
+                let length = self.declared(1) as usize;
+                if length > MAX_PAYLOAD || self.declared(5) as usize > MAX_FDS {
+                    return Err(LinkError::Unreadable);
+                }
+                self.payload = Some(Zeroizing::new(vec![0u8; length]));
+                self.filled = 0;
+            }
+            if let Some(payload) = self.payload.take_if(|payload| payload.len() == self.filled) {
+                self.filled = 0;
+                let fds = std::mem::take(&mut self.fds);
+                if fds.len() != self.declared(5) as usize {
+                    return Err(LinkError::Unreadable);
+                }
+                return Ok(Some(Frame {
+                    kind: self.header[0],
+                    payload,
+                    fds,
+                }));
+            }
+            let buf = match &mut self.payload {
+                None => &mut self.header[self.filled..],
+                Some(payload) => &mut payload[self.filled..],
+            };
+            match recv_with_fds(stream, buf, &mut self.fds) {
+                Ok(0) => return Err(LinkError::Gone),
+                Ok(received) => self.filled += received,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    return Err(LinkError::Unreadable)
+                }
+                Err(_) => return Err(LinkError::Gone),
+            }
+        }
+    }
+
+    /// The u32 in the header at `at`: the payload length at 1, the descriptor count at 5.
+    fn declared(&self, at: usize) -> u32 {
+        u32::from_be_bytes(self.header[at..at + 4].try_into().expect("four bytes"))
+    }
 }
 
 /// Takes ownership of every descriptor that arrives, closed on exec.

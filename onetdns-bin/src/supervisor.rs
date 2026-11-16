@@ -55,17 +55,25 @@ impl RestartPolicy {
 }
 
 #[cfg(target_os = "linux")]
+mod channel;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use super::channel::{self, Hello};
     use super::{RestartDecision, RestartPolicy, MAX_STARTUP_FAILURES};
     use crate::error::{BoxResult, Context};
+    use crate::handoff::wire::{self, Frame, FrameReader, PROTOCOL};
+    use crate::handoff::LinkError;
     use crate::tui::ChildConsole;
     use crate::update::launch::UPDATE_EXIT_CODE;
     use crate::update::trial::{Startup, Trial};
+    use crate::update::VERSION;
     use onetdns_config::Config;
-    use std::net::{SocketAddr, UdpSocket};
-    use std::os::unix::process::CommandExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, ExitStatus};
+    use std::process::{Command, ExitStatus};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -73,78 +81,10 @@ mod linux {
     /// The image this parent is running. The install path would name another version after an
     /// update's rename, or gain a ` (deleted)` suffix.
     const SELF_IMAGE: &str = "/proc/self/exe";
-    const READY_ADDR_ENV: &str = "ONETDNS_SUPERVISOR_READY_ADDR";
-    const READY_TOKEN_ENV: &str = "ONETDNS_SUPERVISOR_READY_TOKEN";
     const RESTARTS_ENV: &str = "ONETDNS_SUPERVISOR_RESTARTS";
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
     const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     const PR_SET_DUMPABLE: libc::c_int = 4;
-
-    enum ReadyState {
-        Pending,
-        Ready,
-    }
-
-    struct ReadinessReceiver {
-        socket: UdpSocket,
-        token: [u8; 16],
-    }
-
-    impl ReadinessReceiver {
-        /// Accepts only the token over loopback, or any packet could claim the child is ready.
-        fn poll_ready(&self) -> std::io::Result<ReadyState> {
-            let mut token = [0u8; 16];
-
-            for _ in 0..64 {
-                match self.socket.recv_from(&mut token) {
-                    Ok((16, peer)) if peer.ip().is_loopback() && token == self.token => {
-                        return Ok(ReadyState::Ready);
-                    }
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        return Ok(ReadyState::Pending);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(ReadyState::Pending)
-        }
-    }
-
-    fn encode_token(token: &[u8; 16]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(32);
-        for byte in token {
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        encoded
-    }
-
-    fn decode_token(encoded: &str) -> Option<[u8; 16]> {
-        if encoded.len() != 32 {
-            return None;
-        }
-        let mut token = [0u8; 16];
-        for (index, byte) in token.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(encoded.get(index * 2..index * 2 + 2)?, 16).ok()?;
-        }
-        Some(token)
-    }
-
-    fn readiness_channel() -> std::io::Result<(ReadinessReceiver, SocketAddr, [u8; 16])> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        socket.set_nonblocking(true)?;
-        let address = socket.local_addr()?;
-        let token = onetdns_core::rng::try_random_array()?;
-        Ok((ReadinessReceiver { socket, token }, address, token))
-    }
-
-    fn signal_readiness(address: SocketAddr, token: [u8; 16]) -> std::io::Result<()> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        socket.send_to(&token, address)?;
-        Ok(())
-    }
 
     /// A dump would hold keys and tokens, and writing a large one delays the restart.
     fn disable_core_dumps() -> std::io::Result<()> {
@@ -183,27 +123,81 @@ mod linux {
         Ok(())
     }
 
-    struct ManagedChild {
-        process: Child,
-        readiness: Option<ReadinessReceiver>,
+    /// A worker process and the supervisor's end of its channel.
+    struct Worker {
+        pid: libc::pid_t,
+        channel: UnixStream,
+        reader: FrameReader,
+        /// Cleared once the worker closes its end.
+        open: bool,
+        greeted: bool,
         ready: bool,
         started: Instant,
     }
 
-    impl ManagedChild {
-        fn poll_ready(&mut self) -> std::io::Result<bool> {
-            if self.ready {
-                return Ok(true);
+    impl Worker {
+        /// Handles what the worker sent. Fails when it broke the protocol; the caller then ends it.
+        fn poll(&mut self) -> Result<(), String> {
+            while self.open {
+                match self.reader.read(&self.channel) {
+                    Ok(Some(frame)) => self.handle(frame)?,
+                    Ok(None) => break,
+                    Err(LinkError::Gone) => self.open = false,
+                    Err(error) => return Err(error.to_string()),
+                }
             }
-            let Some(receiver) = &self.readiness else {
-                return Ok(false);
-            };
-            match receiver.poll_ready()? {
-                ReadyState::Pending => Ok(false),
-                ReadyState::Ready => {
-                    self.ready = true;
-                    self.readiness = None;
-                    Ok(true)
+            Ok(())
+        }
+
+        fn handle(&mut self, frame: Frame) -> Result<(), String> {
+            if !self.greeted {
+                let hello = Hello::read(&frame).map_err(|error| error.to_string())?;
+                if (hello.protocol, hello.version.as_str()) != (PROTOCOL, VERSION) {
+                    return Err(format!(
+                        "It is version {} with handoff protocol {}, not {VERSION} with {PROTOCOL}",
+                        hello.version, hello.protocol
+                    ));
+                }
+                self.greeted = true;
+                return wire::send(&self.channel, &Frame::new(channel::RUN))
+                    .map_err(|error| format!("Could not answer it: {error}"));
+            }
+            if channel::is_bare(&frame, channel::READY) {
+                self.ready = true;
+                return Ok(());
+            }
+            Err(format!("It sent message kind {} out of turn", frame.kind))
+        }
+
+        fn try_wait(&self) -> std::io::Result<Option<ExitStatus>> {
+            let mut status = 0;
+            loop {
+                // SAFETY: `status` is valid for writing; WNOHANG returns at once.
+                let rc = unsafe { libc::waitpid(self.pid, &raw mut status, libc::WNOHANG) };
+                match rc {
+                    0 => return Ok(None),
+                    pid if pid == self.pid => return Ok(Some(ExitStatus::from_raw(status))),
+                    _ => {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn wait(&self) -> std::io::Result<ExitStatus> {
+            let mut status = 0;
+            loop {
+                // SAFETY: `status` is valid for writing.
+                let rc = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+                if rc == self.pid {
+                    return Ok(ExitStatus::from_raw(status));
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
                 }
             }
         }
@@ -215,9 +209,13 @@ mod linux {
         config_path: Option<&Path>,
         no_web: bool,
         restarts: u64,
-    ) -> BoxResult<ManagedChild> {
-        let (readiness, ready_address, ready_token) = readiness_channel()
-            .with_context(|| "Could not create the supervisor readiness channel")?;
+    ) -> BoxResult<Worker> {
+        let (channel, worker_end) = UnixStream::pair()
+            .with_context(|| "Could not create the channel to the DNS service process")?;
+        channel
+            .set_nonblocking(true)
+            .with_context(|| "Could not create the channel to the DNS service process")?;
+        let worker_fd = worker_end.as_raw_fd();
         let mut command = Command::new(SELF_IMAGE);
         command.arg0(program);
         command.arg("run");
@@ -228,8 +226,7 @@ mod linux {
             command.arg("--no-web");
         }
         command.arg("--no-supervisor");
-        command.env(READY_ADDR_ENV, ready_address.to_string());
-        command.env(READY_TOKEN_ENV, encode_token(&ready_token));
+        command.env(channel::CHANNEL_ENV, worker_fd.to_string());
         command.env(RESTARTS_ENV, restarts.to_string());
         command.env(
             crate::update::install::INSTALL_PATH_ENV,
@@ -238,43 +235,61 @@ mod linux {
                 .unwrap_or_default(),
         );
         crate::osnet::harden_child_env(&mut command);
+        // SAFETY: Runs between fork and exec and calls only fcntl, which is async-signal-safe. The
+        // worker's end is the one descriptor kept open across exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(worker_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let process = command
             .spawn()
             .with_context(|| "Could not create the supervised DNS child process")?;
-        Ok(ManagedChild {
-            process,
-            readiness: Some(readiness),
+        drop(worker_end);
+        Ok(Worker {
+            pid: process.id() as libc::pid_t,
+            channel,
+            reader: FrameReader::default(),
+            open: true,
+            greeted: false,
             ready: false,
             started: Instant::now(),
         })
     }
 
-    fn signal_child(child: &Child, signal: libc::c_int) {
-        let result = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+    fn signal_child(child: &Worker, signal: libc::c_int) {
+        // SAFETY: Signals a child this process has not reaped, so the PID is still its.
+        let result = unsafe { libc::kill(child.pid, signal) };
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                onetdns_core::warn!(event = "supervisor.shutdown_signal_failed", pid = child.id(), %error, "Supervisor could not forward the shutdown signal to the DNS service");
+                onetdns_core::warn!(event = "supervisor.shutdown_signal_failed", pid = child.pid, %error, "Supervisor could not forward the shutdown signal to the DNS service");
             }
         }
     }
 
-    fn terminate_child(child: &mut Child, console: Option<&ChildConsole>) {
+    fn terminate_child(child: &Worker, console: Option<&ChildConsole>) {
         signal_child(child, libc::SIGTERM);
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(status)) => {
+                    if let Some(console) = console {
+                        console.child_exited(status);
+                    }
+                    return;
+                }
                 Ok(None) => std::thread::sleep(POLL_INTERVAL),
                 Err(error) => {
-                    onetdns_core::warn!(event = "supervisor.child_wait_failed", pid = child.id(), %error, "Could not check the state of the exiting child process; killing it now");
+                    onetdns_core::warn!(event = "supervisor.child_wait_failed", pid = child.pid, %error, "Could not check the state of the exiting child process; killing it now");
                     break;
                 }
             }
         }
-        if let Err(error) = child.kill() {
-            onetdns_core::warn!(event = "supervisor.child_kill_failed", pid = child.id(), %error, "Could not kill the child process; a process holding the ports may be left behind");
-        }
+        signal_child(child, libc::SIGKILL);
         match child.wait() {
             Ok(status) => {
                 if let Some(console) = console {
@@ -282,7 +297,7 @@ mod linux {
                 }
             }
             Err(error) => {
-                onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.id(), %error, "Could not reap the exited child process");
+                onetdns_core::warn!(event = "supervisor.child_reap_failed", pid = child.pid, %error, "Could not reap the exited child process");
             }
         }
     }
@@ -360,17 +375,22 @@ mod linux {
             let mut child = spawn_child(&program, config_path.as_deref(), no_web, restarts)?;
             onetdns_core::info!(
                 event = "supervisor.child_started",
-                pid = child.process.id(),
+                pid = child.pid,
                 restarts,
                 "Started the DNS service process"
             );
 
             let status = loop {
                 if stop.load(Ordering::Acquire) {
-                    terminate_child(&mut child.process, console);
+                    terminate_child(&child, console);
                     return Ok(());
                 }
-                if child.poll_ready()? {
+                if let Err(error) = child.poll() {
+                    onetdns_core::error!(event = "supervisor.child_refused", pid = child.pid, %error, "Stopping a DNS service process that does not follow the supervisor protocol");
+                    signal_child(&child, libc::SIGKILL);
+                    child.open = false;
+                }
+                if child.ready {
                     if let Some(trial) = trial.take() {
                         trial.commit();
                     }
@@ -378,7 +398,7 @@ mod linux {
                         let (user, group) = run_as.as_ref().expect("run_as is set");
                         if let Err(error) = crate::privdrop::drop_privileges(user, group.as_deref())
                         {
-                            terminate_child(&mut child.process, console);
+                            terminate_child(&child, console);
                             return Err(crate::anyhow!(format!(
                                 "Stopping the service because the supervisor could not drop privileges: {error}"
                             )));
@@ -386,7 +406,7 @@ mod linux {
                         if let Err(error) =
                             crate::privdrop::executable_still_runnable(Path::new(SELF_IMAGE))
                         {
-                            terminate_child(&mut child.process, console);
+                            terminate_child(&child, console);
                             return Err(crate::anyhow!(format!(
                                 "Stopping the service because {user} cannot run {} to restart the DNS service process: {error}",
                                 program.display()
@@ -403,10 +423,10 @@ mod linux {
                 if trial.as_ref().is_some_and(Trial::expired)
                     && trial.take().is_some_and(Trial::revert_expired)
                 {
-                    terminate_child(&mut child.process, console);
+                    terminate_child(&child, console);
                     return Err(crate::anyhow!(exec_install_path()));
                 }
-                match child.process.try_wait()? {
+                match child.try_wait()? {
                     Some(status) => break status,
                     None => std::thread::sleep(POLL_INTERVAL),
                 }
@@ -470,11 +490,7 @@ mod linux {
     /// `None` when not supervised. Also blocks dumps and restores the process name, so call it
     /// before starting threads.
     pub fn take_ready_callback() -> BoxResult<Option<Box<dyn FnOnce() + Send>>> {
-        let address = std::env::var(READY_ADDR_ENV).ok();
-        let token = std::env::var(READY_TOKEN_ENV).ok();
-        std::env::remove_var(READY_ADDR_ENV);
-        std::env::remove_var(READY_TOKEN_ENV);
-        if address.is_none() && token.is_none() {
+        if std::env::var_os(channel::CHANNEL_ENV).is_none() {
             return Ok(None);
         }
         disable_process_dumping()
@@ -482,62 +498,14 @@ mod linux {
         if let Err(error) = restore_process_name() {
             onetdns_core::warn!(event = "supervisor.process_name_failed", %error, "Could not restore the process name of the DNS service process; it is listed as exe");
         }
-        let address = address
-            .ok_or_else(|| crate::anyhow!("The supervisor readiness address is missing"))?
-            .parse::<SocketAddr>()
-            .map_err(|error| {
-                crate::anyhow!(format!("Invalid supervisor readiness address: {error}"))
-            })?;
-        if !address.ip().is_loopback() {
-            return Err(crate::anyhow!(
-                "The supervisor readiness address is not a loopback address"
-            ));
-        }
-        let token = decode_token(
-            token
-                .as_deref()
-                .ok_or_else(|| crate::anyhow!("The supervisor readiness token is missing"))?,
-        )
-        .ok_or_else(|| crate::anyhow!("The supervisor readiness token is malformed"))?;
-        Ok(Some(Box::new(move || {
-            if let Err(error) = signal_readiness(address, token) {
+        channel::join()?;
+        Ok(Some(Box::new(|| {
+            if let Err(error) = channel::ready() {
                 crate::tui::leave();
                 onetdns_core::error!(event = "supervisor.ready_signal_failed", %error, "Could not send the service ready signal; aborting startup");
                 std::process::exit(1);
             }
         })))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn becomes_ready(receiver: &ReadinessReceiver, window: Duration) -> bool {
-            let deadline = Instant::now() + window;
-            loop {
-                if matches!(receiver.poll_ready().expect("poll"), ReadyState::Ready) {
-                    return true;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-
-        #[test]
-        fn readiness_requires_matching_token() {
-            let (receiver, address, token) = readiness_channel().expect("channel");
-            assert_eq!(decode_token(&encode_token(&token)), Some(token));
-            assert_eq!(decode_token("not-a-token"), None);
-            let mut bogus = token;
-            bogus[0] ^= 1;
-            signal_readiness(address, bogus).expect("bogus signal");
-            // Loopback delivery is not immediate under WSL mirrored networking.
-            assert!(!becomes_ready(&receiver, Duration::from_millis(50)));
-            signal_readiness(address, token).expect("ready signal");
-            assert!(becomes_ready(&receiver, Duration::from_secs(5)));
-        }
     }
 }
 
