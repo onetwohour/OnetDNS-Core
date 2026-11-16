@@ -5724,7 +5724,11 @@ class Component extends DCLogic {
   clientSetupView(c){
     if(!c)return {notice:'',rows:[]};
     const names={dns:'DNS',dnscrypt:'DNSCrypt',doh:'DoH',dot:'DoT',doq:'DoQ'};
-    const rows=(Array.isArray(c.stamps)?c.stamps:[]).map(x=>{const name=names[x.protocol]||String(x.protocol);return {label:name+' :'+x.port,stamp:x.stamp,onCopy:()=>this.copyStamp(x.stamp),copyLabel:this.tr('{name} 스탬프 복사',{name})};});
+    const rows=(Array.isArray(c.stamps)?c.stamps:[]).map(x=>{
+      const name=names[x.protocol]||String(x.protocol),address=typeof x.address==='string'?x.address:'';
+      const at=address?(address.includes(':')?'['+address+']':address)+':'+x.port:':'+x.port;
+      return {label:name+' '+at,stamp:x.stamp,onCopy:()=>this.copyStamp(x.stamp),copyLabel:this.tr('{name} 스탬프 복사',{name})};
+    });
     const cert=c.certificate;
     const notice=!rows.length?this.t('만들 수 있는 스탬프가 없습니다')
       :cert&&cert.changes_on_restart?this.t('tls_self_signed_host 인증서는 시작할 때마다 바뀝니다. 다시 시작한 뒤에는 DoH, DoT, DoQ 스탬프를 새로 만들어야 합니다.'):'';

@@ -101,13 +101,15 @@ struct ServedCertificate {
 }
 
 pub(crate) struct Endpoints {
-    /// Plain DNS and DNSCrypt stamps need it. Without it, TLS stamps leave the client to resolve
-    /// the hostname.
+    /// Where clients reach the listeners; see `client_address`. Plain DNS and DNSCrypt stamps need
+    /// an address, and a listener bound to every address has none of its own. Without one, TLS
+    /// stamps leave the client to resolve the hostname.
     address: Option<IpAddr>,
     /// A name the certificate covers; TLS transports need one.
     hostname: Option<String>,
-    /// One per transport and port, sorted.
-    listeners: Vec<(Transport, u16)>,
+    /// One per transport, port, and bound address, sorted. The address is `None` for a listener
+    /// bound to every address.
+    listeners: Vec<(Transport, u16, Option<IpAddr>)>,
     doh_path: String,
     dnssec: bool,
     dnscrypt: Option<DnscryptIdentity>,
@@ -126,13 +128,14 @@ impl Endpoints {
         store: &TrustStore,
         now: i64,
     ) -> Result<Self, String> {
-        let mut listeners: Vec<(Transport, u16)> = served
+        let mut listeners: Vec<(Transport, u16, Option<IpAddr>)> = served
             .listeners
             .iter()
             .filter_map(|(kind, _, bound)| {
                 let transport = Transport::from_listener_kind(kind)?;
-                let port = bound.parse::<SocketAddr>().ok()?.port();
-                Some((transport, port))
+                let bound = bound.parse::<SocketAddr>().ok()?;
+                let ip = Some(bound.ip()).filter(|ip| !ip.is_unspecified());
+                Some((transport, bound.port(), ip))
             })
             .collect();
         listeners.sort_unstable();
@@ -207,23 +210,44 @@ impl Endpoints {
             .map(|cert| (cert.trusted, cert.ephemeral))
     }
 
-    /// One stamp per open listener and port. A listener is left out when the stamp would lack a
-    /// required part: an address for plain DNS and DNSCrypt, a hostname for the TLS transports.
-    pub(crate) fn stamps(&self) -> Result<Vec<(Transport, u16, String)>, String> {
+    /// The address clients use for a listener bound to `bound`, which is `None` for every address.
+    /// A listener on a loopback address is reached only there. Any other takes the requested
+    /// address, which may be a NAT front for it.
+    fn client_address(&self, bound: Option<IpAddr>) -> Option<IpAddr> {
+        match bound {
+            Some(ip) if ip.is_loopback() => Some(ip),
+            bound => self.address.or(bound),
+        }
+    }
+
+    /// One stamp per open listener, port, and client address. A listener is left out when the
+    /// stamp would lack a required part: an address for plain DNS and DNSCrypt, a hostname for the
+    /// TLS transports.
+    pub(crate) fn stamps(&self) -> Result<Vec<(Transport, u16, Option<IpAddr>, String)>, String> {
+        let mut targets: Vec<(Transport, u16, Option<IpAddr>)> = self
+            .listeners
+            .iter()
+            .map(|&(transport, port, bound)| (transport, port, self.client_address(bound)))
+            .collect();
+        targets.sort();
+        targets.dedup();
         let mut out = Vec::new();
-        for &(transport, port) in &self.listeners {
-            if let Some(stamp) = self.stamp(transport, port)? {
-                out.push((transport, port, stamp));
+        for (transport, port, address) in targets {
+            if let Some(stamp) = self.stamp(transport, port, address)? {
+                out.push((transport, port, address, stamp));
             }
         }
         Ok(out)
     }
 
-    fn stamp(&self, transport: Transport, port: u16) -> Result<Option<String>, String> {
+    fn stamp(
+        &self,
+        transport: Transport,
+        port: u16,
+        address: Option<IpAddr>,
+    ) -> Result<Option<String>, String> {
         let default_port = transport.stamp_default_port();
-        let address = self
-            .address
-            .map(|ip| with_port(&ip_literal(ip), port, default_port));
+        let address = address.map(|ip| with_port(&ip_literal(ip), port, default_port));
         let mut props = 0u64;
         if self.dnssec {
             props |= STAMP_PROP_DNSSEC;
@@ -310,10 +334,10 @@ impl Endpoints {
         let ports: Vec<u16> = self
             .listeners
             .iter()
-            .filter(|(listener, _)| *listener == transport)
-            .map(|(_, port)| *port)
+            .filter(|(listener, _, _)| *listener == transport)
+            .map(|(_, port, _)| *port)
             .collect();
-        let dns_settings = match transport {
+        let (port, dns_settings) = match transport {
             Transport::Doh => {
                 let port = if ports.contains(&443) {
                     443
@@ -325,7 +349,10 @@ impl Endpoints {
                     with_port(hostname, port, 443),
                     self.doh_path
                 );
-                plist_entries(&[("DNSProtocol", "HTTPS"), ("ServerURL", &url)])
+                (
+                    port,
+                    plist_entries(&[("DNSProtocol", "HTTPS"), ("ServerURL", &url)]),
+                )
             }
             Transport::Dot => {
                 if !ports.contains(&DOT_PORT) {
@@ -333,7 +360,10 @@ impl Endpoints {
                         "Apple devices use DNS over TLS on port {DOT_PORT} only, and no DoT listener is open on it"
                     ));
                 }
-                plist_entries(&[("DNSProtocol", "TLS"), ("ServerName", hostname)])
+                (
+                    DOT_PORT,
+                    plist_entries(&[("DNSProtocol", "TLS"), ("ServerName", hostname)]),
+                )
             }
             _ => return Err("Apple devices take DoH or DoT only".to_string()),
         };
@@ -367,7 +397,12 @@ impl Endpoints {
 
         payloads.push_str("<dict>\n<key>DNSSettings</key>\n<dict>\n");
         payloads.push_str(&dns_settings);
-        if let Some(address) = self.address {
+        let address = self
+            .listeners
+            .iter()
+            .filter(|&&(listener, at, _)| listener == transport && at == port)
+            .find_map(|&(_, _, bound)| self.client_address(bound));
+        if let Some(address) = address {
             payloads.push_str(&format!(
                 "<key>ServerAddresses</key>\n<array>\n<string>{address}</string>\n</array>\n"
             ));
@@ -526,7 +561,7 @@ mod tests {
         // the props is what this checks.
         let mut e = endpoints(true, Some("1.0.0.1"));
         e.hostname = Some("dns.cloudflare.com".to_string());
-        let stamp = e.stamp(Transport::Doh, 443).unwrap().unwrap();
+        let stamp = e.stamp(Transport::Doh, 443, e.address).unwrap().unwrap();
         let mut published =
             decode("sdns://AgcAAAAAAAAABzEuMC4wLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5");
         published[1] = STAMP_PROP_DNSSEC as u8;
@@ -558,14 +593,14 @@ mod tests {
     #[test]
     fn ports_are_written_only_when_not_the_stamp_default() {
         let e = endpoints(false, Some("2001:db8::1"));
-        let plain = decode(&e.stamp(Transport::Plain, 53).unwrap().unwrap());
+        let plain = decode(&e.stamp(Transport::Plain, 53, e.address).unwrap().unwrap());
         assert_eq!(&plain[9..], b"\x0d[2001:db8::1]");
-        let plain = decode(&e.stamp(Transport::Plain, 5353).unwrap().unwrap());
+        let plain = decode(&e.stamp(Transport::Plain, 5353, e.address).unwrap().unwrap());
         assert_eq!(&plain[9..], b"\x12[2001:db8::1]:5353");
 
         let mut e = endpoints(false, None);
         e.hostname = Some("dns.example".to_string());
-        let dot = decode(&e.stamp(Transport::Dot, 853).unwrap().unwrap());
+        let dot = decode(&e.stamp(Transport::Dot, 853, None).unwrap().unwrap());
         assert_eq!(&dot[9..], b"\x00\x00\x0fdns.example:853");
     }
 
@@ -591,10 +626,10 @@ mod tests {
     #[test]
     fn a_stamp_missing_a_required_part_is_left_out() {
         let e = endpoints(false, None);
-        assert_eq!(e.stamp(Transport::Plain, 53).unwrap(), None);
-        assert_eq!(e.stamp(Transport::Doh, 443).unwrap(), None);
+        assert_eq!(e.stamp(Transport::Plain, 53, None).unwrap(), None);
+        assert_eq!(e.stamp(Transport::Doh, 443, None).unwrap(), None);
         let e = endpoints(false, Some("192.0.2.1"));
-        assert_eq!(e.stamp(Transport::Dnscrypt, 443).unwrap(), None);
+        assert_eq!(e.stamp(Transport::Dnscrypt, 443, e.address).unwrap(), None);
     }
 
     #[test]
@@ -606,7 +641,10 @@ mod tests {
             provider_name: "2.dnscrypt.default.ns1.adguard.com".to_string(),
             public_key: published[28..60].try_into().unwrap(),
         });
-        let stamp = e.stamp(Transport::Dnscrypt, 5443).unwrap().unwrap();
+        let stamp = e
+            .stamp(Transport::Dnscrypt, 5443, e.address)
+            .unwrap()
+            .unwrap();
         published[1] = STAMP_PROP_DNSSEC as u8;
         assert_eq!(decode(&stamp), published);
     }
@@ -651,10 +689,64 @@ mod tests {
         assert_eq!(
             e.listeners,
             vec![
-                (Transport::Plain, 53),
-                (Transport::Doh, 443),
-                (Transport::Dot, 853)
+                (Transport::Plain, 53, None),
+                (Transport::Doh, 443, None),
+                (Transport::Dot, 853, None)
             ]
+        );
+    }
+
+    #[test]
+    fn a_listener_on_one_address_needs_no_address_from_the_request() {
+        let listeners = vec![
+            ("do53-udp", String::new(), "127.0.0.1:53".to_string()),
+            ("do53-udp", String::new(), "0.0.0.0:5353".to_string()),
+            ("dnscrypt", String::new(), "127.0.0.1:5443".to_string()),
+        ];
+        let stamps = |requested: Option<&str>| {
+            let served = Served {
+                listeners: listeners.clone(),
+                chain: Vec::new(),
+                chain_changes_on_restart: false,
+                dnscrypt: Some(DnscryptIdentity {
+                    provider_name: "2.dnscrypt-cert.onetdns".to_string(),
+                    public_key: [7; 32],
+                }),
+            };
+            let requested = requested.map(|ip| ip.parse().unwrap());
+            let e = Endpoints::new(
+                &Config::default(),
+                served,
+                requested,
+                None,
+                &TrustStore::empty(),
+                now(),
+            )
+            .unwrap();
+            e.stamps()
+                .unwrap()
+                .into_iter()
+                .map(|(transport, port, address, _)| (transport, port, address))
+                .collect::<Vec<_>>()
+        };
+        let local = Some("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            stamps(None),
+            vec![
+                (Transport::Plain, 53, local),
+                (Transport::Dnscrypt, 5443, local)
+            ],
+            "모든 주소에 묶인 리스너는 요청 주소 없이 스탬프를 만들 수 없습니다"
+        );
+        let lan = Some("192.168.0.10".parse().unwrap());
+        assert_eq!(
+            stamps(Some("192.168.0.10")),
+            vec![
+                (Transport::Plain, 53, local),
+                (Transport::Plain, 5353, lan),
+                (Transport::Dnscrypt, 5443, local)
+            ],
+            "루프백에 묶인 리스너에 다른 주소로 스탬프를 만들었습니다"
         );
     }
 
@@ -706,7 +798,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.certificate_status(), Some((false, false)));
-        let bytes = decode(&e.stamps().unwrap()[0].2);
+        let bytes = decode(&e.stamps().unwrap()[0].3);
         assert_eq!(&bytes[9..11], &[0, 32]);
         assert_eq!(&bytes[11..43], &Sha256::digest(&tbs)[..]);
 
@@ -714,7 +806,7 @@ mod tests {
         let store = TrustStore::from_ders([leaf.as_slice()]);
         let e = Endpoints::new(&Config::default(), s, None, None, &store, now()).unwrap();
         assert_eq!(e.certificate_status(), Some((true, false)));
-        let bytes = decode(&e.stamps().unwrap()[0].2);
+        let bytes = decode(&e.stamps().unwrap()[0].3);
         assert_eq!(&bytes[9..11], &[0, 0], "신뢰하는 체인에 해시를 넣었습니다");
     }
 

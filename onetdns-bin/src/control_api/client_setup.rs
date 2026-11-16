@@ -49,10 +49,11 @@ impl ControlDeps {
         let stamps: Vec<String> = endpoints
             .stamps()?
             .into_iter()
-            .map(|(transport, port, stamp)| {
+            .map(|(transport, port, address, stamp)| {
                 format!(
-                    "{{\"protocol\":\"{}\",\"port\":{port},\"stamp\":{}}}",
+                    "{{\"protocol\":\"{}\",\"port\":{port},\"address\":{},\"stamp\":{}}}",
                     transport.name(),
+                    address.map_or("null".to_string(), |ip| esc(&ip.to_string())),
                     esc(&stamp)
                 )
             })

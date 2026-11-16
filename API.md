@@ -927,7 +927,7 @@ DNS stamps and Apple configuration profiles that point clients at this server.
 
 | Method | Path | Access | Summary |
 |---|---|---|---|
-| POST | `/v1/client-setup/stamps` | admin | DNS stamps (sdns://) for the open listeners, one per protocol and port (admin only). Plain DNS and DNSCrypt stamps need `address`; DoH, DoT, and DoQ stamps need a name the served certificate covers, by default `ddr_name` or the first name in the certificate. A chain this machine does not trust is pinned by the hash of its topmost certificate |
+| POST | `/v1/client-setup/stamps` | admin | DNS stamps (sdns://) for the open listeners, one per protocol, address, and port (admin only). Plain DNS and DNSCrypt stamps use `address`, or the IP the listener is bound to; a listener on a loopback address keeps it. DoH, DoT, and DoQ stamps need a name the served certificate covers, by default `ddr_name` or the first name in the certificate. A chain this machine does not trust is pinned by the hash of its topmost certificate |
 | POST | `/v1/client-setup/apple-profile` | admin | Apple configuration profile (.mobileconfig) that sets the system DNS to this server over DoH or DoT (admin only). It carries the root certificate when this machine does not trust the chain, and with `ssids` it applies only on those Wi-Fi networks. Refused when Apple devices would reject the certificate or when the certificate changes at every start |
 
 #### `POST /v1/client-setup/stamps`
@@ -941,7 +941,7 @@ Request body (`application/json`):
 
 | Status | Response |
 |---|---|
-| 200 | `{address,hostname,certificate:{trusted,changes_on_restart},stamps:[{protocol,port,stamp}]}` |
+| 200 | `{address,hostname,certificate:{trusted,changes_on_restart},stamps:[{protocol,port,address,stamp}]}` |
 | 400 | `{error}` |
 
 #### `POST /v1/client-setup/apple-profile`
