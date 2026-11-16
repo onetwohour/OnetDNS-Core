@@ -3,6 +3,7 @@
 //! channel between the two, and the order in which the successor takes over.
 
 use std::net::{SocketAddr, TcpListener, UdpSocket};
+#[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +16,9 @@ use zeroize::Zeroizing;
 use crate::config_apply::{install_restart, SecondaryRestart};
 use crate::listeners::{ListenerSet, TicketKeys, TlsSlots};
 use crate::GenerationJobs;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod wire;
 
 /// What a listening socket serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +187,9 @@ pub(crate) enum LinkError {
     TimedOut,
     /// The waiting side was told to stop.
     Aborted,
+    /// The other side sent something this process cannot read.
+    #[cfg(target_os = "linux")]
+    Unreadable,
 }
 
 impl std::fmt::Display for LinkError {
@@ -191,6 +198,8 @@ impl std::fmt::Display for LinkError {
             LinkError::Gone => "the other process ended",
             LinkError::TimedOut => "the other process did not answer in time",
             LinkError::Aborted => "stopped while waiting",
+            #[cfg(target_os = "linux")]
+            LinkError::Unreadable => "the other process sent a message this one cannot read",
         })
     }
 }
@@ -200,7 +209,13 @@ const LINK_POLL: Duration = Duration::from_millis(200);
 
 /// One end of the channel between a running generation and its successor.
 pub(crate) struct Link<Out, In> {
+    #[cfg(target_os = "linux")]
+    stream: std::os::unix::net::UnixStream,
+    #[cfg(target_os = "linux")]
+    messages: std::marker::PhantomData<fn(Out) -> In>,
+    #[cfg(not(target_os = "linux"))]
     tx: mpsc::Sender<Out>,
+    #[cfg(not(target_os = "linux"))]
     rx: mpsc::Receiver<In>,
 }
 
@@ -210,7 +225,15 @@ pub(crate) type SuccessorLink = Link<FromPredecessor, FromSuccessor>;
 pub(crate) type PredecessorLink = Link<FromSuccessor, FromPredecessor>;
 
 /// Both ends in one process.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn link() -> (SuccessorLink, PredecessorLink) {
+    let (predecessor, successor) =
+        std::os::unix::net::UnixStream::pair().expect("a socket pair for the handoff link");
+    (Link::over(predecessor), Link::over(successor))
+}
+
+/// Both ends in one process.
+#[cfg(all(test, not(target_os = "linux")))]
 pub(crate) fn link() -> (SuccessorLink, PredecessorLink) {
     let (to_successor, from_predecessor) = mpsc::channel();
     let (to_predecessor, from_successor) = mpsc::channel();
@@ -226,6 +249,7 @@ pub(crate) fn link() -> (SuccessorLink, PredecessorLink) {
     )
 }
 
+#[cfg(not(target_os = "linux"))]
 impl<Out, In> Link<Out, In> {
     pub(crate) fn send(&self, message: Out) -> Result<(), LinkError> {
         self.tx.send(message).map_err(|_| LinkError::Gone)

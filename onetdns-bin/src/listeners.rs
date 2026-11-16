@@ -135,6 +135,23 @@ pub(crate) struct TicketKeys {
     doh3: Option<Zeroizing<[u8; 32]>>,
 }
 
+#[cfg(target_os = "linux")]
+impl TicketKeys {
+    /// DoT, DoH, DoQ, DoH3.
+    pub(crate) fn each(&self) -> [Option<&Zeroizing<[u8; 32]>>; 4] {
+        [&self.dot, &self.doh, &self.doq, &self.doh3].map(Option::as_ref)
+    }
+
+    pub(crate) fn from_each([dot, doh, doq, doh3]: [Option<Zeroizing<[u8; 32]>>; 4]) -> Self {
+        Self {
+            dot,
+            doh,
+            doq,
+            doh3,
+        }
+    }
+}
+
 impl TlsSlots {
     /// Built from the current config if absent, so slots appear when a certificate and an encrypted
     /// address are added later. Building them up front would fail startup without a certificate.
