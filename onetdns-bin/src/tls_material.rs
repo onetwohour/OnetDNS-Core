@@ -1,11 +1,12 @@
 //! TLS certificates and keys: loading, checks, server config, and replacement through the
 //! management API.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use onetdns_config::Config;
+use onetdns_core::MutexExt;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::{atomic_write_secret, commit_cert_key, rollback_cert_key};
@@ -21,11 +22,16 @@ use crate::{
 /// One certificate and key for every encrypted transport. Per-transport self-signed certificates
 /// would differ, and a client that pinned one could not connect over another; DDR announcing
 /// several encrypted endpoints makes this visible.
-pub(crate) fn native_tls_material(cfg: &Config) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+///
+/// `self_signed_file` is where the `tls_self_signed_host` certificate is kept; `None` without a
+/// config file, and then the certificate changes at every start.
+pub(crate) fn native_tls_material(
+    cfg: &Config,
+    self_signed_file: Option<&Path>,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     if let Some(host) = &cfg.tls_self_signed_host {
         onetdns_core::warn!(event = "tls.self_signed_in_use", host = %host, "Serving encrypted DNS with a self-signed certificate; clients will not connect unless they disable certificate verification");
-        return onetdns_transport::self_signed_material(host)
-            .map_err(|error| format!("Could not create a self-signed TLS certificate: {error}"));
+        return self_signed_material(host, self_signed_file);
     }
     if let (Some(c), Some(k)) = (&cfg.tls_cert, &cfg.tls_key) {
         return onetdns_transport::load_pem(c, k).map_err(|error| {
@@ -33,6 +39,76 @@ pub(crate) fn native_tls_material(cfg: &Config) -> Result<(Vec<Vec<u8>>, Vec<u8>
         });
     }
     Err("There is no TLS certificate for the encrypted DNS listening addresses".to_string())
+}
+
+/// Next to the config file. Stamps and Apple profiles pin this certificate, so it must outlive a
+/// restart.
+pub(crate) fn self_signed_file(config_path: Option<&Path>) -> Option<PathBuf> {
+    Some(config_path?.parent()?.join("tls-self-signed.pem"))
+}
+
+/// A new certificate is made only when the kept one is missing, does not load, is for another
+/// host, or has less than this left.
+const SELF_SIGNED_RENEW_SECS: i64 = 30 * 86400;
+
+fn self_signed_material(
+    host: &str,
+    file: Option<&Path>,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    // Listener setup and a hot apply can both get here; one must not overwrite what the other
+    // just started serving.
+    static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CREATE.lock_recover();
+    if let Some(material) = file.and_then(|file| kept_self_signed(file, host)) {
+        return Ok(material);
+    }
+    let (cert, key) = onetdns_transport::generate_self_signed_pem(host)
+        .map_err(|error| format!("Could not create a self-signed TLS certificate: {error}"))?;
+    let key = Zeroizing::new(key);
+    let material = onetdns_transport::parse_pem(&cert, &key)
+        .map_err(|error| format!("Could not create a self-signed TLS certificate: {error}"))?;
+    let Some(file) = file else {
+        return Ok(material);
+    };
+    let text = Zeroizing::new(format!("{cert}{}", key.as_str()));
+    match atomic_write_secret(file, text.as_bytes()) {
+        Ok(()) => {
+            onetdns_core::info!(event = "tls.self_signed_created", host = %host, path = %file.display(), "Created a self-signed certificate and saved it for later starts")
+        }
+        Err(error) => {
+            onetdns_core::warn!(event = "tls.self_signed_save_failed", path = %file.display(), %error, "Could not save the self-signed certificate; a new one will be made at the next start, and clients that pinned this one will stop connecting")
+        }
+    }
+    Ok(material)
+}
+
+fn kept_self_signed(file: &Path, host: &str) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    if !file.exists() {
+        return None;
+    }
+    let (certs, key) = match onetdns_transport::load_pem(file, file) {
+        Ok(material) => material,
+        Err(error) => {
+            onetdns_core::warn!(event = "tls.self_signed_unreadable", path = %file.display(), %error, "Could not use the saved self-signed certificate; making a new one");
+            return None;
+        }
+    };
+    let leaf = onetdns_tls::X509::parse(certs.first()?).ok()?;
+    let usable = leaf.matches_hostname(host)
+        && leaf.not_after - unix_now() as i64 > SELF_SIGNED_RENEW_SECS
+        && onetdns_transport::verify_key_matches_cert(&certs[0], &key).is_ok();
+    usable.then_some((certs, key))
+}
+
+/// Whether `leaf` is the certificate kept in `file`, so it is served again after a restart.
+pub(crate) fn self_signed_is_kept(file: Option<&Path>, leaf: &[u8]) -> bool {
+    let Some(text) = file.and_then(|file| read_text_limited(file, LOCAL_KEY_MAX_BYTES).ok()) else {
+        return false;
+    };
+    let text = Zeroizing::new(text);
+    crate::revoke::pem_chain_to_ders(&text)
+        .first()
+        .is_some_and(|kept| kept.as_slice() == leaf)
 }
 
 pub(crate) fn native_tls_config(
@@ -407,4 +483,37 @@ pub(crate) fn acme_issue_run(
             .map(onetdns_core::json::escape)
             .unwrap_or_else(|| "null".to_string()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_self_signed_certificate_is_kept_while_its_host_stays() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-self-signed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("시험용 디렉터리");
+        let file = self_signed_file(Some(&dir.join("OnetDNS.toml"))).unwrap();
+
+        let (first, _) = self_signed_material("dns.example", Some(&file)).unwrap();
+        assert!(self_signed_is_kept(Some(&file), &first[0]));
+        let (again, _) = self_signed_material("dns.example", Some(&file)).unwrap();
+        assert_eq!(first, again, "다시 시작하면 인증서가 바뀝니다");
+
+        let (other, _) = self_signed_material("other.example", Some(&file)).unwrap();
+        assert_ne!(first, other, "다른 호스트에 이전 인증서를 썼습니다");
+        assert!(!self_signed_is_kept(Some(&file), &first[0]));
+        assert!(self_signed_is_kept(Some(&file), &other[0]));
+
+        let (unkept, _) = self_signed_material("dns.example", None).unwrap();
+        assert!(!self_signed_is_kept(None, &unkept[0]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

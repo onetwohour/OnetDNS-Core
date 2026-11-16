@@ -99,6 +99,8 @@ pub(crate) struct HotApplyDeps {
     pub(crate) dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<dhcp6::Lease6Pool>>>>>,
     /// `None` without an encrypted listener.
     pub(crate) tls_slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
+    /// Where the `tls_self_signed_host` certificate is kept; `None` without a config file.
+    pub(crate) self_signed_tls: Option<std::path::PathBuf>,
     pub(crate) vendor_db: Arc<ArcSwap<mac::VendorDb>>,
     /// Resolves the host names in the server's own HTTP requests.
     pub(crate) blocklist_resolver_slot: Arc<Mutex<http::HostResolver>>,
@@ -266,6 +268,7 @@ impl HotApplyDeps {
             forward_stats,
             native_hot_state,
             tls_slots,
+            self_signed_tls,
             ..
         } = self;
 
@@ -323,7 +326,7 @@ impl HotApplyDeps {
         let slots = tls_slots.lock_recover().clone();
         let tls = match slots {
             Some(slots) if groups.contains(&ApplyGroup::Tls) => {
-                Some((TlsSlots::prepare(next)?, slots))
+                Some((TlsSlots::prepare(next, self_signed_tls.as_deref())?, slots))
             }
             _ => None,
         };

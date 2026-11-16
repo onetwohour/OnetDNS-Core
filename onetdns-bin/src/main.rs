@@ -1456,6 +1456,7 @@ pub fn serve(
         dhcp_slot: dhcp_slot.clone(),
         dhcp6_slot: dhcp6_slot.clone(),
         tls_slots: tls_slot_handle.clone(),
+        self_signed_tls: tls_material::self_signed_file(config_path.as_deref()),
         vendor_db: vendor_db.clone(),
         blocklist_resolver_slot: blocklist_resolver_slot.clone(),
         revocation_resolver_slot: revocation_resolver_slot.clone(),
@@ -1559,7 +1560,15 @@ pub fn serve(
             let tracker = service_cleanup.tracker();
             let identity = dnscrypt_identity.clone();
             Arc::new(move |next: &Config| -> Result<(), String> {
-                reconcile_listeners(next, &set, &handler, &slots, &sd, &registry)?;
+                reconcile_listeners(
+                    next,
+                    &set,
+                    &handler,
+                    &slots,
+                    &sd,
+                    &registry,
+                    tls_material::self_signed_file(path.as_deref()).as_deref(),
+                )?;
                 reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
             }) as SecondaryRestart
         },
@@ -2717,7 +2726,7 @@ mod tests {
             tls_self_signed_host: Some("localhost".to_string()),
             ..Config::default()
         };
-        let material = native_tls_material(&cfg).expect("TLS 인증서를 읽지 못했습니다");
+        let material = native_tls_material(&cfg, None).expect("TLS 인증서를 읽지 못했습니다");
         let (dot, doh, doq, doh3) =
             tls_configs_from(&cfg, &material).expect("TLS 설정을 만들지 못했습니다");
         assert!(!dot.cert_chain.is_empty(), "인증서 체인이 비었습니다");

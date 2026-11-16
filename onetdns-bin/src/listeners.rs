@@ -130,17 +130,21 @@ impl TlsSlots {
     fn get_or_build(
         handle: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
         cfg: &Config,
+        self_signed_file: Option<&std::path::Path>,
     ) -> Result<Arc<TlsSlots>, String> {
         if let Some(slots) = handle.lock_recover().clone() {
             return Ok(slots);
         }
-        let slots = Arc::new(TlsSlots::from_config(cfg)?);
+        let slots = Arc::new(TlsSlots::from_config(cfg, self_signed_file)?);
         *handle.lock_recover() = Some(slots.clone());
         Ok(slots)
     }
 
-    fn from_config(cfg: &Config) -> Result<Self, String> {
-        let material = native_tls_material(cfg)?;
+    fn from_config(
+        cfg: &Config,
+        self_signed_file: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        let material = native_tls_material(cfg, self_signed_file)?;
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
         Ok(TlsSlots {
             dot: Arc::new(onetdns_core::ArcSwap::new(dot)),
@@ -167,7 +171,7 @@ impl TlsSlots {
         // The whole swap happens under this lock. With a reapply and the watcher overlapping, slots
         // filled from different certificates would present a different one per transport.
         let mut live = self.live_files.lock_recover();
-        let material = native_tls_material(cfg)?;
+        let material = native_tls_material(cfg, None)?;
         let fresh = live_tls_files(cfg, material.0.clone())?;
         let mut changed = Vec::new();
         if live.certs != fresh.certs {
@@ -189,8 +193,11 @@ impl TlsSlots {
     }
 
     /// Leaves the slots alone. Fails on an invalid certificate or private key.
-    pub(crate) fn prepare(cfg: &Config) -> Result<PreparedTls, String> {
-        let material = native_tls_material(cfg)?;
+    pub(crate) fn prepare(
+        cfg: &Config,
+        self_signed_file: Option<&std::path::Path>,
+    ) -> Result<PreparedTls, String> {
+        let material = native_tls_material(cfg, self_signed_file)?;
         let files = live_tls_files(cfg, material.0.clone())?;
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
         Ok(PreparedTls {
@@ -360,6 +367,7 @@ pub(crate) fn reconcile_listeners(
     tls: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
+    self_signed_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let available_cpus = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -442,7 +450,7 @@ pub(crate) fn reconcile_listeners(
     plain.extend(fresh_plain);
     drop(plain);
 
-    reconcile_encrypted(cfg, set, handler, tls, shutdown, registry)
+    reconcile_encrypted(cfg, set, handler, tls, shutdown, registry, self_signed_file)
 }
 
 /// Plain DNS is left alone.
@@ -453,6 +461,7 @@ fn reconcile_encrypted(
     tls: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
+    self_signed_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
     const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
 
@@ -507,7 +516,7 @@ fn reconcile_encrypted(
     }
 
     let need = |pick: fn(&TlsSlots) -> Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>| {
-        TlsSlots::get_or_build(tls, cfg)
+        TlsSlots::get_or_build(tls, cfg, self_signed_file)
             .map(|slots| pick(&slots))
             .map_err(|error| format!("{NEED_TLS}: {error}"))
     };
@@ -845,7 +854,7 @@ mod tests {
             tls_key: Some(key_path.clone()),
             ..Config::default()
         };
-        let slots = TlsSlots::from_config(&cfg).expect("슬롯 생성");
+        let slots = TlsSlots::from_config(&cfg, None).expect("슬롯 생성");
         let before = slots.dot.load().cert_chain.clone();
 
         assert!(
@@ -883,7 +892,7 @@ mod tests {
             tls_client_ca: Some(ca_path.clone()),
             ..cfg.clone()
         };
-        let mtls_slots = TlsSlots::from_config(&mtls).expect("mTLS 슬롯 생성");
+        let mtls_slots = TlsSlots::from_config(&mtls, None).expect("mTLS 슬롯 생성");
         assert!(
             mtls_slots
                 .refresh_certificate_files(&mtls)

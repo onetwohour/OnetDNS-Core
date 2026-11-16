@@ -85,6 +85,9 @@ pub(crate) struct Served {
     pub(crate) listeners: Vec<(&'static str, String, String)>,
     /// What the encrypted listeners present, leaf first; empty without one.
     pub(crate) chain: Vec<Vec<u8>>,
+    /// A `tls_self_signed_host` certificate that is not kept in a file, so the next start replaces
+    /// it.
+    pub(crate) chain_changes_on_restart: bool,
     pub(crate) dnscrypt: Option<DnscryptIdentity>,
 }
 
@@ -93,7 +96,7 @@ struct ServedCertificate {
     parsed: Vec<X509>,
     /// Whether this machine's trust store accepts the chain for the chosen hostname.
     trusted: bool,
-    /// `tls_self_signed_host` makes a new certificate at every start.
+    /// Replaced at the next start; see `Served::chain_changes_on_restart`.
     ephemeral: bool,
 }
 
@@ -174,7 +177,7 @@ impl Endpoints {
                 der: served.chain,
                 parsed,
                 trusted,
-                ephemeral: cfg.tls_self_signed_host.is_some(),
+                ephemeral: served.chain_changes_on_restart,
             });
         }
 
@@ -289,7 +292,7 @@ impl Endpoints {
             .as_deref()
             .ok_or("The served certificate names no host to connect to")?;
         if cert.ephemeral {
-            return Err("The tls_self_signed_host certificate changes at every start, so a profile made from it stops working after a restart. Create a lasting certificate with `OnetDNS --cli cert --host <name>` and set tls_cert and tls_key".to_string());
+            return Err("The tls_self_signed_host certificate could not be kept in a file, so it changes at every start and a profile made from it would stop working after a restart. Run with a config file, or create a certificate with `OnetDNS --cli cert --host <name>` and set tls_cert and tls_key".to_string());
         }
         let leaf = &cert.parsed[0];
         if leaf.eku_server_auth != Some(true)
@@ -617,6 +620,7 @@ mod tests {
                 .map(|(kind, bound)| (*kind, bound.to_string(), bound.to_string()))
                 .collect(),
             chain,
+            chain_changes_on_restart: false,
             dnscrypt: None,
         };
         (served, leaf)

@@ -13,18 +13,27 @@ impl ControlDeps {
                 .filter(|value| !value.is_empty())
         };
         let address = text("address").map(parse_address).transpose()?;
+        let cfg = self.runtime_cfg.load();
+        let chain = self
+            .tls_slot_handle
+            .lock_recover()
+            .as_ref()
+            .map(|slots| slots.served_chain())
+            .unwrap_or_default();
+        let kept = || {
+            let file = crate::tls_material::self_signed_file(self.config_path.as_deref());
+            chain
+                .first()
+                .is_some_and(|leaf| crate::tls_material::self_signed_is_kept(file.as_deref(), leaf))
+        };
         let served = Served {
             listeners: self.listener_reg.lock_recover().clone(),
-            chain: self
-                .tls_slot_handle
-                .lock_recover()
-                .as_ref()
-                .map(|slots| slots.served_chain())
-                .unwrap_or_default(),
+            chain_changes_on_restart: cfg.tls_self_signed_host.is_some() && !kept(),
+            chain,
             dnscrypt: self.dnscrypt_identity.lock_recover().clone(),
         };
         Endpoints::new(
-            &self.runtime_cfg.load(),
+            &cfg,
             served,
             address,
             text("hostname"),
