@@ -3061,7 +3061,7 @@ Object.assign(I18N.ja, {
 
 Object.assign(I18N.en, {
   '조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'Viewing and diagnostics remain available; change controls are disabled.','· 조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'· Viewing and diagnostics remain available; change controls are disabled.',
-  '계정 메뉴':'Account menu','변경 적용':'Apply changes','선택 항목':'Selected option','연결 상태 테스트':'Test connectivity',
+  '계정 메뉴':'Account menu','변경 적용':'Apply changes','선택 항목':'Selected option','연결 상태 테스트':'Test connectivity','테스트 실패: {error}':'Test failed: {error}','테스트 {ms}ms':'Test {ms} ms',
   '인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.':'Authentication is protected by an HttpOnly session cookie and cannot be displayed or copied.',
   '인증서 검증':'Validate certificate','읽기 전용 세션':'Read-only session','주요 메뉴':'Primary navigation','현재 세션':'Current session',
   '미적용 변경':'Pending changes','취소':'Cancel','기존 비밀값은 표시하지 않습니다. 변경할 때만 새 값을 입력하세요.':'Existing secrets are not shown. Enter a new value only when changing it.',
@@ -3069,7 +3069,7 @@ Object.assign(I18N.en, {
 });
 Object.assign(I18N.ja, {
   '조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'閲覧と診断のみ利用でき、変更操作は無効です。','· 조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'· 閲覧と診断のみ利用でき、変更操作は無効です。',
-  '계정 메뉴':'アカウントメニュー','변경 적용':'変更を適用','선택 항목':'選択項目','연결 상태 테스트':'接続状態をテスト',
+  '계정 메뉴':'アカウントメニュー','변경 적용':'変更を適用','선택 항목':'選択項目','연결 상태 테스트':'接続状態をテスト','테스트 실패: {error}':'テスト失敗: {error}','테스트 {ms}ms':'テスト {ms}ms',
   '인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.':'認証情報は HttpOnly セッションクッキーで保護され、表示やコピーはできません。',
   '인증서 검증':'証明書を検証','읽기 전용 세션':'読み取り専用セッション','주요 메뉴':'メインナビゲーション','현재 세션':'現在のセッション',
   '미적용 변경':'未適用の変更','취소':'取り消し','기존 비밀값은 표시하지 않습니다. 변경할 때만 새 값을 입력하세요.':'既存の秘密値は表示されません。変更時のみ新しい値を入力してください。',
@@ -4113,7 +4113,7 @@ Object.assign(I18N.zh, {
   "계정 메뉴":"账户菜单",
   "변경 적용":"应用更改",
   "선택 항목":"所选项目",
-  "연결 상태 테스트":"测试连接状态",
+  "연결 상태 테스트":"测试连接状态","테스트 실패: {error}":"测试失败：{error}","테스트 {ms}ms":"测试 {ms}ms",
   "인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.":"认证信息受 HttpOnly 会话 Cookie 保护，无法显示或复制。",
   "인증서 검증":"验证证书",
   "읽기 전용 세션":"只读会话",
@@ -4889,6 +4889,8 @@ class Component extends DCLogic {
     }
     this.timer=setInterval(()=>this.tick(),1000);
     this._configPoll=setInterval(()=>this.loadConfigStatus(),5000);
+    // Upstream stats do not come over the stream, so the open upstreams page reads them again.
+    this._upstreamPoll=setInterval(()=>{if(this.state.loggedIn&&this.state.view==='upstreams')this.loadUpstreams();},5000);
     this._auditPoll=setInterval(()=>{if(this.state.loggedIn)this.loadAudit();},10000);
     this._updatePoll=setInterval(()=>{if(this.state.loggedIn&&!this._updateWatch)this.loadUpdate();},60000);
     this._fallbackPoll=setInterval(()=>{
@@ -4934,6 +4936,7 @@ class Component extends DCLogic {
   componentWillUnmount(){
     clearInterval(this.timer);
     clearInterval(this._configPoll);
+    clearInterval(this._upstreamPoll);
     clearInterval(this._auditPoll);
     clearInterval(this._updatePoll);
     clearInterval(this._fallbackPoll);
@@ -5604,13 +5607,15 @@ class Component extends DCLogic {
   checkZoneDnssec=async()=>{const origin=String(this.state.forms.dnssecZone||'').trim();if(!this.validDomain(origin))return this.toastMsg('유효한 DNS 영역 이름을 입력하세요',true);const r=await this.apiGet('/v1/zones/'+encodeURIComponent(origin)+'/dnssec');this.setState({zoneDnssec:r.ok?{origin,...r.body}:{origin,error:this.errorText(r)}});this.toastMsg(r.ok?'DNSSEC 상태를 조회했습니다':'DNSSEC 상태 조회 실패',!r.ok);};
   upstreamRow=(u)=>{
     const addr=u.addr;
-    return {id:u.id,addr,proto:/^h3/.test(addr)?'DoH3':/^https/.test(addr)?'DoH':/^tls/.test(addr)?'DoT':/^quic/.test(addr)?'DoQ':'UDP',latency:null,status:'unknown',
+    return {id:u.id,addr,proto:/^h3/.test(addr)?'DoH3':/^https/.test(addr)?'DoH':/^tls/.test(addr)?'DoT':/^quic/.test(addr)?'DoQ':'UDP',latency:null,status:'unknown',testError:'',
       queries:Number(u.queries)||0,okCount:Number(u.ok)||0,failCount:Number(u.fail)||0,ewma:u.ewma_ms!=null?Number(u.ewma_ms):null};
   };
   async loadUpstreams(){
     const fresh=this.writeGuard('upstreams');const up=await this.apiGet('/v1/upstreams');
     if(!(up.ok&&Array.isArray(up.body))||!fresh()) return;
-    this.setState({upstreams:up.body.map(this.upstreamRow)});return true;
+    // A reload brings live stats; a test result stays with its address until the next test.
+    this.setState(s=>{const tested=new Map(s.upstreams.map(u=>[u.addr,u]));return {upstreams:up.body.map(x=>{const row=this.upstreamRow(x),old=tested.get(row.addr);return old?{...row,status:old.status,latency:old.latency,testError:old.testError}:row;})};});
+    return true;
   }
   testUpstreams=async()=>{
     const runId=(this._upstreamProbeRun||0)+1;this._upstreamProbeRun=runId;
@@ -5620,8 +5625,8 @@ class Component extends DCLogic {
       if(this._upstreamProbeRun!==runId) return;
       this.setState(s=>({upstreams:s.upstreams.map(x=>{
         if(x.id!==u.id||x.addr!==u.addr)return x;
-        if(r.ok&&r.body){const ok=r.body.ok===true;return {...x,status:ok?'ok':'error',latency:ok&&r.body.latency_ms!=null?Number(r.body.latency_ms):null};}
-        return {...x,status:'unavailable',latency:null};
+        if(r.ok&&r.body){const ok=r.body.ok===true;return {...x,status:ok?'ok':'error',latency:ok&&r.body.latency_ms!=null?Number(r.body.latency_ms):null,testError:ok?'':String(r.body.error||'')};}
+        return {...x,status:'unavailable',latency:null,testError:''};
       })}));
     }
   }
@@ -5899,6 +5904,7 @@ class Component extends DCLogic {
     if(prevState&&prevState.view!==this.state.view&&this.state.loggedIn){
       if(this.state.view==='lists'){this.loadRewrites();this.loadFilterDiagnostics();}
       if(this.state.view==='clients')this.loadAccess();
+      if(this.state.view==='upstreams')this.loadUpstreams();
       if(this.state.view==='operations'&&!this._updateWatch)this.loadUpdate();
     }
     // 임대와 고정 할당은 실시간 스트림으로 오지 않는다. 화면에 들어올 때 다시 읽지 않으면
@@ -7126,12 +7132,13 @@ class Component extends DCLogic {
 
     const protoColor={UDP:'var(--muted)',TCP:'var(--muted)',DoH:'var(--accent)',DoH3:'var(--accent)',DoT:'var(--accent)',DoQ:'var(--violet)'};
     const upstreams=s.upstreams.map(u=>{
-      // 속도는 하나만: 실측 EWMA가 있으면 그것, 없으면 프로브 지연.
-      const speed=u.queries>0&&u.ewma!=null?Math.round(u.ewma):u.latency;
+      // The test latency shows once: in the speed column without live traffic, in the stats line with it.
+      const live=u.queries>0&&u.ewma!=null,speed=live?Math.round(u.ewma):u.latency;
+      const test=u.status==='error'&&u.testError?this.tr('테스트 실패: {error}',{error:this.t(u.testError)}):u.status==='ok'&&live&&u.latency!=null?this.tr('테스트 {ms}ms',{ms:u.latency}):'';
       return {...u, onRemove:this.removeUpstream(u.id),removeLabel:this.tr('{addr} 업스트림 DNS 서버 삭제',{addr:u.addr}),
       protoColor:protoColor[u.proto]||'var(--muted)',
       latColor:speed==null?'var(--muted)':speed<20?'var(--ok)':speed<40?'var(--warn)':'var(--block)',latencyLabel:speed==null?this.t('미측정'):speed+'ms',statusLabel:this.t(u.status==='ok'?'정상':u.status==='error'?'실패':u.status==='unavailable'?'테스트 미지원':'미측정'),statusColor:u.status==='ok'?'var(--ok)':u.status==='error'?'var(--block)':'var(--muted)',
-      statsLabel:u.queries>0?this.tr('{queries} 질의 · 성공 {success}%',{queries:u.queries.toLocaleString(this.locale()),success:Math.round(u.okCount/u.queries*100)}):''};});
+      statsLabel:[u.queries>0?this.tr('{queries} 질의 · 성공 {success}%',{queries:u.queries.toLocaleString(this.locale()),success:Math.round(u.okCount/u.queries*100)}):'',test].filter(Boolean).join(' · ')};});
     const strategies=[['parallel','병렬','모든 업스트림 DNS 서버 동시 질의, 최초 응답 채택'],['fastest','가장 빠른 서버','지연 기준 가장 빠른 서버'],['sequential','순차','앞 서버가 실패하면 다음 서버로 전환'],['roundrobin','순환 분배','요청마다 분산']].map(([k,label,desc])=>({k,label:this.t(label),desc:this.t(desc),on:s.strategy===k,onClick:this.setStrategy(k),
       style:`text-align:left;padding:13px 15px;border-radius:3px;cursor:pointer;font:inherit;border:1.5px solid ${s.strategy===k?'var(--accent)':'var(--border)'};background:${s.strategy===k?'var(--accent-bg)':'var(--surface)'}`}));
     const backends=[['forwarding','업스트림 서버로 전달','지정한 업스트림 DNS 서버로 질의 전달'],['recursive','재귀','루트부터 직접 해석'],['split','분할','도메인별로 전달 또는 직접 해석']].map(([k,label,desc])=>({k,label:this.t(label),desc:this.t(desc),on:s.backend===k,onClick:this.setBackend(k),
