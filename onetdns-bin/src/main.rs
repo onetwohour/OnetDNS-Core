@@ -848,24 +848,24 @@ fn gen_token() -> String {
     s
 }
 
-/// Starts the list refresh, DNSSEC re-signing and upstream statistics writer, stopping the ones
-/// started before. The re-signing and statistics threads are joined when `jobs` retires, so their
-/// files are finished by then; a list download in progress ends on its own.
+/// Starts the list refresh, DNSSEC re-signing and upstream statistics writer after stopping and
+/// joining the ones started before. `jobs` joins them when it retires, so once that returns no
+/// download, signature or statistics write of theirs is still running.
 fn singletons_restart(
     jobs: Arc<EdgeServices>,
     filters: filter_runtime::FilterState,
     zones: ZoneState,
     forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     stats_path: Option<PathBuf>,
-    threads: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> SecondaryRestart {
     Arc::new(move |next: &Config| -> Result<(), String> {
+        jobs.retire_all();
         let stop = jobs.restart_all();
-        for thread in filters
+        for (name, thread) in filters
             .spawn_refresh(&stop)
             .map_err(|error| error.to_string())?
         {
-            track_service_thread(&threads, thread);
+            jobs.keep(name, thread);
         }
         let zone_files = configured_zone_files(next)?;
         if let Some(thread) = spawn_resign_timer(
@@ -1423,7 +1423,6 @@ pub fn serve(
             zones.clone(),
             forward_stats.clone(),
             upstream_stats_path(config_path.as_deref()),
-            service_cleanup.tracker(),
         ),
         &cfg,
     )

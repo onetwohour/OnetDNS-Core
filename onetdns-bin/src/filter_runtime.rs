@@ -23,9 +23,10 @@ use crate::filters::{
 use crate::native_config::map_block;
 use crate::{http, sleep_or_shutdown, ServiceCleanup};
 
-/// Downloads the subscribed lists and rebuilds; returns the block and allow rule counts.
+/// Downloads the subscribed lists and rebuilds; returns the block and allow rule counts. Setting the
+/// flag ends the downloads.
 pub(crate) type ListRefresh =
-    Arc<dyn Fn() -> Result<(usize, usize), String> + Send + Sync + 'static>;
+    Arc<dyn Fn(&Arc<AtomicBool>) -> Result<(usize, usize), String> + Send + Sync + 'static>;
 
 /// How long a requested rebuild waits for more changes, so a burst costs one build.
 const DEFERRED_REBUILD_SETTLE: Duration = Duration::from_millis(250);
@@ -145,12 +146,10 @@ pub(crate) struct FilterState {
     pub(crate) deferred_rebuild: Arc<DeferredRebuild>,
     pub(crate) refresh_url_lists: ListRefresh,
     blocklist_resolver: http::HostResolver,
-    /// Until set, a started refresh job fetches the URL lists at once instead of after its period.
-    lists_fetched_once: Arc<AtomicBool>,
-    /// The same for the RPZ feeds.
-    rpz_fetched_once: Arc<AtomicBool>,
-    /// The RPZ URLs whose texts `rpz_texts` holds.
-    rpz_fetched_urls: Arc<Mutex<Vec<String>>>,
+    lists_progress: Arc<Mutex<RefreshProgress>>,
+    rpz_progress: Arc<Mutex<RefreshProgress>>,
+    /// The stop signal `spawn_refresh` last got; the generation's until then.
+    refresh_stop: Arc<Mutex<Arc<AtomicBool>>>,
 }
 
 impl FilterState {
@@ -333,8 +332,7 @@ impl FilterState {
             let resolver = blocklist_resolver.clone();
             let cache_dir = blocklist_cache_dir.clone();
             let operation_lock = list_refresh_lock.clone();
-            let sd = shutdown.clone();
-            Arc::new(move || {
+            Arc::new(move |sd: &Arc<AtomicBool>| {
                 let _guard = try_list_refresh_lock(&operation_lock)?;
                 let snapshot = urls.lock_recover().clone();
                 let disabled = disabled_urls.lock_recover().clone();
@@ -346,7 +344,7 @@ impl FilterState {
                     &resolver,
                     &previous_meta,
                     cache_dir.as_deref(),
-                    &sd,
+                    sd,
                 )
                 .ok_or(LIST_REFRESH_STOPPED)?;
                 *sm.lock_recover() = meta;
@@ -402,64 +400,66 @@ impl FilterState {
             deferred_rebuild,
             refresh_url_lists,
             blocklist_resolver: blocklist_resolver.clone(),
-            lists_fetched_once: Arc::new(AtomicBool::new(subscriptions_settled)),
-            rpz_fetched_once: Arc::new(AtomicBool::new(all_rpz_cached)),
-            rpz_fetched_urls: Arc::new(Mutex::new(cfg.rpz_urls.clone())),
+            lists_progress: Arc::new(Mutex::new(RefreshProgress {
+                settled: subscriptions_settled,
+                ..RefreshProgress::default()
+            })),
+            rpz_progress: Arc::new(Mutex::new(RefreshProgress {
+                settled: all_rpz_cached,
+                urls: cfg.rpz_urls.clone(),
+                ..RefreshProgress::default()
+            })),
+            refresh_stop: Arc::new(Mutex::new(shutdown.clone())),
         })
     }
 
     /// Starts the jobs that fetch the URL blocklists and RPZ feeds on their schedule; they end when
-    /// `stop` is set. Started again, they go on from what was already fetched.
+    /// `stop` is set, and downloads in progress end with them. Started again, they go on from where
+    /// the last ones left off. The caller joins the old jobs before starting new ones.
     pub(crate) fn spawn_refresh(
         &self,
         stop: &Arc<AtomicBool>,
-    ) -> BoxResult<Vec<std::thread::JoinHandle<()>>> {
+    ) -> BoxResult<Vec<(&'static str, std::thread::JoinHandle<()>)>> {
+        *self.refresh_stop.lock_recover() = stop.clone();
         let mut threads = Vec::new();
         {
             let refresh_lists = self.refresh_url_lists.clone();
             let interval = self.list_refresh_secs.clone();
             let generation = self.list_generation.clone();
             let sd = stop.clone();
-            let fetched_once = self.lists_fetched_once.clone();
+            let progress = self.lists_progress.clone();
             let thread = std::thread::Builder::new()
                 .name("blocklist-refresh".into())
-                .spawn(move || {
-                    let mut seen_generation = 0u64;
-                    let mut waited = 0u64;
-                    loop {
-                        if sd.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let period = interval.load(Ordering::Acquire);
-                        let now_generation = generation.load(Ordering::Acquire);
-                        let due = now_generation != seen_generation
-                            || !fetched_once.load(Ordering::Acquire)
-                            || (period > 0 && waited >= period);
-                        if due {
-                            seen_generation = now_generation;
-                            fetched_once.store(true, Ordering::Release);
-                            waited = 0;
-                            match refresh_lists() {
-                                Ok((block, _)) => {
-                                    onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
-                                }
-                                Err(error) if error == LIST_REFRESH_STOPPED => break,
-                                Err(error) if error == LIST_REFRESH_BUSY => {
-                                    onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
-                                }
-                                Err(error) => {
-                                    onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "Could not update remote blocklists")
-                                }
+                .spawn(move || loop {
+                    if sd.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now_generation = generation.load(Ordering::Acquire);
+                    if progress
+                        .lock_recover()
+                        .due(now_generation, interval.load(Ordering::Acquire))
+                    {
+                        match refresh_lists(&sd) {
+                            Ok((block, _)) => {
+                                onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
+                            }
+                            Err(error) if error == LIST_REFRESH_STOPPED => break,
+                            Err(error) if error == LIST_REFRESH_BUSY => {
+                                onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
+                            }
+                            Err(error) => {
+                                onetdns_core::warn!(event = "filter.subscription_refresh_failed", %error, "Could not update remote blocklists")
                             }
                         }
-                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                            break;
-                        }
-                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
+                        progress.lock_recover().fetched(now_generation);
                     }
+                    if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
+                        break;
+                    }
+                    progress.lock_recover().waited(LIST_REFRESH_TICK_SECS);
                 })
                 .with_context(|| "Could not start the URL blocklist refresh thread")?;
-            threads.push(thread);
+            threads.push(("blocklist-refresh", thread));
         }
 
         {
@@ -471,35 +471,21 @@ impl FilterState {
             let sd = stop.clone();
             let resolver = self.blocklist_resolver.clone();
             let cache_dir = self.subscription_cache_dir.clone();
-            let fetched_once = self.rpz_fetched_once.clone();
-            let fetched_slot = self.rpz_fetched_urls.clone();
-            let mut fetched_urls = fetched_slot.lock_recover().clone();
+            let progress = self.rpz_progress.clone();
             let thread = std::thread::Builder::new()
                 .name("rpz-refresh".into())
-                .spawn(move || {
-                    let mut seen_generation = 0u64;
-                    let mut waited = 0u64;
-                    loop {
-                        if sd.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let period = interval.load(Ordering::Acquire);
-                        let now_generation = generation.load(Ordering::Acquire);
-                        let due = now_generation != seen_generation
-                            || !fetched_once.load(Ordering::Acquire)
-                            || (period > 0 && waited >= period);
-                        let urls_now = urls.lock_recover().clone();
-                        if !due || (urls_now.is_empty() && fetched_urls.is_empty()) {
-                            seen_generation = now_generation;
-                            if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                                break;
-                            }
-                            waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
-                            continue;
-                        }
-                        seen_generation = now_generation;
-                        fetched_once.store(true, Ordering::Release);
-                        waited = 0;
+                .spawn(move || loop {
+                    if sd.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now_generation = generation.load(Ordering::Acquire);
+                    let urls_now = urls.lock_recover().clone();
+                    let (due, fetched_urls) = {
+                        let progress = progress.lock_recover();
+                        let due = progress.due(now_generation, interval.load(Ordering::Acquire));
+                        (due, progress.urls.clone())
+                    };
+                    if due && !(urls_now.is_empty() && fetched_urls.is_empty()) {
                         let previous = rpz_texts.lock_recover().clone();
                         let kept = rpz_texts_by_url(&fetched_urls, &previous, &urls_now);
                         let Some(fetched) = fetch_rpz_texts(
@@ -512,31 +498,71 @@ impl FilterState {
                             break;
                         };
                         *rpz_texts.lock_recover() = fetched;
-                        let previous_urls = std::mem::replace(&mut fetched_urls, urls_now);
-                        match rebuild3() {
-                            Ok((b, _)) => onetdns_core::info!(event = "filter.rpz_applied", block = b, "Applied downloaded RPZ rules"),
+                        let applied = match rebuild3() {
+                            Ok((b, _)) => {
+                                onetdns_core::info!(event = "filter.rpz_applied", block = b, "Applied downloaded RPZ rules");
+                                urls_now
+                            }
                             Err(e) => {
                                 *rpz_texts.lock_recover() = previous;
-                                fetched_urls = previous_urls;
                                 let error = with_rollback_result(
                                     e,
                                     "Could not restore the previous RPZ runtime state",
                                     rebuild3().map(|_| ()),
                                 );
                                 onetdns_core::warn!(event = "filter.rpz_rebuild_failed", error = %error, "Could not rebuild RPZ rules; keeping the previous rules");
+                                fetched_urls
                             }
-                        }
-                        fetched_slot.lock_recover().clone_from(&fetched_urls);
-                        if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
-                            break;
-                        }
-                        waited = waited.saturating_add(LIST_REFRESH_TICK_SECS);
+                        };
+                        let mut progress = progress.lock_recover();
+                        progress.fetched(now_generation);
+                        progress.urls = applied;
+                    } else {
+                        progress.lock_recover().generation = now_generation;
                     }
+                    if sleep_or_shutdown(LIST_REFRESH_TICK_SECS, &sd) {
+                        break;
+                    }
+                    progress.lock_recover().waited(LIST_REFRESH_TICK_SECS);
                 })
                 .with_context(|| "Could not start the RPZ refresh thread")?;
-            threads.push(thread);
+            threads.push(("rpz-refresh", thread));
         }
         Ok(threads)
+    }
+
+    /// The stop signal of the running refresh jobs, for a refresh started outside them.
+    pub(crate) fn refresh_stop(&self) -> Arc<AtomicBool> {
+        self.refresh_stop.lock_recover().clone()
+    }
+}
+
+/// Where a refresh job left off, so a restarted one neither fetches again nor skips a due fetch.
+#[derive(Debug, Default)]
+struct RefreshProgress {
+    /// The lists were fetched once, or found complete in the cache.
+    settled: bool,
+    /// `list_generation` the last fetch saw.
+    generation: u64,
+    /// Seconds since the last fetch.
+    waited: u64,
+    /// RPZ only: the URLs whose texts `rpz_texts` holds.
+    urls: Vec<String>,
+}
+
+impl RefreshProgress {
+    fn due(&self, generation: u64, period: u64) -> bool {
+        !self.settled || generation != self.generation || (period > 0 && self.waited >= period)
+    }
+
+    fn fetched(&mut self, generation: u64) {
+        self.settled = true;
+        self.generation = generation;
+        self.waited = 0;
+    }
+
+    fn waited(&mut self, secs: u64) {
+        self.waited = self.waited.saturating_add(secs);
     }
 }
 
@@ -644,5 +670,95 @@ mod tests {
         let deferred = Arc::new(DeferredRebuild::default());
         run_until(&deferred, || Ok((0, 0)), || true);
         assert!(!pending(&deferred));
+    }
+
+    /// A started `FilterState` without lists whose list refresh runs `refresh` instead of
+    /// downloading, and has not run yet.
+    fn filters_with_refresh(refresh: ListRefresh) -> (FilterState, ServiceCleanup) {
+        let cfg = Config::from_toml_str("").unwrap();
+        let runtime_cfg = Arc::new(ArcSwap::from_pointee(cfg.clone()));
+        let resolver: http::HostResolver = Arc::new(|_, _| Ok(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cleanup = ServiceCleanup::new(shutdown.clone());
+        let mut filters =
+            FilterState::start(&cfg, &runtime_cfg, None, &resolver, &shutdown, &cleanup).unwrap();
+        filters.refresh_url_lists = refresh;
+        filters.lists_progress.lock_recover().settled = false;
+        (filters, cleanup)
+    }
+
+    fn wait_for(failure: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{failure}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stop_and_join(stop: &AtomicBool, threads: Vec<(&'static str, std::thread::JoinHandle<()>)>) {
+        stop.store(true, Ordering::Release);
+        for (_, thread) in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn restarted_refresh_goes_on_without_fetching_again() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (filters, cleanup) = filters_with_refresh(Arc::new(move |_: &Arc<AtomicBool>| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok((0, 0))
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = filters.spawn_refresh(&stop).unwrap();
+        wait_for("the first refresh did not run", || {
+            calls.load(Ordering::SeqCst) == 1
+        });
+        stop_and_join(&stop, threads);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = filters.spawn_refresh(&stop).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stop_and_join(&stop, threads);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the restarted job fetched again"
+        );
+        cleanup.shutdown_and_join();
+    }
+
+    #[test]
+    /// The refresh stands in for a download that ends when its stop flag is set.
+    fn stopping_ends_the_refresh_in_progress_and_the_next_job_redoes_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (filters, cleanup) = filters_with_refresh(Arc::new(move |stop: &Arc<AtomicBool>| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                for _ in 0..1000 {
+                    if stop.load(Ordering::Acquire) {
+                        return Err(LIST_REFRESH_STOPPED.to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Ok((0, 0))
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = filters.spawn_refresh(&stop).unwrap();
+        wait_for("the first refresh did not start", || {
+            calls.load(Ordering::SeqCst) == 1
+        });
+        assert!(Arc::ptr_eq(&filters.refresh_stop(), &stop));
+        stop_and_join(&stop, threads);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = filters.spawn_refresh(&stop).unwrap();
+        wait_for("the stopped refresh was not done again", || {
+            calls.load(Ordering::SeqCst) == 2
+        });
+        stop_and_join(&stop, threads);
+        cleanup.shutdown_and_join();
     }
 }

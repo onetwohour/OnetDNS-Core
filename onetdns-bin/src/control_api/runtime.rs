@@ -96,9 +96,10 @@ impl ControlDeps {
         };
         let task_jobs = self.jobs.clone();
         let refresh_lists = self.filters.refresh_url_lists.clone();
+        let stop = self.filters.refresh_stop();
         match std::thread::Builder::new()
             .name(format!("refresh-lists-{id}"))
-            .spawn(move || match refresh_lists() {
+            .spawn(move || match refresh_lists(&stop) {
                 Ok((block, allow)) => {
                     task_jobs.finish(id, true, format!("block={block} allow={allow}"))
                 }
