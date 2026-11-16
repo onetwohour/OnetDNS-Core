@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use onetdns_config::Config;
+use onetdns_control::{PersistOpts, Recorder, Stats};
 use onetdns_core::MutexExt;
 
 use crate::config_apply::{install_restart, SecondaryRestart};
@@ -114,7 +115,14 @@ pub(crate) enum FromPredecessor {
     /// Duplicates of the listening sockets. The QUIC ones are no longer read on this side.
     Sockets(SocketPool),
     /// Nothing that only one process may run is running on this side any more.
-    Released,
+    Released(Carried),
+}
+
+/// What the predecessor counted, handed over once it has stopped serving.
+#[derive(Debug, Default)]
+pub(crate) struct Carried {
+    /// `Recorder::export_state`; None when the predecessor could not export it.
+    pub(crate) stats: Option<Vec<u8>>,
 }
 
 /// Sent by the successor to the running generation.
@@ -295,6 +303,16 @@ impl Exclusive {
     }
 }
 
+/// Saving statistics and the query log is exclusive too: two processes would overwrite each other's
+/// files. A successor starts without it and turns it on once it has added its predecessor's counts.
+pub(crate) fn persistence_restart(stats: Stats) -> SecondaryRestart {
+    Arc::new(move |cfg: &Config| {
+        stats
+            .reconfigure_persist(crate::hot_apply::persist_opts(cfg))
+            .map_err(|error| format!("Could not save the statistics or the query log: {error}"))
+    })
+}
+
 /// Runs the hook with its slot locked, as `install_restart` does.
 fn run_restart(slot: &RestartSlot, cfg: &Config) -> Result<(), String> {
     let hook = slot.lock_recover();
@@ -310,6 +328,8 @@ pub(crate) struct Handoff {
     pub(crate) registry: Arc<Mutex<Vec<(&'static str, String, String)>>>,
     pub(crate) control_listener: Arc<Mutex<Option<TcpListener>>>,
     pub(crate) exclusive: Exclusive,
+    pub(crate) recorder: Recorder,
+    pub(crate) stats: Stats,
 }
 
 impl Handoff {
@@ -334,7 +354,7 @@ impl Handoff {
                 }
                 self.listeners.adopt(pool);
             }
-            Ok(FromPredecessor::Released) => return Err(OUT_OF_ORDER.to_string()),
+            Ok(FromPredecessor::Released(_)) => return Err(OUT_OF_ORDER.to_string()),
             Err(LinkError::Gone) => onetdns_core::info!(
                 event = "handoff.predecessor_gone",
                 "The previous process ended before handing over its sockets; opening the listening addresses"
@@ -351,7 +371,8 @@ impl Handoff {
             .send(FromSuccessor::Reading)
             .and_then(|()| link.recv(step_deadline(), abort));
         match released {
-            Ok(FromPredecessor::Released) | Err(LinkError::Gone) => {}
+            Ok(FromPredecessor::Released(carried)) => self.carry_in(Some(carried), cfg),
+            Err(LinkError::Gone) => self.carry_in(None, cfg),
             Ok(FromPredecessor::Sockets(_)) => return Err(OUT_OF_ORDER.to_string()),
             Err(error) => {
                 return Err(format!(
@@ -420,9 +441,44 @@ impl Handoff {
         self.listeners.stop_reading();
         self.exclusive.release(cfg);
         *released = true;
-        link.send(FromPredecessor::Released)
+        link.send(FromPredecessor::Released(self.carry_out()))
             .map_err(|error| error.to_string())?;
         expect(link, FromSuccessor::Ready, abort)
+    }
+
+    /// Stops saving statistics, which writes the last state, and exports them. Saving resumes with
+    /// the exclusive part if the handoff fails.
+    fn carry_out(&self) -> Carried {
+        if let Err(error) = self.stats.reconfigure_persist(PersistOpts::default()) {
+            onetdns_core::warn!(event = "handoff.stats_not_saved", %error, "Could not save the last statistics and query log before handing them over");
+        }
+        let stats = self
+            .recorder
+            .export_state()
+            .map_err(|error| {
+                onetdns_core::warn!(event = "handoff.stats_not_exported", %error, "Could not hand over the statistics; the new process reads the saved ones");
+            })
+            .ok();
+        Carried { stats }
+    }
+
+    /// Adds the predecessor's statistics to what this process counted, or the saved ones when it
+    /// handed over none this process can read.
+    fn carry_in(&self, carried: Option<Carried>, cfg: &Config) {
+        let saved = || {
+            self.recorder
+                .merge_saved(&crate::hot_apply::persist_opts(cfg))
+        };
+        let merged = match carried.and_then(|carried| carried.stats) {
+            Some(state) => self.recorder.merge_state(&state).or_else(|error| {
+                onetdns_core::warn!(event = "handoff.stats_unreadable", %error, "Could not read the statistics the previous process handed over; adding the saved ones instead");
+                saved()
+            }),
+            None => saved(),
+        };
+        if let Err(error) = merged {
+            onetdns_core::warn!(event = "handoff.stats_not_merged", %error, "Could not add the previous process's statistics; they start over from zero");
+        }
     }
 
     /// One pool to hand over and one to keep, so this generation can serve again if the successor
@@ -503,10 +559,12 @@ mod tests {
     fn a_wait_ends_with_the_message_the_deadline_the_abort_or_the_other_side_leaving() {
         let never = || false;
         let (successor, predecessor) = link();
-        successor.send(FromPredecessor::Released).unwrap();
+        successor
+            .send(FromPredecessor::Released(Carried::default()))
+            .unwrap();
         assert!(matches!(
             predecessor.recv(Instant::now() + Duration::from_secs(5), &never),
-            Ok(FromPredecessor::Released)
+            Ok(FromPredecessor::Released(_))
         ));
 
         let started = Instant::now();
@@ -532,7 +590,9 @@ mod tests {
             LinkError::Gone
         );
         assert_eq!(
-            successor.send(FromPredecessor::Released).unwrap_err(),
+            successor
+                .send(FromPredecessor::Released(Carried::default()))
+                .unwrap_err(),
             LinkError::Gone
         );
     }
@@ -587,9 +647,8 @@ mod tests {
     }
 
     /// Starts a successor of the generation that owns `links`.
-    fn start_successor(cfg: Config, links: &Links) -> Running {
+    fn start_successor(cfg: Config, links: &Links, shared: crate::ServeShared) -> Running {
         let (successor, predecessor) = link();
-        let shared = crate::ServeShared::default();
         *shared.links.predecessor.lock_recover() = Some(predecessor);
         *links.successor.lock_recover() = Some(successor);
         start(cfg, shared)
@@ -735,7 +794,11 @@ mod tests {
         let old = start_serving(config(dns, OLD_ANSWER, ""), old_shared);
         let load = Load::start(dns);
 
-        let new = start_successor(config(dns, NEW_ANSWER, ""), &old_links);
+        let new = start_successor(
+            config(dns, NEW_ANSWER, ""),
+            &old_links,
+            crate::ServeShared::default(),
+        );
         wait_until("the running generation did not hand over", || {
             old.thread.is_finished() || new.thread.is_finished()
         });
@@ -774,7 +837,11 @@ mod tests {
         let load = Load::start(dns);
 
         let failing = format!("control_listen = \"{}\"\n", busy.local_addr().unwrap());
-        let new = start_successor(config(dns, NEW_ANSWER, &failing), &old_links);
+        let new = start_successor(
+            config(dns, NEW_ANSWER, &failing),
+            &old_links,
+            crate::ServeShared::default(),
+        );
         wait_until("the successor did not end", || new.thread.is_finished());
         assert!(new.thread.join().unwrap().is_err(), "the successor started");
         assert!(!old.thread.is_finished(), "the running generation ended");
@@ -787,5 +854,83 @@ mod tests {
             .unwrap()
             .expect("the running generation failed");
         assert_eq!(failed, (0, 0), "queries went unanswered (UDP, TCP)");
+    }
+
+    #[test]
+    /// The successor goes on from what the running generation counted: every answered query is
+    /// counted once, the query log IDs run on in one ascending sequence, and the successor saves the
+    /// merged totals.
+    fn the_statistics_carry_over_to_the_successor() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-handoff-stats-{}-{}",
+            std::process::id(),
+            crate::unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats_file = dir.join("stats.json");
+        let path = |file: &std::path::Path| file.display().to_string().replace('\\', "/");
+        let files = format!(
+            "stats_file = \"{}\"\nquerylog_file = \"{}\"\nquerylog_size = 100000\npersist_flush_secs = 1\n",
+            path(&stats_file),
+            path(&dir.join("querylog.jsonl"))
+        );
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let old_shared = crate::ServeShared::default();
+        let old_links = old_shared.links.clone();
+        let old = start_serving(config(dns, OLD_ANSWER, &files), old_shared);
+        let load = Load::start(dns);
+        // A successor that also loaded the saved statistics would count them twice; make sure there
+        // are some.
+        wait_until("the running generation did not save its statistics", || {
+            std::fs::read_to_string(&stats_file)
+                .is_ok_and(|saved| !saved.contains("\"total\":\"0\""))
+        });
+
+        let new_shared = crate::ServeShared::default();
+        let new = start_successor(
+            config(dns, NEW_ANSWER, &files),
+            &old_links,
+            new_shared.clone(),
+        );
+        wait_until("the running generation did not hand over", || {
+            old.thread.is_finished() || new.thread.is_finished()
+        });
+        assert!(!new.thread.is_finished(), "the successor ended");
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        load.wait_for_more(&load.by_new, "the successor did not answer");
+        let (by_old, by_new) = (load.by_old.clone(), load.by_new.clone());
+        assert_eq!(load.finish(), (0, 0), "queries went unanswered (UDP, TCP)");
+        let answered = (by_old.load(Ordering::Relaxed) + by_new.load(Ordering::Relaxed)) as u64;
+
+        let (_, stats) = new_shared.metrics.lock_recover().clone().unwrap();
+        wait_until(
+            "the successor did not count every answered query once",
+            || stats.metrics.snapshot().total == answered,
+        );
+        let ids: Vec<u64> = stats
+            .recent
+            .lock_recover()
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "query log IDs do not ascend"
+        );
+        assert_eq!(ids.last(), Some(&answered), "query log IDs skip or repeat");
+        stats.flush_persisted().unwrap();
+        let saved = std::fs::read_to_string(&stats_file).unwrap();
+        assert!(
+            saved.contains(&format!("\"total\":\"{answered}\"")),
+            "the successor did not save the merged totals"
+        );
+
+        new.stop.store(true, Ordering::SeqCst);
+        new.thread.join().unwrap().expect("the successor failed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

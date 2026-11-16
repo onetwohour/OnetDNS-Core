@@ -1074,10 +1074,12 @@ static CONTROL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 impl ServeShared {
     /// Reuses the previous generation's recorder and store with new settings, so statistics and
-    /// the query log survive reloads.
+    /// the query log survive reloads. A successor neither reads nor writes the saved ones: it adds
+    /// its predecessor's counts later and saves only then.
     fn open_metrics(
         &self,
         cfg: &Config,
+        successor: bool,
     ) -> BoxResult<(onetdns_control::Recorder, onetdns_control::Stats)> {
         let persist_opts = hot_apply::persist_opts(cfg);
         let mut slot = self.metrics.lock_recover();
@@ -1116,7 +1118,11 @@ impl ServeShared {
                 ignored: cfg.querylog_ignored.clone(),
                 stats_retention_secs: cfg.stats_retention_secs,
             },
-            persist_opts,
+            if successor {
+                onetdns_control::PersistOpts::default()
+            } else {
+                persist_opts
+            },
         );
         pair.1.flush_persisted().with_context(|| {
             "Could not start management because the statistics or query log file cannot be used"
@@ -1478,8 +1484,15 @@ pub fn serve(
     let config_prev = shared.previous_config_text.clone();
     let applied_config_text = shared.applied_config_text.clone();
 
-    let (recorder, stats) = shared.open_metrics(&cfg)?;
+    let (recorder, stats) = shared.open_metrics(&cfg, exclusive.deferred())?;
     recorder.set_collecting(telemetry_consumed(&cfg));
+    exclusive
+        .install(
+            &Arc::default(),
+            handoff::persistence_restart(stats.clone()),
+            &cfg,
+        )
+        .map_err(std::io::Error::other)?;
 
     // Control-plane auth is built later; the slot is taken now so an accounts-only change can
     // swap the list without touching DNS.
@@ -1541,7 +1554,13 @@ pub fn serve(
         service_threads: service_cleanup.tracker(),
         shutdown: shutdown.clone(),
     });
-    let state = shared.control_state(&cfg, stats, controls, readiness.clone(), control_proxy)?;
+    let state = shared.control_state(
+        &cfg,
+        stats.clone(),
+        controls,
+        readiness.clone(),
+        control_proxy,
+    )?;
     *console_auth.lock_recover() = Some(state.auth.clone());
     let setup_auth = state.auth.clone();
     if !exclusive.deferred() {
@@ -1592,7 +1611,7 @@ pub fn serve(
         dhcp_slot,
         cache_slot,
         recursor_jobs: jobs.recursor.clone(),
-        recorder: Some(recorder),
+        recorder: Some(recorder.clone()),
         acl,
         rate_limiters,
         mac_cache,
@@ -1633,6 +1652,8 @@ pub fn serve(
         registry: listener_reg.clone(),
         control_listener: shared.control_listener.clone(),
         exclusive,
+        recorder,
+        stats,
     };
     let stopping = || {
         external_stop
