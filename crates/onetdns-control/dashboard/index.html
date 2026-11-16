@@ -4729,6 +4729,16 @@ function pageAddress(){
     return /^\d{1,3}(\.\d{1,3}){3}$/.test(host)||host.includes(':')?host:'';}catch(e){return '';}
 }
 
+// The client setup inputs last used in this browser, so the stamps can be made again after a reload.
+const CLIENT_SETUP_KEY = 'onetdns_client_setup';
+function clientSetupForms(){
+  let saved=null;
+  try{saved=JSON.parse(localStorage.getItem(CLIENT_SETUP_KEY)||'null');}catch(e){}
+  const text=v=>typeof v==='string'?v:'';
+  if(!saved||typeof saved!=='object')return {setupAddress:pageAddress(),setupHost:'',setupSsids:''};
+  return {setupAddress:text(saved.address),setupHost:text(saved.hostname),setupSsids:text(saved.ssids)};
+}
+
 // 접속할 때 새 릴리스를 다시 확인하려면 마지막 확인에서 이만큼(초) 지나야 한다. 새로고침할 때마다
 // 확인하면 출발 주소당 요청 수가 제한된 GitHub API 를 그 한도까지 부를 수 있다.
 const UPDATE_VISIT_CHECK_AGE = 60*60;
@@ -4867,7 +4877,7 @@ class Component extends DCLogic {
              acmeDomain:'', certPem:'', keyPem:'', certFileName:'fullchain.pem 선택…', keyFileName:'privkey.pem 선택…', revocationPem:'', revocationFileName:'fullchain.pem 선택…',
              resIdentity:'', resIp:'', resHost:'', rootAddr:'', cpKey:'', cpVal:'', cfgSearch:'', setupUser:'admin',setupPassword:'',setupConfirm:'',setupCode:'', loginUser:'',loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',tokRole:'readonly',
              rewriteDomain:'',rewriteAnswer:'',restoreFileName:'백업 파일 선택…',dnssecZone:'',
-             setupAddress:pageAddress(),setupHost:'',setupSsids:'' },
+             ...clientSetupForms() },
 
     blocklists: [],
     pendingSubs: [],
@@ -5462,6 +5472,7 @@ class Component extends DCLogic {
     const tasks=[this.loadUpstreams(),this.loadClients(),this.loadAccess(),this.loadRewrites(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
     await Promise.allSettled(tasks);
     if(this.state.view==='lists')await this.loadFilterDiagnostics();
+    if(this.state.view==='encryption'&&this.state.authRole==='admin')await this.loadClientSetup(true);
   }
   async loadClients(){
     const fresh=this.writeGuard('clients');const r=await this.apiGet('/v1/clients');if(!(r.ok&&Array.isArray(r.body))||!fresh())return false;
@@ -5668,16 +5679,26 @@ class Component extends DCLogic {
     }else{this.setState(s=>({cert:{...s.cert,valid:false,domain:'검증 실패',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—'}}));this.toastMsg(this.tr('인증서 검증 실패: {error}',{error:this.errorText(r)}),true);}
   }
   clientSetupBody(){const f=this.state.forms;return {address:String(f.setupAddress||'').trim(),hostname:String(f.setupHost||'').trim()};}
-  makeStamps=async()=>{
+  rememberClientSetup(){
+    const f=this.state.forms;
+    try{localStorage.setItem(CLIENT_SETUP_KEY,JSON.stringify({address:String(f.setupAddress||''),hostname:String(f.setupHost||''),ssids:String(f.setupSsids||'')}));}catch(e){}
+  }
+  // `quiet` is for opening the page: a failure then leaves the section empty instead of raising a toast.
+  async loadClientSetup(quiet){
     const r=await this.apiSend('/v1/client-setup/stamps','POST',this.clientSetupBody());
-    if(!(r.ok&&r.body&&typeof r.body==='object'))return this.toastMsg(this.tr('스탬프를 만들지 못했습니다: {error}',{error:this.errorText(r)}),true);
+    if(r.stale)return;
+    if(!(r.ok&&r.body&&typeof r.body==='object')){if(!quiet)this.toastMsg(this.tr('스탬프를 만들지 못했습니다: {error}',{error:this.errorText(r)}),true);return;}
+    if(quiet&&!(Array.isArray(r.body.stamps)&&r.body.stamps.length))return;
+    if(!quiet)this.rememberClientSetup();
     this.setState({clientSetup:r.body});
-  };
+  }
+  makeStamps=()=>this.loadClientSetup(false);
   copyStamp=async(stamp)=>{try{await navigator.clipboard.writeText(stamp);this.toastMsg('스탬프를 복사했습니다');}catch(e){this.toastMsg('클립보드 복사 권한이 없습니다',true);}};
   appleProfile=async(protocol)=>{
     const ssids=String(this.state.forms.setupSsids||'').split(',').map(name=>name.trim()).filter(Boolean);
     const r=await this.apiSend('/v1/client-setup/apple-profile','POST',{...this.clientSetupBody(),protocol,ssids});
     if(!(r.ok&&typeof r.body==='string'))return this.toastMsg(this.tr('프로필을 만들지 못했습니다: {error}',{error:this.errorText(r)}),true);
+    this.rememberClientSetup();
     try{const blob=new Blob([r.body],{type:'application/x-apple-aspen-config'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='onetdns-'+protocol+'.mobileconfig';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
     catch(e){return this.toastMsg('프로필 파일을 저장하지 못했습니다',true);}
     // 이 컴퓨터가 믿지 않는 인증서면 프로필에 루트 인증서가 들어가고, 기기에서 따로 신뢰를 켜야 한다.
@@ -5923,6 +5944,7 @@ class Component extends DCLogic {
     // 임대와 고정 할당은 실시간 스트림으로 오지 않는다. 화면에 들어올 때 다시 읽지 않으면
     // 처음 연 뒤에 나간 임대나 DHCP를 켠 사실이 새로 고칠 때까지 보이지 않는다.
     if(prevState&&prevState.view!==this.state.view&&this.state.view==='dhcp'&&this.state.loggedIn){this.loadLeases();this.loadReservations();}
+    if(prevState&&prevState.view!==this.state.view&&this.state.view==='encryption'&&this.state.loggedIn&&this.state.authRole==='admin')this.loadClientSetup(true);
     if(prevState){
       if(!prevState.helpOpen&&this.state.helpOpen)this.focusOverlay('help-dialog');
       if(!prevState.accountOpen&&this.state.accountOpen)this.focusOverlay('account-menu');
