@@ -2437,17 +2437,23 @@ pub fn serve(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    serve_listener(listener, state, shutdown)
+    let draining = serve_listener(listener, state, shutdown)?;
+    let _ = draining.join();
+    Ok(())
 }
 
 /// Takes an open listener so a config reapply keeps the same socket and dashboard connections
 /// survive. Only connections with a complete request get a thread; partial ones stay in
 /// non-blocking admission.
+///
+/// Returns once `shutdown` is set and it no longer accepts, so another handle on the same socket
+/// takes the connections that arrive next. The connections it took are answered on the returned
+/// thread.
 pub fn serve_listener(
     listener: TcpListener,
     state: AppState,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     use std::sync::atomic::Ordering;
     listener.set_nonblocking(true)?;
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2531,7 +2537,12 @@ pub fn serve_listener(
     for pending in pending.drain(..) {
         let _ = pending.stream.shutdown(std::net::Shutdown::Both);
     }
+    std::thread::Builder::new()
+        .name("onetdns-control-drain".into())
+        .spawn(move || drain_control_connections(connections))
+}
 
+fn drain_control_connections(mut connections: Vec<(SharedTcp, std::thread::JoinHandle<()>)>) {
     let drain_deadline = Instant::now() + Duration::from_secs(CONTROL_DRAIN_GRACE_SECS);
     loop {
         reap_control_connections(&mut connections);
@@ -2546,7 +2557,6 @@ pub fn serve_listener(
     for (_, thread) in connections {
         let _ = thread.join();
     }
-    Ok(())
 }
 
 /// Joins finished connection threads, whose handles would pile up otherwise.
@@ -5590,7 +5600,9 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = shutdown.clone();
         let server = std::thread::spawn(move || {
-            serve_listener(listener, test_state("adm", "ro"), server_shutdown).unwrap();
+            let draining =
+                serve_listener(listener, test_state("adm", "ro"), server_shutdown).unwrap();
+            draining.join().unwrap();
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -6210,6 +6222,7 @@ mod tests {
     }
 
     #[test]
+    /// The listener stops accepting at once, while the request in flight is still answered.
     fn generation_shutdown_lets_inflight_request_finish() {
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -6217,7 +6230,7 @@ mod tests {
         let (_rec, stats) = channel(8, 100, 0, RecorderOpts::default(), PersistOpts::default());
         let mut controls = Controls::noop();
         controls.net_adapters = Box::new(|| {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(1000));
             Ok("{\"platform\":\"test\",\"adapters\":[]}".to_string())
         });
         let state = AppState {
@@ -6233,7 +6246,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
-        let server = std::thread::spawn(move || serve_listener(listener, state, sd).unwrap());
+        let (returned, stopped_accepting) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let draining = serve_listener(listener, state, sd).unwrap();
+            returned.send(()).unwrap();
+            draining.join().unwrap();
+        });
 
         let mut client = TcpStream::connect(addr).unwrap();
         client
@@ -6247,6 +6265,9 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(120));
         shutdown.store(true, Ordering::Relaxed);
+        stopped_accepting
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the listener waited for the request in flight");
 
         let mut resp = Vec::new();
         client.read_to_end(&mut resp).unwrap();
@@ -6300,7 +6321,9 @@ mod tests {
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_shutdown = shutdown.clone();
         let server = std::thread::spawn(move || {
-            serve_listener(listener, test_state("adm", "ro"), server_shutdown).unwrap();
+            let draining =
+                serve_listener(listener, test_state("adm", "ro"), server_shutdown).unwrap();
+            draining.join().unwrap();
         });
 
         let mut client = TcpStream::connect(addr).unwrap();

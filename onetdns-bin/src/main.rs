@@ -1178,12 +1178,8 @@ impl ServeShared {
         Arc::new(move |next: &Config| -> Result<(), String> {
             let Some(addr) = next.control_listen else {
                 // With the address removed, only stop the listener; there is nothing to restart.
-                let mut running = jobs.running.lock_recover();
-                let had = !running.is_empty();
-                for (_, old) in running.iter() {
-                    old.store(true, std::sync::atomic::Ordering::Release);
-                }
-                running.clear();
+                let had = !jobs.running.lock_recover().is_empty();
+                jobs.retire_all();
                 *shared_slot.lock_recover() = None;
                 if had {
                     onetdns_core::info!(
@@ -1229,6 +1225,8 @@ impl ServeShared {
             let thread = std::thread::Builder::new()
                 .name("onetdns-control".into())
                 .spawn(move || {
+                    // Ends once it stops accepting; the connections it took finish on the thread
+                    // it returns.
                     if let Err(error) =
                         onetdns_control::serve_listener(listener, state, listener_stop)
                     {
@@ -1236,15 +1234,18 @@ impl ServeShared {
                     }
                 })
                 .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
-            // Not tracked by this generation: it must survive the restart, and waiting for it would
-            // keep generation cleanup from finishing. The next generation or shutdown stops it.
-            drop(thread);
-            let mut running = jobs.running.lock_recover();
-            for (_, old) in running.iter() {
-                old.store(true, std::sync::atomic::Ordering::Release);
+            {
+                let mut running = jobs.running.lock_recover();
+                for (_, old) in running.iter() {
+                    old.store(true, std::sync::atomic::Ordering::Release);
+                }
+                running.clear();
+                running.push((key, stop));
             }
-            running.clear();
-            running.push((key, stop));
+            // The group waits for this thread when it retires, so a process handing the socket over
+            // has stopped accepting before the successor serves it. This first waits for the
+            // previous listener.
+            jobs.keep("control", thread);
             onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API");
             Ok(())
         })
@@ -3314,6 +3315,63 @@ mod tests {
             .expect("first listener must be released after partial startup failure");
         drop(rebound);
         drop(occupied);
+    }
+
+    #[test]
+    /// A handoff retires the control group before the successor serves the management socket; by
+    /// then this process must no longer accept on it.
+    fn the_management_api_stops_accepting_before_its_group_retires() {
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.control_listen = Some(control);
+        cfg.listen = vec![tcp_udp_test_listeners().2];
+        cfg.workers = 1;
+        let shared = ServeShared::default();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = {
+            let (shared, stop, ready) = (shared.clone(), stop.clone(), ready.clone());
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    None,
+                    None,
+                    shared,
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst)
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            if generation.is_finished() {
+                panic!(
+                    "the generation ended: {:?}",
+                    generation.join().unwrap().err()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the generation did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // From here on only the listener's own handle keeps the socket open.
+        drop(shared.control_listener.lock_recover().take());
+        shared.control_jobs.retire_all();
+        assert!(
+            std::net::TcpStream::connect_timeout(&control, Duration::from_secs(3)).is_err(),
+            "the management API still listened after its group retired"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        generation.join().unwrap().unwrap();
     }
 
     #[test]
