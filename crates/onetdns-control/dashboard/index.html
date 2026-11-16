@@ -4789,6 +4789,8 @@ function pageAddress(){
 // 접속할 때 새 릴리스를 다시 확인하려면 마지막 확인에서 이만큼(초) 지나야 한다. 새로고침할 때마다
 // 확인하면 출발 주소당 요청 수가 제한된 GitHub API 를 그 한도까지 부를 수 있다.
 const UPDATE_VISIT_CHECK_AGE = 60*60;
+// Query log entries kept in the browser, live and paused alike.
+const LOG_CAP = 5000;
 
 class Component extends DCLogic {
   seq = 1;
@@ -5076,6 +5078,7 @@ class Component extends DCLogic {
     this._sessionGeneration+=1;
     this.abortRequests();
     clearTimeout(this._socketRetry);clearTimeout(this._resyncT);clearTimeout(this._bootSubsT);clearTimeout(this._cfgFlush);clearTimeout(this._reverify);
+    clearTimeout(this._flushT);this._flushT=null;this._pendingEvents=[];this._pendingDropped=0;
     this._socketClosed=true;
     if(this._ws){this._ws.onclose=null;try{this._ws.close();}catch(e){}this._ws=null;}
     this._mutationRequests={};this._writes={};this._filterWatch=false;this._filterItems=[];this.releaseFilterWaiters();this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;this._updateWatch=null;
@@ -5355,7 +5358,7 @@ class Component extends DCLogic {
       stage:String(ev.stage||''), detail:String(ev.detail||''),
       answers:String(ev.answers||''), upstream:String(ev.upstream||''), rule:String(ev.rule||''), list:String(ev.list||'') }; }
   mergeLog(items,cap){
-    cap=cap||5000;
+    cap=cap||LOG_CAP;
     const seen=new Set(), out=[];
     for(const item of items){
       if(item.serverId!=null){ if(seen.has(item.serverId)) continue; seen.add(item.serverId); }
@@ -5388,23 +5391,48 @@ class Component extends DCLogic {
       this.resyncRecent().catch(()=>{});
     },400);
   }
+  // Events are applied in batches: a render per query freezes the page under load.
   ingest(e,countRate=true){
     if(countRate){
       this._qWin=(this._qWin||0)+1;
       if(e.action==='blocked') this._bWin=(this._bWin||0)+1;
     }
+    const pending=this._pendingEvents||(this._pendingEvents=[]);
+    pending.push(e);
+    if(pending.length>LOG_CAP){this._pendingDropped=(this._pendingDropped||0)+pending.length-LOG_CAP;pending.splice(0,pending.length-LOG_CAP);}
+    if(!this._flushT) this._flushT=setTimeout(this.flushEvents,250);
+  }
+  flushEvents=()=>{
+    this._flushT=null;
+    const batch=(this._pendingEvents||[]).reverse(),dropped=this._pendingDropped||0;
+    this._pendingEvents=[];this._pendingDropped=0;
+    if(!batch.length) return;
     if(this.state.feedPaused){
-      const PAUSE_CAP=5000;
       this.setState(s=>{
-        const merged=this.mergeLog([e,...s.pausedEvents],PAUSE_CAP+1);
-        if(merged.length>PAUSE_CAP){
-          return {pausedEvents:merged.slice(0,PAUSE_CAP),pausedDropped:(s.pausedDropped||0)+(merged.length-PAUSE_CAP)};
-        }
-        return {pausedEvents:merged};
+        const merged=this.prependLog(batch,s.pausedEvents,LOG_CAP+1);
+        const over=Math.max(0,merged.length-LOG_CAP)+dropped;
+        return over?{pausedEvents:merged.slice(0,LOG_CAP),pausedDropped:(s.pausedDropped||0)+over}:{pausedEvents:merged};
       });
       return;
     }
-    this.setState(s=>({log:this.mergeLog([e,...s.log])}));
+    this.setState(s=>({log:this.prependLog(batch,s.log)}));
+  };
+  // `batch` is newest first. When it already sorts above the whole log, as live stream events
+  // do, it goes on top without re-sorting the log; anything else takes the full merge.
+  prependLog(batch,log,cap){
+    cap=cap||LOG_CAP;
+    const after=(a,b)=>a.serverId!=null&&b.serverId!=null&&a.serverId>b.serverId&&a.tsMs>=b.tsMs;
+    const ordered=batch.every((e,i)=>i===0||after(batch[i-1],e));
+    if(batch.length&&ordered&&(!log.length||after(batch[batch.length-1],log[0]))) return batch.concat(log).slice(0,cap);
+    return this.mergeLog([...batch,...log],cap);
+  }
+  bufferedCount(paused,log){
+    if(!paused.length) return log.length;
+    const memo=this._bufferedMemo;
+    if(memo&&memo.paused===paused&&memo.log===log) return memo.count;
+    const count=this.mergeLog([...paused,...log],paused.length+log.length).length;
+    this._bufferedMemo={paused,log,count};
+    return count;
   }
   applyRecentEvents(items){
     if(!Array.isArray(items))return false;
@@ -6979,7 +7007,7 @@ class Component extends DCLogic {
       blockBtnStyle:`width:26px;height:26px;border-radius:2px;border:1px solid var(--border);background:var(--surface);cursor:pointer;display:flex;align-items:center;justify-content:center;color:${db?'var(--ok)':'var(--block)'};flex:0 0 26px`,
       blockTitle:da.title }; });
     const qlShown=Math.min(QL_WINDOW,qlMatched.length);
-    const qlBuffered=this.mergeLog([...s.pausedEvents,...s.log],100000).length;
+    const qlBuffered=this.bufferedCount(s.pausedEvents,s.log);
     const qlDropped=s.feedPaused&&s.pausedDropped?this.tr(' · 누락 {count}개',{count:s.pausedDropped.toLocaleString(this.locale())}):'';
     const serverDropped=(s.m&&s.m.droppedLog)||0;
     const qlServerDropLabel=serverDropped>0?this.tr(' · 서버 유실 {count}개',{count:serverDropped.toLocaleString(this.locale())}):'';
