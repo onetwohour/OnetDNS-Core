@@ -70,6 +70,13 @@ impl Log {
         self.entries.push_back(Entry { level, time, text });
     }
 
+    /// Each entry as a line of plain text, oldest first.
+    pub(super) fn lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| format!("{}  {}", entry.time, entry.text))
+    }
+
     /// One past the newest entry.
     fn end(&self) -> u64 {
         self.first + self.entries.len() as u64

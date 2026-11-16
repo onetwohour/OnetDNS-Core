@@ -31,6 +31,7 @@ const FDS_PER_SEND: usize = 250;
 /// A peer that stops reading for this long is treated as gone.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+const HELLO: u8 = 1;
 const REQUEST: u8 = 2;
 const READING: u8 = 3;
 const READY: u8 = 4;
@@ -276,7 +277,6 @@ pub(crate) trait Message: Sized {
 }
 
 impl<Out: Message, In: Message> Link<Out, In> {
-    #[cfg(test)]
     pub(crate) fn over(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -296,6 +296,34 @@ impl<Out: Message, In: Message> Link<Out, In> {
     ) -> Result<In, LinkError> {
         In::decode(recv(&self.stream, deadline, abort)?)
     }
+}
+
+/// Tells the successor the protocol and the credential key, which it needs before it builds
+/// anything that makes digests. The predecessor's first message on the link.
+pub(crate) fn introduce(stream: &UnixStream, credential_key: &[u8; 32]) -> Result<(), LinkError> {
+    let mut frame = Frame::new(HELLO);
+    let mut out = Writer(&mut frame.payload);
+    out.u32(PROTOCOL);
+    out.key(credential_key);
+    send(stream, &frame).map_err(|_| LinkError::Gone)
+}
+
+/// The predecessor's credential key, once it has shown it speaks this protocol.
+pub(crate) fn introduced(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> Result<Zeroizing<[u8; 32]>, LinkError> {
+    let frame = recv(stream, deadline, &|| false)?;
+    if frame.kind != HELLO || !frame.fds.is_empty() {
+        return Err(LinkError::Unreadable);
+    }
+    let mut input = Reader(&frame.payload);
+    if input.u32()? != PROTOCOL {
+        return Err(LinkError::Unreadable);
+    }
+    let key = input.key()?;
+    input.finish()?;
+    Ok(key)
 }
 
 impl Message for FromSuccessor {
@@ -827,5 +855,24 @@ mod tests {
         assert!(matches!(recv(&b, later, &|| true), Err(LinkError::Aborted)));
         drop(a);
         assert!(matches!(recv(&b, later, &|| false), Err(LinkError::Gone)));
+    }
+
+    #[test]
+    fn the_successor_learns_the_key_only_under_the_same_protocol() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        introduce(&a, &[5; 32]).unwrap();
+        assert_eq!(*introduced(&b, deadline).unwrap(), [5; 32]);
+
+        let fixed = frame(HELLO, &format!("00000001 {}", "05".repeat(32)), Vec::new());
+        send(&a, &fixed).unwrap();
+        assert_eq!(*introduced(&b, deadline).unwrap(), [5; 32]);
+
+        let other = frame(HELLO, &format!("00000002 {}", "05".repeat(32)), Vec::new());
+        send(&a, &other).unwrap();
+        assert!(matches!(
+            introduced(&b, deadline),
+            Err(LinkError::Unreadable)
+        ));
     }
 }

@@ -13,8 +13,8 @@ pub(crate) const UPDATE_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Launch {
-    /// Child of the Linux supervisor; exits with UPDATE_EXIT_CODE and the parent execs the install
-    /// path.
+    /// Child of the Linux supervisor, which starts the install path beside it to take over. If that
+    /// cannot happen, it exits with UPDATE_EXIT_CODE and the parent execs the install path.
     SupervisedChild,
     /// Unix process without a supervisor; shuts down cleanly, then execs the install path.
     SingleProcess,
@@ -84,19 +84,55 @@ pub(crate) fn current() -> Launch {
     }
 }
 
-/// Stops the server cleanly so it starts the installed binary. Call after the apply finishes.
+/// Starts the installed binary: beside this server to take over from it, or after it stops
+/// cleanly. Call after the apply finishes.
 ///
 /// False when the operator has to restart; the server keeps running then.
 pub(crate) fn request_restart() -> bool {
     let Some(server) = SERVER.get() else {
         return false;
     };
-    if current() == Launch::Manual {
-        return false;
+    match current() {
+        Launch::Manual => false,
+        #[cfg(target_os = "linux")]
+        Launch::SupervisedChild => {
+            hand_over_or_restart(server.stop.clone());
+            true
+        }
+        _ => {
+            restart(&server.stop);
+            true
+        }
     }
+}
+
+fn restart(stop: &AtomicBool) {
     RESTART.store(true, Ordering::SeqCst);
-    server.stop.store(true, Ordering::SeqCst);
-    true
+    stop.store(true, Ordering::SeqCst);
+}
+
+/// Asks from its own thread, so the update job that called this finishes first and its result is
+/// handed over with the job list.
+#[cfg(target_os = "linux")]
+fn hand_over_or_restart(stop: Arc<AtomicBool>) {
+    use crate::supervisor::Requested;
+
+    let asked = std::thread::Builder::new()
+        .name("update-successor".to_string())
+        .spawn({
+            let stop = stop.clone();
+            move || match crate::supervisor::request_successor() {
+                Requested::Linked | Requested::Cancelled => {}
+                Requested::Unavailable(reason) => {
+                    onetdns_core::info!(event = "update.restarting", %reason, "Restarting into the new version, since it cannot take over while this version serves");
+                    restart(&stop);
+                }
+            }
+        });
+    if let Err(error) = asked {
+        onetdns_core::warn!(event = "update.successor_request_failed", %error, "Could not ask the supervisor to start the new version beside this one; restarting into it");
+        restart(&stop);
+    }
 }
 
 pub(crate) fn restart_requested() -> bool {
@@ -104,23 +140,29 @@ pub(crate) fn restart_requested() -> bool {
 }
 
 #[cfg(unix)]
-/// Replaces this process with the installed binary, with the same arguments and argv[0]. The PID
-/// stays, so the service manager sees no exit. Files and sockets are CLOEXEC, so locks and
-/// listeners do not carry over.
+/// The installed binary with this process's arguments and argv[0].
+pub(crate) fn installed_command(install: &Install) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = std::env::args_os();
+    let argv0 = args
+        .next()
+        .unwrap_or_else(|| install.path().as_os_str().to_os_string());
+    let mut command = std::process::Command::new(install.path());
+    command.args(args).arg0(argv0);
+    command
+}
+
+#[cfg(unix)]
+/// Replaces this process with the installed binary. The PID stays, so the service manager sees no
+/// exit. Files and sockets are CLOEXEC, so locks and listeners do not carry over.
 ///
 /// Returns only when exec fails.
 pub(crate) fn exec_installed(install: &Install) -> std::io::Error {
     use std::os::unix::process::CommandExt;
 
     crate::tui::leave();
-    let mut args = std::env::args_os();
-    let argv0 = args
-        .next()
-        .unwrap_or_else(|| install.path().as_os_str().to_os_string());
-    std::process::Command::new(install.path())
-        .args(args)
-        .arg0(argv0)
-        .exec()
+    installed_command(install).exec()
 }
 
 /// Starts the restored binary after a failed trial. A server that never got ready may never check

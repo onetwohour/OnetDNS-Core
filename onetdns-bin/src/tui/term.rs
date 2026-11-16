@@ -111,6 +111,27 @@ mod unix {
                 libc::tcsetattr(0, libc::TCSANOW, &self.0);
             }
         }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn to_bytes(&self) -> Vec<u8> {
+            // SAFETY: termios is plain data, read here as its own bytes.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (&raw const self.0).cast::<u8>(),
+                    std::mem::size_of::<libc::termios>(),
+                )
+            }
+            .to_vec()
+        }
+
+        /// Bytes `to_bytes` made in a process on the same system.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+            (bytes.len() == std::mem::size_of::<libc::termios>()).then(|| {
+                // SAFETY: the length matches, and every bit pattern is a termios.
+                Self(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::termios>()) })
+            })
+        }
     }
 
     /// In the background, reading the terminal would stop the process.

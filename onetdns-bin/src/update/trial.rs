@@ -128,6 +128,37 @@ fn process(install: &'static Install, waiting: &mut dyn FnMut()) -> Startup {
     }
 }
 
+/// Puts a successor of `version` on trial for a supervisor still running the previous version: the
+/// record must say that version was swapped in and has not started. Does not wait for the lock; the
+/// apply that swapped it in has released it.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_successor(version: &str) -> Result<Trial, String> {
+    successor_trial(install::current()?, version)
+}
+
+#[cfg(target_os = "linux")]
+fn successor_trial(install: &'static Install, version: &str) -> Result<Trial, String> {
+    let lock = install
+        .lock(Duration::ZERO)
+        .map_err(|error| error.to_string())?;
+    let record = install
+        .read_record()
+        .map_err(|error| format!("Could not read the update record: {error}"))?
+        .and_then(|text| Record::parse(&text))
+        .ok_or("No update is waiting to start")?;
+    let installed = install::sha256_file(install.path())
+        .map_err(|error| format!("Could not read the installed executable: {error}"))?;
+    if record.startup_action(version, &installed) != StartupAction::StartTrial {
+        return Err(format!(
+            "The update record does not say that version {version} was installed and waits to start"
+        ));
+    }
+    match begin(install, lock, record) {
+        Startup::Trial(trial) => Ok(trial),
+        _ => Err("Could not mark the new version as being tried out".to_string()),
+    }
+}
+
 fn lock_waiting(install: &Install, waiting: &mut dyn FnMut()) -> Result<UpdateLock, LockError> {
     let deadline = Instant::now() + STARTUP_LOCK_WAIT;
     let mut reported = false;
@@ -428,6 +459,35 @@ mod tests {
             stored_state(install),
             Some(State::Committed),
             "확정한 기록은 되돌리기에 쓰도록 남긴다"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_successor_is_tried_out_only_as_the_version_swapped_in() {
+        let scratch = Scratch::new("trial-successor");
+        let install = swapped(&scratch, State::Pending);
+        assert!(successor_trial(install, "999.0.0").is_err());
+        assert_eq!(stored_state(install), Some(State::Pending));
+
+        let held = install.lock(Duration::ZERO).expect("잠금");
+        assert!(
+            successor_trial(install, VERSION).is_err(),
+            "다른 적용이 잠금을 쥐고 있습니다"
+        );
+        drop(held);
+
+        let trial = successor_trial(install, VERSION).expect("시험");
+        assert_eq!(stored_state(install), Some(State::Trial));
+        assert!(
+            successor_trial(install, VERSION).is_err(),
+            "시험 중에는 다시 시작하지 않습니다"
+        );
+        trial.commit();
+        assert_eq!(stored_state(install), Some(State::Committed));
+        assert!(
+            successor_trial(install, VERSION).is_err(),
+            "확정한 업데이트는 시험하지 않습니다"
         );
     }
 

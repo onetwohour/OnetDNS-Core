@@ -18,6 +18,9 @@ const TICK: Duration = Duration::from_millis(200);
 /// Saved terminal state while the console is up. Drawing happens under this lock, so `leave`
 /// never restores the terminal in the middle of a frame.
 static ACTIVE: Mutex<Option<term::Saved>> = Mutex::new(None);
+/// Set while the log goes to the console instead of stderr, which starts before the console is
+/// up when it waits for the terminal.
+static CAPTURED: AtomicBool = AtomicBool::new(false);
 static LOG: Mutex<view::Log> = Mutex::new(view::Log::new());
 /// Printed after the terminal is restored; on screen they would vanish with the console.
 static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -60,25 +63,33 @@ impl Drop for Session {
 
 /// The drawing thread, or what it needs until `start_drawing` starts it.
 enum Drawer {
-    Waiting(Feed, Arc<AtomicBool>),
+    Waiting(Feed, Arc<AtomicBool>, Option<Wait>),
     Running(JoinHandle<()>),
 }
+
+/// Blocks until another process lets go of the terminal and returns true, or returns false once
+/// the flag is set.
+pub(crate) type Wait = Box<dyn FnOnce(&AtomicBool) -> bool + Send>;
 
 static DRAWER: Mutex<Option<Drawer>> = Mutex::new(None);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Switches the terminal and takes over the log. `None` when the terminal cannot host the
-/// console; the log then stays on stderr. Nothing is drawn until `start_drawing`.
+/// console; the log then stays on stderr. Nothing is drawn until `start_drawing`. With `wait`,
+/// the terminal switches once it returns, and the log is kept for the console meanwhile.
 pub(crate) fn start(
     metrics: MetricsSlot,
     generation: GenerationSlot,
     stop: Arc<AtomicBool>,
+    wait: Option<Wait>,
 ) -> Option<Session> {
     if !wanted() {
         return None;
     }
-    let saved = term::enter()?;
-    *ACTIVE.lock_recover() = Some(saved);
+    if wait.is_none() {
+        let saved = term::enter()?;
+        *ACTIVE.lock_recover() = Some(saved);
+    }
     install_panic_hook();
     onetdns_core::log::set_sink(Some(Box::new(|record| {
         let mut text = record.event.to_string();
@@ -90,6 +101,7 @@ pub(crate) fn start(
         }
         LOG.lock_recover().push(Some(record.level), clock(), text);
     })));
+    CAPTURED.store(true, Ordering::Release);
     DONE.store(false, Ordering::Release);
     let feed = Feed {
         metrics,
@@ -97,7 +109,7 @@ pub(crate) fn start(
         started: Instant::now(),
         rate: Rate::default(),
     };
-    *DRAWER.lock_recover() = Some(Drawer::Waiting(feed, stop));
+    *DRAWER.lock_recover() = Some(Drawer::Waiting(feed, stop, wait));
     Some(Session(()))
 }
 
@@ -108,12 +120,17 @@ pub(crate) fn start_drawing() {
     if !matches!(*drawer, Some(Drawer::Waiting(..))) {
         return;
     }
-    let Some(Drawer::Waiting(feed, stop)) = drawer.take() else {
+    let Some(Drawer::Waiting(feed, stop, wait)) = drawer.take() else {
         return;
     };
     let spawned = std::thread::Builder::new()
         .name("console".to_string())
         .spawn(move || {
+            if let Some(wait) = wait {
+                if !wait(&DONE) || !enter_late() {
+                    return;
+                }
+            }
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw_until(feed, &stop)))
                 .is_err()
             {
@@ -130,13 +147,43 @@ pub(crate) fn start_drawing() {
     }
 }
 
-/// Restores the terminal and sends the log back to stderr. Safe to call more than once and from
-/// any thread; call it before exec or exit, which skip destructors.
+/// Session::drop joins this thread before it leaves, so the terminal entered here is restored.
+fn enter_late() -> bool {
+    match term::enter() {
+        Some(saved) => {
+            *ACTIVE.lock_recover() = Some(saved);
+            true
+        }
+        None => {
+            leave();
+            onetdns_core::warn!(
+                event = "console.start_failed",
+                "Could not switch the terminal to the console screen; printing the log instead"
+            );
+            false
+        }
+    }
+}
+
+/// Restores the terminal and sends the log back to stderr. Lines kept while the console waited
+/// for the terminal are printed. Safe to call more than once and from any thread; call it before
+/// exec or exit, which skip destructors.
 pub(crate) fn leave() {
     let mut active = ACTIVE.lock_recover();
-    if let Some(saved) = active.take() {
-        saved.restore();
+    let entered = match active.take() {
+        Some(saved) => {
+            saved.restore();
+            true
+        }
+        None => false,
+    };
+    if CAPTURED.swap(false, Ordering::AcqRel) {
         onetdns_core::log::set_sink(None);
+        if !entered {
+            for line in LOG.lock_recover().lines() {
+                eprintln!("{line}");
+            }
+        }
     }
     drop(active);
     for text in std::mem::take(&mut *PANICS.lock_recover()) {
@@ -146,7 +193,7 @@ pub(crate) fn leave() {
 
 /// Lines the server prints for the operator, such as the dashboard address.
 pub(crate) fn print_block(lines: &[String]) {
-    if ACTIVE.lock_recover().is_some() {
+    if CAPTURED.load(Ordering::Acquire) {
         let mut log = LOG.lock_recover();
         for line in lines {
             log.push(None, clock(), line.clone());
@@ -176,6 +223,24 @@ impl ChildConsole {
         if status.signal().is_some() {
             self.0.restore();
         }
+    }
+
+    /// Carries the settings across the supervisor's exec of a new version, when the terminal may
+    /// already be in the console's state.
+    pub(crate) fn encode(&self) -> String {
+        crate::update::hex(&self.0.to_bytes())
+    }
+
+    pub(crate) fn decode(text: &str) -> Option<Self> {
+        let digits = text.as_bytes();
+        if digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let bytes = digits
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        term::Saved::from_bytes(&bytes).map(Self)
     }
 }
 
@@ -366,5 +431,24 @@ impl Feed {
             upstreams,
             level: onetdns_core::log::level(),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_settings_survive_the_supervisor_exec() {
+        let size = std::mem::size_of::<libc::termios>();
+        let bytes: Vec<u8> = (0..size)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let console = ChildConsole(term::Saved::from_bytes(&bytes).unwrap());
+        let text = console.encode();
+        assert_eq!(ChildConsole::decode(&text).unwrap().0.to_bytes(), bytes);
+        assert!(ChildConsole::decode(&text[1..]).is_none());
+        assert!(ChildConsole::decode(&text[2..]).is_none());
+        assert!(ChildConsole::decode(&"+1".repeat(size)).is_none());
     }
 }

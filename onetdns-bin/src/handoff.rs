@@ -455,23 +455,56 @@ impl Handoff {
     }
 
     /// Hands the sockets and the exclusive part to the successor at the other end of `link`. True
-    /// once the successor runs everything; otherwise this generation takes back what it handed over
-    /// and goes on.
+    /// when this generation ends: the successor runs everything, or the supervisor says it does.
+    /// Otherwise this generation takes back what it handed over and goes on.
     pub(crate) fn hand_over(
         &self,
         link: &SuccessorLink,
         cfg: &Config,
         abort: &dyn Fn() -> bool,
     ) -> bool {
+        let Some(kept) = self.give_all(link, cfg, abort) else {
+            let ends = crate::supervisor::settle(false, abort);
+            if ends {
+                onetdns_core::info!(
+                    event = "handoff.superseded",
+                    "The new process took over without this one; this process ends"
+                );
+            }
+            return ends;
+        };
+        if crate::supervisor::settle(true, abort) {
+            onetdns_core::info!(
+                event = "handoff.completed",
+                "Handed the DNS service over to the new process"
+            );
+            return true;
+        }
+        onetdns_core::warn!(
+            event = "handoff.cancelled",
+            "The new process stopped after taking over and the update was put back; this process serves again"
+        );
+        self.take_back(kept, true, cfg);
+        false
+    }
+
+    /// The pool kept back, once the successor runs everything. Otherwise this generation has taken
+    /// back what it handed over.
+    fn give_all(
+        &self,
+        link: &SuccessorLink,
+        cfg: &Config,
+        abort: &dyn Fn() -> bool,
+    ) -> Option<SocketPool> {
         if let Err(error) = expect(link, FromSuccessor::Request, abort) {
             onetdns_core::warn!(event = "handoff.not_requested", %error, "The new process did not ask for the listening sockets; this process keeps serving");
-            return false;
+            return None;
         }
         let (kept, handed) = match self.export() {
             Ok(pools) => pools,
             Err(error) => {
                 onetdns_core::warn!(event = "handoff.export_failed", %error, "Could not duplicate the listening sockets for the new process; this process keeps serving");
-                return false;
+                return None;
             }
         };
         // On Windows a socket read on both sides cannot be stopped reliably, so every listener here
@@ -483,17 +516,11 @@ impl Handoff {
         }
         let mut released = false;
         match self.give(link, handed, cfg, abort, &mut released) {
-            Ok(()) => {
-                onetdns_core::info!(
-                    event = "handoff.completed",
-                    "Handed the DNS service over to the new process"
-                );
-                true
-            }
+            Ok(()) => Some(kept),
             Err(error) => {
                 onetdns_core::warn!(event = "handoff.failed", %error, "Could not hand the DNS service over to the new process; this process serves again");
                 self.take_back(kept, released, cfg);
-                false
+                None
             }
         }
     }

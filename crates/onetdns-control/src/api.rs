@@ -1764,13 +1764,30 @@ fn audit_identity(value: &str, fallback: &str) -> String {
     }
 }
 
+/// Made on first use unless a predecessor's key was adopted before it.
+static CREDENTIAL_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// The key that credential and session digests are made with. Sessions are kept by digest, so only
+/// a process using the same key recognizes them. Never store it.
+pub fn credential_key() -> [u8; 32] {
+    *CREDENTIAL_KEY.get_or_init(onetdns_core::random_array::<32>)
+}
+
+/// Uses the key of the process this one takes over from. Call it before any digest is made, that is
+/// before building `Auth`; fails if this process already uses another key.
+pub fn adopt_credential_key(key: &[u8; 32]) -> Result<(), String> {
+    if CREDENTIAL_KEY.get_or_init(|| *key) == key {
+        Ok(())
+    } else {
+        Err("This process already uses another credential key".to_string())
+    }
+}
+
 /// Keyed digest of a credential, for the audit log; a leaked log must not grant access.
 fn credential_digest(prefix: &str, parts: &[&str]) -> [u8; 32] {
     type HmacSha256 = Hmac<Sha256>;
-    /// Per-process key.
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    let key = KEY.get_or_init(onetdns_core::random_array::<32>);
-    let mut hasher = HmacSha256::new_from_slice(key).expect("HMAC-SHA-256 key length is valid");
+    let mut hasher =
+        HmacSha256::new_from_slice(&credential_key()).expect("HMAC-SHA-256 key length is valid");
     hasher.update(prefix.as_bytes());
     for part in parts {
         hasher.update(&[0]);
@@ -6620,6 +6637,16 @@ mod tests {
         let successor = Auth::new(vec![], vec![]).with_users(vec![changed]);
         successor.adopt_sessions(&exported).unwrap();
         assert_eq!(successor.role_for_session(&session), None);
+    }
+
+    #[test]
+    fn the_credential_key_in_use_cannot_be_replaced() {
+        let key = credential_key();
+        assert_eq!(adopt_credential_key(&key), Ok(()));
+        let mut other = key;
+        other[0] ^= 1;
+        assert!(adopt_credential_key(&other).is_err());
+        assert_eq!(credential_key(), key);
     }
 
     #[test]

@@ -7,9 +7,9 @@ pub mod password;
 mod persist;
 
 pub use api::{
-    clear_acme_http01, serve, serve_listener, set_acme_http01, ApiResponse, AppState, AuditLog,
-    Auth, ClusterWrite, Controls, FilterApply, ListCounts, ProxyPolicy, Role, SessionStore,
-    UserCred,
+    adopt_credential_key, clear_acme_http01, credential_key, serve, serve_listener,
+    set_acme_http01, ApiResponse, AppState, AuditLog, Auth, ClusterWrite, Controls, FilterApply,
+    ListCounts, ProxyPolicy, Role, SessionStore, UserCred,
 };
 pub use dnstap::{DnstapProtocol, DnstapWriter};
 pub use metrics::{

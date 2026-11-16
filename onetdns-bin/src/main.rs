@@ -578,8 +578,14 @@ fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     update::launch::register(stop.clone());
 
     let shared = ServeShared::default();
-    let _console = tui::start(shared.metrics.clone(), shared.console.clone(), stop.clone());
-    let ready_callback = Arc::new(Mutex::new(supervisor::take_ready_callback()?));
+    let joined = supervisor::join(&shared.links)?;
+    let _console = tui::start(
+        shared.metrics.clone(),
+        shared.console.clone(),
+        stop.clone(),
+        joined.console,
+    );
+    let ready_callback = Arc::new(Mutex::new(joined.ready));
     let mut recovery_error: Option<String> = None;
     loop {
         let loaded = Config::load_or_default(config_path.as_deref());
@@ -1719,6 +1725,8 @@ pub fn serve(
             Wake::Reload => break true,
             Wake::Successor(link) => {
                 if handover.hand_over(&link, &runtime_cfg.load(), &stopping) {
+                    // The successor takes the terminal once this process lets go of the link.
+                    tui::leave();
                     break false;
                 }
             }
