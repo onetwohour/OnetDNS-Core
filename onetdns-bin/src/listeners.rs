@@ -311,6 +311,7 @@ impl ListenerSet {
     /// Every listener stops reading its listening sockets and closes its handles to them; returns
     /// once none reads them. Connections already accepted are served until `close_all`.
     pub(crate) fn stop_reading(&self) {
+        self.stop_reading_quic();
         for (_, server) in self.plain.lock_recover().iter_mut() {
             server.stop_reading();
         }
@@ -319,13 +320,23 @@ impl ListenerSet {
                 listener.stop_reading();
             }
         }
+        for listener in self.dnscrypt.lock_recover().iter_mut() {
+            listener.stop_reading();
+        }
+    }
+
+    /// QUIC connection state lives in this process, so a successor reads these sockets only after
+    /// this returns. Every QUIC listener drains at the same time.
+    pub(crate) fn stop_reading_quic(&self) {
+        for listeners in [&self.doq, &self.doh3] {
+            for (_, listener) in listeners.lock_recover().iter() {
+                listener.signal_stop();
+            }
+        }
         for listeners in [&self.doq, &self.doh3] {
             for (_, listener) in listeners.lock_recover().iter_mut() {
                 listener.stop_reading();
             }
-        }
-        for listener in self.dnscrypt.lock_recover().iter_mut() {
-            listener.stop_reading();
         }
     }
 

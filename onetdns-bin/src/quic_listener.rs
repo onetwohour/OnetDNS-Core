@@ -244,11 +244,16 @@ impl QuicListener {
         }
     }
 
+    /// Starts what `stop_reading` waits for, so several listeners drain at once.
+    pub(crate) fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// Ends the connections, answering the queries in flight for at most DRAIN_LIMIT first, and
     /// closes this listener's handles to the socket. Connection state lives in the receive loop, so
     /// nothing is left to serve afterwards.
     pub(crate) fn stop_reading(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.signal_stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
