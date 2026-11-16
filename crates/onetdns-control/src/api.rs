@@ -4887,7 +4887,7 @@ fn recent_json(st: &AppState) -> String {
 }
 
 fn stats_history_json(st: &AppState, range_secs: u64) -> String {
-    let points = st.stats.metrics.history(range_secs, 59);
+    let (bucket_secs, points) = st.stats.metrics.history(range_secs, 59);
     let items = points
         .iter()
         .map(|point| {
@@ -4902,7 +4902,7 @@ fn stats_history_json(st: &AppState, range_secs: u64) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    format!("{{\"range_secs\":{range_secs},\"points\":[{items}]}}")
+    format!("{{\"range_secs\":{range_secs},\"bucket_secs\":{bucket_secs},\"points\":[{items}]}}")
 }
 
 fn top_json(st: &AppState) -> String {

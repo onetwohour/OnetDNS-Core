@@ -3017,7 +3017,7 @@ Object.assign(I18N.en, {
   '{port}번 포트의 방화벽 수신을 허용했습니다':'Allowed inbound firewall traffic on port {port}',
   '{port}번 포트의 수신을 허용했습니다':'Allowed inbound traffic on port {port}',
   '{port}번 포트의 방화벽 규칙을 삭제했습니다':'Removed the firewall rule for port {port}',
-  '{range} · 평균 QPS':'{range} · Average QPS','{range} · {bucket}당 질의 수':'{range} · queries per {bucket}','{n}초':'{n}s','{n}분':'{n}min','{n}시간':'{n}h',
+  '{range} · 평균 QPS':'{range} · Average QPS','{range} · {bucket}당 질의 수':'{range} · queries per {bucket}','{n}초':'{n}s','{n}분':'{n}min','{n}시간':'{n}h','{h}시간 {m}분':'{h}h {m}min',
   '{count}초':'{count} seconds',
   '{name} · {count}개':'{name} · {count}',
   '정상 응답':'Answered',
@@ -3036,7 +3036,7 @@ Object.assign(I18N.ja, {
   '{port}번 포트의 방화벽 수신을 허용했습니다':'ポート {port} の受信をファイアウォールで許可しました',
   '{port}번 포트의 수신을 허용했습니다':'ポート {port} の受信を許可しました',
   '{port}번 포트의 방화벽 규칙을 삭제했습니다':'ポート {port} のファイアウォール規則を削除しました',
-  '{range} · 평균 QPS':'{range} · 平均 QPS','{range} · {bucket}당 질의 수':'{range} · {bucket}あたりのクエリ数','{n}초':'{n}秒','{n}분':'{n}分','{n}시간':'{n}時間',
+  '{range} · 평균 QPS':'{range} · 平均 QPS','{range} · {bucket}당 질의 수':'{range} · {bucket}あたりのクエリ数','{n}초':'{n}秒','{n}분':'{n}分','{n}시간':'{n}時間','{h}시간 {m}분':'{h}時間{m}分',
   '{count}초':'{count} 秒',
   '{name} · {count}개':'{name} · {count} 件',
   '정상 응답':'正常応答',
@@ -4095,6 +4095,7 @@ Object.assign(I18N.zh, {
   "{n}초":"{n} 秒",
   "{n}분":"{n} 分钟",
   "{n}시간":"{n} 小时",
+  "{h}시간 {m}분":"{h} 小时 {m} 分钟",
   "{count}초":"{count} 秒",
   "{name} · {count}개":"{name} · {count} 个",
   "정상 응답":"正常应答",
@@ -5213,7 +5214,8 @@ class Component extends DCLogic {
     if(message.type==='history'&&message.data&&Array.isArray(message.data.points)){
       const range=Number(message.data.range_secs)||this.state.qpsRange;
       const points=message.data.points.map(p=>({ts_ms:Number(p.ts_ms)||0,queries:Number(p.queries)||0,blocked:Number(p.blocked)||0,avg_latency_ms:Number(p.avg_latency_ms)||0,cache_hit_pct:Number(p.cache_hit_pct)||0}));
-      this.setState(s=>({historyByRange:{...s.historyByRange,[range]:points}}));
+      const bucketSecs=Number(message.data.bucket_secs)||0;
+      this.setState(s=>({historyByRange:{...s.historyByRange,[range]:{points,bucketSecs}}}));
       return;
     }
     if(message.type==='query'&&message.event){
@@ -6830,17 +6832,20 @@ class Component extends DCLogic {
     const rangeSec=s.qpsRange;
     const liveSec={60:48,300:300,3600:3600,86400:86400,604800:604800}[rangeSec]||60;
     const useHistory=rangeSec>300;
-    const live=!useHistory&&!s.feedPaused;
+    const live=!s.feedPaused;
     const nowMs=Date.now();
     const step=W/(VIS-1);
     let cols=[],bs=1,lastB=0;
     if(useHistory){
-      const source=((s.historyByRange||{})[rangeSec]||[]).slice(-VIS-1);
-      const widthMs=rangeSec*1000/VIS;
+      const history=(s.historyByRange||{})[rangeSec];
+      const source=(history?history.points:[]).slice(-VIS-1);
+      bs=(history&&history.bucketSecs)||Math.max(1,Math.round(rangeSec/VIS));
+      // The server's bins sit on the clock and its first point is a whole bin, so that point
+      // changes exactly when the series moves by one bin.
+      lastB=source.length?source[0].ts_ms:null;
+      const widthMs=bs*1000;
       while(source.length<VIS+1)source.unshift({ts_ms:nowMs-widthMs*(source.length+1),queries:0,blocked:0});
       cols=source.map((point,index)=>({q:Number(point.queries)||0,b:Number(point.blocked)||0,t:Number(point.ts_ms)||nowMs-widthMs*(VIS-index)}));
-      bs=Math.max(1,Math.round(rangeSec/VIS));
-      lastB=Math.floor(nowMs/(bs*1000));
     }else{
       bs=Math.max(1,Math.round((liveSec/tickSec)/VIS));
       // 구간의 경계는 시각에 건다. 표본 배열은 상한에 닿으면 앞에서 하나씩 빠지는 링 버퍼라,
@@ -6884,7 +6889,7 @@ class Component extends DCLogic {
     const qpsNow=visCols.length?(visCols[visCols.length-1].q||0):0;
     const qpsRanges=[[60,'1분'],[300,'5분'],[3600,'1시간'],[86400,'1일'],[604800,'1주']].map(([r,label])=>({r,label:this.t(label),on:rangeSec===r,onClick:this.setQpsRange(r),
       style:`padding:4px 10px;border-radius:2px;border:0;cursor:pointer;font:inherit;font-size:11.5px;font-weight:${rangeSec===r?'700':'500'};background:${rangeSec===r?'var(--surface)':'transparent'};color:${rangeSec===r?'var(--accent)':'var(--muted)'};box-shadow:${rangeSec===r?'var(--shadow)':'none'}`}));
-    const bucketLabel=bs<60?this.tr('{n}초',{n:bs}):(bs<3600?this.tr('{n}분',{n:Math.round(bs/60)}):this.tr('{n}시간',{n:Math.round(bs/3600)}));
+    const bucketLabel=bs<60?this.tr('{n}초',{n:bs}):bs<3600?this.tr('{n}분',{n:Math.round(bs/60)}):bs%3600?this.tr('{h}시간 {m}분',{h:Math.floor(bs/3600),m:Math.round(bs%3600/60)}):this.tr('{n}시간',{n:bs/3600});
     const qpsRangeLabel=this.tr('{range} · {bucket}당 질의 수',{range:this.t({60:'최근 1분',300:'최근 5분',3600:'최근 1시간',86400:'최근 24시간',604800:'최근 7일'}[rangeSec]),bucket:bucketLabel});
 
 

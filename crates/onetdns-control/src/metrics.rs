@@ -231,28 +231,33 @@ impl MetricHistory {
         out
     }
 
-    /// Splits the requested range into `point_count` points, for dashboard graphs.
-    fn points(&self, now_sec: u64, range_secs: u64, point_count: usize) -> Vec<MetricPoint> {
+    /// Splits the requested range into `point_count` bins for dashboard graphs and returns the
+    /// bin width in seconds with the points, oldest first.
+    fn points(&self, now_sec: u64, range_secs: u64, point_count: usize) -> (u64, Vec<MetricPoint>) {
         let point_count = point_count.clamp(2, 240);
         let range_secs = range_secs.clamp(60, 7 * 24 * 60 * 60);
-        let width = range_secs.div_ceil(point_count as u64).max(1);
-        let start = now_sec.saturating_sub(width.saturating_mul(point_count as u64));
+        // Rounding down keeps the oldest bin inside the retained records, and whole minutes keep
+        // a minute record from straddling two bins.
+        let width = (range_secs / point_count as u64).max(1);
+        let width = if width >= 60 { width / 60 * 60 } else { width };
+        // Bins start on multiples of the width, so a later call changes only the current bin.
+        let current = now_sec / width;
+        let first = current.saturating_sub(point_count as u64 - 1);
         let source = if range_secs <= 3_600 {
             &self.seconds
         } else {
             &self.minutes
         };
-        let mut out = Vec::with_capacity(point_count);
-        for index in 0..point_count {
-            let bin_start = start.saturating_add(width.saturating_mul(index as u64));
-            let bin_end = bin_start.saturating_add(width);
-            let mut sum = MetricBucket::default();
-            for bucket in source
-                .iter()
-                .filter(|bucket| bucket.ts_sec > bin_start && bucket.ts_sec <= bin_end)
-            {
-                sum.add(*bucket);
+        let mut sums = vec![MetricBucket::default(); point_count];
+        for bucket in source {
+            let bin = bucket.ts_sec / width;
+            if (first..=current).contains(&bin) {
+                sums[(bin - first) as usize].add(*bucket);
             }
+        }
+        let mut out = Vec::with_capacity(point_count);
+        for (index, sum) in sums.iter().enumerate() {
+            let bin_end = (first + index as u64 + 1).saturating_mul(width);
             let avg_latency_ms = if sum.latency_count == 0 {
                 0.0
             } else {
@@ -264,14 +269,14 @@ impl MetricHistory {
                 sum.cache_hits as f64 * 100.0 / sum.cache_lookups as f64
             };
             out.push(MetricPoint {
-                ts_ms: bin_end.saturating_mul(1_000),
+                ts_ms: bin_end.min(now_sec).saturating_mul(1_000),
                 queries: sum.queries,
                 blocked: sum.blocked,
                 avg_latency_ms,
                 cache_hit_pct,
             });
         }
-        out
+        (width, out)
     }
 }
 
@@ -403,7 +408,8 @@ impl Metrics {
             .reset_baseline(counters, now_sec);
     }
 
-    pub fn history(&self, range_secs: u64, point_count: usize) -> Vec<MetricPoint> {
+    /// The bin width in seconds and the points, oldest first.
+    pub fn history(&self, range_secs: u64, point_count: usize) -> (u64, Vec<MetricPoint>) {
         self.sample_now();
         let now_sec = now_ms() / 1_000;
         self.history
@@ -3168,7 +3174,7 @@ mod tests {
             },
             10_060,
         );
-        let points = history.points(10_060, 3_600, 59);
+        let (_, points) = history.points(10_060, 3_600, 59);
         assert_eq!(points.len(), 59);
         assert_eq!(
             points.iter().map(|point| point.queries).sum::<u64>(),
@@ -3176,6 +3182,68 @@ mod tests {
             "구간을 나눠도 질의 수의 합은 보존되어야 합니다"
         );
         assert!(points.iter().any(|point| point.avg_latency_ms == 30.0));
+    }
+
+    #[test]
+    fn history_bins_stay_on_the_clock_between_refreshes() {
+        let mut history = MetricHistory::default();
+        history.reset_baseline(MetricBucket::default(), 100_000);
+        let mut total = 0;
+        for sec in 100_001..=103_620 {
+            total += sec % 7;
+            history.sample(
+                MetricBucket {
+                    queries: total,
+                    ..MetricBucket::default()
+                },
+                sec,
+            );
+        }
+        let queries = |now| {
+            let (width, points) = history.points(now, 3_600, 59);
+            assert_eq!(width, 60);
+            points.iter().map(|point| point.queries).collect::<Vec<_>>()
+        };
+        let first = queries(103_620);
+        assert_eq!(
+            first,
+            queries(103_625),
+            "다시 계산해도 같은 구간은 같은 값이어야 합니다"
+        );
+        assert_eq!(
+            queries(103_680)[..58],
+            first[1..],
+            "다음 구간으로 넘어가면 한 칸씩 밀려야 합니다"
+        );
+        assert!(
+            first[0] > 0,
+            "가장 오래된 구간도 보관 범위 안에 있어야 합니다"
+        );
+    }
+
+    #[test]
+    fn history_bins_hold_whole_minutes() {
+        let mut history = MetricHistory::default();
+        let start = 1_000_020;
+        history.reset_baseline(MetricBucket::default(), start);
+        for minute in 1..=2 * 24 * 60 {
+            history.sample(
+                MetricBucket {
+                    queries: minute * 10,
+                    ..MetricBucket::default()
+                },
+                start + minute * 60,
+            );
+        }
+        let now = start + 2 * 24 * 60 * 60;
+        let (width, points) = history.points(now, 86_400, 59);
+        assert_eq!(width, 1_440);
+        assert!(
+            points[..58].iter().all(|point| point.queries == 240),
+            "구간마다 분 기록이 같은 수만큼 들어가야 합니다"
+        );
+        assert_eq!(points[0].ts_ms % 1_440_000, 0);
+        assert_eq!(points[58].ts_ms, now * 1_000);
     }
 
     #[test]
