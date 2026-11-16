@@ -1047,6 +1047,8 @@ pub struct ServeShared {
     applied_config_text: ConfigTextSlot,
     /// The one before it, for rollback.
     previous_config_text: ConfigTextSlot,
+
+    links: Arc<handoff::Links>,
 }
 
 /// Config text holding credentials, shared and zeroized on drop.
@@ -1314,6 +1316,8 @@ pub fn serve(
     // while listen sockets stay.
     let tls_slot_handle: Arc<Mutex<Option<Arc<TlsSlots>>>> = Arc::new(Mutex::new(None));
     let jobs = GenerationJobs::new(shared.control_jobs.clone());
+    let predecessor = shared.links.predecessor.lock_recover().take();
+    let mut exclusive = handoff::Exclusive::new(jobs.clone(), predecessor.is_some());
     onetdns_core::info!(event = "serve.starting", mode = ?cfg.mode, backend = ?cfg.backend, "Starting DNS server");
 
     let reload = Arc::new(AtomicBool::new(false));
@@ -1374,7 +1378,18 @@ pub fn serve(
 
     let dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>> = Arc::new(Mutex::new(None));
     let dhcp6_slot: Arc<Mutex<Option<Arc<Mutex<dhcp6::Lease6Pool>>>>> = Arc::new(Mutex::new(None));
-    reconcile_edge_services(&cfg, &jobs.edge, &dhcp_slot, &dhcp6_slot)
+    exclusive
+        .install(
+            &Arc::default(),
+            {
+                let services = jobs.edge.clone();
+                let (dhcp, dhcp6) = (dhcp_slot.clone(), dhcp6_slot.clone());
+                Arc::new(move |next: &Config| {
+                    reconcile_edge_services(next, &services, &dhcp, &dhcp6)
+                })
+            },
+            &cfg,
+        )
         .map_err(std::io::Error::other)?;
     service_cleanup.track(
         jobs.spawn_retire(shutdown.clone(), reload.clone())
@@ -1383,17 +1398,18 @@ pub fn serve(
             })?,
     );
 
-    install_restart(
-        &restarts.lease_sync,
-        lease_sync_restart(
-            jobs.lease_sync.clone(),
-            dhcp_slot.clone(),
-            blocklist_resolver.clone(),
-            service_cleanup.tracker(),
-        ),
-        &cfg,
-    )
-    .map_err(std::io::Error::other)?;
+    exclusive
+        .install(
+            &restarts.lease_sync,
+            lease_sync_restart(
+                jobs.lease_sync.clone(),
+                dhcp_slot.clone(),
+                blocklist_resolver.clone(),
+                service_cleanup.tracker(),
+            ),
+            &cfg,
+        )
+        .map_err(std::io::Error::other)?;
 
     install_revocation_policy(&cfg, &revocation_resolver_slot);
 
@@ -1415,18 +1431,19 @@ pub fn serve(
         )
         .with_context(|| "Could not start the TLS certificate watch task")?,
     );
-    install_restart(
-        &restarts.singletons,
-        singletons_restart(
-            jobs.singletons.clone(),
-            filters.clone(),
-            zones.clone(),
-            forward_stats.clone(),
-            upstream_stats_path(config_path.as_deref()),
-        ),
-        &cfg,
-    )
-    .map_err(std::io::Error::other)?;
+    exclusive
+        .install(
+            &restarts.singletons,
+            singletons_restart(
+                jobs.singletons.clone(),
+                filters.clone(),
+                zones.clone(),
+                forward_stats.clone(),
+                upstream_stats_path(config_path.as_deref()),
+            ),
+            &cfg,
+        )
+        .map_err(std::io::Error::other)?;
     let reload_zone_keys = zones.reload_from_config(&runtime_cfg, &native_hot_state);
     service_cleanup.track(
         spawn_zone_file_watch(
@@ -1436,28 +1453,30 @@ pub fn serve(
         )
         .with_context(|| "Could not start the DNS zone file watch task")?,
     );
-    install_restart(
-        &restarts.zsk_rollover,
-        rollover_restart(
-            jobs.zsk_rollover.clone(),
-            reload_zone_keys,
-            service_cleanup.tracker(),
-        ),
-        &cfg,
-    )
-    .map_err(std::io::Error::other)?;
+    exclusive
+        .install(
+            &restarts.zsk_rollover,
+            rollover_restart(
+                jobs.zsk_rollover.clone(),
+                reload_zone_keys,
+                service_cleanup.tracker(),
+            ),
+            &cfg,
+        )
+        .map_err(std::io::Error::other)?;
     let notify_kick = Arc::new(native::NotifyKick::default());
-    install_restart(
-        &restarts.secondary,
-        refresh_restart(
-            jobs.secondary.clone(),
-            &zones,
-            notify_kick.clone(),
-            service_cleanup.tracker(),
-        ),
-        &cfg,
-    )
-    .map_err(|error| crate::anyhow!(error))?;
+    exclusive
+        .install(
+            &restarts.secondary,
+            refresh_restart(
+                jobs.secondary.clone(),
+                &zones,
+                notify_kick.clone(),
+                service_cleanup.tracker(),
+            ),
+            &cfg,
+        )
+        .map_err(|error| crate::anyhow!(error))?;
     let policy_engine = Arc::new(native::GatedSwap::new(Arc::new(
         build_policy_engine(&cfg).map_err(std::io::Error::other)?,
     )));
@@ -1534,8 +1553,12 @@ pub fn serve(
     });
     let state = shared.control_state(&cfg, stats, controls, readiness.clone(), control_proxy)?;
     *console_auth.lock_recover() = Some(state.auth.clone());
-    issue_setup_code(&state.auth, config_path.as_deref());
-    install_restart(&restarts.control, shared.control_restart(state), &cfg)
+    let setup_auth = state.auth.clone();
+    if !exclusive.deferred() {
+        issue_setup_code(&setup_auth, config_path.as_deref());
+    }
+    exclusive
+        .install(&restarts.control, shared.control_restart(state), &cfg)
         .map_err(std::io::Error::other)?;
 
     let restart_raft = raft_restart(
@@ -1545,11 +1568,14 @@ pub fn serve(
         reload.clone(),
         hot_appliers.wait,
     );
-    *restarts.raft.lock_recover() = Some({
+    // The first start compares the file with the text this generation read; restarts run under
+    // hot apply's config lock and skip that.
+    if exclusive.install_restart_only(&restarts.raft, {
         let restart_raft = restart_raft.clone();
-        Arc::new(move |next: &Config| restart_raft(next, None)) as SecondaryRestart
-    });
-    restart_raft(&cfg, cfg_text.as_deref()).map_err(std::io::Error::other)?;
+        Arc::new(move |next: &Config| restart_raft(next, None))
+    }) {
+        restart_raft(&cfg, cfg_text.as_deref()).map_err(std::io::Error::other)?;
+    }
 
     let mac_cache = if cfg.clients.iter().any(|c| !c.mac.is_empty()) {
         let cache = mac::NeighborCache::new();
@@ -1589,33 +1615,56 @@ pub fn serve(
     let _ = query_handler.set(Arc::downgrade(&native_handler));
 
     let listeners = Arc::new(ListenerSet::default());
-    install_restart(
-        &restarts.listeners,
-        {
-            let set = listeners.clone();
-            let handler = native_handler.clone();
-            let slots = tls_slot_handle.clone();
-            let sd = shutdown.clone();
-            let registry = listener_reg.clone();
-            let path = config_path.clone();
-            let tracker = service_cleanup.tracker();
-            let identity = dnscrypt_identity.clone();
-            Arc::new(move |next: &Config| -> Result<(), String> {
-                reconcile_listeners(
-                    next,
-                    &set,
-                    &handler,
-                    &slots,
-                    &sd,
-                    &registry,
-                    tls_material::self_signed_file(path.as_deref()).as_deref(),
-                )?;
-                reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
-            }) as SecondaryRestart
-        },
-        &cfg,
-    )
-    .map_err(std::io::Error::other)?;
+    let listeners_restart: SecondaryRestart = {
+        let set = listeners.clone();
+        let handler = native_handler.clone();
+        let slots = tls_slot_handle.clone();
+        let sd = shutdown.clone();
+        let registry = listener_reg.clone();
+        let path = config_path.clone();
+        let tracker = service_cleanup.tracker();
+        let identity = dnscrypt_identity.clone();
+        Arc::new(move |next: &Config| -> Result<(), String> {
+            reconcile_listeners(
+                next,
+                &set,
+                &handler,
+                &slots,
+                &sd,
+                &registry,
+                tls_material::self_signed_file(path.as_deref()).as_deref(),
+            )?;
+            reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
+        })
+    };
+    let handover = handoff::Handoff {
+        listeners: listeners.clone(),
+        listeners_slot: restarts.listeners.clone(),
+        registry: listener_reg.clone(),
+        control_listener: shared.control_listener.clone(),
+        exclusive,
+    };
+    let stopping = || {
+        external_stop
+            .as_deref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+    };
+    match &predecessor {
+        None => install_restart(&restarts.listeners, listeners_restart, &cfg)
+            .map_err(std::io::Error::other)?,
+        Some(link) => {
+            if let Err(error) = handover.take_over(link, listeners_restart, &cfg, &stopping) {
+                shutdown.store(true, Ordering::Relaxed);
+                listeners.close_all();
+                return Err(crate::anyhow!(error));
+            }
+            issue_setup_code(&setup_auth, config_path.as_deref());
+            // A change written while the previous process still served is applied by a reload.
+            if config_changed_since(config_path.as_deref(), cfg_text.as_ref()) {
+                reload.store(true, Ordering::Release);
+            }
+        }
+    }
 
     onetdns_core::info!(event = "server.ready", "Now answering queries");
 
@@ -1640,8 +1689,21 @@ pub fn serve(
         },
         blocklist_resolver.clone(),
     );
+    if let Some(link) = predecessor {
+        let _ = link.send(handoff::FromSuccessor::Ready);
+    }
 
-    let reloaded = wait_for_stop_or_reload(&reload, external_stop.as_deref());
+    let reloaded = loop {
+        match wait_for_wake(&reload, external_stop.as_deref(), &shared.links) {
+            Wake::Stop => break false,
+            Wake::Reload => break true,
+            Wake::Successor(link) => {
+                if handover.hand_over(&link, &runtime_cfg.load(), &stopping) {
+                    break false;
+                }
+            }
+        }
+    };
 
     readiness.store(false, Ordering::Release);
     shutdown.store(true, Ordering::Relaxed);
@@ -1657,11 +1719,18 @@ pub fn serve(
     Ok(reloaded)
 }
 
-/// True to reload, false to exit.
-fn wait_for_stop_or_reload(
+enum Wake {
+    Stop,
+    Reload,
+    /// A new process asks to take over.
+    Successor(handoff::SuccessorLink),
+}
+
+fn wait_for_wake(
     reload: &std::sync::atomic::AtomicBool,
     external_stop: Option<&std::sync::atomic::AtomicBool>,
-) -> bool {
+    links: &handoff::Links,
+) -> Wake {
     use std::sync::atomic::Ordering;
     loop {
         if external_stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
@@ -1670,7 +1739,7 @@ fn wait_for_stop_or_reload(
                 reason = "external_signal",
                 "Received an external shutdown signal"
             );
-            return false;
+            return Wake::Stop;
         }
         if reload.load(Ordering::Relaxed) {
             onetdns_core::info!(
@@ -1678,9 +1747,29 @@ fn wait_for_stop_or_reload(
                 reason = "config_change",
                 "Restarting the DNS service to apply configuration changes"
             );
-            return true;
+            return Wake::Reload;
+        }
+        if let Some(link) = links.successor.lock_recover().take() {
+            onetdns_core::info!(
+                event = "handoff.started",
+                "Handing the DNS service over to a new process"
+            );
+            return Wake::Successor(link);
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// True when the file no longer holds the text this generation started from.
+fn config_changed_since(
+    path: Option<&std::path::Path>,
+    text: Option<&onetdns_core::SecretString>,
+) -> bool {
+    match (path, text) {
+        (Some(path), Some(text)) => {
+            Config::read_text(path).is_ok_and(|now| now.as_str() != text.as_str())
+        }
+        _ => false,
     }
 }
 

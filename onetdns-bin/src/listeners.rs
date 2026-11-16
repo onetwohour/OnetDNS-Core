@@ -996,7 +996,7 @@ pub(crate) fn reconcile_dnscrypt(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use onetdns_config::Config;
     use std::io::{Read, Write};
@@ -1070,7 +1070,7 @@ mod tests {
         })
     }
 
-    fn ask_udp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
+    pub(crate) fn ask_udp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1081,7 +1081,7 @@ mod tests {
         answered_address(&buf[..n], id)
     }
 
-    fn ask_tcp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
+    pub(crate) fn ask_tcp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
         let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(5)).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         let wire = query(id, name);

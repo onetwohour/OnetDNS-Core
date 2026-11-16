@@ -712,9 +712,10 @@ pub(crate) struct EdgeServices {
 }
 
 impl EdgeServices {
-    /// Stops every registered service and waits for the threads handed over by name.
+    /// Stops every registered service and waits for the threads handed over by name. Nothing is
+    /// left registered, so starting the services again starts every one.
     pub(crate) fn retire_all(&self) {
-        for (_, stop) in self.running.lock_recover().iter() {
+        for (_, stop) in self.running.lock_recover().drain(..) {
             stop.store(true, std::sync::atomic::Ordering::Release);
         }
         let threads: Vec<_> = self.threads.lock_recover().drain().collect();
