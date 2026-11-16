@@ -377,6 +377,38 @@
             </div>
           </div>
         </div>
+
+        <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
+          <section style="min-width:0">
+            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">DNS 응답 재작성</div></div>
+            <div data-mform="" data-submit-enter="" style="padding:13px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)"><input data-k="rewriteDomain" value="{{ forms.rewriteDomain }}" onInput="{{ onForm }}" aria-label="재작성 도메인" placeholder="router.lan" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><input data-k="rewriteAnswer" value="{{ forms.rewriteAnswer }}" onInput="{{ onForm }}" aria-label="재작성 응답" placeholder="10.0.0.1" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ addRewrite }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button></div>
+            <sc-if value="{{ hasRewrites }}"><div><sc-for list="{{ rewriteRows }}" as="r" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,.75fr) 32px;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)"><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.domain }}<sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></span><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.answer }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" title="{{ r.removeLabel }}" style="width:30px;height:30px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--block);cursor:pointer">×</button></div></sc-for></div></sc-if>
+            <sc-if value="{{ !hasRewrites }}"><div style="padding:20px 0;text-align:center;font-size:11.5px;color:var(--muted)">등록된 재작성 규칙이 없습니다.</div></sc-if>
+          </section>
+
+          <section style="min-width:0">
+            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">필터 품질</div></div>
+            <div style="display:flex;align-items:flex-end;gap:18px;padding:14px 0 10px"><div><div style="font-size:10.5px;color:var(--muted)">필터 적용률</div><div style="font-family:var(--font-mono);font-size:25px;font-weight:600;color:var(--fg);margin-top:4px">{{ filterCoverageLabel }}</div></div><div style="flex:1"><div style="height:7px;border-radius:999px;background:var(--surface3);overflow:hidden"><div style="{{ filterCoverageStyle }}"></div></div><div style="display:flex;justify-content:space-between;margin-top:6px;font-size:10.5px;color:var(--muted)"><span>적용 {{ reportApplied }}</span><span>제외 {{ reportSkipped }} / 전체 {{ reportTotal }}</span></div></div></div>
+            <sc-if value="{{ hasFilterReasons }}"><div style="padding-top:8px;border-top:1px solid var(--border)"><sc-for list="{{ filterReasonRows }}" as="reason" hint-placeholder-count="2"><div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11px"><span style="flex:1;color:var(--fg2)">{{ reason.reason }}</span><strong style="font-family:var(--font-mono);color:var(--warn)">{{ reason.countLabel }}</strong></div></sc-for></div></sc-if><sc-if value="{{ !hasFilterReasons }}"><div style="padding:12px 0;border-top:1px solid var(--border);font-size:11px;color:var(--ok)">건너뛴 규칙이 없습니다.</div></sc-if>
+          </section>
+        </div>
+
+        <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
+          <section style="min-width:0">
+            <div style="padding:0 0 11px;border-bottom:1px solid var(--border);display:flex;align-items:flex-end;gap:8px"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">필터 출처</div></div><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted)">{{ sourceTotalsText }}</span></div>
+            <sc-if value="{{ hasSources }}"><div><sc-for list="{{ sourceRows }}" as="r" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)" title="{{ r.source }}">{{ r.source }}</span><span style="font-family:var(--font-mono);color:var(--muted)">{{ r.rulesLabel }} 규칙</span><span style="font-family:var(--font-mono);color:var(--accent)">{{ r.hitsText }}</span></div></sc-for></div></sc-if><sc-if value="{{ sourceHitsOff }}"><div style="padding:9px 0 0;font-size:10.5px;color:var(--faint)">규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.</div></sc-if><sc-if value="{{ !hasSources }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">필터 출처 데이터가 없습니다.</div></sc-if>
+          </section>
+
+          <section style="min-width:0">
+            <div style="padding:0 0 11px;border-bottom:1px solid var(--border);display:flex;align-items:flex-end;gap:8px"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">WASM 플러그인</div></div><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted)">{{ pluginEvalTotal }} 평가 · {{ pluginBlockTotal }} 차단 · {{ pluginErrorTotal }} 오류</span></div>
+            <sc-if value="{{ hasPlugins }}"><div><sc-for list="{{ pluginRows }}" as="p" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)" title="{{ p.name }}">{{ p.name }}</span><span style="font-family:var(--font-mono);color:{{ p.healthColor }}">{{ p.evalLabel }} / {{ p.errorLabel }}</span><span style="font-family:var(--font-mono);color:var(--accent)">{{ p.latency }}</span></div></sc-for></div></sc-if><sc-if value="{{ !hasPlugins }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">로드된 WASM 플러그인이 없습니다.</div></sc-if>
+          </section>
+        </div>
+
+        <section style="min-width:0">
+          <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">규칙 적중 상위</div></div>
+          <sc-if value="{{ hasTopRules }}"><div><sc-for list="{{ topRuleRows }}" as="r" hint-placeholder-count="5"><div style="display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px"><span style="flex:1;min-width:0;font-family:var(--font-mono);color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><strong style="font-family:var(--font-mono);color:var(--accent)">{{ r.hitsLabel }}</strong></div></sc-for></div></sc-if><sc-if value="{{ topRulesOff }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.</div></sc-if><sc-if value="{{ topRulesEmpty }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">집계된 규칙 적중 기록이 없습니다.</div></sc-if>
+        </section>
       </div>
       </sc-if>
 
@@ -446,6 +478,17 @@
           </sc-for>
                 <sc-if value="{{ !hasClients }}"><div style="padding:22px 18px;text-align:center;color:var(--muted);font-size:12px">등록한 클라이언트가 없습니다.</div></sc-if>
         </div>
+
+        <section style="min-width:0">
+          <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">접근 정책</div></div>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding-top:14px">
+            <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--ok)">허용 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessAllowedRows.length }}</span></div><sc-if value="{{ hasAccessAllowed }}"><sc-for list="{{ accessAllowedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessAllowed }}"><div style="font-size:10.5px;color:var(--faint)">제한 없음</div></sc-if></div>
+            <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거부 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessBlockedRows.length }}</span></div><sc-if value="{{ hasAccessBlocked }}"><sc-for list="{{ accessBlockedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessBlocked }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
+            <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">응답하지 않을 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessDroppedRows.length }}</span></div><sc-if value="{{ hasAccessDropped }}"><sc-for list="{{ accessDroppedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessDropped }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
+            <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거절할 도메인</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessHostRows.length }}</span></div><sc-if value="{{ hasAccessHosts }}"><sc-for list="{{ accessHostRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessHosts }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
+          </div>
+          <sc-if value="{{ hasAccessUnlisted }}"><div style="display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:11px;border-top:1px solid var(--border)"><span style="font-size:10.5px;font-weight:700;color:var(--muted);flex:1">규칙에 없는 클라이언트</span><span style="font-size:10.5px;font-weight:700;color:{{ accessUnlistedColor }}">{{ accessUnlistedLabel }}</span></div></sc-if>
+        </section>
       </div>
       </sc-if>
 
@@ -637,6 +680,15 @@
             </div>
           </sc-for>
         </div>
+
+        <div style="border:1px solid var(--border);border-radius:5px;background:var(--surface);overflow:hidden">
+          <div style="display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid var(--border)"><span style="flex:1;font-size:15px;font-weight:600;color:var(--fg);font-family:var(--font-display)">인증서 폐기 상태</span><span style="font-size:11px;font-weight:700;color:{{ revocationColor }}">{{ revocationLabel }}</span></div>
+          <div style="display:flex;flex-direction:column;gap:10px;padding:14px 20px">
+            <label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:8px 10px;cursor:pointer"><span style="flex:1;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ forms.revocationFileName }}</span><span style="font-size:10.5px;color:var(--accent)">PEM 선택</span><input type="file" aria-label="인증서 PEM 파일" data-k="revocationPem" data-label="revocationFileName" onChange="{{ onCertFile }}" accept=".pem,.crt,.cer,.txt" style="display:none"></label>
+            <div style="font-size:11px;color:var(--muted);line-height:1.5">{{ revocationDetail }}</div>
+            <button onClick="{{ checkTlsRevocation }}" style="align-self:flex-start;padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">OCSP·CRL 확인</button>
+          </div>
+        </div>
       </div>
       </sc-if>
 
@@ -679,6 +731,12 @@
           </div>
         </sc-for>
             <sc-if value="{{ !hasZones }}"><div style="padding:22px 18px;text-align:center;color:var(--muted);font-size:12px">만든 DNS 영역이 없습니다.</div></sc-if>
+
+        <div style="padding:18px;border:1px solid var(--border);border-radius:4px;background:var(--surface)">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="flex:1;font-size:14px;font-weight:600;color:var(--fg)">영역 DNSSEC 상태</span><span style="font-size:11px;font-weight:700;color:{{ zoneDnssecColor }}">{{ zoneDnssecLabel }}</span></div>
+          <div data-readonly-safe="" data-submit-enter="" style="display:flex;gap:8px"><input data-k="dnssecZone" value="{{ forms.dnssecZone }}" onInput="{{ onForm }}" aria-label="DNSSEC 영역 이름" placeholder="example.com" style="flex:1;min-width:0;padding:8px 10px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ checkZoneDnssec }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">조회</button></div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.5;margin-top:8px">{{ zoneDnssecDetail }}</div>
+        </div>
       </div>
       </sc-if>
 
@@ -808,30 +866,9 @@
 
       <sc-if value="{{ isOperations }}">
       <div style="max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:28px">
-        <div style="display:flex;align-items:flex-start;gap:18px;padding:4px 0 18px;border-bottom:1px solid var(--border);flex-wrap:wrap">
-          <div style="flex:1;min-width:240px">
-            <div style="font-size:15.5px;font-weight:600;color:var(--fg);font-family:var(--font-display)">운영 상태와 유지보수</div>
-            <div style="font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.5">백업, 캐시, 재작성, 접근 정책, 필터 품질과 비동기 작업을 한 화면에서 확인합니다.</div>
-            <div style="display:flex;align-items:center;gap:8px;margin-top:9px;font-size:11px;color:var(--muted);flex-wrap:wrap"><span style="width:7px;height:7px;border-radius:50%;background:{{ operationStatusColor }}"></span><span>{{ operationSourceStatus }}</span><span style="color:var(--faint)">·</span><span>{{ operationUpdatedLabel }}</span></div>
-          </div>
-          <div data-readonly-safe=""><button onClick="{{ refreshOperations }}" style="display:flex;align-items:center;gap:7px;padding:8px 13px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"></path></svg>새로고침</button></div>
-        </div>
-
-        <sc-if value="{{ opPartial }}"><div role="status" style="padding:11px 14px;border-left:3px solid var(--warn);background:var(--warn-bg);font-size:11.5px;line-height:1.5;color:var(--fg2)"><strong style="color:var(--fg)">일부 운영 정보를 불러오지 못했습니다.</strong> {{ operationFailedLabel }}</div></sc-if>
-
-        <div style="display:grid;grid-template-columns:{{ g4 }};gap:0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)">
-          <sc-for list="{{ operationSummary }}" as="item" hint-placeholder-count="4">
-            <div style="padding:17px 20px 16px;border-right:1px solid var(--border);min-width:0">
-              <div style="font-size:10.5px;font-weight:700;color:var(--muted);font-family:var(--font-display)">{{ item.label }}</div>
-              <div style="font-family:var(--font-mono);font-size:24px;font-weight:600;color:{{ item.color }};margin-top:8px;line-height:1">{{ item.value }}</div>
-              <div style="font-size:10.5px;color:var(--muted);margin-top:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ item.note }}</div>
-            </div>
-          </sc-for>
-        </div>
-
         <section style="min-width:0">
           <div style="display:flex;align-items:flex-end;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border);flex-wrap:wrap">
-            <div style="flex:1;min-width:220px"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">소프트웨어 업데이트</div><div style="font-size:11px;color:var(--muted);margin-top:3px">서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.</div></div>
+            <div style="flex:1;min-width:220px"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">소프트웨어 업데이트</div></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <sc-if value="{{ upd.canCheck }}"><button onClick="{{ upd.onCheck }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">업데이트 확인</button></sc-if>
               <sc-if value="{{ upd.canApply }}"><button onClick="{{ upd.onApply }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.applyLabel }}</button></sc-if>
@@ -856,63 +893,10 @@
           </section>
 
           <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">접근 정책</div><div style="font-size:11px;color:var(--muted);margin-top:3px">현재 런타임에서 허용·거부하는 네트워크와 호스트</div></div>
-            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding-top:14px">
-              <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--ok)">허용 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessAllowedRows.length }}</span></div><sc-if value="{{ hasAccessAllowed }}"><sc-for list="{{ accessAllowedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessAllowed }}"><div style="font-size:10.5px;color:var(--faint)">제한 없음</div></sc-if></div>
-              <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거부 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessBlockedRows.length }}</span></div><sc-if value="{{ hasAccessBlocked }}"><sc-for list="{{ accessBlockedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessBlocked }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
-              <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">응답하지 않을 네트워크</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessDroppedRows.length }}</span></div><sc-if value="{{ hasAccessDropped }}"><sc-for list="{{ accessDroppedRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessDropped }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
-              <div><div style="display:flex;align-items:center;gap:6px;margin-bottom:7px"><span style="font-size:10.5px;font-weight:700;color:var(--block)">거절할 도메인</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--faint)">{{ accessHostRows.length }}</span></div><sc-if value="{{ hasAccessHosts }}"><sc-for list="{{ accessHostRows }}" as="row" hint-placeholder-count="2"><div style="font-family:var(--font-mono);font-size:10.5px;color:var(--fg2);padding:5px 0;border-top:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ row.value }}">{{ row.value }}</div></sc-for></sc-if><sc-if value="{{ !hasAccessHosts }}"><div style="font-size:10.5px;color:var(--faint)">없음</div></sc-if></div>
-            </div>
-            <sc-if value="{{ hasAccessUnlisted }}"><div style="display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:11px;border-top:1px solid var(--border)"><span style="font-size:10.5px;font-weight:700;color:var(--muted);flex:1">규칙에 없는 클라이언트</span><span style="font-size:10.5px;font-weight:700;color:{{ accessUnlistedColor }}">{{ accessUnlistedLabel }}</span></div></sc-if>
-          </section>
-        </div>
-
-        <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
-          <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">DNS 응답 재작성</div><div style="font-size:11px;color:var(--muted);margin-top:3px">특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경</div></div>
-            <div data-mform="" data-submit-enter="" style="padding:13px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)"><input data-k="rewriteDomain" value="{{ forms.rewriteDomain }}" onInput="{{ onForm }}" aria-label="재작성 도메인" placeholder="router.lan" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><input data-k="rewriteAnswer" value="{{ forms.rewriteAnswer }}" onInput="{{ onForm }}" aria-label="재작성 응답" placeholder="10.0.0.1" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ addRewrite }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button></div>
-            <sc-if value="{{ hasRewrites }}"><div><sc-for list="{{ rewriteRows }}" as="r" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,.75fr) 32px;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)"><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.domain }}<sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></span><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.answer }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" title="{{ r.removeLabel }}" style="width:30px;height:30px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--block);cursor:pointer">×</button></div></sc-for></div></sc-if>
-            <sc-if value="{{ !hasRewrites }}"><div style="padding:20px 0;text-align:center;font-size:11.5px;color:var(--muted)">등록된 재작성 규칙이 없습니다.</div></sc-if>
-          </section>
-
-          <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">필터 품질</div><div style="font-size:11px;color:var(--muted);margin-top:3px">읽은 규칙 중 실제 적용된 비율과 제외 사유</div></div>
-            <div style="display:flex;align-items:flex-end;gap:18px;padding:14px 0 10px"><div><div style="font-size:10.5px;color:var(--muted)">필터 적용률</div><div style="font-family:var(--font-mono);font-size:25px;font-weight:600;color:var(--fg);margin-top:4px">{{ filterCoverageLabel }}</div></div><div style="flex:1"><div style="height:7px;border-radius:999px;background:var(--surface3);overflow:hidden"><div style="{{ filterCoverageStyle }}"></div></div><div style="display:flex;justify-content:space-between;margin-top:6px;font-size:10.5px;color:var(--muted)"><span>적용 {{ reportApplied }}</span><span>제외 {{ reportSkipped }} / 전체 {{ reportTotal }}</span></div></div></div>
-            <sc-if value="{{ hasFilterReasons }}"><div style="padding-top:8px;border-top:1px solid var(--border)"><sc-for list="{{ filterReasonRows }}" as="reason" hint-placeholder-count="2"><div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11px"><span style="flex:1;color:var(--fg2)">{{ reason.reason }}</span><strong style="font-family:var(--font-mono);color:var(--warn)">{{ reason.countLabel }}</strong></div></sc-for></div></sc-if><sc-if value="{{ !hasFilterReasons }}"><div style="padding:12px 0;border-top:1px solid var(--border);font-size:11px;color:var(--ok)">건너뛴 규칙이 없습니다.</div></sc-if>
-          </section>
-        </div>
-
-        <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
-          <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border);display:flex;align-items:flex-end;gap:8px"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">필터 출처</div><div style="font-size:11px;color:var(--muted);margin-top:3px">출처별 규칙 수와 누적 적중</div></div><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted)">{{ sourceTotalsText }}</span></div>
-            <sc-if value="{{ hasSources }}"><div><sc-for list="{{ sourceRows }}" as="r" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)" title="{{ r.source }}">{{ r.source }}</span><span style="font-family:var(--font-mono);color:var(--muted)">{{ r.rulesLabel }} 규칙</span><span style="font-family:var(--font-mono);color:var(--accent)">{{ r.hitsText }}</span></div></sc-for></div></sc-if><sc-if value="{{ sourceHitsOff }}"><div style="padding:9px 0 0;font-size:10.5px;color:var(--faint)">규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.</div></sc-if><sc-if value="{{ !hasSources }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">필터 출처 데이터가 없습니다.</div></sc-if>
-          </section>
-
-          <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border);display:flex;align-items:flex-end;gap:8px"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">WASM 플러그인</div><div style="font-size:11px;color:var(--muted);margin-top:3px">평가, 차단, 오류와 평균 실행 시간</div></div><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted)">{{ pluginEvalTotal }} 평가 · {{ pluginBlockTotal }} 차단 · {{ pluginErrorTotal }} 오류</span></div>
-            <sc-if value="{{ hasPlugins }}"><div><sc-for list="{{ pluginRows }}" as="p" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)" title="{{ p.name }}">{{ p.name }}</span><span style="font-family:var(--font-mono);color:{{ p.healthColor }}">{{ p.evalLabel }} / {{ p.errorLabel }}</span><span style="font-family:var(--font-mono);color:var(--accent)">{{ p.latency }}</span></div></sc-for></div></sc-if><sc-if value="{{ !hasPlugins }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">로드된 WASM 플러그인이 없습니다.</div></sc-if>
-          </section>
-        </div>
-
-        <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
-          <section style="min-width:0">
-            <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">규칙 적중 상위</div><div style="font-size:11px;color:var(--muted);margin-top:3px">규칙별 적중 기록이 활성화된 경우의 상위 항목</div></div>
-            <sc-if value="{{ hasTopRules }}"><div><sc-for list="{{ topRuleRows }}" as="r" hint-placeholder-count="5"><div style="display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:11px"><span style="flex:1;min-width:0;font-family:var(--font-mono);color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.rule }}</span><strong style="font-family:var(--font-mono);color:var(--accent)">{{ r.hitsLabel }}</strong></div></sc-for></div></sc-if><sc-if value="{{ topRulesOff }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.</div></sc-if><sc-if value="{{ topRulesEmpty }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">집계된 규칙 적중 기록이 없습니다.</div></sc-if>
-          </section>
-
-          <section style="min-width:0">
-            <div style="display:flex;align-items:center;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">백그라운드 작업</div><div style="font-size:11px;color:var(--muted);margin-top:3px">필터 목록 갱신 등 비동기 작업의 최근 상태</div></div><button onClick="{{ refreshJob }}" style="display:flex;align-items:center;gap:6px;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:600;cursor:pointer">필터 갱신</button></div>
+            <div style="display:flex;align-items:center;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">백그라운드 작업</div></div><button onClick="{{ refreshJob }}" style="display:flex;align-items:center;gap:6px;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:600;cursor:pointer">필터 갱신</button></div>
             <sc-if value="{{ jobs.length }}"><div><sc-for list="{{ jobs }}" as="j" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);align-items:center"><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--faint)">#{{ j.id }}</span><div style="min-width:0"><div style="font-size:11.5px;font-weight:600;color:var(--fg)">{{ j.kindLabel }}</div><div style="font-size:10.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ j.result }}</div></div><span style="font-size:10.5px;font-weight:700;color:{{ j.stColor }};background:{{ j.stBg }};padding:2px 8px;border-radius:2px">{{ j.stLabel }}</span></div></sc-for></div></sc-if><sc-if value="{{ !jobs.length }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">기록된 백그라운드 작업이 없습니다.</div></sc-if>
           </section>
         </div>
-
-        <section style="min-width:0;padding-top:2px">
-          <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">인증서와 영역 DNSSEC 진단</div><div style="font-size:11px;color:var(--muted);margin-top:3px">외부 폐기 정보와 권한 영역의 서명 상태를 필요할 때 조회합니다.</div></div>
-          <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;padding-top:14px">
-            <div style="min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:11px;font-weight:700;color:var(--fg2);flex:1">인증서 폐기 상태</span><span style="font-size:10.5px;font-weight:700;color:{{ revocationColor }}">{{ revocationLabel }}</span></div><label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:8px 10px;cursor:pointer"><span style="flex:1;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ forms.certFileName }}</span><span style="font-size:10.5px;color:var(--accent)">PEM 선택</span><input type="file" aria-label="인증서 PEM 파일" data-k="certPem" data-label="certFileName" onChange="{{ onCertFile }}" accept=".pem,.crt,.cer,.txt" style="display:none"></label><div style="font-size:10.5px;color:var(--muted);line-height:1.5;margin:8px 0">{{ revocationDetail }}</div><button onClick="{{ checkTlsRevocation }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">OCSP·CRL 확인</button></div>
-            <div style="min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:11px;font-weight:700;color:var(--fg2);flex:1">영역 DNSSEC 상태</span><span style="font-size:10.5px;font-weight:700;color:{{ zoneDnssecColor }}">{{ zoneDnssecLabel }}</span></div><div data-readonly-safe="" data-submit-enter="" style="display:flex;gap:8px"><input data-k="dnssecZone" value="{{ forms.dnssecZone }}" onInput="{{ onForm }}" aria-label="DNSSEC 영역 이름" placeholder="example.com" style="flex:1;min-width:0;padding:8px 10px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ checkZoneDnssec }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">조회</button></div><div style="font-size:10.5px;color:var(--muted);line-height:1.5;margin-top:8px">{{ zoneDnssecDetail }}</div></div>
-          </div>
-        </section>
       </div>
       </sc-if>
 
@@ -3168,40 +3152,37 @@ Object.assign(I18N.ja, {
 });
 
 Object.assign(I18N.en, {
-  '운영 도구':'Operations','백업, 캐시, 진단 및 재작성':'Backup, cache, diagnostics, and rewrites',
-  '운영 상태와 유지보수':'Operations and maintenance','백업, 캐시, 재작성, 필터·플러그인·비동기 작업 상태를 관리합니다.':'Manage backups, cache, rewrites, filter and plugin diagnostics, and asynchronous jobs.',
+  '유지보수':'Maintenance','백업, 캐시, 진단 및 재작성':'Backup, cache, diagnostics, and rewrites',
+  '백업, 캐시, 재작성, 필터·플러그인·비동기 작업 상태를 관리합니다.':'Manage backups, cache, rewrites, filter and plugin diagnostics, and asynchronous jobs.',
   '백업과 캐시':'Backup and cache','복원 전에 현재 백업을 내려받아 보관하는 것을 권장합니다.':'Download and retain a current backup before restoring.',
   '응답 캐시 비우기':'Flush response cache','백업 다운로드':'Download backup','JSON 백업 복원':'Restore JSON backup','백업 파일 선택':'Select backup file','선택한 백업 복원':'Restore selected backup',
   'DNS 응답 재작성':'DNS response rewrites','특정 도메인의 응답을 지정한 IP 또는 도메인으로 바꿉니다.':'Replace a domain response with a specified IP address or domain.',
   '재작성 도메인':'Rewrite domain','재작성 응답':'Rewrite answer','등록된 재작성 규칙이 없습니다.':'No rewrite rules are registered.',
-  '필터 진단':'Filter diagnostics','읽은 규칙':'Rules read','적용됨':'Applied','건너뜀':'Skipped','건너뛴 사유: ':'Skip reasons: ',
-  '인증서와 영역 DNSSEC 진단':'Certificate and zone DNSSEC diagnostics','인증서 폐기 상태':'Certificate revocation status','선택한 인증서 체인 확인':'Check selected certificate chain','영역 DNSSEC 상태':'Zone DNSSEC status','DNSSEC 영역 이름':'DNSSEC zone name',
+  '읽은 규칙':'Rules read','적용됨':'Applied','건너뜀':'Skipped','건너뛴 사유: ':'Skip reasons: ',
+  '인증서 폐기 상태':'Certificate revocation status','선택한 인증서 체인 확인':'Check selected certificate chain','영역 DNSSEC 상태':'Zone DNSSEC status','DNSSEC 영역 이름':'DNSSEC zone name',
   '규칙 적중 상위':'Top rule hits','규칙 적중 기록이 활성화된 경우에만 집계됩니다.':'Available only when per-rule hit tracking is enabled.','집계된 규칙 적중 기록이 없습니다.':'No rule hit records are available.',
   '필터 출처와 플러그인':'Filter sources and plugins','필터 출처':'Filter sources','WASM 플러그인':'WASM plugins','필터 출처 또는 플러그인 데이터가 없습니다.':'No filter-source or plugin data is available.',
   '접근 정책 원문':'Raw access policy','평가 ':'Evaluations ',' · 오류 ':' · errors ',' 규칙':' rules',' 적중':' hits',
   '백업 파일 선택…':'Select a backup file…','조회 결과가 없습니다.':'No result is available.','인증서 체인을 선택한 뒤 확인하세요.':'Select a certificate chain, then run the check.','영역 이름을 입력한 뒤 조회하세요.':'Enter a zone name, then query it.',
-  '백업과 복원, 캐시, DNS 재작성, 필터·플러그인·작업 진단을 한곳에서 관리합니다.':'Manage backup and restore, cache, DNS rewrites, and filter, plugin, and job diagnostics in one place.',
-  '복원과 캐시 비우기는 즉시 운영 상태에 영향을 줍니다.':'Restore and cache flush operations affect the running service immediately.','읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'Read-only accounts can only view data and download backups.'
+  '읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'Read-only accounts can only view data and download backups.'
 });
 Object.assign(I18N.ja, {
-  '운영 도구':'運用ツール','백업, 캐시, 진단 및 재작성':'バックアップ、キャッシュ、診断、リライト',
-  '운영 상태와 유지보수':'運用状態とメンテナンス','백업, 캐시, 재작성, 필터·플러그인·비동기 작업 상태를 관리합니다.':'バックアップ、キャッシュ、リライト、フィルター・プラグイン、非同期ジョブを管理します。',
+  '유지보수':'メンテナンス','백업, 캐시, 진단 및 재작성':'バックアップ、キャッシュ、診断、リライト',
+  '백업, 캐시, 재작성, 필터·플러그인·비동기 작업 상태를 관리합니다.':'バックアップ、キャッシュ、リライト、フィルター・プラグイン、非同期ジョブを管理します。',
   '백업과 캐시':'バックアップとキャッシュ','복원 전에 현재 백업을 내려받아 보관하는 것을 권장합니다.':'復元前に現在のバックアップをダウンロードして保管することを推奨します。',
   '응답 캐시 비우기':'応答キャッシュを消去','백업 다운로드':'バックアップをダウンロード','JSON 백업 복원':'JSON バックアップを復元','백업 파일 선택':'バックアップファイルを選択','선택한 백업 복원':'選択したバックアップを復元',
   'DNS 응답 재작성':'DNS 応答リライト','특정 도메인의 응답을 지정한 IP 또는 도메인으로 바꿉니다.':'特定ドメインの応答を指定した IP またはドメインに変更します。',
   '재작성 도메인':'リライト対象ドメイン','재작성 응답':'リライト応答','등록된 재작성 규칙이 없습니다.':'登録されたリライトルールはありません。',
-  '필터 진단':'フィルター診断','읽은 규칙':'読み込んだルール','적용됨':'適用済み','건너뜀':'スキップ','건너뛴 사유: ':'スキップ理由: ',
-  '인증서와 영역 DNSSEC 진단':'証明書とゾーン DNSSEC 診断','인증서 폐기 상태':'証明書失効状態','선택한 인증서 체인 확인':'選択した証明書チェーンを確認','영역 DNSSEC 상태':'ゾーン DNSSEC 状態','DNSSEC 영역 이름':'DNSSEC ゾーン名',
+  '읽은 규칙':'読み込んだルール','적용됨':'適用済み','건너뜀':'スキップ','건너뛴 사유: ':'スキップ理由: ',
+  '인증서 폐기 상태':'証明書失効状態','선택한 인증서 체인 확인':'選択した証明書チェーンを確認','영역 DNSSEC 상태':'ゾーン DNSSEC 状態','DNSSEC 영역 이름':'DNSSEC ゾーン名',
   '규칙 적중 상위':'ルールヒット上位','규칙 적중 기록이 활성화된 경우에만 집계됩니다.':'ルール別ヒット記録が有効な場合のみ集計されます。','집계된 규칙 적중 기록이 없습니다.':'集計されたルールヒット記録はありません。',
   '필터 출처와 플러그인':'フィルターソースとプラグイン','필터 출처':'フィルターソース','WASM 플러그인':'WASM プラグイン','필터 출처 또는 플러그인 데이터가 없습니다.':'フィルターソースまたはプラグインのデータはありません。',
   '접근 정책 원문':'アクセス方針の原文','평가 ':'評価 ',' · 오류 ':' · エラー ',' 규칙':' ルール',' 적중':' ヒット',
   '백업 파일 선택…':'バックアップファイルを選択…','조회 결과가 없습니다.':'結果がありません。','인증서 체인을 선택한 뒤 확인하세요.':'証明書チェーンを選択してから確認してください。','영역 이름을 입력한 뒤 조회하세요.':'ゾーン名を入力してから照会してください。',
-  '백업과 복원, 캐시, DNS 재작성, 필터·플러그인·작업 진단을 한곳에서 관리합니다.':'バックアップと復元、キャッシュ、DNS リライト、フィルター・プラグイン・ジョブ診断を一元管理します。',
-  '복원과 캐시 비우기는 즉시 운영 상태에 영향을 줍니다.':'復元とキャッシュ消去は稼働状態に直ちに影響します。','읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'読み取り専用アカウントは閲覧とバックアップのダウンロードのみ利用できます。'
+  '읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'読み取り専用アカウントは閲覧とバックアップのダウンロードのみ利用できます。'
 });
 
 Object.assign(I18N.en, {
-  '운영 상태를 새로고침했습니다':'Refreshed operations status.','운영 상태를 불러오지 못했습니다':'Could not load operations status.',
   '응답 캐시를 모두 비우시겠습니까?':'Flush the entire response cache?','캐시 항목 {count}개를 비웠습니다':'Flushed {count} cache entries.','캐시 비우기 실패':'Failed to flush the cache',
   '백업 생성 실패':'Failed to create backup','백업 파일을 생성했습니다':'Created the backup file.','백업 파일을 만들지 못했습니다':'Could not create the backup file.',
   '백업 파일은 1MB 이하여야 합니다':'The backup file must be 1 MB or smaller.','올바른 OnetDNS JSON 백업 파일을 선택하세요':'Select a valid OnetDNS JSON backup file.','백업 파일을 읽지 못했습니다':'Could not read the backup file.',
@@ -3212,7 +3193,6 @@ Object.assign(I18N.en, {
   '유효한 DNS 영역 이름을 입력하세요':'Enter a valid DNS zone name.','DNSSEC 상태를 조회했습니다':'Retrieved the DNSSEC status.','DNSSEC 상태 조회 실패':'DNSSEC status query failed'
 });
 Object.assign(I18N.ja, {
-  '운영 상태를 새로고침했습니다':'運用状態を更新しました。','운영 상태를 불러오지 못했습니다':'運用状態を読み込めませんでした。',
   '응답 캐시를 모두 비우시겠습니까?':'応答キャッシュをすべて消去しますか？','캐시 항목 {count}개를 비웠습니다':'キャッシュ項目を {count} 件消去しました。','캐시 비우기 실패':'キャッシュ消去に失敗しました',
   '백업 생성 실패':'バックアップ作成に失敗しました','백업 파일을 생성했습니다':'バックアップファイルを作成しました。','백업 파일을 만들지 못했습니다':'バックアップファイルを作成できませんでした。',
   '백업 파일은 1MB 이하여야 합니다':'バックアップファイルは 1 MB 以下である必要があります。','올바른 OnetDNS JSON 백업 파일을 선택하세요':'有効な OnetDNS JSON バックアップファイルを選択してください。','백업 파일을 읽지 못했습니다':'バックアップファイルを読み込めませんでした。',
@@ -3251,32 +3231,28 @@ Object.assign(I18N.ja, {
 // 운영 도구 개편 화면의 완전 번역. 조합형 접미사 번역에 기대지 않고
 // 문장과 상태 템플릿을 정확히 등록해 혼합 언어를 방지한다.
 Object.assign(I18N.en, {
-  '백업, 캐시, 재작성, 접근 정책, 필터 품질과 비동기 작업을 한 화면에서 확인합니다.':'Review backups, cache, rewrites, access policy, filter quality, and asynchronous jobs in one place.',
-  '{ok}/{total}개 데이터 원본 정상':'{ok}/{total} data sources available','마지막 갱신 {time}':'Last updated {time}','아직 갱신되지 않음':'Not updated yet','운영 정보를 불러오는 중입니다.':'Loading operations data…',
-  '재작성 규칙':'Rewrite rules','활성 규칙':'Active rules','등록된 규칙 없음':'No rules configured','필터 적용률':'Filter coverage','{applied}/{total}개 적용':'{applied}/{total} applied','규칙 {rules}개 · 적중 {hits}회':'{rules} rules · {hits} hits','진행 {running} · 실패 {failed}':'{running} running · {failed} failed',
+  '필터 적용률':'Filter coverage',
   '캐시와 백업':'Cache and backup','캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원':'Flush cached responses, and export or restore filter data (rules, services, refused domains, SafeSearch).','최대 1MB':'Up to 1 MB',
-  '접근 정책':'Access policy','현재 런타임에서 허용·거부하는 네트워크와 호스트':'Networks and hosts currently allowed or denied by the running service.','허용 네트워크':'Allowed networks','거부 네트워크':'Denied networks','응답하지 않을 네트워크':'Silently dropped networks','거절할 도메인':'Domains answered with REFUSED','규칙에 없는 클라이언트':'Clients matching no rule','응답하지 않음':'No response','거부로 응답 (REFUSED)':'Answered with REFUSED','허용됨':'Allowed',
-  '특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경':'Replace a domain response with a specified IP address or domain.','필터 품질':'Filter quality','읽은 규칙 중 실제 적용된 비율과 제외 사유':'Applied-rule coverage and reasons for excluded rules.','제외':'Excluded','/ 전체':'/ total',
-  '출처별 규칙 수와 누적 적중':'Rule counts and cumulative hits by source.','규칙 ·':'rules ·','평가, 차단, 오류와 평균 실행 시간':'Evaluations, blocks, errors, and average execution time.','차단 ·':'blocks ·',
-  '규칙별 적중 기록이 활성화된 경우의 상위 항목':'Top entries when per-rule hit tracking is enabled.','필터 목록 갱신 등 비동기 작업의 최근 상태':'Recent status of filter refreshes and other asynchronous jobs.','필터 갱신':'Filter refresh',
-  '외부 폐기 정보와 권한 영역의 서명 상태를 필요할 때 조회합니다.':'Query external revocation information and authoritative-zone signing status when needed.','확인 전':'Not checked','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'Select a certificate-chain PEM to check OCSP and CRL status.','OCSP·CRL 확인':'Check OCSP and CRL','조회 전':'Not queried','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'Enter a zone name to inspect DNSKEY records and the DS record for the parent zone.',
-  '일부 운영 정보를 불러오지 못했습니다.':'Some operations data could not be loaded.','일부 운영 정보를 불러오지 못했습니다':'Some operations data could not be loaded','재작성 규칙':'Rewrite rules','규칙 적중':'Rule hits','백그라운드 작업':'Background jobs'
+  '접근 정책':'Access policy','허용 네트워크':'Allowed networks','거부 네트워크':'Denied networks','응답하지 않을 네트워크':'Silently dropped networks','거절할 도메인':'Domains answered with REFUSED','규칙에 없는 클라이언트':'Clients matching no rule','응답하지 않음':'No response','거부로 응답 (REFUSED)':'Answered with REFUSED','허용됨':'Allowed',
+  '필터 품질':'Filter quality','제외':'Excluded','/ 전체':'/ total',
+  '규칙 ·':'rules ·','차단 ·':'blocks ·',
+  '필터 갱신':'Filter refresh',
+  '확인 전':'Not checked','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'Select a certificate-chain PEM to check OCSP and CRL status.','OCSP·CRL 확인':'Check OCSP and CRL','조회 전':'Not queried','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'Enter a zone name to inspect DNSKEY records and the DS record for the parent zone.',
+  '백그라운드 작업':'Background jobs'
 });
 Object.assign(I18N.ja, {
-  '백업, 캐시, 재작성, 접근 정책, 필터 품질과 비동기 작업을 한 화면에서 확인합니다.':'バックアップ、キャッシュ、リライト、アクセス方針、フィルター品質、非同期ジョブを一画面で確認します。',
-  '{ok}/{total}개 데이터 원본 정상':'{ok}/{total} 件のデータソースが利用可能','마지막 갱신 {time}':'最終更新 {time}','아직 갱신되지 않음':'まだ更新されていません','운영 정보를 불러오는 중입니다.':'運用情報を読み込み中…',
-  '재작성 규칙':'リライトルール','활성 규칙':'有効なルール','등록된 규칙 없음':'登録ルールなし','필터 적용률':'フィルター適用率','{applied}/{total}개 적용':'{applied}/{total} 件適用','규칙 {rules}개 · 적중 {hits}회':'ルール {rules} 件 · ヒット {hits} 回','진행 {running} · 실패 {failed}':'実行中 {running} · 失敗 {failed}',
+  '필터 적용률':'フィルター適用率',
   '캐시와 백업':'キャッシュとバックアップ','캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원':'応答キャッシュを消去し、フィルターデータ（ルール・サービス・拒否ドメイン・セーフサーチ）をエクスポートまたは復元します。','최대 1MB':'最大 1 MB',
-  '접근 정책':'アクセス方針','현재 런타임에서 허용·거부하는 네트워크와 호스트':'稼働中のサービスで現在許可・拒否されているネットワークとホストです。','허용 네트워크':'許可ネットワーク','거부 네트워크':'拒否ネットワーク','응답하지 않을 네트워크':'応答しないネットワーク','거절할 도메인':'拒否で応答するドメイン','규칙에 없는 클라이언트':'どの規則にも当てはまらないクライアント','응답하지 않음':'応答しない','거부로 응답 (REFUSED)':'REFUSED で拒否','허용됨':'許可',
-  '특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경':'特定ドメインの応答を指定した IP またはドメインに変更します。','필터 품질':'フィルター品質','읽은 규칙 중 실제 적용된 비율과 제외 사유':'読み込んだルールの適用率と除外理由です。','제외':'除外','/ 전체':'/ 全体',
-  '출처별 규칙 수와 누적 적중':'ソース別のルール数と累積ヒット数です。','규칙 ·':'ルール ·','평가, 차단, 오류와 평균 실행 시간':'評価、ブロック、エラー、平均実行時間です。','차단 ·':'ブロック ·',
-  '규칙별 적중 기록이 활성화된 경우의 상위 항목':'ルール別ヒット記録が有効な場合の上位項目です。','필터 목록 갱신 등 비동기 작업의 최근 상태':'フィルターリスト更新など非同期ジョブの最近の状態です。','필터 갱신':'フィルター更新',
-  '외부 폐기 정보와 권한 영역의 서명 상태를 필요할 때 조회합니다.':'必要に応じて外部失効情報と権威ゾーンの署名状態を照会します。','확인 전':'未確認','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'証明書チェーン PEM を選択して OCSP と CRL の状態を確認してください。','OCSP·CRL 확인':'OCSP・CRL を確認','조회 전':'未照会','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'ゾーン名を入力して DNSKEY と親ゾーン提出用 DS を確認してください。',
-  '일부 운영 정보를 불러오지 못했습니다.':'一部の運用情報を読み込めませんでした。','일부 운영 정보를 불러오지 못했습니다':'一部の運用情報を読み込めませんでした','규칙 적중':'ルールヒット','백그라운드 작업':'バックグラウンドジョブ'
+  '접근 정책':'アクセス方針','허용 네트워크':'許可ネットワーク','거부 네트워크':'拒否ネットワーク','응답하지 않을 네트워크':'応答しないネットワーク','거절할 도메인':'拒否で応答するドメイン','규칙에 없는 클라이언트':'どの規則にも当てはまらないクライアント','응답하지 않음':'応答しない','거부로 응답 (REFUSED)':'REFUSED で拒否','허용됨':'許可',
+  '필터 품질':'フィルター品質','제외':'除外','/ 전체':'/ 全体',
+  '규칙 ·':'ルール ·','차단 ·':'ブロック ·',
+  '필터 갱신':'フィルター更新',
+  '확인 전':'未確認','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'証明書チェーン PEM を選択して OCSP と CRL の状態を確認してください。','OCSP·CRL 확인':'OCSP・CRL を確認','조회 전':'未照会','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'ゾーン名を入力して DNSKEY と親ゾーン提出用 DS を確認してください。',
+  '백그라운드 작업':'バックグラウンドジョブ'
 });
 
 Object.assign(I18N.en, {
-  '상태, 정책, 필터 품질 및 유지보수':'Status, policy, filter quality, and maintenance','JSON 선택':'Select JSON','PEM 선택':'Select PEM','건너뛴 규칙이 없습니다.':'No rules were skipped.','기록된 백그라운드 작업이 없습니다.':'No background jobs have been recorded.','로드된 WASM 플러그인이 없습니다.':'No WASM plugins are loaded.','제한 없음':'No restrictions','평가 ·':'evaluations ·','필터 출처 데이터가 없습니다.':'No filter-source data is available.','{rules} 규칙 · {hits} 적중':'{rules} rules · {hits} hits','{rules} 규칙':'{rules} rules','{hits} 적중':'{hits} hits','규칙 {rules}개':'{rules} rules','규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'Per-rule hit tracking is off, so hits are not counted. Turn on per-rule hit tracking in Settings.','규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'Per-rule hit tracking is off, so nothing is aggregated. Turn on per-rule hit tracking in Settings.',
+  '업데이트, 캐시, 백업':'Updates, cache, and backups','JSON 선택':'Select JSON','PEM 선택':'Select PEM','건너뛴 규칙이 없습니다.':'No rules were skipped.','기록된 백그라운드 작업이 없습니다.':'No background jobs have been recorded.','로드된 WASM 플러그인이 없습니다.':'No WASM plugins are loaded.','제한 없음':'No restrictions','평가 ·':'evaluations ·','필터 출처 데이터가 없습니다.':'No filter-source data is available.','{rules} 규칙 · {hits} 적중':'{rules} rules · {hits} hits','{rules} 규칙':'{rules} rules','{hits} 적중':'{hits} hits','규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'Per-rule hit tracking is off, so hits are not counted. Turn on per-rule hit tracking in Settings.','규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'Per-rule hit tracking is off, so nothing is aggregated. Turn on per-rule hit tracking in Settings.',
   'DNSKEY {keys}개 · DS {ds}':'{keys} DNSKEY records · DS {ds}','OCSP 주소 {ocsp}개 · CRL 주소 {crl}개':'{ocsp} OCSP URLs · {crl} CRL URLs','서명되지 않음':'Unsigned','서명됨':'Signed','있음':'present','조회 실패':'Query failed','폐기되지 않음':'Not revoked','폐기됨':'Revoked','확인 실패':'Check failed'
 ,
   'HTTP 또는 HTTPS URL을 입력하세요':'Enter an HTTP or HTTPS URL',
@@ -3285,7 +3261,7 @@ Object.assign(I18N.en, {
   '이 목록을 이미 받고 있습니다':'This list is already downloading'
 });
 Object.assign(I18N.ja, {
-  '상태, 정책, 필터 품질 및 유지보수':'状態、方針、フィルター品質、メンテナンス','JSON 선택':'JSON を選択','PEM 선택':'PEM を選択','건너뛴 규칙이 없습니다.':'スキップされたルールはありません。','기록된 백그라운드 작업이 없습니다.':'記録されたバックグラウンドジョブはありません。','로드된 WASM 플러그인이 없습니다.':'読み込まれた WASM プラグインはありません。','제한 없음':'制限なし','평가 ·':'評価 ·','필터 출처 데이터가 없습니다.':'フィルターソースのデータはありません。','{rules} 규칙 · {hits} 적중':'{rules} ルール · {hits} ヒット','{rules} 규칙':'{rules} ルール','{hits} 적중':'{hits} ヒット','규칙 {rules}개':'{rules} 件のルール','규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、ヒット数は集計されません。設定でルール別ヒット回数の記録を有効にしてください。','규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、集計されません。設定でルール別ヒット回数の記録を有効にしてください。',
+  '업데이트, 캐시, 백업':'更新、キャッシュ、バックアップ','JSON 선택':'JSON を選択','PEM 선택':'PEM を選択','건너뛴 규칙이 없습니다.':'スキップされたルールはありません。','기록된 백그라운드 작업이 없습니다.':'記録されたバックグラウンドジョブはありません。','로드된 WASM 플러그인이 없습니다.':'読み込まれた WASM プラグインはありません。','제한 없음':'制限なし','평가 ·':'評価 ·','필터 출처 데이터가 없습니다.':'フィルターソースのデータはありません。','{rules} 규칙 · {hits} 적중':'{rules} ルール · {hits} ヒット','{rules} 규칙':'{rules} ルール','{hits} 적중':'{hits} ヒット','규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、ヒット数は集計されません。設定でルール別ヒット回数の記録を有効にしてください。','규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.':'ルール別ヒット記録が無効なため、集計されません。設定でルール別ヒット回数の記録を有効にしてください。',
   'DNSKEY {keys}개 · DS {ds}':'DNSKEY {keys} 件 · DS {ds}','OCSP 주소 {ocsp}개 · CRL 주소 {crl}개':'OCSP URL {ocsp} 件 · CRL URL {crl} 件','서명되지 않음':'未署名','서명됨':'署名済み','있음':'あり','조회 실패':'照会失敗','폐기되지 않음':'失効していません','폐기됨':'失効済み','확인 실패':'確認失敗'
 ,
   'HTTP 또는 HTTPS URL을 입력하세요':'HTTP または HTTPS の URL を入力してください',
@@ -4202,9 +4178,8 @@ Object.assign(I18N.zh, {
   "유효한 IP 주소와 포트를 입력하세요 (예: 0.0.0.0:53 또는 [::]:53)":"请输入有效的 IP 地址和端口（例如 0.0.0.0:53 或 [::]:53）",
   "유효한 레코드 이름을 입력하세요":"请输入有效的记录名称",
   "레코드 유형에 맞는 값을 입력하세요":"请输入与记录类型相符的值",
-  "운영 도구":"运维工具",
+  "유지보수":"维护",
   "백업, 캐시, 진단 및 재작성":"备份、缓存、诊断和改写",
-  "운영 상태와 유지보수":"运行状态与维护",
   "백업, 캐시, 재작성, 필터·플러그인·비동기 작업 상태를 관리합니다.":"管理备份、缓存、改写，以及过滤器、插件和异步任务的状态。",
   "백업과 캐시":"备份与缓存",
   "복원 전에 현재 백업을 내려받아 보관하는 것을 권장합니다.":"建议在恢复前先下载并保存当前备份。",
@@ -4218,12 +4193,10 @@ Object.assign(I18N.zh, {
   "재작성 도메인":"改写域名",
   "재작성 응답":"改写应答",
   "등록된 재작성 규칙이 없습니다.":"没有已注册的改写规则。",
-  "필터 진단":"过滤器诊断",
   "읽은 규칙":"已读取的规则",
   "적용됨":"已应用",
   "건너뜀":"已跳过",
   "건너뛴 사유: ":"跳过原因：",
-  "인증서와 영역 DNSSEC 진단":"证书和区域 DNSSEC 诊断",
   "인증서 폐기 상태":"证书吊销状态",
   "선택한 인증서 체인 확인":"检查所选证书链",
   "영역 DNSSEC 상태":"区域 DNSSEC 状态",
@@ -4244,11 +4217,7 @@ Object.assign(I18N.zh, {
   "조회 결과가 없습니다.":"没有查询结果。",
   "인증서 체인을 선택한 뒤 확인하세요.":"请先选择证书链再检查。",
   "영역 이름을 입력한 뒤 조회하세요.":"请先输入区域名称再查询。",
-  "백업과 복원, 캐시, DNS 재작성, 필터·플러그인·작업 진단을 한곳에서 관리합니다.":"在一处管理备份与恢复、缓存、DNS 改写，以及过滤器、插件和任务诊断。",
-  "복원과 캐시 비우기는 즉시 운영 상태에 영향을 줍니다.":"恢复和清空缓存会立即影响运行状态。",
   "읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.":"只读账户只能查看和下载备份。",
-  "운영 상태를 새로고침했습니다":"已刷新运行状态",
-  "운영 상태를 불러오지 못했습니다":"无法加载运行状态",
   "응답 캐시를 모두 비우시겠습니까?":"要清空全部响应缓存吗？",
   "캐시 항목 {count}개를 비웠습니다":"已清空 {count} 个缓存条目",
   "캐시 비우기 실패":"清空缓存失败",
@@ -4288,23 +4257,11 @@ Object.assign(I18N.zh, {
   "· 오류":"· 错误",
   "unsupported":"不支持",
   "invalid":"无效",
-  "백업, 캐시, 재작성, 접근 정책, 필터 품질과 비동기 작업을 한 화면에서 확인합니다.":"在一个页面中查看备份、缓存、改写、访问策略、过滤质量和异步任务。",
-  "{ok}/{total}개 데이터 원본 정상":"{ok}/{total} 个数据源正常",
-  "마지막 갱신 {time}":"最后更新 {time}",
-  "아직 갱신되지 않음":"尚未更新",
-  "운영 정보를 불러오는 중입니다.":"正在加载运维信息…",
-  "재작성 규칙":"改写规则",
-  "활성 규칙":"已启用的规则",
-  "등록된 규칙 없음":"没有已注册的规则",
   "필터 적용률":"过滤器应用率",
-  "{applied}/{total}개 적용":"已应用 {applied}/{total}",
-  "규칙 {rules}개 · 적중 {hits}회":"{rules} 条规则 · {hits} 次命中",
-  "진행 {running} · 실패 {failed}":"进行中 {running} · 失败 {failed}",
   "캐시와 백업":"缓存与备份",
   "캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원":"清空缓存，以及导出和恢复过滤数据（规则、服务、拒绝应答的域名、安全搜索）",
   "최대 1MB":"最大 1MB",
   "접근 정책":"访问策略",
-  "현재 런타임에서 허용·거부하는 네트워크와 호스트":"当前运行时允许和拒绝的网络与主机",
   "허용 네트워크":"允许的网络",
   "거부 네트워크":"拒绝的网络",
   "응답하지 않을 네트워크":"不予应答的网络",
@@ -4313,28 +4270,18 @@ Object.assign(I18N.zh, {
   "응답하지 않음":"不应答",
   "거부로 응답 (REFUSED)":"以 REFUSED 拒绝",
   "허용됨":"允许",
-  "특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경":"将特定域名的响应改为指定的 IP 或域名",
   "필터 품질":"过滤质量",
-  "읽은 규칙 중 실제 적용된 비율과 제외 사유":"已读取规则中实际应用的比例和排除原因",
   "제외":"已排除",
   "/ 전체":"/ 总计",
-  "출처별 규칙 수와 누적 적중":"按来源的规则数和累计命中",
   "규칙 ·":"条规则 ·",
-  "평가, 차단, 오류와 평균 실행 시간":"评估、拦截、错误和平均执行时间",
   "차단 ·":"拦截 ·",
-  "규칙별 적중 기록이 활성화된 경우의 상위 항목":"启用规则命中记录时的排行项目",
-  "필터 목록 갱신 등 비동기 작업의 최근 상태":"过滤列表更新等异步任务的最近状态",
   "필터 갱신":"过滤器更新",
-  "외부 폐기 정보와 권한 영역의 서명 상태를 필요할 때 조회합니다.":"按需查询外部吊销信息和权威区域的签名状态。",
   "확인 전":"未检查",
   "인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.":"选择证书链 PEM 以检查 OCSP 和 CRL 状态。",
   "OCSP·CRL 확인":"检查 OCSP 和 CRL",
   "조회 전":"未查询",
   "영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.":"输入区域名称以查看 DNSKEY 和提交给父区域的 DS。",
-  "일부 운영 정보를 불러오지 못했습니다.":"部分运维信息无法加载。",
-  "일부 운영 정보를 불러오지 못했습니다":"部分运维信息无法加载",
-  "규칙 적중":"规则命中",
-  "상태, 정책, 필터 품질 및 유지보수":"状态、策略、过滤质量与维护",
+  "업데이트, 캐시, 백업":"更新、缓存和备份",
   "JSON 선택":"选择 JSON",
   "PEM 선택":"选择 PEM",
   "건너뛴 규칙이 없습니다.":"没有跳过的规则。",
@@ -4346,7 +4293,6 @@ Object.assign(I18N.zh, {
   "{rules} 규칙 · {hits} 적중":"{rules} 条规则 · {hits} 次命中",
   "{rules} 규칙":"{rules} 条规则",
   "{hits} 적중":"{hits} 次命中",
-  "규칙 {rules}개":"{rules} 条规则",
   "규칙별 적중 기록이 꺼져 있어 적중 수를 세지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.":"未开启按规则记录命中，因此不统计命中数。请在设置中开启按规则记录命中次数。",
   "규칙별 적중 기록이 꺼져 있어 집계하지 않습니다. 설정에서 규칙별 적중 횟수 기록을 켜십시오.":"未开启按规则记录命中，因此不进行统计。请在设置中开启按规则记录命中次数。",
   "DNSKEY {keys}개 · DS {ds}":"DNSKEY {keys} 个 · DS {ds}",
@@ -4450,7 +4396,6 @@ Object.assign(I18N.zh, {
 Object.assign(I18N.en, {
   "업데이트 보기":"View update",
   "소프트웨어 업데이트":"Software updates",
-  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"Checks for signed official releases and installs them on this node.",
   "업데이트 확인":"Check for updates",
   "현재 버전":"Current version",
   "마지막 확인":"Last check",
@@ -4494,7 +4439,6 @@ Object.assign(I18N.en, {
 Object.assign(I18N.ja, {
   "업데이트 보기":"更新を表示",
   "소프트웨어 업데이트":"ソフトウェア更新",
-  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"署名済みの公式リリースを確認し、このノードにインストールします。",
   "업데이트 확인":"更新を確認",
   "현재 버전":"現在のバージョン",
   "마지막 확인":"最終確認",
@@ -4538,7 +4482,6 @@ Object.assign(I18N.ja, {
 Object.assign(I18N.zh, {
   "업데이트 보기":"查看更新",
   "소프트웨어 업데이트":"软件更新",
-  "서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.":"检查已签名的官方版本并安装到此节点。",
   "업데이트 확인":"检查更新",
   "현재 버전":"当前版本",
   "마지막 확인":"上次检查",
@@ -4921,7 +4864,7 @@ class Component extends DCLogic {
              block:'', allowD:'', ruleText:'', ruleType:'block', subName:'', subUrl:'',
              clName:'', clId:'', exQname:'', exQtype:'A', exClient:'',
              upAddr:'', zoneName:'', zoneOrigin:'', zoneText:'', recName:'', recType:'A', recVal:'', config:'', acmeMethod:'DNS-01',
-             acmeDomain:'', certPem:'', keyPem:'', certFileName:'fullchain.pem 선택…', keyFileName:'privkey.pem 선택…',
+             acmeDomain:'', certPem:'', keyPem:'', certFileName:'fullchain.pem 선택…', keyFileName:'privkey.pem 선택…', revocationPem:'', revocationFileName:'fullchain.pem 선택…',
              resIdentity:'', resIp:'', resHost:'', rootAddr:'', cpKey:'', cpVal:'', cfgSearch:'', setupUser:'admin',setupPassword:'',setupConfirm:'',setupCode:'', loginUser:'',loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',tokRole:'readonly',
              rewriteDomain:'',rewriteAnswer:'',restoreFileName:'백업 파일 선택…',dnssecZone:'',
              setupAddress:pageAddress(),setupHost:'',setupSsids:'' },
@@ -4947,7 +4890,7 @@ class Component extends DCLogic {
     tokens: [],
     jobs: [],
     update: null, updateBusy: null,
-    operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,availability:{},loadedAt:0,loaded:false},
+    rewrites:[],filterPlugins:[],filterReport:null,topRules:null,filterSources:null,access:null,revocation:null,zoneDnssec:null,
     cluster: { self:{role:'standalone',listeners:0}, peers:[] },
     security: { rateLimit:0, anonymize:false, querylog:false, aclAllow:'', aclDeny:'' },
     reservations: [],
@@ -5071,10 +5014,10 @@ class Component extends DCLogic {
       accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
       log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],clientSetup:null,
-      operations:{rewrites:[],plugins:[],filterReport:null,topRules:null,sources:[],access:null,revocation:null,zoneDnssec:null,loaded:false},
+      rewrites:[],filterPlugins:[],filterReport:null,topRules:null,filterSources:null,access:null,revocation:null,zoneDnssec:null,
       blocklists:[],pendingSubs:[],blockRules:[],allowRules:[],services:[],leases:{v4:[],v6:[]},pausedEvents:[],pausedDropped:0,schema:[],schemaHot:[],schemaConditional:[],cfgRaw:{},cfgApplied:{},configStatus:{in_sync:true,source:'runtime',changed_keys:[],error:null},
-      forms:{...f,loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',config:'',certPem:'',keyPem:'',cpKey:'',cpVal:'',rewriteDomain:'',rewriteAnswer:'',dnssecZone:'',
-        certFileName:'fullchain.pem 선택…',keyFileName:'privkey.pem 선택…',restoreFileName:'백업 파일 선택…'}};
+      forms:{...f,loginPassword:'',currentPassword:'',newPassword:'',confirmPassword:'',config:'',certPem:'',keyPem:'',revocationPem:'',cpKey:'',cpVal:'',rewriteDomain:'',rewriteAnswer:'',dnssecZone:'',
+        certFileName:'fullchain.pem 선택…',keyFileName:'privkey.pem 선택…',revocationFileName:'fullchain.pem 선택…',restoreFileName:'백업 파일 선택…'}};
   }
   clearSession(reason){
     this._sessionGeneration+=1;
@@ -5083,7 +5026,7 @@ class Component extends DCLogic {
     clearTimeout(this._flushT);this._flushT=null;this._pendingEvents=[];this._pendingDropped=0;
     this._socketClosed=true;
     if(this._ws){this._ws.onclose=null;try{this._ws.close();}catch(e){}this._ws=null;}
-    this._mutationRequests={};this._writes={};this._filterWatch=false;this._filterItems=[];this.releaseFilterWaiters();this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._operationsLoading=false;this._updateWatch=null;
+    this._mutationRequests={};this._writes={};this._filterWatch=false;this._filterItems=[];this.releaseFilterWaiters();this._booted=false;this._lastSeq=0;this._resyncPending=false;this._restoreBackup=null;this._filterDiagnosticsLoading=false;this._updateWatch=null;
     try{localStorage.removeItem('onetdns_token');}catch(e){}
     if(typeof document!=='undefined')document.querySelectorAll('input[type="file"]').forEach(input=>{try{input.value='';}catch(e){}});
     const state=reason==='auth-expired'?'auth-expired':'offline';
@@ -5203,7 +5146,7 @@ class Component extends DCLogic {
       this.setState({filterApplying:false});
       this.releaseFilterWaiters();
       if(error)this.toastMsg(this.t('필터를 적용하지 못했습니다')+': '+this.t(String(error)),true);
-      if(sawPending){this.reloadSubs();if(this.state.view==='operations')this.loadOperations();}
+      if(sawPending){this.reloadSubs();if(this.state.view==='lists')this.loadFilterDiagnostics();}
     })();
   }
   filterSettled(){return this._filterWatch?new Promise(resolve=>{(this._filterWaiters=this._filterWaiters||[]).push(resolve);}):Promise.resolve();}
@@ -5516,9 +5459,9 @@ class Component extends DCLogic {
     return true;
   }
   async loadCollections(){
-    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
+    const tasks=[this.loadUpstreams(),this.loadClients(),this.loadAccess(),this.loadRewrites(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
     await Promise.allSettled(tasks);
-    if(this.state.view==='operations')await this.loadOperations();
+    if(this.state.view==='lists')await this.loadFilterDiagnostics();
   }
   async loadClients(){
     const fresh=this.writeGuard('clients');const r=await this.apiGet('/v1/clients');if(!(r.ok&&Array.isArray(r.body))||!fresh())return false;
@@ -5545,36 +5488,31 @@ class Component extends DCLogic {
     const fresh=this.writeGuard('tokens');const tk=await this.apiGet('/v1/tokens');
     if(tk.ok&&tk.body&&Array.isArray(tk.body.tokens)&&fresh()) this.setState({tokens:tk.body.tokens.map(t=>({id:t.id,name:t.masked,role:t.role}))});
   }
-  async loadOperations(){
-    if(this._operationsLoading)return false;this._operationsLoading=true;
-    if(!this._updateWatch)this.loadUpdate();
+  async loadRewrites(){
+    const fresh=this.writeGuard('rewrites');const r=await this.apiGet('/v1/rewrites');
+    if(!r.ok||!fresh())return false;
+    const rows=Array.isArray(r.body)?r.body:Array.isArray(r.body&&r.body.rewrites)?r.body.rewrites:[];
+    this.setState({rewrites:rows.map(x=>({domain:String(x.domain||''),answer:String(x.answer||'')}))});
+    return true;
+  }
+  // A part whose request fails keeps its last value.
+  async loadFilterDiagnostics(){
+    if(this._filterDiagnosticsLoading)return;this._filterDiagnosticsLoading=true;
     try{
-      const names=['rewrites','plugins','filterReport','topRules','sources','jobs','access'];
-      const rewritesFresh=this.writeGuard('rewrites');
-      const responses=await Promise.all([
-        this.apiGet('/v1/rewrites'),this.apiGet('/v1/plugins'),this.apiGet('/v1/filter/report'),this.apiGet('/v1/filter/top-rules'),this.apiGet('/v1/filter/sources'),this.apiGet('/v1/jobs'),this.apiGet('/v1/access')
+      const [plugins,report,top,sources]=await Promise.all([
+        this.apiGet('/v1/plugins'),this.apiGet('/v1/filter/report'),this.apiGet('/v1/filter/top-rules'),this.apiGet('/v1/filter/sources')
       ]);
-      const [rw,plugins,report,top,sources,jobs,access]=responses;
-      const availability={};names.forEach((name,index)=>{availability[name]=responses[index].ok===true;});
-      this.setState(state=>{
-        const previous=state.operations||{};
-        const rewriteBody=rw.ok&&rewritesFresh()?(Array.isArray(rw.body)?rw.body:Array.isArray(rw.body&&rw.body.rewrites)?rw.body.rewrites:[]):previous.rewrites||[];
-        const pluginBody=plugins.ok?(Array.isArray(plugins.body)?plugins.body:Array.isArray(plugins.body&&plugins.body.plugins)?plugins.body.plugins:[]):previous.plugins||[];
-        const jobBody=jobs.ok?(Array.isArray(jobs.body)?jobs.body:Array.isArray(jobs.body&&jobs.body.jobs)?jobs.body.jobs:[]):state.jobs||[];
-        return {
-          operations:{...previous,
-            rewrites:rewriteBody.map(x=>({domain:String(x.domain||''),answer:String(x.answer||'')})),
-            plugins:pluginBody,
-            filterReport:report.ok&&report.body?report.body:previous.filterReport,
-            topRules:top.ok&&top.body?top.body:previous.topRules,
-            sources:sources.ok&&sources.body?sources.body:previous.sources,
-            access:access.ok&&access.body?access.body:previous.access,
-            availability,loadedAt:Date.now(),loaded:true},
-          jobs:jobs.ok?jobBody.map(j=>({id:j.id,kind:j.kind||'',status:j.status||'unknown',created:Number(j.created)||0,result:j.result||''})):state.jobs
-        };
-      });
-      return {ok:responses.some(r=>r.ok),complete:responses.every(r=>r.ok),availability};
-    }finally{this._operationsLoading=false;}
+      this.setState(state=>({
+        filterPlugins:plugins.ok?(Array.isArray(plugins.body)?plugins.body:Array.isArray(plugins.body&&plugins.body.plugins)?plugins.body.plugins:[]):state.filterPlugins,
+        filterReport:report.ok&&report.body?report.body:state.filterReport,
+        topRules:top.ok&&top.body?top.body:state.topRules,
+        filterSources:sources.ok&&sources.body?sources.body:state.filterSources
+      }));
+    }finally{this._filterDiagnosticsLoading=false;}
+  }
+  async loadAccess(){
+    const r=await this.apiGet('/v1/access');
+    if(r.ok&&r.body&&typeof r.body==='object')this.setState({access:r.body});
   }
   async loadUpdate(){const r=await this.apiGet('/v1/system/update');if(!(r.ok&&r.body&&typeof r.body==='object'))return null;this.setState({update:r.body});return r.body;}
   // 접속할 때 마지막 확인이 없거나 오래됐으면 새 릴리스를 확인한다. 확인은 관리자만 시작할 수 있다.
@@ -5685,15 +5623,14 @@ class Component extends DCLogic {
     else if(canApply){banner=this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion});bannerAction=s.view!=='operations';}
     return {upd,banner,bannerAction};
   }
-  refreshOperations=async()=>{const result=await this.loadOperations();if(!result||!result.ok)return this.toastMsg(this.t('운영 상태를 불러오지 못했습니다'),true);this.toastMsg(this.t(result.complete?'운영 상태를 새로고침했습니다':'일부 운영 정보를 불러오지 못했습니다'),!result.complete);};
   flushCache=async()=>{if(!await this.confirmDestructive('응답 캐시를 모두 비우시겠습니까?'))return;const r=await this.apiSend('/v1/cache/flush','POST',{});if(r.ok)this.toastMsg(this.tr('캐시 항목 {count}개를 비웠습니다',{count:Number(r.body&&r.body.flushed||0).toLocaleString(this.locale())}));else this.toastMsg(this.t('캐시 비우기 실패')+': '+this.errorText(r),true);};
   downloadBackup=async()=>{const r=await this.apiGet('/v1/backup');if(!r.ok)return this.toastMsg(this.t('백업 생성 실패')+': '+this.errorText(r),true);try{const blob=new Blob([JSON.stringify(r.body,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='onetdns-backup-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);this.toastMsg('백업 파일을 생성했습니다');}catch(e){this.toastMsg('백업 파일을 만들지 못했습니다',true);}};
   onRestoreFile=(e)=>{const input=e.target,file=input.files&&input.files[0];if(!file)return;if(file.size>1024*1024){input.value='';return this.toastMsg('백업 파일은 1MB 이하여야 합니다',true);}const reader=new FileReader();reader.onload=()=>{try{const value=JSON.parse(String(reader.result||''));if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('shape');this._restoreBackup=value;this.setState(state=>({forms:{...state.forms,restoreFileName:file.name}}));}catch(err){this._restoreBackup=null;input.value='';this.setState(state=>({forms:{...state.forms,restoreFileName:'백업 파일 선택…'}}));this.toastMsg('올바른 OnetDNS JSON 백업 파일을 선택하세요',true);}};reader.onerror=()=>this.toastMsg('백업 파일을 읽지 못했습니다',true);reader.readAsText(file);};
-  restoreBackup=async()=>{if(!this._restoreBackup)return this.toastMsg('복원할 백업 파일을 먼저 선택하세요',true);if(!await this.confirmDestructive('차단·허용 규칙, 차단 서비스, 거절 도메인, 세이프서치를 선택한 백업으로 전체 교체하시겠습니까?'))return;const r=await this.apiSend('/v1/restore','POST',this._restoreBackup);if(!r.ok)return this.toastMsg(this.t('백업 복원 실패')+': '+this.errorText(r),true);this._restoreBackup=null;this.setState(state=>({forms:{...state.forms,restoreFileName:'백업 파일 선택…'}}));await Promise.allSettled([this.loadCollections(),this.loadOperations()]);this.toastMsg('백업을 복원했습니다');};
-  addRewrite=async()=>{const f=this.state.forms,domain=String(f.rewriteDomain||'').trim(),answer=String(f.rewriteAnswer||'').trim();if(!this.validDomain(domain))return this.toastMsg('유효한 재작성 도메인을 입력하세요',true);if(!(this.validIp(answer)||this.validDomain(answer)))return this.toastMsg('재작성 응답에 유효한 IP 또는 도메인을 입력하세요',true);let previous=null;const rows=s=>Array.isArray(s.operations.rewrites)?s.operations.rewrites:[];this.setState(state=>({forms:{...state.forms,rewriteDomain:'',rewriteAnswer:''}}));if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{previous=rows(s).find(x=>x.domain===domain)||null;return {operations:{...s.operations,rewrites:[...rows(s).filter(x=>x.domain!==domain),{domain,answer}]}};},revert:s=>{const kept=rows(s).filter(x=>x.domain!==domain);return {operations:{...s.operations,rewrites:previous?[...kept,previous]:kept}};},send:()=>this.apiSend('/v1/rewrites','POST',{domain,answer},{background:true}),reload:()=>this.loadOperations(),failure:this.t('재작성 규칙 추가 실패')+': '}))this.toastMsg('재작성 규칙을 저장했습니다');else this.setState(s=>s.forms.rewriteDomain||s.forms.rewriteAnswer?null:{forms:{...s.forms,rewriteDomain:domain,rewriteAnswer:answer}});};
-  removeRewrite=(domain)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 재작성 규칙을 삭제하시겠습니까?',{name:domain})))return;let index=-1,row=null;const rows=s=>Array.isArray(s.operations.rewrites)?s.operations.rewrites:[];if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{index=rows(s).findIndex(x=>x.domain===domain);row=rows(s)[index]||null;return {operations:{...s.operations,rewrites:rows(s).filter(x=>x.domain!==domain)}};},revert:s=>row?{operations:{...s.operations,rewrites:this.listInsert(rows(s),index,row)}}:null,send:()=>this.apiSend('/v1/rewrites','DELETE',{domain},{background:true}),reload:()=>this.loadOperations(),failure:this.t('재작성 규칙 삭제 실패')+': '}))this.toastMsg('재작성 규칙을 삭제했습니다');};
-  checkTlsRevocation=async()=>{const pem=String(this.state.forms.certPem||'').trim();if(!pem)return this.toastMsg('폐기 상태를 확인할 인증서 체인 PEM을 먼저 선택하세요',true);const r=await this.apiSend('/v1/tls/revocation-check','POST',{certificate_chain:pem});this.setState(state=>({operations:{...state.operations,revocation:r.ok?r.body:{error:this.errorText(r)}}}));this.toastMsg(r.ok?'인증서 폐기 상태를 확인했습니다':'인증서 폐기 상태 확인 실패',!r.ok);};
-  checkZoneDnssec=async()=>{const origin=String(this.state.forms.dnssecZone||'').trim();if(!this.validDomain(origin))return this.toastMsg('유효한 DNS 영역 이름을 입력하세요',true);const r=await this.apiGet('/v1/zones/'+encodeURIComponent(origin)+'/dnssec');this.setState(state=>({operations:{...state.operations,zoneDnssec:r.ok?{origin,...r.body}:{origin,error:this.errorText(r)}}}));this.toastMsg(r.ok?'DNSSEC 상태를 조회했습니다':'DNSSEC 상태 조회 실패',!r.ok);};
+  restoreBackup=async()=>{if(!this._restoreBackup)return this.toastMsg('복원할 백업 파일을 먼저 선택하세요',true);if(!await this.confirmDestructive('차단·허용 규칙, 차단 서비스, 거절 도메인, 세이프서치를 선택한 백업으로 전체 교체하시겠습니까?'))return;const r=await this.apiSend('/v1/restore','POST',this._restoreBackup);if(!r.ok)return this.toastMsg(this.t('백업 복원 실패')+': '+this.errorText(r),true);this._restoreBackup=null;this.setState(state=>({forms:{...state.forms,restoreFileName:'백업 파일 선택…'}}));await this.loadCollections();this.toastMsg('백업을 복원했습니다');};
+  addRewrite=async()=>{const f=this.state.forms,domain=String(f.rewriteDomain||'').trim(),answer=String(f.rewriteAnswer||'').trim();if(!this.validDomain(domain))return this.toastMsg('유효한 재작성 도메인을 입력하세요',true);if(!(this.validIp(answer)||this.validDomain(answer)))return this.toastMsg('재작성 응답에 유효한 IP 또는 도메인을 입력하세요',true);let previous=null;const rows=s=>Array.isArray(s.rewrites)?s.rewrites:[];this.setState(state=>({forms:{...state.forms,rewriteDomain:'',rewriteAnswer:''}}));if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{previous=rows(s).find(x=>x.domain===domain)||null;return {rewrites:[...rows(s).filter(x=>x.domain!==domain),{domain,answer}]};},revert:s=>{const kept=rows(s).filter(x=>x.domain!==domain);return {rewrites:previous?[...kept,previous]:kept};},send:()=>this.apiSend('/v1/rewrites','POST',{domain,answer},{background:true}),reload:()=>this.loadRewrites(),failure:this.t('재작성 규칙 추가 실패')+': '}))this.toastMsg('재작성 규칙을 저장했습니다');else this.setState(s=>s.forms.rewriteDomain||s.forms.rewriteAnswer?null:{forms:{...s.forms,rewriteDomain:domain,rewriteAnswer:answer}});};
+  removeRewrite=(domain)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 재작성 규칙을 삭제하시겠습니까?',{name:domain})))return;let index=-1,row=null;const rows=s=>Array.isArray(s.rewrites)?s.rewrites:[];if(await this.optimistic('rewrites',{item:domain,background:true,apply:s=>{index=rows(s).findIndex(x=>x.domain===domain);row=rows(s)[index]||null;return {rewrites:rows(s).filter(x=>x.domain!==domain)};},revert:s=>row?{rewrites:this.listInsert(rows(s),index,row)}:null,send:()=>this.apiSend('/v1/rewrites','DELETE',{domain},{background:true}),reload:()=>this.loadRewrites(),failure:this.t('재작성 규칙 삭제 실패')+': '}))this.toastMsg('재작성 규칙을 삭제했습니다');};
+  checkTlsRevocation=async()=>{const pem=String(this.state.forms.revocationPem||'').trim();if(!pem)return this.toastMsg('폐기 상태를 확인할 인증서 체인 PEM을 먼저 선택하세요',true);const r=await this.apiSend('/v1/tls/revocation-check','POST',{certificate_chain:pem});this.setState({revocation:r.ok?r.body:{error:this.errorText(r)}});this.toastMsg(r.ok?'인증서 폐기 상태를 확인했습니다':'인증서 폐기 상태 확인 실패',!r.ok);};
+  checkZoneDnssec=async()=>{const origin=String(this.state.forms.dnssecZone||'').trim();if(!this.validDomain(origin))return this.toastMsg('유효한 DNS 영역 이름을 입력하세요',true);const r=await this.apiGet('/v1/zones/'+encodeURIComponent(origin)+'/dnssec');this.setState({zoneDnssec:r.ok?{origin,...r.body}:{origin,error:this.errorText(r)}});this.toastMsg(r.ok?'DNSSEC 상태를 조회했습니다':'DNSSEC 상태 조회 실패',!r.ok);};
   upstreamRow=(u)=>{
     const addr=u.addr;
     return {id:u.id,addr,proto:/^h3/.test(addr)?'DoH3':/^https/.test(addr)?'DoH':/^tls/.test(addr)?'DoT':/^quic/.test(addr)?'DoQ':'UDP',latency:null,status:'unknown',
@@ -5978,7 +5915,11 @@ class Component extends DCLogic {
     // 탭 제목은 화면뿐 아니라 언어가 바뀔 때도 다시 만든다. 화면 전환 때만 만들면
     // 언어를 바꾼 뒤에도 탭에는 이전 언어가 남아, 구간이 여럿일 때 찾을 수가 없다.
     if(prevState&&(prevState.view!==this.state.view||prevState.lang!==this.state.lang)&&typeof document!=='undefined')document.title=this.titleFor(this.state.view)[0]+' · OnetDNS';
-    if(prevState&&prevState.view!==this.state.view&&this.state.view==='operations'&&this.state.loggedIn)this.loadOperations();
+    if(prevState&&prevState.view!==this.state.view&&this.state.loggedIn){
+      if(this.state.view==='lists'){this.loadRewrites();this.loadFilterDiagnostics();}
+      if(this.state.view==='clients')this.loadAccess();
+      if(this.state.view==='operations'&&!this._updateWatch)this.loadUpdate();
+    }
     // 임대와 고정 할당은 실시간 스트림으로 오지 않는다. 화면에 들어올 때 다시 읽지 않으면
     // 처음 연 뒤에 나간 임대나 DHCP를 켠 사실이 새로 고칠 때까지 보이지 않는다.
     if(prevState&&prevState.view!==this.state.view&&this.state.view==='dhcp'&&this.state.loggedIn){this.loadLeases();this.loadReservations();}
@@ -6113,7 +6054,7 @@ class Component extends DCLogic {
       {label:this.t('개요'),items:[item('dashboard','대시보드','dashboard'),item('querylog','질의 로그','log')]},
       {label:this.t('필터링'),items:[item('lists','필터 목록','filter'),item('services','차단 서비스','services')]},
       {label:this.t('네트워크'),items:[item('clients','클라이언트','clients'),item('upstreams','업스트림 DNS 서버','upstream'),item('encryption','암호화 전송','lock'),item('zones','DNS 영역','globe'),item('dhcp','DHCP','dhcp')]},
-      {label:this.t('도구'),items:[item('explain','질의 테스트','explain'),item('cluster','클러스터','cluster'),item('operations','운영 도구','cache'),item('settings','설정','settings')]}
+      {label:this.t('도구'),items:[item('explain','질의 테스트','explain'),item('cluster','클러스터','cluster'),item('operations','유지보수','cache'),item('settings','설정','settings')]}
     ];
   }
 
@@ -6129,7 +6070,7 @@ class Component extends DCLogic {
       dhcp:['DHCP','임대 현황'],
       explain:['질의 테스트','질의 처리 과정 확인'],
       cluster:['클러스터','노드 상태'],
-      operations:['운영 도구','상태, 정책, 필터 품질 및 유지보수'],
+      operations:['유지보수','업데이트, 캐시, 백업'],
       settings:['설정','DNS 서버 설정'],
       account:['계정','로그인 정보'],
       tokens:['접근 토큰','API 접근 권한'] };
@@ -6154,7 +6095,7 @@ class Component extends DCLogic {
       dhcp:[this.t('임대 현황과 고정 할당'),null],
       explain:[this.t('정책 및 필터 적용 결과'),null],
       cluster:[this.t('노드와 합의 상태'),null],
-      operations:[this.t('백업과 복원, 캐시, DNS 재작성, 필터·플러그인·작업 진단을 한곳에서 관리합니다.'),[this.t('복원과 캐시 비우기는 즉시 운영 상태에 영향을 줍니다.'),this.t('읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.')]],
+      operations:[this.t('업데이트, 캐시, 백업'),[this.t('읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.')]],
       settings:[this.t('DNS 서버 설정'),null],
       account:[this.t('로그인 정보'),null],
       tokens:[this.t('API 접근 권한'),null]
@@ -6999,7 +6940,7 @@ class Component extends DCLogic {
 
 
     const f=s.forms;
-    const localizedForms={...s.forms,certFileName:this.t(s.forms.certFileName),keyFileName:this.t(s.forms.keyFileName),restoreFileName:this.t(s.forms.restoreFileName)};
+    const localizedForms={...s.forms,certFileName:this.t(s.forms.certFileName),keyFileName:this.t(s.forms.keyFileName),revocationFileName:this.t(s.forms.revocationFileName),restoreFileName:this.t(s.forms.restoreFileName)};
     const qlText=f.qlText.toLowerCase();
     const qlQueryMatches=r=>(f.qlAction==='all'||r.action===f.qlAction)&&(f.qlTransport==='all'||r.transport===f.qlTransport);
     // 조회 안의 질의 하나라도 맞으면 조회 전체를 보인다. 실패한 AAAA 를 찾을 때 같은 조회의
@@ -7132,7 +7073,7 @@ class Component extends DCLogic {
 
   viewVals(){
     const s=this.state, R=React.createElement;
-    const localizedForms={...s.forms,certFileName:this.t(s.forms.certFileName),keyFileName:this.t(s.forms.keyFileName),restoreFileName:this.t(s.forms.restoreFileName)};
+    const localizedForms={...s.forms,certFileName:this.t(s.forms.certFileName),keyFileName:this.t(s.forms.keyFileName),revocationFileName:this.t(s.forms.revocationFileName),restoreFileName:this.t(s.forms.restoreFileName)};
     const v=s.view;
     const SW3='var(--surface3,#d8dee9)';
     const mkRootSw=(on)=>({track:`width:36px;height:21px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 36px;background:${on?'var(--accent)':SW3}`,knob:`position:absolute;top:2px;left:${on?'17px':'2px'};width:17px;height:17px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`});
@@ -7336,19 +7277,19 @@ class Component extends DCLogic {
     const schemaHasElsewhere=schemaElsewhere.length>0;
     const schemaNoMatch=_searching&&schemaCount===0&&!schemaHasElsewhere;
     const auditRows=(s.audit||[]).slice(0,100);
-    const ops=s.operations||{},report=ops.filterReport||{},topData=ops.topRules||{},sourceData=ops.sources||{};
-    const rewriteRows=(Array.isArray(ops.rewrites)?ops.rewrites:[]).map(row=>({...row,applying:!!(s.pendingItems||{})['rewrites:'+row.domain],onRemove:this.removeRewrite(row.domain),removeLabel:this.tr('{name} 재작성 규칙 삭제',{name:row.domain})}));
+    const report=s.filterReport||{},topData=s.topRules||{},sourceData=s.filterSources||{};
+    const rewriteRows=(Array.isArray(s.rewrites)?s.rewrites:[]).map(row=>({...row,applying:!!(s.pendingItems||{})['rewrites:'+row.domain],onRemove:this.removeRewrite(row.domain),removeLabel:this.tr('{name} 재작성 규칙 삭제',{name:row.domain})}));
     const topRuleRows=(Array.isArray(topData.top)?topData.top:[]).slice(0,20).map(row=>({rule:String(row.rule||''),hits:Number(row.hits)||0,hitsLabel:(Number(row.hits)||0).toLocaleString(this.locale())}));
     // 목록별 출처를 두지 않은 규칙은 inline 하나로 모인다. 그대로 보이면 직접 입력한 규칙만 있는 것처럼 읽힌다.
     const sourceHitsEnabled=sourceData.hits_enabled===true;
     const sourceRows=(Array.isArray(sourceData.sources)?sourceData.sources:[]).slice(0,30).map(row=>({source:row.source==='inline'?this.t('목록별로 나누지 않은 규칙 (구독 목록, 직접 입력, 서비스 차단, 로컬 영역)'):String(row.source||''),rules:Number(row.rules)||0,rulesLabel:(Number(row.rules)||0).toLocaleString(this.locale()),hits:Number(row.hits)||0,hitsText:sourceHitsEnabled?this.tr('{hits} 적중',{hits:(Number(row.hits)||0).toLocaleString(this.locale())}):''}));
-    const pluginRows=(Array.isArray(ops.plugins)?ops.plugins:[]).map(row=>({name:String(row.name||''),eval:Number(row.eval)||0,evalLabel:(Number(row.eval)||0).toLocaleString(this.locale()),error:Number(row.error)||0,errorLabel:(Number(row.error)||0).toLocaleString(this.locale()),block:Number(row.block)||0,blockLabel:(Number(row.block)||0).toLocaleString(this.locale()),latency:(Number(row.latency_us)||0).toLocaleString(this.locale())+'µs',healthColor:(Number(row.error)||0)>0?'var(--warn)':'var(--ok)'}));
+    const pluginRows=(Array.isArray(s.filterPlugins)?s.filterPlugins:[]).map(row=>({name:String(row.name||''),eval:Number(row.eval)||0,evalLabel:(Number(row.eval)||0).toLocaleString(this.locale()),error:Number(row.error)||0,errorLabel:(Number(row.error)||0).toLocaleString(this.locale()),block:Number(row.block)||0,blockLabel:(Number(row.block)||0).toLocaleString(this.locale()),latency:(Number(row.latency_us)||0).toLocaleString(this.locale())+'µs',healthColor:(Number(row.error)||0)>0?'var(--warn)':'var(--ok)'}));
     const reportTotalN=Number(report.rules_total)||0,reportAppliedN=Number(report.rules_applied)||0,reportSkippedN=Number(report.rules_skipped)||0;
     const filterCoverage=reportTotalN?Math.max(0,Math.min(100,reportAppliedN/reportTotalN*100)):0;
     const filterCoverageLabel=filterCoverage.toFixed(filterCoverage>=99?1:0)+'%';
     const filterCoverageStyle=`height:100%;width:${filterCoverage.toFixed(1)}%;background:${reportSkippedN?'var(--warn)':'var(--ok)'};border-radius:999px`;
     const filterReasonRows=report.skip_reasons&&typeof report.skip_reasons==='object'?Object.entries(report.skip_reasons).map(([reason,count])=>({reason:this.t(reason),count:Number(count)||0,countLabel:(Number(count)||0).toLocaleString(this.locale())})):[];
-    const access=ops.access&&typeof ops.access==='object'?ops.access:{};
+    const access=s.access&&typeof s.access==='object'?s.access:{};
     const accessAllowedRows=(Array.isArray(access.allowed)?access.allowed:[]).map(value=>({value:String(value)}));
     const accessBlockedRows=(Array.isArray(access.blocked)?access.blocked:[]).map(value=>({value:String(value)}));
     const accessDroppedRows=(Array.isArray(access.dropped)?access.dropped:[]).map(value=>({value:String(value)}));
@@ -7356,31 +7297,16 @@ class Component extends DCLogic {
     const accessUnlisted=['allow','deny','drop'].includes(access.unlisted)?access.unlisted:'';
     const accessUnlistedLabel=accessUnlisted==='drop'?this.t('응답하지 않음'):accessUnlisted==='deny'?this.t('거부로 응답 (REFUSED)'):accessUnlisted==='allow'?this.t('허용됨'):'';
     const accessUnlistedColor=accessUnlisted==='drop'?'var(--block)':accessUnlisted==='deny'?'var(--warn)':'var(--ok)';
-    const availability=ops.availability&&typeof ops.availability==='object'?ops.availability:{};
-    const opSourceNames={rewrites:this.t('재작성 규칙'),plugins:this.t('WASM 플러그인'),filterReport:this.t('필터 진단'),topRules:this.t('규칙 적중'),sources:this.t('필터 출처'),jobs:this.t('백그라운드 작업'),access:this.t('접근 정책')};
-    const opSourceKeys=Object.keys(opSourceNames),opSourceOk=opSourceKeys.filter(key=>availability[key]===true).length;
-    const opFailedSources=opSourceKeys.filter(key=>ops.loaded&&availability[key]!==true).map(key=>opSourceNames[key]);
-    const opPartial=!!ops.loaded&&opFailedSources.length>0;
-    const operationSourceStatus=ops.loaded?this.tr('{ok}/{total}개 데이터 원본 정상',{ok:opSourceOk,total:opSourceKeys.length}):this.t('운영 정보를 불러오는 중입니다.');
-    const operationUpdatedLabel=ops.loadedAt?this.tr('마지막 갱신 {time}',{time:this.fmtClock(ops.loadedAt)}):this.t('아직 갱신되지 않음');
-    const operationFailedLabel=opFailedSources.join(', ');
-    const runningJobs=jobs.filter(j=>j.status==='running').length,failedJobs=jobs.filter(j=>j.status==='failed').length;
     const sourceRulesTotal=sourceRows.reduce((sum,row)=>sum+row.rules,0),sourceHitsTotal=sourceRows.reduce((sum,row)=>sum+row.hits,0);
     const sourceTotalsText=sourceHitsEnabled?this.tr('{rules} 규칙 · {hits} 적중',{rules:sourceRulesTotal.toLocaleString(this.locale()),hits:sourceHitsTotal.toLocaleString(this.locale())}):this.tr('{rules} 규칙',{rules:sourceRulesTotal.toLocaleString(this.locale())});
     const pluginEvalTotal=pluginRows.reduce((sum,row)=>sum+row.eval,0),pluginErrorTotal=pluginRows.reduce((sum,row)=>sum+row.error,0),pluginBlockTotal=pluginRows.reduce((sum,row)=>sum+row.block,0);
-    const operationSummary=[
-      {label:this.t('재작성 규칙'),value:rewriteRows.length.toLocaleString(this.locale()),note:this.t(rewriteRows.length?'활성 규칙':'등록된 규칙 없음'),color:'var(--accent)'},
-      {label:this.t('필터 적용률'),value:filterCoverageLabel,note:this.tr('{applied}/{total}개 적용',{applied:reportAppliedN.toLocaleString(this.locale()),total:reportTotalN.toLocaleString(this.locale())}),color:reportSkippedN?'var(--warn)':'var(--ok)'},
-      {label:this.t('필터 출처'),value:sourceRows.length.toLocaleString(this.locale()),note:sourceHitsEnabled?this.tr('규칙 {rules}개 · 적중 {hits}회',{rules:sourceRulesTotal.toLocaleString(this.locale()),hits:sourceHitsTotal.toLocaleString(this.locale())}):this.tr('규칙 {rules}개',{rules:sourceRulesTotal.toLocaleString(this.locale())}),color:'var(--violet)'},
-      {label:this.t('백그라운드 작업'),value:jobs.length.toLocaleString(this.locale()),note:this.tr('진행 {running} · 실패 {failed}',{running:runningJobs,failed:failedJobs}),color:failedJobs?'var(--block)':runningJobs?'var(--accent)':'var(--ok)'}
-    ];
-    const revocation=ops.revocation&&typeof ops.revocation==='object'?ops.revocation:null;
+    const revocation=s.revocation&&typeof s.revocation==='object'?s.revocation:null;
     const revocationError=!!(revocation&&revocation.error),revocationChecked=!!revocation&&!revocationError;
     const revocationRevoked=!!(revocationChecked&&revocation.revoked===true);
     const revocationLabel=!revocation?this.t('확인 전'):revocationError?this.t('확인 실패'):revocationRevoked?this.t('폐기됨'):this.t('폐기되지 않음');
     const revocationColor=revocationError||revocationRevoked?'var(--block)':revocationChecked?'var(--ok)':'var(--muted)';
     const revocationDetail=!revocation?this.t('인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.'):revocationError?String(revocation.error):this.tr('OCSP 주소 {ocsp}개 · CRL 주소 {crl}개',{ocsp:Array.isArray(revocation.ocsp_urls)?revocation.ocsp_urls.length:0,crl:Array.isArray(revocation.crl_urls)?revocation.crl_urls.length:0});
-    const zoneDnssec=ops.zoneDnssec&&typeof ops.zoneDnssec==='object'?ops.zoneDnssec:null;
+    const zoneDnssec=s.zoneDnssec&&typeof s.zoneDnssec==='object'?s.zoneDnssec:null;
     const zoneDnssecError=!!(zoneDnssec&&zoneDnssec.error),zoneDnssecChecked=!!zoneDnssec&&!zoneDnssecError;
     const zoneDnssecSigned=!!(zoneDnssecChecked&&zoneDnssec.signed===true),zoneDnssecKeys=zoneDnssecChecked&&Array.isArray(zoneDnssec.dnskeys)?zoneDnssec.dnskeys:[];
     const zoneDnssecLabel=!zoneDnssec?this.t('조회 전'):zoneDnssecError?this.t('조회 실패'):zoneDnssecSigned?this.t('서명됨'):this.t('서명되지 않음');
@@ -7426,9 +7352,9 @@ class Component extends DCLogic {
       listeners, lnAddButtons, onListenerHost, onListenerPort, saveListenerEdit:this.saveListenerEdit, cancelListenerEdit:this.cancelListenerEdit,
       sysAdapters, bootSvc, sysPlatform:String(s.sysPlatform||''), refreshAdapters:()=>{this.loadAdapters();this.loadBootService();}, fwAllowPort:this.fwAllowPort, fwRemovePort:this.fwRemovePort,
       upd:updateView.upd,updateBanner:updateView.banner,updateBannerAction:updateView.bannerAction,goUpdate:this.goUpdate,
-      operationsLoaded:!!ops.loaded,operationSummary,operationSourceStatus,operationUpdatedLabel,opPartial,operationFailedLabel,operationStatusColor:opPartial?'var(--warn)':'var(--ok)',refreshOperations:this.refreshOperations,flushCache:this.flushCache,downloadBackup:this.downloadBackup,onRestoreFile:this.onRestoreFile,restoreBackup:this.restoreBackup,restoreReady:!!this._restoreBackup,restoreFileName:localizedForms.restoreFileName,
+      flushCache:this.flushCache,downloadBackup:this.downloadBackup,onRestoreFile:this.onRestoreFile,restoreBackup:this.restoreBackup,restoreReady:!!this._restoreBackup,restoreFileName:localizedForms.restoreFileName,
       rewriteRows,hasRewrites:rewriteRows.length>0,addRewrite:this.addRewrite,reportTotal:reportTotalN.toLocaleString(this.locale()),reportApplied:reportAppliedN.toLocaleString(this.locale()),reportSkipped:reportSkippedN.toLocaleString(this.locale()),filterCoverageLabel,filterCoverageStyle,filterReasonRows,hasFilterReasons:filterReasonRows.length>0,
-      topRuleRows,hasTopRules:topRuleRows.length>0,topRulesOff:!!ops.loaded&&topData.enabled!==true,topRulesEmpty:topData.enabled===true&&topRuleRows.length===0,sourceRows,hasSources:sourceRows.length>0,sourceHitsOff:!!ops.loaded&&!sourceHitsEnabled,sourceTotalsText,pluginRows,hasPlugins:pluginRows.length>0,pluginEvalTotal:pluginEvalTotal.toLocaleString(this.locale()),pluginErrorTotal:pluginErrorTotal.toLocaleString(this.locale()),pluginBlockTotal:pluginBlockTotal.toLocaleString(this.locale()),
+      topRuleRows,hasTopRules:topRuleRows.length>0,topRulesOff:!!s.topRules&&topData.enabled!==true,topRulesEmpty:topData.enabled===true&&topRuleRows.length===0,sourceRows,hasSources:sourceRows.length>0,sourceHitsOff:!!s.filterSources&&!sourceHitsEnabled,sourceTotalsText,pluginRows,hasPlugins:pluginRows.length>0,pluginEvalTotal:pluginEvalTotal.toLocaleString(this.locale()),pluginErrorTotal:pluginErrorTotal.toLocaleString(this.locale()),pluginBlockTotal:pluginBlockTotal.toLocaleString(this.locale()),
       accessAllowedRows,accessBlockedRows,accessDroppedRows,accessHostRows,hasAccessAllowed:accessAllowedRows.length>0,hasAccessBlocked:accessBlockedRows.length>0,hasAccessDropped:accessDroppedRows.length>0,hasAccessHosts:accessHostRows.length>0,hasAccessUnlisted:accessUnlisted!=='',accessUnlistedLabel,accessUnlistedColor,revocationLabel,revocationColor,revocationDetail,zoneDnssecLabel,zoneDnssecColor,zoneDnssecDetail,checkTlsRevocation:this.checkTlsRevocation,checkZoneDnssec:this.checkZoneDnssec,
       cert:{...s.cert,domain:this.t(s.cert.domain),daysLeftLabel:this.t(s.cert.daysLeftLabel)}, uploadCert:this.uploadCert, requestAcme:this.requestAcme, onCertFile:this.onCertFile,validateTls:this.validateTls,
       clientSetup:this.clientSetupView(s.clientSetup),makeStamps:this.makeStamps,appleProfileDoh:this.appleProfileDoh,appleProfileDot:this.appleProfileDot,
