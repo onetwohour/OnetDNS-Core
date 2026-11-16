@@ -1344,12 +1344,14 @@ pub fn serve(
         listeners: listener_reg.clone(),
         upstreams: forward_stats.clone(),
     });
+    let mut upstream_seed = Vec::new();
     let forward_slot = if backend_uses_forward(cfg.backend) {
         let (resolver, stats) =
             build_forward_backend(&cfg).map_err(|error| crate::anyhow!(error))?;
 
         if let Some(path) = upstream_stats_path(config_path.as_deref()) {
-            stats.seed(&load_upstream_stats(&path));
+            upstream_seed = load_upstream_stats(&path);
+            stats.seed(&upstream_seed);
         }
         *forward_stats.lock_recover() = Some(stats);
         native::ResolverSlot::new(resolver)
@@ -1654,6 +1656,9 @@ pub fn serve(
         exclusive,
         recorder,
         stats,
+        forward_stats: forward_stats.clone(),
+        upstream_seed,
+        upstream_stats_path: upstream_stats_path(config_path.as_deref()),
     };
     let stopping = || {
         external_stop

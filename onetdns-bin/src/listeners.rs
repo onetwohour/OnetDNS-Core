@@ -1006,7 +1006,7 @@ pub(crate) mod tests {
     use crate::CONFIG_FILE_NAME;
 
     /// Answers every A query with `answer`, so a reply shows which handler produced it.
-    fn upstream_answering(answer: Ipv4Addr) -> SocketAddr {
+    pub(crate) fn upstream_answering(answer: Ipv4Addr) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         std::thread::spawn(move || {

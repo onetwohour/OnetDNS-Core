@@ -123,6 +123,8 @@ pub(crate) enum FromPredecessor {
 pub(crate) struct Carried {
     /// `Recorder::export_state`; None when the predecessor could not export it.
     pub(crate) stats: Option<Vec<u8>>,
+    /// The upstream statistics in their file format; None without a forwarding resolver.
+    pub(crate) upstreams: Option<String>,
 }
 
 /// Sent by the successor to the running generation.
@@ -330,6 +332,10 @@ pub(crate) struct Handoff {
     pub(crate) exclusive: Exclusive,
     pub(crate) recorder: Recorder,
     pub(crate) stats: Stats,
+    pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
+    /// What the forwarding resolver was seeded with from the saved upstream statistics.
+    pub(crate) upstream_seed: Vec<onetdns_forward::UpstreamStatReport>,
+    pub(crate) upstream_stats_path: Option<std::path::PathBuf>,
 }
 
 impl Handoff {
@@ -371,8 +377,8 @@ impl Handoff {
             .send(FromSuccessor::Reading)
             .and_then(|()| link.recv(step_deadline(), abort));
         match released {
-            Ok(FromPredecessor::Released(carried)) => self.carry_in(Some(carried), cfg),
-            Err(LinkError::Gone) => self.carry_in(None, cfg),
+            Ok(FromPredecessor::Released(carried)) => self.carry_in(carried, cfg),
+            Err(LinkError::Gone) => self.carry_in(Carried::default(), cfg),
             Ok(FromPredecessor::Sockets(_)) => return Err(OUT_OF_ORDER.to_string()),
             Err(error) => {
                 return Err(format!(
@@ -459,17 +465,27 @@ impl Handoff {
                 onetdns_core::warn!(event = "handoff.stats_not_exported", %error, "Could not hand over the statistics; the new process reads the saved ones");
             })
             .ok();
-        Carried { stats }
+        let upstreams = self
+            .forward_stats
+            .lock_recover()
+            .as_ref()
+            .map(|forward| crate::upstream_stats::upstream_stats_json(&forward.snapshot()));
+        Carried { stats, upstreams }
     }
 
     /// Adds the predecessor's statistics to what this process counted, or the saved ones when it
     /// handed over none this process can read.
-    fn carry_in(&self, carried: Option<Carried>, cfg: &Config) {
+    fn carry_in(&self, carried: Carried, cfg: &Config) {
+        self.carry_stats_in(carried.stats, cfg);
+        self.carry_upstreams_in(carried.upstreams);
+    }
+
+    fn carry_stats_in(&self, state: Option<Vec<u8>>, cfg: &Config) {
         let saved = || {
             self.recorder
                 .merge_saved(&crate::hot_apply::persist_opts(cfg))
         };
-        let merged = match carried.and_then(|carried| carried.stats) {
+        let merged = match state {
             Some(state) => self.recorder.merge_state(&state).or_else(|error| {
                 onetdns_core::warn!(event = "handoff.stats_unreadable", %error, "Could not read the statistics the previous process handed over; adding the saved ones instead");
                 saved()
@@ -479,6 +495,32 @@ impl Handoff {
         if let Err(error) = merged {
             onetdns_core::warn!(event = "handoff.stats_not_merged", %error, "Could not add the previous process's statistics; they start over from zero");
         }
+    }
+
+    /// This process was seeded from the saved upstream statistics, so it adds only what the
+    /// predecessor observed after they were saved. The predecessor saves once more as it releases,
+    /// so the file stands in for statistics it could not hand over.
+    fn carry_upstreams_in(&self, handed: Option<String>) {
+        let Some(forward) = self.forward_stats.lock_recover().clone() else {
+            return;
+        };
+        let saved = || {
+            self.upstream_stats_path
+                .as_deref()
+                .map(crate::upstream_stats::load_upstream_stats)
+                .unwrap_or_default()
+        };
+        let reports = match handed {
+            Some(text) => crate::upstream_stats::parse_upstream_stats(&text).unwrap_or_else(|error| {
+                onetdns_core::warn!(event = "handoff.upstream_stats_unreadable", %error, "Could not read the upstream DNS server statistics the previous process handed over; adding the saved ones instead");
+                saved()
+            }),
+            None => saved(),
+        };
+        forward.add(&crate::upstream_stats::observed_since(
+            reports,
+            &self.upstream_seed,
+        ));
     }
 
     /// One pool to hand over and one to keep, so this generation can serve again if the successor
@@ -598,6 +640,7 @@ mod tests {
     }
 
     use std::net::Ipv4Addr;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const OLD_ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -623,7 +666,7 @@ mod tests {
         stop: Arc<AtomicBool>,
     }
 
-    fn start(cfg: Config, shared: crate::ServeShared) -> Running {
+    fn start(cfg: Config, config_path: Option<PathBuf>, shared: crate::ServeShared) -> Running {
         let ready = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -632,7 +675,7 @@ mod tests {
                 crate::serve(
                     cfg,
                     None,
-                    None,
+                    config_path,
                     shared,
                     Some(stop),
                     Some(Box::new(move || ready.store(true, Ordering::SeqCst))),
@@ -647,11 +690,16 @@ mod tests {
     }
 
     /// Starts a successor of the generation that owns `links`.
-    fn start_successor(cfg: Config, links: &Links, shared: crate::ServeShared) -> Running {
+    fn start_successor(
+        cfg: Config,
+        config_path: Option<PathBuf>,
+        links: &Links,
+        shared: crate::ServeShared,
+    ) -> Running {
         let (successor, predecessor) = link();
         *shared.links.predecessor.lock_recover() = Some(predecessor);
         *links.successor.lock_recover() = Some(successor);
-        start(cfg, shared)
+        start(cfg, config_path, shared)
     }
 
     fn wait_until(failure: &str, done: impl Fn() -> bool) {
@@ -770,8 +818,12 @@ mod tests {
     }
 
     /// Starts a generation and waits until it serves.
-    fn start_serving(cfg: Config, shared: crate::ServeShared) -> Running {
-        let running = start(cfg, shared);
+    fn start_serving(
+        cfg: Config,
+        config_path: Option<PathBuf>,
+        shared: crate::ServeShared,
+    ) -> Running {
+        let running = start(cfg, config_path, shared);
         wait_until("the running generation did not start", || {
             running.ready.load(Ordering::SeqCst) || running.thread.is_finished()
         });
@@ -791,11 +843,12 @@ mod tests {
         let dns = dns_addr();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
-        let old = start_serving(config(dns, OLD_ANSWER, ""), old_shared);
+        let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
         let load = Load::start(dns);
 
         let new = start_successor(
             config(dns, NEW_ANSWER, ""),
+            None,
             &old_links,
             crate::ServeShared::default(),
         );
@@ -833,12 +886,13 @@ mod tests {
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
-        let old = start_serving(config(dns, OLD_ANSWER, ""), old_shared);
+        let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
         let load = Load::start(dns);
 
         let failing = format!("control_listen = \"{}\"\n", busy.local_addr().unwrap());
         let new = start_successor(
             config(dns, NEW_ANSWER, &failing),
+            None,
             &old_links,
             crate::ServeShared::default(),
         );
@@ -878,7 +932,7 @@ mod tests {
         let dns = dns_addr();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
-        let old = start_serving(config(dns, OLD_ANSWER, &files), old_shared);
+        let old = start_serving(config(dns, OLD_ANSWER, &files), None, old_shared);
         let load = Load::start(dns);
         // A successor that also loaded the saved statistics would count them twice; make sure there
         // are some.
@@ -890,6 +944,7 @@ mod tests {
         let new_shared = crate::ServeShared::default();
         let new = start_successor(
             config(dns, NEW_ANSWER, &files),
+            None,
             &old_links,
             new_shared.clone(),
         );
@@ -927,6 +982,86 @@ mod tests {
         assert!(
             saved.contains(&format!("\"total\":\"{answered}\"")),
             "the successor did not save the merged totals"
+        );
+
+        new.stop.store(true, Ordering::SeqCst);
+        new.thread.join().unwrap().expect("the successor failed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    /// The successor starts from the upstream statistics the running generation saved, then adds
+    /// what it observed after saving them: every forwarded query is counted once.
+    fn the_upstream_statistics_carry_over_to_the_successor() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-handoff-upstreams-{}-{}",
+            std::process::id(),
+            crate::unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let upstream = crate::listeners::tests::upstream_answering(OLD_ANSWER);
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let text = format!(
+            "listen = [\"{dns}\"]\nworkers = 2\nbackend = \"forward\"\n\
+             upstream_urls = [\"udp://{upstream}\"]\npersist_flush_secs = 1\n"
+        );
+        let config_path = dir.join(crate::CONFIG_FILE_NAME);
+        std::fs::write(&config_path, &text).unwrap();
+        let config = || Config::from_toml_str(&text).unwrap();
+        let saved = crate::upstream_stats::upstream_stats_path(Some(&config_path)).unwrap();
+
+        let old_shared = crate::ServeShared::default();
+        let old_links = old_shared.links.clone();
+        let old = start_serving(config(), Some(config_path.clone()), old_shared);
+        let load = Load::start(dns);
+        // A successor that added the whole handed-over state on top of its seed would count the
+        // saved queries twice; make sure there are some.
+        wait_until(
+            "the running generation did not save its upstream statistics",
+            || {
+                crate::upstream_stats::load_upstream_stats(&saved)
+                    .iter()
+                    .any(|report| report.queries > 0)
+            },
+        );
+
+        let new_shared = crate::ServeShared::default();
+        let new = start_successor(
+            config(),
+            Some(config_path.clone()),
+            &old_links,
+            new_shared.clone(),
+        );
+        wait_until("the running generation did not hand over", || {
+            old.thread.is_finished() || new.thread.is_finished()
+        });
+        assert!(!new.thread.is_finished(), "the successor ended");
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        // Both forward to the same upstream; only the successor answers from here on.
+        load.wait_for_more(&load.by_old, "the successor did not answer");
+        let answered = load.by_old.clone();
+        assert_eq!(load.finish(), (0, 0), "queries went unanswered (UDP, TCP)");
+        let answered = answered.load(Ordering::Relaxed) as u64;
+
+        let forward = new_shared
+            .console
+            .lock_recover()
+            .as_ref()
+            .unwrap()
+            .upstreams
+            .lock_recover()
+            .clone()
+            .unwrap();
+        let reports = forward.snapshot();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            (reports[0].queries, reports[0].ok, reports[0].fail),
+            (answered, answered, 0),
+            "forwarded queries counted (all, answered, failed)"
         );
 
         new.stop.store(true, Ordering::SeqCst);

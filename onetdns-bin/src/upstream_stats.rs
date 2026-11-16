@@ -143,6 +143,24 @@ pub(crate) fn parse_upstream_stats(
     reports.ok_or(UpstreamStatsError::Format)
 }
 
+/// What `now` counted beyond `since`: what a predecessor observed after this process read the saved
+/// statistics.
+pub(crate) fn observed_since(
+    now: Vec<onetdns_forward::UpstreamStatReport>,
+    since: &[onetdns_forward::UpstreamStatReport],
+) -> Vec<onetdns_forward::UpstreamStatReport> {
+    now.into_iter()
+        .map(|mut report| {
+            if let Some(seen) = since.iter().find(|seen| seen.label == report.label) {
+                report.queries = report.queries.saturating_sub(seen.queries);
+                report.ok = report.ok.saturating_sub(seen.ok);
+                report.fail = report.fail.saturating_sub(seen.fail);
+            }
+            report
+        })
+        .collect()
+}
+
 pub(crate) fn load_upstream_stats(
     path: &std::path::Path,
 ) -> Vec<onetdns_forward::UpstreamStatReport> {
