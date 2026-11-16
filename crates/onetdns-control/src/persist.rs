@@ -6,14 +6,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use onetdns_core::json::{self, Json};
 use onetdns_core::Transport;
 
 use onetdns_proto::Name;
 
-use crate::metrics::{intern_action, intern_transport, Metrics, QueryEvent, TopCounters};
+use crate::metrics::{
+    intern_action, intern_transport, MetricBucket, Metrics, PersistOpts, QueryEvent, TopCounters,
+};
 
 const MAX_STATS_FILE: usize = 16 * 1024 * 1024;
 const MAX_QUERYLOG_LINE: usize = 64 * 1024;
@@ -313,6 +314,11 @@ pub(crate) fn save_querylog(path: &Path, buf: &VecDeque<QueryEvent>) -> std::io:
 }
 
 pub(crate) fn save_stats(path: &Path, m: &Metrics, top: &TopCounters) -> std::io::Result<()> {
+    atomic_write(path, stats_json(m, top).as_bytes())
+}
+
+/// One line in the statistics file format.
+pub(crate) fn stats_json(m: &Metrics, top: &TopCounters) -> String {
     let snapshot = m.current_snapshot();
     let mut s = String::with_capacity(4096);
     s.push_str("{\"version\":1,\"metrics\":{");
@@ -367,7 +373,7 @@ pub(crate) fn save_stats(path: &Path, m: &Metrics, top: &TopCounters) -> std::io
     s.push(',');
     write_pairs(&mut s, "clients", &top.clients);
     s.push_str("}}");
-    atomic_write(path, s.as_bytes())
+    s
 }
 
 fn write_pairs<K: std::fmt::Display>(s: &mut String, key: &str, map: &HashMap<K, u64>) {
@@ -388,10 +394,18 @@ fn write_pairs<K: std::fmt::Display>(s: &mut String, key: &str, map: &HashMap<K,
 
 /// Reads saved statistics and applies them. Nothing is applied until the whole file parses.
 pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
+    if let Some(saved) = read_stats(path, m.by_transport.len()) {
+        m.add_totals(&saved);
+        top.add_counts(saved.domains, saved.top_blocked, saved.clients);
+    }
+}
+
+/// The saved statistics, if the whole file parses. Top lists over their cap keep the largest counts.
+fn read_stats(path: &Path, transport_count: usize) -> Option<PersistedStatsSnapshot> {
     let mut bytes = Vec::new();
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             onetdns_core::warn!(
                 event = "stats.restore_open_failed",
@@ -399,7 +413,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 %error,
                 "Could not open the existing statistics file; starting statistics fresh"
             );
-            return;
+            return None;
         }
     };
     if let Err(error) = file
@@ -412,7 +426,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
             %error,
             "Could not read the existing statistics file; starting statistics fresh"
         );
-        return;
+        return None;
     }
     if bytes.len() > MAX_STATS_FILE {
         onetdns_core::warn!(
@@ -422,7 +436,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
             limit = MAX_STATS_FILE,
             "Existing statistics file exceeds the size limit; not restoring it"
         );
-        return;
+        return None;
     }
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
@@ -433,7 +447,7 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 %error,
                 "Existing statistics file is not valid text; not restoring it"
             );
-            return;
+            return None;
         }
     };
     let j = match json::parse_with_limit(&text, MAX_STATS_FILE) {
@@ -445,10 +459,10 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 %error,
                 "Existing statistics file is not valid JSON; not restoring it"
             );
-            return;
+            return None;
         }
     };
-    let restored = match parse_stats_snapshot(&j, m.by_transport.len()) {
+    let mut restored = match parse_stats_snapshot(&j, transport_count) {
         Ok(restored) => restored,
         Err(reason) => {
             onetdns_core::warn!(
@@ -457,42 +471,14 @@ pub(crate) fn load_stats(path: &Path, m: &Metrics, top: &mut TopCounters) {
                 reason,
                 "Existing statistics file has invalid values; skipping the whole restore"
             );
-            return;
+            return None;
         }
     };
 
-    m.total.store(restored.total, Ordering::Relaxed);
-    m.resolved.store(restored.resolved, Ordering::Relaxed);
-    m.blocked.store(restored.blocked, Ordering::Relaxed);
-    m.rewritten.store(restored.rewritten, Ordering::Relaxed);
-    m.denied.store(restored.denied, Ordering::Relaxed);
-    m.refused.store(restored.refused, Ordering::Relaxed);
-    m.throttled.store(restored.throttled, Ordering::Relaxed);
-    m.servfail.store(restored.servfail, Ordering::Relaxed);
-    m.latency_sum_us
-        .store(restored.latency_sum_us, Ordering::Relaxed);
-    m.latency_count
-        .store(restored.latency_count, Ordering::Relaxed);
-    m.cache_hits.store(restored.cache_hits, Ordering::Relaxed);
-    m.cache_lookups
-        .store(restored.cache_lookups, Ordering::Relaxed);
-    m.dropped_log_events
-        .store(restored.dropped_log_events, Ordering::Relaxed);
-    m.dropped_stat_events
-        .store(restored.dropped_stat_events, Ordering::Relaxed);
-    m.dropped_stream_events
-        .store(restored.dropped_stream_events, Ordering::Relaxed);
-    m.persist_failures
-        .store(restored.persist_failures, Ordering::Relaxed);
-    for (slot, value) in m.by_transport.iter().zip(restored.by_transport) {
-        slot.store(value, Ordering::Relaxed);
-    }
-    top.domains = restored.domains;
-    top.blocked = restored.top_blocked;
-    top.clients = restored.clients;
-    cap_restored_top(path, "domains", &mut top.domains);
-    cap_restored_top(path, "blocked", &mut top.blocked);
-    cap_restored_top(path, "clients", &mut top.clients);
+    cap_restored_top(path, "domains", &mut restored.domains);
+    cap_restored_top(path, "blocked", &mut restored.top_blocked);
+    cap_restored_top(path, "clients", &mut restored.clients);
+    Some(restored)
 }
 
 /// Trims a restored top list to its cap, keeping the largest counts. Eviction replaces entries
@@ -522,27 +508,234 @@ fn cap_restored_top<K: Eq + std::hash::Hash + Ord + std::fmt::Display>(
 
 #[derive(Default)]
 /// Statistics read from a file and fully validated. Only this form is applied.
-struct PersistedStatsSnapshot {
-    total: u64,
-    resolved: u64,
-    blocked: u64,
-    rewritten: u64,
-    denied: u64,
-    refused: u64,
-    throttled: u64,
-    servfail: u64,
-    latency_sum_us: u64,
-    latency_count: u64,
-    cache_hits: u64,
-    cache_lookups: u64,
-    dropped_log_events: u64,
-    dropped_stat_events: u64,
-    dropped_stream_events: u64,
-    persist_failures: u64,
-    by_transport: Vec<u64>,
-    domains: HashMap<Name, u64>,
-    top_blocked: HashMap<Name, u64>,
-    clients: HashMap<std::net::IpAddr, u64>,
+pub(crate) struct PersistedStatsSnapshot {
+    pub(crate) total: u64,
+    pub(crate) resolved: u64,
+    pub(crate) blocked: u64,
+    pub(crate) rewritten: u64,
+    pub(crate) denied: u64,
+    pub(crate) refused: u64,
+    pub(crate) throttled: u64,
+    pub(crate) servfail: u64,
+    pub(crate) latency_sum_us: u64,
+    pub(crate) latency_count: u64,
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_lookups: u64,
+    pub(crate) dropped_log_events: u64,
+    pub(crate) dropped_stat_events: u64,
+    pub(crate) dropped_stream_events: u64,
+    pub(crate) persist_failures: u64,
+    pub(crate) by_transport: Vec<u64>,
+    pub(crate) domains: HashMap<Name, u64>,
+    pub(crate) top_blocked: HashMap<Name, u64>,
+    pub(crate) clients: HashMap<std::net::IpAddr, u64>,
+}
+
+/// What a running process hands to the one replacing it: totals and top lists, the query log, the
+/// ID the next logged query gets, and the graph history.
+pub(crate) struct CarriedStats {
+    pub(crate) totals: PersistedStatsSnapshot,
+    /// Oldest first, IDs ascending and below `next_event_id`.
+    pub(crate) recent: VecDeque<QueryEvent>,
+    pub(crate) next_event_id: u64,
+    pub(crate) seconds: Vec<MetricBucket>,
+    pub(crate) minutes: Vec<MetricBucket>,
+}
+
+/// Bumped with the handoff protocol version when the format changes.
+const CARRIED_VERSION: u64 = 1;
+
+/// A header line with the next query log ID and the graph history, a line in the statistics file
+/// format, then the query log in its file format.
+pub(crate) fn encode_carried(
+    stats_line: &str,
+    recent: &VecDeque<QueryEvent>,
+    next_event_id: u64,
+    seconds: &VecDeque<MetricBucket>,
+    minutes: &VecDeque<MetricBucket>,
+) -> Vec<u8> {
+    let mut s = format!(
+        "{{\"version\":{CARRIED_VERSION},\"next_event_id\":\"{next_event_id}\",\"seconds\":"
+    );
+    write_buckets(&mut s, seconds);
+    s.push_str(",\"minutes\":");
+    write_buckets(&mut s, minutes);
+    s.push_str("}\n");
+    s.push_str(stats_line);
+    s.push('\n');
+    for event in recent {
+        s.push_str(&event.to_json());
+        s.push('\n');
+    }
+    s.into_bytes()
+}
+
+fn write_buckets(s: &mut String, buckets: &VecDeque<MetricBucket>) {
+    s.push('[');
+    for (i, b) in buckets.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
+            b.ts_sec,
+            b.span_secs,
+            b.queries,
+            b.blocked,
+            b.latency_sum_us,
+            b.latency_count,
+            b.cache_hits,
+            b.cache_lookups
+        ));
+    }
+    s.push(']');
+}
+
+/// Rejects the whole state on any deviation, as the saved files are.
+pub(crate) fn decode_carried(bytes: &[u8], transport_count: usize) -> Result<CarriedStats, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "The state is not valid text".to_string())?;
+    let mut lines = text.split('\n');
+    let header = lines.next().unwrap_or_default();
+    let header = json::parse_with_limit(header, MAX_STATS_FILE)
+        .map_err(|error| format!("header: {error}"))?;
+    let Json::Obj(fields) = &header else {
+        return Err("header: must be an object".to_string());
+    };
+    if fields.len() != 4
+        || fields.iter().any(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "version" | "next_event_id" | "seconds" | "minutes"
+            )
+        })
+    {
+        return Err("header: entries do not match the current format".to_string());
+    }
+    if header.get("version").and_then(Json::as_u64) != Some(CARRIED_VERSION) {
+        return Err(format!("header: version must be {CARRIED_VERSION}"));
+    }
+    let next_event_id =
+        json_u64(&header, "next_event_id").map_err(|reason| format!("next_event_id: {reason}"))?;
+    let seconds = parse_buckets(&header, "seconds")?;
+    let minutes = parse_buckets(&header, "minutes")?;
+
+    let stats = lines
+        .next()
+        .ok_or_else(|| "The statistics line is missing".to_string())?;
+    let stats = json::parse_with_limit(stats, MAX_STATS_FILE)
+        .map_err(|error| format!("statistics: {error}"))?;
+    let totals = parse_stats_snapshot(&stats, transport_count)?;
+
+    let mut recent = VecDeque::new();
+    let mut previous_id = 0;
+    let mut ended = false;
+    for (index, line) in lines.enumerate() {
+        if ended {
+            return Err(format!("query log line {index}: follows an empty line"));
+        }
+        if line.is_empty() {
+            ended = true;
+            continue;
+        }
+        if line.len() > MAX_QUERYLOG_LINE {
+            return Err(format!("query log line {index}: too long"));
+        }
+        let event =
+            parse_event(line).ok_or_else(|| format!("query log line {index}: invalid event"))?;
+        if event.id <= previous_id || event.id >= next_event_id {
+            return Err(format!(
+                "query log line {index}: IDs must ascend and stay below next_event_id"
+            ));
+        }
+        previous_id = event.id;
+        recent.push_back(event);
+    }
+    if !ended {
+        return Err("The state does not end with a newline".to_string());
+    }
+    Ok(CarriedStats {
+        totals,
+        recent,
+        next_event_id,
+        seconds,
+        minutes,
+    })
+}
+
+/// Each bucket is `[end, span, queries, blocked, latency_sum_us, latency_count, cache_hits,
+/// cache_lookups]`, ends ascending.
+fn parse_buckets(header: &Json, key: &str) -> Result<Vec<MetricBucket>, String> {
+    let array = header
+        .get(key)
+        .and_then(Json::as_array)
+        .ok_or_else(|| format!("{key}: must be an array"))?;
+    let mut out: Vec<MetricBucket> = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        let values = entry
+            .as_array()
+            .filter(|values| values.len() == 8)
+            .ok_or_else(|| format!("{key}[{index}]: must be an array of eight counts"))?
+            .iter()
+            .map(exact_u64)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|reason| format!("{key}[{index}]: {reason}"))?;
+        let bucket = MetricBucket {
+            ts_sec: values[0],
+            span_secs: values[1],
+            queries: values[2],
+            blocked: values[3],
+            latency_sum_us: values[4],
+            latency_count: values[5],
+            cache_hits: values[6],
+            cache_lookups: values[7],
+        };
+        if out.last().is_some_and(|last| last.ts_sec >= bucket.ts_sec) {
+            return Err(format!("{key}[{index}]: ends must ascend"));
+        }
+        out.push(bucket);
+    }
+    Ok(out)
+}
+
+/// The saved statistics and query log as a predecessor would have handed them over, for when it
+/// ended without doing so. The graph history is not saved, so it is empty.
+pub(crate) fn read_saved(
+    persist: &PersistOpts,
+    log_cap: usize,
+    retention_ms: u64,
+    now_ms: u64,
+    transport_count: usize,
+) -> CarriedStats {
+    let totals = persist
+        .stats_file
+        .as_deref()
+        .and_then(|path| read_stats(path, transport_count))
+        .unwrap_or_default();
+    let mut recent = persist
+        .querylog_file
+        .as_deref()
+        .map(|path| load_querylog(path, log_cap, retention_ms, now_ms))
+        .unwrap_or_default();
+    let next_event_id = number_events(&mut recent);
+    CarriedStats {
+        totals,
+        recent,
+        next_event_id,
+        seconds: Vec::new(),
+        minutes: Vec::new(),
+    }
+}
+
+/// Gives events saved without an ID the next free one; returns the ID after the last.
+pub(crate) fn number_events(events: &mut VecDeque<QueryEvent>) -> u64 {
+    let mut next = 1u64;
+    for event in events.iter_mut() {
+        if event.id == 0 {
+            event.id = next;
+        }
+        next = next.max(event.id.saturating_add(1));
+    }
+    next
 }
 
 fn parse_stats_snapshot(
@@ -723,6 +916,72 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The state a running process hands to its successor, as version 1 writes it.
+    const CARRIED_EXAMPLE: &str = concat!(
+        r#"{"version":1,"next_event_id":"3","seconds":[["1700000000","1","3","1","240","2","1","2"]],"minutes":[["1699999980","1","3","1","240","2","1","2"]]}"#,
+        "\n",
+        r#"{"version":1,"metrics":{"total":"3","resolved":"2","blocked":"1","rewritten":"0","denied":"0","refused":"0","throttled":"0","servfail":"0","latency_sum_us":"240","latency_count":"2","cache_hits":"1","cache_lookups":"2","dropped_log_events":"0","dropped_stat_events":"0","dropped_stream_events":"0","persist_failures":"0","by_transport":["0","0","0","3","0","0","0"]},"top":{"domains":[["a.example.","2"],["b.example.","1"]],"blocked":[["a.example.","1"]],"clients":[["192.0.2.1","3"]]}}"#,
+        "\n",
+        r#"{"id":1,"ts_ms":1699999999000,"client":"192.0.2.1","name":"a.example.","qtype":"A","transport":"doh","action":"blocked","rcode":"NOERROR","reason":"","stage":"","detail":"","answers":"","upstream":"","rule":"","list":"","latency_us":120}"#,
+        "\n",
+        r#"{"id":2,"ts_ms":1700000000000,"client":"192.0.2.1","name":"b.example.","qtype":"A","transport":"doh","action":"resolved","rcode":"NOERROR","reason":"","stage":"","detail":"","answers":"","upstream":"","rule":"","list":"","latency_us":120}"#,
+        "\n",
+    );
+
+    #[test]
+    fn the_carried_state_format_reads_its_example() {
+        let carried = decode_carried(CARRIED_EXAMPLE.as_bytes(), Transport::COUNT).unwrap();
+        assert_eq!(carried.next_event_id, 3);
+        assert_eq!(carried.totals.total, 3);
+        assert_eq!(carried.totals.blocked, 1);
+        assert_eq!(carried.totals.by_transport, [0, 0, 0, 3, 0, 0, 0]);
+        let name = |n: &str| Name::from_str(n).unwrap();
+        assert_eq!(carried.totals.domains.get(&name("a.example.")), Some(&2));
+        assert_eq!(
+            carried.totals.top_blocked.get(&name("a.example.")),
+            Some(&1)
+        );
+        assert_eq!(
+            carried.totals.clients.get(&"192.0.2.1".parse().unwrap()),
+            Some(&3)
+        );
+        let ids: Vec<u64> = carried.recent.iter().map(|event| event.id).collect();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(carried.recent[0].action, "blocked");
+        assert_eq!(carried.seconds.len(), 1);
+        assert_eq!(carried.seconds[0].ts_sec, 1_700_000_000);
+        assert_eq!(carried.seconds[0].queries, 3);
+        assert_eq!(carried.minutes[0].ts_sec, 1_699_999_980);
+        assert_eq!(carried.minutes[0].cache_lookups, 2);
+    }
+
+    #[test]
+    fn a_carried_state_off_the_format_is_rejected_whole() {
+        let broken = [
+            CARRIED_EXAMPLE.replace(r#""version":1,"next"#, r#""version":2,"next"#),
+            CARRIED_EXAMPLE.replace(r#""next_event_id":"3""#, r#""next_event_id":"2""#),
+            CARRIED_EXAMPLE.replace(r#"{"id":2,"#, r#"{"id":1,"#),
+            CARRIED_EXAMPLE.replace(r#"[["1699999980""#, r#"[["1800000000""#)
+                .replace(r#""minutes":[["1800000000","1","3","1","240","2","1","2"]]"#,
+                    r#""minutes":[["1800000000","1","3","1","240","2","1","2"],["1700000000","1","3","1","240","2","1","2"]]"#),
+            CARRIED_EXAMPLE.replace(r#""minutes":"#, r#""extra":[],"minutes":"#),
+            CARRIED_EXAMPLE.trim_end_matches('\n').to_string(),
+            format!("{CARRIED_EXAMPLE}\n"),
+            CARRIED_EXAMPLE.replace(r#""by_transport":["0","0","0","3","0","0","0"]"#, r#""by_transport":["3"]"#),
+        ];
+        for (index, state) in broken.iter().enumerate() {
+            assert_ne!(
+                state, CARRIED_EXAMPLE,
+                "case {index} did not change the example"
+            );
+            assert!(
+                decode_carried(state.as_bytes(), Transport::COUNT).is_err(),
+                "case {index} was accepted"
+            );
+        }
+    }
 
     #[test]
     fn restored_top_lists_are_capped() {

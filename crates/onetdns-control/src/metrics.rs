@@ -100,17 +100,17 @@ impl Action {
 
 #[derive(Debug, Clone, Copy, Default)]
 /// Totals for one interval, the unit of history.
-struct MetricBucket {
+pub(crate) struct MetricBucket {
     /// End of the interval.
-    ts_sec: u64,
+    pub(crate) ts_sec: u64,
     /// Seconds covered; per-second values divide by it.
-    span_secs: u64,
-    queries: u64,
-    blocked: u64,
-    latency_sum_us: u64,
-    latency_count: u64,
-    cache_hits: u64,
-    cache_lookups: u64,
+    pub(crate) span_secs: u64,
+    pub(crate) queries: u64,
+    pub(crate) blocked: u64,
+    pub(crate) latency_sum_us: u64,
+    pub(crate) latency_count: u64,
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_lookups: u64,
 }
 
 impl MetricBucket {
@@ -195,7 +195,17 @@ impl MetricHistory {
         } else {
             self.minutes.push_back(minute_delta);
         }
+        self.trim(now_sec);
+    }
 
+    /// Adds another process's intervals to the ones here, matching them by end time.
+    fn merge(&mut self, seconds: Vec<MetricBucket>, minutes: Vec<MetricBucket>, now_sec: u64) {
+        merge_buckets(&mut self.seconds, seconds);
+        merge_buckets(&mut self.minutes, minutes);
+        self.trim(now_sec);
+    }
+
+    fn trim(&mut self, now_sec: u64) {
         let retention_secs = if self.retention_secs == 0 {
             7 * 24 * 60 * 60
         } else {
@@ -278,6 +288,28 @@ impl MetricHistory {
         }
         (width, out)
     }
+}
+
+/// Both sides are ordered by end time; so is the result.
+fn merge_buckets(into: &mut VecDeque<MetricBucket>, from: Vec<MetricBucket>) {
+    let mut merged = VecDeque::with_capacity(into.len() + from.len());
+    let mut ours = std::mem::take(into).into_iter().peekable();
+    let mut theirs = from.into_iter().peekable();
+    loop {
+        let next = match (ours.peek(), theirs.peek()) {
+            (Some(a), Some(b)) if a.ts_sec == b.ts_sec => {
+                let mut bucket = ours.next().unwrap_or_default();
+                bucket.add(theirs.next().unwrap_or_default());
+                bucket
+            }
+            (Some(a), Some(b)) if a.ts_sec < b.ts_sec => ours.next().unwrap_or_default(),
+            (Some(_), Some(_)) | (None, Some(_)) => theirs.next().unwrap_or_default(),
+            (Some(_), None) => ours.next().unwrap_or_default(),
+            (None, None) => break,
+        };
+        merged.push_back(next);
+    }
+    *into = merged;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -390,10 +422,12 @@ impl Metrics {
         }
     }
 
+    /// Reads the totals under the history lock, so a total added while merging cannot fall between
+    /// the read and the sample and show up as a spike.
     fn sample_now(&self) {
         let now_sec = now_ms() / 1_000;
-        let counters = self.counters();
-        self.history.lock_recover().sample(counters, now_sec);
+        let mut history = self.history.lock_recover();
+        history.sample(self.counters(), now_sec);
     }
 
     fn set_history_retention(&self, retention_secs: u64) {
@@ -402,10 +436,57 @@ impl Metrics {
 
     fn reset_history_baseline(&self) {
         let now_sec = now_ms() / 1_000;
-        let counters = self.counters();
-        self.history
-            .lock_recover()
-            .reset_baseline(counters, now_sec);
+        let mut history = self.history.lock_recover();
+        history.reset_baseline(self.counters(), now_sec);
+    }
+
+    /// Adds totals counted elsewhere. The history baseline moves with them, so they do not read as
+    /// this moment's increase.
+    pub(crate) fn add_totals(&self, saved: &crate::persist::PersistedStatsSnapshot) {
+        self.add_history(saved, Vec::new(), Vec::new());
+    }
+
+    /// `add_totals`, also adding the intervals of the history they were counted in.
+    fn add_history(
+        &self,
+        saved: &crate::persist::PersistedStatsSnapshot,
+        seconds: Vec<MetricBucket>,
+        minutes: Vec<MetricBucket>,
+    ) {
+        let mut history = self.history.lock_recover();
+        for (counter, value) in [
+            (&self.total, saved.total),
+            (&self.resolved, saved.resolved),
+            (&self.blocked, saved.blocked),
+            (&self.rewritten, saved.rewritten),
+            (&self.denied, saved.denied),
+            (&self.refused, saved.refused),
+            (&self.throttled, saved.throttled),
+            (&self.servfail, saved.servfail),
+            (&self.latency_sum_us, saved.latency_sum_us),
+            (&self.latency_count, saved.latency_count),
+            (&self.cache_hits, saved.cache_hits),
+            (&self.cache_lookups, saved.cache_lookups),
+            (&self.dropped_log_events, saved.dropped_log_events),
+            (&self.dropped_stat_events, saved.dropped_stat_events),
+            (&self.dropped_stream_events, saved.dropped_stream_events),
+            (&self.persist_failures, saved.persist_failures),
+        ] {
+            add_saturating(counter, value);
+        }
+        for (counter, value) in self.by_transport.iter().zip(&saved.by_transport) {
+            add_saturating(counter, *value);
+        }
+        history.previous.add(MetricBucket {
+            queries: saved.total,
+            blocked: saved.blocked,
+            latency_sum_us: saved.latency_sum_us,
+            latency_count: saved.latency_count,
+            cache_hits: saved.cache_hits,
+            cache_lookups: saved.cache_lookups,
+            ..MetricBucket::default()
+        });
+        history.merge(seconds, minutes, now_ms() / 1_000);
     }
 
     /// The bin width in seconds and the points, oldest first.
@@ -585,6 +666,10 @@ enum CollectorEvent {
     Log(QueryEvent),
     /// The first event entered an empty stats slot.
     StatsReady,
+    /// Counts everything still queued, then replies with the state for a successor.
+    Export(mpsc::SyncSender<Vec<u8>>),
+    /// Counts everything still queued, then adds a predecessor's state.
+    Merge(Box<crate::persist::CarriedStats>, mpsc::SyncSender<()>),
 }
 
 impl QueryEvent {
@@ -822,6 +907,44 @@ impl Recorder {
     /// something per query, so skip them when nothing can read the result.
     pub fn collecting(&self) -> bool {
         self.collecting.load(Ordering::Acquire)
+    }
+
+    /// Counts what is still queued, then returns what a successor process needs to go on counting
+    /// from here: the totals and top lists, the graph history and the query log.
+    pub fn export_state(&self) -> Result<Vec<u8>, String> {
+        let (reply, state) = mpsc::sync_channel(1);
+        self.log_tx
+            .send(CollectorEvent::Export(reply))
+            .map_err(|_| COLLECTOR_GONE.to_string())?;
+        state.recv().map_err(|_| COLLECTOR_GONE.to_string())
+    }
+
+    /// Adds a predecessor's `export_state` to what this recorder counted. The recorder must have
+    /// started without saved statistics, or they would be counted twice.
+    pub fn merge_state(&self, state: &[u8]) -> Result<(), String> {
+        let carried = crate::persist::decode_carried(state, Transport::COUNT)?;
+        self.merge(carried)
+    }
+
+    /// Adds the saved statistics and query log, for a predecessor that ended without handing over
+    /// its state. Same precondition as `merge_state`.
+    pub fn merge_saved(&self, persist: &PersistOpts) -> Result<(), String> {
+        let carried = crate::persist::read_saved(
+            persist,
+            self.log_cap.load(Ordering::Acquire).max(1),
+            self.retention_ms.load(Ordering::Acquire),
+            now_ms(),
+            Transport::COUNT,
+        );
+        self.merge(carried)
+    }
+
+    fn merge(&self, carried: crate::persist::CarriedStats) -> Result<(), String> {
+        let (reply, done) = mpsc::sync_channel(1);
+        self.log_tx
+            .send(CollectorEvent::Merge(Box::new(carried), reply))
+            .map_err(|_| COLLECTOR_GONE.to_string())?;
+        done.recv().map_err(|_| COLLECTOR_GONE.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1094,6 +1217,12 @@ fn anonymize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn add_saturating(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
 /// Min-heap for finding the smallest top-list entry quickly.
 type CounterHeap<K> = std::collections::BinaryHeap<std::cmp::Reverse<(u64, K)>>;
 
@@ -1109,6 +1238,42 @@ pub struct TopCounters {
     domains_misses: u64,
     blocked_misses: u64,
     clients_misses: u64,
+}
+
+impl TopCounters {
+    /// Adds counts made elsewhere. Lists over the cap keep the largest counts.
+    pub(crate) fn add_counts(
+        &mut self,
+        domains: std::collections::HashMap<Name, u64>,
+        blocked: std::collections::HashMap<Name, u64>,
+        clients: std::collections::HashMap<IpAddr, u64>,
+    ) {
+        add_capped(&mut self.domains, domains);
+        add_capped(&mut self.blocked, blocked);
+        add_capped(&mut self.clients, clients);
+        // Rebuilt from the maps on the next eviction.
+        self.domains_heap.clear();
+        self.blocked_heap.clear();
+        self.clients_heap.clear();
+    }
+}
+
+fn add_capped<K: Eq + std::hash::Hash + Ord>(
+    map: &mut std::collections::HashMap<K, u64>,
+    other: std::collections::HashMap<K, u64>,
+) {
+    for (key, count) in other {
+        let total = map.entry(key).or_default();
+        *total = total.saturating_add(count);
+    }
+    if map.len() <= TOP_CAP {
+        return;
+    }
+    let mut pairs: Vec<(K, u64)> = std::mem::take(map).into_iter().collect();
+    // Ties break by key so the kept entries do not vary between runs.
+    pairs.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    pairs.truncate(TOP_CAP);
+    map.extend(pairs);
 }
 
 /// Bounds memory under high-cardinality traffic.
@@ -1668,6 +1833,54 @@ fn flush_persist(
     }
 }
 
+const COLLECTOR_GONE: &str = "The statistics thread is not running";
+
+/// The predecessor's events come first with their IDs; the ones counted here follow, numbered after
+/// them. Nothing reads these IDs yet, as the successor's dashboard starts after the merge.
+fn merge_carried(
+    carried: crate::persist::CarriedStats,
+    metrics: &Metrics,
+    top: &Mutex<TopCounters>,
+    recent: &Mutex<VecDeque<QueryEvent>>,
+    next_event_id: &std::cell::Cell<u64>,
+    retention_ms: &AtomicU64,
+    log_cap: &AtomicUsize,
+) {
+    let crate::persist::CarriedStats {
+        mut totals,
+        recent: theirs,
+        next_event_id: their_next,
+        seconds,
+        minutes,
+    } = carried;
+    metrics.add_history(&totals, seconds, minutes);
+    top.lock_recover().add_counts(
+        std::mem::take(&mut totals.domains),
+        std::mem::take(&mut totals.top_blocked),
+        std::mem::take(&mut totals.clients),
+    );
+
+    let offset = their_next.saturating_sub(1);
+    let mut events = recent.lock_recover();
+    let ours = std::mem::replace(&mut *events, theirs);
+    events.extend(ours.into_iter().map(|mut event| {
+        event.id = event.id.saturating_add(offset);
+        event
+    }));
+    next_event_id.set(next_event_id.get().saturating_add(offset));
+    let retention_ms = retention_ms.load(Ordering::Acquire);
+    if retention_ms > 0 {
+        let cutoff = now_ms().saturating_sub(retention_ms);
+        while events.front().is_some_and(|event| event.ts_ms < cutoff) {
+            events.pop_front();
+        }
+    }
+    let log_cap = log_cap.load(Ordering::Acquire).max(1);
+    while events.len() > log_cap {
+        events.pop_front();
+    }
+}
+
 /// Creates the recorder and read handle and starts the background threads. The bounded channel
 /// separates the data path from collection; that boundary keeps metrics from blocking queries.
 pub fn channel(
@@ -1706,13 +1919,7 @@ pub fn channel(
     if let Some(p) = &persist.stats_file {
         crate::persist::load_stats(p, &metrics, &mut initial_top);
     }
-    let mut next_event_id = 1u64;
-    for ev in &mut initial_recent {
-        if ev.id == 0 {
-            ev.id = next_event_id;
-        }
-        next_event_id = next_event_id.max(ev.id.saturating_add(1));
-    }
+    let next_event_id = std::cell::Cell::new(crate::persist::number_events(&mut initial_recent));
     metrics.reset_history_baseline();
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = {
@@ -1845,10 +2052,10 @@ pub fn channel(
             // Also the slot drain period. Too long and slots overflow, turning stats into a sample:
             // total slot capacity must exceed the queries arriving in this time.
             let poll_interval = Duration::from_millis(20);
-            let mut process = |mut ev: QueryEvent| {
+            let process = |mut ev: QueryEvent| {
                 if ev.log {
-                    ev.id = next_event_id;
-                    next_event_id = next_event_id.saturating_add(1);
+                    ev.id = next_event_id.get();
+                    next_event_id.set(next_event_id.get().saturating_add(1));
                 }
                 process_event(
                     ev,
@@ -1909,6 +2116,38 @@ pub fn channel(
                         dirty = true;
                     }
                     Ok(CollectorEvent::StatsReady) => {}
+                    // Logs sent before a handoff request arrived ahead of it. Stats-only events may
+                    // have entered a slot since the last drain.
+                    Ok(CollectorEvent::Export(reply)) => {
+                        drain_slots();
+                        metrics_t.sample_now();
+                        let stats_line =
+                            crate::persist::stats_json(&metrics_t, &top_c.lock_recover());
+                        let history = metrics_t.history.lock_recover();
+                        let state = crate::persist::encode_carried(
+                            &stats_line,
+                            &buf.lock_recover(),
+                            next_event_id.get(),
+                            &history.seconds,
+                            &history.minutes,
+                        );
+                        drop(history);
+                        let _ = reply.send(state);
+                    }
+                    Ok(CollectorEvent::Merge(carried, reply)) => {
+                        drain_slots();
+                        merge_carried(
+                            *carried,
+                            &metrics_t,
+                            &top_c,
+                            &buf,
+                            &next_event_id,
+                            &retention_t,
+                            &log_cap_t,
+                        );
+                        dirty = true;
+                        let _ = reply.send(());
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         // Even with every sender gone, what remains in the slots is counted before
@@ -2007,6 +2246,146 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(recorder: &Recorder, name: &str, action: Action, log: bool) {
+        recorder.record(
+            Transport::Do53Udp,
+            action,
+            "192.0.2.1".parse().unwrap(),
+            Some(&Name::from_str(name).unwrap()),
+            Some(RecordType::A),
+            log,
+            true,
+        );
+    }
+
+    fn logged_names(stats: &Stats) -> Vec<(u64, String)> {
+        stats
+            .recent
+            .lock_recover()
+            .iter()
+            .map(|event| (event.id, event.name.as_ref().unwrap().to_string()))
+            .collect()
+    }
+
+    fn history_queries(recorder: &Recorder) -> u64 {
+        let (_, points) = recorder.metrics().history(3_600, 60);
+        points.iter().map(|point| point.queries).sum()
+    }
+
+    #[test]
+    /// The successor's totals, top lists, graph and query log go on from the predecessor's: nothing
+    /// counted twice, nothing lost, the predecessor's log IDs kept and its own numbered after them.
+    fn a_successor_goes_on_counting_from_the_predecessor_state() {
+        let (old, _) = channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
+        ask(&old, "a1.example", Action::Resolved, true);
+        ask(&old, "a2.example", Action::Blocked, true);
+        ask(&old, "a3.example", Action::Resolved, true);
+        ask(&old, "s1.example", Action::Resolved, false);
+        ask(&old, "s2.example", Action::Resolved, false);
+        // Exported at once: what is still queued is counted first.
+        let state = old.export_state().unwrap();
+
+        let (new, stats) = channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
+        ask(&new, "b1.example", Action::Resolved, true);
+        ask(&new, "a1.example", Action::Resolved, true);
+        new.merge_state(&state).unwrap();
+
+        let snapshot = new.metrics().snapshot();
+        assert_eq!(snapshot.total, 7);
+        assert_eq!(snapshot.blocked, 1);
+        assert_eq!(snapshot.resolved, 6);
+        let udp = snapshot
+            .by_transport
+            .iter()
+            .find(|(name, _)| *name == Transport::Do53Udp.name())
+            .unwrap();
+        assert_eq!(udp.1, 7);
+        let top = stats.top(10);
+        assert_eq!(top.domains[0], ("a1.example.".to_string(), 2));
+        assert_eq!(top.blocked, [("a2.example.".to_string(), 1)]);
+        assert_eq!(top.clients, [("192.0.2.1".to_string(), 7)]);
+
+        let names = |list: &[&str]| -> Vec<(u64, String)> {
+            list.iter()
+                .enumerate()
+                .map(|(index, name)| (index as u64 + 1, format!("{name}.")))
+                .collect()
+        };
+        assert_eq!(
+            logged_names(&stats),
+            names(&[
+                "a1.example",
+                "a2.example",
+                "a3.example",
+                "b1.example",
+                "a1.example"
+            ])
+        );
+        ask(&new, "b2.example", Action::Resolved, true);
+        for _ in 0..200 {
+            if stats.recent(10).len() == 6 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            logged_names(&stats).last(),
+            Some(&(6, "b2.example.".to_string()))
+        );
+
+        assert_eq!(
+            history_queries(&new),
+            8,
+            "the graph lost or doubled queries"
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(
+            history_queries(&new),
+            8,
+            "the merged totals showed up as a spike"
+        );
+    }
+
+    #[test]
+    /// A predecessor that ended without handing over its state still saved it; the successor adds
+    /// those files instead.
+    fn a_successor_adds_the_saved_state_when_none_was_handed_over() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-carried-saved-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = PersistOpts {
+            querylog_file: Some(dir.join("querylog.jsonl")),
+            stats_file: Some(dir.join("stats.json")),
+            flush_secs: 3_600,
+        };
+        let (old, old_stats) = channel(64, 100, 0, RecorderOpts::default(), saved.clone());
+        ask(&old, "a1.example", Action::Resolved, true);
+        ask(&old, "a2.example", Action::Blocked, true);
+        // Turning persistence off saves the last state, as a predecessor does when it lets go.
+        old.export_state().unwrap();
+        old_stats
+            .reconfigure_persist(PersistOpts::default())
+            .unwrap();
+
+        let (new, stats) = channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
+        ask(&new, "b1.example", Action::Resolved, true);
+        new.merge_saved(&saved).unwrap();
+
+        assert_eq!(new.metrics().snapshot().total, 3);
+        assert_eq!(
+            logged_names(&stats),
+            [
+                (1, "a1.example.".to_string()),
+                (2, "a2.example.".to_string()),
+                (3, "b1.example.".to_string())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn stat_event_keeps_slot_memory_compact() {
