@@ -4,16 +4,20 @@
 //! build. A version swapped in by an update, in contrast, starts on trial: committed once ready,
 //! and if it exits before that, the install path is restored to the previous executable and exec'd.
 //!
+//! An update applied while the server runs is handed over to a process started beside it, and no
+//! query may fail meanwhile.
+//!
 //! The real binary is copied to a temporary directory and run both supervised and as a single
 //! process.
 #![cfg(target_os = "linux")]
 
-use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, UdpSocket};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -185,11 +189,11 @@ impl Server {
         self.log.lock().expect("기록 잠금").join("\n")
     }
 
-    /// Kills `pid` only when it runs this test's binary.
-    fn kill_if_ours(&self, pid: i32) {
+    /// Signals `pid` only when it runs this test's binary.
+    fn signal_if_ours(&self, pid: i32, signal: libc::c_int) {
         if argv0(pid).as_deref() == Some(self.program.as_os_str().as_bytes()) {
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
+                libc::kill(pid, signal);
             }
         }
     }
@@ -210,7 +214,7 @@ impl Drop for Server {
         let _ = self.process.kill();
         let _ = self.process.wait();
         for pid in &self.children {
-            self.kill_if_ours(*pid);
+            self.signal_if_ours(*pid, libc::SIGKILL);
         }
     }
 }
@@ -579,4 +583,290 @@ fn cli_rollback_without_an_update_leaves_the_directory_alone() {
         "{stderr}"
     );
     assert_eq!(listing(dir), before);
+}
+
+/// Answered from `rewrites`, so no query leaves the machine.
+const LOCAL_NAME: &str = "handoff.test";
+const CONTROL_TOKEN: &str = "handoff-test-control-token-0123456789";
+/// A query unanswered this long counts as lost.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
+/// Keeps the TCP lanes from piling up TIME_WAIT sockets.
+const QUERY_PACE: Duration = Duration::from_millis(20);
+
+fn write_handoff_config(dir: &Path, dns_port: u16, control_port: u16) -> PathBuf {
+    let config = dir.join("onetdns.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "listen = [\"127.0.0.1:{dns_port}\"]\ncontrol_listen = \"127.0.0.1:{control_port}\"\ncontrol_token = \"{CONTROL_TOKEN}\"\nrewrites = [{{ domain = \"{LOCAL_NAME}\", answer = \"192.0.2.1\" }}]\n"
+        ),
+    )
+    .expect("설정을 쓰지 못했습니다");
+    config
+}
+
+/// Starts a rollback through the management API, as the dashboard does, once the API takes it.
+fn request_rollback(control_port: u16) {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        match post(control_port, "/v1/system/update/rollback") {
+            Ok(response) if response.starts_with("HTTP/1.1 200") => return,
+            Ok(response) if !response.starts_with("HTTP/1.1 503") => {
+                panic!("되돌리기 요청이 거절됐습니다:\n{response}")
+            }
+            _ if Instant::now() >= deadline => panic!("관리 API 가 되돌리기 요청을 받지 않습니다"),
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn post(port: u16, path: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(EVENT_TIMEOUT))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {CONTROL_TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+/// An A query for LOCAL_NAME.
+fn query(id: u16) -> Vec<u8> {
+    let mut message = id.to_be_bytes().to_vec();
+    message.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in LOCAL_NAME.split('.') {
+        message.push(label.len() as u8);
+        message.extend_from_slice(label.as_bytes());
+    }
+    message.extend_from_slice(&[0, 0, 1, 0, 1]);
+    message
+}
+
+fn check_answer(id: u16, answer: &[u8]) -> Result<(), String> {
+    if answer.len() < 12 || answer[..2] != id.to_be_bytes() || answer[2] & 0x80 == 0 {
+        return Err(format!("질의 {id} 의 응답이 아닙니다: {answer:?}"));
+    }
+    let rcode = answer[3] & 0x0f;
+    let answers = u16::from_be_bytes([answer[6], answer[7]]);
+    if rcode != 0 || answers == 0 {
+        return Err(format!(
+            "질의 {id} 의 응답 코드 {rcode}, 응답 레코드 {answers}개"
+        ));
+    }
+    Ok(())
+}
+
+fn ask_udp(socket: &UdpSocket, id: u16) -> Result<(), String> {
+    socket
+        .send(&query(id))
+        .map_err(|error| format!("UDP 질의 {id} 를 보내지 못했습니다: {error}"))?;
+    let mut answer = [0u8; 512];
+    let length = socket
+        .recv(&mut answer)
+        .map_err(|error| format!("UDP 질의 {id} 의 응답이 없습니다: {error}"))?;
+    check_answer(id, &answer[..length])
+}
+
+fn ask_tcp(port: u16, id: u16) -> Result<(), String> {
+    let exchange = || -> std::io::Result<Vec<u8>> {
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), ANSWER_TIMEOUT)?;
+        stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+        let message = query(id);
+        let mut framed = (message.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&message);
+        stream.write_all(&framed)?;
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length)?;
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(length))];
+        stream.read_exact(&mut answer)?;
+        Ok(answer)
+    };
+    let answer = exchange().map_err(|error| format!("TCP 질의 {id} 가 실패했습니다: {error}"))?;
+    check_answer(id, &answer)
+}
+
+#[derive(Default)]
+struct Tally {
+    answered: u64,
+    failures: Vec<String>,
+}
+
+/// Asks for LOCAL_NAME until finished: two lanes over UDP, two over a new TCP connection per query.
+struct Load {
+    stop: Arc<AtomicBool>,
+    lanes: Vec<std::thread::JoinHandle<Tally>>,
+}
+
+impl Load {
+    fn start(port: u16) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let lanes = (0..4)
+            .map(|lane| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let udp = (lane % 2 == 0).then(|| {
+                        let socket =
+                            UdpSocket::bind("127.0.0.1:0").expect("UDP 소켓을 열지 못했습니다");
+                        socket
+                            .connect(("127.0.0.1", port))
+                            .expect("UDP 소켓을 연결하지 못했습니다");
+                        socket
+                            .set_read_timeout(Some(ANSWER_TIMEOUT))
+                            .expect("UDP 대기 시간");
+                        socket
+                    });
+                    let mut tally = Tally::default();
+                    let mut id: u16 = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        id = id.wrapping_add(1);
+                        let asked = match &udp {
+                            Some(socket) => ask_udp(socket, id),
+                            None => ask_tcp(port, id),
+                        };
+                        match asked {
+                            Ok(()) => tally.answered += 1,
+                            Err(error) => tally.failures.push(error),
+                        }
+                        std::thread::sleep(QUERY_PACE);
+                    }
+                    tally
+                })
+            })
+            .collect();
+        Self { stop, lanes }
+    }
+
+    fn finish(mut self) -> Tally {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut total = Tally::default();
+        for lane in std::mem::take(&mut self.lanes) {
+            let tally = lane.join().expect("질의 스레드가 패닉했습니다");
+            total.answered += tally.answered;
+            total.failures.extend(tally.failures);
+        }
+        total
+    }
+}
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn children_of(parent: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let ppid: i32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+fn assert_no_query_failed(load: Load, server: &Server) {
+    let tally = load.finish();
+    assert!(
+        tally.failures.is_empty(),
+        "질의 {}개가 답을 받았고 {}개가 실패했습니다: {:?}\n{}",
+        tally.answered,
+        tally.failures.len(),
+        tally.failures,
+        server.log_text()
+    );
+    assert!(tally.answered > 0, "답을 받은 질의가 없습니다");
+}
+
+#[test]
+/// A rollback through the management API starts the previous executable beside the running worker,
+/// which hands its sockets over. Queries over UDP and TCP keep being answered throughout, and the
+/// supervisor then runs from the install path with the successor as its only child.
+fn an_update_hands_over_without_failing_a_query() {
+    let scratch = ScratchDir::create();
+    let dir = &scratch.0;
+    let swapped = Swapped::prepare(dir);
+    swapped.commit();
+    let (dns_port, control_port) = (free_port(), free_port());
+    let config = write_handoff_config(dir, dns_port, control_port);
+
+    let mut server = Server::supervised(dir, swapped.program.clone(), &config);
+    let first = server.wait_for("server.ready", None);
+    server.children.push(first);
+    let load = Load::start(dns_port);
+    request_rollback(control_port);
+    server.wait_for_own("supervisor.update_exec");
+    let children = children_of(server.pid());
+    server.children.extend(&children);
+    // Lets the successor answer under the supervisor's new image for a while.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_no_query_failed(load, &server);
+
+    assert!(
+        children.len() == 1 && children[0] != first,
+        "감독자의 자식 {children:?}, 이전 작업 프로세스 {first}"
+    );
+    let record = swapped.record_text();
+    assert!(record.contains("state=committed\n"), "{record}");
+    assert_eq!(
+        sha256_hex(&swapped.program),
+        swapped.previous_sha256,
+        "설치 경로"
+    );
+}
+
+#[test]
+/// The successor is stopped as soon as its trial begins, before the running worker notices the
+/// link on its next wake and gives it sockets, and killed once the handoff starts. The running
+/// worker takes its sockets back and serves on, and the rollback is put back.
+fn a_successor_that_dies_during_the_handoff_fails_no_query() {
+    let scratch = ScratchDir::create();
+    let dir = &scratch.0;
+    let swapped = Swapped::prepare(dir);
+    swapped.commit();
+    let (dns_port, control_port) = (free_port(), free_port());
+    let config = write_handoff_config(dir, dns_port, control_port);
+
+    let mut server = Server::supervised(dir, swapped.program.clone(), &config);
+    let first = server.wait_for("server.ready", None);
+    server.children.push(first);
+    let load = Load::start(dns_port);
+    request_rollback(control_port);
+    server.wait_for_own("update.trial_started");
+    let successor = children_of(server.pid())
+        .into_iter()
+        .find(|pid| *pid != first)
+        .expect("후속 프로세스가 없습니다");
+    server.signal_if_ours(successor, libc::SIGSTOP);
+    assert_eq!(server.wait_for("handoff.started", None), first);
+    server.signal_if_ours(successor, libc::SIGKILL);
+    server.wait_for_own("update.reverted");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_no_query_failed(load, &server);
+
+    assert_eq!(children_of(server.pid()), vec![first]);
+    let record = swapped.record_text();
+    assert!(record.contains("state=reverted\n"), "{record}");
+    assert!(
+        record.contains("reason=The new version exited before it became ready"),
+        "{record}"
+    );
+    assert_eq!(
+        sha256_hex(&swapped.program),
+        swapped.new_sha256,
+        "설치 경로"
+    );
 }
