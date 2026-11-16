@@ -860,7 +860,7 @@ fn json_u64(object: &Json, key: &str) -> Result<u64, String> {
 }
 
 /// Reads a JSON number as an exact u64. Counters can exceed what a float holds exactly.
-fn exact_u64(value: &Json) -> Result<u64, String> {
+pub(crate) fn exact_u64(value: &Json) -> Result<u64, String> {
     if let Some(text) = value.as_str() {
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err("Must be a non-negative decimal integer".to_string());

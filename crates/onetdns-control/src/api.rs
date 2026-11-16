@@ -910,11 +910,19 @@ pub enum Role {
 }
 
 impl Role {
-    /// Name used in the audit log.
+    /// Name used in the audit log and in exported sessions.
     fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",
             Role::ReadOnly => "readonly",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Role> {
+        match name {
+            "admin" => Some(Role::Admin),
+            "readonly" => Some(Role::ReadOnly),
+            _ => None,
         }
     }
 
@@ -965,6 +973,66 @@ impl SessionStore {
     pub fn restore(&self, checkpoint: SessionCheckpoint) {
         *self.0.lock_recover() = checkpoint.0;
     }
+}
+
+/// Bumped with the handoff protocol version when the format changes.
+const SESSIONS_VERSION: u64 = 1;
+
+/// `{"version":1,"sessions":[[key, role, name, credential, idle_expires_ms, absolute_expires_ms]]}`;
+/// rejects the whole state on any deviation.
+fn decode_sessions(state: &[u8]) -> Result<Vec<([u8; 32], Session)>, String> {
+    let text = std::str::from_utf8(state).map_err(|_| "The sessions are not valid text")?;
+    let top = json::parse(text)?;
+    let json::Json::Obj(fields) = &top else {
+        return Err("The sessions must be an object".to_string());
+    };
+    if fields.len() != 2
+        || fields
+            .iter()
+            .any(|(key, _)| !matches!(key.as_str(), "version" | "sessions"))
+    {
+        return Err("The sessions do not match the current format".to_string());
+    }
+    if top.get("version").and_then(json::Json::as_u64) != Some(SESSIONS_VERSION) {
+        return Err(format!(
+            "The sessions format version must be {SESSIONS_VERSION}"
+        ));
+    }
+    let entries = top
+        .get("sessions")
+        .and_then(json::Json::as_array)
+        .ok_or("The sessions must be an array")?;
+    if entries.len() > MAX_SESSIONS {
+        return Err(format!("More than {MAX_SESSIONS} sessions"));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let fail = |what: &str| format!("sessions[{index}]: {what}");
+            let values = entry
+                .as_array()
+                .filter(|values| values.len() == 6)
+                .ok_or_else(|| fail("must be an array of six entries"))?;
+            let text = |at: usize, what: &str| values[at].as_str().ok_or_else(|| fail(what));
+            let digest = parse_hex32(text(0, "the key must be a string")?)
+                .ok_or_else(|| fail("the key must be 64 lowercase hex digits"))?;
+            let role = Role::from_name(text(1, "the role must be a string")?)
+                .ok_or_else(|| fail("unknown role"))?;
+            let expiry =
+                |at: usize| crate::persist::exact_u64(&values[at]).map_err(|reason| fail(&reason));
+            Ok((
+                digest,
+                Session {
+                    role,
+                    name: text(2, "the name must be a string")?.to_string(),
+                    credential_id: text(3, "the credential must be a string")?.to_string(),
+                    idle_expires_ms: expiry(4)?,
+                    absolute_expires_ms: expiry(5)?,
+                },
+            ))
+        })
+        .collect()
 }
 
 const SESSION_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
@@ -1170,6 +1238,50 @@ impl Auth {
                 && session.absolute_expires_ms > now
                 && valid.get(&session.credential_id) == Some(&session.role)
         });
+    }
+
+    /// The sessions still valid, for a successor process. They are keyed by digests under this
+    /// process's credential key, so only a process sharing that key can use them.
+    pub fn export_sessions(&self) -> Vec<u8> {
+        let now = now_ms();
+        let sessions = self.sessions.0.lock_recover();
+        let entries: Vec<String> = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.idle_expires_ms > now && session.absolute_expires_ms > now
+            })
+            .map(|(digest, session)| {
+                let mut key = String::with_capacity(64);
+                push_hex(&mut key, digest);
+                format!(
+                    "[\"{key}\",\"{}\",{},{},\"{}\",\"{}\"]",
+                    session.role.as_str(),
+                    json::escape(&session.name),
+                    json::escape(&session.credential_id),
+                    session.idle_expires_ms,
+                    session.absolute_expires_ms
+                )
+            })
+            .collect();
+        format!(
+            "{{\"version\":{SESSIONS_VERSION},\"sessions\":[{}]}}",
+            entries.join(",")
+        )
+        .into_bytes()
+    }
+
+    /// Adds the sessions a predecessor exported, then drops those this process's tokens and
+    /// accounts no longer allow.
+    pub fn adopt_sessions(&self, state: &[u8]) -> Result<(), String> {
+        let adopted = decode_sessions(state)?;
+        {
+            let mut sessions = self.sessions.0.lock_recover();
+            for (digest, session) in adopted {
+                sessions.entry(digest).or_insert(session);
+            }
+        }
+        self.reconcile_sessions();
+        Ok(())
     }
 
     pub fn has_users(&self) -> bool {
@@ -1669,15 +1781,36 @@ fn credential_digest(prefix: &str, parts: &[&str]) -> [u8; 32] {
 
 /// Short form of the digest for the audit log.
 fn credential_fingerprint_from_digest(prefix: &str, digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut id = String::with_capacity(prefix.len() + 21);
     id.push_str(prefix);
     id.push('-');
-    for byte in digest.iter().take(10) {
-        id.push(HEX[(byte >> 4) as usize] as char);
-        id.push(HEX[(byte & 0x0f) as usize] as char);
-    }
+    push_hex(&mut id, &digest[..10]);
     id
+}
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+}
+
+fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *slot = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Some(out)
 }
 
 fn credential_fingerprint(prefix: &str, parts: &[&str]) -> String {
@@ -6437,6 +6570,53 @@ mod tests {
         assert_eq!(auth2.role_for_session(&session), None);
         store.restore(checkpoint);
         assert_eq!(auth1.role_for_session(&session), Some(Role::Admin));
+    }
+
+    #[test]
+    /// The successor accepts the predecessor's session tokens, except those its own accounts no
+    /// longer allow.
+    fn exported_sessions_sign_in_on_the_successor_while_their_credential_stands() {
+        let alice = UserCred {
+            name: "alice".into(),
+            hash: "password-hash".into(),
+            role: Role::Admin,
+        };
+        let running = Auth::new(vec![], vec![]).with_users(vec![alice.clone()]);
+        let session =
+            running.issue_session(alice.role, alice.name.clone(), user_credential_id(&alice));
+        let exported = running.export_sessions();
+
+        let successor = Auth::new(vec![], vec![]).with_users(vec![alice.clone()]);
+        successor.adopt_sessions(&exported).unwrap();
+        assert_eq!(successor.role_for_session(&session), Some(Role::Admin));
+
+        let changed = UserCred {
+            hash: "new-password-hash".into(),
+            ..alice
+        };
+        let successor = Auth::new(vec![], vec![]).with_users(vec![changed]);
+        successor.adopt_sessions(&exported).unwrap();
+        assert_eq!(successor.role_for_session(&session), None);
+    }
+
+    #[test]
+    fn exported_sessions_off_the_format_are_rejected_whole() {
+        let key = "ab".repeat(32);
+        let good =
+            format!(r#"{{"version":1,"sessions":[["{key}","admin","alice","user-1","1","2"]]}}"#);
+        assert_eq!(decode_sessions(good.as_bytes()).unwrap().len(), 1);
+        for broken in [
+            good.replace(r#""version":1"#, r#""version":2"#),
+            good.replace(r#""sessions":"#, r#""extra":0,"sessions":"#),
+            good.replace(&key, &"AB".repeat(32)),
+            good.replace(&key, &"ab".repeat(31)),
+            good.replace(r#""admin""#, r#""root""#),
+            good.replace(r#""1","2""#, r#"1,"2""#),
+            good.replace(r#""1","2""#, r#""1","2","3""#),
+            good.replace(r#""alice""#, "7"),
+        ] {
+            assert!(decode_sessions(broken.as_bytes()).is_err(), "{broken}");
+        }
     }
 
     #[test]
