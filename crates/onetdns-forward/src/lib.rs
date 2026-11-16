@@ -754,6 +754,23 @@ impl ForwardStats {
         }
     }
 
+    /// Adds counts another process observed. The latency average stays this process's when it has
+    /// samples of its own, as they are newer.
+    pub fn add(&self, reports: &[UpstreamStatReport]) {
+        for (label, stat) in self.labels.iter().zip(self.stats.iter()) {
+            let Some(r) = reports.iter().find(|r| &r.label == label) else {
+                continue;
+            };
+            let mut s = stat.lock().unwrap_or_else(|error| error.into_inner());
+            if s.samples == 0 {
+                s.ewma_ms = r.ewma_ms;
+            }
+            s.samples = s.samples.saturating_add(r.queries);
+            s.ok = s.ok.saturating_add(r.ok);
+            s.fail = s.fail.saturating_add(r.fail);
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<UpstreamStatReport> {
         self.labels
             .iter()
@@ -3151,6 +3168,29 @@ mod tests {
         live.record_upstream_result(0, Duration::from_millis(30), true);
         live.stats_handle().seed(&prev);
         assert_eq!(live.stats_handle().snapshot()[0].queries, 2, "라이브 우선");
+    }
+
+    #[test]
+    fn added_counts_sum_and_the_latency_average_stays_with_own_samples() {
+        let good: SocketAddr = "127.0.0.1:53001".parse().unwrap();
+        let elsewhere = Forwarder::new(vec![good], Duration::from_secs(3));
+        elsewhere.record_upstream_result(0, Duration::from_millis(100), true);
+        elsewhere.record_upstream_result(0, Duration::from_millis(100), false);
+        let observed = elsewhere.stats_handle().snapshot();
+
+        let idle = Forwarder::new(vec![good], Duration::from_secs(3));
+        idle.stats_handle().add(&observed);
+        let snap = idle.stats_handle().snapshot();
+        assert_eq!((snap[0].queries, snap[0].ok, snap[0].fail), (2, 1, 1));
+        assert_eq!(snap[0].ewma_ms, observed[0].ewma_ms);
+
+        let live = Forwarder::new(vec![good], Duration::from_secs(3));
+        live.record_upstream_result(0, Duration::from_millis(10), true);
+        let own = live.stats_handle().snapshot()[0].ewma_ms;
+        live.stats_handle().add(&observed);
+        let snap = live.stats_handle().snapshot();
+        assert_eq!((snap[0].queries, snap[0].ok, snap[0].fail), (3, 2, 1));
+        assert_eq!(snap[0].ewma_ms, own);
     }
 
     #[test]
