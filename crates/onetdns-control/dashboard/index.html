@@ -4888,7 +4888,7 @@ class Component extends DCLogic {
   };
 
   state = {
-    theme: (this.props.defaultTheme || 'light'),
+    theme: this.initialTheme(),
     lang: this.normalizeLang((typeof localStorage!=='undefined' && localStorage.getItem('onetdns_lang')) || (typeof navigator!=='undefined'?navigator.language:'ko')),
     view: 'dashboard',
     quickSettingsOpen:false,
@@ -4955,6 +4955,7 @@ class Component extends DCLogic {
 
   componentDidMount(){
     if(typeof document!=='undefined') document.documentElement.lang=this.state.lang;
+    this.applyDocumentTheme(this.state.theme);
     this._qWin=0;
     this._bWin=0;
     this._lastTick=Date.now();
@@ -6080,8 +6081,8 @@ class Component extends DCLogic {
       : React.createElement('svg',{width:15,height:15,viewBox:'0 0 24 24',fill:'currentColor'},React.createElement('path',{d:'M6 4h4v16H6zM14 4h4v16h-4z'}));
   }
 
-  themeTokens(){
-    if(this.state.theme==='dark') return {
+  themeTokens(theme){
+    if((theme||this.state.theme)==='dark') return {
       '--bg':'#16130d','--surface':'#16130d','--surface2':'#221d14','--surface3':'#2c261b','--border':'#2c261b','--fg':'#f1ece0','--fg2':'#cdc6b6','--muted':'#a69e8d','--faint':'#a69e8d',
       '--accent':'#8fa6c8','--accent-bg':'#1d2230','--accent-bd':'#333d52',
       '--ok':'#5aab73','--ok-bg':'#16271b','--block':'#df6f5f','--block-bg':'#2b1815','--warn':'#cf9f48','--warn-bg':'#281f10','--violet':'#b39ac0','--violet-bg':'#231b29',
@@ -6158,7 +6159,24 @@ class Component extends DCLogic {
     return H[v]||['',[]];
   }
 
-  toggleTheme=()=>this.setState(s=>({theme:s.theme==='dark'?'light':'dark'}));
+  initialTheme(){
+    try{const saved=localStorage.getItem('onetdns_theme');if(saved==='dark'||saved==='light')return saved;}catch(e){}
+    if(typeof matchMedia!=='undefined'&&matchMedia('(prefers-color-scheme: dark)').matches)return 'dark';
+    return this.props.defaultTheme||'light';
+  }
+  // The page outside the app shell and native form controls follow the theme too.
+  applyDocumentTheme(theme){
+    if(typeof document==='undefined')return;
+    const root=document.documentElement;
+    root.style.colorScheme=theme;
+    root.style.background=this.themeTokens(theme)['--bg'];
+  }
+  toggleTheme=()=>this.setState(s=>{
+    const next=s.theme==='dark'?'light':'dark';
+    try{localStorage.setItem('onetdns_theme',next);}catch(e){}
+    this.applyDocumentTheme(next);
+    return {theme:next};
+  });
   toggleQuickSettings=()=>this.setState(s=>({quickSettingsOpen:!s.quickSettingsOpen}));
   toggleFeed=()=>{
     if(!this.state.feedPaused){this.setState({feedPaused:true});return;}
