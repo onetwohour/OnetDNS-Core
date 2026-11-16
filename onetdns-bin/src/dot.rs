@@ -8,9 +8,8 @@ use std::io::{self, Read, Write};
 #[cfg(test)]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use onetdns_core::tcp::DeadlineTcp;
@@ -19,237 +18,70 @@ use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 use onetdns_tls::{server_handshake, ServerConfig, TlsConnection, TlsError};
 
 use crate::connection_limit::{
-    poll_pending_encrypted_connections, spawn_bounded_connection_thread, wake_tcp_listener,
-    AdmissionProtocol, ConnectionLimiter, ConnectionTracker, PendingEncryptedConnection,
-    PrefixedTcp, ENCRYPTED_ACCEPT_BATCH,
+    spawn_bounded_connection_thread, AdmissionProtocol, AdmittedConnection, ConnectionLimiter,
+    ConnectionSignals, EncryptedTcpListener, PrefixedTcp,
 };
 use crate::native::NativeServer;
 use crate::transport_observe;
-
-/// Stops the listener and joins its threads when dropped.
-pub struct DotListener {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
 
 /// Time for one handshake, or for one query and its answer; also the idle limit between queries. A
 /// connection silent this long is idle and closed.
 const DOT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl DotListener {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-}
-
-impl Drop for DotListener {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        wake_tcp_listener(self.addr);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
+/// Serves DoT on `listener`, already bound.
 pub fn serve_dot(
-    addr: SocketAddr,
+    listener: TcpListener,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     admission: Arc<ConnectionLimiter>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) -> io::Result<DotListener> {
-    let listener = TcpListener::bind(addr)?;
-    let bound = listener.local_addr()?;
-    let tracker = ConnectionTracker::new();
-    let stop = Arc::new(AtomicBool::new(false));
-    let listener_stop = stop.clone();
-    let listener_shutdown = shutdown.clone();
-    let thread = std::thread::Builder::new()
-        .name("dot-listener".into())
-        .spawn(move || {
-            let mut pending = Vec::new();
-            let mut listener_nonblocking = false;
-            while !listener_shutdown.load(Ordering::Relaxed)
-                && !listener_stop.load(Ordering::Relaxed)
-            {
-                let mut accepted = 0usize;
-                if pending.is_empty() {
-                    if listener_nonblocking {
-                        if let Err(error) = listener.set_nonblocking(false) {
-                            transport_observe::record_error(
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<EncryptedTcpListener> {
+    let drops = handler.clone();
+    EncryptedTcpListener::spawn(
+        listener,
+        "dot",
+        AdmissionProtocol::Tls,
+        admission,
+        move |source| drops.drops_source(source),
+        Some(shutdown),
+        move |connection: AdmittedConnection| {
+            let peer = connection.peer;
+            let tls = tls.clone();
+            let handler = handler.clone();
+            let spawned = spawn_bounded_connection_thread("dot-connection", move || {
+                let AdmittedConnection {
+                    stream,
+                    signals,
+                    hold: _hold,
+                    ..
+                } = connection;
+                let result = onetdns_core::isolation::catch_request(|| {
+                    serve_conn(stream, &tls.load(), &handler, &signals, DOT_IO_TIMEOUT)
+                });
+                if let Ok(Err(error)) = result {
+                    if !signals.stopping() {
+                        match error {
+                            ConnError::Tls(error) => transport_observe::record_error(
                                 "dot",
-                                "set_listener_blocking",
-                                None,
-                                error,
-                            );
-                            break;
-                        }
-                        listener_nonblocking = false;
-                    }
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            if listener_shutdown.load(Ordering::Relaxed)
-                                || listener_stop.load(Ordering::Relaxed)
-                            {
-                                break;
-                            }
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Tls,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "dot",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "dot",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                            accepted = 1;
-                        }
-                        Err(error) => {
-                            transport_observe::record_error("dot", "accept", None, error);
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                    }
-                }
-
-                if !listener_nonblocking {
-                    if let Err(error) = listener.set_nonblocking(true) {
-                        transport_observe::record_error(
-                            "dot",
-                            "set_listener_nonblocking",
-                            None,
-                            error,
-                        );
-                        break;
-                    }
-                    listener_nonblocking = true;
-                }
-                while accepted < ENCRYPTED_ACCEPT_BATCH {
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            accepted += 1;
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Tls,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "dot",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "dot",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            transport_observe::record_error("dot", "accept", None, error);
-                            break;
-                        }
-                    }
-                }
-
-                poll_pending_encrypted_connections(
-                    &mut pending,
-                    |stream, peer, guard| {
-                        let tls = tls.clone();
-                        let handler = handler.clone();
-                        let connection_shutdown = listener_shutdown.clone();
-                        let connection_stop = listener_stop.clone();
-                        let activity = tracker.track();
-                        match spawn_bounded_connection_thread("dot-connection", move || {
-                            let _guards = (guard, activity);
-                            let result = onetdns_core::isolation::catch_request(|| {
-                                serve_conn(
-                                    stream,
-                                    &tls.load(),
-                                    &handler,
-                                    connection_shutdown.clone(),
-                                    connection_stop.clone(),
-                                    DOT_IO_TIMEOUT,
-                                )
-                            });
-                            if let Ok(Err(error)) = result {
-                                if !connection_shutdown.load(Ordering::Relaxed)
-                                    && !connection_stop.load(Ordering::Relaxed)
-                                {
-                                    match error {
-                                        ConnError::Tls(error) => transport_observe::record_error(
-                                            "dot",
-                                            "connection",
-                                            Some(peer),
-                                            error,
-                                        ),
-                                        ConnError::Dns(stage, detail) => {
-                                            transport_observe::record_error(
-                                                "dot",
-                                                stage,
-                                                Some(peer),
-                                                detail,
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }) {
-                            Ok(connection) => drop(connection),
-                            Err(error) => transport_observe::record_error(
-                                "dot",
-                                "thread_spawn",
+                                "connection",
                                 Some(peer),
                                 error,
                             ),
+                            ConnError::Dns(stage, detail) => {
+                                transport_observe::record_error("dot", stage, Some(peer), detail)
+                            }
                         }
-                    },
-                    |peer, error| {
-                        transport_observe::record_error(
-                            "dot",
-                            "handshake_admission",
-                            Some(peer),
-                            error,
-                        )
-                    },
-                );
-                if !pending.is_empty() {
-                    thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            });
+            match spawned {
+                Ok(thread) => drop(thread),
+                Err(error) => {
+                    transport_observe::record_error("dot", "thread_spawn", Some(peer), error)
                 }
             }
-            drop(pending);
-            tracker.wait_until_idle();
-        })?;
-    Ok(DotListener {
-        addr: bound,
-        stop,
-        thread: Some(thread),
-    })
+        },
+    )
 }
 
 /// On a TLS failure, the TLS layer has already sent its alert. A broken DNS exchange is still fine
@@ -271,15 +103,12 @@ fn serve_conn(
     stream: PrefixedTcp,
     tls: &ServerConfig,
     handler: &NativeServer,
-    shutdown: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    signals: &ConnectionSignals,
     io_timeout: Duration,
 ) -> Result<(), ConnError> {
     let src = stream.peer_addr().map_err(|_| TlsError::Io)?;
 
-    let mut stream = DeadlineTcp::new(stream, Instant::now() + io_timeout)
-        .stop_on(shutdown)
-        .stop_on(stop);
+    let mut stream = signals.watch(DeadlineTcp::new(stream, Instant::now() + io_timeout));
     let mut conn = server_handshake(&mut stream, tls)?;
     let served = serve_queries(&mut conn, &mut stream, handler, src, io_timeout);
     send_close_notify_without_waiting(&mut conn, &mut stream.into_inner());
@@ -438,11 +267,13 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::UdpSocket;
+    use std::sync::atomic::Ordering;
+    use std::thread;
 
     #[test]
     fn dropping_dot_listener_joins_idle_handshake() {
         let listener = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
             native_handler(),
             Arc::new(ConnectionLimiter::default()),
@@ -553,7 +384,7 @@ mod tests {
         let handler = native_handler();
         let tls = self_signed_tls();
         let listener = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             Arc::new(ConnectionLimiter::default()),
@@ -613,7 +444,7 @@ mod tests {
     /// Common clients such as dig close this way.
     fn dot_eof_between_messages_is_not_counted_as_an_error() {
         let listener = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
             native_handler(),
             Arc::new(ConnectionLimiter::default()),
@@ -665,7 +496,7 @@ mod tests {
     /// from a truncated response. The error counts against the DNS stage, not TLS.
     fn dot_dns_framing_error_closes_with_close_notify() {
         let listener = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
             native_handler(),
             Arc::new(ConnectionLimiter::default()),
@@ -754,13 +585,17 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         let tls = self_signed_tls();
         let handler = native_handler();
+        let signals = ConnectionSignals {
+            shutdown: Some(shutdown),
+            stop,
+            ..ConnectionSignals::default()
+        };
         let serving = thread::spawn(move || {
             serve_conn(
                 PrefixedTcp::new(server, Vec::new()),
                 &tls,
                 &handler,
-                shutdown,
-                stop,
+                &signals,
                 io_timeout,
             )
         });
@@ -919,7 +754,7 @@ mod tests {
         let handler = native_handler();
         let tls = self_signed_tls();
         let l = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             Arc::new(ConnectionLimiter::default()),
@@ -941,7 +776,7 @@ mod tests {
         let handler = native_handler();
         let tls = self_signed_tls();
         let l = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             Arc::new(ConnectionLimiter::default()),
@@ -978,7 +813,7 @@ mod tests {
     /// Whether the handshake finished, and how many bytes the server sent.
     fn dot_handshake_under(acl: IpAcl) -> (bool, usize) {
         let listener = serve_dot(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             Arc::new(onetdns_core::ArcSwap::new(self_signed_tls())),
             native_handler_with(acl),
             Arc::new(ConnectionLimiter::default()),

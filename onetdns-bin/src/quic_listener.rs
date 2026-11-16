@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use onetdns_core::admission::{shrink_if_sparse, ClientCounts};
+use onetdns_core::tcp::DRAIN_LIMIT;
 use onetdns_core::udp::RecvWait;
 use onetdns_proto::Message;
 use onetdns_quic::params::TransportParams;
@@ -136,6 +137,10 @@ pub(crate) trait QuicService: Send + 'static {
     /// Keeps the first reason on a connection already closed. Dropping without notice would leave
     /// the peer waiting for its own idle timeout.
     fn abandon(conn: &mut Self::Conn, why: Abandon);
+    /// Tells the peer that new requests will not be processed. DoQ has no such message.
+    fn go_away(_conn: &mut Self::Conn) -> Result<(), QuicError> {
+        Ok(())
+    }
 }
 
 /// Whether the connection stays usable after a failed send, closing it if not. A stream the peer
@@ -222,32 +227,51 @@ pub(crate) struct QuicListener {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Kept so `socket` can hand it on; closed when the listener stops reading.
+    socket: Option<UdpSocket>,
 }
 
 impl QuicListener {
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
     }
-}
 
-impl Drop for QuicListener {
-    fn drop(&mut self) {
+    /// A duplicate of the listening socket, which stays open after this listener stops.
+    pub(crate) fn socket(&self) -> io::Result<UdpSocket> {
+        match &self.socket {
+            Some(socket) => socket.try_clone(),
+            None => Err(io::Error::other("the listener has stopped reading")),
+        }
+    }
+
+    /// Ends the connections, answering the queries in flight for at most DRAIN_LIMIT first, and
+    /// closes this listener's handles to the socket. Connection state lives in the receive loop, so
+    /// nothing is left to serve afterwards.
+    pub(crate) fn stop_reading(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.socket = None;
     }
 }
 
+impl Drop for QuicListener {
+    fn drop(&mut self) {
+        self.stop_reading();
+    }
+}
+
+/// Serves on `socket`, already bound.
 pub(crate) fn serve<S: QuicService>(
     service: S,
-    addr: SocketAddr,
+    socket: UdpSocket,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     shutdown: Arc<AtomicBool>,
     memory_budget: Arc<QuicMemoryBudget>,
 ) -> io::Result<QuicListener> {
-    let socket = onetdns_core::udp::bind(addr)?;
+    let kept = socket.try_clone()?;
     let bound = socket.local_addr()?;
     let stop = Arc::new(AtomicBool::new(false));
     let listener_stop = stop.clone();
@@ -277,6 +301,7 @@ pub(crate) fn serve<S: QuicService>(
                 retry_key: RetryKey::generate(),
                 next_epoch: 0,
                 clock: Instant::now(),
+                draining_until: None,
             }
             .run(wait)
         })?;
@@ -284,6 +309,7 @@ pub(crate) fn serve<S: QuicService>(
         addr: bound,
         stop,
         thread: Some(thread),
+        socket: Some(kept),
     })
 }
 
@@ -534,9 +560,54 @@ impl<S: QuicService> ConnTable<S> {
         }
     }
 
-    /// Sends a close on every open connection and drops them all. The socket closes too, so RFC
-    /// 9000 lets the closing period be skipped; without the close, clients would wait for their
-    /// idle timeout.
+    /// Tells every open connection's peer that new requests will not be processed, closing the
+    /// connection where that cannot be said.
+    fn go_away(&mut self, socket: &UdpSocket, now_ms: u64) {
+        let mut closed = Vec::new();
+        for (key, entry) in self.conns.iter_mut() {
+            let ConnState::Open(conn) = &mut entry.state else {
+                continue;
+            };
+            conn.set_now(now_ms);
+            if S::go_away(conn).is_err() {
+                S::abandon(conn, Abandon::Shutdown);
+            }
+            if !entry.settle::<S>(socket, "shutdown_send") {
+                closed.push(key.clone());
+            }
+        }
+        for key in closed {
+            self.retire(&key);
+        }
+    }
+
+    /// Closes the open connections with no query in flight. Returns whether any stays open.
+    fn close_finished(&mut self, socket: &UdpSocket, now_ms: u64) -> bool {
+        let mut closed = Vec::new();
+        let mut open = false;
+        for (key, entry) in self.conns.iter_mut() {
+            let ConnState::Open(conn) = &mut entry.state else {
+                continue;
+            };
+            if entry.inflight > 0 {
+                open = true;
+                continue;
+            }
+            conn.set_now(now_ms);
+            S::abandon(conn, Abandon::Shutdown);
+            flush(conn, entry.peer, socket, S::NAME, "shutdown_send");
+            closed.push(key.clone());
+        }
+        for key in closed {
+            self.retire(&key);
+        }
+        open
+    }
+
+    /// Sends a close on every open connection and drops them all without waiting out the closing
+    /// period. RFC 9000 allows that when late packets draw no reply, and a non-Initial packet for
+    /// an unknown connection gets none. Without the close, clients would wait for their idle
+    /// timeout.
     fn close_all(&mut self, socket: &UdpSocket, now_ms: u64) {
         for entry in self.conns.values_mut() {
             if let ConnState::Open(conn) = &mut entry.state {
@@ -566,6 +637,9 @@ struct Listener<S: QuicService> {
     next_epoch: u64,
     /// Origin of the connection clock.
     clock: Instant,
+    /// Set when the listener stops: no connection is taken after that, and the open ones close by
+    /// this time at the latest.
+    draining_until: Option<Instant>,
 }
 
 impl<S: QuicService> Listener<S> {
@@ -578,8 +652,16 @@ impl<S: QuicService> Listener<S> {
         let mut done: Vec<QueryDone> = Vec::new();
         let mut last_sweep = Instant::now();
         let mut last_timer = Instant::now();
-        while !self.control.should_stop() {
+        while !self.control.aborted() {
+            let drain_starts = self.draining_until.is_none() && self.control.should_stop();
+            if drain_starts {
+                self.draining_until = Some(Instant::now() + DRAIN_LIMIT);
+            }
             let maintenance = onetdns_core::isolation::catch_request(|| {
+                if drain_starts {
+                    let now_ms = self.now_ms();
+                    self.table.go_away(&self.socket, now_ms);
+                }
                 self.pool.drain_done(&mut done);
                 if !done.is_empty() {
                     let now_ms = self.now_ms();
@@ -595,10 +677,23 @@ impl<S: QuicService> Listener<S> {
                     self.table.evict_idle();
                     last_sweep = Instant::now();
                 }
+                if self.draining_until.is_none() {
+                    return true;
+                }
+                let now_ms = self.now_ms();
+                self.table.close_finished(&self.socket, now_ms)
             });
-            if maintenance.is_err() {
+            let serving = maintenance.unwrap_or_else(|_| {
                 self.table.clear();
                 done.clear();
+                self.draining_until.is_none()
+            });
+            if !serving
+                || self
+                    .draining_until
+                    .is_some_and(|until| Instant::now() >= until)
+            {
+                break;
             }
             let (n, peer) = match wait.recv_from(&self.socket, &mut buf) {
                 Ok(received) => received,
@@ -666,6 +761,10 @@ impl<S: QuicService> Listener<S> {
         let mut key = self.table.key_for(&dcid);
         *panic_key = Some(key.clone());
         if !self.table.conns.contains_key(&key) {
+            // A stopping listener takes no connection; the client resends its Initial to the next.
+            if self.draining_until.is_some() {
+                return;
+            }
             let Some(accepted) = self.accept(bytes, peer, dcid, now, panic_key) else {
                 return;
             };
@@ -998,6 +1097,7 @@ mod tests {
             retry_key: RetryKey::generate(),
             next_epoch: 0,
             clock: Instant::now(),
+            draining_until: None,
         }
     }
 

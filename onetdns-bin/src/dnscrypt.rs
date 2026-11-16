@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 #[cfg(test)]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,9 +15,8 @@ use onetdns_proto::{Message, Writer};
 use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 
 use crate::connection_limit::{
-    poll_pending_encrypted_connections, spawn_bounded_connection_thread, wake_tcp_listener,
-    AdmissionProtocol, ConnectionLimiter, ConnectionTracker, PendingEncryptedConnection,
-    PrefixedTcp, ENCRYPTED_ACCEPT_BATCH,
+    spawn_bounded_connection_thread, AdmissionProtocol, AdmittedConnection, ConnectionLimiter,
+    EncryptedTcpListener, PrefixedTcp,
 };
 use crate::native::NativeServer;
 use crate::transport_observe;
@@ -77,222 +76,59 @@ pub fn serve(
     onetdns_dnscrypt::server::serve(provider, socket, h, gate, &shutdown)
 }
 
-/// Stops the listener and joins its threads when dropped.
-pub struct DnscryptTcpListener {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for DnscryptTcpListener {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        wake_tcp_listener(self.addr);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Serves DNSCrypt over TCP, one transaction per connection as the spec requires.
+/// Serves DNSCrypt over TCP on `listener`, already bound, one transaction per connection as the
+/// spec requires.
 ///
 /// A length prefix over the limit closes the connection unread; allocating what it says would let
 /// any peer choose this server's memory use.
 pub fn serve_tcp(
-    addr: SocketAddr,
+    listener: TcpListener,
     handler: Arc<NativeServer>,
     provider: Provider,
     admission: Arc<ConnectionLimiter>,
-    shutdown: Arc<AtomicBool>,
-) -> io::Result<DnscryptTcpListener> {
-    let listener = TcpListener::bind(addr)?;
-    let bound = listener.local_addr()?;
-    let tracker = ConnectionTracker::new();
-    let stop = Arc::new(AtomicBool::new(false));
-    let listener_stop = stop.clone();
-    let listener_shutdown = shutdown.clone();
-    let thread = std::thread::Builder::new()
-        .name("dnscrypt-tcp-listener".into())
-        .spawn(move || {
-            let mut pending = Vec::new();
-            let mut listener_nonblocking = false;
-            while !listener_shutdown.load(Ordering::Relaxed)
-                && !listener_stop.load(Ordering::Relaxed)
-            {
-                let mut accepted = 0usize;
-                if pending.is_empty() {
-                    if listener_nonblocking {
-                        if let Err(error) = listener.set_nonblocking(false) {
-                            transport_observe::record_error(
-                                "dnscrypt",
-                                "set_listener_blocking",
-                                None,
-                                error,
-                            );
-                            break;
-                        }
-                        listener_nonblocking = false;
-                    }
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            if listener_shutdown.load(Ordering::Relaxed)
-                                || listener_stop.load(Ordering::Relaxed)
-                            {
-                                break;
-                            }
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Dnscrypt,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "dnscrypt",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "dnscrypt",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                            accepted = 1;
-                        }
-                        Err(error) => {
-                            transport_observe::record_error("dnscrypt", "accept", None, error);
-                            std::thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                    }
+) -> io::Result<EncryptedTcpListener> {
+    let drops = handler.clone();
+    EncryptedTcpListener::spawn(
+        listener,
+        "dnscrypt",
+        AdmissionProtocol::Dnscrypt,
+        admission,
+        move |source| drops.drops_source(source),
+        None,
+        move |connection: AdmittedConnection| {
+            let peer = connection.peer;
+            let provider = provider.clone();
+            let handler = handler.clone();
+            let spawned = spawn_bounded_connection_thread("dnscrypt-tcp-connection", move || {
+                let AdmittedConnection {
+                    stream,
+                    signals,
+                    hold: _hold,
+                    ..
+                } = connection;
+                let result = onetdns_core::isolation::catch_request(|| {
+                    serve_conn(
+                        signals.watch(DeadlineTcp::new(
+                            stream,
+                            std::time::Instant::now() + IO_TIMEOUT,
+                        )),
+                        peer,
+                        &provider,
+                        &handler,
+                    )
+                });
+                if let Ok(Err(error)) = result {
+                    transport_observe::record_error("dnscrypt", "connection", Some(peer), error);
                 }
-
-                if !listener_nonblocking {
-                    if let Err(error) = listener.set_nonblocking(true) {
-                        transport_observe::record_error(
-                            "dnscrypt",
-                            "set_listener_nonblocking",
-                            None,
-                            error,
-                        );
-                        break;
-                    }
-                    listener_nonblocking = true;
-                }
-                while accepted < ENCRYPTED_ACCEPT_BATCH {
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            accepted += 1;
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Dnscrypt,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "dnscrypt",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "dnscrypt",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            transport_observe::record_error("dnscrypt", "accept", None, error);
-                            break;
-                        }
-                    }
-                }
-
-                poll_pending_encrypted_connections(
-                    &mut pending,
-                    |stream, peer, guard| {
-                        let provider = provider.clone();
-                        let handler = handler.clone();
-                        let connection_shutdown = listener_shutdown.clone();
-                        let connection_stop = listener_stop.clone();
-                        let activity = tracker.track();
-                        let spawned =
-                            spawn_bounded_connection_thread("dnscrypt-tcp-connection", move || {
-                                let _guards = (guard, activity);
-                                let result = onetdns_core::isolation::catch_request(|| {
-                                    serve_conn(
-                                        connection_io(stream, connection_shutdown, connection_stop),
-                                        peer,
-                                        &provider,
-                                        &handler,
-                                    )
-                                });
-                                if let Ok(Err(error)) = result {
-                                    transport_observe::record_error(
-                                        "dnscrypt",
-                                        "connection",
-                                        Some(peer),
-                                        error,
-                                    );
-                                }
-                            });
-                        match spawned {
-                            Ok(thread) => drop(thread),
-                            Err(error) => transport_observe::record_error(
-                                "dnscrypt",
-                                "spawn",
-                                Some(peer),
-                                error,
-                            ),
-                        }
-                    },
-                    |peer, error| {
-                        transport_observe::record_error(
-                            "dnscrypt",
-                            "frame_admission",
-                            Some(peer),
-                            error,
-                        )
-                    },
-                );
-                if !pending.is_empty() {
-                    std::thread::sleep(Duration::from_millis(10));
+            });
+            match spawned {
+                Ok(thread) => drop(thread),
+                Err(error) => {
+                    transport_observe::record_error("dnscrypt", "spawn", Some(peer), error)
                 }
             }
-            drop(pending);
-            tracker.wait_until_idle();
-        })?;
-    Ok(DnscryptTcpListener {
-        addr: bound,
-        stop,
-        thread: Some(thread),
-    })
-}
-
-/// Puts a connection under the I/O deadline and both stop signals: `shutdown` for the server,
-/// `stop` for this listener.
-fn connection_io(
-    stream: PrefixedTcp,
-    shutdown: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-) -> DeadlineTcp<PrefixedTcp> {
-    DeadlineTcp::new(stream, std::time::Instant::now() + IO_TIMEOUT)
-        .stop_on(shutdown)
-        .stop_on(stop)
+        },
+    )
 }
 
 fn serve_conn(
@@ -334,6 +170,7 @@ fn serve_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     /// A partial frame must not hold shutdown until the I/O deadline.
@@ -341,12 +178,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut server = connection_io(
+        let signals = crate::connection_limit::ConnectionSignals::default();
+        let mut server = signals.watch(DeadlineTcp::new(
             PrefixedTcp::new(server, Vec::new()),
-            Arc::new(AtomicBool::new(false)),
-            stop.clone(),
-        );
+            std::time::Instant::now() + IO_TIMEOUT,
+        ));
         let worker = std::thread::spawn(move || {
             let mut length = [0u8; 2];
             server.read_exact(&mut length).unwrap_err().kind()
@@ -354,7 +190,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(20));
         let started = std::time::Instant::now();
-        stop.store(true, Ordering::Release);
+        signals.stop.store(true, Ordering::Release);
         assert_eq!(worker.join().unwrap(), io::ErrorKind::ConnectionAborted);
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -364,7 +200,9 @@ mod tests {
     }
 
     /// A listener with this ACL, and a certificate query to send it.
-    fn certificate_listener(acl: onetdns_security::IpAcl) -> (DnscryptTcpListener, Vec<u8>) {
+    fn certificate_listener(
+        acl: onetdns_security::IpAcl,
+    ) -> (crate::connection_limit::EncryptedTcpListener, Vec<u8>) {
         let handler = Arc::new(NativeServer::new(
             Arc::new(onetdns_filter::SharedFilter::from_pointee(
                 onetdns_filter::build_from_str("", "", onetdns_core::BlockResponse::NxDomain),
@@ -380,11 +218,10 @@ mod tests {
             60,
         ));
         let listener = serve_tcp(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             handler,
             Provider::generate("2.dnscrypt-cert.onetdns", 86400),
             Arc::new(ConnectionLimiter::default()),
-            Arc::new(AtomicBool::new(false)),
         )
         .expect("TCP 리스너");
 
@@ -402,7 +239,7 @@ mod tests {
     /// TCP client fails.
     fn tcp_listener_answers_a_certificate_lookup_and_closes() {
         let (listener, question) = certificate_listener(onetdns_security::IpAcl::allow_all());
-        let mut stream = TcpStream::connect(listener.addr).expect("연결");
+        let mut stream = TcpStream::connect(listener.addr()).expect("연결");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("수신 제한 시간");
@@ -438,7 +275,7 @@ mod tests {
         let (listener, question) = certificate_listener(
             onetdns_security::IpAcl::allow_all().with_drop(vec!["127.0.0.0/8".parse().unwrap()]),
         );
-        let mut stream = TcpStream::connect(listener.addr).expect("연결");
+        let mut stream = TcpStream::connect(listener.addr()).expect("연결");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("수신 제한 시간");

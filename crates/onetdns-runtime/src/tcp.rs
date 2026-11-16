@@ -8,6 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use onetdns_core::admission::ClientCounts;
+use onetdns_core::tcp::DRAIN_IDLE;
 use onetdns_core::IpNet;
 use onetdns_proto::{Message, Writer};
 
@@ -61,6 +62,25 @@ fn write_dns_frame<W: Write>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
 
 /// The stream, its peer, and the guard holding its slot.
 pub(crate) type Accepted = (TcpStream, SocketAddr, ConnectionGuard);
+
+/// Once `shutdown` is set, nothing new is accepted and a connection answers what it receives, then
+/// closes after DRAIN_IDLE without a request. `abort` closes it at the next check.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionStop {
+    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) abort: Arc<AtomicBool>,
+}
+
+impl ConnectionStop {
+    fn aborted(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+
+    /// Whether a connection without a request since `idle_since` should close.
+    fn drained(&self, idle_since: Instant) -> bool {
+        self.shutdown.load(Ordering::Relaxed) && idle_since.elapsed() >= DRAIN_IDLE
+    }
+}
 
 pub(crate) struct ConnectionPoolConfig {
     pub poll: Duration,
@@ -185,10 +205,11 @@ pub(crate) fn connection_limiter(
 }
 
 /// Workers share one receiver, so a burst of connections cannot become a burst of threads.
-/// Each connection is a fault isolation boundary. Fails only when no worker starts.
+/// Each connection is a fault isolation boundary. After shutdown, workers keep taking connections
+/// until the accept threads are gone and the queue is empty. Fails only when no worker starts.
 pub(crate) fn spawn_connection_workers<H: Handler>(
     handler: Arc<H>,
-    shutdown: Arc<AtomicBool>,
+    stop: ConnectionStop,
     config: ConnectionPoolConfig,
 ) -> io::Result<(mpsc::SyncSender<Accepted>, Vec<std::thread::JoinHandle<()>>)> {
     let (tx, rx) = mpsc::sync_channel::<Accepted>(config.queue_capacity);
@@ -197,7 +218,7 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
     for idx in 0..config.workers {
         let rx = rx.clone();
         let handler = handler.clone();
-        let shutdown = shutdown.clone();
+        let stop = stop.clone();
         let trusted = config.trusted_proxies.clone();
         let poll = config.poll;
         let proxy_protocol = config.proxy_protocol;
@@ -210,7 +231,7 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
                     crate::sys::pin_to_core(idx % pin_span.max(1));
                 }
                 loop {
-                    if shutdown.load(Ordering::Relaxed) {
+                    if stop.aborted() {
                         break;
                     }
                     let next = {
@@ -230,7 +251,7 @@ pub(crate) fn spawn_connection_workers<H: Handler>(
                                 handle_conn(
                                     accepted,
                                     &handler,
-                                    &shutdown,
+                                    &stop,
                                     poll,
                                     proxy_protocol,
                                     &trusted,
@@ -329,7 +350,7 @@ fn trusted_peer(peer: SocketAddr, trusted: &[IpNet]) -> bool {
 fn handle_conn<H: Handler>(
     accepted: Accepted,
     handler: &Arc<H>,
-    shutdown: &AtomicBool,
+    stop: &ConnectionStop,
     poll: Duration,
     proxy_protocol: bool,
     trusted_proxies: &[IpNet],
@@ -354,7 +375,7 @@ fn handle_conn<H: Handler>(
             );
             return;
         }
-        match read_proxy_header(&mut stream, shutdown) {
+        match read_proxy_header(&mut stream, &stop.abort) {
             Some(Some(real)) if guard.reassign_ip(real.ip()) => peer = real,
             Some(Some(_)) => {
                 note_tcp_drop(
@@ -376,13 +397,14 @@ fn handle_conn<H: Handler>(
     let mut body: Vec<u8> = Vec::with_capacity(512);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if stop.aborted() {
             return;
         }
 
-        let deadline = Instant::now() + DNS_MESSAGE_DEADLINE;
+        let idle_since = Instant::now();
+        let deadline = idle_since + DNS_MESSAGE_DEADLINE;
         let mut lenb = [0u8; 2];
-        if !read_exact_until(&mut stream, &mut lenb, shutdown, deadline) {
+        if !read_exact_until(&mut stream, &mut lenb, stop, deadline, Some(idle_since)) {
             return;
         }
         let len = usize::from(u16::from_be_bytes(lenb));
@@ -390,7 +412,7 @@ fn handle_conn<H: Handler>(
             return;
         }
         body.resize(len, 0);
-        if !read_exact_until(&mut stream, &mut body, shutdown, deadline) {
+        if !read_exact_until(&mut stream, &mut body, stop, deadline, None) {
             return;
         }
         let ctx = RequestCtx {
@@ -486,7 +508,7 @@ fn note_tcp_drop(reason: &'static str, peer: SocketAddr, detail: &str) {
 /// Reads a byte at a time so nothing past the header is consumed, within 256 bytes and a deadline.
 /// `Some(Some(addr))` names the client, `Some(None)` is the proxy's own connection, and `None`
 /// means close.
-fn read_proxy_header(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<Option<SocketAddr>> {
+fn read_proxy_header(stream: &mut TcpStream, abort: &AtomicBool) -> Option<Option<SocketAddr>> {
     use crate::proxy::{parse, ProxyParse};
     let deadline = Instant::now() + PROXY_HEADER_DEADLINE;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
@@ -504,7 +526,7 @@ fn read_proxy_header(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<Op
                 buf.push(one[0]);
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if shutdown.load(Ordering::Relaxed) {
+                if abort.load(Ordering::Relaxed) {
                     return None;
                 }
                 continue;
@@ -522,15 +544,18 @@ fn read_proxy_header(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<Op
 
 /// Fills `buf` by `deadline`. Each read timeout rechecks the deadline and shutdown, so a
 /// connection sending a byte at a time is still cut off. False on deadline, shutdown, EOF or error.
+/// `idle_since` is set when no part of the message has arrived yet: the time the connection last
+/// finished a request, or was accepted.
 fn read_exact_until(
     stream: &mut TcpStream,
     buf: &mut [u8],
-    shutdown: &AtomicBool,
+    stop: &ConnectionStop,
     deadline: Instant,
+    idle_since: Option<Instant>,
 ) -> bool {
     let mut got = 0;
     while got < buf.len() {
-        if shutdown.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        if stop.aborted() || Instant::now() >= deadline {
             return false;
         }
         match stream.read(&mut buf[got..]) {
@@ -541,7 +566,11 @@ fn read_exact_until(
                 }
                 got += k;
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if got == 0 && idle_since.is_some_and(|since| stop.drained(since)) {
+                    return false;
+                }
+            }
             Err(_) => return false,
         }
     }
@@ -625,11 +654,10 @@ mod malformed_tests {
         let guard = limiter
             .try_acquire(peer.ip())
             .expect("Could not take a slot");
-        let shutdown = AtomicBool::new(false);
         handle_conn(
             (stream, peer, guard),
             &Arc::new(TwoAnswerHandler),
-            &shutdown,
+            &ConnectionStop::default(),
             Duration::from_millis(200),
             false,
             &[],
@@ -757,22 +785,24 @@ mod limit_tests {
             std::thread::sleep(Duration::from_millis(400));
             let _ = client.write_all(&[0]);
         });
-        let shutdown = AtomicBool::new(false);
+        let stop = ConnectionStop::default();
         let started = Instant::now();
         let deadline = started + Duration::from_millis(450);
         let mut length = [0u8; 2];
         assert!(read_exact_until(
             &mut server,
             &mut length,
-            &shutdown,
+            &stop,
             deadline,
+            Some(started),
         ));
         assert_eq!(u16::from_be_bytes(length), 1);
         assert!(!read_exact_until(
             &mut server,
             &mut [0u8; 1],
-            &shutdown,
+            &stop,
             deadline,
+            None,
         ));
         assert!(started.elapsed() < Duration::from_millis(800));
         sender.join().unwrap();

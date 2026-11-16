@@ -1,6 +1,6 @@
 //! Opens and closes DNS sockets and encrypted listeners to match the config.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +9,9 @@ use onetdns_config::Config;
 use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write_secret;
+use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
+use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
 use crate::tls_material::{native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
@@ -264,39 +266,156 @@ pub(crate) fn tls_configs_from(
 #[derive(Default)]
 pub(crate) struct ListenerSet {
     plain: Mutex<Vec<(String, onetdns_runtime::Server)>>,
-    dot: Mutex<Vec<(String, dot::DotListener)>>,
-    doh: Mutex<Vec<(String, doh::DohListener)>>,
+    dot: Mutex<Vec<(String, EncryptedTcpListener)>>,
+    doh: Mutex<Vec<(String, EncryptedTcpListener)>>,
     doq: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     doh3: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     /// Shared by DoQ and DoH3 connections on every address.
     quic_memory: Arc<quic_memory::QuicMemoryBudget>,
     /// Admission shared by DoH, DoT, and DNSCrypt TCP connections on every address.
     encrypted_tcp_admission: Arc<connection_limit::ConnectionLimiter>,
-    /// The UDP listener is a thread, so its stop signal is kept; the TCP listener at the same
-    /// address joins itself on drop, so it is kept alongside.
-    dnscrypt: Mutex<
-        Vec<(
-            String,
-            Arc<std::sync::atomic::AtomicBool>,
-            dnscrypt::DnscryptTcpListener,
-        )>,
-    >,
+    dnscrypt: Mutex<Vec<DnscryptListener>>,
+    /// Open sockets that listeners take before binding their address.
+    inherited: Mutex<SocketPool>,
+}
+
+/// UDP is served by a thread of its own, TCP by an encrypted TCP listener on the same address.
+struct DnscryptListener {
+    key: String,
+    /// Ends the UDP thread and the certificate renewal.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    udp_thread: Option<std::thread::JoinHandle<()>>,
+    /// Kept so `export` can hand it on; closed when the listener stops reading.
+    udp: Option<UdpSocket>,
+    tcp: EncryptedTcpListener,
+}
+
+impl DnscryptListener {
+    fn stop_reading(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.udp_thread.take() {
+            let _ = thread.join();
+        }
+        self.udp = None;
+        self.tcp.stop_reading();
+    }
+}
+
+impl Drop for DnscryptListener {
+    fn drop(&mut self) {
+        self.stop_reading();
+    }
 }
 
 impl ListenerSet {
-    /// Called when a generation ends.
-    pub(crate) fn close_all(&self) {
-        for (_, server) in self.plain.lock_recover().drain(..) {
-            server.shutdown();
+    /// Every listener stops reading its listening sockets and closes its handles to them; returns
+    /// once none reads them. Connections already accepted are served until `close_all`.
+    pub(crate) fn stop_reading(&self) {
+        for (_, server) in self.plain.lock_recover().iter_mut() {
+            server.stop_reading();
         }
+        for listeners in [&self.dot, &self.doh] {
+            for (_, listener) in listeners.lock_recover().iter_mut() {
+                listener.stop_reading();
+            }
+        }
+        for listeners in [&self.doq, &self.doh3] {
+            for (_, listener) in listeners.lock_recover().iter_mut() {
+                listener.stop_reading();
+            }
+        }
+        for listener in self.dnscrypt.lock_recover().iter_mut() {
+            listener.stop_reading();
+        }
+    }
+
+    /// Called when a generation ends. Connections already accepted answer what they receive until
+    /// idle, for at most DRAIN_LIMIT.
+    pub(crate) fn close_all(&self) {
+        self.stop_reading();
+        self.plain.lock_recover().clear();
         self.dot.lock_recover().clear();
         self.doh.lock_recover().clear();
         self.doq.lock_recover().clear();
         self.doh3.lock_recover().clear();
-        for (_, stop, tcp) in self.dnscrypt.lock_recover().drain(..) {
-            stop.store(true, std::sync::atomic::Ordering::Release);
-            drop(tcp);
+        self.dnscrypt.lock_recover().clear();
+    }
+
+    /// Listeners opened from now on take their sockets from `pool` where role and address match.
+    pub(crate) fn adopt(&self, pool: SocketPool) {
+        *self.inherited.lock_recover() = pool;
+    }
+
+    /// Closes the adopted sockets no listener took, after the listeners for the config are open.
+    pub(crate) fn drop_unclaimed(&self) {
+        let unclaimed = std::mem::take(&mut *self.inherited.lock_recover());
+        if !unclaimed.is_empty() {
+            onetdns_core::info!(
+                event = "listener.handover_unclaimed",
+                sockets = %unclaimed.describe(),
+                "Closed handed-over listening sockets that the configuration no longer uses"
+            );
         }
+    }
+
+    /// Duplicates of every listening socket. They stay open after the listeners close, so the next
+    /// listeners, in this process or another, can take them over.
+    pub(crate) fn export(&self) -> std::io::Result<SocketPool> {
+        let mut pool = SocketPool::default();
+        for (_, server) in self.plain.lock_recover().iter() {
+            let sockets = server.sockets()?;
+            for socket in sockets.udp {
+                let addr = socket.local_addr()?;
+                pool.put(SocketRole::Do53, addr, ListeningSocket::Udp(socket));
+            }
+            for socket in sockets.tcp {
+                let addr = socket.local_addr()?;
+                pool.put(SocketRole::Do53, addr, ListeningSocket::Tcp(socket));
+            }
+        }
+        for (role, listeners) in [(SocketRole::Dot, &self.dot), (SocketRole::Doh, &self.doh)] {
+            for (_, listener) in listeners.lock_recover().iter() {
+                pool.put(
+                    role,
+                    listener.addr(),
+                    ListeningSocket::Tcp(listener.socket()?),
+                );
+            }
+        }
+        for (role, listeners) in [(SocketRole::Doq, &self.doq), (SocketRole::Doh3, &self.doh3)] {
+            for (_, listener) in listeners.lock_recover().iter() {
+                pool.put(
+                    role,
+                    listener.addr(),
+                    ListeningSocket::Udp(listener.socket()?),
+                );
+            }
+        }
+        for listener in self.dnscrypt.lock_recover().iter() {
+            let udp = match &listener.udp {
+                Some(udp) => udp.try_clone()?,
+                None => return Err(std::io::Error::other("the listener has stopped reading")),
+            };
+            pool.put(
+                SocketRole::Dnscrypt,
+                udp.local_addr()?,
+                ListeningSocket::Udp(udp),
+            );
+            pool.put(
+                SocketRole::Dnscrypt,
+                listener.tcp.addr(),
+                ListeningSocket::Tcp(listener.tcp.socket()?),
+            );
+        }
+        Ok(pool)
+    }
+
+    fn take_udp(&self, role: SocketRole, addr: SocketAddr) -> Option<UdpSocket> {
+        self.inherited.lock_recover().take_udp(role, addr).pop()
+    }
+
+    fn take_tcp(&self, role: SocketRole, addr: SocketAddr) -> Option<TcpListener> {
+        self.inherited.lock_recover().take_tcp(role, addr).pop()
     }
 }
 
@@ -406,21 +525,24 @@ pub(crate) fn reconcile_listeners(
             }
             !replaced
         });
-        let server = onetdns_runtime::Server::bind(
-            *addr,
-            handler.clone(),
-            onetdns_runtime::ServerConfig {
-                proxy_protocol: cfg.proxy_protocol_ports.contains(&addr.port()),
-                trusted_proxies: cfg.proxy_protocol_trusted.clone(),
-                udp: cfg.do_udp,
-                tcp: cfg.do_tcp,
-                udp_workers,
-                tcp_acceptors,
-                udp_reactor: true,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| listener_open_error("Plain DNS", *addr, &error))?;
+        let server = plain_sockets(cfg, set, *addr, udp_workers, tcp_acceptors)
+            .and_then(|sockets| {
+                onetdns_runtime::Server::serve(
+                    sockets,
+                    handler.clone(),
+                    onetdns_runtime::ServerConfig {
+                        proxy_protocol: cfg.proxy_protocol_ports.contains(&addr.port()),
+                        trusted_proxies: cfg.proxy_protocol_trusted.clone(),
+                        udp: cfg.do_udp,
+                        tcp: cfg.do_tcp,
+                        udp_workers,
+                        tcp_acceptors,
+                        udp_reactor: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map_err(|error| listener_open_error("Plain DNS", *addr, &error))?;
         onetdns_core::info!(event = "do53.started", %addr, udp_workers, tcp_acceptors, udp = cfg.do_udp, tcp = cfg.do_tcp, backend = ?cfg.backend, "Listening for plain DNS");
         if let Some(bound) = server.udp_addr() {
             registry
@@ -451,6 +573,58 @@ pub(crate) fn reconcile_listeners(
     drop(plain);
 
     reconcile_encrypted(cfg, set, handler, tls, shutdown, registry, self_signed_file)
+}
+
+/// Adopted sockets first, so a socket handed over keeps the queries queued on it.
+fn plain_sockets(
+    cfg: &Config,
+    set: &ListenerSet,
+    addr: SocketAddr,
+    udp_workers: usize,
+    tcp_acceptors: usize,
+) -> std::io::Result<onetdns_runtime::ServerSockets> {
+    let mut sockets = onetdns_runtime::ServerSockets::default();
+    if cfg.do_udp {
+        sockets.udp = set
+            .inherited
+            .lock_recover()
+            .take_udp(SocketRole::Do53, addr);
+        if sockets.udp.is_empty() {
+            sockets.udp = onetdns_runtime::bind_udp(addr, udp_workers)?;
+        }
+    }
+    if cfg.do_tcp {
+        sockets.tcp = set
+            .inherited
+            .lock_recover()
+            .take_tcp(SocketRole::Do53, addr);
+        if sockets.tcp.is_empty() {
+            sockets.tcp = onetdns_runtime::bind_tcp(addr, tcp_acceptors)?;
+        }
+    }
+    Ok(sockets)
+}
+
+fn tcp_socket(
+    set: &ListenerSet,
+    role: SocketRole,
+    addr: SocketAddr,
+) -> std::io::Result<TcpListener> {
+    match set.take_tcp(role, addr) {
+        Some(socket) => Ok(socket),
+        None => TcpListener::bind(addr),
+    }
+}
+
+fn quic_socket(
+    set: &ListenerSet,
+    role: SocketRole,
+    addr: SocketAddr,
+) -> std::io::Result<UdpSocket> {
+    match set.take_udp(role, addr) {
+        Some(socket) => Ok(socket),
+        None => onetdns_core::udp::bind(addr),
+    }
 }
 
 /// Plain DNS is left alone.
@@ -523,48 +697,68 @@ fn reconcile_encrypted(
 
     if !cfg.listen_dot.is_empty() || !set.dot.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.dot.clone())?;
-        sync_one!(dot, cfg.listen_dot, "dot", |addr| dot::serve_dot(
-            addr,
+        sync_one!(dot, cfg.listen_dot, "dot", |addr| tcp_socket(
+            set,
+            SocketRole::Dot,
+            addr
+        )
+        .and_then(|socket| dot::serve_dot(
+            socket,
             tls_cfg.clone(),
             handler.clone(),
             set.encrypted_tcp_admission.clone(),
             shutdown.clone()
-        )
+        ))
         .map_err(|error| listener_open_error("DoT", addr, &error)));
     }
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh.clone())?;
-        sync_one!(doh, cfg.listen_doh, "doh", |addr| doh::serve_doh(
-            addr,
+        sync_one!(doh, cfg.listen_doh, "doh", |addr| tcp_socket(
+            set,
+            SocketRole::Doh,
+            addr
+        )
+        .and_then(|socket| doh::serve_doh(
+            socket,
             tls_cfg.clone(),
             handler.clone(),
             cfg.doh_path.clone(),
             set.encrypted_tcp_admission.clone(),
             shutdown.clone()
-        )
+        ))
         .map_err(|error| listener_open_error("DoH", addr, &error)));
     }
     if !cfg.listen_doq.is_empty() || !set.doq.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doq.clone())?;
-        sync_one!(doq, cfg.listen_doq, "doq", |addr| doq::serve_doq(
-            addr,
+        sync_one!(doq, cfg.listen_doq, "doq", |addr| quic_socket(
+            set,
+            SocketRole::Doq,
+            addr
+        )
+        .and_then(|socket| doq::serve_doq(
+            socket,
             tls_cfg.clone(),
             handler.clone(),
             shutdown.clone(),
             set.quic_memory.clone()
-        )
+        ))
         .map_err(|error| listener_open_error("DoQ", addr, &error)));
     }
     if !cfg.listen_doh3.is_empty() || !set.doh3.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh3.clone())?;
-        sync_one!(doh3, cfg.listen_doh3, "doh3", |addr| doh3::serve_doh3(
-            addr,
+        sync_one!(doh3, cfg.listen_doh3, "doh3", |addr| quic_socket(
+            set,
+            SocketRole::Doh3,
+            addr
+        )
+        .and_then(|socket| doh3::serve_doh3(
+            socket,
             tls_cfg.clone(),
             handler.clone(),
             cfg.doh_path.clone(),
             shutdown.clone(),
             set.quic_memory.clone()
-        )
+        ))
         .map_err(|error| listener_open_error("DoH3", addr, &error)));
     }
     Ok(())
@@ -651,7 +845,7 @@ pub(crate) fn reconcile_dnscrypt(
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
     identity: &DnscryptIdentitySlot,
 ) -> Result<(), String> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     let wanted: Vec<(String, SocketAddr)> = cfg
         .listen_dnscrypt
@@ -666,13 +860,12 @@ pub(crate) fn reconcile_dnscrypt(
     let mut live = set.dnscrypt.lock_recover();
     let need_new = wanted
         .iter()
-        .any(|(key, _)| !live.iter().any(|(have, _, _)| have == key));
+        .any(|(key, _)| !live.iter().any(|listener| listener.key == *key));
     if !need_new {
-        live.retain(|(key, stop, _)| {
-            let keep = wanted.iter().any(|(want, _)| want == key);
+        live.retain(|listener| {
+            let keep = wanted.iter().any(|(want, _)| *want == listener.key);
             if !keep {
-                stop.store(true, Ordering::Release);
-                if let Some(addr) = key.split('|').nth(1) {
+                if let Some(addr) = listener.key.split('|').nth(1) {
                     forget_listener(registry, "dnscrypt", addr);
                 }
             }
@@ -702,7 +895,7 @@ pub(crate) fn reconcile_dnscrypt(
 
     let mut fresh = Vec::new();
     for (key, addr) in &wanted {
-        if live.iter().any(|(have, _, _)| have == key) {
+        if live.iter().any(|listener| listener.key == *key) {
             continue;
         }
         // The address is unchanged but its config changed, so the old listener closes first;
@@ -710,16 +903,20 @@ pub(crate) fn reconcile_dnscrypt(
         let prefix = format!("dnscrypt|{addr}|");
         let mut index = 0;
         while index < live.len() {
-            if live[index].0 != *key && live[index].0.starts_with(&prefix) {
-                let (_, old_stop, old_tcp) = live.swap_remove(index);
-                old_stop.store(true, Ordering::Release);
-                drop(old_tcp);
+            if live[index].key != *key && live[index].key.starts_with(&prefix) {
+                drop(live.swap_remove(index));
                 forget_listener(registry, "dnscrypt", &addr.to_string());
             } else {
                 index += 1;
             }
         }
-        let socket = open_when_free(|| UdpSocket::bind(addr))
+        let socket = open_when_free(|| match set.take_udp(SocketRole::Dnscrypt, *addr) {
+            Some(socket) => Ok(socket),
+            None => UdpSocket::bind(addr),
+        })
+        .map_err(|error| listener_open_error("DNSCrypt", *addr, &error))?;
+        let kept = socket
+            .try_clone()
             .map_err(|error| listener_open_error("DNSCrypt", *addr, &error))?;
         let bound = socket
             .local_addr()
@@ -752,13 +949,14 @@ pub(crate) fn reconcile_dnscrypt(
         // The spec sends certificate lookups and truncated-response retries over TCP, and UDP alone
         // would break them, so the same address listens on both.
         let tcp = open_when_free(|| {
-            dnscrypt::serve_tcp(
-                *addr,
-                handler.clone(),
-                provider.clone(),
-                set.encrypted_tcp_admission.clone(),
-                stop.clone(),
-            )
+            tcp_socket(set, SocketRole::Dnscrypt, *addr).and_then(|socket| {
+                dnscrypt::serve_tcp(
+                    socket,
+                    handler.clone(),
+                    provider.clone(),
+                    set.encrypted_tcp_admission.clone(),
+                )
+            })
         })
         .map_err(|error| listener_open_error("DNSCrypt TCP", *addr, &error))?;
         let handler = handler.clone();
@@ -772,17 +970,16 @@ pub(crate) fn reconcile_dnscrypt(
                 }
             })
             .map_err(|error| format!("Could not start the DNSCrypt listener thread: {bound}: {error}"))?;
-        track_service_thread(tracker, thread);
         onetdns_core::info!(event = "dnscrypt.started", %addr, "Accepting DNSCrypt queries (UDP and TCP)");
-        fresh.push((key.clone(), stop, tcp));
+        fresh.push(DnscryptListener {
+            key: key.clone(),
+            stop,
+            udp_thread: Some(thread),
+            udp: Some(kept),
+            tcp,
+        });
     }
-    live.retain(|(key, stop, _)| {
-        let keep = wanted.iter().any(|(want, _)| want == key);
-        if !keep {
-            stop.store(true, Ordering::Release);
-        }
-        keep
-    });
+    live.retain(|listener| wanted.iter().any(|(want, _)| *want == listener.key));
     live.extend(fresh);
     Ok(())
 }
@@ -791,8 +988,232 @@ pub(crate) fn reconcile_dnscrypt(
 mod tests {
     use super::*;
     use onetdns_config::Config;
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::CONFIG_FILE_NAME;
+
+    /// Answers every A query with `answer`, so a reply shows which handler produced it.
+    fn upstream_answering(answer: Ipv4Addr) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let Ok(request) = onetdns_proto::Message::parse(&buf[..n]) else {
+                    continue;
+                };
+                let mut reply = onetdns_proto::Message::default();
+                reply.header.id = request.header.id;
+                reply.header.response = true;
+                reply.header.recursion_available = true;
+                reply.questions = request.questions.clone();
+                if let Some(question) = request.questions.first() {
+                    reply.answers.push(onetdns_proto::Record::new(
+                        question.name.clone(),
+                        60,
+                        onetdns_proto::RData::A(answer),
+                    ));
+                }
+                let _ = socket.send_to(&reply.try_encode().unwrap(), from);
+            }
+        });
+        addr
+    }
+
+    fn handler_answering(answer: Ipv4Addr) -> Arc<native::NativeServer> {
+        let engine = onetdns_filter::build_from_str("", "", onetdns_core::BlockResponse::NxDomain);
+        Arc::new(native::NativeServer::new(
+            Arc::new(onetdns_filter::SharedFilter::from_pointee(engine)),
+            Arc::new(onetdns_security::IpAcl::allow_all()),
+            vec![],
+            Arc::new(native::NativeBackend::Forward(
+                onetdns_forward::Forwarder::new(
+                    vec![upstream_answering(answer)],
+                    Duration::from_secs(2),
+                ),
+            )),
+            60,
+        ))
+    }
+
+    fn query(id: u16, name: &str) -> Vec<u8> {
+        onetdns_proto::Message::query(
+            id,
+            onetdns_proto::Name::from_str(name).unwrap(),
+            onetdns_proto::RecordType::A,
+        )
+        .try_encode()
+        .unwrap()
+    }
+
+    fn answered_address(wire: &[u8], id: u16) -> Option<Ipv4Addr> {
+        let reply = onetdns_proto::Message::parse(wire).ok()?;
+        if reply.header.id != id {
+            return None;
+        }
+        reply.answers.iter().find_map(|record| match record.rdata {
+            onetdns_proto::RData::A(addr) => Some(addr),
+            _ => None,
+        })
+    }
+
+    fn ask_udp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.send_to(&query(id, name), server).ok()?;
+        let mut buf = [0u8; 4096];
+        let (n, _) = client.recv_from(&mut buf).ok()?;
+        answered_address(&buf[..n], id)
+    }
+
+    fn ask_tcp(server: SocketAddr, id: u16, name: &str) -> Option<Ipv4Addr> {
+        let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(5)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let wire = query(id, name);
+        let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&wire);
+        stream.write_all(&framed).ok()?;
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).ok()?;
+        let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut reply).ok()?;
+        answered_address(&reply, id)
+    }
+
+    struct Generation {
+        set: ListenerSet,
+        handler: Arc<native::NativeServer>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl Generation {
+        fn new(answer: Ipv4Addr) -> Self {
+            Self {
+                set: ListenerSet::default(),
+                handler: handler_answering(answer),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn open(&self, cfg: &Config, pool: SocketPool) {
+            self.set.adopt(pool);
+            reconcile_listeners(
+                cfg,
+                &self.set,
+                &self.handler,
+                &Arc::new(Mutex::new(None)),
+                &self.shutdown,
+                &Arc::new(Mutex::new(Vec::new())),
+                None,
+            )
+            .expect("수신 주소 열기");
+            self.set.drop_unclaimed();
+        }
+
+        fn close(&self) {
+            self.shutdown.store(true, Ordering::Release);
+            self.set.close_all();
+        }
+    }
+
+    #[test]
+    /// Queries keep being answered while the listeners of one handler give their sockets to the
+    /// next: on Unix the next starts reading before the first stops, on Windows after, and either
+    /// way a query waiting on the socket is answered by whoever reads it next.
+    fn listeners_hand_their_sockets_over_without_dropping_queries() {
+        let udp = onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap();
+        let addr = udp.local_addr().unwrap();
+        let Ok(tcp) = TcpListener::bind(addr) else {
+            return;
+        };
+        let mut first_pool = SocketPool::default();
+        first_pool.put(SocketRole::Do53, addr, ListeningSocket::Udp(udp));
+        first_pool.put(SocketRole::Do53, addr, ListeningSocket::Tcp(tcp));
+        let cfg = Config {
+            listen: vec![addr],
+            workers: 2,
+            ..Config::default()
+        };
+
+        let old_answer = Ipv4Addr::new(192, 0, 2, 1);
+        let new_answer = Ipv4Addr::new(192, 0, 2, 2);
+        let old = Generation::new(old_answer);
+        old.open(&cfg, first_pool);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed_udp = Arc::new(AtomicUsize::new(0));
+        let failed_tcp = Arc::new(AtomicUsize::new(0));
+        let by_new = Arc::new(AtomicUsize::new(0));
+        let clients: Vec<_> = (0..4u16)
+            .map(|client| {
+                let (stop, by_new) = (stop.clone(), by_new.clone());
+                let (failed_udp, failed_tcp) = (failed_udp.clone(), failed_tcp.clone());
+                std::thread::spawn(move || {
+                    let mut sent = 0u16;
+                    while !stop.load(Ordering::Acquire) {
+                        sent = sent.wrapping_add(1);
+                        let id = client * 10_000 + sent % 10_000;
+                        let name = format!("q{id}.handover.test");
+                        let over_udp = sent % 2 == 0;
+                        let answer = if over_udp {
+                            ask_udp(addr, id, &name)
+                        } else {
+                            ask_tcp(addr, id, &name)
+                        };
+                        match answer {
+                            Some(answer) if answer == new_answer => {
+                                by_new.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(_) => {}
+                            None if over_udp => {
+                                failed_udp.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {
+                                failed_tcp.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        std::thread::sleep(Duration::from_millis(300));
+        let handed = old.set.export().expect("소켓 복제");
+        let new = Generation::new(new_answer);
+        if cfg!(windows) {
+            old.set.stop_reading();
+            // Nobody reads meanwhile; queries sent now must wait on the socket, not be refused.
+            std::thread::sleep(Duration::from_millis(200));
+            new.open(&cfg, handed);
+        } else {
+            new.open(&cfg, handed);
+        }
+        old.close();
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Release);
+        for client in clients {
+            client.join().unwrap();
+        }
+        new.close();
+
+        let failed = (
+            failed_udp.load(Ordering::Relaxed),
+            failed_tcp.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            failed,
+            (0, 0),
+            "넘기는 동안 답을 받지 못한 질의가 있습니다 (UDP, TCP)"
+        );
+        assert!(
+            by_new.load(Ordering::Relaxed) > 0,
+            "넘겨받은 쪽이 답하지 않았습니다"
+        );
+    }
 
     #[test]
     /// When another service holds the port, the error alone points at the config, especially for a

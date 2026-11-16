@@ -67,8 +67,11 @@ fn udp_socket_groups(n: usize) -> usize {
     n.min(cpus).max(1)
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn fan_out_udp(groups: Vec<UdpSocket>, n: usize) -> io::Result<Vec<UdpSocket>> {
+/// Gives each of `n` workers a handle, round-robin over the distinct sockets.
+pub(crate) fn fan_out_udp(groups: &[UdpSocket], n: usize) -> io::Result<Vec<UdpSocket>> {
+    if groups.is_empty() {
+        return Err(io::Error::other("no UDP socket to serve"));
+    }
     let mut socks = Vec::with_capacity(n);
     for idx in 0..n {
         socks.push(groups[idx % groups.len()].try_clone()?);
@@ -76,33 +79,26 @@ fn fan_out_udp(groups: Vec<UdpSocket>, n: usize) -> io::Result<Vec<UdpSocket>> {
     Ok(socks)
 }
 
-/// Port 0 does not use reuseport: each socket would get a different port. Without reuseport, one
-/// socket is duplicated.
-pub fn bind_udp_workers(addr: SocketAddr, n: usize) -> io::Result<Vec<UdpSocket>> {
+/// The distinct sockets `n` UDP workers read: several in one SO_REUSEPORT group on Linux,
+/// otherwise one. Port 0 does not use reuseport: each socket would get a different port.
+pub fn bind_udp(addr: SocketAddr, n: usize) -> io::Result<Vec<UdpSocket>> {
     #[cfg(target_os = "linux")]
     {
         if addr.port() != 0 {
             if let Ok(socks) = linux::reuseport_udp(addr, udp_socket_groups(n)) {
-                return fan_out_udp(socks, n);
+                return Ok(socks);
             }
         }
     }
-    let base = onetdns_core::udp::bind(addr)?;
-    let mut socks = Vec::with_capacity(n);
-    for _ in 0..n {
-        socks.push(base.try_clone()?);
-    }
-    Ok(socks)
+    #[cfg(not(target_os = "linux"))]
+    let _ = n;
+    Ok(vec![onetdns_core::udp::bind(addr)?])
 }
 
-/// TCP has a different 4-tuple per connection, so one listener per worker has no UDP-style pinning
-/// problem.
-///
-/// On Windows only one listening socket is returned: accepting concurrently on duplicated handles
-/// can leave a non-blocking handle asleep inside accept until a connection arrives, so that
-/// acceptor never sees shutdown and the side stopping the server waits forever on the join. Windows
-/// has no kernel distribution across handles anyway, so nothing is lost.
-pub fn bind_tcp_workers(addr: SocketAddr, n: usize) -> io::Result<Vec<TcpListener>> {
+/// The distinct sockets `n` TCP acceptors listen on: one per acceptor in one SO_REUSEPORT group on
+/// Linux, otherwise one. TCP has a different 4-tuple per connection, so one listener per acceptor
+/// has no UDP-style pinning problem.
+pub fn bind_tcp(addr: SocketAddr, n: usize) -> io::Result<Vec<TcpListener>> {
     #[cfg(target_os = "linux")]
     {
         if addr.port() != 0 {
@@ -111,15 +107,32 @@ pub fn bind_tcp_workers(addr: SocketAddr, n: usize) -> io::Result<Vec<TcpListene
             }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = n;
     let base = TcpListener::bind(addr)?;
     base.set_nonblocking(true)?;
+    Ok(vec![base])
+}
+
+/// Handles for the acceptors: each socket of a reuseport group once, or one socket shared by `n`
+/// acceptors.
+///
+/// On Windows the one socket is never duplicated: accepting concurrently on duplicated handles can
+/// leave a non-blocking handle asleep inside accept until a connection arrives, so that acceptor
+/// never sees shutdown and the side stopping the server waits forever on the join. Windows has no
+/// kernel distribution across handles anyway, so nothing is lost.
+pub(crate) fn acceptor_sockets(sockets: &[TcpListener], n: usize) -> io::Result<Vec<TcpListener>> {
+    if sockets.is_empty() {
+        return Err(io::Error::other("no TCP socket to serve"));
+    }
+    let n = if sockets.len() > 1 { sockets.len() } else { n };
     #[cfg(windows)]
     let n = n.min(1);
     let mut listeners = Vec::with_capacity(n);
-    for _ in 0..n {
-        let l = base.try_clone()?;
-        l.set_nonblocking(true)?;
-        listeners.push(l);
+    for idx in 0..n {
+        let listener = sockets[idx % sockets.len()].try_clone()?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
     }
     Ok(listeners)
 }
@@ -345,7 +358,8 @@ mod tests {
     /// the server never stops. That shows up only by chance, so the configuration that causes it is
     /// prevented.
     fn windows_tcp_listener_is_never_duplicated() {
-        let listeners = bind_tcp_workers("127.0.0.1:0".parse().unwrap(), 22).unwrap();
+        let sockets = bind_tcp("127.0.0.1:0".parse().unwrap(), 22).unwrap();
+        let listeners = acceptor_sockets(&sockets, 22).unwrap();
         assert_eq!(listeners.len(), 1);
     }
 
@@ -370,7 +384,7 @@ mod tests {
             .iter()
             .map(|s| s.local_addr().expect("addr").port())
             .collect();
-        let socks = fan_out_udp(groups, 5).expect("fan out");
+        let socks = fan_out_udp(&groups, 5).expect("fan out");
         assert_eq!(socks.len(), 5);
         for (idx, sock) in socks.iter().enumerate() {
             assert_eq!(

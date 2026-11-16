@@ -18,6 +18,8 @@ pub mod lrumap;
 pub mod origin;
 /// What ACLs, rate limits and blocking must guarantee.
 pub mod policy;
+/// Waiting for a socket to become readable.
+pub mod poll;
 pub mod rng;
 /// RSA signature verification.
 pub mod rsa;

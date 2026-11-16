@@ -13,6 +13,13 @@ use std::time::{Duration, Instant};
 /// A stopped connection closes within this. Shorter means more wakeups per waiting connection.
 pub const STOP_POLL: Duration = Duration::from_millis(250);
 
+/// Once its server stops, a connection still answers the requests it receives, and closes after
+/// this long without one. A client connecting just before the stop sends its query within it.
+pub const DRAIN_IDLE: Duration = Duration::from_secs(1);
+
+/// Connections still open this long after their server stopped are closed without waiting further.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(3);
+
 pub trait SocketTimeouts {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
@@ -38,14 +45,17 @@ pub fn time_left(deadline: Instant) -> io::Result<Duration> {
 
 /// The deadline covers all work on the connection until set_deadline moves it, not one read. Past
 /// it, reads and writes fail with TimedOut; once a stop flag is set, with ConnectionAborted. With
-/// no stop flag, the whole remaining time goes into one wait.
+/// no flag to watch, the whole remaining time goes into one wait.
 pub struct DeadlineTcp<S = TcpStream> {
     stream: S,
     deadline: Instant,
     /// Any set flag ends pending reads and writes.
     stop: Vec<Arc<AtomicBool>>,
+    drain: Option<Arc<AtomicBool>>,
     /// Whether anything was read since the deadline was last set.
     received: bool,
+    /// When the deadline was last set.
+    since: Instant,
 }
 
 impl DeadlineTcp {
@@ -61,7 +71,9 @@ impl<S> DeadlineTcp<S> {
             stream,
             deadline,
             stop: Vec::new(),
+            drain: None,
             received: false,
+            since: Instant::now(),
         }
     }
 
@@ -72,17 +84,27 @@ impl<S> DeadlineTcp<S> {
         self
     }
 
+    /// Once `flag` is set, a read that has received nothing since the deadline was last set ends
+    /// DRAIN_IDLE after that, as if the deadline had passed there. A request that has started
+    /// arriving is read under the deadline, and writes keep it too, so a closing message still
+    /// goes out.
+    pub fn drain_on(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.drain = Some(flag);
+        self
+    }
+
     /// For waiting on the next request after finishing one.
     pub fn set_deadline(&mut self, deadline: Instant) {
         self.deadline = deadline;
         self.received = false;
+        self.since = Instant::now();
     }
 
     /// Whether the deadline passed with nothing read since it was set. With the deadline set to
     /// wait for the next request, that is a connection that went idle; a peer that stalls
     /// mid-request sent something, so it does not count.
     pub fn idle_expired(&self) -> bool {
-        !self.received && Instant::now() >= self.deadline
+        !self.received && Instant::now() >= self.read_deadline()
     }
 
     pub fn get_ref(&self) -> &S {
@@ -97,43 +119,56 @@ impl<S> DeadlineTcp<S> {
     fn stopped(&self) -> bool {
         self.stop.iter().any(|flag| flag.load(Ordering::Relaxed))
     }
+
+    fn read_deadline(&self) -> Instant {
+        match &self.drain {
+            Some(flag) if !self.received && flag.load(Ordering::Relaxed) => {
+                self.deadline.min(self.since + DRAIN_IDLE)
+            }
+            _ => self.deadline,
+        }
+    }
+
+    fn watching(&self) -> bool {
+        !self.stop.is_empty() || self.drain.is_some()
+    }
 }
 
 impl<S: SocketTimeouts> DeadlineTcp<S> {
-    /// Timeout for this wait; an error if stopped or past the deadline.
-    fn wait(&self) -> io::Result<Duration> {
+    /// Timeout for this wait; an error if stopped or past `deadline`.
+    fn wait(&self, deadline: Instant) -> io::Result<Duration> {
         if self.stopped() {
             // read_exact and write_all retry Interrupted forever, so stopping reports an error that
             // ends them.
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        let left = time_left(self.deadline)?;
-        Ok(if self.stop.is_empty() {
-            left
-        } else {
+        let left = time_left(deadline)?;
+        Ok(if self.watching() {
             left.min(STOP_POLL)
+        } else {
+            left
         })
     }
 
-    /// Restarts a timed-out wait only when it was cut short of the deadline to check the stop
-    /// flags. If a flag was set meanwhile, the next wait ends with ConnectionAborted.
-    fn waits_again(&self, error: &io::Error) -> bool {
-        !self.stop.is_empty()
+    /// Restarts a timed-out wait only when it was cut short of the deadline to check the flags. If
+    /// a stop flag was set meanwhile, the next wait ends with ConnectionAborted.
+    fn waits_again(&self, error: &io::Error, deadline: Instant) -> bool {
+        self.watching()
             && matches!(
                 error.kind(),
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
             )
-            && Instant::now() < self.deadline
+            && Instant::now() < deadline
     }
 }
 
 impl<S: Read + SocketTimeouts> Read for DeadlineTcp<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let wait = self.wait()?;
+            let wait = self.wait(self.read_deadline())?;
             self.stream.set_read_timeout(Some(wait))?;
             match self.stream.read(buf) {
-                Err(error) if self.waits_again(&error) => {}
+                Err(error) if self.waits_again(&error, self.read_deadline()) => {}
                 result => {
                     self.received |= matches!(result, Ok(n) if n > 0);
                     return result;
@@ -146,10 +181,10 @@ impl<S: Read + SocketTimeouts> Read for DeadlineTcp<S> {
 impl<S: Write + SocketTimeouts> Write for DeadlineTcp<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
-            let wait = self.wait()?;
+            let wait = self.wait(self.deadline)?;
             self.stream.set_write_timeout(Some(wait))?;
             match self.stream.write(buf) {
-                Err(error) if self.waits_again(&error) => {}
+                Err(error) if self.waits_again(&error, self.deadline) => {}
                 result => return result,
             }
         }
@@ -278,6 +313,41 @@ mod tests {
         stream.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"late");
         peer.join().unwrap();
+    }
+
+    #[test]
+    /// A connection waiting for its next request closes soon after draining starts, unless the
+    /// request has started arriving: that one is read to the end, past DRAIN_IDLE.
+    fn draining_ends_only_an_idle_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let idle_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (idle_server, _) = listener.accept().unwrap();
+        let mut busy_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (busy_server, _) = listener.accept().unwrap();
+
+        let drain = Arc::new(AtomicBool::new(true));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut idle = DeadlineTcp::new(idle_server, deadline).drain_on(drain.clone());
+        let mut busy = DeadlineTcp::new(busy_server, deadline).drain_on(drain);
+
+        busy_client.write_all(&[1]).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(DRAIN_IDLE + STOP_POLL);
+            busy_client.write_all(&[2]).unwrap();
+            busy_client
+        });
+        let started = Instant::now();
+        let mut request = [0u8; 2];
+        busy.read_exact(&mut request).unwrap();
+        assert_eq!(request, [1, 2]);
+        assert!(started.elapsed() >= DRAIN_IDLE);
+
+        assert!(idle.read(&mut [0u8; 1]).is_err());
+        assert!(idle.idle_expired());
+        idle.write_all(&[0]).expect("the drain must not end writes");
+        assert!(started.elapsed() < DRAIN_IDLE * 3);
+        drop(idle_client);
+        drop(sender.join().unwrap());
     }
 
     #[test]

@@ -2,13 +2,17 @@
 //! with only a total, one client could take every slot.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::sync::{Arc, Condvar, Mutex};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use onetdns_core::admission::ClientCounts;
+use onetdns_core::tcp::{DeadlineTcp, DRAIN_IDLE, DRAIN_LIMIT};
 use onetdns_core::MutexExt;
+
+use crate::transport_observe;
 
 pub(crate) const MAX_ENCRYPTED_TCP_CONNECTIONS: usize = 512;
 /// Shared by every encrypted TCP transport.
@@ -58,6 +62,7 @@ pub(crate) struct PendingEncryptedConnection {
     /// Held while pending, so waiting connections count against the limits too.
     guard: ConnectionGuard,
     protocol: AdmissionProtocol,
+    accepted: Instant,
     deadline: Instant,
     next_poll: Instant,
     poll_interval: Duration,
@@ -166,6 +171,7 @@ impl PendingEncryptedConnection {
             prefix: Vec::new(),
             guard,
             protocol,
+            accepted: now,
             deadline,
             next_poll: now,
             poll_interval: MIN_PREFIX_POLL,
@@ -174,6 +180,11 @@ impl PendingEncryptedConnection {
 
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer
+    }
+
+    /// Nothing arrived within DRAIN_IDLE of being accepted; a draining listener closes it.
+    fn drained(&self) -> bool {
+        self.prefix.is_empty() && self.accepted.elapsed() >= DRAIN_IDLE
     }
 
     /// Reads what is available and reports whether the first frame is complete. Idle connections
@@ -462,6 +473,16 @@ impl ConnectionTracker {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
+
+    /// False when connections are still open after `timeout`.
+    pub fn wait_until_idle_for(&self, timeout: Duration) -> bool {
+        let active = self.active.lock_recover();
+        let (active, _) = self
+            .idle
+            .wait_timeout_while(active, timeout, |active| *active != 0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active == 0
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -484,25 +505,369 @@ impl Drop for ConnectionActivity {
     }
 }
 
-/// A blocked `accept` does not return on a flag; connecting once wakes it.
-pub fn wake_tcp_listener(addr: SocketAddr) {
-    let addr = match addr {
-        SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
+/// How long an idle accept loop waits before checking its stop signals again; stopping a listener
+/// waits up to this long.
+const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+
+/// What ends an admitted connection. `shutdown` and `stop` close it at once; once `drain` is set it
+/// answers what it receives and closes when idle (`DeadlineTcp::drain_on`).
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionSignals {
+    /// The server's. Without it, connections end only with their listener.
+    pub(crate) shutdown: Option<Arc<AtomicBool>>,
+    /// Set by the listener DRAIN_LIMIT after it starts draining.
+    pub(crate) stop: Arc<AtomicBool>,
+    /// Set when the listener stops accepting.
+    pub(crate) drain: Arc<AtomicBool>,
+}
+
+impl ConnectionSignals {
+    pub(crate) fn watch<S>(&self, stream: DeadlineTcp<S>) -> DeadlineTcp<S> {
+        let stream = stream
+            .stop_on(self.stop.clone())
+            .drain_on(self.drain.clone());
+        match &self.shutdown {
+            Some(shutdown) => stream.stop_on(shutdown.clone()),
+            None => stream,
         }
-        SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
-            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), addr.port())
+    }
+
+    /// Whether the server or the listener is stopping; a connection ended by that is not counted
+    /// as an error.
+    pub(crate) fn stopping(&self) -> bool {
+        self.aborted() || self.drain.load(Ordering::Relaxed)
+    }
+
+    fn aborted(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+            || self
+                .shutdown
+                .as_ref()
+                .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
+    }
+}
+
+/// A connection whose first frame has arrived. Keep `hold` for as long as the connection is
+/// served: it holds the admission slot and makes dropping the listener wait for the connection.
+pub(crate) struct AdmittedConnection {
+    pub(crate) stream: PrefixedTcp,
+    pub(crate) peer: SocketAddr,
+    pub(crate) signals: ConnectionSignals,
+    pub(crate) hold: ConnectionHold,
+}
+
+pub(crate) struct ConnectionHold {
+    _guard: ConnectionGuard,
+    _activity: ConnectionActivity,
+}
+
+/// One listening address of an encrypted TCP transport. Dropping it stops accepting and waits for
+/// the connections it accepted to finish, closing those still open after DRAIN_LIMIT.
+///
+/// The loop waits with `poll` and never changes the listening socket's blocking mode or connects
+/// to it, so the socket can be handed to another process that keeps accepting on it.
+pub(crate) struct EncryptedTcpListener {
+    addr: SocketAddr,
+    signals: ConnectionSignals,
+    thread: Option<thread::JoinHandle<()>>,
+    /// Signalled once the accept loop no longer reads the listening socket.
+    stopped_accepting: Option<mpsc::Receiver<()>>,
+    /// Kept so `socket` can hand it on; closed when the listener stops reading.
+    socket: Option<TcpListener>,
+}
+
+impl EncryptedTcpListener {
+    /// `transport` names the transport in logs and in the thread name. `serve` gets each
+    /// connection on the accept thread and must not block. Setting `shutdown` ends every
+    /// connection at once; without it they end with the listener.
+    pub(crate) fn spawn<D, F>(
+        listener: TcpListener,
+        transport: &'static str,
+        protocol: AdmissionProtocol,
+        admission: Arc<ConnectionLimiter>,
+        drops_source: D,
+        shutdown: Option<Arc<AtomicBool>>,
+        serve: F,
+    ) -> io::Result<Self>
+    where
+        D: Fn(IpAddr) -> bool + Send + 'static,
+        F: FnMut(AdmittedConnection) + Send + 'static,
+    {
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let socket = listener.try_clone()?;
+        let signals = ConnectionSignals {
+            shutdown,
+            ..ConnectionSignals::default()
+        };
+        let accept = AcceptLoop {
+            transport,
+            protocol,
+            admission,
+            drops_source,
+            signals: signals.clone(),
+        };
+        let (stopped, stopped_accepting) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name(format!("{transport}-listener"))
+            .spawn(move || accept.run(listener, stopped, serve))?;
+        Ok(Self {
+            addr,
+            signals,
+            thread: Some(thread),
+            stopped_accepting: Some(stopped_accepting),
+            socket: Some(socket),
+        })
+    }
+
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// A duplicate of the listening socket, which stays open after this listener stops.
+    pub(crate) fn socket(&self) -> io::Result<TcpListener> {
+        match &self.socket {
+            Some(socket) => socket.try_clone(),
+            None => Err(io::Error::other("the listener has stopped reading")),
         }
-        addr => addr,
-    };
-    if let Err(e) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-        onetdns_core::debug!(event = "listener.wake_failed", addr = %addr, error = %e, "Could not wake the accept thread; shutdown is delayed until the pending accept returns");
+    }
+
+    /// Stops accepting and closes this listener's handles to the socket, returning once nothing in
+    /// it reads the socket. Connections already accepted are served until it is dropped.
+    pub(crate) fn stop_reading(&mut self) {
+        self.signals.drain.store(true, Ordering::Release);
+        if let Some(stopped) = self.stopped_accepting.take() {
+            let _ = stopped.recv();
+        }
+        self.socket = None;
+    }
+}
+
+impl Drop for EncryptedTcpListener {
+    fn drop(&mut self) {
+        self.signals.drain.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct AcceptLoop<D> {
+    transport: &'static str,
+    protocol: AdmissionProtocol,
+    admission: Arc<ConnectionLimiter>,
+    drops_source: D,
+    signals: ConnectionSignals,
+}
+
+impl<D: Fn(IpAddr) -> bool> AcceptLoop<D> {
+    fn run(
+        self,
+        listener: TcpListener,
+        stopped_accepting: mpsc::Sender<()>,
+        mut serve: impl FnMut(AdmittedConnection),
+    ) {
+        let tracker = ConnectionTracker::new();
+        let mut pending = Vec::new();
+        while !self.signals.stopping() {
+            let wait = if pending.is_empty() {
+                ACCEPT_WAIT
+            } else {
+                MIN_PREFIX_POLL
+            };
+            match onetdns_core::poll::readable(&listener, wait) {
+                Ok(true) => self.accept_batch(&listener, &mut pending),
+                Ok(false) => {}
+                Err(error) => {
+                    transport_observe::record_error(self.transport, "accept", None, error);
+                    thread::sleep(MIN_PREFIX_POLL);
+                }
+            }
+            self.admit_ready(&mut pending, &tracker, &mut serve);
+        }
+        drop(listener);
+        let _ = stopped_accepting.send(());
+
+        let until = Instant::now() + DRAIN_LIMIT;
+        while !pending.is_empty() && !self.signals.aborted() && Instant::now() < until {
+            pending.retain(|connection| !connection.drained());
+            thread::sleep(MIN_PREFIX_POLL);
+            self.admit_ready(&mut pending, &tracker, &mut serve);
+        }
+        drop(pending);
+        if !tracker.wait_until_idle_for(until.saturating_duration_since(Instant::now())) {
+            self.signals.stop.store(true, Ordering::Release);
+            tracker.wait_until_idle();
+        }
+    }
+
+    fn admit_ready(
+        &self,
+        pending: &mut Vec<PendingEncryptedConnection>,
+        tracker: &Arc<ConnectionTracker>,
+        serve: &mut impl FnMut(AdmittedConnection),
+    ) {
+        let failed_stage = match self.protocol {
+            AdmissionProtocol::Tls => "handshake_admission",
+            AdmissionProtocol::Dnscrypt => "frame_admission",
+        };
+        poll_pending_encrypted_connections(
+            pending,
+            |stream, peer, guard| {
+                serve(AdmittedConnection {
+                    stream,
+                    peer,
+                    signals: self.signals.clone(),
+                    hold: ConnectionHold {
+                        _guard: guard,
+                        _activity: tracker.track(),
+                    },
+                })
+            },
+            |peer, error| {
+                transport_observe::record_error(self.transport, failed_stage, Some(peer), error)
+            },
+        );
+    }
+
+    fn accept_batch(&self, listener: &TcpListener, pending: &mut Vec<PendingEncryptedConnection>) {
+        for _ in 0..ENCRYPTED_ACCEPT_BATCH {
+            let (stream, peer) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    transport_observe::record_error(self.transport, "accept", None, error);
+                    return;
+                }
+            };
+            if (self.drops_source)(peer.ip()) {
+                continue;
+            }
+            match PendingEncryptedConnection::admit(stream, peer, &self.admission, self.protocol) {
+                Ok(Some(connection)) => pending.push(connection),
+                Ok(None) => transport_observe::record_error(
+                    self.transport,
+                    "connection_limit",
+                    Some(peer),
+                    "maximum concurrent connections reached",
+                ),
+                Err(error) => transport_observe::record_error(
+                    self.transport,
+                    "admission_start",
+                    Some(peer),
+                    error,
+                ),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Answers every framed message on a connection with `tag`.
+    fn tagging_listener(listener: TcpListener, tag: u8) -> EncryptedTcpListener {
+        EncryptedTcpListener::spawn(
+            listener,
+            "handover-test",
+            AdmissionProtocol::Dnscrypt,
+            Arc::new(ConnectionLimiter::default()),
+            |_| false,
+            None,
+            move |connection: AdmittedConnection| {
+                thread::spawn(move || {
+                    let AdmittedConnection {
+                        stream,
+                        signals,
+                        hold: _hold,
+                        ..
+                    } = connection;
+                    let wait = Duration::from_secs(5);
+                    let mut stream = signals.watch(DeadlineTcp::new(stream, Instant::now() + wait));
+                    loop {
+                        let mut len = [0u8; 2];
+                        if stream.read_exact(&mut len).is_err() {
+                            return;
+                        }
+                        let mut body = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                        if stream.read_exact(&mut body).is_err()
+                            || stream.write_all(&[tag]).is_err()
+                        {
+                            return;
+                        }
+                        stream.set_deadline(Instant::now() + wait);
+                    }
+                });
+            },
+        )
+        .unwrap()
+    }
+
+    fn ask(addr: SocketAddr) -> Option<u8> {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream.write_all(&[0, 4, b'p', b'i', b'n', b'g']).ok()?;
+        let mut tag = [0u8; 1];
+        stream.read_exact(&mut tag).ok()?;
+        Some(tag[0])
+    }
+
+    #[test]
+    /// Connections keep being answered while a listener hands its socket to the next: on Unix the
+    /// next starts accepting before the first stops, on Windows after it stops reading. Either way
+    /// the first answers what it accepted, and the next answers what waits on the socket.
+    fn listener_hands_its_socket_over_without_dropping_connections() {
+        let mut first = tagging_listener(TcpListener::bind("127.0.0.1:0").unwrap(), 1);
+        let addr = first.addr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicUsize::new(0));
+        let by_next = Arc::new(AtomicUsize::new(0));
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                let (stop, failed, by_next) = (stop.clone(), failed.clone(), by_next.clone());
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        match ask(addr) {
+                            Some(2) => {
+                                by_next.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(_) => {}
+                            None => {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        thread::sleep(Duration::from_millis(300));
+        let socket = first.socket().unwrap();
+        if cfg!(windows) {
+            first.stop_reading();
+        }
+        let next = tagging_listener(socket, 2);
+        drop(first);
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Release);
+        for client in clients {
+            client.join().unwrap();
+        }
+        drop(next);
+
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            0,
+            "넘기는 동안 답을 받지 못한 연결이 있습니다"
+        );
+        assert!(
+            by_next.load(Ordering::Relaxed) > 0,
+            "넘겨받은 쪽이 답하지 않았습니다"
+        );
+    }
 
     #[test]
     fn enforces_total_and_per_ip_and_recovers_on_drop() {
@@ -556,15 +921,6 @@ mod tests {
             .try_acquire("2001:db8:0:1::1".parse().unwrap())
             .is_some());
         drop(held);
-    }
-
-    #[test]
-    fn wake_connects_to_unspecified_listener() {
-        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accept = std::thread::spawn(move || listener.accept().is_ok());
-        wake_tcp_listener(addr);
-        assert!(accept.join().unwrap());
     }
 
     #[test]

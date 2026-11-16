@@ -1,12 +1,11 @@
 //! DoH listener: DNS over HTTP/2 over TLS, with HTTP/1.1 for clients that do not negotiate h2.
 
 use std::io;
+use std::net::TcpListener;
 #[cfg(test)]
 use std::net::TcpStream;
-use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use onetdns_core::tcp::DeadlineTcp;
@@ -15,37 +14,13 @@ use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
 use onetdns_tls::{server_handshake, ServerConfig, TlsStream};
 
 use crate::connection_limit::{
-    poll_pending_encrypted_connections, spawn_bounded_connection_thread, wake_tcp_listener,
-    AdmissionProtocol, ConnectionLimiter, ConnectionTracker, PendingEncryptedConnection,
-    PrefixedTcp, ENCRYPTED_ACCEPT_BATCH,
+    spawn_bounded_connection_thread, AdmissionProtocol, AdmittedConnection, ConnectionLimiter,
+    ConnectionSignals, EncryptedTcpListener, PrefixedTcp,
 };
 use crate::native::NativeServer;
 use crate::transport_observe;
 
-/// Stops the listener and joins its threads when dropped.
-pub struct DohListener {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
-
-impl DohListener {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-}
-
-impl Drop for DohListener {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        wake_tcp_listener(self.addr);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 
 /// max-age for the response. RFC 8484 caps it at the smallest answer TTL, or the SOA MINIMUM for an
 /// empty answer; 0 when there is neither. Without it, intermediate caches would guess a lifetime
@@ -64,196 +39,53 @@ pub(crate) fn http_freshness_secs(msg: &Message) -> u32 {
         .unwrap_or(0)
 }
 
+/// Serves DoH on `listener`, already bound.
 pub fn serve_doh(
-    addr: SocketAddr,
+    listener: TcpListener,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     path: String,
     admission: Arc<ConnectionLimiter>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) -> io::Result<DohListener> {
-    let listener = TcpListener::bind(addr)?;
-    let bound = listener.local_addr()?;
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<EncryptedTcpListener> {
     let path = Arc::new(path);
-    let tracker = ConnectionTracker::new();
-    let stop = Arc::new(AtomicBool::new(false));
-    let listener_stop = stop.clone();
-    let listener_shutdown = shutdown.clone();
-    let thread = std::thread::Builder::new()
-        .name("doh-listener".into())
-        .spawn(move || {
-            let mut pending = Vec::new();
-            let mut listener_nonblocking = false;
-            while !listener_shutdown.load(Ordering::Relaxed)
-                && !listener_stop.load(Ordering::Relaxed)
-            {
-                let mut accepted = 0usize;
-                if pending.is_empty() {
-                    if listener_nonblocking {
-                        if let Err(error) = listener.set_nonblocking(false) {
-                            transport_observe::record_error(
-                                "doh",
-                                "set_listener_blocking",
-                                None,
-                                error,
-                            );
-                            break;
-                        }
-                        listener_nonblocking = false;
-                    }
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            if listener_shutdown.load(Ordering::Relaxed)
-                                || listener_stop.load(Ordering::Relaxed)
-                            {
-                                break;
-                            }
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Tls,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "doh",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "doh",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                            accepted = 1;
-                        }
-                        Err(error) => {
-                            transport_observe::record_error("doh", "accept", None, error);
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
+    let drops = handler.clone();
+    EncryptedTcpListener::spawn(
+        listener,
+        "doh",
+        AdmissionProtocol::Tls,
+        admission,
+        move |source| drops.drops_source(source),
+        Some(shutdown),
+        move |connection: AdmittedConnection| {
+            let peer = connection.peer;
+            let tls = tls.clone();
+            let handler = handler.clone();
+            let path = path.clone();
+            let spawned = spawn_bounded_connection_thread("doh-connection", move || {
+                let AdmittedConnection {
+                    stream,
+                    signals,
+                    hold: _hold,
+                    ..
+                } = connection;
+                let result = onetdns_core::isolation::catch_request(|| {
+                    serve_conn(stream, &tls.load(), &handler, &path, &signals)
+                });
+                if let Ok(Err(stage)) = result {
+                    if !signals.stopping() {
+                        transport_observe::record_error("doh", stage, Some(peer), stage);
                     }
                 }
-
-                if !listener_nonblocking {
-                    if let Err(error) = listener.set_nonblocking(true) {
-                        transport_observe::record_error(
-                            "doh",
-                            "set_listener_nonblocking",
-                            None,
-                            error,
-                        );
-                        break;
-                    }
-                    listener_nonblocking = true;
-                }
-                while accepted < ENCRYPTED_ACCEPT_BATCH {
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            accepted += 1;
-                            if handler.drops_source(peer.ip()) {
-                                continue;
-                            }
-                            match PendingEncryptedConnection::admit(
-                                stream,
-                                peer,
-                                &admission,
-                                AdmissionProtocol::Tls,
-                            ) {
-                                Ok(Some(connection)) => pending.push(connection),
-                                Ok(None) => transport_observe::record_error(
-                                    "doh",
-                                    "connection_limit",
-                                    Some(peer),
-                                    "maximum concurrent connections reached",
-                                ),
-                                Err(error) => transport_observe::record_error(
-                                    "doh",
-                                    "admission_start",
-                                    Some(peer),
-                                    error,
-                                ),
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            transport_observe::record_error("doh", "accept", None, error);
-                            break;
-                        }
-                    }
-                }
-
-                poll_pending_encrypted_connections(
-                    &mut pending,
-                    |stream, peer, guard| {
-                        let tls = tls.clone();
-                        let handler = handler.clone();
-                        let path = path.clone();
-                        let connection_shutdown = listener_shutdown.clone();
-                        let connection_stop = listener_stop.clone();
-                        let activity = tracker.track();
-                        match spawn_bounded_connection_thread("doh-connection", move || {
-                            let _guards = (guard, activity);
-                            let result = onetdns_core::isolation::catch_request(|| {
-                                serve_conn(
-                                    stream,
-                                    &tls.load(),
-                                    &handler,
-                                    &path,
-                                    connection_shutdown.clone(),
-                                    connection_stop.clone(),
-                                )
-                            });
-                            if let Ok(Err(stage)) = result {
-                                if !connection_shutdown.load(Ordering::Relaxed)
-                                    && !connection_stop.load(Ordering::Relaxed)
-                                {
-                                    transport_observe::record_error(
-                                        "doh",
-                                        stage,
-                                        Some(peer),
-                                        stage,
-                                    );
-                                }
-                            }
-                        }) {
-                            Ok(connection) => drop(connection),
-                            Err(error) => transport_observe::record_error(
-                                "doh",
-                                "thread_spawn",
-                                Some(peer),
-                                error,
-                            ),
-                        }
-                    },
-                    |peer, error| {
-                        transport_observe::record_error(
-                            "doh",
-                            "handshake_admission",
-                            Some(peer),
-                            error,
-                        )
-                    },
-                );
-                if !pending.is_empty() {
-                    thread::sleep(Duration::from_millis(10));
+            });
+            match spawned {
+                Ok(thread) => drop(thread),
+                Err(error) => {
+                    transport_observe::record_error("doh", "thread_spawn", Some(peer), error)
                 }
             }
-            drop(pending);
-            tracker.wait_until_idle();
-        })?;
-    Ok(DohListener {
-        addr: bound,
-        stop,
-        thread: Some(thread),
-    })
+        },
+    )
 }
 
 /// A client ID in the path counts only on an authenticated connection; otherwise anyone could write
@@ -282,13 +114,10 @@ fn serve_conn(
     tls: &ServerConfig,
     handler: &NativeServer,
     path: &str,
-    shutdown: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    signals: &ConnectionSignals,
 ) -> Result<(), &'static str> {
     let src = tcp.peer_addr().map_err(|_| "peer_addr")?;
-    let mut tcp = DeadlineTcp::new(tcp, Instant::now() + DOH_IO_TIMEOUT)
-        .stop_on(shutdown)
-        .stop_on(stop);
+    let mut tcp = signals.watch(DeadlineTcp::new(tcp, Instant::now() + DOH_IO_TIMEOUT));
     let conn = server_handshake(&mut tcp, tls).map_err(|_| "tls_handshake")?;
 
     let alpn = conn.alpn().map(|a| a.to_vec());
@@ -359,14 +188,18 @@ fn serve_conn(
     };
 
     match alpn.as_deref() {
-        Some(b"h2") => {
-            onetdns_http2::serve_doh_with_deadline_reset(&mut stream, path, dns, |stream| {
+        Some(b"h2") => onetdns_http2::serve_doh_with_deadline_reset(
+            &mut stream,
+            path,
+            dns,
+            |stream| {
                 stream
                     .inner_mut()
                     .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
-            })
-            .map_err(|_| "http2_connection")
-        }
+            },
+            &signals.drain,
+        )
+        .map_err(|_| "http2_connection"),
 
         _ => onetdns_http2::serve_doh_h1_with_deadline_reset(&mut stream, path, dns, |stream| {
             stream
@@ -380,6 +213,8 @@ fn serve_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::thread;
 
     fn soa(minimum: u32) -> onetdns_proto::RData {
         onetdns_proto::RData::Soa(Box::new(onetdns_proto::Soa {
@@ -439,7 +274,7 @@ mod tests {
     fn dropping_doh_listener_joins_idle_handshake() {
         let (tls, _) = self_signed();
         let listener = serve_doh(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             native_handler(),
             "/dns-query".to_string(),
@@ -451,7 +286,7 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
         let started = Instant::now();
         drop(listener);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < onetdns_core::tcp::DRAIN_LIMIT);
         drop(client);
     }
 
@@ -621,7 +456,7 @@ mod tests {
         let (tls, trust) = self_signed();
         let handler = native_handler();
         let l = serve_doh(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             "/dns-query".to_string(),
@@ -705,7 +540,7 @@ mod tests {
         let (tls, trust) = self_signed_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let handler = native_handler();
         let l = serve_doh(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             "/dns-query".to_string(),
@@ -736,7 +571,7 @@ mod tests {
         let acl = Arc::new(crate::native_config::DynamicAccessControl::new(dropping()));
         let (tls, trust) = self_signed();
         let l = serve_doh(
-            "127.0.0.1:0".parse().unwrap(),
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             Arc::new(onetdns_core::ArcSwap::new(tls)),
             native_handler_with(acl.clone()),
             "/dns-query".to_string(),

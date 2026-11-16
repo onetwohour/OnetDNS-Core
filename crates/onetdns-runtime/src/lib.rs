@@ -15,12 +15,14 @@ pub use udp::encode_within;
 pub use udp::recv_batch_counters;
 pub use udp::NON_EDNS_UDP_MAX;
 
+pub use sys::{bind_tcp, bind_udp};
+
 use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use onetdns_core::IpNet;
 
@@ -329,12 +331,41 @@ impl Default for ServerConfig {
     }
 }
 
+/// The distinct listening sockets of one address, without the per-worker duplicates: what
+/// `bind_udp` and `bind_tcp` open, and what is handed to the process that replaces this one.
+#[derive(Debug, Default)]
+pub struct ServerSockets {
+    pub udp: Vec<UdpSocket>,
+    pub tcp: Vec<TcpListener>,
+}
+
+impl ServerSockets {
+    /// Fails when a socket cannot be duplicated, which happens only when the process is out of
+    /// descriptors.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            udp: self
+                .udp
+                .iter()
+                .map(UdpSocket::try_clone)
+                .collect::<io::Result<_>>()?,
+            tcp: self
+                .tcp
+                .iter()
+                .map(TcpListener::try_clone)
+                .collect::<io::Result<_>>()?,
+        })
+    }
+}
+
 /// Stops and joins its workers when dropped.
 pub struct Server {
-    shutdown: Arc<AtomicBool>,
-    handles: Vec<JoinHandle<()>>,
+    stop: tcp::ConnectionStop,
+    workers: Workers,
     udp_addr: Option<SocketAddr>,
     tcp_addr: Option<SocketAddr>,
+    /// Kept so `sockets` can hand them on; dropped after the workers have stopped.
+    sockets: ServerSockets,
 }
 
 impl Server {
@@ -344,46 +375,70 @@ impl Server {
     pub fn bind<H: Handler>(
         addr: SocketAddr,
         handler: Arc<H>,
+        cfg: ServerConfig,
+    ) -> io::Result<Server> {
+        let sockets = ServerSockets {
+            udp: if cfg.udp {
+                sys::bind_udp(addr, sys::worker_count(cfg.udp_workers))?
+            } else {
+                Vec::new()
+            },
+            tcp: if cfg.tcp {
+                sys::bind_tcp(addr, sys::worker_count(cfg.tcp_acceptors))?
+            } else {
+                Vec::new()
+            },
+        };
+        Self::serve(sockets, handler, cfg)
+    }
+
+    /// Serves sockets that are already open, such as ones handed over by the process this one
+    /// replaces. Each protocol is served when it has a socket, whatever `cfg.udp` and `cfg.tcp`
+    /// say. On Linux, one reuseport group of TCP sockets gets one acceptor per socket.
+    pub fn serve<H: Handler>(
+        sockets: ServerSockets,
+        handler: Arc<H>,
         mut cfg: ServerConfig,
     ) -> io::Result<Server> {
         let udp_workers = sys::worker_count(cfg.udp_workers);
         let tcp_acceptors = sys::worker_count(cfg.tcp_acceptors);
         cfg.poll_interval = sys::poll_interval(cfg.poll_interval);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = tcp::ConnectionStop::default();
 
-        let udp_socks = if cfg.udp {
-            Some(sys::bind_udp_workers(addr, udp_workers)?)
-        } else {
+        let udp_socks = if sockets.udp.is_empty() {
             None
+        } else {
+            Some(sys::fan_out_udp(&sockets.udp, udp_workers)?)
         };
-        let tcp_listeners = if cfg.tcp {
-            Some(sys::bind_tcp_workers(addr, tcp_acceptors)?)
-        } else {
+        let tcp_listeners = if sockets.tcp.is_empty() {
             None
+        } else {
+            Some(sys::acceptor_sockets(&sockets.tcp, tcp_acceptors)?)
         };
 
-        let mut handles = Vec::with_capacity(udp_workers.saturating_add(tcp_acceptors));
+        let mut workers = Workers::default();
         let mut udp_addr = None;
         let mut tcp_addr = None;
         if let Err(e) = Self::start_workers(
-            &mut handles,
+            &mut workers,
             &mut udp_addr,
             &mut tcp_addr,
             udp_socks,
             tcp_listeners,
             &handler,
             &cfg,
-            &shutdown,
+            &stop,
         ) {
-            stop_workers(&shutdown, &mut handles, udp_addr);
+            workers.stop(&stop, udp_addr);
             return Err(e);
         }
 
         Ok(Server {
-            shutdown,
-            handles,
+            stop,
+            workers,
             udp_addr,
             tcp_addr,
+            sockets,
         })
     }
 
@@ -396,14 +451,14 @@ impl Server {
     /// keep the same connection capacity.
     #[allow(clippy::too_many_arguments)]
     fn start_workers<H: Handler>(
-        handles: &mut Vec<JoinHandle<()>>,
+        workers: &mut Workers,
         udp_addr: &mut Option<SocketAddr>,
         tcp_addr: &mut Option<SocketAddr>,
         udp_socks: Option<Vec<std::net::UdpSocket>>,
         tcp_listeners: Option<Vec<std::net::TcpListener>>,
         handler: &Arc<H>,
         cfg: &ServerConfig,
-        shutdown: &Arc<AtomicBool>,
+        stop: &tcp::ConnectionStop,
     ) -> io::Result<()> {
         if let Some(socks) = udp_socks {
             *udp_addr = Some(socks[0].local_addr()?);
@@ -411,11 +466,11 @@ impl Server {
             for (i, sock) in socks.into_iter().enumerate() {
                 sock.set_read_timeout(udp_read_timeout(cfg.poll_interval))?;
                 let h = handler.clone();
-                let sd = shutdown.clone();
+                let sd = stop.shutdown.clone();
                 let pin = cfg.pin_cores;
                 let reactor = cfg.udp_reactor;
                 let builder = std::thread::Builder::new().name(format!("onetdns-udp-{i}"));
-                handles.push(builder.spawn(move || {
+                workers.udp.push(builder.spawn(move || {
                     if pin {
                         sys::pin_to_core(i);
                     }
@@ -434,7 +489,7 @@ impl Server {
             let trusted_proxies = Arc::new(cfg.trusted_proxies.clone());
             let (connections, connection_handles) = tcp::spawn_connection_workers(
                 handler.clone(),
-                shutdown.clone(),
+                stop.clone(),
                 tcp::ConnectionPoolConfig {
                     poll: cfg.poll_interval,
                     proxy_protocol: cfg.proxy_protocol,
@@ -445,14 +500,14 @@ impl Server {
                     pin_span: acceptors,
                 },
             )?;
-            handles.extend(connection_handles);
+            workers.connections.extend(connection_handles);
             for (i, listener) in listeners.into_iter().enumerate() {
-                let sd = shutdown.clone();
+                let sd = stop.shutdown.clone();
                 let pin = cfg.pin_cores;
                 let poll = cfg.poll_interval;
                 let limiter = limiter.clone();
                 let connections = connections.clone();
-                handles.push(
+                workers.acceptors.push(
                     std::thread::Builder::new()
                         .name(format!("onetdns-tcp-{i}"))
                         .spawn(move || {
@@ -476,13 +531,24 @@ impl Server {
         self.tcp_addr
     }
 
+    /// Duplicates of the listening sockets. They stay open after this server stops, so another
+    /// server, in this process or the next, can keep answering on them.
+    pub fn sockets(&self) -> io::Result<ServerSockets> {
+        self.sockets.try_clone()
+    }
+
+    /// Stops reading the listening sockets and closes this server's handles to them, returning
+    /// once no worker reads them. TCP connections already accepted are served until the server is
+    /// dropped.
+    pub fn stop_reading(&mut self) {
+        report_panicked(self.workers.stop_reading(&self.stop, self.udp_addr));
+        self.sockets = ServerSockets::default();
+    }
+
     /// Joining is required: otherwise a worker still alive holds the port when the next generation
     /// binds it.
     fn stop(&mut self) {
-        let panicked = stop_workers(&self.shutdown, &mut self.handles, self.udp_addr);
-        if panicked > 0 {
-            onetdns_core::error!(event = "server.worker_panicked", workers = panicked, "A query worker thread exited outside a request boundary; running with that many fewer threads meanwhile");
-        }
+        report_panicked(self.workers.stop(&self.stop, self.udp_addr));
     }
 
     pub fn shutdown(mut self) {
@@ -492,7 +558,7 @@ impl Server {
 
 /// On Windows a datagram that arrives just as a receive times out is lost, and with dozens of
 /// workers sharing a socket and timing out periodically, queries occasionally vanish. So Windows
-/// waits without a timeout and `stop_workers` sends wake-up datagrams at shutdown.
+/// waits without a timeout and `Workers::stop_reading` sends wake-up datagrams when the server stops.
 fn udp_read_timeout(poll: Duration) -> Option<Duration> {
     if cfg!(windows) {
         None
@@ -501,26 +567,51 @@ fn udp_read_timeout(poll: Duration) -> Option<Duration> {
     }
 }
 
-/// Returns how many workers ended outside a request boundary.
-fn stop_workers(
-    shutdown: &AtomicBool,
-    handles: &mut Vec<JoinHandle<()>>,
-    udp_addr: Option<SocketAddr>,
-) -> usize {
-    shutdown.store(true, Ordering::SeqCst);
-    if handles.is_empty() {
-        return 0;
+fn report_panicked(workers: usize) {
+    if workers > 0 {
+        onetdns_core::error!(event = "server.worker_panicked", workers, "A query worker thread exited outside a request boundary; running with that many fewer threads meanwhile");
     }
-    if udp_read_timeout(Duration::ZERO).is_none() {
-        if let Some(addr) = udp_addr {
-            wake_udp_workers(handles, addr);
+}
+
+#[derive(Default)]
+struct Workers {
+    udp: Vec<JoinHandle<()>>,
+    acceptors: Vec<JoinHandle<()>>,
+    connections: Vec<JoinHandle<()>>,
+    /// When the listening sockets stopped being read.
+    draining_since: Option<Instant>,
+}
+
+impl Workers {
+    /// Joins the workers that read the listening sockets. Returns how many ended outside a request
+    /// boundary.
+    fn stop_reading(&mut self, stop: &tcp::ConnectionStop, udp_addr: Option<SocketAddr>) -> usize {
+        stop.shutdown.store(true, Ordering::SeqCst);
+        self.draining_since.get_or_insert_with(Instant::now);
+        if udp_read_timeout(Duration::ZERO).is_none() {
+            if let Some(addr) = udp_addr {
+                wake_udp_workers(&self.udp, addr);
+            }
         }
+        joined_with_panic(self.udp.drain(..).chain(self.acceptors.drain(..)))
     }
-    handles
-        .drain(..)
-        .map(JoinHandle::join)
-        .filter(Result::is_err)
-        .count()
+
+    /// TCP connections already accepted, queued ones included, answer what they receive until
+    /// idle, and are closed DRAIN_LIMIT after the listening sockets stopped being read.
+    fn stop(&mut self, stop: &tcp::ConnectionStop, udp_addr: Option<SocketAddr>) -> usize {
+        let panicked = self.stop_reading(stop, udp_addr);
+        let deadline =
+            self.draining_since.unwrap_or_else(Instant::now) + onetdns_core::tcp::DRAIN_LIMIT;
+        while Instant::now() < deadline && self.connections.iter().any(|w| !w.is_finished()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.abort.store(true, Ordering::SeqCst);
+        panicked + joined_with_panic(self.connections.drain(..))
+    }
+}
+
+fn joined_with_panic(workers: impl Iterator<Item = JoinHandle<()>>) -> usize {
+    workers.map(JoinHandle::join).filter(Result::is_err).count()
 }
 
 /// Sends a one-byte datagram, which cannot be a query, to the worker sockets until every thread has
@@ -784,7 +875,7 @@ mod tests {
 
     #[cfg(unix)]
     struct SwitchingReactor {
-        active: AtomicBool,
+        active: std::sync::atomic::AtomicBool,
         asked: AtomicUsize,
         submitted: AtomicUsize,
         handled: AtomicUsize,
@@ -832,7 +923,7 @@ mod tests {
     /// making the socket blocking again would make receives spin.
     fn udp_worker_follows_the_reactor_switch_at_runtime() {
         let handler = Arc::new(SwitchingReactor {
-            active: AtomicBool::new(false),
+            active: std::sync::atomic::AtomicBool::new(false),
             asked: AtomicUsize::new(0),
             submitted: AtomicUsize::new(0),
             handled: AtomicUsize::new(0),
@@ -1179,6 +1270,48 @@ mod tests {
         drop(tcp_server);
         let rebound_tcp = std::net::TcpListener::bind(tcp_addr).expect("TCP port released on drop");
         drop(rebound_tcp);
+    }
+
+    #[test]
+    /// A connection accepted before the stop is still answered, and closes once it goes idle.
+    fn stopping_answers_open_connections_then_closes_them_when_idle() {
+        fn ask(stream: &mut TcpStream, id: u16) -> Option<u16> {
+            let q = query_bytes(id, "drain.example.com");
+            stream.write_all(&(q.len() as u16).to_be_bytes()).ok()?;
+            stream.write_all(&q).ok()?;
+            let mut lenb = [0u8; 2];
+            stream.read_exact(&mut lenb).ok()?;
+            let mut rb = vec![0u8; u16::from_be_bytes(lenb) as usize];
+            stream.read_exact(&mut rb).ok()?;
+            Some(Message::parse(&rb).ok()?.header.id)
+        }
+
+        let mut cfg = test_cfg();
+        cfg.udp = false;
+        let server = Server::bind(local(0), EchoA::new(), cfg).unwrap();
+        let mut stream = TcpStream::connect(server.tcp_addr().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(ask(&mut stream, 1), Some(1));
+
+        let stopping = std::thread::spawn(move || {
+            let started = Instant::now();
+            server.shutdown();
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            ask(&mut stream, 2),
+            Some(2),
+            "멈추는 중에 받은 질의에 답하지 않았습니다"
+        );
+        assert_eq!(
+            stream.read(&mut [0u8; 1]).ok(),
+            Some(0),
+            "조용해진 연결을 닫지 않았습니다"
+        );
+        assert!(stopping.join().unwrap() < onetdns_core::tcp::DRAIN_LIMIT);
     }
 
     #[test]

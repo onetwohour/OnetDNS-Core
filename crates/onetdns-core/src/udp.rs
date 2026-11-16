@@ -61,7 +61,7 @@ impl RecvWait {
 
     fn wait(self, socket: &UdpSocket) -> io::Result<()> {
         #[cfg(windows)]
-        if !windows::wait_readable(socket, self.timeout)? {
+        if !crate::poll::readable(socket, self.timeout)? {
             return Err(io::ErrorKind::TimedOut.into());
         }
         #[cfg(not(windows))]
@@ -75,7 +75,6 @@ mod windows {
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
     use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
-    use std::time::Duration;
 
     const AF_INET: i32 = 2;
     const AF_INET6: i32 = 23;
@@ -89,14 +88,6 @@ mod windows {
     const SO_RANDOMIZE_PORT: i32 = 0x3005;
     const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
     const SIO_UDP_NETRESET: u32 = 0x9800_000F;
-    const POLLRDNORM: i16 = 0x0100;
-
-    #[repr(C)]
-    struct PollFd {
-        fd: usize,
-        events: i16,
-        revents: i16,
-    }
 
     /// Room for a `SOCKADDR_IN6`, the larger of the two.
     #[repr(C, align(8))]
@@ -126,7 +117,6 @@ mod windows {
             overlapped: *mut core::ffi::c_void,
             completion: *mut core::ffi::c_void,
         ) -> i32;
-        fn WSAPoll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
     }
 
     /// Opens a socket the way std does: overlapped and not inherited by child processes.
@@ -201,23 +191,6 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         Ok(socket)
-    }
-
-    /// Returns true when the socket became readable in time. An error state counts as readable;
-    /// the receive that follows reports it.
-    pub(super) fn wait_readable(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
-        let timeout_ms = i32::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
-        let mut entry = PollFd {
-            fd: socket.as_raw_socket() as usize,
-            events: POLLRDNORM,
-            revents: 0,
-        };
-        // SAFETY: one entry holding a live socket, borrowed for the whole call.
-        let ready = unsafe { WSAPoll(&mut entry, 1, timeout_ms) };
-        if ready < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(ready > 0)
     }
 
     /// Stops ICMP port-unreachable and TTL-expired errors from failing the next receive.

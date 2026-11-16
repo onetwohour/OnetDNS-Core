@@ -2,7 +2,7 @@
 //! checks queries, hands them to workers, and writes responses to streams.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -17,14 +17,15 @@ use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
 
+/// Serves DoQ on `socket`, already bound.
 pub fn serve_doq(
-    addr: SocketAddr,
+    socket: UdpSocket,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     shutdown: Arc<AtomicBool>,
     memory_budget: Arc<QuicMemoryBudget>,
 ) -> io::Result<QuicListener> {
-    quic_listener::serve(Doq, addr, tls, handler, shutdown, memory_budget)
+    quic_listener::serve(Doq, socket, tls, handler, shutdown, memory_budget)
 }
 
 /// The reason to close the connection with DOQ_PROTOCOL_ERROR, or None. RFC 9250 makes a non-zero
@@ -130,7 +131,7 @@ impl QuicService for Doq {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::UdpSocket;
+    use std::net::{SocketAddr, UdpSocket};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -147,11 +148,17 @@ mod tests {
     use crate::quic_listener::random_cid;
 
     fn mock_upstream() -> SocketAddr {
+        mock_upstream_after(Duration::ZERO)
+    }
+
+    /// Answers each query `delay` after it arrives.
+    fn mock_upstream_after(delay: Duration) -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         thread::spawn(move || {
             let mut b = [0u8; 4096];
             while let Ok((n, from)) = sock.recv_from(&mut b) {
+                thread::sleep(delay);
                 if let Ok(req) = Message::parse(&b[..n]) {
                     let mut m = Message::default();
                     m.header.id = req.header.id;
@@ -177,13 +184,17 @@ mod tests {
     }
 
     fn native_handler_with(acl: IpAcl) -> Arc<NativeServer> {
+        native_server(acl, mock_upstream())
+    }
+
+    fn native_server(acl: IpAcl, upstream: SocketAddr) -> Arc<NativeServer> {
         let engine = build_from_str("||blocked.test^\n", "", BlockResponse::NxDomain);
         Arc::new(NativeServer::new(
             Arc::new(SharedFilter::from_pointee(engine)),
             Arc::new(acl),
             vec![],
             Arc::new(NativeBackend::Forward(Forwarder::new(
-                vec![mock_upstream()],
+                vec![upstream],
                 Duration::from_secs(2),
             ))),
             60,
@@ -207,7 +218,7 @@ mod tests {
     #[test]
     fn dropping_doq_listener_joins_event_loop() {
         let listener = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler(),
             Arc::new(AtomicBool::new(false)),
@@ -309,7 +320,7 @@ mod tests {
     #[test]
     fn doq_allowed_query_resolves_over_self_quic() {
         let l = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -328,7 +339,7 @@ mod tests {
     /// Whether anything at all comes back to a first packet within `wait`.
     fn first_packet_answered(acl: IpAcl, wait: Duration) -> bool {
         let listener = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler_with(acl),
             Arc::new(AtomicBool::new(false)),
@@ -388,7 +399,7 @@ mod tests {
             tls.cert_chain[0].as_slice()
         ]));
         let listener = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             Arc::new(onetdns_core::ArcSwap::new(Arc::new(tls))),
             native_handler(),
             Arc::new(AtomicBool::new(false)),
@@ -443,13 +454,17 @@ mod tests {
     }
 
     #[test]
-    /// Otherwise clients hold dead connections until their idle deadline. One query first confirms
-    /// the handshake finished, so the close goes out as an application close.
-    fn stopping_the_listener_notifies_open_connections() {
+    /// The listener stops while the upstream is still answering a query: the answer still goes out,
+    /// and a close without error follows, so the client neither loses the query nor holds a dead
+    /// connection until its idle deadline.
+    fn stopping_the_listener_answers_queries_in_flight_then_closes() {
         let listener = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
-            native_handler(),
+            native_server(
+                IpAcl::allow_all(),
+                mock_upstream_after(Duration::from_millis(400)),
+            ),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
         )
@@ -480,7 +495,9 @@ mod tests {
             .unwrap();
 
         let mut listener = Some(listener);
-        let mut asked = false;
+        let mut stopper = None;
+        let mut asked_at = None;
+        let mut answered = false;
         let mut b = [0u8; 2048];
         let clock = Instant::now();
         let deadline = clock + Duration::from_secs(15);
@@ -488,21 +505,27 @@ mod tests {
             let now_ms = clock.elapsed().as_millis() as u64;
             client.set_now(now_ms);
             client.on_timeout(now_ms);
-            if client.is_handshake_complete() && !asked {
+            if client.is_handshake_complete() && asked_at.is_none() {
                 client.send_dns_message(0, &query).unwrap();
-                asked = true;
+                asked_at = Some(Instant::now());
             }
             while let Some(dg) = client.next_datagram() {
                 let _ = sock.send_to(&dg, server);
             }
-            if asked && listener.is_some() && !client.take_stream_requests().is_empty() {
-                drop(listener.take());
+            // The upstream holds the query for 400 ms, so it is in flight when the listener stops.
+            if asked_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(100)) {
+                if let Some(listener) = listener.take() {
+                    stopper = Some(thread::spawn(move || drop(listener)));
+                }
             }
+            answered |= !client.take_stream_requests().is_empty();
             if let Ok((n, _)) = wait.recv_from(&sock, &mut b) {
                 let _ = client.recv_datagram(&b[..n]);
             }
         }
-        assert!(listener.is_none(), "질의에 대한 답을 받지 못했습니다");
+        answered |= !client.take_stream_requests().is_empty();
+        stopper.expect("질의를 보내지 못했습니다").join().unwrap();
+        assert!(answered, "처리 중이던 질의에 답하지 않고 닫았습니다");
         let close = client
             .peer_close()
             .cloned()
@@ -537,7 +560,7 @@ mod tests {
     #[test]
     fn doq_blocked_query_returns_nxdomain_over_self_quic() {
         let l = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -553,7 +576,7 @@ mod tests {
     /// Otherwise a lost response is never sent.
     fn doq_server_pto_retransmits_without_new_client_packets() {
         let l = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -575,7 +598,7 @@ mod tests {
     /// msquic clients connect this way; rejecting their Initial times out the handshake.
     fn doq_answers_client_with_zero_length_connection_id() {
         let l = serve_doq(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),

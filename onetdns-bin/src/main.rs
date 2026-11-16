@@ -42,6 +42,7 @@ mod filters;
 #[cfg(test)]
 /// Parser sweep helpers for tests.
 mod fuzzutil;
+mod handoff;
 /// Config swaps without restart.
 mod hot_apply;
 mod http;

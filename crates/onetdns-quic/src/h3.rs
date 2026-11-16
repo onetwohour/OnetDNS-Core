@@ -874,6 +874,10 @@ fn extract_dns_request(dec: &mut qpack::Decoder, sid: u64, buf: &[u8]) -> Extrac
 pub struct H3Connection {
     conn: Connection,
     control_sent: bool,
+    /// The first request stream not seen yet.
+    next_request: u64,
+    /// The ID our GOAWAY announced; requests on it or later streams are not processed.
+    goaway: Option<u64>,
     requests: HashMap<u64, ReqBuf>,
     ready: Vec<H3DnsRequest>,
     qp: QpackCtx,
@@ -886,6 +890,8 @@ impl H3Connection {
         H3Connection {
             conn,
             control_sent: false,
+            next_request: 0,
+            goaway: None,
             requests: HashMap::new(),
             ready: Vec::new(),
             qp: QpackCtx::new(Role::Server),
@@ -901,6 +907,27 @@ impl H3Connection {
         }
         self.qp.send_setup(&mut self.conn)?;
         self.control_sent = true;
+        Ok(())
+    }
+
+    /// Sends GOAWAY naming the first request stream not seen yet. Requests on it or later streams
+    /// are then dropped unprocessed, which the client learns from the frame; requests already
+    /// started are still taken. Fails when the control stream cannot be opened, as before the
+    /// handshake has keys for application data.
+    pub fn go_away(&mut self) -> Result<(), QuicError> {
+        if self.goaway.is_some() {
+            return Ok(());
+        }
+        self.maybe_send_control()?;
+        let (true, Some(control)) = (self.control_sent, self.qp.ctrl_sid) else {
+            return Err(QuicError::StreamLimit);
+        };
+        let mut payload = Vec::new();
+        varint::write(&mut payload, self.next_request);
+        let mut frame = Vec::new();
+        encode_frame(&mut frame, FRAME_GOAWAY, &payload);
+        send_critical(&mut self.conn, control, &frame)?;
+        self.goaway = Some(self.next_request);
         Ok(())
     }
 
@@ -1016,6 +1043,10 @@ impl H3Connection {
             if id & 0x03 != 0x00 {
                 continue;
             }
+            if self.goaway.is_some_and(|refused| id >= refused) {
+                continue;
+            }
+            self.next_request = self.next_request.max(id + 4);
             if !self.requests.contains_key(&id) && self.requests.len() >= MAX_H3_STREAMS {
                 return Err(H3Error::ExcessiveLoad.into());
             }
@@ -2607,7 +2638,7 @@ mod tests {
         assert!(!client.is_closed() && !server.is_closed());
     }
 
-    /// This server never sends one itself.
+    /// Announces any ID; `go_away` always names the first request stream not seen.
     fn send_goaway(server: &mut H3Connection, first_unprocessed: u64) {
         let control = server.qp.ctrl_sid.expect("서버 제어 스트림");
         let mut payload = Vec::new();
@@ -2658,6 +2689,41 @@ mod tests {
             "처리하지 않는다고 알린 요청의 결과가 두 번 나왔습니다"
         );
         assert!(!client.is_closed());
+    }
+
+    #[test]
+    /// A request the client sent before it learned of the GOAWAY is not processed and is reported
+    /// to the client as such; the request the server had already taken is still answered.
+    fn go_away_names_the_first_request_not_seen() {
+        let (mut client, mut server) = h3_pair();
+        pump_h3(&mut client, &mut server);
+        let kept = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 kept")
+            .unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(server.take_requests().len(), 1);
+
+        let raced = client
+            .send_request("dns.example", "/dns-query", b"\x00\x00 raced")
+            .unwrap();
+        server.go_away().unwrap();
+        pump_h3(&mut client, &mut server);
+        assert!(
+            server.take_requests().is_empty(),
+            "GOAWAY 뒤에 온 요청을 처리했습니다"
+        );
+        assert_eq!(
+            client.take_responses(),
+            vec![(raced, H3Response::Unanswered)]
+        );
+
+        server.send_response(kept, b"\x00\x00 kept", 0).unwrap();
+        pump_h3(&mut client, &mut server);
+        assert_eq!(
+            client.take_responses(),
+            vec![(kept, H3Response::Dns(b"\x00\x00 kept".to_vec()))]
+        );
+        assert!(!client.is_closed() && !server.is_closed());
     }
 
     #[test]

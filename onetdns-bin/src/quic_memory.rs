@@ -41,6 +41,11 @@ impl QuicRunControl {
         self.shutdown.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed)
     }
 
+    /// Server shutdown: connections close at once instead of finishing their queries.
+    pub(crate) fn aborted(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn memory_budget(&self) -> &Arc<QuicMemoryBudget> {
         &self.memory_budget
     }

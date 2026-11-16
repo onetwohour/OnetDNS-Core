@@ -214,32 +214,22 @@ const REACTOR_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_mill
 ///
 /// At most 64 queries are accepted per round, or polling of submitted exchanges would keep
 /// slipping; it also stops at once when the reactor has no free slot.
+///
+/// Receives and sends do not block, but the socket itself stays blocking: its mode is shared by
+/// every handle to it, including the synchronous workers and a process the socket was handed to.
 #[cfg(unix)]
 fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBool) {
     use std::os::fd::AsRawFd;
-    if let Err(error) = sock.set_nonblocking(true) {
-        onetdns_core::error!(event = "dns.reactor_nonblocking_failed", %error, "Could not make the receive socket non-blocking; the reactor may stall on a single query");
-    }
     let listener_fd = sock.as_raw_fd();
     let mut recv = [0u8; MAX_UDP_REQUEST + 1];
     let mut writer = Writer::with_limit(SERVER_UDP_MAX);
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut map: Vec<usize> = Vec::new();
     let mut outq: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
-    let mut may_leave = true;
 
     while !shutdown.load(Ordering::Relaxed) {
-        if may_leave && !handler.reactor_active() {
-            // The synchronous loop expects a blocking socket that waits up to the receive timeout.
-            // Left non-blocking, receives would spin, so stay in this loop if it cannot be
-            // restored.
-            match sock.set_nonblocking(false) {
-                Ok(()) => return,
-                Err(error) => {
-                    onetdns_core::error!(event = "dns.reactor_blocking_failed", %error, "Could not make the receive socket blocking again; staying on the reactor loop");
-                    may_leave = false;
-                }
-            }
+        if !handler.reactor_active() {
+            return;
         }
         fds.clear();
         map.clear();
@@ -261,8 +251,9 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
                 if !handler.reactor_has_capacity() {
                     break;
                 }
-                let (n, src) = match sock.recv_from(&mut recv) {
+                let (n, src) = match recv_from_now(sock, &mut recv) {
                     Ok(v) => v,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) => {
                         record_recv_error(&error);
                         break;
@@ -359,9 +350,7 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
     }
 }
 
-/// Only the batch module, which uses recvmmsg and sendmmsg, calls this, and that module is Linux
-/// only; under `unix` it would be dead code on other Unixes.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     match libc::c_int::from(storage.ss_family) {
@@ -407,8 +396,101 @@ fn record_send_error(src: std::net::SocketAddr, bytes: usize, error: &std::io::E
 #[cfg(unix)]
 /// So the reactor path shares the same counters.
 fn send_or_record(sock: &UdpSocket, wire: &[u8], dst: std::net::SocketAddr) {
-    if let Err(error) = sock.send_to(wire, dst) {
+    if let Err(error) = send_to_now(sock, wire, dst) {
         record_send_error(dst, wire.len(), &error);
+    }
+}
+
+/// `recv_from` that fails with `WouldBlock` instead of waiting, without making the socket
+/// non-blocking.
+#[cfg(unix)]
+fn recv_from_now(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: all-zero bytes are a valid sockaddr_storage.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `buf` and `storage` outlive the call and their sizes are passed with them.
+    let n = unsafe {
+        libc::recvfrom(
+            sock.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let src = decode_sockaddr(&storage)
+        .ok_or_else(|| std::io::Error::other("datagram from an address that is not IP"))?;
+    Ok((n as usize, src))
+}
+
+/// `send_to` that fails with `WouldBlock` instead of waiting, without making the socket
+/// non-blocking.
+#[cfg(unix)]
+fn send_to_now(sock: &UdpSocket, wire: &[u8], dst: std::net::SocketAddr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (storage, len) = encode_sockaddr(dst);
+    // SAFETY: `wire` and `storage` outlive the call and their sizes are passed with them.
+    let n = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            wire.as_ptr().cast(),
+            wire.len(),
+            libc::MSG_DONTWAIT,
+            (&storage as *const libc::sockaddr_storage).cast(),
+            len,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn encode_sockaddr(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: all-zero bytes are a valid sockaddr_storage.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            // SAFETY: sockaddr_storage is large enough and aligned for any socket address.
+            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from(*v4.ip()).to_be(),
+            };
+            let len = std::mem::size_of::<libc::sockaddr_in>();
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                sin.sin_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
+        std::net::SocketAddr::V6(v6) => {
+            // SAFETY: sockaddr_storage is large enough and aligned for any socket address.
+            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            let len = std::mem::size_of::<libc::sockaddr_in6>();
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                sin6.sin6_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 //! checks requests, hands them to workers, and writes responses to streams.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -17,8 +17,9 @@ use crate::quic_memory::QuicMemoryBudget;
 use crate::qworker::QueryJob;
 use crate::transport_observe;
 
+/// Serves DoH3 on `socket`, already bound.
 pub fn serve_doh3(
-    addr: SocketAddr,
+    socket: UdpSocket,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     doh_path: String,
@@ -27,7 +28,7 @@ pub fn serve_doh3(
 ) -> io::Result<QuicListener> {
     quic_listener::serve(
         Doh3 { doh_path },
-        addr,
+        socket,
         tls,
         handler,
         shutdown,
@@ -140,6 +141,10 @@ impl QuicService for Doh3 {
         h3.send_response_owned(stream_id, wire, max_age)
     }
 
+    fn go_away(h3: &mut H3Connection) -> Result<(), QuicError> {
+        h3.go_away()
+    }
+
     fn abandon(h3: &mut H3Connection, why: Abandon) {
         h3.close(match why {
             Abandon::Shutdown => H3Error::NoError,
@@ -232,7 +237,7 @@ mod tests {
     #[test]
     fn dropping_doh3_listener_joins_event_loop() {
         let listener = serve_doh3(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_h3())),
             native_handler(),
             "/dns-query".to_string(),
@@ -321,7 +326,7 @@ mod tests {
     #[test]
     fn doh3_allowed_query_resolves_over_self_h3() {
         let l = serve_doh3(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_h3())),
             native_handler(),
             "/dns-query".into(),
@@ -341,7 +346,7 @@ mod tests {
     #[test]
     fn doh3_blocked_query_returns_nxdomain_over_self_h3() {
         let l = serve_doh3(
-            "127.0.0.1:0".parse().unwrap(),
+            onetdns_core::udp::bind(([127, 0, 0, 1], 0)).unwrap(),
             std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_h3())),
             native_handler(),
             "/dns-query".into(),

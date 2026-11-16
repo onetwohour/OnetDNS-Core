@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::frame::{self, error_code, flags, frame_type, settings, DEFAULT_MAX_FRAME};
 use crate::hpack::{self, Decoder};
@@ -93,16 +94,28 @@ where
     S: Read + Write,
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
-    serve_doh_with_deadline_reset(stream, expected_path, handler, |_| {})
+    serve_doh_with_deadline_reset(
+        stream,
+        expected_path,
+        handler,
+        |_| {},
+        &AtomicBool::new(false),
+    )
 }
 
 /// Calls `reset_deadline` after each complete request, so idle connections time out while busy ones
 /// stay open.
+///
+/// Once `draining` is set, the next frame boundary sends GOAWAY naming the last stream taken; later
+/// streams are refused, and the connection closes when the streams it took are answered. A read
+/// that fails while draining, which is how an idle connection ends then, sends GOAWAY first, so
+/// the client knows which requests were not processed and can send them elsewhere.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
     handler: H,
     mut reset_deadline: R,
+    draining: &AtomicBool,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -138,6 +151,7 @@ where
     let mut peer_max_frame = DEFAULT_MAX_FRAME;
     let mut send_stream_windows: HashMap<u32, i64> = HashMap::new();
     let mut pending: HashMap<u32, PendingBody> = HashMap::new();
+    let mut goaway_sent = false;
 
     loop {
         flush_pending(
@@ -148,9 +162,23 @@ where
             peer_max_frame,
         )?;
 
+        if !goaway_sent && draining.load(Ordering::Relaxed) {
+            send_goaway(stream, last_client_stream)?;
+            goaway_sent = true;
+        }
+        if goaway_sent && streams.is_empty() && pending.is_empty() && cont_stream.is_none() {
+            return Ok(());
+        }
+
         let (h, payload) = match read_frame(stream) {
             Ok(v) => v,
             Err(H2Error::Closed) => return Ok(()),
+            Err(H2Error::Io) if draining.load(Ordering::Relaxed) => {
+                if !goaway_sent {
+                    let _ = send_goaway(stream, last_client_stream);
+                }
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         if !peer_settings_seen {
@@ -257,7 +285,16 @@ where
                     return Err(H2Error::Protocol);
                 }
                 last_client_stream = h.stream_id;
-                if concurrent_streams(&streams, &pending) >= MAX_H2_STREAMS {
+                if goaway_sent || concurrent_streams(&streams, &pending) >= MAX_H2_STREAMS {
+                    // Decoded all the same: HPACK state belongs to the connection. A block that
+                    // continues is collected for a stream that is not kept, then dropped.
+                    let block = strip_headers(&payload, h.flags)?;
+                    if h.has_flag(flags::END_HEADERS) {
+                        dec.decode(block).ok_or(H2Error::Protocol)?;
+                    } else {
+                        cont_block = block.to_vec();
+                        cont_stream = Some(h.stream_id);
+                    }
                     send_rst_stream(stream, h.stream_id, error_code::REFUSED_STREAM)?;
                     continue;
                 }
@@ -519,6 +556,13 @@ fn header_list_size(headers: &[(Vec<u8>, Vec<u8>)]) -> usize {
     headers
         .iter()
         .fold(0usize, |n, (k, v)| n.saturating_add(k.len() + v.len() + 32))
+}
+
+fn send_goaway<S: Write>(stream: &mut S, last_stream: u32) -> Result<(), H2Error> {
+    let mut payload = [0u8; 8];
+    payload[..4].copy_from_slice(&(last_stream & 0x7fff_ffff).to_be_bytes());
+    payload[4..].copy_from_slice(&error_code::NO_ERROR.to_be_bytes());
+    send_frame(stream, frame_type::GOAWAY, 0, 0, &payload)
 }
 
 /// Resets one stream; the connection stays up.
@@ -1376,6 +1420,7 @@ mod tests {
                 |_| {
                     server_resets.fetch_add(1, Ordering::Relaxed);
                 },
+                &std::sync::atomic::AtomicBool::new(false),
             )
         });
 
@@ -1445,6 +1490,122 @@ mod tests {
         }
         assert!(ok, "스트림 {sid}에서 200 응답 기대");
         body
+    }
+
+    /// Frames the server sends until it closes the connection.
+    fn frames_until_close(client: &mut TcpStream) -> Vec<(frame::FrameHeader, Vec<u8>)> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = read_frame(client) {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn goaway_last_stream(frames: &[(frame::FrameHeader, Vec<u8>)]) -> Option<u32> {
+        frames.iter().find_map(|(h, payload)| {
+            (h.frame_type == frame_type::GOAWAY
+                && payload[4..8] == error_code::NO_ERROR.to_be_bytes())
+            .then(|| u32::from_be_bytes(payload[..4].try_into().unwrap()))
+        })
+    }
+
+    #[test]
+    /// A stream open when draining starts is answered; one started after GOAWAY is refused, so the
+    /// client knows it was not processed. The refused stream's header block continues in a second
+    /// frame, which must not break the connection.
+    fn draining_announces_goaway_and_finishes_streams_it_took() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let draining = Arc::new(AtomicBool::new(false));
+        let server_draining = draining.clone();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh_with_deadline_reset(
+                &mut stream,
+                "/dns-query",
+                |query, _| answer(query.to_vec()),
+                |_| {},
+                &server_draining,
+            )
+        });
+
+        let mut client = h2_connect(addr);
+        assert_eq!(h2_exchange_on(&mut client, 1, b"first"), b"first");
+        send_frame(
+            &mut client,
+            frame_type::HEADERS,
+            flags::END_HEADERS,
+            3,
+            &doh_post_header_block(),
+        )
+        .unwrap();
+        draining.store(true, Ordering::Release);
+        send_frame(&mut client, frame_type::PING, 0, 0, &[1; 8]).unwrap();
+        let block = doh_post_header_block();
+        send_frame(&mut client, frame_type::HEADERS, 0, 5, &block[..2]).unwrap();
+        send_frame(
+            &mut client,
+            frame_type::CONTINUATION,
+            flags::END_HEADERS,
+            5,
+            &block[2..],
+        )
+        .unwrap();
+        send_frame(
+            &mut client,
+            frame_type::DATA,
+            flags::END_STREAM,
+            3,
+            b"second",
+        )
+        .unwrap();
+
+        let frames = frames_until_close(&mut client);
+        assert!(server.join().unwrap().is_ok());
+        assert_eq!(goaway_last_stream(&frames), Some(3));
+        assert!(frames
+            .iter()
+            .any(|(h, payload)| h.frame_type == frame_type::RST_STREAM
+                && h.stream_id == 5
+                && *payload == error_code::REFUSED_STREAM.to_be_bytes()));
+        let answered: Vec<u8> = frames
+            .iter()
+            .filter(|(h, _)| h.frame_type == frame_type::DATA && h.stream_id == 3)
+            .flat_map(|(h, payload)| strip_padding(payload, h.flags).unwrap().to_vec())
+            .collect();
+        assert_eq!(answered, b"second");
+    }
+
+    #[test]
+    /// An idle connection that times out while draining says GOAWAY before it closes.
+    fn idle_connection_ends_with_goaway_while_draining() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_draining = draining.clone();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .unwrap();
+            serve_doh_with_deadline_reset(
+                &mut stream,
+                "/dns-query",
+                |query, _| answer(query.to_vec()),
+                |_| {},
+                &server_draining,
+            )
+        });
+
+        let mut client = h2_connect(addr);
+        assert_eq!(h2_exchange_on(&mut client, 1, b"only"), b"only");
+        draining.store(true, std::sync::atomic::Ordering::Release);
+        let frames = frames_until_close(&mut client);
+        assert!(server.join().unwrap().is_ok());
+        assert_eq!(goaway_last_stream(&frames), Some(1));
     }
 
     #[test]
