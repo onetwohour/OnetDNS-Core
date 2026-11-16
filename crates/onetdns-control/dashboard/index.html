@@ -25,7 +25,7 @@
   button[disabled],input[disabled],textarea[disabled],[aria-disabled="true"]{ cursor:not-allowed !important; opacity:.58; }
   [data-readonly-note]{ display:none; }
   [data-readonly="true"] [data-readonly-note]{ display:block; }
-  ::selection{ background:rgba(47,74,107,.20); }
+  ::selection{ background:color-mix(in srgb,var(--accent,#2f4a6b) 24%,transparent); }
   ::-webkit-scrollbar{ width:10px; height:10px; }
   ::-webkit-scrollbar-thumb{ background:var(--sb,#cbd5e1); border-radius:2px; border:2px solid transparent; background-clip:padding-box; }
   ::-webkit-scrollbar-thumb:hover{ background:var(--sb2,#94a3b8); background-clip:padding-box; }
@@ -64,7 +64,7 @@
   {{ navBackdrop }}
   <aside id="primary-navigation" aria-label="주요 메뉴" aria-hidden="{{ navHidden }}" style="{{ sideStyle }}">
     <div style="display:flex;align-items:center;gap:11px;padding:18px 18px 16px">
-      <span aria-hidden="true" style="width:34px;height:34px;border-radius:3px;flex:0 0 34px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#f7f3e9"><svg width="22" height="22" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M38 14.4 A17 17 0 1 0 38 33.6"></path><path d="M31.5 24 H39.5"></path><path d="M9.5 24 H17 L20 16.5 L24.5 31.5 L27.5 24 H33"></path></svg></span>
+      <span aria-hidden="true" style="width:34px;height:34px;border-radius:3px;flex:0 0 34px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:var(--on-accent)"><svg width="22" height="22" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M38 14.4 A17 17 0 1 0 38 33.6"></path><path d="M31.5 24 H39.5"></path><path d="M9.5 24 H17 L20 16.5 L24.5 31.5 L27.5 24 H33"></path></svg></span>
       <div style="line-height:1.12">
         <div style="font-weight:600;font-size:18px;letter-spacing:-.01em;color:var(--fg);font-family:var(--font-display)">{{ brand }}</div>
 
@@ -117,7 +117,7 @@
       <button data-hc="" onClick="{{ toggleTheme }}" title="{{ themeTitle }}" style="width: 38px; height: 38px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--fg2); border-radius: 3px">{{ themeIcon }}</button>
 
       <button data-hc="" onClick="{{ toggleAccount }}" aria-haspopup="menu" aria-expanded="{{ accountOpen }}" aria-controls="account-menu" style="display: flex; align-items: center; gap: 9px; padding: 7px 12px 7px 9px; border: 1px solid var(--border); cursor: pointer; font: inherit; opacity: 1; background-color: var(--surface2); padding-left: 9px; border-radius: 3px">
-        <span style="width:27px;height:27px;border-radius:2px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#f7f3e9;font-family:var(--font-display);font-size:13px;font-weight:600">{{ accountInitial }}</span>
+        <span style="width:27px;height:27px;border-radius:2px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:var(--on-accent);font-family:var(--font-display);font-size:13px;font-weight:600">{{ accountInitial }}</span>
         <sc-if value="{{ desktop }}"><span style="line-height:1.1;text-align:left">
           <span style="display:block;font-size:12px;font-weight:500;color:var(--fg);font-family:var(--font-display)">{{ accountName }}</span>
           <span style="display:block;font-size:10px;color:{{ connectionColor }};font-weight:600">{{ connectionLabel }}</span>
@@ -131,7 +131,7 @@
 
       <sc-if value="{{ readOnly }}"><div role="status" style="max-width:1100px;margin:0 auto 16px;padding:11px 14px;border:1px solid var(--accent-bd);border-left:4px solid var(--accent);border-radius:4px;background:var(--accent-bg);font-size:12px;color:var(--fg2)"><strong style="color:var(--fg)">읽기 전용 세션</strong> · 조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.</div></sc-if>
 
-      <sc-if value="{{ hasConfigDraft }}"><div role="status" style="position:sticky;top:0;z-index:12;max-width:1100px;margin:0 auto 16px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--accent-bd);border-radius:4px;background:var(--accent-bg);box-shadow:0 8px 24px rgba(20,18,12,.12)"><strong style="font-size:12.5px;color:var(--fg);flex:0 0 auto">미적용 변경 {{ configDraftCount }}개</strong><span style="flex:1;min-width:0;font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ configDraftNames }}</span><button onClick="{{ discardConfigDraft }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">취소</button><button onClick="{{ applyConfigDraft }}" style="padding:8px 15px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:700;cursor:pointer">변경 적용</button></div></sc-if>
+      <sc-if value="{{ hasConfigDraft }}"><div role="status" style="position:sticky;top:0;z-index:12;max-width:1100px;margin:0 auto 16px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--accent-bd);border-radius:4px;background:var(--accent-bg);box-shadow:0 8px 24px rgba(20,18,12,.12)"><strong style="font-size:12.5px;color:var(--fg);flex:0 0 auto">미적용 변경 {{ configDraftCount }}개</strong><span style="flex:1;min-width:0;font-size:12px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ configDraftNames }}</span><button onClick="{{ discardConfigDraft }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">취소</button><button onClick="{{ applyConfigDraft }}" style="padding:8px 15px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">변경 적용</button></div></sc-if>
 
       <sc-if value="{{ configOutOfSync }}">
         <div role="status" style="max-width:1100px;margin:0 auto 20px;padding:14px 16px;border:1px solid var(--warn);border-left-width:4px;border-radius:4px;background:var(--warn-bg);display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
@@ -315,7 +315,7 @@
           <div data-mform="" data-submit-enter="" style="display: flex; flex-wrap: wrap; gap: 9px; padding: 14px 0; border-bottom: 1px solid var(--border); background: var(--surface2); padding-left: 18px; padding-right: 18px">
             <input aria-label="필터 목록 이름" data-k="subName" value="{{ forms.subName }}" onInput="{{ onForm }}" placeholder="목록 이름 (선택)" style="flex:1;min-width:150px;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:13px">
             <input aria-label="필터 목록 URL" data-k="subUrl" value="{{ forms.subUrl }}" onInput="{{ onForm }}" placeholder="https://example.com/list.txt" style="flex:1;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:13px;font-family:var(--font-mono)">
-            <button type="button" data-enter-submit="" onClick="{{ addSub }}" style="display:flex;align-items:center;gap:6px;padding:9px 16px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>추가</button>
+            <button type="button" data-enter-submit="" onClick="{{ addSub }}" style="display:flex;align-items:center;gap:6px;padding:9px 16px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:13px;font-weight:600;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>추가</button>
           </div>
           <sc-for list="{{ blocklists }}" as="b" hint-placeholder-count="4">
             <div style="display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid var(--border);animation:odRowGrow .42s cubic-bezier(.4,0,.2,1)">
@@ -358,7 +358,7 @@
               <button type="button" onClick="{{ setRuleAllow }}" style="{{ ruleSegAllow }}">허용</button>
             </div>
             <input aria-label="필터 규칙" data-k="ruleText" value="{{ forms.ruleText }}" onInput="{{ onForm }}" placeholder="{{ rulePlaceholder }}" style="flex:1;min-width:160px;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
-            <button type="button" data-enter-submit="" onClick="{{ addCustomRule }}" style="padding:9px 18px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">규칙 추가</button>
+            <button type="button" data-enter-submit="" onClick="{{ addCustomRule }}" style="padding:9px 18px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">규칙 추가</button>
           </div>
           <div style="display:grid;grid-template-columns:{{ g2 }}">
             <div style="border-right:1px solid var(--border)">
@@ -422,7 +422,7 @@
           <div data-mform="" data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:9px">
             <input aria-label="클라이언트 이름" data-k="clName" value="{{ forms.clName }}" onInput="{{ onForm }}" placeholder="기기/사용자 이름" style="flex: 1; min-width: 150px; padding: 9px 12px; border-radius: 3px; border: 1px solid var(--border); background: var(--surface2); color: var(--fg); font: inherit; font-size: 13px; font-family: var(--font-sans)">
             <input aria-label="클라이언트 식별자" data-k="clId" value="{{ forms.clId }}" onInput="{{ onForm }}" placeholder="IP 주소, CIDR 또는 클라이언트 ID(쉼표로 구분)" style="flex:1;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:13px;font-family:var(--font-mono)">
-            <button type="button" data-enter-submit="" onClick="{{ addClient }}" style="display:flex;align-items:center;gap:6px;padding:9px 16px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>추가</button>
+            <button type="button" data-enter-submit="" onClick="{{ addClient }}" style="display:flex;align-items:center;gap:6px;padding:9px 16px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:13px;font-weight:600;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>추가</button>
           </div>
         </div>
         <div style="overflow-x: auto; overflow-y: hidden; min-width: 0; padding-left: 0px; padding-right: 0px; margin-left: 0px; margin-right: 0px">
@@ -458,7 +458,7 @@
             <div style="display:flex;align-items:center;gap:10px;padding:15px 0;border-bottom:1px solid var(--border)"><span style="font-size:14px;font-weight:500;color:var(--fg);font-family:var(--font-display)">업스트림 DNS 서버</span><span style="font-size:11.5px;color:var(--muted)">DNS 요청을 전달할 서버</span><span style="flex:1"></span><button onClick="{{ testUpstreams }}" style="padding:7px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:600;cursor:pointer">연결 상태 테스트</button></div>
             <div data-mform="" data-submit-enter="" style="display: flex; flex-wrap: wrap; gap: 8px; padding: 13px 0; border-bottom: 1px solid var(--border); background: var(--surface2); margin-left: 0px; margin-right: 0px; padding-left: 18px; padding-right: 18px">
               <input aria-label="업스트림 DNS 서버 주소" data-k="upAddr" value="{{ forms.upAddr }}" onInput="{{ onForm }}" placeholder="1.1.1.1  ·  https://dns.google/dns-query  ·  tls://9.9.9.9" style="flex:1;min-width:160px;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
-              <button type="button" data-enter-submit="" onClick="{{ addUpstream }}" style="padding:9px 15px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer">추가</button>
+              <button type="button" data-enter-submit="" onClick="{{ addUpstream }}" style="padding:9px 15px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:13px;font-weight:600;cursor:pointer">추가</button>
             </div>
             <sc-for list="{{ upstreams }}" as="u" hint-placeholder-count="4">
               <div style="display: flex; align-items: center; gap: 13px; padding: 13px 0; border-bottom: 1px solid var(--border); padding-left: 18px; padding-right: 18px;animation:odRowGrow .42s cubic-bezier(.4,0,.2,1)">
@@ -555,7 +555,7 @@
                   <div onClick="{{ l.editKindDd.toggle }}" onKeyDown="{{ l.editKindDd.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ l.editKindDd.open }}" aria-label="{{ l.editKindDd.ariaLabel }}" style="display:flex;align-items:center;gap:6px;flex:0 0 104px;padding:7px 9px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:11.5px;font-weight:700;font-family:var(--font-mono);cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.editKindDd.label }}</span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
                   <input value="{{ l.editHost }}" onInput="{{ onListenerHost }}" aria-label="주소" placeholder="0.0.0.0" style="flex:1;min-width:110px;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
                   <input value="{{ l.editPort }}" onInput="{{ onListenerPort }}" aria-label="포트" placeholder="53" style="flex:0 0 82px;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
-                  <button data-enter-submit="" onClick="{{ saveListenerEdit }}" style="flex:0 0 auto;padding:7px 13px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button>
+                  <button data-enter-submit="" onClick="{{ saveListenerEdit }}" style="flex:0 0 auto;padding:7px 13px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button>
                   <button onClick="{{ cancelListenerEdit }}" style="flex:0 0 auto;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">취소</button>
                 </div>
               </sc-if>
@@ -571,13 +571,13 @@
               <div style="font-size:12.5px;font-weight:600;color:var(--fg);font-family:var(--font-sans)">인증서 직접 등록</div>
               <label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:9px 12px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg><span style="flex:1;font-size:12px;color:var(--muted)">{{ forms.certFileName }}</span><input type="file" aria-label="인증서 PEM 파일" data-k="certPem" data-label="certFileName" onChange="{{ onCertFile }}" accept=".pem,.crt,.cer,.txt" style="display:none"></label>
               <label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:9px 12px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"></circle><path d="m10.8 12.2 8.2-8.2 2 2-2 2 2 2-2 2-2-2-1.5 1.5"></path></svg><span style="flex:1;font-size:12px;color:var(--muted)">{{ forms.keyFileName }}</span><input type="file" aria-label="개인 키 PEM 파일" data-k="keyPem" data-label="keyFileName" onChange="{{ onCertFile }}" accept=".pem,.key,.txt" style="display:none"></label>
-              <button onClick="{{ uploadCert }}" style="margin-top:auto;padding:9px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">등록 후 적용</button>
+              <button onClick="{{ uploadCert }}" style="margin-top:auto;padding:9px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">등록 후 적용</button>
             </div>
             <div style="display:flex;flex-direction:column;gap:10px">
               <div style="font-size:12.5px;font-weight:600;color:var(--fg);font-family:var(--font-sans)">ACME 자동 발급</div>
               <input aria-label="ACME 도메인" data-k="acmeDomain" value="{{ forms.acmeDomain }}" onInput="{{ onForm }}" placeholder="도메인" style="width:100%;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
               <div onClick="{{ dd.acmeMethod.toggle }}" onKeyDown="{{ dd.acmeMethod.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ dd.acmeMethod.open }}" aria-label="{{ dd.acmeMethod.ariaLabel }}" style="display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ dd.acmeMethod.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
-              <button onClick="{{ requestAcme }}" style="margin-top:auto;padding:9px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">발급 요청</button>
+              <button onClick="{{ requestAcme }}" style="margin-top:auto;padding:9px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">발급 요청</button>
             </div>
           </div>
         </div>
@@ -587,7 +587,7 @@
           <div data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px 8px">
             <input data-k="setupAddress" value="{{ forms.setupAddress }}" onInput="{{ onForm }}" aria-label="클라이언트가 접속할 IP 주소" placeholder="192.168.0.10" style="flex:1 1 140px;min-width:0;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
             <input data-k="setupHost" value="{{ forms.setupHost }}" onInput="{{ onForm }}" aria-label="인증서 호스트명" placeholder="인증서 호스트명" style="flex:1 1 170px;min-width:0;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
-            <button data-enter-submit="" onClick="{{ makeStamps }}" style="padding:7px 14px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer">스탬프 만들기</button>
+            <button data-enter-submit="" onClick="{{ makeStamps }}" style="padding:7px 14px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:600;cursor:pointer">스탬프 만들기</button>
           </div>
           <sc-if value="{{ clientSetup.notice }}"><div style="padding:10px 20px;font-size:11.5px;color:var(--fg2);border-bottom:1px solid var(--border)">{{ clientSetup.notice }}</div></sc-if>
           <sc-for list="{{ clientSetup.rows }}" as="s" hint-placeholder-count="3">
@@ -609,7 +609,7 @@
           <div data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)">
             <span style="font-size:12.5px;color:var(--fg2);flex:1 1 auto;min-width:120px">방화벽 인바운드 규칙 <span style="color:var(--muted)">UDP/TCP</span></span>
             <input data-k="fwPort" value="{{ forms.fwPort }}" onInput="{{ onForm }}" aria-label="방화벽 포트" placeholder="853" style="width:84px;padding:7px 10px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-family:var(--font-mono)">
-            <button onClick="{{ fwAllowPort }}" style="padding:7px 14px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer">열기</button>
+            <button onClick="{{ fwAllowPort }}" style="padding:7px 14px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:600;cursor:pointer">열기</button>
             <button onClick="{{ fwRemovePort }}" style="padding:7px 14px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">닫기</button>
           </div>
           <sc-if value="{{ bootSvc.supported }}">
@@ -647,7 +647,7 @@
           <div style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:12px">DNS 영역 만들기</div>
           <input data-k="zoneOrigin" value="{{ forms.zoneOrigin }}" onInput="{{ onForm }}" aria-label="DNS 영역 이름" placeholder="example.com" style="width:100%;padding:9px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);margin-bottom:8px">
           <textarea data-k="zoneText" value="{{ forms.zoneText }}" onInput="{{ onForm }}" aria-label="DNS 영역 파일 내용" placeholder="$ORIGIN example.com.&#10;@ 300 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 300&#10;@ 300 IN NS ns.example.com.&#10;ns 300 IN A 192.0.2.53" style="width:100%;min-height:130px;padding:10px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:12px var(--font-mono);resize:vertical"></textarea>
-          <button type="button" data-enter-submit="" onClick="{{ createZone }}" style="margin-top:9px;padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">DNS 영역 만들기</button>
+          <button type="button" data-enter-submit="" onClick="{{ createZone }}" style="margin-top:9px;padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">DNS 영역 만들기</button>
         </div>
         <sc-for list="{{ zones }}" as="z" hint-placeholder-count="1">
           <div style="min-width:0">
@@ -660,7 +660,7 @@
               <input aria-label="DNS 레코드 이름" data-k="recName" value="{{ forms.recName }}" onInput="{{ onForm }}" placeholder="name" style="width:130px;padding:8px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
               <div onClick="{{ dd.recType.toggle }}" onKeyDown="{{ dd.recType.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ dd.recType.open }}" aria-label="{{ dd.recType.ariaLabel }}" style="display:flex;align-items:center;gap:8px;width:92px;padding:9px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ dd.recType.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
               <input aria-label="DNS 레코드 값" data-k="recVal" value="{{ forms.recVal }}" onInput="{{ onForm }}" placeholder="value" style="flex:1;padding:8px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
-              <button type="button" data-enter-submit="" onClick="{{ z.onAddRecord }}" aria-label="{{ '레코드 추가: ' + z.origin }}" style="padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">레코드 추가</button>
+              <button type="button" data-enter-submit="" onClick="{{ z.onAddRecord }}" aria-label="{{ '레코드 추가: ' + z.origin }}" style="padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">레코드 추가</button>
             </div>
             <div style="overflow-x:auto;overflow-y:hidden;min-width:0">
             <div style="display: grid; grid-template-columns: 150px 70px 70px 1fr 44px; gap: 0; min-width: 540px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 10.5px; font-weight: 700; color: var(--muted); padding-left: 18px; padding-right: 18px">
@@ -725,7 +725,7 @@
             <input aria-label="DHCP 예약 클라이언트 식별자" data-k="resIdentity" value="{{ forms.resIdentity }}" onInput="{{ onForm }}" placeholder="mac:aabbccddeeff 또는 id:0102" style="width:250px;padding:8px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
             <input aria-label="DHCP 예약 IP 주소" data-k="resIp" value="{{ forms.resIp }}" onInput="{{ onForm }}" placeholder="192.168.1.50" style="width:130px;padding:8px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-family:var(--font-mono)">
             <input aria-label="DHCP 예약 호스트명" data-k="resHost" value="{{ forms.resHost }}" onInput="{{ onForm }}" placeholder="호스트명 (선택)" style="flex:1;min-width:120px;padding:8px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px">
-            <button type="button" data-enter-submit="" onClick="{{ addReservation }}" style="padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">고정 할당 추가</button>
+            <button type="button" data-enter-submit="" onClick="{{ addReservation }}" style="padding:8px 15px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">고정 할당 추가</button>
           </div>
           </sc-if>
           <sc-for list="{{ reservations }}" as="r" hint-placeholder-count="2">
@@ -751,7 +751,7 @@
             <div><label style="display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:5px">유형</label><div onClick="{{ dd.exQtype.toggle }}" onKeyDown="{{ dd.exQtype.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ dd.exQtype.open }}" aria-label="{{ dd.exQtype.ariaLabel }}" style="display:flex;align-items:center;gap:8px;width:100%;padding:9px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ dd.exQtype.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div></div>
             <div><label style="display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:5px">클라이언트</label><input aria-label="질의 클라이언트 주소" data-k="exClient" value="{{ forms.exClient }}" onInput="{{ onForm }}" style="width:100%;padding:10px 12px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:13px;font-family:var(--font-mono)"></div>
           </div>
-          <button onClick="{{ runExplain }}" style="display: flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 3px; border: 0; background: var(--accent); color: #fff; font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; flex-wrap: nowrap; width: 100%; justify-content: center; flex-direction: row"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>조회</button>
+          <button onClick="{{ runExplain }}" style="display: flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 3px; border: 0; background: var(--accent); color: var(--on-accent); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; flex-wrap: nowrap; width: 100%; justify-content: center; flex-direction: row"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>조회</button>
         </div>
         <sc-if value="{{ hasExPanel }}"><div style="padding:22px">{{ exPanel }}</div></sc-if>
       </div>
@@ -834,7 +834,7 @@
             <div style="flex:1;min-width:220px"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">소프트웨어 업데이트</div><div style="font-size:11px;color:var(--muted);margin-top:3px">서명된 공식 릴리스를 확인하고 이 노드에 설치합니다.</div></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <sc-if value="{{ upd.canCheck }}"><button onClick="{{ upd.onCheck }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">업데이트 확인</button></sc-if>
-              <sc-if value="{{ upd.canApply }}"><button onClick="{{ upd.onApply }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.applyLabel }}</button></sc-if>
+              <sc-if value="{{ upd.canApply }}"><button onClick="{{ upd.onApply }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.applyLabel }}</button></sc-if>
               <sc-if value="{{ upd.canRollback }}"><button onClick="{{ upd.onRollback }}" disabled="{{ upd.busy }}" style="padding:8px 12px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:700;cursor:pointer">{{ upd.rollbackLabel }}</button></sc-if>
             </div>
           </div>
@@ -852,7 +852,7 @@
           <section style="min-width:0">
             <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">캐시와 백업</div><div style="font-size:11px;color:var(--muted);margin-top:3px">캐시 초기화와 필터 데이터(규칙·서비스·거절 도메인·세이프서치)의 내보내기 및 복원</div></div>
             <div style="padding:14px 0;display:flex;gap:8px;flex-wrap:wrap"><button onClick="{{ flushCache }}" style="padding:9px 13px;border:1px solid var(--block);border-radius:3px;background:var(--block-bg);color:var(--block);font:inherit;font-size:12px;font-weight:700;cursor:pointer">응답 캐시 비우기</button><span data-readonly-safe=""><button onClick="{{ downloadBackup }}" style="padding:9px 13px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:700;cursor:pointer">백업 다운로드</button></span></div>
-            <div style="padding:13px 0;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px"><div style="display:flex;align-items:center;gap:8px"><label style="font-size:11px;font-weight:700;color:var(--muted);flex:1">JSON 백업 복원</label><span style="font-size:10.5px;color:var(--faint)">최대 1MB</span></div><label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:9px 11px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg><span style="flex:1;min-width:0;font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ restoreFileName }}</span><span style="font-size:10.5px;font-weight:700;color:var(--accent)">JSON 선택</span><input type="file" accept="application/json,.json" aria-label="백업 파일 선택" onChange="{{ onRestoreFile }}" style="display:none"></label><button onClick="{{ restoreBackup }}" disabled="{{ !restoreReady }}" style="align-self:flex-start;padding:9px 13px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:700;cursor:pointer">선택한 백업 복원</button></div>
+            <div style="padding:13px 0;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px"><div style="display:flex;align-items:center;gap:8px"><label style="font-size:11px;font-weight:700;color:var(--muted);flex:1">JSON 백업 복원</label><span style="font-size:10.5px;color:var(--faint)">최대 1MB</span></div><label style="display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:3px;padding:9px 11px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg><span style="flex:1;min-width:0;font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ restoreFileName }}</span><span style="font-size:10.5px;font-weight:700;color:var(--accent)">JSON 선택</span><input type="file" accept="application/json,.json" aria-label="백업 파일 선택" onChange="{{ onRestoreFile }}" style="display:none"></label><button onClick="{{ restoreBackup }}" disabled="{{ !restoreReady }}" style="align-self:flex-start;padding:9px 13px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">선택한 백업 복원</button></div>
           </section>
 
           <section style="min-width:0">
@@ -870,7 +870,7 @@
         <div style="display:grid;grid-template-columns:{{ g2 }};gap:30px;align-items:start">
           <section style="min-width:0">
             <div style="padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">DNS 응답 재작성</div><div style="font-size:11px;color:var(--muted);margin-top:3px">특정 도메인의 응답을 지정한 IP 또는 도메인으로 변경</div></div>
-            <div data-mform="" data-submit-enter="" style="padding:13px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)"><input data-k="rewriteDomain" value="{{ forms.rewriteDomain }}" onInput="{{ onForm }}" aria-label="재작성 도메인" placeholder="router.lan" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><input data-k="rewriteAnswer" value="{{ forms.rewriteAnswer }}" onInput="{{ onForm }}" aria-label="재작성 응답" placeholder="10.0.0.1" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ addRewrite }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button></div>
+            <div data-mform="" data-submit-enter="" style="padding:13px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)"><input data-k="rewriteDomain" value="{{ forms.rewriteDomain }}" onInput="{{ onForm }}" aria-label="재작성 도메인" placeholder="router.lan" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><input data-k="rewriteAnswer" value="{{ forms.rewriteAnswer }}" onInput="{{ onForm }}" aria-label="재작성 응답" placeholder="10.0.0.1" style="flex:1;min-width:150px;padding:9px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--fg);font:inherit;font-family:var(--font-mono);font-size:12px"><button data-enter-submit="" onClick="{{ addRewrite }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">저장</button></div>
             <sc-if value="{{ hasRewrites }}"><div><sc-for list="{{ rewriteRows }}" as="r" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,.75fr) 32px;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)"><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.domain }}<sc-if value="{{ r.applying }}"><span style="margin-left:8px;font-size:11px;font-weight:500;color:var(--muted)">적용 중…</span></sc-if></span><span style="font-family:var(--font-mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.answer }}</span><button onClick="{{ r.onRemove }}" aria-label="{{ r.removeLabel }}" title="{{ r.removeLabel }}" style="width:30px;height:30px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--block);cursor:pointer">×</button></div></sc-for></div></sc-if>
             <sc-if value="{{ !hasRewrites }}"><div style="padding:20px 0;text-align:center;font-size:11.5px;color:var(--muted)">등록된 재작성 규칙이 없습니다.</div></sc-if>
           </section>
@@ -1008,7 +1008,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
                 <button onClick="{{ diffConfig }}" style="padding:9px 14px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">변경 비교</button>
                 <span style="flex:1"></span>
                 <button onClick="{{ rollbackConfig }}" style="padding:9px 14px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--warn);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">되돌리기</button>
-                <button onClick="{{ applyConfig }}" style="padding:9px 18px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">적용</button>
+                <button onClick="{{ applyConfig }}" style="padding:9px 18px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">적용</button>
               </div>
             </div>
           </div>
@@ -1057,7 +1057,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
       <sc-if value="{{ isAccount }}"><div data-readonly-safe="">
       <div style="max-width:620px;margin:0 auto">
         <div style="display:flex;align-items:center;gap:16px;padding-bottom:22px;border-bottom:1px solid var(--border);margin-bottom:24px">
-          <span style="width:56px;height:56px;border-radius:4px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#f7f3e9;font-family:var(--font-display);font-size:26px;font-weight:600">{{ accountInitial }}</span>
+          <span style="width:56px;height:56px;border-radius:4px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:var(--on-accent);font-family:var(--font-display);font-size:26px;font-weight:600">{{ accountInitial }}</span>
           <div><div style="font-size:18px;font-weight:500;color:var(--fg);font-family:var(--font-display);letter-spacing:-.02em">{{ accountName }}</div><div style="font-size:12.5px;color:var(--muted);margin-top:2px">{{ accountRoleLabel }}</div></div>
         </div>
         <div style="font-size:12px;font-weight:700;color:var(--muted);margin-bottom:14px">로그인 정보</div>
@@ -1068,7 +1068,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
           <div><label for="new-password" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">새 비밀번호</label><input id="new-password" type="password" autocomplete="new-password" data-k="newPassword" value="{{ forms.newPassword }}" onInput="{{ onForm }}" placeholder="12자 이상" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px"></div>
           <div><label for="confirm-password" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">새 비밀번호 확인</label><input id="confirm-password" type="password" autocomplete="new-password" data-k="confirmPassword" value="{{ forms.confirmPassword }}" onInput="{{ onForm }}" placeholder="새 비밀번호 다시 입력" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px"></div>
         </div>
-        <button onClick="{{ changePw }}" style="padding:11px 22px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:13.5px;font-weight:600;cursor:pointer">비밀번호 변경</button>
+        <button onClick="{{ changePw }}" style="padding:11px 22px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:13.5px;font-weight:600;cursor:pointer">비밀번호 변경</button>
       </div>
       </div></sc-if>
 
@@ -1082,7 +1082,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
         <div style="display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--border);margin-bottom:4px">
           <span style="font-size:12px;font-weight:700;color:var(--muted);flex:1">발급한 토큰</span>
           <div onClick="{{ tokRoleDD.toggle }}" onKeyDown="{{ tokRoleDD.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ tokRoleDD.open }}" aria-label="{{ tokRoleDD.ariaLabel }}" style="display:flex;align-items:center;gap:8px;min-width:130px;padding:9px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ tokRoleDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
-          <button onClick="{{ addToken }}" style="padding:8px 16px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">발급</button>
+          <button onClick="{{ addToken }}" style="padding:8px 16px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">발급</button>
         </div>
         <sc-if value="{{ hasTokenSecret }}"><div style="margin:12px 0;padding:12px;border:1px solid var(--warn);border-radius:3px;background:var(--surface2)"><div style="font-size:11px;font-weight:700;color:var(--warn);margin-bottom:6px">새 토큰은 지금 한 번만 표시됩니다</div><code style="font-family:var(--font-mono);font-size:12px;word-break:break-all">{{ tokenSecret }}</code><button onClick="{{ copyNewToken }}" style="margin-left:10px;padding:6px 10px;border-radius:2px;border:1px solid var(--border);background:var(--surface);color:var(--fg);cursor:pointer">복사</button></div></sc-if>
         <sc-for list="{{ tokens }}" as="t" hint-placeholder-count="3">
@@ -1163,7 +1163,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
     <sc-if value="{{ confirmDetail }}"><div style="padding:0 22px 4px;font-size:12px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere;white-space:pre-line">{{ confirmDetail }}</div></sc-if>
     <div style="display:flex;justify-content:flex-end;gap:8px;padding:16px 22px 18px">
       <button onClick="{{ onConfirmCancel }}" style="padding:9px 15px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">취소</button>
-      <button onClick="{{ onConfirmOk }}" data-confirm-ok="" style="padding:9px 17px;border:0;border-radius:3px;background:var(--accent);color:#fff;font:inherit;font-size:12.5px;font-weight:700;cursor:pointer">확인</button>
+      <button onClick="{{ onConfirmOk }}" data-confirm-ok="" style="padding:9px 17px;border:0;border-radius:3px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:700;cursor:pointer">확인</button>
     </div>
   </div></div></sc-if>
 
@@ -1171,7 +1171,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
   <sc-if value="{{ loggedOut }}">
   <div id="login-gate" role="dialog" aria-modal="true" aria-labelledby="login-title" tabIndex="-1" style="position:fixed;inset:0;z-index:80;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:24px">
     <div style="width:380px;max-width:100%;text-align:center">
-      <span aria-hidden="true" style="width:60px;height:60px;border-radius:4px;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;background:var(--accent);color:#f7f3e9"><svg width="40" height="40" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M38 14.4 A17 17 0 1 0 38 33.6"></path><path d="M31.5 24 H39.5"></path><path d="M9.5 24 H17 L20 16.5 L24.5 31.5 L27.5 24 H33"></path></svg></span>
+      <span aria-hidden="true" style="width:60px;height:60px;border-radius:4px;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;background:var(--accent);color:var(--on-accent)"><svg width="40" height="40" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M38 14.4 A17 17 0 1 0 38 33.6"></path><path d="M31.5 24 H39.5"></path><path d="M9.5 24 H17 L20 16.5 L24.5 31.5 L27.5 24 H33"></path></svg></span>
       <div id="login-title" style="font-size:27px;font-weight:600;color:var(--fg);letter-spacing:-.012em;font-family:var(--font-display)">OnetDNS 콘솔</div>
       <p style="font-size:13px;color:var(--muted);margin:6px 0 26px">{{ loginSubtitle }}</p>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:22px;text-align:left">
@@ -1192,10 +1192,10 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
         <label for="setup-code" style="display:block;font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px">설정 코드</label>
         <input id="setup-code" autocomplete="off" spellcheck="false" data-k="setupCode" value="{{ forms.setupCode }}" onInput="{{ onForm }}" onKeyDown="{{ setupKeyDown }}" placeholder="파일에 적힌 코드" style="width:100%;padding:11px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:14px;font-family:var(--font-mono,monospace);margin-bottom:6px">
         <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:18px;word-break:break-all">{{ setupCodeHint }}</div>
-        <button onClick="{{ createAccount }}" disabled="{{ authPending }}" style="width:100%;padding:12px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:14px;font-weight:600;cursor:pointer;opacity:{{ authButtonOpacity }}">{{ setupButtonLabel }}</button>
+        <button onClick="{{ createAccount }}" disabled="{{ authPending }}" style="width:100%;padding:12px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:14px;font-weight:600;cursor:pointer;opacity:{{ authButtonOpacity }}">{{ setupButtonLabel }}</button>
         </sc-if>
         <sc-if value="{{ loginEnabled }}">
-        <button onClick="{{ login }}" disabled="{{ authPending }}" style="width:100%;padding:12px;border-radius:3px;border:0;background:var(--accent);color:#fff;font:inherit;font-size:14px;font-weight:600;cursor:pointer;opacity:{{ authButtonOpacity }}">{{ loginButtonLabel }}</button>
+        <button onClick="{{ login }}" disabled="{{ authPending }}" style="width:100%;padding:12px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:14px;font-weight:600;cursor:pointer;opacity:{{ authButtonOpacity }}">{{ loginButtonLabel }}</button>
         </sc-if>
       </div>
     </div>
@@ -6083,14 +6083,14 @@ class Component extends DCLogic {
 
   themeTokens(theme){
     if((theme||this.state.theme)==='dark') return {
-      '--bg':'#16130d','--surface':'#16130d','--surface2':'#221d14','--surface3':'#2c261b','--border':'#2c261b','--fg':'#f1ece0','--fg2':'#cdc6b6','--muted':'#a69e8d','--faint':'#a69e8d',
-      '--accent':'#8fa6c8','--accent-bg':'#1d2230','--accent-bd':'#333d52',
-      '--ok':'#5aab73','--ok-bg':'#16271b','--block':'#df6f5f','--block-bg':'#2b1815','--warn':'#cf9f48','--warn-bg':'#281f10','--violet':'#b39ac0','--violet-bg':'#231b29',
-      '--shadow':'none','--sb':'#373125','--sb2':'#4a4234'
+      '--bg':'#171614','--surface':'#171614','--surface2':'#201f1c','--surface3':'#2a2925','--border':'#33312c','--fg':'#ece8df','--fg2':'#c8c3b8','--muted':'#9d978b','--faint':'#9d978b',
+      '--accent':'#9fb3cf','--accent-bg':'#1f242c','--accent-bd':'#3a4555','--on-accent':'#171614',
+      '--ok':'#7cb58a','--ok-bg':'#18231b','--block':'#e58b7c','--block-bg':'#2c1b18','--warn':'#d9ad62','--warn-bg':'#2b2316','--violet':'#c0a7cc','--violet-bg':'#261f2a',
+      '--shadow':'none','--sb':'#3a3833','--sb2':'#55524b'
     };
     return {
       '--bg':'#f7f3e9','--surface':'#f7f3e9','--surface2':'#efe8d9','--surface3':'#e6ddc9','--border':'#ddd3bd','--fg':'#241d12','--fg2':'#4b4234','--muted':'#6f6655','--faint':'#6b6252',
-      '--accent':'#2f4a6b','--accent-bg':'#e8ecf2','--accent-bd':'#ccd6e3',
+      '--accent':'#2f4a6b','--accent-bg':'#e8ecf2','--accent-bd':'#ccd6e3','--on-accent':'#fff',
       '--ok':'#3c6b41','--ok-bg':'#e9efe4','--block':'#a8392c','--block-bg':'#f3e5df','--warn':'#946612','--warn-bg':'#f3ead3','--violet':'#6d4a63','--violet-bg':'#efe6ec',
       '--shadow':'none','--sb':'#d8cdb5','--sb2':'#b6ab92'
     };
@@ -7410,8 +7410,8 @@ class Component extends DCLogic {
       leaseV6Empty:dhcpOff?this.t('이 서버의 DHCP가 꺼져 있습니다.'):this.t('임대 중인 IPv6 주소가 없습니다.'),
       addSub:this.addSub, addBlockRule:this.addBlockRule, addAllowRule:this.addAllowRule,
       addCustomRule:this.addCustomRule,
-      ruleSegBlock:`padding:8px 14px;border-radius:3px;border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:${s.forms.ruleType==='block'?'700':'500'};background:${s.forms.ruleType==='block'?'var(--block)':'transparent'};color:${s.forms.ruleType==='block'?'#fff':'var(--muted)'}`,
-      ruleSegAllow:`padding:8px 14px;border-radius:3px;border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:${s.forms.ruleType==='allow'?'700':'500'};background:${s.forms.ruleType==='allow'?'var(--ok)':'transparent'};color:${s.forms.ruleType==='allow'?'#fff':'var(--muted)'}`,
+      ruleSegBlock:`padding:8px 14px;border-radius:3px;border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:${s.forms.ruleType==='block'?'700':'500'};background:${s.forms.ruleType==='block'?'var(--block)':'transparent'};color:${s.forms.ruleType==='block'?'var(--on-accent)':'var(--muted)'}`,
+      ruleSegAllow:`padding:8px 14px;border-radius:3px;border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:${s.forms.ruleType==='allow'?'700':'500'};background:${s.forms.ruleType==='allow'?'var(--ok)':'transparent'};color:${s.forms.ruleType==='allow'?'var(--on-accent)':'var(--muted)'}`,
       setRuleBlock:this.setRuleType('block'), setRuleAllow:this.setRuleType('allow'),
       rulePlaceholder:s.forms.ruleType==='allow'?'@@||cdn.example.com^':'||ads.example.com^',
       refreshLists:this.refreshLists,
@@ -7448,7 +7448,7 @@ class Component extends DCLogic {
 
       runExplain:this.runExplain, exPanel, hasExPanel,
 
-      cself, peers, clusterPropose:this.clusterPropose,hasRaftKey:!!(s.cluster.identity&&s.cluster.identity.public_key),raftKey:(s.cluster.identity&&s.cluster.identity.public_key)||'',hasRaftPeerEntry:!!(s.cluster.identity&&s.cluster.identity.peer_entry),raftPeerEntry:(s.cluster.identity&&s.cluster.identity.peer_entry)||'',copyRaftPeerEntry:this.copyRaftPeerEntry,clusterSelfDetail,clusterHealthy,clusterHealthLabel:this.t(clusterHealthy?'정상':'상태 불명'),clusterHealthColor:clusterHealthy?'var(--ok)':'var(--muted)',clusterHealthAnimation:clusterHealthy?'odPulse 1.6s ease-in-out infinite':'none',clusterCanPropose,clusterProposeStyle:`padding:8px 15px;border-radius:3px;border:0;background:${clusterCanPropose?'var(--violet)':'var(--surface3)'};color:${clusterCanPropose?'#fff':'var(--muted)'};font:inherit;font-size:12.5px;font-weight:700;cursor:${clusterCanPropose?'pointer':'not-allowed'}`,
+      cself, peers, clusterPropose:this.clusterPropose,hasRaftKey:!!(s.cluster.identity&&s.cluster.identity.public_key),raftKey:(s.cluster.identity&&s.cluster.identity.public_key)||'',hasRaftPeerEntry:!!(s.cluster.identity&&s.cluster.identity.peer_entry),raftPeerEntry:(s.cluster.identity&&s.cluster.identity.peer_entry)||'',copyRaftPeerEntry:this.copyRaftPeerEntry,clusterSelfDetail,clusterHealthy,clusterHealthLabel:this.t(clusterHealthy?'정상':'상태 불명'),clusterHealthColor:clusterHealthy?'var(--ok)':'var(--muted)',clusterHealthAnimation:clusterHealthy?'odPulse 1.6s ease-in-out infinite':'none',clusterCanPropose,clusterProposeStyle:`padding:8px 15px;border-radius:3px;border:0;background:${clusterCanPropose?'var(--violet)':'var(--surface3)'};color:${clusterCanPropose?'var(--on-accent)':'var(--muted)'};font:inherit;font-size:12.5px;font-weight:700;cursor:${clusterCanPropose?'pointer':'not-allowed'}`,
 
       cfgNums, blockModes, cfgToggles,hasConfigDraft:Object.keys(s.configDraft||{}).length>0,configDraftCount:Object.keys(s.configDraft||{}).length.toLocaleString(this.locale()),configDraftNames:this.configLabels(Object.keys(s.configDraft||{})).join(', '),applyConfigDraft:this.applyConfigDraft,discardConfigDraft:this.discardConfigDraft,
       schemaShown, schemaCount, schemaElsewhere, schemaHasElsewhere, schemaNoMatch,
@@ -7497,7 +7497,7 @@ class Component extends DCLogic {
       )
     );
     const da=this.domainAction(d.qname,d.decision),cBlocked=this.clientBlocked(d.client);
-    const actBtn=(label,active,color,onClick)=>R('button',{onClick,style:{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:10,cursor:'pointer',font:'inherit',fontSize:12.5,fontWeight:700,border:active?'1px solid '+color:'0',background:active?'transparent':color,color:active?color:'#fff'}},
+    const actBtn=(label,active,color,onClick)=>R('button',{onClick,style:{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'10px 12px',borderRadius:10,cursor:'pointer',font:'inherit',fontSize:12.5,fontWeight:700,border:active?'1px solid '+color:'0',background:active?'transparent':color,color:active?color:'var(--on-accent)'}},
       R('svg',{width:14,height:14,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2.2,strokeLinecap:'round',strokeLinejoin:'round'},R('path',{d:active?'M20 6 9 17l-5-5':'M4.9 4.9 19 19M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z'})),label);
     const actions=R('div',{style:{display:'flex',gap:9,marginBottom:20}},
       actBtn(da.label, da.lift, da.lift?'var(--ok)':'var(--block)', this.runDomainAction(d.qname, d.decision)),
