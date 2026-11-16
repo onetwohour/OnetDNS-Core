@@ -27,23 +27,7 @@ pub(crate) fn save_upstream_stats(
     /// Consecutive save failures; warned at powers of two.
     static CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-    let items: Vec<String> = reports
-        .iter()
-        .map(|r| {
-            format!(
-                "{{\"label\":{},\"queries\":{},\"ok\":{},\"fail\":{},\"ewma_ms\":{:.1}}}",
-                onetdns_core::json::escape(&r.label),
-                r.queries,
-                r.ok,
-                r.fail,
-                r.ewma_ms
-            )
-        })
-        .collect();
-    match atomic_write(
-        path,
-        format!("{{\"version\":1,\"reports\":[{}]}}", items.join(",")).as_bytes(),
-    ) {
+    match atomic_write(path, upstream_stats_json(reports).as_bytes()) {
         Ok(()) => {
             let failures = CONSECUTIVE_FAILURES.swap(0, Ordering::Relaxed);
             if failures > 0 {
@@ -71,41 +55,47 @@ pub(crate) fn save_upstream_stats(
     }
 }
 
-pub(crate) fn load_upstream_stats(
-    path: &std::path::Path,
-) -> Vec<onetdns_forward::UpstreamStatReport> {
-    let text = match read_text_limited(path, MAX_UPSTREAM_STATS_BYTES) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return vec![],
-        Err(error) => {
-            onetdns_core::warn!(
-                event = "upstream.stats_load_failed",
-                path = %path.display(),
-                %error,
-                "Could not read the upstream DNS server statistics file; starting fresh for this run"
-            );
-            return vec![];
+/// The file format.
+pub(crate) fn upstream_stats_json(reports: &[onetdns_forward::UpstreamStatReport]) -> String {
+    let items: Vec<String> = reports
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"label\":{},\"queries\":{},\"ok\":{},\"fail\":{},\"ewma_ms\":{:.1}}}",
+                onetdns_core::json::escape(&r.label),
+                r.queries,
+                r.ok,
+                r.fail,
+                r.ewma_ms
+            )
+        })
+        .collect();
+    format!("{{\"version\":1,\"reports\":[{}]}}", items.join(","))
+}
+
+pub(crate) enum UpstreamStatsError {
+    Json(String),
+    NotObject,
+    Format,
+}
+
+impl std::fmt::Display for UpstreamStatsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamStatsError::Json(error) => write!(f, "not valid JSON: {error}"),
+            UpstreamStatsError::NotObject => f.write_str("not a JSON object"),
+            UpstreamStatsError::Format => f.write_str("does not match the current format"),
         }
-    };
-    let json = match onetdns_core::json::parse(&text) {
-        Ok(json) => json,
-        Err(error) => {
-            onetdns_core::warn!(
-                event = "upstream.stats_parse_failed",
-                path = %path.display(),
-                %error,
-                "Upstream DNS server statistics file is corrupted; starting fresh for this run"
-            );
-            return vec![];
-        }
-    };
+    }
+}
+
+/// Rejects the whole text on any deviation from the file format.
+pub(crate) fn parse_upstream_stats(
+    text: &str,
+) -> Result<Vec<onetdns_forward::UpstreamStatReport>, UpstreamStatsError> {
+    let json = onetdns_core::json::parse(text).map_err(UpstreamStatsError::Json)?;
     let onetdns_core::json::Json::Obj(fields) = &json else {
-        onetdns_core::warn!(
-            event = "upstream.stats_format_invalid",
-            path = %path.display(),
-            "Upstream DNS server statistics file does not hold a JSON object; starting fresh"
-        );
-        return vec![];
+        return Err(UpstreamStatsError::NotObject);
     };
     let reports = (|| {
         if fields.len() != 2
@@ -150,15 +140,53 @@ pub(crate) fn load_upstream_stats(
             })
             .collect::<Option<Vec<_>>>()
     })();
-    let Some(reports) = reports else {
-        onetdns_core::warn!(
-            event = "upstream.stats_format_invalid",
-            path = %path.display(),
-            "Upstream DNS server statistics file does not match the current format; starting fresh"
-        );
-        return vec![];
+    reports.ok_or(UpstreamStatsError::Format)
+}
+
+pub(crate) fn load_upstream_stats(
+    path: &std::path::Path,
+) -> Vec<onetdns_forward::UpstreamStatReport> {
+    let text = match read_text_limited(path, MAX_UPSTREAM_STATS_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(error) => {
+            onetdns_core::warn!(
+                event = "upstream.stats_load_failed",
+                path = %path.display(),
+                %error,
+                "Could not read the upstream DNS server statistics file; starting fresh for this run"
+            );
+            return vec![];
+        }
     };
-    reports
+    match parse_upstream_stats(&text) {
+        Ok(reports) => reports,
+        Err(UpstreamStatsError::Json(error)) => {
+            onetdns_core::warn!(
+                event = "upstream.stats_parse_failed",
+                path = %path.display(),
+                %error,
+                "Upstream DNS server statistics file is corrupted; starting fresh for this run"
+            );
+            vec![]
+        }
+        Err(UpstreamStatsError::NotObject) => {
+            onetdns_core::warn!(
+                event = "upstream.stats_format_invalid",
+                path = %path.display(),
+                "Upstream DNS server statistics file does not hold a JSON object; starting fresh"
+            );
+            vec![]
+        }
+        Err(UpstreamStatsError::Format) => {
+            onetdns_core::warn!(
+                event = "upstream.stats_format_invalid",
+                path = %path.display(),
+                "Upstream DNS server statistics file does not match the current format; starting fresh"
+            );
+            vec![]
+        }
+    }
 }
 
 /// Spawned even without a forwarding path: a later hot apply may build a forwarding resolver whose
