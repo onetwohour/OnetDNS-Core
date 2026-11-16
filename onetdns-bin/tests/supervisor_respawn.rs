@@ -11,6 +11,7 @@
 //! process.
 #![cfg(target_os = "linux")]
 
+use onetdns_forward::{Forwarder, Message, TrustStore, Upstream};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::ffi::OsStrExt;
@@ -585,62 +586,248 @@ fn cli_rollback_without_an_update_leaves_the_directory_alone() {
     assert_eq!(listing(dir), before);
 }
 
-/// Answered from `rewrites`, so no query leaves the machine.
+/// Answered from `rewrites`, so no query leaves the machine. Also the name on the TLS certificate.
 const LOCAL_NAME: &str = "handoff.test";
+/// The default `dnscrypt_provider_name`.
+const DNSCRYPT_PROVIDER: &str = "2.dnscrypt-cert.onetdns";
 const CONTROL_TOKEN: &str = "handoff-test-control-token-0123456789";
+const ADMIN_PASSWORD: &str = "handoff-test-password";
 /// A query unanswered this long counts as lost.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Keeps the TCP lanes from piling up TIME_WAIT sockets.
 const QUERY_PACE: Duration = Duration::from_millis(20);
+/// Longer than the successor takes to start answering, so the predecessor has counted more
+/// queries by then than the successor counts by itself.
+const LOAD_BEFORE_UPDATE: Duration = Duration::from_secs(4);
+const TYPE_A: u16 = 1;
+const TYPE_TXT: u16 = 16;
 
-fn write_handoff_config(dir: &Path, dns_port: u16, control_port: u16) -> PathBuf {
-    let config = dir.join("onetdns.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "listen = [\"127.0.0.1:{dns_port}\"]\ncontrol_listen = \"127.0.0.1:{control_port}\"\ncontrol_token = \"{CONTROL_TOKEN}\"\nrewrites = [{{ domain = \"{LOCAL_NAME}\", answer = \"192.0.2.1\" }}]\n"
-        ),
-    )
-    .expect("설정을 쓰지 못했습니다");
-    config
+struct Ports {
+    dns: u16,
+    dot: u16,
+    doh: u16,
+    dnscrypt: u16,
+    control: u16,
 }
 
-/// Starts a rollback through the management API, as the dashboard does, once the API takes it.
-fn request_rollback(control_port: u16) {
-    let deadline = Instant::now() + EVENT_TIMEOUT;
-    loop {
-        match post(control_port, "/v1/system/update/rollback") {
-            Ok(response) if response.starts_with("HTTP/1.1 200") => return,
-            Ok(response) if !response.starts_with("HTTP/1.1 503") => {
-                panic!("되돌리기 요청이 거절됐습니다:\n{response}")
+/// An install directory right after an update, serving Do53, DoT, DoH, DNSCrypt, and the
+/// management API, each on its own free port.
+struct Handoff {
+    swapped: Swapped,
+    config: PathBuf,
+    ports: Ports,
+    /// Trusts the server's self-signed certificate.
+    trust: Arc<TrustStore>,
+}
+
+impl Handoff {
+    /// The update is committed, so the management API can roll it back.
+    fn prepare(dir: &Path) -> Self {
+        let swapped = Swapped::prepare(dir);
+        swapped.commit();
+        let cert = dir.join("tls.crt");
+        let key = dir.join("tls.key");
+        let output = run_cli(
+            &swapped.program,
+            dir,
+            &[
+                "cert",
+                "--host",
+                LOCAL_NAME,
+                "--cert-out",
+                cert.to_str().expect("인증서 경로가 UTF-8 이 아닙니다"),
+                "--key-out",
+                key.to_str().expect("키 경로가 UTF-8 이 아닙니다"),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "인증서를 만들지 못했습니다: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pem = std::fs::read(&cert).expect("인증서를 읽지 못했습니다");
+        let ports = Ports {
+            dns: free_port(),
+            dot: free_port(),
+            doh: free_port(),
+            dnscrypt: free_port(),
+            control: free_port(),
+        };
+        let config = dir.join("onetdns.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "listen = [\"127.0.0.1:{}\"]\nlisten_dot = [\"127.0.0.1:{}\"]\nlisten_doh = [\"127.0.0.1:{}\"]\nlisten_dnscrypt = [\"127.0.0.1:{}\"]\ntls_cert = \"{}\"\ntls_key = \"{}\"\ncontrol_listen = \"127.0.0.1:{}\"\ncontrol_token = \"{CONTROL_TOKEN}\"\nrewrites = [{{ domain = \"{LOCAL_NAME}\", answer = \"192.0.2.1\" }}]\n",
+                ports.dns,
+                ports.dot,
+                ports.doh,
+                ports.dnscrypt,
+                cert.display(),
+                key.display(),
+                ports.control
+            ),
+        )
+        .expect("설정을 쓰지 못했습니다");
+        Self {
+            swapped,
+            config,
+            ports,
+            trust: Arc::new(TrustStore::from_pem(&pem)),
+        }
+    }
+
+    /// One lane per transport. Do53 TCP opens a new connection per query; DoT and DoH keep theirs
+    /// as clients do, and connect again once the process that served it closes it.
+    fn lanes(&self) -> Vec<(&'static str, Ask)> {
+        let ports = &self.ports;
+        let udp = connected_udp(ports.dns);
+        let dnscrypt = connected_udp(ports.dnscrypt);
+        let dns = ports.dns;
+        let dot = Forwarder::with_upstreams(
+            vec![Upstream::dot(loopback(ports.dot), LOCAL_NAME)],
+            ANSWER_TIMEOUT,
+        )
+        .with_trust(self.trust.clone());
+        let doh = Forwarder::with_upstreams(
+            vec![Upstream::doh(loopback(ports.doh), LOCAL_NAME, "/dns-query")],
+            ANSWER_TIMEOUT,
+        )
+        .with_trust(self.trust.clone());
+        vec![
+            (
+                "UDP",
+                Box::new(move |id| ask_udp(&udp, id, LOCAL_NAME, TYPE_A)) as Ask,
+            ),
+            ("TCP", Box::new(move |id| ask_tcp(dns, id))),
+            ("DoT", Box::new(move |id| ask_forwarder(&dot, id))),
+            ("DoH", Box::new(move |id| ask_forwarder(&doh, id))),
+            // The DNSCrypt listener answers its certificate query without encryption.
+            (
+                "DNSCrypt",
+                Box::new(move |id| ask_udp(&dnscrypt, id, DNSCRYPT_PROVIDER, TYPE_TXT)),
+            ),
+        ]
+    }
+
+    /// Creates the first account with the setup code, as the dashboard does, and returns its
+    /// session cookie.
+    fn sign_in(&self, dir: &Path) -> String {
+        let code = std::fs::read_to_string(dir.join("setup-code.txt"))
+            .expect("설정 코드를 읽지 못했습니다");
+        let body = format!(
+            "{{\"code\":\"{}\",\"user\":\"admin\",\"password\":\"{ADMIN_PASSWORD}\"}}",
+            code.trim()
+        );
+        let response = http(
+            self.ports.control,
+            "POST",
+            "/v1/setup",
+            "Content-Type: application/json\r\n",
+            &body,
+        )
+        .expect("계정을 만들지 못했습니다");
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .and_then(|cookie| cookie.split(';').next())
+            .unwrap_or_else(|| panic!("세션 쿠키가 없습니다:\n{response}"))
+            .to_string()
+    }
+
+    fn signed_in(&self, cookie: &str) -> bool {
+        http(
+            self.ports.control,
+            "GET",
+            "/v1/stats",
+            &format!("Cookie: {cookie}\r\n"),
+            "",
+        )
+        .is_ok_and(|response| response.starts_with("HTTP/1.1 200"))
+    }
+
+    fn total_queries(&self) -> u64 {
+        let response = http(self.ports.control, "GET", "/v1/stats", &bearer(), "")
+            .expect("통계를 읽지 못했습니다");
+        response
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| onetdns_core::json::parse(body).ok())
+            .and_then(|json| json.get("metrics")?.get("total")?.as_u64())
+            .unwrap_or_else(|| panic!("통계 응답에 total 이 없습니다:\n{response}"))
+    }
+
+    /// The resolver public key and client magic in the DNSCrypt certificate, which clients
+    /// encrypt their queries with.
+    fn dnscrypt_resolver_key(&self) -> Vec<u8> {
+        let socket = connected_udp(self.ports.dnscrypt);
+        let request = query(1, DNSCRYPT_PROVIDER, TYPE_TXT);
+        socket
+            .send(&request)
+            .expect("인증서 질의를 보내지 못했습니다");
+        let mut answer = [0u8; 1232];
+        let length = socket
+            .recv(&mut answer)
+            .expect("인증서 질의의 응답이 없습니다");
+        // After the question: name pointer, type, class, TTL, RDATA length, TXT length.
+        let cert = &answer[request.len() + 13..length];
+        cert[72..112].to_vec()
+    }
+
+    /// Starts a rollback, as the dashboard does, once the management API takes it.
+    fn request_rollback(&self) {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        loop {
+            match http(
+                self.ports.control,
+                "POST",
+                "/v1/system/update/rollback",
+                &bearer(),
+                "",
+            ) {
+                Ok(response) if response.starts_with("HTTP/1.1 200") => return,
+                Ok(response) if !response.starts_with("HTTP/1.1 503") => {
+                    panic!("되돌리기 요청이 거절됐습니다:\n{response}")
+                }
+                _ if Instant::now() >= deadline => {
+                    panic!("관리 API 가 되돌리기 요청을 받지 않습니다")
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
             }
-            _ if Instant::now() >= deadline => panic!("관리 API 가 되돌리기 요청을 받지 않습니다"),
-            _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
 
-fn post(port: u16, path: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+fn bearer() -> String {
+    format!("Authorization: Bearer {CONTROL_TOKEN}\r\n")
+}
+
+/// The whole response, status line first.
+fn http(port: u16, method: &str, path: &str, headers: &str, body: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(loopback(port))?;
     stream.set_read_timeout(Some(EVENT_TIMEOUT))?;
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {CONTROL_TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
 }
 
-/// An A query for LOCAL_NAME.
-fn query(id: u16) -> Vec<u8> {
+fn query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut message = id.to_be_bytes().to_vec();
     message.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    for label in LOCAL_NAME.split('.') {
+    for label in name.split('.') {
         message.push(label.len() as u8);
         message.extend_from_slice(label.as_bytes());
     }
-    message.extend_from_slice(&[0, 0, 1, 0, 1]);
+    message.push(0);
+    message.extend_from_slice(&qtype.to_be_bytes());
+    message.extend_from_slice(&[0, 1]);
     message
 }
 
@@ -658,23 +845,33 @@ fn check_answer(id: u16, answer: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn ask_udp(socket: &UdpSocket, id: u16) -> Result<(), String> {
+fn connected_udp(port: u16) -> UdpSocket {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("UDP 소켓을 열지 못했습니다");
     socket
-        .send(&query(id))
-        .map_err(|error| format!("UDP 질의 {id} 를 보내지 못했습니다: {error}"))?;
-    let mut answer = [0u8; 512];
+        .connect(loopback(port))
+        .expect("UDP 소켓을 연결하지 못했습니다");
+    socket
+        .set_read_timeout(Some(ANSWER_TIMEOUT))
+        .expect("UDP 대기 시간");
+    socket
+}
+
+fn ask_udp(socket: &UdpSocket, id: u16, name: &str, qtype: u16) -> Result<(), String> {
+    socket
+        .send(&query(id, name, qtype))
+        .map_err(|error| format!("질의 {id} 를 보내지 못했습니다: {error}"))?;
+    let mut answer = [0u8; 1232];
     let length = socket
         .recv(&mut answer)
-        .map_err(|error| format!("UDP 질의 {id} 의 응답이 없습니다: {error}"))?;
+        .map_err(|error| format!("질의 {id} 의 응답이 없습니다: {error}"))?;
     check_answer(id, &answer[..length])
 }
 
 fn ask_tcp(port: u16, id: u16) -> Result<(), String> {
     let exchange = || -> std::io::Result<Vec<u8>> {
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), ANSWER_TIMEOUT)?;
+        let mut stream = TcpStream::connect_timeout(&loopback(port), ANSWER_TIMEOUT)?;
         stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
-        let message = query(id);
+        let message = query(id, LOCAL_NAME, TYPE_A);
         let mut framed = (message.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&message);
         stream.write_all(&framed)?;
@@ -684,9 +881,27 @@ fn ask_tcp(port: u16, id: u16) -> Result<(), String> {
         stream.read_exact(&mut answer)?;
         Ok(answer)
     };
-    let answer = exchange().map_err(|error| format!("TCP 질의 {id} 가 실패했습니다: {error}"))?;
+    let answer = exchange().map_err(|error| format!("질의 {id} 가 실패했습니다: {error}"))?;
     check_answer(id, &answer)
 }
+
+fn ask_forwarder(forwarder: &Forwarder, id: u16) -> Result<(), String> {
+    let request = Message::parse(&query(id, LOCAL_NAME, TYPE_A))
+        .map_err(|error| format!("질의 {id} 를 만들지 못했습니다: {error:?}"))?;
+    let answer = forwarder
+        .resolve(&request)
+        .map_err(|error| format!("질의 {id} 가 실패했습니다: {error}"))?;
+    if answer.header.rcode != 0 || answer.answers.is_empty() {
+        return Err(format!(
+            "질의 {id} 의 응답 코드 {}, 응답 레코드 {}개",
+            answer.header.rcode,
+            answer.answers.len()
+        ));
+    }
+    Ok(())
+}
+
+type Ask = Box<dyn FnMut(u16) -> Result<(), String> + Send>;
 
 #[derive(Default)]
 struct Tally {
@@ -694,43 +909,34 @@ struct Tally {
     failures: Vec<String>,
 }
 
-/// Asks for LOCAL_NAME until finished: two lanes over UDP, two over a new TCP connection per query.
+/// Each lane asks in turn on its own thread until finished.
 struct Load {
     stop: Arc<AtomicBool>,
     lanes: Vec<std::thread::JoinHandle<Tally>>,
 }
 
 impl Load {
-    fn start(port: u16) -> Self {
+    fn start(lanes: Vec<(&'static str, Ask)>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let lanes = (0..4)
-            .map(|lane| {
+        let lanes = lanes
+            .into_iter()
+            .map(|(name, mut ask)| {
                 let stop = stop.clone();
                 std::thread::spawn(move || {
-                    let udp = (lane % 2 == 0).then(|| {
-                        let socket =
-                            UdpSocket::bind("127.0.0.1:0").expect("UDP 소켓을 열지 못했습니다");
-                        socket
-                            .connect(("127.0.0.1", port))
-                            .expect("UDP 소켓을 연결하지 못했습니다");
-                        socket
-                            .set_read_timeout(Some(ANSWER_TIMEOUT))
-                            .expect("UDP 대기 시간");
-                        socket
-                    });
                     let mut tally = Tally::default();
                     let mut id: u16 = 0;
                     while !stop.load(Ordering::Relaxed) {
                         id = id.wrapping_add(1);
-                        let asked = match &udp {
-                            Some(socket) => ask_udp(socket, id),
-                            None => ask_tcp(port, id),
-                        };
-                        match asked {
+                        match ask(id) {
                             Ok(()) => tally.answered += 1,
-                            Err(error) => tally.failures.push(error),
+                            Err(error) => tally.failures.push(format!("{name}: {error}")),
                         }
                         std::thread::sleep(QUERY_PACE);
+                    }
+                    if tally.answered == 0 {
+                        tally
+                            .failures
+                            .push(format!("{name}: 답을 받은 질의가 없습니다"));
                     }
                     tally
                 })
@@ -788,29 +994,32 @@ fn assert_no_query_failed(load: Load, server: &Server) {
         tally.failures,
         server.log_text()
     );
-    assert!(tally.answered > 0, "답을 받은 질의가 없습니다");
 }
 
 #[test]
 /// A rollback through the management API starts the previous executable beside the running worker,
-/// which hands its sockets over. Queries over UDP and TCP keep being answered throughout, and the
-/// supervisor then runs from the install path with the successor as its only child.
+/// which hands its sockets and state over. Queries over every transport keep being answered, the
+/// counts, the dashboard session, and the DNSCrypt key carry over, and the supervisor then runs
+/// from the install path with the successor as its only child.
 fn an_update_hands_over_without_failing_a_query() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
-    let swapped = Swapped::prepare(dir);
-    swapped.commit();
-    let (dns_port, control_port) = (free_port(), free_port());
-    let config = write_handoff_config(dir, dns_port, control_port);
+    let handoff = Handoff::prepare(dir);
 
-    let mut server = Server::supervised(dir, swapped.program.clone(), &config);
+    let mut server = Server::supervised(dir, handoff.swapped.program.clone(), &handoff.config);
     let first = server.wait_for("server.ready", None);
     server.children.push(first);
-    let load = Load::start(dns_port);
-    request_rollback(control_port);
+    let cookie = handoff.sign_in(dir);
+    let dnscrypt_key = handoff.dnscrypt_resolver_key();
+    let load = Load::start(handoff.lanes());
+    std::thread::sleep(LOAD_BEFORE_UPDATE);
+    handoff.request_rollback();
+    server.wait_for_own("update.trial_started");
+    let counted_before = handoff.total_queries();
     server.wait_for_own("supervisor.update_exec");
     let children = children_of(server.pid());
     server.children.extend(&children);
+    let counted_after = handoff.total_queries();
     // Lets the successor answer under the supervisor's new image for a while.
     std::thread::sleep(Duration::from_secs(1));
     assert_no_query_failed(load, &server);
@@ -819,11 +1028,24 @@ fn an_update_hands_over_without_failing_a_query() {
         children.len() == 1 && children[0] != first,
         "감독자의 자식 {children:?}, 이전 작업 프로세스 {first}"
     );
-    let record = swapped.record_text();
+    assert!(
+        counted_after >= counted_before,
+        "인계 전 질의 수 {counted_before}, 인계 뒤 {counted_after}"
+    );
+    assert!(
+        handoff.signed_in(&cookie),
+        "인계 뒤 대시보드 세션이 풀렸습니다"
+    );
+    assert_eq!(
+        handoff.dnscrypt_resolver_key(),
+        dnscrypt_key,
+        "DNSCrypt 리졸버 키"
+    );
+    let record = handoff.swapped.record_text();
     assert!(record.contains("state=committed\n"), "{record}");
     assert_eq!(
-        sha256_hex(&swapped.program),
-        swapped.previous_sha256,
+        sha256_hex(&handoff.swapped.program),
+        handoff.swapped.previous_sha256,
         "설치 경로"
     );
 }
@@ -835,16 +1057,13 @@ fn an_update_hands_over_without_failing_a_query() {
 fn a_successor_that_dies_during_the_handoff_fails_no_query() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
-    let swapped = Swapped::prepare(dir);
-    swapped.commit();
-    let (dns_port, control_port) = (free_port(), free_port());
-    let config = write_handoff_config(dir, dns_port, control_port);
+    let handoff = Handoff::prepare(dir);
 
-    let mut server = Server::supervised(dir, swapped.program.clone(), &config);
+    let mut server = Server::supervised(dir, handoff.swapped.program.clone(), &handoff.config);
     let first = server.wait_for("server.ready", None);
     server.children.push(first);
-    let load = Load::start(dns_port);
-    request_rollback(control_port);
+    let load = Load::start(handoff.lanes());
+    handoff.request_rollback();
     server.wait_for_own("update.trial_started");
     let successor = children_of(server.pid())
         .into_iter()
@@ -858,15 +1077,15 @@ fn a_successor_that_dies_during_the_handoff_fails_no_query() {
     assert_no_query_failed(load, &server);
 
     assert_eq!(children_of(server.pid()), vec![first]);
-    let record = swapped.record_text();
+    let record = handoff.swapped.record_text();
     assert!(record.contains("state=reverted\n"), "{record}");
     assert!(
         record.contains("reason=The new version exited before it became ready"),
         "{record}"
     );
     assert_eq!(
-        sha256_hex(&swapped.program),
-        swapped.new_sha256,
+        sha256_hex(&handoff.swapped.program),
+        handoff.swapped.new_sha256,
         "설치 경로"
     );
 }
