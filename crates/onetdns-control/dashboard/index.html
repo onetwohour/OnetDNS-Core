@@ -5011,7 +5011,7 @@ class Component extends DCLogic {
   sessionResetPatch(connectionState,notice){
     const f=this.state.forms||{};
     return {loggedIn:false,authRole:'none',authPending:false,restOnline:false,streamOnline:false,connectionState:connectionState||'offline',connectionAt:0,loginNotice:notice||'',
-      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,
+      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,listsUpdating:false,
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
       log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],clientSetup:null,
       rewrites:[],filterPlugins:[],filterReport:null,topRules:null,filterSources:null,access:null,revocation:null,zoneDnssec:null,
@@ -6585,7 +6585,21 @@ class Component extends DCLogic {
     if(result.done)this.watchFilterApply();else this.toastMsg('갱신 실패: '+result.failure,true);
     await this.reloadSubs();
   };
-  refreshLists=async()=>{if(this.state.listsUpdating)return;this.setState({listsUpdating:true});const r=await this.apiSend('/v1/jobs/refresh','POST');this.setState({listsUpdating:false});if(r.ok){this.toastMsg('필터 목록 갱신을 시작했습니다');}else this.toastMsg('갱신 실패: '+this.errorText(r),true);};
+  refreshLists=async()=>{
+    if(this.state.listsUpdating)return;
+    const generation=this._sessionGeneration,live=()=>generation===this._sessionGeneration;
+    this.setState({listsUpdating:true});
+    const r=await this.apiSend('/v1/jobs/refresh','POST');
+    const id=r.ok&&r.body&&!r.body.error?r.body.id:null;
+    if(id==null){if(!r.stale){this.setState({listsUpdating:false});this.toastMsg('갱신 실패: '+this.errorText(r),true);}return;}
+    this.toastMsg('필터 목록 갱신을 시작했습니다');
+    const result=await this.waitForJob(id,live);
+    if(result.abandoned)return;
+    this.setState({listsUpdating:false});
+    if(!result.done)this.toastMsg('갱신 실패: '+result.failure,true);
+    await this.reloadSubs();
+    if(this.state.view==='lists')this.loadFilterDiagnostics();
+  };
   addSub=async()=>{
     const f=this.state.forms,url=(f.subUrl||'').trim(),title=(f.subName||'').trim();
     if(!/^https?:\/\//i.test(url))return this.toastMsg('HTTP 또는 HTTPS URL을 입력하세요',true);
