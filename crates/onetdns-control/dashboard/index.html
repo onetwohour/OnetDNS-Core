@@ -589,7 +589,7 @@
                 <span style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:{{ l.pc }};border:1px solid var(--border);border-radius:2px;padding:2px 0;flex:0 0 58px;text-align:center">{{ l.proto }}</span>
                 <span style="font-family:var(--font-mono);font-size:12.5px;color:var(--fg);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.addr }}</span>
                 <span title="{{ l.connsLabel }}" style="font-size:11px;color:{{ l.connsColor }};flex:0 1 auto;min-width:0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.connsLabel }}</span>
-                <span style="font-size:11px;color:var(--muted);flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.certLabel }}</span>
+                <span style="font-size:11px;color:var(--muted);flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.sockets }}</span>
                 <button onClick="{{ l.onEdit }}" aria-label="{{ l.editLabel }}" style="flex:0 0 auto;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--fg2);font:inherit;font-size:12px;font-weight:600;cursor:pointer">고치기</button>
                 <button onClick="{{ l.onDelete }}" aria-label="{{ l.deleteLabel }}" style="flex:0 0 auto;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--block);font:inherit;font-size:12px;font-weight:600;cursor:pointer">지우기</button>
               </sc-if>
@@ -1771,7 +1771,6 @@ Object.assign(I18N.en, {
   "{queries} 질의 · 성공 {success}%": "{queries} queries · {success}% successful",
   "{proto} {addr} 서비스 주소 중지": "Stop {proto} on {addr}",
   "{proto} {addr} 서비스 주소 시작": "Start {proto} on {addr}",
-  "평문": "Plaintext",
   "중지됨": "Stopped",
   "수신 중 · {bound}": "Listening · {bound}",
   "설정됨 (bind 미확인)": "Configured (binding not verified)",
@@ -1839,7 +1838,6 @@ Object.assign(I18N.ja, {
   "{queries} 질의 · 성공 {success}%": "{queries} クエリ・成功 {success}%",
   "{proto} {addr} 서비스 주소 중지": "{proto} リスナー {addr} を停止",
   "{proto} {addr} 서비스 주소 시작": "{proto} リスナー {addr} を開始",
-  "평문": "平文",
   "중지됨": "停止中",
   "수신 중 · {bound}": "待受中・{bound}",
   "설정됨 (bind 미확인)": "設定済み（bind 未確認）",
@@ -3663,7 +3661,6 @@ Object.assign(I18N.zh, {
   "{queries} 질의 · 성공 {success}%":"{queries} 次查询 · 成功率 {success}%",
   "{proto} {addr} 서비스 주소 중지":"停止 {addr} 上的 {proto}",
   "{proto} {addr} 서비스 주소 시작":"启动 {addr} 上的 {proto}",
-  "평문":"明文",
   "중지됨":"已停止",
   "수신 중 · {bound}":"正在监听 · {bound}",
   "설정됨 (bind 미확인)":"已配置（未确认绑定）",
@@ -5757,7 +5754,7 @@ class Component extends DCLogic {
       mode:(String(c.mode).toLowerCase()==='public'?'public':'personal'),cfgRaw:Object.keys(s.configDraftDirty||{}).length?{...d,...s.configDraft}:d,cfgApplied:c,configStatus:status,
       ...this.restartClassFrom(s,status)
     }));
-    const listeners=[];let lid=1;const addL=(values,proto,key)=>{arr(values).forEach(value=>listeners.push({id:`${key}-${String(value)}`,proto,key,addr:String(value),savedAddr:String(value),enabled:true,cert:(proto==='Do53'?null:'tls'),conns:null}));};
+    const listeners=[];let lid=1;const addL=(values,proto,key)=>{arr(values).forEach(value=>listeners.push({id:`${key}-${String(value)}`,proto,key,addr:String(value),savedAddr:String(value),enabled:true,conns:null}));};
     addL(c.listen,'Do53','listen');addL(c.listen_dot,'DoT','listen_dot');addL(c.listen_doh,'DoH','listen_doh');addL(c.listen_doq,'DoQ','listen_doq');addL(c.listen_doh3,'DoH3','listen_doh3');addL(c.listen_dnscrypt,'DNSCrypt','listen_dnscrypt');
     this.setState({listeners});
     this.applyRoots(c.root_hints);
@@ -7158,6 +7155,7 @@ class Component extends DCLogic {
 
 
     const lprotoColor={Do53:'var(--muted)',DoH:'var(--accent)',DoH3:'var(--accent)',DoT:'var(--accent)',DoQ:'var(--violet)',DNSCrypt:'var(--violet)'};
+    const lnSockets={Do53:'UDP · TCP',DoT:'TCP',DoH:'TCP',DoQ:'UDP',DoH3:'UDP',DNSCrypt:'UDP · TCP'};
     const lstat=Array.isArray(s.listenerStatus)?s.listenerStatus:[];
     // 행 하나는 주소 하나다. 접두사로 고르면 DoH 행에 DoH3 주소가 섞이고, 같은 프로토콜의 모든 행에 같은 목록이 나온다.
     const boundFor=(l)=>{ const key=String(l.proto).toLowerCase(); const hits=lstat.filter(x=>{const p=String(x.protocol||'');return (p===key||(key==='do53'&&p.startsWith('do53-')))&&String(x.configured)===String(l.savedAddr);}); return hits.length?this.tr('수신 중 · {bound}',{bound:[...new Set(hits.map(h=>h.bound))].join(', ')}):null; };
@@ -7165,7 +7163,7 @@ class Component extends DCLogic {
     const lnEdit=s.lnEdit;
     const listeners=s.listeners.map(l=>({...l, proto:(l.proto==='Do53'?'DNS':l.proto),
       pc:lprotoColor[l.proto]||'var(--muted)',
-      certLabel:l.cert?l.cert:this.t('평문'),
+      sockets:lnSockets[l.proto]||'',
       connsLabel:boundFor(l)||this.t('설정됨 (bind 미확인)'),
       connsColor:boundFor(l)?'var(--ok)':'var(--muted)',
       isEditing:!!(lnEdit&&lnEdit.id===l.id),
