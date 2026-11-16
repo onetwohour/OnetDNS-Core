@@ -603,6 +603,17 @@ mod tests {
         }
     }
 
+    /// Each TCP query leaves a client port in TIME_WAIT for a minute or two; without a pause, a few
+    /// runs use up the machine's dynamic ports.
+    const PACE: Duration = Duration::from_millis(10);
+
+    /// The tests that put a generation under load run one at a time, so they neither pick the same
+    /// port nor add up their client ports.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock_recover()
+    }
+
     /// Clients asking over UDP and TCP until stopped, counting who answered.
     struct Load {
         stop: Arc<AtomicBool>,
@@ -642,6 +653,7 @@ mod tests {
                                 _ => &failed_tcp,
                             };
                             counter.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(PACE);
                         }
                     })
                 })
@@ -676,11 +688,39 @@ mod tests {
         }
     }
 
+    /// A loopback address free for both UDP and TCP. A port free over one may be taken over the
+    /// other: Windows reserves port ranges per protocol, and TCP ports linger in TIME_WAIT.
     fn dns_addr() -> SocketAddr {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
+        let mut last = None;
+        for attempt in 0..64 {
+            let found = if attempt % 2 == 0 {
+                let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = tcp.local_addr().unwrap();
+                UdpSocket::bind(addr).map(|_| addr)
+            } else {
+                let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let addr = udp.local_addr().unwrap();
+                TcpListener::bind(addr).map(|_| addr)
+            };
+            match found {
+                Ok(addr) => return addr,
+                Err(error) => last = Some(error),
+            }
+        }
+        panic!("no loopback port is free for both UDP and TCP: {last:?}");
+    }
+
+    /// Starts a generation and waits until it serves.
+    fn start_serving(cfg: Config, shared: crate::ServeShared) -> Running {
+        let running = start(cfg, shared);
+        wait_until("the running generation did not start", || {
+            running.ready.load(Ordering::SeqCst) || running.thread.is_finished()
+        });
+        if running.thread.is_finished() {
+            let ended = running.thread.join().unwrap();
+            panic!("the running generation ended: {:?}", ended.err());
+        }
+        running
     }
 
     #[test]
@@ -688,13 +728,11 @@ mod tests {
     /// asking over UDP and TCP. Every query is answered, the successor answers in the end, and the
     /// running generation returns once the successor is ready.
     fn a_successor_takes_over_a_running_generation_without_dropping_queries() {
+        let _serial = one_at_a_time();
         let dns = dns_addr();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
-        let old = start(config(dns, OLD_ANSWER, ""), old_shared);
-        wait_until("the running generation did not start", || {
-            old.ready.load(Ordering::SeqCst) || old.thread.is_finished()
-        });
+        let old = start_serving(config(dns, OLD_ANSWER, ""), old_shared);
         let load = Load::start(dns);
 
         let new = start_successor(config(dns, NEW_ANSWER, ""), &old_links);
@@ -727,14 +765,12 @@ mod tests {
     /// The successor takes the sockets, then fails to start what only one process may run. The
     /// running generation serves again, and no query goes unanswered on the way there and back.
     fn a_failed_successor_hands_the_service_back() {
+        let _serial = one_at_a_time();
         let dns = dns_addr();
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
-        let old = start(config(dns, OLD_ANSWER, ""), old_shared);
-        wait_until("the running generation did not start", || {
-            old.ready.load(Ordering::SeqCst) || old.thread.is_finished()
-        });
+        let old = start_serving(config(dns, OLD_ANSWER, ""), old_shared);
         let load = Load::start(dns);
 
         let failing = format!("control_listen = \"{}\"\n", busy.local_addr().unwrap());
