@@ -813,26 +813,9 @@ mod tests {
         }
     }
 
-    /// A loopback address free for both UDP and TCP. A port free over one may be taken over the
-    /// other: Windows reserves port ranges per protocol, and TCP ports linger in TIME_WAIT.
+    /// Free for both UDP and TCP, and released at once for the server to bind.
     fn dns_addr() -> SocketAddr {
-        let mut last = None;
-        for attempt in 0..64 {
-            let found = if attempt % 2 == 0 {
-                let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-                let addr = tcp.local_addr().unwrap();
-                UdpSocket::bind(addr).map(|_| addr)
-            } else {
-                let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-                let addr = udp.local_addr().unwrap();
-                TcpListener::bind(addr).map(|_| addr)
-            };
-            match found {
-                Ok(addr) => return addr,
-                Err(error) => last = Some(error),
-            }
-        }
-        panic!("no loopback port is free for both UDP and TCP: {last:?}");
+        crate::tests::tcp_udp_test_listeners().2
     }
 
     /// Starts a generation and waits until it serves.
