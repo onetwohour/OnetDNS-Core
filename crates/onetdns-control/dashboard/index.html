@@ -232,7 +232,7 @@
             <div style="padding:18px 0">
               <div style="font-size:13.5px;font-weight:500;color:var(--fg);font-family:var(--font-display);margin-bottom:14px">전송 프로토콜</div>
               <div style="display:flex;flex-direction:column;gap:13px">
-                <sc-for list="{{ transportRows }}" as="t" hint-placeholder-count="6">
+                <sc-for list="{{ transportRows }}" as="t" hint-placeholder-count="7">
                   <div>
                     <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;margin-bottom:5px">
                       <span style="font-family:var(--font-mono);font-weight:600;color:var(--fg);width:48px">{{ t.label }}</span>
@@ -4879,12 +4879,13 @@ class Component extends DCLogic {
     refused:{label:'거절',c:'var(--warn)',bg:'var(--warn-bg)'}
   };
   TRANSPORT = {
-    'do53-udp':{label:'UDP',desc:'암호화하지 않은 DNS(포트 53)'},
-    'do53-tcp':{label:'TCP',desc:'암호화하지 않은 DNS(포트 53)'},
-    'doh':{label:'DoH',desc:'HTTPS / 포트 443'},
-    'doh3':{label:'DoH3',desc:'HTTP/3 / QUIC'},
-    'dot':{label:'DoT',desc:'TLS / 포트 853'},
-    'doq':{label:'DoQ',desc:'QUIC / 포트 853'}
+    'do53-udp':{label:'UDP',desc:'암호화하지 않은 DNS(포트 53)',color:'var(--tr-udp)'},
+    'do53-tcp':{label:'TCP',desc:'암호화하지 않은 DNS(포트 53)',color:'var(--tr-tcp)'},
+    'doh':{label:'DoH',desc:'HTTPS / 포트 443',color:'var(--tr-doh)'},
+    'doh3':{label:'DoH3',desc:'HTTP/3 / QUIC',color:'var(--tr-doh3)'},
+    'dot':{label:'DoT',desc:'TLS / 포트 853',color:'var(--tr-dot)'},
+    'doq':{label:'DoQ',desc:'QUIC / 포트 853',color:'var(--tr-doq)'},
+    'dnscrypt':{label:'DNSCrypt',desc:'UDP · TCP',color:'var(--tr-dnscrypt)'}
   };
 
   state = {
@@ -6086,13 +6087,15 @@ class Component extends DCLogic {
       '--bg':'#171614','--surface':'#171614','--surface2':'#201f1c','--surface3':'#2a2925','--border':'#33312c','--fg':'#ece8df','--fg2':'#c8c3b8','--muted':'#9d978b','--faint':'#9d978b',
       '--accent':'#9fb3cf','--accent-bg':'#1f242c','--accent-bd':'#3a4555','--on-accent':'#171614',
       '--ok':'#7cb58a','--ok-bg':'#18231b','--block':'#e58b7c','--block-bg':'#2c1b18','--warn':'#d9ad62','--warn-bg':'#2b2316','--violet':'#c0a7cc','--violet-bg':'#261f2a',
-      '--shadow':'none','--sb':'#3a3833','--sb2':'#55524b'
+      '--shadow':'none','--sb':'#3a3833','--sb2':'#55524b',
+      '--tr-udp':'#a3abbd','--tr-tcp':'#bdb5a5','--tr-doh':'#9fb3cf','--tr-doh3':'#86a2b8','--tr-dot':'#94b886','--tr-doq':'#c0a7cc','--tr-dnscrypt':'#d39a6a'
     };
     return {
       '--bg':'#f7f3e9','--surface':'#f7f3e9','--surface2':'#efe8d9','--surface3':'#e6ddc9','--border':'#ddd3bd','--fg':'#241d12','--fg2':'#4b4234','--muted':'#6f6655','--faint':'#6b6252',
       '--accent':'#2f4a6b','--accent-bg':'#e8ecf2','--accent-bd':'#ccd6e3','--on-accent':'#fff',
       '--ok':'#3c6b41','--ok-bg':'#e9efe4','--block':'#a8392c','--block-bg':'#f3e5df','--warn':'#946612','--warn-bg':'#f3ead3','--violet':'#6d4a63','--violet-bg':'#efe6ec',
-      '--shadow':'none','--sb':'#d8cdb5','--sb2':'#b6ab92'
+      '--shadow':'none','--sb':'#d8cdb5','--sb2':'#b6ab92',
+      '--tr-udp':'#8b94a8','--tr-tcp':'#b0a99a','--tr-doh':'#2f4a6b','--tr-doh3':'#5a7a93','--tr-dot':'#5b7a4e','--tr-doq':'#6d4a63','--tr-dnscrypt':'#8a5a3c'
     };
   }
 
@@ -6249,7 +6252,7 @@ class Component extends DCLogic {
   setQpsRange=(r)=>()=>{ this._snapY=true; this.setState({qpsRange:r},()=>this.sendSocket({type:'history',range:r})); };
   setForm(k,v){ this.setState(s=>({forms:{...s.forms,[k]:v}})); }
   ddSet(){ const f=this.state.forms; return {
-    qlTransport:this.mkDropdown('qlTransport',f.qlTransport,[['all','모든 전송'],['do53-udp','UDP'],['do53-tcp','TCP'],['doh','DoH'],['dot','DoT'],['doq','DoQ'],['doh3','DoH3']],v=>this.setForm('qlTransport',v)),
+    qlTransport:this.mkDropdown('qlTransport',f.qlTransport,[['all','모든 전송'],...Object.entries(this.TRANSPORT).map(([key,T])=>[key,T.label])],v=>this.setForm('qlTransport',v)),
     recType:this.mkDropdown('recType',f.recType,[['A','A'],['AAAA','AAAA'],['CNAME','CNAME'],['MX','MX'],['TXT','TXT'],['NS','NS']],v=>this.setForm('recType',v)),
     exQtype:this.mkDropdown('exQtype',f.exQtype,[['A','A'],['AAAA','AAAA'],['HTTPS','HTTPS'],['MX','MX'],['TXT','TXT']],v=>this.setForm('exQtype',v)),
     acmeMethod:this.mkDropdown('acmeMethod',f.acmeMethod,[['HTTP-01','HTTP-01'],['DNS-01','DNS-01']],v=>this.setForm('acmeMethod',v))
@@ -6974,22 +6977,11 @@ class Component extends DCLogic {
     });
 
 
-    const torder=['do53-udp','do53-tcp','doh','doh3','dot','doq'];
-    const tcolors={'do53-udp':'#8b94a8','do53-tcp':'#b0a99a','doh':'#2f4a6b','doh3':'#5a7a93','dot':'#5b7a4e','doq':'#6d4a63'};
+    const torder=Object.keys(this.TRANSPORT);
     const tmax=Math.max(1,...torder.map(t=>m.byTransport[t]||0));
-    const transportRows=torder.map(t=>{ const c=m.byTransport[t]||0; return {key:t,label:this.TRANSPORT[t].label,desc:this.t(this.TRANSPORT[t].desc),valueFmt:this.fmt(c),color:tcolors[t],
+    const transportRows=torder.map(t=>{ const c=m.byTransport[t]||0,T=this.TRANSPORT[t]; return {key:t,label:T.label,desc:this.t(T.desc),valueFmt:this.fmt(c),color:T.color,
       pct:m.total?((c/m.total)*100).toFixed(0):'0',
-      barStyle:`display:block;height:100%;border-radius:4px;background:${tcolors[t]};width:${(c/tmax*100).toFixed(1)}%;transition:width .55s cubic-bezier(.4,0,.2,1)`}; });
-
-    const cx=50,cy=50,minR=11,maxR=44,Np=torder.length,gap=0.10,slice=2*Math.PI/Np;
-    const transportPetals=torder.map((t,i)=>{
-      const c=m.byTransport[t]||0; const r=minR+(c/tmax)*(maxR-minR);
-      const a0=-Math.PI/2+i*slice+gap/2, a1=-Math.PI/2+(i+1)*slice-gap/2;
-      const x0=cx+r*Math.cos(a0), y0=cy+r*Math.sin(a0), x1=cx+r*Math.cos(a1), y1=cy+r*Math.sin(a1);
-      const lx=cx+(maxR+5)*Math.cos((a0+a1)/2), ly=cy+(maxR+5)*Math.sin((a0+a1)/2);
-      return {d:`M${cx} ${cy} L${x0.toFixed(2)} ${y0.toFixed(2)} A${r.toFixed(2)} ${r.toFixed(2)} 0 0 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z`,
-        color:tcolors[t], label:this.TRANSPORT[t].label, lx:lx.toFixed(1), ly:ly.toFixed(1)};
-    });
+      barStyle:`display:block;height:100%;border-radius:4px;background:${T.color};width:${(c/tmax*100).toFixed(1)}%;transition:width .55s cubic-bezier(.4,0,.2,1)`}; });
 
 
     const topOf=(obj,color)=>{ const arr=Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,7); const mx=arr.length?arr[0][1]:1;
