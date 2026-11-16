@@ -893,7 +893,7 @@
           </section>
 
           <section style="min-width:0">
-            <div style="display:flex;align-items:center;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">백그라운드 작업</div></div><button onClick="{{ refreshJob }}" style="display:flex;align-items:center;gap:6px;padding:7px 11px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--accent);font:inherit;font-size:11.5px;font-weight:600;cursor:pointer">필터 갱신</button></div>
+            <div style="display:flex;align-items:center;gap:10px;padding:0 0 11px;border-bottom:1px solid var(--border)"><div style="flex:1"><div style="font-size:14px;font-weight:600;color:var(--fg);font-family:var(--font-display)">백그라운드 작업</div></div></div>
             <sc-if value="{{ jobs.length }}"><div><sc-for list="{{ jobs }}" as="j" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);align-items:center"><span style="font-family:var(--font-mono);font-size:10.5px;color:var(--faint)">#{{ j.id }}</span><div style="min-width:0"><div style="font-size:11.5px;font-weight:600;color:var(--fg)">{{ j.kindLabel }}</div><div style="font-size:10.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ j.result }}</div></div><span style="font-size:10.5px;font-weight:700;color:{{ j.stColor }};background:{{ j.stBg }};padding:2px 8px;border-radius:2px">{{ j.stLabel }}</span></div></sc-for></div></sc-if><sc-if value="{{ !jobs.length }}"><div style="padding:18px 0;text-align:center;font-size:11px;color:var(--muted)">기록된 백그라운드 작업이 없습니다.</div></sc-if>
           </section>
         </div>
@@ -995,18 +995,6 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
                 <button onClick="{{ applyConfig }}" style="padding:9px 18px;border-radius:3px;border:0;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer">적용</button>
               </div>
             </div>
-          </div>
-
-          <div style="overflow-x:auto;overflow-y:hidden;min-width:0">
-            <div style="display:flex;align-items:center;gap:10px;padding:15px 0;border-bottom:1px solid var(--border)"><span style="font-size:14px;font-weight:500;color:var(--fg);font-family:var(--font-display)">백그라운드 작업</span><span style="flex:1"></span><button onClick="{{ refreshJob }}" style="display:flex;align-items:center;gap:6px;padding:7px 13px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--accent);font:inherit;font-size:12px;font-weight:600;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"></path></svg>필터 목록 갱신</button></div>
-            <sc-for list="{{ jobs }}" as="j" hint-placeholder-count="3">
-              <div style="display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--border);animation:odRowGrow .42s cubic-bezier(.4,0,.2,1)">
-                <span style="font-family:var(--font-mono);font-size:11.5px;color:var(--faint);width:32px">#{{ j.id }}</span>
-                <div style="flex:1;min-width:0"><div style="font-size: 12.5px; font-weight: 600; color: var(--fg); font-family: var(--font-sans)">{{ j.kindLabel }}</div><div style="font-size:11px;color:var(--muted);margin-top:1px">{{ j.result }}</div></div>
-                <span style="font-family:var(--font-mono);font-size:11px;color:var(--faint)">{{ j.createdLabel }}</span>
-                <span style="font-size:11px;font-weight:700;color:{{ j.stColor }};background:{{ j.stBg }};padding:2px 9px;border-radius:2px">{{ j.stLabel }}</span>
-              </div>
-            </sc-for>
           </div>
 
           <div style="border:1px solid var(--border);border-radius:5px;background:var(--surface);overflow:hidden">
@@ -1437,7 +1425,6 @@ Object.assign(I18N.en, {
   "검증": "Validate",
   "되돌리기": "Roll back",
   "백그라운드 작업": "Background jobs",
-  "필터 목록 갱신": "Update lists",
   "보안": "Security",
   "클라이언트별 초당 질의 제한": "Rate limit (QPS per client)",
   "클라이언트 한 주소가 1초에 보낼 수 있는 질의 수입니다. 0이면 제한하지 않으며 공개 DNS 서버에서는 ACL과 함께 설정해야 합니다.": "Maximum queries a single client address may send per second. Zero disables the limit; public resolvers should use it together with ACLs.",
@@ -1675,7 +1662,6 @@ Object.assign(I18N.ja, {
   "검증": "検証",
   "되돌리기": "元に戻す",
   "백그라운드 작업": "バックグラウンド処理",
-  "필터 목록 갱신": "リスト更新",
   "보안": "セキュリティ",
   "클라이언트별 초당 질의 제한": "レート制限（クライアントごとの QPS）",
   "클라이언트 한 주소가 1초에 보낼 수 있는 질의 수입니다. 0이면 제한하지 않으며 공개 DNS 서버에서는 ACL과 함께 설정해야 합니다.": "1 つのクライアントアドレスが 1 秒間に送信できる最大クエリ数です。0 は無制限です。公開リゾルバでは ACL と併用してください。",
@@ -2033,7 +2019,6 @@ Object.assign(I18N.en, {
   "차단 응답 TTL": "Blocked-response TTL",
   "클라이언트별 설정": "Per-client policy",
   "변경 비교 완료": "Configuration comparison completed",
-  "갱신을 시작했습니다": "Refresh started",
   "규칙 변경 실패: ": "Rule update failed: ",
   "노드와 합의 상태": "Nodes · consensus",
   "로그 삭제 실패: ": "Log deletion failed: ",
@@ -2045,7 +2030,6 @@ Object.assign(I18N.en, {
   "업스트림 DNS 서버 응답 없음": "No upstream response",
   "예약을 삭제했습니다": "Reservation deleted",
   "임대 현황과 고정 할당": "Leases · reservations",
-  "작업 시작 실패: ": "Job start failed: ",
   "정책 및 필터 적용 결과": "Policy · filter result",
   "질의 진단 실패: ": "Query explanation failed: ",
   "차단 및 허용 규칙": "Block · allow rules",
@@ -2327,7 +2311,6 @@ Object.assign(I18N.ja, {
   "차단 응답 TTL": "遮断応答 TTL",
   "클라이언트별 설정": "クライアント別ポリシー",
   "변경 비교 완료": "設定の比較が完了しました",
-  "갱신을 시작했습니다": "更新を開始しました",
   "규칙 변경 실패: ": "ルール変更失敗: ",
   "노드와 합의 상태": "ノード · 合意状態",
   "로그 삭제 실패: ": "ログ削除失敗: ",
@@ -2339,7 +2322,6 @@ Object.assign(I18N.ja, {
   "업스트림 DNS 서버 응답 없음": "上位 DNS サーバーの応答なし",
   "예약을 삭제했습니다": "予約を削除しました",
   "임대 현황과 고정 할당": "リース · 固定予約",
-  "작업 시작 실패: ": "処理開始失敗: ",
   "정책 및 필터 적용 결과": "ポリシー · フィルタ結果",
   "질의 진단 실패: ": "クエリ説明失敗: ",
   "차단 및 허용 규칙": "遮断 · 許可ルール",
@@ -2926,7 +2908,6 @@ Object.assign(I18N.en, {
   'DNS 서비스를 멈추지 않고 바로 적용됩니다.':'Applies immediately without stopping the DNS service.',
   '네트워크 주소나 처리 방식이 바뀌므로 DNS 서비스가 다시 시작됩니다.':'Restarts the DNS service because a network address or query-handling path changes.',
   '백그라운드 작업':'Background tasks',
-  '필터 목록 갱신':'Refresh filter lists',
   '클라이언트별 초당 질의 제한':'Per-client query limit',
   '클라이언트 IP 주소 일부 가리기':'Partially mask client IP addresses',
   '로그에서 주소 가리기':'Mask addresses in logs',
@@ -3013,7 +2994,6 @@ Object.assign(I18N.ja, {
   'DNS 서비스를 멈추지 않고 바로 적용됩니다.':'DNS サービスを停止せず、すぐに適用します。',
   '네트워크 주소나 처리 방식이 바뀌므로 DNS 서비스가 다시 시작됩니다.':'ネットワークアドレスまたは処理方式が変わるため、DNS サービスを再起動します。',
   '백그라운드 작업':'バックグラウンド処理',
-  '필터 목록 갱신':'フィルターリストを更新',
   '클라이언트별 초당 질의 제한':'クライアントごとの秒間クエリ上限',
   '클라이언트 IP 주소 일부 가리기':'クライアント IP アドレスの一部を隠す',
   '로그에서 주소 가리기':'ログ内のアドレスを隠す',
@@ -3236,7 +3216,7 @@ Object.assign(I18N.en, {
   '접근 정책':'Access policy','허용 네트워크':'Allowed networks','거부 네트워크':'Denied networks','응답하지 않을 네트워크':'Silently dropped networks','거절할 도메인':'Domains answered with REFUSED','규칙에 없는 클라이언트':'Clients matching no rule','응답하지 않음':'No response','거부로 응답 (REFUSED)':'Answered with REFUSED','허용됨':'Allowed',
   '필터 품질':'Filter quality','제외':'Excluded','/ 전체':'/ total',
   '규칙 ·':'rules ·','차단 ·':'blocks ·',
-  '필터 갱신':'Filter refresh',
+  '필터 목록 전체 갱신':'Refresh all filter lists','필터 목록 개별 갱신':'Refresh a filter list','필터 목록 추가':'Add filter list',
   '확인 전':'Not checked','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'Select a certificate-chain PEM to check OCSP and CRL status.','OCSP·CRL 확인':'Check OCSP and CRL','조회 전':'Not queried','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'Enter a zone name to inspect DNSKEY records and the DS record for the parent zone.',
   '백그라운드 작업':'Background jobs'
 });
@@ -3246,7 +3226,7 @@ Object.assign(I18N.ja, {
   '접근 정책':'アクセス方針','허용 네트워크':'許可ネットワーク','거부 네트워크':'拒否ネットワーク','응답하지 않을 네트워크':'応答しないネットワーク','거절할 도메인':'拒否で応答するドメイン','규칙에 없는 클라이언트':'どの規則にも当てはまらないクライアント','응답하지 않음':'応答しない','거부로 응답 (REFUSED)':'REFUSED で拒否','허용됨':'許可',
   '필터 품질':'フィルター品質','제외':'除外','/ 전체':'/ 全体',
   '규칙 ·':'ルール ·','차단 ·':'ブロック ·',
-  '필터 갱신':'フィルター更新',
+  '필터 목록 전체 갱신':'すべてのフィルターリストを更新','필터 목록 개별 갱신':'フィルターリストを個別に更新','필터 목록 추가':'フィルターリストの追加',
   '확인 전':'未確認','인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.':'証明書チェーン PEM を選択して OCSP と CRL の状態を確認してください。','OCSP·CRL 확인':'OCSP・CRL を確認','조회 전':'未照会','영역 이름을 입력해 DNSKEY와 부모 제출용 DS를 확인하세요.':'ゾーン名を入力して DNSKEY と親ゾーン提出用 DS を確認してください。',
   '백그라운드 작업':'バックグラウンドジョブ'
 });
@@ -3581,7 +3561,6 @@ Object.assign(I18N.zh, {
   "검증":"验证",
   "되돌리기":"恢复之前的设置",
   "백그라운드 작업":"后台任务",
-  "필터 목록 갱신":"更新过滤列表",
   "보안":"安全",
   "클라이언트별 초당 질의 제한":"每个客户端的每秒查询限制",
   "클라이언트 한 주소가 1초에 보낼 수 있는 질의 수입니다. 0이면 제한하지 않으며 공개 DNS 서버에서는 ACL과 함께 설정해야 합니다.":"单个客户端地址每秒可发送的查询数。0 表示不限制；公共 DNS 服务器应同时配置 ACL。",
@@ -3864,7 +3843,6 @@ Object.assign(I18N.zh, {
   "차단 응답 TTL":"拦截响应 TTL",
   "클라이언트별 설정":"按客户端设置",
   "변경 비교 완료":"已完成更改比较",
-  "갱신을 시작했습니다":"已开始刷新",
   "규칙 변경 실패: ":"更改规则失败：",
   "노드와 합의 상태":"节点与共识状态",
   "로그 삭제 실패: ":"删除日志失败：",
@@ -3876,7 +3854,6 @@ Object.assign(I18N.zh, {
   "업스트림 DNS 서버 응답 없음":"上游 DNS 服务器无响应",
   "예약을 삭제했습니다":"已删除预留",
   "임대 현황과 고정 할당":"租约和固定分配",
-  "작업 시작 실패: ":"启动任务失败：",
   "정책 및 필터 적용 결과":"策略和过滤结果",
   "질의 진단 실패: ":"查询诊断失败：",
   "토큰을 회수했습니다":"已撤销令牌",
@@ -4275,7 +4252,7 @@ Object.assign(I18N.zh, {
   "/ 전체":"/ 总计",
   "규칙 ·":"条规则 ·",
   "차단 ·":"拦截 ·",
-  "필터 갱신":"过滤器更新",
+  "필터 목록 전체 갱신":"刷新全部过滤列表","필터 목록 개별 갱신":"单独刷新过滤列表","필터 목록 추가":"添加过滤列表",
   "확인 전":"未检查",
   "인증서 체인 PEM을 선택해 OCSP와 CRL 상태를 확인하세요.":"选择证书链 PEM 以检查 OCSP 和 CRL 状态。",
   "OCSP·CRL 확인":"检查 OCSP 和 CRL",
@@ -6800,7 +6777,6 @@ class Component extends DCLogic {
     if(r.ok){this.setState(s=>({forms:{...s.forms,recName:'',recVal:''}}));await this.loadZones();this.toastMsg('레코드를 추가했습니다');}else this.toastMsg('추가 실패: '+this.errorText(r),true); };
   removeRecord=(zi,ri)=>async()=>{const z=this.state.zones[zi],rec=z&&z.records[ri];if(!z||!rec||!await this.confirmDestructive(this.tr('{name} {type} 레코드를 삭제하시겠습니까?',{name:rec.name,type:rec.type})))return;const origin=z.origin,setRecords=edit=>s=>({zones:s.zones.map(x=>x.origin===origin?{...x,records:edit(x.records)}:x)});if(await this.optimistic('zones',{apply:setRecords(records=>records.filter(x=>x!==rec)),revert:setRecords(records=>this.listInsert(records,ri,rec)),send:()=>this.apiSend('/v1/zones/'+encodeURIComponent(origin)+'/records','DELETE',{name:rec.name,type:rec.type,value:rec.value}),reload:()=>this.loadZones(),failure:'삭제 실패: '}))this.toastMsg('레코드를 삭제했습니다');};
 
-  refreshJob=async()=>{const r=await this.apiSend('/v1/jobs/refresh','POST');if(r.ok){this.toastMsg('갱신을 시작했습니다');}else this.toastMsg('작업 시작 실패: '+this.errorText(r),true);};
   /**
    * 검증 결과와 비교 결과는 그 결과를 낸 입력에만 해당한다. 입력이 바뀐 뒤에도 남겨 두거나
    * 늦게 도착한 이전 입력의 응답을 보여 주면, 고친 입력이 여전히 틀렸다고 읽힌다.
@@ -7244,7 +7220,7 @@ class Component extends DCLogic {
     const tokens=s.tokens.map(t=>({...t, onRemove:this.removeToken(t.id),removeLabel:this.tr('{name} 삭제',{name:t.name||this.t('접근 토큰')}),
       rc:roleColor[t.role], roleLabel:this.t(t.role==='admin'?'관리자':'읽기 전용')}));
     const jobStatus={done:[this.t('완료'),'var(--ok)','var(--ok-bg)'],running:[this.t('진행 중'),'var(--accent)','var(--accent-bg)'],failed:[this.t('실패'),'var(--block)','var(--block-bg)']};
-    const jobKinds={'refresh-lists':this.t('필터 목록 갱신'),'update-check':this.t('업데이트 확인'),'update-apply':this.t('업데이트 설치'),'update-rollback':this.t('이전 버전으로 되돌리기')};
+    const jobKinds={'refresh-lists':this.t('필터 목록 전체 갱신'),'refresh-list':this.t('필터 목록 개별 갱신'),'add-list':this.t('필터 목록 추가'),'update-check':this.t('업데이트 확인'),'update-apply':this.t('업데이트 설치'),'update-rollback':this.t('이전 버전으로 되돌리기')};
     const updateView=this.updateModel();
     const jobs=s.jobs.map(j=>{const st=jobStatus[j.status]||[j.status||this.t('알 수 없음'),'var(--muted)','var(--surface2)'];return {...j,kindLabel:jobKinds[j.kind]||j.kind,createdLabel:this.relTime(j.created),stLabel:st[0],stColor:st[1],stBg:st[2]};});
     const diff=s.diff;
@@ -7410,7 +7386,7 @@ class Component extends DCLogic {
       revealToken:this.revealToken, tokenReveal:s.account.tokenReveal,
       tokenValue:this.maskToken(),
       copyToken:this.copyToken, changePw:this.changePw, accountUser:s.account.user,
-      tokens,addToken:this.addToken,jobs,refreshJob:this.refreshJob,hasTokenSecret:!!s.tokenSecret,tokenSecret:s.tokenSecret||'',copyNewToken:this.copyNewToken,
+      tokens,addToken:this.addToken,jobs,hasTokenSecret:!!s.tokenSecret,tokenSecret:s.tokenSecret||'',copyNewToken:this.copyNewToken,
       auditRows,hasAudit:auditRows.length>0,refreshAudit:()=>this.loadAudit(),
       validateConfig:this.validateConfig, diffConfig:this.diffConfig, applyConfig:this.applyConfig, rollbackConfig:this.rollbackConfig,
       configValid:s.configValid,diff,sec,secRate:String(sec.rateLimit),secAclAllow:String(sec.aclAllow),secAclDeny:String(sec.aclDeny),
