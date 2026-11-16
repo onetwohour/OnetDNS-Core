@@ -127,6 +127,8 @@ pub(crate) struct Carried {
     pub(crate) upstreams: Option<String>,
     /// `Auth::export_sessions`.
     pub(crate) sessions: Option<Vec<u8>>,
+    /// `JobRegistry::export`.
+    pub(crate) jobs: Option<String>,
 }
 
 /// Sent by the successor to the running generation.
@@ -335,6 +337,7 @@ pub(crate) struct Handoff {
     pub(crate) recorder: Recorder,
     pub(crate) stats: Stats,
     pub(crate) auth: Arc<onetdns_control::Auth>,
+    pub(crate) jobs: Arc<crate::JobRegistry>,
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     /// What the forwarding resolver was seeded with from the saved upstream statistics.
     pub(crate) upstream_seed: Vec<onetdns_forward::UpstreamStatReport>,
@@ -477,6 +480,7 @@ impl Handoff {
             stats,
             upstreams,
             sessions: Some(self.auth.export_sessions()),
+            jobs: Some(self.jobs.export()),
         }
     }
 
@@ -486,6 +490,7 @@ impl Handoff {
         self.carry_stats_in(carried.stats, cfg);
         self.carry_upstreams_in(carried.upstreams);
         self.carry_sessions_in(carried.sessions);
+        self.carry_jobs_in(carried.jobs);
     }
 
     fn carry_stats_in(&self, state: Option<Vec<u8>>, cfg: &Config) {
@@ -538,6 +543,16 @@ impl Handoff {
         };
         if let Err(error) = self.auth.adopt_sessions(&state) {
             onetdns_core::warn!(event = "handoff.sessions_unreadable", %error, "Could not read the dashboard sign-ins the previous process handed over; users sign in again");
+        }
+    }
+
+    /// The dashboard follows a job by its ID, also across the switch.
+    fn carry_jobs_in(&self, handed: Option<String>) {
+        let Some(state) = handed else {
+            return;
+        };
+        if let Err(error) = self.jobs.adopt(&state) {
+            onetdns_core::warn!(event = "handoff.jobs_unreadable", %error, "Could not read the job list the previous process handed over; jobs it started no longer show");
         }
     }
 
@@ -1154,6 +1169,41 @@ mod tests {
         );
         let forged = format!("{cookie}x");
         assert!(stats_status(control, &forged).starts_with("HTTP/1.1 401"));
+
+        new.stop.store(true, Ordering::SeqCst);
+        new.thread.join().unwrap().expect("the successor failed");
+    }
+
+    #[test]
+    /// The successor lists the running generation's jobs under the same IDs. The one still running
+    /// stopped with the running generation and shows as failed.
+    fn the_job_list_carries_over_to_the_successor() {
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let old_shared = crate::ServeShared::default();
+        let (old_links, old_jobs) = (old_shared.links.clone(), old_shared.jobs.clone());
+        let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
+        let done = old_jobs.create("refresh-lists").unwrap();
+        old_jobs.finish(done, true, "block=10".to_string());
+        let unfinished = old_jobs.create("update-check").unwrap();
+
+        let new_shared = crate::ServeShared::default();
+        let new_jobs = new_shared.jobs.clone();
+        let new = start_successor(config(dns, NEW_ANSWER, ""), None, &old_links, new_shared);
+        wait_until("the running generation did not hand over", || {
+            old.thread.is_finished() || new.thread.is_finished()
+        });
+        assert!(!new.thread.is_finished(), "the successor ended");
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        assert!(new_jobs
+            .get_json(done)
+            .is_some_and(|job| job.contains("\"status\":\"done\"")));
+        assert!(new_jobs
+            .get_json(unfinished)
+            .is_some_and(|job| job.contains("\"status\":\"failed\"")));
 
         new.stop.store(true, Ordering::SeqCst);
         new.thread.join().unwrap().expect("the successor failed");

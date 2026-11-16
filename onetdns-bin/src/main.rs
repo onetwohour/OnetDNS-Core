@@ -1657,6 +1657,7 @@ pub fn serve(
         recorder,
         stats,
         auth: setup_auth.clone(),
+        jobs: shared.jobs.clone(),
         forward_stats: forward_stats.clone(),
         upstream_seed,
         upstream_stats_path: upstream_stats_path(config_path.as_deref()),
@@ -2466,6 +2467,12 @@ struct Job {
 /// Jobs kept; the oldest finished one goes first when full.
 const JOB_HISTORY: usize = 64;
 
+/// Bumped with the handoff protocol version when the format changes.
+const JOBS_VERSION: u64 = 1;
+
+/// Result of a job that was running when its process handed over to a successor.
+const JOB_INTERRUPTED: &str = "Stopped when the service moved to a new process";
+
 impl Default for JobRegistry {
     fn default() -> Self {
         JobRegistry::new(JOB_HISTORY)
@@ -2549,6 +2556,129 @@ impl JobRegistry {
     fn get_json(&self, id: u64) -> Option<String> {
         self.jobs.lock_recover().get(&id).map(Self::job_json)
     }
+
+    /// The jobs and the next ID, for a successor process.
+    fn export(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let g = self.jobs.lock_recover();
+        let mut items: Vec<&Job> = g.values().collect();
+        items.sort_by_key(|j| j.id);
+        format!(
+            "{{\"version\":{JOBS_VERSION},\"next\":{},\"jobs\":[{}]}}",
+            self.next.load(Ordering::Relaxed),
+            items
+                .iter()
+                .map(|j| Self::job_json(j))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    /// Takes over a predecessor's jobs. The ones it was running stopped with it.
+    fn adopt(&self, state: &str) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let (next, jobs) = decode_jobs(state)?;
+        let now = unix_now();
+        let mut g = self.jobs.lock_recover();
+        for mut job in jobs {
+            if job.status == "running" {
+                job.status = "failed";
+                job.finished = Some(now);
+                job.result = JOB_INTERRUPTED.to_string();
+            }
+            g.entry(job.id).or_insert(job);
+        }
+        while g.len() > self.cap {
+            let Some(&oldest) = g.keys().min() else {
+                break;
+            };
+            g.remove(&oldest);
+        }
+        self.next.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// `JobRegistry::export`'s format; rejects the whole state on any deviation.
+fn decode_jobs(state: &str) -> Result<(u64, Vec<Job>), String> {
+    use onetdns_core::json::{self, Json};
+    let top = json::parse(state)?;
+    let Json::Obj(fields) = &top else {
+        return Err("The jobs must be an object".to_string());
+    };
+    if fields.len() != 3
+        || fields
+            .iter()
+            .any(|(key, _)| !matches!(key.as_str(), "version" | "next" | "jobs"))
+    {
+        return Err("The jobs do not match the current format".to_string());
+    }
+    if top.get("version").and_then(Json::as_u64) != Some(JOBS_VERSION) {
+        return Err(format!("The jobs format version must be {JOBS_VERSION}"));
+    }
+    let next = top
+        .get("next")
+        .and_then(Json::as_u64)
+        .ok_or("The next job ID must be an integer")?;
+    let entries = top
+        .get("jobs")
+        .and_then(Json::as_array)
+        .ok_or("The jobs must be an array")?;
+    let jobs = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let fail = |what: &str| format!("jobs[{index}]: {what}");
+            let Json::Obj(fields) = entry else {
+                return Err(fail("must be an object"));
+            };
+            if fields.len() != 6
+                || fields.iter().any(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "id" | "kind" | "status" | "created" | "finished" | "result"
+                    )
+                })
+            {
+                return Err(fail("entries do not match the current format"));
+            }
+            let number = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Json::as_u64)
+                    .ok_or_else(|| fail(&format!("{key} must be an integer")))
+            };
+            let text = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| fail(&format!("{key} must be a string")))
+            };
+            let status = match text("status")? {
+                "running" => "running",
+                "done" => "done",
+                "failed" => "failed",
+                _ => return Err(fail("unknown status")),
+            };
+            let finished = match entry.get("finished") {
+                Some(Json::Null) => None,
+                _ => Some(number("finished")?),
+            };
+            let id = number("id")?;
+            if id >= next {
+                return Err(fail("the ID must be below the next job ID"));
+            }
+            Ok(Job {
+                id,
+                kind: text("kind")?.to_string(),
+                status,
+                created: number("created")?,
+                finished,
+                result: text("result")?.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((next, jobs))
 }
 
 /// Returns early on shutdown.
@@ -3890,6 +4020,38 @@ mod tests {
         assert!(full.create("a").is_some());
         assert!(full.create("b").is_some());
         assert!(full.create("c").is_none());
+    }
+
+    #[test]
+    fn a_successor_keeps_the_jobs_and_fails_the_running_ones() {
+        let running = JobRegistry::new(4);
+        let done = running.create("refresh-lists").unwrap();
+        running.finish(done, true, "block=10".to_string());
+        let unfinished = running.create("update-check").unwrap();
+
+        let successor = JobRegistry::new(4);
+        successor.adopt(&running.export()).unwrap();
+        let kept = successor.get_json(done).unwrap();
+        assert!(kept.contains("\"status\":\"done\"") && kept.contains("block=10"));
+        let stopped = successor.get_json(unfinished).unwrap();
+        assert!(stopped.contains("\"status\":\"failed\"") && stopped.contains(JOB_INTERRUPTED));
+        assert!(successor.create("x").unwrap() > unfinished);
+    }
+
+    #[test]
+    fn handed_over_jobs_off_the_format_are_rejected_whole() {
+        let good = r#"{"version":1,"next":3,"jobs":[{"id":2,"kind":"x","status":"done","created":1,"finished":2,"result":""}]}"#;
+        assert_eq!(decode_jobs(good).unwrap().1.len(), 1);
+        for broken in [
+            good.replace(r#""version":1"#, r#""version":2"#),
+            good.replace(r#""next":3"#, r#""next":2"#),
+            good.replace(r#""done""#, r#""paused""#),
+            good.replace(r#""kind":"x""#, r#""kind":"x","extra":0"#),
+            good.replace(r#""finished":2"#, r#""finished":"2""#),
+            good.replace(r#""id":2"#, r#""id":-2"#),
+        ] {
+            assert!(decode_jobs(&broken).is_err(), "{broken}");
+        }
     }
 
     /// A TCP/UDP socket pair on one port. A port free for TCP may still fail for UDP: in use by
