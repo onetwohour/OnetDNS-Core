@@ -125,6 +125,8 @@ pub(crate) struct Carried {
     pub(crate) stats: Option<Vec<u8>>,
     /// The upstream statistics in their file format; None without a forwarding resolver.
     pub(crate) upstreams: Option<String>,
+    /// `Auth::export_sessions`.
+    pub(crate) sessions: Option<Vec<u8>>,
 }
 
 /// Sent by the successor to the running generation.
@@ -332,6 +334,7 @@ pub(crate) struct Handoff {
     pub(crate) exclusive: Exclusive,
     pub(crate) recorder: Recorder,
     pub(crate) stats: Stats,
+    pub(crate) auth: Arc<onetdns_control::Auth>,
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     /// What the forwarding resolver was seeded with from the saved upstream statistics.
     pub(crate) upstream_seed: Vec<onetdns_forward::UpstreamStatReport>,
@@ -470,7 +473,11 @@ impl Handoff {
             .lock_recover()
             .as_ref()
             .map(|forward| crate::upstream_stats::upstream_stats_json(&forward.snapshot()));
-        Carried { stats, upstreams }
+        Carried {
+            stats,
+            upstreams,
+            sessions: Some(self.auth.export_sessions()),
+        }
     }
 
     /// Adds the predecessor's statistics to what this process counted, or the saved ones when it
@@ -478,6 +485,7 @@ impl Handoff {
     fn carry_in(&self, carried: Carried, cfg: &Config) {
         self.carry_stats_in(carried.stats, cfg);
         self.carry_upstreams_in(carried.upstreams);
+        self.carry_sessions_in(carried.sessions);
     }
 
     fn carry_stats_in(&self, state: Option<Vec<u8>>, cfg: &Config) {
@@ -521,6 +529,16 @@ impl Handoff {
             reports,
             &self.upstream_seed,
         ));
+    }
+
+    /// Sign-ins live only in memory; without the predecessor's, users sign in again.
+    fn carry_sessions_in(&self, handed: Option<Vec<u8>>) {
+        let Some(state) = handed else {
+            return;
+        };
+        if let Err(error) = self.auth.adopt_sessions(&state) {
+            onetdns_core::warn!(event = "handoff.sessions_unreadable", %error, "Could not read the dashboard sign-ins the previous process handed over; users sign in again");
+        }
     }
 
     /// One pool to hand over and one to keep, so this generation can serve again if the successor
@@ -1067,5 +1085,94 @@ mod tests {
         new.stop.store(true, Ordering::SeqCst);
         new.thread.join().unwrap().expect("the successor failed");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sends one request to the management API and returns the whole response.
+    fn http(control: SocketAddr, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&control, Duration::from_secs(5)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn stats_status(control: SocketAddr, cookie: &str) -> String {
+        let response = http(
+            control,
+            &format!(
+                "GET /v1/stats HTTP/1.1\r\nHost: {control}\r\nCookie: {cookie}\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        );
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    /// A dashboard sign-in made on the running generation still works on the successor, through the
+    /// management socket it took over.
+    fn a_signed_in_session_carries_over_to_the_successor() {
+        const PASSWORD: &str = "handover-passphrase";
+        /// PBKDF2 at the lowest accepted cost, so signing in does not take seconds in a debug build.
+        const PASSWORD_HASH: &str = "pbkdf2-sha256$100000$000102030405060708090a0b0c0d0e0f$\
+            d342ca8060f543f59165684524a66a4a1db7b862b3661a9cb84632fa87479273";
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let control = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let account = format!(
+            "control_listen = \"{control}\"\n[[users]]\nname = \"alice\"\n\
+             password_hash = \"{PASSWORD_HASH}\"\nrole = \"admin\"\n"
+        );
+        let old_shared = crate::ServeShared::default();
+        let old_links = old_shared.links.clone();
+        let old = start_serving(config(dns, OLD_ANSWER, &account), None, old_shared);
+
+        let body = format!("{{\"user\":\"alice\",\"password\":\"{PASSWORD}\"}}");
+        let login = format!(
+            "POST /v1/login HTTP/1.1\r\nHost: {control}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = http(control, &login);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let cookie = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .and_then(|cookie| cookie.split(';').next())
+            .expect("no session cookie")
+            .to_string();
+        assert!(stats_status(control, &cookie).starts_with("HTTP/1.1 200"));
+
+        let new = start_successor(
+            config(dns, NEW_ANSWER, &account),
+            None,
+            &old_links,
+            crate::ServeShared::default(),
+        );
+        wait_until("the running generation did not hand over", || {
+            old.thread.is_finished() || new.thread.is_finished()
+        });
+        assert!(!new.thread.is_finished(), "the successor ended");
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        let status = stats_status(control, &cookie);
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "the successor did not keep the sign-in: {status}"
+        );
+        let forged = format!("{cookie}x");
+        assert!(stats_status(control, &forged).starts_with("HTTP/1.1 401"));
+
+        new.stop.store(true, Ordering::SeqCst);
+        new.thread.join().unwrap().expect("the successor failed");
     }
 }

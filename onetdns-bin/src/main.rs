@@ -1656,6 +1656,7 @@ pub fn serve(
         exclusive,
         recorder,
         stats,
+        auth: setup_auth.clone(),
         forward_stats: forward_stats.clone(),
         upstream_seed,
         upstream_stats_path: upstream_stats_path(config_path.as_deref()),
