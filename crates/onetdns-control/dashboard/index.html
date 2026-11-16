@@ -2916,7 +2916,7 @@ Object.assign(I18N.en, {
   '등록 후 적용':'Add and apply',
   '운영체제 설정':'Operating-system settings',
   '실제 응답':'Actual response',
-  '응답 레코드가 없습니다':'No answer records','지금 응답을 물어보는 중입니다':'Querying for the current response…',
+  '응답 레코드가 없습니다':'No answer records',
   '부팅 시 자동 시작':'Start automatically at boot',
   '서비스로 등록':'Register as a service',
   '등록 해제':'Unregister',
@@ -3003,7 +3003,7 @@ Object.assign(I18N.ja, {
   '등록 후 적용':'登録して適用',
   '운영체제 설정':'OS 設定',
   '실제 응답':'実際の応答',
-  '응답 레코드가 없습니다':'応答レコードがありません','지금 응답을 물어보는 중입니다':'現在の応答を照会しています…',
+  '응답 레코드가 없습니다':'応答レコードがありません',
   '부팅 시 자동 시작':'起動時に自動開始',
   '서비스로 등록':'サービスとして登録',
   '등록 해제':'登録を解除',
@@ -4135,7 +4135,6 @@ Object.assign(I18N.zh, {
   "차단된 상위 도메인":"被拦截最多的域名",
   "실제 응답":"实际响应",
   "응답 레코드가 없습니다":"没有应答记录",
-  "지금 응답을 물어보는 중입니다":"正在查询当前响应…",
   "대표 노드의 설정을 다른 클러스터 노드에 동일하게 적용합니다.":"将领导节点的设置同样应用到其他集群节点。",
   "네트워크 주소나 처리 방식이 바뀌므로 DNS 서비스가 다시 시작됩니다.":"网络地址或处理方式将发生变化，因此会重启 DNS 服务。",
   "{count}일":"{count} 天",
@@ -6529,7 +6528,7 @@ class Component extends DCLogic {
   stageLabel(stage){
     return {upstream:'업스트림 DNS 서버',resolver:'해석',response_validation:'응답 검증',policy:'정책',filter:'필터'}[stage]||stage||'기록 없음';
   }
-  openExplainFor=async(ev)=>{
+  openExplainFor=(ev)=>{
     if(!ev) return;
     const key=ev.action||'resolved',a=this.ACT[key]||this.ACT.resolved;
     const failed=key==='servfail',refused=key==='refused'||key==='denied',dropped=key==='throttled'&&ev.rcode==='DROPPED';
@@ -6547,12 +6546,6 @@ class Component extends DCLogic {
     this._lastOverlayTrigger=typeof document!=='undefined'?document.activeElement:null;
     const qname=ev.name,qtype=ev.qtype;
     this.setState({drawer:{qname,qtype,client:ev.ip||ev.client,decision:key,decisionLabel:a.label,decisionColor:a.c,decisionBg:a.bg,rcode,stages}});
-    // 서랍을 먼저 열고 지금 응답을 뒤이어 채운다. 기록된 요약과 달리 이 값은 "지금 물으면
-    // 무엇이 오는가"이므로 질의 로그에서도 실제로 물어봐야 한다.
-    const rv=await this.apiSend('/v1/resolve','POST',{qname,qtype});
-    const resolved=(rv.ok&&rv.body&&!rv.body.error)?rv.body:{error:this.errorText(rv)};
-    this.setState(st=>(st.drawer&&st.drawer.qname===qname&&st.drawer.qtype===qtype)
-      ?{drawer:Object.assign({},st.drawer,{resolved})}:null);
   };
   closeDrawer=()=>this.setState({drawer:null},()=>this.restoreOverlayFocus());
   runExplain=async()=>{const f=this.state.forms;const q=(f.exQname||'').trim();if(!this.validDomain(q))return this.toastMsg('유효한 도메인을 입력하세요',true);const x=await this.explainData(q,f.exQtype,(f.exClient||'').trim());if(x)this.setState({pageExplain:x});};
@@ -7471,9 +7464,10 @@ class Component extends DCLogic {
         R('span',{style:{fontFamily:"var(--font-mono)",fontSize:12,color:'var(--fg2)',textAlign:'right',maxWidth:220,wordBreak:'break-word'}},this.explainValue(st.val))
       ))
     );
-    const rv=d.resolved||{};
-    const rvRows=Array.isArray(rv.answers)?rv.answers:[];
-    const answers=R('div',{style:{marginTop:20}},
+    // Only the query diagnostics panel asks for a live answer; a log entry shows what was recorded.
+    const rv=d.resolved;
+    const rvRows=rv&&Array.isArray(rv.answers)?rv.answers:[];
+    const answers=rv&&R('div',{style:{marginTop:20}},
       R('div',{style:{display:'flex',alignItems:'baseline',gap:8,marginBottom:8}},
         R('span',{style:{fontSize:11,fontWeight:700,color:'var(--muted)',letterSpacing:'.05em',textTransform:'uppercase'}},this.t('실제 응답')),
         rv.elapsed_ms!=null?R('span',{style:{fontSize:11,color:'var(--muted)'}},rv.elapsed_ms+'ms'):null,
@@ -7481,8 +7475,7 @@ class Component extends DCLogic {
         rv.rcode?R('span',{style:{fontFamily:"var(--font-mono)",fontSize:11,color:'var(--fg2)'}},rv.rcode):null,
         rv.authentic_data?R('span',{style:{fontSize:10,fontWeight:700,color:'var(--ok)',background:'var(--ok-bg)',padding:'1px 6px',borderRadius:5}},'AD'):null
       ),
-      d.resolved===undefined?R('div',{style:{fontSize:12,color:'var(--muted)'}},this.t('지금 응답을 물어보는 중입니다'))
-      :rv.error?R('div',{style:{fontSize:12,color:'var(--block)'}},String(rv.error))
+      rv.error?R('div',{style:{fontSize:12,color:'var(--block)'}},String(rv.error))
       :rvRows.length===0?R('div',{style:{fontSize:12,color:'var(--muted)'}},this.t('응답 레코드가 없습니다'))
       :R('div',{},...rvRows.map((a,i)=>R('div',{key:i,style:{display:'flex',alignItems:'baseline',gap:10,padding:'8px 0',borderBottom:'1px solid var(--border)'}},
           R('span',{style:{fontFamily:"var(--font-mono)",fontSize:11,color:'var(--muted)',minWidth:52}},String(a.type||'')),
@@ -7490,7 +7483,7 @@ class Component extends DCLogic {
           R('span',{style:{fontSize:11,color:'var(--muted)'}},String(a.ttl!=null?a.ttl+'s':''))
         )))
     );
-    return R('div',{},head,verdict,actions,stages,answers);
+    return R('div',{},head,verdict,actions,stages,answers||null);
   }
 }
 </script>
