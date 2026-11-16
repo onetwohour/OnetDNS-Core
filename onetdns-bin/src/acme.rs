@@ -3,7 +3,8 @@
 //! DNS answers, http-01 through the control plane.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -376,6 +377,8 @@ pub struct AcmeClient {
     account_url: Option<String>,
     timeout: Duration,
     resolver: http::HostResolver,
+    /// Ends every request soon after it is set; see `http::Req::stop_on`.
+    stop: Arc<AtomicBool>,
 }
 
 impl AcmeClient {
@@ -384,10 +387,12 @@ impl AcmeClient {
         directory_url: &str,
         timeout: Duration,
         resolver: http::HostResolver,
+        stop: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let resp = http::get(directory_url)
             .timeout(timeout)
             .resolver(resolver.clone())
+            .stop_on(stop.clone())
             .call()
             .map_err(|e| format!("Could not fetch the ACME directory: {e}"))?;
         let body = String::from_utf8_lossy(&resp.body);
@@ -406,6 +411,7 @@ impl AcmeClient {
             account_url: None,
             timeout,
             resolver,
+            stop,
         })
     }
 
@@ -417,6 +423,7 @@ impl AcmeClient {
         let resp = http::get(&self.dir.new_nonce)
             .timeout(self.timeout)
             .resolver(self.resolver.clone())
+            .stop_on(self.stop.clone())
             .call()
             .map_err(|e| format!("Could not fetch a nonce: {e}"))?;
         resp.header("replay-nonce")
@@ -436,6 +443,7 @@ impl AcmeClient {
             .header("Content-Type", "application/jose+json")
             .timeout(self.timeout)
             .resolver(self.resolver.clone())
+            .stop_on(self.stop.clone())
             .body_bytes(body.into_bytes())
             .call()
             .map_err(|e| format!("Could not send the request to the ACME server ({url}): {e}"))?;
@@ -668,10 +676,13 @@ pub struct IssueResult {
 }
 
 /// With `account_only` it stops after registration, to obtain the account key ahead of issuance.
+/// `stop` is the generation's shutdown flag: an issuance in progress when it ends is abandoned
+/// rather than holding up the shutdown.
 pub fn run_issue(
     p: IssueParams,
     timeout: Duration,
     resolver: http::HostResolver,
+    stop: Arc<AtomicBool>,
 ) -> Result<IssueResult, String> {
     let account_key = match &p.account_key_pem {
         Some(pem) => {
@@ -681,7 +692,7 @@ pub fn run_issue(
     };
     let account_key_pem = account_key.to_pkcs8_pem();
 
-    let mut client = AcmeClient::new(account_key, &p.directory_url, timeout, resolver)?;
+    let mut client = AcmeClient::new(account_key, &p.directory_url, timeout, resolver, stop)?;
     let account_url = client.register_account(p.contact.as_deref())?;
 
     if p.account_only {

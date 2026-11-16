@@ -58,6 +58,9 @@ pub(crate) struct ControlDeps {
     pub(crate) jobs: Arc<JobRegistry>,
     /// Threads to join when this generation ends.
     pub(crate) service_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// This generation's shutdown flag. Downloads and ACME issuance started from the API watch it,
+    /// so they do not hold up the end of the generation.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ControlDeps {

@@ -1488,6 +1488,7 @@ pub fn serve(
         dnscrypt_identity: dnscrypt_identity.clone(),
         jobs: shared.jobs.clone(),
         service_threads: service_cleanup.tracker(),
+        shutdown: shutdown.clone(),
     });
     let state = shared.control_state(&cfg, stats, controls, readiness.clone(), control_proxy)?;
     *console_auth.lock_recover() = Some(state.auth.clone());

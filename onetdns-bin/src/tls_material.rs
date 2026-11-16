@@ -296,6 +296,7 @@ pub(crate) fn acme_issue_run(
     body: &str,
     resolver: http::HostResolver,
     tls_slots: Option<Arc<TlsSlots>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
     let j = onetdns_core::json::parse(body)
         .map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
@@ -347,7 +348,7 @@ pub(crate) fn acme_issue_run(
         account_key_pem,
         account_only,
     };
-    let res = acme::run_issue(params, Duration::from_secs(20), resolver)?;
+    let res = acme::run_issue(params, Duration::from_secs(20), resolver, stop)?;
 
     if let Some(p) = &cfg.acme_account_key_file {
         if !std::path::Path::new(p).exists() {

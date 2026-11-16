@@ -95,6 +95,7 @@ impl ControlDeps {
             body,
             self.blocklist_resolver.clone(),
             self.tls_slot_handle.lock_recover().clone(),
+            self.shutdown.clone(),
         )
     }
 }

@@ -195,10 +195,11 @@ impl ControlDeps {
     }
 
     fn download_and_save(&self, request: &NewSubscription, body: &str) -> ApiResponse {
-        let fresh = match fetch_blocklist(&request.url, &self.blocklist_resolver, None) {
-            Ok(fresh) => fresh,
-            Err(error) => return error_response("400 Bad Request", &error),
-        };
+        let fresh =
+            match fetch_blocklist(&request.url, &self.blocklist_resolver, None, &self.shutdown) {
+                Ok(fresh) => fresh,
+                Err(error) => return error_response("400 Bad Request", &error),
+            };
         // Waits instead of failing as busy: a refresh in progress writes back the list metadata
         // it started from, which would drop this list.
         let _refresh = self.filters.list_refresh_lock.lock_recover();
@@ -481,10 +482,15 @@ impl ControlDeps {
         match apply {
             FilterApply::Background => (SubMeta::unavailable(url), true),
             FilterApply::Wait => {
-                let fetched =
-                    fetch_blocklists_meta(&urls, &self.blocklist_resolver, &[], cache_dir)
-                        .pop()
-                        .unwrap_or_else(|| SubMeta::unavailable(url));
+                let fetched = fetch_blocklists_meta(
+                    &urls,
+                    &self.blocklist_resolver,
+                    &[],
+                    cache_dir,
+                    &self.shutdown,
+                )
+                .and_then(|mut meta| meta.pop())
+                .unwrap_or_else(|| SubMeta::unavailable(url));
                 (fetched, false)
             }
         }
@@ -555,6 +561,7 @@ impl ControlDeps {
             target,
             &self.blocklist_resolver,
             self.filters.subscription_cache_dir.as_deref(),
+            &self.shutdown,
         )?;
         let _guard = self.filters.list_refresh_lock.lock_recover();
         // The list may have been removed or disabled during the download.

@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,8 @@ const MAX_HEADER_LINE: usize = 8 * 1024;
 pub type HostResolver =
     Arc<dyn Fn(&str, Duration) -> Result<Vec<IpAddr>, String> + Send + Sync + 'static>;
 
+pub const STOPPED: &str = "Stopped because the DNS service is restarting or shutting down";
+
 #[derive(Debug)]
 pub enum HttpError {
     Url(String),
@@ -30,6 +33,8 @@ pub enum HttpError {
     Io(String),
     Protocol(String),
     TooManyRedirects,
+    /// The stop flag passed to `Req::stop_on` was set.
+    Stopped,
 }
 
 impl std::fmt::Display for HttpError {
@@ -41,6 +46,7 @@ impl std::fmt::Display for HttpError {
             HttpError::Io(s) => write!(f, "I/O error: {s}"),
             HttpError::Protocol(s) => write!(f, "HTTP protocol error: {s}"),
             HttpError::TooManyRedirects => write!(f, "Followed too many HTTP redirects"),
+            HttpError::Stopped => f.write_str(STOPPED),
         }
     }
 }
@@ -165,6 +171,7 @@ pub struct Req {
     deny_private_targets: bool,
     /// Without one, only IP-literal and localhost URLs work.
     resolver: Option<HostResolver>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Req {
@@ -178,6 +185,7 @@ impl Req {
             max_response: MAX_RESPONSE,
             deny_private_targets: false,
             resolver: None,
+            stop: None,
         }
     }
 
@@ -208,6 +216,18 @@ impl Req {
         self
     }
 
+    /// Ends the call with `HttpError::Stopped` soon after `flag` is set, instead of at the deadline.
+    pub fn stop_on(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.stop = Some(flag);
+        self
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     pub fn body_string(mut self, s: &str) -> Self {
         self.body = s.as_bytes().to_vec();
         self
@@ -222,7 +242,16 @@ impl Req {
     pub fn call(mut self) -> Result<Resp, HttpError> {
         let deadline = Instant::now() + self.timeout;
         for _ in 0..MAX_REDIRECTS {
-            let resp = send_one(&self, deadline)?;
+            if self.stopped() {
+                return Err(HttpError::Stopped);
+            }
+            let resp = send_one(&self, deadline).map_err(|error| {
+                if self.stopped() {
+                    HttpError::Stopped
+                } else {
+                    error
+                }
+            })?;
             if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
                 if let Some(loc) = resp.header("location") {
                     let next = resolve_redirect(&self.url, &loc)?;
@@ -282,13 +311,16 @@ impl Resp {
 
 fn send_one(req: &Req, deadline: Instant) -> Result<Resp, HttpError> {
     let url = parse_url(&req.url)?;
-    let tcp = connect(
+    let mut tcp = connect(
         &url.host,
         url.port,
         deadline,
         req.deny_private_targets,
         req.resolver.as_ref(),
     )?;
+    if let Some(flag) = &req.stop {
+        tcp = tcp.stop_on(flag.clone());
+    }
     let request = build_request(req, &url)?;
     let raw = match url.scheme {
         Scheme::Http => send_plain(tcp, &request, req.max_response)?,
@@ -1259,6 +1291,51 @@ mod tests {
             .call();
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_download_ends_soon_after_the_stop_flag_is_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK
+Content-Length: 5
+
+h",
+            );
+            let _ = done_rx.recv();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+
+        let started = Instant::now();
+        let result = get(&format!("http://{addr}/stalled"))
+            .timeout(Duration::from_secs(60))
+            .stop_on(stop)
+            .call();
+        match result {
+            Err(HttpError::Stopped) => {}
+            Err(error) => panic!("중단 대신 다른 오류로 끝났습니다: {error}"),
+            Ok(_) => panic!("멈춘 응답을 받았습니다"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "중단 플래그를 보고도 기한까지 기다렸습니다"
+        );
+        let _ = done_tx.send(());
+        setter.join().unwrap();
         server.join().unwrap();
     }
 

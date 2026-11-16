@@ -17,7 +17,7 @@ use crate::filters::{
     active_subscription_urls, build_filter_engine_for_config, fetch_blocklists_meta,
     fetch_rpz_texts, load_blocklist_cache, load_rpz_cache, preset_list_urls,
     release_subscription_lines, rpz_texts_by_url, service_blocking_paused, try_list_refresh_lock,
-    FilterBuildInputs, SubMeta, LIST_REFRESH_BUSY, LIST_REFRESH_TICK_SECS,
+    FilterBuildInputs, SubMeta, LIST_REFRESH_BUSY, LIST_REFRESH_STOPPED, LIST_REFRESH_TICK_SECS,
     SERVICE_SCHEDULE_TICK_SECS,
 };
 use crate::native_config::map_block;
@@ -325,6 +325,7 @@ impl FilterState {
             let resolver = blocklist_resolver.clone();
             let cache_dir = blocklist_cache_dir.clone();
             let operation_lock = list_refresh_lock.clone();
+            let sd = shutdown.clone();
             Arc::new(move || {
                 let _guard = try_list_refresh_lock(&operation_lock)?;
                 let snapshot = urls.lock_recover().clone();
@@ -332,8 +333,14 @@ impl FilterState {
                 let presets_now = presets.lock_recover().clone();
                 let active = active_subscription_urls(&snapshot, &disabled, &presets_now);
                 let previous_meta = sm.lock_recover().clone();
-                let meta =
-                    fetch_blocklists_meta(&active, &resolver, &previous_meta, cache_dir.as_deref());
+                let meta = fetch_blocklists_meta(
+                    &active,
+                    &resolver,
+                    &previous_meta,
+                    cache_dir.as_deref(),
+                    &sd,
+                )
+                .ok_or(LIST_REFRESH_STOPPED)?;
                 *sm.lock_recover() = meta;
                 match rebuild() {
                     Ok(counts) => Ok(counts),
@@ -379,6 +386,7 @@ impl FilterState {
                                 Ok((block, _)) => {
                                     onetdns_core::info!(event = "filter.subscription_applied", block, "Applied downloaded blocklists")
                                 }
+                                Err(error) if error == LIST_REFRESH_STOPPED => break,
                                 Err(error) if error == LIST_REFRESH_BUSY => {
                                     onetdns_core::info!(event = "filter.subscription_refresh_inflight", "A blocklist update is already running")
                                 }
@@ -437,8 +445,15 @@ impl FilterState {
                         waited = 0;
                         let previous = rpz_texts.lock_recover().clone();
                         let kept = rpz_texts_by_url(&fetched_urls, &previous, &urls_now);
-                        let fetched =
-                            fetch_rpz_texts(&urls_now, &resolver, &kept, cache_dir.as_deref());
+                        let Some(fetched) = fetch_rpz_texts(
+                            &urls_now,
+                            &resolver,
+                            &kept,
+                            cache_dir.as_deref(),
+                            &sd,
+                        ) else {
+                            break;
+                        };
                         *rpz_texts.lock_recover() = fetched;
                         let previous_urls = std::mem::replace(&mut fetched_urls, urls_now);
                         match rebuild3() {

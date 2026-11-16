@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -771,16 +772,20 @@ fn cached_host_resolver(
     })
 }
 
+/// `stop` is the generation's shutdown flag: a download in progress when it ends is abandoned
+/// rather than holding up the shutdown.
 pub(crate) fn fetch_blocklist(
     url: &str,
     resolver: &http::HostResolver,
     cache_dir: Option<&std::path::Path>,
+    stop: &Arc<AtomicBool>,
 ) -> Result<SubMeta, String> {
     let resp = http::get(url)
         .timeout(Duration::from_secs(120))
         .max_response(BLOCKLIST_MAX_RESPONSE)
         .resolver(resolver.clone())
         .deny_private_targets()
+        .stop_on(stop.clone())
         .call()
         .map_err(|error| format!("Could not download the blocklist: {error}"))?;
     if !(200..300).contains(&resp.status) {
@@ -887,19 +892,25 @@ pub(crate) fn load_blocklist_cache(urls: &[String], dir: Option<&std::path::Path
         .collect()
 }
 
+/// `None` when `stop` was set before every list was fetched; nothing from the partial run is used.
 pub(crate) fn fetch_blocklists_meta(
     urls: &[String],
     resolver: &http::HostResolver,
     previous: &[SubMeta],
     cache_dir: Option<&std::path::Path>,
-) -> Vec<SubMeta> {
+    stop: &Arc<AtomicBool>,
+) -> Option<Vec<SubMeta>> {
     let previous_by_url: std::collections::HashMap<&str, &SubMeta> = previous
         .iter()
         .map(|item| (item.url.as_str(), item))
         .collect();
     let mut meta = Vec::new();
     for url in urls {
-        match fetch_blocklist(url, resolver, cache_dir) {
+        let fetched = fetch_blocklist(url, resolver, cache_dir, stop);
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        match fetched {
             Ok(item) => meta.push(item),
             Err(error) => {
                 if let Some(old) = previous_by_url.get(url.as_str()) {
@@ -912,7 +923,7 @@ pub(crate) fn fetch_blocklists_meta(
             }
         }
     }
-    meta
+    Some(meta)
 }
 
 fn rpz_cache_key(url: &str) -> String {
@@ -997,12 +1008,14 @@ pub(crate) fn rpz_texts_by_url(
         .collect()
 }
 
+/// `None` when `stop` was set before every URL was fetched.
 pub(crate) fn fetch_rpz_texts(
     urls: &[String],
     resolver: &http::HostResolver,
     previous: &[String],
     cache_dir: Option<&std::path::Path>,
-) -> Vec<String> {
+    stop: &Arc<AtomicBool>,
+) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(urls.len());
     for (index, url) in urls.iter().enumerate() {
         let fetched = http::get(url)
@@ -1010,6 +1023,7 @@ pub(crate) fn fetch_rpz_texts(
             .max_response(BLOCKLIST_MAX_RESPONSE)
             .resolver(resolver.clone())
             .deny_private_targets()
+            .stop_on(stop.clone())
             .call()
             .and_then(|resp| {
                 if !(200..300).contains(&resp.status) {
@@ -1020,6 +1034,9 @@ pub(crate) fn fetch_rpz_texts(
                 }
                 resp.into_string()
             });
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         match fetched {
             Ok(body)
                 if !body.trim().is_empty()
@@ -1052,7 +1069,7 @@ pub(crate) fn fetch_rpz_texts(
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn merge_config_filters(
@@ -1188,6 +1205,7 @@ pub(crate) fn preset_list_urls(cfg: &Config) -> Vec<String> {
 }
 
 pub(crate) const LIST_REFRESH_BUSY: &str = "A blocklist update is already running";
+pub(crate) const LIST_REFRESH_STOPPED: &str = http::STOPPED;
 
 pub(crate) fn try_list_refresh_lock(
     lock: &Mutex<()>,
