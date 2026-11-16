@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use onetdns_config::Config;
 use onetdns_control::{PersistOpts, Recorder, Stats};
 use onetdns_core::MutexExt;
+use zeroize::Zeroizing;
 
 use crate::config_apply::{install_restart, SecondaryRestart};
-use crate::listeners::ListenerSet;
+use crate::listeners::{ListenerSet, TicketKeys, TlsSlots};
 use crate::GenerationJobs;
 
 /// What a listening socket serves.
@@ -34,17 +35,49 @@ pub(crate) enum ListeningSocket {
     Tcp(TcpListener),
 }
 
-/// Sockets that are open but not served, keyed by role and bound address. A listener opening an
-/// address takes its sockets from here before it binds.
+/// Sockets that are open but not served, keyed by role and bound address, and the keys clients hold
+/// on to. A listener opening an address takes its sockets and keys from here before it binds.
 ///
 /// Port 0 never matches: the configured address then differs from the bound one, and the listener
 /// binds a new socket.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct SocketPool {
     entries: Vec<(SocketRole, SocketAddr, ListeningSocket)>,
+    /// The resolver key each DNSCrypt address answered with.
+    dnscrypt_keys: Vec<(SocketAddr, Zeroizing<[u8; 32]>)>,
+    tickets: TicketKeys,
+}
+
+/// Leaves the keys out.
+impl std::fmt::Debug for SocketPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketPool")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SocketPool {
+    pub(crate) fn put_dnscrypt_key(&mut self, addr: SocketAddr, secret: Zeroizing<[u8; 32]>) {
+        self.dnscrypt_keys.push((addr, secret));
+    }
+
+    pub(crate) fn take_dnscrypt_key(&mut self, addr: SocketAddr) -> Option<Zeroizing<[u8; 32]>> {
+        let at = self
+            .dnscrypt_keys
+            .iter()
+            .position(|(bound, _)| *bound == addr)?;
+        Some(self.dnscrypt_keys.swap_remove(at).1)
+    }
+
+    pub(crate) fn put_ticket_keys(&mut self, keys: TicketKeys) {
+        self.tickets = keys;
+    }
+
+    pub(crate) fn take_ticket_keys(&mut self) -> TicketKeys {
+        std::mem::take(&mut self.tickets)
+    }
+
     pub(crate) fn put(&mut self, role: SocketRole, addr: SocketAddr, socket: ListeningSocket) {
         self.entries.push((role, addr, socket));
     }
@@ -112,7 +145,8 @@ impl SocketPool {
 /// Sent by the running generation to its successor.
 #[derive(Debug)]
 pub(crate) enum FromPredecessor {
-    /// Duplicates of the listening sockets. The QUIC ones are no longer read on this side.
+    /// Duplicates of the listening sockets, with the keys clients hold on to. The QUIC sockets are
+    /// no longer read on this side.
     Sockets(SocketPool),
     /// Nothing that only one process may run is running on this side any more.
     Released(Carried),
@@ -338,6 +372,7 @@ pub(crate) struct Handoff {
     pub(crate) stats: Stats,
     pub(crate) auth: Arc<onetdns_control::Auth>,
     pub(crate) jobs: Arc<crate::JobRegistry>,
+    pub(crate) tls_slots: Arc<Mutex<Option<Arc<TlsSlots>>>>,
     pub(crate) forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     /// What the forwarding resolver was seeded with from the saved upstream statistics.
     pub(crate) upstream_seed: Vec<onetdns_forward::UpstreamStatReport>,
@@ -557,7 +592,8 @@ impl Handoff {
     }
 
     /// One pool to hand over and one to keep, so this generation can serve again if the successor
-    /// fails.
+    /// fails. Only the handed one carries the ticket keys: this generation's TLS slots outlive its
+    /// listeners.
     fn export(&self) -> std::io::Result<(SocketPool, SocketPool)> {
         let kept = self.listeners.export()?;
         let mut handed = self.listeners.export()?;
@@ -567,6 +603,9 @@ impl Handoff {
                 control.local_addr()?,
                 ListeningSocket::Tcp(control.try_clone()?),
             );
+        }
+        if let Some(slots) = self.tls_slots.lock_recover().as_ref() {
+            handed.put_ticket_keys(slots.ticket_keys());
         }
         Ok((kept, handed))
     }
@@ -1207,5 +1246,102 @@ mod tests {
 
         new.stop.store(true, Ordering::SeqCst);
         new.thread.join().unwrap().expect("the successor failed");
+    }
+
+    /// One DoT query, resuming `session` when given. Returns whether it resumed and the tickets the
+    /// server sent.
+    fn ask_dot(
+        dot: SocketAddr,
+        session: Option<onetdns_tls::TlsSession>,
+    ) -> (bool, Vec<onetdns_tls::TlsSession>) {
+        let mut socket =
+            std::net::TcpStream::connect_timeout(&dot, Duration::from_secs(5)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let client = onetdns_tls::ClientConfig {
+            server_name: "localhost".to_string(),
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![b"dot".to_vec()],
+            session,
+            ..Default::default()
+        };
+        let mut conn = onetdns_tls::client_handshake(&mut socket, &client).unwrap();
+        let wire = crate::listeners::tests::query(7, "dot.handover.test");
+        let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&wire);
+        conn.write_app(&mut socket, &framed).unwrap();
+        assert!(!conn.read_app(&mut socket).unwrap().is_empty());
+        (conn.is_resumed(), conn.take_sessions())
+    }
+
+    #[test]
+    /// A DoT client resumes on the successor with a ticket the running generation issued, and the
+    /// DNSCrypt certificate the successor serves names the same resolver key.
+    fn the_keys_clients_hold_carry_over_to_the_successor() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-handoff-keys-{}-{}",
+            std::process::id(),
+            crate::unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let dnscrypt = dns_addr();
+        let dot = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let text = format!(
+            "listen = [\"{dns}\"]\nworkers = 2\nbackend = \"forward\"\n\
+             upstream_urls = [\"udp://192.0.2.1:53\"]\nblock_rules = [\"||handover.test^\"]\n\
+             listen_dot = [\"{dot}\"]\ntls_self_signed_host = \"localhost\"\n\
+             listen_dnscrypt = [\"{dnscrypt}\"]\n"
+        );
+        let config_path = dir.join(crate::CONFIG_FILE_NAME);
+        std::fs::write(&config_path, &text).unwrap();
+        let config = || Config::from_toml_str(&text).unwrap();
+        let provider_name = config().dnscrypt_provider_name;
+
+        let old_shared = crate::ServeShared::default();
+        let old_links = old_shared.links.clone();
+        let old = start_serving(config(), Some(config_path.clone()), old_shared);
+        let (resumed, mut tickets) = ask_dot(dot, None);
+        assert!(!resumed);
+        let ticket = tickets
+            .pop()
+            .expect("the running generation sent no ticket");
+        let served = crate::listeners::tests::dnscrypt_resolver_key(dnscrypt, &provider_name);
+
+        let new = start_successor(
+            config(),
+            Some(config_path.clone()),
+            &old_links,
+            crate::ServeShared::default(),
+        );
+        wait_until("the running generation did not hand over", || {
+            old.thread.is_finished() || new.thread.is_finished()
+        });
+        assert!(!new.thread.is_finished(), "the successor ended");
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        assert!(
+            ask_dot(dot, Some(ticket)).0,
+            "the successor did not resume the ticket"
+        );
+        assert_eq!(
+            crate::listeners::tests::dnscrypt_resolver_key(dnscrypt, &provider_name),
+            served,
+            "the successor serves another resolver key"
+        );
+
+        new.stop.store(true, Ordering::SeqCst);
+        new.thread.join().unwrap().expect("the successor failed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

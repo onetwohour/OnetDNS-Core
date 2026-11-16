@@ -1658,6 +1658,7 @@ pub fn serve(
         stats,
         auth: setup_auth.clone(),
         jobs: shared.jobs.clone(),
+        tls_slots: tls_slot_handle.clone(),
         forward_stats: forward_stats.clone(),
         upstream_seed,
         upstream_stats_path: upstream_stats_path(config_path.as_deref()),
@@ -3005,7 +3006,8 @@ mod tests {
         };
         let material = native_tls_material(&cfg, None).expect("TLS 인증서를 읽지 못했습니다");
         let (dot, doh, doq, doh3) =
-            tls_configs_from(&cfg, &material).expect("TLS 설정을 만들지 못했습니다");
+            tls_configs_from(&cfg, &material, crate::listeners::TicketKeys::default())
+                .expect("TLS 설정을 만들지 못했습니다");
         assert!(!dot.cert_chain.is_empty(), "인증서 체인이 비었습니다");
         assert_eq!(dot.cert_chain, doh.cert_chain, "DoH가 다른 인증서를 냅니다");
         assert_eq!(dot.cert_chain, doq.cert_chain, "DoQ가 다른 인증서를 냅니다");

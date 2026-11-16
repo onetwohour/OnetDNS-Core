@@ -203,6 +203,12 @@ impl Ticketer {
         ticketer
     }
 
+    /// Opens every ticket sealed with it and forges new ones, so it goes only to a process taking
+    /// over this one's listeners. Never store it.
+    pub fn key(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.key)
+    }
+
     pub fn seal(&self, state: &ResumptionState) -> Option<Vec<u8>> {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         let cipher = aes_gcm::Aes256Gcm::new_from_slice(&self.key)
@@ -292,6 +298,14 @@ mod tests {
         let st = sample_state();
         let ticket = t.seal(&st).unwrap();
         assert_eq!(t.open(&ticket), Some(st));
+    }
+
+    #[test]
+    fn a_ticketer_built_from_the_key_opens_the_tickets() {
+        let t = Ticketer::new();
+        let st = sample_state();
+        let ticket = t.seal(&st).unwrap();
+        assert_eq!(Ticketer::from_key(*t.key()).open(&ticket), Some(st));
     }
 
     #[test]

@@ -111,10 +111,12 @@ pub(crate) fn self_signed_is_kept(file: Option<&Path>, leaf: &[u8]) -> bool {
         .is_some_and(|kept| kept.as_slice() == leaf)
 }
 
+/// Seals session tickets with `ticket_key` when given, so tickets sealed with it elsewhere resume.
 pub(crate) fn native_tls_config(
     cfg: &Config,
     alpn: Vec<Vec<u8>>,
     material: &(Vec<Vec<u8>>, Vec<u8>),
+    ticket_key: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Arc<onetdns_tls::ServerConfig>, String> {
     let (certs, key) = (material.0.clone(), material.1.clone());
     if certs.is_empty() {
@@ -131,7 +133,11 @@ pub(crate) fn native_tls_config(
     }
 
     if cfg.tls_client_ca.is_none() {
-        sc = sc.with_resumption(onetdns_tls::conn::ServerResumption::secure_default());
+        let mut resumption = onetdns_tls::conn::ServerResumption::secure_default();
+        if let Some(key) = ticket_key {
+            resumption.ticketer = Arc::new(onetdns_tls::Ticketer::from_key(*key));
+        }
+        sc = sc.with_resumption(resumption);
     }
     Ok(Arc::new(sc))
 }

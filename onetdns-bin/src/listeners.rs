@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use onetdns_config::Config;
 use onetdns_core::MutexExt;
+use zeroize::Zeroizing;
 
 use crate::atomic_file::atomic_write_secret;
 use crate::connection_limit::EncryptedTcpListener;
@@ -125,6 +126,15 @@ fn live_tls_files(cfg: &Config, certs: Vec<Vec<u8>>) -> Result<LiveTlsFiles, Str
     Ok(LiveTlsFiles { certs, client_ca })
 }
 
+/// The key each transport seals TLS session tickets with; None where resumption is off.
+#[derive(Default)]
+pub(crate) struct TicketKeys {
+    dot: Option<Zeroizing<[u8; 32]>>,
+    doh: Option<Zeroizing<[u8; 32]>>,
+    doq: Option<Zeroizing<[u8; 32]>>,
+    doh3: Option<Zeroizing<[u8; 32]>>,
+}
+
 impl TlsSlots {
     /// Built from the current config if absent, so slots appear when a certificate and an encrypted
     /// address are added later. Building them up front would fail startup without a certificate.
@@ -133,11 +143,12 @@ impl TlsSlots {
         handle: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
         cfg: &Config,
         self_signed_file: Option<&std::path::Path>,
+        tickets: impl FnOnce() -> TicketKeys,
     ) -> Result<Arc<TlsSlots>, String> {
         if let Some(slots) = handle.lock_recover().clone() {
             return Ok(slots);
         }
-        let slots = Arc::new(TlsSlots::from_config(cfg, self_signed_file)?);
+        let slots = Arc::new(TlsSlots::from_config(cfg, self_signed_file, tickets())?);
         *handle.lock_recover() = Some(slots.clone());
         Ok(slots)
     }
@@ -145,9 +156,10 @@ impl TlsSlots {
     fn from_config(
         cfg: &Config,
         self_signed_file: Option<&std::path::Path>,
+        tickets: TicketKeys,
     ) -> Result<Self, String> {
         let material = native_tls_material(cfg, self_signed_file)?;
-        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
+        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material, tickets)?;
         Ok(TlsSlots {
             dot: Arc::new(onetdns_core::ArcSwap::new(dot)),
             doh: Arc::new(onetdns_core::ArcSwap::new(doh)),
@@ -185,7 +197,7 @@ impl TlsSlots {
         if changed.is_empty() {
             return Ok(changed);
         }
-        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
+        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material, TicketKeys::default())?;
         self.dot.store(dot);
         self.doh.store(doh);
         self.doq.store(doq);
@@ -201,7 +213,7 @@ impl TlsSlots {
     ) -> Result<PreparedTls, String> {
         let material = native_tls_material(cfg, self_signed_file)?;
         let files = live_tls_files(cfg, material.0.clone())?;
-        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material)?;
+        let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material, TicketKeys::default())?;
         Ok(PreparedTls {
             dot,
             doh,
@@ -225,6 +237,21 @@ impl TlsSlots {
     pub(crate) fn served_chain(&self) -> Vec<Vec<u8>> {
         self.dot.load().cert_chain.clone()
     }
+
+    pub(crate) fn ticket_keys(&self) -> TicketKeys {
+        let key = |slot: &onetdns_core::ArcSwap<onetdns_tls::ServerConfig>| {
+            slot.load()
+                .resumption
+                .as_ref()
+                .map(|resumption| resumption.ticketer.key())
+        };
+        TicketKeys {
+            dot: key(&self.dot),
+            doh: key(&self.doh),
+            doq: key(&self.doq),
+            doh3: key(&self.doh3),
+        }
+    }
 }
 
 /// Read but not yet installed.
@@ -241,6 +268,7 @@ pub(crate) struct PreparedTls {
 pub(crate) fn tls_configs_from(
     cfg: &Config,
     material: &(Vec<Vec<u8>>, Vec<u8>),
+    tickets: TicketKeys,
 ) -> Result<
     (
         Arc<onetdns_tls::ServerConfig>,
@@ -250,11 +278,22 @@ pub(crate) fn tls_configs_from(
     ),
     String,
 > {
+    let TicketKeys {
+        dot,
+        doh,
+        doq,
+        doh3,
+    } = tickets;
     Ok((
-        native_tls_config(cfg, vec![b"dot".to_vec()], material)?,
-        native_tls_config(cfg, vec![b"h2".to_vec(), b"http/1.1".to_vec()], material)?,
-        native_tls_config(cfg, vec![b"doq".to_vec()], material)?,
-        native_tls_config(cfg, vec![b"h3".to_vec()], material)?,
+        native_tls_config(cfg, vec![b"dot".to_vec()], material, dot)?,
+        native_tls_config(
+            cfg,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            material,
+            doh,
+        )?,
+        native_tls_config(cfg, vec![b"doq".to_vec()], material, doq)?,
+        native_tls_config(cfg, vec![b"h3".to_vec()], material, doh3)?,
     ))
 }
 
@@ -288,6 +327,8 @@ struct DnscryptListener {
     /// Kept so `export` can hand it on; closed when the listener stops reading.
     udp: Option<UdpSocket>,
     tcp: EncryptedTcpListener,
+    /// Kept so `export` can hand its resolver key on.
+    provider: onetdns_dnscrypt::Provider,
 }
 
 impl DnscryptListener {
@@ -407,11 +448,9 @@ impl ListenerSet {
                 Some(udp) => udp.try_clone()?,
                 None => return Err(std::io::Error::other("the listener has stopped reading")),
             };
-            pool.put(
-                SocketRole::Dnscrypt,
-                udp.local_addr()?,
-                ListeningSocket::Udp(udp),
-            );
+            let addr = udp.local_addr()?;
+            pool.put(SocketRole::Dnscrypt, addr, ListeningSocket::Udp(udp));
+            pool.put_dnscrypt_key(addr, listener.provider.resolver_secret());
             pool.put(
                 SocketRole::Dnscrypt,
                 listener.tcp.addr(),
@@ -427,6 +466,14 @@ impl ListenerSet {
 
     fn take_tcp(&self, role: SocketRole, addr: SocketAddr) -> Option<TcpListener> {
         self.inherited.lock_recover().take_tcp(role, addr).pop()
+    }
+
+    fn take_dnscrypt_key(&self, addr: SocketAddr) -> Option<Zeroizing<[u8; 32]>> {
+        self.inherited.lock_recover().take_dnscrypt_key(addr)
+    }
+
+    fn take_ticket_keys(&self) -> TicketKeys {
+        self.inherited.lock_recover().take_ticket_keys()
     }
 }
 
@@ -701,7 +748,7 @@ fn reconcile_encrypted(
     }
 
     let need = |pick: fn(&TlsSlots) -> Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>| {
-        TlsSlots::get_or_build(tls, cfg, self_signed_file)
+        TlsSlots::get_or_build(tls, cfg, self_signed_file, || set.take_ticket_keys())
             .map(|slots| pick(&slots))
             .map_err(|error| format!("{NEED_TLS}: {error}"))
     };
@@ -921,6 +968,11 @@ pub(crate) fn reconcile_dnscrypt(
                 index += 1;
             }
         }
+        // Clients that fetched the handed-over listener's certificate seal to its resolver key.
+        let provider = match set.take_dnscrypt_key(*addr) {
+            Some(secret) => provider.with_resolver_secret(&secret, DNSCRYPT_CERT_VALID_SECS),
+            None => provider.clone(),
+        };
         let socket = open_when_free(|| match set.take_udp(SocketRole::Dnscrypt, *addr) {
             Some(socket) => Ok(socket),
             None => UdpSocket::bind(addr),
@@ -971,12 +1023,12 @@ pub(crate) fn reconcile_dnscrypt(
         })
         .map_err(|error| listener_open_error("DNSCrypt TCP", *addr, &error))?;
         let handler = handler.clone();
-        let provider = provider.clone();
+        let udp_provider = provider.clone();
         let listener_stop = stop.clone();
         let thread = std::thread::Builder::new()
             .name(format!("dnscrypt-{bound}"))
             .spawn(move || {
-                if let Err(error) = dnscrypt::serve(handler, socket, provider, listener_stop) {
+                if let Err(error) = dnscrypt::serve(handler, socket, udp_provider, listener_stop) {
                     onetdns_core::error!(event = "dnscrypt.stopped", %error, "Stopped DNSCrypt listener");
                 }
             })
@@ -988,6 +1040,7 @@ pub(crate) fn reconcile_dnscrypt(
             udp_thread: Some(thread),
             udp: Some(kept),
             tcp,
+            provider,
         });
     }
     live.retain(|listener| wanted.iter().any(|(want, _)| *want == listener.key));
@@ -1049,7 +1102,7 @@ pub(crate) mod tests {
         ))
     }
 
-    fn query(id: u16, name: &str) -> Vec<u8> {
+    pub(crate) fn query(id: u16, name: &str) -> Vec<u8> {
         onetdns_proto::Message::query(
             id,
             onetdns_proto::Name::from_str(name).unwrap(),
@@ -1286,7 +1339,7 @@ pub(crate) mod tests {
             tls_key: Some(key_path.clone()),
             ..Config::default()
         };
-        let slots = TlsSlots::from_config(&cfg, None).expect("슬롯 생성");
+        let slots = TlsSlots::from_config(&cfg, None, TicketKeys::default()).expect("슬롯 생성");
         let before = slots.dot.load().cert_chain.clone();
 
         assert!(
@@ -1324,7 +1377,8 @@ pub(crate) mod tests {
             tls_client_ca: Some(ca_path.clone()),
             ..cfg.clone()
         };
-        let mtls_slots = TlsSlots::from_config(&mtls, None).expect("mTLS 슬롯 생성");
+        let mtls_slots =
+            TlsSlots::from_config(&mtls, None, TicketKeys::default()).expect("mTLS 슬롯 생성");
         assert!(
             mtls_slots
                 .refresh_certificate_files(&mtls)
@@ -1356,6 +1410,74 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The resolver public key and client magic in the certificate served at `addr`.
+    pub(crate) fn dnscrypt_resolver_key(addr: SocketAddr, provider_name: &str) -> Vec<u8> {
+        let mut question = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in provider_name.split('.') {
+            question.push(label.len() as u8);
+            question.extend_from_slice(label.as_bytes());
+        }
+        question.extend_from_slice(&[0, 0, 16, 0, 1]);
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.send_to(&question, addr).unwrap();
+        let mut reply = [0u8; 4096];
+        let (n, _) = client.recv_from(&mut reply).expect("no certificate");
+        // The answer repeats the question, then a name pointer, type, class, TTL, length and the
+        // string length come before the certificate; its signed part starts 72 bytes in.
+        let signed = question.len() + 13 + 72;
+        assert!(n >= signed + 40, "the certificate is cut short");
+        reply[signed..signed + 40].to_vec()
+    }
+
+    #[test]
+    /// Reopened from the sockets it exported, after a handoff or when one fails, a DNSCrypt address
+    /// answers with the same resolver key, so clients holding its certificate keep working.
+    fn a_dnscrypt_address_keeps_its_resolver_key_when_reopened_from_its_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-dnscrypt-handover-{}-{}",
+            std::process::id(),
+            crate::unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = Some(dir.join(CONFIG_FILE_NAME));
+        let addr = crate::tests::tcp_udp_test_listeners().2;
+        let cfg = Config {
+            listen_dnscrypt: vec![addr],
+            ..Config::default()
+        };
+        let open = |generation: &Generation| {
+            reconcile_dnscrypt(
+                &cfg,
+                &generation.set,
+                &generation.handler,
+                &config_path,
+                &Arc::new(Mutex::new(Vec::new())),
+                &Arc::new(Mutex::new(Vec::new())),
+                &Arc::new(Mutex::new(None)),
+            )
+            .expect("could not open the DNSCrypt address");
+        };
+
+        let old = Generation::new(Ipv4Addr::new(192, 0, 2, 1));
+        open(&old);
+        let served = dnscrypt_resolver_key(addr, &cfg.dnscrypt_provider_name);
+        let pool = old.set.export().unwrap();
+        old.close();
+
+        let new = Generation::new(Ipv4Addr::new(192, 0, 2, 2));
+        new.set.adopt(pool);
+        open(&new);
+        assert_eq!(
+            dnscrypt_resolver_key(addr, &cfg.dnscrypt_provider_name),
+            served
+        );
+        new.close();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

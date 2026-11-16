@@ -88,12 +88,34 @@ impl Provider {
     /// Restores a provider from a stored signing seed, so clients keep trusting it across restarts.
     /// The resolver key is new every time; clients learn it from the certificate.
     pub fn with_signing_seed(seed: &[u8; 32], provider_name: &str, valid_secs: u32) -> Self {
-        let signing = SigningKey::from_bytes(seed);
-
         let mut rsk = [0u8; 32];
         onetdns_core::fill_random(&mut rsk);
         let resolver_sk = StaticSecret::from(rsk);
         rsk.zeroize();
+        Self::from_keys(
+            SigningKey::from_bytes(seed),
+            resolver_sk,
+            provider_name,
+            valid_secs,
+        )
+    }
+
+    /// This provider answering with the resolver key `resolver_secret`, under a new certificate.
+    pub fn with_resolver_secret(&self, resolver_secret: &[u8; 32], valid_secs: u32) -> Self {
+        Self::from_keys(
+            self.signing.clone(),
+            StaticSecret::from(*resolver_secret),
+            &self.provider_name,
+            valid_secs,
+        )
+    }
+
+    fn from_keys(
+        signing: SigningKey,
+        resolver_sk: StaticSecret,
+        provider_name: &str,
+        valid_secs: u32,
+    ) -> Self {
         let resolver_pk = PublicKey::from(&resolver_sk).to_bytes();
 
         let mut client_magic = [0u8; CLIENT_MAGIC_LEN];
@@ -115,6 +137,12 @@ impl Provider {
     /// Use it only to persist the provider across restarts.
     pub fn signing_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing.to_bytes())
+    }
+
+    /// Clients seal their queries to the resolver key in the certificate they hold, so a process
+    /// taking over this provider's addresses must answer with this one. Never store it.
+    pub fn resolver_secret(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.resolver_sk.to_bytes())
     }
 
     /// Re-signs with a new validity window; the keys stay the same.
@@ -478,6 +506,34 @@ mod tests {
         assert_eq!(before.len(), after.len());
         let (rpk, _) = client_parse_cert(&after, &p.provider_public_key());
         assert_eq!(rpk, p.resolver_pk);
+    }
+
+    #[test]
+    /// A client holding the first provider's certificate gets the same shared key from a provider
+    /// given its resolver secret, and the new certificate names the same resolver key.
+    fn the_resolver_secret_answers_clients_holding_the_old_certificate() {
+        let first = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
+        let successor =
+            Provider::with_signing_seed(&first.signing_seed(), "2.dnscrypt-cert.onetdns", 86400)
+                .with_resolver_secret(&first.resolver_secret(), 86400);
+
+        let (resolver_pk, client_magic) =
+            client_parse_cert(&first.cert_bytes(), &first.provider_public_key());
+        assert_eq!(
+            client_parse_cert(&successor.cert_bytes(), &first.provider_public_key()),
+            (resolver_pk, client_magic)
+        );
+        let client_sk = StaticSecret::from([9u8; 32]);
+        let client_shared = box_beforenm(
+            &client_sk
+                .diffie_hellman(&PublicKey::from(resolver_pk))
+                .to_bytes(),
+        );
+        let client_pk = PublicKey::from(&client_sk).to_bytes();
+        assert_eq!(
+            successor.shared_key(&client_pk).as_slice(),
+            client_shared.as_slice()
+        );
     }
 
     #[test]
