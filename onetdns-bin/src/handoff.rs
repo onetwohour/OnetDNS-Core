@@ -161,6 +161,8 @@ pub(crate) type SuccessorLink = Link<FromPredecessor, FromSuccessor>;
 /// Held by the successor.
 pub(crate) type PredecessorLink = Link<FromSuccessor, FromPredecessor>;
 
+/// Both ends in one process.
+#[cfg(test)]
 pub(crate) fn link() -> (SuccessorLink, PredecessorLink) {
     let (to_successor, from_predecessor) = mpsc::channel();
     let (to_predecessor, from_successor) = mpsc::channel();
