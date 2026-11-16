@@ -9,10 +9,7 @@ use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write;
 use crate::config_apply::SecondaryRestart;
-use crate::{
-    dhcp, dhcp6, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, track_service_thread,
-    unix_now,
-};
+use crate::{dhcp, dhcp6, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, unix_now};
 
 /// Most leases accepted in one sync.
 const MAX_SYNCED_LEASES: usize = 16_384;
@@ -569,15 +566,15 @@ pub(crate) fn spawn_lease_sync(
         .map(Some)
 }
 
-/// Runs only with a DHCPv4 pool, cluster peers and a control token; a config change stops the
-/// previous job and starts a new one.
+/// Runs only with a DHCPv4 pool, cluster peers and a control token; a config change stops and joins
+/// the previous job, then starts a new one.
 pub(crate) fn lease_sync_restart(
     jobs: Arc<EdgeServices>,
     dhcp_slot: Arc<Mutex<Option<Arc<Mutex<dhcp::LeasePool>>>>>,
     resolver: http::HostResolver,
-    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> SecondaryRestart {
     Arc::new(move |next: &Config| -> Result<(), String> {
+        jobs.retire_all();
         let stop = jobs.restart_all();
         let Some(pool) = dhcp_slot.lock_recover().clone() else {
             return Ok(());
@@ -594,7 +591,7 @@ pub(crate) fn lease_sync_restart(
         )
         .map_err(|error| format!("Could not start the DHCP lease sync thread: {error}"))?;
         if let Some(thread) = thread {
-            track_service_thread(&threads, thread);
+            jobs.keep("dhcp-lease-sync", thread);
         }
         onetdns_core::info!(
             event = "dhcp.lease_sync_started",
@@ -963,11 +960,55 @@ pub(crate) fn reconcile_edge_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use onetdns_config::Config;
 
     use crate::dhcp;
+
+    /// A job that keeps running for a while after its stop signal, then marks itself done.
+    fn slow_job(stop: Arc<AtomicBool>, done: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            done.store(true, Ordering::Release);
+        })
+    }
+
+    #[test]
+    /// Restart hooks retire the group and keep the new thread by name, so a job never overlaps the
+    /// one it replaces, and retiring the group returns only once its jobs have ended.
+    fn a_group_stops_and_waits_for_the_jobs_it_keeps() {
+        let jobs = EdgeServices::default();
+        let first = Arc::new(AtomicBool::new(false));
+        jobs.keep("job", slow_job(jobs.restart_all(), first.clone()));
+
+        jobs.retire_all();
+        assert!(
+            first.load(Ordering::Acquire),
+            "retiring returned before the job ended"
+        );
+
+        let second = Arc::new(AtomicBool::new(false));
+        let stop = jobs.restart_all();
+        jobs.keep("job", slow_job(stop.clone(), second.clone()));
+        stop.store(true, Ordering::Release);
+        let third = Arc::new(AtomicBool::new(false));
+        jobs.keep("job", slow_job(jobs.restart_all(), third.clone()));
+        assert!(
+            second.load(Ordering::Acquire),
+            "the replaced job was still running"
+        );
+
+        jobs.retire_all();
+        assert!(
+            third.load(Ordering::Acquire),
+            "retiring returned before the job ended"
+        );
+    }
 
     #[test]
     fn dhcp_range_excludes_server_and_router_addresses() {

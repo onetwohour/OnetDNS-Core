@@ -1405,7 +1405,6 @@ pub fn serve(
                 jobs.lease_sync.clone(),
                 dhcp_slot.clone(),
                 blocklist_resolver.clone(),
-                service_cleanup.tracker(),
             ),
             &cfg,
         )
@@ -1456,11 +1455,7 @@ pub fn serve(
     exclusive
         .install(
             &restarts.zsk_rollover,
-            rollover_restart(
-                jobs.zsk_rollover.clone(),
-                reload_zone_keys,
-                service_cleanup.tracker(),
-            ),
+            rollover_restart(jobs.zsk_rollover.clone(), reload_zone_keys),
             &cfg,
         )
         .map_err(std::io::Error::other)?;
@@ -1468,12 +1463,7 @@ pub fn serve(
     exclusive
         .install(
             &restarts.secondary,
-            refresh_restart(
-                jobs.secondary.clone(),
-                &zones,
-                notify_kick.clone(),
-                service_cleanup.tracker(),
-            ),
+            refresh_restart(jobs.secondary.clone(), &zones, notify_kick.clone()),
             &cfg,
         )
         .map_err(|error| crate::anyhow!(error))?;

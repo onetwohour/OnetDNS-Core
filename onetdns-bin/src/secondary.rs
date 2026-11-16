@@ -1,7 +1,7 @@
 //! Secondary zones: transferred from the primary by AXFR and IXFR, refreshed when the SOA serial
 //! says so.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use onetdns_config::Config;
@@ -16,8 +16,7 @@ use crate::zones::{
     ZonemdPolicy,
 };
 use crate::{
-    build_tsig_keys, native, nonblocking_tcp, read_text_limited, track_service_thread,
-    tsig_for_secondary, unix_now,
+    build_tsig_keys, native, nonblocking_tcp, read_text_limited, tsig_for_secondary, unix_now,
 };
 
 /// Reads the copy saved by the last transfer, so the zone is served before the first transfer
@@ -1765,18 +1764,18 @@ pub(crate) fn spawn_secondary_refresh(
     )
 }
 
-/// Stops the previous task and starts one on the new config; with no secondaries or catalogs, only
-/// stops.
+/// Stops the previous task, waiting for a transfer in progress, and starts one on the new config;
+/// with no secondaries or catalogs, only stops.
 pub(crate) fn refresh_restart(
     jobs: Arc<EdgeServices>,
     zones: &ZoneState,
     kick: Arc<native::NotifyKick>,
-    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> SecondaryRestart {
     let store = zones.store.clone();
     let journal = zones.journal.clone();
     let sender = zones.notify.clone();
     Arc::new(move |next: &Config| -> Result<(), String> {
+        jobs.retire_all();
         let stop = jobs.restart_all();
         if next.secondary.is_empty() && next.catalog.is_empty() {
             return Ok(());
@@ -1792,7 +1791,7 @@ pub(crate) fn refresh_restart(
             stop,
         )
         .map_err(|error| format!("Could not start the secondary zone refresh task: {error}"))?;
-        track_service_thread(&threads, thread);
+        jobs.keep("secondary-refresh", thread);
         Ok(())
     })
 }

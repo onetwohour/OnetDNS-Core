@@ -1,6 +1,6 @@
 //! Loads or creates signing keys for authoritative zones and rolls ZSKs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use onetdns_config::Config;
 use zeroize::Zeroizing;
@@ -9,8 +9,8 @@ use crate::atomic_file::{atomic_write_secret, replace_file, FileBackup};
 use crate::config_apply::SecondaryRestart;
 use crate::edge::EdgeServices;
 use crate::{
-    read_text_limited, rollover, sleep_or_shutdown, track_service_thread, unix_now,
-    LOCAL_KEY_MAX_BYTES, LOCAL_STATE_MAX_BYTES,
+    read_text_limited, rollover, sleep_or_shutdown, unix_now, LOCAL_KEY_MAX_BYTES,
+    LOCAL_STATE_MAX_BYTES,
 };
 
 pub(crate) fn zsk_path_for(zc: &onetdns_config::ZoneConfig) -> std::path::PathBuf {
@@ -113,14 +113,14 @@ pub(crate) fn spawn_zsk_rollover(
         .map(Some)
 }
 
-/// Only split-key signed zones roll. A changed zone list or period stops the old job and starts a
-/// new one.
+/// Only split-key signed zones roll. A changed zone list or period stops and joins the old job, then
+/// starts a new one.
 pub(crate) fn rollover_restart(
     jobs: Arc<EdgeServices>,
     reload_keys: ZoneKeyReload,
-    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> SecondaryRestart {
     Arc::new(move |next: &Config| -> Result<(), String> {
+        jobs.retire_all();
         let stop = jobs.restart_all();
         let zones = next
             .zones
@@ -140,7 +140,7 @@ pub(crate) fn rollover_restart(
         )
         .map_err(|error| format!("Could not start the DNSSEC ZSK rollover thread: {error}"))?;
         if let Some(thread) = thread {
-            track_service_thread(&threads, thread);
+            jobs.keep("zsk-rollover", thread);
         }
         Ok(())
     })

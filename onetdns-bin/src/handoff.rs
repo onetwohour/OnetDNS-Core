@@ -273,8 +273,8 @@ impl Exclusive {
         Ok(())
     }
 
-    /// Stops all of it. Edge services and the singleton jobs are joined; the other threads end on
-    /// their own.
+    /// Stops all of it and waits for its threads, so none still writes a file or holds a port when
+    /// the successor starts its own.
     fn release(&self, cfg: &Config) {
         for group in [
             &self.jobs.edge,
