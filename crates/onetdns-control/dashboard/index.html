@@ -295,7 +295,7 @@
               {{ qlRows }}
               {{ qlMoreBtn }}
             </div>
-            <div style="display:flex;align-items:center;gap:8px;padding:10px 18px;border-top:1px solid var(--border);font-family:var(--font-mono);font-size:11px;color:var(--muted)">{{ qlCountLabel }}</div>
+            <sc-if value="{{ qlCountLabel }}"><div style="display:flex;align-items:center;gap:8px;padding:10px 18px;border-top:1px solid var(--border);font-family:var(--font-mono);font-size:11px;color:var(--muted)">{{ qlCountLabel }}</div></sc-if>
           </div>
         </div>
       </div>
@@ -1749,10 +1749,9 @@ Object.assign(I18N.en, {
   "읽기 전용 계정에는 변경 권한이 없습니다": "This read-only account cannot make changes",
   "알 수 없음": "Unknown",
   "올바르지 않은 업스트림 DNS 서버": "Invalid upstream",
-  "현재 {shown}개 표시 · 버퍼 {buffered}개 · 필터 일치 {matched}개": "Showing {shown} · buffered {buffered} · matched {matched}",
-  " · 서버 유실 {count}개": " · server dropped {count}",
-  " · 누락 {count}개": " · missed {count}",
-  " · 일시정지됨": " · paused",
+  "{count}개 일치": "{count} matching",
+  "일시정지 중 표시하지 못한 질의 {count}개": "{count} queries not shown while paused",
+  "서버가 기록하지 못한 질의 {count}개": "{count} queries the server could not log",
   "{name} 차단 해제": "Unblock {name}",
   "{name} 차단": "Block {name}",
   "{name} 목록 비활성화": "Disable list {name}",
@@ -1816,10 +1815,9 @@ Object.assign(I18N.ja, {
   "읽기 전용 계정에는 변경 권한이 없습니다": "読み取り専用アカウントには変更権限がありません",
   "알 수 없음": "不明",
   "올바르지 않은 업스트림 DNS 서버": "無効な上位 DNS サーバー",
-  "현재 {shown}개 표시 · 버퍼 {buffered}개 · 필터 일치 {matched}개": "{shown} 件表示・バッファ {buffered} 件・一致 {matched} 件",
-  " · 서버 유실 {count}개": "・サーバー欠落 {count} 件",
-  " · 누락 {count}개": "・未表示 {count} 件",
-  " · 일시정지됨": "・一時停止中",
+  "{count}개 일치": "一致 {count} 件",
+  "일시정지 중 표시하지 못한 질의 {count}개": "一時停止中に表示できなかったクエリ {count} 件",
+  "서버가 기록하지 못한 질의 {count}개": "サーバーが記録できなかったクエリ {count} 件",
   "{name} 차단 해제": "{name} の遮断を解除",
   "{name} 차단": "{name} を遮断",
   "{name} 목록 비활성화": "リスト {name} を無効化",
@@ -2089,7 +2087,6 @@ Object.assign(I18N.en, {
   "이름과 식별자를 입력하세요": "Enter a name and identifier",
   "규칙별 적중 횟수": "Per-rule hit counts",
   "루트 서버 IP를 입력하세요": "Enter a root server IP",
-  "일시정지 버퍼 상한 초과로 ": "Pause buffer overflow dropped ",
   "직전 저장본으로 되돌렸습니다": "Rolled back to the previous snapshot",
   "\" DNS를 이전 값으로 복원": "\" DNS restored to its previous value",
   "필터 목록 갱신 작업을 시작했습니다": "List refresh job started",
@@ -2381,7 +2378,6 @@ Object.assign(I18N.ja, {
   "이름과 식별자를 입력하세요": "名前と識別子を入力してください",
   "규칙별 적중 횟수": "ルール別ヒット数",
   "루트 서버 IP를 입력하세요": "ルートサーバー IP を入力してください",
-  "일시정지 버퍼 상한 초과로 ": "一時停止バッファ上限超過により ",
   "직전 저장본으로 되돌렸습니다": "直前に保存した内容へ戻しました",
   "\" DNS를 이전 값으로 복원": "\" の DNS を以前の値へ復元",
   "필터 목록 갱신 작업을 시작했습니다": "リスト更新処理を開始しました",
@@ -3639,10 +3635,9 @@ Object.assign(I18N.zh, {
   "읽기 전용 계정에는 변경 권한이 없습니다":"只读账户没有更改权限",
   "알 수 없음":"未知",
   "올바르지 않은 업스트림 DNS 서버":"无效的上游 DNS 服务器",
-  "현재 {shown}개 표시 · 버퍼 {buffered}개 · 필터 일치 {matched}개":"当前显示 {shown} 条 · 缓冲 {buffered} 条 · 匹配 {matched} 条",
-  " · 서버 유실 {count}개":" · 服务器丢弃 {count} 条",
-  " · 누락 {count}개":" · 遗漏 {count} 条",
-  " · 일시정지됨":" · 已暂停",
+  "{count}개 일치":"匹配 {count} 条",
+  "일시정지 중 표시하지 못한 질의 {count}개":"暂停期间未显示的查询 {count} 条",
+  "서버가 기록하지 못한 질의 {count}개":"服务器未能记录的查询 {count} 条",
   "{name} 차단 해제":"取消拦截 {name}",
   "{name} 차단":"拦截 {name}",
   "{name} 목록 비활성화":"停用列表 {name}",
@@ -3911,7 +3906,6 @@ Object.assign(I18N.zh, {
   "이름과 식별자를 입력하세요":"请输入名称和标识符",
   "규칙별 적중 횟수":"按规则的命中次数",
   "루트 서버 IP를 입력하세요":"请输入根服务器 IP",
-  "일시정지 버퍼 상한 초과로 ":"暂停缓冲区已满，丢弃了 ",
   "직전 저장본으로 되돌렸습니다":"已恢复到上一次保存的版本",
   "\" DNS를 이전 값으로 복원":"\" 的 DNS 已恢复为之前的值",
   "필터 목록 갱신 작업을 시작했습니다":"已开始更新过滤列表的任务",
@@ -5354,14 +5348,6 @@ class Component extends DCLogic {
     const ordered=batch.every((e,i)=>i===0||after(batch[i-1],e));
     if(batch.length&&ordered&&(!log.length||after(batch[batch.length-1],log[0]))) return batch.concat(log).slice(0,cap);
     return this.mergeLog([...batch,...log],cap);
-  }
-  bufferedCount(paused,log){
-    if(!paused.length) return log.length;
-    const memo=this._bufferedMemo;
-    if(memo&&memo.paused===paused&&memo.log===log) return memo.count;
-    const count=this.mergeLog([...paused,...log],paused.length+log.length).length;
-    this._bufferedMemo={paused,log,count};
-    return count;
   }
   applyRecentEvents(items){
     if(!Array.isArray(items))return false;
@@ -6966,12 +6952,12 @@ class Component extends DCLogic {
       domBlocked:db, notBlocked:!db, onToggleBlock:(e)=>{ if(e&&e.stopPropagation)e.stopPropagation(); this.toggleBlockDomain(r.name,r.action)(); },
       blockBtnStyle:`width:26px;height:26px;border-radius:2px;border:1px solid var(--border);background:var(--surface);cursor:pointer;display:flex;align-items:center;justify-content:center;color:${db?'var(--ok)':'var(--block)'};flex:0 0 26px`,
       blockTitle:da.title }; });
-    const qlShown=Math.min(QL_WINDOW,qlMatched.length);
-    const qlBuffered=this.bufferedCount(s.pausedEvents,s.log);
-    const qlDropped=s.feedPaused&&s.pausedDropped?this.tr(' · 누락 {count}개',{count:s.pausedDropped.toLocaleString(this.locale())}):'';
-    const serverDropped=(s.m&&s.m.droppedLog)||0;
-    const qlServerDropLabel=serverDropped>0?this.tr(' · 서버 유실 {count}개',{count:serverDropped.toLocaleString(this.locale())}):'';
-    const qlCountLabel=this.tr('현재 {shown}개 표시 · 버퍼 {buffered}개 · 필터 일치 {matched}개',{shown:qlShown.toLocaleString(this.locale()),buffered:qlBuffered.toLocaleString(this.locale()),matched:qlMatched.length.toLocaleString(this.locale())})+qlServerDropLabel+(s.feedPaused?this.t(' · 일시정지됨')+qlDropped:'');
+    const qlFiltered=f.qlAction!=='all'||f.qlTransport!=='all'||!!f.qlText,serverDropped=(s.m&&s.m.droppedLog)||0;
+    const qlCountLabel=[
+      qlFiltered?this.tr('{count}개 일치',{count:qlMatched.length.toLocaleString(this.locale())}):'',
+      s.feedPaused&&s.pausedDropped?this.tr('일시정지 중 표시하지 못한 질의 {count}개',{count:s.pausedDropped.toLocaleString(this.locale())}):'',
+      serverDropped>0?this.tr('서버가 기록하지 못한 질의 {count}개',{count:serverDropped.toLocaleString(this.locale())}):''
+    ].filter(Boolean).join(' · ');
     const qlHasMore=qlMatched.length>QL_WINDOW;
     const qlLoadMore=()=>this.setState(st=>({qlWindow:(st.qlWindow||100)+200}));
 
