@@ -465,10 +465,19 @@ mod linux {
                     Ok(trial) => self.trial = Some(trial),
                     Err(reason) => return Some(Failure::Refused(reason)),
                 }
-                if let Err(error) = link(worker, current) {
-                    return Some(Failure::Refused(format!(
-                        "Could not connect the new version to the running one: {error}"
-                    )));
+                match link(worker, current) {
+                    Ok(()) => {}
+                    // It ended and closed its channel; the exit check below says how.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) => {}
+                    Err(error) => {
+                        return Some(Failure::Refused(format!(
+                            "Could not connect the new version to the running one: {error}"
+                        )))
+                    }
                 }
             }
             if worker.ready {
