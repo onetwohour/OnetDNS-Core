@@ -25,6 +25,8 @@ use unix as sys;
 #[cfg(windows)]
 use windows as sys;
 
+#[cfg(target_os = "linux")]
+pub(crate) use sys::pair;
 #[cfg(test)]
 pub(crate) use sys::stream_pair;
 pub(crate) use sys::{Passed, Stream};

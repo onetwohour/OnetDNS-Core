@@ -289,7 +289,7 @@ fn millis(timeout: Option<Duration>) -> u64 {
 
 /// Both ends of a new pipe, neither inheritable. The pipe allows one client, and the second end
 /// is that client, so no other process can have connected to it.
-pub(crate) fn pipe_pair() -> io::Result<(Pipe, Pipe)> {
+pub(crate) fn pair() -> io::Result<(Pipe, Pipe)> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -452,7 +452,7 @@ pub(super) fn socket_type(socket: &Passed) -> Result<SocketType, LinkError> {
 /// Both ends of a new pipe, each passing sockets to this process.
 #[cfg(test)]
 pub(crate) fn stream_pair() -> (Stream, Stream) {
-    let (a, b) = pipe_pair().expect("a pipe pair");
+    let (a, b) = pair().expect("a pipe pair");
     a.set_peer(std::process::id());
     b.set_peer(std::process::id());
     (a, b)

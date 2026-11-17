@@ -1,21 +1,19 @@
-//! The channel between the supervisor and a worker process it started: one Unix stream socket per
-//! worker. The worker finds its end through `CHANNEL_ENV`, speaks first with its protocol and
-//! version, and starts the way the supervisor answers: on its own, or taking over from the worker
-//! it succeeds.
+//! The channel between the supervisor and a worker process it started: one link per worker. The
+//! worker finds its end through `CHANNEL_ENV`, speaks first with its protocol and version, and
+//! starts the way the supervisor answers: on its own, or taking over from the worker it succeeds.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use onetdns_core::MutexExt;
 
+use super::sys;
 use crate::error::BoxResult;
-use crate::handoff::wire::{self, Frame, Reader, Writer, PROTOCOL};
+use crate::handoff::wire::{self, Frame, Reader, Stream, Writer, PROTOCOL};
 use crate::handoff::LinkError;
 use crate::update::VERSION;
 
-/// Names the descriptor of the worker's end.
+/// Names the worker's end: a descriptor on Unix, a handle on Windows.
 pub(super) const CHANNEL_ENV: &str = "ONETDNS_SUPERVISOR_CHANNEL";
 
 /// Worker to supervisor. Its layout stays the same in every protocol, so a supervisor can turn
@@ -77,20 +75,6 @@ pub(super) fn is_bare(frame: &Frame, kind: u8) -> bool {
     frame.kind == kind && frame.payload.is_empty() && frame.fds.is_empty()
 }
 
-/// A frame of `kind` carrying one descriptor.
-pub(super) fn with_stream(kind: u8, stream: UnixStream) -> Frame {
-    let mut frame = Frame::new(kind);
-    frame.fds.push(stream.into());
-    frame
-}
-
-fn take_stream(mut frame: Frame) -> Result<UnixStream, LinkError> {
-    if !frame.payload.is_empty() || frame.fds.len() != 1 {
-        return Err(LinkError::Unreadable);
-    }
-    Ok(UnixStream::from(frame.fds.remove(0)))
-}
-
 pub(super) fn no_successor(reason: &str) -> Frame {
     let mut frame = Frame::new(NO_SUCCESSOR);
     Writer(&mut frame.payload).bytes(reason.as_bytes());
@@ -106,12 +90,12 @@ fn read_reason(frame: &Frame) -> Result<String, LinkError> {
 
 /// This worker's end, kept for the life of the process. A request holds the lock until its answer
 /// arrives.
-static CHANNEL: OnceLock<Mutex<UnixStream>> = OnceLock::new();
+static CHANNEL: OnceLock<Mutex<Stream>> = OnceLock::new();
 
 pub(super) enum Start {
     Fresh,
     /// The link to the worker this one takes over from.
-    Successor(UnixStream),
+    Successor(Stream),
 }
 
 /// Introduces this process to the supervisor that started it and waits for its answer. None when
@@ -121,7 +105,7 @@ pub(super) fn join() -> BoxResult<Option<Start>> {
         return Ok(None);
     };
     std::env::remove_var(CHANNEL_ENV);
-    let stream = adopt(&named)?;
+    let stream = sys::adopt(&named)?;
     wire::send(&stream, &Hello::own()).map_err(|error| {
         crate::anyhow!(format!(
             "Could not introduce this process to the supervisor: {error}"
@@ -131,7 +115,7 @@ pub(super) fn join() -> BoxResult<Option<Start>> {
         .map_err(|error| crate::anyhow!(format!("The supervisor did not answer: {error}")))?;
     let start = match answer.kind {
         RUN if is_bare(&answer, RUN) => Start::Fresh,
-        TAKE_OVER => Start::Successor(take_stream(answer).map_err(|error| {
+        TAKE_OVER => Start::Successor(sys::take_stream(answer).map_err(|error| {
             crate::anyhow!(format!("The supervisor's answer is unreadable: {error}"))
         })?),
         _ => {
@@ -144,7 +128,7 @@ pub(super) fn join() -> BoxResult<Option<Start>> {
     Ok(Some(start))
 }
 
-fn channel() -> std::io::Result<&'static Mutex<UnixStream>> {
+fn channel() -> std::io::Result<&'static Mutex<Stream>> {
     CHANNEL.get().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotConnected, "No supervisor channel")
     })
@@ -157,7 +141,7 @@ pub(super) fn ready() -> std::io::Result<()> {
 
 pub(super) enum Reply {
     /// The link to the successor, which waits for this process to introduce itself.
-    Link(UnixStream),
+    Link(Stream),
     /// Restart the way a process without a successor does.
     Fallback(String),
     /// The successor failed and the update was put back.
@@ -174,7 +158,9 @@ pub(super) fn request_successor() -> Result<Reply, String> {
         .map_err(|error| format!("The supervisor did not answer: {error}"))?;
     let unreadable = |error: LinkError| format!("The supervisor's answer is unreadable: {error}");
     match answer.kind {
-        LINK => take_stream(answer).map(Reply::Link).map_err(unreadable),
+        LINK => sys::take_stream(answer)
+            .map(Reply::Link)
+            .map_err(unreadable),
         NO_SUCCESSOR => read_reason(&answer)
             .map(Reply::Fallback)
             .map_err(unreadable),
@@ -206,54 +192,6 @@ pub(super) fn settle(handed: bool, abort: &dyn Fn() -> bool) -> bool {
             handed
         }
     }
-}
-
-/// The descriptor came through the environment, so it is checked to be an open Unix stream socket
-/// before this process owns it, and closed on exec so the processes it starts do not inherit it.
-pub(super) fn adopt(named: &str) -> BoxResult<UnixStream> {
-    let invalid = || {
-        crate::anyhow!(format!(
-            "{named} does not name a supervisor channel descriptor"
-        ))
-    };
-    let fd: libc::c_int = named.parse().map_err(|_| invalid())?;
-    if fd < 3 {
-        return Err(invalid());
-    }
-    // SAFETY: F_GETFD only reads the descriptor flags; it fails on a descriptor that is not open.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(invalid());
-    }
-    let option = |name| {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `value` and `len` are valid for the size passed.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                name,
-                (&raw mut value).cast(),
-                &raw mut len,
-            )
-        };
-        (rc == 0).then_some(value)
-    };
-    if option(libc::SO_DOMAIN) != Some(libc::AF_UNIX)
-        || option(libc::SO_TYPE) != Some(libc::SOCK_STREAM)
-    {
-        return Err(invalid());
-    }
-    // SAFETY: Same descriptor, checked open above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(invalid());
-    }
-    // SAFETY: Whoever named this descriptor passed it to this process alone, and the variable
-    // naming it is gone, so nothing else owns it.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    debug_assert_eq!(owned.as_raw_fd(), fd);
-    Ok(UnixStream::from(owned))
 }
 
 #[cfg(test)]
@@ -298,30 +236,5 @@ mod tests {
             [0, 0, 0, 6, b'm', b'e', b'm', b'o', b'r', b'y']
         );
         assert_eq!(read_reason(&refusal).unwrap(), "memory");
-
-        let (ours, _) = UnixStream::pair().unwrap();
-        let link = with_stream(LINK, ours);
-        assert_eq!((link.payload.len(), link.fds.len()), (0, 1));
-        assert!(take_stream(link).is_ok());
-        assert!(take_stream(Frame::new(LINK)).is_err());
-    }
-
-    #[test]
-    fn only_an_open_unix_stream_socket_is_adopted() {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        for named in ["", "x", "1", &udp.as_raw_fd().to_string(), "1000000"] {
-            assert!(adopt(named).is_err(), "{named}");
-        }
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        let fd = OwnedFd::from(theirs);
-        // SAFETY: Clears the flag on a descriptor this test owns.
-        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) };
-        let named = fd.as_raw_fd().to_string();
-        std::mem::forget(fd);
-        let adopted = adopt(&named).unwrap();
-        // SAFETY: Reads the flags of a descriptor `adopted` owns.
-        let flags = unsafe { libc::fcntl(adopted.as_raw_fd(), libc::F_GETFD) };
-        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
-        drop(ours);
     }
 }

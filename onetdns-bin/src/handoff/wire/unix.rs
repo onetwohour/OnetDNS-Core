@@ -166,7 +166,11 @@ pub(super) fn socket_type(fd: &Passed) -> Result<SocketType, LinkError> {
 }
 
 /// Both ends of a new stream.
+pub(crate) fn pair() -> io::Result<(Stream, Stream)> {
+    UnixStream::pair()
+}
+
 #[cfg(test)]
 pub(crate) fn stream_pair() -> (Stream, Stream) {
-    UnixStream::pair().expect("a socket pair")
+    pair().expect("a socket pair")
 }
