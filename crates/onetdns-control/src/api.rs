@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use onetdns_core::json;
-use onetdns_core::tcp::DeadlineTcp;
+use onetdns_core::tcp::{DeadlineTcp, DRAIN_IDLE};
 use onetdns_core::{ArcSwap, HttpsOrigin, IpNet, MutexExt, SecretString};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -2079,6 +2079,7 @@ impl Default for AuditLog {
 struct PendingControlConnection {
     stream: SharedTcp,
     peer: SocketAddr,
+    accepted: Instant,
     /// Counted from accept.
     deadline: Instant,
     /// Request bytes admission read so far.
@@ -2325,6 +2326,7 @@ fn spawn_control_connection(
     let PendingControlConnection {
         stream,
         peer,
+        accepted: _,
         deadline,
         received,
         next_probe: _,
@@ -2526,6 +2528,7 @@ pub fn serve_listener(
                     pending.push(PendingControlConnection {
                         stream: s,
                         peer,
+                        accepted: Instant::now(),
                         deadline: Instant::now() + Duration::from_secs(CONTROL_READ_TIMEOUT_SECS),
                         received: Vec::new(),
                         next_probe: Instant::now(),
@@ -2551,22 +2554,45 @@ pub fn serve_listener(
         std::thread::sleep(Duration::from_millis(CONTROL_ADMISSION_POLL_MS));
     }
 
-    for pending in pending.drain(..) {
-        let _ = pending.stream.shutdown(std::net::Shutdown::Both);
-    }
     std::thread::Builder::new()
         .name("onetdns-control-drain".into())
-        .spawn(move || drain_control_connections(connections))
+        .spawn(move || drain_control_connections(pending, connections, &state, &shutdown))
 }
 
-fn drain_control_connections(mut connections: Vec<(SharedTcp, std::thread::JoinHandle<()>)>) {
+/// Answers the connections the listener took. Pending ones go on through admission, and one that
+/// sent nothing within DRAIN_IDLE of being accepted is closed. Whatever is left after
+/// CONTROL_DRAIN_GRACE_SECS is cut.
+fn drain_control_connections(
+    mut pending: Vec<PendingControlConnection>,
+    mut connections: Vec<(SharedTcp, std::thread::JoinHandle<()>)>,
+    state: &AppState,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
     let drain_deadline = Instant::now() + Duration::from_secs(CONTROL_DRAIN_GRACE_SECS);
+    let mut scratch = [0u8; CONTROL_ADMISSION_READ_BYTES];
     loop {
         reap_control_connections(&mut connections);
-        if connections.is_empty() || Instant::now() >= drain_deadline {
+        pending.retain(|waiting| {
+            let idle = waiting.received.is_empty() && waiting.accepted.elapsed() >= DRAIN_IDLE;
+            if idle {
+                let _ = waiting.stream.shutdown(std::net::Shutdown::Both);
+            }
+            !idle
+        });
+        promote_control_connections(
+            &mut pending,
+            state,
+            shutdown,
+            &mut connections,
+            &mut scratch,
+        );
+        if (pending.is_empty() && connections.is_empty()) || Instant::now() >= drain_deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(CONTROL_ADMISSION_POLL_MS));
+    }
+    for waiting in &pending {
+        let _ = waiting.stream.shutdown(std::net::Shutdown::Both);
     }
     for (stream, _) in &connections {
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -2807,7 +2833,7 @@ fn handle_conn_inner(
         request_deadline,
     );
     if let Some(shutdown) = shutdown {
-        deadline_stream = deadline_stream.stop_on(shutdown);
+        deadline_stream = deadline_stream.drain_on(shutdown);
     }
     let mut reader = BufReader::new(deadline_stream);
 
@@ -5407,6 +5433,7 @@ mod tests {
         let mut pending = PendingControlConnection {
             stream: shared,
             peer,
+            accepted: Instant::now(),
             deadline: Instant::now() + Duration::from_secs(1),
             received: Vec::new(),
             next_probe: Instant::now(),
@@ -5486,6 +5513,7 @@ mod tests {
         let mut pending = PendingControlConnection {
             stream: SharedTcp::new(server),
             peer,
+            accepted: Instant::now(),
             deadline: Instant::now() + Duration::from_secs(1),
             received: Vec::new(),
             next_probe: Instant::now(),
@@ -5553,6 +5581,7 @@ mod tests {
         let mut pending = PendingControlConnection {
             stream: SharedTcp::new(server),
             peer,
+            accepted: Instant::now(),
             deadline: Instant::now() + Duration::from_secs(1),
             received: Vec::new(),
             next_probe: Instant::now(),
@@ -6300,6 +6329,94 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Serves `listener` until the returned flag is set; the receiver hears when it stops
+    /// accepting.
+    fn serve_until_stopped(
+        listener: TcpListener,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let (returned, stopped_accepting) = std::sync::mpsc::channel();
+        let state = test_state("adm", "ro");
+        let server = std::thread::spawn(move || {
+            let draining = serve_listener(listener, state, stop).unwrap();
+            returned.send(()).unwrap();
+            draining.join().unwrap();
+        });
+        (shutdown, stopped_accepting, server)
+    }
+
+    #[test]
+    /// The next handle on the socket cannot take a connection this listener already accepted, so
+    /// a request that arrives on it after the stop is still answered here.
+    fn stopping_answers_a_request_that_arrives_after_the_accept() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, stopped_accepting, server) = serve_until_stopped(listener);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        stopped_accepting
+            .recv_timeout(Duration::from_secs(2))
+            .expect("멈춘 뒤 수락을 그만두지 않음");
+
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "멈춘 뒤 도착한 요청이 답을 받지 못함: {:?}",
+            &text[..text.len().min(60)]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    /// An accepted connection that never sends a request does not hold the drain until its grace
+    /// runs out.
+    fn stopping_closes_an_accepted_connection_that_stays_silent() {
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, stopped_accepting, server) = serve_until_stopped(listener);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(CONTROL_DRAIN_GRACE_SECS + 5)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        let stopped = Instant::now();
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        stopped_accepting
+            .recv_timeout(Duration::from_secs(2))
+            .expect("멈춘 뒤 수락을 그만두지 않음");
+
+        let mut byte = [0u8; 1];
+        let read = client.read(&mut byte);
+        assert!(
+            matches!(read, Ok(0)) || read.is_err(),
+            "말이 없는 연결에 무언가 보냄: {read:?}"
+        );
+        server.join().unwrap();
+        assert!(
+            stopped.elapsed() < Duration::from_secs(CONTROL_DRAIN_GRACE_SECS),
+            "말이 없는 연결이 유예 시간이 끝날 때까지 남음: {:?}",
+            stopped.elapsed()
+        );
+    }
+
     fn call(st: &AppState, m: &str, p: &str, tok: &str, body: &str) -> (u16, String) {
         let auth = if tok.is_empty() {
             String::new()
@@ -6333,7 +6450,8 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_joins_idle_control_connection() {
+    /// A request that started arriving gets the drain grace to finish, and no more.
+    fn stopping_cuts_a_stalled_request_when_the_grace_ends() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6350,7 +6468,11 @@ mod tests {
         let started = Instant::now();
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(CONTROL_DRAIN_GRACE_SECS + 2),
+            "다 오지 않은 요청을 유예 시간이 지나도 기다림: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
