@@ -144,8 +144,9 @@ pub fn sampled(counter: &AtomicU64) -> Option<u64> {
     count.is_power_of_two().then_some(count)
 }
 
-/// Writes the line with one `writeln!` under the stderr lock; split writes interleave across
-/// threads. `target` builds the fallback event code.
+/// Writes each line with one write: stderr is unbuffered, so a formatted write would reach a pipe
+/// shared with the supervisor and other workers in pieces that interleave with theirs. `target`
+/// builds the fallback event code.
 pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body: &str) {
     let timestamp = utc_timestamp();
     let body = body.trim_end();
@@ -171,12 +172,10 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
             return;
         }
     }
-    let mut out = std::io::stderr().lock();
-    if json {
+    let mut text = if json {
         let current = std::thread::current();
         let thread = current.name().unwrap_or("unnamed");
-        let _ = writeln!(
-            out,
+        format!(
             "{{\"ts\":\"{}\",\"level\":\"{}\",\"event\":\"{}\",\"target\":\"{}\",\"pid\":{},\"thread\":\"{}\",\"source\":\"{}:{}\",\"message\":\"{}\"}}",
             json_escape(&timestamp),
             level.label(),
@@ -187,14 +186,12 @@ pub fn emit_with_context(level: Level, target: &str, file: &str, line: u32, body
             json_escape(file),
             line,
             json_escape(&body.replace(MESSAGE_SEPARATOR, ""))
-        );
+        )
     } else {
-        let _ = writeln!(
-            out,
-            "{}",
-            human_line(&timestamp, level, event, message, fields)
-        );
-    }
+        human_line(&timestamp, level, event, message, fields)
+    };
+    text.push('\n');
+    let _ = std::io::stderr().lock().write_all(text.as_bytes());
 }
 
 /// Splits at the separator the macro wrote; without one the whole body is the message.
@@ -392,6 +389,68 @@ mod tests {
         strip_event, Level, MESSAGE_SEPARATOR,
     };
     use std::sync::atomic::AtomicU64;
+
+    /// Set in a child this module's tests start: the number of lines it logs.
+    const CHILD_LINES: &str = "ONETDNS_LOG_TEST_CHILD_LINES";
+
+    #[test]
+    /// The supervisor and its workers share one stderr pipe; a line written in pieces would
+    /// interleave with another process's line.
+    fn lines_from_processes_sharing_stderr_stay_whole() {
+        use std::io::Read as _;
+        let exe = std::env::current_exe().unwrap();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let children: Vec<_> = (0..2)
+            .map(|_| {
+                std::process::Command::new(&exe)
+                    .args(["--exact", "log::tests::logs_lines_for_a_parent_test"])
+                    .env(CHILD_LINES, "1000")
+                    .env("ONETDNS_LOG_FORMAT", "json")
+                    .env_remove("ONETDNS_LOG")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(writer.try_clone().unwrap())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        drop(writer);
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "{text}");
+        }
+        let ours: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("log.shared_pipe"))
+            .collect();
+        let whole = ours
+            .iter()
+            .filter(|line| {
+                line.starts_with("{\"ts\":\"")
+                    && line.ends_with("\"}")
+                    && line.matches("{\"ts\"").count() == 1
+            })
+            .count();
+        assert_eq!((ours.len(), whole), (2000, 2000));
+    }
+
+    #[test]
+    fn logs_lines_for_a_parent_test() {
+        let Some(count) = std::env::var(CHILD_LINES)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+        else {
+            return;
+        };
+        super::init_from_env();
+        let body = format!(
+            "event=log.shared_pipe filler={}{MESSAGE_SEPARATOR}Line from a process sharing stderr",
+            "x".repeat(200)
+        );
+        for _ in 0..count {
+            super::emit_with_context(Level::Info, "onetdns_core::log", "log.rs", 1, &body);
+        }
+    }
 
     #[test]
     fn sampled_keeps_powers_of_two() {
