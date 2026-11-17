@@ -153,6 +153,12 @@ impl Install {
         self.sibling("failed", true)
     }
 
+    /// Where a Windows swap moves a .previous that a process still runs, such as a supervisor that
+    /// stays the version it started as.
+    pub(crate) fn retired(&self) -> PathBuf {
+        self.sibling("retired", true)
+    }
+
     pub(crate) fn record_path(&self) -> PathBuf {
         self.sibling("update", false)
     }
@@ -164,9 +170,14 @@ impl Install {
 
     /// Without them, startup has nothing to handle.
     pub(crate) fn has_update_files(&self) -> bool {
-        [self.record_path(), self.staged(), self.failed()]
-            .iter()
-            .any(|path| path.exists())
+        [
+            self.record_path(),
+            self.staged(),
+            self.failed(),
+            self.retired(),
+        ]
+        .iter()
+        .any(|path| path.exists())
     }
 
     /// Waits up to `wait` while another process holds it. The lock file is really created, so
@@ -222,7 +233,7 @@ impl Install {
 
     /// Only call it while no apply is in progress.
     pub(crate) fn remove_leftovers(&self, _lock: &UpdateLock) {
-        for path in [self.staged(), self.failed()] {
+        for path in [self.staged(), self.failed(), self.retired()] {
             if let Err(error) = remove_if_present(&path) {
                 onetdns_core::warn!(event = "update.leftover_remove_failed", path = %path.display(), %error, "Could not remove a file left by an earlier update; it is removed at a later start");
             }
@@ -275,18 +286,26 @@ impl Install {
     /// Running processes keep the old image. Unix hard-links the install path to .previous and
     /// renames .new over it, so the install path is never missing. Windows cannot delete a running
     /// file but can rename it, so it renames twice; the install path is missing in between, so a
-    /// failed second rename undoes the first.
+    /// failed second rename undoes the first. A .previous still running there is moved to .retired.
     pub(crate) fn swap(&self, _lock: &UpdateLock) -> io::Result<()> {
         let previous = self.previous();
-        remove_if_present(&previous)?;
         #[cfg(unix)]
         {
+            remove_if_present(&previous)?;
             std::fs::hard_link(&self.path, &previous)?;
             std::fs::rename(self.staged(), &self.path)?;
             sync_dir(&self.dir)
         }
         #[cfg(not(unix))]
         {
+            match remove_if_present(&previous) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    let retired = self.retired();
+                    remove_if_present(&retired)?;
+                    std::fs::rename(&previous, &retired)?;
+                }
+                removed => removed?,
+            }
             std::fs::rename(&self.path, &previous)?;
             if let Err(error) = std::fs::rename(self.staged(), &self.path) {
                 if let Err(restore) = std::fs::rename(&previous, &self.path) {
@@ -618,6 +637,7 @@ mod tests {
                 install.staged(),
                 install.previous(),
                 install.failed(),
+                install.retired(),
                 install.record_path(),
                 install.lock_path(),
             ]
@@ -634,6 +654,7 @@ mod tests {
                 "OnetDNS.new",
                 "OnetDNS.previous",
                 "OnetDNS.failed",
+                "OnetDNS.retired",
                 "OnetDNS.update",
                 "OnetDNS.update.lock"
             ]
@@ -644,6 +665,7 @@ mod tests {
                 "OnetDNS.new.exe",
                 "OnetDNS.previous.exe",
                 "OnetDNS.failed.exe",
+                "OnetDNS.retired.exe",
                 "OnetDNS.update",
                 "OnetDNS.update.lock"
             ]
@@ -807,6 +829,43 @@ mod tests {
         assert_eq!(sha256_file(install.path()).expect("되돌린 설치 경로"), old);
         assert!(!install.previous().exists());
         running.assert_alive();
+    }
+
+    #[test]
+    /// A Windows supervisor stays the version it started as, so its image is .previous after one
+    /// update and still running at the next. That swap moves it aside, and a start after it ended
+    /// removes it. Unix deletes a running file, so it moves nothing.
+    fn a_running_previous_does_not_stop_the_next_swap() {
+        let scratch = Scratch::new("retire");
+        let install = scratch.install();
+        let mut running = run_copy_of_this_binary(&install);
+        let image = sha256_file(install.path()).expect("실행 중인 이미지");
+        let lock = install.lock(Duration::ZERO).expect("잠금");
+        for update in [b"second".as_slice(), b"third".as_slice()] {
+            install.stage(&lock, update).expect(".new 쓰기");
+            install.swap(&lock).expect("맞바꾸기");
+            assert_eq!(std::fs::read(install.path()).expect("설치 경로"), update);
+        }
+        assert_eq!(
+            std::fs::read(install.previous()).expect(".previous"),
+            b"second"
+        );
+        running.assert_alive();
+        if cfg!(unix) {
+            assert!(!install.retired().exists());
+            return;
+        }
+        assert_eq!(sha256_file(&install.retired()).expect(".retired"), image);
+        assert!(install.has_update_files());
+
+        install.remove_leftovers(&lock);
+        assert!(
+            install.retired().exists(),
+            "실행 중인 파일은 지울 수 없습니다"
+        );
+        drop(running);
+        install.remove_leftovers(&lock);
+        assert!(!install.retired().exists());
     }
 
     #[cfg(unix)]
