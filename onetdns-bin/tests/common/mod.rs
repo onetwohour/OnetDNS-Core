@@ -100,8 +100,8 @@ pub fn block_after<'a>(source: &'a str, head: &str) -> Option<&'a str> {
     None
 }
 
-/// Strings inside tests are never shown to users. A doc comment between the attribute and mod tests
-/// still counts as a test module.
+/// Strings inside tests are never shown to users. A test module still counts with a doc comment
+/// between the attribute and `mod tests`, or as `pub(crate) mod tests`.
 pub fn production_prefix(source: &str) -> &str {
     let mut from = 0usize;
     while let Some(at) = source[from..].find("#[cfg(test)]") {
@@ -117,7 +117,11 @@ pub fn production_prefix(source: &str) -> &str {
             };
             after = tail.trim_start();
         }
-        if after.starts_with("mod tests") {
+        if after
+            .strip_prefix("pub(crate) ")
+            .unwrap_or(after)
+            .starts_with("mod tests")
+        {
             return &source[..start];
         }
         from = start + "#[cfg(test)]".len();
