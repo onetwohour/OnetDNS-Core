@@ -662,7 +662,7 @@ impl Handoff {
 
     /// Serves again from the sockets kept back, and restarts the exclusive part if it was released.
     fn take_back(&self, kept: SocketPool, released: bool, cfg: &Config) {
-        self.listeners.close_all();
+        let closed = self.listeners.take_all();
         self.registry.lock_recover().clear();
         self.listeners.adopt(kept);
         if let Err(error) = run_restart(&self.listeners_slot, cfg) {
@@ -674,6 +674,7 @@ impl Handoff {
                 onetdns_core::error!(event = "handoff.services_not_restored", %error, "Could not restart every service after the handoff failed");
             }
         }
+        drop(closed);
     }
 }
 
@@ -1013,6 +1014,91 @@ mod tests {
             .unwrap()
             .expect("the running generation failed");
         assert_eq!(failed, (0, 0), "queries went unanswered (UDP, TCP)");
+    }
+
+    /// One TCP connection asking until closed, so the generation that accepted it has a busy
+    /// connection to drain.
+    struct AskingConnection {
+        stop: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl AskingConnection {
+        fn open(dns: SocketAddr) -> Self {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(dns).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut ask = move |id: u16| -> std::io::Result<()> {
+                let wire = crate::listeners::tests::query(id, "asking.handover.test");
+                let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&wire);
+                stream.write_all(&framed)?;
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len)?;
+                stream.read_exact(&mut vec![0u8; usize::from(u16::from_be_bytes(len))])
+            };
+            ask(0).expect("the running generation did not answer over TCP");
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut id = 0u16;
+                    while !stop.load(Ordering::Acquire) {
+                        id = id.wrapping_add(1);
+                        if ask(id).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(PACE);
+                    }
+                })
+            };
+            Self { stop, thread }
+        }
+
+        fn close(self) {
+            self.stop.store(true, Ordering::Release);
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    /// When the handoff fails, the running generation listens again before the connections it is
+    /// draining end, so a busy one does not leave UDP unanswered meanwhile.
+    fn a_failed_handoff_serves_again_before_its_connections_drain() {
+        let _serial = one_at_a_time();
+        let dns = dns_addr();
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let old_shared = crate::ServeShared::default();
+        let old_links = old_shared.links.clone();
+        let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
+        let asking = AskingConnection::open(dns);
+
+        let failing = format!("control_listen = \"{}\"\n", busy.local_addr().unwrap());
+        let new = start_successor(
+            config(dns, NEW_ANSWER, &failing),
+            None,
+            &old_links,
+            crate::ServeShared::default(),
+        );
+        wait_until("the successor did not end", || new.thread.is_finished());
+        let asked = Instant::now();
+        let answer = crate::listeners::tests::ask_udp(dns, 1, "q1.handover.test");
+        let waited = asked.elapsed();
+
+        asking.close();
+        assert!(new.thread.join().unwrap().is_err(), "the successor started");
+        old.stop.store(true, Ordering::SeqCst);
+        old.thread
+            .join()
+            .unwrap()
+            .expect("the running generation failed");
+        assert_eq!(answer, Some(OLD_ANSWER));
+        assert!(
+            waited < onetdns_core::tcp::DRAIN_LIMIT / 2,
+            "the running generation answered only after {waited:?}"
+        );
     }
 
     #[test]

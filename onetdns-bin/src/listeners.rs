@@ -335,6 +335,17 @@ pub(crate) struct ListenerSet {
     inherited: Mutex<SocketPool>,
 }
 
+/// Listeners that no longer read their sockets. Dropping them waits until the connections they
+/// accepted are idle, for at most DRAIN_LIMIT.
+pub(crate) struct Closed {
+    _plain: Vec<(String, onetdns_runtime::Server)>,
+    _dot: Vec<(String, EncryptedTcpListener)>,
+    _doh: Vec<(String, EncryptedTcpListener)>,
+    _doq: Vec<(String, quic_listener::QuicListener)>,
+    _doh3: Vec<(String, quic_listener::QuicListener)>,
+    _dnscrypt: Vec<DnscryptListener>,
+}
+
 /// UDP is served by a thread of its own, TCP by an encrypted TCP listener on the same address.
 struct DnscryptListener {
     key: String,
@@ -401,13 +412,21 @@ impl ListenerSet {
     /// Called when a generation ends. Connections already accepted answer what they receive until
     /// idle, for at most DRAIN_LIMIT.
     pub(crate) fn close_all(&self) {
+        drop(self.take_all());
+    }
+
+    /// Stops every listener reading and takes them out, so new ones can open while the connections
+    /// they accepted drain.
+    pub(crate) fn take_all(&self) -> Closed {
         self.stop_reading();
-        self.plain.lock_recover().clear();
-        self.dot.lock_recover().clear();
-        self.doh.lock_recover().clear();
-        self.doq.lock_recover().clear();
-        self.doh3.lock_recover().clear();
-        self.dnscrypt.lock_recover().clear();
+        Closed {
+            _plain: std::mem::take(&mut *self.plain.lock_recover()),
+            _dot: std::mem::take(&mut *self.dot.lock_recover()),
+            _doh: std::mem::take(&mut *self.doh.lock_recover()),
+            _doq: std::mem::take(&mut *self.doq.lock_recover()),
+            _doh3: std::mem::take(&mut *self.doh3.lock_recover()),
+            _dnscrypt: std::mem::take(&mut *self.dnscrypt.lock_recover()),
+        }
     }
 
     /// Listeners opened from now on take their sockets from `pool` where role and address match.
