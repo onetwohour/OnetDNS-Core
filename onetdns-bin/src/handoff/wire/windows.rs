@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::io::{
     AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket, RawHandle,
+    RawSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -482,7 +483,7 @@ pub(super) fn attach(bytes: &[u8]) -> Result<Vec<Passed>, LinkError> {
                 return Err(LinkError::Unreadable);
             }
             // SAFETY: A new socket that nothing else owns.
-            Ok(unsafe { OwnedSocket::from_raw_socket(socket as u64) })
+            Ok(unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) })
         })
         .collect()
 }
