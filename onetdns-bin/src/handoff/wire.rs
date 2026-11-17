@@ -103,9 +103,7 @@ pub(crate) fn recv(
         if left.is_zero() {
             return Err(LinkError::TimedOut);
         }
-        stream
-            .set_read_timeout(Some(left.min(LINK_POLL)))
-            .map_err(|_| LinkError::Gone)?;
+        sys::set_read_timeout(stream, left.min(LINK_POLL)).map_err(|_| LinkError::Gone)?;
         if let Some(frame) = reader.read(stream)? {
             return Ok(frame);
         }
@@ -710,6 +708,24 @@ mod tests {
             };
             assert_eq!(decoded, Err(LinkError::Unreadable), "{case}");
         }
+    }
+
+    #[test]
+    /// A frame the peer sent before closing is read after the close too.
+    fn a_frame_sent_before_the_peer_closed_still_arrives() {
+        let (a, b) = stream_pair();
+        let mut sent = Frame::new(RELEASED);
+        sent.fds
+            .push(UdpSocket::bind("127.0.0.1:0").unwrap().into());
+        send(&a, &sent).unwrap();
+        drop(a);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let got = recv(&b, deadline, &|| false).unwrap();
+        assert_eq!((got.kind, got.fds.len()), (RELEASED, 1));
+        assert!(matches!(
+            recv(&b, deadline, &|| false),
+            Err(LinkError::Gone)
+        ));
     }
 
     #[test]

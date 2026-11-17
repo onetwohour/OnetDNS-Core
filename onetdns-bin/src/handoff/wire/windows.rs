@@ -411,6 +411,10 @@ pub(crate) fn pair() -> io::Result<(Pipe, Pipe)> {
     Ok((Pipe::from_handle(server), Pipe::from_handle(client)))
 }
 
+pub(super) fn set_read_timeout(stream: &Stream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))
+}
+
 pub(super) fn write_frame(stream: &Stream, bytes: &[u8], passed: &[Passed]) -> io::Result<()> {
     if passed.is_empty() {
         return stream.write_all(bytes);

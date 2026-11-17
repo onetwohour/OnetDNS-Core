@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use super::SocketType;
 use crate::handoff::LinkError;
@@ -20,6 +21,17 @@ const FDS_PER_SEND: usize = 250;
 const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
 #[cfg(not(target_os = "linux"))]
 const SEND_FLAGS: libc::c_int = 0;
+
+/// macOS refuses every socket option with EINVAL once the peer has closed. A read then returns
+/// what is still buffered and does not block, so it needs no timeout.
+pub(super) fn set_read_timeout(stream: &Stream, timeout: Duration) -> io::Result<()> {
+    match stream.set_read_timeout(Some(timeout)) {
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EINVAL) => {
+            Ok(())
+        }
+        result => result,
+    }
+}
 
 pub(super) fn write_frame(stream: &Stream, bytes: &[u8], passed: &[Passed]) -> io::Result<()> {
     // Each batch of descriptors rides on one byte and the last on the rest, so all of them arrive
