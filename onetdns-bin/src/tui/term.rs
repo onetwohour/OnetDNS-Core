@@ -112,7 +112,7 @@ mod unix {
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(crate) fn to_bytes(&self) -> Vec<u8> {
             // SAFETY: termios is plain data, read here as its own bytes.
             unsafe {
@@ -125,7 +125,7 @@ mod unix {
         }
 
         /// Bytes `to_bytes` made in a process on the same system.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
             (bytes.len() == std::mem::size_of::<libc::termios>()).then(|| {
                 // SAFETY: the length matches, and every bit pattern is a termios.

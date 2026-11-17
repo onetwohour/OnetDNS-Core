@@ -209,10 +209,10 @@ pub(crate) fn print_block(lines: &[String]) {
 
 /// The supervisor parent's copy of the terminal settings. A child that is killed leaves the
 /// terminal as its console set it, so the parent puts it back.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) struct ChildConsole(term::Saved);
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl ChildConsole {
     pub(crate) fn capture() -> Option<Self> {
         wanted().then(term::Saved::capture).flatten().map(Self)
@@ -235,12 +235,12 @@ impl ChildConsole {
 
     /// Carries the settings across the supervisor's exec of a new version, when the terminal may
     /// already be in the console's state.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn encode(&self) -> String {
         crate::update::hex(&self.0.to_bytes())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn decode(text: &str) -> Option<Self> {
         let digits = text.as_bytes();
         if digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {

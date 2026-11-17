@@ -9,7 +9,7 @@
 //!
 //! The real binary is copied to a temporary directory and run both supervised and as a single
 //! process. Only the handoff tests also run on Windows.
-#![cfg(any(target_os = "linux", windows))]
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
 
 use onetdns_forward::{Forwarder, Message, TrustStore, Upstream};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -211,11 +211,37 @@ impl Server {
     /// Signals `pid` only when it runs this test's binary.
     #[cfg(unix)]
     fn signal_if_ours(&self, pid: i32, signal: libc::c_int) {
-        if argv0(pid).as_deref() == Some(self.program.as_os_str().as_bytes()) {
+        if self.runs_ours(pid) {
             unsafe {
                 libc::kill(pid, signal);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runs_ours(&self, pid: i32) -> bool {
+        argv0(pid).as_deref() == Some(self.program.as_os_str().as_bytes())
+    }
+
+    /// An update renames the executable a process runs, so a process counts as ours while its
+    /// executable is in this test's directory.
+    #[cfg(target_os = "macos")]
+    fn runs_ours(&self, pid: i32) -> bool {
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `path` is valid for the size passed.
+        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        path.truncate(len);
+        let running = Path::new(std::ffi::OsStr::from_bytes(&path));
+        let ours = self
+            .program
+            .parent()
+            .and_then(|dir| dir.canonicalize().ok());
+        running
+            .parent()
+            .is_some_and(|dir| Some(dir) == ours.as_deref())
     }
 
     /// Stops `pid` where it is, when it runs this test's binary.
@@ -1135,6 +1161,20 @@ fn children_of(parent: i32) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
+fn children_of(parent: i32) -> Vec<i32> {
+    let mut pids = vec![0 as libc::pid_t; 256];
+    let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` is valid for `size` bytes.
+    let found = unsafe { libc::proc_listchildpids(parent, pids.as_mut_ptr().cast(), size) };
+    // The count is in PIDs on current systems; unfilled entries stay zero either way.
+    let found = usize::try_from(found).unwrap_or(0).min(pids.len());
+    pids.into_iter()
+        .take(found)
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
 /// Only the server's own children: a console the supervisor gets also shows up as its child.
 #[cfg(windows)]
 fn children_of(parent: i32) -> Vec<i32> {
@@ -1278,9 +1318,9 @@ fn assert_no_query_failed(load: Load, server: &Server) {
     );
 }
 
-/// Logged once the successor is the supervisor's only child. A Linux supervisor then runs from the
-/// install path; a Windows supervisor stays the version it started as.
-#[cfg(target_os = "linux")]
+/// Logged once the successor is the supervisor's only child. A Linux or macOS supervisor then runs
+/// from the install path; a Windows supervisor stays the version it started as.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SUPERVISING_THE_SUCCESSOR: &str = "supervisor.update_exec";
 #[cfg(windows)]
 const SUPERVISING_THE_SUCCESSOR: &str = "supervisor.predecessor_ended";

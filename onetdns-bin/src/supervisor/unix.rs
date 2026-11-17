@@ -1,11 +1,14 @@
-//! Linux workers start from this supervisor's own image through /proc/self/exe, and a successor that
-//! took over is handed to the supervisor of its own version by exec.
+//! Linux starts workers from this supervisor's own image through /proc/self/exe; macOS has no such
+//! path and starts them from the install path. On both, a successor that took over is handed to the
+//! supervisor of its own version by exec.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::Ordering;
 
@@ -18,12 +21,14 @@ use crate::tui::ChildConsole;
 
 /// The image this parent is running. The install path would name another version after an
 /// update's rename, or gain a ` (deleted)` suffix.
+#[cfg(target_os = "linux")]
 pub(super) const SELF_IMAGE: &str = "/proc/self/exe";
 /// Set when a supervisor execs a new version: the PID of the worker it hands down and the
 /// descriptor of its end of that worker's channel.
 const ADOPT_ENV: &str = "ONETDNS_SUPERVISOR_ADOPT";
 /// The terminal settings handed down with it.
 const CONSOLE_ENV: &str = "ONETDNS_SUPERVISOR_CONSOLE";
+#[cfg(target_os = "linux")]
 const PR_SET_DUMPABLE: libc::c_int = 4;
 
 pub(super) struct Process {
@@ -90,8 +95,18 @@ impl Process {
 }
 
 /// A worker restarted after a crash runs this supervisor's own version.
+#[cfg(target_os = "linux")]
 pub(super) fn worker_image() -> BoxResult<PathBuf> {
     Ok(PathBuf::from(SELF_IMAGE))
+}
+
+/// After an update's rename no path names this supervisor's own image, so workers run the install
+/// path. The supervisor execs the version it holds once that version is confirmed.
+#[cfg(target_os = "macos")]
+pub(super) fn worker_image() -> BoxResult<PathBuf> {
+    crate::update::install::current()
+        .map(|install| install.path().to_path_buf())
+        .map_err(|reason| crate::anyhow!(reason))
 }
 
 pub(super) fn spawn(command: &WorkerCommand) -> BoxResult<(Process, Stream)> {
@@ -105,6 +120,7 @@ pub(super) fn spawn(command: &WorkerCommand) -> BoxResult<(Process, Stream)> {
         process.env(name, value);
     }
     process.env(CHANNEL_ENV, worker_fd.to_string());
+    #[cfg(target_os = "linux")]
     crate::osnet::harden_child_env(&mut process);
     // SAFETY: Runs between fork and exec and calls only fcntl, which is async-signal-safe. The
     // worker's end is the one descriptor kept open across exec.
@@ -200,10 +216,14 @@ pub(super) fn follow_install() -> Result<(), String> {
     })
 }
 
+/// Workers inherit the core limit.
 pub(super) fn harden() -> BoxResult<()> {
     disable_core_dumps()
         .with_context(|| "Could not disable core dumps in the supervisor process")?;
-    disable_process_dumping().with_context(|| "Could not make the supervisor process non-dumpable")
+    #[cfg(target_os = "linux")]
+    disable_process_dumping()
+        .with_context(|| "Could not make the supervisor process non-dumpable")?;
+    Ok(())
 }
 
 /// A dump would hold keys and tokens, and writing a large one delays the restart.
@@ -218,6 +238,7 @@ fn disable_core_dumps() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn disable_process_dumping() -> io::Result<()> {
     if unsafe { libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
@@ -227,6 +248,7 @@ fn disable_process_dumping() -> io::Result<()> {
 
 /// A child started through `SELF_IMAGE` is named exe, which hides it from top, pgrep and OOM
 /// records. Call before starting threads; they inherit the name.
+#[cfg(target_os = "linux")]
 fn restore_process_name() -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -244,6 +266,7 @@ fn restore_process_name() -> io::Result<()> {
 }
 
 /// Blocks dumps and restores the process name of a worker, before it starts threads.
+#[cfg(target_os = "linux")]
 pub(super) fn prepare_worker() -> BoxResult<()> {
     disable_process_dumping()
         .with_context(|| "Could not make the DNS child process non-dumpable")?;
@@ -253,17 +276,26 @@ pub(super) fn prepare_worker() -> BoxResult<()> {
     Ok(())
 }
 
+/// A macOS worker starts from the install path, which gives it its name.
+#[cfg(target_os = "macos")]
+pub(super) fn prepare_worker() -> BoxResult<()> {
+    Ok(())
+}
+
 /// Bytes the system has available and the current worker uses.
+#[cfg(target_os = "linux")]
 pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
     memory_of(&current.pid.to_string())
 }
 
 /// Bytes the system has available and this process uses.
+#[cfg(target_os = "linux")]
 pub(super) fn own_memory() -> Option<(u64, u64)> {
     memory_of("self")
 }
 
 /// `pid` names a directory under /proc.
+#[cfg(target_os = "linux")]
 fn memory_of(pid: &str) -> Option<(u64, u64)> {
     let read = |path: &str, field: &str| {
         std::fs::read_to_string(path)
@@ -278,6 +310,7 @@ fn memory_of(pid: &str) -> Option<(u64, u64)> {
 }
 
 /// A field in kB from /proc/meminfo or /proc/<pid>/status.
+#[cfg(target_os = "linux")]
 fn kib(text: &str, field: &str) -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix(field))?
@@ -286,6 +319,51 @@ fn kib(text: &str, field: &str) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Bytes the system has available and the current worker uses.
+#[cfg(target_os = "macos")]
+pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
+    memory_of(current.pid)
+}
+
+/// Bytes the system has available and this process uses.
+#[cfg(target_os = "macos")]
+pub(super) fn own_memory() -> Option<(u64, u64)> {
+    memory_of(libc::pid_t::try_from(std::process::id()).ok()?)
+}
+
+/// Available is the share of memory the kernel reports for its memory pressure level.
+#[cfg(target_os = "macos")]
+fn memory_of(pid: libc::pid_t) -> Option<(u64, u64)> {
+    let total: u64 = sysctl(c"hw.memsize")?;
+    let level: libc::c_int = sysctl(c"kern.memorystatus_level")?;
+    let level = u64::try_from(level).ok().filter(|level| *level <= 100)?;
+    // SAFETY: All-zero bits are a valid proc_taskinfo.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is valid for `size` bytes.
+    let filled =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    (filled == size).then_some((total / 100 * level, info.pti_resident_size))
+}
+
+/// A sysctl value exactly the size of `T`.
+#[cfg(target_os = "macos")]
+fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `value` is valid for `len` bytes, and nothing is written to the kernel.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(value)
 }
 
 pub(super) fn status_text(status: ExitStatus) -> String {
@@ -333,7 +411,15 @@ pub(super) fn adopt(named: &str) -> BoxResult<Stream> {
     if flags < 0 {
         return Err(invalid());
     }
-    let option = |name| {
+    let family = {
+        // SAFETY: All-zero bits are a valid sockaddr_storage.
+        let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `address` and `len` are valid for the size passed.
+        let rc = unsafe { libc::getsockname(fd, (&raw mut address).cast(), &raw mut len) };
+        (rc == 0).then_some(libc::c_int::from(address.ss_family))
+    };
+    let kind = {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: `value` and `len` are valid for the size passed.
@@ -341,16 +427,14 @@ pub(super) fn adopt(named: &str) -> BoxResult<Stream> {
             libc::getsockopt(
                 fd,
                 libc::SOL_SOCKET,
-                name,
+                libc::SO_TYPE,
                 (&raw mut value).cast(),
                 &raw mut len,
             )
         };
         (rc == 0).then_some(value)
     };
-    if option(libc::SO_DOMAIN) != Some(libc::AF_UNIX)
-        || option(libc::SO_TYPE) != Some(libc::SOCK_STREAM)
-    {
+    if family != Some(libc::AF_UNIX) || kind != Some(libc::SOCK_STREAM) {
         return Err(invalid());
     }
     // SAFETY: Same descriptor, checked open above.
@@ -365,6 +449,7 @@ pub(super) fn adopt(named: &str) -> BoxResult<Stream> {
 }
 
 /// Waits until the predecessor closes `link`, which it does after leaving the console.
+#[cfg(target_os = "linux")]
 pub(super) fn until_released(link: &Stream) -> BoxResult<crate::tui::Wait> {
     let link = link
         .try_clone()
@@ -387,12 +472,84 @@ pub(super) fn until_released(link: &Stream) -> BoxResult<crate::tui::Wait> {
     }))
 }
 
+/// Waits until the predecessor closes `link`, which it does after leaving the console. The handoff
+/// goes on over the same link meanwhile, so readable data must not end the wait: an edge-triggered
+/// read filter wakes on each change, and only its end-of-file flag counts.
+#[cfg(target_os = "macos")]
+pub(super) fn until_released(link: &Stream) -> BoxResult<crate::tui::Wait> {
+    let link = link
+        .try_clone()
+        .with_context(|| "Could not watch the link to the running version")?;
+    // SAFETY: Takes no arguments.
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| "Could not watch the link to the running version");
+    }
+    // SAFETY: kqueue returned a new descriptor this process owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let watch = libc::kevent {
+        ident: link.as_raw_fd() as libc::uintptr_t,
+        filter: libc::EVFILT_READ,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: One change and no event buffer, as the counts say.
+    if unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &raw const watch,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error())
+            .with_context(|| "Could not watch the link to the running version");
+    }
+    Ok(Box::new(move |done| {
+        // Closing the watched descriptor would drop the filter.
+        let _link = link;
+        let wait = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 200_000_000,
+        };
+        // SAFETY: All-zero bits are a valid kevent.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        while !done.load(Ordering::Acquire) {
+            // SAFETY: No changes and one event, as the counts say.
+            match unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &raw mut event,
+                    1,
+                    &raw const wait,
+                )
+            } {
+                1 if event.flags & libc::EV_EOF != 0 => return true,
+                -1 if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => {
+                    return true
+                }
+                _ => {}
+            }
+        }
+        false
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::supervisor::channel::LINK;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn memory_figures_are_read_in_kib() {
         let meminfo = "MemTotal:       16318500 kB\nMemAvailable:    9841224 kB\n";
         assert_eq!(kib(meminfo, "MemAvailable:"), Some(9_841_224));

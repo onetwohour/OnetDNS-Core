@@ -1,34 +1,34 @@
 //! Process supervisor. The parent loads no filters or caches, so it survives a child that runs
 //! out of memory or is killed, and restarts it. It gives up when startup keeps failing.
 
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 use std::time::Duration;
 
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 const BASE_RESTART_DELAY: Duration = Duration::from_millis(10);
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(5);
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 /// Running this long resets the restart delay.
 const STABLE_RUNTIME: Duration = Duration::from_secs(30);
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 const MAX_STARTUP_FAILURES: u32 = 5;
 
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartDecision {
     RestartAfter(Duration),
     GiveUp,
 }
 
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 #[derive(Default)]
 struct RestartPolicy {
     crash_streak: u32,
     startup_failures: u32,
 }
 
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 impl RestartPolicy {
     /// Reaching ready clears the failure count, or occasional crashes of a long-running server
     /// would add up to giving up.
@@ -57,7 +57,7 @@ impl RestartPolicy {
 /// The successor runs beside the current worker until it takes over, so it needs about as much
 /// memory again. `memory` is what the system has available and the worker uses; figures that cannot
 /// be read do not stop it.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn room_for_successor(memory: Option<(u64, u64)>) -> Result<(), String> {
     match memory {
         Some((available, used)) if available < used => Err(format!(
@@ -78,46 +78,46 @@ pub struct Joined {
     pub console: Option<crate::tui::Wait>,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod channel;
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod supervise;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix;
 #[cfg(windows)]
 mod windows;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod worker;
-#[cfg(target_os = "linux")]
-use linux as sys;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use unix as sys;
 #[cfg(windows)]
 use windows as sys;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use supervise::run;
 #[cfg(windows)]
 pub use supervise::run_service;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use worker::{handing_over, join, settle};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) use worker::{request_successor, successor_fits, Requested};
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn join(_links: &std::sync::Arc<crate::handoff::Links>) -> crate::error::BoxResult<Joined> {
     Ok(Joined::default())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn settle(handed: bool, _abort: &dyn Fn() -> bool) -> bool {
     handed
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn handing_over() -> bool {
     false
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn successor_fits() -> bool {
     false
 }
@@ -171,7 +171,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_successor_needs_as_much_memory_again() {
         assert!(room_for_successor(Some((2 << 30, 1 << 30))).is_ok());
@@ -183,7 +183,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn this_process_reads_its_own_memory() {
         let (available, used) = sys::own_memory().expect("이 프로세스의 메모리");

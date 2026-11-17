@@ -64,7 +64,7 @@ pub(crate) fn request_restart() -> bool {
     };
     match current() {
         Launch::Manual => false,
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Launch::SupervisedChild => {
             hand_over_or_restart(server.stop.clone());
             true
@@ -83,7 +83,7 @@ fn restart(stop: &AtomicBool) {
 
 /// Asks from its own thread, so the update job that called this finishes first and its result is
 /// handed over with the job list.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn hand_over_or_restart(stop: Arc<AtomicBool>) {
     use crate::supervisor::Requested;
 

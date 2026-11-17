@@ -23,7 +23,7 @@ use unix as sys;
 #[cfg(windows)]
 use windows as sys;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) use sys::pair;
 #[cfg(test)]
 pub(crate) use sys::stream_pair;

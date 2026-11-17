@@ -209,11 +209,11 @@ fn main() -> BoxResult<()> {
             no_web,
             no_supervisor,
         } => {
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             if !no_supervisor {
                 return supervisor::run(config, no_web);
             }
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             let _ = no_supervisor;
             serve_directly(config, no_web)
         }

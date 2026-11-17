@@ -113,8 +113,9 @@ Notes:
              differ from what the server would return.
   --no-web   Start only the DNS server, without the default web dashboard (headless).
              A control_listen setting in the config always takes precedence.
-  --no-supervisor  Run the server directly without Linux process self-recovery
-                   (for an external supervisor).
+  --no-supervisor  Run the server without its supervisor process, which restarts it
+                   after a crash and starts updates beside it (for an external
+                   supervisor).
   update     Checks GitHub for a newer release signed by the OnetDNS release key.
              apply installs it and rollback reinstalls the version the last
              update replaced. Restart OnetDNS afterwards to start the installed

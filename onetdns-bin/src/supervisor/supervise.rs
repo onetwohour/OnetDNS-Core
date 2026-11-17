@@ -47,9 +47,9 @@ pub(super) struct Worker {
     ready: bool,
     /// Asked for a successor; cleared when the supervisor takes up the request.
     wants_successor: bool,
-    /// Runs the install path rather than this supervisor's image.
-    #[cfg(target_os = "linux")]
-    installed: bool,
+    /// Started to take over; once it runs everything, this supervisor execs its version.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    follow: bool,
     started: Instant,
 }
 
@@ -161,8 +161,8 @@ fn spawn_worker(
         answered: false,
         ready: false,
         wants_successor: false,
-        #[cfg(target_os = "linux")]
-        installed: image != Path::new(sys::SELF_IMAGE),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        follow: false,
         started: Instant::now(),
     })
 }
@@ -202,6 +202,11 @@ impl Successor {
         let install = crate::update::install::current()?;
         let worker = spawn_worker(install.path(), program, config_path, no_web, restarts)
             .map_err(|error| error.to_string())?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let worker = Worker {
+            follow: true,
+            ..worker
+        };
         onetdns_core::info!(
             event = "supervisor.successor_started",
             pid = worker.process.id(),
@@ -433,8 +438,8 @@ fn supervise(
         answered: true,
         ready: true,
         wants_successor: false,
-        #[cfg(target_os = "linux")]
-        installed: false,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        follow: false,
         started: Instant::now(),
     });
     // A supervisor that hands a worker down has settled that worker's trial.
@@ -562,15 +567,15 @@ fn supervise(
                         "Dropped the supervisor's privileges"
                     );
                 }
-                #[cfg(target_os = "linux")]
-                if child.installed {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if child.follow {
                     onetdns_core::info!(
                         event = "supervisor.update_exec",
                         "Starting the supervisor of the new version"
                     );
                     let error = sys::exec_adopting(&child, console);
-                    onetdns_core::error!(event = "supervisor.update_exec_failed", %error, "Could not start the supervisor of the new version; this one goes on, and restarts the previous version if the DNS service process stops");
-                    child.installed = false;
+                    onetdns_core::error!(event = "supervisor.update_exec_failed", %error, "Could not start the supervisor of the new version; this one goes on supervising the DNS service process");
+                    child.follow = false;
                 }
             }
             if trial.as_ref().is_some_and(Trial::expired)

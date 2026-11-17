@@ -14,6 +14,12 @@ pub(crate) type Passed = OwnedFd;
 pub(super) const ATTACHED: usize = 0;
 /// Linux refuses more than SCM_MAX_FD (253) descriptors in one message.
 const FDS_PER_SEND: usize = 250;
+/// macOS has no MSG_NOSIGNAL. The Rust runtime ignores SIGPIPE, so a closed peer is an EPIPE error
+/// there too.
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
 
 pub(super) fn write_frame(stream: &Stream, bytes: &[u8], passed: &[Passed]) -> io::Result<()> {
     // Each batch of descriptors rides on one byte and the last on the rest, so all of them arrive
@@ -69,8 +75,7 @@ fn send_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[OwnedFd]) -> io::Resu
     }
     loop {
         // SAFETY: The buffer and control data `message` points to live for the whole call.
-        let sent =
-            unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL) };
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, SEND_FLAGS) };
         match usize::try_from(sent) {
             Ok(sent) => return Ok(sent),
             Err(_) => {
@@ -104,9 +109,12 @@ pub(super) fn read_some(
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
     // SAFETY: The buffer and control data `message` points to live for the whole call.
-    let received =
-        unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, libc::MSG_CMSG_CLOEXEC) };
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, flags) };
     let received = usize::try_from(received).map_err(|_| io::Error::last_os_error())?;
     // SAFETY: Kernel-filled control data is walked only with the CMSG macros, within
     // msg_controllen; each SCM_RIGHTS descriptor is new to this process and owned from here on.
@@ -118,6 +126,10 @@ pub(super) fn read_some(
                 let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                 for index in 0..bytes / std::mem::size_of::<libc::c_int>() {
                     let fd = std::ptr::read_unaligned(data.cast::<libc::c_int>().add(index));
+                    // Without MSG_CMSG_CLOEXEC, a process another thread starts before this line
+                    // inherits the descriptor.
+                    #[cfg(not(target_os = "linux"))]
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     fds.push(OwnedFd::from_raw_fd(fd));
                 }
             }
