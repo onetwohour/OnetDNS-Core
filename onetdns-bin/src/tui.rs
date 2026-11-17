@@ -207,30 +207,40 @@ pub(crate) fn print_block(lines: &[String]) {
     println!();
 }
 
-/// The Linux supervisor parent's copy of the terminal settings. A child killed by a signal leaves
-/// the terminal as its console set it, so the parent puts it back.
-#[cfg(target_os = "linux")]
+/// The supervisor parent's copy of the terminal settings. A child that is killed leaves the
+/// terminal as its console set it, so the parent puts it back.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) struct ChildConsole(term::Saved);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl ChildConsole {
     pub(crate) fn capture() -> Option<Self> {
         wanted().then(term::Saved::capture).flatten().map(Self)
     }
 
     pub(crate) fn child_exited(&self, status: std::process::ExitStatus) {
-        use std::os::unix::process::ExitStatusExt;
-        if status.signal().is_some() {
+        #[cfg(unix)]
+        let killed = std::os::unix::process::ExitStatusExt::signal(&status).is_some();
+        // A worker that ends on its own leaves the console first; one that is ended exits with
+        // the code its killer chose.
+        #[cfg(windows)]
+        let killed = !matches!(
+            status.code(),
+            Some(0 | crate::update::launch::UPDATE_EXIT_CODE)
+        );
+        if killed {
             self.0.restore();
         }
     }
 
     /// Carries the settings across the supervisor's exec of a new version, when the terminal may
     /// already be in the console's state.
+    #[cfg(target_os = "linux")]
     pub(crate) fn encode(&self) -> String {
         crate::update::hex(&self.0.to_bytes())
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn decode(text: &str) -> Option<Self> {
         let digits = text.as_bytes();
         if digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {
@@ -282,8 +292,8 @@ fn install_panic_hook() {
     });
 }
 
-/// Ctrl+C reaches the whole foreground process group. Doing the same stops a supervisor parent
-/// too, which would otherwise start this process again.
+/// Ctrl+C reaches a supervisor parent too, which would otherwise start this process again, so
+/// quitting sends it the same way.
 fn quit(stop: &AtomicBool) {
     stop.store(true, Ordering::SeqCst);
     #[cfg(unix)]
@@ -291,6 +301,18 @@ fn quit(stop: &AtomicBool) {
         // SAFETY: sends a signal; no memory is involved.
         unsafe {
             libc::kill(0, libc::SIGINT);
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
+        }
+        const CTRL_C_EVENT: u32 = 0;
+        // SAFETY: takes no pointers; group 0 is every process on this console.
+        unsafe {
+            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
         }
     }
 }

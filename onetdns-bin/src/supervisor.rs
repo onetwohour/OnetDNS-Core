@@ -1,34 +1,34 @@
 //! Process supervisor. The parent loads no filters or caches, so it survives a child that runs
 //! out of memory or is killed, and restarts it. It gives up when startup keeps failing.
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 use std::time::Duration;
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 const BASE_RESTART_DELAY: Duration = Duration::from_millis(10);
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(5);
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 /// Running this long resets the restart delay.
 const STABLE_RUNTIME: Duration = Duration::from_secs(30);
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 const MAX_STARTUP_FAILURES: u32 = 5;
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartDecision {
     RestartAfter(Duration),
     GiveUp,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 #[derive(Default)]
 struct RestartPolicy {
     crash_streak: u32,
     startup_failures: u32,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", windows))]
 impl RestartPolicy {
     /// Reaching ready clears the failure count, or occasional crashes of a long-running server
     /// would add up to giving up.
@@ -63,35 +63,39 @@ pub struct Joined {
     pub console: Option<crate::tui::Wait>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod channel;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod supervise;
-#[cfg(target_os = "linux")]
+#[cfg(windows)]
+mod windows;
+#[cfg(any(target_os = "linux", windows))]
 mod worker;
 #[cfg(target_os = "linux")]
 use linux as sys;
+#[cfg(windows)]
+use windows as sys;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub use supervise::run;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub use worker::{handing_over, join, settle};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) use worker::{request_successor, Requested};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn join(_links: &std::sync::Arc<crate::handoff::Links>) -> crate::error::BoxResult<Joined> {
     Ok(Joined::default())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn settle(handed: bool, _abort: &dyn Fn() -> bool) -> bool {
     handed
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn handing_over() -> bool {
     false
 }

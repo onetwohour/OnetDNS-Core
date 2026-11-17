@@ -271,6 +271,17 @@ mod windows {
     }
 
     impl Saved {
+        pub(crate) fn capture() -> Option<Self> {
+            let input = handle(STD_INPUT_HANDLE);
+            let output = handle(STD_OUTPUT_HANDLE);
+            Some(Self {
+                input,
+                output,
+                input_mode: mode(input)?,
+                output_mode: mode(output)?,
+            })
+        }
+
         pub(crate) fn restore(&self) {
             write(LEAVE);
             // SAFETY: handles and modes came from the same console.
@@ -299,14 +310,8 @@ mod windows {
 
     /// Ctrl+C arrives as a key, so the console quits through the normal shutdown.
     pub(in crate::tui) fn enter() -> Option<Saved> {
-        let input = handle(STD_INPUT_HANDLE);
-        let output = handle(STD_OUTPUT_HANDLE);
-        let saved = Saved {
-            input,
-            output,
-            input_mode: mode(input)?,
-            output_mode: mode(output)?,
-        };
+        let saved = Saved::capture()?;
+        let (input, output) = (saved.input, saved.output);
         let output_mode =
             saved.output_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         let input_mode = saved.input_mode

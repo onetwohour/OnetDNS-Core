@@ -253,24 +253,18 @@ pub(super) fn prepare_worker() -> BoxResult<()> {
     Ok(())
 }
 
-/// The successor runs beside the current worker until it takes over, so it needs about as much
-/// memory again. Figures that cannot be read do not stop it.
-pub(super) fn room_for_successor(current: &Process) -> Result<(), String> {
+/// Bytes the system has available and the current worker uses.
+pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
     let read = |path: &str, field: &str| {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| kib(&text, field))
+            .map(|kib| kib * 1024)
     };
-    let available = read("/proc/meminfo", "MemAvailable:");
-    let used = read(&format!("/proc/{}/status", current.pid), "VmRSS:");
-    match (available, used) {
-        (Some(available), Some(used)) if available < used => Err(format!(
-            "{} MiB of memory is available, and the new version needs about {} MiB beside the running one",
-            available / 1024,
-            used / 1024
-        )),
-        _ => Ok(()),
-    }
+    Some((
+        read("/proc/meminfo", "MemAvailable:")?,
+        read(&format!("/proc/{}/status", current.pid), "VmRSS:")?,
+    ))
 }
 
 /// A field in kB from /proc/meminfo or /proc/<pid>/status.

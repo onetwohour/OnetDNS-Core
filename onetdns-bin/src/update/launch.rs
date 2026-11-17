@@ -6,15 +6,15 @@ use std::sync::{Arc, OnceLock};
 #[cfg(unix)]
 use super::install::Install;
 
-/// Exit code that asks for the swapped-in binary. A supervisor parent execs the install path on it;
-/// a Windows service reports it as its service-specific exit code, and the recovery action restarts
-/// the service. Same value as EX_TEMPFAIL.
+/// Exit code that asks for the swapped-in binary. A supervisor parent starts the install path on
+/// it; a Windows service reports it as its service-specific exit code, and the recovery action
+/// restarts the service. Same value as EX_TEMPFAIL.
 pub(crate) const UPDATE_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Launch {
-    /// Child of the Linux supervisor, which starts the install path beside it to take over. If that
-    /// cannot happen, it exits with UPDATE_EXIT_CODE and the parent execs the install path.
+    /// Child of the supervisor, which starts the install path beside it to take over. If that cannot
+    /// happen, it exits with UPDATE_EXIT_CODE and the parent starts the install path.
     SupervisedChild,
     /// Unix process without a supervisor; shuts down cleanly, then execs the install path.
     SingleProcess,
@@ -94,7 +94,7 @@ pub(crate) fn request_restart() -> bool {
     };
     match current() {
         Launch::Manual => false,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         Launch::SupervisedChild => {
             hand_over_or_restart(server.stop.clone());
             true
@@ -113,7 +113,7 @@ fn restart(stop: &AtomicBool) {
 
 /// Asks from its own thread, so the update job that called this finishes first and its result is
 /// handed over with the job list.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn hand_over_or_restart(stop: Arc<AtomicBool>) {
     use crate::supervisor::Requested;
 
@@ -192,9 +192,8 @@ pub(crate) fn start_reverted() -> ! {
     std::process::exit(1)
 }
 
-#[cfg(unix)]
 /// Starts the swapped-in binary once the server has stopped after an apply. A supervised child
-/// exits with the update code and leaves it to the parent. A single process execs it; if that
+/// exits with the update code and leaves it to the parent. A Unix single process execs it; if that
 /// fails, it reverts the swap and execs the restored binary.
 ///
 /// Returns only when neither could start, with the reason.
@@ -203,6 +202,15 @@ pub(crate) fn start_installed() -> String {
     if super::install::supervised_child() {
         std::process::exit(UPDATE_EXIT_CODE);
     }
+    #[cfg(unix)]
+    let reason = exec_installed_or_previous();
+    #[cfg(not(unix))]
+    let reason = "Start OnetDNS again to run the new version".to_string();
+    reason
+}
+
+#[cfg(unix)]
+fn exec_installed_or_previous() -> String {
     let install = match super::install::current() {
         Ok(install) => install,
         Err(reason) => return reason,

@@ -209,11 +209,11 @@ fn main() -> BoxResult<()> {
             no_web,
             no_supervisor,
         } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             if !no_supervisor {
                 return supervisor::run(config, no_web);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             let _ = no_supervisor;
             serve_directly(config, no_web)
         }
@@ -519,11 +519,29 @@ fn ddr_endpoints_from(cfg: &Config) -> Vec<layers::DdrEndpoint> {
 static SHUTDOWN_FLAG: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
-#[cfg(unix)]
-/// Only sets the flag; almost nothing is safe inside a signal handler.
-extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+/// Stops the server the way a shutdown signal does. Safe inside a signal handler.
+fn request_shutdown() {
     if let Some(flag) = SHUTDOWN_FLAG.get() {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    request_shutdown();
+}
+
+/// Ctrl+C and Ctrl+Break stop the server; other events, such as closing the console, keep their
+/// default handling.
+#[cfg(windows)]
+unsafe extern "system" fn handle_console_ctrl(event: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        request_shutdown();
+        1
+    } else {
+        0
     }
 }
 
@@ -538,6 +556,20 @@ fn install_shutdown_handler() -> Arc<std::sync::atomic::AtomicBool> {
         action.sa_flags = libc::SA_RESTART;
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        // SAFETY: Registers a handler that only stores to an atomic.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handle_console_ctrl), 1);
+        }
     }
     flag
 }
@@ -559,7 +591,6 @@ fn serve_directly(config: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
             update::launch::start_reverted();
         }
     }
-    #[cfg(unix)]
     if result.is_ok() && update::launch::restart_requested() {
         return Err(crate::anyhow!(update::launch::start_installed()));
     }

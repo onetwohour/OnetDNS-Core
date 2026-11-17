@@ -1,8 +1,6 @@
 //! Frames between processes, with listening sockets passed alongside, and the handoff messages in
 //! them. Both ends run different versions during an update, so the layout here is a contract
 //! between versions.
-// Until the Windows supervisor opens links, only the tests open them there.
-#![cfg_attr(all(windows, not(test)), allow(dead_code))]
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -25,7 +23,7 @@ use unix as sys;
 #[cfg(windows)]
 use windows as sys;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) use sys::pair;
 #[cfg(test)]
 pub(crate) use sys::stream_pair;

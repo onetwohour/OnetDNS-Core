@@ -20,7 +20,6 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long to keep reading output after the check exits, in case a grandchild holds the pipe.
 const OUTPUT_GRACE: Duration = Duration::from_secs(2);
-#[cfg(unix)]
 /// Lock wait when undoing a new version that failed to start, once the process that applied it lets
 /// go.
 const UNDO_LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -142,10 +141,8 @@ pub(crate) fn rollback(config: Option<&Path>) -> Result<Swapped, String> {
     result
 }
 
-#[cfg(unix)]
 /// Restores the previous executable when the swapped-in version could not start. This process is
 /// the previous version and the record is pending; after the restore, the record becomes reverted.
-/// Unused on Windows, where this process has no way to start the new version itself.
 pub(crate) fn undo_unstarted(reason: &str) -> Result<(), String> {
     let install = install::current()?;
     let lock = install

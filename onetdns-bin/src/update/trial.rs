@@ -131,12 +131,12 @@ fn process(install: &'static Install, waiting: &mut dyn FnMut()) -> Startup {
 /// Puts a successor of `version` on trial for a supervisor still running the previous version: the
 /// record must say that version was swapped in and has not started. Does not wait for the lock; the
 /// apply that swapped it in has released it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn for_successor(version: &str) -> Result<Trial, String> {
     successor_trial(install::current()?, version)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn successor_trial(install: &'static Install, version: &str) -> Result<Trial, String> {
     let lock = install
         .lock(Duration::ZERO)
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn a_successor_is_tried_out_only_as_the_version_swapped_in() {
         let scratch = Scratch::new("trial-successor");
         let install = swapped(&scratch, State::Pending);

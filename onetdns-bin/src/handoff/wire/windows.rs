@@ -4,9 +4,9 @@
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::io::{
-    AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket,
+    AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket, RawHandle,
 };
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ mod win32 {
     pub const OPEN_EXISTING: u32 = 3;
     pub const ERROR_BROKEN_PIPE: i32 = 109;
     pub const ERROR_IO_PENDING: i32 = 997;
+    pub const ERROR_IO_INCOMPLETE: i32 = 996;
     pub const WAIT_TIMEOUT: i32 = 258;
     pub const INFINITE: u32 = u32::MAX;
 
@@ -116,6 +117,14 @@ mod win32 {
             alertable: i32,
         ) -> i32;
         pub fn CancelIoEx(file: *mut c_void, overlapped: *mut OVERLAPPED) -> i32;
+        pub fn PeekNamedPipe(
+            pipe: *mut c_void,
+            buffer: *mut u8,
+            size: u32,
+            read: *mut u32,
+            available: *mut u32,
+            left_in_message: *mut u32,
+        ) -> i32;
     }
 
     #[link(name = "Ws2_32")]
@@ -148,6 +157,14 @@ pub(crate) struct Pipe {
     /// Milliseconds, or NO_TIMEOUT.
     read_timeout: AtomicU64,
     write_timeout: AtomicU64,
+    /// Reads return WouldBlock rather than wait when nothing has arrived.
+    nonblocking: AtomicBool,
+}
+
+impl AsRawHandle for Pipe {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
 }
 
 impl Pipe {
@@ -157,7 +174,45 @@ impl Pipe {
             peer: AtomicU32::new(0),
             read_timeout: AtomicU64::new(NO_TIMEOUT),
             write_timeout: AtomicU64::new(NO_TIMEOUT),
+            nonblocking: AtomicBool::new(false),
         }
+    }
+
+    /// Another handle to the same end, for watching it from another thread.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let clone = Self::from_handle(self.handle.try_clone()?);
+        clone.set_peer(self.peer.load(Ordering::Relaxed));
+        Ok(clone)
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.nonblocking.store(nonblocking, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// True once the other end is closed and everything it sent has been read.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.available()
+            .is_err_and(|error| error.raw_os_error() == Some(win32::ERROR_BROKEN_PIPE))
+    }
+
+    fn available(&self) -> io::Result<u32> {
+        let mut available = 0u32;
+        // SAFETY: Only the count is asked for; the other pointers may be null.
+        if unsafe {
+            win32::PeekNamedPipe(
+                self.raw(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(available)
     }
 
     pub(crate) fn set_peer(&self, process_id: u32) {
@@ -176,6 +231,16 @@ impl Pipe {
 
     /// Zero once the other end is closed.
     pub(crate) fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.nonblocking.load(Ordering::Relaxed) {
+            match self.available() {
+                Ok(0) => return Err(io::ErrorKind::WouldBlock.into()),
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(win32::ERROR_BROKEN_PIPE) => {
+                    return Ok(0)
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let length = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let timeout = self.read_timeout.load(Ordering::Relaxed);
         // SAFETY: `buf` outlives the operation: overlapped_io returns only once it has ended.
@@ -263,7 +328,11 @@ impl Pipe {
             return Ok(transferred as usize);
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(win32::WAIT_TIMEOUT) {
+        // A zero wait reports an operation still running as incomplete rather than timed out.
+        if !matches!(
+            error.raw_os_error(),
+            Some(win32::WAIT_TIMEOUT | win32::ERROR_IO_INCOMPLETE)
+        ) {
             return Err(error);
         }
         // The operation still uses `overlapped` and the caller's buffer, so it must end before
@@ -456,4 +525,43 @@ pub(crate) fn stream_pair() -> (Stream, Stream) {
     a.set_peer(std::process::id());
     b.set_peer(std::process::id());
     (a, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// The supervisor polls its channel without waiting, and a successor watches its link for the
+    /// predecessor letting go.
+    fn a_nonblocking_read_does_not_wait_and_a_closed_peer_is_seen() {
+        let (ours, theirs) = pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            ours.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!ours.peer_closed());
+        theirs.write_all(b"ab").unwrap();
+        drop(theirs);
+        assert!(!ours.peer_closed(), "what it sent is still unread");
+        assert_eq!(ours.read(&mut buf).unwrap(), 2);
+        assert!(ours.try_clone().unwrap().peer_closed());
+        assert_eq!(ours.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    /// A deadline less than a millisecond away waits zero milliseconds, which Windows reports as
+    /// an operation still running rather than as a timeout.
+    fn a_wait_shorter_than_a_millisecond_times_out() {
+        let (ours, _theirs) = pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_micros(500)))
+            .unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            ours.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 }
