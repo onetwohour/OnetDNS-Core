@@ -8,14 +8,18 @@
 //! query may fail meanwhile.
 //!
 //! The real binary is copied to a temporary directory and run both supervised and as a single
-//! process.
-#![cfg(target_os = "linux")]
+//! process. Only the handoff tests also run on Windows.
+#![cfg(any(target_os = "linux", windows))]
 
 use onetdns_forward::{Forwarder, Message, TrustStore, Upstream};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +30,12 @@ use std::time::{Duration, Instant};
 /// Enough for a slow first start on CI.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The install path's file name.
+const PROGRAM: &str = if cfg!(windows) {
+    "OnetDNS.exe"
+} else {
+    "OnetDNS"
+};
 
 /// Serializes writing executables and spawning processes. Tests run on threads of one process, and
 /// a descriptor one thread opened for writing is copied into a child another thread spawns
@@ -71,6 +81,13 @@ impl ScratchDir {
             .expect("시계")
             .as_nanos();
         let base = std::fs::canonicalize(std::env::temp_dir()).expect("임시 디렉터리의 실제 경로");
+        // Windows canonical paths are verbatim (\\?\C:\...), which a running image does not report.
+        #[cfg(windows)]
+        let base = PathBuf::from(
+            base.to_str()
+                .and_then(|path| path.strip_prefix(r"\\?\"))
+                .expect("드라이브 문자로 시작하는 임시 디렉터리"),
+        );
         let dir = base.join(format!("onetdns-respawn-{}-{unique}", std::process::id()));
         std::fs::create_dir(&dir).expect("임시 디렉터리를 만들지 못했습니다");
         Self(dir)
@@ -102,6 +119,7 @@ impl Server {
         Self::start(dir, program, config, &[])
     }
 
+    #[cfg(target_os = "linux")]
     fn single_process(dir: &Path, program: PathBuf, config: &Path) -> Self {
         Self::start(dir, program, config, &["--no-supervisor"])
     }
@@ -191,6 +209,7 @@ impl Server {
     }
 
     /// Signals `pid` only when it runs this test's binary.
+    #[cfg(unix)]
     fn signal_if_ours(&self, pid: i32, signal: libc::c_int) {
         if argv0(pid).as_deref() == Some(self.program.as_os_str().as_bytes()) {
             unsafe {
@@ -198,24 +217,67 @@ impl Server {
             }
         }
     }
+
+    /// Stops `pid` where it is, when it runs this test's binary.
+    fn freeze(&self, pid: i32) {
+        #[cfg(unix)]
+        self.signal_if_ours(pid, libc::SIGSTOP);
+        #[cfg(windows)]
+        if let Some(process) = self.open_if_ours(pid) {
+            // SAFETY: the handle is open with PROCESS_SUSPEND_RESUME.
+            unsafe { win32::NtSuspendProcess(process.as_raw_handle() as isize) };
+        }
+    }
+
+    /// Ends `pid` at once, when it runs this test's binary.
+    fn kill(&self, pid: i32) {
+        #[cfg(unix)]
+        self.signal_if_ours(pid, libc::SIGKILL);
+        #[cfg(windows)]
+        if let Some(process) = self.open_if_ours(pid) {
+            win32::end(&process);
+        }
+    }
+
+    /// A handle to `pid` while it runs an executable in this test's directory, so a reused PID is
+    /// never touched.
+    #[cfg(windows)]
+    fn open_if_ours(&self, pid: i32) -> Option<std::os::windows::io::OwnedHandle> {
+        win32::open_running_in(pid, self.program.parent()?)
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.pid(), libc::SIGTERM);
-        }
-        let deadline = Instant::now() + EXIT_TIMEOUT;
-        while Instant::now() < deadline {
-            if matches!(self.process.try_wait(), Ok(Some(_))) {
-                break;
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(self.pid(), libc::SIGTERM);
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            while Instant::now() < deadline {
+                if matches!(self.process.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
+        // Windows cannot delete a running executable, so each child is opened while the
+        // supervisor is still its parent and waited for once it is gone.
+        #[cfg(windows)]
+        let children: Vec<_> = children_of(self.pid())
+            .into_iter()
+            .filter_map(|pid| self.open_if_ours(pid))
+            .collect();
         let _ = self.process.kill();
         let _ = self.process.wait();
+        #[cfg(unix)]
         for pid in &self.children {
-            self.signal_if_ours(*pid, libc::SIGKILL);
+            self.kill(*pid);
+        }
+        #[cfg(windows)]
+        for child in &children {
+            win32::end(child);
         }
     }
 }
@@ -228,6 +290,7 @@ fn parse_event(line: &str) -> Option<Event> {
 }
 
 /// None once it has exited.
+#[cfg(target_os = "linux")]
 fn argv0(pid: i32) -> Option<Vec<u8>> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     cmdline.split(|byte| *byte == 0).next().map(<[u8]>::to_vec)
@@ -252,6 +315,7 @@ fn free_port() -> u16 {
     hold_free_port().0
 }
 
+#[cfg(target_os = "linux")]
 fn write_config(dir: &Path, port: u16) -> PathBuf {
     let config = dir.join("onetdns.toml");
     std::fs::write(&config, format!("listen = [\"127.0.0.1:{port}\"]\n"))
@@ -260,7 +324,7 @@ fn write_config(dir: &Path, port: u16) -> PathBuf {
 }
 
 fn install_copy(dir: &Path) -> PathBuf {
-    let program = dir.join("OnetDNS");
+    let program = dir.join(PROGRAM);
     let _exec = exec_lock();
     std::fs::copy(env!("CARGO_BIN_EXE_OnetDNS"), &program).expect("바이너리를 복사하지 못했습니다");
     program
@@ -300,6 +364,7 @@ fn run_cli(program: &Path, dir: &Path, args: &[&str]) -> std::process::Output {
     .expect("관리 명령을 실행하지 못했습니다")
 }
 
+#[cfg(target_os = "linux")]
 fn listing(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("디렉터리를 읽지 못했습니다")
@@ -332,11 +397,12 @@ impl Swapped {
     /// record's from and to match.
     fn prepare(dir: &Path) -> Self {
         let program = install_copy(dir);
-        let previous = dir.join("OnetDNS.previous");
+        let previous = dir.join(format!("OnetDNS.previous{}", std::env::consts::EXE_SUFFIX));
         let mut image = std::fs::read(&program).expect("바이너리를 읽지 못했습니다");
         image.extend_from_slice(b"\0previous\0");
         let exec = exec_lock();
         std::fs::write(&previous, &image).expect("이전 실행 파일을 쓰지 못했습니다");
+        #[cfg(unix)]
         std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o755))
             .expect("이전 실행 파일 권한");
         drop(exec);
@@ -373,6 +439,7 @@ impl Swapped {
     }
 
     /// The install path and .previous must be unchanged, so they remain usable for rollback.
+    #[cfg(target_os = "linux")]
     fn assert_committed(&self) {
         let record = self.record_text();
         assert!(record.contains("state=committed\n"), "{record}");
@@ -385,6 +452,7 @@ impl Swapped {
     }
 
     /// The record must hold `reason`.
+    #[cfg(target_os = "linux")]
     fn assert_reverted(&self, reason: &str) {
         assert_eq!(
             sha256_hex(&self.program),
@@ -401,6 +469,7 @@ impl Swapped {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// The install path holds a file that cannot run. A supervisor restarting from that path would fail
 /// and exit, and the next ready notice would never come. The restarted child must also keep its
@@ -436,6 +505,7 @@ fn child_restarts_from_the_running_image_after_the_binary_is_replaced() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn supervised_trial_that_becomes_ready_is_committed() {
     let scratch = ScratchDir::create();
@@ -452,6 +522,7 @@ fn supervised_trial_that_becomes_ready_is_committed() {
     swapped.assert_committed();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// Holding the listen port makes the new version's child exit before it gets ready. The supervisor
 /// reverts, execs, and reports the reverted update under the same PID. Once the port is released,
@@ -475,6 +546,7 @@ fn supervised_trial_that_fails_before_ready_starts_the_previous_executable() {
     swapped.assert_reverted("The new version exited before it became ready");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn single_process_trial_that_becomes_ready_is_committed() {
     let scratch = ScratchDir::create();
@@ -490,6 +562,7 @@ fn single_process_trial_that_becomes_ready_is_committed() {
     swapped.assert_committed();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// A single process has no supervisor to start it again, so the exec'd previous executable also
 /// fails while the port is held; this test only checks that the exec'd process reports the reverted
@@ -509,6 +582,7 @@ fn single_process_trial_that_fails_before_ready_execs_the_previous_executable() 
     swapped.assert_reverted("The new version stopped with an error before it became ready");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// Rolling back goes through the same preflight and swap as installing a new version: the real
 /// binary checks its own copy with --version and --cli check. The next start trial-runs the
@@ -559,6 +633,7 @@ fn cli_rollback_installs_the_previous_executable_for_a_trial() {
     assert!(record.contains("state=committed\n"), "{record}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// Not even a lock file may appear in the install directory when there is nothing to roll back.
 fn cli_rollback_without_an_update_leaves_the_directory_alone() {
@@ -679,8 +754,8 @@ impl Handoff {
                 ports.doq,
                 ports.doh3,
                 ports.dnscrypt,
-                cert.display(),
-                key.display(),
+                toml_path(&cert),
+                toml_path(&key),
                 ports.control
             ),
         )
@@ -861,6 +936,11 @@ impl Handoff {
     }
 }
 
+/// Backslashes in a TOML string are escapes, and Windows accepts forward slashes.
+fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -1033,6 +1113,7 @@ impl Drop for Load {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn children_of(parent: i32) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -1054,6 +1135,136 @@ fn children_of(parent: i32) -> Vec<i32> {
         .collect()
 }
 
+/// Only the server's own children: a console the supervisor gets also shows up as its child.
+#[cfg(windows)]
+fn children_of(parent: i32) -> Vec<i32> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    // SAFETY: takes no pointers; the result is checked before use.
+    let snapshot = unsafe { win32::CreateToolhelp32Snapshot(win32::TH32CS_SNAPPROCESS, 0) };
+    if snapshot == -1 {
+        return Vec::new();
+    }
+    // SAFETY: a new handle that nothing else owns.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as _) };
+    // SAFETY: all-zero bits are a valid PROCESSENTRY32W for the calls to fill.
+    let mut entry: win32::PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<win32::PROCESSENTRY32W>() as u32;
+    let mut children = Vec::new();
+    // SAFETY: `entry` is sized as dwSize says.
+    let mut more =
+        unsafe { win32::Process32FirstW(snapshot.as_raw_handle() as isize, &mut entry) } != 0;
+    while more {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(0);
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        if entry.th32ParentProcessID == parent as u32 && name.eq_ignore_ascii_case(PROGRAM) {
+            children.push(entry.th32ProcessID as i32);
+        }
+        // SAFETY: as above.
+        more = unsafe { win32::Process32NextW(snapshot.as_raw_handle() as isize, &mut entry) } != 0;
+    }
+    children
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case, clippy::upper_case_acronyms)]
+mod win32 {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::Path;
+
+    pub const TH32CS_SNAPPROCESS: u32 = 0x2;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    #[repr(C)]
+    pub struct PROCESSENTRY32W {
+        pub dwSize: u32,
+        pub cntUsage: u32,
+        pub th32ProcessID: u32,
+        pub th32DefaultHeapID: usize,
+        pub th32ModuleID: u32,
+        pub cntThreads: u32,
+        pub th32ParentProcessID: u32,
+        pub pcPriClassBase: i32,
+        pub dwFlags: u32,
+        pub szExeFile: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> isize;
+        pub fn Process32FirstW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+        pub fn Process32NextW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn TerminateProcess(process: isize, code: u32) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        /// Undocumented, and what debuggers use to stop a process where it is.
+        pub fn NtSuspendProcess(process: isize) -> i32;
+    }
+
+    /// A handle to `pid` while it runs an executable in `dir`.
+    pub fn open_running_in(pid: i32, dir: &Path) -> Option<OwnedHandle> {
+        // SAFETY: takes no pointers; the result is checked before use.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE
+                    | PROCESS_SUSPEND_RESUME
+                    | PROCESS_QUERY_LIMITED_INFORMATION
+                    | SYNCHRONIZE,
+                0,
+                pid as u32,
+            )
+        };
+        if handle == 0 {
+            return None;
+        }
+        // SAFETY: a new handle that nothing else owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+        let mut name = [0u16; 1024];
+        let mut size = name.len() as u32;
+        // SAFETY: `name` holds `size` units.
+        let named = unsafe {
+            QueryFullProcessImageNameW(
+                process.as_raw_handle() as isize,
+                0,
+                name.as_mut_ptr(),
+                &mut size,
+            )
+        } != 0;
+        let image = String::from_utf16_lossy(&name[..size as usize]);
+        let image_dir = Path::new(&image).parent()?.display().to_string();
+        (named && image_dir.eq_ignore_ascii_case(&dir.display().to_string())).then_some(process)
+    }
+
+    /// Terminates the process and waits until it has exited.
+    pub fn end(process: &OwnedHandle) {
+        // SAFETY: the handle is open with PROCESS_TERMINATE and SYNCHRONIZE.
+        unsafe {
+            TerminateProcess(process.as_raw_handle() as isize, 1);
+            WaitForSingleObject(
+                process.as_raw_handle() as isize,
+                super::EXIT_TIMEOUT.as_millis() as u32,
+            );
+        }
+    }
+}
+
 fn assert_no_query_failed(load: Load, server: &Server) {
     let tally = load.finish();
     assert!(
@@ -1067,12 +1278,18 @@ fn assert_no_query_failed(load: Load, server: &Server) {
     );
 }
 
+/// Logged once the successor is the supervisor's only child. A Linux supervisor then runs from the
+/// install path; a Windows supervisor stays the version it started as.
+#[cfg(target_os = "linux")]
+const SUPERVISING_THE_SUCCESSOR: &str = "supervisor.update_exec";
+#[cfg(windows)]
+const SUPERVISING_THE_SUCCESSOR: &str = "supervisor.predecessor_ended";
+
 #[test]
 /// A rollback through the management API starts the previous executable beside the running worker,
 /// which hands its sockets and state over. Queries keep being answered on every transport but
 /// QUIC, whose clients connect again; the counts, the dashboard session, and the DNSCrypt key
-/// carry over; and the supervisor then runs from the install path with the successor as its only
-/// child.
+/// carry over; and the successor is then the supervisor's only child.
 fn an_update_hands_over_without_failing_a_query() {
     let scratch = ScratchDir::create();
     let dir = &scratch.0;
@@ -1088,7 +1305,7 @@ fn an_update_hands_over_without_failing_a_query() {
     handoff.request_rollback();
     server.wait_for_own("update.trial_started");
     let counted_before = handoff.total_queries();
-    server.wait_for_own("supervisor.update_exec");
+    server.wait_for_own(SUPERVISING_THE_SUCCESSOR);
     let children = children_of(server.pid());
     server.children.extend(&children);
     let counted_after = handoff.total_queries();
@@ -1121,6 +1338,11 @@ fn an_update_hands_over_without_failing_a_query() {
         handoff.swapped.previous_sha256,
         "설치 경로"
     );
+    assert_eq!(
+        sha256_hex(&handoff.swapped.previous),
+        handoff.swapped.new_sha256,
+        ".previous"
+    );
 }
 
 #[test]
@@ -1142,9 +1364,9 @@ fn a_successor_that_dies_during_the_handoff_fails_no_query() {
         .into_iter()
         .find(|pid| *pid != first)
         .expect("후속 프로세스가 없습니다");
-    server.signal_if_ours(successor, libc::SIGSTOP);
+    server.freeze(successor);
     assert_eq!(server.wait_for("handoff.started", None), first);
-    server.signal_if_ours(successor, libc::SIGKILL);
+    server.kill(successor);
     server.wait_for_own("update.reverted");
     std::thread::sleep(Duration::from_secs(1));
     assert_no_query_failed(load, &server);
