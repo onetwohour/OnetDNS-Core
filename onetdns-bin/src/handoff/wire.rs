@@ -1,11 +1,11 @@
-//! Frames over a Unix stream socket, with descriptors passed alongside, and the handoff messages in
+//! Frames between processes, with listening sockets passed alongside, and the handoff messages in
 //! them. Both ends run different versions during an update, so the layout here is a contract
 //! between versions.
+// Until the Windows supervisor opens links, only the tests open them there.
+#![cfg_attr(all(windows, not(test)), allow(dead_code))]
 
-use std::io::{self, Write};
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -16,18 +16,29 @@ use super::{
 };
 use crate::listeners::TicketKeys;
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+#[cfg(unix)]
+use unix as sys;
+#[cfg(windows)]
+use windows as sys;
+
+#[cfg(test)]
+pub(crate) use sys::stream_pair;
+pub(crate) use sys::{Passed, Stream};
+
 /// The handoff protocol: the frames on the supervisor channel and on the link between two workers,
 /// the messages in them, and the formats of the state they carry. Each process states its number
 /// in its first frame, and both must use the same; it is separate from the update contract so a
 /// change here does not cut off self-updates.
 pub(crate) const PROTOCOL: u32 = 1;
 
-/// Kind, payload length, and descriptor count.
+/// Kind, payload length, and socket count.
 const HEADER: usize = 9;
 const MAX_PAYLOAD: usize = 1 << 28;
 const MAX_FDS: usize = 4096;
-/// Linux refuses more than SCM_MAX_FD (253) descriptors in one message.
-const FDS_PER_SEND: usize = 250;
 /// A peer that stops reading for this long is treated as gone.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -41,7 +52,14 @@ const RELEASED: u8 = 6;
 pub(crate) struct Frame {
     pub(crate) kind: u8,
     pub(crate) payload: Zeroizing<Vec<u8>>,
-    pub(crate) fds: Vec<OwnedFd>,
+    pub(crate) fds: Vec<Passed>,
+}
+
+/// SO_TYPE of a passed socket.
+pub(super) enum SocketType {
+    Datagram,
+    Stream,
+    Other,
 }
 
 impl Frame {
@@ -54,7 +72,7 @@ impl Frame {
     }
 }
 
-pub(crate) fn send(stream: &UnixStream, frame: &Frame) -> io::Result<()> {
+pub(crate) fn send(stream: &Stream, frame: &Frame) -> io::Result<()> {
     if frame.payload.len() > MAX_PAYLOAD || frame.fds.len() > MAX_FDS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -67,77 +85,12 @@ pub(crate) fn send(stream: &UnixStream, frame: &Frame) -> io::Result<()> {
     bytes.extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&(frame.fds.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&frame.payload);
-
-    // Each batch of descriptors rides on one byte and the last on the rest, so all of them arrive
-    // before the frame ends.
-    let batches: Vec<&[OwnedFd]> = frame.fds.chunks(FDS_PER_SEND).collect();
-    if batches.len() > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Too many descriptors for the handoff message",
-        ));
-    }
-    let mut at = 0;
-    for (index, batch) in batches.iter().enumerate() {
-        let end = if index + 1 == batches.len() {
-            bytes.len()
-        } else {
-            at + 1
-        };
-        at += send_with_fds(stream, &bytes[at..end], batch)?;
-    }
-    (&*stream).write_all(&bytes[at..])
-}
-
-fn send_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[OwnedFd]) -> io::Result<usize> {
-    let raw: Vec<libc::c_int> = fds.iter().map(AsRawFd::as_raw_fd).collect();
-    let data_len = u32::try_from(std::mem::size_of_val(raw.as_slice()))
-        .expect("A batch of descriptors fits in u32");
-    // SAFETY: CMSG_SPACE only computes a length.
-    let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
-    let mut control = vec![0u8; space];
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_ptr().cast_mut().cast(),
-        iov_len: bytes.len(),
-    };
-    // SAFETY: All-zero bits are a valid initial msghdr.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = space as _;
-    // SAFETY: `control` was sized with CMSG_SPACE for these descriptors, so the header and its
-    // data fit.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&raw const message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(data_len) as _;
-        std::ptr::copy_nonoverlapping(
-            raw.as_ptr().cast::<u8>(),
-            libc::CMSG_DATA(header),
-            data_len as usize,
-        );
-    }
-    loop {
-        // SAFETY: The buffer and control data `message` points to live for the whole call.
-        let sent =
-            unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL) };
-        match usize::try_from(sent) {
-            Ok(sent) => return Ok(sent),
-            Err(_) => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-    }
+    sys::write_frame(stream, &bytes, &frame.fds)
 }
 
 /// The next frame, waiting until `deadline` or until `abort` returns true.
 pub(crate) fn recv(
-    stream: &UnixStream,
+    stream: &Stream,
     deadline: Instant,
     abort: &dyn Fn() -> bool,
 ) -> Result<Frame, LinkError> {
@@ -165,14 +118,16 @@ pub(crate) struct FrameReader {
     header: [u8; HEADER],
     /// Allocated once the header is complete.
     payload: Option<Zeroizing<Vec<u8>>>,
+    /// What follows the payload about each passed socket; allocated once the payload is complete.
+    attached: Option<Vec<u8>>,
     filled: usize,
-    fds: Vec<OwnedFd>,
+    fds: Vec<Passed>,
 }
 
 impl FrameReader {
     /// Reads until the socket has nothing more, by its timeout or because it does not block. Some
     /// once a whole frame has arrived.
-    pub(crate) fn read(&mut self, stream: &UnixStream) -> Result<Option<Frame>, LinkError> {
+    pub(crate) fn read(&mut self, stream: &Stream) -> Result<Option<Frame>, LinkError> {
         loop {
             if self.payload.is_none() && self.filled == HEADER {
                 let length = self.declared(1) as usize;
@@ -182,9 +137,23 @@ impl FrameReader {
                 self.payload = Some(Zeroizing::new(vec![0u8; length]));
                 self.filled = 0;
             }
-            if let Some(payload) = self.payload.take_if(|payload| payload.len() == self.filled) {
+            if self.attached.is_none()
+                && self
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.len() == self.filled)
+            {
+                self.attached = Some(vec![0u8; self.declared(5) as usize * sys::ATTACHED]);
                 self.filled = 0;
-                let fds = std::mem::take(&mut self.fds);
+            }
+            if let Some(attached) = self
+                .attached
+                .take_if(|attached| attached.len() == self.filled)
+            {
+                self.filled = 0;
+                let payload = self.payload.take().expect("the payload comes first");
+                let mut fds = std::mem::take(&mut self.fds);
+                fds.extend(sys::attach(&attached)?);
                 if fds.len() != self.declared(5) as usize {
                     return Err(LinkError::Unreadable);
                 }
@@ -194,11 +163,12 @@ impl FrameReader {
                     fds,
                 }));
             }
-            let buf = match &mut self.payload {
-                None => &mut self.header[self.filled..],
-                Some(payload) => &mut payload[self.filled..],
+            let buf = match (&mut self.payload, &mut self.attached) {
+                (None, _) => &mut self.header[self.filled..],
+                (Some(payload), None) => &mut payload[self.filled..],
+                (Some(_), Some(attached)) => &mut attached[self.filled..],
             };
-            match recv_with_fds(stream, buf, &mut self.fds) {
+            match sys::read_some(stream, buf, &mut self.fds) {
                 Ok(0) => return Err(LinkError::Gone),
                 Ok(received) => self.filled += received,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -224,52 +194,6 @@ impl FrameReader {
     }
 }
 
-/// Takes ownership of every descriptor that arrives, closed on exec.
-fn recv_with_fds(stream: &UnixStream, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
-    const SCM_MAX_FD: u32 = 253;
-    let data_len = SCM_MAX_FD * std::mem::size_of::<libc::c_int>() as u32;
-    // SAFETY: CMSG_SPACE only computes a length.
-    let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
-    let mut control = vec![0u8; space];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    // SAFETY: All-zero bits are a valid initial msghdr.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = space as _;
-    // SAFETY: The buffer and control data `message` points to live for the whole call.
-    let received =
-        unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, libc::MSG_CMSG_CLOEXEC) };
-    let received = usize::try_from(received).map_err(|_| io::Error::last_os_error())?;
-    // SAFETY: Kernel-filled control data is walked only with the CMSG macros, within
-    // msg_controllen; each SCM_RIGHTS descriptor is new to this process and owned from here on.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&raw const message);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(header);
-                let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                for index in 0..bytes / std::mem::size_of::<libc::c_int>() {
-                    let fd = std::ptr::read_unaligned(data.cast::<libc::c_int>().add(index));
-                    fds.push(OwnedFd::from_raw_fd(fd));
-                }
-            }
-            header = libc::CMSG_NXTHDR(&raw const message, header);
-        }
-    }
-    if message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Descriptors were cut off",
-        ));
-    }
-    Ok(received)
-}
-
 /// A handoff message as a frame.
 pub(crate) trait Message: Sized {
     fn encode(self) -> Frame;
@@ -277,7 +201,7 @@ pub(crate) trait Message: Sized {
 }
 
 impl<Out: Message, In: Message> Link<Out, In> {
-    pub(crate) fn over(stream: UnixStream) -> Self {
+    pub(crate) fn over(stream: Stream) -> Self {
         Self {
             stream,
             messages: std::marker::PhantomData,
@@ -300,7 +224,7 @@ impl<Out: Message, In: Message> Link<Out, In> {
 
 /// Tells the successor the protocol and the credential key, which it needs before it builds
 /// anything that makes digests. The predecessor's first message on the link.
-pub(crate) fn introduce(stream: &UnixStream, credential_key: &[u8; 32]) -> Result<(), LinkError> {
+pub(crate) fn introduce(stream: &Stream, credential_key: &[u8; 32]) -> Result<(), LinkError> {
     let mut frame = Frame::new(HELLO);
     let mut out = Writer(&mut frame.payload);
     out.u32(PROTOCOL);
@@ -310,7 +234,7 @@ pub(crate) fn introduce(stream: &UnixStream, credential_key: &[u8; 32]) -> Resul
 
 /// The predecessor's credential key, once it has shown it speaks this protocol.
 pub(crate) fn introduced(
-    stream: &UnixStream,
+    stream: &Stream,
     deadline: Instant,
 ) -> Result<Zeroizing<[u8; 32]>, LinkError> {
     let frame = recv(stream, deadline, &|| false)?;
@@ -408,9 +332,9 @@ fn decode_sockets(frame: Frame) -> Result<SocketPool, LinkError> {
         let role = SocketRole::from_code(input.u8()?).ok_or(LinkError::Unreadable)?;
         let kind = input.u8()?;
         let addr = input.addr()?;
-        let socket = match (kind, socket_type(fd.as_fd())?) {
-            (UDP, libc::SOCK_DGRAM) => ListeningSocket::Udp(fd.into()),
-            (TCP, libc::SOCK_STREAM) => ListeningSocket::Tcp(fd.into()),
+        let socket = match (kind, sys::socket_type(&fd)?) {
+            (UDP, SocketType::Datagram) => ListeningSocket::Udp(fd.into()),
+            (TCP, SocketType::Stream) => ListeningSocket::Tcp(fd.into()),
             _ => return Err(LinkError::Unreadable),
         };
         pool.put(role, addr, socket);
@@ -427,25 +351,6 @@ fn decode_sockets(frame: Frame) -> Result<SocketPool, LinkError> {
     ]));
     input.finish()?;
     Ok(pool)
-}
-
-fn socket_type(fd: BorrowedFd<'_>) -> Result<libc::c_int, LinkError> {
-    let mut kind: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `kind` and `len` are valid for the size passed.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&raw mut kind).cast(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(LinkError::Unreadable);
-    }
-    Ok(kind)
 }
 
 fn encode_released(carried: Carried) -> Frame {
@@ -669,7 +574,7 @@ mod tests {
             .collect()
     }
 
-    fn frame(kind: u8, payload: &str, fds: Vec<OwnedFd>) -> Frame {
+    fn frame(kind: u8, payload: &str, fds: Vec<Passed>) -> Frame {
         Frame {
             kind,
             payload: Zeroizing::new(hex(payload)),
@@ -767,7 +672,7 @@ mod tests {
 
     #[test]
     fn messages_off_the_format_are_unreadable() {
-        let udp = || -> OwnedFd { UdpSocket::bind("127.0.0.1:0").unwrap().into() };
+        let udp = || -> Passed { UdpSocket::bind("127.0.0.1:0").unwrap().into() };
         let entry = "00000001 00 00 04 7f000001 0035 00000000 00 00 00 00";
         let cases = [
             ("payload on a step", frame(2, "00", Vec::new())),
@@ -808,10 +713,10 @@ mod tests {
     }
 
     #[test]
-    /// Descriptors beyond what one sendmsg may carry still arrive with their frame, and the next
-    /// frame keeps its own.
+    /// Sockets beyond what one sendmsg may carry still arrive with their frame, and the next frame
+    /// keeps its own.
     fn many_descriptors_arrive_with_their_frame() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = stream_pair();
         let sockets: Vec<UdpSocket> = (0..300)
             .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
             .collect();
@@ -821,7 +726,7 @@ mod tests {
             .collect();
         let mut first = Frame::new(SOCKETS);
         first.payload = Zeroizing::new(vec![7; 1000]);
-        first.fds = sockets.into_iter().map(OwnedFd::from).collect();
+        first.fds = sockets.into_iter().map(Passed::from).collect();
         let mut second = Frame::new(RELEASED);
         second
             .fds
@@ -845,7 +750,7 @@ mod tests {
 
     #[test]
     fn a_closed_peer_and_a_missing_reply_are_told_apart() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = stream_pair();
         let soon = Instant::now() + Duration::from_millis(50);
         assert!(matches!(
             recv(&b, soon, &|| false),
@@ -859,7 +764,7 @@ mod tests {
 
     #[test]
     fn the_successor_learns_the_key_only_under_the_same_protocol() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = stream_pair();
         let deadline = Instant::now() + Duration::from_secs(10);
         introduce(&a, &[5; 32]).unwrap();
         assert_eq!(*introduced(&b, deadline).unwrap(), [5; 32]);

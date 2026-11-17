@@ -135,7 +135,7 @@ pub(crate) struct TicketKeys {
     doh3: Option<Zeroizing<[u8; 32]>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl TicketKeys {
     /// DoT, DoH, DoQ, DoH3.
     pub(crate) fn each(&self) -> [Option<&Zeroizing<[u8; 32]>>; 4] {
