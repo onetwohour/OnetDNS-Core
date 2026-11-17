@@ -263,12 +263,13 @@ pub(crate) fn status_json(release_check: bool) -> String {
             },
         );
     format!(
-        "{{\"version\":{},\"target\":{},\"participating\":{},\"reason\":{},\"launch\":\"{}\",\"release_check\":{},\"task\":{},\"checked_at\":{},\"result\":{},\"new_version\":{},\"release_url\":{},\"detail\":{},\"record\":{},\"rollback\":{}}}",
+        "{{\"version\":{},\"target\":{},\"participating\":{},\"reason\":{},\"launch\":\"{}\",\"handoff\":{},\"release_check\":{},\"task\":{},\"checked_at\":{},\"result\":{},\"new_version\":{},\"release_url\":{},\"detail\":{},\"record\":{},\"rollback\":{}}}",
         json_text(Some(VERSION)),
         json_text(RELEASE_TARGET),
         reason.is_none(),
         json_text(reason.as_deref()),
         launch::current().name(),
+        launch::current() == launch::Launch::SupervisedChild && crate::supervisor::successor_fits(),
         release_check,
         json_text(task.map(Task::name)),
         checked_at.map_or_else(|| "null".to_string(), |at| at.to_string()),

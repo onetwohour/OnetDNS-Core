@@ -4393,6 +4393,10 @@ Object.assign(I18N.en, {
   "{version} 버전으로 되돌릴까요?":"Roll back to version {version}?",
   "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"After the installation, restart OnetDNS yourself to run the installed version.",
   "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"OnetDNS restarts when the installation finishes. DNS answers pause briefly during the restart, and you need to sign in to this page again.",
+  "설치가 끝나면 설치한 버전이 실행 중인 버전을 이어받습니다. DNS 응답은 멈추지 않고, 이 화면의 로그인도 유지됩니다.":"When the installation finishes, the installed version takes over from the running one. DNS answers do not pause, and you stay signed in to this page.",
+  "사용할 수 있는 메모리가 모자라 두 버전을 함께 띄울 수 없으므로, 설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"There is not enough free memory to run both versions at once, so OnetDNS restarts when the installation finishes. DNS answers pause briefly during the restart, and you need to sign in to this page again.",
+  "설치한 버전이 이어받기를 기다리고 있습니다. 이어받으면 화면을 새로 고칩니다":"Waiting for the installed version to take over. This page reloads once it has",
+  "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS now runs version {version}",
   "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"If the installed version does not become ready in time, the current version is put back automatically.",
   "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"Only this node changes. Replication stops between cluster nodes running different versions, so bring the other nodes to the same version.",
   "업데이트를 확인하지 못했습니다":"Could not check for updates",
@@ -4435,6 +4439,10 @@ Object.assign(I18N.ja, {
   "{version} 버전으로 되돌릴까요?":"バージョン {version} に戻しますか？",
   "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"インストール後、OnetDNS を手動で再起動すると、インストールしたバージョンで動作します。",
   "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"インストールが終わると OnetDNS が再起動します。再起動中は DNS の応答が一時的に止まり、この画面には再度サインインが必要です。",
+  "설치가 끝나면 설치한 버전이 실행 중인 버전을 이어받습니다. DNS 응답은 멈추지 않고, 이 화면의 로그인도 유지됩니다.":"インストールが終わると、インストールしたバージョンが実行中のバージョンを引き継ぎます。DNS の応答は止まらず、この画面のサインインも維持されます。",
+  "사용할 수 있는 메모리가 모자라 두 버전을 함께 띄울 수 없으므로, 설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"空きメモリが足りず 2 つのバージョンを同時に起動できないため、インストールが終わると OnetDNS が再起動します。再起動中は DNS の応答が一時的に止まり、この画面には再度サインインが必要です。",
+  "설치한 버전이 이어받기를 기다리고 있습니다. 이어받으면 화면을 새로 고칩니다":"インストールしたバージョンの引き継ぎを待っています。引き継ぐとこの画面を再読み込みします",
+  "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS がバージョン {version} に切り替わりました",
   "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"インストールしたバージョンが所定の時間内に準備できない場合は、現在のバージョンに自動で戻します。",
   "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"変更されるのはこのノードだけです。バージョンが異なるクラスターノード間では複製が止まるため、他のノードも同じバージョンにそろえてください。",
   "업데이트를 확인하지 못했습니다":"更新を確認できませんでした",
@@ -4477,6 +4485,10 @@ Object.assign(I18N.zh, {
   "{version} 버전으로 되돌릴까요?":"要回退到版本 {version} 吗？",
   "설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.":"安装完成后，需要手动重启 OnetDNS 才能运行已安装的版本。",
   "설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"安装完成后 OnetDNS 将重启。重启期间 DNS 响应会短暂中断，并且需要重新登录此页面。",
+  "설치가 끝나면 설치한 버전이 실행 중인 버전을 이어받습니다. DNS 응답은 멈추지 않고, 이 화면의 로그인도 유지됩니다.":"安装完成后，已安装的版本将接管正在运行的版本。DNS 响应不会中断，此页面也保持登录。",
+  "사용할 수 있는 메모리가 모자라 두 버전을 함께 띄울 수 없으므로, 설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.":"可用内存不足，无法同时运行两个版本，因此安装完成后 OnetDNS 将重启。重启期间 DNS 响应会短暂中断，并且需要重新登录此页面。",
+  "설치한 버전이 이어받기를 기다리고 있습니다. 이어받으면 화면을 새로 고칩니다":"正在等待已安装的版本接管。接管后将重新加载此页面",
+  "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS 已切换到版本 {version}",
   "설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.":"如果已安装的版本未能在规定时间内就绪，将自动恢复为当前版本。",
   "이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.":"只会更改此节点。版本不同的集群节点之间会停止复制，请将其他节点也更新到相同版本。",
   "업데이트를 확인하지 못했습니다":"无法检查更新",
@@ -4928,7 +4940,11 @@ class Component extends DCLogic {
     document.addEventListener('keydown',this._onSubmitEnter,true);
     document.addEventListener('keydown',this._onGlobalKeyDown,true);
     const initialView=this.viewFromLocation();if(initialView!==this.state.view)this.setState({view:initialView});
-    try{if(sessionStorage.getItem('onetdns_notice')==='update-restart'){sessionStorage.removeItem('onetdns_notice');this.setState({loginNotice:'OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요'});}}catch(e){}
+    try{
+      const notice=sessionStorage.getItem('onetdns_notice')||'';
+      if(notice==='update-restart'){sessionStorage.removeItem('onetdns_notice');this.setState({loginNotice:'OnetDNS가 업데이트로 다시 시작했습니다. 다시 로그인하세요'});}
+      else if(notice.startsWith('update-handoff:')){sessionStorage.removeItem('onetdns_notice');this.toastMsg(this.tr('OnetDNS가 {version} 버전으로 바뀌었습니다',{version:notice.slice('update-handoff:'.length)}));}
+    }catch(e){}
     this.checkAuth();
   }
   componentWillUnmount(){
@@ -5019,6 +5035,7 @@ class Component extends DCLogic {
   // 다시 시작했다는 뜻이므로, 새 버전의 화면을 받도록 페이지를 다시 읽는다.
   authExpired(){if(this._updateWatch&&this._updateWatch.kind!=='check')return this.reloadAfterRestart();this.clearSession('auth-expired');}
   reloadAfterRestart(){this._updateWatch=null;try{sessionStorage.setItem('onetdns_notice','update-restart');}catch(e){}window.location.reload();}
+  reloadAfterHandoff(version){this._updateWatch=null;try{sessionStorage.setItem('onetdns_notice','update-handoff:'+version);}catch(e){}window.location.reload();}
   async request(path,opts){
     const generation=this._sessionGeneration;
     const controller=new AbortController();
@@ -5194,6 +5211,11 @@ class Component extends DCLogic {
   handleSocketMessage(message){
     if(!message||typeof message!=='object') return;
     if(message.type==='hello'){
+      // 다시 붙은 서버의 버전이 다르면 인계나 재시작으로 바뀐 것이므로 새 버전의 화면을 받는다.
+      if(typeof message.version==='string'){
+        if(this._serverVersion&&this._serverVersion!==message.version)return this.reloadAfterHandoff(message.version);
+        this._serverVersion=message.version;
+      }
       if(message.replay_gap){
         this._lastSeq=0;
         // 서버 재시작이나 보존 한도 초과로 연속 재생이 불가능해도 화면을 비우지
@@ -5506,7 +5528,11 @@ class Component extends DCLogic {
   goUpdate=()=>this.go('operations')();
   updateFailure(kind){return {check:this.t('업데이트를 확인하지 못했습니다'),apply:this.t('업데이트를 설치하지 못했습니다'),rollback:this.t('이전 버전으로 되돌리지 못했습니다')}[kind];}
   updateConfirmDetail(u){
-    const lines=[this.t(u.launch==='manual'?'설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.':'설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.'),
+    const first=u.launch==='manual'?'설치가 끝난 뒤 OnetDNS를 직접 다시 시작해야 설치한 버전이 실행됩니다.'
+      :u.handoff===true?'설치가 끝나면 설치한 버전이 실행 중인 버전을 이어받습니다. DNS 응답은 멈추지 않고, 이 화면의 로그인도 유지됩니다.'
+      :u.launch==='supervisor'?'사용할 수 있는 메모리가 모자라 두 버전을 함께 띄울 수 없으므로, 설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.'
+      :'설치가 끝나면 OnetDNS가 다시 시작합니다. 다시 시작하는 동안 DNS 응답이 잠시 멈추고, 이 화면에는 다시 로그인해야 합니다.';
+    const lines=[this.t(first),
       this.t('설치한 버전이 정해진 시간 안에 준비되지 않으면 지금 버전으로 자동으로 되돌립니다.')];
     const self=(this.state.cluster&&this.state.cluster.self)||{};
     if(self.role&&self.role!=='standalone')lines.push(this.t('이 노드만 바꿉니다. 클러스터의 다른 노드와 버전이 다르면 복제가 멈추므로, 다른 노드도 같은 버전으로 맞추세요.'));
@@ -5522,16 +5548,17 @@ class Component extends DCLogic {
     if(!r.ok){this.loadUpdate();return this.toastMsg(this.updateFailure(kind)+': '+this.errorText(r),true);}
     const id=r.body&&r.body.id;
     if(id==null)return this.loadUpdate();
-    const watch={kind};
+    const watch={kind,from:String(u.version||''),handoff:u.handoff===true};
     this._updateWatch=watch;
     this.setState({updateBusy:kind});
     await this.followUpdate(watch,id);
   };
   // 설치와 되돌리기가 끝나면 서버가 다시 시작해 작업 결과를 못 받은 채 연결이 끊길 수 있다.
   // 끊김은 다시 시작하는 중으로 보고, 다시 붙었을 때의 401에서 페이지를 다시 읽는다(authExpired).
+  // 인계로 바뀌면 세션이 이어지므로, 실행 중인 버전이 바뀐 것을 보고 페이지를 다시 읽는다.
   async followUpdate(watch,id){
     const finish=()=>{if(this._updateWatch===watch){this._updateWatch=null;this.setState({updateBusy:null});}};
-    const restarting=()=>{if(this.state.updateBusy!=='restart')this.setState({updateBusy:'restart'});};
+    const restarting=()=>{const busy=watch.handoff?'handoff':'restart';if(this.state.updateBusy!==busy)this.setState({updateBusy:busy});};
     for(;;){
       await new Promise(resolve=>setTimeout(resolve,1500));
       if(this._updateWatch!==watch)return;
@@ -5545,7 +5572,10 @@ class Component extends DCLogic {
       if(this._updateWatch!==watch)return;
       if(watch.kind==='check'){finish();if(watch.quiet)return;return after?this.toastUpdateCheck(after):this.toastMsg(String(job.result||''));}
       if(!after)continue;
-      if(after.launch==='manual'){finish();const record=after.record&&typeof after.record==='object'?after.record:{};return this.toastMsg(this.tr('{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다',{version:String(record.to||'')}));}
+      const record=after.record&&typeof after.record==='object'?after.record:{};
+      if(after.launch==='manual'){finish();return this.toastMsg(this.tr('{version} 버전을 설치했습니다. OnetDNS를 다시 시작하면 이 버전이 실행됩니다',{version:String(record.to||'')}));}
+      if(watch.from&&typeof after.version==='string'&&after.version!==watch.from)return this.reloadAfterHandoff(after.version);
+      if(record.state==='reverted'){finish();return;}
       restarting();
     }
   }
@@ -5562,7 +5592,7 @@ class Component extends DCLogic {
     if(!u)return {upd:empty,banner:'',bannerAction:false};
     const record=u.record&&typeof u.record==='object'?u.record:null;
     const task=s.updateBusy||(typeof u.task==='string'?u.task:'');
-    const busyText={check:this.t('새 버전을 확인하고 있습니다'),apply:this.t('새 버전을 내려받아 설치하고 있습니다'),rollback:this.t('이전 버전을 다시 설치하고 있습니다'),restart:this.t('OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다')}[task]||'';
+    const busyText={check:this.t('새 버전을 확인하고 있습니다'),apply:this.t('새 버전을 내려받아 설치하고 있습니다'),rollback:this.t('이전 버전을 다시 설치하고 있습니다'),restart:this.t('OnetDNS가 다시 시작하기를 기다리고 있습니다. 다시 시작하면 화면을 새로 고칩니다'),handoff:this.t('설치한 버전이 이어받기를 기다리고 있습니다. 이어받으면 화면을 새로 고칩니다')}[task]||'';
     const participating=u.participating===true;
     const result=typeof u.result==='string'?u.result:'';
     const newVersion=typeof u.new_version==='string'?u.new_version:'';

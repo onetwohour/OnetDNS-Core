@@ -68,6 +68,11 @@ pub(crate) enum Requested {
     Unavailable(String),
 }
 
+/// Whether the supervisor would start a successor beside this process now, as far as memory goes.
+pub(crate) fn successor_fits() -> bool {
+    super::room_for_successor(sys::own_memory()).is_ok()
+}
+
 /// Asks the supervisor to start the installed version beside this process.
 pub(crate) fn request_successor() -> Requested {
     HANDING_OVER.store(true, Ordering::Release);

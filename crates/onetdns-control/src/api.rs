@@ -3806,12 +3806,13 @@ fn handle_dashboard_websocket(
 
     let subscription = st.stats.subscribe_after(resume);
     let hello = format!(
-        "{{\"type\":\"hello\",\"replay_gap\":{}}}",
+        "{{\"type\":\"hello\",\"replay_gap\":{},\"version\":\"{}\"}}",
         if subscription.replay_gap {
             "true"
         } else {
             "false"
-        }
+        },
+        env!("CARGO_PKG_VERSION")
     );
     ws_write_text(&mut stream, &hello)?;
     for event in subscription.replay {
@@ -5279,7 +5280,7 @@ fn openapi_json() -> String {
     "/v1/system/service": { "get": { "tags": ["System"], "summary": "Boot service registration status", "responses": { "200": { "description": "{supported,installed,running}" } } }, "post": { "tags": ["System"], "summary": "Install or remove the boot service (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["install", "uninstall"] } }, "required": ["action"] } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply" } } } },
     "/v1/system/dns-client": { "post": { "tags": ["System"], "summary": "Change the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "adapter": { "type": "string" }, "servers": { "type": "array", "items": { "type": "string" } } }, "required": ["adapter", "servers"] } } } }, "responses": { "200": { "description": "Result" }, "400": { "description": "Could not apply the change" } } } },
     "/v1/system/dns-client/restore": { "post": { "tags": ["System"], "summary": "Restore the OS DNS client settings (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "adapter": { "type": "string" } }, "required": ["adapter"] } } } }, "responses": { "200": { "description": "Restore result" }, "400": { "description": "Could not restore" } } } },
-    "/v1/system/update": { "get": { "tags": ["Updates"], "summary": "Self-update status of this node: its version, whether this build updates itself and why not, how a new version is started, the last release check, the update record, and the version a rollback would reinstall", "responses": { "200": { "description": "{version,target,participating,reason,launch,release_check,task,checked_at,result,new_version,release_url,detail,record,rollback}" } } } },
+    "/v1/system/update": { "get": { "tags": ["Updates"], "summary": "Self-update status of this node: its version, whether this build updates itself and why not, how a new version is started, the last release check, the update record, and the version a rollback would reinstall", "responses": { "200": { "description": "{version,target,participating,reason,launch,handoff,release_check,task,checked_at,result,new_version,release_url,detail,record,rollback}" } } } },
     "/v1/system/update/check": { "post": { "tags": ["Updates"], "summary": "Start a job that checks GitHub for a newer release (admin only)", "responses": { "200": { "description": "{id,status}" }, "409": { "description": "{error}" } } } },
     "/v1/system/update/apply": { "post": { "tags": ["Updates"], "summary": "Start a job that installs the release found by the last check and starts it (admin only). version must be the version the last check found", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "version": { "type": "string" } }, "required": ["version"] } } } }, "responses": { "200": { "description": "{id,status}" }, "400": { "description": "{error}" }, "409": { "description": "{error}" } } } },
     "/v1/system/update/rollback": { "post": { "tags": ["Updates"], "summary": "Start a job that reinstalls the version replaced by the last committed update and starts it (admin only)", "responses": { "200": { "description": "{id,status}" }, "409": { "description": "{error}" } } } },

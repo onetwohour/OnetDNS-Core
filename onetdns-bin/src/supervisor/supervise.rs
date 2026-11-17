@@ -198,7 +198,7 @@ impl Successor {
         restarts: u64,
         current: &Worker,
     ) -> Result<Self, String> {
-        room_for_successor(&current.process)?;
+        super::room_for_successor(sys::memory(&current.process))?;
         let install = crate::update::install::current()?;
         let worker = spawn_worker(install.path(), program, config_path, no_web, restarts)
             .map_err(|error| error.to_string())?;
@@ -306,19 +306,6 @@ impl Successor {
                 }
             }
         }
-    }
-}
-
-/// The successor runs beside the current worker until it takes over, so it needs about as much
-/// memory again. Figures that cannot be read do not stop it.
-fn room_for_successor(current: &Process) -> Result<(), String> {
-    match sys::memory(current) {
-        Some((available, used)) if available < used => Err(format!(
-            "{} MiB of memory is available, and the new version needs about {} MiB beside the running one",
-            available >> 20,
-            used >> 20
-        )),
-        _ => Ok(()),
     }
 }
 

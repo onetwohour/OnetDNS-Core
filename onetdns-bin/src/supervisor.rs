@@ -54,6 +54,21 @@ impl RestartPolicy {
     }
 }
 
+/// The successor runs beside the current worker until it takes over, so it needs about as much
+/// memory again. `memory` is what the system has available and the worker uses; figures that cannot
+/// be read do not stop it.
+#[cfg(any(target_os = "linux", windows))]
+fn room_for_successor(memory: Option<(u64, u64)>) -> Result<(), String> {
+    match memory {
+        Some((available, used)) if available < used => Err(format!(
+            "{} MiB of memory is available, and the new version needs about {} MiB beside the running one",
+            available >> 20,
+            used >> 20
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// How this process runs under the supervisor that started it.
 #[derive(Default)]
 pub struct Joined {
@@ -85,7 +100,7 @@ pub use supervise::run_service;
 #[cfg(any(target_os = "linux", windows))]
 pub use worker::{handing_over, join, settle};
 #[cfg(any(target_os = "linux", windows))]
-pub(crate) use worker::{request_successor, Requested};
+pub(crate) use worker::{request_successor, successor_fits, Requested};
 
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn join(_links: &std::sync::Arc<crate::handoff::Links>) -> crate::error::BoxResult<Joined> {
@@ -99,6 +114,11 @@ pub fn settle(handed: bool, _abort: &dyn Fn() -> bool) -> bool {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn handing_over() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) fn successor_fits() -> bool {
     false
 }
 
@@ -149,5 +169,24 @@ mod tests {
             policy.child_exited(true, STABLE_RUNTIME),
             RestartDecision::RestartAfter(BASE_RESTART_DELAY)
         );
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_successor_needs_as_much_memory_again() {
+        assert!(room_for_successor(Some((2 << 30, 1 << 30))).is_ok());
+        assert!(room_for_successor(Some((1 << 30, 1 << 30))).is_ok());
+        assert!(room_for_successor(Some((1 << 30, 2 << 30))).is_err());
+        assert!(
+            room_for_successor(None).is_ok(),
+            "읽지 못한 값은 막지 않습니다"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn this_process_reads_its_own_memory() {
+        let (available, used) = sys::own_memory().expect("이 프로세스의 메모리");
+        assert!(available > 0 && used > 0, "{available} {used}");
     }
 }

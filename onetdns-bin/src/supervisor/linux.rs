@@ -255,6 +255,16 @@ pub(super) fn prepare_worker() -> BoxResult<()> {
 
 /// Bytes the system has available and the current worker uses.
 pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
+    memory_of(&current.pid.to_string())
+}
+
+/// Bytes the system has available and this process uses.
+pub(super) fn own_memory() -> Option<(u64, u64)> {
+    memory_of("self")
+}
+
+/// `pid` names a directory under /proc.
+fn memory_of(pid: &str) -> Option<(u64, u64)> {
     let read = |path: &str, field: &str| {
         std::fs::read_to_string(path)
             .ok()
@@ -263,7 +273,7 @@ pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
     };
     Some((
         read("/proc/meminfo", "MemAvailable:")?,
-        read(&format!("/proc/{}/status", current.pid), "VmRSS:")?,
+        read(&format!("/proc/{pid}/status"), "VmRSS:")?,
     ))
 }
 

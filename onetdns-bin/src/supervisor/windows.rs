@@ -615,6 +615,17 @@ fn push_quoted(line: &mut Vec<u16>, arg: &OsStr) {
 
 /// Bytes the system has available and the current worker uses.
 pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
+    memory_of(raw(&current.handle))
+}
+
+/// Bytes the system has available and this process uses.
+pub(super) fn own_memory() -> Option<(u64, u64)> {
+    // SAFETY: Takes no arguments; the pseudo handle needs no closing.
+    memory_of(unsafe { win32::GetCurrentProcess() })
+}
+
+/// `process` must be open.
+fn memory_of(process: win32::HANDLE) -> Option<(u64, u64)> {
     let mut status = win32::MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<win32::MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -628,10 +639,7 @@ pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
         ..Default::default()
     };
     // SAFETY: `counters` is sized as cb says, and the process handle is open.
-    if unsafe {
-        win32::K32GetProcessMemoryInfo(raw(&current.handle), &raw mut counters, counters.cb)
-    } == 0
-    {
+    if unsafe { win32::K32GetProcessMemoryInfo(process, &raw mut counters, counters.cb) } == 0 {
         return None;
     }
     Some((status.ullAvailPhys, counters.WorkingSetSize as u64))
