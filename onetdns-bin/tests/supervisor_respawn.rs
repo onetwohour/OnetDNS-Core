@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,10 +76,13 @@ struct ScratchDir(PathBuf);
 impl ScratchDir {
     /// The path is canonical, with symlinks resolved.
     fn create() -> Self {
+        // macOS clocks tick in microseconds, so tests starting together can read the same time.
+        static CREATED: AtomicU32 = AtomicU32::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("시계")
             .as_nanos();
+        let unique = format!("{unique}-{}", CREATED.fetch_add(1, Ordering::Relaxed));
         let base = std::fs::canonicalize(std::env::temp_dir()).expect("임시 디렉터리의 실제 경로");
         // Windows canonical paths are verbatim (\\?\C:\...), which a running image does not report.
         #[cfg(windows)]
