@@ -1408,7 +1408,7 @@ Object.assign(I18N.en, {
   "자녀 보호 (내장 목록)": "Parental control (built-in list)",
   "설정의 위험 사이트 차단으로 켜고 끕니다": "Turned on and off by Safe browsing in Settings",
   "설정의 자녀 보호로 켜고 끕니다": "Turned on and off by Parental control in Settings",
-  "목록별로 나누지 않은 규칙 (구독 목록, 직접 입력, 서비스 차단, 로컬 영역)": "Rules not split by list (subscriptions, custom rules, blocked services, local zones)",
+  "목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)": "Rules not split by list (custom rules, blocked services, local zones)",
   "DHCPv4 서버가 실행 중이 아니어서 고정 할당을 추가할 수 없습니다. 설정에서 DHCPv4 서버 사용을 켜면 추가할 수 있습니다.": "The DHCPv4 server is not running, so reservations cannot be added. Turn on Enable DHCPv4 server in Settings to add them.",
   "연결된 피어 노드가 없습니다.": "No peer nodes connected.",
   "발급한 토큰이 없습니다.": "No tokens issued.",
@@ -1645,7 +1645,7 @@ Object.assign(I18N.ja, {
   "자녀 보호 (내장 목록)": "ペアレンタルコントロール（内蔵リスト）",
   "설정의 위험 사이트 차단으로 켜고 끕니다": "設定のセーフブラウジングでオン・オフします",
   "설정의 자녀 보호로 켜고 끕니다": "設定のペアレンタルコントロールでオン・オフします",
-  "목록별로 나누지 않은 규칙 (구독 목록, 직접 입력, 서비스 차단, 로컬 영역)": "リスト別に分けていないルール（購読リスト、手動入力、サービスブロック、ローカルゾーン）",
+  "목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)": "リスト別に分けていないルール（手動入力、サービスブロック、ローカルゾーン）",
   "DHCPv4 서버가 실행 중이 아니어서 고정 할당을 추가할 수 없습니다. 설정에서 DHCPv4 서버 사용을 켜면 추가할 수 있습니다.": "DHCPv4 サーバーが動作していないため、固定割り当てを追加できません。設定で「DHCPv4 サーバーを使用」をオンにすると追加できます。",
   "연결된 피어 노드가 없습니다.": "接続されたピアノードはありません。",
   "발급한 토큰이 없습니다.": "発行したトークンはありません。",
@@ -3538,7 +3538,7 @@ Object.assign(I18N.zh, {
   "자녀 보호 (내장 목록)":"家长控制（内置列表）",
   "설정의 위험 사이트 차단으로 켜고 끕니다":"由设置中的危险网站拦截开启或关闭",
   "설정의 자녀 보호로 켜고 끕니다":"由设置中的家长控制开启或关闭",
-  "목록별로 나누지 않은 규칙 (구독 목록, 직접 입력, 서비스 차단, 로컬 영역)":"未按列表区分的规则（订阅列表、手动输入、服务拦截、本地区域）",
+  "목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)":"未按列表区分的规则（手动输入、服务拦截、本地区域）",
   "DHCPv4 서버가 실행 중이 아니어서 고정 할당을 추가할 수 없습니다. 설정에서 DHCPv4 서버 사용을 켜면 추가할 수 있습니다.":"DHCPv4 服务器未运行，无法添加固定分配。在设置中启用 DHCPv4 服务器后即可添加。",
   "연결된 피어 노드가 없습니다.":"没有已连接的对等节点。",
   "발급한 토큰이 없습니다.":"没有已签发的令牌。",
@@ -7317,7 +7317,7 @@ class Component extends DCLogic {
     const topRuleRows=(Array.isArray(topData.top)?topData.top:[]).slice(0,20).map(row=>({rule:String(row.rule||''),hits:Number(row.hits)||0,hitsLabel:(Number(row.hits)||0).toLocaleString(this.locale())}));
     // 목록별 출처를 두지 않은 규칙은 inline 하나로 모인다. 그대로 보이면 직접 입력한 규칙만 있는 것처럼 읽힌다.
     const sourceHitsEnabled=sourceData.hits_enabled===true;
-    const sourceRows=(Array.isArray(sourceData.sources)?sourceData.sources:[]).slice(0,30).map(row=>({source:row.source==='inline'?this.t('목록별로 나누지 않은 규칙 (구독 목록, 직접 입력, 서비스 차단, 로컬 영역)'):String(row.source||''),rules:Number(row.rules)||0,rulesLabel:(Number(row.rules)||0).toLocaleString(this.locale()),hits:Number(row.hits)||0,hitsText:sourceHitsEnabled?this.tr('{hits} 적중',{hits:(Number(row.hits)||0).toLocaleString(this.locale())}):''}));
+    const sourceRows=(Array.isArray(sourceData.sources)?sourceData.sources:[]).slice(0,30).map(row=>({source:row.source==='inline'?this.t('목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)'):String(row.source||''),rules:Number(row.rules)||0,rulesLabel:(Number(row.rules)||0).toLocaleString(this.locale()),hits:Number(row.hits)||0,hitsText:sourceHitsEnabled?this.tr('{hits} 적중',{hits:(Number(row.hits)||0).toLocaleString(this.locale())}):''}));
     const pluginRows=(Array.isArray(s.filterPlugins)?s.filterPlugins:[]).map(row=>({name:String(row.name||''),eval:Number(row.eval)||0,evalLabel:(Number(row.eval)||0).toLocaleString(this.locale()),error:Number(row.error)||0,errorLabel:(Number(row.error)||0).toLocaleString(this.locale()),block:Number(row.block)||0,blockLabel:(Number(row.block)||0).toLocaleString(this.locale()),latency:(Number(row.latency_us)||0).toLocaleString(this.locale())+'µs',healthColor:(Number(row.error)||0)>0?'var(--warn)':'var(--ok)'}));
     const reportTotalN=Number(report.rules_total)||0,reportAppliedN=Number(report.rules_applied)||0,reportSkippedN=Number(report.rules_skipped)||0;
     const filterCoverage=reportTotalN?Math.max(0,Math.min(100,reportAppliedN/reportTotalN*100)):0;
