@@ -10,7 +10,8 @@ mod common;
 use common::{production_files, read, root};
 
 const BIN_REQUIRED: &[&str] = &[
-    "metrics: Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>",
+    "metrics: tui::MetricsSlot,",
+    "Arc<Mutex<Option<(onetdns_control::Recorder, onetdns_control::Stats)>>>",
     "audit: Arc<Mutex<Option<onetdns_control::AuditLog>>>",
     "event = \"stats.channel_reused\"",
     "desired_config_json(self.config_path.as_deref(), &self.runtime_cfg.load())",
@@ -32,8 +33,10 @@ const BIN_REQUIRED: &[&str] = &[
     "previous_config_text: ConfigTextSlot",
     "type ConfigTextSlot = Arc<Mutex<Option<onetdns_core::SecretString>>>;",
     "fn restore_last_applied_config(",
-    "let ready_callback = Arc::new(Mutex::new(supervisor::take_ready_callback()?));",
+    "let ready_callback = Arc::new(Mutex::new(joined.ready));",
+    "let session_checkpoint = shared.sessions.checkpoint();",
     "shared.sessions.restore(session_checkpoint);",
+    "restore_last_applied_config(config_path.as_deref(), &shared)",
     "fn validate_config_patch_values(",
     "config_patch_rejects_redacted_or_destructive_secret_placeholders",
     "fn normalize_config_for_comparison(",
@@ -90,12 +93,6 @@ const PERSIST_REQUIRED: &[&str] = &[
     "fn parse_stats_snapshot(",
     "invalid_stats_file_is_not_partially_applied",
     "querylog_accepts_only_the_complete_current_shape",
-];
-
-const SERVICE_REQUIRED: &[&str] = &[
-    "let session_checkpoint = shared.sessions.checkpoint();",
-    "shared.sessions.restore(session_checkpoint);",
-    "restore_last_applied_config(config.as_deref(), &shared)",
 ];
 
 const DASHBOARD_REQUIRED: &[&str] = &[
@@ -172,11 +169,6 @@ fn every_control_plane_safeguard_is_present() {
         "통계 복구",
     );
     require(
-        &read(&repo.join("onetdns-bin/src/service.rs")),
-        SERVICE_REQUIRED,
-        "Windows 서비스 되돌리기",
-    );
-    require(
         &read(&repo.join("crates/onetdns-control/dashboard/index.html")),
         DASHBOARD_REQUIRED,
         "대시보드 상태 동기화",
@@ -201,24 +193,19 @@ fn an_invalid_desired_file_is_reported_rather_than_replaced() {
 }
 
 #[test]
+/// The Windows service runs this loop too, in the worker its supervisor starts.
 fn session_rollback_comes_after_its_checkpoint() {
-    let repo = root();
-    for (subject, name) in [
-        ("main.rs 서비스 루프", "onetdns-bin/src/main.rs"),
-        ("Windows 서비스 루프", "onetdns-bin/src/service.rs"),
-    ] {
-        let source = read(&repo.join(name));
-        let checkpoint = source
-            .find("let session_checkpoint = shared.sessions.checkpoint();")
-            .unwrap_or_else(|| panic!("{subject}: 체크포인트를 찾지 못했습니다"));
-        let restore = source
-            .find("shared.sessions.restore(session_checkpoint);")
-            .unwrap_or_else(|| panic!("{subject}: 되돌리기를 찾지 못했습니다"));
-        assert!(
-            restore > checkpoint,
-            "{subject}: 되돌리기가 체크포인트보다 먼저 나옵니다"
-        );
-    }
+    let source = read(&root().join("onetdns-bin/src/main.rs"));
+    let checkpoint = source
+        .find("let session_checkpoint = shared.sessions.checkpoint();")
+        .expect("서비스 루프: 체크포인트를 찾지 못했습니다");
+    let restore = source
+        .find("shared.sessions.restore(session_checkpoint);")
+        .expect("서비스 루프: 되돌리기를 찾지 못했습니다");
+    assert!(
+        restore > checkpoint,
+        "서비스 루프: 되돌리기가 체크포인트보다 먼저 나옵니다"
+    );
 }
 
 #[test]
