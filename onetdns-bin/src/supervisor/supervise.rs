@@ -398,10 +398,45 @@ fn trial_after_update(version: &str) -> Option<Trial> {
     }
 }
 
-/// Also settles updates: a new version that exits before ready or misses its deadline is reverted,
-/// a child's update exit starts the swapped executable, and a successor that took over is handed to
-/// the supervisor of its own version where the platform can exec one.
-pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
+/// Without a config path, finds or creates the config file and gives the workers that path.
+pub fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
+    let config_path = match config_path {
+        None if !no_web => crate::ensure_auto_config()?,
+        given => given,
+    };
+    supervise(
+        config_path,
+        no_web,
+        crate::install_shutdown_handler(),
+        &mut || {},
+        None,
+    )
+}
+
+/// Run by the Windows service, which creates no config file: without `--config` it runs on
+/// defaults. `starting` is called while the update record is handled and `ready` once a worker is
+/// ready, so the service can report both to the service manager.
+#[cfg(windows)]
+pub fn run_service(
+    config_path: Option<PathBuf>,
+    stop: Arc<AtomicBool>,
+    starting: &mut dyn FnMut(),
+    ready: Box<dyn FnOnce()>,
+) -> BoxResult<()> {
+    supervise(config_path, false, stop, starting, Some(ready))
+}
+
+/// Supervises workers until `stop` is set. Also settles updates: a new version that exits before
+/// ready or misses its deadline is reverted, a child's update exit starts the swapped executable,
+/// and a successor that took over is handed to the supervisor of its own version where the platform
+/// can exec one.
+fn supervise(
+    config_path: Option<PathBuf>,
+    no_web: bool,
+    stop: Arc<AtomicBool>,
+    starting: &mut dyn FnMut(),
+    mut ready: Option<Box<dyn FnOnce()>>,
+) -> BoxResult<()> {
     let mut next = sys::adopted()?.map(|(process, channel)| Worker {
         process,
         channel,
@@ -419,7 +454,7 @@ pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     let mut trial = if next.is_some() {
         None
     } else {
-        match crate::update::trial::on_start(&mut || {}) {
+        match crate::update::trial::on_start(starting) {
             Startup::Normal => None,
             Startup::Trial(trial) => Some(trial),
             Startup::Reverted => {
@@ -428,9 +463,6 @@ pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
             }
         }
     };
-    if config_path.is_none() && !no_web {
-        config_path = crate::ensure_auto_config()?;
-    }
     let program = std::env::current_exe()
         .with_context(|| "Could not find the path of the current executable")?;
     let config = onetdns_config::Config::load_or_default(config_path.as_deref())?;
@@ -442,7 +474,6 @@ pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     drop(config);
     sys::harden()?;
 
-    let stop: Arc<AtomicBool> = crate::install_shutdown_handler();
     let handed_down = sys::handed_down_console();
     let console = if next.is_some() {
         handed_down
@@ -513,6 +544,9 @@ pub fn run(mut config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
                 }
             }
             if child.ready {
+                if let Some(ready) = ready.take() {
+                    ready();
+                }
                 if let Some(trial) = trial.take() {
                     trial.commit();
                 }

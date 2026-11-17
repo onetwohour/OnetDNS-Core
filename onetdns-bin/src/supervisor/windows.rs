@@ -42,6 +42,7 @@ mod win32 {
     pub const STARTF_USESTDHANDLES: u32 = 0x100;
     pub const CREATE_SUSPENDED: u32 = 0x4;
     pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+    pub const CREATE_NO_WINDOW: u32 = 0x800_0000;
     pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x8_0000;
     pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x2_0002;
     pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
@@ -174,6 +175,7 @@ mod win32 {
         ) -> i32;
         pub fn SetHandleInformation(handle: HANDLE, mask: u32, flags: u32) -> i32;
         pub fn GetStdHandle(which: u32) -> isize;
+        pub fn GetConsoleProcessList(processes: *mut u32, count: u32) -> u32;
         pub fn GetFileType(file: HANDLE) -> u32;
         pub fn InitializeProcThreadAttributeList(
             list: *mut c_void,
@@ -368,7 +370,8 @@ pub(super) fn spawn(command: &WorkerCommand) -> BoxResult<(Process, Stream)> {
                 1,
                 win32::CREATE_SUSPENDED
                     | win32::CREATE_UNICODE_ENVIRONMENT
-                    | win32::EXTENDED_STARTUPINFO_PRESENT,
+                    | win32::EXTENDED_STARTUPINFO_PRESENT
+                    | console_flags(),
                 environment.as_ptr().cast(),
                 std::ptr::null(),
                 &raw const startup.StartupInfo,
@@ -409,6 +412,18 @@ pub(super) fn spawn(command: &WorkerCommand) -> BoxResult<(Process, Stream)> {
         Ok((process, channel))
     })();
     started.with_context(|| "Could not create the supervised DNS child process")
+}
+
+/// A supervisor with no console, such as the service, starts workers without a console window;
+/// otherwise Windows opens one for each.
+fn console_flags() -> u32 {
+    let mut process = 0u32;
+    // SAFETY: The buffer holds the one entry it is declared to.
+    if unsafe { win32::GetConsoleProcessList(&raw mut process, 1) } == 0 {
+        win32::CREATE_NO_WINDOW
+    } else {
+        0
+    }
 }
 
 fn inheritable_event() -> io::Result<OwnedHandle> {

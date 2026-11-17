@@ -80,6 +80,8 @@ use windows as sys;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use supervise::run;
+#[cfg(windows)]
+pub use supervise::run_service;
 #[cfg(any(target_os = "linux", windows))]
 pub use worker::{handing_over, join, settle};
 #[cfg(any(target_os = "linux", windows))]

@@ -602,7 +602,8 @@ fn serve_directly(config: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
 fn run(config_path: Option<PathBuf>, no_web: bool) -> BoxResult<()> {
     let _raft_process_cleanup = RaftProcessCleanup;
     let mut config_path = config_path;
-    if config_path.is_none() && !no_web {
+    // A supervisor has already looked for the config file and passed what it found.
+    if config_path.is_none() && !no_web && !update::install::supervised_child() {
         config_path = ensure_auto_config()?;
     }
     let stop = install_shutdown_handler();

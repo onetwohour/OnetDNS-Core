@@ -4384,7 +4384,6 @@ Object.assign(I18N.en, {
   "확인하지 못했습니다":"Check failed",
   "감시 프로세스가 새 버전을 띄웁니다":"The supervisor process starts the new version",
   "프로세스가 새 버전으로 바뀝니다":"The process replaces itself with the new version",
-  "Windows 서비스가 새 버전으로 다시 시작합니다":"The Windows service restarts with the new version",
   "설치한 뒤 직접 다시 시작해야 합니다":"Restart OnetDNS yourself after installing",
   "하루에 한 번 확인합니다":"Checks once a day",
   "꺼져 있습니다. 직접 확인할 수 있습니다":"Off. You can still check manually",
@@ -4427,7 +4426,6 @@ Object.assign(I18N.ja, {
   "확인하지 못했습니다":"確認できませんでした",
   "감시 프로세스가 새 버전을 띄웁니다":"監視プロセスが新しいバージョンを起動します",
   "프로세스가 새 버전으로 바뀝니다":"プロセスが新しいバージョンに置き換わります",
-  "Windows 서비스가 새 버전으로 다시 시작합니다":"Windows サービスが新しいバージョンで再起動します",
   "설치한 뒤 직접 다시 시작해야 합니다":"インストール後に手動で再起動する必要があります",
   "하루에 한 번 확인합니다":"1 日 1 回確認します",
   "꺼져 있습니다. 직접 확인할 수 있습니다":"オフです。手動で確認できます",
@@ -4470,7 +4468,6 @@ Object.assign(I18N.zh, {
   "확인하지 못했습니다":"检查失败",
   "감시 프로세스가 새 버전을 띄웁니다":"由监控进程启动新版本",
   "프로세스가 새 버전으로 바뀝니다":"进程将替换为新版本",
-  "Windows 서비스가 새 버전으로 다시 시작합니다":"Windows 服务将以新版本重启",
   "설치한 뒤 직접 다시 시작해야 합니다":"安装后需要手动重启",
   "하루에 한 번 확인합니다":"每天检查一次",
   "꺼져 있습니다. 직접 확인할 수 있습니다":"已关闭。仍可手动检查",
@@ -5582,7 +5579,7 @@ class Component extends DCLogic {
       :result==='available'?this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion})
       :result==='manual'?this.tr('{version} 버전은 직접 설치해야 합니다',{version:newVersion})+detail
       :this.t('확인하지 못했습니다')+detail;
-    const launchLabel=!participating?'—':{supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),service:this.t('Windows 서비스가 새 버전으로 다시 시작합니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
+    const launchLabel=!participating?'—':{supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
     const rollbackTo=typeof u.rollback==='string'?u.rollback:'';
     const canApply=participating&&result==='available'&&!!newVersion&&!pending;
     const releaseUrl=(result==='available'||result==='manual')&&typeof u.release_url==='string'&&/^https:\/\//.test(u.release_url)?u.release_url:'';

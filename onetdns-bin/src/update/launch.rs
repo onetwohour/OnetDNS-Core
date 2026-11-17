@@ -6,9 +6,8 @@ use std::sync::{Arc, OnceLock};
 #[cfg(unix)]
 use super::install::Install;
 
-/// Exit code that asks for the swapped-in binary. A supervisor parent starts the install path on
-/// it; a Windows service reports it as its service-specific exit code, and the recovery action
-/// restarts the service. Same value as EX_TEMPFAIL.
+/// Exit code that asks for the swapped-in binary; a supervisor parent starts the install path on
+/// it. Same value as EX_TEMPFAIL.
 pub(crate) const UPDATE_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,10 +17,7 @@ pub(crate) enum Launch {
     SupervisedChild,
     /// Unix process without a supervisor; shuts down cleanly, then execs the install path.
     SingleProcess,
-    /// Windows service; reports UPDATE_EXIT_CODE on stop, and the recovery action restarts it.
-    #[cfg(windows)]
-    WindowsService,
-    /// The operator restarts: a Windows console, or a Windows service without a recovery action.
+    /// The operator restarts: a Windows process without a supervisor.
     Manual,
 }
 
@@ -30,8 +26,6 @@ impl Launch {
         match self {
             Launch::SupervisedChild => "supervisor",
             Launch::SingleProcess => "exec",
-            #[cfg(windows)]
-            Launch::WindowsService => "service",
             Launch::Manual => "manual",
         }
     }
@@ -39,8 +33,6 @@ impl Launch {
 
 struct Server {
     stop: Arc<AtomicBool>,
-    #[cfg(windows)]
-    service: bool,
 }
 
 /// Absent in processes that are not servers, such as management commands.
@@ -49,32 +41,10 @@ static SERVER: OnceLock<Server> = OnceLock::new();
 static RESTART: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn register(stop: Arc<AtomicBool>) {
-    let _ = SERVER.set(Server {
-        stop,
-        #[cfg(windows)]
-        service: false,
-    });
+    let _ = SERVER.set(Server { stop });
 }
 
-#[cfg(windows)]
-pub(crate) fn register_service(stop: Arc<AtomicBool>) {
-    let _ = SERVER.set(Server {
-        stop,
-        service: true,
-    });
-}
-
-/// A Windows service comes back only with a restart recovery action. The operator can change that,
-/// so the service manager is asked on every call.
 pub(crate) fn current() -> Launch {
-    #[cfg(windows)]
-    if SERVER.get().is_some_and(|server| server.service) {
-        return if crate::service::restarts_on_failure() {
-            Launch::WindowsService
-        } else {
-            Launch::Manual
-        };
-    }
     if super::install::supervised_child() {
         Launch::SupervisedChild
     } else if cfg!(unix) {
@@ -170,10 +140,6 @@ pub(crate) fn exec_installed(install: &Install) -> std::io::Error {
 /// this asks for a restart and exits.
 pub(crate) fn start_reverted() -> ! {
     crate::tui::leave();
-    #[cfg(windows)]
-    if SERVER.get().is_some_and(|server| server.service) {
-        crate::service::exit_for_update();
-    }
     #[cfg(unix)]
     match super::install::current() {
         Ok(install) => {

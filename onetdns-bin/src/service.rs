@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::error::BoxResult;
-use onetdns_config::Config;
 
 const SERVICE_NAME: &str = "OnetDNS";
 const SERVICE_DISPLAY: &str = "OnetDNS ad-blocking DNS";
@@ -17,8 +16,6 @@ const SERVICE_DISPLAY: &str = "OnetDNS ad-blocking DNS";
 /// The service entry point takes no arguments, so the config path waits here.
 static CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static STOP_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-/// Static because the update trial timer reports a stop too.
-static STATUS: OnceLock<StatusHandle> = OnceLock::new();
 
 /// Milliseconds before each successive restart after a failure.
 const RECOVERY_DELAYS_MS: [u32; 3] = [1_000, 5_000, 30_000];
@@ -38,12 +35,10 @@ mod win32 {
     pub const SERVICE_CHANGE_CONFIG: u32 = 0x0002;
     pub const SERVICE_QUERY_STATUS: u32 = 0x0004;
     pub const SERVICE_STOP: u32 = 0x0020;
-    pub const SERVICE_QUERY_CONFIG: u32 = 0x0001;
     pub const SERVICE_START: u32 = 0x0010;
     pub const SERVICE_CONFIG_FAILURE_ACTIONS: u32 = 2;
     pub const SERVICE_CONFIG_FAILURE_ACTIONS_FLAG: u32 = 4;
     pub const SC_ACTION_RESTART: u32 = 1;
-    pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 
     pub const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0010;
     pub const SERVICE_AUTO_START: u32 = 0x0002;
@@ -133,13 +128,6 @@ mod win32 {
         pub fn ControlService(service: ScHandle, control: u32, status: *mut ServiceStatus) -> i32;
         pub fn DeleteService(service: ScHandle) -> i32;
         pub fn ChangeServiceConfig2W(service: ScHandle, info_level: u32, info: *mut c_void) -> i32;
-        pub fn QueryServiceConfig2W(
-            service: ScHandle,
-            info_level: u32,
-            buffer: *mut u8,
-            buffer_size: u32,
-            bytes_needed: *mut u32,
-        ) -> i32;
         pub fn CloseServiceHandle(handle: ScHandle) -> i32;
         pub fn StartServiceCtrlDispatcherW(table: *const ServiceTableEntryW) -> i32;
         pub fn RegisterServiceCtrlHandlerExW(
@@ -433,7 +421,7 @@ pub fn install(config: Option<PathBuf>) -> BoxResult<String> {
 
     if let Err(error) = set_recovery(&service) {
         return Ok(format!(
-            "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot. Could not set it to restart after a failure ({error}), so restart the service by hand after an update"
+            "Installed service '{SERVICE_NAME}'; it starts automatically from the next boot. Could not set it to restart after a failure: {error}"
         ));
     }
     Ok(format!(
@@ -549,8 +537,8 @@ fn run_elevated(arguments: &[OsString]) -> BoxResult<()> {
     Ok(())
 }
 
-/// A service stopping with the update exit code is a non-crash failure, so recovery has to be
-/// switched on for those too.
+/// A supervisor that gives up stops the service with an error, which is a non-crash failure, so
+/// recovery has to be switched on for those too.
 fn set_recovery(service: &ScHandle) -> io::Result<()> {
     let mut actions = RECOVERY_DELAYS_MS.map(|delay| win32::ScAction {
         Type: win32::SC_ACTION_RESTART,
@@ -580,85 +568,6 @@ fn set_recovery(service: &ScHandle) -> io::Result<()> {
             (&mut flag as *mut win32::ServiceFailureActionsFlag).cast(),
         )
     })
-}
-
-/// Whether a service that stops itself for an update comes back. Asked each time, since an
-/// operator can change the service settings.
-pub(crate) fn restarts_on_failure() -> bool {
-    match recovery_restarts(SERVICE_NAME) {
-        Ok(restarts) => restarts,
-        Err(error) => {
-            onetdns_core::warn!(event = "service.recovery_query_failed", %error, "Could not read the service recovery settings; an update waits for the service to be restarted by hand");
-            false
-        }
-    }
-}
-
-fn recovery_restarts(name: &str) -> io::Result<bool> {
-    let manager = ScHandle::new(unsafe {
-        win32::OpenSCManagerW(ptr::null(), ptr::null(), win32::SC_MANAGER_CONNECT)
-    })?;
-    let name = wide_nul(OsStr::new(name))?;
-    let service = ScHandle::new(unsafe {
-        win32::OpenServiceW(manager.0, name.as_ptr(), win32::SERVICE_QUERY_CONFIG)
-    })?;
-    let failure = query_config(&service, win32::SERVICE_CONFIG_FAILURE_ACTIONS)?;
-    let restarts = failure.len() * 8 >= std::mem::size_of::<win32::ServiceFailureActionsW>() && {
-        let failure = unsafe { &*failure.as_ptr().cast::<win32::ServiceFailureActionsW>() };
-        !failure.lpsaActions.is_null()
-            && unsafe { std::slice::from_raw_parts(failure.lpsaActions, failure.cActions as usize) }
-                .iter()
-                .any(|action| action.Type == win32::SC_ACTION_RESTART)
-    };
-    let flag = query_config(&service, win32::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG)?;
-    let on_non_crash = flag.len() * 8 >= std::mem::size_of::<win32::ServiceFailureActionsFlag>()
-        && unsafe { &*flag.as_ptr().cast::<win32::ServiceFailureActionsFlag>() }
-            .fFailureActionsOnNonCrashFailures
-            != 0;
-    Ok(restarts && on_non_crash)
-}
-
-/// In 8-byte words, so the structs inside stay aligned. Pointers in the result point into it.
-fn query_config(service: &ScHandle, level: u32) -> io::Result<Vec<u64>> {
-    let mut needed = 0u32;
-    if unsafe { win32::QueryServiceConfig2W(service.0, level, ptr::null_mut(), 0, &mut needed) }
-        == 0
-    {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(win32::ERROR_INSUFFICIENT_BUFFER) {
-            return Err(error);
-        }
-    }
-    let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-    let size = u32::try_from(buffer.len() * 8)
-        .map_err(|_| io::Error::other("The service setting is too large to read"))?;
-    bool_result(unsafe {
-        win32::QueryServiceConfig2W(
-            service.0,
-            level,
-            buffer.as_mut_ptr().cast(),
-            size,
-            &mut needed,
-        )
-    })?;
-    Ok(buffer)
-}
-
-/// Called right after reverting an update; recovery starts the reverted executable.
-pub(crate) fn exit_for_update() -> ! {
-    let code = crate::update::launch::UPDATE_EXIT_CODE;
-    if !restarts_on_failure() {
-        onetdns_core::error!(
-            event = "service.restart_needed",
-            "Reverted the update; start the OnetDNS service again to run the previous version"
-        );
-    }
-    if let Some(handle) = STATUS.get() {
-        if let Err(error) = handle.report(win32::SERVICE_STOPPED, 0, Some(code as u32), 0, 0) {
-            onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", %error, "Could not report status to the service manager");
-        }
-    }
-    std::process::exit(code)
 }
 
 pub fn uninstall() -> BoxResult<String> {
@@ -728,90 +637,30 @@ extern "system" fn service_control_handler(
     }
 }
 
-/// The service-specific exit code to report; `None` for a clean stop.
-fn exit_code(result: &BoxResult<()>) -> Option<u32> {
-    let update = crate::update::launch::UPDATE_EXIT_CODE as u32;
-    match result {
-        Err(error) if crate::update::trial::revert_after_error(error) => Some(update),
-        Err(_) => Some(1),
-        Ok(()) if crate::update::launch::restart_requested() => Some(update),
-        Ok(()) => None,
-    }
-}
-
-/// Handles the update record before reading the config, reporting progress while it waits.
+/// The service process is the supervisor, and reports its start and stop to the service manager.
 fn service_run() -> BoxResult<()> {
     let stop = STOP_FLAG
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
         .clone();
     stop.store(false, Ordering::Relaxed);
     let status_handle = StatusHandle::register()?;
-    let _ = STATUS.set(status_handle);
-    crate::update::launch::register_service(stop.clone());
-
     let start_pending = |checkpoint: u32| {
         status_handle.report(win32::SERVICE_START_PENDING, 0, None, checkpoint, 15_000)
     };
     start_pending(1)?;
 
     let mut checkpoint = 1;
-    let startup = crate::update::trial::on_start(&mut || {
-        checkpoint += 1;
-        if let Err(error) = start_pending(checkpoint) {
-            onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "Could not report status to the service manager");
-        }
-    });
-    match startup {
-        crate::update::trial::Startup::Normal => {}
-        crate::update::trial::Startup::Trial(trial) => crate::update::trial::hold(trial),
-        crate::update::trial::Startup::Reverted => crate::update::launch::start_reverted(),
-    }
-
-    let config = CONFIG_PATH.get().cloned().flatten();
-    if let Err(error) = Config::load_or_default(config.as_deref()) {
-        onetdns_core::error!(event = "service.config_load_failed", %error, "Could not read the configuration; not starting the service");
-        let result: BoxResult<()> = Err(error.into());
-        if let Err(report_error) =
-            status_handle.report(win32::SERVICE_STOPPED, 0, exit_code(&result), 0, 0)
-        {
-            onetdns_core::warn!(event = "service.status_report_failed", state = "stopped", error = %report_error, "Could not report status to the service manager");
-        }
-        return result;
-    }
-
-    let shared = crate::ServeShared::default();
-    let mut recovery_error: Option<String> = None;
-    let result = loop {
-        let cfg = match Config::load_or_default(config.as_deref()) {
-            Ok(config) => config,
-            Err(error) => match crate::restore_last_applied_config(config.as_deref(), &shared) {
-                Ok(true) if recovery_error.is_none() => {
-                    onetdns_core::error!(event = "service.config_rolled_back", %error, "Could not read the new configuration; starting with the last configuration that worked");
-                    recovery_error = Some(error.to_string());
-                    continue;
-                }
-                Ok(_) => {
-                    if let Some(first_error) = recovery_error.take() {
-                        break Err(crate::anyhow!(format!(
-                            "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
-                        )));
-                    }
-                    break Err(error.into());
-                }
-                Err(rollback_error) => break Err(rollback_error),
-            },
-        };
-        let cfg_text = config.as_deref().and_then(|path| match Config::read_text(path) {
-            Ok(text) => Some(onetdns_core::SecretString::from(text)),
-            Err(error) => {
-                onetdns_core::warn!(event = "service.config_text_unavailable", path = %path.display(), %error, "Could not read the configuration file text; the dashboard's configuration editor will be empty");
-                None
+    let result = crate::supervisor::run_service(
+        CONFIG_PATH.get().cloned().flatten(),
+        stop,
+        &mut || {
+            checkpoint += 1;
+            if let Err(error) = start_pending(checkpoint) {
+                onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "Could not report status to the service manager");
             }
-        });
-        let ready_handle = status_handle;
-        let on_ready: Box<dyn FnOnce() + Send> = Box::new(move || {
-            crate::update::trial::commit_active();
-            if let Err(error) = ready_handle.report(
+        },
+        Box::new(move || {
+            if let Err(error) = status_handle.report(
                 win32::SERVICE_RUNNING,
                 win32::SERVICE_ACCEPT_STOP,
                 None,
@@ -820,50 +669,16 @@ fn service_run() -> BoxResult<()> {
             ) {
                 onetdns_core::warn!(event = "service.status_report_failed", state = "running", %error, "Could not tell the service manager that the service is running; it may treat startup as failed and stop the service");
             }
-        });
-        let session_checkpoint = shared.sessions.checkpoint();
-        match crate::serve(
-            cfg,
-            cfg_text,
-            config.clone(),
-            shared.clone(),
-            Some(stop.clone()),
-            Some(on_ready),
-        ) {
-            Ok(true) => {
-                recovery_error = None;
-                if let Err(error) = start_pending(1) {
-                    onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", %error, "Could not report status to the service manager");
-                }
-                continue;
-            }
-            Ok(false) => break Ok(()),
-            Err(error) => {
-                shared.sessions.restore(session_checkpoint);
-                match crate::restore_last_applied_config(config.as_deref(), &shared) {
-                    Ok(true) if recovery_error.is_none() => {
-                        onetdns_core::error!(event = "service.config_rolled_back", %error, "Could not start with the new configuration; reverting to the last configuration that worked");
-                        recovery_error = Some(error.to_string());
-                        if let Err(report_error) = start_pending(2) {
-                            onetdns_core::warn!(event = "service.status_report_failed", state = "start_pending", error = %report_error, "Could not report status to the service manager");
-                        }
-                        continue;
-                    }
-                    Ok(_) => {
-                        if let Some(first_error) = recovery_error.take() {
-                            break Err(crate::anyhow!(format!(
-                                "Could not apply the new configuration, and could not recover the service with the last working configuration either: new configuration error={first_error}; recovery configuration error={error}"
-                            )));
-                        }
-                        break Err(error);
-                    }
-                    Err(rollback_error) => break Err(rollback_error),
-                }
-            }
-        }
-    };
-
-    status_handle.report(win32::SERVICE_STOPPED, 0, exit_code(&result), 0, 0)?;
+        }),
+    );
+    // Stopping with an error lets the recovery action start the service again.
+    status_handle.report(
+        win32::SERVICE_STOPPED,
+        0,
+        result.is_err().then_some(1),
+        0,
+        0,
+    )?;
     result
 }
 
@@ -963,16 +778,5 @@ mod tests {
             4 * word
         );
         assert_eq!(std::mem::size_of::<win32::ServiceFailureActionsFlag>(), 4);
-    }
-
-    #[test]
-    // Reads EventLog, present on every Windows, so nothing has to be installed.
-    fn recovery_settings_of_an_installed_service_can_be_read() {
-        recovery_restarts("EventLog").expect("이벤트 로그 서비스의 복구 설정");
-        let missing = recovery_restarts("OnetDNS-no-such-service").unwrap_err();
-        assert_eq!(
-            missing.raw_os_error(),
-            Some(win32::ERROR_SERVICE_DOES_NOT_EXIST)
-        );
     }
 }
