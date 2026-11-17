@@ -4,6 +4,7 @@
 mod term;
 mod view;
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -92,14 +93,13 @@ pub(crate) fn start(
     }
     install_panic_hook();
     onetdns_core::log::set_sink(Some(Box::new(|record| {
-        let mut text = record.event.to_string();
-        for part in [record.message, record.fields] {
-            if !part.is_empty() {
-                text.push_str("  ");
-                text.push_str(part);
-            }
-        }
-        LOG.lock_recover().push(Some(record.level), clock(), text);
+        LOG.lock_recover().push(
+            Some(record.level),
+            clock(),
+            record.event,
+            record.message,
+            record.fields,
+        );
     })));
     CAPTURED.store(true, Ordering::Release);
     DONE.store(false, Ordering::Release);
@@ -196,7 +196,7 @@ pub(crate) fn print_block(lines: &[String]) {
     if CAPTURED.load(Ordering::Acquire) {
         let mut log = LOG.lock_recover();
         for line in lines {
-            log.push(None, clock(), line.clone());
+            log.push(None, clock(), "", line, "");
         }
         return;
     }
@@ -285,7 +285,13 @@ fn install_panic_hook() {
             );
             // The panicking thread may hold the log lock.
             if let Ok(mut log) = LOG.try_lock() {
-                log.push(Some(onetdns_core::log::Level::Error), clock(), text.clone());
+                log.push(
+                    Some(onetdns_core::log::Level::Error),
+                    clock(),
+                    "",
+                    &text,
+                    "",
+                );
             }
             PANICS.lock_recover().push(text);
         }));
@@ -373,7 +379,8 @@ struct Feed {
 #[derive(Default)]
 struct Rate {
     last: Option<(Instant, u64)>,
-    per_second: Option<f64>,
+    /// Oldest first; the last is the current rate.
+    recent: VecDeque<f64>,
 }
 
 impl Rate {
@@ -383,13 +390,17 @@ impl Rate {
             Some((at, before)) => {
                 let elapsed = now.duration_since(at).as_secs_f64();
                 if elapsed >= 1.0 {
-                    self.per_second = Some(total.saturating_sub(before) as f64 / elapsed);
+                    if self.recent.len() == view::RATE_HISTORY {
+                        self.recent.pop_front();
+                    }
+                    self.recent
+                        .push_back(total.saturating_sub(before) as f64 / elapsed);
                     self.last = Some((now, total));
                 }
             }
             None => self.last = Some((now, total)),
         }
-        self.per_second
+        self.recent.back().copied()
     }
 }
 
@@ -404,6 +415,7 @@ impl Feed {
             let snapshot = metrics.snapshot();
             view::Traffic {
                 per_second: self.rate.sample(snapshot.total),
+                recent: self.rate.recent.iter().copied().collect(),
                 total: snapshot.total,
                 blocked: snapshot.blocked,
                 cache_hit_pct: snapshot.cache_hit_pct,
