@@ -393,7 +393,15 @@ impl<S: Read + Write> H2Client<S> {
                     if h.stream_id != 0 || payload.len() < 8 {
                         return Err(H2Error::Protocol);
                     }
-                    return Err(H2Error::Closed);
+                    // RFC 9113: the server answers streams up to the one it names and processed
+                    // none after it. Either way this connection opens no more.
+                    self.next_id = 0;
+                    let last =
+                        u32::from_be_bytes(payload[..4].try_into().map_err(|_| H2Error::Protocol)?)
+                            & 0x7fff_ffff;
+                    if sid > last {
+                        return Err(H2Error::Closed);
+                    }
                 }
                 frame_type::RST_STREAM => {
                     if h.stream_id == 0 || payload.len() != 4 {
@@ -1031,6 +1039,88 @@ mod tests {
         );
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Reads what the server sends from a script and keeps what the client writes.
+    struct Scripted {
+        from_server: std::io::Cursor<Vec<u8>>,
+        to_server: Vec<u8>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.from_server.read(buf)
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.to_server.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted_client(frames: &[ScriptedFrame]) -> H2Client<Scripted> {
+        let mut from_server = Vec::new();
+        send_frame(&mut from_server, frame_type::SETTINGS, 0, 0, &[]).unwrap();
+        for &(kind, frame_flags, stream_id, payload) in frames {
+            send_frame(&mut from_server, kind, frame_flags, stream_id, payload).unwrap();
+        }
+        H2Client::connect(Scripted {
+            from_server: std::io::Cursor::new(from_server),
+            to_server: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn goaway(last_stream: u32) -> Vec<u8> {
+        let mut payload = last_stream.to_be_bytes().to_vec();
+        payload.extend_from_slice(&error_code::NO_ERROR.to_be_bytes());
+        payload
+    }
+
+    #[test]
+    /// RFC 9113: streams up to the one a GOAWAY names are still answered, as a server shutting
+    /// down gracefully first names the highest ID. Streams after it were not processed and can be
+    /// sent again elsewhere. Either way the connection opens no more streams.
+    fn goaway_ends_only_the_streams_after_the_one_it_names() {
+        let head = hpack::encode_response(&[
+            (":status", "200"),
+            ("content-type", "application/dns-message"),
+            ("content-length", "6"),
+        ]);
+        let (announced, named) = (goaway(0x7fff_ffff), goaway(1));
+        let mut client = scripted_client(&[
+            (frame_type::GOAWAY, 0, 0, &announced),
+            (frame_type::HEADERS, flags::END_HEADERS, 1, &head),
+            (frame_type::GOAWAY, 0, 0, &named),
+            (frame_type::DATA, flags::END_STREAM, 1, b"answer"),
+        ]);
+        let answered = client.query("dns.test", "/dns-query", b"query");
+        assert!(
+            matches!(&answered, Ok(body) if body == b"answer"),
+            "GOAWAY 가 처리한다고 한 스트림의 답을 받지 못했습니다: {answered:?}"
+        );
+        let written = client.stream_mut().to_server.len();
+        assert!(matches!(
+            client.query("dns.test", "/dns-query", b"query"),
+            Err(H2Error::Closed)
+        ));
+        assert_eq!(
+            client.stream_mut().to_server.len(),
+            written,
+            "GOAWAY 를 받은 연결에 새 요청을 보냈습니다"
+        );
+
+        let earlier = goaway(0);
+        let mut client = scripted_client(&[(frame_type::GOAWAY, 0, 0, &earlier)]);
+        assert!(matches!(
+            client.query("dns.test", "/dns-query", b"query"),
+            Err(H2Error::Closed)
+        ));
     }
 
     #[test]

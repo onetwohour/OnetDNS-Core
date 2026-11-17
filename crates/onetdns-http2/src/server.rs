@@ -76,6 +76,12 @@ const INITIAL_WINDOW: i64 = 65_535;
 
 /// Exceeding it is FLOW_CONTROL_ERROR.
 const MAX_WINDOW: i64 = 0x7fff_ffff;
+/// The highest stream ID, named by the GOAWAY that announces a shutdown before the last stream is
+/// known.
+const MAX_STREAM_ID: u32 = 0x7fff_ffff;
+/// Sent with that GOAWAY. Its acknowledgement comes after every stream the client opened before it
+/// read the GOAWAY.
+const DRAIN_PING: [u8; 8] = *b"draining";
 
 /// Open streams: those still receiving plus those with a response pending.
 fn concurrent_streams(
@@ -106,10 +112,13 @@ where
 /// Calls `reset_deadline` after each complete request, so idle connections time out while busy ones
 /// stay open.
 ///
-/// Once `draining` is set, the next frame boundary sends GOAWAY naming the last stream taken; later
-/// streams are refused, and the connection closes when the streams it took are answered. A read
-/// that fails while draining, which is how an idle connection ends then, sends GOAWAY first, so
-/// the client knows which requests were not processed and can send them elsewhere.
+/// Once `draining` is set, the next frame boundary starts the graceful shutdown of RFC 9113: a
+/// GOAWAY naming the highest stream ID and a PING. Streams the client opened before it read that
+/// GOAWAY arrive before the PING acknowledgement, and are taken. The acknowledgement brings a second
+/// GOAWAY naming the last stream taken; later streams are refused, and the connection closes when
+/// the streams it took are answered. A read that fails while draining, which is how an idle
+/// connection ends then, sends that second GOAWAY first, so the client knows which requests were
+/// not processed and can send them elsewhere.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
@@ -151,6 +160,8 @@ where
     let mut peer_max_frame = DEFAULT_MAX_FRAME;
     let mut send_stream_windows: HashMap<u32, i64> = HashMap::new();
     let mut pending: HashMap<u32, PendingBody> = HashMap::new();
+    let mut shutdown_announced = false;
+    // The GOAWAY naming the last stream taken.
     let mut goaway_sent = false;
 
     loop {
@@ -162,9 +173,10 @@ where
             peer_max_frame,
         )?;
 
-        if !goaway_sent && draining.load(Ordering::Relaxed) {
-            send_goaway(stream, last_client_stream)?;
-            goaway_sent = true;
+        if !shutdown_announced && draining.load(Ordering::Relaxed) {
+            send_goaway(stream, MAX_STREAM_ID)?;
+            send_frame(stream, frame_type::PING, 0, 0, &DRAIN_PING)?;
+            shutdown_announced = true;
         }
         if goaway_sent && streams.is_empty() && pending.is_empty() && cont_stream.is_none() {
             return Ok(());
@@ -243,6 +255,10 @@ where
             }
             frame_type::PING if (h.stream_id != 0 || payload.len() != 8) => {
                 return Err(H2Error::Protocol);
+            }
+            frame_type::PING if shutdown_announced && !goaway_sent && payload == DRAIN_PING => {
+                send_goaway(stream, last_client_stream)?;
+                goaway_sent = true;
             }
             frame_type::GOAWAY => {
                 if h.stream_id != 0 || payload.len() < 8 {
@@ -1501,18 +1517,46 @@ mod tests {
         frames
     }
 
-    fn goaway_last_stream(frames: &[(frame::FrameHeader, Vec<u8>)]) -> Option<u32> {
-        frames.iter().find_map(|(h, payload)| {
-            (h.frame_type == frame_type::GOAWAY
-                && payload[4..8] == error_code::NO_ERROR.to_be_bytes())
-            .then(|| u32::from_be_bytes(payload[..4].try_into().unwrap()))
-        })
+    /// The last stream each GOAWAY named, in order.
+    fn goaway_last_streams(frames: &[(frame::FrameHeader, Vec<u8>)]) -> Vec<u32> {
+        frames
+            .iter()
+            .filter(|(h, payload)| {
+                h.frame_type == frame_type::GOAWAY
+                    && payload[4..8] == error_code::NO_ERROR.to_be_bytes()
+            })
+            .map(|(_, payload)| u32::from_be_bytes(payload[..4].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Reads up to the server's drain PING, which follows its first GOAWAY.
+    fn frames_until_drain_ping(client: &mut TcpStream) -> Vec<(frame::FrameHeader, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = read_frame(client).expect("the server closed before its drain PING");
+            let done = frame.0.frame_type == frame_type::PING
+                && !frame.0.has_flag(flags::ACK)
+                && frame.1 == DRAIN_PING;
+            frames.push(frame);
+            if done {
+                return frames;
+            }
+        }
+    }
+
+    fn answered_on(frames: &[(frame::FrameHeader, Vec<u8>)], sid: u32) -> Vec<u8> {
+        frames
+            .iter()
+            .filter(|(h, _)| h.frame_type == frame_type::DATA && h.stream_id == sid)
+            .flat_map(|(h, payload)| strip_padding(payload, h.flags).unwrap().to_vec())
+            .collect()
     }
 
     #[test]
-    /// A stream open when draining starts is answered; one started after GOAWAY is refused, so the
-    /// client knows it was not processed. The refused stream's header block continues in a second
-    /// frame, which must not break the connection.
+    /// Streams the client opened before it acknowledged the drain PING are answered, including one
+    /// open when draining starts. One opened after is refused, so the client knows it was not
+    /// processed. The refused stream's header block continues in a second frame, which must not
+    /// break the connection.
     fn draining_announces_goaway_and_finishes_streams_it_took() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1543,14 +1587,34 @@ mod tests {
         )
         .unwrap();
         draining.store(true, Ordering::Release);
+        // Moves the server past a frame boundary, where it sees `draining`.
         send_frame(&mut client, frame_type::PING, 0, 0, &[1; 8]).unwrap();
+        send_frame(
+            &mut client,
+            frame_type::HEADERS,
+            flags::END_HEADERS,
+            5,
+            &doh_post_header_block(),
+        )
+        .unwrap();
+        send_frame(
+            &mut client,
+            frame_type::DATA,
+            flags::END_STREAM,
+            5,
+            b"in flight",
+        )
+        .unwrap();
+        let mut frames = frames_until_drain_ping(&mut client);
+        assert_eq!(goaway_last_streams(&frames), [MAX_STREAM_ID]);
+        send_frame(&mut client, frame_type::PING, flags::ACK, 0, &DRAIN_PING).unwrap();
         let block = doh_post_header_block();
-        send_frame(&mut client, frame_type::HEADERS, 0, 5, &block[..2]).unwrap();
+        send_frame(&mut client, frame_type::HEADERS, 0, 7, &block[..2]).unwrap();
         send_frame(
             &mut client,
             frame_type::CONTINUATION,
             flags::END_HEADERS,
-            5,
+            7,
             &block[2..],
         )
         .unwrap();
@@ -1563,20 +1627,41 @@ mod tests {
         )
         .unwrap();
 
-        let frames = frames_until_close(&mut client);
+        frames.extend(frames_until_close(&mut client));
         assert!(server.join().unwrap().is_ok());
-        assert_eq!(goaway_last_stream(&frames), Some(3));
+        assert_eq!(goaway_last_streams(&frames), [MAX_STREAM_ID, 5]);
         assert!(frames
             .iter()
             .any(|(h, payload)| h.frame_type == frame_type::RST_STREAM
-                && h.stream_id == 5
+                && h.stream_id == 7
                 && *payload == error_code::REFUSED_STREAM.to_be_bytes()));
-        let answered: Vec<u8> = frames
-            .iter()
-            .filter(|(h, _)| h.frame_type == frame_type::DATA && h.stream_id == 3)
-            .flat_map(|(h, payload)| strip_padding(payload, h.flags).unwrap().to_vec())
-            .collect();
-        assert_eq!(answered, b"second");
+        assert_eq!(answered_on(&frames, 5), b"in flight");
+        assert_eq!(answered_on(&frames, 3), b"second");
+    }
+
+    #[test]
+    /// A connection accepted just before the listener stopped gets its first request answered:
+    /// the client sent it before it could read any GOAWAY.
+    fn a_connection_accepted_while_draining_answers_its_first_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh_with_deadline_reset(
+                &mut stream,
+                "/dns-query",
+                |query, _| answer(query.to_vec()),
+                |_| {},
+                &std::sync::atomic::AtomicBool::new(true),
+            )
+        });
+
+        let mut client = h2_connect(addr);
+        assert_eq!(h2_exchange_on(&mut client, 1, b"late"), b"late");
+        send_frame(&mut client, frame_type::PING, flags::ACK, 0, &DRAIN_PING).unwrap();
+        let frames = frames_until_close(&mut client);
+        assert!(server.join().unwrap().is_ok());
+        assert_eq!(goaway_last_streams(&frames).last(), Some(&1));
     }
 
     #[test]
@@ -1605,7 +1690,7 @@ mod tests {
         draining.store(true, std::sync::atomic::Ordering::Release);
         let frames = frames_until_close(&mut client);
         assert!(server.join().unwrap().is_ok());
-        assert_eq!(goaway_last_stream(&frames), Some(1));
+        assert_eq!(goaway_last_streams(&frames).last(), Some(&1));
     }
 
     #[test]
