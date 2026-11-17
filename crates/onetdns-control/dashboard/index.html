@@ -7317,7 +7317,8 @@ class Component extends DCLogic {
     const topRuleRows=(Array.isArray(topData.top)?topData.top:[]).slice(0,20).map(row=>({rule:String(row.rule||''),hits:Number(row.hits)||0,hitsLabel:(Number(row.hits)||0).toLocaleString(this.locale())}));
     // 목록별 출처를 두지 않은 규칙은 inline 하나로 모인다. 그대로 보이면 직접 입력한 규칙만 있는 것처럼 읽힌다.
     const sourceHitsEnabled=sourceData.hits_enabled===true;
-    const sourceRows=(Array.isArray(sourceData.sources)?sourceData.sources:[]).slice(0,30).map(row=>({source:row.source==='inline'?this.t('목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)'):String(row.source||''),rules:Number(row.rules)||0,rulesLabel:(Number(row.rules)||0).toLocaleString(this.locale()),hits:Number(row.hits)||0,hitsText:sourceHitsEnabled?this.tr('{hits} 적중',{hits:(Number(row.hits)||0).toLocaleString(this.locale())}):''}));
+    const sourceAll=Array.isArray(sourceData.sources)?sourceData.sources:[];
+    const sourceRows=sourceAll.slice(0,30).map(row=>({source:row.source==='inline'?this.t('목록별로 나누지 않은 규칙 (직접 입력, 서비스 차단, 로컬 영역)'):String(row.source||''),rules:Number(row.rules)||0,rulesLabel:(Number(row.rules)||0).toLocaleString(this.locale()),hits:Number(row.hits)||0,hitsText:sourceHitsEnabled?this.tr('{hits} 적중',{hits:(Number(row.hits)||0).toLocaleString(this.locale())}):''}));
     const pluginRows=(Array.isArray(s.filterPlugins)?s.filterPlugins:[]).map(row=>({name:String(row.name||''),eval:Number(row.eval)||0,evalLabel:(Number(row.eval)||0).toLocaleString(this.locale()),error:Number(row.error)||0,errorLabel:(Number(row.error)||0).toLocaleString(this.locale()),block:Number(row.block)||0,blockLabel:(Number(row.block)||0).toLocaleString(this.locale()),latency:(Number(row.latency_us)||0).toLocaleString(this.locale())+'µs',healthColor:(Number(row.error)||0)>0?'var(--warn)':'var(--ok)'}));
     const reportTotalN=Number(report.rules_total)||0,reportAppliedN=Number(report.rules_applied)||0,reportSkippedN=Number(report.rules_skipped)||0;
     const filterCoverage=reportTotalN?Math.max(0,Math.min(100,reportAppliedN/reportTotalN*100)):0;
@@ -7332,7 +7333,7 @@ class Component extends DCLogic {
     const accessUnlisted=['allow','deny','drop'].includes(access.unlisted)?access.unlisted:'';
     const accessUnlistedLabel=accessUnlisted==='drop'?this.t('응답하지 않음'):accessUnlisted==='deny'?this.t('거부로 응답 (REFUSED)'):accessUnlisted==='allow'?this.t('허용됨'):'';
     const accessUnlistedColor=accessUnlisted==='drop'?'var(--block)':accessUnlisted==='deny'?'var(--warn)':'var(--ok)';
-    const sourceRulesTotal=sourceRows.reduce((sum,row)=>sum+row.rules,0),sourceHitsTotal=sourceRows.reduce((sum,row)=>sum+row.hits,0);
+    const sourceRulesTotal=sourceAll.reduce((sum,row)=>sum+(Number(row.rules)||0),0),sourceHitsTotal=sourceAll.reduce((sum,row)=>sum+(Number(row.hits)||0),0);
     const sourceTotalsText=sourceHitsEnabled?this.tr('{rules} 규칙 · {hits} 적중',{rules:sourceRulesTotal.toLocaleString(this.locale()),hits:sourceHitsTotal.toLocaleString(this.locale())}):this.tr('{rules} 규칙',{rules:sourceRulesTotal.toLocaleString(this.locale())});
     const pluginEvalTotal=pluginRows.reduce((sum,row)=>sum+row.eval,0),pluginErrorTotal=pluginRows.reduce((sum,row)=>sum+row.error,0),pluginBlockTotal=pluginRows.reduce((sum,row)=>sum+row.block,0);
     const revocation=s.revocation&&typeof s.revocation==='object'?s.revocation:null;
