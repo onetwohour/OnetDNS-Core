@@ -30,7 +30,7 @@ pub(crate) fn native_tls_material(
     self_signed_file: Option<&Path>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     if let Some(host) = &cfg.tls_self_signed_host {
-        onetdns_core::warn!(event = "tls.self_signed_in_use", host = %host, "Serving encrypted DNS with a self-signed certificate; clients will not connect unless they disable certificate verification");
+        onetdns_core::warn!(event = "tls.self_signed_in_use", host = %host, "Serving TLS with a self-signed certificate; clients connect only if they trust it or skip certificate verification");
         return self_signed_material(host, self_signed_file);
     }
     if let (Some(c), Some(k)) = (&cfg.tls_cert, &cfg.tls_key) {
@@ -118,16 +118,7 @@ pub(crate) fn native_tls_config(
     material: &(Vec<Vec<u8>>, Vec<u8>),
     ticket_key: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Arc<onetdns_tls::ServerConfig>, String> {
-    let (certs, key) = (material.0.clone(), material.1.clone());
-    if certs.is_empty() {
-        return Err("The TLS certificate chain is empty".to_string());
-    }
-    let mut sc = onetdns_tls::ServerConfig::from_chain_pkcs8(certs, &key)
-        .ok_or_else(|| {
-            "The TLS certificate and private key do not match, or the format is not supported"
-                .to_string()
-        })?
-        .with_alpn(alpn);
+    let mut sc = server_config(material)?.with_alpn(alpn);
     if let Some(ca_path) = &cfg.tls_client_ca {
         sc = sc.with_client_ca(load_client_ca(ca_path)?);
     }
@@ -140,6 +131,30 @@ pub(crate) fn native_tls_config(
         sc = sc.with_resumption(resumption);
     }
     Ok(Arc::new(sc))
+}
+
+/// For the HTTPS management listener. `tls_client_ca` does not apply: browsers present no client
+/// certificate, and sign-in authenticates the user.
+pub(crate) fn control_tls_config(
+    material: &(Vec<Vec<u8>>, Vec<u8>),
+) -> Result<Arc<onetdns_tls::ServerConfig>, String> {
+    Ok(Arc::new(
+        server_config(material)?
+            .with_alpn(vec![b"http/1.1".to_vec()])
+            .with_resumption(onetdns_tls::conn::ServerResumption::secure_default()),
+    ))
+}
+
+fn server_config(
+    (certs, key): &(Vec<Vec<u8>>, Vec<u8>),
+) -> Result<onetdns_tls::ServerConfig, String> {
+    if certs.is_empty() {
+        return Err("The TLS certificate chain is empty".to_string());
+    }
+    onetdns_tls::ServerConfig::from_chain_pkcs8(certs.clone(), key).ok_or_else(|| {
+        "The TLS certificate and private key do not match, or the format is not supported"
+            .to_string()
+    })
 }
 
 pub(crate) fn load_client_ca(path: &std::path::Path) -> Result<onetdns_tls::TrustStore, String> {

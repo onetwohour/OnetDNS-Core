@@ -721,6 +721,23 @@ impl EdgeServices {
         }
     }
 
+    /// Stops the services whose key starts with `name|` and waits for the thread kept as `name`.
+    /// Returns whether any was registered.
+    pub(crate) fn retire(&self, name: &str) -> bool {
+        let prefix = format!("{name}|");
+        let mut had = false;
+        self.running.lock_recover().retain(|(key, stop)| {
+            let mine = key.starts_with(&prefix);
+            if mine {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                had = true;
+            }
+            !mine
+        });
+        self.join_service(name);
+        had
+    }
+
     /// Joins `thread` when the group retires, after any earlier thread under the same name.
     pub(crate) fn keep(&self, name: &str, thread: std::thread::JoinHandle<()>) {
         self.join_service(name);

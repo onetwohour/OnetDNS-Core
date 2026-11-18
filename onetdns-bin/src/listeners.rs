@@ -13,7 +13,7 @@ use crate::atomic_file::atomic_write_secret;
 use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
-use crate::tls_material::{native_tls_config, native_tls_material};
+use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
     quic_listener, quic_memory, read_bytes_limited, read_text_limited, sleep_or_shutdown,
@@ -99,6 +99,8 @@ pub(crate) struct TlsSlots {
     doh: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
     doq: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
     doh3: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
+    /// The HTTPS management listener.
+    control: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
     /// The file-based material the slots use now, which tells whether contents changed under an
     /// unchanged path. Public values only; the private key stays in the slots, with no copy here.
     live_files: Mutex<LiveTlsFiles>,
@@ -177,13 +179,27 @@ impl TlsSlots {
     ) -> Result<Self, String> {
         let material = native_tls_material(cfg, self_signed_file)?;
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material, tickets)?;
+        let control = control_tls_config(&material)?;
         Ok(TlsSlots {
             dot: Arc::new(onetdns_core::ArcSwap::new(dot)),
             doh: Arc::new(onetdns_core::ArcSwap::new(doh)),
             doq: Arc::new(onetdns_core::ArcSwap::new(doq)),
             doh3: Arc::new(onetdns_core::ArcSwap::new(doh3)),
+            control: Arc::new(onetdns_core::ArcSwap::new(control)),
             live_files: Mutex::new(live_tls_files(cfg, material.0)?),
         })
+    }
+
+    /// What the HTTPS management listener presents. Builds the slots when no encrypted DNS
+    /// listener has; those then start without the session ticket keys a predecessor handed over,
+    /// which only costs DNS clients one full handshake.
+    pub(crate) fn control_certificate(
+        handle: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
+        cfg: &Config,
+        self_signed_file: Option<&std::path::Path>,
+    ) -> Result<onetdns_control::CertificateSource, String> {
+        let slots = Self::get_or_build(handle, cfg, self_signed_file, TicketKeys::default)?;
+        Ok(Arc::new(move || Some(slots.control.load())))
     }
 
     /// Reloads certificates whose contents changed under the same path. Renewal tools overwrite the
@@ -215,10 +231,12 @@ impl TlsSlots {
             return Ok(changed);
         }
         let (dot, doh, doq, doh3) = tls_configs_from(cfg, &material, TicketKeys::default())?;
+        let control = control_tls_config(&material)?;
         self.dot.store(dot);
         self.doh.store(doh);
         self.doq.store(doq);
         self.doh3.store(doh3);
+        self.control.store(control);
         *live = fresh;
         Ok(changed)
     }
@@ -236,17 +254,19 @@ impl TlsSlots {
             doh,
             doq,
             doh3,
+            control: control_tls_config(&material)?,
             files,
         })
     }
 
-    /// All four at once; swapping half would present different certificates per transport.
+    /// All at once; swapping some would present different certificates per transport.
     pub(crate) fn install(&self, prepared: PreparedTls) {
         let mut live = self.live_files.lock_recover();
         self.dot.store(prepared.dot);
         self.doh.store(prepared.doh);
         self.doq.store(prepared.doq);
         self.doh3.store(prepared.doh3);
+        self.control.store(prepared.control);
         *live = prepared.files;
     }
 
@@ -277,6 +297,7 @@ pub(crate) struct PreparedTls {
     doh: Arc<onetdns_tls::ServerConfig>,
     doq: Arc<onetdns_tls::ServerConfig>,
     doh3: Arc<onetdns_tls::ServerConfig>,
+    control: Arc<onetdns_tls::ServerConfig>,
     files: LiveTlsFiles,
 }
 

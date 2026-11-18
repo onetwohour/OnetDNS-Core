@@ -301,7 +301,8 @@ impl HotApplyDeps {
             None
         };
         let rebind = if groups.contains(&ApplyGroup::ControlTokens)
-            && next.control_listen != previous.control_listen
+            && (next.control_listen != previous.control_listen
+                || next.control_listen_https != previous.control_listen_https)
         {
             Some(
                 control_rebind

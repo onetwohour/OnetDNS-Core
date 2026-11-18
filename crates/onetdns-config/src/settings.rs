@@ -605,6 +605,10 @@ pub struct Config {
 
     pub control_listen: Option<SocketAddr>,
 
+    /// Serves the dashboard and API over HTTPS on any address, answering only at
+    /// `control_public_origins`.
+    pub control_listen_https: Option<SocketAddr>,
+
     pub control_token: SecretString,
 
     pub control_admin_tokens: Vec<SecretString>,
@@ -1021,6 +1025,7 @@ impl Default for Config {
             acme_cert_file: None,
             acme_key_file: None,
             control_listen: None,
+            control_listen_https: None,
             control_token: SecretString::default(),
             control_admin_tokens: vec![],
             control_readonly_tokens: vec![],
@@ -2153,6 +2158,9 @@ impl Config {
         if let Some(addr) = self.control_listen {
             tcp_addrs.push((addr, "control_listen"));
         }
+        if let Some(addr) = self.control_listen_https {
+            tcp_addrs.push((addr, "control_listen_https"));
+        }
         for (addr, label) in tcp_addrs.iter().chain(udp_addrs.iter()) {
             if addr.port() == 0 {
                 return Err(ConfigError::Invalid(format!(
@@ -2262,11 +2270,20 @@ impl Config {
         if let Some(addr) = self.control_listen {
             if !addr.ip().is_loopback() {
                 return Err(ConfigError::Invalid(format!(
-                    "The built-in management server has no TLS, so it can listen only on a local address: {addr}"
+                    "control_listen serves plain HTTP, so it can listen only on a local address; use control_listen_https to reach the dashboard from other machines: {addr}"
                 )));
             }
         }
-        validate_control_proxy(&self.control_trusted_proxies, &self.control_public_origins)?;
+        validate_control_proxy(
+            &self.control_trusted_proxies,
+            &self.control_public_origins,
+            self.control_listen_https.is_some(),
+        )?;
+        if self.control_listen_https.is_some() && !self.has_cert_source() {
+            return Err(ConfigError::Invalid(
+                "control_listen_https needs tls_cert and tls_key, or a self-signed certificate from tls_self_signed_host".into(),
+            ));
+        }
 
         if self.tftp_enable
             && !self.tftp_listen.ip().is_loopback()
@@ -2947,6 +2964,11 @@ impl Config {
             self.control_listen
                 .map_or("null".into(), |v| js(&v.to_string())),
         );
+        kv(
+            "control_listen_https",
+            self.control_listen_https
+                .map_or("null".into(), |v| js(&v.to_string())),
+        );
         let admin_n = self.control_admin_tokens.len() + usize::from(!self.control_token.is_empty());
         kv("control_admin_tokens", admin_n.to_string());
         kv(
@@ -3349,6 +3371,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "cluster_raft_secret",
         "cluster_raft_node_key",
         "control_listen",
+        "control_listen_https",
         "control_token",
         "cookies",
         "ddr_name",
@@ -3500,6 +3523,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_named_ip_array::<Ipv4Addr>(root, "local_a", "IPv4")?;
     check_named_ip_array::<Ipv6Addr>(root, "local_aaaa", "IPv6")?;
     check_optional_parse::<SocketAddr>(root, "control_listen", "address:port")?;
+    check_optional_parse::<SocketAddr>(root, "control_listen_https", "address:port")?;
     check_optional_parse::<Ipv4Addr>(root, "block_ipv4", "IPv4 address")?;
     check_optional_parse::<Ipv6Addr>(root, "block_ipv6", "IPv6 address")?;
     check_optional_parse::<IpAddr>(root, "ecs_custom_ip", "IP address")?;
@@ -4782,10 +4806,20 @@ fn check_named_ip_array<T: FromStr>(
 
 /// The two keys go together; either alone does nothing. The control server listens only on
 /// loopback, so the proxy connects from loopback too.
-fn validate_control_proxy(proxies: &[IpNet], origins: &[HttpsOrigin]) -> Result<(), ConfigError> {
-    if proxies.is_empty() != origins.is_empty() {
+/// `https` is whether `control_listen_https` is set; it answers only at a public origin.
+fn validate_control_proxy(
+    proxies: &[IpNet],
+    origins: &[HttpsOrigin],
+    https: bool,
+) -> Result<(), ConfigError> {
+    if origins.is_empty() && (https || !proxies.is_empty()) {
         return Err(ConfigError::Invalid(
-            "Set control_trusted_proxies and control_public_origins together: the reverse proxy's address and the HTTPS address it serves the dashboard on".into(),
+            "Set control_public_origins to the HTTPS address the dashboard is reached at, like https://admin.example.com; control_listen_https and control_trusted_proxies answer only there".into(),
+        ));
+    }
+    if !origins.is_empty() && proxies.is_empty() && !https {
+        return Err(ConfigError::Invalid(
+            "control_public_origins needs control_listen_https, or control_trusted_proxies with the address of the reverse proxy serving the dashboard".into(),
         ));
     }
     for net in proxies {
@@ -5136,6 +5170,7 @@ const KNOWN_KEYS: &[&str] = &[
     "acme_cert_file",
     "acme_key_file",
     "control_listen",
+    "control_listen_https",
     "control_token",
     "control_admin_tokens",
     "control_readonly_tokens",
@@ -5493,6 +5528,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.acme_cert_file = gstr(root, "acme_cert_file");
     c.acme_key_file = gstr(root, "acme_key_file");
     c.control_listen = gopt_parse(root, "control_listen");
+    c.control_listen_https = gopt_parse(root, "control_listen_https");
     c.control_token = gstr(root, "control_token")
         .map(SecretString::from)
         .unwrap_or(d.control_token);
@@ -6362,8 +6398,8 @@ answer = \"target.example\"
     }
 
     #[test]
-    /// The two keys go together, proxies must be local and origins path-less HTTPS. Origins are
-    /// normalized to the form browsers send in Origin.
+    /// Without `control_listen_https` the two keys go together, proxies must be local and origins
+    /// path-less HTTPS. Origins are normalized to the form browsers send in Origin.
     fn dashboard_reverse_proxy_settings_are_validated() {
         let parsed = Config::from_toml_str(
             "control_trusted_proxies = [\"127.0.0.1/32\"]\n\
@@ -6393,6 +6429,32 @@ answer = \"target.example\"
                     .is_err(),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    /// The HTTPS listener may bind any address but needs a certificate and a public origin, the
+    /// only Host it answers.
+    fn the_https_dashboard_listener_needs_a_certificate_and_a_public_origin() {
+        const CERT: &str = "tls_self_signed_host = \"admin.example.com\"\n";
+        const ORIGIN: &str = "control_public_origins = [\"https://admin.example.com:8554\"]\n";
+        const HTTPS: &str = "control_listen_https = \"0.0.0.0:8554\"\n";
+        let valid = |text: String| Config::from_toml_str(&text).and_then(|cfg| cfg.validate());
+
+        let parsed = Config::from_toml_str(&format!("{HTTPS}{ORIGIN}{CERT}")).unwrap();
+        assert_eq!(
+            parsed.control_listen_https,
+            Some("0.0.0.0:8554".parse().unwrap())
+        );
+        assert!(parsed.validate().is_ok(), "{:?}", parsed.validate());
+
+        for text in [
+            format!("{HTTPS}{CERT}"),
+            format!("{HTTPS}{ORIGIN}"),
+            format!("{HTTPS}{ORIGIN}{CERT}control_listen = \"127.0.0.1:8554\"\n"),
+            format!("control_listen_https = \"8554\"\n{ORIGIN}{CERT}"),
+        ] {
+            assert!(valid(text.clone()).is_err(), "{text}");
         }
     }
 

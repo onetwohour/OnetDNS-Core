@@ -499,6 +499,7 @@ static KEYS: &[KeySpec] = &[
     key!(acme_cert_file, Hot(Acme), Node, Lanes::OPEN),
     key!(acme_key_file, Hot(Acme), Node, Lanes::OPEN),
     key!(control_listen, Hot(ControlTokens), Node, Lanes::OPEN),
+    key!(control_listen_https, Hot(ControlTokens), Node, Lanes::OPEN),
     key!(control_token, Hot(ControlTokens), Node, Lanes::OPEN),
     key!(control_admin_tokens, Hot(ControlTokens), Node, Lanes::OPEN,),
     key!(

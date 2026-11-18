@@ -364,6 +364,9 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
     if let Some(c) = cfg.control_listen {
         println!("  Dashboard listening address: {c}");
     }
+    if let Some(c) = cfg.control_listen_https {
+        println!("  Dashboard HTTPS listening address: {c}");
+    }
 
     let mut ext: Vec<String> = Vec::new();
     if cfg.block_response == BlockResponseKind::Custom {
@@ -1067,6 +1070,8 @@ pub struct ServeShared {
     sessions: onetdns_control::SessionStore,
     /// Taken over by the next generation when the bind address is unchanged.
     control_listener: Arc<Mutex<Option<TcpListener>>>,
+    /// The same for `control_listen_https`.
+    control_https_listener: Arc<Mutex<Option<TcpListener>>>,
     /// Dashboard threads that span generations; recreating them per generation would leave nobody
     /// accepting connections while lists load. The old thread stops after the next generation
     /// starts its own.
@@ -1207,87 +1212,185 @@ impl ServeShared {
         })
     }
 
-    /// The returned function carries this generation's tag: a new generation restarts the listener
-    /// even on the same address, since the old thread holds the previous data plane.
-    fn control_restart(&self, state: onetdns_control::AppState) -> SecondaryRestart {
+    /// Opens or closes both management listeners. The returned function carries this generation's
+    /// tag: a new generation restarts each listener even on the same address, since the old thread
+    /// holds the previous data plane.
+    fn control_restart(
+        &self,
+        state: onetdns_control::AppState,
+        tls: Arc<Mutex<Option<Arc<TlsSlots>>>>,
+        self_signed_file: Option<PathBuf>,
+    ) -> SecondaryRestart {
         let jobs = self.control_jobs.clone();
-        let shared_slot = self.control_listener.clone();
+        let http_slot = self.control_listener.clone();
+        let https_slot = self.control_https_listener.clone();
         let generation = CONTROL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Arc::new(move |next: &Config| -> Result<(), String> {
-            let Some(addr) = next.control_listen else {
-                // With the address removed, only stop the listener; there is nothing to restart.
-                let had = !jobs.running.lock_recover().is_empty();
-                jobs.retire_all();
-                *shared_slot.lock_recover() = None;
-                if had {
-                    onetdns_core::info!(
-                        event = "control.stopped",
-                        "control_listen was removed; closed the dashboard and API"
-                    );
+            match next.control_listen {
+                None => close_control_listener(&jobs, &http_slot, ControlListener::Http),
+                Some(addr) => {
+                    let state = state.clone();
+                    open_control_listener(
+                        &jobs,
+                        &http_slot,
+                        ControlListener::Http,
+                        addr,
+                        generation,
+                        move |listener, stop| {
+                            onetdns_control::serve_listener(listener, state, stop)
+                        },
+                    )?;
                 }
-                return Ok(());
-            };
-            let key = format!("{addr}#{generation}");
-            if jobs
-                .running
-                .lock_recover()
-                .iter()
-                .any(|(have, _)| have == &key)
-            {
-                return Ok(());
             }
-            if !addr.ip().is_loopback() {
-                onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "Management API is listening on a non-loopback address; check your firewall and access control");
-            }
-            let listener = match reuse_control_listener(&shared_slot, addr) {
-                Some(listener) => listener,
-                None => TcpListener::bind(addr).map_err(|error| {
-                    format!("Could not open the dashboard listening address: {addr}: {error}")
-                })?,
-            };
-            *shared_slot.lock_recover() = match listener.try_clone() {
-                Ok(clone) => Some(clone),
-                Err(error) => {
-                    onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "Could not hand the management socket over to the next configuration; the port must be reopened on reload");
-                    None
+            match next.control_listen_https {
+                None => close_control_listener(&jobs, &https_slot, ControlListener::Https),
+                Some(addr) => {
+                    let certificate =
+                        TlsSlots::control_certificate(&tls, next, self_signed_file.as_deref())?;
+                    let state = state.clone();
+                    open_control_listener(
+                        &jobs,
+                        &https_slot,
+                        ControlListener::Https,
+                        addr,
+                        generation,
+                        move |listener, stop| {
+                            onetdns_control::serve_https_listener(
+                                listener,
+                                state,
+                                stop,
+                                certificate,
+                            )
+                        },
+                    )?;
                 }
-            };
-            let bound = listener.local_addr().map_err(|error| {
-                format!("Could not read the dashboard listening address: {addr}: {error}")
-            })?;
-            // Start the new listener before stopping the old one, which finishes responses in
-            // flight.
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let state = state.clone();
-            let listener_stop = stop.clone();
-            let thread = std::thread::Builder::new()
-                .name("onetdns-control".into())
-                .spawn(move || {
-                    // Ends once it stops accepting; the connections it took finish on the thread
-                    // it returns.
-                    if let Err(error) =
-                        onetdns_control::serve_listener(listener, state, listener_stop)
-                    {
-                        onetdns_core::error!(event = "control.stopped", %error, "Stopped the dashboard service");
-                    }
-                })
-                .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
-            {
-                let mut running = jobs.running.lock_recover();
-                for (_, old) in running.iter() {
-                    old.store(true, std::sync::atomic::Ordering::Release);
-                }
-                running.clear();
-                running.push((key, stop));
             }
-            // The group waits for this thread when it retires, so a process handing the socket over
-            // has stopped accepting before the successor serves it. This first waits for the
-            // previous listener.
-            jobs.keep("control", thread);
-            onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API");
             Ok(())
         })
     }
+}
+
+/// A management listening address. Both share one job group, so a handoff stops them together;
+/// each has its own keys there, named `control` or `control-https` before a `|`.
+#[derive(Clone, Copy)]
+enum ControlListener {
+    /// `control_listen`: plain HTTP on a loopback address.
+    Http,
+    /// `control_listen_https`.
+    Https,
+}
+
+impl ControlListener {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Http => "control",
+            Self::Https => "control-https",
+        }
+    }
+}
+
+/// With the address removed, only stops the listener; there is nothing to restart.
+fn close_control_listener(
+    jobs: &EdgeServices,
+    slot: &Mutex<Option<TcpListener>>,
+    kind: ControlListener,
+) {
+    let had = jobs.retire(kind.name());
+    *slot.lock_recover() = None;
+    if had {
+        match kind {
+            ControlListener::Http => onetdns_core::info!(
+                event = "control.stopped",
+                "control_listen was removed; closed the dashboard and API"
+            ),
+            ControlListener::Https => onetdns_core::info!(
+                event = "control.stopped",
+                "control_listen_https was removed; closed the HTTPS dashboard and API"
+            ),
+        }
+    }
+}
+
+/// `serve` runs on a new thread and returns once `stop` is set and it no longer accepts.
+fn open_control_listener(
+    jobs: &EdgeServices,
+    slot: &Arc<Mutex<Option<TcpListener>>>,
+    kind: ControlListener,
+    addr: SocketAddr,
+    generation: u64,
+    serve: impl FnOnce(
+            TcpListener,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>
+        + Send
+        + 'static,
+) -> Result<(), String> {
+    let key = format!("{}|{addr}#{generation}", kind.name());
+    if jobs
+        .running
+        .lock_recover()
+        .iter()
+        .any(|(have, _)| have == &key)
+    {
+        return Ok(());
+    }
+    if matches!(kind, ControlListener::Http) && !addr.ip().is_loopback() {
+        onetdns_core::warn!(event = "control.non_loopback_bind", %addr, "Management API is listening on a non-loopback address; check your firewall and access control");
+    }
+    let listener = match reuse_control_listener(slot, addr) {
+        Some(listener) => listener,
+        None => TcpListener::bind(addr).map_err(|error| {
+            format!("Could not open the dashboard listening address: {addr}: {error}")
+        })?,
+    };
+    *slot.lock_recover() = match listener.try_clone() {
+        Ok(clone) => Some(clone),
+        Err(error) => {
+            onetdns_core::warn!(event = "control.listener_share_failed", %addr, %error, "Could not hand the management socket over to the next configuration; the port must be reopened on reload");
+            None
+        }
+    };
+    let bound = listener.local_addr().map_err(|error| {
+        format!("Could not read the dashboard listening address: {addr}: {error}")
+    })?;
+    // Start the new listener before stopping the old one, which finishes responses in flight.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener_stop = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name(format!("onetdns-{}", kind.name()))
+        .spawn(move || {
+            // Ends once it stops accepting; the connections it took finish on the thread it
+            // returns.
+            if let Err(error) = serve(listener, listener_stop) {
+                onetdns_core::error!(event = "control.stopped", %error, "Stopped the dashboard service");
+            }
+        })
+        .map_err(|error| format!("Could not start the dashboard thread: {error}"))?;
+    {
+        let prefix = format!("{}|", kind.name());
+        let mut running = jobs.running.lock_recover();
+        running.retain(|(have, old)| {
+            let same_listener = have.starts_with(&prefix);
+            if same_listener {
+                old.store(true, std::sync::atomic::Ordering::Release);
+            }
+            !same_listener
+        });
+        running.push((key, stop));
+    }
+    // The group waits for this thread when it retires, so a process handing the socket over has
+    // stopped accepting before the successor serves it. This first waits for the previous
+    // listener.
+    jobs.keep(kind.name(), thread);
+    match kind {
+        ControlListener::Http => {
+            onetdns_core::info!(event = "control.started", addr = %bound, "Opened the dashboard and API")
+        }
+        ControlListener::Https => {
+            onetdns_core::info!(event = "control.started", addr = %bound, "Opened the HTTPS dashboard and API")
+        }
+    }
+    Ok(())
 }
 
 const RECURSIVE_UDP_WORKERS_PER_CPU: usize = 5;
@@ -1608,7 +1711,15 @@ pub fn serve(
         issue_setup_code(&setup_auth, config_path.as_deref());
     }
     exclusive
-        .install(&restarts.control, shared.control_restart(state), &cfg)
+        .install(
+            &restarts.control,
+            shared.control_restart(
+                state,
+                tls_slot_handle.clone(),
+                tls_material::self_signed_file(config_path.as_deref()),
+            ),
+            &cfg,
+        )
         .map_err(std::io::Error::other)?;
 
     let restart_raft = raft_restart(
@@ -1692,6 +1803,7 @@ pub fn serve(
         listeners_slot: restarts.listeners.clone(),
         registry: listener_reg.clone(),
         control_listener: shared.control_listener.clone(),
+        control_https_listener: shared.control_https_listener.clone(),
         exclusive,
         recorder,
         stats,
@@ -3412,6 +3524,94 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         generation.join().unwrap().unwrap();
+    }
+
+    #[test]
+    /// Both management listeners serve one generation; the HTTPS one with the encrypted DNS
+    /// certificate, at the public origin only.
+    fn the_management_api_answers_over_http_and_https_together() {
+        use std::io::{Read as _, Write as _};
+
+        let free = || {
+            TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        let (control, https) = (free(), free());
+        let mut cfg = Config::default();
+        cfg.control_listen = Some(control);
+        cfg.control_listen_https = Some(https);
+        cfg.control_public_origins =
+            vec![onetdns_core::HttpsOrigin::parse("https://admin.example.com").unwrap()];
+        cfg.tls_self_signed_host = Some("admin.example.com".to_string());
+        cfg.listen = vec![tcp_udp_test_listeners().2];
+        cfg.workers = 1;
+        let shared = ServeShared::default();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = {
+            let (shared, stop, ready) = (shared.clone(), stop.clone(), ready.clone());
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    None,
+                    None,
+                    shared,
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst)
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            if generation.is_finished() {
+                panic!(
+                    "the generation ended: {:?}",
+                    generation.join().unwrap().err()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the generation did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut plain = std::net::TcpStream::connect(control).unwrap();
+        plain
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(plain, "GET /v1/auth HTTP/1.1\r\nHost: {control}\r\n\r\n").unwrap();
+        let mut response = String::new();
+        plain.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        let mut tcp = std::net::TcpStream::connect(https).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let client = onetdns_tls::ClientConfig {
+            server_name: "admin.example.com".to_string(),
+            verify_name: true,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            alpn: vec![b"http/1.1".to_vec()],
+            ..Default::default()
+        };
+        let conn = onetdns_tls::client_handshake(&mut tcp, &client).expect("TLS 핸드셰이크");
+        let mut tls = onetdns_tls::TlsStream::new(conn, tcp);
+        tls.write_all(b"GET /v1/auth HTTP/1.1\r\nHost: admin.example.com\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        tls.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        generation.join().unwrap().unwrap();
+        shared.control_jobs.retire_all();
     }
 
     #[test]

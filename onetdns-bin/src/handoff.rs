@@ -29,7 +29,7 @@ pub(crate) enum SocketRole {
     Doq,
     Doh3,
     Dnscrypt,
-    /// The dashboard and management API.
+    /// The dashboard and management API, plain or HTTPS; the address tells them apart.
     Control,
 }
 
@@ -390,6 +390,7 @@ pub(crate) struct Handoff {
     /// The listeners the dashboard shows.
     pub(crate) registry: Arc<Mutex<Vec<(&'static str, String, String)>>>,
     pub(crate) control_listener: Arc<Mutex<Option<TcpListener>>>,
+    pub(crate) control_https_listener: Arc<Mutex<Option<TcpListener>>>,
     pub(crate) exclusive: Exclusive,
     pub(crate) recorder: Recorder,
     pub(crate) stats: Stats,
@@ -417,9 +418,14 @@ impl Handoff {
             .and_then(|()| link.recv(step_deadline(), abort));
         match handed {
             Ok(FromPredecessor::Sockets(mut pool)) => {
-                if let Some(addr) = cfg.control_listen {
-                    if let Some(socket) = pool.take_tcp(SocketRole::Control, addr).pop() {
-                        *self.control_listener.lock_recover() = Some(socket);
+                for (addr, slot) in [
+                    (cfg.control_listen, &self.control_listener),
+                    (cfg.control_listen_https, &self.control_https_listener),
+                ] {
+                    if let Some(socket) =
+                        addr.and_then(|addr| pool.take_tcp(SocketRole::Control, addr).pop())
+                    {
+                        *slot.lock_recover() = Some(socket);
                     }
                 }
                 self.listeners.adopt(pool);
@@ -647,12 +653,14 @@ impl Handoff {
     fn export(&self) -> std::io::Result<(SocketPool, SocketPool)> {
         let kept = self.listeners.export()?;
         let mut handed = self.listeners.export()?;
-        if let Some(control) = self.control_listener.lock_recover().as_ref() {
-            handed.put(
-                SocketRole::Control,
-                control.local_addr()?,
-                ListeningSocket::Tcp(control.try_clone()?),
-            );
+        for slot in [&self.control_listener, &self.control_https_listener] {
+            if let Some(control) = slot.lock_recover().as_ref() {
+                handed.put(
+                    SocketRole::Control,
+                    control.local_addr()?,
+                    ListeningSocket::Tcp(control.try_clone()?),
+                );
+            }
         }
         if let Some(slots) = self.tls_slots.lock_recover().as_ref() {
             handed.put_ticket_keys(slots.ticket_keys());
