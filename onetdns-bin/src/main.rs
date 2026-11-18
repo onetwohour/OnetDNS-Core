@@ -232,8 +232,9 @@ fn main() -> BoxResult<()> {
         Command::Block { domain, ctl } => ctl_add("block", &domain, &ctl),
         Command::Allow { domain, ctl } => ctl_add("allow", &domain, &ctl),
         Command::Service { action } => run_service(action),
-        Command::Check { config } => check_config(config),
+        Command::Check { config } => check_config(config.or_else(existing_auto_config)),
         Command::Update { action, config } => {
+            let config = config.or_else(existing_auto_config);
             update::task::run_cli(action, config.as_deref()).map_err(|error| crate::anyhow!(error))
         }
         Command::Top { ctl } => ctl_top(&ctl),
@@ -309,6 +310,9 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
     };
 
     println!("The configuration file is valid.");
+    if let Some(path) = &config {
+        println!("  File: {}", path.display());
+    }
     println!("  Mode: {mode_label}");
     println!("  Query resolution: {backend_label}");
     println!("  Plain DNS listening addresses: {:?}", cfg.listen);
@@ -784,6 +788,11 @@ fn auto_config_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
     base.map(|b| b.join(PRODUCT_NAME).join(CONFIG_FILE_NAME))
+}
+
+/// The config file OnetDNS reads without `--config`, if it exists.
+pub(crate) fn existing_auto_config() -> Option<PathBuf> {
+    auto_config_path().filter(|path| path.is_file())
 }
 
 #[cfg(windows)]

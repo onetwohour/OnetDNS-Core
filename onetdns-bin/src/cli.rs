@@ -111,6 +111,8 @@ Notes:
   query      Asks the configured upstream directly, not the running server.
              It skips access control, filters, and the cache, so the answer can
              differ from what the server would return.
+  --config   Without it, check, update, and the commands that call the running
+             server read the config file OnetDNS uses without --config.
   --no-web   Start only the DNS server, without the default web dashboard (headless).
              A control_listen setting in the config always takes precedence.
   --no-supervisor  Run the server without its supervisor process, which restarts it
@@ -119,8 +121,8 @@ Notes:
   update     Checks GitHub for a newer release signed by the OnetDNS release key.
              apply installs it and rollback reinstalls the version the last
              update replaced. Restart OnetDNS afterwards to start the installed
-             version. Pass the --config the server uses so the new version
-             checks that configuration before it is installed.
+             version. The new version checks the config file before it is
+             installed; pass --config if the server uses another file.
 ";
 
 const VALUE_FLAGS: &[&str] = &[

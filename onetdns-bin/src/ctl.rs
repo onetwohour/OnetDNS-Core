@@ -15,7 +15,7 @@ fn resolve_ctl(ctl: &CtlArgs) -> BoxResult<(String, String)> {
         (Some(path), _) => Some(path.clone()),
         // The token in this machine's config must not go to an address the user typed.
         (None, Some(_)) => None,
-        (None, None) => crate::auto_config_path().filter(|path| path.is_file()),
+        (None, None) => crate::existing_auto_config(),
     };
     let Some(path) = config else {
         let url = ctl

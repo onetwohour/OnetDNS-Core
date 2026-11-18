@@ -263,8 +263,7 @@ fn swap(install: &Install, lock: &UpdateLock, pending: Record) -> Result<Swapped
     })
 }
 
-/// Checks that the new executable runs on this machine and accepts the current config. Without
-/// `config`, it checks the default config, as the server would.
+/// Checks that the new executable runs on this machine and accepts the current config.
 fn preflight(executable: &Path, version: &str, config: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new(executable);
     command.arg("--version");
