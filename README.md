@@ -6,9 +6,14 @@ An ad-blocking DNS server with a web dashboard, in one executable for Linux, Win
 
 <br>
 
-[![Release](https://img.shields.io/github/v/release/onetwohour/OnetDNS-Core?style=flat&label=release&color=gray)](https://github.com/onetwohour/OnetDNS-Core/releases)
-![Platforms](https://img.shields.io/badge/Linux_|_Windows_|_macOS-gray?style=flat)
-[![License](https://img.shields.io/badge/Apache--2.0-gray?style=flat&label=license)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/onetwohour/OnetDNS-Core?style=for-the-badge&label=release&color=2563EB)](https://github.com/onetwohour/OnetDNS-Core/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/onetwohour/OnetDNS-Core/ci.yml?branch=main&style=for-the-badge&label=build)](https://github.com/onetwohour/OnetDNS-Core/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-4C1?style=for-the-badge)](LICENSE)
+
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0wIDBoMTF2MTFIMHpNMTMgMGgxMXYxMUgxM3pNMCAxM2gxMXYxMUgwek0xMyAxM2gxMXYxMUgxM3oiLz48L3N2Zz4%3D)
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-B7410E?style=for-the-badge&logo=rust&logoColor=white)
 
 </div>
 
@@ -25,15 +30,12 @@ Devices look up a name before they connect to it. When your network uses OnetDNS
 - **Authoritative zones**: zone files, or zones stored in etcd, MySQL, PostgreSQL, SQLite, or LMDB, with DNSSEC signing, zone transfers, and dynamic updates.
 - **DHCP**: DHCPv4, DHCPv6, router advertisements, and PXE boot over TFTP. Devices that get a lease can be reached by name.
 - **Clustering**: several servers keep the same settings through Raft.
-- **Updates**: installs signed releases from GitHub when an admin applies them.
-
-The dashboard is in English, Korean, Japanese, and Simplified Chinese.
 
 ## Getting started
 
 ### Download
 
-Get the archive for your system from the [releases page](https://github.com/onetwohour/OnetDNS-Core/releases) and extract it. There are builds for Linux (x86-64, x86, ARM64, ARMv7), Windows (x64, x86), and macOS (Apple silicon, Intel). The Linux builds are statically linked and run on any distribution. The Windows builds need no Visual C++ Redistributable.
+Get the archive for your system from the [releases page](https://github.com/onetwohour/OnetDNS-Core/releases) and extract it. There are builds for Linux (x86-64, x86, ARM64, ARMv7), Windows (x64, x86), and macOS (Apple silicon, Intel).
 
 ### Run
 
@@ -51,8 +53,6 @@ Without `--config`, OnetDNS uses `OnetDNS.toml` in your config folder and create
 The new file holds only an access token, so OnetDNS starts with the defaults: it answers only this machine on `127.0.0.1:53`, forwards lookups to Cloudflare over DNS-over-HTTP/3, and blocks nothing.
 
 On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it needs no administrator rights.
-
-In a terminal, OnetDNS shows a status screen with the dashboard address, listeners, upstreams, and log. Press `q` twice or Ctrl+C to quit.
 
 ### Create the admin account
 
@@ -107,15 +107,9 @@ tls_key  = "/etc/OnetDNS/privkey.pem"
 
 Devices accept only a certificate that is valid for the name they connect to, so you need a domain name that points at this machine and a certificate for it.
 
-To get the certificate through ACME, set these first, without `listen_dot` and `listen_doh`:
+To get one from Let's Encrypt, request it on the Encrypted transport page, then add `listen_dot` and `listen_doh`; they do not start without a certificate. HTTP-01 needs requests to port 80 for `/.well-known/acme-challenge/` forwarded to the dashboard address. DNS-01 needs OnetDNS to be the authoritative server for the domain.
 
-```toml
-acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory"   # Let's Encrypt
-acme_cert_file     = "/etc/OnetDNS/fullchain.pem"
-acme_key_file      = "/etc/OnetDNS/privkey.pem"
-```
-
-Then request the certificate for your domain on the Encrypted transport page. HTTP-01 needs requests to port 80 for `/.well-known/acme-challenge/` forwarded to the dashboard address. DNS-01 needs OnetDNS to be the authoritative server for the domain. OnetDNS does not renew the certificate by itself; request it again before it expires, and the listeners load the new files.
+The certificate goes to the files in `tls_cert` and `tls_key`; without them, it is saved next to the config file and set as `tls_cert` and `tls_key`. OnetDNS renews it when a third of its lifetime is left. `acme_directory_url` selects another ACME CA.
 
 `tls_self_signed_host` makes a self-signed certificate instead. Devices trust it only if you install it on them.
 
@@ -246,6 +240,9 @@ To fix it, best first:
 OnetDNS --cli check --config PATH            # check a config file
 OnetDNS --cli query example.com --type AAAA  # look up a name at the default upstreams
 OnetDNS --cli services                       # names for blocked_services
+OnetDNS --cli stats                          # query counts from the running server
+OnetDNS --cli block example.com              # add a block rule to the running server
+OnetDNS --cli allow example.com              # add an allow rule to the running server
 OnetDNS --cli passwd --name NAME             # print a dashboard account entry for the config file
 OnetDNS --cli cert --host dns.example.com    # write a self-signed certificate
 OnetDNS --help                               # everything else
