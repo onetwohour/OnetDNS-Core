@@ -2,9 +2,7 @@
 
 # OnetDNS
 
-**Block ads and trackers on every device in your home.**
-
-One small program on one machine. Nothing to install on your phones, TVs, or consoles.
+An ad-blocking DNS server with a web dashboard, in one executable for Linux, Windows, and macOS.
 
 <br>
 
@@ -16,224 +14,138 @@ One small program on one machine. Nothing to install on your phones, TVs, or con
 
 <br>
 
-You can't install an ad blocker on a smart TV, and the one in your browser does nothing for the apps on your phone. What they all have in common is that they look up names before they connect. OnetDNS answers those lookups for your whole network and refuses the ones that lead to ads and trackers, so the connection never happens.
+Devices look up a name before they connect to it. When your network uses OnetDNS as its DNS server, OnetDNS answers those lookups and blocks the names on your blocklists. This works for apps, TVs, and consoles as well as browsers, with nothing installed on the devices.
 
-Run it on a PC, a Raspberry Pi, or a small server, point your router at it, and every device on your Wi-Fi is covered.
+## Features
 
-<br>
+- **Filtering**: blocklists in hosts or AdGuard format, RPZ, and your own block and allow rules. A name is also blocked when its CNAME chain passes through a blocked name.
+- **Per-device rules**: blocked services such as TikTok or YouTube, SafeSearch and YouTube Restricted Mode, other upstreams, or no filtering. Devices are matched by IP address or subnet, MAC address, or the client ID of an encrypted connection.
+- **Encrypted DNS**: DNS-over-TLS, DNS-over-HTTPS (HTTP/2 and HTTP/3), DNS-over-QUIC, and DNSCrypt. Certificates come from files, from an ACME CA such as Let's Encrypt, or are self-signed. The dashboard makes DNS stamps and Apple configuration profiles for clients.
+- **Resolution**: forwarding to upstream servers, recursion from the root servers, or a split between the two by domain. DNSSEC validation.
+- **Authoritative zones**: zone files, or zones stored in etcd, MySQL, PostgreSQL, SQLite, or LMDB, with DNSSEC signing, zone transfers, and dynamic updates.
+- **DHCP**: DHCPv4, DHCPv6, router advertisements, and PXE boot over TFTP. Devices that get a lease can be reached by name.
+- **Clustering**: several servers keep the same settings through Raft.
+- **Updates**: installs signed releases from GitHub when an admin applies them.
 
-## What you get
-
-### Blocking that covers everything
-
-Phones, laptops, TVs, consoles, and every app on them. OnetDNS reads the blocklists people already use, both hosts files and AdGuard-style rules, and re-downloads them on a schedule you choose. Trackers that hide behind a site's own domain are caught too.
-
-### A dashboard
-
-See what each device is looking up, what got blocked, and whether your upstream servers are healthy. Filter lists and most settings can be changed there and take effect right away. It comes in English, Korean, Japanese, and Simplified Chinese.
-
-### Different rules for different devices
-
-Give the kids' tablet SafeSearch, YouTube Restricted Mode, and no TikTok, and leave your work laptop unfiltered. Devices are recognized by address or hardware address.
-
-### Private DNS for your phone
-
-Android's Private DNS, iOS profiles, and browsers can all talk to OnetDNS over an encrypted connection (DNS-over-TLS, DNS-over-HTTPS, DNS-over-QUIC, DNSCrypt). It can also encrypt the lookups it sends onward.
-
-### No middleman, if you want
-
-Instead of passing your lookups to Cloudflare or Google, OnetDNS can find the answers itself, starting from the root servers, and check DNSSEC signatures along the way. No single company sees everything your network looks up.
-
-### Names for your own devices
-
-The built-in DHCP server hands out addresses, and every device that gets one is reachable by name. You can also host your own domains on it.
-
-### Two servers, no outage
-
-Run two copies and list both as your DNS servers. Settings stay in sync between them, and if one goes down, the other keeps answering.
-
-<br>
-
-## Compared to AdGuard Home and Pi-hole
-
-All three block ads for your whole network. Where they differ:
-
-| | OnetDNS | AdGuard Home | Pi-hole |
-|---|:---:|:---:|:---:|
-| Single program, no install script | ✓ | ✓ | |
-| Runs on Windows | ✓ | ✓ | |
-| Encrypted DNS for your devices | ✓ | ✓ | |
-| Resolves without a third-party DNS | ✓ | | with Unbound |
-| Hosts your own domains, with DNSSEC signing | ✓ | | |
-| Two servers kept in sync | ✓ | third-party tool | third-party tool |
-| DHCP server | ✓ | ✓ (not on Windows) | ✓ |
-
-AdGuard Home and Pi-hole have years of releases and large communities behind them. OnetDNS is new.
-
-<br>
+The dashboard is in English, Korean, Japanese, and Simplified Chinese.
 
 ## Getting started
 
-**1. Download.** Grab the file for your system from the [releases page](https://github.com/onetwohour/OnetDNS-Core/releases) and extract it. There are builds for Linux (x86_64, i686, aarch64, armv7), Windows (x86_64, i686), and macOS (Apple Silicon, Intel). The Linux builds run on any distribution, and the Windows builds need no extra runtime.
+### Download
 
-**2. Write a config.** Out of the box OnetDNS answers only the machine it runs on, forwards lookups to Cloudflare over encrypted DNS (DNS over HTTP/3), and has no blocklists. Create `OnetDNS.toml` with this machine's LAN address and a list to start with:
+Get the archive for your system from the [releases page](https://github.com/onetwohour/OnetDNS-Core/releases) and extract it. There are builds for Linux (x86-64, x86, ARM64, ARMv7), Windows (x64, x86), and macOS (Apple silicon, Intel). The Linux builds are statically linked and run on any distribution. The Windows builds need no Visual C++ Redistributable.
 
-```toml
-listen = ["192.168.1.10:53"]
-
-blocklist_urls    = ["https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"]
-list_refresh_secs = 86400   # re-download once a day
-```
-
-You can add more lists from the dashboard later.
-
-**3. Start it.**
+### Run
 
 ```sh
-OnetDNS --config OnetDNS.toml
+./OnetDNS
 ```
 
-On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it works without admin rights.
+Without `--config`, OnetDNS uses `OnetDNS.toml` in your config folder and creates it on the first run:
 
-To start it at boot, run `OnetDNS service install --config OnetDNS.toml`. Windows asks for administrator rights; on Linux and macOS, use `sudo`.
+| System | Path |
+|---|---|
+| Windows | `%APPDATA%\OnetDNS\OnetDNS.toml` |
+| Linux, macOS | `$XDG_CONFIG_HOME/OnetDNS/OnetDNS.toml`, or `~/.config/OnetDNS/OnetDNS.toml` |
 
-**4. Open the dashboard** at <http://127.0.0.1:8553> on the same machine and create your admin account. It asks for a setup code: OnetDNS writes one to `setup-code.txt` next to its configuration file, and the page shows the exact path. The code works once.
+The new file holds only an access token, so OnetDNS starts with the defaults: it answers only this machine on `127.0.0.1:53`, forwards lookups to Cloudflare over DNS-over-HTTP/3, and blocks nothing.
 
-**5. Point your devices at it.** In your router's settings, set the DNS server to this machine's address. Every device picks it up the next time it reconnects. To try it on one device first, change the DNS setting on that device only.
+On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. On Windows it needs no administrator rights.
 
-<br>
+In a terminal, OnetDNS shows a status screen with the dashboard address, listeners, upstreams, and log. Press `q` twice or Ctrl+C to quit.
 
-## Common setups
+### Create the admin account
 
-All of these go in the same `OnetDNS.toml`. Before restarting, `OnetDNS --cli check --config OnetDNS.toml` tells you if something is wrong.
+Open <http://127.0.0.1:8553> on the same machine. The page asks for a setup code, which OnetDNS writes to `setup-code.txt` next to the config file; the page shows the path. The first account can only be created on this machine.
 
-### Rules for the kids' devices
+### Serve your network
+
+In the dashboard:
+
+- **Settings**: add this machine's LAN address to the plain DNS listening addresses, for example `192.168.1.10:53`.
+- **Filter lists**: add blocklists and choose how often to download them again.
+
+Then set this machine's address as the DNS server in your router's DHCP settings. Devices switch when they reconnect or renew their lease. To try it on one device first, change the DNS server on that device only.
+
+### Start at boot
+
+```sh
+OnetDNS service install --config PATH
+```
+
+This registers a Windows service, a systemd unit, or a launchd daemon that starts from the next boot. Windows asks for administrator rights. On Linux and macOS, run it with `sudo`.
+
+## Configuration
+
+All settings are in the TOML config file. The dashboard's Settings page lists every key with a description and saves changes to the file, and most changes apply without a restart. When the file is edited by hand, the dashboard shows the changed keys and applies them on request. To check a file first:
+
+```sh
+OnetDNS --cli check --config PATH
+```
+
+### Rules for some devices
 
 ```toml
 [[clients]]
 name = "Kids"
-ids = ["192.168.1.50/32", "192.168.1.51/32"]
+ids = ["192.168.1.50", "192.168.1.51"]
 safe_search = true
-blocked_services = ["tiktok"]
+blocked_services = ["tiktok", "youtube"]
 ```
 
-### Encrypted DNS for phones
+`OnetDNS --cli services` lists the service names.
+
+### Encrypted DNS
 
 ```toml
-listen_dot = ["0.0.0.0:853"]    # Android Private DNS
-listen_doh = ["0.0.0.0:443"]    # browsers, iOS
+listen_dot = ["0.0.0.0:853"]   # Android Private DNS
+listen_doh = ["0.0.0.0:443"]   # browsers, Apple devices
 
 tls_cert = "/etc/OnetDNS/fullchain.pem"
 tls_key  = "/etc/OnetDNS/privkey.pem"
 ```
 
-Phones only connect if the certificate is valid for the name they are given, so use a real certificate for a domain you own, such as one from Let's Encrypt.
+Devices accept only a certificate that is valid for the name they connect to, so you need a domain name that points at this machine and a certificate for it.
 
-### Skip the upstream provider
+To get the certificate through ACME, set these first, without `listen_dot` and `listen_doh`:
+
+```toml
+acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory"   # Let's Encrypt
+acme_cert_file     = "/etc/OnetDNS/fullchain.pem"
+acme_key_file      = "/etc/OnetDNS/privkey.pem"
+```
+
+Then request the certificate for your domain on the Encrypted transport page. HTTP-01 needs requests to port 80 for `/.well-known/acme-challenge/` forwarded to the dashboard address. DNS-01 needs OnetDNS to be the authoritative server for the domain. OnetDNS does not renew the certificate by itself; request it again before it expires, and the listeners load the new files.
+
+`tls_self_signed_host` makes a self-signed certificate instead. Devices trust it only if you install it on them.
+
+### Recursion
 
 ```toml
 backend = "recurse"
 dnssec  = true
 ```
 
-### Hand out addresses
+OnetDNS then asks the root servers and each domain's own servers instead of an upstream provider.
 
-Turn off DHCP on your router first. Two DHCP servers on one network will fight.
+### DHCP
 
-```toml
-dhcp_enable       = true
-dhcp_server_ip    = "192.168.1.10"   # this machine
-dhcp_range_start  = "192.168.1.100"
-dhcp_range_end    = "192.168.1.199"
-dhcp_subnet_mask  = "255.255.255.0"
-dhcp_router       = "192.168.1.1"
-```
-
-A device named `laptop` becomes reachable as `laptop.lan`. Change the suffix with `dhcp_local_domain`.
-
-There are many more settings. The settings page in the dashboard lists every one with a description.
-
-<br>
-
-## Running a resolver on the internet
-
-OnetDNS is meant for your own network. If you do open it to the internet, set `mode = "public"` and a rate limit:
+Turn off DHCP on your router first. Two DHCP servers on one network will conflict.
 
 ```toml
-mode               = "public"
-rate_limit_per_sec = 20
-rate_limit_burst   = 40
+dhcp_enable      = true
+dhcp_server_ip   = "192.168.1.10"   # this machine
+dhcp_range_start = "192.168.1.100"
+dhcp_range_end   = "192.168.1.199"
+dhcp_subnet_mask = "255.255.255.0"
+dhcp_router      = "192.168.1.1"
 ```
 
-An open DNS server without a rate limit gets used to flood other people's servers. OnetDNS starts without one but warns you every time it does. Keep the dashboard off the internet: if you open it with `control_listen_https`, bind that to your LAN.
+A device named `laptop` can then be reached as `laptop.lan`. `dhcp_local_domain` changes the suffix.
 
-<br>
+## Dashboard from another computer
 
-## FAQ
-
-<details>
-<summary>A site or app stopped working. How do I unblock it?</summary>
-<br>
-
-Find the blocked name in the dashboard's live query view and add it under block and allow rules, or from the command line:
-
-```sh
-OnetDNS --cli allow example.com
-```
-
-</details>
-
-<details>
-<summary>OnetDNS says port 53 is already in use.</summary>
-<br>
-
-Something else is already a DNS server on that machine. On Windows it is often Internet Connection Sharing or the DNS Server role; on Linux, `systemd-resolved` or `dnsmasq`. `netstat -ano` (Windows) or `ss -lunp` (Linux) shows which program holds it.
-
-</details>
-
-<details>
-<summary>Some sites fail to load, or lookups are slow.</summary>
-<br>
-
-Some ISPs, routers, and security programs quietly take over every ordinary DNS lookup, whichever server it was meant for, and answer it themselves. Filters that run on your own computer, such as AdGuard for Windows, can do this too, so it can happen even when your router is fine.
-
-To check, run these two commands. Each prints the address of whoever answered. If the two addresses differ, something between you and Google is answering in its place.
-
-```sh
-nslookup -type=txt o-o.myaddr.l.google.com 8.8.8.8
-nslookup -vc -type=txt o-o.myaddr.l.google.com 8.8.8.8
-```
-
-If you forward to plain IP upstreams, your lookups never reach the servers you picked, and some answers arrive slowly.
-
-If you use `backend = "recurse"`, OnetDNS notices the interception at startup, warns about it in its log, and works around it. The workaround does not reach every site: a few, often ones served through large CDNs, keep failing, and the dashboard shows them as failed queries. Once a site has failed, it fails right away for a while instead of making you wait each time.
-
-To fix it, best first:
-
-- Stop the interception. For a filter on your computer, exclude OnetDNS from its DNS filtering or turn that filtering off; OnetDNS already blocks ads. For a router, turn off its DNS redirect or "DNS proxy" option.
-- With `backend = "recurse"`, add a fallback server. OnetDNS uses it only for sites it cannot reach on its own:
-
-  ```toml
-  fallback_upstreams = ["https://1.1.1.1/dns-query#cloudflare-dns.com"]
-  ```
-
-- Or forward instead of recursing, using encrypted upstreams in `upstream_urls`. Nothing on the way can take those over. The default settings already do this.
-
-</details>
-
-<details>
-<summary>Does it replace my router?</summary>
-<br>
-
-No. Your router still connects you to the internet. OnetDNS only takes over name lookups, and addresses too if you turn on its DHCP server.
-
-</details>
-
-<details>
-<summary>Can I open the dashboard from another computer?</summary>
-<br>
-
-Yes, over HTTPS. Give the dashboard an HTTPS address and the name you will type in the browser:
+Give the dashboard an HTTPS address and the URL you will type in the browser:
 
 ```toml
 control_listen_https   = "0.0.0.0:8554"
@@ -242,36 +154,102 @@ control_public_origins = ["https://dns.example.com:8554"]
 
 It uses the same certificate as DoT and DoH, so set `tls_cert` and `tls_key`, or `tls_self_signed_host` for a self-signed one that the browser warns about. It answers only at the addresses in `control_public_origins`.
 
-An SSH tunnel works too, and so does an HTTPS reverse proxy such as Caddy or nginx on the same machine:
+An SSH tunnel also works, and so does an HTTPS reverse proxy such as Caddy or nginx on the same machine:
 
 ```toml
 control_trusted_proxies = ["127.0.0.1/32"]
-control_public_origins = ["https://dns.example.com"]
+control_public_origins  = ["https://dns.example.com"]
 ```
 
-The proxy has to forward to `127.0.0.1:8553`, keep the original `Host` header, and set `X-Forwarded-For`.
+The proxy must forward to `127.0.0.1:8553`, keep the original `Host` header, and set `X-Forwarded-For`.
 
-Either way, create your admin account on the machine itself first; the first-time setup page does not open from another computer.
+The plain HTTP dashboard (`control_listen`) accepts only loopback addresses.
+
+## Updates
+
+OnetDNS checks GitHub for new releases. When one is available, the dashboard shows a banner, and Maintenance → Software updates installs it. From the command line:
+
+```sh
+OnetDNS --cli update                  # check
+OnetDNS --cli update apply            # install the newest release
+OnetDNS --cli update rollback         # reinstall the version the last update replaced
+```
+
+Restart OnetDNS after a command-line update.
+
+A release is installed only if it is signed by the OnetDNS release key. A stable version is offered only stable releases; a pre-release is offered both. Builds from source do not update themselves. `release_check = false` turns off the periodic check.
+
+## Serving the internet
+
+In the default personal mode, OnetDNS answers only loopback and private addresses: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, fc00::/7, and fe80::/10. To answer everyone, set public mode and a per-client rate limit:
+
+```toml
+mode               = "public"
+rate_limit_per_sec = 20
+rate_limit_burst   = 40
+```
+
+A DNS server that answers everyone without a rate limit can be used to flood other people's servers. OnetDNS logs a warning at every start when it is in that state. Keep the dashboard off the internet: if you set `control_listen_https`, bind it to a LAN address.
+
+## Troubleshooting
+
+<details>
+<summary>A site or app stopped working.</summary>
+<br>
+
+Find the blocked lookup in the Query log and allow the domain there, or add an allow rule on the Filter lists page.
 
 </details>
 
 <details>
-<summary>What else can I do from the command line?</summary>
+<summary>Port 53 is already in use.</summary>
 <br>
 
-```sh
-OnetDNS --cli block example.com         # block a name
-OnetDNS --cli allow example.com         # unblock a name
-OnetDNS --cli stats                     # query stats
-OnetDNS --cli top                       # most looked-up names
-OnetDNS --cli reload                    # apply edits to the config file
-OnetDNS --cli passwd --name admin       # add a dashboard account
-OnetDNS --help                          # everything else
-```
+Another DNS server is running on the machine. On Windows it is often Internet Connection Sharing or the DNS Server role; on Linux, `systemd-resolved` or `dnsmasq`. `netstat -ano` (Windows) or `ss -lunp` (Linux) shows which program holds the port.
 
 </details>
 
+<details>
+<summary>Some sites fail to load, or lookups are slow.</summary>
 <br>
+
+Some ISPs, routers, and security programs intercept plain DNS on port 53 and answer it themselves, whichever server it was sent to. Filters on your own computer, such as AdGuard for Windows, do this too.
+
+To check, ask a root server directly. A root server never returns an address for `example.com`; it returns the servers for `com`:
+
+```sh
+nslookup -norecurse example.com 198.41.0.4
+```
+
+If the output lists `gtld-servers.net` servers, the lookup was not intercepted. If it shows an address for `example.com`, something answered in the root server's place. Add `-vc` to check TCP the same way.
+
+With plain IP upstreams, intercepted lookups never reach the servers you chose.
+
+With `backend = "recurse"`, OnetDNS checks for interception at startup, logs a warning, and sends its queries over TCP if TCP is not intercepted. This does not reach every site: some authoritative servers do not answer over TCP, and lookups for those sites fail. After repeated failures, OnetDNS stops asking those servers for a while, so the lookups fail at once instead of timing out.
+
+To fix it, best first:
+
+- Stop the interception. For a filter on your computer, exclude OnetDNS from its DNS filtering or turn that filtering off. For a router, turn off its DNS redirect or DNS proxy option.
+- With `backend = "recurse"`, add a fallback server. OnetDNS uses it only when the authoritative servers do not answer:
+
+  ```toml
+  fallback_upstreams = ["https://1.1.1.1/dns-query#cloudflare-dns.com"]
+  ```
+
+- Forward to encrypted upstreams in `upstream_urls` instead of recursing. The default settings do this.
+
+</details>
+
+## Command line
+
+```sh
+OnetDNS --cli check --config PATH            # check a config file
+OnetDNS --cli query example.com --type AAAA  # look up a name at the default upstreams
+OnetDNS --cli services                       # names for blocked_services
+OnetDNS --cli passwd --name NAME             # print a dashboard account entry for the config file
+OnetDNS --cli cert --host dns.example.com    # write a self-signed certificate
+OnetDNS --help                               # everything else
+```
 
 ## Building from source
 
@@ -281,8 +259,6 @@ Requires Rust 1.88 or newer.
 cargo build --release                         # target/release/OnetDNS
 cargo build --release --no-default-features   # without the dashboard
 ```
-
-<br>
 
 ## License
 
