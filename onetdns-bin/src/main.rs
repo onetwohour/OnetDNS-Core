@@ -902,6 +902,7 @@ fn singletons_restart(
     zones: ZoneState,
     forward_stats: Arc<Mutex<Option<onetdns_forward::ForwardStats>>>,
     stats_path: Option<PathBuf>,
+    acme_renewal: tls_material::AcmeRenewal,
 ) -> SecondaryRestart {
     Arc::new(move |next: &Config| -> Result<(), String> {
         jobs.retire_all();
@@ -925,6 +926,11 @@ fn singletons_restart(
         {
             jobs.keep("dnssec-resign", thread);
         }
+        let thread = acme_renewal
+            .clone()
+            .spawn(stop.clone())
+            .map_err(|error| format!("Could not start the ACME renewal thread: {error}"))?;
+        jobs.keep("acme-renew", thread);
         if let Some(path) = &stats_path {
             let thread = upstream_stats::spawn_flush(
                 path.clone(),
@@ -1593,6 +1599,12 @@ pub fn serve(
                 zones.clone(),
                 forward_stats.clone(),
                 upstream_stats_path(config_path.as_deref()),
+                tls_material::AcmeRenewal {
+                    runtime_cfg: runtime_cfg.clone(),
+                    tls_slots: tls_slot_handle.clone(),
+                    resolver: blocklist_resolver.clone(),
+                    config_path: config_path.clone(),
+                },
             ),
             &cfg,
         )

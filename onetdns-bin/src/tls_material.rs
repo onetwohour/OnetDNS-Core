@@ -437,6 +437,20 @@ impl AcmeRequest {
         Ok(request)
     }
 
+    /// `None` until a certificate was requested.
+    fn renewal(cfg: &Config) -> Option<Self> {
+        if cfg.acme_domains.is_empty() {
+            return None;
+        }
+        Some(Self {
+            directory: cfg.acme_directory_url.clone()?,
+            domains: cfg.acme_domains.clone(),
+            contact: cfg.acme_contact_email.clone(),
+            challenge: cfg.acme_challenge.clone(),
+            account_only: false,
+        })
+    }
+
     pub(crate) fn recorded_in(&self, cfg: &Config) -> bool {
         cfg.acme_directory_url.as_deref() == Some(self.directory.as_str())
             && (self.domains.is_empty() || cfg.acme_domains == self.domains)
@@ -585,6 +599,97 @@ pub(crate) fn acme_issue(
     Ok((res.account_url, true))
 }
 
+const ACME_RENEWAL_CHECK: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Keeps a crash-looping server from asking the CA at every start.
+const ACME_RENEWAL_FIRST_CHECK: Duration = Duration::from_secs(10 * 60);
+
+/// With a third of the lifetime left, as Let's Encrypt advises.
+fn renewal_due(not_before: i64, not_after: i64, now: i64) -> bool {
+    now >= not_after - (not_after - not_before).max(0) / 3
+}
+
+#[derive(Clone)]
+pub(crate) struct AcmeRenewal {
+    pub(crate) runtime_cfg: Arc<onetdns_core::ArcSwap<Config>>,
+    pub(crate) tls_slots: Arc<std::sync::Mutex<Option<Arc<TlsSlots>>>>,
+    pub(crate) resolver: http::HostResolver,
+    pub(crate) config_path: Option<PathBuf>,
+}
+
+impl AcmeRenewal {
+    /// Generations share one schedule.
+    pub(crate) fn spawn(
+        self,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        static NEXT_CHECK: std::sync::Mutex<Option<std::time::Instant>> =
+            std::sync::Mutex::new(None);
+        std::thread::Builder::new()
+            .name("acme-renew".into())
+            .spawn(move || loop {
+                if crate::sleep_or_shutdown(60, &stop) {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                {
+                    let mut next = NEXT_CHECK.lock_recover();
+                    if now < *next.get_or_insert(now + ACME_RENEWAL_FIRST_CHECK) {
+                        continue;
+                    }
+                    *next = Some(now + ACME_RENEWAL_CHECK);
+                }
+                self.renew_if_due(&stop);
+            })
+    }
+
+    fn renew_if_due(&self, stop: &Arc<std::sync::atomic::AtomicBool>) {
+        let cfg = self.runtime_cfg.load();
+        let Some(request) = AcmeRequest::renewal(&cfg) else {
+            return;
+        };
+        let Some(files) = AcmeFiles::of(&cfg, self.config_path.as_deref()) else {
+            return;
+        };
+        // The first certificate is requested by hand.
+        let Ok((certs, _)) = onetdns_transport::load_pem(&files.cert, &files.key) else {
+            return;
+        };
+        let Some(leaf) = certs
+            .first()
+            .and_then(|der| onetdns_tls::X509::parse(der).ok())
+        else {
+            return;
+        };
+        let now = unix_now() as i64;
+        if !renewal_due(leaf.not_before, leaf.not_after, now) {
+            return;
+        }
+        let days_left = (leaf.not_after - now).div_euclid(86_400);
+        let slots = self.tls_slots.lock_recover().clone();
+        match acme_issue(
+            &request,
+            &files,
+            &cfg,
+            self.resolver.clone(),
+            slots,
+            stop.clone(),
+        ) {
+            Ok(_) => onetdns_core::info!(
+                event = "acme.certificate_renewed",
+                domains = %request.domains.join(","),
+                "Renewed the ACME certificate"
+            ),
+            Err(error) => onetdns_core::warn!(
+                event = "acme.renewal_failed",
+                %error,
+                days_left,
+                "Could not renew the ACME certificate"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,5 +790,16 @@ mod tests {
             again.recorded_in(&after),
             "설정에 있는 값으로 다시 발급하지 않습니다"
         );
+        assert!(AcmeRequest::renewal(&before).is_none());
+        assert!(AcmeRequest::renewal(&after).is_some());
+    }
+
+    #[test]
+    fn renewal_starts_with_a_third_of_the_lifetime_left() {
+        let day = 86_400;
+        assert!(!renewal_due(0, 90 * day, 59 * day));
+        assert!(renewal_due(0, 90 * day, 60 * day));
+        assert!(!renewal_due(0, 6 * day, 3 * day));
+        assert!(renewal_due(0, 6 * day, 4 * day));
     }
 }
