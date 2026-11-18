@@ -11,6 +11,8 @@ x25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 chacha20 = "0.9"
 poly1305 = "0.8"
+hkdf.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 
 [lints]

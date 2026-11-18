@@ -1,7 +1,6 @@
 //! DNSCrypt v2: certificates and query encryption. A client fetches the signed certificate over TXT
 //! to learn the resolver key, then seals queries with XChaCha20-Poly1305 under an X25519 shared
-//! key. The signing key is the long-term trust anchor; the resolver key can change because clients
-//! learn it from the certificate.
+//! key. The signing key is the long-term trust anchor, and the resolver key is derived from it.
 
 pub mod server;
 
@@ -86,15 +85,16 @@ impl Provider {
     }
 
     /// Restores a provider from a stored signing seed, so clients keep trusting it across restarts.
-    /// The resolver key is new every time; clients learn it from the certificate.
+    /// The resolver key is derived from the seed: some clients keep using the certificate they
+    /// fetched and never fetch it again when queries go unanswered.
     pub fn with_signing_seed(seed: &[u8; 32], provider_name: &str, valid_secs: u32) -> Self {
-        let mut rsk = [0u8; 32];
-        onetdns_core::fill_random(&mut rsk);
-        let resolver_sk = StaticSecret::from(rsk);
-        rsk.zeroize();
+        let mut rsk = Zeroizing::new([0u8; 32]);
+        hkdf::Hkdf::<sha2::Sha256>::new(None, seed)
+            .expand(b"onetdns dnscrypt resolver key", &mut *rsk)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
         Self::from_keys(
             SigningKey::from_bytes(seed),
-            resolver_sk,
+            StaticSecret::from(*rsk),
             provider_name,
             valid_secs,
         )
@@ -140,7 +140,7 @@ impl Provider {
     }
 
     /// Clients seal their queries to the resolver key in the certificate they hold, so a process
-    /// taking over this provider's addresses must answer with this one. Never store it.
+    /// taking over this provider's addresses must answer with this one.
     pub fn resolver_secret(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.resolver_sk.to_bytes())
     }
@@ -534,6 +534,59 @@ mod tests {
             successor.shared_key(&client_pk).as_slice(),
             client_shared.as_slice()
         );
+    }
+
+    #[test]
+    /// A client that never fetches the certificate again keeps sealing to the resolver key from
+    /// before the restart, and an unknown key gets no answer at all.
+    fn a_restarted_server_answers_clients_holding_the_old_certificate() {
+        let first = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
+        let (resolver_pk, client_magic) =
+            client_parse_cert(&first.cert_bytes(), &first.provider_public_key());
+        let restarted =
+            Provider::with_signing_seed(&first.signing_seed(), "2.dnscrypt-cert.onetdns", 86400);
+
+        let client_sk = StaticSecret::from([9u8; 32]);
+        let shared = box_beforenm(
+            &client_sk
+                .diffie_hellman(&PublicKey::from(resolver_pk))
+                .to_bytes(),
+        );
+        let client_nonce = [5u8; 12];
+        let mut nonce = [0u8; 24];
+        nonce[..12].copy_from_slice(&client_nonce);
+        let query: &[u8] = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&client_magic);
+        packet.extend_from_slice(&PublicKey::from(&client_sk).to_bytes());
+        packet.extend_from_slice(&client_nonce);
+        packet.extend_from_slice(&secretbox_seal(&shared, &nonce, &pad(query, 256)));
+
+        let answer: &[u8] = b"\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        let reply = crate::server::respond(
+            &restarted,
+            &packet,
+            "127.0.0.1:5353".parse().unwrap(),
+            true,
+            &|received: Vec<u8>, _src, _budget| {
+                assert_eq!(received, query);
+                Some(answer.to_vec())
+            },
+            &|_src| true,
+        )
+        .expect("재시작한 서버는 이전 인증서로 봉한 질의에 답해야 합니다");
+        let mut response_nonce = [0u8; 24];
+        response_nonce.copy_from_slice(&reply[8..32]);
+        let plain = secretbox_open(&shared, &response_nonce, &reply[32..]).expect("응답 복호화");
+        assert_eq!(unpad(&plain), answer);
+    }
+
+    #[test]
+    fn each_signing_seed_has_its_own_resolver_key() {
+        let a = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
+        let b = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
+        assert_ne!(a.resolver_pk, b.resolver_pk);
+        assert_ne!(a.client_magic, b.client_magic);
     }
 
     #[test]

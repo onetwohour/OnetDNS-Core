@@ -969,8 +969,10 @@ version = "0.1.3"
 dependencies = [
  "chacha20 0.9.1",
  "ed25519-dalek",
+ "hkdf 0.12.4",
  "onetdns-core",
  "poly1305",
+ "sha2 0.10.9",
  "x25519-dalek",
  "zeroize",
 ]
