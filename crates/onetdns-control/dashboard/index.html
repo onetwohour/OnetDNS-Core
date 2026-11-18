@@ -6476,7 +6476,7 @@ class Component extends DCLogic {
     const fr=new FileReader(); fr.onload=()=>{ this.setState(s=>({forms:{...s.forms,[pem]:String(fr.result||''),[lab]:file.name}})); }; fr.onerror=()=>this.toastMsg('파일을 읽지 못했습니다',true); fr.readAsText(file); };
   uploadCert=()=>{ const f=this.state.forms; if(!f.certPem.trim()||!f.keyPem.trim()) return this.toastMsg('인증서와 개인키 파일을 선택하세요',true);
     this.toastMsg('인증서 적용 중…');
-    this.apiSend('/v1/tls/configure','POST',{certificate_chain:f.certPem,private_key:f.keyPem}).then(r=>this.toastMsg(r.ok?'인증서를 적용하고 암호화 DNS 수신 서비스를 다시 시작했습니다':(this.t('적용 실패: ')+this.errorText(r)),!r.ok)); };
+    this.apiSend('/v1/tls/configure','POST',{certificate_chain:f.certPem,private_key:f.keyPem}).then(r=>{if(r.ok)this.loadTls();this.toastMsg(r.ok?'인증서를 적용하고 암호화 DNS 수신 서비스를 다시 시작했습니다':(this.t('적용 실패: ')+this.errorText(r)),!r.ok);}); };
   requestAcme=()=>{ const f=this.state.forms; const dom=(f.acmeDomain||'').trim(),wildcard=dom.startsWith('*.'); if(!this.validDomain(dom,true)) return this.toastMsg('유효한 도메인을 입력하세요',true);
     if(wildcard&&f.acmeMethod!=='DNS-01')return this.toastMsg('와일드카드 인증서는 DNS-01 방식으로만 발급할 수 있습니다',true);
     const ch=({'HTTP-01':'http01','DNS-01':'dns01'})[f.acmeMethod]||'http01';

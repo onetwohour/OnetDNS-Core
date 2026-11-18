@@ -856,7 +856,7 @@ Certificates for encrypted DNS: status, validation, replacement, revocation chec
 |---|---|---|---|
 | GET | `/v1/tls` | read-only | TLS certificate and private key paths, and encrypted DNS listener status |
 | POST | `/v1/tls/validate` | admin | Validate the configured certificate, private key, chain, and validity period (admin only). Trust path and hostname are not checked |
-| POST | `/v1/tls/configure` | admin | Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners |
+| POST | `/v1/tls/configure` | admin | Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners. PEM bodies go to cert_path and key_path, tls_cert and tls_key, or next to the config file, in that order. Removes tls_self_signed_host |
 | POST | `/v1/tls/revocation-check` | admin | Check OCSP and CRL revocation status of a certificate chain (admin only). Fetches from the URLs in the certificate and verifies signatures |
 | POST | `/v1/acme/issue` | admin | Issue an ACME certificate or register an account (admin only). Answers HTTP-01 and DNS-01 challenges automatically. Missing fields come from the config, with Let's Encrypt as the default directory, and the values used are saved to it. The certificate goes to acme_cert_file, tls_cert, or next to the config file |
 

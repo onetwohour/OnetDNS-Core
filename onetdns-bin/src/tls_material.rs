@@ -341,14 +341,22 @@ pub(crate) fn tls_configure(
             .map_err(|e| format!("PEM certificate and private key validation failed: {e}"))?;
         let chain_len = certs.len();
         require_servable_tls_material(&certs, &key)?;
+        let beside = |name: &str| {
+            path.as_deref()
+                .and_then(Path::parent)
+                .map(|dir| dir.join(name))
+        };
         let cert_p = requested_cert_path
             .map(PathBuf::from)
             .or_else(|| cfg_cert.clone())
-            .ok_or("A cert_path or an existing tls_cert path is needed to save the certificate")?;
+            .or_else(|| beside("tls-cert.pem"));
         let key_p = requested_key_path
             .map(PathBuf::from)
             .or_else(|| cfg_key.clone())
-            .ok_or("A key_path or an existing tls_key path is needed to save the private key")?;
+            .or_else(|| beside("tls-key.pem"));
+        let (Some(cert_p), Some(key_p)) = (cert_p, key_p) else {
+            return Err("There is no configuration file to save the certificate next to".into());
+        };
         let backup = commit_cert_key(&cert_p, cpem.as_bytes(), &key_p, kpem.as_bytes())
             .map_err(|e| format!("Could not save the certificate and private key: {e}"))?;
         (cert_p, key_p, chain_len, Some(backup))
@@ -369,8 +377,7 @@ pub(crate) fn tls_configure(
     let cert_s = cert_path.display().to_string();
     let key_s = key_path.display().to_string();
     let config_result = apply_config_edit(path, prev, reload, |text| {
-        let out = rewrite_config_kv(text, "tls_cert", &toml_quote(&cert_s))?;
-        rewrite_config_kv(&out, "tls_key", &toml_quote(&key_s))
+        serve_tls_files(text, &cert_path, &key_path)
     });
     if let Err(config_err) = config_result {
         if let Some(backup) = &material_backup {
@@ -388,6 +395,13 @@ pub(crate) fn tls_configure(
         onetdns_core::json::escape(&cert_s),
         onetdns_core::json::escape(&key_s)
     ))
+}
+
+/// Sets `tls_cert` and `tls_key` and drops `tls_self_signed_host`, which takes precedence.
+fn serve_tls_files(text: &str, cert: &Path, key: &Path) -> Result<String, String> {
+    let out = rewrite_config_kv(text, "tls_cert", &toml_quote(&cert.display().to_string()))?;
+    let out = rewrite_config_kv(&out, "tls_key", &toml_quote(&key.display().to_string()))?;
+    remove_config_key(&out, "tls_self_signed_host")
 }
 
 /// Let's Encrypt, used when neither the request nor the config names an ACME directory.
@@ -517,19 +531,8 @@ impl AcmeFiles {
         }
     }
 
-    /// Drops `tls_self_signed_host`, which takes precedence over `tls_cert`.
     pub(crate) fn serve(&self, text: &str) -> Result<String, String> {
-        let out = rewrite_config_kv(
-            text,
-            "tls_cert",
-            &toml_quote(&self.cert.display().to_string()),
-        )?;
-        let out = rewrite_config_kv(
-            &out,
-            "tls_key",
-            &toml_quote(&self.key.display().to_string()),
-        )?;
-        remove_config_key(&out, "tls_self_signed_host")
+        serve_tls_files(text, &self.cert, &self.key)
     }
 }
 
@@ -801,5 +804,48 @@ mod tests {
         assert!(renewal_due(0, 90 * day, 60 * day));
         assert!(!renewal_due(0, 6 * day, 3 * day));
         assert!(renewal_due(0, 6 * day, 4 * day));
+    }
+
+    #[test]
+    fn an_uploaded_certificate_without_tls_cert_goes_next_to_the_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-upload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("시험용 디렉터리");
+        let config_path = dir.join("OnetDNS.toml");
+        std::fs::write(&config_path, "tls_self_signed_host = \"dns.example\"\n").unwrap();
+        let (cert, key) = onetdns_transport::generate_self_signed_pem("dns.example").unwrap();
+        let body = format!(
+            "{{\"certificate_chain\":{},\"private_key\":{}}}",
+            onetdns_core::json::escape(&cert),
+            onetdns_core::json::escape(&key)
+        );
+        let reload = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        tls_configure(
+            &body,
+            &None,
+            &None,
+            &Some(config_path.clone()),
+            &ConfigTextSlot::default(),
+            &reload,
+        )
+        .unwrap();
+
+        let after = config(&std::fs::read_to_string(&config_path).unwrap());
+        assert_eq!(after.tls_cert, Some(dir.join("tls-cert.pem")));
+        assert_eq!(after.tls_key, Some(dir.join("tls-key.pem")));
+        assert_eq!(
+            after.tls_self_signed_host, None,
+            "자체 서명 인증서가 앞섭니다"
+        );
+        let saved = std::fs::read_to_string(dir.join("tls-cert.pem")).unwrap();
+        assert_eq!(saved.trim(), cert.trim());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
