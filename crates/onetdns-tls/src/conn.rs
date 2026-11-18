@@ -458,10 +458,20 @@ pub struct TlsConnection {
     /// Sessions received after the handshake and not yet taken.
     new_sessions: Vec<crate::session::TlsSession>,
 
+    consecutive: Consecutive,
+
     /// Set after a fatal alert was sent or received, or a record was only partly written. RFC 8446
     /// allows nothing more on such a connection, and after a partial record the peer cannot parse
     /// anything, so reads, writes and close_notify all fail with this reason.
     failed: Option<TlsError>,
+}
+
+/// Records since the last application data; a peer could otherwise send them without end.
+#[derive(Default)]
+struct Consecutive {
+    ignored_records: usize,
+    post_handshake_messages: usize,
+    answered_key_update: bool,
 }
 
 struct Tls13Traffic {
@@ -651,125 +661,166 @@ impl TlsConnection {
         }
         let result = self.read_application_data(s);
         if let Err(error) = &result {
-            if let Some(description) = error.alert() {
-                self.write.send_fatal_alert(s, description);
-                self.failed = Some(error.clone());
-            } else if matches!(error, TlsError::PeerAlert { .. }) {
-                self.failed = Some(error.clone());
-            }
+            self.note_read_failure(s, error);
         }
         result
     }
 
+    /// `read_app` for one record the caller already read, so reading the socket does not need this
+    /// connection while another thread writes through it. `None` when the record carried no
+    /// application data. `s` only receives alerts and KeyUpdate answers.
+    pub fn open_app_record<S: Write>(
+        &mut self,
+        rec: TlsRecord,
+        s: &mut S,
+    ) -> Result<Option<Vec<u8>>, TlsError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let result = self.open_record(rec, s);
+        if let Err(error) = &result {
+            self.note_read_failure(s, error);
+        }
+        result
+    }
+
+    /// For a received record the caller could not frame: sends the alert `read_app` would and
+    /// returns the error.
+    pub fn fail_read<S: Write>(&mut self, s: &mut S, error: TlsError) -> TlsError {
+        self.note_read_failure(s, &error);
+        error
+    }
+
+    fn note_read_failure<S: Write>(&mut self, s: &mut S, error: &TlsError) {
+        if let Some(description) = error.alert() {
+            self.write.send_fatal_alert(s, description);
+            self.failed = Some(error.clone());
+        } else if matches!(error, TlsError::PeerAlert { .. }) {
+            self.failed = Some(error.clone());
+        }
+    }
+
     fn read_application_data<S: Read + Write>(&mut self, s: &mut S) -> Result<Vec<u8>, TlsError> {
-        let mut ignored_records = 0usize;
-        let mut post_handshake_messages = 0usize;
-        let mut answered_key_update = false;
         loop {
             let rec = read_record(s)?;
-            if rec.content_type == ContentType::ChangeCipherSpec {
-                return Err(TlsError::UnexpectedMessage);
-            }
-            let (ct, pt) = self.read.decrypt(&rec)?;
-            match ct {
-                ContentType::ApplicationData if pt.is_empty() => {
-                    ignored_records += 1;
-                    if ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS
-                        || self.post_handshake.has_pending()
-                    {
-                        return Err(TlsError::UnexpectedMessage);
-                    }
-                }
-                ContentType::ApplicationData => {
-                    if self.post_handshake.has_pending() {
-                        return Err(TlsError::UnexpectedMessage);
-                    }
-                    return Ok(pt);
-                }
-                ContentType::Handshake if pt.is_empty() => return Err(TlsError::UnexpectedMessage),
-                ContentType::Handshake => {
-                    ignored_records += 1;
-                    if ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS || self.version != TLS13 {
-                        return Err(TlsError::UnexpectedMessage);
-                    }
-                    let had_pending = self.post_handshake.has_pending();
-                    self.post_handshake.feed(&pt);
-                    while let Some(msg) = self.post_handshake.next_message()? {
-                        post_handshake_messages += 1;
-                        if post_handshake_messages > MAX_CONSECUTIVE_IGNORED_RECORDS {
-                            return Err(TlsError::UnexpectedMessage);
-                        }
-                        match msg.msg_type {
-                            HandshakeType::NewSessionTicket if self.is_client => {
-                                let ticket = crate::msg::NewSessionTicket::parse(&msg.body)?;
-                                if ticket.lifetime_secs > 0 {
-                                    let Some(resumption) = &self.resumption else {
-                                        continue;
-                                    };
-                                    let max_early_data = ticket.max_early_data();
-                                    let psk = crate::keyschedule::resumption_psk(
-                                        resumption.hash,
-                                        &resumption.master,
-                                        &ticket.nonce,
-                                    );
-                                    self.new_sessions.push(crate::session::TlsSession {
-                                        server_name: resumption.server_name.clone(),
-                                        suite: resumption.suite,
-                                        psk,
-                                        ticket: ticket.ticket,
-                                        lifetime_secs: ticket
-                                            .lifetime_secs
-                                            .min(crate::session::MAX_TICKET_LIFETIME_SECS),
-                                        age_add: ticket.age_add,
-                                        max_early_data,
-                                        alpn: self.alpn.clone(),
-                                        server_transport_params: Vec::new(),
-                                        obtained_at_ms: crate::session::now_ms(),
-                                    });
-                                }
-                            }
-                            HandshakeType::KeyUpdate => {
-                                if msg.body.len() != 1 {
-                                    return Err(TlsError::Decode);
-                                }
-                                if msg.body[0] > 1 {
-                                    return Err(TlsError::IllegalParameter);
-                                }
-                                if had_pending || pt.len() != 5 {
-                                    return Err(TlsError::UnexpectedMessage);
-                                }
-                                self.update_read_key()?;
-                                if msg.body[0] == 1
-                                    && !answered_key_update
-                                    && self.can_update_write_key()
-                                {
-                                    self.send_key_update(s, false)?;
-                                    answered_key_update = true;
-                                }
-                            }
-                            _ => return Err(TlsError::UnexpectedMessage),
-                        }
-                    }
-                }
-                ContentType::Alert => {
-                    let error = if self.version == TLS13 {
-                        tls13_alert_error(&pt)
-                    } else {
-                        alert_error(&pt)
-                    };
-                    if let Some(error) = error {
-                        return Err(error);
-                    }
-                    ignored_records += 1;
-                    if ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS
-                        || self.post_handshake.has_pending()
-                    {
-                        return Err(TlsError::UnexpectedMessage);
-                    }
-                }
-                _ => return Err(TlsError::UnexpectedMessage),
+            if let Some(data) = self.open_record(rec, s)? {
+                return Ok(data);
             }
         }
+    }
+
+    /// `None` when the record carried no application data.
+    fn open_record<S: Write>(
+        &mut self,
+        rec: TlsRecord,
+        s: &mut S,
+    ) -> Result<Option<Vec<u8>>, TlsError> {
+        if rec.content_type == ContentType::ChangeCipherSpec {
+            return Err(TlsError::UnexpectedMessage);
+        }
+        let (ct, pt) = self.read.decrypt(&rec)?;
+        match ct {
+            ContentType::ApplicationData if pt.is_empty() => {
+                self.consecutive.ignored_records += 1;
+                if self.consecutive.ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS
+                    || self.post_handshake.has_pending()
+                {
+                    return Err(TlsError::UnexpectedMessage);
+                }
+            }
+            ContentType::ApplicationData => {
+                if self.post_handshake.has_pending() {
+                    return Err(TlsError::UnexpectedMessage);
+                }
+                self.consecutive = Consecutive::default();
+                return Ok(Some(pt));
+            }
+            ContentType::Handshake if pt.is_empty() => return Err(TlsError::UnexpectedMessage),
+            ContentType::Handshake => {
+                self.consecutive.ignored_records += 1;
+                if self.consecutive.ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS
+                    || self.version != TLS13
+                {
+                    return Err(TlsError::UnexpectedMessage);
+                }
+                let had_pending = self.post_handshake.has_pending();
+                self.post_handshake.feed(&pt);
+                while let Some(msg) = self.post_handshake.next_message()? {
+                    self.consecutive.post_handshake_messages += 1;
+                    if self.consecutive.post_handshake_messages > MAX_CONSECUTIVE_IGNORED_RECORDS {
+                        return Err(TlsError::UnexpectedMessage);
+                    }
+                    match msg.msg_type {
+                        HandshakeType::NewSessionTicket if self.is_client => {
+                            let ticket = crate::msg::NewSessionTicket::parse(&msg.body)?;
+                            if ticket.lifetime_secs > 0 {
+                                let Some(resumption) = &self.resumption else {
+                                    continue;
+                                };
+                                let max_early_data = ticket.max_early_data();
+                                let psk = crate::keyschedule::resumption_psk(
+                                    resumption.hash,
+                                    &resumption.master,
+                                    &ticket.nonce,
+                                );
+                                self.new_sessions.push(crate::session::TlsSession {
+                                    server_name: resumption.server_name.clone(),
+                                    suite: resumption.suite,
+                                    psk,
+                                    ticket: ticket.ticket,
+                                    lifetime_secs: ticket
+                                        .lifetime_secs
+                                        .min(crate::session::MAX_TICKET_LIFETIME_SECS),
+                                    age_add: ticket.age_add,
+                                    max_early_data,
+                                    alpn: self.alpn.clone(),
+                                    server_transport_params: Vec::new(),
+                                    obtained_at_ms: crate::session::now_ms(),
+                                });
+                            }
+                        }
+                        HandshakeType::KeyUpdate => {
+                            if msg.body.len() != 1 {
+                                return Err(TlsError::Decode);
+                            }
+                            if msg.body[0] > 1 {
+                                return Err(TlsError::IllegalParameter);
+                            }
+                            if had_pending || pt.len() != 5 {
+                                return Err(TlsError::UnexpectedMessage);
+                            }
+                            self.update_read_key()?;
+                            if msg.body[0] == 1
+                                && !self.consecutive.answered_key_update
+                                && self.can_update_write_key()
+                            {
+                                self.send_key_update(s, false)?;
+                                self.consecutive.answered_key_update = true;
+                            }
+                        }
+                        _ => return Err(TlsError::UnexpectedMessage),
+                    }
+                }
+            }
+            ContentType::Alert => {
+                let error = if self.version == TLS13 {
+                    tls13_alert_error(&pt)
+                } else {
+                    alert_error(&pt)
+                };
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                self.consecutive.ignored_records += 1;
+                if self.consecutive.ignored_records > MAX_CONSECUTIVE_IGNORED_RECORDS
+                    || self.post_handshake.has_pending()
+                {
+                    return Err(TlsError::UnexpectedMessage);
+                }
+            }
+            _ => return Err(TlsError::UnexpectedMessage),
+        }
+        Ok(None)
     }
 }
 
@@ -1713,6 +1764,7 @@ fn run_server_handshake<S: Read + Write>(
         resumption: None,
         new_sessions: Vec::new(),
         failed: None,
+        consecutive: Consecutive::default(),
     })
 }
 
@@ -2009,6 +2061,7 @@ fn run_client_handshake<S: Read + Write>(
             }),
             new_sessions: Vec::new(),
             failed: None,
+            consecutive: Consecutive::default(),
         });
     }
 
@@ -2143,6 +2196,7 @@ fn run_client_handshake<S: Read + Write>(
         }),
         new_sessions: Vec::new(),
         failed: None,
+        consecutive: Consecutive::default(),
     })
 }
 
@@ -2275,6 +2329,7 @@ fn server_handshake_tls12<S: Read + Write>(
         resumption: None,
         new_sessions: Vec::new(),
         failed: None,
+        consecutive: Consecutive::default(),
     })
 }
 
@@ -2446,6 +2501,7 @@ fn client_handshake_tls12<S: Read + Write>(
         resumption: None,
         new_sessions: Vec::new(),
         failed: None,
+        consecutive: Consecutive::default(),
     })
 }
 
@@ -2519,6 +2575,7 @@ mod tests {
             resumption: None,
             new_sessions: Vec::new(),
             failed: None,
+            consecutive: Consecutive::default(),
         }
     }
 
@@ -3364,6 +3421,7 @@ mod tests {
             resumption: None,
             new_sessions: Vec::new(),
             failed: None,
+            consecutive: Consecutive::default(),
         };
         let plaintext = vec![0x5a; MAX_FRAGMENT * 2 + 17];
         let mut wire = Vec::new();
