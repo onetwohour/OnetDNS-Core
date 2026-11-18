@@ -2357,6 +2357,17 @@ enum Route {
     Https,
 }
 
+impl Route {
+    /// The name `/v1/auth` reports, which tells the dashboard which listener serves it.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Proxied { .. } => "proxy",
+            Self::Https => "https",
+        }
+    }
+}
+
 impl Caller {
     fn direct(peer: Option<SocketAddr>) -> Self {
         Self {
@@ -3803,12 +3814,13 @@ fn auth_status_body(
         st.auth.setup_code_file()
     };
     format!(
-        "{{\"login_enabled\":{},\"authenticated\":{},\"role\":{},\"user\":{},\"setup_code_file\":{}}}",
+        "{{\"login_enabled\":{},\"authenticated\":{},\"role\":{},\"user\":{},\"setup_code_file\":{},\"route\":\"{}\"}}",
         st.auth.has_users(),
         authenticated,
         json::escape(role),
         json::escape(user),
-        setup_code_file.map_or_else(|| "null".to_string(), |file| json::escape(&file))
+        setup_code_file.map_or_else(|| "null".to_string(), |file| json::escape(&file)),
+        caller.route.name()
     )
 }
 
@@ -5479,7 +5491,7 @@ fn openapi_json() -> String {
   "paths": {
     "/healthz": { "get": { "tags": ["Service"], "summary": "Process liveness check", "security": [], "responses": { "200": { "description": "ok" } } } },
     "/openapi.json": { "get": { "tags": ["Service"], "summary": "This OpenAPI spec", "security": [], "responses": { "200": { "description": "OpenAPI 3.1 document" } } } },
-    "/v1/auth": { "get": { "tags": ["Authentication"], "summary": "Current authentication state and role", "description": "The control token is for the API only and is never turned into a session cookie. Web console sessions are issued only by /v1/login.", "security": [], "responses": { "200": { "description": "{login_enabled,authenticated,role,user}" } } } },
+    "/v1/auth": { "get": { "tags": ["Authentication"], "summary": "Current authentication state and role", "description": "The control token is for the API only and is never turned into a session cookie. Web console sessions are issued only by /v1/login.", "security": [], "responses": { "200": { "description": "{login_enabled,authenticated,role,user,setup_code_file,route}" } } } },
     "/v1/setup": { "post": { "tags": ["Authentication"], "summary": "Create the first admin account", "description": "Available only while no account exists. Returns 409 once any account exists.", "security": [], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "user": { "type": "string" }, "password": { "type": "string", "minLength": 12 }, "code": { "type": "string" } }, "required": ["user", "password", "code"] } } } }, "responses": { "200": { "description": "Session cookie and {ok,user,role}" }, "400": { "description": "Username or password does not meet the rules" }, "409": { "description": "An account already exists" } } } },
     "/v1/login": { "post": { "tags": ["Authentication"], "summary": "Sign in with username and password", "security": [], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "user": { "type": "string" }, "password": { "type": "string" } }, "required": ["user", "password"] } } } }, "responses": { "200": { "description": "Session cookie and {authenticated,role,user}" }, "401": { "description": "Credentials do not match" } } } },
     "/v1/logout": { "post": { "tags": ["Authentication"], "summary": "End the current sign-in session", "security": [], "responses": { "200": { "description": "{ok:true}" } } } },
@@ -5984,6 +5996,7 @@ mod tests {
             "GET /v1/auth HTTP/1.1\r\nHost: admin.example.com\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"route\":\"https\""), "{response}");
 
         let response = https_exchange(
             addr,
@@ -7488,6 +7501,25 @@ mod tests {
             st.auth.role_for_session("adm").is_none(),
             "토큰 값 자체가 세션으로 통해서는 안 됩니다"
         );
+    }
+
+    #[test]
+    /// The dashboard reads `route` to tell which listener address it is on.
+    fn auth_status_names_the_route_a_request_took() {
+        let st = test_state("adm", "ro");
+        for (route, name) in [
+            (Route::Local, "local"),
+            (Route::Proxied { client: None }, "proxy"),
+            (Route::Https, "https"),
+        ] {
+            let caller = Caller {
+                peer: None,
+                route,
+                filter_apply: FilterApply::Wait,
+            };
+            let body = auth_status_body(&st, &caller, false, "none", "");
+            assert!(body.contains(&format!("\"route\":\"{name}\"")), "{body}");
+        }
     }
 
     #[test]

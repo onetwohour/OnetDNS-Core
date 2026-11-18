@@ -121,9 +121,11 @@ Sign-in sessions, the first admin account, passwords, and API tokens.
 
 The control token is for the API only and is never turned into a session cookie. Web console sessions are issued only by /v1/login.
 
+`route` tells how the request reached the server: `local` on the plain HTTP listener, `proxy` through a trusted reverse proxy to that listener, or `https` on the HTTPS listener.
+
 | Status | Response |
 |---|---|
-| 200 | `{login_enabled,authenticated,role,user}` |
+| 200 | `{login_enabled,authenticated,role,user,setup_code_file,route}` |
 
 #### `POST /v1/setup`
 
