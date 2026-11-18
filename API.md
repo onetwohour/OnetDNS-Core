@@ -121,8 +121,6 @@ Sign-in sessions, the first admin account, passwords, and API tokens.
 
 The control token is for the API only and is never turned into a session cookie. Web console sessions are issued only by /v1/login.
 
-`route` tells how the request reached the server: `local` on the plain HTTP listener, `proxy` through a trusted reverse proxy to that listener, or `https` on the HTTPS listener.
-
 | Status | Response |
 |---|---|
 | 200 | `{login_enabled,authenticated,role,user,setup_code_file,route}` |
@@ -860,7 +858,7 @@ Certificates for encrypted DNS: status, validation, replacement, revocation chec
 | POST | `/v1/tls/validate` | admin | Validate the configured certificate, private key, chain, and validity period (admin only). Trust path and hostname are not checked |
 | POST | `/v1/tls/configure` | admin | Replace the TLS certificate and private key (admin only): accepts PEM bodies or file paths, checks the format and that the key matches, saves them, and restarts the encrypted DNS listeners |
 | POST | `/v1/tls/revocation-check` | admin | Check OCSP and CRL revocation status of a certificate chain (admin only). Fetches from the URLs in the certificate and verifies signatures |
-| POST | `/v1/acme/issue` | admin | Issue an ACME certificate or register an account (admin only). Answers HTTP-01 and DNS-01 challenges automatically and saves the issued certificate and private key to the configured files |
+| POST | `/v1/acme/issue` | admin | Issue an ACME certificate or register an account (admin only). Fields left out come from the config; without a directory, Let's Encrypt is used. The settings used are saved to the config. Answers HTTP-01 and DNS-01 challenges automatically. Saves the certificate to acme_cert_file, tls_cert, or a file next to the config, in that order, and serves it unless tls_cert names another file |
 
 #### `GET /v1/tls`
 

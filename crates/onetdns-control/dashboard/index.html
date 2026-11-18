@@ -6482,7 +6482,7 @@ class Component extends DCLogic {
     const ch=({'HTTP-01':'http01','DNS-01':'dns01'})[f.acmeMethod]||'http01';
     this.toastMsg('ACME 발급 요청 중…');
     this.apiSend('/v1/acme/issue','POST',{domains:[dom],challenge:ch}).then(r=>{
-      if(r.ok&&r.body&&r.body.issued)return this.toastMsg(this.t('인증서 발급 완료: ')+dom);
+      if(r.ok&&r.body&&r.body.issued){this.loadTls();return this.toastMsg(this.t('인증서 발급 완료: ')+dom);}
       if(r.ok&&r.body&&r.body.account)return this.toastMsg('ACME 계정을 등록했습니다');
       this.toastMsg(this.t('인증서 발급 실패: ')+this.errorText(r),true);
     }); };

@@ -1,7 +1,9 @@
 //! Management API: TLS certificates.
 
 use super::*;
-use crate::tls_material::{acme_issue_run, inspect_tls_material, tls_configure};
+use crate::tls_material::{
+    acme_issue, inspect_tls_material, tls_configure, AcmeFiles, AcmeRequest,
+};
 
 impl ControlDeps {
     pub(super) fn tls_status(&self) -> String {
@@ -87,15 +89,45 @@ impl ControlDeps {
         )
     }
 
+    /// Reads the live config: values captured at startup would keep issuing with the old
+    /// directory URL and domains after an ACME config change.
     pub(super) fn acme_issue(&self, body: &str) -> Result<String, String> {
-        // Reads the live config: values captured at startup would keep issuing with the old
-        // directory URL and domains after an ACME config change.
-        acme_issue_run(
-            &self.runtime_cfg.load(),
-            body,
+        let request = AcmeRequest::parse(body, &self.runtime_cfg.load())?;
+        if !request.recorded_in(&self.runtime_cfg.load()) {
+            self.edit_config(|text| request.record(text))?;
+        }
+        let cfg = self.runtime_cfg.load();
+        let files = AcmeFiles::of(&cfg, self.config_path.as_deref()).ok_or(
+            "There is no configuration file to keep the certificate next to; set acme_cert_file and acme_key_file",
+        )?;
+        let (account, issued) = acme_issue(
+            &request,
+            &files,
+            &cfg,
             self.blocklist_resolver.clone(),
             self.tls_slot_handle.lock_recover().clone(),
             self.shutdown.clone(),
-        )
+        )?;
+        if issued && files.needs_serving(&cfg) {
+            self.edit_config(|text| files.serve(text)).map_err(|error| {
+                format!(
+                    "Saved the issued certificate to {}, but could not switch the listeners to it: {error}",
+                    files.cert.display()
+                )
+            })?;
+        }
+        let file = |path: &std::path::Path| {
+            if issued {
+                onetdns_core::json::escape(&path.display().to_string())
+            } else {
+                "null".to_string()
+            }
+        };
+        Ok(format!(
+            "{{\"account\":{},\"issued\":{issued},\"cert_file\":{},\"key_file\":{}}}",
+            onetdns_core::json::escape(&account),
+            file(&files.cert),
+            file(&files.key),
+        ))
     }
 }

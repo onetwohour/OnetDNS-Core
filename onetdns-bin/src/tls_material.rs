@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 
 use crate::atomic_file::{atomic_write_secret, commit_cert_key, rollback_cert_key};
 use crate::config_apply::apply_config_edit;
-use crate::config_edit::{rewrite_config_kv, toml_quote};
+use crate::config_edit::{
+    remove_config_key, rewrite_config_kv, rewrite_config_string_array, toml_quote,
+};
 use crate::error::{BoxResult, Context};
 use crate::listeners::TlsSlots;
 use crate::{
@@ -388,122 +390,203 @@ pub(crate) fn tls_configure(
     ))
 }
 
-pub(crate) fn acme_issue_run(
+/// Let's Encrypt, used when neither the request nor the config names an ACME directory.
+pub(crate) const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// One ACME issuance.
+pub(crate) struct AcmeRequest {
+    directory: String,
+    domains: Vec<String>,
+    contact: Option<String>,
+    challenge: String,
+    account_only: bool,
+}
+
+impl AcmeRequest {
+    /// Fields the body leaves out come from the config.
+    pub(crate) fn parse(body: &str, cfg: &Config) -> Result<Self, String> {
+        let j = onetdns_core::json::parse(body)
+            .map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
+        let bstr = |k: &str| j.get(k).and_then(|v| v.as_str()).map(String::from);
+        let request = Self {
+            directory: bstr("directory")
+                .or_else(|| cfg.acme_directory_url.clone())
+                .unwrap_or_else(|| DEFAULT_ACME_DIRECTORY.to_string()),
+            domains: j
+                .get("domains")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_else(|| cfg.acme_domains.clone()),
+            contact: bstr("contact").or_else(|| cfg.acme_contact_email.clone()),
+            challenge: bstr("challenge").unwrap_or_else(|| cfg.acme_challenge.clone()),
+            account_only: j
+                .get("account_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+        onetdns_config::validate_acme_request(
+            Some(&request.directory),
+            &request.domains,
+            request.contact.as_deref(),
+            &request.challenge,
+        )?;
+        Ok(request)
+    }
+
+    pub(crate) fn recorded_in(&self, cfg: &Config) -> bool {
+        cfg.acme_directory_url.as_deref() == Some(self.directory.as_str())
+            && (self.domains.is_empty() || cfg.acme_domains == self.domains)
+            && cfg.acme_challenge == self.challenge
+            && (self.contact.is_none() || cfg.acme_contact_email == self.contact)
+    }
+
+    /// Renewal repeats what the config records, and DNS-01 is answered only while
+    /// `acme_directory_url` is set, so a request is recorded before it runs.
+    pub(crate) fn record(&self, text: &str) -> Result<String, String> {
+        let mut out = rewrite_config_kv(text, "acme_directory_url", &toml_quote(&self.directory))?;
+        out = rewrite_config_kv(&out, "acme_challenge", &toml_quote(&self.challenge))?;
+        if !self.domains.is_empty() {
+            out = rewrite_config_string_array(&out, "acme_domains", &self.domains)?;
+        }
+        if let Some(contact) = &self.contact {
+            out = rewrite_config_kv(&out, "acme_contact_email", &toml_quote(contact))?;
+        }
+        Ok(out)
+    }
+}
+
+/// Where issuance keeps the account key, the certificate, and its key.
+pub(crate) struct AcmeFiles {
+    account_key: Option<PathBuf>,
+    pub(crate) cert: PathBuf,
+    pub(crate) key: PathBuf,
+}
+
+impl AcmeFiles {
+    /// The `acme_*_file` keys win. Without them the certificate replaces the one in `tls_cert`,
+    /// and with neither it goes next to the config file. `None` with nowhere to keep it.
+    pub(crate) fn of(cfg: &Config, config_path: Option<&Path>) -> Option<Self> {
+        let beside = |name: &str| config_path.and_then(Path::parent).map(|dir| dir.join(name));
+        let (cert, key) = match (
+            &cfg.acme_cert_file,
+            &cfg.acme_key_file,
+            &cfg.tls_cert,
+            &cfg.tls_key,
+        ) {
+            (Some(cert), Some(key), _, _) => (PathBuf::from(cert), PathBuf::from(key)),
+            (None, None, Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            _ => (beside("acme-cert.pem")?, beside("acme-key.pem")?),
+        };
+        let account_key = cfg
+            .acme_account_key_file
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| beside("acme-account-key.pem"));
+        Some(Self {
+            account_key,
+            cert,
+            key,
+        })
+    }
+
+    /// Whether the listeners have to be pointed at these files. They are not when they already
+    /// serve them, or when `tls_cert` names other files on purpose.
+    pub(crate) fn needs_serving(&self, cfg: &Config) -> bool {
+        match (&cfg.tls_cert, &cfg.tls_key) {
+            (Some(cert), Some(key)) if *cert == self.cert && *key == self.key => {
+                cfg.tls_self_signed_host.is_some()
+            }
+            (Some(_), Some(_)) => false,
+            _ => true,
+        }
+    }
+
+    /// A self-signed certificate takes precedence over `tls_cert`, so it goes.
+    pub(crate) fn serve(&self, text: &str) -> Result<String, String> {
+        let out = rewrite_config_kv(
+            text,
+            "tls_cert",
+            &toml_quote(&self.cert.display().to_string()),
+        )?;
+        let out = rewrite_config_kv(
+            &out,
+            "tls_key",
+            &toml_quote(&self.key.display().to_string()),
+        )?;
+        remove_config_key(&out, "tls_self_signed_host")
+    }
+}
+
+/// Runs one issuance, keeps the account key, and writes the certificate and its key. Listeners
+/// serving those files switch to the new certificate. Returns the account URL and whether a
+/// certificate was issued.
+pub(crate) fn acme_issue(
+    request: &AcmeRequest,
+    files: &AcmeFiles,
     cfg: &Config,
-    body: &str,
     resolver: http::HostResolver,
     tls_slots: Option<Arc<TlsSlots>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<String, String> {
-    let j = onetdns_core::json::parse(body)
-        .map_err(|e| format!("Could not parse the JSON request body: {e}"))?;
-    let bstr = |k: &str| j.get(k).and_then(|v| v.as_str()).map(String::from);
-    let directory_url = bstr("directory")
-        .or_else(|| cfg.acme_directory_url.clone())
-        .ok_or("Enter the ACME directory URL in directory or acme_directory_url")?;
-    let domains: Vec<String> = j
-        .get("domains")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| cfg.acme_domains.clone());
-    let contact = bstr("contact").or_else(|| cfg.acme_contact_email.clone());
-    let challenge = bstr("challenge").unwrap_or_else(|| cfg.acme_challenge.clone());
-    let account_only = j
-        .get("account_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    onetdns_config::validate_acme_request(
-        Some(&directory_url),
-        &domains,
-        contact.as_deref(),
-        &challenge,
-    )?;
-
-    let account_key_pem = match cfg.acme_account_key_file.as_ref() {
-        Some(path) => match read_text_limited(std::path::Path::new(path), LOCAL_KEY_MAX_BYTES) {
+) -> Result<(String, bool), String> {
+    let account_key_pem = match &files.account_key {
+        Some(path) => match read_text_limited(path, LOCAL_KEY_MAX_BYTES) {
             Ok(pem) => Some(Zeroizing::new(pem)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(format!(
-                    "Could not read the ACME account key ({path}): {error}"
+                    "Could not read the ACME account key ({}): {error}",
+                    path.display()
                 ));
             }
         },
         None => None,
     };
 
-    let params_domains = domains.clone();
     let params = acme::IssueParams {
-        directory_url,
-        domains,
-        contact,
-        challenge,
+        directory_url: request.directory.clone(),
+        domains: request.domains.clone(),
+        contact: request.contact.clone(),
+        challenge: request.challenge.clone(),
         account_key_pem,
-        account_only,
+        account_only: request.account_only,
     };
     let res = acme::run_issue(params, Duration::from_secs(20), resolver, stop)?;
 
-    if let Some(p) = &cfg.acme_account_key_file {
-        if !std::path::Path::new(p).exists() {
-            atomic_write_secret(std::path::Path::new(p), res.account_key_pem.as_bytes())
+    if let Some(path) = &files.account_key {
+        if !path.exists() {
+            atomic_write_secret(path, res.account_key_pem.as_bytes())
                 .map_err(|e| format!("Could not save the ACME account key: {e}"))?;
         }
     }
 
-    let mut issued = false;
-    if let (Some(cert), Some(key)) = (&res.cert_pem, &res.cert_key_pem) {
-        match (&cfg.acme_cert_file, &cfg.acme_key_file) {
-            (Some(cf), Some(kf)) => {
-                commit_cert_key(
-                    std::path::Path::new(cf),
-                    cert.as_bytes(),
-                    std::path::Path::new(kf),
-                    key.as_bytes(),
-                )
-                .map_err(|e| format!("Could not save the certificate and private key: {e}"))?;
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err("Set both acme_cert_file and acme_key_file, or neither".to_string());
-            }
-            (None, None) => {}
+    let (Some(cert), Some(key)) = (&res.cert_pem, &res.cert_key_pem) else {
+        return Ok((res.account_url, false));
+    };
+    commit_cert_key(&files.cert, cert.as_bytes(), &files.key, key.as_bytes())
+        .map_err(|e| format!("Could not save the certificate and private key: {e}"))?;
+    onetdns_core::info!(event = "acme.certificate_issued", account = %res.account_url, domains = %request.domains.join(","), cert = %files.cert.display(), "Issued a new certificate through ACME");
+    // Issuance only writes the files; without this, listeners keep presenting the old
+    // certificate until restart.
+    if let Some(slots) = &tls_slots {
+        match slots.refresh_certificate_files(cfg) {
+            Ok(swapped) if !swapped.is_empty() => onetdns_core::info!(
+                event = "tls.certificate_reloaded",
+                changed = %swapped.join(","),
+                "Replaced the TLS certificate without closing listening addresses"
+            ),
+            Ok(_) => {}
+            Err(error) => onetdns_core::warn!(
+                event = "tls.certificate_reload_failed",
+                %error,
+                "Could not load the issued certificate on the running listeners; keeping the previous certificate"
+            ),
         }
-        // Issuance only writes the files; without this, listeners keep presenting the old
-        // certificate until restart.
-        if let Some(slots) = &tls_slots {
-            match slots.refresh_certificate_files(cfg) {
-                Ok(swapped) if !swapped.is_empty() => onetdns_core::info!(
-                    event = "tls.certificate_reloaded",
-                    changed = %swapped.join(","),
-                    "Replaced the TLS certificate without closing listening addresses"
-                ),
-                Ok(_) => {}
-                Err(error) => onetdns_core::warn!(
-                    event = "tls.certificate_reload_failed",
-                    %error,
-                    "Could not load the issued certificate on the running listeners; keeping the previous certificate"
-                ),
-            }
-        }
-        issued = true;
-        onetdns_core::info!(event = "acme.certificate_issued", account = %res.account_url, domains = %params_domains.join(","), stored = cfg.acme_cert_file.is_some(), "Issued a new certificate through ACME");
     }
-
-    Ok(format!(
-        "{{\"account\":{},\"issued\":{issued},\"cert_file\":{},\"key_file\":{}}}",
-        onetdns_core::json::escape(&res.account_url),
-        cfg.acme_cert_file
-            .as_deref()
-            .map(onetdns_core::json::escape)
-            .unwrap_or_else(|| "null".to_string()),
-        cfg.acme_key_file
-            .as_deref()
-            .map(onetdns_core::json::escape)
-            .unwrap_or_else(|| "null".to_string()),
-    ))
+    Ok((res.account_url, true))
 }
 
 #[cfg(test)]
@@ -536,5 +619,75 @@ mod tests {
         let (unkept, _) = self_signed_material("dns.example", None).unwrap();
         assert!(!self_signed_is_kept(None, &unkept[0]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn config(text: &str) -> Config {
+        Config::from_toml_str(text).unwrap()
+    }
+
+    #[test]
+    fn an_issued_certificate_goes_where_the_listeners_read_it() {
+        let config_path = Path::new("/etc/OnetDNS/OnetDNS.toml");
+        let beside = AcmeFiles::of(&config(""), Some(config_path)).unwrap();
+        assert_eq!(beside.cert, Path::new("/etc/OnetDNS/acme-cert.pem"));
+        assert_eq!(beside.key, Path::new("/etc/OnetDNS/acme-key.pem"));
+        assert_eq!(
+            beside.account_key.as_deref(),
+            Some(Path::new("/etc/OnetDNS/acme-account-key.pem"))
+        );
+        assert!(AcmeFiles::of(&config(""), None).is_none());
+
+        let served = config("tls_cert = \"/srv/cert.pem\"\ntls_key = \"/srv/key.pem\"\n");
+        let files = AcmeFiles::of(&served, Some(config_path)).unwrap();
+        assert_eq!(files.cert, Path::new("/srv/cert.pem"));
+        assert!(!files.needs_serving(&served));
+
+        let separate = config(
+            "tls_cert = \"/srv/cert.pem\"\ntls_key = \"/srv/key.pem\"\nacme_cert_file = \"/acme/cert.pem\"\nacme_key_file = \"/acme/key.pem\"\n",
+        );
+        let files = AcmeFiles::of(&separate, Some(config_path)).unwrap();
+        assert_eq!(files.cert, Path::new("/acme/cert.pem"));
+        assert!(
+            !files.needs_serving(&separate),
+            "tls_cert 가 가리키는 다른 파일을 바꿨습니다"
+        );
+
+        let self_signed = config("tls_self_signed_host = \"dns.example\"\n");
+        let files = AcmeFiles::of(&self_signed, Some(config_path)).unwrap();
+        assert!(files.needs_serving(&self_signed));
+        let after = config(
+            &files
+                .serve("tls_self_signed_host = \"dns.example\"\n")
+                .unwrap(),
+        );
+        assert_eq!(after.tls_cert.as_deref(), Some(files.cert.as_path()));
+        assert_eq!(after.tls_key.as_deref(), Some(files.key.as_path()));
+        assert_eq!(after.tls_self_signed_host, None);
+        assert!(!files.needs_serving(&after));
+    }
+
+    #[test]
+    fn a_request_without_a_directory_uses_lets_encrypt_and_is_recorded() {
+        let before = config("");
+        let request = AcmeRequest::parse(
+            "{\"domains\":[\"dns.example.com\"],\"challenge\":\"dns01\"}",
+            &before,
+        )
+        .unwrap();
+        assert!(!request.recorded_in(&before));
+        let after = config(&request.record("").unwrap());
+        assert_eq!(
+            after.acme_directory_url.as_deref(),
+            Some(DEFAULT_ACME_DIRECTORY)
+        );
+        assert_eq!(after.acme_domains, ["dns.example.com"]);
+        assert_eq!(after.acme_challenge, "dns01");
+        assert!(request.recorded_in(&after));
+
+        let again = AcmeRequest::parse("{}", &after).unwrap();
+        assert!(
+            again.recorded_in(&after),
+            "설정에 있는 값으로 다시 발급하지 않습니다"
+        );
     }
 }
