@@ -444,8 +444,8 @@ impl AcmeRequest {
             && (self.contact.is_none() || cfg.acme_contact_email == self.contact)
     }
 
-    /// Renewal repeats what the config records, and DNS-01 is answered only while
-    /// `acme_directory_url` is set, so a request is recorded before it runs.
+    /// Recorded before issuing: renewal reads the config, and DNS-01 is answered only while
+    /// `acme_directory_url` is set.
     pub(crate) fn record(&self, text: &str) -> Result<String, String> {
         let mut out = rewrite_config_kv(text, "acme_directory_url", &toml_quote(&self.directory))?;
         out = rewrite_config_kv(&out, "acme_challenge", &toml_quote(&self.challenge))?;
@@ -467,8 +467,7 @@ pub(crate) struct AcmeFiles {
 }
 
 impl AcmeFiles {
-    /// The `acme_*_file` keys win. Without them the certificate replaces the one in `tls_cert`,
-    /// and with neither it goes next to the config file. `None` with nowhere to keep it.
+    /// `acme_*_file`, else `tls_cert`/`tls_key`, else next to the config file.
     pub(crate) fn of(cfg: &Config, config_path: Option<&Path>) -> Option<Self> {
         let beside = |name: &str| config_path.and_then(Path::parent).map(|dir| dir.join(name));
         let (cert, key) = match (
@@ -493,8 +492,7 @@ impl AcmeFiles {
         })
     }
 
-    /// Whether the listeners have to be pointed at these files. They are not when they already
-    /// serve them, or when `tls_cert` names other files on purpose.
+    /// False when the listeners already serve these files or `tls_cert` names other files.
     pub(crate) fn needs_serving(&self, cfg: &Config) -> bool {
         match (&cfg.tls_cert, &cfg.tls_key) {
             (Some(cert), Some(key)) if *cert == self.cert && *key == self.key => {
@@ -505,7 +503,7 @@ impl AcmeFiles {
         }
     }
 
-    /// A self-signed certificate takes precedence over `tls_cert`, so it goes.
+    /// Drops `tls_self_signed_host`, which takes precedence over `tls_cert`.
     pub(crate) fn serve(&self, text: &str) -> Result<String, String> {
         let out = rewrite_config_kv(
             text,
@@ -521,9 +519,7 @@ impl AcmeFiles {
     }
 }
 
-/// Runs one issuance, keeps the account key, and writes the certificate and its key. Listeners
-/// serving those files switch to the new certificate. Returns the account URL and whether a
-/// certificate was issued.
+/// Returns the account URL and whether a certificate was issued.
 pub(crate) fn acme_issue(
     request: &AcmeRequest,
     files: &AcmeFiles,
