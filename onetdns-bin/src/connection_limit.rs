@@ -23,10 +23,6 @@ pub(crate) const CONNECTION_THREAD_STACK_BYTES: usize = 512 * 1024;
 /// Accepts per round before pending input and shutdown are checked again.
 pub(crate) const ENCRYPTED_ACCEPT_BATCH: usize = 64;
 
-const TLS_RECORD_HEADER_BYTES: usize = 5;
-const MAX_TLS_PLAINTEXT_RECORD_BYTES: usize = 16 * 1024;
-/// Bound on the buffered ClientHello before a connection gets a thread.
-const MAX_TLS_CLIENT_HELLO_PREFIX_BYTES: usize = 64 * 1024;
 const MAX_DNSCRYPT_TCP_QUERY_BYTES: usize = 8192;
 const ENCRYPTED_PREFIX_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_PREFIX_POLL: Duration = Duration::from_millis(10);
@@ -202,7 +198,7 @@ impl PendingEncryptedConnection {
         }
 
         let limit = match self.protocol {
-            AdmissionProtocol::Tls => MAX_TLS_CLIENT_HELLO_PREFIX_BYTES,
+            AdmissionProtocol::Tls => onetdns_tls::record::MAX_CLIENT_HELLO_PREFIX,
             AdmissionProtocol::Dnscrypt => MAX_DNSCRYPT_TCP_QUERY_BYTES + 2,
         };
         let mut scratch = [0u8; 2048];
@@ -277,70 +273,13 @@ pub(crate) fn encrypted_prefix_state(
     protocol: AdmissionProtocol,
 ) -> io::Result<AdmissionState> {
     match protocol {
-        AdmissionProtocol::Tls => tls_client_hello_prefix_state(prefix),
+        AdmissionProtocol::Tls => match onetdns_tls::record::client_hello_complete(prefix) {
+            Ok(true) => Ok(AdmissionState::Ready),
+            Ok(false) => Ok(AdmissionState::Pending),
+            Err(message) => Err(invalid_admission(message)),
+        },
         AdmissionProtocol::Dnscrypt => dnscrypt_prefix_state(prefix),
     }
-}
-
-fn tls_client_hello_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {
-    if prefix.len() > MAX_TLS_CLIENT_HELLO_PREFIX_BYTES {
-        return Err(invalid_admission("TLS ClientHello prefix exceeds 64 KiB"));
-    }
-
-    let mut record_offset = 0usize;
-    let mut handshake_header = [0u8; 4];
-    let mut handshake_bytes = 0usize;
-    let mut handshake_total = None;
-
-    while record_offset < prefix.len() {
-        if prefix.len() - record_offset < TLS_RECORD_HEADER_BYTES {
-            return Ok(AdmissionState::Pending);
-        }
-        let header = &prefix[record_offset..record_offset + TLS_RECORD_HEADER_BYTES];
-        if header[0] != 22 || header[1] != 3 {
-            return Err(invalid_admission(
-                "The first TLS message must be a handshake record",
-            ));
-        }
-        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        if record_len == 0 || record_len > MAX_TLS_PLAINTEXT_RECORD_BYTES {
-            return Err(invalid_admission("TLS record length is out of range"));
-        }
-        let record_end = record_offset + TLS_RECORD_HEADER_BYTES + record_len;
-        if record_end > prefix.len() {
-            return Ok(AdmissionState::Pending);
-        }
-
-        let payload = &prefix[record_offset + TLS_RECORD_HEADER_BYTES..record_end];
-        if handshake_bytes < handshake_header.len() {
-            let copy = (handshake_header.len() - handshake_bytes).min(payload.len());
-            handshake_header[handshake_bytes..handshake_bytes + copy]
-                .copy_from_slice(&payload[..copy]);
-        }
-        handshake_bytes = handshake_bytes.saturating_add(payload.len());
-
-        if handshake_total.is_none() && handshake_bytes >= handshake_header.len() {
-            if handshake_header[0] != 1 {
-                return Err(invalid_admission(
-                    "The first TLS handshake message must be a ClientHello",
-                ));
-            }
-            let body_len = ((handshake_header[1] as usize) << 16)
-                | ((handshake_header[2] as usize) << 8)
-                | handshake_header[3] as usize;
-            let total = handshake_header.len() + body_len;
-            if total + TLS_RECORD_HEADER_BYTES > MAX_TLS_CLIENT_HELLO_PREFIX_BYTES {
-                return Err(invalid_admission("TLS ClientHello length exceeds 64 KiB"));
-            }
-            handshake_total = Some(total);
-        }
-        if handshake_total.is_some_and(|total| handshake_bytes >= total) {
-            return Ok(AdmissionState::Ready);
-        }
-        record_offset = record_end;
-    }
-
-    Ok(AdmissionState::Pending)
 }
 
 fn dnscrypt_prefix_state(prefix: &[u8]) -> io::Result<AdmissionState> {

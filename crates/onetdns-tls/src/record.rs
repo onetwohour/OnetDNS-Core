@@ -78,6 +78,69 @@ impl TlsRecord {
     }
 }
 
+/// Bound on a buffered first ClientHello, which may span records.
+pub const MAX_CLIENT_HELLO_PREFIX: usize = 64 * 1024;
+
+/// Whether `prefix` holds the whole first ClientHello, so a server can hold a new connection
+/// without a thread until the handshake can run without waiting. Checks lengths and types only;
+/// the handshake still parses the message. The error says what is wrong with the prefix.
+pub fn client_hello_complete(prefix: &[u8]) -> Result<bool, &'static str> {
+    if prefix.len() > MAX_CLIENT_HELLO_PREFIX {
+        return Err("TLS ClientHello prefix exceeds 64 KiB");
+    }
+
+    let mut record_offset = 0usize;
+    let mut handshake_header = [0u8; 4];
+    let mut handshake_bytes = 0usize;
+    let mut handshake_total = None;
+
+    while record_offset < prefix.len() {
+        if prefix.len() - record_offset < 5 {
+            return Ok(false);
+        }
+        let header = &prefix[record_offset..record_offset + 5];
+        if header[0] != 22 || header[1] != 3 {
+            return Err("The first TLS message must be a handshake record");
+        }
+        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if record_len == 0 || record_len > MAX_FRAGMENT {
+            return Err("TLS record length is out of range");
+        }
+        let record_end = record_offset + 5 + record_len;
+        if record_end > prefix.len() {
+            return Ok(false);
+        }
+
+        let payload = &prefix[record_offset + 5..record_end];
+        if handshake_bytes < handshake_header.len() {
+            let copy = (handshake_header.len() - handshake_bytes).min(payload.len());
+            handshake_header[handshake_bytes..handshake_bytes + copy]
+                .copy_from_slice(&payload[..copy]);
+        }
+        handshake_bytes = handshake_bytes.saturating_add(payload.len());
+
+        if handshake_total.is_none() && handshake_bytes >= handshake_header.len() {
+            if handshake_header[0] != 1 {
+                return Err("The first TLS handshake message must be a ClientHello");
+            }
+            let body_len = ((handshake_header[1] as usize) << 16)
+                | ((handshake_header[2] as usize) << 8)
+                | handshake_header[3] as usize;
+            let total = handshake_header.len() + body_len;
+            if total + 5 > MAX_CLIENT_HELLO_PREFIX {
+                return Err("TLS ClientHello length exceeds 64 KiB");
+            }
+            handshake_total = Some(total);
+        }
+        if handshake_total.is_some_and(|total| handshake_bytes >= total) {
+            return Ok(true);
+        }
+        record_offset = record_end;
+    }
+
+    Ok(false)
+}
+
 #[derive(Default)]
 pub struct RecordReader {
     buf: Vec<u8>,
