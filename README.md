@@ -165,7 +165,7 @@ rate_limit_per_sec = 20
 rate_limit_burst   = 40
 ```
 
-An open DNS server without a rate limit gets used to flood other people's servers. OnetDNS starts without one but warns you every time it does. Never expose the dashboard; keep `control_listen` on localhost or your LAN.
+An open DNS server without a rate limit gets used to flood other people's servers. OnetDNS starts without one but warns you every time it does. Keep the dashboard off the internet: if you open it with `control_listen_https`, bind that to your LAN.
 
 <br>
 
@@ -233,14 +233,25 @@ No. Your router still connects you to the internet. OnetDNS only takes over name
 <summary>Can I open the dashboard from another computer?</summary>
 <br>
 
-The dashboard only answers on the machine running OnetDNS, because it has no HTTPS of its own. To reach it from elsewhere, either use an SSH tunnel, or put an HTTPS reverse proxy such as Caddy or nginx on the same machine and tell OnetDNS about it:
+Yes, over HTTPS. Give the dashboard an HTTPS address and the name you will type in the browser:
+
+```toml
+control_listen_https   = "0.0.0.0:8554"
+control_public_origins = ["https://dns.example.com:8554"]
+```
+
+It uses the same certificate as DoT and DoH, so set `tls_cert` and `tls_key`, or `tls_self_signed_host` for a self-signed one that the browser warns about. It answers only at the addresses in `control_public_origins`.
+
+An SSH tunnel works too, and so does an HTTPS reverse proxy such as Caddy or nginx on the same machine:
 
 ```toml
 control_trusted_proxies = ["127.0.0.1/32"]
 control_public_origins = ["https://dns.example.com"]
 ```
 
-The proxy has to forward to `127.0.0.1:8553`, keep the original `Host` header, and set `X-Forwarded-For`. Create your admin account on the machine itself first; the first-time setup page does not open through the proxy.
+The proxy has to forward to `127.0.0.1:8553`, keep the original `Host` header, and set `X-Forwarded-For`.
+
+Either way, create your admin account on the machine itself first; the first-time setup page does not open from another computer.
 
 </details>
 
