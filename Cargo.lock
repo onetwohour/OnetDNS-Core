@@ -949,6 +949,8 @@ dependencies = [
  "hmac 0.12.1",
  "onetdns-core",
  "onetdns-proto",
+ "onetdns-tls",
+ "rcgen",
  "sha1",
  "sha2 0.10.9",
 ]

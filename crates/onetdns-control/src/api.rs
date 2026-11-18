@@ -39,46 +39,26 @@ const MAX_REQUEST_FAILURE_COUNTS: usize = 256;
 /// How long shutdown waits for open connections.
 const CONTROL_DRAIN_GRACE_SECS: u64 = 5;
 
-/// One TCP socket shared by the read, write and shutdown paths without duplicating the OS handle.
+/// One TCP connection, plain or TLS, shared by the read, write and shutdown paths without
+/// duplicating the OS handle. Socket options and shutdown act on the TCP socket under the TLS layer.
 #[derive(Clone)]
-struct SharedTcp(Arc<TcpStream>);
-
-impl SharedTcp {
-    fn new(stream: TcpStream) -> Self {
-        Self(Arc::new(stream))
-    }
-
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.0.peer_addr()
-    }
-
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.0.local_addr()
-    }
-
-    /// Applies to every path reading this socket.
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(timeout)
-    }
-
-    /// Non-blocking only during admission.
-    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
-    }
-
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.0.shutdown(how)
-    }
+struct SharedTcp {
+    socket: RawTcp,
+    tls: Option<onetdns_tls::SharedTlsStream<RawTcp>>,
 }
 
-impl Read for SharedTcp {
+/// The socket itself, below any TLS layer.
+#[derive(Clone)]
+struct RawTcp(Arc<TcpStream>);
+
+impl Read for RawTcp {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut stream = &*self.0;
         stream.read(buf)
     }
 }
 
-impl Write for SharedTcp {
+impl Write for RawTcp {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut stream = &*self.0;
         stream.write(buf)
@@ -87,6 +67,89 @@ impl Write for SharedTcp {
     fn flush(&mut self) -> std::io::Result<()> {
         let mut stream = &*self.0;
         stream.flush()
+    }
+}
+
+impl SharedTcp {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            socket: RawTcp(Arc::new(stream)),
+            tls: None,
+        }
+    }
+
+    /// Reads and writes then go through `conn`. `pending` is ciphertext read past the handshake.
+    fn with_tls(&self, conn: onetdns_tls::TlsConnection, pending: &[u8]) -> Self {
+        Self {
+            socket: self.socket.clone(),
+            tls: Some(onetdns_tls::SharedTlsStream::new(
+                conn,
+                self.socket.clone(),
+                pending,
+            )),
+        }
+    }
+
+    fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// Lets the peer tell the end of a TLS response from a truncation.
+    fn finish(&mut self) {
+        if let Some(tls) = &mut self.tls {
+            let _ = tls.send_close_notify();
+        }
+    }
+
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.0.peer_addr()
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.0.local_addr()
+    }
+
+    /// Applies to every path reading this socket.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.socket.0.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.socket.0.set_write_timeout(timeout)
+    }
+
+    /// Non-blocking only during admission.
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.socket.0.set_nonblocking(nonblocking)
+    }
+
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.socket.0.shutdown(how)
+    }
+}
+
+impl Read for SharedTcp {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.tls {
+            Some(tls) => tls.read(buf),
+            None => self.socket.read(buf),
+        }
+    }
+}
+
+impl Write for SharedTcp {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.tls {
+            Some(tls) => tls.write(buf),
+            None => self.socket.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.tls {
+            Some(tls) => tls.flush(),
+            None => self.socket.flush(),
+        }
     }
 }
 
@@ -129,13 +192,31 @@ impl Read for AdmittedTcp {
     }
 }
 
+impl AdmittedTcp {
+    /// Admission bytes not read yet.
+    fn unread_prefix(&self) -> &[u8] {
+        &self.prefix[self.prefix_offset..]
+    }
+}
+
+/// Only the TLS handshake writes through this; requests answer on the `SharedTcp`.
+impl Write for AdmittedTcp {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 impl onetdns_core::tcp::SocketTimeouts for AdmittedTcp {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.stream.0.set_write_timeout(timeout)
+        self.stream.set_write_timeout(timeout)
     }
 }
 
@@ -291,7 +372,7 @@ mod stream_slot_tests {
         let mut shared = SharedTcp::new(client);
         let clone = shared.clone();
 
-        assert!(Arc::ptr_eq(&shared.0, &clone.0));
+        assert!(Arc::ptr_eq(&shared.socket.0, &clone.socket.0));
         shared.write_all(b"x").unwrap();
         let mut byte = [0u8; 1];
         server.read_exact(&mut byte).unwrap();
@@ -2090,6 +2171,8 @@ struct PendingControlConnection {
     admission_bytes: AdmissionBytesGuard,
     /// Counts toward the connection limit while pending.
     guard: ActiveConnectionGuard,
+    /// Set on the HTTPS listener: admission then waits for the ClientHello instead of the request.
+    tls: Option<Arc<onetdns_tls::ServerConfig>>,
 }
 
 enum ControlAdmissionState {
@@ -2150,7 +2233,16 @@ fn control_admission_state(
     scratch: &mut [u8],
 ) -> std::io::Result<ControlAdmissionState> {
     loop {
-        let required = if let Some(header_end) = pending
+        let required = if pending.tls.is_some() {
+            let limit = onetdns_tls::record::MAX_CLIENT_HELLO_PREFIX;
+            match onetdns_tls::record::client_hello_complete(&pending.received) {
+                Ok(true) => return Ok(ControlAdmissionState::Ready),
+                Ok(false) if pending.received.len() < limit => Ok(limit),
+                Ok(false) => Err("TLS ClientHello did not end within 64 KiB"),
+                Err(message) => Err(message),
+            }
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?
+        } else if let Some(header_end) = pending
             .received
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -2241,74 +2333,89 @@ impl ProxyPolicy {
 /// For direct loopback connections.
 const SESSION_COOKIE: &str = "onetdns_session";
 
-/// For connections through an HTTPS reverse proxy. Browsers accept a `__Host-` cookie only with
-/// Secure, Path=/ and no Domain, so other subdomains cannot overwrite it.
+/// For requests to an HTTPS public origin. Browsers accept a `__Host-` cookie only with Secure,
+/// Path=/ and no Domain, so other subdomains cannot overwrite it.
 const SECURE_SESSION_COOKIE: &str = "__Host-onetdns_session";
 
 /// The sender of a request. Audit records, sign-in limits and the cookie form follow it.
 struct Caller {
     /// The TCP peer; the proxy when the request came through one.
     peer: Option<SocketAddr>,
-    /// Set when the request came through a trusted reverse proxy to a public origin.
-    proxied: Option<Proxied>,
+    route: Route,
     /// `Background` when the request carries `Prefer: respond-async`.
     filter_apply: FilterApply,
 }
 
-struct Proxied {
-    /// From X-Forwarded-For; `None` when missing or malformed.
-    client: Option<IpAddr>,
+/// How a request reached this server.
+enum Route {
+    /// A loopback connection to the plain HTTP listener.
+    Local,
+    /// A trusted reverse proxy forwarding to a public origin. `client` comes from X-Forwarded-For
+    /// and is `None` when that is missing or malformed.
+    Proxied { client: Option<IpAddr> },
+    /// The HTTPS listener, reached at a public origin.
+    Https,
 }
 
 impl Caller {
     fn direct(peer: Option<SocketAddr>) -> Self {
         Self {
             peer,
-            proxied: None,
+            route: Route::Local,
             filter_apply: FilterApply::Wait,
         }
+    }
+
+    /// Reached through a public origin rather than a loopback address on this machine.
+    fn public(&self) -> bool {
+        !matches!(self.route, Route::Local)
     }
 
     /// Source for audit records and logs, naming both client and proxy when proxied.
     fn label(&self) -> String {
         let peer = self.peer.map(|value| value.to_string()).unwrap_or_default();
-        match &self.proxied {
-            Some(proxied) => match proxied.client {
-                Some(client) => format!("{client} via {peer}"),
-                None => format!("unknown via {peer}"),
-            },
-            None => peer,
+        match &self.route {
+            Route::Proxied {
+                client: Some(client),
+            } => format!("{client} via {peer}"),
+            Route::Proxied { client: None } => format!("unknown via {peer}"),
+            Route::Local | Route::Https => peer,
         }
     }
 
-    /// Key for counting sign-in failures. Through a proxy it is the client's network, since
-    /// counting the proxy would let one attacker block every admin behind it; the proxy's only
-    /// when the client is unknown. An IPv6 client is counted by its /64, or it could change
-    /// addresses within it to escape the limit. Direct requests all come from this machine and
-    /// share one key; on Linux any address in 127.0.0.0/8 can connect, so per-address keys could be
-    /// rotated.
+    /// Key for counting sign-in failures. From a public origin it is the client's network: through
+    /// a proxy, counting the proxy would let one attacker block every admin behind it, so the
+    /// proxy's address is used only when the client is unknown. An IPv6 client is counted by its
+    /// /64, or it could change addresses within it to escape the limit. Loopback requests all come
+    /// from this machine and share one key; on Linux any address in 127.0.0.0/8 can connect, so
+    /// per-address keys could be rotated.
     fn login_source(&self) -> String {
-        match &self.proxied {
-            Some(proxied) => proxied
-                .client
-                .or(self.peer.map(|peer| peer.ip()))
-                .map_or_else(
-                    || "unknown".to_string(),
-                    |ip| onetdns_core::admission::client_network(ip).to_string(),
-                ),
-            None => "local".to_string(),
-        }
+        let client = match &self.route {
+            Route::Local => return "local".to_string(),
+            Route::Proxied { client } => client.or(self.peer.map(|peer| peer.ip())),
+            // Loopback peers can reach the HTTPS listener too, so they share the local key.
+            Route::Https => match self.peer.map(|peer| peer.ip().to_canonical()) {
+                Some(ip) if ip.is_loopback() => return "local".to_string(),
+                ip => ip,
+            },
+        };
+        client.map_or_else(
+            || "unknown".to_string(),
+            |ip| onetdns_core::admission::client_network(ip).to_string(),
+        )
     }
 
     /// The proxy address when proxied; the key for per-proxy sign-in pacing.
     fn login_proxy(&self) -> Option<String> {
-        self.proxied.as_ref()?;
-        Some(self.peer?.ip().to_string())
+        match self.route {
+            Route::Proxied { .. } => Some(self.peer?.ip().to_string()),
+            Route::Local | Route::Https => None,
+        }
     }
 
-    /// The Secure cookie when the request came through an HTTPS public origin.
+    /// The Secure cookie when the request came to an HTTPS public origin.
     fn session_cookie(&self) -> &'static str {
-        if self.proxied.is_some() {
+        if self.public() {
             SECURE_SESSION_COOKIE
         } else {
             SESSION_COOKIE
@@ -2333,6 +2440,7 @@ fn spawn_control_connection(
         probe_delay: _,
         admission_bytes,
         guard,
+        tls,
     } = pending;
     if let Err(error) = stream.set_nonblocking(false) {
         record_control_error("socket_blocking", Some(peer), error);
@@ -2346,15 +2454,44 @@ fn spawn_control_connection(
         .stack_size(CONTROL_CONNECTION_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
-            if let Err(error) =
-                handle_conn_until_shutdown(
+            let served = match tls {
+                None => handle_conn_until_shutdown(
                     stream,
                     &st,
                     connection_shutdown,
                     deadline,
                     received,
-                    admission_bytes,
-                )
+                    Some(admission_bytes),
+                ),
+                Some(config) => {
+                    match accept_tls(stream, received, admission_bytes, &config, deadline) {
+                        Ok(mut stream) => {
+                            let served = handle_conn_until_shutdown(
+                                stream.clone(),
+                                &st,
+                                connection_shutdown,
+                                deadline,
+                                Vec::new(),
+                                None,
+                            );
+                            stream.finish();
+                            served
+                        }
+                        // The peer closed or stalled; logged like any other closed connection.
+                        Err(error @ (onetdns_tls::TlsError::Io | onetdns_tls::TlsError::Eof)) => {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                error.to_string(),
+                            ))
+                        }
+                        Err(error) => {
+                            record_control_error("tls_handshake", Some(peer), error);
+                            Ok(())
+                        }
+                    }
+                }
+            };
+            if let Err(error) = served
             {
                 if matches!(
                     error.kind(),
@@ -2378,6 +2515,23 @@ fn spawn_control_connection(
     }
 }
 
+/// Runs the TLS handshake within the request deadline, starting with the ClientHello admission read.
+/// The admission budget for the ClientHello is returned once the handshake ends.
+fn accept_tls(
+    stream: SharedTcp,
+    client_hello: Vec<u8>,
+    admission_bytes: AdmissionBytesGuard,
+    config: &onetdns_tls::ServerConfig,
+    deadline: Instant,
+) -> Result<SharedTcp, onetdns_tls::TlsError> {
+    let mut handshake = DeadlineTcp::new(
+        AdmittedTcp::new(stream.clone(), client_hello, Some(admission_bytes)),
+        deadline,
+    );
+    let conn = onetdns_tls::server_handshake(&mut handshake, config)?;
+    Ok(stream.with_tls(conn, handshake.get_ref().unread_prefix()))
+}
+
 /// Handles pending connections that completed, hit their deadline or closed.
 fn promote_control_connections(
     pending: &mut Vec<PendingControlConnection>,
@@ -2391,7 +2545,7 @@ fn promote_control_connections(
         let now = Instant::now();
         if now >= pending[index].deadline {
             let expired = pending.swap_remove(index);
-            if expired.stream.set_nonblocking(false).is_ok() {
+            if expired.tls.is_none() && expired.stream.set_nonblocking(false).is_ok() {
                 let _ = write_simple(
                     expired.stream,
                     "408 Request Timeout",
@@ -2431,7 +2585,7 @@ fn promote_control_connections(
             }
             ControlAdmissionState::Overloaded => {
                 let overloaded = pending.swap_remove(index);
-                if overloaded.stream.set_nonblocking(false).is_ok() {
+                if overloaded.tls.is_none() && overloaded.stream.set_nonblocking(false).is_ok() {
                     let _ = write_simple(
                         overloaded.stream,
                         "503 Service Unavailable",
@@ -2473,6 +2627,31 @@ pub fn serve_listener(
     state: AppState,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    serve_listener_with(listener, state, shutdown, None)
+}
+
+/// The certificate the HTTPS listener presents; read at each accept, so a renewed certificate
+/// applies to the next connection. `None` while no certificate is available.
+pub type CertificateSource = Arc<dyn Fn() -> Option<Arc<onetdns_tls::ServerConfig>> + Send + Sync>;
+
+/// `serve_listener` for HTTPS. Requests are answered only at a public origin
+/// (`ProxyPolicy::origins`). Its connection limit is separate from the plain listener's, so
+/// connections from the network cannot use up local access.
+pub fn serve_https_listener(
+    listener: TcpListener,
+    state: AppState,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    certificate: CertificateSource,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    serve_listener_with(listener, state, shutdown, Some(certificate))
+}
+
+fn serve_listener_with(
+    listener: TcpListener,
+    state: AppState,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    certificate: Option<CertificateSource>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     use std::sync::atomic::Ordering;
     listener.set_nonblocking(true)?;
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2506,19 +2685,35 @@ pub fn serve_listener(
                         continue;
                     }
                     let s = SharedTcp::new(s);
+                    let tls = match &certificate {
+                        Some(certificate) => match certificate() {
+                            Some(config) => Some(config),
+                            None => {
+                                record_control_error(
+                                    "tls_certificate",
+                                    Some(peer),
+                                    "No TLS certificate is available for the HTTPS management listener",
+                                );
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     let Some(guard) = acquire_connection_slot(&active) else {
                         record_control_error(
                             "connection_limit",
                             Some(peer),
                             "Too many concurrent management connections",
                         );
-                        let _ = write_simple(
-                            s,
-                            "503 Service Unavailable",
-                            "text/plain",
-                            "Retry-After: 1\r\n",
-                            "Too many management requests. Try again shortly",
-                        );
+                        if tls.is_none() {
+                            let _ = write_simple(
+                                s,
+                                "503 Service Unavailable",
+                                "text/plain",
+                                "Retry-After: 1\r\n",
+                                "Too many management requests. Try again shortly",
+                            );
+                        }
                         continue;
                     };
                     if let Err(error) = s.set_nonblocking(true) {
@@ -2535,6 +2730,7 @@ pub fn serve_listener(
                         probe_delay: Duration::from_millis(CONTROL_ADMISSION_POLL_MS),
                         admission_bytes: AdmissionBytesGuard::new(admission_bytes.clone()),
                         guard,
+                        tls,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -2739,6 +2935,9 @@ enum HostRejection {
 /// proxy and only when listed as a public origin, with Origin, if present, equal to it; only then
 /// is X-Forwarded-For read. Opening public origins to non-proxy connections would let another
 /// local program pose as the proxy and forge X-Forwarded-For to evade sign-in limits.
+///
+/// The HTTPS listener (`https`) answers only at a public origin, from any peer, and ignores
+/// X-Forwarded-For. A loopback origin there would be `https`, which no loopback check expects.
 fn control_caller(
     policy: &ProxyPolicy,
     peer: Option<SocketAddr>,
@@ -2746,33 +2945,46 @@ fn control_caller(
     host: &str,
     origin: Option<&str>,
     forwarded_for: &str,
+    https: bool,
 ) -> Result<Caller, HostRejection> {
-    if let Some(authority) = control_authority(host, local_port) {
+    let route = if https {
+        check_public_origin(policy, host, origin)?;
+        Route::Https
+    } else if let Some(authority) = control_authority(host, local_port) {
         if origin.is_some_and(|value| !same_loopback_origin(value, &authority)) {
             return Err(HostRejection::CrossOrigin);
         }
-        return Ok(Caller::direct(peer));
-    }
-    let from_proxy = peer.is_some_and(|peer| policy.trusts(peer.ip()));
-    let public = from_proxy
-        .then(|| {
-            policy
-                .origins
-                .iter()
-                .find(|public| public.matches_host(host))
-        })
-        .flatten()
+        Route::Local
+    } else if peer.is_some_and(|peer| policy.trusts(peer.ip())) {
+        check_public_origin(policy, host, origin)?;
+        Route::Proxied {
+            client: policy.forwarded_client(forwarded_for),
+        }
+    } else {
+        return Err(HostRejection::Misdirected);
+    };
+    Ok(Caller {
+        peer,
+        route,
+        filter_apply: FilterApply::Wait,
+    })
+}
+
+/// Host must be a public origin and Origin, if present, the same one.
+fn check_public_origin(
+    policy: &ProxyPolicy,
+    host: &str,
+    origin: Option<&str>,
+) -> Result<(), HostRejection> {
+    let public = policy
+        .origins
+        .iter()
+        .find(|public| public.matches_host(host))
         .ok_or(HostRejection::Misdirected)?;
     if origin.is_some_and(|value| !public.matches_origin(value)) {
         return Err(HostRejection::CrossOrigin);
     }
-    Ok(Caller {
-        peer,
-        proxied: Some(Proxied {
-            client: policy.forwarded_client(forwarded_for),
-        }),
-        filter_apply: FilterApply::Wait,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2793,7 +3005,7 @@ fn handle_conn_until_shutdown(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     request_deadline: Instant,
     prefix: Vec<u8>,
-    admission_bytes: AdmissionBytesGuard,
+    admission_bytes: Option<AdmissionBytesGuard>,
 ) -> std::io::Result<()> {
     handle_conn_inner(
         stream,
@@ -2801,7 +3013,7 @@ fn handle_conn_until_shutdown(
         Some(shutdown),
         request_deadline,
         prefix,
-        Some(admission_bytes),
+        admission_bytes,
     )
 }
 
@@ -3111,6 +3323,7 @@ fn handle_conn_inner(
         &host,
         origin.as_deref(),
         &forwarded_for,
+        stream.is_tls(),
     ) {
         Ok(caller) => caller,
         Err(HostRejection::Misdirected) => {
@@ -3124,7 +3337,7 @@ fn handle_conn_inner(
                 "421 Misdirected Request",
                 "text/plain",
                 "",
-                "Management API Host must be localhost, a loopback address, or an address in control_public_origins reached through control_trusted_proxies",
+                "Management API Host must be localhost or a loopback address, or an address in control_public_origins reached over HTTPS or through control_trusted_proxies",
             );
         }
         Err(HostRejection::CrossOrigin) => {
@@ -3371,11 +3584,7 @@ fn write_simple(
 /// A `max_age` of 0 deletes the cookie. Secure is set only for an HTTPS public origin; some
 /// browsers do not store a Secure cookie over plain loopback HTTP.
 fn session_cookie_header(caller: &Caller, token: &str, max_age: u64) -> String {
-    let secure = if caller.proxied.is_some() {
-        " Secure;"
-    } else {
-        ""
-    };
+    let secure = if caller.public() { " Secure;" } else { "" };
     format!(
         "Set-Cookie: {}={token};{secure} HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}\r\n",
         caller.session_cookie()
@@ -3404,8 +3613,8 @@ fn handle_setup(
     };
 
     // Only someone who can edit the config file may create the first account, and anyone on the
-    // internet can send through the reverse proxy.
-    if caller.proxied.is_some() {
+    // internet can reach a public origin.
+    if caller.public() {
         st.audit
             .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
         return refuse(
@@ -3587,8 +3796,8 @@ fn auth_status_body(
     user: &str,
 ) -> String {
     // The path can contain an account name. The first account can only be created on this
-    // machine, so proxied requests do not get it.
-    let setup_code_file = if st.auth.has_users() || caller.proxied.is_some() {
+    // machine, so requests to a public origin do not get it.
+    let setup_code_file = if st.auth.has_users() || caller.public() {
         None
     } else {
         st.auth.setup_code_file()
@@ -5440,6 +5649,7 @@ mod tests {
             probe_delay: Duration::from_millis(CONTROL_ADMISSION_POLL_MS),
             admission_bytes: AdmissionBytesGuard::new(admission_total.clone()),
             guard: acquire_connection_slot(&active).unwrap(),
+            tls: None,
         };
         let request = b"POST /v1/config/validate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 4\r\n\r\n{}{}";
         let body_tail = 2;
@@ -5520,6 +5730,7 @@ mod tests {
             probe_delay: Duration::from_millis(CONTROL_ADMISSION_POLL_MS),
             admission_bytes: AdmissionBytesGuard::new(admission_total),
             guard: acquire_connection_slot(&active).unwrap(),
+            tls: None,
         };
         pending.stream.set_nonblocking(true).unwrap();
         client.write_all(b"G").unwrap();
@@ -5588,6 +5799,7 @@ mod tests {
             probe_delay: Duration::from_millis(CONTROL_ADMISSION_POLL_MS),
             admission_bytes: AdmissionBytesGuard::new(admission_total),
             guard: acquire_connection_slot(&active).unwrap(),
+            tls: None,
         };
         pending.stream.set_nonblocking(true).unwrap();
         client.write_all(b"G").unwrap();
@@ -5672,6 +5884,146 @@ mod tests {
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    fn test_certificate() -> Arc<onetdns_tls::ServerConfig> {
+        let ck = rcgen::generate_simple_self_signed(vec!["admin.example.com".to_string()]).unwrap();
+        Arc::new(
+            onetdns_tls::ServerConfig::from_pkcs8(
+                ck.cert.der().as_ref().to_vec(),
+                &ck.key_pair.serialize_der(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn tls_admission_rejects_a_client_hello_that_does_not_end_within_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        let shared = SharedTcp::new(server);
+        shared.set_nonblocking(true).unwrap();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let limit = onetdns_tls::record::MAX_CLIENT_HELLO_PREFIX;
+        // A 60000-byte ClientHello sent one byte per record does not end within the limit.
+        let mut received = vec![22, 3, 1, 0, 4, 1, 0, 0xea, 0x60];
+        while received.len() < limit {
+            received.extend_from_slice(&[22, 3, 1, 0, 1, 0]);
+        }
+        received.truncate(limit);
+        let mut pending = PendingControlConnection {
+            stream: shared,
+            peer,
+            accepted: Instant::now(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            received,
+            next_probe: Instant::now(),
+            probe_delay: Duration::from_millis(CONTROL_ADMISSION_POLL_MS),
+            admission_bytes: AdmissionBytesGuard::new(Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+            guard: acquire_connection_slot(&active).unwrap(),
+            tls: Some(test_certificate()),
+        };
+        let mut scratch = [0u8; CONTROL_ADMISSION_READ_BYTES];
+        let error = control_admission_state(&mut pending, &mut scratch)
+            .err()
+            .expect("한도를 넘는 ClientHello를 기다림");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A TLS client of the HTTPS listener at `addr`; returns the whole response.
+    fn https_exchange(addr: SocketAddr, request: &str) -> String {
+        let mut tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let client = onetdns_tls::ClientConfig {
+            server_name: "admin.example.com".to_string(),
+            verify_name: true,
+            roots: None,
+            insecure_verifier: Some(
+                onetdns_tls::InsecureVerifier::dangerously_disable_certificate_verification(),
+            ),
+            ..Default::default()
+        };
+        let conn = onetdns_tls::client_handshake(&mut tcp, &client).expect("TLS 핸드셰이크");
+        let mut tls = onetdns_tls::TlsStream::new(conn, tcp);
+        tls.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        tls.read_to_string(&mut response)
+            .expect("응답 끝에 close_notify가 와야 합니다");
+        response
+    }
+
+    #[test]
+    fn the_https_listener_answers_over_tls_at_a_public_origin() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let config = test_certificate();
+        let certificate: CertificateSource = Arc::new(move || Some(config.clone()));
+        let state = test_state("adm", "ro");
+        state.proxy.store(Arc::new(ProxyPolicy {
+            trusted: Vec::new(),
+            origins: vec![HttpsOrigin::parse("https://admin.example.com").unwrap()],
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let draining =
+                serve_https_listener(listener, state, server_shutdown, certificate).unwrap();
+            draining.join().unwrap();
+        });
+
+        let response = https_exchange(
+            addr,
+            "GET /v1/auth HTTP/1.1\r\nHost: admin.example.com\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        let response = https_exchange(
+            addr,
+            &format!("GET /v1/auth HTTP/1.1\r\nHost: {addr}\r\n\r\n"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 421 "),
+            "HTTPS 리스너가 루프백 Host에 답함: {response}"
+        );
+
+        let mut plain = TcpStream::connect(addr).unwrap();
+        plain
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        plain
+            .write_all(format!("GET /v1/auth HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ = plain.read_to_end(&mut answer);
+        assert!(
+            answer.is_empty(),
+            "평문 요청에 응답함: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        let failures = control_error_count("tls_handshake");
+        let mut broken = TcpStream::connect(addr).unwrap();
+        broken
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Framed as a whole ClientHello, so it passes admission and fails in the handshake.
+        broken
+            .write_all(&[22, 3, 1, 0, 8, 1, 0, 0, 4, 0, 0, 0, 0])
+            .unwrap();
+        let _ = broken.read_to_end(&mut Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control_error_count("tls_handshake") == failures {
+            assert!(Instant::now() < deadline, "핸드셰이크 실패가 집계되지 않음");
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
@@ -8369,20 +8721,37 @@ mod tests {
         let host = "admin.example.com";
         let origin = Some("https://admin.example.com");
 
-        let caller = control_caller(&policy, Some(proxy), 8553, host, origin, "198.51.100.7")
-            .expect("프록시를 거친 공개 출처가 거절됨");
-        assert!(caller.proxied.is_some());
+        let caller = control_caller(
+            &policy,
+            Some(proxy),
+            8553,
+            host,
+            origin,
+            "198.51.100.7",
+            false,
+        )
+        .expect("프록시를 거친 공개 출처가 거절됨");
+        assert!(matches!(caller.route, Route::Proxied { .. }));
         assert_eq!(caller.login_source(), "198.51.100.7");
         assert_eq!(caller.login_proxy().as_deref(), Some("127.0.0.1"));
         assert_eq!(caller.session_cookie(), SECURE_SESSION_COOKIE);
 
         assert_eq!(
-            control_caller(&policy, Some(other), 8553, host, origin, "").err(),
+            control_caller(&policy, Some(other), 8553, host, origin, "", false).err(),
             Some(HostRejection::Misdirected),
             "신뢰하지 않는 연결이 공개 출처로 들어옴"
         );
         assert_eq!(
-            control_caller(&ProxyPolicy::default(), Some(proxy), 8553, host, origin, "").err(),
+            control_caller(
+                &ProxyPolicy::default(),
+                Some(proxy),
+                8553,
+                host,
+                origin,
+                "",
+                false
+            )
+            .err(),
             Some(HostRejection::Misdirected),
             "설정이 없는데 공개 출처가 열림"
         );
@@ -8393,7 +8762,8 @@ mod tests {
                 8553,
                 host,
                 Some("https://evil.example"),
-                ""
+                "",
+                false
             )
             .err(),
             Some(HostRejection::CrossOrigin)
@@ -8405,7 +8775,8 @@ mod tests {
                 8553,
                 host,
                 Some("http://admin.example.com"),
-                ""
+                "",
+                false
             )
             .err(),
             Some(HostRejection::CrossOrigin),
@@ -8419,13 +8790,99 @@ mod tests {
             "127.0.0.1:8553",
             None,
             "1.2.3.4",
+            false,
         )
         .expect("루프백 Host가 거절됨");
         assert!(
-            local.proxied.is_none(),
+            matches!(local.route, Route::Local),
             "루프백 Host 요청에서 X-Forwarded-For를 읽음"
         );
         assert_eq!(local.session_cookie(), SESSION_COOKIE);
+    }
+
+    #[test]
+    /// The HTTPS listener answers only at a public origin, from any peer, and counts sign-in
+    /// failures per client network without reading X-Forwarded-For.
+    fn the_https_listener_answers_only_at_a_public_origin() {
+        let policy = proxied_policy();
+        let remote: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        let host = "admin.example.com";
+        let origin = Some("https://admin.example.com");
+
+        let caller = control_caller(
+            &policy,
+            Some(remote),
+            8554,
+            host,
+            origin,
+            "198.51.100.7",
+            true,
+        )
+        .expect("HTTPS 리스너가 공개 출처를 거절함");
+        assert!(matches!(caller.route, Route::Https));
+        assert_eq!(
+            caller.login_source(),
+            "203.0.113.9",
+            "X-Forwarded-For를 읽음"
+        );
+        assert_eq!(caller.login_proxy(), None);
+        assert_eq!(caller.session_cookie(), SECURE_SESSION_COOKIE);
+        assert!(caller.public(), "HTTPS 요청에 첫 계정 만들기가 열림");
+
+        assert_eq!(
+            control_caller(
+                &policy,
+                Some(remote),
+                8554,
+                "127.0.0.1:8554",
+                None,
+                "",
+                true
+            )
+            .err(),
+            Some(HostRejection::Misdirected),
+            "HTTPS 리스너가 루프백 Host를 받음"
+        );
+        assert_eq!(
+            control_caller(&policy, Some(remote), 8554, "evil.example", None, "", true).err(),
+            Some(HostRejection::Misdirected),
+            "HTTPS 리스너가 공개 출처가 아닌 Host를 받음"
+        );
+        assert_eq!(
+            control_caller(
+                &policy,
+                Some(remote),
+                8554,
+                host,
+                Some("https://evil.example"),
+                "",
+                true
+            )
+            .err(),
+            Some(HostRejection::CrossOrigin)
+        );
+        assert_eq!(
+            control_caller(
+                &ProxyPolicy::default(),
+                Some(remote),
+                8554,
+                host,
+                origin,
+                "",
+                true
+            )
+            .err(),
+            Some(HostRejection::Misdirected),
+            "공개 출처 설정 없이 HTTPS 요청을 받음"
+        );
+
+        let mapped: SocketAddr = "[::ffff:127.0.0.2]:50000".parse().unwrap();
+        let local = control_caller(&policy, Some(mapped), 8554, host, origin, "", true).unwrap();
+        assert_eq!(
+            local.login_source(),
+            "local",
+            "루프백 주소를 바꿔 가며 로그인 실패 한도를 피할 수 있음"
+        );
     }
 
     #[test]
@@ -8573,9 +9030,9 @@ mod tests {
         let proxy: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let caller = |client: &str| Caller {
             peer: Some(proxy),
-            proxied: Some(Proxied {
+            route: Route::Proxied {
                 client: Some(client.parse().unwrap()),
-            }),
+            },
             filter_apply: FilterApply::Wait,
         };
         for i in 0..MAX_SOURCE_LOGIN_FAILURES {
