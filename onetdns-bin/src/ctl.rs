@@ -9,20 +9,28 @@ use crate::error::BoxResult;
 use crate::filters::blocklist_host_resolver;
 use crate::http;
 
+/// Without `--config` or `--url`, reads the config a server started without `--config` uses.
 fn resolve_ctl(ctl: &CtlArgs) -> BoxResult<(String, String)> {
-    if let Some(p) = &ctl.config {
-        let cfg = Config::load_or_default(Some(p))?;
-        let addr = cfg.control_listen.ok_or_else(|| {
-            crate::anyhow!("The configuration file has no control_listen setting")
-        })?;
-        Ok((base_url(addr), cfg.control_token.as_str().to_owned()))
-    } else {
+    let config = match (&ctl.config, &ctl.url) {
+        (Some(path), _) => Some(path.clone()),
+        // The token in this machine's config must not go to an address the user typed.
+        (None, Some(_)) => None,
+        (None, None) => crate::auto_config_path().filter(|path| path.is_file()),
+    };
+    let Some(path) = config else {
         let url = ctl
             .url
             .clone()
-            .unwrap_or_else(|| "http://127.0.0.1:8553".to_string());
-        Ok((url, ctl.token.clone().unwrap_or_default()))
-    }
+            .unwrap_or_else(|| base_url(crate::DEFAULT_CONTROL_LISTEN));
+        return Ok((url, ctl.token.clone().unwrap_or_default()));
+    };
+    let cfg = Config::load_or_default(Some(&path))?;
+    let addr = cfg.control_listen.unwrap_or(crate::DEFAULT_CONTROL_LISTEN);
+    let token = ctl
+        .token
+        .clone()
+        .unwrap_or_else(|| cfg.control_token.as_str().to_owned());
+    Ok((base_url(addr), token))
 }
 
 fn base_url(addr: SocketAddr) -> String {
@@ -136,4 +144,56 @@ pub(crate) fn ctl_add(kind: &str, domain: &str, ctl: &CtlArgs) -> BoxResult<()> 
 
 pub(crate) fn counts((block, allow): (usize, usize)) -> onetdns_control::ListCounts {
     onetdns_control::ListCounts { block, allow }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_file(body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-ctl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("OnetDNS.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_config_without_control_listen_reaches_the_default_dashboard() {
+        let path = config_file("control_token = \"config-token\"\n");
+        let ctl = CtlArgs {
+            config: Some(path.clone()),
+            ..CtlArgs::default()
+        };
+        let (url, token) = resolve_ctl(&ctl).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8553");
+        assert_eq!(token, "config-token");
+
+        let typed = CtlArgs {
+            config: Some(path.clone()),
+            token: Some("typed-token".into()),
+            ..CtlArgs::default()
+        };
+        assert_eq!(resolve_ctl(&typed).unwrap().1, "typed-token");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_typed_address_gets_only_a_typed_token() {
+        let ctl = CtlArgs {
+            url: Some("https://dns.example:8554".into()),
+            ..CtlArgs::default()
+        };
+        assert_eq!(
+            resolve_ctl(&ctl).unwrap(),
+            ("https://dns.example:8554".to_string(), String::new())
+        );
+    }
 }

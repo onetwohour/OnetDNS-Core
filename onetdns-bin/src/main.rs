@@ -175,6 +175,10 @@ pub(crate) const PRODUCT_NAME: &str = "OnetDNS";
 /// Looked up when started without arguments.
 pub(crate) const CONFIG_FILE_NAME: &str = "OnetDNS.toml";
 
+/// Where the dashboard opens when the config sets no `control_listen`.
+pub(crate) const DEFAULT_CONTROL_LISTEN: SocketAddr =
+    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8553));
+
 fn main() -> BoxResult<()> {
     #[cfg(unix)]
     unsafe {
@@ -729,7 +733,7 @@ fn apply_web_defaults(cfg: &mut Config, no_web: bool, config_path: Option<&std::
         );
         return;
     }
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8553));
+    let addr = DEFAULT_CONTROL_LISTEN;
     cfg.control_listen = Some(addr);
     let auto_token = cfg.control_token.is_empty();
     let mut persisted = false;
