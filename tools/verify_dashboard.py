@@ -629,9 +629,9 @@ def check_toast_is_never_painted_behind_an_overlay(source: str) -> None:
     layers = [int(value) for value in re.findall(r"z-index:\s*(\d+)", source)]
     if not layers:
         fail("no z-index declarations found; the stacking check cannot run")
-    match = re.search(r"const toastStyle=`[^`]*?z-index:\s*(\d+)", source)
+    match = re.search(r"const toastStackStyle=`[^`]*?z-index:\s*(\d+)", source)
     if not match:
-        fail("toastStyle not found, or it no longer declares a z-index")
+        fail("toastStackStyle not found, or it no longer declares a z-index")
     toast = int(match.group(1))
     highest_other = max(value for value in layers if value != toast)
     if toast <= highest_other:
@@ -951,7 +951,7 @@ def main() -> None:
     ):
         if dialog not in source:
             fail(f"accessible dialog semantics missing: {dialog}")
-    if ':focus-visible' not in source or 'aria-live="{{ toastLive }}"' not in source:
+    if ':focus-visible' not in source or 'aria-live="{{ tt.live }}"' not in source:
         fail("keyboard focus or live-region accessibility support is missing")
 
     # 확인 대화상자는 답을 기다려야 한다. await 를 빠뜨리면 Promise 가 늘 참이라

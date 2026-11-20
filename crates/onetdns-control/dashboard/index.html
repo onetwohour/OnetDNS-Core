@@ -23,6 +23,9 @@
   body{ font-family:var(--font-sans); -webkit-font-smoothing:antialiased; }
   button:focus-visible,input:focus-visible,textarea:focus-visible,[role="button"]:focus-visible,[tabindex]:focus-visible{ outline:3px solid var(--accent); outline-offset:2px; }
   button[disabled],input[disabled],textarea[disabled],[aria-disabled="true"]{ cursor:not-allowed !important; opacity:.58; }
+  [data-toast-text]{ flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  [data-toast]:hover,[data-toast]:focus-within{ align-items:flex-start !important; max-height:60vh; overflow-y:auto; }
+  [data-toast]:hover [data-toast-text],[data-toast]:focus-within [data-toast-text]{ white-space:normal; overflow:visible; overflow-wrap:anywhere; }
   [data-readonly-note]{ display:none; }
   [data-readonly="true"] [data-readonly-note]{ display:block; }
   ::selection{ background:color-mix(in srgb,var(--accent,#2f4a6b) 24%,transparent); }
@@ -1129,7 +1132,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
   </div>
   </sc-if>
 
-  <sc-if value="{{ toast }}"><div role="{{ toastRole }}" aria-live="{{ toastLive }}" aria-atomic="true" style="{{ toastStyle }}"><span style="display:flex">{{ toastIcon }}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ toast }}</span><sc-if value="{{ toastAction }}"><button onClick="{{ runToastAction }}" style="flex:0 0 auto;padding:5px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">{{ toastActionLabel }}</button></sc-if></div></sc-if>
+  <sc-if value="{{ hasToasts }}"><div style="{{ toastStackStyle }}"><sc-for list="{{ toasts }}" as="tt" key="{{ tt.id }}" hint-placeholder-count="1"><div data-toast="" tabIndex="0" role="{{ tt.role }}" aria-live="{{ tt.live }}" aria-atomic="true" onMouseEnter="{{ tt.onHold }}" onMouseLeave="{{ tt.onRelease }}" onFocus="{{ tt.onHold }}" onBlur="{{ tt.onRelease }}" style="{{ tt.style }}"><span style="display:flex">{{ tt.icon }}</span><span data-toast-text="">{{ tt.text }}</span><sc-if value="{{ tt.action }}"><button onClick="{{ tt.onAction }}" style="flex:0 0 auto;padding:5px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">{{ tt.actionLabel }}</button></sc-if><button onClick="{{ tt.onClose }}" aria-label="{{ tt.closeLabel }}" title="{{ tt.closeLabel }}" style="flex:0 0 auto;width:24px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:3px;background:transparent;color:var(--muted);font:inherit;font-size:17px;line-height:1;cursor:pointer">×</button></div></sc-for></div></sc-if>
   <sc-if value="{{ confirmOpen }}"><div style="position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(20,18,12,.45);padding:20px"><div id="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-message" style="width:100%;max-width:420px;border:1px solid var(--border);border-radius:5px;background:var(--surface);box-shadow:0 18px 48px rgba(20,18,12,.28);overflow:hidden">
     <div id="confirm-message" style="padding:20px 22px 6px;font-size:13.5px;font-weight:600;color:var(--fg);line-height:1.55">{{ confirmMessage }}</div>
     <sc-if value="{{ confirmDetail }}"><div style="padding:0 22px 4px;font-size:12px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere;white-space:pre-line">{{ confirmDetail }}</div></sc-if>
@@ -4397,6 +4400,7 @@ Object.assign(I18N.en, {
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"The new address is not in the public addresses, so it will not answer: {url}",
   "현재 주소를 공개 주소에서 뺄까요?":"Remove the current address from the public addresses?",
   "관리 화면 공개 주소도 함께 저장할까요?":"Save a public dashboard address too?",
+  "알림 닫기":"Close notification",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"The HTTPS dashboard answers only at a public dashboard address. Public address: {url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"The HTTPS dashboard answers only at a public dashboard address. Enter the HTTPS address you reach it at in Public dashboard addresses as well",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS now runs version {version}",
@@ -4444,6 +4448,7 @@ Object.assign(I18N.ja, {
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"新しいアドレスが公開アドレスにないため、接続できません: {url}",
   "현재 주소를 공개 주소에서 뺄까요?":"現在のアドレスを公開アドレスから外しますか？",
   "관리 화면 공개 주소도 함께 저장할까요?":"管理画面の公開アドレスも一緒に保存しますか？",
+  "알림 닫기":"通知を閉じる",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。公開アドレス: {url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。管理画面の公開アドレスに、接続に使う HTTPS アドレスも入力してください",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS がバージョン {version} に切り替わりました",
@@ -4491,6 +4496,7 @@ Object.assign(I18N.zh, {
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"新地址不在公开地址中，无法访问：{url}",
   "현재 주소를 공개 주소에서 뺄까요?":"要从公开地址中移除当前地址吗？",
   "관리 화면 공개 주소도 함께 저장할까요?":"要同时保存管理界面公开地址吗？",
+  "알림 닫기":"关闭通知",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS 管理界面只响应发往管理界面公开地址的请求。公开地址：{url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS 管理界面只响应发往管理界面公开地址的请求。请同时在管理界面公开地址中填写用于访问的 HTTPS 地址",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS 已切换到版本 {version}",
@@ -4729,6 +4735,8 @@ function pageAddress(){
 
 // The client setup inputs last used in this browser, so the stamps can be made again after a reload.
 const CLIENT_SETUP_KEY = 'onetdns_client_setup';
+// Notifications shown at once; the oldest goes first.
+const TOAST_LIMIT = 4;
 function clientSetupForms(){
   let saved=null;
   try{saved=JSON.parse(localStorage.getItem(CLIENT_SETUP_KEY)||'null');}catch(e){}
@@ -4867,7 +4875,7 @@ class Component extends DCLogic {
     qlWindow: 100,
     hover: null,
     drawer: null,
-    toast: null,
+    toasts: [],
     forms: { qlText:'', qlAction:'all', qlTransport:'all',
              block:'', allowD:'', ruleText:'', ruleType:'block', subName:'', subUrl:'',
              clName:'', clId:'', exQname:'', exQtype:'A', exClient:'',
@@ -4979,7 +4987,7 @@ class Component extends DCLogic {
     clearTimeout(this._bootSubsT);
     clearTimeout(this._cfgFlush);
     clearTimeout(this._reverify);
-    clearTimeout(this._tt);
+    this.clearToastTimers();
     this._socketClosed=true;
     if(this._ws){this._ws.onclose=null;this._ws.close();}
     this.abortRequests();
@@ -5026,7 +5034,7 @@ class Component extends DCLogic {
   sessionResetPatch(connectionState,notice){
     const f=this.state.forms||{};
     return {loggedIn:false,authRole:'none',authPending:false,restOnline:false,streamOnline:false,connectionState:connectionState||'offline',connectionAt:0,loginNotice:notice||'',
-      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toast:null,confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,listsUpdating:false,
+      accountOpen:false,helpOpen:false,navOpen:false,dropdown:null,ddOptions:[],drawer:null,toasts:[],confirm:null,lnEdit:null,mutationPending:{},pendingItems:{},filterApplying:false,listsUpdating:false,
       account:{user:'',display:'',tokenReveal:false},tokenSecret:null,configDraft:{},configDraftDirty:{},diff:null,configValid:null,pageExplain:null,
       log:[],audit:[],clients:[],upstreams:[],zones:[],tokens:[],jobs:[],update:null,updateBusy:null,reservations:[],reservationsAvailable:null,listeners:[],listenerStatus:[],sysAdapters:[],clientSetup:null,
       rewrites:[],filterPlugins:[],filterReport:null,topRules:null,filterSources:null,access:null,revocation:null,zoneDnssec:null,
@@ -5973,9 +5981,24 @@ class Component extends DCLogic {
   onChartKeyDown=(e)=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key)||!this._chartCols||!this._chartCols.length)return;e.preventDefault();const max=this._chartCols.length-1;let i=Number.isInteger(this._chartKeyboardIndex)?this._chartKeyboardIndex:max;if(e.key==='ArrowLeft')i=Math.max(0,i-1);else if(e.key==='ArrowRight')i=Math.min(max,i+1);else if(e.key==='Home')i=0;else i=max;this._chartKeyboardIndex=i;const c=this._chartCols[i],t=this._tipRef&&this._tipRef.current,g=this._guideRef&&this._guideRef.current,d=this._dotRef&&this._dotRef.current;if(g){g.style.opacity='1';g.style.left=c.xPct+'%';}if(d){d.style.opacity='1';d.style.left=c.xPct+'%';d.style.top=c.qyPct+'%';}if(t){t.style.opacity='1';t.textContent=this.tr('{time} · 질의 {qps} · 차단 {blocked}',{time:c.label,qps:c.qv,blocked:c.bv});t.style.left=c.xPct+'%';}};
   // 오류 문구는 서버 설명이 붙어 길다. 고정 2.6초로 지우면 다 읽기 전에 사라지고
   // 토스트는 기록이 남지 않아 다시 볼 방법이 없다. 길이에 맞춰 머무는 시간을 늘린다.
-  toastHold(text,bad){ if(!bad) return 2600; return Math.max(8000, Math.min(20000, 1200+160*text.length)); }
-  toastMsg(msg,bad,action){ const text=String(msg==null?'':msg); const localized=this.t(text); this.setState({toast:localized, toastBad:!!bad, toastAction:action||null}); clearTimeout(this._tt); this._tt=setTimeout(()=>this.setState({toast:null,toastAction:null}),Math.max(this.toastHold(localized,!!bad),action?8000:0)); }
-  runToastAction=()=>{const action=this.state.toastAction;clearTimeout(this._tt);this.setState({toast:null,toastAction:null});if(action)action.run();};
+  // 오류 알림은 닫을 때까지 남고, 나머지는 잠시 뒤 사라진다. 마우스나 포커스가 올라가 있는 동안은
+  // 사라지지 않는다. 같은 알림이 다시 오면 쌓지 않고 맨 아래로 옮긴다.
+  toastTimers(){return this._toastTimers||(this._toastTimers=new Map());}
+  clearToastTimers(){for(const timer of this.toastTimers().values())clearTimeout(timer);this.toastTimers().clear();}
+  toastMsg(msg,bad,action){
+    const text=this.t(String(msg==null?'':msg)),toast={id:this._toastSeq=(this._toastSeq||0)+1,text,bad:!!bad,action:action||null};
+    this.setState(s=>({toasts:[...(s.toasts||[]).filter(x=>x.text!==text||x.bad!==toast.bad),toast].slice(-TOAST_LIMIT)}));
+    this.scheduleToast(toast);
+  }
+  scheduleToast(toast){
+    this.holdToast(toast.id);
+    if(toast.bad)return;
+    this.toastTimers().set(toast.id,setTimeout(()=>this.dismissToast(toast.id),toast.action?8000:2600));
+  }
+  holdToast(id){clearTimeout(this.toastTimers().get(id));this.toastTimers().delete(id);}
+  releaseToast(id){const toast=(this.state.toasts||[]).find(x=>x.id===id);if(toast)this.scheduleToast(toast);}
+  dismissToast(id){this.holdToast(id);this.setState(s=>({toasts:(s.toasts||[]).filter(x=>x.id!==id)}));}
+  runToastAction(id){const toast=(this.state.toasts||[]).find(x=>x.id===id);this.dismissToast(id);if(toast&&toast.action)toast.action.run();}
   validViews(){return new Set(['dashboard','querylog','lists','services','clients','upstreams','encryption','zones','dhcp','explain','cluster','operations','settings','account','tokens']);}
   viewFromLocation(){if(typeof location==='undefined')return 'dashboard';const value=decodeURIComponent(String(location.hash||'').replace(/^#\/?/,''));return this.validViews().has(value)?value:'dashboard';}
   go(v){return ()=>{if(!this.validViews().has(v))return;if(typeof history!=='undefined'&&this.viewFromLocation()!==v)history.pushState({view:v},'','#/'+encodeURIComponent(v));this.setState({view:v,navOpen:false,dropdown:null,ddOptions:[]});};}
@@ -7077,8 +7100,12 @@ class Component extends DCLogic {
     const [vt,vs]=this.titleFor(s.view);
 
 
-    const toastStyle=`position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:100;max-width:min(92vw,620px);display:flex;align-items:center;gap:9px;padding:11px 17px;border-radius:3px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${s.toastBad?'var(--block)':'var(--ok)'};box-shadow:0 12px 40px rgba(13,18,30,.2);font-size:13px;font-weight:600;color:var(--fg);animation:odToast .2s ease`;
-    const toastIcon=React.createElement('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:s.toastBad?'var(--block)':'var(--ok)','strokeWidth':1.85,'strokeLinecap':'round','strokeLinejoin':'round'},React.createElement('path',{d:s.toastBad?'M12 8v5m0 3h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z':'M20 6 9 17l-5-5'}));
+    const toastStackStyle=`position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:100;display:flex;flex-direction:column;align-items:center;gap:8px;width:max-content;max-width:min(92vw,620px)`;
+    const toastStyle=bad=>`max-width:100%;display:flex;align-items:center;gap:9px;padding:11px 9px 11px 17px;border-radius:3px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${bad?'var(--block)':'var(--ok)'};box-shadow:0 12px 40px rgba(13,18,30,.2);font-size:13px;font-weight:600;color:var(--fg);animation:odToast .2s ease`;
+    const toastIcon=bad=>React.createElement('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:bad?'var(--block)':'var(--ok)','strokeWidth':1.85,'strokeLinecap':'round','strokeLinejoin':'round'},React.createElement('path',{d:bad?'M12 8v5m0 3h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z':'M20 6 9 17l-5-5'}));
+    const toasts=(s.toasts||[]).map(x=>({id:x.id,text:x.text,role:x.bad?'alert':'status',live:x.bad?'assertive':'polite',style:toastStyle(x.bad),icon:toastIcon(x.bad),
+      action:!!x.action,actionLabel:x.action?x.action.label:'',onAction:()=>this.runToastAction(x.id),onClose:()=>this.dismissToast(x.id),
+      onHold:()=>this.holdToast(x.id),onRelease:()=>this.releaseToast(x.id),closeLabel:this.t('알림 닫기')}));
     const configStatus=s.configStatus||{in_sync:true,changed_keys:[]};
     // 확인 실패도 배너로 드러낸다. 어긋남과 구분해 문구·적용 버튼을 달리한다.
     const configCheckFailed=configStatus.check_failed===true;
@@ -7152,11 +7179,7 @@ class Component extends DCLogic {
       onForm:this.onForm, onConfigText:this.onConfigText, clearLog:this.clearLog, hoverOn:this.hoverOn, hoverOff:this.hoverOff,
       drawerOpen:!!s.drawer, drawer:s.drawer, closeDrawer:this.closeDrawer,
       drawerBody:this.drawerBodyEl(),
-      toast:s.toast, toastStyle, toastIcon, toastAction:!!s.toastAction, toastActionLabel:s.toastAction?s.toastAction.label:'', runToastAction:this.runToastAction,
-      // 템플릿이 role과 aria-live를 여기서 받는다. 빠뜨리면 토스트가 라이브 리전이
-      // 아니게 되어 화면을 읽어 주는 사용자에게 성공도 실패도 전달되지 않는다.
-      toastRole:s.toastBad?'alert':'status', toastLive:s.toastBad?'assertive':'polite',
-
+      toasts, hasToasts:toasts.length>0, toastStackStyle,
       ...this.viewVals()
     };
   }

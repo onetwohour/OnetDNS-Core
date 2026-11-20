@@ -504,6 +504,8 @@
   function walkFor(el, host) {
     const listGet = compileAttr(el.getAttribute("list") || "");
     const asName = el.getAttribute("as") || "item";
+    // Without a key, items are told apart by position, so removing one hands its element to the next.
+    const keyGet = el.hasAttribute("key") ? compileAttr(el.getAttribute("key")) : null;
     const hintN = parseInt(el.getAttribute("hint-placeholder-count") || "0", 10);
     const kids = walkChildren(el, host);
     const listSrc = el.getAttribute("list") || "";
@@ -529,7 +531,7 @@
           const sub = { ...vals, [asName]: item, $index: i };
           return h(
             getReact().Fragment,
-            { key: i },
+            { key: keyGet ? keyGet(sub) : i },
             kids.map((b, j) => b(sub, ctx, j))
           );
         })
