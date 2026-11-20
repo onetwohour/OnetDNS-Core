@@ -550,9 +550,14 @@ fn plain_listener_key(cfg: &Config, addr: &SocketAddr, workers: usize, acceptors
 
 /// "Address in use" alone does not say who holds it, so the operator cannot fix it. A wildcard
 /// address is blocked even when every specific address looks free, which makes the config look
-/// wrong. The message adds a command that finds the holder.
+/// wrong. The message adds a command that finds the holder. A public IP behind NAT is not on the
+/// machine, so that error says what to listen on instead.
 fn listener_open_error(role: &str, addr: SocketAddr, error: &std::io::Error) -> String {
     let mut text = format!("Could not open the {role} listening address: {addr}: {error}");
+    if error.kind() == std::io::ErrorKind::AddrNotAvailable {
+        text.push_str(". This machine has no such address. A cloud server's public IP usually belongs to the provider's NAT, not to the machine: listen on 0.0.0.0 or the private address, and give clients the public IP.");
+        return text;
+    }
     if error.kind() != std::io::ErrorKind::AddrInUse {
         return text;
     }
@@ -1367,6 +1372,19 @@ pub(crate) mod tests {
         assert!(
             !denied.contains("netstat") && !denied.contains("ss -lnup"),
             "점유 문제가 아닐 때 엉뚱한 명령을 알리면 안 됩니다: {denied}"
+        );
+    }
+
+    #[test]
+    fn an_address_this_machine_lacks_points_to_the_wildcard() {
+        // 192.0.2.1 is reserved for documentation, so no machine running the tests has it.
+        let addr: SocketAddr = "192.0.2.1:5443".parse().unwrap();
+        let error = UdpSocket::bind(addr).expect_err("문서용 주소에 바인드됐습니다");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+        let text = listener_open_error("DNSCrypt", addr, &error);
+        assert!(
+            text.contains("listen on 0.0.0.0"),
+            "수신할 주소를 알려야 합니다: {text}"
         );
     }
 
