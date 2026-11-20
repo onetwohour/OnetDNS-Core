@@ -438,8 +438,13 @@ pub(crate) fn parse_address(text: &str) -> Result<IpAddr, String> {
     if text.parse::<SocketAddr>().is_ok() {
         return Err(format!("Enter the IP address without a port: {text}"));
     }
-    text.parse()
-        .map_err(|_| format!("Invalid IP address: {text}"))
+    let ip: IpAddr = text
+        .parse()
+        .map_err(|_| format!("Invalid IP address: {text}"))?;
+    if ip.is_unspecified() {
+        return Err(format!("0.0.0.0 and :: mean every address on this machine, so clients cannot connect to them. Enter the address clients reach this server at, such as its public IP, instead of {text}"));
+    }
+    Ok(ip)
 }
 
 /// IPv6 goes in brackets even without a port.
@@ -621,6 +626,13 @@ mod tests {
             parse_address("dns.example"),
             Err("Invalid IP address: dns.example".to_string())
         );
+        for text in ["0.0.0.0", "::"] {
+            let refused = parse_address(text).unwrap_err();
+            assert!(
+                refused.ends_with(&format!("instead of {text}")),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
