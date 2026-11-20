@@ -4401,6 +4401,7 @@ Object.assign(I18N.en, {
   "현재 주소를 공개 주소에서 뺄까요?":"Remove the current address from the public addresses?",
   "관리 화면 공개 주소도 함께 저장할까요?":"Save a public dashboard address too?",
   "알림 닫기":"Close notification",
+  "다음 화면의 정보를 불러오지 못했습니다: ":"Could not load the information for: ",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"The HTTPS dashboard answers only at a public dashboard address. Public address: {url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"The HTTPS dashboard answers only at a public dashboard address. Enter the HTTPS address you reach it at in Public dashboard addresses as well",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS now runs version {version}",
@@ -4449,6 +4450,7 @@ Object.assign(I18N.ja, {
   "현재 주소를 공개 주소에서 뺄까요?":"現在のアドレスを公開アドレスから外しますか？",
   "관리 화면 공개 주소도 함께 저장할까요?":"管理画面の公開アドレスも一緒に保存しますか？",
   "알림 닫기":"通知を閉じる",
+  "다음 화면의 정보를 불러오지 못했습니다: ":"次の画面の情報を読み込めませんでした: ",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。公開アドレス: {url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。管理画面の公開アドレスに、接続に使う HTTPS アドレスも入力してください",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS がバージョン {version} に切り替わりました",
@@ -4497,6 +4499,7 @@ Object.assign(I18N.zh, {
   "현재 주소를 공개 주소에서 뺄까요?":"要从公开地址中移除当前地址吗？",
   "관리 화면 공개 주소도 함께 저장할까요?":"要同时保存管理界面公开地址吗？",
   "알림 닫기":"关闭通知",
+  "다음 화면의 정보를 불러오지 못했습니다: ":"无法加载以下页面的信息：",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS 管理界面只响应发往管理界面公开地址的请求。公开地址：{url}",
   "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS 管理界面只响应发往管理界面公开地址的请求。请同时在管理界面公开地址中填写用于访问的 HTTPS 地址",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS 已切换到版本 {version}",
@@ -4737,6 +4740,10 @@ function pageAddress(){
 const CLIENT_SETUP_KEY = 'onetdns_client_setup';
 // Notifications shown at once; the oldest goes first.
 const TOAST_LIMIT = 4;
+// The view that shows what each request of the first load reads. A path also covers the paths under it.
+const LOAD_VIEWS = [['/v1/upstreams','upstreams'],['/v1/clients','clients'],['/v1/access','clients'],['/v1/rewrites','lists'],
+  ['/v1/zones','zones'],['/v1/dhcp','dhcp'],['/v1/cluster','cluster'],['/v1/config','settings'],['/v1/services','services'],
+  ['/v1/tls','encryption'],['/v1/tokens','tokens'],['/v1/filter','lists'],['/v1/audit','operations']];
 function clientSetupForms(){
   let saved=null;
   try{saved=JSON.parse(localStorage.getItem(CLIENT_SETUP_KEY)||'null');}catch(e){}
@@ -5082,6 +5089,7 @@ class Component extends DCLogic {
       if(r.status===401&&path!=='/v1/auth'&&path!=='/v1/login'){this.authExpired();return {ok:false,status:401,body,stale:true};}
       if(r.ok){const streamOnline=!!(this._ws&&this._ws.readyState===WebSocket.OPEN);this.setState({restOnline:true,streamOnline,connectionState:streamOnline||!this.state.loggedIn?'online':'degraded',connectionAt:Date.now()});}
       else if(r.status>=500)this.setState({restOnline:true,connectionState:'degraded'});
+      if(!r.ok)this.noteLoadFailure(method,path,{ok:false,status:r.status,body});
       return {ok:r.ok,status:r.status,body};
     }catch(e){
       if(generation!==this._sessionGeneration)return {ok:false,status:499,body:null,stale:true};
@@ -5092,6 +5100,15 @@ class Component extends DCLogic {
     }finally{clearTimeout(timeout);this._requestControllers.delete(controller);}
   }
   apiGet(path){ return this.request(path,{headers:this.apiHdr()}); }
+  // Collects what the first load after login could not read, by the view that shows it. A role
+  // without access (403) or a feature this build lacks (404) is expected and stays quiet, and an
+  // unreachable server already shows in the connection state.
+  noteLoadFailure(method,path,response){
+    const failed=this._loadFailures;
+    if(!failed||method!=='GET'||response.status===403||response.status===404)return;
+    const view=LOAD_VIEWS.find(([prefix])=>path===prefix||path.startsWith(prefix+'/'));
+    if(view&&!failed.has(view[1]))failed.set(view[1],response);
+  }
   apiSend(path,method,body,options){
     const readonlySafe=method==='POST'&&(path==='/v1/explain'||path==='/v1/resolve'||path==='/v1/policies/simulate'||path==='/v1/password');
     if(this.state.authRole==='readonly'&&path!=='/v1/logout'&&!readonlySafe){
@@ -5481,8 +5498,14 @@ class Component extends DCLogic {
     return true;
   }
   async loadCollections(){
+    const failed=this._loadFailures=new Map();
     const tasks=[this.loadUpstreams(),this.loadClients(),this.loadAccess(),this.loadRewrites(),this.loadZones(),this.loadLeases(),this.loadReservations(),this.loadCluster(),this.loadSchema(),this.loadServices(),this.loadTls(),this.loadTokens(),this.bootSubs(),this.loadConfigState(),this.loadRuleState(),this.loadAudit()];
     await Promise.allSettled(tasks);
+    if(this._loadFailures===failed)this._loadFailures=null;
+    if(failed.size){
+      const views=[...failed.keys()].map(view=>this.titleFor(view)[0]).join(', ');
+      this.toastMsg(this.t('다음 화면의 정보를 불러오지 못했습니다: ')+views+'. '+this.errorText([...failed.values()][0]),true);
+    }
     if(this.state.view==='lists')await this.loadFilterDiagnostics();
     if(this.state.view==='encryption'&&this.state.authRole==='admin')await this.loadClientSetup(true);
   }
