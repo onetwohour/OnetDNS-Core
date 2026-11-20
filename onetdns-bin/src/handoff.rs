@@ -931,6 +931,14 @@ mod tests {
         crate::tests::tcp_udp_test_listeners().2
     }
 
+    /// Each address is chosen while the ones before it are still held, so no two are the same.
+    fn distinct_addrs<const N: usize>() -> [SocketAddr; N] {
+        let held: Vec<_> = (0..N)
+            .map(|_| crate::tests::tcp_udp_test_listeners())
+            .collect();
+        std::array::from_fn(|i| held[i].2)
+    }
+
     /// Starts a generation and waits until it serves.
     fn start_serving(
         cfg: Config,
@@ -996,8 +1004,8 @@ mod tests {
     /// running generation serves again, and no query goes unanswered on the way there and back.
     fn a_failed_successor_hands_the_service_back() {
         let _serial = one_at_a_time();
-        let dns = dns_addr();
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dns = dns_addr();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
         let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
@@ -1076,8 +1084,8 @@ mod tests {
     /// draining end, so a busy one does not leave UDP unanswered meanwhile.
     fn a_failed_handoff_serves_again_before_its_connections_drain() {
         let _serial = one_at_a_time();
-        let dns = dns_addr();
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dns = dns_addr();
         let old_shared = crate::ServeShared::default();
         let old_links = old_shared.links.clone();
         let old = start_serving(config(dns, OLD_ANSWER, ""), None, old_shared);
@@ -1302,11 +1310,7 @@ mod tests {
         const PASSWORD_HASH: &str = "pbkdf2-sha256$100000$000102030405060708090a0b0c0d0e0f$\
             d342ca8060f543f59165684524a66a4a1db7b862b3661a9cb84632fa87479273";
         let _serial = one_at_a_time();
-        let dns = dns_addr();
-        let control = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let [dns, control] = distinct_addrs();
         let account = format!(
             "control_listen = \"{control}\"\n[[users]]\nname = \"alice\"\n\
              password_hash = \"{PASSWORD_HASH}\"\nrole = \"admin\"\n"
@@ -1433,12 +1437,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let _serial = one_at_a_time();
-        let dns = dns_addr();
-        let dnscrypt = dns_addr();
-        let dot = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let [dns, dnscrypt, dot] = distinct_addrs();
         let text = format!(
             "listen = [\"{dns}\"]\nworkers = 2\nbackend = \"forward\"\n\
              upstream_urls = [\"udp://192.0.2.1:53\"]\nblock_rules = [\"||handover.test^\"]\n\
