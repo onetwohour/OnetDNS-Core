@@ -107,7 +107,7 @@ tls_key  = "/etc/OnetDNS/privkey.pem"
 
 Devices accept only a certificate that is valid for the name they connect to, so you need a domain name that points at this machine and a certificate for it.
 
-To get one from Let's Encrypt, request it on the Encrypted transport page, then add `listen_dot` and `listen_doh`; they do not start without a certificate. HTTP-01 needs requests to port 80 for `/.well-known/acme-challenge/` forwarded to the dashboard address. DNS-01 needs OnetDNS to be the authoritative server for the domain.
+To get one from Let's Encrypt, request it on the Encrypted transport page, then add `listen_dot` and `listen_doh`; they do not start without a certificate. HTTP-01 needs requests to port 80 for `/.well-known/acme-challenge/` forwarded to the dashboard address. DNS-01 needs an NS record that delegates `_acme-challenge.<your domain>` to this server, and port 53 open to the internet.
 
 The certificate goes to the files in `tls_cert` and `tls_key`; without them, it is saved next to the config file and set as `tls_cert` and `tls_key`. OnetDNS renews it when a third of its lifetime is left. `acme_directory_url` selects another ACME CA.
 
