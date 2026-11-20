@@ -4396,6 +4396,9 @@ Object.assign(I18N.en, {
   "현재 주소를 바꿀까요?":"Change the current address?",
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"The new address is not in the public addresses, so it will not answer: {url}",
   "현재 주소를 공개 주소에서 뺄까요?":"Remove the current address from the public addresses?",
+  "관리 화면 공개 주소도 함께 저장할까요?":"Save a public dashboard address too?",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"The HTTPS dashboard answers only at a public dashboard address. Public address: {url}",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"The HTTPS dashboard answers only at a public dashboard address. Enter the HTTPS address you reach it at in Public dashboard addresses as well",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS now runs version {version}",
   "업데이트를 확인하지 못했습니다":"Could not check for updates",
   "업데이트를 설치하지 못했습니다":"Could not install the update",
@@ -4440,6 +4443,9 @@ Object.assign(I18N.ja, {
   "현재 주소를 바꿀까요?":"現在のアドレスを変更しますか？",
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"新しいアドレスが公開アドレスにないため、接続できません: {url}",
   "현재 주소를 공개 주소에서 뺄까요?":"現在のアドレスを公開アドレスから外しますか？",
+  "관리 화면 공개 주소도 함께 저장할까요?":"管理画面の公開アドレスも一緒に保存しますか？",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。公開アドレス: {url}",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS の管理画面は、管理画面の公開アドレス宛ての要求にだけ応答します。管理画面の公開アドレスに、接続に使う HTTPS アドレスも入力してください",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS がバージョン {version} に切り替わりました",
   "업데이트를 확인하지 못했습니다":"更新を確認できませんでした",
   "업데이트를 설치하지 못했습니다":"更新をインストールできませんでした",
@@ -4484,6 +4490,9 @@ Object.assign(I18N.zh, {
   "현재 주소를 바꿀까요?":"要更改当前地址吗？",
   "새 주소가 공개 주소 목록에 없어 접속할 수 없습니다: {url}":"新地址不在公开地址中，无法访问：{url}",
   "현재 주소를 공개 주소에서 뺄까요?":"要从公开地址中移除当前地址吗？",
+  "관리 화면 공개 주소도 함께 저장할까요?":"要同时保存管理界面公开地址吗？",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}":"HTTPS 管理界面只响应发往管理界面公开地址的请求。公开地址：{url}",
+  "HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요":"HTTPS 管理界面只响应发往管理界面公开地址的请求。请同时在管理界面公开地址中填写用于访问的 HTTPS 地址",
   "OnetDNS가 {version} 버전으로 바뀌었습니다":"OnetDNS 已切换到版本 {version}",
   "업데이트를 확인하지 못했습니다":"无法检查更新",
   "업데이트를 설치하지 못했습니다":"无法安装更新",
@@ -6313,9 +6322,30 @@ class Component extends DCLogic {
     // 설정 화면에서 공개 모드를 고른 경우에도 모드 토글과 같은 경고를 거친다.
     const toPublic=String(draft.mode||'').toLowerCase()==='public'&&String((this.state.cfgApplied||{}).mode||'').toLowerCase()!=='public';
     if(toPublic&&!await this.askConfirm('공개 모드로 바꾸면 인터넷 쪽에서도 이 서버에 질의할 수 있습니다. 계속할까요?'))return;
+    if(!await this.withPublicOrigin(draft))return;
     const move=this.pageAddressChange(draft);
     if(move&&!await this.askConfirm(move.message,move.detail))return;
     const ok=await this.cset(draft,{successMessage:this.t('설정을 적용했습니다'),leave:move});if(ok)this.setState({configDraft:{},configDraftDirty:{}});};
+  /**
+   * HTTPS 수신 주소는 공개 주소로 들어온 요청에만 답하므로, 공개 주소가 비어 있으면 서버가 저장을
+   * 거부한다. 거부되기 전에 인증서 이름과 수신 포트로 만든 공개 주소를 함께 저장할지 묻고, 그렇게
+   * 하면 draft 에 넣는다. 저장을 멈춰야 하면 false.
+   */
+  async withPublicOrigin(draft){
+    const has=key=>Object.prototype.hasOwnProperty.call(draft,key),applied=this.state.cfgApplied||{};
+    const value=key=>has(key)?draft[key]:applied[key];
+    const https=listenAddr(value('control_listen_https'));
+    const origins=(Array.isArray(value('control_public_origins'))?value('control_public_origins'):[]).filter(o=>String(o).trim());
+    if(!https||origins.length||!(has('control_listen_https')||has('control_public_origins')))return true;
+    const names=[...(Array.isArray(value('acme_domains'))?value('acme_domains'):[]),value('tls_self_signed_host'),value('ddr_name')];
+    const host=names.map(n=>String(n??'').trim()).find(n=>n&&!n.startsWith('*'));
+    if(!host){this.toastMsg('HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 관리 화면 공개 주소에 접속할 HTTPS 주소를 함께 입력하세요',true);return false;}
+    const origin='https://'+host+(https.port===443?'':':'+https.port);
+    if(!await this.askConfirm('관리 화면 공개 주소도 함께 저장할까요?',this.tr('HTTPS 관리 화면은 관리 화면 공개 주소로 들어온 요청에만 답합니다. 공개 주소: {url}',{url:origin})))return false;
+    draft.control_public_origins=[origin];
+    this.stageConfig({control_public_origins:[origin]});
+    return true;
+  }
   /**
    * 저장하면 현재 주소가 바뀌거나 닫히는지 본다. 그렇다면 확인 문구를 돌려주고, 브라우저가 수신
    * 주소에 바로 붙어 있으면 옮겨 갈 새 주소(url)도 돌려준다. 프록시, SSH 터널, 포트 포워딩을 거친
