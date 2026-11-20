@@ -298,21 +298,23 @@ static FIELDS: &[Field] = &[
     ),
     f("control_listen", "string", "control", ""),
     f("control_listen_https", "string", "control", "0.0.0.0:8554"),
-    f("control_token", "string", "control", ""),
-    f("control_admin_tokens", "array", "control", ""),
-    f("control_readonly_tokens", "array", "control", ""),
-    f(
-        "control_trusted_proxies",
-        "array",
-        "control",
-        "127.0.0.1/32",
-    ),
+    // Neither the HTTPS address nor the proxy answers without a public address, so the settings
+    // screen shows the three together.
     f(
         "control_public_origins",
         "array",
         "control",
         "https://admin.example.com",
     ),
+    f(
+        "control_trusted_proxies",
+        "array",
+        "control",
+        "127.0.0.1/32",
+    ),
+    f("control_token", "string", "control", ""),
+    f("control_admin_tokens", "array", "control", ""),
+    f("control_readonly_tokens", "array", "control", ""),
     f("users", "table", "control", ""),
     f("clients", "table", "control", ""),
     f(
@@ -3062,10 +3064,10 @@ static FIELD_COPY: &[FieldCopy] = &[
         label_en: "Dashboard HTTPS listening address",
         label_ja: "管理画面の HTTPS 待受アドレス",
         label_zh: "管理界面 HTTPS 监听地址",
-        description_ko: "다른 기기에서 관리 화면과 REST API에 접속할 수 있도록 HTTPS로 받을 주소입니다. 인증서는 DoT, DoH와 같은 것을 쓰고, 관리 화면 공개 주소로 들어온 요청에만 답합니다.",
-        description_en: "Address that serves the dashboard and REST API over HTTPS to other machines. It uses the same certificate as DoT and DoH, and answers only requests addressed to a public dashboard address.",
-        description_ja: "他の機器から管理画面と REST API に接続できるよう HTTPS で待ち受けるアドレスです。証明書は DoT、DoH と同じものを使い、管理画面の公開アドレス宛ての要求にだけ応答します。",
-        description_zh: "通过 HTTPS 向其他设备提供管理界面和 REST API 的地址。使用与 DoT、DoH 相同的证书，只响应发往管理界面公开地址的请求。",
+        description_ko: "다른 기기에서 관리 화면과 REST API에 접속할 수 있도록 HTTPS로 받을 주소입니다. 인증서는 DoT, DoH와 같은 것을 씁니다. 관리 화면 공개 주소로 들어온 요청에만 답하므로 공개 주소도 함께 설정해야 합니다.",
+        description_en: "Address that serves the dashboard and REST API over HTTPS to other machines. It uses the same certificate as DoT and DoH. It answers only requests addressed to a public dashboard address, so set the public dashboard address too.",
+        description_ja: "他の機器から管理画面と REST API に接続できるよう HTTPS で待ち受けるアドレスです。証明書は DoT、DoH と同じものを使います。管理画面の公開アドレス宛ての要求にだけ応答するため、公開アドレスも一緒に設定する必要があります。",
+        description_zh: "通过 HTTPS 向其他设备提供管理界面和 REST API 的地址。使用与 DoT、DoH 相同的证书。它只响应发往管理界面公开地址的请求，因此还需要设置公开地址。",
     },
     FieldCopy {
         key: "control_token",
