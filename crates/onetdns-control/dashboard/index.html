@@ -4619,7 +4619,9 @@ Object.assign(I18N.ja, {
   "`protocol` must be doh or dot: ":"`protocol` は doh か dot でなければなりません: ",
   "`ssids` must be an array of strings":"`ssids` は文字列の配列でなければなりません",
   "Could not parse the JSON request body: ":"リクエスト本文の JSON を解析できませんでした: ",
-  "The requested feature is not available":"要求された機能は使えません"
+  "The requested feature is not available":"要求された機能は使えません",
+  "Invalid configuration value: Set control_public_origins to the HTTPS address the dashboard is reached at, like https://admin.example.com; control_listen_https and control_trusted_proxies answer only there":"管理画面の公開アドレス (control_public_origins) に、他の機器から管理画面に接続する HTTPS アドレスを入力してください。例: https://admin.example.com。管理画面の HTTPS 待受アドレスとリバースプロキシは、このアドレス宛ての要求にだけ応答します",
+  "Invalid configuration value: control_public_origins needs control_listen_https, or control_trusted_proxies with the address of the reverse proxy serving the dashboard":"管理画面の公開アドレス (control_public_origins) だけでは接続できません。管理画面の HTTPS 待受アドレスを開くか、管理画面を中継するプロキシのアドレスを管理画面のリバースプロキシのアドレスに入力してください"
 });
 Object.assign(I18N.zh, {
   "클라이언트 접속 정보":"客户端连接信息",
@@ -4657,7 +4659,9 @@ Object.assign(I18N.zh, {
   "`protocol` must be doh or dot: ":"`protocol` 必须是 doh 或 dot：",
   "`ssids` must be an array of strings":"`ssids` 必须是字符串数组",
   "Could not parse the JSON request body: ":"无法解析请求正文的 JSON：",
-  "The requested feature is not available":"请求的功能不可用"
+  "The requested feature is not available":"请求的功能不可用",
+  "Invalid configuration value: Set control_public_origins to the HTTPS address the dashboard is reached at, like https://admin.example.com; control_listen_https and control_trusted_proxies answer only there":"请在管理界面公开地址 (control_public_origins) 中填写其他设备访问管理界面所用的 HTTPS 地址，例如 https://admin.example.com。管理界面 HTTPS 监听地址和反向代理只响应发往此地址的请求",
+  "Invalid configuration value: control_public_origins needs control_listen_https, or control_trusted_proxies with the address of the reverse proxy serving the dashboard":"仅设置管理界面公开地址 (control_public_origins) 无法访问。请开启管理界面 HTTPS 监听地址，或在管理界面反向代理地址中填写转发管理界面的代理地址"
 });
 Object.assign(I18N.ko, {
   "Invalid IP address: ":"IP 형식이 올바르지 않습니다: ",
@@ -4678,7 +4682,9 @@ Object.assign(I18N.ko, {
   "`protocol` must be doh or dot: ":"`protocol`은 doh나 dot이어야 합니다: ",
   "`ssids` must be an array of strings":"`ssids`는 문자열 배열이어야 합니다",
   "Could not parse the JSON request body: ":"요청 본문의 JSON을 해석하지 못했습니다: ",
-  "The requested feature is not available":"요청한 기능을 쓸 수 없습니다"
+  "The requested feature is not available":"요청한 기능을 쓸 수 없습니다",
+  "Invalid configuration value: Set control_public_origins to the HTTPS address the dashboard is reached at, like https://admin.example.com; control_listen_https and control_trusted_proxies answer only there":"관리 화면 공개 주소(control_public_origins)에 다른 기기에서 관리 화면에 접속할 HTTPS 주소를 입력하세요. 예: https://admin.example.com. 관리 화면 HTTPS 수신 주소와 리버스 프록시는 이 주소로 들어온 요청에만 답합니다",
+  "Invalid configuration value: control_public_origins needs control_listen_https, or control_trusted_proxies with the address of the reverse proxy serving the dashboard":"관리 화면 공개 주소(control_public_origins)만으로는 접속할 수 없습니다. 관리 화면 HTTPS 수신 주소를 열거나, 관리 화면을 중계하는 프록시의 주소를 관리 화면 리버스 프록시 주소에 입력하세요"
 });
 
 // 전용 편집 화면이 따로 있는 설정과 그 화면. '전체 설정' 목록에서는 빼되 검색에는
