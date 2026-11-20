@@ -3117,8 +3117,20 @@ fn first_bind_conflict(addrs: &[(SocketAddr, &str)]) -> Option<String> {
                 || (a_ip.is_unspecified() || b_ip.is_unspecified())
                     && (same_family || dual_stack_wildcard);
             if overlap {
+                if a_ip == b_ip {
+                    return Some(format!(
+                        "DNS listening address conflict: {la}={a} and {lb}={b} are the same address"
+                    ));
+                }
+                let a_covers_b =
+                    a_ip.is_unspecified() && (a_ip.is_ipv6() || !b_ip.is_unspecified());
+                let ((wide, wide_label), (narrow, narrow_label)) = if a_covers_b {
+                    ((a, la), (b, lb))
+                } else {
+                    ((b, lb), (a, la))
+                };
                 return Some(format!(
-                    "DNS listening address conflict: {la}={a} and {lb}={b}"
+                    "DNS listening address conflict: {wide_label}={wide} already covers {narrow_label}={narrow}; keep only one of them"
                 ));
             }
         }
@@ -6511,6 +6523,25 @@ answer = \"target.example\"
             cfg.validate().is_ok(),
             "같은 역할(admin) 안의 중복 기재는 허용"
         );
+    }
+
+    #[test]
+    fn a_wildcard_listener_names_the_address_it_already_covers() {
+        let reason = |listen: &[&str]| {
+            let config = Config {
+                listen: listen.iter().map(|a| a.parse().unwrap()).collect(),
+                ..Config::default()
+            };
+            match config.validate() {
+                Err(ConfigError::Invalid(msg)) => msg,
+                other => panic!("{listen:?} was not rejected: {other:?}"),
+            }
+        };
+        assert!(reason(&["127.0.0.1:53", "0.0.0.0:53"])
+            .contains("listen(TCP)=0.0.0.0:53 already covers listen(TCP)=127.0.0.1:53"),);
+        assert!(reason(&["0.0.0.0:53", "[::]:53"])
+            .contains("listen(TCP)=[::]:53 already covers listen(TCP)=0.0.0.0:53"));
+        assert!(reason(&["127.0.0.1:53", "127.0.0.1:53"]).contains("are the same address"));
     }
 
     #[test]
