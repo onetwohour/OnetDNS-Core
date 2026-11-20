@@ -327,27 +327,30 @@ fn argv0(pid: i32) -> Option<Vec<u8>> {
 
 /// Holds UDP and TCP on a free loopback port, so the server cannot bind it until they are dropped.
 /// Returns the sockets it found with: releasing and rebinding would let another socket take the
-/// port. Windows reserves port ranges per protocol, so a port one protocol picks can be closed to
-/// the other; each round tries a port picked by each.
+/// port.
 fn hold_free_port() -> (u16, (UdpSocket, TcpListener)) {
-    let (mut udp_error, mut tcp_error) = (None, None);
-    for _ in 0..32 {
+    // Enough attempts to walk past a contiguous reserved range. Ports UDP cannot take stay held, so
+    // the next TCP port is a new one.
+    const ATTEMPTS: usize = 512;
+
+    let mut taken = Vec::new();
+    for _ in 0..ATTEMPTS {
         let tcp = TcpListener::bind("127.0.0.1:0").expect("TCP 포트를 잡지 못했습니다");
         let port = tcp.local_addr().expect("TCP 주소").port();
         match UdpSocket::bind(("127.0.0.1", port)) {
             Ok(udp) => return (port, (udp, tcp)),
-            Err(error) => udp_error = Some(error),
-        }
-        let udp = UdpSocket::bind("127.0.0.1:0").expect("UDP 포트를 잡지 못했습니다");
-        let port = udp.local_addr().expect("UDP 주소").port();
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(tcp) => return (port, (udp, tcp)),
-            Err(error) => tcp_error = Some(error),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                taken.push(tcp)
+            }
+            Err(error) => panic!("TCP 와 함께 쓸 UDP 소켓을 열지 못했습니다: {error}"),
         }
     }
-    panic!(
-        "UDP 와 TCP 가 함께 비어 있는 포트를 찾지 못했습니다: UDP {udp_error:?}, TCP {tcp_error:?}"
-    );
+    panic!("UDP 와 TCP 가 함께 비어 있는 포트를 찾지 못했습니다");
 }
 
 /// Released at once for the server to bind.
