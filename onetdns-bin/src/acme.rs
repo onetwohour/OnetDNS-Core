@@ -596,7 +596,7 @@ impl AcmeClient {
                 .map_err(|e| format!("Could not parse the ACME authorization status JSON: {e}"))?;
             match j.get("status").and_then(|v| v.as_str()) {
                 Some("valid") => return Ok(()),
-                Some("invalid") => return Err(format!("ACME domain authorization failed: {body}")),
+                Some("invalid") => return Err(authz_failure(&j, &body)),
                 _ => std::thread::sleep(Duration::from_secs(2)),
             }
         }
@@ -728,6 +728,25 @@ pub fn run_issue(
     })
 }
 
+/// The CA gives the reason on the challenge that failed.
+fn authz_failure(authz: &Json, body: &str) -> String {
+    let domain = authz
+        .get("identifier")
+        .and_then(|i| i.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("the domain");
+    let detail = authz
+        .get("challenges")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|c| c.get("error")?.get("detail")?.as_str());
+    match detail {
+        Some(detail) => format!("The CA could not validate {domain}: {detail}"),
+        None => format!("The CA could not validate {domain}: {body}"),
+    }
+}
+
 fn str_array(j: &Json, key: &str) -> Vec<String> {
     j.get(key)
         .and_then(|v| v.as_array())
@@ -784,6 +803,16 @@ mod tests {
         );
         clear_dns01("_ACME-CHALLENGE.EXAMPLE.");
         assert_eq!(dns01_txt("_acme-challenge.example"), None);
+    }
+
+    #[test]
+    fn a_failed_authorization_reports_the_ca_reason() {
+        let body = r#"{"identifier":{"type":"dns","value":"dns.example"},"status":"invalid","challenges":[{"type":"dns-01","url":"https://ca.example/chall/1","status":"invalid","error":{"type":"urn:ietf:params:acme:error:unauthorized","detail":"No TXT record found at _acme-challenge.dns.example","status":403},"token":"t"}]}"#;
+        let authz = json::parse(body).unwrap();
+        assert_eq!(
+            authz_failure(&authz, body),
+            "The CA could not validate dns.example: No TXT record found at _acme-challenge.dns.example"
+        );
     }
 
     #[test]
