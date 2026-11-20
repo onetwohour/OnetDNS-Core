@@ -31,16 +31,46 @@ impl Resolver for AcmeChallengeLayer {
                     if let Some(txt) = crate::acme::dns01_txt(&name) {
                         let rec =
                             Record::new(q.name.clone(), 0, RData::Txt(vec![txt.into_bytes()]));
-                        return ResolveOutcome::Response(answer_message(
+                        let mut response = answer_message(
                             req.header.id,
                             q.name.clone(),
                             RecordType::TXT,
                             vec![rec],
-                        ));
+                        );
+                        // The CA's validating resolver discards a non-authoritative answer from
+                        // the server the name is delegated to.
+                        response.header.authoritative = true;
+                        return ResolveOutcome::Response(response);
                     }
                 }
             }
         }
         self.inner.resolve_outcome(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::test_support::{query, Mock};
+
+    #[test]
+    fn a_pending_challenge_is_answered_with_authority() {
+        let name = "_acme-challenge.layer-test.example";
+        crate::acme::set_dns01(name, "proof");
+        let layer = AcmeChallengeLayer::new(Mock::new(1, 0));
+        let response = layer.resolve(&query(name, RecordType::TXT)).unwrap();
+        crate::acme::clear_dns01(name);
+
+        assert!(response.header.authoritative);
+        assert_eq!(
+            response.answers[0].rdata,
+            RData::Txt(vec![b"proof".to_vec()])
+        );
+        let passed = layer.resolve(&query(name, RecordType::TXT)).unwrap();
+        assert!(
+            !passed.header.authoritative,
+            "nothing pending reaches the inner resolver"
+        );
     }
 }

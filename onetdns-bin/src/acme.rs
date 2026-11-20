@@ -39,7 +39,7 @@ pub fn dns01_txt(name: &str) -> Option<String> {
 }
 
 /// Must run once the challenge ends, or the name keeps answering the value.
-fn clear_dns01(name: &str) {
+pub(crate) fn clear_dns01(name: &str) {
     dns01_store()
         .lock_recover()
         .remove(&name.trim_end_matches('.').to_ascii_lowercase());
