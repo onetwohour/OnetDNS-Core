@@ -5457,7 +5457,7 @@ fn metrics_text(st: &AppState) -> String {
 
 /// Served without authentication.
 fn openapi_json() -> String {
-    // Adding a path means updating this and regenerating API.md at the repository root.
+    // Adding a path means updating this and regenerating docs/API.md.
     const SPEC: &str = r##"{
   "openapi": "3.1.0",
   "info": {
@@ -5602,7 +5602,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// API.md at the repository root must match the OpenAPI document and role rules.
+/// docs/API.md must match the OpenAPI document and role rules.
 #[cfg(test)]
 mod reference;
 

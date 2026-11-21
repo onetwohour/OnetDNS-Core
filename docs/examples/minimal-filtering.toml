@@ -1,0 +1,7 @@
+# Minimal forwarder with one temporary block rule.
+backend = "forward"
+listen = ["127.0.0.1:53"]
+upstreams = ["1.1.1.1"]
+block_response = "nxdomain"
+block_rules = ["||ads.example.com^"]
+cache_enabled = true

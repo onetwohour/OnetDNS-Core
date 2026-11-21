@@ -11,6 +11,41 @@
 /docs/
 /*.md
 !/README.md
-!/API.md
 
 /onetdns-bin/tests/docs_drift.rs
+
+# BEGIN OnetDNS public documentation
+# Keep internal docs ignored; only explicitly published pages are visible to Git.
+!/docs/
+/docs/*
+!/docs/API.md
+!/docs/README.md
+!/docs/advanced-services.md
+!/docs/cli.md
+!/docs/clients.md
+!/docs/configuration.md
+!/docs/encrypted-dns.md
+!/docs/examples.md
+!/docs/filtering.md
+!/docs/getting-started.md
+!/docs/installation.md
+!/docs/operations.md
+!/docs/performance.md
+!/docs/resolution.md
+!/docs/troubleshooting.md
+!/docs/reference/
+/docs/reference/*
+!/docs/reference/README.md
+!/docs/reference/access-and-tls.md
+!/docs/reference/administration.md
+!/docs/reference/authority.md
+!/docs/reference/cluster.md
+!/docs/reference/core.md
+!/docs/reference/filtering.md
+!/docs/reference/network.md
+!/docs/reference/structures.md
+!/docs/reference/upstreams.md
+!/docs/examples/
+/docs/examples/*
+!/docs/examples/minimal-filtering.toml
+# END OnetDNS public documentation

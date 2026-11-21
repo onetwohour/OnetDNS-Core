@@ -1,4 +1,4 @@
-//! Generates the endpoint section of API.md at the repository root from the OpenAPI document and
+//! Generates the endpoint section of docs/API.md from the OpenAPI document and
 //! compares. openapi_json is the truth for endpoints and their descriptions, and Role::allows for
 //! who may call them. Between the two marker comments, API.md is generated from these; outside
 //! them, people write it. Changing the spec or access rules without updating API.md fails this
@@ -10,7 +10,7 @@ use super::{openapi_json, Role};
 
 const BEGIN: &str = "<!-- endpoints:begin -->";
 const END: &str = "<!-- endpoints:end -->";
-const DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../API.md");
+const DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/API.md");
 const WRITE_ENV: &str = "ONETDNS_WRITE_API_DOC";
 
 struct Operation<'a> {
@@ -274,7 +274,7 @@ fn render() -> String {
 #[test]
 fn api_reference_matches_the_openapi_document() {
     let current = std::fs::read_to_string(DOC)
-        .expect("저장소 루트의 API.md 를 읽지 못했습니다")
+        .expect("docs/API.md 를 읽지 못했습니다")
         .replace("\r\n", "\n");
     let (head, rest) = current
         .split_once(BEGIN)

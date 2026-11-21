@@ -4,7 +4,7 @@ The dashboard is built on this API and served from the same address, so anything
 
 ## Address
 
-The API listens on `control_listen`, `127.0.0.1:8553` by default, and speaks plain HTTP/1.1. It answers only requests addressed to a loopback host. To manage a server from another machine, set `control_listen_https`: the API then also speaks HTTPS on that address and answers requests addressed to one of `control_public_origins`. An SSH tunnel, or an HTTPS reverse proxy on the same machine with `control_trusted_proxies` and `control_public_origins` set, also works; the [README](README.md) describes both.
+The API listens on `control_listen`, `127.0.0.1:8553` by default, and speaks plain HTTP/1.1. It answers only requests addressed to a loopback host. To manage a server from another machine, set `control_listen_https`: the API then also speaks HTTPS on that address and answers requests addressed to one of `control_public_origins`. An SSH tunnel, or an HTTPS reverse proxy on the same machine with `control_trusted_proxies` and `control_public_origins` set, also works; the [README](../README.md) describes both.
 
 Paths below are relative to that address, for example `http://127.0.0.1:8553/v1/stats`. The server also serves this reference as an OpenAPI 3.1 document at `/openapi.json`.
 
