@@ -48,6 +48,16 @@ where
         if packet.len() < HEADER_LEN + AEAD_TAG_LEN {
             return None;
         }
+        // Before the key exchange: a packet too short to carry any answer must not cost a scalar
+        // multiplication and a decryption.
+        let budget = if over_udp {
+            response_budget(packet.len())
+        } else {
+            TCP_RESPONSE_BUDGET
+        };
+        if budget == 0 {
+            return None;
+        }
         let mut client_pk = [0u8; 32];
         client_pk.copy_from_slice(&packet[CLIENT_MAGIC_LEN..CLIENT_MAGIC_LEN + PUBKEY_LEN]);
         let mut client_nonce = [0u8; 12];
@@ -62,14 +72,6 @@ where
             }
         };
 
-        let budget = if over_udp {
-            response_budget(packet.len())
-        } else {
-            TCP_RESPONSE_BUDGET
-        };
-        if budget == 0 {
-            return None;
-        }
         let dns_response = handler(dns_query, src, budget)?;
         if dns_response.len() > budget {
             onetdns_core::debug!(event = "dnscrypt.response_over_budget", client = %src, len = dns_response.len(), budget = budget, "Response exceeds the size budget; not sent");
@@ -271,6 +273,37 @@ mod tests {
             budgets[1] > 4096,
             "TCP 예산 {}이 질의 길이에 묶여 있습니다",
             budgets[1]
+        );
+    }
+
+    #[test]
+    /// Packets between the minimum header and the smallest answerable size can still decrypt, so
+    /// UDP must refuse them by length alone; TCP keeps answering them.
+    fn short_udp_queries_are_refused_before_they_reach_the_handler() {
+        let provider = Provider::generate("2.dnscrypt-cert.test", 86_400);
+        let dns: &[u8] =
+            b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01";
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let handler = |_q: Vec<u8>, _src: SocketAddr, _budget: usize| -> Option<Vec<u8>> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        };
+        let allow = |_src: SocketAddr| true;
+        let src: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let shortest = HEADER_LEN + AEAD_TAG_LEN + dns.len() + 1;
+        for pad_to in dns.len() + 1..=111 - HEADER_LEN - AEAD_TAG_LEN {
+            let packet = build_query(&provider, dns, pad_to);
+            assert!((shortest..=111).contains(&packet.len()));
+            assert!(respond(&provider, &packet, src, true, &handler, &allow).is_none());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let packet = build_query(&provider, dns, dns.len() + 1);
+        respond(&provider, &packet, src, false, &handler, &allow);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the same packet decrypts over TCP"
         );
     }
 
