@@ -8,21 +8,28 @@ use crate::{valid_header_field, H2Error};
 /// The largest DNS message.
 const MAX_DNS_RESPONSE: usize = u16::MAX as usize;
 
-/// The media type a request carries, which a 200 response must carry back, and the body cap.
+/// The media type a request carries, which a 200 response must carry back, and the body cap. A
+/// GET without a media type takes any.
 #[derive(Clone, Copy)]
 struct Payload {
-    media_type: &'static str,
+    media_type: Option<&'static str>,
     max_body: usize,
 }
 
 const DNS: Payload = Payload {
-    media_type: "application/dns-message",
+    media_type: Some("application/dns-message"),
     max_body: MAX_DNS_RESPONSE,
 };
 
 const OBLIVIOUS: Payload = Payload {
-    media_type: crate::server::ODOH_MEDIA_TYPE,
+    media_type: Some(crate::server::ODOH_MEDIA_TYPE),
     max_body: crate::server::MAX_ODOH_MESSAGE,
+};
+
+/// ObliviousDoHConfigs: a list with a 16-bit length. Targets serve it with differing media types.
+const ODOH_CONFIGS: Payload = Payload {
+    media_type: None,
+    max_body: 2 + u16::MAX as usize,
 };
 
 /// Also advertised to the peer in SETTINGS.
@@ -104,16 +111,18 @@ fn response_metadata(
             }
         } else if name == b"content-type" {
             content_types += 1;
-            expected_type = value.eq_ignore_ascii_case(payload.media_type.as_bytes());
+            expected_type = payload
+                .media_type
+                .is_none_or(|media_type| value.eq_ignore_ascii_case(media_type.as_bytes()));
         }
     }
 
     let status = status?;
-    if status == 200
-        && (content_types != 1
-            || !expected_type
-            || content_length.is_some_and(|length| length > payload.max_body))
-    {
+    let typed = match payload.media_type {
+        Some(_) => content_types == 1 && expected_type,
+        None => content_types <= 1,
+    };
+    if status == 200 && (!typed || content_length.is_some_and(|length| length > payload.max_body)) {
         return None;
     }
     Some((status, content_length))
@@ -191,7 +200,7 @@ impl<S: Read + Write> H2Client<S> {
         path: &str,
         dns_wire: &[u8],
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, dns_wire, DNS, false, |_| {})
+        self.query_inner(authority, path, Some(dns_wire), DNS, false, |_| {})
     }
 
     /// Sends a PING with the query for a two-stage deadline. A reused connection may be dead, and
@@ -205,7 +214,7 @@ impl<S: Read + Write> H2Client<S> {
         dns_wire: &[u8],
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, dns_wire, DNS, true, on_alive)
+        self.query_inner(authority, path, Some(dns_wire), DNS, true, on_alive)
     }
 
     /// `query_probed` for an ObliviousDoHMessage. A non-200 status comes back as
@@ -217,61 +226,75 @@ impl<S: Read + Write> H2Client<S> {
         message: &[u8],
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, message, OBLIVIOUS, true, on_alive)
+        self.query_inner(authority, path, Some(message), OBLIVIOUS, true, on_alive)
     }
 
+    /// GETs an Oblivious DoH target's ObliviousDoHConfigs.
+    pub fn odoh_configs(&mut self, authority: &str) -> Result<Vec<u8>, H2Error> {
+        let path = crate::server::ODOH_CONFIGS_PATH;
+        self.query_inner(authority, path, None, ODOH_CONFIGS, false, |_| {})
+    }
+
+    /// POSTs `body`, or GETs without one.
     fn query_inner(
         &mut self,
         authority: &str,
         path: &str,
-        dns_wire: &[u8],
+        body: Option<&[u8]>,
         payload: Payload,
         probe: bool,
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
         let sid = self.allocate_stream_id()?;
 
-        let clen = dns_wire.len().to_string();
-        let headers: [(&str, &str); 7] = [
-            (":method", "POST"),
+        let clen = body.map(|body| body.len().to_string());
+        let mut headers: Vec<(&str, &str)> = vec![
+            (":method", if body.is_some() { "POST" } else { "GET" }),
             (":scheme", "https"),
             (":authority", authority),
             (":path", path),
-            ("accept", payload.media_type),
-            ("content-type", payload.media_type),
-            ("content-length", &clen),
         ];
+        if let Some(media_type) = payload.media_type {
+            headers.push(("accept", media_type));
+        }
+        if let (Some(media_type), Some(clen)) = (payload.media_type, &clen) {
+            headers.push(("content-type", media_type));
+            headers.push(("content-length", clen));
+        }
 
         let block = hpack::encode_response(&headers);
+        let end = if body.is_some() { 0 } else { flags::END_STREAM };
         send_frame(
             &mut self.stream,
             frame_type::HEADERS,
-            flags::END_HEADERS,
+            flags::END_HEADERS | end,
             sid,
             &block,
         )?;
 
-        if dns_wire.is_empty() {
-            send_frame(
+        match body {
+            None => {}
+            Some([]) => send_frame(
                 &mut self.stream,
                 frame_type::DATA,
                 flags::END_STREAM,
                 sid,
                 &[],
-            )?;
-        } else {
-            const INITIAL_CONNECTION_WINDOW: usize = 65_535;
-            if dns_wire.len() > INITIAL_CONNECTION_WINDOW {
-                return Err(H2Error::Protocol);
-            }
-            let mut chunks = dns_wire.chunks(DEFAULT_MAX_FRAME).peekable();
-            while let Some(chunk) = chunks.next() {
-                let fl = if chunks.peek().is_none() {
-                    flags::END_STREAM
-                } else {
-                    0
-                };
-                send_frame(&mut self.stream, frame_type::DATA, fl, sid, chunk)?;
+            )?,
+            Some(body) => {
+                const INITIAL_CONNECTION_WINDOW: usize = 65_535;
+                if body.len() > INITIAL_CONNECTION_WINDOW {
+                    return Err(H2Error::Protocol);
+                }
+                let mut chunks = body.chunks(DEFAULT_MAX_FRAME).peekable();
+                while let Some(chunk) = chunks.next() {
+                    let fl = if chunks.peek().is_none() {
+                        flags::END_STREAM
+                    } else {
+                        0
+                    };
+                    send_frame(&mut self.stream, frame_type::DATA, fl, sid, chunk)?;
+                }
             }
         }
         let ping_token = u64::from(sid).to_be_bytes();

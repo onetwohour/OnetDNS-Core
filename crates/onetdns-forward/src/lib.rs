@@ -425,6 +425,16 @@ pub enum Transport {
         public_key: [u8; 32],
         relay: Option<SocketAddr>,
     },
+
+    /// Oblivious DoH through the proxy at the upstream's address. `path` already names the target
+    /// in `targethost` and `targetpath`; the target's key config comes from `target_addr`, checked
+    /// against `target_name`.
+    Odoh {
+        server_name: String,
+        path: String,
+        target_name: String,
+        target_addr: SocketAddr,
+    },
 }
 
 /// Where an upstream's connections go.
@@ -558,6 +568,9 @@ impl Upstream {
                 Some(relay) => format!("dnscrypt://{provider_name} via {relay}"),
                 None => format!("dnscrypt://{provider_name}"),
             },
+            Transport::Odoh {
+                server_name, path, ..
+            } => format!("odoh://{server_name}{path}"),
         }
     }
 
@@ -573,6 +586,25 @@ impl Upstream {
                 provider_name: provider_name.into(),
                 public_key,
                 relay,
+            },
+        }
+    }
+
+    /// `path` is from `odoh::proxy_request_path`.
+    pub fn odoh(
+        proxy: SocketAddr,
+        server_name: impl Into<String>,
+        path: impl Into<String>,
+        target_name: impl Into<String>,
+        target_addr: SocketAddr,
+    ) -> Self {
+        Upstream {
+            endpoint: Endpoint::Direct(proxy),
+            transport: Transport::Odoh {
+                server_name: server_name.into(),
+                path: path.into(),
+                target_name: target_name.into(),
+                target_addr,
             },
         }
     }
@@ -1715,6 +1747,24 @@ fn exchange_one(
             wire_id,
             request,
             timeout,
+        ),
+        (
+            Transport::Odoh {
+                server_name,
+                path,
+                target_name,
+                target_addr,
+            },
+            Endpoint::Direct(addr),
+        ) => odoh::exchange(
+            *addr,
+            server_name,
+            path,
+            (target_name, *target_addr),
+            wire,
+            request,
+            timeout,
+            trust,
         ),
         // Sending these directly would go around the proxy the operator chose.
         (_, Endpoint::Socks5 { .. }) => Err(ForwardError::Io(

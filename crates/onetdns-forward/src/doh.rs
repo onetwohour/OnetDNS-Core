@@ -52,9 +52,25 @@ pub(crate) fn exchange(
     timeout: Duration,
     trust: &TrustStore,
 ) -> Result<Message, ForwardError> {
+    let deadline = super::deadline_after(timeout);
+    with_pooled(endpoint, server_name, path, deadline, trust, |conn| {
+        roundtrip(conn, server_name, path, wire, request, deadline)
+    })?
+}
+
+/// Runs `roundtrip` on this thread's connection for `endpoint`, `server_name` and `path`. An error
+/// from `roundtrip` means the connection is unusable: it leaves the pool, and a reused one is
+/// replaced once.
+pub(crate) fn with_pooled<T>(
+    endpoint: &Endpoint,
+    server_name: &str,
+    path: &str,
+    deadline: Instant,
+    trust: &TrustStore,
+    mut roundtrip: impl FnMut(&mut DohConn) -> Result<T, ForwardError>,
+) -> Result<T, ForwardError> {
     #[cfg(test)]
     let _revocation_test_guard = crate::revocation_test_read_guard();
-    let deadline = super::deadline_after(timeout);
     POOL.with(|pool| {
         let scope = crate::tls_cache_scope(trust);
         let key = (
@@ -76,7 +92,7 @@ pub(crate) fn exchange(
             let (res, session) = {
                 let mut p = pool.borrow_mut();
                 let conn = p.get_mut(&key).expect("Just inserted");
-                let result = roundtrip(conn, server_name, path, wire, request, deadline);
+                let result = roundtrip(conn);
                 let session = conn.client.stream_mut().take_sessions().pop();
                 (result, session)
             };
@@ -84,7 +100,7 @@ pub(crate) fn exchange(
                 SESSIONS.with(|sessions| sessions.borrow_mut().put(session_key.clone(), session));
             }
             match res {
-                Ok(answer) => return answer,
+                Ok(answer) => return Ok(answer),
                 Err(e) => {
                     pool.borrow_mut().pop(&key);
                     if reused && attempt == 0 {

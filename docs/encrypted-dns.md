@@ -51,7 +51,7 @@ DoH uses HTTP over TLS/TCP; DoH3 uses HTTP/3 over QUIC/UDP. A browser may suppor
 
 ## Oblivious DoH
 
-Oblivious DoH (ODoH, RFC 9230) splits what one DoH server learns between two parties. The client encrypts its query to a **target** and sends it through a **proxy**. The proxy sees the client's address but not the query; the target decrypts and answers the query but sees only the proxy's address.
+Oblivious DoH (ODoH, RFC 9230) splits what one DoH server learns between two parties. The client encrypts its query to a **target** and sends it through a **proxy**. The proxy sees the client's address but not the query; the target decrypts and answers the query but sees only the proxy's address. OnetDNS can be the target or the proxy for other clients, as below, and can itself be a client: see [Oblivious DoH upstreams](resolution.md#oblivious-doh-upstreams).
 
 To act as a target, turn it on for the DoH listeners:
 

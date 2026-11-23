@@ -1,6 +1,7 @@
 //! HTTP/2 for DoH and Oblivious DoH only, not a general HTTP/2 stack. Only what they use is
-//! implemented: the client always sends POST with application/dns-message or
-//! application/oblivious-dns-message, and neither side handles server push or priority.
+//! implemented: the client sends POST with application/dns-message or
+//! application/oblivious-dns-message, and GET only for ODoH target configs. Neither side handles
+//! server push or priority.
 
 pub mod client;
 pub mod frame;

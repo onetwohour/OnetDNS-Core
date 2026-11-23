@@ -1555,6 +1555,11 @@ impl Config {
                         "{label} has a DNSCrypt server, but DNSCrypt runs over UDP and cannot go through `upstream_proxy`; use tls:// or https://"
                     ));
                 }
+                Some("odoh") => {
+                    return invalid(format!(
+                        "{label} has {url}, but Oblivious DoH upstreams cannot go through `upstream_proxy`; use tls:// or https://"
+                    ));
+                }
                 Some("quic" | "h3") => {
                     return invalid(format!(
                         "{label} has {url}, but QUIC cannot go through `upstream_proxy`: SOCKS5 carries only TCP, and proxying QUIC over HTTP/3 (CONNECT-UDP) is not supported; use tls:// or https://"
@@ -2151,25 +2156,25 @@ impl Config {
             reject_loop("root DNS server", SocketAddr::new(*ip, 53))?;
         }
         for raw in &self.fallback_upstreams {
-            if let Some(target) = numeric_upstream_endpoint(raw) {
+            for target in numeric_upstream_endpoints(raw) {
                 reject_loop("fallback upstream DNS server", target)?;
             }
         }
         for raw in &self.upstream_urls {
-            if let Some(target) = numeric_upstream_endpoint(raw) {
+            for target in numeric_upstream_endpoints(raw) {
                 reject_loop("encrypted upstream DNS server", target)?;
             }
         }
         for zone in &self.stub_zones {
             for raw in &zone.servers {
-                if let Some(target) = numeric_upstream_endpoint(raw) {
+                for target in numeric_upstream_endpoints(raw) {
                     reject_loop(&format!("stub zone '{}'", zone.suffix), target)?;
                 }
             }
         }
         for client in &self.clients {
             for raw in &client.upstreams {
-                if let Some(target) = numeric_upstream_endpoint(raw) {
+                for target in numeric_upstream_endpoints(raw) {
                     reject_loop(
                         &format!("dedicated upstream DNS server of client '{}'", client.name),
                         target,
@@ -3223,7 +3228,7 @@ fn upstream_url_is_encrypted(url: &str) -> bool {
     url.trim().split_once("://").is_some_and(|(scheme, _)| {
         matches!(
             scheme.to_ascii_lowercase().as_str(),
-            "tls" | "https" | "quic" | "h3" | "sdns"
+            "tls" | "https" | "quic" | "h3" | "odoh" | "sdns"
         )
     })
 }
@@ -3262,9 +3267,10 @@ fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return false;
     };
+    let scheme = scheme.to_ascii_lowercase();
     if !matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "udp" | "tcp" | "tls" | "https" | "quic" | "h3"
+        scheme.as_str(),
+        "udp" | "tcp" | "tls" | "https" | "quic" | "h3" | "odoh"
     ) {
         return false;
     }
@@ -3281,7 +3287,62 @@ fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
         return false;
     }
 
-    let authority = endpoint.split('/').next().unwrap_or_default().trim();
+    let (authority, path) = endpoint.split_at(endpoint.find('/').unwrap_or(endpoint.len()));
+    valid_authority(authority.trim())
+        && (scheme != "odoh" || parse_odoh_upstream_path(path).is_some())
+}
+
+/// The proxy path and the target of an `odoh://` upstream.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OdohUpstreamPath<'a> {
+    pub proxy_path: &'a str,
+    /// `host[:port]`, as the proxy receives it in `targethost`.
+    pub target_host: &'a str,
+    pub target_path: &'a str,
+}
+
+/// Reads `/proxy-path?targethost=HOST[:PORT]&targetpath=/path`, what follows the authority of an
+/// `odoh://` upstream. The values are taken as written, not percent-decoded.
+pub fn parse_odoh_upstream_path(path: &str) -> Option<OdohUpstreamPath<'_>> {
+    let (proxy_path, query) = path.split_once('?')?;
+    let (mut target_host, mut target_path) = (None, None);
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=')?;
+        let slot = match name {
+            "targethost" => &mut target_host,
+            "targetpath" => &mut target_path,
+            _ => return None,
+        };
+        if slot.replace(value).is_some() {
+            return None;
+        }
+    }
+    let parsed = OdohUpstreamPath {
+        proxy_path,
+        target_host: target_host?,
+        target_path: target_path?,
+    };
+    (valid_doh_path(parsed.proxy_path)
+        && valid_doh_path(parsed.target_path)
+        && valid_odoh_target_host(parsed.target_host))
+    .then_some(parsed)
+}
+
+/// A DNS name or an IP, with an optional port; an IPv6 address in brackets.
+fn valid_odoh_target_host(authority: &str) -> bool {
+    if authority.starts_with('[') {
+        return valid_authority(authority);
+    }
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host);
+    authority.matches(':').count() <= 1
+        && valid_authority(authority)
+        && (host.parse::<Ipv4Addr>().is_ok() || valid_dns_name(host))
+}
+
+/// `host[:port]` or `[ipv6][:port]`, with a nonzero port.
+fn valid_authority(authority: &str) -> bool {
     if authority.is_empty() {
         return false;
     }
@@ -3393,6 +3454,21 @@ fn first_bind_conflict(addrs: &[(SocketAddr, &str)]) -> Option<String> {
     None
 }
 
+/// The upstream's numeric endpoints. An `odoh://` upstream has two, the proxy and the target, and
+/// either one pointing here would loop.
+fn numeric_upstream_endpoints(raw: &str) -> impl Iterator<Item = SocketAddr> {
+    let target = raw
+        .trim()
+        .split_once("://")
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("odoh"))
+        .and_then(|(_, rest)| {
+            let endpoint = rest.split('#').next().unwrap_or_default();
+            parse_odoh_upstream_path(&endpoint[endpoint.find('/')?..])
+        })
+        .and_then(|odoh| numeric_upstream_endpoint(&format!("https://{}", odoh.target_host)));
+    numeric_upstream_endpoint(raw).into_iter().chain(target)
+}
+
 /// `None` for a name.
 fn numeric_upstream_endpoint(raw: &str) -> Option<SocketAddr> {
     let raw = raw.trim();
@@ -3409,7 +3485,7 @@ fn numeric_upstream_endpoint(raw: &str) -> Option<SocketAddr> {
     let default_port = match scheme.as_str() {
         "udp" | "tcp" => 53,
         "tls" | "quic" => 853,
-        "https" | "h3" => 443,
+        "https" | "h3" | "odoh" => 443,
         _ => return None,
     };
     let authority = rest
@@ -3967,7 +4043,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "fallback_upstreams",
                 i,
                 v,
-                "an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp",
+                "an IP or udp|tcp|tls|https|quic|h3|odoh://host[:port] or an sdns:// DNSCrypt stamp",
             ));
         }
     }
@@ -3986,7 +4062,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "upstream_urls",
                 i,
                 v,
-                "udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp",
+                "udp|tcp|tls|https|quic|h3|odoh://host[:port] or an sdns:// DNSCrypt stamp",
             ));
         }
     }
@@ -4093,7 +4169,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 };
                 if !valid_upstream_spec(raw, true) {
                     return Err(ConfigError::Invalid(format!(
-                        "clients[{index}].upstreams[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp"
+                        "clients[{index}].upstreams[{item}]: expected an IP or udp|tcp|tls|https|quic|h3|odoh://host[:port] or an sdns:// DNSCrypt stamp"
                     )));
                 }
             }
@@ -4238,7 +4314,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             })?;
             if !valid_upstream_spec(raw, true) {
                 return Err(ConfigError::Invalid(format!(
-                    "stub_zones[{index}].servers[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp"
+                    "stub_zones[{index}].servers[{item}]: expected an IP or udp|tcp|tls|https|quic|h3|odoh://host[:port] or an sdns:// DNSCrypt stamp"
                 )));
             }
         }
@@ -6799,6 +6875,12 @@ answer = \"target.example\"
         let error = dnscrypt.validate().unwrap_err().to_string();
         assert!(error.contains("DNSCrypt"), "{error}");
 
+        let mut odoh = base.clone();
+        odoh.upstream_urls =
+            vec!["odoh://192.0.2.1/proxy?targethost=198.51.100.2&targetpath=/dns-query".into()];
+        let error = odoh.validate().unwrap_err().to_string();
+        assert!(error.contains("Oblivious DoH"), "{error}");
+
         let mut client = base.clone();
         client.clients = vec![ClientConfig {
             name: "laptop".into(),
@@ -7721,6 +7803,16 @@ tftp_writable = true
             (1, 0),
             "DNSCrypt 는 암호화입니다"
         );
+        let odoh = Config::from_toml_str(
+            "upstream_urls = [\"odoh://192.0.2.1/proxy?targethost=198.51.100.2&targetpath=/dns-query\"]
+",
+        )
+        .unwrap();
+        assert_eq!(
+            odoh.upstream_url_counts(),
+            (1, 0),
+            "Oblivious DoH 는 암호화입니다"
+        );
     }
 
     #[test]
@@ -8406,5 +8498,51 @@ types = ["A", "AAAA", "CAA", "257"]
             Some("127.0.0.1:5300".parse().unwrap())
         );
         assert!(numeric_upstream_endpoint("https://dns.example/dns-query").is_none());
+        assert_eq!(
+            numeric_upstream_endpoints(
+                "odoh://192.0.2.1/proxy?targethost=127.0.0.1:8443&targetpath=/dns-query#proxy.example"
+            )
+            .collect::<Vec<_>>(),
+            ["192.0.2.1:443".parse().unwrap(), "127.0.0.1:8443".parse().unwrap()],
+            "the target is checked as well as the proxy"
+        );
+    }
+
+    #[test]
+    fn odoh_upstreams_name_a_proxy_path_and_a_target() {
+        assert_eq!(
+            parse_odoh_upstream_path("/proxy?targetpath=/dns-query&targethost=odoh.example:8443"),
+            Some(OdohUpstreamPath {
+                proxy_path: "/proxy",
+                target_host: "odoh.example:8443",
+                target_path: "/dns-query",
+            })
+        );
+        for path in [
+            "/proxy",
+            "/proxy?targethost=odoh.example",
+            "/proxy?targethost=odoh.example&targetpath=/q&targethost=other.example",
+            "/proxy?targethost=odoh.example&targetpath=/q&extra=1",
+            "/proxy?targethost=odoh.example&targetpath=q",
+            "/proxy?targethost=odoh.example:0&targetpath=/q",
+            "/proxy?targethost=odoh.example=x&targetpath=/q",
+            "/proxy?targethost=2001:db8::1&targetpath=/q",
+            "proxy?targethost=odoh.example&targetpath=/q",
+        ] {
+            assert_eq!(parse_odoh_upstream_path(path), None, "{path}");
+        }
+        assert!(
+            parse_odoh_upstream_path("/p?targethost=[2001:db8::1]:8443&targetpath=/q").is_some()
+        );
+
+        let accepted = "upstream_urls = [\"odoh://proxy.example/proxy?targethost=odoh.example&targetpath=/dns-query\"]\n";
+        Config::from_toml_str(accepted).expect("an ODoH upstream");
+        for rejected in [
+            "upstream_urls = [\"odoh://proxy.example/proxy\"]\n",
+            "upstream_urls = [\"odoh://proxy.example?targethost=odoh.example&targetpath=/q\"]\n",
+            "upstream_urls = [\"odoh://proxy.example/p?targethost=bad name&targetpath=/q\"]\n",
+        ] {
+            assert!(Config::from_toml_str(rejected).is_err(), "{rejected}");
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use onetdns_config::Config;
-use onetdns_forward::{Endpoint, Socks5Proxy, Upstream};
+use onetdns_forward::{Endpoint, Socks5Proxy, Transport, Upstream};
 
 pub(crate) const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -39,19 +39,25 @@ impl UpstreamRoute {
 }
 
 /// Hostname upstreams are checked after resolving; the URL alone would miss this server hidden
-/// behind a name.
+/// behind a name. An Oblivious DoH target is checked like the proxy: a query relayed to this
+/// server would come back to the same upstream.
 pub fn ensure_not_listener(
     upstreams: &[Upstream],
     listeners: &[SocketAddr],
     label: &str,
 ) -> Result<(), String> {
-    let direct = upstreams
-        .iter()
-        .filter_map(|upstream| match upstream.endpoint {
+    let endpoints = upstreams.iter().flat_map(|upstream| {
+        let direct = match upstream.endpoint {
             Endpoint::Direct(addr) => Some(addr),
             Endpoint::Socks5 { .. } => None,
-        });
-    for addr in direct {
+        };
+        let target = match &upstream.transport {
+            Transport::Odoh { target_addr, .. } => Some(*target_addr),
+            _ => None,
+        };
+        direct.into_iter().chain(target)
+    });
+    for addr in endpoints {
         if points_at_listener(addr, listeners) {
             return Err(format!(
                 "{label}={addr} points to this server's own DNS listening address after the initial lookup, which would create a query loop"
@@ -128,28 +134,23 @@ pub fn servers_to_upstreams(servers: &[String], route: &UpstreamRoute) -> Vec<Up
     out
 }
 
-/// Hostnames need bootstrap servers.
+/// Hostnames need bootstrap servers: the upstream's, and an Oblivious DoH target's.
 pub fn url_uses_hostname(url: &str) -> bool {
     if url.trim().starts_with("sdns://") {
         return false;
     }
-    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let rest = rest.split_once('#').map(|(r, _)| r).unwrap_or(rest);
-    let hostport = rest.split_once('/').map(|(hp, _)| hp).unwrap_or(rest);
-    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
-        bracketed
-            .split_once(']')
-            .map(|(h, _)| h)
-            .unwrap_or(bracketed)
-    } else if hostport.matches(':').count() == 1 {
-        hostport
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
-    } else {
-        hostport
+    let is_name = |host: &str| !host.is_empty() && host.parse::<IpAddr>().is_err();
+    let Some(parsed) = parse_upstream_url(url) else {
+        return false;
     };
-    !host.is_empty() && host.parse::<IpAddr>().is_err()
+    is_name(parsed.host)
+        || parsed.scheme == "odoh"
+            && parsed
+                .path
+                .as_deref()
+                .and_then(onetdns_config::parse_odoh_upstream_path)
+                .and_then(|odoh| split_authority(odoh.target_host))
+                .is_some_and(|(host, _)| is_name(host))
 }
 
 /// An upstream URL before its host is resolved. A URL without a scheme is plain DNS.
@@ -235,7 +236,39 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
             sni(),
             doh_path(),
         )),
+        "odoh" => {
+            let odoh = onetdns_config::parse_odoh_upstream_path(parsed.path.as_deref()?)?;
+            let (target_name, target_port) = split_authority(odoh.target_host)?;
+            let target_ip = resolve_host(target_name, bootstrap)?;
+            Some(Upstream::odoh(
+                SocketAddr::new(ip, port.unwrap_or(443)),
+                sni(),
+                onetdns_forward::odoh::proxy_request_path(
+                    odoh.proxy_path,
+                    odoh.target_host,
+                    odoh.target_path,
+                ),
+                target_name,
+                SocketAddr::new(target_ip, target_port.unwrap_or(443)),
+            ))
+        }
         _ => None,
+    }
+}
+
+/// Splits `host[:port]` or `[v6][:port]`; `None` for a port that is malformed or 0.
+pub(crate) fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let port = |raw: &str| raw.parse::<u16>().ok().filter(|port| *port != 0);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, rest) = bracketed.split_once(']')?;
+        return match rest {
+            "" => Some((host, None)),
+            rest => Some((host, Some(port(rest.strip_prefix(':')?)?))),
+        };
+    }
+    match authority.split_once(':') {
+        Some((host, raw)) if !raw.contains(':') => Some((host, Some(port(raw)?))),
+        _ => Some((authority, None)),
     }
 }
 
@@ -259,32 +292,7 @@ pub(crate) fn parse_upstream_url(url: &str) -> Option<UpstreamUrl<'_>> {
         Some((hp, p)) => (hp, Some(format!("/{p}"))),
         None => (rest, None),
     };
-    let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
-        let end = bracketed.find(']')?;
-        let host = &bracketed[..end];
-        let suffix = &bracketed[end + 1..];
-        let port = if suffix.is_empty() {
-            None
-        } else {
-            suffix
-                .strip_prefix(':')?
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-        };
-        if !suffix.is_empty() && port.is_none() {
-            return None;
-        }
-        (host, port)
-    } else if hostport.matches(':').count() == 1 {
-        let (host, raw_port) = hostport.rsplit_once(':')?;
-        match raw_port.parse::<u16>() {
-            Ok(port) if port != 0 => (host, Some(port)),
-            _ => return None,
-        }
-    } else {
-        (hostport, None)
-    };
+    let (host, port) = split_authority(hostport)?;
     if host.trim().is_empty() {
         return None;
     }
@@ -323,7 +331,6 @@ pub fn resolve_host_via_bootstrap(host: &str, bootstrap: &[IpAddr]) -> Option<Ip
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onetdns_forward::Transport;
 
     const DIRECT: UpstreamRoute = UpstreamRoute::Direct {
         bootstrap: Vec::new(),
@@ -413,6 +420,64 @@ mod tests {
         assert_eq!(
             ups[5].endpoint,
             Endpoint::Direct("8.8.8.8:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn odoh_upstreams_carry_the_proxy_and_the_target() {
+        let up = parse_native_upstream(
+            "odoh://192.0.2.1/proxy?targethost=198.51.100.2:8443&targetpath=/dns-query#proxy.example",
+            &DIRECT,
+        )
+        .unwrap();
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("192.0.2.1:443".parse().unwrap())
+        );
+        let proxy = UpstreamRoute::Socks5(Arc::new(Socks5Proxy::new(
+            "127.0.0.1:9050".parse().unwrap(),
+        )));
+        assert!(
+            parse_native_upstream(
+                "odoh://192.0.2.1/p?targethost=198.51.100.2&targetpath=/q",
+                &proxy
+            )
+            .is_none(),
+            "ODoH 는 SOCKS5 프록시를 거치지 않습니다"
+        );
+        assert_eq!(
+            up.transport,
+            Transport::Odoh {
+                server_name: "proxy.example".into(),
+                path: "/proxy?targethost=198.51.100.2%3A8443&targetpath=%2Fdns-query".into(),
+                target_name: "198.51.100.2".into(),
+                target_addr: "198.51.100.2:8443".parse().unwrap(),
+            }
+        );
+
+        let named_target = "odoh://192.0.2.1/p?targethost=odoh.example&targetpath=/q";
+        assert!(
+            parse_native_upstream(named_target, &DIRECT).is_none(),
+            "a target name needs bootstrap"
+        );
+        assert!(url_uses_hostname(named_target));
+        assert!(!url_uses_hostname(
+            "odoh://192.0.2.1/p?targethost=198.51.100.2&targetpath=/q"
+        ));
+
+        let looping = parse_native_upstream(
+            "odoh://192.0.2.1/p?targethost=127.0.0.1:8443&targetpath=/q",
+            &DIRECT,
+        )
+        .unwrap();
+        assert!(
+            ensure_not_listener(
+                &[looping],
+                &["127.0.0.1:8443".parse().unwrap()],
+                "upstream_urls"
+            )
+            .is_err(),
+            "a target on this server's DoH listener would loop"
         );
     }
 

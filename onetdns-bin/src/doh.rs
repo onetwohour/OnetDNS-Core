@@ -783,6 +783,29 @@ mod tests {
             "{head}"
         );
 
+        // OnetDNS's own ODoH upstream, through this proxy to this target. The URL form would name
+        // the target by IP, which this test certificate does not cover, so the TLS name is given
+        // apart from `targethost`.
+        let upstream = onetdns_forward::Upstream::odoh(
+            proxy.addr(),
+            "dns.test",
+            onetdns_forward::odoh::proxy_request_path(
+                "/dns-query",
+                &target.addr().to_string(),
+                "/dns-query",
+            ),
+            "dns.test",
+            target.addr(),
+        );
+        let forwarder = Forwarder::with_upstreams(vec![upstream], Duration::from_secs(5))
+            .with_trust(trust.clone());
+        let resolved = forwarder.resolve(&query).unwrap();
+        assert_eq!(resolved.header.id, 0x7171);
+        assert!(matches!(
+            resolved.answers[0].rdata,
+            ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
+        ));
+
         let denying = serve_proxy(Arc::new(IpAcl::new(
             vec![],
             vec!["127.0.0.0/8".parse().unwrap()],

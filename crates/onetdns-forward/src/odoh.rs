@@ -1,13 +1,14 @@
 //! Oblivious DoH (RFC 9230). The messages serve both ends: the target opens queries sealed to its
-//! key and seals the response to the same HPKE context, and the client does the reverse. The relay
-//! carries them for a proxy.
+//! key and seals the response to the same HPKE context, and the client (`exchange`) does the
+//! reverse. The relay carries them for a proxy.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use onetdns_core::MutexExt;
+use onetdns_core::{LruMap, MutexExt};
 use onetdns_http2::H2Error;
+use onetdns_proto::Message;
 use onetdns_tls::hpke::{
     self, HpkeError, PrivateKey, ReceiverContext, SenderContext, N_ENC, N_H, N_K, N_N, N_PK, N_T,
 };
@@ -15,7 +16,7 @@ use onetdns_tls::{TlsError, TrustStore};
 use zeroize::Zeroizing;
 
 use crate::doh::{self, ConnectError, DohConn};
-use crate::{Endpoint, ForwardError};
+use crate::{validate_response, Endpoint, ForwardError};
 
 const VERSION: u16 = 0x0001;
 const QUERY: u8 = 0x01;
@@ -499,9 +500,332 @@ fn relay_connect_error(error: ConnectError) -> RelayError {
     }
 }
 
+/// A target's config is fetched again after this long, and at once when the target answers 401.
+const CONFIG_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+const MAX_CACHED_CONFIGS: usize = 64;
+
+type ConfigKey = (String, SocketAddr, crate::TlsCacheScope);
+
+/// Shared by every thread, so a target's config is fetched once rather than once per thread.
+fn config_cache() -> &'static Mutex<LruMap<ConfigKey, (PublicConfig, Instant)>> {
+    static CONFIGS: OnceLock<Mutex<LruMap<ConfigKey, (PublicConfig, Instant)>>> = OnceLock::new();
+    CONFIGS.get_or_init(|| Mutex::new(LruMap::new(MAX_CACHED_CONFIGS)))
+}
+
+/// The proxy request path: `proxy_path` with the target in `targethost` and `targetpath`, encoded
+/// as RFC 9230's URI template `{?targethost,targetpath}` expands them.
+pub fn proxy_request_path(proxy_path: &str, target_host: &str, target_path: &str) -> String {
+    fn encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+    format!(
+        "{proxy_path}?targethost={}&targetpath={}",
+        encode(target_host),
+        encode(target_path)
+    )
+}
+
+/// Seals the query to the target's key and sends it through the proxy on this thread's pooled
+/// connection. A 401 means the target changed its key: the config is fetched again and the query
+/// resent once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exchange(
+    proxy: SocketAddr,
+    server_name: &str,
+    path: &str,
+    target: (&str, SocketAddr),
+    wire: &[u8],
+    request: &Message,
+    timeout: Duration,
+    trust: &TrustStore,
+) -> Result<Message, ForwardError> {
+    let deadline = crate::deadline_after(timeout);
+    if wire.len() < 2 {
+        return Err(ForwardError::BadResponse);
+    }
+    let mut query = wire.to_vec();
+    query[..2].fill(0);
+    let mut refresh = false;
+    loop {
+        let config = target_config(target, refresh, deadline, trust)?;
+        let (message, pending) = config
+            .seal_query(&query)
+            .map_err(|_| ForwardError::BadResponse)?;
+        let reply = doh::with_pooled(
+            &Endpoint::Direct(proxy),
+            server_name,
+            path,
+            deadline,
+            trust,
+            |conn| {
+                doh::arm_probe(conn, deadline);
+                let sent = conn
+                    .client
+                    .oblivious_probed(server_name, path, &message, |stream| {
+                        stream.inner_mut().set_deadline(deadline)
+                    });
+                match sent {
+                    Ok(body) => Ok(Ok(body)),
+                    Err(H2Error::BadStatus(status)) => Ok(Err(status)),
+                    Err(H2Error::Closed) => {
+                        Err(ForwardError::Io("ODoH proxy closed the connection".into()))
+                    }
+                    Err(H2Error::Protocol) => Err(ForwardError::BadResponse),
+                    Err(H2Error::Io) => Err(ForwardError::Io(
+                        "I/O error on the ODoH proxy connection".into(),
+                    )),
+                }
+            },
+        )?;
+        match reply {
+            Ok(body) => {
+                let plaintext = pending
+                    .open_response(&body)
+                    .map_err(|_| ForwardError::BadResponse)?;
+                let response = Message::parse(&plaintext).map_err(|_| ForwardError::BadResponse)?;
+                validate_response(request, &response, Some(0))?;
+                return Ok(response);
+            }
+            Err(401) if !refresh => refresh = true,
+            Err(status) => return Err(ForwardError::Io(format!("ODoH status {status}"))),
+        }
+    }
+}
+
+fn target_config(
+    (name, addr): (&str, SocketAddr),
+    refresh: bool,
+    deadline: Instant,
+    trust: &TrustStore,
+) -> Result<PublicConfig, ForwardError> {
+    let key = (name.to_string(), addr, crate::tls_cache_scope(trust));
+    if !refresh {
+        let mut cache = config_cache().lock_recover();
+        if let Some((config, fetched)) = cache.get(&key) {
+            if fetched.elapsed() < CONFIG_LIFETIME {
+                return Ok(config.clone());
+            }
+        }
+    }
+    let mut conn =
+        doh::connect_h2(&Endpoint::Direct(addr), name, deadline, trust, None).map_err(|error| {
+            match error {
+                ConnectError::Tcp(error) => error,
+                ConnectError::Tls(error) => {
+                    crate::note_upstream_connect_failure("odoh", addr, name, &error);
+                    ForwardError::Io(format!("ODoH target handshake: {error}"))
+                }
+                ConnectError::Revoked(error) => error,
+                ConnectError::Preface => ForwardError::Io("ODoH target HTTP/2 preface".into()),
+            }
+        })?;
+    conn.client.stream_mut().inner_mut().set_deadline(deadline);
+    let body = conn
+        .client
+        .odoh_configs(name)
+        .map_err(|error| match error {
+            H2Error::BadStatus(status) => {
+                ForwardError::Io(format!("ODoH target config status {status}"))
+            }
+            _ => ForwardError::Io("Could not fetch the ODoH target config".into()),
+        })?;
+    let config = PublicConfig::from_configs(&body).map_err(|_| ForwardError::BadResponse)?;
+    config_cache()
+        .lock_recover()
+        .put(key, (config.clone(), Instant::now()));
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod client {
+        use super::*;
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+
+        use onetdns_http2::{Oblivious, ObliviousReply};
+        use onetdns_proto::{Name, RData, Record, RecordType};
+        use onetdns_tls::{
+            server_handshake, signer_from_pkcs8_der, ServerConfig as TlsServerConfig, TlsStream,
+        };
+
+        /// Proxy and target in one server: the proxy relays to its own address, as a real proxy
+        /// would to another host.
+        struct ProxyAndTarget {
+            key: Mutex<TargetKey>,
+            addr: SocketAddr,
+            relay: Relay,
+            config_fetches: AtomicUsize,
+            relayed_to: Mutex<Vec<(String, String)>>,
+        }
+
+        impl Oblivious for ProxyAndTarget {
+            fn configs(&self) -> Option<Vec<u8>> {
+                self.config_fetches.fetch_add(1, Ordering::Relaxed);
+                Some(self.key.lock_recover().configs())
+            }
+
+            fn target(&self, message: &[u8]) -> ObliviousReply {
+                let key = self.key.lock_recover();
+                let opened = match key.open_query(message) {
+                    Ok(opened) => opened,
+                    Err(OdohError::UnknownKey) => return ObliviousReply::Status("401"),
+                    Err(_) => return ObliviousReply::Status("400"),
+                };
+                let request = Message::parse(opened.dns()).unwrap();
+                let mut answer = Message::default();
+                answer.header.id = request.header.id;
+                answer.header.response = true;
+                answer.questions = request.questions.clone();
+                answer.answers.push(Record::new(
+                    request.questions[0].name.clone(),
+                    60,
+                    RData::A(Ipv4Addr::new(192, 0, 2, 7)),
+                ));
+                let sealed = opened.seal_response(&answer.try_encode().unwrap());
+                ObliviousReply::Message(sealed.unwrap())
+            }
+
+            fn proxy(&self, host: &str, path: &str, message: &[u8]) -> ObliviousReply {
+                self.relayed_to
+                    .lock_recover()
+                    .push((host.to_string(), path.to_string()));
+                let timeout = Duration::from_secs(5);
+                match self
+                    .relay
+                    .send(self.addr, "dns.test", path, message, timeout)
+                {
+                    Ok(Relayed::Message(message)) => ObliviousReply::Message(message),
+                    Ok(Relayed::Status(status)) => ObliviousReply::TargetStatus(status),
+                    Err(error) => ObliviousReply::ProxyError {
+                        status: "502",
+                        error: error.proxy_status(),
+                    },
+                }
+            }
+        }
+
+        fn serve() -> (Arc<ProxyAndTarget>, Arc<TrustStore>) {
+            let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
+            let cert_der = ck.cert.der().to_vec();
+            let key_der = ck.key_pair.serialize_der();
+            let trust = Arc::new(TrustStore::from_ders([cert_der.as_slice()]));
+            let (sign_scheme, sign) = signer_from_pkcs8_der(&key_der).unwrap();
+            let tls = Arc::new(TlsServerConfig {
+                cert_chain: vec![cert_der],
+                sign_scheme,
+                sign,
+                alpn: vec![b"h2".to_vec()],
+                client_ca: None,
+                resumption: None,
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let server = Arc::new(ProxyAndTarget {
+                key: Mutex::new(TargetKey::new(PrivateKey::generate())),
+                addr: listener.local_addr().unwrap(),
+                relay: Relay::with_trust(trust.clone()),
+                config_fetches: AtomicUsize::new(0),
+                relayed_to: Mutex::new(Vec::new()),
+            });
+            let shared = server.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut tcp) = stream else { continue };
+                    let (tls, server) = (tls.clone(), shared.clone());
+                    thread::spawn(move || {
+                        let Ok(conn) = server_handshake(&mut tcp, &tls) else {
+                            return;
+                        };
+                        let mut stream = TlsStream::new(conn, tcp);
+                        let _ = onetdns_http2::serve_doh_with_deadline_reset(
+                            &mut stream,
+                            "/dns-query",
+                            |_, _| Err("404"),
+                            |_| {},
+                            &AtomicBool::new(false),
+                            Some(&*server as &dyn Oblivious),
+                        );
+                    });
+                }
+            });
+            (server, trust)
+        }
+
+        #[test]
+        /// The query reaches the target only through the proxy; the target's config is fetched
+        /// once, and again only after the target answers 401 for a new key.
+        fn queries_go_through_the_proxy_and_follow_a_key_change() {
+            let (server, trust) = serve();
+            let target_host = format!("dns.test:{}", server.addr.port());
+            let path = proxy_request_path("/dns-query", &target_host, "/dns-query");
+            let upstream = crate::Upstream::odoh(
+                server.addr,
+                "dns.test",
+                path.clone(),
+                "dns.test",
+                server.addr,
+            );
+            let ask = |id: u16| {
+                let request =
+                    Message::query(id, Name::from_str("page.test").unwrap(), RecordType::A);
+                let wire = request.try_encode().unwrap();
+                crate::exchange_one(
+                    &upstream,
+                    &wire,
+                    id,
+                    &request,
+                    Duration::from_secs(5),
+                    &trust,
+                )
+            };
+
+            for id in [1, 2] {
+                let answer = ask(id).unwrap();
+                assert_eq!(
+                    answer.header.id, 0,
+                    "sent with ID 0 like DoH; the caller restores it"
+                );
+                assert!(matches!(
+                    answer.answers[0].rdata,
+                    RData::A(ip) if ip == Ipv4Addr::new(192, 0, 2, 7)
+                ));
+            }
+            assert_eq!(server.config_fetches.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                server.relayed_to.lock_recover()[0],
+                (target_host.clone(), "/dns-query".to_string())
+            );
+
+            *server.key.lock_recover() = TargetKey::new(PrivateKey::generate());
+            ask(3).expect("the 401 makes the client fetch the new config and resend");
+            assert_eq!(server.config_fetches.load(Ordering::Relaxed), 2);
+            assert_eq!(server.relayed_to.lock_recover().len(), 4);
+        }
+
+        #[test]
+        fn proxy_request_paths_encode_the_target_as_the_uri_template_does() {
+            assert_eq!(
+                proxy_request_path("/proxy", "odoh.example:8443", "/dns-query"),
+                "/proxy?targethost=odoh.example%3A8443&targetpath=%2Fdns-query"
+            );
+            assert_eq!(
+                proxy_request_path("/p", "[2001:db8::1]", "/a~b_c.d-e"),
+                "/p?targethost=%5B2001%3Adb8%3A%3A1%5D&targetpath=%2Fa~b_c.d-e"
+            );
+        }
+    }
 
     #[test]
     fn relay_reports_a_target_it_cannot_reach() {

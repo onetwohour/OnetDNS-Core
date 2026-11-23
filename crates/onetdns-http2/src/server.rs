@@ -3114,4 +3114,43 @@ mod tests {
         drop(client);
         server.join().unwrap();
     }
+
+    #[test]
+    /// The client half of ODoH: configs by GET, messages by POST, and a stale key as status 401.
+    fn h2_client_fetches_configs_and_sends_oblivious_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut s = deadline_accept(&listener);
+            let target = EchoTarget { is_target: true };
+            serve_doh_with_deadline_reset(
+                &mut s,
+                "/dns-query",
+                |q, _| answer(q.to_vec()),
+                |_| {},
+                &AtomicBool::new(false),
+                Some(&target),
+            )
+            .ok();
+        });
+        let mut client = crate::H2Client::connect(deadline_connect(addr)).unwrap();
+        assert_eq!(client.odoh_configs("dns.test").unwrap(), b"configs");
+        assert_eq!(
+            client
+                .oblivious_probed("dns.test", "/dns-query", b"abc", |_| {})
+                .unwrap(),
+            b"cba"
+        );
+        assert!(matches!(
+            client.oblivious_probed("dns.test", "/dns-query", b"unknown", |_| {}),
+            Err(H2Error::BadStatus(401))
+        ));
+        assert_eq!(
+            client.query("dns.test", "/dns-query", b"dns").unwrap(),
+            b"dns",
+            "the connection stays usable after an error status"
+        );
+        drop(client);
+        server.join().unwrap();
+    }
 }

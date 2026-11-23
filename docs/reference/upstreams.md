@@ -42,7 +42,9 @@ Plain DNS server addresses used for UDP or TCP forwarding.
 upstream_urls = ["h3://1.1.1.1/dns-query#cloudflare-dns.com"]
 ```
 
-Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, and DoH3 with h3://; a DNSCrypt server is given by its sdns:// stamp. Add # and a relay stamp after it to ask through an Anonymized DNSCrypt relay.
+Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, DoH3 with h3://, and Oblivious DoH with odoh://; a DNSCrypt server is given by its sdns:// stamp. Add # and a relay stamp after it to ask through an Anonymized DNSCrypt relay.
+
+An Oblivious DoH upstream names the proxy and, in its query string, the target: `odoh://proxy.example/proxy-path?targethost=odoh.example&targetpath=/dns-query`. `#name` after it sets the proxy's TLS server name. Both `targethost` and `targetpath` are required, written without percent-encoding; `targethost` may carry a port. See [Oblivious DoH upstreams](../resolution.md#oblivious-doh-upstreams).
 
 **Note:** If `upstreams` is specified and `upstream_urls` is omitted, the implicit encrypted defaults are cleared.
 

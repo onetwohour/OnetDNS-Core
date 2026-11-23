@@ -54,9 +54,23 @@ upstream_urls = ["https://dns.quad9.net/dns-query"]
 
 The host name is passed to the proxy as written, so the proxy resolves it and this server never looks it up; `bootstrap` is not needed. The certificate is still checked against the upstream's name, connections are still pooled, and a dropped connection is reopened through the proxy. If the proxy asks for a user name and password, set `upstream_proxy_username` and `upstream_proxy_password`. SOCKS5 sends them in plain text, so keep the proxy on this machine or a network you trust.
 
-SOCKS5 carries only TCP. A configuration with a proxy is refused if any forwarding upstream would have to bypass it: entries in `upstreams`, and `udp://`, `tcp://`, `quic://` or `h3://` entries in `upstream_urls`, `fallback_upstreams` or a client's `upstreams`. QUIC upstreams would need CONNECT-UDP over HTTP/3, which OnetDNS does not support. `backend = "recurse"` is refused with a proxy for the same reason.
+SOCKS5 carries only TCP. A configuration with a proxy is refused if any forwarding upstream would have to bypass it: entries in `upstreams`, and `udp://`, `tcp://`, `quic://`, `h3://`, `odoh://` or `sdns://` entries in `upstream_urls`, `fallback_upstreams` or a client's `upstreams`. QUIC upstreams would need CONNECT-UDP over HTTP/3, which OnetDNS does not support. `backend = "recurse"` is refused with a proxy for the same reason.
 
 Some traffic still leaves directly even with a proxy set: stub zones, recursion (including the recursive part of `backend = "split"`), `bootstrap` lookups for stub zones, certificate revocation checks when `tls_revocation` is on, and blocklist and update downloads. A resumed TLS session lets the upstream link connections that use it, as it would without a proxy.
+
+### Oblivious DoH upstreams
+
+An `odoh://` upstream sends each query encrypted to an Oblivious DoH target (RFC 9230) through a separate proxy:
+
+```toml
+upstream_urls = [
+  "odoh://odoh-proxy.example/proxy?targethost=odoh-target.example&targetpath=/dns-query",
+]
+```
+
+The proxy learns this server's address but not the queries; the target answers the queries but sees only the proxy's address. The split protects you only if the proxy and the target are run by different operators who do not share logs.
+
+OnetDNS fetches the target's key configuration directly from `https://odoh-target.example/.well-known/odohconfigs` and keeps it for a day, or until the target answers that the key changed. That fetch reaches the target from this server's own address, so the target can see that this server uses it, though not what it asks. Host names in the URL, the proxy's and the target's, are resolved through `bootstrap` like other upstream names; an upstream whose proxy or target points at one of this server's own listeners is rejected.
 
 ## Recursive resolution
 

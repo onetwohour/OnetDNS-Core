@@ -13,7 +13,7 @@ use onetdns_tls::hpke::PrivateKey;
 
 use crate::native::RelayAdmission;
 use crate::transport_observe;
-use crate::upstream::{parse_upstream_url, BOOTSTRAP_TIMEOUT};
+use crate::upstream::{parse_upstream_url, split_authority, BOOTSTRAP_TIMEOUT};
 
 /// How long a relay waits for a target. Fixed rather than `query_timeout_secs`, so changing that
 /// key does not reopen the DoH listener.
@@ -167,22 +167,6 @@ impl OdohProxy {
         };
         *target.addr.lock_recover() = Some((addr, Instant::now().checked_add(lifetime)));
         Some(addr)
-    }
-}
-
-/// Splits `host[:port]` or `[v6][:port]`.
-fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
-    let port = |raw: &str| raw.parse::<u16>().ok().filter(|port| *port != 0);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, rest) = bracketed.split_once(']')?;
-        return match rest {
-            "" => Some((host, None)),
-            rest => Some((host, Some(port(rest.strip_prefix(':')?)?))),
-        };
-    }
-    match authority.split_once(':') {
-        Some((host, raw)) if !raw.contains(':') => Some((host, Some(port(raw)?))),
-        _ => Some((authority, None)),
     }
 }
 
