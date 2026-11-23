@@ -1514,6 +1514,11 @@ impl Config {
                 .map(|(scheme, _)| scheme.to_ascii_lowercase());
             match scheme.as_deref() {
                 Some("tls" | "https") => {}
+                Some("sdns") => {
+                    return invalid(format!(
+                        "{label} has a DNSCrypt server, but DNSCrypt runs over UDP and cannot go through `upstream_proxy`; use tls:// or https://"
+                    ));
+                }
                 Some("quic" | "h3") => {
                     return invalid(format!(
                         "{label} has {url}, but QUIC cannot go through `upstream_proxy`: SOCKS5 carries only TCP, and proxying QUIC over HTTP/3 (CONNECT-UDP) is not supported; use tls:// or https://"
@@ -3180,7 +3185,7 @@ fn upstream_url_is_encrypted(url: &str) -> bool {
     url.trim().split_once("://").is_some_and(|(scheme, _)| {
         matches!(
             scheme.to_ascii_lowercase().as_str(),
-            "tls" | "https" | "quic" | "h3"
+            "tls" | "https" | "quic" | "h3" | "sdns"
         )
     })
 }
@@ -6720,6 +6725,11 @@ answer = \"target.example\"
             assert!(error.contains("plain DNS"), "{url}: {error}");
         }
 
+        let mut dnscrypt = base.clone();
+        dnscrypt.upstream_urls = vec!["sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20".into()];
+        let error = dnscrypt.validate().unwrap_err().to_string();
+        assert!(error.contains("DNSCrypt"), "{error}");
+
         let mut client = base.clone();
         client.clients = vec![ClientConfig {
             name: "laptop".into(),
@@ -7632,6 +7642,16 @@ tftp_writable = true
         .unwrap();
         assert_eq!(mixed_urls.upstream_url_counts(), (1, 1));
         assert!(mixed_urls.mixes_plain_and_encrypted_upstreams());
+        let stamp = Config::from_toml_str(
+            "upstream_urls = [\"sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20\"]
+",
+        )
+        .unwrap();
+        assert_eq!(
+            stamp.upstream_url_counts(),
+            (1, 0),
+            "DNSCrypt 는 암호화입니다"
+        );
     }
 
     #[test]
