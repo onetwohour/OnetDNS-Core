@@ -31,6 +31,28 @@ pub struct DdrEndpoint {
     pub dohpath: Option<String>,
 }
 
+impl DdrEndpoint {
+    /// In ascending key order, as SVCB records and DNR options both require.
+    pub fn svc_params(&self) -> Result<Vec<(u16, Box<[u8]>)>, String> {
+        let mut params: Vec<(u16, Box<[u8]>)> = Vec::with_capacity(3);
+        let mut alpn = Vec::new();
+        for id in self.alpn {
+            let bytes = id.as_bytes();
+            if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                return Err(format!("DDR ALPN identifier '{id}' has an invalid length"));
+            }
+            alpn.push(bytes.len() as u8);
+            alpn.extend_from_slice(bytes);
+        }
+        params.push((SVCB_KEY_ALPN, alpn.into_boxed_slice()));
+        params.push((SVCB_KEY_PORT, Box::from(self.port.to_be_bytes().as_slice())));
+        if let Some(path) = &self.dohpath {
+            params.push((SVCB_KEY_DOHPATH, Box::from(path.as_bytes())));
+        }
+        Ok(params)
+    }
+}
+
 /// Lets clients that ask over Do53 upgrade to DoH, DoT, or DoQ. The answer depends on neither the
 /// client nor the time, so it is built once and cloned per query.
 pub struct DdrLayer {
@@ -60,32 +82,13 @@ impl DdrLayer {
         })?;
         let mut records = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
-            // Parameters must be in ascending key order; the encoder checks it.
-            let mut params: Vec<(u16, Box<[u8]>)> = Vec::with_capacity(3);
-            let mut alpn = Vec::new();
-            for id in endpoint.alpn {
-                let bytes = id.as_bytes();
-                if bytes.is_empty() || bytes.len() > u8::MAX as usize {
-                    return Err(format!("DDR ALPN identifier '{id}' has an invalid length"));
-                }
-                alpn.push(bytes.len() as u8);
-                alpn.extend_from_slice(bytes);
-            }
-            params.push((SVCB_KEY_ALPN, alpn.into_boxed_slice()));
-            params.push((
-                SVCB_KEY_PORT,
-                Box::from(endpoint.port.to_be_bytes().as_slice()),
-            ));
-            if let Some(path) = &endpoint.dohpath {
-                params.push((SVCB_KEY_DOHPATH, Box::from(path.as_bytes())));
-            }
             records.push(Record::new(
                 owner.clone(),
                 DDR_TTL,
                 RData::Svcb {
                     priority: endpoint.priority,
                     target: target.clone(),
-                    params: params.into_boxed_slice(),
+                    params: endpoint.svc_params()?.into_boxed_slice(),
                 },
             ));
         }

@@ -493,38 +493,46 @@ fn run_service(action: ServiceAction) -> BoxResult<()> {
     }
 }
 
-/// Encrypted transports DDR advertises, most widely supported first so upgrades succeed more
-/// often, one per open port. Empty without encrypted listeners.
-fn ddr_endpoints_from(cfg: &Config) -> Vec<layers::DdrEndpoint> {
-    fn ports(addrs: &[SocketAddr]) -> Vec<u16> {
-        let mut out: Vec<u16> = Vec::new();
-        for addr in addrs {
-            if !out.contains(&addr.port()) {
-                out.push(addr.port());
-            }
-        }
-        out
-    }
-
+/// Encrypted transports DDR and DNR advertise, most widely supported first so upgrades succeed
+/// more often, one per open port with the addresses it listens on. Empty without encrypted
+/// listeners.
+fn encrypted_endpoints(cfg: &Config) -> Vec<(layers::DdrEndpoint, Vec<IpAddr>)> {
     // The dohpath must be a URI template with the dns variable (RFC 9461).
     let dohpath = format!("{}{{?dns}}", cfg.doh_path);
-    let mut out = Vec::new();
+    let mut out: Vec<(layers::DdrEndpoint, Vec<IpAddr>)> = Vec::new();
     for (priority, alpn, addrs, path) in [
         (1u16, &["h2"][..], &cfg.listen_doh, Some(dohpath.clone())),
         (2, &["h3"][..], &cfg.listen_doh3, Some(dohpath)),
         (3, &["dot"][..], &cfg.listen_dot, None),
         (4, &["doq"][..], &cfg.listen_doq, None),
     ] {
-        for port in ports(addrs) {
-            out.push(layers::DdrEndpoint {
-                priority,
-                alpn,
-                port,
-                dohpath: path.clone(),
-            });
+        let transport = out.len();
+        for addr in addrs {
+            match out[transport..]
+                .iter_mut()
+                .find(|(endpoint, _)| endpoint.port == addr.port())
+            {
+                Some((_, ips)) => ips.push(addr.ip()),
+                None => out.push((
+                    layers::DdrEndpoint {
+                        priority,
+                        alpn,
+                        port: addr.port(),
+                        dohpath: path.clone(),
+                    },
+                    vec![addr.ip()],
+                )),
+            }
         }
     }
     out
+}
+
+fn ddr_endpoints_from(cfg: &Config) -> Vec<layers::DdrEndpoint> {
+    encrypted_endpoints(cfg)
+        .into_iter()
+        .map(|(endpoint, _)| endpoint)
+        .collect()
 }
 
 /// Set by the signal handler.
@@ -3227,11 +3235,26 @@ mod tests {
         cfg.listen_dot = vec!["127.0.0.1:853".parse().unwrap()];
         let endpoints = ddr_endpoints_from(&cfg);
 
-        // A port served on several addresses is advertised once.
+        // A port served on several addresses is advertised once, with those addresses for DNR.
         let doh: Vec<_> = endpoints.iter().filter(|e| e.alpn == ["h2"]).collect();
         assert_eq!(doh.len(), 2);
         assert_eq!(doh[0].port, 443);
         assert_eq!(doh[1].port, 8443);
+        let listening: Vec<Vec<IpAddr>> = encrypted_endpoints(&cfg)
+            .into_iter()
+            .filter(|(endpoint, _)| endpoint.alpn == ["h2"])
+            .map(|(_, addrs)| addrs)
+            .collect();
+        assert_eq!(
+            listening,
+            [
+                vec![
+                    IpAddr::from(Ipv4Addr::LOCALHOST),
+                    IpAddr::from(Ipv6Addr::LOCALHOST)
+                ],
+                vec![IpAddr::from(Ipv4Addr::LOCALHOST)],
+            ]
+        );
         assert!(doh.iter().all(|e| e.dohpath.as_deref() == Some("/q{?dns}")));
 
         let dot: Vec<_> = endpoints.iter().filter(|e| e.alpn == ["dot"]).collect();
