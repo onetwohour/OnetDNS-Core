@@ -254,23 +254,36 @@ pub(crate) fn build_filter_engine_for_config(
         let mut extra_block: Vec<&str> = service_rules.iter().map(String::as_str).collect();
         extra_block.extend(overlay_block.iter().map(String::as_str));
         let overlay_allow_refs: Vec<&str> = overlay_allow.iter().map(String::as_str).collect();
-        let mut parts = onetdns_filter::load_parts_with_subscriptions(
+        let mut parsed_lists = compiled_filter_cache
+            .and_then(|path| path.parent())
+            .map(|dir| ParsedListDir::new(dir.join("parsed-lists")));
+        let mut parts = onetdns_filter::load_parts_with_store(
             &config.blocklists,
             &config.allowlists,
             &subscription_sources,
             &extra_block,
             &overlay_allow_refs,
+            parsed_lists
+                .as_mut()
+                .map(|store| store as &mut dyn onetdns_filter::ParsedListStore),
+            |parts| {
+                merge_config_filters(
+                    parts,
+                    &config.rewrites,
+                    &config.local_zones,
+                    refused_domains,
+                    &config.rpz_files,
+                )
+                .map_err(std::io::Error::other)?;
+                for text in rpz_texts {
+                    onetdns_filter::parse_rpz_text(text, parts);
+                }
+                Ok(())
+            },
         )
         .map_err(|error| error.to_string())?;
-        merge_config_filters(
-            &mut parts,
-            &config.rewrites,
-            &config.local_zones,
-            refused_domains,
-            &config.rpz_files,
-        )?;
-        for text in rpz_texts {
-            onetdns_filter::parse_rpz_text(text, &mut parts);
+        if let Some(parsed_lists) = &parsed_lists {
+            parsed_lists.remove_unused();
         }
         if let Some(path) = compiled_filter_cache {
             save_compiled_filter_cache(path, &mut parts, fingerprint);
@@ -341,11 +354,14 @@ struct CompiledFilterInputs<'a> {
     rpz_texts: &'a [String],
 }
 
+/// Bump when rule parsing changes meaning, so the compiled cache and every parsed list built by the
+/// old parser are rebuilt.
+const FILTER_PARSE_FORMAT: &[u8] = b"onetdns-compiled-filter-input-v2";
+
 /// The compiled cache is reused only when this matches.
 fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
     let mut digest = Sha256::new();
-    // Bump when rule parsing changes meaning, so caches built by the old parser are rebuilt.
-    fingerprint_bytes(&mut digest, b"format", b"onetdns-compiled-filter-input-v2");
+    fingerprint_bytes(&mut digest, b"format", FILTER_PARSE_FORMAT);
     fingerprint_files(&mut digest, b"blocklists", input.blocklists);
     fingerprint_files(&mut digest, b"allowlists", input.allowlists);
     fingerprint_strings(&mut digest, b"service-rules", input.service_rules.iter());
@@ -491,19 +507,16 @@ fn fingerprint_file(digest: &mut Sha256, path: &std::path::Path, skip_cache_head
     }
 }
 
-fn load_compiled_filter_cache(
-    path: &std::path::Path,
-    fingerprint: [u8; 32],
-) -> Option<EngineParts> {
+/// `None` when the file is missing, unreadable, or over the cache size limit.
+fn read_cache_file(path: &std::path::Path) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() > onetdns_filter::MAX_CACHE_BYTES as u64 {
-        onetdns_core::warn!(event = "filter.cache_evicted_oversize", path = %path.display(), "Deleted the compiled filter cache because it exceeded the size limit");
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > onetdns_filter::MAX_CACHE_BYTES as u64 {
         return None;
     }
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(metadata.len() as usize).ok()?;
+    bytes.try_reserve_exact(len as usize).ok()?;
     let mut file = std::fs::File::open(path)
         .ok()?
         .take(onetdns_filter::MAX_CACHE_BYTES as u64 + 1);
@@ -511,6 +524,19 @@ fn load_compiled_filter_cache(
     if bytes.len() > onetdns_filter::MAX_CACHE_BYTES {
         return None;
     }
+    Some(bytes)
+}
+
+fn load_compiled_filter_cache(
+    path: &std::path::Path,
+    fingerprint: [u8; 32],
+) -> Option<EngineParts> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > onetdns_filter::MAX_CACHE_BYTES as u64 {
+        onetdns_core::warn!(event = "filter.cache_evicted_oversize", path = %path.display(), "Deleted the compiled filter cache because it exceeded the size limit");
+        return None;
+    }
+    let bytes = read_cache_file(path)?;
     match onetdns_filter::decode_engine_cache(&bytes, fingerprint) {
         Ok(parts) => Some(parts),
         Err(error) => {
@@ -536,6 +562,83 @@ fn save_compiled_filter_cache(
         onetdns_filter::write_engine_cache(parts, fingerprint, file).map_err(std::io::Error::other)
     }) {
         onetdns_core::warn!(event = "filter.cache_save_failed", path = %path.display(), %error, "Could not save the compiled filter cache");
+    }
+}
+
+/// Keeps each list file's parsed form between builds, so after one list changes only that list is
+/// parsed again. An entry is named by the rules it holds; entries the last build did not use are
+/// removed.
+struct ParsedListDir {
+    dir: PathBuf,
+    used: std::collections::HashSet<std::ffi::OsString>,
+}
+
+impl ParsedListDir {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            used: std::collections::HashSet::new(),
+        }
+    }
+
+    fn key(rules: &[u8; 32]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        fingerprint_bytes(&mut digest, b"format", FILTER_PARSE_FORMAT);
+        fingerprint_bytes(&mut digest, b"rules", rules);
+        digest.finalize().into()
+    }
+
+    fn entry_path(&mut self, key: &[u8; 32]) -> PathBuf {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&key[..8]);
+        let name = format!("{:016x}.parsed", u64::from_be_bytes(prefix));
+        let path = self.dir.join(&name);
+        self.used.insert(name.into());
+        path
+    }
+
+    fn remove_unused(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let is_entry = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "parsed");
+            if is_entry && !self.used.contains(&name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+impl onetdns_filter::ParsedListStore for ParsedListDir {
+    fn load(&mut self, rules: &[u8; 32]) -> Option<onetdns_filter::ParsedList> {
+        let key = Self::key(rules);
+        let path = self.entry_path(&key);
+        let bytes = read_cache_file(&path)?;
+        match onetdns_filter::decode_parsed_list(&bytes, key) {
+            Ok(list) => Some(list),
+            Err(error) => {
+                onetdns_core::debug!(event = "filter.parsed_list_unusable", path = %path.display(), %error, "Stored parsed list is unusable; parsing the list again");
+                None
+            }
+        }
+    }
+
+    fn save(&mut self, rules: &[u8; 32], list: &onetdns_filter::ParsedList) {
+        let key = Self::key(rules);
+        let path = self.entry_path(&key);
+        if let Err(error) = std::fs::create_dir_all(&self.dir) {
+            onetdns_core::warn!(event = "filter.cache_dir_failed", path = %self.dir.display(), %error, "Could not create the parsed list directory");
+            return;
+        }
+        if let Err(error) = atomic_write_with(&path, false, |file| {
+            onetdns_filter::write_parsed_list(list, key, file).map_err(std::io::Error::other)
+        }) {
+            onetdns_core::warn!(event = "filter.parsed_list_save_failed", path = %path.display(), %error, "Could not save a parsed list");
+        }
     }
 }
 
@@ -1536,6 +1639,99 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    /// A damaged entry is parsed again and replaced, a changed list gets a new entry, and an entry no
+    /// build uses any more is removed.
+    fn parsed_lists_are_repaired_and_pruned() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-parsed-lists-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&first, "||first.example^\n||shared.example^\n").unwrap();
+        std::fs::write(&second, "||second.example^\n||shared.example^\n").unwrap();
+        let config = Config {
+            blocklists: vec![first.clone(), second.clone()],
+            ..Config::default()
+        };
+        let cache = dir.join("cache").join("compiled-filter.bin");
+        let overlay = vec!["||user.example^".to_string()];
+        let input = FilterBuildInputs {
+            blocked_services: &[],
+            subscriptions: &[],
+            overlay_block: &overlay,
+            overlay_allow: &[],
+            refused_domains: &[],
+            rpz_texts: &[],
+            compiled_filter_cache: Some(&cache),
+            subscription_cache_dir: None,
+        };
+        let entries = || {
+            let mut entries: Vec<(PathBuf, Vec<u8>)> =
+                std::fs::read_dir(dir.join("cache").join("parsed-lists"))
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
+                    .collect();
+            entries.sort();
+            entries
+        };
+        let client = onetdns_core::ClientInfo {
+            source_ip: "127.0.0.1".parse().unwrap(),
+            client_id: None,
+            transport: onetdns_core::Transport::Do53Udp,
+            authenticated: false,
+        };
+        let source_of = |engine: &BlockEngine, name: &str| {
+            onetdns_core::FilterEngine::explain(
+                engine,
+                &onetdns_proto::Name::from_str(name).unwrap(),
+                onetdns_proto::RecordType::A,
+                &client,
+            )
+            .source
+        };
+
+        build_filter_engine_for_config(&config, &input).unwrap();
+        let stored = entries();
+        assert_eq!(stored.len(), 2);
+
+        let mut damaged = stored[0].1.clone();
+        let middle = damaged.len() / 2;
+        damaged[middle] ^= 0x40;
+        std::fs::write(&stored[0].0, damaged).unwrap();
+        std::fs::remove_file(&cache).unwrap();
+        let engine = build_filter_engine_for_config(&config, &input).unwrap();
+        assert_eq!(entries(), stored);
+        assert_eq!(
+            source_of(&engine, "shared.example"),
+            Some(first.display().to_string())
+        );
+        assert_eq!(source_of(&engine, "user.example"), None);
+
+        std::fs::write(&second, "||second.example^\n||changed.example^\n").unwrap();
+        let engine = build_filter_engine_for_config(&config, &input).unwrap();
+        let now = entries();
+        assert_eq!(now.len(), 2);
+        assert_eq!(now.iter().filter(|entry| stored.contains(entry)).count(), 1);
+        assert_eq!(
+            source_of(&engine, "changed.example"),
+            Some(second.display().to_string())
+        );
+        assert_eq!(
+            source_of(&engine, "shared.example"),
+            Some(first.display().to_string())
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
