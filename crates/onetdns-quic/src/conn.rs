@@ -7062,6 +7062,48 @@ mod tests {
     }
 
     #[test]
+    /// Each reset returns its stream's credit, so an acknowledging peer can keep opening and
+    /// resetting streams. What the closed streams leave behind must not grow with the cycles.
+    fn reset_cycles_leave_no_per_stream_state() {
+        let (mut client, mut server) = established_doq_pair();
+        let cycles = MAX_STREAMS_HARD as u64 * 4;
+        for number in 0..cycles {
+            let id = number << 2;
+            let mut payload = Vec::new();
+            frame::encode(
+                &mut payload,
+                &Frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: b"\x00\x40partial".to_vec(),
+                },
+            );
+            frame::encode(
+                &mut payload,
+                &Frame::ResetStream {
+                    id,
+                    error_code: 0x10,
+                    final_size: 9,
+                },
+            );
+            server
+                .recv_datagram(&forge_packet(&mut client, APP, &payload))
+                .unwrap();
+            assert_eq!(server.take_resets(), vec![(id, 0x10)]);
+            pump(&mut client, &mut server);
+        }
+        assert!(server.streams.is_empty(), "끊은 스트림의 상태가 남았습니다");
+        assert!(server.local_stream_max.is_empty());
+        assert_eq!(server.recv_buffered, 0);
+        assert_eq!(
+            server.closed_recv_ranges[0],
+            vec![(0, cycles - 1)],
+            "닫힌 스트림 기록이 범위 하나로 합쳐지지 않았습니다"
+        );
+    }
+
+    #[test]
     /// A peer that never acknowledges keeps the congestion window full, so nothing queued leaves.
     /// Each PATH_CHALLENGE must not add a PATH_RESPONSE to that queue; the newest one is enough.
     fn unacknowledged_path_challenges_queue_one_response() {
