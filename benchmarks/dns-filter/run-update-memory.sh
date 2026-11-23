@@ -108,7 +108,7 @@ rss() { awk '/^VmRSS:/{print $2}' "/proc/$PID/status" 2>/dev/null; }
 PID=$!
 wait_for "$W/a.log" "filter.subscription_applied" 1 || echo "warn: 1차 로드를 확인하지 못했습니다" >&2
 sleep 1
-echo "first   peak_rss_kib=$(peak) settled_rss_kib=$(rss) $(grep -o 'subscription_applied block=[0-9]*' "$W/a.log" | tail -1)"
+echo "first   peak_rss_kib=$(peak) settled_rss_kib=$(rss) $(grep 'filter.subscription_applied' "$W/a.log" | grep -o 'block=[0-9]*' | tail -1)"
 
 # 내용을 바꿔야 지문이 달라져 실제 재빌드가 일어난다.
 cp "$W/www/list2.txt" "$W/www/list.txt"
@@ -125,7 +125,7 @@ sed 's/^list_refresh_secs = .*/list_refresh_secs = 86400/' "$W/onetdns.toml" >"$
 
 "$BIN" run --config "$W/restart.toml" --no-web --no-supervisor >"$W/b.log" 2>&1 &
 PID=$!
-wait_for "$W/b.log" "filter.lists_loaded\|filter.cache_loaded" 1 || echo "warn: 재시작 로드를 확인하지 못했습니다" >&2
+wait_for "$W/b.log" "filter.lists_loaded\|filter.cache_loaded\|filter.cache_applied" 1 || echo "warn: 재시작 로드를 확인하지 못했습니다" >&2
 sleep 2
 echo "restart peak_rss_kib=$(peak) settled_rss_kib=$(rss)"
 kill -KILL "$PID" 2>/dev/null || true
