@@ -14,8 +14,8 @@ mod doh;
 mod doh3;
 mod doq;
 mod dot;
-mod opportunistic;
 pub mod odoh;
+mod opportunistic;
 mod quicdrive;
 mod socks5;
 
