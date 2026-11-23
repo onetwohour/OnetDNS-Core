@@ -1463,9 +1463,14 @@ mod tests {
     }
 
     fn h2_connect(addr: std::net::SocketAddr) -> TcpStream {
+        h2_connect_with(addr, &[])
+    }
+
+    /// `peer_settings` is the payload of the client's first SETTINGS.
+    fn h2_connect_with(addr: std::net::SocketAddr, peer_settings: &[u8]) -> TcpStream {
         let mut client = deadline_connect(addr);
         client.write_all(frame::PREFACE).unwrap();
-        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &[]).unwrap();
+        send_frame(&mut client, frame_type::SETTINGS, 0, 0, peer_settings).unwrap();
         client
     }
 
@@ -1789,18 +1794,59 @@ mod tests {
         let _ = server.join().unwrap();
     }
 
-    /// Frames the server sends up to its answer to the PING carrying `payload`. A PING sent after
-    /// other frames marks when the server has handled them.
-    fn frames_until_ping_ack(
-        client: &mut TcpStream,
-        payload: &[u8; 8],
-    ) -> Vec<(frame::FrameHeader, Vec<u8>)> {
+    const QUERY: &[u8] = b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01";
+
+    fn spawn_server<H>(
+        handler: H,
+    ) -> (
+        std::net::SocketAddr,
+        thread::JoinHandle<Result<(), H2Error>>,
+    )
+    where
+        H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh(&mut stream, "/dns-query", handler)
+        });
+        (addr, server)
+    }
+
+    /// A SETTINGS payload that sets the client's initial stream window.
+    fn initial_window(value: u32) -> Vec<u8> {
+        let mut payload = settings::INITIAL_WINDOW_SIZE.to_be_bytes().to_vec();
+        payload.extend_from_slice(&value.to_be_bytes());
+        payload
+    }
+
+    fn open_stream(client: &mut TcpStream, sid: u32, block: &[u8]) {
+        send_frame(client, frame_type::HEADERS, flags::END_HEADERS, sid, block).unwrap();
+    }
+
+    /// Sends `len` body bytes without ending the stream.
+    fn send_body(client: &mut TcpStream, sid: u32, len: usize) {
+        let chunk = vec![0u8; DEFAULT_MAX_FRAME];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            send_frame(client, frame_type::DATA, 0, sid, &chunk[..n]).unwrap();
+            left -= n;
+        }
+    }
+
+    /// Sends a PING and returns what the server sent before answering it, which is everything it
+    /// sent for the frames before the PING.
+    fn barrier(client: &mut TcpStream) -> Vec<(frame::FrameHeader, Vec<u8>)> {
+        const PAYLOAD: &[u8; 8] = b"barrier!";
+        send_frame(client, frame_type::PING, 0, 0, PAYLOAD).unwrap();
         let mut frames = Vec::new();
         loop {
             let frame = read_frame(client).expect("the server closed before its PING answer");
             if frame.0.frame_type == frame_type::PING
                 && frame.0.has_flag(flags::ACK)
-                && frame.1 == payload
+                && frame.1 == PAYLOAD
             {
                 return frames;
             }
@@ -1808,39 +1854,27 @@ mod tests {
         }
     }
 
+    /// The streams the server reset and its error codes, in order.
+    fn resets(frames: &[(frame::FrameHeader, Vec<u8>)]) -> Vec<(u32, u32)> {
+        frames
+            .iter()
+            .filter(|(h, _)| h.frame_type == frame_type::RST_STREAM)
+            .map(|(h, payload)| {
+                let code = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                (h.stream_id, code)
+            })
+            .collect()
+    }
+
     #[test]
     /// DATA after the request's END_STREAM resets the stream. Its answer, still waiting for window,
     /// must go with it: sending DATA on a stream this side reset breaks RFC 9113, and the waiting
     /// answer would keep its place in the stream and response budgets.
     fn stream_reset_for_late_data_drops_its_pending_answer() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut stream = deadline_accept(&listener);
-            serve_doh(&mut stream, "/dns-query", |query, _| answer(query.to_vec()))
-        });
-
-        let mut client = deadline_connect(addr);
-        client.write_all(frame::PREFACE).unwrap();
-        let mut no_window = settings::INITIAL_WINDOW_SIZE.to_be_bytes().to_vec();
-        no_window.extend_from_slice(&0u32.to_be_bytes());
-        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &no_window).unwrap();
-        send_frame(
-            &mut client,
-            frame_type::HEADERS,
-            flags::END_HEADERS,
-            1,
-            &doh_post_header_block(),
-        )
-        .unwrap();
-        send_frame(
-            &mut client,
-            frame_type::DATA,
-            flags::END_STREAM,
-            1,
-            b"query",
-        )
-        .unwrap();
+        let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+        let mut client = h2_connect_with(addr, &initial_window(0));
+        open_stream(&mut client, 1, &doh_post_header_block());
+        send_frame(&mut client, frame_type::DATA, flags::END_STREAM, 1, QUERY).unwrap();
         send_frame(&mut client, frame_type::DATA, 0, 1, b"late").unwrap();
         send_frame(
             &mut client,
@@ -1850,9 +1884,8 @@ mod tests {
             &1024u32.to_be_bytes(),
         )
         .unwrap();
-        send_frame(&mut client, frame_type::PING, 0, 0, b"barrier!").unwrap();
 
-        let frames = frames_until_ping_ack(&mut client, b"barrier!");
+        let frames = barrier(&mut client);
         assert!(
             frames
                 .iter()
@@ -1870,6 +1903,222 @@ mod tests {
                 .iter()
                 .any(|(h, _)| h.frame_type == frame_type::DATA && h.stream_id == 1),
             "끊은 스트림에 기다리던 답을 보냈습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn stream_cap_refuses_until_a_stream_closes() {
+        let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+        let mut client = h2_connect(addr);
+        let block = doh_post_header_block();
+        let over = MAX_H2_STREAMS as u32 * 2 + 1;
+        for sid in (1..=over).step_by(2) {
+            open_stream(&mut client, sid, &block);
+        }
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(over, error_code::REFUSED_STREAM)],
+            "동시 스트림 상한을 넘은 스트림 하나만 거절해야 합니다"
+        );
+
+        send_frame(
+            &mut client,
+            frame_type::RST_STREAM,
+            0,
+            1,
+            &error_code::CANCEL.to_be_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            h2_exchange_on(&mut client, over + 2, QUERY),
+            QUERY,
+            "클라이언트가 끊은 스트림의 자리가 돌아오지 않았습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    /// An answer waiting for window keeps its stream slot until it is sent.
+    fn answers_waiting_for_window_hold_their_stream_slots() {
+        let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+        let mut client = h2_connect_with(addr, &initial_window(0));
+        let block = doh_post_header_block();
+        let over = MAX_H2_STREAMS as u32 * 2 + 1;
+        for sid in (1..over).step_by(2) {
+            open_stream(&mut client, sid, &block);
+            send_frame(&mut client, frame_type::DATA, flags::END_STREAM, sid, QUERY).unwrap();
+        }
+        open_stream(&mut client, over, &block);
+        let frames = barrier(&mut client);
+        assert!(
+            !frames.iter().any(|(h, _)| h.frame_type == frame_type::DATA),
+            "대조군이 무효입니다. 창이 0인데 답을 보냈습니다"
+        );
+        assert_eq!(
+            resets(&frames),
+            vec![(over, error_code::REFUSED_STREAM)],
+            "창을 기다리는 답이 스트림 자리를 차지하지 않았습니다"
+        );
+
+        let opened = initial_window(INITIAL_WINDOW as u32);
+        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &opened).unwrap();
+        assert_eq!(
+            h2_exchange_on(&mut client, over + 2, QUERY),
+            QUERY,
+            "보낸 답의 스트림 자리가 돌아오지 않았습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    /// Answers waiting for window are bounded in bytes as well, and sending them returns the bytes.
+    fn answers_waiting_for_window_are_bounded_in_bytes() {
+        let (addr, server) = spawn_server(|_, _| answer(vec![0x5a; MAX_H2_RESPONSE]));
+        let mut client = h2_connect_with(addr, &initial_window(0));
+        let block = doh_post_header_block();
+        let fit = (MAX_H2_BUFFERED_RESPONSES / MAX_H2_RESPONSE) as u32;
+        let over = fit * 2 + 1;
+        for sid in (1..=over).step_by(2) {
+            open_stream(&mut client, sid, &block);
+            send_frame(&mut client, frame_type::DATA, flags::END_STREAM, sid, QUERY).unwrap();
+        }
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(over, error_code::REFUSED_STREAM)],
+            "창을 기다리는 답의 바이트 상한을 넘은 스트림을 거절하지 않았습니다"
+        );
+
+        let opened = initial_window(INITIAL_WINDOW as u32);
+        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &opened).unwrap();
+        let all_answers = MAX_H2_RESPONSE as u32 * (fit + 1);
+        send_frame(
+            &mut client,
+            frame_type::WINDOW_UPDATE,
+            0,
+            0,
+            &all_answers.to_be_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            h2_exchange_on(&mut client, over + 2, QUERY).len(),
+            MAX_H2_RESPONSE,
+            "보낸 답의 바이트가 돌아오지 않았습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    /// A request body is cut past MAX_H2_BODY, and the bodies of all open streams past
+    /// MAX_H2_BUFFERED_REQUESTS. A stream cut early would draw a second reset from its next DATA
+    /// frame, so the exact reset lists also pin the boundaries.
+    fn request_bodies_are_bounded_per_stream_and_per_connection() {
+        let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+        let mut client = h2_connect(addr);
+        let block = doh_post_header_block();
+        open_stream(&mut client, 1, &block);
+        send_body(&mut client, 1, MAX_H2_BODY + 1);
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(1, error_code::CANCEL)],
+            "본문 상한을 넘은 스트림을 끊지 않았습니다"
+        );
+
+        let fit = (MAX_H2_BUFFERED_REQUESTS / MAX_H2_BODY) as u32;
+        let first = 3;
+        let over = first + fit * 2;
+        for sid in (first..over).step_by(2) {
+            open_stream(&mut client, sid, &block);
+            send_body(&mut client, sid, MAX_H2_BODY);
+        }
+        open_stream(&mut client, over, &block);
+        send_body(&mut client, over, 1);
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(over, error_code::CANCEL)],
+            "연결 전체의 본문 상한을 넘은 스트림을 끊지 않았습니다"
+        );
+
+        send_frame(
+            &mut client,
+            frame_type::RST_STREAM,
+            0,
+            first,
+            &error_code::CANCEL.to_be_bytes(),
+        )
+        .unwrap();
+        open_stream(&mut client, over + 2, &block);
+        send_body(&mut client, over + 2, MAX_H2_BODY);
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![],
+            "클라이언트가 끊은 스트림의 본문 몫이 돌아오지 않았습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    /// A request header block that decodes to nearly MAX_H2_HEADER_BLOCK but stays small on the
+    /// wire, by repeating one dynamic table entry. `insert` adds the entry first.
+    fn bulky_header_block(insert: bool) -> Vec<u8> {
+        const NAME: &[u8] = b"x-pad";
+        const VALUE_LEN: usize = 4000;
+        let mut block = doh_post_header_block();
+        let mut copies = 8;
+        if insert {
+            block.push(0x40);
+            hpack::encode_int(&mut block, NAME.len() as u64, 7, 0);
+            block.extend_from_slice(NAME);
+            hpack::encode_int(&mut block, VALUE_LEN as u64, 7, 0);
+            block.resize(block.len() + VALUE_LEN, b'a');
+            copies -= 1;
+        }
+        // Index 62 is the newest dynamic table entry.
+        block.extend(std::iter::repeat_n(0xbe, copies));
+        block
+    }
+
+    #[test]
+    fn buffered_header_lists_are_connection_bounded() {
+        let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+        let mut client = h2_connect(addr);
+        let decoded = Decoder::new(4096)
+            .decode(&bulky_header_block(true))
+            .unwrap();
+        let per_stream = header_list_size(&decoded);
+        assert!(
+            per_stream <= MAX_H2_HEADER_BLOCK,
+            "대조군이 무효입니다. 스트림 하나의 헤더가 이미 상한을 넘습니다"
+        );
+        let fit = (MAX_H2_BUFFERED_HEADERS / per_stream) as u32;
+        let over = fit * 2 + 1;
+        open_stream(&mut client, 1, &bulky_header_block(true));
+        for sid in (3..=over).step_by(2) {
+            open_stream(&mut client, sid, &bulky_header_block(false));
+        }
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(over, error_code::CANCEL)],
+            "연결 전체의 헤더 상한을 넘은 스트림을 끊지 않았습니다"
+        );
+
+        send_frame(
+            &mut client,
+            frame_type::RST_STREAM,
+            0,
+            1,
+            &error_code::CANCEL.to_be_bytes(),
+        )
+        .unwrap();
+        open_stream(&mut client, over + 2, &bulky_header_block(false));
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![],
+            "클라이언트가 끊은 스트림의 헤더 몫이 돌아오지 않았습니다"
         );
         drop(client);
         let _ = server.join().unwrap();
