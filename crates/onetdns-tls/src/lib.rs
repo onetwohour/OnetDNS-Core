@@ -10,6 +10,7 @@ pub mod conn;
 pub mod der;
 pub mod engine;
 pub mod handshake;
+pub mod hpke;
 pub mod keyschedule;
 pub mod kx;
 pub mod msg;
