@@ -135,6 +135,14 @@ mod win32 {
         pub ullAvailExtendedVirtual: u64,
     }
 
+    /// 100-nanosecond intervals.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct FILETIME {
+        pub dwLowDateTime: u32,
+        pub dwHighDateTime: u32,
+    }
+
     #[repr(C)]
     #[derive(Default)]
     pub struct PROCESS_MEMORY_COUNTERS {
@@ -218,6 +226,13 @@ mod win32 {
             process: HANDLE,
             counters: *mut PROCESS_MEMORY_COUNTERS,
             size: u32,
+        ) -> i32;
+        pub fn GetProcessTimes(
+            process: HANDLE,
+            creation: *mut FILETIME,
+            exit: *mut FILETIME,
+            kernel: *mut FILETIME,
+            user: *mut FILETIME,
         ) -> i32;
     }
 }
@@ -619,9 +634,26 @@ pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
 }
 
 /// Bytes the system has available and this process uses.
-pub(super) fn own_memory() -> Option<(u64, u64)> {
+pub(crate) fn own_memory() -> Option<(u64, u64)> {
     // SAFETY: Takes no arguments; the pseudo handle needs no closing.
     memory_of(unsafe { win32::GetCurrentProcess() })
+}
+
+/// CPU time this process has used, in user and kernel mode together.
+pub(crate) fn own_cpu_time() -> Option<std::time::Duration> {
+    let mut times: [win32::FILETIME; 4] = Default::default();
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: The pseudo handle needs no closing, and each pointer is valid for one FILETIME.
+    let ok =
+        unsafe { win32::GetProcessTimes(win32::GetCurrentProcess(), creation, exit, kernel, user) };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |time: &win32::FILETIME| {
+        u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)
+    };
+    let total = ticks(kernel).saturating_add(ticks(user));
+    Some(std::time::Duration::from_nanos(total.saturating_mul(100)))
 }
 
 /// `process` must be open.

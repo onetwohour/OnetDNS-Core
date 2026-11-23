@@ -108,6 +108,7 @@ pub(crate) fn start(
         generation,
         started: Instant::now(),
         rate: Rate::default(),
+        usage: Usage::default(),
     };
     *DRAWER.lock_recover() = Some(Drawer::Waiting(feed, stop, wait));
     Some(Session(()))
@@ -374,6 +375,61 @@ struct Feed {
     generation: GenerationSlot,
     started: Instant,
     rate: Rate,
+    usage: Usage,
+}
+
+/// This process's CPU and memory use, read once a second. CPU is a share of one core, as `top`
+/// shows it, so a process busy on several cores goes over 100%.
+#[derive(Default)]
+struct Usage {
+    /// When it was last read, and the CPU time then.
+    last: Option<(Instant, Option<Duration>)>,
+    shown: view::Usage,
+}
+
+impl Usage {
+    fn sample(&mut self) -> view::Usage {
+        let now = Instant::now();
+        if let Some((at, _)) = self.last {
+            if now.duration_since(at) < Duration::from_secs(1) {
+                return self.shown;
+            }
+        }
+        let cpu = own_cpu_time();
+        let cpu_pct = match (self.last, cpu) {
+            (Some((at, Some(before))), Some(cpu)) => Some(
+                cpu.saturating_sub(before).as_secs_f64() * 100.0
+                    / now.duration_since(at).as_secs_f64(),
+            ),
+            _ => None,
+        };
+        self.last = Some((now, cpu));
+        self.shown = view::Usage {
+            cpu_pct,
+            resident: own_resident_memory(),
+        };
+        self.shown
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn own_cpu_time() -> Option<Duration> {
+    crate::supervisor::own_cpu_time()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn own_resident_memory() -> Option<u64> {
+    crate::supervisor::own_memory().map(|(_, used)| used)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn own_cpu_time() -> Option<Duration> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn own_resident_memory() -> Option<u64> {
+    None
 }
 
 #[derive(Default)]
@@ -459,6 +515,7 @@ impl Feed {
             version: crate::update::VERSION,
             serving,
             uptime: self.started.elapsed(),
+            usage: self.usage.sample(),
             traffic,
             dashboard,
             listeners,

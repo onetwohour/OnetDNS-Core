@@ -94,6 +94,9 @@ use unix as sys;
 use windows as sys;
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub(crate) use sys::{own_cpu_time, own_memory};
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use supervise::run;
 #[cfg(windows)]
 pub use supervise::run_service;
@@ -188,5 +191,19 @@ mod tests {
     fn this_process_reads_its_own_memory() {
         let (available, used) = sys::own_memory().expect("이 프로세스의 메모리");
         assert!(available > 0 && used > 0, "{available} {used}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn this_process_reads_its_own_cpu_time() {
+        let before = sys::own_cpu_time().expect("이 프로세스의 CPU 시간");
+        let started = std::time::Instant::now();
+        let mut spin = 0u64;
+        while started.elapsed() < Duration::from_millis(200) {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+        let after = sys::own_cpu_time().expect("이 프로세스의 CPU 시간");
+        // Windows counts in clock ticks of about 16 ms, so only growth is certain.
+        assert!(after > before, "{before:?} {after:?}");
     }
 }

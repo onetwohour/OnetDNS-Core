@@ -290,8 +290,24 @@ pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
 
 /// Bytes the system has available and this process uses.
 #[cfg(target_os = "linux")]
-pub(super) fn own_memory() -> Option<(u64, u64)> {
+pub(crate) fn own_memory() -> Option<(u64, u64)> {
     memory_of("self")
+}
+
+/// CPU time this process has used, in user and kernel mode together.
+pub(crate) fn own_cpu_time() -> Option<std::time::Duration> {
+    // SAFETY: All-zero bits are a valid rusage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is valid for writing.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
+        return None;
+    }
+    let time = |value: libc::timeval| {
+        let seconds = u64::try_from(value.tv_sec).ok()?;
+        let micros = u64::try_from(value.tv_usec).ok()?;
+        Some(std::time::Duration::from_secs(seconds) + std::time::Duration::from_micros(micros))
+    };
+    Some(time(usage.ru_utime)? + time(usage.ru_stime)?)
 }
 
 /// `pid` names a directory under /proc.
@@ -329,7 +345,7 @@ pub(super) fn memory(current: &Process) -> Option<(u64, u64)> {
 
 /// Bytes the system has available and this process uses.
 #[cfg(target_os = "macos")]
-pub(super) fn own_memory() -> Option<(u64, u64)> {
+pub(crate) fn own_memory() -> Option<(u64, u64)> {
     memory_of(libc::pid_t::try_from(std::process::id()).ok()?)
 }
 

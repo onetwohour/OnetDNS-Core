@@ -203,11 +203,21 @@ pub(super) struct Traffic {
     pub(super) latency_ms: f64,
 }
 
+/// What this process uses; `None` where the platform does not tell.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Usage {
+    /// Share of one core over the last second.
+    pub(super) cpu_pct: Option<f64>,
+    /// Resident bytes; the working set on Windows.
+    pub(super) resident: Option<u64>,
+}
+
 pub(super) struct Status {
     pub(super) version: &'static str,
     /// Mode and backend; `None` before the first configuration loads.
     pub(super) serving: Option<(&'static str, &'static str)>,
     pub(super) uptime: Duration,
+    pub(super) usage: Usage,
     pub(super) traffic: Option<Traffic>,
     pub(super) dashboard: Option<String>,
     /// Kind and bound address.
@@ -266,15 +276,32 @@ fn title(status: &Status, cols: usize) -> String {
         None => (WARN, "starting"),
     };
     let up = format!("up {}", uptime(status.uptime));
-    let right = 2 + text_width(state) + 3 + text_width(&up) + 1;
-    if row.width + 3 + right <= cols {
+    let usage = usage_text(status.usage);
+    let right = |usage: &str| {
+        let usage = if usage.is_empty() {
+            0
+        } else {
+            text_width(usage) + 3
+        };
+        2 + text_width(state) + 3 + usage + text_width(&up) + 1
+    };
+    // Usage goes first when the row is short.
+    let usage = if row.width + 3 + right(&usage) <= cols {
+        usage
+    } else {
+        String::new()
+    };
+    if row.width + 3 + right(&usage) <= cols {
         row.plain();
-        row.pad_to(cols - right);
+        row.pad_to(cols - right(&usage));
         row.paint(dot);
         row.text("● ");
         row.plain();
         row.text(state);
         row.paint(MUTED);
+        if !usage.is_empty() {
+            row.text(&format!("   {usage}"));
+        }
         row.text(&format!("   {up} "));
     }
     row.plain();
@@ -718,6 +745,27 @@ fn grouped(number: u64) -> String {
     out
 }
 
+fn usage_text(usage: Usage) -> String {
+    let cpu = usage.cpu_pct.map(|pct| format!("cpu {pct:.1}%"));
+    let memory = usage
+        .resident
+        .map(|bytes| format!("mem {}", binary_size(bytes)));
+    cpu.into_iter()
+        .chain(memory)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn binary_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mib = bytes as f64 / MIB;
+    if mib < 1024.0 {
+        format!("{mib:.0} MiB")
+    } else {
+        format!("{:.1} GiB", mib / 1024.0)
+    }
+}
+
 fn uptime(duration: Duration) -> String {
     let seconds = duration.as_secs();
     match seconds {
@@ -863,6 +911,7 @@ mod tests {
             version: "1.2.3",
             serving: Some(("personal", "forward")),
             uptime: Duration::from_secs(7_380),
+            usage: Usage::default(),
             traffic: Some(Traffic {
                 per_second: Some(12.0),
                 recent: vec![2.0, 4.0, 8.0, 12.0],
@@ -970,6 +1019,37 @@ mod tests {
             text[19].starts_with(" q quit   p pause   l level"),
             "{}",
             text[19]
+        );
+    }
+
+    #[test]
+    /// Usage is the first thing the title drops, so a narrow screen still shows the state.
+    fn the_title_shows_process_usage_when_it_fits() {
+        let mut status = status();
+        status.usage = Usage {
+            cpu_pct: Some(3.25),
+            resident: Some(42 * 1024 * 1024),
+        };
+        let wide = screen(&status, &log_with(1), 100, 20);
+        assert!(
+            wide[0].ends_with("● serving   cpu 3.2% · mem 42 MiB   up 2h 3m "),
+            "{}",
+            wide[0]
+        );
+        let narrow = screen(&status, &log_with(1), 70, 20);
+        assert!(
+            narrow[0].ends_with("● serving   up 2h 3m "),
+            "{}",
+            narrow[0]
+        );
+
+        status.usage.cpu_pct = None;
+        status.usage.resident = Some(3 * 1024 * 1024 * 1024 / 2);
+        let first_second = screen(&status, &log_with(1), 100, 20);
+        assert!(
+            first_second[0].ends_with("● serving   mem 1.5 GiB   up 2h 3m "),
+            "{}",
+            first_second[0]
         );
     }
 
