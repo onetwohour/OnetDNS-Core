@@ -438,6 +438,8 @@ where
                 });
                 let Some(st) = streams.get_mut(&h.stream_id) else {
                     restore_receive_credit(stream, 0, flow, &mut recv_conn_window)?;
+                    pending.remove(&h.stream_id);
+                    send_stream_windows.remove(&h.stream_id);
                     send_rst_stream(stream, h.stream_id, error_code::CANCEL)?;
                     continue;
                 };
@@ -1782,6 +1784,92 @@ mod tests {
         assert_eq!(
             echoed, query,
             "{cycles}번 열고 끊은 뒤 정상 질의가 처리되지 않았습니다"
+        );
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    /// Frames the server sends up to its answer to the PING carrying `payload`. A PING sent after
+    /// other frames marks when the server has handled them.
+    fn frames_until_ping_ack(
+        client: &mut TcpStream,
+        payload: &[u8; 8],
+    ) -> Vec<(frame::FrameHeader, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = read_frame(client).expect("the server closed before its PING answer");
+            if frame.0.frame_type == frame_type::PING
+                && frame.0.has_flag(flags::ACK)
+                && frame.1 == payload
+            {
+                return frames;
+            }
+            frames.push(frame);
+        }
+    }
+
+    #[test]
+    /// DATA after the request's END_STREAM resets the stream. Its answer, still waiting for window,
+    /// must go with it: sending DATA on a stream this side reset breaks RFC 9113, and the waiting
+    /// answer would keep its place in the stream and response budgets.
+    fn stream_reset_for_late_data_drops_its_pending_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = deadline_accept(&listener);
+            serve_doh(&mut stream, "/dns-query", |query, _| answer(query.to_vec()))
+        });
+
+        let mut client = deadline_connect(addr);
+        client.write_all(frame::PREFACE).unwrap();
+        let mut no_window = settings::INITIAL_WINDOW_SIZE.to_be_bytes().to_vec();
+        no_window.extend_from_slice(&0u32.to_be_bytes());
+        send_frame(&mut client, frame_type::SETTINGS, 0, 0, &no_window).unwrap();
+        send_frame(
+            &mut client,
+            frame_type::HEADERS,
+            flags::END_HEADERS,
+            1,
+            &doh_post_header_block(),
+        )
+        .unwrap();
+        send_frame(
+            &mut client,
+            frame_type::DATA,
+            flags::END_STREAM,
+            1,
+            b"query",
+        )
+        .unwrap();
+        send_frame(&mut client, frame_type::DATA, 0, 1, b"late").unwrap();
+        send_frame(
+            &mut client,
+            frame_type::WINDOW_UPDATE,
+            0,
+            1,
+            &1024u32.to_be_bytes(),
+        )
+        .unwrap();
+        send_frame(&mut client, frame_type::PING, 0, 0, b"barrier!").unwrap();
+
+        let frames = frames_until_ping_ack(&mut client, b"barrier!");
+        assert!(
+            frames
+                .iter()
+                .any(|(h, _)| h.frame_type == frame_type::HEADERS && h.stream_id == 1),
+            "대조군이 무효입니다. 요청에 응답 헤더를 보내지 않았습니다"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(h, _)| h.frame_type == frame_type::RST_STREAM && h.stream_id == 1),
+            "END_STREAM 뒤에 DATA 를 받은 스트림을 끊지 않았습니다"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|(h, _)| h.frame_type == frame_type::DATA && h.stream_id == 1),
+            "끊은 스트림에 기다리던 답을 보냈습니다"
         );
         drop(client);
         let _ = server.join().unwrap();
