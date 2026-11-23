@@ -136,7 +136,8 @@ if (-not (Test-Path $exeB)) { throw "B팔 바이너리가 없습니다: $exeB" }
 #>
 function Measure-Arm([string]$binary, [string]$extra, [string]$tag) {
     $argv = New-Object System.Collections.Generic.List[string]
-    $argv.AddRange([string[]]@('run', '--config', $config))
+    # Under a supervisor this PID would be the parent, and the worker's CPU would go unmeasured.
+    $argv.AddRange([string[]]@('run', '--config', $config, '--no-supervisor'))
     foreach ($piece in ($extra -split '\s+')) { if ($piece) { $argv.Add($piece) } }
 
     $proc = Start-Process -FilePath $binary -ArgumentList $argv.ToArray() `
