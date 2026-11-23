@@ -70,7 +70,7 @@ upstream_urls = [
 
 The proxy learns this server's address but not the queries; the target answers the queries but sees only the proxy's address. The split protects you only if the proxy and the target are run by different operators who do not share logs.
 
-OnetDNS fetches the target's key configuration directly from `https://odoh-target.example/.well-known/odohconfigs` and keeps it for a day, or until the target answers that the key changed. That fetch reaches the target from this server's own address, so the target can see that this server uses it, though not what it asks. Host names in the URL, the proxy's and the target's, are resolved through `bootstrap` like other upstream names; an upstream whose proxy or target points at one of this server's own listeners is rejected.
+OnetDNS fetches the target's key configuration directly from `https://odoh-target.example/.well-known/odohconfigs` before the first query to that target, then again in the background every 12 to 22 hours. That fetch reaches the target from this server's own address, so the target can see that this server uses it, though not what it asks; only the first query, which waits for the fetch, can be matched to this server by its timing. When the target changes its key, queries through it fail until the new configuration arrives 30 seconds to 5 minutes later. Fetching it at once would let the target match the fetch to the query that triggered it. Host names in the URL, the proxy's and the target's, are resolved through `bootstrap` like other upstream names; an upstream whose proxy or target points at one of this server's own listeners is rejected.
 
 ## Recursive resolution
 
