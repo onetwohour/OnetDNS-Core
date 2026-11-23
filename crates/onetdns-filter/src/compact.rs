@@ -93,7 +93,7 @@ struct CollapsedArrays {
 #[derive(Debug, Default)]
 /// The representation is chosen to fit the value range. Most sets have only a few sources or just
 /// one; always using 4 bytes would waste memory in proportion to the entry count.
-enum SourceTable {
+pub(crate) enum SourceTable {
     #[default]
     Empty,
     Uniform {
@@ -106,8 +106,19 @@ enum SourceTable {
 }
 
 impl SourceTable {
+    /// `len` is below `u32::MAX`, as every name count is.
+    pub(crate) fn uniform(value: u32, len: usize) -> Self {
+        if len == 0 {
+            return Self::Empty;
+        }
+        Self::Uniform {
+            value,
+            len: len as u32,
+        }
+    }
+
     /// Picks the smallest representation for the value range.
-    fn from_vec(values: Vec<u32>) -> Self {
+    pub(crate) fn from_vec(values: Vec<u32>) -> Self {
         let Some(&value) = values.first() else {
             return Self::Empty;
         };
@@ -273,31 +284,51 @@ fn rebuild_input_table(domains: &str, offsets: &[u32], sources: &SourceTable) ->
 }
 
 fn collect_sources(sorted: &SortedDomains) -> SourceTable {
-    let entry_count = sorted.len();
-    let mut uniform_source = None::<(u32, usize)>;
-    let mut dense_sources = Vec::new();
+    let mut sources = SourceTableBuilder::with_capacity(sorted.len());
     for (_, source) in sorted.iter() {
-        match uniform_source {
-            None => uniform_source = Some((source, 1)),
-            Some((value, count)) if dense_sources.is_empty() && value == source => {
-                uniform_source = Some((value, count + 1));
-            }
-            Some((value, count)) if dense_sources.is_empty() => {
-                dense_sources.reserve_exact(entry_count);
-                dense_sources.resize(count, value);
-                dense_sources.push(source);
-            }
-            Some(_) => dense_sources.push(source),
+        sources.push(source);
+    }
+    sources.finish()
+}
+
+/// Collects one source per name in order, keeping a single value until a second one appears.
+pub(crate) struct SourceTableBuilder {
+    capacity: usize,
+    uniform: Option<(u32, usize)>,
+    dense: Vec<u32>,
+}
+
+impl SourceTableBuilder {
+    /// `capacity` is the most names that will be pushed.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            uniform: None,
+            dense: Vec::new(),
         }
     }
-    if dense_sources.is_empty() {
-        let (value, len) = uniform_source.expect("A non-empty map has a source");
-        SourceTable::Uniform {
-            value,
-            len: len as u32,
+
+    pub(crate) fn push(&mut self, source: u32) {
+        match self.uniform {
+            None => self.uniform = Some((source, 1)),
+            Some((value, count)) if self.dense.is_empty() && value == source => {
+                self.uniform = Some((value, count + 1));
+            }
+            Some((value, count)) if self.dense.is_empty() => {
+                self.dense.reserve_exact(self.capacity);
+                self.dense.resize(count, value);
+                self.dense.push(source);
+            }
+            Some(_) => self.dense.push(source),
         }
-    } else {
-        SourceTable::from_vec(dense_sources)
+    }
+
+    pub(crate) fn finish(self) -> SourceTable {
+        match self.uniform {
+            None => SourceTable::Empty,
+            Some((value, len)) if self.dense.is_empty() => SourceTable::uniform(value, len),
+            Some(_) => SourceTable::from_vec(self.dense),
+        }
     }
 }
 
@@ -524,64 +555,82 @@ impl CompactDomainMap {
         if table.is_empty() {
             return Ok(Self::default());
         }
-
-        let Some(total_bytes) = table
-            .keys()
-            .try_fold(0usize, |total, key| total.checked_add(key.len()))
-        else {
-            return Err(table);
-        };
-        if table.len() > u32::MAX as usize || total_bytes >= u32::MAX as usize {
+        if table.len() > u32::MAX as usize {
             return Err(table);
         }
+        Self::try_from_sorted(table.into_sorted(reverse_cmp))
+    }
 
-        let sorted = table.into_sorted(reverse_cmp);
-
+    /// Takes names sorted with [`reverse_cmp`], each once.
+    pub(crate) fn try_from_sorted(sorted: SortedDomains) -> Result<Self, DomainTable> {
         let entry_count = sorted.len();
-        let sources = collect_sources(&sorted);
-        let stage_input = staging_reduces_peak(&sorted, total_bytes);
-        let mut builder = DawgBuilder::new();
-        if stage_input {
-            let mut domains = String::new();
-            domains.reserve_exact(total_bytes);
-            let mut offsets = Vec::with_capacity(entry_count + 1);
-            for (domain, _) in sorted.iter() {
-                offsets.push(domains.len() as u32);
-                domains.push_str(domain);
+        let fallback = |sorted: &SortedDomains| {
+            let mut table = DomainTable::default();
+            table.reserve(entry_count);
+            for (domain, source) in sorted.iter() {
+                table.insert_if_absent(domain, source);
             }
-            offsets.push(domains.len() as u32);
-            drop(sorted);
-
-            for window in offsets.windows(2) {
-                let (start, end) = (window[0] as usize, window[1] as usize);
-                builder.insert_reversed(&domains.as_bytes()[start..end]);
-            }
-            builder.complete();
-            if !offsets.windows(2).all(|window| {
-                let (start, end) = (window[0] as usize, window[1] as usize);
-                builder.contains_reversed(&domains.as_bytes()[start..end])
-            }) {
-                return Err(rebuild_input_table(&domains, &offsets, &sources));
-            }
-        } else {
-            for (domain, _) in sorted.iter() {
-                builder.insert_reversed(domain.as_bytes());
-            }
-            builder.complete();
-            if !sorted
-                .iter()
-                .all(|(domain, _)| builder.contains_reversed(domain.as_bytes()))
-            {
-                let mut fallback = DomainTable::default();
-                fallback.reserve(entry_count);
-                for (domain, source) in sorted.iter() {
-                    fallback.insert_if_absent(domain, source);
-                }
-                return Err(fallback);
-            }
-            drop(sorted);
+            table
+        };
+        if entry_count == 0 {
+            return Ok(Self::default());
         }
+        let total_bytes = sorted
+            .iter()
+            .try_fold(0usize, |total, (key, _)| total.checked_add(key.len()))
+            .filter(|total| *total < u32::MAX as usize);
+        let Some(total_bytes) = total_bytes else {
+            return Err(fallback(&sorted));
+        };
 
+        let sources = collect_sources(&sorted);
+        if staging_reduces_peak(&sorted, total_bytes) {
+            let (domains, offsets) = sorted.into_staged(total_bytes);
+            return Self::try_from_staged(domains, offsets, sources);
+        }
+        let mut builder = DawgBuilder::new();
+        for (domain, _) in sorted.iter() {
+            builder.insert_reversed(domain.as_bytes());
+        }
+        builder.complete();
+        if !sorted
+            .iter()
+            .all(|(domain, _)| builder.contains_reversed(domain.as_bytes()))
+        {
+            return Err(fallback(&sorted));
+        }
+        drop(sorted);
+        Ok(Self::from_builder(builder, sources))
+    }
+
+    /// Takes names back to back, sorted with [`reverse_cmp`] and each once, with `offsets` holding
+    /// where each starts followed by the total length, and one source per name.
+    pub(crate) fn try_from_staged(
+        domains: String,
+        offsets: Vec<u32>,
+        sources: SourceTable,
+    ) -> Result<Self, DomainTable> {
+        if offsets.len() < 2 {
+            return Ok(Self::default());
+        }
+        let mut builder = DawgBuilder::new();
+        for window in offsets.windows(2) {
+            let (start, end) = (window[0] as usize, window[1] as usize);
+            builder.insert_reversed(&domains.as_bytes()[start..end]);
+        }
+        builder.complete();
+        if !offsets.windows(2).all(|window| {
+            let (start, end) = (window[0] as usize, window[1] as usize);
+            builder.contains_reversed(&domains.as_bytes()[start..end])
+        }) {
+            return Err(rebuild_input_table(&domains, &offsets, &sources));
+        }
+        drop(domains);
+        drop(offsets);
+        Ok(Self::from_builder(builder, sources))
+    }
+
+    fn from_builder(builder: DawgBuilder, sources: SourceTable) -> Self {
         let (states, edge_labels, edge_targets, edge_outputs, root_terms) =
             builder.finish_completed();
         assert_eq!(
@@ -594,7 +643,7 @@ impl CompactDomainMap {
         drop(edge_labels);
         drop(edge_targets);
         drop(edge_outputs);
-        let built = Self {
+        Self {
             state_edges: collapsed.state_edges,
             state_terminal: collapsed.state_terminal,
             edge_labels: collapsed.edge_labels,
@@ -603,9 +652,7 @@ impl CompactDomainMap {
             edge_tails: collapsed.edge_tails,
             tail_bytes: collapsed.tail_bytes,
             sources,
-        };
-
-        Ok(built)
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1253,7 +1300,7 @@ fn source_wire_len(kind: u8, len: usize) -> Result<usize, &'static str> {
 
 /// Compares strings by their reversed bytes. Read from the end, domains under the same parent sit
 /// together, which is what lets states sharing a suffix merge.
-fn reverse_cmp(left: &str, right: &str) -> Ordering {
+pub(crate) fn reverse_cmp(left: &str, right: &str) -> Ordering {
     left.as_bytes()
         .iter()
         .rev()

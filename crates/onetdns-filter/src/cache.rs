@@ -1,5 +1,6 @@
 //! Stores compiled filter sets on disk and reads them back. Reparsing the lists takes tens of
-//! seconds; keeping the built sets makes restarts that much faster.
+//! seconds; keeping the built sets makes restarts that much faster. Each list's parsed names are
+//! kept as well, so a build after one list changed parses only that list.
 //!
 //! The file is untrusted input. The header's input fingerprint and payload hash reject tampering,
 //! and the parsers behind them must still not panic on any bytes.
@@ -16,6 +17,8 @@ use crate::engine::{
     ClientCond, ClientRule, DomainSet, EngineParts, FilterLoadReport, LocalZoneAction,
     LocalZoneSet, RewriteSet, RpzIpRule, RpzNameRule, StaticZone,
 };
+use crate::loader::{Kind, ListSet, ParsedList, Slot};
+use crate::table::KeyRun;
 
 /// File identifier.
 const MAGIC: &[u8; 8] = b"ONETFST\0";
@@ -26,9 +29,82 @@ const MAGIC: &[u8; 8] = b"ONETFST\0";
 /// is no reason to migrate it.
 const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:edge_starts+terminal_bits|edges:labels,targets,outputs|sources";
 
-fn layout_tag() -> [u8; 4] {
-    let digest: [u8; 32] = Sha256::digest(LAYOUT.as_bytes()).into();
+/// A parsed list file: one list's domain entries and the rest of its rules as text.
+const LIST_MAGIC: &[u8; 8] = b"ONETLST\0";
+
+/// Plays the part of [`LAYOUT`] for parsed list files.
+const LIST_LAYOUT: &str = "report|other_lines|sets:slot(plain:kind|typed:type|typed_except:types),exact,suffix|names:count,bytes,(shared_suffix,head_len,head)*";
+
+fn tag_of(layout: &str) -> [u8; 4] {
+    let digest: [u8; 32] = Sha256::digest(layout.as_bytes()).into();
     [digest[0], digest[1], digest[2], digest[3]]
+}
+
+fn seal(
+    magic: &[u8; 8],
+    layout: &str,
+    fingerprint: [u8; 32],
+    payload_len: usize,
+    payload_digest: [u8; 32],
+) -> [u8; HEADER_BYTES] {
+    let mut header = [0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(magic);
+    header[8..12].copy_from_slice(&tag_of(layout));
+    header[12..44].copy_from_slice(&fingerprint);
+    header[44..52].copy_from_slice(&(payload_len as u64).to_le_bytes());
+    header[52..].copy_from_slice(&payload_digest);
+    header
+}
+
+/// Checks the header against what the caller expects and the payload against its hash, and returns
+/// the payload.
+fn unseal<'a>(
+    encoded: &'a [u8],
+    magic: &[u8; 8],
+    layout: &str,
+    expected_fingerprint: [u8; 32],
+) -> Result<&'a [u8], CacheError> {
+    if encoded.len() < HEADER_BYTES || encoded.len() > MAX_CACHE_BYTES {
+        return Err(CacheError::new(
+            "Compiled filter cache file size is invalid",
+        ));
+    }
+    if encoded.get(..8) != Some(magic.as_slice()) {
+        return Err(CacheError::new(
+            "Compiled filter cache file magic does not match",
+        ));
+    }
+    if encoded[8..12] != tag_of(layout) {
+        return Err(CacheError::new(
+            "Compiled filter cache layout differs from the current layout",
+        ));
+    }
+    if encoded[12..44] != expected_fingerprint {
+        return Err(CacheError::new(
+            "Compiled filter cache input fingerprint does not match",
+        ));
+    }
+    let payload_len = u64::from_le_bytes(
+        encoded[44..52]
+            .try_into()
+            .map_err(|_| CacheError::new("Invalid compiled filter cache header"))?,
+    );
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        CacheError::new("Compiled filter cache declares a data size that cannot be handled")
+    })?;
+    if HEADER_BYTES.checked_add(payload_len) != Some(encoded.len()) {
+        return Err(CacheError::new(
+            "Compiled filter cache data length does not match the file size",
+        ));
+    }
+    let payload = &encoded[HEADER_BYTES..];
+    let actual_digest: [u8; 32] = Sha256::digest(payload).into();
+    if encoded[52..84] != actual_digest {
+        return Err(CacheError::new(
+            "Compiled filter cache integrity check failed",
+        ));
+    }
+    Ok(payload)
 }
 
 /// Magic, layout tag, fingerprint, length, and hash.
@@ -107,11 +183,13 @@ pub fn encode_engine_cache(
         return Err(CacheError::new("Compiled filter cache is too large"));
     }
     let payload_digest: [u8; 32] = Sha256::digest(&output[HEADER_BYTES..]).into();
-    output[..8].copy_from_slice(MAGIC);
-    output[8..12].copy_from_slice(&layout_tag());
-    output[12..44].copy_from_slice(&input_fingerprint);
-    output[44..52].copy_from_slice(&(payload_len as u64).to_le_bytes());
-    output[52..HEADER_BYTES].copy_from_slice(&payload_digest);
+    output[..HEADER_BYTES].copy_from_slice(&seal(
+        MAGIC,
+        LAYOUT,
+        input_fingerprint,
+        payload_len,
+        payload_digest,
+    ));
     Ok(output)
 }
 
@@ -130,17 +208,51 @@ pub fn write_engine_cache(
     let mut write_chunk = |bytes: &[u8]| payload.write(bytes);
     encode_parts_tail(&mut Encoder::streaming(&mut write_chunk), parts)?;
     let (payload_len, payload_digest) = payload.finish()?;
-
-    let mut header = [0u8; HEADER_BYTES];
-    header[..8].copy_from_slice(MAGIC);
-    header[8..12].copy_from_slice(&layout_tag());
-    header[12..44].copy_from_slice(&input_fingerprint);
-    header[44..52].copy_from_slice(&(payload_len as u64).to_le_bytes());
-    header[52..].copy_from_slice(&payload_digest);
+    let header = seal(
+        MAGIC,
+        LAYOUT,
+        input_fingerprint,
+        payload_len,
+        payload_digest,
+    );
     output.seek(SeekFrom::Start(0))?;
     output.write_all(&header)?;
     output.seek(SeekFrom::End(0))?;
     Ok(())
+}
+
+/// Streams one parsed list under `key`, which must name the rules it was parsed from.
+pub fn write_parsed_list(
+    list: &ParsedList,
+    key: [u8; 32],
+    output: &mut (impl Write + Seek),
+) -> Result<(), CacheWriteError> {
+    output.write_all(&[0u8; HEADER_BYTES])?;
+    let mut payload = PayloadStream::new(output);
+    {
+        let mut write_chunk = |bytes: &[u8]| payload.write(bytes);
+        encode_parsed_list(&mut Encoder::streaming(&mut write_chunk), list)?;
+    }
+    let (payload_len, payload_digest) = payload.finish()?;
+    let header = seal(LIST_MAGIC, LIST_LAYOUT, key, payload_len, payload_digest);
+    output.seek(SeekFrom::Start(0))?;
+    output.write_all(&header)?;
+    output.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+/// Checked like [`decode_engine_cache`]. The names must also come in the order the automaton is
+/// built in, each once, so a sealed file with bad content is still rejected rather than built.
+pub fn decode_parsed_list(encoded: &[u8], key: [u8; 32]) -> Result<ParsedList, CacheError> {
+    let payload = unseal(encoded, LIST_MAGIC, LIST_LAYOUT, key)?;
+    let mut decoder = Decoder::new(payload);
+    let list = decode_list_payload(&mut decoder)?;
+    if !decoder.input.is_empty() {
+        return Err(CacheError::new(
+            "Unexpected trailing data in compiled filter cache",
+        ));
+    }
+    Ok(list)
 }
 
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -252,47 +364,7 @@ pub fn decode_engine_cache(
     encoded: &[u8],
     expected_fingerprint: [u8; 32],
 ) -> Result<EngineParts, CacheError> {
-    if encoded.len() < HEADER_BYTES || encoded.len() > MAX_CACHE_BYTES {
-        return Err(CacheError::new(
-            "Compiled filter cache file size is invalid",
-        ));
-    }
-    if encoded.get(..8) != Some(MAGIC.as_slice()) {
-        return Err(CacheError::new(
-            "Compiled filter cache file magic does not match",
-        ));
-    }
-    if encoded[8..12] != layout_tag() {
-        return Err(CacheError::new(
-            "Compiled filter cache layout differs from the current layout",
-        ));
-    }
-    if encoded[12..44] != expected_fingerprint {
-        return Err(CacheError::new(
-            "Compiled filter cache input fingerprint does not match",
-        ));
-    }
-    let payload_len = u64::from_le_bytes(
-        encoded[44..52]
-            .try_into()
-            .map_err(|_| CacheError::new("Invalid compiled filter cache header"))?,
-    );
-    let payload_len = usize::try_from(payload_len).map_err(|_| {
-        CacheError::new("Compiled filter cache declares a data size that cannot be handled")
-    })?;
-    if HEADER_BYTES.checked_add(payload_len) != Some(encoded.len()) {
-        return Err(CacheError::new(
-            "Compiled filter cache data length does not match the file size",
-        ));
-    }
-    let payload = &encoded[HEADER_BYTES..];
-    let actual_digest: [u8; 32] = Sha256::digest(payload).into();
-    if encoded[52..84] != actual_digest {
-        return Err(CacheError::new(
-            "Compiled filter cache integrity check failed",
-        ));
-    }
-
+    let payload = unseal(encoded, MAGIC, LAYOUT, expected_fingerprint)?;
     let mut decoder = Decoder::new(payload);
     let parts = decode_parts(&mut decoder)?;
     if !decoder.input.is_empty() {
@@ -363,6 +435,23 @@ impl<'a> Encoder<'a> {
     fn string(&mut self, value: &str) -> Result<(), CacheError> {
         self.blob(value.as_bytes(), MAX_STRING_BYTES)
     }
+
+    fn varint(&mut self, mut value: u32) {
+        let mut bytes = [0u8; 5];
+        let mut len = 0;
+        loop {
+            let low = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                bytes[len] = low;
+                len += 1;
+                break;
+            }
+            bytes[len] = low | 0x80;
+            len += 1;
+        }
+        self.write(&bytes[..len]);
+    }
 }
 
 /// Every read is bounds-checked.
@@ -427,6 +516,19 @@ impl<'a> Decoder<'a> {
         let value = std::str::from_utf8(bytes)
             .map_err(|_| CacheError::new("Invalid string in compiled filter cache"))?;
         Ok(value.to_owned())
+    }
+
+    fn varint(&mut self) -> Result<u32, CacheError> {
+        let mut value = 0u64;
+        for shift in [0, 7, 14, 21, 28] {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return u32::try_from(value)
+                    .map_err(|_| CacheError::new("Oversized number in compiled filter cache"));
+            }
+        }
+        Err(CacheError::new("Oversized number in compiled filter cache"))
     }
 
     /// Values other than 0 and 1 are errors.
@@ -607,6 +709,168 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
         report,
         sources,
     })
+}
+
+fn encode_parsed_list(w: &mut Encoder<'_>, list: &ParsedList) -> Result<(), CacheError> {
+    encode_report(w, &list.report)?;
+    encode_strings(w, &list.other_lines)?;
+    w.len(list.sets.len(), MAX_ITEMS)?;
+    let mut budget = MAX_CACHE_BYTES;
+    for (slot, set) in &list.sets {
+        encode_slot(w, slot)?;
+        encode_names(w, &set.exact, &mut budget)?;
+        encode_names(w, &set.suffix, &mut budget)?;
+    }
+    Ok(())
+}
+
+fn decode_list_payload(r: &mut Decoder<'_>) -> Result<ParsedList, CacheError> {
+    let report = decode_report(r)?;
+    let other_lines = decode_strings(r)?;
+    let set_count = r.len(MAX_ITEMS)?;
+    let mut sets: Vec<(Slot, ListSet)> = Vec::new();
+    let mut budget = MAX_CACHE_BYTES;
+    for _ in 0..set_count {
+        let slot = decode_slot(r)?;
+        if sets.iter().any(|(known, _)| *known == slot) {
+            return Err(CacheError::new(
+                "Compiled filter cache has a duplicate domain set",
+            ));
+        }
+        let exact = decode_names(r, &mut budget)?;
+        let suffix = decode_names(r, &mut budget)?;
+        sets.push((slot, ListSet { exact, suffix }));
+    }
+    Ok(ParsedList {
+        sets,
+        other_lines,
+        report,
+    })
+}
+
+const SLOT_TYPED: u8 = 7;
+const SLOT_TYPED_EXCEPT: u8 = 8;
+
+fn encode_slot(w: &mut Encoder<'_>, slot: &Slot) -> Result<(), CacheError> {
+    match slot {
+        Slot::Plain(kind) => w.u8(*kind as u8),
+        Slot::Typed(rtype) => {
+            w.u8(SLOT_TYPED);
+            w.u16(rtype.0);
+        }
+        Slot::TypedExcept(types) => {
+            w.u8(SLOT_TYPED_EXCEPT);
+            encode_record_types(w, types)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_slot(r: &mut Decoder<'_>) -> Result<Slot, CacheError> {
+    let tag = r.u8()?;
+    if let Some(kind) = Kind::ALL.get(usize::from(tag)) {
+        return Ok(Slot::Plain(*kind));
+    }
+    match tag {
+        SLOT_TYPED => Ok(Slot::Typed(RecordType(r.u16()?))),
+        SLOT_TYPED_EXCEPT => {
+            let types = decode_record_types(r)?;
+            if types.is_empty() || !types.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return Err(CacheError::new(
+                    "Invalid record type set in compiled filter cache",
+                ));
+            }
+            Ok(Slot::TypedExcept(types))
+        }
+        _ => Err(CacheError::new(
+            "Invalid domain set kind in compiled filter cache",
+        )),
+    }
+}
+
+/// Each name is stored as the length of the suffix it shares with the previous one and the bytes
+/// in front of it; sorted by reversed bytes, neighbors share most of their suffix. `budget` bounds
+/// the bytes of every name in the file together.
+fn encode_names(w: &mut Encoder<'_>, run: &KeyRun, budget: &mut usize) -> Result<(), CacheError> {
+    let bytes: usize = run.names().map(str::len).sum();
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or(CacheError::new("Compiled filter cache is too large"))?;
+    w.len(run.len(), u32::MAX as usize)?;
+    w.len(bytes, u32::MAX as usize)?;
+    let mut previous: &[u8] = &[];
+    for name in run.names() {
+        let name = name.as_bytes();
+        let shared = previous
+            .iter()
+            .rev()
+            .zip(name.iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let head = &name[..name.len() - shared];
+        w.varint(shared as u32);
+        w.varint(head.len() as u32);
+        w.write(head);
+        previous = name;
+    }
+    Ok(())
+}
+
+fn decode_names(r: &mut Decoder<'_>, budget: &mut usize) -> Result<KeyRun, CacheError> {
+    let count = r.len(u32::MAX as usize)?;
+    let bytes = r.len(u32::MAX as usize)?;
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or(CacheError::new("Compiled filter cache is too large"))?;
+    // Every name takes at least two bytes, so a count the input cannot hold is rejected before
+    // anything is reserved for it.
+    if count > r.input.len() / 2 {
+        return Err(CacheError::new("Compiled filter cache is truncated"));
+    }
+    let mut names: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::new();
+    names
+        .try_reserve_exact(bytes)
+        .and_then(|()| offsets.try_reserve_exact(count + 1))
+        .map_err(|_| CacheError::new("Out of memory loading compiled filter cache entries"))?;
+    offsets.push(0);
+    let mut previous = 0..0;
+    for index in 0..count {
+        let shared = r.varint()? as usize;
+        let head_len = r.varint()? as usize;
+        let head = r.take(head_len)?;
+        if shared > previous.len() || names.len() + head.len() + shared > bytes {
+            return Err(CacheError::new("Invalid name in compiled filter cache"));
+        }
+        let start = names.len();
+        names.extend_from_slice(head);
+        names.extend_from_within(previous.end - shared..previous.end);
+        let name = start..names.len();
+        let ordered = index == 0
+            || names[previous]
+                .iter()
+                .rev()
+                .lt(names[name.clone()].iter().rev());
+        if !ordered {
+            return Err(CacheError::new(
+                "Compiled filter cache names are out of order",
+            ));
+        }
+        offsets.push(names.len() as u32);
+        previous = name;
+    }
+    if names.len() != bytes {
+        return Err(CacheError::new("Invalid name in compiled filter cache"));
+    }
+    let names = String::from_utf8(names)
+        .map_err(|_| CacheError::new("Invalid string in compiled filter cache"))?;
+    if !offsets
+        .iter()
+        .all(|offset| names.is_char_boundary(*offset as usize))
+    {
+        return Err(CacheError::new("Invalid string in compiled filter cache"));
+    }
+    Ok(KeyRun::Stored { names, offsets })
 }
 
 fn encode_vec<T>(
@@ -1106,7 +1370,7 @@ mod tests {
 
         let fingerprint = [7; 32];
         let encoded = encode_engine_cache(&mut parts, fingerprint).unwrap();
-        assert_eq!(&encoded[8..12], &layout_tag());
+        assert_eq!(&encoded[8..12], &tag_of(LAYOUT));
         let restored = decode_engine_cache(&encoded, fingerprint).unwrap();
         assert_eq!(
             verdict(restored, "typed.example", RecordType::AAAA),
@@ -1163,7 +1427,7 @@ mod tests {
         let encoded = encode_engine_cache(&mut parts, fingerprint).unwrap();
 
         assert_eq!(&encoded[..8], MAGIC.as_slice());
-        assert_eq!(&encoded[8..12], &layout_tag());
+        assert_eq!(&encoded[8..12], &tag_of(LAYOUT));
         assert_eq!(&encoded[12..44], &fingerprint);
         let payload_len = u64::from_le_bytes(encoded[44..52].try_into().unwrap()) as usize;
         assert_eq!(payload_len, encoded.len() - HEADER_BYTES);
@@ -1456,7 +1720,7 @@ mod tests {
         let reseal = |body: &[u8]| -> Vec<u8> {
             let mut out = Vec::with_capacity(HEADER_BYTES + body.len());
             out.extend_from_slice(MAGIC);
-            out.extend_from_slice(&layout_tag());
+            out.extend_from_slice(&tag_of(LAYOUT));
             out.extend_from_slice(&fingerprint);
             out.extend_from_slice(&(body.len() as u64).to_le_bytes());
             out.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(body)));
@@ -1520,5 +1784,155 @@ mod tests {
             accepted > 0,
             "재봉인한 변형 {iters}건 중 {accepted}건 복원: 본문 파서 노출 확인"
         );
+    }
+
+    const PARSED_RULES: &str = "\
+||ads.example^
+||tracker.ads.example^
+0.0.0.0 é.example ©.example
+||typed.example^$dnstype=AAAA
+||except.example^$dnstype=~A
+@@||allowed.example^
+||rewrite.example^$dnsrewrite=192.0.2.1
+||cancel.example^$badfilter
+||weird.example^$app=org.example
+";
+
+    fn parsed(text: &str) -> ParsedList {
+        ParsedList::parse(false, |on_line| {
+            text.lines().for_each(on_line);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn encode_list(list: &ParsedList, key: [u8; 32]) -> Vec<u8> {
+        let mut file = std::io::Cursor::new(Vec::new());
+        write_parsed_list(list, key, &mut file).unwrap();
+        file.into_inner()
+    }
+
+    fn describe_list(list: &ParsedList) -> String {
+        let sets: Vec<String> = list
+            .sets
+            .iter()
+            .map(|(slot, set)| {
+                let names = |run: &KeyRun| run.names().map(str::to_owned).collect::<Vec<_>>();
+                format!(
+                    "{:?} {:?} {:?}",
+                    encode_slot_bytes(slot),
+                    names(&set.exact),
+                    names(&set.suffix)
+                )
+            })
+            .collect();
+        format!(
+            "{sets:?} {:?} {}",
+            list.other_lines,
+            crate::engine::FilterLoadReport::to_json(&list.report)
+        )
+    }
+
+    fn encode_slot_bytes(slot: &Slot) -> Vec<u8> {
+        let mut w = Encoder::default();
+        encode_slot(&mut w, slot).unwrap();
+        w.bytes
+    }
+
+    #[test]
+    fn parsed_list_roundtrips_names_slots_lines_and_report() {
+        let list = parsed(PARSED_RULES);
+        assert!(list.sets.len() >= 4);
+        assert_eq!(list.other_lines.len(), 2);
+        let encoded = encode_list(&list, [7; 32]);
+        let restored = decode_parsed_list(&encoded, [7; 32]).unwrap();
+        assert!(matches!(restored.sets[0].1.suffix, KeyRun::Stored { .. }));
+        assert_eq!(describe_list(&restored), describe_list(&list));
+    }
+
+    #[test]
+    fn parsed_list_rejects_wrong_key_truncation_and_every_single_byte_corruption() {
+        let encoded = encode_list(&parsed(PARSED_RULES), [7; 32]);
+        assert!(decode_parsed_list(&encoded, [8; 32]).is_err());
+        let mut engine_magic = encoded.clone();
+        engine_magic[..8].copy_from_slice(MAGIC);
+        assert!(decode_parsed_list(&engine_magic, [7; 32]).is_err());
+        for end in 0..encoded.len() {
+            assert!(decode_parsed_list(&encoded[..end], [7; 32]).is_err());
+        }
+        for index in 0..encoded.len() {
+            let mut damaged = encoded.clone();
+            damaged[index] ^= 0x5a;
+            assert!(decode_parsed_list(&damaged, [7; 32]).is_err());
+        }
+    }
+
+    #[test]
+    /// The automaton builder trusts its input order, so a sealed file must not get past it.
+    fn sealed_parsed_list_with_names_out_of_order_is_rejected() {
+        let mut list = parsed("||b.example^\n||a.example^\n");
+        let (_, set) = &mut list.sets[0];
+        let mut names: Vec<String> = set.suffix.names().map(str::to_owned).collect();
+        names.reverse();
+        let mut joined = String::new();
+        let mut offsets = vec![0];
+        for name in &names {
+            joined.push_str(name);
+            offsets.push(joined.len() as u32);
+        }
+        set.suffix = KeyRun::Stored {
+            names: joined,
+            offsets,
+        };
+        let encoded = encode_list(&list, [1; 32]);
+        assert!(decode_parsed_list(&encoded, [1; 32]).is_err());
+    }
+
+    #[test]
+    fn parsed_list_decoder_never_panics_on_resealed_mutations() {
+        let key = [0x44; 32];
+        let seed = encode_list(&parsed(PARSED_RULES), key);
+        let reseal = |body: &[u8]| -> Vec<u8> {
+            let mut out = seal(
+                LIST_MAGIC,
+                LIST_LAYOUT,
+                key,
+                body.len(),
+                Sha256::digest(body).into(),
+            )
+            .to_vec();
+            out.extend_from_slice(body);
+            out
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut accepted = 0u64;
+        for _ in 0..2000 {
+            let mut body = seed[HEADER_BYTES..].to_vec();
+            let index = (next() % body.len() as u64) as usize;
+            match next() % 10 {
+                0..=4 => body[index] = (next() & 0xff) as u8,
+                5..=7 => body[index] ^= 1 << (next() % 8),
+                8 => body.insert(index, (next() & 0xff) as u8),
+                _ => body.truncate(index),
+            }
+            if let Ok(restored) = decode_parsed_list(&reseal(&body), key) {
+                accepted += 1;
+                for (_, set) in &restored.sets {
+                    for run in [&set.exact, &set.suffix] {
+                        let names: Vec<&str> = run.names().collect();
+                        assert!(names
+                            .windows(2)
+                            .all(|pair| crate::compact::reverse_cmp(pair[0], pair[1]).is_lt()));
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0, "{accepted} of the mutations decoded");
     }
 }

@@ -32,7 +32,11 @@ fn read_list_line(reader: &mut impl BufRead, line: &mut String) -> std::io::Resu
     Ok(read)
 }
 
-fn open_validated_list_file(path: &Path) -> std::io::Result<File> {
+/// With `digest`, also feeds it every line on the way.
+fn open_validated_list_file(
+    path: &Path,
+    mut digest: Option<&mut RulesDigest>,
+) -> std::io::Result<File> {
     let mut file = File::open(path)?;
     {
         let mut reader = BufReader::new((&mut file).take(MAX_LOCAL_LIST_FILE + 1));
@@ -48,10 +52,39 @@ fn open_validated_list_file(path: &Path) -> std::io::Result<File> {
             if total > MAX_LOCAL_LIST_FILE {
                 return Err(list_too_large());
             }
+            if let Some(digest) = digest.as_deref_mut() {
+                digest.line(&line);
+            }
         }
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(file)
+}
+
+/// Identifies what parsing a list depends on: its trimmed rule lines in order, and whether they
+/// are read as allow rules. Comments are left out, so a list that changed only its header keeps
+/// its parsed form.
+struct RulesDigest(sha2::Sha256);
+
+impl RulesDigest {
+    fn new(allow: bool) -> Self {
+        use sha2::Digest;
+        Self(sha2::Sha256::new_with_prefix([u8::from(allow)]))
+    }
+
+    fn line(&mut self, line: &str) {
+        use sha2::Digest;
+        let line = line.trim();
+        if is_rule_line(line) {
+            self.0.update(line.as_bytes());
+            self.0.update(b"\n");
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        use sha2::Digest;
+        self.0.finalize().into()
+    }
 }
 
 /// A failure partway makes the whole file an error; the caller applies none of its rules.
@@ -77,7 +110,10 @@ use crate::regex::Regex;
 use onetdns_core::{BlockResponse, FilterVerdict, IpNet, RewriteTarget};
 use onetdns_proto::{Name, RecordType};
 
+use crate::compact::{reverse_cmp, CompactDomainMap, SourceTable, SourceTableBuilder};
 use crate::engine::{BlockEngine, DomainSet, EngineParts, RpzIpRule, RpzNameRule};
+use crate::table::{DomainTable, KeyRun};
+use std::collections::{BinaryHeap, HashSet};
 
 #[derive(Default)]
 struct Accum {
@@ -87,6 +123,11 @@ struct Accum {
     cancels: Vec<Placement>,
 
     cur_source: u32,
+
+    /// Set while one list is parsed for a [`ParsedList`]: only domain entries are placed, and a
+    /// line with any other rule sets `deferred_line` so its text is kept instead.
+    defer_others: bool,
+    deferred_line: bool,
 }
 
 impl Accum {
@@ -103,7 +144,9 @@ impl Accum {
     }
 
     fn emit(&mut self, placement: Placement, badfilter: bool) {
-        if badfilter {
+        if self.defer_others && (badfilter || !matches!(placement, Placement::Domain { .. })) {
+            self.deferred_line = true;
+        } else if badfilter {
             self.cancels.push(placement);
         } else {
             place(&mut self.parts, placement, self.cur_source);
@@ -113,7 +156,7 @@ impl Accum {
 
 /// The plain sets, each kept once for domain rules and once for regex rules.
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Block,
     BlockImportant,
     Allow,
@@ -124,6 +167,16 @@ enum Kind {
 }
 
 impl Kind {
+    pub(crate) const ALL: [Kind; 7] = [
+        Kind::Block,
+        Kind::BlockImportant,
+        Kind::Allow,
+        Kind::AllowImportant,
+        Kind::Refuse,
+        Kind::Nodata,
+        Kind::NoResponse,
+    ];
+
     fn of(allow: bool, important: bool) -> Self {
         match (allow, important) {
             (true, true) => Kind::AllowImportant,
@@ -134,8 +187,8 @@ impl Kind {
     }
 }
 
-#[derive(PartialEq)]
-enum Slot {
+#[derive(Clone, PartialEq)]
+pub(crate) enum Slot {
     Plain(Kind),
     Typed(RecordType),
     /// Every type except these, sorted and deduplicated.
@@ -382,7 +435,7 @@ fn route_regex_rule(pat: &str, m: RuleMods, allow: bool, acc: &mut Accum) {
 /// else a hosts line or a bare domain.
 fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
     let line = line.trim();
-    if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+    if !is_rule_line(line) {
         return;
     }
 
@@ -551,6 +604,11 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
         exact: false,
     };
     acc.emit(placement, badfilter);
+}
+
+/// Takes a trimmed line. Anything else is a blank line or a comment and does not change the filter.
+fn is_rule_line(line: &str) -> bool {
+    !(line.is_empty() || line.starts_with('#') || line.starts_with('!'))
 }
 
 fn skip_invalid_pattern(acc: &mut Accum) {
@@ -841,7 +899,7 @@ fn apply_badfilter(acc: &mut Accum) {
 /// The dashboard shows the reason.
 pub fn validate_rule(line: &str) -> Result<(), String> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+    if !is_rule_line(trimmed) {
         return Err("Empty rule or comment".to_string());
     }
 
@@ -1107,95 +1165,436 @@ pub fn load_parts_with_subscriptions(
     extra_block: &[&str],
     extra_allow: &[&str],
 ) -> std::io::Result<EngineParts> {
-    let mut acc = Accum::new();
+    load_parts_with_store(
+        blocklists,
+        allowlists,
+        subscriptions,
+        extra_block,
+        extra_allow,
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// Like [`load_parts_with_subscriptions`], but a list file whose rules `store` already holds is
+/// not parsed again. `tail` then adds rules after every list and user rule, where `$badfilter`
+/// does not reach them; the domain sets it sees hold only the user rules. The domain sets come
+/// back frozen.
+pub fn load_parts_with_store(
+    blocklists: &[impl AsRef<Path>],
+    allowlists: &[impl AsRef<Path>],
+    subscriptions: &[SubscriptionSource<'_>],
+    extra_block: &[&str],
+    extra_allow: &[&str],
+    mut store: Option<&mut dyn ParsedListStore>,
+    tail: impl FnOnce(&mut EngineParts) -> std::io::Result<()>,
+) -> std::io::Result<EngineParts> {
+    let mut lists = Vec::new();
     for path in blocklists {
-        let file = open_validated_list_file(path.as_ref()).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "Could not read or validate blocklist '{}': {error}",
-                    path.as_ref().display()
-                ),
-            )
-        })?;
-        acc.register_source(path.as_ref().display().to_string());
-        parse_validated_list_file(file, |line| parse_line(line, &mut acc, false)).map_err(
-            |error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "Could not read blocklist '{}': {error}",
-                        path.as_ref().display()
-                    ),
-                )
-            },
-        )?;
+        let path = path.as_ref();
+        let rules = SubscriptionRules::File(path);
+        let list = load_list(&rules, false, "blocklist", &mut store)?;
+        lists.push((path.display().to_string(), false, list));
     }
     for path in allowlists {
-        let file = open_validated_list_file(path.as_ref()).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "Could not read or validate allowlist '{}': {error}",
-                    path.as_ref().display()
-                ),
-            )
-        })?;
-        acc.register_source(path.as_ref().display().to_string());
-        parse_validated_list_file(file, |line| parse_line(line, &mut acc, true)).map_err(
-            |error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "Could not read allowlist '{}': {error}",
-                        path.as_ref().display()
-                    ),
-                )
-            },
-        )?;
+        let path = path.as_ref();
+        let rules = SubscriptionRules::File(path);
+        let list = load_list(&rules, true, "allowlist", &mut store)?;
+        lists.push((path.display().to_string(), true, list));
     }
     for subscription in subscriptions {
-        acc.register_source(subscription.name.to_string());
-        match subscription.rules {
-            SubscriptionRules::File(path) => {
-                let file = open_validated_list_file(path).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Could not read or validate subscription blocklist cache '{}': {error}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                parse_validated_list_file(file, |line| parse_line(line, &mut acc, false)).map_err(
-                    |error| {
-                        std::io::Error::new(
-                            error.kind(),
-                            format!(
-                                "Could not read subscription blocklist cache '{}': {error}",
-                                path.display()
-                            ),
-                        )
-                    },
-                )?;
+        let list = load_list(
+            &subscription.rules,
+            false,
+            "subscription blocklist cache",
+            &mut store,
+        )?;
+        lists.push((subscription.name.to_string(), false, list));
+    }
+    combine(lists, extra_block, extra_allow, tail)
+}
+
+/// Keeps parsed lists between builds. `rules` digests a list's trimmed rule lines and whether they
+/// were read as allow rules, so comment-only changes keep the same entry.
+pub trait ParsedListStore {
+    fn load(&mut self, rules: &[u8; 32]) -> Option<ParsedList>;
+
+    /// A list that is not kept is parsed again next time.
+    fn save(&mut self, rules: &[u8; 32], list: &ParsedList);
+}
+
+/// One list parsed on its own. Domain entries are kept sorted for the automaton. Every other rule
+/// is kept as its line and parsed again when lists are combined, because `$badfilter` and rewrites
+/// act across lists.
+pub struct ParsedList {
+    /// In first-use order, which decides the order of typed sets.
+    pub(crate) sets: Vec<(Slot, ListSet)>,
+    pub(crate) other_lines: Vec<String>,
+    pub(crate) report: crate::engine::FilterLoadReport,
+}
+
+pub(crate) struct ListSet {
+    pub(crate) exact: KeyRun,
+    pub(crate) suffix: KeyRun,
+}
+
+impl ListSet {
+    fn take(set: &mut DomainSet) -> Self {
+        let (exact, suffix) = set.take_tables();
+        Self {
+            exact: KeyRun::Parsed(exact.into_sorted(reverse_cmp)),
+            suffix: KeyRun::Parsed(suffix.into_sorted(reverse_cmp)),
+        }
+    }
+}
+
+impl ParsedList {
+    pub(crate) fn parse(
+        allow: bool,
+        read: impl FnOnce(&mut dyn FnMut(&str)) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        let mut acc = Accum {
+            defer_others: true,
+            ..Accum::new()
+        };
+        let mut other_lines = Vec::new();
+        read(&mut |line| {
+            parse_line(line, &mut acc, allow);
+            if std::mem::take(&mut acc.deferred_line) {
+                other_lines.push(line.trim().to_string());
             }
-            SubscriptionRules::Lines(lines) => {
-                for line in lines {
-                    parse_line(line, &mut acc, false);
-                }
+        })?;
+        let mut parts = acc.parts;
+        let mut sets = Vec::new();
+        for kind in Kind::ALL {
+            let set = plain_set(&mut parts, kind);
+            if !set.is_empty() {
+                sets.push((Slot::Plain(kind), ListSet::take(set)));
+            }
+        }
+        for (rtype, mut set) in parts.typed_block {
+            sets.push((Slot::Typed(rtype), ListSet::take(&mut set)));
+        }
+        for (types, mut set) in parts.typed_block_except {
+            sets.push((Slot::TypedExcept(types), ListSet::take(&mut set)));
+        }
+        Ok(Self {
+            sets,
+            other_lines,
+            report: parts.report,
+        })
+    }
+}
+
+/// `label` names the kind of list in errors.
+fn load_list(
+    rules: &SubscriptionRules<'_>,
+    allow: bool,
+    label: &str,
+    store: &mut Option<&mut dyn ParsedListStore>,
+) -> std::io::Result<ParsedList> {
+    let path = match rules {
+        SubscriptionRules::File(path) => *path,
+        SubscriptionRules::Lines(lines) => {
+            return ParsedList::parse(allow, |on_line| {
+                lines.iter().for_each(|line| on_line(line));
+                Ok(())
+            });
+        }
+    };
+    let mut digest = store.is_some().then(|| RulesDigest::new(allow));
+    let file = open_validated_list_file(path, digest.as_mut()).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "Could not read or validate {label} '{}': {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let digest = digest.map(RulesDigest::finish);
+    if let (Some(store), Some(digest)) = (store.as_deref_mut(), &digest) {
+        if let Some(list) = store.load(digest) {
+            return Ok(list);
+        }
+    }
+    let list = ParsedList::parse(allow, |on_line| parse_validated_list_file(file, on_line))
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Could not read {label} '{}': {error}", path.display()),
+            )
+        })?;
+    if let (Some(store), Some(digest)) = (store.as_deref_mut(), &digest) {
+        store.save(digest, &list);
+    }
+    Ok(list)
+}
+
+/// Puts parsed lists together in order. A name in several lists keeps the earliest as its source,
+/// user rules come after every list, and `$badfilter` rules act across all of them, as if
+/// everything had been parsed in one pass.
+fn combine(
+    lists: Vec<(String, bool, ParsedList)>,
+    extra_block: &[&str],
+    extra_allow: &[&str],
+    tail: impl FnOnce(&mut EngineParts) -> std::io::Result<()>,
+) -> std::io::Result<EngineParts> {
+    let mut acc = Accum::new();
+    let mut slots: Vec<(Slot, Vec<(u32, ListSet)>)> = Vec::new();
+    for (name, allow, list) in lists {
+        acc.register_source(name);
+        let ParsedList {
+            sets,
+            other_lines,
+            report,
+        } = list;
+        // The list's report already counts these lines.
+        let counted = std::mem::take(&mut acc.parts.report);
+        for line in &other_lines {
+            parse_line(line, &mut acc, allow);
+        }
+        acc.parts.report = counted;
+        acc.parts.report.absorb(report);
+        for (slot, set) in sets {
+            let source = acc.cur_source;
+            match slots.iter_mut().find(|(known, _)| *known == slot) {
+                Some((_, runs)) => runs.push((source, set)),
+                None => slots.push((slot, vec![(source, set)])),
             }
         }
     }
     acc.cur_source = crate::engine::NO_SOURCE;
-    for d in extra_block {
-        parse_line(d, &mut acc, false);
+    for rule in extra_block {
+        parse_line(rule, &mut acc, false);
     }
-    for d in extra_allow {
-        parse_line(d, &mut acc, true);
+    for rule in extra_allow {
+        parse_line(rule, &mut acc, true);
     }
+    let cancelled: Vec<(Slot, bool, String)> = acc
+        .cancels
+        .iter()
+        .filter_map(|placement| match placement {
+            Placement::Domain {
+                slot,
+                domain,
+                exact,
+            } => Some((slot.clone(), *exact, crate::engine::normalize_str(domain))),
+            _ => None,
+        })
+        .collect();
     apply_badfilter(&mut acc);
-    Ok(acc.parts)
+    let mut parts = acc.parts;
+    tail(&mut parts)?;
+
+    // The sets still in `parts` hold the user rules and the tail, which rank after every list.
+    for kind in Kind::ALL {
+        let slot = Slot::Plain(kind);
+        let runs = match slots.iter().position(|(known, _)| *known == slot) {
+            Some(index) => slots.remove(index).1,
+            None => Vec::new(),
+        };
+        build_set(plain_set(&mut parts, kind), runs, &slot, &cancelled);
+    }
+    let mut own_typed = std::mem::take(&mut parts.typed_block);
+    let mut own_typed_except = std::mem::take(&mut parts.typed_block_except);
+    for (slot, runs) in slots {
+        let mut set = DomainSet::default();
+        match &slot {
+            Slot::Typed(rtype) => {
+                if let Some(index) = own_typed.iter().position(|(known, _)| known == rtype) {
+                    set = own_typed.remove(index).1;
+                }
+                build_set(&mut set, runs, &slot, &cancelled);
+                parts.typed_block.push((*rtype, set));
+            }
+            Slot::TypedExcept(types) => {
+                if let Some(index) = own_typed_except
+                    .iter()
+                    .position(|(known, _)| known == types)
+                {
+                    set = own_typed_except.remove(index).1;
+                }
+                build_set(&mut set, runs, &slot, &cancelled);
+                parts.typed_block_except.push((types.clone(), set));
+            }
+            Slot::Plain(_) => {}
+        }
+    }
+    for (rtype, mut set) in own_typed {
+        build_set(&mut set, Vec::new(), &Slot::Typed(rtype), &cancelled);
+        parts.typed_block.push((rtype, set));
+    }
+    for (types, mut set) in own_typed_except {
+        let slot = Slot::TypedExcept(types.clone());
+        build_set(&mut set, Vec::new(), &slot, &cancelled);
+        parts.typed_block_except.push((types, set));
+    }
+    Ok(parts)
 }
+
+/// Replaces `set`, which holds the rules ranked after every list, with the frozen merge of the
+/// lists' entries and its own. `cancelled` removes entries from the lists only.
+fn build_set(
+    set: &mut DomainSet,
+    lists: Vec<(u32, ListSet)>,
+    slot: &Slot,
+    cancelled: &[(Slot, bool, String)],
+) {
+    let (own_exact, own_suffix) = set.take_tables();
+    let mut exact_runs = Vec::with_capacity(lists.len());
+    let mut suffix_runs = Vec::with_capacity(lists.len());
+    for (source, ListSet { exact, suffix }) in lists {
+        exact_runs.push((source, exact));
+        suffix_runs.push((source, suffix));
+    }
+    let cancelled_in = |exact: bool| -> HashSet<&str> {
+        cancelled
+            .iter()
+            .filter(|(known, known_exact, _)| known == slot && *known_exact == exact)
+            .map(|(_, _, name)| name.as_str())
+            .collect()
+    };
+    *set = DomainSet::from_built(
+        merge_runs(exact_runs, own_exact, &cancelled_in(true)),
+        merge_runs(suffix_runs, own_suffix, &cancelled_in(false)),
+    );
+}
+
+fn merge_runs(
+    lists: Vec<(u32, KeyRun)>,
+    own: DomainTable,
+    cancelled: &HashSet<&str>,
+) -> Result<CompactDomainMap, DomainTable> {
+    let mut lists: Vec<(u32, KeyRun)> = lists
+        .into_iter()
+        .filter(|(_, run)| !run.is_empty())
+        .collect();
+    let own = (!own.is_empty()).then(|| own.into_sorted(reverse_cmp));
+    if lists.is_empty() {
+        return match own {
+            Some(own) => CompactDomainMap::try_from_sorted(own),
+            None => Ok(CompactDomainMap::default()),
+        };
+    }
+    if lists.len() == 1 && own.is_none() && cancelled.is_empty() {
+        if let Some((source, run)) = lists.pop() {
+            return match run {
+                KeyRun::Parsed(mut sorted) => {
+                    sorted.set_source(source);
+                    CompactDomainMap::try_from_sorted(sorted)
+                }
+                KeyRun::Stored { names, offsets } => {
+                    let sources = SourceTable::uniform(source, offsets.len() - 1);
+                    CompactDomainMap::try_from_staged(names, offsets, sources)
+                }
+            };
+        }
+    }
+
+    let mut inputs: Vec<Box<dyn Iterator<Item = (&str, u32)> + '_>> = lists
+        .iter()
+        .map(|(source, run)| {
+            let source = *source;
+            Box::new(run.names().map(move |name| (name, source))) as Box<dyn Iterator<Item = _>>
+        })
+        .collect();
+    // `$badfilter` was already applied to the user rules and the tail, the last input.
+    let own_input = inputs.len();
+    if let Some(own) = &own {
+        inputs.push(Box::new(own.iter()));
+    }
+    let mut heap = BinaryHeap::with_capacity(inputs.len());
+    for (input, entries) in inputs.iter_mut().enumerate() {
+        if let Some((name, source)) = entries.next() {
+            heap.push(MergeHead {
+                name,
+                input,
+                source,
+            });
+        }
+    }
+    let most_names = lists.iter().map(|(_, run)| run.len()).sum::<usize>()
+        + own.as_ref().map_or(0, |own| own.len());
+    let most_bytes = lists.iter().map(|(_, run)| run.text_len()).sum::<usize>()
+        + own.as_ref().map_or(0, |own| own.text_len());
+    let mut names = String::with_capacity(most_bytes.min(u32::MAX as usize));
+    let mut offsets = Vec::with_capacity(most_names + 1);
+    offsets.push(0u32);
+    let mut sources = SourceTableBuilder::with_capacity(most_names);
+    let mut overflowed = false;
+    while let Some(first) = heap.pop() {
+        let name = first.name;
+        let dropped = cancelled.contains(name);
+        let mut winner = None;
+        let mut current = Some(first);
+        while let Some(head) = current {
+            if winner.is_none() && (!dropped || head.input >= own_input) {
+                winner = Some(head.source);
+            }
+            if let Some((next, source)) = inputs[head.input].next() {
+                heap.push(MergeHead {
+                    name: next,
+                    input: head.input,
+                    source,
+                });
+            }
+            current = if heap.peek().is_some_and(|next| next.name == name) {
+                heap.pop()
+            } else {
+                None
+            };
+        }
+        let Some(source) = winner else {
+            continue;
+        };
+        if names.len() + name.len() >= u32::MAX as usize {
+            if !overflowed {
+                overflowed = true;
+                onetdns_core::warn!(
+                    event = "filter.rule_table_overflow",
+                    "Blocklist exceeds the 32-bit index limit; later rules were not added"
+                );
+            }
+            continue;
+        }
+        names.push_str(name);
+        offsets.push(names.len() as u32);
+        sources.push(source);
+    }
+    // Free the inputs before the automaton is built.
+    drop(inputs);
+    drop(lists);
+    drop(own);
+    CompactDomainMap::try_from_staged(names, offsets, sources.finish())
+}
+
+/// Orders the heap so the smallest name pops first, and among equal names the earliest input.
+struct MergeHead<'a> {
+    name: &'a str,
+    input: usize,
+    source: u32,
+}
+
+impl Ord for MergeHead<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        reverse_cmp(other.name, self.name).then_with(|| other.input.cmp(&self.input))
+    }
+}
+
+impl PartialOrd for MergeHead<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MergeHead<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for MergeHead<'_> {}
 
 pub fn load_lists(
     blocklists: &[impl AsRef<Path>],
@@ -2143,5 +2542,406 @@ ok.example.com CNAME rpz-passthru.
             verdict(&eng, "ok.example.com."),
             FilterVerdict::Allow
         ));
+    }
+
+    const LIST_A: &str = "\
+! Title: list a
+||ads.example^
+||shared.example^
+0.0.0.0 hosts-block.example other-host.example
+0.0.0.0 .
+192.0.2.7 rewrite-host.example
+||typed.example^$dnstype=AAAA
+||except.example^$dnstype=~A|~MX
+||important.example^$important
+/^regex[0-9]+\\.example$/
+||rewrite.example^$dnsrewrite=192.0.2.9
+||refused.example^$dnsrewrite=REFUSED
+||client.example^$client=192.168.1.0/24
+||cancel-me.example^
+||cross-cancel.example^
+@@||allowed-in-block.example^
+||Mixed.Case.Example^
+||weird.example^$app=org.example
+";
+
+    const LIST_B: &str = "\
+||shared.example^
+||b-only.example^
+||cancel-me.example^$badfilter
+||typed.example^$dnstype=AAAA
+||mx.example^$dnstype=MX
+||cross-cancel.example^
+||except.example^$dnstype=~MX|~A
+/^regex[0-9]+\\.example$/$badfilter
+";
+
+    const LIST_B_CHANGED: &str = "\
+||shared.example^
+||b-new.example^
+||cancel-me.example^$badfilter
+||typed.example^$dnstype=AAAA
+||mx.example^$dnstype=MX
+||cross-cancel.example^
+||txt-from-b.example^$dnstype=TXT
+";
+
+    const LIST_C: &str = "\
+||allowed.example^
+||ads.example^
+||allowed.example^$important
+";
+
+    const LIST_D: &str = "\
+# onetdns-fetched: 1
+||sub.example^
+||cross-cancel.example^$badfilter
+||user-cancelled.example^$badfilter
+||nodata.example^$dnsrewrite=NODATA
+||drop.example^$dnsrewrite=NORESPONSE
+";
+
+    const EXTRA_BLOCK: &[&str] = &[
+        "||user.example^",
+        "||shared.example^",
+        "||user-cancelled.example^",
+        "||ads.example^$dnstype=TXT",
+        "||mx.example^$dnstype=MX",
+    ];
+    const EXTRA_ALLOW: &[&str] = &["||user-allow.example^", "||b-only.example^"];
+
+    /// What the bin adds after the lists: a cancelled name added back and a name a list already has.
+    fn tail(parts: &mut EngineParts) -> std::io::Result<()> {
+        parts.refuse.add_suffix("cross-cancel.example");
+        parts.block.add_suffix("cross-cancel.example");
+        parts.block.add_suffix("tail.example");
+        parts.block.add_suffix("ads.example");
+        parts.nodata.add_exact("user-cancelled.example");
+        Ok(())
+    }
+
+    /// Every list in one pass, as loading worked before lists were parsed one at a time.
+    fn load_in_one_pass(lists: &[(&str, bool, &str)]) -> EngineParts {
+        let mut acc = Accum::new();
+        for (name, allow, text) in lists {
+            acc.register_source(name.to_string());
+            for line in text.lines() {
+                parse_line(line, &mut acc, *allow);
+            }
+        }
+        acc.cur_source = crate::engine::NO_SOURCE;
+        for rule in EXTRA_BLOCK {
+            parse_line(rule, &mut acc, false);
+        }
+        for rule in EXTRA_ALLOW {
+            parse_line(rule, &mut acc, true);
+        }
+        apply_badfilter(&mut acc);
+        let mut parts = acc.parts;
+        tail(&mut parts).unwrap();
+        parts
+    }
+
+    #[derive(Default)]
+    struct MemoryStore {
+        files: std::collections::HashMap<[u8; 32], Vec<u8>>,
+        hits: usize,
+        saves: usize,
+    }
+
+    impl ParsedListStore for MemoryStore {
+        fn load(&mut self, rules: &[u8; 32]) -> Option<ParsedList> {
+            let list = crate::cache::decode_parsed_list(self.files.get(rules)?, *rules).ok()?;
+            self.hits += 1;
+            Some(list)
+        }
+
+        fn save(&mut self, rules: &[u8; 32], list: &ParsedList) {
+            let mut file = std::io::Cursor::new(Vec::new());
+            crate::cache::write_parsed_list(list, *rules, &mut file).unwrap();
+            self.files.insert(*rules, file.into_inner());
+            self.saves += 1;
+        }
+    }
+
+    struct ListFiles {
+        dir: std::path::PathBuf,
+    }
+
+    impl ListFiles {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "onetdns-filter-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn write(&self, name: &str, text: &str) -> std::path::PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ListFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Loads block files `a` and `b`, allow file `c`, and subscription `d` from a file, the way the
+    /// bin does.
+    fn load_from_files(
+        files: &ListFiles,
+        b_text: &str,
+        store: Option<&mut dyn ParsedListStore>,
+    ) -> EngineParts {
+        let a = files.write("a.txt", LIST_A);
+        let b = files.write("b.txt", b_text);
+        let c = files.write("c.txt", LIST_C);
+        let d = files.write("d.list", LIST_D);
+        load_parts_with_store(
+            &[a, b],
+            &[c],
+            &[SubscriptionSource {
+                name: "https://lists.example/d.txt",
+                rules: SubscriptionRules::File(&d),
+            }],
+            EXTRA_BLOCK,
+            EXTRA_ALLOW,
+            store,
+            tail,
+        )
+        .unwrap()
+    }
+
+    fn reference(files: &ListFiles, b_text: &str) -> EngineParts {
+        let path = |name: &str| files.dir.join(name).display().to_string();
+        load_in_one_pass(&[
+            (&path("a.txt"), false, LIST_A),
+            (&path("b.txt"), false, b_text),
+            (&path("c.txt"), true, LIST_C),
+            ("https://lists.example/d.txt", false, LIST_D),
+        ])
+    }
+
+    /// Every rule with its list, and the verdict, explanation, and counts for each probe.
+    fn describe(parts: EngineParts) -> Vec<String> {
+        let source = |id: u32| parts.sources.get(id as usize).cloned();
+        let set = |label: String, set: &DomainSet| {
+            let entries: Vec<_> = set
+                .entries()
+                .into_iter()
+                .map(|(exact, key, id)| (exact, key, source(id)))
+                .collect();
+            format!("{label}: {entries:?}")
+        };
+        let mut out = vec![
+            set("block".into(), &parts.block),
+            set("allow".into(), &parts.allow),
+            set("block_important".into(), &parts.block_important),
+            set("allow_important".into(), &parts.allow_important),
+            set("refuse".into(), &parts.refuse),
+            set("nodata".into(), &parts.nodata),
+            set("no_response".into(), &parts.no_response),
+        ];
+        for (rtype, typed) in &parts.typed_block {
+            out.push(set(format!("typed {rtype:?}"), typed));
+        }
+        for (types, typed) in &parts.typed_block_except {
+            out.push(set(format!("typed except {types:?}"), typed));
+        }
+        let mut rewrites: Vec<_> = parts
+            .rewrites
+            .exact
+            .iter()
+            .map(|(name, target)| format!("= {name} {target:?}"))
+            .chain(
+                parts
+                    .rewrites
+                    .suffix
+                    .iter()
+                    .map(|(name, target)| format!("* {name} {target:?}")),
+            )
+            .collect();
+        rewrites.sort();
+        out.push(format!("rewrites: {rewrites:?}"));
+        out.push(format!(
+            "regex: {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            parts.regex_block,
+            parts.regex_allow,
+            parts.regex_block_important,
+            parts.regex_allow_important,
+            parts.regex_refuse,
+            parts.regex_nodata,
+            parts.regex_no_response,
+            parts.regex_rewrites,
+            parts.regex_typed_block,
+            parts.regex_typed_block_except,
+        ));
+        out.push(format!("clients: {:?}", parts.client_rules));
+        out.push(format!("sources: {:?}", parts.sources));
+
+        let probes: Vec<String> = [LIST_A, LIST_B, LIST_B_CHANGED, LIST_C, LIST_D]
+            .iter()
+            .flat_map(|text| {
+                text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+            })
+            .chain(EXTRA_BLOCK.iter().copied())
+            .chain(EXTRA_ALLOW.iter().copied())
+            .chain(["tail.example", "regex12.example", "nothing.example"])
+            .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+            .filter(|token| token.contains('.') && token.parse::<IpAddr>().is_err())
+            .flat_map(|token| [token.to_string(), format!("deep.{token}")])
+            .collect();
+        let engine = BlockEngine::new(parts, BlockResponse::NxDomain);
+        out.push(format!("report: {}", engine.load_report().to_json()));
+        out.push(format!(
+            "counts: {} {} {:?}",
+            engine.block_count(),
+            engine.allow_count(),
+            engine.source_stats()
+        ));
+        for address in ["127.0.0.1", "192.168.1.5"] {
+            let client = ClientInfo {
+                source_ip: address.parse().unwrap(),
+                client_id: None,
+                transport: Transport::Do53Udp,
+                authenticated: false,
+            };
+            for probe in &probes {
+                let Ok(name) = Name::from_str(probe) else {
+                    continue;
+                };
+                for rtype in [
+                    RecordType::A,
+                    RecordType::AAAA,
+                    RecordType::MX,
+                    RecordType::TXT,
+                    RecordType::HTTPS,
+                ] {
+                    out.push(format!(
+                        "{address} {probe} {rtype:?}: {:?} {:?}",
+                        engine.verdict(&name, rtype, &client),
+                        engine.explain(&name, rtype, &client)
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_same(actual: EngineParts, expected: EngineParts) {
+        let (actual, expected) = (describe(actual), describe(expected));
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    /// Each list is parsed on its own and merged; the result must be what one pass over every list
+    /// gives, down to which list each rule is credited to.
+    fn lists_parsed_one_by_one_match_a_single_pass() {
+        let files = ListFiles::new("merge");
+        let parts = load_from_files(&files, LIST_B, None);
+        assert_same(parts, reference(&files, LIST_B));
+    }
+
+    #[test]
+    fn stored_lists_build_the_same_engine_as_parsing_them() {
+        let files = ListFiles::new("stored");
+        let mut store = MemoryStore::default();
+        let cold = load_from_files(&files, LIST_B, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (0, 4));
+        assert_same(cold, reference(&files, LIST_B));
+
+        let warm = load_from_files(&files, LIST_B, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (4, 4));
+        assert_same(warm, reference(&files, LIST_B));
+    }
+
+    #[test]
+    /// Only the changed list is parsed again, and the engine matches a full rebuild.
+    fn changing_one_list_reparses_only_that_list() {
+        let files = ListFiles::new("one-changed");
+        let mut store = MemoryStore::default();
+        load_from_files(&files, LIST_B, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (0, 4));
+
+        let parts = load_from_files(&files, LIST_B_CHANGED, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (3, 5));
+        assert_same(parts, reference(&files, LIST_B_CHANGED));
+    }
+
+    #[test]
+    fn comment_changes_keep_the_stored_list() {
+        let files = ListFiles::new("comments");
+        let mut store = MemoryStore::default();
+        load_from_files(&files, LIST_B, Some(&mut store));
+        let commented = format!("! Updated: today\n{LIST_B}\n# trailing note\n   \n");
+        load_from_files(&files, &commented, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (4, 4));
+
+        let reordered: String = LIST_B
+            .lines()
+            .rev()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        load_from_files(&files, &reordered, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (7, 5));
+    }
+
+    #[test]
+    fn the_same_rules_as_block_and_allow_are_stored_apart() {
+        let files = ListFiles::new("allow-flag");
+        let mut store = MemoryStore::default();
+        let path = files.write("same.txt", "||same.example^\n");
+        let empty = &[] as &[std::path::PathBuf];
+        let parts = load_parts_with_store(
+            std::slice::from_ref(&path),
+            std::slice::from_ref(&path),
+            &[],
+            &[],
+            &[],
+            Some(&mut store),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((store.hits, store.saves), (0, 2));
+        assert_eq!(parts.block.len(), 1);
+        assert_eq!(parts.allow.len(), 1);
+        load_parts_with_store(
+            empty,
+            std::slice::from_ref(&path),
+            &[],
+            &[],
+            &[],
+            Some(&mut store),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(store.hits, 1);
+    }
+
+    #[test]
+    /// A damaged entry is not used; the list is parsed again and the entry replaced.
+    fn corrupted_stored_list_falls_back_to_parsing() {
+        let files = ListFiles::new("corrupt");
+        let mut store = MemoryStore::default();
+        load_from_files(&files, LIST_B, Some(&mut store));
+        for file in store.files.values_mut() {
+            let middle = file.len() / 2;
+            file[middle] ^= 0x40;
+        }
+        let parts = load_from_files(&files, LIST_B, Some(&mut store));
+        assert_eq!((store.hits, store.saves), (0, 8));
+        assert_same(parts, reference(&files, LIST_B));
+
+        load_from_files(&files, LIST_B, Some(&mut store));
+        assert_eq!(store.hits, 4);
     }
 }

@@ -17,8 +17,8 @@ pub mod safesearch;
 pub mod services;
 
 pub use cache::{
-    decode_engine_cache, encode_engine_cache, write_engine_cache, CacheError, CacheWriteError,
-    MAX_CACHE_BYTES,
+    decode_engine_cache, decode_parsed_list, encode_engine_cache, write_engine_cache,
+    write_parsed_list, CacheError, CacheWriteError, MAX_CACHE_BYTES,
 };
 pub use engine::{
     normalize_name, normalize_str, BlockEngine, ClientPolicy, DomainSet, EngineParts,
@@ -27,6 +27,6 @@ pub use engine::{
 };
 pub use loader::{
     build_from_named, build_from_str, load_lists, load_lists_with, load_parts,
-    load_parts_with_subscriptions, parse_rpz_text, validate_rule, SubscriptionRules,
-    SubscriptionSource,
+    load_parts_with_store, load_parts_with_subscriptions, parse_rpz_text, validate_rule,
+    ParsedList, ParsedListStore, SubscriptionRules, SubscriptionSource,
 };

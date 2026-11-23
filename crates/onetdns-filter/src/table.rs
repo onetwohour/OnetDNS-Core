@@ -241,6 +241,71 @@ impl SortedDomains {
             .iter()
             .map(|entry| (key_in(&self.text, entry), entry.source))
     }
+
+    /// At least the bytes of every name.
+    pub(crate) fn text_len(&self) -> usize {
+        self.text.len()
+    }
+
+    pub(crate) fn set_source(&mut self, source: u32) {
+        for entry in &mut self.entries {
+            entry.source = source;
+        }
+    }
+
+    /// Copies the names back to back in sorted order and drops the table. The offsets hold where
+    /// each name starts, followed by the total length.
+    pub(crate) fn into_staged(self, total_bytes: usize) -> (String, Vec<u32>) {
+        let mut names = String::new();
+        names.reserve_exact(total_bytes);
+        let mut offsets = Vec::with_capacity(self.entries.len() + 1);
+        for (name, _) in self.iter() {
+            offsets.push(names.len() as u32);
+            names.push_str(name);
+        }
+        offsets.push(names.len() as u32);
+        (names, offsets)
+    }
+}
+
+/// The names of one set in reversed-byte order, each once, as the automaton builder takes them.
+pub(crate) enum KeyRun {
+    /// Parsed in this build.
+    Parsed(SortedDomains),
+    /// Read back from a parsed list; `offsets` is laid out as in [`SortedDomains::into_staged`].
+    Stored { names: String, offsets: Vec<u32> },
+}
+
+impl KeyRun {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Parsed(sorted) => sorted.len(),
+            Self::Stored { offsets, .. } => offsets.len().saturating_sub(1),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// At least the bytes of every name.
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            Self::Parsed(sorted) => sorted.text_len(),
+            Self::Stored { names, .. } => names.len(),
+        }
+    }
+
+    pub(crate) fn names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Self::Parsed(sorted) => Box::new(sorted.iter().map(|(name, _)| name)),
+            Self::Stored { names, offsets } => Box::new(
+                offsets
+                    .windows(2)
+                    .map(|window| &names[window[0] as usize..window[1] as usize]),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

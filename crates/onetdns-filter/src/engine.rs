@@ -251,6 +251,68 @@ impl DomainSet {
         self.suffix_hits = None;
     }
 
+    /// Each half is the built automaton, or the table kept when building was abandoned.
+    pub(crate) fn from_built(
+        exact: Result<CompactDomainMap, DomainTable>,
+        suffix: Result<CompactDomainMap, DomainTable>,
+    ) -> Self {
+        let mut set = Self::default();
+        match exact {
+            Ok(built) => set.exact_compact = built,
+            Err(table) => set.exact = table,
+        }
+        match suffix {
+            Ok(built) => set.suffix_compact = built,
+            Err(table) => set.suffixes = table,
+        }
+        set.entry_count = set.exact.len()
+            + set.exact_compact.len()
+            + set.suffixes.len()
+            + set.suffix_compact.len();
+        set
+    }
+
+    /// Exact and suffix entries as tables, leaving the set empty.
+    pub(crate) fn take_tables(&mut self) -> (DomainTable, DomainTable) {
+        Self::thaw(
+            &mut self.exact,
+            &mut self.exact_compact,
+            &mut self.exact_hits,
+        );
+        Self::thaw(
+            &mut self.suffixes,
+            &mut self.suffix_compact,
+            &mut self.suffix_hits,
+        );
+        let tables = (
+            std::mem::take(&mut self.exact),
+            std::mem::take(&mut self.suffixes),
+        );
+        *self = Self::default();
+        tables
+    }
+
+    /// `(exact, name, source)`, sorted.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> Vec<(bool, String, u32)> {
+        let mut entries = Vec::new();
+        for (exact, table, compact) in [
+            (true, &self.exact, &self.exact_compact),
+            (false, &self.suffixes, &self.suffix_compact),
+        ] {
+            entries.extend(
+                table
+                    .iter()
+                    .map(|(key, source)| (exact, key.to_string(), source)),
+            );
+            compact
+                .for_each_entry(|_, key, source| entries.push((exact, key.to_string(), source)))
+                .expect("a built set lists its entries");
+        }
+        entries.sort();
+        entries
+    }
+
     /// Once, after loading.
     fn finalize(&mut self) {
         Self::compact(&mut self.exact, &mut self.exact_compact);
@@ -712,6 +774,17 @@ pub struct FilterLoadReport {
 }
 
 impl FilterLoadReport {
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.rules_total += other.rules_total;
+        self.rules_skipped += other.rules_skipped;
+        self.invalid_regex += other.invalid_regex;
+        self.invalid_pattern += other.invalid_pattern;
+        self.not_applicable += other.not_applicable;
+        for (modifier, count) in other.unsupported_modifier {
+            *self.unsupported_modifier.entry(modifier).or_default() += count;
+        }
+    }
+
     pub fn rules_applied(&self) -> u64 {
         self.rules_total.saturating_sub(self.rules_skipped)
     }
