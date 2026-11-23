@@ -89,6 +89,18 @@ dig @127.0.0.1 -p 15357 b011289.example A +noall +comment +stats   # NXDOMAIN, 0
 피크는 회차 편차가 0이다(같은 빌드 2회가 KiB 단위까지 일치) — A/B는 1회로 판정된다.
 안정 상태 RSS는 편차가 있으므로 같은 기준으로 보지 말 것.
 
+200만 규칙(x86_64 musl 정적 릴리스 빌드, WSL Debian의 netns)에서는 다음과 같다.
+
+| 시나리오 | 최대 RSS | 안정 상태 RSS |
+|---|---:|---:|
+| first | 127,360 KiB | 31,124 KiB |
+| update | 151,660 KiB | 31,140 KiB |
+| restart | 55,424 KiB | 31,272 KiB |
+
+목록 내용이 그대로인 채 `POST /v1/reload`로 다시 읽으면 컴파일 캐시를 쓰므로 피크가 update보다
+낮다. 감독자 아래에서 대시보드를 켠 같은 구성으로 프로세스 트리의 Pss를 50 ms마다 재면, 안정
+상태 41 MiB, 다시 읽는 동안 최대 93 MiB였다. 감독자 프로세스는 3 MiB다.
+
 ```sh
 unshare -rn sh run-update-memory.sh /path/to/onetdns 200000
 ```
