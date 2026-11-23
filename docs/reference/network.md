@@ -477,7 +477,7 @@ Network interface index used to send Router Advertisements.
 
 ### `ra_dns`
 
-**Type:** array
+**Type:** array  
 **Default:** `[]`
 
 **TOML:**
