@@ -1300,6 +1300,9 @@ mod tests {
             ("recurse_deny_answers", |c: &mut Config| {
                 c.recurse_deny_answers = vec!["192.0.2.1/32".parse().unwrap()]
             }),
+            ("recurse_opportunistic_encryption", |c: &mut Config| {
+                c.recurse_opportunistic_encryption = true
+            }),
         ] {
             assert!(
                 config_keys::is_hot(key),

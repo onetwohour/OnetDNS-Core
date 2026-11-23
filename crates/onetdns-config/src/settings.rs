@@ -877,6 +877,10 @@ pub struct Config {
 
     pub recurse_allow_server: Vec<IpNet>,
 
+    /// RFC 9539: authoritative servers that answer over DoT or DoQ are asked that way, without
+    /// authentication.
+    pub recurse_opportunistic_encryption: bool,
+
     pub ns_recursion_limit: u8,
 
     pub ns_cache_size: usize,
@@ -1181,6 +1185,7 @@ impl Default for Config {
             rebind_allow: vec![],
             recurse_deny_server: vec![],
             recurse_allow_server: vec![],
+            recurse_opportunistic_encryption: false,
             ns_recursion_limit: 0,
             ns_cache_size: 0,
             recurse_deny_answers: vec![],
@@ -1754,6 +1759,13 @@ impl Config {
         {
             soft.push(
                 "`aggressive_nsec` and `harden_below_nxdomain` work only with recursive or split resolution using local DNSSEC validation; they have no effect with the current settings"
+                    .into(),
+            );
+        }
+
+        if self.recurse_opportunistic_encryption && self.backend == BackendKind::Forward {
+            soft.push(
+                "`recurse_opportunistic_encryption` works only with recursive or split resolution; it has no effect with forwarding"
                     .into(),
             );
         }
@@ -2980,6 +2992,10 @@ impl Config {
         kv("ns_cache_size", self.ns_cache_size.to_string());
         kv("recurse_deny_server", sarr(&self.recurse_deny_server));
         kv("recurse_allow_server", sarr(&self.recurse_allow_server));
+        kv(
+            "recurse_opportunistic_encryption",
+            self.recurse_opportunistic_encryption.to_string(),
+        );
         kv("recurse_deny_answers", sarr(&self.recurse_deny_answers));
         kv("recurse_allow_answers", sarr(&self.recurse_allow_answers));
         kv(
@@ -3490,6 +3506,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "ra_managed",
         "ra_other",
         "rebind_protection",
+        "recurse_opportunistic_encryption",
         "release_check",
         "root_key_sentinel",
         "rrset_roundrobin",
@@ -5481,6 +5498,7 @@ const KNOWN_KEYS: &[&str] = &[
     "rebind_allow",
     "recurse_deny_server",
     "recurse_allow_server",
+    "recurse_opportunistic_encryption",
     "ns_recursion_limit",
     "ns_cache_size",
     "recurse_deny_answers",
@@ -5977,6 +5995,11 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.rebind_allow = gstrvec(root, "rebind_allow");
     c.recurse_deny_server = gparsevec(root, "recurse_deny_server");
     c.recurse_allow_server = gparsevec(root, "recurse_allow_server");
+    c.recurse_opportunistic_encryption = gbool(
+        root,
+        "recurse_opportunistic_encryption",
+        d.recurse_opportunistic_encryption,
+    );
     c.ns_recursion_limit = gi64(root, "ns_recursion_limit")
         .map(|i| i as u8)
         .unwrap_or(d.ns_recursion_limit);
@@ -6902,6 +6925,29 @@ answer = \"target.example\"
         config.prefetch = true;
         config.prefetch_interval_secs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn opportunistic_encryption_is_off_by_default_and_noted_under_forwarding() {
+        let mut config = Config::default();
+        assert!(!config.recurse_opportunistic_encryption);
+
+        config.recurse_opportunistic_encryption = true;
+        assert!(config
+            .advisories()
+            .iter()
+            .any(|advisory| advisory.contains("recurse_opportunistic_encryption")));
+
+        config.backend = BackendKind::Recurse;
+        assert!(config.validate().is_ok());
+        assert!(config.advisories().is_empty());
+
+        let parsed = Config::from_toml_str(
+            "backend = \"recurse\"\nrecurse_opportunistic_encryption = true\n",
+        )
+        .unwrap();
+        assert!(parsed.recurse_opportunistic_encryption);
+        assert!(Config::from_toml_str("recurse_opportunistic_encryption = \"yes\"\n").is_err());
     }
 
     #[test]

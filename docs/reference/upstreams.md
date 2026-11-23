@@ -385,6 +385,23 @@ recurse_allow_server = ["192.0.2.0/24"]
 
 Name server address ranges that recursive lookups may query. Private addresses that are blocked by default, and addresses on the exclusion list, are queried if listed here. Public addresses not listed here are still queried.
 
+### `recurse_opportunistic_encryption`
+
+**Type:** boolean  
+**Default:** `false`
+
+**TOML:**
+
+```toml
+recurse_opportunistic_encryption = true
+```
+
+Asks authoritative servers that answer over DoT or DoQ that way, as RFC 9539 describes. Certificates are not checked, so this stops eavesdropping but not an attacker on the path.
+
+After a server answers a query in plaintext, the same query is asked again in the background over DoT on port 853, or over DoQ on port 853 if DoT has failed. Once that gets an answer, later queries to the server go over encryption for up to three days after its last encrypted answer. If an encrypted query fails or is slow, the server is asked in plaintext within the same query time limit. A server whose encryption fails is not tried again for one day.
+
+**Requirement:** This option is meaningful only with `backend = "recurse"` or `"split"`. It turns off the fast path for recursive queries not in the cache, which sends only plain UDP.
+
 ### `recurse_deny_answers`
 
 **Type:** array  

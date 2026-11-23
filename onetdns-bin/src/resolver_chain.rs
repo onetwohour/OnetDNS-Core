@@ -91,6 +91,7 @@ pub(crate) struct RecursivePlan {
     ns_recursion_limit: u8,
     recurse_deny_server: Vec<onetdns_core::IpNet>,
     recurse_allow_server: Vec<onetdns_core::IpNet>,
+    recurse_opportunistic_encryption: bool,
     qname_minimisation_strict: bool,
     harden_referral_path: bool,
     root_key_sentinel: bool,
@@ -531,6 +532,7 @@ fn recursion_context(plan: &RecursivePlan) -> String {
         ignore_cd_flag,
         harden_below_nxdomain,
         aggressive_nsec,
+        recurse_opportunistic_encryption: _,
         query_timeout_secs: _,
         prefer_ip4: _,
         prefer_ip6: _,
@@ -634,6 +636,7 @@ impl RecursivePlan {
             ns_recursion_limit: cfg.ns_recursion_limit,
             recurse_deny_server: cfg.recurse_deny_server.clone(),
             recurse_allow_server: cfg.recurse_allow_server.clone(),
+            recurse_opportunistic_encryption: cfg.recurse_opportunistic_encryption,
             qname_minimisation_strict: cfg.qname_minimisation_strict,
             harden_referral_path: cfg.harden_referral_path,
             root_key_sentinel: cfg.root_key_sentinel,
@@ -790,6 +793,10 @@ impl RecursiveBase {
             .with_server_acl(deny, allow)
             .with_ip_family(plan.do_ip4, plan.do_ip6, prefer)
             .with_qname_min_strict(plan.qname_minimisation_strict)
+            .with_opportunistic_encryption(
+                plan.recurse_opportunistic_encryption
+                    .then(onetdns_forward::OpportunisticEncryption::default),
+            )
             .with_harden_referral_path(plan.harden_referral_path)
             .with_domain_insecure(insecure)
             .with_root_key_sentinel(plan.root_key_sentinel)
@@ -1477,6 +1484,14 @@ mod tests {
             change(&mut changed);
             assert_ne!(context(&changed), context(&recurse), "{key}");
         }
+        let mut encrypted = recurse.clone();
+        encrypted.recurse_opportunistic_encryption = true;
+        assert_eq!(
+            context(&encrypted),
+            context(&recurse),
+            "the transport to authorities leaves answers alone"
+        );
+        assert_ne!(ChainPlan::new(&encrypted), ChainPlan::new(&recurse));
 
         let mut split = base.clone();
         split.backend = BackendKind::Split;
