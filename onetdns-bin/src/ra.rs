@@ -27,6 +27,9 @@ pub struct RaConfig {
     pub preferred_lifetime: u32,
     pub mtu: Option<u32>,
 
+    /// Sent as the RDNSS option (RFC 8106); empty leaves it out.
+    pub dns: Vec<Ipv6Addr>,
+
     /// Sent as the source link-layer address option.
     pub source_mac: Option<[u8; 6]>,
 
@@ -48,6 +51,7 @@ impl Default for RaConfig {
             valid_lifetime: 86_400,
             preferred_lifetime: 14_400,
             mtu: None,
+            dns: Vec::new(),
             source_mac: None,
             interval: 600,
             interface_index: 0,
@@ -81,6 +85,19 @@ pub fn build_ra(cfg: &RaConfig) -> Vec<u8> {
         m.extend_from_slice(&mtu.to_be_bytes());
     }
 
+    // The length byte counts 8-byte units, so one option holds 127 addresses at most; the config
+    // allows fewer.
+    if !cfg.dns.is_empty() {
+        let servers = &cfg.dns[..cfg.dns.len().min(127)];
+        m.push(25);
+        m.push(1 + 2 * servers.len() as u8);
+        m.extend_from_slice(&0u16.to_be_bytes());
+        m.extend_from_slice(&rdnss_lifetime(cfg.interval).to_be_bytes());
+        for server in servers {
+            m.extend_from_slice(&server.octets());
+        }
+    }
+
     if !cfg.prefix.is_unspecified() {
         m.push(3);
         m.push(4);
@@ -93,6 +110,12 @@ pub fn build_ra(cfg: &RaConfig) -> Vec<u8> {
         m.extend_from_slice(&cfg.prefix.octets());
     }
     m
+}
+
+/// RFC 8106 asks for at least three advertisement intervals, so one lost advertisement does not
+/// expire the servers.
+fn rdnss_lifetime(interval: u64) -> u32 {
+    u32::try_from(interval.saturating_mul(3)).unwrap_or(u32::MAX)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -615,10 +638,43 @@ mod tests {
             valid_lifetime: 86_400,
             preferred_lifetime: 14_400,
             mtu: Some(1500),
+            dns: Vec::new(),
             source_mac: Some([0x02, 0, 0, 0, 0, 0x01]),
             interval: 600,
             interface_index: 2,
         }
+    }
+
+    /// The option of `kind` after the 16-byte RA header.
+    fn option(m: &[u8], kind: u8) -> Option<&[u8]> {
+        let mut rest = &m[16..];
+        while rest.len() >= 2 {
+            let len = usize::from(rest[1]) * 8;
+            assert!(len > 0 && len <= rest.len(), "option walks to the end");
+            if rest[0] == kind {
+                return Some(&rest[..len]);
+            }
+            rest = &rest[len..];
+        }
+        None
+    }
+
+    #[test]
+    /// Without it, hosts that do not use DHCPv6 learn no DNS server from this router.
+    fn rdnss_carries_the_servers_for_three_intervals() {
+        assert!(option(&build_ra(&cfg()), 25).is_none());
+
+        let mut c = cfg();
+        c.dns = vec!["2001:db8::53".parse().unwrap(), "fd00::53".parse().unwrap()];
+        let m = build_ra(&c);
+        let rdnss = option(&m, 25).expect("RDNSS");
+        assert_eq!(rdnss.len(), 40);
+        assert_eq!(rdnss[1], 5);
+        assert_eq!(&rdnss[2..4], &[0, 0]);
+        assert_eq!(u32::from_be_bytes(rdnss[4..8].try_into().unwrap()), 1_800);
+        assert_eq!(&rdnss[8..24], &c.dns[0].octets());
+        assert_eq!(&rdnss[24..40], &c.dns[1].octets());
+        assert!(option(&m, 3).is_some(), "the prefix still follows");
     }
 
     #[test]

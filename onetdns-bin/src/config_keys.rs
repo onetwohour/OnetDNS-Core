@@ -742,6 +742,7 @@ static KEYS: &[KeySpec] = &[
     key!(ra_interval, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(ra_mtu, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(ra_interface_index, Hot(EdgeServices), Node, Lanes::OPEN),
+    key!(ra_dns, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(dhcp6_enable, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(dhcp6_range_start, Hot(EdgeServices), Node, Lanes::OPEN),
     key!(dhcp6_range_end, Hot(EdgeServices), Node, Lanes::OPEN),

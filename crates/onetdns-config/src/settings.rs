@@ -817,6 +817,9 @@ pub struct Config {
 
     pub ra_interface_index: u32,
 
+    /// Sent as the RDNSS option, for hosts that learn DNS servers only from router advertisements.
+    pub ra_dns: Vec<String>,
+
     pub dhcp6_enable: bool,
 
     pub dhcp6_range_start: Option<String>,
@@ -1136,6 +1139,7 @@ impl Default for Config {
             ra_router_lifetime: 1800,
             ra_interval: 600,
             ra_mtu: 0,
+            ra_dns: vec![],
             ra_interface_index: 0,
             dhcp6_enable: false,
             dhcp6_range_start: None,
@@ -1458,6 +1462,15 @@ impl Config {
                     "dhcp6_dns entries must be IPv6 addresses: {server}"
                 ));
             }
+        }
+        for server in &self.ra_dns {
+            if server.parse::<std::net::Ipv6Addr>().is_err() {
+                return invalid(format!("ra_dns entries must be IPv6 addresses: {server}"));
+            }
+        }
+        // With the other options, 64 servers still fit an advertisement in the IPv6 minimum MTU.
+        if self.ra_dns.len() > 64 {
+            return invalid("ra_dns holds at most 64 addresses".into());
         }
         if let Some(prefix) = &self.ra_prefix {
             let parsed = prefix.split_once('/').and_then(|(address, length)| {
@@ -2759,6 +2772,7 @@ impl Config {
         kv("ra_router_lifetime", self.ra_router_lifetime.to_string());
         kv("ra_interval", self.ra_interval.to_string());
         kv("ra_mtu", self.ra_mtu.to_string());
+        kv("ra_dns", sarr(&self.ra_dns));
         kv("ra_interface_index", self.ra_interface_index.to_string());
         kv("dhcp6_enable", self.dhcp6_enable.to_string());
         kv("dhcp6_range_start", opt_s(&self.dhcp6_range_start));
@@ -3469,6 +3483,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "control_trusted_proxies",
         "dhcp6_dns",
         "dhcp_dns",
+        "ra_dns",
         "disabled_blocklist_urls",
         "domain_insecure",
         "fallback_upstreams",
@@ -5286,6 +5301,7 @@ const KNOWN_KEYS: &[&str] = &[
     "ra_interval",
     "ra_mtu",
     "ra_interface_index",
+    "ra_dns",
     "dhcp6_enable",
     "dhcp6_range_start",
     "dhcp6_range_end",
@@ -5767,6 +5783,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.dhcp6_range_start = gstr(root, "dhcp6_range_start");
     c.dhcp6_range_end = gstr(root, "dhcp6_range_end");
     c.dhcp6_dns = gstrvec(root, "dhcp6_dns");
+    c.ra_dns = gstrvec(root, "ra_dns");
     c.dhcp6_interface_index = gi64(root, "dhcp6_interface_index")
         .filter(|value| (0..=u32::MAX as i64).contains(value))
         .map(|value| value as u32)
@@ -6079,13 +6096,14 @@ mod tests {
             "ra_router_lifetime = 65535\n",
             "ra_interval = 600\nra_router_lifetime = 300\n",
             "ra_mtu = 100\n",
+            "ra_dns = [\"10.0.0.53\"]\n",
         ] {
             assert!(Config::from_toml_str(text).is_err(), "{text:?}");
         }
         let long = format!("dhcp_boot_file = \"{}\"\n", "b".repeat(256));
         assert!(Config::from_toml_str(&long).is_err());
         Config::from_toml_str(
-            "dhcp_local_domain = \"home.arpa\"\ndhcp_tftp_server = \"10.0.0.2\"\ndhcp6_dns = [\"fd00::53\"]\nra_prefix = \"fd31:e5e5::/64\"\nra_interval = 30\nra_router_lifetime = 0\nra_mtu = 1500\n",
+            "dhcp_local_domain = \"home.arpa\"\ndhcp_tftp_server = \"10.0.0.2\"\ndhcp6_dns = [\"fd00::53\"]\nra_prefix = \"fd31:e5e5::/64\"\nra_interval = 30\nra_router_lifetime = 0\nra_mtu = 1500\nra_dns = [\"fd00::53\"]\n",
         )
         .expect("쓸 수 있는 값은 받아들인다");
     }

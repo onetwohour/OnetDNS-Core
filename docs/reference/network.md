@@ -475,6 +475,19 @@ ra_interface_index = 0
 
 Network interface index used to send Router Advertisements.
 
+### `ra_dns`
+
+**Type:** array
+**Default:** `[]`
+
+**TOML:**
+
+```toml
+ra_dns = ["2001:db8::53"]
+```
+
+IPv6 DNS server addresses sent in the Router Advertisement RDNSS option (RFC 8106). Devices that do not use DHCPv6, such as Android, learn their DNS server only this way. Each address must be IPv6, and at most 64 are accepted. The option lifetime is three times `ra_interval`, so one lost advertisement does not expire it. An empty list leaves the option out.
+
 ## Networking, kernel integration and Redis
 
 ### `ipset_name_v4`

@@ -235,6 +235,7 @@ Top-level keys are indexed alphabetically below.
 
 ### R
 
+[`ra_dns`](network.md#ra_dns)
 [`ra_enable`](network.md#ra_enable)
 [`ra_interface_index`](network.md#ra_interface_index)
 [`ra_interval`](network.md#ra_interval)

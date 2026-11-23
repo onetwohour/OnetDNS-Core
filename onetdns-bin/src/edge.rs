@@ -143,6 +143,14 @@ fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
         valid_lifetime: 86_400,
         preferred_lifetime: 14_400,
         mtu: (cfg.ra_mtu != 0).then_some(cfg.ra_mtu),
+        dns: cfg
+            .ra_dns
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| format!("ra_dns needs IPv6 addresses: {s}"))
+            })
+            .collect::<Result<_, _>>()?,
         source_mac: None,
         interval: cfg.ra_interval,
         interface_index: cfg.ra_interface_index,
@@ -809,7 +817,7 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
     }
     if cfg.ra_enable {
         keys.push(format!(
-            "ra:{:?}:{}:{}:{}:{}:{}:{:?}",
+            "ra:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}",
             cfg.ra_prefix,
             cfg.ra_managed,
             cfg.ra_other,
@@ -817,6 +825,7 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
             cfg.ra_interval,
             cfg.ra_mtu,
             cfg.ra_interface_index,
+            cfg.ra_dns,
         ));
     }
     if cfg.dhcp6_enable {
