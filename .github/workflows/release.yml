@@ -10,9 +10,13 @@ name: Release
 # OnetDNS-release.toml lists with their sizes and hashes. The publish job signs it in the
 # release environment and creates no release unless a key in onetdns-bin/release-keys.txt
 # verifies the signature.
+#
+# Running it by hand builds every target the same way and publishes nothing, so a change to
+# the build can be checked without a release.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,6 +37,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Require the tagged commit to be on main
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -41,6 +46,7 @@ jobs:
             exit 1
           fi
       - name: Require CI to have passed for the tagged commit
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -66,7 +72,7 @@ jobs:
           set -euo pipefail
           version=$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "onetdns") | .version')
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match package version $version. Name the tag v$version."
             exit 1
           fi
@@ -92,14 +98,17 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          # The 1.88.0 standard library for these two targets has no profiler runtime.
           - os: ubuntu-latest
             target: i686-unknown-linux-musl
+            pgo: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             emulator: qemu-aarch64
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
             emulator: qemu-arm
+            pgo: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: windows-latest
@@ -113,12 +122,14 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       EMULATOR: ${{ matrix.emulator }}
+      PGO: ${{ matrix.pgo }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}
+          components: llvm-tools
 
       - name: Install emulator (Linux)
         if: runner.os == 'Linux' && matrix.emulator
@@ -144,7 +155,22 @@ jobs:
           # The binary looks up its own executable in the release manifest by this key, and a
           # binary built without it never updates itself.
           export ONETDNS_RELEASE_TARGET="$TARGET"
-          cargo build -p onetdns --release --locked --target "$TARGET"
+          if [ "$PGO" = false ]; then
+            cargo build -p onetdns --release --locked --target "$TARGET"
+            exit 0
+          fi
+          # Profile-guided: an instrumented build serves the training workloads, and the release
+          # binary is compiled with the profile it wrote.
+          root=$(pwd -W 2>/dev/null || pwd)
+          python=python3
+          exe=
+          if [ "$RUNNER_OS" = Windows ]; then python=python; exe=.exe; fi
+          RUSTFLAGS="$RUSTFLAGS -C profile-generate" \
+            cargo build -p onetdns --release --locked --target "$TARGET" --target-dir target/pgo
+          "$python" tools/pgo_train.py --emulator "$EMULATOR" \
+            "target/pgo/$TARGET/release/OnetDNS$exe" target/pgo/onetdns.profdata
+          RUSTFLAGS="$RUSTFLAGS -C profile-use=$root/target/pgo/onetdns.profdata" \
+            cargo build -p onetdns --release --locked --target "$TARGET"
 
       - name: Check linkage and version
         shell: bash
@@ -209,6 +235,7 @@ jobs:
   publish:
     name: publish release
     needs: [version, build]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # The manifest signing key is a secret of this environment. The environment requires the
     # owner's approval, so pushing a tag alone cannot produce a signed release.
