@@ -9,7 +9,9 @@ use onetdns_core::MutexExt;
 
 use crate::atomic_file::atomic_write;
 use crate::config_apply::SecondaryRestart;
-use crate::{dhcp, dhcp6, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, unix_now};
+use crate::{
+    dhcp, dhcp6, dnr, http, mac, ra, read_text_limited, sleep_or_shutdown, tftp, unix_now,
+};
 
 /// Most leases accepted in one sync.
 const MAX_SYNCED_LEASES: usize = 16_384;
@@ -105,6 +107,10 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
         }
         out
     };
+    let dnr = dnr_instances(cfg, &dns)?
+        .iter()
+        .filter_map(dnr::Instance::dhcp4)
+        .collect();
     Ok(dhcp::DhcpConfig {
         server_ip,
         range_start,
@@ -117,9 +123,21 @@ fn build_dhcp_config(cfg: &Config) -> Result<dhcp::DhcpConfig, String> {
         boot_file: cfg.dhcp_boot_file.clone(),
         domain_name: (!cfg.dhcp_local_domain.is_empty())
             .then(|| cfg.dhcp_local_domain.trim_end_matches('.').to_string()),
+        dnr,
         lease_file: cfg.dhcp_lease_file.as_ref().map(std::path::PathBuf::from),
         static_file,
     })
+}
+
+/// DNR instances for the DNS servers a service hands out; none without `ddr_name`.
+fn dnr_instances<A>(cfg: &Config, dns: &[A]) -> Result<Vec<dnr::Instance<A>>, String>
+where
+    A: Copy + Into<std::net::IpAddr>,
+{
+    match dnr::Source::new(cfg) {
+        Some(source) => source.instances(dns),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Fails without a readable `ra_prefix`; config validation already checks value ranges.
@@ -134,6 +152,14 @@ fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
         .ok()
         .filter(|l| *l <= 128)
         .ok_or_else(missing)?;
+    let dns: Vec<std::net::Ipv6Addr> = cfg
+        .ra_dns
+        .iter()
+        .map(|s| {
+            s.parse()
+                .map_err(|_| format!("ra_dns needs IPv6 addresses: {s}"))
+        })
+        .collect::<Result<_, _>>()?;
     Ok(ra::RaConfig {
         prefix,
         prefix_len,
@@ -143,14 +169,8 @@ fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
         valid_lifetime: 86_400,
         preferred_lifetime: 14_400,
         mtu: (cfg.ra_mtu != 0).then_some(cfg.ra_mtu),
-        dns: cfg
-            .ra_dns
-            .iter()
-            .map(|s| {
-                s.parse()
-                    .map_err(|_| format!("ra_dns needs IPv6 addresses: {s}"))
-            })
-            .collect::<Result<_, _>>()?,
+        dnr: dnr_instances(cfg, &dns)?,
+        dns,
         source_mac: None,
         interval: cfg.ra_interval,
         interface_index: cfg.ra_interface_index,
@@ -160,11 +180,16 @@ fn build_ra_config(cfg: &Config) -> Result<ra::RaConfig, String> {
 /// May create the server identifier file; checks use `dhcp6_addresses` instead.
 fn build_dhcp6_config(cfg: &Config) -> Result<dhcp6::Dhcp6Config, String> {
     let (range_start, range_end, dns) = dhcp6_addresses(cfg)?;
+    let dnr = dnr_instances(cfg, &dns)?
+        .iter()
+        .filter_map(dnr::Instance::dhcp6)
+        .collect();
     Ok(dhcp6::Dhcp6Config {
         server_duid: load_or_create_server_duid6(cfg.dhcp6_lease_file.as_deref())?,
         range_start,
         range_end,
         dns,
+        dnr,
         interface_index: cfg.dhcp6_interface_index,
         lease_secs: wire_dhcp_lease_secs(cfg.dhcp_lease_secs)?,
         lease_file: cfg.dhcp6_lease_file.as_ref().map(std::path::PathBuf::from),
@@ -785,11 +810,12 @@ impl EdgeServices {
 
 /// One key per enabled service. Any setting change alters the key, which restarts that service;
 /// an unchanged key leaves it running.
-fn edge_service_keys(cfg: &Config) -> Vec<String> {
+pub(crate) fn edge_service_keys(cfg: &Config) -> Vec<String> {
+    let dnr = dnr::Source::new(cfg);
     let mut keys = Vec::new();
     if cfg.dhcp_enable {
         keys.push(format!(
-            "dhcp4:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            "dhcp4:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{dnr:?}",
             cfg.dhcp_server_ip,
             cfg.dhcp_range_start,
             cfg.dhcp_range_end,
@@ -817,7 +843,7 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
     }
     if cfg.ra_enable {
         keys.push(format!(
-            "ra:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}",
+            "ra:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}:{dnr:?}",
             cfg.ra_prefix,
             cfg.ra_managed,
             cfg.ra_other,
@@ -830,7 +856,7 @@ fn edge_service_keys(cfg: &Config) -> Vec<String> {
     }
     if cfg.dhcp6_enable {
         keys.push(format!(
-            "dhcp6:{:?}:{:?}:{:?}:{}:{}:{:?}",
+            "dhcp6:{:?}:{:?}:{:?}:{}:{}:{:?}:{dnr:?}",
             cfg.dhcp6_range_start,
             cfg.dhcp6_range_end,
             cfg.dhcp6_dns,
@@ -1114,6 +1140,7 @@ mod tests {
             tftp_server: None,
             boot_file: None,
             domain_name: None,
+            dnr: Vec::new(),
             lease_file: None,
             static_file: None,
         };
@@ -1291,5 +1318,55 @@ mod tests {
         cfg.dhcp6_interface_index = 17;
 
         assert_ne!(before, edge_service_keys(&cfg));
+    }
+
+    const DHCP4: &str = "dhcp_enable = true\ndhcp_server_ip = \"192.168.1.1\"\n\
+                         dhcp_range_start = \"192.168.1.100\"\n\
+                         dhcp_range_end = \"192.168.1.199\"\n";
+
+    #[test]
+    /// DNR announces what DDR does, at the DNS server address DHCP already hands out.
+    fn dhcp_announces_the_ddr_endpoints_through_dnr() {
+        let ddr = "ddr_name = \"dns.example\"\ntls_self_signed_host = \"dns.example\"\n\
+                   listen_doh = [\"0.0.0.0:443\"]\nlisten_dot = [\"127.0.0.1:853\"]\n";
+        let cfg = Config::from_toml_str(&format!("{DHCP4}{ddr}")).unwrap();
+        let dc = build_dhcp_config(&cfg).unwrap();
+        let expected: Vec<Vec<u8>> = dnr::Source::new(&cfg)
+            .unwrap()
+            .instances(&[std::net::Ipv4Addr::new(192, 168, 1, 1)])
+            .unwrap()
+            .iter()
+            .filter_map(dnr::Instance::dhcp4)
+            .collect();
+        assert_eq!(expected.len(), 1, "루프백의 DoT는 LAN에 알리지 않음");
+        assert_eq!(dc.dnr, expected);
+
+        let without_ddr = Config::from_toml_str(DHCP4).unwrap();
+        assert!(build_dhcp_config(&without_ddr).unwrap().dnr.is_empty());
+    }
+
+    #[test]
+    fn dnr_inputs_change_the_dhcp_identity() {
+        let keys = |extra: &str| {
+            edge_service_keys(&Config::from_toml_str(&format!("{DHCP4}{extra}")).unwrap())
+        };
+        let ddr = "ddr_name = \"dns.example\"\ntls_self_signed_host = \"dns.example\"\n";
+        let base = keys(&format!("{ddr}listen_doh = [\"0.0.0.0:443\"]\n"));
+        assert_ne!(
+            base,
+            keys(&format!("{ddr}listen_doh = [\"192.168.1.1:443\"]\n"))
+        );
+        assert_ne!(
+            base,
+            keys(&format!(
+                "{ddr}listen_doh = [\"0.0.0.0:443\"]\ndoh_path = \"/q\"\n"
+            ))
+        );
+        // Without ddr_name the listeners do not reach DHCP.
+        let tls = "tls_self_signed_host = \"dns.example\"\n";
+        assert_eq!(
+            keys(&format!("{tls}listen_doh = [\"0.0.0.0:443\"]\n")),
+            keys(&format!("{tls}listen_doh = [\"192.168.1.1:443\"]\n"))
+        );
     }
 }

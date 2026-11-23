@@ -16,6 +16,11 @@ const FIXED_LEN: usize = 236;
 const MAX_STANDARD_IPV4_UDP_PAYLOAD: usize = u16::MAX as usize - 20 - 8;
 /// One byte over the limit, so an oversized datagram is seen as such instead of cut to fit.
 const DHCP4_RECV_CAPACITY: usize = MAX_STANDARD_IPV4_UDP_PAYLOAD + 1;
+/// Datagram every client takes (RFC 2131); a larger one only when option 57 asks for it.
+const MIN_REPLY_DATAGRAM: usize = 576;
+/// Keeps a reply in one Ethernet frame whatever option 57 claims.
+const MAX_REPLY_DATAGRAM: usize = 1500;
+const IPV4_UDP_HEADERS: usize = 20 + 8;
 const BROADCAST_FLAG: u16 = 0x8000;
 const SNAME_RANGE: std::ops::Range<usize> = 44..108;
 const FILE_RANGE: std::ops::Range<usize> = 108..236;
@@ -101,6 +106,8 @@ pub const OPT_LEASE_TIME: u8 = 51;
 const OPT_OVERLOAD: u8 = 52;
 pub const OPT_MSG_TYPE: u8 = 53;
 pub const OPT_SERVER_ID: u8 = 54;
+const OPT_PARAMETER_REQUEST_LIST: u8 = 55;
+const OPT_MAX_MESSAGE_SIZE: u8 = 57;
 pub const OPT_CLIENT_ID: u8 = 61;
 pub const OPT_DOMAIN_NAME: u8 = 15;
 pub const OPT_TFTP_SERVER_NAME: u8 = 66;
@@ -111,7 +118,8 @@ fn standard_dhcp4_datagram_len(received: usize) -> Option<usize> {
     (received <= MAX_STANDARD_IPV4_UDP_PAYLOAD).then_some(received)
 }
 
-/// Longest value, after joining fragments, of an option this server uses; `None` for the rest.
+/// Longest value, after joining fragments, of an option this server keeps whole; `None` for the
+/// rest.
 fn retained_option_limit(code: u8) -> Option<usize> {
     match code {
         OPT_OVERLOAD | OPT_MSG_TYPE => Some(1),
@@ -168,8 +176,26 @@ fn scan_option_field(
         if code == OPT_OVERLOAD && !allow_overload {
             return None;
         }
-        if let Some(limit) = retained_option_limit(code) {
-            append_option_fragment(options, code, value, limit)?;
+        match code {
+            // Kept only as whether it lists DNR, so no length or repetition refuses the message
+            // or grows the buffer.
+            OPT_PARAMETER_REQUEST_LIST => {
+                if value.contains(&crate::dnr::OPTION_V4_DNR)
+                    && !options.iter().any(|(kept, _)| *kept == code)
+                {
+                    options.push((code, vec![crate::dnr::OPTION_V4_DNR]));
+                }
+            }
+            // Past two bytes the size is malformed and reads as absent, so it stops growing there.
+            OPT_MAX_MESSAGE_SIZE => match options.iter_mut().find(|(kept, _)| *kept == code) {
+                Some((_, kept)) => kept.extend(value.iter().take(3 - kept.len())),
+                None => options.push((code, value.iter().take(3).copied().collect())),
+            },
+            _ => {
+                if let Some(limit) = retained_option_limit(code) {
+                    append_option_fragment(options, code, value, limit)?;
+                }
+            }
         }
         offset = end;
     }
@@ -184,6 +210,8 @@ fn retained_options_are_valid(options: &[(u8, Vec<u8>)]) -> bool {
         OPT_CLIENT_ID => (2..=255).contains(&value.len()),
         OPT_OVERLOAD => value.len() == 1 && matches!(value[0], 1..=3),
         OPT_MSG_TYPE => value.len() == 1,
+        // They only shape the reply, so a malformed value must not cost the client its address.
+        OPT_PARAMETER_REQUEST_LIST | OPT_MAX_MESSAGE_SIZE => true,
         _ => false,
     })
 }
@@ -418,6 +446,9 @@ pub struct DhcpConfig {
     pub boot_file: Option<String>,
 
     pub domain_name: Option<String>,
+
+    /// DNR Instance Data for option 162, in priority order.
+    pub dnr: Vec<Vec<u8>>,
 
     pub lease_file: Option<PathBuf>,
 
@@ -1695,6 +1726,10 @@ fn build_reply(req: &DhcpMessage, mtype: u8, yiaddr: Ipv4Addr, cfg: &DhcpConfig)
         if let Some(bf) = &cfg.boot_file {
             options.push((OPT_BOOTFILE, bf.as_bytes().to_vec()));
         }
+        let requested = req.option(OPT_PARAMETER_REQUEST_LIST);
+        if requested.is_some_and(|codes| codes.contains(&crate::dnr::OPTION_V4_DNR)) {
+            push_dnr(&mut options, &cfg.dnr, reply_capacity(req));
+        }
     }
     DhcpMessage {
         op: 2,
@@ -1720,6 +1755,49 @@ fn build_reply(req: &DhcpMessage, mtype: u8, yiaddr: Ipv4Addr, cfg: &DhcpConfig)
         chaddr: req.chaddr,
         client_identifier: None,
         options,
+    }
+}
+
+/// Longest DHCP message the client takes: the option 57 datagram size, kept within 576 and 1500
+/// bytes, less the IP and UDP headers.
+fn reply_capacity(req: &DhcpMessage) -> usize {
+    let asked = req
+        .option(OPT_MAX_MESSAGE_SIZE)
+        .and_then(|value| <[u8; 2]>::try_from(value).ok())
+        .map_or(0, |value| usize::from(u16::from_be_bytes(value)));
+    asked.clamp(MIN_REPLY_DATAGRAM, MAX_REPLY_DATAGRAM) - IPV4_UDP_HEADERS
+}
+
+/// Adds the DNR instances that fit in `capacity`, in priority order, as RFC 3396 fragments of
+/// option 162.
+fn push_dnr(options: &mut Vec<(u8, Vec<u8>)>, instances: &[Vec<u8>], capacity: usize) {
+    let used = FIXED_LEN
+        + MAGIC.len()
+        + options
+            .iter()
+            .map(|(_, value)| 2 + value.len())
+            .sum::<usize>()
+        + 1;
+    let mut value = Vec::new();
+    let mut left_out = 0usize;
+    for instance in instances {
+        let len = value.len() + instance.len();
+        if used + len + 2 * len.div_ceil(255) <= capacity {
+            value.extend_from_slice(instance);
+        } else {
+            left_out += 1;
+        }
+    }
+    if left_out > 0 {
+        onetdns_core::debug!(
+            event = "dhcp4.dnr_left_out",
+            left_out,
+            capacity,
+            "Left out encrypted DNS announcements that do not fit the client's DHCP message size"
+        );
+    }
+    for fragment in value.chunks(255) {
+        options.push((crate::dnr::OPTION_V4_DNR, fragment.to_vec()));
     }
 }
 
@@ -1879,6 +1957,7 @@ mod tests {
             tftp_server: None,
             boot_file: None,
             domain_name: None,
+            dnr: Vec::new(),
             lease_file: None,
             static_file: None,
         }
@@ -3552,6 +3631,174 @@ mod tests {
             offer.option(OPT_TFTP_SERVER_NAME),
             Some(b"192.168.1.5".as_slice())
         );
+    }
+
+    /// The option 162 fragments of an encoded reply, in order.
+    fn dnr_fragments(reply: &DhcpMessage) -> Vec<Vec<u8>> {
+        let wire = reply.encode();
+        let mut fragments = Vec::new();
+        let mut offset = FIXED_LEN + MAGIC.len();
+        while wire[offset] != OPT_END {
+            let len = usize::from(wire[offset + 1]);
+            if wire[offset] == crate::dnr::OPTION_V4_DNR {
+                fragments.push(wire[offset + 2..offset + 2 + len].to_vec());
+            }
+            offset += 2 + len;
+        }
+        fragments
+    }
+
+    fn asking_for_dnr(mut req: DhcpMessage, max_message: Option<u16>) -> DhcpMessage {
+        req.options
+            .push((OPT_PARAMETER_REQUEST_LIST, vec![1, 3, 6, 162]));
+        if let Some(size) = max_message {
+            req.options
+                .push((OPT_MAX_MESSAGE_SIZE, size.to_be_bytes().to_vec()));
+        }
+        DhcpMessage::parse(&req.encode()).expect("유효한 요청")
+    }
+
+    #[test]
+    fn dnr_goes_out_only_when_the_parameter_request_list_asks() {
+        let config = onetdns_config::Config::from_toml_str(
+            "ddr_name = \"dns.example\"\ntls_self_signed_host = \"dns.example\"\n\
+             listen_dot = [\"0.0.0.0:853\"]\n",
+        )
+        .unwrap();
+        let mut c = cfg();
+        c.dnr = crate::dnr::Source::new(&config)
+            .unwrap()
+            .instances(&c.dns)
+            .unwrap()
+            .iter()
+            .filter_map(crate::dnr::Instance::dhcp4)
+            .collect();
+        // Length, priority 3, the 13-byte ADN, one address, then alpn dot and port 853.
+        let mut expected = vec![0, 35, 0, 3, 13];
+        expected.extend_from_slice(b"\x03dns\x07example\x00");
+        expected.extend_from_slice(&[4, 192, 168, 1, 1]);
+        expected.extend_from_slice(b"\x00\x01\x00\x04\x03dot\x00\x03\x00\x02\x03\x55");
+        assert_eq!(expected.len(), 2 + 35);
+        assert_eq!(c.dnr, [expected.clone()]);
+
+        let mut pool = LeasePool::new(&c);
+        let plain = handle(&discover([1, 2, 3, 4, 5, 6]), &mut pool, &c).unwrap();
+        assert!(dnr_fragments(&plain).is_empty());
+
+        let offer = handle(
+            &asking_for_dnr(discover([1, 2, 3, 4, 5, 7]), None),
+            &mut pool,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(dnr_fragments(&offer), [expected]);
+
+        let nak = handle(
+            &asking_for_dnr(request([1, 2, 3, 4, 5, 8], [10, 0, 0, 1], None), None),
+            &mut pool,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(nak.msg_type(), Some(NAK));
+        assert!(dnr_fragments(&nak).is_empty());
+
+        c.dnr.clear();
+        let offer = handle(
+            &asking_for_dnr(discover([1, 2, 3, 4, 5, 9]), None),
+            &mut pool,
+            &c,
+        )
+        .unwrap();
+        assert!(dnr_fragments(&offer).is_empty());
+    }
+
+    #[test]
+    /// RFC 9463 makes option 162 concatenation-requiring, so a value over 255 bytes goes out as
+    /// consecutive fragments.
+    fn dnr_over_255_bytes_is_split_into_fragments() {
+        let mut c = cfg();
+        c.dnr = vec![vec![0xa1; 200], vec![0xb2; 150]];
+        let mut pool = LeasePool::new(&c);
+        let offer = handle(
+            &asking_for_dnr(discover([1, 2, 3, 4, 5, 6]), Some(1500)),
+            &mut pool,
+            &c,
+        )
+        .unwrap();
+        let fragments = dnr_fragments(&offer);
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].len(), 255);
+        assert_eq!(fragments[1].len(), 95);
+        assert_eq!(
+            fragments.concat(),
+            [c.dnr[0].clone(), c.dnr[1].clone()].concat()
+        );
+        let wire = offer.encode();
+        let start = wire.windows(2).position(|pair| pair == [162, 255]).unwrap();
+        assert_eq!(&wire[start + 257..start + 259], &[162, 95]);
+    }
+
+    #[test]
+    /// A client without option 57 takes 576 bytes; instances that do not fit are left out and
+    /// smaller ones after them still go in.
+    fn dnr_instances_that_do_not_fit_the_message_size_are_left_out() {
+        let mut c = cfg();
+        c.dnr = vec![vec![1; 200], vec![2; 100], vec![3; 60]];
+        let mut pool = LeasePool::new(&c);
+        let offer = |pool: &mut LeasePool, mac: u8, size: Option<u16>| {
+            let req = asking_for_dnr(discover([1, 2, 3, 4, 5, mac]), size);
+            let offer = handle(&req, pool, &c).unwrap();
+            assert!(offer.encode().len() <= reply_capacity(&req));
+            dnr_fragments(&offer).concat()
+        };
+
+        let small = offer(&mut pool, 1, None);
+        assert_eq!(small, [c.dnr[0].clone(), c.dnr[2].clone()].concat());
+        // Below the RFC 2131 floor counts as the floor.
+        assert_eq!(offer(&mut pool, 2, Some(300)), small);
+        assert_eq!(offer(&mut pool, 3, Some(1500)), c.dnr.concat());
+
+        let mut malformed = discover([1, 2, 3, 4, 5, 4]);
+        malformed
+            .options
+            .push((OPT_PARAMETER_REQUEST_LIST, vec![162]));
+        malformed.options.push((OPT_MAX_MESSAGE_SIZE, vec![5]));
+        let malformed = DhcpMessage::parse(&malformed.encode()).expect("57이 틀려도 요청은 받음");
+        assert_eq!(reply_capacity(&malformed), 548);
+        assert!(handle(&malformed, &mut LeasePool::new(&c), &c).is_some());
+    }
+
+    #[test]
+    /// Options 55 and 57 only shape the reply, so neither a long fragmented list nor a size of
+    /// the wrong length refuses the request, and repeating them does not grow what is kept.
+    fn parameter_list_and_message_size_never_refuse_a_request() {
+        let mut wire = discover([1, 2, 3, 4, 5, 6]).encode();
+        wire.pop();
+        for _ in 0..3 {
+            wire.push(OPT_PARAMETER_REQUEST_LIST);
+            wire.push(200);
+            wire.extend_from_slice(&[6; 200]);
+        }
+        wire.extend_from_slice(&[OPT_PARAMETER_REQUEST_LIST, 2, 3, 162]);
+        wire.extend_from_slice(&[OPT_MAX_MESSAGE_SIZE, 2, 0x05, 0xdc]);
+        for _ in 0..200 {
+            wire.extend_from_slice(&[OPT_MAX_MESSAGE_SIZE, 1, 0]);
+        }
+        wire.push(OPT_END);
+        let parsed = DhcpMessage::parse(&wire).expect("55·57 때문에 거부하지 않음");
+        assert_eq!(parsed.option(OPT_PARAMETER_REQUEST_LIST), Some(&[162][..]));
+        assert_eq!(
+            parsed.option(OPT_MAX_MESSAGE_SIZE),
+            Some(&[0x05, 0xdc, 0][..])
+        );
+        assert_eq!(reply_capacity(&parsed), 548);
+
+        let mut without = discover([1, 2, 3, 4, 5, 7]);
+        without
+            .options
+            .push((OPT_PARAMETER_REQUEST_LIST, vec![1, 3, 6]));
+        let without = DhcpMessage::parse(&without.encode()).unwrap();
+        assert!(without.option(OPT_PARAMETER_REQUEST_LIST).is_none());
     }
 
     #[test]

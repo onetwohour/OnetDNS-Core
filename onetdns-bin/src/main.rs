@@ -27,6 +27,7 @@ mod dhcp;
 mod dhcp6;
 /// Layer-2 delivery to DHCPv4 clients that have no address yet.
 mod dhcp_l2;
+mod dnr;
 mod dnscrypt;
 /// DNSSEC validation of answers in forward mode.
 mod dnssecfwd;

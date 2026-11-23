@@ -169,6 +169,7 @@ mod tests {
             tftp_server: None,
             boot_file: None,
             domain_name: None,
+            dnr: Vec::new(),
             lease_file: None,
             static_file: None,
         };

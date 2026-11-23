@@ -565,6 +565,7 @@ pub const OPT_SERVER_ID: u16 = 2;
 pub const OPT_IA_NA: u16 = 3;
 pub const OPT_IA_ADDR: u16 = 5;
 const OPT_IA_TA: u16 = 4;
+const OPT_ORO: u16 = 6;
 const OPT_IA_PD: u16 = 25;
 pub const OPT_STATUS_CODE: u16 = 13;
 pub const OPT_DNS_SERVERS: u16 = 23;
@@ -593,6 +594,7 @@ impl Dhcp6Message {
         let mut ia_count = 0usize;
         let mut seen_client_id = false;
         let mut seen_server_id = false;
+        let mut requests_dnr = false;
         let mut i = 4;
         while i < buf.len() {
             if buf.len() - i < 4 {
@@ -627,6 +629,12 @@ impl Dhcp6Message {
                     }
                     options.push((code, buf[i..end].to_vec()));
                 }
+                // Kept only as far as a reply reads it, and once, so a flood of them allocates
+                // once.
+                OPT_ORO if !requests_dnr && oro_lists(&buf[i..end], crate::dnr::OPTION_V6_DNR) => {
+                    requests_dnr = true;
+                    options.push((OPT_ORO, crate::dnr::OPTION_V6_DNR.to_be_bytes().to_vec()));
+                }
                 _ => {}
             }
             i = end;
@@ -658,6 +666,27 @@ impl Dhcp6Message {
         let mut matching = self.options.iter().filter(|(c, _)| *c == code);
         let value = matching.next()?.1.as_slice();
         matching.next().is_none().then_some(value)
+    }
+}
+
+/// A malformed ORO asks for nothing. It only shapes the reply, so the message is still answered.
+fn oro_lists(oro: &[u8], code: u16) -> bool {
+    oro.len() % 2 == 0
+        && oro
+            .chunks_exact(2)
+            .any(|pair| u16::from_be_bytes([pair[0], pair[1]]) == code)
+}
+
+/// All DNR options when the request's ORO asks for them, otherwise none.
+fn requested_dnr<'a>(req: &Dhcp6Message, cfg: &'a Dhcp6Config) -> &'a [Vec<u8>] {
+    let asked = req
+        .options
+        .iter()
+        .any(|(code, value)| *code == OPT_ORO && oro_lists(value, crate::dnr::OPTION_V6_DNR));
+    if asked {
+        &cfg.dnr
+    } else {
+        &[]
     }
 }
 
@@ -813,6 +842,8 @@ pub struct Dhcp6Config {
     pub range_start: Ipv6Addr,
     pub range_end: Ipv6Addr,
     pub dns: Vec<Ipv6Addr>,
+    /// OPTION_V6_DNR values, in priority order.
+    pub dnr: Vec<Vec<u8>>,
     /// Interface that joins the multicast group; 0 for the OS default.
     pub interface_index: u32,
     pub lease_secs: u32,
@@ -1336,6 +1367,7 @@ fn response_ia_capacity(
     client_id_len: usize,
     cfg: &Dhcp6Config,
     request_type: u8,
+    dnr: &[Vec<u8>],
 ) -> Option<usize> {
     if !valid_duid(&cfg.server_duid) {
         return None;
@@ -1351,6 +1383,9 @@ fn response_ia_capacity(
             return None;
         }
         fixed = fixed.checked_add(4usize.checked_add(dns_bytes)?)?;
+    }
+    for value in dnr {
+        fixed = fixed.checked_add(4usize.checked_add(value.len())?)?;
     }
     let remaining = MAX_STANDARD_IPV6_UDP_PAYLOAD.checked_sub(fixed)?;
     Some(remaining / IA_NA_ADDRESS_RESPONSE_WIRE_LEN)
@@ -1412,7 +1447,12 @@ pub fn handle(
         REQUEST | RENEW | RELEASE => return None,
         _ => return None,
     }
-    let max_ias = response_ia_capacity(client_id.len(), cfg, req.msg_type)?;
+    let dnr = if req.msg_type == RELEASE {
+        &[][..]
+    } else {
+        requested_dnr(req, cfg)
+    };
+    let max_ias = response_ia_capacity(client_id.len(), cfg, req.msg_type, dnr)?;
     let ia_count = validate_ia_nas(req, max_ias)?;
     let response_type = if req.msg_type == SOLICIT {
         ADVERTISE
@@ -1492,6 +1532,9 @@ pub fn handle(
         let dns: Vec<u8> = cfg.dns.iter().flat_map(|d| d.octets()).collect();
         options.push((OPT_DNS_SERVERS, dns));
     }
+    for value in dnr {
+        options.push((crate::dnr::OPTION_V6_DNR, value.clone()));
+    }
     Some(Dhcp6Message {
         msg_type: response_type,
         txid: req.txid,
@@ -1528,6 +1571,9 @@ fn information_reply(req: &Dhcp6Message, cfg: &Dhcp6Config) -> Option<Dhcp6Messa
             OPT_DNS_SERVERS,
             cfg.dns.iter().flat_map(|d| d.octets()).collect(),
         ));
+    }
+    for value in requested_dnr(req, cfg) {
+        options.push((crate::dnr::OPTION_V6_DNR, value.clone()));
     }
     Some(Dhcp6Message {
         msg_type: REPLY,
@@ -1676,6 +1722,7 @@ mod tests {
             range_start: "2001:db8::100".parse().unwrap(),
             range_end: "2001:db8::102".parse().unwrap(),
             dns: vec!["2001:db8::1".parse().unwrap()],
+            dnr: Vec::new(),
             interface_index: 0,
             lease_secs: 3600,
             lease_file: None,
@@ -1918,7 +1965,7 @@ mod tests {
         let mut c = cfg();
         c.range_end = "2001:db8::ffff".parse().unwrap();
         let duid = b"response-budget";
-        let capacity = response_ia_capacity(duid.len(), &c, SOLICIT).unwrap();
+        let capacity = response_ia_capacity(duid.len(), &c, SOLICIT, &[]).unwrap();
         let request_with = |count: usize| {
             let mut request = solicit(duid, 0u32.to_be_bytes());
             for iaid in 1..count as u32 {
@@ -1937,6 +1984,84 @@ mod tests {
         let mut oversized_pool = Lease6Pool::new(&c);
         assert!(handle(&request_with(capacity + 1), &mut oversized_pool, &c).is_none());
         assert_eq!(oversized_pool.dynamic_entries(), 0);
+
+        // Requested DNR options count against the same budget.
+        c.dnr = vec![vec![0; 4_000]];
+        let with_dnr = response_ia_capacity(duid.len(), &c, SOLICIT, &c.dnr).unwrap();
+        assert!(with_dnr < capacity);
+        let asking = |count: usize| {
+            let mut request = request_with(count);
+            request.options.push((OPT_ORO, vec![0, 144]));
+            request
+        };
+        let mut pool = Lease6Pool::new(&c);
+        let fitting = handle(&asking(with_dnr), &mut pool, &c).unwrap();
+        assert!(fitting.encode().len() <= MAX_STANDARD_IPV6_UDP_PAYLOAD);
+        let mut pool = Lease6Pool::new(&c);
+        assert!(handle(&asking(with_dnr + 1), &mut pool, &c).is_none());
+        assert_eq!(pool.dynamic_entries(), 0);
+    }
+
+    #[test]
+    fn dnr_options_go_out_only_when_the_oro_asks() {
+        let mut c = cfg();
+        c.dnr = vec![vec![0, 1, 0xaa], vec![0, 3, 0xbb]];
+        let dnr_values = |reply: &Dhcp6Message| -> Vec<Vec<u8>> {
+            reply
+                .options
+                .iter()
+                .filter(|(code, _)| *code == 144)
+                .map(|(_, value)| value.clone())
+                .collect()
+        };
+        let duid = b"dnr-client";
+
+        let mut pool = Lease6Pool::new(&c);
+        let plain = handle(&solicit(duid, [0, 0, 0, 1]), &mut pool, &c).unwrap();
+        assert!(dnr_values(&plain).is_empty());
+
+        let mut asking = solicit(duid, [0, 0, 0, 2]);
+        asking.options.push((OPT_ORO, vec![0, 23, 0, 144]));
+        let advertise = handle(&asking, &mut pool, &c).unwrap();
+        assert_eq!(dnr_values(&advertise), c.dnr);
+        let wire = advertise.encode();
+        let first = wire
+            .windows(4)
+            .position(|w| w == [0, 144, 0, 3])
+            .expect("OPTION_V6_DNR");
+        assert_eq!(
+            &wire[first..first + 14],
+            b"\x00\x90\x00\x03\x00\x01\xaa\x00\x90\x00\x03\x00\x03\xbb"
+        );
+
+        let information = Dhcp6Message {
+            msg_type: INFORMATION_REQUEST,
+            txid: [4, 5, 6],
+            options: vec![(OPT_ORO, vec![0, 144])],
+        };
+        let reply = handle(&information, &mut pool, &c).unwrap();
+        assert_eq!(dnr_values(&reply), c.dnr);
+
+        c.dnr.clear();
+        assert!(dnr_values(&handle(&asking, &mut pool, &c).unwrap()).is_empty());
+    }
+
+    #[test]
+    /// An ORO is kept only as whether it asks for DNR, so repeating it allocates nothing more, and
+    /// a malformed one is ignored rather than refused.
+    fn oro_is_reduced_to_the_dnr_request() {
+        let mut wire = solicit(b"oro-flood", [0, 0, 0, 1]).encode();
+        for _ in 0..1_000 {
+            wire.extend_from_slice(&[0, 6, 0, 4, 0, 23, 0, 144]);
+        }
+        let parsed = Dhcp6Message::parse(&wire).unwrap();
+        assert_eq!(parsed.options.len(), 3);
+        assert_eq!(parsed.option(OPT_ORO), Some(&[0, 144][..]));
+
+        let mut odd = solicit(b"oro-odd", [0, 0, 0, 1]).encode();
+        odd.extend_from_slice(&[0, 6, 0, 3, 0, 144, 0]);
+        let parsed = Dhcp6Message::parse(&odd).expect("잘못된 ORO가 있어도 메시지는 받음");
+        assert!(parsed.option(OPT_ORO).is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use onetdns_core::ArcSwap;
 
 use crate::atomic_file::atomic_write;
 use crate::config_keys::ApplyGroup;
-use crate::{config_keys, resolver_chain, runtime_preflight, ConfigTextSlot};
+use crate::{config_keys, edge, resolver_chain, runtime_preflight, ConfigTextSlot};
 
 /// Local-only name settings decided below the response cache. Their verdicts are cached, so
 /// changing them must clear the cache for the new verdict to show at once.
@@ -27,9 +27,14 @@ pub(crate) fn hot_reload_groups(
     // and fallback upstreams.
     if resolver_chain::ChainPlan::new(previous) != resolver_chain::ChainPlan::new(next) {
         groups.push(ApplyGroup::Chain);
-        groups.sort_unstable();
-        groups.dedup();
     }
+    // DNR carries `ddr_name` and the encrypted listeners into DHCP and router advertisements.
+    // Those services keep their lease pools when restarted, so the chain stays.
+    if edge::edge_service_keys(previous) != edge::edge_service_keys(next) {
+        groups.push(ApplyGroup::EdgeServices);
+    }
+    groups.sort_unstable();
+    groups.dedup();
     groups
 }
 
@@ -935,6 +940,34 @@ mod tests {
         assert_eq!(
             hot_reload_groups(&plain, &next, &changed),
             vec![ApplyGroup::Chain, ApplyGroup::EdgeServices]
+        );
+    }
+
+    #[test]
+    /// DHCP announces the encrypted listeners through DNR, so moving one must restart DHCP even
+    /// when DDR still announces the same port and the chain stays.
+    fn dnr_inputs_restart_the_edge_services() {
+        let base = "ddr_name = \"dns.example\"\ntls_self_signed_host = \"dns.example\"\n\
+                    dhcp_enable = true\ndhcp_server_ip = \"192.168.1.1\"\n\
+                    dhcp_range_start = \"192.168.1.100\"\ndhcp_range_end = \"192.168.1.199\"\n";
+        let config = |listen: &str| {
+            Config::from_toml_str(&format!("{base}listen_doh = [\"{listen}\"]\n")).unwrap()
+        };
+        let (now, moved) = (config("0.0.0.0:443"), config("192.168.1.1:443"));
+        let changed = config_changed_keys(&now, &moved);
+        assert_eq!(changed, ["listen_doh"]);
+        assert_eq!(
+            hot_reload_groups(&now, &moved, &changed),
+            vec![ApplyGroup::EdgeServices, ApplyGroup::Listeners]
+        );
+
+        let without_dhcp = |cfg: &Config| Config {
+            dhcp_enable: false,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            hot_reload_groups(&without_dhcp(&now), &without_dhcp(&moved), &changed),
+            vec![ApplyGroup::Listeners]
         );
     }
 

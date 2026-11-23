@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 const ICMP6_RA: u8 = 134;
 const ICMP6_RS: u8 = 133;
+/// Neighbor discovery must not be fragmented (RFC 6980), so an advertisement fits the IPv6 minimum
+/// MTU after the 40-byte header.
+const MAX_RA_LEN: usize = 1280 - 40;
 
 #[derive(Debug, Clone)]
 pub struct RaConfig {
@@ -29,6 +32,9 @@ pub struct RaConfig {
 
     /// Sent as the RDNSS option (RFC 8106); empty leaves it out.
     pub dns: Vec<Ipv6Addr>,
+
+    /// Sent as Encrypted DNS options, in priority order, as far as they fit.
+    pub dnr: Vec<crate::dnr::Instance<Ipv6Addr>>,
 
     /// Sent as the source link-layer address option.
     pub source_mac: Option<[u8; 6]>,
@@ -52,6 +58,7 @@ impl Default for RaConfig {
             preferred_lifetime: 14_400,
             mtu: None,
             dns: Vec::new(),
+            dnr: Vec::new(),
             source_mac: None,
             interval: 600,
             interface_index: 0,
@@ -109,7 +116,26 @@ pub fn build_ra(cfg: &RaConfig) -> Vec<u8> {
         m.extend_from_slice(&0u32.to_be_bytes());
         m.extend_from_slice(&cfg.prefix.octets());
     }
+
+    // RFC 9463 asks for the same lifetime floor as RDNSS.
+    let lifetime = rdnss_lifetime(cfg.interval);
+    for option in cfg.dnr.iter().filter_map(|instance| instance.ra(lifetime)) {
+        if m.len() + option.len() <= MAX_RA_LEN {
+            m.extend_from_slice(&option);
+        }
+    }
     m
+}
+
+/// Encrypted DNS options in an advertisement `build_ra` made.
+fn dnr_option_count(ra: &[u8]) -> usize {
+    let mut count = 0;
+    let mut offset = 16;
+    while let Some(&[kind, units]) = ra.get(offset..offset + 2) {
+        count += usize::from(kind == crate::dnr::RA_ENCRYPTED_DNS);
+        offset += usize::from(units).max(1) * 8;
+    }
+    count
 }
 
 /// RFC 8106 asks for at least three advertisement intervals, so one lost advertisement does not
@@ -281,13 +307,22 @@ pub fn spawn_ra(
     };
 
     let pkt = build_ra(&cfg);
+    let dnr = dnr_option_count(&pkt);
     onetdns_core::info!(
         event = "ra.packet_built",
         bytes = pkt.len(),
         ifindex = cfg.interface_index,
         interval = cfg.interval,
+        dnr,
         "Built the IPv6 router advertisement packet"
     );
+    if dnr < cfg.dnr.len() {
+        onetdns_core::warn!(
+            event = "ra.dnr_left_out",
+            left_out = cfg.dnr.len() - dnr,
+            "Left encrypted DNS announcements out of router advertisements to keep them within 1280 bytes; fewer ra_dns addresses make room"
+        );
+    }
     #[cfg(target_os = "linux")]
     {
         std::thread::Builder::new()
@@ -639,6 +674,7 @@ mod tests {
             preferred_lifetime: 14_400,
             mtu: Some(1500),
             dns: Vec::new(),
+            dnr: Vec::new(),
             source_mac: Some([0x02, 0, 0, 0, 0, 0x01]),
             interval: 600,
             interface_index: 2,
@@ -657,6 +693,68 @@ mod tests {
             rest = &rest[len..];
         }
         None
+    }
+
+    fn dnr(listen: &str, dns: &[Ipv6Addr]) -> Vec<crate::dnr::Instance<Ipv6Addr>> {
+        let cfg = onetdns_config::Config::from_toml_str(&format!(
+            "ddr_name = \"dns.example\"\ntls_self_signed_host = \"dns.example\"\n{listen}\n"
+        ))
+        .unwrap();
+        crate::dnr::Source::new(&cfg)
+            .unwrap()
+            .instances(dns)
+            .unwrap()
+    }
+
+    #[test]
+    fn encrypted_dns_goes_out_at_the_rdnss_servers_for_three_intervals() {
+        assert!(option(&build_ra(&cfg()), 144).is_none());
+
+        let mut c = cfg();
+        c.dns = vec!["fd00::53".parse().unwrap()];
+        c.dnr = dnr(
+            "listen_doh = [\"[::]:443\"]\nlisten_dot = [\"[::]:853\"]",
+            &c.dns,
+        );
+        assert_eq!(c.dnr.len(), 2);
+        let m = build_ra(&c);
+        let first = option(&m, 144).expect("Encrypted DNS");
+        assert_eq!(first, c.dnr[0].ra(1_800).unwrap());
+        assert_eq!(u32::from_be_bytes(first[4..8].try_into().unwrap()), 1_800);
+        assert_eq!(dnr_option_count(&m), 2);
+        let without = build_ra(&RaConfig {
+            dnr: Vec::new(),
+            ..c.clone()
+        });
+        assert_eq!(
+            m.len(),
+            without.len() + first.len() + c.dnr[1].ra(1_800).unwrap().len()
+        );
+    }
+
+    #[test]
+    /// Options that do not fit the IPv6 minimum MTU are left out; the highest priority goes first.
+    fn encrypted_dns_stays_within_the_minimum_mtu() {
+        let mut c = cfg();
+        c.dns = (1..=32)
+            .map(|i| Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i))
+            .collect();
+        c.dnr = dnr(
+            "listen_doh = [\"[::]:443\"]\nlisten_dot = [\"[::]:853\"]",
+            &c.dns,
+        );
+        let m = build_ra(&c);
+        assert!(m.len() <= MAX_RA_LEN);
+        assert_eq!(dnr_option_count(&m), 1);
+        assert_eq!(option(&m, 144).unwrap(), c.dnr[0].ra(1_800).unwrap());
+
+        c.dns = (1..=64)
+            .map(|i| Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i))
+            .collect();
+        c.dnr = dnr("listen_doh = [\"[::]:443\"]", &c.dns);
+        let m = build_ra(&c);
+        assert_eq!(dnr_option_count(&m), 0);
+        assert!(option(&m, 25).is_some(), "RDNSS stays");
     }
 
     #[test]

@@ -337,3 +337,5 @@ ddr_name = "dns.example.com"
 ```
 
 Server name announced so that devices can discover and switch to this server's encrypted DNS (DoH, DoT, DoQ) on their own. The TLS certificate must contain this name. Leave empty to announce nothing.
+
+Devices find it in two ways. They can ask this server over plain DNS (DDR, RFC 9462). When DHCPv4, DHCPv6 or router advertisements are on, those services also send it as encrypted DNS options (DNR, RFC 9463): DHCP to devices that ask for option 162 (DHCPv4) or 144 (DHCPv6), router advertisements to every device. DNR names each encrypted listener at the DNS server addresses that service already hands out (`dhcp_dns`, or `dhcp_server_ip` when that is empty; `dhcp6_dns`; `ra_dns`), but only where the listener is bound to that address or to `0.0.0.0` or `[::]`. A listener on loopback alone is not announced. Announcements go in priority order (DoH, DoH3, DoT, DoQ), and any that do not fit the client's DHCPv4 message size or the 1280-byte limit of a router advertisement are left out.

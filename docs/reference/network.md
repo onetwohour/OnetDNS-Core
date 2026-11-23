@@ -102,7 +102,7 @@ Default gateway sent in DHCPv4 options.
 dhcp_dns = ["192.168.1.1"]
 ```
 
-DNS server addresses sent to DHCPv4 clients.
+DNS server addresses sent to DHCPv4 clients. When empty, `dhcp_server_ip` is sent. With `ddr_name` set, clients that ask for option 162 also learn the encrypted DNS listeners at these addresses; see [`ddr_name`](administration.md#ddr_name).
 
 ### `dhcp_lease_secs`
 
@@ -234,7 +234,7 @@ Last IPv6 address available for dynamic DHCPv6 allocation.
 dhcp6_dns = ["2001:db8::53"]
 ```
 
-DNS server addresses sent to DHCPv6 clients.
+DNS server addresses sent to DHCPv6 clients. With `ddr_name` set, clients that ask for option 144 also learn the encrypted DNS listeners at these addresses; see [`ddr_name`](administration.md#ddr_name).
 
 ### `dhcp6_interface_index`
 
@@ -486,7 +486,7 @@ Network interface index used to send Router Advertisements.
 ra_dns = ["2001:db8::53"]
 ```
 
-IPv6 DNS server addresses sent in the Router Advertisement RDNSS option (RFC 8106). Devices that do not use DHCPv6, such as Android, learn their DNS server only this way. Each address must be IPv6, and at most 64 are accepted. The option lifetime is three times `ra_interval`, so one lost advertisement does not expire it. An empty list leaves the option out.
+IPv6 DNS server addresses sent in the Router Advertisement RDNSS option (RFC 8106). Devices that do not use DHCPv6, such as Android, learn their DNS server only this way. Each address must be IPv6, and at most 64 are accepted. The option lifetime is three times `ra_interval`, so one lost advertisement does not expire it. An empty list leaves the option out. With `ddr_name` set, the advertisement also carries Encrypted DNS options (RFC 9463) for these addresses with the same lifetime, as many as fit in 1280 bytes; see [`ddr_name`](administration.md#ddr_name).
 
 ## Networking, kernel integration and Redis
 
