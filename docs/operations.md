@@ -51,7 +51,7 @@ anonymize_client_ip = false
 
 Logs can be dropped when their asynchronous queue is backpressured, preserving DNS response handling. A log row is therefore not a guaranteed one-to-one accounting entry for all processed queries. Separate detailed Query log retention from aggregated statistics, and use relevant per-client `ignore_querylog`/`ignore_stats` fields where desired.
 
-Query log `latency_us` records an internal processing span and can exclude DNSCrypt cryptography, QUIC processing, and network RTT. See [Performance](performance.md) for measurement boundaries.
+Query log `latency_us` runs from the moment the server has the DNS message until the answer is ready to send. It leaves out transport decryption and encryption, the send, and network RTT. See [Performance](performance.md) for measurement boundaries.
 
 ## Measuring CPU and memory
 

@@ -13,11 +13,11 @@ The filter data structure compiles domains into a compact automaton rather than 
 | Metric | What it covers | Common mistake |
 | --- | --- | --- |
 | Filter lookup time | Domain normalization and classification inside the filter engine | Treating it as total DNS latency |
-| Internal request latency | The span recorded around selected server processing stages | Assuming all encryption/transport work is included |
+| Internal request latency (`latency_us`, dashboard average latency) | From the moment the server has the DNS message until the answer is ready to send | Assuming transport decryption, encryption, or the send is included |
 | Server processing CPU time | CPU consumed across selected protocol and resolver work | Confusing elapsed time waiting for upstreams with active CPU time |
 | Client-observed RTT | Full round-trip from client send to response received | Inferring it directly from the dashboard's `latency_us` |
 
-The Query log's microsecond field is an internal processing span, not a full encrypted DNS end-to-end RTT. DNSCrypt decryption and final encryption, HTTP/3/QUIC work, and network delays can be outside that span.
+The Query log's `latency_us` starts when the server has the DNS message: for plain UDP, when the datagram is read from the socket; for TCP, DoT, DoH, DoQ, DoH3, and DNSCrypt, when the transport hands over the decrypted and framed message. It stops when the answer is ready to send. A cache hit, a blocked name, and a local answer are measured the same way, and a query sent upstream includes the wait for the upstream. Transport decryption, TLS/QUIC/DNSCrypt encryption of the answer, the send itself, and network delay are outside the span, so encrypted transports cost more per query than the field shows.
 
 ## Benchmark procedure
 
