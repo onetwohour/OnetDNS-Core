@@ -290,7 +290,7 @@ impl NativeServer {
 
 /// Logs refused clients. Otherwise the verdicts reach only the stats recorder, and with it off
 /// nothing shows why queries fail. Called per verdict, so only powers of two are logged per kind.
-fn note_rejection(action: Action, client: &ClientInfo) {
+pub(super) fn note_rejection(action: Action, client: &ClientInfo) {
     static DENIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static THROTTLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (counter, denied) = match action {

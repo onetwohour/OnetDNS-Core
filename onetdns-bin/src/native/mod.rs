@@ -35,6 +35,7 @@ mod response;
 
 use authority::AuthorityWirePath;
 pub(crate) use authority::{NotifyKick, UpdateRule, ZoneJournal};
+pub(crate) use query::RelayAdmission;
 pub(crate) use response::{block_rcode, local_only_negative_response, rcode_str, rdata_brief};
 use response::{block_resp, records_resp};
 

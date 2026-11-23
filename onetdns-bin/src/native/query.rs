@@ -21,7 +21,7 @@ use onetdns_proto::{
 use onetdns_runtime::{RequestCtx, Transport as RtTransport};
 
 use crate::native::authority::name_ends_with;
-use crate::native::observe::{note_dropped, FilterRuleLabel};
+use crate::native::observe::{note_dropped, note_rejection, FilterRuleLabel};
 use crate::native::response::{
     base_response, block_rcode, block_resp, dns64_negative_ttl, ede_text, edns_error_resp,
     error_resp, finalize, has_alias_answer, has_negative_soa, is_delegation_referral,
@@ -34,6 +34,14 @@ use crate::native::{
     NativeFeatures, NativeServer, ResolveOutcome, DEFAULT_EDNS_PAYLOAD, MAX_LARGE_QUERY_BYTES,
     OPT_COOKIE, OPT_NSID,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayAdmission {
+    Allow,
+    Deny,
+    Drop,
+    Throttle,
+}
 
 impl NativeServer {
     fn view_local_answer(
@@ -149,6 +157,30 @@ impl NativeServer {
             }
             AclDecision::Allow | AclDecision::Deny => false,
         }
+    }
+
+    /// The ACL and rate limits for a message an Oblivious DoH proxy relays. The query inside is
+    /// sealed, so nothing else applies, and the query log has nothing to record.
+    pub(crate) fn admit_relay(&self, ctx: &RequestCtx) -> RelayAdmission {
+        let client = self.identify(ctx);
+        match self.acl.check(&client) {
+            AclDecision::Drop(reason) => {
+                note_dropped(client.source_ip, reason);
+                return RelayAdmission::Drop;
+            }
+            AclDecision::Deny => {
+                note_rejection(Action::Denied, &client);
+                return RelayAdmission::Deny;
+            }
+            AclDecision::Allow => {}
+        }
+        for limiter in &self.rate_limiters {
+            if limiter.check(&client) == RateDecision::Throttle {
+                note_rejection(Action::Throttled, &client);
+                return RelayAdmission::Throttle;
+            }
+        }
+        RelayAdmission::Allow
     }
 
     /// Admission, request policy, resolution, answer completion, then response policy. Once a stage

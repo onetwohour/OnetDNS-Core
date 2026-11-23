@@ -12,6 +12,7 @@ Incoming encrypted DNS uses `listen_dot`, `listen_doh`, `listen_doh3`, `listen_d
 | DNS over QUIC (DoQ) | `listen_doq` | UDP 853 | DoQ-capable client and matching certificate |
 | DNSCrypt | `listen_dnscrypt` | Configured UDP/TCP port | DNSCrypt provider information/stamp |
 | Oblivious DoH target | `listen_doh` with `odoh_target` | Same as DoH | Reached through an ODoH proxy; see [Oblivious DoH](#oblivious-doh) |
+| Oblivious DoH proxy | `listen_doh` with `odoh_proxy_targets` | Same as DoH | ODoH client; relays only to the listed targets |
 
 The ports shown are conventional; each transport is enabled by setting its listener. The host firewall and any cloud network rule must permit the corresponding TCP or UDP traffic.
 
@@ -64,6 +65,17 @@ The listener then also accepts `application/oblivious-dns-message` POSTs on `doh
 The target key is created on first use as `odoh-target.key` next to the configuration file and kept across restarts and upgrades. OnetDNS never replaces it on its own: a damaged file stops the DoH listener with an error. To change the key, delete the file and restart OnetDNS; clients holding the old configuration get HTTP 401 and fetch the new one. Anyone who can read the file can decrypt previously captured queries to this target, so protect it like the TLS private key.
 
 **Every ODoH query appears to come from the proxy.** Client policy, ACLs, rate limits, client-specific rules and the query log key on the proxy's address (or the proxy's mTLS client identity), never on the client behind it. All clients of one proxy share its policy and its per-client rate limit; if you rate-limit clients, list the proxy in `rate_limit_allow` or the proxy's users will be throttled together.
+
+To act as a proxy, list the targets it may relay to:
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+odoh_proxy_targets = ["https://odoh.example.net/dns-query"]
+```
+
+A client then POSTs its encrypted query to `https://dns.example.com/dns-query?targethost=odoh.example.net&targetpath=/dns-query`. The proxy forwards it without any header that identifies the client, over connections it shares between all clients, and returns the target's answer. It relays only to the listed targets: any other host, port or path gets HTTP 403 with a `Proxy-Status` header, so the listener never becomes an open proxy. Failures to reach a target also come back with `Proxy-Status`, and a target's error status is passed on without its body. A listener can be a proxy and a target at once.
+
+As a proxy, OnetDNS sees each client's address but not its queries. Relayed messages do not appear in the query log or statistics. The ACL and rate limits apply to each relay as to a query from that client, but the targets see every relayed query as coming from this server.
 
 ## DNSCrypt setup
 

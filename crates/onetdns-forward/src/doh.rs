@@ -10,11 +10,20 @@ use onetdns_tls::{client_handshake, ClientConfig, TlsSession, TlsStream, TrustSt
 
 use crate::{validate_response, DeadlineTcp, Endpoint, ForwardError};
 
-struct DohConn {
-    client: H2Client<TlsStream<DeadlineTcp>>,
+pub(crate) struct DohConn {
+    pub(crate) client: H2Client<TlsStream<DeadlineTcp>>,
 
     /// Observed round-trip time; sets the PING wait on reuse.
-    rtt_hint: Duration,
+    pub(crate) rtt_hint: Duration,
+}
+
+/// Where opening an HTTP/2 connection over TLS failed.
+pub(crate) enum ConnectError {
+    Tcp(ForwardError),
+    Tls(onetdns_tls::TlsError),
+    /// The revocation check refused the certificate.
+    Revoked(ForwardError),
+    Preface,
 }
 
 thread_local! {
@@ -97,8 +106,6 @@ pub(crate) fn exchange(
     })
 }
 
-/// Checks revocation right after the handshake, before a query. A certificate the hook rejects is
-/// reported to the server with a fatal alert, as when TLS rejects it.
 fn connect(
     endpoint: &Endpoint,
     server_name: &str,
@@ -106,10 +113,30 @@ fn connect(
     trust: &TrustStore,
     session: Option<TlsSession>,
 ) -> Result<DohConn, ForwardError> {
+    connect_h2(endpoint, server_name, deadline, trust, session).map_err(|error| match error {
+        ConnectError::Tcp(e) => e,
+        ConnectError::Tls(e) => {
+            crate::note_upstream_connect_failure("doh", endpoint, server_name, &e);
+            ForwardError::Io(format!("DoH handshake: {e}"))
+        }
+        ConnectError::Revoked(e) => e,
+        ConnectError::Preface => ForwardError::Io("DoH HTTP/2 preface".into()),
+    })
+}
+
+/// Checks revocation right after the handshake, before a query. A certificate the hook rejects is
+/// reported to the server with a fatal alert, as when TLS rejects it.
+pub(crate) fn connect_h2(
+    endpoint: &Endpoint,
+    server_name: &str,
+    deadline: Instant,
+    trust: &TrustStore,
+    session: Option<TlsSession>,
+) -> Result<DohConn, ConnectError> {
     let started = Instant::now();
     // Through a proxy this spans the tunnel setup, which the proxy completes only after reaching
     // the server, so it still approximates the round trip to the server.
-    let mut tcp = crate::connect_stream(endpoint, deadline)?;
+    let mut tcp = crate::connect_stream(endpoint, deadline).map_err(ConnectError::Tcp)?;
     let rtt_hint = started.elapsed();
     let cfg = ClientConfig {
         server_name: server_name.to_string(),
@@ -119,18 +146,29 @@ fn connect(
         session,
         ..Default::default()
     };
-    let mut tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
-        crate::note_upstream_connect_failure("doh", endpoint, server_name, &e);
-        ForwardError::Io(format!("DoH handshake: {e}"))
-    })?;
+    let mut tls = client_handshake(&mut tcp, &cfg).map_err(ConnectError::Tls)?;
     if !tls.is_resumed() {
         crate::check_revocation(tls.verified_chain(), server_name)
-            .inspect_err(|_| tls.reject_peer_certificate(&mut tcp))?;
+            .inspect_err(|_| tls.reject_peer_certificate(&mut tcp))
+            .map_err(ConnectError::Revoked)?;
     }
     let stream = TlsStream::new(tls, tcp);
-    let client =
-        H2Client::connect(stream).map_err(|_| ForwardError::Io("DoH HTTP/2 preface".into()))?;
+    let client = H2Client::connect(stream).map_err(|_| ConnectError::Preface)?;
     Ok(DohConn { client, rtt_hint })
+}
+
+/// Sets the short deadline a probed request starts with; its `on_alive` moves it out to `deadline`.
+pub(crate) fn arm_probe(conn: &mut DohConn, deadline: Instant) {
+    let silence = Duration::from_millis(crate::quicdrive::silence_limit_ms(
+        conn.rtt_hint.as_millis() as u64,
+    ));
+    let probe_deadline = Instant::now()
+        .checked_add(silence)
+        .map_or(deadline, |d| d.min(deadline));
+    conn.client
+        .stream_mut()
+        .inner_mut()
+        .set_deadline(probe_deadline);
 }
 
 /// An outer Err means the connection is unusable. An inner Err means the server answered this query
@@ -151,22 +189,15 @@ fn roundtrip(
     q[0] = 0;
     q[1] = 0;
 
-    let silence = Duration::from_millis(crate::quicdrive::silence_limit_ms(
-        conn.rtt_hint.as_millis() as u64,
-    ));
-    let probe_deadline = Instant::now()
-        .checked_add(silence)
-        .map_or(deadline, |d| d.min(deadline));
-    conn.client
-        .stream_mut()
-        .inner_mut()
-        .set_deadline(probe_deadline);
+    arm_probe(conn, deadline);
     let answer = conn.client.query_probed(server_name, path, &q, |stream| {
         stream.inner_mut().set_deadline(deadline);
     });
     let body = match answer {
         Ok(body) => body,
-        Err(H2Error::BadStatus) => return Ok(Err(ForwardError::Io("DoH non-200 status".into()))),
+        Err(H2Error::BadStatus(_)) => {
+            return Ok(Err(ForwardError::Io("DoH non-200 status".into())))
+        }
         Err(H2Error::Closed) => {
             return Err(ForwardError::Io("DoH server closed the connection".into()))
         }

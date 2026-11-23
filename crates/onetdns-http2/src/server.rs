@@ -69,6 +69,15 @@ impl HttpReply {
             body,
         }
     }
+
+    /// A status the proxy sends for the target, with an RFC 9209 Proxy-Status naming this proxy.
+    fn proxy_status(status: String, parameter: String) -> Self {
+        Self {
+            status,
+            fields: vec![("proxy-status", format!("OnetDNS; {parameter}"))],
+            body: Vec::new(),
+        }
+    }
 }
 
 pub const ODOH_MEDIA_TYPE: &str = "application/oblivious-dns-message";
@@ -79,15 +88,19 @@ pub const ODOH_CONFIGS_PATH: &str = "/.well-known/odohconfigs";
 /// The largest ObliviousDoHMessage: a type byte and two fields with 16-bit lengths.
 pub const MAX_ODOH_MESSAGE: usize = 1 + 2 * (2 + u16::MAX as usize);
 
-/// Oblivious DoH (RFC 9230) on a DoH listener. This crate only routes requests by media type and
-/// path; the implementor opens, resolves and seals.
+/// Oblivious DoH (RFC 9230) on a DoH listener. This crate only routes requests by media type, path
+/// and the proxy variables; the implementor opens, resolves, seals and relays.
 pub trait Oblivious {
     /// The ObliviousDoHConfigs served at `ODOH_CONFIGS_PATH`; `None` when this listener is not a
     /// target.
     fn configs(&self) -> Option<Vec<u8>>;
 
-    /// An ObliviousDoHMessage POSTed to the DoH path.
+    /// An ObliviousDoHMessage POSTed to the DoH path for this server to answer.
     fn target(&self, message: &[u8]) -> ObliviousReply;
+
+    /// An ObliviousDoHMessage to relay to the target the `targethost` and `targetpath` variables
+    /// name, both percent-decoded.
+    fn proxy(&self, target_host: &str, target_path: &str, message: &[u8]) -> ObliviousReply;
 }
 
 pub enum ObliviousReply {
@@ -96,6 +109,13 @@ pub enum ObliviousReply {
     Status(&'static str),
     /// No response; the connection closes, as for a DNS query the handler does not answer.
     Drop,
+    /// The target's non-200 status, passed on with Proxy-Status `received-status`.
+    TargetStatus(u16),
+    /// The proxy relayed nothing back: this status, and the Proxy-Status error type saying why.
+    ProxyError {
+        status: &'static str,
+        error: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,11 +148,12 @@ enum Route {
 /// POST whose content type is the ODoH one.
 fn route_oblivious(
     method: &[u8],
-    path_only: &[u8],
+    path: &[u8],
     oblivious_body: Option<&[u8]>,
     expected_path: &str,
     oblivious: Option<&dyn Oblivious>,
 ) -> Route {
+    let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
     if method == b"GET" && path_only == ODOH_CONFIGS_PATH.as_bytes() {
         return match oblivious.and_then(Oblivious::configs) {
             Some(configs) => Route::Respond(AppResponse::Http(HttpReply::odoh_configs(configs))),
@@ -153,14 +174,85 @@ fn route_oblivious(
     if body.is_empty() {
         return Route::Respond(AppResponse::Status(STATUS_BAD_REQUEST));
     }
-    match oblivious.target(body) {
+    let reply = match proxy_target(path) {
+        Ok(None) => oblivious.target(body),
+        Ok(Some((host, target_path))) => oblivious.proxy(&host, &target_path, body),
+        Err(()) => ObliviousReply::ProxyError {
+            status: STATUS_BAD_REQUEST,
+            error: "http_request_error",
+        },
+    };
+    let response = match reply {
         ObliviousReply::Message(message) if message.len() <= MAX_ODOH_MESSAGE => {
-            Route::Respond(AppResponse::Http(HttpReply::oblivious_message(message)))
+            AppResponse::Http(HttpReply::oblivious_message(message))
         }
-        ObliviousReply::Message(_) => Route::Respond(AppResponse::Status(STATUS_BAD_GATEWAY)),
-        ObliviousReply::Status(status) => Route::Respond(AppResponse::Status(status)),
-        ObliviousReply::Drop => Route::Drop,
+        ObliviousReply::Message(_) => AppResponse::Status(STATUS_BAD_GATEWAY),
+        ObliviousReply::Status(status) => AppResponse::Status(status),
+        ObliviousReply::Drop => return Route::Drop,
+        ObliviousReply::TargetStatus(status) => AppResponse::Http(HttpReply::proxy_status(
+            status.to_string(),
+            format!("received-status={status}"),
+        )),
+        ObliviousReply::ProxyError { status, error } => AppResponse::Http(HttpReply::proxy_status(
+            status.to_string(),
+            format!("error={error}"),
+        )),
+    };
+    Route::Respond(response)
+}
+
+/// The `targethost` and `targetpath` variables of a proxy request, percent-decoded. `Ok(None)`
+/// when neither is there. Each must appear once, decode to printable ASCII, and the path must
+/// start with `/`; anything else is a malformed proxy request.
+fn proxy_target(path: &[u8]) -> Result<Option<(String, String)>, ()> {
+    let Some(query) = path.splitn(2, |&b| b == b'?').nth(1) else {
+        return Ok(None);
+    };
+    let mut host = None;
+    let mut target_path = None;
+    for pair in query.split(|&b| b == b'&') {
+        let (name, value) = match pair.iter().position(|&b| b == b'=') {
+            Some(index) => (&pair[..index], &pair[index + 1..]),
+            None => (pair, &[][..]),
+        };
+        let slot = match name {
+            b"targethost" => &mut host,
+            b"targetpath" => &mut target_path,
+            _ => continue,
+        };
+        if slot.replace(percent_decode(value)?).is_some() {
+            return Err(());
+        }
     }
+    match (host, target_path) {
+        (None, None) => Ok(None),
+        (Some(host), Some(path)) if !host.is_empty() && path.starts_with('/') => {
+            Ok(Some((host, path)))
+        }
+        _ => Err(()),
+    }
+}
+
+fn percent_decode(raw: &[u8]) -> Result<String, ()> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let [high, low, ..] = *tail else {
+                return Err(());
+            };
+            let digit = |c: u8| (c as char).to_digit(16).ok_or(());
+            out.push((digit(high)? * 16 + digit(low)?) as u8);
+            rest = &tail[2..];
+        } else {
+            out.push(byte);
+            rest = tail;
+        }
+    }
+    if !out.iter().all(|byte| byte.is_ascii_graphic()) {
+        return Err(());
+    }
+    String::from_utf8(out).map_err(|_| ())
 }
 
 /// DoH response body and its HTTP freshness lifetime. This layer does not parse DNS, so whoever
@@ -860,7 +952,7 @@ where
     };
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
     let oblivious_body = is_oblivious.then_some(st.body.as_slice());
-    match route_oblivious(method, path_only, oblivious_body, expected_path, oblivious) {
+    match route_oblivious(method, path, oblivious_body, expected_path, oblivious) {
         Route::Doh => {}
         Route::Respond(response) => return Ok(Some(response)),
         Route::Drop => return Ok(None),
@@ -1167,7 +1259,7 @@ where
     let oblivious_body = query
         .as_deref()
         .filter(|_| method == b"POST" && content_type == Some(Media::Oblivious));
-    match route_oblivious(method, path_only, oblivious_body, expected_path, oblivious) {
+    match route_oblivious(method, target, oblivious_body, expected_path, oblivious) {
         Route::Doh => {}
         Route::Respond(response) => return write_h1_app_response(stream, response),
         Route::Drop => return Ok(()),
@@ -1226,7 +1318,9 @@ fn h1_status_line(status: &str) -> String {
         "403" => "Forbidden",
         "404" => "Not Found",
         "415" => "Unsupported Media Type",
+        "429" => "Too Many Requests",
         "502" => "Bad Gateway",
+        "504" => "Gateway Timeout",
         _ => "Error",
     };
     format!("{status} {reason}")
@@ -2754,6 +2848,26 @@ mod tests {
                 _ => ObliviousReply::Message(message.iter().rev().copied().collect()),
             }
         }
+
+        /// Echoes where it would relay; a few hosts stand for the ways a relay ends.
+        fn proxy(&self, target_host: &str, target_path: &str, message: &[u8]) -> ObliviousReply {
+            match target_host {
+                "denied.example" => ObliviousReply::ProxyError {
+                    status: "403",
+                    error: "http_request_denied",
+                },
+                "down.example" => ObliviousReply::ProxyError {
+                    status: "502",
+                    error: "connection_refused",
+                },
+                "rotated.example" => ObliviousReply::TargetStatus(401),
+                _ => {
+                    let mut echoed = format!("{target_host} {target_path} ").into_bytes();
+                    echoed.extend_from_slice(message);
+                    ObliviousReply::Message(echoed)
+                }
+            }
+        }
     }
 
     fn h1_oblivious(raw: Vec<u8>, oblivious: Option<EchoTarget>) -> String {
@@ -2812,6 +2926,73 @@ mod tests {
         assert!(other_path.starts_with("HTTP/1.1 404 "), "{other_path}");
         let no_service = h1_oblivious_post("/dns-query", b"abc", None);
         assert!(no_service.starts_with("HTTP/1.1 415 "), "{no_service}");
+    }
+
+    #[test]
+    fn h1_routes_proxy_requests_by_their_variables() {
+        let relayed = h1_oblivious_post(
+            "/dns-query?targethost=odoh.example&targetpath=%2Fdns%2Dquery",
+            b"abc",
+            TARGET,
+        );
+        assert!(relayed.starts_with("HTTP/1.1 200 OK\r\n"), "{relayed}");
+        assert!(relayed.contains("\r\ncontent-type: application/oblivious-dns-message\r\n"));
+        assert!(relayed.contains("\r\ncache-control: no-cache, no-store\r\n"));
+        assert!(
+            relayed.ends_with("\r\n\r\nodoh.example /dns-query abc"),
+            "{relayed}"
+        );
+
+        let denied = h1_oblivious_post(
+            "/dns-query?targethost=denied.example&targetpath=/q",
+            b"abc",
+            TARGET,
+        );
+        assert!(denied.starts_with("HTTP/1.1 403 "), "{denied}");
+        assert!(denied.contains("\r\nproxy-status: OnetDNS; error=http_request_denied\r\n"));
+
+        let down = h1_oblivious_post(
+            "/dns-query?targethost=down.example&targetpath=/q",
+            b"abc",
+            TARGET,
+        );
+        assert!(down.starts_with("HTTP/1.1 502 "), "{down}");
+        assert!(down.contains("\r\nproxy-status: OnetDNS; error=connection_refused\r\n"));
+
+        let rotated = h1_oblivious_post(
+            "/dns-query?targethost=rotated.example&targetpath=/q",
+            b"abc",
+            TARGET,
+        );
+        assert!(rotated.starts_with("HTTP/1.1 401 "), "{rotated}");
+        assert!(rotated.contains("\r\nproxy-status: OnetDNS; received-status=401\r\n"));
+    }
+
+    #[test]
+    fn malformed_proxy_variables_are_request_errors() {
+        for query in [
+            "targethost=odoh.example",
+            "targetpath=/dns-query",
+            "targethost=a.example&targethost=b.example&targetpath=/q",
+            "targethost=odoh.example&targetpath=dns-query",
+            "targethost=odoh%zz.example&targetpath=/q",
+            "targethost=odoh%2.example&targetpath=/q",
+            "targethost=odoh%20.example&targetpath=/q",
+            "targethost=&targetpath=/q",
+        ] {
+            let response = h1_oblivious_post(&format!("/dns-query?{query}"), b"abc", TARGET);
+            assert!(response.starts_with("HTTP/1.1 400 "), "{query}: {response}");
+            assert!(
+                response.contains("\r\nproxy-status: OnetDNS; error=http_request_error\r\n"),
+                "{query}: {response}"
+            );
+        }
+        assert_eq!(
+            proxy_target(b"/dns-query?ct=1&targetpath=%2Fq&targethost=Odoh.Example"),
+            Ok(Some(("Odoh.Example".to_string(), "/q".to_string()))),
+            "other variables are ignored, and case is the caller's to judge"
+        );
+        assert_eq!(proxy_target(b"/dns-query?dns=AAAB"), Ok(None));
     }
 
     #[test]

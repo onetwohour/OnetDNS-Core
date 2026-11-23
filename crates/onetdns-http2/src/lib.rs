@@ -1,6 +1,6 @@
 //! HTTP/2 for DoH and Oblivious DoH only, not a general HTTP/2 stack. Only what they use is
-//! implemented: the client always sends POST with application/dns-message, and neither side handles
-//! server push or priority.
+//! implemented: the client always sends POST with application/dns-message or
+//! application/oblivious-dns-message, and neither side handles server push or priority.
 
 pub mod client;
 pub mod frame;
@@ -69,7 +69,7 @@ pub enum H2Error {
     /// Reconnecting recovers.
     Closed,
 
-    /// The upstream answered with a non-200 status. Only that stream ended, so the connection stays
-    /// usable.
-    BadStatus,
+    /// The upstream answered with this non-200 status. Only that stream ended, so the connection
+    /// stays usable.
+    BadStatus(u16),
 }

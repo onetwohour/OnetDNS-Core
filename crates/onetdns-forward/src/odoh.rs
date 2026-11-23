@@ -1,10 +1,21 @@
-//! Oblivious DoH (RFC 9230) messages, for both ends: the target opens queries sealed to its key and
-//! seals the response to the same HPKE context, and the client does the reverse.
+//! Oblivious DoH (RFC 9230). The messages serve both ends: the target opens queries sealed to its
+//! key and seals the response to the same HPKE context, and the client does the reverse. The relay
+//! carries them for a proxy.
 
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use onetdns_core::MutexExt;
+use onetdns_http2::H2Error;
 use onetdns_tls::hpke::{
     self, HpkeError, PrivateKey, ReceiverContext, SenderContext, N_ENC, N_H, N_K, N_N, N_PK, N_T,
 };
+use onetdns_tls::{TlsError, TrustStore};
 use zeroize::Zeroizing;
+
+use crate::doh::{self, ConnectError, DohConn};
+use crate::{Endpoint, ForwardError};
 
 const VERSION: u16 = 0x0001;
 const QUERY: u8 = 0x01;
@@ -345,9 +356,167 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Idle target connections a relay keeps, across all targets.
+const MAX_IDLE_RELAY_CONNECTIONS: usize = 16;
+
+/// Relays ObliviousDoHMessages to targets for an ODoH proxy. Connections are shared by all clients,
+/// as RFC 9230 recommends, so a target cannot group queries by connection; a request takes one
+/// out of the pool and puts it back when the target has answered.
+pub struct Relay {
+    trust: Arc<TrustStore>,
+    idle: Mutex<Vec<((SocketAddr, String), DohConn)>>,
+}
+
+/// What the target answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Relayed {
+    /// A 200 with this ObliviousDoHMessage.
+    Message(Vec<u8>),
+    /// Any other final status.
+    Status(u16),
+}
+
+/// Why the target gave no answer, named as Proxy-Status error types (RFC 9209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayError {
+    ConnectionRefused,
+    ConnectionTimeout,
+    ConnectionTerminated,
+    TlsCertificate,
+    TlsProtocol,
+    HttpProtocol,
+    HttpResponseTimeout,
+}
+
+impl RelayError {
+    pub fn proxy_status(self) -> &'static str {
+        match self {
+            RelayError::ConnectionRefused => "connection_refused",
+            RelayError::ConnectionTimeout => "connection_timeout",
+            RelayError::ConnectionTerminated => "connection_terminated",
+            RelayError::TlsCertificate => "tls_certificate_error",
+            RelayError::TlsProtocol => "tls_protocol_error",
+            RelayError::HttpProtocol => "http_protocol_error",
+            RelayError::HttpResponseTimeout => "http_response_timeout",
+        }
+    }
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.proxy_status())
+    }
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self::with_trust(crate::system_trust())
+    }
+}
+
+impl Relay {
+    pub fn with_trust(trust: Arc<TrustStore>) -> Self {
+        Self {
+            trust,
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// POSTs `message` to the target at `https://server_name/path` on `addr`, without redirects
+    /// and without any header from the client. A pooled connection that turns out dead is replaced
+    /// once.
+    pub fn send(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        path: &str,
+        message: &[u8],
+        timeout: Duration,
+    ) -> Result<Relayed, RelayError> {
+        let deadline = crate::deadline_after(timeout);
+        let key = (addr, server_name.to_string());
+        let mut retried = false;
+        loop {
+            let pooled = {
+                let mut idle = self.idle.lock_recover();
+                let found = idle.iter().position(|(have, _)| *have == key);
+                found.map(|index| idle.swap_remove(index).1)
+            };
+            let reused = pooled.is_some();
+            let mut conn = match pooled {
+                Some(conn) => conn,
+                None => doh::connect_h2(
+                    &Endpoint::Direct(addr),
+                    server_name,
+                    deadline,
+                    &self.trust,
+                    None,
+                )
+                .map_err(relay_connect_error)?,
+            };
+            doh::arm_probe(&mut conn, deadline);
+            let result = conn
+                .client
+                .oblivious_probed(server_name, path, message, |stream| {
+                    stream.inner_mut().set_deadline(deadline)
+                });
+            let relayed = match result {
+                Ok(body) => Relayed::Message(body),
+                Err(H2Error::BadStatus(status)) => Relayed::Status(status),
+                Err(_) if reused && !retried && Instant::now() < deadline => {
+                    retried = true;
+                    continue;
+                }
+                Err(H2Error::Io) if Instant::now() >= deadline => {
+                    return Err(RelayError::HttpResponseTimeout)
+                }
+                Err(H2Error::Io | H2Error::Closed) => return Err(RelayError::ConnectionTerminated),
+                Err(H2Error::Protocol) => return Err(RelayError::HttpProtocol),
+            };
+            let mut idle = self.idle.lock_recover();
+            if idle.len() == MAX_IDLE_RELAY_CONNECTIONS {
+                idle.remove(0);
+            }
+            idle.push((key, conn));
+            return Ok(relayed);
+        }
+    }
+}
+
+fn relay_connect_error(error: ConnectError) -> RelayError {
+    match error {
+        ConnectError::Tcp(ForwardError::Timeout) => RelayError::ConnectionTimeout,
+        ConnectError::Tcp(_) => RelayError::ConnectionRefused,
+        ConnectError::Tls(
+            TlsError::BadCert
+            | TlsError::UnknownCa
+            | TlsError::CertificateExpired
+            | TlsError::CertificateUnknown,
+        )
+        | ConnectError::Revoked(_) => RelayError::TlsCertificate,
+        ConnectError::Tls(_) => RelayError::TlsProtocol,
+        ConnectError::Preface => RelayError::HttpProtocol,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_reports_a_target_it_cannot_reach() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        assert_eq!(
+            Relay::default().send(addr, "odoh.test", "/q", b"sealed", Duration::from_secs(10)),
+            Err(RelayError::ConnectionRefused)
+        );
+        assert_eq!(
+            RelayError::ConnectionRefused.proxy_status(),
+            "connection_refused"
+        );
+    }
 
     fn target() -> TargetKey {
         TargetKey::new(PrivateKey::generate())

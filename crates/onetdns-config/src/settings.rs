@@ -590,6 +590,11 @@ pub struct Config {
     /// and the key config at /.well-known/odohconfigs. Queries count as coming from the proxy.
     pub odoh_target: bool,
 
+    /// Oblivious DoH targets the DoH listeners relay to, as `https://host[:port]/path[#sni]`; empty
+    /// turns the proxy off. A proxy request whose `targethost` and `targetpath` match no entry is
+    /// refused, so the proxy never relays anywhere else.
+    pub odoh_proxy_targets: Vec<String>,
+
     /// Authentication name advertised by DDR (RFC 9462); empty disables DDR. With a name,
     /// `_dns.resolver.arpa` SVCB queries list the encrypted listeners so clients upgrade from Do53
     /// on their own. Clients verify TLS against this name, so the certificate must carry it.
@@ -1040,6 +1045,7 @@ impl Default for Config {
             dnscrypt_relay_allow_targets: vec![],
             doh_path: "/dns-query".to_string(),
             odoh_target: false,
+            odoh_proxy_targets: vec![],
             ddr_name: String::new(),
             tls_cert: None,
             tls_key: None,
@@ -1439,6 +1445,25 @@ impl Config {
                 "odoh_target needs a DoH listener in listen_doh; Oblivious DoH is served there"
                     .into(),
             );
+        }
+        if !self.odoh_proxy_targets.is_empty() && self.listen_doh.is_empty() {
+            return invalid(
+                "odoh_proxy_targets needs a DoH listener in listen_doh; the Oblivious DoH proxy runs there"
+                    .into(),
+            );
+        }
+        for (index, target) in self.odoh_proxy_targets.iter().enumerate() {
+            if !valid_odoh_proxy_target(target) {
+                return invalid(format!(
+                    "odoh_proxy_targets needs https://host[:port]/path[#sni] with the target's path: {target:?}"
+                ));
+            }
+            if self.odoh_proxy_targets[..index]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(target))
+            {
+                return invalid(format!("odoh_proxy_targets lists {target:?} twice"));
+            }
         }
         if !valid_dns_name(&self.dnscrypt_provider_name) {
             return invalid(format!(
@@ -3076,6 +3101,7 @@ impl Config {
         );
         kv("doh_path", js(&self.doh_path));
         kv("odoh_target", self.odoh_target.to_string());
+        kv("odoh_proxy_targets", sarr(&self.odoh_proxy_targets));
         kv("ddr_name", js(&self.ddr_name));
         kv("tls_cert", opt_p(&self.tls_cert));
         kv("tls_key", opt_p(&self.tls_key));
@@ -3282,6 +3308,20 @@ fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
     }
 
     !authority.chars().any(char::is_whitespace)
+}
+
+/// An `https://` upstream URL with the path proxy requests must name exactly.
+fn valid_odoh_proxy_target(raw: &str) -> bool {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    let endpoint = rest.split('#').next().unwrap_or_default();
+    let Some((_, path)) = endpoint.split_once('/') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("https")
+        && valid_upstream_spec(raw, false)
+        && valid_doh_path(&format!("/{path}"))
 }
 
 fn listener_conflicts(listeners: &[SocketAddr], target: SocketAddr) -> bool {
@@ -3706,6 +3746,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "split_recurse",
         "upstream_urls",
         "proxy_protocol_trusted",
+        "odoh_proxy_targets",
     ] {
         check_string_array(root, key)?;
     }
@@ -5403,6 +5444,7 @@ const KNOWN_KEYS: &[&str] = &[
     "dnscrypt_relay_allow_targets",
     "doh_path",
     "odoh_target",
+    "odoh_proxy_targets",
     "ddr_name",
     "tls_cert",
     "tls_key",
@@ -5775,6 +5817,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.dnscrypt_relay_allow_targets = gparsevec(root, "dnscrypt_relay_allow_targets");
     c.doh_path = gstr(root, "doh_path").unwrap_or(d.doh_path);
     c.odoh_target = gbool(root, "odoh_target", d.odoh_target);
+    c.odoh_proxy_targets = gstrvec(root, "odoh_proxy_targets");
     c.ddr_name = gstr(root, "ddr_name").unwrap_or(d.ddr_name);
     c.tls_cert = gstr(root, "tls_cert").map(PathBuf::from);
     c.tls_key = gstr(root, "tls_key").map(PathBuf::from);
@@ -6390,6 +6433,12 @@ mod tests {
             "doh_path = \"no-slash\"\n",
             "doh_path = \"/a b\"\n",
             "odoh_target = true\n",
+            "odoh_proxy_targets = [\"https://odoh.example/dns-query\"]\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example\"]\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"tls://odoh.example/q\"]\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/a b\"]\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/q?x=1\"]\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/q\", \"https://ODOH.example/q\"]\n",
             "dnscrypt_provider_name = \"\"\n",
             "dnscrypt_provider_name = \"not a name!\"\n",
             "acme_challenge = \"tls-alpn-01\"\n",
@@ -6407,6 +6456,8 @@ mod tests {
             .expect("쓸 수 있는 값은 받아들인다");
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_target = true\n")
             .expect("an ODoH target with a DoH listener");
+        Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/dns-query\", \"https://[2001:db8::1]:8443/q#odoh.example\"]\n")
+            .expect("ODoH proxy targets with a DoH listener");
     }
 
     #[test]

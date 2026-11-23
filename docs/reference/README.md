@@ -212,6 +212,7 @@ Top-level keys are indexed alphabetically below.
 
 ### O
 
+[`odoh_proxy_targets`](core.md#odoh_proxy_targets)
 [`odoh_target`](core.md#odoh_target)
 
 ### P

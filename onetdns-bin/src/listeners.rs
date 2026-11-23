@@ -13,7 +13,7 @@ use crate::atomic_file::atomic_write_secret;
 use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
-use crate::odoh::OdohTarget;
+use crate::odoh::{ObliviousDoh, OdohProxy, OdohTarget};
 use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
@@ -104,6 +104,39 @@ fn load_or_create_odoh_target(
         "Loaded the Oblivious DoH target key"
     );
     Ok(Arc::new(target))
+}
+
+/// What the DoH listeners serve of Oblivious DoH; `None` when neither role is on.
+fn open_oblivious(
+    cfg: &Config,
+    config_path: Option<&std::path::Path>,
+) -> Result<Option<Arc<ObliviousDoh>>, String> {
+    let target = if cfg.odoh_target {
+        Some(load_or_create_odoh_target(config_path)?)
+    } else {
+        None
+    };
+    let proxy = (!cfg.odoh_proxy_targets.is_empty()).then(|| {
+        OdohProxy::new(
+            &cfg.odoh_proxy_targets,
+            &cfg.bootstrap,
+            onetdns_forward::odoh::Relay::default(),
+        )
+    });
+    Ok((target.is_some() || proxy.is_some()).then(|| Arc::new(ObliviousDoh { target, proxy })))
+}
+
+/// The DoH settings fixed when a DoH listener opens.
+fn doh_listener_variant(cfg: &Config) -> String {
+    let mut variant = cfg.doh_path.clone();
+    if cfg.odoh_target {
+        variant.push_str("|odoh");
+    }
+    if !cfg.odoh_proxy_targets.is_empty() {
+        variant.push_str("|odoh-proxy=");
+        variant.push_str(&cfg.odoh_proxy_targets.join(","));
+    }
+    variant
 }
 
 enum KeyFileError {
@@ -818,14 +851,14 @@ fn reconcile_encrypted(
     let self_signed_file = crate::tls_material::self_signed_file(config_path);
     let self_signed_file = self_signed_file.as_deref();
 
-    // The DoH path and Oblivious DoH are fixed when the listener opens. The same address reopens
-    // only after the old listener is taken down.
+    // The DoH path and Oblivious DoH are fixed when the listener opens, so they are part of its key.
+    // The same address reopens only after the old listener is taken down.
     macro_rules! sync_one {
         ($field:ident, $addrs:expr, $kind:literal, $open:expr) => {{
             let mut live = set.$field.lock_recover();
             let path_part = match $kind {
-                "doh" if cfg.odoh_target => format!("{}|odoh", cfg.doh_path),
-                "doh" | "doh3" => cfg.doh_path.clone(),
+                "doh" => doh_listener_variant(cfg),
+                "doh3" => cfg.doh_path.clone(),
                 _ => String::new(),
             };
             let wanted: Vec<(String, SocketAddr)> = $addrs
@@ -892,18 +925,14 @@ fn reconcile_encrypted(
     }
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh.clone())?;
-        // Loaded only when a listener opens, so a reload that leaves DoH alone never reads it.
-        let mut odoh_target = None;
+        // Built only when a listener opens, so a reload that leaves DoH alone never reads the
+        // target key. Listeners opened together share it and the proxy's target connections.
+        let mut oblivious = None;
         sync_one!(doh, cfg.listen_doh, "doh", |addr| -> Result<_, String> {
-            let target = match (&odoh_target, cfg.odoh_target) {
-                (_, false) => None,
-                (Some(target), true) => Some(Arc::clone(target)),
-                (None, true) => {
-                    let target = load_or_create_odoh_target(config_path)?;
-                    odoh_target = Some(target.clone());
-                    Some(target)
-                }
-            };
+            if oblivious.is_none() {
+                oblivious = Some(open_oblivious(cfg, config_path)?);
+            }
+            let oblivious = oblivious.clone().flatten();
             tcp_socket(set, SocketRole::Doh, addr)
                 .and_then(|socket| {
                     doh::serve_doh(
@@ -911,7 +940,7 @@ fn reconcile_encrypted(
                         tls_cfg.clone(),
                         handler.clone(),
                         cfg.doh_path.clone(),
-                        target,
+                        oblivious,
                         set.encrypted_tcp_admission.clone(),
                         shutdown.clone(),
                     )

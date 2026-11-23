@@ -8,6 +8,23 @@ use crate::{valid_header_field, H2Error};
 /// The largest DNS message.
 const MAX_DNS_RESPONSE: usize = u16::MAX as usize;
 
+/// The media type a request carries, which a 200 response must carry back, and the body cap.
+#[derive(Clone, Copy)]
+struct Payload {
+    media_type: &'static str,
+    max_body: usize,
+}
+
+const DNS: Payload = Payload {
+    media_type: "application/dns-message",
+    max_body: MAX_DNS_RESPONSE,
+};
+
+const OBLIVIOUS: Payload = Payload {
+    media_type: crate::server::ODOH_MEDIA_TYPE,
+    max_body: crate::server::MAX_ODOH_MESSAGE,
+};
+
 /// Also advertised to the peer in SETTINGS.
 const MAX_RESPONSE_HEADERS: usize = 32 * 1024;
 
@@ -35,16 +52,19 @@ fn is_connection_specific(name: &[u8]) -> bool {
 /// duplicate pseudo-header, implementations disagree on which value counts. Interim 1xx and final
 /// responses follow the same rules, and HTTP/2 has no 101.
 ///
-/// A 200 must carry one content-type, application/dns-message, and a body within the DNS message
-/// cap. Other statuses are not read, so neither is checked: rejecting a 404 text/html here would
-/// turn a status error into a protocol error.
+/// A 200 must carry one content-type, the request's, and a body within its cap. Other statuses are
+/// not read, so neither is checked: rejecting a 404 text/html here would turn a status error into a
+/// protocol error.
 ///
 /// `None` means a rule was broken; the caller treats it as a protocol error.
-fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usize>)> {
+fn response_metadata(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    payload: Payload,
+) -> Option<(u16, Option<usize>)> {
     let mut status = None;
     let mut content_length = None;
     let mut content_types = 0usize;
-    let mut dns_content_type = false;
+    let mut expected_type = false;
     let mut regular_seen = false;
     let mut header_size = 0usize;
 
@@ -84,15 +104,15 @@ fn response_metadata(headers: &[(Vec<u8>, Vec<u8>)]) -> Option<(u16, Option<usiz
             }
         } else if name == b"content-type" {
             content_types += 1;
-            dns_content_type = value.eq_ignore_ascii_case(b"application/dns-message");
+            expected_type = value.eq_ignore_ascii_case(payload.media_type.as_bytes());
         }
     }
 
     let status = status?;
     if status == 200
         && (content_types != 1
-            || !dns_content_type
-            || content_length.is_some_and(|length| length > MAX_DNS_RESPONSE))
+            || !expected_type
+            || content_length.is_some_and(|length| length > payload.max_body))
     {
         return None;
     }
@@ -171,7 +191,7 @@ impl<S: Read + Write> H2Client<S> {
         path: &str,
         dns_wire: &[u8],
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, dns_wire, false, |_| {})
+        self.query_inner(authority, path, dns_wire, DNS, false, |_| {})
     }
 
     /// Sends a PING with the query for a two-stage deadline. A reused connection may be dead, and
@@ -185,7 +205,19 @@ impl<S: Read + Write> H2Client<S> {
         dns_wire: &[u8],
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, dns_wire, true, on_alive)
+        self.query_inner(authority, path, dns_wire, DNS, true, on_alive)
+    }
+
+    /// `query_probed` for an ObliviousDoHMessage. A non-200 status comes back as
+    /// `H2Error::BadStatus` with its code, which an ODoH client acts on: 401 means a stale key.
+    pub fn oblivious_probed(
+        &mut self,
+        authority: &str,
+        path: &str,
+        message: &[u8],
+        on_alive: impl FnOnce(&mut S),
+    ) -> Result<Vec<u8>, H2Error> {
+        self.query_inner(authority, path, message, OBLIVIOUS, true, on_alive)
     }
 
     fn query_inner(
@@ -193,6 +225,7 @@ impl<S: Read + Write> H2Client<S> {
         authority: &str,
         path: &str,
         dns_wire: &[u8],
+        payload: Payload,
         probe: bool,
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
@@ -204,8 +237,8 @@ impl<S: Read + Write> H2Client<S> {
             (":scheme", "https"),
             (":authority", authority),
             (":path", path),
-            ("accept", "application/dns-message"),
-            ("content-type", "application/dns-message"),
+            ("accept", payload.media_type),
+            ("content-type", payload.media_type),
             ("content-length", &clen),
         ];
 
@@ -246,7 +279,7 @@ impl<S: Read + Write> H2Client<S> {
             send_frame(&mut self.stream, frame_type::PING, 0, 0, &ping_token)?;
         }
 
-        self.read_response(sid, ping_token, on_alive)
+        self.read_response(sid, ping_token, payload, on_alive)
     }
 
     /// Errors past 31 bits, which would enter the reserved bit; wrapping around would reuse old IDs
@@ -328,6 +361,7 @@ impl<S: Read + Write> H2Client<S> {
         &mut self,
         sid: u32,
         ping_token: [u8; 8],
+        expected: Payload,
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
         let mut body = Vec::new();
@@ -441,7 +475,8 @@ impl<S: Read + Write> H2Client<S> {
                         }
                         return complete_body(body, content_length);
                     }
-                    let (status, length) = response_metadata(&hs).ok_or(H2Error::Protocol)?;
+                    let (status, length) =
+                        response_metadata(&hs, expected).ok_or(H2Error::Protocol)?;
                     match status {
                         // An interim response only delays the final one: it has no body and does
                         // not end the stream.
@@ -460,7 +495,7 @@ impl<S: Read + Write> H2Client<S> {
                             if !end_stream {
                                 self.cancel(sid)?;
                             }
-                            return Err(H2Error::BadStatus);
+                            return Err(H2Error::BadStatus(status));
                         }
                     }
                 }
@@ -469,7 +504,7 @@ impl<S: Read + Write> H2Client<S> {
                         return Err(H2Error::Protocol);
                     }
                     let data = strip_padding(&payload, h.flags)?;
-                    if body.len().saturating_add(data.len()) > MAX_DNS_RESPONSE {
+                    if body.len().saturating_add(data.len()) > expected.max_body {
                         return Err(H2Error::Protocol);
                     }
                     body.extend_from_slice(data);
@@ -530,18 +565,18 @@ mod tests {
             (b":status", b"200"),
             (b"content-type", b"application/dns-message"),
         ];
-        assert!(response_metadata(&owned_headers(&duplicate)).is_none());
+        assert!(response_metadata(&owned_headers(&duplicate), DNS).is_none());
 
         let bad_type: [(&[u8], &[u8]); 2] =
             [(b":status", b"200"), (b"content-type", b"text/plain")];
-        assert!(response_metadata(&owned_headers(&bad_type)).is_none());
+        assert!(response_metadata(&owned_headers(&bad_type), DNS).is_none());
 
         let two_types = owned_headers(&[
             (b":status", b"200"),
             (b"content-type", b"application/dns-message"),
             (b"content-type", b"application/dns-message"),
         ]);
-        assert!(response_metadata(&two_types).is_none());
+        assert!(response_metadata(&two_types, DNS).is_none());
 
         let oversized = (MAX_DNS_RESPONSE + 1).to_string();
         let oversized_headers = owned_headers(&[
@@ -549,14 +584,39 @@ mod tests {
             (b"content-type", b"application/dns-message"),
             (b"content-length", oversized.as_bytes()),
         ]);
-        assert!(response_metadata(&oversized_headers).is_none());
+        assert!(response_metadata(&oversized_headers, DNS).is_none());
+    }
+
+    #[test]
+    /// An ODoH request takes back only its own media type, within the ObliviousDoHMessage cap.
+    fn oblivious_responses_carry_their_own_media_type() {
+        let dns_typed = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/dns-message"),
+        ]);
+        assert!(response_metadata(&dns_typed, OBLIVIOUS).is_none());
+
+        let largest = crate::server::MAX_ODOH_MESSAGE.to_string();
+        let message = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/oblivious-dns-message"),
+            (b"content-length", largest.as_bytes()),
+        ]);
+        assert_eq!(
+            response_metadata(&message, OBLIVIOUS),
+            Some((200, Some(crate::server::MAX_ODOH_MESSAGE)))
+        );
+        assert!(
+            response_metadata(&message, DNS).is_none(),
+            "a DoH query must not take an ODoH message for an answer"
+        );
     }
 
     #[test]
     /// Rejecting them would turn a status error into a protocol error.
     fn error_status_is_not_judged_as_a_dns_answer() {
         let html = owned_headers(&[(b":status", b"404"), (b"content-type", b"text/html")]);
-        assert_eq!(response_metadata(&html), Some((404, None)));
+        assert_eq!(response_metadata(&html, DNS), Some((404, None)));
 
         let page_length = (MAX_DNS_RESPONSE + 1).to_string();
         let long_page = owned_headers(&[
@@ -565,12 +625,12 @@ mod tests {
             (b"content-length", page_length.as_bytes()),
         ]);
         assert_eq!(
-            response_metadata(&long_page),
+            response_metadata(&long_page, DNS),
             Some((404, Some(MAX_DNS_RESPONSE + 1)))
         );
 
         let bare = owned_headers(&[(b":status", b"503")]);
-        assert_eq!(response_metadata(&bare), Some((503, None)));
+        assert_eq!(response_metadata(&bare, DNS), Some((503, None)));
     }
 
     #[test]
@@ -589,7 +649,7 @@ mod tests {
                 (frame_type::DATA, flags::END_STREAM, 1, page),
             ],
         );
-        assert!(matches!(result, Err(H2Error::BadStatus)), "{result:?}");
+        assert!(matches!(result, Err(H2Error::BadStatus(404))), "{result:?}");
     }
 
     #[test]
@@ -606,12 +666,15 @@ mod tests {
         ] {
             let mut headers = owned_headers(&valid);
             headers.push((name.to_vec(), value.to_vec()));
-            assert!(response_metadata(&headers).is_none(), "{name:?}: {value:?}");
+            assert!(
+                response_metadata(&headers, DNS).is_none(),
+                "{name:?}: {value:?}"
+            );
         }
 
         let mut bad_length = owned_headers(&valid);
         bad_length.push((b"content-length".to_vec(), b"+3".to_vec()));
-        assert!(response_metadata(&bad_length).is_none());
+        assert!(response_metadata(&bad_length, DNS).is_none());
     }
 
     #[test]
@@ -944,7 +1007,7 @@ mod tests {
 
         let mut client = H2Client::connect(deadline_connect(addr)).unwrap();
         let first = client.query("dns.test", "/dns-query", b"one");
-        assert!(matches!(first, Err(H2Error::BadStatus)), "{first:?}");
+        assert!(matches!(first, Err(H2Error::BadStatus(_))), "{first:?}");
         let second = client.query("dns.test", "/dns-query", b"two");
         assert!(
             matches!(&second, Ok(body) if body == b"answer"),
@@ -998,7 +1061,7 @@ mod tests {
 
         let mut client = H2Client::connect(deadline_connect(addr)).unwrap();
         let result = client.query("dns.test", "/dns-query", b"query");
-        assert!(matches!(result, Err(H2Error::BadStatus)), "{result:?}");
+        assert!(matches!(result, Err(H2Error::BadStatus(_))), "{result:?}");
         drop(client);
         let received = server.join().unwrap();
         assert!(
@@ -1225,7 +1288,7 @@ mod tests {
         let mut client = H2Client::connect(tcp).unwrap();
         let q = vec![0x00, 0x01, 0x02, 0x03];
         let res = client.query("dns.test", "/wrong-path", &q);
-        assert!(matches!(res, Err(H2Error::BadStatus)));
+        assert!(matches!(res, Err(H2Error::BadStatus(_))));
         drop(client);
         server.join().ok();
     }

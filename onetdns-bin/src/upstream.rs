@@ -8,7 +8,7 @@ use std::time::Duration;
 use onetdns_config::Config;
 use onetdns_forward::{Endpoint, Socks5Proxy, Upstream};
 
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How a forwarder reaches its upstreams.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,13 +152,25 @@ pub fn url_uses_hostname(url: &str) -> bool {
     !host.is_empty() && host.parse::<IpAddr>().is_err()
 }
 
+/// An upstream URL before its host is resolved. A URL without a scheme is plain DNS.
+pub(crate) struct UpstreamUrl<'a> {
+    pub(crate) scheme: String,
+    pub(crate) host: &'a str,
+    pub(crate) port: Option<u16>,
+    pub(crate) path: Option<String>,
+    pub(crate) sni: Option<String>,
+}
+
+impl UpstreamUrl<'_> {
+    pub(crate) fn server_name(&self) -> String {
+        self.sni.clone().unwrap_or_else(|| self.host.to_string())
+    }
+}
+
 /// None for an unknown scheme, a malformed URL, a hostname without bootstrap servers, or a scheme
 /// the route cannot carry.
 fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
     let url = url.trim();
-    if url.is_empty() || url.chars().any(char::is_control) {
-        return None;
-    }
     if url.starts_with("sdns://") {
         if matches!(route, UpstreamRoute::Socks5(_)) {
             return None;
@@ -170,6 +182,68 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
             stamp.public_key,
             stamp.relay,
         ));
+    }
+    let parsed = parse_upstream_url(url)?;
+    let port = parsed.port;
+    let sni = || parsed.server_name();
+    let doh_path = || {
+        parsed
+            .path
+            .clone()
+            .unwrap_or_else(|| "/dns-query".to_string())
+    };
+    let bootstrap = match route {
+        UpstreamRoute::Direct { bootstrap } => bootstrap,
+        UpstreamRoute::Socks5(proxy) => {
+            return match parsed.scheme.as_str() {
+                "tls" => Some(Upstream::dot_via(
+                    Arc::clone(proxy),
+                    parsed.host,
+                    port.unwrap_or(853),
+                    sni(),
+                )),
+                "https" => Some(Upstream::doh_via(
+                    Arc::clone(proxy),
+                    parsed.host,
+                    port.unwrap_or(443),
+                    sni(),
+                    doh_path(),
+                )),
+                _ => None,
+            };
+        }
+    };
+    let ip = resolve_host(parsed.host, bootstrap)?;
+    match parsed.scheme.as_str() {
+        "udp" => Some(Upstream::udp(SocketAddr::new(ip, port.unwrap_or(53)))),
+        "tcp" => Some(Upstream::tcp(SocketAddr::new(ip, port.unwrap_or(53)))),
+        "tls" => Some(Upstream::dot(
+            SocketAddr::new(ip, port.unwrap_or(853)),
+            sni(),
+        )),
+        "https" => Some(Upstream::doh(
+            SocketAddr::new(ip, port.unwrap_or(443)),
+            sni(),
+            doh_path(),
+        )),
+        "quic" => Some(Upstream::doq(
+            SocketAddr::new(ip, port.unwrap_or(853)),
+            sni(),
+        )),
+        "h3" => Some(Upstream::doh3(
+            SocketAddr::new(ip, port.unwrap_or(443)),
+            sni(),
+            doh_path(),
+        )),
+        _ => None,
+    }
+}
+
+/// None for a malformed URL. The scheme is lowercased but not checked.
+pub(crate) fn parse_upstream_url(url: &str) -> Option<UpstreamUrl<'_>> {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return None;
     }
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (s.to_ascii_lowercase(), r),
@@ -214,53 +288,13 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
     if host.trim().is_empty() {
         return None;
     }
-    let sni = || sni.clone().unwrap_or_else(|| host.to_string());
-    let doh_path = || path.clone().unwrap_or_else(|| "/dns-query".to_string());
-    let bootstrap = match route {
-        UpstreamRoute::Direct { bootstrap } => bootstrap,
-        UpstreamRoute::Socks5(proxy) => {
-            return match scheme.as_str() {
-                "tls" => Some(Upstream::dot_via(
-                    Arc::clone(proxy),
-                    host,
-                    port.unwrap_or(853),
-                    sni(),
-                )),
-                "https" => Some(Upstream::doh_via(
-                    Arc::clone(proxy),
-                    host,
-                    port.unwrap_or(443),
-                    sni(),
-                    doh_path(),
-                )),
-                _ => None,
-            };
-        }
-    };
-    let ip = resolve_host(host, bootstrap)?;
-    match scheme.as_str() {
-        "udp" => Some(Upstream::udp(SocketAddr::new(ip, port.unwrap_or(53)))),
-        "tcp" => Some(Upstream::tcp(SocketAddr::new(ip, port.unwrap_or(53)))),
-        "tls" => Some(Upstream::dot(
-            SocketAddr::new(ip, port.unwrap_or(853)),
-            sni(),
-        )),
-        "https" => Some(Upstream::doh(
-            SocketAddr::new(ip, port.unwrap_or(443)),
-            sni(),
-            doh_path(),
-        )),
-        "quic" => Some(Upstream::doq(
-            SocketAddr::new(ip, port.unwrap_or(853)),
-            sni(),
-        )),
-        "h3" => Some(Upstream::doh3(
-            SocketAddr::new(ip, port.unwrap_or(443)),
-            sni(),
-            doh_path(),
-        )),
-        _ => None,
-    }
+    Some(UpstreamUrl {
+        scheme,
+        host,
+        port,
+        path,
+        sni,
+    })
 }
 
 fn resolve_host(host: &str, bootstrap: &[IpAddr]) -> Option<IpAddr> {

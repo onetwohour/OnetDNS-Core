@@ -250,6 +250,22 @@ odoh_target = true
 
 Answers Oblivious DoH (RFC 9230) on the `listen_doh` listeners: encrypted queries an ODoH proxy POSTs to `doh_path`, and the key configuration at `/.well-known/odohconfigs`. Requires `listen_doh`; DoH3 does not serve Oblivious DoH. The key is created on first use as `odoh-target.key` next to the configuration file and kept across restarts. Queries arrive from the proxy's address, so client policy, ACLs, rate limits and the query log all see the proxy, not the client behind it. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
 
+### `odoh_proxy_targets`
+
+**Type:** array  
+**Default:** `[]`
+
+**TOML:**
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+odoh_proxy_targets = ["https://odoh.example.net/dns-query"]
+```
+
+Makes the `listen_doh` listeners an Oblivious DoH proxy for these targets, each written as `https://host[:port]/path`, with `#name` to set the TLS server name as in `upstream_urls`. A client names the target in the `targethost` and `targetpath` query parameters of a POST to `doh_path`; a request for a host, port or path not listed gets HTTP 403, so the proxy relays nowhere else. Empty, the default, turns the proxy off. Requires `listen_doh`.
+
+The proxy cannot read what it relays. The relayed messages are not in the query log; the ACL and rate limits still apply to the client that sends them. Each target sees every relayed query as coming from this server. A target given by hostname is looked up through `bootstrap` when first used and again when its TTL runs out; the bootstrap servers are those in effect when the DoH listener opened. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
+
 ### `proxy_protocol_ports`
 
 **Type:** array  
