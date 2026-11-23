@@ -137,3 +137,34 @@ impl HandshakeReader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(len: usize) -> Vec<u8> {
+        let len = u32::try_from(len).unwrap().to_be_bytes();
+        vec![HandshakeType::Certificate.0, len[1], len[2], len[3]]
+    }
+
+    #[test]
+    /// A length past the cap fails on the four header bytes, so the reader never buffers toward
+    /// it; one at the cap waits for its body.
+    fn handshake_length_past_the_cap_fails_on_the_header() {
+        let mut at_cap = HandshakeReader::new();
+        at_cap.feed(&header(MAX_HANDSHAKE_MESSAGE));
+        assert_eq!(
+            at_cap.next_message(),
+            Ok(None),
+            "상한 안의 메시지를 기다리지 않았습니다"
+        );
+
+        let mut past_cap = HandshakeReader::new();
+        past_cap.feed(&header(MAX_HANDSHAKE_MESSAGE + 1));
+        assert_eq!(
+            past_cap.next_message(),
+            Err(TlsError::IllegalParameter),
+            "상한을 넘는 길이를 받아들였습니다"
+        );
+    }
+}
