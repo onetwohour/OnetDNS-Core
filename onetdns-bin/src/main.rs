@@ -3676,6 +3676,112 @@ mod tests {
     }
 
     #[test]
+    /// RFC 9539 resolvers ask authoritative servers on DoT and DoQ without checking the
+    /// certificate; zones served here must answer there as they do over Do53.
+    fn local_zones_answer_opportunistic_dot_and_doq() {
+        use onetdns_forward::{AuthorityTransport, Encryption};
+        use onetdns_proto::{Message, Name, RData, RecordType};
+
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-adot-zone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zone_file = dir.join("adot.test.zone");
+        std::fs::write(
+            &zone_file,
+            "@ 300 IN SOA ns admin 1 7200 3600 1209600 3600\n\
+             @ 300 IN NS ns\n\
+             ns 300 IN A 192.0.2.53\n\
+             www 300 IN A 192.0.2.10\n",
+        )
+        .unwrap();
+
+        let dot = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let doq = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.listen = vec![tcp_udp_test_listeners().2];
+        cfg.listen_dot = vec![dot];
+        cfg.listen_doq = vec![doq];
+        cfg.tls_self_signed_host = Some("localhost".to_string());
+        cfg.upstream_urls = vec!["udp://192.0.2.1:53".to_string()];
+        cfg.release_check = false;
+        cfg.zones = vec![onetdns_config::ZoneConfig {
+            origin: "adot.test".to_string(),
+            file: Some(zone_file),
+            ..Default::default()
+        }];
+        cfg.workers = 1;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = {
+            let (stop, ready) = (stop.clone(), ready.clone());
+            std::thread::spawn(move || {
+                serve(
+                    cfg,
+                    None,
+                    None,
+                    ServeShared::default(),
+                    Some(stop),
+                    Some(Box::new(move || {
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst)
+                    })),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            if generation.is_finished() {
+                panic!(
+                    "the generation ended: {:?}",
+                    generation.join().unwrap().err()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the generation did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let query = Message::query(
+            0x5353,
+            Name::from_str("www.adot.test").unwrap(),
+            RecordType::A,
+        );
+        for (endpoint, encryption) in [(dot, Encryption::Dot), (doq, Encryption::Doq)] {
+            let response = onetdns_forward::query_server_over(
+                endpoint,
+                &query,
+                Duration::from_secs(5),
+                AuthorityTransport::Encrypted(encryption),
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{encryption:?}: {error:?}"));
+            assert!(response.header.authoritative, "{encryption:?}");
+            assert_eq!(
+                response.answers.first().map(|record| &record.rdata),
+                Some(&RData::A("192.0.2.10".parse().unwrap())),
+                "{encryption:?}"
+            );
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        generation.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn occupied_control_listener_fails_before_readiness() {
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let occupied_addr = occupied.local_addr().unwrap();
