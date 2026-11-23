@@ -1519,4 +1519,109 @@ mod tests {
         table.remove(b"second");
         assert!(table.clients.allows("2001:db8::ffff:3".parse().unwrap()));
     }
+
+    #[test]
+    /// A connection idle for IDLE_TIMEOUT goes with its aliases, its client count and its memory
+    /// share; one idle for just under it stays.
+    fn idle_sweep_drops_stale_connections_with_all_their_state() {
+        let budget = Arc::new(QuicMemoryBudget::default());
+        let stale_peer: SocketAddr = "192.0.2.1:4433".parse().unwrap();
+        let recent_peer: SocketAddr = "192.0.2.2:4433".parse().unwrap();
+        let now = Instant::now();
+        let ago = |idle: Duration| now.checked_sub(idle).expect("시계가 너무 이릅니다");
+
+        let (_stale_client, stale) = handshaked_pair(b"doq");
+        let mut table = conn_table::<Probe>(stale, stale_peer, budget.clone(), 0);
+        table.conns.get_mut(SERVER_KEY).unwrap().last = ago(IDLE_TIMEOUT);
+        table
+            .aliases
+            .insert(b"stale-alias".to_vec(), SERVER_KEY.to_vec());
+        let (_recent_client, recent) = handshaked_pair(b"doq");
+        table.insert(
+            b"recent".to_vec(),
+            b"recent".to_vec(),
+            ConnEntry {
+                state: ConnState::Open(recent),
+                peer: recent_peer,
+                last: ago(IDLE_TIMEOUT - Duration::from_secs(1)),
+                epoch: 8,
+                inflight: 0,
+                memory: QuicMemoryLease::try_new(budget.clone()).unwrap(),
+            },
+        );
+        table.clients = ClientCounts::new(1, 4);
+        for entry in table.conns.values() {
+            table.clients.add(entry.peer.ip());
+        }
+        assert!(
+            !table.clients.allows(stale_peer.ip()),
+            "대조군이 무효입니다. 오래 쉰 연결이 클라이언트 몫을 잡지 않았습니다"
+        );
+
+        table.evict_idle();
+        assert_eq!(
+            table.conns.keys().cloned().collect::<Vec<_>>(),
+            vec![b"recent".to_vec()],
+            "오래 쉰 연결만 버려야 합니다"
+        );
+        assert_eq!(
+            table.aliases.values().cloned().collect::<Vec<_>>(),
+            vec![b"recent".to_vec()],
+            "버린 연결의 별칭이 남았습니다"
+        );
+        assert!(
+            table.clients.allows(stale_peer.ip()),
+            "버린 연결의 클라이언트 몫이 남았습니다"
+        );
+        assert!(!table.clients.allows(recent_peer.ip()));
+        assert_eq!(
+            budget.used_bytes(),
+            crate::quic_memory::QUIC_CONNECTION_BASE_CHARGE,
+            "버린 연결의 메모리 몫이 남았습니다"
+        );
+    }
+
+    #[test]
+    /// A peer that opens every stream it may, leaves each request unfinished and goes quiet loses
+    /// the connection at the idle deadline, with every share it held.
+    fn quiet_peer_with_unfinished_streams_is_dropped_at_the_idle_deadline() {
+        let (mut client, server) = handshaked_pair(b"doq");
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = client_socket.local_addr().unwrap();
+        let budget = Arc::new(QuicMemoryBudget::default());
+        let mut listener = listener_with(
+            Probe::default(),
+            conn_table(server, peer, budget.clone(), 0),
+        );
+        let before = budget.used_bytes();
+
+        // The length prefix asks for far more than follows.
+        let unfinished = [0xff; 32];
+        let streams = TransportParams::server_defaults().initial_max_streams_bidi;
+        for index in 0..streams {
+            client.send_stream(index * 4, &unfinished, false).unwrap();
+        }
+        while let Some(datagram) = client.next_datagram() {
+            listener.on_datagram(&datagram, peer, &mut None);
+        }
+        assert!(
+            budget.used_bytes() >= before + streams as usize * unfinished.len(),
+            "대조군이 무효입니다. 끝나지 않은 요청이 메모리 몫에 잡히지 않았습니다"
+        );
+
+        listener.table.drive_timeouts(&listener.socket, 60_000);
+        assert!(
+            listener.table.conns.is_empty(),
+            "쉬는 시간이 지난 연결이 남았습니다"
+        );
+        assert!(
+            listener.table.aliases.is_empty(),
+            "버린 연결의 별칭이 남았습니다"
+        );
+        assert!(
+            listener.table.clients.is_empty(),
+            "버린 연결의 클라이언트 몫이 남았습니다"
+        );
+        assert_eq!(budget.used_bytes(), 0, "버린 연결의 메모리 몫이 남았습니다");
+    }
 }
