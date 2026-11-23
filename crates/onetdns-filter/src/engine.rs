@@ -1454,16 +1454,7 @@ impl BlockEngine {
 
 impl FilterEngine for BlockEngine {
     fn verdict(&self, name: &Name, qtype: RecordType, client: &ClientInfo) -> FilterVerdict {
-        if !self.has_verdict_rules {
-            return FilterVerdict::Allow;
-        }
-        let mut buf = [0u8; MAX_NAME];
-        let key = match normalize_into(name, &mut buf) {
-            Some(k) => k,
-            None => return FilterVerdict::Allow,
-        };
-
-        self.classify(&key, qtype, client, self.track_hits).0
+        self.verdict_counting(name, qtype, client, self.track_hits)
     }
 
     /// Also tells which stage matched and on what.
@@ -1493,6 +1484,34 @@ impl FilterEngine for BlockEngine {
 }
 
 impl BlockEngine {
+    /// `verdict` without counting a rule hit, for a check after which the query may still go to
+    /// the path that applies the verdict and counts it.
+    pub fn verdict_uncounted(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        client: &ClientInfo,
+    ) -> FilterVerdict {
+        self.verdict_counting(name, qtype, client, false)
+    }
+
+    fn verdict_counting(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        client: &ClientInfo,
+        count: bool,
+    ) -> FilterVerdict {
+        if !self.has_verdict_rules {
+            return FilterVerdict::Allow;
+        }
+        let mut buf = [0u8; MAX_NAME];
+        let Some(key) = normalize_into(name, &mut buf) else {
+            return FilterVerdict::Allow;
+        };
+        self.classify(&key, qtype, client, count).0
+    }
+
     /// `verdict` with the stage, rule, and list behind it from the same lookup. The rule and list
     /// are filled in only for a verdict other than Allow, so allowed queries still do not allocate.
     pub fn verdict_with_rule(
@@ -2444,7 +2463,11 @@ mod tests {
         );
 
         eng.explain(&name("x.ads.example.com."), RecordType::A, &client());
+        eng.verdict_uncounted(&name("x.ads.example.com."), RecordType::A, &client());
         assert_eq!(eng.top_rule_hits(10)[0], ("ads.example.com".to_string(), 3));
+
+        eng.verdict_with_rule(&name("x.ads.example.com."), RecordType::A, &client());
+        assert_eq!(eng.top_rule_hits(10)[0], ("ads.example.com".to_string(), 4));
     }
 
     #[test]

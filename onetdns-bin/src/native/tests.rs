@@ -6414,3 +6414,68 @@ fn harden_large_queries_drops_oversized() {
         "한도 이하 질의는 정상 처리"
     );
 }
+
+#[test]
+/// A fast path that hands a query on must not count its rule; the path that answers does. Counting
+/// in both would show each blocked or allowlisted query twice.
+fn each_answered_query_counts_its_rule_once() {
+    use onetdns_runtime::WireDisposition;
+
+    let (backend, cache) = fixed_answer_cache();
+    let engine = onetdns_filter::build_from_str(
+        "||blocked.example^\n@@||allowed.example^",
+        "",
+        BlockResponse::NxDomain,
+    )
+    .with_hit_tracking(true);
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(engine)),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_wire_fast_path(Some((
+        crate::wirecache::WireEntryFactory::new(0, 86_400),
+        cache,
+    )));
+    let hits = |rule: &str| {
+        server
+            .filter
+            .load()
+            .top_rule_hits(10)
+            .into_iter()
+            .find(|(name, _)| name == rule)
+            .map_or(0, |(_, hits)| hits)
+    };
+    let wire = |name: &str| {
+        let request = Message::query(0x0202, ApName::from_str(name).unwrap(), ApRt::A);
+        let mut out = onetdns_proto::Writer::with_limit(1232);
+        let disposition = server.handle_udp_wire(
+            &request.try_encode().unwrap(),
+            &ctx(),
+            &mut out,
+            Instant::now(),
+        );
+        (request, disposition)
+    };
+
+    let (blocked, disposition) = wire("blocked.example");
+    assert_eq!(disposition, WireDisposition::Fallback);
+    let response = server.handle(&blocked, &ctx()).unwrap();
+    assert_eq!(response.header.rcode, ResponseCode::NXDomain.0);
+    assert_eq!(hits("blocked.example"), 1);
+
+    assert_eq!(
+        wire("allowed.example").1,
+        WireDisposition::Respond,
+        "the miss is resolved through the full path"
+    );
+    assert_eq!(hits("allowed.example"), 1);
+    assert_eq!(
+        wire("allowed.example").1,
+        WireDisposition::Respond,
+        "the stored answer is sent from the fast path"
+    );
+    assert_eq!(hits("allowed.example"), 2);
+}

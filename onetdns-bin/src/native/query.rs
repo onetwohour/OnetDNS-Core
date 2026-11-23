@@ -887,7 +887,7 @@ impl NativeServer {
             clear_dnssec_assertion(&mut resp);
         }
 
-        match Self::cname_uncloak(filter, &resp.answers, &scope.client) {
+        match Self::cname_uncloak(filter, &resp.answers, &scope.client, true) {
             Some(CloakedBlock::Respond(br)) => {
                 self.rec_rc(
                     &scope.client,

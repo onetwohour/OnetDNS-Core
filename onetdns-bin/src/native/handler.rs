@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use onetdns_control::Action;
-use onetdns_core::{AclDecision, FilterEngine, FilterVerdict, RateDecision};
+use onetdns_core::{AclDecision, FilterVerdict, RateDecision};
 #[cfg(unix)]
 use onetdns_proto::Edns;
 use onetdns_proto::{DnsClass, Message, Name as ApName, RecordType as ApRt, ResponseCode};
@@ -275,7 +275,7 @@ impl Handler for NativeServer {
                 return R::Fallback;
             }
             if !matches!(
-                filter.verdict(&request.questions[0].name, qtype, &client),
+                filter.verdict_uncounted(&request.questions[0].name, qtype, &client),
                 FilterVerdict::Allow
             ) {
                 return R::Fallback;
@@ -288,7 +288,7 @@ impl Handler for NativeServer {
             .or_else(|| runtime.cache.lane_failure(&request))
         {
             if !filter.is_trivially_allow()
-                && Self::cname_uncloak(&filter, &resp.answers, &client).is_some()
+                && Self::cname_uncloak(&filter, &resp.answers, &client, false).is_some()
             {
                 return R::Fallback;
             }
@@ -316,6 +316,8 @@ impl Handler for NativeServer {
                 self.rec_final_answer(&client, qname, qtype, &resp);
                 self.rec_latency(&client, Some(qname), timer.elapsed_us());
             }
+            let qname = &request.questions[0].name;
+            Self::count_fast_answer(&filter, qname, qtype, &client, &resp.answers);
             return R::Respond;
         }
 
@@ -358,6 +360,14 @@ impl Handler for NativeServer {
                 request.header.checking_disabled,
             ) {
                 SubmitOutcome::Accepted | SubmitOutcome::Merged => {
+                    // The completion counts the CNAME chain.
+                    Self::count_fast_answer(
+                        &filter,
+                        &request.questions[0].name,
+                        qtype,
+                        &client,
+                        &[],
+                    );
                     st.next = st.next.wrapping_add(1);
                     if let Some(recorder) = self.events() {
                         recorder.record_cache(false);
@@ -564,7 +574,7 @@ impl NativeServer {
                 }
 
                 if let Some(name) = &qname {
-                    match filter.verdict(name, ApRt(scanned.qtype), &client) {
+                    match filter.verdict_uncounted(name, ApRt(scanned.qtype), &client) {
                         FilterVerdict::Allow => {}
                         _ => return Wire::Fallback,
                     }
@@ -577,6 +587,10 @@ impl NativeServer {
                 }
             }
             entry.emit_at_age(&scanned, elapsed_secs, out);
+            // Stored answers passed the CNAME check when they were stored.
+            if let Some(name) = &qname {
+                Self::count_fast_answer(&filter, name, ApRt(scanned.qtype), &client, &[]);
+            }
             if let Some(recorder) = events {
                 let (log, stat) = filter.client_log_stat(&client);
                 recorder.record_cache(true);
@@ -618,7 +632,7 @@ impl NativeServer {
                 return Wire::Fallback;
             };
             matches!(
-                filter.verdict(&qname, ApRt(scanned.qtype), &client),
+                filter.verdict_uncounted(&qname, ApRt(scanned.qtype), &client),
                 FilterVerdict::Allow
             )
         };

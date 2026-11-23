@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use onetdns_control::Action;
-use onetdns_core::{ClientInfo, FilterEngine, FilterVerdict, MutexExt};
+use onetdns_core::{ClientInfo, FilterVerdict, MutexExt};
 use onetdns_proto::{Edns, Message, ResponseCode};
 use onetdns_runtime::RequestCtx;
 
@@ -311,7 +311,7 @@ impl NativeServer {
             runtime.cache.store(cl.epoch, req, &resp);
 
             let uncloaked = (!filter.is_trivially_allow())
-                .then(|| Self::cname_uncloak(&filter, &resp.answers, &cl.client))
+                .then(|| Self::cname_uncloak(&filter, &resp.answers, &cl.client, true))
                 .flatten();
             let blocked = uncloaked.is_some();
             let q = &req.questions[0];
@@ -355,7 +355,7 @@ impl NativeServer {
                     || (!filter.has_client_specific_rules()
                         && !filter.client_safe_search(&cl.client).unwrap_or(false)
                         && matches!(
-                            filter.verdict(
+                            filter.verdict_uncounted(
                                 &req.questions[0].name,
                                 req.questions[0].qtype,
                                 &cl.client

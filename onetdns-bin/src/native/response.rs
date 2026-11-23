@@ -58,14 +58,22 @@ impl NativeServer {
     /// Checks the CNAME chain for blocked names; checking only the end lets a name slip through
     /// behind an alias. A block on a hidden name applies to the original query as is. A drop rule
     /// drops the original query too, or one alias would get an answer for a name meant to get none.
+    ///
+    /// `count` is false for a check after which the query may still go to a path that counts.
     pub(crate) fn cname_uncloak(
         engine: &BlockEngine,
         answers: &[ApRecord],
         client: &ClientInfo,
+        count: bool,
     ) -> Option<CloakedBlock> {
         for rec in answers {
             if let ApRData::Cname(cn) = &rec.rdata {
-                match engine.verdict(cn, ApRt::CNAME, client) {
+                let verdict = if count {
+                    engine.verdict(cn, ApRt::CNAME, client)
+                } else {
+                    engine.verdict_uncounted(cn, ApRt::CNAME, client)
+                };
+                match verdict {
                     FilterVerdict::Block(br) => return Some(CloakedBlock::Respond(br)),
                     FilterVerdict::Drop => return Some(CloakedBlock::Drop),
                     FilterVerdict::Allow | FilterVerdict::Rewrite(_) => {}
@@ -73,6 +81,22 @@ impl NativeServer {
             }
         }
         None
+    }
+
+    /// A fast path checks without counting, since it may still hand the query on; when it answers
+    /// by itself, it counts here the rules it applied.
+    pub(crate) fn count_fast_answer(
+        engine: &BlockEngine,
+        qname: &ApName,
+        qtype: ApRt,
+        client: &ClientInfo,
+        answers: &[ApRecord],
+    ) {
+        if !engine.hits_enabled() {
+            return;
+        }
+        engine.verdict(qname, qtype, client);
+        Self::cname_uncloak(engine, answers, client, true);
     }
 
     pub(crate) fn rpz_ip_check(
