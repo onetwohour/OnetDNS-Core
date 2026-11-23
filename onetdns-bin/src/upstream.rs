@@ -4,7 +4,7 @@
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use onetdns_forward::Upstream;
+use onetdns_forward::{Endpoint, Upstream};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -15,19 +15,24 @@ pub fn ensure_not_listener(
     listeners: &[SocketAddr],
     label: &str,
 ) -> Result<(), String> {
-    if let Some(upstream) = upstreams.iter().find(|upstream| {
-        listeners.iter().any(|listener| {
-            onetdns_config::dns_endpoint_conflicts(*listener, upstream.addr)
-                || listener.port() == upstream.addr.port()
+    let direct = upstreams
+        .iter()
+        .filter_map(|upstream| match upstream.endpoint {
+            Endpoint::Direct(addr) => Some(addr),
+            Endpoint::Socks5 { .. } => None,
+        });
+    for addr in direct {
+        if listeners.iter().any(|listener| {
+            onetdns_config::dns_endpoint_conflicts(*listener, addr)
+                || listener.port() == addr.port()
                     && listener.ip().is_unspecified()
-                    && (listener.is_ipv6() || listener.is_ipv4() == upstream.addr.is_ipv4())
-                    && is_local_ip(upstream.addr.ip())
-        })
-    }) {
-        return Err(format!(
-            "{label}={} points to this server's own DNS listening address after the initial lookup, which would create a query loop",
-            upstream.addr
-        ));
+                    && (listener.is_ipv6() || listener.is_ipv4() == addr.is_ipv4())
+                    && is_local_ip(addr.ip())
+        }) {
+            return Err(format!(
+                "{label}={addr} points to this server's own DNS listening address after the initial lookup, which would create a query loop"
+            ));
+        }
     }
     Ok(())
 }
@@ -280,7 +285,10 @@ mod tests {
                 server_name: "cloudflare-dns.com".into()
             }
         );
-        assert_eq!(ups[4].addr, "1.0.0.1:853".parse().unwrap());
+        assert_eq!(
+            ups[4].endpoint,
+            Endpoint::Direct("1.0.0.1:853".parse().unwrap())
+        );
         assert_eq!(
             ups[5].transport,
             Transport::Doh3 {
@@ -288,7 +296,10 @@ mod tests {
                 path: "/dns-query".into()
             }
         );
-        assert_eq!(ups[5].addr, "8.8.8.8:443".parse().unwrap());
+        assert_eq!(
+            ups[5].endpoint,
+            Endpoint::Direct("8.8.8.8:443".parse().unwrap())
+        );
     }
 
     #[test]
@@ -297,7 +308,10 @@ mod tests {
         assert!(url_uses_hostname("h3://cloudflare-dns.com/dns-query"));
 
         let up = parse_native_upstream("h3://1.1.1.1/dns-query#cloudflare-dns.com", &[]).unwrap();
-        assert_eq!(up.addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("1.1.1.1:443".parse().unwrap())
+        );
         assert_eq!(
             up.transport,
             Transport::Doh3 {
@@ -315,7 +329,10 @@ mod tests {
     #[test]
     fn parses_doh_defaults_and_overrides() {
         let up = parse_native_upstream("https://1.1.1.1", &[]).unwrap();
-        assert_eq!(up.addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("1.1.1.1:443".parse().unwrap())
+        );
         assert_eq!(
             up.transport,
             Transport::Doh {
@@ -325,7 +342,10 @@ mod tests {
         );
 
         let up = parse_native_upstream("https://9.9.9.9:8443/resolve#dns.quad9.net", &[]).unwrap();
-        assert_eq!(up.addr, "9.9.9.9:8443".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("9.9.9.9:8443".parse().unwrap())
+        );
         assert_eq!(
             up.transport,
             Transport::Doh {
@@ -338,7 +358,10 @@ mod tests {
     #[test]
     fn parses_doq_and_doh3() {
         let up = parse_native_upstream("quic://1.1.1.1", &[]).unwrap();
-        assert_eq!(up.addr, "1.1.1.1:853".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("1.1.1.1:853".parse().unwrap())
+        );
         assert_eq!(
             up.transport,
             Transport::Doq {
@@ -347,7 +370,10 @@ mod tests {
         );
 
         let up = parse_native_upstream("h3://1.1.1.1#cloudflare-dns.com", &[]).unwrap();
-        assert_eq!(up.addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("1.1.1.1:443".parse().unwrap())
+        );
         assert_eq!(
             up.transport,
             Transport::Doh3 {
@@ -368,7 +394,10 @@ mod tests {
         );
         assert_eq!(ups.len(), 2);
         assert_eq!(ups[0].transport, Transport::Udp);
-        assert_eq!(ups[1].addr, "9.9.9.9:853".parse().unwrap());
+        assert_eq!(
+            ups[1].endpoint,
+            Endpoint::Direct("9.9.9.9:853".parse().unwrap())
+        );
     }
 
     #[test]
@@ -390,7 +419,10 @@ mod tests {
     fn bracketed_ipv6_with_port_is_parsed() {
         let up =
             parse_native_upstream("tls://[2001:4860:4860::8888]:8853#dns.google", &[]).unwrap();
-        assert_eq!(up.addr, "[2001:4860:4860::8888]:8853".parse().unwrap());
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("[2001:4860:4860::8888]:8853".parse().unwrap())
+        );
     }
 
     #[test]

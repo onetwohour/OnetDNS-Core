@@ -51,7 +51,7 @@ pub use rng::{
     ephemeral_random_array, fill_ephemeral_random, fill_random, random_array, try_fill_random,
     try_random_array,
 };
-pub use secret::SecretString;
+pub use secret::{SecretBytes, SecretString};
 pub use swap::ArcSwap;
 
 /// Size classes of the thread-local allocator. A request is rounded up to one of these so that

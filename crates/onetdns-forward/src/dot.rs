@@ -2,14 +2,13 @@
 //! query would make DoT far slower than plain DNS.
 
 use std::cell::RefCell;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
 use onetdns_proto::Message;
 use onetdns_tls::{client_handshake, ClientConfig, TlsConnection, TlsSession, TrustStore};
 
-use crate::{validate_response, DeadlineTcp, ForwardError};
+use crate::{validate_response, DeadlineTcp, Endpoint, ForwardError};
 
 struct DotConn {
     tcp: DeadlineTcp,
@@ -22,10 +21,10 @@ struct DotConn {
 }
 
 thread_local! {
-    static POOL: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), DotConn>> =
+    static POOL: RefCell<LruMap<(Endpoint, String, crate::TlsCacheScope), DotConn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
     /// Recent sessions for resuming dropped connections with PSK-DHE.
-    static SESSIONS: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), TlsSession>> =
+    static SESSIONS: RefCell<LruMap<(Endpoint, String, crate::TlsCacheScope), TlsSession>> =
         RefCell::new(LruMap::new(MAX_CACHED_SESSIONS));
 }
 
@@ -35,7 +34,7 @@ const MAX_CACHED_SESSIONS: usize = 64;
 /// Tries a kept connection first with a short deadline, so a dead one does not use up the budget
 /// before moving to a new connection.
 pub(crate) fn exchange(
-    addr: SocketAddr,
+    endpoint: &Endpoint,
     server_name: &str,
     wire: &[u8],
     wire_id: u16,
@@ -47,14 +46,18 @@ pub(crate) fn exchange(
     let _revocation_test_guard = crate::revocation_test_read_guard();
     let deadline = super::deadline_after(timeout);
     POOL.with(|pool| {
-        let key = (addr, server_name.to_string(), crate::tls_cache_scope(trust));
+        let key = (
+            endpoint.clone(),
+            server_name.to_string(),
+            crate::tls_cache_scope(trust),
+        );
 
         let idle = { pool.borrow().peek(&key).map(|c| c.last_used.elapsed()) };
         if idle.is_some_and(|idle| idle >= super::tcp_idle_reuse_max()) {
             pool.borrow_mut().pop(&key);
             onetdns_core::debug!(event = "forward.conn_idle_closed",
                 transport = "dot",
-                addr = %addr,
+                addr = %endpoint,
                 idle_ms = idle.unwrap_or_default().as_millis() as u64,
                 "Closed an idle pooled connection"
             );
@@ -64,7 +67,7 @@ pub(crate) fn exchange(
             let reused = { pool.borrow().contains_key(&key) };
             if !reused {
                 let session = SESSIONS.with(|sessions| sessions.borrow().peek(&key).cloned());
-                let c = connect(addr, server_name, deadline, trust, session)?;
+                let c = connect(endpoint, server_name, deadline, trust, session)?;
                 pool.borrow_mut().put(key.clone(), c);
             }
             let rt_deadline = if reused && attempt == 0 {
@@ -91,7 +94,7 @@ pub(crate) fn exchange(
                     if reused && attempt == 0 {
                         onetdns_core::debug!(event = "forward.conn_retry",
                             transport = "dot",
-                            addr = %addr,
+                            addr = %endpoint,
                             reason = ?e,
                             "Could not reuse the existing connection; retrying on a new one"
                         );
@@ -110,13 +113,13 @@ pub(crate) fn exchange(
 /// would send the query to a server with a revoked certificate. A certificate the hook rejects is
 /// reported to the server with a fatal alert, as when TLS rejects it.
 fn connect(
-    addr: SocketAddr,
+    endpoint: &Endpoint,
     server_name: &str,
     deadline: Instant,
     trust: &TrustStore,
     session: Option<TlsSession>,
 ) -> Result<DotConn, ForwardError> {
-    let mut tcp = crate::connect_upstream(addr, deadline).map_err(crate::io_err)?;
+    let mut tcp = crate::connect_stream(endpoint, deadline)?;
     let cfg = ClientConfig {
         server_name: server_name.to_string(),
         verify_name: true,
@@ -126,7 +129,7 @@ fn connect(
         ..Default::default()
     };
     let mut tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
-        crate::note_upstream_connect_failure("dot", addr, server_name, &e);
+        crate::note_upstream_connect_failure("dot", endpoint, server_name, &e);
         ForwardError::Io(format!("DoT handshake failed: {e}"))
     })?;
     if !tls.is_resumed() {
@@ -189,7 +192,7 @@ fn tls_io(_e: onetdns_tls::TlsError) -> ForwardError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
     use std::thread;
 
@@ -199,7 +202,8 @@ mod tests {
     use onetdns_tls::conn::ServerResumption;
     use onetdns_tls::{server_handshake, signer_from_pkcs8_der, ServerConfig as TlsServerConfig};
 
-    use crate::{Forwarder, Upstream};
+    use crate::socks5::test_proxy::{self, Mode, Request};
+    use crate::{Forwarder, Socks5Proxy, Upstream};
 
     fn dot_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _accepts, _signatures) = dot_server_ex(ip);
@@ -423,5 +427,139 @@ mod tests {
         )
         .with_trust(Arc::new(TrustStore::empty()));
         assert!(untrusted.resolve(&q(2, "must-reverify.test")).is_err());
+    }
+
+    fn via(proxy: Socks5Proxy, port: u16, server_name: &str) -> Upstream {
+        Upstream::dot_via(Arc::new(proxy), "dns.test", port, server_name)
+    }
+
+    fn named(addr: SocketAddr) -> [(&'static str, IpAddr); 1] {
+        [("dns.test", addr.ip())]
+    }
+
+    #[test]
+    /// Nothing on this machine can resolve dns.test, so an answer means the proxy did.
+    fn dot_through_socks5_lets_the_proxy_resolve_the_name() {
+        let (addr, trust, accepts, _signatures) = dot_server_ex(Ipv4Addr::new(9, 9, 9, 1));
+        let proxy = test_proxy::spawn(Mode::Open, &named(addr));
+        let fwd = Forwarder::with_upstreams(
+            vec![via(Socks5Proxy::new(proxy.addr), addr.port(), "dns.test")],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+
+        for id in [1, 2] {
+            let response = fwd.resolve(&q(id, "proxied.test")).unwrap();
+            assert_eq!(response.header.id, id);
+            assert_eq!(response.answers.len(), 1);
+        }
+        assert_eq!(
+            proxy.requests(),
+            [Request {
+                atyp: 3,
+                host: "dns.test".into(),
+                port: addr.port()
+            }],
+            "the second query should reuse the pooled tunnel"
+        );
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dot_through_socks5_authenticates_with_the_configured_credentials() {
+        let (addr, trust, accepts, _signatures) = dot_server_ex(Ipv4Addr::new(9, 9, 9, 2));
+        let proxy = test_proxy::spawn(Mode::Password("user", "secret"), &named(addr));
+        let resolve = |proxy_config: Socks5Proxy| {
+            Forwarder::with_upstreams(
+                vec![via(proxy_config, addr.port(), "dns.test")],
+                Duration::from_secs(5),
+            )
+            .with_trust(trust.clone())
+            .resolve(&q(7, "x.test"))
+        };
+
+        let anonymous = resolve(Socks5Proxy::new(proxy.addr)).unwrap_err();
+        assert!(
+            anonymous
+                .to_string()
+                .contains("requires a user name and password"),
+            "{anonymous}"
+        );
+        let wrong = resolve(Socks5Proxy::new(proxy.addr).with_credentials("user", "wrong".into()))
+            .unwrap_err();
+        assert!(
+            wrong
+                .to_string()
+                .contains("rejected the user name or password"),
+            "{wrong}"
+        );
+        assert!(!wrong.to_string().contains("wrong"), "{wrong}");
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            0,
+            "the proxy connected an unauthenticated client"
+        );
+
+        let answer =
+            resolve(Socks5Proxy::new(proxy.addr).with_credentials("user", "secret".into()))
+                .unwrap();
+        assert_eq!(answer.answers.len(), 1);
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dot_through_socks5_reports_a_refused_connection() {
+        let proxy = test_proxy::spawn(Mode::Refuse(5), &[]);
+        let fwd = Forwarder::with_upstreams(
+            vec![via(Socks5Proxy::new(proxy.addr), 853, "dns.test")],
+            Duration::from_secs(5),
+        );
+        let error = fwd.resolve(&q(1, "x.test")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the destination refused the connection"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dot_through_socks5_still_checks_the_certificate_name() {
+        let (addr, trust) = dot_server(Ipv4Addr::new(9, 9, 9, 3));
+        let proxy = test_proxy::spawn(Mode::Open, &named(addr));
+        let fwd = Forwarder::with_upstreams(
+            vec![via(Socks5Proxy::new(proxy.addr), addr.port(), "evil.test")],
+            Duration::from_secs(3),
+        )
+        .with_trust(trust);
+        assert!(fwd.resolve(&q(1, "x.test")).is_err());
+    }
+
+    #[test]
+    fn dot_through_socks5_reconnects_with_session_resumption() {
+        crate::set_reuse_caps_for_test(Duration::from_millis(1500), Duration::from_millis(30));
+        let (addr, trust, accepts, signatures) = dot_server_ex(Ipv4Addr::new(9, 9, 9, 4));
+        let proxy = test_proxy::spawn(Mode::Open, &named(addr));
+        let fwd = Forwarder::with_upstreams(
+            vec![via(Socks5Proxy::new(proxy.addr), addr.port(), "dns.test")],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+
+        fwd.resolve(&q(1, "a.test")).unwrap();
+        std::thread::sleep(Duration::from_millis(45));
+        assert_eq!(fwd.resolve(&q(2, "b.test")).unwrap().answers.len(), 1);
+        crate::clear_reuse_caps_for_test();
+        assert_eq!(
+            proxy.requests().len(),
+            2,
+            "the idle tunnel should be replaced"
+        );
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            signatures.load(Ordering::Relaxed),
+            1,
+            "the new tunnel should resume the TLS session"
+        );
     }
 }

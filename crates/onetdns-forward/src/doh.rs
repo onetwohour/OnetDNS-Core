@@ -1,7 +1,6 @@
 //! DNS over HTTPS upstream on HTTP/2 (RFC 8484).
 
 use std::cell::RefCell;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
@@ -9,7 +8,7 @@ use onetdns_http2::{H2Client, H2Error};
 use onetdns_proto::Message;
 use onetdns_tls::{client_handshake, ClientConfig, TlsSession, TlsStream, TrustStore};
 
-use crate::{validate_response, DeadlineTcp, ForwardError};
+use crate::{validate_response, DeadlineTcp, Endpoint, ForwardError};
 
 struct DohConn {
     client: H2Client<TlsStream<DeadlineTcp>>,
@@ -19,10 +18,10 @@ struct DohConn {
 }
 
 thread_local! {
-    static POOL: RefCell<LruMap<(SocketAddr, String, String, crate::TlsCacheScope), DohConn>> =
+    static POOL: RefCell<LruMap<(Endpoint, String, String, crate::TlsCacheScope), DohConn>> =
         RefCell::new(LruMap::new(MAX_POOLED_CONNECTIONS));
     /// Sessions for resuming dropped HTTP/2 connections quickly.
-    static SESSIONS: RefCell<LruMap<(SocketAddr, String, crate::TlsCacheScope), TlsSession>> =
+    static SESSIONS: RefCell<LruMap<(Endpoint, String, crate::TlsCacheScope), TlsSession>> =
         RefCell::new(LruMap::new(MAX_CACHED_SESSIONS));
 }
 
@@ -36,7 +35,7 @@ const MAX_CACHED_SESSIONS: usize = 64;
 /// connection would not change it, and 429 and 503 also ask clients not to retry at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
-    addr: SocketAddr,
+    endpoint: &Endpoint,
     server_name: &str,
     path: &str,
     wire: &[u8],
@@ -49,15 +48,20 @@ pub(crate) fn exchange(
     let deadline = super::deadline_after(timeout);
     POOL.with(|pool| {
         let scope = crate::tls_cache_scope(trust);
-        let key = (addr, server_name.to_string(), path.to_string(), scope);
-        let session_key = (addr, server_name.to_string(), scope);
+        let key = (
+            endpoint.clone(),
+            server_name.to_string(),
+            path.to_string(),
+            scope,
+        );
+        let session_key = (endpoint.clone(), server_name.to_string(), scope);
 
         for attempt in 0..2 {
             let reused = { pool.borrow().contains_key(&key) };
             if !reused {
                 let session =
                     SESSIONS.with(|sessions| sessions.borrow().peek(&session_key).cloned());
-                let c = connect(addr, server_name, deadline, trust, session)?;
+                let c = connect(endpoint, server_name, deadline, trust, session)?;
                 pool.borrow_mut().put(key.clone(), c);
             }
             let (res, session) = {
@@ -77,7 +81,7 @@ pub(crate) fn exchange(
                     if reused && attempt == 0 {
                         onetdns_core::debug!(event = "forward.conn_retry",
                             transport = "doh",
-                            addr = %addr,
+                            addr = %endpoint,
                             path = path,
                             reason = ?e,
                             "Could not reuse the existing connection; retrying on a new one"
@@ -96,14 +100,16 @@ pub(crate) fn exchange(
 /// Checks revocation right after the handshake, before a query. A certificate the hook rejects is
 /// reported to the server with a fatal alert, as when TLS rejects it.
 fn connect(
-    addr: SocketAddr,
+    endpoint: &Endpoint,
     server_name: &str,
     deadline: Instant,
     trust: &TrustStore,
     session: Option<TlsSession>,
 ) -> Result<DohConn, ForwardError> {
     let started = Instant::now();
-    let mut tcp = crate::connect_upstream(addr, deadline).map_err(crate::io_err)?;
+    // Through a proxy this spans the tunnel setup, which the proxy completes only after reaching
+    // the server, so it still approximates the round trip to the server.
+    let mut tcp = crate::connect_stream(endpoint, deadline)?;
     let rtt_hint = started.elapsed();
     let cfg = ClientConfig {
         server_name: server_name.to_string(),
@@ -114,7 +120,7 @@ fn connect(
         ..Default::default()
     };
     let mut tls = client_handshake(&mut tcp, &cfg).map_err(|e| {
-        crate::note_upstream_connect_failure("doh", addr, server_name, &e);
+        crate::note_upstream_connect_failure("doh", endpoint, server_name, &e);
         ForwardError::Io(format!("DoH handshake: {e}"))
     })?;
     if !tls.is_resumed() {
@@ -180,7 +186,7 @@ fn roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::sync::Arc;
     use std::thread;
 
@@ -191,7 +197,8 @@ mod tests {
     use onetdns_tls::conn::ServerResumption;
     use onetdns_tls::{server_handshake, signer_from_pkcs8_der, ServerConfig as TlsServerConfig};
 
-    use crate::{Forwarder, Upstream};
+    use crate::socks5::test_proxy::{self, Mode, Request};
+    use crate::{Forwarder, Socks5Proxy, Upstream};
 
     fn doh_server(ip: Ipv4Addr) -> (SocketAddr, Arc<TrustStore>) {
         let (addr, trust, _accepts, _signatures) = doh_server_ex(ip, false);
@@ -447,7 +454,7 @@ mod tests {
             let wire = request.try_encode().unwrap();
             [(); 2].map(|()| {
                 exchange(
-                    addr,
+                    &Endpoint::Direct(addr),
                     "dns.test",
                     "/wrong",
                     &wire,
@@ -470,6 +477,96 @@ mod tests {
             1,
             "오류 상태를 받은 연결을 버리고 새로 맺었습니다"
         );
+    }
+
+    #[test]
+    /// Nothing on this machine can resolve dns.test, so an answer means the proxy did.
+    fn doh_through_socks5_lets_the_proxy_resolve_the_name() {
+        let (addr, trust, accepts, _signatures) = doh_server_ex(Ipv4Addr::new(9, 9, 8, 1), false);
+        let proxy = test_proxy::spawn(Mode::Open, &[("dns.test", addr.ip())]);
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doh_via(
+                Arc::new(Socks5Proxy::new(proxy.addr)),
+                "dns.test",
+                addr.port(),
+                "dns.test",
+                "/dns-query",
+            )],
+            Duration::from_secs(5),
+        )
+        .with_trust(trust);
+
+        for id in [1, 2] {
+            let response = fwd.resolve(&q(id, "proxied.test")).unwrap();
+            assert_eq!(response.header.id, id);
+            assert_eq!(response.answers.len(), 1);
+        }
+        assert_eq!(
+            proxy.requests(),
+            [Request {
+                atyp: 3,
+                host: "dns.test".into(),
+                port: addr.port()
+            }],
+            "the second query should reuse the pooled tunnel"
+        );
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn doh_through_socks5_authenticates_and_sends_an_address_as_an_address() {
+        let (addr, trust, _accepts, _signatures) = doh_server_ex(Ipv4Addr::new(9, 9, 8, 2), false);
+        let proxy = test_proxy::spawn(Mode::Password("user", "secret"), &[]);
+        let resolve = |password: &str| {
+            Forwarder::with_upstreams(
+                vec![Upstream::doh_via(
+                    Arc::new(
+                        Socks5Proxy::new(proxy.addr).with_credentials("user", password.into()),
+                    ),
+                    "127.0.0.1",
+                    addr.port(),
+                    "dns.test",
+                    "/dns-query",
+                )],
+                Duration::from_secs(5),
+            )
+            .with_trust(trust.clone())
+            .resolve(&q(3, "x.test"))
+        };
+
+        let wrong = resolve("wrong").unwrap_err();
+        assert!(
+            wrong
+                .to_string()
+                .contains("rejected the user name or password"),
+            "{wrong}"
+        );
+        assert_eq!(resolve("secret").unwrap().answers.len(), 1);
+        assert_eq!(
+            proxy.requests(),
+            [Request {
+                atyp: 1,
+                host: "127.0.0.1".into(),
+                port: addr.port()
+            }]
+        );
+    }
+
+    #[test]
+    fn doh_through_socks5_reports_a_refused_connection() {
+        let proxy = test_proxy::spawn(Mode::Refuse(4), &[]);
+        let fwd = Forwarder::with_upstreams(
+            vec![Upstream::doh_via(
+                Arc::new(Socks5Proxy::new(proxy.addr)),
+                "dns.test",
+                443,
+                "dns.test",
+                "/dns-query",
+            )],
+            Duration::from_secs(5),
+        );
+        let error = fwd.resolve(&q(1, "x.test")).unwrap_err();
+        assert!(error.to_string().contains("host unreachable"), "{error}");
     }
 
     #[test]

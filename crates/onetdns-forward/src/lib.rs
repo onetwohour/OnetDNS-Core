@@ -14,6 +14,9 @@ mod doh3;
 mod doq;
 mod dot;
 mod quicdrive;
+mod socks5;
+
+pub use socks5::Socks5Proxy;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -349,6 +352,17 @@ pub(crate) fn connect_upstream(
     ))
 }
 
+/// The TCP connection a DoT or DoH upstream runs over.
+pub(crate) fn connect_stream(
+    endpoint: &Endpoint,
+    deadline: Instant,
+) -> Result<DeadlineTcp, ForwardError> {
+    match endpoint {
+        Endpoint::Direct(addr) => connect_upstream(*addr, deadline).map_err(io_err),
+        Endpoint::Socks5 { proxy, host, port } => socks5::connect(proxy, host, *port, deadline),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
     /// Tries in order, so the first upstream is effectively primary.
@@ -379,23 +393,47 @@ pub enum Transport {
     Doh3 { server_name: String, path: String },
 }
 
+/// Where an upstream's connections go.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Endpoint {
+    Direct(SocketAddr),
+    /// Through a SOCKS5 proxy, which opens the connection and resolves `host` when it is a name.
+    /// Only DoT and DoH run over it; the proxy carries TCP only.
+    Socks5 {
+        proxy: Arc<Socks5Proxy>,
+        host: String,
+        port: u16,
+    },
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Direct(addr) => write!(f, "{addr}"),
+            Endpoint::Socks5 { proxy, host, port } => {
+                write!(f, "{} via {proxy}", socks5::host_port(host, *port))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstream {
-    pub addr: SocketAddr,
+    pub endpoint: Endpoint,
     pub transport: Transport,
 }
 
 impl Upstream {
     pub fn udp(addr: SocketAddr) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
             transport: Transport::Udp,
         }
     }
 
     pub fn tcp(addr: SocketAddr) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
             transport: Transport::Tcp,
         }
     }
@@ -403,7 +441,26 @@ impl Upstream {
     /// `server_name` is the name the certificate is checked against.
     pub fn dot(addr: SocketAddr, server_name: impl Into<String>) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
+            transport: Transport::Dot {
+                server_name: server_name.into(),
+            },
+        }
+    }
+
+    /// DoT through `proxy`, which is given `host` as written.
+    pub fn dot_via(
+        proxy: Arc<Socks5Proxy>,
+        host: impl Into<String>,
+        port: u16,
+        server_name: impl Into<String>,
+    ) -> Self {
+        Upstream {
+            endpoint: Endpoint::Socks5 {
+                proxy,
+                host: host.into(),
+                port,
+            },
             transport: Transport::Dot {
                 server_name: server_name.into(),
             },
@@ -412,7 +469,28 @@ impl Upstream {
 
     pub fn doh(addr: SocketAddr, server_name: impl Into<String>, path: impl Into<String>) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
+            transport: Transport::Doh {
+                server_name: server_name.into(),
+                path: path.into(),
+            },
+        }
+    }
+
+    /// DoH through `proxy`, which is given `host` as written.
+    pub fn doh_via(
+        proxy: Arc<Socks5Proxy>,
+        host: impl Into<String>,
+        port: u16,
+        server_name: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Upstream {
+            endpoint: Endpoint::Socks5 {
+                proxy,
+                host: host.into(),
+                port,
+            },
             transport: Transport::Doh {
                 server_name: server_name.into(),
                 path: path.into(),
@@ -422,7 +500,7 @@ impl Upstream {
 
     pub fn doq(addr: SocketAddr, server_name: impl Into<String>) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
             transport: Transport::Doq {
                 server_name: server_name.into(),
             },
@@ -432,8 +510,8 @@ impl Upstream {
     /// Transport and address, for logs and stats.
     pub fn label(&self) -> String {
         match &self.transport {
-            Transport::Udp => self.addr.to_string(),
-            Transport::Tcp => format!("tcp://{}", self.addr),
+            Transport::Udp => self.endpoint.to_string(),
+            Transport::Tcp => format!("tcp://{}", self.endpoint),
             Transport::Dot { server_name } => format!("tls://{server_name}"),
             Transport::Doh { server_name, path } => format!("https://{server_name}{path}"),
             Transport::Doq { server_name } => format!("quic://{server_name}"),
@@ -443,7 +521,7 @@ impl Upstream {
 
     pub fn doh3(addr: SocketAddr, server_name: impl Into<String>, path: impl Into<String>) -> Self {
         Upstream {
-            addr,
+            endpoint: Endpoint::Direct(addr),
             transport: Transport::Doh3 {
                 server_name: server_name.into(),
                 path: path.into(),
@@ -1306,16 +1384,16 @@ fn response_class(request: &Message, resp: &Message) -> RespClass {
     }
 }
 
-static NON_FINAL_COUNTS: OnceLock<Mutex<HashMap<(SocketAddr, RespClass), u64>>> = OnceLock::new();
+static NON_FINAL_COUNTS: OnceLock<Mutex<HashMap<(Endpoint, RespClass), u64>>> = OnceLock::new();
 /// Bounds memory however many servers send such responses.
 const MAX_NON_FINAL_COUNTERS: usize = 1024;
 
 fn increment_non_final_count(
-    counts: &mut HashMap<(SocketAddr, RespClass), u64>,
-    key: (SocketAddr, RespClass),
+    counts: &mut HashMap<(Endpoint, RespClass), u64>,
+    key: (Endpoint, RespClass),
 ) -> u64 {
     if !counts.contains_key(&key) && counts.len() >= MAX_NON_FINAL_COUNTERS {
-        if let Some(victim) = counts.keys().next().copied() {
+        if let Some(victim) = counts.keys().next().cloned() {
             counts.remove(&victim);
         }
     }
@@ -1332,7 +1410,7 @@ fn observe_non_final(upstream: &Upstream, class: RespClass, request: &Message, r
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        increment_non_final_count(&mut counts, (upstream.addr, class))
+        increment_non_final_count(&mut counts, (upstream.endpoint.clone(), class))
     };
     if count == 1 || count.is_power_of_two() {
         let (qname, qtype) = request
@@ -1346,7 +1424,7 @@ fn observe_non_final(upstream: &Upstream, class: RespClass, request: &Message, r
             })
             .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
         onetdns_core::warn!(event = "forward.upstream_response_anomaly",
-            upstream = %upstream.addr,
+            upstream = %upstream.endpoint,
             transport = ?upstream.transport,
             response_class = ?class,
             rcode = response.header.rcode,
@@ -1536,21 +1614,35 @@ fn exchange_one(
     timeout: Duration,
     trust: &TrustStore,
 ) -> Result<Message, ForwardError> {
-    match &up.transport {
-        Transport::Udp => udp_exchange(up.addr, wire, wire_id, request, timeout, false),
-        Transport::Tcp => tcp_exchange(up.addr, wire, wire_id, request, timeout),
-        Transport::Dot { server_name } => {
-            dot::exchange(up.addr, server_name, wire, wire_id, request, timeout, trust)
+    match (&up.transport, &up.endpoint) {
+        (Transport::Dot { server_name }, endpoint) => dot::exchange(
+            endpoint,
+            server_name,
+            wire,
+            wire_id,
+            request,
+            timeout,
+            trust,
+        ),
+        (Transport::Doh { server_name, path }, endpoint) => {
+            doh::exchange(endpoint, server_name, path, wire, request, timeout, trust)
         }
-        Transport::Doh { server_name, path } => {
-            doh::exchange(up.addr, server_name, path, wire, request, timeout, trust)
+        (Transport::Udp, Endpoint::Direct(addr)) => {
+            udp_exchange(*addr, wire, wire_id, request, timeout, false)
         }
-        Transport::Doq { server_name } => {
-            doq::exchange(up.addr, server_name, wire, request, timeout, trust)
+        (Transport::Tcp, Endpoint::Direct(addr)) => {
+            tcp_exchange(*addr, wire, wire_id, request, timeout)
         }
-        Transport::Doh3 { server_name, path } => {
-            doh3::exchange(up.addr, server_name, path, wire, request, timeout, trust)
+        (Transport::Doq { server_name }, Endpoint::Direct(addr)) => {
+            doq::exchange(*addr, server_name, wire, request, timeout, trust)
         }
+        (Transport::Doh3 { server_name, path }, Endpoint::Direct(addr)) => {
+            doh3::exchange(*addr, server_name, path, wire, request, timeout, trust)
+        }
+        // Sending these directly would go around the proxy the operator chose.
+        (_, Endpoint::Socks5 { .. }) => Err(ForwardError::Io(
+            "Only DoT and DoH upstreams can go through a SOCKS5 proxy".into(),
+        )),
     }
 }
 
@@ -2227,7 +2319,7 @@ pub(crate) fn io_err(e: std::io::Error) -> ForwardError {
 /// occurrences per transport, since a dead upstream fails every query.
 pub(crate) fn note_upstream_connect_failure(
     transport: &'static str,
-    addr: SocketAddr,
+    addr: impl std::fmt::Display,
     server_name: &str,
     error: &impl std::fmt::Display,
 ) {
@@ -2751,17 +2843,17 @@ mod tests {
             increment_non_final_count(
                 &mut counts,
                 (
-                    SocketAddr::from(([192, 0, 2, 1], port)),
+                    Endpoint::Direct(SocketAddr::from(([192, 0, 2, 1], port))),
                     RespClass::Retryable,
                 ),
             );
         }
         assert_eq!(counts.len(), MAX_NON_FINAL_COUNTERS);
         let new_key = (
-            SocketAddr::from(([192, 0, 2, 2], 53)),
+            Endpoint::Direct(SocketAddr::from(([192, 0, 2, 2], 53))),
             RespClass::Incomplete,
         );
-        assert_eq!(increment_non_final_count(&mut counts, new_key), 1);
+        assert_eq!(increment_non_final_count(&mut counts, new_key.clone()), 1);
         assert_eq!(counts.len(), MAX_NON_FINAL_COUNTERS);
         assert_eq!(increment_non_final_count(&mut counts, new_key), 2);
     }

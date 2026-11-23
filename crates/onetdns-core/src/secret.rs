@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
+/// Wiped when dropped, for building a message that carries a secret. Reserve the full length up
+/// front: growing the buffer leaves unwiped copies behind.
+pub type SecretBytes = Zeroizing<Vec<u8>>;
+
 #[derive(Clone, Default, Eq, PartialEq)]
 /// Secret string whose clones share one buffer. The last owner wipes it, so config reloads and
 /// worker threads leave no plaintext copies behind.
