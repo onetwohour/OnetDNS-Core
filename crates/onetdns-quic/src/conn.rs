@@ -692,6 +692,10 @@ pub struct Connection {
     local_stream_max: HashMap<u64, u64>,
     local_max_streams_bidi: u64,
     local_max_streams_uni: u64,
+    /// The stream limits the peer has been sent, which RFC 9000 holds it to. They trail the
+    /// local ones while a MAX_STREAMS frame waits behind a full congestion window.
+    sent_max_streams_bidi: u64,
+    sent_max_streams_uni: u64,
 
     readable: Vec<(u64, Vec<u8>, bool)>,
     send_offsets: HashMap<u64, u64>,
@@ -839,6 +843,8 @@ impl Connection {
             local_stream_max: HashMap::new(),
             local_max_streams_bidi,
             local_max_streams_uni,
+            sent_max_streams_bidi: local_max_streams_bidi,
+            sent_max_streams_uni: local_max_streams_uni,
             readable: Vec::new(),
             send_offsets: HashMap::new(),
             pending_stream_sends: VecDeque::new(),
@@ -948,6 +954,8 @@ impl Connection {
             local_stream_max: HashMap::new(),
             local_max_streams_bidi,
             local_max_streams_uni,
+            sent_max_streams_bidi: local_max_streams_bidi,
+            sent_max_streams_uni: local_max_streams_uni,
             readable: Vec::new(),
             send_offsets: HashMap::new(),
             pending_stream_sends: VecDeque::new(),
@@ -1851,7 +1859,7 @@ impl Connection {
                         return Err(QuicError::Frame);
                     }
                     ack_eliciting = true;
-                    self.out_frames_app.push(Frame::PathResponse(data));
+                    self.queue_superseding(Frame::PathResponse(data));
                 }
                 Frame::PathResponse(data) => {
                     if kind != PacketKind::OneRtt {
@@ -2072,9 +2080,9 @@ impl Connection {
 
     fn check_peer_stream_limit(&self, id: u64) -> Result<(), QuicError> {
         let advertised = if id & 0x02 != 0 {
-            self.local_max_streams_uni
+            self.sent_max_streams_uni
         } else {
-            self.local_max_streams_bidi
+            self.sent_max_streams_bidi
         };
         if id >> 2 >= advertised {
             return Err(QuicError::StreamLimit);
@@ -2097,8 +2105,7 @@ impl Connection {
         let target = initial_limit.max(MAX_STREAM_REASSEMBLY);
         self.local_stream_max.insert(id, target);
         if target > initial_limit {
-            self.out_frames_app
-                .push(Frame::MaxStreamData { id, max: target });
+            self.queue_superseding(Frame::MaxStreamData { id, max: target });
         }
     }
 
@@ -2479,6 +2486,16 @@ impl Connection {
         );
         if ack_eliciting && !window_open {
             *probe = probe.saturating_sub(1);
+        }
+        for frame in &rtx_frames {
+            if let Frame::MaxStreams { uni, max } = *frame {
+                let sent = if uni {
+                    &mut self.sent_max_streams_uni
+                } else {
+                    &mut self.sent_max_streams_bidi
+                };
+                *sent = (*sent).max(max);
+            }
         }
         self.track_sent(APP, pn, ack_eliciting, pkt.len() as u64, rtx_frames);
         Some(pkt)
@@ -3185,6 +3202,26 @@ impl Connection {
         self.send_dns_message(id, &msgs[0])
     }
 
+    /// Replaces a queued frame the new one supersedes: a newer limit of the same kind, or a newer
+    /// PATH_RESPONSE on this connection's single path. While a peer withholds acknowledgments the
+    /// queue does not drain, and appending would grow it with every frame the peer sends.
+    fn queue_superseding(&mut self, frame: Frame) {
+        let index = self
+            .out_frames_app
+            .iter()
+            .position(|queued| match (queued, &frame) {
+                (Frame::MaxData(_), Frame::MaxData(_))
+                | (Frame::PathResponse(_), Frame::PathResponse(_)) => true,
+                (Frame::MaxStreams { uni: a, .. }, Frame::MaxStreams { uni: b, .. }) => a == b,
+                (Frame::MaxStreamData { id: a, .. }, Frame::MaxStreamData { id: b, .. }) => a == b,
+                _ => false,
+            });
+        match index {
+            Some(index) => self.out_frames_app[index] = frame,
+            None => self.out_frames_app.push(frame),
+        }
+    }
+
     fn queue_app_frame(&mut self, f: Frame) {
         if !self.handshake_complete && self.early_send_keys.is_some() {
             self.early_backup.push(f.clone());
@@ -3323,8 +3360,7 @@ impl Connection {
             .local_max_data
             .saturating_add(consumed)
             .min(MAX_FLOW_CONTROL);
-        self.out_frames_app
-            .push(Frame::MaxData(self.local_max_data));
+        self.queue_superseding(Frame::MaxData(self.local_max_data));
     }
 
     fn extend_recv_stream_credit(&mut self, id: u64, consumed: u64) {
@@ -3337,8 +3373,7 @@ impl Connection {
         let next = current.saturating_add(consumed).min(MAX_FLOW_CONTROL);
         if next > *current {
             *current = next;
-            self.out_frames_app
-                .push(Frame::MaxStreamData { id, max: next });
+            self.queue_superseding(Frame::MaxStreamData { id, max: next });
         }
     }
 
@@ -3357,7 +3392,7 @@ impl Connection {
                 .local_max_streams_uni
                 .saturating_add(1)
                 .min(MAX_FLOW_CONTROL);
-            self.out_frames_app.push(Frame::MaxStreams {
+            self.queue_superseding(Frame::MaxStreams {
                 uni: true,
                 max: self.local_max_streams_uni,
             });
@@ -3366,7 +3401,7 @@ impl Connection {
                 .local_max_streams_bidi
                 .saturating_add(1)
                 .min(MAX_FLOW_CONTROL);
-            self.out_frames_app.push(Frame::MaxStreams {
+            self.queue_superseding(Frame::MaxStreams {
                 uni: false,
                 max: self.local_max_streams_bidi,
             });
@@ -7024,6 +7059,98 @@ mod tests {
         pump(&mut client, &mut server);
         assert!(client.is_handshake_confirmed() && server.is_handshake_complete());
         (client, server)
+    }
+
+    #[test]
+    /// A peer that never acknowledges keeps the congestion window full, so nothing queued leaves.
+    /// Each PATH_CHALLENGE must not add a PATH_RESPONSE to that queue; the newest one is enough.
+    fn unacknowledged_path_challenges_queue_one_response() {
+        let (mut client, mut server) = established_doq_pair();
+        server.bytes_in_flight = server.cwnd;
+        let mut newest = [0u8; 8];
+        for round in 0..20u8 {
+            let mut payload = Vec::new();
+            for index in 0..100u8 {
+                newest = [round, index, 0, 0, 0, 0, 0, 0];
+                frame::encode(&mut payload, &Frame::PathChallenge(newest));
+            }
+            server
+                .recv_datagram(&forge_packet(&mut client, APP, &payload))
+                .unwrap();
+            while server.next_datagram().is_some() {}
+        }
+        assert_eq!(
+            server.out_frames_app.len(),
+            1,
+            "보내지 못한 PATH_RESPONSE 가 쌓였습니다"
+        );
+        assert_eq!(
+            server.out_frames_app[0],
+            Frame::PathResponse(newest),
+            "가장 최근 도전에 답해야 합니다"
+        );
+    }
+
+    #[test]
+    /// RFC 9000 holds the peer to the stream limit this side has sent. Credit for closed streams
+    /// still queued behind a full window does not count yet; otherwise a peer that never
+    /// acknowledges could open and close streams without end, each leaving a frame queued.
+    fn peer_streams_are_held_to_the_limit_actually_sent() {
+        let (mut client, mut server) = established_doq_pair();
+        let limit = TransportParams::server_defaults().initial_max_streams_bidi;
+        let churn = |client: &mut Connection,
+                     server: &mut Connection,
+                     numbers: std::ops::Range<u64>|
+         -> Result<(), QuicError> {
+            for number in numbers {
+                let id = number << 2;
+                let mut payload = Vec::new();
+                frame::encode(&mut payload, &Frame::StopSending { id, error_code: 0 });
+                frame::encode(
+                    &mut payload,
+                    &Frame::ResetStream {
+                        id,
+                        error_code: 0,
+                        final_size: 0,
+                    },
+                );
+                server.recv_datagram(&forge_packet(client, APP, &payload))?;
+                server.take_resets();
+            }
+            Ok(())
+        };
+        let max_streams_queued = |server: &Connection| {
+            server
+                .out_frames_app
+                .iter()
+                .filter(|frame| matches!(frame, Frame::MaxStreams { .. }))
+                .count()
+        };
+
+        server.bytes_in_flight = server.cwnd;
+        churn(&mut client, &mut server, 0..limit).unwrap();
+        assert_eq!(
+            max_streams_queued(&server),
+            1,
+            "새 스트림 한도는 가장 최근 것 하나만 기다려야 합니다"
+        );
+
+        server.bytes_in_flight = 0;
+        server.flush();
+        while server.next_datagram().is_some() {}
+        assert_eq!(
+            max_streams_queued(&server),
+            0,
+            "대조군이 무효입니다. 윈도우를 열었는데 새 스트림 한도를 보내지 않았습니다"
+        );
+        server.bytes_in_flight = server.cwnd;
+        churn(&mut client, &mut server, limit..limit * 2)
+            .expect("보낸 한도 안의 스트림을 거절했습니다");
+        assert_eq!(
+            churn(&mut client, &mut server, limit * 2..limit * 2 + 1),
+            Err(QuicError::StreamLimit),
+            "아직 보내지 않은 한도로 스트림을 열게 했습니다"
+        );
     }
 
     /// Also relays the server's acknowledgment back to the client.
