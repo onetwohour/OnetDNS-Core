@@ -24,7 +24,7 @@ const NONCE_AT: usize = CLIENT_MAGIC_LEN + PUBKEY_LEN;
 const MIN_QUERY: usize = NONCE_AT + CLIENT_NONCE_LEN + 16 + 64;
 
 /// The largest packet the protocol allows.
-const MAX_PACKET: usize = 4096;
+pub const MAX_PACKET: usize = 4096;
 
 /// The largest packet a client sends a relay: the target's address and port, then the packet.
 pub const MAX_ANONYMIZED: usize = ANON_MAGIC.len() + 16 + 2 + MAX_PACKET;
@@ -42,6 +42,20 @@ const RELAY_STACK_BYTES: usize = 128 * 1024;
 
 pub fn is_anonymized(packet: &[u8]) -> bool {
     packet.starts_with(&ANON_MAGIC)
+}
+
+/// `packet` as a client sends it to a relay to have it passed on to `target`.
+pub fn wrap(target: SocketAddr, packet: &[u8]) -> Vec<u8> {
+    let ip = match target.ip() {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        IpAddr::V6(ip) => ip,
+    };
+    let mut wrapped = Vec::with_capacity(MAX_ANONYMIZED - MAX_PACKET + packet.len());
+    wrapped.extend_from_slice(&ANON_MAGIC);
+    wrapped.extend_from_slice(&ip.octets());
+    wrapped.extend_from_slice(&target.port().to_be_bytes());
+    wrapped.extend_from_slice(packet);
+    wrapped
 }
 
 pub struct Relay {
@@ -212,18 +226,6 @@ mod tests {
     use crate::client::{Certificate, Session};
     use crate::Provider;
     use std::net::UdpSocket;
-
-    fn wrap(target: SocketAddr, inner: &[u8]) -> Vec<u8> {
-        let ip = match target.ip() {
-            IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-            IpAddr::V6(ip) => ip,
-        };
-        let mut packet = ANON_MAGIC.to_vec();
-        packet.extend_from_slice(&ip.octets());
-        packet.extend_from_slice(&target.port().to_be_bytes());
-        packet.extend_from_slice(inner);
-        packet
-    }
 
     fn certificate_query(name: &str) -> Vec<u8> {
         let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];

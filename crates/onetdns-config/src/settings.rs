@@ -3213,7 +3213,7 @@ fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
         return true;
     }
     if raw.starts_with("sdns://") {
-        return crate::stamp::dnscrypt_server(raw).is_some();
+        return crate::stamp::dnscrypt_upstream(raw).is_some();
     }
 
     let Some((scheme, rest)) = raw.split_once("://") else {
@@ -3343,7 +3343,7 @@ fn numeric_upstream_endpoint(raw: &str) -> Option<SocketAddr> {
         return None;
     }
     if raw.starts_with("sdns://") {
-        return crate::stamp::dnscrypt_server(raw).map(|stamp| stamp.addr);
+        return crate::stamp::dnscrypt_upstream(raw).map(|stamp| stamp.addr);
     }
     let (scheme, rest) = raw
         .split_once("://")
@@ -7421,6 +7421,11 @@ tftp_writable = true
             assert!(Config::from_toml_str(&text).is_err(), "{key}");
             let doh = "sdns://AgcAAAAAAAAABzEuMC4wLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5";
             let text = format!("{key} = [\"{doh}\"]\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{key}");
+            let relayed =
+                format!("{key} = [\"{ADGUARD_DNSCRYPT}#sdns://gQ4xOTIuMC4yLjE6NTQ0Mw\"]\n");
+            assert!(Config::from_toml_str(&relayed).is_ok(), "{key}");
+            let text = format!("{key} = [\"{ADGUARD_DNSCRYPT}#{doh}\"]\n");
             assert!(Config::from_toml_str(&text).is_err(), "{key}");
         }
         let looped = format!(

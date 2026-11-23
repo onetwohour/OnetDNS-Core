@@ -418,10 +418,11 @@ pub enum Transport {
     },
 
     /// Certificates are fetched as TXT records of `provider_name` and must be signed by
-    /// `public_key`.
+    /// `public_key`. With a `relay`, everything goes through that Anonymized DNSCrypt relay.
     Dnscrypt {
         provider_name: String,
         public_key: [u8; 32],
+        relay: Option<SocketAddr>,
     },
 }
 
@@ -548,7 +549,14 @@ impl Upstream {
             Transport::Doh { server_name, path } => format!("https://{server_name}{path}"),
             Transport::Doq { server_name } => format!("quic://{server_name}"),
             Transport::Doh3 { server_name, path } => format!("h3://{server_name}{path}"),
-            Transport::Dnscrypt { provider_name, .. } => format!("dnscrypt://{provider_name}"),
+            Transport::Dnscrypt {
+                provider_name,
+                relay,
+                ..
+            } => match relay {
+                Some(relay) => format!("dnscrypt://{provider_name} via {relay}"),
+                None => format!("dnscrypt://{provider_name}"),
+            },
         }
     }
 
@@ -556,12 +564,14 @@ impl Upstream {
         addr: SocketAddr,
         provider_name: impl Into<String>,
         public_key: [u8; 32],
+        relay: Option<SocketAddr>,
     ) -> Self {
         Upstream {
             endpoint: Endpoint::Direct(addr),
             transport: Transport::Dnscrypt {
                 provider_name: provider_name.into(),
                 public_key,
+                relay,
             },
         }
     }
@@ -1690,6 +1700,7 @@ fn exchange_one(
             Transport::Dnscrypt {
                 provider_name,
                 public_key,
+                relay,
             },
             Endpoint::Direct(addr),
         ) => dnscrypt::exchange(
@@ -1697,6 +1708,7 @@ fn exchange_one(
                 addr: *addr,
                 provider_name,
                 public_key,
+                relay: *relay,
             },
             wire,
             wire_id,

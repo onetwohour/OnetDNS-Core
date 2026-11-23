@@ -163,11 +163,12 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
         if matches!(route, UpstreamRoute::Socks5(_)) {
             return None;
         }
-        let stamp = onetdns_config::stamp::dnscrypt_server(url)?;
+        let stamp = onetdns_config::stamp::dnscrypt_upstream(url)?;
         return Some(Upstream::dnscrypt(
             stamp.addr,
             stamp.provider_name,
             stamp.public_key,
+            stamp.relay,
         ));
     }
     let (scheme, rest) = match url.split_once("://") {
@@ -508,6 +509,18 @@ mod tests {
             parse_native_upstream(stamp, &proxy).is_none(),
             "DNSCrypt 는 UDP 라 프록시를 거치지 못합니다"
         );
+
+        let relayed = format!("{stamp}#sdns://gQ4xOTIuMC4yLjE6NTQ0Mw");
+        assert!(!url_uses_hostname(&relayed));
+        let up = parse_native_upstream(&relayed, &DIRECT).unwrap();
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("94.140.14.14:5443".parse().unwrap())
+        );
+        assert!(matches!(
+            &up.transport,
+            Transport::Dnscrypt { relay: Some(relay), .. } if *relay == "192.0.2.1:5443".parse().unwrap()
+        ));
     }
 
     #[test]

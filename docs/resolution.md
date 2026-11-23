@@ -32,6 +32,14 @@ upstream_urls = ["sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIb
 
 The stamp carries the server's IP address, its provider name and the key that signs its certificates, so it needs no `bootstrap`. OnetDNS fetches the certificate from the server itself and uses it only if the stamp's key signed it and it is within its validity period; it fetches it again about once an hour. A UDP answer that comes back truncated is asked again over TCP, so the server must accept DNSCrypt over TCP on the same port. Only DNSCrypt server stamps are accepted; write DoH, DoT and DoQ servers as URLs.
 
+To hide your address from the DNSCrypt server, send the queries through an Anonymized DNSCrypt relay: put `#` and the relay's stamp after the server's stamp.
+
+```toml
+upstream_urls = ["sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20#sdns://gQ4xOTIuMC4yLjE6NTQ0Mw"]
+```
+
+Everything for that server then goes through the relay, the certificate lookup included. The server sees the relay's address, and the relay sees only encrypted queries. A relay run by the server's operator sees both your address and your queries, so pick one run by someone else. The relay stamp must carry an IP address. `sdns://gQ4xOTIuMC4yLjE6NTQ0Mw` above stands for a relay at `192.0.2.1:5443`; replace it with a real relay's stamp.
+
 Upstream selection is controlled by `upstream_strategy` (such as query statistics, order, round-robin or parallel) and related concurrency/timeout options. These choices can affect both tail latency and total outbound traffic. Test them with repeated queries and a mix of cache hits/misses; do not assume sending more upstream requests always improves latency.
 
 ### Forwarding through a SOCKS5 proxy

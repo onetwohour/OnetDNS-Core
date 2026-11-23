@@ -395,14 +395,9 @@ mod tests {
                 b"\x00\x09\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01",
                 len,
             );
-            let mut packet = relay::ANON_MAGIC.to_vec();
-            packet.extend_from_slice(&match target.ip() {
-                std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
-                std::net::IpAddr::V6(ip) => ip.octets(),
-            });
-            packet.extend_from_slice(&target.port().to_be_bytes());
-            packet.extend_from_slice(&sealed);
-            client.send_to(&packet, relay_addr).unwrap();
+            client
+                .send_to(&relay::wrap(target, &sealed), relay_addr)
+                .unwrap();
             let mut buf = [0u8; 4096];
             let (len, _) = client.recv_from(&mut buf).ok()?;
             session.open(&buf[..len], &nonce)

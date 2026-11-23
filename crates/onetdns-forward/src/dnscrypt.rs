@@ -1,7 +1,9 @@
 //! DNSCrypt upstream. The provider's certificate is fetched from the server itself, checked against
 //! the key in the stamp and kept per upstream until it is due for refresh. Queries go over UDP and
-//! are asked again over TCP when the answer comes back truncated.
+//! are asked again over TCP when the answer comes back truncated. With a relay, every packet goes to
+//! it with the server's address in front, certificate lookups included.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -10,7 +12,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use onetdns_core::{LruMap, MutexExt};
 use onetdns_dnscrypt::client::{best_certificate, Certificate, Session, QUERY_OVERHEAD};
-use onetdns_proto::{Message, Name, RData, RecordType};
+use onetdns_dnscrypt::relay;
+use onetdns_proto::{Edns, Message, Name, RData, RecordType};
 
 use crate::{deadline_after, io_err, validate_response, ForwardError};
 
@@ -40,6 +43,17 @@ pub(crate) struct Server<'a> {
     pub(crate) addr: SocketAddr,
     pub(crate) provider_name: &'a str,
     pub(crate) public_key: &'a [u8; 32],
+    pub(crate) relay: Option<SocketAddr>,
+}
+
+impl Server<'_> {
+    /// Where to send `packet` for the server, and what to send.
+    fn route<'p>(&self, packet: &'p [u8]) -> (SocketAddr, Cow<'p, [u8]>) {
+        match self.relay {
+            Some(relay) => (relay, Cow::Owned(relay::wrap(self.addr, packet))),
+            None => (self.addr, Cow::Borrowed(packet)),
+        }
+    }
 }
 
 struct Active {
@@ -169,7 +183,8 @@ pub(crate) fn exchange(
 
     let udp_len = state.udp_query_len();
     let (packet, nonce) = active.session.seal(wire, udp_len);
-    let response = udp_roundtrip(server.addr, &packet, deadline, |bytes| {
+    let (dest, packet) = server.route(&packet);
+    let response = udp_roundtrip(dest, &packet, deadline, |bytes| {
         active.session.open(bytes, &nonce).and_then(answer)
     })?;
     if !response.header.truncated {
@@ -177,13 +192,18 @@ pub(crate) fn exchange(
     }
     state.grow_udp_query(udp_len);
 
-    // Random padding up to 256 bytes hides the query length on TCP, where the answer size does
-    // not depend on it.
-    let extra = usize::from(onetdns_core::ephemeral_random_array::<1>()[0] % 4) * 64;
-    let (packet, nonce) = active
-        .session
-        .seal(wire, QUERY_OVERHEAD + wire.len() + 1 + extra);
-    let bytes = tcp_roundtrip(server.addr, &packet, deadline)?;
+    let tcp_len = if server.relay.is_some() {
+        // The relay passes it on over UDP, where the answer may be no larger than the query.
+        relay::MAX_PACKET
+    } else {
+        // Random padding up to 256 bytes hides the query length on TCP, where the answer size
+        // does not depend on it.
+        let extra = usize::from(onetdns_core::ephemeral_random_array::<1>()[0] % 4) * 64;
+        QUERY_OVERHEAD + wire.len() + 1 + extra
+    };
+    let (packet, nonce) = active.session.seal(wire, tcp_len);
+    let (dest, packet) = server.route(&packet);
+    let bytes = tcp_roundtrip(dest, &packet, deadline)?;
     active
         .session
         .open(&bytes, &nonce)
@@ -196,24 +216,32 @@ pub(crate) fn exchange(
 fn fetch_certificate(server: &Server<'_>, deadline: Instant) -> Result<Certificate, ForwardError> {
     let name = Name::from_str(server.provider_name).map_err(|_| ForwardError::BadResponse)?;
     let id = crate::next_id();
-    let query = Message::query(id, name, RecordType::TXT);
+    let mut query = Message::query(id, name, RecordType::TXT);
+    if server.relay.is_some() {
+        // A relay passes back nothing larger than the lookup.
+        let opt = Edns::default()
+            .try_to_record()
+            .map_err(|_| ForwardError::BadResponse)?;
+        query.additionals.push(opt);
+        query
+            .pad_to(UDP_QUERY_MAX)
+            .map_err(|_| ForwardError::BadResponse)?;
+    }
     let wire = query.try_encode().map_err(|_| ForwardError::BadResponse)?;
+    let (dest, wire) = server.route(&wire);
     let valid = |response: Message| {
         validate_response(&query, &response, Some(id))
             .is_ok()
             .then_some(response)
     };
 
-    let over_udp = udp_roundtrip(
-        server.addr,
-        &wire,
-        crate::bounded_first_try(deadline),
-        |bytes| Message::parse_udp_reply(bytes).and_then(valid),
-    );
+    let over_udp = udp_roundtrip(dest, &wire, crate::bounded_first_try(deadline), |bytes| {
+        Message::parse_udp_reply(bytes).and_then(valid)
+    });
     let response = match over_udp {
         Ok(response) if !response.header.truncated => response,
         _ => {
-            let bytes = tcp_roundtrip(server.addr, &wire, deadline)?;
+            let bytes = tcp_roundtrip(dest, &wire, deadline)?;
             Message::parse(&bytes)
                 .ok()
                 .and_then(valid)
@@ -415,7 +443,7 @@ pub(crate) mod tests {
     }
 
     fn upstream(server: &TestServer) -> Upstream {
-        Upstream::dnscrypt(server.addr, PROVIDER, server.public_key)
+        Upstream::dnscrypt(server.addr, PROVIDER, server.public_key, None)
     }
 
     fn held_state(server: &TestServer) -> Arc<State> {
@@ -423,6 +451,7 @@ pub(crate) mod tests {
             addr: server.addr,
             provider_name: PROVIDER,
             public_key: &server.public_key,
+            relay: None,
         })
     }
 
@@ -444,10 +473,43 @@ pub(crate) mod tests {
     fn a_certificate_not_signed_by_the_stamp_key_is_refused() {
         let server = spawn_server(1);
         let stranger = Provider::generate(PROVIDER, 3_600).provider_public_key();
-        let refused = ask(Upstream::dnscrypt(server.addr, PROVIDER, stranger));
+        let refused = ask(Upstream::dnscrypt(server.addr, PROVIDER, stranger, None));
         assert!(
             refused.is_err(),
             "스탬프 키가 서명하지 않은 인증서를 믿었습니다"
+        );
+    }
+
+    #[test]
+    /// The relay counts what it passes on; the certificate lookup and the query must both be there.
+    fn a_relayed_upstream_reaches_its_server_only_through_the_relay() {
+        let server = spawn_server(1);
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let relayed = Arc::new(AtomicUsize::new(0));
+        let (count, target, stop) = (relayed.clone(), server.addr, server.stop.clone());
+        std::thread::spawn(move || {
+            onetdns_dnscrypt::server::serve(
+                Provider::generate("2.dnscrypt-cert.relay", 3_600),
+                relay_socket,
+                |_query, _src, _budget| None,
+                |_src| true,
+                |_src| false,
+                Some(Arc::new(relay::Relay::new(move |to| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    to == target
+                }))),
+                &stop,
+            )
+        });
+        let relayed_upstream =
+            Upstream::dnscrypt(server.addr, PROVIDER, server.public_key, Some(relay_addr));
+        let response = ask(relayed_upstream).expect("릴레이를 거친 응답");
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(
+            relayed.load(Ordering::Relaxed),
+            2,
+            "인증서 조회와 질의가 모두 릴레이를 거쳐야 합니다"
         );
     }
 

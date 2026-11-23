@@ -218,15 +218,7 @@ mod tests {
     /// Whether the relay built from `settings` passes a sealed-looking packet on to `target`.
     fn relays_to(settings: &str, target: &str) -> bool {
         let cfg = Config::from_toml_str(&format!("dnscrypt_relay = true\n{settings}")).unwrap();
-        let target: SocketAddr = target.parse().unwrap();
-        let ip = match target.ip() {
-            std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-            std::net::IpAddr::V6(ip) => ip,
-        };
-        let mut packet = relay::ANON_MAGIC.to_vec();
-        packet.extend_from_slice(&ip.octets());
-        packet.extend_from_slice(&target.port().to_be_bytes());
-        packet.extend_from_slice(&[0x42; 256]);
+        let packet = relay::wrap(target.parse().unwrap(), &[0x42; 256]);
         relay(&cfg).unwrap().accept(&packet).is_some()
     }
 
