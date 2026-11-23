@@ -720,6 +720,7 @@ mod tests {
                     provider_name: "2.dnscrypt-cert.onetdns".to_string(),
                     public_key: [7; 32],
                 }),
+                signer: None,
             };
             Endpoints::new(
                 &cfg,
