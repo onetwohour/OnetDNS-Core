@@ -711,12 +711,16 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     /// Answers every framed message on a connection with `tag`.
-    fn tagging_listener(listener: TcpListener, tag: u8) -> EncryptedTcpListener {
+    fn tagging_listener(
+        listener: TcpListener,
+        tag: u8,
+        limiter: Arc<ConnectionLimiter>,
+    ) -> EncryptedTcpListener {
         EncryptedTcpListener::spawn(
             listener,
             "handover-test",
             AdmissionProtocol::Dnscrypt,
-            Arc::new(ConnectionLimiter::default()),
+            limiter,
             |_| false,
             None,
             move |connection: AdmittedConnection| {
@@ -762,7 +766,11 @@ mod tests {
     /// next starts accepting before the first stops, on Windows after it stops reading. Either way
     /// the first answers what it accepted, and the next answers what waits on the socket.
     fn listener_hands_its_socket_over_without_dropping_connections() {
-        let mut first = tagging_listener(TcpListener::bind("127.0.0.1:0").unwrap(), 1);
+        let mut first = tagging_listener(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            1,
+            Arc::new(ConnectionLimiter::default()),
+        );
         let addr = first.addr();
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicUsize::new(0));
@@ -791,7 +799,7 @@ mod tests {
         if cfg!(windows) {
             first.stop_reading();
         }
-        let next = tagging_listener(socket, 2);
+        let next = tagging_listener(socket, 2, Arc::new(ConnectionLimiter::default()));
         drop(first);
         thread::sleep(Duration::from_millis(500));
         stop.store(true, Ordering::Release);
@@ -1055,5 +1063,125 @@ mod tests {
         .unwrap();
 
         assert_eq!(pending.poll().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Holds one pending connection on a single-slot limiter while `misbehave` drives the client,
+    /// polls until the connection fails, checks that the failure returned the slot, and returns
+    /// the error.
+    fn failed_admission(
+        protocol: AdmissionProtocol,
+        deadline: Duration,
+        misbehave: impl FnOnce(&mut TcpStream) + Send + 'static,
+    ) -> io::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        let limiter = ConnectionLimiter::new(1, 1);
+        let guard = limiter.try_acquire(peer.ip()).unwrap();
+        let connection = PendingEncryptedConnection::with_deadline(
+            server,
+            peer,
+            guard,
+            protocol,
+            Instant::now() + deadline,
+        )
+        .unwrap();
+        let mut pending = vec![connection];
+        assert!(
+            limiter.try_acquire(peer.ip()).is_none(),
+            "대조군이 무효입니다. 기다리는 연결이 자리를 잡지 않았습니다"
+        );
+
+        let client = thread::spawn(move || {
+            misbehave(&mut client);
+            client
+        });
+        let give_up = Instant::now() + Duration::from_secs(5);
+        let mut failure = None;
+        while failure.is_none() {
+            assert!(
+                Instant::now() < give_up,
+                "기다리는 연결이 실패하지 않았습니다"
+            );
+            thread::sleep(MIN_PREFIX_POLL);
+            poll_pending_encrypted_connections(
+                &mut pending,
+                |_, _, _| panic!("받아들이면 안 되는 연결을 받아들였습니다"),
+                |_, error| failure = Some(error),
+            );
+        }
+        drop(client.join().unwrap());
+        assert!(pending.is_empty());
+        assert!(
+            limiter.try_acquire(peer.ip()).is_some(),
+            "실패한 연결이 자리를 돌려주지 않았습니다"
+        );
+        failure.unwrap()
+    }
+
+    #[test]
+    fn failed_admission_returns_its_connection_slot() {
+        let long = Duration::from_secs(30);
+
+        let closed = failed_admission(AdmissionProtocol::Dnscrypt, long, |client| {
+            client.write_all(&[0, 3, 1]).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        assert_eq!(closed.kind(), io::ErrorKind::UnexpectedEof);
+
+        let oversized = failed_admission(AdmissionProtocol::Dnscrypt, long, |client| {
+            client.write_all(&[0x20, 0x01]).unwrap();
+        });
+        assert_eq!(
+            oversized.to_string(),
+            "DNSCrypt TCP frame length is out of range"
+        );
+
+        // A ClientHello cut into one-byte records never completes within the prefix limit.
+        let flood = failed_admission(AdmissionProtocol::Tls, long, |client| {
+            let mut bytes = tls_record(&[1, 0, 0x75, 0x30]);
+            while bytes.len() <= onetdns_tls::record::MAX_CLIENT_HELLO_PREFIX {
+                bytes.extend_from_slice(&tls_record(&[0]));
+            }
+            let _ = client.write_all(&bytes);
+        });
+        assert_eq!(
+            flood.to_string(),
+            "Frame did not end within the encrypted TCP prefix limit"
+        );
+
+        let silent = failed_admission(AdmissionProtocol::Tls, Duration::from_millis(100), |_| {});
+        assert_eq!(silent.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    /// A connection still waiting for its first frame holds its slot, so the listener refuses the
+    /// next one; the slot comes back when the waiting peer leaves, and again when a served
+    /// connection ends.
+    fn listener_refuses_at_the_cap_and_recovers() {
+        let listener = tagging_listener(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            1,
+            ConnectionLimiter::new(1, 1),
+        );
+        let addr = listener.addr();
+        let ask_until_answered = || {
+            let give_up = Instant::now() + Duration::from_secs(5);
+            while ask(addr).is_none() {
+                assert!(Instant::now() < give_up, "상한에서 풀려나지 않았습니다");
+                thread::sleep(MIN_PREFIX_POLL);
+            }
+        };
+
+        let waiting = TcpStream::connect(addr).unwrap();
+        assert_eq!(
+            ask(addr),
+            None,
+            "첫 프레임을 기다리는 연결이 자리를 차지하지 않았습니다"
+        );
+        drop(waiting);
+        ask_until_answered();
+        ask_until_answered();
+        drop(listener);
     }
 }
