@@ -6,7 +6,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use onetdns_core::MutexExt;
+use onetdns_config::Config;
+use onetdns_core::{ArcSwap, MutexExt};
 use onetdns_forward::odoh::{OdohError, Relay, RelayError, Relayed, TargetKey};
 use onetdns_http2::{Oblivious, ObliviousReply};
 use onetdns_tls::hpke::PrivateKey;
@@ -49,7 +50,8 @@ impl OdohTarget {
 /// The targets an ODoH proxy relays to. Connections to them are shared by every client.
 pub(crate) struct OdohProxy {
     targets: Vec<ProxyTarget>,
-    bootstrap: Vec<IpAddr>,
+    /// The running config. Its `bootstrap` changes without reopening the DoH listener.
+    runtime_cfg: Arc<ArcSwap<Config>>,
     relay: Relay,
 }
 
@@ -64,9 +66,9 @@ struct ProxyTarget {
 }
 
 impl OdohProxy {
-    /// `targets` are URLs config validation accepted. Hostnames are looked up through `bootstrap`
-    /// on first use.
-    pub(crate) fn new(targets: &[String], bootstrap: &[IpAddr], relay: Relay) -> Self {
+    /// `targets` are URLs config validation accepted. Hostnames are looked up through the running
+    /// config's `bootstrap` on first use.
+    pub(crate) fn new(targets: &[String], runtime_cfg: Arc<ArcSwap<Config>>, relay: Relay) -> Self {
         let targets = targets
             .iter()
             .filter_map(|url| {
@@ -88,7 +90,7 @@ impl OdohProxy {
             .collect();
         Self {
             targets,
-            bootstrap: bootstrap.to_vec(),
+            runtime_cfg,
             relay,
         }
     }
@@ -146,7 +148,7 @@ impl OdohProxy {
         }
         let resolved = onetdns_forward::resolve_via_bootstrap(
             &target.host,
-            &self.bootstrap,
+            &self.runtime_cfg.load().bootstrap,
             BOOTSTRAP_TIMEOUT,
         )
         .map(|(ip, ttl)| {
@@ -219,10 +221,13 @@ where
                 });
             }
         };
-        let response = match (self.resolve)(opened.dns()) {
-            Ok(Some(response)) => response,
-            Ok(None) => return ObliviousReply::Drop,
-            Err(status) => return ObliviousReply::Status(status),
+        let response = match refused_unless_query(opened.dns()) {
+            Some(refused) => refused,
+            None => match (self.resolve)(opened.dns()) {
+                Ok(Some(response)) => response,
+                Ok(None) => return ObliviousReply::Unanswered,
+                Err(status) => return ObliviousReply::Status(status),
+            },
         };
         match opened.seal_response(&response) {
             Ok(sealed) => ObliviousReply::Message(sealed),
@@ -246,13 +251,64 @@ where
     }
 }
 
+/// The proxy's address stands for every client behind it, so a request authorized by source
+/// address, such as UPDATE, NOTIFY or a zone transfer, is refused rather than granted to all of
+/// them.
+fn refused_unless_query(dns: &[u8]) -> Option<Vec<u8>> {
+    const IXFR: u16 = 251;
+    const AXFR: u16 = 252;
+    let request = onetdns_proto::Message::parse(dns).ok()?;
+    let transfer = request
+        .questions
+        .iter()
+        .any(|question| matches!(question.qtype.0, IXFR | AXFR));
+    if request.header.response || (request.header.opcode == 0 && !transfer) {
+        return None;
+    }
+    crate::native::error_resp(&request, onetdns_proto::ResponseCode::Refused)
+        .try_encode()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_standard_queries_reach_the_resolver() {
+        let name = onetdns_proto::Name::from_str("zone.test").unwrap();
+        let query = onetdns_proto::Message::query(7, name.clone(), onetdns_proto::RecordType::SOA);
+        assert_eq!(refused_unless_query(&query.try_encode().unwrap()), None);
+        let mut update = query.clone();
+        update.header.opcode = 5;
+        let mut notify = query.clone();
+        notify.header.opcode = 4;
+        let axfr = onetdns_proto::Message::query(7, name.clone(), onetdns_proto::RecordType(252));
+        let ixfr = onetdns_proto::Message::query(7, name, onetdns_proto::RecordType(251));
+        for (label, other) in [
+            ("UPDATE", update),
+            ("NOTIFY", notify),
+            ("AXFR", axfr),
+            ("IXFR", ixfr),
+        ] {
+            let refused = refused_unless_query(&other.try_encode().unwrap()).expect(label);
+            let refused = onetdns_proto::Message::parse(&refused).unwrap();
+            assert_eq!(refused.header.id, 7);
+            assert_eq!(
+                refused.header.rcode,
+                onetdns_proto::ResponseCode::Refused.0,
+                "{label}"
+            );
+        }
+    }
+
     fn proxy(targets: &[&str]) -> OdohProxy {
         let targets: Vec<String> = targets.iter().map(|target| target.to_string()).collect();
-        OdohProxy::new(&targets, &[], Relay::default())
+        OdohProxy::new(
+            &targets,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Relay::default(),
+        )
     }
 
     #[test]

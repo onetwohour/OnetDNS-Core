@@ -110,6 +110,7 @@ fn load_or_create_odoh_target(
 fn open_oblivious(
     cfg: &Config,
     config_path: Option<&std::path::Path>,
+    runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
 ) -> Result<Option<Arc<ObliviousDoh>>, String> {
     let target = if cfg.odoh_target {
         Some(load_or_create_odoh_target(config_path)?)
@@ -119,7 +120,7 @@ fn open_oblivious(
     let proxy = (!cfg.odoh_proxy_targets.is_empty()).then(|| {
         OdohProxy::new(
             &cfg.odoh_proxy_targets,
-            &cfg.bootstrap,
+            runtime_cfg.clone(),
             onetdns_forward::odoh::Relay::default(),
         )
     });
@@ -137,6 +138,10 @@ fn doh_listener_variant(cfg: &Config) -> String {
         variant.push_str(&cfg.odoh_proxy_targets.join(","));
     }
     variant
+}
+
+fn encrypted_listener_key(kind: &str, addr: &SocketAddr, variant: &str) -> String {
+    format!("{kind}|{addr}|{variant}")
 }
 
 enum KeyFileError {
@@ -689,6 +694,7 @@ fn forget_listener(
 /// their queries are never cut. New listeners open before old ones close.
 ///
 /// Fails when an address cannot be opened; the old listeners then stay up and keep answering.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_listeners(
     cfg: &Config,
     set: &ListenerSet,
@@ -697,6 +703,7 @@ pub(crate) fn reconcile_listeners(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
     config_path: Option<&std::path::Path>,
+    runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
 ) -> Result<(), String> {
     let available_cpus = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -782,7 +789,16 @@ pub(crate) fn reconcile_listeners(
     plain.extend(fresh_plain);
     drop(plain);
 
-    reconcile_encrypted(cfg, set, handler, tls, shutdown, registry, config_path)
+    reconcile_encrypted(
+        cfg,
+        set,
+        handler,
+        tls,
+        shutdown,
+        registry,
+        config_path,
+        runtime_cfg,
+    )
 }
 
 /// Adopted sockets first, so a socket handed over keeps the queries queued on it.
@@ -838,6 +854,7 @@ fn quic_socket(
 }
 
 /// Plain DNS is left alone.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_encrypted(
     cfg: &Config,
     set: &ListenerSet,
@@ -846,6 +863,7 @@ fn reconcile_encrypted(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
     config_path: Option<&std::path::Path>,
+    runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
 ) -> Result<(), String> {
     const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
     let self_signed_file = crate::tls_material::self_signed_file(config_path);
@@ -863,7 +881,7 @@ fn reconcile_encrypted(
             };
             let wanted: Vec<(String, SocketAddr)> = $addrs
                 .iter()
-                .map(|addr: &SocketAddr| (format!("{}|{}|{}", $kind, addr, path_part), *addr))
+                .map(|addr: &SocketAddr| (encrypted_listener_key($kind, addr, &path_part), *addr))
                 .collect();
             let mut fresh = Vec::new();
             for (key, addr) in &wanted {
@@ -926,13 +944,23 @@ fn reconcile_encrypted(
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh.clone())?;
         // Built only when a listener opens, so a reload that leaves DoH alone never reads the
-        // target key. Listeners opened together share it and the proxy's target connections.
-        let mut oblivious = None;
+        // target key, and before any listener closes, so a bad key file leaves the old ones up.
+        // Listeners opened together share it and the proxy's target connections.
+        let variant = doh_listener_variant(cfg);
+        let opening = {
+            let live = set.doh.lock_recover();
+            cfg.listen_doh.iter().any(|addr| {
+                let key = encrypted_listener_key("doh", addr, &variant);
+                !live.iter().any(|(have, _)| *have == key)
+            })
+        };
+        let oblivious = if opening {
+            open_oblivious(cfg, config_path, runtime_cfg)?
+        } else {
+            None
+        };
         sync_one!(doh, cfg.listen_doh, "doh", |addr| -> Result<_, String> {
-            if oblivious.is_none() {
-                oblivious = Some(open_oblivious(cfg, config_path)?);
-            }
-            let oblivious = oblivious.clone().flatten();
+            let oblivious = oblivious.clone();
             tcp_socket(set, SocketRole::Doh, addr)
                 .and_then(|socket| {
                     doh::serve_doh(
@@ -1361,6 +1389,7 @@ pub(crate) mod tests {
                 &self.shutdown,
                 &Arc::new(Mutex::new(Vec::new())),
                 None,
+                &Arc::new(onetdns_core::ArcSwap::from_pointee(cfg.clone())),
             )
             .expect("수신 주소 열기");
             self.set.drop_unclaimed();
@@ -1744,5 +1773,61 @@ pub(crate) mod tests {
 
         std::fs::remove_file(key_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    /// The target key is read before the DoH listener it changes closes, so a damaged key file
+    /// fails the reload and leaves plain DoH up.
+    fn a_bad_odoh_key_on_reload_keeps_the_doh_listener() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-odoh-reload-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config_path = dir.join(CONFIG_FILE_NAME);
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let plain = Config {
+            listen: vec![],
+            listen_doh: vec![addr],
+            tls_self_signed_host: Some("dns.test".into()),
+            ..Config::default()
+        };
+        let generation = Generation::new(Ipv4Addr::new(192, 0, 2, 1));
+        let tls = Arc::new(Mutex::new(None));
+        let reconcile = |cfg: &Config| {
+            reconcile_listeners(
+                cfg,
+                &generation.set,
+                &generation.handler,
+                &tls,
+                &generation.shutdown,
+                &Arc::new(Mutex::new(Vec::new())),
+                Some(&config_path),
+                &Arc::new(onetdns_core::ArcSwap::from_pointee(cfg.clone())),
+            )
+        };
+        reconcile(&plain).expect("DoH 리스너 열기");
+
+        std::fs::write(dir.join("odoh-target.key"), "not hex").unwrap();
+        let target = Config {
+            odoh_target: true,
+            ..plain.clone()
+        };
+        let error = reconcile(&target).expect_err("깨진 키 파일로 대상을 켜면 안 됩니다");
+        assert!(error.contains("corrupted"), "{error}");
+        assert!(
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok(),
+            "키를 읽기 전에 기존 DoH 리스너를 닫았습니다"
+        );
+
+        generation.close();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

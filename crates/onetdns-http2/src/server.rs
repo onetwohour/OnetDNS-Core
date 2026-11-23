@@ -40,6 +40,8 @@ enum AppResponse {
     Status(&'static str),
     Dns(DohAnswer),
     Http(HttpReply),
+    /// No answer for this request alone: HTTP/2 resets its stream and keeps the connection.
+    Reset,
 }
 
 /// A response that is not a DNS answer: status, fields after it, and body.
@@ -109,6 +111,9 @@ pub enum ObliviousReply {
     Status(&'static str),
     /// No response; the connection closes, as for a DNS query the handler does not answer.
     Drop,
+    /// No response to this message alone. A proxy carries other clients' messages on the same
+    /// connection, so closing it would drop theirs too.
+    Unanswered,
     /// The target's non-200 status, passed on with Proxy-Status `received-status`.
     TargetStatus(u16),
     /// The proxy relayed nothing back: this status, and the Proxy-Status error type saying why.
@@ -189,6 +194,7 @@ fn route_oblivious(
         ObliviousReply::Message(_) => AppResponse::Status(STATUS_BAD_GATEWAY),
         ObliviousReply::Status(status) => AppResponse::Status(status),
         ObliviousReply::Drop => return Route::Drop,
+        ObliviousReply::Unanswered => AppResponse::Reset,
         ObliviousReply::TargetStatus(status) => AppResponse::Http(HttpReply::proxy_status(
             status.to_string(),
             format!("received-status={status}"),
@@ -1018,6 +1024,11 @@ fn queue_response<S: Write>(
         AppResponse::Http(reply) => {
             return queue_reply(stream, sid, reply, pending, stream_windows);
         }
+        AppResponse::Reset => {
+            send_rst_stream(stream, sid, error_code::CANCEL)?;
+            pending.remove(&sid);
+            stream_windows.remove(&sid);
+        }
     }
     Ok(())
 }
@@ -1293,6 +1304,8 @@ fn write_h1_app_response<S: Write>(stream: &mut S, response: AppResponse) -> Res
         AppResponse::Status(status) => write_h1_status(stream, &h1_status_line(status)),
         AppResponse::Dns(answer) => write_h1_response(stream, &answer.body, answer.max_age),
         AppResponse::Http(reply) => write_h1_reply(stream, reply),
+        // Every HTTP/1.1 response here closes the connection, which then carries nothing else.
+        AppResponse::Reset => Ok(()),
     }
 }
 
@@ -2830,8 +2843,8 @@ mod tests {
         assert_eq!(payload, error_code::REFUSED_STREAM.to_be_bytes());
     }
 
-    /// Reverses the message; "unknown" stands for another key and "drop" for a query the resolver
-    /// does not answer.
+    /// Reverses the message; "unknown" stands for another key, "drop" for a relay refused outright
+    /// and "unanswered" for a query the resolver does not answer.
     struct EchoTarget {
         is_target: bool,
     }
@@ -2845,6 +2858,7 @@ mod tests {
             match message {
                 b"unknown" => ObliviousReply::Status("401"),
                 b"drop" => ObliviousReply::Drop,
+                b"unanswered" => ObliviousReply::Unanswered,
                 _ => ObliviousReply::Message(message.iter().rev().copied().collect()),
             }
         }
@@ -2912,6 +2926,7 @@ mod tests {
         let unknown = h1_oblivious_post("/dns-query", b"unknown", TARGET);
         assert!(unknown.starts_with("HTTP/1.1 401 "), "{unknown}");
         assert_eq!(h1_oblivious_post("/dns-query", b"drop", TARGET), "");
+        assert_eq!(h1_oblivious_post("/dns-query", b"unanswered", TARGET), "");
         let empty = h1_oblivious_post("/dns-query", b"", TARGET);
         assert!(empty.starts_with("HTTP/1.1 400 "), "{empty}");
     }
@@ -3100,17 +3115,33 @@ mod tests {
         let (headers, _) = h2_request_on(&mut client, 5, &post("/dns-query/laptop"), b"abc");
         assert_eq!(header(&headers, b":status"), Some(&b"404"[..]));
 
+        let block = hpack::encode_response(&post("/dns-query"));
+        open_stream(&mut client, 7, &block);
+        send_frame(
+            &mut client,
+            frame_type::DATA,
+            flags::END_STREAM,
+            7,
+            b"unanswered",
+        )
+        .unwrap();
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(7, error_code::CANCEL)],
+            "an unanswered message must end its own stream, not the proxy's connection"
+        );
+
         let get = [
             (":method", "GET"),
             (":scheme", "https"),
             (":authority", "dns.test"),
             (":path", ODOH_CONFIGS_PATH),
         ];
-        let (headers, body) = h2_request_on(&mut client, 7, &get, b"");
+        let (headers, body) = h2_request_on(&mut client, 9, &get, b"");
         assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
         assert_eq!(body, b"configs");
 
-        assert_eq!(h2_exchange_on(&mut client, 9, b"dns"), b"dns");
+        assert_eq!(h2_exchange_on(&mut client, 11, b"dns"), b"dns");
         drop(client);
         server.join().unwrap();
     }

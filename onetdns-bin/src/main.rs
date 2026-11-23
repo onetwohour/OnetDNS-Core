@@ -1821,6 +1821,7 @@ pub fn serve(
         let path = config_path.clone();
         let tracker = service_cleanup.tracker();
         let identity = dnscrypt_identity.clone();
+        let running = runtime_cfg.clone();
         Arc::new(move |next: &Config| -> Result<(), String> {
             reconcile_listeners(
                 next,
@@ -1830,6 +1831,7 @@ pub fn serve(
                 &sd,
                 &registry,
                 path.as_deref(),
+                &running,
             )?;
             reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
         })

@@ -264,7 +264,7 @@ odoh_proxy_targets = ["https://odoh.example.net/dns-query"]
 
 Makes the `listen_doh` listeners an Oblivious DoH proxy for these targets, each written as `https://host[:port]/path`, with `#name` to set the TLS server name as in `upstream_urls`. A client names the target in the `targethost` and `targetpath` query parameters of a POST to `doh_path`; a request for a host, port or path not listed gets HTTP 403, so the proxy relays nowhere else. Empty, the default, turns the proxy off. Requires `listen_doh`.
 
-The proxy cannot read what it relays. The relayed messages are not in the query log; the ACL and rate limits still apply to the client that sends them. Each target sees every relayed query as coming from this server. A target given by hostname is looked up through `bootstrap` when first used and again when its TTL runs out; the bootstrap servers are those in effect when the DoH listener opened. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
+The proxy cannot read what it relays. The relayed messages are not in the query log; the ACL and rate limits still apply to the client that sends them. Each target sees every relayed query as coming from this server. A target given by hostname is looked up through `bootstrap` when first used and again when its TTL runs out. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
 
 ### `proxy_protocol_ports`
 

@@ -64,7 +64,7 @@ The listener then also accepts `application/oblivious-dns-message` POSTs on `doh
 
 The target key is created on first use as `odoh-target.key` next to the configuration file and kept across restarts and upgrades. OnetDNS never replaces it on its own: a damaged file stops the DoH listener with an error. To change the key, delete the file and restart OnetDNS; clients holding the old configuration get HTTP 401 and fetch the new one. Anyone who can read the file can decrypt previously captured queries to this target, so protect it like the TLS private key.
 
-**Every ODoH query appears to come from the proxy.** Client policy, ACLs, rate limits, client-specific rules and the query log key on the proxy's address (or the proxy's mTLS client identity), never on the client behind it. All clients of one proxy share its policy and its per-client rate limit; if you rate-limit clients, list the proxy in `rate_limit_allow` or the proxy's users will be throttled together.
+**Every ODoH query appears to come from the proxy.** Client policy, ACLs, rate limits, client-specific rules and the query log key on the proxy's address (or the proxy's mTLS client identity), never on the client behind it. All clients of one proxy share its policy and its per-client rate limit; if you rate-limit clients, list the proxy in `rate_limit_allow` or the proxy's users will be throttled together. For the same reason, dynamic updates, NOTIFY and zone transfers that arrive through ODoH are refused, even when the proxy's address is in `update_allow` or `xfr_allow`.
 
 To act as a proxy, list the targets it may relay to:
 

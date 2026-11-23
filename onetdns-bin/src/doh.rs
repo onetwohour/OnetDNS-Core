@@ -709,7 +709,9 @@ mod tests {
                     target: None,
                     proxy: Some(crate::odoh::OdohProxy::new(
                         std::slice::from_ref(&listed),
-                        &[],
+                        Arc::new(onetdns_core::ArcSwap::from_pointee(
+                            onetdns_config::Config::default(),
+                        )),
                         Relay::with_trust(trust.clone()),
                     )),
                 })),
