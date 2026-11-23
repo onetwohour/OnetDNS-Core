@@ -1117,6 +1117,7 @@ impl NativeServer {
         packet: &[u8],
         ctx: &RequestCtx,
         out: &mut onetdns_proto::Writer,
+        now: std::time::Instant,
     ) -> onetdns_runtime::WireDisposition {
         use onetdns_runtime::WireDisposition as Wire;
 
@@ -1222,7 +1223,7 @@ impl NativeServer {
                 return Wire::Fallback;
             }
         }
-        self.record_authority_wire(ctx, &scanned, client, out);
+        self.record_authority_wire(ctx, &scanned, client, out, now);
         Wire::Respond
     }
 
@@ -1235,10 +1236,12 @@ impl NativeServer {
         scanned: &crate::wirecache::ScannedQuery<'_>,
         client: Option<ClientInfo>,
         out: &onetdns_proto::Writer,
+        now: std::time::Instant,
     ) {
         let Some(recorder) = self.events() else {
             return;
         };
+        let timer = onetdns_control::RequestTimer::start_at(now);
         let Some(flags) = out.buf.get(3) else {
             return;
         };
@@ -1263,6 +1266,7 @@ impl NativeServer {
             stat,
             None,
         );
+        recorder.record_latency_for(timer.elapsed_us(), stat, qname.as_ref());
     }
 }
 

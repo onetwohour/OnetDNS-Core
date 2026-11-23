@@ -3471,6 +3471,8 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
     .with_authority_wire_path(Some(store), true);
 
     let mut output = onetdns_proto::Writer::with_limit(1232);
+    let arrived = Instant::now();
+    std::thread::sleep(Duration::from_millis(20));
     for (name, expected) in [
         ("www.rec.test", ResponseCode::NoError),
         ("nope.rec.test", ResponseCode::NXDomain),
@@ -3479,12 +3481,7 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
         output.clear();
         server.features.take_test_loads();
         assert_eq!(
-            server.handle_udp_wire(
-                &request.try_encode().unwrap(),
-                &ctx(),
-                &mut output,
-                Instant::now()
-            ),
+            server.handle_udp_wire(&request.try_encode().unwrap(), &ctx(), &mut output, arrived),
             onetdns_runtime::WireDisposition::Respond,
             "{name}은 무할당 경로가 맡아야 합니다"
         );
@@ -3510,6 +3507,20 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
         snapshot.total, 2,
         "무할당 경로로 답한 질의가 지표에 남지 않았습니다"
     );
+    assert!(
+        snapshot.avg_latency_ms >= 20.0,
+        "무할당 경로가 받은 시각부터 잰 처리시간을 평균에 넣지 않았습니다: {}",
+        snapshot.avg_latency_ms
+    );
+    let recent = stats.recent(8);
+    assert_eq!(recent.len(), 2, "무할당 경로의 질의 기록이 없습니다");
+    for event in recent {
+        assert!(
+            event.latency_us >= 20_000,
+            "무할당 경로의 질의 기록에 처리시간이 없습니다: {} us",
+            event.latency_us
+        );
+    }
 }
 
 #[test]

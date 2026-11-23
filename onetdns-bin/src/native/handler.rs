@@ -101,7 +101,7 @@ impl Handler for NativeServer {
         out: &mut onetdns_proto::Writer,
         now: std::time::Instant,
     ) -> onetdns_runtime::WireDisposition {
-        let authority = self.authority_wire_dispatch(packet, ctx, out);
+        let authority = self.authority_wire_dispatch(packet, ctx, out, now);
         if authority != onetdns_runtime::WireDisposition::Fallback {
             return authority;
         }
@@ -114,9 +114,9 @@ impl Handler for NativeServer {
         packet: &[u8],
         ctx: &RequestCtx,
         out: &mut onetdns_proto::Writer,
-        _now: std::time::Instant,
+        now: std::time::Instant,
     ) -> onetdns_runtime::WireDisposition {
-        self.authority_wire_dispatch(packet, ctx, out)
+        self.authority_wire_dispatch(packet, ctx, out, now)
     }
 
     fn handle_preencoded_stream(
