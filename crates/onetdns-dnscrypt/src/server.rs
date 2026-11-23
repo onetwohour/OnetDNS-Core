@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::relay::{self, Relay};
 use crate::{
@@ -103,14 +104,31 @@ fn record_send_error(src: SocketAddr, error: &std::io::Error) {
     }
 }
 
+/// Packets waiting for a worker; more are dropped, and the client retries.
+const QUEUE_DEPTH: usize = 1024;
+
+/// Logs only every power-of-two drop, as overload would otherwise also flood the log.
+fn record_queue_full(src: SocketAddr) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        onetdns_core::warn!(event = "dnscrypt.queue_full", client = %src, count = count, "Dropped a DNSCrypt query: queries arrive faster than the workers answer them");
+    }
+}
+
 /// `allowed` guards the certificate lookup too: anyone can call it without encryption or
 /// authentication, so without this check it would be an amplification path past access control and
 /// rate limiting. It guards relayed packets as well, which never reach the pipeline. `drops` is
 /// checked first on every packet: a source dropped by address gets no answer whatever the packet
-/// holds, so it must not cost a key exchange. Each packet runs inside a fault isolation boundary,
-/// so a panic from a crafted packet cannot kill the listener. The read timeout lets the loop see
-/// the shutdown signal; without it the thread would not join on reload and the socket would stay
+/// holds, so it must not cost a key exchange.
+///
+/// One thread reads the socket and `workers` threads answer, so a query waiting on its upstream
+/// does not hold up the ones behind it. Each packet runs inside a fault isolation boundary, so a
+/// panic from a crafted packet cannot kill a thread. The read timeout lets the reader see the
+/// shutdown signal; without it the thread would not join on reload and the socket would stay
 /// bound.
+#[allow(clippy::too_many_arguments)]
 pub fn serve<H, A, D>(
     provider: Provider,
     socket: UdpSocket,
@@ -118,11 +136,12 @@ pub fn serve<H, A, D>(
     allowed: A,
     drops: D,
     relay: Option<Arc<Relay>>,
+    workers: usize,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()>
 where
-    H: Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>>,
-    A: Fn(SocketAddr) -> bool,
+    H: Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>> + Sync,
+    A: Fn(SocketAddr) -> bool + Sync,
     D: Fn(SocketAddr) -> bool,
 {
     let wait = onetdns_core::udp::RecvWait::new(std::time::Duration::from_millis(500));
@@ -131,9 +150,54 @@ where
     }
     // Relay threads hold it weakly, so a late answer cannot keep the port bound after shutdown.
     let socket = Arc::new(socket);
+    let (queue, jobs) = mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(QUEUE_DEPTH);
+    let jobs = Mutex::new(jobs);
+    std::thread::scope(|scope| {
+        let mut started = 0;
+        for index in 0..workers.max(1) {
+            let spawned = std::thread::Builder::new()
+                .name(format!("dnscrypt-worker-{index}"))
+                .spawn_scoped(scope, || {
+                    answer_queued(&jobs, &provider, &socket, &handler, &allowed)
+                });
+            match spawned {
+                Ok(_) => started += 1,
+                Err(error) if started == 0 => return Err(error),
+                Err(error) => {
+                    onetdns_core::error!(event = "dnscrypt.worker_spawn_failed", started, wanted = workers, %error, "Could not start every DNSCrypt worker; answering with fewer");
+                    break;
+                }
+            }
+        }
+        receive(
+            &socket,
+            wait,
+            queue,
+            &allowed,
+            &drops,
+            relay.as_ref(),
+            shutdown,
+        );
+        Ok(())
+    })
+}
+
+/// Returns on shutdown, and dropping `queue` then stops the workers.
+fn receive<A, D>(
+    socket: &Arc<UdpSocket>,
+    wait: onetdns_core::udp::RecvWait,
+    queue: SyncSender<(Vec<u8>, SocketAddr)>,
+    allowed: &A,
+    drops: &D,
+    relay: Option<&Arc<Relay>>,
+    shutdown: &std::sync::atomic::AtomicBool,
+) where
+    A: Fn(SocketAddr) -> bool,
+    D: Fn(SocketAddr) -> bool,
+{
     let mut buf = vec![0u8; relay::MAX_ANONYMIZED];
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        let (n, src) = match wait.recv_from(&socket, &mut buf) {
+        let (n, src) = match wait.recv_from(socket, &mut buf) {
             Ok(x) => x,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -152,9 +216,9 @@ where
             if drops(src) {
                 return;
             }
-            if let Some(relay) = relay.as_ref().filter(|_| relay::is_anonymized(packet)) {
+            if let Some(relay) = relay.filter(|_| relay::is_anonymized(packet)) {
                 if let Some(forward) = relay.accept(packet).filter(|_| allowed(src)) {
-                    let socket = Arc::downgrade(&socket);
+                    let socket = Arc::downgrade(socket);
                     relay.spawn(forward, move |answer| {
                         if let Some(socket) = socket.upgrade() {
                             if let Err(error) = socket.send_to(answer, src) {
@@ -165,14 +229,36 @@ where
                 }
                 return;
             }
-            if let Some(out) = respond(&provider, packet, src, true, &handler, &allowed) {
+            if queue.try_send((packet.to_vec(), src)).is_err() {
+                record_queue_full(src);
+            }
+        });
+    }
+}
+
+fn answer_queued<H, A>(
+    jobs: &Mutex<Receiver<(Vec<u8>, SocketAddr)>>,
+    provider: &Provider,
+    socket: &UdpSocket,
+    handler: &H,
+    allowed: &A,
+) where
+    H: Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>>,
+    A: Fn(SocketAddr) -> bool,
+{
+    loop {
+        let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok((packet, src)) = job else {
+            return;
+        };
+        let _ = onetdns_core::isolation::catch_request(|| {
+            if let Some(out) = respond(provider, &packet, src, true, handler, allowed) {
                 if let Err(error) = socket.send_to(&out, src) {
                     record_send_error(src, &error);
                 }
             }
         });
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -217,6 +303,7 @@ mod tests {
                 move |_src| allow,
                 move |_src| drop,
                 None,
+                2,
                 &worker_stop,
             );
         });
@@ -338,7 +425,7 @@ mod tests {
     /// A listener on loopback that answers queries with the query itself, flagged as a response.
     fn spawn_listener(
         provider: Provider,
-        allowed: impl Fn(SocketAddr) -> bool + Send + 'static,
+        allowed: impl Fn(SocketAddr) -> bool + Send + Sync + 'static,
         relay: Option<Arc<Relay>>,
     ) -> (SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -357,6 +444,7 @@ mod tests {
                 allowed,
                 |_src| false,
                 relay,
+                2,
                 &worker_stop,
             )
         });

@@ -90,6 +90,7 @@ pub fn serve(
     socket: UdpSocket,
     provider: Provider,
     relay: Option<Arc<Relay>>,
+    workers: usize,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let gate = make_gate(handler.clone());
@@ -98,7 +99,7 @@ pub fn serve(
         move |src: SocketAddr| handler.drops_source(src.ip())
     };
     let h = make_handler(handler);
-    onetdns_dnscrypt::server::serve(provider, socket, h, gate, drops, relay, &shutdown)
+    onetdns_dnscrypt::server::serve(provider, socket, h, gate, drops, relay, workers, &shutdown)
 }
 
 /// Serves DNSCrypt over TCP on `listener`, already bound, one transaction per connection as the
@@ -421,7 +422,14 @@ mod tests {
         let (server_provider, server_handler, server_stop) =
             (provider.clone(), handler.clone(), stop.clone());
         std::thread::spawn(move || {
-            serve(server_handler, server, server_provider, None, server_stop)
+            serve(
+                server_handler,
+                server,
+                server_provider,
+                None,
+                2,
+                server_stop,
+            )
         });
 
         let cfg = Config::from_toml_str(&format!(
@@ -457,6 +465,7 @@ mod tests {
                 relay_udp,
                 relay_provider,
                 relay(&cfg),
+                2,
                 relay_stop,
             )
         });
@@ -481,5 +490,85 @@ mod tests {
         assert_eq!(response.header.id, 0x5151);
         assert!(!response.header.truncated);
         assert_eq!(response.answers.len(), 40);
+    }
+
+    /// Answers every query after `delay`, each on its own thread.
+    fn slow_upstream(delay: Duration) -> SocketAddr {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let addr = socket.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((len, from)) = socket.recv_from(&mut buf) {
+                let Ok(mut answer) = Message::parse(&buf[..len]) else {
+                    continue;
+                };
+                let socket = socket.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    answer.header.response = true;
+                    answer.additionals.clear();
+                    let _ = socket.send_to(&answer.try_encode().unwrap(), from);
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_slow_upstream_answer_does_not_hold_up_other_queries() {
+        const DELAY: Duration = Duration::from_millis(200);
+        const CLIENTS: u16 = 8;
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler = native_handler(onetdns_security::IpAcl::allow_all(), slow_upstream(DELAY));
+        let provider = Provider::generate("2.dnscrypt-cert.onetdns", 86_400);
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let (server_provider, server_stop) = (provider.clone(), stop.clone());
+        std::thread::spawn(move || {
+            serve(
+                handler,
+                server,
+                server_provider,
+                None,
+                usize::from(CLIENTS),
+                server_stop,
+            )
+        });
+
+        let key = provider.provider_public_key();
+        let started = std::time::Instant::now();
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let client = onetdns_forward::Forwarder::with_upstreams(
+                        vec![onetdns_forward::Upstream::dnscrypt(
+                            addr,
+                            "2.dnscrypt-cert.onetdns",
+                            key,
+                            None,
+                        )],
+                        Duration::from_secs(5),
+                    );
+                    let query = Message::query(
+                        index,
+                        onetdns_proto::Name::from_str(&format!("slow{index}.test")).unwrap(),
+                        onetdns_proto::RecordType::A,
+                    );
+                    client.resolve(&query).is_ok()
+                })
+            })
+            .collect();
+        let answered = clients
+            .into_iter()
+            .filter_map(|client| client.join().ok())
+            .filter(|answered| *answered)
+            .count();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Release);
+        assert_eq!(answered, usize::from(CLIENTS));
+        assert!(
+            elapsed < DELAY * 4,
+            "업스트림을 기다리는 질의 {CLIENTS}개가 차례로 처리됐습니다: {elapsed:?}"
+        );
     }
 }

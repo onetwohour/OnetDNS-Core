@@ -959,8 +959,9 @@ fn open_when_free<T>(mut open: impl FnMut() -> std::io::Result<T>) -> std::io::R
     }
 }
 
-/// Keyed by address, provider name and relay settings; a listener whose key is unchanged is left
-/// alone. Fails when the provider key cannot be read or an address cannot be opened.
+/// Keyed by address, provider name, worker count and relay settings; a listener whose key is
+/// unchanged is left alone. Fails when the provider key cannot be read or an address cannot be
+/// opened.
 pub(crate) fn reconcile_dnscrypt(
     cfg: &Config,
     set: &ListenerSet,
@@ -983,13 +984,19 @@ pub(crate) fn reconcile_dnscrypt(
     } else {
         String::new()
     };
+    // Sized like the plain DNS workers, as they wait on upstreams the same way; `workers` names
+    // plain DNS only, so it is not applied here.
+    let available_cpus = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let (workers, _) = plain_dns_worker_counts(0, cfg.backend, available_cpus);
     let wanted: Vec<(String, SocketAddr)> = cfg
         .listen_dnscrypt
         .iter()
         .map(|addr| {
             (
                 format!(
-                    "dnscrypt|{addr}|{}|{relay_settings}",
+                    "dnscrypt|{addr}|{}|{workers}|{relay_settings}",
                     cfg.dnscrypt_provider_name
                 ),
                 *addr,
@@ -1113,7 +1120,7 @@ pub(crate) fn reconcile_dnscrypt(
             .name(format!("dnscrypt-{bound}"))
             .spawn(move || {
                 if let Err(error) =
-                    dnscrypt::serve(handler, socket, udp_provider, udp_relay, listener_stop)
+                    dnscrypt::serve(handler, socket, udp_provider, udp_relay, workers, listener_stop)
                 {
                     onetdns_core::error!(event = "dnscrypt.stopped", %error, "Stopped DNSCrypt listener");
                 }

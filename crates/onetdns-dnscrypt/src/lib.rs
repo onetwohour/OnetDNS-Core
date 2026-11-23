@@ -682,6 +682,7 @@ mod tests {
                 |_src| true,
                 |_src| false,
                 None,
+                2,
                 &listener_shutdown,
             )
         });

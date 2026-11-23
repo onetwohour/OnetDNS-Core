@@ -418,6 +418,7 @@ pub(crate) mod tests {
                 udp_allowed,
                 |_src| false,
                 None,
+                2,
                 &stop,
             )
         });
@@ -512,6 +513,7 @@ pub(crate) mod tests {
                     count.fetch_add(1, Ordering::Relaxed);
                     to == target
                 }))),
+                2,
                 &stop,
             )
         });
