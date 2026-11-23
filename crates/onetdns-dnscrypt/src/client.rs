@@ -109,19 +109,22 @@ impl Session {
         })
     }
 
-    /// Seals `query` into a packet of at least `min_len` bytes, padding the plaintext to a
-    /// multiple of 64. Returns the packet and the nonce its response must echo. Every call draws
-    /// a new nonce, as each sealed query must have its own.
+    /// Seals `query` into a packet of at least `min_len` bytes, padded to a multiple of 64, so a
+    /// `min_len` that is one is the packet's size whenever the query fits. Returns the packet and
+    /// the nonce its response must echo. Every call draws a new nonce, as each sealed query must
+    /// have its own.
     pub fn seal(&self, query: &[u8], min_len: usize) -> (Vec<u8>, [u8; CLIENT_NONCE_LEN]) {
         let nonce = onetdns_core::random_array::<CLIENT_NONCE_LEN>();
         let mut full_nonce = [0u8; 24];
         full_nonce[..CLIENT_NONCE_LEN].copy_from_slice(&nonce);
 
-        let want = min_len.saturating_sub(QUERY_OVERHEAD).max(query.len() + 1);
-        let mut padded = Vec::with_capacity(want.next_multiple_of(PAD_BLOCK));
+        let packet_len = min_len
+            .max(QUERY_OVERHEAD + query.len() + 1)
+            .next_multiple_of(PAD_BLOCK);
+        let mut padded = Vec::with_capacity(packet_len - QUERY_OVERHEAD);
         padded.extend_from_slice(query);
         padded.push(0x80);
-        padded.resize(want.next_multiple_of(PAD_BLOCK), 0);
+        padded.resize(packet_len - QUERY_OVERHEAD, 0);
 
         let sealed = secretbox_seal(&self.shared, &full_nonce, &padded);
         let mut packet = Vec::with_capacity(QUERY_HEADER_LEN + sealed.len());
@@ -264,8 +267,13 @@ mod tests {
         let query: &[u8] =
             b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01";
         let (packet, nonce) = session.seal(query, 256);
-        assert!(packet.len() >= 256);
-        assert_eq!((packet.len() - QUERY_OVERHEAD) % PAD_BLOCK, 0);
+        assert_eq!(packet.len(), 256);
+        assert_eq!(session.seal(query, 300).0.len(), 320);
+        assert_eq!(
+            session.seal(&[0; 200], 256).0.len(),
+            320,
+            "질의가 크면 늘어남"
+        );
 
         let answer: &[u8] =
             b"\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01";

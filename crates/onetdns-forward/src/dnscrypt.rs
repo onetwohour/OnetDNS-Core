@@ -26,8 +26,9 @@ const CERT_RETRY_SECS: u32 = 60;
 /// leaves room for most answers; the draft allows starting here.
 const UDP_QUERY_START: usize = 512;
 
-/// The IPv6 minimum MTU less the IPv6 and UDP headers; a larger query risks fragmentation.
-const UDP_QUERY_MAX: usize = 1_232;
+/// Packets are multiples of 64; this is the largest within the IPv6 minimum MTU less the IPv6 and
+/// UDP headers (1232). A larger query risks fragmentation.
+const UDP_QUERY_MAX: usize = 1_216;
 
 const UDP_QUERY_STEP: usize = 64;
 
