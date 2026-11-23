@@ -131,7 +131,7 @@ where
     }
     // Relay threads hold it weakly, so a late answer cannot keep the port bound after shutdown.
     let socket = Arc::new(socket);
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; relay::MAX_ANONYMIZED];
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         let (n, src) = match wait.recv_from(&socket, &mut buf) {
             Ok(x) => x,
@@ -390,10 +390,10 @@ mod tests {
         client
             .set_read_timeout(Some(std::time::Duration::from_millis(700)))
             .unwrap();
-        let ask = |target: SocketAddr| {
+        let ask_padded = |target: SocketAddr, len: usize| {
             let (sealed, nonce) = session.seal(
                 b"\x00\x09\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01",
-                512,
+                len,
             );
             let mut packet = relay::ANON_MAGIC.to_vec();
             packet.extend_from_slice(&match target.ip() {
@@ -407,9 +407,14 @@ mod tests {
             let (len, _) = client.recv_from(&mut buf).ok()?;
             session.open(&buf[..len], &nonce)
         };
+        let ask = |target: SocketAddr| ask_padded(target, 512);
 
         let answer = ask(server_addr).expect("릴레이를 거친 응답");
         assert_eq!(&answer[..3], &[0x00, 0x09, 0x81]);
+        assert!(
+            ask_padded(server_addr, 4096).is_some(),
+            "가장 큰 질의를 릴레이 머리와 함께 받지 못했습니다"
+        );
         let elsewhere = SocketAddr::new(server_addr.ip(), server_addr.port().wrapping_add(1));
         assert!(
             ask(elsewhere).is_none(),

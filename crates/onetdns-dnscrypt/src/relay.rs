@@ -26,6 +26,9 @@ const MIN_QUERY: usize = NONCE_AT + CLIENT_NONCE_LEN + 16 + 64;
 /// The largest packet the protocol allows.
 const MAX_PACKET: usize = 4096;
 
+/// The largest packet a client sends a relay: the target's address and port, then the packet.
+pub const MAX_ANONYMIZED: usize = ANON_MAGIC.len() + 16 + 2 + MAX_PACKET;
+
 /// Resolver magic, nonce, MAC and a DNS header with one byte of padding.
 const MIN_RESPONSE: usize = RESOLVER_MAGIC.len() + 24 + 16 + 12 + 1;
 
