@@ -289,27 +289,27 @@ mod tests {
         drop(client);
     }
 
-    /// A listener with this ACL, and a certificate query to send it.
-    fn certificate_listener(
-        acl: onetdns_security::IpAcl,
-    ) -> (crate::connection_limit::EncryptedTcpListener, Vec<u8>) {
-        let handler = Arc::new(NativeServer::new(
+    fn native_handler(acl: onetdns_security::IpAcl, upstream: SocketAddr) -> Arc<NativeServer> {
+        Arc::new(NativeServer::new(
             Arc::new(onetdns_filter::SharedFilter::from_pointee(
                 onetdns_filter::build_from_str("", "", onetdns_core::BlockResponse::NxDomain),
             )),
             Arc::new(acl),
             vec![],
             Arc::new(crate::native::NativeBackend::Forward(
-                onetdns_forward::Forwarder::new(
-                    vec!["127.0.0.1:1".parse().unwrap()],
-                    Duration::from_secs(1),
-                ),
+                onetdns_forward::Forwarder::new(vec![upstream], Duration::from_secs(1)),
             )),
             60,
-        ));
+        ))
+    }
+
+    /// A listener with this ACL, and a certificate query to send it.
+    fn certificate_listener(
+        acl: onetdns_security::IpAcl,
+    ) -> (crate::connection_limit::EncryptedTcpListener, Vec<u8>) {
         let listener = serve_tcp(
             std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
-            handler,
+            native_handler(acl, "127.0.0.1:1".parse().unwrap()),
             Provider::generate("2.dnscrypt-cert.onetdns", 86400),
             None,
             Arc::new(ConnectionLimiter::default()),
@@ -377,5 +377,109 @@ mod tests {
         let mut received = Vec::new();
         let _ = stream.read_to_end(&mut received);
         assert!(received.is_empty(), "버리는 주소에 인증서를 보냈습니다");
+    }
+
+    /// A plain DNS server answering every query with `answers` A records.
+    fn many_answers_upstream(answers: u8) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((len, from)) = socket.recv_from(&mut buf) {
+                let Ok(mut answer) = Message::parse(&buf[..len]) else {
+                    continue;
+                };
+                answer.header.response = true;
+                answer.additionals.clear();
+                let name = answer.questions[0].name.clone();
+                for index in 0..answers {
+                    answer.answers.push(onetdns_proto::Record::new(
+                        name.clone(),
+                        60,
+                        onetdns_proto::RData::A(std::net::Ipv4Addr::new(192, 0, 2, index)),
+                    ));
+                }
+                let _ = socket.send_to(&answer.try_encode().unwrap(), from);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    /// The relay in front is another OnetDNS listener, so this covers both ends. The answer does
+    /// not fit the first UDP query, so the client asks the relay again over TCP and the relay still
+    /// passes it on over UDP.
+    fn a_query_through_a_relay_is_answered_by_the_listener() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler = native_handler(
+            onetdns_security::IpAcl::allow_all(),
+            many_answers_upstream(40),
+        );
+        let provider = Provider::generate("2.dnscrypt-cert.onetdns", 86_400);
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (server_provider, server_handler, server_stop) =
+            (provider.clone(), handler.clone(), stop.clone());
+        std::thread::spawn(move || {
+            serve(server_handler, server, server_provider, None, server_stop)
+        });
+
+        let cfg = Config::from_toml_str(&format!(
+            "dnscrypt_relay = true\n\
+             dnscrypt_relay_ports = [{}]\n\
+             dnscrypt_relay_allow_targets = [\"127.0.0.0/8\"]\n",
+            server_addr.port()
+        ))
+        .unwrap();
+        // TCP first, as Windows reserves TCP port ranges that UDP may still be given.
+        let mut taken = Vec::new();
+        let (relay_tcp, relay_udp) = loop {
+            let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+            match UdpSocket::bind(tcp.local_addr().unwrap()) {
+                Ok(udp) => break (tcp, udp),
+                Err(_) => taken.push(tcp),
+            }
+        };
+        let relay_addr = relay_udp.local_addr().unwrap();
+        let relay_provider = Provider::generate("2.dnscrypt-cert.relay", 86_400);
+        let _relay_tcp = serve_tcp(
+            relay_tcp,
+            handler.clone(),
+            relay_provider.clone(),
+            relay(&cfg),
+            Arc::new(ConnectionLimiter::default()),
+        )
+        .expect("릴레이 TCP 리스너");
+        let (relay_handler, relay_stop) = (handler.clone(), stop.clone());
+        std::thread::spawn(move || {
+            serve(
+                relay_handler,
+                relay_udp,
+                relay_provider,
+                relay(&cfg),
+                relay_stop,
+            )
+        });
+
+        let client = onetdns_forward::Forwarder::with_upstreams(
+            vec![onetdns_forward::Upstream::dnscrypt(
+                server_addr,
+                "2.dnscrypt-cert.onetdns",
+                provider.provider_public_key(),
+                Some(relay_addr),
+            )],
+            Duration::from_secs(3),
+        );
+        let query = Message::query(
+            0x5151,
+            onetdns_proto::Name::from_str("many.test").unwrap(),
+            onetdns_proto::RecordType::A,
+        );
+        let response = client.resolve(&query);
+        stop.store(true, Ordering::Release);
+        let response = response.expect("릴레이를 거친 응답");
+        assert_eq!(response.header.id, 0x5151);
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 40);
     }
 }
