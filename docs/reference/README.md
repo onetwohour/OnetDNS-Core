@@ -210,6 +210,10 @@ Top-level keys are indexed alphabetically below.
 [`ns_recursion_limit`](upstreams.md#ns_recursion_limit)
 [`nsid`](access-and-tls.md#nsid)
 
+### O
+
+[`odoh_target`](core.md#odoh_target)
+
 ### P
 
 [`parental_control`](filtering.md#parental_control)

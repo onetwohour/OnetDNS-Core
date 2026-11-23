@@ -236,6 +236,20 @@ doh_path = "/dns-query"
 
 HTTP path used for DoH requests, normally /dns-query.
 
+### `odoh_target`
+
+**Type:** boolean  
+**Default:** `false`
+
+**TOML:**
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+odoh_target = true
+```
+
+Answers Oblivious DoH (RFC 9230) on the `listen_doh` listeners: encrypted queries an ODoH proxy POSTs to `doh_path`, and the key configuration at `/.well-known/odohconfigs`. Requires `listen_doh`; DoH3 does not serve Oblivious DoH. The key is created on first use as `odoh-target.key` next to the configuration file and kept across restarts. Queries arrive from the proxy's address, so client policy, ACLs, rate limits and the query log all see the proxy, not the client behind it. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
+
 ### `proxy_protocol_ports`
 
 **Type:** array  

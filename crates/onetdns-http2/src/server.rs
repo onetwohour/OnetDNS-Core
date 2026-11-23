@@ -39,6 +39,128 @@ struct PendingBody {
 enum AppResponse {
     Status(&'static str),
     Dns(DohAnswer),
+    Http(HttpReply),
+}
+
+/// A response that is not a DNS answer: status, fields after it, and body.
+struct HttpReply {
+    status: String,
+    fields: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpReply {
+    /// RFC 9230: ODoH requests and responses must not be cached.
+    fn oblivious_message(body: Vec<u8>) -> Self {
+        Self {
+            status: "200".to_string(),
+            fields: vec![
+                ("content-type", ODOH_MEDIA_TYPE.to_string()),
+                ("cache-control", "no-cache, no-store".to_string()),
+            ],
+            body,
+        }
+    }
+
+    fn odoh_configs(body: Vec<u8>) -> Self {
+        Self {
+            status: "200".to_string(),
+            fields: vec![("content-type", "application/octet-stream".to_string())],
+            body,
+        }
+    }
+}
+
+pub const ODOH_MEDIA_TYPE: &str = "application/oblivious-dns-message";
+
+/// Where an Oblivious DoH target publishes its ObliviousDoHConfigs.
+pub const ODOH_CONFIGS_PATH: &str = "/.well-known/odohconfigs";
+
+/// The largest ObliviousDoHMessage: a type byte and two fields with 16-bit lengths.
+pub const MAX_ODOH_MESSAGE: usize = 1 + 2 * (2 + u16::MAX as usize);
+
+/// Oblivious DoH (RFC 9230) on a DoH listener. This crate only routes requests by media type and
+/// path; the implementor opens, resolves and seals.
+pub trait Oblivious {
+    /// The ObliviousDoHConfigs served at `ODOH_CONFIGS_PATH`; `None` when this listener is not a
+    /// target.
+    fn configs(&self) -> Option<Vec<u8>>;
+
+    /// An ObliviousDoHMessage POSTed to the DoH path.
+    fn target(&self, message: &[u8]) -> ObliviousReply;
+}
+
+pub enum ObliviousReply {
+    /// A 200 carrying this ObliviousDoHMessage.
+    Message(Vec<u8>),
+    Status(&'static str),
+    /// No response; the connection closes, as for a DNS query the handler does not answer.
+    Drop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Media {
+    Dns,
+    Oblivious,
+    Other,
+}
+
+impl Media {
+    fn of(content_type: &[u8]) -> Self {
+        if content_type.eq_ignore_ascii_case(b"application/dns-message") {
+            Media::Dns
+        } else if content_type.eq_ignore_ascii_case(ODOH_MEDIA_TYPE.as_bytes()) {
+            Media::Oblivious
+        } else {
+            Media::Other
+        }
+    }
+}
+
+enum Route {
+    Doh,
+    Respond(AppResponse),
+    /// Send nothing and close the connection.
+    Drop,
+}
+
+/// Routes the Oblivious DoH requests; everything else stays DoH. `oblivious_body` is the body of a
+/// POST whose content type is the ODoH one.
+fn route_oblivious(
+    method: &[u8],
+    path_only: &[u8],
+    oblivious_body: Option<&[u8]>,
+    expected_path: &str,
+    oblivious: Option<&dyn Oblivious>,
+) -> Route {
+    if method == b"GET" && path_only == ODOH_CONFIGS_PATH.as_bytes() {
+        return match oblivious.and_then(Oblivious::configs) {
+            Some(configs) => Route::Respond(AppResponse::Http(HttpReply::odoh_configs(configs))),
+            None => Route::Respond(AppResponse::Status("404")),
+        };
+    }
+    let Some(body) = oblivious_body else {
+        return Route::Doh;
+    };
+    let Some(oblivious) = oblivious else {
+        return Route::Respond(AppResponse::Status(STATUS_UNSUPPORTED_MEDIA_TYPE));
+    };
+    // Path segments after the DoH path name a client, which means nothing for a message the proxy
+    // relayed.
+    if path_only != expected_path.as_bytes() {
+        return Route::Respond(AppResponse::Status("404"));
+    }
+    if body.is_empty() {
+        return Route::Respond(AppResponse::Status(STATUS_BAD_REQUEST));
+    }
+    match oblivious.target(body) {
+        ObliviousReply::Message(message) if message.len() <= MAX_ODOH_MESSAGE => {
+            Route::Respond(AppResponse::Http(HttpReply::oblivious_message(message)))
+        }
+        ObliviousReply::Message(_) => Route::Respond(AppResponse::Status(STATUS_BAD_GATEWAY)),
+        ObliviousReply::Status(status) => Route::Respond(AppResponse::Status(status)),
+        ObliviousReply::Drop => Route::Drop,
+    }
 }
 
 /// DoH response body and its HTTP freshness lifetime. This layer does not parse DNS, so whoever
@@ -106,6 +228,7 @@ where
         handler,
         |_| {},
         &AtomicBool::new(false),
+        None,
     )
 }
 
@@ -119,12 +242,15 @@ where
 /// the streams it took are answered. A read that fails while draining, which is how an idle
 /// connection ends then, sends that second GOAWAY first, so the client knows which requests were
 /// not processed and can send them elsewhere.
+///
+/// Without `oblivious`, Oblivious DoH requests get the status of any unsupported media type.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
     handler: H,
     mut reset_deadline: R,
     draining: &AtomicBool,
+    oblivious: Option<&dyn Oblivious>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -349,7 +475,9 @@ where
                 }
                 if h.has_flag(flags::END_HEADERS) && h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
-                        let Some(response) = process_request(st, expected_path, &handler)? else {
+                        let Some(response) =
+                            process_request(st, expected_path, &handler, oblivious)?
+                        else {
                             return Ok(());
                         };
                         reset_deadline(stream);
@@ -402,7 +530,8 @@ where
                         .unwrap_or(false);
                     if end_stream {
                         if let Some(st) = streams.remove(&h.stream_id) {
-                            let Some(response) = process_request(st, expected_path, &handler)?
+                            let Some(response) =
+                                process_request(st, expected_path, &handler, oblivious)?
                             else {
                                 return Ok(());
                             };
@@ -461,7 +590,9 @@ where
                 }
                 if h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
-                        let Some(response) = process_request(st, expected_path, &handler)? else {
+                        let Some(response) =
+                            process_request(st, expected_path, &handler, oblivious)?
+                        else {
                             return Ok(());
                         };
                         reset_deadline(stream);
@@ -605,10 +736,12 @@ const ALLOWED_METHODS: &str = "GET, POST";
 /// Pseudo-headers come before regular ones, once each, and a content-length must match the body.
 /// Loosening the order or duplicate rules is a request smuggling path: a front end and this server
 /// would read the same bytes as different requests.
+///
+/// The flag is true for a POST of an ObliviousDoHMessage.
 fn valid_doh_request_headers(
     headers: &[(Vec<u8>, Vec<u8>)],
     body_len: usize,
-) -> Result<(&[u8], &[u8]), &'static str> {
+) -> Result<(&[u8], &[u8], bool), &'static str> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -667,8 +800,7 @@ fn valid_doh_request_headers(
             // A different type and a duplicated header mean different things. A duplicate is a
             // request smuggling path and stays 400; a different type is 415, so the client can fix
             // it.
-            let is_dns = value.eq_ignore_ascii_case(b"application/dns-message");
-            if content_type.replace(is_dns).is_some() {
+            if content_type.replace(Media::of(value)).is_some() {
                 return Err(STATUS_BAD_REQUEST);
             }
         } else if name == b"host" {
@@ -694,14 +826,14 @@ fn valid_doh_request_headers(
             if content_length.is_some_and(|length| length != body_len) {
                 return Err(STATUS_BAD_REQUEST);
             }
-            if content_type == Some(true) {
-                Ok((method, path))
-            } else {
-                Err(STATUS_UNSUPPORTED_MEDIA_TYPE)
+            match content_type {
+                Some(Media::Dns) => Ok((method, path, false)),
+                Some(Media::Oblivious) => Ok((method, path, true)),
+                Some(Media::Other) | None => Err(STATUS_UNSUPPORTED_MEDIA_TYPE),
             }
         }
         b"GET" if body_len == 0 && content_length.is_none_or(|length| length == 0) => {
-            Ok((method, path))
+            Ok((method, path, false))
         }
         b"GET" => Err(STATUS_BAD_REQUEST),
         _ => Err(STATUS_METHOD_NOT_ALLOWED),
@@ -714,6 +846,7 @@ fn process_request<H>(
     st: StreamState,
     expected_path: &str,
     handler: &H,
+    oblivious: Option<&dyn Oblivious>,
 ) -> Result<Option<AppResponse>, H2Error>
 where
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
@@ -721,11 +854,17 @@ where
     if !st.have_headers {
         return Err(H2Error::Protocol);
     }
-    let (method, path) = match valid_doh_request_headers(&st.headers, st.body.len()) {
-        Ok(pair) => pair,
+    let (method, path, is_oblivious) = match valid_doh_request_headers(&st.headers, st.body.len()) {
+        Ok(head) => head,
         Err(status) => return Ok(Some(AppResponse::Status(status))),
     };
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
+    let oblivious_body = is_oblivious.then_some(st.body.as_slice());
+    match route_oblivious(method, path_only, oblivious_body, expected_path, oblivious) {
+        Route::Doh => {}
+        Route::Respond(response) => return Ok(Some(response)),
+        Route::Drop => return Ok(None),
+    }
     let client_id = match match_doh_path(path_only, expected_path) {
         Some(cid) => cid,
         None => return Ok(Some(AppResponse::Status("404"))),
@@ -774,35 +913,59 @@ fn queue_response<S: Write>(
             stream_windows.remove(&sid);
         }
         AppResponse::Dns(answer) => {
-            let body = answer.body;
-            let buffered_responses = pending.values().fold(0usize, |size, response| {
-                size.saturating_add(response.body.len().saturating_sub(response.offset))
-            });
-            if buffered_responses.saturating_add(body.len()) > MAX_H2_BUFFERED_RESPONSES {
-                pending.remove(&sid);
-                stream_windows.remove(&sid);
-                return send_rst_stream(stream, sid, error_code::REFUSED_STREAM);
-            }
-            let content_length = body.len().to_string();
-            let cache_control = format!("max-age={}", answer.max_age);
-            let block = hpack::encode_response(&[
-                (":status", "200"),
-                ("content-type", "application/dns-message"),
-                ("content-length", &content_length),
-                ("cache-control", &cache_control),
-            ]);
-            let flags = if body.is_empty() {
-                flags::END_HEADERS | flags::END_STREAM
-            } else {
-                flags::END_HEADERS
+            let reply = HttpReply {
+                status: "200".to_string(),
+                fields: vec![
+                    ("content-type", "application/dns-message".to_string()),
+                    ("cache-control", format!("max-age={}", answer.max_age)),
+                ],
+                body: answer.body,
             };
-            send_frame(stream, frame_type::HEADERS, flags, sid, &block)?;
-            if body.is_empty() {
-                stream_windows.remove(&sid);
-            } else {
-                pending.insert(sid, PendingBody { body, offset: 0 });
-            }
+            return queue_reply(stream, sid, reply, pending, stream_windows);
         }
+        AppResponse::Http(reply) => {
+            return queue_reply(stream, sid, reply, pending, stream_windows);
+        }
+    }
+    Ok(())
+}
+
+fn queue_reply<S: Write>(
+    stream: &mut S,
+    sid: u32,
+    reply: HttpReply,
+    pending: &mut HashMap<u32, PendingBody>,
+    stream_windows: &mut HashMap<u32, i64>,
+) -> Result<(), H2Error> {
+    let body = reply.body;
+    let buffered_responses = pending.values().fold(0usize, |size, response| {
+        size.saturating_add(response.body.len().saturating_sub(response.offset))
+    });
+    if buffered_responses.saturating_add(body.len()) > MAX_H2_BUFFERED_RESPONSES {
+        pending.remove(&sid);
+        stream_windows.remove(&sid);
+        return send_rst_stream(stream, sid, error_code::REFUSED_STREAM);
+    }
+    let content_length = body.len().to_string();
+    let mut fields: Vec<(&str, &str)> = vec![(":status", &reply.status)];
+    fields.extend(
+        reply
+            .fields
+            .iter()
+            .map(|(name, value)| (*name, value.as_str())),
+    );
+    fields.push(("content-length", &content_length));
+    let block = hpack::encode_response(&fields);
+    let flags = if body.is_empty() {
+        flags::END_HEADERS | flags::END_STREAM
+    } else {
+        flags::END_HEADERS
+    };
+    send_frame(stream, frame_type::HEADERS, flags, sid, &block)?;
+    if body.is_empty() {
+        stream_windows.remove(&sid);
+    } else {
+        pending.insert(sid, PendingBody { body, offset: 0 });
     }
     Ok(())
 }
@@ -834,7 +997,7 @@ where
     S: Read + Write,
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
-    serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {})
+    serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {}, None)
 }
 
 /// Only Content-Length bodies are accepted, not chunked. An encoding the front end reads
@@ -844,6 +1007,7 @@ pub fn serve_doh_h1_with_deadline_reset<S, H, R>(
     expected_path: &str,
     handler: H,
     mut reset_deadline: R,
+    oblivious: Option<&dyn Oblivious>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -893,7 +1057,7 @@ where
     }
 
     let mut content_length: Option<usize> = None;
-    let mut content_type: Option<bool> = None;
+    let mut content_type: Option<Media> = None;
     let mut host_seen = false;
     let mut transfer_encoding = false;
     for line in lines {
@@ -946,8 +1110,7 @@ where
                 return write_h1_status(stream, "400 Bad Request");
             }
         } else if name.eq_ignore_ascii_case(b"content-type") {
-            let is_dns = value.eq_ignore_ascii_case(b"application/dns-message");
-            if content_type.replace(is_dns).is_some() {
+            if content_type.replace(Media::of(value)).is_some() {
                 return write_h1_status(stream, "400 Bad Request");
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
@@ -960,13 +1123,15 @@ where
     }
 
     let path_only = target.split(|&b| b == b'?').next().unwrap_or(b"");
+    let is_configs = method == b"GET" && path_only == ODOH_CONFIGS_PATH.as_bytes();
     let client_id = match match_doh_path(path_only, expected_path) {
         Some(cid) => cid,
+        None if is_configs => None,
         None => return write_h1_status(stream, "404 Not Found"),
     };
 
     let query: Option<Vec<u8>> = if method == b"POST" {
-        if content_type != Some(true) {
+        if !matches!(content_type, Some(Media::Dns | Media::Oblivious)) {
             return write_h1_status(stream, "415 Unsupported Media Type");
         }
         let Some(content_length) = content_length else {
@@ -999,6 +1164,15 @@ where
         return write_h1_status(stream, "405 Method Not Allowed");
     };
 
+    let oblivious_body = query
+        .as_deref()
+        .filter(|_| method == b"POST" && content_type == Some(Media::Oblivious));
+    match route_oblivious(method, path_only, oblivious_body, expected_path, oblivious) {
+        Route::Doh => {}
+        Route::Respond(response) => return write_h1_app_response(stream, response),
+        Route::Drop => return Ok(()),
+    }
+
     match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
             Ok(Some(answer)) if answer.body.len() <= MAX_H2_RESPONSE => {
@@ -1006,8 +1180,7 @@ where
             }
             Ok(Some(_)) => write_h1_status(stream, "502 Bad Gateway"),
             Ok(None) => Ok(()),
-            Err(STATUS_BAD_REQUEST) => write_h1_status(stream, "400 Bad Request"),
-            Err(status) => write_h1_status(stream, &format!("{status} Error")),
+            Err(status) => write_h1_status(stream, &h1_status_line(status)),
         },
         _ => write_h1_status(stream, "400 Bad Request"),
     }
@@ -1021,6 +1194,42 @@ fn write_h1_response<S: Write>(stream: &mut S, body: &[u8], max_age: u32) -> Res
     stream.write_all(head.as_bytes()).map_err(|_| H2Error::Io)?;
     stream.write_all(body).map_err(|_| H2Error::Io)?;
     Ok(())
+}
+
+fn write_h1_app_response<S: Write>(stream: &mut S, response: AppResponse) -> Result<(), H2Error> {
+    match response {
+        AppResponse::Status(status) => write_h1_status(stream, &h1_status_line(status)),
+        AppResponse::Dns(answer) => write_h1_response(stream, &answer.body, answer.max_age),
+        AppResponse::Http(reply) => write_h1_reply(stream, reply),
+    }
+}
+
+fn write_h1_reply<S: Write>(stream: &mut S, reply: HttpReply) -> Result<(), H2Error> {
+    let mut head = format!("HTTP/1.1 {}\r\n", h1_status_line(&reply.status));
+    for (name, value) in &reply.fields {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.body.len()
+    ));
+    stream.write_all(head.as_bytes()).map_err(|_| H2Error::Io)?;
+    stream.write_all(&reply.body).map_err(|_| H2Error::Io)
+}
+
+/// HTTP/1.1 status line text after the version. Clients read only the code.
+fn h1_status_line(status: &str) -> String {
+    let reason = match status {
+        "200" => "OK",
+        "400" => "Bad Request",
+        "401" => "Unauthorized",
+        "403" => "Forbidden",
+        "404" => "Not Found",
+        "415" => "Unsupported Media Type",
+        "502" => "Bad Gateway",
+        _ => "Error",
+    };
+    format!("{status} {reason}")
 }
 
 fn write_h1_status<S: Write>(stream: &mut S, status: &str) -> Result<(), H2Error> {
@@ -1443,6 +1652,7 @@ mod tests {
                     server_resets.fetch_add(1, Ordering::Relaxed);
                 },
                 &std::sync::atomic::AtomicBool::new(false),
+                None,
             )
         });
 
@@ -1584,6 +1794,7 @@ mod tests {
                 |query, _| answer(query.to_vec()),
                 |_| {},
                 &server_draining,
+                None,
             )
         });
 
@@ -1664,6 +1875,7 @@ mod tests {
                 |query, _| answer(query.to_vec()),
                 |_| {},
                 &std::sync::atomic::AtomicBool::new(true),
+                None,
             )
         });
 
@@ -1693,6 +1905,7 @@ mod tests {
                 |query, _| answer(query.to_vec()),
                 |_| {},
                 &server_draining,
+                None,
             )
         });
 
@@ -2521,5 +2734,203 @@ mod tests {
         assert_eq!(header.frame_type, frame_type::RST_STREAM);
         assert_eq!(header.stream_id, 3);
         assert_eq!(payload, error_code::REFUSED_STREAM.to_be_bytes());
+    }
+
+    /// Reverses the message; "unknown" stands for another key and "drop" for a query the resolver
+    /// does not answer.
+    struct EchoTarget {
+        is_target: bool,
+    }
+
+    impl Oblivious for EchoTarget {
+        fn configs(&self) -> Option<Vec<u8>> {
+            self.is_target.then(|| b"configs".to_vec())
+        }
+
+        fn target(&self, message: &[u8]) -> ObliviousReply {
+            match message {
+                b"unknown" => ObliviousReply::Status("401"),
+                b"drop" => ObliviousReply::Drop,
+                _ => ObliviousReply::Message(message.iter().rev().copied().collect()),
+            }
+        }
+    }
+
+    fn h1_oblivious(raw: Vec<u8>, oblivious: Option<EchoTarget>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut s = deadline_accept(&listener);
+            serve_doh_h1_with_deadline_reset(
+                &mut s,
+                "/dns-query",
+                |q, _| answer(q.to_vec()),
+                |_| {},
+                oblivious.as_ref().map(|target| target as &dyn Oblivious),
+            )
+            .ok();
+        });
+        let response = String::from_utf8_lossy(&h1_request(addr, &raw)).to_string();
+        server.join().unwrap();
+        response
+    }
+
+    fn h1_oblivious_post(path: &str, body: &[u8], oblivious: Option<EchoTarget>) -> String {
+        let mut raw = format!(
+            "POST {path} HTTP/1.1\r\nHost: dns.test\r\nContent-Type: application/oblivious-dns-message\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        h1_oblivious(raw, oblivious)
+    }
+
+    const TARGET: Option<EchoTarget> = Some(EchoTarget { is_target: true });
+
+    #[test]
+    fn h1_routes_oblivious_messages_to_the_target() {
+        let response = h1_oblivious_post("/dns-query", b"abc", TARGET);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("\r\ncontent-type: application/oblivious-dns-message\r\n"));
+        assert!(response.contains("\r\ncache-control: no-cache, no-store\r\n"));
+        assert!(response.ends_with("\r\n\r\ncba"), "{response}");
+
+        let unknown = h1_oblivious_post("/dns-query", b"unknown", TARGET);
+        assert!(unknown.starts_with("HTTP/1.1 401 "), "{unknown}");
+        assert_eq!(h1_oblivious_post("/dns-query", b"drop", TARGET), "");
+        let empty = h1_oblivious_post("/dns-query", b"", TARGET);
+        assert!(empty.starts_with("HTTP/1.1 400 "), "{empty}");
+    }
+
+    #[test]
+    /// A client ID in the path means nothing for a relayed message, and a listener that is not a
+    /// target treats the type like any other it does not take.
+    fn h1_refuses_oblivious_messages_it_cannot_serve() {
+        let with_id = h1_oblivious_post("/dns-query/laptop", b"abc", TARGET);
+        assert!(with_id.starts_with("HTTP/1.1 404 "), "{with_id}");
+        let other_path = h1_oblivious_post("/other", b"abc", TARGET);
+        assert!(other_path.starts_with("HTTP/1.1 404 "), "{other_path}");
+        let no_service = h1_oblivious_post("/dns-query", b"abc", None);
+        assert!(no_service.starts_with("HTTP/1.1 415 "), "{no_service}");
+    }
+
+    #[test]
+    fn h1_serves_configs_only_on_a_target() {
+        let get = b"GET /.well-known/odohconfigs HTTP/1.1\r\nHost: dns.test\r\n\r\n".to_vec();
+        let response = h1_oblivious(get.clone(), TARGET);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("\r\ncontent-type: application/octet-stream\r\n"));
+        assert!(response.ends_with("\r\n\r\nconfigs"), "{response}");
+
+        let not_target = h1_oblivious(get.clone(), Some(EchoTarget { is_target: false }));
+        assert!(not_target.starts_with("HTTP/1.1 404 "), "{not_target}");
+        let plain = h1_oblivious(get, None);
+        assert!(plain.starts_with("HTTP/1.1 404 "), "{plain}");
+    }
+
+    /// Sends one request on a stream and returns the response header fields and body.
+    fn h2_request_on(
+        client: &mut TcpStream,
+        sid: u32,
+        fields: &[(&str, &str)],
+        body: &[u8],
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>) {
+        let header_flags = if body.is_empty() {
+            flags::END_HEADERS | flags::END_STREAM
+        } else {
+            flags::END_HEADERS
+        };
+        let block = hpack::encode_response(fields);
+        send_frame(client, frame_type::HEADERS, header_flags, sid, &block).unwrap();
+        if !body.is_empty() {
+            send_frame(client, frame_type::DATA, flags::END_STREAM, sid, body).unwrap();
+        }
+        let mut headers = Vec::new();
+        let mut response = Vec::new();
+        let mut dec = Decoder::new(4096);
+        loop {
+            let (h, payload) = read_frame(client).expect("the server closed mid-response");
+            match h.frame_type {
+                frame_type::HEADERS if h.stream_id == sid => {
+                    headers = dec
+                        .decode(strip_headers(&payload, h.flags).unwrap())
+                        .unwrap();
+                    if h.has_flag(flags::END_STREAM) {
+                        break;
+                    }
+                }
+                frame_type::DATA if h.stream_id == sid => {
+                    response.extend_from_slice(strip_padding(&payload, h.flags).unwrap());
+                    if h.has_flag(flags::END_STREAM) {
+                        break;
+                    }
+                }
+                frame_type::SETTINGS if !h.has_flag(flags::ACK) => {
+                    send_frame(client, frame_type::SETTINGS, flags::ACK, 0, &[]).unwrap();
+                }
+                _ => {}
+            }
+        }
+        (headers, response)
+    }
+
+    #[test]
+    fn h2_serves_oblivious_messages_and_configs_beside_doh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut s = deadline_accept(&listener);
+            let target = EchoTarget { is_target: true };
+            serve_doh_with_deadline_reset(
+                &mut s,
+                "/dns-query",
+                |q, _| answer(q.to_vec()),
+                |_| {},
+                &AtomicBool::new(false),
+                Some(&target),
+            )
+            .ok();
+        });
+        let mut client = h2_connect(addr);
+        let post = |path| {
+            [
+                (":method", "POST"),
+                (":scheme", "https"),
+                (":authority", "dns.test"),
+                (":path", path),
+                ("content-type", ODOH_MEDIA_TYPE),
+            ]
+        };
+
+        let (headers, body) = h2_request_on(&mut client, 1, &post("/dns-query"), b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
+        assert_eq!(
+            header(&headers, b"content-type"),
+            Some(ODOH_MEDIA_TYPE.as_bytes())
+        );
+        assert_eq!(
+            header(&headers, b"cache-control"),
+            Some(&b"no-cache, no-store"[..])
+        );
+        assert_eq!(body, b"cba");
+
+        let (headers, _) = h2_request_on(&mut client, 3, &post("/dns-query"), b"unknown");
+        assert_eq!(header(&headers, b":status"), Some(&b"401"[..]));
+        let (headers, _) = h2_request_on(&mut client, 5, &post("/dns-query/laptop"), b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"404"[..]));
+
+        let get = [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "dns.test"),
+            (":path", ODOH_CONFIGS_PATH),
+        ];
+        let (headers, body) = h2_request_on(&mut client, 7, &get, b"");
+        assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
+        assert_eq!(body, b"configs");
+
+        assert_eq!(h2_exchange_on(&mut client, 9, b"dns"), b"dns");
+        drop(client);
+        server.join().unwrap();
     }
 }

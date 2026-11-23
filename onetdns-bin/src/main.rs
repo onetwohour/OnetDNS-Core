@@ -62,6 +62,7 @@ mod native_config;
 mod nonblocking_tcp;
 /// NOTIFY to secondaries.
 mod notify;
+mod odoh;
 /// OS DNS settings and firewall changes.
 mod osnet;
 #[cfg(target_os = "linux")]
@@ -1828,7 +1829,7 @@ pub fn serve(
                 &slots,
                 &sd,
                 &registry,
-                tls_material::self_signed_file(path.as_deref()).as_deref(),
+                path.as_deref(),
             )?;
             reconcile_dnscrypt(next, &set, &handler, &path, &tracker, &registry, &identity)
         })

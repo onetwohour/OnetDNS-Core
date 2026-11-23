@@ -586,6 +586,10 @@ pub struct Config {
 
     pub doh_path: String,
 
+    /// Answers Oblivious DoH (RFC 9230) on the DoH listeners: relayed queries POSTed to `doh_path`
+    /// and the key config at /.well-known/odohconfigs. Queries count as coming from the proxy.
+    pub odoh_target: bool,
+
     /// Authentication name advertised by DDR (RFC 9462); empty disables DDR. With a name,
     /// `_dns.resolver.arpa` SVCB queries list the encrypted listeners so clients upgrade from Do53
     /// on their own. Clients verify TLS against this name, so the certificate must carry it.
@@ -1035,6 +1039,7 @@ impl Default for Config {
             dnscrypt_relay_ports: vec![443],
             dnscrypt_relay_allow_targets: vec![],
             doh_path: "/dns-query".to_string(),
+            odoh_target: false,
             ddr_name: String::new(),
             tls_cert: None,
             tls_key: None,
@@ -1428,6 +1433,12 @@ impl Config {
                 "doh_path must start with / and contain no spaces, ?, or #: {:?}",
                 self.doh_path
             ));
+        }
+        if self.odoh_target && self.listen_doh.is_empty() {
+            return invalid(
+                "odoh_target needs a DoH listener in listen_doh; Oblivious DoH is served there"
+                    .into(),
+            );
         }
         if !valid_dns_name(&self.dnscrypt_provider_name) {
             return invalid(format!(
@@ -3064,6 +3075,7 @@ impl Config {
             sarr(&self.dnscrypt_relay_allow_targets),
         );
         kv("doh_path", js(&self.doh_path));
+        kv("odoh_target", self.odoh_target.to_string());
         kv("ddr_name", js(&self.ddr_name));
         kv("tls_cert", opt_p(&self.tls_cert));
         kv("tls_key", opt_p(&self.tls_key));
@@ -3535,6 +3547,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "ignore_cd_flag",
         "lowercase_outgoing",
         "minimal_responses",
+        "odoh_target",
         "parental_control",
         "prefer_ip4",
         "prefer_ip6",
@@ -5389,6 +5402,7 @@ const KNOWN_KEYS: &[&str] = &[
     "dnscrypt_relay_ports",
     "dnscrypt_relay_allow_targets",
     "doh_path",
+    "odoh_target",
     "ddr_name",
     "tls_cert",
     "tls_key",
@@ -5760,6 +5774,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     }
     c.dnscrypt_relay_allow_targets = gparsevec(root, "dnscrypt_relay_allow_targets");
     c.doh_path = gstr(root, "doh_path").unwrap_or(d.doh_path);
+    c.odoh_target = gbool(root, "odoh_target", d.odoh_target);
     c.ddr_name = gstr(root, "ddr_name").unwrap_or(d.ddr_name);
     c.tls_cert = gstr(root, "tls_cert").map(PathBuf::from);
     c.tls_key = gstr(root, "tls_key").map(PathBuf::from);
@@ -6374,6 +6389,7 @@ mod tests {
             "doh_path = \"\"\n",
             "doh_path = \"no-slash\"\n",
             "doh_path = \"/a b\"\n",
+            "odoh_target = true\n",
             "dnscrypt_provider_name = \"\"\n",
             "dnscrypt_provider_name = \"not a name!\"\n",
             "acme_challenge = \"tls-alpn-01\"\n",
@@ -6389,6 +6405,8 @@ mod tests {
         }
         Config::from_toml_str("acme_directory_url = \"http://127.0.0.1:14000/dir\"\nacme_challenge = \"dns01\"\nacme_domains = [\"*.example.com\", \"dns.example.com\"]\nacme_contact_email = \"ops@example.com\"\nacme_cert_file = \"c.pem\"\nacme_key_file = \"k.pem\"\necs_mode = \"send\"\necs_custom_ip = \"203.0.113.0\"\nquery_source = \"127.0.0.1\"\nedns_tcp_keepalive_secs = 6553\n")
             .expect("쓸 수 있는 값은 받아들인다");
+        Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_target = true\n")
+            .expect("an ODoH target with a DoH listener");
     }
 
     #[test]

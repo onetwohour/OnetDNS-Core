@@ -487,6 +487,7 @@ static KEYS: &[KeySpec] = &[
         Lanes::OPEN
     ),
     key!(doh_path, Hot(Listeners), Node, Lanes::OPEN),
+    key!(odoh_target, Hot(Listeners), Node, Lanes::OPEN),
     key!(ddr_name, Hot(Chain), Node, Lanes::OPEN),
     key!(tls_cert, Hot(Tls), Node, Lanes::OPEN),
     key!(tls_key, Hot(Tls), Node, Lanes::OPEN),

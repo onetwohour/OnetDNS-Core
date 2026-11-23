@@ -13,6 +13,7 @@ use crate::atomic_file::atomic_write_secret;
 use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
+use crate::odoh::OdohTarget;
 use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
@@ -46,48 +47,99 @@ fn load_or_create_dnscrypt_provider(
     let path = dnscrypt_provider_key_path(config_path).ok_or_else(|| {
         "There is no configuration file path to store the DNSCrypt provider key, so DNSCrypt is not started; this keeps the public key from changing on restart".to_string()
     })?;
-    match read_text_limited(&path, 4096) {
+    let seed = load_or_create_key_seed(&path).map_err(|error| match error {
+        KeyFileError::Corrupt => format!(
+            "DNSCrypt provider key file is corrupted ({}); it is not replaced automatically so that clients that trust the current public key keep working",
+            path.display()
+        ),
+        KeyFileError::Read(error) => format!(
+            "Could not read the DNSCrypt provider key file ({}): {error}",
+            path.display()
+        ),
+        KeyFileError::Write(error) => format!(
+            "Could not save the DNSCrypt provider key to a file ({}): {error}. DNSCrypt is not started because the public key could not be kept across restarts",
+            path.display()
+        ),
+    })?;
+    Ok(onetdns_dnscrypt::Provider::with_signing_seed(
+        &seed,
+        &cfg.dnscrypt_provider_name,
+        valid_secs,
+    ))
+}
+
+/// Loaded when a DoH listener with `odoh_target` opens. Clients fetch the public key once a day or
+/// after a 401, so it must not change on restart.
+fn load_or_create_odoh_target(
+    config_path: Option<&std::path::Path>,
+) -> Result<Arc<OdohTarget>, String> {
+    let path = config_path
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join("odoh-target.key"))
+        .ok_or_else(|| {
+            "There is no configuration file path to store the Oblivious DoH target key, so the DoH listener does not start; this keeps the key from changing on restart".to_string()
+        })?;
+    let seed = load_or_create_key_seed(&path).map_err(|error| match error {
+        KeyFileError::Corrupt => format!(
+            "Oblivious DoH target key file is corrupted ({}); it is not replaced automatically. Delete it to make a new key",
+            path.display()
+        ),
+        KeyFileError::Read(error) => format!(
+            "Could not read the Oblivious DoH target key file ({}): {error}",
+            path.display()
+        ),
+        KeyFileError::Write(error) => format!(
+            "Could not save the Oblivious DoH target key to a file ({}): {error}. The DoH listener does not start because the key could not be kept across restarts",
+            path.display()
+        ),
+    })?;
+    let target = OdohTarget::new(onetdns_tls::hpke::PrivateKey::from_bytes(&seed));
+    let public_key: String = target
+        .public_key()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    onetdns_core::info!(event = "odoh.target_key_loaded",
+        public_key = %public_key,
+        "Loaded the Oblivious DoH target key"
+    );
+    Ok(Arc::new(target))
+}
+
+enum KeyFileError {
+    Corrupt,
+    Read(std::io::Error),
+    Write(std::io::Error),
+}
+
+/// A 32-byte secret kept as hex in `path`, made on first use. Clients trust the public key derived
+/// from it, so a corrupt file is an error and is never replaced.
+fn load_or_create_key_seed(path: &std::path::Path) -> Result<Zeroizing<[u8; 32]>, KeyFileError> {
+    match read_text_limited(path, 4096) {
         Ok(text) => {
-            let text = zeroize::Zeroizing::new(text);
-            if let Some(bytes) = parse_hex_bytes(text.trim()).filter(|bytes| bytes.len() == 32) {
-                let bytes = zeroize::Zeroizing::new(bytes);
-                let mut seed = zeroize::Zeroizing::new([0u8; 32]);
-                seed.copy_from_slice(&bytes);
-                return Ok(onetdns_dnscrypt::Provider::with_signing_seed(
-                    &seed,
-                    &cfg.dnscrypt_provider_name,
-                    valid_secs,
-                ));
-            }
-            return Err(format!(
-                "DNSCrypt provider key file is corrupted ({}); it is not replaced automatically so that clients that trust the current public key keep working",
-                path.display()
-            ));
+            let text = Zeroizing::new(text);
+            let bytes = parse_hex_bytes(text.trim())
+                .map(Zeroizing::new)
+                .filter(|bytes| bytes.len() == 32)
+                .ok_or(KeyFileError::Corrupt)?;
+            let mut seed = Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(&bytes);
+            return Ok(seed);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "Could not read the DNSCrypt provider key file ({}): {error}",
-                path.display()
-            ));
-        }
+        Err(error) => return Err(KeyFileError::Read(error)),
     }
 
-    let provider = onetdns_dnscrypt::Provider::generate(&cfg.dnscrypt_provider_name, valid_secs);
-    let seed = provider.signing_seed();
-    let mut hex = zeroize::Zeroizing::new(String::with_capacity(64));
+    let mut seed = Zeroizing::new([0u8; 32]);
+    onetdns_core::fill_random(&mut *seed);
+    let mut hex = Zeroizing::new(String::with_capacity(64));
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in seed.iter() {
         hex.push(HEX[(byte >> 4) as usize] as char);
         hex.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    atomic_write_secret(&path, hex.as_bytes()).map_err(|error| {
-        format!(
-            "Could not save the DNSCrypt provider key to a file ({}): {error}. DNSCrypt is not started because the public key could not be kept across restarts",
-            path.display()
-        )
-    })?;
-    Ok(provider)
+    atomic_write_secret(path, hex.as_bytes()).map_err(KeyFileError::Write)?;
+    Ok(seed)
 }
 
 /// Swappable per-transport TLS configs, so a certificate change needs no listener reopen:
@@ -611,7 +663,7 @@ pub(crate) fn reconcile_listeners(
     tls: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
-    self_signed_file: Option<&std::path::Path>,
+    config_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let available_cpus = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -697,7 +749,7 @@ pub(crate) fn reconcile_listeners(
     plain.extend(fresh_plain);
     drop(plain);
 
-    reconcile_encrypted(cfg, set, handler, tls, shutdown, registry, self_signed_file)
+    reconcile_encrypted(cfg, set, handler, tls, shutdown, registry, config_path)
 }
 
 /// Adopted sockets first, so a socket handed over keeps the queries queued on it.
@@ -760,19 +812,21 @@ fn reconcile_encrypted(
     tls: &Arc<Mutex<Option<Arc<TlsSlots>>>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     registry: &Arc<Mutex<Vec<(&'static str, String, String)>>>,
-    self_signed_file: Option<&std::path::Path>,
+    config_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
+    let self_signed_file = crate::tls_material::self_signed_file(config_path);
+    let self_signed_file = self_signed_file.as_deref();
 
-    // The DoH path is fixed when the listener opens. The same address reopens only after the old
-    // listener is taken down.
+    // The DoH path and Oblivious DoH are fixed when the listener opens. The same address reopens
+    // only after the old listener is taken down.
     macro_rules! sync_one {
         ($field:ident, $addrs:expr, $kind:literal, $open:expr) => {{
             let mut live = set.$field.lock_recover();
-            let path_part = if matches!($kind, "doh" | "doh3") {
-                cfg.doh_path.as_str()
-            } else {
-                ""
+            let path_part = match $kind {
+                "doh" if cfg.odoh_target => format!("{}|odoh", cfg.doh_path),
+                "doh" | "doh3" => cfg.doh_path.clone(),
+                _ => String::new(),
             };
             let wanted: Vec<(String, SocketAddr)> = $addrs
                 .iter()
@@ -838,20 +892,32 @@ fn reconcile_encrypted(
     }
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh.clone())?;
-        sync_one!(doh, cfg.listen_doh, "doh", |addr| tcp_socket(
-            set,
-            SocketRole::Doh,
-            addr
-        )
-        .and_then(|socket| doh::serve_doh(
-            socket,
-            tls_cfg.clone(),
-            handler.clone(),
-            cfg.doh_path.clone(),
-            set.encrypted_tcp_admission.clone(),
-            shutdown.clone()
-        ))
-        .map_err(|error| listener_open_error("DoH", addr, &error)));
+        // Loaded only when a listener opens, so a reload that leaves DoH alone never reads it.
+        let mut odoh_target = None;
+        sync_one!(doh, cfg.listen_doh, "doh", |addr| -> Result<_, String> {
+            let target = match (&odoh_target, cfg.odoh_target) {
+                (_, false) => None,
+                (Some(target), true) => Some(Arc::clone(target)),
+                (None, true) => {
+                    let target = load_or_create_odoh_target(config_path)?;
+                    odoh_target = Some(target.clone());
+                    Some(target)
+                }
+            };
+            tcp_socket(set, SocketRole::Doh, addr)
+                .and_then(|socket| {
+                    doh::serve_doh(
+                        socket,
+                        tls_cfg.clone(),
+                        handler.clone(),
+                        cfg.doh_path.clone(),
+                        target,
+                        set.encrypted_tcp_admission.clone(),
+                        shutdown.clone(),
+                    )
+                })
+                .map_err(|error| listener_open_error("DoH", addr, &error))
+        });
     }
     if !cfg.listen_doq.is_empty() || !set.doq.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doq.clone())?;
@@ -1608,6 +1674,44 @@ pub(crate) mod tests {
 
         let restored = load_or_create_dnscrypt_provider(&cfg, &config_path, 86_400).unwrap();
         assert_eq!(restored.provider_public_key(), public_key);
+
+        std::fs::remove_file(key_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    /// Clients cache the target's config, so the key survives a restart, and a damaged key file
+    /// stops the listener instead of quietly becoming a new key.
+    fn odoh_target_key_survives_reload_and_is_never_replaced() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-odoh-target-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config_path = dir.join(CONFIG_FILE_NAME);
+
+        let Err(no_path) = load_or_create_odoh_target(None) else {
+            panic!("a key with nowhere to persist must not be used");
+        };
+        assert!(no_path.contains("no configuration file path"), "{no_path}");
+
+        let first = load_or_create_odoh_target(Some(&config_path)).unwrap();
+        let key_path = dir.join("odoh-target.key");
+        let persisted = Zeroizing::new(std::fs::read_to_string(&key_path).unwrap());
+        assert_eq!(persisted.len(), 64);
+        let restored = load_or_create_odoh_target(Some(&config_path)).unwrap();
+        assert_eq!(restored.public_key(), first.public_key());
+
+        std::fs::write(&key_path, "not hex").unwrap();
+        let Err(corrupt) = load_or_create_odoh_target(Some(&config_path)) else {
+            panic!("a corrupt key file must not be replaced");
+        };
+        assert!(corrupt.contains("corrupted"), "{corrupt}");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not hex");
 
         std::fs::remove_file(key_path).unwrap();
         std::fs::remove_dir(dir).unwrap();

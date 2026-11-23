@@ -11,6 +11,7 @@ Incoming encrypted DNS uses `listen_dot`, `listen_doh`, `listen_doh3`, `listen_d
 | DNS over HTTPS/3 | `listen_doh3` | UDP 443, path `/dns-query` | HTTP/3-capable client and matching certificate |
 | DNS over QUIC (DoQ) | `listen_doq` | UDP 853 | DoQ-capable client and matching certificate |
 | DNSCrypt | `listen_dnscrypt` | Configured UDP/TCP port | DNSCrypt provider information/stamp |
+| Oblivious DoH target | `listen_doh` with `odoh_target` | Same as DoH | Reached through an ODoH proxy; see [Oblivious DoH](#oblivious-doh) |
 
 The ports shown are conventional; each transport is enabled by setting its listener. The host firewall and any cloud network rule must permit the corresponding TCP or UDP traffic.
 
@@ -46,6 +47,23 @@ https://dns.example.com/dns-query
 ```
 
 DoH uses HTTP over TLS/TCP; DoH3 uses HTTP/3 over QUIC/UDP. A browser may support classic DoH but not manually selecting DoH3. Test UDP 443 separately. HTTP errors must be diagnosed at the HTTP layer before investigating DNS policy.
+
+## Oblivious DoH
+
+Oblivious DoH (ODoH, RFC 9230) splits what one DoH server learns between two parties. The client encrypts its query to a **target** and sends it through a **proxy**. The proxy sees the client's address but not the query; the target decrypts and answers the query but sees only the proxy's address.
+
+To act as a target, turn it on for the DoH listeners:
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+odoh_target = true
+```
+
+The listener then also accepts `application/oblivious-dns-message` POSTs on `doh_path` and publishes its key configuration at `https://dns.example.com/.well-known/odohconfigs`. Ordinary DoH keeps working on the same listener. DoH3 listeners do not serve ODoH.
+
+The target key is created on first use as `odoh-target.key` next to the configuration file and kept across restarts and upgrades. OnetDNS never replaces it on its own: a damaged file stops the DoH listener with an error. To change the key, delete the file and restart OnetDNS; clients holding the old configuration get HTTP 401 and fetch the new one. Anyone who can read the file can decrypt previously captured queries to this target, so protect it like the TLS private key.
+
+**Every ODoH query appears to come from the proxy.** Client policy, ACLs, rate limits, client-specific rules and the query log key on the proxy's address (or the proxy's mTLS client identity), never on the client behind it. All clients of one proxy share its policy and its per-client rate limit; if you rate-limit clients, list the proxy in `rate_limit_allow` or the proxy's users will be throttled together.
 
 ## DNSCrypt setup
 

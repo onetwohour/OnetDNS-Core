@@ -10,7 +10,7 @@ Depending on transport and network topology, OnetDNS may see:
 - an available MAC address on directly observable networks;
 - an authenticated or configured client identifier on an encrypted DNS transport.
 
-A NAT router, VPN gateway or proxy may hide the individual device address. An Ethernet MAC address is generally not preserved across routed networks. Do not assume a DHCP lease name, hostname or friendly dashboard label provides authenticated client identity.
+A NAT router, VPN gateway or proxy may hide the individual device address. Oblivious DoH hides it by design: a query relayed by an ODoH proxy shows only the proxy's address, so profiles, ACLs, rate limits and the query log apply to the proxy (see [Oblivious DoH](encrypted-dns.md#oblivious-doh)). An Ethernet MAC address is generally not preserved across routed networks. Do not assume a DHCP lease name, hostname or friendly dashboard label provides authenticated client identity.
 
 Send a query from the device, inspect its identity in Query log, and match that identity with `ids`, `client_ids`, or `mac`.
 

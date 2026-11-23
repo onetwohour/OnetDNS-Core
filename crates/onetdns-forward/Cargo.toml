@@ -12,6 +12,7 @@ onetdns-tls.workspace = true
 onetdns-http2.workspace = true
 onetdns-quic.workspace = true
 onetdns-dnscrypt.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -18,6 +18,7 @@ use crate::connection_limit::{
     ConnectionSignals, EncryptedTcpListener, PrefixedTcp,
 };
 use crate::native::NativeServer;
+use crate::odoh::{ObliviousConn, OdohTarget};
 use crate::transport_observe;
 
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,12 +40,13 @@ pub(crate) fn http_freshness_secs(msg: &Message) -> u32 {
         .unwrap_or(0)
 }
 
-/// Serves DoH on `listener`, already bound.
+/// Serves DoH on `listener`, already bound, and Oblivious DoH as `target` when given.
 pub fn serve_doh(
     listener: TcpListener,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     handler: Arc<NativeServer>,
     path: String,
+    target: Option<Arc<OdohTarget>>,
     admission: Arc<ConnectionLimiter>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<EncryptedTcpListener> {
@@ -62,6 +64,7 @@ pub fn serve_doh(
             let tls = tls.clone();
             let handler = handler.clone();
             let path = path.clone();
+            let target = target.clone();
             let spawned = spawn_bounded_connection_thread("doh-connection", move || {
                 let AdmittedConnection {
                     stream,
@@ -70,7 +73,14 @@ pub fn serve_doh(
                     ..
                 } = connection;
                 let result = onetdns_core::isolation::catch_request(|| {
-                    serve_conn(stream, &tls.load(), &handler, &path, &signals)
+                    serve_conn(
+                        stream,
+                        &tls.load(),
+                        &handler,
+                        &path,
+                        target.as_deref(),
+                        &signals,
+                    )
                 });
                 if let Ok(Err(stage)) = result {
                     if !signals.stopping() {
@@ -114,6 +124,7 @@ fn serve_conn(
     tls: &ServerConfig,
     handler: &NativeServer,
     path: &str,
+    target: Option<&OdohTarget>,
     signals: &ConnectionSignals,
 ) -> Result<(), &'static str> {
     let src = tcp.peer_addr().map_err(|_| "peer_addr")?;
@@ -128,9 +139,7 @@ fn serve_conn(
     // Failures are HTTP statuses. An unreadable body is the request's fault, so it gets a 4xx; a
     // 5xx means a server fault, and clients would resend to the same server. A query the handler
     // chose not to answer gets no status; the connection just ends.
-    let dns = |q: &[u8],
-               path_client_id: Option<&str>|
-     -> Result<Option<onetdns_http2::DohAnswer>, &'static str> {
+    let resolve = |q: &[u8], client_id: Option<String>| -> Result<Option<Message>, &'static str> {
         let request = match Message::parse(q) {
             Ok(request) => request,
             Err(error) => {
@@ -147,6 +156,19 @@ fn serve_conn(
             );
             return Err("400");
         }
+        let ctx = RequestCtx {
+            src,
+            transport: RtTransport::DoH,
+            raw: Some(q),
+            client_id,
+            authenticated: tls_authenticated,
+            auth_identity: tls_auth_identity.clone(),
+        };
+        Ok(handler.handle(&request, &ctx))
+    };
+    let dns = |q: &[u8],
+               path_client_id: Option<&str>|
+     -> Result<Option<onetdns_http2::DohAnswer>, &'static str> {
         let client_id = match authenticated_path_identity(
             path_client_id,
             tls_authenticated,
@@ -169,15 +191,7 @@ fn serve_conn(
                 return Err("403");
             }
         };
-        let ctx = RequestCtx {
-            src,
-            transport: RtTransport::DoH,
-            raw: Some(q),
-            client_id,
-            authenticated: tls_authenticated,
-            auth_identity: tls_auth_identity.clone(),
-        };
-        let Some(response) = handler.handle(&request, &ctx) else {
+        let Some(response) = resolve(q, client_id)? else {
             return Ok(None);
         };
         let max_age = http_freshness_secs(&response);
@@ -186,6 +200,25 @@ fn serve_conn(
             max_age,
         }))
     };
+    // A relayed query names no client in the path; the connection's own identity, the proxy's,
+    // is the only one.
+    let oblivious = target.map(|target| ObliviousConn {
+        target,
+        peer: src,
+        resolve: |q: &[u8]| {
+            let client_id =
+                authenticated_path_identity(None, tls_authenticated, tls_auth_identity.as_deref())
+                    .ok()
+                    .flatten();
+            match resolve(q, client_id)? {
+                Some(response) => response.try_encode().map(Some).map_err(|_| "502"),
+                None => Ok(None),
+            }
+        },
+    });
+    let oblivious = oblivious
+        .as_ref()
+        .map(|conn| conn as &dyn onetdns_http2::Oblivious);
 
     match alpn.as_deref() {
         Some(b"h2") => onetdns_http2::serve_doh_with_deadline_reset(
@@ -198,14 +231,21 @@ fn serve_conn(
                     .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
             },
             &signals.drain,
+            oblivious,
         )
         .map_err(|_| "http2_connection"),
 
-        _ => onetdns_http2::serve_doh_h1_with_deadline_reset(&mut stream, path, dns, |stream| {
-            stream
-                .inner_mut()
-                .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
-        })
+        _ => onetdns_http2::serve_doh_h1_with_deadline_reset(
+            &mut stream,
+            path,
+            dns,
+            |stream| {
+                stream
+                    .inner_mut()
+                    .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
+            },
+            oblivious,
+        )
         .map_err(|_| "http1_connection"),
     }
 }
@@ -278,6 +318,7 @@ mod tests {
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             native_handler(),
             "/dns-query".to_string(),
+            None,
             Arc::new(ConnectionLimiter::default()),
             Arc::new(AtomicBool::new(false)),
         )
@@ -460,6 +501,7 @@ mod tests {
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             "/dns-query".to_string(),
+            None,
             Arc::new(ConnectionLimiter::default()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
@@ -484,6 +526,28 @@ mod tests {
     }
 
     fn doh_post_h1(addr: SocketAddr, trust: Arc<TrustStore>, query: &[u8]) -> Vec<u8> {
+        let (head, body) = https_post_h1(addr, trust, "application/dns-message", query);
+        assert!(head.starts_with("HTTP/1.1 200"), "200 응답: {head}");
+        body
+    }
+
+    fn https_post_h1(
+        addr: SocketAddr,
+        trust: Arc<TrustStore>,
+        content_type: &str,
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        let mut req = format!(
+            "POST /dns-query HTTP/1.1\r\nHost: dns.test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        https_h1(addr, trust, &req)
+    }
+
+    /// One HTTP/1.1 request over TLS; returns the status line with the header fields, and the body.
+    fn https_h1(addr: SocketAddr, trust: Arc<TrustStore>, req: &[u8]) -> (String, Vec<u8>) {
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -497,14 +561,7 @@ mod tests {
         let conn = client_handshake(&mut tcp, &cfg).expect("클라 핸드셰이크");
         assert_eq!(conn.alpn(), Some(b"http/1.1".as_slice()), "http/1.1 협상");
         let mut s = TlsStream::new(conn, tcp);
-
-        let mut req = format!(
-            "POST /dns-query HTTP/1.1\r\nHost: dns.test\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            query.len()
-        )
-        .into_bytes();
-        req.extend_from_slice(query);
-        s.write_all(&req).unwrap();
+        s.write_all(req).unwrap();
 
         let mut resp = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -530,9 +587,70 @@ mod tests {
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .expect("헤더 끝");
-        let head = std::str::from_utf8(&resp[..split]).unwrap();
-        assert!(head.starts_with("HTTP/1.1 200"), "200 응답: {head}");
-        resp[split + 4..].to_vec()
+        let head = std::str::from_utf8(&resp[..split]).unwrap().to_string();
+        (head, resp[split + 4..].to_vec())
+    }
+
+    #[test]
+    /// A client fetches the config, seals a query to it, and opens the answer, which went through
+    /// the same filtering as DoH.
+    fn odoh_queries_resolve_through_the_doh_listener() {
+        use onetdns_forward::odoh::PublicConfig;
+        use onetdns_tls::hpke::PrivateKey;
+
+        let (tls, trust) = self_signed_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let target = Arc::new(OdohTarget::new(PrivateKey::generate()));
+        let l = serve_doh(
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(tls)),
+            native_handler(),
+            "/dns-query".to_string(),
+            Some(target),
+            Arc::new(ConnectionLimiter::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        let get =
+            b"GET /.well-known/odohconfigs HTTP/1.1\r\nHost: dns.test\r\nConnection: close\r\n\r\n";
+        let (head, configs) = https_h1(l.addr(), trust.clone(), get);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let config = PublicConfig::from_configs(&configs).unwrap();
+
+        let ask = |name: &str, id: u16| {
+            let query = Message::query(id, ApName::from_str(name).unwrap(), RecordType::A);
+            let (message, pending) = config.seal_query(&query.try_encode().unwrap()).unwrap();
+            let (head, body) = https_post_h1(
+                l.addr(),
+                trust.clone(),
+                onetdns_http2::ODOH_MEDIA_TYPE,
+                &message,
+            );
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.contains("cache-control: no-cache, no-store"), "{head}");
+            Message::parse(&pending.open_response(&body).unwrap()).unwrap()
+        };
+        let allowed = ask("allowed.test", 0x6161);
+        assert_eq!(allowed.header.id, 0x6161);
+        assert!(matches!(
+            allowed.answers[0].rdata,
+            ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
+        ));
+        let blocked = ask("blocked.test", 0x6262);
+        assert_eq!(
+            blocked.header.rcode,
+            onetdns_proto::ResponseCode::NXDomain.0
+        );
+
+        let other_key = onetdns_forward::odoh::TargetKey::new(PrivateKey::generate());
+        let stale = PublicConfig::from_configs(&other_key.configs()).unwrap();
+        let query = Message::query(1, ApName::from_str("allowed.test").unwrap(), RecordType::A);
+        let (message, _) = stale.seal_query(&query.try_encode().unwrap()).unwrap();
+        let (head, _) = https_post_h1(l.addr(), trust, onetdns_http2::ODOH_MEDIA_TYPE, &message);
+        assert!(
+            head.starts_with("HTTP/1.1 401"),
+            "a query for another key tells the client to refetch: {head}"
+        );
     }
 
     #[test]
@@ -544,6 +662,7 @@ mod tests {
             std::sync::Arc::new(onetdns_core::ArcSwap::new(tls)),
             handler,
             "/dns-query".to_string(),
+            None,
             Arc::new(ConnectionLimiter::default()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
@@ -575,6 +694,7 @@ mod tests {
             Arc::new(onetdns_core::ArcSwap::new(tls)),
             native_handler_with(acl.clone()),
             "/dns-query".to_string(),
+            None,
             Arc::new(ConnectionLimiter::default()),
             Arc::new(AtomicBool::new(false)),
         )
