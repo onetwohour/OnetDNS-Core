@@ -928,7 +928,7 @@ DNS stamps and Apple configuration profiles that point clients at this server.
 | Method | Path | Access | Summary |
 |---|---|---|---|
 | POST | `/v1/client-setup/stamps` | admin | DNS stamps (sdns://) for the open listeners, one per protocol, address, and port (admin only). Plain DNS and DNSCrypt stamps use `address`, or the IP the listener is bound to; a listener on a loopback address keeps it. DoH, DoT, and DoQ stamps need a name the served certificate covers, by default `ddr_name` or the first name in the certificate. A chain this machine does not trust is pinned by the hash of its topmost certificate |
-| POST | `/v1/client-setup/apple-profile` | admin | Apple configuration profile (.mobileconfig) that sets the system DNS to this server over DoH or DoT (admin only). It carries the root certificate when this machine does not trust the chain, and with `ssids` it applies only on those Wi-Fi networks. Refused when Apple devices would reject the certificate or when the certificate changes at every start |
+| POST | `/v1/client-setup/apple-profile` | admin | Apple configuration profile (.mobileconfig) that sets the system DNS to this server over DoH or DoT (admin only). It carries the root certificate when this machine does not trust the chain, and with `ssids` it applies only on those Wi-Fi networks. With `sign`, a chain this machine trusts signs it so devices show it as verified; with any other chain it stays unsigned. Refused when Apple devices would reject the certificate or when the certificate changes at every start |
 
 #### `POST /v1/client-setup/stamps`
 
@@ -954,10 +954,11 @@ Request body (`application/json`):
 | `address` | string | no |
 | `hostname` | string | no |
 | `ssids` | array of strings | no |
+| `sign` | boolean | no |
 
 | Status | Response |
 |---|---|
-| 200 | application/x-apple-aspen-config plist |
+| 200 | application/x-apple-aspen-config: plist, or when signed, CMS SignedData (DER) carrying it |
 | 400 | `{error}` |
 
 ### Zones

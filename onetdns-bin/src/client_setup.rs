@@ -2,6 +2,7 @@
 //! profile. Both encoders read one `Endpoints` value built from the running listeners.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use onetdns_config::Config;
 use onetdns_tls::{TrustStore, X509};
@@ -79,12 +80,22 @@ impl Transport {
     }
 }
 
+/// Signs with the key of the served leaf and returns a DER signature; `scheme` is the TLS signature
+/// scheme.
+#[derive(Clone)]
+pub(crate) struct Signer {
+    pub(crate) scheme: u16,
+    pub(crate) sign: Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
+}
+
 /// Read from the running server.
 pub(crate) struct Served {
     /// Listener registry entries: kind, configured address, bound address.
     pub(crate) listeners: Vec<(&'static str, String, String)>,
     /// What the encrypted listeners present, leaf first; empty without one.
     pub(crate) chain: Vec<Vec<u8>>,
+    /// Holds the key of `chain[0]`.
+    pub(crate) signer: Option<Signer>,
     /// A `tls_self_signed_host` certificate that is not kept in a file, so the next start replaces
     /// it.
     pub(crate) chain_changes_on_restart: bool,
@@ -98,6 +109,7 @@ struct ServedCertificate {
     trusted: bool,
     /// Replaced at the next start; see `Served::chain_changes_on_restart`.
     ephemeral: bool,
+    signer: Option<Signer>,
 }
 
 pub(crate) struct Endpoints {
@@ -181,6 +193,7 @@ impl Endpoints {
                 parsed,
                 trusted,
                 ephemeral: served.chain_changes_on_restart,
+                signer: served.signer,
             });
         }
 
@@ -431,6 +444,19 @@ impl Endpoints {
             payload_header(&display_name, &identifier, "Configuration")
         ))
     }
+
+    /// `profile` signed with the served certificate, which Apple devices show as verified. None
+    /// when this machine does not trust the certificate for the hostname: a device would not trust
+    /// the signature either.
+    pub(crate) fn sign_profile(&self, profile: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let Some(cert) = self.certificate.as_ref().filter(|cert| cert.trusted) else {
+            return Ok(None);
+        };
+        let Some(signer) = &cert.signer else {
+            return Ok(None);
+        };
+        crate::cms::signed_data(profile, &cert.der, signer.scheme, &*signer.sign).map(Some)
+    }
 }
 
 /// The address clients connect to. A port is refused: each stamp takes its listener's port.
@@ -662,7 +688,8 @@ mod tests {
     }
 
     fn serving(host: &str, kinds: &[(&'static str, &str)]) -> (Served, Vec<u8>) {
-        let (chain, _key) = onetdns_transport::self_signed_material(host).unwrap();
+        let (chain, key) = onetdns_transport::self_signed_material(host).unwrap();
+        let (scheme, sign) = onetdns_tls::conn::signer_from_pkcs8_der(&key).unwrap();
         let leaf = chain[0].clone();
         let served = Served {
             listeners: kinds
@@ -670,6 +697,7 @@ mod tests {
                 .map(|(kind, bound)| (*kind, bound.to_string(), bound.to_string()))
                 .collect(),
             chain,
+            signer: Some(Signer { scheme, sign }),
             chain_changes_on_restart: false,
             dnscrypt: None,
         };
@@ -719,6 +747,7 @@ mod tests {
             let served = Served {
                 listeners: listeners.clone(),
                 chain: Vec::new(),
+                signer: None,
                 chain_changes_on_restart: false,
                 dnscrypt: Some(DnscryptIdentity {
                     provider_name: "2.dnscrypt-cert.onetdns".to_string(),
@@ -848,6 +877,32 @@ mod tests {
         assert!(profile.contains("<string>192.0.2.1</string>"));
         assert!(profile.contains("<string>Home &amp; Co</string>"));
         assert!(profile.contains("<string>onetdns.dns.example.dns</string>"));
+    }
+
+    #[test]
+    fn only_a_certificate_trusted_here_signs_the_profile() {
+        let (e, _) = profile_endpoints(&[("doh", "0.0.0.0:443")]);
+        assert_eq!(
+            e.sign_profile(b"<plist/>").unwrap(),
+            None,
+            "이 컴퓨터가 믿지 않는 인증서로 서명했습니다"
+        );
+
+        let (s, leaf) = serving("dns.example", &[("doh", "0.0.0.0:443")]);
+        let store = TrustStore::from_ders([leaf.as_slice()]);
+        let e = Endpoints::new(&Config::default(), s, None, None, &store, now()).unwrap();
+        let profile = e.apple_profile(Transport::Doh, &[]).unwrap();
+        assert!(!profile.contains("com.apple.security.root"));
+        let signed = e
+            .sign_profile(profile.as_bytes())
+            .unwrap()
+            .expect("믿는 인증서로 서명하지 않았습니다");
+        let carries = |part: &[u8]| signed.windows(part.len()).any(|window| window == part);
+        assert!(
+            carries(profile.as_bytes()),
+            "서명한 프로필에 원문이 없습니다"
+        );
+        assert!(carries(&leaf), "서명한 프로필에 인증서가 없습니다");
     }
 
     #[test]

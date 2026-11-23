@@ -270,9 +270,14 @@ impl TlsSlots {
         *live = prepared.files;
     }
 
-    /// The chain every encrypted transport presents now, leaf first.
-    pub(crate) fn served_chain(&self) -> Vec<Vec<u8>> {
-        self.dot.load().cert_chain.clone()
+    /// The chain every encrypted transport presents now, leaf first, and a signer holding its key.
+    pub(crate) fn served_certificate(&self) -> (Vec<Vec<u8>>, crate::client_setup::Signer) {
+        let served = self.dot.load();
+        let signer = crate::client_setup::Signer {
+            scheme: served.sign_scheme,
+            sign: served.sign.clone(),
+        };
+        (served.cert_chain.clone(), signer)
     }
 
     pub(crate) fn ticket_keys(&self) -> TicketKeys {

@@ -79,6 +79,7 @@ The resulting DNSCrypt stamp includes the supplied client address, the configure
 | Client | Select |
 | --- | --- |
 | Android Private DNS | The hostname of your DoT endpoint, not a bare `https://` URL |
+| iPhone, iPad, Mac | A configuration profile from the dashboard's client setup (`POST /v1/client-setup/apple-profile`). With a certificate this machine trusts, such as one from ACME, the profile is signed and shows as verified on the device |
 | Browser encrypted DNS | Full DoH URL and a certificate the browser trusts |
 | DoQ-capable app | Matching host, UDP port and protocol support |
 | DNSCrypt client | Configured provider identity, resolver stamp and port |

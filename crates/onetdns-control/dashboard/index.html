@@ -5083,8 +5083,10 @@ class Component extends DCLogic {
     const timeout=setTimeout(()=>controller.abort(),method==='GET'?12000:30000);
     try{
       const r=await fetch(path,options);
-      const t=await r.text();
-      let body;try{body=t?JSON.parse(t):null;}catch(e){body=t;}
+      let body;
+      // A binary body read as text loses every byte that is not valid UTF-8.
+      if(options.binary&&r.ok)body=new Uint8Array(await r.arrayBuffer());
+      else{const t=await r.text();try{body=t?JSON.parse(t):null;}catch(e){body=t;}}
       if(generation!==this._sessionGeneration)return {ok:false,status:499,body:null,stale:true};
       if(r.status===401&&path!=='/v1/auth'&&path!=='/v1/login'){this.authExpired();return {ok:false,status:401,body,stale:true};}
       if(r.ok){const streamOnline=!!(this._ws&&this._ws.readyState===WebSocket.OPEN);this.setState({restOnline:true,streamOnline,connectionState:streamOnline||!this.state.loggedIn?'online':'degraded',connectionAt:Date.now()});}
@@ -5126,7 +5128,7 @@ class Component extends DCLogic {
     this.setState(st=>({mutationPending:{...st.mutationPending,[key]:true}}));
     const generation=this._sessionGeneration;
     const headers={...(body==null?{}:{'Content-Type':isStr?'text/plain':'application/json'}),...(options&&options.background?{Prefer:'respond-async'}:{})};
-    const promise=this.request(path,{method,headers:this.apiHdr(headers),body:body==null?undefined:(isStr?body:JSON.stringify(body))}).finally(()=>{
+    const promise=this.request(path,{method,headers:this.apiHdr(headers),body:body==null?undefined:(isStr?body:JSON.stringify(body)),binary:!!(options&&options.binary)}).finally(()=>{
       delete this._mutationRequests[key];
       if(generation===this._sessionGeneration)this.setState(st=>{const next={...st.mutationPending};delete next[key];return {mutationPending:next};});
     });
@@ -5730,13 +5732,14 @@ class Component extends DCLogic {
   copyStamp=async(stamp)=>{try{await navigator.clipboard.writeText(stamp);this.toastMsg('스탬프를 복사했습니다');}catch(e){this.toastMsg('클립보드 복사 권한이 없습니다',true);}};
   appleProfile=async(protocol)=>{
     const ssids=String(this.state.forms.setupSsids||'').split(',').map(name=>name.trim()).filter(Boolean);
-    const r=await this.apiSend('/v1/client-setup/apple-profile','POST',{...this.clientSetupBody(),protocol,ssids});
-    if(!(r.ok&&typeof r.body==='string'))return this.toastMsg(this.tr('프로필을 만들지 못했습니다: {error}',{error:this.errorText(r)}),true);
+    const r=await this.apiSend('/v1/client-setup/apple-profile','POST',{...this.clientSetupBody(),protocol,ssids,sign:true},{binary:true});
+    if(!(r.ok&&r.body instanceof Uint8Array))return this.toastMsg(this.tr('프로필을 만들지 못했습니다: {error}',{error:this.errorText(r)}),true);
     this.rememberClientSetup();
     try{const blob=new Blob([r.body],{type:'application/x-apple-aspen-config'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='onetdns-'+protocol+'.mobileconfig';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
     catch(e){return this.toastMsg('프로필 파일을 저장하지 못했습니다',true);}
     // 이 컴퓨터가 믿지 않는 인증서면 프로필에 루트 인증서가 들어가고, 기기에서 따로 신뢰를 켜야 한다.
-    this.toastMsg(r.body.includes('com.apple.security.root')
+    // A signed profile carries the plist as is, so the same search reads both forms.
+    this.toastMsg(new TextDecoder().decode(r.body).includes('com.apple.security.root')
       ?'프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치한 뒤, 설정 > 일반 > 정보 > 인증서 신뢰 설정에서 이 인증서를 켜세요.'
       :'프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.');
   };

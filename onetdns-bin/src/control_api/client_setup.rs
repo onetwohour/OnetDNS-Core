@@ -14,12 +14,13 @@ impl ControlDeps {
         };
         let address = text("address").map(parse_address).transpose()?;
         let cfg = self.runtime_cfg.load();
-        let chain = self
-            .tls_slot_handle
-            .lock_recover()
-            .as_ref()
-            .map(|slots| slots.served_chain())
-            .unwrap_or_default();
+        let (chain, signer) = match self.tls_slot_handle.lock_recover().as_ref() {
+            Some(slots) => {
+                let (chain, signer) = slots.served_certificate();
+                (chain, Some(signer))
+            }
+            None => (Vec::new(), None),
+        };
         let kept = || {
             let file = crate::tls_material::self_signed_file(self.config_path.as_deref());
             chain
@@ -30,6 +31,7 @@ impl ControlDeps {
             listeners: self.listener_reg.lock_recover().clone(),
             chain_changes_on_restart: cfg.tls_self_signed_host.is_some() && !kept(),
             chain,
+            signer,
             dnscrypt: self.dnscrypt_identity.lock_recover().clone(),
         };
         Endpoints::new(
@@ -74,6 +76,7 @@ impl ControlDeps {
         ))
     }
 
+    /// Plist XML, or with `sign` its CMS SignedData when a certificate this machine trusts can sign.
     pub(super) fn client_apple_profile(&self, body: &str) -> Result<Vec<u8>, String> {
         let request = parse_body(body)?;
         let protocol = request
@@ -93,9 +96,18 @@ impl ControlDeps {
                 .collect::<Option<Vec<_>>>()
                 .ok_or("`ssids` must be an array of strings")?,
         };
-        self.endpoints(&request)?
-            .apple_profile(transport, &ssids)
-            .map(String::into_bytes)
+        let sign = match request.get("sign") {
+            None => false,
+            Some(value) => value.as_bool().ok_or("`sign` must be true or false")?,
+        };
+        let endpoints = self.endpoints(&request)?;
+        let profile = endpoints.apple_profile(transport, &ssids)?.into_bytes();
+        if sign {
+            if let Some(signed) = endpoints.sign_profile(&profile)? {
+                return Ok(signed);
+            }
+        }
+        Ok(profile)
     }
 }
 

@@ -10,6 +10,7 @@ mod cli;
 mod client_setup;
 /// Raft cluster and config writes through it.
 mod cluster;
+mod cms;
 /// Classifies and applies config changes.
 mod config_apply;
 /// Edits the TOML config file.

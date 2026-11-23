@@ -90,14 +90,14 @@ fn der_len(len: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+pub(crate) fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut v = vec![tag];
     der_len(content.len(), &mut v);
     v.extend_from_slice(content);
     v
 }
 
-fn seq(content: &[u8]) -> Vec<u8> {
+pub(crate) fn seq(content: &[u8]) -> Vec<u8> {
     tlv(0x30, content)
 }
 
