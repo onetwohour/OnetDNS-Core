@@ -42,6 +42,9 @@ powershell -File benchmarks/windows/run-cpu-per-resolution.ps1 `
   -BinaryB 'target\release\onetdns-baseline.exe'
 ```
 
+`--no-web`을 뺀 팔은 대시보드를 기본 주소 `127.0.0.1:8553`에 연다. 이 PC에서 OnetDNS가
+돌고 있으면 그 포트와 겹치므로, 그때는 `-ControlPort`로 다른 loopback 포트를 준다.
+
 비율 산포가 게이트(기본 5%)를 넘으면 그 회차의 값은 인용하지 않는다. 넘더라도 모든
 라운드가 같은 방향으로 크게 벌어진다면 방향만 보고하고 점추정은 보고하지 않는다.
 

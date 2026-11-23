@@ -42,7 +42,7 @@ param(
     # 안에서 두 팔을 번갈아 재고 그 비율만 인용하면 창의 열화가 양쪽에 같이 실려 상쇄된다.
     [string]$BinaryB = "",
     [string]$ArgsA = "--no-web",
-    [string]$ArgsB = ""
+    [string]$ArgsB = "--no-web"
 )
 
 $ErrorActionPreference = 'Stop'
