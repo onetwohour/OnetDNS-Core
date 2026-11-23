@@ -359,10 +359,11 @@ pub(crate) fn connect_upstream(
     deadline: Instant,
 ) -> std::io::Result<DeadlineTcp> {
     let left = onetdns_core::tcp::time_left(deadline)?;
-    Ok(DeadlineTcp::new(
-        bound_tcp::connect(outgoing_bind(addr), addr, left)?,
-        deadline,
-    ))
+    let stream = bound_tcp::connect(outgoing_bind(addr), addr, left)?;
+    // With Nagle on, a query written while the previous one is unacknowledged waits for the
+    // server's delayed ACK.
+    let _ = stream.set_nodelay(true);
+    Ok(DeadlineTcp::new(stream, deadline))
 }
 
 /// The TCP connection a DoT or DoH upstream runs over.
@@ -2591,6 +2592,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         condition()
+    }
+
+    #[test]
+    fn upstream_connections_send_without_waiting_for_acks() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let stream = connect_upstream(
+            listener.local_addr().unwrap(),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(stream.get_ref().nodelay().unwrap());
     }
 
     #[test]

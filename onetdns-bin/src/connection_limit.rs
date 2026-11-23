@@ -160,6 +160,9 @@ impl PendingEncryptedConnection {
         deadline: Instant,
     ) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
+        // With Nagle on, each answer written in several TLS records waits for the client's
+        // delayed ACK.
+        let _ = stream.set_nodelay(true);
         let now = Instant::now();
         Ok(Self {
             stream,
@@ -988,6 +991,22 @@ mod tests {
         let mut bytes = [0u8; 11];
         stream.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"prefix-tail");
+    }
+
+    #[test]
+    fn admitted_connections_send_without_waiting_for_acks() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        assert!(
+            !server.nodelay().unwrap(),
+            "대조군: 받은 소켓은 Nagle 이 켜져 있습니다"
+        );
+        let limiter = ConnectionLimiter::new(1, 1);
+        let guard = limiter.try_acquire(peer.ip()).unwrap();
+        let pending =
+            PendingEncryptedConnection::new(server, peer, guard, AdmissionProtocol::Tls).unwrap();
+        assert!(pending.stream.nodelay().unwrap());
     }
 
     #[test]
