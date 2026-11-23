@@ -174,7 +174,7 @@ where
         )?;
 
         if !shutdown_announced && draining.load(Ordering::Relaxed) {
-            send_goaway(stream, MAX_STREAM_ID)?;
+            send_goaway(stream, MAX_STREAM_ID, error_code::NO_ERROR)?;
             send_frame(stream, frame_type::PING, 0, 0, &DRAIN_PING)?;
             shutdown_announced = true;
         }
@@ -187,7 +187,7 @@ where
             Err(H2Error::Closed) => return Ok(()),
             Err(H2Error::Io) if draining.load(Ordering::Relaxed) => {
                 if !goaway_sent {
-                    let _ = send_goaway(stream, last_client_stream);
+                    let _ = send_goaway(stream, last_client_stream, error_code::NO_ERROR);
                 }
                 return Ok(());
             }
@@ -257,7 +257,7 @@ where
                 return Err(H2Error::Protocol);
             }
             frame_type::PING if shutdown_announced && !goaway_sent && payload == DRAIN_PING => {
-                send_goaway(stream, last_client_stream)?;
+                send_goaway(stream, last_client_stream, error_code::NO_ERROR)?;
                 goaway_sent = true;
             }
             frame_type::GOAWAY => {
@@ -316,8 +316,7 @@ where
                 }
                 let block = strip_headers(&payload, h.flags)?;
                 if block.len() > MAX_H2_HEADER_BLOCK {
-                    send_rst_stream(stream, h.stream_id, error_code::CANCEL)?;
-                    continue;
+                    return undecoded_header_block(stream, last_client_stream);
                 }
 
                 reset_deadline(stream);
@@ -369,12 +368,7 @@ where
                     return Err(H2Error::Protocol);
                 }
                 if cont_block.len().saturating_add(payload.len()) > MAX_H2_HEADER_BLOCK {
-                    streams.remove(&h.stream_id);
-                    send_stream_windows.remove(&h.stream_id);
-                    cont_stream = None;
-                    cont_block.clear();
-                    send_rst_stream(stream, h.stream_id, error_code::CANCEL)?;
-                    continue;
+                    return undecoded_header_block(stream, last_client_stream);
                 }
                 cont_block.extend_from_slice(&payload);
                 if h.has_flag(flags::END_HEADERS) {
@@ -437,10 +431,13 @@ where
                     size.saturating_add(stream.body.len())
                 });
                 let Some(st) = streams.get_mut(&h.stream_id) else {
+                    if h.stream_id & 1 == 0 || h.stream_id > last_client_stream {
+                        return Err(H2Error::Protocol);
+                    }
                     restore_receive_credit(stream, 0, flow, &mut recv_conn_window)?;
                     pending.remove(&h.stream_id);
                     send_stream_windows.remove(&h.stream_id);
-                    send_rst_stream(stream, h.stream_id, error_code::CANCEL)?;
+                    send_rst_stream(stream, h.stream_id, error_code::STREAM_CLOSED)?;
                     continue;
                 };
                 st.recv_window -= flow;
@@ -576,11 +573,18 @@ fn header_list_size(headers: &[(Vec<u8>, Vec<u8>)]) -> usize {
         .fold(0usize, |n, (k, v)| n.saturating_add(k.len() + v.len() + 32))
 }
 
-fn send_goaway<S: Write>(stream: &mut S, last_stream: u32) -> Result<(), H2Error> {
+fn send_goaway<S: Write>(stream: &mut S, last_stream: u32, code: u32) -> Result<(), H2Error> {
     let mut payload = [0u8; 8];
     payload[..4].copy_from_slice(&(last_stream & 0x7fff_ffff).to_be_bytes());
-    payload[4..].copy_from_slice(&error_code::NO_ERROR.to_be_bytes());
+    payload[4..].copy_from_slice(&code.to_be_bytes());
     send_frame(stream, frame_type::GOAWAY, 0, 0, &payload)
+}
+
+/// A header block left undecoded leaves the HPACK table out of step with the client's, so RFC 9113
+/// ends the connection rather than the stream.
+fn undecoded_header_block<S: Write>(stream: &mut S, last_stream: u32) -> Result<(), H2Error> {
+    send_goaway(stream, last_stream, error_code::COMPRESSION_ERROR)?;
+    Err(H2Error::Protocol)
 }
 
 /// Resets one stream; the connection stays up.
@@ -1701,9 +1705,9 @@ mod tests {
     }
 
     #[test]
-    /// Past the limit the stream must be cut, or the peer can postpone END_HEADERS forever and fill
-    /// memory.
-    fn continuation_flood_is_cut_at_the_header_block_limit() {
+    /// Past the limit the block is not decoded, so the connection must end; otherwise the peer can
+    /// postpone END_HEADERS forever and fill memory.
+    fn continuation_flood_ends_the_connection_at_the_header_block_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1723,7 +1727,7 @@ mod tests {
 
         let chunk = vec![0u8; 4096];
         let mut sent = 0usize;
-        let mut reset = false;
+        let mut goaway = None;
         while sent <= MAX_H2_HEADER_BLOCK * 2 {
             if send_frame(&mut client, frame_type::CONTINUATION, 0, 1, &chunk).is_err() {
                 break;
@@ -1732,19 +1736,22 @@ mod tests {
             client
                 .set_read_timeout(Some(std::time::Duration::from_millis(50)))
                 .unwrap();
-            if let Ok((h, _)) = read_frame(&mut client) {
-                if h.frame_type == frame_type::RST_STREAM && h.stream_id == 1 {
-                    reset = true;
+            if let Ok((h, payload)) = read_frame(&mut client) {
+                if h.frame_type == frame_type::GOAWAY {
+                    goaway = Some(u32::from_be_bytes(payload[4..8].try_into().unwrap()));
                     break;
                 }
             }
         }
-        assert!(
-            reset,
-            "헤더 상한을 넘겨도 스트림을 끊지 않았습니다. {sent}바이트를 버퍼에 쌓았습니다"
+        assert_eq!(
+            goaway,
+            Some(error_code::COMPRESSION_ERROR),
+            "헤더 상한을 넘겨도 연결을 끊지 않았습니다. {sent}바이트를 버퍼에 쌓았습니다"
         );
-        drop(client);
-        let _ = server.join().unwrap();
+        assert!(
+            server.join().unwrap().is_err(),
+            "풀지 않은 헤더 블록 뒤에도 연결을 이어 갔습니다"
+        );
     }
 
     #[test]
@@ -1892,11 +1899,10 @@ mod tests {
                 .any(|(h, _)| h.frame_type == frame_type::HEADERS && h.stream_id == 1),
             "대조군이 무효입니다. 요청에 응답 헤더를 보내지 않았습니다"
         );
-        assert!(
-            frames
-                .iter()
-                .any(|(h, _)| h.frame_type == frame_type::RST_STREAM && h.stream_id == 1),
-            "END_STREAM 뒤에 DATA 를 받은 스트림을 끊지 않았습니다"
+        assert_eq!(
+            resets(&frames),
+            vec![(1, error_code::STREAM_CLOSED)],
+            "END_STREAM 뒤에 DATA 를 받은 스트림을 STREAM_CLOSED 로 끊지 않았습니다"
         );
         assert!(
             !frames
@@ -1906,6 +1912,24 @@ mod tests {
         );
         drop(client);
         let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn data_on_a_stream_never_opened_ends_the_connection() {
+        for sid in [1, 2] {
+            let (addr, server) = spawn_server(|query, _| answer(query.to_vec()));
+            let mut client = h2_connect(addr);
+            send_frame(&mut client, frame_type::DATA, flags::END_STREAM, sid, QUERY).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            while read_frame(&mut client).is_ok() {}
+            drop(client);
+            assert!(
+                server.join().unwrap().is_err(),
+                "열리지 않은 스트림 {sid} 의 DATA 를 연결 오류로 다루지 않았습니다"
+            );
+        }
     }
 
     #[test]

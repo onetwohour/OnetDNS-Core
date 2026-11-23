@@ -46,6 +46,7 @@ pub mod error_code {
     pub const PROTOCOL_ERROR: u32 = 0x1;
     pub const INTERNAL_ERROR: u32 = 0x2;
     pub const FLOW_CONTROL_ERROR: u32 = 0x3;
+    pub const STREAM_CLOSED: u32 = 0x5;
     pub const FRAME_SIZE_ERROR: u32 = 0x6;
     pub const REFUSED_STREAM: u32 = 0x7;
     pub const CANCEL: u32 = 0x8;
