@@ -74,7 +74,7 @@ impl ControlDeps {
         ))
     }
 
-    pub(super) fn client_apple_profile(&self, body: &str) -> Result<String, String> {
+    pub(super) fn client_apple_profile(&self, body: &str) -> Result<Vec<u8>, String> {
         let request = parse_body(body)?;
         let protocol = request
             .get("protocol")
@@ -93,7 +93,9 @@ impl ControlDeps {
                 .collect::<Option<Vec<_>>>()
                 .ok_or("`ssids` must be an array of strings")?,
         };
-        self.endpoints(&request)?.apple_profile(transport, &ssids)
+        self.endpoints(&request)?
+            .apple_profile(transport, &ssids)
+            .map(String::into_bytes)
     }
 }
 

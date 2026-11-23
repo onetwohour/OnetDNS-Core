@@ -643,8 +643,8 @@ pub struct Controls {
     /// DNS stamps for the open listeners.
     pub client_stamps: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
 
-    /// An Apple configuration profile, as plist XML.
-    pub client_apple_profile: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+    /// An Apple configuration profile: plist XML, or its CMS SignedData in DER when signed.
+    pub client_apple_profile: Box<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>,
 
     /// Starts certificate issuance.
     pub acme_issue: Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
@@ -3042,7 +3042,7 @@ fn prefers_respond_async(value: &str) -> bool {
 /// authenticates, then routes. State-changing requests take the mutation lock, or concurrent
 /// config applies overwrite each other.
 fn handle_conn_inner(
-    mut stream: SharedTcp,
+    stream: SharedTcp,
     st: &AppState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     request_deadline: Instant,
@@ -3463,15 +3463,7 @@ fn handle_conn_inner(
     }
 
     let (status, ctype, resp) = route(&method, &path, &auth, &session, &body, &caller, st);
-    let ctype = with_charset(ctype);
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        control_security_headers(),
-        resp.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(resp.as_bytes())?;
-    stream.flush()
+    write_simple(stream, status, ctype, "", &resp)
 }
 
 /// Refusing content types a browser can send without a preflight is the CSRF defense.
@@ -3579,8 +3571,9 @@ fn write_simple(
     status: &str,
     ctype: &str,
     extra: &str,
-    body: &str,
+    body: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
+    let body = body.as_ref();
     let ctype = with_charset(ctype);
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{}{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3588,7 +3581,7 @@ fn write_simple(
         body.len()
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    stream.write_all(body)?;
     stream.flush()
 }
 
@@ -3619,7 +3612,7 @@ fn handle_setup(
             status,
             "application/json",
             "",
-            &format!("{{\"ok\":false,\"error\":{}}}", json::escape(message)),
+            format!("{{\"ok\":false,\"error\":{}}}", json::escape(message)),
         )
     };
 
@@ -4448,17 +4441,17 @@ fn route(
     body: &str,
     caller: &Caller,
     st: &AppState,
-) -> (&'static str, &'static str, String) {
+) -> (&'static str, &'static str, Vec<u8>) {
     let peer_s = caller.label();
 
     if method == "GET" {
         if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
             return match acme_http01().lock_recover().get(token) {
-                Some(v) => ("200 OK", "text/plain", v.clone()),
+                Some(v) => ("200 OK", "text/plain", v.as_bytes().to_vec()),
                 None => (
                     "404 Not Found",
                     "text/plain",
-                    "Requested path not found".to_string(),
+                    "Requested path not found".into(),
                 ),
             };
         }
@@ -4470,13 +4463,13 @@ fn route(
             let page = (
                 "200 OK",
                 "text/html; charset=utf-8",
-                include_str!("../dashboard/index.html").to_string(),
+                include_str!("../dashboard/index.html").into(),
             );
             #[cfg(not(feature = "dashboard"))]
             let page = (
                 "200 OK",
                 "text/plain",
-                "OnetDNS management API is running. The web dashboard is disabled.".to_string(),
+                "OnetDNS management API is running. The web dashboard is disabled.".into(),
             );
             return page;
         }
@@ -4486,13 +4479,13 @@ fn route(
             return (
                 "200 OK",
                 "application/javascript; charset=utf-8",
-                include_str!("../dashboard/support.js").to_string(),
+                include_str!("../dashboard/support.js").into(),
             );
             #[cfg(not(feature = "dashboard"))]
             return (
                 "404 Not Found",
                 "text/plain",
-                "Requested path not found".to_string(),
+                "Requested path not found".into(),
             );
         }
 
@@ -4501,13 +4494,13 @@ fn route(
             return (
                 "200 OK",
                 "application/javascript; charset=utf-8",
-                include_str!("../dashboard/react.js").to_string(),
+                include_str!("../dashboard/react.js").into(),
             );
             #[cfg(not(feature = "dashboard"))]
             return (
                 "404 Not Found",
                 "text/plain",
-                "Requested path not found".to_string(),
+                "Requested path not found".into(),
             );
         }
         ("GET", "/react-dom.js") => {
@@ -4515,13 +4508,13 @@ fn route(
             return (
                 "200 OK",
                 "application/javascript; charset=utf-8",
-                include_str!("../dashboard/react-dom.js").to_string(),
+                include_str!("../dashboard/react-dom.js").into(),
             );
             #[cfg(not(feature = "dashboard"))]
             return (
                 "404 Not Found",
                 "text/plain",
-                "Requested path not found".to_string(),
+                "Requested path not found".into(),
             );
         }
         // Linking the icon alone still leaves browsers, bookmarks and checkers requesting this
@@ -4529,29 +4522,27 @@ fn route(
         // break-in attempts.
         ("GET", "/favicon.ico") => {
             #[cfg(feature = "dashboard")]
-            return ("200 OK", "image/svg+xml", FAVICON_SVG.to_string());
+            return ("200 OK", "image/svg+xml", FAVICON_SVG.into());
             #[cfg(not(feature = "dashboard"))]
             return (
                 "404 Not Found",
                 "text/plain",
-                "Requested path not found".to_string(),
+                "Requested path not found".into(),
             );
         }
 
-        ("GET", "/healthz") => return ("200 OK", "text/plain", "ok".to_string()),
+        ("GET", "/healthz") => return ("200 OK", "text/plain", "ok".into()),
 
         ("GET", "/readyz") => {
             return if st.readiness.load(std::sync::atomic::Ordering::Acquire) {
-                ("200 OK", "text/plain", "ready".to_string())
+                ("200 OK", "text/plain", "ready".into())
             } else {
-                (
-                    "503 Service Unavailable",
-                    "text/plain",
-                    "not ready".to_string(),
-                )
+                ("503 Service Unavailable", "text/plain", "not ready".into())
             }
         }
-        ("GET", "/openapi.json") => return ("200 OK", "application/json", openapi_json()),
+        ("GET", "/openapi.json") => {
+            return ("200 OK", "application/json", openapi_json().into_bytes())
+        }
 
         ("GET", "/v1/auth") => {
             let token = auth.strip_prefix("Bearer ").unwrap_or("");
@@ -4565,7 +4556,7 @@ fn route(
                 }
                 None => auth_status_body(st, caller, false, "none", ""),
             };
-            return ("200 OK", "application/json", body);
+            return ("200 OK", "application/json", body.into_bytes());
         }
         _ => {}
     }
@@ -4585,7 +4576,7 @@ fn route(
             return (
                 "401 Unauthorized",
                 "text/plain",
-                "Authentication required".to_string(),
+                "Authentication required".into(),
             );
         }
     };
@@ -4597,7 +4588,7 @@ fn route(
         return (
             "403 Forbidden",
             "text/plain",
-            "Read-only access cannot perform this action".to_string(),
+            "Read-only access cannot perform this action".into(),
         );
     }
 
@@ -4609,18 +4600,30 @@ fn route(
         return (
             "503 Service Unavailable",
             "text/plain",
-            "DNS service settings are being applied. Try again when they are ready".to_string(),
+            "DNS service settings are being applied. Try again when they are ready".into(),
         );
     }
 
     let _mutation_guard = requires_control_mutation_lock(method, path)
         .then(|| control_mutation_lock().lock_recover());
 
-    let mut dispatch = || route_dispatch(method, path, session, body, caller.filter_apply, st);
-    let out = if requires_control_mutation_lock(method, path) {
-        (st.controls.cluster_write)(method, path, body, &mut dispatch)
+    // A signed profile is DER, the one body that is not text.
+    let out = if (method, path) == ("POST", "/v1/client-setup/apple-profile") {
+        match (st.controls.client_apple_profile)(body) {
+            Ok(profile) => ("200 OK", "application/x-apple-aspen-config", profile),
+            Err(error) => {
+                let (status, ctype, text) = result_resp(Err(error));
+                (status, ctype, text.into_bytes())
+            }
+        }
     } else {
-        dispatch()
+        let mut dispatch = || route_dispatch(method, path, session, body, caller.filter_apply, st);
+        let (status, ctype, text) = if requires_control_mutation_lock(method, path) {
+            (st.controls.cluster_write)(method, path, body, &mut dispatch)
+        } else {
+            dispatch()
+        };
+        (status, ctype, text.into_bytes())
     };
 
     let code = status_code(out.0);
@@ -4995,12 +4998,6 @@ fn route_dispatch(
             result_resp((st.controls.tls_revocation_check)(body))
         }
         ("POST", "/v1/client-setup/stamps") => result_resp((st.controls.client_stamps)(body)),
-        ("POST", "/v1/client-setup/apple-profile") => {
-            match (st.controls.client_apple_profile)(body) {
-                Ok(profile) => ("200 OK", "application/x-apple-aspen-config", profile),
-                Err(error) => result_resp(Err(error)),
-            }
-        }
         ("POST", "/v1/acme/issue") => result_resp((st.controls.acme_issue)(body)),
         ("POST", "/v1/config/rollback") => conflict_resp((st.controls.config_rollback)()),
         ("POST", "/v1/policies/simulate") => (
@@ -6175,8 +6172,10 @@ mod tests {
             }),
             client_stamps: Box::new(|_| Ok("{\"stamps\":[]}".to_string())),
             client_apple_profile: Box::new(|body| {
-                if body.contains("\"doh\"") {
-                    Ok("<plist version=\"1.0\"></plist>".to_string())
+                if body.contains("\"sign\":true") {
+                    Ok(vec![0x30, 0x80, 0xff, 0x00])
+                } else if body.contains("\"doh\"") {
+                    Ok(b"<plist version=\"1.0\"></plist>".to_vec())
                 } else {
                     Err("`protocol` must be doh or dot".to_string())
                 }
@@ -6789,12 +6788,12 @@ mod tests {
             format!("Bearer {tok}")
         };
         let (s, _ct, b) = route(m, p, &auth, "", body, &Caller::direct(None), st);
-        (status_code(s), b)
+        (status_code(s), String::from_utf8(b).expect("텍스트 응답"))
     }
 
     fn call_session(st: &AppState, m: &str, p: &str, session: &str, body: &str) -> (u16, String) {
         let (s, _ct, b) = route(m, p, "", session, body, &Caller::direct(None), st);
-        (status_code(s), b)
+        (status_code(s), String::from_utf8(b).expect("텍스트 응답"))
     }
 
     #[test]
@@ -7370,14 +7369,14 @@ mod tests {
         let (status, ctype, body) = profile("{\"protocol\":\"doh\"}");
         assert_eq!(status_code(status), 200);
         assert_eq!(ctype, "application/x-apple-aspen-config");
-        assert!(body.starts_with("<plist"));
+        assert!(body.starts_with(b"<plist"));
         let (status, ctype, body) = profile("{\"protocol\":\"dot\"}");
         assert_eq!(status_code(status), 400);
         assert_eq!(
             ctype, "application/json",
             "오류가 프로필 형식으로 나갔습니다"
         );
-        assert!(body.contains("\"error\""));
+        assert!(body.starts_with(b"{\"error\""));
 
         assert_eq!(
             call(&st, "POST", "/v1/client-setup/stamps", "adm", "{}").0,
@@ -8729,6 +8728,10 @@ mod tests {
 
     /// Over a real connection from 127.0.0.1.
     fn exchange(st: &AppState, request: &str) -> String {
+        String::from_utf8(exchange_bytes(st, request)).expect("텍스트 응답")
+    }
+
+    fn exchange_bytes(st: &AppState, request: &str) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::scope(|scope| {
@@ -8739,10 +8742,33 @@ mod tests {
             let mut client = TcpStream::connect(addr).unwrap();
             client.write_all(request.as_bytes()).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
-            let mut response = String::new();
-            std::io::Read::read_to_string(&mut client, &mut response).unwrap();
+            let mut response = Vec::new();
+            std::io::Read::read_to_end(&mut client, &mut response).unwrap();
             response
         })
+    }
+
+    #[test]
+    fn a_signed_profile_reaches_the_client_byte_for_byte() {
+        let st = test_state("adm", "ro");
+        let body = "{\"protocol\":\"doh\",\"sign\":true}";
+        let request = format!(
+            "POST /v1/client-setup/apple-profile HTTP/1.1\r\nHost: localhost\r\n\
+             Authorization: Bearer adm\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = exchange_bytes(&st, &request);
+        let head_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("응답 헤더의 끝")
+            + 4;
+        let head = std::str::from_utf8(&response[..head_end]).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Content-Type: application/x-apple-aspen-config\r\n"));
+        assert!(head.contains("Content-Length: 4\r\n"));
+        assert_eq!(&response[head_end..], [0x30, 0x80, 0xff, 0x00]);
     }
 
     #[test]
