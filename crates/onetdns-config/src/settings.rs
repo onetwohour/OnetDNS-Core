@@ -1683,7 +1683,7 @@ impl Config {
 
         if self.mixes_plain_and_encrypted_upstreams() {
             soft.push(
-                "Both encrypted and plain upstream DNS servers are set. Upstreams are chosen by round-trip time, so the plain ones almost always win and most queries actually leave unencrypted. To use encryption only, empty `upstreams`"
+                "Both encrypted and plain upstream DNS servers are set. Upstreams are chosen by round-trip time, so the plain ones almost always win and most queries actually leave unencrypted. To use encryption only, empty `upstreams` and remove the `udp://` and `tcp://` entries from `upstream_urls`"
                     .into(),
             );
         }
@@ -2508,9 +2508,20 @@ impl Config {
     /// Selection goes by round-trip time, so plain upstreams nearly always win and most queries
     /// leave in plain text.
     pub fn mixes_plain_and_encrypted_upstreams(&self) -> bool {
+        let (encrypted, plain) = self.upstream_url_counts();
         self.backend != BackendKind::Recurse
-            && !self.upstreams.is_empty()
-            && !self.upstream_urls.is_empty()
+            && encrypted > 0
+            && (plain > 0 || !self.upstreams.is_empty())
+    }
+
+    /// Entries of `upstream_urls` that leave encrypted, then those that leave in plain text.
+    pub fn upstream_url_counts(&self) -> (usize, usize) {
+        let encrypted = self
+            .upstream_urls
+            .iter()
+            .filter(|url| upstream_url_is_encrypted(url))
+            .count();
+        (encrypted, self.upstream_urls.len() - encrypted)
     }
 
     pub fn tls_enabled(&self) -> bool {
@@ -3021,6 +3032,15 @@ impl Config {
 
         format!("{{{}}}", o.join(","))
     }
+}
+
+fn upstream_url_is_encrypted(url: &str) -> bool {
+    url.trim().split_once("://").is_some_and(|(scheme, _)| {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "tls" | "https" | "quic" | "h3"
+        )
+    })
 }
 
 fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
@@ -7211,6 +7231,19 @@ tftp_writable = true
                 .any(|line| line.contains("plain upstream")),
             "섞였다는 것을 알리지 않았습니다"
         );
+
+        // `upstream_urls` also takes plain servers, and only the scheme tells them apart.
+        let plain_urls =
+            Config::from_toml_str("upstream_urls = [\"udp://9.9.9.9\", \"TCP://9.9.9.9\"]\n")
+                .unwrap();
+        assert_eq!(plain_urls.upstream_url_counts(), (0, 2));
+        assert!(!plain_urls.mixes_plain_and_encrypted_upstreams());
+        let mixed_urls = Config::from_toml_str(
+            "upstream_urls = [\"udp://9.9.9.9\", \"h3://1.1.1.1/dns-query#cloudflare-dns.com\"]\n",
+        )
+        .unwrap();
+        assert_eq!(mixed_urls.upstream_url_counts(), (1, 1));
+        assert!(mixed_urls.mixes_plain_and_encrypted_upstreams());
     }
 
     #[test]

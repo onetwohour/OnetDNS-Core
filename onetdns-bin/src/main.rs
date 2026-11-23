@@ -386,19 +386,16 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
         ext.push("AAAA responses disabled".into());
     }
     if !cfg.upstream_urls.is_empty() {
+        let (encrypted, mut plain) = cfg.upstream_url_counts();
         // With both, "N encrypted" alone would hide that most queries go out in plain text.
         if cfg.mixes_plain_and_encrypted_upstreams() {
-            ext.push(format!(
-                "{} encrypted + {} plain upstream DNS servers",
-                cfg.upstream_urls.len(),
-                cfg.upstreams.len()
-            ));
-        } else {
-            ext.push(format!(
-                "{} encrypted upstream DNS servers",
-                cfg.upstream_urls.len()
-            ));
+            plain += cfg.upstreams.len();
         }
+        ext.push(match (encrypted, plain) {
+            (_, 0) => format!("{encrypted} encrypted upstream DNS servers"),
+            (0, _) => format!("{plain} plain upstream DNS servers"),
+            _ => format!("{encrypted} encrypted + {plain} plain upstream DNS servers"),
+        });
     }
     if !cfg.fallback_upstreams.is_empty() {
         ext.push("fallback upstream DNS servers".into());
