@@ -72,8 +72,12 @@ pub fn serve(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let gate = make_gate(handler.clone());
+    let drops = {
+        let handler = handler.clone();
+        move |src: SocketAddr| handler.drops_source(src.ip())
+    };
     let h = make_handler(handler);
-    onetdns_dnscrypt::server::serve(provider, socket, h, gate, &shutdown)
+    onetdns_dnscrypt::server::serve(provider, socket, h, gate, drops, &shutdown)
 }
 
 /// Serves DNSCrypt over TCP on `listener`, already bound, one transaction per connection as the

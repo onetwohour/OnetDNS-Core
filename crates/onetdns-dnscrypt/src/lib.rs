@@ -678,6 +678,7 @@ mod tests {
                     Some(answer.to_vec())
                 },
                 |_src| true,
+                |_src| false,
                 &listener_shutdown,
             )
         });

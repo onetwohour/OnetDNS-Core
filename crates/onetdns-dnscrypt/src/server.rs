@@ -103,19 +103,23 @@ fn record_send_error(src: SocketAddr, error: &std::io::Error) {
 
 /// `allowed` guards the certificate lookup too: anyone can call it without encryption or
 /// authentication, so without this check it would be an amplification path past access control and
-/// rate limiting. Each packet runs inside a fault isolation boundary, so a panic from a crafted
-/// packet cannot kill the listener. The read timeout lets the loop see the shutdown signal; without
-/// it the thread would not join on reload and the socket would stay bound.
-pub fn serve<H, A>(
+/// rate limiting. `drops` is checked first on every packet: a source dropped by address gets no
+/// answer whatever the packet holds, so it must not cost a key exchange. Each packet runs inside a
+/// fault isolation boundary, so a panic from a crafted packet cannot kill the listener. The read
+/// timeout lets the loop see the shutdown signal; without it the thread would not join on reload
+/// and the socket would stay bound.
+pub fn serve<H, A, D>(
     provider: Provider,
     socket: UdpSocket,
     handler: H,
     allowed: A,
+    drops: D,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()>
 where
     H: Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>>,
     A: Fn(SocketAddr) -> bool,
+    D: Fn(SocketAddr) -> bool,
 {
     let wait = onetdns_core::udp::RecvWait::new(std::time::Duration::from_millis(500));
     if let Err(error) = wait.install(&socket) {
@@ -139,6 +143,9 @@ where
         let packet = &buf[..n];
 
         let _ = onetdns_core::isolation::catch_request(|| {
+            if drops(src) {
+                return;
+            }
             if let Some(out) = respond(&provider, packet, src, true, &handler, &allowed) {
                 if let Err(error) = socket.send_to(&out, src) {
                     record_send_error(src, &error);
@@ -175,7 +182,7 @@ mod tests {
         }
     }
 
-    fn ask_for_cert(allow: bool) -> bool {
+    fn ask_for_cert(allow: bool, drop: bool) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let provider = Provider::generate("2.dnscrypt-cert.test", 86_400);
@@ -189,6 +196,7 @@ mod tests {
                 server,
                 |_query, _src, _budget| None,
                 move |_src| allow,
+                move |_src| drop,
                 &worker_stop,
             );
         });
@@ -311,10 +319,17 @@ mod tests {
     /// The certificate lookup needs no encryption or authentication, answers with four times the
     /// query size and bypasses the pipeline, so it has to be gated here.
     fn the_certificate_lookup_answers_only_allowed_clients() {
-        assert!(ask_for_cert(true), "허용된 클라이언트는 답을 받아야 합니다");
         assert!(
-            !ask_for_cert(false),
+            ask_for_cert(true, false),
+            "허용된 클라이언트는 답을 받아야 합니다"
+        );
+        assert!(
+            !ask_for_cert(false, false),
             "막힌 클라이언트에게 인증서를 내주면 안 됩니다"
+        );
+        assert!(
+            !ask_for_cert(true, true),
+            "주소로 버리는 클라이언트에게는 아무것도 보내면 안 됩니다"
         );
     }
 }
