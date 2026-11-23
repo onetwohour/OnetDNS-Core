@@ -617,6 +617,70 @@ fn wire_lane_hits_patch_id_and_respect_filter_generation() {
 }
 
 #[test]
+fn wire_cache_hits_are_timed_from_the_datagram_arrival() {
+    use onetdns_runtime::WireDisposition;
+
+    let (recorder, stats) = onetdns_control::channel(
+        64,
+        64,
+        3600,
+        onetdns_control::RecorderOpts {
+            querylog: true,
+            anonymize: false,
+            ignored: vec![],
+            stats_retention_secs: 3600,
+        },
+        onetdns_control::PersistOpts::default(),
+    );
+    let (backend, cache) = fixed_answer_cache();
+    let server = NativeServer::new(
+        shared_filter(ArcSwap::from_pointee(BlockEngine::empty(
+            BlockResponse::NxDomain,
+        ))),
+        Arc::new(IpAcl::allow_all()),
+        vec![],
+        backend,
+        60,
+    )
+    .with_wire_fast_path(Some((
+        crate::wirecache::WireEntryFactory::new(0, 86_400),
+        cache,
+    )))
+    .with_recorder(Some(recorder));
+    let wire = Message::query(0x0303, ApName::from_str("ok.example").unwrap(), ApRt::A)
+        .try_encode()
+        .unwrap();
+    let mut out = onetdns_proto::Writer::with_limit(1232);
+    assert_eq!(
+        server.handle_udp_wire(&wire, &ctx(), &mut out, Instant::now()),
+        WireDisposition::Respond
+    );
+
+    std::thread::sleep(Duration::from_millis(5));
+    let arrived = Instant::now();
+    std::thread::sleep(Duration::from_millis(20));
+    out.clear();
+    assert_eq!(
+        server.handle_udp_wire(&wire, &ctx(), &mut out, arrived),
+        WireDisposition::Respond
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let hit = loop {
+        let recent = stats.recent(8);
+        if recent.len() >= 2 || Instant::now() >= deadline {
+            break recent.first().cloned().expect("적중 기록이 없습니다");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        hit.latency_us >= 20_000,
+        "캐시 적중 처리시간을 받은 시각이 아니라 답을 찾은 뒤부터 쟀습니다: {} us",
+        hit.latency_us
+    );
+}
+
+#[test]
 fn wire_lane_long_key_falls_back_to_structured_response() {
     use onetdns_runtime::WireDisposition;
 

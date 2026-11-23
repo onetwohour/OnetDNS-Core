@@ -311,7 +311,7 @@ impl Handler for NativeServer {
             if let Some(recorder) = self.events() {
                 recorder.record_cache(true);
                 onetdns_forward::note_response_source("cache");
-                let timer = onetdns_control::RequestTimer::start();
+                let timer = onetdns_control::RequestTimer::start_at(now);
                 let qname = &request.questions[0].name;
                 self.rec_final_answer(&client, qname, qtype, &resp);
                 self.rec_latency(&client, Some(qname), timer.elapsed_us());
@@ -554,7 +554,9 @@ impl NativeServer {
         if let Some((entry, elapsed_secs)) = runtime.cache.wire_get(scanned.key(), filter_tag, now)
         {
             let events = self.events();
-            let timer = events.is_some().then(onetdns_control::RequestTimer::start);
+            let timer = events
+                .is_some()
+                .then(|| onetdns_control::RequestTimer::start_at(now));
             let client = self.identify(ctx);
             if self.acl.check(&client) != AclDecision::Allow {
                 return Wire::Fallback;
