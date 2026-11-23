@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use onetdns_config::Config;
 use onetdns_core::tcp::DeadlineTcp;
+use onetdns_dnscrypt::relay::{self, Relay};
 use onetdns_dnscrypt::Provider;
 use onetdns_proto::{Message, Writer};
 use onetdns_runtime::{Handler, RequestCtx, Transport as RtTransport};
@@ -60,15 +62,34 @@ fn make_gate(handler: Arc<NativeServer>) -> impl Fn(SocketAddr) -> bool {
     }
 }
 
+/// None when relaying is off. A relayed query goes only to an allowed port, and only to a public
+/// address that is not one of this server's listeners unless an allowed network names it.
+pub(crate) fn relay(cfg: &Config) -> Option<Arc<Relay>> {
+    if !cfg.dnscrypt_relay {
+        return None;
+    }
+    let ports = cfg.dnscrypt_relay_ports.clone();
+    let allowed = cfg.dnscrypt_relay_allow_targets.clone();
+    let listeners = crate::dns_listeners(cfg);
+    Some(Arc::new(Relay::new(move |target: SocketAddr| {
+        ports.contains(&target.port())
+            && (allowed.iter().any(|net| net.contains(&target.ip()))
+                || onetdns_core::is_globally_routable(target.ip())
+                    && !crate::upstream::points_at_listener(target, &listeners))
+    })))
+}
+
 /// Serves DNSCrypt over UDP through the shared pipeline. A response larger than the query packet
 /// allows is truncated with TC set, as Do53 does, and the client retries over TCP or with more
 /// padding.
 ///
-/// Certificate lookups bypass the pipeline, so access control and rate limits are applied here.
+/// Certificate lookups and relayed queries bypass the pipeline, so access control and rate limits
+/// are applied here.
 pub fn serve(
     handler: Arc<NativeServer>,
     socket: UdpSocket,
     provider: Provider,
+    relay: Option<Arc<Relay>>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let gate = make_gate(handler.clone());
@@ -77,7 +98,7 @@ pub fn serve(
         move |src: SocketAddr| handler.drops_source(src.ip())
     };
     let h = make_handler(handler);
-    onetdns_dnscrypt::server::serve(provider, socket, h, gate, drops, &shutdown)
+    onetdns_dnscrypt::server::serve(provider, socket, h, gate, drops, relay, &shutdown)
 }
 
 /// Serves DNSCrypt over TCP on `listener`, already bound, one transaction per connection as the
@@ -89,6 +110,7 @@ pub fn serve_tcp(
     listener: TcpListener,
     handler: Arc<NativeServer>,
     provider: Provider,
+    relay: Option<Arc<Relay>>,
     admission: Arc<ConnectionLimiter>,
 ) -> io::Result<EncryptedTcpListener> {
     let drops = handler.clone();
@@ -103,6 +125,7 @@ pub fn serve_tcp(
             let peer = connection.peer;
             let provider = provider.clone();
             let handler = handler.clone();
+            let relay = relay.clone();
             let spawned = spawn_bounded_connection_thread("dnscrypt-tcp-connection", move || {
                 let AdmittedConnection {
                     stream,
@@ -119,6 +142,7 @@ pub fn serve_tcp(
                         peer,
                         &provider,
                         &handler,
+                        relay.as_deref(),
                     )
                 });
                 if let Ok(Err(error)) = result {
@@ -135,11 +159,13 @@ pub fn serve_tcp(
     )
 }
 
+/// A relayed query is sent on over UDP, as relays always do, and waited for here.
 fn serve_conn(
     mut stream: DeadlineTcp<PrefixedTcp>,
     peer: SocketAddr,
     provider: &Provider,
     handler: &Arc<NativeServer>,
+    relay: Option<&Relay>,
 ) -> io::Result<()> {
     let mut len_bytes = [0u8; 2];
     stream.read_exact(&mut len_bytes)?;
@@ -154,12 +180,25 @@ fn serve_conn(
     stream.read_exact(&mut packet)?;
 
     let gate = make_gate(handler.clone());
+    if let Some(relay) = relay.filter(|_| relay::is_anonymized(&packet)) {
+        return match relay.accept(&packet).filter(|_| gate(peer)) {
+            Some(forward) => match forward.exchange() {
+                Some(answer) => write_framed(&mut stream, &answer),
+                None => Ok(()),
+            },
+            None => Ok(()),
+        };
+    }
     let respond_to = make_handler(handler.clone());
     let Some(payload) =
         onetdns_dnscrypt::server::respond(provider, &packet, peer, false, &respond_to, &gate)
     else {
         return Ok(());
     };
+    write_framed(&mut stream, &payload)
+}
+
+fn write_framed(stream: &mut DeadlineTcp<PrefixedTcp>, payload: &[u8]) -> io::Result<()> {
     let Ok(prefix) = u16::try_from(payload.len()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -167,7 +206,7 @@ fn serve_conn(
         ));
     };
     stream.write_all(&prefix.to_be_bytes())?;
-    stream.write_all(&payload)?;
+    stream.write_all(payload)?;
     stream.flush()
 }
 
@@ -175,6 +214,61 @@ fn serve_conn(
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// Whether the relay built from `settings` passes a sealed-looking packet on to `target`.
+    fn relays_to(settings: &str, target: &str) -> bool {
+        let cfg = Config::from_toml_str(&format!("dnscrypt_relay = true\n{settings}")).unwrap();
+        let target: SocketAddr = target.parse().unwrap();
+        let ip = match target.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ip) => ip,
+        };
+        let mut packet = relay::ANON_MAGIC.to_vec();
+        packet.extend_from_slice(&ip.octets());
+        packet.extend_from_slice(&target.port().to_be_bytes());
+        packet.extend_from_slice(&[0x42; 256]);
+        relay(&cfg).unwrap().accept(&packet).is_some()
+    }
+
+    #[test]
+    /// A relay is an open path to whatever address a stranger names, so by default it reaches
+    /// only public servers on port 443 other than this one.
+    fn the_relay_reaches_only_public_servers_on_allowed_ports() {
+        assert!(
+            relay(&Config::default()).is_none(),
+            "기본값은 꺼져 있어야 합니다"
+        );
+        assert!(relays_to("", "8.8.8.8:443"));
+        assert!(relays_to("", "[2606:4700::1111]:443"));
+        assert!(!relays_to("", "8.8.8.8:53"), "허용하지 않은 포트");
+        assert!(relays_to("dnscrypt_relay_ports = [5443]", "8.8.8.8:5443"));
+        for internal in [
+            "127.0.0.1:443",
+            "192.168.1.5:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+        ] {
+            assert!(!relays_to("", internal), "{internal}");
+        }
+        assert!(
+            !relays_to("listen_dnscrypt = [\"8.8.4.4:443\"]", "8.8.4.4:443"),
+            "자기 자신"
+        );
+        assert!(
+            !relays_to("listen = [\"8.8.4.4:443\"]", "8.8.4.4:443"),
+            "자기 Do53"
+        );
+        let allowed = "dnscrypt_relay_allow_targets = [\"127.0.0.0/8\", \"8.8.4.4\"]";
+        assert!(relays_to(allowed, "127.0.0.1:443"));
+        assert!(
+            !relays_to(allowed, "127.0.0.1:53"),
+            "허용 대상도 포트는 지켜야 합니다"
+        );
+        assert!(relays_to(
+            &format!("{allowed}\nlisten_dnscrypt = [\"8.8.4.4:443\"]"),
+            "8.8.4.4:443"
+        ));
+    }
 
     #[test]
     /// A partial frame must not hold shutdown until the I/O deadline.
@@ -225,6 +319,7 @@ mod tests {
             std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             handler,
             Provider::generate("2.dnscrypt-cert.onetdns", 86400),
+            None,
             Arc::new(ConnectionLimiter::default()),
         )
         .expect("TCP 리스너");

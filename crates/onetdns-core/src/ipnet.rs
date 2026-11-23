@@ -1,4 +1,5 @@
-//! CIDR IP networks, for ACLs, RPZ client-IP rules, and ECS.
+//! CIDR IP networks, for ACLs, RPZ client-IP rules, and ECS, and which addresses the public
+//! internet routes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -109,9 +110,128 @@ impl std::fmt::Display for IpNet {
     }
 }
 
+/// False for loopback, private, link-local, documentation and other special-use addresses,
+/// including IPv4 ones wrapped in IPv6, which would otherwise slip through. An address someone
+/// else named (a delegation, a relay target) must pass this before this server sends to it, or
+/// they could make it probe the internal network.
+pub fn is_globally_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => !is_special_v4(address),
+        IpAddr::V6(address) => {
+            if let Some(mapped) = embedded_v4(address) {
+                return !is_special_v4(mapped);
+            }
+            let octets = address.octets();
+            let segments = address.segments();
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (octets[0] == 0x20
+                    && octets[1] == 0x01
+                    && octets[2] == 0x0d
+                    && octets[3] == 0xb8)
+                || octets[..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 0]
+                || (octets[0] == 0x20
+                    && octets[1] == 0x01
+                    && octets[2] == 0x00
+                    && octets[3] == 0x02)
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001))
+        }
+    }
+}
+
+/// Mapped, 6to4 and NAT64 forms.
+fn embedded_v4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let segments = address.segments();
+    let octets = address.octets();
+
+    if segments[0] == 0x2002 {
+        return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
+}
+
+fn is_special_v4(address: Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    let in_net = |network: [u8; 4], prefix: u8| {
+        let mask = v4_mask(prefix);
+        value & mask == u32::from(Ipv4Addr::from(network)) & mask
+    };
+
+    in_net([0, 0, 0, 0], 8)
+        || in_net([10, 0, 0, 0], 8)
+        || in_net([100, 64, 0, 0], 10)
+        || in_net([127, 0, 0, 0], 8)
+        || in_net([169, 254, 0, 0], 16)
+        || in_net([172, 16, 0, 0], 12)
+        || in_net([192, 0, 0, 0], 24)
+        || in_net([192, 0, 2, 0], 24)
+        || in_net([192, 88, 99, 0], 24)
+        || in_net([192, 168, 0, 0], 16)
+        || in_net([198, 18, 0, 0], 15)
+        || in_net([198, 51, 100, 0], 24)
+        || in_net([203, 0, 113, 0], 24)
+        || in_net([224, 0, 0, 0], 4)
+        || in_net([240, 0, 0, 0], 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nat64_local_use_prefix_is_not_globally_routable() {
+        assert!(
+            !is_globally_routable("64:ff9b:1::808:808".parse().unwrap()),
+            "64:ff9b:1::/48은 비라우팅이어야 한다"
+        );
+
+        assert!(is_globally_routable("64:ff9b::808:808".parse().unwrap()));
+        assert!(
+            !is_globally_routable("64:ff9b::a9fe:a9fe".parse().unwrap()),
+            "64:ff9b::169.254.169.254는 특수라 거부"
+        );
+    }
+
+    #[test]
+    fn internal_addresses_wrapped_in_ipv6_are_not_globally_routable() {
+        for internal in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "2002:7f00:1::",
+            "64:ff9b::7f00:1",
+        ] {
+            assert!(!is_globally_routable(ip(internal)), "{internal}");
+        }
+        for public in ["8.8.8.8", "::ffff:8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(is_globally_routable(ip(public)), "{public}");
+        }
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

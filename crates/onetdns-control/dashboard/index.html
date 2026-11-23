@@ -4585,6 +4585,7 @@ Object.assign(I18N.en, {
   "스탬프를 만들지 못했습니다: {error}":"Could not make stamps: {error}",
   "스탬프를 복사했습니다":"Stamp copied",
   "{name} 스탬프 복사":"Copy the {name} stamp",
+  "DNSCrypt 릴레이":"DNSCrypt relay",
   "프로필을 만들지 못했습니다: {error}":"Could not make the profile: {error}",
   "프로필 파일을 저장하지 못했습니다":"Could not save the profile file",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"Profile downloaded. Install it on the device in Settings > General > VPN & Device Management.",
@@ -4604,6 +4605,7 @@ Object.assign(I18N.ja, {
   "스탬프를 만들지 못했습니다: {error}":"スタンプを作成できませんでした: {error}",
   "스탬프를 복사했습니다":"スタンプをコピーしました",
   "{name} 스탬프 복사":"{name} スタンプをコピー",
+  "DNSCrypt 릴레이":"DNSCrypt リレー",
   "프로필을 만들지 못했습니다: {error}":"プロファイルを作成できませんでした: {error}",
   "프로필 파일을 저장하지 못했습니다":"プロファイルを保存できませんでした",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"プロファイルをダウンロードしました。デバイスの「設定 > 一般 > VPNとデバイス管理」でインストールしてください。",
@@ -4645,6 +4647,7 @@ Object.assign(I18N.zh, {
   "스탬프를 만들지 못했습니다: {error}":"无法生成 Stamp：{error}",
   "스탬프를 복사했습니다":"已复制 Stamp",
   "{name} 스탬프 복사":"复制 {name} Stamp",
+  "DNSCrypt 릴레이":"DNSCrypt 中继",
   "프로필을 만들지 못했습니다: {error}":"无法生成描述文件：{error}",
   "프로필 파일을 저장하지 못했습니다":"无法保存描述文件",
   "프로필을 내려받았습니다. 기기의 설정 > 일반 > VPN 및 기기 관리에서 설치하세요.":"已下载描述文件。请在设备的“设置 > 通用 > VPN与设备管理”中安装。",
@@ -5747,7 +5750,7 @@ class Component extends DCLogic {
   appleProfileDot=()=>this.appleProfile('dot');
   clientSetupView(c){
     if(!c)return {notice:'',rows:[]};
-    const names={dns:'DNS',dnscrypt:'DNSCrypt',doh:'DoH',dot:'DoT',doq:'DoQ'};
+    const names={dns:'DNS',dnscrypt:'DNSCrypt','dnscrypt-relay':this.t('DNSCrypt 릴레이'),doh:'DoH',dot:'DoT',doq:'DoQ'};
     const rows=(Array.isArray(c.stamps)?c.stamps:[]).map(x=>{
       const name=names[x.protocol]||String(x.protocol),address=typeof x.address==='string'?x.address:'';
       const at=address?(address.includes(':')?'['+address+']':address)+':'+x.port:':'+x.port;

@@ -52,19 +52,24 @@ pub fn ensure_not_listener(
             Endpoint::Socks5 { .. } => None,
         });
     for addr in direct {
-        if listeners.iter().any(|listener| {
-            onetdns_config::dns_endpoint_conflicts(*listener, addr)
-                || listener.port() == addr.port()
-                    && listener.ip().is_unspecified()
-                    && (listener.is_ipv6() || listener.is_ipv4() == addr.is_ipv4())
-                    && is_local_ip(addr.ip())
-        }) {
+        if points_at_listener(addr, listeners) {
             return Err(format!(
                 "{label}={addr} points to this server's own DNS listening address after the initial lookup, which would create a query loop"
             ));
         }
     }
     Ok(())
+}
+
+/// A listener on the unspecified address also answers at every address of this machine.
+pub(crate) fn points_at_listener(target: SocketAddr, listeners: &[SocketAddr]) -> bool {
+    listeners.iter().any(|listener| {
+        onetdns_config::dns_endpoint_conflicts(*listener, target)
+            || listener.port() == target.port()
+                && listener.ip().is_unspecified()
+                && (listener.is_ipv6() || listener.is_ipv4() == target.is_ipv4())
+                && is_local_ip(target.ip())
+    })
 }
 
 /// Loopback, unspecified, or assigned to this machine.

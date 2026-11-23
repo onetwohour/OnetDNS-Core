@@ -74,6 +74,30 @@ The resulting DNSCrypt stamp includes the supplied client address, the configure
 
 `dnscrypt_provider_name` identifies the DNSCrypt certificate provider; it is not the public IP address. Replace `dns.example.com` with your provider name. DNSCrypt uses its own certificate exchange rather than the `tls_cert`/`tls_key` identity used for DoT and DoH. Permit **both UDP and TCP 5443** through the applicable network path, then test the stamp from a remote DNSCrypt client.
 
+### Queries that arrive through a relay
+
+A client using Anonymized DNSCrypt sends its queries through a relay, so OnetDNS sees the relay's address, not the client's. Client policies, `[[clients]]` matching, the ACL, rate limits, statistics and the query log all go by that address. Every client behind one relay shares its rate limit, and blocking the relay's address blocks all of them.
+
+### Running a relay
+
+With `dnscrypt_relay = true`, the DNSCrypt listeners also pass Anonymized DNSCrypt queries on to the server the client names and return its answer. The server sees the relay's address instead of the client's, and the relay sees only encrypted queries.
+
+```toml
+listen_dnscrypt = ["0.0.0.0:443"]
+dnscrypt_relay = true
+dnscrypt_relay_ports = [443]
+```
+
+A relay sends packets wherever a stranger asks, so it is limited:
+
+- The ACL and rate limits apply to the client's address before anything is passed on.
+- Only packets that look like DNSCrypt are passed on: an encrypted query, or a certificate lookup for a name starting with `2.dnscrypt`.
+- The target port must be in `dnscrypt_relay_ports` (default `[443]`).
+- The target must be a public address and not one of this server's own listeners. Loopback, private, link-local and documentation addresses are refused, including IPv4 ones written inside IPv6. To relay to such an address anyway, for a DNSCrypt server on your LAN for example, list its network in `dnscrypt_relay_allow_targets`.
+- An answer is returned only if it comes from the target, answers the query that was passed on, and is no larger than it. Anything refused gets no answer.
+
+The relay always talks to the server over UDP, also for queries that arrived over TCP. With relaying on, **Client setup** shows a relay stamp (`sdns://` of type `0x81`) next to the DNSCrypt stamp; clients put it in their anonymized route.
+
 ## Client setup
 
 | Client | Select |

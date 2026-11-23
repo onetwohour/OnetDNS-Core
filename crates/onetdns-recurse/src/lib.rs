@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use onetdns_core::{IpNet, LruMap, MutexExt};
+use onetdns_core::{is_globally_routable, IpNet, LruMap, MutexExt};
 use onetdns_proto::{
     ede_code, DnsClass, Edns, Header, Message, Name, Question, RData, Record, RecordType,
     ResponseCode,
@@ -3103,95 +3103,6 @@ fn infra_score(state: Option<&InfraStat>, srtt_ms: Option<u32>, now: Instant) ->
     base + transport_penalty + protocol_penalty
 }
 
-/// Filters loopback, private, link-local, documentation and IPv4-embedding IPv6 forms; missing the
-/// embedded forms would let an internal IPv4 address slip through wrapped in IPv6. This is the core
-/// SSRF defense: a crafted delegation naming an internal address would make this server probe the
-/// internal network.
-fn is_globally_routable(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => !is_special_v4(address),
-        IpAddr::V6(address) => {
-            if let Some(mapped) = embedded_v4(address) {
-                return !is_special_v4(mapped);
-            }
-            let octets = address.octets();
-            let segments = address.segments();
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (octets[0] == 0x20
-                    && octets[1] == 0x01
-                    && octets[2] == 0x0d
-                    && octets[3] == 0xb8)
-                || octets[..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 0]
-                || (octets[0] == 0x20
-                    && octets[1] == 0x01
-                    && octets[2] == 0x00
-                    && octets[3] == 0x02)
-                || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001))
-        }
-    }
-}
-
-/// Mapped, 6to4 and NAT64 forms.
-fn embedded_v4(address: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    if let Some(mapped) = address.to_ipv4_mapped() {
-        return Some(mapped);
-    }
-    let segments = address.segments();
-    let octets = address.octets();
-
-    if segments[0] == 0x2002 {
-        return Some(std::net::Ipv4Addr::new(
-            octets[2], octets[3], octets[4], octets[5],
-        ));
-    }
-
-    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
-        return Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-
-    if segments[..6] == [0, 0, 0, 0, 0, 0] {
-        return Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-    None
-}
-
-fn is_special_v4(address: std::net::Ipv4Addr) -> bool {
-    let value = u32::from(address);
-    let in_net = |network: [u8; 4], prefix: u8| {
-        let mask = if prefix == 0 {
-            0
-        } else {
-            u32::MAX << (32 - prefix)
-        };
-        value & mask == u32::from(std::net::Ipv4Addr::from(network)) & mask
-    };
-
-    in_net([0, 0, 0, 0], 8)
-        || in_net([10, 0, 0, 0], 8)
-        || in_net([100, 64, 0, 0], 10)
-        || in_net([127, 0, 0, 0], 8)
-        || in_net([169, 254, 0, 0], 16)
-        || in_net([172, 16, 0, 0], 12)
-        || in_net([192, 0, 0, 0], 24)
-        || in_net([192, 0, 2, 0], 24)
-        || in_net([192, 88, 99, 0], 24)
-        || in_net([192, 168, 0, 0], 16)
-        || in_net([198, 18, 0, 0], 15)
-        || in_net([198, 51, 100, 0], 24)
-        || in_net([203, 0, 113, 0], 24)
-        || in_net([224, 0, 0, 0], 4)
-        || in_net([240, 0, 0, 0], 4)
-}
-
 /// Answers blocked as bogus, exported as a metric.
 pub static VALIDATION_BOGUS_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4851,20 +4762,6 @@ mod tests {
         assert!(
             matches!(status, SecurityStatus::Insecure),
             "qtype=RRSIG는 Insecure여야 한다(Bogus 아님): {status:?}"
-        );
-    }
-
-    #[test]
-    fn nat64_local_use_prefix_is_not_globally_routable() {
-        assert!(
-            !is_globally_routable("64:ff9b:1::808:808".parse().unwrap()),
-            "64:ff9b:1::/48은 비라우팅이어야 한다"
-        );
-
-        assert!(is_globally_routable("64:ff9b::808:808".parse().unwrap()));
-        assert!(
-            !is_globally_routable("64:ff9b::a9fe:a9fe".parse().unwrap()),
-            "64:ff9b::169.254.169.254는 특수라 거부"
         );
     }
 

@@ -959,8 +959,8 @@ fn open_when_free<T>(mut open: impl FnMut() -> std::io::Result<T>) -> std::io::R
     }
 }
 
-/// Keyed by address and provider name; a listener whose key is unchanged is left alone.
-/// Fails when the provider key cannot be read or an address cannot be opened.
+/// Keyed by address, provider name and relay settings; a listener whose key is unchanged is left
+/// alone. Fails when the provider key cannot be read or an address cannot be opened.
 pub(crate) fn reconcile_dnscrypt(
     cfg: &Config,
     set: &ListenerSet,
@@ -972,12 +972,26 @@ pub(crate) fn reconcile_dnscrypt(
 ) -> Result<(), String> {
     use std::sync::atomic::AtomicBool;
 
+    // The relay refuses this server's own listeners, so they are part of its settings.
+    let relay_settings = if cfg.dnscrypt_relay {
+        format!(
+            "relay {:?} {:?} {:?}",
+            cfg.dnscrypt_relay_ports,
+            cfg.dnscrypt_relay_allow_targets,
+            crate::dns_listeners(cfg)
+        )
+    } else {
+        String::new()
+    };
     let wanted: Vec<(String, SocketAddr)> = cfg
         .listen_dnscrypt
         .iter()
         .map(|addr| {
             (
-                format!("dnscrypt|{addr}|{}", cfg.dnscrypt_provider_name),
+                format!(
+                    "dnscrypt|{addr}|{}|{relay_settings}",
+                    cfg.dnscrypt_provider_name
+                ),
                 *addr,
             )
         })
@@ -1018,6 +1032,7 @@ pub(crate) fn reconcile_dnscrypt(
         "Loaded DNSCrypt provider key; clients must trust this public key"
     );
 
+    let relay = dnscrypt::relay(cfg);
     let mut fresh = Vec::new();
     for (key, addr) in &wanted {
         if live.iter().any(|listener| listener.key == *key) {
@@ -1084,6 +1099,7 @@ pub(crate) fn reconcile_dnscrypt(
                     socket,
                     handler.clone(),
                     provider.clone(),
+                    relay.clone(),
                     set.encrypted_tcp_admission.clone(),
                 )
             })
@@ -1091,11 +1107,14 @@ pub(crate) fn reconcile_dnscrypt(
         .map_err(|error| listener_open_error("DNSCrypt TCP", *addr, &error))?;
         let handler = handler.clone();
         let udp_provider = provider.clone();
+        let udp_relay = relay.clone();
         let listener_stop = stop.clone();
         let thread = std::thread::Builder::new()
             .name(format!("dnscrypt-{bound}"))
             .spawn(move || {
-                if let Err(error) = dnscrypt::serve(handler, socket, udp_provider, listener_stop) {
+                if let Err(error) =
+                    dnscrypt::serve(handler, socket, udp_provider, udp_relay, listener_stop)
+                {
                     onetdns_core::error!(event = "dnscrypt.stopped", %error, "Stopped DNSCrypt listener");
                 }
             })

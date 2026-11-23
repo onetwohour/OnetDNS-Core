@@ -1,5 +1,7 @@
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 
+use crate::relay::{self, Relay};
 use crate::{
     decrypt_query, encrypt_response, Provider, CLIENT_MAGIC_LEN, CLIENT_NONCE_LEN, PUBKEY_LEN,
     RESOLVER_MAGIC,
@@ -103,17 +105,19 @@ fn record_send_error(src: SocketAddr, error: &std::io::Error) {
 
 /// `allowed` guards the certificate lookup too: anyone can call it without encryption or
 /// authentication, so without this check it would be an amplification path past access control and
-/// rate limiting. `drops` is checked first on every packet: a source dropped by address gets no
-/// answer whatever the packet holds, so it must not cost a key exchange. Each packet runs inside a
-/// fault isolation boundary, so a panic from a crafted packet cannot kill the listener. The read
-/// timeout lets the loop see the shutdown signal; without it the thread would not join on reload
-/// and the socket would stay bound.
+/// rate limiting. It guards relayed packets as well, which never reach the pipeline. `drops` is
+/// checked first on every packet: a source dropped by address gets no answer whatever the packet
+/// holds, so it must not cost a key exchange. Each packet runs inside a fault isolation boundary,
+/// so a panic from a crafted packet cannot kill the listener. The read timeout lets the loop see
+/// the shutdown signal; without it the thread would not join on reload and the socket would stay
+/// bound.
 pub fn serve<H, A, D>(
     provider: Provider,
     socket: UdpSocket,
     handler: H,
     allowed: A,
     drops: D,
+    relay: Option<Arc<Relay>>,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()>
 where
@@ -125,6 +129,8 @@ where
     if let Err(error) = wait.install(&socket) {
         onetdns_core::error!(event = "dnscrypt.read_timeout_failed", %error, "Could not set a receive timeout; this thread will not exit on reload and will keep the port bound");
     }
+    // Relay threads hold it weakly, so a late answer cannot keep the port bound after shutdown.
+    let socket = Arc::new(socket);
     let mut buf = vec![0u8; 4096];
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         let (n, src) = match wait.recv_from(&socket, &mut buf) {
@@ -144,6 +150,19 @@ where
 
         let _ = onetdns_core::isolation::catch_request(|| {
             if drops(src) {
+                return;
+            }
+            if let Some(relay) = relay.as_ref().filter(|_| relay::is_anonymized(packet)) {
+                if let Some(forward) = relay.accept(packet).filter(|_| allowed(src)) {
+                    let socket = Arc::downgrade(&socket);
+                    relay.spawn(forward, move |answer| {
+                        if let Some(socket) = socket.upgrade() {
+                            if let Err(error) = socket.send_to(answer, src) {
+                                record_send_error(src, &error);
+                            }
+                        }
+                    });
+                }
                 return;
             }
             if let Some(out) = respond(&provider, packet, src, true, &handler, &allowed) {
@@ -197,6 +216,7 @@ mod tests {
                 |_query, _src, _budget| None,
                 move |_src| allow,
                 move |_src| drop,
+                None,
                 &worker_stop,
             );
         });
@@ -313,6 +333,93 @@ mod tests {
             1,
             "the same packet decrypts over TCP"
         );
+    }
+
+    /// A listener on loopback that answers queries with the query itself, flagged as a response.
+    fn spawn_listener(
+        provider: Provider,
+        allowed: impl Fn(SocketAddr) -> bool + Send + 'static,
+        relay: Option<Arc<Relay>>,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        std::thread::spawn(move || {
+            serve(
+                provider,
+                socket,
+                |query: Vec<u8>, _src, _budget| {
+                    let mut answer = query;
+                    answer[2] |= 0x80;
+                    Some(answer)
+                },
+                allowed,
+                |_src| false,
+                relay,
+                &worker_stop,
+            )
+        });
+        (addr, stop)
+    }
+
+    #[test]
+    /// The relay passes a sealed query on to an allowed target and its answer back; another target
+    /// or a client the gate refuses gets nothing.
+    fn the_listener_relays_anonymized_queries_to_allowed_targets() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = Provider::generate("2.dnscrypt-cert.server", 3_600);
+        let cert = crate::client::Certificate::verify(
+            &server.cert_bytes(),
+            &server.provider_public_key(),
+            crate::unix_now(),
+        )
+        .unwrap();
+        let (server_addr, server_stop) = spawn_listener(server, |_src| true, None);
+        let gate_open = Arc::new(AtomicBool::new(true));
+        let gate = gate_open.clone();
+        let (relay_addr, relay_stop) = spawn_listener(
+            Provider::generate("2.dnscrypt-cert.relay", 3_600),
+            move |_src| gate.load(Ordering::Relaxed),
+            Some(Arc::new(Relay::new(move |target| target == server_addr))),
+        );
+
+        let session = crate::client::Session::new(&cert).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(700)))
+            .unwrap();
+        let ask = |target: SocketAddr| {
+            let (sealed, nonce) = session.seal(
+                b"\x00\x09\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01",
+                512,
+            );
+            let mut packet = relay::ANON_MAGIC.to_vec();
+            packet.extend_from_slice(&match target.ip() {
+                std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+                std::net::IpAddr::V6(ip) => ip.octets(),
+            });
+            packet.extend_from_slice(&target.port().to_be_bytes());
+            packet.extend_from_slice(&sealed);
+            client.send_to(&packet, relay_addr).unwrap();
+            let mut buf = [0u8; 4096];
+            let (len, _) = client.recv_from(&mut buf).ok()?;
+            session.open(&buf[..len], &nonce)
+        };
+
+        let answer = ask(server_addr).expect("릴레이를 거친 응답");
+        assert_eq!(&answer[..3], &[0x00, 0x09, 0x81]);
+        let elsewhere = SocketAddr::new(server_addr.ip(), server_addr.port().wrapping_add(1));
+        assert!(
+            ask(elsewhere).is_none(),
+            "허용하지 않은 대상으로 보냈습니다"
+        );
+        gate_open.store(false, Ordering::Relaxed);
+        assert!(ask(server_addr).is_none(), "막힌 클라이언트를 중계했습니다");
+
+        server_stop.store(true, Ordering::Release);
+        relay_stop.store(true, Ordering::Release);
     }
 
     #[test]

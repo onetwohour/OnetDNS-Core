@@ -22,6 +22,8 @@ const STAMP_PROP_DNSSEC: u64 = 1;
 pub(crate) enum Transport {
     Plain,
     Dnscrypt,
+    /// A DNSCrypt listener with `dnscrypt_relay` on.
+    DnscryptRelay,
     Doh,
     Dot,
     Doq,
@@ -44,6 +46,7 @@ impl Transport {
         match name {
             "dns" => Some(Transport::Plain),
             "dnscrypt" => Some(Transport::Dnscrypt),
+            "dnscrypt-relay" => Some(Transport::DnscryptRelay),
             "doh" => Some(Transport::Doh),
             "dot" => Some(Transport::Dot),
             "doq" => Some(Transport::Doq),
@@ -55,6 +58,7 @@ impl Transport {
         match self {
             Transport::Plain => "dns",
             Transport::Dnscrypt => "dnscrypt",
+            Transport::DnscryptRelay => "dnscrypt-relay",
             Transport::Doh => "doh",
             Transport::Dot => "dot",
             Transport::Doq => "doq",
@@ -68,6 +72,7 @@ impl Transport {
             Transport::Doh => 0x02,
             Transport::Dot => 0x03,
             Transport::Doq => 0x04,
+            Transport::DnscryptRelay => 0x81,
         }
     }
 
@@ -150,6 +155,14 @@ impl Endpoints {
                 Some((transport, bound.port(), ip))
             })
             .collect();
+        if cfg.dnscrypt_relay {
+            let relays: Vec<_> = listeners
+                .iter()
+                .filter(|(transport, ..)| *transport == Transport::Dnscrypt)
+                .map(|&(_, port, ip)| (Transport::DnscryptRelay, port, ip))
+                .collect();
+            listeners.extend(relays);
+        }
         listeners.sort_unstable();
         listeners.dedup();
 
@@ -234,8 +247,8 @@ impl Endpoints {
     }
 
     /// One stamp per open listener, port, and client address. A listener is left out when the
-    /// stamp would lack a required part: an address for plain DNS and DNSCrypt, a hostname for the
-    /// TLS transports.
+    /// stamp would lack a required part: an address for plain DNS, DNSCrypt and the relay, a
+    /// hostname for the TLS transports.
     pub(crate) fn stamps(&self) -> Result<Vec<(Transport, u16, Option<IpAddr>, String)>, String> {
         let mut targets: Vec<(Transport, u16, Option<IpAddr>)> = self
             .listeners
@@ -266,9 +279,12 @@ impl Endpoints {
             props |= STAMP_PROP_DNSSEC;
         }
         let mut out = vec![transport.stamp_type()];
-        out.extend_from_slice(&props.to_le_bytes());
+        // A relay serves no queries of its own, so its stamp has no properties.
+        if transport != Transport::DnscryptRelay {
+            out.extend_from_slice(&props.to_le_bytes());
+        }
         match transport {
-            Transport::Plain => {
+            Transport::Plain | Transport::DnscryptRelay => {
                 let Some(address) = address else {
                     return Ok(None);
                 };
@@ -685,6 +701,50 @@ mod tests {
             .unwrap();
         published[1] = STAMP_PROP_DNSSEC as u8;
         assert_eq!(decode(&stamp), published);
+    }
+
+    #[test]
+    /// Each DNSCrypt listener also gets a relay stamp when relaying is on: the type, then the
+    /// address alone, with no properties.
+    fn a_relaying_dnscrypt_listener_gets_a_relay_stamp() {
+        let stamps = |relay: bool| {
+            let cfg = Config {
+                dnscrypt_relay: relay,
+                ..Config::default()
+            };
+            let served = Served {
+                listeners: vec![("dnscrypt", String::new(), "0.0.0.0:5443".to_string())],
+                chain: Vec::new(),
+                chain_changes_on_restart: false,
+                dnscrypt: Some(DnscryptIdentity {
+                    provider_name: "2.dnscrypt-cert.onetdns".to_string(),
+                    public_key: [7; 32],
+                }),
+            };
+            Endpoints::new(
+                &cfg,
+                served,
+                Some("192.0.2.1".parse().unwrap()),
+                None,
+                &TrustStore::empty(),
+                now(),
+            )
+            .unwrap()
+            .stamps()
+            .unwrap()
+        };
+        assert!(stamps(false)
+            .iter()
+            .all(|(transport, ..)| *transport == Transport::Dnscrypt));
+        let relay = stamps(true)
+            .into_iter()
+            .find(|(transport, ..)| *transport == Transport::DnscryptRelay)
+            .expect("릴레이 스탬프");
+        assert_eq!(decode(&relay.3), b"\x81\x0e192.0.2.1:5443");
+
+        let e = endpoints(true, Some("2001:db8::1"));
+        let on_443 = e.stamp(Transport::DnscryptRelay, 443, e.address).unwrap();
+        assert_eq!(decode(&on_443.unwrap()), b"\x81\x0d[2001:db8::1]");
     }
 
     fn serving(host: &str, kinds: &[(&'static str, &str)]) -> (Served, Vec<u8>) {

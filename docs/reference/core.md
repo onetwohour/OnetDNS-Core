@@ -169,7 +169,7 @@ listen_dnscrypt = ["0.0.0.0:5443"]
 # Binds locally; generate stamps with the publicly reachable address.
 ```
 
-Local IP addresses and ports on which DNSCrypt accepts both UDP and TCP requests. `0.0.0.0:5443` binds all local IPv4 interfaces; the public client address is supplied separately when generating a DNS stamp. See [DNSCrypt setup](../encrypted-dns.md#dnscrypt-setup).
+Local IP addresses and ports on which DNSCrypt accepts both UDP and TCP requests. `0.0.0.0:5443` binds all local IPv4 interfaces; the public client address is supplied separately when generating a DNS stamp. A query that came through an Anonymized DNSCrypt relay shows the relay's address, so client policies, the ACL, rate limits and the query log all go by that address. See [DNSCrypt setup](../encrypted-dns.md#dnscrypt-setup).
 
 ### `dnscrypt_provider_name`
 
@@ -183,6 +183,45 @@ dnscrypt_provider_name = "2.dnscrypt-cert.dns.example.com"
 ```
 
 Provider name written into DNSCrypt certificates.
+
+### `dnscrypt_relay`
+
+**Type:** bool  
+**Default:** `false`
+
+**TOML:**
+
+```toml
+dnscrypt_relay = true
+```
+
+Passes Anonymized DNSCrypt queries arriving at `listen_dnscrypt` on to their server and returns the answer. The server sees only this server's address. The ACL and rate limits apply to the sender's address before anything is passed on. See [Running a relay](../encrypted-dns.md#running-a-relay).
+
+### `dnscrypt_relay_ports`
+
+**Type:** array  
+**Default:** `[443]`
+
+**TOML:**
+
+```toml
+dnscrypt_relay_ports = [443, 5443]
+```
+
+Server ports relayed queries may go to. Queries for any other port are not passed on.
+
+### `dnscrypt_relay_allow_targets`
+
+**Type:** array  
+**Default:** `[]`
+
+**TOML:**
+
+```toml
+dnscrypt_relay_allow_targets = ["192.168.1.0/24"]
+```
+
+Networks (CIDR) relayed queries may go to even though they are not public addresses or are this server. Left empty, queries go only to public addresses of other servers.
 
 ### `doh_path`
 

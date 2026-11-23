@@ -3,6 +3,7 @@
 //! key. The signing key is the long-term trust anchor, and the resolver key is derived from it.
 
 pub mod client;
+pub mod relay;
 pub mod server;
 
 use std::sync::{Arc, Mutex};
@@ -680,6 +681,7 @@ mod tests {
                 },
                 |_src| true,
                 |_src| false,
+                None,
                 &listener_shutdown,
             )
         });

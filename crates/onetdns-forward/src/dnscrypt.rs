@@ -375,6 +375,7 @@ pub(crate) mod tests {
                 handler,
                 udp_allowed,
                 |_src| false,
+                None,
                 &stop,
             )
         });

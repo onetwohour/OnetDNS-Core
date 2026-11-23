@@ -478,6 +478,14 @@ static KEYS: &[KeySpec] = &[
     key!(listen_doh3, Hot(Listeners), Node, Lanes::OPEN),
     key!(listen_dnscrypt, Hot(Listeners), Node, Lanes::OPEN),
     key!(dnscrypt_provider_name, Hot(Listeners), Node, Lanes::OPEN),
+    key!(dnscrypt_relay, Hot(Listeners), Node, Lanes::OPEN),
+    key!(dnscrypt_relay_ports, Hot(Listeners), Node, Lanes::OPEN),
+    key!(
+        dnscrypt_relay_allow_targets,
+        Hot(Listeners),
+        Node,
+        Lanes::OPEN
+    ),
     key!(doh_path, Hot(Listeners), Node, Lanes::OPEN),
     key!(ddr_name, Hot(Chain), Node, Lanes::OPEN),
     key!(tls_cert, Hot(Tls), Node, Lanes::OPEN),

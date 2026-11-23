@@ -576,6 +576,14 @@ pub struct Config {
 
     pub dnscrypt_provider_name: String,
 
+    /// Pass anonymized DNSCrypt queries arriving on `listen_dnscrypt` on to their server.
+    pub dnscrypt_relay: bool,
+
+    pub dnscrypt_relay_ports: Vec<u16>,
+
+    /// Targets a relayed query may reach though they are not public addresses or are this server.
+    pub dnscrypt_relay_allow_targets: Vec<IpNet>,
+
     pub doh_path: String,
 
     /// Authentication name advertised by DDR (RFC 9462); empty disables DDR. With a name,
@@ -1023,6 +1031,9 @@ impl Default for Config {
             listen_doh3: vec![],
             listen_dnscrypt: vec![],
             dnscrypt_provider_name: "2.dnscrypt-cert.onetdns".to_string(),
+            dnscrypt_relay: false,
+            dnscrypt_relay_ports: vec![443],
+            dnscrypt_relay_allow_targets: vec![],
             doh_path: "/dns-query".to_string(),
             ddr_name: String::new(),
             tls_cert: None,
@@ -3031,6 +3042,22 @@ impl Config {
         kv("listen_doh3", sarr(&self.listen_doh3));
         kv("listen_dnscrypt", sarr(&self.listen_dnscrypt));
         kv("dnscrypt_provider_name", js(&self.dnscrypt_provider_name));
+        kv("dnscrypt_relay", self.dnscrypt_relay.to_string());
+        kv(
+            "dnscrypt_relay_ports",
+            format!(
+                "[{}]",
+                self.dnscrypt_relay_ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
+        kv(
+            "dnscrypt_relay_allow_targets",
+            sarr(&self.dnscrypt_relay_allow_targets),
+        );
         kv("doh_path", js(&self.doh_path));
         kv("ddr_name", js(&self.ddr_name));
         kv("tls_cert", opt_p(&self.tls_cert));
@@ -3491,6 +3518,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "do_ip4",
         "do_ip6",
         "do_tcp",
+        "dnscrypt_relay",
         "do_udp",
         "domain_needed",
         "empty_zones",
@@ -3846,6 +3874,8 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_typed_array::<IpNet>(root, "bogus_nxdomain", "CIDR (for example 10.10.10.10/32)")?;
     check_typed_array::<IpNet>(root, "recurse_deny_server", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_server", "CIDR")?;
+    check_int_array_range::<u16>(root, "dnscrypt_relay_ports")?;
+    check_typed_array::<IpNet>(root, "dnscrypt_relay_allow_targets", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_deny_answers", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_answers", "CIDR")?;
     check_typed_array::<IpNet>(root, "xfr_allow", "CIDR")?;
@@ -5350,6 +5380,9 @@ const KNOWN_KEYS: &[&str] = &[
     "listen_doh3",
     "listen_dnscrypt",
     "dnscrypt_provider_name",
+    "dnscrypt_relay",
+    "dnscrypt_relay_ports",
+    "dnscrypt_relay_allow_targets",
     "doh_path",
     "ddr_name",
     "tls_cert",
@@ -5713,6 +5746,14 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.listen_dnscrypt = gparsevec(root, "listen_dnscrypt");
     c.dnscrypt_provider_name =
         gstr(root, "dnscrypt_provider_name").unwrap_or(d.dnscrypt_provider_name);
+    c.dnscrypt_relay = gbool(root, "dnscrypt_relay", d.dnscrypt_relay);
+    if root.get("dnscrypt_relay_ports").is_some() {
+        c.dnscrypt_relay_ports = garr(root, "dnscrypt_relay_ports")
+            .iter()
+            .filter_map(|v| v.as_int().map(|i| i as u16))
+            .collect();
+    }
+    c.dnscrypt_relay_allow_targets = gparsevec(root, "dnscrypt_relay_allow_targets");
     c.doh_path = gstr(root, "doh_path").unwrap_or(d.doh_path);
     c.ddr_name = gstr(root, "ddr_name").unwrap_or(d.ddr_name);
     c.tls_cert = gstr(root, "tls_cert").map(PathBuf::from);
