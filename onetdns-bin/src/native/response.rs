@@ -636,6 +636,14 @@ pub(crate) fn local_only_negative_response(request: &Message, qname: &ApName, tt
     policy_negative_resp(request, qname, ResponseCode::NXDomain, ttl)
 }
 
+thread_local! {
+    // Every blocked answer carries these: built once per thread, each with its own refcount.
+    static POLICY_SOA_NAMES: (ApName, ApName) = (
+        ApName::from_str("blocked.invalid").unwrap_or_else(|_| ApName::root()),
+        ApName::from_str("hostmaster.blocked.invalid").unwrap_or_else(|_| ApName::root()),
+    );
+}
+
 pub(crate) fn policy_negative_resp(
     request: &Message,
     qname: &ApName,
@@ -643,8 +651,7 @@ pub(crate) fn policy_negative_resp(
     ttl: u32,
 ) -> Message {
     let mut response = error_resp(request, code);
-    let mname = ApName::from_str("blocked.invalid").unwrap_or_else(|_| ApName::root());
-    let rname = ApName::from_str("hostmaster.blocked.invalid").unwrap_or_else(|_| ApName::root());
+    let (mname, rname) = POLICY_SOA_NAMES.with(|(mname, rname)| (mname.clone(), rname.clone()));
     response.authorities.push(ApRecord::new(
         qname.clone(),
         ttl,
@@ -830,6 +837,23 @@ mod tests {
         );
         assert_eq!(missing_family.header.rcode, ResponseCode::NXDomain.0);
         assert_eq!(negative_soa_ttl(&missing_family), 0);
+    }
+
+    #[test]
+    fn policy_soa_names_the_blocked_invalid_zone() {
+        let request = Message::query(1, ApName::from_str("blocked.example").unwrap(), ApRt::A);
+        let qname = request.questions[0].name.clone();
+        for code in [ResponseCode::NXDomain, ResponseCode::NoError] {
+            let negative = policy_negative_resp(&request, &qname, code, 60);
+            let ApRData::Soa(soa) = &negative.authorities[0].rdata else {
+                panic!("SOA");
+            };
+            assert_eq!(soa.mname, ApName::from_str("blocked.invalid").unwrap());
+            assert_eq!(
+                soa.rname,
+                ApName::from_str("hostmaster.blocked.invalid").unwrap()
+            );
+        }
     }
 
     #[test]
