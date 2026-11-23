@@ -13,10 +13,13 @@ mod doh;
 mod doh3;
 mod doq;
 mod dot;
+mod opportunistic;
 mod quicdrive;
 mod socks5;
 
 pub use socks5::Socks5Proxy;
+
+pub use opportunistic::{EncryptedRoute, Encryption, OpportunisticEncryption};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,12 +37,15 @@ pub use onetdns_tls::TrustStore;
 static QUERY_SRC: RwLock<(Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)> =
     RwLock::new((None, None));
 
-/// Single-flight key: destination server and normalized query wire, with the transaction ID cleared
-/// and, when configured, the question name's case folded. Otherwise the same query would get a new
-/// key every time and single-flight would group nothing.
+/// Single-flight key: destination server, transport, and normalized query wire, with the
+/// transaction ID cleared and, when configured, the question name's case folded. Otherwise the same
+/// query would get a new key every time and single-flight would group nothing. The transport is
+/// part of it so a plaintext retry does not wait on the encrypted exchange it falls back from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AuthorityQueryKey {
     server: SocketAddr,
+
+    transport: AuthorityTransport,
 
     normalized_wire: Arc<[u8]>,
 }
@@ -47,7 +53,12 @@ struct AuthorityQueryKey {
 impl AuthorityQueryKey {
     /// `normalize_question_case` folds case for 0x20 encoding. None when the key material exceeds
     /// the limit; that query is not grouped.
-    fn from_wire(server: SocketAddr, wire: &[u8], normalize_question_case: bool) -> Option<Self> {
+    fn from_wire(
+        server: SocketAddr,
+        transport: AuthorityTransport,
+        wire: &[u8],
+        normalize_question_case: bool,
+    ) -> Option<Self> {
         if wire.len() < 12 || wire.len() > MAX_AUTHORITY_FLIGHT_KEY_BYTES {
             return None;
         }
@@ -77,13 +88,14 @@ impl AuthorityQueryKey {
         }
         Some(Self {
             server,
-
+            transport,
             normalized_wire: normalized.into(),
         })
     }
 
     fn from_request(
         server: SocketAddr,
+        transport: AuthorityTransport,
         request: &Message,
         normalize_question_case: bool,
     ) -> Option<Self> {
@@ -107,6 +119,7 @@ impl AuthorityQueryKey {
         }
         Some(Self {
             server,
+            transport,
             normalized_wire: normalized_wire.into(),
         })
     }
@@ -1706,7 +1719,7 @@ pub fn query_server_case_merged(
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AuthorityTransport {
     /// Falls back to TCP on a truncated answer.
     Udp,
@@ -1714,6 +1727,9 @@ pub enum AuthorityTransport {
     /// TCP from the start, for networks where a middlebox intercepts UDP 53 and answers itself;
     /// there, UDP answers do not come from the authoritative server.
     Tcp,
+
+    /// Opportunistic encryption to the server's encrypted endpoint; see `OpportunisticEncryption`.
+    Encrypted(Encryption),
 }
 
 /// `merge_case` compares ignoring case and returns the caller's form; otherwise names are
@@ -1746,8 +1762,10 @@ fn query_server_with_case_policy(
     let wire = request
         .try_encode()
         .map_err(|_| ForwardError::BadResponse)?;
-    let key = AuthorityQueryKey::from_wire(server, &wire, normalize_key_case)
-        .or_else(|| AuthorityQueryKey::from_request(server, request, normalize_key_case));
+    let key =
+        AuthorityQueryKey::from_wire(server, transport, &wire, normalize_key_case).or_else(|| {
+            AuthorityQueryKey::from_request(server, transport, request, normalize_key_case)
+        });
     let Some(key) = key else {
         return query_server_uncollapsed(
             server,
@@ -1850,6 +1868,9 @@ fn query_server_uncollapsed(
             require_exact_question_case,
         )?,
         AuthorityTransport::Tcp => tcp_exchange(server, &wire, wire_id, request, timeout)?,
+        AuthorityTransport::Encrypted(encryption) => {
+            opportunistic::exchange(server, encryption, &wire, wire_id, request, timeout)?
+        }
     };
     response.header.id = request.header.id;
     Ok(response)
@@ -2095,71 +2116,88 @@ fn udp_exchange_on(
     }
 }
 
-struct IdleTcp {
-    stream: TcpStream,
+struct Idle<C> {
+    conn: C,
     last_used: Instant,
 }
 
-/// Keyed by bind address and server address.
-#[derive(Default)]
-struct TcpIdlePool {
-    idle: HashMap<(SocketAddr, SocketAddr), Vec<IdleTcp>>,
+/// Connections between queries to authoritative servers. Shared by the process: per-thread pools
+/// would keep the exchange threads recursion starts per server from using each other's
+/// connections.
+struct IdlePool<K, C> {
+    idle: HashMap<K, Vec<Idle<C>>>,
     total: usize,
 }
 
 /// As many as concurrent queries to one server need.
-const TCP_IDLE_PER_SERVER: usize = 2;
+const IDLE_PER_SERVER: usize = 2;
 
 /// Recursion goes through hundreds of servers; without a cap idle connections would use up file
 /// descriptors.
-const TCP_IDLE_TOTAL: usize = 256;
+const IDLE_TOTAL: usize = 256;
 
-/// Shared by the process: per-thread pools would keep the exchange threads recursion starts per
-/// server from using each other's connections.
-fn tcp_idle_pool() -> &'static Mutex<TcpIdlePool> {
-    static POOL: OnceLock<Mutex<TcpIdlePool>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(TcpIdlePool::default()))
-}
-
-/// Drops connections idle too long. A connection the server has since closed can still come out;
-/// sending on it reads EOF at once and moves to a new connection, so it is not checked separately.
-fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
-    let mut pool = tcp_idle_pool()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let TcpIdlePool { idle, total } = &mut *pool;
-    let conns = idle.get_mut(&(bind, upstream))?;
-    let mut found = None;
-    while let Some(conn) = conns.pop() {
-        *total -= 1;
-        if conn.last_used.elapsed() < tcp_idle_reuse_max() {
-            found = Some(conn.stream);
-            break;
+impl<K: std::hash::Hash + Eq, C> IdlePool<K, C> {
+    fn new() -> Self {
+        Self {
+            idle: HashMap::new(),
+            total: 0,
         }
     }
-    if conns.is_empty() {
-        idle.remove(&(bind, upstream));
+
+    /// Drops connections idle too long. A connection the server has since closed can still come
+    /// out; its first exchange fails at once, so it is not checked here.
+    fn take(&mut self, key: &K) -> Option<C> {
+        let conns = self.idle.get_mut(key)?;
+        let mut found = None;
+        while let Some(idle) = conns.pop() {
+            self.total -= 1;
+            if idle.last_used.elapsed() < tcp_idle_reuse_max() {
+                found = Some(idle.conn);
+                break;
+            }
+        }
+        if conns.is_empty() {
+            self.idle.remove(key);
+        }
+        found
     }
-    found
+
+    /// Closes the connection past the caps.
+    fn put(&mut self, key: K, conn: C) {
+        if self.total >= IDLE_TOTAL {
+            return;
+        }
+        let conns = self.idle.entry(key).or_default();
+        if conns.len() >= IDLE_PER_SERVER {
+            return;
+        }
+        conns.push(Idle {
+            conn,
+            last_used: Instant::now(),
+        });
+        self.total += 1;
+    }
 }
 
-/// Only connections whose answer was read in full; closes past the cap.
-fn return_idle_tcp(bind: SocketAddr, upstream: SocketAddr, stream: TcpStream) {
-    let mut pool = tcp_idle_pool()
+/// Keyed by bind address and server address.
+fn tcp_idle_pool() -> &'static Mutex<IdlePool<(SocketAddr, SocketAddr), TcpStream>> {
+    static POOL: OnceLock<Mutex<IdlePool<(SocketAddr, SocketAddr), TcpStream>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(IdlePool::new()))
+}
+
+fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
+    tcp_idle_pool()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if pool.total >= TCP_IDLE_TOTAL {
-        return;
-    }
-    let conns = pool.idle.entry((bind, upstream)).or_default();
-    if conns.len() >= TCP_IDLE_PER_SERVER {
-        return;
-    }
-    conns.push(IdleTcp {
-        stream,
-        last_used: Instant::now(),
-    });
-    pool.total += 1;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take(&(bind, upstream))
+}
+
+/// Only connections whose answer was read in full.
+fn return_idle_tcp(bind: SocketAddr, upstream: SocketAddr, stream: TcpStream) {
+    tcp_idle_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .put((bind, upstream), stream);
 }
 
 /// Plain TCP with 2-byte length framing. Asks over a kept connection to the server first: a new
@@ -2625,6 +2663,7 @@ mod tests {
         for index in 0..MAX_AUTHORITY_FLIGHTS {
             let key = AuthorityQueryKey {
                 server: SocketAddr::from(([192, 0, 2, 1], 53)),
+                transport: AuthorityTransport::Udp,
                 normalized_wire: index.to_be_bytes().to_vec().into(),
             };
             assert!(acquire_authority_flight(&mut flights, &key).is_some());
@@ -2647,6 +2686,7 @@ mod tests {
 
         let overflow = AuthorityQueryKey {
             server: SocketAddr::from(([192, 0, 2, 2], 53)),
+            transport: AuthorityTransport::Udp,
             normalized_wire: b"overflow".to_vec().into(),
         };
         assert!(acquire_authority_flight(&mut flights, &overflow).is_none());
@@ -2661,18 +2701,28 @@ mod tests {
         let wire_upper = upper.try_encode().unwrap();
         let wire_lower = lower.try_encode().unwrap();
 
-        let by_wire_upper = AuthorityQueryKey::from_wire(server, &wire_upper, true).unwrap();
-        let by_wire_lower = AuthorityQueryKey::from_wire(server, &wire_lower, true).unwrap();
-        let by_message = AuthorityQueryKey::from_request(server, &upper, true).unwrap();
+        let by_wire_upper =
+            AuthorityQueryKey::from_wire(server, AuthorityTransport::Udp, &wire_upper, true)
+                .unwrap();
+        let by_wire_lower =
+            AuthorityQueryKey::from_wire(server, AuthorityTransport::Udp, &wire_lower, true)
+                .unwrap();
+        let by_message =
+            AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &upper, true).unwrap();
         assert_eq!(by_wire_upper, by_wire_lower);
         assert_eq!(by_wire_upper, by_message);
 
-        let exact_upper = AuthorityQueryKey::from_wire(server, &wire_upper, false).unwrap();
-        let exact_lower = AuthorityQueryKey::from_wire(server, &wire_lower, false).unwrap();
+        let exact_upper =
+            AuthorityQueryKey::from_wire(server, AuthorityTransport::Udp, &wire_upper, false)
+                .unwrap();
+        let exact_lower =
+            AuthorityQueryKey::from_wire(server, AuthorityTransport::Udp, &wire_lower, false)
+                .unwrap();
         assert_ne!(exact_upper, exact_lower);
         assert_eq!(
             exact_upper,
-            AuthorityQueryKey::from_request(server, &upper, false).unwrap()
+            AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &upper, false)
+                .unwrap()
         );
     }
 
@@ -2681,7 +2731,8 @@ mod tests {
     fn same_thread_leader_flight_is_bypassed_not_joined() {
         let server = SocketAddr::from(([192, 0, 2, 1], 53));
         let request = Message::query(1, Name::from_str("nest.example").unwrap(), RecordType::A);
-        let key = AuthorityQueryKey::from_request(server, &request, true).unwrap();
+        let key = AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &request, true)
+            .unwrap();
         let mut flights = HashMap::new();
 
         let (leader_flight, leader) = acquire_authority_flight(&mut flights, &key).unwrap();
@@ -2694,7 +2745,9 @@ mod tests {
             let mut flights = HashMap::new();
             let request =
                 Message::query(2, Name::from_str("cross.example").unwrap(), RecordType::A);
-            let key = AuthorityQueryKey::from_request(server, &request, true).unwrap();
+            let key =
+                AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &request, true)
+                    .unwrap();
             let _ = acquire_authority_flight(&mut flights, &key).unwrap();
             (flights, key)
         });
@@ -2714,7 +2767,10 @@ mod tests {
             0,
             RData::Unknown(65_000, vec![0; MAX_AUTHORITY_FLIGHT_KEY_BYTES + 1]),
         ));
-        assert!(AuthorityQueryKey::from_request(server, &request, true).is_none());
+        assert!(
+            AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &request, true)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2728,15 +2784,27 @@ mod tests {
             )
         };
 
-        let first = AuthorityQueryKey::from_request(server, &request(1, 0xff), true).unwrap();
-        let second = AuthorityQueryKey::from_request(server, &request(2, 0xfe), true).unwrap();
+        let first = AuthorityQueryKey::from_request(
+            server,
+            AuthorityTransport::Udp,
+            &request(1, 0xff),
+            true,
+        )
+        .unwrap();
+        let second = AuthorityQueryKey::from_request(
+            server,
+            AuthorityTransport::Udp,
+            &request(2, 0xfe),
+            true,
+        )
+        .unwrap();
         assert_ne!(first, second);
 
         let upper = Message::query(3, Name::from_str("WWW.example").unwrap(), RecordType::A);
         let lower = Message::query(4, Name::from_str("www.EXAMPLE").unwrap(), RecordType::A);
         assert_eq!(
-            AuthorityQueryKey::from_request(server, &upper, true),
-            AuthorityQueryKey::from_request(server, &lower, true)
+            AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &upper, true),
+            AuthorityQueryKey::from_request(server, AuthorityTransport::Udp, &lower, true)
         );
     }
 

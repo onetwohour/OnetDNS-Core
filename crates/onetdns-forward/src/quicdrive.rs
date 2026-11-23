@@ -220,12 +220,21 @@ pub(crate) fn new_client_connection(
     } else {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     };
+    let cfg = client_tls_config(addr, server_name, alpn, trust);
+    open_client_connection(addr, bind, cfg, read_timeout)
+}
+
+pub(crate) fn open_client_connection(
+    addr: SocketAddr,
+    bind: SocketAddr,
+    cfg: ClientConfig,
+    read_timeout: Duration,
+) -> Result<(QuicSocket, Connection), ForwardError> {
     let sock = onetdns_core::udp::bind(bind).map_err(io_err)?;
     sock.connect(addr).map_err(io_err)?;
     let wait = RecvWait::new(read_timeout.min(POLL));
     wait.install(&sock).map_err(io_err)?;
 
-    let cfg = client_tls_config(addr, server_name, alpn, trust);
     let conn = Connection::new_client(
         cfg,
         random_cid(),

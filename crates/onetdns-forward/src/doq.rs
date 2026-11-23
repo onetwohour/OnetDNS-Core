@@ -20,7 +20,7 @@ use crate::quicdrive::{
 };
 use crate::{validate_response, ForwardError};
 
-struct DoqConn {
+pub(crate) struct DoqConn {
     sock: QuicSocket,
     conn: Connection,
 
@@ -117,25 +117,40 @@ fn connect(
         .ok_or(ForwardError::Timeout)?;
     let created = Instant::now();
     let (sock, conn) = new_client_connection(addr, server_name, b"doq", timeout, trust)?;
-    let mut c = DoqConn {
-        sock,
-        conn,
-        next_bidi: 0,
-        created,
-        server_name: server_name.to_string(),
-        revocation_checked: false,
-    };
-    if !c.conn.can_send_early() {
-        pump_handshake(&c.sock, &mut c.conn, created, deadline).inspect_err(|error| {
+    DoqConn::establish(sock, conn, created, server_name.to_string(), deadline).inspect_err(
+        |error| {
             crate::note_upstream_connect_failure("doq", addr, server_name, error);
-        })?;
+        },
+    )
+}
+
+impl DoqConn {
+    /// Completes the handshake. `created` is when `conn` was made, its clock's zero.
+    pub(crate) fn establish(
+        sock: QuicSocket,
+        conn: Connection,
+        created: Instant,
+        server_name: String,
+        deadline: Instant,
+    ) -> Result<Self, ForwardError> {
+        let mut c = DoqConn {
+            sock,
+            conn,
+            next_bidi: 0,
+            created,
+            server_name,
+            revocation_checked: false,
+        };
+        if !c.conn.can_send_early() {
+            pump_handshake(&c.sock, &mut c.conn, created, deadline)?;
+        }
+        Ok(c)
     }
-    Ok(c)
 }
 
 /// Sends with transaction ID 0, as RFC 9250 requires: the stream already pairs query and response,
 /// and a kept ID would fingerprint the connection.
-fn roundtrip(
+pub(crate) fn roundtrip(
     c: &mut DoqConn,
     wire: &[u8],
     request: &Message,

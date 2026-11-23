@@ -319,7 +319,7 @@ pub struct ClientConfig {
 
     pub roots: Option<crate::trust::TrustStore>,
 
-    /// For tests only.
+    /// Accepts any certificate when `roots` is None.
     pub insecure_verifier: Option<InsecureVerifier>,
 
     pub alpn: Vec<Vec<u8>>,

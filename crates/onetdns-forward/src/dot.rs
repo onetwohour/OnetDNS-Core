@@ -10,7 +10,7 @@ use onetdns_tls::{client_handshake, ClientConfig, TlsConnection, TlsSession, Tru
 
 use crate::{validate_response, DeadlineTcp, Endpoint, ForwardError};
 
-struct DotConn {
+pub(crate) struct DotConn {
     tcp: DeadlineTcp,
     tls: TlsConnection,
 
@@ -18,6 +18,17 @@ struct DotConn {
     buf: Vec<u8>,
 
     last_used: Instant,
+}
+
+impl DotConn {
+    pub(crate) fn new(tcp: DeadlineTcp, tls: TlsConnection) -> Self {
+        Self {
+            tcp,
+            tls,
+            buf: Vec::new(),
+            last_used: Instant::now(),
+        }
+    }
 }
 
 thread_local! {
@@ -136,16 +147,11 @@ fn connect(
         crate::check_revocation(tls.verified_chain(), server_name)
             .inspect_err(|_| tls.reject_peer_certificate(&mut tcp))?;
     }
-    Ok(DotConn {
-        tcp,
-        tls,
-        buf: Vec::new(),
-        last_used: Instant::now(),
-    })
+    Ok(DotConn::new(tcp, tls))
 }
 
 /// 2-byte length framing.
-fn roundtrip(
+pub(crate) fn roundtrip(
     conn: &mut DotConn,
     wire: &[u8],
     wire_id: u16,
