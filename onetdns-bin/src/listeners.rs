@@ -732,7 +732,7 @@ fn tcp_socket(
 ) -> std::io::Result<TcpListener> {
     match set.take_tcp(role, addr) {
         Some(socket) => Ok(socket),
-        None => TcpListener::bind(addr),
+        None => onetdns_core::listen::tcp(addr),
     }
 }
 
@@ -743,7 +743,7 @@ fn quic_socket(
 ) -> std::io::Result<UdpSocket> {
     match set.take_udp(role, addr) {
         Some(socket) => Ok(socket),
-        None => onetdns_core::udp::bind(addr),
+        None => onetdns_core::listen::udp(addr),
     }
 }
 
@@ -1037,7 +1037,7 @@ pub(crate) fn reconcile_dnscrypt(
         };
         let socket = open_when_free(|| match set.take_udp(SocketRole::Dnscrypt, *addr) {
             Some(socket) => Ok(socket),
-            None => UdpSocket::bind(addr),
+            None => onetdns_core::listen::udp(*addr),
         })
         .map_err(|error| listener_open_error("DNSCrypt", *addr, &error))?;
         let kept = socket

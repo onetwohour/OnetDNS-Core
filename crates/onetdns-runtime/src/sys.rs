@@ -92,7 +92,7 @@ pub fn bind_udp(addr: SocketAddr, n: usize) -> io::Result<Vec<UdpSocket>> {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = n;
-    Ok(vec![onetdns_core::udp::bind(addr)?])
+    Ok(vec![onetdns_core::listen::udp(addr)?])
 }
 
 /// The distinct sockets `n` TCP acceptors listen on: one per acceptor in one SO_REUSEPORT group on
@@ -109,7 +109,7 @@ pub fn bind_tcp(addr: SocketAddr, n: usize) -> io::Result<Vec<TcpListener>> {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = n;
-    let base = TcpListener::bind(addr)?;
+    let base = onetdns_core::listen::tcp(addr)?;
     base.set_nonblocking(true)?;
     Ok(vec![base])
 }
@@ -169,6 +169,8 @@ mod linux {
     const SO_REUSEADDR: c_int = 2;
     const SO_REUSEPORT: c_int = 15;
     const SOMAXCONN: c_int = 128;
+    const IPPROTO_IPV6: c_int = 41;
+    const IPV6_V6ONLY: c_int = 26;
 
     extern "C" {
         fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
@@ -220,10 +222,15 @@ mod linux {
             }
             let on: c_int = 1;
             let onp = (&on as *const c_int) as *const c_void;
+            let off: c_int = 0;
+            let offp = (&off as *const c_int) as *const c_void;
             let sz = std::mem::size_of::<c_int>() as u32;
+            // The same dual-stack rule as onetdns_core::listen.
+            let dual_stack = onetdns_core::listen::is_dual_stack(*addr);
 
             if setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, onp, sz) < 0
                 || setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, onp, sz) < 0
+                || (dual_stack && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, offp, sz) < 0)
                 || bind(fd, sa.as_ptr() as *const c_void, sa.len() as u32) < 0
             {
                 let e = io::Error::last_os_error();

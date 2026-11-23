@@ -11,6 +11,8 @@ pub mod ipnet;
 /// Confines a panic to the query that caused it.
 pub mod isolation;
 pub mod json;
+/// Listening sockets; the unspecified IPv6 address takes IPv4 too.
+pub mod listen;
 pub mod log;
 /// Bounded caches.
 pub mod lrumap;
@@ -34,6 +36,8 @@ pub mod talloc;
 pub mod tcp;
 /// UDP sockets that ICMP errors cannot break.
 pub mod udp;
+#[cfg(windows)]
+mod winsock;
 
 pub use client::{ClientInfo, Transport};
 pub use ipnet::IpNet;

@@ -127,7 +127,7 @@ mode = "public"
 listen = ["[::]:53"]
 ```
 
-This binds plain DNS to all IPv6 interfaces. On Linux and macOS the same socket also accepts IPv4, so `0.0.0.0:53` is not listed with it; the config check rejects the pair as a conflict. `mode`, `acl_*`, and rate controls select DNS admission and traffic policy; dashboard access is configured with `control_*` settings.
+This binds plain DNS to all interfaces. The `[::]` socket accepts IPv4 as well, so `0.0.0.0:53` is not listed with it; the config check rejects the pair as a conflict. `mode`, `acl_*`, and rate controls select DNS admission and traffic policy; dashboard access is configured with `control_*` settings.
 
 ## Dashboard through an HTTPS reverse proxy
 

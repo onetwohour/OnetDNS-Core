@@ -56,7 +56,7 @@ listen_dnscrypt = ["0.0.0.0:5443"]
 dnscrypt_provider_name = "2.dnscrypt-cert.dns.example.com"
 ```
 
-`0.0.0.0:5443` accepts DNSCrypt on all local IPv4 interfaces, over **UDP and TCP**. To serve IPv6 as well, and the host has IPv6 connectivity, use `"[::]:5443"` instead. On Linux and macOS it also accepts IPv4; listing it together with `0.0.0.0:5443` is rejected as a conflict. Do not replace `0.0.0.0` with a cloud VM's NAT public IP unless that IP is actually assigned to a local interface.
+`0.0.0.0:5443` accepts DNSCrypt on all local IPv4 interfaces, over **UDP and TCP**. To serve IPv6 as well, and the host has IPv6 connectivity, use `"[::]:5443"` instead. It accepts IPv4 as well; listing it together with `0.0.0.0:5443` is rejected as a conflict. Do not replace `0.0.0.0` with a cloud VM's NAT public IP unless that IP is actually assigned to a local interface.
 
 For clients connecting over the public internet, generate the stamp with the server's **publicly reachable IP address**, not `0.0.0.0`, `127.0.0.1`, or the VM's internal-only IP. For example, when the public address is `203.0.113.10` (documentation placeholder):
 
