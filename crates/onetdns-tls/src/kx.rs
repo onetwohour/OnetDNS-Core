@@ -60,7 +60,7 @@ impl KeyExchange {
                 let p: [u8; 32] = peer.try_into().ok()?;
                 let shared = s.diffie_hellman(&x25519_dalek::PublicKey::from(p));
 
-                if shared.as_bytes().iter().all(|&b| b == 0) {
+                if !shared.was_contributory() {
                     return None;
                 }
                 Some(shared.as_bytes().to_vec())

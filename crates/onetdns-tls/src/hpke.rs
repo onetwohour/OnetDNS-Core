@@ -94,7 +94,7 @@ impl PrivateKey {
         let shared = self
             .secret
             .diffie_hellman(&x25519_dalek::PublicKey::from(peer));
-        if shared.as_bytes().iter().all(|&byte| byte == 0) {
+        if !shared.was_contributory() {
             return Err(HpkeError::InvalidKey);
         }
         Ok(Zeroizing::new(*shared.as_bytes()))
