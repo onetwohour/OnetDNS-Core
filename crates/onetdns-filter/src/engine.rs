@@ -230,21 +230,24 @@ impl DomainSet {
     }
 
     /// Thaws first if frozen.
-    pub fn remove(&mut self, domain: &str) {
+    pub fn remove_exact(&mut self, domain: &str) {
         Self::thaw(
             &mut self.exact,
             &mut self.exact_compact,
             &mut self.exact_hits,
         );
+        self.entry_count -= usize::from(self.exact.remove(normalize_str(domain).as_str()));
+        self.exact_hits = None;
+    }
+
+    /// Thaws first if frozen.
+    pub fn remove_suffix(&mut self, domain: &str) {
         Self::thaw(
             &mut self.suffixes,
             &mut self.suffix_compact,
             &mut self.suffix_hits,
         );
-        let n = normalize_str(domain);
-        self.entry_count -= usize::from(self.exact.remove(n.as_str()));
-        self.entry_count -= usize::from(self.suffixes.remove(n.as_str()));
-        self.exact_hits = None;
+        self.entry_count -= usize::from(self.suffixes.remove(normalize_str(domain).as_str()));
         self.suffix_hits = None;
     }
 
@@ -484,6 +487,19 @@ impl RewriteSet {
 
     pub fn len(&self) -> usize {
         self.exact.len() + self.suffix.len()
+    }
+
+    /// Removes the entry only when it still holds `target`.
+    pub(crate) fn remove(&mut self, domain: &str, exact: bool, target: &RewriteTarget) {
+        let map = if exact {
+            &mut self.exact
+        } else {
+            &mut self.suffix
+        };
+        let key = normalize_str(domain);
+        if map.get(key.as_str()) == Some(target) {
+            map.remove(key.as_str());
+        }
     }
 
     /// An exact match wins.
@@ -865,13 +881,13 @@ pub struct SourceStat {
     pub hits: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientCond {
     Net { negated: bool, net: IpNet },
     Id { negated: bool, id: String },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 /// A rule that applies only to certain clients.
 pub struct ClientRule {
     pub domain: String,
@@ -2174,7 +2190,7 @@ mod tests {
         assert_eq!(set.source_of("x.blocked.example"), Some(8));
         assert_eq!(set.source_of("x.new.example"), Some(9));
 
-        set.remove("blocked.example");
+        set.remove_suffix("blocked.example");
         assert!(!set.matches("x.blocked.example"));
         assert!(set.matches("x.new.example"));
     }

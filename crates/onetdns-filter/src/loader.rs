@@ -83,8 +83,8 @@ use crate::engine::{BlockEngine, DomainSet, EngineParts, RpzIpRule, RpzNameRule}
 struct Accum {
     parts: EngineParts,
 
-    badfilter: Vec<String>,
-    badfilter_regex: Vec<String>,
+    /// Placements of `$badfilter` rules, removed once every rule has been read.
+    cancels: Vec<Placement>,
 
     cur_source: u32,
 }
@@ -101,6 +101,69 @@ impl Accum {
         self.cur_source = self.parts.sources.len() as u32;
         self.parts.sources.push(name);
     }
+
+    fn emit(&mut self, placement: Placement, badfilter: bool) {
+        if badfilter {
+            self.cancels.push(placement);
+        } else {
+            place(&mut self.parts, placement, self.cur_source);
+        }
+    }
+}
+
+/// The plain sets, each kept once for domain rules and once for regex rules.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Block,
+    BlockImportant,
+    Allow,
+    AllowImportant,
+    Refuse,
+    Nodata,
+    NoResponse,
+}
+
+impl Kind {
+    fn of(allow: bool, important: bool) -> Self {
+        match (allow, important) {
+            (true, true) => Kind::AllowImportant,
+            (true, false) => Kind::Allow,
+            (false, true) => Kind::BlockImportant,
+            (false, false) => Kind::Block,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum Slot {
+    Plain(Kind),
+    Typed(RecordType),
+    /// Every type except these, sorted and deduplicated.
+    TypedExcept(Vec<RecordType>),
+}
+
+/// Where one rule lands. A `$badfilter` rule computes its placement the same way and removes it,
+/// so it cancels only the rule written the same way without `$badfilter`.
+enum Placement {
+    Domain {
+        slot: Slot,
+        domain: String,
+        exact: bool,
+    },
+    Rewrite {
+        domain: String,
+        exact: bool,
+        target: RewriteTarget,
+    },
+    Regex {
+        slot: Slot,
+        pattern: String,
+    },
+    RegexRewrite {
+        pattern: String,
+        target: RewriteTarget,
+    },
+    Client(crate::engine::ClientRule),
 }
 
 fn split_mods(s: &str) -> (&str, Vec<&str>) {
@@ -259,52 +322,60 @@ fn route_regex_rule(pat: &str, m: RuleMods, allow: bool, acc: &mut Accum) {
     } = m;
 
     if !client_conds.is_empty() || !ctags.is_empty() || !denyallow.is_empty() {
-        acc.parts.client_rules.push(crate::engine::ClientRule {
+        let rule = crate::engine::ClientRule {
             domain: String::new(),
             regex: Some(pat.to_string()),
             allow,
             clients: client_conds,
             ctags,
             denyallow,
-        });
+        };
+        acc.emit(Placement::Client(rule), badfilter);
         return;
     }
 
+    let pattern = pat.to_string();
     if let Some(v) = dnsrewrite {
-        if !apply_regex_dnsrewrite(pat, v, &mut acc.parts) {
-            skip_invalid_pattern(acc);
+        match parse_dnsrewrite(v) {
+            Some(DnsRewrite::Code(kind)) => acc.emit(
+                Placement::Regex {
+                    slot: Slot::Plain(kind),
+                    pattern,
+                },
+                badfilter,
+            ),
+            Some(DnsRewrite::Target(target)) => {
+                acc.emit(Placement::RegexRewrite { pattern, target }, badfilter)
+            }
+            None => skip_invalid_pattern(acc),
         }
-        return;
-    }
-
-    if badfilter {
-        acc.badfilter_regex.push(pat.to_string());
         return;
     }
 
     if !dnstype_excluded.is_empty() && !allow {
         dnstype_excluded.sort_by_key(|t| t.0);
         dnstype_excluded.dedup();
-        acc.parts
-            .regex_typed_block_except
-            .push((dnstype_excluded, pat.to_string()));
+        let slot = Slot::TypedExcept(dnstype_excluded);
+        acc.emit(Placement::Regex { slot, pattern }, badfilter);
         return;
     }
 
     if !dnstypes.is_empty() && !allow {
         for t in dnstypes {
-            acc.parts.regex_typed_block.push((t, pat.to_string()));
+            let pattern = pattern.clone();
+            acc.emit(
+                Placement::Regex {
+                    slot: Slot::Typed(t),
+                    pattern,
+                },
+                badfilter,
+            );
         }
         return;
     }
 
-    let list = match (allow, important) {
-        (true, true) => &mut acc.parts.regex_allow_important,
-        (true, false) => &mut acc.parts.regex_allow,
-        (false, true) => &mut acc.parts.regex_block_important,
-        (false, false) => &mut acc.parts.regex_block,
-    };
-    list.push(pat.to_string());
+    let slot = Slot::Plain(Kind::of(allow, important));
+    acc.emit(Placement::Regex { slot, pattern }, badfilter);
 }
 
 /// Formats are told apart by prefix: `||` is a domain, `@@` an allow rule, `/` a regex, anything
@@ -316,7 +387,6 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
     }
 
     acc.parts.report.rules_total += 1;
-    let src = acc.cur_source;
 
     let (body, force_allow) = match line.strip_prefix("@@") {
         Some(r) => (r, true),
@@ -370,24 +440,35 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
                 }
             }
         };
-        acc.parts.client_rules.push(crate::engine::ClientRule {
+        let rule = crate::engine::ClientRule {
             domain,
             regex: None,
             allow,
             clients: client_conds,
             ctags,
             denyallow,
-        });
+        };
+        acc.emit(Placement::Client(rule), badfilter);
         return;
     }
 
     if let Some(v) = dnsrewrite {
-        match extract_domain(pattern) {
-            Some(dom) => {
-                if !apply_dnsrewrite(&dom, v, &mut acc.parts, src) {
-                    skip_invalid_pattern(acc);
-                }
-            }
+        let placement = extract_domain(pattern).and_then(|domain| {
+            Some(match parse_dnsrewrite(v)? {
+                DnsRewrite::Code(kind) => Placement::Domain {
+                    slot: Slot::Plain(kind),
+                    domain,
+                    exact: false,
+                },
+                DnsRewrite::Target(target) => Placement::Rewrite {
+                    domain,
+                    exact: false,
+                    target,
+                },
+            })
+        });
+        match placement {
+            Some(placement) => acc.emit(placement, badfilter),
             None => skip_invalid_pattern(acc),
         }
         return;
@@ -402,11 +483,21 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
                 if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
                     continue;
                 }
-                if is_unspecified_or_loopback(&ip) {
-                    target_set(&mut acc.parts, allow, important, false).add_exact_src(host, src);
+                let domain = host.to_string();
+                let placement = if is_unspecified_or_loopback(&ip) {
+                    Placement::Domain {
+                        slot: Slot::Plain(Kind::of(allow, important)),
+                        domain,
+                        exact: true,
+                    }
                 } else {
-                    acc.parts.rewrites.add_exact(host, RewriteTarget::ip(ip));
-                }
+                    Placement::Rewrite {
+                        domain,
+                        exact: true,
+                        target: RewriteTarget::ip(ip),
+                    }
+                };
+                acc.emit(placement, badfilter);
             }
             return;
         }
@@ -420,11 +511,6 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
         }
     };
 
-    if badfilter {
-        acc.badfilter.push(dom);
-        return;
-    }
-
     if allow && (!dnstypes.is_empty() || !dnstype_excluded.is_empty()) {
         acc.parts.report.rules_skipped += 1;
         *acc.parts
@@ -435,21 +521,36 @@ fn parse_line(line: &str, acc: &mut Accum, into_allow: bool) {
         return;
     }
 
-    if !dnstype_excluded.is_empty() && !allow {
+    if !dnstype_excluded.is_empty() {
         dnstype_excluded.sort_by_key(|t| t.0);
         dnstype_excluded.dedup();
-        typed_except_set(&mut acc.parts, &dnstype_excluded).add_suffix_src(&dom, src);
+        let placement = Placement::Domain {
+            slot: Slot::TypedExcept(dnstype_excluded),
+            domain: dom,
+            exact: false,
+        };
+        acc.emit(placement, badfilter);
         return;
     }
 
-    if !dnstypes.is_empty() && !allow {
+    if !dnstypes.is_empty() {
         for t in dnstypes {
-            typed_set(&mut acc.parts, t).add_suffix_src(&dom, src);
+            let placement = Placement::Domain {
+                slot: Slot::Typed(t),
+                domain: dom.clone(),
+                exact: false,
+            };
+            acc.emit(placement, badfilter);
         }
         return;
     }
 
-    target_set(&mut acc.parts, allow, important, false).add_suffix_src(&dom, src);
+    let placement = Placement::Domain {
+        slot: Slot::Plain(Kind::of(allow, important)),
+        domain: dom,
+        exact: false,
+    };
+    acc.emit(placement, badfilter);
 }
 
 fn skip_invalid_pattern(acc: &mut Accum) {
@@ -509,130 +610,180 @@ fn is_network_modifier(key: &str) -> bool {
     )
 }
 
-fn target_set(
-    parts: &mut EngineParts,
-    allow: bool,
-    important: bool,
-    refuse: bool,
-) -> &mut DomainSet {
-    if refuse {
-        &mut parts.refuse
-    } else {
-        match (allow, important) {
-            (true, true) => &mut parts.allow_important,
-            (true, false) => &mut parts.allow,
-            (false, true) => &mut parts.block_important,
-            (false, false) => &mut parts.block,
+fn plain_set(parts: &mut EngineParts, kind: Kind) -> &mut DomainSet {
+    match kind {
+        Kind::Block => &mut parts.block,
+        Kind::BlockImportant => &mut parts.block_important,
+        Kind::Allow => &mut parts.allow,
+        Kind::AllowImportant => &mut parts.allow_important,
+        Kind::Refuse => &mut parts.refuse,
+        Kind::Nodata => &mut parts.nodata,
+        Kind::NoResponse => &mut parts.no_response,
+    }
+}
+
+fn regex_list(parts: &mut EngineParts, kind: Kind) -> &mut Vec<String> {
+    match kind {
+        Kind::Block => &mut parts.regex_block,
+        Kind::BlockImportant => &mut parts.regex_block_important,
+        Kind::Allow => &mut parts.regex_allow,
+        Kind::AllowImportant => &mut parts.regex_allow_important,
+        Kind::Refuse => &mut parts.regex_refuse,
+        Kind::Nodata => &mut parts.regex_nodata,
+        Kind::NoResponse => &mut parts.regex_no_response,
+    }
+}
+
+fn domain_set(parts: &mut EngineParts, slot: Slot) -> &mut DomainSet {
+    match slot {
+        Slot::Plain(kind) => plain_set(parts, kind),
+        Slot::Typed(t) => {
+            let idx = match parts.typed_block.iter().position(|(rt, _)| *rt == t) {
+                Some(idx) => idx,
+                None => {
+                    parts.typed_block.push((t, DomainSet::default()));
+                    parts.typed_block.len() - 1
+                }
+            };
+            &mut parts.typed_block[idx].1
+        }
+        Slot::TypedExcept(excluded) => {
+            let sets = &mut parts.typed_block_except;
+            let idx = match sets.iter().position(|(e, _)| *e == excluded) {
+                Some(idx) => idx,
+                None => {
+                    sets.push((excluded, DomainSet::default()));
+                    sets.len() - 1
+                }
+            };
+            &mut sets[idx].1
         }
     }
 }
 
-fn typed_set(parts: &mut EngineParts, t: RecordType) -> &mut DomainSet {
-    if let Some(idx) = parts.typed_block.iter().position(|(rt, _)| *rt == t) {
-        &mut parts.typed_block[idx].1
-    } else {
-        let idx = parts.typed_block.len();
-        parts.typed_block.push((t, DomainSet::default()));
-        &mut parts.typed_block[idx].1
-    }
-}
-
-/// The set that applies to every type except those listed.
-fn typed_except_set<'a>(parts: &'a mut EngineParts, excluded: &[RecordType]) -> &'a mut DomainSet {
-    if let Some(idx) = parts
-        .typed_block_except
-        .iter()
-        .position(|(e, _)| e == excluded)
-    {
-        &mut parts.typed_block_except[idx].1
-    } else {
-        let idx = parts.typed_block_except.len();
-        parts
+/// Unlike `domain_set`, does not create a typed set that no rule has used.
+fn existing_domain_set<'a>(parts: &'a mut EngineParts, slot: &Slot) -> Option<&'a mut DomainSet> {
+    match slot {
+        Slot::Plain(kind) => Some(plain_set(parts, *kind)),
+        Slot::Typed(t) => parts
+            .typed_block
+            .iter_mut()
+            .find(|(rt, _)| rt == t)
+            .map(|(_, set)| set),
+        Slot::TypedExcept(excluded) => parts
             .typed_block_except
-            .push((excluded.to_vec(), DomainSet::default()));
-        &mut parts.typed_block_except[idx].1
+            .iter_mut()
+            .find(|(e, _)| e == excluded)
+            .map(|(_, set)| set),
     }
 }
 
-/// The value can give an address, a name, or a response code.
-fn apply_dnsrewrite(dom: &str, value: &str, parts: &mut EngineParts, src: u32) -> bool {
-    let segs: Vec<&str> = value.split(';').collect();
-    let val = if segs.len() == 3 { segs[2] } else { segs[0] };
-    let upper = val.trim().to_ascii_uppercase();
-
-    match upper.as_str() {
-        "NXDOMAIN" => {
-            parts.block.add_suffix_src(dom, src);
-            return true;
+fn place(parts: &mut EngineParts, placement: Placement, src: u32) {
+    match placement {
+        Placement::Domain {
+            slot,
+            domain,
+            exact,
+        } => {
+            let set = domain_set(parts, slot);
+            if exact {
+                set.add_exact_src(&domain, src);
+            } else {
+                set.add_suffix_src(&domain, src);
+            }
         }
-        "REFUSED" => {
-            parts.refuse.add_suffix_src(dom, src);
-            return true;
+        Placement::Rewrite {
+            domain,
+            exact,
+            target,
+        } => {
+            if exact {
+                parts.rewrites.add_exact(&domain, target);
+            } else {
+                parts.rewrites.add_suffix(&domain, target);
+            }
         }
-        "" | "NODATA" | "NOERROR" => {
-            parts.nodata.add_suffix_src(dom, src);
-            return true;
+        Placement::Regex { slot, pattern } => match slot {
+            Slot::Plain(kind) => regex_list(parts, kind).push(pattern),
+            Slot::Typed(t) => parts.regex_typed_block.push((t, pattern)),
+            Slot::TypedExcept(excluded) => parts.regex_typed_block_except.push((excluded, pattern)),
+        },
+        Placement::RegexRewrite { pattern, target } => {
+            parts.regex_rewrites.push((pattern, target));
         }
-        "NORESPONSE" => {
-            parts.no_response.add_suffix_src(dom, src);
-            return true;
-        }
-        _ => {}
+        Placement::Client(rule) => parts.client_rules.push(rule),
     }
-
-    if let Ok(ip) = val.parse::<IpAddr>() {
-        parts.rewrites.add_suffix(dom, RewriteTarget::ip(ip));
-        return true;
-    }
-    if looks_like_domain(val) {
-        if let Ok(name) = Name::from_str(val) {
-            parts.rewrites.add_suffix(dom, RewriteTarget::Cname(name));
-            return true;
-        }
-    }
-    false
 }
 
-fn apply_regex_dnsrewrite(pat: &str, value: &str, parts: &mut EngineParts) -> bool {
-    let segs: Vec<&str> = value.split(';').collect();
-    let val = if segs.len() == 3 { segs[2] } else { segs[0] };
-    let upper = val.trim().to_ascii_uppercase();
-
-    match upper.as_str() {
-        "NXDOMAIN" => {
-            parts.regex_block.push(pat.to_string());
-            return true;
+fn cancel(parts: &mut EngineParts, placement: &Placement) {
+    match placement {
+        Placement::Domain {
+            slot,
+            domain,
+            exact,
+        } => {
+            if let Some(set) = existing_domain_set(parts, slot) {
+                if *exact {
+                    set.remove_exact(domain);
+                } else {
+                    set.remove_suffix(domain);
+                }
+            }
         }
-        "REFUSED" => {
-            parts.regex_refuse.push(pat.to_string());
-            return true;
-        }
-        "" | "NODATA" | "NOERROR" => {
-            parts.regex_nodata.push(pat.to_string());
-            return true;
-        }
-        "NORESPONSE" => {
-            parts.regex_no_response.push(pat.to_string());
-            return true;
-        }
-        _ => {}
-    }
-
-    if let Ok(ip) = val.parse::<IpAddr>() {
-        parts
+        Placement::Rewrite {
+            domain,
+            exact,
+            target,
+        } => parts.rewrites.remove(domain, *exact, target),
+        Placement::Regex { slot, pattern } => match slot {
+            Slot::Plain(kind) => regex_list(parts, *kind).retain(|p| p != pattern),
+            Slot::Typed(t) => parts
+                .regex_typed_block
+                .retain(|(rt, p)| !(rt == t && p == pattern)),
+            Slot::TypedExcept(excluded) => parts
+                .regex_typed_block_except
+                .retain(|(e, p)| !(e == excluded && p == pattern)),
+        },
+        Placement::RegexRewrite { pattern, target } => parts
             .regex_rewrites
-            .push((pat.to_string(), RewriteTarget::ip(ip)));
-        return true;
+            .retain(|(p, t)| !(p == pattern && t == target)),
+        Placement::Client(rule) => parts.client_rules.retain(|r| r != rule),
+    }
+}
+
+/// What a `$dnsrewrite` value asks for.
+enum DnsRewrite {
+    /// A response code, answered from the matching set.
+    Code(Kind),
+    /// An address or a name.
+    Target(RewriteTarget),
+}
+
+fn parse_dnsrewrite(value: &str) -> Option<DnsRewrite> {
+    let segs: Vec<&str> = value.split(';').collect();
+    let val = if segs.len() == 3 { segs[2] } else { segs[0] };
+    let upper = val.trim().to_ascii_uppercase();
+
+    let kind = match upper.as_str() {
+        "NXDOMAIN" => Some(Kind::Block),
+        "REFUSED" => Some(Kind::Refuse),
+        "" | "NODATA" | "NOERROR" => Some(Kind::Nodata),
+        "NORESPONSE" => Some(Kind::NoResponse),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        return Some(DnsRewrite::Code(kind));
+    }
+
+    if let Ok(ip) = val.parse::<IpAddr>() {
+        return Some(DnsRewrite::Target(RewriteTarget::ip(ip)));
     }
     if looks_like_domain(val) {
         if let Ok(name) = Name::from_str(val) {
-            parts
-                .regex_rewrites
-                .push((pat.to_string(), RewriteTarget::Cname(name)));
-            return true;
+            return Some(DnsRewrite::Target(RewriteTarget::Cname(name)));
         }
     }
-    false
+    None
 }
 
 fn extract_domain(pattern: &str) -> Option<String> {
@@ -680,40 +831,10 @@ fn is_unspecified_or_loopback(ip: &IpAddr) -> bool {
     ip.is_unspecified() || ip.is_loopback()
 }
 
-/// Runs after every rule has been read.
+/// Runs after every rule has been read, so a `$badfilter` rule cancels its rule wherever it is.
 fn apply_badfilter(acc: &mut Accum) {
-    for d in &acc.badfilter {
-        acc.parts.block.remove(d);
-        acc.parts.block_important.remove(d);
-        acc.parts.allow.remove(d);
-        acc.parts.allow_important.remove(d);
-        acc.parts.refuse.remove(d);
-        acc.parts.nodata.remove(d);
-        acc.parts.no_response.remove(d);
-        for (_, s) in &mut acc.parts.typed_block {
-            s.remove(d);
-        }
-        for (_, s) in &mut acc.parts.typed_block_except {
-            s.remove(d);
-        }
-    }
-
-    for p in &acc.badfilter_regex {
-        let parts = &mut acc.parts;
-        for list in [
-            &mut parts.regex_block,
-            &mut parts.regex_allow,
-            &mut parts.regex_block_important,
-            &mut parts.regex_allow_important,
-            &mut parts.regex_refuse,
-            &mut parts.regex_nodata,
-            &mut parts.regex_no_response,
-        ] {
-            list.retain(|x| x != p);
-        }
-        parts.regex_rewrites.retain(|(x, _)| x != p);
-        parts.regex_typed_block.retain(|(_, x)| x != p);
-        parts.regex_typed_block_except.retain(|(_, x)| x != p);
+    for placement in std::mem::take(&mut acc.cancels) {
+        cancel(&mut acc.parts, &placement);
     }
 }
 
@@ -1301,6 +1422,55 @@ analytics.bad
     }
 
     #[test]
+    /// A badfilter rule names one rule by its text; removing every rule for the name took out
+    /// important, typed, and allow rules that the list author meant to keep.
+    fn badfilter_cancels_only_the_rule_written_the_same_way() {
+        let rules = "\
+||imp.example^$important
+||imp.example^$badfilter
+||typed.example^$dnstype=AAAA
+||typed.example^$badfilter
+||gone-typed.example^$dnstype=AAAA
+||gone-typed.example^$dnstype=AAAA,badfilter
+/^re\\./$important
+/^re\\./$badfilter
+||both.example^
+@@||both.example^
+@@||both.example^$badfilter
+||cl.example^$client=10.0.0.0/8
+||cl.example^$client=10.0.0.0/8,badfilter
+||only-bad.example^$dnsrewrite=192.0.2.1,badfilter
+";
+        let eng = build_from_str(rules, "", BlockResponse::NxDomain);
+        let ask = |name: &str, qtype: RecordType, source: &str| {
+            let client = ClientInfo {
+                source_ip: source.parse().unwrap(),
+                client_id: None,
+                transport: Transport::Do53Udp,
+                authenticated: false,
+            };
+            eng.verdict(&Name::from_str(name).unwrap(), qtype, &client)
+        };
+        let local = "127.0.0.1";
+        let blocked = |v: FilterVerdict| matches!(v, FilterVerdict::Block(_));
+        let allowed = |v: FilterVerdict| matches!(v, FilterVerdict::Allow);
+
+        assert!(blocked(ask("imp.example.", RecordType::A, local)));
+        assert!(blocked(ask("typed.example.", RecordType::AAAA, local)));
+        assert!(allowed(ask("gone-typed.example.", RecordType::AAAA, local)));
+        assert!(blocked(ask("re.example.", RecordType::A, local)));
+        assert!(
+            blocked(ask("both.example.", RecordType::A, local)),
+            "the allow rule was cancelled, so the block rule applies"
+        );
+        assert!(allowed(ask("cl.example.", RecordType::A, "10.1.2.3")));
+        assert!(
+            allowed(ask("only-bad.example.", RecordType::A, local)),
+            "a badfilter rule must not add a rule of its own"
+        );
+    }
+
+    #[test]
     fn dnsrewrite_to_ip() {
         let eng = build_from_str(
             "||rw.example.com^$dnsrewrite=1.2.3.4\n",
@@ -1640,7 +1810,7 @@ analytics.bad
 ||quiet.example^$dnsrewrite=NORESPONSE
 /^scan[0-9]+\\.example$/$dnsrewrite=noresponse
 ||gone.example^$dnsrewrite=NORESPONSE
-||gone.example^$badfilter
+||gone.example^$dnsrewrite=NORESPONSE,badfilter
 ";
         let eng = build_from_str(rules, "", BlockResponse::NxDomain);
         for name in ["quiet.example.", "www.quiet.example.", "scan42.example."] {

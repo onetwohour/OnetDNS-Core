@@ -344,7 +344,8 @@ struct CompiledFilterInputs<'a> {
 /// The compiled cache is reused only when this matches.
 fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
     let mut digest = Sha256::new();
-    fingerprint_bytes(&mut digest, b"format", b"onetdns-compiled-filter-input-v1");
+    // Bump when rule parsing changes meaning, so caches built by the old parser are rebuilt.
+    fingerprint_bytes(&mut digest, b"format", b"onetdns-compiled-filter-input-v2");
     fingerprint_files(&mut digest, b"blocklists", input.blocklists);
     fingerprint_files(&mut digest, b"allowlists", input.allowlists);
     fingerprint_strings(&mut digest, b"service-rules", input.service_rules.iter());
