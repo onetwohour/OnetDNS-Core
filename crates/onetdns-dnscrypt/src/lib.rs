@@ -2,6 +2,7 @@
 //! to learn the resolver key, then seals queries with XChaCha20-Poly1305 under an X25519 shared
 //! key. The signing key is the long-term trust anchor, and the resolver key is derived from it.
 
+pub mod client;
 pub mod server;
 
 use std::sync::{Arc, Mutex};

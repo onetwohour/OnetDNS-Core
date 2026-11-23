@@ -6,6 +6,7 @@ pub mod mode;
 /// Per-key UI metadata the dashboard builds its settings screens from.
 pub mod schema;
 pub mod settings;
+pub mod stamp;
 pub mod toml;
 
 pub use mode::Mode;

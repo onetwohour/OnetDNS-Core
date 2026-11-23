@@ -42,7 +42,7 @@ Plain DNS server addresses used for UDP or TCP forwarding.
 upstream_urls = ["h3://1.1.1.1/dns-query#cloudflare-dns.com"]
 ```
 
-Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, and DoH3 with h3://.
+Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, and DoH3 with h3://; a DNSCrypt server is given by its sdns:// stamp.
 
 **Note:** If `upstreams` is specified and `upstream_urls` is omitted, the implicit encrypted defaults are cleared.
 

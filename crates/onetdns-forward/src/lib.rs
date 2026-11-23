@@ -9,6 +9,7 @@
 /// first. On a multihomed host with query_source set, TCP leaving by another route lets a firewall
 /// pass UDP queries while blocking TCP retries after TC and encrypted upstreams.
 mod bound_tcp;
+mod dnscrypt;
 mod doh;
 mod doh3;
 mod doq;
@@ -398,13 +399,30 @@ pub enum Transport {
 
     Tcp,
 
-    Dot { server_name: String },
+    Dot {
+        server_name: String,
+    },
 
-    Doh { server_name: String, path: String },
+    Doh {
+        server_name: String,
+        path: String,
+    },
 
-    Doq { server_name: String },
+    Doq {
+        server_name: String,
+    },
 
-    Doh3 { server_name: String, path: String },
+    Doh3 {
+        server_name: String,
+        path: String,
+    },
+
+    /// Certificates are fetched as TXT records of `provider_name` and must be signed by
+    /// `public_key`.
+    Dnscrypt {
+        provider_name: String,
+        public_key: [u8; 32],
+    },
 }
 
 /// Where an upstream's connections go.
@@ -530,6 +548,21 @@ impl Upstream {
             Transport::Doh { server_name, path } => format!("https://{server_name}{path}"),
             Transport::Doq { server_name } => format!("quic://{server_name}"),
             Transport::Doh3 { server_name, path } => format!("h3://{server_name}{path}"),
+            Transport::Dnscrypt { provider_name, .. } => format!("dnscrypt://{provider_name}"),
+        }
+    }
+
+    pub fn dnscrypt(
+        addr: SocketAddr,
+        provider_name: impl Into<String>,
+        public_key: [u8; 32],
+    ) -> Self {
+        Upstream {
+            endpoint: Endpoint::Direct(addr),
+            transport: Transport::Dnscrypt {
+                provider_name: provider_name.into(),
+                public_key,
+            },
         }
     }
 
@@ -1653,6 +1686,23 @@ fn exchange_one(
         (Transport::Doh3 { server_name, path }, Endpoint::Direct(addr)) => {
             doh3::exchange(*addr, server_name, path, wire, request, timeout, trust)
         }
+        (
+            Transport::Dnscrypt {
+                provider_name,
+                public_key,
+            },
+            Endpoint::Direct(addr),
+        ) => dnscrypt::exchange(
+            dnscrypt::Server {
+                addr: *addr,
+                provider_name,
+                public_key,
+            },
+            wire,
+            wire_id,
+            request,
+            timeout,
+        ),
         // Sending these directly would go around the proxy the operator chose.
         (_, Endpoint::Socks5 { .. }) => Err(ForwardError::Io(
             "Only DoT and DoH upstreams can go through a SOCKS5 proxy".into(),
@@ -2363,8 +2413,9 @@ pub(crate) fn note_upstream_connect_failure(
     error: &impl std::fmt::Display,
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /// Per transport: dot, doh, doq, doh3.
-    static COUNTS: [AtomicU64; 4] = [
+    /// Per transport: dot, doh, doq, doh3, dnscrypt.
+    static COUNTS: [AtomicU64; 5] = [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -2374,6 +2425,7 @@ pub(crate) fn note_upstream_connect_failure(
         "dot" => 0,
         "doh" => 1,
         "doq" => 2,
+        "dnscrypt" => 4,
         _ => 3,
     };
     let count = COUNTS[slot].fetch_add(1, Ordering::Relaxed) + 1;

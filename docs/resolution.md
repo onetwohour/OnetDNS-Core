@@ -24,6 +24,14 @@ upstream_urls = [
 
 `upstream_urls` accepts supported URL-based upstream endpoints, including encrypted transports. `upstreams` accepts IP-based DNS upstreams. The `#cloudflare-dns.com` part in these examples gives the TLS verification name when addressing a server by IP; changing it can break certificate validation. `bootstrap` is separate from the DNS server you query: it is relevant to resolving names needed to contact upstreams.
 
+A DNSCrypt server is given by its `sdns://` stamp, in `upstream_urls`, `fallback_upstreams`, a client's `upstreams` or a stub zone's `servers`:
+
+```toml
+upstream_urls = ["sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20"]
+```
+
+The stamp carries the server's IP address, its provider name and the key that signs its certificates, so it needs no `bootstrap`. OnetDNS fetches the certificate from the server itself and uses it only if the stamp's key signed it and it is within its validity period; it fetches it again about once an hour. A UDP answer that comes back truncated is asked again over TCP, so the server must accept DNSCrypt over TCP on the same port. Only DNSCrypt server stamps are accepted; write DoH, DoT and DoQ servers as URLs.
+
 Upstream selection is controlled by `upstream_strategy` (such as query statistics, order, round-robin or parallel) and related concurrency/timeout options. These choices can affect both tail latency and total outbound traffic. Test them with repeated queries and a mix of cache hits/misses; do not assume sending more upstream requests always improves latency.
 
 ### Forwarding through a SOCKS5 proxy

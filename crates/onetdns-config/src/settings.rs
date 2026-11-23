@@ -3185,6 +3185,9 @@ fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
     if allow_plain_ip && (raw.parse::<IpAddr>().is_ok() || raw.parse::<SocketAddr>().is_ok()) {
         return true;
     }
+    if raw.starts_with("sdns://") {
+        return crate::stamp::dnscrypt_server(raw).is_some();
+    }
 
     let Some((scheme, rest)) = raw.split_once("://") else {
         return false;
@@ -3311,6 +3314,9 @@ fn numeric_upstream_endpoint(raw: &str) -> Option<SocketAddr> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
+    }
+    if raw.starts_with("sdns://") {
+        return crate::stamp::dnscrypt_server(raw).map(|stamp| stamp.addr);
     }
     let (scheme, rest) = raw
         .split_once("://")
@@ -3872,7 +3878,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "fallback_upstreams",
                 i,
                 v,
-                "an IP or udp|tcp|tls|https|quic|h3://host[:port]",
+                "an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp",
             ));
         }
     }
@@ -3891,7 +3897,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
                 "upstream_urls",
                 i,
                 v,
-                "udp|tcp|tls|https|quic|h3://host[:port]",
+                "udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp",
             ));
         }
     }
@@ -3998,7 +4004,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 };
                 if !valid_upstream_spec(raw, true) {
                     return Err(ConfigError::Invalid(format!(
-                        "clients[{index}].upstreams[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port]"
+                        "clients[{index}].upstreams[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp"
                     )));
                 }
             }
@@ -4143,7 +4149,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
             })?;
             if !valid_upstream_spec(raw, true) {
                 return Err(ConfigError::Invalid(format!(
-                    "stub_zones[{index}].servers[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port]"
+                    "stub_zones[{index}].servers[{item}]: expected an IP or udp|tcp|tls|https|quic|h3://host[:port] or an sdns:// DNSCrypt stamp"
                 )));
             }
         }
@@ -4618,7 +4624,7 @@ fn valid_acme_directory_url(url: &str) -> bool {
 }
 
 /// Accepts one trailing dot; labels up to 63 octets, the whole name up to 255.
-fn valid_dns_name(raw: &str) -> bool {
+pub(crate) fn valid_dns_name(raw: &str) -> bool {
     let trimmed = raw.strip_suffix('.').unwrap_or(raw);
     if trimmed.is_empty() || trimmed.len() > 253 {
         return false;
@@ -7358,6 +7364,31 @@ tftp_writable = true
             let text = format!("upstream_urls = [\"{removed_alias}://192.0.2.1\"]\n");
             assert!(Config::from_toml_str(&text).is_err(), "{removed_alias}");
         }
+    }
+
+    const ADGUARD_DNSCRYPT: &str = "sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20";
+
+    #[test]
+    /// Every place that takes an upstream takes a DNSCrypt stamp; a damaged one or a stamp of
+    /// another kind is refused when the config is read.
+    fn dnscrypt_stamps_are_upstreams() {
+        for key in ["upstream_urls", "fallback_upstreams"] {
+            let text = format!("{key} = [\"{ADGUARD_DNSCRYPT}\"]\n");
+            assert!(Config::from_toml_str(&text).is_ok(), "{key}");
+            let damaged = &ADGUARD_DNSCRYPT[..ADGUARD_DNSCRYPT.len() - 3];
+            let text = format!("{key} = [\"{damaged}\"]\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{key}");
+            let doh = "sdns://AgcAAAAAAAAABzEuMC4wLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5";
+            let text = format!("{key} = [\"{doh}\"]\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{key}");
+        }
+        let looped = format!(
+            "listen_dnscrypt = [\"94.140.14.14:5443\"]\nupstream_urls = [\"{ADGUARD_DNSCRYPT}\"]\n"
+        );
+        let refused = Config::from_toml_str(&looped)
+            .expect_err("자기 DNSCrypt 수신 주소를 가리키는 스탬프를 받았습니다")
+            .to_string();
+        assert!(refused.contains("query loop"), "{refused}");
     }
 
     #[test]

@@ -125,6 +125,9 @@ pub fn servers_to_upstreams(servers: &[String], route: &UpstreamRoute) -> Vec<Up
 
 /// Hostnames need bootstrap servers.
 pub fn url_uses_hostname(url: &str) -> bool {
+    if url.trim().starts_with("sdns://") {
+        return false;
+    }
     let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url);
     let rest = rest.split_once('#').map(|(r, _)| r).unwrap_or(rest);
     let hostport = rest.split_once('/').map(|(hp, _)| hp).unwrap_or(rest);
@@ -150,6 +153,17 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
     let url = url.trim();
     if url.is_empty() || url.chars().any(char::is_control) {
         return None;
+    }
+    if url.starts_with("sdns://") {
+        if matches!(route, UpstreamRoute::Socks5(_)) {
+            return None;
+        }
+        let stamp = onetdns_config::stamp::dnscrypt_server(url)?;
+        return Some(Upstream::dnscrypt(
+            stamp.addr,
+            stamp.provider_name,
+            stamp.public_key,
+        ));
     }
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (s.to_ascii_lowercase(), r),
@@ -459,6 +473,35 @@ mod tests {
         assert_eq!(
             ups[1].endpoint,
             Endpoint::Direct("9.9.9.9:853".parse().unwrap())
+        );
+    }
+
+    #[test]
+    /// A stamp carries its own address, so it needs no bootstrap servers.
+    fn a_dnscrypt_stamp_is_an_upstream_without_bootstrap() {
+        let stamp = "sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20";
+        assert!(!url_uses_hostname(stamp));
+        let up = parse_native_upstream(stamp, &DIRECT).unwrap();
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("94.140.14.14:5443".parse().unwrap())
+        );
+        assert!(matches!(
+            &up.transport,
+            Transport::Dnscrypt { provider_name, .. }
+                if provider_name == "2.dnscrypt.default.ns1.adguard.com"
+        ));
+        assert_eq!(
+            servers_to_upstreams(&[stamp.to_string()], &DIRECT),
+            vec![up]
+        );
+        assert!(parse_native_upstream(&stamp[..stamp.len() - 2], &DIRECT).is_none());
+        let proxy = UpstreamRoute::Socks5(Arc::new(Socks5Proxy::new(
+            "127.0.0.1:9050".parse().unwrap(),
+        )));
+        assert!(
+            parse_native_upstream(stamp, &proxy).is_none(),
+            "DNSCrypt 는 UDP 라 프록시를 거치지 못합니다"
         );
     }
 

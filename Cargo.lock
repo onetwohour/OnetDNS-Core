@@ -1009,6 +1009,7 @@ version = "0.1.4"
 dependencies = [
  "libc",
  "onetdns-core",
+ "onetdns-dnscrypt",
  "onetdns-http2",
  "onetdns-proto",
  "onetdns-quic",
