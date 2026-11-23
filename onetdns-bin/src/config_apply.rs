@@ -707,6 +707,9 @@ mod tests {
             ("zones_etcd_password", |c: &mut Config| {
                 c.zones_etcd_password = Some("etcd-pass".into())
             }),
+            ("upstream_proxy_password", |c: &mut Config| {
+                c.upstream_proxy_password = Some("proxy-pass".into())
+            }),
         ] {
             let mut desired = applied.clone();
             mutate(&mut desired);

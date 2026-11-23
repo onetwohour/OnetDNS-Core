@@ -399,6 +399,7 @@ pub(crate) fn validate_config_patch_values(
         "zones_etcd_password",
         "cachedb_redis_secret",
         "cachedb_redis_password",
+        "upstream_proxy_password",
     ];
     /// Shown redacted because they embed passwords.
     const REDACTED_URLS: &[&str] = &["zones_postgres", "zones_mysql"];

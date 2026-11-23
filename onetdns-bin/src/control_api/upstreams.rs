@@ -6,7 +6,7 @@ use crate::native_config::stable_resource_id;
 
 impl ControlDeps {
     pub(super) fn upstream_test(&self, body: &str) -> Result<String, String> {
-        let bootstrap = self.runtime_cfg.load().bootstrap.clone();
+        let route = upstream::UpstreamRoute::forwarding(&self.runtime_cfg.load());
         let j = onetdns_core::json::parse(body)
             .map_err(|_| "Could not parse the JSON request body".to_string())?;
         let addr_s = j
@@ -16,17 +16,22 @@ impl ControlDeps {
             .trim()
             .to_string();
         let mut candidates = if addr_s.contains("://") {
-            upstream::native_upstreams(&[], &[addr_s.clone()], &bootstrap)
+            upstream::native_upstreams(&[], &[addr_s.clone()], &route)
         } else {
             let ip: std::net::IpAddr = addr_s
                 .parse()
                 .map_err(|_| format!("Invalid IP address: {addr_s}"))?;
-            vec![onetdns_forward::Upstream::udp(std::net::SocketAddr::new(
-                ip, 53,
-            ))]
+            upstream::native_upstreams(&[ip], &[], &route)
         };
         let Some(up) = candidates.pop() else {
-            return Err(format!("Invalid upstream DNS server address: {addr_s}"));
+            return Err(match route {
+                upstream::UpstreamRoute::Direct { .. } => {
+                    format!("Invalid upstream DNS server address: {addr_s}")
+                }
+                upstream::UpstreamRoute::Socks5(_) => format!(
+                    "Invalid upstream DNS server address, or one that cannot go through `upstream_proxy`, which carries only tls:// and https://: {addr_s}"
+                ),
+            });
         };
         let fwd = onetdns_forward::Forwarder::with_upstreams(vec![up], Duration::from_secs(3));
         let probe = onetdns_proto::Message::query(

@@ -126,9 +126,9 @@ fn clients_swappable(previous: &Config, next: &Config) -> bool {
     routes(previous) == routes(next) && (uses_mac(previous) || !uses_mac(next))
 }
 
-/// Client route forwarders copy the query timeout and upstream strategy at generation start and
-/// are not swapped; the default forwarder, the recursive resolver, stubs and fallback upstreams
-/// are rebuilt with the new values.
+/// Client route forwarders copy the query timeout, upstream strategy and upstream proxy at
+/// generation start and are not swapped; the default forwarder, the recursive resolver, stubs and
+/// fallback upstreams are rebuilt with the new values.
 fn without_client_routes(previous: &Config, next: &Config) -> bool {
     !has_client_routes(previous) && !has_client_routes(next)
 }
@@ -576,6 +576,24 @@ static KEYS: &[KeySpec] = &[
     ),
     key!(query_source, Hot(QuerySource), Node, Lanes::OPEN),
     key!(query_source_v6, Hot(QuerySource), Node, Lanes::OPEN),
+    key!(
+        upstream_proxy,
+        HotWhile(Forward, without_client_routes),
+        Node,
+        Lanes::OPEN,
+    ),
+    key!(
+        upstream_proxy_username,
+        HotWhile(Forward, without_client_routes),
+        Node,
+        Lanes::OPEN,
+    ),
+    key!(
+        upstream_proxy_password,
+        HotWhile(Forward, without_client_routes),
+        Node,
+        Lanes::OPEN,
+    ),
     key!(
         stub_zones,
         Hot(Chain),

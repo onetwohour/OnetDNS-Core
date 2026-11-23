@@ -673,6 +673,13 @@ pub struct Config {
 
     pub query_source_v6: Option<Ipv6Addr>,
 
+    /// SOCKS5 proxy that forwarding upstreams are reached through.
+    pub upstream_proxy: Option<SocketAddr>,
+
+    pub upstream_proxy_username: Option<String>,
+
+    pub upstream_proxy_password: Option<SecretString>,
+
     pub stub_zones: Vec<StubZone>,
 
     pub zones: Vec<ZoneConfig>,
@@ -1064,6 +1071,9 @@ impl Default for Config {
             upstream_concurrency: 0,
             query_source: None,
             query_source_v6: None,
+            upstream_proxy: None,
+            upstream_proxy_username: None,
+            upstream_proxy_password: None,
             stub_zones: vec![],
             zones: vec![],
             secondary: vec![],
@@ -1433,6 +1443,82 @@ impl Config {
         Ok(())
     }
 
+    /// A forwarding upstream the proxy cannot carry is refused rather than sent around it, since
+    /// the proxy is there to hide where queries go.
+    fn check_upstream_proxy(&self, soft: &mut Vec<String>) -> Result<(), ConfigError> {
+        let invalid = |message: String| Err(ConfigError::Invalid(message));
+        let username = self.upstream_proxy_username.as_deref();
+        let password = self.upstream_proxy_password.as_deref();
+        if username.is_some() != password.is_some() {
+            return invalid(
+                "Set `upstream_proxy_username` and `upstream_proxy_password` together".into(),
+            );
+        }
+        for (key, value) in [
+            ("upstream_proxy_username", username),
+            ("upstream_proxy_password", password),
+        ] {
+            if value.is_some_and(|value| !(1..=255).contains(&value.len())) {
+                return invalid(format!(
+                    "`{key}` must be 1 to 255 bytes, the most SOCKS5 can carry"
+                ));
+            }
+        }
+        if self.upstream_proxy.is_none() {
+            if username.is_some() {
+                soft.push("`upstream_proxy_username` and `upstream_proxy_password` are used only with `upstream_proxy`, which is not set".into());
+            }
+            return Ok(());
+        }
+        if self.backend == BackendKind::Recurse {
+            return invalid("`upstream_proxy` carries forwarded queries, but `backend = \"recurse\"` does not forward, so queries would leave without the proxy; remove `upstream_proxy` or use the forward backend".into());
+        }
+        if !self.upstreams.is_empty() {
+            return invalid("`upstream_proxy` carries only tls:// and https:// upstreams, and `upstreams` lists plain DNS servers, which would bypass the proxy; list the servers in `upstream_urls` as tls:// or https://".into());
+        }
+        let urls = self
+            .upstream_urls
+            .iter()
+            .map(|url| ("upstream_urls".to_string(), url))
+            .chain(
+                self.fallback_upstreams
+                    .iter()
+                    .map(|url| ("fallback_upstreams".to_string(), url)),
+            )
+            .chain(self.clients.iter().flat_map(|client| {
+                client
+                    .upstreams
+                    .iter()
+                    .map(|url| (format!("upstreams of client '{}'", client.name), url))
+            }));
+        for (label, url) in urls {
+            let scheme = url
+                .trim()
+                .split_once("://")
+                .map(|(scheme, _)| scheme.to_ascii_lowercase());
+            match scheme.as_deref() {
+                Some("tls" | "https") => {}
+                Some("quic" | "h3") => {
+                    return invalid(format!(
+                        "{label} has {url}, but QUIC cannot go through `upstream_proxy`: SOCKS5 carries only TCP, and proxying QUIC over HTTP/3 (CONNECT-UDP) is not supported; use tls:// or https://"
+                    ));
+                }
+                _ => {
+                    return invalid(format!(
+                        "{label} has {url}, which is plain DNS and cannot go through `upstream_proxy`; use tls:// or https://"
+                    ));
+                }
+            }
+        }
+        if self.backend == BackendKind::Split {
+            soft.push("With `backend = \"split\"`, names resolved by recursion are looked up directly from this server, not through `upstream_proxy`".into());
+        }
+        if self.tls_revocation != "off" {
+            soft.push("Certificate revocation checks set by `tls_revocation` connect to OCSP and CRL servers directly, not through `upstream_proxy`, which shows those servers which upstream certificates this server checks".into());
+        }
+        Ok(())
+    }
+
     /// Checked even with the service off, so turning it on cannot keep the server from starting.
     /// Subnet and range checks that combine values are left to service startup.
     fn check_edge_service_values(&self) -> Result<(), ConfigError> {
@@ -1626,6 +1712,7 @@ impl Config {
         self.check_edge_service_values()?;
         self.check_protocol_values()?;
         self.check_authority_values()?;
+        self.check_upstream_proxy(soft)?;
         if !(1..=3_600).contains(&self.query_timeout_secs) {
             return Err(ConfigError::Invalid(
                 "Set `query_timeout_secs` between 1 and 3,600 seconds".into(),
@@ -2606,6 +2693,18 @@ impl Config {
             "query_source_v6",
             opt_s(&self.query_source_v6.map(|a| a.to_string())),
         );
+        kv(
+            "upstream_proxy",
+            opt_s(&self.upstream_proxy.map(|a| format!("socks5://{a}"))),
+        );
+        kv(
+            "upstream_proxy_username",
+            opt_s(&self.upstream_proxy_username),
+        );
+        kv(
+            "upstream_proxy_password_set",
+            self.upstream_proxy_password.is_some().to_string(),
+        );
 
         kv("blocklists", parr(&self.blocklists));
         kv("allowlists", parr(&self.allowlists));
@@ -3043,6 +3142,25 @@ fn upstream_url_is_encrypted(url: &str) -> bool {
     })
 }
 
+/// `socks5://IP[:port]`, port 1080 when left out. Credentials in the URL are refused so they stay in
+/// the keys that are kept secret.
+fn parse_upstream_proxy(raw: &str) -> Option<SocketAddr> {
+    let (scheme, authority) = raw.trim().split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("socks5") {
+        return None;
+    }
+    let addr = authority.parse::<SocketAddr>().ok().or_else(|| {
+        let host = authority
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(authority);
+        host.parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 1080))
+    })?;
+    (addr.port() != 0).then_some(addr)
+}
+
 fn valid_upstream_spec(raw: &str, allow_plain_ip: bool) -> bool {
     let raw = raw.trim();
     if raw.is_empty() || raw.chars().any(char::is_control) {
@@ -3464,6 +3582,9 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "tls_key",
         "tls_revocation",
         "tls_self_signed_host",
+        "upstream_proxy",
+        "upstream_proxy_password",
+        "upstream_proxy_username",
         "upstream_strategy",
         "version",
         "wasm_fail_mode",
@@ -3576,6 +3697,11 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_optional_parse::<IpAddr>(root, "ecs_custom_ip", "IP address")?;
     check_optional_parse::<Ipv4Addr>(root, "query_source", "IPv4 address")?;
     check_optional_parse::<Ipv6Addr>(root, "query_source_v6", "IPv6 address")?;
+    if gstr(root, "upstream_proxy").is_some_and(|raw| parse_upstream_proxy(&raw).is_none()) {
+        return Err(ConfigError::Invalid(
+            "upstream_proxy: expected socks5://IP[:port], for example socks5://127.0.0.1:9050; the user name and password go in upstream_proxy_username and upstream_proxy_password".into(),
+        ));
+    }
 
     for key in [
         "recursion_limit",
@@ -5249,6 +5375,9 @@ const KNOWN_KEYS: &[&str] = &[
     "upstream_concurrency",
     "query_source",
     "query_source_v6",
+    "upstream_proxy",
+    "upstream_proxy_username",
+    "upstream_proxy_password",
     "stub_zones",
     "zones",
     "zones_dir",
@@ -5656,6 +5785,9 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.upstream_concurrency = gusize(root, "upstream_concurrency", d.upstream_concurrency);
     c.query_source = gstr(root, "query_source").and_then(|s| s.parse().ok());
     c.query_source_v6 = gstr(root, "query_source_v6").and_then(|s| s.parse().ok());
+    c.upstream_proxy = gstr(root, "upstream_proxy").and_then(|s| parse_upstream_proxy(&s));
+    c.upstream_proxy_username = gstr(root, "upstream_proxy_username");
+    c.upstream_proxy_password = gstr(root, "upstream_proxy_password").map(SecretString::from);
     c.stub_zones = garr(root, "stub_zones")
         .iter()
         .map(|t| StubZone {
@@ -6445,6 +6577,139 @@ answer = \"target.example\"
         assert!(!json.contains("redis-password-secret"), "비밀번호 마스킹");
         assert!(json.contains("\"cachedb_redis_secret_set\":true"));
         assert!(json.contains("\"cachedb_redis_password_set\":true"));
+    }
+
+    #[test]
+    fn upstream_proxy_is_parsed_and_its_password_kept_secret() {
+        let cfg = Config::from_toml_str(concat!(
+            "upstream_urls = [\"tls://dns.example#dns.example\", \"https://dns.example/dns-query\"]\n",
+            "upstream_proxy = \"SOCKS5://[::1]:9050\"\n",
+            "upstream_proxy_username = \"onet\"\n",
+            "upstream_proxy_password = \"proxy-password-secret\"\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.upstream_proxy, Some("[::1]:9050".parse().unwrap()));
+        assert_eq!(cfg.upstream_proxy_username.as_deref(), Some("onet"));
+        assert!(!format!("{cfg:?}").contains("proxy-password-secret"));
+        let json = cfg.effective_json();
+        assert!(!json.contains("proxy-password-secret"));
+        assert!(json.contains("\"upstream_proxy\":\"socks5://[::1]:9050\""));
+        assert!(json.contains("\"upstream_proxy_password_set\":true"));
+
+        let default_port = Config::from_toml_str(concat!(
+            "upstream_urls = [\"tls://192.0.2.1\"]\n",
+            "upstream_proxy = \"socks5://127.0.0.1\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            default_port.upstream_proxy,
+            Some("127.0.0.1:1080".parse().unwrap())
+        );
+
+        for proxy in [
+            "127.0.0.1:9050",
+            "socks4://127.0.0.1:9050",
+            "socks5h://127.0.0.1:9050",
+            "socks5://localhost:9050",
+            "socks5://user:pass@127.0.0.1:9050",
+            "socks5://127.0.0.1:0",
+            "socks5://127.0.0.1:9050/",
+        ] {
+            let toml =
+                format!("upstream_urls = [\"tls://192.0.2.1\"]\nupstream_proxy = \"{proxy}\"\n");
+            assert!(Config::from_toml_str(&toml).is_err(), "{proxy}");
+        }
+    }
+
+    #[test]
+    /// A query sent around the proxy would reveal what the proxy is there to hide.
+    fn upstream_proxy_refuses_upstreams_it_cannot_carry() {
+        let base = Config {
+            upstreams: vec![],
+            upstream_urls: vec!["tls://192.0.2.1#dns.example".into()],
+            upstream_proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            ..Config::default()
+        };
+        base.validate().unwrap();
+
+        let default_urls = Config {
+            upstream_proxy: base.upstream_proxy,
+            ..Config::default()
+        };
+        let error = default_urls.validate().unwrap_err().to_string();
+        assert!(error.contains("CONNECT-UDP"), "{error}");
+
+        let mut plain = base.clone();
+        plain.upstreams = vec!["192.0.2.53".parse().unwrap()];
+        assert!(plain.validate().is_err());
+
+        for url in ["udp://192.0.2.1", "tcp://192.0.2.1", "192.0.2.1"] {
+            let mut fallback = base.clone();
+            fallback.fallback_upstreams = vec![url.into()];
+            let error = fallback.validate().unwrap_err().to_string();
+            assert!(error.contains("plain DNS"), "{url}: {error}");
+        }
+
+        let mut client = base.clone();
+        client.clients = vec![ClientConfig {
+            name: "laptop".into(),
+            upstreams: vec!["quic://192.0.2.1".into()],
+            ..ClientConfig::default()
+        }];
+        let error = client.validate().unwrap_err().to_string();
+        assert!(error.contains("client 'laptop'"), "{error}");
+
+        let mut recurse = base.clone();
+        recurse.backend = BackendKind::Recurse;
+        assert!(recurse.validate().is_err());
+
+        let mut split = base.clone();
+        split.backend = BackendKind::Split;
+        assert!(split
+            .advisories()
+            .iter()
+            .any(|warning| warning.contains("upstream_proxy")));
+
+        let mut revocation = base.clone();
+        revocation.tls_revocation = "ocsp".into();
+        revocation.validate().unwrap();
+        assert!(revocation
+            .advisories()
+            .iter()
+            .any(|warning| warning.contains("tls_revocation")));
+        assert!(base.advisories().is_empty(), "{:?}", base.advisories());
+    }
+
+    #[test]
+    fn upstream_proxy_credentials_go_together_and_fit_socks5() {
+        let base = Config {
+            upstream_urls: vec!["https://192.0.2.1/dns-query".into()],
+            upstream_proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            upstream_proxy_username: Some("onet".into()),
+            upstream_proxy_password: Some("secret".into()),
+            ..Config::default()
+        };
+        base.validate().unwrap();
+
+        let mut username_only = base.clone();
+        username_only.upstream_proxy_password = None;
+        assert!(username_only.validate().is_err());
+
+        let mut long_password = base.clone();
+        long_password.upstream_proxy_password = Some("p".repeat(256).into());
+        assert!(long_password.validate().is_err());
+
+        let mut empty_username = base.clone();
+        empty_username.upstream_proxy_username = Some(String::new());
+        assert!(empty_username.validate().is_err());
+
+        let mut without_proxy = base.clone();
+        without_proxy.upstream_proxy = None;
+        without_proxy.validate().unwrap();
+        assert!(without_proxy
+            .advisories()
+            .iter()
+            .any(|warning| warning.contains("upstream_proxy_username")));
     }
 
     #[test]

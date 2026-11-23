@@ -1104,6 +1104,7 @@ mod tests {
             "cluster_raft_secret",
             "cachedb_redis_secret",
             "cachedb_redis_password",
+            "upstream_proxy_password",
             "control_token",
             "control_admin_tokens",
             "control_readonly_tokens",

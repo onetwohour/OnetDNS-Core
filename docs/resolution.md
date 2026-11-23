@@ -26,6 +26,22 @@ upstream_urls = [
 
 Upstream selection is controlled by `upstream_strategy` (such as query statistics, order, round-robin or parallel) and related concurrency/timeout options. These choices can affect both tail latency and total outbound traffic. Test them with repeated queries and a mix of cache hits/misses; do not assume sending more upstream requests always improves latency.
 
+### Forwarding through a SOCKS5 proxy
+
+To reach upstreams through a SOCKS5 proxy such as Tor, set `upstream_proxy` and list the upstreams as `tls://` or `https://`:
+
+```toml
+backend = "forward"
+upstream_proxy = "socks5://127.0.0.1:9050"
+upstream_urls = ["https://dns.quad9.net/dns-query"]
+```
+
+The host name is passed to the proxy as written, so the proxy resolves it and this server never looks it up; `bootstrap` is not needed. The certificate is still checked against the upstream's name, connections are still pooled, and a dropped connection is reopened through the proxy. If the proxy asks for a user name and password, set `upstream_proxy_username` and `upstream_proxy_password`. SOCKS5 sends them in plain text, so keep the proxy on this machine or a network you trust.
+
+SOCKS5 carries only TCP. A configuration with a proxy is refused if any forwarding upstream would have to bypass it: entries in `upstreams`, and `udp://`, `tcp://`, `quic://` or `h3://` entries in `upstream_urls`, `fallback_upstreams` or a client's `upstreams`. QUIC upstreams would need CONNECT-UDP over HTTP/3, which OnetDNS does not support. `backend = "recurse"` is refused with a proxy for the same reason.
+
+Some traffic still leaves directly even with a proxy set: stub zones, recursion (including the recursive part of `backend = "split"`), `bootstrap` lookups for stub zones, certificate revocation checks when `tls_revocation` is on, and blocklist and update downloads. A resumed TLS session lets the upstream link connections that use it, as it would without a proxy.
+
 ## Recursive resolution
 
 ```toml

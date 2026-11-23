@@ -137,6 +137,49 @@ query_source_v6 = "2001:db8::10"
 
 Local IPv6 address used for outgoing upstream DNS queries.
 
+### `upstream_proxy`
+
+**Type:** string  
+**Default:** not set
+
+**TOML:**
+
+```toml
+upstream_proxy = "socks5://127.0.0.1:9050"
+```
+
+Connects tls:// and https:// upstreams through this SOCKS5 proxy, such as Tor at socks5://127.0.0.1:9050. The proxy resolves upstream names. Once set, upstreams of any other kind are refused.
+
+**Note:** Give the proxy as `socks5://IP[:port]` with an IP address, not a host name; the port defaults to 1080. Credentials go in the two keys below, not in the URL. The setting covers `upstream_urls`, `fallback_upstreams`, and clients' `upstreams`; `upstreams` must be empty. QUIC upstreams (`quic://`, `h3://`) cannot use it, and neither can `backend = "recurse"`. Stub zones, recursion, and certificate revocation checks still connect directly. See [Forwarding through a SOCKS5 proxy](../resolution.md#forwarding-through-a-socks5-proxy).
+
+### `upstream_proxy_username`
+
+**Type:** string  
+**Default:** not set
+
+**TOML:**
+
+```toml
+upstream_proxy_username = "REPLACE_WITH_PROXY_USERNAME"
+```
+
+User name sent to the SOCKS5 proxy. Set it together with the password.
+
+### `upstream_proxy_password`
+
+**Type:** string  
+**Default:** not set
+
+**TOML:**
+
+```toml
+upstream_proxy_password = "REPLACE_WITH_PROXY_PASSWORD"
+```
+
+Password sent to the SOCKS5 proxy. SOCKS5 sends it in plain text, so keep the proxy on this machine or a trusted network.
+
+**Note:** The user name and the password are each 1 to 255 bytes. The password is never shown in the dashboard or returned by the management API, and it is not replicated to other cluster nodes.
+
 ## Recursive and split resolution
 
 ### `recursion_limit`

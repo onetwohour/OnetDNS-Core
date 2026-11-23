@@ -119,7 +119,7 @@ pub(crate) struct RecursivePlan {
 #[derive(Clone, Debug, PartialEq)]
 struct ForwarderPlan {
     servers: Vec<String>,
-    bootstrap: Vec<IpAddr>,
+    route: upstream::UpstreamRoute,
     listeners: Vec<SocketAddr>,
     query_timeout_secs: u64,
     upstream_strategy: UpstreamStrategy,
@@ -213,9 +213,9 @@ impl ChainPlan {
                 split_forward: cfg.split_forward.clone(),
             },
         };
-        let forwarder = |servers: &[String]| ForwarderPlan {
+        let forwarder = |servers: &[String], route: upstream::UpstreamRoute| ForwarderPlan {
             servers: servers.to_vec(),
-            bootstrap: cfg.bootstrap.clone(),
+            route,
             listeners: dns_listeners(cfg),
             query_timeout_secs: cfg.query_timeout_secs,
             upstream_strategy: cfg.upstream_strategy,
@@ -223,8 +223,12 @@ impl ChainPlan {
         };
         Self {
             base,
-            fallback: (!cfg.fallback_upstreams.is_empty())
-                .then(|| forwarder(&cfg.fallback_upstreams)),
+            fallback: (!cfg.fallback_upstreams.is_empty()).then(|| {
+                forwarder(
+                    &cfg.fallback_upstreams,
+                    upstream::UpstreamRoute::forwarding(cfg),
+                )
+            }),
             validation: cfg.dnssec_validation_active().then(|| ValidationPlan {
                 dnssec_strict: cfg.dnssec_strict,
                 val_permissive_mode: cfg.val_permissive_mode,
@@ -279,7 +283,12 @@ impl ChainPlan {
             stub_zones: cfg
                 .stub_zones
                 .iter()
-                .map(|zone| (zone.suffix.clone(), forwarder(&zone.servers)))
+                .map(|zone| {
+                    let direct = upstream::UpstreamRoute::Direct {
+                        bootstrap: cfg.bootstrap.clone(),
+                    };
+                    (zone.suffix.clone(), forwarder(&zone.servers, direct))
+                })
                 .collect(),
             dhcp_local_domain: cfg.dhcp_local_domain.clone(),
             ipset: ipset_layer_active(cfg).then(|| IpsetPlan {
@@ -336,6 +345,13 @@ impl ChainPlan {
                 "query_timeout_secs",
                 "upstream_strategy",
                 "upstream_concurrency",
+            ]);
+        }
+        if self.fallback.is_some() {
+            keys.extend([
+                "upstream_proxy",
+                "upstream_proxy_username",
+                "upstream_proxy_password",
             ]);
         }
         if self.cachedb.is_some() {
@@ -550,12 +566,17 @@ fn recursion_context(plan: &RecursivePlan) -> String {
 fn forwarder_context(plan: &ForwarderPlan) -> String {
     let ForwarderPlan {
         servers,
-        bootstrap,
+        route,
         listeners: _,
         query_timeout_secs: _,
         upstream_strategy: _,
         upstream_concurrency: _,
     } = plan;
+    // Through the proxy no name is resolved here, so bootstrap plays no part.
+    let bootstrap = match route {
+        upstream::UpstreamRoute::Direct { bootstrap } => &bootstrap[..],
+        upstream::UpstreamRoute::Socks5(_) => &[],
+    };
     format!(
         "servers={:?};bootstrap={:?}",
         canonical_list(servers.iter()),
@@ -669,7 +690,7 @@ impl ForwarderPlan {
     /// `label` names the setting in the error. Fails when an upstream is one of this server's
     /// listen addresses.
     fn upstreams(&self, label: &str) -> Result<Vec<onetdns_forward::Upstream>, String> {
-        let upstreams = upstream::servers_to_upstreams(&self.servers, &self.bootstrap);
+        let upstreams = upstream::servers_to_upstreams(&self.servers, &self.route);
         upstream::ensure_not_listener(&upstreams, &self.listeners, label)?;
         Ok(upstreams)
     }

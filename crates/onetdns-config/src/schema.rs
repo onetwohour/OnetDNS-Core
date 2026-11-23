@@ -59,6 +59,14 @@ static FIELDS: &[Field] = &[
     f("upstream_concurrency", "int", "upstream", ""),
     f("query_source", "string", "upstream", ""),
     f("query_source_v6", "string", "upstream", ""),
+    f(
+        "upstream_proxy",
+        "string",
+        "upstream",
+        "socks5://127.0.0.1:9050",
+    ),
+    f("upstream_proxy_username", "string", "upstream", ""),
+    f("upstream_proxy_password", "string", "upstream", ""),
     f("cache_size", "int", "cache", "entries"),
     f("min_ttl", "int", "cache", "seconds"),
     f("max_ttl", "int", "cache", "seconds"),
@@ -660,6 +668,39 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_en: "Local IPv6 address used for outgoing upstream DNS queries.",
         description_ja: "上位 DNS クエリの送信元として使うローカル IPv6 アドレスです。",
         description_zh: "发出上游 DNS 查询时使用的本地 IPv6 地址。",
+    },
+    FieldCopy {
+        key: "upstream_proxy",
+        label_ko: "업스트림 SOCKS5 프록시",
+        label_en: "SOCKS5 proxy for upstream DNS servers",
+        label_ja: "上位 DNS サーバー用 SOCKS5 プロキシ",
+        label_zh: "上游 DNS 服务器的 SOCKS5 代理",
+        description_ko: "tls:// 와 https:// 업스트림을 이 SOCKS5 프록시(예: Tor 의 socks5://127.0.0.1:9050)를 거쳐 연결합니다. 업스트림 이름은 프록시가 해석합니다. 설정하면 다른 방식의 업스트림은 거부됩니다.",
+        description_en: "Connects tls:// and https:// upstreams through this SOCKS5 proxy, such as Tor at socks5://127.0.0.1:9050. The proxy resolves upstream names. Once set, upstreams of any other kind are refused.",
+        description_ja: "tls:// と https:// の上位サーバーにこの SOCKS5 プロキシ (Tor の socks5://127.0.0.1:9050 など) を経由して接続します。上位サーバーの名前はプロキシが解決します。設定すると、ほかの方式の上位サーバーは拒否されます。",
+        description_zh: "通过此 SOCKS5 代理（例如 Tor 的 socks5://127.0.0.1:9050）连接 tls:// 和 https:// 上游。上游名称由代理解析。设置后，其他类型的上游会被拒绝。",
+    },
+    FieldCopy {
+        key: "upstream_proxy_username",
+        label_ko: "업스트림 프록시 사용자 이름",
+        label_en: "Upstream proxy user name",
+        label_ja: "上位プロキシのユーザー名",
+        label_zh: "上游代理用户名",
+        description_ko: "SOCKS5 프록시에 보낼 사용자 이름입니다. 비밀번호와 함께 설정합니다.",
+        description_en: "User name sent to the SOCKS5 proxy. Set it together with the password.",
+        description_ja: "SOCKS5 プロキシに送るユーザー名です。パスワードと一緒に設定します。",
+        description_zh: "发送给 SOCKS5 代理的用户名。需与密码一起设置。",
+    },
+    FieldCopy {
+        key: "upstream_proxy_password",
+        label_ko: "업스트림 프록시 비밀번호",
+        label_en: "Upstream proxy password",
+        label_ja: "上位プロキシのパスワード",
+        label_zh: "上游代理密码",
+        description_ko: "SOCKS5 프록시에 보낼 비밀번호입니다. SOCKS5 는 이를 평문으로 보내므로 프록시는 이 컴퓨터나 믿는 망 안에 둡니다.",
+        description_en: "Password sent to the SOCKS5 proxy. SOCKS5 sends it in plain text, so keep the proxy on this machine or a trusted network.",
+        description_ja: "SOCKS5 プロキシに送るパスワードです。SOCKS5 は平文で送るため、プロキシはこのコンピューターか信頼できるネットワーク内に置きます。",
+        description_zh: "发送给 SOCKS5 代理的密码。SOCKS5 以明文发送，因此请将代理放在本机或可信网络中。",
     },
     FieldCopy {
         key: "cache_size",
@@ -3491,6 +3532,7 @@ fn field_sensitive(key: &str) -> bool {
             | "zones_etcd_password"
             | "cachedb_redis_secret"
             | "cachedb_redis_password"
+            | "upstream_proxy_password"
             | "cluster_raft_secret"
             | "cluster_raft_node_key"
             | "tsig_keys"
@@ -3509,6 +3551,7 @@ fn field_write_only(key: &str) -> bool {
             | "zones_etcd_password"
             | "cachedb_redis_secret"
             | "cachedb_redis_password"
+            | "upstream_proxy_password"
             | "cluster_raft_secret"
             | "cluster_raft_node_key"
     )

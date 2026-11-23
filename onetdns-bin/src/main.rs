@@ -400,6 +400,9 @@ fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
     if !cfg.fallback_upstreams.is_empty() {
         ext.push("fallback upstream DNS servers".into());
     }
+    if let Some(proxy) = cfg.upstream_proxy {
+        ext.push(format!("upstream DNS servers through socks5://{proxy}"));
+    }
     if cfg.ecs_mode != EcsMode::Off {
         ext.push(match cfg.ecs_mode {
             EcsMode::Off => unreachable!(),
@@ -2241,7 +2244,11 @@ fn build_native_server(
 /// server answers. `qtype` defaults to A.
 fn query(name: String, qtype: Option<String>) -> BoxResult<()> {
     let cfg = Config::default();
-    let ups = upstream::native_upstreams(&cfg.upstreams, &cfg.upstream_urls, &cfg.bootstrap);
+    let ups = upstream::native_upstreams(
+        &cfg.upstreams,
+        &cfg.upstream_urls,
+        &upstream::UpstreamRoute::forwarding(&cfg),
+    );
     if ups.is_empty() {
         crate::bail!("No upstream DNS servers are set in `upstreams`");
     }
@@ -2477,11 +2484,12 @@ fn build_client_upstream_routes(
     timeout: Duration,
 ) -> Result<Vec<native::ClientUpstream>, String> {
     let mut routes = Vec::new();
+    let route = upstream::UpstreamRoute::forwarding(cfg);
     for c in &cfg.clients {
         if c.upstreams.is_empty() {
             continue;
         }
-        let ups = upstream::servers_to_upstreams(&c.upstreams, &cfg.bootstrap);
+        let ups = upstream::servers_to_upstreams(&c.upstreams, &route);
         if ups.is_empty() {
             return Err(format!(
                 "Client '{}' has no usable dedicated upstream DNS servers",
@@ -2513,7 +2521,11 @@ fn build_forward_backend(
     cfg: &Config,
 ) -> Result<(Arc<dyn native::Resolver>, onetdns_forward::ForwardStats), String> {
     ensure_resolution_sources_not_self(cfg)?;
-    let upstreams = upstream::native_upstreams(&cfg.upstreams, &cfg.upstream_urls, &cfg.bootstrap);
+    let upstreams = upstream::native_upstreams(
+        &cfg.upstreams,
+        &cfg.upstream_urls,
+        &upstream::UpstreamRoute::forwarding(cfg),
+    );
     if upstreams.is_empty() {
         let configured = cfg.upstreams.len() + cfg.upstream_urls.len();
         if configured > 0 {
@@ -2521,7 +2533,9 @@ fn build_forward_backend(
                 .upstream_urls
                 .iter()
                 .any(|u| upstream::url_uses_hostname(u));
-            let hint = if has_hostname && cfg.bootstrap.is_empty() {
+            let hint = if cfg.upstream_proxy.is_some() {
+                " (only tls:// and https:// upstream DNS servers can go through `upstream_proxy`)"
+            } else if has_hostname && cfg.bootstrap.is_empty() {
                 " (upstream DNS servers given by host name need bootstrap, or give an IP address together with the TLS server name, for example h3://1.1.1.1/dns-query#cloudflare-dns.com)"
             } else if has_hostname {
                 " (could not resolve the upstream DNS server host name; check that `bootstrap` is reachable, or give an IP address together with the TLS server name, for example h3://1.1.1.1/dns-query#cloudflare-dns.com)"
@@ -4268,6 +4282,8 @@ mod tests {
             "cluster_raft_secret",
             "cachedb_redis_secret",
             "cachedb_redis_password",
+            "upstream_proxy",
+            "upstream_proxy_password",
             "cluster_node_id",
             "tls_cert",
             "acme_domains",

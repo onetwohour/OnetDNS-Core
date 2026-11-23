@@ -2,11 +2,41 @@
 //! is rejected, since queries would loop.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::time::Duration;
 
-use onetdns_forward::{Endpoint, Upstream};
+use onetdns_config::Config;
+use onetdns_forward::{Endpoint, Socks5Proxy, Upstream};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How a forwarder reaches its upstreams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamRoute {
+    /// Host names are resolved through `bootstrap` when the URL is read.
+    Direct { bootstrap: Vec<IpAddr> },
+    /// The proxy is given host names as written, so this server never looks them up. Only DoT and
+    /// DoH can use it.
+    Socks5(Arc<Socks5Proxy>),
+}
+
+impl UpstreamRoute {
+    /// The route of the default, fallback, and client forwarders.
+    pub fn forwarding(cfg: &Config) -> Self {
+        let Some(addr) = cfg.upstream_proxy else {
+            return UpstreamRoute::Direct {
+                bootstrap: cfg.bootstrap.clone(),
+            };
+        };
+        let mut proxy = Socks5Proxy::new(addr);
+        if let (Some(username), Some(password)) =
+            (&cfg.upstream_proxy_username, &cfg.upstream_proxy_password)
+        {
+            proxy = proxy.with_credentials(username.clone(), password.clone());
+        }
+        UpstreamRoute::Socks5(Arc::new(proxy))
+    }
+}
 
 /// Hostname upstreams are checked after resolving; the URL alone would miss this server hidden
 /// behind a name.
@@ -58,13 +88,17 @@ pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
         .is_ok_and(|local| local.ip() == ip)
 }
 
-pub fn native_upstreams(plain: &[IpAddr], urls: &[String], bootstrap: &[IpAddr]) -> Vec<Upstream> {
-    let mut out: Vec<Upstream> = plain
-        .iter()
-        .map(|ip| Upstream::udp(SocketAddr::new(*ip, 53)))
-        .collect();
+/// Plain servers cannot use a proxy route; validation refuses them with one.
+pub fn native_upstreams(plain: &[IpAddr], urls: &[String], route: &UpstreamRoute) -> Vec<Upstream> {
+    let mut out: Vec<Upstream> = match route {
+        UpstreamRoute::Direct { .. } => plain
+            .iter()
+            .map(|ip| Upstream::udp(SocketAddr::new(*ip, 53)))
+            .collect(),
+        UpstreamRoute::Socks5(_) => Vec::new(),
+    };
     for u in urls {
-        match parse_native_upstream(u, bootstrap) {
+        match parse_native_upstream(u, route) {
             Some(up) => out.push(up),
             None => {
                 onetdns_core::warn!(event = "upstream.parse_failed", url = %u, "Could not resolve an upstream DNS server's address; skipping that server")
@@ -74,13 +108,13 @@ pub fn native_upstreams(plain: &[IpAddr], urls: &[String], bootstrap: &[IpAddr])
     out
 }
 
-pub fn servers_to_upstreams(servers: &[String], bootstrap: &[IpAddr]) -> Vec<Upstream> {
+pub fn servers_to_upstreams(servers: &[String], route: &UpstreamRoute) -> Vec<Upstream> {
     let mut out = Vec::new();
     for s in servers {
         let s = s.trim();
-        if let Ok(ip) = s.parse::<IpAddr>() {
+        if let (Ok(ip), UpstreamRoute::Direct { .. }) = (s.parse::<IpAddr>(), route) {
             out.push(Upstream::udp(SocketAddr::new(ip, 53)));
-        } else if let Some(up) = parse_native_upstream(s, bootstrap) {
+        } else if let Some(up) = parse_native_upstream(s, route) {
             out.push(up);
         } else {
             onetdns_core::warn!(event = "upstream.fallback_parse_failed", server = %s, "Could not resolve a stub or fallback upstream DNS server's address; skipping that server");
@@ -110,8 +144,9 @@ pub fn url_uses_hostname(url: &str) -> bool {
     !host.is_empty() && host.parse::<IpAddr>().is_err()
 }
 
-/// None for an unknown scheme, a malformed URL, or a hostname without bootstrap servers.
-fn parse_native_upstream(url: &str, bootstrap: &[IpAddr]) -> Option<Upstream> {
+/// None for an unknown scheme, a malformed URL, a hostname without bootstrap servers, or a scheme
+/// the route cannot carry.
+fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
     let url = url.trim();
     if url.is_empty() || url.chars().any(char::is_control) {
         return None;
@@ -159,9 +194,30 @@ fn parse_native_upstream(url: &str, bootstrap: &[IpAddr]) -> Option<Upstream> {
     if host.trim().is_empty() {
         return None;
     }
-    let ip = resolve_host(host, bootstrap)?;
     let sni = || sni.clone().unwrap_or_else(|| host.to_string());
     let doh_path = || path.clone().unwrap_or_else(|| "/dns-query".to_string());
+    let bootstrap = match route {
+        UpstreamRoute::Direct { bootstrap } => bootstrap,
+        UpstreamRoute::Socks5(proxy) => {
+            return match scheme.as_str() {
+                "tls" => Some(Upstream::dot_via(
+                    Arc::clone(proxy),
+                    host,
+                    port.unwrap_or(853),
+                    sni(),
+                )),
+                "https" => Some(Upstream::doh_via(
+                    Arc::clone(proxy),
+                    host,
+                    port.unwrap_or(443),
+                    sni(),
+                    doh_path(),
+                )),
+                _ => None,
+            };
+        }
+    };
+    let ip = resolve_host(host, bootstrap)?;
     match scheme.as_str() {
         "udp" => Some(Upstream::udp(SocketAddr::new(ip, port.unwrap_or(53)))),
         "tcp" => Some(Upstream::tcp(SocketAddr::new(ip, port.unwrap_or(53)))),
@@ -215,6 +271,10 @@ mod tests {
     use super::*;
     use onetdns_forward::Transport;
 
+    const DIRECT: UpstreamRoute = UpstreamRoute::Direct {
+        bootstrap: Vec::new(),
+    };
+
     #[test]
     fn resolved_upstream_cannot_point_back_to_listener() {
         let upstreams = vec![Upstream::doh(
@@ -262,7 +322,7 @@ mod tests {
             "quic://1.0.0.1#cloudflare-dns.com".to_string(),
             "h3://8.8.8.8/dns-query#dns.google".to_string(),
         ];
-        let ups = native_upstreams(&plain, &urls, &[]);
+        let ups = native_upstreams(&plain, &urls, &DIRECT);
         assert_eq!(ups.len(), 6, "평문1 + tls + tcp + doh + doq + doh3");
         assert_eq!(ups[0].transport, Transport::Udp);
         assert_eq!(
@@ -304,10 +364,11 @@ mod tests {
 
     #[test]
     fn hostname_upstream_needs_bootstrap_but_ip_literal_does_not() {
-        assert!(parse_native_upstream("h3://cloudflare-dns.com/dns-query", &[]).is_none());
+        assert!(parse_native_upstream("h3://cloudflare-dns.com/dns-query", &DIRECT).is_none());
         assert!(url_uses_hostname("h3://cloudflare-dns.com/dns-query"));
 
-        let up = parse_native_upstream("h3://1.1.1.1/dns-query#cloudflare-dns.com", &[]).unwrap();
+        let up =
+            parse_native_upstream("h3://1.1.1.1/dns-query#cloudflare-dns.com", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("1.1.1.1:443".parse().unwrap())
@@ -328,7 +389,7 @@ mod tests {
 
     #[test]
     fn parses_doh_defaults_and_overrides() {
-        let up = parse_native_upstream("https://1.1.1.1", &[]).unwrap();
+        let up = parse_native_upstream("https://1.1.1.1", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("1.1.1.1:443".parse().unwrap())
@@ -341,7 +402,8 @@ mod tests {
             }
         );
 
-        let up = parse_native_upstream("https://9.9.9.9:8443/resolve#dns.quad9.net", &[]).unwrap();
+        let up =
+            parse_native_upstream("https://9.9.9.9:8443/resolve#dns.quad9.net", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("9.9.9.9:8443".parse().unwrap())
@@ -357,7 +419,7 @@ mod tests {
 
     #[test]
     fn parses_doq_and_doh3() {
-        let up = parse_native_upstream("quic://1.1.1.1", &[]).unwrap();
+        let up = parse_native_upstream("quic://1.1.1.1", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("1.1.1.1:853".parse().unwrap())
@@ -369,7 +431,7 @@ mod tests {
             }
         );
 
-        let up = parse_native_upstream("h3://1.1.1.1#cloudflare-dns.com", &[]).unwrap();
+        let up = parse_native_upstream("h3://1.1.1.1#cloudflare-dns.com", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("1.1.1.1:443".parse().unwrap())
@@ -390,7 +452,7 @@ mod tests {
                 "1.0.0.1".to_string(),
                 "tls://9.9.9.9#dns.quad9.net".to_string(),
             ],
-            &[],
+            &DIRECT,
         );
         assert_eq!(ups.len(), 2);
         assert_eq!(ups[0].transport, Transport::Udp);
@@ -402,15 +464,15 @@ mod tests {
 
     #[test]
     fn unknown_scheme_skipped() {
-        assert!(parse_native_upstream("ftp://1.2.3.4", &[]).is_none());
-        assert!(parse_native_upstream("gopher://8.8.8.8", &[]).is_none());
+        assert!(parse_native_upstream("ftp://1.2.3.4", &DIRECT).is_none());
+        assert!(parse_native_upstream("gopher://8.8.8.8", &DIRECT).is_none());
     }
 
     #[test]
     fn removed_scheme_aliases_are_rejected() {
         for scheme in ["dot", "doh", "h2", "doq", "doh3"] {
             assert!(
-                parse_native_upstream(&format!("{scheme}://192.0.2.1"), &[]).is_none(),
+                parse_native_upstream(&format!("{scheme}://192.0.2.1"), &DIRECT).is_none(),
                 "{scheme}"
             );
         }
@@ -418,7 +480,7 @@ mod tests {
     #[test]
     fn bracketed_ipv6_with_port_is_parsed() {
         let up =
-            parse_native_upstream("tls://[2001:4860:4860::8888]:8853#dns.google", &[]).unwrap();
+            parse_native_upstream("tls://[2001:4860:4860::8888]:8853#dns.google", &DIRECT).unwrap();
         assert_eq!(
             up.endpoint,
             Endpoint::Direct("[2001:4860:4860::8888]:8853".parse().unwrap())
@@ -427,7 +489,7 @@ mod tests {
 
     #[test]
     fn hostname_without_bootstrap_is_rejected() {
-        assert!(parse_native_upstream("https://dns.example/dns-query", &[]).is_none());
+        assert!(parse_native_upstream("https://dns.example/dns-query", &DIRECT).is_none());
         assert!(resolve_host_via_bootstrap("dns.example", &[]).is_none());
         assert_eq!(
             resolve_host_via_bootstrap("192.0.2.53", &[]),
@@ -437,9 +499,46 @@ mod tests {
 
     #[test]
     fn malformed_authority_is_rejected() {
-        assert!(parse_native_upstream("udp://1.1.1.1:not-a-port", &[]).is_none());
-        assert!(parse_native_upstream("udp://1.1.1.1:0", &[]).is_none());
-        assert!(parse_native_upstream("https:///dns-query", &[]).is_none());
-        assert!(parse_native_upstream("tls://1.1.1.1#", &[]).is_none());
+        assert!(parse_native_upstream("udp://1.1.1.1:not-a-port", &DIRECT).is_none());
+        assert!(parse_native_upstream("udp://1.1.1.1:0", &DIRECT).is_none());
+        assert!(parse_native_upstream("https:///dns-query", &DIRECT).is_none());
+        assert!(parse_native_upstream("tls://1.1.1.1#", &DIRECT).is_none());
+    }
+
+    #[test]
+    /// The proxy gets the host as written: nothing is looked up here, even with bootstrap set.
+    fn proxy_route_passes_host_names_to_the_proxy() {
+        let cfg = Config {
+            bootstrap: vec!["192.0.2.53".parse().unwrap()],
+            upstream_proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            upstream_proxy_username: Some("onet".into()),
+            upstream_proxy_password: Some("secret".into()),
+            ..Config::default()
+        };
+        let route = UpstreamRoute::forwarding(&cfg);
+        let UpstreamRoute::Socks5(proxy) = &route else {
+            panic!("{route:?}");
+        };
+        assert_eq!(
+            **proxy,
+            Socks5Proxy::new("127.0.0.1:9050".parse().unwrap())
+                .with_credentials("onet", "secret".into())
+        );
+
+        let up = parse_native_upstream("tls://dns.example#dns.example", &route).unwrap();
+        assert_eq!(
+            up,
+            Upstream::dot_via(Arc::clone(proxy), "dns.example", 853, "dns.example")
+        );
+        let up = parse_native_upstream("https://[2001:db8::1]:8443/q#dns.example", &route).unwrap();
+        assert_eq!(
+            up,
+            Upstream::doh_via(Arc::clone(proxy), "2001:db8::1", 8443, "dns.example", "/q")
+        );
+        for url in ["quic://dns.example", "h3://dns.example", "udp://192.0.2.1"] {
+            assert!(parse_native_upstream(url, &route).is_none(), "{url}");
+        }
+        assert!(native_upstreams(&["192.0.2.1".parse().unwrap()], &[], &route).is_empty());
+        assert!(servers_to_upstreams(&["192.0.2.1".to_string()], &route).is_empty());
     }
 }
