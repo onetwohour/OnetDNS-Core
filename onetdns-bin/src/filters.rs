@@ -360,7 +360,8 @@ fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
             .map(|dir| dir.join(blocklist_cache_key(&meta.url)))
             .filter(|path| path.is_file());
         if let Some(path) = cache_path {
-            fingerprint_files(&mut digest, b"subscription-file", &[path]);
+            fingerprint_header(&mut digest, b"subscription-file", 1);
+            fingerprint_file(&mut digest, &path, true);
         } else {
             fingerprint_strings(&mut digest, b"subscription-lines", meta.lines.iter());
         }
@@ -429,38 +430,64 @@ fn fingerprint_strings<'a>(
 }
 
 fn fingerprint_files(digest: &mut Sha256, label: &[u8], paths: &[PathBuf]) {
-    use std::io::Read;
-
-    const MAX_FILTER_FILE: u64 = 128 * 1024 * 1024;
     fingerprint_header(digest, label, paths.len() as u64);
     for path in paths {
-        fingerprint_bytes(digest, b"path", path.to_string_lossy().as_bytes());
-        let Ok(file) = std::fs::File::open(path) else {
-            fingerprint_bytes(digest, b"file-status", b"unreadable");
-            continue;
-        };
-        let mut reader = file.take(MAX_FILTER_FILE + 1);
-        let mut content = Sha256::new();
-        let mut total = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
-        let status = loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break b"ok".as_slice(),
+        fingerprint_file(digest, path, false);
+    }
+}
+
+/// `skip_cache_header` leaves out the header of a cached subscription: it holds the fetch time and
+/// validators, which change on every refresh while the rules stay the same.
+fn fingerprint_file(digest: &mut Sha256, path: &std::path::Path, skip_cache_header: bool) {
+    use std::io::{BufRead, Read};
+
+    const MAX_FILTER_FILE: u64 = 128 * 1024 * 1024;
+    fingerprint_bytes(digest, b"path", path.to_string_lossy().as_bytes());
+    let Ok(file) = std::fs::File::open(path) else {
+        fingerprint_bytes(digest, b"file-status", b"unreadable");
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file.take(MAX_FILTER_FILE + 1));
+    let mut content = Sha256::new();
+    let mut total = 0u64;
+    let mut status = None;
+    if skip_cache_header {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(_) if line.starts_with(CACHE_HEADER_PREFIX.as_bytes()) => {}
                 Ok(read) => {
                     total += read as u64;
-                    if total > MAX_FILTER_FILE {
-                        break b"oversize".as_slice();
-                    }
-                    content.update(&buffer[..read]);
+                    content.update(&line);
+                    break;
                 }
-                Err(_) => break b"unreadable".as_slice(),
+                Err(_) => {
+                    status = Some(b"unreadable".as_slice());
+                    break;
+                }
             }
-        };
-        fingerprint_bytes(digest, b"file-status", status);
-        if status == b"ok" {
-            digest.update(total.to_le_bytes());
-            digest.update(content.finalize());
         }
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    let status = status.unwrap_or_else(|| loop {
+        match reader.read(&mut buffer) {
+            Ok(0) if total > MAX_FILTER_FILE => break b"oversize".as_slice(),
+            Ok(0) => break b"ok".as_slice(),
+            Ok(read) => {
+                total += read as u64;
+                if total > MAX_FILTER_FILE {
+                    break b"oversize".as_slice();
+                }
+                content.update(&buffer[..read]);
+            }
+            Err(_) => break b"unreadable".as_slice(),
+        }
+    });
+    fingerprint_bytes(digest, b"file-status", status);
+    if status == b"ok" {
+        digest.update(total.to_le_bytes());
+        digest.update(content.finalize());
     }
 }
 
@@ -781,7 +808,13 @@ pub(crate) fn fetch_blocklist(
     cache_dir: Option<&std::path::Path>,
     stop: &Arc<AtomicBool>,
 ) -> Result<SubMeta, String> {
-    let resp = http::get(url)
+    let cache_path = cache_dir.map(|dir| dir.join(blocklist_cache_key(url)));
+    let validators = cache_path
+        .as_deref()
+        .map(|path| Validators::read(path, &format!("{BLOCKLIST_URL_LINE}{url}")))
+        .unwrap_or_default();
+    let resp = validators
+        .apply(http::get(url))
         .timeout(Duration::from_secs(120))
         .max_response(BLOCKLIST_MAX_RESPONSE)
         .resolver(resolver.clone())
@@ -789,12 +822,17 @@ pub(crate) fn fetch_blocklist(
         .stop_on(stop.clone())
         .call()
         .map_err(|error| format!("Could not download the blocklist: {error}"))?;
+    if resp.status == 304 && !validators.is_empty() {
+        let path = cache_path.ok_or("The server reported no change but no copy is cached")?;
+        return reuse_cached_blocklist(url, &path, validators.refreshed(&resp), cache_dir);
+    }
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "Blocklist server returned an error status: {}",
             resp.status
         ));
     }
+    let validators = Validators::from_response(&resp);
     let body = resp
         .into_string()
         .map_err(|error| format!("Could not read the blocklist response: {error}"))?;
@@ -807,7 +845,7 @@ pub(crate) fn fetch_blocklist(
     }
     onetdns_core::debug!(event = "filter.subscription_downloaded", %url, lines = rules, "Downloaded blocklist");
     let updated_unix = unix_now();
-    save_blocklist_cache_text(url, updated_unix, &body, cache_dir)?;
+    save_blocklist_cache_text(url, updated_unix, &validators, &body, cache_dir)?;
 
     let lines: Vec<String> = if cache_dir.is_some() {
         Vec::new()
@@ -832,9 +870,155 @@ fn blocklist_cache_key(url: &str) -> String {
     format!("{h:016x}.list")
 }
 
+/// The cached copy is still current: refreshes its time and validators and reads it again.
+fn reuse_cached_blocklist(
+    url: &str,
+    path: &std::path::Path,
+    validators: Validators,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<SubMeta, String> {
+    let text = read_text_limited(path, BLOCKLIST_MAX_RESPONSE)
+        .map_err(|error| format!("Could not read the cached blocklist: {error}"))?;
+    let (_, body) = split_cache_header(&text);
+    let rules = count_list_rules(body);
+    if rules == 0 {
+        return Err("The cached blocklist has no valid rules".to_string());
+    }
+    onetdns_core::debug!(event = "filter.subscription_not_modified", %url, lines = rules, "Blocklist has not changed");
+    let updated_unix = unix_now();
+    save_blocklist_cache_text(url, updated_unix, &validators, body, cache_dir)?;
+    Ok(SubMeta {
+        url: url.to_string(),
+        title: parse_list_title(body),
+        rules,
+        updated_unix,
+        lines: Vec::new().into(),
+    })
+}
+
+/// Cached lists start with header lines that all begin with this: the URL, when it was fetched,
+/// and the validators.
+const CACHE_HEADER_PREFIX: &str = "# onetdns-";
+const BLOCKLIST_URL_LINE: &str = "# onetdns-url:";
+const RPZ_URL_LINE: &str = "# onetdns-rpz-url:";
+const UPDATED_LINE: &str = "# onetdns-updated:";
+const ETAG_LINE: &str = "# onetdns-etag:";
+const LAST_MODIFIED_LINE: &str = "# onetdns-last-modified:";
+
+/// Splits a cached file into its header lines and the list after them.
+fn split_cache_header(text: &str) -> (Vec<&str>, &str) {
+    let mut header = Vec::new();
+    let mut rest = text;
+    while rest.starts_with(CACHE_HEADER_PREFIX) {
+        let (line, next) = rest.split_once('\n').unwrap_or((rest, ""));
+        header.push(line.trim_end_matches('\r'));
+        rest = next;
+    }
+    (header, rest)
+}
+
+/// HTTP validators kept in a cached list's header and sent back on the next refresh, so a list
+/// that has not changed comes back as 304 instead of in full.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Validators {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl Validators {
+    fn from_response(resp: &http::Resp) -> Self {
+        Self {
+            etag: header_value(resp.header("etag")),
+            last_modified: header_value(resp.header("last-modified")),
+        }
+    }
+
+    fn from_header(header: &[&str]) -> Self {
+        let find = |prefix: &str| {
+            header_value(
+                header
+                    .iter()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::to_string),
+            )
+        };
+        Self {
+            etag: find(ETAG_LINE),
+            last_modified: find(LAST_MODIFIED_LINE),
+        }
+    }
+
+    /// Reads only the header of the file at `path`, and only when its first line is `url_line`.
+    fn read(path: &std::path::Path, url_line: &str) -> Self {
+        use std::io::{BufRead, Read};
+
+        const MAX_HEADER: u64 = 64 * 1024;
+        let Ok(file) = std::fs::File::open(path) else {
+            return Self::default();
+        };
+        let mut lines = Vec::new();
+        for line in std::io::BufReader::new(file.take(MAX_HEADER)).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if !line.starts_with(CACHE_HEADER_PREFIX) {
+                break;
+            }
+            lines.push(line);
+        }
+        if lines.first().map(String::as_str) != Some(url_line) {
+            return Self::default();
+        }
+        let header: Vec<&str> = lines.iter().map(String::as_str).collect();
+        Self::from_header(&header)
+    }
+
+    /// A 304 may carry new validators; the ones it leaves out stay.
+    fn refreshed(self, resp: &http::Resp) -> Self {
+        let fresh = Self::from_response(resp);
+        Self {
+            etag: fresh.etag.or(self.etag),
+            last_modified: fresh.last_modified.or(self.last_modified),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+
+    fn apply(&self, mut req: http::Req) -> http::Req {
+        if let Some(etag) = &self.etag {
+            req = req.header("If-None-Match", etag);
+        }
+        if let Some(last_modified) = &self.last_modified {
+            req = req.header("If-Modified-Since", last_modified);
+        }
+        req
+    }
+
+    fn write_header(&self, out: &mut String) {
+        for (prefix, value) in [
+            (ETAG_LINE, &self.etag),
+            (LAST_MODIFIED_LINE, &self.last_modified),
+        ] {
+            if let Some(value) = value {
+                out.push_str(prefix);
+                out.push_str(value);
+                out.push('\n');
+            }
+        }
+    }
+}
+
+/// A value that could break a header line, here or in the next request, is dropped.
+fn header_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+}
+
 fn save_blocklist_cache_text(
     url: &str,
     updated_unix: u64,
+    validators: &Validators,
     text: &str,
     dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
@@ -844,7 +1028,8 @@ fn save_blocklist_cache_text(
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("Could not create the blocklist cache directory: {e}"))?;
     let path = dir.join(blocklist_cache_key(url));
-    let mut body = format!("# onetdns-url:{url}\n# onetdns-updated:{updated_unix}\n");
+    let mut body = format!("{BLOCKLIST_URL_LINE}{url}\n{UPDATED_LINE}{updated_unix}\n");
+    validators.write_header(&mut body);
     body.reserve(text.len() + 1);
     for line in text.lines() {
         body.push_str(line);
@@ -865,20 +1050,11 @@ pub(crate) fn load_blocklist_cache(urls: &[String], dir: Option<&std::path::Path
             let text =
                 read_text_limited(&dir.join(blocklist_cache_key(url)), BLOCKLIST_MAX_RESPONSE)
                     .ok()?;
-            let mut parts = text.splitn(3, '\n');
-            let stored_url = parts
-                .next()?
-                .trim_end_matches('\r')
-                .strip_prefix("# onetdns-url:")?;
-            if stored_url != url {
+            let (header, body) = split_cache_header(&text);
+            if header.first()?.strip_prefix(BLOCKLIST_URL_LINE)? != url {
                 return None;
             }
-            let updated_unix = parts
-                .next()
-                .map(|line| line.trim_end_matches('\r'))
-                .and_then(|v| v.strip_prefix("# onetdns-updated:"))
-                .and_then(|v| v.parse().ok())?;
-            let body = parts.next()?;
+            let updated_unix = header.get(1)?.strip_prefix(UPDATED_LINE)?.parse().ok()?;
             let rules = count_list_rules(body);
             let title = parse_list_title(body);
 
@@ -927,20 +1103,28 @@ pub(crate) fn fetch_blocklists_meta(
     Some(meta)
 }
 
+enum RpzFetch {
+    Body(String, Validators),
+    NotModified(Validators),
+}
+
 fn rpz_cache_key(url: &str) -> String {
     format!("{}.rpz", blocklist_cache_key(url).trim_end_matches(".list"))
 }
 
-fn save_rpz_cache(url: &str, body: &str, dir: Option<&std::path::Path>) -> Result<(), String> {
+fn save_rpz_cache(
+    url: &str,
+    validators: &Validators,
+    body: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(), String> {
     let Some(dir) = dir else {
         return Ok(());
     };
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("Could not create the RPZ cache directory: {error}"))?;
-    let mut cached = format!(
-        "# onetdns-rpz-url:{url}\n# onetdns-updated:{}\n",
-        unix_now()
-    );
+    let mut cached = format!("{RPZ_URL_LINE}{url}\n{UPDATED_LINE}{}\n", unix_now());
+    validators.write_header(&mut cached);
     cached.push_str(body);
     if !cached.ends_with('\n') {
         cached.push('\n');
@@ -959,24 +1143,21 @@ pub(crate) fn load_rpz_cache(urls: &[String], dir: Option<&std::path::Path>) -> 
             else {
                 return String::new();
             };
-            let mut lines = text.lines();
-            let Some(stored_url) = lines
-                .next()
-                .and_then(|line| line.strip_prefix("# onetdns-rpz-url:"))
-            else {
-                return String::new();
-            };
-            if stored_url != url {
+            let (header, rest) = split_cache_header(&text);
+            let stored_url = header
+                .first()
+                .and_then(|line| line.strip_prefix(RPZ_URL_LINE));
+            if stored_url != Some(url.as_str()) {
                 return String::new();
             }
-            let updated = lines
-                .next()
-                .and_then(|line| line.strip_prefix("# onetdns-updated:"))
+            let updated = header
+                .get(1)
+                .and_then(|line| line.strip_prefix(UPDATED_LINE))
                 .and_then(|value| value.parse::<u64>().ok());
             if updated.is_none() {
                 return String::new();
             }
-            let body = lines.collect::<Vec<_>>().join("\n");
+            let body = rest.lines().collect::<Vec<_>>().join("\n");
             if body.trim().is_empty()
                 || looks_like_error_document(&body)
                 || likely_rpz_rule_count(&body) == 0
@@ -1019,7 +1200,17 @@ pub(crate) fn fetch_rpz_texts(
 ) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(urls.len());
     for (index, url) in urls.iter().enumerate() {
-        let fetched = http::get(url)
+        let previous_text = previous.get(index).filter(|text| !text.is_empty());
+        // Without the previous rules in memory a 304 would leave nothing to use.
+        let validators = match (cache_dir, previous_text) {
+            (Some(dir), Some(_)) => Validators::read(
+                &dir.join(rpz_cache_key(url)),
+                &format!("{RPZ_URL_LINE}{url}"),
+            ),
+            _ => Validators::default(),
+        };
+        let fetched = validators
+            .apply(http::get(url))
             .timeout(Duration::from_secs(120))
             .max_response(BLOCKLIST_MAX_RESPONSE)
             .resolver(resolver.clone())
@@ -1027,25 +1218,37 @@ pub(crate) fn fetch_rpz_texts(
             .stop_on(stop.clone())
             .call()
             .and_then(|resp| {
+                if resp.status == 304 && !validators.is_empty() {
+                    return Ok(RpzFetch::NotModified(validators.clone().refreshed(&resp)));
+                }
                 if !(200..300).contains(&resp.status) {
                     return Err(http::HttpError::Protocol(format!(
                         "HTTP status {}",
                         resp.status
                     )));
                 }
-                resp.into_string()
+                let validators = Validators::from_response(&resp);
+                Ok(RpzFetch::Body(resp.into_string()?, validators))
             });
         if stop.load(Ordering::Relaxed) {
             return None;
         }
         match fetched {
-            Ok(body)
+            Ok(RpzFetch::NotModified(validators)) => {
+                let old = previous_text.cloned().unwrap_or_default();
+                onetdns_core::debug!(event = "filter.rpz_not_modified", %url, "RPZ rules have not changed");
+                if let Err(error) = save_rpz_cache(url, &validators, &old, cache_dir) {
+                    onetdns_core::warn!(event = "filter.rpz_cache_save_failed", %url, %error, "Could not save the RPZ cache file");
+                }
+                out.push(old);
+            }
+            Ok(RpzFetch::Body(body, validators))
                 if !body.trim().is_empty()
                     && !looks_like_error_document(&body)
                     && likely_rpz_rule_count(&body) > 0 =>
             {
                 onetdns_core::debug!(event = "filter.rpz_downloaded", %url, bytes = body.len(), "Downloaded RPZ rules");
-                if let Err(error) = save_rpz_cache(url, &body, cache_dir) {
+                if let Err(error) = save_rpz_cache(url, &validators, &body, cache_dir) {
                     onetdns_core::warn!(event = "filter.rpz_cache_save_failed", %url, %error, "Could not save the RPZ cache file");
                 }
                 out.push(body);
@@ -1718,10 +1921,8 @@ mod tests {
         save_blocklist_cache_text(
             &item.url,
             item.updated_unix,
-            &item.lines.join(
-                "
-    ",
-            ),
+            &Validators::default(),
+            &item.lines.join("\n"),
             Some(&dir),
         )
         .expect("cache 저장");
@@ -1748,9 +1949,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("onetdns-rpzcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let url = "https://example.test/policy.rpz".to_string();
-        save_rpz_cache(&url, "bad.example CNAME .\n", Some(&dir)).unwrap();
+        let validators = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        save_rpz_cache(&url, &validators, "bad.example CNAME .\n", Some(&dir)).unwrap();
         let loaded = load_rpz_cache(std::slice::from_ref(&url), Some(&dir));
         assert!(loaded[0].contains("bad.example"));
+        assert!(
+            !loaded[0].contains("onetdns-"),
+            "the header must not reach the RPZ parser: {}",
+            loaded[0]
+        );
 
         std::fs::write(
             dir.join(rpz_cache_key(&url)),
@@ -1779,10 +1989,8 @@ mod tests {
         save_blocklist_cache_text(
             &item.url,
             item.updated_unix,
-            &item.lines.join(
-                "
-    ",
-            ),
+            &Validators::default(),
+            &item.lines.join("\n"),
             Some(&dir),
         )
         .unwrap();
@@ -1811,7 +2019,72 @@ mod tests {
         assert!(guard[0].lines.is_empty());
         assert_eq!(guard[0].rules, 2);
         assert_eq!(before, after);
+        let url = guard[0].url.clone();
         drop(guard);
+
+        let validators = Validators {
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        };
+        let rules = "||ads.example^\n||track.example^";
+        save_blocklist_cache_text(&url, 99, &validators, rules, Some(&dir)).unwrap();
+        assert_eq!(
+            calculate(&meta.lock_recover()),
+            before,
+            "a refresh that only moved the fetch time recompiled the engine"
+        );
+        save_blocklist_cache_text(&url, 99, &validators, "||ads.example^", Some(&dir)).unwrap();
+        assert_ne!(calculate(&meta.lock_recover()), before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// The validators are what turn an unchanged list into a 304; the list itself must still load.
+    fn cached_validators_are_sent_back_and_the_list_still_loads() {
+        let dir = std::env::temp_dir().join(format!("onetdns-validators-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = "https://example.test/list.txt".to_string();
+        let validators = Validators {
+            etag: Some("W/\"1f\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        };
+        save_blocklist_cache_text(&url, 7, &validators, "||ads.example^", Some(&dir)).unwrap();
+        let path = dir.join(blocklist_cache_key(&url));
+
+        assert_eq!(
+            Validators::read(&path, &format!("{BLOCKLIST_URL_LINE}{url}")),
+            validators
+        );
+        assert!(
+            Validators::read(&path, "# onetdns-url:https://other.example/").is_empty(),
+            "a file saved for another URL has no validators to offer"
+        );
+        let loaded = load_blocklist_cache(std::slice::from_ref(&url), Some(&dir));
+        assert_eq!((loaded[0].rules, loaded[0].updated_unix), (1, 7));
+
+        let not_modified = http::Resp {
+            status: 304,
+            headers: vec![("ETag".to_string(), "W/\"20\"".to_string())],
+            body: Vec::new(),
+        };
+        let reused = reuse_cached_blocklist(
+            &url,
+            &path,
+            validators.clone().refreshed(&not_modified),
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(reused.rules, 1);
+        let refreshed = Validators::read(&path, &format!("{BLOCKLIST_URL_LINE}{url}"));
+        assert_eq!(refreshed.etag.as_deref(), Some("W/\"20\""));
+        assert_eq!(refreshed.last_modified, validators.last_modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_header_value_that_could_split_a_line_is_dropped() {
+        assert_eq!(header_value(Some("\"ok\"".into())), Some("\"ok\"".into()));
+        assert_eq!(header_value(Some("a\r\nX-Injected: 1".into())), None);
+        assert_eq!(header_value(Some(String::new())), None);
     }
 }
