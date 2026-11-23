@@ -1493,6 +1493,39 @@ impl FilterEngine for BlockEngine {
 }
 
 impl BlockEngine {
+    /// `verdict` with the stage, rule, and list behind it from the same lookup. The rule and list
+    /// are filled in only for a verdict other than Allow, so allowed queries still do not allocate.
+    pub fn verdict_with_rule(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        client: &ClientInfo,
+    ) -> FilterExplanation {
+        let allow = FilterExplanation {
+            verdict: FilterVerdict::Allow,
+            stage: MatchStage::DefaultAllow,
+            matched: None,
+            source: None,
+        };
+        if !self.has_verdict_rules {
+            return allow;
+        }
+        let mut buf = [0u8; MAX_NAME];
+        let Some(key) = normalize_into(name, &mut buf) else {
+            return allow;
+        };
+        let (verdict, stage, matched) = self.classify(&key, qtype, client, self.track_hits);
+        if matches!(verdict, FilterVerdict::Allow) {
+            return FilterExplanation { stage, ..allow };
+        }
+        FilterExplanation {
+            verdict,
+            stage,
+            matched: matched.map(String::from),
+            source: matched.and_then(|_| self.source_name(stage, &key)),
+        }
+    }
+
     /// The list that held the rule behind the verdict, looked up in the set that stage checks.
     /// Stages without list sources, such as regexes, local zones, and client rules, answer None.
     /// Diagnostic path only.
@@ -2577,6 +2610,20 @@ mod tests {
                 std::mem::discriminant(&e.verdict),
                 "{q}: verdict/explain 일치하지 않습니다"
             );
+            // The query path logs this instead of asking explain a second time.
+            let r = eng.verdict_with_rule(&name(q), RecordType::A, &client());
+            assert_eq!(
+                std::mem::discriminant(&v),
+                std::mem::discriminant(&r.verdict),
+                "{q}"
+            );
+            if !matches!(v, FilterVerdict::Allow) {
+                assert_eq!(
+                    (r.stage, &r.matched, &r.source),
+                    (e.stage, &e.matched, &e.source),
+                    "{q}"
+                );
+            }
         }
     }
 

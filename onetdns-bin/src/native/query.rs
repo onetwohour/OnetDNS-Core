@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use onetdns_control::Action;
 use onetdns_core::{
-    AclDecision, ClientInfo, FilterEngine, FilterVerdict, RateDecision, RewriteTarget, Transport,
+    AclDecision, ClientInfo, FilterExplanation, FilterVerdict, RateDecision, RewriteTarget,
+    Transport,
 };
 use onetdns_filter::BlockEngine;
 use onetdns_proto::{
@@ -20,7 +21,7 @@ use onetdns_proto::{
 use onetdns_runtime::{RequestCtx, Transport as RtTransport};
 
 use crate::native::authority::name_ends_with;
-use crate::native::observe::note_dropped;
+use crate::native::observe::{note_dropped, FilterRuleLabel};
 use crate::native::response::{
     base_response, block_rcode, block_resp, dns64_negative_ttl, ede_text, edns_error_resp,
     error_resp, finalize, has_alias_answer, has_negative_soa, is_delegation_referral,
@@ -525,10 +526,16 @@ impl NativeServer {
 
         let filter = self.filter.load();
         if !policy_allow {
-            match filter.verdict(qname, qtype, &scope.client) {
+            let FilterExplanation {
+                verdict,
+                stage,
+                matched,
+                source,
+            } = filter.verdict_with_rule(qname, qtype, &scope.client);
+            match verdict {
                 FilterVerdict::Allow => {}
                 FilterVerdict::Block(br) => {
-                    let rule = self.filter_rule_label(qname, qtype, &scope.client);
+                    let rule = FilterRuleLabel::new(stage, matched, source);
                     self.rec_rc_diag(
                         &scope.client,
                         Action::Blocked,
@@ -545,12 +552,12 @@ impl NativeServer {
                     ));
                 }
                 FilterVerdict::Drop => {
-                    let rule = self.filter_rule_label(qname, qtype, &scope.client);
+                    let rule = FilterRuleLabel::new(stage, matched, source);
                     self.rec_dropped(&scope.client, qname, qtype, rule.as_match());
                     return ControlFlow::Break(None);
                 }
                 FilterVerdict::Rewrite(target) => {
-                    let rule = self.filter_rule_label(qname, qtype, &scope.client);
+                    let rule = FilterRuleLabel::new(stage, matched, source);
                     let response = self.rewrite_resp(request, qname, qtype, target, &scope.client);
                     self.rec_rewrite_response(
                         &scope.client,

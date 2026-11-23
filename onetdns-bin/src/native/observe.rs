@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 
 use onetdns_control::{Action, EventDiag, Recorder};
-use onetdns_core::{ClientInfo, DropReason, FilterEngine};
+use onetdns_core::{ClientInfo, DropReason, MatchStage};
 use onetdns_proto::{Message, Name as ApName, RecordType as ApRt, ResponseCode};
 
 use crate::native::query::RuleMatch;
@@ -18,6 +18,13 @@ pub(crate) struct FilterRuleLabel {
 }
 
 impl FilterRuleLabel {
+    pub(crate) fn new(stage: MatchStage, matched: Option<String>, source: Option<String>) -> Self {
+        Self {
+            rule: matched.unwrap_or_else(|| stage.as_str().to_string()),
+            list: source.unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn as_match(&self) -> RuleMatch<'_> {
         RuleMatch {
             rule: &self.rule,
@@ -27,21 +34,6 @@ impl FilterRuleLabel {
 }
 
 impl NativeServer {
-    pub(crate) fn filter_rule_label(
-        &self,
-        name: &ApName,
-        qtype: ApRt,
-        client: &ClientInfo,
-    ) -> FilterRuleLabel {
-        let exp = self.filter.load().explain(name, qtype, client);
-        FilterRuleLabel {
-            rule: exp
-                .matched
-                .unwrap_or_else(|| exp.stage.as_str().to_string()),
-            list: exp.source.unwrap_or_default(),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rec_failure(
         &self,
