@@ -13,6 +13,8 @@ onetdns-core.workspace = true
 
 [dev-dependencies]
 p256 = { workspace = true }
+onetdns-tls.workspace = true
+rcgen = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

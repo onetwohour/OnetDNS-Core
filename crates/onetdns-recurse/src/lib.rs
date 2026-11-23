@@ -143,6 +143,8 @@ pub struct Recursor {
     /// Improves cache hits; cannot be combined with 0x20.
     lowercase_outgoing: bool,
 
+    opportunistic: Option<onetdns_forward::OpportunisticEncryption>,
+
     /// Always validates, ignoring the client's CD bit.
     ignore_cd: bool,
 
@@ -277,6 +279,14 @@ const UNKNOWN_SERVER_PATIENCE: Duration = Duration::from_millis(400);
 /// Two suffice to wait on a slow server while asking the next. More would widen what a worker
 /// keeps in flight, which DNSBomb-style attacks use to make answers arrive at once.
 const MAX_EXCHANGES_PER_QUERY: usize = 2;
+
+/// One exchange a query may make with a server. An encrypted rung comes right before the same
+/// server's plaintext rung.
+#[derive(Clone, Copy)]
+struct Rung {
+    server: SocketAddr,
+    encrypted: Option<onetdns_forward::EncryptedRoute>,
+}
 
 /// Even a near server can exceed three times its RTT from scheduling delay alone; this keeps that
 /// from sending every query twice.
@@ -676,6 +686,7 @@ impl Recursor {
             caps_for_id: true,
             authority_tcp: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lowercase_outgoing: false,
+            opportunistic: None,
             ignore_cd: true,
             deny_servers: Vec::new(),
             allow_servers: Vec::new(),
@@ -788,6 +799,16 @@ impl Recursor {
 
     pub fn with_qname_min_strict(mut self, strict: bool) -> Self {
         self.qname_min_strict = strict;
+        self
+    }
+
+    /// Asks servers known to answer over DoT or DoQ that way first, with plaintext as the
+    /// fallback. The reactor lane asks over UDP only and must stay off while this is set.
+    pub fn with_opportunistic_encryption(
+        mut self,
+        encryption: Option<onetdns_forward::OpportunisticEncryption>,
+    ) -> Self {
+        self.opportunistic = encryption;
         self
     }
 
@@ -2689,6 +2710,9 @@ impl Recursor {
     /// and waiting to the end would let one slow server take the rest. Name server resolution stops
     /// at the first usable address, so the list is short; dividing time among those few would let
     /// one dead server keep the remaining names from being tried.
+    ///
+    /// A server known to answer over encryption is asked that way first, and in plaintext once
+    /// that fails or outlasts its patience; both count against the same deadline and in-flight cap.
     fn query_any_reserving(
         &self,
         servers: &[SocketAddr],
@@ -2703,6 +2727,7 @@ impl Recursor {
         self.apply_outgoing_case(&mut sent);
 
         let ordered = self.ask_order(servers, zone)?;
+        let rungs = self.rungs(&ordered);
 
         let per_exchange_deadline = Instant::now().checked_add(self.timeout).unwrap_or(deadline);
         let deadline = deadline.min(per_exchange_deadline);
@@ -2710,7 +2735,8 @@ impl Recursor {
         let per_server = (self.timeout / divisor).max(Duration::from_millis(300));
         let request = std::sync::Arc::new(sent);
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut started: Vec<Option<Instant>> = vec![None; ordered.len()];
+        let mut started: Vec<Option<Instant>> = vec![None; rungs.len()];
+        let mut skipped = vec![false; rungs.len()];
         let mut next = 0;
         let mut in_flight = 0usize;
         let mut ask_next_at = Instant::now();
@@ -2719,10 +2745,13 @@ impl Recursor {
         // exchange overruns.
         let settled_by = deadline + per_server;
         loop {
+            while skipped.get(next) == Some(&true) {
+                next += 1;
+            }
             let now = Instant::now();
             let asking = now < deadline;
             if !asking && (in_flight == 0 || now >= settled_by) {
-                if next < ordered.len() {
+                if next < rungs.len() {
                     rtrace!(
                         "Ran out of time before asking some of the {} servers: name={}",
                         servers.len(),
@@ -2736,16 +2765,16 @@ impl Recursor {
                 break;
             }
             if asking
-                && next < ordered.len()
+                && next < rungs.len()
                 && (in_flight == 0 || (now >= ask_next_at && in_flight < MAX_EXCHANGES_PER_QUERY))
             {
-                let server = ordered[next];
+                let rung = rungs[next];
                 let attempt_timeout = per_server.min(deadline - now);
-                self.spawn_attempt(server, &request, attempt_timeout, next, &tx);
+                self.spawn_attempt(rung, &request, attempt_timeout, next, &tx);
                 started[next] = Some(now);
                 next += 1;
                 in_flight += 1;
-                ask_next_at = now + self.server_patience(server.ip()).min(per_server);
+                ask_next_at = now + self.rung_patience(rung).min(per_server);
                 continue;
             }
             if in_flight == 0 {
@@ -2756,7 +2785,7 @@ impl Recursor {
             // join it and time out with it.
             let wake = if !asking {
                 settled_by
-            } else if next < ordered.len() && in_flight < MAX_EXCHANGES_PER_QUERY {
+            } else if next < rungs.len() && in_flight < MAX_EXCHANGES_PER_QUERY {
                 ask_next_at.min(deadline)
             } else {
                 deadline
@@ -2765,7 +2794,9 @@ impl Recursor {
                 continue;
             };
             in_flight -= 1;
-            let s = ordered[idx];
+            let rung = rungs[idx];
+            let s = rung.server;
+            let target = rung.encrypted.map_or(s, |route| route.endpoint);
             let elapsed = started[idx]
                 .take()
                 .map_or(Duration::ZERO, |at| at.elapsed());
@@ -2774,7 +2805,7 @@ impl Recursor {
                     if self.caps_for_id && !questions_case_exact(&r.questions, &request.questions) {
                         rtrace!(
                             "{} did not echo the query name case; dropping: sent={}, got={}",
-                            s,
+                            target,
                             request
                                 .questions
                                 .first()
@@ -2785,13 +2816,30 @@ impl Recursor {
                                 .map(|q| q.name.to_string())
                                 .unwrap_or_default()
                         );
-                        self.infra_fail(s.ip(), zone);
+                        if rung.encrypted.is_none() {
+                            self.infra_fail(s.ip(), zone);
+                        }
                         ask_next_at = Instant::now();
                         continue;
                     }
+                    if rung.encrypted.is_some() {
+                        // The server answered; asking it again in plaintext gets the same answer.
+                        if let Some(plain) = skipped.get_mut(idx + 1) {
+                            *plain = true;
+                        }
+                    }
                     if response_usable_for_iteration(&r, &request, zone) {
-                        self.infra_success(s.ip(), zone, elapsed);
-                        self.record_unanswered(&ordered, &started);
+                        match rung.encrypted {
+                            // The time may include a handshake, so it is no RTT sample.
+                            Some(_) => self.infra_answered(s.ip(), zone),
+                            None => {
+                                self.infra_success(s.ip(), zone, elapsed);
+                                if let Some(encryption) = self.opportunistic {
+                                    encryption.after_plain_answer(s.ip(), &request);
+                                }
+                            }
+                        }
+                        self.record_unanswered(&rungs, &started);
                         return Ok(r);
                     }
 
@@ -2802,7 +2850,7 @@ impl Recursor {
                 Err(error) => {
                     rtrace!(
                         "Asked {} but got no answer: name={}, type={:?}, error={:?}",
-                        s,
+                        target,
                         request
                             .questions
                             .first()
@@ -2811,13 +2859,47 @@ impl Recursor {
                         request.questions.first().map(|q| q.qtype),
                         error
                     );
-                    self.infra_fail(s.ip(), zone);
+                    // A failed encryption says nothing about the server in plaintext, which is
+                    // asked next.
+                    if rung.encrypted.is_none() {
+                        self.infra_fail(s.ip(), zone);
+                    }
                     ask_next_at = Instant::now();
                 }
             }
         }
-        self.record_unanswered(&ordered, &started);
+        self.record_unanswered(&rungs, &started);
         fallback.ok_or(RecurseError::NoResponse)
+    }
+
+    /// Each server in order, preceded by its encrypted endpoint when one is known to answer.
+    fn rungs(&self, ordered: &[SocketAddr]) -> Vec<Rung> {
+        let mut rungs = Vec::with_capacity(ordered.len());
+        for &server in ordered {
+            if let Some(route) = self
+                .opportunistic
+                .and_then(|encryption| encryption.route(server.ip()))
+            {
+                rungs.push(Rung {
+                    server,
+                    encrypted: Some(route),
+                });
+            }
+            rungs.push(Rung {
+                server,
+                encrypted: None,
+            });
+        }
+        rungs
+    }
+
+    /// A new encrypted connection costs more round trips than the query alone.
+    fn rung_patience(&self, rung: Rung) -> Duration {
+        let patience = self.server_patience(rung.server.ip());
+        match rung.encrypted {
+            Some(route) => patience * route.encryption.round_trips_on_new_connection(),
+            None => patience,
+        }
     }
 
     /// Lets the caller ask other servers while this one runs. If the caller finishes first and
@@ -2826,17 +2908,19 @@ impl Recursor {
     /// interception may be detected mid-resolution and a UDP query after that gets no answer.
     fn spawn_attempt(
         &self,
-        server: SocketAddr,
+        rung: Rung,
         request: &std::sync::Arc<Message>,
         timeout: Duration,
         idx: usize,
         tx: &std::sync::mpsc::Sender<(usize, Result<Message, onetdns_forward::ForwardError>)>,
     ) {
         let merge_case = self.caps_for_id;
-        let transport = if self.authority_over_tcp() {
-            onetdns_forward::AuthorityTransport::Tcp
-        } else {
-            onetdns_forward::AuthorityTransport::Udp
+        let (server, transport) = match rung.encrypted {
+            Some(route) => (route.endpoint, route.transport()),
+            None if self.authority_over_tcp() => {
+                (rung.server, onetdns_forward::AuthorityTransport::Tcp)
+            }
+            None => (rung.server, onetdns_forward::AuthorityTransport::Udp),
         };
         let attempt = {
             let request = request.clone();
@@ -2859,11 +2943,12 @@ impl Recursor {
         }
     }
 
-    /// Records the RTT of servers abandoned before answering as at least the time waited.
-    fn record_unanswered(&self, ordered: &[SocketAddr], started: &[Option<Instant>]) {
-        for (server, at) in ordered.iter().zip(started) {
-            if let Some(at) = at {
-                self.record_rtt_at_least(server.ip(), at.elapsed());
+    /// Records the RTT of servers abandoned before answering as at least the time waited. An
+    /// encrypted wait may include a handshake, so it is not counted.
+    fn record_unanswered(&self, rungs: &[Rung], started: &[Option<Instant>]) {
+        for (rung, at) in rungs.iter().zip(started) {
+            if let (None, Some(at)) = (rung.encrypted, at) {
+                self.record_rtt_at_least(rung.server.ip(), at.elapsed());
             }
         }
     }
@@ -2965,6 +3050,10 @@ impl Recursor {
     /// Updates the RTT and clears the zone's failure record.
     fn infra_success(&self, ip: IpAddr, zone: &Name, rtt: Duration) {
         self.record_rtt(ip, rtt);
+        self.infra_answered(ip, zone);
+    }
+
+    fn infra_answered(&self, ip: IpAddr, zone: &Name) {
         self.infra.lock_recover().pop(&InfraKey::new(ip, zone));
     }
 
@@ -8699,5 +8788,222 @@ mod tests {
             before + 1,
             "검증 실패 SERVFAIL은 이 요청의 관측 카운터를 한 번 올려야 함"
         );
+    }
+
+    mod opportunistic_encryption {
+        use super::*;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use onetdns_forward::OpportunisticEncryption;
+        use onetdns_tls::{server_handshake, signer_from_pkcs8_der, ServerConfig};
+
+        const ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 80);
+
+        fn answer(req: &Message) -> Message {
+            a_answer(req, ANSWER)
+        }
+
+        /// Counts the queries it answers.
+        fn plain_server(ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicUsize>) {
+            let sock = UdpSocket::bind((ip, 0)).unwrap();
+            let addr = sock.local_addr().unwrap();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let counted = asked.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    if let Ok(req) = Message::parse(&buf[..n]) {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock.send_to(&answer(&req).try_encode().unwrap(), from);
+                    }
+                }
+            });
+            (addr, asked)
+        }
+
+        /// Counts the queries it receives; while `silent` is set it keeps connections but
+        /// answers nothing. The certificate names nothing the client knows.
+        fn dot_server(ip: Ipv4Addr, silent: Arc<AtomicBool>) -> (u16, Arc<AtomicUsize>) {
+            let ck =
+                rcgen::generate_simple_self_signed(vec!["unrelated.test".to_string()]).unwrap();
+            let (sign_scheme, sign) = signer_from_pkcs8_der(&ck.key_pair.serialize_der()).unwrap();
+            let cfg = Arc::new(ServerConfig {
+                cert_chain: vec![ck.cert.der().to_vec()],
+                sign_scheme,
+                sign,
+                alpn: vec![b"dot".to_vec()],
+                client_ca: None,
+                resumption: None,
+            });
+            let listener = TcpListener::bind((ip, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let counted = asked.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let (cfg, silent, counted) = (cfg.clone(), silent.clone(), counted.clone());
+                    std::thread::spawn(move || {
+                        let Ok(mut tls) = server_handshake(&mut stream, &cfg) else {
+                            return;
+                        };
+                        let mut buf = Vec::new();
+                        loop {
+                            let framed_len = |buf: &[u8]| {
+                                (buf.len() >= 2)
+                                    .then(|| 2 + usize::from(u16::from_be_bytes([buf[0], buf[1]])))
+                            };
+                            while framed_len(&buf).is_none_or(|len| buf.len() < len) {
+                                match tls.read_app(&mut stream) {
+                                    Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                                    _ => return,
+                                }
+                            }
+                            let len = framed_len(&buf).unwrap();
+                            let req = Message::parse(&buf[2..len]).unwrap();
+                            buf.drain(..len);
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            if silent.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            let out = answer(&req).try_encode().unwrap();
+                            let mut framed = (out.len() as u16).to_be_bytes().to_vec();
+                            framed.extend_from_slice(&out);
+                            if tls.write_app(&mut stream, &framed).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            (port, asked)
+        }
+
+        fn closed_udp_port(ip: Ipv4Addr) -> u16 {
+            UdpSocket::bind((ip, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+            let until = Instant::now() + limit;
+            while Instant::now() < until {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done()
+        }
+
+        fn ask(rec: &Recursor, server: SocketAddr) -> Result<Message, RecurseError> {
+            let zone = Name::from_str("adot.test").unwrap();
+            let query = make_query(
+                &Name::from_str("host.adot.test").unwrap(),
+                RecordType::A,
+                false,
+            );
+            rec.query_any(&[server], &query, &zone, rec.query_deadline())
+        }
+
+        fn recursor(encryption: OpportunisticEncryption) -> Recursor {
+            Recursor::new(vec![], Duration::from_secs(4))
+                .with_test_loopback()
+                .with_opportunistic_encryption(Some(encryption))
+        }
+
+        #[test]
+        /// The first answer comes in plaintext and starts a probe over DoT; once it answers, the
+        /// server is asked over DoT only.
+        fn a_server_offering_dot_is_asked_over_it_after_a_probe() {
+            let ip = Ipv4Addr::new(127, 0, 0, 150);
+            let (server, plain_asked) = plain_server(ip);
+            let (dot_port, dot_asked) = dot_server(ip, Arc::new(AtomicBool::new(false)));
+            let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip));
+            let rec = recursor(encryption);
+
+            ask(&rec, server).unwrap();
+            assert_eq!(plain_asked.load(Ordering::SeqCst), 1);
+            assert!(wait_until(Duration::from_secs(5), || encryption
+                .route(server.ip())
+                .is_some()));
+
+            let response = ask(&rec, server).unwrap();
+            assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+            assert_eq!(plain_asked.load(Ordering::SeqCst), 1, "asked over DoT only");
+            assert_eq!(
+                dot_asked.load(Ordering::SeqCst),
+                2,
+                "the probe, then the query"
+            );
+        }
+
+        #[test]
+        /// DoT resets and DoQ is closed: every query is answered in plaintext, and neither is
+        /// tried again within the damping period.
+        fn a_server_without_encryption_is_answered_in_plaintext_and_not_probed_again() {
+            let ip = Ipv4Addr::new(127, 0, 0, 151);
+            let (server, plain_asked) = plain_server(ip);
+            let listener = TcpListener::bind((ip, 0)).unwrap();
+            let dot_port = listener.local_addr().unwrap().port();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let counted = accepts.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip));
+            let rec = recursor(encryption);
+
+            for _ in 0..5 {
+                let response = ask(&rec, server).unwrap();
+                assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(plain_asked.load(Ordering::SeqCst), 5);
+            assert_eq!(accepts.load(Ordering::SeqCst), 1, "DoT is probed once");
+            assert_eq!(encryption.route(server.ip()), None);
+        }
+
+        #[test]
+        /// When DoT stops answering, the plaintext query goes out after the encrypted patience
+        /// rather than after the encrypted exchange times out, and the query makes no more than
+        /// those two exchanges.
+        fn a_silent_encrypted_server_is_raced_in_plaintext_within_the_budget() {
+            let ip = Ipv4Addr::new(127, 0, 0, 152);
+            let (server, plain_asked) = plain_server(ip);
+            let silent = Arc::new(AtomicBool::new(false));
+            let (dot_port, dot_asked) = dot_server(ip, silent.clone());
+            let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip));
+            let rec = recursor(encryption);
+
+            ask(&rec, server).unwrap();
+            assert!(wait_until(Duration::from_secs(5), || encryption
+                .route(server.ip())
+                .is_some()));
+            silent.store(true, Ordering::SeqCst);
+            let (plain_before, dot_before) = (
+                plain_asked.load(Ordering::SeqCst),
+                dot_asked.load(Ordering::SeqCst),
+            );
+
+            let started = Instant::now();
+            let response = ask(&rec, server).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+            let patience = rec.server_patience(server.ip())
+                * onetdns_forward::Encryption::Dot.round_trips_on_new_connection();
+            assert!(
+                elapsed >= patience && elapsed < Duration::from_secs(1),
+                "{elapsed:?}"
+            );
+            assert_eq!(plain_asked.load(Ordering::SeqCst), plain_before + 1);
+            assert_eq!(dot_asked.load(Ordering::SeqCst), dot_before + 1);
+        }
     }
 }

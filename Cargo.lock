@@ -1063,7 +1063,9 @@ dependencies = [
  "onetdns-dnssec",
  "onetdns-forward",
  "onetdns-proto",
+ "onetdns-tls",
  "p256",
+ "rcgen",
 ]
 
 [[package]]
