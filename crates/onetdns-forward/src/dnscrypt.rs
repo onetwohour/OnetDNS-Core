@@ -354,13 +354,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// TCP first: Windows reserves ranges of TCP ports that UDP may still be given. A port UDP
+    /// cannot take stays held, so the next try gets another.
+    fn bind_udp_and_tcp() -> (UdpSocket, TcpListener) {
+        let mut taken = Vec::new();
+        for _ in 0..512 {
+            let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+            match UdpSocket::bind(tcp.local_addr().unwrap()) {
+                Ok(udp) => return (udp, tcp),
+                Err(_) => taken.push(tcp),
+            }
+        }
+        panic!("UDP 와 TCP 가 함께 비어 있는 포트를 찾지 못했습니다");
+    }
+
     /// A DNSCrypt server on one loopback port, UDP and TCP, answering A queries with `answers`
     /// addresses and truncating what does not fit the UDP budget.
     pub(crate) fn spawn_server(answers: usize) -> TestServer {
         let provider = Provider::generate(PROVIDER, 3_600);
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (udp, tcp) = bind_udp_and_tcp();
         let addr = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(addr).unwrap();
         tcp.set_nonblocking(true).unwrap();
         let server = TestServer {
             addr,
