@@ -667,6 +667,7 @@ impl<S: QuicService> Listener<S> {
                     let now_ms = self.now_ms();
                     self.table.go_away(&self.socket, now_ms);
                 }
+                // Draining once per datagram is what bounds `done` (transports.md).
                 self.pool.drain_done(&mut done);
                 if !done.is_empty() {
                     let now_ms = self.now_ms();
