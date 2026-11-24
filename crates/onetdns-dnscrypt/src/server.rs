@@ -201,12 +201,9 @@ fn read_and_answer<H, A, D>(
     D: Fn(SocketAddr) -> bool,
 {
     let mut buf = vec![0u8; relay::MAX_ANONYMIZED];
-    loop {
-        let received = socket.recv_from(&mut buf);
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-        let (n, src) = match received {
+    // Checked before receiving, not after: a query read during a handoff must still be answered.
+    while !shutdown.load(Ordering::Relaxed) {
+        let (n, src) = match socket.recv_from(&mut buf) {
             Ok(x) => x,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

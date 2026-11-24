@@ -46,8 +46,9 @@ pub fn shared_read_timeout(poll: Duration) -> Option<Duration> {
 }
 
 /// Sends one-byte datagrams, which no listener answers, to the socket bound to `addr` until
-/// `running` reports no reader left. Each reader checks its stop flag before handling what it
-/// received; one busy with a slow request gets its wake-up after finishing it.
+/// `running` reports no reader left. Each reader answers what it already received and checks its
+/// stop flag before the next receive; one busy with a slow request gets its wake-up after finishing
+/// it.
 pub fn wake_readers(addr: SocketAddr, running: impl Fn() -> usize) -> io::Result<()> {
     let target = if addr.ip().is_unspecified() {
         match addr {
