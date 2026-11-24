@@ -510,13 +510,56 @@ fn relay_connect_error(error: ConnectError) -> RelayError {
     }
 }
 
+/// The key document a target publishes: an ODoH target's configs or an OHTTP gateway's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum KeySource {
+    Odoh,
+    Ohttp,
+}
+
+impl KeySource {
+    fn path(self) -> &'static str {
+        match self {
+            KeySource::Odoh => onetdns_http2::server::ODOH_CONFIGS_PATH,
+            KeySource::Ohttp => onetdns_http2::server::OHTTP_GATEWAY_PATH,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            KeySource::Odoh => "ODoH target",
+            KeySource::Ohttp => "OHTTP gateway",
+        }
+    }
+
+    fn protocol(self) -> &'static str {
+        match self {
+            KeySource::Odoh => "odoh",
+            KeySource::Ohttp => "ohttp",
+        }
+    }
+
+    fn parse(self, body: &[u8]) -> Option<TargetKeys> {
+        match self {
+            KeySource::Odoh => PublicConfig::from_configs(body).ok().map(TargetKeys::Odoh),
+            KeySource::Ohttp => crate::ohttp::KeyConfig::from_keys(body).map(TargetKeys::Ohttp),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum TargetKeys {
+    Odoh(PublicConfig),
+    Ohttp(crate::ohttp::KeyConfig),
+}
+
 /// A cached config is fetched again at a random point between half and nine tenths of this.
 const CONFIG_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// After a 401 the new config is fetched at a random point in this window, never at once: the fetch
 /// comes from this server's address, and a fetch followed by the same question through the proxy
 /// would let the target tie the two together.
-const REFETCH_AFTER_UNKNOWN_KEY: (Duration, Duration) =
+pub(crate) const REFETCH_AFTER_UNKNOWN_KEY: (Duration, Duration) =
     (Duration::from_secs(30), Duration::from_secs(300));
 
 /// How long to wait before trying a failed background fetch again.
@@ -527,16 +570,16 @@ const REFRESH_POLL: Duration = Duration::from_secs(30);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHED_CONFIGS: usize = 64;
 
-type ConfigKey = (String, SocketAddr, crate::TlsCacheScope);
+type ConfigKey = (KeySource, String, SocketAddr, crate::TlsCacheScope);
 
 struct CachedConfig {
-    config: PublicConfig,
+    keys: TargetKeys,
     trust: TrustStore,
     refresh_at: Instant,
     used_at: Instant,
 }
 
-/// Shared by every thread, so a target's config is fetched once rather than once per thread.
+/// Shared by every thread, so a target's keys are fetched once rather than once per thread.
 fn config_cache() -> &'static Mutex<LruMap<ConfigKey, CachedConfig>> {
     static CONFIGS: OnceLock<Mutex<LruMap<ConfigKey, CachedConfig>>> = OnceLock::new();
     CONFIGS.get_or_init(|| Mutex::new(LruMap::new(MAX_CACHED_CONFIGS)))
@@ -557,21 +600,25 @@ fn start_refresher() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         let spawned = std::thread::Builder::new()
-            .name("odoh-config-refresh".into())
+            .name("oblivious-key-refresh".into())
             .spawn(|| loop {
                 std::thread::sleep(REFRESH_POLL);
-                refresh_due(Instant::now());
+                refresh_due(Instant::now(), None);
             });
         if let Err(error) = spawned {
-            onetdns_core::warn!(event = "forward.odoh_refresh_spawn_failed", %error, "Could not start ODoH target config refreshes; a target's new key is picked up only after a restart");
+            onetdns_core::warn!(event = "forward.oblivious_refresh_spawn_failed", %error, "Could not start ODoH and OHTTP key refreshes; a target's new key is picked up only after a restart");
         }
     });
 }
 
-/// Fetches the configs due by `now` and forgets the ones no query has used for a lifetime.
-fn refresh_due(now: Instant) {
+/// Fetches the keys due by `now` and forgets the ones no query has used for a lifetime. `target`
+/// limits this to one target's address, so a test refreshes only its own.
+pub(crate) fn refresh_due(now: Instant, target: Option<SocketAddr>) {
     let mut due = Vec::new();
     config_cache().lock_recover().retain(|key, cached| {
+        if target.is_some_and(|target| target != key.2) {
+            return true;
+        }
         if now.saturating_duration_since(cached.used_at) > CONFIG_LIFETIME {
             return false;
         }
@@ -582,18 +629,18 @@ fn refresh_due(now: Instant) {
     });
     for (key, trust) in due {
         let deadline = Instant::now() + REFRESH_TIMEOUT;
-        let fetched = fetch_config((&key.0, key.1), deadline, &trust);
+        let fetched = fetch_keys(key.0, (&key.1, key.2), deadline, &trust);
         let mut cache = config_cache().lock_recover();
         let Some(cached) = cache.peek_mut(&key) else {
             continue;
         };
         match fetched {
-            Ok(config) => {
-                cached.config = config;
+            Ok(keys) => {
+                cached.keys = keys;
                 cached.refresh_at = next_refresh(Instant::now());
             }
             Err(error) => {
-                onetdns_core::debug!(event = "forward.odoh_config_refresh_failed", target = %key.0, %error, "Could not refresh an ODoH target's key config; keeping the cached one");
+                onetdns_core::debug!(event = "forward.oblivious_keys_refresh_failed", kind = key.0.name(), target = %key.1, %error, "Could not refresh a target's key config; keeping the cached one");
                 cached.refresh_at = Instant::now() + random_between(RETRY_FAILED_FETCH);
             }
         }
@@ -641,37 +688,20 @@ pub(crate) fn exchange(
     }
     let mut query = wire.to_vec();
     query[..2].fill(0);
-    let config = target_config(target, deadline, trust)?;
+    let TargetKeys::Odoh(config) = target_keys(KeySource::Odoh, target, deadline, trust)? else {
+        return Err(ForwardError::BadResponse);
+    };
     let (message, pending) = config
         .seal_query(&query)
         .map_err(|_| ForwardError::BadResponse)?;
-    let reply = doh::with_pooled(
-        &Endpoint::Direct(proxy),
+    let reply = post(
+        proxy,
         server_name,
         path,
+        &message,
+        ObliviousMedia::Odoh,
         deadline,
         trust,
-        |conn| {
-            doh::arm_probe(conn, deadline);
-            let sent = conn.client.oblivious_probed(
-                server_name,
-                path,
-                &message,
-                ObliviousMedia::Odoh,
-                |stream| stream.inner_mut().set_deadline(deadline),
-            );
-            match sent {
-                Ok(body) => Ok(Ok(body)),
-                Err(H2Error::BadStatus(status)) => Ok(Err(status)),
-                Err(H2Error::Closed | H2Error::Refused) => {
-                    Err(ForwardError::Io("ODoH proxy closed the connection".into()))
-                }
-                Err(H2Error::Protocol) => Err(ForwardError::BadResponse),
-                Err(H2Error::Io) => Err(ForwardError::Io(
-                    "I/O error on the ODoH proxy connection".into(),
-                )),
-            }
-        },
     )?;
     match reply {
         Ok(body) => {
@@ -683,7 +713,7 @@ pub(crate) fn exchange(
             Ok(response)
         }
         Err(401) => {
-            refetch_later(target, trust);
+            refetch_later(KeySource::Odoh, target, trust);
             Err(ForwardError::Io(
                 "The ODoH target no longer accepts its cached key; fetching the new one in the background".into(),
             ))
@@ -692,36 +722,94 @@ pub(crate) fn exchange(
     }
 }
 
-/// Only the first query to a target fetches its config itself.
-fn target_config(
+/// POSTs an ObliviousDoHMessage or an Encapsulated Request to the proxy or relay on this thread's
+/// pooled connection. The inner `Err` is the status of a reply other than 200.
+pub(crate) fn post(
+    proxy: SocketAddr,
+    server_name: &str,
+    path: &str,
+    message: &[u8],
+    media: ObliviousMedia,
+    deadline: Instant,
+    trust: &TrustStore,
+) -> Result<Result<Vec<u8>, u16>, ForwardError> {
+    let peer = match media {
+        ObliviousMedia::Odoh => "ODoH proxy",
+        ObliviousMedia::Ohttp => "OHTTP relay",
+    };
+    doh::with_pooled(
+        &Endpoint::Direct(proxy),
+        server_name,
+        path,
+        deadline,
+        trust,
+        |conn| {
+            doh::arm_probe(conn, deadline);
+            let sent = conn
+                .client
+                .oblivious_probed(server_name, path, message, media, |stream| {
+                    stream.inner_mut().set_deadline(deadline)
+                });
+            match sent {
+                Ok(body) => Ok(Ok(body)),
+                Err(H2Error::BadStatus(status)) => Ok(Err(status)),
+                Err(H2Error::Closed | H2Error::Refused) => {
+                    Err(ForwardError::Io(format!("{peer} closed the connection")))
+                }
+                Err(H2Error::Protocol) => Err(ForwardError::BadResponse),
+                Err(H2Error::Io) => Err(ForwardError::Io(format!(
+                    "I/O error on the {peer} connection"
+                ))),
+            }
+        },
+    )
+}
+
+/// Only the first query to a target fetches its keys itself.
+pub(crate) fn target_keys(
+    source: KeySource,
     (name, addr): (&str, SocketAddr),
     deadline: Instant,
     trust: &TrustStore,
-) -> Result<PublicConfig, ForwardError> {
-    let key = (name.to_string(), addr, crate::tls_cache_scope(trust));
+) -> Result<TargetKeys, ForwardError> {
+    let key = (
+        source,
+        name.to_string(),
+        addr,
+        crate::tls_cache_scope(trust),
+    );
     if let Some(cached) = config_cache().lock_recover().get_mut(&key) {
         cached.used_at = Instant::now();
-        return Ok(cached.config.clone());
+        return Ok(cached.keys.clone());
     }
-    let config = fetch_config((name, addr), deadline, trust)?;
+    let keys = fetch_keys(source, (name, addr), deadline, trust)?;
     let now = Instant::now();
     config_cache().lock_recover().put(
         key,
         CachedConfig {
-            config: config.clone(),
+            keys: keys.clone(),
             trust: trust.clone(),
             refresh_at: next_refresh(now),
             used_at: now,
         },
     );
     start_refresher();
-    Ok(config)
+    Ok(keys)
 }
 
 /// The first 401 picks the time. Taking the earliest of every 401's pick would pull it toward the
 /// start of the window.
-fn refetch_later((name, addr): (&str, SocketAddr), trust: &TrustStore) {
-    let key = (name.to_string(), addr, crate::tls_cache_scope(trust));
+pub(crate) fn refetch_later(
+    source: KeySource,
+    (name, addr): (&str, SocketAddr),
+    trust: &TrustStore,
+) {
+    let key = (
+        source,
+        name.to_string(),
+        addr,
+        crate::tls_cache_scope(trust),
+    );
     if let Some(cached) = config_cache().lock_recover().peek_mut(&key) {
         let now = Instant::now();
         if cached.refresh_at > now + REFETCH_AFTER_UNKNOWN_KEY.1 {
@@ -730,41 +818,43 @@ fn refetch_later((name, addr): (&str, SocketAddr), trust: &TrustStore) {
     }
 }
 
-fn fetch_config(
+fn fetch_keys(
+    source: KeySource,
     (name, addr): (&str, SocketAddr),
     deadline: Instant,
     trust: &TrustStore,
-) -> Result<PublicConfig, ForwardError> {
+) -> Result<TargetKeys, ForwardError> {
+    let target = source.name();
     let mut conn =
         doh::connect_h2(&Endpoint::Direct(addr), name, deadline, trust, None).map_err(|error| {
             match error {
                 ConnectError::Tcp(error) => error,
                 ConnectError::Tls(error) => {
-                    crate::note_upstream_connect_failure("odoh", addr, name, &error);
-                    ForwardError::Io(format!("ODoH target handshake: {error}"))
+                    crate::note_upstream_connect_failure(source.protocol(), addr, name, &error);
+                    ForwardError::Io(format!("{target} handshake: {error}"))
                 }
                 ConnectError::Revoked(error) => error,
-                ConnectError::Preface => ForwardError::Io("ODoH target HTTP/2 preface".into()),
+                ConnectError::Preface => ForwardError::Io(format!("{target} HTTP/2 preface")),
             }
         })?;
     conn.client.stream_mut().inner_mut().set_deadline(deadline);
     let body = conn
         .client
-        .odoh_configs(name)
+        .key_configs(name, source.path())
         .map_err(|error| match error {
             H2Error::BadStatus(status) => {
-                ForwardError::Io(format!("ODoH target config status {status}"))
+                ForwardError::Io(format!("{target} key config status {status}"))
             }
-            _ => ForwardError::Io("Could not fetch the ODoH target config".into()),
+            _ => ForwardError::Io(format!("Could not fetch the {target} key config")),
         })?;
-    PublicConfig::from_configs(&body).map_err(|_| ForwardError::BadResponse)
+    source.parse(&body).ok_or(ForwardError::BadResponse)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    mod client {
+    pub(crate) mod client {
         use super::*;
         use std::net::{Ipv4Addr, TcpListener};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -836,7 +926,7 @@ mod tests {
             }
         }
 
-        fn test_tls() -> (Arc<TlsServerConfig>, Arc<TrustStore>) {
+        pub(crate) fn test_tls() -> (Arc<TlsServerConfig>, Arc<TrustStore>) {
             let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
             let cert_der = ck.cert.der().to_vec();
             let key_der = ck.key_pair.serialize_der();
@@ -940,7 +1030,10 @@ mod tests {
                 1,
                 "a fetch right after the 401 would tie this server's address to the query"
             );
-            refresh_due(Instant::now() + REFETCH_AFTER_UNKNOWN_KEY.1);
+            refresh_due(
+                Instant::now() + REFETCH_AFTER_UNKNOWN_KEY.1,
+                Some(server.addr),
+            );
             assert_eq!(server.config_fetches.load(Ordering::Relaxed), 2);
             ask(4).expect("the refreshed config carries the new key");
             assert_eq!(server.config_fetches.load(Ordering::Relaxed), 2);

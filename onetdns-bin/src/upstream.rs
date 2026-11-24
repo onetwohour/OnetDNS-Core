@@ -52,7 +52,9 @@ pub fn ensure_not_listener(
             Endpoint::Socks5 { .. } => None,
         };
         let target = match &upstream.transport {
-            Transport::Odoh { target_addr, .. } => Some(*target_addr),
+            Transport::Odoh { target_addr, .. } | Transport::Ohttp { target_addr, .. } => {
+                Some(*target_addr)
+            }
             _ => None,
         };
         direct.into_iter().chain(target)
@@ -134,7 +136,7 @@ pub fn servers_to_upstreams(servers: &[String], route: &UpstreamRoute) -> Vec<Up
     out
 }
 
-/// Hostnames need bootstrap servers: the upstream's, and an Oblivious DoH target's.
+/// Hostnames need bootstrap servers: the upstream's, and an ODoH target's or OHTTP gateway's.
 pub fn url_uses_hostname(url: &str) -> bool {
     if url.trim().starts_with("sdns://") {
         return false;
@@ -144,11 +146,11 @@ pub fn url_uses_hostname(url: &str) -> bool {
         return false;
     };
     is_name(parsed.host)
-        || parsed.scheme == "odoh"
+        || matches!(parsed.scheme.as_str(), "odoh" | "ohttp")
             && parsed
                 .path
                 .as_deref()
-                .and_then(onetdns_config::parse_odoh_upstream_path)
+                .and_then(onetdns_config::parse_oblivious_upstream_path)
                 .and_then(|odoh| split_authority(odoh.target_host))
                 .is_some_and(|(host, _)| is_name(host))
 }
@@ -237,17 +239,31 @@ fn parse_native_upstream(url: &str, route: &UpstreamRoute) -> Option<Upstream> {
             doh_path(),
         )),
         "odoh" => {
-            let odoh = onetdns_config::parse_odoh_upstream_path(parsed.path.as_deref()?)?;
+            let odoh = onetdns_config::parse_oblivious_upstream_path(parsed.path.as_deref()?)?;
             let (target_name, target_port) = split_authority(odoh.target_host)?;
             let target_ip = resolve_host(target_name, bootstrap)?;
             Some(Upstream::odoh(
                 SocketAddr::new(ip, port.unwrap_or(443)),
                 sni(),
                 onetdns_forward::odoh::proxy_request_path(
-                    odoh.proxy_path,
+                    odoh.relay_path,
                     odoh.target_host,
                     odoh.target_path,
                 ),
+                target_name,
+                SocketAddr::new(target_ip, target_port.unwrap_or(443)),
+            ))
+        }
+        "ohttp" => {
+            let ohttp = onetdns_config::parse_oblivious_upstream_path(parsed.path.as_deref()?)?;
+            let (target_name, target_port) = split_authority(ohttp.target_host)?;
+            let target_ip = resolve_host(target_name, bootstrap)?;
+            Some(Upstream::ohttp(
+                SocketAddr::new(ip, port.unwrap_or(443)),
+                sni(),
+                ohttp.relay_path,
+                ohttp.target_host,
+                ohttp.target_path,
                 target_name,
                 SocketAddr::new(target_ip, target_port.unwrap_or(443)),
             ))
@@ -420,6 +436,48 @@ mod tests {
         assert_eq!(
             ups[5].endpoint,
             Endpoint::Direct("8.8.8.8:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ohttp_upstreams_carry_the_relay_and_the_gateway() {
+        let up = parse_native_upstream(
+            "ohttp://192.0.2.1/relay?targethost=[2001:db8::2]:8443&targetpath=/dns-query#relay.example",
+            &DIRECT,
+        )
+        .unwrap();
+        assert_eq!(
+            up.endpoint,
+            Endpoint::Direct("192.0.2.1:443".parse().unwrap())
+        );
+        assert_eq!(
+            up.transport,
+            Transport::Ohttp {
+                server_name: "relay.example".into(),
+                path: "/relay".into(),
+                target_host: "[2001:db8::2]:8443".into(),
+                target_path: "/dns-query".into(),
+                target_name: "2001:db8::2".into(),
+                target_addr: "[2001:db8::2]:8443".parse().unwrap(),
+            }
+        );
+        assert!(url_uses_hostname(
+            "ohttp://192.0.2.1/r?targethost=gateway.example&targetpath=/q"
+        ));
+
+        let looping = parse_native_upstream(
+            "ohttp://192.0.2.1/r?targethost=127.0.0.1:8443&targetpath=/q",
+            &DIRECT,
+        )
+        .unwrap();
+        assert!(
+            ensure_not_listener(
+                &[looping],
+                &["127.0.0.1:8443".parse().unwrap()],
+                "upstream_urls"
+            )
+            .is_err(),
+            "a gateway on this server's DoH listener would loop"
         );
     }
 

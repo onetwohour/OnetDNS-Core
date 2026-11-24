@@ -35,8 +35,9 @@ const OHTTP: Payload = Payload {
     max_body: crate::server::MAX_OHTTP_RESPONSE,
 };
 
-/// ObliviousDoHConfigs: a list with a 16-bit length. Targets serve it with differing media types.
-const ODOH_CONFIGS: Payload = Payload {
+/// ObliviousDoHConfigs, a list with a 16-bit length, or Oblivious HTTP key configurations. Targets
+/// serve them with differing media types.
+const KEY_CONFIGS: Payload = Payload {
     request_type: None,
     response_type: None,
     max_body: 2 + u16::MAX as usize,
@@ -254,10 +255,10 @@ impl<S: Read + Write> H2Client<S> {
         self.query_inner(authority, path, Some(message), payload, true, on_alive)
     }
 
-    /// GETs an Oblivious DoH target's ObliviousDoHConfigs.
-    pub fn odoh_configs(&mut self, authority: &str) -> Result<Vec<u8>, H2Error> {
-        let path = crate::server::ODOH_CONFIGS_PATH;
-        self.query_inner(authority, path, None, ODOH_CONFIGS, false, |_| {})
+    /// GETs the key configurations at `path`: an Oblivious DoH target's ObliviousDoHConfigs or an
+    /// Oblivious HTTP gateway's keys.
+    pub fn key_configs(&mut self, authority: &str, path: &str) -> Result<Vec<u8>, H2Error> {
+        self.query_inner(authority, path, None, KEY_CONFIGS, false, |_| {})
     }
 
     /// POSTs `body`, or GETs without one.

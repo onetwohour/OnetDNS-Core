@@ -3631,7 +3631,10 @@ mod tests {
             .ok();
         });
         let mut client = crate::H2Client::connect(deadline_connect(addr)).unwrap();
-        assert_eq!(client.odoh_configs("dns.test").unwrap(), b"configs");
+        assert_eq!(
+            client.key_configs("dns.test", ODOH_CONFIGS_PATH).unwrap(),
+            b"configs"
+        );
         assert_eq!(
             client
                 .oblivious_probed(

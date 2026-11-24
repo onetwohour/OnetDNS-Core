@@ -106,6 +106,8 @@ gateway = "https://gateway.example.net/.well-known/ohttp-gateway"
 
 A client POSTs `message/ohttp-req` to `https://dns.example.com/relay/example`. The relay sends the same content to the gateway and returns the gateway's answer; it can read neither. It passes on none of the client's header fields, so the gateway sees only this server's address. A path not listed gets HTTP 404. An error status from the gateway reaches the client with a `Proxy-Status` field; if the gateway cannot be reached, the client gets 502 or 504. A request the gateway may already have received is not sent again. The ACL and rate limits apply to the client, and relayed requests are not in the query log. DDR does not announce relays, so clients need the relay URL and the gateway's key configuration from their operator.
 
+OnetDNS can also be an OHTTP client and send its own upstream queries through a relay: see [Oblivious HTTP upstreams](resolution.md#oblivious-http-upstreams).
+
 ## DNSCrypt setup
 
 The listener address and the address published in a DNS stamp serve different purposes. `listen_dnscrypt` binds a local socket. The stamp contains an address that remote clients can reach.

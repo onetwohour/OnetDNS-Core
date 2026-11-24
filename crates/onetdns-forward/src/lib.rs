@@ -15,6 +15,7 @@ mod doh3;
 mod doq;
 mod dot;
 pub mod odoh;
+pub mod ohttp;
 mod opportunistic;
 mod quicdrive;
 mod socks5;
@@ -435,6 +436,18 @@ pub enum Transport {
         target_name: String,
         target_addr: SocketAddr,
     },
+
+    /// Oblivious HTTP through the relay resource at the upstream's address and `path`, to the
+    /// gateway at `target_host` that answers DoH at `target_path`. The gateway's key config comes
+    /// from `target_addr`, checked against `target_name`.
+    Ohttp {
+        server_name: String,
+        path: String,
+        target_host: String,
+        target_path: String,
+        target_name: String,
+        target_addr: SocketAddr,
+    },
 }
 
 /// Where an upstream's connections go.
@@ -571,6 +584,15 @@ impl Upstream {
             Transport::Odoh {
                 server_name, path, ..
             } => format!("odoh://{server_name}{path}"),
+            Transport::Ohttp {
+                server_name,
+                path,
+                target_host,
+                target_path,
+                ..
+            } => format!(
+                "ohttp://{server_name}{path}?targethost={target_host}&targetpath={target_path}"
+            ),
         }
     }
 
@@ -603,6 +625,28 @@ impl Upstream {
             transport: Transport::Odoh {
                 server_name: server_name.into(),
                 path: path.into(),
+                target_name: target_name.into(),
+                target_addr,
+            },
+        }
+    }
+
+    pub fn ohttp(
+        relay: SocketAddr,
+        server_name: impl Into<String>,
+        path: impl Into<String>,
+        target_host: impl Into<String>,
+        target_path: impl Into<String>,
+        target_name: impl Into<String>,
+        target_addr: SocketAddr,
+    ) -> Self {
+        Upstream {
+            endpoint: Endpoint::Direct(relay),
+            transport: Transport::Ohttp {
+                server_name: server_name.into(),
+                path: path.into(),
+                target_host: target_host.into(),
+                target_path: target_path.into(),
                 target_name: target_name.into(),
                 target_addr,
             },
@@ -1760,6 +1804,27 @@ fn exchange_one(
             *addr,
             server_name,
             path,
+            (target_name, *target_addr),
+            wire,
+            request,
+            timeout,
+            trust,
+        ),
+        (
+            Transport::Ohttp {
+                server_name,
+                path,
+                target_host,
+                target_path,
+                target_name,
+                target_addr,
+            },
+            Endpoint::Direct(addr),
+        ) => ohttp::exchange(
+            *addr,
+            server_name,
+            path,
+            (target_host, target_path),
             (target_name, *target_addr),
             wire,
             request,

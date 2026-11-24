@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 use onetdns_config::Config;
 use onetdns_core::{ArcSwap, MutexExt};
 use onetdns_forward::odoh::{OdohError, Relay, RelayError, Relayed, TargetKey};
+use onetdns_forward::ohttp::GatewayKey;
 use onetdns_http2::{DohAnswer, Oblivious, ObliviousMedia, ObliviousReply};
 use onetdns_tls::hpke::PrivateKey;
 
 use crate::native::RelayAdmission;
-use crate::ohttp::{GatewayKey, OhttpRelays};
+use crate::ohttp::OhttpRelays;
 use crate::transport_observe;
 use crate::upstream::{parse_upstream_url, split_authority, BOOTSTRAP_TIMEOUT};
 

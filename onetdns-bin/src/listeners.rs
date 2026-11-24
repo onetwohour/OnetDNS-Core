@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use onetdns_config::Config;
 use onetdns_core::MutexExt;
+use onetdns_forward::ohttp::GatewayKey;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::atomic_write_secret;
@@ -14,7 +15,6 @@ use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
 use crate::odoh::{ObliviousDoh, OdohProxy, OdohTarget};
-use crate::ohttp::GatewayKey;
 use crate::ohttp::OhttpRelays;
 use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{

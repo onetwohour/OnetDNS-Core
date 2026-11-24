@@ -54,7 +54,7 @@ upstream_urls = ["https://dns.quad9.net/dns-query"]
 
 The host name is passed to the proxy as written, so the proxy resolves it and this server never looks it up; `bootstrap` is not needed. The certificate is still checked against the upstream's name, connections are still pooled, and a dropped connection is reopened through the proxy. If the proxy asks for a user name and password, set `upstream_proxy_username` and `upstream_proxy_password`. SOCKS5 sends them in plain text, so keep the proxy on this machine or a network you trust.
 
-SOCKS5 carries only TCP. A configuration with a proxy is refused if any forwarding upstream would have to bypass it: entries in `upstreams`, and `udp://`, `tcp://`, `quic://`, `h3://`, `odoh://` or `sdns://` entries in `upstream_urls`, `fallback_upstreams` or a client's `upstreams`. QUIC upstreams would need CONNECT-UDP over HTTP/3, which OnetDNS does not support. `backend = "recurse"` is refused with a proxy for the same reason.
+SOCKS5 carries only TCP. A configuration with a proxy is refused if any forwarding upstream would have to bypass it: entries in `upstreams`, and `udp://`, `tcp://`, `quic://`, `h3://`, `odoh://`, `ohttp://` or `sdns://` entries in `upstream_urls`, `fallback_upstreams` or a client's `upstreams`. QUIC upstreams would need CONNECT-UDP over HTTP/3, which OnetDNS does not support. `backend = "recurse"` is refused with a proxy for the same reason.
 
 Some traffic still leaves directly even with a proxy set: stub zones, recursion (including the recursive part of `backend = "split"`), `bootstrap` lookups for stub zones, certificate revocation checks when `tls_revocation` is on, and blocklist and update downloads. A resumed TLS session lets the upstream link connections that use it, as it would without a proxy.
 
@@ -71,6 +71,20 @@ upstream_urls = [
 The proxy learns this server's address but not the queries; the target answers the queries but sees only the proxy's address. The split protects you only if the proxy and the target are run by different operators who do not share logs.
 
 OnetDNS fetches the target's key configuration directly from `https://odoh-target.example/.well-known/odohconfigs` before the first query to that target, then again in the background every 12 to 22 hours. That fetch reaches the target from this server's own address, so the target can see that this server uses it, though not what it asks; only the first query, which waits for the fetch, can be matched to this server by its timing. When the target changes its key, queries through it fail until the new configuration arrives 30 seconds to 5 minutes later. Fetching it at once would let the target match the fetch to the query that triggered it. Host names in the URL, the proxy's and the target's, are resolved through `bootstrap` like other upstream names; an upstream whose proxy or target points at one of this server's own listeners is rejected.
+
+### Oblivious HTTP upstreams
+
+An `ohttp://` upstream sends each query as a DoH request encrypted to an Oblivious HTTP gateway (RFC 9458) through a relay:
+
+```toml
+upstream_urls = [
+  "ohttp://ohttp-relay.example/relay?targethost=dns.example&targetpath=/dns-query",
+]
+```
+
+The URL before `?` is the relay resource, and `targethost` and `targetpath` name the DoH server behind the gateway. Only the relay's path is sent to the relay. Each relay resource forwards to one gateway chosen by whoever runs the relay, so it must be one that forwards to `dns.example`'s gateway. The relay learns this server's address but not the queries; the gateway answers the queries but sees only the relay's address. As with ODoH, the split protects you only if different operators run the two.
+
+OnetDNS fetches the gateway's keys from `https://dns.example/.well-known/ohttp-gateway` (RFC 9540) on the same schedule as an ODoH target's configuration. When the relay answers with a 4xx status, such as a gateway that no longer has the cached key, the query fails and the keys are fetched again 30 seconds to 5 minutes later. Requests are padded to multiples of 128 bytes so their size says less about the name. Host names and loops are handled as for `odoh://` upstreams. To be the relay or the gateway for other clients instead, see [Oblivious HTTP](encrypted-dns.md#oblivious-http).
 
 ## Recursive resolution
 

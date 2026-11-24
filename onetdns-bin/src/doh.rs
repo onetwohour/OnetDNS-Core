@@ -708,8 +708,7 @@ mod tests {
     /// answers, which went through the same filtering as DoH. The relay's address stands for every
     /// client behind it, so UPDATE is refused.
     fn ohttp_requests_resolve_through_the_doh_listener() {
-        use crate::ohttp::tests::Client;
-        use crate::ohttp::GatewayKey;
+        use onetdns_forward::ohttp::{GatewayKey, KeyConfig};
         use onetdns_http2::bhttp::{Control, Message as Bhttp};
         use onetdns_tls::hpke::PrivateKey;
 
@@ -766,7 +765,10 @@ mod tests {
                 fields,
                 content,
             };
-            let (encapsulated, client) = Client::encapsulate(&keys, &request.encode());
+            let (encapsulated, client) = KeyConfig::from_keys(&keys)
+                .unwrap()
+                .encapsulate(&request.encode())
+                .unwrap();
             let (head, body) = https_post_path_h1(
                 l.addr(),
                 trust.clone(),
@@ -777,7 +779,7 @@ mod tests {
             assert!(head.starts_with("HTTP/1.1 200"), "{head}");
             assert!(head.contains("content-type: message/ohttp-res"), "{head}");
             assert!(head.contains("cache-control: private, no-store"), "{head}");
-            let plaintext = client.open(&body);
+            let plaintext = client.open_response(&body).unwrap();
             assert_eq!(plaintext.len() % 468, 0, "the answer is padded");
             Bhttp::decode(&plaintext).unwrap()
         };
@@ -827,7 +829,10 @@ mod tests {
         assert_eq!(elsewhere.control, Control::Response(404));
 
         let stale = GatewayKey::new(PrivateKey::generate());
-        let (encapsulated, _) = Client::encapsulate(stale.keys(), b"request");
+        let (encapsulated, _) = KeyConfig::from_keys(stale.keys())
+            .unwrap()
+            .encapsulate(b"request")
+            .unwrap();
         let (head, _) = https_post_path_h1(
             l.addr(),
             trust,
@@ -988,9 +993,9 @@ mod tests {
     /// The client reaches the gateway only through a relay resource, which passes the request to
     /// its gateway and the gateway's answer back unchanged.
     fn ohttp_relay_passes_requests_to_its_gateway() {
-        use crate::ohttp::tests::Client;
-        use crate::ohttp::{GatewayKey, OhttpRelays};
+        use crate::ohttp::OhttpRelays;
         use onetdns_forward::odoh::Relay;
+        use onetdns_forward::ohttp::{GatewayKey, KeyConfig};
         use onetdns_http2::bhttp::{Control, Message as Bhttp};
         use onetdns_tls::hpke::PrivateKey;
 
@@ -1066,7 +1071,10 @@ mod tests {
         }
         .encode();
         let send = |relay: SocketAddr, path: &str, keys: &[u8]| {
-            let (encapsulated, client) = Client::encapsulate(keys, &request);
+            let (encapsulated, client) = KeyConfig::from_keys(keys)
+                .unwrap()
+                .encapsulate(&request)
+                .unwrap();
             let (head, body) = https_post_path_h1(
                 relay,
                 trust.clone(),
@@ -1082,7 +1090,7 @@ mod tests {
             let (head, body, client) = send(relay.addr(), "/relay", &keys);
             assert!(head.starts_with("HTTP/1.1 200"), "{head}");
             assert!(head.contains("content-type: message/ohttp-res"), "{head}");
-            let response = Bhttp::decode(&client.open(&body)).unwrap();
+            let response = Bhttp::decode(&client.open_response(&body).unwrap()).unwrap();
             assert_eq!(response.control, Control::Response(200));
             let answer = Message::parse(&response.content).unwrap();
             assert_eq!(answer.header.id, 0x7171);
@@ -1091,6 +1099,27 @@ mod tests {
                 ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
             ));
         }
+
+        // OnetDNS's own OHTTP upstream, through this relay to this gateway. The URL form would name
+        // the gateway by IP, which this test certificate does not cover, so the TLS name is given
+        // apart from `targethost`.
+        let upstream = onetdns_forward::Upstream::ohttp(
+            relay.addr(),
+            "dns.test",
+            "/relay",
+            "dns.test",
+            "/dns-query",
+            "dns.test",
+            gateway.addr(),
+        );
+        let forwarder = Forwarder::with_upstreams(vec![upstream], Duration::from_secs(5))
+            .with_trust(trust.clone());
+        let resolved = forwarder.resolve(&query).unwrap();
+        assert_eq!(resolved.header.id, 0x7171);
+        assert!(matches!(
+            resolved.answers[0].rdata,
+            ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
+        ));
 
         let (head, _, _) = send(relay.addr(), "/other", &keys);
         assert!(head.starts_with("HTTP/1.1 404"), "{head}");
