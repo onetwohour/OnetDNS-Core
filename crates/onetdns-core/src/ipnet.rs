@@ -39,6 +39,77 @@ impl IpNet {
     }
 }
 
+/// Longest-prefix lookup over a fixed list of networks, for lists too long to scan per query.
+/// Among equal networks the later one wins, as `max_by_key` over the list would pick.
+#[derive(Debug, Default)]
+pub struct NetIndex {
+    /// Per prefix length, longest first: each network with its list position, sorted by network.
+    v4: Vec<(u8, Vec<(u32, u32)>)>,
+    v6: Vec<(u8, Vec<(u128, u32)>)>,
+}
+
+impl NetIndex {
+    pub fn new<'a>(nets: impl IntoIterator<Item = &'a IpNet>) -> Self {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for (position, net) in nets.into_iter().enumerate() {
+            let position = u32::try_from(position).expect("network lists stay under 2^32 entries");
+            match net.network {
+                IpAddr::V4(address) => bucket(&mut v4, net.prefix)
+                    .push((u32::from(address) & v4_mask(net.prefix), position)),
+                IpAddr::V6(address) => bucket(&mut v6, net.prefix)
+                    .push((u128::from(address) & v6_mask(net.prefix), position)),
+            }
+        }
+        Self {
+            v4: sorted(v4),
+            v6: sorted(v6),
+        }
+    }
+
+    /// The list position of the longest network holding `addr`, with its prefix length.
+    pub fn longest(&self, addr: &IpAddr) -> Option<(u8, usize)> {
+        match addr {
+            IpAddr::V4(address) => longest_in(&self.v4, u32::from(*address), v4_mask),
+            IpAddr::V6(address) => longest_in(&self.v6, u128::from(*address), v6_mask),
+        }
+    }
+}
+
+fn bucket<T>(buckets: &mut Vec<(u8, Vec<T>)>, prefix: u8) -> &mut Vec<T> {
+    let at = match buckets.iter().position(|(length, _)| *length == prefix) {
+        Some(at) => at,
+        None => {
+            buckets.push((prefix, Vec::new()));
+            buckets.len() - 1
+        }
+    };
+    &mut buckets[at].1
+}
+
+fn sorted<T: Ord>(mut buckets: Vec<(u8, Vec<(T, u32)>)>) -> Vec<(u8, Vec<(T, u32)>)> {
+    buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, nets) in &mut buckets {
+        nets.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        nets.dedup_by(|later, kept| later.0 == kept.0);
+        nets.shrink_to_fit();
+    }
+    buckets
+}
+
+fn longest_in<T: Ord + Copy + std::ops::BitAnd<Output = T>>(
+    buckets: &[(u8, Vec<(T, u32)>)],
+    address: T,
+    mask: fn(u8) -> T,
+) -> Option<(u8, usize)> {
+    buckets.iter().find_map(|(prefix, nets)| {
+        let network = address & mask(*prefix);
+        nets.binary_search_by(|(candidate, _)| candidate.cmp(&network))
+            .ok()
+            .map(|at| (*prefix, nets[at].1 as usize))
+    })
+}
+
 /// 0 and 32 or more are handled apart, since shifting a u32 by 32 overflows.
 fn v4_mask(prefix: u8) -> u32 {
     match prefix {
@@ -196,6 +267,48 @@ fn is_special_v4(address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_index_picks_what_a_scan_for_the_longest_network_picks() {
+        let nets: Vec<IpNet> = [
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "0.0.0.0/0",
+            "10.1.2.3/32",
+            "10.1.9.9/16",
+            "2001:db8::/32",
+            "::/0",
+            "2001:db8:1::/48",
+        ]
+        .iter()
+        .map(|net| net.parse().unwrap())
+        .collect();
+        let index = NetIndex::new(&nets);
+        for address in [
+            "10.1.2.3",
+            "10.1.2.4",
+            "10.2.0.1",
+            "192.0.2.1",
+            "2001:db8:1::5",
+            "2001:db8:2::5",
+            "2001:db9::1",
+            "::ffff:10.1.2.3",
+        ] {
+            let address: IpAddr = address.parse().unwrap();
+            let scanned = nets
+                .iter()
+                .enumerate()
+                .filter(|(_, net)| net.contains(&address))
+                .max_by_key(|(_, net)| net.prefix_len())
+                .map(|(position, net)| (net.prefix_len(), position));
+            assert_eq!(index.longest(&address), scanned, "{address}");
+        }
+        assert_eq!(index.longest(&"10.1.7.7".parse().unwrap()), Some((16, 4)));
+        assert_eq!(
+            NetIndex::new(&[]).longest(&"10.0.0.1".parse().unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn nat64_local_use_prefix_is_not_globally_routable() {

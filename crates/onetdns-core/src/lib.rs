@@ -40,7 +40,7 @@ pub mod udp;
 mod winsock;
 
 pub use client::{ClientInfo, Transport};
-pub use ipnet::{is_globally_routable, IpNet};
+pub use ipnet::{is_globally_routable, IpNet, NetIndex};
 pub use lrumap::LruMap;
 pub use origin::HttpsOrigin;
 pub use policy::{

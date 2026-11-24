@@ -15,7 +15,7 @@ use crate::regex::{Regex, RegexSet};
 use crate::table::DomainTable;
 use onetdns_core::{
     ArcSwap, BlockResponse, ClientInfo, FilterEngine, FilterExplanation, FilterVerdict, IpNet,
-    MatchStage, RewriteTarget,
+    MatchStage, NetIndex, RewriteTarget,
 };
 use onetdns_proto::{Name, RecordType};
 
@@ -978,6 +978,48 @@ pub struct ClientRule {
     pub denyallow: Vec<String>,
 }
 
+/// Client rule positions by domain, so a query checks only the rules for its name and its parents
+/// and the rules without a domain.
+#[derive(Debug, Default)]
+struct ClientRuleIndex {
+    by_domain: HashMap<Box<str>, Vec<u32>>,
+    any_domain: Vec<u32>,
+}
+
+impl ClientRuleIndex {
+    fn new(rules: &[ClientRule]) -> Self {
+        let mut index = Self::default();
+        for (position, rule) in rules.iter().enumerate() {
+            let position = u32::try_from(position).expect("client rules stay under 2^32");
+            if rule.domain.is_empty() {
+                index.any_domain.push(position);
+            } else {
+                index
+                    .by_domain
+                    .entry(rule.domain.as_str().into())
+                    .or_default()
+                    .push(position);
+            }
+        }
+        index
+    }
+
+    /// In no particular order. A rule's domain matches `key` exactly when it is `key` or what
+    /// follows one of its dots, which is what `name_matches_suffix` tests.
+    fn candidates<'a>(&'a self, key: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let mut rest = Some(key);
+        std::iter::from_fn(move || {
+            let current = rest?;
+            rest = current.find('.').map(|dot| &current[dot + 1..]);
+            Some(current)
+        })
+        .filter_map(|suffix| self.by_domain.get(suffix))
+        .flatten()
+        .chain(&self.any_domain)
+        .map(|&position| position as usize)
+    }
+}
+
 impl ClientRule {
     fn applies(&self, key: &str, client: &ClientInfo, tags: &[String]) -> bool {
         if !self.domain.is_empty() && !name_matches_suffix(key, &self.domain) {
@@ -1160,6 +1202,11 @@ pub struct BlockEngine {
 
     /// Precompiled per client rule.
     client_rule_regex: Vec<Option<Regex>>,
+    client_rule_index: ClientRuleIndex,
+
+    rpz_client_ip_nets: NetIndex,
+    rpz_ip_nets: NetIndex,
+    rpz_nsip_nets: NetIndex,
 
     default_block: BlockResponse,
     clients: Vec<ClientPolicy>,
@@ -1291,6 +1338,11 @@ impl BlockEngine {
             .iter()
             .map(|r| r.regex.as_deref().and_then(compile_isolated))
             .collect();
+        let client_rule_index = ClientRuleIndex::new(&parts.client_rules);
+        let nets = |rules: &[RpzIpRule]| NetIndex::new(rules.iter().map(|rule| &rule.net));
+        let rpz_client_ip_nets = nets(&parts.rpz_client_ip);
+        let rpz_ip_nets = nets(&parts.rpz_ip);
+        let rpz_nsip_nets = nets(&parts.rpz_nsip);
         Self {
             parts,
             has_verdict_rules,
@@ -1305,6 +1357,10 @@ impl BlockEngine {
             regex_typed,
             regex_typed_except,
             client_rule_regex,
+            client_rule_index,
+            rpz_client_ip_nets,
+            rpz_ip_nets,
+            rpz_nsip_nets,
             default_block,
             clients: Vec::new(),
             track_hits: false,
@@ -1451,12 +1507,9 @@ impl BlockEngine {
     }
 
     pub fn rpz_ip_verdict(&self, ip: std::net::IpAddr) -> Option<&FilterVerdict> {
-        self.parts
-            .rpz_ip
-            .iter()
-            .filter(|rule| rule.net.contains(&ip))
-            .max_by_key(|rule| rule.net.prefix_len())
-            .map(|rule| &rule.verdict)
+        self.rpz_ip_nets
+            .longest(&ip)
+            .map(|(_, at)| &self.parts.rpz_ip[at].verdict)
     }
 
     /// Without any, the fast path opens.
@@ -1479,17 +1532,12 @@ impl BlockEngine {
         if !self.has_rpz_ns() {
             return None;
         }
-        if let Some(rule) = ns_ips
+        if let Some((_, at)) = ns_ips
             .iter()
-            .flat_map(|ip| {
-                self.parts
-                    .rpz_nsip
-                    .iter()
-                    .filter(move |rule| rule.net.contains(ip))
-            })
-            .max_by_key(|rule| rule.net.prefix_len())
+            .filter_map(|ip| self.rpz_nsip_nets.longest(ip))
+            .max_by_key(|(prefix, _)| *prefix)
         {
-            return Some(rule.verdict.clone());
+            return Some(self.parts.rpz_nsip[at].verdict.clone());
         }
         ns_names
             .iter()
@@ -1695,19 +1743,13 @@ impl BlockEngine {
             }
         }
 
-        if !p.rpz_client_ip.is_empty() {
-            if let Some(rule) = p
-                .rpz_client_ip
-                .iter()
-                .filter(|rule| rule.net.contains(&client.source_ip))
-                .max_by_key(|rule| rule.net.prefix_len())
-            {
-                return (
-                    rule.verdict.clone(),
-                    MatchStage::RpzClientIp,
-                    Some(&rule.display),
-                );
-            }
+        if let Some((_, at)) = self.rpz_client_ip_nets.longest(&client.source_ip) {
+            let rule = &p.rpz_client_ip[at];
+            return (
+                rule.verdict.clone(),
+                MatchStage::RpzClientIp,
+                Some(&rule.display),
+            );
         }
 
         if !p.client_rules.is_empty() {
@@ -1722,28 +1764,27 @@ impl BlockEngine {
                 }
                 r.applies(key, client, tags)
             };
-            if let Some((_, r)) = p
-                .client_rules
-                .iter()
-                .enumerate()
-                .find(|(i, r)| r.allow && applies(*i, r))
-            {
+            // The first allowing rule in list order wins, then the first blocking one.
+            let (mut allow, mut block) = (None, None);
+            for i in self.client_rule_index.candidates(key) {
+                let r = &p.client_rules[i];
+                let first = if r.allow { &mut allow } else { &mut block };
+                if first.is_none_or(|first| i < first) && applies(i, r) {
+                    *first = Some(i);
+                }
+            }
+            if let Some(i) = allow {
                 return (
                     FilterVerdict::Allow,
                     MatchStage::ClientRuleAllow,
-                    rule_key(r),
+                    rule_key(&p.client_rules[i]),
                 );
             }
-            if let Some((_, r)) = p
-                .client_rules
-                .iter()
-                .enumerate()
-                .find(|(i, r)| !r.allow && applies(*i, r))
-            {
+            if let Some(i) = block {
                 return (
                     FilterVerdict::Block(self.default_block),
                     MatchStage::ClientRuleBlock,
-                    rule_key(r),
+                    rule_key(&p.client_rules[i]),
                 );
             }
         }
@@ -2423,6 +2464,60 @@ mod tests {
             &client_ip("192.168.1.1"),
         );
         assert_eq!(e2.stage, MatchStage::DefaultAllow);
+    }
+
+    #[test]
+    fn client_rules_keep_list_order_across_domains() {
+        let rule = |domain: &str, allow: bool, net: &str| ClientRule {
+            domain: domain.into(),
+            allow,
+            clients: vec![ClientCond::Net {
+                negated: false,
+                net: net.parse().unwrap(),
+            }],
+            ..ClientRule::default()
+        };
+        let mut parts = EngineParts::default();
+        parts.client_rules = vec![
+            rule("ads.example", false, "10.0.0.0/8"),
+            rule("example", false, "10.0.0.0/8"),
+            rule("example", true, "10.9.0.0/16"),
+            rule("", false, "10.7.0.0/16"),
+            rule("cdn.ads.example", true, "10.0.0.0/8"),
+        ];
+        let eng = engine_with(parts);
+        let explain = |qname: &str, ip: &str| {
+            let e = eng.explain(&name(qname), RecordType::A, &client_ip(ip));
+            (e.stage, e.matched)
+        };
+        assert_eq!(
+            explain("x.ads.example.", "10.1.1.1"),
+            (MatchStage::ClientRuleBlock, Some("ads.example".into()))
+        );
+        assert_eq!(
+            explain("www.example.", "10.1.1.1"),
+            (MatchStage::ClientRuleBlock, Some("example".into()))
+        );
+        assert_eq!(
+            explain("x.ads.example.", "10.9.1.1"),
+            (MatchStage::ClientRuleAllow, Some("example".into()))
+        );
+        assert_eq!(
+            explain("cdn.ads.example.", "10.1.1.1"),
+            (MatchStage::ClientRuleAllow, Some("cdn.ads.example".into()))
+        );
+        assert_eq!(
+            explain("other.test.", "10.7.1.1").0,
+            MatchStage::ClientRuleBlock
+        );
+        assert_eq!(
+            explain("other.test.", "10.1.1.1").0,
+            MatchStage::DefaultAllow
+        );
+        assert_eq!(
+            explain("notexample.", "10.1.1.1").0,
+            MatchStage::DefaultAllow
+        );
     }
 
     #[test]
