@@ -177,6 +177,6 @@ Clients can bypass an OS-provided DNS server if they use an independent encrypte
 4. **HTTP framing where applicable:** verify path and HTTP/2 vs HTTP/3 support.
 5. **DNS processing:** check QNAME/QTYPE and filter result only after transport succeeds.
 
-A dashboard log entry marked with an internal microsecond latency measures a server-side span. It is **not necessarily total client-visible latency**: decryption, encryption, QUIC/TLS processing and network RTT can fall outside the timer.
+The Query log's `latency_us` starts when the transport hands over the decrypted DNS message and stops when the answer is ready to send. Decryption, encryption of the answer, TLS, QUIC and HTTP processing, and network RTT are outside it, so it is **not the latency a client sees**. See [Performance](performance.md#latency-metrics).
 
 Related: [Examples](examples.md) · [Operations](operations.md) · [Troubleshooting](troubleshooting.md) · [Reference: access and TLS](reference/access-and-tls.md).
