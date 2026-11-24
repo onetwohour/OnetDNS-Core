@@ -23,8 +23,8 @@
   body{ font-family:var(--font-sans); -webkit-font-smoothing:antialiased; }
   button:focus-visible,input:focus-visible,textarea:focus-visible,[role="button"]:focus-visible,[tabindex]:focus-visible{ outline:3px solid var(--accent); outline-offset:2px; }
   button[disabled],input[disabled],textarea[disabled],[aria-disabled="true"]{ cursor:not-allowed !important; opacity:.58; }
-  [data-toast-text]{ flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  [data-toast]:hover,[data-toast]:focus-within{ align-items:flex-start !important; max-height:60vh; overflow-y:auto; }
+  [data-toast-text]{ flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:18px; padding:3px 0; }
+  [data-toast]:hover,[data-toast]:focus-within{ max-height:60vh; overflow-y:auto; }
   [data-toast]:hover [data-toast-text],[data-toast]:focus-within [data-toast-text]{ white-space:normal; overflow:visible; overflow-wrap:anywhere; }
   [data-readonly-note]{ display:none; }
   [data-readonly="true"] [data-readonly-note]{ display:block; }
@@ -1131,7 +1131,7 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
   </div>
   </sc-if>
 
-  <sc-if value="{{ hasToasts }}"><div style="{{ toastStackStyle }}"><sc-for list="{{ toasts }}" as="tt" key="{{ tt.id }}" hint-placeholder-count="1"><div data-toast="" tabIndex="0" role="{{ tt.role }}" aria-live="{{ tt.live }}" aria-atomic="true" onMouseEnter="{{ tt.onHold }}" onMouseLeave="{{ tt.onRelease }}" onFocus="{{ tt.onHold }}" onBlur="{{ tt.onRelease }}" style="{{ tt.style }}"><span style="display:flex">{{ tt.icon }}</span><span data-toast-text="">{{ tt.text }}</span><sc-if value="{{ tt.action }}"><button onClick="{{ tt.onAction }}" style="flex:0 0 auto;padding:5px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">{{ tt.actionLabel }}</button></sc-if><button onClick="{{ tt.onClose }}" aria-label="{{ tt.closeLabel }}" title="{{ tt.closeLabel }}" style="flex:0 0 auto;width:24px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:3px;background:transparent;color:var(--muted);font:inherit;font-size:17px;line-height:1;cursor:pointer">×</button></div></sc-for></div></sc-if>
+  <sc-if value="{{ hasToasts }}"><div style="{{ toastStackStyle }}"><sc-for list="{{ toasts }}" as="tt" key="{{ tt.id }}" hint-placeholder-count="1"><div data-toast="" tabIndex="0" role="{{ tt.role }}" aria-live="{{ tt.live }}" aria-atomic="true" onMouseEnter="{{ tt.onHold }}" onMouseLeave="{{ tt.onRelease }}" onFocus="{{ tt.onHold }}" onBlur="{{ tt.onRelease }}" style="{{ tt.style }}"><span style="display:flex;align-items:center;height:24px">{{ tt.icon }}</span><span data-toast-text="">{{ tt.text }}</span><sc-if value="{{ tt.action }}"><button onClick="{{ tt.onAction }}" style="flex:0 0 auto;height:24px;padding:0 11px;line-height:22px;border:1px solid var(--border);border-radius:3px;background:var(--surface2);color:var(--accent);font:inherit;font-size:12px;font-weight:700;cursor:pointer">{{ tt.actionLabel }}</button></sc-if><button onClick="{{ tt.onClose }}" aria-label="{{ tt.closeLabel }}" title="{{ tt.closeLabel }}" style="flex:0 0 auto;width:24px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:3px;background:transparent;color:var(--muted);font:inherit;font-size:17px;line-height:1;cursor:pointer">×</button></div></sc-for></div></sc-if>
   <sc-if value="{{ confirmOpen }}"><div style="position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(20,18,12,.45);padding:20px"><div id="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-message" style="width:100%;max-width:420px;border:1px solid var(--border);border-radius:5px;background:var(--surface);box-shadow:0 18px 48px rgba(20,18,12,.28);overflow:hidden">
     <div id="confirm-message" style="padding:20px 22px 6px;font-size:13.5px;font-weight:600;color:var(--fg);line-height:1.55">{{ confirmMessage }}</div>
     <sc-if value="{{ confirmDetail }}"><div style="padding:0 22px 4px;font-size:12px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere;white-space:pre-line">{{ confirmDetail }}</div></sc-if>
@@ -4708,7 +4708,8 @@ const DEDICATED_HOME = {
   rrset_roundrobin:'settings-quick', aggressive_nsec:'settings-quick', dnssec_strict:'settings-quick',
   deny_any:'settings-quick', minimal_responses:'settings-quick', harden_below_nxdomain:'settings-quick',
   rebind_protection:'settings-quick', hide_identity:'settings-quick', hide_version:'settings-quick',
-  track_rule_hits:'settings-quick', block_response:'settings-quick'
+  track_rule_hits:'settings-quick', block_response:'settings-quick',
+  rewrites:'lists', clients:'clients', control_admin_tokens:'tokens', control_readonly_tokens:'tokens'
 };
 
 // 대시보드를 IP 로 열었으면 그 주소를 클라이언트 접속 주소의 기본값으로 쓴다. 루프백은 다른 기기가 쓸 수 없다.
@@ -7109,7 +7110,7 @@ class Component extends DCLogic {
 
 
     const toastStackStyle=`position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:100;display:flex;flex-direction:column;align-items:center;gap:8px;width:max-content;max-width:min(92vw,620px)`;
-    const toastStyle=bad=>`max-width:100%;display:flex;align-items:center;gap:9px;padding:11px 9px 11px 17px;border-radius:3px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${bad?'var(--block)':'var(--ok)'};box-shadow:0 12px 40px rgba(13,18,30,.2);font-size:13px;font-weight:600;color:var(--fg);animation:odToast .2s ease`;
+    const toastStyle=bad=>`max-width:100%;display:flex;align-items:flex-start;gap:9px;padding:11px 9px 11px 17px;border-radius:3px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${bad?'var(--block)':'var(--ok)'};box-shadow:0 12px 40px rgba(13,18,30,.2);font-size:13px;font-weight:600;color:var(--fg);animation:odToast .2s ease`;
     const toastIcon=bad=>React.createElement('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:bad?'var(--block)':'var(--ok)','strokeWidth':1.85,'strokeLinecap':'round','strokeLinejoin':'round'},React.createElement('path',{d:bad?'M12 8v5m0 3h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z':'M20 6 9 17l-5-5'}));
     const toasts=(s.toasts||[]).map(x=>({id:x.id,text:x.text,role:x.bad?'alert':'status',live:x.bad?'assertive':'polite',style:toastStyle(x.bad),icon:toastIcon(x.bad),
       action:!!x.action,actionLabel:x.action?x.action.label:'',onAction:()=>this.runToastAction(x.id),onClose:()=>this.dismissToast(x.id),
