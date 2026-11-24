@@ -14,6 +14,7 @@ use crate::connection_limit::EncryptedTcpListener;
 use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
 use crate::odoh::{ObliviousDoh, OdohProxy, OdohTarget};
+use crate::ohttp::GatewayKey;
 use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
@@ -68,45 +69,70 @@ fn load_or_create_dnscrypt_provider(
     ))
 }
 
-/// Loaded when a DoH listener with `odoh_target` opens. Clients fetch the public key once a day or
-/// after a 401, so it must not change on restart.
-fn load_or_create_odoh_target(
+/// The HPKE key a DoH listener's oblivious `role` decrypts with, kept in `file_name` next to the
+/// config. Clients and relays cache its public half, so it must not change on restart.
+fn load_or_create_hpke_key(
     config_path: Option<&std::path::Path>,
-) -> Result<Arc<OdohTarget>, String> {
+    file_name: &str,
+    role: &str,
+) -> Result<onetdns_tls::hpke::PrivateKey, String> {
     let path = config_path
         .and_then(std::path::Path::parent)
-        .map(|dir| dir.join("odoh-target.key"))
+        .map(|dir| dir.join(file_name))
         .ok_or_else(|| {
-            "There is no configuration file path to store the Oblivious DoH target key, so the DoH listener does not start; this keeps the key from changing on restart".to_string()
+            format!("There is no configuration file path to store the {role} key, so the DoH listener does not start; this keeps the key from changing on restart")
         })?;
     let seed = load_or_create_key_seed(&path).map_err(|error| match error {
         KeyFileError::Corrupt => format!(
-            "Oblivious DoH target key file is corrupted ({}); it is not replaced automatically. Delete it to make a new key",
+            "{role} key file is corrupted ({}); it is not replaced automatically. Delete it to make a new key",
             path.display()
         ),
         KeyFileError::Read(error) => format!(
-            "Could not read the Oblivious DoH target key file ({}): {error}",
+            "Could not read the {role} key file ({}): {error}",
             path.display()
         ),
         KeyFileError::Write(error) => format!(
-            "Could not save the Oblivious DoH target key to a file ({}): {error}. The DoH listener does not start because the key could not be kept across restarts",
+            "Could not save the {role} key to a file ({}): {error}. The DoH listener does not start because the key could not be kept across restarts",
             path.display()
         ),
     })?;
-    let target = OdohTarget::new(onetdns_tls::hpke::PrivateKey::from_bytes(&seed));
-    let public_key: String = target
-        .public_key()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    Ok(onetdns_tls::hpke::PrivateKey::from_bytes(&seed))
+}
+
+/// Loaded when a DoH listener with `odoh_target` opens. Clients fetch the public key once a day or
+/// after a 401.
+fn load_or_create_odoh_target(
+    config_path: Option<&std::path::Path>,
+) -> Result<Arc<OdohTarget>, String> {
+    let target = OdohTarget::new(load_or_create_hpke_key(
+        config_path,
+        "odoh-target.key",
+        "Oblivious DoH target",
+    )?);
     onetdns_core::info!(event = "odoh.target_key_loaded",
-        public_key = %public_key,
+        public_key = %crate::update::hex(&target.public_key()),
         "Loaded the Oblivious DoH target key"
     );
     Ok(Arc::new(target))
 }
 
-/// What the DoH listeners serve of Oblivious DoH; `None` when neither role is on.
+/// Loaded when a DoH listener with `ohttp_gateway` opens.
+fn load_or_create_ohttp_gateway(
+    config_path: Option<&std::path::Path>,
+) -> Result<GatewayKey, String> {
+    let gateway = GatewayKey::new(load_or_create_hpke_key(
+        config_path,
+        "ohttp-gateway.key",
+        "Oblivious HTTP gateway",
+    )?);
+    onetdns_core::info!(event = "ohttp.gateway_key_loaded",
+        public_key = %crate::update::hex(&gateway.public_key()),
+        "Loaded the Oblivious HTTP gateway key"
+    );
+    Ok(gateway)
+}
+
+/// What the DoH listeners serve of Oblivious DoH and Oblivious HTTP; `None` when no role is on.
 fn open_oblivious(
     cfg: &Config,
     config_path: Option<&std::path::Path>,
@@ -117,6 +143,11 @@ fn open_oblivious(
     } else {
         None
     };
+    let gateway = if cfg.ohttp_gateway {
+        Some(load_or_create_ohttp_gateway(config_path)?)
+    } else {
+        None
+    };
     let proxy = (!cfg.odoh_proxy_targets.is_empty()).then(|| {
         OdohProxy::new(
             &cfg.odoh_proxy_targets,
@@ -124,7 +155,15 @@ fn open_oblivious(
             onetdns_forward::odoh::Relay::default(),
         )
     });
-    Ok((target.is_some() || proxy.is_some()).then(|| Arc::new(ObliviousDoh { target, proxy })))
+    Ok(
+        (target.is_some() || proxy.is_some() || gateway.is_some()).then(|| {
+            Arc::new(ObliviousDoh {
+                target,
+                proxy,
+                gateway,
+            })
+        }),
+    )
 }
 
 /// The DoH settings fixed when a DoH listener opens.
@@ -132,6 +171,9 @@ fn doh_listener_variant(cfg: &Config) -> String {
     let mut variant = cfg.doh_path.clone();
     if cfg.odoh_target {
         variant.push_str("|odoh");
+    }
+    if cfg.ohttp_gateway {
+        variant.push_str("|ohttp");
     }
     if !cfg.odoh_proxy_targets.is_empty() {
         variant.push_str("|odoh-proxy=");
@@ -943,8 +985,8 @@ fn reconcile_encrypted(
     }
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doh.clone())?;
-        // Built only when a listener opens, so a reload that leaves DoH alone never reads the
-        // target key, and before any listener closes, so a bad key file leaves the old ones up.
+        // Built only when a listener opens, so a reload that leaves DoH alone never reads the key
+        // files, and before any listener closes, so a bad key file leaves the old ones up.
         // Listeners opened together share it and the proxy's target connections.
         let variant = doh_listener_variant(cfg);
         let opening = {
@@ -1776,15 +1818,68 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// The target key is read before the DoH listener it changes closes, so a damaged key file
-    /// fails the reload and leaves plain DoH up.
-    fn a_bad_odoh_key_on_reload_keeps_the_doh_listener() {
+    /// The gateway key has its own file: RFC 9458 forbids an OHTTP key that another HPKE protocol
+    /// also accepts.
+    fn ohttp_gateway_key_survives_reload_and_is_never_replaced() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "onetdns-odoh-reload-{}-{unique}",
+            "onetdns-ohttp-gateway-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config_path = dir.join(CONFIG_FILE_NAME);
+
+        let Err(no_path) = load_or_create_ohttp_gateway(None) else {
+            panic!("a key with nowhere to persist must not be used");
+        };
+        assert!(no_path.contains("Oblivious HTTP gateway"), "{no_path}");
+
+        let first = load_or_create_ohttp_gateway(Some(&config_path)).unwrap();
+        let key_path = dir.join("ohttp-gateway.key");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap().len(), 64);
+        let restored = load_or_create_ohttp_gateway(Some(&config_path)).unwrap();
+        assert_eq!(restored.public_key(), first.public_key());
+        let target = load_or_create_odoh_target(Some(&config_path)).unwrap();
+        assert_ne!(target.public_key(), first.public_key());
+
+        std::fs::write(&key_path, "not hex").unwrap();
+        let Err(corrupt) = load_or_create_ohttp_gateway(Some(&config_path)) else {
+            panic!("a corrupt key file must not be replaced");
+        };
+        assert!(corrupt.contains("corrupted"), "{corrupt}");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not hex");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    /// The target key is read before the DoH listener it changes closes, so a damaged key file
+    /// fails the reload and leaves plain DoH up.
+    fn a_bad_odoh_key_on_reload_keeps_the_doh_listener() {
+        bad_key_on_reload_keeps_the_doh_listener("odoh-target.key", |cfg| Config {
+            odoh_target: true,
+            ..cfg
+        });
+    }
+
+    #[test]
+    fn a_bad_ohttp_key_on_reload_keeps_the_doh_listener() {
+        bad_key_on_reload_keeps_the_doh_listener("ohttp-gateway.key", |cfg| Config {
+            ohttp_gateway: true,
+            ..cfg
+        });
+    }
+
+    fn bad_key_on_reload_keeps_the_doh_listener(key_file: &str, enable: fn(Config) -> Config) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-oblivious-reload-{}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir(&dir).unwrap();
@@ -1815,12 +1910,8 @@ pub(crate) mod tests {
         };
         reconcile(&plain).expect("DoH 리스너 열기");
 
-        std::fs::write(dir.join("odoh-target.key"), "not hex").unwrap();
-        let target = Config {
-            odoh_target: true,
-            ..plain.clone()
-        };
-        let error = reconcile(&target).expect_err("깨진 키 파일로 대상을 켜면 안 됩니다");
+        std::fs::write(dir.join(key_file), "not hex").unwrap();
+        let error = reconcile(&enable(plain.clone())).expect_err("깨진 키 파일로 켜면 안 됩니다");
         assert!(error.contains("corrupted"), "{error}");
         assert!(
             TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok(),

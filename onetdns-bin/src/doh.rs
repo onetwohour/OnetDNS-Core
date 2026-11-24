@@ -19,6 +19,7 @@ use crate::connection_limit::{
 };
 use crate::native::NativeServer;
 use crate::odoh::{ObliviousConn, ObliviousDoh};
+use crate::ohttp::GatewayConn;
 use crate::transport_observe;
 
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,7 +41,14 @@ pub(crate) fn http_freshness_secs(msg: &Message) -> u32 {
         .unwrap_or(0)
 }
 
-/// Serves DoH on `listener`, already bound, and the parts of Oblivious DoH `oblivious` holds.
+fn doh_answer(response: &Message) -> Result<onetdns_http2::DohAnswer, &'static str> {
+    Ok(onetdns_http2::DohAnswer {
+        body: response.try_encode().map_err(|_| "502")?,
+        max_age: http_freshness_secs(response),
+    })
+}
+
+/// Serves DoH on `listener`, already bound, and the oblivious services `oblivious` holds.
 pub fn serve_doh(
     listener: TcpListener,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
@@ -191,39 +199,48 @@ fn serve_conn(
                 return Err("403");
             }
         };
-        let Some(response) = resolve(q, client_id)? else {
-            return Ok(None);
-        };
-        let max_age = http_freshness_secs(&response);
-        Ok(Some(onetdns_http2::DohAnswer {
-            body: response.try_encode().map_err(|_| "502")?,
-            max_age,
-        }))
+        resolve(q, client_id)?.as_ref().map(doh_answer).transpose()
     };
-    // An Oblivious DoH message names no client in the path; the connection's own identity is the
-    // only one.
+    // A relayed message names no client in the path; the connection's own identity is the only
+    // one.
     let connection_identity =
         authenticated_path_identity(None, tls_authenticated, tls_auth_identity.as_deref())
             .ok()
             .flatten();
-    let oblivious = oblivious.map(|service| ObliviousConn {
-        service,
-        peer: src,
-        resolve: |q: &[u8]| match resolve(q, connection_identity.clone())? {
-            Some(response) => response.try_encode().map(Some).map_err(|_| "502"),
-            None => Ok(None),
-        },
-        admit_relay: || {
-            handler.admit_relay(&RequestCtx {
-                src,
-                transport: RtTransport::DoH,
-                raw: None,
-                client_id: connection_identity.clone(),
-                authenticated: tls_authenticated,
-                auth_identity: tls_auth_identity.clone(),
-            })
-        },
-    });
+    let relayed = |q: &[u8]| -> Result<Option<onetdns_http2::DohAnswer>, &'static str> {
+        resolve(q, connection_identity.clone())?
+            .as_ref()
+            .map(doh_answer)
+            .transpose()
+    };
+    let gateway = oblivious
+        .and_then(|service| service.gateway.as_ref())
+        .map(|key| GatewayConn {
+            key,
+            peer: src,
+            doh_path: path,
+            resolve: relayed,
+        });
+    let gateway = gateway
+        .as_ref()
+        .map(|conn| conn as &dyn onetdns_http2::Gateway);
+    let oblivious = oblivious
+        .filter(|service| service.target.is_some() || service.proxy.is_some())
+        .map(|service| ObliviousConn {
+            service,
+            peer: src,
+            resolve: relayed,
+            admit_relay: || {
+                handler.admit_relay(&RequestCtx {
+                    src,
+                    transport: RtTransport::DoH,
+                    raw: None,
+                    client_id: connection_identity.clone(),
+                    authenticated: tls_authenticated,
+                    auth_identity: tls_auth_identity.clone(),
+                })
+            },
+        });
     let oblivious = oblivious
         .as_ref()
         .map(|conn| conn as &dyn onetdns_http2::Oblivious);
@@ -240,6 +257,7 @@ fn serve_conn(
             },
             &signals.drain,
             oblivious,
+            gateway,
         )
         .map_err(|_| "http2_connection"),
 
@@ -253,6 +271,7 @@ fn serve_conn(
                     .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
             },
             oblivious,
+            gateway,
         )
         .map_err(|_| "http1_connection"),
     }
@@ -570,6 +589,7 @@ mod tests {
                 onetdns_tls::hpke::PrivateKey::generate(),
             ))),
             proxy: None,
+            gateway: None,
         })
     }
 
@@ -680,6 +700,143 @@ mod tests {
     }
 
     #[test]
+    /// A client fetches the key configuration, encapsulates DoH requests to it, and opens the
+    /// answers, which went through the same filtering as DoH. The relay's address stands for every
+    /// client behind it, so UPDATE is refused.
+    fn ohttp_requests_resolve_through_the_doh_listener() {
+        use crate::ohttp::tests::Client;
+        use crate::ohttp::GatewayKey;
+        use onetdns_http2::bhttp::{Control, Message as Bhttp};
+        use onetdns_tls::hpke::PrivateKey;
+
+        let (tls, trust) = self_signed_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let l = serve_doh(
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            Arc::new(onetdns_core::ArcSwap::new(tls)),
+            native_handler(),
+            "/dns-query".to_string(),
+            Some(Arc::new(ObliviousDoh {
+                target: None,
+                proxy: None,
+                gateway: Some(GatewayKey::new(PrivateKey::generate())),
+            })),
+            Arc::new(ConnectionLimiter::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        let get = b"GET /.well-known/ohttp-gateway HTTP/1.1\r\nHost: dns.test\r\nAccept: application/ohttp-keys\r\nConnection: close\r\n\r\n";
+        let (head, keys) = https_h1(l.addr(), trust.clone(), get);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            head.contains("content-type: application/ohttp-keys"),
+            "{head}"
+        );
+        let (configs, _) = https_h1(
+            l.addr(),
+            trust.clone(),
+            b"GET /.well-known/odohconfigs HTTP/1.1\r\nHost: dns.test\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            configs.starts_with("HTTP/1.1 404"),
+            "not an ODoH target: {configs}"
+        );
+
+        let send = |method: &str, path: String, content: Vec<u8>| {
+            let fields = if method == "POST" {
+                vec![(
+                    b"content-type".to_vec(),
+                    b"application/dns-message".to_vec(),
+                )]
+            } else {
+                Vec::new()
+            };
+            let request = Bhttp {
+                control: Control::Request {
+                    method: method.as_bytes().to_vec(),
+                    scheme: b"https".to_vec(),
+                    authority: b"dns.test".to_vec(),
+                    path: path.into_bytes(),
+                },
+                fields,
+                content,
+            };
+            let (encapsulated, client) = Client::encapsulate(&keys, &request.encode());
+            let (head, body) = https_post_path_h1(
+                l.addr(),
+                trust.clone(),
+                onetdns_http2::OHTTP_GATEWAY_PATH,
+                onetdns_http2::OHTTP_REQUEST_MEDIA_TYPE,
+                &encapsulated,
+            );
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.contains("content-type: message/ohttp-res"), "{head}");
+            assert!(head.contains("cache-control: private, no-store"), "{head}");
+            let plaintext = client.open(&body);
+            assert_eq!(plaintext.len() % 468, 0, "the answer is padded");
+            Bhttp::decode(&plaintext).unwrap()
+        };
+        let ask = |name: &str, id: u16| {
+            let query = Message::query(id, ApName::from_str(name).unwrap(), RecordType::A);
+            let response = send("POST", "/dns-query".into(), query.try_encode().unwrap());
+            assert_eq!(response.control, Control::Response(200));
+            Message::parse(&response.content).unwrap()
+        };
+        let allowed = ask("allowed.test", 0x7171);
+        assert_eq!(allowed.header.id, 0x7171);
+        assert!(matches!(
+            allowed.answers[0].rdata,
+            ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
+        ));
+        let blocked = ask("blocked.test", 0x7272);
+        assert_eq!(
+            blocked.header.rcode,
+            onetdns_proto::ResponseCode::NXDomain.0
+        );
+
+        let query = Message::query(
+            0x7373,
+            ApName::from_str("allowed.test").unwrap(),
+            RecordType::A,
+        );
+        let by_get = send(
+            "GET",
+            format!(
+                "/dns-query?dns={}",
+                crate::acme::b64url(&query.try_encode().unwrap())
+            ),
+            Vec::new(),
+        );
+        assert_eq!(by_get.control, Control::Response(200));
+        assert_eq!(Message::parse(&by_get.content).unwrap().header.id, 0x7373);
+
+        let mut update = query.clone();
+        update.header.opcode = 5;
+        let refused = send("POST", "/dns-query".into(), update.try_encode().unwrap());
+        assert_eq!(refused.control, Control::Response(200));
+        assert_eq!(
+            Message::parse(&refused.content).unwrap().header.rcode,
+            onetdns_proto::ResponseCode::Refused.0
+        );
+        let elsewhere = send("POST", "/other".into(), query.try_encode().unwrap());
+        assert_eq!(elsewhere.control, Control::Response(404));
+
+        let stale = GatewayKey::new(PrivateKey::generate());
+        let (encapsulated, _) = Client::encapsulate(stale.keys(), b"request");
+        let (head, _) = https_post_path_h1(
+            l.addr(),
+            trust,
+            onetdns_http2::OHTTP_GATEWAY_PATH,
+            onetdns_http2::OHTTP_REQUEST_MEDIA_TYPE,
+            &encapsulated,
+        );
+        assert!(
+            head.starts_with("HTTP/1.1 422"),
+            "a request for another key is refused unencapsulated: {head}"
+        );
+    }
+
+    #[test]
     /// The client reaches the target only through the proxy, which relays to the listed target and
     /// refuses any other.
     fn odoh_proxy_relays_only_to_listed_targets() {
@@ -714,6 +871,7 @@ mod tests {
                         )),
                         Relay::with_trust(trust.clone()),
                     )),
+                    gateway: None,
                 })),
                 Arc::new(ConnectionLimiter::default()),
                 Arc::new(AtomicBool::new(false)),

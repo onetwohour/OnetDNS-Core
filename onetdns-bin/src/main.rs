@@ -63,6 +63,7 @@ mod nonblocking_tcp;
 /// NOTIFY to secondaries.
 mod notify;
 mod odoh;
+mod ohttp;
 /// OS DNS settings and firewall changes.
 mod osnet;
 #[cfg(target_os = "linux")]
@@ -502,11 +503,18 @@ fn encrypted_endpoints(cfg: &Config) -> Vec<(layers::DdrEndpoint, Vec<IpAddr>)> 
     // The dohpath must be a URI template with the dns variable (RFC 9461).
     let dohpath = format!("{}{{?dns}}", cfg.doh_path);
     let mut out: Vec<(layers::DdrEndpoint, Vec<IpAddr>)> = Vec::new();
-    for (priority, alpn, addrs, path) in [
-        (1u16, &["h2"][..], &cfg.listen_doh, Some(dohpath.clone())),
-        (2, &["h3"][..], &cfg.listen_doh3, Some(dohpath)),
-        (3, &["dot"][..], &cfg.listen_dot, None),
-        (4, &["doq"][..], &cfg.listen_doq, None),
+    // The Oblivious HTTP gateway runs on the DoH listeners only.
+    for (priority, alpn, addrs, path, ohttp) in [
+        (
+            1u16,
+            &["h2"][..],
+            &cfg.listen_doh,
+            Some(dohpath.clone()),
+            cfg.ohttp_gateway,
+        ),
+        (2, &["h3"][..], &cfg.listen_doh3, Some(dohpath), false),
+        (3, &["dot"][..], &cfg.listen_dot, None, false),
+        (4, &["doq"][..], &cfg.listen_doq, None, false),
     ] {
         let transport = out.len();
         for addr in addrs {
@@ -521,6 +529,7 @@ fn encrypted_endpoints(cfg: &Config) -> Vec<(layers::DdrEndpoint, Vec<IpAddr>)> 
                         alpn,
                         port: addr.port(),
                         dohpath: path.clone(),
+                        ohttp,
                     },
                     vec![addr.ip()],
                 )),
@@ -3271,6 +3280,10 @@ mod tests {
             ]
         );
         assert!(doh.iter().all(|e| e.dohpath.as_deref() == Some("/q{?dns}")));
+        assert!(
+            endpoints.iter().all(|e| !e.ohttp),
+            "ohttp is announced only with the gateway on"
+        );
 
         let dot: Vec<_> = endpoints.iter().filter(|e| e.alpn == ["dot"]).collect();
         assert_eq!(dot.len(), 1);
@@ -3289,6 +3302,13 @@ mod tests {
         // DNSCrypt has no ALPN for SVCB, so it is not advertised.
         cfg.listen_dnscrypt = vec!["127.0.0.1:5443".parse().unwrap()];
         assert_eq!(ddr_endpoints_from(&cfg).len(), endpoints.len());
+
+        // The gateway answers on the DoH listeners, so only their records carry ohttp.
+        cfg.ohttp_gateway = true;
+        cfg.listen_doh3 = vec!["127.0.0.1:443".parse().unwrap()];
+        for endpoint in ddr_endpoints_from(&cfg) {
+            assert_eq!(endpoint.ohttp, endpoint.alpn == ["h2"], "{endpoint:?}");
+        }
     }
 
     #[test]

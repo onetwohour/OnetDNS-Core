@@ -19,6 +19,9 @@ const SVCB_KEY_PORT: u16 = 3;
 /// SvcParamKey dohpath, RFC 9461.
 const SVCB_KEY_DOHPATH: u16 = 7;
 
+/// SvcParamKey ohttp, RFC 9540. Its value is empty.
+const SVCB_KEY_OHTTP: u16 = 8;
+
 /// One encrypted transport to announce.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DdrEndpoint {
@@ -29,12 +32,14 @@ pub struct DdrEndpoint {
     pub port: u16,
     /// URI template; DoH only.
     pub dohpath: Option<String>,
+    /// An Oblivious HTTP gateway serves this DoH endpoint at the same host and port.
+    pub ohttp: bool,
 }
 
 impl DdrEndpoint {
     /// In ascending key order, as SVCB records and DNR options both require.
     pub fn svc_params(&self) -> Result<Vec<(u16, Box<[u8]>)>, String> {
-        let mut params: Vec<(u16, Box<[u8]>)> = Vec::with_capacity(3);
+        let mut params: Vec<(u16, Box<[u8]>)> = Vec::with_capacity(4);
         let mut alpn = Vec::new();
         for id in self.alpn {
             let bytes = id.as_bytes();
@@ -48,6 +53,9 @@ impl DdrEndpoint {
         params.push((SVCB_KEY_PORT, Box::from(self.port.to_be_bytes().as_slice())));
         if let Some(path) = &self.dohpath {
             params.push((SVCB_KEY_DOHPATH, Box::from(path.as_bytes())));
+        }
+        if self.ohttp {
+            params.push((SVCB_KEY_OHTTP, Box::default()));
         }
         Ok(params)
     }
@@ -173,12 +181,14 @@ mod tests {
                     alpn: &["h2"],
                     port: 443,
                     dohpath: Some("/dns-query{?dns}".to_string()),
+                    ohttp: true,
                 },
                 DdrEndpoint {
                     priority: 3,
                     alpn: &["dot"],
                     port: 853,
                     dohpath: None,
+                    ohttp: false,
                 },
             ],
         )
@@ -219,10 +229,13 @@ mod tests {
             }
             other => panic!("SVCB가 아님: {other:?}"),
         };
-        // alpn (1) is a length-prefixed list, port (3) a big-endian u16, dohpath (7) a template.
+        // alpn (1) is a length-prefixed list, port (3) a big-endian u16, dohpath (7) a template,
+        // and ohttp (8) empty.
         assert_eq!(doh[0], (1, Box::from(&b"\x02h2"[..])));
         assert_eq!(doh[1], (3, Box::from(&443u16.to_be_bytes()[..])));
         assert_eq!(doh[2], (7, Box::from(&b"/dns-query{?dns}"[..])));
+        assert_eq!(doh[3], (8, Box::default()));
+        assert_eq!(doh.len(), 4);
         assert!(
             doh.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "SVCB 매개변수 키는 오름차순이어야 합니다"

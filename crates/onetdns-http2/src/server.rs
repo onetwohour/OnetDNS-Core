@@ -80,6 +80,26 @@ impl HttpReply {
             body: Vec::new(),
         }
     }
+
+    /// RFC 9458 allows only fields that say nothing about the encapsulated response.
+    fn ohttp_response(body: Vec<u8>) -> Self {
+        Self {
+            status: "200".to_string(),
+            fields: vec![
+                ("content-type", OHTTP_RESPONSE_MEDIA_TYPE.to_string()),
+                ("cache-control", "private, no-store".to_string()),
+            ],
+            body,
+        }
+    }
+
+    fn ohttp_keys(body: Vec<u8>) -> Self {
+        Self {
+            status: "200".to_string(),
+            fields: vec![("content-type", OHTTP_KEYS_MEDIA_TYPE.to_string())],
+            body,
+        }
+    }
 }
 
 pub const ODOH_MEDIA_TYPE: &str = "application/oblivious-dns-message";
@@ -123,19 +143,50 @@ pub enum ObliviousReply {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Media {
+/// RFC 9540's Oblivious Gateway Resource: POST takes encapsulated requests, GET returns the key
+/// configuration.
+pub const OHTTP_GATEWAY_PATH: &str = "/.well-known/ohttp-gateway";
+pub const OHTTP_REQUEST_MEDIA_TYPE: &str = "message/ohttp-req";
+pub const OHTTP_RESPONSE_MEDIA_TYPE: &str = "message/ohttp-res";
+pub const OHTTP_KEYS_MEDIA_TYPE: &str = "application/ohttp-keys";
+
+/// An Oblivious HTTP gateway (RFC 9458) in front of this listener's DoH path. This crate routes the
+/// requests; the implementor decapsulates, answers and encapsulates.
+pub trait Gateway {
+    /// The `application/ohttp-keys` body served by GET at `OHTTP_GATEWAY_PATH`.
+    fn keys(&self) -> Vec<u8>;
+
+    /// An Encapsulated Request POSTed to `OHTTP_GATEWAY_PATH`.
+    fn answer(&self, encapsulated: &[u8]) -> GatewayReply;
+}
+
+pub enum GatewayReply {
+    /// A 200 carrying this Encapsulated Response.
+    Response(Vec<u8>),
+    /// An error found before the request could be decapsulated, so it cannot be encapsulated
+    /// either.
+    Status(&'static str),
+    /// No response to this request alone. A relay carries other clients' requests on the same
+    /// connection, so closing it would drop theirs too.
+    Unanswered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Media {
     Dns,
     Oblivious,
+    OhttpRequest,
     Other,
 }
 
 impl Media {
-    fn of(content_type: &[u8]) -> Self {
+    pub(crate) fn of(content_type: &[u8]) -> Self {
         if content_type.eq_ignore_ascii_case(b"application/dns-message") {
             Media::Dns
         } else if content_type.eq_ignore_ascii_case(ODOH_MEDIA_TYPE.as_bytes()) {
             Media::Oblivious
+        } else if content_type.eq_ignore_ascii_case(OHTTP_REQUEST_MEDIA_TYPE.as_bytes()) {
+            Media::OhttpRequest
         } else {
             Media::Other
         }
@@ -207,6 +258,38 @@ fn route_oblivious(
     Route::Respond(response)
 }
 
+/// Routes the Oblivious HTTP gateway; `None` leaves the request to the other routes. `ohttp_body` is
+/// the body of a POST whose content type is `message/ohttp-req`.
+fn route_gateway(
+    method: &[u8],
+    path: &[u8],
+    ohttp_body: Option<&[u8]>,
+    gateway: Option<&dyn Gateway>,
+) -> Option<AppResponse> {
+    let at_gateway = path.split(|&b| b == b'?').next() == Some(OHTTP_GATEWAY_PATH.as_bytes());
+    if method == b"GET" && at_gateway {
+        return Some(match gateway {
+            Some(gateway) => AppResponse::Http(HttpReply::ohttp_keys(gateway.keys())),
+            None => AppResponse::Status("404"),
+        });
+    }
+    let body = ohttp_body?;
+    let Some(gateway) = gateway else {
+        return Some(AppResponse::Status(STATUS_UNSUPPORTED_MEDIA_TYPE));
+    };
+    if !at_gateway {
+        return Some(AppResponse::Status("404"));
+    }
+    if body.is_empty() {
+        return Some(AppResponse::Status(STATUS_BAD_REQUEST));
+    }
+    Some(match gateway.answer(body) {
+        GatewayReply::Response(response) => AppResponse::Http(HttpReply::ohttp_response(response)),
+        GatewayReply::Status(status) => AppResponse::Status(status),
+        GatewayReply::Unanswered => AppResponse::Reset,
+    })
+}
+
 /// The `targethost` and `targetpath` variables of a proxy request, percent-decoded. `Ok(None)`
 /// when neither is there. Each must appear once, decode to printable ASCII, and the path must
 /// start with `/`; anything else is a malformed proxy request.
@@ -276,7 +359,7 @@ const MAX_H2_STREAMS: usize = 128;
 const MAX_H2_BODY: usize = 64 * 1024;
 
 /// The largest DNS message.
-const MAX_H2_RESPONSE: usize = u16::MAX as usize;
+pub(crate) const MAX_H2_RESPONSE: usize = u16::MAX as usize;
 
 const MAX_H2_HEADER_BLOCK: usize = 32 * 1024;
 
@@ -327,6 +410,7 @@ where
         |_| {},
         &AtomicBool::new(false),
         None,
+        None,
     )
 }
 
@@ -341,7 +425,8 @@ where
 /// connection ends then, sends that second GOAWAY first, so the client knows which requests were
 /// not processed and can send them elsewhere.
 ///
-/// Without `oblivious`, Oblivious DoH requests get the status of any unsupported media type.
+/// Without `oblivious` or `gateway`, Oblivious DoH or Oblivious HTTP requests get the status of any
+/// unsupported media type.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
     expected_path: &str,
@@ -349,6 +434,7 @@ pub fn serve_doh_with_deadline_reset<S, H, R>(
     mut reset_deadline: R,
     draining: &AtomicBool,
     oblivious: Option<&dyn Oblivious>,
+    gateway: Option<&dyn Gateway>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -574,7 +660,7 @@ where
                 if h.has_flag(flags::END_HEADERS) && h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
                         let Some(response) =
-                            process_request(st, expected_path, &handler, oblivious)?
+                            process_request(st, expected_path, &handler, oblivious, gateway)?
                         else {
                             return Ok(());
                         };
@@ -629,7 +715,7 @@ where
                     if end_stream {
                         if let Some(st) = streams.remove(&h.stream_id) {
                             let Some(response) =
-                                process_request(st, expected_path, &handler, oblivious)?
+                                process_request(st, expected_path, &handler, oblivious, gateway)?
                             else {
                                 return Ok(());
                             };
@@ -689,7 +775,7 @@ where
                 if h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
                         let Some(response) =
-                            process_request(st, expected_path, &handler, oblivious)?
+                            process_request(st, expected_path, &handler, oblivious, gateway)?
                         else {
                             return Ok(());
                         };
@@ -821,25 +907,25 @@ fn send_rst_stream<S: Write>(stream: &mut S, sid: u32, code: u32) -> Result<(), 
     send_frame(stream, frame_type::RST_STREAM, 0, sid, &code.to_be_bytes())
 }
 
-const STATUS_BAD_REQUEST: &str = "400";
+pub(crate) const STATUS_BAD_REQUEST: &str = "400";
 
 /// An answer exists but cannot be sent as is: a server problem, not a bad request.
-const STATUS_BAD_GATEWAY: &str = "502";
-const STATUS_METHOD_NOT_ALLOWED: &str = "405";
+pub(crate) const STATUS_BAD_GATEWAY: &str = "502";
+pub(crate) const STATUS_METHOD_NOT_ALLOWED: &str = "405";
 /// RFC 8484 names this code for a body type the server does not handle.
-const STATUS_UNSUPPORTED_MEDIA_TYPE: &str = "415";
+pub(crate) const STATUS_UNSUPPORTED_MEDIA_TYPE: &str = "415";
 /// Sent in the Allow header of a 405.
-const ALLOWED_METHODS: &str = "GET, POST";
+pub(crate) const ALLOWED_METHODS: &str = "GET, POST";
 
 /// Pseudo-headers come before regular ones, once each, and a content-length must match the body.
 /// Loosening the order or duplicate rules is a request smuggling path: a front end and this server
 /// would read the same bytes as different requests.
 ///
-/// The flag is true for a POST of an ObliviousDoHMessage.
+/// The media type is that of a POST body; a GET has none.
 fn valid_doh_request_headers(
     headers: &[(Vec<u8>, Vec<u8>)],
     body_len: usize,
-) -> Result<(&[u8], &[u8], bool), &'static str> {
+) -> Result<(&[u8], &[u8], Option<Media>), &'static str> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -925,13 +1011,12 @@ fn valid_doh_request_headers(
                 return Err(STATUS_BAD_REQUEST);
             }
             match content_type {
-                Some(Media::Dns) => Ok((method, path, false)),
-                Some(Media::Oblivious) => Ok((method, path, true)),
                 Some(Media::Other) | None => Err(STATUS_UNSUPPORTED_MEDIA_TYPE),
+                media => Ok((method, path, media)),
             }
         }
         b"GET" if body_len == 0 && content_length.is_none_or(|length| length == 0) => {
-            Ok((method, path, false))
+            Ok((method, path, None))
         }
         b"GET" => Err(STATUS_BAD_REQUEST),
         _ => Err(STATUS_METHOD_NOT_ALLOWED),
@@ -945,6 +1030,7 @@ fn process_request<H>(
     expected_path: &str,
     handler: &H,
     oblivious: Option<&dyn Oblivious>,
+    gateway: Option<&dyn Gateway>,
 ) -> Result<Option<AppResponse>, H2Error>
 where
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
@@ -952,13 +1038,22 @@ where
     if !st.have_headers {
         return Err(H2Error::Protocol);
     }
-    let (method, path, is_oblivious) = match valid_doh_request_headers(&st.headers, st.body.len()) {
+    let (method, path, media) = match valid_doh_request_headers(&st.headers, st.body.len()) {
         Ok(head) => head,
         Err(status) => return Ok(Some(AppResponse::Status(status))),
     };
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
-    let oblivious_body = is_oblivious.then_some(st.body.as_slice());
-    match route_oblivious(method, path, oblivious_body, expected_path, oblivious) {
+    let body_of = |kind| (media == Some(kind)).then_some(st.body.as_slice());
+    if let Some(response) = route_gateway(method, path, body_of(Media::OhttpRequest), gateway) {
+        return Ok(Some(response));
+    }
+    match route_oblivious(
+        method,
+        path,
+        body_of(Media::Oblivious),
+        expected_path,
+        oblivious,
+    ) {
         Route::Doh => {}
         Route::Respond(response) => return Ok(Some(response)),
         Route::Drop => return Ok(None),
@@ -1100,7 +1195,7 @@ where
     S: Read + Write,
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
 {
-    serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {}, None)
+    serve_doh_h1_with_deadline_reset(stream, expected_path, handler, |_| {}, None, None)
 }
 
 /// Only Content-Length bodies are accepted, not chunked. An encoding the front end reads
@@ -1111,6 +1206,7 @@ pub fn serve_doh_h1_with_deadline_reset<S, H, R>(
     handler: H,
     mut reset_deadline: R,
     oblivious: Option<&dyn Oblivious>,
+    gateway: Option<&dyn Gateway>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -1227,14 +1323,16 @@ where
 
     let path_only = target.split(|&b| b == b'?').next().unwrap_or(b"");
     let is_configs = method == b"GET" && path_only == ODOH_CONFIGS_PATH.as_bytes();
-    let client_id = match match_doh_path(path_only, expected_path) {
-        Some(cid) => cid,
-        None if is_configs => None,
-        None => return write_h1_status(stream, "404 Not Found"),
-    };
+    let client_id = match_doh_path(path_only, expected_path);
+    if client_id.is_none() && !is_configs && path_only != OHTTP_GATEWAY_PATH.as_bytes() {
+        return write_h1_status(stream, "404 Not Found");
+    }
 
     let query: Option<Vec<u8>> = if method == b"POST" {
-        if !matches!(content_type, Some(Media::Dns | Media::Oblivious)) {
+        if !matches!(
+            content_type,
+            Some(Media::Dns | Media::Oblivious | Media::OhttpRequest)
+        ) {
             return write_h1_status(stream, "415 Unsupported Media Type");
         }
         let Some(content_length) = content_length else {
@@ -1267,14 +1365,28 @@ where
         return write_h1_status(stream, "405 Method Not Allowed");
     };
 
-    let oblivious_body = query
-        .as_deref()
-        .filter(|_| method == b"POST" && content_type == Some(Media::Oblivious));
-    match route_oblivious(method, target, oblivious_body, expected_path, oblivious) {
+    let body_of = |kind| {
+        query
+            .as_deref()
+            .filter(|_| method == b"POST" && content_type == Some(kind))
+    };
+    if let Some(response) = route_gateway(method, target, body_of(Media::OhttpRequest), gateway) {
+        return write_h1_app_response(stream, response);
+    }
+    match route_oblivious(
+        method,
+        target,
+        body_of(Media::Oblivious),
+        expected_path,
+        oblivious,
+    ) {
         Route::Doh => {}
         Route::Respond(response) => return write_h1_app_response(stream, response),
         Route::Drop => return Ok(()),
     }
+    let Some(client_id) = client_id else {
+        return write_h1_status(stream, "404 Not Found");
+    };
 
     match query {
         Some(q) if !q.is_empty() => match handler(&q, client_id.as_deref()) {
@@ -1331,6 +1443,7 @@ fn h1_status_line(status: &str) -> String {
         "403" => "Forbidden",
         "404" => "Not Found",
         "415" => "Unsupported Media Type",
+        "422" => "Unprocessable Content",
         "429" => "Too Many Requests",
         "502" => "Bad Gateway",
         "504" => "Gateway Timeout",
@@ -1363,7 +1476,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Decoded value of the `dns` query parameter.
-fn get_dns_param(path: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn get_dns_param(path: &[u8]) -> Option<Vec<u8>> {
     let q = path.split(|&b| b == b'?').nth(1)?;
     for kv in q.split(|&b| b == b'&') {
         if let Some(v) = kv.strip_prefix(b"dns=") {
@@ -1760,6 +1873,7 @@ mod tests {
                 },
                 &std::sync::atomic::AtomicBool::new(false),
                 None,
+                None,
             )
         });
 
@@ -1902,6 +2016,7 @@ mod tests {
                 |_| {},
                 &server_draining,
                 None,
+                None,
             )
         });
 
@@ -1983,6 +2098,7 @@ mod tests {
                 |_| {},
                 &std::sync::atomic::AtomicBool::new(true),
                 None,
+                None,
             )
         });
 
@@ -2012,6 +2128,7 @@ mod tests {
                 |query, _| answer(query.to_vec()),
                 |_| {},
                 &server_draining,
+                None,
                 None,
             )
         });
@@ -2884,7 +3001,33 @@ mod tests {
         }
     }
 
+    /// Reverses the request; "unknown" stands for a key it does not hold and "unanswered" for a
+    /// query the resolver does not answer.
+    struct EchoGateway;
+
+    impl Gateway for EchoGateway {
+        fn keys(&self) -> Vec<u8> {
+            b"keys".to_vec()
+        }
+
+        fn answer(&self, encapsulated: &[u8]) -> GatewayReply {
+            match encapsulated {
+                b"unknown" => GatewayReply::Status("422"),
+                b"unanswered" => GatewayReply::Unanswered,
+                _ => GatewayReply::Response(encapsulated.iter().rev().copied().collect()),
+            }
+        }
+    }
+
     fn h1_oblivious(raw: Vec<u8>, oblivious: Option<EchoTarget>) -> String {
+        h1_serve(raw, oblivious, None)
+    }
+
+    fn h1_serve(
+        raw: Vec<u8>,
+        oblivious: Option<EchoTarget>,
+        gateway: Option<EchoGateway>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2895,12 +3038,88 @@ mod tests {
                 |q, _| answer(q.to_vec()),
                 |_| {},
                 oblivious.as_ref().map(|target| target as &dyn Oblivious),
+                gateway.as_ref().map(|gateway| gateway as &dyn Gateway),
             )
             .ok();
         });
         let response = String::from_utf8_lossy(&h1_request(addr, &raw)).to_string();
         server.join().unwrap();
         response
+    }
+
+    fn h1_gateway_post(
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        gateway: Option<EchoGateway>,
+    ) -> String {
+        let mut raw = format!(
+            "POST {path} HTTP/1.1\r\nHost: dns.test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        h1_serve(raw, None, gateway)
+    }
+
+    #[test]
+    fn h1_routes_encapsulated_requests_to_the_gateway() {
+        let post = |body: &[u8]| {
+            h1_gateway_post(
+                OHTTP_GATEWAY_PATH,
+                OHTTP_REQUEST_MEDIA_TYPE,
+                body,
+                Some(EchoGateway),
+            )
+        };
+        let response = post(b"abc");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("\r\ncontent-type: message/ohttp-res\r\n"));
+        assert!(response.contains("\r\ncache-control: private, no-store\r\n"));
+        assert!(response.ends_with("\r\n\r\ncba"), "{response}");
+
+        let unknown = post(b"unknown");
+        assert!(
+            unknown.starts_with("HTTP/1.1 422 Unprocessable Content\r\n"),
+            "{unknown}"
+        );
+        assert_eq!(post(b"unanswered"), "");
+        let empty = post(b"");
+        assert!(empty.starts_with("HTTP/1.1 400 "), "{empty}");
+
+        let get = format!("GET {OHTTP_GATEWAY_PATH} HTTP/1.1\r\nHost: dns.test\r\nAccept: application/ohttp-keys\r\n\r\n")
+            .into_bytes();
+        let keys = h1_serve(get.clone(), None, Some(EchoGateway));
+        assert!(keys.starts_with("HTTP/1.1 200 OK\r\n"), "{keys}");
+        assert!(keys.contains("\r\ncontent-type: application/ohttp-keys\r\n"));
+        assert!(keys.ends_with("\r\n\r\nkeys"), "{keys}");
+        let no_gateway = h1_serve(get, None, None);
+        assert!(no_gateway.starts_with("HTTP/1.1 404 "), "{no_gateway}");
+    }
+
+    #[test]
+    /// The gateway takes encapsulated requests at its own path only, and its path is not a DoH path.
+    fn h1_refuses_gateway_requests_it_cannot_serve() {
+        let at_doh_path = h1_gateway_post(
+            "/dns-query",
+            OHTTP_REQUEST_MEDIA_TYPE,
+            b"abc",
+            Some(EchoGateway),
+        );
+        assert!(at_doh_path.starts_with("HTTP/1.1 404 "), "{at_doh_path}");
+        let no_gateway =
+            h1_gateway_post(OHTTP_GATEWAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, b"abc", None);
+        assert!(no_gateway.starts_with("HTTP/1.1 415 "), "{no_gateway}");
+        let wrong_type =
+            h1_gateway_post(OHTTP_GATEWAY_PATH, "text/plain", b"abc", Some(EchoGateway));
+        assert!(wrong_type.starts_with("HTTP/1.1 415 "), "{wrong_type}");
+        let dns_query = h1_gateway_post(
+            OHTTP_GATEWAY_PATH,
+            "application/dns-message",
+            b"dns",
+            Some(EchoGateway),
+        );
+        assert!(dns_query.starts_with("HTTP/1.1 404 "), "{dns_query}");
     }
 
     fn h1_oblivious_post(path: &str, body: &[u8], oblivious: Option<EchoTarget>) -> String {
@@ -3084,6 +3303,7 @@ mod tests {
                 |_| {},
                 &AtomicBool::new(false),
                 Some(&target),
+                None,
             )
             .ok();
         });
@@ -3147,6 +3367,92 @@ mod tests {
     }
 
     #[test]
+    fn h2_serves_the_gateway_beside_doh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut s = deadline_accept(&listener);
+            serve_doh_with_deadline_reset(
+                &mut s,
+                "/dns-query",
+                |q, _| answer(q.to_vec()),
+                |_| {},
+                &AtomicBool::new(false),
+                None,
+                Some(&EchoGateway),
+            )
+            .ok();
+        });
+        let mut client = h2_connect(addr);
+        let post = |path, content_type| {
+            [
+                (":method", "POST"),
+                (":scheme", "https"),
+                (":authority", "dns.test"),
+                (":path", path),
+                ("content-type", content_type),
+            ]
+        };
+        let encapsulated = post(OHTTP_GATEWAY_PATH, OHTTP_REQUEST_MEDIA_TYPE);
+
+        let (headers, body) = h2_request_on(&mut client, 1, &encapsulated, b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
+        assert_eq!(
+            header(&headers, b"content-type"),
+            Some(OHTTP_RESPONSE_MEDIA_TYPE.as_bytes())
+        );
+        assert_eq!(
+            header(&headers, b"cache-control"),
+            Some(&b"private, no-store"[..])
+        );
+        assert_eq!(body, b"cba");
+
+        let (headers, _) = h2_request_on(&mut client, 3, &encapsulated, b"unknown");
+        assert_eq!(header(&headers, b":status"), Some(&b"422"[..]));
+        let at_doh_path = post("/dns-query", OHTTP_REQUEST_MEDIA_TYPE);
+        let (headers, _) = h2_request_on(&mut client, 5, &at_doh_path, b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"404"[..]));
+        let wrong_type = post(OHTTP_GATEWAY_PATH, "text/plain");
+        let (headers, _) = h2_request_on(&mut client, 7, &wrong_type, b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"415"[..]));
+
+        let block = hpack::encode_response(&encapsulated);
+        open_stream(&mut client, 9, &block);
+        send_frame(
+            &mut client,
+            frame_type::DATA,
+            flags::END_STREAM,
+            9,
+            b"unanswered",
+        )
+        .unwrap();
+        assert_eq!(
+            resets(&barrier(&mut client)),
+            vec![(9, error_code::CANCEL)],
+            "an unanswered request must end its own stream, not the relay's connection"
+        );
+
+        let get = [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "dns.test"),
+            (":path", OHTTP_GATEWAY_PATH),
+            ("accept", OHTTP_KEYS_MEDIA_TYPE),
+        ];
+        let (headers, body) = h2_request_on(&mut client, 11, &get, b"");
+        assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
+        assert_eq!(
+            header(&headers, b"content-type"),
+            Some(OHTTP_KEYS_MEDIA_TYPE.as_bytes())
+        );
+        assert_eq!(body, b"keys");
+
+        assert_eq!(h2_exchange_on(&mut client, 13, b"dns"), b"dns");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
     /// The client half of ODoH: configs by GET, messages by POST, and a stale key as status 401.
     fn h2_client_fetches_configs_and_sends_oblivious_messages() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3161,6 +3467,7 @@ mod tests {
                 |_| {},
                 &AtomicBool::new(false),
                 Some(&target),
+                None,
             )
             .ok();
         });

@@ -859,6 +859,7 @@ mod tests {
                             |_| {},
                             &AtomicBool::new(false),
                             Some(&*server as &dyn Oblivious),
+                            None,
                         );
                     });
                 }

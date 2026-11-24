@@ -371,6 +371,7 @@ impl ChainPlan {
                 "listen_dot",
                 "listen_doq",
                 "doh_path",
+                "ohttp_gateway",
             ]);
         }
         keys.sort_unstable();

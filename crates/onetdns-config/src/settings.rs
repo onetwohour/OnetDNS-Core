@@ -595,6 +595,10 @@ pub struct Config {
     /// refused, so the proxy never relays anywhere else.
     pub odoh_proxy_targets: Vec<String>,
 
+    /// Runs an Oblivious HTTP gateway (RFC 9458) for DoH on the DoH listeners, at
+    /// /.well-known/ohttp-gateway (RFC 9540). Queries count as coming from the relay.
+    pub ohttp_gateway: bool,
+
     /// Authentication name advertised by DDR (RFC 9462); empty disables DDR. With a name,
     /// `_dns.resolver.arpa` SVCB queries list the encrypted listeners so clients upgrade from Do53
     /// on their own. Clients verify TLS against this name, so the certificate must carry it.
@@ -1046,6 +1050,7 @@ impl Default for Config {
             doh_path: "/dns-query".to_string(),
             odoh_target: false,
             odoh_proxy_targets: vec![],
+            ohttp_gateway: false,
             ddr_name: String::new(),
             tls_cert: None,
             tls_key: None,
@@ -1449,6 +1454,12 @@ impl Config {
         if !self.odoh_proxy_targets.is_empty() && self.listen_doh.is_empty() {
             return invalid(
                 "odoh_proxy_targets needs a DoH listener in listen_doh; the Oblivious DoH proxy runs there"
+                    .into(),
+            );
+        }
+        if self.ohttp_gateway && self.listen_doh.is_empty() {
+            return invalid(
+                "ohttp_gateway needs a DoH listener in listen_doh; the Oblivious HTTP gateway runs there"
                     .into(),
             );
         }
@@ -3107,6 +3118,7 @@ impl Config {
         kv("doh_path", js(&self.doh_path));
         kv("odoh_target", self.odoh_target.to_string());
         kv("odoh_proxy_targets", sarr(&self.odoh_proxy_targets));
+        kv("ohttp_gateway", self.ohttp_gateway.to_string());
         kv("ddr_name", js(&self.ddr_name));
         kv("tls_cert", opt_p(&self.tls_cert));
         kv("tls_key", opt_p(&self.tls_key));
@@ -3664,6 +3676,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "lowercase_outgoing",
         "minimal_responses",
         "odoh_target",
+        "ohttp_gateway",
         "parental_control",
         "prefer_ip4",
         "prefer_ip6",
@@ -5521,6 +5534,7 @@ const KNOWN_KEYS: &[&str] = &[
     "doh_path",
     "odoh_target",
     "odoh_proxy_targets",
+    "ohttp_gateway",
     "ddr_name",
     "tls_cert",
     "tls_key",
@@ -5894,6 +5908,7 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.doh_path = gstr(root, "doh_path").unwrap_or(d.doh_path);
     c.odoh_target = gbool(root, "odoh_target", d.odoh_target);
     c.odoh_proxy_targets = gstrvec(root, "odoh_proxy_targets");
+    c.ohttp_gateway = gbool(root, "ohttp_gateway", d.ohttp_gateway);
     c.ddr_name = gstr(root, "ddr_name").unwrap_or(d.ddr_name);
     c.tls_cert = gstr(root, "tls_cert").map(PathBuf::from);
     c.tls_key = gstr(root, "tls_key").map(PathBuf::from);
@@ -6509,6 +6524,7 @@ mod tests {
             "doh_path = \"no-slash\"\n",
             "doh_path = \"/a b\"\n",
             "odoh_target = true\n",
+            "ohttp_gateway = true\n",
             "odoh_proxy_targets = [\"https://odoh.example/dns-query\"]\n",
             "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example\"]\n",
             "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"tls://odoh.example/q\"]\n",
@@ -6532,6 +6548,8 @@ mod tests {
             .expect("쓸 수 있는 값은 받아들인다");
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_target = true\n")
             .expect("an ODoH target with a DoH listener");
+        Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nohttp_gateway = true\n")
+            .expect("an OHTTP gateway with a DoH listener");
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/dns-query\", \"https://[2001:db8::1]:8443/q#odoh.example\"]\n")
             .expect("ODoH proxy targets with a DoH listener");
     }

@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use onetdns_config::Config;
 use onetdns_core::{ArcSwap, MutexExt};
 use onetdns_forward::odoh::{OdohError, Relay, RelayError, Relayed, TargetKey};
-use onetdns_http2::{Oblivious, ObliviousReply};
+use onetdns_http2::{DohAnswer, Oblivious, ObliviousReply};
 use onetdns_tls::hpke::PrivateKey;
 
 use crate::native::RelayAdmission;
+use crate::ohttp::GatewayKey;
 use crate::transport_observe;
 use crate::upstream::{parse_upstream_url, split_authority, BOOTSTRAP_TIMEOUT};
 
@@ -24,10 +25,11 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 /// a failed lookup keeps the old address this long before trying again.
 const MIN_TARGET_ADDR_LIFETIME: Duration = Duration::from_secs(60);
 
-/// What a DoH listener serves of Oblivious DoH.
+/// What a DoH listener serves of Oblivious DoH and Oblivious HTTP.
 pub(crate) struct ObliviousDoh {
     pub(crate) target: Option<Arc<OdohTarget>>,
     pub(crate) proxy: Option<OdohProxy>,
+    pub(crate) gateway: Option<GatewayKey>,
 }
 
 pub(crate) struct OdohTarget {
@@ -191,7 +193,7 @@ pub(crate) struct ObliviousConn<'a, R, A> {
 
 impl<R, A> Oblivious for ObliviousConn<'_, R, A>
 where
-    R: Fn(&[u8]) -> Result<Option<Vec<u8>>, &'static str>,
+    R: Fn(&[u8]) -> Result<Option<DohAnswer>, &'static str>,
     A: Fn() -> RelayAdmission,
 {
     fn configs(&self) -> Option<Vec<u8>> {
@@ -224,7 +226,7 @@ where
         let response = match refused_unless_query(opened.dns()) {
             Some(refused) => refused,
             None => match (self.resolve)(opened.dns()) {
-                Ok(Some(response)) => response,
+                Ok(Some(answer)) => answer.body,
                 Ok(None) => return ObliviousReply::Unanswered,
                 Err(status) => return ObliviousReply::Status(status),
             },
@@ -251,10 +253,10 @@ where
     }
 }
 
-/// The proxy's address stands for every client behind it, so a request authorized by source
-/// address, such as UPDATE, NOTIFY or a zone transfer, is refused rather than granted to all of
-/// them.
-fn refused_unless_query(dns: &[u8]) -> Option<Vec<u8>> {
+/// An ODoH proxy's or OHTTP relay's address stands for every client behind it, so a request
+/// authorized by source address, such as UPDATE, NOTIFY or a zone transfer, is refused rather than
+/// granted to all of them.
+pub(crate) fn refused_unless_query(dns: &[u8]) -> Option<Vec<u8>> {
     const IXFR: u16 = 251;
     const AXFR: u16 = 252;
     let request = onetdns_proto::Message::parse(dns).ok()?;
@@ -372,6 +374,7 @@ mod tests {
         let service = ObliviousDoh {
             target: None,
             proxy: Some(proxy(&["https://odoh.example/q"])),
+            gateway: None,
         };
         let conn = |admission: RelayAdmission| ObliviousConn {
             service: &service,
