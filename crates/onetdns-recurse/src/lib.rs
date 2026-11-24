@@ -2180,7 +2180,38 @@ impl Recursor {
 
         if plan.is_final {
             strip_out_of_bailiwick_dnames(&mut resp, &state.zone);
-            if is_relevant_positive(&resp, ctx.qname, ctx.qtype) {
+            let positive = is_relevant_positive(&resp, ctx.qname, ctx.qtype);
+            // An unvalidated positive answer is complete as it is; anything else needs the zone it
+            // came from as the chain's last step.
+            if ctx.collect_ds || !positive {
+                if let Some(apex) = hidden_zone_cut(&resp, ctx.qname, &state.zone) {
+                    rtrace!(
+                        "Found a zone cut in a final answer: zone={}",
+                        apex.to_ascii_lower()
+                    );
+                    let pending = PendingReferral {
+                        zone: apex,
+                        resp,
+                        ns_names: state
+                            .chain
+                            .last()
+                            .map(|step| step.ns_names.clone())
+                            .unwrap_or_default(),
+                        addrs: state.servers.clone(),
+                        address_ttl: None,
+                        ds_evidence: None,
+                        unresolved: state.unresolved_ns.clone(),
+                    };
+                    if ctx.collect_ds {
+                        return StepOutcome::NeedDs {
+                            missing: Vec::new(),
+                            pending: Box::new(pending),
+                        };
+                    }
+                    return self.descend(state, ctx, pending, Vec::new());
+                }
+            }
+            if positive {
                 rtrace!("Got final response: name={}", ctx.qname.to_ascii_lower());
                 return StepOutcome::Done(resp);
             }
@@ -3594,6 +3625,31 @@ fn answer_zone_cut(resp: &Message, plan: &NextQuery, zone: &Name) -> Option<Vec<
     (!ns.is_empty()).then_some(ns)
 }
 
+/// A final answer from a zone below the current one, served by the same server: no NS query
+/// showed the cut, because the query name is the child's apex or minimization was abandoned. The
+/// answer still names its zone, as the signer of its RRSIGs or the owner of a negative answer's
+/// SOA. Returns the shallowest such zone; a deeper one is found from there.
+fn hidden_zone_cut(resp: &Message, qname: &Name, zone: &Name) -> Option<Name> {
+    if !resp.header.authoritative {
+        return None;
+    }
+    let signers = resp
+        .answers
+        .iter()
+        .chain(&resp.authorities)
+        .filter_map(onetdns_dnssec::Rrsig::from_record)
+        .map(|signature| signature.signer);
+    let soa_owners = resp
+        .authorities
+        .iter()
+        .filter(|record| record.rtype == RecordType::SOA && record.class == DnsClass::IN)
+        .map(|record| record.name.clone());
+    signers
+        .chain(soa_owners)
+        .filter(|apex| is_closer(apex, zone) && is_within(qname, apex))
+        .min_by_key(Name::num_labels)
+}
+
 fn has_direct_qtype_answer(resp: &Message, qname: &Name, qtype: RecordType) -> bool {
     resp.answers.iter().any(|record| {
         record.class == DnsClass::IN
@@ -3669,7 +3725,8 @@ fn retryable_rcode(rcode: u16) -> bool {
 }
 
 /// The ID and question must match what this server sent, and the rcode must be usable; otherwise
-/// the next server is tried.
+/// the next server is tried. A negative answer from a zone below the current one is usable because
+/// it shows a cut; it is asked again from that zone.
 fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -> bool {
     let Some(question) = query.questions.first() else {
         return false;
@@ -3685,9 +3742,11 @@ fn response_usable_for_iteration(resp: &Message, query: &Message, zone: &Name) -
                 || extract_referral(resp, &question.name)
                     .0
                     .is_some_and(|child| is_closer(&child, zone))
+                || hidden_zone_cut(resp, &question.name, zone).is_some()
         }
         code if code == ResponseCode::NXDomain.0 => {
             is_authoritative_negative(resp, &question.name, zone)
+                || hidden_zone_cut(resp, &question.name, zone).is_some()
         }
 
         code if code == ResponseCode::YXDomain.0 => is_dname_yxdomain(resp, &question.name),
@@ -4653,6 +4712,53 @@ mod tests {
             2,
             "ANY 응답의 A·AAAA RRset이 유지되어야 한다"
         );
+    }
+
+    #[test]
+    /// A negative answer carrying the SOA of a zone between the current zone and the name asked
+    /// shows a cut the same server serves. Refusing it would count the server as broken and ask
+    /// the others first. An SOA outside that range shows nothing.
+    fn a_negative_answer_from_a_hidden_child_is_usable() {
+        let zone = Name::from_str("parent.test").unwrap();
+        let qname = Name::from_str("l.parent.test").unwrap();
+        let query = Message::query(1, qname.clone(), RecordType::AAAA);
+        let soa = |owner: &str| {
+            Record::new(
+                Name::from_str(owner).unwrap(),
+                300,
+                RData::soa(onetdns_proto::Soa {
+                    mname: Name::from_str("ns.parent.test").unwrap(),
+                    rname: Name::from_str("hostmaster.parent.test").unwrap(),
+                    serial: 1,
+                    refresh: 3600,
+                    retry: 600,
+                    expire: 86_400,
+                    minimum: 300,
+                }),
+            )
+        };
+        for rcode in [ResponseCode::NoError.0, ResponseCode::NXDomain.0] {
+            let mut resp = query.clone();
+            resp.header.response = true;
+            resp.header.authoritative = true;
+            resp.header.rcode = rcode;
+            resp.authorities.push(soa("l.parent.test"));
+            assert!(response_usable_for_iteration(&resp, &query, &zone));
+            assert_eq!(hidden_zone_cut(&resp, &qname, &zone), Some(qname.clone()));
+
+            let mut not_authoritative = resp.clone();
+            not_authoritative.header.authoritative = false;
+            assert!(!response_usable_for_iteration(
+                &not_authoritative,
+                &query,
+                &zone
+            ));
+
+            let mut elsewhere = resp.clone();
+            elsewhere.authorities = vec![soa("other.parent.test")];
+            assert!(!response_usable_for_iteration(&elsewhere, &query, &zone));
+            assert_eq!(hidden_zone_cut(&elsewhere, &qname, &zone), None);
+        }
     }
 
     #[test]
@@ -7080,6 +7186,12 @@ mod tests {
             RData::A(COHOSTED_TARGET),
         )];
         let host_sig = rrsig_rec(&child_sk, &child_key, "l.parent.test", 1, &host);
+        let apex = vec![Record::new(
+            name("l.parent.test"),
+            3600,
+            RData::A(COHOSTED_TARGET),
+        )];
+        let apex_sig = rrsig_rec(&child_sk, &child_key, "l.parent.test", 1, &apex);
         spawn_server(&zone_ip.to_string(), port, move |req| {
             let q = req.questions.first().unwrap().clone();
             let mut m = base(req);
@@ -7098,6 +7210,7 @@ mod tests {
                     }
                     ("l.parent.test", RecordType::DS) => (&child_ds, &child_ds_sig),
                     ("host.l.parent.test", RecordType::A) => (&host, &host_sig),
+                    ("l.parent.test", RecordType::A) => (&apex, &apex_sig),
                     _ => return m,
                 };
             m.answers.extend(records.iter().cloned());
@@ -7164,6 +7277,72 @@ mod tests {
             .expect("검증 실패도 응답으로 돌아와야 합니다");
         assert_eq!(resp.header.rcode, ResponseCode::ServFail.0, "{resp:?}");
         assert!(!resp.header.authentic_data);
+    }
+
+    #[test]
+    /// Asked for the child's apex, the shared server answers from the child at once, so no NS
+    /// query reveals the cut. The answer's signer names the child; its DS from the parent and its
+    /// DNSKEY then validate the answer. Validating with the parent's keys instead was Bogus.
+    fn a_signed_answer_at_a_hidden_child_apex_validates_through_its_ds() {
+        for (port, ip, child_ds_seed, secure) in [
+            (5426, Ipv4Addr::new(127, 0, 0, 76), 73, true),
+            (5427, Ipv4Addr::new(127, 0, 0, 78), 74, false),
+        ] {
+            let (root, anchor) = spawn_signed_cohosted_zones(
+                Ipv4Addr::new(127, 0, 0, ip.octets()[3] - 1),
+                ip,
+                port,
+                child_ds_seed,
+            );
+            let rec = Recursor::new(vec![root], Duration::from_secs(3))
+                .with_port(port)
+                .with_test_loopback()
+                .with_trust_anchors(vec![anchor]);
+            let resp = rec
+                .resolve(&Name::from_str("l.parent.test").unwrap(), RecordType::A)
+                .expect("검증 결과와 상관없이 응답으로 돌아와야 합니다");
+            if secure {
+                assert_eq!(resp.header.rcode, ResponseCode::NoError.0, "{resp:?}");
+                assert!(
+                    resp.header.authentic_data,
+                    "자식의 DS로 확인해 Secure여야 합니다"
+                );
+            } else {
+                assert_eq!(resp.header.rcode, ResponseCode::ServFail.0, "{resp:?}");
+                assert!(!resp.header.authentic_data);
+            }
+        }
+    }
+
+    #[test]
+    /// The shared server answers NODATA for the child's apex with the child's SOA. That SOA is
+    /// below the current zone; refusing the answer failed every server and ended in SERVFAIL. The
+    /// cut it shows is followed, the name asked again from the child, and the answer keeps the
+    /// child's SOA, which gives the negative TTL.
+    fn nodata_at_a_hidden_child_apex_is_accepted_with_its_soa() {
+        const PORT: u16 = 5428;
+        let (root, _) = spawn_cohosted_zones(
+            Ipv4Addr::new(127, 0, 0, 79),
+            Ipv4Addr::new(127, 0, 0, 80),
+            PORT,
+        );
+        let rec = Recursor::new(vec![root], Duration::from_secs(3))
+            .with_port(PORT)
+            .with_test_loopback();
+        let resp = rec
+            .resolve(&Name::from_str("l.parent.test").unwrap(), RecordType::AAAA)
+            .expect("자식 영역의 NODATA를 받아야 합니다");
+        assert_eq!(resp.header.rcode, ResponseCode::NoError.0, "{resp:?}");
+        assert!(resp.answers.is_empty(), "{resp:?}");
+        assert!(
+            resp.authorities
+                .iter()
+                .any(|record| record.rtype == RecordType::SOA
+                    && record
+                        .name
+                        .eq_ignore_case(&Name::from_str("l.parent.test").unwrap())),
+            "부정 TTL을 줄 자식의 SOA가 남아야 합니다: {resp:?}"
+        );
     }
 
     const GLUELESS_TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 58);
