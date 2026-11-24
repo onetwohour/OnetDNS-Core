@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20Legacy;
 use ed25519_dalek::{Signer, SigningKey};
+use onetdns_core::LruMap;
 use poly1305::universal_hash::KeyInit as _;
 use poly1305::Poly1305;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -32,8 +33,12 @@ pub const CLIENT_NONCE_LEN: usize = 12;
 
 pub const PUBKEY_LEN: usize = 32;
 
-/// Only the certificate is behind a mutex: it is the only part that changes, so the query path
-/// reads the keys without locking.
+/// Clients whose shared key is kept. A client seals every query to the same key pair, and the key
+/// exchange costs far more than decrypting the query.
+const SHARED_KEYS: usize = 4096;
+
+/// The keys never change. Clones share the certificate, which reissuing replaces, and the shared
+/// keys of recent clients.
 #[derive(Clone)]
 pub struct Provider {
     signing: SigningKey,
@@ -46,6 +51,8 @@ pub struct Provider {
 
     cert: Arc<Mutex<Vec<u8>>>,
     pub provider_name: String,
+
+    shared_keys: Arc<Mutex<LruMap<[u8; 32], Zeroizing<[u8; 32]>>>>,
 }
 
 /// Signs the resolver public key, client magic, serial and validity window, so only the holder of
@@ -132,6 +139,7 @@ impl Provider {
             client_magic,
             cert: Arc::new(Mutex::new(cert)),
             provider_name: provider_name.to_string(),
+            shared_keys: Arc::new(Mutex::new(LruMap::new(SHARED_KEYS))),
         }
     }
 
@@ -171,12 +179,26 @@ impl Provider {
     /// (libsodium's crypto_box_beforenm). Without that step no standard client derives the same
     /// key.
     pub fn shared_key(&self, client_pk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        let cached = self
+            .shared_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(client_pk)
+            .cloned();
+        if let Some(key) = cached {
+            return key;
+        }
         let raw = Zeroizing::new(
             self.resolver_sk
                 .diffie_hellman(&PublicKey::from(*client_pk))
                 .to_bytes(),
         );
-        Zeroizing::new(box_beforenm(&raw))
+        let key = Zeroizing::new(box_beforenm(&raw));
+        self.shared_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .put(*client_pk, key.clone());
+        key
     }
 
     /// Compares the query name with the provider name as raw octets: converting to a string would
@@ -536,6 +558,30 @@ mod tests {
             successor.shared_key(&client_pk).as_slice(),
             client_shared.as_slice()
         );
+    }
+
+    #[test]
+    fn shared_keys_are_computed_once_per_client_key() {
+        let provider = Provider::generate("2.dnscrypt-cert.onetdns", 86400);
+        let client_sk = StaticSecret::from([9u8; 32]);
+        let client_pk = PublicKey::from(&client_sk).to_bytes();
+        let expected = box_beforenm(
+            &client_sk
+                .diffie_hellman(&PublicKey::from(provider.resolver_pk))
+                .to_bytes(),
+        );
+        for _ in 0..2 {
+            assert_eq!(*provider.clone().shared_key(&client_pk), expected);
+        }
+        assert_eq!(provider.shared_keys.lock().unwrap().len(), 1);
+
+        let rotated = provider.with_resolver_secret(&[5u8; 32], 86400);
+        let rotated_expected = box_beforenm(
+            &client_sk
+                .diffie_hellman(&PublicKey::from(rotated.resolver_pk))
+                .to_bytes(),
+        );
+        assert_eq!(*rotated.shared_key(&client_pk), rotated_expected);
     }
 
     #[test]
