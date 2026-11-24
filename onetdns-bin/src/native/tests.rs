@@ -3497,7 +3497,7 @@ fn authority_wire_answers_are_recorded_like_the_structured_path() {
     }
 
     for _ in 0..200 {
-        if stats.metrics.snapshot().total >= 2 {
+        if stats.metrics.snapshot().total >= 2 && stats.recent(8).len() >= 2 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
