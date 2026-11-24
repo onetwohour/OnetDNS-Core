@@ -48,6 +48,8 @@ An Oblivious DoH upstream names the proxy and, in its query string, the target: 
 
 An Oblivious HTTP upstream is written the same way, with the relay in place of the proxy: `ohttp://relay.example/relay-path?targethost=dns.example&targetpath=/dns-query`. The query string names the DoH server behind the gateway and is not sent to the relay. See [Oblivious HTTP upstreams](../resolution.md#oblivious-http-upstreams).
 
+Server certificates are checked against the operating system's root certificates. As in OpenSSL, a PEM file named by the `SSL_CERT_FILE` environment variable is used in their place.
+
 **Note:** If `upstreams` is specified and `upstream_urls` is omitted, the implicit encrypted defaults are cleared.
 
 ### `bootstrap`

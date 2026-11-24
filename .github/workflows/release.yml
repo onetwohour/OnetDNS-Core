@@ -165,6 +165,8 @@ jobs:
           python=python3
           exe=
           if [ "$RUNNER_OS" = Windows ]; then python=python; exe=.exe; fi
+          # The recursion workload serves its root zone on port 53.
+          if [ "$RUNNER_OS" = Linux ]; then sudo sysctl -q -w net.ipv4.ip_unprivileged_port_start=0; fi
           RUSTFLAGS="$RUSTFLAGS -C profile-generate" \
             cargo build -p onetdns --release --locked --target "$TARGET" --target-dir target/pgo
           "$python" tools/pgo_train.py --emulator "$EMULATOR" \

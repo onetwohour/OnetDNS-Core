@@ -5,6 +5,8 @@
 //! copy supplies the constraints; otherwise a copy without constraints would escape name
 //! constraints.
 
+use std::ffi::OsString;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::x509::{IpConstraint, NameConstraints, X509};
@@ -108,9 +110,13 @@ impl TrustStore {
     /// Read on the first call in the process; later calls get a copy. Roots added to the OS store
     /// take effect after a restart. The default client config holds this store, so reading it per
     /// call would reread and parse the whole store on every connection.
+    ///
+    /// As in OpenSSL, a PEM bundle named by `SSL_CERT_FILE` replaces the OS store.
     pub fn system() -> TrustStore {
         static SYSTEM: OnceLock<TrustStore> = OnceLock::new();
-        SYSTEM.get_or_init(load_system_store).clone()
+        SYSTEM
+            .get_or_init(|| load_system_store(std::env::var_os("SSL_CERT_FILE")))
+            .clone()
     }
 }
 
@@ -120,8 +126,12 @@ impl TrustStore {
 ///
 /// Loading none is reported as an error: every encrypted upstream would then fail validation, which
 /// at the connection looks like nothing more than a validation failure.
-fn load_system_store() -> TrustStore {
-    let ders = load_system_root_ders();
+fn load_system_store(ssl_cert_file: Option<OsString>) -> TrustStore {
+    let bundle = ssl_cert_file.filter(|path| !path.is_empty());
+    let ders = match &bundle {
+        Some(path) => read_pem_bundle(Path::new(path)),
+        None => load_system_root_ders(),
+    };
     let mut store = TrustStore::empty();
     let mut skipped = 0usize;
     for der in &ders {
@@ -139,7 +149,10 @@ fn load_system_store() -> TrustStore {
         }
     }
     if store.is_empty() {
-        onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates");
+        match &bundle {
+            Some(path) => onetdns_core::error!(event = "tls.system_roots_empty", path = %Path::new(path).display(), found = ders.len(), "Could not load any certificate from the SSL_CERT_FILE bundle; cannot verify encrypted upstream DNS server certificates"),
+            None => onetdns_core::error!(event = "tls.system_roots_empty", found = ders.len(), "Could not load any system root certificates; cannot verify encrypted upstream DNS server certificates"),
+        }
     } else if skipped > 0 {
         onetdns_core::info!(event = "tls.system_roots_loaded", roots = store.len(), skipped = skipped, "Loaded system root certificates; the skipped ones could not be parsed and are not trusted");
     } else {
@@ -199,9 +212,6 @@ fn load_system_root_ders() -> Vec<Vec<u8>> {
 
 #[cfg(not(windows))]
 fn load_system_root_ders() -> Vec<Vec<u8>> {
-    use std::io::Read;
-
-    const MAX_ROOT_BUNDLE: u64 = 16 * 1024 * 1024;
     /// Root bundle paths differ by distribution; the first one found is used.
     const PATHS: &[&str] = &[
         "/etc/ssl/certs/ca-certificates.crt",
@@ -209,25 +219,31 @@ fn load_system_root_ders() -> Vec<Vec<u8>> {
         "/etc/ssl/ca-bundle.pem",
         "/etc/ssl/cert.pem",
     ];
-    for p in PATHS {
-        let Ok(file) = std::fs::File::open(p) else {
-            continue;
-        };
-        let mut pem = Vec::new();
-        if file
-            .take(MAX_ROOT_BUNDLE + 1)
-            .read_to_end(&mut pem)
-            .is_err()
-            || pem.len() as u64 > MAX_ROOT_BUNDLE
-        {
-            continue;
-        }
-        let ders = pem_certs(&pem);
-        if !ders.is_empty() {
-            return ders;
-        }
+    PATHS
+        .iter()
+        .map(|path| read_pem_bundle(Path::new(path)))
+        .find(|ders| !ders.is_empty())
+        .unwrap_or_default()
+}
+
+/// Empty when the file cannot be read, is too large, or holds no certificate.
+fn read_pem_bundle(path: &Path) -> Vec<Vec<u8>> {
+    use std::io::Read;
+
+    const MAX_ROOT_BUNDLE: u64 = 16 * 1024 * 1024;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut pem = Vec::new();
+    if file
+        .take(MAX_ROOT_BUNDLE + 1)
+        .read_to_end(&mut pem)
+        .is_err()
+        || pem.len() as u64 > MAX_ROOT_BUNDLE
+    {
+        return Vec::new();
     }
-    Vec::new()
+    pem_certs(&pem)
 }
 
 /// Returns the validated path: from the leaf to the store's copy of the root. Certificates the peer
@@ -918,6 +934,22 @@ mod tests {
         assert!(
             !store.is_empty(),
             "시스템 루트 스토어가 비어있음(환경에 CA 번들 없음?)"
+        );
+    }
+
+    #[test]
+    fn ssl_cert_file_replaces_the_system_store() {
+        let (ca_der, _) = ca_and_leaf("host.example");
+        let path =
+            std::env::temp_dir().join(format!("onetdns-ssl-cert-{}.pem", std::process::id()));
+        std::fs::write(&path, rcgen_pem(&ca_der)).unwrap();
+        let store = load_system_store(Some(path.clone().into_os_string()));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(load_system_store(Some(path.into_os_string())).is_empty());
+        assert!(
+            !load_system_store(Some(OsString::new())).is_empty(),
+            "빈 값은 시스템 저장소를 써야 합니다"
         );
     }
 
