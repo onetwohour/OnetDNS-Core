@@ -134,6 +134,10 @@ mod windows {
 
     const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
     const SIO_UDP_NETRESET: u32 = 0x9800_000F;
+    const WSAENOBUFS: i32 = 10_055;
+    /// A random port that lands among taken ones can fail the bind with WSAENOBUFS while other
+    /// ports are free; the next pick almost always succeeds.
+    const RANDOM_PORT_BINDS: usize = 4;
 
     /// Binds through Winsock to set options that std's `UdpSocket::bind` gives no chance to set
     /// before `bind`: `SO_RANDOMIZE_PORT` on port 0, so Windows picks a random free port rather
@@ -148,8 +152,18 @@ mod windows {
         if dual_stack {
             winsock::set_option(handle, winsock::IPPROTO_IPV6, winsock::IPV6_V6ONLY, 0)?;
         }
-        winsock::bind(handle, addr)?;
-        Ok(socket)
+        let mut binds = if addr.port() == 0 {
+            RANDOM_PORT_BINDS
+        } else {
+            1
+        };
+        loop {
+            binds -= 1;
+            match winsock::bind(handle, addr) {
+                Err(error) if binds > 0 && error.raw_os_error() == Some(WSAENOBUFS) => {}
+                result => return result.map(|()| socket),
+            }
+        }
     }
 
     /// Stops ICMP port-unreachable and TTL-expired errors from failing the next receive.
