@@ -143,15 +143,22 @@ fn main() {
         return;
     }
 
-    let mut rules = String::with_capacity(rule_count.saturating_mul(32));
-    for index in 0..rule_count {
-        writeln!(
-            rules,
-            "||ad{index}.tenant{}.tracking.example^",
-            index % 4093
-        )
-        .expect("String 쓰기는 실패하지 않음");
-    }
+    // A real list, since synthetic names share suffixes and shrink the automaton.
+    let rules = if let Some(path) = std::env::var_os("ONETDNS_DOMAIN_BENCH_FILE") {
+        std::fs::read_to_string(path).expect("규칙 파일을 읽지 못했습니다")
+    } else {
+        let mut rules = String::with_capacity(rule_count.saturating_mul(32));
+        for index in 0..rule_count {
+            writeln!(
+                rules,
+                "||ad{index}.tenant{}.tracking.example^",
+                index % 4093
+            )
+            .expect("String 쓰기는 실패하지 않음");
+        }
+        rules
+    };
+    let rule_count = rules.lines().count();
 
     let build_started = Instant::now();
     let engine = build_from_str(&rules, "", BlockResponse::NxDomain).with_hit_tracking(track_hits);
