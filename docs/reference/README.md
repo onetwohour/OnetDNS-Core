@@ -215,6 +215,7 @@ Top-level keys are indexed alphabetically below.
 [`odoh_proxy_targets`](core.md#odoh_proxy_targets)
 [`odoh_target`](core.md#odoh_target)
 [`ohttp_gateway`](core.md#ohttp_gateway)
+[`ohttp_relays`](core.md#ohttp_relays)
 
 ### P
 

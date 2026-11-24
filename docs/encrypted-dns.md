@@ -14,6 +14,7 @@ Incoming encrypted DNS uses `listen_dot`, `listen_doh`, `listen_doh3`, `listen_d
 | Oblivious DoH target | `listen_doh` with `odoh_target` | Same as DoH | Reached through an ODoH proxy; see [Oblivious DoH](#oblivious-doh) |
 | Oblivious DoH proxy | `listen_doh` with `odoh_proxy_targets` | Same as DoH | ODoH client; relays only to the listed targets |
 | Oblivious HTTP gateway | `listen_doh` with `ohttp_gateway` | Same as DoH, path `/.well-known/ohttp-gateway` | Reached through an OHTTP relay; see [Oblivious HTTP](#oblivious-http) |
+| Oblivious HTTP relay | `listen_doh` with `ohttp_relays` | Same as DoH, each relay's `path` | Passes encrypted requests to one gateway; see [Oblivious HTTP](#oblivious-http) |
 
 The ports shown are conventional; each transport is enabled by setting its listener. The host firewall and any cloud network rule must permit the corresponding TCP or UDP traffic.
 
@@ -87,11 +88,23 @@ listen_doh = ["0.0.0.0:443"]
 ohttp_gateway = true
 ```
 
-The DoH listeners then publish the key configuration (`application/ohttp-keys`) by GET at `https://dns.example.com/.well-known/ohttp-gateway`, and take encrypted requests (`message/ohttp-req`) POSTed to the same URL, as RFC 9540 describes. Each request must be a DoH request for `doh_path`, by POST or GET, and is answered like DoH from the relay. Answers are padded to a multiple of 468 bytes before encryption, so the relay cannot tell them apart by size. With `ddr_name` set, the DoH entries in DDR answers carry the `ohttp` parameter, which tells clients the gateway exists. DoH3 listeners do not serve OHTTP, and OnetDNS does not act as an OHTTP relay.
+The DoH listeners then publish the key configuration (`application/ohttp-keys`) by GET at `https://dns.example.com/.well-known/ohttp-gateway`, and take encrypted requests (`message/ohttp-req`) POSTed to the same URL, as RFC 9540 describes. Each request must be a DoH request for `doh_path`, by POST or GET, and is answered like DoH from the relay. Answers are padded to a multiple of 468 bytes before encryption, so the relay cannot tell them apart by size. With `ddr_name` set, the DoH entries in DDR answers carry the `ohttp` parameter, which tells clients the gateway exists. DoH3 listeners do not serve OHTTP.
 
 The gateway key is created on first use as `ohttp-gateway.key` next to the configuration file and kept across restarts and upgrades. It is separate from the ODoH target key, so either can be replaced without the other. OnetDNS never replaces it on its own: a damaged file stops the DoH listener with an error. To change the key, delete the file and restart OnetDNS. Requests made with the old key configuration then get HTTP 422 until the client fetches the new one. Protect the file like the TLS private key.
 
 As with ODoH, **every OHTTP request appears to come from the relay.** Client policy, ACLs, rate limits, client-specific rules and the query log key on the relay's address, and dynamic updates, NOTIFY and zone transfers are refused.
+
+OnetDNS can also be the relay. Each `ohttp_relays` entry names a path on the DoH listeners and the one gateway it forwards to:
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+
+[[ohttp_relays]]
+path = "/relay/example"
+gateway = "https://gateway.example.net/.well-known/ohttp-gateway"
+```
+
+A client POSTs `message/ohttp-req` to `https://dns.example.com/relay/example`. The relay sends the same content to the gateway and returns the gateway's answer; it can read neither. It passes on none of the client's header fields, so the gateway sees only this server's address. A path not listed gets HTTP 404. An error status from the gateway reaches the client with a `Proxy-Status` field; if the gateway cannot be reached, the client gets 502 or 504. A request the gateway may already have received is not sent again. The ACL and rate limits apply to the client, and relayed requests are not in the query log. DDR does not announce relays, so clients need the relay URL and the gateway's key configuration from their operator.
 
 ## DNSCrypt setup
 

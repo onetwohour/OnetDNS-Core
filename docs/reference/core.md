@@ -280,6 +280,25 @@ ohttp_gateway = true
 
 Runs an Oblivious HTTP gateway (RFC 9458) for DoH on the `listen_doh` listeners: the key configuration by GET at `/.well-known/ohttp-gateway`, and encrypted DoH requests for `doh_path` POSTed to the same path. Requires `listen_doh`; DoH3 does not serve it. The key is created on first use as `ohttp-gateway.key` next to the configuration file and kept across restarts. Requests arrive from the relay's address, so client policy, ACLs, rate limits and the query log all see the relay, not the client behind it. With `ddr_name` set, DDR announces the gateway with the `ohttp` parameter. See [Oblivious HTTP](../encrypted-dns.md#oblivious-http).
 
+### `ohttp_relays`
+
+**Type:** nested table / table array
+**Default:** `[]`
+
+**TOML:**
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+
+[[ohttp_relays]]
+path = "/relay/example"
+gateway = "https://gateway.example.net/.well-known/ohttp-gateway"
+```
+
+Oblivious HTTP relay resources (RFC 9458) on the `listen_doh` listeners. Each entry's `path` takes `message/ohttp-req` requests by POST and sends them to its `gateway`, written as `https://host[:port]/path`, with `#name` to set the TLS server name as in `upstream_urls`. A `path` starts with `/`, appears once, and is none of `doh_path`, the paths under it, `/.well-known/ohttp-gateway` and `/.well-known/odohconfigs`. Empty, the default, turns the relay off. Requires `listen_doh`; DoH3 does not serve it.
+
+The relay cannot read what it relays and passes on none of the client's header fields. Relayed requests are not in the query log; the ACL and rate limits still apply to the client that sends them. A gateway given by hostname is looked up through `bootstrap` when first used and again when its TTL runs out. See [Oblivious HTTP](../encrypted-dns.md#oblivious-http).
+
 ### `proxy_protocol_ports`
 
 **Type:** array  
