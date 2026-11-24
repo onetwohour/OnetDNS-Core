@@ -32,7 +32,6 @@
   ::-webkit-scrollbar{ width:10px; height:10px; }
   ::-webkit-scrollbar-thumb{ background:var(--sb,#cbd5e1); border-radius:2px; border:2px solid transparent; background-clip:padding-box; }
   ::-webkit-scrollbar-thumb:hover{ background:var(--sb2,#94a3b8); background-clip:padding-box; }
-  @keyframes odPulse{ 0%,100%{ opacity:1; transform:scale(1); } 50%{ opacity:.35; transform:scale(.82); } }
   @keyframes odRing{ 0%{ box-shadow:0 0 0 0 rgba(47,74,107,.4); } 70%{ box-shadow:0 0 0 7px rgba(47,74,107,0); } 100%{ box-shadow:0 0 0 0 rgba(47,74,107,0); } }
   @keyframes odSlideIn{ from{ opacity:0; } to{ opacity:1; } }
   @keyframes odScan{ 0%{ transform:translateX(-100%); } 100%{ transform:translateX(320%); } }
@@ -613,7 +612,7 @@
         </div>
 
         <div style="border:1px solid var(--border);border-radius:5px;background:var(--surface);overflow:hidden">
-          <div style="display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid var(--border)"><span style="font-size:15px;font-weight:600;color:var(--fg);font-family:var(--font-display)">TLS 인증서</span><span style="flex:1"></span><span style="font-size:11.5px;color:var(--muted);font-family:var(--font-mono)">{{ cert.domain }} · {{ cert.daysLeftLabel }}</span><button onClick="{{ validateTls }}" style="padding:7px 11px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--fg2);font:inherit;font-size:11.5px;font-weight:600;cursor:pointer">인증서 검증</button></div>
+          <div style="display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid var(--border)"><span style="font-size:15px;font-weight:600;color:var(--fg);font-family:var(--font-display)">TLS 인증서</span><span style="flex:1"></span><span style="font-size:11.5px;color:var(--muted);font-family:var(--font-mono)">{{ cert.domain }} · {{ cert.daysLeftLabel }}</span></div>
           <div style="display:grid;grid-template-columns:{{ g2 }};gap:22px;padding:20px">
             <div style="display:flex;flex-direction:column;gap:10px">
               <div style="font-size:12.5px;font-weight:600;color:var(--fg);font-family:var(--font-sans)">인증서 직접 등록</div>
@@ -829,7 +828,7 @@
             <div style="display:flex;align-items:center;gap:9px"><span style="font-size:15px;font-weight:500;color:var(--fg);font-family:var(--font-display)">현재 노드</span><span style="font-size:10.5px;font-weight:700;color:var(--violet);background:var(--violet-bg);padding:2px 9px;border-radius:2px">{{ cself.role }}</span></div>
             <div style="font-size:12px;color:var(--muted);margin-top:3px">{{ clusterSelfDetail }}</div>
           </div>
-          <span style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:{{ clusterHealthColor }}"><span style="width:8px;height:8px;border-radius:50%;background:{{ clusterHealthColor }};animation:{{ clusterHealthAnimation }}"></span>{{ clusterHealthLabel }}</span>
+          <span style="font-size:12.5px;font-weight:700;color:{{ clusterHealthColor }}">{{ clusterHealthLabel }}</span>
         </div>
         <div style="min-width:0">
           <div style="padding:15px 0;border-bottom:1px solid var(--border)"><span style="font-size:14px;font-weight:500;color:var(--fg);font-family:var(--font-display)">이 노드의 Raft 공개 키</span></div>
@@ -881,11 +880,9 @@
             </div>
           </div>
           <sc-if value="{{ upd.notice }}"><div role="status" style="margin-top:12px;padding:10px 13px;border-left:3px solid {{ upd.noticeColor }};background:{{ upd.noticeBg }};font-size:11.5px;line-height:1.55;color:var(--fg2);overflow-wrap:anywhere">{{ upd.notice }}</div></sc-if>
-          <div style="display:grid;grid-template-columns:{{ g4 }};gap:14px;padding-top:14px">
+          <div style="display:grid;grid-template-columns:{{ g2 }};gap:14px;padding-top:14px">
             <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">현재 버전</div><div style="font-family:var(--font-mono);font-size:13px;color:var(--fg);margin-top:5px;overflow-wrap:anywhere">{{ upd.version }}</div></div>
             <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">마지막 확인</div><div style="font-size:11.5px;color:{{ upd.checkColor }};margin-top:5px;line-height:1.5;overflow-wrap:anywhere">{{ upd.checkLabel }}</div><div style="font-size:10.5px;color:var(--faint);margin-top:3px">{{ upd.checkedAt }}</div></div>
-            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">다시 시작 방식</div><div style="font-size:11.5px;color:var(--fg2);margin-top:5px;line-height:1.5">{{ upd.launchLabel }}</div></div>
-            <div style="min-width:0"><div style="font-size:10.5px;font-weight:700;color:var(--muted)">주기 확인</div><div style="font-size:11.5px;color:var(--fg2);margin-top:5px;line-height:1.5">{{ upd.scheduleLabel }}</div></div>
           </div>
           <sc-if value="{{ upd.releaseUrl }}"><div style="padding-top:10px;font-size:11.5px"><a href="{{ upd.releaseUrl }}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:600">릴리스 노트</a></div></sc-if>
         </section>
@@ -1113,9 +1110,6 @@ qps = 200" style="width:100%;height:150px;padding:12px;border-radius:3px;border:
   <div id="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-dialog-title" tabIndex="-1" style="{{ helpPopPos }};z-index:51;background:var(--surface);border:1px solid var(--border);border-radius:4px;box-shadow:0 18px 50px rgba(40,33,20,.18);padding:20px 22px;animation:odSlideIn .16s ease">
     <div style="display:flex;align-items:center;gap:9px;margin-bottom:9px"><span style="display:flex;color:var(--accent)">{{ helpIcon }}</span><span id="help-dialog-title" style="font-size:16px;font-weight:500;color:var(--fg);font-family:var(--font-display);letter-spacing:-.01em">{{ viewTitle }}</span></div>
     <p style="margin:0;font-size:13px;line-height:1.65;color:var(--fg2)">{{ helpText }}</p>
-    <sc-if value="{{ helpTips }}"><div style="margin-top:13px;padding-top:13px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px">
-      <sc-for list="{{ helpTips }}" as="t" hint-placeholder-count="2"><div style="display:flex;gap:8px;font-size:12px;color:var(--muted);line-height:1.5"><span style="color:var(--accent);flex:0 0 auto">•</span><span>{{ t }}</span></div></sc-for>
-    </div></sc-if>
   </div>
   </sc-if>
 
@@ -1282,8 +1276,8 @@ Object.assign(I18N.en, {
   "지연": "Latency",
   "결과": "Result",
   "실행 취소": "Undo",
-  "인증서 자료가 올바릅니다. 발급자 {issuer}, 만료 {expires}. 신뢰 여부와 호스트 이름은 확인하지 않았습니다.": "Certificate material is valid. Issuer {issuer}, expires {expires}. Trust and host name were not checked.",
-  "인증서 자료에 문제가 있습니다: {problems}": "Certificate material has problems: {problems}",
+  "인증서 문제: {problems}": "Certificate problem: {problems}",
+  "설정됨": "Configured",
   "인증서 검증 실패: {error}": "Certificate validation failed: {error}",
   "유효 기간 밖": "outside validity period",
   "체인 연결 불일치": "chain links do not match",
@@ -1519,8 +1513,8 @@ Object.assign(I18N.ja, {
   "지연": "遅延",
   "결과": "結果",
   "실행 취소": "元に戻す",
-  "인증서 자료가 올바릅니다. 발급자 {issuer}, 만료 {expires}. 신뢰 여부와 호스트 이름은 확인하지 않았습니다.": "証明書の内容は正しいです。発行者 {issuer}、有効期限 {expires}。信頼性とホスト名は確認していません。",
-  "인증서 자료에 문제가 있습니다: {problems}": "証明書の内容に問題があります: {problems}",
+  "인증서 문제: {problems}": "証明書の問題: {problems}",
+  "설정됨": "設定済み",
   "인증서 검증 실패: {error}": "証明書の検証に失敗しました: {error}",
   "유효 기간 밖": "有効期間外",
   "체인 연결 불일치": "チェーンのつながりが一致しない",
@@ -2009,7 +2003,6 @@ Object.assign(I18N.en, {
   "개를 적용했습니다": " applied",
   "규칙을 입력하세요": "Enter a rule",
   "도메인 차단 해제": "Unblock domain",
-  "인증서 발급자 정보 없음": "Issuer DN unavailable",
   "부가 섹션 최소화": "Minimize additional section",
   "설정이 유효합니다": "Configuration is valid",
   "업스트림 DNS 서버 응답 대기 시간": "Upstream timeout",
@@ -2300,7 +2293,6 @@ Object.assign(I18N.ja, {
   "개를 적용했습니다": "件を適用しました",
   "규칙을 입력하세요": "ルールを入力してください",
   "도메인 차단 해제": "ドメイン遮断を解除",
-  "인증서 발급자 정보 없음": "発行者 DN なし",
   "부가 섹션 최소화": "追加セクションを最小化",
   "설정이 유효합니다": "設定は有効です",
   "업스트림 DNS 서버 응답 대기 시간": "上位 DNS サーバータイムアウト",
@@ -2663,7 +2655,6 @@ Object.assign(I18N.en, {
   '일련번호':'Serial',
   '속도 제한':'Rate limited',
   'RRset 순서 순환':'Rotate RRset order',
-  '인증서 발급자 정보 없음':'Certificate issuer unavailable',
   '동기화할 설정 항목':'Cluster configuration field',
   '설정 항목을 입력하세요':'Enter a configuration field',
   'TOML 설정':'TOML source',
@@ -2691,7 +2682,6 @@ Object.assign(I18N.ja, {
   '일련번호':'シリアル',
   '속도 제한':'レート制限',
   'RRset 순서 순환':'RRset の順序を巡回',
-  '인증서 발급자 정보 없음':'証明書の発行者情報なし',
   '동기화할 설정 항목':'クラスタ設定項目',
   '설정 항목을 입력하세요':'設定項目を入力してください',
   'TOML 설정':'TOML 設定原文',
@@ -3010,7 +3000,6 @@ Object.assign(I18N.ja, {
 
 
 Object.assign(I18N.en, {
-  '인증서 발급자 정보 없음':'Issuer information unavailable',
   '{count}일':'{count} days',
   '사용자 지정 루트':'Custom root server',
   '사용자 설정':'Custom setting',
@@ -3029,7 +3018,6 @@ Object.assign(I18N.en, {
   '응답 변경':'Modified response'
 });
 Object.assign(I18N.ja, {
-  '인증서 발급자 정보 없음':'証明書の発行者情報がありません',
   '{count}일':'{count} 日',
   '사용자 지정 루트':'カスタムルートサーバー',
   '사용자 설정':'ユーザー設定',
@@ -3068,7 +3056,7 @@ Object.assign(I18N.en, {
   '조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'Viewing and diagnostics remain available; change controls are disabled.','· 조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'· Viewing and diagnostics remain available; change controls are disabled.',
   '계정 메뉴':'Account menu','변경 적용':'Apply changes','선택 항목':'Selected option','연결 상태 테스트':'Test connectivity','테스트 실패: {error}':'Test failed: {error}','테스트 {ms}ms':'Test {ms} ms',
   '인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.':'Authentication is protected by an HttpOnly session cookie and cannot be displayed or copied.',
-  '인증서 검증':'Validate certificate','읽기 전용 세션':'Read-only session','주요 메뉴':'Primary navigation','현재 세션':'Current session',
+  '읽기 전용 세션':'Read-only session','주요 메뉴':'Primary navigation','현재 세션':'Current session',
   '미적용 변경':'Pending changes','취소':'Cancel','기존 비밀값은 표시하지 않습니다. 변경할 때만 새 값을 입력하세요.':'Existing secrets are not shown. Enter a new value only when changing it.',
   '직접 편집이 제한된 복합·민감 설정입니다. TOML 직접 편집 또는 전용 화면을 사용하세요.':'This complex or sensitive setting cannot be edited here. Use the TOML editor or its dedicated screen.'
 });
@@ -3076,7 +3064,7 @@ Object.assign(I18N.ja, {
   '조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'閲覧と診断のみ利用でき、変更操作は無効です。','· 조회와 진단만 사용할 수 있으며 변경 컨트롤은 비활성화됩니다.':'· 閲覧と診断のみ利用でき、変更操作は無効です。',
   '계정 메뉴':'アカウントメニュー','변경 적용':'変更を適用','선택 항목':'選択項目','연결 상태 테스트':'接続状態をテスト','테스트 실패: {error}':'テスト失敗: {error}','테스트 {ms}ms':'テスト {ms}ms',
   '인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.':'認証情報は HttpOnly セッションクッキーで保護され、表示やコピーはできません。',
-  '인증서 검증':'証明書を検証','읽기 전용 세션':'読み取り専用セッション','주요 메뉴':'メインナビゲーション','현재 세션':'現在のセッション',
+  '읽기 전용 세션':'読み取り専用セッション','주요 메뉴':'メインナビゲーション','현재 세션':'現在のセッション',
   '미적용 변경':'未適用の変更','취소':'取り消し','기존 비밀값은 표시하지 않습니다. 변경할 때만 새 값을 입력하세요.':'既存の秘密値は表示されません。変更時のみ新しい値を入力してください。',
   '직접 편집이 제한된 복합·민감 설정입니다. TOML 직접 편집 또는 전용 화면을 사용하세요.':'この複合・機密設定はここでは編集できません。TOML エディターまたは専用画面を使用してください。'
 });
@@ -3143,7 +3131,6 @@ Object.assign(I18N.en, {
   '필터 출처와 플러그인':'Filter sources and plugins','필터 출처':'Filter sources','WASM 플러그인':'WASM plugins','필터 출처 또는 플러그인 데이터가 없습니다.':'No filter-source or plugin data is available.',
   '접근 정책 원문':'Raw access policy','평가 ':'Evaluations ',' · 오류 ':' · errors ',' 규칙':' rules',' 적중':' hits',
   '백업 파일 선택…':'Select a backup file…','조회 결과가 없습니다.':'No result is available.','인증서 체인을 선택한 뒤 확인하세요.':'Select a certificate chain, then run the check.','영역 이름을 입력한 뒤 조회하세요.':'Enter a zone name, then query it.',
-  '읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'Read-only accounts can only view data and download backups.'
 });
 Object.assign(I18N.ja, {
   '유지보수':'メンテナンス','백업, 캐시, 진단 및 재작성':'バックアップ、キャッシュ、診断、リライト',
@@ -3158,7 +3145,6 @@ Object.assign(I18N.ja, {
   '필터 출처와 플러그인':'フィルターソースとプラグイン','필터 출처':'フィルターソース','WASM 플러그인':'WASM プラグイン','필터 출처 또는 플러그인 데이터가 없습니다.':'フィルターソースまたはプラグインのデータはありません。',
   '접근 정책 원문':'アクセス方針の原文','평가 ':'評価 ',' · 오류 ':' · エラー ',' 규칙':' ルール',' 적중':' ヒット',
   '백업 파일 선택…':'バックアップファイルを選択…','조회 결과가 없습니다.':'結果がありません。','인증서 체인을 선택한 뒤 확인하세요.':'証明書チェーンを選択してから確認してください。','영역 이름을 입력한 뒤 조회하세요.':'ゾーン名を入力してから照会してください。',
-  '읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.':'読み取り専用アカウントは閲覧とバックアップのダウンロードのみ利用できます。'
 });
 
 Object.assign(I18N.en, {
@@ -3417,8 +3403,8 @@ Object.assign(I18N.zh, {
   "지연":"延迟",
   "결과":"结果",
   "실행 취소":"撤销",
-  "인증서 자료가 올바릅니다. 발급자 {issuer}, 만료 {expires}. 신뢰 여부와 호스트 이름은 확인하지 않았습니다.":"证书材料有效。颁发者 {issuer}，到期 {expires}。未检查信任链和主机名。",
-  "인증서 자료에 문제가 있습니다: {problems}":"证书材料存在问题：{problems}",
+  "인증서 문제: {problems}":"证书问题：{problems}",
+  "설정됨":"已配置",
   "인증서 검증 실패: {error}":"证书验证失败：{error}",
   "유효 기간 밖":"不在有效期内",
   "체인 연결 불일치":"证书链不匹配",
@@ -3829,7 +3815,6 @@ Object.assign(I18N.zh, {
   "개를 적용했습니다":" 项已应用",
   "규칙을 입력하세요":"请输入规则",
   "도메인 차단 해제":"取消拦截域名",
-  "인증서 발급자 정보 없음":"无证书颁发者信息",
   "부가 섹션 최소화":"最小化附加部分",
   "설정이 유효합니다":"配置有效",
   "업스트림 DNS 서버 응답 대기 시간":"上游 DNS 服务器响应等待时间",
@@ -4121,7 +4106,6 @@ Object.assign(I18N.zh, {
   "선택 항목":"所选项目",
   "연결 상태 테스트":"测试连接状态","테스트 실패: {error}":"测试失败：{error}","테스트 {ms}ms":"测试 {ms}ms",
   "인증 정보는 HttpOnly 세션 쿠키로 보호되며 화면에 표시하거나 복사할 수 없습니다.":"认证信息受 HttpOnly 会话 Cookie 保护，无法显示或复制。",
-  "인증서 검증":"验证证书",
   "읽기 전용 세션":"只读会话",
   "주요 메뉴":"主菜单",
   "현재 세션":"当前会话",
@@ -4191,7 +4175,6 @@ Object.assign(I18N.zh, {
   "조회 결과가 없습니다.":"没有查询结果。",
   "인증서 체인을 선택한 뒤 확인하세요.":"请先选择证书链再检查。",
   "영역 이름을 입력한 뒤 조회하세요.":"请先输入区域名称再查询。",
-  "읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.":"只读账户只能查看和下载备份。",
   "응답 캐시를 모두 비우시겠습니까?":"要清空全部响应缓存吗？",
   "캐시 항목 {count}개를 비웠습니다":"已清空 {count} 个缓存条目",
   "캐시 비우기 실패":"清空缓存失败",
@@ -4373,8 +4356,6 @@ Object.assign(I18N.en, {
   "업데이트 확인":"Check for updates",
   "현재 버전":"Current version",
   "마지막 확인":"Last check",
-  "다시 시작 방식":"Restart method",
-  "주기 확인":"Scheduled check",
   "릴리스 노트":"Release notes",
   "새 버전을 확인하고 있습니다":"Checking for a new version",
   "새 버전을 내려받아 설치하고 있습니다":"Downloading and installing the new version",
@@ -4387,11 +4368,6 @@ Object.assign(I18N.en, {
   "{version} 버전을 설치할 수 있습니다":"Version {version} is available",
   "{version} 버전은 직접 설치해야 합니다":"Version {version} must be installed manually",
   "확인하지 못했습니다":"Check failed",
-  "감시 프로세스가 새 버전을 띄웁니다":"The supervisor process starts the new version",
-  "프로세스가 새 버전으로 바뀝니다":"The process replaces itself with the new version",
-  "설치한 뒤 직접 다시 시작해야 합니다":"Restart OnetDNS yourself after installing",
-  "하루에 한 번 확인합니다":"Checks once a day",
-  "꺼져 있습니다. 직접 확인할 수 있습니다":"Off. You can still check manually",
   "{version} 버전 설치":"Install {version}",
   "{version} 버전으로 되돌리기":"Roll back to {version}",
   "{version} 버전으로 업데이트할까요?":"Update to version {version}?",
@@ -4422,8 +4398,6 @@ Object.assign(I18N.ja, {
   "업데이트 확인":"更新を確認",
   "현재 버전":"現在のバージョン",
   "마지막 확인":"最終確認",
-  "다시 시작 방식":"再起動の方法",
-  "주기 확인":"定期確認",
   "릴리스 노트":"リリースノート",
   "새 버전을 확인하고 있습니다":"新しいバージョンを確認しています",
   "새 버전을 내려받아 설치하고 있습니다":"新しいバージョンをダウンロードしてインストールしています",
@@ -4436,11 +4410,6 @@ Object.assign(I18N.ja, {
   "{version} 버전을 설치할 수 있습니다":"バージョン {version} をインストールできます",
   "{version} 버전은 직접 설치해야 합니다":"バージョン {version} は手動でインストールする必要があります",
   "확인하지 못했습니다":"確認できませんでした",
-  "감시 프로세스가 새 버전을 띄웁니다":"監視プロセスが新しいバージョンを起動します",
-  "프로세스가 새 버전으로 바뀝니다":"プロセスが新しいバージョンに置き換わります",
-  "설치한 뒤 직접 다시 시작해야 합니다":"インストール後に手動で再起動する必要があります",
-  "하루에 한 번 확인합니다":"1 日 1 回確認します",
-  "꺼져 있습니다. 직접 확인할 수 있습니다":"オフです。手動で確認できます",
   "{version} 버전 설치":"{version} をインストール",
   "{version} 버전으로 되돌리기":"{version} に戻す",
   "{version} 버전으로 업데이트할까요?":"バージョン {version} に更新しますか？",
@@ -4471,8 +4440,6 @@ Object.assign(I18N.zh, {
   "업데이트 확인":"检查更新",
   "현재 버전":"当前版本",
   "마지막 확인":"上次检查",
-  "다시 시작 방식":"重启方式",
-  "주기 확인":"定期检查",
   "릴리스 노트":"发行说明",
   "새 버전을 확인하고 있습니다":"正在检查新版本",
   "새 버전을 내려받아 설치하고 있습니다":"正在下载并安装新版本",
@@ -4485,11 +4452,6 @@ Object.assign(I18N.zh, {
   "{version} 버전을 설치할 수 있습니다":"可以安装版本 {version}",
   "{version} 버전은 직접 설치해야 합니다":"版本 {version} 需要手动安装",
   "확인하지 못했습니다":"检查失败",
-  "감시 프로세스가 새 버전을 띄웁니다":"由监控进程启动新版本",
-  "프로세스가 새 버전으로 바뀝니다":"进程将替换为新版本",
-  "설치한 뒤 직접 다시 시작해야 합니다":"安装后需要手动重启",
-  "하루에 한 번 확인합니다":"每天检查一次",
-  "꺼져 있습니다. 직접 확인할 수 있습니다":"已关闭。仍可手动检查",
   "{version} 버전 설치":"安装 {version}",
   "{version} 버전으로 되돌리기":"回退到 {version}",
   "{version} 버전으로 업데이트할까요?":"要更新到版本 {version} 吗？",
@@ -4921,7 +4883,7 @@ class Component extends DCLogic {
     sysAdapters: [],
     sysPlatform: '',
     bootService: {supported:false,installed:false,running:false},
-    cert:{configured:false,domain:'미설정',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—',valid:null},
+    cert:{configured:false,domain:'미설정',daysLeft:null,daysLeftLabel:'—',valid:null},
     clientSetup: null,
     zones: [],
     leases: { v4:[], v6:[] },
@@ -5546,7 +5508,7 @@ class Component extends DCLogic {
   async loadCluster(){const r=await this.apiGet('/v1/cluster/nodes');if(!(r.ok&&r.body))return false;this.setState({cluster:{identity:r.body.identity||null,self:r.body.self||{role:'standalone',listeners:0},peers:(r.body.peers||[]).map(x=>({url:x.url,healthy:x.healthy,role:x.role,rtt:x.rtt_ms,version:x.version}))}});return true;}
   async loadSchema(){const r=await this.apiGet('/v1/config/schema');if(!(r.ok&&r.body&&Array.isArray(r.body.fields)))return false;this.setState({schema:r.body.fields,schemaHot:Array.isArray(r.body.hot_reload_keys)?r.body.hot_reload_keys:[],schemaConditional:Array.isArray(r.body.conditional_hot_reload_keys)?r.body.conditional_hot_reload_keys:[]});return true;}
   async loadServices(){const fresh=this.writeGuard('services');const r=await this.apiGet('/v1/services');if(!(r.ok&&r.body&&Array.isArray(r.body.services))||!fresh())return false;this.setState({services:r.body.services.map(x=>({id:x.id,name:x.name,group:x.group||'other',ruleCount:Number(x.rule_count)||0,blocked:!!x.blocked}))});return true;}
-  async loadTls(){const r=await this.apiGet('/v1/tls');if(!(r.ok&&r.body))return false;const configured=!!r.body.configured;this.setState({cert:{configured,domain:configured?'검증 대기':'미설정',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—',valid:null}});return true;}
+  async loadTls(){const r=await this.apiGet('/v1/tls');if(!(r.ok&&r.body))return false;const configured=!!r.body.configured;const admin=this.state.authRole==='admin';this.setState({cert:{configured,domain:!configured?'미설정':admin?'검증 대기':'설정됨',daysLeft:null,daysLeftLabel:'—',valid:null}});if(configured&&admin)this.validateTls();return true;}
   async loadTokens(){
     const fresh=this.writeGuard('tokens');const tk=await this.apiGet('/v1/tokens');
     if(tk.ok&&tk.body&&Array.isArray(tk.body.tokens)&&fresh()) this.setState({tokens:tk.body.tokens.map(t=>({id:t.id,name:t.masked,role:t.role}))});
@@ -5645,7 +5607,7 @@ class Component extends DCLogic {
   }
   updateModel(){
     const s=this.state,u=s.update&&typeof s.update==='object'?s.update:null;
-    const empty={canCheck:false,canApply:false,canRollback:false,busy:true,notice:'',noticeColor:'var(--accent)',noticeBg:'var(--accent-bg)',version:'—',checkLabel:'—',checkColor:'var(--fg2)',checkedAt:'',launchLabel:'—',scheduleLabel:'—',releaseUrl:'',applyLabel:'',rollbackLabel:''};
+    const empty={canCheck:false,canApply:false,canRollback:false,busy:true,notice:'',noticeColor:'var(--accent)',noticeBg:'var(--accent-bg)',version:'—',checkLabel:'—',checkColor:'var(--fg2)',checkedAt:'',releaseUrl:'',applyLabel:'',rollbackLabel:''};
     if(!u)return {upd:empty,banner:'',bannerAction:false};
     const record=u.record&&typeof u.record==='object'?u.record:null;
     const task=s.updateBusy||(typeof u.task==='string'?u.task:'');
@@ -5666,15 +5628,13 @@ class Component extends DCLogic {
       :result==='available'?this.tr('{version} 버전을 설치할 수 있습니다',{version:newVersion})
       :result==='manual'?this.tr('{version} 버전은 직접 설치해야 합니다',{version:newVersion})+detail
       :this.t('확인하지 못했습니다')+detail;
-    const launchLabel=!participating?'—':{supervisor:this.t('감시 프로세스가 새 버전을 띄웁니다'),exec:this.t('프로세스가 새 버전으로 바뀝니다'),manual:this.t('설치한 뒤 직접 다시 시작해야 합니다')}[u.launch]||'—';
     const rollbackTo=typeof u.rollback==='string'?u.rollback:'';
     const canApply=participating&&result==='available'&&!!newVersion&&!pending;
     const releaseUrl=(result==='available'||result==='manual')&&typeof u.release_url==='string'&&/^https:\/\//.test(u.release_url)?u.release_url:'';
     const upd={canCheck:participating,canApply,canRollback:!!rollbackTo&&!pending,busy:!!task,
       notice,noticeColor:tones[tone][0],noticeBg:tones[tone][1],
       version:String(u.version||'—'),checkLabel,checkColor:result==='available'?'var(--accent)':(result==='manual'||result==='failed')?'var(--warn)':'var(--fg2)',
-      checkedAt:u.checked_at?this.relTime(u.checked_at):'',launchLabel,
-      scheduleLabel:!participating?'—':u.release_check===false?this.t('꺼져 있습니다. 직접 확인할 수 있습니다'):this.t('하루에 한 번 확인합니다'),
+      checkedAt:u.checked_at?this.relTime(u.checked_at):'',
       releaseUrl,applyLabel:this.tr('{version} 버전 설치',{version:newVersion}),rollbackLabel:this.tr('{version} 버전으로 되돌리기',{version:rollbackTo}),
       onCheck:this.updateTask('check'),onApply:this.updateTask('apply'),onRollback:this.updateTask('rollback')};
     let banner='',bannerAction=false;
@@ -5722,14 +5682,11 @@ class Component extends DCLogic {
     const r=await this.apiSend('/v1/tls/validate','POST');
     if(r.ok&&r.body){
       const x=r.body;
-      const expiry=Number.isFinite(Number(x.not_after))?new Date(Number(x.not_after)*1000).toLocaleString(this.locale()):'정보 없음';
       const names=Array.isArray(x.sans)&&x.sans.length?x.sans.join(', '):(x.subject||'SAN 없음');
-      const issuer=x.issuer||this.t('인증서 발급자 정보 없음');
-      this.setState({cert:{configured:true,valid:x.material_valid===true,domain:names,issuer,expires:expiry,daysLeft:x.days_left==null?null:Number(x.days_left),daysLeftLabel:x.days_left==null?'—':this.tr('{count}일',{count:Number(x.days_left).toLocaleString(this.locale())})}});
+      this.setState({cert:{configured:true,valid:x.material_valid===true,domain:names,daysLeft:x.days_left==null?null:Number(x.days_left),daysLeftLabel:x.days_left==null?'—':this.tr('{count}일',{count:Number(x.days_left).toLocaleString(this.locale())})}});
       // 카드에는 이름과 남은 날만 들어간다. 판정과 그 이유는 알림으로 알려야 사라지지 않는다.
-      if(x.material_valid===true)this.toastMsg(this.tr('인증서 자료가 올바릅니다. 발급자 {issuer}, 만료 {expires}. 신뢰 여부와 호스트 이름은 확인하지 않았습니다.',{issuer,expires:expiry}));
-      else{const problems=[x.all_times_valid===false&&this.t('유효 기간 밖'),x.chain_links_valid===false&&this.t('체인 연결 불일치'),x.chain_constraints_valid===false&&this.t('체인 제약 위반')].filter(Boolean).join(', ');this.toastMsg(this.tr('인증서 자료에 문제가 있습니다: {problems}',{problems}),true);}
-    }else{this.setState(s=>({cert:{...s.cert,valid:false,domain:'검증 실패',issuer:'—',expires:'—',daysLeft:null,daysLeftLabel:'—'}}));this.toastMsg(this.tr('인증서 검증 실패: {error}',{error:this.errorText(r)}),true);}
+      if(x.material_valid!==true){const problems=[x.all_times_valid===false&&this.t('유효 기간 밖'),x.chain_links_valid===false&&this.t('체인 연결 불일치'),x.chain_constraints_valid===false&&this.t('체인 제약 위반')].filter(Boolean).join(', ');this.toastMsg(this.tr('인증서 문제: {problems}',{problems}),true);}
+    }else{this.setState(s=>({cert:{...s.cert,valid:false,domain:'검증 실패',daysLeft:null,daysLeftLabel:'—'}}));this.toastMsg(this.tr('인증서 검증 실패: {error}',{error:this.errorText(r)}),true);}
   }
   clientSetupBody(){const f=this.state.forms;return {address:String(f.setupAddress||'').trim(),hostname:String(f.setupHost||'').trim()};}
   rememberClientSetup(){
@@ -6176,23 +6133,23 @@ class Component extends DCLogic {
   // 이 문자열들을 볼 수 있다는 뜻이기도 하다 — 검사기는 t()와 tr()의 인자만 훑는다.
   helpFor(v){
     const H={
-      dashboard:[this.t('처리량, 차단 현황, 응답 상태'),null],
-      querylog:[this.t('질의 검색과 상세 정보'),null],
-      lists:[this.t('차단 및 허용 규칙'),null],
-      services:[this.t('서비스별 접속 차단'),null],
-      clients:[this.t('클라이언트별 설정'),null],
-      upstreams:[this.t('업스트림 DNS 서버와 질의 처리 방식'),null],
-      encryption:[this.t('암호화 DNS와 인증서'),null],
-      zones:[this.t('로컬 DNS 영역과 레코드'),null],
-      dhcp:[this.t('임대 현황과 고정 할당'),null],
-      explain:[this.t('정책 및 필터 적용 결과'),null],
-      cluster:[this.t('노드와 합의 상태'),null],
-      operations:[this.t('업데이트, 캐시, 백업'),[this.t('읽기 전용 계정은 조회와 백업 다운로드만 사용할 수 있습니다.')]],
-      settings:[this.t('DNS 서버 설정'),null],
-      account:[this.t('로그인 정보'),null],
-      tokens:[this.t('API 접근 권한'),null]
+      dashboard:this.t('처리량, 차단 현황, 응답 상태'),
+      querylog:this.t('질의 검색과 상세 정보'),
+      lists:this.t('차단 및 허용 규칙'),
+      services:this.t('서비스별 접속 차단'),
+      clients:this.t('클라이언트별 설정'),
+      upstreams:this.t('업스트림 DNS 서버와 질의 처리 방식'),
+      encryption:this.t('암호화 DNS와 인증서'),
+      zones:this.t('로컬 DNS 영역과 레코드'),
+      dhcp:this.t('임대 현황과 고정 할당'),
+      explain:this.t('정책 및 필터 적용 결과'),
+      cluster:this.t('노드와 합의 상태'),
+      operations:this.t('업데이트, 캐시, 백업'),
+      settings:this.t('DNS 서버 설정'),
+      account:this.t('로그인 정보'),
+      tokens:this.t('API 접근 권한')
     };
-    return H[v]||['',[]];
+    return H[v]||'';
   }
 
   initialTheme(){
@@ -7204,12 +7161,11 @@ class Component extends DCLogic {
       toggleFeed:this.toggleFeed, feedToggleIcon:this.playPauseEl(),
       feedToggleLabel:s.feedPaused?this.t('재개'):this.t('일시정지'),
       feedDot:s.feedPaused?'var(--faint)':'var(--ok)',
-      feedAnim:s.feedPaused?'none':'odPulse 1.4s ease-in-out infinite',
       toggleMode:this.toggleMode, modeBg, modeIcon,
       confirmOpen:!!s.confirm,confirmMessage:s.confirm?s.confirm.message:'',confirmDetail:s.confirm?s.confirm.detail:'',
       onConfirmOk:this.confirmOk,onConfirmCancel:this.confirmCancel,
       modeLabel:s.mode==='personal'?this.t('개인 모드'):this.t('공개 모드'),
-      toggleHelp:this.toggleHelp,closeHelp:this.closeHelp, helpOpen:s.helpOpen, helpText:this.helpFor(s.view)[0], helpTips:this.helpFor(s.view)[1],
+      toggleHelp:this.toggleHelp,closeHelp:this.closeHelp, helpOpen:s.helpOpen, helpText:this.helpFor(s.view),
       helpIcon:this.ic(this.navIconFor(s.view)),
       toggleAccount:this.toggleAccount,closeAccount:this.closeAccount, accountOpen:s.accountOpen, accountName:s.account.display||this.t('계정'),
       goAccount:this.goAccount, goTokens:this.goTokens, logout:this.logout, login:this.login, loggedOut:!s.loggedIn,
@@ -7524,7 +7480,7 @@ class Component extends DCLogic {
       rewriteRows,hasRewrites:rewriteRows.length>0,addRewrite:this.addRewrite,reportTotal:reportTotalN.toLocaleString(this.locale()),reportApplied:reportAppliedN.toLocaleString(this.locale()),reportSkipped:reportSkippedN.toLocaleString(this.locale()),filterCoverageLabel,filterCoverageStyle,filterReasonRows,hasFilterReasons:filterReasonRows.length>0,
       topRuleRows,hasTopRules:topRuleRows.length>0,topRulesOff:!!s.topRules&&topData.enabled!==true,topRulesEmpty:topData.enabled===true&&topRuleRows.length===0,sourceRows,hasSources:sourceRows.length>0,sourceHitsOff:!!s.filterSources&&!sourceHitsEnabled,sourceTotalsText,pluginRows,hasPlugins:pluginRows.length>0,pluginEvalTotal:pluginEvalTotal.toLocaleString(this.locale()),pluginErrorTotal:pluginErrorTotal.toLocaleString(this.locale()),pluginBlockTotal:pluginBlockTotal.toLocaleString(this.locale()),
       accessAllowedRows,accessBlockedRows,accessDroppedRows,accessHostRows,hasAccessAllowed:accessAllowedRows.length>0,hasAccessBlocked:accessBlockedRows.length>0,hasAccessDropped:accessDroppedRows.length>0,hasAccessHosts:accessHostRows.length>0,hasAccessUnlisted:accessUnlisted!=='',accessUnlistedLabel,accessUnlistedColor,revocationLabel,revocationColor,revocationDetail,zoneDnssecLabel,zoneDnssecColor,zoneDnssecDetail,checkTlsRevocation:this.checkTlsRevocation,checkZoneDnssec:this.checkZoneDnssec,
-      cert:{...s.cert,domain:this.t(s.cert.domain),daysLeftLabel:this.t(s.cert.daysLeftLabel)}, uploadCert:this.uploadCert, requestAcme:this.requestAcme, onCertFile:this.onCertFile,validateTls:this.validateTls,
+      cert:{...s.cert,domain:this.t(s.cert.domain),daysLeftLabel:this.t(s.cert.daysLeftLabel)}, uploadCert:this.uploadCert, requestAcme:this.requestAcme, onCertFile:this.onCertFile,
       clientSetup:this.clientSetupView(s.clientSetup),makeStamps:this.makeStamps,appleProfileDoh:this.appleProfileDoh,appleProfileDot:this.appleProfileDot,
 
       zones, addRecord:this.addRecord,createZone:this.createZone,
@@ -7534,7 +7490,7 @@ class Component extends DCLogic {
 
       runExplain:this.runExplain, exPanel, hasExPanel,
 
-      cself, peers, clusterPropose:this.clusterPropose,hasRaftKey:!!(s.cluster.identity&&s.cluster.identity.public_key),raftKey:(s.cluster.identity&&s.cluster.identity.public_key)||'',hasRaftPeerEntry:!!(s.cluster.identity&&s.cluster.identity.peer_entry),raftPeerEntry:(s.cluster.identity&&s.cluster.identity.peer_entry)||'',copyRaftPeerEntry:this.copyRaftPeerEntry,clusterSelfDetail,clusterHealthy,clusterHealthLabel:this.t(clusterHealthy?'정상':'상태 불명'),clusterHealthColor:clusterHealthy?'var(--ok)':'var(--muted)',clusterHealthAnimation:clusterHealthy?'odPulse 1.6s ease-in-out infinite':'none',clusterCanPropose,clusterProposeStyle:`padding:8px 15px;border-radius:3px;border:0;background:${clusterCanPropose?'var(--violet)':'var(--surface3)'};color:${clusterCanPropose?'var(--on-accent)':'var(--muted)'};font:inherit;font-size:12.5px;font-weight:700;cursor:${clusterCanPropose?'pointer':'not-allowed'}`,
+      cself, peers, clusterPropose:this.clusterPropose,hasRaftKey:!!(s.cluster.identity&&s.cluster.identity.public_key),raftKey:(s.cluster.identity&&s.cluster.identity.public_key)||'',hasRaftPeerEntry:!!(s.cluster.identity&&s.cluster.identity.peer_entry),raftPeerEntry:(s.cluster.identity&&s.cluster.identity.peer_entry)||'',copyRaftPeerEntry:this.copyRaftPeerEntry,clusterSelfDetail,clusterHealthy,clusterHealthLabel:this.t(clusterHealthy?'정상':'상태 불명'),clusterHealthColor:clusterHealthy?'var(--ok)':'var(--muted)',clusterCanPropose,clusterProposeStyle:`padding:8px 15px;border-radius:3px;border:0;background:${clusterCanPropose?'var(--violet)':'var(--surface3)'};color:${clusterCanPropose?'var(--on-accent)':'var(--muted)'};font:inherit;font-size:12.5px;font-weight:700;cursor:${clusterCanPropose?'pointer':'not-allowed'}`,
 
       cfgNums, blockModes, cfgToggles,hasConfigDraft:Object.keys(s.configDraft||{}).length>0,configDraftCount:Object.keys(s.configDraft||{}).length.toLocaleString(this.locale()),configDraftNames:this.configLabels(Object.keys(s.configDraft||{})).join(', '),applyConfigDraft:this.applyConfigDraft,discardConfigDraft:this.discardConfigDraft,
       schemaShown, schemaCount, schemaElsewhere, schemaHasElsewhere, schemaNoMatch,
