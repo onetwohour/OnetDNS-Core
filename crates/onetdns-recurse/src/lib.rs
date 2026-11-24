@@ -280,8 +280,7 @@ const UNKNOWN_SERVER_PATIENCE: Duration = Duration::from_millis(400);
 /// keeps in flight, which DNSBomb-style attacks use to make answers arrive at once.
 const MAX_EXCHANGES_PER_QUERY: usize = 2;
 
-/// One exchange a query may make with a server. An encrypted rung comes right before the same
-/// server's plaintext rung, or, when encryption is required, before its other encrypted rung.
+/// One exchange a query may make with a server.
 #[derive(Clone, Copy)]
 struct Rung {
     server: SocketAddr,
@@ -803,8 +802,7 @@ impl Recursor {
     }
 
     /// Asks servers known to answer over DoT or DoQ that way first, with plaintext as the
-    /// fallback unless encryption is required. The reactor lane asks over UDP only and must stay
-    /// off while this is set.
+    /// fallback. The reactor lane asks over UDP only and must stay off while this is set.
     pub fn with_opportunistic_encryption(
         mut self,
         encryption: Option<onetdns_forward::OpportunisticEncryption>,
@@ -2712,9 +2710,9 @@ impl Recursor {
     /// at the first usable address, so the list is short; dividing time among those few would let
     /// one dead server keep the remaining names from being tried.
     ///
-    /// A server known to answer over encryption is asked that way first, and in plaintext once
-    /// that fails or outlasts its patience; both count against the same deadline and in-flight cap.
-    /// When encryption is required, servers are asked only over DoT or DoQ.
+    /// Servers known to answer over encryption are asked that way before any server is asked in
+    /// plaintext, which follows once they fail or outlast their patience; both count against the
+    /// same deadline and in-flight cap.
     fn query_any_reserving(
         &self,
         servers: &[SocketAddr],
@@ -2824,10 +2822,14 @@ impl Recursor {
                         ask_next_at = Instant::now();
                         continue;
                     }
-                    if rung.encrypted.is_some() && rungs.get(idx + 1).is_some_and(|r| r.server == s)
-                    {
-                        // The server answered; asking it again another way gets the same answer.
-                        skipped[idx + 1] = true;
+                    if rung.encrypted.is_some() {
+                        // The server answered; asking it again in plaintext gets the same answer.
+                        if let Some(plain) = rungs
+                            .iter()
+                            .position(|r| r.server == s && r.encrypted.is_none())
+                        {
+                            skipped[plain] = true;
+                        }
                     }
                     if response_usable_for_iteration(&r, &request, zone) {
                         match rung.encrypted {
@@ -2835,8 +2837,14 @@ impl Recursor {
                             Some(_) => self.infra_answered(s.ip(), zone),
                             None => {
                                 self.infra_success(s.ip(), zone, elapsed);
+                                // Probing the zone's other servers too finds the ones the next
+                                // query can ask over encryption.
                                 if let Some(encryption) = self.opportunistic {
-                                    encryption.after_plain_answer(s.ip(), &request);
+                                    encryption.probe(s.ip(), &request);
+                                    for other in ordered.iter().filter(|other| other.ip() != s.ip())
+                                    {
+                                        encryption.probe(other.ip(), &request);
+                                    }
                                 }
                             }
                         }
@@ -2873,37 +2881,21 @@ impl Recursor {
         fallback.ok_or(RecurseError::NoResponse)
     }
 
-    /// Each server in order, preceded by its encrypted endpoint when one is known to answer. When
-    /// encryption is required, only the encrypted endpoints not known to fail.
+    /// The servers known to answer over encryption, asked that way, then every server in
+    /// plaintext; each part in the given order.
     fn rungs(&self, ordered: &[SocketAddr]) -> Vec<Rung> {
-        let mut rungs = Vec::with_capacity(ordered.len());
-        for &server in ordered {
-            match self.opportunistic {
-                Some(encryption) if encryption.is_required() => {
-                    rungs.extend(encryption.required_routes(server.ip()).into_iter().map(
-                        |route| Rung {
-                            server,
-                            encrypted: Some(route),
-                        },
-                    ));
-                }
-                encryption => {
-                    if let Some(route) =
-                        encryption.and_then(|encryption| encryption.route(server.ip()))
-                    {
-                        rungs.push(Rung {
-                            server,
-                            encrypted: Some(route),
-                        });
-                    }
-                    rungs.push(Rung {
-                        server,
-                        encrypted: None,
-                    });
-                }
-            }
-        }
-        rungs
+        let encrypted = ordered.iter().filter_map(|&server| {
+            let route = self.opportunistic?.route(server.ip())?;
+            Some(Rung {
+                server,
+                encrypted: Some(route),
+            })
+        });
+        let plain = ordered.iter().map(|&server| Rung {
+            server,
+            encrypted: None,
+        });
+        encrypted.chain(plain).collect()
     }
 
     /// A new encrypted connection costs more round trips than the query alone.
@@ -8809,14 +8801,14 @@ mod tests {
             done()
         }
 
-        fn ask(rec: &Recursor, server: SocketAddr) -> Result<Message, RecurseError> {
+        fn ask(rec: &Recursor, servers: &[SocketAddr]) -> Result<Message, RecurseError> {
             let zone = Name::from_str("adot.test").unwrap();
             let query = make_query(
                 &Name::from_str("host.adot.test").unwrap(),
                 RecordType::A,
                 false,
             );
-            rec.query_any(&[server], &query, &zone, rec.query_deadline())
+            rec.query_any(servers, &query, &zone, rec.query_deadline())
         }
 
         fn recursor(encryption: OpportunisticEncryption) -> Recursor {
@@ -8835,13 +8827,13 @@ mod tests {
             let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip));
             let rec = recursor(encryption);
 
-            ask(&rec, server).unwrap();
+            ask(&rec, &[server]).unwrap();
             assert_eq!(plain_asked.load(Ordering::SeqCst), 1);
             assert!(wait_until(Duration::from_secs(5), || encryption
                 .route(server.ip())
                 .is_some()));
 
-            let response = ask(&rec, server).unwrap();
+            let response = ask(&rec, &[server]).unwrap();
             assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
             assert_eq!(plain_asked.load(Ordering::SeqCst), 1, "asked over DoT only");
             assert_eq!(
@@ -8871,7 +8863,7 @@ mod tests {
             let rec = recursor(encryption);
 
             for _ in 0..5 {
-                let response = ask(&rec, server).unwrap();
+                let response = ask(&rec, &[server]).unwrap();
                 assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -8892,7 +8884,7 @@ mod tests {
             let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip));
             let rec = recursor(encryption);
 
-            ask(&rec, server).unwrap();
+            ask(&rec, &[server]).unwrap();
             assert!(wait_until(Duration::from_secs(5), || encryption
                 .route(server.ip())
                 .is_some()));
@@ -8903,7 +8895,7 @@ mod tests {
             );
 
             let started = Instant::now();
-            let response = ask(&rec, server).unwrap();
+            let response = ask(&rec, &[server]).unwrap();
             let elapsed = started.elapsed();
             assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
             let patience = rec.server_patience(server.ip())
@@ -8917,46 +8909,37 @@ mod tests {
         }
 
         #[test]
-        fn required_encryption_asks_over_dot_from_the_first_query() {
-            let ip = Ipv4Addr::new(127, 0, 0, 153);
-            let (server, plain_asked) = plain_server(ip);
-            let (dot_port, dot_asked) = dot_server(ip, Arc::new(AtomicBool::new(false)));
-            let rec = recursor(
-                OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip)).required(),
+        /// Of a zone's two servers only the second offers DoT. The plaintext answer from the first
+        /// starts probes of both, and from then on the zone is asked over DoT and not in plaintext.
+        fn a_zone_is_asked_over_the_server_that_offers_encryption() {
+            let plain_ip = Ipv4Addr::new(127, 0, 0, 153);
+            let dot_ip = Ipv4Addr::new(127, 0, 0, 154);
+            let (plain_only, plain_only_asked) = plain_server(plain_ip);
+            let (encrypting, encrypting_plain_asked) = plain_server(dot_ip);
+            let (dot_port, dot_asked) = dot_server(dot_ip, Arc::new(AtomicBool::new(false)));
+            let encryption = OpportunisticEncryption::with_ports(dot_port, closed_udp_port(dot_ip));
+            let rec = recursor(encryption);
+            let zone = [plain_only, encrypting];
+            let plain_asked = || {
+                plain_only_asked.load(Ordering::SeqCst)
+                    + encrypting_plain_asked.load(Ordering::SeqCst)
+            };
+
+            ask(&rec, &zone).unwrap();
+            assert!(wait_until(Duration::from_secs(5), || encryption
+                .route(encrypting.ip())
+                .is_some()));
+            assert_eq!(encryption.route(plain_only.ip()), None);
+            let plain_before = plain_asked();
+
+            let response = ask(&rec, &zone).unwrap();
+            assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+            assert_eq!(plain_asked(), plain_before, "nothing in plaintext");
+            assert_eq!(
+                dot_asked.load(Ordering::SeqCst),
+                2,
+                "the probe, then the query"
             );
-
-            for _ in 0..2 {
-                let response = ask(&rec, server).unwrap();
-                assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
-            }
-            assert_eq!(dot_asked.load(Ordering::SeqCst), 2);
-            assert_eq!(plain_asked.load(Ordering::SeqCst), 0);
-        }
-
-        #[test]
-        /// A server offering neither DoT nor DoQ fails the query, and its failed DoT is not tried
-        /// again within the damping period.
-        fn required_encryption_never_falls_back_to_plaintext() {
-            let ip = Ipv4Addr::new(127, 0, 0, 154);
-            let (server, plain_asked) = plain_server(ip);
-            let listener = TcpListener::bind((ip, 0)).unwrap();
-            let dot_port = listener.local_addr().unwrap().port();
-            let accepts = Arc::new(AtomicUsize::new(0));
-            let counted = accepts.clone();
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    drop(stream);
-                }
-            });
-            let rec = recursor(
-                OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip)).required(),
-            );
-
-            assert!(ask(&rec, server).is_err());
-            assert!(ask(&rec, server).is_err());
-            assert_eq!(plain_asked.load(Ordering::SeqCst), 0);
-            assert_eq!(accepts.load(Ordering::SeqCst), 1);
         }
     }
 }

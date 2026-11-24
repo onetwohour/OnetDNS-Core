@@ -404,20 +404,11 @@ recurse_opportunistic_encryption = true
 
 Queries authoritative servers over DoT or DoQ when they support it, as RFC 9539 describes. Certificates are not checked, so this stops eavesdropping but not an attacker on the path.
 
-After a server answers a query in plaintext, the same query is asked again in the background over DoT on port 853, or over DoQ on port 853 if DoT has failed. Once that gets an answer, later queries to the server go over encryption for up to three days after its last encrypted answer. If an encrypted query fails or is slow, the server is asked in plaintext within the same query time limit. A server whose encryption fails is not tried again for one day.
+After a zone's server answers a query in plaintext, the same query is asked again in the background over DoT on port 853, or over DoQ on port 853 if DoT has failed, to that server and to the zone's other servers. A server that answers this way is asked over encryption for up to three days after its last encrypted answer. A server whose encryption fails is not tried again for one day.
 
-### `recurse_require_encryption`
+When some of a zone's servers are known to answer over encryption, the zone is asked through them before any server is asked in plaintext, even if a plaintext server is closer. The zone is asked in plaintext when none is known yet, or when they fail or are slow, within the same query time limit. What is known is kept in memory, so after a restart the first queries to each zone go in plaintext again.
 
-**Type:** boolean
-**Default:** `false`
-
-**TOML:**
-
-```toml
-recurse_require_encryption = true
-```
-
-Never queries authoritative servers in plaintext. Each server is asked over DoT on port 853, then over DoQ on port 853 if DoT fails; a protocol that fails is not tried again for one day. A name whose servers offer neither fails to resolve, and today that includes most top-level domains, such as .com. Certificates are not checked, as with `recurse_opportunistic_encryption`. Works only with recursive or split resolution.
+On the dashboard this is the switch under DNSSEC on the Upstreams page, and root servers asked over encryption are marked DoT or DoQ in the root server list.
 
 **Requirement:** This option is meaningful only with `backend = "recurse"` or `"split"`. It turns off the fast path for recursive queries not in the cache, which sends only plain UDP.
 
@@ -589,6 +580,8 @@ dnssec = false
 ```
 
 Checks DNSSEC signatures to make sure answers were not forged and does not pass on answers that fail the check.
+
+Signatures are checked for algorithms 8 and 10 (RSA), 13 and 14 (ECDSA), 15 (Ed25519), and 18 (ML-DSA-44). A zone whose DS records use only other algorithms is treated as unsigned.
 
 ### `dnssec_strict`
 

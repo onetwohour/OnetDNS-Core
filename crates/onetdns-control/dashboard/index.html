@@ -518,7 +518,6 @@
           <sc-if value="{{ isRecursive }}"><div style="overflow-x:auto;overflow-y:hidden;min-width:0">
             <div style="display:flex;align-items:center;gap:10px;padding:15px 0;border-bottom:1px solid var(--border)"><span style="font-size:14px;font-weight:500;color:var(--fg);font-family:var(--font-display)">루트 서버</span><span style="font-size:11.5px;color:var(--muted)">{{ rootActiveLabel }}</span></div>
             <div style="font-size:10.5px;color:var(--muted);line-height:1.45;padding:10px 0">표준 루트 서버는 삭제 대신 활성화 여부를 변경합니다.</div>
-            <div style="display:flex;align-items:center;gap:12px;padding:0 0 13px;border-bottom:1px solid var(--border)"><span style="flex:1;font-size:12.5px;color:var(--fg)">암호화된 서버로만 조회</span><button onClick="{{ toggleRequireEnc }}" role="switch" aria-checked="{{ requireEnc }}" aria-label="암호화된 서버로만 조회" style="{{ reqTrack }}"><span style="{{ reqKnob }}"></span></button></div>
             <sc-for list="{{ rootServers }}" as="r" hint-placeholder-count="3">
               <div style="display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--border);animation:odRowGrow .42s cubic-bezier(.4,0,.2,1)">
                 <span style="width:30px;height:30px;border-radius:3px;background:var(--accent-bg);display:flex;align-items:center;justify-content:center;color:var(--accent);flex:0 0 30px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM3 12h18M12 3c2.5 2.5 2.5 15.5 0 18M12 3c-2.5 2.5-2.5 15.5 0 18"></path></svg></span>
@@ -569,6 +568,10 @@
                 <div style="flex:1"><div style="font-size:13px;font-weight:500;color:var(--fg);font-family:var(--font-display)">DNSSEC 검증</div><div style="font-size:11px;color:var(--muted);margin-top:2px">서명된 DNS 응답이 신뢰할 수 있는지 확인</div></div>
                 <button onClick="{{ toggleDnssec }}" role="switch" aria-checked="{{ dnssec }}" aria-label="DNSSEC 검증" style="{{ dnssecTrack }}"><span style="{{ dnssecKnob }}"></span></button>
               </div>
+              <sc-if value="{{ isRecursive }}"><div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+                <div style="flex:1"><div style="font-size:13px;font-weight:500;color:var(--fg);font-family:var(--font-display)">권한 서버 암호화</div><div style="font-size:11px;color:var(--muted);margin-top:2px">DoT나 DoQ를 지원하는 권한 서버에는 암호화해서 질의</div></div>
+                <button onClick="{{ toggleAuthEnc }}" role="switch" aria-checked="{{ authEnc }}" aria-label="권한 서버 암호화" style="{{ authEncTrack }}"><span style="{{ authEncKnob }}"></span></button>
+              </div></sc-if>
             </div>
           </div>
         </div>
@@ -4642,13 +4645,16 @@ Object.assign(I18N.zh, {
   "Invalid configuration value: control_public_origins needs control_listen_https, or control_trusted_proxies with the address of the reverse proxy serving the dashboard":"仅设置管理界面公开地址 (control_public_origins) 无法访问。请开启管理界面 HTTPS 监听地址，或在管理界面反向代理地址中填写转发管理界面的代理地址"
 });
 Object.assign(I18N.en, {
-  "암호화된 서버로만 조회":"Encrypted servers only"
+  "권한 서버 암호화":"Authoritative server encryption",
+  "DoT나 DoQ를 지원하는 권한 서버에는 암호화해서 질의":"Encrypt queries to authoritative servers that support DoT or DoQ"
 });
 Object.assign(I18N.ja, {
-  "암호화된 서버로만 조회":"暗号化対応サーバーのみに問い合わせ"
+  "권한 서버 암호화":"権威サーバーの暗号化",
+  "DoT나 DoQ를 지원하는 권한 서버에는 암호화해서 질의":"DoT か DoQ に対応する権威サーバーへの問い合わせを暗号化します"
 });
 Object.assign(I18N.zh, {
-  "암호화된 서버로만 조회":"仅查询加密服务器"
+  "권한 서버 암호화":"权威服务器加密",
+  "DoT나 DoQ를 지원하는 권한 서버에는 암호화해서 질의":"对支持 DoT 或 DoQ 的权威服务器加密查询"
 });
 Object.assign(I18N.ko, {
   "Invalid IP address: ":"IP 형식이 올바르지 않습니다: ",
@@ -4687,7 +4693,7 @@ function listenAddr(value){
 
 const DEDICATED_HOME = {
   upstreams:'upstreams', upstream_urls:'upstreams', root_hints:'upstreams', upstream_strategy:'upstreams',
-  backend:'upstreams', dnssec:'upstreams', recurse_require_encryption:'upstreams', split_default:'upstreams', split_recurse:'upstreams', split_forward:'upstreams',
+  backend:'upstreams', dnssec:'upstreams', recurse_opportunistic_encryption:'upstreams', split_default:'upstreams', split_recurse:'upstreams', split_forward:'upstreams',
   listen:'encryption', listen_dot:'encryption', listen_doh:'encryption', listen_doq:'encryption',
   listen_doh3:'encryption', listen_dnscrypt:'encryption',
   blocklist_urls:'lists',
@@ -4877,7 +4883,7 @@ class Component extends DCLogic {
     clients: [],
     upstreams: [],
     encryptedAuthorities: [],
-    strategy:'parallel', backend:'forwarding', dnssec:false, requireEnc:false, cfgCat:'',
+    strategy:'parallel', backend:'forwarding', dnssec:false, authEnc:false, cfgCat:'',
     listeners: [],
     listenerStatus: [],
     sysAdapters: [],
@@ -5787,7 +5793,7 @@ class Component extends DCLogic {
         aclAllow:arr(c.acl_allow).join(String.fromCharCode(10)),aclDeny:arr(c.acl_deny).join(String.fromCharCode(10))},
       safeSearch:bl(c.safe_search),safeBrowsing:bl(c.safe_browsing),parental:bl(c.parental_control),
       strategy:({parallel:'parallel',querystatistics:'fastest',userorder:'sequential',roundrobin:'roundrobin'}[String(c.upstream_strategy||'').replace(/_/g,'').toLowerCase()]||s.strategy),
-      backend:({forward:'forwarding',recurse:'recursive',split:'split'}[c.backend]||s.backend),dnssec:bl(c.dnssec),requireEnc:bl(c.recurse_require_encryption),
+      backend:({forward:'forwarding',recurse:'recursive',split:'split'}[c.backend]||s.backend),dnssec:bl(c.dnssec),authEnc:bl(c.recurse_opportunistic_encryption),
       mode:(String(c.mode).toLowerCase()==='public'?'public':'personal'),cfgRaw:Object.keys(s.configDraftDirty||{}).length?{...d,...s.configDraft}:d,cfgApplied:c,configStatus:status,
       ...this.restartClassFrom(s,status)
     }));
@@ -6803,7 +6809,7 @@ class Component extends DCLogic {
 
   setStrategy=(v)=>()=>{ this.setState({strategy:v}); this.cset({upstream_strategy:({parallel:'parallel',fastest:'query_statistics',sequential:'user_order',roundrobin:'round_robin'}[v]||v)}); };
   setBackend=(v)=>()=>{ this.setState({backend:v}); this.cset({backend:({forwarding:'forward',recursive:'recurse',split:'split'}[v]||v)}); };
-  toggleRequireEnc=()=>{ const en=!this.state.requireEnc; this.setState({requireEnc:en}); this.cset({recurse_require_encryption:en}); };
+  toggleAuthEnc=()=>{ const en=!this.state.authEnc; this.setState({authEnc:en}); this.cset({recurse_opportunistic_encryption:en}); };
   toggleDnssec=()=>{ const en=!this.state.dnssec; this.setState({dnssec:en}); this.cset({dnssec:en}); };
   // 수신 주소는 설정 배열 그 자체다. 켜고 끄는 상태가 따로 없으므로 고치거나 지운다.
   listenerRow(id){ return (this.state.listeners||[]).find(x=>x.id===id); }
@@ -7262,8 +7268,8 @@ class Component extends DCLogic {
       style:`text-align:left;padding:13px 15px;border-radius:3px;cursor:pointer;font:inherit;border:1.5px solid ${s.backend===k?'var(--accent)':'var(--border)'};background:${s.backend===k?'var(--accent-bg)':'var(--surface)'}`}));
     const dnssecTrack=`width:44px;height:26px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 44px;background:${s.dnssec?'var(--accent)':SW3}`;
     const dnssecKnob=`position:absolute;top:3px;left:${s.dnssec?'21px':'3px'};width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`;
-    const reqTrack=`width:44px;height:26px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 44px;background:${s.requireEnc?'var(--accent)':SW3}`;
-    const reqKnob=`position:absolute;top:3px;left:${s.requireEnc?'21px':'3px'};width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`;
+    const authEncTrack=`width:44px;height:26px;border-radius:999px;border:0;cursor:pointer;padding:0;position:relative;flex:0 0 44px;background:${s.authEnc?'var(--accent)':SW3}`;
+    const authEncKnob=`position:absolute;top:3px;left:${s.authEnc?'21px':'3px'};width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)`;
     const encByIp=Object.fromEntries(s.encryptedAuthorities.map(x=>[x.addr,x.protocol==='doq'?'DoQ':'DoT']));
 
 
@@ -7467,7 +7473,7 @@ class Component extends DCLogic {
 
       clients, addClient:this.addClient,
 
-      upstreams, strategies, backends, dnssec:s.dnssec, dnssecTrack, dnssecKnob, toggleDnssec:this.toggleDnssec, requireEnc:s.requireEnc, reqTrack, reqKnob, toggleRequireEnc:this.toggleRequireEnc, addUpstream:this.addUpstream,testUpstreams:this.testUpstreams,
+      upstreams, strategies, backends, dnssec:s.dnssec, dnssecTrack, dnssecKnob, toggleDnssec:this.toggleDnssec, authEnc:s.authEnc, authEncTrack, authEncKnob, toggleAuthEnc:this.toggleAuthEnc, addUpstream:this.addUpstream,testUpstreams:this.testUpstreams,
 
       rootServers:s.rootServers.map(r=>{const sw=mkRootSw(r.enabled);return {...r,enc:encByIp[r.ip]||'',onToggle:this.toggleRoot(r.id),toggleLabel:this.tr(r.enabled?'{name} 비활성화':'{name} 활성화',{name:r.name}),track:sw.track,knob:sw.knob,canRemove:!r.canonical,onRemove:this.removeRoot(r.id),removeLabel:this.tr('{addr} 주소 지우기',{addr:r.ip})};}),
       rootActiveLabel:this.tr('{count}개 활성',{count:s.rootServers.filter(r=>r.enabled).length}), addRoot:this.addRoot, isRecursive:s.backend==='recursive'||s.backend==='split', isForwarding:s.backend==='forwarding'||s.backend==='split',

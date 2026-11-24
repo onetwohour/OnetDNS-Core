@@ -67,8 +67,6 @@ pub(crate) fn exchange(
     timeout: Duration,
     trust: &TrustStore,
 ) -> Result<Message, ForwardError> {
-    #[cfg(test)]
-    let _revocation_test_guard = crate::revocation_test_read_guard();
     let deadline = super::deadline_after(timeout);
     POOL.with(|pool| {
         let key = (
@@ -611,7 +609,6 @@ mod tests {
     /// The server has acknowledged nothing, so the send buffer is full. The connection is dropped
     /// and the server is told of an internal failure, distinct from a normal close.
     fn doh3_unsendable_request_closes_with_internal_error() {
-        let _revocation_test_guard = crate::revocation_test_read_guard();
         let (addr, trust, closes) = doh3_close_recorder(answer_in_kind);
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut conn =

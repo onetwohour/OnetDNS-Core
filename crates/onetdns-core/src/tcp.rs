@@ -150,15 +150,14 @@ impl<S: SocketTimeouts> DeadlineTcp<S> {
         })
     }
 
-    /// Restarts a timed-out wait only when it was cut short of the deadline to check the flags. If
-    /// a stop flag was set meanwhile, the next wait ends with ConnectionAborted.
+    /// Restarts a timed-out wait that ended before the deadline: one cut short to check the flags,
+    /// or a socket timeout that ended slightly early. If a stop flag was set meanwhile, the next wait
+    /// ends with ConnectionAborted.
     fn waits_again(&self, error: &io::Error, deadline: Instant) -> bool {
-        self.watching()
-            && matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            )
-            && Instant::now() < deadline
+        matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) && Instant::now() < deadline
     }
 }
 
@@ -251,6 +250,35 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_millis(500));
         peer.join().unwrap();
+    }
+
+    #[test]
+    /// Callers tell a timeout from other failures by the deadline having passed.
+    fn a_socket_timeout_ending_before_the_deadline_waits_again() {
+        // Times out once before the deadline, as a socket timeout can.
+        struct EarlyTimeout(bool);
+        impl Read for EarlyTimeout {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.0) {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                buf[0] = 7;
+                Ok(1)
+            }
+        }
+        impl SocketTimeouts for EarlyTimeout {
+            fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stream = DeadlineTcp::new(EarlyTimeout(true), deadline);
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [7]);
     }
 
     #[test]

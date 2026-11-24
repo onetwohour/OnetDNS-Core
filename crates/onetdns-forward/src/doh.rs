@@ -69,8 +69,6 @@ pub(crate) fn with_pooled<T>(
     trust: &TrustStore,
     mut roundtrip: impl FnMut(&mut DohConn) -> Result<T, ForwardError>,
 ) -> Result<T, ForwardError> {
-    #[cfg(test)]
-    let _revocation_test_guard = crate::revocation_test_read_guard();
     POOL.with(|pool| {
         let scope = crate::tls_cache_scope(trust);
         let key = (
@@ -358,7 +356,6 @@ mod tests {
     /// Closing TCP without an alert leaves the server unable to tell a rejection from a connection
     /// cut on the way.
     fn doh_revocation_rejection_is_reported_to_the_server() {
-        let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, reads) = crate::tls_first_read_recorder(b"h2");
         crate::set_revocation_hook(Box::new(|_, host| {
             if host == "dns.test" {

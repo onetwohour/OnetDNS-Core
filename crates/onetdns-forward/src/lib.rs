@@ -723,69 +723,35 @@ struct RevocationPolicy {
     generation: u64,
 }
 
-static REVOCATION_POLICY: OnceLock<Mutex<RevocationPolicy>> = OnceLock::new();
-
-fn revocation_policy() -> &'static Mutex<RevocationPolicy> {
-    REVOCATION_POLICY.get_or_init(|| {
-        Mutex::new(RevocationPolicy {
-            hook: None,
-            generation: 0,
-        })
-    })
+/// Per thread in tests, so a hook one test installs does not reach the exchanges of tests running
+/// beside it.
+fn with_revocation_policy<R>(f: impl FnOnce(&mut RevocationPolicy) -> R) -> R {
+    const UNSET: RevocationPolicy = RevocationPolicy {
+        hook: None,
+        generation: 0,
+    };
+    #[cfg(not(test))]
+    {
+        static POLICY: Mutex<RevocationPolicy> = Mutex::new(UNSET);
+        f(&mut POLICY.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static POLICY: std::cell::RefCell<RevocationPolicy> =
+                const { std::cell::RefCell::new(UNSET) };
+        }
+        POLICY.with(|policy| f(&mut policy.borrow_mut()))
+    }
 }
 
 fn tls_cache_scope(trust: &TrustStore) -> TlsCacheScope {
-    let policy = revocation_policy()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     TlsCacheScope {
         trust: trust.cache_key(),
-        revocation_generation: policy.hook.as_ref().map_or(0, |_| policy.generation),
+        revocation_generation: with_revocation_policy(|policy| {
+            policy.hook.as_ref().map_or(0, |_| policy.generation)
+        }),
     }
-}
-
-#[cfg(test)]
-/// Serializes tests that change the global revocation hook against encrypted transport tests.
-static REVOCATION_TEST_LOCK: RwLock<()> = RwLock::new(());
-
-#[cfg(test)]
-thread_local! {
-    /// A test thread holding the write lock skips the read lock in its own exchanges.
-    static REVOCATION_TEST_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn revocation_test_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
-    if REVOCATION_TEST_WRITER.with(std::cell::Cell::get) {
-        None
-    } else {
-        Some(
-            REVOCATION_TEST_LOCK
-                .read()
-                .unwrap_or_else(|error| error.into_inner()),
-        )
-    }
-}
-
-#[cfg(test)]
-struct RevocationTestWriteGuard {
-    _guard: std::sync::RwLockWriteGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl Drop for RevocationTestWriteGuard {
-    fn drop(&mut self) {
-        REVOCATION_TEST_WRITER.with(|writer| writer.set(false));
-    }
-}
-
-#[cfg(test)]
-fn revocation_test_write_guard() -> RevocationTestWriteGuard {
-    let guard = REVOCATION_TEST_LOCK
-        .write()
-        .unwrap_or_else(|error| error.into_inner());
-    REVOCATION_TEST_WRITER.with(|writer| writer.set(true));
-    RevocationTestWriteGuard { _guard: guard }
 }
 
 #[cfg(test)]
@@ -838,25 +804,23 @@ fn tls_first_read_recorder(
 pub fn set_revocation_hook(
     f: Box<dyn Fn(&[onetdns_tls::X509], &str) -> Result<(), String> + Send + Sync>,
 ) {
-    let mut policy = revocation_policy()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    policy.generation = policy
-        .generation
-        .checked_add(1)
-        .expect("Revocation policy generations exhausted");
-    policy.hook = Some(Arc::from(f));
+    with_revocation_policy(|policy| {
+        policy.generation = policy
+            .generation
+            .checked_add(1)
+            .expect("Revocation policy generations exhausted");
+        policy.hook = Some(Arc::from(f));
+    });
 }
 
 pub fn clear_revocation_hook() {
-    let mut policy = revocation_policy()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    policy.generation = policy
-        .generation
-        .checked_add(1)
-        .expect("Revocation policy generations exhausted");
-    policy.hook = None;
+    with_revocation_policy(|policy| {
+        policy.generation = policy
+            .generation
+            .checked_add(1)
+            .expect("Revocation policy generations exhausted");
+        policy.hook = None;
+    });
 }
 
 /// Passes when no hook is installed: revocation checking is optional and enforced only when on.
@@ -864,11 +828,7 @@ pub(crate) fn check_revocation(
     verified_chain: &[onetdns_tls::X509],
     host: &str,
 ) -> Result<(), ForwardError> {
-    let hook = revocation_policy()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .hook
-        .clone();
+    let hook = with_revocation_policy(|policy| policy.hook.clone());
     if let Some(hook) = hook {
         hook(verified_chain, host)
             .map_err(|e| ForwardError::Io(format!("Certificate revocation check failed: {e}")))?;
@@ -2260,13 +2220,9 @@ fn udp_exchange_on(
         });
         let (from, parsed) = match received {
             Ok(v) => v,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(if saw_case_mismatch {
-                    ForwardError::BadResponse
-                } else {
-                    ForwardError::Timeout
-                });
-            }
+            // A reused timeout may be up to 1 ms short, and a socket timeout can end slightly early;
+            // the loop's start ends the exchange once the deadline has passed.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
             Err(e) => return Err(io_err(e)),
         };
 
@@ -2306,6 +2262,8 @@ struct Idle<C> {
 struct IdlePool<K, C> {
     idle: HashMap<K, Vec<Idle<C>>>,
     total: usize,
+    /// False once the server has closed the connection.
+    open: fn(&C) -> bool,
 }
 
 /// As many as concurrent queries to one server need.
@@ -2315,42 +2273,77 @@ const IDLE_PER_SERVER: usize = 2;
 /// descriptors.
 const IDLE_TOTAL: usize = 256;
 
-impl<K: std::hash::Hash + Eq, C> IdlePool<K, C> {
-    fn new() -> Self {
+/// How often kept connections that servers closed or that sat past the reuse limit are closed.
+/// Without it they would hold descriptors until their server is asked again.
+const IDLE_SWEEP_EVERY: Duration = Duration::from_secs(10);
+
+impl<K: std::hash::Hash + Eq + Clone, C> IdlePool<K, C> {
+    fn new(open: fn(&C) -> bool) -> Self {
         Self {
             idle: HashMap::new(),
             total: 0,
+            open,
         }
     }
 
-    /// Drops connections idle too long. A connection the server has since closed can still come
-    /// out; its first exchange fails at once, so it is not checked here.
+    fn sweep(&mut self) {
+        let mut idle = std::mem::take(&mut self.idle);
+        idle.retain(|_, conns| {
+            conns.retain(|kept| self.usable(kept));
+            !conns.is_empty()
+        });
+        self.total = idle.values().map(Vec::len).sum();
+        self.idle = idle;
+    }
+
+    fn usable(&self, idle: &Idle<C>) -> bool {
+        idle.last_used.elapsed() < tcp_idle_reuse_max() && (self.open)(&idle.conn)
+    }
+
+    /// Skips connections idle too long or closed by the server. One closed after this check makes
+    /// its first exchange fail at once, and the caller retries on a new connection.
     fn take(&mut self, key: &K) -> Option<C> {
-        let conns = self.idle.get_mut(key)?;
+        let mut conns = self.idle.remove(key)?;
         let mut found = None;
         while let Some(idle) = conns.pop() {
             self.total -= 1;
-            if idle.last_used.elapsed() < tcp_idle_reuse_max() {
+            if self.usable(&idle) {
                 found = Some(idle.conn);
                 break;
             }
         }
-        if conns.is_empty() {
-            self.idle.remove(key);
+        if !conns.is_empty() {
+            self.idle.insert(key.clone(), conns);
         }
         found
     }
 
-    /// Closes the connection past the caps.
+    /// Past the per-server cap the connection is closed. At the total cap the connection unused
+    /// longest makes room, so connections to servers no longer asked cannot fill the pool.
     fn put(&mut self, key: K, conn: C) {
+        if self
+            .idle
+            .get(&key)
+            .is_some_and(|conns| conns.len() >= IDLE_PER_SERVER)
+        {
+            return;
+        }
         if self.total >= IDLE_TOTAL {
-            return;
+            let oldest = self
+                .idle
+                .iter()
+                .min_by_key(|(_, conns)| conns[0].last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                let conns = self.idle.get_mut(&oldest).expect("the key was just found");
+                conns.remove(0);
+                if conns.is_empty() {
+                    self.idle.remove(&oldest);
+                }
+                self.total -= 1;
+            }
         }
-        let conns = self.idle.entry(key).or_default();
-        if conns.len() >= IDLE_PER_SERVER {
-            return;
-        }
-        conns.push(Idle {
+        self.idle.entry(key).or_default().push(Idle {
             conn,
             last_used: Instant::now(),
         });
@@ -2358,10 +2351,56 @@ impl<K: std::hash::Hash + Eq, C> IdlePool<K, C> {
     }
 }
 
+/// Creates a process-wide pool and the thread that sweeps it every `IDLE_SWEEP_EVERY`.
+fn shared_idle_pool<K, C>(
+    pool: &'static OnceLock<Mutex<IdlePool<K, C>>>,
+    open: fn(&C) -> bool,
+) -> &'static Mutex<IdlePool<K, C>>
+where
+    K: std::hash::Hash + Eq + Clone + Send + 'static,
+    C: Send + 'static,
+{
+    let mut created = false;
+    let shared = pool.get_or_init(|| {
+        created = true;
+        Mutex::new(IdlePool::new(open))
+    });
+    if created {
+        let spawned = std::thread::Builder::new()
+            .name("idle-conn-sweep".into())
+            .spawn(move || loop {
+                std::thread::sleep(IDLE_SWEEP_EVERY);
+                shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .sweep();
+            });
+        if let Err(error) = spawned {
+            onetdns_core::warn!(event = "forward.idle_sweep_thread_failed", %error,
+                "Could not start the thread that closes idle connections; they are closed when reused instead");
+        }
+    }
+    shared
+}
+
+/// Whether an idle connection is still usable: nothing to read and not ended. Bytes waiting on an
+/// idle connection are a TLS close notice ahead of the end or a stray message, so they count as
+/// closed.
+pub(crate) fn peer_open(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let open = matches!(
+        stream.peek(&mut [0u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    stream.set_nonblocking(false).is_ok() && open
+}
+
 /// Keyed by bind address and server address.
 fn tcp_idle_pool() -> &'static Mutex<IdlePool<(SocketAddr, SocketAddr), TcpStream>> {
     static POOL: OnceLock<Mutex<IdlePool<(SocketAddr, SocketAddr), TcpStream>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(IdlePool::new()))
+    shared_idle_pool(&POOL, peer_open)
 }
 
 fn take_idle_tcp(bind: SocketAddr, upstream: SocketAddr) -> Option<TcpStream> {
@@ -3259,6 +3298,50 @@ mod tests {
         ask_over_tcp(addr, 0x7004).expect("둘째 질의");
         assert!(started.elapsed() < Duration::from_millis(300));
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn idle_pool_skips_connections_the_server_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let open = TcpStream::connect(addr).unwrap();
+        let _server_side = listener.accept().unwrap();
+        let closed = TcpStream::connect(addr).unwrap();
+        drop(listener.accept().unwrap());
+        // A TLS server sends its close notice before ending the connection.
+        let notified = TcpStream::connect(addr).unwrap();
+        let (mut notifier, _) = listener.accept().unwrap();
+        notifier.write_all(&[21, 3, 3, 0, 2, 1, 0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (peer_open(&closed) || peer_open(&notified)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(peer_open(&open));
+        assert!(!peer_open(&closed));
+        assert!(!peer_open(&notified));
+
+        let mut pool = IdlePool::new(peer_open);
+        pool.put(1, open);
+        pool.put(1, closed);
+        pool.sweep();
+        assert_eq!(pool.total, 1);
+        let kept = pool.take(&1).expect("the connection still open");
+        assert!(peer_open(&kept));
+        assert_eq!(pool.total, 0);
+    }
+
+    #[test]
+    fn idle_pool_at_its_cap_drops_the_connection_unused_longest() {
+        let mut pool: IdlePool<usize, usize> = IdlePool::new(|_| true);
+        for key in 0..IDLE_TOTAL {
+            pool.put(key, key);
+        }
+        pool.idle.get_mut(&7).unwrap()[0].last_used -= Duration::from_secs(1);
+        pool.put(IDLE_TOTAL, IDLE_TOTAL);
+        assert_eq!(pool.total, IDLE_TOTAL);
+        assert_eq!(pool.take(&7), None);
+        assert_eq!(pool.take(&IDLE_TOTAL), Some(IDLE_TOTAL));
+        assert_eq!(pool.take(&0), Some(0));
     }
 
     #[test]

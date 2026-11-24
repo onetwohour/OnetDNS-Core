@@ -83,7 +83,6 @@ impl EncryptedRoute {
 pub struct OpportunisticEncryption {
     dot_port: u16,
     doq_port: u16,
-    required: bool,
 }
 
 impl Default for OpportunisticEncryption {
@@ -95,38 +94,7 @@ impl Default for OpportunisticEncryption {
 impl OpportunisticEncryption {
     /// Ports other than 853 only for tests.
     pub fn with_ports(dot_port: u16, doq_port: u16) -> Self {
-        Self {
-            dot_port,
-            doq_port,
-            required: false,
-        }
-    }
-
-    /// Servers are never asked in plaintext.
-    pub fn required(self) -> Self {
-        Self {
-            required: true,
-            ..self
-        }
-    }
-
-    pub fn is_required(self) -> bool {
-        self.required
-    }
-
-    /// Where to ask `server` when plaintext is not allowed: the known route, or else every
-    /// endpoint not failed within `DAMPING`. Empty when both failed.
-    pub fn required_routes(self, server: IpAddr) -> Vec<EncryptedRoute> {
-        memory()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .candidates(self.keys(server), Instant::now())
-            .into_iter()
-            .map(|(endpoint, encryption)| EncryptedRoute {
-                endpoint,
-                encryption,
-            })
-            .collect()
+        Self { dot_port, doq_port }
     }
 
     fn keys(self, server: IpAddr) -> [Key; 2] {
@@ -151,9 +119,10 @@ impl OpportunisticEncryption {
             })
     }
 
-    /// Called when `server` answered `request` in plaintext. Asks the same again over the first
-    /// encryption not known to fail, in the background, and returns at once.
-    pub fn after_plain_answer(self, server: IpAddr, request: &Message) {
+    /// Asks `server` the same request over the first encryption not known to fail, in the
+    /// background, and returns at once. Does nothing while a route is known, a probe runs, or both
+    /// failed within `DAMPING`.
+    pub fn probe(self, server: IpAddr, request: &Message) {
         let Some(slot) = ProbeSlot::claim(self.keys(server)) else {
             return;
         };
@@ -277,17 +246,6 @@ impl Memory {
         }
     }
 
-    fn candidates(&mut self, keys: [Key; 2], now: Instant) -> Vec<Key> {
-        if let Some(key) = self.route(keys, now) {
-            return vec![key];
-        }
-        keys.into_iter()
-            .filter(|key| {
-                self.status.get(key).map(|status| status.state(now)) != Some(State::Failed)
-            })
-            .collect()
-    }
-
     /// For a probe that ended without recording anything.
     fn release(&mut self, key: Key) {
         if self.status.peek(&key) == Some(&Status::Probing) {
@@ -360,7 +318,7 @@ type PoolKey = (SocketAddr, SocketAddr, Encryption);
 
 fn pool() -> &'static Mutex<IdlePool<PoolKey, EncryptedConn>> {
     static POOL: OnceLock<Mutex<IdlePool<PoolKey, EncryptedConn>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(IdlePool::new()))
+    crate::shared_idle_pool(&POOL, EncryptedConn::open)
 }
 
 /// Any certificate, no SNI, no resumption: there is no name to check against, and a ticket would
@@ -380,6 +338,14 @@ fn unauthenticated_config(endpoint: SocketAddr, encryption: Encryption) -> Clien
 }
 
 impl EncryptedConn {
+    /// A DoQ connection the server closed is found by its first exchange.
+    fn open(&self) -> bool {
+        match self {
+            EncryptedConn::Dot(conn) => conn.open(),
+            EncryptedConn::Doq(_) => true,
+        }
+    }
+
     fn connect(
         bind: SocketAddr,
         endpoint: SocketAddr,
@@ -697,33 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn required_encryption_tries_every_endpoint_not_known_to_fail() {
-        let dot = (SocketAddr::from(([192, 0, 2, 3], 853)), Encryption::Dot);
-        let doq = (dot.0, Encryption::Doq);
-        let keys = [dot, doq];
-        let mut memory = Memory::new(8);
-        let start = Instant::now();
-
-        assert_eq!(memory.candidates(keys, start), [dot, doq]);
-        memory.record(dot, Outcome::Failed, start);
-        assert_eq!(memory.candidates(keys, start), [doq]);
-        memory.record(doq, Outcome::Failed, start);
-        assert_eq!(memory.candidates(keys, start), Vec::<Key>::new());
-        let later = start + DAMPING;
-        assert_eq!(
-            memory.candidates(keys, later),
-            [dot, doq],
-            "failures stop counting once damping ends"
-        );
-        memory.record(doq, Outcome::Answered, later);
-        assert_eq!(
-            memory.candidates(keys, later),
-            [doq],
-            "a known route is the only one"
-        );
-    }
-
-    #[test]
     fn encrypted_servers_name_each_server_once() {
         let server = SocketAddr::from(([192, 0, 2, 5], 853));
         {
@@ -772,7 +711,7 @@ mod tests {
         let server = endpoint.ip();
         assert_eq!(encryption.route(server), None);
 
-        encryption.after_plain_answer(server, &query("probe.test"));
+        encryption.probe(server, &query("probe.test"));
         assert!(wait_until(Duration::from_secs(5), || encryption
             .route(server)
             .is_some()));
@@ -809,14 +748,14 @@ mod tests {
         let server = endpoint.ip();
         let dot = (SocketAddr::new(server, dot_port), Encryption::Dot);
 
-        encryption.after_plain_answer(server, &query("first.test"));
+        encryption.probe(server, &query("first.test"));
         assert!(wait_until(Duration::from_secs(6), || matches!(
             status(dot),
             Some(Status::Failed(_))
         )));
         assert_eq!(encryption.route(server), None);
 
-        encryption.after_plain_answer(server, &query("second.test"));
+        encryption.probe(server, &query("second.test"));
         assert!(wait_until(Duration::from_secs(5), || encryption
             .route(server)
             .is_some()));
@@ -854,13 +793,13 @@ mod tests {
         let doq = (SocketAddr::new(server, doq_port), Encryption::Doq);
         let failed = |key| matches!(status(key), Some(Status::Failed(_)));
 
-        encryption.after_plain_answer(server, &query("first.test"));
+        encryption.probe(server, &query("first.test"));
         assert!(wait_until(Duration::from_secs(6), || failed(dot)));
-        encryption.after_plain_answer(server, &query("second.test"));
+        encryption.probe(server, &query("second.test"));
         assert!(wait_until(Duration::from_secs(6), || failed(doq)));
 
         for _ in 0..3 {
-            encryption.after_plain_answer(server, &query("again.test"));
+            encryption.probe(server, &query("again.test"));
         }
         thread::sleep(Duration::from_millis(200));
         assert_eq!(accepts.load(Ordering::SeqCst), 1);

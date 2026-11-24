@@ -21,6 +21,10 @@ pub(crate) struct DotConn {
 }
 
 impl DotConn {
+    pub(crate) fn open(&self) -> bool {
+        crate::peer_open(self.tcp.get_ref())
+    }
+
     pub(crate) fn new(tcp: DeadlineTcp, tls: TlsConnection) -> Self {
         Self {
             tcp,
@@ -53,8 +57,6 @@ pub(crate) fn exchange(
     timeout: Duration,
     trust: &TrustStore,
 ) -> Result<Message, ForwardError> {
-    #[cfg(test)]
-    let _revocation_test_guard = crate::revocation_test_read_guard();
     let deadline = super::deadline_after(timeout);
     POOL.with(|pool| {
         let key = (
@@ -359,7 +361,6 @@ mod tests {
     /// Closing TCP without an alert leaves the server unable to tell a rejection from a connection
     /// cut on the way.
     fn dot_revocation_rejection_is_reported_to_the_server() {
-        let _revocation_test_guard = crate::revocation_test_write_guard();
         let (addr, trust, reads) = crate::tls_first_read_recorder(b"dot");
         crate::set_revocation_hook(Box::new(|_, host| {
             if host == "dns.test" {
