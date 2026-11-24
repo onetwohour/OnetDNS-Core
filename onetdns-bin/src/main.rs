@@ -184,10 +184,6 @@ pub(crate) const DEFAULT_CONTROL_LISTEN: SocketAddr =
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8553));
 
 fn main() -> BoxResult<()> {
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
     update::install::init();
     init_tracing();
     let cmd = match parse_args() {
@@ -197,6 +193,15 @@ fn main() -> BoxResult<()> {
             std::process::exit(2);
         }
     };
+    // A command whose output goes to a closed pipe ends quietly. The server keeps the Rust
+    // default of ignoring SIGPIPE: a write to a connection already closed must not end it.
+    #[cfg(unix)]
+    if !matches!(cmd, Command::Run { .. }) {
+        // SAFETY: only sets how this process handles SIGPIPE.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
 
     let mut rng_probe = [0u8; 32];
     onetdns_core::try_fill_random(&mut rng_probe).map_err(|error| {
