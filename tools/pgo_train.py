@@ -218,13 +218,25 @@ querylog = false
 
 
 class Server:
-    def __init__(self, command: list[str], config: Path, profile: str, env: dict | None = None) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        config: Path,
+        profile: str,
+        env: dict | None = None,
+        low_ports: bool = False,
+    ) -> None:
         self.log_path = config.with_suffix(".log")
         self.log = self.log_path.open("wb")
         env = dict(os.environ, LLVM_PROFILE_FILE=profile, **(env or {}))
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        argv = [*command, "run", "--config", str(config), "--no-web", "--no-supervisor"]
+        if low_ports and sys.platform == "darwin":
+            # macOS lets only root bind a port below 1024 to a specific address. sudo drops the
+            # environment, so the profile path goes on the command line.
+            argv = ["sudo", "-n", "env", f"LLVM_PROFILE_FILE={profile}", *argv]
         self.proc = subprocess.Popen(
-            [*command, "run", "--config", str(config), "--no-web", "--no-supervisor"],
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -425,7 +437,7 @@ def main() -> None:
         )
         servers = []
         try:
-            zone = Server(command, work / "zone.toml", str(work / "train-zone-%p.profraw"))
+            zone = Server(command, work / "zone.toml", str(work / "train-zone-%p.profraw"), low_ports=True)
             servers.append(zone)
             zone.wait_ready("127.0.0.1", ZONE_PORT, allowed[0], NOERROR)
             write_root_zone(work, key_signing_key(ZONE, 53, "test."))
@@ -437,7 +449,7 @@ def main() -> None:
                 + f'listen_dot = ["{ROOT}:853"]\nlisten_doq = ["{ROOT}:853"]\n'
                 + f'zones = [{{ origin = ".", file = "{(work / "db.root").as_posix()}", {signed} }}]\n',
             )
-            root = Server(command, work / "root.toml", str(work / "train-root-%p.profraw"))
+            root = Server(command, work / "root.toml", str(work / "train-root-%p.profraw"), low_ports=True)
             servers.append(root)
             root.wait_ready(ROOT, 53, "ns.root", NOERROR)
             write_anchor(work / "root.anchor", key_signing_key(ROOT, 53, "."))
