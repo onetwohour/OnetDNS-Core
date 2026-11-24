@@ -307,6 +307,11 @@ fn signature_algorithm_supported(algorithm: u8) -> bool {
     matches!(algorithm, 8 | 10 | 13 | 14 | 15 | 18)
 }
 
+/// ML-DSA-44.
+fn is_post_quantum(algorithm: u8) -> bool {
+    algorithm == 18
+}
+
 /// The public-key operation for one candidate that passed the structural checks.
 fn verify_rrsig_crypto(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<(), DnssecError> {
     let data = signed_data(rrsig, rrset);
@@ -695,6 +700,11 @@ fn validate_rrset_for_signer(
 /// trusted DS as KSK candidates, and trusts the RRset once a candidate validates its signature:
 /// the DS names one KSK, and its signature vouches for the ZSKs. `Invalid` when the records are
 /// malformed or no key matches a DS, `BadSignature` when no candidate validates the RRset.
+///
+/// When a trusted DS names a post-quantum key, only post-quantum keys are candidates or returned,
+/// so the zone validates only through post-quantum signatures. Otherwise anyone able to forge the
+/// zone's classical signature could break its post-quantum ones and still pass. This is stricter
+/// than RFC 6840, which accepts any one valid algorithm.
 pub fn validate_dnskey_set(
     dnskeys: &[Record],
     rrsigs: &[Rrsig],
@@ -729,11 +739,18 @@ pub fn validate_dnskey_set(
             .or_default()
             .insert(&ds.digest);
     }
+    let post_quantum = trusted_digests
+        .keys()
+        .any(|&(_, algorithm, _)| is_post_quantum(algorithm));
 
     let mut digest_budget = DsDigestBudget::default();
     let mut candidate_ksks = Vec::new();
     for key in &keys {
-        if key.protocol != 3 || !key.is_zone_key() || key.is_revoked() {
+        if key.protocol != 3
+            || !key.is_zone_key()
+            || key.is_revoked()
+            || post_quantum && !is_post_quantum(key.algorithm)
+        {
             continue;
         }
         let key_tag = key.key_tag();
@@ -761,7 +778,13 @@ pub fn validate_dnskey_set(
             }
             budget.charge()?;
             if verify_rrsig_crypto(dnskeys, sig, ksk).is_ok() {
-                return Ok(keys);
+                return Ok(if post_quantum {
+                    keys.into_iter()
+                        .filter(|key| is_post_quantum(key.algorithm))
+                        .collect()
+                } else {
+                    keys
+                });
             }
         }
     }
@@ -3222,6 +3245,119 @@ mod tests {
                 unusable.protocol
             );
         }
+    }
+
+    fn ml_dsa_key(seed: u8) -> (ml_dsa::ExpandedSigningKey<ml_dsa::MlDsa44>, Dnskey) {
+        let seed = ml_dsa::Seed::try_from(&[seed; 32][..]).unwrap();
+        let sk = ml_dsa::ExpandedSigningKey::<ml_dsa::MlDsa44>::from_seed(&seed);
+        let dnskey = Dnskey {
+            flags: 257,
+            protocol: 3,
+            algorithm: 18,
+            public_key: sk.verifying_key().encode().to_vec(),
+        };
+        (sk, dnskey)
+    }
+
+    fn sign_ml_dsa(
+        sk: &ml_dsa::ExpandedSigningKey<ml_dsa::MlDsa44>,
+        key: &Dnskey,
+        signer: &str,
+        type_covered: u16,
+        rrset: &[Record],
+    ) -> Rrsig {
+        let mut rrsig = Rrsig {
+            type_covered,
+            algorithm: 18,
+            labels: rrset[0].name.num_labels() as u8,
+            original_ttl: 3600,
+            expiration: 0x7FFF_FFFF,
+            inception: 0,
+            key_tag: key.key_tag(),
+            signer: Name::from_str(signer).unwrap(),
+            signature: vec![],
+        };
+        rrsig.signature = sk
+            .sign_deterministic(&signed_data(&rrsig, rrset), &[])
+            .unwrap()
+            .encode()
+            .to_vec();
+        rrsig
+    }
+
+    #[test]
+    /// The zone is signed with P-256 and ML-DSA-44, and its DS set names both. A valid P-256 path
+    /// must not stand in for a broken ML-DSA-44 one, and the keys trusted afterwards are the
+    /// ML-DSA-44 ones only, so the zone's data needs an ML-DSA-44 signature too. A DS set naming
+    /// only P-256 keeps the any-algorithm rule.
+    fn a_post_quantum_ds_requires_a_post_quantum_path() {
+        const ZONE: &str = "pq.example.";
+        let zone = Name::from_str(ZONE).unwrap();
+        let (classic_sk, classic) = p256_key(81);
+        let (pq_sk, pq) = ml_dsa_key(82);
+        let dnskeys = vec![dnskey_rec(ZONE, &classic), dnskey_rec(ZONE, &pq)];
+        let classic_sig = sign(&classic_sk, &classic, ZONE, RecordType::DNSKEY.0, &dnskeys);
+        let pq_sig = sign_ml_dsa(&pq_sk, &pq, ZONE, RecordType::DNSKEY.0, &dnskeys);
+        let mut broken_pq_sig = pq_sig.clone();
+        broken_pq_sig.signature[100] ^= 1;
+        let both_ds = vec![
+            Ds::from_dnskey(&classic, &zone, 2).unwrap(),
+            Ds::from_dnskey(&pq, &zone, 2).unwrap(),
+        ];
+        let classic_ds = vec![both_ds[0].clone()];
+
+        let keys = validate_dnskey_set(
+            &dnskeys,
+            &[classic_sig.clone(), pq_sig.clone()],
+            &both_ds,
+            &zone,
+            1,
+        )
+        .expect("ML-DSA-44 경로가 유효하면 통과해야 합니다");
+        assert_eq!(keys, vec![pq.clone()], "ML-DSA-44 키만 신뢰해야 합니다");
+
+        assert_eq!(
+            validate_dnskey_set(
+                &dnskeys,
+                &[classic_sig.clone(), broken_pq_sig.clone()],
+                &both_ds,
+                &zone,
+                1,
+            ),
+            Err(DnssecError::BadSignature),
+            "P-256 경로만 유효하면 다운그레이드로 거부해야 합니다"
+        );
+
+        let answer = vec![Record::new(
+            zone.clone(),
+            3600,
+            RData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        )];
+        let classic_answer_sig = sign(&classic_sk, &classic, ZONE, 1, &answer);
+        let pq_answer_sig = sign_ml_dsa(&pq_sk, &pq, ZONE, 1, &answer);
+        assert!(
+            validate_rrset_in_zone(&answer, &[classic_answer_sig.clone()], &keys, &zone, 1)
+                .is_err(),
+            "P-256 서명만 있는 데이터는 거부해야 합니다"
+        );
+        assert!(validate_rrset_in_zone(
+            &answer,
+            &[classic_answer_sig, pq_answer_sig],
+            &keys,
+            &zone,
+            1
+        )
+        .is_ok());
+
+        let keys = validate_dnskey_set(
+            &dnskeys,
+            &[classic_sig, broken_pq_sig],
+            &classic_ds,
+            &zone,
+            1,
+        )
+        .expect("DS가 P-256만 가리키면 P-256 경로로 충분합니다");
+        assert_eq!(keys.len(), 2);
     }
 
     #[test]
