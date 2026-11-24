@@ -22,10 +22,7 @@ mod socks5;
 
 pub use socks5::Socks5Proxy;
 
-pub use opportunistic::{
-    endpoint_statuses, EncryptedRoute, Encryption, EndpointState, EndpointStatus,
-    OpportunisticEncryption,
-};
+pub use opportunistic::{encrypted_servers, EncryptedRoute, Encryption, OpportunisticEncryption};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};

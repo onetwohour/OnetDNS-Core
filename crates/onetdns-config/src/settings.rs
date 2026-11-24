@@ -914,6 +914,9 @@ pub struct Config {
     /// authentication.
     pub recurse_opportunistic_encryption: bool,
 
+    /// Authoritative servers are asked only over DoT or DoQ.
+    pub recurse_require_encryption: bool,
+
     pub ns_recursion_limit: u8,
 
     pub ns_cache_size: usize,
@@ -1226,6 +1229,7 @@ impl Default for Config {
             recurse_deny_server: vec![],
             recurse_allow_server: vec![],
             recurse_opportunistic_encryption: false,
+            recurse_require_encryption: false,
             ns_recursion_limit: 0,
             ns_cache_size: 0,
             recurse_deny_answers: vec![],
@@ -1884,6 +1888,12 @@ impl Config {
         if self.recurse_opportunistic_encryption && self.backend == BackendKind::Forward {
             soft.push(
                 "`recurse_opportunistic_encryption` works only with recursive or split resolution; it has no effect with forwarding"
+                    .into(),
+            );
+        }
+        if self.recurse_require_encryption && self.backend == BackendKind::Forward {
+            soft.push(
+                "`recurse_require_encryption` works only with recursive or split resolution; it has no effect with forwarding"
                     .into(),
             );
         }
@@ -3114,6 +3124,10 @@ impl Config {
             "recurse_opportunistic_encryption",
             self.recurse_opportunistic_encryption.to_string(),
         );
+        kv(
+            "recurse_require_encryption",
+            self.recurse_require_encryption.to_string(),
+        );
         kv("recurse_deny_answers", sarr(&self.recurse_deny_answers));
         kv("recurse_allow_answers", sarr(&self.recurse_allow_answers));
         kv(
@@ -3742,6 +3756,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "ra_other",
         "rebind_protection",
         "recurse_opportunistic_encryption",
+        "recurse_require_encryption",
         "release_check",
         "root_key_sentinel",
         "rrset_roundrobin",
@@ -5751,6 +5766,7 @@ const KNOWN_KEYS: &[&str] = &[
     "recurse_deny_server",
     "recurse_allow_server",
     "recurse_opportunistic_encryption",
+    "recurse_require_encryption",
     "ns_recursion_limit",
     "ns_cache_size",
     "recurse_deny_answers",
@@ -6269,6 +6285,11 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
         root,
         "recurse_opportunistic_encryption",
         d.recurse_opportunistic_encryption,
+    );
+    c.recurse_require_encryption = gbool(
+        root,
+        "recurse_require_encryption",
+        d.recurse_require_encryption,
     );
     c.ns_recursion_limit = gi64(root, "ns_recursion_limit")
         .map(|i| i as u8)
@@ -7267,6 +7288,23 @@ answer = \"target.example\"
         .unwrap();
         assert!(parsed.recurse_opportunistic_encryption);
         assert!(Config::from_toml_str("recurse_opportunistic_encryption = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn required_encryption_is_off_by_default_and_noted_under_forwarding() {
+        let mut config = Config::default();
+        assert!(!config.recurse_require_encryption);
+        config.recurse_require_encryption = true;
+        assert!(config
+            .advisories()
+            .iter()
+            .any(|advisory| advisory.contains("recurse_require_encryption")));
+        config.backend = BackendKind::Recurse;
+        assert!(config.advisories().is_empty());
+        let parsed =
+            Config::from_toml_str("backend = \"recurse\"\nrecurse_require_encryption = true\n")
+                .unwrap();
+        assert!(parsed.recurse_require_encryption);
     }
 
     #[test]

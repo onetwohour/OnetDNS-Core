@@ -829,6 +829,12 @@ static KEYS: &[KeySpec] = &[
         Shared,
         reactor(|c, _| c.recurse_opportunistic_encryption),
     ),
+    key!(
+        recurse_require_encryption,
+        Hot(Chain),
+        Shared,
+        reactor(|c, _| c.recurse_require_encryption),
+    ),
     key!(ns_recursion_limit, Hot(Chain), Shared, Lanes::OPEN),
     key!(ns_cache_size, Hot(Chain), Shared, Lanes::OPEN),
     key!(
@@ -950,6 +956,7 @@ mod tests {
                 "harden_below_nxdomain",
                 "cachedb_redis_host",
                 "recurse_opportunistic_encryption",
+                "recurse_require_encryption",
                 "recurse_deny_answers",
             ]
         );

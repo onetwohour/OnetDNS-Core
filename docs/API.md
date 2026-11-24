@@ -743,7 +743,7 @@ Listen addresses, upstream DNS servers, the response cache, and query diagnostic
 | GET | `/v1/upstreams` | read-only | Upstream DNS servers |
 | POST | `/v1/upstreams` | admin | Add an upstream DNS server (admin only; applies without dropping connections) |
 | DELETE | `/v1/upstreams` | admin | Delete an upstream DNS server (admin only; applies without dropping connections) |
-| GET | `/v1/upstreams/authority-encryption` | read-only | Authoritative servers that recursion has tried over DoT or DoQ, most recent first (at most 500; total counts all) |
+| GET | `/v1/upstreams/authority-encryption` | read-only | Authoritative servers that recursion asks over DoT or DoQ |
 
 #### `POST /v1/policies/simulate`
 
@@ -853,7 +853,7 @@ Other fields are rejected.
 
 | Status | Response |
 |---|---|
-| 200 | {servers:[{addr,protocol,state,checked_at}],total}; state is encrypted, probing, failed, or expired |
+| 200 | `[{addr,protocol}]` |
 
 ### TLS
 

@@ -31,7 +31,7 @@ const MAX_SERVERS: usize = 50_000;
 /// Each probe is a thread holding a socket for up to `PROBE_TIMEOUT`.
 const MAX_PROBES: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Encryption {
     Dot,
     Doq,
@@ -83,6 +83,7 @@ impl EncryptedRoute {
 pub struct OpportunisticEncryption {
     dot_port: u16,
     doq_port: u16,
+    required: bool,
 }
 
 impl Default for OpportunisticEncryption {
@@ -94,7 +95,38 @@ impl Default for OpportunisticEncryption {
 impl OpportunisticEncryption {
     /// Ports other than 853 only for tests.
     pub fn with_ports(dot_port: u16, doq_port: u16) -> Self {
-        Self { dot_port, doq_port }
+        Self {
+            dot_port,
+            doq_port,
+            required: false,
+        }
+    }
+
+    /// Servers are never asked in plaintext.
+    pub fn required(self) -> Self {
+        Self {
+            required: true,
+            ..self
+        }
+    }
+
+    pub fn is_required(self) -> bool {
+        self.required
+    }
+
+    /// Where to ask `server` when plaintext is not allowed: the known route, or else every
+    /// endpoint not failed within `DAMPING`. Empty when both failed.
+    pub fn required_routes(self, server: IpAddr) -> Vec<EncryptedRoute> {
+        memory()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .candidates(self.keys(server), Instant::now())
+            .into_iter()
+            .map(|(endpoint, encryption)| EncryptedRoute {
+                endpoint,
+                encryption,
+            })
+            .collect()
     }
 
     fn keys(self, server: IpAddr) -> [Key; 2] {
@@ -132,46 +164,20 @@ impl OpportunisticEncryption {
     }
 }
 
-/// What decides how one encrypted endpoint is used now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointState {
-    /// Answered within `PERSISTENCE`, so queries to the server go this way.
-    Encrypted,
-    Probing,
-    /// Failed within `DAMPING`, so it is not tried again until then.
-    Failed,
-    /// The last result is too old to decide anything; the next plaintext answer probes again.
-    Expired,
-}
-
-impl EndpointState {
-    pub fn name(self) -> &'static str {
-        match self {
-            EndpointState::Encrypted => "encrypted",
-            EndpointState::Probing => "probing",
-            EndpointState::Failed => "failed",
-            EndpointState::Expired => "expired",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EndpointStatus {
-    pub endpoint: SocketAddr,
-    pub encryption: Encryption,
-    pub state: EndpointState,
-    /// Since the last answer or failure; `None` while probing.
-    pub age: Option<Duration>,
-}
-
-/// Every endpoint this process has probed, the most recent result first.
-pub fn endpoint_statuses() -> Vec<EndpointStatus> {
-    let mut statuses = memory()
+/// Servers whose last answer over encryption is recent, each with the protocol queries to it use.
+pub fn encrypted_servers() -> Vec<(IpAddr, Encryption)> {
+    let now = Instant::now();
+    let mut servers: Vec<_> = memory()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .statuses(Instant::now());
-    statuses.sort_by_key(|status| status.age.unwrap_or_default());
-    statuses
+        .status
+        .iter()
+        .filter(|(_, status)| status.state(now) == State::Encrypted)
+        .map(|(&(endpoint, encryption), _)| (endpoint.ip(), encryption))
+        .collect();
+    servers.sort_unstable();
+    servers.dedup_by_key(|(server, _)| *server);
+    servers
 }
 
 type Key = (SocketAddr, Encryption);
@@ -186,28 +192,26 @@ enum Status {
     Failed(Instant),
 }
 
+/// What a status decides now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Answered within `PERSISTENCE`: queries go this way.
+    Encrypted,
+    Probing,
+    /// Failed within `DAMPING`: not tried again until then.
+    Failed,
+    Expired,
+}
+
 impl Status {
-    fn state(self, now: Instant) -> (EndpointState, Option<Duration>) {
+    fn state(self, now: Instant) -> State {
         match self {
-            Status::Probing => (EndpointState::Probing, None),
-            Status::Answered(at) => {
-                let age = now.saturating_duration_since(at);
-                let state = if age < PERSISTENCE {
-                    EndpointState::Encrypted
-                } else {
-                    EndpointState::Expired
-                };
-                (state, Some(age))
+            Status::Probing => State::Probing,
+            Status::Answered(at) if now.saturating_duration_since(at) < PERSISTENCE => {
+                State::Encrypted
             }
-            Status::Failed(at) => {
-                let age = now.saturating_duration_since(at);
-                let state = if age < DAMPING {
-                    EndpointState::Failed
-                } else {
-                    EndpointState::Expired
-                };
-                (state, Some(age))
-            }
+            Status::Failed(at) if now.saturating_duration_since(at) < DAMPING => State::Failed,
+            Status::Answered(_) | Status::Failed(_) => State::Expired,
         }
     }
 }
@@ -237,7 +241,7 @@ impl Memory {
         keys.into_iter().find(|key| {
             self.status
                 .get(key)
-                .is_some_and(|status| status.state(now).0 == EndpointState::Encrypted)
+                .is_some_and(|status| status.state(now) == State::Encrypted)
         })
     }
 
@@ -248,9 +252,9 @@ impl Memory {
             return None;
         }
         for key in keys {
-            match self.status.get(&key).map(|status| status.state(now).0) {
-                Some(EndpointState::Probing) => return None,
-                Some(EndpointState::Failed) => {}
+            match self.status.get(&key).map(|status| status.state(now)) {
+                Some(State::Probing) => return None,
+                Some(State::Failed) => {}
                 _ => {
                     self.status.put(key, Status::Probing);
                     return Some(key);
@@ -273,17 +277,13 @@ impl Memory {
         }
     }
 
-    fn statuses(&self, now: Instant) -> Vec<EndpointStatus> {
-        self.status
-            .iter()
-            .map(|(&(endpoint, encryption), status)| {
-                let (state, age) = status.state(now);
-                EndpointStatus {
-                    endpoint,
-                    encryption,
-                    state,
-                    age,
-                }
+    fn candidates(&mut self, keys: [Key; 2], now: Instant) -> Vec<Key> {
+        if let Some(key) = self.route(keys, now) {
+            return vec![key];
+        }
+        keys.into_iter()
+            .filter(|key| {
+                self.status.get(key).map(|status| status.state(now)) != Some(State::Failed)
             })
             .collect()
     }
@@ -697,45 +697,49 @@ mod tests {
     }
 
     #[test]
-    fn statuses_say_what_decides_each_endpoint() {
+    fn required_encryption_tries_every_endpoint_not_known_to_fail() {
         let dot = (SocketAddr::from(([192, 0, 2, 3], 853)), Encryption::Dot);
         let doq = (dot.0, Encryption::Doq);
-        let other = (SocketAddr::from(([192, 0, 2, 4], 853)), Encryption::Dot);
+        let keys = [dot, doq];
         let mut memory = Memory::new(8);
         let start = Instant::now();
-        memory.record(dot, Outcome::Failed, start);
-        memory.record(doq, Outcome::Answered, start);
-        memory.claim_probe([other, (other.0, Encryption::Doq)], start);
 
-        let state_at = |memory: &Memory, key: Key, now| {
-            memory
-                .statuses(now)
-                .into_iter()
-                .find(|status| (status.endpoint, status.encryption) == key)
-                .map(|status| (status.state, status.age))
-        };
-        let soon = start + Duration::from_secs(5);
+        assert_eq!(memory.candidates(keys, start), [dot, doq]);
+        memory.record(dot, Outcome::Failed, start);
+        assert_eq!(memory.candidates(keys, start), [doq]);
+        memory.record(doq, Outcome::Failed, start);
+        assert_eq!(memory.candidates(keys, start), Vec::<Key>::new());
+        let later = start + DAMPING;
         assert_eq!(
-            state_at(&memory, dot, soon),
-            Some((EndpointState::Failed, Some(Duration::from_secs(5))))
+            memory.candidates(keys, later),
+            [dot, doq],
+            "failures stop counting once damping ends"
         );
+        memory.record(doq, Outcome::Answered, later);
         assert_eq!(
-            state_at(&memory, doq, soon),
-            Some((EndpointState::Encrypted, Some(Duration::from_secs(5))))
+            memory.candidates(keys, later),
+            [doq],
+            "a known route is the only one"
         );
+    }
+
+    #[test]
+    fn encrypted_servers_name_each_server_once() {
+        let server = SocketAddr::from(([192, 0, 2, 5], 853));
+        {
+            let mut memory = memory().lock().unwrap();
+            let now = Instant::now();
+            memory.record((server, Encryption::Doq), Outcome::Answered, now);
+            memory.record((server, Encryption::Dot), Outcome::Answered, now);
+        }
+        let listed: Vec<_> = encrypted_servers()
+            .into_iter()
+            .filter(|(ip, _)| *ip == server.ip())
+            .collect();
         assert_eq!(
-            state_at(&memory, other, soon),
-            Some((EndpointState::Probing, None))
-        );
-        assert_eq!(
-            state_at(&memory, dot, start + DAMPING).map(|(state, _)| state),
-            Some(EndpointState::Expired),
-            "a failure stops deciding once damping ends"
-        );
-        assert_eq!(
-            state_at(&memory, doq, start + PERSISTENCE).map(|(state, _)| state),
-            Some(EndpointState::Expired),
-            "an answer stops deciding once persistence ends"
+            listed,
+            [(server.ip(), Encryption::Dot)],
+            "queries go over DoT when both answer"
         );
     }
 

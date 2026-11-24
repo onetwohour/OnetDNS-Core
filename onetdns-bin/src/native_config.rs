@@ -1303,6 +1303,9 @@ mod tests {
             ("recurse_opportunistic_encryption", |c: &mut Config| {
                 c.recurse_opportunistic_encryption = true
             }),
+            ("recurse_require_encryption", |c: &mut Config| {
+                c.recurse_require_encryption = true
+            }),
         ] {
             assert!(
                 config_keys::is_hot(key),

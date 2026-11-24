@@ -281,7 +281,7 @@ const UNKNOWN_SERVER_PATIENCE: Duration = Duration::from_millis(400);
 const MAX_EXCHANGES_PER_QUERY: usize = 2;
 
 /// One exchange a query may make with a server. An encrypted rung comes right before the same
-/// server's plaintext rung.
+/// server's plaintext rung, or, when encryption is required, before its other encrypted rung.
 #[derive(Clone, Copy)]
 struct Rung {
     server: SocketAddr,
@@ -803,7 +803,8 @@ impl Recursor {
     }
 
     /// Asks servers known to answer over DoT or DoQ that way first, with plaintext as the
-    /// fallback. The reactor lane asks over UDP only and must stay off while this is set.
+    /// fallback unless encryption is required. The reactor lane asks over UDP only and must stay
+    /// off while this is set.
     pub fn with_opportunistic_encryption(
         mut self,
         encryption: Option<onetdns_forward::OpportunisticEncryption>,
@@ -2713,6 +2714,7 @@ impl Recursor {
     ///
     /// A server known to answer over encryption is asked that way first, and in plaintext once
     /// that fails or outlasts its patience; both count against the same deadline and in-flight cap.
+    /// When encryption is required, servers are asked only over DoT or DoQ.
     fn query_any_reserving(
         &self,
         servers: &[SocketAddr],
@@ -2822,11 +2824,10 @@ impl Recursor {
                         ask_next_at = Instant::now();
                         continue;
                     }
-                    if rung.encrypted.is_some() {
-                        // The server answered; asking it again in plaintext gets the same answer.
-                        if let Some(plain) = skipped.get_mut(idx + 1) {
-                            *plain = true;
-                        }
+                    if rung.encrypted.is_some() && rungs.get(idx + 1).is_some_and(|r| r.server == s)
+                    {
+                        // The server answered; asking it again another way gets the same answer.
+                        skipped[idx + 1] = true;
                     }
                     if response_usable_for_iteration(&r, &request, zone) {
                         match rung.encrypted {
@@ -2872,23 +2873,35 @@ impl Recursor {
         fallback.ok_or(RecurseError::NoResponse)
     }
 
-    /// Each server in order, preceded by its encrypted endpoint when one is known to answer.
+    /// Each server in order, preceded by its encrypted endpoint when one is known to answer. When
+    /// encryption is required, only the encrypted endpoints not known to fail.
     fn rungs(&self, ordered: &[SocketAddr]) -> Vec<Rung> {
         let mut rungs = Vec::with_capacity(ordered.len());
         for &server in ordered {
-            if let Some(route) = self
-                .opportunistic
-                .and_then(|encryption| encryption.route(server.ip()))
-            {
-                rungs.push(Rung {
-                    server,
-                    encrypted: Some(route),
-                });
+            match self.opportunistic {
+                Some(encryption) if encryption.is_required() => {
+                    rungs.extend(encryption.required_routes(server.ip()).into_iter().map(
+                        |route| Rung {
+                            server,
+                            encrypted: Some(route),
+                        },
+                    ));
+                }
+                encryption => {
+                    if let Some(route) =
+                        encryption.and_then(|encryption| encryption.route(server.ip()))
+                    {
+                        rungs.push(Rung {
+                            server,
+                            encrypted: Some(route),
+                        });
+                    }
+                    rungs.push(Rung {
+                        server,
+                        encrypted: None,
+                    });
+                }
             }
-            rungs.push(Rung {
-                server,
-                encrypted: None,
-            });
         }
         rungs
     }
@@ -8901,6 +8914,49 @@ mod tests {
             );
             assert_eq!(plain_asked.load(Ordering::SeqCst), plain_before + 1);
             assert_eq!(dot_asked.load(Ordering::SeqCst), dot_before + 1);
+        }
+
+        #[test]
+        fn required_encryption_asks_over_dot_from_the_first_query() {
+            let ip = Ipv4Addr::new(127, 0, 0, 153);
+            let (server, plain_asked) = plain_server(ip);
+            let (dot_port, dot_asked) = dot_server(ip, Arc::new(AtomicBool::new(false)));
+            let rec = recursor(
+                OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip)).required(),
+            );
+
+            for _ in 0..2 {
+                let response = ask(&rec, server).unwrap();
+                assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+            }
+            assert_eq!(dot_asked.load(Ordering::SeqCst), 2);
+            assert_eq!(plain_asked.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        /// A server offering neither DoT nor DoQ fails the query, and its failed DoT is not tried
+        /// again within the damping period.
+        fn required_encryption_never_falls_back_to_plaintext() {
+            let ip = Ipv4Addr::new(127, 0, 0, 154);
+            let (server, plain_asked) = plain_server(ip);
+            let listener = TcpListener::bind((ip, 0)).unwrap();
+            let dot_port = listener.local_addr().unwrap().port();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let counted = accepts.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            let rec = recursor(
+                OpportunisticEncryption::with_ports(dot_port, closed_udp_port(ip)).required(),
+            );
+
+            assert!(ask(&rec, server).is_err());
+            assert!(ask(&rec, server).is_err());
+            assert_eq!(plain_asked.load(Ordering::SeqCst), 0);
+            assert_eq!(accepts.load(Ordering::SeqCst), 1);
         }
     }
 }

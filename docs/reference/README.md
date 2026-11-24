@@ -264,6 +264,7 @@ Top-level keys are indexed alphabetically below.
 [`recurse_deny_answers`](upstreams.md#recurse_deny_answers)
 [`recurse_deny_server`](upstreams.md#recurse_deny_server)
 [`recurse_opportunistic_encryption`](upstreams.md#recurse_opportunistic_encryption)
+[`recurse_require_encryption`](upstreams.md#recurse_require_encryption)
 [`recursion_limit`](upstreams.md#recursion_limit)
 [`refused_domains`](filtering.md#refused_domains)
 [`release_check`](administration.md#release_check)
