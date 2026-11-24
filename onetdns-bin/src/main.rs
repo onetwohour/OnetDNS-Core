@@ -2293,8 +2293,8 @@ fn query(name: String, qtype: Option<String>) -> BoxResult<()> {
 }
 
 /// Runs one query through this server's query handler, so the answer passes access control,
-/// filters, cache and backends as a client of the first plain listen address would get it;
-/// explain only describes the decision. It stays in process because software that intercepts
+/// filters, cache and backends as a client of the first plain listen address would get it, or a
+/// loopback client when there is none; explain only describes the decision. It stays in process because software that intercepts
 /// port 53, such as a VPN, also catches this server's queries to itself. Returns JSON with the
 /// rcode and answers, or an error message.
 fn resolve_probe(
@@ -2325,9 +2325,8 @@ fn resolve_probe(
     );
 
     // 0.0.0.0 and :: mean every address; a local client reaches them through loopback.
-    let target = listeners
-        .first()
-        .map(|addr| match addr.ip() {
+    let target = match listeners.first() {
+        Some(addr) => match addr.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
             }
@@ -2335,8 +2334,9 @@ fn resolve_probe(
                 SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), addr.port())
             }
             _ => *addr,
-        })
-        .ok_or("There is no plain DNS listening address to query")?;
+        },
+        None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+    };
 
     let request = onetdns_proto::Message::query(
         u16::from_be_bytes(onetdns_core::ephemeral_random_array::<2>()),
@@ -3176,6 +3176,23 @@ mod tests {
             probe_field(&body, "server"),
             Some(idle.to_string()),
             "{body}"
+        );
+    }
+
+    #[test]
+    /// Encrypted-only servers have no plain listener; the query is then asked as from loopback.
+    fn resolve_probe_answers_without_a_plain_listener() {
+        let handler = probe_handler(onetdns_security::IpAcl::allow_all());
+        let body = resolve_probe(&handler, &[], r#"{"qname":"blocked.test"}"#)
+            .expect("평문 수신 주소가 없어도 답해야 합니다");
+        assert_eq!(
+            probe_field(&body, "rcode").as_deref(),
+            Some("NXDOMAIN"),
+            "{body}"
+        );
+        assert_eq!(
+            probe_field(&body, "server").as_deref(),
+            Some("127.0.0.1:53")
         );
     }
 
