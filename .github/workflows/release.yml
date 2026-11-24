@@ -360,12 +360,7 @@ jobs:
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/notes.md"
-          {
-            cat <<'EOF'
-          OnetDNS is an ad-blocking DNS resolver that ships as a single self-contained binary. It answers over plain DNS, DNS-over-TLS, DNS-over-HTTPS (HTTP/2 and HTTP/3), DNS-over-QUIC and DNSCrypt, resolves by forwarding, full recursion or a split of the two, validates and signs DNSSEC, and can also serve authoritative zones and DHCP. A web dashboard is built in.
-
-          EOF
-            cat <<'EOF'
+          sed "s/@VERSION@/$VERSION/g" > "$notes" <<'EOF'
           ## Downloads
 
           | Platform | Archive |
@@ -379,20 +374,13 @@ jobs:
           | macOS Apple silicon | `OnetDNS-@VERSION@-aarch64-apple-darwin.tar.gz` |
           | macOS Intel | `OnetDNS-@VERSION@-x86_64-apple-darwin.tar.gz` |
 
-          Linux builds are statically linked against musl and run on any distribution. Windows builds bundle the C runtime and need no Visual C++ Redistributable.
-
-          Each target also has its bare executable, named like its archive without the extension (with `.exe` on Windows). OnetDNS installations update themselves from these files after checking them against the signed `OnetDNS-release.toml`.
-
-          ## Verify your download
-
-          Every archive and executable is listed in `SHA256SUMS`:
+          Check downloads against `SHA256SUMS`:
 
           ```sh
           sha256sum -c SHA256SUMS --ignore-missing
           ```
 
           EOF
-          } | sed "s/@VERSION@/$VERSION/g" > "$notes"
           args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "OnetDNS $VERSION" --notes-file "$notes" --generate-notes)
           if [ "$PRERELEASE" = true ]; then
             args+=(--prerelease)
