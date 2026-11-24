@@ -1050,6 +1050,7 @@ version = "0.1.5-alpha.1"
 dependencies = [
  "ed25519-dalek",
  "hmac 0.12.1",
+ "ml-dsa",
  "onetdns-core",
  "onetdns-proto",
  "p256",

@@ -304,7 +304,7 @@ fn rrsig_applies_to_rrset(rrsig: &Rrsig, first: &Record) -> bool {
 }
 
 fn signature_algorithm_supported(algorithm: u8) -> bool {
-    matches!(algorithm, 8 | 10 | 13 | 14 | 15)
+    matches!(algorithm, 8 | 10 | 13 | 14 | 15 | 18)
 }
 
 /// The public-key operation for one candidate that passed the structural checks.
@@ -316,6 +316,7 @@ fn verify_rrsig_crypto(rrset: &[Record], rrsig: &Rrsig, key: &Dnskey) -> Result<
         13 => verify_ecdsa_p256(&key.public_key, &data, &rrsig.signature),
         14 => verify_ecdsa_p384(&key.public_key, &data, &rrsig.signature),
         15 => verify_ed25519(&key.public_key, &data, &rrsig.signature),
+        18 => verify_ml_dsa_44(&key.public_key, &data, &rrsig.signature),
         other => Err(DnssecError::Unsupported(other)),
     }
 }
@@ -368,6 +369,19 @@ fn verify_ed25519(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecErr
     let signature = ed25519_dalek::Signature::from_bytes(&sigb);
     vk.verify_strict(msg, &signature)
         .map_err(|_| DnssecError::BadSignature)
+}
+
+/// Pure ML-DSA with an empty context.
+fn verify_ml_dsa_44(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecError> {
+    use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature, VerifyingKey};
+    let pk = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey).map_err(|_| DnssecError::BadKey)?;
+    let sig = EncodedSignature::<MlDsa44>::try_from(sig).map_err(|_| DnssecError::BadSignature)?;
+    let sig = Signature::<MlDsa44>::decode(&sig).ok_or(DnssecError::BadSignature)?;
+    if VerifyingKey::<MlDsa44>::decode(&pk).verify_with_context(msg, &[], &sig) {
+        Ok(())
+    } else {
+        Err(DnssecError::BadSignature)
+    }
 }
 
 fn verify_ecdsa_p256(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), DnssecError> {
@@ -1106,10 +1120,10 @@ impl RootKeySentinel {
     }
 }
 
-/// Algorithms 8, 10, 13, 14 and 15, digests 2 and 4. SHA-1 is excluded for its collisions. A
-/// delegation with only unsupported DS records is Insecure, not Bogus.
+/// The algorithms `verify_rrsig` supports, with digests 2 and 4. SHA-1 is excluded for its
+/// collisions. A delegation with only unsupported DS records is Insecure, not Bogus.
 pub fn ds_is_supported(ds: &Ds) -> bool {
-    matches!(ds.algorithm, 8 | 10 | 13 | 14 | 15) && matches!(ds.digest_type, 2 | 4)
+    signature_algorithm_supported(ds.algorithm) && matches!(ds.digest_type, 2 | 4)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3039,9 +3053,61 @@ mod tests {
                 "algo {alg}는 verifier 미구현이라 미지원(→Insecure)이어야 한다"
             );
         }
-        for alg in [8u8, 10, 13, 14, 15] {
+        for alg in [8u8, 10, 13, 14, 15, 18] {
             assert!(ds_is_supported(&ds(alg)), "algo {alg}는 지원되어야 한다");
         }
+    }
+
+    #[test]
+    fn ml_dsa_44_example_from_the_draft_verifies() {
+        let mut fixture = include_str!("../../../testdata/mldsa44_dnssec_example.b64").lines();
+        let mut next = || crate::tsig::b64_decode(fixture.next().unwrap()).unwrap();
+        let (public_key, signature) = (next(), next());
+        let owner = Name::from_str("example.com.").unwrap();
+        let key = Dnskey {
+            flags: 257,
+            protocol: 3,
+            algorithm: 18,
+            public_key,
+        };
+        assert_eq!(key.key_tag(), 59829);
+        let digest = "812cb1a22af04380e2f72d91c06c14eb1a918cf30037a8a9c67497e9264b4bfa";
+        let ds = Ds {
+            key_tag: 59829,
+            algorithm: 18,
+            digest_type: 2,
+            digest: (0..digest.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&digest[i..i + 2], 16).unwrap())
+                .collect(),
+        };
+        assert_eq!(verify_ds(&ds, &key, &owner), Ok(()));
+
+        let rrset = vec![Record::new(
+            owner.clone(),
+            3600,
+            RData::Mx {
+                preference: 10,
+                exchange: Name::from_str("mail.example.com.").unwrap(),
+            },
+        )];
+        let mut rrsig = Rrsig {
+            type_covered: 15,
+            algorithm: 18,
+            labels: 2,
+            original_ttl: 3600,
+            expiration: 1440021600,
+            inception: 1438207200,
+            key_tag: 59829,
+            signer: owner,
+            signature,
+        };
+        assert_eq!(verify_rrsig(&rrset, &rrsig, &key), Ok(()));
+        rrsig.signature[100] ^= 1;
+        assert_eq!(
+            verify_rrsig(&rrset, &rrsig, &key),
+            Err(DnssecError::BadSignature)
+        );
     }
 
     #[test]

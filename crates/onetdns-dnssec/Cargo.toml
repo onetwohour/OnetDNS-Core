@@ -13,6 +13,7 @@ sha1.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
 p384.workspace = true
+ml-dsa.workspace = true
 hmac.workspace = true
 zeroize.workspace = true
 
