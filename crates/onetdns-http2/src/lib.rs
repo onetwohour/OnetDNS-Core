@@ -13,12 +13,12 @@ pub mod server;
 mod testutil;
 pub(crate) mod wire;
 
-pub use client::H2Client;
+pub use client::{H2Client, ObliviousMedia};
 pub use server::{
     serve_doh, serve_doh_h1, serve_doh_h1_with_deadline_reset, serve_doh_with_deadline_reset,
-    DohAnswer, Gateway, GatewayReply, Oblivious, ObliviousReply, MAX_ODOH_MESSAGE,
-    ODOH_CONFIGS_PATH, ODOH_MEDIA_TYPE, OHTTP_GATEWAY_PATH, OHTTP_KEYS_MEDIA_TYPE,
-    OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
+    DohAnswer, GatewayReply, Oblivious, ObliviousHttp, ObliviousReply, MAX_ODOH_MESSAGE,
+    MAX_OHTTP_RESPONSE, ODOH_CONFIGS_PATH, ODOH_MEDIA_TYPE, OHTTP_GATEWAY_PATH,
+    OHTTP_KEYS_MEDIA_TYPE, OHTTP_REQUEST_MEDIA_TYPE, OHTTP_RESPONSE_MEDIA_TYPE,
 };
 
 /// Whether a header field follows the HTTP/2 rules: a lowercase name of token characters, and a
@@ -80,6 +80,10 @@ pub enum H2Error {
 
     /// Reconnecting recovers.
     Closed,
+
+    /// The server processed nothing of the request: it was never sent, or the server refused its
+    /// stream or left it out of a GOAWAY. Sending it again on a new connection is safe.
+    Refused,
 
     /// The upstream answered with this non-200 status. Only that stream ended, so the connection
     /// stays usable.

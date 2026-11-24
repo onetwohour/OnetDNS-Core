@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use onetdns_core::{LruMap, MutexExt};
-use onetdns_http2::H2Error;
+use onetdns_http2::{H2Error, ObliviousMedia};
 use onetdns_proto::Message;
 use onetdns_tls::hpke::{
     self, HpkeError, PrivateKey, ReceiverContext, SenderContext, N_ENC, N_H, N_K, N_N, N_PK, N_T,
@@ -360,9 +360,10 @@ impl<'a> Reader<'a> {
 /// Idle target connections a relay keeps, across all targets.
 const MAX_IDLE_RELAY_CONNECTIONS: usize = 16;
 
-/// Relays ObliviousDoHMessages to targets for an ODoH proxy. Connections are shared by all clients,
-/// as RFC 9230 recommends, so a target cannot group queries by connection; a request takes one
-/// out of the pool and puts it back when the target has answered.
+/// Relays ObliviousDoHMessages to ODoH targets and Encapsulated Requests to OHTTP gateways.
+/// Connections are shared by all clients, as RFC 9230 recommends, so a target cannot group queries
+/// by connection; a request takes one out of the pool and puts it back when the target has
+/// answered.
 pub struct Relay {
     trust: Arc<TrustStore>,
     idle: Mutex<Vec<((SocketAddr, String), DohConn)>>,
@@ -371,7 +372,7 @@ pub struct Relay {
 /// What the target answered.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Relayed {
-    /// A 200 with this ObliviousDoHMessage.
+    /// A 200 with this body.
     Message(Vec<u8>),
     /// Any other final status.
     Status(u16),
@@ -425,13 +426,15 @@ impl Relay {
 
     /// POSTs `message` to the target at `https://server_name/path` on `addr`, without redirects
     /// and without any header from the client. A pooled connection that turns out dead is replaced
-    /// once.
+    /// once. An Encapsulated Request is sent again only when the gateway certainly did not see it,
+    /// since RFC 9458 forbids retrying one it may have processed.
     pub fn send(
         &self,
         addr: SocketAddr,
         server_name: &str,
         path: &str,
         message: &[u8],
+        media: ObliviousMedia,
         timeout: Duration,
     ) -> Result<Relayed, RelayError> {
         let deadline = crate::deadline_after(timeout);
@@ -456,22 +459,29 @@ impl Relay {
                 .map_err(relay_connect_error)?,
             };
             doh::arm_probe(&mut conn, deadline);
-            let result = conn
-                .client
-                .oblivious_probed(server_name, path, message, |stream| {
-                    stream.inner_mut().set_deadline(deadline)
-                });
+            let result =
+                conn.client
+                    .oblivious_probed(server_name, path, message, media, |stream| {
+                        stream.inner_mut().set_deadline(deadline)
+                    });
             let relayed = match result {
                 Ok(body) => Relayed::Message(body),
                 Err(H2Error::BadStatus(status)) => Relayed::Status(status),
-                Err(_) if reused && !retried && Instant::now() < deadline => {
+                Err(error)
+                    if reused
+                        && !retried
+                        && Instant::now() < deadline
+                        && (media == ObliviousMedia::Odoh || matches!(error, H2Error::Refused)) =>
+                {
                     retried = true;
                     continue;
                 }
                 Err(H2Error::Io) if Instant::now() >= deadline => {
                     return Err(RelayError::HttpResponseTimeout)
                 }
-                Err(H2Error::Io | H2Error::Closed) => return Err(RelayError::ConnectionTerminated),
+                Err(H2Error::Io | H2Error::Closed | H2Error::Refused) => {
+                    return Err(RelayError::ConnectionTerminated)
+                }
                 Err(H2Error::Protocol) => return Err(RelayError::HttpProtocol),
             };
             let mut idle = self.idle.lock_recover();
@@ -643,15 +653,17 @@ pub(crate) fn exchange(
         trust,
         |conn| {
             doh::arm_probe(conn, deadline);
-            let sent = conn
-                .client
-                .oblivious_probed(server_name, path, &message, |stream| {
-                    stream.inner_mut().set_deadline(deadline)
-                });
+            let sent = conn.client.oblivious_probed(
+                server_name,
+                path,
+                &message,
+                ObliviousMedia::Odoh,
+                |stream| stream.inner_mut().set_deadline(deadline),
+            );
             match sent {
                 Ok(body) => Ok(Ok(body)),
                 Err(H2Error::BadStatus(status)) => Ok(Err(status)),
-                Err(H2Error::Closed) => {
+                Err(H2Error::Closed | H2Error::Refused) => {
                     Err(ForwardError::Io("ODoH proxy closed the connection".into()))
                 }
                 Err(H2Error::Protocol) => Err(ForwardError::BadResponse),
@@ -758,7 +770,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::thread;
 
-        use onetdns_http2::{Oblivious, ObliviousReply};
+        use onetdns_http2::{GatewayReply, Oblivious, ObliviousHttp, ObliviousReply};
         use onetdns_proto::{Name, RData, Record, RecordType};
         use onetdns_tls::{
             server_handshake, signer_from_pkcs8_der, ServerConfig as TlsServerConfig, TlsStream,
@@ -806,10 +818,14 @@ mod tests {
                     .lock_recover()
                     .push((host.to_string(), path.to_string()));
                 let timeout = Duration::from_secs(5);
-                match self
-                    .relay
-                    .send(self.addr, "dns.test", path, message, timeout)
-                {
+                match self.relay.send(
+                    self.addr,
+                    "dns.test",
+                    path,
+                    message,
+                    ObliviousMedia::Odoh,
+                    timeout,
+                ) {
                     Ok(Relayed::Message(message)) => ObliviousReply::Message(message),
                     Ok(Relayed::Status(status)) => ObliviousReply::TargetStatus(status),
                     Err(error) => ObliviousReply::ProxyError {
@@ -820,7 +836,7 @@ mod tests {
             }
         }
 
-        fn serve() -> (Arc<ProxyAndTarget>, Arc<TrustStore>) {
+        fn test_tls() -> (Arc<TlsServerConfig>, Arc<TrustStore>) {
             let ck = rcgen::generate_simple_self_signed(vec!["dns.test".to_string()]).unwrap();
             let cert_der = ck.cert.der().to_vec();
             let key_der = ck.key_pair.serialize_der();
@@ -834,6 +850,11 @@ mod tests {
                 client_ca: None,
                 resumption: None,
             });
+            (tls, trust)
+        }
+
+        fn serve() -> (Arc<ProxyAndTarget>, Arc<TrustStore>) {
+            let (tls, trust) = test_tls();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let server = Arc::new(ProxyAndTarget {
                 key: Mutex::new(TargetKey::new(PrivateKey::generate())),
@@ -926,6 +947,126 @@ mod tests {
             assert_eq!(server.relayed_to.lock_recover().len(), 4);
         }
 
+        /// Answers the first request on its connection, reversed, and closes the connection on the
+        /// next without a reply or a GOAWAY, as a server that may have processed it would. Its
+        /// OHTTP side is a relay resource, the route that can close a connection.
+        struct AnswersOnce {
+            answered: AtomicBool,
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl AnswersOnce {
+            fn reply(&self, message: &[u8]) -> ObliviousReply {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                if self.answered.swap(true, Ordering::Relaxed) {
+                    ObliviousReply::Drop
+                } else {
+                    ObliviousReply::Message(message.iter().rev().copied().collect())
+                }
+            }
+        }
+
+        impl Oblivious for AnswersOnce {
+            fn configs(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn target(&self, message: &[u8]) -> ObliviousReply {
+                self.reply(message)
+            }
+
+            fn proxy(&self, _: &str, _: &str, _: &[u8]) -> ObliviousReply {
+                unreachable!("not a proxy")
+            }
+        }
+
+        impl ObliviousHttp for AnswersOnce {
+            fn keys(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn answer(&self, _: &[u8]) -> Option<GatewayReply> {
+                None
+            }
+
+            fn relays(&self, path: &[u8]) -> bool {
+                path == b"/relay"
+            }
+
+            fn relay(&self, _: &[u8], encapsulated: &[u8]) -> ObliviousReply {
+                self.reply(encapsulated)
+            }
+        }
+
+        fn serve_answering_once() -> (SocketAddr, Arc<TrustStore>, Arc<AtomicUsize>) {
+            let (tls, trust) = test_tls();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut tcp) = stream else { continue };
+                    let (tls, requests) = (tls.clone(), counted.clone());
+                    thread::spawn(move || {
+                        let Ok(conn) = server_handshake(&mut tcp, &tls) else {
+                            return;
+                        };
+                        let mut stream = TlsStream::new(conn, tcp);
+                        let upstream = AnswersOnce {
+                            answered: AtomicBool::new(false),
+                            requests,
+                        };
+                        let _ = onetdns_http2::serve_doh_with_deadline_reset(
+                            &mut stream,
+                            "/dns-query",
+                            |_, _| Err("404"),
+                            |_| {},
+                            &AtomicBool::new(false),
+                            Some(&upstream),
+                            Some(&upstream),
+                        );
+                    });
+                }
+            });
+            (addr, trust, requests)
+        }
+
+        #[test]
+        /// A pooled connection that ends without an answer may have carried the request to the
+        /// server. RFC 9458 forbids sending an Encapsulated Request again then; an ODoH message
+        /// goes again on a new connection.
+        fn only_odoh_messages_are_sent_again_after_a_pooled_connection_ends() {
+            let (addr, trust, requests) = serve_answering_once();
+            let relay = Relay::with_trust(trust);
+            let send = |path, media| {
+                relay.send(
+                    addr,
+                    "dns.test",
+                    path,
+                    b"abc",
+                    media,
+                    Duration::from_secs(5),
+                )
+            };
+            let answered = Ok(Relayed::Message(b"cba".to_vec()));
+
+            assert_eq!(send("/relay", ObliviousMedia::Ohttp), answered);
+            assert_eq!(
+                send("/relay", ObliviousMedia::Ohttp),
+                Err(RelayError::ConnectionTerminated)
+            );
+            assert_eq!(requests.load(Ordering::Relaxed), 2);
+
+            assert_eq!(send("/dns-query", ObliviousMedia::Odoh), answered);
+            assert_eq!(send("/dns-query", ObliviousMedia::Odoh), answered);
+            assert_eq!(
+                requests.load(Ordering::Relaxed),
+                5,
+                "the second ODoH message went on the pooled connection, then on a new one"
+            );
+        }
+
         #[test]
         fn proxy_request_paths_encode_the_target_as_the_uri_template_does() {
             assert_eq!(
@@ -945,7 +1086,14 @@ mod tests {
         let addr = closed.local_addr().unwrap();
         drop(closed);
         assert_eq!(
-            Relay::default().send(addr, "odoh.test", "/q", b"sealed", Duration::from_secs(10)),
+            Relay::default().send(
+                addr,
+                "odoh.test",
+                "/q",
+                b"sealed",
+                ObliviousMedia::Ohttp,
+                Duration::from_secs(10)
+            ),
             Err(RelayError::ConnectionRefused)
         );
         assert_eq!(

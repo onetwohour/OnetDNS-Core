@@ -15,6 +15,7 @@ use crate::edge::parse_hex_bytes;
 use crate::handoff::{ListeningSocket, SocketPool, SocketRole};
 use crate::odoh::{ObliviousDoh, OdohProxy, OdohTarget};
 use crate::ohttp::GatewayKey;
+use crate::ohttp::OhttpRelays;
 use crate::tls_material::{control_tls_config, native_tls_config, native_tls_material};
 use crate::{
     connection_limit, dnscrypt, doh, doh3, doq, dot, native, plain_dns_worker_counts,
@@ -155,15 +156,22 @@ fn open_oblivious(
             onetdns_forward::odoh::Relay::default(),
         )
     });
-    Ok(
-        (target.is_some() || proxy.is_some() || gateway.is_some()).then(|| {
-            Arc::new(ObliviousDoh {
-                target,
-                proxy,
-                gateway,
-            })
-        }),
-    )
+    let ohttp_relays = (!cfg.ohttp_relays.is_empty()).then(|| {
+        OhttpRelays::new(
+            &cfg.ohttp_relays,
+            runtime_cfg.clone(),
+            onetdns_forward::odoh::Relay::default(),
+        )
+    });
+    let serves = target.is_some() || proxy.is_some() || gateway.is_some() || ohttp_relays.is_some();
+    Ok(serves.then(|| {
+        Arc::new(ObliviousDoh {
+            target,
+            proxy,
+            gateway,
+            ohttp_relays,
+        })
+    }))
 }
 
 /// The DoH settings fixed when a DoH listener opens.
@@ -178,6 +186,9 @@ fn doh_listener_variant(cfg: &Config) -> String {
     if !cfg.odoh_proxy_targets.is_empty() {
         variant.push_str("|odoh-proxy=");
         variant.push_str(&cfg.odoh_proxy_targets.join(","));
+    }
+    for relay in &cfg.ohttp_relays {
+        variant.push_str(&format!("|ohttp-relay={}>{}", relay.path, relay.gateway));
     }
     variant
 }

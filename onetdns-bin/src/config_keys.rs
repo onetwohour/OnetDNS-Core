@@ -490,6 +490,7 @@ static KEYS: &[KeySpec] = &[
     key!(odoh_target, Hot(Listeners), Node, Lanes::OPEN),
     key!(odoh_proxy_targets, Hot(Listeners), Node, Lanes::OPEN),
     key!(ohttp_gateway, Hot(Listeners), Node, Lanes::OPEN),
+    key!(ohttp_relays, Hot(Listeners), Node, Lanes::OPEN),
     key!(ddr_name, Hot(Chain), Node, Lanes::OPEN),
     key!(tls_cert, Hot(Tls), Node, Lanes::OPEN),
     key!(tls_key, Hot(Tls), Node, Lanes::OPEN),

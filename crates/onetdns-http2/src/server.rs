@@ -150,14 +150,28 @@ pub const OHTTP_REQUEST_MEDIA_TYPE: &str = "message/ohttp-req";
 pub const OHTTP_RESPONSE_MEDIA_TYPE: &str = "message/ohttp-res";
 pub const OHTTP_KEYS_MEDIA_TYPE: &str = "application/ohttp-keys";
 
-/// An Oblivious HTTP gateway (RFC 9458) in front of this listener's DoH path. This crate routes the
-/// requests; the implementor decapsulates, answers and encapsulates.
-pub trait Gateway {
-    /// The `application/ohttp-keys` body served by GET at `OHTTP_GATEWAY_PATH`.
-    fn keys(&self) -> Vec<u8>;
+/// The largest Encapsulated Response a relay passes on. A DNS answer of any size fits with its
+/// Binary HTTP framing and padding.
+pub const MAX_OHTTP_RESPONSE: usize = 128 * 1024;
 
-    /// An Encapsulated Request POSTed to `OHTTP_GATEWAY_PATH`.
-    fn answer(&self, encapsulated: &[u8]) -> GatewayReply;
+/// Oblivious HTTP (RFC 9458) on this listener: a gateway in front of its DoH path, relay resources,
+/// or both. This crate routes the requests; the implementor decapsulates, answers, encapsulates
+/// and relays.
+pub trait ObliviousHttp {
+    /// The `application/ohttp-keys` body served by GET at `OHTTP_GATEWAY_PATH`; `None` when this
+    /// listener is no gateway.
+    fn keys(&self) -> Option<Vec<u8>>;
+
+    /// An Encapsulated Request POSTed to `OHTTP_GATEWAY_PATH`; `None` when this listener is no
+    /// gateway.
+    fn answer(&self, encapsulated: &[u8]) -> Option<GatewayReply>;
+
+    /// Whether `path`, without its query, is one of this listener's relay resources.
+    fn relays(&self, path: &[u8]) -> bool;
+
+    /// An Encapsulated Request POSTed to a path `relays` accepted, passed to that resource's
+    /// gateway.
+    fn relay(&self, path: &[u8], encapsulated: &[u8]) -> ObliviousReply;
 }
 
 pub enum GatewayReply {
@@ -238,10 +252,14 @@ fn route_oblivious(
             error: "http_request_error",
         },
     };
+    relayed_route(reply, HttpReply::oblivious_message, MAX_ODOH_MESSAGE)
+}
+
+/// The response for what the ODoH or OHTTP implementor decided. `message` wraps a 200 body in the
+/// protocol's media type; a body over `max` is a server problem.
+fn relayed_route(reply: ObliviousReply, message: fn(Vec<u8>) -> HttpReply, max: usize) -> Route {
     let response = match reply {
-        ObliviousReply::Message(message) if message.len() <= MAX_ODOH_MESSAGE => {
-            AppResponse::Http(HttpReply::oblivious_message(message))
-        }
+        ObliviousReply::Message(body) if body.len() <= max => AppResponse::Http(message(body)),
         ObliviousReply::Message(_) => AppResponse::Status(STATUS_BAD_GATEWAY),
         ObliviousReply::Status(status) => AppResponse::Status(status),
         ObliviousReply::Drop => return Route::Drop,
@@ -258,35 +276,50 @@ fn route_oblivious(
     Route::Respond(response)
 }
 
-/// Routes the Oblivious HTTP gateway; `None` leaves the request to the other routes. `ohttp_body` is
-/// the body of a POST whose content type is `message/ohttp-req`.
-fn route_gateway(
+/// Routes Oblivious HTTP: the gateway's key configuration and requests, and the relay resources.
+/// `Route::Doh` leaves the request to the other routes. `ohttp_body` is the body of a POST whose
+/// content type is `message/ohttp-req`.
+fn route_ohttp(
     method: &[u8],
     path: &[u8],
     ohttp_body: Option<&[u8]>,
-    gateway: Option<&dyn Gateway>,
-) -> Option<AppResponse> {
-    let at_gateway = path.split(|&b| b == b'?').next() == Some(OHTTP_GATEWAY_PATH.as_bytes());
+    ohttp: Option<&dyn ObliviousHttp>,
+) -> Route {
+    let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
+    let at_gateway = path_only == OHTTP_GATEWAY_PATH.as_bytes();
     if method == b"GET" && at_gateway {
-        return Some(match gateway {
-            Some(gateway) => AppResponse::Http(HttpReply::ohttp_keys(gateway.keys())),
+        return Route::Respond(match ohttp.and_then(|ohttp| ohttp.keys()) {
+            Some(keys) => AppResponse::Http(HttpReply::ohttp_keys(keys)),
             None => AppResponse::Status("404"),
         });
     }
-    let body = ohttp_body?;
-    let Some(gateway) = gateway else {
-        return Some(AppResponse::Status(STATUS_UNSUPPORTED_MEDIA_TYPE));
+    let Some(body) = ohttp_body else {
+        return Route::Doh;
     };
-    if !at_gateway {
-        return Some(AppResponse::Status("404"));
+    let Some(ohttp) = ohttp else {
+        return Route::Respond(AppResponse::Status(STATUS_UNSUPPORTED_MEDIA_TYPE));
+    };
+    let relays = !at_gateway && ohttp.relays(path_only);
+    if !at_gateway && !relays {
+        return Route::Respond(AppResponse::Status("404"));
     }
     if body.is_empty() {
-        return Some(AppResponse::Status(STATUS_BAD_REQUEST));
+        return Route::Respond(AppResponse::Status(STATUS_BAD_REQUEST));
     }
-    Some(match gateway.answer(body) {
-        GatewayReply::Response(response) => AppResponse::Http(HttpReply::ohttp_response(response)),
-        GatewayReply::Status(status) => AppResponse::Status(status),
-        GatewayReply::Unanswered => AppResponse::Reset,
+    if relays {
+        return relayed_route(
+            ohttp.relay(path_only, body),
+            HttpReply::ohttp_response,
+            MAX_OHTTP_RESPONSE,
+        );
+    }
+    Route::Respond(match ohttp.answer(body) {
+        None => AppResponse::Status("404"),
+        Some(GatewayReply::Response(response)) => {
+            AppResponse::Http(HttpReply::ohttp_response(response))
+        }
+        Some(GatewayReply::Status(status)) => AppResponse::Status(status),
+        Some(GatewayReply::Unanswered) => AppResponse::Reset,
     })
 }
 
@@ -425,7 +458,7 @@ where
 /// connection ends then, sends that second GOAWAY first, so the client knows which requests were
 /// not processed and can send them elsewhere.
 ///
-/// Without `oblivious` or `gateway`, Oblivious DoH or Oblivious HTTP requests get the status of any
+/// Without `oblivious` or `ohttp`, Oblivious DoH or Oblivious HTTP requests get the status of any
 /// unsupported media type.
 pub fn serve_doh_with_deadline_reset<S, H, R>(
     stream: &mut S,
@@ -434,7 +467,7 @@ pub fn serve_doh_with_deadline_reset<S, H, R>(
     mut reset_deadline: R,
     draining: &AtomicBool,
     oblivious: Option<&dyn Oblivious>,
-    gateway: Option<&dyn Gateway>,
+    ohttp: Option<&dyn ObliviousHttp>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -660,7 +693,7 @@ where
                 if h.has_flag(flags::END_HEADERS) && h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
                         let Some(response) =
-                            process_request(st, expected_path, &handler, oblivious, gateway)?
+                            process_request(st, expected_path, &handler, oblivious, ohttp)?
                         else {
                             return Ok(());
                         };
@@ -715,7 +748,7 @@ where
                     if end_stream {
                         if let Some(st) = streams.remove(&h.stream_id) {
                             let Some(response) =
-                                process_request(st, expected_path, &handler, oblivious, gateway)?
+                                process_request(st, expected_path, &handler, oblivious, ohttp)?
                             else {
                                 return Ok(());
                             };
@@ -775,7 +808,7 @@ where
                 if h.has_flag(flags::END_STREAM) {
                     if let Some(st) = streams.remove(&h.stream_id) {
                         let Some(response) =
-                            process_request(st, expected_path, &handler, oblivious, gateway)?
+                            process_request(st, expected_path, &handler, oblivious, ohttp)?
                         else {
                             return Ok(());
                         };
@@ -1030,7 +1063,7 @@ fn process_request<H>(
     expected_path: &str,
     handler: &H,
     oblivious: Option<&dyn Oblivious>,
-    gateway: Option<&dyn Gateway>,
+    ohttp: Option<&dyn ObliviousHttp>,
 ) -> Result<Option<AppResponse>, H2Error>
 where
     H: Fn(&[u8], Option<&str>) -> Result<Option<DohAnswer>, &'static str>,
@@ -1044,8 +1077,10 @@ where
     };
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(b"");
     let body_of = |kind| (media == Some(kind)).then_some(st.body.as_slice());
-    if let Some(response) = route_gateway(method, path, body_of(Media::OhttpRequest), gateway) {
-        return Ok(Some(response));
+    match route_ohttp(method, path, body_of(Media::OhttpRequest), ohttp) {
+        Route::Doh => {}
+        Route::Respond(response) => return Ok(Some(response)),
+        Route::Drop => return Ok(None),
     }
     match route_oblivious(
         method,
@@ -1206,7 +1241,7 @@ pub fn serve_doh_h1_with_deadline_reset<S, H, R>(
     handler: H,
     mut reset_deadline: R,
     oblivious: Option<&dyn Oblivious>,
-    gateway: Option<&dyn Gateway>,
+    ohttp: Option<&dyn ObliviousHttp>,
 ) -> Result<(), H2Error>
 where
     S: Read + Write,
@@ -1324,7 +1359,11 @@ where
     let path_only = target.split(|&b| b == b'?').next().unwrap_or(b"");
     let is_configs = method == b"GET" && path_only == ODOH_CONFIGS_PATH.as_bytes();
     let client_id = match_doh_path(path_only, expected_path);
-    if client_id.is_none() && !is_configs && path_only != OHTTP_GATEWAY_PATH.as_bytes() {
+    if client_id.is_none()
+        && !is_configs
+        && path_only != OHTTP_GATEWAY_PATH.as_bytes()
+        && !ohttp.is_some_and(|ohttp| ohttp.relays(path_only))
+    {
         return write_h1_status(stream, "404 Not Found");
     }
 
@@ -1370,8 +1409,10 @@ where
             .as_deref()
             .filter(|_| method == b"POST" && content_type == Some(kind))
     };
-    if let Some(response) = route_gateway(method, target, body_of(Media::OhttpRequest), gateway) {
-        return write_h1_app_response(stream, response);
+    match route_ohttp(method, target, body_of(Media::OhttpRequest), ohttp) {
+        Route::Doh => {}
+        Route::Respond(response) => return write_h1_app_response(stream, response),
+        Route::Drop => return Ok(()),
     }
     match route_oblivious(
         method,
@@ -1522,6 +1563,7 @@ mod tests {
     use super::*;
     use crate::testutil::{deadline_accept, deadline_connect};
     use crate::wire::header;
+    use crate::ObliviousMedia;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
@@ -3005,29 +3047,65 @@ mod tests {
     /// query the resolver does not answer.
     struct EchoGateway;
 
-    impl Gateway for EchoGateway {
-        fn keys(&self) -> Vec<u8> {
-            b"keys".to_vec()
+    impl ObliviousHttp for EchoGateway {
+        fn keys(&self) -> Option<Vec<u8>> {
+            Some(b"keys".to_vec())
         }
 
-        fn answer(&self, encapsulated: &[u8]) -> GatewayReply {
-            match encapsulated {
+        fn answer(&self, encapsulated: &[u8]) -> Option<GatewayReply> {
+            Some(match encapsulated {
                 b"unknown" => GatewayReply::Status("422"),
                 b"unanswered" => GatewayReply::Unanswered,
                 _ => GatewayReply::Response(encapsulated.iter().rev().copied().collect()),
+            })
+        }
+
+        fn relays(&self, _: &[u8]) -> bool {
+            false
+        }
+
+        fn relay(&self, _: &[u8], _: &[u8]) -> ObliviousReply {
+            unreachable!("no relay resources")
+        }
+    }
+
+    /// Relays at /relay to a gateway that reverses the request; "refused" stands for a gateway
+    /// answering 503 and "denied" for a client the relay does not admit.
+    struct EchoRelay;
+
+    impl ObliviousHttp for EchoRelay {
+        fn keys(&self) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn answer(&self, _: &[u8]) -> Option<GatewayReply> {
+            None
+        }
+
+        fn relays(&self, path: &[u8]) -> bool {
+            path == b"/relay"
+        }
+
+        fn relay(&self, path: &[u8], encapsulated: &[u8]) -> ObliviousReply {
+            assert_eq!(path, b"/relay");
+            match encapsulated {
+                b"refused" => ObliviousReply::TargetStatus(503),
+                b"denied" => ObliviousReply::ProxyError {
+                    status: "403",
+                    error: "http_request_denied",
+                },
+                _ => ObliviousReply::Message(encapsulated.iter().rev().copied().collect()),
             }
         }
     }
+
+    type EchoOhttp = Option<&'static (dyn ObliviousHttp + Sync)>;
 
     fn h1_oblivious(raw: Vec<u8>, oblivious: Option<EchoTarget>) -> String {
         h1_serve(raw, oblivious, None)
     }
 
-    fn h1_serve(
-        raw: Vec<u8>,
-        oblivious: Option<EchoTarget>,
-        gateway: Option<EchoGateway>,
-    ) -> String {
+    fn h1_serve(raw: Vec<u8>, oblivious: Option<EchoTarget>, ohttp: EchoOhttp) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -3038,7 +3116,7 @@ mod tests {
                 |q, _| answer(q.to_vec()),
                 |_| {},
                 oblivious.as_ref().map(|target| target as &dyn Oblivious),
-                gateway.as_ref().map(|gateway| gateway as &dyn Gateway),
+                ohttp.map(|ohttp| ohttp as &dyn ObliviousHttp),
             )
             .ok();
         });
@@ -3047,19 +3125,14 @@ mod tests {
         response
     }
 
-    fn h1_gateway_post(
-        path: &str,
-        content_type: &str,
-        body: &[u8],
-        gateway: Option<EchoGateway>,
-    ) -> String {
+    fn h1_gateway_post(path: &str, content_type: &str, body: &[u8], ohttp: EchoOhttp) -> String {
         let mut raw = format!(
             "POST {path} HTTP/1.1\r\nHost: dns.test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
             body.len()
         )
         .into_bytes();
         raw.extend_from_slice(body);
-        h1_serve(raw, None, gateway)
+        h1_serve(raw, None, ohttp)
     }
 
     #[test]
@@ -3069,7 +3142,7 @@ mod tests {
                 OHTTP_GATEWAY_PATH,
                 OHTTP_REQUEST_MEDIA_TYPE,
                 body,
-                Some(EchoGateway),
+                Some(&EchoGateway),
             )
         };
         let response = post(b"abc");
@@ -3089,7 +3162,7 @@ mod tests {
 
         let get = format!("GET {OHTTP_GATEWAY_PATH} HTTP/1.1\r\nHost: dns.test\r\nAccept: application/ohttp-keys\r\n\r\n")
             .into_bytes();
-        let keys = h1_serve(get.clone(), None, Some(EchoGateway));
+        let keys = h1_serve(get.clone(), None, Some(&EchoGateway));
         assert!(keys.starts_with("HTTP/1.1 200 OK\r\n"), "{keys}");
         assert!(keys.contains("\r\ncontent-type: application/ohttp-keys\r\n"));
         assert!(keys.ends_with("\r\n\r\nkeys"), "{keys}");
@@ -3104,22 +3177,47 @@ mod tests {
             "/dns-query",
             OHTTP_REQUEST_MEDIA_TYPE,
             b"abc",
-            Some(EchoGateway),
+            Some(&EchoGateway),
         );
         assert!(at_doh_path.starts_with("HTTP/1.1 404 "), "{at_doh_path}");
         let no_gateway =
             h1_gateway_post(OHTTP_GATEWAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, b"abc", None);
         assert!(no_gateway.starts_with("HTTP/1.1 415 "), "{no_gateway}");
         let wrong_type =
-            h1_gateway_post(OHTTP_GATEWAY_PATH, "text/plain", b"abc", Some(EchoGateway));
+            h1_gateway_post(OHTTP_GATEWAY_PATH, "text/plain", b"abc", Some(&EchoGateway));
         assert!(wrong_type.starts_with("HTTP/1.1 415 "), "{wrong_type}");
         let dns_query = h1_gateway_post(
             OHTTP_GATEWAY_PATH,
             "application/dns-message",
             b"dns",
-            Some(EchoGateway),
+            Some(&EchoGateway),
         );
         assert!(dns_query.starts_with("HTTP/1.1 404 "), "{dns_query}");
+    }
+
+    #[test]
+    fn h1_relays_encapsulated_requests_at_relay_paths() {
+        let post = |path, content_type, body: &[u8]| {
+            h1_gateway_post(path, content_type, body, Some(&EchoRelay))
+        };
+        let relayed = post("/relay", OHTTP_REQUEST_MEDIA_TYPE, b"abc");
+        assert!(relayed.starts_with("HTTP/1.1 200 OK\r\n"), "{relayed}");
+        assert!(relayed.contains("\r\ncontent-type: message/ohttp-res\r\n"));
+        assert!(relayed.ends_with("\r\n\r\ncba"), "{relayed}");
+
+        let refused = post("/relay", OHTTP_REQUEST_MEDIA_TYPE, b"refused");
+        assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+        assert!(refused.contains("\r\nproxy-status: OnetDNS; received-status=503\r\n"));
+        let denied = post("/relay", OHTTP_REQUEST_MEDIA_TYPE, b"denied");
+        assert!(denied.starts_with("HTTP/1.1 403 "), "{denied}");
+        assert!(denied.contains("\r\nproxy-status: OnetDNS; error=http_request_denied\r\n"));
+
+        let elsewhere = post("/other", OHTTP_REQUEST_MEDIA_TYPE, b"abc");
+        assert!(elsewhere.starts_with("HTTP/1.1 404 "), "{elsewhere}");
+        let dns = post("/relay", "application/dns-message", b"dns");
+        assert!(dns.starts_with("HTTP/1.1 404 "), "{dns}");
+        let at_gateway = post(OHTTP_GATEWAY_PATH, OHTTP_REQUEST_MEDIA_TYPE, b"abc");
+        assert!(at_gateway.starts_with("HTTP/1.1 404 "), "{at_gateway}");
     }
 
     fn h1_oblivious_post(path: &str, body: &[u8], oblivious: Option<EchoTarget>) -> String {
@@ -3367,6 +3465,66 @@ mod tests {
     }
 
     #[test]
+    fn h2_relays_encapsulated_requests_beside_doh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut s = deadline_accept(&listener);
+            serve_doh_with_deadline_reset(
+                &mut s,
+                "/dns-query",
+                |q, _| answer(q.to_vec()),
+                |_| {},
+                &AtomicBool::new(false),
+                None,
+                Some(&EchoRelay),
+            )
+            .ok();
+        });
+        let mut client = h2_connect(addr);
+        let post = |path, content_type| {
+            [
+                (":method", "POST"),
+                (":scheme", "https"),
+                (":authority", "dns.test"),
+                (":path", path),
+                ("content-type", content_type),
+            ]
+        };
+        let relayed = post("/relay", OHTTP_REQUEST_MEDIA_TYPE);
+        let (headers, body) = h2_request_on(&mut client, 1, &relayed, b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"200"[..]));
+        assert_eq!(
+            header(&headers, b"content-type"),
+            Some(OHTTP_RESPONSE_MEDIA_TYPE.as_bytes())
+        );
+        assert_eq!(body, b"cba");
+
+        let (headers, body) = h2_request_on(&mut client, 3, &relayed, b"refused");
+        assert_eq!(header(&headers, b":status"), Some(&b"503"[..]));
+        assert_eq!(
+            header(&headers, b"proxy-status"),
+            Some(&b"OnetDNS; received-status=503"[..])
+        );
+        assert!(body.is_empty());
+        let elsewhere = post("/other", OHTTP_REQUEST_MEDIA_TYPE);
+        let (headers, _) = h2_request_on(&mut client, 5, &elsewhere, b"abc");
+        assert_eq!(header(&headers, b":status"), Some(&b"404"[..]));
+        let keys = [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "dns.test"),
+            (":path", OHTTP_GATEWAY_PATH),
+        ];
+        let (headers, _) = h2_request_on(&mut client, 7, &keys, b"");
+        assert_eq!(header(&headers, b":status"), Some(&b"404"[..]));
+
+        assert_eq!(h2_exchange_on(&mut client, 9, b"dns"), b"dns");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn h2_serves_the_gateway_beside_doh() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3453,7 +3611,8 @@ mod tests {
     }
 
     #[test]
-    /// The client half of ODoH: configs by GET, messages by POST, and a stale key as status 401.
+    /// The client half of ODoH and OHTTP: configs by GET, messages by POST in each protocol's media
+    /// type, and a stale key as status 401.
     fn h2_client_fetches_configs_and_sends_oblivious_messages() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3467,7 +3626,7 @@ mod tests {
                 |_| {},
                 &AtomicBool::new(false),
                 Some(&target),
-                None,
+                Some(&EchoGateway),
             )
             .ok();
         });
@@ -3475,13 +3634,47 @@ mod tests {
         assert_eq!(client.odoh_configs("dns.test").unwrap(), b"configs");
         assert_eq!(
             client
-                .oblivious_probed("dns.test", "/dns-query", b"abc", |_| {})
+                .oblivious_probed(
+                    "dns.test",
+                    "/dns-query",
+                    b"abc",
+                    ObliviousMedia::Odoh,
+                    |_| {}
+                )
                 .unwrap(),
             b"cba"
         );
         assert!(matches!(
-            client.oblivious_probed("dns.test", "/dns-query", b"unknown", |_| {}),
+            client.oblivious_probed(
+                "dns.test",
+                "/dns-query",
+                b"unknown",
+                ObliviousMedia::Odoh,
+                |_| {}
+            ),
             Err(H2Error::BadStatus(401))
+        ));
+        assert_eq!(
+            client
+                .oblivious_probed(
+                    "dns.test",
+                    OHTTP_GATEWAY_PATH,
+                    b"abc",
+                    ObliviousMedia::Ohttp,
+                    |_| {}
+                )
+                .unwrap(),
+            b"cba"
+        );
+        assert!(matches!(
+            client.oblivious_probed(
+                "dns.test",
+                OHTTP_GATEWAY_PATH,
+                b"unknown",
+                ObliviousMedia::Ohttp,
+                |_| {}
+            ),
+            Err(H2Error::BadStatus(422))
         ));
         assert_eq!(
             client.query("dns.test", "/dns-query", b"dns").unwrap(),

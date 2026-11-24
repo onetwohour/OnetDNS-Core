@@ -214,7 +214,7 @@ fn roundtrip(
         Err(H2Error::BadStatus(_)) => {
             return Ok(Err(ForwardError::Io("DoH non-200 status".into())))
         }
-        Err(H2Error::Closed) => {
+        Err(H2Error::Closed | H2Error::Refused) => {
             return Err(ForwardError::Io("DoH server closed the connection".into()))
         }
         Err(H2Error::Protocol) => return Err(ForwardError::BadResponse),

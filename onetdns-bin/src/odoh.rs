@@ -1,6 +1,7 @@
 //! Oblivious DoH on the DoH listener. As a target it opens queries a proxy relays, resolves them as
 //! DoH queries from the proxy, and seals the answers. As a proxy it relays sealed messages to the
-//! targets the config allows, and to no others.
+//! targets the config allows, and to no others; the OHTTP relay sends through the same
+//! `Forwarder`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -9,11 +10,11 @@ use std::time::{Duration, Instant};
 use onetdns_config::Config;
 use onetdns_core::{ArcSwap, MutexExt};
 use onetdns_forward::odoh::{OdohError, Relay, RelayError, Relayed, TargetKey};
-use onetdns_http2::{DohAnswer, Oblivious, ObliviousReply};
+use onetdns_http2::{DohAnswer, Oblivious, ObliviousMedia, ObliviousReply};
 use onetdns_tls::hpke::PrivateKey;
 
 use crate::native::RelayAdmission;
-use crate::ohttp::GatewayKey;
+use crate::ohttp::{GatewayKey, OhttpRelays};
 use crate::transport_observe;
 use crate::upstream::{parse_upstream_url, split_authority, BOOTSTRAP_TIMEOUT};
 
@@ -30,6 +31,7 @@ pub(crate) struct ObliviousDoh {
     pub(crate) target: Option<Arc<OdohTarget>>,
     pub(crate) proxy: Option<OdohProxy>,
     pub(crate) gateway: Option<GatewayKey>,
+    pub(crate) ohttp_relays: Option<OhttpRelays>,
 }
 
 pub(crate) struct OdohTarget {
@@ -49,15 +51,46 @@ impl OdohTarget {
     }
 }
 
-/// The targets an ODoH proxy relays to. Connections to them are shared by every client.
+/// The targets an ODoH proxy relays to.
 pub(crate) struct OdohProxy {
-    targets: Vec<ProxyTarget>,
-    /// The running config. Its `bootstrap` changes without reopening the DoH listener.
-    runtime_cfg: Arc<ArcSwap<Config>>,
-    relay: Relay,
+    targets: Vec<Destination>,
+    forwarder: Forwarder,
 }
 
-struct ProxyTarget {
+impl OdohProxy {
+    /// `targets` are URLs config validation accepted. Hostnames are looked up through the running
+    /// config's `bootstrap` on first use.
+    pub(crate) fn new(targets: &[String], runtime_cfg: Arc<ArcSwap<Config>>, relay: Relay) -> Self {
+        Self {
+            targets: targets
+                .iter()
+                .filter_map(|url| Destination::new(url))
+                .collect(),
+            forwarder: Forwarder { runtime_cfg, relay },
+        }
+    }
+
+    fn relay(&self, target_host: &str, target_path: &str, message: &[u8]) -> ObliviousReply {
+        match self.find(target_host, target_path) {
+            Some(target) => self.forwarder.send(target, message, ObliviousMedia::Odoh),
+            None => denied(),
+        }
+    }
+
+    /// `targethost` may carry the port; 443 may be left out.
+    fn find(&self, target_host: &str, target_path: &str) -> Option<&Destination> {
+        let (host, port) = split_authority(target_host)?;
+        let port = port.unwrap_or(443);
+        self.targets.iter().find(|target| {
+            target.port == port
+                && target.host.eq_ignore_ascii_case(host)
+                && target.path == target_path
+        })
+    }
+}
+
+/// An ODoH target or OHTTP gateway the config lists.
+pub(crate) struct Destination {
     /// Lowercase; an IPv6 address without brackets.
     host: String,
     port: u16,
@@ -67,41 +100,45 @@ struct ProxyTarget {
     addr: Mutex<Option<(SocketAddr, Option<Instant>)>>,
 }
 
-impl OdohProxy {
-    /// `targets` are URLs config validation accepted. Hostnames are looked up through the running
-    /// config's `bootstrap` on first use.
-    pub(crate) fn new(targets: &[String], runtime_cfg: Arc<ArcSwap<Config>>, relay: Relay) -> Self {
-        let targets = targets
-            .iter()
-            .filter_map(|url| {
-                let parsed = parse_upstream_url(url)?;
-                let port = parsed.port.unwrap_or(443);
-                let fixed = parsed
-                    .host
-                    .parse::<IpAddr>()
-                    .ok()
-                    .map(|ip| (SocketAddr::new(ip, port), None));
-                Some(ProxyTarget {
-                    host: parsed.host.to_ascii_lowercase(),
-                    port,
-                    path: parsed.path.clone()?,
-                    server_name: parsed.server_name(),
-                    addr: Mutex::new(fixed),
-                })
-            })
-            .collect();
-        Self {
-            targets,
-            runtime_cfg,
-            relay,
-        }
+impl Destination {
+    /// `url` is one config validation accepted.
+    pub(crate) fn new(url: &str) -> Option<Self> {
+        let parsed = parse_upstream_url(url)?;
+        let port = parsed.port.unwrap_or(443);
+        let fixed = parsed
+            .host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| (SocketAddr::new(ip, port), None));
+        Some(Self {
+            host: parsed.host.to_ascii_lowercase(),
+            port,
+            path: parsed.path.clone()?,
+            server_name: parsed.server_name(),
+            addr: Mutex::new(fixed),
+        })
     }
+}
 
-    fn relay(&self, target_host: &str, target_path: &str, message: &[u8]) -> ObliviousReply {
-        let Some(target) = self.find(target_host, target_path) else {
-            return denied();
+/// Sends what an ODoH proxy or OHTTP relay passes on. Connections are shared by every client.
+pub(crate) struct Forwarder {
+    /// The running config. Its `bootstrap` changes without reopening the DoH listener.
+    pub(crate) runtime_cfg: Arc<ArcSwap<Config>>,
+    pub(crate) relay: Relay,
+}
+
+impl Forwarder {
+    pub(crate) fn send(
+        &self,
+        to: &Destination,
+        message: &[u8],
+        media: ObliviousMedia,
+    ) -> ObliviousReply {
+        let protocol = match media {
+            ObliviousMedia::Odoh => "odoh",
+            ObliviousMedia::Ohttp => "ohttp",
         };
-        let Some(addr) = self.address(target) else {
+        let Some(addr) = self.address(to, protocol) else {
             return ObliviousReply::ProxyError {
                 status: "502",
                 error: "dns_error",
@@ -109,15 +146,16 @@ impl OdohProxy {
         };
         match self.relay.send(
             addr,
-            &target.server_name,
-            &target.path,
+            &to.server_name,
+            &to.path,
             message,
+            media,
             RELAY_TIMEOUT,
         ) {
             Ok(Relayed::Message(message)) => ObliviousReply::Message(message),
             Ok(Relayed::Status(status)) => ObliviousReply::TargetStatus(status),
             Err(error) => {
-                transport_observe::record_error("odoh", "relay", Some(addr), error);
+                transport_observe::record_error(protocol, "relay", Some(addr), error);
                 let status = match error {
                     RelayError::ConnectionTimeout | RelayError::HttpResponseTimeout => "504",
                     _ => "502",
@@ -130,47 +168,49 @@ impl OdohProxy {
         }
     }
 
-    /// `targethost` may carry the port; 443 may be left out.
-    fn find(&self, target_host: &str, target_path: &str) -> Option<&ProxyTarget> {
-        let (host, port) = split_authority(target_host)?;
-        let port = port.unwrap_or(443);
-        self.targets.iter().find(|target| {
-            target.port == port
-                && target.host.eq_ignore_ascii_case(host)
-                && target.path == target_path
-        })
-    }
-
-    fn address(&self, target: &ProxyTarget) -> Option<SocketAddr> {
-        let cached = *target.addr.lock_recover();
+    fn address(&self, to: &Destination, protocol: &'static str) -> Option<SocketAddr> {
+        let cached = *to.addr.lock_recover();
         if let Some((addr, expires)) = cached {
             if expires.is_none_or(|at| Instant::now() < at) {
                 return Some(addr);
             }
         }
         let resolved = onetdns_forward::resolve_via_bootstrap(
-            &target.host,
+            &to.host,
             &self.runtime_cfg.load().bootstrap,
             BOOTSTRAP_TIMEOUT,
         )
         .map(|(ip, ttl)| {
             let lifetime = Duration::from_secs(ttl.into()).max(MIN_TARGET_ADDR_LIFETIME);
-            (SocketAddr::new(ip, target.port), lifetime)
+            (SocketAddr::new(ip, to.port), lifetime)
         });
         let (addr, lifetime) = match (resolved, cached) {
             (Some(fresh), _) => fresh,
             (None, stale) => {
                 transport_observe::record_error(
-                    "odoh",
+                    protocol,
                     "target_lookup",
                     None,
-                    format_args!("{} through the bootstrap servers", target.host),
+                    format_args!("{} through the bootstrap servers", to.host),
                 );
                 (stale?.0, MIN_TARGET_ADDR_LIFETIME)
             }
         };
-        *target.addr.lock_recover() = Some((addr, Instant::now().checked_add(lifetime)));
+        *to.addr.lock_recover() = Some((addr, Instant::now().checked_add(lifetime)));
         Some(addr)
+    }
+}
+
+/// What a relay answers once the ACL and rate limit decided; `relay` passes the request on.
+pub(crate) fn admitted(
+    admission: RelayAdmission,
+    relay: impl FnOnce() -> ObliviousReply,
+) -> ObliviousReply {
+    match admission {
+        RelayAdmission::Allow => relay(),
+        RelayAdmission::Drop => ObliviousReply::Drop,
+        RelayAdmission::Deny => denied(),
+        RelayAdmission::Throttle => ObliviousReply::Status("429"),
     }
 }
 
@@ -244,12 +284,9 @@ where
         let Some(proxy) = &self.service.proxy else {
             return denied();
         };
-        match (self.admit_relay)() {
-            RelayAdmission::Allow => proxy.relay(target_host, target_path, message),
-            RelayAdmission::Drop => ObliviousReply::Drop,
-            RelayAdmission::Deny => denied(),
-            RelayAdmission::Throttle => ObliviousReply::Status("429"),
-        }
+        admitted((self.admit_relay)(), || {
+            proxy.relay(target_host, target_path, message)
+        })
     }
 }
 
@@ -355,11 +392,11 @@ mod tests {
         let proxy = proxy(&["https://192.0.2.1:8443/q", "https://odoh.example/q"]);
         let literal = proxy.find("192.0.2.1:8443", "/q").unwrap();
         assert_eq!(
-            proxy.address(literal),
+            proxy.forwarder.address(literal, "odoh"),
             Some("192.0.2.1:8443".parse().unwrap())
         );
         let named = proxy.find("odoh.example", "/q").unwrap();
-        assert_eq!(proxy.address(named), None);
+        assert_eq!(proxy.forwarder.address(named, "odoh"), None);
         assert!(matches!(
             proxy.relay("odoh.example", "/q", b"sealed"),
             ObliviousReply::ProxyError {
@@ -375,6 +412,7 @@ mod tests {
             target: None,
             proxy: Some(proxy(&["https://odoh.example/q"])),
             gateway: None,
+            ohttp_relays: None,
         };
         let conn = |admission: RelayAdmission| ObliviousConn {
             service: &service,

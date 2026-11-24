@@ -19,7 +19,7 @@ use crate::connection_limit::{
 };
 use crate::native::NativeServer;
 use crate::odoh::{ObliviousConn, ObliviousDoh};
-use crate::ohttp::GatewayConn;
+use crate::ohttp::OhttpConn;
 use crate::transport_observe;
 
 const DOH_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -213,33 +213,36 @@ fn serve_conn(
             .map(doh_answer)
             .transpose()
     };
-    let gateway = oblivious
-        .and_then(|service| service.gateway.as_ref())
-        .map(|key| GatewayConn {
-            key,
+    let admit_relay = || {
+        handler.admit_relay(&RequestCtx {
+            src,
+            transport: RtTransport::DoH,
+            raw: None,
+            client_id: connection_identity.clone(),
+            authenticated: tls_authenticated,
+            auth_identity: tls_auth_identity.clone(),
+        })
+    };
+    let ohttp = oblivious
+        .filter(|service| service.gateway.is_some() || service.ohttp_relays.is_some())
+        .map(|service| OhttpConn {
+            gateway: service.gateway.as_ref(),
+            relays: service.ohttp_relays.as_ref(),
             peer: src,
             doh_path: path,
             resolve: relayed,
+            admit_relay,
         });
-    let gateway = gateway
+    let ohttp = ohttp
         .as_ref()
-        .map(|conn| conn as &dyn onetdns_http2::Gateway);
+        .map(|conn| conn as &dyn onetdns_http2::ObliviousHttp);
     let oblivious = oblivious
         .filter(|service| service.target.is_some() || service.proxy.is_some())
         .map(|service| ObliviousConn {
             service,
             peer: src,
             resolve: relayed,
-            admit_relay: || {
-                handler.admit_relay(&RequestCtx {
-                    src,
-                    transport: RtTransport::DoH,
-                    raw: None,
-                    client_id: connection_identity.clone(),
-                    authenticated: tls_authenticated,
-                    auth_identity: tls_auth_identity.clone(),
-                })
-            },
+            admit_relay,
         });
     let oblivious = oblivious
         .as_ref()
@@ -257,7 +260,7 @@ fn serve_conn(
             },
             &signals.drain,
             oblivious,
-            gateway,
+            ohttp,
         )
         .map_err(|_| "http2_connection"),
 
@@ -271,7 +274,7 @@ fn serve_conn(
                     .set_deadline(Instant::now() + DOH_IO_TIMEOUT)
             },
             oblivious,
-            gateway,
+            ohttp,
         )
         .map_err(|_| "http1_connection"),
     }
@@ -590,6 +593,7 @@ mod tests {
             ))),
             proxy: None,
             gateway: None,
+            ohttp_relays: None,
         })
     }
 
@@ -719,6 +723,7 @@ mod tests {
                 target: None,
                 proxy: None,
                 gateway: Some(GatewayKey::new(PrivateKey::generate())),
+                ohttp_relays: None,
             })),
             Arc::new(ConnectionLimiter::default()),
             Arc::new(AtomicBool::new(false)),
@@ -872,6 +877,7 @@ mod tests {
                         Relay::with_trust(trust.clone()),
                     )),
                     gateway: None,
+                    ohttp_relays: None,
                 })),
                 Arc::new(ConnectionLimiter::default()),
                 Arc::new(AtomicBool::new(false)),
@@ -972,6 +978,142 @@ mod tests {
             true,
         )));
         let (head, _, _) = send(denying.addr(), &relayed_path, &config);
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "the ACL applies to relays: {head}"
+        );
+    }
+
+    #[test]
+    /// The client reaches the gateway only through a relay resource, which passes the request to
+    /// its gateway and the gateway's answer back unchanged.
+    fn ohttp_relay_passes_requests_to_its_gateway() {
+        use crate::ohttp::tests::Client;
+        use crate::ohttp::{GatewayKey, OhttpRelays};
+        use onetdns_forward::odoh::Relay;
+        use onetdns_http2::bhttp::{Control, Message as Bhttp};
+        use onetdns_tls::hpke::PrivateKey;
+
+        let (tls, trust) = self_signed_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let tls = Arc::new(onetdns_core::ArcSwap::new(tls));
+        let key = GatewayKey::new(PrivateKey::generate());
+        let keys = key.keys().to_vec();
+        let gateway = serve_doh(
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            tls.clone(),
+            native_handler(),
+            "/dns-query".to_string(),
+            Some(Arc::new(ObliviousDoh {
+                target: None,
+                proxy: None,
+                gateway: Some(key),
+                ohttp_relays: None,
+            })),
+            Arc::new(ConnectionLimiter::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let resources = [onetdns_config::OhttpRelay {
+            path: "/relay".to_string(),
+            gateway: format!(
+                "https://{}{}#dns.test",
+                gateway.addr(),
+                onetdns_http2::OHTTP_GATEWAY_PATH
+            ),
+        }];
+        let serve_relay = |acl: Arc<dyn onetdns_core::AccessControl>| {
+            serve_doh(
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+                tls.clone(),
+                native_handler_with(acl),
+                "/dns-query".to_string(),
+                Some(Arc::new(ObliviousDoh {
+                    target: None,
+                    proxy: None,
+                    gateway: None,
+                    ohttp_relays: Some(OhttpRelays::new(
+                        &resources,
+                        Arc::new(onetdns_core::ArcSwap::from_pointee(
+                            onetdns_config::Config::default(),
+                        )),
+                        Relay::with_trust(trust.clone()),
+                    )),
+                })),
+                Arc::new(ConnectionLimiter::default()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+        };
+        let relay = serve_relay(Arc::new(IpAcl::allow_all()));
+
+        let query = Message::query(
+            0x7171,
+            ApName::from_str("allowed.test").unwrap(),
+            RecordType::A,
+        );
+        let request = Bhttp {
+            control: Control::Request {
+                method: b"POST".to_vec(),
+                scheme: b"https".to_vec(),
+                authority: b"dns.test".to_vec(),
+                path: b"/dns-query".to_vec(),
+            },
+            fields: vec![(
+                b"content-type".to_vec(),
+                b"application/dns-message".to_vec(),
+            )],
+            content: query.try_encode().unwrap(),
+        }
+        .encode();
+        let send = |relay: SocketAddr, path: &str, keys: &[u8]| {
+            let (encapsulated, client) = Client::encapsulate(keys, &request);
+            let (head, body) = https_post_path_h1(
+                relay,
+                trust.clone(),
+                path,
+                onetdns_http2::OHTTP_REQUEST_MEDIA_TYPE,
+                &encapsulated,
+            );
+            (head, body, client)
+        };
+
+        // Twice, so the second rides the pooled gateway connection.
+        for _ in 0..2 {
+            let (head, body, client) = send(relay.addr(), "/relay", &keys);
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.contains("content-type: message/ohttp-res"), "{head}");
+            let response = Bhttp::decode(&client.open(&body)).unwrap();
+            assert_eq!(response.control, Control::Response(200));
+            let answer = Message::parse(&response.content).unwrap();
+            assert_eq!(answer.header.id, 0x7171);
+            assert!(matches!(
+                answer.answers[0].rdata,
+                ApRData::A(ip) if ip == std::net::Ipv4Addr::new(9, 9, 9, 9)
+            ));
+        }
+
+        let (head, _, _) = send(relay.addr(), "/other", &keys);
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        let (head, _, _) = send(relay.addr(), onetdns_http2::OHTTP_GATEWAY_PATH, &keys);
+        assert!(
+            head.starts_with("HTTP/1.1 404"),
+            "a relay alone is no gateway: {head}"
+        );
+
+        let stale = GatewayKey::new(PrivateKey::generate());
+        let (head, _, _) = send(relay.addr(), "/relay", stale.keys());
+        assert!(head.starts_with("HTTP/1.1 422"), "{head}");
+        assert!(
+            head.contains("proxy-status: OnetDNS; received-status=422"),
+            "{head}"
+        );
+
+        let denying = serve_relay(Arc::new(IpAcl::new(
+            vec![],
+            vec!["127.0.0.0/8".parse().unwrap()],
+            true,
+        )));
+        let (head, _, _) = send(denying.addr(), "/relay", &keys);
         assert!(
             head.starts_with("HTTP/1.1 403"),
             "the ACL applies to relays: {head}"

@@ -16,7 +16,7 @@ pub use settings::{
     dns_endpoint_conflicts, known_keys, parse_odoh_upstream_path, parse_update_rtype,
     redact_url_credentials, AclUnlisted, BackendKind, BlockResponseKind, ClientConfig, Config,
     ConfigError, CookieMode, DynamicRecord, EcsMode, LocalAnswer, LocalZone, LocalZoneKind,
-    NotifyTarget, OdohUpstreamPath, PolicyRule, Rewrite, ScheduleWindow, SecondaryZone,
+    NotifyTarget, OdohUpstreamPath, OhttpRelay, PolicyRule, Rewrite, ScheduleWindow, SecondaryZone,
     SplitTarget, StubZone, TsigKeyConfig, UpdatePolicyRule, UpstreamStrategy, UserConfig,
     ViewConfig, WasmPluginConfig, ZoneConfig,
 };

@@ -1,14 +1,21 @@
-//! The Oblivious HTTP gateway (RFC 9458) on the DoH listener. It decapsulates the Binary HTTP
-//! requests a relay forwards, answers those for the DoH path as DoH queries from the relay, and
-//! encapsulates the responses.
+//! Oblivious HTTP (RFC 9458) on the DoH listener. The gateway decapsulates the Binary HTTP requests
+//! a relay forwards, answers those for the DoH path as DoH queries from the relay, and encapsulates
+//! the responses. The relay resources pass clients' requests to the gateway each one names.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use onetdns_http2::{bhttp, DohAnswer, Gateway, GatewayReply};
+use onetdns_config::Config;
+use onetdns_core::ArcSwap;
+use onetdns_forward::odoh::Relay;
+use onetdns_http2::{
+    bhttp, DohAnswer, GatewayReply, ObliviousHttp, ObliviousMedia, ObliviousReply,
+};
 use onetdns_tls::hpke::{self, HpkeError, PrivateKey, ReceiverContext, N_ENC, N_K, N_N, N_PK, N_T};
 use zeroize::Zeroizing;
 
-use crate::odoh::refused_unless_query;
+use crate::native::RelayAdmission;
+use crate::odoh::{admitted, refused_unless_query, Destination, Forwarder};
 use crate::transport_observe;
 
 const REQUEST_LABEL: &[u8] = b"message/bhttp request";
@@ -153,25 +160,58 @@ impl OpenedRequest {
     }
 }
 
-/// The gateway on one DoH connection, whose peer is a relay. `resolve` answers a DNS query as the
-/// listener answers DoH from that peer.
-pub(crate) struct GatewayConn<'a, R> {
-    pub(crate) key: &'a GatewayKey,
+/// The relay resources of a DoH listener, each passing requests to its one gateway.
+pub(crate) struct OhttpRelays {
+    resources: Vec<(String, Destination)>,
+    forwarder: Forwarder,
+}
+
+impl OhttpRelays {
+    /// `resources` are ones config validation accepted. Gateway hostnames are looked up through
+    /// the running config's `bootstrap` on first use.
+    pub(crate) fn new(
+        resources: &[onetdns_config::OhttpRelay],
+        runtime_cfg: Arc<ArcSwap<Config>>,
+        relay: Relay,
+    ) -> Self {
+        let resources = resources
+            .iter()
+            .filter_map(|resource| {
+                Some((resource.path.clone(), Destination::new(&resource.gateway)?))
+            })
+            .collect();
+        Self {
+            resources,
+            forwarder: Forwarder { runtime_cfg, relay },
+        }
+    }
+
+    fn gateway(&self, path: &[u8]) -> Option<&Destination> {
+        self.resources
+            .iter()
+            .find(|(resource, _)| resource.as_bytes() == path)
+            .map(|(_, gateway)| gateway)
+    }
+}
+
+/// Oblivious HTTP on one DoH connection: the gateway, whose peer is a relay, and the relay
+/// resources, whose peer is a client. `resolve` answers a DNS query as the listener answers DoH
+/// from that peer; `admit_relay` is the ACL and rate limit check for relaying.
+pub(crate) struct OhttpConn<'a, R, A> {
+    pub(crate) gateway: Option<&'a GatewayKey>,
+    pub(crate) relays: Option<&'a OhttpRelays>,
     pub(crate) peer: SocketAddr,
     pub(crate) doh_path: &'a str,
     pub(crate) resolve: R,
+    pub(crate) admit_relay: A,
 }
 
-impl<R> Gateway for GatewayConn<'_, R>
+impl<R, A> OhttpConn<'_, R, A>
 where
     R: Fn(&[u8]) -> Result<Option<DohAnswer>, &'static str>,
 {
-    fn keys(&self) -> Vec<u8> {
-        self.key.keys().to_vec()
-    }
-
-    fn answer(&self, encapsulated: &[u8]) -> GatewayReply {
-        let opened = match self.key.open_request(encapsulated) {
+    fn answer_with(&self, key: &GatewayKey, encapsulated: &[u8]) -> GatewayReply {
+        let opened = match key.open_request(encapsulated) {
             Ok(opened) => opened,
             Err(error) => {
                 transport_observe::record_error("ohttp", "open_request", Some(self.peer), error);
@@ -204,6 +244,37 @@ where
                 GatewayReply::Status("502")
             }
         }
+    }
+}
+
+impl<R, A> ObliviousHttp for OhttpConn<'_, R, A>
+where
+    R: Fn(&[u8]) -> Result<Option<DohAnswer>, &'static str>,
+    A: Fn() -> RelayAdmission,
+{
+    fn keys(&self) -> Option<Vec<u8>> {
+        self.gateway.map(|key| key.keys().to_vec())
+    }
+
+    fn answer(&self, encapsulated: &[u8]) -> Option<GatewayReply> {
+        self.gateway.map(|key| self.answer_with(key, encapsulated))
+    }
+
+    fn relays(&self, path: &[u8]) -> bool {
+        self.relays
+            .is_some_and(|relays| relays.gateway(path).is_some())
+    }
+
+    fn relay(&self, path: &[u8], encapsulated: &[u8]) -> ObliviousReply {
+        let Some((forwarder, gateway)) = self
+            .relays
+            .and_then(|relays| Some((&relays.forwarder, relays.gateway(path)?)))
+        else {
+            return ObliviousReply::Status("404");
+        };
+        admitted((self.admit_relay)(), || {
+            forwarder.send(gateway, encapsulated, ObliviousMedia::Ohttp)
+        })
     }
 }
 
@@ -342,17 +413,19 @@ pub(crate) mod tests {
             .encode()
         };
         let answer = |dns: &onetdns_proto::Message, status: Option<&'static str>| {
-            let conn = GatewayConn {
-                key: &key,
+            let conn = OhttpConn {
+                gateway: Some(&key),
+                relays: None,
                 peer: "192.0.2.9:4000".parse().unwrap(),
                 doh_path: "/dns-query",
                 resolve: move |_: &[u8]| match status {
                     Some(status) => Err(status),
                     None => Ok(None),
                 },
+                admit_relay: || RelayAdmission::Allow,
             };
             let (encapsulated, client) = Client::encapsulate(key.keys(), &request(dns));
-            match conn.answer(&encapsulated) {
+            match conn.answer_with(&key, &encapsulated) {
                 GatewayReply::Response(sealed) => {
                     Some(Bhttp::decode(&client.open(&sealed)).unwrap())
                 }

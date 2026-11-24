@@ -312,6 +312,15 @@ pub struct DynamicRecord {
     pub probe_port: u16,
 }
 
+/// An Oblivious HTTP relay resource (RFC 9458): requests POSTed to `path` on the DoH listeners go
+/// to `gateway` and nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OhttpRelay {
+    pub path: String,
+    /// `https://host[:port]/path[#sni]`.
+    pub gateway: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StubZone {
     pub suffix: String,
@@ -598,6 +607,9 @@ pub struct Config {
     /// Runs an Oblivious HTTP gateway (RFC 9458) for DoH on the DoH listeners, at
     /// /.well-known/ohttp-gateway (RFC 9540). Queries count as coming from the relay.
     pub ohttp_gateway: bool,
+
+    /// Oblivious HTTP relay resources on the DoH listeners; empty turns the relay off.
+    pub ohttp_relays: Vec<OhttpRelay>,
 
     /// Authentication name advertised by DDR (RFC 9462); empty disables DDR. With a name,
     /// `_dns.resolver.arpa` SVCB queries list the encrypted listeners so clients upgrade from Do53
@@ -1051,6 +1063,7 @@ impl Default for Config {
             odoh_target: false,
             odoh_proxy_targets: vec![],
             ohttp_gateway: false,
+            ohttp_relays: vec![],
             ddr_name: String::new(),
             tls_cert: None,
             tls_key: None,
@@ -1462,6 +1475,43 @@ impl Config {
                 "ohttp_gateway needs a DoH listener in listen_doh; the Oblivious HTTP gateway runs there"
                     .into(),
             );
+        }
+        if !self.ohttp_relays.is_empty() && self.listen_doh.is_empty() {
+            return invalid(
+                "ohttp_relays needs a DoH listener in listen_doh; the Oblivious HTTP relay runs there"
+                    .into(),
+            );
+        }
+        let doh_prefix = self.doh_path.trim_end_matches('/');
+        for (index, relay) in self.ohttp_relays.iter().enumerate() {
+            let path = relay.path.as_str();
+            // Paths the DoH listener already answers: DoH with or without a client ID, and the
+            // gateway and ODoH key configurations.
+            let taken = path == self.doh_path
+                || path
+                    .strip_prefix(doh_prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+                || matches!(
+                    path,
+                    "/.well-known/ohttp-gateway" | "/.well-known/odohconfigs"
+                );
+            if !valid_doh_path(path) || taken {
+                return invalid(format!(
+                    "ohttp_relays[{index}].path needs a path starting with / that the DoH listener does not already serve: {path:?}"
+                ));
+            }
+            if self.ohttp_relays[..index]
+                .iter()
+                .any(|earlier| earlier.path == path)
+            {
+                return invalid(format!("ohttp_relays lists the path {path:?} twice"));
+            }
+            if !valid_odoh_proxy_target(&relay.gateway) {
+                return invalid(format!(
+                    "ohttp_relays[{index}].gateway needs https://host[:port]/path[#sni] with the gateway's path: {:?}",
+                    relay.gateway
+                ));
+            }
         }
         for (index, target) in self.odoh_proxy_targets.iter().enumerate() {
             if !valid_odoh_proxy_target(target) {
@@ -3119,6 +3169,7 @@ impl Config {
         kv("odoh_target", self.odoh_target.to_string());
         kv("odoh_proxy_targets", sarr(&self.odoh_proxy_targets));
         kv("ohttp_gateway", self.ohttp_gateway.to_string());
+        kv("ohttp_relays", self.ohttp_relays.len().to_string());
         kv("ddr_name", js(&self.ddr_name));
         kv("tls_cert", opt_p(&self.tls_cert));
         kv("tls_key", opt_p(&self.tls_key));
@@ -3870,6 +3921,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "clients",
         "dynamic_records",
         "local_zones",
+        "ohttp_relays",
         "policy",
         "rewrites",
         "secondary",
@@ -4113,6 +4165,7 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 "action", "clients", "suffixes", "qtypes", "rewrite", "days", "start", "end",
             ],
         ),
+        ("ohttp_relays", &["path", "gateway"]),
         ("rewrites", &["domain", "answer"]),
         (
             "secondary",
@@ -4310,6 +4363,11 @@ fn validate_nested_config(root: &Value) -> Result<(), ConfigError> {
                 "local_zones[{index}].records needs at least one answer value"
             )));
         }
+    }
+
+    for (index, table) in garr(root, "ohttp_relays").iter().enumerate() {
+        required_nested_str(table, "ohttp_relays", index, "path")?;
+        required_nested_str(table, "ohttp_relays", index, "gateway")?;
     }
 
     for (index, table) in garr(root, "stub_zones").iter().enumerate() {
@@ -5535,6 +5593,7 @@ const KNOWN_KEYS: &[&str] = &[
     "odoh_target",
     "odoh_proxy_targets",
     "ohttp_gateway",
+    "ohttp_relays",
     "ddr_name",
     "tls_cert",
     "tls_key",
@@ -5909,6 +5968,13 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.odoh_target = gbool(root, "odoh_target", d.odoh_target);
     c.odoh_proxy_targets = gstrvec(root, "odoh_proxy_targets");
     c.ohttp_gateway = gbool(root, "ohttp_gateway", d.ohttp_gateway);
+    c.ohttp_relays = garr(root, "ohttp_relays")
+        .iter()
+        .map(|t| OhttpRelay {
+            path: gstr(t, "path").unwrap_or_default(),
+            gateway: gstr(t, "gateway").unwrap_or_default(),
+        })
+        .collect();
     c.ddr_name = gstr(root, "ddr_name").unwrap_or(d.ddr_name);
     c.tls_cert = gstr(root, "tls_cert").map(PathBuf::from);
     c.tls_key = gstr(root, "tls_key").map(PathBuf::from);
@@ -6525,6 +6591,15 @@ mod tests {
             "doh_path = \"/a b\"\n",
             "odoh_target = true\n",
             "ohttp_gateway = true\n",
+            "[[ohttp_relays]]\npath = \"/relay\"\ngateway = \"https://gw.example/.well-known/ohttp-gateway\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/dns-query\"\ngateway = \"https://gw.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/dns-query/client\"\ngateway = \"https://gw.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/.well-known/ohttp-gateway\"\ngateway = \"https://gw.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"relay\"\ngateway = \"https://gw.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/relay\"\ngateway = \"https://gw.example\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/relay\"\ngateway = \"http://gw.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/relay\"\ngateway = \"https://gw.example/g\"\n[[ohttp_relays]]\npath = \"/relay\"\ngateway = \"https://other.example/g\"\n",
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/relay\"\n",
             "odoh_proxy_targets = [\"https://odoh.example/dns-query\"]\n",
             "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example\"]\n",
             "listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"tls://odoh.example/q\"]\n",
@@ -6550,6 +6625,15 @@ mod tests {
             .expect("an ODoH target with a DoH listener");
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nohttp_gateway = true\n")
             .expect("an OHTTP gateway with a DoH listener");
+        let relays = Config::from_toml_str(
+            "listen_doh = [\"127.0.0.1:8443\"]\n[[ohttp_relays]]\npath = \"/relay/a\"\ngateway = \"https://gw.example/.well-known/ohttp-gateway\"\n[[ohttp_relays]]\npath = \"/dns-queryx\"\ngateway = \"https://[2001:db8::1]:8443/g#gw.example\"\n",
+        )
+        .expect("OHTTP relays with a DoH listener");
+        assert_eq!(relays.ohttp_relays[0].path, "/relay/a");
+        assert_eq!(
+            relays.ohttp_relays[1].gateway,
+            "https://[2001:db8::1]:8443/g#gw.example"
+        );
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/dns-query\", \"https://[2001:db8::1]:8443/q#odoh.example\"]\n")
             .expect("ODoH proxy targets with a DoH listener");
     }
@@ -8040,6 +8124,7 @@ types = ["A", "AAAA", "CAA", "257"]
             "clients",
             "dynamic_records",
             "local_zones",
+            "ohttp_relays",
             "policy",
             "rewrites",
             "service_schedule",

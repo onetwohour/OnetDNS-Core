@@ -8,29 +8,48 @@ use crate::{valid_header_field, H2Error};
 /// The largest DNS message.
 const MAX_DNS_RESPONSE: usize = u16::MAX as usize;
 
-/// The media type a request carries, which a 200 response must carry back, and the body cap. A
-/// GET without a media type takes any.
+/// The media type a POST carries, the one a 200 response must carry back, and the body cap. A GET
+/// without a response media type takes any.
 #[derive(Clone, Copy)]
 struct Payload {
-    media_type: Option<&'static str>,
+    request_type: Option<&'static str>,
+    response_type: Option<&'static str>,
     max_body: usize,
 }
 
 const DNS: Payload = Payload {
-    media_type: Some("application/dns-message"),
+    request_type: Some("application/dns-message"),
+    response_type: Some("application/dns-message"),
     max_body: MAX_DNS_RESPONSE,
 };
 
 const OBLIVIOUS: Payload = Payload {
-    media_type: Some(crate::server::ODOH_MEDIA_TYPE),
+    request_type: Some(crate::server::ODOH_MEDIA_TYPE),
+    response_type: Some(crate::server::ODOH_MEDIA_TYPE),
     max_body: crate::server::MAX_ODOH_MESSAGE,
+};
+
+const OHTTP: Payload = Payload {
+    request_type: Some(crate::server::OHTTP_REQUEST_MEDIA_TYPE),
+    response_type: Some(crate::server::OHTTP_RESPONSE_MEDIA_TYPE),
+    max_body: crate::server::MAX_OHTTP_RESPONSE,
 };
 
 /// ObliviousDoHConfigs: a list with a 16-bit length. Targets serve it with differing media types.
 const ODOH_CONFIGS: Payload = Payload {
-    media_type: None,
+    request_type: None,
+    response_type: None,
     max_body: 2 + u16::MAX as usize,
 };
+
+/// What an opaque relayed POST carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObliviousMedia {
+    /// An ObliviousDoHMessage (RFC 9230).
+    Odoh,
+    /// An Encapsulated Request, answered by an Encapsulated Response (RFC 9458).
+    Ohttp,
+}
 
 /// Also advertised to the peer in SETTINGS.
 const MAX_RESPONSE_HEADERS: usize = 32 * 1024;
@@ -112,13 +131,13 @@ fn response_metadata(
         } else if name == b"content-type" {
             content_types += 1;
             expected_type = payload
-                .media_type
+                .response_type
                 .is_none_or(|media_type| value.eq_ignore_ascii_case(media_type.as_bytes()));
         }
     }
 
     let status = status?;
-    let typed = match payload.media_type {
+    let typed = match payload.response_type {
         Some(_) => content_types == 1 && expected_type,
         None => content_types <= 1,
     };
@@ -217,16 +236,22 @@ impl<S: Read + Write> H2Client<S> {
         self.query_inner(authority, path, Some(dns_wire), DNS, true, on_alive)
     }
 
-    /// `query_probed` for an ObliviousDoHMessage. A non-200 status comes back as
-    /// `H2Error::BadStatus` with its code, which an ODoH client acts on: 401 means a stale key.
+    /// `query_probed` for an ObliviousDoHMessage or an Encapsulated Request. A non-200 status comes
+    /// back as `H2Error::BadStatus` with its code, which an ODoH client acts on: 401 means a stale
+    /// key.
     pub fn oblivious_probed(
         &mut self,
         authority: &str,
         path: &str,
         message: &[u8],
+        media: ObliviousMedia,
         on_alive: impl FnOnce(&mut S),
     ) -> Result<Vec<u8>, H2Error> {
-        self.query_inner(authority, path, Some(message), OBLIVIOUS, true, on_alive)
+        let payload = match media {
+            ObliviousMedia::Odoh => OBLIVIOUS,
+            ObliviousMedia::Ohttp => OHTTP,
+        };
+        self.query_inner(authority, path, Some(message), payload, true, on_alive)
     }
 
     /// GETs an Oblivious DoH target's ObliviousDoHConfigs.
@@ -254,10 +279,10 @@ impl<S: Read + Write> H2Client<S> {
             (":authority", authority),
             (":path", path),
         ];
-        if let Some(media_type) = payload.media_type {
+        if let Some(media_type) = payload.response_type {
             headers.push(("accept", media_type));
         }
-        if let (Some(media_type), Some(clen)) = (payload.media_type, &clen) {
+        if let (Some(media_type), Some(clen)) = (payload.request_type, &clen) {
             headers.push(("content-type", media_type));
             headers.push(("content-length", clen));
         }
@@ -310,7 +335,7 @@ impl<S: Read + Write> H2Client<S> {
     fn allocate_stream_id(&mut self) -> Result<u32, H2Error> {
         let sid = self.next_id;
         if sid == 0 || sid > 0x7fff_ffff {
-            return Err(H2Error::Closed);
+            return Err(H2Error::Refused);
         }
         self.next_id = sid
             .checked_add(2)
@@ -457,7 +482,7 @@ impl<S: Read + Write> H2Client<S> {
                         u32::from_be_bytes(payload[..4].try_into().map_err(|_| H2Error::Protocol)?)
                             & 0x7fff_ffff;
                     if sid > last {
-                        return Err(H2Error::Closed);
+                        return Err(H2Error::Refused);
                     }
                 }
                 frame_type::RST_STREAM => {
@@ -465,7 +490,11 @@ impl<S: Read + Write> H2Client<S> {
                         return Err(H2Error::Protocol);
                     }
                     if h.stream_id == sid {
-                        return Err(H2Error::Protocol);
+                        return Err(if payload[..] == error_code::REFUSED_STREAM.to_be_bytes() {
+                            H2Error::Refused
+                        } else {
+                            H2Error::Protocol
+                        });
                     }
                 }
                 frame_type::WINDOW_UPDATE => {
@@ -633,6 +662,27 @@ mod tests {
             response_metadata(&message, DNS).is_none(),
             "a DoH query must not take an ODoH message for an answer"
         );
+
+        let encapsulated = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"message/ohttp-res"),
+        ]);
+        assert_eq!(response_metadata(&encapsulated, OHTTP), Some((200, None)));
+        let request_typed = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"message/ohttp-req"),
+        ]);
+        assert!(
+            response_metadata(&request_typed, OHTTP).is_none(),
+            "a relay must not pass on a request as a response"
+        );
+        let too_long = (crate::server::MAX_OHTTP_RESPONSE + 1).to_string();
+        let too_long = owned_headers(&[
+            (b":status", b"200"),
+            (b"content-type", b"message/ohttp-res"),
+            (b"content-length", too_long.as_bytes()),
+        ]);
+        assert!(response_metadata(&too_long, OHTTP).is_none());
     }
 
     #[test]
@@ -1193,7 +1243,7 @@ mod tests {
         let written = client.stream_mut().to_server.len();
         assert!(matches!(
             client.query("dns.test", "/dns-query", b"query"),
-            Err(H2Error::Closed)
+            Err(H2Error::Refused)
         ));
         assert_eq!(
             client.stream_mut().to_server.len(),
@@ -1205,7 +1255,7 @@ mod tests {
         let mut client = scripted_client(&[(frame_type::GOAWAY, 0, 0, &earlier)]);
         assert!(matches!(
             client.query("dns.test", "/dns-query", b"query"),
-            Err(H2Error::Closed)
+            Err(H2Error::Refused)
         ));
     }
 
@@ -1214,7 +1264,7 @@ mod tests {
         let mut client = H2Client::connect(std::io::Cursor::new(Vec::new())).unwrap();
         client.next_id = 0x7fff_ffff;
         assert!(matches!(client.allocate_stream_id(), Ok(0x7fff_ffff)));
-        assert!(matches!(client.allocate_stream_id(), Err(H2Error::Closed)));
+        assert!(matches!(client.allocate_stream_id(), Err(H2Error::Refused)));
     }
 
     #[test]
