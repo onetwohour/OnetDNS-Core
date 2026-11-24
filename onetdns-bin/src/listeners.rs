@@ -1818,8 +1818,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// The gateway key has its own file: RFC 9458 forbids an OHTTP key that another HPKE protocol
-    /// also accepts.
+    /// The gateway key has its own file, so replacing it leaves the ODoH target key alone.
     fn ohttp_gateway_key_survives_reload_and_is_never_replaced() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

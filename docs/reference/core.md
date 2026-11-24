@@ -266,6 +266,20 @@ Makes the `listen_doh` listeners an Oblivious DoH proxy for these targets, each 
 
 The proxy cannot read what it relays. The relayed messages are not in the query log; the ACL and rate limits still apply to the client that sends them. Each target sees every relayed query as coming from this server. A target given by hostname is looked up through `bootstrap` when first used and again when its TTL runs out. See [Oblivious DoH](../encrypted-dns.md#oblivious-doh).
 
+### `ohttp_gateway`
+
+**Type:** boolean  
+**Default:** `false`
+
+**TOML:**
+
+```toml
+listen_doh = ["0.0.0.0:443"]
+ohttp_gateway = true
+```
+
+Runs an Oblivious HTTP gateway (RFC 9458) for DoH on the `listen_doh` listeners: the key configuration by GET at `/.well-known/ohttp-gateway`, and encrypted DoH requests for `doh_path` POSTed to the same path. Requires `listen_doh`; DoH3 does not serve it. The key is created on first use as `ohttp-gateway.key` next to the configuration file and kept across restarts. Requests arrive from the relay's address, so client policy, ACLs, rate limits and the query log all see the relay, not the client behind it. With `ddr_name` set, DDR announces the gateway with the `ohttp` parameter. See [Oblivious HTTP](../encrypted-dns.md#oblivious-http).
+
 ### `proxy_protocol_ports`
 
 **Type:** array  
