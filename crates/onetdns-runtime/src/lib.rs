@@ -303,7 +303,7 @@ pub struct ServerConfig {
     pub pin_cores: bool,
 
     /// How often workers check for shutdown and reload: responsiveness against idle wake-ups.
-    /// Windows UDP workers do not wake on it; see `udp_read_timeout`.
+    /// Windows UDP workers do not wake on it; see `onetdns_core::udp::shared_read_timeout`.
     pub poll_interval: Duration,
 
     /// Only meaningful on Unix.
@@ -464,7 +464,7 @@ impl Server {
             *udp_addr = Some(socks[0].local_addr()?);
             let batch_size = udp::worker_batch_size(socks.len());
             for (i, sock) in socks.into_iter().enumerate() {
-                sock.set_read_timeout(udp_read_timeout(cfg.poll_interval))?;
+                sock.set_read_timeout(onetdns_core::udp::shared_read_timeout(cfg.poll_interval))?;
                 let h = handler.clone();
                 let sd = stop.shutdown.clone();
                 let pin = cfg.pin_cores;
@@ -556,17 +556,6 @@ impl Server {
     }
 }
 
-/// On Windows a datagram that arrives just as a receive times out is lost, and with dozens of
-/// workers sharing a socket and timing out periodically, queries occasionally vanish. So Windows
-/// waits without a timeout and `Workers::stop_reading` sends wake-up datagrams when the server stops.
-fn udp_read_timeout(poll: Duration) -> Option<Duration> {
-    if cfg!(windows) {
-        None
-    } else {
-        Some(poll)
-    }
-}
-
 fn report_panicked(workers: usize) {
     if workers > 0 {
         onetdns_core::error!(event = "server.worker_panicked", workers, "A query worker thread exited outside a request boundary; running with that many fewer threads meanwhile");
@@ -588,7 +577,7 @@ impl Workers {
     fn stop_reading(&mut self, stop: &tcp::ConnectionStop, udp_addr: Option<SocketAddr>) -> usize {
         stop.shutdown.store(true, Ordering::SeqCst);
         self.draining_since.get_or_insert_with(Instant::now);
-        if udp_read_timeout(Duration::ZERO).is_none() {
+        if onetdns_core::udp::shared_read_timeout(Duration::ZERO).is_none() {
             if let Some(addr) = udp_addr {
                 wake_udp_workers(&self.udp, addr);
             }
@@ -614,39 +603,15 @@ fn joined_with_panic(workers: impl Iterator<Item = JoinHandle<()>>) -> usize {
     workers.map(JoinHandle::join).filter(Result::is_err).count()
 }
 
-/// Sends a one-byte datagram, which cannot be a query, to the worker sockets until every thread has
-/// ended; each worker that receives one sees the shutdown flag and exits. A worker busy with a slow
-/// query gets its wake-up after finishing it.
 fn wake_udp_workers(handles: &[JoinHandle<()>], addr: SocketAddr) {
-    let target = if addr.ip().is_unspecified() {
-        match addr {
-            SocketAddr::V4(v4) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, v4.port())),
-            SocketAddr::V6(v6) => SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port())),
-        }
-    } else {
-        addr
-    };
-    let local: SocketAddr = if target.is_ipv4() {
-        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-    } else {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    };
-    let Ok(sender) = onetdns_core::udp::bind(local) else {
-        onetdns_core::error!(event = "server.udp_wake_failed", %addr, "Could not open the socket used to wake UDP workers; shutdown waits until each worker receives its next query");
-        return;
-    };
-    loop {
-        let running = handles
+    let running = || {
+        handles
             .iter()
             .filter(|handle| !handle.is_finished())
-            .count();
-        if running == 0 {
-            return;
-        }
-        for _ in 0..running {
-            let _ = sender.send_to(&[0], target);
-        }
-        std::thread::sleep(Duration::from_millis(20));
+            .count()
+    };
+    if onetdns_core::udp::wake_readers(addr, running).is_err() {
+        onetdns_core::error!(event = "server.udp_wake_failed", %addr, "Could not open the socket used to wake UDP workers; shutdown waits until each worker receives its next query");
     }
 }
 

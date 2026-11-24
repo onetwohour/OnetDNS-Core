@@ -33,6 +33,48 @@ pub(crate) fn open(addr: SocketAddr, dual_stack: bool) -> io::Result<UdpSocket> 
     }
 }
 
+/// The receive timeout for a socket several threads read. A Windows receive that ends on its
+/// timeout drops the datagram arriving at that moment, and with many threads timing out
+/// periodically, queries occasionally vanish. So on Windows those threads wait without a timeout and
+/// are woken with `wake_readers` when they must stop.
+pub fn shared_read_timeout(poll: Duration) -> Option<Duration> {
+    if cfg!(windows) {
+        None
+    } else {
+        Some(poll)
+    }
+}
+
+/// Sends one-byte datagrams, which no listener answers, to the socket bound to `addr` until
+/// `running` reports no reader left. Each reader checks its stop flag before handling what it
+/// received; one busy with a slow request gets its wake-up after finishing it.
+pub fn wake_readers(addr: SocketAddr, running: impl Fn() -> usize) -> io::Result<()> {
+    let target = if addr.ip().is_unspecified() {
+        match addr {
+            SocketAddr::V4(v4) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, v4.port())),
+            SocketAddr::V6(v6) => SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port())),
+        }
+    } else {
+        addr
+    };
+    let local: SocketAddr = if target.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let sender = bind(local)?;
+    loop {
+        let running = running();
+        if running == 0 {
+            return Ok(());
+        }
+        for _ in 0..running {
+            let _ = sender.send_to(&[0], target);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Waits at most `timeout` for one datagram.
 ///
 /// A Windows receive that ends on the socket timeout drops the datagram arriving at that moment,
