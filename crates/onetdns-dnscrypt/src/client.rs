@@ -175,11 +175,11 @@ mod tests {
             "다른 제공자 키"
         );
         assert!(
-            Certificate::verify(&cert, &pk, now() + 3_601).is_none(),
+            Certificate::verify(&cert, &pk, parsed.ts_end + 1).is_none(),
             "만료"
         );
         assert!(
-            Certificate::verify(&cert, &pk, now() - 1).is_none(),
+            Certificate::verify(&cert, &pk, parsed.ts_start - 1).is_none(),
             "시작 전"
         );
 

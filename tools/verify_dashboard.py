@@ -798,9 +798,9 @@ def main() -> None:
     if unknown_homes:
         fail(f"DEDICATED_HOME points at screens that do not exist: {unknown_homes}")
     # 전용 편집기를 붙이거나 떼면 여기가 걸린다. 검색이 조용히 반쪽이 되는 것을 막는 고의적 핀이다.
-    if len(dedicated_home) != 52:
+    if len(dedicated_home) != 53:
         fail(
-            f"DEDICATED_HOME has {len(dedicated_home)} keys, pinned at 52; "
+            f"DEDICATED_HOME has {len(dedicated_home)} keys, pinned at 53; "
             "update the map and this pin together"
         )
 
