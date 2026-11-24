@@ -93,8 +93,9 @@ pub struct CertificateRequestMsg {
 /// Signature schemes the TLS 1.3 CertificateRequest offers; the client's CertificateVerify must
 /// pick one. RSA PKCS#1 is listed for certificate signatures only: RFC 8446 forbids it in
 /// CertificateVerify.
-pub(crate) const REQUESTED_SIGNATURE_SCHEMES: [u16; 5] = [
+pub(crate) const REQUESTED_SIGNATURE_SCHEMES: [u16; 6] = [
     consts::ED25519,
+    consts::MLDSA44,
     consts::ECDSA_SECP256R1_SHA256,
     consts::ECDSA_SECP384R1_SHA384,
     consts::RSA_PSS_RSAE_SHA256,
@@ -226,6 +227,7 @@ pub fn verify_signature(
 ) -> Result<(), TlsError> {
     match scheme {
         consts::ED25519 => verify_ed25519(public_key, content, signature),
+        consts::MLDSA44 => verify_ml_dsa_44(public_key, content, signature),
         consts::ECDSA_SECP256R1_SHA256 => verify_ecdsa_p256(public_key, content, signature),
         consts::ECDSA_SECP384R1_SHA384 => verify_ecdsa_p384(public_key, content, signature),
         consts::RSA_PSS_RSAE_SHA256 => verify_rsa_pss_sha256(public_key, content, signature),
@@ -244,6 +246,19 @@ fn verify_ed25519(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError>
     let sig: [u8; 64] = sig.try_into().map_err(|_| TlsError::BadSignature)?;
     vk.verify_strict(content, &ed25519_dalek::Signature::from_bytes(&sig))
         .map_err(|_| TlsError::BadSignature)
+}
+
+/// Pure ML-DSA with an empty context, as both X.509 (RFC 9881) and TLS use it.
+fn verify_ml_dsa_44(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {
+    use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature, VerifyingKey};
+    let pk = EncodedVerifyingKey::<MlDsa44>::try_from(pk).map_err(|_| TlsError::BadCert)?;
+    let sig = EncodedSignature::<MlDsa44>::try_from(sig).map_err(|_| TlsError::BadSignature)?;
+    let sig = Signature::<MlDsa44>::decode(&sig).ok_or(TlsError::BadSignature)?;
+    if VerifyingKey::<MlDsa44>::decode(&pk).verify_with_context(content, &[], &sig) {
+        Ok(())
+    } else {
+        Err(TlsError::BadSignature)
+    }
 }
 
 fn verify_ecdsa_p256(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {

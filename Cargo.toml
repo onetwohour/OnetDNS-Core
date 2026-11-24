@@ -70,6 +70,8 @@ aes-gcm = "0.10"
 p256 = { version = "0.14", features = ["ecdsa", "ecdh", "pem"] }
 p384 = { version = "0.14", features = ["ecdsa"] }
 zeroize = "1"
+ml-kem = { version = "0.3", default-features = false, features = ["hazmat", "zeroize"] }
+ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"] }
 libc = "0.2"
 
 # 클러스터는 프레임마다 Ed25519 서명을 검증한다. 이 크레이트를 최적화하지 않으면 debug 빌드의

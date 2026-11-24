@@ -18,8 +18,10 @@ pub mod consts {
     pub const X25519: u16 = 0x001d;
     pub const SECP256R1: u16 = 0x0017;
     pub const SECP384R1: u16 = 0x0018;
+    pub const X25519MLKEM768: u16 = 0x11ec;
 
     pub const ED25519: u16 = 0x0807;
+    pub const MLDSA44: u16 = 0x0904;
     pub const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
     pub const ECDSA_SECP384R1_SHA384: u16 = 0x0503;
     pub const RSA_PSS_RSAE_SHA256: u16 = 0x0804;
@@ -842,20 +844,20 @@ impl ServerHello {
         }
     }
 
-    /// `sent` is the group this side sent a key share for in its last hello, if any.
+    /// `sent` is the groups this side sent a key share for in its last hello.
     /// MissingExtension when there is no key share: this stack never offers resumption without one,
     /// so the server must send it. IllegalParameter when the server picked a group this side sent
     /// no key share for.
-    pub(crate) fn key_share(&self, sent: Option<u16>) -> Result<Vec<u8>, TlsError> {
+    pub(crate) fn key_share(&self, sent: &[u16]) -> Result<(u16, Vec<u8>), TlsError> {
         let (group, key) = self
             .ext(EXT_KEY_SHARE)
             .ok_or(TlsError::MissingExtension)?
             .as_key_share_server()
             .ok_or(TlsError::Decode)?;
-        if Some(group) != sent {
+        if !sent.contains(&group) {
             return Err(TlsError::IllegalParameter);
         }
-        Ok(key)
+        Ok((group, key))
     }
 
     pub fn parse(body: &[u8]) -> Result<ServerHello, TlsError> {
@@ -1228,13 +1230,16 @@ mod tests {
             random: [0; 32],
             ..retry(vec![Extension::key_share_server(SECP256R1, &[4; 65])])
         };
-        assert_eq!(answer.key_share(Some(SECP256R1)), Ok(vec![4; 65]));
         assert_eq!(
-            answer.key_share(Some(X25519)),
+            answer.key_share(&[X25519, SECP256R1]),
+            Ok((SECP256R1, vec![4; 65]))
+        );
+        assert_eq!(
+            answer.key_share(&[X25519]),
             Err(TlsError::IllegalParameter),
             "키 조각을 보내지 않은 곡선으로 답하면 안 된다"
         );
-        assert_eq!(answer.key_share(None), Err(TlsError::IllegalParameter));
+        assert_eq!(answer.key_share(&[]), Err(TlsError::IllegalParameter));
     }
 
     #[test]

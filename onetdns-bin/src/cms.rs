@@ -16,8 +16,7 @@ const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 
 /// Signs `content` with the key of `chain[0]` and carries the whole chain. `sign` returns a DER
-/// signature under the TLS signature `scheme`; only ECDSA P-256 with SHA-256, the one key type the
-/// TLS listeners load, is accepted.
+/// signature under the TLS signature `scheme`; only ECDSA P-256 with SHA-256 is accepted.
 pub(crate) fn signed_data(
     content: &[u8],
     chain: &[Vec<u8>],

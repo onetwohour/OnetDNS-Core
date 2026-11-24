@@ -351,7 +351,7 @@ PEM certificate presented by DoT, DoH, DoQ, and DoH3 listeners.
 tls_key = "/etc/OnetDNS/privkey.pem"
 ```
 
-PEM private key matching the configured TLS certificate.
+PEM private key matching the configured TLS certificate, in PKCS#8: ECDSA P-256, or ML-DSA-44 (RFC 9881) with its seed. An ML-DSA-44 certificate serves only TLS 1.3 clients, and an Apple configuration profile is then left unsigned.
 
 ### `tls_self_signed_host`
 

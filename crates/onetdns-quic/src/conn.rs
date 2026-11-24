@@ -3089,15 +3089,19 @@ impl Connection {
         // Short header, Initial, packet bytes.
         let mut packets: Vec<(bool, bool, Vec<u8>)> = Vec::new();
 
-        // Packet numbers continue after a Retry, so the connection's first Initial and the first
-        // one after a Retry are told apart by whether they carry the ClientHello from the start,
-        // not by number.
-        let pad = if self.role == Role::Client && self.spaces[INITIAL].send_crypto_offset == 0 {
-            MIN_INITIAL_DATAGRAM
-        } else {
-            0
-        };
-        if let Some(p) = self.build_long_packet(INITIAL, pad, &mut probe) {
+        // A hello with a post-quantum key share does not fit one packet, so Initial packets are
+        // built until the data runs out. Packet numbers continue after a Retry, so the
+        // connection's first Initial and the first one after a Retry are told apart by whether
+        // they carry the ClientHello from the start, not by number.
+        loop {
+            let pad = if self.role == Role::Client && self.spaces[INITIAL].send_crypto_offset == 0 {
+                MIN_INITIAL_DATAGRAM
+            } else {
+                0
+            };
+            let Some(p) = self.build_long_packet(INITIAL, pad, &mut probe) else {
+                break;
+            };
             packets.push((false, true, p));
         }
 
@@ -4345,6 +4349,23 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_longer_than_a_packet_goes_out_at_once() {
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"ORIGDCID".to_vec(),
+            b"CLNTSCID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let flight: Vec<Vec<u8>> = std::iter::from_fn(|| client.next_datagram()).collect();
+        assert!(flight.len() >= 2, "데이터그램 {}개", flight.len());
+        assert!(flight
+            .iter()
+            .all(|dg| (MIN_INITIAL_DATAGRAM..=MAX_DATAGRAM).contains(&dg.len())));
+        assert!(client.spaces[INITIAL].out_crypto.is_empty());
+    }
+
+    #[test]
     fn retry_path_handshake_completes_like_doq_listener() {
         use crate::retry::{build_retry, parse_initial_header, RetryKey};
 
@@ -4362,6 +4383,7 @@ mod tests {
         let initial1 = client.next_datagram().expect("무토큰 Initial");
         let header = parse_initial_header(&initial1).expect("Initial 파싱");
         assert!(header.token.is_empty(), "첫 Initial에는 토큰이 없어야");
+        while client.next_datagram().is_some() {}
 
         let retry_scid = b"RETRYCID".to_vec();
         let token = retry_key.issue(ip, header.dcid, &retry_scid, 1_000);
@@ -6709,6 +6731,7 @@ mod tests {
         )
         .unwrap();
         let first = client.next_datagram().expect("첫 Initial 이 없습니다");
+        while client.next_datagram().is_some() {}
         let header = crate::retry::parse_initial_header(&first).expect("Initial 파싱");
         let token = vec![0xab; MAX_RETRY_TOKEN];
         let retry = crate::retry::build_retry(header.dcid, header.scid, b"RETRYCID", &token);
@@ -6724,7 +6747,6 @@ mod tests {
         client.spaces[INITIAL]
             .out_crypto
             .extend_from_slice(&[0; 2 * MAX_DATAGRAM]);
-        // Each flush builds only one Initial packet.
         let mut datagrams = Vec::new();
         for _ in 0..8 {
             client.flush();

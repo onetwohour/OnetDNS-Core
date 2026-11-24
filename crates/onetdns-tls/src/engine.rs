@@ -9,8 +9,9 @@ use crate::cert::{
     CertificateVerify, REQUESTED_SIGNATURE_SCHEMES,
 };
 use crate::conn::{
-    choose_server_key_share, client_config_wire_is_valid, new_key_exchange, retry_key_share,
-    server_config_wire_is_valid, ClientConfig, ServerConfig, ServerKeyShare,
+    choose_server_key_share, client_config_wire_is_valid, client_key_shares, client_shared_secret,
+    new_key_exchange, respond_key_exchange, retry_key_share, server_config_wire_is_valid,
+    ClientConfig, ServerConfig, ServerKeyShare,
 };
 use crate::handshake::{HandshakeMsg, HandshakeReader, HandshakeType};
 use crate::keyschedule::{
@@ -506,14 +507,10 @@ impl ServerHandshake {
             }
         }
 
-        let kx = new_key_exchange(group)?;
-        let shared = Zeroizing::new(
-            kx.shared_secret(&client_pub)
-                .ok_or(TlsError::IllegalParameter)?,
-        );
+        let (server_share, shared) = respond_key_exchange(group, &client_pub)?;
         let mut sh_extensions = vec![
             Extension::supported_versions_server(TLS13),
-            Extension::key_share_server(group, &kx.public_bytes()),
+            Extension::key_share_server(group, &server_share),
         ];
         if resumed {
             sh_extensions.push(Extension::pre_shared_key_server(0));
@@ -789,9 +786,8 @@ enum CFlightState {
 
 pub struct ClientHandshake {
     cfg: ClientConfig,
-    kx: KeyExchange,
-    /// The group the last hello sent a key share for.
-    share_group: Option<u16>,
+    /// The key shares the last hello sent.
+    shares: Vec<KeyExchange>,
     /// The transcript up to the ServerHello. After a HelloRetryRequest it holds the first hello's
     /// hash, the request, and the second hello.
     ch_wire: Vec<u8>,
@@ -851,22 +847,23 @@ impl ClientHandshake {
         if !client_config_wire_is_valid(&cfg) || local_transport_params.len() > u16::MAX as usize {
             return Err(TlsError::Internal);
         }
-        let kx = new_key_exchange(X25519)?;
-        let share_group = cfg.send_key_share.then(|| kx.group());
+        let shares = client_key_shares(cfg.send_key_share)?;
         let session = cfg
             .session
             .clone()
             .filter(|s| s.is_fresh(crate::session::now_ms()) && suite_params(s.suite).is_some());
 
-        let key_shares: Vec<(u16, Vec<u8>)> = share_group
-            .map(|group| vec![(group, kx.public_bytes())])
-            .unwrap_or_default();
+        let key_shares: Vec<(u16, Vec<u8>)> = shares
+            .iter()
+            .map(|kx| (kx.group(), kx.public_bytes()))
+            .collect();
         let mut extensions = vec![
             Extension::supported_versions_client(&[TLS13]),
-            Extension::supported_groups(&[X25519]),
+            Extension::supported_groups(&[X25519MLKEM768, X25519]),
             Extension::signature_algorithms(&[
                 ED25519,
                 ECDSA_SECP256R1_SHA256,
+                MLDSA44,
                 RSA_PSS_RSAE_SHA256,
                 RSA_PKCS1_SHA256,
             ]),
@@ -945,8 +942,7 @@ impl ClientHandshake {
 
         Ok(Self {
             cfg,
-            kx,
-            share_group,
+            shares,
             out_initial: ch_wire.clone(),
             ch_wire,
             hello: ch,
@@ -1049,13 +1045,13 @@ impl ClientHandshake {
             self.psk_session = None;
         }
         if let Some(group) = retry_group {
-            self.kx = new_key_exchange(group)?;
-            self.share_group = Some(group);
+            self.shares = vec![new_key_exchange(group)?];
         }
         let key_shares: Vec<(u16, Vec<u8>)> = self
-            .share_group
-            .map(|group| vec![(group, self.kx.public_bytes())])
-            .unwrap_or_default();
+            .shares
+            .iter()
+            .map(|kx| (kx.group(), kx.public_bytes()))
+            .collect();
         let mut extensions = Vec::with_capacity(first_ch.extensions.len() + 1);
         for extension in &first_ch.extensions {
             match extension.ext_type {
@@ -1121,12 +1117,7 @@ impl ClientHandshake {
             return Err(TlsError::IllegalParameter);
         }
         let (hash, _key_len) = suite_params(suite).ok_or(TlsError::IllegalParameter)?;
-        let server_pub = sh.key_share(self.share_group)?;
-        let shared = Zeroizing::new(
-            self.kx
-                .shared_secret(&server_pub)
-                .ok_or(TlsError::IllegalParameter)?,
-        );
+        let shared = client_shared_secret(&self.shares, &sh)?;
 
         let psk_accepted = match sh.ext(EXT_PRE_SHARED_KEY) {
             None => false,

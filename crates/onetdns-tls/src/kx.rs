@@ -1,7 +1,15 @@
-//! TLS key exchange over X25519 and P-256.
+//! TLS key exchange over X25519, P-256, and the X25519MLKEM768 hybrid (RFC 10024).
 
-use crate::msg::consts::{SECP256R1, X25519};
+use crate::msg::consts::{SECP256R1, X25519, X25519MLKEM768};
+use ml_kem::ml_kem_768::{Ciphertext, DecapsulationKey, EncapsulationKey};
+use ml_kem::{Decapsulate, Key, KeyExport, B32};
 use zeroize::Zeroize;
+
+/// Seed length that covers every group; X25519MLKEM768 uses all of it.
+pub const SEED_LEN: usize = 96;
+
+const MLKEM768_EK_LEN: usize = 1184;
+const MLKEM768_CT_LEN: usize = 1088;
 
 pub struct KeyExchange {
     inner: Inner,
@@ -10,34 +18,72 @@ pub struct KeyExchange {
 enum Inner {
     X25519(x25519_dalek::StaticSecret),
     P256(p256::SecretKey),
+    X25519MlKem768(Box<DecapsulationKey>, x25519_dalek::StaticSecret),
+}
+
+fn x25519_secret(seed: &[u8]) -> Option<x25519_dalek::StaticSecret> {
+    let mut s: [u8; 32] = seed.get(..32)?.try_into().ok()?;
+    let secret = x25519_dalek::StaticSecret::from(s);
+    s.zeroize();
+    Some(secret)
+}
+
+/// Rejects a low-order point, which would fix the shared secret.
+fn x25519_agree(secret: &x25519_dalek::StaticSecret, peer: &[u8]) -> Option<Vec<u8>> {
+    let p: [u8; 32] = peer.try_into().ok()?;
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(p));
+    if !shared.was_contributory() {
+        return None;
+    }
+    Some(shared.as_bytes().to_vec())
 }
 
 impl KeyExchange {
-    /// Returns `None` for an unknown group.
+    /// Returns `None` for an unknown group or a seed shorter than the group needs.
     pub fn from_seed(group: u16, seed: &[u8]) -> Option<KeyExchange> {
-        match group {
-            X25519 => {
-                let mut s: [u8; 32] = seed.get(..32)?.try_into().ok()?;
-                let secret = x25519_dalek::StaticSecret::from(s);
-                s.zeroize();
-                Some(KeyExchange {
-                    inner: Inner::X25519(secret),
-                })
+        let inner = match group {
+            X25519 => Inner::X25519(x25519_secret(seed)?),
+            SECP256R1 => Inner::P256(p256::SecretKey::from_slice(seed.get(..32)?).ok()?),
+            X25519MLKEM768 => {
+                let kem_seed = ml_kem::Seed::try_from(seed.get(..64)?).ok()?;
+                Inner::X25519MlKem768(
+                    Box::new(DecapsulationKey::from_seed(kem_seed)),
+                    x25519_secret(seed.get(64..)?)?,
+                )
             }
-            SECP256R1 => {
-                let sk = p256::SecretKey::from_slice(seed).ok()?;
-                Some(KeyExchange {
-                    inner: Inner::P256(sk),
-                })
-            }
-            _ => None,
+            _ => return None,
+        };
+        Some(KeyExchange { inner })
+    }
+
+    /// The server's key share and the shared secret for the client's share. A key encapsulation
+    /// has no key pair on this side, so this replaces `from_seed` followed by `shared_secret`.
+    pub fn respond(group: u16, peer: &[u8], seed: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        if group != X25519MLKEM768 {
+            let kx = KeyExchange::from_seed(group, seed)?;
+            let secret = kx.shared_secret(peer)?;
+            return Some((kx.public_bytes(), secret));
         }
+        if peer.len() != MLKEM768_EK_LEN + 32 {
+            return None;
+        }
+        let (ek, x_peer) = peer.split_at(MLKEM768_EK_LEN);
+        let ek = EncapsulationKey::new(&Key::<EncapsulationKey>::try_from(ek).ok()?).ok()?;
+        let x = x25519_secret(seed.get(32..)?)?;
+        let ecdh = x25519_agree(&x, x_peer)?;
+        let (ct, kem) = ek.encapsulate_deterministic(&B32::try_from(seed.get(..32)?).ok()?);
+        let mut share = ct.to_vec();
+        share.extend_from_slice(x25519_dalek::PublicKey::from(&x).as_bytes());
+        let mut secret = kem.to_vec();
+        secret.extend_from_slice(&ecdh);
+        Some((share, secret))
     }
 
     pub fn group(&self) -> u16 {
         match self.inner {
             Inner::X25519(_) => X25519,
             Inner::P256(_) => SECP256R1,
+            Inner::X25519MlKem768(..) => X25519MLKEM768,
         }
     }
 
@@ -48,6 +94,11 @@ impl KeyExchange {
                 use p256::elliptic_curve::sec1::ToSec1Point;
                 s.public_key().to_sec1_point(false).as_bytes().to_vec()
             }
+            Inner::X25519MlKem768(dk, x) => {
+                let mut share = dk.encapsulation_key().to_bytes().to_vec();
+                share.extend_from_slice(x25519_dalek::PublicKey::from(x).as_bytes());
+                share
+            }
         }
     }
 
@@ -56,15 +107,7 @@ impl KeyExchange {
     /// format this side advertises in TLS 1.2.
     pub fn shared_secret(&self, peer: &[u8]) -> Option<Vec<u8>> {
         match &self.inner {
-            Inner::X25519(s) => {
-                let p: [u8; 32] = peer.try_into().ok()?;
-                let shared = s.diffie_hellman(&x25519_dalek::PublicKey::from(p));
-
-                if !shared.was_contributory() {
-                    return None;
-                }
-                Some(shared.as_bytes().to_vec())
-            }
+            Inner::X25519(s) => x25519_agree(s, peer),
             Inner::P256(s) => {
                 if peer.len() != 65 || peer[0] != 0x04 {
                     return None;
@@ -72,6 +115,16 @@ impl KeyExchange {
                 let pp = p256::PublicKey::from_sec1_bytes(peer).ok()?;
                 let shared = p256::ecdh::diffie_hellman(s.to_nonzero_scalar(), pp.as_affine());
                 Some(shared.raw_secret_bytes().to_vec())
+            }
+            Inner::X25519MlKem768(dk, x) => {
+                if peer.len() != MLKEM768_CT_LEN + 32 {
+                    return None;
+                }
+                let (ct, x_peer) = peer.split_at(MLKEM768_CT_LEN);
+                let ecdh = x25519_agree(x, x_peer)?;
+                let mut secret = dk.decapsulate(&Ciphertext::try_from(ct).ok()?).to_vec();
+                secret.extend_from_slice(&ecdh);
+                Some(secret)
             }
         }
     }
@@ -127,6 +180,51 @@ mod tests {
             .public_bytes();
         assert_eq!(pk.len(), 65);
         assert_eq!(pk[0], 0x04);
+    }
+
+    #[test]
+    /// RFC 10024 puts the ML-KEM part first in each share and in the secret.
+    fn hybrid_agrees_and_orders_ml_kem_first() {
+        let client = KeyExchange::from_seed(X25519MLKEM768, &[0x11; SEED_LEN]).unwrap();
+        let share = client.public_bytes();
+        assert_eq!(share.len(), MLKEM768_EK_LEN + 32);
+        let (reply, secret) =
+            KeyExchange::respond(X25519MLKEM768, &share, &[0x22; SEED_LEN]).unwrap();
+        assert_eq!(reply.len(), MLKEM768_CT_LEN + 32);
+        assert_eq!(secret.len(), 64);
+        assert_eq!(client.shared_secret(&reply).as_ref(), Some(&secret));
+
+        let x_client = KeyExchange::from_seed(X25519, &[0x11; 32]).unwrap();
+        assert_eq!(&share[MLKEM768_EK_LEN..], x_client.public_bytes());
+        assert_eq!(
+            x_client.shared_secret(&reply[MLKEM768_CT_LEN..]).unwrap(),
+            secret[32..]
+        );
+    }
+
+    #[test]
+    fn hybrid_rejects_malformed_shares() {
+        let client = KeyExchange::from_seed(X25519MLKEM768, &[0x11; SEED_LEN]).unwrap();
+        let share = client.public_bytes();
+        let seed = [0x22; SEED_LEN];
+        assert!(KeyExchange::respond(X25519MLKEM768, &share[1..], &seed).is_none());
+
+        let mut low_order = share.clone();
+        low_order[MLKEM768_EK_LEN..].fill(0);
+        assert!(KeyExchange::respond(X25519MLKEM768, &low_order, &seed).is_none());
+
+        let mut unreduced = share.clone();
+        unreduced[..MLKEM768_EK_LEN - 32].fill(0xff);
+        assert!(
+            KeyExchange::respond(X25519MLKEM768, &unreduced, &seed).is_none(),
+            "q 이상인 계수가 든 캡슐화 키는 거부해야 합니다"
+        );
+
+        let (reply, _) = KeyExchange::respond(X25519MLKEM768, &share, &seed).unwrap();
+        assert!(client.shared_secret(&reply[1..]).is_none());
+        let mut reply_low_order = reply.clone();
+        reply_low_order[MLKEM768_CT_LEN..].fill(0);
+        assert!(client.shared_secret(&reply_low_order).is_none());
     }
 
     #[test]

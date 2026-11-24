@@ -228,13 +228,9 @@ impl ServerConfig {
         if !certificate_chain_is_valid(&cert_chain, false) {
             return None;
         }
-        let (sign_scheme, sign) = signer_from_pkcs8_der(key_pkcs8_der)?;
-
-        use p256::elliptic_curve::sec1::ToSec1Point;
-        use p256::pkcs8::DecodePrivateKey;
-        let secret = p256::SecretKey::from_pkcs8_der(key_pkcs8_der).ok()?;
+        let (sign_scheme, sign, public_key) = signing_key_from_pkcs8_der(key_pkcs8_der)?;
         let leaf = X509::parse(&cert_chain[0]).ok()?;
-        if leaf.public_key != secret.public_key().to_sec1_point(false).as_bytes() {
+        if leaf.public_key != public_key {
             return None;
         }
         Some(ServerConfig {
@@ -284,21 +280,75 @@ impl ClientCert {
     }
 }
 
-/// Picks the signer from the key type.
-pub fn signer_from_pkcs8_der(
-    der: &[u8],
-) -> Option<(u16, Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>)> {
+type Signer = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// Picks the signer from the key type: ECDSA P-256 or ML-DSA-44.
+pub fn signer_from_pkcs8_der(der: &[u8]) -> Option<(u16, Signer)> {
+    signing_key_from_pkcs8_der(der).map(|(scheme, sign, _)| (scheme, sign))
+}
+
+/// The public key of a private key `signer_from_pkcs8_der` accepts, as a certificate carries it.
+pub fn pkcs8_public_key(der: &[u8]) -> Option<Vec<u8>> {
+    signing_key_from_pkcs8_der(der).map(|(_, _, public_key)| public_key)
+}
+
+fn signing_key_from_pkcs8_der(der: &[u8]) -> Option<(u16, Signer, Vec<u8>)> {
     use p256::pkcs8::DecodePrivateKey;
     if let Ok(secret) = p256::SecretKey::from_pkcs8_der(der) {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let public_key = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
         let signing = p256::ecdsa::SigningKey::from(secret);
         let f = move |content: &[u8]| -> Vec<u8> {
             use p256::ecdsa::{signature::Signer, Signature};
             let sig: Signature = signing.sign(content);
             sig.to_der().as_bytes().to_vec()
         };
-        return Some((ECDSA_SECP256R1_SHA256, Arc::new(f)));
+        return Some((ECDSA_SECP256R1_SHA256, Arc::new(f), public_key));
     }
-    None
+    let key = ml_dsa_44_from_pkcs8(der)?;
+    let public_key = key.verifying_key().encode().to_vec();
+    let f = move |content: &[u8]| -> Vec<u8> {
+        key.sign_deterministic(content, &[])
+            .expect("an empty context is always accepted")
+            .encode()
+            .to_vec()
+    };
+    Some((MLDSA44, Arc::new(f), public_key))
+}
+
+/// The seed form of RFC 9881, or the form carrying both seed and expanded key, whose seed is used.
+/// The expanded-only form is refused: ml-dsa reads it only through a deprecated API.
+fn ml_dsa_44_from_pkcs8(der: &[u8]) -> Option<ml_dsa::ExpandedSigningKey<ml_dsa::MlDsa44>> {
+    use crate::der::{self, Der};
+    const SEED: u8 = 0x80;
+    let mut outer = Der::new(der);
+    let mut info = Der::new(outer.expect(der::SEQUENCE).ok()?);
+    if !outer.is_empty() || !matches!(info.expect(der::INTEGER).ok()?, [0] | [1]) {
+        return None;
+    }
+    let mut algorithm = Der::new(info.expect(der::SEQUENCE).ok()?);
+    if algorithm.expect(der::OID).ok()? != crate::x509::OID_ML_DSA_44 || !algorithm.is_empty() {
+        return None;
+    }
+    let mut private_key = Der::new(info.expect(der::OCTET_STRING).ok()?);
+    let choice = private_key.next().ok()?;
+    if !private_key.is_empty() {
+        return None;
+    }
+    let seed = match choice.tag {
+        SEED => choice.value,
+        der::SEQUENCE => {
+            let mut both = choice.der();
+            let seed = both.expect(der::OCTET_STRING).ok()?;
+            if both.expect(der::OCTET_STRING).ok()?.len() != 2560 || !both.is_empty() {
+                return None;
+            }
+            seed
+        }
+        _ => return None,
+    };
+    let seed = ml_dsa::Seed::try_from(seed).ok()?;
+    Some(ml_dsa::ExpandedSigningKey::from_seed(&seed))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1121,9 +1171,47 @@ fn choose_suite(offered: &[u16]) -> Option<u16> {
 }
 
 pub(crate) fn new_key_exchange(group: u16) -> Result<KeyExchange, TlsError> {
-    let mut seed = Zeroizing::new([0u8; 32]);
+    let mut seed = Zeroizing::new([0u8; crate::kx::SEED_LEN]);
     fill_random(&mut *seed);
     KeyExchange::from_seed(group, &*seed).ok_or(TlsError::Internal)
+}
+
+/// The server's TLS 1.3 key share and the shared secret. `IllegalParameter` for a malformed client
+/// share.
+pub(crate) fn respond_key_exchange(
+    group: u16,
+    client_share: &[u8],
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), TlsError> {
+    let mut seed = Zeroizing::new([0u8; crate::kx::SEED_LEN]);
+    fill_random(&mut *seed);
+    let (share, secret) =
+        KeyExchange::respond(group, client_share, &*seed).ok_or(TlsError::IllegalParameter)?;
+    Ok((share, Zeroizing::new(secret)))
+}
+
+/// The key shares a client's first hello carries: the hybrid, and X25519 for servers without it.
+pub(crate) fn client_key_shares(send: bool) -> Result<Vec<KeyExchange>, TlsError> {
+    if !send {
+        return Ok(Vec::new());
+    }
+    [X25519MLKEM768, X25519]
+        .into_iter()
+        .map(new_key_exchange)
+        .collect()
+}
+
+pub(crate) fn client_shared_secret(
+    shares: &[KeyExchange],
+    sh: &ServerHello,
+) -> Result<Zeroizing<Vec<u8>>, TlsError> {
+    let groups: Vec<u16> = shares.iter().map(KeyExchange::group).collect();
+    let (group, server_share) = sh.key_share(&groups)?;
+    shares
+        .iter()
+        .find(|kx| kx.group() == group)
+        .and_then(|kx| kx.shared_secret(&server_share))
+        .map(Zeroizing::new)
+        .ok_or(TlsError::IllegalParameter)
 }
 
 /// A session the blocking client can offer now.
@@ -1234,7 +1322,7 @@ fn accept_client_psk(
 }
 
 /// In preference order. RFC 8446 makes secp256r1 mandatory.
-const SERVER_TLS13_GROUPS: [u16; 2] = [X25519, SECP256R1];
+const SERVER_TLS13_GROUPS: [u16; 3] = [X25519MLKEM768, X25519, SECP256R1];
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ServerKeyShare {
@@ -1355,7 +1443,7 @@ fn scheme_is_ecdsa(scheme: u16) -> bool {
 /// Renegotiation info on a first connection may come as an empty extension or the SCSV (RFC 5746).
 /// A point format list without uncompressed is refused, as RFC 8422 requires. Without extended
 /// master secret or renegotiation info nothing here is acceptable. The client must offer a scheme
-/// this side's certificate can sign with.
+/// this side's certificate can sign with, and ML-DSA is not defined for TLS 1.2.
 fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(), TlsError> {
     if !ch.compression_methods.contains(&0) {
         return Err(TlsError::IllegalParameter);
@@ -1390,7 +1478,7 @@ fn validate_tls12_client_hello(ch: &ClientHello, sign_scheme: u16) -> Result<(),
     {
         return Err(TlsError::IllegalParameter);
     }
-    if !ch.offers_signature_scheme(sign_scheme) {
+    if sign_scheme == MLDSA44 || !ch.offers_signature_scheme(sign_scheme) {
         return Err(TlsError::HandshakeFailure);
     }
     Ok(())
@@ -1565,15 +1653,11 @@ fn run_server_handshake<S: Read + Write>(
         .and_then(Extension::as_psk_modes)
         .is_some_and(|modes| modes.contains(&PSK_DHE_KE));
 
-    let kx = new_key_exchange(group)?;
-    let shared = Zeroizing::new(
-        kx.shared_secret(&client_pub)
-            .ok_or(TlsError::IllegalParameter)?,
-    );
+    let (server_share, shared) = respond_key_exchange(group, &client_pub)?;
 
     let mut sh_extensions = vec![
         Extension::supported_versions_server(TLS13),
-        Extension::key_share_server(group, &kx.public_bytes()),
+        Extension::key_share_server(group, &server_share),
     ];
     if resumed {
         sh_extensions.push(Extension::pre_shared_key_server(0));
@@ -1770,23 +1854,22 @@ fn run_server_handshake<S: Read + Write>(
 
 fn build_client_hello(
     cfg: &ClientConfig,
-    kx: &KeyExchange,
-    send_key_share: bool,
+    shares: &[KeyExchange],
     cookie: Option<&[u8]>,
     session: Option<&crate::session::TlsSession>,
 ) -> ClientHello {
-    let key_shares: Vec<(u16, Vec<u8>)> = if send_key_share {
-        vec![(kx.group(), kx.public_bytes())]
-    } else {
-        vec![]
-    };
+    let key_shares: Vec<(u16, Vec<u8>)> = shares
+        .iter()
+        .map(|kx| (kx.group(), kx.public_bytes()))
+        .collect();
     let mut extensions = vec![
         Extension::supported_versions_client(&[TLS13, TLS12]),
-        Extension::supported_groups(&[X25519, SECP256R1]),
+        Extension::supported_groups(&[X25519MLKEM768, X25519, SECP256R1]),
         Extension::signature_algorithms(&[
             ED25519,
             ECDSA_SECP256R1_SHA256,
             ECDSA_SECP384R1_SHA384,
+            MLDSA44,
             RSA_PSS_RSAE_SHA256,
             RSA_PSS_RSAE_SHA384,
             RSA_PKCS1_SHA256,
@@ -1858,11 +1941,10 @@ fn run_client_handshake<S: Read + Write>(
     cfg: &ClientConfig,
     w: &mut HandshakeWrite,
 ) -> Result<TlsConnection, TlsError> {
-    let mut kx = new_key_exchange(X25519)?;
-    let mut share_group = cfg.send_key_share.then(|| kx.group());
+    let mut shares = client_key_shares(cfg.send_key_share)?;
 
     let mut offered_session = fresh_client_session(cfg);
-    let ch = build_client_hello(cfg, &kx, cfg.send_key_share, None, offered_session);
+    let ch = build_client_hello(cfg, &shares, None, offered_session);
     let mut ch_bytes = encode_client_hello(&ch, offered_session, &[])?;
     w.send(s, &ch_bytes)?;
 
@@ -1906,16 +1988,9 @@ fn run_client_handshake<S: Read + Write>(
             offered_session = None;
         }
         if let Some(group) = retry_group {
-            kx = new_key_exchange(group)?;
-            share_group = Some(group);
+            shares = vec![new_key_exchange(group)?];
         }
-        let mut ch2 = build_client_hello(
-            cfg,
-            &kx,
-            share_group.is_some(),
-            cookie.as_deref(),
-            offered_session,
-        );
+        let mut ch2 = build_client_hello(cfg, &shares, cookie.as_deref(), offered_session);
         ch2.random = ch.random;
         ch2.session_id.clone_from(&ch.session_id);
         ch2.cipher_suites.clone_from(&ch.cipher_suites);
@@ -1939,11 +2014,7 @@ fn run_client_handshake<S: Read + Write>(
     }
     let (hash, key_len) = suite_params(suite).ok_or(TlsError::IllegalParameter)?;
     let aead = aead_for_suite(suite).ok_or(TlsError::Internal)?;
-    let server_pub = sh.key_share(share_group)?;
-    let shared = Zeroizing::new(
-        kx.shared_secret(&server_pub)
-            .ok_or(TlsError::IllegalParameter)?,
-    );
+    let shared = client_shared_secret(&shares, &sh)?;
     let psk_accepted = match sh.ext(EXT_PRE_SHARED_KEY) {
         None => false,
         Some(extension) => {
@@ -2393,6 +2464,7 @@ fn client_handshake_tls12<S: Read + Write>(
             .and_then(Extension::as_supported_groups)
             .is_some_and(|groups| groups.contains(&group))
         || info.ecdsa != scheme_is_ecdsa(sig_scheme)
+        || sig_scheme == MLDSA44
         || !ch
             .ext(EXT_SIGNATURE_ALGORITHMS)
             .and_then(Extension::as_signature_algorithms)
@@ -2434,7 +2506,7 @@ fn client_handshake_tls12<S: Read + Write>(
     let client_cert = certificate_request.as_ref().map(|request| {
         cfg.client_cert
             .as_ref()
-            .filter(|cc| request.accepts(cc.sign_scheme))
+            .filter(|cc| cc.sign_scheme != MLDSA44 && request.accepts(cc.sign_scheme))
     });
     if let Some(client_cert) = client_cert {
         let chain = client_cert.map_or(&[][..], |cc| cc.chain.as_slice());
@@ -3819,7 +3891,7 @@ mod tests {
         };
         let kx = KeyExchange::from_seed(X25519, &[0x21; 32]).unwrap();
         let session = fresh_client_session(&client_cfg);
-        let hello = build_client_hello(&client_cfg, &kx, true, None, session);
+        let hello = build_client_hello(&client_cfg, std::slice::from_ref(&kx), None, session);
         let wire = encode_client_hello(&hello, session, &[]).unwrap();
         let message = parse_exact_handshake(&wire).unwrap();
         let parsed = ClientHello::from_handshake(&message).unwrap();
@@ -3860,7 +3932,7 @@ mod tests {
             obtained_at_ms: now,
         });
         let session = fresh_client_session(&forged_cfg);
-        let hello = build_client_hello(&forged_cfg, &kx, true, None, session);
+        let hello = build_client_hello(&forged_cfg, std::slice::from_ref(&kx), None, session);
         let wire = encode_client_hello(&hello, session, &[]).unwrap();
         let message = parse_exact_handshake(&wire).unwrap();
         let parsed = ClientHello::from_handshake(&message).unwrap();
@@ -4173,6 +4245,171 @@ mod tests {
         )
     }
 
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match content.len() {
+            n if n < 0x80 => out.push(n as u8),
+            n if n < 0x100 => out.extend([0x81, n as u8]),
+            n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// `private_key` is the encoded ML-DSA-44-PrivateKey choice.
+    fn ml_dsa_44_pkcs8(private_key: &[u8]) -> Vec<u8> {
+        use crate::der::{INTEGER, OCTET_STRING, OID, SEQUENCE};
+        let algorithm = der_tlv(SEQUENCE, &der_tlv(OID, crate::x509::OID_ML_DSA_44));
+        let content = [
+            der_tlv(INTEGER, &[0]),
+            algorithm,
+            der_tlv(OCTET_STRING, private_key),
+        ];
+        der_tlv(SEQUENCE, &content.concat())
+    }
+
+    /// A certificate for `name` and its key in the seed form. `issuer` is the issuing CA's seed and
+    /// name; `None` makes it self-signed.
+    fn ml_dsa_44_cert(
+        seed: [u8; 32],
+        name: &str,
+        ca: bool,
+        issuer: Option<([u8; 32], &str)>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use crate::der::{BIT_STRING, BOOLEAN, INTEGER, OCTET_STRING, OID, SEQUENCE, SET};
+        use ml_dsa::{ExpandedSigningKey, MlDsa44};
+        let key = ExpandedSigningKey::<MlDsa44>::from_seed(&seed.into());
+        let algorithm = der_tlv(SEQUENCE, &der_tlv(OID, crate::x509::OID_ML_DSA_44));
+        let dn = |name: &str| {
+            let cn = [
+                der_tlv(OID, &[0x55, 0x04, 0x03]),
+                der_tlv(0x0c, name.as_bytes()),
+            ];
+            der_tlv(SEQUENCE, &der_tlv(SET, &der_tlv(SEQUENCE, &cn.concat())))
+        };
+        let bits = |bytes: &[u8]| der_tlv(BIT_STRING, &[&[0], bytes].concat());
+        let (issuer_seed, issuer_name) = issuer.unwrap_or((seed, name));
+        let san = [
+            der_tlv(OID, &[0x55, 0x1d, 0x11]),
+            der_tlv(
+                OCTET_STRING,
+                &der_tlv(SEQUENCE, &der_tlv(0x82, name.as_bytes())),
+            ),
+        ];
+        let mut extensions = der_tlv(SEQUENCE, &san.concat());
+        if ca {
+            let basic_constraints = [
+                der_tlv(OID, &[0x55, 0x1d, 0x13]),
+                der_tlv(BOOLEAN, &[0xff]),
+                der_tlv(OCTET_STRING, &der_tlv(SEQUENCE, &der_tlv(BOOLEAN, &[0xff]))),
+            ];
+            extensions.extend(der_tlv(SEQUENCE, &basic_constraints.concat()));
+        }
+        let tbs = [
+            der_tlv(0xa0, &der_tlv(INTEGER, &[2])),
+            der_tlv(INTEGER, &[1]),
+            algorithm.clone(),
+            dn(issuer_name),
+            der_tlv(
+                SEQUENCE,
+                &[
+                    der_tlv(0x17, b"250101000000Z"),
+                    der_tlv(0x17, b"491231235959Z"),
+                ]
+                .concat(),
+            ),
+            dn(name),
+            der_tlv(
+                SEQUENCE,
+                &[algorithm.clone(), bits(&key.verifying_key().encode())].concat(),
+            ),
+            der_tlv(0xa3, &der_tlv(SEQUENCE, &extensions)),
+        ];
+        let tbs = der_tlv(SEQUENCE, &tbs.concat());
+        let signature = ExpandedSigningKey::<MlDsa44>::from_seed(&issuer_seed.into())
+            .sign_deterministic(&tbs, &[])
+            .unwrap()
+            .encode();
+        let cert = der_tlv(SEQUENCE, &[tbs, algorithm, bits(&signature)].concat());
+        (cert, ml_dsa_44_pkcs8(&der_tlv(0x80, &seed)))
+    }
+
+    #[test]
+    /// ML-DSA-44 signs both the certificates and CertificateVerify, and the client checks each
+    /// against an ML-DSA-44 root.
+    fn tls13_handshake_with_ml_dsa_44_certificates() {
+        let ca_seed = [0x41; 32];
+        let (ca_der, _) = ml_dsa_44_cert(ca_seed, "ca.test", true, None);
+        let (leaf_der, leaf_key) =
+            ml_dsa_44_cert([0x42; 32], "dns.test", false, Some((ca_seed, "ca.test")));
+        let leaf = X509::parse(&leaf_der).unwrap();
+        assert!(leaf
+            .verify_signed_by(&X509::parse(&ca_der).unwrap())
+            .is_ok());
+        assert_eq!(
+            leaf.verify_signed_by(&leaf),
+            Err(TlsError::BadSignature),
+            "다른 키로는 서명이 맞지 않아야 합니다"
+        );
+
+        let server_cfg = ServerConfig::from_pkcs8(leaf_der, &leaf_key).expect("ML-DSA-44 키");
+        assert_eq!(server_cfg.sign_scheme, MLDSA44);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut conn = server_handshake(&mut s, &server_cfg).unwrap();
+            assert_eq!(conn.read_app(&mut s).unwrap(), b"hi");
+            conn.write_app(&mut s, b"ok").unwrap();
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let cfg = ClientConfig {
+            server_name: "dns.test".into(),
+            verify_name: true,
+            roots: Some(crate::trust::TrustStore::from_ders([ca_der.as_slice()])),
+            ..Default::default()
+        };
+        let mut conn = client_handshake(&mut c, &cfg).expect("ML-DSA-44 체인을 받아들여야 합니다");
+        conn.write_app(&mut c, b"hi").unwrap();
+        assert_eq!(conn.read_app(&mut c).unwrap(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    /// RFC 9881 allows a seed, an expanded key, or both; only forms with a seed are read.
+    fn ml_dsa_44_keys_load_only_with_a_seed() {
+        use crate::der::{OCTET_STRING, SEQUENCE};
+        let seed = [0x43; 32];
+        let (cert, seed_form) = ml_dsa_44_cert(seed, "dns.test", false, None);
+        assert!(ServerConfig::from_pkcs8(cert.clone(), &seed_form).is_some());
+
+        let expanded = der_tlv(OCTET_STRING, &[0; 2560]);
+        let both = [der_tlv(OCTET_STRING, &seed), expanded.clone()].concat();
+        let both = ml_dsa_44_pkcs8(&der_tlv(SEQUENCE, &both));
+        assert!(ServerConfig::from_pkcs8(cert.clone(), &both).is_some());
+        assert!(ServerConfig::from_pkcs8(cert.clone(), &ml_dsa_44_pkcs8(&expanded)).is_none());
+
+        let (_, other_key) = ml_dsa_44_cert([0x44; 32], "dns.test", false, None);
+        assert!(
+            ServerConfig::from_pkcs8(cert, &other_key).is_none(),
+            "인증서와 다른 키는 거부해야 합니다"
+        );
+    }
+
+    #[test]
+    fn ml_dsa_is_refused_in_tls12() {
+        let (_, mut hello, _) = valid_tls12_hellos();
+        for extension in &mut hello.extensions {
+            if extension.ext_type == EXT_SIGNATURE_ALGORITHMS {
+                *extension = Extension::signature_algorithms(&[MLDSA44]);
+            }
+        }
+        assert_eq!(
+            validate_tls12_client_hello(&hello, MLDSA44),
+            Err(TlsError::HandshakeFailure)
+        );
+    }
+
     fn insecure_test_client(server_name: &str) -> ClientConfig {
         ClientConfig {
             server_name: server_name.to_string(),
@@ -4367,9 +4604,14 @@ mod tests {
     fn client_hello_names_only_host_names() {
         let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
         let sni = |server_name: &str| {
-            build_client_hello(&insecure_test_client(server_name), &kx, true, None, None)
-                .ext(EXT_SERVER_NAME)
-                .and_then(Extension::as_server_name)
+            build_client_hello(
+                &insecure_test_client(server_name),
+                std::slice::from_ref(&kx),
+                None,
+                None,
+            )
+            .ext(EXT_SERVER_NAME)
+            .and_then(Extension::as_server_name)
         };
         assert_eq!(sni("192.0.2.1"), None);
         assert_eq!(sni("2001:db8::1"), None);
@@ -4448,7 +4690,7 @@ mod tests {
             alpn: vec![b"dot".to_vec()],
             ..insecure_test_client("localhost")
         };
-        let hello = build_client_hello(&client_cfg, &kx, true, None, None);
+        let hello = build_client_hello(&client_cfg, std::slice::from_ref(&kx), None, None);
         let answer = |hello: &ClientHello| first_server_hello(&cfg, hello.to_handshake().encode());
         let reply = answer(&hello).expect("정상 인사말에는 답해야 한다");
         assert_ne!(
@@ -4548,7 +4790,8 @@ mod tests {
         let share = |kx: &KeyExchange| (kx.group(), kx.public_bytes());
         let hello = |shares: Vec<(u16, Vec<u8>)>, groups: &[u16]| {
             let client_cfg = insecure_test_client("localhost");
-            let mut hello = build_client_hello(&client_cfg, &x25519, true, None, None);
+            let mut hello =
+                build_client_hello(&client_cfg, std::slice::from_ref(&x25519), None, None);
             for extension in &mut hello.extensions {
                 match extension.ext_type {
                     EXT_KEY_SHARE => *extension = Extension::key_share_client(&shares),
@@ -4579,6 +4822,24 @@ mod tests {
                 &x25519
             ),
             "두 곡선의 조각이 모두 있으면 X25519 를 골라야 한다"
+        );
+        let hybrid = KeyExchange::from_seed(X25519MLKEM768, &[0x33; crate::kx::SEED_LEN]).unwrap();
+        assert!(
+            agreed(
+                &hello(
+                    vec![share(&hybrid), share(&x25519)],
+                    &[X25519MLKEM768, X25519]
+                ),
+                &hybrid
+            ),
+            "하이브리드 조각이 있으면 하이브리드를 골라야 한다"
+        );
+        assert!(
+            agreed(
+                &hello(vec![share(&x25519)], &[X25519MLKEM768, X25519]),
+                &x25519
+            ),
+            "X25519 조각만 있으면 다시 시도를 요청하지 않고 X25519 로 답해야 한다"
         );
 
         let retry = answer(&hello(Vec::new(), &[SECP256R1])).expect("다시 시도를 요청해야 한다");
@@ -4625,7 +4886,12 @@ mod tests {
             .unwrap()
         };
         let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
-        let hello = build_client_hello(&insecure_test_client("localhost"), &kx, true, None, None);
+        let hello = build_client_hello(
+            &insecure_test_client("localhost"),
+            std::slice::from_ref(&kx),
+            None,
+            None,
+        );
 
         let mut broken = hello.clone();
         broken
@@ -4640,8 +4906,7 @@ mod tests {
                 alpn: vec![b"h2".to_vec()],
                 ..insecure_test_client("localhost")
             },
-            &kx,
-            true,
+            std::slice::from_ref(&kx),
             None,
             None,
         );
@@ -4686,9 +4951,14 @@ mod tests {
         )
         .unwrap();
         let kx = KeyExchange::from_seed(X25519, &[0x31; 32]).unwrap();
-        let hello = build_client_hello(&insecure_test_client("localhost"), &kx, true, None, None)
-            .to_handshake()
-            .encode();
+        let hello = build_client_hello(
+            &insecure_test_client("localhost"),
+            std::slice::from_ref(&kx),
+            None,
+            None,
+        )
+        .to_handshake()
+        .encode();
         let handshake =
             |fragment: Vec<u8>| TlsRecord::new(ContentType::Handshake, fragment).encode();
         for (case, input, expected) in [
@@ -4872,8 +5142,7 @@ mod tests {
         let kx = KeyExchange::from_seed(X25519, &[0x32; 32]).unwrap();
         let mut hello = build_client_hello(
             &insecure_test_client("localhost"),
-            &kx,
-            true,
+            std::slice::from_ref(&kx),
             None,
             Some(&session),
         );

@@ -22,6 +22,8 @@ const RUNTIME_ALLOWED: &[&str] = &[
     "hmac",
     "p256",
     "p384",
+    "ml-kem",
+    "ml-dsa",
     "zeroize",
     // Raw block ciphers for QUIC header protection and DNSCrypt's crypto_secretbox, which the AEAD
     // crates do not expose. All three already come in through those crates.

@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+/// id-ml-dsa-44 (RFC 9881): the key and the signature algorithm share it.
+pub(crate) const OID_ML_DSA_44: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11];
 /// A key exchange key; it cannot sign.
 const OID_X25519: &[u8] = &[0x2b, 0x65, 0x6e];
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
@@ -57,6 +59,7 @@ const KU_KEY_CERT_SIGN: u16 = 1 << 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicKeyAlgorithm {
     Ed25519,
+    MlDsa44,
     X25519,
     EcP256,
     EcP384,
@@ -69,6 +72,7 @@ impl PublicKeyAlgorithm {
     pub fn allows_signature_scheme(self, scheme: u16) -> bool {
         match self {
             PublicKeyAlgorithm::Ed25519 => scheme == consts::ED25519,
+            PublicKeyAlgorithm::MlDsa44 => scheme == consts::MLDSA44,
             PublicKeyAlgorithm::X25519 => false,
             PublicKeyAlgorithm::EcP256 => scheme == consts::ECDSA_SECP256R1_SHA256,
             PublicKeyAlgorithm::EcP384 => scheme == consts::ECDSA_SECP384R1_SHA384,
@@ -448,6 +452,12 @@ fn public_key_algorithm_from_algid(algid: &[u8]) -> Result<PublicKeyAlgorithm, T
             }
             PublicKeyAlgorithm::Ed25519
         }
+        x if x == OID_ML_DSA_44 => {
+            if !d.is_empty() {
+                return Err(TlsError::BadCert);
+            }
+            PublicKeyAlgorithm::MlDsa44
+        }
         x if x == OID_X25519 => {
             if !d.is_empty() {
                 return Err(TlsError::BadCert);
@@ -491,6 +501,7 @@ fn public_key_algorithm_from_algid(algid: &[u8]) -> Result<PublicKeyAlgorithm, T
 fn public_key_encoding_valid(algorithm: PublicKeyAlgorithm, key: &[u8]) -> bool {
     match algorithm {
         PublicKeyAlgorithm::Ed25519 | PublicKeyAlgorithm::X25519 => key.len() == 32,
+        PublicKeyAlgorithm::MlDsa44 => key.len() == 1312,
         PublicKeyAlgorithm::EcP256 => p256::PublicKey::from_sec1_bytes(key).is_ok(),
         PublicKeyAlgorithm::EcP384 => p384::PublicKey::from_sec1_bytes(key).is_ok(),
         PublicKeyAlgorithm::RsaEncryption | PublicKeyAlgorithm::RsaPss { .. } => {
@@ -615,6 +626,12 @@ pub fn scheme_from_sig_algid(algid: &[u8]) -> Result<u16, TlsError> {
                 return Err(TlsError::BadCert);
             }
             consts::ED25519
+        }
+        x if x == OID_ML_DSA_44 => {
+            if !d.is_empty() {
+                return Err(TlsError::BadCert);
+            }
+            consts::MLDSA44
         }
         x if x == OID_ECDSA_SHA256 => {
             if !d.is_empty() {

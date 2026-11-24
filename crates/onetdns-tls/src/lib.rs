@@ -28,8 +28,8 @@ pub use aead::{Aead, RecordCrypto};
 pub use cert::CertificateRequestMsg;
 pub use cert::{certificate_verify_content, verify_signature, CertificateMsg, CertificateVerify};
 pub use conn::{
-    client_handshake, server_handshake, signer_from_pkcs8_der, ClientCert, ClientConfig,
-    InsecureVerifier, ServerConfig, TlsConnection, TlsStream,
+    client_handshake, pkcs8_public_key, server_handshake, signer_from_pkcs8_der, ClientCert,
+    ClientConfig, InsecureVerifier, ServerConfig, TlsConnection, TlsStream,
 };
 pub use engine::{
     ClientHandshake, Level, Secret, SecretPair, ServerHandshake, EXT_QUIC_TRANSPORT_PARAMETERS,

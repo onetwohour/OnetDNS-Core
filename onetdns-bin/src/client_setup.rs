@@ -462,13 +462,17 @@ impl Endpoints {
     }
 
     /// `profile` signed with the served certificate, which Apple devices show as verified. None
-    /// when this machine does not trust the certificate for the hostname: a device would not trust
-    /// the signature either.
+    /// when this machine does not trust the certificate for the hostname, since a device would not
+    /// trust the signature either, or when the key is not ECDSA P-256, the only one CMS signs with.
     pub(crate) fn sign_profile(&self, profile: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let Some(cert) = self.certificate.as_ref().filter(|cert| cert.trusted) else {
             return Ok(None);
         };
-        let Some(signer) = &cert.signer else {
+        let Some(signer) = cert
+            .signer
+            .as_ref()
+            .filter(|signer| signer.scheme == onetdns_tls::msg::consts::ECDSA_SECP256R1_SHA256)
+        else {
             return Ok(None);
         };
         crate::cms::signed_data(profile, &cert.der, signer.scheme, &*signer.sign).map(Some)

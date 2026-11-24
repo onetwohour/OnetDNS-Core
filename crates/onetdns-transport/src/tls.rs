@@ -326,14 +326,15 @@ pub fn parse_pem(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>
 
 /// A mismatched pair starts but fails every handshake, so it is caught before the listener opens.
 pub fn verify_key_matches_cert(cert_der: &[u8], key_pkcs8_der: &[u8]) -> Result<(), TlsError> {
-    use p256::elliptic_curve::sec1::ToSec1Point;
-    use p256::pkcs8::DecodePrivateKey;
-    let secret = p256::SecretKey::from_pkcs8_der(key_pkcs8_der)
-        .map_err(|e| TlsError::NoKey(format!("Could not parse PKCS#8 P-256 private key: {e}")))?;
-    let point = secret.public_key().to_sec1_point(false);
+    let public_key = onetdns_tls::pkcs8_public_key(key_pkcs8_der).ok_or_else(|| {
+        TlsError::NoKey(
+            "Could not parse the PKCS#8 private key; ECDSA P-256 or ML-DSA-44 is required"
+                .to_string(),
+        )
+    })?;
     let x = onetdns_tls::X509::parse(cert_der)
         .map_err(|e| TlsError::NoCert(format!("Could not parse X.509: {e:?}")))?;
-    if x.public_key != point.as_bytes() {
+    if x.public_key != public_key {
         return Err(TlsError::Mismatch(
             "Private key does not match the certificate public key".to_string(),
         ));

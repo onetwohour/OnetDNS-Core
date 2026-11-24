@@ -227,7 +227,7 @@ pub(crate) fn inspect_tls_material(
         .ok_or("The certificate chain is empty".to_string())?;
     if onetdns_tls::ServerConfig::from_chain_pkcs8(certs.to_vec(), key).is_none() {
         return Err(
-            "Could not parse the certificate and private key; ECDSA P-256 in PKCS#8 is required"
+            "Could not parse the certificate and private key; ECDSA P-256 or ML-DSA-44 in PKCS#8 is required"
                 .to_string(),
         );
     }

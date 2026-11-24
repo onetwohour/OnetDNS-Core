@@ -918,7 +918,7 @@ fn reconcile_encrypted(
     config_path: Option<&std::path::Path>,
     runtime_cfg: &Arc<onetdns_core::ArcSwap<Config>>,
 ) -> Result<(), String> {
-    const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 certificate and private key";
+    const NEED_TLS: &str = "Encrypted DNS needs queries to be forwarded to upstream servers or resolved recursively, plus an ECDSA P-256 or ML-DSA-44 certificate and private key";
     let self_signed_file = crate::tls_material::self_signed_file(config_path);
     let self_signed_file = self_signed_file.as_deref();
 
