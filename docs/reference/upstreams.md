@@ -42,7 +42,7 @@ Plain DNS server addresses used for UDP or TCP forwarding.
 upstream_urls = ["h3://1.1.1.1/dns-query#cloudflare-dns.com"]
 ```
 
-Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, DoH3 with h3://, and Oblivious DoH with odoh://; a DNSCrypt server is given by its sdns:// stamp. Add # and a relay stamp after it to ask through an Anonymized DNSCrypt relay.
+Upstream DNS servers reached over an encrypted connection. DoT addresses start with tls://, DoH with https://, DoQ with quic://, DoH3 with h3://, and Oblivious DoH with odoh://; a DNSCrypt server is given by its sdns:// stamp. Append # and a relay stamp to a DNSCrypt stamp to query through an Anonymized DNSCrypt relay.
 
 An Oblivious DoH upstream names the proxy and, in its query string, the target: `odoh://proxy.example/proxy-path?targethost=odoh.example&targetpath=/dns-query`. `#name` after it sets the proxy's TLS server name. Both `targethost` and `targetpath` are required, written without percent-encoding; `targethost` may carry a port. See [Oblivious DoH upstreams](../resolution.md#oblivious-doh-upstreams).
 
@@ -398,7 +398,7 @@ Name server address ranges that recursive lookups may query. Private addresses t
 recurse_opportunistic_encryption = true
 ```
 
-Asks authoritative servers that answer over DoT or DoQ that way, as RFC 9539 describes. Certificates are not checked, so this stops eavesdropping but not an attacker on the path.
+Queries authoritative servers over DoT or DoQ when they support it, as RFC 9539 describes. Certificates are not checked, so this stops eavesdropping but not an attacker on the path.
 
 After a server answers a query in plaintext, the same query is asked again in the background over DoT on port 853, or over DoQ on port 853 if DoT has failed. Once that gets an answer, later queries to the server go over encryption for up to three days after its last encrypted answer. If an encrypted query fails or is slow, the server is asked in plaintext within the same query time limit. A server whose encryption fails is not tried again for one day.
 
