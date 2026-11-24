@@ -404,6 +404,8 @@ Queries authoritative servers over DoT or DoQ when they support it, as RFC 9539 
 
 After a server answers a query in plaintext, the same query is asked again in the background over DoT on port 853, or over DoQ on port 853 if DoT has failed. Once that gets an answer, later queries to the server go over encryption for up to three days after its last encrypted answer. If an encrypted query fails or is slow, the server is asked in plaintext within the same query time limit. A server whose encryption fails is not tried again for one day.
 
+The dashboard's Upstreams page lists the servers tried, most recent first. Each row is one server and protocol: encrypted means queries to it go that way, checking means a probe is running, failed means it is asked in plaintext until the day is over, and expired means the result is too old to count and the server is tried again after its next plaintext answer. `GET /v1/upstreams/authority-encryption` returns the same list. Results are kept in memory and start empty after a restart.
+
 **Requirement:** This option is meaningful only with `backend = "recurse"` or `"split"`. It turns off the fast path for recursive queries not in the cache, which sends only plain UDP.
 
 ### `recurse_deny_answers`

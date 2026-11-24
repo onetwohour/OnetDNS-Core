@@ -138,6 +138,14 @@ impl<K: Hash + Eq, V> LruMap<K, V> {
         self.nodes[idx as usize].as_mut().map(|node| &mut node.val)
     }
 
+    /// In no particular order, and without changing recency.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.nodes
+            .iter()
+            .flatten()
+            .map(|node| (&node.key, &node.val))
+    }
+
     /// Keeps the arena allocation so a reload does not allocate again.
     pub fn clear(&mut self) {
         self.map.clear();
@@ -448,6 +456,20 @@ mod tests {
         assert_eq!(m.get(&1), Some(&10));
         assert_eq!(m.get(&2), Some(&20));
         assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn iter_skips_freed_slots() {
+        let mut m: LruMap<u32, u32> = LruMap::new(3);
+        m.put(1, 10);
+        m.put(2, 20);
+        m.put(3, 30);
+        m.pop(&2);
+        m.put(4, 40);
+        m.put(5, 50);
+        let mut seen: Vec<_> = m.iter().map(|(k, v)| (*k, *v)).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [(3, 30), (4, 40), (5, 50)]);
     }
 
     #[cfg(target_pointer_width = "64")]

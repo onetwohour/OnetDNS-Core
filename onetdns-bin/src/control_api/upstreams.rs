@@ -4,6 +4,9 @@ use super::*;
 use crate::config_edit::{rewrite_config_string_array, upstream_key, upstream_values};
 use crate::native_config::stable_resource_id;
 
+/// Enough for the dashboard; `total` still counts every endpoint.
+const AUTHORITY_ENCRYPTION_SHOWN: usize = 500;
+
 impl ControlDeps {
     pub(super) fn upstream_test(&self, body: &str) -> Result<String, String> {
         let route = upstream::UpstreamRoute::forwarding(&self.runtime_cfg.load());
@@ -99,6 +102,34 @@ impl ControlDeps {
             })
             .collect();
         format!("[{}]", items.join(","))
+    }
+
+    pub(super) fn authority_encryption(&self) -> String {
+        let statuses = onetdns_forward::endpoint_statuses();
+        let now = std::time::SystemTime::now();
+        let items: Vec<String> = statuses
+            .iter()
+            .take(AUTHORITY_ENCRYPTION_SHOWN)
+            .map(|status| {
+                let checked_at = status
+                    .age
+                    .and_then(|age| now.checked_sub(age))
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or_else(|| "null".to_string(), |at| at.as_secs().to_string());
+                format!(
+                    "{{\"addr\":{},\"protocol\":\"{}\",\"state\":\"{}\",\"checked_at\":{}}}",
+                    onetdns_core::json::escape(&status.endpoint.ip().to_string()),
+                    status.encryption.name(),
+                    status.state.name(),
+                    checked_at
+                )
+            })
+            .collect();
+        format!(
+            "{{\"servers\":[{}],\"total\":{}}}",
+            items.join(","),
+            statuses.len()
+        )
     }
 
     pub(super) fn upstream_add(&self, entry: &str) -> Result<String, String> {

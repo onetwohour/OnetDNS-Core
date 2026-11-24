@@ -207,6 +207,7 @@ pub(crate) fn build(deps: ControlDeps) -> onetdns_control::Controls {
         filter_apply_status: bind!(deps.filter_apply_status()),
         clients_list: bind!(deps.clients_list()),
         upstreams_list: bind!(deps.upstreams_list()),
+        authority_encryption: bind!(deps.authority_encryption()),
         jobs_list: bind!(deps.jobs_list()),
         job_get: bind!(deps.job_get(id: u64)),
         job_refresh: bind!(deps.job_refresh()),

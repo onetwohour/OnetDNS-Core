@@ -49,6 +49,13 @@ impl Encryption {
         }
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            Encryption::Dot => "dot",
+            Encryption::Doq => "doq",
+        }
+    }
+
     fn alpn(self) -> &'static [u8] {
         match self {
             Encryption::Dot => b"dot",
@@ -125,6 +132,48 @@ impl OpportunisticEncryption {
     }
 }
 
+/// What decides how one encrypted endpoint is used now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointState {
+    /// Answered within `PERSISTENCE`, so queries to the server go this way.
+    Encrypted,
+    Probing,
+    /// Failed within `DAMPING`, so it is not tried again until then.
+    Failed,
+    /// The last result is too old to decide anything; the next plaintext answer probes again.
+    Expired,
+}
+
+impl EndpointState {
+    pub fn name(self) -> &'static str {
+        match self {
+            EndpointState::Encrypted => "encrypted",
+            EndpointState::Probing => "probing",
+            EndpointState::Failed => "failed",
+            EndpointState::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointStatus {
+    pub endpoint: SocketAddr,
+    pub encryption: Encryption,
+    pub state: EndpointState,
+    /// Since the last answer or failure; `None` while probing.
+    pub age: Option<Duration>,
+}
+
+/// Every endpoint this process has probed, the most recent result first.
+pub fn endpoint_statuses() -> Vec<EndpointStatus> {
+    let mut statuses = memory()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .statuses(Instant::now());
+    statuses.sort_by_key(|status| status.age.unwrap_or_default());
+    statuses
+}
+
 type Key = (SocketAddr, Encryption);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +184,32 @@ enum Status {
     Answered(Instant),
 
     Failed(Instant),
+}
+
+impl Status {
+    fn state(self, now: Instant) -> (EndpointState, Option<Duration>) {
+        match self {
+            Status::Probing => (EndpointState::Probing, None),
+            Status::Answered(at) => {
+                let age = now.saturating_duration_since(at);
+                let state = if age < PERSISTENCE {
+                    EndpointState::Encrypted
+                } else {
+                    EndpointState::Expired
+                };
+                (state, Some(age))
+            }
+            Status::Failed(at) => {
+                let age = now.saturating_duration_since(at);
+                let state = if age < DAMPING {
+                    EndpointState::Failed
+                } else {
+                    EndpointState::Expired
+                };
+                (state, Some(age))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,8 +235,9 @@ impl Memory {
 
     fn route(&mut self, keys: [Key; 2], now: Instant) -> Option<Key> {
         keys.into_iter().find(|key| {
-            matches!(self.status.get(key),
-                Some(Status::Answered(at)) if now.saturating_duration_since(*at) < PERSISTENCE)
+            self.status
+                .get(key)
+                .is_some_and(|status| status.state(now).0 == EndpointState::Encrypted)
         })
     }
 
@@ -172,9 +248,9 @@ impl Memory {
             return None;
         }
         for key in keys {
-            match self.status.get(&key) {
-                Some(Status::Probing) => return None,
-                Some(Status::Failed(at)) if now.saturating_duration_since(*at) < DAMPING => {}
+            match self.status.get(&key).map(|status| status.state(now).0) {
+                Some(EndpointState::Probing) => return None,
+                Some(EndpointState::Failed) => {}
                 _ => {
                     self.status.put(key, Status::Probing);
                     return Some(key);
@@ -195,6 +271,21 @@ impl Memory {
                 }
             }
         }
+    }
+
+    fn statuses(&self, now: Instant) -> Vec<EndpointStatus> {
+        self.status
+            .iter()
+            .map(|(&(endpoint, encryption), status)| {
+                let (state, age) = status.state(now);
+                EndpointStatus {
+                    endpoint,
+                    encryption,
+                    state,
+                    age,
+                }
+            })
+            .collect()
     }
 
     /// For a probe that ended without recording anything.
@@ -602,6 +693,49 @@ mod tests {
             memory.claim_probe(keys, later),
             Some(dot),
             "DoT is probed again"
+        );
+    }
+
+    #[test]
+    fn statuses_say_what_decides_each_endpoint() {
+        let dot = (SocketAddr::from(([192, 0, 2, 3], 853)), Encryption::Dot);
+        let doq = (dot.0, Encryption::Doq);
+        let other = (SocketAddr::from(([192, 0, 2, 4], 853)), Encryption::Dot);
+        let mut memory = Memory::new(8);
+        let start = Instant::now();
+        memory.record(dot, Outcome::Failed, start);
+        memory.record(doq, Outcome::Answered, start);
+        memory.claim_probe([other, (other.0, Encryption::Doq)], start);
+
+        let state_at = |memory: &Memory, key: Key, now| {
+            memory
+                .statuses(now)
+                .into_iter()
+                .find(|status| (status.endpoint, status.encryption) == key)
+                .map(|status| (status.state, status.age))
+        };
+        let soon = start + Duration::from_secs(5);
+        assert_eq!(
+            state_at(&memory, dot, soon),
+            Some((EndpointState::Failed, Some(Duration::from_secs(5))))
+        );
+        assert_eq!(
+            state_at(&memory, doq, soon),
+            Some((EndpointState::Encrypted, Some(Duration::from_secs(5))))
+        );
+        assert_eq!(
+            state_at(&memory, other, soon),
+            Some((EndpointState::Probing, None))
+        );
+        assert_eq!(
+            state_at(&memory, dot, start + DAMPING).map(|(state, _)| state),
+            Some(EndpointState::Expired),
+            "a failure stops deciding once damping ends"
+        );
+        assert_eq!(
+            state_at(&memory, doq, start + PERSISTENCE).map(|(state, _)| state),
+            Some(EndpointState::Expired),
+            "an answer stops deciding once persistence ends"
         );
     }
 

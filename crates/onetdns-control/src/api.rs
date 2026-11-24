@@ -734,6 +734,9 @@ pub struct Controls {
     /// Upstream servers and their scores.
     pub upstreams_list: Box<dyn Fn() -> String + Send + Sync>,
 
+    /// Per authoritative server, whether recursion reaches it over DoT or DoQ (RFC 9539).
+    pub authority_encryption: Box<dyn Fn() -> String + Send + Sync>,
+
     /// Long-running jobs.
     pub jobs_list: Box<dyn Fn() -> String + Send + Sync>,
 
@@ -923,6 +926,7 @@ impl Controls {
             filter_apply_status: Box::new(|| "{\"pending\":false,\"error\":null}".to_string()),
             clients_list: Box::new(|| "[]".to_string()),
             upstreams_list: Box::new(|| "[]".to_string()),
+            authority_encryption: Box::new(|| "{\"servers\":[],\"total\":0}".to_string()),
             jobs_list: Box::new(|| "[]".to_string()),
             job_get: Box::new(|_| Err("Job not found".to_string())),
             job_refresh: Box::new(|| "{\"id\":0,\"status\":\"running\"}".to_string()),
@@ -5114,6 +5118,11 @@ fn route_dispatch(
         )),
         ("PATCH", "/v1/clients") => result_resp((st.controls.client_update)(body, filter_apply)),
         ("GET", "/v1/upstreams") => ("200 OK", "application/json", (st.controls.upstreams_list)()),
+        ("GET", "/v1/upstreams/authority-encryption") => (
+            "200 OK",
+            "application/json",
+            (st.controls.authority_encryption)(),
+        ),
 
         ("POST", "/v1/upstreams") => match upstream_field(body) {
             Ok(addr) => result_resp((st.controls.upstream_add)(&addr)),
@@ -5577,6 +5586,7 @@ fn openapi_json() -> String {
     "/v1/filter/rules": { "get": { "tags": ["Filtering"], "summary": "User block and allow rules, and domains answered with REFUSED", "responses": { "200": { "description": "{block,allow,refused_domains}" } } }, "post": { "tags": ["Filtering"], "summary": "Add a filter rule (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["block", "allow", "refused_domain"] }, "rule": { "type": "string" } }, "required": ["kind", "rule"] } } } }, "responses": { "200": { "description": "{updated:true}" } } }, "delete": { "tags": ["Filtering"], "summary": "Delete a filter rule (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["block", "allow", "refused_domain"] }, "rule": { "type": "string" } }, "required": ["kind", "rule"] } } } }, "responses": { "200": { "description": "{updated:true}" } } } },
     "/v1/clients": { "get": { "tags": ["Clients"], "summary": "Per-client policies", "responses": { "200": { "description": "[{name,nets,client_ids,tags,block_rules,disable_filtering}]" } } }, "post": { "tags": ["Clients"], "summary": "Add a client policy (admin only): ordinary block and allow policies apply without dropping connections; a dedicated upstream DNS server or a new MAC match restarts the DNS service", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "ids": { "type": "array", "items": { "type": "string" } }, "client_ids": { "type": "array", "items": { "type": "string" } }, "mac": { "type": "array", "items": { "type": "string" } }, "tags": { "type": "array", "items": { "type": "string" } }, "block": { "type": "array", "items": { "type": "string" } }, "allow": { "type": "array", "items": { "type": "string" } }, "blocked_services": { "type": "array", "items": { "type": "string" } }, "disable_filtering": { "type": "boolean" }, "safe_search": { "type": "boolean" } }, "required": ["name"] } } } }, "responses": { "200": { "description": "{added,reloading}" }, "400": { "description": "{error}" } } }, "patch": { "tags": ["Clients"], "summary": "Turn filtering on or off for a client (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" }, "disable_filtering": { "type": "boolean" } }, "required": ["name", "disable_filtering"] } } } }, "responses": { "200": { "description": "{updated,disable_filtering,reloading}" } } }, "delete": { "tags": ["Clients"], "summary": "Delete a client policy (admin only)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } } } }, "responses": { "200": { "description": "{removed,reloading}" }, "400": { "description": "{error}" } } } },
     "/v1/upstreams": { "get": { "tags": ["Resolution"], "summary": "Upstream DNS servers", "responses": { "200": { "description": "[{id,addr,queries?,ok?,fail?,ewma_ms?}]" } } }, "post": { "tags": ["Resolution"], "summary": "Add an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{added,mode,restart_required}" }, "400": { "description": "{error}" } } }, "delete": { "tags": ["Resolution"], "summary": "Delete an upstream DNS server (admin only; applies without dropping connections)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "addr": { "type": "string" } }, "required": ["addr"], "additionalProperties": false } } } }, "responses": { "200": { "description": "{removed,mode,restart_required}" }, "400": { "description": "{error}" } } } },
+    "/v1/upstreams/authority-encryption": { "get": { "tags": ["Resolution"], "summary": "Authoritative servers that recursion has tried over DoT or DoQ, most recent first (at most 500; total counts all)", "responses": { "200": { "description": "{servers:[{addr,protocol,state,checked_at}],total}; state is encrypted, probing, failed, or expired" } } } },
     "/v1/jobs": { "get": { "tags": ["Jobs"], "summary": "Background jobs", "responses": { "200": { "description": "[{id,kind,status,created,finished,result}]" } } } },
     "/v1/jobs/refresh": { "post": { "tags": ["Jobs"], "summary": "Start a blocklist refresh job (admin only)", "responses": { "200": { "description": "{id,status}" } } } },
     "/v1/jobs/{id}": { "get": { "tags": ["Jobs"], "summary": "Status of one job (polling)", "responses": { "200": { "description": "{id,kind,status,...}" }, "404": { "description": "{error}" } } } },
@@ -6306,6 +6316,7 @@ mod tests {
             filter_apply_status: Box::new(|| "{\"pending\":true,\"error\":null}".to_string()),
             clients_list: Box::new(|| "[]".to_string()),
             upstreams_list: Box::new(|| "[]".to_string()),
+            authority_encryption: Box::new(|| "{\"servers\":[],\"total\":0}".to_string()),
             jobs_list: Box::new(|| "[{\"id\":1,\"status\":\"done\"}]".to_string()),
             job_get: Box::new(|id| {
                 if id == 1 {
