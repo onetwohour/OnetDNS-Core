@@ -27,7 +27,7 @@ const MAGIC: &[u8; 8] = b"ONETFST\0";
 /// to bump. Its hash is written in the header and compared on read, so editing this text along with
 /// the layout makes older files get rejected and rebuilt. The cache can always be rebuilt, so there
 /// is no reason to migrate it.
-const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:edge_starts+terminal_bits|edges:labels,targets,outputs|sources";
+const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:blocks(header,labels,edges(target,output,tail))|tails|sources";
 
 /// A parsed list file: one list's domain entries and the rest of its rules as text.
 const LIST_MAGIC: &[u8; 8] = b"ONETLST\0";

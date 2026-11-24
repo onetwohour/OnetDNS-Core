@@ -15,7 +15,31 @@ use crate::table::{DomainTable, SortedDomains};
 const NONE: u32 = u32::MAX;
 const TERMINAL_BIT: u32 = 1 << 31;
 const EDGE_COUNT_MASK: u32 = !TERMINAL_BIT;
-const MAP_HEADER_BYTES: usize = 17;
+const MAP_HEADER_BYTES: usize = 13;
+
+/// A little-endian `u16`: the edge count in the low bits, the terminal flag in the top bit.
+const STATE_HEADER_BYTES: usize = 2;
+const HEADER_COUNT_MASK: u16 = 0x1ff;
+const HEADER_TERMINAL: u16 = 1 << 15;
+/// Little-endian `u32`s: the target block, the output added to the rank, and the tail position.
+const EDGE_RECORD_BYTES: usize = 12;
+
+/// About 0.4% of names outside the set pass a [`Prefilter`] this size.
+const PREFILTER_BITS_PER_NAME: usize = 12;
+const PREFILTER_BLOCK_BITS: usize = 512;
+/// In smaller sets a walk that finds nothing ends about as fast as hashing every suffix.
+const PREFILTER_MIN_NAMES: usize = 256;
+/// One odd multiplier per word, so a name's bits in the eight words are independent.
+const PREFILTER_SALTS: [u32; 8] = [
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
+];
 
 /// The length fits in one byte.
 const MAX_EDGE_TAIL: usize = 255;
@@ -60,34 +84,162 @@ impl PackedState {
 #[derive(Debug, Default)]
 /// Immutable once built.
 pub(crate) struct CompactDomainMap {
-    /// The first edge of each state. Its length is the state count plus one, and the last value is
-    /// the total edge count.
-    ///
-    /// Edges are laid out contiguously in state order, so a state's edge count is the next state's
-    /// start minus its own. Storing a count per state would hold the same information twice.
-    state_edges: Box<[u32]>,
-    state_terminal: Box<[u64]>,
-    edge_labels: Box<[u8]>,
-    edge_targets: Box<[u32]>,
-    /// Added when the edge is taken; the sum along a path is the name's rank.
-    edge_outputs: Box<[u32]>,
-    /// Where the bytes an edge consumes after its first label sit; 0 means none. The first byte
-    /// there is the length and the bytes follow. Edges with the same bytes point at the same place,
-    /// so each run is stored once.
-    edge_tails: Box<[u32]>,
-    /// Index 0 is left empty to mean none.
+    /// Every state as one block, the root at 0: a header with the edge count and the terminal
+    /// flag, the edge labels in order, then one record per edge. A step reads one block, so a walk
+    /// waits on one load per state instead of one per array.
+    states: Box<[u8]>,
+    /// An edge's tail position points at a length byte followed by the bytes the edge consumes
+    /// after its label. Position 0 means none, so the first byte is left empty.
     tail_bytes: Box<[u8]>,
+    prefilter: Prefilter,
     sources: SourceTable,
 }
 
-struct CollapsedArrays {
-    state_edges: Box<[u32]>,
-    state_terminal: Box<[u64]>,
-    edge_labels: Box<[u8]>,
-    edge_targets: Box<[u32]>,
-    edge_outputs: Box<[u32]>,
-    edge_tails: Box<[u32]>,
-    tail_bytes: Box<[u8]>,
+/// One state's block.
+#[derive(Clone, Copy)]
+struct Block<'a> {
+    labels: &'a [u8],
+    edges: &'a [u8],
+    terminal: bool,
+}
+
+impl Block<'_> {
+    /// Target block, rank output, and tail position.
+    #[inline]
+    fn edge(self, position: usize) -> Option<(u32, u32, u32)> {
+        let at = position * EDGE_RECORD_BYTES;
+        let record: &[u8; EDGE_RECORD_BYTES] = self
+            .edges
+            .get(at..at + EDGE_RECORD_BYTES)?
+            .try_into()
+            .ok()?;
+        let word = |offset: usize| {
+            u32::from_le_bytes([
+                record[offset],
+                record[offset + 1],
+                record[offset + 2],
+                record[offset + 3],
+            ])
+        };
+        Some((word(0), word(4), word(8)))
+    }
+
+    fn len(self) -> usize {
+        STATE_HEADER_BYTES + self.labels.len() + self.edges.len()
+    }
+}
+
+#[derive(Debug, Default)]
+/// A blocked Bloom filter over a map's names. A name sets one bit in each word of one 64-byte
+/// block, so a check reads one cache line. A name it rejects is not in the map; one it passes is
+/// still walked, so it never decides a match.
+struct Prefilter {
+    /// Empty means every name may be in the map.
+    blocks: Box<[[u64; 8]]>,
+}
+
+impl Prefilter {
+    /// Empty, sized for `names`. None for a set too small to gain from one, or when it cannot be
+    /// allocated; every lookup then walks, which is still correct.
+    fn for_names(names: usize) -> Option<Self> {
+        if names < PREFILTER_MIN_NAMES {
+            return None;
+        }
+        let blocks = names
+            .checked_mul(PREFILTER_BITS_PER_NAME)?
+            .div_ceil(PREFILTER_BLOCK_BITS);
+        let blocks = filled_vec(
+            blocks,
+            [0u64; 8],
+            "Out of memory storing the compact filter prefilter",
+        )
+        .ok()?;
+        Some(Self {
+            blocks: blocks.into_boxed_slice(),
+        })
+    }
+
+    fn insert(&mut self, name: &[u8]) {
+        let hash = name_hash(name);
+        let index = self.block_index(hash);
+        for (word, bits) in self.blocks[index].iter_mut().enumerate() {
+            *bits |= prefilter_bit(hash, word);
+        }
+    }
+
+    #[inline]
+    fn block_index(&self, hash: u64) -> usize {
+        (((hash >> 32) * self.blocks.len() as u64) >> 32) as usize
+    }
+
+    /// Checks all eight words without stopping early, so no branch waits on the block's load.
+    #[inline]
+    fn passes(&self, hash: u64) -> bool {
+        let block = &self.blocks[self.block_index(hash)];
+        block.iter().enumerate().fold(true, |all, (word, bits)| {
+            all & (bits & prefilter_bit(hash, word) != 0)
+        })
+    }
+
+    #[inline]
+    fn may_contain(&self, name: &[u8]) -> bool {
+        self.blocks.is_empty() || self.passes(name_hash(name))
+    }
+
+    /// Whether any suffix starting at a label boundary may be in the map. The hash is built from
+    /// the end, so each suffix's hash is on hand when its boundary is reached. Every boundary is
+    /// checked before deciding, so the blocks load in parallel.
+    #[inline]
+    fn may_contain_suffix(&self, name: &[u8]) -> bool {
+        if self.blocks.is_empty() {
+            return true;
+        }
+        let mut state = NAME_HASH_SEED;
+        let mut any = false;
+        for at in (0..name.len()).rev() {
+            state = absorb(state, name[at]);
+            if at == 0 || name[at - 1] == b'.' {
+                any |= self.passes(finish(state));
+            }
+        }
+        any
+    }
+
+    fn storage_bytes(&self) -> usize {
+        self.blocks.len() * size_of::<[u64; 8]>()
+    }
+}
+
+const NAME_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Hashes from the last byte to the first, as [`Prefilter::may_contain_suffix`] reads suffixes.
+#[inline]
+fn name_hash(name: &[u8]) -> u64 {
+    finish(
+        name.iter()
+            .rev()
+            .fold(NAME_HASH_SEED, |state, byte| absorb(state, *byte)),
+    )
+}
+
+#[inline]
+fn absorb(state: u64, byte: u8) -> u64 {
+    (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// Spreads every input bit over the whole word; the byte step alone leaves the high bits weak.
+#[inline]
+fn finish(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ hash >> 33
+}
+
+#[inline]
+fn prefilter_bit(hash: u64, word: usize) -> u64 {
+    1 << ((hash as u32).wrapping_mul(PREFILTER_SALTS[word]) >> 26)
 }
 
 #[derive(Debug, Default)]
@@ -383,36 +535,41 @@ fn staging_beats_direct(
 
 impl CompactDomainMap {
     #[inline]
-    fn state_count(&self) -> usize {
-        self.state_edges.len().saturating_sub(1)
+    fn header(&self, at: usize) -> Option<u16> {
+        let bytes = self.states.get(at..at.checked_add(STATE_HEADER_BYTES)?)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     #[inline]
-    fn state(&self, index: usize) -> Option<PackedState> {
-        let first = *self.state_edges.get(index)?;
-        let end = *self.state_edges.get(index + 1)?;
-        Some(PackedState::new(
-            first,
-            end.checked_sub(first)? as usize,
-            self.terminal(index),
-        ))
+    fn block(&self, at: usize) -> Option<Block<'_>> {
+        let header = self.header(at)?;
+        let labels_at = at + STATE_HEADER_BYTES;
+        let count = usize::from(header & HEADER_COUNT_MASK);
+        let edges_at = labels_at + count;
+        Some(Block {
+            labels: self.states.get(labels_at..edges_at)?,
+            edges: self
+                .states
+                .get(edges_at..edges_at + count * EDGE_RECORD_BYTES)?,
+            terminal: header & HEADER_TERMINAL != 0,
+        })
     }
 
-    fn iter_states(&self) -> impl Iterator<Item = PackedState> + '_ {
-        (0..self.state_count()).filter_map(|index| self.state(index))
-    }
-
-    #[inline]
-    /// Out of range reads as an empty state.
-    fn state_at(&self, index: usize) -> PackedState {
-        self.state(index)
-            .unwrap_or_else(|| PackedState::new(0, 0, false))
+    /// Every block with its position, in layout order, up to the first one that does not fit.
+    fn blocks(&self) -> impl Iterator<Item = (usize, Block<'_>)> + '_ {
+        let mut at = 0usize;
+        std::iter::from_fn(move || {
+            let block = self.block(at)?;
+            let here = at;
+            at += block.len();
+            Some((here, block))
+        })
     }
 
     #[inline]
     /// Empty when there are none.
-    fn edge_tail(&self, edge: usize) -> Option<&[u8]> {
-        let at = *self.edge_tails.get(edge)? as usize;
+    fn edge_tail(&self, at: u32) -> Option<&[u8]> {
+        let at = at as usize;
         if at == 0 {
             return Some(&[]);
         }
@@ -421,24 +578,22 @@ impl CompactDomainMap {
     }
 
     #[inline]
-    fn terminal(&self, index: usize) -> bool {
-        let Some(word) = self.state_terminal.get(index / 64) else {
-            return false;
-        };
-        word >> (index % 64) & 1 == 1
+    fn terminal(&self, at: usize) -> bool {
+        self.header(at)
+            .is_some_and(|header| header & HEADER_TERMINAL != 0)
     }
 
-    /// Folds branchless intermediate states so one edge consumes several bytes. A state with one
-    /// outgoing edge, not terminal, and no rank to add is only a pass-through, yet it costs 8 bytes
-    /// of state and 12 of edge for one byte of information. Each such run is appended after the
-    /// leading edge's label and the intermediate states are removed. Several edges can point at the
-    /// same run, so each run is stored once.
-    fn collapse_chains(
+    /// Folds branchless intermediate states so one edge consumes several bytes, then writes every
+    /// remaining state as one block. A state with one outgoing edge, not terminal, and no rank to
+    /// add is only a pass-through, yet it would cost a header and an edge record for one byte of
+    /// information. Each such run is stored once after the leading edge's label, and several edges
+    /// can point at the same run.
+    fn lay_out(
         states: &[PackedState],
         edge_labels: &[u8],
         edge_targets: &[u32],
         edge_outputs: &[u32],
-    ) -> CollapsedArrays {
+    ) -> (Box<[u8]>, Box<[u8]>) {
         // The root is never folded; folding it would lose the start.
         let passthrough = |index: usize| -> bool {
             if index == 0 {
@@ -452,7 +607,7 @@ impl CompactDomainMap {
 
         // A state where folding stopped at the length limit must stay: removing it as a
         // pass-through would leave that edge with no target. So where folding stops is settled
-        // first, and numbering comes after.
+        // first, and positions come after.
         let mut keep: Vec<bool> = (0..states.len()).map(|index| !passthrough(index)).collect();
         let mut pending: Vec<usize> = (0..states.len()).filter(|index| keep[*index]).collect();
         while let Some(index) = pending.pop() {
@@ -472,43 +627,32 @@ impl CompactDomainMap {
             }
         }
 
-        let mut new_id = vec![NONE; states.len()];
-        let mut kept = 0u32;
-        let mut edge_total = 0usize;
+        // Blocks follow in state order, so every position is known before any block is written.
+        let mut block_at = vec![NONE; states.len()];
+        let mut size = 0usize;
         for index in 0..states.len() {
-            if !keep[index] {
-                continue;
+            if keep[index] {
+                block_at[index] = size as u32;
+                size += STATE_HEADER_BYTES + states[index].edge_count() * (1 + EDGE_RECORD_BYTES);
             }
-            new_id[index] = kept;
-            kept += 1;
-            edge_total += states[index].edge_count();
         }
+        debug_assert!(size <= u32::MAX as usize, "callers check blocks_fit");
 
-        let mut state_edges = Vec::with_capacity(kept as usize + 1);
-        let mut terminal_bits = vec![0u64; (kept as usize).div_ceil(64)];
-        let mut labels = Vec::with_capacity(edge_total);
-        let mut targets = Vec::with_capacity(edge_total);
-        let mut outputs = Vec::with_capacity(edge_total);
-        let mut tails = Vec::with_capacity(edge_total);
-        // Index 0 is left empty so it cannot collide with the none marker.
+        let mut blocks = Vec::with_capacity(size);
+        // Position 0 is left empty so it cannot collide with the none marker.
         let mut tail_bytes = vec![0u8];
         let mut tail_at = vec![NONE; states.len()];
-
         for index in 0..states.len() {
             if !keep[index] {
                 continue;
-            }
-            let id = new_id[index] as usize;
-            if states[index].terminal() {
-                terminal_bits[id / 64] |= 1 << (id % 64);
             }
             let state = states[index];
             let first = state.first_edge as usize;
-            state_edges.push(labels.len() as u32);
-            for edge in first..first + state.edge_count() {
-                labels.push(edge_labels[edge]);
-                outputs.push(edge_outputs[edge]);
-
+            let end = first + state.edge_count();
+            let terminal = if state.terminal() { HEADER_TERMINAL } else { 0 };
+            blocks.extend_from_slice(&(state.edge_count() as u16 | terminal).to_le_bytes());
+            blocks.extend_from_slice(&edge_labels[first..end]);
+            for edge in first..end {
                 let entry = edge_targets[edge] as usize;
                 let mut walk = entry;
                 let mut length = 0usize;
@@ -516,14 +660,13 @@ impl CompactDomainMap {
                     length += 1;
                     walk = edge_targets[states[walk].first_edge as usize] as usize;
                 }
-                if length == 0 {
-                    tails.push(0);
+                let tail = if length == 0 {
+                    0
                 } else if tail_at[entry] != NONE {
-                    tails.push(tail_at[entry]);
+                    tail_at[entry]
                 } else {
                     let at = tail_bytes.len() as u32;
                     tail_at[entry] = at;
-                    tails.push(at);
                     tail_bytes.push(length as u8);
                     let mut cursor = entry;
                     for _ in 0..length {
@@ -531,21 +674,15 @@ impl CompactDomainMap {
                         tail_bytes.push(edge_labels[only]);
                         cursor = edge_targets[only] as usize;
                     }
-                }
-                targets.push(new_id[walk]);
+                    at
+                };
+                blocks.extend_from_slice(&block_at[walk].to_le_bytes());
+                blocks.extend_from_slice(&edge_outputs[edge].to_le_bytes());
+                blocks.extend_from_slice(&tail.to_le_bytes());
             }
         }
-        state_edges.push(labels.len() as u32);
-
-        CollapsedArrays {
-            state_edges: state_edges.into_boxed_slice(),
-            state_terminal: terminal_bits.into_boxed_slice(),
-            edge_labels: labels.into_boxed_slice(),
-            edge_targets: targets.into_boxed_slice(),
-            edge_outputs: outputs.into_boxed_slice(),
-            edge_tails: tails.into_boxed_slice(),
-            tail_bytes: tail_bytes.into_boxed_slice(),
-        }
+        debug_assert_eq!(blocks.len(), size);
+        (blocks.into_boxed_slice(), tail_bytes.into_boxed_slice())
     }
 
     /// After building, checks that every entry is found again at its own rank. If any is not,
@@ -578,7 +715,7 @@ impl CompactDomainMap {
         let total_bytes = sorted
             .iter()
             .try_fold(0usize, |total, (key, _)| total.checked_add(key.len()))
-            .filter(|total| *total < u32::MAX as usize);
+            .filter(|total| blocks_fit(*total));
         let Some(total_bytes) = total_bytes else {
             return Err(fallback(&sorted));
         };
@@ -613,6 +750,12 @@ impl CompactDomainMap {
         if offsets.len() < 2 {
             return Ok(Self::default());
         }
+        if !offsets
+            .last()
+            .is_some_and(|total| blocks_fit(*total as usize))
+        {
+            return Err(rebuild_input_table(&domains, &offsets, &sources));
+        }
         let mut builder = DawgBuilder::new();
         for window in offsets.windows(2) {
             let (start, end) = (window[0] as usize, window[1] as usize);
@@ -638,21 +781,31 @@ impl CompactDomainMap {
             sources.len() as u32,
             "Validated compact filter item count changed while packing"
         );
-        let collapsed = Self::collapse_chains(&states, &edge_labels, &edge_targets, &edge_outputs);
+        let (blocks, tail_bytes) =
+            Self::lay_out(&states, &edge_labels, &edge_targets, &edge_outputs);
         drop(states);
         drop(edge_labels);
         drop(edge_targets);
         drop(edge_outputs);
         Self {
-            state_edges: collapsed.state_edges,
-            state_terminal: collapsed.state_terminal,
-            edge_labels: collapsed.edge_labels,
-            edge_targets: collapsed.edge_targets,
-            edge_outputs: collapsed.edge_outputs,
-            edge_tails: collapsed.edge_tails,
-            tail_bytes: collapsed.tail_bytes,
+            states: blocks,
+            tail_bytes,
+            prefilter: Prefilter::default(),
             sources,
         }
+        .with_prefilter()
+    }
+
+    fn with_prefilter(mut self) -> Self {
+        if let Some(mut prefilter) = Prefilter::for_names(self.len()) {
+            if self
+                .for_each_entry(|_, key, _| prefilter.insert(key.as_bytes()))
+                .is_ok()
+            {
+                self.prefilter = prefilter;
+            }
+        }
+        self
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -664,13 +817,9 @@ impl CompactDomainMap {
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.state_edges.len() * size_of::<u32>()
-            + self.state_terminal.len() * size_of::<u64>()
-            + self.edge_labels.len()
-            + self.edge_targets.len() * size_of::<u32>()
-            + self.edge_outputs.len() * size_of::<u32>()
-            + self.edge_tails.len() * size_of::<u32>()
+        self.states.len()
             + self.tail_bytes.len()
+            + self.prefilter.storage_bytes()
             + self.sources.storage_bytes()
     }
 
@@ -692,7 +841,7 @@ impl CompactDomainMap {
         &self,
         mut visitor: impl FnMut(usize, &str, u32),
     ) -> Result<(), &'static str> {
-        if self.state_count() == 0 {
+        if self.states.is_empty() {
             return if self.sources.is_empty() {
                 Ok(())
             } else {
@@ -702,19 +851,18 @@ impl CompactDomainMap {
 
         let mut reversed = Vec::new();
         let mut forward = Vec::new();
-        // The fourth value is how many bytes were pushed on entering this slot. One edge carries
+        // The fifth value is how many bytes were pushed on entering this slot. One edge carries
         // several bytes, so popping a single byte on the way out would corrupt the name.
         let mut stack = vec![(0usize, 0usize, 0u32, false, 0usize)];
         while !stack.is_empty() {
             let frame_index = stack.len() - 1;
-            let (state_index, next_edge, rank, terminal_emitted, pushed) = stack[frame_index];
-            let _ = pushed;
-            let state = self
-                .state(state_index)
+            let (at, next_edge, rank, terminal_emitted, _) = stack[frame_index];
+            let block = self
+                .block(at)
                 .ok_or("Automaton traversal state is out of range")?;
             if !terminal_emitted {
                 stack[frame_index].3 = true;
-                if state.terminal() {
+                if block.terminal {
                     let index = rank as usize;
                     let source = self.source(index).ok_or("Automaton rank has no source")?;
                     forward.clear();
@@ -726,33 +874,20 @@ impl CompactDomainMap {
                 continue;
             }
 
-            if next_edge < state.edge_count() {
-                let edge = (state.first_edge as usize)
-                    .checked_add(next_edge)
-                    .ok_or("Could not compute automaton edge position")?;
+            if next_edge < block.labels.len() {
                 stack[frame_index].1 += 1;
-                let label = *self
-                    .edge_labels
-                    .get(edge)
-                    .ok_or("Automaton edge has no label")?;
-                let target = *self
-                    .edge_targets
-                    .get(edge)
-                    .ok_or("Automaton edge has no target")? as usize;
+                let (target, output, tail) = block
+                    .edge(next_edge)
+                    .ok_or("Automaton edge has no record")?;
                 let child_rank = rank
-                    .checked_add(
-                        *self
-                            .edge_outputs
-                            .get(edge)
-                            .ok_or("Automaton edge has no output")?,
-                    )
+                    .checked_add(output)
                     .ok_or("Automaton traversal rank overflowed")?;
-                reversed.push(label);
+                reversed.push(block.labels[next_edge]);
                 let tail = self
-                    .edge_tail(edge)
+                    .edge_tail(tail)
                     .ok_or("Could not read automaton edge tail bytes")?;
                 reversed.extend_from_slice(tail);
-                stack.push((target, 0, child_rank, false, 1 + tail.len()));
+                stack.push((target as usize, 0, child_rank, false, 1 + tail.len()));
                 continue;
             }
 
@@ -785,44 +920,27 @@ impl CompactDomainMap {
         if encoded_len > MAX_ENCODED_MAP_BYTES {
             return Err("Compact filter map is too large");
         }
-        for value in [
-            self.state_count(),
-            self.edge_labels.len(),
-            self.sources.len(),
-            self.tail_bytes.len(),
-        ] {
+        for value in [self.states.len(), self.sources.len(), self.tail_bytes.len()] {
             let value =
                 u32::try_from(value).map_err(|_| "Compact filter map length exceeds 32 bits")?;
             output(&value.to_le_bytes());
         }
         output(&[self.sources.wire_kind()]);
-        for start in self.state_edges.iter() {
-            output(&start.to_le_bytes());
-        }
-        for word in self.state_terminal.iter() {
-            output(&word.to_le_bytes());
-        }
-        output(&self.edge_labels);
-        for values in [&self.edge_targets, &self.edge_outputs, &self.edge_tails] {
-            for value in values.iter() {
-                output(&value.to_le_bytes());
-            }
-        }
+        output(&self.states);
         output(&self.tail_bytes);
         self.sources.encode_payload_chunks(output);
         Ok(())
     }
 
-    /// Validates the whole structure after reading: cycles, out-of-range indexes, edge order,
+    /// Validates the whole structure after reading: block bounds, edge targets, cycles,
     /// reachability, and partial ranks. Using it with any of these wrong would send the verdict
     /// path into an infinite loop or a wrong read.
     pub(crate) fn decode_from(input: &mut &[u8]) -> Result<Self, &'static str> {
         let states_len = read_u32(input)? as usize;
-        let edges_len = read_u32(input)? as usize;
         let entries_len = read_u32(input)? as usize;
         let tail_len = read_u32(input)? as usize;
         let source_kind = read_u8(input)?;
-        if states_len == 0 && edges_len == 0 && entries_len == 0 {
+        if states_len == 0 && entries_len == 0 && tail_len == 0 {
             return if source_kind == SOURCE_EMPTY {
                 Ok(Self::default())
             } else {
@@ -834,12 +952,7 @@ impl CompactDomainMap {
         }
         let source_bytes = source_wire_len(source_kind, entries_len)?;
         let body_len = states_len
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(4))
-            .and_then(|bytes| bytes.checked_add(states_len.div_ceil(64).checked_mul(8)?))
-            .and_then(|bytes| bytes.checked_add(edges_len))
-            .and_then(|bytes| bytes.checked_add(edges_len.checked_mul(12)?))
-            .and_then(|bytes| bytes.checked_add(tail_len))
+            .checked_add(tail_len)
             .and_then(|bytes| bytes.checked_add(source_bytes))
             .ok_or("Could not compute compact domain map size")?;
         let encoded_len = MAP_HEADER_BYTES
@@ -849,39 +962,10 @@ impl CompactDomainMap {
             return Err("Invalid compact map serialized length");
         }
 
-        let state_edges = read_u32_vec(
+        let states = copy_bytes(
             input,
-            states_len + 1,
+            states_len,
             "Out of memory storing compact filter states",
-        )?
-        .into_boxed_slice();
-        let mut state_terminal = reserved_vec(
-            states_len.div_ceil(64),
-            "Out of memory storing compact filter final-state bits",
-        )?;
-        for _ in 0..states_len.div_ceil(64) {
-            state_terminal.push(read_u64(input)?);
-        }
-        let state_terminal = state_terminal.into_boxed_slice();
-        let edge_labels = copy_bytes(
-            input,
-            edges_len,
-            "Out of memory storing compact filter edge labels",
-        )?;
-        let edge_targets = read_u32_vec(
-            input,
-            edges_len,
-            "Out of memory storing compact filter edge targets",
-        )?;
-        let edge_outputs = read_u32_vec(
-            input,
-            edges_len,
-            "Out of memory storing compact filter edge outputs",
-        )?;
-        let edge_tails = read_u32_vec(
-            input,
-            edges_len,
-            "Out of memory storing compact filter edge tail offsets",
         )?;
         let tail_bytes = copy_bytes(
             input,
@@ -894,22 +978,25 @@ impl CompactDomainMap {
             source_kind,
             "Out of memory storing compact filter sources",
         )?;
-        let map = Self {
-            state_edges,
-            state_terminal,
-            edge_labels: edge_labels.into_boxed_slice(),
-            edge_targets: edge_targets.into_boxed_slice(),
-            edge_outputs: edge_outputs.into_boxed_slice(),
-            edge_tails: edge_tails.into_boxed_slice(),
+        let mut map = Self {
+            states: states.into_boxed_slice(),
             tail_bytes: tail_bytes.into_boxed_slice(),
+            prefilter: Prefilter::default(),
             sources,
         };
-        map.validate_decoded()?;
+        // Validation visits every name anyway, so the prefilter is filled on the way.
+        let mut prefilter = Prefilter::for_names(map.len());
+        map.validate_decoded(|name| {
+            if let Some(prefilter) = prefilter.as_mut() {
+                prefilter.insert(name.as_bytes());
+            }
+        })?;
+        map.prefilter = prefilter.unwrap_or_default();
         Ok(map)
     }
 
     pub(crate) fn lookup_exact<'a>(&self, domain: &'a str) -> Option<CompactMatch<'a>> {
-        if self.state_count() == 0 {
+        if self.states.is_empty() || !self.prefilter.may_contain(domain.as_bytes()) {
             return None;
         }
         let bytes = domain.as_bytes();
@@ -928,7 +1015,7 @@ impl CompactDomainMap {
     /// Matches only at label boundaries; otherwise evil-example.com would match an example.com
     /// rule.
     pub(crate) fn lookup_suffix<'a>(&self, domain: &'a str) -> Option<CompactMatch<'a>> {
-        if self.state_count() == 0 {
+        if self.states.is_empty() || !self.prefilter.may_contain_suffix(domain.as_bytes()) {
             return None;
         }
         let bytes = domain.as_bytes();
@@ -962,113 +1049,105 @@ impl CompactDomainMap {
 
     fn encoded_len(&self) -> Option<usize> {
         MAP_HEADER_BYTES
-            .checked_add(self.state_edges.len().checked_mul(4)?)?
-            .checked_add(self.state_terminal.len().checked_mul(8)?)?
-            .checked_add(self.edge_labels.len())?
-            .checked_add(self.edge_targets.len().checked_mul(4)?)?
-            .checked_add(self.edge_outputs.len().checked_mul(4)?)?
-            .checked_add(self.edge_tails.len().checked_mul(4)?)?
+            .checked_add(self.states.len())?
             .checked_add(self.tail_bytes.len())?
             .checked_add(self.sources.wire_len()?)
     }
 
-    fn validate_decoded(&self) -> Result<(), &'static str> {
-        if self.edge_labels.len() != self.edge_targets.len()
-            || self.edge_labels.len() != self.edge_outputs.len()
-        {
-            return Err("Compact map array length invariant violated");
-        }
-
-        // Edge counts come from the difference of adjacent starts, so if this array is not
-        // monotonic a state silently disappears and validation passes while reading the wrong
-        // edges.
-        if self.state_edges.first() != Some(&0)
-            || self.state_edges.last().map(|last| *last as usize) != Some(self.edge_labels.len())
-        {
-            return Err("Compact filter edge start offsets do not match at the ends");
-        }
-        if self.state_edges.windows(2).any(|pair| pair[0] > pair[1]) {
-            return Err("Compact filter edge start offsets are not increasing");
-        }
-        if self.state_terminal.len() != self.state_count().div_ceil(64) {
-            return Err("Compact filter final-state bit length does not match the state count");
-        }
-        // Unless the spare bits are pinned to 0, the same set encodes to different bytes.
-        let spare = self.state_terminal.len() * 64 - self.state_count();
-        if spare > 0
-            && self
-                .state_terminal
-                .last()
-                .is_some_and(|word| word >> (64 - spare) != 0)
-        {
-            return Err("Compact filter final-state bits have unused bits set");
-        }
-
-        if self.edge_tails.len() != self.edge_labels.len() {
-            return Err("Compact filter edge tail array length does not match");
-        }
-        // Index 0 is the none marker and must not be read as bytes.
-        if self.tail_bytes.len() == 1 && self.edge_tails.iter().any(|at| *at != 0) {
-            return Err("Compact filter edge points to tail bytes that do not exist");
-        }
-        for at in self.edge_tails.iter() {
-            let at = *at as usize;
-            if at == 0 {
-                continue;
+    fn validate_decoded(&self, mut each_name: impl FnMut(&str)) -> Result<(), &'static str> {
+        // The blocks must parse one after another up to the end, and an edge may point only where
+        // one starts; any other position would read labels out of record bytes.
+        let len = self.states.len();
+        let mut starts = filled_vec(
+            len.div_ceil(64),
+            0u64,
+            "Out of memory storing compact filter state positions",
+        )?;
+        let mut state_count = 0usize;
+        let mut end = 0usize;
+        for (at, block) in self.blocks() {
+            let header = self.header(at).unwrap_or(u16::MAX);
+            if header & !(HEADER_COUNT_MASK | HEADER_TERMINAL) != 0 {
+                return Err("Compact filter state header has unused bits set");
             }
-            let Some(length) = self.tail_bytes.get(at).map(|value| *value as usize) else {
-                return Err("Compact filter edge points to a missing tail");
-            };
-            if length == 0 || at + 1 + length > self.tail_bytes.len() {
-                return Err("Invalid compact filter tail length");
-            }
-        }
-
-        let mut edge_cursor = 0usize;
-        for state in self.iter_states() {
-            let first = state.first_edge as usize;
-            let count = state.edge_count();
-            let end = first
-                .checked_add(count)
-                .ok_or("Compact filter edge range overflowed")?;
-            if first != edge_cursor || end > self.edge_labels.len() || count > 256 {
-                return Err("Invalid compact filter edge range");
-            }
-            let labels = &self.edge_labels[first..end];
-            if labels.windows(2).any(|pair| pair[0] >= pair[1]) {
+            if block.labels.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err("Compact filter edge labels are not sorted");
             }
-            if self.edge_targets[first..end]
-                .iter()
-                .any(|target| *target as usize >= self.state_count())
-            {
-                return Err("Invalid compact filter edge target");
-            }
-            edge_cursor = end;
+            starts[at / 64] |= 1 << (at % 64);
+            state_count += 1;
+            end = at + block.len();
         }
-        if edge_cursor != self.edge_labels.len() {
-            return Err("Compact filter has unreferenced edge data");
+        if end != len {
+            return Err("Compact filter state blocks do not fill the state data");
+        }
+        let mut before = reserved_vec(
+            starts.len(),
+            "Out of memory storing compact filter state positions",
+        )?;
+        let mut seen = 0usize;
+        for word in &starts {
+            before.push(seen);
+            seen += word.count_ones() as usize;
+        }
+        let index_of = |at: u32| -> Option<usize> {
+            let at = at as usize;
+            let word = *starts.get(at / 64)?;
+            let bit = at % 64;
+            (word >> bit & 1 == 1)
+                .then(|| before[at / 64] + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+        };
+
+        for (_, block) in self.blocks() {
+            for position in 0..block.labels.len() {
+                let (target, _, tail) = block
+                    .edge(position)
+                    .ok_or("Compact filter edge record is missing")?;
+                if index_of(target).is_none() {
+                    return Err("Invalid compact filter edge target");
+                }
+                // Position 0 is the none marker and must not be read as bytes.
+                if tail != 0 {
+                    let tail = tail as usize;
+                    let Some(length) = self.tail_bytes.get(tail).map(|value| *value as usize)
+                    else {
+                        return Err("Compact filter edge points to a missing tail");
+                    };
+                    if length == 0 || tail + 1 + length > self.tail_bytes.len() {
+                        return Err("Invalid compact filter tail length");
+                    }
+                }
+            }
         }
 
         const VISITING: u32 = NONE - 1;
         let mut calculated = filled_vec(
-            self.state_count(),
+            state_count,
             NONE,
             "Out of memory storing compact filter graph counts",
         )?;
         let mut stack = reserved_vec(
-            self.state_count().min(256),
+            state_count.min(256),
             "Out of memory storing the compact filter traversal stack",
         )?;
+        let target_index = |block: Block<'_>, position: usize| -> Result<usize, &'static str> {
+            let (target, _, _) = block
+                .edge(position)
+                .ok_or("Compact filter edge record is missing")?;
+            index_of(target).ok_or("Invalid compact filter edge target")
+        };
         calculated[0] = VISITING;
         stack.push((0usize, 0usize));
-        while let Some((state_index, next_edge)) = stack.last_mut() {
-            let state = self.state_at(*state_index);
-            let first = state.first_edge as usize;
-            let count = state.edge_count();
-            if *next_edge < count {
-                let target = self.edge_targets[first + *next_edge] as usize;
+        while let Some((at, next_edge)) = stack.last_mut() {
+            let at = *at;
+            let block = self
+                .block(at)
+                .ok_or("Compact filter state is out of range")?;
+            if *next_edge < block.labels.len() {
+                let (target_at, _, _) = block
+                    .edge(*next_edge)
+                    .ok_or("Compact filter edge record is missing")?;
                 *next_edge += 1;
+                let target = index_of(target_at).ok_or("Invalid compact filter edge target")?;
                 match calculated[target] {
                     NONE => {
                         calculated[target] = VISITING;
@@ -1077,46 +1156,49 @@ impl CompactDomainMap {
                                 "Out of memory storing the compact filter traversal stack"
                             })?;
                         }
-                        stack.push((target, 0));
+                        stack.push((target_at as usize, 0));
                     }
                     VISITING => return Err("Compact automaton has a cycle"),
                     _ => {}
                 }
                 continue;
             }
-            let mut terms = u64::from(state.terminal());
-            for target in &self.edge_targets[first..first + count] {
+            let mut terms = u64::from(block.terminal);
+            for position in 0..block.labels.len() {
                 terms = terms
-                    .checked_add(u64::from(calculated[*target as usize]))
+                    .checked_add(u64::from(calculated[target_index(block, position)?]))
                     .ok_or("Compact subtree term count overflowed")?;
             }
             let terms = u32::try_from(terms)
                 .map_err(|_| "Compact filter subtree has too many terminal entries")?;
-            calculated[*state_index] = terms;
+            let index = index_of(at as u32).ok_or("Compact filter state is out of range")?;
+            calculated[index] = terms;
             stack.pop();
         }
         if calculated.iter().any(|count| *count >= VISITING)
-            || calculated[0] as usize != self.sources.len()
+            || calculated.first().map(|count| *count as usize) != Some(self.sources.len())
         {
             return Err("Compact automaton reachable and final state counts do not match");
         }
 
-        for state in self.iter_states() {
-            let first = state.first_edge as usize;
-            let end = first + state.edge_count();
-            let mut expected = u32::from(state.terminal());
-            for edge in first..end {
-                if self.edge_outputs[edge] != expected {
+        for (_, block) in self.blocks() {
+            let mut expected = u32::from(block.terminal);
+            for position in 0..block.labels.len() {
+                let (_, output, _) = block
+                    .edge(position)
+                    .ok_or("Compact filter edge record is missing")?;
+                if output != expected {
                     return Err("Compact edge output rank does not match");
                 }
                 expected = expected
-                    .checked_add(calculated[self.edge_targets[edge] as usize])
+                    .checked_add(calculated[target_index(block, position)?])
                     .ok_or("Compact edge output computation overflowed")?;
             }
         }
         let mut expected_index = 0usize;
         let mut ranks_match = true;
         self.for_each_entry(|index, key, _| {
+            each_name(key);
             if index != expected_index
                 || self.lookup_exact(key).map(|found| found.index) != Some(index)
             {
@@ -1135,16 +1217,13 @@ impl CompactDomainMap {
     #[inline]
     fn step(
         &self,
-        state_index: usize,
+        at: usize,
         rank: u32,
         bytes: &[u8],
         eaten: usize,
     ) -> Option<(usize, u32, usize)> {
-        // Choosing an edge needs only the edge range. Reading the terminal flag too would touch
-        // another array per byte for a value not used here.
-        let first = *self.state_edges.get(state_index)? as usize;
-        let end = *self.state_edges.get(state_index + 1)? as usize;
-        let labels = self.edge_labels.get(first..end)?;
+        let block = self.block(at)?;
+        let labels = block.labels;
         let label = *bytes.get(bytes.len().checked_sub(eaten + 1)?)?;
         let position = match labels.len() {
             0 => return None,
@@ -1154,32 +1233,36 @@ impl CompactDomainMap {
             _ => labels.binary_search(&label).ok()?,
         };
 
-        let edge = first + position;
+        let (target, output, tail) = block.edge(position)?;
         let mut eaten = eaten + 1;
-        let tail = self.edge_tail(edge)?;
-        for expected in tail {
+        for expected in self.edge_tail(tail)? {
             if *bytes.get(bytes.len().checked_sub(eaten + 1)?)? != *expected {
                 return None;
             }
             eaten += 1;
         }
-
-        let next_rank = rank + *self.edge_outputs.get(edge)?;
-        let target = *self.edge_targets.get(edge)? as usize;
-        Some((target, next_rank, eaten))
+        Some((target as usize, rank + output, eaten))
     }
+
+    #[cfg(test)]
+    fn state_count(&self) -> usize {
+        self.blocks().count()
+    }
+}
+
+/// Block positions are `u32`. Every edge consumes at least one name byte and every state but the
+/// root is entered by an edge, so the blocks take at most one header and one labelled edge record
+/// per name byte, plus the root header.
+fn blocks_fit(name_bytes: usize) -> bool {
+    name_bytes
+        .checked_mul(STATE_HEADER_BYTES + 1 + EDGE_RECORD_BYTES)
+        .and_then(|bytes| bytes.checked_add(STATE_HEADER_BYTES))
+        .is_some_and(|bytes| bytes <= u32::MAX as usize)
 }
 
 fn read_u32(input: &mut &[u8]) -> Result<u32, &'static str> {
     let bytes = take_bytes(input, 4)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64(input: &mut &[u8]) -> Result<u64, &'static str> {
-    let bytes = take_bytes(input, 8)?;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(bytes);
-    Ok(u64::from_le_bytes(word))
 }
 
 fn read_u8(input: &mut &[u8]) -> Result<u8, &'static str> {
@@ -1825,18 +1908,8 @@ mod tests {
         table
     }
 
-    fn state_area_bytes(map: &CompactDomainMap) -> usize {
-        map.state_edges.len() * size_of::<u32>() + map.state_terminal.len() * size_of::<u64>()
-    }
-
     fn source_payload_start(map: &CompactDomainMap) -> usize {
-        MAP_HEADER_BYTES
-            + state_area_bytes(map)
-            + map.edge_labels.len()
-            + map.edge_targets.len() * size_of::<u32>()
-            + map.edge_outputs.len() * size_of::<u32>()
-            + map.edge_tails.len() * size_of::<u32>()
-            + map.tail_bytes.len()
+        MAP_HEADER_BYTES + map.states.len() + map.tail_bytes.len()
     }
 
     fn owned_entries(map: &CompactDomainMap) -> Vec<(String, u32)> {
@@ -1888,12 +1961,9 @@ mod tests {
         assert!(found_start >= query_start && found_start < query_end);
         assert_eq!(
             map.storage_bytes(),
-            state_area_bytes(&map)
-                + map.edge_labels.len()
-                + map.edge_targets.len() * size_of::<u32>()
-                + map.edge_outputs.len() * size_of::<u32>()
-                + map.edge_tails.len() * size_of::<u32>()
+            map.states.len()
                 + map.tail_bytes.len()
+                + map.prefilter.storage_bytes()
                 + map.sources.storage_bytes(),
             "compact map에는 도메인 문자열이나 offset 배열을 상주시키지 않는다"
         );
@@ -2176,8 +2246,19 @@ mod tests {
                 source += 1;
             }
         }
-        let compact =
+        let built =
             CompactDomainMap::try_from_table(table_from_reference(&reference)).expect("compact");
+        assert!(
+            !built.prefilter.blocks.is_empty(),
+            "이 크기에는 사전 필터가 붙어야 합니다"
+        );
+        let mut encoded = Vec::new();
+        built.encode_into(&mut encoded).expect("encode");
+        let compact = CompactDomainMap::decode_from(&mut encoded.as_slice()).expect("decode");
+        assert!(
+            !compact.prefilter.blocks.is_empty(),
+            "디코딩한 맵에도 사전 필터가 붙어야 합니다"
+        );
 
         for (domain, expected) in &reference {
             let found = compact
@@ -2237,10 +2318,13 @@ mod tests {
     fn equivalent_suffix_languages_share_states() {
         let map = compact(&[("ab", 1), ("ac", 2)]);
         assert_eq!(map.state_count(), 2);
-        assert_eq!(map.edge_labels.len(), 2);
-        assert_eq!(map.edge_targets[0], map.edge_targets[1]);
-        assert_eq!(map.edge_tails[0], map.edge_tails[1]);
-        assert_eq!(map.edge_tail(0), Some(b"a".as_slice()));
+        let root = map.block(0).expect("root");
+        assert_eq!(root.labels.len(), 2);
+        let (first_target, _, first_tail) = root.edge(0).expect("first edge");
+        let (second_target, _, second_tail) = root.edge(1).expect("second edge");
+        assert_eq!(first_target, second_target);
+        assert_eq!(first_tail, second_tail);
+        assert_eq!(map.edge_tail(first_tail), Some(b"a".as_slice()));
     }
 
     #[test]
@@ -2261,14 +2345,60 @@ mod tests {
                 .and_then(|found| map.source(found.index)),
             Some(5)
         );
-        assert!(
-            map.edge_tails.iter().any(|at| *at != 0),
-            "접힌 엣지가 없습니다"
-        );
+        assert!(map.tail_bytes.len() > 1, "접힌 엣지가 없습니다");
         let mut encoded = Vec::new();
         map.encode_into(&mut encoded).expect("encode");
         let decoded = CompactDomainMap::decode_from(&mut encoded.as_slice()).expect("decode");
         assert_eq!(decoded.lookup_exact(&key).map(|found| found.index), Some(1));
+    }
+
+    #[test]
+    /// The prefilter may let an absent name through but must never stop a present one, at any
+    /// label boundary.
+    fn prefilter_passes_every_entry_and_its_subdomains() {
+        let fillers: Vec<String> = (0..PREFILTER_MIN_NAMES)
+            .map(|n| format!("filler{n}.test"))
+            .collect();
+        let mut entries = vec![
+            ("ads.example.com", 1),
+            ("tracker.test", 2),
+            ("한글.example", 3),
+            ("x", 4),
+        ];
+        entries.extend(fillers.iter().map(|name| (name.as_str(), 5)));
+        let map = compact(&entries);
+        assert!(
+            !map.prefilter.blocks.is_empty(),
+            "사전 필터가 붙지 않았습니다"
+        );
+        for (query, expected) in [
+            ("ads.example.com", Some("ads.example.com")),
+            ("deep.ads.example.com", Some("ads.example.com")),
+            ("a.b.tracker.test", Some("tracker.test")),
+            ("사이트.한글.example", Some("한글.example")),
+            ("y.x", Some("x")),
+            ("example.com", None),
+            ("bads.example.com", None),
+        ] {
+            assert_eq!(
+                map.lookup_suffix(query).map(|found| found.key),
+                expected,
+                "{query}"
+            );
+        }
+        assert!(map.lookup_exact("tracker.test").is_some());
+        assert!(map.lookup_exact("deep.tracker.test").is_none());
+
+        let rejected = (0..1000)
+            .filter(|n| {
+                !map.prefilter
+                    .may_contain(format!("absent{n}.test").as_bytes())
+            })
+            .count();
+        assert!(
+            rejected > 900,
+            "rejected only {rejected} of 1000 absent names"
+        );
     }
 
     #[test]
@@ -2319,9 +2449,8 @@ mod tests {
         let mut encoded = Vec::new();
         map.encode_into(&mut encoded).expect("encode");
 
-        let states = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
-        let edges = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
-        let first_target = MAP_HEADER_BYTES + (states + 1) * 4 + states.div_ceil(64) * 8 + edges;
+        let root_edges = usize::from(encoded[MAP_HEADER_BYTES]);
+        let first_target = MAP_HEADER_BYTES + STATE_HEADER_BYTES + root_edges;
         let mut cyclic = encoded.clone();
         cyclic[first_target..first_target + 4].copy_from_slice(&0u32.to_le_bytes());
         assert!(CompactDomainMap::decode_from(&mut cyclic.as_slice()).is_err());
