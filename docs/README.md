@@ -23,6 +23,7 @@
 - [Client policies](clients.md): identity matching, per-client rules and verification from the correct client.
 - [Resolution](resolution.md): forwarding, recursion, split mode, stub zones, caching and DNSSEC.
 - [Encrypted DNS](encrypted-dns.md): DoT, DoH, DoH3, DoQ, DNSCrypt and certificate setup.
+- [Cryptography](cryptography.md): TLS versions and cipher suites, DNSCrypt, DNSSEC algorithms and how stored secrets are protected.
 - [Advanced services](advanced-services.md): authoritative zones, DHCP, ACME and clustering with prerequisites.
 
 ## Operations and API

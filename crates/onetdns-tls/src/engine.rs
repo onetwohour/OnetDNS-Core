@@ -9,9 +9,10 @@ use crate::cert::{
     CertificateVerify, REQUESTED_SIGNATURE_SCHEMES,
 };
 use crate::conn::{
-    choose_server_key_share, client_config_wire_is_valid, client_key_shares, client_shared_secret,
-    new_key_exchange, respond_key_exchange, retry_key_share, server_config_wire_is_valid,
-    ClientConfig, ServerConfig, ServerKeyShare,
+    choose_server_key_share, choose_suite, client_config_wire_is_valid, client_key_shares,
+    client_shared_secret, new_key_exchange, respond_key_exchange, retry_key_share,
+    server_config_wire_is_valid, ClientConfig, ServerConfig, ServerKeyShare,
+    CLIENT_SIGNATURE_SCHEMES, TLS13_GROUPS, TLS13_SUITES,
 };
 use crate::handshake::{HandshakeMsg, HandshakeReader, HandshakeType};
 use crate::keyschedule::{
@@ -62,16 +63,6 @@ fn now_epoch() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn choose_suite_quic(offered: &[u16]) -> Option<u16> {
-    [
-        TLS_AES_128_GCM_SHA256,
-        TLS_AES_256_GCM_SHA384,
-        TLS_CHACHA20_POLY1305_SHA256,
-    ]
-    .into_iter()
-    .find(|&s| offered.contains(&s))
 }
 
 /// For diagnostic logs.
@@ -436,7 +427,7 @@ impl ServerHandshake {
                 ServerKeyShare::Offered { group, public } => (group, public),
                 ServerKeyShare::Retry(group) => {
                     let suite =
-                        choose_suite_quic(&ch.cipher_suites).ok_or(TlsError::HandshakeFailure)?;
+                        choose_suite(&ch.cipher_suites).ok_or(TlsError::HandshakeFailure)?;
                     let (hash, _) = suite_params(suite).ok_or(TlsError::Internal)?;
                     let cookie = random_32().to_vec();
                     let mut t = Transcript::new(hash);
@@ -474,7 +465,7 @@ impl ServerHandshake {
 
         let suite = self
             .hrr_suite
-            .or_else(|| choose_suite_quic(&ch.cipher_suites))
+            .or_else(|| choose_suite(&ch.cipher_suites))
             .ok_or(TlsError::HandshakeFailure)?;
         let (hash, _key_len) = suite_params(suite).ok_or(TlsError::Internal)?;
         let psk = self.try_accept_psk(
@@ -859,14 +850,8 @@ impl ClientHandshake {
             .collect();
         let mut extensions = vec![
             Extension::supported_versions_client(&[TLS13]),
-            Extension::supported_groups(&[X25519MLKEM768, X25519]),
-            Extension::signature_algorithms(&[
-                ED25519,
-                ECDSA_SECP256R1_SHA256,
-                MLDSA44,
-                RSA_PSS_RSAE_SHA256,
-                RSA_PKCS1_SHA256,
-            ]),
+            Extension::supported_groups(&TLS13_GROUPS),
+            Extension::signature_algorithms(&CLIENT_SIGNATURE_SCHEMES),
             Extension::key_share_client(&key_shares),
         ];
         if let Some(host) = cfg.sni() {
@@ -897,11 +882,7 @@ impl ClientHandshake {
             ));
         }
 
-        let mut cipher_suites = vec![
-            TLS_AES_128_GCM_SHA256,
-            TLS_AES_256_GCM_SHA384,
-            TLS_CHACHA20_POLY1305_SHA256,
-        ];
+        let mut cipher_suites = TLS13_SUITES.to_vec();
         if let Some(s) = &session {
             cipher_suites.retain(|cs| *cs != s.suite);
             cipher_suites.insert(0, s.suite);
@@ -2669,9 +2650,9 @@ mod tests {
 
         assert_eq!(
             test_client(&[b"doq"])
-                .provide(Level::Initial, &retry(Extension::key_share_hrr(SECP256R1))),
+                .provide(Level::Initial, &retry(Extension::key_share_hrr(SECP384R1))),
             Err(TlsError::IllegalParameter),
-            "엔진 클라이언트는 P-256 을 제안하지 않는다"
+            "제안하지 않은 그룹을 요구하는 재요청은 거부한다"
         );
     }
 
@@ -2929,7 +2910,8 @@ mod tests {
         for (scheme, expected) in [
             (RSA_PSS_RSAE_SHA256, Ok(())),
             (RSA_PKCS1_SHA256, Err(TlsError::IllegalParameter)),
-            (RSA_PSS_RSAE_SHA384, Err(TlsError::IllegalParameter)),
+            (RSA_PSS_RSAE_SHA384, Ok(())),
+            (RSA_PSS_RSAE_SHA512, Err(TlsError::IllegalParameter)),
         ] {
             let cfg = ServerConfig {
                 cert_chain: vec![certificate.clone()],

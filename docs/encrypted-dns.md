@@ -33,7 +33,7 @@ tls_key = "/etc/OnetDNS/privkey.pem"
 doh_path = "/dns-query"
 ```
 
-TLS 1.3 connections, from clients and to upstream servers, use the X25519MLKEM768 post-quantum hybrid key exchange when the other side supports it, and X25519 otherwise.
+The TLS versions, cipher suites and key exchanges, including the X25519MLKEM768 post-quantum hybrid, are listed in [Cryptography](cryptography.md#tls).
 
 Use only addresses assigned to the machine. The process must be able to read the certificate/key files. Binding TCP 443 and UDP 443 simultaneously is possible; they are different sockets. The same is true of TCP/UDP 853 for DoT and DoQ.
 

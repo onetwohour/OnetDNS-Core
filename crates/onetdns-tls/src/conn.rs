@@ -1160,14 +1160,30 @@ fn iv12(v: Vec<u8>) -> [u8; 12] {
     a
 }
 
-fn choose_suite(offered: &[u16]) -> Option<u16> {
-    [
-        TLS_AES_128_GCM_SHA256,
-        TLS_CHACHA20_POLY1305_SHA256,
-        TLS_AES_256_GCM_SHA384,
-    ]
-    .into_iter()
-    .find(|&s| offered.contains(&s))
+/// TLS 1.3 suites in preference order, over TCP and QUIC alike.
+pub const TLS13_SUITES: [u16; 3] = [
+    TLS_AES_128_GCM_SHA256,
+    TLS_CHACHA20_POLY1305_SHA256,
+    TLS_AES_256_GCM_SHA384,
+];
+
+/// TLS 1.3 groups in preference order. RFC 8446 makes secp256r1 mandatory.
+pub const TLS13_GROUPS: [u16; 3] = [X25519MLKEM768, X25519, SECP256R1];
+
+/// Signature schemes a client accepts from servers. RSA PKCS#1 is listed for certificate
+/// signatures only: RFC 8446 forbids it in CertificateVerify.
+pub const CLIENT_SIGNATURE_SCHEMES: [u16; 7] = [
+    ED25519,
+    ECDSA_SECP256R1_SHA256,
+    ECDSA_SECP384R1_SHA384,
+    MLDSA44,
+    RSA_PSS_RSAE_SHA256,
+    RSA_PSS_RSAE_SHA384,
+    RSA_PKCS1_SHA256,
+];
+
+pub(crate) fn choose_suite(offered: &[u16]) -> Option<u16> {
+    TLS13_SUITES.into_iter().find(|&s| offered.contains(&s))
 }
 
 pub(crate) fn new_key_exchange(group: u16) -> Result<KeyExchange, TlsError> {
@@ -1321,9 +1337,6 @@ fn accept_client_psk(
     Ok(Some(state))
 }
 
-/// In preference order. RFC 8446 makes secp256r1 mandatory.
-const SERVER_TLS13_GROUPS: [u16; 3] = [X25519MLKEM768, X25519, SECP256R1];
-
 #[derive(Debug, PartialEq)]
 pub(crate) enum ServerKeyShare {
     Offered { group: u16, public: Vec<u8> },
@@ -1338,7 +1351,7 @@ pub(crate) fn choose_server_key_share(ch: &ClientHello) -> Result<ServerKeyShare
         .ext(EXT_KEY_SHARE)
         .and_then(Extension::as_key_share_client)
         .unwrap_or_default();
-    for group in SERVER_TLS13_GROUPS {
+    for group in TLS13_GROUPS {
         if let Some((_, public)) = shares.iter().find(|(offered, _)| *offered == group) {
             return Ok(ServerKeyShare::Offered {
                 group,
@@ -1350,7 +1363,7 @@ pub(crate) fn choose_server_key_share(ch: &ClientHello) -> Result<ServerKeyShare
         .ext(EXT_SUPPORTED_GROUPS)
         .and_then(Extension::as_supported_groups)
         .unwrap_or_default();
-    SERVER_TLS13_GROUPS
+    TLS13_GROUPS
         .into_iter()
         .find(|group| supported.contains(group))
         .map(ServerKeyShare::Retry)
@@ -1864,16 +1877,8 @@ fn build_client_hello(
         .collect();
     let mut extensions = vec![
         Extension::supported_versions_client(&[TLS13, TLS12]),
-        Extension::supported_groups(&[X25519MLKEM768, X25519, SECP256R1]),
-        Extension::signature_algorithms(&[
-            ED25519,
-            ECDSA_SECP256R1_SHA256,
-            ECDSA_SECP384R1_SHA384,
-            MLDSA44,
-            RSA_PSS_RSAE_SHA256,
-            RSA_PSS_RSAE_SHA384,
-            RSA_PKCS1_SHA256,
-        ]),
+        Extension::supported_groups(&TLS13_GROUPS),
+        Extension::signature_algorithms(&CLIENT_SIGNATURE_SCHEMES),
         Extension::key_share_client(&key_shares),
     ];
     if let Some(host) = cfg.sni() {
@@ -1901,11 +1906,7 @@ fn build_client_hello(
         ));
     }
 
-    let mut cipher_suites = vec![
-        TLS_AES_128_GCM_SHA256,
-        TLS_CHACHA20_POLY1305_SHA256,
-        TLS_AES_256_GCM_SHA384,
-    ];
+    let mut cipher_suites = TLS13_SUITES.to_vec();
     if let Some(session) = session {
         cipher_suites.retain(|suite| *suite != session.suite);
         cipher_suites.insert(0, session.suite);

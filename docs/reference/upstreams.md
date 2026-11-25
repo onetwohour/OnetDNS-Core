@@ -581,9 +581,7 @@ dnssec = false
 
 Checks DNSSEC signatures to make sure answers were not forged and does not pass on answers that fail the check.
 
-Signatures are checked for algorithms 8 and 10 (RSA), 13 and 14 (ECDSA), 15 (Ed25519), and 18 (ML-DSA-44). A zone whose DS records use only other algorithms is treated as unsigned.
-
-If a zone's DS records include an ML-DSA-44 key, the zone must validate through ML-DSA-44; a valid signature in another algorithm alone fails. Otherwise a forged classical signature could stand in for a broken ML-DSA-44 one. This is stricter than RFC 6840, which accepts any one valid algorithm.
+The algorithms and DS digests it checks, and the rule for zones with ML-DSA-44 keys, are listed in [Cryptography](../cryptography.md#dnssec).
 
 ### `dnssec_strict`
 
