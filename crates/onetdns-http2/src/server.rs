@@ -1204,9 +1204,10 @@ fn queue_reply<S: Write>(
 }
 
 /// Matches the configured DoH path and extracts the client ID after it. `None` when the path does
-/// not match; `Some(None)` when it matches without an ID.
-fn match_doh_path(path_only: &[u8], expected: &str) -> Option<Option<String>> {
-    if path_only == expected.as_bytes() {
+/// not match; `Some(None)` when it matches without an ID. `/` matches too, for clients given only
+/// the server's host name.
+pub fn match_doh_path(path_only: &[u8], expected: &str) -> Option<Option<String>> {
+    if path_only == expected.as_bytes() || path_only == b"/" {
         return Some(None);
     }
     let mut prefix = expected.as_bytes().to_vec();
@@ -1687,6 +1688,7 @@ mod tests {
     #[test]
     fn doh_path_extracts_client_id() {
         assert_eq!(match_doh_path(b"/dns-query", "/dns-query"), Some(None));
+        assert_eq!(match_doh_path(b"/", "/dns-query"), Some(None));
         assert_eq!(
             match_doh_path(b"/dns-query/kids-tablet", "/dns-query"),
             Some(Some("kids-tablet".to_string()))
@@ -2877,6 +2879,16 @@ mod tests {
         let head = std::str::from_utf8(&resp).unwrap();
         assert!(head.starts_with("HTTP/1.1 404"), "404: {head}");
         drop(server);
+    }
+
+    #[test]
+    /// A client given only the server's host name asks at `/`.
+    fn doh_h1_answers_at_the_root() {
+        let status = h1_status(
+            b"POST / HTTP/1.1\r\nHost: dns.test\r\nContent-Type: application/dns-message\r\nContent-Length: 3\r\n\r\ndns"
+                .to_vec(),
+        );
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     }
 
     fn h1_status(raw: Vec<u8>) -> String {

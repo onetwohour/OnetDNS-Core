@@ -51,6 +51,8 @@ With `doh_path = "/dns-query"` and a certificate for `dns.example.com`, clients 
 https://dns.example.com/dns-query
 ```
 
+`https://dns.example.com/` without a path is answered too, for clients that take only a host name.
+
 DoH uses HTTP over TLS/TCP; DoH3 uses HTTP/3 over QUIC/UDP. A browser may support classic DoH but not manually selecting DoH3. Test UDP 443 separately. HTTP errors must be diagnosed at the HTTP layer before investigating DNS policy.
 
 ## Oblivious DoH

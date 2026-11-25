@@ -38,14 +38,7 @@ pub fn serve_doh3(
 
 fn match_doh_path(path: &[u8], expected: &str) -> bool {
     let path_only = path.split(|&b| b == b'?').next().unwrap_or(path);
-    if path_only == expected.as_bytes() {
-        return true;
-    }
-    let mut prefix = expected.as_bytes().to_vec();
-    prefix.push(b'/');
-    path_only
-        .strip_prefix(prefix.as_slice())
-        .is_some_and(|rest| !rest.is_empty() && !rest.contains(&b'/'))
+    onetdns_http2::server::match_doh_path(path_only, expected).is_some()
 }
 
 pub(crate) struct Doh3 {

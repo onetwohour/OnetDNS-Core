@@ -116,7 +116,7 @@ impl Message {
     }
 }
 
-/// The DNS query a Binary HTTP request for DoH at `doh_path` carries, read as the DoH listener
+/// The DNS query a Binary HTTP request for DoH at `doh_path` or `/` carries, read as the DoH listener
 /// reads one. `Err` is the status to answer with. The authority is not checked: the gateway only
 /// ever answers for this server's own DoH path.
 pub fn doh_query(request: &[u8], doh_path: &str) -> Result<Vec<u8>, &'static str> {
@@ -158,7 +158,7 @@ pub fn doh_query(request: &[u8], doh_path: &str) -> Result<Vec<u8>, &'static str
         }
     }
     let path_only = path.split(|&byte| byte == b'?').next().unwrap_or(b"");
-    if path_only != doh_path.as_bytes() {
+    if path_only != doh_path.as_bytes() && path_only != b"/" {
         return Err("404");
     }
     let query = match method.as_slice() {

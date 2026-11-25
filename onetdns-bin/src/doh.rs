@@ -827,6 +827,9 @@ mod tests {
         );
         let elsewhere = send("POST", "/other".into(), query.try_encode().unwrap());
         assert_eq!(elsewhere.control, Control::Response(404));
+        let at_root = send("POST", "/".into(), query.try_encode().unwrap());
+        assert_eq!(at_root.control, Control::Response(200));
+        assert_eq!(Message::parse(&at_root.content).unwrap().header.id, 0x7373);
 
         let stale = GatewayKey::new(PrivateKey::generate());
         let (encapsulated, _) = KeyConfig::from_keys(stale.keys())
