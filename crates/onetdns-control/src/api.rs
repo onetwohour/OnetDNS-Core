@@ -3549,7 +3549,7 @@ fn select_session_cookie(candidates: &[String], auth: &Auth) -> String {
 #[cfg(feature = "dashboard")]
 const FAVICON_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\">\
 <rect width=\"48\" height=\"48\" rx=\"10\" fill=\"#2f4a6b\"/>\
-<g fill=\"none\" stroke=\"#f7f3e9\" stroke-width=\"4.6\" stroke-linecap=\"round\" \
+<g fill=\"none\" stroke=\"#ffffff\" stroke-width=\"4.6\" stroke-linecap=\"round\" \
 stroke-linejoin=\"round\" transform=\"translate(5.28,5.28) scale(0.78)\">\
 <path d=\"M38 14.4A17 17 0 1 0 38 33.6\"/>\
 <path d=\"M31.5 24H39.5\"/>\
