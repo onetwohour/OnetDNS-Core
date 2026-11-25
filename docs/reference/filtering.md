@@ -131,7 +131,7 @@ Interval used to download remote blocklists and RPZ data again.
 blocked_services = ["youtube"]
 ```
 
-Built-in service categories to block.
+Selects the services to block.
 
 ### `refused_domains`
 

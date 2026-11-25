@@ -4,7 +4,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use onetdns_config::Config;
 use onetdns_core::{ArcSwap, MutexExt};
@@ -21,7 +21,14 @@ use crate::filters::{
     SERVICE_SCHEDULE_TICK_SECS,
 };
 use crate::native_config::map_block;
-use crate::{http, sleep_or_shutdown, ServiceCleanup};
+use crate::{http, service_catalog, sleep_or_shutdown, ServiceCleanup};
+
+/// Holds the downloaded lists and the service catalog; `None` without a config file.
+pub(crate) fn blocklist_cache_dir(config_path: Option<&Path>) -> Option<PathBuf> {
+    config_path
+        .and_then(Path::parent)
+        .map(|dir| dir.join("blocklist-cache"))
+}
 
 /// Downloads the subscribed lists and rebuilds; returns the block and allow rule counts. Setting the
 /// flag ends the downloads.
@@ -146,6 +153,9 @@ pub(crate) struct FilterState {
     pub(crate) deferred_rebuild: Arc<DeferredRebuild>,
     pub(crate) refresh_url_lists: ListRefresh,
     blocklist_resolver: http::HostResolver,
+    runtime_cfg: Arc<ArcSwap<Config>>,
+    /// When the service catalog is next fetched.
+    services_due: Arc<Mutex<Instant>>,
     lists_progress: Arc<Mutex<RefreshProgress>>,
     rpz_progress: Arc<Mutex<RefreshProgress>>,
     /// The stop signal `spawn_refresh` last got; the generation's until then.
@@ -164,9 +174,8 @@ impl FilterState {
         service_cleanup: &ServiceCleanup,
     ) -> BoxResult<Self> {
         let block_response = map_block(cfg);
-        let blocklist_cache_dir = config_path
-            .and_then(|p| p.parent())
-            .map(|p| p.join("blocklist-cache"));
+        let blocklist_cache_dir = blocklist_cache_dir(config_path);
+        service_catalog::load_cache(blocklist_cache_dir.as_deref());
         let compiled_filter_cache = blocklist_cache_dir
             .as_ref()
             .map(|dir| dir.join("compiled-filter.bin"));
@@ -400,6 +409,8 @@ impl FilterState {
             deferred_rebuild,
             refresh_url_lists,
             blocklist_resolver: blocklist_resolver.clone(),
+            runtime_cfg: runtime_cfg.clone(),
+            services_due: Arc::new(Mutex::new(Instant::now())),
             lists_progress: Arc::new(Mutex::new(RefreshProgress {
                 settled: subscriptions_settled,
                 ..RefreshProgress::default()
@@ -527,6 +538,61 @@ impl FilterState {
                 })
                 .with_context(|| "Could not start the RPZ refresh thread")?;
             threads.push(("rpz-refresh", thread));
+        }
+
+        {
+            let sd = stop.clone();
+            let resolver = self.blocklist_resolver.clone();
+            let cache_dir = self.subscription_cache_dir.clone();
+            let rebuild = self.rebuild.clone();
+            let runtime = self.runtime_cfg.clone();
+            let service_set = self.service_set.clone();
+            let due = self.services_due.clone();
+            let thread = std::thread::Builder::new()
+                .name("service-catalog".into())
+                .spawn(move || loop {
+                    if sleep_or_shutdown(service_catalog::TICK_SECS, &sd) {
+                        break;
+                    }
+                    // Nodes that block no service make no request.
+                    let in_use = !service_set.lock_recover().is_empty()
+                        || runtime
+                            .load()
+                            .clients
+                            .iter()
+                            .any(|client| !client.blocked_services.is_empty());
+                    if !in_use || Instant::now() < *due.lock_recover() {
+                        continue;
+                    }
+                    let result = service_catalog::refresh(&resolver, cache_dir.as_deref(), &sd);
+                    if sd.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let wait = match &result {
+                        Ok(_) => service_catalog::CHECK_INTERVAL,
+                        Err(_) => service_catalog::RETRY_INTERVAL,
+                    };
+                    *due.lock_recover() = Instant::now() + wait;
+                    match result {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            if let Err(error) = rebuild() {
+                                onetdns_core::warn!(
+                                    event = "filter.services_rebuild_failed",
+                                    %error,
+                                    "Could not apply the updated service catalog; keeping the previous filter"
+                                );
+                            }
+                        }
+                        Err(error) => onetdns_core::warn!(
+                            event = "filter.services_fetch_failed",
+                            %error,
+                            "Could not update the service catalog; retrying in an hour"
+                        ),
+                    }
+                })
+                .with_context(|| "Could not start the service catalog thread")?;
+            threads.push(("service-catalog", thread));
         }
         Ok(threads)
     }

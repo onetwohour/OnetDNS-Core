@@ -57,7 +57,7 @@ impl ControlDeps {
         apply: FilterApply,
     ) -> Result<ListCounts, String> {
         let service_set = &self.filters.service_set;
-        if enable && onetdns_filter::services::service_rules(svc).is_none() {
+        if enable && onetdns_filter::services::current().get(svc).is_none() {
             return Err(format!("Unknown blocked service: {svc}"));
         }
         let previous = service_set.lock_recover().clone();
@@ -309,16 +309,18 @@ impl ControlDeps {
 
     pub(super) fn services_catalog(&self) -> String {
         let blocked = self.filters.service_set.lock_recover().clone();
-        let all: Vec<String> = onetdns_filter::services::catalog()
+        let catalog = onetdns_filter::services::current();
+        let all: Vec<String> = catalog
+            .services
             .iter()
             .map(|service| {
-                let b = blocked.iter().any(|id| id.as_str() == service.id);
+                let b = blocked.contains(&service.id);
                 format!(
                     "{{\"id\":{},\"name\":{},\"group\":{},\"rule_count\":{},\"blocked\":{}}}",
-                    onetdns_core::json::escape(service.id),
-                    onetdns_core::json::escape(service.name),
-                    onetdns_core::json::escape(service.group),
-                    service.rules.len(),
+                    onetdns_core::json::escape(&service.id),
+                    onetdns_core::json::escape(&service.name),
+                    onetdns_core::json::escape(&service.group),
+                    service.domains.len(),
                     b
                 )
             })

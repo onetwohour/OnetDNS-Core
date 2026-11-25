@@ -111,11 +111,13 @@ pub(crate) fn mutate_user_rule(
 }
 
 fn expand_services(services: &[String]) -> Result<Vec<String>, String> {
+    let catalog = onetdns_filter::services::current();
     let mut out = vec![];
     for svc in services {
-        let rules = onetdns_filter::services::service_rules(svc)
+        let service = catalog
+            .get(svc)
             .ok_or_else(|| format!("Unsupported blocked service: {svc}"))?;
-        out.extend(rules.iter().map(|rule| (*rule).to_string()));
+        out.extend(service.rules());
     }
     Ok(out)
 }

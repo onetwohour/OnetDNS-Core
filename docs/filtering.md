@@ -15,6 +15,8 @@ Configure filtering through a subscription URL, a local list, or inline rules. D
 | Per-client policy | `[[clients]]` | Client allow/block settings may override global behavior. |
 | Specialized controls | `refused_domains`, `blocked_services`, `safe_search`, related settings | Each has its own semantics; not all are ordinary domain-list entries. |
 
+While any service is blocked, the server downloads the service list from `raw.githubusercontent.com` once a day and keeps a copy in `blocklist-cache/services.json`, so service domains change without a release. Without that connection it uses the copy, or the list built into the binary.
+
 ### Start with an explicit rule
 
 ```toml

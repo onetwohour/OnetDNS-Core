@@ -93,6 +93,7 @@ mod secondary;
 #[cfg(windows)]
 /// Windows service registration and execution.
 mod service;
+mod service_catalog;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// systemd and launchd registration.
 mod service_unix;
@@ -249,8 +250,8 @@ fn main() -> BoxResult<()> {
         Command::Top { ctl } => ctl_top(&ctl),
         Command::Services => {
             println!("Services that can be blocked:");
-            for (id, name) in onetdns_filter::services::list() {
-                println!("  {id:12} {name}");
+            for service in &onetdns_filter::services::current().services {
+                println!("  {:12} {}", service.id, service.name);
             }
             Ok(())
         }
@@ -301,6 +302,7 @@ fn gen_passwd(name: Option<String>) -> BoxResult<()> {
 /// they would show up only in the logs after startup.
 fn check_config(config: Option<PathBuf>) -> BoxResult<()> {
     let cfg = Config::load_or_default(config.as_deref())?;
+    service_catalog::load_cache(filter_runtime::blocklist_cache_dir(config.as_deref()).as_deref());
     runtime_preflight(&cfg).map_err(|error| crate::anyhow!(error))?;
 
     let mode_label = match cfg.mode {
@@ -2477,7 +2479,7 @@ fn runtime_preflight(cfg: &Config) -> Result<(), String> {
             .flat_map(|client| client.blocked_services.iter()),
     );
     for service in services {
-        if onetdns_filter::services::service_rules(service).is_none() {
+        if onetdns_filter::services::current().get(service).is_none() {
             return Err(format!("Unknown blocked service: {service}"));
         }
     }
