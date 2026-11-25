@@ -447,6 +447,12 @@ fn ask(
                 return Ok(response);
             }
             Err(error) => {
+                if matches!(error, ForwardError::Timeout) {
+                    pool()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .stop_reusing(&key);
+                }
                 onetdns_core::debug!(event = "forward.conn_retry",
                     transport = "adot",
                     addr = %endpoint,

@@ -2285,10 +2285,18 @@ struct IdlePool<K, C> {
     total: usize,
     /// False once the server has closed the connection.
     open: fn(&C) -> bool,
+    /// Servers whose connections are not kept, and until when.
+    no_reuse: HashMap<K, Instant>,
 }
 
 /// As many as concurrent queries to one server need.
 const IDLE_PER_SERVER: usize = 2;
+
+/// Some servers acknowledge a second query on a connection and never answer it. Each query
+/// would then wait out the first-try deadline before asking on a new connection.
+const NO_REUSE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+const NO_REUSE_MAX: usize = 4096;
 
 /// Recursion goes through hundreds of servers; without a cap idle connections would use up file
 /// descriptors.
@@ -2304,10 +2312,36 @@ impl<K: std::hash::Hash + Eq + Clone, C> IdlePool<K, C> {
             idle: HashMap::new(),
             total: 0,
             open,
+            no_reuse: HashMap::new(),
         }
     }
 
+    /// Called when a kept connection stayed open but left the query unanswered.
+    fn stop_reusing(&mut self, key: &K) {
+        if let Some(conns) = self.idle.remove(key) {
+            self.total -= conns.len();
+        }
+        let now = Instant::now();
+        if self.no_reuse.len() >= NO_REUSE_MAX {
+            self.no_reuse.retain(|_, until| now < *until);
+        }
+        if self.no_reuse.len() >= NO_REUSE_MAX {
+            let earliest = self
+                .no_reuse
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| key.clone());
+            if let Some(earliest) = earliest {
+                self.no_reuse.remove(&earliest);
+            }
+        }
+        self.no_reuse
+            .insert(key.clone(), now.checked_add(NO_REUSE_FOR).unwrap_or(now));
+    }
+
     fn sweep(&mut self) {
+        let now = Instant::now();
+        self.no_reuse.retain(|_, until| now < *until);
         let mut idle = std::mem::take(&mut self.idle);
         idle.retain(|_, conns| {
             conns.retain(|kept| self.usable(kept));
@@ -2339,13 +2373,18 @@ impl<K: std::hash::Hash + Eq + Clone, C> IdlePool<K, C> {
         found
     }
 
-    /// Past the per-server cap the connection is closed. At the total cap the connection unused
-    /// longest makes room, so connections to servers no longer asked cannot fill the pool.
+    /// Past the per-server cap, or for a server whose connections are not kept, the connection is
+    /// closed. At the total cap the connection unused longest makes room, so connections to servers
+    /// no longer asked cannot fill the pool.
     fn put(&mut self, key: K, conn: C) {
         if self
             .idle
             .get(&key)
             .is_some_and(|conns| conns.len() >= IDLE_PER_SERVER)
+            || self
+                .no_reuse
+                .get(&key)
+                .is_some_and(|until| Instant::now() < *until)
         {
             return;
         }
@@ -2472,6 +2511,12 @@ fn tcp_exchange(
                 return Ok(resp);
             }
             Err(error) => {
+                if matches!(error, ForwardError::Timeout) {
+                    tcp_idle_pool()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .stop_reusing(&(bind, upstream));
+                }
                 onetdns_core::debug!(event = "forward.conn_retry",
                     transport = "tcp",
                     addr = %upstream,
@@ -3256,9 +3301,17 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    /// TCP server answering each query with an empty response. With `close_after_answer` it closes
-    /// after one answer. Returns the address and the number of connections accepted.
-    fn spawn_tcp_answerer(close_after_answer: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum AfterAnswer {
+        AnswerAgain,
+        Close,
+        /// Keeps the connection open and reads later queries without answering them.
+        Ignore,
+    }
+
+    /// TCP server answering queries with an empty response. Returns the address and the number of
+    /// connections accepted.
+    fn spawn_tcp_answerer(after: AfterAnswer) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -3266,6 +3319,7 @@ mod tests {
         std::thread::spawn(move || {
             for mut stream in listener.incoming().map_while(Result::ok) {
                 counter.fetch_add(1, Ordering::SeqCst);
+                let mut answered = false;
                 std::thread::spawn(move || loop {
                     let mut len = [0u8; 2];
                     if stream.read_exact(&mut len).is_err() {
@@ -3275,6 +3329,9 @@ mod tests {
                     if stream.read_exact(&mut wire).is_err() {
                         return;
                     }
+                    if answered && after == AfterAnswer::Ignore {
+                        continue;
+                    }
                     let request = Message::parse(&wire).unwrap();
                     let mut response = Message::default();
                     response.header.id = request.header.id;
@@ -3283,9 +3340,10 @@ mod tests {
                     let wire = response.try_encode().unwrap();
                     let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
                     framed.extend_from_slice(&wire);
-                    if stream.write_all(&framed).is_err() || close_after_answer {
+                    if stream.write_all(&framed).is_err() || after == AfterAnswer::Close {
                         return;
                     }
+                    answered = true;
                 });
             }
         });
@@ -3302,7 +3360,7 @@ mod tests {
     /// A new connection costs another handshake round trip, which every query pays on networks
     /// where UDP 53 is blocked and authoritative servers are asked over TCP.
     fn tcp_exchange_reuses_the_connection_to_the_same_server() {
-        let (addr, accepted) = spawn_tcp_answerer(false);
+        let (addr, accepted) = spawn_tcp_answerer(AfterAnswer::AnswerAgain);
         ask_over_tcp(addr, 0x7001).expect("첫 질의");
         ask_over_tcp(addr, 0x7002).expect("둘째 질의");
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
@@ -3312,13 +3370,52 @@ mod tests {
     /// Authoritative servers may close idle connections within seconds; if a closed kept connection
     /// failed the query or waited for the timeout, reuse would do harm.
     fn tcp_exchange_retries_on_a_new_connection_when_the_kept_one_was_closed() {
-        let (addr, accepted) = spawn_tcp_answerer(true);
+        let (addr, accepted) = spawn_tcp_answerer(AfterAnswer::Close);
         ask_over_tcp(addr, 0x7003).expect("첫 질의");
         std::thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         ask_over_tcp(addr, 0x7004).expect("둘째 질의");
         assert!(started.elapsed() < Duration::from_millis(300));
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    /// Some authoritative servers acknowledge a second query on a connection but never answer it.
+    /// Once one does, its later queries go on new connections instead of waiting on a kept one.
+    fn tcp_exchange_stops_reusing_connections_a_server_leaves_unanswered() {
+        let (addr, accepted) = spawn_tcp_answerer(AfterAnswer::Ignore);
+        ask_over_tcp(addr, 0x7005).expect("첫 질의");
+        ask_over_tcp(addr, 0x7006).expect("답하지 않으면 새 연결로 다시 물어야 합니다");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let started = Instant::now();
+        ask_over_tcp(addr, 0x7007).expect("셋째 질의");
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "이어 둔 연결을 기다리지 않아야 합니다"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn idle_pool_keeps_no_connection_for_a_server_that_left_one_unanswered() {
+        let mut pool: IdlePool<usize, usize> = IdlePool::new(|_| true);
+        pool.put(1, 10);
+        pool.put(2, 20);
+        pool.stop_reusing(&1);
+        assert_eq!(pool.total, 1);
+        pool.put(1, 11);
+        assert_eq!(pool.take(&1), None);
+        assert_eq!(pool.take(&2), Some(20));
+
+        *pool.no_reuse.get_mut(&1).unwrap() -= NO_REUSE_FOR;
+        pool.sweep();
+        pool.put(1, 12);
+        assert_eq!(pool.take(&1), Some(12), "기한이 지나면 다시 보관합니다");
+
+        for key in 0..NO_REUSE_MAX + 10 {
+            pool.stop_reusing(&key);
+        }
+        assert_eq!(pool.no_reuse.len(), NO_REUSE_MAX);
     }
 
     #[test]
