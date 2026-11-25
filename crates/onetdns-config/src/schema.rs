@@ -1242,7 +1242,7 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_ko: "차단할 서비스를 고릅니다.",
         description_en: "Selects the services to block.",
         description_ja: "遮断するサービスを選びます。",
-        description_zh: "选择要拦截的服务。",
+        description_zh: "选择需要拦截访问的服务。",
     },
     FieldCopy {
         key: "refused_domains",
@@ -3453,7 +3453,7 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_ko: "업데이트 채널을 선택합니다.",
         description_en: "Selects the update channel.",
         description_ja: "アップデートチャネルを選びます。",
-        description_zh: "选择更新通道。",
+        description_zh: "选择接收更新的发布通道。",
     },
 ];
 
