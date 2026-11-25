@@ -39,6 +39,16 @@ pub enum BackendKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which releases an update check offers.
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+
+    /// Pre-releases as well as stable releases.
+    Alpha,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SplitTarget {
     #[default]
     Forward,
@@ -964,6 +974,7 @@ pub struct Config {
 
     /// Off stops only the periodic check; an administrator can still check and apply by hand.
     pub release_check: bool,
+    pub update_channel: UpdateChannel,
 }
 
 impl Default for Config {
@@ -1252,6 +1263,7 @@ impl Default for Config {
             dnstap_file: None,
             dnstap_identity: String::new(),
             release_check: true,
+            update_channel: UpdateChannel::Stable,
         }
     }
 }
@@ -3282,6 +3294,7 @@ impl Config {
         kv("dnstap_file", opt_p(&self.dnstap_file));
         kv("dnstap_identity", js(&self.dnstap_identity));
         kv("release_check", self.release_check.to_string());
+        kv("update_channel", lower_dbg(&self.update_channel));
 
         format!("{{{}}}", o.join(","))
     }
@@ -3834,6 +3847,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
         "tls_key",
         "tls_revocation",
         "tls_self_signed_host",
+        "update_channel",
         "upstream_proxy",
         "upstream_proxy_password",
         "upstream_proxy_username",
@@ -3914,6 +3928,7 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_enum(root, "wasm_fail_mode", &WASM_FAIL_MODE_VALUES)?;
     check_enum(root, "tls_revocation", &["off", "crl", "ocsp", "both"])?;
     check_enum(root, "acme_challenge", &["http01", "dns01"])?;
+    check_enum(root, "update_channel", &["stable", "alpha"])?;
     check_enum(
         root,
         "log_level",
@@ -5777,6 +5792,7 @@ const KNOWN_KEYS: &[&str] = &[
     "dnstap_file",
     "dnstap_identity",
     "release_check",
+    "update_channel",
 ];
 
 pub fn known_keys() -> &'static [&'static str] {
@@ -6300,6 +6316,9 @@ pub fn decode_config(root: &Value) -> Result<Config, ConfigError> {
     c.dnstap_file = gstr(root, "dnstap_file").map(PathBuf::from);
     c.dnstap_identity = gstr(root, "dnstap_identity").unwrap_or(d.dnstap_identity);
     c.release_check = gbool(root, "release_check", d.release_check);
+    if gstr(root, "update_channel").as_deref() == Some("alpha") {
+        c.update_channel = UpdateChannel::Alpha;
+    }
 
     Ok(c)
 }
@@ -6612,6 +6631,7 @@ mod tests {
             "dnscrypt_provider_name = \"\"\n",
             "dnscrypt_provider_name = \"not a name!\"\n",
             "acme_challenge = \"tls-alpn-01\"\n",
+            "update_channel = \"beta\"\n",
             "acme_directory_url = \"not a url\"\n",
             "acme_directory_url = \"http://ca.example/dir\"\n",
             "acme_contact_email = \"not-an-email\"\n",
@@ -6639,6 +6659,13 @@ mod tests {
         );
         Config::from_toml_str("listen_doh = [\"127.0.0.1:8443\"]\nodoh_proxy_targets = [\"https://odoh.example/dns-query\", \"https://[2001:db8::1]:8443/q#odoh.example\"]\n")
             .expect("ODoH proxy targets with a DoH listener");
+    }
+
+    #[test]
+    fn update_channel_defaults_to_stable() {
+        assert_eq!(Config::default().update_channel, UpdateChannel::Stable);
+        let cfg = Config::from_toml_str("update_channel = \"alpha\"\n").expect("alpha");
+        assert_eq!(cfg.update_channel, UpdateChannel::Alpha);
     }
 
     #[test]

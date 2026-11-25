@@ -1907,7 +1907,10 @@ pub fn serve(
     update::task::schedule(
         {
             let runtime = runtime_cfg.clone();
-            move || runtime.load().release_check
+            move || {
+                let cfg = runtime.load();
+                cfg.release_check.then_some(cfg.update_channel)
+            }
         },
         blocklist_resolver.clone(),
     );

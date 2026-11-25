@@ -319,6 +319,7 @@ Top-level keys are indexed alphabetically below.
 ### U
 
 [`update_allow`](authority.md#update_allow)
+[`update_channel`](administration.md#update_channel)
 [`update_policy`](authority.md#update_policy)
 [`update_tsig_required`](authority.md#update_tsig_required)
 [`upstream_concurrency`](upstreams.md#upstream_concurrency)

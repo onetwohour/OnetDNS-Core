@@ -17,6 +17,6 @@ pub use settings::{
     redact_url_credentials, AclUnlisted, BackendKind, BlockResponseKind, ClientConfig, Config,
     ConfigError, CookieMode, DynamicRecord, EcsMode, LocalAnswer, LocalZone, LocalZoneKind,
     NotifyTarget, ObliviousUpstreamPath, OhttpRelay, PolicyRule, Rewrite, ScheduleWindow,
-    SecondaryZone, SplitTarget, StubZone, TsigKeyConfig, UpdatePolicyRule, UpstreamStrategy,
-    UserConfig, ViewConfig, WasmPluginConfig, ZoneConfig,
+    SecondaryZone, SplitTarget, StubZone, TsigKeyConfig, UpdateChannel, UpdatePolicyRule,
+    UpstreamStrategy, UserConfig, ViewConfig, WasmPluginConfig, ZoneConfig,
 };

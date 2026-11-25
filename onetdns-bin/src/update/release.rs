@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
+use onetdns_config::UpdateChannel;
 
 use super::manifest::{self, Asset, ManifestError};
 use super::version::Version;
@@ -50,6 +51,7 @@ pub(crate) fn release_page(version: &str) -> String {
 /// a result.
 pub(crate) fn check(
     current: &Version,
+    channel: UpdateChannel,
     target: &str,
     keys: &[VerifyingKey],
     resolver: &HostResolver,
@@ -58,7 +60,7 @@ pub(crate) fn check(
         .ok_or_else(|| "GitHub did not find the OnetDNS release list".to_string())?;
     let listing = String::from_utf8(listing)
         .map_err(|_| "The GitHub release list is not UTF-8 text".to_string())?;
-    let Some(candidate) = newest_candidate(&listing, current)? else {
+    let Some(candidate) = newest_candidate(&listing, current, channel)? else {
         return Ok(Finding::UpToDate);
     };
     let version = candidate.to_string();
@@ -135,7 +137,11 @@ fn fetch(
 }
 
 /// Only tag names are read; tags that do not start with v or do not parse as versions are skipped.
-fn newest_candidate(listing: &str, current: &Version) -> Result<Option<Version>, String> {
+fn newest_candidate(
+    listing: &str,
+    current: &Version,
+    channel: UpdateChannel,
+) -> Result<Option<Version>, String> {
     let parsed = onetdns_core::json::parse_with_limit(listing, MAX_LISTING_BYTES as usize)
         .map_err(|error| format!("Could not read the GitHub release list: {error}"))?;
     let releases = parsed
@@ -145,7 +151,7 @@ fn newest_candidate(listing: &str, current: &Version) -> Result<Option<Version>,
         .iter()
         .filter_map(|release| release.get("tag_name")?.as_str())
         .filter_map(Version::from_tag)
-        .filter(|candidate| current.accepts(candidate))
+        .filter(|candidate| current.accepts(candidate, channel))
         .max())
 }
 
@@ -263,31 +269,47 @@ mod tests {
             "v1.0.0+build.5",
             "v01.0.0",
         ]);
+        use UpdateChannel::{Alpha, Stable};
         assert_eq!(
-            newest_candidate(&tags, &v("0.1.0-alpha.5")),
+            newest_candidate(&tags, &v("0.0.9"), Alpha),
             Ok(Some(v("0.2.0-beta.1"))),
-            "시험판은 시험판과 정식판을 모두 봅니다"
+            "알파 채널은 시험판과 정식판을 모두 봅니다"
         );
         assert_eq!(
-            newest_candidate(&tags, &v("0.0.9")),
+            newest_candidate(&tags, &v("0.0.9"), Stable),
             Ok(Some(v("0.1.0"))),
-            "정식판은 시험판으로 가지 않습니다"
+            "정식판 채널은 시험판으로 가지 않습니다"
         );
         assert_eq!(
-            newest_candidate(&tags, &v("0.2.0-beta.1")),
+            newest_candidate(&tags, &v("0.1.0-alpha.5"), Stable),
+            Ok(Some(v("0.1.0"))),
+            "시험판을 쓰다가 정식판 채널로 바꾸면 다음 정식판을 기다립니다"
+        );
+        assert_eq!(
+            newest_candidate(&tags, &v("0.2.0-beta.1"), Alpha),
             Ok(None),
             "같은 버전으로는 가지 않습니다"
         );
-        assert_eq!(newest_candidate(&listing(&[]), &v("0.1.0")), Ok(None));
+        assert_eq!(
+            newest_candidate(&listing(&[]), &v("0.1.0"), Alpha),
+            Ok(None)
+        );
     }
 
     #[test]
     fn malformed_listings_fail_the_check() {
         for body in ["{\"message\":\"API rate limit exceeded\"}", "not json", ""] {
-            assert!(newest_candidate(body, &v("0.1.0")).is_err(), "{body:?}");
+            assert!(
+                newest_candidate(body, &v("0.1.0"), UpdateChannel::Stable).is_err(),
+                "{body:?}"
+            );
         }
         assert_eq!(
-            newest_candidate("[{\"tag_name\":7},{\"name\":\"v9.0.0\"}]", &v("0.1.0")),
+            newest_candidate(
+                "[{\"tag_name\":7},{\"name\":\"v9.0.0\"}]",
+                &v("0.1.0"),
+                UpdateChannel::Stable
+            ),
             Ok(None),
             "태그 이름이 문자열이 아닌 항목은 건너뜁니다"
         );

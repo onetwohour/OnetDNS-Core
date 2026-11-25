@@ -865,6 +865,7 @@ static KEYS: &[KeySpec] = &[
     ),
     key!(dnstap_identity, Hot(Native), Node, Lanes::OPEN),
     key!(release_check, Hot(ReleaseCheck), Node, Lanes::OPEN),
+    key!(update_channel, Hot(ReleaseCheck), Node, Lanes::OPEN),
 ];
 
 #[cfg(test)]

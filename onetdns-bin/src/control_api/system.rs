@@ -83,22 +83,25 @@ impl ControlDeps {
     }
 
     pub(super) fn update_status(&self) -> String {
-        crate::update::task::status_json(self.runtime_cfg.load().release_check)
+        let cfg = self.runtime_cfg.load();
+        crate::update::task::status_json(cfg.release_check, cfg.update_channel)
     }
 
     pub(super) fn update_check(&self) -> Result<String, String> {
         crate::update::task::participation()?;
         let running = crate::update::task::begin(crate::update::task::Task::Check)?;
         let resolver = self.blocklist_resolver.clone();
+        let channel = self.runtime_cfg.load().update_channel;
         start_update_job(&self.jobs, running, move |running| {
-            crate::update::task::check(running, &resolver)
+            crate::update::task::check(running, &resolver, channel)
                 .map(|finding| crate::update::task::describe(&finding))
         })
     }
 
     pub(super) fn update_apply(&self, version: &str) -> Result<String, String> {
         let running = crate::update::task::begin(crate::update::task::Task::Apply)?;
-        let release = crate::update::task::confirmed(version)?;
+        let release =
+            crate::update::task::confirmed(version, self.runtime_cfg.load().update_channel)?;
         let resolver = self.blocklist_resolver.clone();
         let config = self.config_path.clone();
         start_update_job(&self.jobs, running, move |running| {

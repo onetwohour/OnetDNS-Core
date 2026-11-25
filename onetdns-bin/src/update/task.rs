@@ -9,6 +9,7 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
+use onetdns_config::UpdateChannel;
 use onetdns_core::MutexExt;
 
 use super::apply::{self, Swapped};
@@ -78,6 +79,8 @@ pub(crate) fn begin(task: Task) -> Result<Running, String> {
 struct Checked {
     /// Unix seconds.
     at: u64,
+    /// A result checked on another channel counts as no result.
+    channel: UpdateChannel,
     /// Err holds why the check failed.
     outcome: Result<Finding, String>,
 }
@@ -101,16 +104,20 @@ pub(crate) fn participation() -> Result<(&'static str, Vec<VerifyingKey>), Strin
 }
 
 /// Neither records nor logs the result.
-fn find(resolver: &HostResolver) -> Result<Finding, String> {
+fn find(resolver: &HostResolver, channel: UpdateChannel) -> Result<Finding, String> {
     let (target, keys) = participation()?;
     let current = Version::parse(VERSION)
         .ok_or_else(|| format!("The version of this build ({VERSION}) is not a release version"))?;
-    release::check(&current, target, &keys, resolver)
+    release::check(&current, channel, target, &keys, resolver)
 }
 
 /// Records the result for the status response and logs it.
-pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Finding, String> {
-    let outcome = find(resolver);
+pub(crate) fn check(
+    _running: &Running,
+    resolver: &HostResolver,
+    channel: UpdateChannel,
+) -> Result<Finding, String> {
+    let outcome = find(resolver, channel);
     match &outcome {
         Ok(Finding::UpToDate) => onetdns_core::info!(
             event = "update.up_to_date",
@@ -136,6 +143,7 @@ pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Findi
     }
     *LAST.lock_recover() = Some(Checked {
         at: crate::unix_now(),
+        channel,
         outcome: outcome.clone(),
     });
     outcome
@@ -143,8 +151,13 @@ pub(crate) fn check(_running: &Running, resolver: &HostResolver) -> Result<Findi
 
 /// `version` is the one the operator saw. A different result from the last check is refused, so a
 /// result that changed between checks never installs a version the operator did not see.
-pub(crate) fn confirmed(version: &str) -> Result<Release, String> {
-    match LAST.lock_recover().as_ref().map(|checked| &checked.outcome) {
+pub(crate) fn confirmed(version: &str, channel: UpdateChannel) -> Result<Release, String> {
+    match LAST
+        .lock_recover()
+        .as_ref()
+        .filter(|checked| checked.channel == channel)
+        .map(|checked| &checked.outcome)
+    {
         Some(Ok(Finding::Available(release))) if release.version == version => Ok(release.clone()),
         Some(Ok(Finding::Available(release))) => Err(format!(
             "The last check found version {}, not {version}; review it before applying",
@@ -225,14 +238,18 @@ fn json_text(value: Option<&str>) -> String {
     value.map_or_else(|| "null".to_string(), onetdns_core::json::escape)
 }
 
-/// `release_check` comes from the running config. Executable hashes are not computed, since the
-/// dashboard asks often; applying and rolling back check them.
-pub(crate) fn status_json(release_check: bool) -> String {
+/// `release_check` and `channel` come from the running config. Executable hashes are not
+/// computed, since the dashboard asks often; applying and rolling back check them.
+pub(crate) fn status_json(release_check: bool, channel: UpdateChannel) -> String {
     let reason = participation().err();
     let task = *RUNNING.lock_recover();
-    let (checked_at, result, new_version, detail) = match LAST.lock_recover().as_ref() {
+    let (checked_at, result, new_version, detail) = match LAST
+        .lock_recover()
+        .as_ref()
+        .filter(|checked| checked.channel == channel)
+    {
         None => (None, None, None, None),
-        Some(Checked { at, outcome }) => {
+        Some(Checked { at, outcome, .. }) => {
             let (result, version, detail) = match outcome {
                 Ok(Finding::UpToDate) => ("up_to_date", None, None),
                 Ok(Finding::Available(release)) => {
@@ -284,8 +301,8 @@ pub(crate) fn status_json(release_check: bool) -> String {
 
 /// What the periodic check reads from the current generation.
 struct Feed {
-    /// Reads that generation's running config.
-    enabled: Box<dyn Fn() -> bool + Send>,
+    /// Reads that generation's running config; None while periodic checks are off.
+    channel: Box<dyn Fn() -> Option<UpdateChannel> + Send>,
     resolver: HostResolver,
 }
 
@@ -296,12 +313,15 @@ static FEED: Mutex<Option<Feed>> = Mutex::new(None);
 /// generations and runs until the process exits: DNS is paused during a generation switch, and the
 /// switch must not wait for a check that can take tens of seconds. A binary that takes no part in
 /// updates starts no thread.
-pub(crate) fn schedule(enabled: impl Fn() -> bool + Send + 'static, resolver: HostResolver) {
+pub(crate) fn schedule(
+    channel: impl Fn() -> Option<UpdateChannel> + Send + 'static,
+    resolver: HostResolver,
+) {
     if participation().is_err() {
         return;
     }
     *FEED.lock_recover() = Some(Feed {
-        enabled: Box::new(enabled),
+        channel: Box::new(channel),
         resolver,
     });
     static STARTED: Once = Once::new();
@@ -328,18 +348,17 @@ fn run_schedule(mut due: Instant) {
         if Instant::now() < due {
             continue;
         }
-        let resolver = FEED
+        let due_check = FEED
             .lock_recover()
             .as_ref()
-            .filter(|feed| (feed.enabled)())
-            .map(|feed| feed.resolver.clone());
-        let Some(resolver) = resolver else {
+            .and_then(|feed| Some(((feed.channel)()?, feed.resolver.clone())));
+        let Some((channel, resolver)) = due_check else {
             continue;
         };
         let Ok(running) = begin(Task::Check) else {
             continue;
         };
-        let _ = check(&running, &resolver);
+        let _ = check(&running, &resolver, channel);
         due = Instant::now() + CHECK_INTERVAL;
     }
 }
@@ -353,11 +372,11 @@ pub(crate) fn run_cli(action: UpdateAction, config: Option<&Path>) -> Result<(),
     match action {
         UpdateAction::Check => {
             let _running = begin(Task::Check)?;
-            println!("{}", describe(&find(&resolver)?));
+            println!("{}", describe(&find(&resolver, cfg.update_channel)?));
         }
         UpdateAction::Apply { version } => {
             let running = begin(Task::Apply)?;
-            let release = match find(&resolver)? {
+            let release = match find(&resolver, cfg.update_channel)? {
                 Finding::Available(release) => release,
                 Finding::UpToDate => {
                     println!("{}", describe(&Finding::UpToDate));
@@ -402,6 +421,7 @@ mod tests {
     fn found(version: &str) {
         *LAST.lock_recover() = Some(Checked {
             at: 1,
+            channel: UpdateChannel::Stable,
             outcome: Ok(Finding::Available(Release {
                 version: version.to_string(),
                 asset: Asset {
@@ -424,7 +444,8 @@ mod tests {
             .expect("두 번째 작업은 거절해야 합니다");
         assert!(refused.contains("check"), "{refused}");
         let status: onetdns_core::json::Json =
-            onetdns_core::json::parse(&status_json(true)).expect("상태 JSON");
+            onetdns_core::json::parse(&status_json(true, UpdateChannel::Stable))
+                .expect("상태 JSON");
         assert_eq!(
             status.get("task").and_then(|task| task.as_str()),
             Some("check")
@@ -433,22 +454,40 @@ mod tests {
         drop(begin(Task::Rollback).expect("앞 작업이 끝난 뒤"));
 
         *LAST.lock_recover() = None;
-        assert!(confirmed("0.2.0").is_err(), "확인한 적이 없습니다");
+        assert!(
+            confirmed("0.2.0", UpdateChannel::Stable).is_err(),
+            "확인한 적이 없습니다"
+        );
         found("0.2.0");
         assert_eq!(
-            confirmed("0.2.0").map(|release| release.version),
+            confirmed("0.2.0", UpdateChannel::Stable).map(|release| release.version),
             Ok("0.2.0".to_string())
         );
-        let other = confirmed("0.3.0").expect_err("다른 버전");
+        assert!(
+            confirmed("0.2.0", UpdateChannel::Alpha).is_err(),
+            "다른 채널에서 확인한 결과"
+        );
+        let status =
+            onetdns_core::json::parse(&status_json(true, UpdateChannel::Alpha)).expect("상태 JSON");
+        assert!(matches!(
+            status.get("result"),
+            Some(onetdns_core::json::Json::Null)
+        ));
+        let other = confirmed("0.3.0", UpdateChannel::Stable).expect_err("다른 버전");
         assert!(other.contains("0.2.0"), "{other}");
         *LAST.lock_recover() = Some(Checked {
             at: 2,
+            channel: UpdateChannel::Stable,
             outcome: Err("network down".to_string()),
         });
-        assert!(confirmed("0.2.0").is_err(), "확인이 실패한 뒤");
+        assert!(
+            confirmed("0.2.0", UpdateChannel::Stable).is_err(),
+            "확인이 실패한 뒤"
+        );
 
         found("0.2.0");
-        let status = onetdns_core::json::parse(&status_json(false)).expect("상태 JSON");
+        let status = onetdns_core::json::parse(&status_json(false, UpdateChannel::Stable))
+            .expect("상태 JSON");
         assert_eq!(
             status.get("result").and_then(|value| value.as_str()),
             Some("available")

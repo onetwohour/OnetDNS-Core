@@ -3,6 +3,8 @@
 
 use std::cmp::Ordering;
 
+use onetdns_config::UpdateChannel;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Identifier {
     Numeric(u64),
@@ -98,10 +100,9 @@ impl Version {
         !self.pre.is_empty()
     }
 
-    /// It must be strictly newer, and a release only moves to another release, so release users
-    /// never get a prerelease.
-    pub(crate) fn accepts(&self, candidate: &Version) -> bool {
-        candidate > self && (self.is_prerelease() || !candidate.is_prerelease())
+    /// It must be strictly newer, and the stable channel never offers a prerelease.
+    pub(crate) fn accepts(&self, candidate: &Version, channel: UpdateChannel) -> bool {
+        candidate > self && (channel == UpdateChannel::Alpha || !candidate.is_prerelease())
     }
 }
 
@@ -210,18 +211,24 @@ mod tests {
 
     #[test]
     fn candidates_must_be_newer_and_match_the_channel() {
+        use UpdateChannel::{Alpha, Stable};
         let stable = v("1.0.0");
-        assert!(stable.accepts(&v("1.0.1")));
-        assert!(!stable.accepts(&v("1.0.0")));
-        assert!(!stable.accepts(&v("0.9.9")));
-        assert!(!stable.accepts(&v("1.1.0-alpha.1")));
+        assert!(stable.accepts(&v("1.0.1"), Stable));
+        assert!(!stable.accepts(&v("1.1.0-alpha.1"), Stable));
+        assert!(stable.accepts(&v("1.1.0-alpha.1"), Alpha));
+        for channel in [Stable, Alpha] {
+            assert!(!stable.accepts(&v("1.0.0"), channel));
+            assert!(!stable.accepts(&v("0.9.9"), channel));
+            assert!(!stable.accepts(&v("1.0.0-rc.1"), channel));
+        }
 
         let alpha = v("0.1.0-alpha.5");
-        assert!(alpha.accepts(&v("0.1.0-alpha.6")));
-        assert!(alpha.accepts(&v("0.1.0")));
-        assert!(alpha.accepts(&v("0.2.0-beta.1")));
-        assert!(!alpha.accepts(&v("0.1.0-alpha.5")));
-        assert!(!alpha.accepts(&v("0.1.0-alpha.4")));
-        assert!(!alpha.accepts(&v("0.0.9")));
+        assert!(alpha.accepts(&v("0.1.0-alpha.6"), Alpha));
+        assert!(alpha.accepts(&v("0.2.0-beta.1"), Alpha));
+        assert!(!alpha.accepts(&v("0.1.0-alpha.6"), Stable));
+        assert!(alpha.accepts(&v("0.1.0"), Stable));
+        assert!(!alpha.accepts(&v("0.1.0-alpha.5"), Alpha));
+        assert!(!alpha.accepts(&v("0.1.0-alpha.4"), Alpha));
+        assert!(!alpha.accepts(&v("0.0.9"), Stable));
     }
 }

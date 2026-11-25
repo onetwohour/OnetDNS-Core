@@ -357,6 +357,7 @@ static FIELDS: &[Field] = &[
     f("dnstap_file", "string", "control", ""),
     f("dnstap_identity", "string", "control", ""),
     f("release_check", "bool", "control", ""),
+    f("update_channel", "enum", "control", "stable|alpha"),
 ];
 
 /// Order: ko, en, ja, zh.
@@ -3443,6 +3444,17 @@ static FIELD_COPY: &[FieldCopy] = &[
         description_ja: "GitHub で新しいリリースを定期的に確認します。",
         description_zh: "定期在 GitHub 上检查新版本。",
     },
+    FieldCopy {
+        key: "update_channel",
+        label_ko: "업데이트 채널",
+        label_en: "Update channel",
+        label_ja: "アップデートチャネル",
+        label_zh: "更新通道",
+        description_ko: "업데이트 채널을 선택합니다.",
+        description_en: "Selects the update channel.",
+        description_ja: "アップデートチャネルを選びます。",
+        description_zh: "选择更新通道。",
+    },
 ];
 
 fn field_copy(key: &str) -> &'static FieldCopy {
@@ -3554,6 +3566,8 @@ fn enum_label_i18n(key: &str, value: &str) -> Option<[&'static str; 4]> {
         ],
         ("acme_challenge", "http01") => ["HTTP-01", "HTTP-01", "HTTP-01", "HTTP-01"],
         ("acme_challenge", "dns01") => ["DNS-01", "DNS-01", "DNS-01", "DNS-01"],
+        ("update_channel", "stable") => ["정식판", "Stable", "安定版", "稳定版"],
+        ("update_channel", "alpha") => ["알파", "Alpha", "アルファ", "Alpha"],
         ("wasm_fail_mode", "closed-refuse") => [
             "정책 실행 중 오류가 나면 질의를 거부함",
             "Refuse on error",

@@ -323,6 +323,19 @@ release_check = false
 
 Periodically checks GitHub for a new release.
 
+### `update_channel`
+
+**Type:** enum (`stable` / `alpha`)
+**Default:** `"stable"`
+
+**TOML:**
+
+```toml
+update_channel = "alpha"
+```
+
+Selects the update channel.
+
 ## Discovery and other settings
 
 ### `ddr_name`
