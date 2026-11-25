@@ -16,7 +16,7 @@ Incoming encrypted DNS uses `listen_dot`, `listen_doh`, `listen_doh3`, `listen_d
 | Oblivious HTTP gateway | `listen_doh` with `ohttp_gateway` | Same as DoH, path `/.well-known/ohttp-gateway` | Reached through an OHTTP relay; see [Oblivious HTTP](#oblivious-http) |
 | Oblivious HTTP relay | `listen_doh` with `ohttp_relays` | Same as DoH, each relay's `path` | Passes encrypted requests to one gateway; see [Oblivious HTTP](#oblivious-http) |
 
-The ports shown are conventional; each transport is enabled by setting its listener. The host firewall and any cloud network rule must permit the corresponding TCP or UDP traffic.
+The ports shown are conventional; each transport is enabled by setting its listener. The host firewall and any cloud network rule must permit the corresponding TCP or UDP traffic. Let in ICMP "fragmentation needed" and ICMPv6 "packet too big" as well: TCP needs them to find the path MTU, and without them connections across a path with a smaller MTU can hang.
 
 ## TLS certificates and hostnames
 

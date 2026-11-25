@@ -139,6 +139,7 @@ impl Forward {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         };
         let socket = onetdns_core::udp::bind((any, 0)).ok()?;
+        onetdns_core::udp::allow_fragmentation(&socket);
         socket.connect(self.target).ok()?;
         socket.send(&self.packet).ok()?;
         let deadline = Instant::now() + RELAY_TIMEOUT;

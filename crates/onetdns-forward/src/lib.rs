@@ -1041,9 +1041,7 @@ impl Forwarder {
             return Err(ForwardError::NoUpstream);
         }
 
-        let mut wire = request
-            .try_encode()
-            .map_err(|_| ForwardError::BadResponse)?;
+        let mut wire = upstream_wire(request)?;
         let wire_id = next_id();
         wire[0..2].copy_from_slice(&wire_id.to_be_bytes());
         let deadline = deadline_after(self.timeout);
@@ -2133,6 +2131,29 @@ fn bootstrap_answer(
         current = next;
     }
     (None, cname)
+}
+
+/// The EDNS UDP size advertised to upstream and authoritative servers. OPT is hop by hop (RFC
+/// 6891), so a client's larger size is not passed on: answers that large would arrive fragmented,
+/// and fragments are often lost. A larger answer comes back truncated and is fetched over TCP.
+pub const UPSTREAM_UDP_PAYLOAD: u16 = 1232;
+
+fn upstream_wire(request: &Message) -> Result<Vec<u8>, ForwardError> {
+    let capped;
+    let request = match request.opt() {
+        Some(opt) if opt.class.0 > UPSTREAM_UDP_PAYLOAD => {
+            let mut copy = request.clone();
+            for record in &mut copy.additionals {
+                if record.rtype == RecordType::OPT {
+                    record.class.0 = UPSTREAM_UDP_PAYLOAD;
+                }
+            }
+            capped = copy;
+            &capped
+        }
+        _ => request,
+    };
+    request.try_encode().map_err(|_| ForwardError::BadResponse)
 }
 
 /// Takes a socket from the pool.
@@ -4141,6 +4162,35 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "잘린 응답을 버리고 제한 시간까지 기다렸다: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_larger_client_udp_size_is_not_passed_upstream() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (sizes, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                if let Ok(req) = Message::parse(&buf[..n]) {
+                    let _ = sizes.send(req.opt().map(|opt| opt.class.0));
+                    let answer = answer_for(&req, Ipv4Addr::new(1, 2, 3, 4));
+                    let _ = sock.send_to(&answer.try_encode().unwrap(), from);
+                }
+            }
+        });
+        let fwd = Forwarder::new(vec![addr], Duration::from_secs(2));
+        for (client, upstream) in [(4096, 1232), (1232, 1232), (512, 512)] {
+            let mut request = query("size.example.com");
+            let edns = onetdns_proto::Edns {
+                udp_payload: client,
+                ..Default::default()
+            };
+            request.additionals.push(edns.try_to_record().unwrap());
+            fwd.resolve(&request).unwrap();
+            let sent = seen.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(sent, Some(upstream), "client {client}");
+        }
     }
 
     #[test]

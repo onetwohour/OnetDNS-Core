@@ -3212,7 +3212,7 @@ fn make_query(qname: &Name, qtype: RecordType, do_bit: bool) -> Message {
     };
     m.additionals.push(
         Edns {
-            udp_payload: 1232,
+            udp_payload: onetdns_forward::UPSTREAM_UDP_PAYLOAD,
             extended_rcode: 0,
             version: 0,
             dnssec_ok: do_bit,

@@ -1243,6 +1243,7 @@ pub(crate) fn reconcile_dnscrypt(
             None => onetdns_core::listen::udp(*addr),
         })
         .map_err(|error| listener_open_error("DNSCrypt", *addr, &error))?;
+        onetdns_core::udp::allow_fragmentation(&socket);
         let kept = socket
             .try_clone()
             .map_err(|error| listener_open_error("DNSCrypt", *addr, &error))?;

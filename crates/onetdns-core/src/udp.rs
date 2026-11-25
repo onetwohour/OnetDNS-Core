@@ -33,6 +33,23 @@ pub(crate) fn open(addr: SocketAddr, dual_stack: bool) -> io::Result<UdpSocket> 
     }
 }
 
+/// For sockets whose datagrams can exceed 1500 bytes, such as DNSCrypt's, which run up to 4096. On
+/// Linux, IPv4 then goes out without DF so routers can fragment it, and IPv6 is fragmented here at
+/// the 1280-byte minimum MTU, so a jumbo-frame interface does not lose them at the first 1500-byte
+/// hop. QUIC must keep DF and does not use this.
+pub fn allow_fragmentation(socket: &UdpSocket) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(error) = linux::allow_fragmentation(socket) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::warn!(event = "udp.fragmentation_unavailable", %error, "Could not let large UDP datagrams be fragmented; on hosts with jumbo frames they may be lost");
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = socket;
+}
+
 /// The receive timeout for a socket several threads read. A Windows receive that ends on its
 /// timeout drops the datagram arriving at that moment, and with many threads timing out
 /// periodically, queries occasionally vanish. So on Windows those threads wait without a timeout and
@@ -175,11 +192,87 @@ mod windows {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod linux {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    /// RFC 8200.
+    const IPV6_MIN_MTU: libc::c_int = 1280;
+
+    fn set(
+        socket: &UdpSocket,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: libc::c_int,
+    ) -> io::Result<()> {
+        // SAFETY: a live socket and an int option value that outlives the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The IPv4 option also covers IPv4-mapped traffic on a dual-stack socket. OMIT, unlike DONT,
+    /// ignores path MTUs learned from ICMP, which anyone can forge; kernels before 3.15 lack it.
+    pub(super) fn allow_fragmentation(socket: &UdpSocket) -> io::Result<()> {
+        let (level, name) = (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER);
+        set(socket, level, name, libc::IP_PMTUDISC_OMIT)
+            .or_else(|_| set(socket, level, name, libc::IP_PMTUDISC_DONT))?;
+        if socket.local_addr()?.is_ipv6() {
+            set(socket, libc::IPPROTO_IPV6, libc::IPV6_MTU, IPV6_MIN_MTU)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::IpAddr;
     use std::time::Duration;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn large_datagrams_may_be_fragmented() {
+        use std::os::fd::AsRawFd;
+        let get = |socket: &UdpSocket, level, name| {
+            let mut value: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a live socket and an int-sized output buffer.
+            let rc = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    name,
+                    (&mut value as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            value
+        };
+        let v4 = bind(([127, 0, 0, 1], 0)).unwrap();
+        // A dual-stack socket, which also carries IPv4-mapped traffic.
+        let v6 = crate::listen::udp(SocketAddr::from(([0u16; 8], 0))).unwrap();
+        for socket in [&v4, &v6] {
+            linux::allow_fragmentation(socket).unwrap();
+            assert_eq!(
+                get(socket, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER),
+                libc::IP_PMTUDISC_OMIT
+            );
+        }
+    }
 
     fn ports_in_sequence(ip: IpAddr) -> usize {
         let sockets: Vec<UdpSocket> = (0..16).map(|_| bind((ip, 0)).expect("bind")).collect();
