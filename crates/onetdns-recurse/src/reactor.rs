@@ -174,7 +174,7 @@ impl Session {
         now: Instant,
     ) -> Option<Self> {
         let (zone, servers) = r
-            .deepest_cached_delegation(&qname)
+            .deepest_cached_delegation(&qname, qtype)
             .filter(|(zone, _)| r.validated_start_ok(zone))
             .unwrap_or_else(|| (Name::root(), r.roots.clone()));
         Self::start_at(r, qname, qtype, zone, servers, budget, now)

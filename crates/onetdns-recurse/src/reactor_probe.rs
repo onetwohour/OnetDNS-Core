@@ -56,7 +56,7 @@ impl Session {
     /// Starts from a cached delegation or the root.
     fn start(r: &Recursor, qname: Name, qtype: RecordType, now: Instant) -> Option<Self> {
         let (zone, servers) = r
-            .deepest_cached_delegation(&qname)
+            .deepest_cached_delegation(&qname, qtype)
             .unwrap_or_else(|| (Name::root(), r.roots.clone()));
         let state = IterationState::start(zone, servers);
         let step_cap = r.max_referrals + qname.num_labels() + 2;

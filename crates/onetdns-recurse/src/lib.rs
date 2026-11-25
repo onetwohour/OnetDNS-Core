@@ -1997,7 +1997,7 @@ impl Recursor {
         let validated_start_ok = |zone: &Name| !validate || self.validated_start_ok(zone);
         {
             if let Some((zone, servers)) = self
-                .deepest_cached_delegation(qname)
+                .deepest_cached_delegation(qname, qtype)
                 .filter(|(zone, _)| validated_start_ok(zone))
             {
                 rtrace!(
@@ -2647,13 +2647,23 @@ impl Recursor {
         );
     }
 
-    /// Deeper means fewer steps left.
-    fn deepest_cached_delegation(&self, qname: &Name) -> Option<(Name, Vec<SocketAddr>)> {
+    /// Deeper means fewer steps left. DS is parent data, so for DS a cut at `qname` itself is
+    /// skipped: its servers would answer from the child zone that DS does not exist.
+    fn deepest_cached_delegation(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+    ) -> Option<(Name, Vec<SocketAddr>)> {
         let total = qname.num_labels();
+        let deepest = if qtype == RecordType::DS {
+            total.saturating_sub(1)
+        } else {
+            total
+        };
         let now = cache_now_millis();
         let mut key = [0u8; 255];
         let mut cache = self.deleg_cache.lock_recover();
-        for k in (1..=total).rev() {
+        for k in (1..=deepest).rev() {
             let key = qname.canonical_suffix_key_into(k, &mut key)?;
             match cache.get(key) {
                 Some(entry) if entry.lifetime.is_live(now) => {
@@ -4551,13 +4561,20 @@ mod tests {
 
         let q = Name::from_str("eu-mobile.events.data.microsoft.com").unwrap();
         let (zone, servers) = rec
-            .deepest_cached_delegation(&q)
+            .deepest_cached_delegation(&q, RecordType::A)
             .expect("cached delegation");
         assert_eq!(zone.to_ascii_lower(), "microsoft.com");
         assert_eq!(servers, ms_srv);
 
+        // The DS of a cut is asked of the parent, not of the servers the cut delegates to.
+        let (zone, servers) = rec
+            .deepest_cached_delegation(&ms, RecordType::DS)
+            .expect("cached parent delegation");
+        assert_eq!(zone.to_ascii_lower(), "com");
+        assert_eq!(servers, com_srv);
+
         rec.deleg_evict_path(&q);
-        assert!(rec.deepest_cached_delegation(&q).is_none());
+        assert!(rec.deepest_cached_delegation(&q, RecordType::A).is_none());
 
         {
             let mut cache = rec.deleg_cache.lock_recover();
