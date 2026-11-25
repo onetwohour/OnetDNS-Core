@@ -1265,7 +1265,7 @@ Self-update of this node: release checks, installation, and rollback.
 
 | Status | Response |
 |---|---|
-| 200 | `{version,target,participating,reason,launch,handoff,release_check,task,checked_at,result,new_version,release_url,detail,record,rollback}` |
+| 200 | `{version,target,participating,reason,launch,handoff,release_check,channel,task,checked_at,result,new_version,release_url,detail,record,rollback}` |
 
 #### `POST /v1/system/update/check`
 

@@ -48,6 +48,15 @@ pub enum UpdateChannel {
     Alpha,
 }
 
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Alpha => "alpha",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SplitTarget {
     #[default]
@@ -3294,7 +3303,7 @@ impl Config {
         kv("dnstap_file", opt_p(&self.dnstap_file));
         kv("dnstap_identity", js(&self.dnstap_identity));
         kv("release_check", self.release_check.to_string());
-        kv("update_channel", lower_dbg(&self.update_channel));
+        kv("update_channel", js(self.update_channel.as_str()));
 
         format!("{{{}}}", o.join(","))
     }

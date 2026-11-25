@@ -875,9 +875,10 @@
             </div>
           </div>
           <sc-if value="{{ upd.notice }}"><div role="status" style="padding:10px 20px;border-left:3px solid {{ upd.noticeColor }};background:{{ upd.noticeBg }};border-bottom:1px solid var(--border);font-size:12.5px;line-height:1.55;color:var(--fg2);overflow-wrap:anywhere">{{ upd.notice }}</div></sc-if>
-          <div class="od-body" style="display:grid;grid-template-columns:{{ g2 }};gap:14px">
+          <div class="od-body" style="display:grid;grid-template-columns:{{ g3 }};gap:14px">
             <div style="min-width:0"><div class="od-sub" style="margin:0">현재 버전</div><div class="od-mono" style="font-size:13.5px;color:var(--fg);margin-top:4px;overflow-wrap:anywhere">{{ upd.version }}</div></div>
             <div style="min-width:0"><div class="od-sub" style="margin:0">마지막 확인</div><div style="font-size:13px;color:{{ upd.checkColor }};margin-top:4px;line-height:1.5;overflow-wrap:anywhere">{{ upd.checkLabel }}</div><div class="od-sub">{{ upd.checkedAt }}</div></div>
+            <div style="min-width:0"><div class="od-sub" style="margin:0">업데이트 채널</div><button type="button" onClick="{{ upd.channelDD.toggle }}" onKeyDown="{{ upd.channelDD.keyDown }}" aria-haspopup="listbox" aria-expanded="{{ upd.channelDD.open }}" aria-label="{{ upd.channelDD.ariaLabel }}" class="od-input" style="margin-top:4px;width:100%;max-width:200px;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:13px;font-weight:500;text-align:left;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ upd.channelDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></button></div>
           </div>
           <sc-if value="{{ upd.releaseUrl }}"><div style="padding:0 20px 16px;font-size:12.5px"><a href="{{ upd.releaseUrl }}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:600">릴리스 노트</a></div></sc-if>
         </section>
@@ -4337,6 +4338,9 @@ Object.assign(I18N.en, {
   "소프트웨어 업데이트":"Software updates",
   "업데이트 확인":"Check for updates",
   "현재 버전":"Current version",
+  "업데이트 채널":"Update channel",
+  "정식판":"Stable",
+  "알파":"Alpha",
   "마지막 확인":"Last check",
   "릴리스 노트":"Release notes",
   "새 버전을 확인하고 있습니다":"Checking for a new version",
@@ -4379,6 +4383,9 @@ Object.assign(I18N.ja, {
   "소프트웨어 업데이트":"ソフトウェア更新",
   "업데이트 확인":"更新を確認",
   "현재 버전":"現在のバージョン",
+  "업데이트 채널":"アップデートチャネル",
+  "정식판":"安定版",
+  "알파":"アルファ",
   "마지막 확인":"最終確認",
   "릴리스 노트":"リリースノート",
   "새 버전을 확인하고 있습니다":"新しいバージョンを確認しています",
@@ -4421,6 +4428,9 @@ Object.assign(I18N.zh, {
   "소프트웨어 업데이트":"软件更新",
   "업데이트 확인":"检查更新",
   "현재 버전":"当前版本",
+  "업데이트 채널":"更新通道",
+  "정식판":"稳定版",
+  "알파":"Alpha",
   "마지막 확인":"上次检查",
   "릴리스 노트":"发行说明",
   "새 버전을 확인하고 있습니다":"正在检查新版本",
@@ -4717,6 +4727,7 @@ function listenAddr(value){
   return port>=0&&port<65536?{host:m[1],port}:null;
 }
 
+const UPDATE_CHANNELS = [['stable','정식판'],['alpha','알파']];
 const LANGUAGES = [['ko','한국어'],['en','English'],['ja','日本語'],['zh','中文']];
 const GROUP_ORDER = ['general','network','listen','security','upstream','recursion','query','policy','cache','filtering','dnssec','tls','acme','authority','dhcp','cluster','control','other'];
 const DEDICATED_HOME = {
@@ -5595,6 +5606,14 @@ class Component extends DCLogic {
     await this.followUpdate(watch,id);
   }
   goUpdate=()=>this.go('operations')();
+  // A result from the old channel no longer shows, so the new one is checked right away.
+  setUpdateChannel=async(next)=>{
+    const u=this.state.update||{};
+    if(next===(u.channel==='alpha'?'alpha':'stable'))return;
+    if(!await this.cset({update_channel:next}))return;
+    await this.loadUpdate();
+    if(u.participating===true)await this.updateTask('check')();
+  };
   updateFailure(kind){return {check:this.t('업데이트를 확인하지 못했습니다'),apply:this.t('업데이트를 설치하지 못했습니다'),rollback:this.t('이전 버전으로 되돌리지 못했습니다')}[kind];}
   updateTask=(kind)=>async()=>{
     if(this._updateWatch)return;
@@ -5646,7 +5665,8 @@ class Component extends DCLogic {
   }
   updateModel(){
     const s=this.state,u=s.update&&typeof s.update==='object'?s.update:null;
-    const empty={canCheck:false,canApply:false,canRollback:false,busy:true,notice:'',noticeColor:'var(--accent)',noticeBg:'var(--accent-bg)',version:'—',checkLabel:'—',checkColor:'var(--fg2)',checkedAt:'',releaseUrl:'',applyLabel:'',rollbackLabel:''};
+    const channelDD=this.mkDropdown('updateChannel',u&&u.channel==='alpha'?'alpha':'stable',UPDATE_CHANNELS,this.setUpdateChannel);
+    const empty={channelDD,canCheck:false,canApply:false,canRollback:false,busy:true,notice:'',noticeColor:'var(--accent)',noticeBg:'var(--accent-bg)',version:'—',checkLabel:'—',checkColor:'var(--fg2)',checkedAt:'',releaseUrl:'',applyLabel:'',rollbackLabel:''};
     if(!u)return {upd:empty,banner:'',bannerAction:false};
     const record=u.record&&typeof u.record==='object'?u.record:null;
     const task=s.updateBusy||(typeof u.task==='string'?u.task:'');
@@ -5670,7 +5690,7 @@ class Component extends DCLogic {
     const rollbackTo=typeof u.rollback==='string'?u.rollback:'';
     const canApply=participating&&result==='available'&&!!newVersion&&!pending;
     const releaseUrl=(result==='available'||result==='manual')&&typeof u.release_url==='string'&&/^https:\/\//.test(u.release_url)?u.release_url:'';
-    const upd={canCheck:participating,canApply,canRollback:!!rollbackTo&&!pending,busy:!!task,
+    const upd={channelDD,canCheck:participating,canApply,canRollback:!!rollbackTo&&!pending,busy:!!task,
       notice,noticeColor:tones[tone][0],noticeBg:tones[tone][1],
       version:String(u.version||'—'),checkLabel,checkColor:result==='available'?'var(--accent)':(result==='manual'||result==='failed')?'var(--warn)':'var(--fg2)',
       checkedAt:u.checked_at?this.relTime(u.checked_at):'',

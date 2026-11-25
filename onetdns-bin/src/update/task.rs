@@ -280,7 +280,7 @@ pub(crate) fn status_json(release_check: bool, channel: UpdateChannel) -> String
             },
         );
     format!(
-        "{{\"version\":{},\"target\":{},\"participating\":{},\"reason\":{},\"launch\":\"{}\",\"handoff\":{},\"release_check\":{},\"task\":{},\"checked_at\":{},\"result\":{},\"new_version\":{},\"release_url\":{},\"detail\":{},\"record\":{},\"rollback\":{}}}",
+        "{{\"version\":{},\"target\":{},\"participating\":{},\"reason\":{},\"launch\":\"{}\",\"handoff\":{},\"release_check\":{},\"channel\":\"{}\",\"task\":{},\"checked_at\":{},\"result\":{},\"new_version\":{},\"release_url\":{},\"detail\":{},\"record\":{},\"rollback\":{}}}",
         json_text(Some(VERSION)),
         json_text(RELEASE_TARGET),
         reason.is_none(),
@@ -288,6 +288,7 @@ pub(crate) fn status_json(release_check: bool, channel: UpdateChannel) -> String
         launch::current().name(),
         launch::current() == launch::Launch::SupervisedChild && crate::supervisor::successor_fits(),
         release_check,
+        channel.as_str(),
         json_text(task.map(Task::name)),
         checked_at.map_or_else(|| "null".to_string(), |at| at.to_string()),
         json_text(result),
@@ -508,6 +509,10 @@ mod tests {
             status.get("release_check"),
             Some(onetdns_core::json::Json::Bool(false))
         ));
+        assert_eq!(
+            status.get("channel").and_then(|value| value.as_str()),
+            Some("stable")
+        );
         assert!(matches!(
             status.get("task"),
             Some(onetdns_core::json::Json::Null)
