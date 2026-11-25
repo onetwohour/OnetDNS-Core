@@ -4,9 +4,10 @@
 Runs an OnetDNS binary built with -Cprofile-generate on the workloads the profile should cover,
 then merges what every instance wrote with the llvm-profdata of the rustc in use: blocked queries
 and cache hits behind a filter over UDP and TCP, forwarding over each encrypted transport to a
-second instance, and DNSSEC-validated recursion from a local root.
+second instance, a new TLS connection per query to that instance, and DNSSEC-validated recursion
+and forwarding from a local root, over zones signed with ECDSA, Ed25519 and RSA.
 
-Root hints carry no port, so the root listens on 127.0.0.1:53 and the zone below it on [::1]:53;
+Root hints carry no port, so the root listens on 127.0.0.1:53 and the zones below it on [::1]:53;
 on Linux this needs net.ipv4.ip_unprivileged_port_start=0 or a network namespace.
 
 usage: pgo_train.py [--emulator CMD] BINARY OUTPUT.profdata
@@ -22,6 +23,7 @@ import re
 import shlex
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -35,12 +37,17 @@ ZONE_PORT = 15853
 DOT_PORT = 15854
 DOH_PORT = 15443
 DNSCRYPT_PORT = 15855
+RESOLVER_PORT = 15856
 ROOT = "127.0.0.1"
 ZONE = "::1"
 TLS_NAME = "pgo.test"
 PROVIDER = "2.dnscrypt-cert.pgo.test"
 ZONE_OWNERS = 20000
+ED25519_OWNERS = 5000
+# Each one is signed in Python here.
+RSA_OWNERS = 500
 RULES = 100000
+REGEX_RULES = 100
 BLOCKED_QUERIES = 20000
 LOAD_SECONDS = 15
 SHORT_SECONDS = 5
@@ -50,7 +57,12 @@ STOP_SECONDS = 120
 NXDOMAIN = 3
 NOERROR = 0
 A = 1
+NS = 2
+SOA = 6
 DNSKEY = 48
+RSASHA256 = 8
+SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+CLIENT_COOKIE = bytes(range(1, 9))
 
 
 def fail(message: str) -> None:
@@ -63,12 +75,13 @@ def name_wire(name: str) -> bytes:
     return b"".join(bytes([len(label)]) + label.encode() for label in labels) + b"\0"
 
 
-def query(name: str, edns: bool, qtype: int = A, ad: bool = False) -> bytes:
+def query(name: str, edns: bool, qtype: int = A, ad: bool = False, cookie: bool = False) -> bytes:
     flags = 0x0100 | (0x0020 if ad else 0)
     header = struct.pack("!HHHHHH", 0, flags, 1, 0, 0, 1 if edns else 0)
     packet = header + name_wire(name) + struct.pack("!HH", qtype, 1)
     if edns:
-        packet += b"\0" + struct.pack("!HHIH", 41, 1232, 0, 0)
+        option = struct.pack("!HH", 10, len(CLIENT_COOKIE)) + CLIENT_COOKIE if cookie else b""
+        packet += b"\0" + struct.pack("!HHIH", 41, 1232, 0, len(option)) + option
     return packet
 
 
@@ -184,26 +197,130 @@ def write_fixtures(work: Path) -> tuple[list[str], list[str]]:
         else:
             names.add(f"{rng.choice(subs)}.{rng.choice(subs)}.{domain}")
     blocked = sorted(names)
-    rules = "".join(f"||{name}^\n" for name in blocked)
+    # Lists in use mix hosts files, exceptions and a few regular expressions in with these rules.
+    hosts = blocked[::5]
+    adblock = [name for i, name in enumerate(blocked) if i % 5]
+    excepted = [f"allow.{name}" for name in rng.sample(adblock, RULES // 100)]
+    regex_domains = rng.sample(domains, REGEX_RULES)
+    rules = "".join(f"||{name}^\n" for name in adblock)
+    rules += "".join(f"@@||{name}^\n" for name in excepted)
+    for domain in regex_domains:
+        labels = "|".join(rng.sample(subs, 3))
+        escaped = domain.replace(".", "\\.")
+        rules += f"/^({labels})[0-9]{{1,3}}\\.{escaped}$/\n"
     (work / "blocklist.txt").write_text(rules, encoding="utf-8")
-    return allowed, [rng.choice(blocked) for _ in range(BLOCKED_QUERIES)]
+    (work / "hosts.txt").write_text("".join(f"0.0.0.0 {name}\n" for name in hosts), encoding="utf-8")
+
+    queries = [rng.choice(blocked) for _ in range(BLOCKED_QUERIES)]
+    for i in range(5, BLOCKED_QUERIES, 10):
+        queries[i] = f"{rng.choice(subs)}{rng.randrange(1000)}.{rng.choice(regex_domains)}"
+    for i in range(7, BLOCKED_QUERIES, 50):
+        queries[i] = rng.choice(excepted)
+    return allowed, queries
 
 
-def write_root_zone(work: Path, test_key: bytes) -> None:
+def write_ed25519_zone(work: Path) -> list[str]:
+    zone = [
+        "$TTL 3600",
+        "@ IN SOA ns.test. hostmaster.test. 1 3600 600 86400 300",
+        "@ IN NS ns.test.",
+    ]
+    zone += [f"h{i:06d} IN A 192.0.2.{i % 254 + 1}" for i in range(ED25519_OWNERS)]
+    (work / "db.ed25519").write_text("\n".join(zone) + "\n", encoding="utf-8")
+    return [f"h{i:06d}.ed25519" for i in range(ED25519_OWNERS)]
+
+
+def probable_prime(n: int, rng: random.Random) -> bool:
+    """Miller-Rabin."""
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d, s = d // 2, s + 1
+    for _ in range(20):
+        x = pow(rng.randrange(2, n - 1), d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def rsa_prime(rng: random.Random, small_primes: list[int]) -> int:
+    """A 1024-bit prime p with p - 1 coprime to the public exponent 65537."""
+    while True:
+        p = rng.getrandbits(1024) | (3 << 1022) | 1
+        if p % 65537 != 1 and all(p % q for q in small_primes) and probable_prime(p, rng):
+            return p
+
+
+def write_rsa_zone(work: Path) -> list[str]:
+    """Writes the `rsa.` zone signed with RSA/SHA-256, which zone signing does not offer. The key
+    comes from a fixed seed: it is a fixture, not a secret."""
+    rng = random.Random(RSASHA256)
+    small_primes = [n for n in range(3, 2000, 2) if all(n % d for d in range(3, int(n**0.5) + 1, 2))]
+    p, q = rsa_prime(rng, small_primes), rsa_prime(rng, small_primes)
+    e = 65537
+    d = pow(e, -1, (p - 1) * (q - 1))
+    dp, dq, qinv = d % (p - 1), d % (q - 1), pow(q, -1, p)
+    dnskey = struct.pack("!HBBB", 257, 3, RSASHA256, 3) + e.to_bytes(3, "big") + (p * q).to_bytes(256, "big")
+    tag = key_tag(dnskey)
+    ttl = 3600
+    now = int(time.time())
+    inception, expiration = now - 3600, now + 7 * 86400
+
+    def sign(data: bytes) -> bytes:
+        """PKCS #1 v1.5 with the private key in CRT form."""
+        digest = SHA256_DIGEST_INFO + hashlib.sha256(data).digest()
+        m = int.from_bytes(b"\0\1" + b"\xff" * (253 - len(digest)) + b"\0" + digest, "big")
+        m1, m2 = pow(m, dp, p), pow(m, dq, q)
+        return (m2 + qinv * (m1 - m2) % p * q).to_bytes(256, "big")
+
+    lines = []
+
+    def rrset(owner: str, rtype: int, mnemonic: str, text: str, rdata: bytes) -> None:
+        """One record and its RRSIG (RFC 4034)."""
+        labels = owner.count(".")
+        rrsig = struct.pack("!HBBIIIH", rtype, RSASHA256, labels, ttl, expiration, inception, tag)
+        rrsig += name_wire("rsa.")
+        record = name_wire(owner) + struct.pack("!HHIH", rtype, 1, ttl, len(rdata)) + rdata
+        signature = base64.b64encode(sign(rrsig + record)).decode()
+        lines.append(f"{owner} {ttl} IN {mnemonic} {text}")
+        lines.append(
+            f"{owner} {ttl} IN RRSIG {mnemonic} {RSASHA256} {labels} {ttl} {expiration} {inception} "
+            f"{tag} rsa. {signature}"
+        )
+
+    soa = name_wire("ns.test.") + name_wire("hostmaster.test.") + struct.pack("!5I", 1, 3600, 600, 86400, 300)
+    rrset("rsa.", SOA, "SOA", "ns.test. hostmaster.test. 1 3600 600 86400 300", soa)
+    rrset("rsa.", NS, "NS", "ns.test.", name_wire("ns.test."))
+    rrset("rsa.", DNSKEY, "DNSKEY", f"257 3 {RSASHA256} {base64.b64encode(dnskey[4:]).decode()}", dnskey)
+    for i in range(RSA_OWNERS):
+        address = bytes([192, 0, 2, i % 254 + 1])
+        rrset(f"h{i:06d}.rsa.", A, "A", socket.inet_ntoa(address), address)
+    (work / "db.rsa").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return [f"h{i:06d}.rsa" for i in range(RSA_OWNERS)]
+
+
+def write_root_zone(work: Path, keys: dict[str, bytes]) -> None:
+    """The root, with each zone below it delegated to ns.test. and secured by a DS of `keys`."""
     zone = [
         "$TTL 86400",
         "@ IN SOA ns.root. hostmaster.root. 1 1800 900 604800 86400",
         "@ IN NS ns.root.",
         f"ns.root. IN A {ROOT}",
-        "test. IN NS ns.test.",
         f"ns.test. IN AAAA {ZONE}",
-        ds_record("test.", test_key),
     ]
+    for owner, key in keys.items():
+        zone += [f"{owner} IN NS ns.test.", ds_record(owner, key)]
     (work / "db.root").write_text("\n".join(zone) + "\n", encoding="utf-8")
 
 
 def write_config(path: Path, listen: list[str], extra: str) -> None:
     addresses = ", ".join(f'"{address}"' for address in listen)
+    # Without the dashboard, statistics and the query log are kept only for a file.
     path.write_text(
         f"""mode = "personal"
 listen = [{addresses}]
@@ -211,7 +328,7 @@ workers = 1
 do_udp = true
 do_tcp = true
 prefetch = false
-querylog = false
+querylog_file = "{path.with_suffix(".querylog").as_posix()}"
 {extra}""",
         encoding="utf-8",
     )
@@ -293,7 +410,7 @@ class Server:
 
 def drive(port: int, names: list[str], seconds: float, window: int = 64) -> tuple[int, int]:
     """Keeps `window` queries in flight over UDP for `seconds`; returns queries sent and answered."""
-    packets = [query(name, edns=i % 2 == 1) for i, name in enumerate(names)]
+    packets = [query(name, edns=i % 2 == 1, cookie=i % 4 == 3) for i, name in enumerate(names)]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.connect(("127.0.0.1", port))
     sock.settimeout(1.0)
@@ -352,6 +469,88 @@ def drive_tcp(port: int, names: list[str], seconds: float, window: int = 16) -> 
     return sent, answered
 
 
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("connection closed early")
+        data += chunk
+    return data
+
+
+def exchange_dot(sock: socket.socket, packet: bytes) -> bool:
+    sock.sendall(struct.pack("!H", len(packet)) + packet)
+    return len(recv_exact(sock, struct.unpack("!H", recv_exact(sock, 2))[0])) > 12
+
+
+def exchange_doh(sock: socket.socket, packet: bytes, get: bool) -> bool:
+    """One DoH request over HTTP/1.1."""
+    head = f"Host: {TLS_NAME}\r\nAccept: application/dns-message\r\n"
+    if get:
+        encoded = base64.urlsafe_b64encode(packet).decode().rstrip("=")
+        request = f"GET /dns-query?dns={encoded} HTTP/1.1\r\n{head}\r\n".encode()
+    else:
+        head += f"Content-Type: application/dns-message\r\nContent-Length: {len(packet)}\r\n"
+        request = f"POST /dns-query HTTP/1.1\r\n{head}\r\n".encode() + packet
+    sock.sendall(request)
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return False
+        response += chunk
+    header, body = response.split(b"\r\n\r\n", 1)
+    length = re.search(rb"(?i)\r\ncontent-length:\s*(\d+)", header)
+    if not header.startswith(b"HTTP/1.1 200") or not length:
+        return False
+    return len(body + recv_exact(sock, int(length[1]) - len(body))) > 12
+
+
+def drive_tls(names: list[str], seconds: float) -> tuple[int, int, int]:
+    """Opens a new connection per query to the DoT and DoH listeners of the zone instance, so its
+    server side runs a handshake each time: TLS 1.3 in full and resumed, and TLS 1.2. Returns
+    connections opened, answered, and resumed."""
+
+    def context(alpn: str, tls12: bool) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Only the server's work is trained; the client need not check its certificate.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if tls12:
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_alpn_protocols([alpn])
+        return ctx
+
+    variants = [
+        (DOT_PORT, context("dot", False), False, exchange_dot),
+        (DOT_PORT, context("dot", False), True, exchange_dot),
+        (DOT_PORT, context("dot", True), False, exchange_dot),
+        (DOH_PORT, context("http/1.1", False), False, lambda s, p: exchange_doh(s, p, False)),
+        (DOH_PORT, context("http/1.1", False), True, lambda s, p: exchange_doh(s, p, True)),
+        (DOH_PORT, context("http/1.1", True), False, lambda s, p: exchange_doh(s, p, False)),
+    ]
+    sessions: dict[int, ssl.SSLSession] = {}
+    opened = answered = resumed = 0
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        index = opened % len(variants)
+        port, ctx, resume, exchange = variants[index]
+        packet = query(names[opened % len(names)], edns=True)
+        opened += 1
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw:
+                session = sessions.get(index) if resume else None
+                with ctx.wrap_socket(raw, server_hostname=TLS_NAME, session=session) as sock:
+                    if exchange(sock, packet):
+                        answered += 1
+                    resumed += sock.session_reused
+                    sessions[index] = sock.session
+        except OSError:
+            pass
+    return opened, answered, resumed
+
+
 def llvm_profdata() -> Path:
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
     info = subprocess.check_output(["rustc", "-vV"], text=True)
@@ -374,12 +573,16 @@ def train(
     tcp_seconds: float = 0,
     ad: bool = False,
     env: dict | None = None,
+    probes: list[tuple[str, int]] | None = None,
 ) -> None:
+    """Runs one instance under load. It is ready once each of `probes`, by default the first of
+    `names`, gets its rcode."""
     config = work / f"{phase}.toml"
     write_config(config, [f"127.0.0.1:{PORT}"], extra)
     server = Server(command, config, str(work / f"train-{phase}-%p.profraw"), env)
     try:
-        server.wait_ready("127.0.0.1", PORT, names[0], rcode, ad)
+        for name, code in probes or [(names[0], rcode)]:
+            server.wait_ready("127.0.0.1", PORT, name, code, ad)
         sent, answered = drive(PORT, names, seconds)
         print(f"{phase}: {answered} of {sent} UDP queries answered in {seconds} s")
         if answered == 0:
@@ -414,6 +617,13 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="onetdns-pgo-", ignore_cleanup_errors=True) as tmp:
         work = Path(tmp)
         allowed, blocked = write_fixtures(work)
+        ed25519_names = write_ed25519_zone(work)
+        rsa_names = write_rsa_zone(work)
+        missing = [f"x{i:06d}.bench.test" for i in range(ZONE_OWNERS)]
+        # Answers from each signing algorithm, and denials proved by NSEC.
+        pools = [allowed, ed25519_names, allowed, rsa_names, missing]
+        signed_names = [pools[i % 5][i // 5 % len(pools[i % 5])] for i in range(ZONE_OWNERS)]
+        signed_probes = [(allowed[0], NOERROR), (ed25519_names[0], NOERROR), (rsa_names[0], NOERROR)]
         cert, key = work / "pgo.crt", work / "pgo.key"
         subprocess.run(
             [*command, "--cli", "cert", "--host", TLS_NAME, "--cert-out", str(cert), "--key-out", str(key)],
@@ -423,6 +633,14 @@ def main() -> None:
         )
         tls = f'tls_cert = "{cert.as_posix()}"\ntls_key = "{key.as_posix()}"\n'
         signed = "dnssec_sign = true"
+        zones = ", ".join(
+            [
+                f'{{ origin = "test", file = "{(work / "db.test").as_posix()}", {signed} }}',
+                f'{{ origin = "ed25519", file = "{(work / "db.ed25519").as_posix()}", {signed}, '
+                'dnssec_algorithm = "ed25519" }',
+                f'{{ origin = "rsa", file = "{(work / "db.rsa").as_posix()}" }}',
+            ]
+        )
 
         write_config(
             work / "zone.toml",
@@ -433,14 +651,14 @@ def main() -> None:
             + f'listen_doq = ["127.0.0.1:{DOT_PORT}", "[{ZONE}]:853"]\n'
             + f'listen_doh = ["127.0.0.1:{DOH_PORT}"]\nlisten_doh3 = ["127.0.0.1:{DOH_PORT}"]\n'
             + f'listen_dnscrypt = ["127.0.0.1:{DNSCRYPT_PORT}"]\ndnscrypt_provider_name = "{PROVIDER}"\n'
-            + f'zones = [{{ origin = "test", file = "{(work / "db.test").as_posix()}", {signed} }}]\n',
+            + f"zones = [{zones}]\n",
         )
         servers = []
         try:
             zone = Server(command, work / "zone.toml", str(work / "train-zone-%p.profraw"), low_ports=True)
             servers.append(zone)
             zone.wait_ready("127.0.0.1", ZONE_PORT, allowed[0], NOERROR)
-            write_root_zone(work, key_signing_key(ZONE, 53, "test."))
+            write_root_zone(work, {owner: key_signing_key(ZONE, 53, owner) for owner in ("test.", "ed25519.", "rsa.")})
             write_config(
                 work / "root.toml",
                 [f"{ROOT}:53"],
@@ -455,7 +673,8 @@ def main() -> None:
             write_anchor(work / "root.anchor", key_signing_key(ROOT, 53, "."))
 
             forward = 'backend = "forward"\ndnssec = false\n'
-            filters = f'blocklists = ["{(work / "blocklist.txt").as_posix()}"]\n'
+            lists = [(work / name).as_posix() for name in ("blocklist.txt", "hosts.txt")]
+            filters = f'blocklists = ["{lists[0]}", "{lists[1]}"]\n'
             plain = f'upstreams = []\nupstream_urls = ["udp://127.0.0.1:{ZONE_PORT}"]\n'
             cache = "cache_enabled = true\ncache_size = 40000\nsharded_cache = false\n"
             no_cache = "cache_enabled = false\n"
@@ -481,13 +700,33 @@ def main() -> None:
                     env={"SSL_CERT_FILE": str(cert)},
                 )
 
+            opened, answered, resumed = drive_tls(allowed, SHORT_SECONDS)
+            print(f"tls: {answered} of {opened} new connections answered, {resumed} resumed, in {SHORT_SECONDS} s")
+            if answered == 0 or resumed == 0:
+                zone.fail("the TLS listeners answered no new connection or resumed no session")
+
+            anchor = f'dnssec_anchor_file = "{(work / "root.anchor").as_posix()}"\n'
             recurse = (
                 f'backend = "recurse"\nroot_hints = ["{ROOT}"]\ndnssec = true\n'
                 f'recurse_allow_server = ["{ROOT}/32", "{ZONE}/128"]\n'
-                f'dnssec_anchor_file = "{(work / "root.anchor").as_posix()}"\n'
-                "recurse_opportunistic_encryption = true\n"
+                + anchor
+                + "recurse_opportunistic_encryption = true\n"
             )
-            train(command, work, "recurse", recurse + no_cache, allowed, ad=True)
+            recurse_probes = [*signed_probes, (missing[0], NXDOMAIN)]
+            train(command, work, "recurse", recurse + no_cache, signed_names, ad=True, probes=recurse_probes)
+
+            # Forwarding validates what a recursive resolver answers. It does not check denial
+            # proofs, so a missing name gets no AD there.
+            write_config(work / "resolver.toml", [f"127.0.0.1:{RESOLVER_PORT}"], recurse)
+            resolver = Server(command, work / "resolver.toml", str(work / "train-resolver-%p.profraw"))
+            servers.append(resolver)
+            resolver.wait_ready("127.0.0.1", RESOLVER_PORT, allowed[0], NOERROR, ad=True)
+            validate = (
+                'backend = "forward"\ndnssec = true\n'
+                + anchor
+                + f'upstreams = []\nupstream_urls = ["udp://127.0.0.1:{RESOLVER_PORT}"]\n'
+            )
+            train(command, work, "validate", validate + no_cache, signed_names, ad=True, probes=signed_probes)
 
             for server in reversed(servers):
                 server.stop()
@@ -498,7 +737,7 @@ def main() -> None:
 
         profiles = sorted(work.glob("train-*.profraw"))
         sizes = [(p.name, p.stat().st_size) for p in profiles]
-        expected = 2 + 2 + len(encrypted) + 1
+        expected = 3 + 2 + len(encrypted) + 2
         if len(profiles) != expected or any(size == 0 for _, size in sizes):
             fail(f"expected {expected} non-empty profiles, found {sizes}")
         args.output.parent.mkdir(parents=True, exist_ok=True)
