@@ -1060,18 +1060,60 @@ pub fn validate_chain_status_with_options(
     now: u32,
     require_ds_absence_proof: bool,
 ) -> ChainStatus {
-    let mut trusted_ds = root_anchors.to_vec();
+    chain_status_from(
+        ChainStart::Anchors(root_anchors),
+        links,
+        now,
+        require_ds_absence_proof,
+    )
+}
+
+/// For a chain whose first zone's keys were validated earlier: `start_keys` are those keys, and the
+/// first link's DNSKEY set is not checked again.
+pub fn validate_chain_status_from_keys(
+    start_keys: &[Dnskey],
+    links: &[ChainLink],
+    now: u32,
+    require_ds_absence_proof: bool,
+) -> ChainStatus {
+    chain_status_from(
+        ChainStart::Keys(start_keys),
+        links,
+        now,
+        require_ds_absence_proof,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ChainStart<'a> {
+    Anchors(&'a [Ds]),
+    Keys(&'a [Dnskey]),
+}
+
+fn chain_status_from(
+    start: ChainStart<'_>,
+    links: &[ChainLink],
+    now: u32,
+    require_ds_absence_proof: bool,
+) -> ChainStatus {
+    let mut trusted_ds = match start {
+        ChainStart::Anchors(anchors) => anchors.to_vec(),
+        ChainStart::Keys(_) => Vec::new(),
+    };
     let mut keys: Vec<Dnskey> = Vec::new();
     for (i, link) in links.iter().enumerate() {
-        keys = match validate_dnskey_set(
-            &link.dnskeys,
-            &link.dnskey_rrsigs,
-            &trusted_ds,
-            &link.zone,
-            now,
-        ) {
-            Ok(k) => k,
-            Err(_) => return ChainStatus::Bogus,
+        keys = match start {
+            ChainStart::Keys(start_keys) if i == 0 => start_keys.to_vec(),
+            _ => match validate_dnskey_set(
+                &link.dnskeys,
+                &link.dnskey_rrsigs,
+                &trusted_ds,
+                &link.zone,
+                now,
+            ) {
+                Ok(k) => k,
+                Err(_) => return ChainStatus::Bogus,
+            },
         };
         if link.ds_records.is_empty() {
             if i + 1 < links.len() {

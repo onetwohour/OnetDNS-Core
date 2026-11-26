@@ -55,10 +55,10 @@ fn make_ctx(qname: &Name, qtype: RecordType) -> IterationContext<'_> {
 impl Session {
     /// Starts from a cached delegation or the root.
     fn start(r: &Recursor, qname: Name, qtype: RecordType, now: Instant) -> Option<Self> {
-        let (zone, servers) = r
-            .deepest_cached_delegation(&qname, qtype)
-            .unwrap_or_else(|| (Name::root(), r.roots.clone()));
-        let state = IterationState::start(zone, servers);
+        let start = r
+            .cached_walk_start(&qname, qtype, false)
+            .unwrap_or_else(|| WalkStart::root(r.roots.clone()));
+        let state = IterationState::start(start);
         let step_cap = r.max_referrals + qname.num_labels() + 2;
         let sock = onetdns_core::udp::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
         sock.set_nonblocking(true).ok()?;

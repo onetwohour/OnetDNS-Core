@@ -173,23 +173,21 @@ impl Session {
         budget: Duration,
         now: Instant,
     ) -> Option<Self> {
-        let (zone, servers) = r
-            .deepest_cached_delegation(&qname, qtype)
-            .filter(|(zone, _)| r.validated_start_ok(zone))
-            .unwrap_or_else(|| (Name::root(), r.roots.clone()));
-        Self::start_at(r, qname, qtype, zone, servers, budget, now)
+        let start = r
+            .cached_walk_start(&qname, qtype, true)
+            .unwrap_or_else(|| crate::WalkStart::root(r.roots.clone()));
+        Self::start_at(r, qname, qtype, start, budget, now)
     }
 
     fn start_at(
         r: &Recursor,
         qname: Name,
         qtype: RecordType,
-        zone: Name,
-        servers: Vec<SocketAddr>,
+        start: crate::WalkStart,
         budget: Duration,
         now: Instant,
     ) -> Option<Self> {
-        let state = IterationState::start(zone, servers);
+        let state = IterationState::start(start);
         let step_cap = r.max_referrals + qname.num_labels() + 2;
 
         let sock = bind_outgoing((std::net::Ipv4Addr::UNSPECIFIED, 0).into())?;
@@ -1073,8 +1071,11 @@ impl Reactor {
             r,
             zone.clone(),
             RecordType::DNSKEY,
-            zone.clone(),
-            servers,
+            crate::WalkStart {
+                zone: zone.clone(),
+                servers,
+                trust: None,
+            },
             budget,
             now,
         ) {

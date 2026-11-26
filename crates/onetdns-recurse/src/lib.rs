@@ -389,6 +389,7 @@ struct DnskeyEntry {
 
 const DNSKEY_CACHE_MAX: usize = 4_096;
 
+#[derive(Clone)]
 /// Holds the anchors used; once they change the entry is stale.
 struct ValidatedKeyEntry {
     trust: ZoneTrust,
@@ -574,9 +575,31 @@ enum StepOutcome {
     Failed(RecurseError),
 }
 
+/// Where a walk begins. Below the root, `trust` holds the keys the chain is validated from.
+struct WalkStart {
+    zone: Name,
+    servers: Vec<SocketAddr>,
+    trust: Option<ValidatedKeyEntry>,
+}
+
+impl WalkStart {
+    fn root(servers: Vec<SocketAddr>) -> Self {
+        Self {
+            zone: Name::root(),
+            servers,
+            trust: None,
+        }
+    }
+}
+
 impl IterationState {
     /// Also creates the chain's first step.
-    fn start(zone: Name, servers: Vec<SocketAddr>) -> Self {
+    fn start(start: WalkStart) -> Self {
+        let WalkStart {
+            zone,
+            servers,
+            trust,
+        } = start;
         let depth = zone.num_labels();
         let chain = vec![ZoneStep {
             zone: zone.clone(),
@@ -589,6 +612,7 @@ impl IterationState {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: trust,
         }];
         Self {
             zone,
@@ -634,6 +658,9 @@ struct ZoneStep {
     ds_nsec3_rrsigs: Vec<onetdns_dnssec::Rrsig>,
     /// Parsed DS, the trust basis for the next step.
     ds: Vec<onetdns_dnssec::Ds>,
+    /// Only on the first step of a walk that started below the root: the zone's keys as validated
+    /// earlier, which the chain is validated from.
+    start_trust: Option<ValidatedKeyEntry>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1457,8 +1484,8 @@ impl Recursor {
         SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS)
     }
 
-    /// Each step's DNSKEY is fetched from that zone; its DS comes from the child step, where the
-    /// parent's referral recorded it.
+    /// Each step's DNSKEY is fetched from that zone, except a start whose keys are already trusted;
+    /// its DS comes from the child step, where the parent's referral recorded it.
     fn build_chain_links(
         &self,
         chain: &[ZoneStep],
@@ -1466,8 +1493,11 @@ impl Recursor {
     ) -> Result<Vec<onetdns_dnssec::ChainLink>, RecurseError> {
         let mut links = Vec::with_capacity(chain.len());
         for (i, step) in chain.iter().enumerate() {
-            let (dnskeys, dnskey_rrsigs) =
-                self.fetch_dnskey(&step.zone, &step.servers, deadline)?;
+            let (dnskeys, dnskey_rrsigs) = if step.start_trust.is_some() {
+                (Vec::new(), Vec::new())
+            } else {
+                self.fetch_dnskey(&step.zone, &step.servers, deadline)?
+            };
             let (
                 ds_records,
                 ds_rrsigs,
@@ -1790,13 +1820,22 @@ impl Recursor {
         );
     }
 
-    /// Used only when the stored anchors are the same object as the current ones; after an anchor
-    /// change, an old result would validate with keys no longer trusted.
     fn validated_keys_cached(
         &self,
         zone_key: &[u8],
         anchors: &std::sync::Arc<Vec<onetdns_dnssec::Ds>>,
     ) -> Option<ZoneTrust> {
+        self.validated_key_entry(zone_key, anchors)
+            .map(|entry| entry.trust)
+    }
+
+    /// Used only when the stored anchors are the same object as the current ones; after an anchor
+    /// change, an old result would validate with keys no longer trusted.
+    fn validated_key_entry(
+        &self,
+        zone_key: &[u8],
+        anchors: &std::sync::Arc<Vec<onetdns_dnssec::Ds>>,
+    ) -> Option<ValidatedKeyEntry> {
         let mut cache = self.validated_keys.lock_recover();
         let now = cache_now_millis();
         match cache.get(zone_key) {
@@ -1804,7 +1843,7 @@ impl Recursor {
                 if entry.lifetime.is_live(now)
                     && std::sync::Arc::ptr_eq(&entry.anchors, anchors) =>
             {
-                Some(entry.trust.clone())
+                Some(entry.clone())
             }
             Some(_) => {
                 cache.pop(zone_key);
@@ -1850,6 +1889,7 @@ impl Recursor {
     ) -> Option<(Name, Vec<SocketAddr>)> {
         chain
             .iter()
+            .filter(|step| step.start_trust.is_none())
             .map(|step| (step.zone.canonical_key(), step))
             .find(|(key, _)| !skip.contains(key) && self.dnskey_cached(key).is_none())
             .map(|(_, step)| (step.zone.clone(), step.servers.clone()))
@@ -1874,7 +1914,10 @@ impl Recursor {
             return Some((SecurityStatus::Insecure, Vec::new()));
         }
         if self.cached_chain_trust(chain).is_none() {
-            if !chain.first().is_some_and(|step| step.zone.is_root()) {
+            if !chain
+                .first()
+                .is_some_and(|step| step.zone.is_root() || step.start_trust.is_some())
+            {
                 return None;
             }
             if self.first_chain_zone_missing_dnskey(chain, &[]).is_some() {
@@ -1896,19 +1939,31 @@ impl Recursor {
         })
     }
 
-    /// Always true without validation. With it, the zone's keys must already be established, since
-    /// starting midway skips the chain above.
-    fn validated_start_ok(&self, zone: &Name) -> bool {
-        !self.validating() || {
-            let anchors = self.trust_anchors.load();
-            self.validated_keys_cached(&zone.canonical_key(), &anchors)
-                .is_some()
-        }
+    /// The deepest cached delegation for `qname`, with the keys a chain starting there is validated
+    /// from. When validating, a zone whose keys are not established cannot be a start: the chain
+    /// above it would go unchecked.
+    fn cached_walk_start(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+        validate: bool,
+    ) -> Option<WalkStart> {
+        let (zone, servers) = self.deepest_cached_delegation(qname, qtype)?;
+        let trust = if validate && self.validating() {
+            Some(self.validated_key_entry(&zone.canonical_key(), &self.trust_anchors.load())?)
+        } else {
+            None
+        };
+        Some(WalkStart {
+            zone,
+            servers,
+            trust,
+        })
     }
 
     /// Uses the cache when it can, otherwise fetches every step's DNSKEY and validates from the
-    /// anchor. A chain not starting at the root is Bogus: the delegations above it were never
-    /// checked.
+    /// anchor, or from the keys a chain starting below the root was given. Any other chain is
+    /// Bogus: the delegations above it were never checked.
     fn validated_chain_keys(
         &self,
         chain: &[ZoneStep],
@@ -1923,11 +1978,37 @@ impl Recursor {
             return Err(SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS));
         };
         let zone_key = leaf.zone.canonical_key();
-        let anchors = self.trust_anchors.load();
+        let start = match chain.first() {
+            Some(first) if first.zone.is_root() => None,
+            Some(ZoneStep {
+                start_trust: Some(start),
+                ..
+            }) => Some(start),
+            _ => return Err(SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS)),
+        };
+        // What the leaf learns cannot outlive the start it was validated from.
+        let start_ttl = start.map(|start| {
+            start
+                .lifetime
+                .remaining_secs(cache_now_millis())
+                .unwrap_or(0)
+        });
+        let anchors =
+            start.map_or_else(|| self.trust_anchors.load(), |start| start.anchors.clone());
+        let start_keys = match start.map(|start| &start.trust) {
+            None => None,
+            Some(ZoneTrust::Secure(keys)) => Some(keys.clone()),
+            Some(ZoneTrust::Insecure) => {
+                self.validated_keys_store(
+                    zone_key,
+                    ZoneTrust::Insecure,
+                    anchors,
+                    start_ttl.unwrap_or(0),
+                );
+                return Err(SecurityStatus::Insecure);
+            }
+        };
 
-        if !chain.first().is_some_and(|step| step.zone.is_root()) {
-            return Err(SecurityStatus::Bogus(ede_code::DNSSEC_BOGUS));
-        }
         let links = match self.build_chain_links(chain, deadline) {
             Ok(l) => l,
 
@@ -1953,20 +2034,22 @@ impl Recursor {
             ));
         }
         let now = now_secs();
-        let keys = match onetdns_dnssec::validate_chain_status_with_options(
-            &anchors,
-            &links,
-            now,
-            self.strict,
-        ) {
+        let status = match &start_keys {
+            None => onetdns_dnssec::validate_chain_status_with_options(
+                &anchors,
+                &links,
+                now,
+                self.strict,
+            ),
+            Some(keys) => {
+                onetdns_dnssec::validate_chain_status_from_keys(keys, &links, now, self.strict)
+            }
+        };
+        let ttl = chain_validity_ttl(&links, now).min(start_ttl.unwrap_or(u32::MAX));
+        let keys = match status {
             onetdns_dnssec::ChainStatus::Secure(keys) => keys,
             onetdns_dnssec::ChainStatus::Insecure => {
-                self.validated_keys_store(
-                    zone_key,
-                    ZoneTrust::Insecure,
-                    anchors,
-                    chain_validity_ttl(&links, now),
-                );
+                self.validated_keys_store(zone_key, ZoneTrust::Insecure, anchors, ttl);
                 return Err(SecurityStatus::Insecure);
             }
             onetdns_dnssec::ChainStatus::Bogus => {
@@ -1974,12 +2057,7 @@ impl Recursor {
             }
         };
         let keys: std::sync::Arc<[onetdns_dnssec::Dnskey]> = keys.into();
-        self.validated_keys_store(
-            zone_key,
-            ZoneTrust::Secure(keys.clone()),
-            anchors,
-            chain_validity_ttl(&links, now),
-        );
+        self.validated_keys_store(zone_key, ZoneTrust::Secure(keys.clone()), anchors, ttl);
         Ok(keys)
     }
 
@@ -1994,36 +2072,25 @@ impl Recursor {
         budget: &mut Budget,
         validate: bool,
     ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
-        let validated_start_ok = |zone: &Name| !validate || self.validated_start_ok(zone);
-        {
-            if let Some((zone, servers)) = self
-                .deepest_cached_delegation(qname, qtype)
-                .filter(|(zone, _)| validated_start_ok(zone))
-            {
-                rtrace!(
-                    "Starting {} from cached delegation {} ({} servers)",
-                    zone.to_ascii_lower(),
-                    servers.len(),
-                    qname.to_ascii_lower()
-                );
-                let saved = budget.ns_resolves;
-                match self.iterate_from(qname, qtype, budget, zone.clone(), servers, validate) {
-                    Ok(v) if validated_start_ok(v.1.last().map_or(&zone, |s| &s.zone)) => {
-                        return Ok(v)
-                    }
-                    Ok(_) => {
-                        rtrace!("No cached validated key for the partial chain leaf; walking again from the root");
-                        budget.ns_resolves = saved;
-                    }
-                    Err(e) => {
-                        rtrace!(
-                            "Query from cached delegation {} failed ({:?}); dropping that path and retrying from the root",
-                            zone.to_ascii_lower(),
-                            e
-                        );
-                        self.deleg_evict_path(qname);
-                        budget.ns_resolves = saved;
-                    }
+        if let Some(start) = self.cached_walk_start(qname, qtype, validate) {
+            let zone = start.zone.clone();
+            rtrace!(
+                "Starting from cached delegation {} ({} servers): name={}",
+                zone.to_ascii_lower(),
+                start.servers.len(),
+                qname.to_ascii_lower()
+            );
+            let saved = budget.ns_resolves;
+            match self.iterate_from(qname, qtype, budget, start, validate) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    rtrace!(
+                        "Query from cached delegation {} failed ({:?}); dropping that path and retrying from the root",
+                        zone.to_ascii_lower(),
+                        e
+                    );
+                    self.deleg_evict_path(qname);
+                    budget.ns_resolves = saved;
                 }
             }
         }
@@ -2031,8 +2098,7 @@ impl Recursor {
             qname,
             qtype,
             budget,
-            Name::root(),
-            self.roots.clone(),
+            WalkStart::root(self.roots.clone()),
             validate,
         )
     }
@@ -2045,8 +2111,7 @@ impl Recursor {
         qname: &Name,
         qtype: RecordType,
         budget: &mut Budget,
-        start_zone: Name,
-        start_servers: Vec<SocketAddr>,
+        start: WalkStart,
         validate: bool,
     ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
         let ctx = IterationContext {
@@ -2056,7 +2121,7 @@ impl Recursor {
             do_bit: true,
             collect_ds: validate,
         };
-        let mut state = IterationState::start(start_zone, start_servers);
+        let mut state = IterationState::start(start);
         let mut referrals = 0usize;
 
         for _ in 0..(self.max_referrals + ctx.total + 2) {
@@ -2445,6 +2510,7 @@ impl Recursor {
             ds_nsec3_records,
             ds_nsec3_rrsigs,
             ds,
+            start_trust: None,
         });
         state.depth = nz.num_labels();
         state.zone = nz;
@@ -5948,6 +6014,7 @@ mod tests {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: None,
         }];
         let soa = Record::new(
             apex,
@@ -6034,6 +6101,7 @@ mod tests {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: None,
         }];
         let soa = Record::new(
             apex,
@@ -6114,6 +6182,7 @@ mod tests {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: None,
         }];
         let soa = Record::new(
             apex.clone(),
@@ -6219,6 +6288,7 @@ mod tests {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: None,
         }];
         let answer = Record::new(qname.clone(), 3600, RData::A(Ipv4Addr::new(192, 0, 2, 65)));
         let other = Record::new(qname.clone(), 3600, RData::A(Ipv4Addr::new(192, 0, 2, 66)));
@@ -6282,6 +6352,7 @@ mod tests {
             ds_nsec3_records: vec![],
             ds_nsec3_rrsigs: vec![],
             ds: vec![],
+            start_trust: None,
         }];
         let soa = Record::new(
             apex,
@@ -7098,8 +7169,7 @@ mod tests {
                 &qname,
                 RecordType::A,
                 &mut budget,
-                Name::root(),
-                vec![root],
+                WalkStart::root(vec![root]),
                 true,
             )
             .expect("검증을 켜도 경계를 따라 내려가야 합니다");
@@ -7531,8 +7601,7 @@ mod tests {
                 &qname,
                 RecordType::A,
                 &mut budget,
-                Name::root(),
-                vec![root],
+                WalkStart::root(vec![root]),
                 true,
             )
             .expect("주소를 풀어 내려가야 합니다");
@@ -8069,6 +8138,240 @@ mod tests {
         );
     }
 
+    type Counter = Arc<std::sync::atomic::AtomicUsize>;
+
+    /// Root, `test`, and `sub.test`, each signed. With `wrong_sub_ds`, the DS for `sub.test` names
+    /// another key. Also returns how many queries the root got and how many final
+    /// `host.sub.test` queries the leaf got.
+    fn spawn_three_level_signed_hierarchy(
+        port: u16,
+        [root_ip, test_ip, sub_ip]: [&str; 3],
+        wrong_sub_ds: bool,
+    ) -> (SocketAddr, onetdns_dnssec::Ds, Counter, Counter) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let name = |text: &str| Name::from_str(text).unwrap();
+        let (sk_root, k_root) = ecdsa_key(31);
+        let (sk_test, k_test) = ecdsa_key(32);
+        let (sk_sub, k_sub) = ecdsa_key(33);
+        let (_, k_other) = ecdsa_key(34);
+
+        let anchor = onetdns_dnssec::Ds::from_dnskey(&k_root, &name("."), 2).unwrap();
+        let ds_record = |owner: &str, key: &onetdns_dnssec::Dnskey| {
+            let ds = onetdns_dnssec::Ds::from_dnskey(key, &name(owner), 2).unwrap();
+            Record::new(name(owner), 3600, RData::Unknown(43, ds.rdata_bytes()))
+        };
+        let test_ds = ds_record("test", &k_test);
+        let sub_ds = ds_record("sub.test", if wrong_sub_ds { &k_other } else { &k_sub });
+        let test_glue: Ipv4Addr = test_ip.parse().unwrap();
+        let sub_glue: Ipv4Addr = sub_ip.parse().unwrap();
+
+        let root_queries = Arc::new(AtomicUsize::new(0));
+        let leaf_queries = Arc::new(AtomicUsize::new(0));
+        {
+            let root_queries = root_queries.clone();
+            spawn_server(root_ip, port, move |req| {
+                root_queries.fetch_add(1, Ordering::SeqCst);
+                let q = req.questions.first().unwrap().clone();
+                let mut m = base(req);
+                if q.qtype == RecordType::DNSKEY && q.name.is_root() {
+                    m.header.authoritative = true;
+                    let dk = dnskey_rec(".", &k_root);
+                    let sig =
+                        rrsig_rec(&sk_root, &k_root, ".", RecordType::DNSKEY.0, &[dk.clone()]);
+                    m.answers.push(dk);
+                    m.answers.push(sig);
+                } else {
+                    m.authorities
+                        .push(Record::new(name("test"), 3600, RData::Ns(name("ns.test"))));
+                    m.authorities.push(test_ds.clone());
+                    m.authorities.push(rrsig_rec(
+                        &sk_root,
+                        &k_root,
+                        ".",
+                        RecordType::DS.0,
+                        &[test_ds.clone()],
+                    ));
+                    m.additionals
+                        .push(Record::new(name("ns.test"), 3600, RData::A(test_glue)));
+                }
+                m
+            });
+        }
+        spawn_server(test_ip, port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let qname = q.name.to_ascii_lower();
+            let mut m = base(req);
+            if qname == "sub.test" || qname.ends_with(".sub.test") {
+                m.authorities.push(Record::new(
+                    name("sub.test"),
+                    3600,
+                    RData::Ns(name("ns.sub.test")),
+                ));
+                m.authorities.push(sub_ds.clone());
+                m.authorities.push(rrsig_rec(
+                    &sk_test,
+                    &k_test,
+                    "test",
+                    RecordType::DS.0,
+                    &[sub_ds.clone()],
+                ));
+                m.additionals
+                    .push(Record::new(name("ns.sub.test"), 3600, RData::A(sub_glue)));
+                return m;
+            }
+            m.header.authoritative = true;
+            if q.qtype == RecordType::DNSKEY && qname == "test" {
+                let dk = dnskey_rec("test", &k_test);
+                let sig = rrsig_rec(
+                    &sk_test,
+                    &k_test,
+                    "test",
+                    RecordType::DNSKEY.0,
+                    &[dk.clone()],
+                );
+                m.answers.push(dk);
+                m.answers.push(sig);
+            } else if qname == "host.test" && q.qtype == RecordType::A {
+                let a = Record::new(
+                    name("host.test"),
+                    3600,
+                    RData::A(Ipv4Addr::new(10, 0, 0, 9)),
+                );
+                let sig = rrsig_rec(&sk_test, &k_test, "test", RecordType::A.0, &[a.clone()]);
+                m.answers.push(a);
+                m.answers.push(sig);
+            }
+            m
+        });
+        {
+            let leaf_queries = leaf_queries.clone();
+            spawn_server(sub_ip, port, move |req| {
+                let q = req.questions.first().unwrap().clone();
+                let qname = q.name.to_ascii_lower();
+                let mut m = base(req);
+                m.header.authoritative = true;
+                if q.qtype == RecordType::DNSKEY && qname == "sub.test" {
+                    let dk = dnskey_rec("sub.test", &k_sub);
+                    let sig = rrsig_rec(
+                        &sk_sub,
+                        &k_sub,
+                        "sub.test",
+                        RecordType::DNSKEY.0,
+                        &[dk.clone()],
+                    );
+                    m.answers.push(dk);
+                    m.answers.push(sig);
+                } else if qname == "host.sub.test" && q.qtype == RecordType::A {
+                    leaf_queries.fetch_add(1, Ordering::SeqCst);
+                    let a = Record::new(
+                        name("host.sub.test"),
+                        3600,
+                        RData::A(Ipv4Addr::new(10, 0, 0, 10)),
+                    );
+                    let sig = rrsig_rec(&sk_sub, &k_sub, "sub.test", RecordType::A.0, &[a.clone()]);
+                    m.answers.push(a);
+                    m.answers.push(sig);
+                }
+                m
+            });
+        }
+        let root = SocketAddr::new(IpAddr::V4(root_ip.parse().unwrap()), port);
+        (root, anchor, root_queries, leaf_queries)
+    }
+
+    /// Resolves `host.test`, so `test` is a cached delegation with validated keys.
+    fn warmed_recursor(root: SocketAddr, port: u16, anchor: onetdns_dnssec::Ds) -> Recursor {
+        let rec = Recursor::new(vec![root], Duration::from_secs(2))
+            .with_port(port)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor]);
+        let warm = rec
+            .resolve(&Name::from_str("host.test").unwrap(), RecordType::A)
+            .expect("상위 영역 해석");
+        assert!(warm.header.authentic_data, "상위 영역 답은 AD=1");
+        rec
+    }
+
+    #[test]
+    /// The child is validated from the cached keys of the zone the walk started at; walking from the
+    /// root instead would ask the child again.
+    fn a_validated_cached_start_validates_the_child_without_walking_from_the_root() {
+        use std::sync::atomic::Ordering;
+        let ips = ["127.0.0.110", "127.0.0.111", "127.0.0.112"];
+        let (root, anchor, root_queries, leaf_queries) =
+            spawn_three_level_signed_hierarchy(5430, ips, false);
+        let rec = warmed_recursor(root, 5430, anchor);
+        let root_before = root_queries.load(Ordering::SeqCst);
+
+        let resp = rec
+            .resolve(&Name::from_str("host.sub.test").unwrap(), RecordType::A)
+            .expect("하위 영역 해석");
+        assert_eq!(resp.header.rcode, ResponseCode::NoError.0);
+        assert!(
+            resp.header.authentic_data,
+            "상위 영역의 검증된 키에서 이어 검증한 답은 AD=1"
+        );
+        assert_eq!(
+            root_queries.load(Ordering::SeqCst),
+            root_before,
+            "루트부터 다시 걸으면 안 됨"
+        );
+        assert_eq!(
+            leaf_queries.load(Ordering::SeqCst),
+            1,
+            "하위 영역에 최종 질의를 한 번만 보내야 함"
+        );
+    }
+
+    #[test]
+    fn a_validated_cached_start_still_rejects_a_mismatched_child_ds() {
+        let ips = ["127.0.0.113", "127.0.0.114", "127.0.0.115"];
+        let (root, anchor, _, _) = spawn_three_level_signed_hierarchy(5431, ips, true);
+        let rec = warmed_recursor(root, 5431, anchor);
+
+        let resp = rec
+            .resolve(&Name::from_str("host.sub.test").unwrap(), RecordType::A)
+            .expect("하위 영역 해석 시도");
+        assert_eq!(
+            resp.header.rcode,
+            ResponseCode::ServFail.0,
+            "다른 키를 가리키는 DS는 캐시된 출발점에서도 bogus"
+        );
+        assert!(!resp.header.authentic_data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reactor_lane_validates_the_child_of_a_validated_cached_start() {
+        use crate::reactor::{Completion, Reactor, ReactorConfig, SubmitOutcome};
+        use std::sync::atomic::Ordering;
+        let ips = ["127.0.0.116", "127.0.0.117", "127.0.0.118"];
+        let (root, anchor, root_queries, _) = spawn_three_level_signed_hierarchy(5432, ips, false);
+        let rec = warmed_recursor(root, 5432, anchor);
+        let root_before = root_queries.load(Ordering::SeqCst);
+
+        let mut lane = Reactor::new(ReactorConfig::default());
+        let qname = Name::from_str("host.sub.test").unwrap();
+        assert!(matches!(
+            lane.submit(&rec, qname, RecordType::A, 1, Instant::now(), false),
+            SubmitOutcome::Accepted
+        ));
+        match drive_lane(&mut lane, &rec) {
+            Some(Completion::Answer(_, msg)) => {
+                assert_eq!(msg.header.rcode, ResponseCode::NoError.0);
+                assert!(msg.header.authentic_data, "레인이 검증한 답은 AD=1");
+            }
+            Some(Completion::Retry(_)) => panic!("레인이 검증하지 않고 동기 경로로 넘겼다"),
+            Some(Completion::Fail(..)) => panic!("해석 자체가 실패했다"),
+            None => panic!("완료 통지가 없다"),
+        }
+        assert_eq!(
+            root_queries.load(Ordering::SeqCst),
+            root_before,
+            "루트부터 다시 걸으면 안 됨"
+        );
+    }
+
     #[test]
     /// That verdict must be cached; otherwise the zone's next query cannot start from the cached
     /// delegation and walks from the root again.
@@ -8170,7 +8473,15 @@ mod tests {
             ),
             "서명 없는 영역이라는 판정이 캐시에 남아야 함"
         );
-        assert!(rec.validated_start_ok(&insecure_zone));
+        assert!(rec
+            .cached_walk_start(
+                &Name::from_str("host.insecure.test").unwrap(),
+                RecordType::A,
+                true
+            )
+            .is_some_and(
+                |start| start.zone.eq_ignore_case(&insecure_zone) && start.trust.is_some()
+            ));
         let root_before = root_queries.load(std::sync::atomic::Ordering::SeqCst);
         let nodata = rec
             .resolve(
