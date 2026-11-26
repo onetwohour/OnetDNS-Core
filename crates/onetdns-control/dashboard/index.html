@@ -39,10 +39,25 @@
   @keyframes odSpin{ to{ transform:rotate(360deg); } }
   @media (max-width:640px){
     [data-mform]{ gap:8px !important; }
-    [data-mform] > *{ flex:1 1 100% !important; min-width:0 !important; width:100% !important; }
+    [data-mform] > *{ flex:1 1 100% !important; min-width:0 !important; width:100% !important; max-width:none !important; }
     [data-mform] > button{ justify-content:center !important; }
     [data-mform] > div{ display:flex !important; }
     [data-mform] > div > button{ flex:1 1 0 !important; }
+    .od-head{ row-gap:10px !important; }
+    .od-actions{ flex:1 1 100% !important; margin-left:0 !important; }
+    .od-actions > *{ flex:1 1 0 !important; }
+    .od-actions > button{ justify-content:center !important; }
+    .od-actions:has(> :nth-child(3)) > *{ flex-basis:100% !important; }
+    [data-mtabs]{ flex:1 1 100% !important; }
+    [data-msub]{ order:1; flex:1 1 100% !important; max-width:none !important; }
+    [data-msub] ~ .od-actions{ order:2; }
+    [data-mkv]{ display:flex !important; justify-content:space-between; align-items:baseline; gap:16px; }
+    [data-mkv] > :first-child{ flex:0 0 auto; }
+    [data-mkv] > :last-child{ margin-top:0 !important; min-width:0; text-align:right; }
+    [data-mtabs] > button{ flex:1 1 0 !important; }
+    [data-mfield]{ flex-wrap:wrap !important; row-gap:8px !important; }
+    [data-mfield] > :not(:first-child):not([role=switch]){ flex:1 1 100% !important; max-width:none !important; }
+    [data-mfield] > span > input{ flex:1 1 auto !important; }
     [data-query-actions]{ overflow-x:auto !important; flex-wrap:nowrap !important; justify-content:flex-start !important; }
     [data-query-actions] > button{ flex:0 0 auto !important; width:auto !important; white-space:nowrap !important; }
     [data-querylog-table]{ overflow:visible !important; }
@@ -168,7 +183,9 @@
             <div style="font-size:12px;color:var(--fg2);margin-top:4px;line-height:1.55">{{ configStatusText }}</div>
             <sc-if value="{{ configStatusKeys }}"><div style="font-family:var(--font-mono);font-size:11px;color:var(--muted);margin-top:6px;word-break:break-all">{{ configStatusKeys }}</div></sc-if>
           </div>
-          <button onClick="{{ applyDiskConfig }}" disabled="{{ configApplyDisabled }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--warn);color:var(--on-warn);font:inherit;font-size:12px;font-weight:700;cursor:pointer;opacity:{{ configApplyOpacity }}">{{ configApplyLabel }}</button>
+          <div class="od-actions">
+            <button onClick="{{ applyDiskConfig }}" disabled="{{ configApplyDisabled }}" style="padding:9px 14px;border:0;border-radius:3px;background:var(--warn);color:var(--on-warn);font:inherit;font-size:12px;font-weight:700;cursor:pointer;opacity:{{ configApplyOpacity }}">{{ configApplyLabel }}</button>
+          </div>
         </div>
       </sc-if>
 
@@ -194,12 +211,14 @@
 
 
           <section class="od-card">
-            <div class="od-head" style="flex-wrap:{{ chartHeadWrap }}"><span class="od-title">실시간 처리량</span>
+            <div class="od-head" style="flex-wrap:{{ chartHeadWrap }}"><span class="od-title" style="flex-basis:{{ chartTitleBasis }}">실시간 처리량</span>
               <span class="od-desc">{{ qpsRangeLabel }}</span>
               <span style="flex:1"></span>
-              <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-right:4px"><span style="width:9px;height:3px;border-radius:2px;background:var(--accent)"></span>질의</div>
-              <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-right:8px"><span style="width:9px;height:3px;border-radius:2px;background:var(--block)"></span>차단</div>
-              <div style="display: inline-block; gap: 3px; background: var(--surface2); border: 1px solid var(--border); border-radius:4px; padding: 3px; flex-direction: row; justify-content: flex-end; margin-right: 0px; margin-left: auto">
+              <div style="display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted);margin-right:8px">
+                <span style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:3px;border-radius:2px;background:var(--accent)"></span>질의</span>
+                <span style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:3px;border-radius:2px;background:var(--block)"></span>차단</span>
+              </div>
+              <div data-mtabs="" style="display:flex;margin-left:auto;gap:3px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:3px">
                 <sc-for list="{{ qpsRanges }}" as="r" hint-placeholder-count="3"><button data-readonly-safe="" onClick="{{ r.onClick }}" style="{{ r.style }}">{{ r.label }}</button></sc-for>
               </div>
             </div>
@@ -610,7 +629,7 @@
 
         <section class="od-card">
           <div class="od-head"><span class="od-title">서비스 주소</span><span class="od-desc">DoT · DoH · DoQ · DoH3 · DNSCrypt</span></div>
-          <div data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)">
+          <div data-submit-enter="" data-mform="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)">
             <input data-k="lnHost" value="{{ forms.lnHost }}" onInput="{{ onForm }}" aria-label="주소" placeholder="0.0.0.0" class="od-input od-mono" style="flex:1;min-width:150px"><input data-k="lnPort" value="{{ forms.lnPort }}" onInput="{{ onForm }}" aria-label="포트" placeholder="853" class="od-input od-mono" style="flex:0 0 92px;min-width:0">
             <div onClick="{{ lnAddDd.toggle }}" onKeyDown="{{ lnAddDd.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ lnAddDd.open }}" aria-label="{{ lnAddDd.ariaLabel }}" class="od-input od-mono" style="flex:0 0 120px;display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:600"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ lnAddDd.label }}</span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
             <button data-enter-submit="" onClick="{{ addListener }}" class="od-btn-primary">추가</button>
@@ -619,20 +638,26 @@
           <sc-for list="{{ listeners }}" as="l" hint-placeholder-count="5">
             <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:13px 20px;border-bottom:1px solid var(--border)">
               <sc-if value="{{ !l.isEditing }}">
-                <span style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:{{ l.pc }};border:1px solid var(--border);border-radius:4px;padding:2px 0;flex:0 0 58px;text-align:center">{{ l.proto }}</span>
-                <span style="font-family:var(--font-mono);font-size:12.5px;color:var(--fg);flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.addr }}</span>
-                <span title="{{ l.connsLabel }}" style="font-size:12px;color:{{ l.connsColor }};flex:0 1 auto;min-width:0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.connsLabel }}</span>
+                <div style="display:flex;align-items:center;gap:12px;flex:1 1 210px;min-width:0">
+                  <span style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:{{ l.pc }};border:1px solid var(--border);border-radius:4px;padding:2px 0;flex:0 0 58px;text-align:center">{{ l.proto }}</span>
+                  <span style="font-family:var(--font-mono);font-size:12.5px;color:var(--fg);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.addr }}</span>
+                </div>
+                <span data-msub="" title="{{ l.connsLabel }}" style="font-size:12px;color:{{ l.connsColor }};flex:0 1 auto;min-width:0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.connsLabel }}</span>
                 <span style="font-size:12px;color:var(--muted);flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.sockets }}</span>
-                <button onClick="{{ l.onEdit }}" aria-label="{{ l.editLabel }}" class="od-btn" style="flex:0 0 auto">고치기</button>
-                <button onClick="{{ l.onDelete }}" aria-label="{{ l.deleteLabel }}" class="od-btn" style="flex:0 0 auto;color:var(--block)">지우기</button>
+                <div class="od-actions">
+                  <button onClick="{{ l.onEdit }}" aria-label="{{ l.editLabel }}" class="od-btn">고치기</button>
+                  <button onClick="{{ l.onDelete }}" aria-label="{{ l.deleteLabel }}" class="od-btn" style="color:var(--block)">지우기</button>
+                </div>
               </sc-if>
               <sc-if value="{{ l.isEditing }}">
-                <div data-submit-enter="" style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;flex-wrap:wrap">
+                <div data-submit-enter="" data-mform="" style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;flex-wrap:wrap">
                   <div onClick="{{ l.editKindDd.toggle }}" onKeyDown="{{ l.editKindDd.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ l.editKindDd.open }}" aria-label="{{ l.editKindDd.ariaLabel }}" style="display:flex;align-items:center;gap:6px;flex:0 0 104px;padding:7px 9px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--fg);font:inherit;font-size:12px;font-weight:700;font-family:var(--font-mono);cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.editKindDd.label }}</span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
                   <input value="{{ l.editHost }}" onInput="{{ onListenerHost }}" aria-label="주소" placeholder="0.0.0.0" class="od-input od-mono" style="flex:1;min-width:110px">
                   <input value="{{ l.editPort }}" onInput="{{ onListenerPort }}" aria-label="포트" placeholder="53" class="od-input od-mono" style="flex:0 0 82px;min-width:0">
-                  <button data-enter-submit="" onClick="{{ saveListenerEdit }}" class="od-btn-primary" style="flex:0 0 auto">저장</button>
-                  <button onClick="{{ cancelListenerEdit }}" class="od-btn" style="flex:0 0 auto">취소</button>
+                  <div class="od-actions">
+                    <button data-enter-submit="" onClick="{{ saveListenerEdit }}" class="od-btn-primary">저장</button>
+                    <button onClick="{{ cancelListenerEdit }}" class="od-btn">취소</button>
+                  </div>
                 </div>
               </sc-if>
             </div>
@@ -658,8 +683,10 @@
           </div>
           <div class="od-row" style="border-top:1px solid var(--border);flex-wrap:wrap;gap:10px 14px">
             <div class="od-main" style="flex:1 1 220px"><div class="od-label" style="display:flex;align-items:center;gap:8px"><span>인증서 폐기 상태</span><span style="font-size:12.5px;font-weight:600;color:{{ revocationColor }}">{{ revocationLabel }}</span></div><div class="od-sub" style="line-height:1.5">{{ revocationDetail }}</div></div>
-            <label style="flex:0 1 260px;min-width:0;display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:4px;padding:8px 10px;cursor:pointer"><span style="flex:1;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ forms.revocationFileName }}</span><span style="font-size:12px;font-weight:600;color:var(--accent)">PEM 선택</span><input type="file" aria-label="인증서 PEM 파일" data-k="revocationPem" data-label="revocationFileName" onChange="{{ onCertFile }}" accept=".pem,.crt,.cer,.txt" style="display:none"></label>
-            <button onClick="{{ checkTlsRevocation }}" class="od-btn">OCSP·CRL 확인</button>
+            <label style="flex:1 1 260px;min-width:0;display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:4px;padding:8px 10px;cursor:pointer"><span style="flex:1;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ forms.revocationFileName }}</span><span style="font-size:12px;font-weight:600;color:var(--accent)">PEM 선택</span><input type="file" aria-label="인증서 PEM 파일" data-k="revocationPem" data-label="revocationFileName" onChange="{{ onCertFile }}" accept=".pem,.crt,.cer,.txt" style="display:none"></label>
+            <div class="od-actions">
+              <button onClick="{{ checkTlsRevocation }}" class="od-btn">OCSP·CRL 확인</button>
+            </div>
           </div>
         </section>
 
@@ -668,7 +695,9 @@
           <div data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface2)">
             <input data-k="setupAddress" value="{{ forms.setupAddress }}" onInput="{{ onForm }}" aria-label="클라이언트가 접속할 IP 주소" placeholder="192.168.0.10" class="od-input od-mono" style="flex:1 1 140px;min-width:0">
             <input data-k="setupHost" value="{{ forms.setupHost }}" onInput="{{ onForm }}" aria-label="인증서 호스트명" placeholder="인증서 호스트명" class="od-input od-mono" style="flex:1 1 170px;min-width:0">
-            <button data-enter-submit="" onClick="{{ makeStamps }}" class="od-btn-primary">스탬프 만들기</button>
+            <div class="od-actions">
+              <button data-enter-submit="" onClick="{{ makeStamps }}" class="od-btn-primary">스탬프 만들기</button>
+            </div>
           </div>
           <sc-if value="{{ clientSetup.notice }}"><div class="od-note">{{ clientSetup.notice }}</div></sc-if>
           <sc-for list="{{ clientSetup.rows }}" as="s" hint-placeholder-count="3">
@@ -680,8 +709,10 @@
           </sc-for>
           <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px">
             <input data-k="setupSsids" value="{{ forms.setupSsids }}" onInput="{{ onForm }}" aria-label="프로필을 쓸 Wi-Fi 이름" placeholder="Wi-Fi 이름(쉼표로 구분)" class="od-input od-mono" style="flex:1 1 220px;min-width:0">
-            <button onClick="{{ appleProfileDoh }}" class="od-btn">Apple 프로필 · DoH</button>
-            <button onClick="{{ appleProfileDot }}" class="od-btn">Apple 프로필 · DoT</button>
+            <div class="od-actions">
+              <button onClick="{{ appleProfileDoh }}" class="od-btn">Apple 프로필 · DoH</button>
+              <button onClick="{{ appleProfileDot }}" class="od-btn">Apple 프로필 · DoT</button>
+            </div>
           </div>
         </section>
 
@@ -725,7 +756,7 @@
           <div class="od-body" data-submit-enter="" style="display:flex;flex-direction:column;gap:10px">
             <input class="od-input od-mono" data-k="zoneOrigin" value="{{ forms.zoneOrigin }}" onInput="{{ onForm }}" aria-label="DNS 영역 이름" placeholder="example.com">
             <textarea class="od-input od-mono" data-k="zoneText" value="{{ forms.zoneText }}" onInput="{{ onForm }}" aria-label="DNS 영역 파일 내용" placeholder="$ORIGIN example.com.&#10;@ 300 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 300&#10;@ 300 IN NS ns.example.com.&#10;ns 300 IN A 192.0.2.53" style="min-height:130px;font-size:12.5px;resize:vertical"></textarea>
-            <div style="display:flex;justify-content:flex-end"><button type="button" data-enter-submit="" onClick="{{ createZone }}" class="od-btn-primary">DNS 영역 만들기</button></div>
+            <div data-mform="" style="display:flex;justify-content:flex-end"><button type="button" data-enter-submit="" onClick="{{ createZone }}" class="od-btn-primary">DNS 영역 만들기</button></div>
           </div>
         </section>
       </div>
@@ -770,7 +801,7 @@
           <div class="od-head"><span class="od-title">고정 할당</span><span class="od-desc">지정한 클라이언트 식별자에 항상 같은 IP 주소를 할당합니다.</span></div>
           <sc-if value="{{ reservationsUnavailable }}"><div class="od-note">DHCPv4 서버가 실행 중이 아니어서 고정 할당을 추가할 수 없습니다. 설정에서 DHCPv4 서버 사용을 켜면 추가할 수 있습니다.</div></sc-if>
           <sc-if value="{{ reservationsAvailable }}">
-          <div class="od-band" data-submit-enter="">
+          <div class="od-band" data-mform="" data-submit-enter="">
             <input class="od-input od-mono" aria-label="DHCP 예약 클라이언트 식별자" data-k="resIdentity" value="{{ forms.resIdentity }}" onInput="{{ onForm }}" placeholder="mac:aabbccddeeff 또는 id:0102" style="flex:2 1 220px">
             <input class="od-input od-mono" aria-label="DHCP 예약 IP 주소" data-k="resIp" value="{{ forms.resIp }}" onInput="{{ onForm }}" placeholder="192.168.1.50" style="flex:1 1 130px;min-width:130px">
             <input class="od-input" aria-label="DHCP 예약 호스트명" data-k="resHost" value="{{ forms.resHost }}" onInput="{{ onForm }}" placeholder="호스트명 (선택)" style="flex:1 1 140px;min-width:120px">
@@ -854,7 +885,7 @@
         <section class="od-card">
           <div class="od-head"><span class="od-title">클러스터 설정 동기화</span></div>
           <div class="od-note">설정 키 하나를 리더 노드에서 모든 노드에 적용합니다. 다른 화면에서 바꾼 설정도 자동으로 모든 노드에 적용됩니다.</div>
-          <div class="od-band" style="border-bottom:0">
+          <div class="od-band" data-mform="" style="border-bottom:0">
             <input class="od-input od-mono" aria-label="동기화할 설정 항목" data-k="cpKey" value="{{ forms.cpKey }}" onInput="{{ onForm }}" placeholder="설정 키 (예: prefetch)" style="flex:1 1 200px">
             <input class="od-input od-mono" aria-label="적용할 설정 값" data-k="cpVal" value="{{ forms.cpVal }}" onInput="{{ onForm }}" placeholder="값 (예: true / 16384)" style="flex:2 1 200px">
             <button onClick="{{ clusterPropose }}" disabled="{{ !clusterCanPropose }}" aria-disabled="{{ !clusterCanPropose }}" style="{{ clusterProposeStyle }}">설정 동기화 요청</button>
@@ -876,9 +907,9 @@
           </div>
           <sc-if value="{{ upd.notice }}"><div role="status" style="padding:10px 20px;border-left:3px solid {{ upd.noticeColor }};background:{{ upd.noticeBg }};border-bottom:1px solid var(--border);font-size:12.5px;line-height:1.55;color:var(--fg2);overflow-wrap:anywhere">{{ upd.notice }}</div></sc-if>
           <div class="od-body" style="display:grid;grid-template-columns:{{ g3 }};gap:14px">
-            <div style="min-width:0"><div class="od-sub" style="margin:0">현재 버전</div><div class="od-mono" style="font-size:13.5px;color:var(--fg);margin-top:4px;overflow-wrap:anywhere">{{ upd.version }}</div></div>
-            <div style="min-width:0"><div class="od-sub" style="margin:0">마지막 확인</div><div style="font-size:13px;color:{{ upd.checkColor }};margin-top:4px;line-height:1.5;overflow-wrap:anywhere">{{ upd.checkLabel }}</div><div class="od-sub">{{ upd.checkedAt }}</div></div>
-            <div style="min-width:0"><div class="od-sub" style="margin:0">업데이트 채널</div><button type="button" onClick="{{ upd.channelDD.toggle }}" onKeyDown="{{ upd.channelDD.keyDown }}" aria-haspopup="listbox" aria-expanded="{{ upd.channelDD.open }}" aria-label="{{ upd.channelDD.ariaLabel }}" class="od-input" style="margin-top:4px;width:100%;max-width:200px;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:13px;font-weight:500;text-align:left;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ upd.channelDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></button></div>
+            <div data-mkv="" style="min-width:0"><div class="od-sub" style="margin:0">현재 버전</div><div class="od-mono" style="font-size:13.5px;color:var(--fg);margin-top:4px;overflow-wrap:anywhere">{{ upd.version }}</div></div>
+            <div data-mkv="" style="min-width:0"><div class="od-sub" style="margin:0">마지막 확인</div><div style="margin-top:4px"><div style="font-size:13px;color:{{ upd.checkColor }};line-height:1.5;overflow-wrap:anywhere">{{ upd.checkLabel }}</div><div class="od-sub">{{ upd.checkedAt }}</div></div></div>
+            <div data-mkv="" style="min-width:0"><div class="od-sub" style="margin:0">업데이트 채널</div><button type="button" onClick="{{ upd.channelDD.toggle }}" onKeyDown="{{ upd.channelDD.keyDown }}" aria-haspopup="listbox" aria-expanded="{{ upd.channelDD.open }}" aria-label="{{ upd.channelDD.ariaLabel }}" class="od-input" style="margin-top:4px;width:100%;max-width:200px;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:13px;font-weight:500;text-align:left;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ upd.channelDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></button></div>
           </div>
           <sc-if value="{{ upd.releaseUrl }}"><div style="padding:0 20px 16px;font-size:12.5px"><a href="{{ upd.releaseUrl }}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:600">릴리스 노트</a></div></sc-if>
         </section>
@@ -898,7 +929,9 @@
               <div style="display:flex;align-items:center;gap:8px"><span class="od-label" style="flex:1">JSON 백업 복원</span><span class="od-sub" style="margin:0">최대 1MB</span></div>
               <div style="display:flex;flex-wrap:wrap;gap:8px">
                 <label style="flex:1 1 240px;min-width:0;display:flex;align-items:center;gap:10px;border:1px dashed var(--border);border-radius:4px;padding:9px 12px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg><span style="flex:1;min-width:0;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ restoreFileName }}</span><span style="font-size:12px;font-weight:600;color:var(--accent)">JSON 선택</span><input type="file" accept="application/json,.json" aria-label="백업 파일 선택" onChange="{{ onRestoreFile }}" style="display:none"></label>
-                <button onClick="{{ restoreBackup }}" disabled="{{ !restoreReady }}" class="od-btn-primary">선택한 백업 복원</button>
+                <div class="od-actions">
+                  <button onClick="{{ restoreBackup }}" disabled="{{ !restoreReady }}" class="od-btn-primary">선택한 백업 복원</button>
+                </div>
               </div>
             </div>
           </section>
@@ -913,8 +946,10 @@
           <div data-submit-enter="" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)">
             <span class="od-label" style="flex:1 1 auto;min-width:120px">방화벽 인바운드 규칙 <span style="color:var(--muted)">UDP/TCP</span></span>
             <input data-k="fwPort" value="{{ forms.fwPort }}" onInput="{{ onForm }}" aria-label="방화벽 포트" placeholder="853" class="od-input od-mono" style="flex:0 0 auto;width:84px;min-width:0">
-            <button onClick="{{ fwAllowPort }}" class="od-btn-primary">열기</button>
-            <button onClick="{{ fwRemovePort }}" class="od-btn">닫기</button>
+            <div class="od-actions">
+              <button onClick="{{ fwAllowPort }}" class="od-btn-primary">열기</button>
+              <button onClick="{{ fwRemovePort }}" class="od-btn">닫기</button>
+            </div>
           </div>
           <sc-if value="{{ bootSvc.supported }}">
           <div style="display:flex;align-items:center;gap:12px;padding:13px 20px;border-bottom:1px solid var(--border)">
@@ -980,7 +1015,7 @@
                 </sc-for>
               </div>
               <label style="display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:7px">차단 시 응답 방식</label>
-              <div style="display:flex;gap:8px;margin-bottom:6px">
+              <div data-mform="" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px">
                 <sc-for list="{{ blockModes }}" as="b" hint-placeholder-count="3"><button onClick="{{ b.onClick }}" style="{{ b.style }}"><div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--fg)">{{ b.label }}</div><div style="font-size:12px;color:var(--muted);margin-top:2px">{{ b.desc }}</div></button></sc-for>
               </div>
               <div style="margin-top:6px">
@@ -994,15 +1029,16 @@
             <div class="od-head">
               <span class="od-title">전체 설정</span>
               <span class="od-desc">{{ schemaCount }}개 항목</span>
-              <span style="flex:1"></span>
-              <div onClick="{{ cfgCatDD.toggle }}" onKeyDown="{{ cfgCatDD.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ cfgCatDD.open }}" aria-label="{{ cfgCatDD.ariaLabel }}" class="od-input" style="flex:0 1 220px;min-width:140px;display:flex;align-items:center;gap:8px;padding:8px 11px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ cfgCatDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
-              <input data-readonly-safe="" aria-label="설정 검색" data-k="cfgSearch" value="{{ forms.cfgSearch }}" onInput="{{ onForm }}" placeholder="설정 검색…" class="od-input" style="flex:0 0 auto;width:190px;min-width:0">
+              <div class="od-actions">
+                <div onClick="{{ cfgCatDD.toggle }}" onKeyDown="{{ cfgCatDD.keyDown }}" role="button" tabIndex="0" aria-haspopup="listbox" aria-expanded="{{ cfgCatDD.open }}" aria-label="{{ cfgCatDD.ariaLabel }}" class="od-input" style="flex:0 1 220px;width:220px;min-width:140px;display:flex;align-items:center;gap:8px;padding:8px 11px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ cfgCatDD.label }}</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></div>
+                <input data-readonly-safe="" aria-label="설정 검색" data-k="cfgSearch" value="{{ forms.cfgSearch }}" onInput="{{ onForm }}" placeholder="설정 검색…" class="od-input" style="flex:0 0 auto;width:190px;min-width:0">
+              </div>
             </div>
             <div style="margin-top:-1px;padding:0 20px 6px">
               <sc-for list="{{ schemaShown }}" as="g" hint-placeholder-count="4">
                 <sc-if value="{{ g.showHeader }}"><div style="padding:18px 0 6px;font-size:12px;font-weight:700;color:var(--muted)">{{ g.name }}</div></sc-if>
                 <sc-for list="{{ g.fields }}" as="fd" hint-placeholder-count="5">
-                  <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border)">
+                  <div data-mfield="" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border)">
                     <div style="flex:1;min-width:0">
                       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;font-weight:600;color:var(--fg);font-family:var(--font-sans)">{{ fd.label }}</span><sc-if value="{{ fd.applyLabel }}"><span style="font-size:12px;font-weight:700;color:{{ fd.applyColor }};border:1px solid {{ fd.applyColor }};border-radius:4px;padding:1px 6px">{{ fd.applyLabel }}</span></sc-if><sc-if value="{{ fd.pending }}"><span style="font-size:12px;font-weight:700;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:1px 6px">{{ fd.pendingLabel }}</span></sc-if></div>
                       <div style="font-size:12px;color:var(--muted);line-height:1.45;margin-top:3px;max-width:520px">{{ fd.help }}</div>
@@ -1020,7 +1056,7 @@
               <sc-if value="{{ schemaHasElsewhere }}">
                 <div style="padding:18px 0 6px;font-size:12px;font-weight:700;color:var(--muted)">전용 화면에서 바꾸는 설정</div>
                 <sc-for list="{{ schemaElsewhere }}" as="fd" hint-placeholder-count="2">
-                  <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border)">
+                  <div data-mfield="" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border)">
                     <div style="flex:1;min-width:0">
                       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;font-weight:600;color:var(--fg);font-family:var(--font-sans)">{{ fd.label }}</span><span style="font-size:12px;font-weight:700;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:1px 6px">{{ fd.whereLabel }}</span></div>
                       <div style="font-size:12px;color:var(--muted);line-height:1.45;margin-top:3px;max-width:520px">{{ fd.help }}</div>
@@ -1085,7 +1121,7 @@ qps = 200" class="od-input od-mono" style="width:100%;height:150px;resize:vertic
               <div class="od-field"><span><label for="new-password">새 비밀번호</label></span><input class="od-input" id="new-password" type="password" autocomplete="new-password" data-k="newPassword" value="{{ forms.newPassword }}" onInput="{{ onForm }}" placeholder="12자 이상"></div>
               <div class="od-field"><span><label for="confirm-password">새 비밀번호 확인</label></span><input class="od-input" id="confirm-password" type="password" autocomplete="new-password" data-k="confirmPassword" value="{{ forms.confirmPassword }}" onInput="{{ onForm }}" placeholder="새 비밀번호 다시 입력"></div>
             </div>
-            <div style="display:flex;justify-content:flex-end"><button onClick="{{ changePw }}" class="od-btn-primary">비밀번호 변경</button></div>
+            <div data-mform="" style="display:flex;justify-content:flex-end"><button onClick="{{ changePw }}" class="od-btn-primary">비밀번호 변경</button></div>
           </div>
         </section>
       </div>
@@ -7215,7 +7251,7 @@ class Component extends DCLogic {
       titleSize: mobile?'18px':'23px',
       statGap: mobile?'16px 16px':'0',
       certBtnMt: mobile?'16px':'auto',
-      chartHeadWrap: mobile?'wrap':'nowrap',
+      chartHeadWrap: mobile?'wrap':'nowrap', chartTitleBasis: mobile?'100%':'auto',
       helpPopPos: mobile?'position:fixed;top:56px;left:12px;right:12px;width:auto':'position:fixed;top:84px;left:282px;width:388px;max-width:calc(100vw - 60px)',
       headerPad: mobile?'0 16px':'0 34px',
       headerH: mobile?'62px':'80px',
@@ -7609,10 +7645,12 @@ class Component extends DCLogic {
     const da=this.domainAction(d.qname,d.decision),cBlocked=this.clientBlocked(d.client);
     const actBtn=(label,color,onClick)=>R('button',{className:'od-btn',onClick,style:{color}},label);
     const verdict=R('div',{style:{display:'flex',flexWrap:'wrap',alignItems:'center',gap:'8px 12px',marginTop:16,padding:'10px 0',borderTop:'1px solid var(--border)',borderBottom:'1px solid var(--border)'}},
-      R('span',{style:{fontSize:12,fontWeight:600,color:'var(--muted)'}},this.t('상태')),
-      R('span',{style:{fontSize:15,fontWeight:600,color:d.decisionColor}},this.t(d.decisionLabel)),
-      R('span',{style:{fontFamily:mono,fontSize:12.5,color:'var(--fg2)'}},d.rcode),
-      R('div',{style:{display:'flex',gap:8,marginLeft:'auto'}},
+      R('div',{'data-mkv':'',style:{display:'flex',alignItems:'baseline',gap:12,flex:'1 1 auto'}},
+        R('span',{style:{fontSize:12,fontWeight:600,color:'var(--muted)'}},this.t('상태')),
+        R('span',{style:{display:'flex',alignItems:'baseline',gap:12}},
+          R('span',{style:{fontSize:15,fontWeight:600,color:d.decisionColor}},this.t(d.decisionLabel)),
+          R('span',{style:{fontFamily:mono,fontSize:12.5,color:'var(--fg2)'}},d.rcode))),
+      R('div',{className:'od-actions'},
         actBtn(da.label, da.lift?'var(--ok)':'var(--block)', this.runDomainAction(d.qname, d.decision)),
         actBtn(this.t(cBlocked?'클라이언트 차단 해제':'클라이언트 차단'), cBlocked?'var(--ok)':'var(--warn)', this.toggleBlockClient(d.client)))
     );
