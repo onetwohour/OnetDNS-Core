@@ -570,6 +570,10 @@ mod tests {
         memory().lock().unwrap().status.peek(&key).copied()
     }
 
+    /// A closed UDP port reports nothing on Windows, so a probe reaches DoT only once DoQ has
+    /// timed out.
+    const PROBED: Duration = Duration::from_secs(10);
+
     fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         let until = Instant::now() + limit;
         while Instant::now() < until {
@@ -795,9 +799,7 @@ mod tests {
         assert_eq!(encryption.route(server), None);
 
         encryption.probe(server, &query("probe.test"));
-        assert!(wait_until(Duration::from_secs(5), || encryption
-            .route(server)
-            .is_some()));
+        assert!(wait_until(PROBED, || encryption.route(server).is_some()));
         let route = encryption.route(server).unwrap();
         assert_eq!(
             route,
@@ -905,7 +907,7 @@ mod tests {
         let failed = |key| matches!(status(key), Some(Status::Failed(_)));
 
         encryption.probe(server, &query("first.test"));
-        assert!(wait_until(Duration::from_secs(6), || failed(doq) && failed(dot)));
+        assert!(wait_until(PROBED, || failed(doq) && failed(dot)));
 
         for _ in 0..3 {
             encryption.probe(server, &query("again.test"));

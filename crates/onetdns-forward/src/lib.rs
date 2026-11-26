@@ -2165,6 +2165,9 @@ fn udp_exchange(
     timeout: Duration,
     require_exact_question_case: bool,
 ) -> Result<Message, ForwardError> {
+    // Opening a socket counts against the timeout; it can take long enough to leave the next
+    // upstream no time.
+    let deadline = deadline_after(timeout);
     let bind = outgoing_bind(upstream);
     let (sock, uses, cached_timeout) = take_pooled_udp_socket(bind).map_err(io_err)?;
     let mut exchange = ExchangeSocket {
@@ -2177,7 +2180,7 @@ fn udp_exchange(
         wire,
         wire_id,
         request,
-        timeout,
+        deadline,
         require_exact_question_case,
     );
     let rcv_timeout = exchange.rcv_timeout;
@@ -2205,11 +2208,10 @@ fn udp_exchange_on(
     wire: &[u8],
     wire_id: u16,
     request: &Message,
-    timeout: Duration,
+    deadline: Instant,
     require_exact_question_case: bool,
 ) -> Result<Message, ForwardError> {
     let sock = exchange.sock;
-    let deadline = deadline_after(timeout);
     sock.send_to(wire, upstream).map_err(io_err)?;
     let mut saw_case_mismatch = false;
 
