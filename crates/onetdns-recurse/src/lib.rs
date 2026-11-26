@@ -9325,8 +9325,8 @@ mod tests {
         }
 
         #[test]
-        /// The first answer comes in plaintext and starts a probe over DoT; once it answers, the
-        /// server is asked over DoT only.
+        /// The first answer comes in plaintext and starts a probe, which moves on to DoT since DoQ
+        /// is closed; once DoT answers, the server is asked over it only.
         fn a_server_offering_dot_is_asked_over_it_after_a_probe() {
             let ip = Ipv4Addr::new(127, 0, 0, 150);
             let (server, plain_asked) = plain_server(ip);

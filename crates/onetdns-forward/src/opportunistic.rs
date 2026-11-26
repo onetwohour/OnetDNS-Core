@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
 use onetdns_proto::Message;
-use onetdns_tls::{client_handshake, ClientConfig, InsecureVerifier};
+use onetdns_tls::{client_handshake, ClientConfig, InsecureVerifier, TlsSession};
 
 use crate::doq::{self, DoqConn};
 use crate::dot::{self, DotConn};
@@ -28,8 +28,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Same bound as the recursor's per-server records.
 const MAX_SERVERS: usize = 50_000;
 
-/// Each probe is a thread holding a socket for up to `PROBE_TIMEOUT`.
+/// Each probe is a thread holding a socket for up to `PROBE_TIMEOUT` per encryption it tries.
 const MAX_PROBES: usize = 16;
+
+/// Each new connection uses one; a server sends one or two per handshake.
+const TICKETS_PER_SERVER: usize = 2;
+
+/// Only servers that answer over DoQ have tickets, far fewer than `MAX_SERVERS`.
+const MAX_TICKET_SERVERS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Encryption {
@@ -38,10 +44,13 @@ pub enum Encryption {
 }
 
 impl Encryption {
-    /// Tried in this order.
-    const ALL: [Encryption; 2] = [Encryption::Dot, Encryption::Doq];
+    /// Tried in this order. DoQ comes first because a resumed DoQ connection carries the query in
+    /// its first flight, so asking a server that closed the idle connection costs no extra round
+    /// trip.
+    const ALL: [Encryption; 2] = [Encryption::Doq, Encryption::Dot];
 
-    /// TCP, TLS 1.3, and the query for DoT; the QUIC handshake and the query for DoQ.
+    /// TCP, TLS 1.3, and the query for DoT; the QUIC handshake and the query for DoQ without a
+    /// ticket.
     pub fn round_trips_on_new_connection(self) -> u32 {
         match self {
             Encryption::Dot => 3,
@@ -119,9 +128,9 @@ impl OpportunisticEncryption {
             })
     }
 
-    /// Asks `server` the same request over the first encryption not known to fail, in the
-    /// background, and returns at once. Does nothing while a route is known, a probe runs, or both
-    /// failed within `DAMPING`.
+    /// Asks `server` the same request in the background over each encryption not known to fail,
+    /// in order, until one answers, and returns at once. Does nothing while a route is known, a
+    /// probe runs, or both failed within `DAMPING`.
     pub fn probe(self, server: IpAddr, request: &Message) {
         let Some(slot) = ProbeSlot::claim(self.keys(server)) else {
             return;
@@ -144,7 +153,12 @@ pub fn encrypted_servers() -> Vec<(IpAddr, Encryption)> {
         .filter(|(_, status)| status.state(now) == State::Encrypted)
         .map(|(&(endpoint, encryption), _)| (endpoint.ip(), encryption))
         .collect();
-    servers.sort_unstable();
+    servers.sort_unstable_by_key(|&(server, encryption)| {
+        let order = Encryption::ALL
+            .iter()
+            .position(|&tried| tried == encryption);
+        (server, order)
+    });
     servers.dedup_by_key(|(server, _)| *server);
     servers
 }
@@ -261,6 +275,7 @@ fn memory() -> &'static Mutex<Memory> {
 
 /// Holds one of `MAX_PROBES`; dropping it, on any path, frees the slot and the probing mark.
 struct ProbeSlot {
+    keys: [Key; 2],
     key: Key,
 }
 
@@ -279,19 +294,31 @@ impl ProbeSlot {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .claim_probe(keys, Instant::now())?;
         *probes += 1;
-        Some(Self { key })
+        Some(Self { keys, key })
     }
 
-    /// The exchange records the outcome; the slot is held until it ends.
-    fn probe(self, request: &Message) {
-        let (endpoint, encryption) = self.key;
-        let _ = crate::query_server_over(
-            endpoint,
-            request,
-            PROBE_TIMEOUT,
-            AuthorityTransport::Encrypted(encryption),
-            true,
-        );
+    /// Each exchange records its outcome, and a failure moves on to the next encryption; the
+    /// slot is held until the last ends. Without moving on, a server offering only DoT would
+    /// stay in plaintext until another plaintext answer started a probe.
+    fn probe(mut self, request: &Message) {
+        for _ in Encryption::ALL {
+            let (endpoint, encryption) = self.key;
+            let _ = crate::query_server_over(
+                endpoint,
+                request,
+                PROBE_TIMEOUT,
+                AuthorityTransport::Encrypted(encryption),
+                true,
+            );
+            let next = memory()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .claim_probe(self.keys, Instant::now());
+            match next {
+                Some(next) => self.key = next,
+                None => return,
+            }
+        }
     }
 }
 
@@ -321,9 +348,10 @@ fn pool() -> &'static Mutex<IdlePool<PoolKey, EncryptedConn>> {
     crate::shared_idle_pool(&POOL, EncryptedConn::open)
 }
 
-/// Any certificate, no SNI, no resumption: there is no name to check against, and a ticket would
-/// only link this resolver's connections together.
+/// Any certificate and no SNI: there is no name to check against. DoQ resumes with the query in
+/// early data; DoT does not resume, since without early data that saves no round trip.
 fn unauthenticated_config(endpoint: SocketAddr, encryption: Encryption) -> ClientConfig {
+    let resumes = encryption == Encryption::Doq;
     ClientConfig {
         server_name: endpoint.ip().to_string(),
         verify_name: false,
@@ -331,10 +359,46 @@ fn unauthenticated_config(endpoint: SocketAddr, encryption: Encryption) -> Clien
         insecure_verifier: Some(InsecureVerifier::dangerously_disable_certificate_verification()),
         alpn: vec![encryption.alpn().to_vec()],
         client_cert: None,
-        session: None,
-        enable_early_data: false,
+        session: if resumes { take_ticket(endpoint) } else { None },
+        enable_early_data: resumes,
         send_key_share: true,
     }
+}
+
+/// Kept apart from the upstreams' tickets: resuming skips the certificate check, and these
+/// handshakes checked none.
+fn tickets() -> &'static Mutex<LruMap<SocketAddr, Vec<TlsSession>>> {
+    static TICKETS: OnceLock<Mutex<LruMap<SocketAddr, Vec<TlsSession>>>> = OnceLock::new();
+    TICKETS.get_or_init(|| Mutex::new(LruMap::new(MAX_TICKET_SERVERS)))
+}
+
+/// Each ticket is used once (RFC 9539), newest first.
+fn take_ticket(endpoint: SocketAddr) -> Option<TlsSession> {
+    let now = onetdns_tls::session::now_ms();
+    let mut tickets = tickets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stack = tickets.get_mut(&endpoint)?;
+    stack.retain(|ticket| ticket.is_fresh(now));
+    let ticket = stack.pop();
+    if stack.is_empty() {
+        tickets.pop(&endpoint);
+    }
+    ticket
+}
+
+fn keep_tickets(endpoint: SocketAddr, new: Vec<TlsSession>) {
+    if new.is_empty() {
+        return;
+    }
+    let mut tickets = tickets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut stack = tickets.pop(&endpoint).unwrap_or_default();
+    stack.extend(new);
+    let excess = stack.len().saturating_sub(TICKETS_PER_SERVER);
+    stack.drain(..excess);
+    tickets.put(endpoint, stack);
 }
 
 impl EncryptedConn {
@@ -468,7 +532,11 @@ fn ask(
     Ok(response)
 }
 
-fn put_idle(key: PoolKey, conn: EncryptedConn) {
+/// Tickets arrive after the handshake, so any answered exchange may bring some.
+fn put_idle(key: PoolKey, mut conn: EncryptedConn) {
+    if let EncryptedConn::Doq(doq) = &mut conn {
+        keep_tickets(key.1, doq.take_new_sessions());
+    }
     pool()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -487,6 +555,7 @@ mod tests {
     use onetdns_proto::{Name, RData, Record, RecordType};
     use onetdns_quic::params::TransportParams;
     use onetdns_quic::Connection;
+    use onetdns_tls::conn::ServerResumption;
     use onetdns_tls::{server_handshake, signer_from_pkcs8_der, ServerConfig};
 
     use crate::quicdrive::random_cid;
@@ -514,7 +583,7 @@ mod tests {
 
     /// Named for no address the client knows, so a handshake that completes proves nothing was
     /// checked.
-    fn server_config(alpn: &[u8]) -> Arc<ServerConfig> {
+    fn server_config(alpn: &[u8], resumption: Option<ServerResumption>) -> Arc<ServerConfig> {
         let ck = rcgen::generate_simple_self_signed(vec!["unrelated.test".to_string()]).unwrap();
         let (sign_scheme, sign) = signer_from_pkcs8_der(&ck.key_pair.serialize_der()).unwrap();
         Arc::new(ServerConfig {
@@ -523,7 +592,7 @@ mod tests {
             sign,
             alpn: vec![alpn.to_vec()],
             client_ca: None,
-            resumption: None,
+            resumption,
         })
     }
 
@@ -543,7 +612,7 @@ mod tests {
 
     /// Counts connections.
     fn dot_server() -> (SocketAddr, Arc<AtomicUsize>) {
-        let cfg = server_config(b"dot");
+        let cfg = server_config(b"dot", None);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
@@ -584,13 +653,17 @@ mod tests {
         (addr, accepts)
     }
 
-    /// Counts peers.
-    fn doq_server() -> (SocketAddr, Arc<AtomicUsize>) {
-        let cfg = server_config(b"doq");
+    /// Issues tickets and accepts early data. Counts peers, and the queries that came in accepted
+    /// early data.
+    fn doq_server() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let mut resumption = ServerResumption::secure_default();
+        resumption.max_early_data = 0xffff_ffff;
+        let cfg = server_config(b"doq", Some(resumption));
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let peers = Arc::new(AtomicUsize::new(0));
-        let counted = peers.clone();
+        let early = Arc::new(AtomicUsize::new(0));
+        let (counted, counted_early) = (peers.clone(), early.clone());
         thread::spawn(move || {
             let mut conns: HashMap<SocketAddr, Connection> = HashMap::new();
             let mut buf = [0u8; onetdns_quic::MAX_RECV_UDP_PAYLOAD as usize];
@@ -611,6 +684,9 @@ mod tests {
                     continue;
                 }
                 for (stream, query) in conn.take_stream_requests() {
+                    if conn.early_data_accepted() {
+                        counted_early.fetch_add(1, Ordering::SeqCst);
+                    }
                     let _ = conn.send_dns_message(stream, &answer(&query));
                 }
                 while let Some(datagram) = conn.next_datagram() {
@@ -618,7 +694,7 @@ mod tests {
                 }
             }
         });
-        (addr, peers)
+        (addr, peers, early)
     }
 
     fn closed_tcp_port() -> u16 {
@@ -640,31 +716,31 @@ mod tests {
     #[test]
     fn memory_keeps_answers_for_persistence_and_failures_for_damping() {
         let server = SocketAddr::from(([192, 0, 2, 1], 853));
-        let dot = (server, Encryption::Dot);
         let doq = (server, Encryption::Doq);
-        let keys = [dot, doq];
+        let dot = (server, Encryption::Dot);
+        let keys = [doq, dot];
         let mut memory = Memory::new(8);
         let start = Instant::now();
 
-        assert_eq!(memory.claim_probe(keys, start), Some(dot));
+        assert_eq!(memory.claim_probe(keys, start), Some(doq));
         assert_eq!(memory.claim_probe(keys, start), None, "one probe at a time");
-        memory.record(dot, Outcome::Failed, start);
+        memory.record(doq, Outcome::Failed, start);
         assert_eq!(memory.route(keys, start), None);
-        assert_eq!(memory.claim_probe(keys, start), Some(doq), "DoT is damped");
-        memory.record(doq, Outcome::Answered, start);
-        assert_eq!(memory.route(keys, start), Some(doq));
+        assert_eq!(memory.claim_probe(keys, start), Some(dot), "DoQ is damped");
+        memory.record(dot, Outcome::Answered, start);
+        assert_eq!(memory.route(keys, start), Some(dot));
         assert_eq!(
             memory.claim_probe(keys, start + DAMPING),
             None,
-            "nothing is probed while DoQ answers"
+            "nothing is probed while DoT answers"
         );
 
         let later = start + PERSISTENCE;
         assert_eq!(memory.route(keys, later), None, "the answer is too old");
         assert_eq!(
             memory.claim_probe(keys, later),
-            Some(dot),
-            "DoT is probed again"
+            Some(doq),
+            "DoQ is probed again"
         );
     }
 
@@ -683,8 +759,8 @@ mod tests {
             .collect();
         assert_eq!(
             listed,
-            [(server.ip(), Encryption::Dot)],
-            "queries go over DoT when both answer"
+            [(server.ip(), Encryption::Doq)],
+            "queries go over DoQ when both answer"
         );
     }
 
@@ -711,9 +787,10 @@ mod tests {
     }
 
     #[test]
-    fn a_server_offering_dot_is_asked_over_it_after_one_probe() {
+    fn a_server_offering_only_dot_is_asked_over_it_after_one_probe() {
         let (endpoint, accepts) = dot_server();
-        let encryption = OpportunisticEncryption::with_ports(endpoint.port(), closed_udp_port());
+        let doq_port = closed_udp_port();
+        let encryption = OpportunisticEncryption::with_ports(endpoint.port(), doq_port);
         let server = endpoint.ip();
         assert_eq!(encryption.route(server), None);
 
@@ -729,6 +806,10 @@ mod tests {
                 encryption: Encryption::Dot
             }
         );
+        assert!(matches!(
+            status((SocketAddr::new(server, doq_port), Encryption::Doq)),
+            Some(Status::Failed(_))
+        ));
 
         let response = crate::query_server_over(
             route.endpoint,
@@ -747,30 +828,26 @@ mod tests {
     }
 
     #[test]
-    fn doq_is_probed_once_dot_has_failed() {
-        let (endpoint, peers) = doq_server();
+    fn a_server_offering_doq_is_asked_over_it_before_dot_is_tried() {
+        let (endpoint, peers, _) = doq_server();
         let dot_port = closed_tcp_port();
         let encryption = OpportunisticEncryption::with_ports(dot_port, endpoint.port());
         let server = endpoint.ip();
-        let dot = (SocketAddr::new(server, dot_port), Encryption::Dot);
 
-        encryption.probe(server, &query("first.test"));
-        assert!(wait_until(Duration::from_secs(6), || matches!(
-            status(dot),
-            Some(Status::Failed(_))
-        )));
-        assert_eq!(encryption.route(server), None);
-
-        encryption.probe(server, &query("second.test"));
+        encryption.probe(server, &query("probe.test"));
         assert!(wait_until(Duration::from_secs(5), || encryption
             .route(server)
             .is_some()));
         let route = encryption.route(server).unwrap();
         assert_eq!(route.encryption, Encryption::Doq);
+        assert_eq!(
+            status((SocketAddr::new(server, dot_port), Encryption::Dot)),
+            None
+        );
 
         let response = crate::query_server_over(
             route.endpoint,
-            &query("third.test"),
+            &query("next.test"),
             Duration::from_secs(2),
             route.transport(),
             true,
@@ -778,6 +855,34 @@ mod tests {
         .unwrap();
         assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
         assert_eq!(peers.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /// The probe's handshake leaves a ticket; once its connection is gone, the next query resumes
+    /// and goes out as early data the server accepts.
+    fn a_new_doq_connection_resumes_with_the_query_in_early_data() {
+        let (endpoint, peers, early) = doq_server();
+        let encryption = OpportunisticEncryption::with_ports(closed_tcp_port(), endpoint.port());
+        let server = endpoint.ip();
+        encryption.probe(server, &query("probe.test"));
+        assert!(wait_until(Duration::from_secs(5), || encryption
+            .route(server)
+            .is_some()));
+        let route = encryption.route(server).unwrap();
+        let pooled = (crate::outgoing_bind(endpoint), endpoint, Encryption::Doq);
+        drop(pool().lock().unwrap().take(&pooled));
+
+        let response = crate::query_server_over(
+            route.endpoint,
+            &query("resumed.test"),
+            Duration::from_secs(2),
+            route.transport(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(response.answers[0].rdata, RData::A(ANSWER));
+        assert_eq!(peers.load(Ordering::SeqCst), 2);
+        assert_eq!(early.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -800,9 +905,7 @@ mod tests {
         let failed = |key| matches!(status(key), Some(Status::Failed(_)));
 
         encryption.probe(server, &query("first.test"));
-        assert!(wait_until(Duration::from_secs(6), || failed(dot)));
-        encryption.probe(server, &query("second.test"));
-        assert!(wait_until(Duration::from_secs(6), || failed(doq)));
+        assert!(wait_until(Duration::from_secs(6), || failed(doq) && failed(dot)));
 
         for _ in 0..3 {
             encryption.probe(server, &query("again.test"));

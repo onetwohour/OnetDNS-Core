@@ -123,6 +123,10 @@ fn connect(
 }
 
 impl DoqConn {
+    pub(crate) fn take_new_sessions(&mut self) -> Vec<onetdns_tls::TlsSession> {
+        self.conn.take_new_sessions()
+    }
+
     /// Completes the handshake. `created` is when `conn` was made, its clock's zero.
     pub(crate) fn establish(
         sock: QuicSocket,

@@ -179,9 +179,9 @@ pub(crate) fn random_cid() -> Vec<u8> {
 ///
 /// 0-RTT stays off. With it on, DoQ and DoH3 queries would go out as early data without forward
 /// secrecy: an on-path attacker could record and replay them, and a ticket key leaked later would
-/// reveal which names were asked. DoH3 uses POST, the form RFC 8470 warns about. The can_send_early
-/// branches in doh3 and doq are unreachable in production because this is false; changing it brings
-/// them to life.
+/// reveal which names were asked. DoH3 uses POST, the form RFC 8470 warns about. Opportunistic
+/// encryption sends early data over DoQ under its own config; for configured upstreams this value
+/// is what keeps it off.
 pub(crate) fn client_tls_config(
     addr: SocketAddr,
     server_name: &str,
@@ -366,8 +366,8 @@ mod tests {
 
     #[test]
     /// Early data would carry queries without forward secrecy, open to replay. The value is pinned
-    /// here instead of relying on the default, since this one value keeps the can_send_early
-    /// branches in doh3 and doq dead in production.
+    /// here instead of relying on the default, since this one value keeps configured upstreams from
+    /// sending it.
     fn forward_quic_client_never_offers_early_data() {
         let trust = TrustStore::empty();
         for alpn in [b"doq".as_slice(), b"h3".as_slice()] {
