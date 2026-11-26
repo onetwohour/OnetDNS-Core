@@ -1373,9 +1373,10 @@ impl Auth {
         !self.users.lock_recover().is_empty()
     }
 
-    /// Being able to connect to loopback does not mean being allowed to edit the config file; on a
-    /// shared machine other users' programs reach loopback too. So the first account needs a code
-    /// that only someone who can read the file next to the config knows.
+    /// Reaching the dashboard does not mean being allowed to edit the config file: anyone can
+    /// reach a public origin, and on a shared machine other users' programs reach loopback too. So
+    /// the first account needs a code that only someone who can read the file next to the config
+    /// knows.
     pub fn set_setup_code(&self, code: &str, file: String) {
         *self.setup_code.lock_recover() = Some(SetupCode {
             digest: credential_digest("setup", &[code]),
@@ -3620,18 +3621,6 @@ fn handle_setup(
         )
     };
 
-    // Only someone who can edit the config file may create the first account, and anyone on the
-    // internet can reach a public origin.
-    if caller.public() {
-        st.audit
-            .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
-        return refuse(
-            stream,
-            "403 Forbidden",
-            "Create the first account on the computer running OnetDNS, then sign in here",
-        );
-    }
-
     if st.auth.has_users() {
         st.audit
             .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 409);
@@ -3658,7 +3647,7 @@ fn handle_setup(
     if !st.auth.setup_code_matches(&field("code")) {
         st.audit
             .record_actor("none", "anonymous", "POST", "/v1/setup", &peer_s, 403);
-        let message = match st.auth.setup_code_file() {
+        let message = match setup_code_location(st, caller) {
             Some(file) => format!("The setup code does not match. Copy it from {file}"),
             None => "OnetDNS has no setup code to check. Restart OnetDNS; it writes a new code next to its configuration file".to_string(),
         };
@@ -3795,6 +3784,17 @@ fn handle_auth(
     write_simple(stream, "200 OK", "application/json", "", &body)
 }
 
+/// The full path can contain an account name, so a public origin gets only the file name.
+fn setup_code_location(st: &AppState, caller: &Caller) -> Option<String> {
+    let file = st.auth.setup_code_file()?;
+    if !caller.public() {
+        return Some(file);
+    }
+    std::path::Path::new(&file)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 /// Shared by `handle_auth` and direct `route()` calls so the two cannot drift.
 fn auth_status_body(
     st: &AppState,
@@ -3803,12 +3803,10 @@ fn auth_status_body(
     role: &str,
     user: &str,
 ) -> String {
-    // The path can contain an account name. The first account can only be created on this
-    // machine, so requests to a public origin do not get it.
-    let setup_code_file = if st.auth.has_users() || caller.public() {
+    let setup_code_file = if st.auth.has_users() {
         None
     } else {
-        st.auth.setup_code_file()
+        setup_code_location(st, caller)
     };
     format!(
         "{{\"login_enabled\":{},\"authenticated\":{},\"role\":{},\"user\":{},\"setup_code_file\":{},\"route\":\"{}\"}}",
@@ -8896,7 +8894,7 @@ mod tests {
         );
         assert_eq!(caller.login_proxy(), None);
         assert_eq!(caller.session_cookie(), SECURE_SESSION_COOKIE);
-        assert!(caller.public(), "HTTPS 요청에 첫 계정 만들기가 열림");
+        assert!(caller.public(), "HTTPS 요청을 공개 경로로 보지 않음");
 
         assert_eq!(
             control_caller(
@@ -9022,20 +9020,50 @@ mod tests {
     }
 
     #[test]
-    fn first_account_setup_is_closed_through_the_proxy() {
+    fn first_account_setup_through_the_proxy_needs_the_code() {
         let mut st = state_without_accounts(Box::new(|_, _| Ok("{}".to_string())));
         st.proxy = Arc::new(ArcSwap::from_pointee(proxied_policy()));
-        let body = "{\"user\":\"owner\",\"password\":\"correct-horse-battery\"}";
-        let response = exchange(
-            &st,
-            &format!(
-                "POST /v1/setup HTTP/1.1\r\nHost: admin.example.com\r\nContent-Type: application/json\r\n\
+        let setup = |code: &str| {
+            let body = format!(
+                "{{\"user\":\"owner\",\"password\":\"correct-horse-battery\",\"code\":\"{code}\"}}"
+            );
+            format!(
+                "POST /v1/setup HTTP/1.1\r\nHost: admin.example.com\r\nOrigin: https://admin.example.com\r\n\
+                 X-Forwarded-For: 198.51.100.7\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
-            ),
+            )
+        };
+
+        let auth = exchange(
+            &st,
+            "GET /v1/auth HTTP/1.1\r\nHost: admin.example.com\r\n\r\n",
         );
-        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            auth.contains("\"setup_code_file\":\"setup-code.txt\""),
+            "공개 경로에 설정 코드 파일 이름이 없거나 전체 경로가 나감: {auth}"
+        );
+
+        let wrong = exchange(&st, &setup("wrong-code"));
+        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+        assert!(
+            !wrong.contains(TEST_SETUP_FILE) && wrong.contains("setup-code.txt"),
+            "공개 경로의 오류에 전체 경로가 나가거나 파일 이름이 없음: {wrong}"
+        );
         assert!(!st.auth.has_users());
+
+        let response = loop {
+            let response = exchange(&st, &setup(TEST_SETUP_CODE));
+            if !response.starts_with("HTTP/1.1 503") {
+                break response;
+            }
+        };
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(st.auth.has_users());
+        assert!(
+            response.contains("Set-Cookie: __Host-onetdns_session="),
+            "{response}"
+        );
     }
 
     #[test]

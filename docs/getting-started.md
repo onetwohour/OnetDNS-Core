@@ -23,7 +23,7 @@ If the program cannot bind port 53, check whether another resolver already occup
 
 ## 2. Create an administrator
 
-Browse to **http://127.0.0.1:8553** on the same computer. The first-use screen points to `setup-code.txt`, stored beside `OnetDNS.toml`. Enter the code and create an account. The initial enrollment flow is local-only; later dashboard access is a separate configuration.
+Browse to **http://127.0.0.1:8553** on the same computer. The first-use screen points to `setup-code.txt`, stored beside `OnetDNS.toml`. Enter the code and create an account. If the dashboard is also served at an HTTPS address, the first account can be created there with the same code.
 
 If the page does not load, verify the process is running, check the configured dashboard address, and ensure `--no-web` was not used. See [Operations](operations.md#dashboard-access).
 
