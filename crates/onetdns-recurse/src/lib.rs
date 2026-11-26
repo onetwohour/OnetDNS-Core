@@ -663,6 +663,61 @@ struct ZoneStep {
     start_trust: Option<ValidatedKeyEntry>,
 }
 
+/// The steps whose DNSKEY validation reads: down to the first delegation without a supported DS,
+/// where the chain is Insecure and no key below is checked.
+fn keyed_steps(chain: &[ZoneStep]) -> impl Iterator<Item = &ZoneStep> {
+    chain
+        .iter()
+        .enumerate()
+        .take_while(|(i, step)| {
+            *i == 0
+                || !step.ds_records.is_empty()
+                    && step.ds.iter().any(onetdns_dnssec::ds_is_supported)
+        })
+        .map(|(_, step)| step)
+}
+
+/// Fetches the DNSKEY of each zone a validating walk enters while the walk goes on, instead of
+/// zone by zone after the answer. One thread fetches them in order, so a walk adds at most one
+/// query's exchanges.
+struct KeyPrefetch<'scope, 'env> {
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    recursor: &'env Recursor,
+    queue: Option<std::sync::mpsc::Sender<(Name, Vec<SocketAddr>)>>,
+    /// Chain steps already looked at; the chain only grows.
+    seen: usize,
+}
+
+impl KeyPrefetch<'_, '_> {
+    fn ask(&mut self, chain: &[ZoneStep], deadline: Instant) {
+        for step in keyed_steps(chain).skip(self.seen) {
+            if !self.recursor.lacks_keys(step) {
+                continue;
+            }
+            if self.queue.is_none() {
+                let (queue, zones) = std::sync::mpsc::channel::<(Name, Vec<SocketAddr>)>();
+                let recursor = self.recursor;
+                let started = std::thread::Builder::new()
+                    .name("recurse-dnskey".into())
+                    .spawn_scoped(self.scope, move || {
+                        for (zone, servers) in zones {
+                            let _ = recursor.fetch_dnskey(&zone, &servers, deadline);
+                        }
+                    });
+                // Validation fetches the keys itself.
+                if started.is_err() {
+                    break;
+                }
+                self.queue = Some(queue);
+            }
+            if let Some(queue) = &self.queue {
+                let _ = queue.send((step.zone.clone(), step.servers.clone()));
+            }
+        }
+        self.seen = chain.len();
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 /// Name servers involved in this resolution, passed upward with the answer.
 pub struct NsContext {
@@ -1492,8 +1547,9 @@ impl Recursor {
         deadline: Instant,
     ) -> Result<Vec<onetdns_dnssec::ChainLink>, RecurseError> {
         let mut links = Vec::with_capacity(chain.len());
+        let keyed = keyed_steps(chain).count();
         for (i, step) in chain.iter().enumerate() {
-            let (dnskeys, dnskey_rrsigs) = if step.start_trust.is_some() {
+            let (dnskeys, dnskey_rrsigs) = if step.start_trust.is_some() || i >= keyed {
                 (Vec::new(), Vec::new())
             } else {
                 self.fetch_dnskey(&step.zone, &step.servers, deadline)?
@@ -1887,12 +1943,14 @@ impl Recursor {
         chain: &[ZoneStep],
         skip: &[Vec<u8>],
     ) -> Option<(Name, Vec<SocketAddr>)> {
-        chain
-            .iter()
-            .filter(|step| step.start_trust.is_none())
-            .map(|step| (step.zone.canonical_key(), step))
-            .find(|(key, _)| !skip.contains(key) && self.dnskey_cached(key).is_none())
-            .map(|(_, step)| (step.zone.clone(), step.servers.clone()))
+        keyed_steps(chain)
+            .find(|step| !skip.contains(&step.zone.canonical_key()) && self.lacks_keys(step))
+            .map(|step| (step.zone.clone(), step.servers.clone()))
+    }
+
+    /// Whether validation has to fetch this step's DNSKEY.
+    fn lacks_keys(&self, step: &ZoneStep) -> bool {
+        step.start_trust.is_none() && self.dnskey_cached(&step.zone.canonical_key()).is_none()
     }
 
     #[cfg(unix)]
@@ -2103,9 +2161,9 @@ impl Recursor {
         )
     }
 
-    /// One query per turn, then a step down, an address lookup, or the end. The turn count is
-    /// capped, so a referral loop stops. Minimization needs the referral budget plus the label
-    /// count in turns, so followed delegations are counted separately against the referral budget.
+    /// When validating, the keys of each zone entered are fetched alongside the walk; returning
+    /// waits for those fetches, so validation finds the keys cached. The walk drops its queue when
+    /// it ends, which lets the fetching thread finish.
     fn iterate_from(
         &self,
         qname: &Name,
@@ -2113,6 +2171,29 @@ impl Recursor {
         budget: &mut Budget,
         start: WalkStart,
         validate: bool,
+    ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
+        std::thread::scope(|scope| {
+            let keys = (validate && !self.is_domain_insecure(qname)).then_some(KeyPrefetch {
+                scope,
+                recursor: self,
+                queue: None,
+                seen: 0,
+            });
+            self.walk(qname, qtype, budget, start, validate, keys)
+        })
+    }
+
+    /// One query per turn, then a step down, an address lookup, or the end. The turn count is
+    /// capped, so a referral loop stops. Minimization needs the referral budget plus the label
+    /// count in turns, so followed delegations are counted separately against the referral budget.
+    fn walk(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+        budget: &mut Budget,
+        start: WalkStart,
+        validate: bool,
+        mut keys: Option<KeyPrefetch<'_, '_>>,
     ) -> Result<(Message, Vec<ZoneStep>), RecurseError> {
         let ctx = IterationContext {
             qname,
@@ -2125,6 +2206,9 @@ impl Recursor {
         let mut referrals = 0usize;
 
         for _ in 0..(self.max_referrals + ctx.total + 2) {
+            if let Some(keys) = keys.as_mut() {
+                keys.ask(&state.chain, budget.deadline);
+            }
             let plan = state.next_query(&ctx);
             let zone_depth = state.zone.num_labels();
 
@@ -7567,8 +7651,8 @@ mod tests {
 
     #[test]
     /// The address only picks a destination and the answer is validated through the chain, so
-    /// validating this lookup would only spend time fetching DNSKEYs. The final answer is not
-    /// validated here either, so a DNSKEY query at the root can only come from the address lookup.
+    /// validating this lookup would only spend time fetching DNSKEYs. The walk here neither fetches
+    /// keys ahead nor validates its answer, so a DNSKEY query can only come from the address lookup.
     fn glueless_nameserver_lookup_does_not_validate() {
         const PORT: u16 = 5419;
         let (root, seen) = spawn_glueless_delegation(
@@ -7597,12 +7681,13 @@ mod tests {
         };
         let qname = Name::from_str("host.target.test").unwrap();
         let (resp, _) = rec
-            .iterate_from(
+            .walk(
                 &qname,
                 RecordType::A,
                 &mut budget,
                 WalkStart::root(vec![root]),
                 true,
+                None,
             )
             .expect("주소를 풀어 내려가야 합니다");
         assert!(has_glueless_target(&resp), "{resp:?}");
@@ -8372,6 +8457,177 @@ mod tests {
         );
     }
 
+    /// `test`, signed below a signed root. The `test` server holds the answer for `host.test` until
+    /// it is asked for the zone's DNSKEY, a second at most; the flag says whether the keys were
+    /// asked before the answer went out.
+    fn spawn_signed_zone_holding_its_answer(
+        port: u16,
+        [root_ip, test_ip]: [&str; 2],
+    ) -> (
+        SocketAddr,
+        onetdns_dnssec::Ds,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let name = |text: &str| Name::from_str(text).unwrap();
+        let (sk_root, k_root) = ecdsa_key(35);
+        let (sk_test, k_test) = ecdsa_key(36);
+        let anchor = onetdns_dnssec::Ds::from_dnskey(&k_root, &name("."), 2).unwrap();
+        let ds = onetdns_dnssec::Ds::from_dnskey(&k_test, &name("test"), 2).unwrap();
+        let test_ds = Record::new(name("test"), 3600, RData::Unknown(43, ds.rdata_bytes()));
+        let test_glue: Ipv4Addr = test_ip.parse().unwrap();
+        let root = spawn_server(root_ip, port, move |req| {
+            let q = req.questions.first().unwrap().clone();
+            let mut m = base(req);
+            if q.qtype == RecordType::DNSKEY && q.name.is_root() {
+                m.header.authoritative = true;
+                let dk = dnskey_rec(".", &k_root);
+                let sig = rrsig_rec(&sk_root, &k_root, ".", RecordType::DNSKEY.0, &[dk.clone()]);
+                m.answers.push(dk);
+                m.answers.push(sig);
+            } else {
+                m.authorities
+                    .push(Record::new(name("test"), 3600, RData::Ns(name("ns.test"))));
+                m.authorities.push(test_ds.clone());
+                m.authorities.push(rrsig_rec(
+                    &sk_root,
+                    &k_root,
+                    ".",
+                    RecordType::DS.0,
+                    &[test_ds.clone()],
+                ));
+                m.additionals
+                    .push(Record::new(name("ns.test"), 3600, RData::A(test_glue)));
+            }
+            m
+        });
+
+        let keys_first = Arc::new(AtomicBool::new(false));
+        let flag = keys_first.clone();
+        let sock = UdpSocket::bind(format!("{test_ip}:{port}")).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        std::thread::spawn(move || {
+            let reply = |req: &Message| {
+                let q = req.questions.first().unwrap().clone();
+                let owner = q.name.to_ascii_lower();
+                let mut m = base(req);
+                m.header.authoritative = true;
+                if q.qtype == RecordType::DNSKEY && owner == "test" {
+                    let dk = dnskey_rec("test", &k_test);
+                    let sig = rrsig_rec(
+                        &sk_test,
+                        &k_test,
+                        "test",
+                        RecordType::DNSKEY.0,
+                        &[dk.clone()],
+                    );
+                    m.answers.push(dk);
+                    m.answers.push(sig);
+                } else if q.qtype == RecordType::A && owner == "host.test" {
+                    let a = Record::new(
+                        name("host.test"),
+                        3600,
+                        RData::A(Ipv4Addr::new(10, 0, 0, 11)),
+                    );
+                    let sig = rrsig_rec(&sk_test, &k_test, "test", RecordType::A.0, &[a.clone()]);
+                    m.answers.push(a);
+                    m.answers.push(sig);
+                }
+                m.try_encode().unwrap()
+            };
+            let mut buf = [0u8; 4096];
+            let mut held: Option<(Message, SocketAddr)> = None;
+            let mut keys_asked = false;
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else {
+                    if let Some((req, to)) = held.take() {
+                        let _ = sock.send_to(&reply(&req), to);
+                    }
+                    continue;
+                };
+                let Ok(req) = Message::parse(&buf[..n]) else {
+                    continue;
+                };
+                match req.questions.first().map(|q| q.qtype) {
+                    Some(RecordType::DNSKEY) => {
+                        keys_asked = true;
+                        let _ = sock.send_to(&reply(&req), from);
+                        if let Some((held_req, to)) = held.take() {
+                            flag.store(true, Ordering::SeqCst);
+                            let _ = sock.send_to(&reply(&held_req), to);
+                        }
+                    }
+                    Some(RecordType::A) if !keys_asked => held = Some((req, from)),
+                    Some(RecordType::A) => {
+                        flag.store(true, Ordering::SeqCst);
+                        let _ = sock.send_to(&reply(&req), from);
+                    }
+                    _ => {
+                        let _ = sock.send_to(&reply(&req), from);
+                    }
+                }
+            }
+        });
+        (root, anchor, keys_first)
+    }
+
+    fn validating_recursor(root: SocketAddr, port: u16, anchor: onetdns_dnssec::Ds) -> Recursor {
+        Recursor::new(vec![root], Duration::from_secs(2))
+            .with_port(port)
+            .with_test_loopback()
+            .with_trust_anchors(vec![anchor])
+    }
+
+    #[test]
+    /// Entering a signed zone asks for its keys alongside the query, so validating the answer does
+    /// not wait another round trip for them.
+    fn a_signed_zone_is_asked_for_its_keys_alongside_the_query() {
+        use std::sync::atomic::Ordering;
+        let (root, anchor, keys_first) =
+            spawn_signed_zone_holding_its_answer(5433, ["127.0.0.119", "127.0.0.120"]);
+        let rec = validating_recursor(root, 5433, anchor);
+
+        let resp = rec
+            .resolve(&Name::from_str("host.test").unwrap(), RecordType::A)
+            .expect("서명된 영역 해석");
+        assert_eq!(resp.header.rcode, ResponseCode::NoError.0);
+        assert!(resp.header.authentic_data, "검증된 답은 AD=1");
+        assert!(
+            keys_first.load(Ordering::SeqCst),
+            "답이 나가기 전에 영역 키를 물어야 함"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reactor_lane_asks_a_signed_zone_for_its_keys_alongside_the_query() {
+        use crate::reactor::{Completion, Reactor, ReactorConfig, SubmitOutcome};
+        use std::sync::atomic::Ordering;
+        let (root, anchor, keys_first) =
+            spawn_signed_zone_holding_its_answer(5434, ["127.0.0.121", "127.0.0.122"]);
+        let rec = validating_recursor(root, 5434, anchor);
+
+        let mut lane = Reactor::new(ReactorConfig::default());
+        let qname = Name::from_str("host.test").unwrap();
+        assert!(matches!(
+            lane.submit(&rec, qname, RecordType::A, 1, Instant::now(), false),
+            SubmitOutcome::Accepted
+        ));
+        match drive_lane(&mut lane, &rec) {
+            Some(Completion::Answer(_, msg)) => {
+                assert_eq!(msg.header.rcode, ResponseCode::NoError.0);
+                assert!(msg.header.authentic_data, "레인이 검증한 답은 AD=1");
+            }
+            Some(Completion::Retry(_)) => panic!("레인이 검증하지 않고 동기 경로로 넘겼다"),
+            Some(Completion::Fail(..)) => panic!("해석 자체가 실패했다"),
+            None => panic!("완료 통지가 없다"),
+        }
+        assert!(
+            keys_first.load(Ordering::SeqCst),
+            "답이 나가기 전에 영역 키를 물어야 함"
+        );
+    }
+
     #[test]
     /// That verdict must be cached; otherwise the zone's next query cannot start from the cached
     /// delegation and walks from the root again.
@@ -8411,8 +8667,13 @@ mod tests {
             });
         }
 
+        let child_key_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key_queries = child_key_queries.clone();
         spawn_server("127.0.0.41", PORT, move |req| {
             let q = req.questions.first().unwrap().clone();
+            if q.qtype == RecordType::DNSKEY {
+                key_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let mut m = base(req);
             m.header.authoritative = true;
             if q.name.to_ascii_lower() == "host.insecure.test" && q.qtype == RecordType::A {
@@ -8461,6 +8722,11 @@ mod tests {
                 .iter()
                 .any(|r| matches!(&r.rdata, RData::A(ip) if *ip == Ipv4Addr::new(203, 0, 113, 5))),
             "비서명 A 답이 그대로 전달됨"
+        );
+        assert_eq!(
+            child_key_queries.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "서명 없는 위임 아래 영역의 키는 검증에 쓰이지 않으므로 묻지 않아야 함"
         );
         let insecure_zone = Name::from_str("insecure.test").unwrap();
         assert!(
@@ -9297,6 +9563,10 @@ mod tests {
                 .port()
         }
 
+        /// A closed UDP port reports nothing on Windows, so a probe reaches DoT only once DoQ has
+        /// timed out.
+        const PROBED: Duration = Duration::from_secs(10);
+
         fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
             let until = Instant::now() + limit;
             while Instant::now() < until {
@@ -9336,7 +9606,7 @@ mod tests {
 
             ask(&rec, &[server]).unwrap();
             assert_eq!(plain_asked.load(Ordering::SeqCst), 1);
-            assert!(wait_until(Duration::from_secs(5), || encryption
+            assert!(wait_until(PROBED, || encryption
                 .route(server.ip())
                 .is_some()));
 
@@ -9375,6 +9645,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
             }
             assert_eq!(plain_asked.load(Ordering::SeqCst), 5);
+            assert!(wait_until(PROBED, || accepts.load(Ordering::SeqCst) == 1));
+            for _ in 0..3 {
+                ask(&rec, &[server]).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(200));
             assert_eq!(accepts.load(Ordering::SeqCst), 1, "DoT is probed once");
             assert_eq!(encryption.route(server.ip()), None);
         }
@@ -9392,7 +9667,7 @@ mod tests {
             let rec = recursor(encryption);
 
             ask(&rec, &[server]).unwrap();
-            assert!(wait_until(Duration::from_secs(5), || encryption
+            assert!(wait_until(PROBED, || encryption
                 .route(server.ip())
                 .is_some()));
             silent.store(true, Ordering::SeqCst);
@@ -9433,7 +9708,7 @@ mod tests {
             };
 
             ask(&rec, &zone).unwrap();
-            assert!(wait_until(Duration::from_secs(5), || encryption
+            assert!(wait_until(PROBED, || encryption
                 .route(encrypting.ip())
                 .is_some()));
             assert_eq!(encryption.route(plain_only.ip()), None);

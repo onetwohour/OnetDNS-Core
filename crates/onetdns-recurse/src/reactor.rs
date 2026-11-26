@@ -102,6 +102,10 @@ struct Session {
     /// with it on, a zone cut seen in the answer section would push the parent to the sync path to
     /// fetch DS.
     collect_ds: bool,
+    /// Chain steps already looked at for a DNSKEY fetch ahead of validation; the chain only grows.
+    keys_seen: usize,
+    /// Zone of the last fetch started ahead.
+    keys_ahead: Option<Vec<u8>>,
 }
 
 thread_local! {
@@ -212,6 +216,8 @@ impl Session {
             steps: 0,
             step_cap,
             collect_ds: r.is_validating(),
+            keys_seen: 0,
+            keys_ahead: None,
         };
         if s.send_next(r, now).is_err() {
             return None;
@@ -463,10 +469,14 @@ enum SlotKind {
         parent: usize,
     },
 
-    /// Fetching a DNSKEY for `parent`'s validation.
+    /// Fetching a zone's DNSKEY, ahead of validation or for the roots in `waiters`, which stay
+    /// parked until it ends.
     Dnskey {
-        parent: usize,
         zone: Name,
+        waiters: Vec<usize>,
+        /// The root this fetch runs ahead for, asked for its next zone when this ends. The slot
+        /// may hold another resolution by then, which only asks that one instead.
+        ahead_of: Option<usize>,
     },
 }
 
@@ -520,6 +530,9 @@ pub struct Reactor {
     /// Singleflight index: query key to slot.
     inflight: HashMap<(Vec<u8>, RecordType), usize>,
 
+    /// DNSKEY fetches in flight: zone key to slot. A zone is asked once at a time.
+    key_fetches: HashMap<Vec<u8>, usize>,
+
     pub merged: u64,
     pub completed: u64,
     pub failed: u64,
@@ -535,6 +548,7 @@ impl Reactor {
             slots: Vec::new(),
             free: Vec::new(),
             inflight: HashMap::new(),
+            key_fetches: HashMap::new(),
             merged: 0,
             completed: 0,
             failed: 0,
@@ -643,6 +657,7 @@ impl Reactor {
                 if self.cfg.singleflight {
                     self.inflight.insert(key, idx);
                 }
+                self.fetch_keys_ahead(r, idx, now);
                 SubmitOutcome::Accepted
             }
             None => SubmitOutcome::Failed,
@@ -697,8 +712,9 @@ impl Reactor {
                     }
                 }
             }
-            if let Some(e) = end {
-                self.settle(r, slot_idx, e, now, out);
+            match end {
+                Some(e) => self.settle(r, slot_idx, e, now, out),
+                None => self.fetch_keys_ahead(r, slot_idx, now),
             }
         }
     }
@@ -920,11 +936,24 @@ impl Reactor {
                     Settled::NeedsSync => self.retry_root(&root, out),
                 }
             }
-            SlotKind::Dnskey { parent, zone } => {
+            SlotKind::Dnskey {
+                zone,
+                waiters,
+                ahead_of,
+            } => {
                 if let Settled::Answer(m) = outcome {
                     r.absorb_dnskey_response(&zone, &m);
                 }
-                self.resume_key_parent(r, parent, now, out);
+                let key = zone.canonical_key();
+                if self.key_fetches.get(&key) == Some(&idx) {
+                    self.key_fetches.remove(&key);
+                }
+                for waiter in waiters {
+                    self.resume_key_parent(r, waiter, now, out);
+                }
+                if let Some(root) = ahead_of {
+                    self.fetch_keys_ahead(r, root, now);
+                }
             }
             SlotKind::NsAddr { parent } => {
                 if matches!(outcome, Settled::NeedsSync) {
@@ -984,9 +1013,11 @@ impl Reactor {
         if r.is_validating() {
             let chain = &session.state.chain;
             if let Some((zone, servers)) = r.first_chain_zone_missing_dnskey(chain, &tried) {
-                if fetches < MAX_KEY_FETCHES && self.has_child_capacity() {
+                let key = zone.canonical_key();
+                let in_flight = self.key_fetches.get(&key).copied();
+                if fetches < MAX_KEY_FETCHES && (in_flight.is_some() || self.has_child_capacity()) {
                     let mut tried = tried;
-                    tried.push(zone.canonical_key());
+                    tried.push(key);
                     let sf_key = root.sf_key.clone();
                     let idx = self.insert(Slot {
                         session,
@@ -1003,7 +1034,17 @@ impl Reactor {
                     if self.cfg.singleflight {
                         self.inflight.insert(sf_key, idx);
                     }
-                    self.spawn_key_child(r, idx, zone, servers, now, out);
+                    match in_flight.and_then(|fetch| self.slots[fetch].as_mut()) {
+                        Some(Slot {
+                            kind: SlotKind::Dnskey { waiters, .. },
+                            ..
+                        }) => waiters.push(idx),
+                        _ => {
+                            if !self.spawn_key_child(r, idx, zone, servers, vec![idx], now) {
+                                self.resume_key_parent(r, idx, now, out);
+                            }
+                        }
+                    }
                     return;
                 }
                 self.retry_root(&root, out);
@@ -1054,46 +1095,93 @@ impl Reactor {
         self.completed += 1;
     }
 
+    /// Fetches `zone`'s DNSKEY in a child slot with the deadline and side-resolution budget of slot
+    /// `from`. Without waiters it runs ahead for `from`. False when it cannot start.
     fn spawn_key_child(
         &mut self,
         r: &Recursor,
-        parent: usize,
+        from: usize,
         zone: Name,
         servers: Vec<SocketAddr>,
+        waiters: Vec<usize>,
         now: Instant,
-        out: &mut Vec<Completion>,
-    ) {
-        let Some(budget) = self.child_budget(parent, now) else {
-            self.resume_key_parent(r, parent, now, out);
+    ) -> bool {
+        let session = self.child_budget(from, now).and_then(|budget| {
+            Session::start_at(
+                r,
+                zone.clone(),
+                RecordType::DNSKEY,
+                crate::WalkStart {
+                    zone: zone.clone(),
+                    servers,
+                    trust: None,
+                },
+                budget,
+                now,
+            )
+        });
+        let Some(session) = session else {
+            return false;
+        };
+        let ns_budget = self.slots[from]
+            .as_ref()
+            .map(|slot| slot.ns_budget)
+            .unwrap_or(0);
+        let key = zone.canonical_key();
+        let ahead_of = waiters.is_empty().then_some(from);
+        let idx = self.insert(Slot {
+            session,
+            kind: SlotKind::Dnskey {
+                zone,
+                waiters,
+                ahead_of,
+            },
+            parked: None,
+            awaiting: None,
+            ns_budget,
+        });
+        self.key_fetches.insert(key, idx);
+        true
+    }
+
+    /// Fetches the DNSKEY of the next zone a root's walk entered whose keys are neither cached nor
+    /// being fetched, so the answer finds them ready instead of asking zone by zone. As in the sync
+    /// path's `KeyPrefetch`, one fetch runs ahead per root at a time, and the next starts when it
+    /// ends; a zone it does not reach is fetched in `complete_terminal`.
+    fn fetch_keys_ahead(&mut self, r: &Recursor, idx: usize, now: Instant) {
+        let capacity = self.has_child_capacity();
+        let Some(slot) = self.slots[idx].as_mut() else {
             return;
         };
-        match Session::start_at(
-            r,
-            zone.clone(),
-            RecordType::DNSKEY,
-            crate::WalkStart {
-                zone: zone.clone(),
-                servers,
-                trust: None,
-            },
-            budget,
-            now,
-        ) {
-            Some(session) => {
-                let ns_budget = self.slots[parent]
-                    .as_ref()
-                    .map(|slot| slot.ns_budget)
-                    .unwrap_or(0);
-                self.insert(Slot {
-                    session,
-                    kind: SlotKind::Dnskey { parent, zone },
-                    parked: None,
-                    awaiting: None,
-                    ns_budget,
-                });
-            }
-            None => self.resume_key_parent(r, parent, now, out),
+        let session = &mut slot.session;
+        let busy = session
+            .keys_ahead
+            .as_ref()
+            .is_some_and(|zone| self.key_fetches.contains_key(zone));
+        if !capacity
+            || busy
+            || !matches!(slot.kind, SlotKind::Root(_))
+            || !session.collect_ds
+            || session.keys_seen == session.state.chain.len()
+            || r.is_domain_insecure(&session.qname)
+        {
+            return;
         }
+        let next = crate::keyed_steps(&session.state.chain)
+            .enumerate()
+            .skip(session.keys_seen)
+            .find(|(_, step)| {
+                r.lacks_keys(step) && !self.key_fetches.contains_key(&step.zone.canonical_key())
+            });
+        session.keys_seen = next
+            .as_ref()
+            .map_or(session.state.chain.len(), |(i, _)| i + 1);
+        let Some((_, step)) = next else {
+            return;
+        };
+        let (zone, servers) = (step.zone.clone(), step.servers.clone());
+        session.keys_ahead = Some(zone.canonical_key());
+        self.spawn_key_child(r, idx, zone, servers, Vec::new(), now);
     }
 
     fn resume_key_parent(
@@ -1217,7 +1305,10 @@ impl Reactor {
             .session
             .resume_with_addrs(r, pending, parked.addrs, parked.addr_ttl, now)
         {
-            None => self.slots[parent] = Some(pslot),
+            None => {
+                self.slots[parent] = Some(pslot);
+                self.fetch_keys_ahead(r, parent, now);
+            }
             Some(e) => {
                 self.slots[parent] = Some(pslot);
                 self.settle(r, parent, e, now, out);
@@ -1254,6 +1345,7 @@ impl Reactor {
                 if self.cfg.singleflight {
                     self.inflight.insert(sf_key, idx);
                 }
+                self.fetch_keys_ahead(r, idx, now);
             }
             None => self.fail_root(&root, &crate::RecurseError::NoReachableNs, out),
         }
