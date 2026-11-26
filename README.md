@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/onetwohour/OnetDNS-Core?style=for-the-badge&label=release&color=2563EB)](https://github.com/onetwohour/OnetDNS-Core/releases)
 [![Build](https://img.shields.io/github/actions/workflow/status/onetwohour/OnetDNS-Core/ci.yml?branch=main&style=for-the-badge&label=build)](https://github.com/onetwohour/OnetDNS-Core/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-4C1?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--only-4C1?style=for-the-badge)](LICENSE)
 
 ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0wIDBoMTF2MTFIMHpNMTMgMGgxMXYxMUgxM3pNMCAxM2gxMXYxMUgwek0xMyAxM2gxMXYxMUgxM3oiLz48L3N2Zz4%3D)
@@ -108,4 +108,4 @@ The output binary is `target/release/OnetDNS`. For a headless build without the 
 
 ## License and issues
 
-Licensed under [Apache-2.0](LICENSE). Report issues in [GitHub Issues](https://github.com/onetwohour/OnetDNS-Core/issues).
+Licensed under [GPL-3.0-only](LICENSE). Report issues in [GitHub Issues](https://github.com/onetwohour/OnetDNS-Core/issues).

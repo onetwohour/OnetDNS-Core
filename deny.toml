@@ -8,9 +8,9 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# 워크스페이스는 Apache-2.0. 아래 목록은 의존성(암호 크레이트 등)에서 실제로 쓰이는
-# 라이선스라 MIT 도 남는다. 이 서버의 코드의 라이선스와는 별개다.
+# GPL-3.0-only는 워크스페이스 크레이트 자신의 라이선스이고, 나머지는 의존성이 쓰는 라이선스다.
 allow = [
+    "GPL-3.0-only",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
