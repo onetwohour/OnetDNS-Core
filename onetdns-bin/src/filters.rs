@@ -33,10 +33,11 @@ pub(crate) fn mutate_user_rule(
     if rule.is_empty() {
         return Err("`rule` is required".to_string());
     }
-    if add {
-        onetdns_filter::validate_rule(rule).map_err(|reason| format!("Invalid rule: {reason}"))?;
-    }
     let into_allow = tab_allow || rule.starts_with("@@");
+    if add {
+        onetdns_filter::validate_rule(rule, into_allow)
+            .map_err(|reason| format!("Invalid rule: {reason}"))?;
+    }
 
     let previous = overlay.lock_recover().clone();
     let mut next = previous.clone();
@@ -358,7 +359,7 @@ struct CompiledFilterInputs<'a> {
 
 /// Bump when rule parsing changes meaning, so the compiled cache and every parsed list built by the
 /// old parser are rebuilt.
-const FILTER_PARSE_FORMAT: &[u8] = b"onetdns-compiled-filter-input-v2";
+const FILTER_PARSE_FORMAT: &[u8] = b"onetdns-compiled-filter-input-v3";
 
 /// The compiled cache is reused only when this matches.
 fn compiled_filter_fingerprint(input: &CompiledFilterInputs<'_>) -> [u8; 32] {
@@ -1964,6 +1965,12 @@ mod tests {
         )
         .unwrap();
         assert!(overlay.lock().unwrap().1.is_empty());
+
+        let lift = "||rw.example.com^$dnsrewrite";
+        mutate_user_rule(&overlay, None, &rebuild, lift, false, true)
+            .expect_err("a block rule needs a value");
+        mutate_user_rule(&overlay, None, &rebuild, lift, true, true).unwrap();
+        assert_eq!(overlay.lock().unwrap().1, vec![lift.to_string()]);
     }
 
     #[test]

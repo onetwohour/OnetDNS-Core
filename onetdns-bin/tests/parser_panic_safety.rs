@@ -440,7 +440,7 @@ fn parsers_never_panic_on_malformed_input() {
         let ss = String::from_utf8_lossy(&r).into_owned();
         rec.run("rules", &r, || {
             for line in ss.lines() {
-                let _ = onetdns_filter::validate_rule(line);
+                let _ = onetdns_filter::validate_rule(line, false);
             }
             let _ = onetdns_filter::build_from_str(&ss, "", onetdns_core::BlockResponse::NxDomain);
             let _ = onetdns_filter::build_from_str("", &ss, onetdns_core::BlockResponse::NxDomain);

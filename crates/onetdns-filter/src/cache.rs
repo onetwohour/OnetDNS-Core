@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::{
     ClientCond, ClientRule, DomainSet, EngineParts, FilterLoadReport, LocalZoneAction,
-    LocalZoneSet, RewriteSet, RpzIpRule, RpzNameRule, StaticZone,
+    LocalZoneSet, RewriteException, RewriteSet, RewriteValue, RpzIpRule, RpzNameRule, StaticZone,
 };
 use crate::loader::{Kind, ListSet, ParsedList, Slot};
 use crate::table::KeyRun;
@@ -27,13 +27,13 @@ const MAGIC: &[u8; 8] = b"ONETFST\0";
 /// to bump. Its hash is written in the header and compared on read, so editing this text along with
 /// the layout makes older files get rejected and rebuilt. The cache can always be rebuilt, so there
 /// is no reason to migrate it.
-const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response|verdicts:allow,block,rewrite,drop|states:blocks(header,labels,edges(target,output,tail))|tails|sources";
+const LAYOUT: &str = "domain_sets:block,allow,block_important,allow_important,refuse,nodata,no_response,rewrite_refuse,rewrite_nodata,rewrite_nxdomain|typed:block,block_except,allow,allow_except|regex_sets:block,allow,block_important,allow_important,refuse,nodata,no_response,nxdomain|regex_typed:block,block_except,allow,allow_except|rewrites:exact,suffix,rules(name,targets)|rewrite_exceptions:pattern,regex,value(nxdomain,refused,nodata,noresponse,answer)|verdicts:allow,block,rewrite,drop|states:blocks(header,labels,edges(target,output,tail))|tails|sources";
 
 /// A parsed list file: one list's domain entries and the rest of its rules as text.
 const LIST_MAGIC: &[u8; 8] = b"ONETLST\0";
 
 /// Plays the part of [`LAYOUT`] for parsed list files.
-const LIST_LAYOUT: &str = "report|other_lines|sets:slot(plain:kind|typed:type|typed_except:types),exact,suffix|names:count,bytes,(shared_suffix,head_len,head)*";
+const LIST_LAYOUT: &str = "report|other_lines|sets:slot(plain:kind|typed:type|typed_except:types|typed_allow:type|typed_allow_except:types),exact,suffix|names:count,bytes,(shared_suffix,head_len,head)*";
 
 fn tag_of(layout: &str) -> [u8; 4] {
     let digest: [u8; 32] = Sha256::digest(layout.as_bytes()).into();
@@ -555,17 +555,24 @@ fn encode_domain_sets(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Ca
         &parts.refuse,
         &parts.nodata,
         &parts.no_response,
+        &parts.rewrite_refuse,
+        &parts.rewrite_nodata,
+        &parts.rewrite_nxdomain,
     ] {
         set.encode_compact(&mut w.bytes).map_err(CacheError::new)?;
     }
-    encode_vec(w, &parts.typed_block, |w, (rtype, set)| {
-        w.u16(rtype.0);
-        set.encode_compact(&mut w.bytes).map_err(CacheError::new)
-    })?;
-    encode_vec(w, &parts.typed_block_except, |w, (types, set)| {
-        encode_record_types(w, types)?;
-        set.encode_compact(&mut w.bytes).map_err(CacheError::new)
-    })?;
+    for family in [&parts.typed_block, &parts.typed_allow] {
+        encode_vec(w, family, |w, (rtype, set)| {
+            w.u16(rtype.0);
+            set.encode_compact(&mut w.bytes).map_err(CacheError::new)
+        })?;
+    }
+    for family in [&parts.typed_block_except, &parts.typed_allow_except] {
+        encode_vec(w, family, |w, (types, set)| {
+            encode_record_types(w, types)?;
+            set.encode_compact(&mut w.bytes).map_err(CacheError::new)
+        })?;
+    }
     Ok(())
 }
 
@@ -582,24 +589,31 @@ fn encode_domain_sets_streaming<W: Write>(
         &parts.refuse,
         &parts.nodata,
         &parts.no_response,
+        &parts.rewrite_refuse,
+        &parts.rewrite_nodata,
+        &parts.rewrite_nxdomain,
     ] {
         set.encode_compact_chunks(&mut |bytes| w.write(bytes))
             .map_err(CacheError::new)?;
     }
-    w.len(parts.typed_block.len(), MAX_ITEMS)?;
-    for (rtype, set) in &parts.typed_block {
-        w.u16(rtype.0);
-        set.encode_compact_chunks(&mut |bytes| w.write(bytes))
-            .map_err(CacheError::new)?;
-    }
-    w.len(parts.typed_block_except.len(), MAX_ITEMS)?;
-    for (types, set) in &parts.typed_block_except {
-        w.len(types.len(), MAX_ITEMS)?;
-        for rtype in types {
+    for family in [&parts.typed_block, &parts.typed_allow] {
+        w.len(family.len(), MAX_ITEMS)?;
+        for (rtype, set) in family {
             w.u16(rtype.0);
+            set.encode_compact_chunks(&mut |bytes| w.write(bytes))
+                .map_err(CacheError::new)?;
         }
-        set.encode_compact_chunks(&mut |bytes| w.write(bytes))
-            .map_err(CacheError::new)?;
+    }
+    for family in [&parts.typed_block_except, &parts.typed_allow_except] {
+        w.len(family.len(), MAX_ITEMS)?;
+        for (types, set) in family {
+            w.len(types.len(), MAX_ITEMS)?;
+            for rtype in types {
+                w.u16(rtype.0);
+            }
+            set.encode_compact_chunks(&mut |bytes| w.write(bytes))
+                .map_err(CacheError::new)?;
+        }
     }
     Ok(())
 }
@@ -613,6 +627,7 @@ fn encode_parts_tail(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Cac
         &parts.regex_refuse,
         &parts.regex_nodata,
         &parts.regex_no_response,
+        &parts.regex_nxdomain,
     ] {
         encode_strings(w, strings)?;
     }
@@ -620,15 +635,36 @@ fn encode_parts_tail(w: &mut Encoder<'_>, parts: &EngineParts) -> Result<(), Cac
         w.string(pattern)?;
         encode_rewrite_target(w, target)
     })?;
-    encode_vec(w, &parts.regex_typed_block, |w, (rtype, pattern)| {
-        w.u16(rtype.0);
-        w.string(pattern)
-    })?;
-    encode_vec(w, &parts.regex_typed_block_except, |w, (types, pattern)| {
-        encode_record_types(w, types)?;
-        w.string(pattern)
-    })?;
+    for family in [&parts.regex_typed_block, &parts.regex_typed_allow] {
+        encode_vec(w, family, |w, (rtype, pattern)| {
+            w.u16(rtype.0);
+            w.string(pattern)
+        })?;
+    }
+    for family in [
+        &parts.regex_typed_block_except,
+        &parts.regex_typed_allow_except,
+    ] {
+        encode_vec(w, family, |w, (types, pattern)| {
+            encode_record_types(w, types)?;
+            w.string(pattern)
+        })?;
+    }
     encode_rewrite_set(w, &parts.rewrites)?;
+    encode_vec(w, &parts.rewrite_exceptions, |w, exception| {
+        w.string(&exception.pattern)?;
+        w.u8(u8::from(exception.regex));
+        match &exception.value {
+            None => {
+                w.u8(0);
+                Ok(())
+            }
+            Some(value) => {
+                w.u8(1);
+                encode_rewrite_value(w, value)
+            }
+        }
+    })?;
     encode_local_zones(w, &parts.local_zones)?;
     encode_vec(w, &parts.client_rules, encode_client_rule)?;
     for rules in [&parts.rpz_client_ip, &parts.rpz_ip, &parts.rpz_nsip] {
@@ -650,8 +686,14 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     let refuse = decode_domain_set(r)?;
     let nodata = decode_domain_set(r)?;
     let no_response = decode_domain_set(r)?;
+    let rewrite_refuse = decode_domain_set(r)?;
+    let rewrite_nodata = decode_domain_set(r)?;
+    let rewrite_nxdomain = decode_domain_set(r)?;
     let typed_block = decode_vec(r, |r| Ok((RecordType(r.u16()?), decode_domain_set(r)?)))?;
+    let typed_allow = decode_vec(r, |r| Ok((RecordType(r.u16()?), decode_domain_set(r)?)))?;
     let typed_block_except =
+        decode_vec(r, |r| Ok((decode_record_types(r)?, decode_domain_set(r)?)))?;
+    let typed_allow_except =
         decode_vec(r, |r| Ok((decode_record_types(r)?, decode_domain_set(r)?)))?;
     let regex_block = decode_strings(r)?;
     let regex_allow = decode_strings(r)?;
@@ -660,10 +702,31 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
     let regex_refuse = decode_strings(r)?;
     let regex_nodata = decode_strings(r)?;
     let regex_no_response = decode_strings(r)?;
+    let regex_nxdomain = decode_strings(r)?;
     let regex_rewrites = decode_vec(r, |r| Ok((r.string()?, decode_rewrite_target(r)?)))?;
     let regex_typed_block = decode_vec(r, |r| Ok((RecordType(r.u16()?), r.string()?)))?;
+    let regex_typed_allow = decode_vec(r, |r| Ok((RecordType(r.u16()?), r.string()?)))?;
     let regex_typed_block_except = decode_vec(r, |r| Ok((decode_record_types(r)?, r.string()?)))?;
+    let regex_typed_allow_except = decode_vec(r, |r| Ok((decode_record_types(r)?, r.string()?)))?;
     let rewrites = decode_rewrite_set(r)?;
+    let rewrite_exceptions = decode_vec(r, |r| {
+        let pattern = r.string()?;
+        let regex = r.boolean()?;
+        let value = match r.u8()? {
+            0 => None,
+            1 => Some(decode_rewrite_value(r)?),
+            _ => {
+                return Err(CacheError::new(
+                    "Invalid rewrite exception in compiled filter cache",
+                ))
+            }
+        };
+        Ok(RewriteException {
+            pattern,
+            regex,
+            value,
+        })
+    })?;
     let local_zones = decode_local_zones(r)?;
     let client_rules = decode_vec(r, decode_client_rule)?;
     let rpz_client_ip = decode_vec(r, decode_rpz_ip)?;
@@ -687,8 +750,13 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
         refuse,
         nodata,
         no_response,
+        rewrite_refuse,
+        rewrite_nodata,
+        rewrite_nxdomain,
         typed_block,
         typed_block_except,
+        typed_allow,
+        typed_allow_except,
         regex_block,
         regex_allow,
         regex_block_important,
@@ -696,10 +764,14 @@ fn decode_parts(r: &mut Decoder<'_>) -> Result<EngineParts, CacheError> {
         regex_refuse,
         regex_nodata,
         regex_no_response,
+        regex_nxdomain,
         regex_rewrites,
         regex_typed_block,
         regex_typed_block_except,
+        regex_typed_allow,
+        regex_typed_allow_except,
         rewrites,
+        rewrite_exceptions,
         local_zones,
         client_rules,
         rpz_client_ip,
@@ -748,8 +820,10 @@ fn decode_list_payload(r: &mut Decoder<'_>) -> Result<ParsedList, CacheError> {
     })
 }
 
-const SLOT_TYPED: u8 = 7;
-const SLOT_TYPED_EXCEPT: u8 = 8;
+const SLOT_TYPED: u8 = 0x80;
+const SLOT_TYPED_EXCEPT: u8 = 0x81;
+const SLOT_TYPED_ALLOW: u8 = 0x82;
+const SLOT_TYPED_ALLOW_EXCEPT: u8 = 0x83;
 
 fn encode_slot(w: &mut Encoder<'_>, slot: &Slot) -> Result<(), CacheError> {
     match slot {
@@ -760,6 +834,14 @@ fn encode_slot(w: &mut Encoder<'_>, slot: &Slot) -> Result<(), CacheError> {
         }
         Slot::TypedExcept(types) => {
             w.u8(SLOT_TYPED_EXCEPT);
+            encode_record_types(w, types)?;
+        }
+        Slot::TypedAllow(rtype) => {
+            w.u8(SLOT_TYPED_ALLOW);
+            w.u16(rtype.0);
+        }
+        Slot::TypedAllowExcept(types) => {
+            w.u8(SLOT_TYPED_ALLOW_EXCEPT);
             encode_record_types(w, types)?;
         }
     }
@@ -773,14 +855,19 @@ fn decode_slot(r: &mut Decoder<'_>) -> Result<Slot, CacheError> {
     }
     match tag {
         SLOT_TYPED => Ok(Slot::Typed(RecordType(r.u16()?))),
-        SLOT_TYPED_EXCEPT => {
+        SLOT_TYPED_ALLOW => Ok(Slot::TypedAllow(RecordType(r.u16()?))),
+        SLOT_TYPED_EXCEPT | SLOT_TYPED_ALLOW_EXCEPT => {
             let types = decode_record_types(r)?;
             if types.is_empty() || !types.windows(2).all(|pair| pair[0].0 < pair[1].0) {
                 return Err(CacheError::new(
                     "Invalid record type set in compiled filter cache",
                 ));
             }
-            Ok(Slot::TypedExcept(types))
+            Ok(if tag == SLOT_TYPED_EXCEPT {
+                Slot::TypedExcept(types)
+            } else {
+                Slot::TypedAllowExcept(types)
+            })
         }
         _ => Err(CacheError::new(
             "Invalid domain set kind in compiled filter cache",
@@ -926,7 +1013,44 @@ fn decode_record_types(r: &mut Decoder<'_>) -> Result<Vec<RecordType>, CacheErro
 
 fn encode_rewrite_set(w: &mut Encoder<'_>, set: &RewriteSet) -> Result<(), CacheError> {
     encode_rewrite_map(w, &set.exact)?;
-    encode_rewrite_map(w, &set.suffix)
+    encode_rewrite_map(w, &set.suffix)?;
+    let mut rules: Vec<_> = set.rules.iter().collect();
+    rules.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    w.len(rules.len(), MAX_ITEMS)?;
+    for (domain, targets) in rules {
+        w.string(domain)?;
+        encode_vec(w, targets, encode_rewrite_target)?;
+    }
+    Ok(())
+}
+
+fn encode_rewrite_value(w: &mut Encoder<'_>, value: &RewriteValue) -> Result<(), CacheError> {
+    match value {
+        RewriteValue::NxDomain => w.u8(0),
+        RewriteValue::Refused => w.u8(1),
+        RewriteValue::NoData => w.u8(2),
+        RewriteValue::NoResponse => w.u8(3),
+        RewriteValue::Answer(target) => {
+            w.u8(4);
+            return encode_rewrite_target(w, target);
+        }
+    }
+    Ok(())
+}
+
+fn decode_rewrite_value(r: &mut Decoder<'_>) -> Result<RewriteValue, CacheError> {
+    Ok(match r.u8()? {
+        0 => RewriteValue::NxDomain,
+        1 => RewriteValue::Refused,
+        2 => RewriteValue::NoData,
+        3 => RewriteValue::NoResponse,
+        4 => RewriteValue::Answer(decode_rewrite_target(r)?),
+        _ => {
+            return Err(CacheError::new(
+                "Invalid rewrite value in compiled filter cache",
+            ))
+        }
+    })
 }
 
 fn encode_rewrite_map(
@@ -944,9 +1068,29 @@ fn encode_rewrite_map(
 }
 
 fn decode_rewrite_set(r: &mut Decoder<'_>) -> Result<RewriteSet, CacheError> {
+    let exact = decode_rewrite_map(r)?;
+    let suffix = decode_rewrite_map(r)?;
+    let entries: Vec<(Box<str>, Vec<RewriteTarget>)> = decode_vec(r, |r| {
+        let domain = r.string()?.into_boxed_str();
+        let targets = decode_vec(r, decode_rewrite_target)?;
+        if targets.is_empty() {
+            return Err(CacheError::new(
+                "Compiled filter cache has an empty rewrite rule",
+            ));
+        }
+        Ok((domain, targets))
+    })?;
+    let count = entries.len();
+    let rules: HashMap<_, _> = entries.into_iter().collect();
+    if rules.len() != count {
+        return Err(CacheError::new(
+            "Compiled filter cache has a duplicate rewrite entry",
+        ));
+    }
     Ok(RewriteSet {
-        exact: decode_rewrite_map(r)?,
-        suffix: decode_rewrite_map(r)?,
+        exact,
+        suffix,
+        rules,
     })
 }
 
@@ -1593,6 +1737,33 @@ mod tests {
             .rpz_nsdname
             .push(RpzNameRule::new("ns.example", FilterVerdict::Allow).unwrap());
         parts.report.unsupported_modifier.insert("foo".into(), 2);
+        let ip = |text: &str| RewriteTarget::ip(text.parse::<std::net::IpAddr>().unwrap());
+        parts.rewrites.add_rule("rule.example", ip("192.0.2.2"));
+        parts.rewrites.add_rule("rule.example", ip("192.0.2.3"));
+        parts.rewrite_exceptions.push(RewriteException {
+            pattern: "rule.example".into(),
+            regex: false,
+            value: None,
+        });
+        parts.rewrite_exceptions.push(RewriteException {
+            pattern: r"^nx\.".into(),
+            regex: true,
+            value: Some(RewriteValue::Answer(ip("192.0.2.3"))),
+        });
+        parts.rewrite_nxdomain.add_suffix("nx.example");
+        parts.regex_nxdomain.push(r"^nx[0-9]\.".into());
+        let mut txt = DomainSet::default();
+        txt.add_suffix("txt.example");
+        parts.typed_allow.push((RecordType::TXT, txt));
+        let mut not_a = DomainSet::default();
+        not_a.add_exact("not-a.example");
+        parts.typed_allow_except.push((vec![RecordType::A], not_a));
+        parts
+            .regex_typed_allow
+            .push((RecordType::MX, r"^mx\.".into()));
+        parts
+            .regex_typed_allow_except
+            .push((vec![RecordType::A], r"^na\.".into()));
         for (zone, action) in [
             ("corp.example", LocalZoneAction::Deny),
             ("api.corp.example", LocalZoneAction::Transparent),
@@ -1626,7 +1797,21 @@ mod tests {
 
         let encoded = encode_engine_cache(&mut parts, [9; 32]).unwrap();
         let restored = decode_engine_cache(&encoded, [9; 32]).unwrap();
-        assert_eq!(restored.rewrites.len(), 1);
+        assert_eq!(restored.rewrites.len(), 3);
+        assert_eq!(
+            restored.rewrites.rules.get("rule.example"),
+            parts.rewrites.rules.get("rule.example")
+        );
+        assert_eq!(restored.rewrite_exceptions, parts.rewrite_exceptions);
+        assert_eq!(restored.rewrite_nxdomain.len(), 1);
+        assert_eq!(restored.regex_nxdomain, parts.regex_nxdomain);
+        assert_eq!(restored.typed_allow.len(), 1);
+        assert_eq!(restored.typed_allow_except.len(), 1);
+        assert_eq!(restored.regex_typed_allow, parts.regex_typed_allow);
+        assert_eq!(
+            restored.regex_typed_allow_except,
+            parts.regex_typed_allow_except
+        );
         assert_eq!(restored.regex_rewrites.len(), 1);
         assert_eq!(restored.client_rules.len(), 1);
         assert_eq!(restored.rpz_client_ip.len(), 1);

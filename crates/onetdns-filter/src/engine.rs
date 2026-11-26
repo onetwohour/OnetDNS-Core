@@ -530,6 +530,9 @@ pub struct RewriteSet {
     pub(crate) exact: HashMap<Box<str>, RewriteTarget>,
 
     pub(crate) suffix: HashMap<Box<str>, RewriteTarget>,
+
+    /// `$dnsrewrite` rules, in rule order. Each covers the name and every name under it.
+    pub(crate) rules: HashMap<Box<str>, Vec<RewriteTarget>>,
 }
 
 impl RewriteSet {
@@ -543,29 +546,44 @@ impl RewriteSet {
             .insert(normalize_str(domain).into_boxed_str(), target);
     }
 
+    pub fn add_rule(&mut self, domain: &str, target: RewriteTarget) {
+        self.rules
+            .entry(normalize_str(domain).into_boxed_str())
+            .or_default()
+            .push(target);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.suffix.is_empty()
+        self.exact.is_empty() && self.suffix.is_empty() && self.rules.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.exact.len() + self.suffix.len()
+        self.exact.len() + self.suffix.len() + self.rules.values().map(Vec::len).sum::<usize>()
     }
 
-    /// Removes the entry only when it still holds `target`.
+    /// Removes an exact entry only when it still holds `target`, and every `$dnsrewrite` rule
+    /// with `target`.
     pub(crate) fn remove(&mut self, domain: &str, exact: bool, target: &RewriteTarget) {
-        let map = if exact {
-            &mut self.exact
-        } else {
-            &mut self.suffix
-        };
         let key = normalize_str(domain);
-        if map.get(key.as_str()) == Some(target) {
-            map.remove(key.as_str());
+        if exact {
+            if self.exact.get(key.as_str()) == Some(target) {
+                self.exact.remove(key.as_str());
+            }
+        } else if let Some(targets) = self.rules.get_mut(key.as_str()) {
+            targets.retain(|t| t != target);
+            if targets.is_empty() {
+                self.rules.remove(key.as_str());
+            }
         }
     }
 
-    /// An exact match wins.
-    fn get(&self, normalized: &str) -> Option<&RewriteTarget> {
+    /// An exact match wins, then the longest suffix. On the same name a configured rewrite wins
+    /// over `$dnsrewrite` rules, and of those the last one not `lifted` wins.
+    fn get(
+        &self,
+        normalized: &str,
+        lifted: impl Fn(&RewriteTarget) -> bool,
+    ) -> Option<&RewriteTarget> {
         if let Some(t) = self.exact.get(normalized) {
             return Some(t);
         }
@@ -574,12 +592,39 @@ impl RewriteSet {
             if let Some(target) = self.suffix.get(rest) {
                 return Some(target);
             }
+            if let Some(target) = self
+                .rules
+                .get(rest)
+                .and_then(|targets| targets.iter().rev().find(|t| !lifted(t)))
+            {
+                return Some(target);
+            }
             rest = match rest.find('.') {
                 Some(index) => &rest[index + 1..],
                 None => return None,
             };
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// What a `$dnsrewrite` rule answers.
+pub enum RewriteValue {
+    NxDomain,
+    Refused,
+    NoData,
+    NoResponse,
+    Answer(RewriteTarget),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// An `@@` rule with `$dnsrewrite`. The `$dnsrewrite` rules with `value`, or all of them when it is
+/// None, do not apply to the names it covers. Other rules still do.
+pub struct RewriteException {
+    /// A normalized name, covering it and every name under it, or a regex.
+    pub pattern: String,
+    pub regex: bool,
+    pub value: Option<RewriteValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -861,9 +906,14 @@ impl EngineParts {
             &self.refuse,
             &self.nodata,
             &self.no_response,
+            &self.rewrite_refuse,
+            &self.rewrite_nodata,
+            &self.rewrite_nxdomain,
         ];
         sets.extend(self.typed_block.iter().map(|(_, set)| set));
         sets.extend(self.typed_block_except.iter().map(|(_, set)| set));
+        sets.extend(self.typed_allow.iter().map(|(_, set)| set));
+        sets.extend(self.typed_allow_except.iter().map(|(_, set)| set));
         sets
     }
 
@@ -876,9 +926,14 @@ impl EngineParts {
             &mut self.refuse,
             &mut self.nodata,
             &mut self.no_response,
+            &mut self.rewrite_refuse,
+            &mut self.rewrite_nodata,
+            &mut self.rewrite_nxdomain,
         ];
         sets.extend(self.typed_block.iter_mut().map(|(_, s)| s));
         sets.extend(self.typed_block_except.iter_mut().map(|(_, s)| s));
+        sets.extend(self.typed_allow.iter_mut().map(|(_, s)| s));
+        sets.extend(self.typed_allow_except.iter_mut().map(|(_, s)| s));
         sets
     }
 
@@ -898,15 +953,26 @@ pub struct EngineParts {
     pub block_important: DomainSet,
     pub allow_important: DomainSet,
 
+    /// Refused names and RPZ rules.
     pub refuse: DomainSet,
 
+    /// RPZ rules.
     pub nodata: DomainSet,
 
+    /// `$dnsrewrite` rules that answer with a response code. They have sets of their own so
+    /// `rewrite_exceptions` lifts them and nothing else.
     pub no_response: DomainSet,
+    pub rewrite_refuse: DomainSet,
+    pub rewrite_nodata: DomainSet,
+    pub rewrite_nxdomain: DomainSet,
 
     pub typed_block: Vec<(RecordType, DomainSet)>,
 
     pub typed_block_except: Vec<(Vec<RecordType>, DomainSet)>,
+
+    pub typed_allow: Vec<(RecordType, DomainSet)>,
+
+    pub typed_allow_except: Vec<(Vec<RecordType>, DomainSet)>,
 
     pub regex_block: Vec<String>,
     pub regex_allow: Vec<String>,
@@ -914,16 +980,23 @@ pub struct EngineParts {
     pub regex_block_important: Vec<String>,
     pub regex_allow_important: Vec<String>,
 
+    /// `$dnsrewrite` rules, like the code sets above.
     pub regex_refuse: Vec<String>,
     pub regex_nodata: Vec<String>,
     pub regex_no_response: Vec<String>,
+    pub regex_nxdomain: Vec<String>,
 
     pub regex_rewrites: Vec<(String, RewriteTarget)>,
 
     pub regex_typed_block: Vec<(RecordType, String)>,
     pub regex_typed_block_except: Vec<(Vec<RecordType>, String)>,
 
+    pub regex_typed_allow: Vec<(RecordType, String)>,
+    pub regex_typed_allow_except: Vec<(Vec<RecordType>, String)>,
+
     pub rewrites: RewriteSet,
+
+    pub rewrite_exceptions: Vec<RewriteException>,
 
     pub local_zones: LocalZoneSet,
 
@@ -1195,10 +1268,16 @@ pub struct BlockEngine {
     regex_refuse: RegexMatcher,
     regex_nodata: RegexMatcher,
     regex_no_response: RegexMatcher,
+    regex_nxdomain: RegexMatcher,
 
     regex_rewrites: Vec<(String, Regex, RewriteTarget)>,
     regex_typed: Vec<(RecordType, String, Regex)>,
     regex_typed_except: Vec<(Vec<RecordType>, String, Regex)>,
+    regex_typed_allow: Vec<(RecordType, String, Regex)>,
+    regex_typed_allow_except: Vec<(Vec<RecordType>, String, Regex)>,
+
+    /// `rewrite_exceptions` with their regexes compiled; None for a name.
+    rewrite_exceptions: Vec<(Option<Regex>, RewriteException)>,
 
     /// Precompiled per client rule.
     client_rule_regex: Vec<Option<Regex>>,
@@ -1285,6 +1364,7 @@ impl std::fmt::Debug for EngineParts {
             .field("regex_block", &self.regex_block.len())
             .field("regex_allow", &self.regex_allow.len())
             .field("rewrites", &self.rewrites.len())
+            .field("rewrite_exceptions", &self.rewrite_exceptions.len())
             .field("local_zones", &self.local_zones.len())
             .field("rules_total", &self.report.rules_total)
             .field("rules_skipped", &self.report.rules_skipped)
@@ -1304,6 +1384,7 @@ impl BlockEngine {
             || !parts.regex_refuse.is_empty()
             || !parts.regex_nodata.is_empty()
             || !parts.regex_no_response.is_empty()
+            || !parts.regex_nxdomain.is_empty()
             || !parts.regex_rewrites.is_empty()
             || !parts.regex_typed_block.is_empty()
             || !parts.regex_typed_block_except.is_empty()
@@ -1318,6 +1399,7 @@ impl BlockEngine {
         let regex_refuse = build_regexes(&parts.regex_refuse);
         let regex_nodata = build_regexes(&parts.regex_nodata);
         let regex_no_response = build_regexes(&parts.regex_no_response);
+        let regex_nxdomain = build_regexes(&parts.regex_nxdomain);
         let regex_rewrites = parts
             .regex_rewrites
             .iter()
@@ -1332,6 +1414,28 @@ impl BlockEngine {
             .regex_typed_block_except
             .iter()
             .filter_map(|(ex, p)| compile_isolated(p).map(|re| (ex.clone(), p.clone(), re)))
+            .collect();
+        let regex_typed_allow = parts
+            .regex_typed_allow
+            .iter()
+            .filter_map(|(t, p)| compile_isolated(p).map(|re| (*t, p.clone(), re)))
+            .collect();
+        let regex_typed_allow_except = parts
+            .regex_typed_allow_except
+            .iter()
+            .filter_map(|(ex, p)| compile_isolated(p).map(|re| (ex.clone(), p.clone(), re)))
+            .collect();
+        let rewrite_exceptions = parts
+            .rewrite_exceptions
+            .iter()
+            .filter_map(|exception| {
+                let regex = if exception.regex {
+                    Some(compile_isolated(&exception.pattern)?)
+                } else {
+                    None
+                };
+                Some((regex, exception.clone()))
+            })
             .collect();
         let client_rule_regex = parts
             .client_rules
@@ -1353,9 +1457,13 @@ impl BlockEngine {
             regex_refuse,
             regex_nodata,
             regex_no_response,
+            regex_nxdomain,
             regex_rewrites,
             regex_typed,
             regex_typed_except,
+            regex_typed_allow,
+            regex_typed_allow_except,
+            rewrite_exceptions,
             client_rule_regex,
             client_rule_index,
             rpz_client_ip_nets,
@@ -1463,11 +1571,15 @@ impl BlockEngine {
             + self.parts.refuse.len()
             + self.parts.nodata.len()
             + self.parts.no_response.len()
+            + self.parts.rewrite_refuse.len()
+            + self.parts.rewrite_nodata.len()
+            + self.parts.rewrite_nxdomain.len()
             + self.parts.regex_block.len()
             + self.parts.regex_block_important.len()
             + self.parts.regex_refuse.len()
             + self.parts.regex_nodata.len()
             + self.parts.regex_no_response.len()
+            + self.parts.regex_nxdomain.len()
             + self.parts.regex_typed_block.len()
             + self.parts.regex_typed_block_except.len()
             + self
@@ -1492,10 +1604,18 @@ impl BlockEngine {
     }
 
     pub fn allow_count(&self) -> usize {
-        self.parts.allow.len()
-            + self.parts.allow_important.len()
-            + self.parts.regex_allow.len()
-            + self.parts.regex_allow_important.len()
+        let p = &self.parts;
+        p.allow.len()
+            + p.allow_important.len()
+            + p.regex_allow.len()
+            + p.regex_allow_important.len()
+            + p.typed_allow.iter().map(|(_, s)| s.len()).sum::<usize>()
+            + p.typed_allow_except
+                .iter()
+                .map(|(_, s)| s.len())
+                .sum::<usize>()
+            + p.regex_typed_allow.len()
+            + p.regex_typed_allow_except.len()
     }
 
     pub fn load_report(&self) -> &FilterLoadReport {
@@ -1671,17 +1791,19 @@ impl BlockEngine {
     /// Diagnostic path only.
     fn source_name(&self, stage: MatchStage, key: &str) -> Option<String> {
         let p = &self.parts;
-        let set = match stage {
-            MatchStage::Block => &p.block,
-            MatchStage::ImportantBlock => &p.block_important,
-            MatchStage::Allow => &p.allow,
-            MatchStage::ImportantAllow => &p.allow_important,
-            MatchStage::NoResponse => &p.no_response,
-            MatchStage::Refuse => &p.refuse,
-            MatchStage::NoData => &p.nodata,
+        let (set, rewrite_set) = match stage {
+            MatchStage::Block => (&p.block, Some(&p.rewrite_nxdomain)),
+            MatchStage::ImportantBlock => (&p.block_important, None),
+            MatchStage::Allow => (&p.allow, None),
+            MatchStage::ImportantAllow => (&p.allow_important, None),
+            MatchStage::NoResponse => (&p.no_response, None),
+            MatchStage::Refuse => (&p.refuse, Some(&p.rewrite_refuse)),
+            MatchStage::NoData => (&p.nodata, Some(&p.rewrite_nodata)),
             _ => return None,
         };
-        let id = set.source_of(key)?;
+        let id = set
+            .source_of(key)
+            .or_else(|| rewrite_set.and_then(|set| set.source_of(key)))?;
         if id == NO_SOURCE {
             return None;
         }
@@ -1796,11 +1918,13 @@ impl BlockEngine {
             return (FilterVerdict::Allow, MatchStage::ImportantAllow, Some(m));
         }
 
-        if let Some(m) = self.lookup(&p.no_response, key, count) {
-            return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
-        }
-        if let Some(m) = self.regex_no_response.find(key) {
-            return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
+        if !self.rewrite_lifted(key, |v| *v == RewriteValue::NoResponse) {
+            if let Some(m) = self.lookup(&p.no_response, key, count) {
+                return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
+            }
+            if let Some(m) = self.regex_no_response.find(key) {
+                return (FilterVerdict::Drop, MatchStage::NoResponse, Some(m));
+            }
         }
 
         if let Some(m) = self.lookup(&p.block_important, key, count) {
@@ -1825,12 +1949,21 @@ impl BlockEngine {
                 Some(m),
             );
         }
-        if let Some(m) = self.regex_refuse.find(key) {
-            return (
-                FilterVerdict::Block(BlockResponse::Refused),
-                MatchStage::Refuse,
-                Some(m),
-            );
+        if !self.rewrite_lifted(key, |v| *v == RewriteValue::Refused) {
+            if let Some(m) = self.lookup(&p.rewrite_refuse, key, count) {
+                return (
+                    FilterVerdict::Block(BlockResponse::Refused),
+                    MatchStage::Refuse,
+                    Some(m),
+                );
+            }
+            if let Some(m) = self.regex_refuse.find(key) {
+                return (
+                    FilterVerdict::Block(BlockResponse::Refused),
+                    MatchStage::Refuse,
+                    Some(m),
+                );
+            }
         }
         if let Some((zone, LocalZoneAction::Refuse)) = local_zone_of(key) {
             local_zone_hit(zone);
@@ -1848,15 +1981,27 @@ impl BlockEngine {
                 Some(m),
             );
         }
-        if let Some(m) = self.regex_nodata.find(key) {
-            return (
-                FilterVerdict::Block(BlockResponse::NoData),
-                MatchStage::NoData,
-                Some(m),
-            );
+        if !self.rewrite_lifted(key, |v| *v == RewriteValue::NoData) {
+            if let Some(m) = self.lookup(&p.rewrite_nodata, key, count) {
+                return (
+                    FilterVerdict::Block(BlockResponse::NoData),
+                    MatchStage::NoData,
+                    Some(m),
+                );
+            }
+            if let Some(m) = self.regex_nodata.find(key) {
+                return (
+                    FilterVerdict::Block(BlockResponse::NoData),
+                    MatchStage::NoData,
+                    Some(m),
+                );
+            }
         }
 
-        if let Some(t) = p.rewrites.get(key) {
+        let answer_lifted = |t: &RewriteTarget| {
+            self.rewrite_lifted(key, |v| matches!(v, RewriteValue::Answer(a) if a == t))
+        };
+        if let Some(t) = p.rewrites.get(key, answer_lifted) {
             return (FilterVerdict::Rewrite(t.clone()), MatchStage::Rewrite, None);
         }
         if let Some((zone, LocalZoneAction::Rewrite(t))) = local_zone_of(key) {
@@ -1879,7 +2024,7 @@ impl BlockEngine {
         if let Some((pattern, _, t)) = self
             .regex_rewrites
             .iter()
-            .find(|(_, re, _)| re.is_match(key))
+            .find(|(_, re, t)| re.is_match(key) && !answer_lifted(t))
         {
             return (
                 FilterVerdict::Rewrite(t.clone()),
@@ -1894,13 +2039,47 @@ impl BlockEngine {
         if let Some(m) = self.regex_allow.find(key) {
             return (FilterVerdict::Allow, MatchStage::RegexAllow, Some(m));
         }
+        for (excluded, set) in &p.typed_allow_except {
+            if !excluded.contains(&qtype) {
+                if let Some(m) = self.lookup(set, key, count) {
+                    return (FilterVerdict::Allow, MatchStage::Allow, Some(m));
+                }
+            }
+        }
+        for (t, set) in &p.typed_allow {
+            if *t == qtype {
+                if let Some(m) = self.lookup(set, key, count) {
+                    return (FilterVerdict::Allow, MatchStage::Allow, Some(m));
+                }
+            }
+        }
+        for (excluded, pattern, re) in &self.regex_typed_allow_except {
+            if !excluded.contains(&qtype) && re.is_match(key) {
+                return (FilterVerdict::Allow, MatchStage::RegexAllow, Some(pattern));
+            }
+        }
+        for (t, pattern, re) in &self.regex_typed_allow {
+            if *t == qtype && re.is_match(key) {
+                return (FilterVerdict::Allow, MatchStage::RegexAllow, Some(pattern));
+            }
+        }
 
+        let nxdomain_lifted = self.rewrite_lifted(key, |v| *v == RewriteValue::NxDomain);
         if let Some(m) = self.lookup(&p.block, key, count) {
             return (
                 FilterVerdict::Block(self.default_block),
                 MatchStage::Block,
                 Some(m),
             );
+        }
+        if !nxdomain_lifted {
+            if let Some(m) = self.lookup(&p.rewrite_nxdomain, key, count) {
+                return (
+                    FilterVerdict::Block(self.default_block),
+                    MatchStage::Block,
+                    Some(m),
+                );
+            }
         }
         if let Some((zone, LocalZoneAction::Deny)) = local_zone_of(key) {
             local_zone_hit(zone);
@@ -1916,6 +2095,15 @@ impl BlockEngine {
                 MatchStage::RegexBlock,
                 Some(m),
             );
+        }
+        if !nxdomain_lifted {
+            if let Some(m) = self.regex_nxdomain.find(key) {
+                return (
+                    FilterVerdict::Block(self.default_block),
+                    MatchStage::RegexBlock,
+                    Some(m),
+                );
+            }
         }
         for (excluded, set) in &p.typed_block_except {
             if !excluded.contains(&qtype) {
@@ -1960,6 +2148,18 @@ impl BlockEngine {
         (FilterVerdict::Allow, MatchStage::DefaultAllow, None)
     }
 
+    /// Whether an `@@` rule with `$dnsrewrite` covering `key` lifts the `$dnsrewrite` rules whose
+    /// value passes `is_value`.
+    fn rewrite_lifted(&self, key: &str, is_value: impl Fn(&RewriteValue) -> bool) -> bool {
+        self.rewrite_exceptions.iter().any(|(regex, exception)| {
+            exception.value.as_ref().is_none_or(&is_value)
+                && match regex {
+                    Some(re) => re.is_match(key),
+                    None => covers(&exception.pattern, key),
+                }
+        })
+    }
+
     #[inline]
     /// Counts the hit when `count` is set.
     fn lookup<'a>(&'a self, set: &'a DomainSet, key: &'a str, count: bool) -> Option<&'a str> {
@@ -1969,6 +2169,12 @@ impl BlockEngine {
             set.matched(key)
         }
     }
+}
+
+/// Whether the normalized `name` is `key` or a parent of it.
+fn covers(name: &str, key: &str) -> bool {
+    key.strip_suffix(name)
+        .is_some_and(|head| head.is_empty() || head.ends_with('.'))
 }
 
 fn rule_key(r: &ClientRule) -> Option<&str> {
