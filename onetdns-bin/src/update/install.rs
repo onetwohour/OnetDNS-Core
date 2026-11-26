@@ -21,6 +21,10 @@ pub(crate) const INSTALL_PATH_ENV: &str = "ONETDNS_SUPERVISOR_INSTALL_PATH";
 /// A normal record is a few hundred bytes.
 const MAX_RECORD_BYTES: u64 = 4096;
 const LOCK_RETRY: Duration = Duration::from_millis(50);
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+#[cfg(windows)]
+const RENAME_PATIENCE: Duration = Duration::from_secs(5);
 
 static LOCATED: OnceLock<Located> = OnceLock::new();
 
@@ -293,7 +297,7 @@ impl Install {
         {
             remove_if_present(&previous)?;
             std::fs::hard_link(&self.path, &previous)?;
-            std::fs::rename(self.staged(), &self.path)?;
+            rename(&self.staged(), &self.path)?;
             sync_dir(&self.dir)
         }
         #[cfg(not(unix))]
@@ -302,13 +306,13 @@ impl Install {
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     let retired = self.retired();
                     remove_if_present(&retired)?;
-                    std::fs::rename(&previous, &retired)?;
+                    rename(&previous, &retired)?;
                 }
                 removed => removed?,
             }
-            std::fs::rename(&self.path, &previous)?;
-            if let Err(error) = std::fs::rename(self.staged(), &self.path) {
-                if let Err(restore) = std::fs::rename(&previous, &self.path) {
+            rename(&self.path, &previous)?;
+            if let Err(error) = rename(&self.staged(), &self.path) {
+                if let Err(restore) = rename(&previous, &self.path) {
                     return Err(io::Error::new(
                         restore.kind(),
                         format!(
@@ -346,16 +350,16 @@ impl Install {
         let moved = (|| -> io::Result<()> {
             #[cfg(unix)]
             {
-                std::fs::rename(&previous, &self.path)?;
+                rename(&previous, &self.path)?;
                 sync_dir(&self.dir)
             }
             #[cfg(not(unix))]
             {
                 let failed = self.failed();
                 remove_if_present(&failed)?;
-                std::fs::rename(&self.path, &failed)?;
-                if let Err(error) = std::fs::rename(&previous, &self.path) {
-                    let _ = std::fs::rename(&failed, &self.path);
+                rename(&self.path, &failed)?;
+                if let Err(error) = rename(&previous, &self.path) {
+                    let _ = rename(&failed, &self.path);
                     return Err(error);
                 }
                 Ok(())
@@ -373,12 +377,12 @@ impl Install {
     /// The first step of an operator-requested rollback.
     pub(crate) fn stage_previous(&self, _lock: &UpdateLock) -> io::Result<()> {
         remove_if_present(&self.staged())?;
-        std::fs::rename(self.previous(), self.staged())
+        rename(&self.previous(), &self.staged())
     }
 
     /// For a rollback that stopped at the preflight.
     pub(crate) fn unstage_previous(&self, _lock: &UpdateLock) -> io::Result<()> {
-        std::fs::rename(self.staged(), self.previous())
+        rename(&self.staged(), &self.previous())
     }
 
     pub(crate) fn discard_staged(&self, _lock: &UpdateLock) {
@@ -468,7 +472,6 @@ fn try_lock(path: &Path) -> io::Result<Option<File>> {
 fn try_lock(path: &Path) -> io::Result<Option<File>> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    const ERROR_SHARING_VIOLATION: i32 = 32;
     match OpenOptions::new()
         .read(true)
         .write(true)
@@ -480,6 +483,30 @@ fn try_lock(path: &Path) -> io::Result<Option<File>> {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Windows refuses to rename a file another process holds open without delete sharing, as a virus
+/// scanner does for a moment after an executable is written or started.
+fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + RENAME_PATIENCE;
+        loop {
+            match std::fs::rename(from, to) {
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(LOCK_RETRY)
+                }
+                renamed => return renamed,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
     }
 }
 
@@ -679,6 +706,39 @@ mod tests {
         let deleted = Install::at(PathBuf::from("/usr/local/bin/OnetDNS (deleted)"));
         assert_eq!(deleted.is_err(), cfg!(target_os = "linux"));
         assert!(Install::at(PathBuf::from("OnetDNS")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_waits_while_another_handle_refuses_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let scratch = Scratch::new("rename-busy");
+        let (from, to) = (
+            scratch.0.join("OnetDNS.exe"),
+            scratch.0.join("OnetDNS.failed.exe"),
+        );
+        std::fs::write(&from, b"image").expect("파일 쓰기");
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&from)
+            .expect("공유 없이 열기");
+        assert_eq!(
+            std::fs::rename(&from, &to)
+                .err()
+                .and_then(|error| error.raw_os_error()),
+            Some(ERROR_SHARING_VIOLATION),
+            "공유 없이 연 파일의 이름이 바뀌어 재시도를 확인할 수 없습니다"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        rename(&from, &to).expect("핸들이 닫힌 뒤의 이름 바꾸기");
+        release.join().expect("핸들을 닫는 스레드");
+        assert!(!from.exists() && to.exists());
     }
 
     #[test]
