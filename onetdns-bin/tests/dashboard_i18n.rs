@@ -57,6 +57,7 @@ const RENDER_DATA_LITERALS: &[(&str, &str)] = &[
     ("label", "전송"),
     ("label", "응답 서버"),
     ("label", "처리시간"),
+    ("label", "재작성 응답"),
     ("label", "응답"),
 ];
 

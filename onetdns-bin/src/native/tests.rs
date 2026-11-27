@@ -4674,6 +4674,29 @@ fn filter_noresponse_answers_nothing_and_logs_the_drop() {
 }
 
 #[test]
+/// A query of a type the rule has no records for gets none, so only the detail shows the target.
+fn rewrite_log_names_the_rule_target() {
+    let (recorder, stats) = querylog_recorder();
+    let s = server("||rw.test^$dnsrewrite=192.0.2.7\n").with_recorder(Some(recorder));
+    s.handle(&q("a.rw.test"), &ctx()).unwrap();
+    let aaaa = Message::query(
+        0x1234,
+        ApName::from_str("aaaa.rw.test").unwrap(),
+        RecordType::AAAA,
+    );
+    let response = s.handle(&aaaa, &ctx()).unwrap();
+    assert_eq!(response.header.rcode, ResponseCode::NoError.0);
+    assert!(response.answers.is_empty());
+
+    for (name, answers) in [("a.rw.test.", "A 192.0.2.7"), ("aaaa.rw.test.", "")] {
+        let event = wait_for_event(&stats, name);
+        assert_eq!(event.action, "rewritten", "{name}");
+        assert_eq!(event.answers, answers, "{name}");
+        assert_eq!(event.detail, "A 192.0.2.7", "{name}");
+    }
+}
+
+#[test]
 /// Answering after the alias would let one alias extract an answer for a name meant to get none.
 fn cname_to_a_noresponse_name_answers_nothing() {
     let with_rules = |rules: &str| {

@@ -6733,7 +6733,8 @@ class Component extends DCLogic {
     stages.push({label:'전송',val:ev.transportLabel||ev.transport||'unknown'});
     if(ev.upstream) stages.push({label:'응답 서버',val:this.t(ev.upstream)});
     if(ev.latencyUs>0) stages.push({label:'처리시간',val:ev.latency});
-    if(ev.answers) stages.push({label:'응답',val:ev.answers});
+    if(key==='rewritten'&&ev.detail&&ev.detail!==ev.answers) stages.push({label:'재작성 응답',val:ev.detail});
+    if(ev.answers||key==='rewritten') stages.push({label:'응답',val:ev.answers||'없음'});
     this._lastOverlayTrigger=typeof document!=='undefined'?document.activeElement:null;
     const qname=ev.name,qtype=ev.qtype;
     this.setState({drawer:{qname,qtype,client:ev.ip||ev.client,decision:key,decisionLabel:a.label,decisionColor:a.c,rcode,stages}});

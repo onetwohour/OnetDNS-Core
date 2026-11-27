@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use onetdns_control::Action;
+use onetdns_control::{Action, EventDiag};
 use onetdns_core::{BlockResponse, ClientInfo, FilterEngine, FilterVerdict, IpNet, RewriteTarget};
 use onetdns_filter::BlockEngine;
 use onetdns_proto::{
@@ -20,12 +20,14 @@ use crate::native::{NativeFeatures, NativeServer};
 use crate::wirecache::ScannedQuery;
 
 impl NativeServer {
-    /// Logs a rewritten answer.
+    /// Logs a rewritten answer, with the rule's target as the detail: a query of another type gets
+    /// no records, and the log would not show what the rule answers with.
     pub(crate) fn rec_rewrite_response<'r>(
         &self,
         client: &ClientInfo,
         name: &ApName,
         qtype: ApRt,
+        target: &RewriteTarget,
         response: &Message,
         rule: impl Into<RuleMatch<'r>>,
     ) {
@@ -41,17 +43,25 @@ impl NativeServer {
             );
         } else if rcode == ResponseCode::Refused {
             self.rec_rc(client, Action::Refused, Some(name), Some(qtype), rcode);
-        } else {
-            let answers = answers_summary(&response.answers);
-            self.rec_rc_diag(
-                client,
+        } else if let Some(recorder) = self.events() {
+            let (log, stat) = self.filter.load().client_log_stat(client);
+            let rule = rule.into();
+            recorder.record_detailed(
+                client.transport,
                 Action::Rewritten,
+                client.source_ip,
                 Some(name),
                 Some(qtype),
-                rcode,
-                &answers,
-                "",
-                rule,
+                log,
+                stat,
+                EventDiag {
+                    rcode: &rcode_str(rcode),
+                    detail: &rewrite_target_summary(target),
+                    answers: &answers_summary(&response.answers),
+                    rule: rule.rule,
+                    list: rule.list,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -125,16 +135,16 @@ impl NativeServer {
         request: &Message,
         qname: &ApName,
         qtype: ApRt,
-        target: RewriteTarget,
+        target: &RewriteTarget,
         client: &ClientInfo,
     ) -> Message {
         let ttl = self.local_ttl.load(Ordering::Acquire);
         match target {
             RewriteTarget::Records(rdatas) => {
                 let recs: Vec<ApRecord> = rdatas
-                    .into_iter()
+                    .iter()
                     .filter(|rd| rd.record_type() == qtype)
-                    .map(|rd| ApRecord::new(qname.clone(), ttl, rd))
+                    .map(|rd| ApRecord::new(qname.clone(), ttl, rd.clone()))
                     .collect();
                 records_resp(request, recs)
             }
@@ -452,22 +462,35 @@ pub(crate) fn is_delegation_referral(response: &Message) -> bool {
 
 /// For the query log.
 pub(crate) fn answers_summary(answers: &[ApRecord]) -> String {
+    rdata_summary(answers.iter().map(|record| (record.rtype, &record.rdata)))
+}
+
+fn rewrite_target_summary(target: &RewriteTarget) -> String {
+    match target {
+        RewriteTarget::Records(rdatas) => {
+            rdata_summary(rdatas.iter().map(|rdata| (rdata.record_type(), rdata)))
+        }
+        RewriteTarget::Cname(name) => format!("CNAME {}", name.to_ascii_lower()),
+    }
+}
+
+fn rdata_summary<'a>(records: impl ExactSizeIterator<Item = (ApRt, &'a ApRData)>) -> String {
     /// Most entries the summary lists.
     const MAX: usize = 5;
-    let mut parts: Vec<String> = answers
-        .iter()
+    let total = records.len();
+    let mut parts: Vec<String> = records
         .take(MAX)
-        .map(|record| {
-            let value = rdata_brief(&record.rdata);
+        .map(|(rtype, rdata)| {
+            let value = rdata_brief(rdata);
             if value.is_empty() {
-                record.rtype.name().to_string()
+                rtype.name().to_string()
             } else {
-                format!("{} {value}", record.rtype.name())
+                format!("{} {value}", rtype.name())
             }
         })
         .collect();
-    if answers.len() > MAX {
-        parts.push(format!("+{} more", answers.len() - MAX));
+    if total > MAX {
+        parts.push(format!("+{} more", total - MAX));
     }
     parts.join(" · ")
 }

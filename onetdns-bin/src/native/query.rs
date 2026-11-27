@@ -542,14 +542,17 @@ impl NativeServer {
                         ));
                     }
                     onetdns_policy::Action::Rewrite(ip) => {
-                        let response = self.rewrite_resp(
-                            request,
+                        let target = RewriteTarget::ip(ip.into());
+                        let response =
+                            self.rewrite_resp(request, qname, qtype, &target, &scope.client);
+                        self.rec_rewrite_response(
+                            &scope.client,
                             qname,
                             qtype,
-                            RewriteTarget::ip(ip.into()),
-                            &scope.client,
+                            &target,
+                            &response,
+                            "policy",
                         );
-                        self.rec_rewrite_response(&scope.client, qname, qtype, &response, "policy");
                         return ControlFlow::Break(scope.reply(response, None));
                     }
                 }
@@ -590,11 +593,12 @@ impl NativeServer {
                 }
                 FilterVerdict::Rewrite(target) => {
                     let rule = FilterRuleLabel::new(stage, matched, source);
-                    let response = self.rewrite_resp(request, qname, qtype, target, &scope.client);
+                    let response = self.rewrite_resp(request, qname, qtype, &target, &scope.client);
                     self.rec_rewrite_response(
                         &scope.client,
                         qname,
                         qtype,
+                        &target,
                         &response,
                         rule.as_match(),
                     );
@@ -960,8 +964,8 @@ impl NativeServer {
                     return ControlFlow::Break(None);
                 }
                 FilterVerdict::Rewrite(t) => {
-                    let response = self.rewrite_resp(request, qname, qtype, t, &scope.client);
-                    self.rec_rewrite_response(&scope.client, qname, qtype, &response, "rpz-ip");
+                    let response = self.rewrite_resp(request, qname, qtype, &t, &scope.client);
+                    self.rec_rewrite_response(&scope.client, qname, qtype, &t, &response, "rpz-ip");
                     return ControlFlow::Break(scope.reply(response, None));
                 }
             }
