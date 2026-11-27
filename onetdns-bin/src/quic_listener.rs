@@ -15,6 +15,7 @@ use onetdns_core::tcp::DRAIN_LIMIT;
 use onetdns_core::udp::RecvWait;
 use onetdns_proto::Message;
 use onetdns_quic::params::TransportParams;
+use onetdns_quic::reset::ResetKey;
 use onetdns_quic::retry::{build_retry, parse_initial_header, RetryKey};
 use onetdns_quic::{packet, ClosePeriod, Connection, H3Connection, QuicDiagnostic, QuicError};
 use onetdns_tls::ServerConfig;
@@ -275,6 +276,7 @@ pub(crate) fn serve<S: QuicService>(
     handler: Arc<NativeServer>,
     shutdown: Arc<AtomicBool>,
     memory_budget: Arc<QuicMemoryBudget>,
+    reset_key: ResetKey,
 ) -> io::Result<QuicListener> {
     let kept = socket.try_clone()?;
     let bound = socket.local_addr()?;
@@ -304,6 +306,7 @@ pub(crate) fn serve<S: QuicService>(
                 table: ConnTable::new(),
                 base_tp: TransportParams::server_defaults(),
                 retry_key: RetryKey::generate(),
+                reset_key,
                 next_epoch: 0,
                 clock: Instant::now(),
                 draining_until: None,
@@ -610,9 +613,9 @@ impl<S: QuicService> ConnTable<S> {
     }
 
     /// Sends a close on every open connection and drops them all without waiting out the closing
-    /// period. RFC 9000 allows that when late packets draw no reply, and a non-Initial packet for
-    /// an unknown connection gets none. Without the close, clients would wait for their idle
-    /// timeout.
+    /// period. A late packet then draws a stateless reset from the next listener instead of the
+    /// close again; both tell the client the connection is gone. Without the close, clients would
+    /// wait for their idle timeout.
     fn close_all(&mut self, socket: &UdpSocket, now_ms: u64) {
         for entry in self.conns.values_mut() {
             if let ConnState::Open(conn) = &mut entry.state {
@@ -639,6 +642,7 @@ struct Listener<S: QuicService> {
     /// Transport parameters every new connection starts from.
     base_tp: TransportParams,
     retry_key: RetryKey,
+    reset_key: ResetKey,
     next_epoch: u64,
     /// Origin of the connection clock.
     clock: Instant,
@@ -858,6 +862,22 @@ impl<S: QuicService> Listener<S> {
                 Some(peer),
                 "non-initial packet for unknown connection",
             );
+            // A short header packet comes from a client that still has the connection, for example
+            // one this server had before it restarted.
+            let short_header = bytes.first().is_some_and(|first| first & 0x80 == 0);
+            if let Some(reset) = short_header
+                .then(|| self.reset_key.reset_for(&dcid, bytes.len()))
+                .flatten()
+            {
+                if let Err(error) = self.socket.send_to(&reset, peer) {
+                    transport_observe::record_error(
+                        S::NAME,
+                        "send_stateless_reset",
+                        Some(peer),
+                        error,
+                    );
+                }
+            }
             return None;
         }
         let client_has_room = self.table.clients.allows(peer.ip());
@@ -912,6 +932,7 @@ impl<S: QuicService> Listener<S> {
         let mut transport = self.base_tp.clone();
         transport.original_destination_connection_id = Some(original_dcid);
         transport.retry_source_connection_id = Some(local_cid.clone());
+        transport.stateless_reset_token = Some(self.reset_key.token(&local_cid));
         let conn = Connection::new_server(self.tls.load(), local_cid.clone(), transport);
         self.table.insert(
             dcid,
@@ -1101,6 +1122,7 @@ mod tests {
             table,
             base_tp: TransportParams::server_defaults(),
             retry_key: RetryKey::generate(),
+            reset_key: ResetKey::generate(),
             next_epoch: 0,
             clock: Instant::now(),
             draining_until: None,
@@ -1361,6 +1383,65 @@ mod tests {
             received_close(&client_socket, &mut client),
             Some((0x1, None)),
             "늦게 온 패킷에 종료를 다시 알리지 않았습니다"
+        );
+    }
+
+    /// Delivers what `client` sends to `listener` and what comes back on `socket` to `client`.
+    fn exchange_once<S: QuicService>(
+        client: &mut Connection,
+        listener: &mut Listener<S>,
+        socket: &UdpSocket,
+        wait: &RecvWait,
+    ) {
+        let peer = socket.local_addr().unwrap();
+        while let Some(datagram) = client.next_datagram() {
+            listener.on_datagram(&datagram, peer, &mut None);
+        }
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = wait.recv_from(socket, &mut buf) {
+            let _ = client.recv_datagram(&buf[..n]);
+        }
+    }
+
+    #[test]
+    /// A client of a connection from before a restart learns at once that it is gone, instead of
+    /// waiting for its idle timeout. A reset made with another key is not accepted.
+    fn restarted_listener_resets_a_connection_it_does_not_have() {
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let wait = RecvWait::new(Duration::from_millis(50));
+        wait.install(&client_socket).unwrap();
+        let key = ResetKey::generate();
+        let mut before = listener_with(Probe::default(), ConnTable::new());
+        before.reset_key = key.clone();
+        let mut client = client_connection(b"doq");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_handshake_complete() && Instant::now() < deadline {
+            exchange_once(&mut client, &mut before, &client_socket, &wait);
+        }
+        assert!(
+            client.is_handshake_complete(),
+            "리스너와 핸드셰이크하지 못했습니다"
+        );
+        drop(before);
+
+        let query = Message::query(0, Name::from_str("restart.test").unwrap(), RecordType::A)
+            .try_encode()
+            .unwrap();
+        let mut other_key = listener_with(Probe::default(), ConnTable::new());
+        client.send_dns_message(0, &query).unwrap();
+        exchange_once(&mut client, &mut other_key, &client_socket, &wait);
+        assert!(
+            !client.reset_received() && !client.is_closed(),
+            "다른 키로 만든 reset 을 받아들였습니다"
+        );
+
+        let mut after = listener_with(Probe::default(), ConnTable::new());
+        after.reset_key = key;
+        client.send_dns_message(4, &query).unwrap();
+        exchange_once(&mut client, &mut after, &client_socket, &wait);
+        assert!(
+            client.reset_received() && client.is_closed(),
+            "다시 시작한 리스너가 모르는 연결을 reset 하지 않았습니다"
         );
     }
 

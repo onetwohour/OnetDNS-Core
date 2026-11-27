@@ -193,6 +193,30 @@ fn doh_listener_variant(cfg: &Config) -> String {
     variant
 }
 
+/// Kept in `quic-reset.key` next to the config, so a restarted server can still reset connections
+/// it had before. Without the file, only connections of this process can be reset.
+fn load_quic_reset_key(config_path: Option<&std::path::Path>) -> onetdns_quic::reset::ResetKey {
+    let Some(path) = config_path
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join("quic-reset.key"))
+    else {
+        return onetdns_quic::reset::ResetKey::generate();
+    };
+    let reason = match load_or_create_key_seed(&path) {
+        Ok(seed) => return onetdns_quic::reset::ResetKey::new(*seed),
+        Err(KeyFileError::Corrupt) => {
+            "the file is corrupted; delete it to make a new key".to_string()
+        }
+        Err(KeyFileError::Read(error) | KeyFileError::Write(error)) => error.to_string(),
+    };
+    onetdns_core::warn!(event = "quic.reset_key_unavailable",
+        path = %path.display(),
+        %reason,
+        "Could not keep the QUIC stateless reset key; after a restart, DoQ and DoH3 clients wait for their idle timeout"
+    );
+    onetdns_quic::reset::ResetKey::generate()
+}
+
 fn encrypted_listener_key(kind: &str, addr: &SocketAddr, variant: &str) -> String {
     format!("{kind}|{addr}|{variant}")
 }
@@ -497,6 +521,8 @@ pub(crate) struct ListenerSet {
     doh3: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     /// Shared by DoQ and DoH3 connections on every address.
     quic_memory: Arc<quic_memory::QuicMemoryBudget>,
+    /// Read when the first QUIC listener opens.
+    quic_reset: std::sync::OnceLock<onetdns_quic::reset::ResetKey>,
     /// Admission shared by DoH, DoT, and DNSCrypt TCP connections on every address.
     encrypted_tcp_admission: Arc<connection_limit::ConnectionLimiter>,
     dnscrypt: Mutex<Vec<DnscryptListener>>,
@@ -1029,6 +1055,11 @@ fn reconcile_encrypted(
                 .map_err(|error| listener_open_error("DoH", addr, &error))
         });
     }
+    let quic_reset = || {
+        set.quic_reset
+            .get_or_init(|| load_quic_reset_key(config_path))
+            .clone()
+    };
     if !cfg.listen_doq.is_empty() || !set.doq.lock_recover().is_empty() {
         let tls_cfg = need(|s| s.doq.clone())?;
         sync_one!(doq, cfg.listen_doq, "doq", |addr| quic_socket(
@@ -1041,7 +1072,8 @@ fn reconcile_encrypted(
             tls_cfg.clone(),
             handler.clone(),
             shutdown.clone(),
-            set.quic_memory.clone()
+            set.quic_memory.clone(),
+            quic_reset()
         ))
         .map_err(|error| listener_open_error("DoQ", addr, &error)));
     }
@@ -1058,7 +1090,8 @@ fn reconcile_encrypted(
             handler.clone(),
             cfg.doh_path.clone(),
             shutdown.clone(),
-            set.quic_memory.clone()
+            set.quic_memory.clone(),
+            quic_reset()
         ))
         .map_err(|error| listener_open_error("DoH3", addr, &error)));
     }
@@ -1861,6 +1894,40 @@ pub(crate) mod tests {
             panic!("a corrupt key file must not be replaced");
         };
         assert!(corrupt.contains("corrupted"), "{corrupt}");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not hex");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    /// A damaged file costs only the resets after a restart, so QUIC still starts; the file is
+    /// left for the operator.
+    fn quic_reset_key_survives_restart_and_a_bad_file_is_kept() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "onetdns-quic-reset-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config_path = dir.join(CONFIG_FILE_NAME);
+
+        let first = load_quic_reset_key(Some(&config_path)).token(b"SERVERID");
+        let key_path = dir.join("quic-reset.key");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap().len(), 64);
+        assert_eq!(
+            load_quic_reset_key(Some(&config_path)).token(b"SERVERID"),
+            first
+        );
+        assert_ne!(load_quic_reset_key(None).token(b"SERVERID"), first);
+
+        std::fs::write(&key_path, "not hex").unwrap();
+        assert_ne!(
+            load_quic_reset_key(Some(&config_path)).token(b"SERVERID"),
+            first
+        );
         assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not hex");
 
         std::fs::remove_dir_all(dir).unwrap();

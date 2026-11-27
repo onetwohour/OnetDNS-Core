@@ -10,6 +10,7 @@ pub mod packet;
 pub mod params;
 pub mod protect;
 pub mod qpack;
+pub mod reset;
 pub mod retry;
 pub mod varint;
 

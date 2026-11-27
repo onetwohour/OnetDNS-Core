@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use onetdns_proto::Message;
+use onetdns_quic::reset::ResetKey;
 use onetdns_quic::{doq, Connection, QuicError};
 use onetdns_runtime::Transport as RtTransport;
 use onetdns_tls::ServerConfig;
@@ -24,8 +25,17 @@ pub fn serve_doq(
     handler: Arc<NativeServer>,
     shutdown: Arc<AtomicBool>,
     memory_budget: Arc<QuicMemoryBudget>,
+    reset_key: ResetKey,
 ) -> io::Result<QuicListener> {
-    quic_listener::serve(Doq, socket, tls, handler, shutdown, memory_budget)
+    quic_listener::serve(
+        Doq,
+        socket,
+        tls,
+        handler,
+        shutdown,
+        memory_budget,
+        reset_key,
+    )
 }
 
 /// The reason to close the connection with DOQ_PROTOCOL_ERROR, or None. RFC 9250 makes a non-zero
@@ -223,6 +233,7 @@ mod tests {
             native_handler(),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let started = Instant::now();
@@ -325,6 +336,7 @@ mod tests {
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doq_query(l.addr(), "allowed.test", RecordType::A);
@@ -344,6 +356,7 @@ mod tests {
             native_handler_with(acl),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let cfg = ClientConfig {
@@ -404,6 +417,7 @@ mod tests {
             native_handler(),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
 
@@ -467,6 +481,7 @@ mod tests {
             ),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let server = listener.addr();
@@ -565,6 +580,7 @@ mod tests {
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doq_query(l.addr(), "blocked.test", RecordType::A);
@@ -581,6 +597,7 @@ mod tests {
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doq_query_with_blackout(
@@ -603,6 +620,7 @@ mod tests {
             native_handler(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doq_query_with_blackout(

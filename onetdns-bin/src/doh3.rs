@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use onetdns_proto::Message;
+use onetdns_quic::reset::ResetKey;
 use onetdns_quic::{H3Connection, H3Error, QuicError};
 use onetdns_runtime::Transport as RtTransport;
 use onetdns_tls::ServerConfig;
@@ -25,6 +26,7 @@ pub fn serve_doh3(
     doh_path: String,
     shutdown: Arc<AtomicBool>,
     memory_budget: Arc<QuicMemoryBudget>,
+    reset_key: ResetKey,
 ) -> io::Result<QuicListener> {
     quic_listener::serve(
         Doh3 { doh_path },
@@ -33,6 +35,7 @@ pub fn serve_doh3(
         handler,
         shutdown,
         memory_budget,
+        reset_key,
     )
 }
 
@@ -236,6 +239,7 @@ mod tests {
             "/dns-query".to_string(),
             Arc::new(AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let started = Instant::now();
@@ -325,6 +329,7 @@ mod tests {
             "/dns-query".into(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doh3_query(l.addr(), "allowed.test", RecordType::A);
@@ -345,6 +350,7 @@ mod tests {
             "/dns-query".into(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_budget(),
+            ResetKey::generate(),
         )
         .unwrap();
         let resp = doh3_query(l.addr(), "blocked.test", RecordType::A);

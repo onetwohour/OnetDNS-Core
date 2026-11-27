@@ -37,6 +37,8 @@ The TLS versions, cipher suites and key exchanges, including the X25519MLKEM768 
 
 Use only addresses assigned to the machine. The process must be able to read the certificate/key files. Binding TCP 443 and UDP 443 simultaneously is possible; they are different sockets. The same is true of TCP/UDP 853 for DoT and DoQ.
 
+DoQ and DoH3 keep a key in `quic-reset.key` next to the configuration file, created on first use. After a restart, it lets OnetDNS tell clients that their earlier connections are gone, so they reconnect at once instead of waiting for their idle timeout. If the file is damaged, OnetDNS logs a warning and leaves it in place; delete it to make a new key.
+
 ### ACME or a self-signed certificate
 
 The dashboard supports ACME issuance/renewal and a self-signed option. ACME challenge types have distinct prerequisites: HTTP-01 needs the relevant HTTP challenge route reachable on port 80; DNS-01 needs the necessary DNS challenge records or delegation. Self-signed certificates require explicit trust on devices. ACME configuration controls certificate issuance, not what DNS names the server blocks.
