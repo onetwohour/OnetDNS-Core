@@ -359,6 +359,131 @@ def check_cleared_fields_remove_their_key(source: str) -> None:
         )
 
 
+def check_integer_arrays_are_sent_as_numbers(source: str) -> None:
+    """Lines of an array the schema marks `items: "int"` must be staged as numbers.
+
+    The editor reads every array as lines of text. A port list staged as strings is
+    saved as ["443"], which the server rejects as not an integer.
+    """
+    handlers = {}
+    for name in ("schemaSetArr", "schemaCommitArr"):
+        match = re.search(r"\n  " + name + r"=(\(.*?\};)\n", source)
+        if not match:
+            fail(name + " not found; the integer array check cannot run")
+        handlers[name] = match.group(1).rstrip(";")
+    if "this.schemaCommitArr(fd.key,ints)" not in source or "fd.items==='int'" not in source:
+        fail("the settings editor no longer passes the schema's items to the array handlers")
+
+    calls = [
+        ("schemaCommitArr", "ports", True, "443\n 5443 \n"),
+        ("schemaCommitArr", "rules", False, "443\n"),
+        ("schemaSetArr", "ports", True, "443\n"),
+        ("schemaCommitArr", "ports", True, "443\nabc"),
+    ]
+    harness = (
+        "const staged = [];" + chr(10)
+        + "const self = { stageConfig(obj) { staged.push(obj); }, toastMsg(text) { staged.push({ toast: text }); } };" + chr(10)
+        + "const h = (function () { return {" + chr(10)
+        + "  schemaSetArr: " + handlers["schemaSetArr"] + "," + chr(10)
+        + "  schemaCommitArr: " + handlers["schemaCommitArr"] + "," + chr(10)
+        + "}; }).call(self);" + chr(10)
+        + "".join(
+            "h." + name + "(" + json.dumps(key) + ", " + ("true" if ints else "false") + ")"
+            + "({ target: { value: " + json.dumps(text) + " } });" + chr(10)
+            for name, key, ints, text in calls
+        )
+        + "process.stdout.write(JSON.stringify(staged));" + chr(10)
+    )
+    with tempfile.TemporaryDirectory(prefix="onetdns-intarray-") as td:
+        script = Path(td) / "intarray.js"
+        script.write_text(harness, encoding="utf-8")
+        got = json.loads(
+            subprocess.check_output(["node", str(script)], text=True, encoding="utf-8")
+        )
+
+    want = [
+        {"ports": [443, 5443]},
+        {"rules": ["443"]},
+        {"ports": [443, ""]},
+        {"toast": "정수를 입력하세요"},
+    ]
+    if got != want:
+        fail(
+            "array settings stage the wrong values: got "
+            + json.dumps(got, ensure_ascii=False)
+            + ", want "
+            + json.dumps(want, ensure_ascii=False)
+            + ". Integer arrays must stage numbers and refuse lines that are not integers;"
+            " other arrays keep their lines as strings."
+        )
+
+
+def check_cluster_proposals_follow_the_schema(source: str) -> None:
+    """The cluster sync form must type each value by the schema, not by how the text looks.
+
+    A string setting written as digits is still a string, and a list is sent as one; a value of
+    the wrong type is refused by the server and the proposal fails.
+    """
+    match = re.search(r"\n  clusterPropose=(\(\)=>\{.*?\};)\n  onForm=", source, re.S)
+    if not match:
+        fail("clusterPropose not found; the cluster proposal check cannot run")
+    handler = match.group(1).rstrip(";")
+
+    schema = [
+        {"key": "prefetch", "kind": "bool"},
+        {"key": "cache_size", "kind": "int"},
+        {"key": "version", "kind": "string"},
+        {"key": "ports", "kind": "array", "items": "int"},
+        {"key": "bootstrap", "kind": "array", "items": ""},
+    ]
+    calls = [
+        ("prefetch", "true"),
+        ("cache_size", "16384"),
+        ("cache_size", "abc"),
+        ("version", "1"),
+        ("ports", "443, 5443"),
+        ("bootstrap", "1.1.1.1, 8.8.8.8"),
+    ]
+    harness = (
+        "const sent = [];" + chr(10)
+        + "const self = {" + chr(10)
+        + "  state: { cluster: { self: { role: 'leader' } }, authRole: 'admin', forms: {}, schema: "
+        + json.dumps(schema) + " }," + chr(10)
+        + "  apiSend(path, method, body) { sent.push(body.patch); return Promise.resolve({ ok: true, body: { index: 1 } }); }," + chr(10)
+        + "  toastMsg(text, error) { if (error) sent.push({ toast: text }); }," + chr(10)
+        + "  tr() { return ''; }, t(text) { return text; }, errorText() { return ''; }," + chr(10)
+        + "};" + chr(10)
+        + "const propose = (function () { return " + handler + "; }).call(self);" + chr(10)
+        + "".join(
+            "self.state.forms = { cpKey: " + json.dumps(key) + ", cpVal: " + json.dumps(value) + " }; propose();" + chr(10)
+            for key, value in calls
+        )
+        + "setTimeout(() => process.stdout.write(JSON.stringify(sent)), 0);" + chr(10)
+    )
+    with tempfile.TemporaryDirectory(prefix="onetdns-propose-") as td:
+        script = Path(td) / "propose.js"
+        script.write_text(harness, encoding="utf-8")
+        got = json.loads(
+            subprocess.check_output(["node", str(script)], text=True, encoding="utf-8")
+        )
+
+    want = [
+        {"prefetch": True},
+        {"cache_size": 16384},
+        {"toast": "정수를 입력하세요"},
+        {"version": "1"},
+        {"ports": [443, 5443]},
+        {"bootstrap": ["1.1.1.1", "8.8.8.8"]},
+    ]
+    if got != want:
+        fail(
+            "the cluster sync form sends the wrong values: got "
+            + json.dumps(got, ensure_ascii=False)
+            + ", want "
+            + json.dumps(want, ensure_ascii=False)
+        )
+
+
 def check_restart_verdict_is_confirmed(source: str) -> None:
     """Every way of applying settings must confirm whenever the server says it restarts.
 
@@ -982,6 +1107,8 @@ def main() -> None:
     check_chart_axis_labels_are_evenly_spaced(source)
     check_live_chart_buckets_are_time_anchored(source)
     check_cleared_fields_remove_their_key(source)
+    check_integer_arrays_are_sent_as_numbers(source)
+    check_cluster_proposals_follow_the_schema(source)
     check_restart_verdict_is_confirmed(source)
     check_writes_show_first_and_undo_on_failure(source)
     check_toast_is_never_painted_behind_an_overlay(source)

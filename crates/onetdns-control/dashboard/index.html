@@ -887,7 +887,7 @@
           <div class="od-note">설정 키 하나를 리더 노드에서 모든 노드에 적용합니다. 다른 화면에서 바꾼 설정도 자동으로 모든 노드에 적용됩니다.</div>
           <div class="od-band" data-mform="" style="border-bottom:0">
             <input class="od-input od-mono" aria-label="동기화할 설정 항목" data-k="cpKey" value="{{ forms.cpKey }}" onInput="{{ onForm }}" placeholder="설정 키 (예: prefetch)" style="flex:1 1 200px">
-            <input class="od-input od-mono" aria-label="적용할 설정 값" data-k="cpVal" value="{{ forms.cpVal }}" onInput="{{ onForm }}" placeholder="값 (예: true / 16384)" style="flex:2 1 200px">
+            <input class="od-input od-mono" aria-label="적용할 설정 값" data-k="cpVal" value="{{ forms.cpVal }}" onInput="{{ onForm }}" placeholder="값 (예: true / 16384 / a, b)" style="flex:2 1 200px">
             <button onClick="{{ clusterPropose }}" disabled="{{ !clusterCanPropose }}" aria-disabled="{{ !clusterCanPropose }}" style="{{ clusterProposeStyle }}">설정 동기화 요청</button>
           </div>
         </section>
@@ -1531,7 +1531,7 @@ Object.assign(I18N.en, {
   "example.org  ·  한 줄에 하나": "example.org · one per line",
   "호스트명 (선택)": "Hostname (optional)",
   "설정 키 (예: prefetch)": "Configuration key (for example, prefetch)",
-  "값 (예: true / 16384)": "Value (for example, true / 16384)",
+  "값 (예: true / 16384 / a, b)": "Value (for example, true / 16384 / a, b)",
   "설정 검색…": "Search settings…",
   "(미설정)": "(not configured)",
   "(변경할 때만 입력)": "(enter only when changing it)",
@@ -1758,7 +1758,7 @@ Object.assign(I18N.ja, {
   "example.org  ·  한 줄에 하나": "example.org ・ 1 行に 1 件",
   "호스트명 (선택)": "ホスト名（任意）",
   "설정 키 (예: prefetch)": "設定キー（例: prefetch）",
-  "값 (예: true / 16384)": "値（例: true / 16384）",
+  "값 (예: true / 16384 / a, b)": "値（例: true / 16384 / a, b）",
   "설정 검색…": "設定を検索…",
   "(미설정)": "（未設定）",
   "(변경할 때만 입력)": "（変更時のみ入力）",
@@ -3614,7 +3614,7 @@ Object.assign(I18N.zh, {
   "example.org  ·  한 줄에 하나":"example.org · 每行一个",
   "호스트명 (선택)":"主机名（可选）",
   "설정 키 (예: prefetch)":"设置键（例如 prefetch）",
-  "값 (예: true / 16384)":"值（例如 true / 16384）",
+  "값 (예: true / 16384 / a, b)":"值（例如 true / 16384 / a, b）",
   "설정 검색…":"搜索设置…",
   "(미설정)":"（未设置）",
   "(변경할 때만 입력)":"（仅在更改时输入）",
@@ -6443,8 +6443,8 @@ class Component extends DCLogic {
    */
   schemaSetStr=(fd)=>(e)=>{const v=e.target.value;this.stageConfig({[fd.key]:v===''&&fd.nullable===true?null:v});};
   schemaCommitStr=(key)=>(e)=>{if(e.target.value!=='')this.stageConfig({[key]:e.target.value});};
-  schemaSetArr=(key)=>(e)=>{this.stageConfig({[key]:e.target.value.split(String.fromCharCode(10))});};
-  schemaCommitArr=(key)=>(e)=>{this.stageConfig({[key]:e.target.value.split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean)});};
+  schemaSetArr=(key,ints)=>(e)=>{this.stageConfig({[key]:e.target.value.split(String.fromCharCode(10)).map(x=>ints&&/^\d+$/.test(x)?Number(x):x)});};
+  schemaCommitArr=(key,ints)=>(e)=>{const lines=e.target.value.split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean);if(!ints)return this.stageConfig({[key]:lines});const nums=lines.map(Number);if(!nums.every(Number.isSafeInteger))return this.toastMsg('정수를 입력하세요',true);this.stageConfig({[key]:nums});};
   schemaCommit(key,value){this.stageConfig({[key]:value});return Promise.resolve(true);}
   schemaSetEnum=(key)=>(e)=>{const v=e.target.value;this.stageConfig({[key]:v});};
   setSplitDefault=(v)=>()=>{this.stageConfig({split_default:v});};
@@ -6553,7 +6553,7 @@ class Component extends DCLogic {
         if(secret)row.help=help+' '+this.t('기존 비밀값은 표시하지 않습니다. 변경할 때만 새 값을 입력하세요.');
       }
       else if(fd.kind==='enum'){ const opts=Array.isArray(fd.enum_values)?fd.enum_values:String(fd.meta||'').split('|').filter(Boolean); const cv=norm(cur); const sel=(opts.find(o=>norm(o)===cv)||opts[0]||''); row.dd=this.mkDropdown('cfgenum_'+fd.key,sel,opts.map(o=>[o,this.enumText(fd,o)]),(v)=>{this.setCfgRaw(fd.key,v);this.cfgQueue({[fd.key]:v});}); }
-      else if(fd.kind==='array'&&editable){row.value=(Array.isArray(cur)?cur.join(String.fromCharCode(10)):'');row.onInput=this.schemaSetArr(fd.key);row.onBlur=this.schemaCommitArr(fd.key);}else if(fd.kind==='table'||!editable){row.readonlyValue=this.t('여기서는 바꿀 수 없습니다');}
+      else if(fd.kind==='array'&&editable){row.value=(Array.isArray(cur)?cur.join(String.fromCharCode(10)):'');const ints=fd.items==='int';row.onInput=this.schemaSetArr(fd.key,ints);row.onBlur=this.schemaCommitArr(fd.key,ints);}else if(fd.kind==='table'||!editable){row.readonlyValue=this.t('여기서는 바꿀 수 없습니다');}
       if(!groups[group]){ groups[group]=[]; order.push(group); rank[group]=GROUP_ORDER.indexOf(fd.group); }
       groups[group].push(row);
     }
@@ -6678,8 +6678,11 @@ class Component extends DCLogic {
   confirmDestructive(message){return this.askConfirm(message);}
   removeReservation=(identity)=>async()=>{if(!await this.confirmDestructive(this.tr('{name} 예약을 삭제하시겠습니까?',{name:identity})))return;let index=-1,row=null;if(await this.optimistic('reservations',{apply:s=>{index=s.reservations.findIndex(x=>x.identity===identity);row=s.reservations[index]||null;return {reservations:s.reservations.filter(x=>x.identity!==identity)};},revert:s=>row?{reservations:this.listInsert(s.reservations,index,row)}:null,send:()=>this.apiSend('/v1/dhcp/static','DELETE',{identity}),failure:'삭제 실패: '}))this.toastMsg('예약을 삭제했습니다');};
   clusterPropose=()=>{const self=this.state.cluster.self;if(this.state.authRole!=='admin'||self.role!=='leader')return this.toastMsg('리더 관리자 노드에서만 설정 동기화 요청을 보낼 수 있습니다',true); const f=this.state.forms; const k=(f.cpKey||'').trim(); if(!k) return this.toastMsg('설정 항목을 입력하세요',true);
-    let v=(f.cpVal||'').trim(); let pv; if(v==='true')pv=true; else if(v==='false')pv=false; else if(v!==''&&!isNaN(Number(v)))pv=Number(v); else pv=v;
-    const patch={}; patch[k]=pv;
+    const v=(f.cpVal||'').trim(); const fd=(this.state.schema||[]).find(x=>x.key===k)||{}; let pv=v;
+    if(fd.kind==='bool'&&(v==='true'||v==='false'))pv=v==='true';
+    else if(fd.kind==='int'){pv=Number(v);if(v===''||!Number.isSafeInteger(pv))return this.toastMsg('정수를 입력하세요',true);}
+    else if(fd.kind==='array'){pv=v.split(',').map(x=>x.trim()).filter(Boolean);if(fd.items==='int'){pv=pv.map(Number);if(!pv.every(Number.isSafeInteger))return this.toastMsg('정수를 입력하세요',true);}}
+    const patch={[k]:pv};
     this.apiSend('/v1/cluster/propose','POST',{patch}).then(r=>this.toastMsg(r.ok?this.tr('클러스터 설정 동기화 요청을 보냈습니다 (인덱스 {index})',{index:(r.body&&r.body.index)||'?'}):(this.t('제안 실패: ')+this.errorText(r)),!r.ok)); };
   onForm=(e)=>{ const k=e.target.dataset.k, val=e.target.value; this.setState(s=>({forms:{...s.forms,[k]:val}})); };
   setQlAction=(a)=>()=>this.setState(s=>({forms:{...s.forms,qlAction:a}}));

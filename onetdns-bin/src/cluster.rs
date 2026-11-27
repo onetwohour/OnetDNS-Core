@@ -883,6 +883,58 @@ fn decode_raft_command_patch(
     Ok(patch)
 }
 
+fn raft_patch_edit(
+    text: &str,
+    patch: &[(String, onetdns_core::json::Json)],
+) -> Result<String, String> {
+    let mut output = text.to_string();
+    for (key, value) in patch {
+        if key.is_empty() || key.len() > 128 {
+            return Err("Raft configuration key length is out of range".into());
+        }
+        output = match value {
+            // null is agreement to delete the key; writing an empty value would not restore the
+            // default.
+            onetdns_core::json::Json::Null => remove_config_key(&output, key)?,
+            value => rewrite_config_kv(&output, key, &json_to_raft_toml_literal(value, 0)?)?,
+        };
+    }
+    Ok(output)
+}
+
+/// Runs the checks applying `patch` would run, without writing anything.
+fn check_raft_patch(
+    context: &RaftApplyContext,
+    patch: &[(String, onetdns_core::json::Json)],
+) -> Result<(), String> {
+    let path = context
+        .path
+        .as_deref()
+        .ok_or("There is no configuration file for a Raft change to apply to")?;
+    let current =
+        onetdns_core::SecretString::from(Config::read_text(path).map_err(|e| e.to_string())?);
+    let edited = onetdns_core::SecretString::from(raft_patch_edit(&current, patch)?);
+    let config = Config::from_toml_str(&edited)
+        .map_err(|e| format!("The changed configuration is invalid: {e}"))?;
+    crate::runtime_preflight(&config)
+        .map_err(|e| format!("The changed configuration is invalid: {e}"))
+}
+
+/// Handles `/v1/cluster/propose`. Every node applies a committed entry, and one that fails to
+/// apply stops Raft on each of them, so the patch must apply here before it is proposed.
+pub(crate) fn propose_config_patch(body: &str) -> Result<u64, String> {
+    parse_cluster_proposal(body)?;
+    let entries = decode_raft_command_patch(body.as_bytes())?;
+    let (handle, context) = raft_slot()
+        .lock_recover()
+        .as_ref()
+        .map(|runtime| (runtime.handle.clone(), runtime.apply.clone()))
+        .ok_or("Raft is not configured")?;
+    let _proposal = cluster_proposal_lock().lock_recover();
+    check_raft_patch(&context, &entries)?;
+    Ok(handle.propose(body.as_bytes().to_vec())?)
+}
+
 fn apply_raft_patch(
     context: &RaftApplyContext,
     patch: &[(String, onetdns_core::json::Json)],
@@ -891,21 +943,6 @@ fn apply_raft_patch(
         return Err("Raft configuration state has too many or too few entries".into());
     }
     validate_raft_patch_scope(&onetdns_core::json::Json::Obj(patch.to_vec()))?;
-    let edit = |text: &str| {
-        let mut output = text.to_string();
-        for (key, value) in patch {
-            if key.is_empty() || key.len() > 128 {
-                return Err("Raft configuration key length is out of range".into());
-            }
-            output = match value {
-                // null is agreement to delete the key; writing an empty value would not restore the
-                // default.
-                onetdns_core::json::Json::Null => remove_config_key(&output, key)?,
-                value => rewrite_config_kv(&output, key, &json_to_raft_toml_literal(value, 0)?)?,
-            };
-        }
-        Ok(output)
-    };
 
     let _write_guard = config_write_lock().lock_recover();
     let generation = context.generation.lock_recover().clone();
@@ -915,7 +952,7 @@ fn apply_raft_patch(
         &context.applied,
         &generation.reload,
         &generation.hot_apply,
-        edit,
+        |text: &str| raft_patch_edit(text, patch),
     )?
     .mode;
     onetdns_core::info!(
@@ -1386,6 +1423,56 @@ mod tests {
             std::fs::read_to_string(&file_path).unwrap(),
             "blocked_response_ttl = 11\n"
         );
+        std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn a_patch_that_would_not_apply_is_refused_before_it_is_proposed() {
+        let file_path = std::env::temp_dir().join(format!(
+            "onetdns-raft-check-{}-{}.toml",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::write(&file_path, "blocked_response_ttl = 10\n").unwrap();
+        let hot_apply: HotConfigApply = Arc::new(|_, _| panic!("a check applies nothing"));
+        let context = |path| {
+            RaftApplyContext::new(
+                path,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                RaftGenerationApply {
+                    reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    hot_apply: hot_apply.clone(),
+                },
+            )
+        };
+        let with_file = context(Some(file_path.clone()));
+        let check = |body: &str| {
+            check_raft_patch(
+                &with_file,
+                &decode_raft_command_patch(body.as_bytes()).unwrap(),
+            )
+        };
+
+        check(r#"{"patch":{"blocked_response_ttl":11}}"#).unwrap();
+        check(r#"{"patch":{"blocked_response_ttl":null}}"#).unwrap();
+        for refused in [
+            r#"{"patch":{"blocked_response_ttl":"11"}}"#,
+            r#"{"patch":{"version":1}}"#,
+            r#"{"patch":{"block_rules":[1]}}"#,
+            r#"{"patch":{"no_such_setting":1}}"#,
+        ] {
+            assert!(check(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "blocked_response_ttl = 10\n"
+        );
+        assert!(check_raft_patch(
+            &context(None),
+            &decode_raft_command_patch(br#"{"patch":{"blocked_response_ttl":11}}"#).unwrap(),
+        )
+        .is_err());
         std::fs::remove_file(file_path).unwrap();
     }
 

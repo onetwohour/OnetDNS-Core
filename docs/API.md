@@ -1116,7 +1116,7 @@ Cluster node status and Raft config proposals.
 | Method | Path | Access | Summary |
 |---|---|---|---|
 | GET | `/v1/cluster/nodes` | read-only | Cluster node status. With consensus enabled, includes role, term, leader, and apply position |
-| POST | `/v1/cluster/propose` | admin | Propose a config change to the Raft leader (admin only): replicates {patch:{key:value}} to every node and applies it. A null value removes the entry. Node-local settings are rejected. With Raft enabled, other config-changing management requests are also accepted only on the leader and replicated the same way; followers reject them with 409 |
+| POST | `/v1/cluster/propose` | admin | Propose a config change to the Raft leader (admin only): replicates {patch:{key:value}} to every node and applies it. A null value removes the entry. Node-local settings are rejected, and so is a patch that would not apply to the leader's configuration; nothing is replicated then. With Raft enabled, other config-changing management requests are also accepted only on the leader and replicated the same way; followers reject them with 409 |
 
 #### `GET /v1/cluster/nodes`
 

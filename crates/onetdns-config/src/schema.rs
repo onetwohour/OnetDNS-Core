@@ -3683,6 +3683,15 @@ fn field_nullable(defaults: &onetdns_core::json::Json, key: &str) -> bool {
     matches!(defaults.get(key), Some(onetdns_core::json::Json::Null))
 }
 
+/// `int` for arrays the editor must send as numbers; empty otherwise.
+fn field_items(field: &Field) -> &'static str {
+    if field.kind == "array" && crate::settings::PORT_ARRAY_KEYS.contains(&field.key) {
+        "int"
+    } else {
+        ""
+    }
+}
+
 fn field_unit(field: &Field) -> &'static str {
     if field.kind != "int" {
         return "";
@@ -3743,13 +3752,14 @@ pub fn schema_json() -> String {
             .map(|(lang, column)| format!("\"{lang}\":{{{}}}", column.join(",")))
             .collect();
         out.push_str(&format!(
-            "{{\"key\":{},\"kind\":{},\"group\":{},\"label\":{},\"meta\":{},\"unit\":{},\"sensitive\":{},\"write_only\":{},\"editable\":{},\"nullable\":{},\"enum_values\":[{}],\"enum_labels_i18n\":{{{}}},\"group_i18n\":{},\"label_i18n\":{},\"description_i18n\":{}}}",
+            "{{\"key\":{},\"kind\":{},\"group\":{},\"label\":{},\"meta\":{},\"unit\":{},\"items\":{},\"sensitive\":{},\"write_only\":{},\"editable\":{},\"nullable\":{},\"enum_values\":[{}],\"enum_labels_i18n\":{{{}}},\"group_i18n\":{},\"label_i18n\":{},\"description_i18n\":{}}}",
             json::escape(fd.key),
             json::escape(fd.kind),
             json::escape(fd.group),
             json::escape(copy.label_en),
             json::escape(fd.meta),
             json::escape(unit),
+            json::escape(field_items(fd)),
             field_sensitive(fd.key),
             field_write_only(fd.key),
             field_editable(fd.key, fd.kind),
@@ -3787,6 +3797,28 @@ mod tests {
         for k in known_keys() {
             let n = fields().iter().filter(|fd| fd.key == *k).count();
             assert_eq!(n, 1, "키 '{k}' 스키마 항목 {n}개(정확히 1이어야)");
+        }
+    }
+
+    #[test]
+    fn items_marks_exactly_the_arrays_that_take_integers() {
+        use crate::Config;
+        use onetdns_core::json::{parse, Json};
+        let schema = parse(&schema_json()).unwrap();
+        for field in schema.as_array().unwrap() {
+            if field.get("kind").and_then(Json::as_str) != Some("array") {
+                continue;
+            }
+            let key = field.get("key").and_then(Json::as_str).unwrap();
+            let marked = field.get("items").and_then(Json::as_str) == Some("int");
+            let takes_numbers = Config::from_toml_str(&format!("{key} = [53]\n")).is_ok();
+            assert_eq!(marked, takes_numbers, "{key}");
+            if marked {
+                assert!(
+                    Config::from_toml_str(&format!("{key} = [\"53\"]\n")).is_err(),
+                    "{key}"
+                );
+            }
         }
     }
 

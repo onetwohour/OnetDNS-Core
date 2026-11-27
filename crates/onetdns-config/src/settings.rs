@@ -4074,7 +4074,9 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     ] {
         check_int_range::<usize>(root, key)?;
     }
-    check_int_array_range::<u16>(root, "proxy_protocol_ports")?;
+    for key in PORT_ARRAY_KEYS {
+        check_int_array_range::<u16>(root, key)?;
+    }
     check_typed_array::<IpNet>(
         root,
         "proxy_protocol_trusted",
@@ -4126,7 +4128,6 @@ fn strict_check(root: &Value) -> Result<(), ConfigError> {
     check_typed_array::<IpNet>(root, "bogus_nxdomain", "CIDR (for example 10.10.10.10/32)")?;
     check_typed_array::<IpNet>(root, "recurse_deny_server", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_server", "CIDR")?;
-    check_int_array_range::<u16>(root, "dnscrypt_relay_ports")?;
     check_typed_array::<IpNet>(root, "dnscrypt_relay_allow_targets", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_deny_answers", "CIDR")?;
     check_typed_array::<IpNet>(root, "recurse_allow_answers", "CIDR")?;
@@ -5142,6 +5143,9 @@ where
         .map_err(|_| ConfigError::Invalid(format!("{key}: integer out of range (={i})")))?;
     Ok(())
 }
+
+/// The only arrays whose items are integers.
+pub(crate) const PORT_ARRAY_KEYS: [&str; 2] = ["proxy_protocol_ports", "dnscrypt_relay_ports"];
 
 fn check_int_array_range<T>(root: &Value, key: &str) -> Result<(), ConfigError>
 where

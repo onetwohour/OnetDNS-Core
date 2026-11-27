@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::cluster::{
-    parse_cluster_proposal, peer_cluster_status_json, raft_handle, standalone_cluster_status_json,
-    validate_raft_patch_scope, with_raft_identity,
+    peer_cluster_status_json, propose_config_patch, raft_handle, standalone_cluster_status_json,
+    with_raft_identity,
 };
 use crate::query_explain::{backend_label, explain_query, simulate_policy};
 use std::sync::atomic::Ordering;
@@ -143,17 +143,10 @@ impl ControlDeps {
 }
 
 pub(super) fn cluster_propose(body: &str) -> Result<String, String> {
-    match raft_handle() {
-        Some(h) => {
-            let patch = parse_cluster_proposal(body)?;
-            validate_raft_patch_scope(&patch)?;
-            let idx = h.propose(body.as_bytes().to_vec())?;
-            Ok(format!(
-                "{{\"committed\":true,\"applied\":true,\"index\":{idx}}}"
-            ))
-        }
-        None => Err("Raft is not configured".to_string()),
-    }
+    let idx = propose_config_patch(body)?;
+    Ok(format!(
+        "{{\"committed\":true,\"applied\":true,\"index\":{idx}}}"
+    ))
 }
 
 /// Metrics the data path keeps outside the control plane's counters.
