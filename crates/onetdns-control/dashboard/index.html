@@ -4833,8 +4833,8 @@ class Component extends DCLogic {
     if(!affix){
       const all=Object.keys(d);
       affix={
-        prefix:all.filter(k=>k.length>2&&!k.startsWith(' ')&&k.endsWith(' ')).sort((a,b)=>b.length-a.length),
-        suffix:all.filter(k=>k.length>2&&(k.startsWith(' ')||k.startsWith('개 ')||k.startsWith('개를 ')||k.startsWith('번 ')||k.startsWith('" DNS'))).sort((a,b)=>b.length-a.length)
+        prefix:all.filter(k=>!k.startsWith(' ')&&k.endsWith(' ')).sort((a,b)=>b.length-a.length),
+        suffix:all.filter(k=>(k.startsWith(' ')||k.startsWith('개 ')||k.startsWith('개를 ')||k.startsWith('번 ')||k.startsWith('" DNS'))).sort((a,b)=>b.length-a.length)
       };
       this._i18nAffix[lang]=affix;
     }

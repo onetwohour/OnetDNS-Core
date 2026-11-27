@@ -272,9 +272,6 @@ fn resolvable(key: &str, keys: &BTreeSet<String>) -> bool {
         return true;
     }
     keys.iter().any(|source| {
-        if source.chars().count() <= 2 {
-            return false;
-        }
         if !source.starts_with(' ') && source.ends_with(' ') && key.starts_with(source.as_str()) {
             return true;
         }
