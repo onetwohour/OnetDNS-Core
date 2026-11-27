@@ -589,8 +589,12 @@ fn wire_lane_hits_patch_id_and_respect_filter_generation() {
     let mut out3 = onetdns_proto::Writer::with_limit(1232);
     assert_eq!(
         server.handle_udp_wire(&blocked_wire, &ctx(), &mut out3, std::time::Instant::now()),
-        WireDisposition::Fallback
+        WireDisposition::Respond,
+        "차단 응답은 빠른 경로가 직접 만듭니다"
     );
+    let blocked = Message::parse(&out3.buf).unwrap();
+    assert_eq!(blocked.header.id, 0x0303);
+    assert_eq!(blocked.header.rcode, ResponseCode::NXDomain.0);
 
     server.filter.store(Arc::new(onetdns_filter::build_from_str(
         "||other.example^",
@@ -6536,10 +6540,15 @@ fn each_answered_query_counts_its_rule_once() {
     };
 
     let (blocked, disposition) = wire("blocked.example");
-    assert_eq!(disposition, WireDisposition::Fallback);
+    assert_eq!(
+        disposition,
+        WireDisposition::Respond,
+        "the fast path answers the block itself"
+    );
+    assert_eq!(hits("blocked.example"), 1);
     let response = server.handle(&blocked, &ctx()).unwrap();
     assert_eq!(response.header.rcode, ResponseCode::NXDomain.0);
-    assert_eq!(hits("blocked.example"), 1);
+    assert_eq!(hits("blocked.example"), 2);
 
     assert_eq!(
         wire("allowed.example").1,
@@ -6553,4 +6562,117 @@ fn each_answered_query_counts_its_rule_once() {
         "the stored answer is sent from the fast path"
     );
     assert_eq!(hits("allowed.example"), 2);
+}
+
+#[test]
+/// The fast path writes the block straight from the query bytes; the message, its EDNS, and the
+/// query log entry must be what the normal path produces for the same query.
+fn wire_lane_block_answers_match_the_normal_path() {
+    use onetdns_runtime::WireDisposition;
+
+    let blocks = [
+        BlockResponse::NxDomain,
+        BlockResponse::NoData,
+        BlockResponse::Refused,
+        BlockResponse::ZeroIp,
+        BlockResponse::Custom {
+            v4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            v6: None,
+        },
+        BlockResponse::Custom {
+            v4: None,
+            v6: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        },
+    ];
+    for block in blocks {
+        let (recorder, stats) = onetdns_control::channel(
+            64,
+            64,
+            3600,
+            onetdns_control::RecorderOpts {
+                querylog: true,
+                anonymize: false,
+                ignored: vec![],
+                stats_retention_secs: 3600,
+            },
+            onetdns_control::PersistOpts::default(),
+        );
+        let (backend, cache) = fixed_answer_cache();
+        let engine = onetdns_filter::build_from_str("||blocked.example^", "", block);
+        let server = NativeServer::new(
+            shared_filter(ArcSwap::from_pointee(engine)),
+            Arc::new(IpAcl::allow_all()),
+            vec![],
+            backend,
+            60,
+        )
+        .with_wire_fast_path(Some((
+            crate::wirecache::WireEntryFactory::new(0, 86_400),
+            cache,
+        )))
+        .with_recorder(Some(recorder));
+        let mut logged = 0;
+        for qtype in [ApRt::A, ApRt::AAAA, ApRt::TXT] {
+            for (edns, rd, name) in [
+                (None, true, "blocked.example"),
+                (Some(false), true, "Ads.Blocked.EXAMPLE"),
+                (Some(true), false, "blocked.example"),
+            ] {
+                let mut query = Message::query(0x4242, ApName::from_str(name).unwrap(), qtype);
+                query.header.recursion_desired = rd;
+                query.header.checking_disabled = !rd;
+                if let Some(dnssec_ok) = edns {
+                    let opt = Edns {
+                        dnssec_ok,
+                        ..Edns::default()
+                    };
+                    query.additionals.push(opt.try_to_record().unwrap());
+                }
+                let wire = query.try_encode().unwrap();
+                let case = format!(
+                    "{block:?} {qtype:?} {name} edns={edns:?} rd={rd} cd={}",
+                    !rd
+                );
+
+                let mut fast = onetdns_proto::Writer::with_limit(1232);
+                assert_eq!(
+                    server.handle_udp_wire(&wire, &ctx(), &mut fast, Instant::now()),
+                    WireDisposition::Respond,
+                    "{case}"
+                );
+                let request = Message::parse(&wire).unwrap();
+                let response = server.handle(&request, &ctx()).unwrap();
+                let mut normal = onetdns_proto::Writer::with_limit(1232);
+                onetdns_runtime::encode_limited(&request, &response, &mut normal);
+                assert_eq!(
+                    format!("{:?}", Message::parse(&fast.buf).unwrap()),
+                    format!("{:?}", Message::parse(&normal.buf).unwrap()),
+                    "{case}"
+                );
+
+                logged += 2;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let recent = loop {
+                    if stats.recent(64).len() >= logged || Instant::now() >= deadline {
+                        break stats.recent(2);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let entry = |event: &onetdns_control::QueryEvent| {
+                    (
+                        event.name.clone(),
+                        event.qtype.clone(),
+                        event.action,
+                        event.rcode.clone(),
+                        event.reason.clone(),
+                        event.stage.clone(),
+                        event.rule.clone(),
+                        event.list.clone(),
+                    )
+                };
+                assert_eq!(recent.len(), 2, "{case}");
+                assert_eq!(entry(&recent[1]), entry(&recent[0]), "{case}");
+            }
+        }
+    }
 }

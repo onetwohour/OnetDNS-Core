@@ -15,8 +15,9 @@ use onetdns_proto::{
 };
 use onetdns_runtime::{RequestCtx, Transport as RtTransport};
 
-use crate::native::query::{base_edns, RuleMatch};
+use crate::native::query::{advertised_udp_payload, base_edns, RuleMatch};
 use crate::native::{NativeFeatures, NativeServer};
+use crate::wirecache::ScannedQuery;
 
 impl NativeServer {
     /// Logs a rewritten answer.
@@ -748,6 +749,96 @@ pub(crate) fn block_resp(
                 records_resp(request, recs)
             }
         }
+    }
+}
+
+/// `block_resp` for a query the wire lane scanned, written straight from its bytes, with the OPT
+/// `admit` builds and the EDE `reply` adds. The lane admits only queries whose response nothing
+/// before the filter changes. `wire_lane_block_answers_match_the_normal_path` holds the two
+/// paths to the same message.
+pub(crate) fn write_block_wire(
+    query: &ScannedQuery<'_>,
+    recursion_desired: bool,
+    br: &BlockResponse,
+    block_ttl: u32,
+    udp_payload: u16,
+    out: &mut onetdns_proto::Writer,
+) {
+    const IN: [u8; 2] = 1u16.to_be_bytes();
+    const QNAME_POINTER: [u8; 2] = 0xc00cu16.to_be_bytes();
+    const EDE_TEXT: &[u8] = b"blocked by filter";
+    let qtype = ApRt(query.qtype);
+    let address: Option<IpAddr> = match (br, qtype) {
+        (BlockResponse::ZeroIp, ApRt::A) => Some(Ipv4Addr::UNSPECIFIED.into()),
+        (BlockResponse::ZeroIp, ApRt::AAAA) => Some(Ipv6Addr::UNSPECIFIED.into()),
+        (BlockResponse::Custom { v4: Some(v4), .. }, ApRt::A) => Some((*v4).into()),
+        (BlockResponse::Custom { v6: Some(v6), .. }, ApRt::AAAA) => Some((*v6).into()),
+        _ => None,
+    };
+    let negative = match br {
+        BlockResponse::NxDomain | BlockResponse::NoData => true,
+        BlockResponse::Custom { .. } => address.is_none(),
+        BlockResponse::Refused | BlockResponse::ZeroIp => false,
+    };
+
+    out.clear();
+    let buf = &mut out.buf;
+    buf.extend_from_slice(&query.id);
+    buf.push(0x80 | u8::from(recursion_desired));
+    buf.push(0x80 | block_rcode(br, qtype).0 as u8);
+    for count in [
+        1,
+        u16::from(address.is_some()),
+        u16::from(negative),
+        u16::from(query.edns.is_some()),
+    ] {
+        buf.extend_from_slice(&count.to_be_bytes());
+    }
+    buf.extend_from_slice(query.qname);
+    buf.extend_from_slice(&query.qtype.to_be_bytes());
+    buf.extend_from_slice(&IN);
+
+    let record_head = |buf: &mut Vec<u8>, rtype: ApRt, rdlen: usize| {
+        buf.extend_from_slice(&QNAME_POINTER);
+        buf.extend_from_slice(&rtype.0.to_be_bytes());
+        buf.extend_from_slice(&IN);
+        buf.extend_from_slice(&block_ttl.to_be_bytes());
+        buf.extend_from_slice(&(rdlen as u16).to_be_bytes());
+    };
+    match address {
+        Some(IpAddr::V4(v4)) => {
+            record_head(buf, ApRt::A, 4);
+            buf.extend_from_slice(&v4.octets());
+        }
+        Some(IpAddr::V6(v6)) => {
+            record_head(buf, ApRt::AAAA, 16);
+            buf.extend_from_slice(&v6.octets());
+        }
+        None => {}
+    }
+    if negative {
+        const MNAME: &[u8] = b"\x07blocked\x07invalid\x00";
+        const RNAME_LABEL: &[u8] = b"\x0ahostmaster";
+        record_head(buf, ApRt::SOA, MNAME.len() + RNAME_LABEL.len() + 2 + 20);
+        let mname_at = buf.len() as u16;
+        buf.extend_from_slice(MNAME);
+        buf.extend_from_slice(RNAME_LABEL);
+        buf.extend_from_slice(&(0xc000 | mname_at).to_be_bytes());
+        let expire = block_ttl.saturating_mul(24).max(block_ttl);
+        for field in [1, block_ttl, block_ttl, expire, block_ttl] {
+            buf.extend_from_slice(&field.to_be_bytes());
+        }
+    }
+    if let Some(edns) = &query.edns {
+        buf.push(0);
+        buf.extend_from_slice(&ApRt::OPT.0.to_be_bytes());
+        buf.extend_from_slice(&advertised_udp_payload(udp_payload).to_be_bytes());
+        buf.extend_from_slice(&[0, 0, if edns.dnssec_ok { 0x80 } else { 0 }, 0]);
+        buf.extend_from_slice(&(4 + 2 + EDE_TEXT.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&onetdns_proto::EDE_OPTION.to_be_bytes());
+        buf.extend_from_slice(&(2 + EDE_TEXT.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&onetdns_proto::ede_code::BLOCKED.to_be_bytes());
+        buf.extend_from_slice(EDE_TEXT);
     }
 }
 

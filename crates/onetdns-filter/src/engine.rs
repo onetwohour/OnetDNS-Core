@@ -1761,6 +1761,26 @@ impl BlockEngine {
         qtype: RecordType,
         client: &ClientInfo,
     ) -> FilterExplanation {
+        self.explain_counting(name, qtype, client, self.track_hits)
+    }
+
+    /// `verdict_with_rule` without counting the hit, like `verdict_uncounted`.
+    pub fn verdict_with_rule_uncounted(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        client: &ClientInfo,
+    ) -> FilterExplanation {
+        self.explain_counting(name, qtype, client, false)
+    }
+
+    fn explain_counting(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        client: &ClientInfo,
+        count: bool,
+    ) -> FilterExplanation {
         let allow = FilterExplanation {
             verdict: FilterVerdict::Allow,
             stage: MatchStage::DefaultAllow,
@@ -1774,7 +1794,7 @@ impl BlockEngine {
         let Some(key) = normalize_into(name, &mut buf) else {
             return allow;
         };
-        let (verdict, stage, matched) = self.classify(&key, qtype, client, self.track_hits);
+        let (verdict, stage, matched) = self.classify(&key, qtype, client, count);
         if matches!(verdict, FilterVerdict::Allow) {
             return FilterExplanation { stage, ..allow };
         }

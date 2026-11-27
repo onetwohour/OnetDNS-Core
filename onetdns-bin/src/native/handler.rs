@@ -18,11 +18,13 @@ use crate::native::ddr_owner;
 #[cfg(unix)]
 use crate::native::lane::{reactor_response_edns, LaneClient, LaneState, LANE, MAX_LANE_PENDING};
 use crate::native::observe::note_dropped;
+use crate::native::observe::FilterRuleLabel;
 use crate::native::query::dnstap_proto;
 #[cfg(unix)]
 use crate::native::query::read_cookie;
 use crate::native::response::{
-    answers_summary, edns_error_resp, error_resp, finalize, now_unix, postprocess, with_ede,
+    answers_summary, block_rcode, edns_error_resp, error_resp, finalize, now_unix, postprocess,
+    with_ede, write_block_wire,
 };
 use crate::native::{NativeServer, MAX_LARGE_QUERY_BYTES};
 
@@ -635,7 +637,7 @@ impl NativeServer {
 
         let client = self.identify(ctx);
 
-        let storable = trivial || {
+        if !trivial {
             if filter.has_client_specific_rules() {
                 return Wire::Fallback;
             }
@@ -645,13 +647,58 @@ impl NativeServer {
             let Some(qname) = ApName::from_uncompressed_wire(scanned.qname) else {
                 return Wire::Fallback;
             };
-            matches!(
-                filter.verdict_uncounted(&qname, ApRt(scanned.qtype), &client),
-                FilterVerdict::Allow
-            )
-        };
-        if !storable {
-            return Wire::Fallback;
+            let qtype = ApRt(scanned.qtype);
+            let explained = filter.verdict_with_rule_uncounted(&qname, qtype, &client);
+            match explained.verdict {
+                FilterVerdict::Allow => {}
+                FilterVerdict::Block(block) => {
+                    // Before the filter, the normal path changes nothing for the queries this lane
+                    // scans except by access control and rate limits.
+                    let timer = self
+                        .events()
+                        .is_some()
+                        .then(|| onetdns_control::RequestTimer::start_at(now));
+                    if self.acl.check(&client) != AclDecision::Allow
+                        || self
+                            .rate_limiters
+                            .iter()
+                            .any(|limiter| limiter.check(&client) == RateDecision::Throttle)
+                    {
+                        return Wire::Fallback;
+                    }
+                    let recursion_desired = packet[2] & 0x01 != 0;
+                    let block_ttl = self.block_ttl.load(Ordering::Acquire);
+                    write_block_wire(
+                        &scanned,
+                        recursion_desired,
+                        &block,
+                        block_ttl,
+                        f.edns_buffer,
+                        out,
+                    );
+                    Self::count_fast_answer(&filter, &qname, qtype, &client, &[]);
+                    if let Some(timer) = timer {
+                        let rule = FilterRuleLabel::new(
+                            explained.stage,
+                            explained.matched,
+                            explained.source,
+                        );
+                        self.rec_rc_diag(
+                            &client,
+                            Action::Blocked,
+                            Some(&qname),
+                            Some(qtype),
+                            block_rcode(&block, qtype),
+                            "",
+                            "",
+                            rule.as_match(),
+                        );
+                        self.rec_latency(&client, Some(&qname), timer.elapsed_us());
+                    }
+                    return Wire::Respond;
+                }
+                _ => return Wire::Fallback,
+            }
         }
         let Ok(request) = Message::parse(packet) else {
             return Wire::Fallback;
